@@ -1,0 +1,15 @@
+edr_agent_help 1 0.616428
+pmfe_scan_detail_format 1 0.326821
+ave_file_fingerprint 1 0.370927
+ave_infer_dry_run 1 0.336043
+ave_phase1_contract 1 0.408434
+ave_static_features_lite512 1 0.326226
+ave_sdk_smoke 1 0.336026
+ave_fl_abi_c0 1 0.338615
+ave_suppression_sqlite 1 0.37051
+ave_scan_pipeline 1 0.353318
+config_fingerprint 1 0.349734
+fl_trainer_c1 1 0.552877
+shellcode_modules 1 0.354891
+edr_agent_smoke 1 1.0072
+---

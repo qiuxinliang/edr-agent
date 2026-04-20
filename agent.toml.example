@@ -1,0 +1,181 @@
+# 与《EDR 端点详细设计 v1.0》§11.1 对齐 — 复制为 agent.toml 后按需修改
+#
+# 使用说明、gRPC/mTLS、SQLite 队列与环境变量：见同目录 README.md
+
+[server]
+address              = "127.0.0.1:50051"
+ca_cert              = ""
+client_cert          = ""
+client_key           = ""
+connect_timeout_s    = 10
+keepalive_interval_s = 30
+
+[agent]
+endpoint_id          = "auto"
+tenant_id            = "tenant_default"
+
+# §19 攻击面：GET_ATTACK_SURFACE 采集后 POST 至平台（需 PATH 中有 curl）。endpoint_id 不可为 auto。
+# [platform]
+# rest_base_url      = "http://127.0.0.1:8080/api/v1"
+# rest_user_id       = "edr-agent"
+# rest_bearer_token  = ""
+
+# §19.8 攻击面 TOML（与《EDR_端点详细设计》§19.8 对齐；主循环周期 POST 间隔 = min(port,service,policy,full)；enabled 默认 false 避免误报）。
+# [attack_surface]
+# enabled                  = false
+# port_interval_s          = 300
+# conn_interval_s          = 300
+# service_interval_s       = 600
+# policy_interval_s        = 3600
+# full_snapshot_interval_s = 1800
+# outbound_top_n           = 128
+# outbound_exclude_loopback = true
+# geoip_db_path            = "/opt/edr/data/GeoLite2-City.mmdb"
+# high_risk_immediate_ports = [23, 445, 3389, 6379, 27017, 1433, 3306]
+# firewall_rule_detail_max = 500
+# §19.10：TCPIP/WFAS ETW 命中后，经预处理打标、主线程去抖触发 POST 攻击面快照
+# etw_refresh_triggers_snapshot = true
+# etw_refresh_debounce_s        = 8
+
+[collection]
+etw_enabled          = true
+# Windows §19.10：Microsoft-Windows-TCPIP / WFAS 防火墙 ETW（需管理员；失败时跳过并打日志）
+etw_tcpip_provider   = true
+etw_firewall_provider = true
+ebpf_enabled         = true
+poll_interval_s      = 1
+max_event_queue_size = 4096
+
+[preprocessing]
+dedup_window_s       = 30
+high_freq_threshold  = 100
+sampling_rate_whitelist = 0.1
+# 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
+rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
+
+# 可选：见 docs/PREPROCESS_RULES.md — 在 dedup/限流 之前匹配，action = drop | emit_always
+# [[preprocessing.rules]]
+# name = "drop_temp_exe"
+# action = "drop"
+# exe_path_contains = "\\Windows\\Temp\\"
+# icase_exe_path = true
+
+# 配置热载（可选）：设置环境变量 EDR_CONFIG_RELOAD_S 为正整数秒，则主循环周期性检测本文件 mtime，
+# 变更后重载 preprocessing / resource / self_protect / 攻击面调度，并调用 AVE_SyncFromEdrConfig 从 [ave].model_dir 重载 ONNX。
+# 吊销、L4 联动、SQLite 路径等 [ave] 项在扫描时从内存配置读取，热载后即可生效；仅更换磁盘上的模型文件时需依赖 AVE_SyncFromEdrConfig（或 AVE_UpdateModel / AVE_ApplyHotfix）。
+[ave]
+# 静态 ONNX：将 static.onnx 放到本目录（与仓库 onnx-output 中产物一致）。
+# 安装：./scripts/install_static_onnx.sh（默认安装到本路径；无权限时用 --dest-dir $PWD/models 做本机联调）。
+# 加载：目录内首个非 behavior.onnx 的 .onnx 作为 static；behavior.onnx 单独用于行为模型。
+#
+# 本仓库开发/测试：训练产物在**仓库根目录** `model/releases/<release_id>/`（见根目录 `model/releases/current.json`）。
+# 将 model_dir 设为该目录的绝对路径即可，例如（按本机路径与 release 名修改）：
+#   macOS/Linux:  /…/AI Agent/model/releases/20260418_053704_UTC
+#   Windows:      C:/…/AI Agent/model/releases/20260418_053704_UTC
+# Linux/macOS 常用示例路径；Windows 示例：model_dir = "C:\\ProgramData\\EDR\\models"（与内置默认一致）
+model_dir            = "/opt/edr/models"
+scan_threads         = 2
+max_file_size_mb     = 256
+sensitivity          = "MEDIUM"
+# P2：static ONNX 推理结果进程内缓存（键为文件 SHA256；0=关闭）。TTL 秒；0=仅 LRU、不按时间过期。
+# static_infer_cache_max_entries = 0
+# static_infer_cache_ttl_s       = 0
+# Windows Authenticode：WinVerifyTrust 吊销链（WTD_REVOKE_WHOLECHAIN）。可被环境变量 EDR_AVE_CERT_REVOCATION=0/1 覆盖。
+# cert_revocation_check = false
+# 与 AVE_ScanFileWithSubject(subject_pid) 配合：ONNX 之后若行为异常分 ≥ 阈值则叠加 L4（rule_name=behavior_realtime）。环境变量 EDR_AVE_L4_BEHAVIOR_LINK=0/1 可覆盖开关。
+# l4_realtime_behavior_link = false
+# l4_realtime_anomaly_threshold = 0.65
+# L3 IOC 先于 L2 哈希白名单匹配；为 false 时仅 ONNX 后二次核对 IOC。
+# ioc_precheck_enabled = true
+# 行为管线消费线程（AVE_StartBehaviorMonitor）；改此项热载后需进程级策略评估是否重启 Agent。
+# behavior_monitor_enabled = true
+# 可选 SQLite：空路径表示禁用该层（详见 docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md）
+# file_whitelist_db_path = ""
+# ioc_db_path = ""
+# behavior_policy_db_path = ""
+# cert_whitelist_db_path = ""
+# cert_whitelist_enabled = true
+
+[upload]
+batch_max_events     = 500
+batch_max_size_mb    = 4
+batch_timeout_s      = 5
+max_upload_mbps      = 1
+
+[offline]
+queue_db_path        = "edr_queue.db"
+max_queue_size_mb    = 512
+retention_hours      = 72
+
+[resource_limit]
+cpu_limit_percent    = 1
+memory_limit_mb      = 100
+emergency_cpu_limit  = 5
+
+[logging]
+level                = "info"
+log_dir              = "/var/log/edr"
+max_log_size_mb      = 100
+max_log_files        = 10
+
+# §8 高危指令（kill / isolate / forensic）：默认关闭；亦可由环境变量 EDR_CMD_ENABLED=1 开启
+# [command]
+# allow_dangerous      = false
+
+# §9 自保护：防调试、事件总线背压告警、可选 Windows Job Object
+# [self_protect]
+# anti_debug                      = false
+# job_object_windows              = false
+# watchdog_log_interval_s         = 0
+# event_bus_pressure_warn_pct     = 90
+
+# §10 联邦学习（T-015 frozen_layers）：与 `docs/FL_ROUND_TRAINING_SEMANTICS.md` 一致；默认关闭。
+# [fl]
+# enabled = false
+# model_target = "static"
+# [fl.frozen_layers]
+# static   = ["head_b", "head_c"]
+# behavior = ["head_b"]
+
+# §17 协议层 Shellcode 检测（Windows；需管理员 + WinDivert 驱动）。默认关闭。
+# 部署约定：WinDivert.dll 位于 %SystemRoot%\System32（驱动一般在 System32\drivers）；详见 README §17。
+# [shellcode_detector]
+# enabled                  = false
+# windivert_priority       = -1000
+# max_payload_inspect      = 16384
+# alert_threshold          = 0.70
+# auto_isolate_threshold   = 0.95
+# auto_isolate_execute     = false
+# heuristic_score_scale    = 1.0
+# yara_rules_reload_interval_s = 0
+# monitor_smb              = true
+# monitor_rdp              = true
+# monitor_winrm            = true
+# monitor_msrpc            = true
+# monitor_ldap             = true
+# detector_threads         = 2
+# yara_rules_dir           = ""
+# forensic_dir             = ""
+# forensic_save_pcap       = false
+# evidence_preview_bytes   = 0
+# forensic_ring_slots      = 0
+# forensic_ring_max_packet_bytes = 2048
+# windivert_tcp_ports      = ""
+#   空 = 内置 SMB/RDP/WinRM/MSRPC/LDAP 等端口；非空 = 仅监听所列 TCP 端口（逗号分隔），并忽略 monitor_smb 等按类开关
+
+# §18 Webshell 检测引擎（Linux 当前支持 inotify 目录监控；可通过 EDR_WEBSHELL_ROOTS 指定站点根目录）
+# [webshell_detector]
+# enabled                  = false
+# discovery_interval_s     = 1800
+# iis_config_path          = ""
+# max_watch_dirs           = 64
+# monitor_subdirs          = true
+# webshell_rules_dir       = "src/webshell_detector/rules"
+# scan_threads             = 2
+# max_file_size_mb         = 10
+# defer_retry_ms           = 1000
+# alert_threshold          = 0.50
+# l2_review_threshold      = 0.80
+# upload_webshell_files    = true
+# upload_timeout_s         = 60
+# max_upload_size_mb       = 10

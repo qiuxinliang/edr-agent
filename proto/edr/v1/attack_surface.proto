@@ -1,0 +1,110 @@
+// §19.5 攻击面快照上报协议（与实现路径对齐：当前落地以 REST JSON 为主；本文件供 gRPC 演进对齐设计书）
+syntax = "proto3";
+
+package edr.v1;
+
+option go_package = "edr/v1;edrv1";
+
+// 设计书 §19.5 服务名；实现时可与 EventIngest 共用通道或独立 stub。
+service AttackSurfaceService {
+  rpc ReportSnapshot(AttackSurfaceSnapshotProto) returns (SnapshotAck);
+  rpc RequestSnapshot(SnapshotRequest) returns (SnapshotAck);
+}
+
+message SnapshotRequest {
+  string endpoint_id = 1;
+  bool full = 2;
+}
+
+message SnapshotAck {
+  string snapshot_id = 1;
+  bool received = 2;
+}
+
+message AttackSurfaceSnapshotProto {
+  string snapshot_id = 1;
+  string endpoint_id = 2;
+  int64 collected_at = 3;
+  string agent_version = 4;
+  int32 trigger = 5;
+  repeated ListenPortProto ports = 10;
+  repeated OutboundConnProto outbound = 11;
+  repeated ServiceEntryProto services = 12;
+  repeated WebRootProto web_roots = 13;
+  SecuritySummaryProto security = 14;
+  int32 high_risk_port_count = 20;
+  int32 ioc_hit_outbound_count = 21;
+  bool smbv1_exposed = 22;
+  bool rdp_exposed_no_nla = 23;
+  bool firewall_disabled = 24;
+}
+
+message ListenPortProto {
+  int32 port = 1;
+  int32 proto = 2;
+  int32 scope = 3;
+  string bind_addr = 4;
+  int32 pid = 5;
+  string process_name = 6;
+  string service_label = 7;
+  int32 risk = 8;
+  string risk_reason = 9;
+  bool in_whitelist = 10;
+}
+
+message OutboundConnProto {
+  string dst_ip = 1;
+  int32 dst_port = 2;
+  string dst_country = 3;
+  string dst_asn = 4;
+  int32 pid = 5;
+  string process_name = 6;
+  int64 bytes_sent = 7;
+  int64 bytes_recv = 8;
+  bool is_ioc_hit = 9;
+  string ioc_threat = 10;
+  int32 ioc_severity = 11;
+  int32 connection_count = 12;
+}
+
+message WebRootProto {
+  string path = 1;
+  string service_name = 2;
+}
+
+message ServiceEntryProto {
+  string service_name = 1;
+  string display_name = 2;
+  int32 state = 3;
+  string start_type = 4;
+  int32 pid = 5;
+  string binary_path = 6;
+  string run_as = 7;
+  bool is_listening = 8;
+}
+
+message SecuritySummaryProto {
+  bool auto_rollback_enabled = 1;
+  int32 signal_c_timeout_min = 2;
+  string ave_sensitivity = 3;
+  bool webshell_monitor = 4;
+  bool shellcode_detect = 5;
+  int32 whitelist_rule_count = 6;
+  bool firewall_enabled = 10;
+  string default_inbound = 11;
+  string default_outbound = 12;
+  int32 inbound_allow_rules = 13;
+  int32 inbound_block_rules = 14;
+  repeated string high_risk_allow_ports = 15;
+  bool policy_overridden = 16;
+  string override_source = 17;
+  bool uac_enabled = 20;
+  bool dep_enabled = 21;
+  bool aslr_enabled = 22;
+  bool smb_signing = 23;
+  bool smbv1_enabled = 24;
+  bool rdp_nla_enabled = 25;
+  bool powershell_constrained = 26;
+  bool secure_boot = 27;
+  string os_patch_level = 28;
+}

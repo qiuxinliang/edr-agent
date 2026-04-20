@@ -1,0 +1,12 @@
+edr_agent_help 2 0.00315094
+ave_file_fingerprint 2 0.0417498
+ave_infer_dry_run 2 0.0166048
+ave_sdk_smoke 2 0.0125387
+ave_fl_abi_c0 2 0.0168567
+ave_suppression_sqlite 2 0.0228032
+ave_scan_pipeline 2 0.00755617
+config_fingerprint 2 0.00225973
+fl_trainer_c1 2 0.00920504
+shellcode_modules 2 0.00205621
+edr_agent_smoke 2 0.50615
+---

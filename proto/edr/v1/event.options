@@ -1,0 +1,43 @@
+# nanopb 字段上限（与 EdrBehaviorRecord / 设计 §6 一致）
+edr.v1.BehaviorEvent.event_id max_size:48
+edr.v1.BehaviorEvent.endpoint_id max_size:48
+edr.v1.BehaviorEvent.tenant_id max_size:64
+edr.v1.BehaviorEvent.process_name max_size:256
+edr.v1.BehaviorEvent.cmdline max_size:1024
+edr.v1.BehaviorEvent.exe_hash max_size:65
+edr.v1.BehaviorEvent.exe_path max_size:1024
+edr.v1.BehaviorEvent.username max_size:256
+edr.v1.BehaviorEvent.ave_result_json max_size:4096
+edr.v1.BehaviorEvent.mitre_ttps max_count:8 max_size:16
+
+edr.v1.ProcessDetail.parent_name max_size:256
+edr.v1.ProcessDetail.parent_path max_size:512
+edr.v1.ProcessDetail.integrity_level max_size:64
+
+edr.v1.FileDetail.operation max_size:32
+edr.v1.FileDetail.target_path max_size:1024
+
+edr.v1.NetworkDetail.src_ip max_size:64
+edr.v1.NetworkDetail.dst_ip max_size:64
+edr.v1.NetworkDetail.protocol max_size:16
+
+edr.v1.DnsDetail.query_name max_size:512
+
+edr.v1.ScriptDetail.snippet max_size:1024
+
+edr.v1.RegistryDetail.key_path max_size:1024
+edr.v1.RegistryDetail.value_name max_size:512
+edr.v1.RegistryDetail.value_data max_size:8192
+edr.v1.RegistryDetail.operation max_size:32
+edr.v1.RegistryDetail descriptorsize:DS_4
+
+edr.v1.BehaviorAlert.tactic_probs max_count:14
+edr.v1.BehaviorAlert.triggered_tactics max_size:512
+edr.v1.BehaviorAlert.process_name max_size:256
+edr.v1.BehaviorAlert.process_path max_size:1024
+
+# 《11》§4.1 / `AVEBehaviorEvent` — `AveBehaviorEventFeed`
+edr.v1.AveBehaviorEventFeed.target_path max_size:1024
+edr.v1.AveBehaviorEventFeed.target_ip max_size:64
+edr.v1.AveBehaviorEventFeed.target_domain max_size:512
+edr.v1.AveBehaviorEventFeed.file_sha256_hex max_size:65

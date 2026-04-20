@@ -1,0 +1,233 @@
+Start testing: Apr 18 12:15 CST
+----------------------------------------------------------
+1/14 Testing: edr_agent_help
+1/14 Test: edr_agent_help
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/edr_agent" "--help"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"edr_agent_help" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+用法: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/edr_agent [--config <path>]
+  EDR Agent — 端点实现骨架，设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md
+<end of output>
+Test time =   0.62 sec
+----------------------------------------------------------
+Test Passed.
+"edr_agent_help" end time: Apr 18 12:15 CST
+"edr_agent_help" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/14 Testing: pmfe_scan_detail_format
+2/14 Test: pmfe_scan_detail_format
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_pmfe_detail"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"pmfe_scan_detail_format" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.33 sec
+----------------------------------------------------------
+Test Passed.
+"pmfe_scan_detail_format" end time: Apr 18 12:15 CST
+"pmfe_scan_detail_format" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/14 Testing: ave_file_fingerprint
+3/14 Test: ave_file_fingerprint
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_fp"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_file_fingerprint" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.37 sec
+----------------------------------------------------------
+Test Passed.
+"ave_file_fingerprint" end time: Apr 18 12:15 CST
+"ave_file_fingerprint" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/14 Testing: ave_infer_dry_run
+4/14 Test: ave_infer_dry_run
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_infer"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_infer_dry_run" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.34 sec
+----------------------------------------------------------
+Test Passed.
+"ave_infer_dry_run" end time: Apr 18 12:15 CST
+"ave_infer_dry_run" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/14 Testing: ave_phase1_contract
+5/14 Test: ave_phase1_contract
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_phase1"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_phase1_contract" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+[ave] infer 未实现（可设 EDR_AVE_INFER_DRY_RUN=1 联调；生产请 CMake -DEDR_WITH_ONNXRUNTIME=ON 并安装 ONNX Runtime）
+<end of output>
+Test time =   0.41 sec
+----------------------------------------------------------
+Test Passed.
+"ave_phase1_contract" end time: Apr 18 12:15 CST
+"ave_phase1_contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/14 Testing: ave_static_features_lite512
+6/14 Test: ave_static_features_lite512
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_static_features"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_static_features_lite512" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.33 sec
+----------------------------------------------------------
+Test Passed.
+"ave_static_features_lite512" end time: Apr 18 12:15 CST
+"ave_static_features_lite512" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/14 Testing: ave_sdk_smoke
+7/14 Test: ave_sdk_smoke
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_sdk"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_sdk_smoke" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+[ave] model_dir=. 模型扩展名命中=0 非目录文件=19 sensitivity=MEDIUM threads=2
+AVE_GetVersion: 2.5.0
+<end of output>
+Test time =   0.34 sec
+----------------------------------------------------------
+Test Passed.
+"ave_sdk_smoke" end time: Apr 18 12:15 CST
+"ave_sdk_smoke" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/14 Testing: ave_fl_abi_c0
+8/14 Test: ave_fl_abi_c0
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_fl_abi"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_fl_abi_c0" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+[ave] model_dir=. 模型扩展名命中=0 非目录文件=19 sensitivity=MEDIUM threads=1
+<end of output>
+Test time =   0.34 sec
+----------------------------------------------------------
+Test Passed.
+"ave_fl_abi_c0" end time: Apr 18 12:15 CST
+"ave_fl_abi_c0" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/14 Testing: ave_suppression_sqlite
+9/14 Test: ave_suppression_sqlite
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_suppression"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_suppression_sqlite" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+test_ave_suppression: ok
+<end of output>
+Test time =   0.37 sec
+----------------------------------------------------------
+Test Passed.
+"ave_suppression_sqlite" end time: Apr 18 12:15 CST
+"ave_suppression_sqlite" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/14 Testing: ave_scan_pipeline
+10/14 Test: ave_scan_pipeline
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_ave_pipeline"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"ave_scan_pipeline" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+[ave] model_dir=. 模型扩展名命中=0 非目录文件=19 sensitivity=MEDIUM threads=2
+test_ave_pipeline: ok
+<end of output>
+Test time =   0.35 sec
+----------------------------------------------------------
+Test Passed.
+"ave_scan_pipeline" end time: Apr 18 12:15 CST
+"ave_scan_pipeline" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/14 Testing: config_fingerprint
+11/14 Test: config_fingerprint
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_config_fp"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"config_fingerprint" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.35 sec
+----------------------------------------------------------
+Test Passed.
+"config_fingerprint" end time: Apr 18 12:15 CST
+"config_fingerprint" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/14 Testing: fl_trainer_c1
+12/14 Test: fl_trainer_c1
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_fl_trainer_smoke"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"fl_trainer_c1" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.55 sec
+----------------------------------------------------------
+Test Passed.
+"fl_trainer_c1" end time: Apr 18 12:15 CST
+"fl_trainer_c1" time elapsed: 00:00:00
+----------------------------------------------------------
+
+13/14 Testing: shellcode_modules
+13/14 Test: shellcode_modules
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/test_shellcode"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"shellcode_modules" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.35 sec
+----------------------------------------------------------
+Test Passed.
+"shellcode_modules" end time: Apr 18 12:15 CST
+"shellcode_modules" time elapsed: 00:00:00
+----------------------------------------------------------
+
+14/14 Testing: edr_agent_smoke
+14/14 Test: edr_agent_smoke
+Command: "/bin/bash" "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/scripts/agent_smoke.sh" "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl/edr_agent"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_ssl
+"edr_agent_smoke" start time: Apr 18 12:15 CST
+Output:
+----------------------------------------------------------
+[self_protect] 已启用（SIGTERM/SIGINT 审计）
+[ave] model_dir=/opt/edr/models 模型扩展名命中=0 非目录文件=0 sensitivity=MEDIUM threads=2
+[pmfe] init workers=2 queue=64 (listen_table: 60s + deferred; Windows/Linux)
+[transport] gRPC target: 127.0.0.1:50051
+[self_protect] 收到信号 2（审计）
+[preprocess] wire_events=0 wire_bytes=0 batches=0 batch_bytes=0 batch_lz4=0 batch_timeout_flushes=0 bus_hw80=0 bus_dropped=0 dedup_drops=0 rate_drops=0 queue_pending=0
+[grpc] rpc_ok=0 rpc_fail=0
+[command] handled=0 unknown=0 rejected=0 exec_ok=0 exec_fail=0
+[resource] emergency=0
+[pmfe] submitted=0 completed=0 dropped=0
+[pmfe] shutdown submitted=0 completed=0 dropped=0
+<end of output>
+Test time =   1.01 sec
+----------------------------------------------------------
+Test Passed.
+"edr_agent_smoke" end time: Apr 18 12:15 CST
+"edr_agent_smoke" time elapsed: 00:00:01
+----------------------------------------------------------
+
+End testing: Apr 18 12:15 CST

@@ -1,0 +1,1 @@
+/Library/Developer/CommandLineTools/usr/bin/cc  -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_fl_trainer_smoke.dir/tests/test_fl_trainer_smoke.c.o CMakeFiles/test_fl_trainer_smoke.dir/src/fl_trainer/fl_trainer.c.o -o test_fl_trainer_smoke  -lm

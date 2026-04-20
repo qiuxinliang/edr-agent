@@ -1,0 +1,96 @@
+// 联邦学习 gRPC — 与平台 FLService 对齐（Unary 上传为 Agent 首版；流式见设计 §3.1.3 可演进）。
+syntax = "proto3";
+
+package edr.v1;
+
+message FLRoundRequest {
+  string endpoint_id = 1;
+  /** 默认为 "default"；与 fl_rounds.tenant_id 对齐 */
+  string tenant_id = 2;
+  /** 为 0 时表示取该 tenant 最新一条 announced round */
+  uint64 round_id = 3;
+}
+
+message FLRoundInfo {
+  string round_id = 1;
+  string model_target = 2;
+  string base_model_version = 3;
+  bytes server_pubkey = 4;
+  int64 announce_ts = 5;
+  int64 deadline_ts = 6;
+  int32 min_clients = 7;
+  float dp_epsilon = 8;
+  float dp_clip_norm = 9;
+  int32 local_epochs = 10;
+  bool round_active = 11;
+  string tenant_scope = 12;
+  /** 与 fl_rounds.status 对齐，如 announced、cancelled */
+  string round_status = 13;
+}
+
+message ReportClientStatusRequest {
+  string tenant_id = 1;
+  uint64 round_id = 2;
+  string endpoint_id = 3;
+  string phase = 4;
+  string detail_json = 5;
+}
+
+message ReportClientStatusResponse {
+  bool accepted = 1;
+}
+
+message UploadGradientsRequest {
+  string endpoint_id = 1;
+  uint64 round_id = 2;
+  bytes sealed_gradient = 3;
+  string tenant_id = 4;
+  /** 非空表示分块上传：`sealed_gradient` 仅为第 `chunk_index` 片（0 起始），共 `chunk_count` 片 */
+  string gradient_upload_id = 5;
+  uint32 chunk_index = 6;
+  uint32 chunk_count = 7;
+  /** 本地上传样本数，用于样本加权 FedAvg；<=0 时按 1 处理 */
+  uint64 sample_count = 8;
+}
+
+message UploadGradientsResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+/** 与 HTTP POST /v1/fl/round/announce 等价：upsert fl_rounds + 可选 Kafka RoundAnnounceV1 */
+message TriggerRoundRequest {
+  string tenant_id = 1;
+  uint64 round_id = 2;
+  string model_target = 3;
+  int32 min_clients = 4;
+  optional int64 deadline_ts_unix = 5;
+  string base_model_version = 6;
+  string tenant_scope = 7;
+  string server_pubkey_b64 = 8;
+}
+
+message TriggerRoundResponse {
+  bool ok = 1;
+  string message = 2;
+  bool db = 3;
+  bool kafka = 4;
+}
+
+message CancelRoundRequest {
+  string tenant_id = 1;
+  uint64 round_id = 2;
+}
+
+message CancelRoundResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+service FLService {
+  rpc GetRoundInfo(FLRoundRequest) returns (FLRoundInfo);
+  rpc UploadGradients(UploadGradientsRequest) returns (UploadGradientsResponse);
+  rpc ReportClientStatus(ReportClientStatusRequest) returns (ReportClientStatusResponse);
+  rpc TriggerRound(TriggerRoundRequest) returns (TriggerRoundResponse);
+  rpc CancelRound(CancelRoundRequest) returns (CancelRoundResponse);
+}

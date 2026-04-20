@@ -1,0 +1,17 @@
+fl_crypto_fl3 7 0.000987536
+edr_agent_help 6 0.0898946
+pmfe_scan_detail_format 6 0.000499396
+ave_file_fingerprint 6 0.000441924
+ave_infer_dry_run 6 0.000384278
+ave_phase1_contract 6 0.000451403
+ave_static_features_lite512 6 0.000555354
+ave_sdk_smoke 6 0.000595674
+ave_fl_abi_c0 7 0.00212442
+ave_suppression_sqlite 6 0.0011291
+ave_scan_pipeline 6 0.000985792
+config_fingerprint 6 0.000512889
+fl_trainer_c1 7 0.000782482
+shellcode_modules 6 0.00045682
+edr_agent_smoke 6 0.16932
+fl_pb_gradient_chunk 1 0.363181
+---
