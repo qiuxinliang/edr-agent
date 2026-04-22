@@ -51,6 +51,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_install_wizard_enroll.ps1"" ""{tmp}\edr_wizard_enroll.json"" ""{app}\agent.toml"""; StatusMsg: "Registering with platform..."; Flags: waituntilterminated; Check: EnrollParamsFileExists
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start EDR Agent now (runs in background until stopped)"; Flags: postinstall nowait skipifsilent; Check: AgentTomlExistsForRun
 
 [Code]
 var
@@ -143,4 +144,9 @@ end;
 function EnrollParamsFileExists: Boolean;
 begin
   Result := FileExists(ExpandConstant('{tmp}\edr_wizard_enroll.json'));
+end;
+
+function AgentTomlExistsForRun: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\agent.toml'));
 end;

@@ -9,7 +9,7 @@
     EDR_ENROLL_TOKEN  注册 Token
 
   可选：
-    EDR_OUTPUT              输出路径，默认当前目录 agent.toml
+    EDR_OUTPUT              输出路径，默认当前目录下的 agent.toml（相对路径相对「执行脚本时的当前目录」）
     EDR_AGENT_VERSION       默认 0.3.0
     EDR_OVERRIDE_SERVER_ADDR
     EDR_INSECURE_TLS=1      [System.Net.ServicePointManager]::ServerCertificateValidationCallback（仅调试）
@@ -17,7 +17,7 @@
 .EXAMPLE
   $env:EDR_API_BASE="http://127.0.0.1:8080"
   $env:EDR_ENROLL_TOKEN="xxxxxxxx"
-  .\edr_agent_install.ps1 -Output "C:\ProgramData\EDR\agent.toml"
+  .\edr_agent_install.ps1 -Output "C:\Program Files\EDR Agent\agent.toml"
 #>
 param(
   [string]$Output = $(if ($env:EDR_OUTPUT) { $env:EDR_OUTPUT } else { "agent.toml" }),

@@ -2,7 +2,7 @@
 <#
   由 EDRAgentSetup.iss 的 [Run] 调用：读取向导写入的 JSON，调用同目录 edr_agent_install.ps1 完成 enroll。
   参数 1：JSON 路径（含 api_base、token、insecure_tls）
-  参数 2：输出的 agent.toml 绝对路径
+  参数 2：输出的 agent.toml 绝对路径（安装器传 {app}\agent.toml，与 edr_agent.exe 同目录）
 #>
 param(
   [Parameter(Mandatory = $true)][string]$ParamsFile,
