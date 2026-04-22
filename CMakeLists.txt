@@ -403,9 +403,13 @@ endif()
 
 if(MSVC)
   target_compile_options(edr_agent PRIVATE /W4 /WX-)
-  # MSVC 默认 C 模式无 stdatomic；/std:c17 启用 C11 原子与 vcruntime_c11_stdatomic.h
+  # MSVC：C11 stdatomic 需 /std:c11+ 且显式 /experimental:c11atomics，否则 vcruntime_c11_stdatomic.h 报
+  # "C atomic support is not enabled"（见 VS 17.5+ C11 atomics 文档）
   target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c17>)
-  target_compile_definitions(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>)
+  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+  target_compile_definitions(edr_agent PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>
+    $<$<COMPILE_LANGUAGE:C>:_CRT_NONSTDC_NO_WARNINGS>)
 else()
   target_compile_options(edr_agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
