@@ -161,7 +161,12 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   fclose(cf);
 
   char cmd[700];
+#ifdef _WIN32
+  /* cmd.exe 不剥单引号；curl 会收到字面量 'C:\...' 导致 rc=26。用双引号包裹配置路径。 */
+  snprintf(cmd, sizeof(cmd), "curl -fsS --config \"%s\"", cfgpath);
+#else
   snprintf(cmd, sizeof(cmd), "curl -fsS --config '%s'", cfgpath);
+#endif
   int rc = system(cmd);
   (void)remove(jsonpath);
   (void)remove(cfgpath);

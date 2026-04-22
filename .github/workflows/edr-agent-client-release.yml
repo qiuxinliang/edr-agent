@@ -35,6 +35,8 @@ on:
 
 permissions:
   contents: write
+  # vcpkg x-gha binary cache (run-vcpkg + CMake manifest install) needs Actions cache API env on later steps.
+  actions: write
 
 concurrency:
   group: edr-agent-release-${{ github.ref }}

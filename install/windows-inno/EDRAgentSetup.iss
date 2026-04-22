@@ -174,7 +174,7 @@ begin
   EnrollPage := CreateInputQueryPage(wpWelcome,
     'Platform enrollment',
     'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.',
-    'Leave both fields empty to skip: you can run edr_agent_install.ps1 from the install folder later, or edit agent.toml.example.');
+    'When both fields are filled, the installer calls POST /api/v1/enroll and writes a complete agent.toml next to edr_agent.exe (bundled template + your server/tenant/endpoint). Leave both empty to skip and start from a copy of agent.toml.example instead.');
   EnrollPage.Add('Platform API base URL (example: https://platform.example:8080):', False);
   EnrollPage.Add('Enrollment token:', False);
   if EdrHasCmdlineEnroll then
