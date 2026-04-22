@@ -4,7 +4,7 @@
 # 触发（push tag）：
 #   - 标签形如 win_主版本.次版本.修订号（例 win_1.0.1）→ 仅构建并发布 **Windows** 产物。
 #   - 标签形如 linux_主版本.次版本.修订号（例 linux_1.0.1）→ 仅构建并发布 **Linux** 产物。
-#   说明：glob 用 win_*.*.* / linux_*.*.* 过滤；各 job 再用 matches() 校验三位数字版本，避免 win_beta 等误触发。
+#   说明：glob 用 win_*.*.* / linux_*.*.* 过滤；job 的 if 仅用 startsWith（兼容无 matches() 的旧 GHE）；semver 精确校验在构建 job 首步 bash。
 #   workflow_dispatch → 仅构建并保留 Artifact（不创建 GitHub Release，便于验证 Actions）。
 # Windows Artifact：zip（便携）+ EDRAgentSetup-<tag>.exe（Inno 图形安装）；Linux：zip 内含 install.sh。
 # 说明：只 push 分支、不打符合规则的 tag 时，本 workflow 不会出现任何 run，属正常现象。
@@ -19,7 +19,7 @@ name: edr-agent client release
 on:
   push:
     tags:
-      # 至少含两段点分，与「主.次.修订」命名一致；精确校验在下方 if / matches()
+      # 至少含两段点分，与「主.次.修订」命名一致；精确校验在构建 job 的 bash 步骤
       - 'win_*.*.*'
       - 'linux_*.*.*'
   workflow_dispatch:
@@ -55,12 +55,23 @@ jobs:
   # ---------- Windows ----------
   windows-build:
     name: Build Windows (edr_agent.exe)
-    # push tag：仅 win_主.次.修订（数字）；允许 win_1.0.0-rc1 等后缀
-    if: ${{ (github.event_name == 'push' && matches(github.ref_name, '^win_[0-9]+\.[0-9]+\.[0-9]+($|[-+].*)$')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
+    # push tag：on.push.tags 已限制 win_*.*.*；startsWith 兼容无 matches() 的 Actions/GHE 版本
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Validate release tag (semver)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
+            echo "::error::Invalid tag '${ref}'. Expected win_M.m.p with optional suffix (e.g. win_1.0.1, win_1.0.0-rc1)"
+            exit 1
+          fi
 
       - name: Configure (Release, no gRPC)
         # 精简仓库可无 tests/；仅跑 edr_agent --help（见 EDR_BUILD_TESTS=OFF）
@@ -109,7 +120,7 @@ jobs:
 
   windows-release:
     name: Publish Windows Release
-    if: ${{ github.event_name == 'push' && matches(github.ref_name, '^win_[0-9]+\.[0-9]+\.[0-9]+($|[-+].*)$') }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
     needs: windows-build
     runs-on: ubuntu-latest
     steps:
@@ -138,11 +149,21 @@ jobs:
   # ---------- Linux ----------
   linux-build:
     name: Build Linux (edr_agent)
-    if: ${{ (github.event_name == 'push' && matches(github.ref_name, '^linux_[0-9]+\.[0-9]+\.[0-9]+($|[-+].*)$')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'linux') }}
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'linux_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'linux') }}
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Validate release tag (semver)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          if [[ ! "${ref}" =~ ^linux_[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
+            echo "::error::Invalid tag '${ref}'. Expected linux_M.m.p with optional suffix (e.g. linux_1.0.1)"
+            exit 1
+          fi
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyara-dev zip
@@ -183,7 +204,7 @@ jobs:
 
   linux-release:
     name: Publish Linux Release
-    if: ${{ github.event_name == 'push' && matches(github.ref_name, '^linux_[0-9]+\.[0-9]+\.[0-9]+($|[-+].*)$') }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'linux_') }}
     needs: linux-build
     runs-on: ubuntu-latest
     steps:
