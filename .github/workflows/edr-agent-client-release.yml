@@ -6,6 +6,7 @@
 #   - 标签形如 linux_主版本.次版本.修订号（例 linux_1.0.1）→ 仅构建并发布 **Linux** 产物。
 #   说明：glob 用 win_*.*.* / linux_*.*.* 过滤；各 job 再用 matches() 校验三位数字版本，避免 win_beta 等误触发。
 #   workflow_dispatch → 仅构建并保留 Artifact（不创建 GitHub Release，便于验证 Actions）。
+# Windows Artifact：zip（便携）+ EDRAgentSetup-<tag>.exe（Inno 图形安装）；Linux：zip 内含 install.sh。
 # 说明：只 push 分支、不打符合规则的 tag 时，本 workflow 不会出现任何 run，属正常现象。
 #
 # 使用示例：
@@ -60,16 +61,37 @@ jobs:
         shell: bash
         run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Package zip
+      - name: Package zip (portable)
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64.zip"
           Compress-Archive -LiteralPath "build/Release/edr_agent.exe" -DestinationPath $zip -Force
 
+      - name: Install Inno Setup 6
+        run: choco install innosetup -y
+
+      - name: Build Windows installer (EDRAgentSetup.exe)
+        shell: pwsh
+        run: |
+          $ref = '${{ github.ref_name }}'
+          if ($ref -match '^win_(.+)$') { $v = $Matches[1] } else { $v = '0.0.${{ github.run_number }}' }
+          $iss = Join-Path $PWD "install\windows-inno\EDRAgentSetup.iss"
+          $agent = Join-Path $PWD "build\Release\edr_agent.exe"
+          if (-not (Test-Path $agent)) { throw "missing $agent" }
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          & $iscc "/DEDR_AGENT_EXE=$agent" "/DMyAppVersion=$v" $iss
+          $out = Join-Path $PWD "install\windows-inno\Output\EDRAgentSetup.exe"
+          if (-not (Test-Path $out)) { throw "installer output missing: $out" }
+          Copy-Item $out -Destination (Join-Path $PWD "EDRAgentSetup-$ref.exe") -Force
+
       - uses: actions/upload-artifact@v7
         with:
           name: edr-agent-windows-${{ github.ref_name }}
-          path: edr-agent-${{ github.ref_name }}-windows-amd64.zip
+          path: |
+            edr-agent-${{ github.ref_name }}-windows-amd64.zip
+            EDRAgentSetup-${{ github.ref_name }}.exe
           retention-days: 14
           if-no-files-found: error
 
@@ -96,7 +118,9 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: edr-agent ${{ github.ref_name }} (Windows amd64)
           generate_release_notes: true
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.exe
           fail_on_unmatched_files: true
 
   # ---------- Linux ----------
@@ -120,10 +144,23 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      - name: Package zip
+      - name: Package zip (binary + install.sh 一键安装)
         run: |
           strip build/edr_agent 2>/dev/null || true
-          zip -9 -j "edr-agent-${{ github.ref_name }}-linux-amd64.zip" build/edr_agent
+          DIST="edr-agent-${{ github.ref_name }}-linux-amd64"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+          cp build/edr_agent "$DIST/"
+          cp agent.toml.example "$DIST/"
+          cp install/linux/install.sh "$DIST/"
+          chmod +x "$DIST/edr_agent" "$DIST/install.sh"
+          {
+            echo "解压后在本目录执行（需 root）："
+            echo "  sudo ./install.sh"
+            echo ""
+            echo "安装完成后用平台 Token 注册并写全 agent.toml，见 docs/AGENT_INSTALLER.md"
+          } >"$DIST/README-INSTALL.txt"
+          zip -9 -r "edr-agent-${{ github.ref_name }}-linux-amd64.zip" "$DIST"
 
       - uses: actions/upload-artifact@v7
         with:

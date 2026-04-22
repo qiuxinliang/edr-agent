@@ -56,7 +56,7 @@ cmake --build build
 ./build/edr_agent --config agent.toml.example
 ```
 
-**首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。
+**首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。从 **GitHub Release** 下载安装时，优先用 **`EDRAgentSetup-*.exe`（Windows）** 或 zip 内 **`install.sh`（Linux）**，见 **`docs/AGENT_INSTALLER.md`** 中「Release 一键安装」。
 
 **Windows 生产部署（服务账户、ETW/WinDivert 预检、`sc` 示例草案）**：见 **`docs/WINDOWS_DEPLOY.md`**（**AGT-006 已关闭**）；索引见 **`deploy/README.md`**。管理端 zip / MSI 流水线以 **edr-backend** 文档为准。
 
