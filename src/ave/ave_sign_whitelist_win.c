@@ -23,6 +23,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 #include <wintrust.h>
+#include <softpub.h>
 
 #ifdef EDR_HAVE_SQLITE
 #include <sqlite3.h>

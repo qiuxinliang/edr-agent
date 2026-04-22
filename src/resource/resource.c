@@ -20,6 +20,9 @@ static struct {
 #ifndef _WIN32
   struct timeval wall;
   struct rusage ru;
+#else
+  /* MSVC C 不允许零成员 struct；仅占位 */
+  unsigned char _unused;
 #endif
 } s_last;
 

@@ -12,10 +12,14 @@
 #endif
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #include <iphlpapi.h>
 #include <stdio.h>
-#include <winsock2.h>
-#include <windows.h>
 
 /** 在 ETW1 文本中查找 `key=value` 行（key 不含 '='） */
 static int etw1_line_value(const uint8_t *data, uint32_t len, const char *key, char *out, size_t out_cap) {

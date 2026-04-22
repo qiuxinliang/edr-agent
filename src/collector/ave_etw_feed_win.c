@@ -16,6 +16,7 @@
 
 #include "edr/ave_sdk.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 

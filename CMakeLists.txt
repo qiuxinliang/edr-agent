@@ -403,6 +403,9 @@ endif()
 
 if(MSVC)
   target_compile_options(edr_agent PRIVATE /W4 /WX-)
+  # MSVC 默认 C 模式无 stdatomic；/std:c17 启用 C11 原子与 vcruntime_c11_stdatomic.h
+  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c17>)
+  target_compile_definitions(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>)
 else()
   target_compile_options(edr_agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
