@@ -1,0 +1,142 @@
+# 本文件位于「仅含 edr-agent」的仓库根目录下的 .github/workflows/。
+# 按标签构建并发布到 GitHub Release。
+#
+# 触发：仅推送标签 win_*（Windows）或 linux_*（Linux 本机二进制）。
+# 权限：GITHUB_TOKEN + contents:write 创建 Release 并上传附件。
+#
+# 使用示例：
+#   git tag win_1.0.0 && git push origin win_1.0.0
+#   git tag linux_1.0.0 && git push origin linux_1.0.0
+
+name: edr-agent client release
+
+on:
+  push:
+    tags:
+      - 'win_*'
+      - 'linux_*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edr-agent-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- Windows ----------
+  windows-build:
+    name: Build Windows (edr_agent.exe)
+    if: startsWith(github.ref_name, 'win_')
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure (Release, no gRPC)
+        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64.zip"
+          Compress-Archive -LiteralPath "build/Release/edr_agent.exe" -DestinationPath $zip -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: edr-agent-windows-${{ github.ref_name }}
+          path: edr-agent-${{ github.ref_name }}-windows-amd64.zip
+          retention-days: 14
+          if-no-files-found: error
+
+  windows-release:
+    name: Publish Windows Release
+    if: startsWith(github.ref_name, 'win_')
+    needs: windows-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: edr-agent-windows-${{ github.ref_name }}
+          path: dist
+
+      - name: Verify artifact
+        run: ls -la dist/
+
+      - uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: edr-agent ${{ github.ref_name }} (Windows amd64)
+          generate_release_notes: true
+          files: dist/*.zip
+          fail_on_unmatched_files: true
+
+  # ---------- Linux ----------
+  linux-build:
+    name: Build Linux (edr_agent)
+    if: startsWith(github.ref_name, 'linux_')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyara-dev zip
+
+      - name: Configure (Release, no gRPC)
+        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_WITH_YARA=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package zip
+        run: |
+          strip build/edr_agent 2>/dev/null || true
+          zip -9 -j "edr-agent-${{ github.ref_name }}-linux-amd64.zip" build/edr_agent
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: edr-agent-linux-${{ github.ref_name }}
+          path: edr-agent-${{ github.ref_name }}-linux-amd64.zip
+          retention-days: 14
+          if-no-files-found: error
+
+  linux-release:
+    name: Publish Linux Release
+    if: startsWith(github.ref_name, 'linux_')
+    needs: linux-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: edr-agent-linux-${{ github.ref_name }}
+          path: dist
+
+      - name: Verify artifact
+        run: ls -la dist/
+
+      - uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: edr-agent ${{ github.ref_name }} (Linux amd64)
+          generate_release_notes: true
+          files: dist/*.zip
+          fail_on_unmatched_files: true
