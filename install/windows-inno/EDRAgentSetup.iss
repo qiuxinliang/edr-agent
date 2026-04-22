@@ -82,10 +82,10 @@ procedure InitializeWizard;
 begin
   EnrollPage := CreateInputQueryPage(wpWelcome,
     'Platform enrollment',
-    'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.' + Chr(13) + Chr(10) + Chr(13) + Chr(10) +
-    'Leave both fields empty to skip: you can run edr_agent_install.ps1 from the install folder later, or edit agent.toml.example.',
-    'Platform API base URL (example: https://platform.example:8080):',
-    'Enrollment token:');
+    'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.',
+    'Leave both fields empty to skip: you can run edr_agent_install.ps1 from the install folder later, or edit agent.toml.example.');
+  EnrollPage.Add('Platform API base URL (example: https://platform.example:8080):', False);
+  EnrollPage.Add('Enrollment token:', False);
   EnrollPage.Values[0] := '';
   EnrollPage.Values[1] := '';
 end;
