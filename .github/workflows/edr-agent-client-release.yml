@@ -88,7 +88,8 @@ jobs:
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64.zip"
-          Compress-Archive -LiteralPath "build/Release/edr_agent.exe" -DestinationPath $zip -Force
+          if (-not (Test-Path -LiteralPath "agent.toml.example")) { throw "missing agent.toml.example for portable zip" }
+          Compress-Archive -Path "build/Release/edr_agent.exe", "agent.toml.example" -DestinationPath $zip -Force
 
       - name: Install Inno Setup 6
         run: choco install innosetup -y

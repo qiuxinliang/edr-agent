@@ -38,12 +38,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "enrollinsecure"; Description: "Skip TLS certificate verification during enrollment (self-signed / lab only)"; GroupDescription: "Enrollment:"; Flags: unchecked
+Name: "windowsautorun"; Description: "Run at startup (scheduled task as SYSTEM, survives reboot)"; GroupDescription: "Runtime:"; Flags: checkedonce
+Name: "hardeninstalldir"; Description: "Restrict install folder to SYSTEM + Administrators (use Add/Remove Programs to uninstall)"; GroupDescription: "Runtime:"; Flags: unchecked
 
 [Files]
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""
@@ -51,7 +54,12 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_install_wizard_enroll.ps1"" ""{tmp}\edr_wizard_enroll.json"" ""{app}\agent.toml"""; StatusMsg: "Registering with platform..."; Flags: waituntilterminated; Check: EnrollParamsFileExists
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start EDR Agent now (runs in background until stopped)"; Flags: postinstall nowait skipifsilent; Check: AgentTomlExistsForRun
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""if ((-not (Test-Path -LiteralPath '{app}\agent.toml')) -and (Test-Path -LiteralPath '{app}\agent.toml.example')) {{ Copy-Item -LiteralPath '{app}\agent.toml.example' -Destination '{app}\agent.toml' -Force }}"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start EDR Agent now (console window; skip if startup task is enabled)"; Flags: postinstall nowait skipifsilent; Check: ShouldPostinstallStartExe
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:AutorunInstallPsParameters}"; StatusMsg: "Configuring startup task..."; Flags: waituntilterminated; Check: ShouldInstallAutorun
+
+[UninstallRun]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
 
 [Code]
 var
@@ -137,7 +145,10 @@ begin
     AppToml := ExpandConstant('{app}\agent.toml');
     ExToml := ExpandConstant('{app}\agent.toml.example');
     if (not FileExists(AppToml)) and FileExists(ExToml) then
-      FileCopy(ExToml, AppToml, False);
+    begin
+      if not FileCopy(ExToml, AppToml, False) then
+        Log('CurStepChanged: FileCopy agent.toml.example -> agent.toml failed');
+    end;
   end;
 end;
 
@@ -149,4 +160,26 @@ end;
 function AgentTomlExistsForRun: Boolean;
 begin
   Result := FileExists(ExpandConstant('{app}\agent.toml'));
+end;
+
+function ShouldPostinstallStartExe: Boolean;
+begin
+  Result := AgentTomlExistsForRun and (not WizardIsTaskSelected('windowsautorun'));
+end;
+
+function ShouldInstallAutorun: Boolean;
+begin
+  Result := WizardIsTaskSelected('windowsautorun') and AgentTomlExistsForRun;
+end;
+
+function AutorunInstallPsParameters(Param: string): string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_windows_autorun.ps1') + '" -Action Install';
+  if WizardIsTaskSelected('hardeninstalldir') then
+    Result := Result + ' -HardenAcl';
+end;
+
+function AutorunScriptPresentForUninstall: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
 end;

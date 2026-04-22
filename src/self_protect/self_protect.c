@@ -167,7 +167,11 @@ void edr_self_protect_init(void) {
   (void)sigaction(SIGINT, &sa, NULL);
 #endif
   s_active = 1;
+#ifdef _WIN32
+  fprintf(stderr, "[self_protect] enabled (audit)\n");
+#else
   fprintf(stderr, "[self_protect] 已启用（SIGTERM/SIGINT 审计）\n");
+#endif
 }
 
 void edr_self_protect_shutdown(void) {

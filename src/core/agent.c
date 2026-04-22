@@ -150,8 +150,10 @@ EdrError edr_agent_run(EdrAgent *agent) {
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
       if (e != EDR_OK) {
-        edr_preprocess_stop();
-        return e;
+        fprintf(stderr,
+                "[agent] edr_collector_start failed (%d); staying up without live ETW (run as admin for "
+                "ETW, or set [collection] etw_enabled=false in agent.toml).\n",
+                (int)e);
       }
       if (agent->cfg.attack_surface.enabled && agent->cfg.agent.endpoint_id[0] &&
           strcmp(agent->cfg.agent.endpoint_id, "auto") != 0) {

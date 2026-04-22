@@ -1738,6 +1738,10 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 #ifdef _WIN32
     edr_win_listen_apply_config(cfg);
 #endif
+    fprintf(stderr,
+            "[config] no TOML file (--config not set); using built-in defaults (server.address=%s). "
+            "Install: use --config with agent.toml next to edr_agent.exe.\n",
+            cfg->server.address);
     return EDR_OK;
   }
 
