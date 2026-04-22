@@ -58,12 +58,13 @@ var
 
 function JsonEscape(const S: string): string;
 var
-  Q, B: string;
+  Q, B, EscBB, EscBQ: string;
 begin
-  { Do not use '\"' inside single-quoted literals here; compiler reports Variable Expected. }
   B := Chr(92);
   Q := Chr(34);
-  Result := Q + StringChange(StringChange(S, B, B + B), Q, B + Q) + Q;
+  EscBB := Concat(B, B);
+  EscBQ := Concat(B, Q);
+  Result := Concat(Concat(Q, StringChange(StringChange(S, B, EscBB), Q, EscBQ)), Q);
 end;
 
 procedure InitializeWizard;
@@ -111,11 +112,12 @@ begin
   if (U <> '') and (T <> '') then
   begin
     Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
-    Json := '{' + '"api_base":' + JsonEscape(U) + ',' + '"token":' + JsonEscape(T) + ',' + '"insecure_tls":';
+    Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) +
+      ':' + JsonEscape(T) + ',' + Chr(34) + 'insecure_tls' + Chr(34) + ':';
     if WizardIsTaskSelected('enrollinsecure') then
-      Json := Json + 'true}'
+      Json := Json + 'true' + Chr(125)
     else
-      Json := Json + 'false}';
+      Json := Json + 'false' + Chr(125);
     SaveStringToFile(Path, Json, False, True);
   end
   else
