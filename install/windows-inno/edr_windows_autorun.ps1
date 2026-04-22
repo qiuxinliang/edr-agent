@@ -39,8 +39,8 @@ function Reset-InstallDirAcl {
 function Set-InstallDirAclHarden {
   param([string]$Dir)
   if (-not (Test-Path -LiteralPath $Dir)) { return }
-  # SID：SYSTEM、Administrators（避免非英文系统上组名本地化问题）
-  & icacls.exe $Dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
+  # SID：SYSTEM / Administrators 完全控制；Users 仅读取+执行（否则普通用户无法运行 edr_agent.exe 或读 agent.toml，会报「拒绝访问」）
+  & icacls.exe $Dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
 }
 
 if ($Action -eq "Remove") {

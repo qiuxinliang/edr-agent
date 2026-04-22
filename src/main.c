@@ -77,19 +77,47 @@ static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
 }
 #endif
 
-static void print_usage(const char *argv0) {
-  fprintf(stderr, "用法: %s [--config <path>]\n", argv0);
+static void print_usage(const char *prog) {
+  const char *name = (prog && prog[0]) ? prog : "edr_agent";
   fprintf(stderr,
-          "  Windows: 若未指定 --config 且与 exe 同目录存在 agent.toml，将自动加载该文件。\n"
-          "  EDR Agent — 端点实现（初版：采集/预处理/批次/gRPC/指令/AVE 等已接通，见 README「实现状态快照」；"
-          "设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md）\n");
+          "%s — EDR 端点 Agent\n"
+          "\n"
+          "用法:\n"
+          "  %s [--config <path>]\n"
+          "  不带任何参数时显示本说明并退出。\n"
+          "\n"
+          "选项:\n"
+          "  --config <path>   加载 agent.toml（推荐始终显式指定）\n"
+          "  -h, --help, -help, /?   显示本说明并退出\n"
+          "\n",
+          name, name);
+#ifdef _WIN32
+  fprintf(stderr,
+          "说明 (Windows):\n"
+          "  安装包生成的计划任务与快捷方式会附带 --config 指向安装目录下的 agent.toml。\n"
+          "  便携 zip 解压后请运行: %s --config .\\agent.toml\n"
+          "\n"
+          "Inno 安装包 EDRAgentSetup.exe（与本程序不同）静默安装并注册时，可在安装包命令行传入\n"
+          "（须同时指定 API 与 Token，或两者均省略；Token 会出现在安装进程命令行）：\n"
+          "  /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\n"
+          "  /EDR_API_BASE=<平台 REST 根 URL>  /EDR_ENROLL_TOKEN=<注册 Token>\n"
+          "  短参数: /API= /TOK= ；跳过 TLS 校验: /EDR_INSECURE_TLS=1 或 /TLS=1（或 /MERGETASKS=enrollinsecure）\n"
+          "  完整参数与安全提示见仓库内 docs/AGENT_INSTALLER.md（Release 一键安装 · Windows）。\n"
+          "\n",
+          name);
+#endif
+  fprintf(stderr,
+          "更多: README「实现状态快照」与仓库内设计文档。\n");
 }
 
 int main(int argc, char **argv) {
   const char *config = NULL;
+  const char *prog = (argc > 0 && argv[0]) ? argv[0] : "edr_agent";
+
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      print_usage(argv[0]);
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0 ||
+        strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "/?") == 0) {
+      print_usage(prog);
       return 0;
     }
     if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -97,8 +125,13 @@ int main(int argc, char **argv) {
       continue;
     }
     fprintf(stderr, "未知参数: %s\n", argv[i]);
-    print_usage(argv[0]);
+    print_usage(prog);
     return 1;
+  }
+
+  if (argc < 2) {
+    print_usage(prog);
+    return 0;
   }
 
 #ifdef _WIN32

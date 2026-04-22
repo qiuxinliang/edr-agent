@@ -2,6 +2,12 @@
 ; 平台 setup_exe 默认对象键：installers/setup-exe/<os_type>/<agent_version>/EDRAgentSetup.exe
 ; 本地编译示例（在 edr-agent 仓库根）：
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DEDR_AGENT_EXE=build\Release\edr_agent.exe /DMyAppVersion=1.0.1 install\windows-inno\EDRAgentSetup.iss
+;
+; 静默 + 命令行注册（与向导页二选一；Token 会出现在进程命令行，见 docs/AGENT_INSTALLER.md）：
+;   长参数：/EDR_API_BASE=... /EDR_ENROLL_TOKEN=...  可选 /EDR_INSECURE_TLS=1
+;   短参数：/API=... /TOK=...  可选 /TLS=1（与长参数等价；长参数优先）
+;   示例：... /VERYSILENT /API=https://host:8080 /TOK=your-token
+;   /MERGETASKS=enrollinsecure 与 /TLS=1 同类效果
 
 #define MyAppName "EDR Agent"
 #define MyAppPublisher "EDR"
@@ -39,7 +45,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "enrollinsecure"; Description: "Skip TLS certificate verification during enrollment (self-signed / lab only)"; GroupDescription: "Enrollment:"; Flags: unchecked
 Name: "windowsautorun"; Description: "Run at startup (scheduled task as SYSTEM, survives reboot)"; GroupDescription: "Runtime:"; Flags: checkedonce
-Name: "hardeninstalldir"; Description: "Restrict install folder to SYSTEM + Administrators (use Add/Remove Programs to uninstall)"; GroupDescription: "Runtime:"; Flags: unchecked
+Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin full, Users read+execute; use Add/Remove Programs to uninstall)"; GroupDescription: "Runtime:"; Flags: unchecked
 
 [Files]
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
@@ -64,6 +70,77 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 [Code]
 var
   EnrollPage: TInputQueryWizardPage;
+  EdrCmdApiBase: string;
+  EdrCmdToken: string;
+  EdrCmdInsecureTls: Boolean;
+
+function EdrCmdLineParamValue(const Flag: string): string;
+var
+  I, EqPos: Integer;
+  S, Prefix: string;
+begin
+  Result := '';
+  Prefix := UpperCase(Flag);
+  for I := 1 to ParamCount do
+  begin
+    S := ParamStr(I);
+    if UpperCase(Copy(S, 1, Length(Prefix))) <> Prefix then
+      Continue;
+    EqPos := Pos('=', S);
+    if EqPos < 2 then
+      Continue;
+    Result := Copy(S, EqPos + 1, MaxInt);
+    Result := Trim(Result);
+    if (Length(Result) >= 2) and (Result[1] = '"') and (Result[Length(Result)] = '"') then
+      Result := Copy(Result, 2, Length(Result) - 2);
+    Exit;
+  end;
+end;
+
+function EdrParseTruthyParam(const LongFlag, ShortFlag: string): Boolean;
+var
+  V: string;
+begin
+  V := UpperCase(Trim(EdrCmdLineParamValue(LongFlag)));
+  if V = '' then
+    V := UpperCase(Trim(EdrCmdLineParamValue(ShortFlag)));
+  Result := (V = '1') or (V = 'TRUE') or (V = 'YES');
+end;
+
+procedure EdrLoadCmdlineEnroll;
+begin
+  EdrCmdApiBase := Trim(EdrCmdLineParamValue('/EDR_API_BASE'));
+  if EdrCmdApiBase = '' then
+    EdrCmdApiBase := Trim(EdrCmdLineParamValue('/API'));
+  EdrCmdToken := Trim(EdrCmdLineParamValue('/EDR_ENROLL_TOKEN'));
+  if EdrCmdToken = '' then
+    EdrCmdToken := Trim(EdrCmdLineParamValue('/TOK'));
+  EdrCmdInsecureTls := EdrParseTruthyParam('/EDR_INSECURE_TLS', '/TLS');
+end;
+
+function EdrHasCmdlineEnroll: Boolean;
+begin
+  Result := (EdrCmdApiBase <> '') and (EdrCmdToken <> '');
+end;
+
+function InitializeSetup(): Boolean;
+var
+  A, T: string;
+begin
+  EdrCmdApiBase := '';
+  EdrCmdToken := '';
+  EdrCmdInsecureTls := False;
+  EdrLoadCmdlineEnroll;
+  A := EdrCmdApiBase;
+  T := EdrCmdToken;
+  if ((A <> '') and (T = '')) or ((A = '') and (T <> '')) then
+  begin
+    MsgBox('EDR: provide both API base and enroll token (/EDR_API_BASE= + /EDR_ENROLL_TOKEN= or /API= + /TOK=), or omit both.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  Result := True;
+end;
 
 function JsonEscape(const S: string): string;
 var
@@ -95,13 +172,21 @@ begin
     'Leave both fields empty to skip: you can run edr_agent_install.ps1 from the install folder later, or edit agent.toml.example.');
   EnrollPage.Add('Platform API base URL (example: https://platform.example:8080):', False);
   EnrollPage.Add('Enrollment token:', False);
-  EnrollPage.Values[0] := '';
-  EnrollPage.Values[1] := '';
+  if EdrHasCmdlineEnroll then
+  begin
+    EnrollPage.Values[0] := EdrCmdApiBase;
+    EnrollPage.Values[1] := EdrCmdToken;
+  end
+  else
+  begin
+    EnrollPage.Values[0] := '';
+    EnrollPage.Values[1] := '';
+  end;
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = EnrollPage.ID) and WizardSilent;
+  Result := (PageID = EnrollPage.ID) and (WizardSilent or EdrHasCmdlineEnroll);
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -124,17 +209,27 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Path, U, T, Json, AppToml, ExToml: string;
+  Insecure: Boolean;
 begin
   if CurStep <> ssPostInstall then
     Exit;
-  U := Trim(EnrollPage.Values[0]);
-  T := Trim(EnrollPage.Values[1]);
+  if EdrHasCmdlineEnroll then
+  begin
+    U := EdrCmdApiBase;
+    T := EdrCmdToken;
+  end
+  else
+  begin
+    U := Trim(EnrollPage.Values[0]);
+    T := Trim(EnrollPage.Values[1]);
+  end;
   if (U <> '') and (T <> '') then
   begin
     Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
     Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) + ':' + JsonEscape(T) + ',' +
       Chr(34) + 'insecure_tls' + Chr(34) + ':';
-    if WizardIsTaskSelected('enrollinsecure') then
+    Insecure := EdrCmdInsecureTls or WizardIsTaskSelected('enrollinsecure');
+    if Insecure then
       Json := Json + 'true' + Chr(125)
     else
       Json := Json + 'false' + Chr(125);

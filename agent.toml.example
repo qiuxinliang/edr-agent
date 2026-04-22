@@ -72,7 +72,8 @@ rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
 # 将 model_dir 设为该目录的绝对路径即可，例如（按本机路径与 release 名修改）：
 #   macOS/Linux:  /…/AI Agent/model/releases/20260418_053704_UTC
 #   Windows:      C:/…/AI Agent/model/releases/20260418_053704_UTC
-# Linux/macOS 常用示例路径；Windows 示例：model_dir = "C:\\ProgramData\\EDR\\models"（与内置默认一致）
+# Linux/macOS 常用示例路径。Windows：若保留本行 Unix 路径，Agent 会自动改为「与 edr_agent.exe 同目录下的 models」；
+# 也可显式写绝对路径（如独立数据盘）。内置默认在 Windows 上亦为 exe 同目录\models。
 model_dir            = "/opt/edr/models"
 scan_threads         = 2
 max_file_size_mb     = 256

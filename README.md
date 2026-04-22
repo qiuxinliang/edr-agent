@@ -120,8 +120,11 @@ cmake --build build
 
 | 参数 | 说明 |
 |------|------|
-| `--config <path>` | 加载 TOML 配置文件；未指定则仅使用 `edr_config_apply_defaults` 内置默认值。 |
-| `--help` / `-h` | 打印用法。 |
+| （无参数） | 打印用法说明后退出。 |
+| `--config <path>` | 加载 TOML 配置文件；启动 Agent 时须指定（或依赖安装包/计划任务已写入的带 `--config` 的启动方式）。 |
+| `--help` / `-h` / `-help` / `/?` | 打印用法说明后退出。 |
+
+`edr_agent` 在 Windows 上执行 **`--help`** 或**无参数**时，帮助文本中会顺带说明 **Inno 安装包 `EDRAgentSetup.exe` 静默安装**时如何通过 **`/EDR_API_BASE=`**、**`/EDR_ENROLL_TOKEN=`**（或 **`/API=`**、**`/TOK=`**）传入平台与注册信息；细则见 **`docs/AGENT_INSTALLER.md`**（Release 一键安装 · Windows）。
 
 解析器为 **tomlc99**（`third_party/tomlc99`）。参考模板：**`agent.toml.example`**，可复制为 `agent.toml` 后修改。与 **platform + 前端 + 种子库** 对齐的联调示例见 **`agent.integration.toml`** 与仓库 **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`**。**Windows 真机行为 ONNX 端到端验收**见 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**。
 

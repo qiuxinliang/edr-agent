@@ -1,7 +1,65 @@
 #include "edr/config.h"
 
 #ifdef _WIN32
+#include <wchar.h>
+#include <windows.h>
 #include "edr/listen_table_win.h"
+
+/** 与 Inno `DefaultDirName`（%ProgramFiles%\\EDR Agent）一致；ProgramData 下勿混用裸 `EDR`。 */
+#define EDR_WIN_FALLBACK_PROGRAMDATA_MODELS "C:\\ProgramData\\EDR Agent\\models"
+
+/** 将 model_dir 设为与当前 edr_agent.exe 同目录下的 `models`（UTF-8）。失败返回 0。 */
+static int edr_win_model_dir_next_to_exe(char *out_utf8, size_t out_cap) {
+  wchar_t wpath[MAX_PATH];
+  DWORD n = GetModuleFileNameW(NULL, wpath, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) {
+    return 0;
+  }
+  wchar_t *slash = wcsrchr(wpath, L'\\');
+  if (!slash) {
+    slash = wcsrchr(wpath, L'/');
+  }
+  if (!slash) {
+    return 0;
+  }
+  *slash = L'\0';
+  if (wcslen(wpath) + wcslen(L"\\models") + 1u >= (size_t)MAX_PATH) {
+    return 0;
+  }
+  wcscat(wpath, L"\\models");
+  if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out_utf8, (int)out_cap, NULL, NULL) <= 1) {
+    return 0;
+  }
+  return 1;
+}
+
+/** True if model_dir is the Linux example path (optional trailing slash / spaces). */
+static int edr_config_model_dir_is_unix_example(const char *md) {
+  if (!md) {
+    return 0;
+  }
+  while (*md == ' ' || *md == '\t') {
+    md++;
+  }
+  size_t n = strlen(md);
+  while (n > 0 && (md[n - 1] == ' ' || md[n - 1] == '\t' || md[n - 1] == '/')) {
+    n--;
+  }
+  if (n == strlen("/opt/edr/models") && strncmp(md, "/opt/edr/models", n) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+/** TOML 中仍为 Linux 示例路径时，在 Windows 上改为 exe 同目录\models。 */
+static void edr_config_win_fixup_model_dir_from_unix_example(EdrConfig *cfg) {
+  if (!edr_config_model_dir_is_unix_example(cfg->ave.model_dir)) {
+    return;
+  }
+  if (!edr_win_model_dir_next_to_exe(cfg->ave.model_dir, sizeof(cfg->ave.model_dir))) {
+    snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", EDR_WIN_FALLBACK_PROGRAMDATA_MODELS);
+  }
+}
 #endif
 
 #include "edr/emit_rules.h"
@@ -1264,8 +1322,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   apply_builtin_preprocess_rules(cfg);
 
 #ifdef _WIN32
-  /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
-  snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "C:\\ProgramData\\EDR\\models");
+  if (!edr_win_model_dir_next_to_exe(cfg->ave.model_dir, sizeof(cfg->ave.model_dir))) {
+    snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", EDR_WIN_FALLBACK_PROGRAMDATA_MODELS);
+  }
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
@@ -1860,6 +1919,9 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
   }
 
   toml_free(root);
+#ifdef _WIN32
+  edr_config_win_fixup_model_dir_from_unix_example(cfg);
+#endif
   edr_config_clamp(cfg);
 #ifdef _WIN32
   edr_win_listen_apply_config(cfg);

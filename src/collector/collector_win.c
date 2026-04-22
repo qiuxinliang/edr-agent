@@ -335,7 +335,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
 
   prop->Wnode.BufferSize = buffer_size;
-  prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+  /* Do not set WNODE_FLAG_TRACED_GUID without initializing Wnode.Guid; that yields StartTrace
+   * ERROR_INVALID_NAME (123). LoggerName at LoggerNameOffset identifies the session. */
   prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
   memcpy((BYTE *)prop + prop->LoggerNameOffset, g_session_name, name_bytes);
   prop->BufferSize = 64;
@@ -348,7 +349,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   ULONG status = StartTrace(&s_session_handle, NULL, prop);
   if (status != ERROR_SUCCESS) {
     fprintf(stderr,
-            "[collector_win] StartTrace failed winerr=%lu (session=%ls). Common: 183=stale session name, 5=access denied.\n",
+            "[collector_win] StartTrace failed winerr=%lu (session=%ls). Common: "
+            "123=invalid name/properties, 183=stale session name, 5=access denied.\n",
             (unsigned long)status, g_session_name);
     /* 上次进程未正常 StopTrace 时，内核仍占用同名实时会话，导致 ERROR_ALREADY_EXISTS。 */
     if (status == ERROR_ALREADY_EXISTS) {
