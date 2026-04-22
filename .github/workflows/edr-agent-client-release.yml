@@ -46,7 +46,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Configure (Release, no gRPC)
-        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release
+        # 精简仓库可无 tests/；仅跑 edr_agent --help（见 EDR_BUILD_TESTS=OFF）
+        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_BUILD_TESTS=OFF
 
       - name: Build
         run: cmake --build build --config Release --parallel 4
@@ -107,7 +108,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyara-dev zip
 
       - name: Configure (Release, no gRPC)
-        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_WITH_YARA=ON
+        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_WITH_YARA=ON -DEDR_BUILD_TESTS=OFF
 
       - name: Build
         run: cmake --build build -j "$(nproc)"

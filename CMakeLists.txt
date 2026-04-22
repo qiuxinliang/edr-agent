@@ -464,9 +464,21 @@ if(EDR_BUILD_AVE_SHARED_LIB)
   set_target_properties(edr_ave_shared PROPERTIES OUTPUT_NAME "edr_ave")
 endif()
 
+# 精简仓库未包含 tests/ 时默认关闭单元测试，避免 CMake 找不到 tests/*.c。
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ave_fp.c")
+  set(_EDR_DEFAULT_BUILD_TESTS ON)
+else()
+  set(_EDR_DEFAULT_BUILD_TESTS OFF)
+endif()
+option(EDR_BUILD_TESTS "Build CTest targets and tests/*.c executables (requires tests/ tree)" ${_EDR_DEFAULT_BUILD_TESTS})
+if(EDR_BUILD_TESTS AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ave_fp.c")
+  message(FATAL_ERROR "EDR_BUILD_TESTS=ON but tests/test_ave_fp.c is missing. Add tests/ or configure with -DEDR_BUILD_TESTS=OFF.")
+endif()
+
 enable_testing()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+if(EDR_BUILD_TESTS)
 add_executable(test_ave_fp tests/test_ave_fp.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
   src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
 target_include_directories(test_ave_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
@@ -1063,3 +1075,5 @@ endif()
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
+
+endif() # EDR_BUILD_TESTS
