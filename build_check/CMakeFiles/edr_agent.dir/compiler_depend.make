@@ -2635,6 +2635,7 @@ CMakeFiles/edr_agent.dir/src/core/agent.c.o: /Users/qiuxinliang/工程区/EDR\ D
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/error.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/event_bus.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/grpc_client.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/preprocess.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/resource.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/self_protect.h \
@@ -6259,9 +6260,9 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_ucontext.h:
 
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h:
-
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb_encode.h:
+
+/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_time_t.h:
 

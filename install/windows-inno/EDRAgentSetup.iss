@@ -49,6 +49,8 @@ Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin 
 
 [Files]
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
+; 终端联调工具（可选；CI 无 Release 产物时跳过）
+Source: "..\..\build\Release\edr_monitor.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; 与 edr_agent.exe 同目录，供 EDR_WITH_ONNXRUNTIME 链 ORT 的运行时加载（发布 CI 在 ISCC 前复制到 build\Release\）
 Source: "..\..\build\Release\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\build\Release\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

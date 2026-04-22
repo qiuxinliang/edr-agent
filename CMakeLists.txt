@@ -471,6 +471,22 @@ if(EDR_BUILD_AVE_SHARED_LIB)
   set_target_properties(edr_ave_shared PROPERTIES OUTPUT_NAME "edr_ave")
 endif()
 
+# 终端联调：读 agent.toml，按《EDR_端点详细设计》§1.2/§14 对通信 / AVE / 离线队列做黑盒探针（独立进程，不嵌入 Agent）。
+add_executable(edr_monitor tools/edr_monitor.c third_party/tomlc99/toml.c)
+target_include_directories(edr_monitor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99)
+if(MSVC)
+  target_compile_options(edr_monitor PRIVATE /W4 /WX- $<$<COMPILE_LANGUAGE:C>:/std:c17>)
+  target_compile_definitions(edr_monitor PRIVATE $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>)
+else()
+  target_compile_options(edr_monitor PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(WIN32)
+  target_compile_definitions(edr_monitor PRIVATE EDR_OS_WINDOWS=1)
+  target_link_libraries(edr_monitor PRIVATE ws2_32 winhttp)
+else()
+  target_compile_definitions(edr_monitor PRIVATE EDR_OS_POSIX=1)
+endif()
+
 # 精简仓库未包含 tests/ 时默认关闭单元测试，避免 CMake 找不到 tests/*.c。
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ave_fp.c")
   set(_EDR_DEFAULT_BUILD_TESTS ON)

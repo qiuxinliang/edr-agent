@@ -139,6 +139,19 @@ edr_agent/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/build
 .PHONY : edr_agent/fast
 
+#=============================================================================
+# Target rules for targets named edr_monitor
+
+# Build rule for target.
+edr_monitor: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 edr_monitor
+.PHONY : edr_monitor
+
+# fast build rule for target.
+edr_monitor/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/build
+.PHONY : edr_monitor/fast
+
 src/attack_surface/attack_surface_egress.o: src/attack_surface/attack_surface_egress.c.o
 .PHONY : src/attack_surface/attack_surface_egress.o
 
@@ -1561,6 +1574,7 @@ third_party/tomlc99/toml.o: third_party/tomlc99/toml.c.o
 # target to build an object file
 third_party/tomlc99/toml.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/third_party/tomlc99/toml.c.o
 .PHONY : third_party/tomlc99/toml.c.o
 
 third_party/tomlc99/toml.i: third_party/tomlc99/toml.c.i
@@ -1569,6 +1583,7 @@ third_party/tomlc99/toml.i: third_party/tomlc99/toml.c.i
 # target to preprocess a source file
 third_party/tomlc99/toml.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/third_party/tomlc99/toml.c.i
 .PHONY : third_party/tomlc99/toml.c.i
 
 third_party/tomlc99/toml.s: third_party/tomlc99/toml.c.s
@@ -1577,7 +1592,32 @@ third_party/tomlc99/toml.s: third_party/tomlc99/toml.c.s
 # target to generate assembly for a file
 third_party/tomlc99/toml.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/third_party/tomlc99/toml.c.s
 .PHONY : third_party/tomlc99/toml.c.s
+
+tools/edr_monitor.o: tools/edr_monitor.c.o
+.PHONY : tools/edr_monitor.o
+
+# target to build an object file
+tools/edr_monitor.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/tools/edr_monitor.c.o
+.PHONY : tools/edr_monitor.c.o
+
+tools/edr_monitor.i: tools/edr_monitor.c.i
+.PHONY : tools/edr_monitor.i
+
+# target to preprocess a source file
+tools/edr_monitor.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/tools/edr_monitor.c.i
+.PHONY : tools/edr_monitor.c.i
+
+tools/edr_monitor.s: tools/edr_monitor.c.s
+.PHONY : tools/edr_monitor.s
+
+# target to generate assembly for a file
+tools/edr_monitor.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/tools/edr_monitor.c.s
+.PHONY : tools/edr_monitor.c.s
 
 # Help Target
 help:
@@ -1589,6 +1629,7 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... edr_agent"
+	@echo "... edr_monitor"
 	@echo "... src/attack_surface/attack_surface_egress.o"
 	@echo "... src/attack_surface/attack_surface_egress.i"
 	@echo "... src/attack_surface/attack_surface_egress.s"
@@ -1769,6 +1810,9 @@ help:
 	@echo "... third_party/tomlc99/toml.o"
 	@echo "... third_party/tomlc99/toml.i"
 	@echo "... third_party/tomlc99/toml.s"
+	@echo "... tools/edr_monitor.o"
+	@echo "... tools/edr_monitor.i"
+	@echo "... tools/edr_monitor.s"
 .PHONY : help
 
 

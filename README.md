@@ -42,6 +42,7 @@
 | `src/self_protect/` | §9 自保护 |
 | `src/storage/queue_sqlite.c` | §10 SQLite `event_queue`（可选 `EDR_HAVE_SQLITE`） |
 | `src/config/` | §11 配置管理 |
+| `tools/edr_monitor.c`（`edr_monitor`） | §1.2 / §14 终端联调：读 `agent.toml`，对 gRPC 目标 TCP、REST `healthz`、`[ave]` 模型目录、`[offline]` 队列与 **edr_agent** 进程做黑盒探针（非进程内观测） |
 | `src/resource/` | §12 资源限制 |
 | `src/shellcode_detector/` | §17 协议层 Shellcode 检测（Windows：WinDivert + 可选 libyara；协议解析含 SMB/RDP/明文 HTTP） |
 | `src/webshell_detector/` | §18 Webshell 检测引擎（站点目录监控、专项规则匹配、告警入总线） |
@@ -54,7 +55,11 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ./build/edr_agent --help
 ./build/edr_agent --config agent.toml.example
+./build/edr_monitor --config agent.toml.example
+./build/edr_monitor --config agent.toml.example --json
 ```
+
+**终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、模型目录与离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
 
 **首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。从 **GitHub Release** 下载安装时，优先用 **`EDRAgentSetup-*.exe`（Windows）** 或 zip 内 **`install.sh`（Linux）**，见 **`docs/AGENT_INSTALLER.md`** 中「Release 一键安装」。
 

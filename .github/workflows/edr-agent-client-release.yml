@@ -119,6 +119,7 @@ jobs:
           if (-not (Test-Path -LiteralPath "agent.toml.example")) { throw "missing agent.toml.example for portable zip" }
           if (-not (Test-Path -LiteralPath "models")) { throw "missing models/ for portable zip" }
           $items = @("build/Release/edr_agent.exe", "agent.toml.example", "models")
+          if (Test-Path -LiteralPath "build/Release/edr_monitor.exe") { $items += "build/Release/edr_monitor.exe" }
           if (Test-Path -LiteralPath "build/Release/onnxruntime.dll") { $items += "build/Release/onnxruntime.dll" }
           if (Test-Path -LiteralPath "build/Release/onnxruntime_providers_shared.dll") { $items += "build/Release/onnxruntime_providers_shared.dll" }
           Compress-Archive -Path $items -DestinationPath $zip -Force

@@ -67,4 +67,5 @@ set(CMAKE_MAKEFILE_PRODUCTS
 # Dependency information for all targets:
 set(CMAKE_DEPEND_INFO_FILES
   "CMakeFiles/edr_agent.dir/DependInfo.cmake"
+  "CMakeFiles/edr_monitor.dir/DependInfo.cmake"
   )

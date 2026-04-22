@@ -11,6 +11,73 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+/** curl 配置里若用双引号路径，反斜杠会被当作转义；统一成正斜杠最稳。 */
+static void win_path_fwd_slashes(char *p) {
+  if (!p) {
+    return;
+  }
+  for (; *p; ++p) {
+    if (*p == '\\') {
+      *p = '/';
+    }
+  }
+}
+#endif
+
+/** JSON 字符串值（不含外层引号）。 */
+static void fprint_json_string_escaped(FILE *f, const char *s) {
+  if (!s) {
+    return;
+  }
+  for (; *s; ++s) {
+    unsigned char c = (unsigned char)*s;
+    switch (c) {
+      case '"':
+        fputs("\\\"", f);
+        break;
+      case '\\':
+        fputs("\\\\", f);
+        break;
+      case '\b':
+        fputs("\\b", f);
+        break;
+      case '\f':
+        fputs("\\f", f);
+        break;
+      case '\n':
+        fputs("\\n", f);
+        break;
+      case '\r':
+        fputs("\\r", f);
+        break;
+      case '\t':
+        fputs("\\t", f);
+        break;
+      default:
+        if (c < 0x20u) {
+          fprintf(f, "\\u%04x", (unsigned)c);
+        } else {
+          fputc((int)c, f);
+        }
+        break;
+    }
+  }
+}
+
+/** curl 配置文件中双引号参数内的字面量（如 Authorization）。 */
+static void fprint_curl_cfg_dquoted_body(FILE *f, const char *s) {
+  if (!s) {
+    return;
+  }
+  for (; *s; ++s) {
+    if (*s == '\\' || *s == '"') {
+      fputc('\\', f);
+    }
+    fputc(*s, f);
+  }
+}
+
 #ifndef EDR_AGENT_VERSION_STRING
 #define EDR_AGENT_VERSION_STRING "0.3.0"
 #endif
@@ -118,18 +185,23 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
 
   char jsonpath[512];
   char cfgpath[512];
+  char resp_path[512];
 #ifdef _WIN32
   char td[MAX_PATH];
   DWORD nn = GetTempPathA(sizeof(td), td);
   if (nn == 0 || nn >= sizeof(td)) {
     snprintf(td, sizeof(td), ".\\");
   }
+  win_path_fwd_slashes(td);
   snprintf(jsonpath, sizeof(jsonpath), "%sedr_ingest_%lu.json", td,
            (unsigned long)GetCurrentProcessId());
   snprintf(cfgpath, sizeof(cfgpath), "%sedr_ingest_%lu.cfg", td, (unsigned long)GetCurrentProcessId());
+  snprintf(resp_path, sizeof(resp_path), "%sedr_ingest_%lu.http", td,
+           (unsigned long)GetCurrentProcessId());
 #else
   snprintf(jsonpath, sizeof(jsonpath), "/tmp/edr_ingest_%d.json", (int)getpid());
   snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_ingest_%d.cfg", (int)getpid());
+  snprintf(resp_path, sizeof(resp_path), "/tmp/edr_ingest_%d.http", (int)getpid());
 #endif
 
   FILE *jf = fopen(jsonpath, "wb");
@@ -137,9 +209,15 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
     free(b64);
     return -1;
   }
-  fprintf(jf,
-          "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}\n",
-          s_endpoint, batch_id, s_agent_ver, b64);
+  fputs("{\"endpoint_id\":\"", jf);
+  fprint_json_string_escaped(jf, s_endpoint);
+  fputs("\",\"batch_id\":\"", jf);
+  fprint_json_string_escaped(jf, batch_id);
+  fputs("\",\"agent_version\":\"", jf);
+  fprint_json_string_escaped(jf, s_agent_ver);
+  fputs("\",\"payload\":\"", jf);
+  fputs(b64, jf);
+  fputs("\"}\n", jf);
   fclose(jf);
   free(b64);
 
@@ -150,28 +228,80 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   }
   fprintf(cf, "url = \"%s/ingest/report-events\"\n", s_rest);
   fprintf(cf, "header = \"Content-Type: application/json\"\n");
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", s_tenant[0] ? s_tenant : "demo-tenant");
-  fprintf(cf, "header = \"X-User-ID: %s\"\n", s_user[0] ? s_user : "edr-agent");
+  fputs("header = \"X-Tenant-ID: ", cf);
+  fprint_curl_cfg_dquoted_body(cf, s_tenant[0] ? s_tenant : "demo-tenant");
+  fputs("\"\n", cf);
+  fputs("header = \"X-User-ID: ", cf);
+  fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
+  fputs("\"\n", cf);
   fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
   if (s_bearer[0]) {
-    fprintf(cf, "header = \"Authorization: Bearer %s\"\n", s_bearer);
+    fputs("header = \"Authorization: Bearer ", cf);
+    fprint_curl_cfg_dquoted_body(cf, s_bearer);
+    fputs("\"\n", cf);
   }
-  fprintf(cf, "data = '@%s'\n", jsonpath);
+  /* 路径用正斜杠，避免 Windows 下 curl 配置解析把 \ 当转义导致读错 body、服务端 JSON 校验失败(400)。 */
+  fprintf(cf, "data = @%s\n", jsonpath);
   fprintf(cf, "silent\n");
   fclose(cf);
 
-  char cmd[700];
+  char cmd[1536];
 #ifdef _WIN32
-  /* cmd.exe 不剥单引号；curl 会收到字面量 'C:\...' 导致 rc=26。用双引号包裹配置路径。 */
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config \"%s\"", cfgpath);
+  snprintf(cmd, sizeof(cmd), "curl -sS -o \"%s\" -w \"%%{http_code}\" --config \"%s\"", resp_path,
+           cfgpath);
 #else
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config '%s'", cfgpath);
+  snprintf(cmd, sizeof(cmd), "curl -sS -o '%s' -w '%%{http_code}' --config '%s'", resp_path, cfgpath);
 #endif
-  int rc = system(cmd);
+
+  char codebuf[32];
+  size_t code_n = 0;
+  memset(codebuf, 0, sizeof(codebuf));
+#ifdef _WIN32
+  FILE *pf = _popen(cmd, "r");
+#else
+  FILE *pf = popen(cmd, "r");
+#endif
+  if (!pf) {
+    (void)remove(jsonpath);
+    (void)remove(cfgpath);
+    fprintf(stderr, "[ingest-http] curl popen failed (rest=%s)\n", s_rest);
+    return -1;
+  }
+  code_n = fread(codebuf, 1, sizeof(codebuf) - 1u, pf);
+#ifdef _WIN32
+  (void)_pclose(pf);
+#else
+  (void)pclose(pf);
+#endif
+
+  int http_code = 0;
+  if (code_n > 0u) {
+    codebuf[code_n] = 0;
+    http_code = (int)strtol(codebuf, NULL, 10);
+  }
+
+  int ok = (http_code >= 200 && http_code < 300);
+  if (!ok) {
+    char snippet[640];
+    size_t sn = 0;
+    FILE *rf = fopen(resp_path, "rb");
+    if (rf) {
+      sn = fread(snippet, 1, sizeof(snippet) - 1u, rf);
+      snippet[sn] = 0;
+      fclose(rf);
+    } else {
+      snippet[0] = 0;
+    }
+    fprintf(stderr,
+            "[ingest-http] HTTP %d (rest=%s); body_snippet=%.*s\n", http_code, s_rest, (int)sn,
+            snippet);
+  }
+
   (void)remove(jsonpath);
   (void)remove(cfgpath);
-  if (rc != 0) {
-    fprintf(stderr, "[ingest-http] curl failed rc=%d (rest=%s)\n", rc, s_rest);
+  (void)remove(resp_path);
+
+  if (!ok) {
     return -1;
   }
   return 0;

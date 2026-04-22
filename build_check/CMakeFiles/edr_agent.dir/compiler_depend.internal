@@ -2659,6 +2659,7 @@ CMakeFiles/edr_agent.dir/src/core/agent.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/event_bus.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/grpc_client.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/ingest_http.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/preprocess.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/resource.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/self_protect.h
