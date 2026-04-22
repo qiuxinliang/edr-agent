@@ -180,22 +180,24 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   s_n_files = 0;
   const char *dir = cfg->ave.model_dir;
   if (!dir || !dir[0]) {
-    fprintf(stderr, "[ave] model_dir 为空，跳过\n");
+    fprintf(stderr, "[ave] model_dir empty, skip AVE scan init\n");
     return EDR_OK;
   }
   int n_model = 0, n_all = 0;
   scan_dir(dir, &n_model, &n_all);
   s_n_model = n_model;
   s_n_files = n_all;
-  fprintf(stderr, "[ave] model_dir=%s 模型扩展名命中=%d 非目录文件=%d sensitivity=%s threads=%d\n", dir,
-          n_model, n_all, cfg->ave.sensitivity, cfg->ave.scan_threads);
+  fprintf(stderr,
+          "[ave] model_dir=%s onnx_files=%d total_files=%d sensitivity=%s threads=%d\n",
+          dir, n_model, n_all, cfg->ave.sensitivity, cfg->ave.scan_threads);
   s_ready = n_model > 0 ? 1 : 0;
 
   char onnx_path[2048];
   if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
     EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
     if (oe != EDR_OK) {
-      fprintf(stderr, "[ave] ONNX Runtime 加载失败 (%d)，推理将退回 dry-run / NOT_IMPL\n", (int)oe);
+      fprintf(stderr, "[ave] ONNX Runtime load failed (%d); inference falls back to dry-run / NOT_IMPL\n",
+              (int)oe);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
@@ -204,7 +206,7 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
     EdrError be = edr_onnx_behavior_load(beh_path, cfg);
     if (be != EDR_OK) {
-      fprintf(stderr, "[ave] behavior.onnx 加载失败 (%d)，行为分将使用启发式\n", (int)be);
+      fprintf(stderr, "[ave] behavior.onnx load failed (%d); behavior score uses heuristics\n", (int)be);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
@@ -224,7 +226,7 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
   if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
     EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
     if (oe != EDR_OK) {
-      fprintf(stderr, "[ave] reload static ONNX 失败 (%d)\n", (int)oe);
+      fprintf(stderr, "[ave] reload static ONNX failed (%d)\n", (int)oe);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
@@ -233,7 +235,7 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
   if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
     EdrError be = edr_onnx_behavior_load(beh_path, cfg);
     if (be != EDR_OK) {
-      fprintf(stderr, "[ave] reload behavior.onnx 失败 (%d)\n", (int)be);
+      fprintf(stderr, "[ave] reload behavior.onnx failed (%d)\n", (int)be);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
@@ -276,6 +278,8 @@ EdrError edr_ave_infer_file(const EdrConfig *cfg, const char *path, EdrAveInferR
   if (edr_onnx_runtime_ready()) {
     return edr_onnx_infer_file(cfg, path, out);
   }
-  fprintf(stderr, "[ave] infer 未实现（可设 EDR_AVE_INFER_DRY_RUN=1 联调；生产请 CMake -DEDR_WITH_ONNXRUNTIME=ON 并安装 ONNX Runtime）\n");
+  fprintf(stderr,
+          "[ave] infer not implemented (set EDR_AVE_INFER_DRY_RUN=1 for dev; production: "
+          "CMake -DEDR_WITH_ONNXRUNTIME=ON and install ONNX Runtime)\n");
   return EDR_ERR_NOT_IMPL;
 }

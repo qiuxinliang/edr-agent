@@ -346,7 +346,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   prop->LogFileMode =
       EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
 
-  ULONG status = StartTrace(&s_session_handle, NULL, prop);
+  /* Pass session name explicitly; some builds mis-handle NULL SessionName with LoggerNameOffset. */
+  ULONG status = StartTraceW(&s_session_handle, g_session_name, prop);
   if (status != ERROR_SUCCESS) {
     fprintf(stderr,
             "[collector_win] StartTrace failed winerr=%lu (session=%ls). Common: "
@@ -359,7 +360,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
       ULONG stc = ControlTraceW(0, g_session_name, &st0, EVENT_TRACE_CONTROL_STOP);
       fprintf(stderr, "[collector_win] ControlTrace STOP stale session winerr=%lu, retry StartTrace\n",
               (unsigned long)stc);
-      status = StartTrace(&s_session_handle, NULL, prop);
+      status = StartTraceW(&s_session_handle, g_session_name, prop);
       if (status == ERROR_SUCCESS) {
         fprintf(stderr, "[collector_win] StartTrace OK after cleanup\n");
       }
