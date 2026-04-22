@@ -129,8 +129,7 @@ function Merge-EnrollIntoAgentTomlExample {
     if ($line -match '^\s*#\s*\[platform\]\s*$') {
       $out.Add('[platform]')
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
-      $out.Add('rest_user_id         = "edr-agent"')
-      $out.Add('rest_bearer_token    = ""')
+      # 省略 rest_user_id / rest_bearer_token：Agent 默认 X-User-ID=edr-agent；Bearer 用环境变量或后续手写。
       $i++
       while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*#\s*rest_(base_url|user_id|bearer_token)')) {
         $i++
@@ -177,8 +176,6 @@ tenant_id            = "$(Escape-Toml $d.tenant_id)"
 
 [platform]
 rest_base_url        = "$(Escape-Toml $rest)"
-rest_user_id         = ""
-rest_bearer_token    = ""
 
 "@
 

@@ -23,6 +23,23 @@
 #define EDR_GETPID (int)getpid
 #endif
 
+#ifdef _WIN32
+/**
+ * curl 配置里若用双引号包住路径，反斜杠会被当作转义（如 \\Users\\testPC 中 \\t → TAB），
+ * 导致 data-binary / output 指向错误文件 → curl_exit_26。与 ingest_http.c 一致改为正斜杠。
+ */
+static void win_path_fwd_slashes(char *p) {
+  if (!p) {
+    return;
+  }
+  for (; *p; ++p) {
+    if (*p == '\\') {
+      *p = '/';
+    }
+  }
+}
+#endif
+
 /** 与 `[attack_surface]` 对齐：单次 ss 解析与快照序列化上限 */
 #define EDR_ASURF_LISTENERS_MAX 256
 #define EDR_ASURF_EGRESS_OUT_MAX 256
@@ -844,10 +861,13 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
 
 static int run_curl_upload(const char *cfg_path, char *errbuf, size_t errlen) {
 #ifdef _WIN32
-  char cmd[700];
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config \"%s\"", cfg_path);
+  char cfg_slash[768];
+  snprintf(cfg_slash, sizeof(cfg_slash), "%s", cfg_path ? cfg_path : "");
+  win_path_fwd_slashes(cfg_slash);
+  char cmd[1536];
+  snprintf(cmd, sizeof(cmd), "curl -fsS --config \"%s\"", cfg_slash);
 #else
-  char cmd[700];
+  char cmd[1536];
   snprintf(cmd, sizeof(cmd), "curl -fsS --config '%s'", cfg_path);
 #endif
   int rc = system(cmd);
@@ -890,7 +910,9 @@ int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
     if (nn == 0 || nn >= sizeof(td)) {
       snprintf(td, sizeof(td), ".\\");
     }
+    win_path_fwd_slashes(td);
     snprintf(outpath, sizeof(outpath), "%sedr_asurf_pend_%d.json", td, EDR_GETPID());
+    win_path_fwd_slashes(outpath);
   }
 #else
   snprintf(outpath, sizeof(outpath), "/tmp/edr_asurf_pend_%d.json", EDR_GETPID());
@@ -904,7 +926,9 @@ int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
     if (nn == 0 || nn >= sizeof(td)) {
       snprintf(td, sizeof(td), ".\\");
     }
+    win_path_fwd_slashes(td);
     snprintf(cfgpath, sizeof(cfgpath), "%sedr_asurf_pend_curl_%d.cfg", td, EDR_GETPID());
+    win_path_fwd_slashes(cfgpath);
   }
 #else
   snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_asurf_pend_curl_%d.cfg", EDR_GETPID());
@@ -969,8 +993,10 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     if (n == 0 || n >= sizeof(td)) {
       snprintf(td, sizeof(td), ".\\");
     }
+    win_path_fwd_slashes(td);
     snprintf(jsonpath, sizeof(jsonpath), "%sedr_asurf_%d_%lld.json", td, EDR_GETPID(),
              (long long)time(NULL) * 1000LL);
+    win_path_fwd_slashes(jsonpath);
   }
 #endif
   if (write_snapshot_json(jsonpath, cfg, L, nL, truncated, listeners_only) != 0) {
@@ -1003,7 +1029,9 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     if (n == 0 || n >= sizeof(td)) {
       snprintf(td, sizeof(td), ".\\");
     }
+    win_path_fwd_slashes(td);
     snprintf(cfgpath, sizeof(cfgpath), "%sedr_asurf_curl_%d.cfg", td, EDR_GETPID());
+    win_path_fwd_slashes(cfgpath);
   }
 #else
   snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_asurf_curl_%d.cfg", EDR_GETPID());
@@ -1024,7 +1052,8 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
   if (bearer && bearer[0]) {
     fprintf(cf, "header = \"Authorization: Bearer %s\"\n", bearer);
   }
-  fprintf(cf, "data-binary = \"@%s\"\n", jsonpath);
+  /* 正斜杠 jsonpath 可避免 curl 配置双引号内 \\ 被误解析（与 ingest_http 一致）。 */
+  fprintf(cf, "data-binary = @%s\n", jsonpath);
   fprintf(cf, "silent\n");
   fclose(cf);
 

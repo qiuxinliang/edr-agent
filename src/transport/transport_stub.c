@@ -12,6 +12,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/** 非 0/false/off 时：gRPC 未就绪仍走 HTTP 时每批都打日志（默认只打一次）。 */
+static int transport_env_truthy(const char *name) {
+  const char *v = getenv(name);
+  if (!v || !v[0] || strcmp(v, "0") == 0) {
+    return 0;
+  }
+  if (strcmp(v, "false") == 0 || strcmp(v, "off") == 0 || strcmp(v, "no") == 0 || strcmp(v, "NO") == 0) {
+    return 0;
+  }
+  return 1;
+}
+
 static char s_target[256];
 
 void edr_transport_init_from_config(const EdrConfig *cfg) {
@@ -115,9 +127,17 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const u
     if (edr_ingest_http_configured() && !edr_grpc_client_ready()) {
       send_rc = edr_ingest_http_post_report_events(batch_id, header12, header_len, payload, payload_len);
       if (send_rc == 0) {
-        fprintf(stderr,
-                "[transport] gRPC not ready; sent via HTTP ingest same payload (batch_id=%s)\n",
-                batch_id ? batch_id : "");
+        static int s_logged_grpc_stub_http;
+        if (!s_logged_grpc_stub_http || transport_env_truthy("EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK")) {
+          if (!s_logged_grpc_stub_http) {
+            s_logged_grpc_stub_http = 1;
+          }
+          fprintf(stderr,
+                  "[transport] gRPC not ready; sent via HTTP ingest (batch_id=%s). "
+                  "Further identical notices suppressed; set EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK=1 "
+                  "to log every batch.\n",
+                  batch_id ? batch_id : "");
+        }
       }
     } else {
       send_rc = edr_grpc_client_send_batch(batch_id, header12, header_len, payload, payload_len);
