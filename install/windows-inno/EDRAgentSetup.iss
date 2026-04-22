@@ -58,17 +58,16 @@ var
 
 function JsonEscape(const S: string): string;
 var
-  Q, B, EscBB, EscBQ, Tmp, Escaped: string;
+  Q, B, EscBB, EscBQ, Src, Stage1, Stage2: string;
 begin
-  B := Chr(92);
-  Q := Chr(34);
-  EscBB := B;
-  EscBB := EscBB + B;
-  EscBQ := B;
-  EscBQ := EscBQ + Q;
-  Tmp := StringChange(S, B, EscBB);
-  Escaped := StringChange(Tmp, Q, EscBQ);
-  Result := Q + Escaped + Q;
+  Src := S;
+  B := #92;
+  Q := #34;
+  EscBB := #92#92;
+  EscBQ := #92#34;
+  Stage1 := StringChange(Src, B, EscBB);
+  Stage2 := StringChange(Stage1, Q, EscBQ);
+  Result := Q + Stage2 + Q;
 end;
 
 procedure InitializeWizard;
@@ -116,12 +115,12 @@ begin
   if (U <> '') and (T <> '') then
   begin
     Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
-    Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) +
-      ':' + JsonEscape(T) + ',' + Chr(34) + 'insecure_tls' + Chr(34) + ':';
+    Json := #123 + #34 + 'api_base' + #34 + ':' + JsonEscape(U) + ',' + #34 + 'token' + #34 + ':' + JsonEscape(T) + ',' +
+      #34 + 'insecure_tls' + #34 + ':';
     if WizardIsTaskSelected('enrollinsecure') then
-      Json := Json + 'true' + Chr(125)
+      Json := Json + 'true' + #125
     else
-      Json := Json + 'false' + Chr(125);
+      Json := Json + 'false' + #125;
     SaveStringToFile(Path, Json, False, True);
   end
   else
