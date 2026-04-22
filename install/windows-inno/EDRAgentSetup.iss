@@ -61,10 +61,10 @@ var
   Q, B, EscBB, EscBQ, Src, Stage1, Stage2: string;
 begin
   Src := S;
-  B := #92;
-  Q := #34;
-  EscBB := #92#92;
-  EscBQ := #92#34;
+  B := Chr(92);
+  Q := Chr(34);
+  EscBB := B + B;
+  EscBQ := B + Q;
   Stage1 := StringChange(Src, B, EscBB);
   Stage2 := StringChange(Stage1, Q, EscBQ);
   Result := Q + Stage2 + Q;
@@ -74,7 +74,7 @@ procedure InitializeWizard;
 begin
   EnrollPage := CreateInputQueryPage(wpWelcome,
     'Platform enrollment',
-    'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.'#13#10#13#10 +
+    'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.' + Chr(13) + Chr(10) + Chr(13) + Chr(10) +
     'Leave both fields empty to skip: you can run edr_agent_install.ps1 from the install folder later, or edit agent.toml.example.',
     'Platform API base URL (example: https://platform.example:8080):',
     'Enrollment token:');
@@ -115,12 +115,12 @@ begin
   if (U <> '') and (T <> '') then
   begin
     Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
-    Json := #123 + #34 + 'api_base' + #34 + ':' + JsonEscape(U) + ',' + #34 + 'token' + #34 + ':' + JsonEscape(T) + ',' +
-      #34 + 'insecure_tls' + #34 + ':';
+    Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) + ':' + JsonEscape(T) + ',' +
+      Chr(34) + 'insecure_tls' + Chr(34) + ':';
     if WizardIsTaskSelected('enrollinsecure') then
-      Json := Json + 'true' + #125
+      Json := Json + 'true' + Chr(125)
     else
-      Json := Json + 'false' + #125;
+      Json := Json + 'false' + Chr(125);
     SaveStringToFile(Path, Json, False, True);
   end
   else
