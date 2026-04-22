@@ -27,13 +27,14 @@
 #define AVE_BP_ORT_NELEM_MAX (EDR_PID_HISTORY_MAX_SEQ * EDR_PID_HISTORY_FEAT_DIM)
 
 static float s_bp_ort_scratch[AVE_BP_ORT_NELEM_MAX];
-static _Atomic uint64_t s_bp_beh_infer_ok = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t s_bp_beh_infer_fail = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t s_bp_feed_total = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t s_bp_queue_enqueued = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t s_bp_queue_full_fallback = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t s_bp_feed_sync_bypass = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t s_bp_worker_dequeued = ATOMIC_VAR_INIT(0);
+/* 文件作用域 _Atomic 隐式零初始化；ATOMIC_VAR_INIT 在 C17/MSVC 不可用 */
+static _Atomic uint64_t s_bp_beh_infer_ok;
+static _Atomic uint64_t s_bp_beh_infer_fail;
+static _Atomic uint64_t s_bp_feed_total;
+static _Atomic uint64_t s_bp_queue_enqueued;
+static _Atomic uint64_t s_bp_queue_full_fallback;
+static _Atomic uint64_t s_bp_feed_sync_bypass;
+static _Atomic uint64_t s_bp_worker_dequeued;
 
 static void bp_reset_metrics(void) {
   atomic_store_explicit(&s_bp_beh_infer_ok, 0u, memory_order_relaxed);
