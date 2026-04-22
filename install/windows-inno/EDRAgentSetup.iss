@@ -58,7 +58,7 @@ var
 
 function JsonEscape(const S: string): string;
 var
-  Q, B, EscBB, EscBQ, Mid: string;
+  Q, B, EscBB, EscBQ, Tmp, Escaped: string;
 begin
   B := Chr(92);
   Q := Chr(34);
@@ -66,8 +66,9 @@ begin
   EscBB := EscBB + B;
   EscBQ := B;
   EscBQ := EscBQ + Q;
-  Mid := StringChange(StringChange(S, B, EscBB), Q, EscBQ);
-  Result := Q + Mid + Q;
+  Tmp := StringChange(S, B, EscBB);
+  Escaped := StringChange(Tmp, Q, EscBQ);
+  Result := Q + Escaped + Q;
 end;
 
 procedure InitializeWizard;
