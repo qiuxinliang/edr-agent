@@ -2,18 +2,20 @@
 """
 独立安装器：POST {EDR_API_BASE}/api/v1/enroll，根据响应生成 agent.toml。
 
-环境变量（必填）：
-  EDR_API_BASE      平台 REST 根 URL，如 http://127.0.0.1:8080（无尾斜杠）
+环境变量（与命令行二选一；命令行优先）：
+  EDR_API_BASE      平台 REST 根 URL，如 http://192.168.1.35:8080（无尾斜杠）
   EDR_ENROLL_TOKEN  注册 Token 明文
 
 可选：
-  EDR_OUTPUT              输出路径，默认当前目录 agent.toml
-  EDR_AGENT_VERSION       默认 0.3.0
-  EDR_OVERRIDE_SERVER_ADDR  覆盖响应中的 server_addr 写入 [server].address
-  EDR_INSECURE_TLS=1      跳过 TLS 证书校验（仅调试）
+  EDR_OUTPUT                 输出路径，默认当前目录 agent.toml
+  EDR_AGENT_VERSION          默认 0.3.0
+  EDR_ENROLL_IP              显式写入 enroll JSON 的 ip（不设则本机尽力探测）
+  EDR_OVERRIDE_SERVER_ADDR   覆盖响应中的 server_addr 写入 [server].address
+  EDR_INSECURE_TLS=1         跳过 TLS 证书校验（仅调试）
 
-命令行：
-  python3 edr_agent_install.py [--output PATH] [--dry-run]
+命令行（推荐终端一行安装）：
+  python3 edr_agent_install.py --api-base URL --token TOKEN [-o agent.toml]
+  或使用同目录 ./edr-terminal-install（薄封装，需 python3）
 """
 
 from __future__ import annotations
@@ -80,6 +82,22 @@ def _hostname() -> str:
         return "unknown"
 
 
+def _local_ip_for_enroll() -> str:
+    v = (os.environ.get("EDR_ENROLL_IP") or "").strip()
+    if v:
+        return v
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("203.0.113.1", 53))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ip
+    except OSError:
+        return ""
+
+
 def enroll(api_base: str, token: str, agent_version: str) -> Dict[str, Any]:
     api_base = api_base.rstrip("/")
     url = api_base + "/api/v1/enroll"
@@ -89,7 +107,7 @@ def enroll(api_base: str, token: str, agent_version: str) -> Dict[str, Any]:
         "os": _detect_os(),
         "arch": platform.machine() or "",
         "agent_version": agent_version,
-        "ip": "",
+        "ip": _local_ip_for_enroll(),
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -139,6 +157,33 @@ def enroll(api_base: str, token: str, agent_version: str) -> Dict[str, Any]:
 def main() -> None:
     p = argparse.ArgumentParser(description="EDR Agent enroll → agent.toml")
     p.add_argument(
+        "--api-base",
+        dest="api_base",
+        default=None,
+        metavar="URL",
+        help="平台 REST 根（默认读取环境变量 EDR_API_BASE）",
+    )
+    p.add_argument(
+        "--token",
+        dest="token",
+        default=None,
+        metavar="TOKEN",
+        help="注册 Token（默认读取环境变量 EDR_ENROLL_TOKEN）",
+    )
+    p.add_argument(
+        "--override-server-addr",
+        dest="override_server_addr",
+        default=None,
+        metavar="HOST:PORT",
+        help="覆盖 enroll 返回的 server_addr（同 EDR_OVERRIDE_SERVER_ADDR）",
+    )
+    p.add_argument(
+        "-k",
+        "--insecure-tls",
+        action="store_true",
+        help="调试：跳过 TLS 证书校验（同 EDR_INSECURE_TLS=1）",
+    )
+    p.add_argument(
         "-o",
         "--output",
         default=os.environ.get("EDR_OUTPUT", "agent.toml"),
@@ -151,10 +196,28 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    api_base = os.environ.get("EDR_API_BASE", "").strip()
-    token = os.environ.get("EDR_ENROLL_TOKEN", "").strip()
+    if args.insecure_tls:
+        os.environ["EDR_INSECURE_TLS"] = "1"
+    if args.override_server_addr:
+        os.environ["EDR_OVERRIDE_SERVER_ADDR"] = str(args.override_server_addr).strip()
+
+    if args.api_base is not None:
+        api_base = (args.api_base or "").strip()
+    else:
+        api_base = os.environ.get("EDR_API_BASE", "").strip()
+
+    if args.token is not None:
+        token = (args.token or "").strip()
+    else:
+        token = os.environ.get("EDR_ENROLL_TOKEN", "").strip()
+
     if not api_base or not token:
-        print("Set EDR_API_BASE and EDR_ENROLL_TOKEN", file=sys.stderr)
+        p.print_help()
+        print(
+            "\n缺少平台地址或 Token：请设置 --api-base / --token，"
+            "或环境变量 EDR_API_BASE / EDR_ENROLL_TOKEN。",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     av = os.environ.get("EDR_AGENT_VERSION", "0.3.0").strip() or "0.3.0"

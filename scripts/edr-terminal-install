@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# EDR Agent 终端安装器：调用平台 POST /api/v1/enroll，生成本地 agent.toml。
+# 依赖：python3（与 edr_agent_install.py 相同）。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PY="${SCRIPT_DIR}/edr_agent_install.py"
+
+if [[ ! -f "${PY}" ]]; then
+  echo "edr-terminal-install: 找不到 ${PY}" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "edr-terminal-install: 需要 python3，请先安装 Python 3。" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  ""|-h|help)
+    cat <<'EOF'
+EDR Agent 终端安装器
+
+用法:
+  ./edr-terminal-install --api-base <平台HTTP根> --token <注册Token> [选项]
+
+常用选项:
+  -o, --output PATH              输出 agent.toml（默认 ./agent.toml）
+  --dry-run                      只打印 TOML，不写文件
+  -k, --insecure-tls             调试：跳过 HTTPS 证书校验
+  --override-server-addr H:P     覆盖 enroll 返回的 gRPC server_addr
+
+也可用环境变量（与上面参数二选一，参数优先）:
+  EDR_API_BASE  EDR_ENROLL_TOKEN
+
+示例:
+  ./edr-terminal-install --api-base http://192.168.1.35:8080 --token "$EDR_ENROLL_TOKEN" -o ./agent.toml
+  ./edr-terminal-install --api-base http://192.168.1.35:8080 --token "$EDR_ENROLL_TOKEN" --dry-run
+
+完整参数列表: ./edr-terminal-install --help
+详细说明: edr-agent/docs/AGENT_INSTALLER.md
+EOF
+    exit 0
+    ;;
+  --help)
+    exec python3 "${PY}" --help
+    ;;
+esac
+
+exec python3 "${PY}" "$@"

@@ -98,8 +98,10 @@ endif()
 
 set(EDR_AGENT_SOURCES
   src/main.c
+  src/agent_main.c
   src/core/agent.c
   src/core/event_bus.c
+  src/core/metrics_http.c
   src/core/time_util.c
   src/config/config.c
   src/preprocess/behavior_record.c
@@ -163,6 +165,7 @@ endif()
 
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES
+    src/platform/edr_windows_service.c
     src/collector/collector_win.c
     src/collector/etw_tdh_win.c
     src/collector/ave_etw_feed_win.c
@@ -1050,7 +1053,7 @@ if(EDR_YARA_AVAILABLE)
   target_link_libraries(test_shellcode PRIVATE ${YARA_LIB})
 endif()
 if(WIN32)
-  target_link_libraries(test_shellcode PRIVATE advapi32 ws2_32)
+  target_link_libraries(test_shellcode PRIVATE advapi32 ws2_32 iphlpapi)
 endif()
 if(UNIX AND NOT WIN32)
   target_link_libraries(test_shellcode PRIVATE m)
@@ -1061,5 +1064,83 @@ else()
   target_compile_options(test_shellcode PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+set(_edr_shellcode_corpus_manifest "${CMAKE_SOURCE_DIR}/test_data/shellcode_corpus/baselines/manifest.tsv")
+if(EXISTS "${_edr_shellcode_corpus_manifest}")
+  add_executable(test_shellcode_corpus tests/test_shellcode_corpus.c ${EDR_SHELLCODE_SRCS})
+  target_include_directories(test_shellcode_corpus PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party/windivert
+  )
+  target_compile_definitions(test_shellcode_corpus PRIVATE
+    "EDR_SHELLCODE_CORPUS_DIR=\"${CMAKE_SOURCE_DIR}/test_data/shellcode_corpus/baselines\""
+  )
+  if(EDR_YARA_AVAILABLE)
+    target_compile_definitions(test_shellcode_corpus PRIVATE EDR_HAVE_YARA=1)
+    target_include_directories(test_shellcode_corpus PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(test_shellcode_corpus PRIVATE ${YARA_LIB})
+  endif()
+  if(WIN32)
+    target_link_libraries(test_shellcode_corpus PRIVATE advapi32 ws2_32 iphlpapi)
+  endif()
+  if(UNIX AND NOT WIN32)
+    target_link_libraries(test_shellcode_corpus PRIVATE m)
+  endif()
+  if(MSVC)
+    target_compile_options(test_shellcode_corpus PRIVATE /W4 /WX-)
+  else()
+    target_compile_options(test_shellcode_corpus PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  add_test(NAME shellcode_corpus COMMAND test_shellcode_corpus WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+  add_executable(eval_shellcode_corpus tools/eval_shellcode_corpus.c ${EDR_SHELLCODE_SRCS})
+  target_include_directories(eval_shellcode_corpus PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party/windivert
+  )
+  target_compile_definitions(eval_shellcode_corpus PRIVATE
+    "EDR_EVAL_DEFAULT_CORPUS_DIR=\"${CMAKE_SOURCE_DIR}/test_data/shellcode_corpus/baselines\""
+  )
+  if(EDR_YARA_AVAILABLE)
+    target_compile_definitions(eval_shellcode_corpus PRIVATE EDR_HAVE_YARA=1)
+    target_include_directories(eval_shellcode_corpus PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(eval_shellcode_corpus PRIVATE ${YARA_LIB})
+  endif()
+  if(WIN32)
+    target_link_libraries(eval_shellcode_corpus PRIVATE advapi32 ws2_32 iphlpapi)
+  endif()
+  if(UNIX AND NOT WIN32)
+    target_link_libraries(eval_shellcode_corpus PRIVATE m)
+  endif()
+  if(MSVC)
+    target_compile_options(eval_shellcode_corpus PRIVATE /W4 /WX-)
+  else()
+    target_compile_options(eval_shellcode_corpus PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+
+  # T-SC-000: after changing shellcode_known / YARA / proto_parse / emit script, run this target (or t_sc_000_verify.sh).
+  if(CMAKE_CONFIGURATION_TYPES)
+    set(_EDR_SHELLCODE_T_SC000_CTEST_CFG -C Release)
+  else()
+    set(_EDR_SHELLCODE_T_SC000_CTEST_CFG "")
+  endif()
+  add_custom_target(
+    shellcode_t_sc_000_verify
+    DEPENDS test_shellcode test_shellcode_corpus eval_shellcode_corpus
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/shellcode_corpus/emit_baseline_variants.py
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} ${_EDR_SHELLCODE_T_SC000_CTEST_CFG} -R shellcode
+            --output-on-failure
+    COMMAND $<TARGET_FILE:eval_shellcode_corpus> --mode manifest
+    COMMENT
+      "T-SC-000: emit baselines + ctest shellcode* (includes T-SC-001 pipeline --strict) + manifest eval")
+
+  # T-SC-001: pipeline eval as a CTest (so `ctest -R shellcode` covers CI without duplicate workflow steps).
+  configure_file(${CMAKE_SOURCE_DIR}/cmake/run_shellcode_pipeline_eval.in.cmake
+                   ${CMAKE_BINARY_DIR}/run_shellcode_pipeline_eval.cmake @ONLY)
+  add_test(NAME shellcode_corpus_pipeline_eval COMMAND ${CMAKE_COMMAND} -P
+                                                        ${CMAKE_BINARY_DIR}/run_shellcode_pipeline_eval.cmake)
+  set_tests_properties(shellcode_corpus_pipeline_eval PROPERTIES LABELS "shellcode")
+endif()
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)

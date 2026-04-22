@@ -24,4 +24,16 @@ double edr_shellcode_shannon_entropy_bits(const uint8_t *data, size_t len);
 /** 0.0–1.0 启发式分数（熵、NOP sled、简化 GetPC 特征），不含 YARA */
 double edr_shellcode_heuristic_score(const uint8_t *data, size_t len);
 
+#ifdef _WIN32
+/**
+ * WinDivert 线程累计计数（§17 性能 / P2-PERF-2）；未启动捕获时多为 0。
+ * 指针可为 NULL（跳过该项）。关机前 **`edr_windivert_capture_stop`** 若 **`EDR_SHELLCODE_WD_STATS=1`** 会 stderr 打一行汇总。
+ * **`alert_dedup_suppressed`**（T-SC-041）：同五元组语义键 + 同 rule 在 30s 内被合并丢弃的次数。
+ */
+void edr_shellcode_windivert_stats_snapshot(unsigned long long *recv_packets, unsigned long long *recv_errors,
+                                            unsigned long long *rows_skipped, unsigned long long *monitor_filtered,
+                                            unsigned long long *alerts_pushed, unsigned long long *bus_drops,
+                                            unsigned long long *alert_dedup_suppressed);
+#endif
+
 #endif

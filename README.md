@@ -2,9 +2,9 @@
 
 本目录按 [Cauld Design/EDR_端点详细设计_v1.0.md](../Cauld%20Design/EDR_端点详细设计_v1.0.md) 拆分模块，用于从设计落地到实现的起点。
 
-**改进任务单（按 AGT-xxx 编号，可拆 issue）**：[docs/CLIENT_IMPROVEMENT_TASKS.md](docs/CLIENT_IMPROVEMENT_TASKS.md)。
+**改进任务单（按 AGT-xxx 编号，可拆 issue）**：[docs/CLIENT_IMPROVEMENT_TASKS.md](docs/CLIENT_IMPROVEMENT_TASKS.md)。**相对《端点详细设计》章节的完成度打勾表**：[docs/EDR_AGENT_DESIGN_COVERAGE_CHECKLIST.md](docs/EDR_AGENT_DESIGN_COVERAGE_CHECKLIST.md)。**仅 Windows 发版核对**：[docs/WINDOWS_RELEASE_CHECKLIST.md](docs/WINDOWS_RELEASE_CHECKLIST.md)。
 
-**线程模型（M2）**：[docs/AGENT_THREAD_MODEL.md](docs/AGENT_THREAD_MODEL.md)（**AGT-003**）。**取证 UploadFile 联调**：[docs/AGT009_FORENSIC_UPLOAD_E2E.md](docs/AGT009_FORENSIC_UPLOAD_E2E.md)。**Linux P7 eBPF 路线图**：[docs/AGT012_LINUX_EBPF_P7.md](docs/AGT012_LINUX_EBPF_P7.md)。
+**线程模型（M2）**：[docs/AGENT_THREAD_MODEL.md](docs/AGENT_THREAD_MODEL.md)（**AGT-003**）。**取证 UploadFile 联调**：[docs/AGT009_FORENSIC_UPLOAD_E2E.md](docs/AGT009_FORENSIC_UPLOAD_E2E.md)（含 **§2.1 gRPC 目标与 MinIO 配置**；平台实现见 **`edr-backend/docs/GRPC_INGEST.md`**）。**Shellcode / WinDivert 产品 SLO 框架**：[docs/SHELLCODE_AGENT_SLO.md](docs/SHELLCODE_AGENT_SLO.md)。**Linux P7 eBPF 路线图**：[docs/AGT012_LINUX_EBPF_P7.md](docs/AGT012_LINUX_EBPF_P7.md)。**Windows 注册表 ETW → 平台 `category=registry` 实机验收（P0）**：[docs/REGISTRY_ETW_ACCEPTANCE.md](docs/REGISTRY_ETW_ACCEPTANCE.md)。
 
 ### 工程文档与 Windows / Linux 能力对齐（AGT-011）
 
@@ -13,7 +13,7 @@
 
 | 能力 | Windows | Linux（默认 `EDR_WITH_LINUX_COLLECTOR=ON`） | 其它 POSIX |
 |------|---------|-----------------------------------------------|------------|
-| 采集主路径 | ETW（内核三通道 + TDH + 扩展 Provider，见下文「ETW 增强」） | **M1**：inotify 文件事件（`collector_linux.c`）；进程/网络等 **§3.2** 见路线图 **P7** | `collector_stub` |
+| 采集主路径 | ETW（**Kernel-Process / File / Network / Registry** + TDH + 扩展 Provider，见下文「ETW 增强」） | **M1**：inotify 文件事件（`collector_linux.c`）；**无** Windows 级注册表内核流；进程/网络等 **§3.2** 见路线图 **P7** | `collector_stub` |
 | 预处理 / 批次 / gRPC 客户端 / Subscribe 指令 | 是 | 是 | 是 |
 | §19 攻击面 HTTP `POST` | 是（监听/出站路径最完整） | 是（依赖 `ss`/`curl` 等，见 §19 长段） | 同 Linux |
 | §17 WinDivert Shellcode | 是 | 否 | 否 |
@@ -29,7 +29,7 @@
 | `src/collector/` | §3 ETW / eBPF / 轮询 |
 | `src/preprocess/` | §4 本地预处理引擎（ETW1→`EdrBehaviorRecord`、MITRE 初标） |
 | `src/serialize/behavior_wire.c` | §6 紧凑线格式 v1（BER1，默认批次帧） |
-| `proto/edr/v1/event.proto`、`src/proto/edr/v1/event.pb.*` | §6.1 `BehaviorEvent` — **nanopb** 生成 + `behavior_proto.c` 编码 |
+| `proto/edr/v1/event.proto`、`src/proto/edr/v1/event.pb.*` | §6.1 `BehaviorEvent` — **nanopb** 生成 + `behavior_proto.c` 编码（含 **`RegistryDetail`** / **`registry`**）；实机验收 **`docs/REGISTRY_ETW_ACCEPTANCE.md`** |
 | `src/serialize/behavior_proto_c.c` | 同 wire 的 `edr_behavior_record_encode_protobuf_c`；可选 **protobuf-c** `event.pb-c.*`（见 `third_party/protobuf-c/`） |
 | `src/transport/event_batch.c` | §6.2 批次：`BAT1` 头 + 多帧 `u32le` 长度前缀 + wire 体；字节/条数上限见 §11 `upload` |
 | `src/ave/`、`include/edr/ave_sdk.h` | §5 AV Engine：`edr_ave_*` 与 09 文档对齐的 **`AVE_*` SDK**；`AVE_ScanFile` 含 **L1** 证书 Stage0、**L2/L3** 哈希白名单与 IOC（见 `docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`） |
@@ -56,11 +56,15 @@ cmake --build build
 ./build/edr_agent --config agent.toml.example
 ```
 
+**Windows（CMD / PowerShell）**：可执行文件名是 **`edr_agent.exe`**；不在 `PATH` 里时，必须在**含该 exe 的目录**用前缀调用，例如 **`.\edr_agent.exe --help`**、**`.\edr_agent.exe --config C:\ProgramData\EDR\agent.toml`**。若提示「不是内部或外部命令」，说明当前目录没有 exe 或未写对路径。从 zip 里解压出的无后缀 **`edr_agent`** 若是 **在 macOS/Linux 上编的二进制**，不能在 Windows 上运行，需在 Windows 上用 **MSVC/MinGW** 重新编译得到 **`.exe`**。
+
 **首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。
 
 **Windows 生产部署（服务账户、ETW/WinDivert 预检、`sc` 示例草案）**：见 **`docs/WINDOWS_DEPLOY.md`**（**AGT-006 已关闭**）；索引见 **`deploy/README.md`**。管理端 zip / MSI 流水线以 **edr-backend** 文档为准。
 
-**无 MSVC、仅验证 Windows 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、**gRPC/protobuf/vcpkg** 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查）。
+**Windows on ARM（ARM64 本机 / WoA）**：在目标机上用 **MSVC + CMake `-A ARM64`** 编译，勿使用 x64 的 exe 或 MinGW 的 x86_64 产物。一键脚本：**`scripts/build_windows_arm64.ps1`**；说明见 **`docs/WINDOWS_DEPLOY.md`** §3.2。
+
+**无 MSVC、仅验证 Windows x64 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、**gRPC/protobuf/vcpkg** 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查；**该路径产出为 x64 PE，不适用于 ARM64 Windows 本机原生运行**）。
 
 **本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；仅需 CMake 链路冒烟时可设 **`EDR_WITH_GRPC=OFF`**。
 
@@ -90,8 +94,8 @@ cmake --build build
 - 配置节 **`[shellcode_detector]`**（见 `agent.toml.example`），默认 **`enabled = false`**，不改变既有部署行为。
 - 已编译：**熵 / 启发式 / SMB2·SMB1·RDP·明文 HTTP 载荷区定位**（`proto_parse.c`；HTTPS/TLS 仍按原始字节启发式），单测 `test_shellcode`。
 - **WinDivert 闭环（初版）**：`windivert_capture.c` 从 **`%SystemRoot%\System32\WinDivert.dll`** **动态加载**（无需链接 `WinDivert.lib`），`SNIFF | RECV_ONLY` 捕获 TCP 端口集合；**`windivert_tcp_ports`** 为空时使用内置端口（SMB/RDP/WinRM/MSRPC/LDAP 等）；**非空**时为逗号分隔列表（如 `80,443,8443`），据此生成过滤器，且 **`monitor_smb` 等按类开关不再生效**（仅按列表匹配）。TCP 载荷经协议区段提取与启发式打分，**≥ `alert_threshold`** 时投递 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（ETW1，`prov=windivert`），预处理映射 **T1210**。
-- **已实现（Phase 2）**：优先使用 **libyara** 扫描已知漏洞规则（`yara_rules_dir` 指向规则目录，加载 `.yar/.yara`）；命中时以 `detector=yara` 和 `rule=<规则名>` 上报。若未安装 libyara 或目录未加载到规则，自动降级为内置匹配器（规则名保持一致：`EternalBlue_MS17_010` / `BlueKeep_CVE_2019_0708` / `PrintNightmare_CVE_2021_34527`）。默认规则文件见 `src/shellcode_detector/rules/known_exploits.yar`。
-- **P0（持续迭代）**：IPv6 五元组；**`windivert_tcp_ports`**；**单包或环形 PCAP**（`shellcode_ring_*.pcap`，EN10MB）；**SHA256 + 可选 preview_hex**；环形告警附 **`ring_*_ns` / `ring_trigger_slot`** 与 **`shellcode_json`** 行；**`heuristic_score_scale`** 调启发式灵敏度；**`yara_rules_reload_interval_s`** 热重载规则（libyara）；**`auto_isolate_threshold`** 仍为高优先级标记；**可选端上隔离**：`EDR_SHELLCODE_AUTO_ISOLATE=1` 或 **`auto_isolate_execute`** + 高危策略，与 **`isolate`** 同路径（每进程最多一次）。WinDivert 过滤器在**启动时**固定。**pcapng / 纯服务端编排隔离**等见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`**。
+- **已实现（Phase 2）**：若编译并加载 **libyara**（`yara_rules_dir` 指向规则目录，加载 `.yar/.yara`），**`edr_shellcode_match_known_exploit`** 内 **YARA 优先**；否则走 **内置 C 匹配器**（规则名与 YARA 对齐）。**WinDivert 告警** ETW1 行 **`detector=known_exploit`**（或启发式 **`detector=heuristic`**），**`shellcode_json`** 含 **`det_layer` / `rule_confidence` / `rule`** 等（见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`**）。默认规则文件见 `src/shellcode_detector/rules/known_exploits.yar`。
+- **P0（持续迭代）**：IPv6 五元组；**`windivert_tcp_ports`**；**单包或环形 PCAP**（`shellcode_ring_*.pcap`，EN10MB）；**SHA256 + 可选 preview_hex**；环形告警附 **`ring_*_ns` / `ring_trigger_slot`** 与 **`shellcode_json`** 行；**`heuristic_score_scale`** 调启发式灵敏度；**`yara_rules_reload_interval_s`** 热重载规则（libyara）；**`auto_isolate_threshold`** 仍为高优先级标记；**可选端上隔离**：`EDR_SHELLCODE_AUTO_ISOLATE=1` 或 **`auto_isolate_execute`** + 高危策略，与 **`isolate`** 同路径（每进程最多一次）。WinDivert 过滤器在**启动时**固定。**P2**：PCAP 根目录与 **`EDR_FORENSIC_OUT`** 对齐（见环境变量表）；**SOAR playbook** 示例见 **`docs/SOAR_CONTRACT.md` §5.3**。**pcapng / 纯服务端编排隔离**等见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`**。**检测评估语料**：**43** 条 baseline（含 EternalBlue NetBIOS 封装 + SMB2/SMB1/HTTP 边界扩展），见 **`docs/SHELLCODE_EVALUATION_CORPUS.md`**、**`docs/SHELLCODE_ENHANCEMENT_PLAN.md`**、**`test_data/shellcode_corpus/`**；设计覆盖打勾表见 **`docs/EDR_AGENT_DESIGN_COVERAGE_CHECKLIST.md`**。
 
 ### §18 Webshell 检测引擎（Web 服务目录监控）
 
@@ -211,8 +215,13 @@ cmake --build build
 | `EDR_RESOURCE_STRICT` | `=1` 时即使 `cpu_limit_percent` &lt; 5 也做 CPU 监控（否则跳过以免默认 1% 刷屏）。 |
 | `EDR_SELF_PROTECT_WATCHDOG` | `=1` 时周期性 stderr 心跳（极粗看门狗）；与 TOML **`[self_protect] watchdog_log_interval_s`** 可并存。 |
 | `EDR_SELF_PROTECT_PIDFILE` | 若设置，启动时写入当前 PID（退出时尝试 `remove`）；便于外部进程管理。 |
-| `EDR_FORENSIC_OUT` | 取证输出根目录；未设置时 **POSIX** 默认 `/tmp/edr_forensic`，**Windows** 默认 **`%TEMP%\\edr_forensic`**。 |
+| `EDR_FORENSIC_OUT` | 取证输出根目录；未设置时 **POSIX** 默认 `/tmp/edr_forensic`，**Windows** 默认 **`%TEMP%\\edr_forensic`**。**§17 Shellcode**：**`forensic_save_pcap=true`** 且 **`[shellcode_detector].forensic_dir`** 为空时，PCAP 根为 **`EDR_FORENSIC_OUT\\shellcode`**；若本变量也未设置则为 **`%TEMP%\\edr_forensic\\shellcode`**。 |
 | `EDR_FORENSIC_COPY_PATHS` | `=1` 时按 payload **每行一个路径**复制到作业目录（POSIX：**`open`/`read`/`write`**；Windows：**`CopyFileA`**；`#` 行与空行忽略）。 |
+| `EDR_FORENSIC_REGISTRY_DUMP` | **Windows**、**`payload_format=json`** 且含 **`registry_keys[]`** 时：**`=1`** 导出注册表文本（**`registry_*`**）；见 **`docs/FORENSIC_STRUCTURED_PAYLOAD.md`**。 |
+| `EDR_FORENSIC_MEMORY_DUMP` | **Windows**、JSON **`memory_regions[]`**（**`pid`/`base`/`size`**）时：**`=1`** 尝试 **`ReadProcessMemory`** 落盘 **`mem_*.bin`**；受权限与进程保护限制；见同上文档。 |
+| `EDR_FORENSIC_UPLOAD` | **`forensic`** 生成 **`bundle.tgz`** 后：未设置或非 **`0`** 时，若 **gRPC EventIngest** 已就绪且包非空，则自动 **`UploadFile`**（`FileChunk.alert_id` = **`forensic-<command_id>`**，无 **`command_id`** 时为 **`forensic-job`**，与作业目录默认名一致）；设为 **`0`** 关闭（离线/排障）。 |
+| `EDR_SHELLCODE_WD_STATS` | **`=1`** 且 **§17 WinDivert** 已启动时，在 **`edr_windivert_capture_stop`**（模块关闭）打印一行 **`wd_stats`**（**`recv` / `recv_err` / `skip` / `mon_skip` / `pushed` / `bus_drop` / `alert_dedup`**）；见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`** **P2b**、**`edr_shellcode_windivert_stats_snapshot`**。 |
+| `EDR_AGENT_METRICS_BIND` | **（Windows）** 形如 **`127.0.0.1:9123`**（**IPv4:端口**）时，进程内 **`GET /metrics`**（Prometheus 文本）与 **`GET /health`**；见 **`docs/PROMETHEUS_BUS_METRICS.md`**、**`src/core/metrics_http.c`**。 |
 | `EDR_ISOLATE_STAMP_PATH` | 隔离标记文件路径；未设置时 POSIX 默认 `/tmp/edr_isolated_<command_id>`，Windows 默认 **`%TEMP%\\edr_isolated_<command_id>`**。 |
 | `EDR_PLATFORM_REST_BASE` | 覆盖 **`[platform].rest_base_url`**；攻击面 **`POST`** 的 API 前缀（无尾斜杠）。未设置且 TOML 未配时，指令仍成功结束但不发起 HTTP（结果 detail 含 `skip_no_rest_base`）。 |
 | `EDR_PLATFORM_BEARER` | 可选 JWT，作为 **`Authorization: Bearer …`**（优先于 **`[platform].rest_bearer_token`**）。 |
@@ -239,7 +248,7 @@ cmake --build build
 
 - **`ReportEvents`**：每次批次 flush 时，将 **12 字节批次头 + 载荷**（BAT1 或 BLZ4，见 §6.2）作为 `payload` 上报，并带 `batch_id`（幂等）、`endpoint_id`、`agent_version`。
 - **`upload.max_upload_mbps`**：在 `ReportEvents` 发送前对**本批 wire 字节数**（头+体）做**令牌桶**节流（`0` = 不限制；默认 `1` Mbps）；与失败退避独立，二者可能叠加等待。
-- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `kill` / `forensic` 在启用高危策略时执行（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`** 在 Windows 上同样写 manifest、可选 `copy`、`tar` 打 **`bundle.tgz`**（依赖 **`tar.exe`**）。
+- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `kill` / `forensic` 在启用高危策略时执行（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`**：写 manifest、可选路径复制、**`tar`** 打 **`bundle.tgz`**；**Windows** 用 **`CreateDirectoryA`** + **`CreateProcessW`** 调 **`%SystemRoot%\\System32\\tar.exe`**；**POSIX** 用 **`mkdir`** + **`fork`/`execvp("tar")`**；均不经 **shell**（需系统 **`tar`**）。**`bundle.tgz`** 非空且 **gRPC** 就绪时默认 **`edr_grpc_client_upload_file`**（与 Webshell 同一 **`UploadFile`** RPC，**`alert_id`** = **`forensic-<command_id>`**，便于与告警 **`alert_id`** 区分；无 **`command_id`** 时为 **`forensic-job`**）；**`EDR_FORENSIC_UPLOAD=0`** 关闭。
 - **`ReportCommandResult`**： unary，上报 **`CommandExecutionResult`**（状态、exit_code、detail、完成时间等）；与 **`ReportEvents` 事件批次**相互独立。详见 **`docs/SOAR_CONTRACT.md`**。
 - **`ReportEvents` 失败退避**：连续失败后，下一次 RPC 前在持锁侧做 **50ms～5s** 的指数退避（减轻对不可用服务端的冲击）。
 - 通道参数：`GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS` / `MAX_RECONNECT_BACKOFF_MS` 已设置，便于底层重连。
@@ -298,7 +307,7 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 - 启动时若配置了 `server.address`，`[transport] gRPC target: …` 会打印目标地址；随后由 gRPC 客户端按证书或 `EDR_GRPC_INSECURE` 建立通道。
 - 成功加载配置文件路径时，stderr 会打印 **`[config] fingerprint=…`**（FNV-1a 十六进制）；热重载成功后再打一行 **`热重载 fingerprint=…`**。
 
-**Linux**（且 `EDR_WITH_LINUX_COLLECTOR=ON`，默认）编入 `collector_linux.c`：**inotify** 监视目录（默认 `/tmp` 或 `EDR_INOTIFY_PATHS`），产出**文件侧**事件（`ETW1\nprov=inotify…`），**无**进程创建/网络等内核级等价流。**其它非 Windows**（如 macOS）仍为 **`collector_stub`**。在 **Windows** 上构建时自动编译 `src/collector/collector_win.c`：创建实时 ETW 会话、启用 **Kernel-Process / Kernel-File / Kernel-Network** 三通道（§3.1.1），并按配置启用 **§19.10** 的 **Microsoft-Windows-TCPIP** / **WFAS 防火墙** Provider（见「ETW 增强」）；独立线程 `OpenTrace` + `ProcessTrace`，回调中过滤本进程 PID 并写入事件总线。
+**Linux**（且 `EDR_WITH_LINUX_COLLECTOR=ON`，默认）编入 `collector_linux.c`：**inotify** 监视目录（默认 `/tmp` 或 `EDR_INOTIFY_PATHS`），产出**文件侧**事件（`ETW1\nprov=inotify…`），**无**进程创建/网络等内核级等价流。**其它非 Windows**（如 macOS）仍为 **`collector_stub`**。在 **Windows** 上构建时自动编译 `src/collector/collector_win.c`：创建实时 ETW 会话、启用 **Kernel-Process / Kernel-File / Kernel-Network** 与 **Kernel-Registry**（**Microsoft-Windows-Kernel-Registry**，§3.1.1 行为类扩展），并按配置启用 **§19.10** 的 **Microsoft-Windows-TCPIP** / **WFAS 防火墙** Provider（见「ETW 增强」）；独立线程 `OpenTrace` + `ProcessTrace`，回调中过滤本进程 PID 并写入事件总线。
 
 运行 `edr_agent` 后将以 200ms 周期等待直至 Ctrl+C（控制台）触发关闭。**内核 Provider 通常需要提升权限**（管理员或具备相应 ETW 权限），否则 `StartTrace` / `EnableTraceEx2` 可能返回 `EDR_ERR_ETW_SESSION_CREATE` 或 `EDR_ERR_ETW_PROVIDER_ENABLE`。
 
@@ -306,9 +315,10 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 
 - 运行时库：`third_party/nanopb`（`pb_encode.c`、`pb_common.c`），定义 `EDR_HAVE_NANOPB`。
 - 生成文件：`src/proto/edr/v1/event.pb.h`、`event.pb.c`（由 `proto/edr/v1/event.proto` + `event.options` 生成）。
-- 重新生成：`chmod +x scripts/regen_event_proto.sh && ./scripts/regen_event_proto.sh`（需 Python3，且建议 `pip install protobuf` 与系统 `protoc` 主版本一致，否则 nanopb 生成器可能报错）。
+- 重新生成：`chmod +x scripts/regen_event_proto.sh && ./scripts/regen_event_proto.sh`（需 Python3，且 **`pip install` 的 `protobuf` 主版本须与 `third_party/nanopb` 生成器内 `nanopb_pb2` 一致**，常见为 **protobuf 7.x**；不一致会报 `VersionError`。若环境无法升级，可暂用手工维护的 `event.pb.h` / `event.pb.c` 与 `event.options` 中 `descriptorsize` 对齐仓库）。
 - 编码 API：`edr_behavior_record_encode_protobuf()`（`include/edr/behavior_proto.h`）。
-- 默认预处理仍输出 **BER1 线格式**；设置环境变量 `EDR_BEHAVIOR_ENCODING=protobuf` 时尝试 nanopb；`protobuf_c` 时调用 `edr_behavior_record_encode_protobuf_c()`（当前与 nanopb **同一套 protobuf 二进制**，可与 `libprotobuf-c` 解包兼容；若需原生 `*_pack`，见 `third_party/protobuf-c/README_EDR.txt` 与 `scripts/regen_event_proto_c.sh`）；失败则回退 BER1。
+- **`RegistryDetail`**：`BehaviorEvent` oneof **`registry = 23`**，与平台 ingest **`category=registry`** / `registry_key_path` 等字段对齐；仅当记录上 **`reg_*`** 有内容（或类型为注册表且已默认 **`reg_op`**）时写入该分支。
+- 默认预处理仍输出 **BER1 线格式**；设置环境变量 **`EDR_BEHAVIOR_ENCODING=protobuf`** 时尝试 **nanopb**（含 **`RegistryDetail`** wire）；`protobuf_c` 时调用 `edr_behavior_record_encode_protobuf_c()`（当前与 nanopb **同一套 protobuf 二进制**，可与 `libprotobuf-c` 解包兼容；若需原生 `*_pack`，见 `third_party/protobuf-c/README_EDR.txt` 与 `scripts/regen_event_proto_c.sh`）；失败则回退 BER1。
 
 ### LZ4（可选）
 
@@ -317,7 +327,8 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 ### ETW 增强（Windows）
 
 - **TDH**（`etw_tdh_win.c`）：`TdhGetPropertySize` / `TdhGetProperty` 按 Provider 尝试多组字段名，将事件整理为 UTF-8 文本载荷 `ETW1\nprov=...\npid=...\nimg=...\ncmd=...\n`（见 §3.1.3）。
-- **Provider**：在 Kernel 三通道之外，尽力启用 **DNS-Client、PowerShell、Security-Auditing、WMI-Activity**；后四类若因权限或策略失败会**跳过**（内核三通道仍失败则整段启动失败）。
+- **Kernel-Registry（注册表）**：**Microsoft-Windows-Kernel-Registry** 与 Process/File/Network 同为 **mandatory** Provider；TDH 尝试 **`KeyName` / `RelativeName` / `ValueName` / `ValueData`（及备选 `Data`）** 等，写入 ETW1 行 **`regkey=`**、**`regname=`**、**`regdata=`**；**`ValueData` 无法按 UTF-16/ULONG 转成可读 UTF-8 时**回退为 **`hex:` + 小写十六进制**（端上最多约 **2048 字节** 载荷，与平台 **`truncateRunes(..., 8192)`** 衔接）。预处理映射为 **`EDR_EVENT_REG_*`**（**Opcode 为主**，部分变体按 **Event ID 12–17** 回退），默认 **`regop`** 为 **`create_key` / `set_value` / `delete_key`**；**`prov=kreg`**。与 **`BehaviorEvent.detail.registry`**（nanopb **`registry`**）及平台 **`category=registry`** 的联调步骤见 **`docs/REGISTRY_ETW_ACCEPTANCE.md`**。
+- **Provider**：在 **Kernel 四通道（含 Registry）** 之外，尽力启用 **DNS-Client、PowerShell、Security-Auditing、WMI-Activity**；后四类若因权限或策略失败会**跳过**（**Kernel 四通道**仍失败则整段启动失败）。
 - **§19.10（AGT-001）**：`[collection]` 中 **`etw_tcpip_provider`**（默认 `true`）启用 **Microsoft-Windows-TCPIP**；**`etw_firewall_provider`**（默认 `true`）启用 **Windows Firewall With Advanced Security**。二者启用失败时**仅 stderr 提示并继续**（不导致 `edr_collector_start` 失败）。事件映射：`prov=tcpip`，事件 ID **1002** → `EDR_EVENT_NET_LISTEN`，其余常见 ID → `EDR_EVENT_NET_CONNECT`；`prov=wf` → `EDR_EVENT_FIREWALL_RULE_CHANGE`（MITRE 初标 **T1562.004**）。TDH 对 TCPIP/WF 补充常见属性名（如 `LocalPort` / `RuleName` 等），解析不到时仍可能回退 **UserData 原始字节**。
 - **§19.10 → 攻击面联动**：上述 Provider 产生的事件在入总线时置 **`attack_surface_hint`**；预处理线程消费时调用 **`edr_attack_surface_etw_signal()`**；主循环在 **`[attack_surface].enabled=true`** 且 **`etw_refresh_triggers_snapshot=true`（默认）** 时，按 **`etw_refresh_debounce_s`（默认 8，范围 1～300 秒）** 去抖后执行 **`edr_attack_surface_execute("etw_tcpip_wf", …)`**（与周期快照、refresh-request 共用采集与 POST 路径）。关闭联动：将 `etw_refresh_triggers_snapshot` 设为 `false`。
 - **优先级**：载荷中出现 `EncodedCommand` / `-Enc` 时置 `priority=0`（对齐 §4 高危特征初筛）；`tcpip` 连接类默认低优先级，`wf` 规则变更默认高优先级。
@@ -337,19 +348,19 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 |------|------|
 | §6–§7 批次上报、gRPC、mTLS、Subscribe 重连、指令入口 | 已接通初版 |
 | §10 队列 always/on_fail、补传、重试上限、库大小上限 | 已接通初版（Windows 下 MSVC 用 `_stat64` 检查库大小） |
-| **P1 §8** | **深化**：`kill` / `isolate` / `forensic`（POSIX/Windows 路径与产物、**`EDR_FORENSIC_COPY_PATHS`**、**`EDR_CMD_AUDIT_PATH`**、**`EDR_ISOLATE_HOOK`**）；TOML **`[command] allow_dangerous`**；**`EDR_CMD_KILL_ALLOWLIST`**；**Windows** 下 **kill** 拒绝本进程；**`self_protect_status` / `agent_health` / `health_status`**。 |
-| **P2 §9** | **深化**：**`SIGTERM` / `SIGINT`**、**`EDR_SELF_PROTECT_PIDFILE`**、**`EDR_SELF_PROTECT_WATCHDOG`**；**防调试**（`[self_protect] anti_debug`）、**事件总线背压**告警（`event_bus_pressure_warn_pct`）、可选 **Windows Job Object**（`job_object_windows`）、**`watchdog_log_interval_s`**、**`edr_self_protect_format_status`**。 |
-| **P3 §12** | **初版**：`getrusage` 粗算 CPU%、RSS 与 `resource_limit` 比对；`cpu_limit<5%` 且未设 **`EDR_RESOURCE_STRICT=1`** 时不刷屏。**AGT-010**：**`edr_resource_preprocess_throttle_active()`** — 超限时预处理 **跳过低优先级**（`priority!=0`，且非 `attack_surface_hint`）；**Windows** 无 rusage 时可设 **`EDR_PREPROCESS_THROTTLE=1`** 联调。 |
-| **P4 §5** | **深化**：模型目录统计 + **`edr_ave_file_fingerprint`**；**`edr_ave_infer_file`** 占位（未接 ONNX 时返回 **`EDR_ERR_NOT_IMPL`**；**`EDR_AVE_INFER_DRY_RUN=1`** 可走通联调）；**gRPC Subscribe** 指令类型 **`ave_status` / `ave_fingerprint` / `ave_infer`** 与 **`edr_command_bind_config`** 联动。 |
+| **P1 §8** | **深化**：`kill` / `isolate` / `forensic`（POSIX/Windows 路径与产物、**`EDR_FORENSIC_COPY_PATHS`**、**`EDR_CMD_AUDIT_PATH`**、**`EDR_ISOLATE_HOOK`**）；TOML **`[command] allow_dangerous`**；**`EDR_CMD_KILL_ALLOWLIST`**；**Windows** 下 **kill** 拒绝本进程；**`self_protect_status` / `agent_health` / `health_status`**。**`forensic` JSON**：**`paths[]`**、**`registry_keys[]`** / **`memory_regions[]`**（**`EDR_FORENSIC_REGISTRY_DUMP` / `EDR_FORENSIC_MEMORY_DUMP`**，Windows）、manifest **用户/卷序列号** 见 **`docs/FORENSIC_STRUCTURED_PAYLOAD.md`**；总表 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md` §P1**。 |
+| **P2 §9** | **深化**：**`SIGTERM` / `SIGINT`**、**`EDR_SELF_PROTECT_PIDFILE`**、**`EDR_SELF_PROTECT_WATCHDOG`**；**防调试**（`[self_protect] anti_debug`）、**事件总线背压**告警（`event_bus_pressure_warn_pct`）、可选 **Windows Job Object**（`job_object_windows`）、**`watchdog_log_interval_s`**、**`edr_self_protect_format_status`**。**§P2c**：**`--service`**（SCM **STOP** → **`edr_agent_shutdown`**）见 **`WINDOWS_SERVICE_SHUTDOWN.md`**；**S2–S4** 见 **`SELF_PROTECT_REGRESSION.md`**、**`PROMETHEUS_BUS_METRICS.md`**、**`WINDOWS_DEPLOY.md` §3.0**；进程内 **`/metrics`** 仍排期，总表 **`WINDOWS_SHELLCODE_FORENSIC_TODO.md` §P2c**。 |
+| **P3 §12** | **初版**：`getrusage` 粗算 CPU%、RSS 与 `resource_limit` 比对；`cpu_limit<5%` 且未设 **`EDR_RESOURCE_STRICT=1`** 时不刷屏。**AGT-010**：**`edr_resource_preprocess_throttle_active()`** — 超限时预处理 **跳过低优先级**（`priority!=0`，且非 `attack_surface_hint`）；**Windows** 无 rusage 时可设 **`EDR_PREPROCESS_THROTTLE=1`** 联调。**与 §17 交界**：WinDivert **总线丢包**语义见 **`docs/EVENT_BUS_BACKPRESSURE.md`**（**`WINDOWS_SHELLCODE_FORENSIC_TODO` §P2b P2-PERF-3** 已关闭）。 |
+| **P4 §5** | **深化**：模型目录统计 + **`edr_ave_file_fingerprint`**；**`edr_ave_infer_file`** 占位（未接 ONNX 时返回 **`EDR_ERR_NOT_IMPL`**；**`EDR_AVE_INFER_DRY_RUN=1`** 可走通联调）；**gRPC Subscribe** 指令类型 **`ave_status` / `ave_fingerprint` / `ave_infer`** 与 **`edr_command_bind_config`** 联动。**与控制台交界**：行为 ONNX 详情面板 **`BehaviorAlertDetailPanel`**（**`edr-frontend`**）；告警侧 **MinIO key**：**`GET /alerts/:id`** 已合并 **`artifacts`**（C2）；**`AlertDetailPage`** 已展示（C3）；ingest **C1** 落桶 **`agent-artifacts/`**。 |
 | **P5 §11.2** | **深化**：本地 mtime 热重载 + **`EDR_REMOTE_CONFIG_URL` / `EDR_REMOTE_CONFIG_POLL_S`** 心跳拉 TOML（依赖 **curl**）；指纹日志；**未**热更 gRPC 证书/批次参数。 |
 | **P6** | **ctest**：`edr_agent --help`、**`ave_file_fingerprint`**、**`ave_infer_dry_run`**、**`config_fingerprint`**、**`shellcode_modules`**、**`edr_agent_smoke`**（`scripts/agent_smoke.sh` 启动进程后 SIGINT）；**`scripts/ci_build.sh`**、**`.github/workflows/edr-agent-ci.yml`**（**macOS / Ubuntu / Windows**）。 |
-| §3 采集 | **Windows**：ETW 内核三通道 + TDH + 扩展 Provider（见上文「ETW 增强」）。**Linux**：**M1 inotify** 文件事件（`collector_linux.c`）；**进程/网络等 §3.2 级采集** 仍属 **P7（eBPF CO-RE）**。**其它 POSIX**：`collector_stub`。 |
+| §3 采集 | **Windows**：ETW **Kernel-Process / File / Network / Registry** + TDH + 扩展 Provider（见上文「ETW 增强」；Registry 实机验收 **`docs/REGISTRY_ETW_ACCEPTANCE.md`**）。**Linux**：**M1 inotify** 文件事件（`collector_linux.c`）；**进程/网络等 §3.2 级采集** 仍属 **P7（eBPF CO-RE）**。**其它 POSIX**：`collector_stub`。 |
 | §1.2 API / IAT 监控层 | **本期 descope**（**`docs/AGT004_API_MONITOR_DESCope.md`**）；主路径为 **ETW → 总线 → 预处理**。 |
 | Windows 服务 / 权限预检（§1.1 / §13） | **已关闭 AGT-006**（**`docs/WINDOWS_DEPLOY.md`**、**`deploy/README.md`**）；MSI/平台打包见 **edr-backend**。 |
 | §7 连接保活 / 控制台「在线」 | **已关闭 AGT-007**：终端 **gRPC keepalive**（**`docs/SOAR_CONTRACT.md` §4.1**）；平台 **`T_offline` 与在线语义**（**§4.2**）；**落库与控制台 API** 在 **edr-backend**（**§4.2.3**）。 |
 | §2.1 线程 / 主循环 | **已关闭 AGT-003**（**`docs/AGENT_THREAD_MODEL.md`**）。 |
 | §12 资源 / 预处理降载 | **已关闭 AGT-010**（预处理 **`priority`** 降载 + **`resource.h`**）；**`README`** 本表 **P3 §12**。 |
-| 取证 UploadFile E2E | **已关闭 AGT-009**（**`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**；`forensic` bundle 上传续见 **WINDOWS_SHELLCODE_FORENSIC_TODO**）。 |
+| 取证 UploadFile E2E | **已关闭 AGT-009**（**`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**；Webshell + **`forensic`** **`bundle.tgz`**、**`EDR_FORENSIC_UPLOAD`**）。 |
 | §3.2 Linux P7 eBPF | **已关闭 AGT-012**（路线图 **`docs/AGT012_LINUX_EBPF_P7.md`**；**实现** 按 P7.x PR）。 |
 
 ---

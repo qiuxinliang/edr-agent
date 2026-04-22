@@ -524,7 +524,9 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
     return;
   }
   slot.size = (uint32_t)n;
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    fprintf(stderr, "[webshell_detector] event bus full, drop alert: %s\n", file_path);
+  }
 }
 
 static void handle_change(const char *full_path, const char *action) {

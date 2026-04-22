@@ -3,6 +3,7 @@
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
+#include "edr/metrics_http.h"
 #include "edr/preprocess.h"
 #include "edr/resource.h"
 #include "edr/self_protect.h"
@@ -49,6 +50,7 @@ void edr_agent_destroy(EdrAgent *agent) {
   if (!agent) {
     return;
   }
+  edr_metrics_http_stop();
   edr_preprocess_stop();
   edr_self_protect_shutdown();
   edr_resource_shutdown();
@@ -127,6 +129,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   }
   edr_self_protect_apply_config(&agent->cfg);
   edr_self_protect_set_event_bus(agent->event_bus);
+  edr_metrics_http_start_if_configured(agent->event_bus);
   return EDR_OK;
 }
 

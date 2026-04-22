@@ -88,6 +88,67 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   return ERROR_NOT_FOUND;
 }
 
+/**
+ * 将任意属性字节序列格式化为 `hex:` + 小写十六进制（与平台 truncate 8192 对齐前在端上截断）。
+ * 用于 Kernel-Registry 的 ValueData 等二进制字段（UTF-16/ULONG 路径走 edr_prop_utf8）。
+ */
+static ULONG edr_prop_as_hex_line(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
+                                  size_t out_cap) {
+  if (!rec || !prop_name || !out || out_cap == 0) {
+    return ERROR_INVALID_PARAMETER;
+  }
+  PROPERTY_DATA_DESCRIPTOR pdd;
+  memset(&pdd, 0, sizeof(pdd));
+  pdd.PropertyName = (ULONGLONG)(ULONG_PTR)prop_name;
+  pdd.ArrayIndex = ULONG_MAX;
+
+  ULONG cb = 0;
+  ULONG st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
+  if (st != ERROR_SUCCESS || cb == 0 || cb > 65536) {
+    return st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+  }
+
+  BYTE *tmp = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cb);
+  if (!tmp) {
+    return ERROR_NOT_ENOUGH_MEMORY;
+  }
+
+  st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, tmp);
+  if (st != ERROR_SUCCESS) {
+    HeapFree(GetProcessHeap(), 0, tmp);
+    return st;
+  }
+
+  static const char k_prefix[] = "hex:";
+  const size_t plen = sizeof(k_prefix) - 1u;
+  if (out_cap <= plen + 8u) {
+    HeapFree(GetProcessHeap(), 0, tmp);
+    return ERROR_NOT_FOUND;
+  }
+  size_t room = out_cap - 1u - plen;
+  size_t max_bytes = room / 2u;
+  if (max_bytes > 2048u) {
+    max_bytes = 2048u;
+  }
+  if ((size_t)cb > max_bytes) {
+    cb = (ULONG)max_bytes;
+  }
+  memcpy(out, k_prefix, plen);
+  size_t pos = plen;
+  for (ULONG i = 0; i < cb; i++) {
+    int n = snprintf(out + pos, out_cap - pos, "%02x", (unsigned)tmp[i]);
+    if (n <= 0 || (size_t)n >= out_cap - pos) {
+      out[out_cap - 1] = '\0';
+      HeapFree(GetProcessHeap(), 0, tmp);
+      return ERROR_SUCCESS;
+    }
+    pos += (size_t)n;
+  }
+  out[pos] = '\0';
+  HeapFree(GetProcessHeap(), 0, tmp);
+  return ERROR_SUCCESS;
+}
+
 typedef struct {
   PCWSTR name;
   const char *key;
@@ -156,7 +217,10 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"RelativeName", "regpath"},
       {L"ValueName", "regname"},
       {L"CapturedValueName", "regname"},
-      {L"ValueData", "regdata"},
+  };
+  static const PCWSTR reg_value_data_props[] = {
+      L"ValueData",
+      L"Data",
   };
   static const EdrPropTry dns_try[] = {
       {L"QueryName", "qname"},
@@ -207,6 +271,18 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
+    for (size_t i = 0; i < sizeof(reg_value_data_props) / sizeof(reg_value_data_props[0]); i++) {
+      if (edr_prop_utf8(rec, reg_value_data_props[i], line, sizeof(line)) == ERROR_SUCCESS &&
+          line[0]) {
+        append_utf8((char *)out, out_cap, &off, "regdata=%s\n", line);
+        break;
+      }
+      if (edr_prop_as_hex_line(rec, reg_value_data_props[i], line, sizeof(line)) == ERROR_SUCCESS &&
+          line[0]) {
+        append_utf8((char *)out, out_cap, &off, "regdata=%s\n", line);
+        break;
+      }
+    }
   } else if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, dns_try, sizeof(dns_try) / sizeof(dns_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);

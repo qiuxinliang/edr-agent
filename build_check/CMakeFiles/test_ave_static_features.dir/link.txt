@@ -1,0 +1,1 @@
+/usr/bin/cc  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_ave_static_features.dir/tests/test_ave_static_features.c.o CMakeFiles/test_ave_static_features.dir/src/ave/ave_static_features.c.o -o test_ave_static_features

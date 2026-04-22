@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_ave_cross_engine_parse.dir/tests/test_ave_cross_engine_parse.c.o CMakeFiles/test_ave_cross_engine_parse.dir/src/ave/ave_cross_engine_parse.c.o -o test_ave_cross_engine_parse  -lm

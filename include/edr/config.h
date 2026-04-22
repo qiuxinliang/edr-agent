@@ -219,8 +219,9 @@ typedef struct EdrConfig {
     bool monitor_ldap;
     uint32_t detector_threads;
     char yara_rules_dir[1024];
+    /** 非空：WinDivert PCAP 根目录；空则回退 EDR_FORENSIC_OUT\\shellcode，再 %TEMP%\\edr_forensic\\shellcode（windivert_capture.c） */
     char forensic_dir[1024];
-    /** 告警时写 PCAP（需 forensic_dir 非空；无环形时单包 raw LINKTYPE 228/229） */
+    /** 告警时写 PCAP（true 即落盘；根路径见 forensic_dir 与上述回退） */
     bool forensic_save_pcap;
     /** 告警 ETW1 中附加证据区 SHA256 后的十六进制预览长度（0=关闭，上限见 config clamp） */
     uint32_t evidence_preview_bytes;

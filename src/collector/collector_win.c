@@ -33,6 +33,9 @@
 static WCHAR g_session_name[] = L"EDR_Agent_RT_001";
 
 static EdrEventBus *s_bus;
+/** Throttle stderr when ETW events cannot be queued (align observability with shellcode / Linux webshell). */
+static ULONGLONG s_etw_bus_drop_log_tick;
+static unsigned s_etw_bus_drops_since_log;
 static DWORD s_agent_pid;
 static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
@@ -120,7 +123,19 @@ static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
       *out_type = EDR_EVENT_REG_SET_VALUE;
       return;
     }
-    (void)ev_id;
+    /* 部分构建/ETW 变体 Opcode 恒为 0：按 Event ID 回退（常见 12–17） */
+    if (ev_id == 12u || ev_id == 13u) {
+      *out_type = EDR_EVENT_REG_CREATE_KEY;
+      return;
+    }
+    if (ev_id == 14u || ev_id == 17u) {
+      *out_type = EDR_EVENT_REG_DELETE_KEY;
+      return;
+    }
+    if (ev_id == 16u) {
+      *out_type = EDR_EVENT_REG_SET_VALUE;
+      return;
+    }
     *out_type = EDR_EVENT_REG_SET_VALUE;
     return;
   }
@@ -243,7 +258,20 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     }
   }
 
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (edr_event_bus_try_push(s_bus, &slot)) {
+    s_etw_bus_drops_since_log = 0u;
+    return;
+  }
+  s_etw_bus_drops_since_log++;
+  {
+    ULONGLONG t = GetTickCount64();
+    if (s_etw_bus_drop_log_tick == 0ULL || t - s_etw_bus_drop_log_tick >= 5000ULL) {
+      fprintf(stderr, "[collector_win] event bus full, dropped ETW events (count since last log: %u)\n",
+              s_etw_bus_drops_since_log);
+      s_etw_bus_drop_log_tick = t;
+      s_etw_bus_drops_since_log = 0u;
+    }
+  }
 }
 
 static DWORD WINAPI edr_etw_consumer_thread(void *arg) {

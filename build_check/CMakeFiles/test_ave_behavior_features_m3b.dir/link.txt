@@ -1,0 +1,1 @@
+/usr/bin/cc  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_ave_behavior_features_m3b.dir/tests/test_ave_behavior_features_m3b.c.o CMakeFiles/test_ave_behavior_features_m3b.dir/src/ave/ave_behavior_features.c.o -o test_ave_behavior_features_m3b  -lm

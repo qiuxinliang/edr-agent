@@ -50,6 +50,26 @@ $env:EDR_ENROLL_TOKEN="..."
 
 调试自签：`$env:EDR_INSECURE_TLS="1"`（脚本内使用旧版证书回调，仅用于测试）。
 
+### 方式三 · Windows 服务（可选，`--service` 与 SCM 对齐）
+
+与 **`docs/WINDOWS_SERVICE_SHUTDOWN.md`**、**`docs/WINDOWS_DEPLOY.md` §4** 一致：**`sc create` 的服务名**须与 **`binPath` 中 `--service` 后的名称**相同（脚本默认 **`EdrAgent`**，可用 **`-ServiceName`** 或 **`EDR_SERVICE_NAME`**）。
+
+- **Enroll 并注册服务**（管理员 PowerShell）：
+
+```powershell
+.\scripts\edr_agent_install.ps1 -ApiBase "http://127.0.0.1:8080" -Token "enr_..." `
+  -Output "C:\ProgramData\EDR\agent.toml" `
+  -AgentExe "C:\Program Files\EDR\edr_agent.exe" -RegisterService -ServiceName EdrAgent
+```
+
+- **已有 `agent.toml`，仅注册**：**`-SkipEnroll`** + **`-RegisterService`** + **`-AgentExe`**（路径同 **`EDR_AGENT_EXE`**）。
+
+- **卸载服务**（不删配置与二进制）：**`-UnregisterService -ServiceName EdrAgent`**。
+
+- **服务已存在需重建**：加 **`-ReplaceService`**（先 **stop/delete** 再 **create**）。
+
+**`edr-backend`** 内嵌 zip 使用的副本见 **`platform/internal/installer/embedded/`**；更新 **`edr-agent/scripts/edr_agent_install.ps1`** 后请执行仓库 **`edr-backend/scripts/sync_agent_installer_embedded.sh`**（或等价复制），见 **`embedded/SYNC_FROM_EDR_AGENT.md`**。
+
 ## 生成内容说明
 
 安装器会写入：

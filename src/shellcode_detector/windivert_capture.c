@@ -13,6 +13,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <wincrypt.h>
+#include <iphlpapi.h>
 
 #include "edr/command.h"
 #include "edr/config.h"
@@ -77,6 +78,15 @@ static volatile LONG s_capture_stop;
 static const EdrConfig *s_cfg;
 static EdrEventBus *s_bus;
 static int s_wsa_started;
+
+/* P2-PERF-2：WinDivert 可观测计数（Interlocked64；关机见 EDR_SHELLCODE_WD_STATS） */
+static volatile LONG64 s_wd_stat_recv_packets;
+static volatile LONG64 s_wd_stat_recv_errors;
+static volatile LONG64 s_wd_stat_row_skipped;
+static volatile LONG64 s_wd_stat_monitor_filtered;
+static volatile LONG64 s_wd_stat_alerts_pushed;
+static volatile LONG64 s_wd_stat_bus_drops;
+static volatile LONG64 s_wd_stat_alert_dedup;
 
 /** 环形缓冲（仅捕获线程写；告警同线程读） */
 static uint8_t *s_ring_mem;
@@ -159,6 +169,39 @@ static void mkdir_p_win(const char *dir) {
   char cmd[1200];
   snprintf(cmd, sizeof(cmd), "cmd /c mkdir \"%s\" 2>nul", dir);
   (void)system(cmd);
+}
+
+/**
+ * Shellcode PCAP 落盘根路径（P2 与远程取证根对齐）：
+ * 1) `[shellcode_detector].forensic_dir` 非空则用之；
+ * 2) 否则若设置 **`EDR_FORENSIC_OUT`** → **`%s\\shellcode`**（与 **`do_forensic`** 作业子目录并列，避免混写）；
+ * 3) 否则 **`%TEMP%\\edr_forensic\\shellcode`**（与默认 **`EDR_FORENSIC_OUT`** 语义一致）。
+ */
+static void shellcode_forensic_root(char *out, size_t cap, const EdrConfig *cfg) {
+  if (!out || cap < 8u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!cfg) {
+    return;
+  }
+  if (cfg->shellcode_detector.forensic_dir[0]) {
+    (void)snprintf(out, cap, "%s", cfg->shellcode_detector.forensic_dir);
+    return;
+  }
+  const char *fo = getenv("EDR_FORENSIC_OUT");
+  if (fo && fo[0]) {
+    (void)snprintf(out, cap, "%s\\shellcode", fo);
+    return;
+  }
+  const char *tmp = getenv("TEMP");
+  if (!tmp || !tmp[0]) {
+    tmp = getenv("TMP");
+  }
+  if (!tmp || !tmp[0]) {
+    tmp = ".";
+  }
+  (void)snprintf(out, cap, "%s\\edr_forensic\\shellcode", tmp);
 }
 
 static void pcap_write_global_header(FILE *f, uint32_t linktype) {
@@ -419,6 +462,96 @@ static int monitor_allows(const EdrConfig *c, uint16_t dp, uint16_t sp) {
   return 1;
 }
 
+static uint64_t str_hash_fnv1a64(const char *s) {
+  const uint64_t fnv_offset = 14695981039346656037ull;
+  const uint64_t fnv_prime = 1099511628211ull;
+  uint64_t h = fnv_offset;
+  if (s) {
+    for (; *s; s++) {
+      h ^= (uint64_t)(unsigned char)*s;
+      h *= fnv_prime;
+    }
+  }
+  return h;
+}
+
+/** T-SC-041: suppress duplicate pushes for same ports + rule + proto within 30s (wall clock). */
+#define EDR_SHELLCODE_ALERT_DEDUP_NS (30ull * 1000000000ull)
+
+/**
+ * 对本地端口 `port_host_order`（主机序）用 GetExtendedTcpTable 反查属主 PID。
+ * 与 pmfe_etw_preprocess / attack_surface 一致：优先 LISTEN(2)，否则 ESTABLISHED(5)。
+ */
+static DWORD shellcode_tcp_owner_pid_for_local_port_v4(uint16_t port_host_order) {
+  DWORD size = 0;
+  if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER ||
+      size == 0) {
+    return 0u;
+  }
+  MIB_TCPTABLE_OWNER_PID *tab = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
+  if (!tab) {
+    return 0u;
+  }
+  if (GetExtendedTcpTable(tab, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+    free(tab);
+    return 0u;
+  }
+  DWORD listen_pid = 0u;
+  DWORD estab_pid = 0u;
+  for (DWORD i = 0; i < tab->dwNumEntries; i++) {
+    MIB_TCPROW_OWNER_PID *r = &tab->table[i];
+    uint16_t lp = (uint16_t)ntohs((u_short)r->dwLocalPort);
+    if (lp != port_host_order) {
+      continue;
+    }
+    if ((int)r->dwState == 2) {
+      listen_pid = r->dwOwningPid;
+    } else if ((int)r->dwState == 5) {
+      estab_pid = r->dwOwningPid;
+    }
+  }
+  free(tab);
+  if (listen_pid != 0u) {
+    return listen_pid;
+  }
+  return estab_pid;
+}
+
+static DWORD shellcode_tcp_owner_pid_for_local_port_v6(uint16_t port_host_order) {
+  DWORD size = 0;
+  if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER ||
+      size == 0) {
+    return 0u;
+  }
+  MIB_TCP6TABLE_OWNER_PID *tab = (MIB_TCP6TABLE_OWNER_PID *)malloc(size);
+  if (!tab) {
+    return 0u;
+  }
+  if (GetExtendedTcpTable(tab, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+    free(tab);
+    return 0u;
+  }
+  DWORD listen_pid = 0u;
+  DWORD estab_pid = 0u;
+  for (DWORD i = 0; i < tab->dwNumEntries; i++) {
+    MIB_TCP6ROW_OWNER_PID *r = &tab->table[i];
+    uint16_t lp = (uint16_t)ntohs((u_short)r->dwLocalPort);
+    if (lp != port_host_order) {
+      continue;
+    }
+    if ((int)r->dwState == 2) {
+      listen_pid = r->dwOwningPid;
+    } else if ((int)r->dwState == 5) {
+      estab_pid = r->dwOwningPid;
+    }
+  }
+  free(tab);
+  if (listen_pid != 0u) {
+    return listen_pid;
+  }
+  return estab_pid;
+}
+
 static const char *kind_name(EdrProtoKind k) {
   switch (k) {
     case EDR_PROTO_KIND_SMB2:
@@ -436,11 +569,26 @@ static const char *kind_name(EdrProtoKind k) {
 
 static int push_alert(double score, const char *detector_label, const char *rule_name, const char *proto_label,
                       uint16_t dpt, uint16_t spt, const char *src, const char *dst, const uint8_t *evidence,
-                      uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6) {
+                      uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6, const char *det_layer,
+                      double rule_confidence) {
   if (!s_bus) {
     fprintf(stderr, "[shellcode_detector] score=%.3f proto=%s %s:%u -> %s:%u (no event bus)\n", score, proto_label,
             src, (unsigned)spt, dst, (unsigned)dpt);
     return 0;
+  }
+  {
+    static uint64_t s_dedup_last_fp;
+    static uint64_t s_dedup_last_ns;
+    uint64_t now = edr_win_now_ns();
+    uint64_t fp = (uint64_t)dpt | ((uint64_t)spt << 16);
+    fp ^= str_hash_fnv1a64(rule_name) ^ (str_hash_fnv1a64(proto_label) << 1);
+    if (s_dedup_last_ns != 0u && now >= s_dedup_last_ns && (now - s_dedup_last_ns) < EDR_SHELLCODE_ALERT_DEDUP_NS &&
+        fp == s_dedup_last_fp) {
+      (void)InterlockedIncrement64(&s_wd_stat_alert_dedup);
+      return 0;
+    }
+    s_dedup_last_fp = fp;
+    s_dedup_last_ns = now;
   }
   int wrote_pcap_ok = 0;
   char forensic_stem[192];
@@ -448,14 +596,18 @@ static int push_alert(double score, const char *detector_label, const char *rule
   unsigned forensic_frames = 0u;
   const char *forensic_kind = "";
 
-  if (s_cfg && s_cfg->shellcode_detector.forensic_save_pcap && s_cfg->shellcode_detector.forensic_dir[0]) {
-    mkdir_p_win(s_cfg->shellcode_detector.forensic_dir);
+  char forensic_root[1100];
+  forensic_root[0] = '\0';
+  if (s_cfg && s_cfg->shellcode_detector.forensic_save_pcap) {
+    shellcode_forensic_root(forensic_root, sizeof(forensic_root), s_cfg);
+  }
+  if (forensic_root[0]) {
+    mkdir_p_win(forensic_root);
     char pcap_path[1200];
     unsigned long long tsn = (unsigned long long)edr_win_now_ns();
     unsigned long pid = (unsigned long)GetCurrentProcessId();
     if (s_ring_mem && s_cfg->shellcode_detector.forensic_ring_slots > 0u && s_ring_count > 0u) {
-      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_ring_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir,
-               tsn, pid);
+      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_ring_%llu_%lu.pcap", forensic_root, tsn, pid);
       if (write_ring_pcap(pcap_path) == 0) {
         wrote_pcap_ok = 1;
         forensic_kind = "ring";
@@ -465,8 +617,7 @@ static int push_alert(double score, const char *detector_label, const char *rule
                 (unsigned)s_ring_count);
       }
     } else if (ip_packet && ip_len > 0u) {
-      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
-               pid);
+      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_%llu_%lu.pcap", forensic_root, tsn, pid);
       if (write_single_pcap(pcap_path, ip_packet, ip_len, is_v6) == 0) {
         wrote_pcap_ok = 1;
         forensic_kind = "single";
@@ -563,10 +714,21 @@ static int push_alert(double score, const char *detector_label, const char *rule
       }
     }
     const char *det = detector_label ? detector_label : "heuristic";
+    char edlayer[48];
+    snprintf(edlayer, sizeof(edlayer), "%s", det_layer && det_layer[0] ? det_layer : det);
+    for (size_t z = 0; z < sizeof(edlayer) && edlayer[z]; z++) {
+      if (edlayer[z] == '"' || edlayer[z] == '\\' || edlayer[z] == '\n' || edlayer[z] == '\r') {
+        edlayer[z] = '_';
+      }
+    }
+    DWORD cand_pid = is_v6 ? shellcode_tcp_owner_pid_for_local_port_v6(dpt) : shellcode_tcp_owner_pid_for_local_port_v4(dpt);
+    const char *cand_src = (cand_pid != 0u) ? "tcp_table" : "none";
     int jn = snprintf(wx + off, sizeof(wx) - off,
                       "shellcode_json={\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
-                      "\"rule\":\"%s\"}\n",
-                      score, (unsigned)dpt, (unsigned)spt, eproto, det, erule);
+                      "\"det_layer\":\"%s\",\"rule_confidence\":%.6f,\"candidate_pid\":%lu,"
+                      "\"candidate_pid_source\":\"%s\",\"rule\":\"%s\"}\n",
+                      score, (unsigned)dpt, (unsigned)spt, eproto, det, edlayer, rule_confidence,
+                      (unsigned long)cand_pid, cand_src, erule);
     if (jn > 0 && (size_t)jn < sizeof(wx) - off) {
       off += (size_t)jn;
     }
@@ -578,6 +740,9 @@ static int push_alert(double score, const char *detector_label, const char *rule
   slot.size = (uint32_t)off;
   if (!edr_event_bus_try_push(s_bus, &slot)) {
     fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
+    (void)InterlockedIncrement64(&s_wd_stat_bus_drops);
+  } else {
+    (void)InterlockedIncrement64(&s_wd_stat_alerts_pushed);
   }
   if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
     edr_isolate_auto_from_shellcode_alarm();
@@ -611,7 +776,8 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   char rule_name[96];
   EdrProtoKind k = (pr == EDR_PROTO_PARSE_OK) ? reg.kind : EDR_PROTO_KIND_UNKNOWN;
   if (edr_shellcode_match_known_exploit(scan, slen, k, rule_name, sizeof(rule_name))) {
-    (void)push_alert(1.0, "yara", rule_name, proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt);
+    (void)push_alert(1.0, "known_exploit", rule_name, proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len,
+                     is_v6_pkt, "known_exploit", 1.0);
     return;
   }
   double sc = edr_shellcode_heuristic_score(scan, slen);
@@ -622,7 +788,8 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   if (sc < s_cfg->shellcode_detector.alert_threshold) {
     return;
   }
-  (void)push_alert(sc, "heuristic", "-", proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt);
+  (void)push_alert(sc, "heuristic", "-", proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+                   "heuristic", sc);
 }
 
 static DWORD WINAPI wd_thread_main(void *arg) {
@@ -641,11 +808,13 @@ static DWORD WINAPI wd_thread_main(void *arg) {
       if (e == ERROR_INVALID_HANDLE || InterlockedCompareExchange(&s_capture_stop, 0, 0) != 0) {
         break;
       }
+      (void)InterlockedIncrement64(&s_wd_stat_recv_errors);
       continue;
     }
     if (recvlen == 0u || !s_cfg) {
       continue;
     }
+    (void)InterlockedIncrement64(&s_wd_stat_recv_packets);
     WINDIVERT_IPHDR *ip = NULL;
     void *ipv6 = NULL;
     UINT8 proto = 0;
@@ -659,14 +828,17 @@ static DWORD WINAPI wd_thread_main(void *arg) {
     UINT nextlen = 0;
     if (!s_parse(buf, recvlen, &ip, (VOID **)&ipv6, &proto, &ic, &ic6, &tcp, &udp, &data, &datalen, &next,
                  &nextlen)) {
+      (void)InterlockedIncrement64(&s_wd_stat_row_skipped);
       continue;
     }
     if (!tcp || !data || datalen == 0) {
+      (void)InterlockedIncrement64(&s_wd_stat_row_skipped);
       continue;
     }
     uint16_t sp = tcp->SrcPort;
     uint16_t dp = tcp->DstPort;
     if (!monitor_allows(s_cfg, dp, sp)) {
+      (void)InterlockedIncrement64(&s_wd_stat_monitor_filtered);
       continue;
     }
     char src[64], dst[64];
@@ -678,6 +850,7 @@ static DWORD WINAPI wd_thread_main(void *arg) {
       is_v6 = 1;
       (void)ipv6_addrs_to_str((const WINDIVERT_IPV6HDR *)ipv6, src, sizeof(src), dst, sizeof(dst));
     } else {
+      (void)InterlockedIncrement64(&s_wd_stat_row_skipped);
       continue;
     }
     ring_packet_push(buf, recvlen, is_v6);
@@ -718,6 +891,12 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
   s_cfg = cfg;
   s_bus = bus;
   InterlockedExchange(&s_capture_stop, 0);
+  (void)InterlockedExchange64(&s_wd_stat_recv_packets, 0);
+  (void)InterlockedExchange64(&s_wd_stat_recv_errors, 0);
+  (void)InterlockedExchange64(&s_wd_stat_row_skipped, 0);
+  (void)InterlockedExchange64(&s_wd_stat_monitor_filtered, 0);
+  (void)InterlockedExchange64(&s_wd_stat_alerts_pushed, 0);
+  (void)InterlockedExchange64(&s_wd_stat_bus_drops, 0);
   if (!cfg || !cfg->shellcode_detector.enabled) {
     return EDR_OK;
   }
@@ -837,5 +1016,45 @@ void edr_windivert_capture_stop(void) {
     (void)WSACleanup();
     s_wsa_started = 0;
   }
+  {
+    const char *wdst = getenv("EDR_SHELLCODE_WD_STATS");
+    if (wdst && wdst[0] == '1') {
+      unsigned long long rp, re, sk, mf, ap, bd, dd;
+      edr_shellcode_windivert_stats_snapshot(&rp, &re, &sk, &mf, &ap, &bd, &dd);
+      fprintf(stderr,
+              "[shellcode_detector] wd_stats recv=%llu recv_err=%llu skip=%llu mon_skip=%llu pushed=%llu bus_drop=%llu "
+              "alert_dedup=%llu\n",
+              rp, re, sk, mf, ap, bd, dd);
+    }
+  }
   InterlockedExchange(&s_capture_stop, 0);
+}
+
+static unsigned long long wd_stat_read64(volatile LONG64 *p) { return (unsigned long long)InterlockedAdd64(p, 0); }
+
+void edr_shellcode_windivert_stats_snapshot(unsigned long long *recv_packets, unsigned long long *recv_errors,
+                                            unsigned long long *rows_skipped, unsigned long long *monitor_filtered,
+                                            unsigned long long *alerts_pushed, unsigned long long *bus_drops,
+                                            unsigned long long *alert_dedup_suppressed) {
+  if (recv_packets) {
+    *recv_packets = wd_stat_read64(&s_wd_stat_recv_packets);
+  }
+  if (recv_errors) {
+    *recv_errors = wd_stat_read64(&s_wd_stat_recv_errors);
+  }
+  if (rows_skipped) {
+    *rows_skipped = wd_stat_read64(&s_wd_stat_row_skipped);
+  }
+  if (monitor_filtered) {
+    *monitor_filtered = wd_stat_read64(&s_wd_stat_monitor_filtered);
+  }
+  if (alerts_pushed) {
+    *alerts_pushed = wd_stat_read64(&s_wd_stat_alerts_pushed);
+  }
+  if (bus_drops) {
+    *bus_drops = wd_stat_read64(&s_wd_stat_bus_drops);
+  }
+  if (alert_dedup_suppressed) {
+    *alert_dedup_suppressed = wd_stat_read64(&s_wd_stat_alert_dedup);
+  }
 }

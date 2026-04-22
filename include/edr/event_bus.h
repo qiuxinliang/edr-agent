@@ -15,7 +15,8 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count);
 void edr_event_bus_destroy(EdrEventBus *bus);
 
 /**
- * 非阻塞推送。满则返回 false，调用方应累计 dropped（§2.3 背压）。
+ * 非阻塞推送。满则返回 false；总线内部递增 dropped（§2.3 背压）。
+ * 各调用方日志与可观测性：docs/EVENT_BUS_BACKPRESSURE.md
  */
 bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot);
 

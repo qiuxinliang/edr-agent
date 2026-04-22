@@ -47,6 +47,36 @@ static bool has_ascii(const uint8_t *data, uint32_t len, const char *s) {
   return has_subseq(data, len, (const uint8_t *)s, strlen(s));
 }
 
+static uint8_t ascii_lower_u8(uint8_t c) {
+  if (c >= 'A' && c <= 'Z') {
+    return (uint8_t)(c + 32u);
+  }
+  return c;
+}
+
+/** ASCII needle, case-insensitive (Follina / Log4Shell edge variants, T-SC-031). */
+static bool has_ascii_ci(const uint8_t *data, uint32_t len, const char *s) {
+  if (!data || !s) {
+    return false;
+  }
+  size_t slen = strlen(s);
+  if (slen == 0u || len < slen) {
+    return false;
+  }
+  for (uint32_t i = 0; i + slen <= len; i++) {
+    size_t j;
+    for (j = 0; j < slen; j++) {
+      if (ascii_lower_u8(data[i + j]) != ascii_lower_u8((uint8_t)(unsigned char)s[j])) {
+        break;
+      }
+    }
+    if (j == slen) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool has_run(const uint8_t *data, uint32_t len, uint8_t v, uint32_t run_len) {
   if (!data || run_len == 0u || len < run_len) {
     return false;
@@ -102,6 +132,27 @@ static int match_msrpc_printnightmare(const uint8_t *data, uint32_t len) {
           has_subseq(data, len, kOpnum89, sizeof(kOpnum89)) && has_subseq(data, len, kUncWide, sizeof(kUncWide)))
              ? 1
              : 0;
+}
+
+/** MS-EFSR interface UUID `{c681d488-d850-11d0-8c52-00c04fd90f7e}` as 16 bytes (same order as Python `uuid.UUID(...).bytes`). */
+static int match_petitpotam_efsr_uuid(const uint8_t *data, uint32_t len) {
+  static const uint8_t kEfsr[] = {0xC6u, 0x81u, 0xD4u, 0x88u, 0xD8u, 0x50u, 0x11u, 0xD0u,
+                                  0x8Cu, 0x52u, 0x00u, 0xC0u, 0x4Fu, 0xD9u, 0x0Fu, 0x7Eu};
+  return has_subseq(data, len, kEfsr, sizeof(kEfsr)) ? 1 : 0;
+}
+
+static int match_follina_msdt(const uint8_t *data, uint32_t len) {
+  return has_ascii_ci(data, len, "ms-msdt:") ? 1 : 0;
+}
+
+static int match_log4shell_jndi(const uint8_t *data, uint32_t len) {
+  if (has_ascii_ci(data, len, "${jndi:")) {
+    return 1;
+  }
+  if (has_ascii(data, len, "${${::-j")) {
+    return 1;
+  }
+  return 0;
 }
 
 #ifdef EDR_HAVE_YARA
@@ -321,6 +372,18 @@ int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProt
   }
   if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_SMB2) && match_msrpc_printnightmare(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "PrintNightmare_CVE_2021_34527");
+    return 1;
+  }
+  if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_SMB2) && match_petitpotam_efsr_uuid(data, len)) {
+    set_rule_name(rule_name_out, rule_name_cap, "PetitPotam_MS_EFSR");
+    return 1;
+  }
+  if (kind == EDR_PROTO_KIND_HTTP && match_follina_msdt(data, len)) {
+    set_rule_name(rule_name_out, rule_name_cap, "Follina_CVE_2022_30190");
+    return 1;
+  }
+  if (kind == EDR_PROTO_KIND_HTTP && match_log4shell_jndi(data, len)) {
+    set_rule_name(rule_name_out, rule_name_cap, "Log4Shell_CVE_2021_44228");
     return 1;
   }
   return 0;

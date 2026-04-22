@@ -144,6 +144,32 @@
 - **当前**：**HTTP** **`POST /api/v1/ingest/report-events`** 与 **BAT1** 解析已用于事件批次；**gRPC `EventIngest`** 若在目标环境**未注册** **`ReportCommandResult`**，则终端 unary 会失败，stderr 见 **`[grpc] ReportCommandResult 失败`**（**`grpc_client_impl.cpp`**）。
 - **联调无完整 ingest gRPC 时**：仍可用 **`EDR_SOAR_REPORT_ALWAYS=1`** 验证客户端是否发起 RPC；服务端侧需后续在 **EventIngest** 实现 **`ReportCommandResult`** 并落库/对账，或先用 **grpcurl** / 自建 mock 监听同端口。
 
+### 5.3 Playbook 示例（P2：Shellcode 高优 → 取证 → 人工确认 → 隔离）
+
+以下为 **编排侧** 参考流程（字段名与 **§1 `CommandEnvelope`**、**§2 `ReportCommandResult`** 对齐）；平台实现可为 SOAR / Temporal / 自研工单。**终端已实现**的指令：`forensic`（见 **`command_stub.c`**）、`isolate`、`kill`；**`UploadFile`** 与 **`forensic-<command_id>`** 见 **`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**。
+
+1. **触发**：行为告警 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（或平台规则名 **`protocol_shellcode`** / 分数阈值）创建 **`soar_correlation_id`**。
+2. **自动取证**：下发 **`forensic`**，`payload` 为 UTF-8 JSON 或 **每行绝对路径**（可选 **`EDR_FORENSIC_COPY_PATHS=1`** 复制 **`paths[]`**；**Windows** 另可选 **`EDR_FORENSIC_REGISTRY_DUMP=1`** / **`EDR_FORENSIC_MEMORY_DUMP=1`** 处理 **`registry_keys[]`** / **`memory_regions[]`**，见 **`docs/FORENSIC_STRUCTURED_PAYLOAD.md`**）；携带 **`playbook_run_id` / `playbook_step_id`** 以便 **§3** 回传 **`ReportCommandResult`**。产物：**`manifest.txt`** + **`bundle.tgz`**；默认 **`UploadFile`**（**`EDR_FORENSIC_UPLOAD=0`** 可关）。
+3. **人工确认**：控制台或工单 **WAIT** 步骤；分析员确认 PCAP / 包哈希与 **`detail_utf8`**（含 **`UploadFile key=…`** 或失败原因）。
+4. **隔离（可选）**：确认后下发 **`isolate`**（同 **`soar_correlation_id`** 串联），或依赖端上 **`EDR_SHELLCODE_AUTO_ISOLATE`** / **`auto_isolate_execute`**（仍须高危策略），见 **`README.md` §17**。
+
+**注意**：**`deadline_ms`** 当前为提示性（终端未硬杀）；编排侧宜设 **超时 + 补偿**（重发 `forensic` 或工单升级）。
+
+### 5.4 Shellcode 告警 — 候选 PID 契约草案（T-SC-051）
+
+**现状**：**`behavior_from_slot.c`** 已解析 ETW1 中的 **`hint_pid`**（写入内部 **`epid`** 覆盖语义，见 **§1** PMFE 段）。**`windivert_capture.c`** 推送的 **`shellcode_json=`** 含 **`score` / `dpt` / `spt` / `proto` / `det` / `det_layer` / `rule_confidence` / `rule`**（**`det`** 与 **`det_layer`**：已知利用为 **`known_exploit`**，启发式为 **`heuristic`**）。
+
+**建议扩展**（供 **edr-backend** 与控制台可选消费；**未写入** ETW1 前字段名勿硬编码为已发布 API）：
+
+| 字段 | 类型 | 语义 |
+|------|------|------|
+| **`candidate_pid`** | 整数或 **0** | 本地可疑进程：**ETW `hint_pid`** 或 **`GetExtendedTcpTable`** 对本地 **`dpt`** 反查；**0** = 未知。 |
+| **`candidate_pid_source`** | 短字符串 | **`none`** / **`etw`** / **`tcp_table`**。 |
+
+**终端现状（WinDivert 路径）**：**`windivert_capture.c`** 在告警时以 **`GetExtendedTcpTable`**（**`TCP_TABLE_OWNER_PID_ALL`**）对 **`dpt`**（主机序本地端口语义，与 ETW1 行一致）做 **IPv4 / IPv6** 反查：优先 **LISTEN(2)** 行 **`dwOwningPid`**，否则 **ESTABLISHED(5)**；命中则 **`candidate_pid_source":"tcp_table"`**，否则 **`0`** / **`none`**。与 **`hint_pid`** 的 ETW 侧 **`etw`** 来源并列时，以后端/编排约定优先级为准。
+
+与 **`pmfe_scan`** 的 **`{"pid":...}`** 区分：后者为**明确**内存扫描目标；前者为**关联猜测**，适合 SOAR 分支与人工复核。
+
 ---
 
 ## 6. 与事件上报的关系

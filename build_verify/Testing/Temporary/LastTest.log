@@ -1,0 +1,51 @@
+Start testing: Apr 21 20:24 CST
+----------------------------------------------------------
+19/22 Testing: shellcode_modules
+19/22 Test: shellcode_modules
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_verify/test_shellcode"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_verify
+"shellcode_modules" start time: Apr 21 20:24 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.45 sec
+----------------------------------------------------------
+Test Passed.
+"shellcode_modules" end time: Apr 21 20:24 CST
+"shellcode_modules" time elapsed: 00:00:00
+----------------------------------------------------------
+
+20/22 Testing: shellcode_corpus
+20/22 Test: shellcode_corpus
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_verify/test_shellcode_corpus"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_verify
+"shellcode_corpus" start time: Apr 21 20:24 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.41 sec
+----------------------------------------------------------
+Test Passed.
+"shellcode_corpus" end time: Apr 21 20:24 CST
+"shellcode_corpus" time elapsed: 00:00:00
+----------------------------------------------------------
+
+21/22 Testing: shellcode_corpus_pipeline_eval
+21/22 Test: shellcode_corpus_pipeline_eval
+Command: "/opt/homebrew/bin/cmake" "-P" "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_verify/run_shellcode_pipeline_eval.cmake"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_verify
+"shellcode_corpus_pipeline_eval" start time: Apr 21 20:24 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"shellcode_corpus_pipeline_eval" end time: Apr 21 20:24 CST
+"shellcode_corpus_pipeline_eval" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 21 20:24 CST
+
+shellcode =   0.01 sec*proc
+

@@ -2,6 +2,7 @@
 #
 # 使用说明、gRPC/mTLS、SQLite 队列与环境变量：见同目录 README.md
 
+# [server].address：须指向 **edr-api** 的 **EventIngest** gRPC（与 ReportEvents/Subscribe 同通道），且平台已配置 **UploadFile** 所需 MinIO（见 **edr-backend/docs/GRPC_INGEST.md**、**docs/AGT009_FORENSIC_UPLOAD_E2E.md** §2.1）。
 [server]
 address              = "127.0.0.1:50051"
 ca_cert              = ""
@@ -39,6 +40,8 @@ tenant_id            = "tenant_default"
 
 [collection]
 etw_enabled          = true
+# Windows：与 README「ETW 增强」一致 — Kernel-Process/File/Network/Registry（Registry=Microsoft-Windows-Kernel-Registry，mandatory）+ 可选 DNS/PowerShell/Security/WMI 等。
+# 注册表事件经 TDH → ETW1（regkey/regname/regdata）→ 预处理 → 行为记录；设置环境变量 EDR_BEHAVIOR_ENCODING=protobuf 时，上报 wire 含 BehaviorEvent.detail.registry（平台解析为 payload_json category=registry）。实机验收清单：docs/REGISTRY_ETW_ACCEPTANCE.md
 # Windows §19.10：Microsoft-Windows-TCPIP / WFAS 防火墙 ETW（需管理员；失败时跳过并打日志）
 etw_tcpip_provider   = true
 etw_firewall_provider = true
@@ -119,6 +122,8 @@ max_log_size_mb      = 100
 max_log_files        = 10
 
 # §8 高危指令（kill / isolate / forensic）：默认关闭；亦可由环境变量 EDR_CMD_ENABLED=1 开启
+# forensic 生成 bundle.tgz 后：gRPC 就绪则默认 UploadFile（ingest）；FileChunk.alert_id = forensic-<command_id>
+# EDR_FORENSIC_UPLOAD=0 关闭自动上传
 # [command]
 # allow_dangerous      = false
 
@@ -155,7 +160,7 @@ max_log_files        = 10
 # monitor_ldap             = true
 # detector_threads         = 2
 # yara_rules_dir           = ""
-# forensic_dir             = ""
+# forensic_dir             = ""   # 空且 forensic_save_pcap=true：PCAP → EDR_FORENSIC_OUT\shellcode 或 %TEMP%\edr_forensic\shellcode
 # forensic_save_pcap       = false
 # evidence_preview_bytes   = 0
 # forensic_ring_slots      = 0

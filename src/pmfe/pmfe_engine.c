@@ -1682,7 +1682,21 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
     return;
   }
   slot.size = (uint32_t)n;
-  (void)edr_event_bus_try_push(s_pmfe_bus, &slot);
+  if (edr_event_bus_try_push(s_pmfe_bus, &slot)) {
+    return;
+  }
+  {
+    static time_t s_pmfe_bus_warn_last_sec;
+    static unsigned s_pmfe_bus_drops_since_log;
+    s_pmfe_bus_drops_since_log++;
+    time_t now = time(NULL);
+    if (s_pmfe_bus_warn_last_sec == 0 || now - s_pmfe_bus_warn_last_sec >= 5) {
+      fprintf(stderr, "[pmfe] event bus full, dropped PMFE scan result (count since last log: %u)\n",
+              s_pmfe_bus_drops_since_log);
+      s_pmfe_bus_warn_last_sec = now;
+      s_pmfe_bus_drops_since_log = 0u;
+    }
+  }
 }
 
 static void pmfe_worker_body(void) {

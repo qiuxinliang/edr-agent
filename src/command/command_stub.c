@@ -19,11 +19,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winreg.h>
+#include <wchar.h>
 #else
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -39,6 +43,161 @@ static const EdrConfig *s_bound_cfg;
 void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
 
 static int streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
+
+#ifdef _WIN32
+/** 递归创建目录（等价 mkdir -p），不经 shell。 */
+static int edr_mkdir_p_win(const char *path) {
+  char t[768];
+  if (!path || !path[0] || snprintf(t, sizeof(t), "%s", path) >= (int)sizeof(t)) {
+    return -1;
+  }
+  size_t i = 0;
+  if (t[0] && t[1] == ':' && (t[2] == '\\' || t[2] == '/')) {
+    i = 3;
+  }
+  for (;;) {
+    char *slash = strchr(t + i, '\\');
+    if (!slash) {
+      break;
+    }
+    *slash = '\0';
+    if (t[0] && !CreateDirectoryA(t, NULL)) {
+      DWORD e = GetLastError();
+      if (e != ERROR_ALREADY_EXISTS) {
+        *slash = '\\';
+        return -1;
+      }
+    }
+    *slash = '\\';
+    i = (size_t)(slash - t + 1u);
+  }
+  if (!CreateDirectoryA(t, NULL)) {
+    DWORD e = GetLastError();
+    if (e != ERROR_ALREADY_EXISTS) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/** 取证打包：直接拉起 System32\\tar.exe，避免经 cmd /c 拼接命令行。 */
+static int edr_forensic_run_tar_czf(const char *job_dir) {
+  if (!job_dir || !job_dir[0]) {
+    return -1;
+  }
+  wchar_t wdir[768];
+  if (MultiByteToWideChar(CP_UTF8, 0, job_dir, -1, wdir, 768) == 0 &&
+      MultiByteToWideChar(CP_ACP, 0, job_dir, -1, wdir, 768) == 0) {
+    return -1;
+  }
+  wchar_t sys[MAX_PATH];
+  UINT nd = GetSystemDirectoryW(sys, MAX_PATH);
+  if (nd == 0 || nd >= MAX_PATH) {
+    return -1;
+  }
+  wchar_t tar_exe[MAX_PATH + 16];
+  if (nd + 9u >= sizeof(tar_exe) / sizeof(tar_exe[0])) {
+    return -1;
+  }
+  memcpy(tar_exe, sys, (size_t)nd * sizeof(wchar_t));
+  tar_exe[nd] = L'\\';
+  wcscpy(tar_exe + nd + 1u, L"tar.exe");
+
+  char tar_exe_utf8[MAX_PATH * 3];
+  char bundle_utf8[900];
+  char cmd8[2048];
+  if (WideCharToMultiByte(CP_UTF8, 0, tar_exe, -1, tar_exe_utf8, (int)sizeof(tar_exe_utf8), NULL, NULL) == 0) {
+    return -1;
+  }
+  if (snprintf(bundle_utf8, sizeof(bundle_utf8), "%s\\bundle.tgz", job_dir) >= (int)sizeof(bundle_utf8)) {
+    return -1;
+  }
+  if (snprintf(cmd8, sizeof(cmd8), "\"%s\" czf \"%s\" -C \"%s\" .", tar_exe_utf8, bundle_utf8, job_dir) >=
+      (int)sizeof(cmd8)) {
+    return -1;
+  }
+  wchar_t cmdw[2048];
+  if (MultiByteToWideChar(CP_UTF8, 0, cmd8, -1, cmdw, 2048) == 0) {
+    return -1;
+  }
+
+  STARTUPINFOW si;
+  PROCESS_INFORMATION pi;
+  memset(&si, 0, sizeof(si));
+  si.cb = sizeof(si);
+  memset(&pi, 0, sizeof(pi));
+  if (!CreateProcessW(NULL, cmdw, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, wdir, &si, &pi)) {
+    return -1;
+  }
+  (void)WaitForSingleObject(pi.hProcess, 120000);
+  DWORD code = 1;
+  (void)GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return code == 0 ? 0 : -1;
+}
+#else
+/** 递归创建目录（等价 mkdir -p），不经 shell。 */
+static int edr_mkdir_p_posix(const char *path) {
+  char buf[768];
+  if (!path || !path[0]) {
+    return -1;
+  }
+  size_t len = strlen(path);
+  if (len >= sizeof(buf)) {
+    return -1;
+  }
+  memcpy(buf, path, len + 1u);
+  for (char *p = buf + 1u; *p; p++) {
+    if (*p != '/') {
+      continue;
+    }
+    *p = '\0';
+    if (buf[0] && mkdir(buf, 0755) != 0 && errno != EEXIST) {
+      return -1;
+    }
+    *p = '/';
+  }
+  if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+    return -1;
+  }
+  return 0;
+}
+
+/** 取证打包：execvp("tar", …)，不经 shell（与 Windows CreateProcess 路径对齐）。 */
+static int edr_forensic_run_tar_czf_posix(const char *job_dir) {
+  if (!job_dir || !job_dir[0]) {
+    return -1;
+  }
+  char bundle[900];
+  if (snprintf(bundle, sizeof(bundle), "%s/bundle.tgz", job_dir) >= (int)sizeof(bundle)) {
+    return -1;
+  }
+  char cwd_arg[700];
+  if (snprintf(cwd_arg, sizeof(cwd_arg), "%s", job_dir) >= (int)sizeof(cwd_arg)) {
+    return -1;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    return -1;
+  }
+  if (pid == 0) {
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd >= 0) {
+      (void)dup2(fd, STDERR_FILENO);
+      (void)close(fd);
+    }
+    char *argv[] = {"tar", "czf", bundle, "-C", cwd_arg, ".", NULL};
+    (void)execvp("tar", argv);
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) {
+    return -1;
+  }
+  return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+#endif
 
 static int dangerous_enabled(void) {
   const char *e = getenv("EDR_CMD_ENABLED");
@@ -614,6 +773,705 @@ static void forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t le
   }
 }
 
+/** JSON 字符串片段内 **`\\` `"`** 等常见转义（§P1 结构化 payload 路径）。 */
+static void forensic_unescape_json_string(char *out, size_t outcap, const char *in, size_t inlen) {
+  size_t w = 0;
+  for (size_t i = 0; i < inlen && w + 1u < outcap; i++) {
+    if (in[i] == '\\' && i + 1u < inlen) {
+      unsigned char c = (unsigned char)in[i + 1u];
+      if (c == '\\' || c == '"') {
+        out[w++] = (char)c;
+        i++;
+        continue;
+      }
+      if (c == 'n') {
+        out[w++] = '\n';
+        i++;
+        continue;
+      }
+      if (c == 'r') {
+        out[w++] = '\r';
+        i++;
+        continue;
+      }
+      if (c == 't') {
+        out[w++] = '\t';
+        i++;
+        continue;
+      }
+    }
+    out[w++] = in[i];
+  }
+  out[w] = '\0';
+}
+
+static int forensic_payload_trimmed_starts_json(const uint8_t *p, size_t len) {
+  size_t i = 0;
+  while (i < len && (p[i] == ' ' || p[i] == '\t' || p[i] == '\r' || p[i] == '\n')) {
+    i++;
+  }
+  return i < len && p[i] == '{';
+}
+
+static void forensic_manifest_declared_extensions(FILE *f, const uint8_t *pl, size_t len) {
+  if (!f || !pl || len == 0u) {
+    return;
+  }
+  char tmp[4096];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, pl, len);
+  tmp[len] = '\0';
+  if (strstr(tmp, "\"registry_keys\"")) {
+    fprintf(f, "registry_keys_declared_in_payload=1\n");
+  }
+  if (strstr(tmp, "\"memory_regions\"")) {
+    fprintf(f, "memory_regions_declared_in_payload=1\n");
+  }
+}
+
+static void forensic_manifest_user_volume(FILE *f) {
+  if (!f) {
+    return;
+  }
+#ifdef _WIN32
+  {
+    char un[256];
+    DWORD ul = sizeof(un);
+    if (GetUserNameA(un, &ul)) {
+      un[sizeof(un) - 1u] = '\0';
+      fprintf(f, "windows_username=%s\n", un);
+    }
+  }
+  {
+    char sysdir[MAX_PATH];
+    if (GetWindowsDirectoryA(sysdir, (UINT)sizeof(sysdir)) > 0 && sysdir[0] && sysdir[1] == ':') {
+      char root[8];
+      (void)snprintf(root, sizeof(root), "%c:\\", sysdir[0]);
+      DWORD vsn = 0, maxcomp = 0, fsflags = 0;
+      char vn[MAX_PATH], fsn[MAX_PATH];
+      if (GetVolumeInformationA(root, vn, (DWORD)sizeof(vn), &vsn, &maxcomp, &fsflags, fsn, (DWORD)sizeof(fsn))) {
+        fprintf(f, "boot_volume_serial_number=0x%08lx\n", (unsigned long)vsn);
+      }
+    }
+  }
+#else
+  {
+    const char *u = getenv("USER");
+    if (u && u[0]) {
+      fprintf(f, "posix_user=%s\n", u);
+    }
+  }
+#endif
+}
+
+/** 从 **`{"paths":["a","b"]}`** 复制文件（需 **`EDR_FORENSIC_COPY_PATHS=1`**）。 */
+static void forensic_copy_paths_from_json(const char *jobdir, const uint8_t *pl, size_t len) {
+  const char *e = getenv("EDR_FORENSIC_COPY_PATHS");
+  if (!e || e[0] != '1' || !pl || len == 0u) {
+    return;
+  }
+  char tmp[8192];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, pl, len);
+  tmp[len] = '\0';
+  char *paths = strstr(tmp, "\"paths\"");
+  if (!paths) {
+    return;
+  }
+  char *lb = strchr(paths, '[');
+  if (!lb) {
+    return;
+  }
+  char *p = lb + 1;
+  int idx = 0;
+  for (;;) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      p++;
+    }
+    if (*p == '\0' || *p == ']') {
+      break;
+    }
+    if (*p == ',') {
+      p++;
+      continue;
+    }
+    if (*p != '"') {
+      break;
+    }
+    p++;
+    char *end = strchr(p, '"');
+    if (!end) {
+      break;
+    }
+    size_t rawn = (size_t)(end - p);
+    char pathbuf[2048];
+    forensic_unescape_json_string(pathbuf, sizeof(pathbuf), p, rawn);
+    p = end + 1;
+    if (!pathbuf[0]) {
+      continue;
+    }
+    if (idx >= 100) {
+      break;
+    }
+    char dst[900];
+#ifdef _WIN32
+    (void)snprintf(dst, sizeof(dst), "%s\\copied_json_%02d", jobdir, idx++);
+#else
+    (void)snprintf(dst, sizeof(dst), "%s/copied_json_%02d", jobdir, idx++);
+#endif
+    (void)forensic_copy_one_file(pathbuf, dst);
+  }
+}
+
+#ifdef _WIN32
+static void forensic_manifest_append_line(const char *manifest_path, const char *line) {
+  if (!manifest_path || !line) {
+    return;
+  }
+  FILE *a = fopen(manifest_path, "a");
+  if (!a) {
+    return;
+  }
+  fputs(line, a);
+  if (line[0] && line[strlen(line) - 1u] != '\n') {
+    fputc('\n', a);
+  }
+  fclose(a);
+}
+
+static int forensic_registry_split_root(const char *path_in, HKEY *root, char *sub, size_t subsz, char *tag, size_t tagsz) {
+  char p[1024];
+  if (!path_in || !path_in[0] || !root || !sub || subsz < 2u || !tag || tagsz < 4u) {
+    return -1;
+  }
+  (void)snprintf(p, sizeof(p), "%s", path_in);
+  for (char *c = p; *c; c++) {
+    if (*c == '/') {
+      *c = '\\';
+    }
+  }
+  static const struct {
+    const char *pfx;
+    HKEY hk;
+    const char *tg;
+  } map[] = {
+      {"HKEY_LOCAL_MACHINE\\", HKEY_LOCAL_MACHINE, "HKLM"},
+      {"HKLM\\", HKEY_LOCAL_MACHINE, "HKLM"},
+      {"HKEY_CURRENT_USER\\", HKEY_CURRENT_USER, "HKCU"},
+      {"HKCU\\", HKEY_CURRENT_USER, "HKCU"},
+      {"HKEY_CLASSES_ROOT\\", HKEY_CLASSES_ROOT, "HKCR"},
+      {"HKCR\\", HKEY_CLASSES_ROOT, "HKCR"},
+      {"HKEY_USERS\\", HKEY_USERS, "HKU"},
+      {"HKU\\", HKEY_USERS, "HKU"},
+      {"HKEY_CURRENT_CONFIG\\", HKEY_CURRENT_CONFIG, "HKCC"},
+      {"HKCC\\", HKEY_CURRENT_CONFIG, "HKCC"},
+  };
+  for (size_t k = 0; k < sizeof(map) / sizeof(map[0]); k++) {
+    size_t n = strlen(map[k].pfx);
+    if (_strnicmp(p, map[k].pfx, n) == 0) {
+      *root = map[k].hk;
+      (void)snprintf(tag, tagsz, "%s", map[k].tg);
+      (void)snprintf(sub, subsz, "%s", p + n);
+      return 0;
+    }
+  }
+  return -1;
+}
+
+static void forensic_reg_sanitize_filename(const char *path_in, char *out, size_t outsz) {
+  size_t w = 0;
+  for (const char *s = path_in; *s && w + 2u < outsz; s++) {
+    char c = *s;
+    if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+      out[w++] = '_';
+    } else {
+      out[w++] = c;
+    }
+  }
+  out[w] = '\0';
+}
+
+#ifndef KEY_WOW64_64KEY
+#define KEY_WOW64_64KEY 0x0100
+#endif
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
+
+static void forensic_reg_dump_recursive(FILE *out, HKEY parent, const char *disp_path, int depth, unsigned *nodes_budget) {
+  if (!out || !nodes_budget || *nodes_budget > 400u || depth > 8) {
+    return;
+  }
+  HKEY hk = NULL;
+  REGSAM sam = KEY_READ;
+#if defined(_WIN64)
+  sam |= KEY_WOW64_64KEY;
+#endif
+  if (RegOpenKeyExA(parent, disp_path, 0, sam, &hk) != ERROR_SUCCESS) {
+    fprintf(out, "# open failed: %s\n", disp_path);
+    (*nodes_budget)++;
+    return;
+  }
+  fprintf(out, "==== %s ====\n", disp_path);
+  (*nodes_budget)++;
+
+  DWORD nvals = 0, maxdata = 0;
+  (void)RegQueryInfoKeyA(hk, NULL, NULL, NULL, NULL, NULL, NULL, &nvals, NULL, &maxdata, NULL, NULL);
+  if (maxdata > 65536u) {
+    maxdata = 65536u;
+  }
+  char vname[512];
+  for (DWORD vi = 0u; vi < nvals && *nodes_budget <= 400u; vi++) {
+    DWORD vnlen = (DWORD)sizeof(vname);
+    DWORD typ = 0;
+    DWORD dsz = maxdata + 1u;
+    if (dsz < 4u) {
+      dsz = 4u;
+    }
+    uint8_t *buf = (uint8_t *)malloc(dsz);
+    if (!buf) {
+      continue;
+    }
+    LONG rr = RegEnumValueA(hk, vi, vname, &vnlen, NULL, &typ, buf, &dsz);
+    if (rr != ERROR_SUCCESS) {
+      free(buf);
+      continue;
+    }
+    fprintf(out, "  value name=\"%s\" type=%lu size=%lu\n", vname[0] ? vname : "(default)", (unsigned long)typ,
+            (unsigned long)dsz);
+    if (typ == REG_SZ || typ == REG_EXPAND_SZ) {
+      buf[dsz < 4095u ? dsz : 4095u] = '\0';
+      fprintf(out, "    data=\"%s\"\n", (char *)buf);
+    } else if (typ == REG_DWORD && dsz >= 4u) {
+      fprintf(out, "    dword=0x%08lx\n", (unsigned long)*(const uint32_t *)buf);
+    } else if (typ == REG_QWORD && dsz >= 8u) {
+      uint64_t q = *(const uint64_t *)buf;
+      fprintf(out, "    qword=0x%016llx\n", (unsigned long long)q);
+    } else {
+      fprintf(out, "    (binary truncated)\n");
+    }
+    free(buf);
+  }
+
+  char sk[256];
+  DWORD kidx = 0;
+  while (*nodes_budget <= 400u && kidx < 80u) {
+    DWORD sklen = (DWORD)sizeof(sk);
+    FILETIME ft;
+    LONG rk = RegEnumKeyExA(hk, kidx, sk, &sklen, NULL, NULL, NULL, &ft);
+    if (rk == ERROR_NO_MORE_ITEMS) {
+      break;
+    }
+    if (rk != ERROR_SUCCESS) {
+      kidx++;
+      continue;
+    }
+    kidx++;
+    char child_disp[768];
+    if (disp_path[0]) {
+      (void)snprintf(child_disp, sizeof(child_disp), "%s\\%s", disp_path, sk);
+    } else {
+      (void)snprintf(child_disp, sizeof(child_disp), "%s", sk);
+    }
+    forensic_reg_dump_recursive(out, parent, child_disp, depth + 1, nodes_budget);
+  }
+  RegCloseKey(hk);
+}
+
+static void forensic_copy_registry_keys_from_json(const char *jobdir, const char *manifest_path, const uint8_t *pl,
+                                                  size_t len, int *out_files, int *had_error) {
+  (void)manifest_path;
+  const char *e = getenv("EDR_FORENSIC_REGISTRY_DUMP");
+  if (!e || e[0] != '1' || !pl || len == 0u || !jobdir || !out_files || !had_error) {
+    return;
+  }
+  char tmp[8192];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, pl, len);
+  tmp[len] = '\0';
+  if (!strstr(tmp, "\"registry_keys\"")) {
+    return;
+  }
+  char *keys = strstr(tmp, "\"registry_keys\"");
+  if (!keys) {
+    return;
+  }
+  char *lb = strchr(keys, '[');
+  if (!lb) {
+    *had_error = 1;
+    return;
+  }
+  char *p = lb + 1;
+  int idx = 0;
+  for (;;) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      p++;
+    }
+    if (*p == '\0' || *p == ']') {
+      break;
+    }
+    if (*p == ',') {
+      p++;
+      continue;
+    }
+    if (*p != '"') {
+      break;
+    }
+    p++;
+    char *end = strchr(p, '"');
+    if (!end) {
+      break;
+    }
+    size_t rawn = (size_t)(end - p);
+    char pathbuf[2048];
+    forensic_unescape_json_string(pathbuf, sizeof(pathbuf), p, rawn);
+    p = end + 1;
+    if (!pathbuf[0]) {
+      continue;
+    }
+    if (idx >= 32) {
+      break;
+    }
+    HKEY root = NULL;
+    char sub[1024];
+    char tag[16];
+    if (forensic_registry_split_root(pathbuf, &root, sub, sizeof(sub), tag, sizeof(tag)) != 0) {
+      *had_error = 1;
+      idx++;
+      continue;
+    }
+    if (!sub[0]) {
+      *had_error = 1;
+      idx++;
+      continue;
+    }
+    char safe[180];
+    forensic_reg_sanitize_filename(pathbuf, safe, sizeof(safe));
+    char outpath[900];
+    (void)snprintf(outpath, sizeof(outpath), "%s\\registry_%02d_%s.txt", jobdir, idx++, safe);
+    FILE *out = fopen(outpath, "w");
+    if (!out) {
+      *had_error = 1;
+      continue;
+    }
+    fprintf(out, "# edr forensic registry export\n# source=%s\n# hive=%s\n\n", pathbuf, tag);
+    unsigned budget = 0;
+    forensic_reg_dump_recursive(out, root, sub[0] ? sub : "", 0, &budget);
+    fclose(out);
+    (*out_files)++;
+  }
+}
+
+static int forensic_mem_parse_one(const char *obj_start, const char *obj_end, DWORD *pid, uint64_t *base, size_t *sz) {
+  const char *slice_end = obj_end;
+  char slice[512];
+  size_t n = (size_t)(slice_end - obj_start);
+  if (n >= sizeof(slice)) {
+    n = sizeof(slice) - 1u;
+  }
+  memcpy(slice, obj_start, n);
+  slice[n] = '\0';
+
+  *pid = 0;
+  *base = 0u;
+  *sz = 0u;
+  const char *kp = strstr(slice, "\"pid\"");
+  if (!kp) {
+    return -1;
+  }
+  kp = strchr(kp, ':');
+  if (!kp) {
+    return -1;
+  }
+  kp++;
+  while (*kp == ' ' || *kp == '\t') {
+    kp++;
+  }
+  *pid = (DWORD)strtoul(kp, (char **)&kp, 10);
+  const char *bp = strstr(slice, "\"base\"");
+  if (!bp) {
+    return -1;
+  }
+  bp = strchr(bp, ':');
+  if (!bp) {
+    return -1;
+  }
+  bp++;
+  while (*bp == ' ' || *bp == '\t') {
+    bp++;
+  }
+  if (*bp == '"') {
+    bp++;
+  }
+  *base = strtoull(bp, (char **)&bp, 0);
+  const char *sp = strstr(slice, "\"size\"");
+  if (!sp) {
+    return -1;
+  }
+  sp = strchr(sp, ':');
+  if (!sp) {
+    return -1;
+  }
+  sp++;
+  while (*sp == ' ' || *sp == '\t') {
+    sp++;
+  }
+  *sz = (size_t)strtoull(sp, NULL, 10);
+  if (*pid == 0u || *sz == 0u || *sz > (size_t)(16u * 1024u * 1024u)) {
+    return -1;
+  }
+  return 0;
+}
+
+static void forensic_dump_memory_regions_from_json(const char *jobdir, const uint8_t *pl, size_t len, int *out_files,
+                                                   int *had_error) {
+  const char *e = getenv("EDR_FORENSIC_MEMORY_DUMP");
+  if (!e || e[0] != '1' || !pl || len == 0u || !jobdir || !out_files || !had_error) {
+    return;
+  }
+  char tmp[8192];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, pl, len);
+  tmp[len] = '\0';
+  if (!strstr(tmp, "\"memory_regions\"")) {
+    return;
+  }
+  char *mr = strstr(tmp, "\"memory_regions\"");
+  if (!mr) {
+    return;
+  }
+  char *lb = strchr(mr, '[');
+  if (!lb) {
+    *had_error = 1;
+    return;
+  }
+  const char *p = lb + 1;
+  int idx = 0;
+  for (;;) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') {
+      p++;
+    }
+    if (*p == '\0' || *p == ']') {
+      break;
+    }
+    if (*p != '{') {
+      break;
+    }
+    const char *obj = p;
+    const char *brace = strchr(obj + 1, '}');
+    if (!brace) {
+      *had_error = 1;
+      break;
+    }
+    DWORD pid = 0;
+    uint64_t base = 0;
+    size_t sz = 0;
+    if (forensic_mem_parse_one(obj, brace + 1, &pid, &base, &sz) != 0) {
+      p = brace + 1;
+      continue;
+    }
+    if (idx >= 32) {
+      break;
+    }
+    HANDLE h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) {
+      h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    }
+    if (!h) {
+      *had_error = 1;
+      p = brace + 1;
+      idx++;
+      continue;
+    }
+    void *buf = malloc(sz);
+    if (!buf) {
+      CloseHandle(h);
+      *had_error = 1;
+      p = brace + 1;
+      continue;
+    }
+    SIZE_T got = 0;
+    int ok = ReadProcessMemory(h, (LPCVOID)(ULONG_PTR)base, buf, sz, &got) ? 1 : 0;
+    CloseHandle(h);
+    char outpath[900];
+    (void)snprintf(outpath, sizeof(outpath), "%s\\mem_%02u_0x%llx_%llu.bin", jobdir, (unsigned)idx,
+                   (unsigned long long)base, (unsigned long long)sz);
+    idx++;
+    FILE *bf = fopen(outpath, "wb");
+    if (!bf) {
+      free(buf);
+      *had_error = 1;
+      p = brace + 1;
+      continue;
+    }
+    if (ok && got > 0u) {
+      fwrite(buf, 1, got, bf);
+    }
+    fclose(bf);
+    free(buf);
+    (*out_files)++;
+    p = brace + 1;
+  }
+}
+
+static void forensic_post_json_extensions_win(const char *jobdir, const char *manifest_path, const uint8_t *pl,
+                                              size_t len) {
+  if (!pl || len == 0u || !forensic_payload_trimmed_starts_json(pl, len)) {
+    return;
+  }
+  int reg_decl = (strstr((const char *)pl, "\"registry_keys\"") != NULL);
+  int mem_decl = (strstr((const char *)pl, "\"memory_regions\"") != NULL);
+  const char *re = getenv("EDR_FORENSIC_REGISTRY_DUMP");
+  const char *me = getenv("EDR_FORENSIC_MEMORY_DUMP");
+  int reg_files = 0, mem_files = 0;
+  int reg_err = 0, mem_err = 0;
+  if (reg_decl && re && re[0] == '1') {
+    forensic_copy_registry_keys_from_json(jobdir, manifest_path, pl, len, &reg_files, &reg_err);
+  }
+  if (mem_decl && me && me[0] == '1') {
+    forensic_dump_memory_regions_from_json(jobdir, pl, len, &mem_files, &mem_err);
+  }
+  if (reg_decl) {
+    if (!re || re[0] != '1') {
+      forensic_manifest_append_line(manifest_path, "registry_dump_status=disabled_set_EDR_FORENSIC_REGISTRY_DUMP=1\n");
+    } else if (reg_err && reg_files == 0) {
+      forensic_manifest_append_line(manifest_path, "registry_dump_status=error\n");
+    } else if (reg_err) {
+      forensic_manifest_append_line(manifest_path, "registry_dump_status=partial\n");
+    } else {
+      forensic_manifest_append_line(manifest_path, "registry_dump_status=ok\n");
+    }
+    {
+      char ln[80];
+      (void)snprintf(ln, sizeof(ln), "registry_dump_files=%d\n", reg_files);
+      forensic_manifest_append_line(manifest_path, ln);
+    }
+  }
+  if (mem_decl) {
+    if (!me || me[0] != '1') {
+      forensic_manifest_append_line(manifest_path, "memory_dump_status=disabled_set_EDR_FORENSIC_MEMORY_DUMP=1\n");
+    } else if (mem_err && mem_files == 0) {
+      forensic_manifest_append_line(manifest_path, "memory_dump_status=error\n");
+    } else if (mem_err) {
+      forensic_manifest_append_line(manifest_path, "memory_dump_status=partial\n");
+    } else {
+      forensic_manifest_append_line(manifest_path, "memory_dump_status=ok\n");
+    }
+    {
+      char ln[80];
+      (void)snprintf(ln, sizeof(ln), "memory_dump_files=%d\n", mem_files);
+      forensic_manifest_append_line(manifest_path, ln);
+    }
+  }
+}
+#else
+static void forensic_manifest_append_line(const char *manifest_path, const char *line) {
+  if (!manifest_path || !line) {
+    return;
+  }
+  FILE *a = fopen(manifest_path, "a");
+  if (!a) {
+    return;
+  }
+  fputs(line, a);
+  if (line[0] && line[strlen(line) - 1u] != '\n') {
+    fputc('\n', a);
+  }
+  fclose(a);
+}
+
+static void forensic_post_json_extensions_posix(const char *manifest_path, const uint8_t *pl, size_t len) {
+  if (!manifest_path || !pl || len == 0u || !forensic_payload_trimmed_starts_json(pl, len)) {
+    return;
+  }
+  char tmp[4096];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, pl, len);
+  tmp[len] = '\0';
+  if (strstr(tmp, "\"registry_keys\"")) {
+    forensic_manifest_append_line(manifest_path, "registry_dump_status=unsupported_platform\n");
+  }
+  if (strstr(tmp, "\"memory_regions\"")) {
+    forensic_manifest_append_line(manifest_path, "memory_dump_status=unsupported_platform\n");
+  }
+}
+#endif
+
+static void forensic_post_json_extensions(const char *jobdir, const char *manifest_path, const uint8_t *pl, size_t len) {
+#ifdef _WIN32
+  forensic_post_json_extensions_win(jobdir, manifest_path, pl, len);
+#else
+  (void)jobdir;
+  forensic_post_json_extensions_posix(manifest_path, pl, len);
+#endif
+}
+
+static int forensic_bundle_nonempty(const char *path) {
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    return 0;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  long z = ftell(fp);
+  fclose(fp);
+  return z > 0L;
+}
+
+static void forensic_digest_to_hex(const uint8_t d[EDR_SHA256_DIGEST_LEN], char out65[65]) {
+  static const char hx[] = "0123456789abcdef";
+  for (int i = 0; i < 32; i++) {
+    out65[i * 2] = (char)hx[(d[i] >> 4) & 15u];
+    out65[i * 2 + 1] = (char)hx[d[i] & 15u];
+  }
+  out65[64] = '\0';
+}
+
+static int forensic_sha256_file_hex(const char *path, char out65[65]) {
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    return -1;
+  }
+  EdrSha256Ctx ctx;
+  edr_sha256_init(&ctx);
+  uint8_t buf[65536];
+  for (;;) {
+    size_t n = fread(buf, 1, sizeof(buf), fp);
+    if (n > 0u) {
+      edr_sha256_update(&ctx, buf, n);
+    }
+    if (n < sizeof(buf)) {
+      break;
+    }
+  }
+  fclose(fp);
+  uint8_t d[EDR_SHA256_DIGEST_LEN];
+  edr_sha256_final(&ctx, d);
+  forensic_digest_to_hex(d, out65);
+  return 0;
+}
+
+/** 默认开启：`EDR_FORENSIC_UPLOAD=0` 关闭自动 **UploadFile**（`ingest.proto`）。 */
+static int forensic_auto_upload_enabled(void) {
+  const char *e = getenv("EDR_FORENSIC_UPLOAD");
+  if (!e || !e[0]) {
+    return 1;
+  }
+  return !(e[0] == '0' && e[1] == '\0');
+}
+
 static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
@@ -643,18 +1501,10 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   char dir[700];
 #ifdef _WIN32
   snprintf(dir, sizeof(dir), "%s\\%s", base, job);
-  {
-    char cmdline[900];
-    snprintf(cmdline, sizeof(cmdline), "cmd /c mkdir \"%s\" 2>nul", dir);
-    (void)system(cmdline);
-  }
+  (void)edr_mkdir_p_win(dir);
 #else
   snprintf(dir, sizeof(dir), "%s/%s", base, job);
-  {
-    char cmdline[800];
-    snprintf(cmdline, sizeof(cmdline), "mkdir -p \"%s\" 2>/dev/null", dir);
-    (void)system(cmdline);
-  }
+  (void)edr_mkdir_p_posix(dir);
 #endif
   char manifest[800];
 #ifdef _WIN32
@@ -702,24 +1552,65 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
     fprintf(f, "endpoint_id=%s\ntenant_id=%s\n", s_bound_cfg->agent.endpoint_id[0] ? s_bound_cfg->agent.endpoint_id : "",
             s_bound_cfg->agent.tenant_id[0] ? s_bound_cfg->agent.tenant_id : "");
   }
+  if (pl && len > 0u && forensic_payload_trimmed_starts_json(pl, len)) {
+    fprintf(f, "payload_format=json\n");
+    forensic_manifest_declared_extensions(f, pl, len);
+  } else if (pl && len > 0u) {
+    fprintf(f, "payload_format=lines\n");
+  }
+  forensic_manifest_user_volume(f);
   fclose(f);
-  forensic_copy_lines(dir, pl, len);
+  if (pl && len > 0u) {
+    if (forensic_payload_trimmed_starts_json(pl, len)) {
+      forensic_copy_paths_from_json(dir, pl, len);
+    } else {
+      forensic_copy_lines(dir, pl, len);
+    }
+  }
+  forensic_post_json_extensions(dir, manifest, pl, len);
 #ifdef _WIN32
-  {
-    char tarcmd[1100];
-    snprintf(tarcmd, sizeof(tarcmd), "cmd /c tar czf \"%s\\bundle.tgz\" -C \"%s\" . 2>nul", dir, dir);
-    (void)system(tarcmd);
-  }
+  (void)edr_forensic_run_tar_czf(dir);
 #else
-  {
-    char tarcmd[1000];
-    snprintf(tarcmd, sizeof(tarcmd), "tar czf \"%s/bundle.tgz\" -C \"%s\" . 2>/dev/null", dir, dir);
-    (void)system(tarcmd);
-  }
+  (void)edr_forensic_run_tar_czf_posix(dir);
 #endif
+  char bundle_path[800];
+#ifdef _WIN32
+  snprintf(bundle_path, sizeof(bundle_path), "%s\\bundle.tgz", dir);
+#else
+  snprintf(bundle_path, sizeof(bundle_path), "%s/bundle.tgz", dir);
+#endif
+
+  char detail[384];
+  snprintf(detail, sizeof(detail), "forensic bundle ok");
+  if (forensic_auto_upload_enabled()) {
+    if (!edr_grpc_client_ready()) {
+      snprintf(detail, sizeof(detail), "forensic bundle ok; skip UploadFile (grpc not ready)");
+    } else if (!forensic_bundle_nonempty(bundle_path)) {
+      snprintf(detail, sizeof(detail), "forensic bundle ok; skip UploadFile (missing or empty bundle.tgz)");
+    } else {
+      char shahex[65];
+      if (forensic_sha256_file_hex(bundle_path, shahex) != 0) {
+        snprintf(detail, sizeof(detail), "forensic bundle ok; skip UploadFile (sha256 failed)");
+      } else {
+        char alert_id[288];
+        {
+          const char *id = (cmd_id && cmd_id[0]) ? cmd_id : "job";
+          (void)snprintf(alert_id, sizeof(alert_id), "forensic-%s", id);
+        }
+        char minio_key[256];
+        minio_key[0] = '\0';
+        if (edr_grpc_client_upload_file(alert_id, bundle_path, shahex, minio_key, sizeof(minio_key)) == 0) {
+          snprintf(detail, sizeof(detail), "forensic bundle ok; UploadFile key=%.220s", minio_key[0] ? minio_key : "(ok)");
+        } else {
+          snprintf(detail, sizeof(detail), "forensic bundle ok; UploadFile failed (local=%.200s)", bundle_path);
+        }
+      }
+    }
+  }
+
   s_exec_ok++;
-  audit_both(cmd_id, "forensic: manifest + bundle.tgz（可选路径复制见 EDR_FORENSIC_COPY_PATHS）");
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "forensic bundle ok");
+  audit_both(cmd_id, detail);
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {

