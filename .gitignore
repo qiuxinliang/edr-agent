@@ -1,0 +1,9 @@
+/build/
+install/windows-inno/Output/
+.onnx_gen_deps/
+# install_static_onnx.sh 默认联调目录（含大体积 .onnx，勿提交）
+/models/
+.venv-proto/
+/tmp
+requirements-dev.txt
+/docs

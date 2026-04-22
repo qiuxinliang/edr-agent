@@ -1,0 +1,152 @@
+// 与《EDR 端点详细设计》§6.1 一致；`AveBehaviorEventFeed` 与《11_behavior.onnx详细设计》§4.1 / `AVEBehaviorEvent` 对齐。
+// nanopb：src/proto/edr/v1/event.pb.{h,c}（scripts/regen_event_proto.sh；需与本机 protobuf 版本匹配）。
+// Go 服务端生成：edr-backend/platform/Makefile proto（internal/edrpb/edrv1）。
+syntax = "proto3";
+
+package edr.v1;
+
+option go_package = "edr-backend/platform/internal/edrpb/edrv1;edrv1";
+
+// 《11_behavior.onnx详细设计》§4.1：`AVEBehaviorEvent` 标准载荷（ETW/预处理 → 行为 ONNX）。
+// 与 `include/edr/ave_sdk.h` 中 `AVEBehaviorEvent` 字段语义一致；嵌于 `BehaviorEvent` 供平台强类型入库与特征重建。
+// `BehaviorEvent.type` 为平台 `EdrEventType`；`ave_event_type` 为 **AVEEventType**（0–13），二者缺省可独立填写。
+message AveBehaviorEventFeed {
+  uint32 severity_hint = 1;
+
+  // 文件 / 注册表 / DLL 等路径类目标（§4.1 目标字段）
+  string target_path = 2;
+  float target_path_entropy = 3;
+  bool target_is_system_dir = 4;
+  bool target_is_temp_dir = 5;
+  bool target_is_network_path = 6;
+  // 0=普通 1=脚本 2=PE 可执行（与端侧 `target_file_ext_risk` 枚举一致）
+  uint32 target_file_ext_risk = 7;
+  bool target_has_motw = 8;
+
+  // 网络类 NET_CONNECT / NET_DNS
+  string target_ip = 9;
+  string target_domain = 10;
+  uint32 target_port = 11;
+  bool target_ip_is_public = 12;
+  float target_ip_geoip_risk = 13;
+  float target_port_risk = 14;
+  float target_domain_entropy = 15;
+
+  // 注册表 REG_WRITE
+  float reg_key_risk = 16;
+
+  // §4.1 E 组：SHELLCODE_SIGNAL / WEBSHELL_SIGNAL / PMFE_RESULT
+  float shellcode_score = 17;
+  float webshell_score = 18;
+  float pmfe_confidence = 19;
+  bool pmfe_pe_found = 20;
+  bool pmfe_dns_tunnel = 21;
+
+  // TIP / IOC（§4.1）
+  bool ioc_ip_hit = 22;
+  bool ioc_domain_hit = 23;
+  bool ioc_sha256_hit = 24;
+
+  // 证书白名单子系统
+  bool cert_revoked_ancestor = 25;
+
+  // 端侧 `AVEBehaviorEvent` 扩展：静态扫描置信度、行为位域、文件哈希（供 IOC / E 组）
+  float ave_confidence = 26;
+  uint64 behavior_flags = 27;
+  string file_sha256_hex = 28;
+
+  // `AVEEventType`：与平台 `BehaviorEvent.type`（EdrEventType）区分；未设置时由平台按 type 映射或忽略
+  optional int32 ave_event_type = 29;
+}
+
+// §12.4 behavior.onnx → 平台：与《11_behavior.onnx详细设计》AVEBehaviorAlert 对齐（嵌于 BehaviorEvent 或单独帧）。
+message BehaviorAlert {
+  float anomaly_score = 1;           // 0–1
+  // 固定 14 维；nanopb 默认对 repeated 标量走 packed（LEN）；ingest 侧仍归一为 14 浮点再入库。
+  repeated float tactic_probs = 2 [packed = true];
+  // 逗号分隔；推荐 MITRE 战术 id（如 T1059）；端上亦可填英文展示名（平台 mitre_ttps 存 JSON 字符串数组）。
+  string triggered_tactics = 3;
+  bool skip_ai_analysis = 4;
+  bool needs_l2_review = 5;
+  int64 timestamp_ns = 6;
+  uint32 pid = 7;
+  string process_name = 8;
+  string process_path = 9; // 对应 BehaviorEvent.exe_path
+}
+
+// BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。
+message BehaviorEvent {
+  string event_id = 1;
+  string endpoint_id = 2;
+  string tenant_id = 3;
+  int32 type = 4;
+  int64 event_time_ns = 5;
+  uint32 pid = 6;
+  uint32 ppid = 7;
+  string process_name = 8;
+  string cmdline = 9;
+  string exe_hash = 10;
+  string exe_path = 11;
+  string username = 12;
+  uint32 session_id = 13;
+
+  oneof detail {
+    ProcessDetail process = 20;
+    FileDetail file = 21;
+    NetworkDetail network = 22;
+    // 注册表 REG_CREATE_KEY / REG_SET_VALUE / REG_DELETE_KEY（与 `EdrEventType` 30–32 对齐）；ingest 写入 payload_json category=registry
+    RegistryDetail registry = 23;
+    DnsDetail dns = 24;
+    ScriptDetail script = 25;
+  }
+
+  string ave_result_json = 30;
+  repeated string mitre_ttps = 31;
+  uint32 priority = 32;
+
+  // 行为 ONNX 高危/中危告警载荷（与 ave_result_json 二选一或并存；上报时优先填本字段便于平台强类型入库）
+  BehaviorAlert behavior_alert = 40;
+
+  // 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台 ONNX/检索优先读本消息）
+  optional AveBehaviorEventFeed ave_behavior_feed = 41;
+}
+
+message ProcessDetail {
+  string parent_name = 1;
+  string parent_path = 2;
+  string integrity_level = 3;
+}
+
+message FileDetail {
+  string operation = 1;
+  string target_path = 2;
+  uint64 file_size = 3;
+  /** 《11》§5.3 维 35：与 `AVEBehaviorEvent.target_has_motw` 对齐（MOTW / Zone.Identifier 等） */
+  bool target_has_motw = 4;
+}
+
+// 注册表事件明细；与平台 `endpoint_events.payload_json`（category=registry）字段对齐。
+message RegistryDetail {
+  string key_path = 1;
+  string value_name = 2;
+  // 文本/可打印表示；二进制数据建议端上编码为十六进制或省略（平台侧截断见 ingest）
+  string value_data = 3;
+  // 如 set_value、create_key、delete_key（小写约定，可选）
+  string operation = 4;
+}
+
+message NetworkDetail {
+  string src_ip = 1;
+  uint32 src_port = 2;
+  string dst_ip = 3;
+  uint32 dst_port = 4;
+  string protocol = 5;
+}
+
+message DnsDetail {
+  string query_name = 1;
+}
+
+message ScriptDetail {
+  string snippet = 1;
+}

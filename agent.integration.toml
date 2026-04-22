@@ -1,0 +1,51 @@
+# 与 edr-backend/docs/LOCAL_STACK_INTEGRATION.md 对齐的联调示例（复制为 agent.toml 或 --config 指向本文件）
+# 前置：reset_local_edr_db.sh 已灌入 demo-tenant / ep-1~ep-3
+
+[server]
+address              = "127.0.0.1:50051"
+ca_cert              = ""
+client_cert          = ""
+client_key           = ""
+connect_timeout_s    = 10
+keepalive_interval_s = 30
+
+[agent]
+# 与 demo_endpoints.sql 一致；在 Linux 本机联调可改为 ep-1 / ep-2
+endpoint_id          = "ep-3"
+tenant_id            = "demo-tenant"
+
+[collection]
+etw_enabled          = true
+ebpf_enabled         = true
+poll_interval_s      = 1
+max_event_queue_size = 4096
+
+[platform]
+rest_base_url        = "http://127.0.0.1:8080/api/v1"
+rest_user_id         = "edr-agent"
+# rest_bearer_token  = ""
+
+# §19.8：与 agent.toml.example 同形；周期上报未接主循环前保持 enabled=false。
+[attack_surface]
+enabled                  = false
+port_interval_s          = 300
+conn_interval_s          = 300
+service_interval_s       = 600
+policy_interval_s       = 3600
+full_snapshot_interval_s = 1800
+outbound_top_n           = 128
+outbound_exclude_loopback = true
+geoip_db_path            = "/opt/edr/data/GeoLite2-City.mmdb"
+high_risk_immediate_ports = [23, 445, 3389, 6379, 27017, 1433, 3306]
+firewall_rule_detail_max = 500
+
+[offline]
+queue_db_path        = "edr_queue.integration.db"
+max_queue_size_mb    = 128
+retention_hours      = 72
+
+[logging]
+level                = "info"
+log_dir              = "."
+max_log_size_mb      = 50
+max_log_files        = 5

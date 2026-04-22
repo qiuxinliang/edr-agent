@@ -1,0 +1,26 @@
+/* 在运行 regen_event_proto_c.sh 生成 event.pb-c.h 后，将此文件复制到
+ * src/serialize/behavior_proto_c_pack.c，按生成头文件中的类型/枚举名调整
+ * （尤其 oneof 的 case 与 union 成员名），并在 CMake 中：
+ *   target_sources(edr_agent PRIVATE src/serialize/behavior_proto_c_pack.c)
+ *   target_compile_definitions(edr_agent PRIVATE EDR_PROTOBUF_C_USE_GENERATED=1)
+ *   target_link_libraries(edr_agent PRIVATE ${ProtobufC_LIBRARIES})
+ *
+ * 下面为示意代码，可能无法直接编译，需与 event.pb-c.h 对齐。
+ */
+
+#if 0
+#include "edr/behavior_proto_c.h"
+#include "edr/behavior_record.h"
+#include "edr/v1/event.pb-c.h"
+#include <protobuf-c/protobuf-c.h>
+#include <stdlib.h>
+#include <string.h>
+
+size_t edr_behavior_record_encode_protobuf_c(const EdrBehaviorRecord *r, uint8_t *out,
+                                             size_t out_cap) {
+  (void)r;
+  (void)out;
+  (void)out_cap;
+  return 0;
+}
+#endif

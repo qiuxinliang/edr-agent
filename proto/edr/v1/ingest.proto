@@ -1,0 +1,94 @@
+// §7 gRPC 上报 / 指令订阅 — 与服务端 EventIngest 对齐
+// SOAR：编排侧通过 CommandEnvelope 扩展字段关联 playbook；执行结果经 ReportCommandResult 回传对账。
+syntax = "proto3";
+
+package edr.v1;
+
+option go_package = "edr-backend/platform/internal/edrpb/edrv1;edrv1";
+
+message ReportEventsRequest {
+  string endpoint_id = 1;
+  string batch_id = 2;
+  string agent_version = 3;
+  bytes payload = 4; // BAT1 / BLZ4 批次体（含 12B 头 + 帧）
+}
+
+message ReportEventsResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message SubscribeRequest {
+  string endpoint_id = 1;
+}
+
+// 服务端 → 终端：编排指令（与 SOAR / playbook 对账）
+message CommandEnvelope {
+  string command_id = 1;
+  string command_type = 2;
+  bytes payload = 3;
+  // --- SOAR / 编排（可选；空串表示非编排下发，兼容旧服务端）---
+  string soar_correlation_id = 4; // 与 SOAR 工单或 run 全局关联，建议 UUID
+  string playbook_run_id = 5;     // 一次 playbook 实例
+  string playbook_step_id = 6;    // playbook 内步骤 id
+  int64 issued_at_unix_ms = 7;    // 服务端签发时间（Unix 毫秒），0 表示未填
+  uint32 deadline_ms = 8;         // 建议最大执行耗时（毫秒），0 表示未限制
+  string idempotency_key = 9;     // 幂等键（服务端去重）
+}
+
+// 终端 → 服务端：指令执行结果（供 SOAR 关闭循环、审计）
+enum CommandExecutionStatus {
+  COMMAND_EXECUTION_STATUS_UNSPECIFIED = 0;
+  COMMAND_EXECUTION_STATUS_OK = 1;
+  COMMAND_EXECUTION_STATUS_REJECTED = 2;       // 策略拒绝（如未启用高危开关）
+  COMMAND_EXECUTION_STATUS_FAILED = 3;         // 已接受但执行失败
+  COMMAND_EXECUTION_STATUS_UNKNOWN_TYPE = 4;   // 未知 command_type
+}
+
+message CommandExecutionResult {
+  string command_id = 1;
+  string endpoint_id = 2;
+  string agent_version = 3;
+  string soar_correlation_id = 4;
+  string playbook_run_id = 5;
+  string playbook_step_id = 6;
+  CommandExecutionStatus status = 7;
+  int32 exit_code = 8;           // 0 成功；非 0 为子系统错误码或约定错误
+  string detail_utf8 = 9;        // 人类可读说明（短）
+  int64 finished_unix_ms = 10;   // 终端完成时间（Unix 毫秒）
+}
+
+message ReportCommandResultRequest {
+  string endpoint_id = 1;
+  CommandExecutionResult result = 2;
+}
+
+message ReportCommandResultResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// Webshell 取证文件上传（流式分片）
+message FileChunk {
+  string upload_id = 1;
+  string alert_id = 2;
+  string filename = 3;
+  string sha256 = 4;     // 仅首片可携带
+  uint64 file_size = 5;  // 仅首片可携带
+  bytes data = 6;
+  uint64 offset = 7;
+  bool is_last = 8;
+}
+
+message UploadResult {
+  bool success = 1;
+  string minio_key = 2;
+  string error = 3;
+}
+
+service EventIngest {
+  rpc ReportEvents(ReportEventsRequest) returns (ReportEventsResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream CommandEnvelope);
+  rpc ReportCommandResult(ReportCommandResultRequest) returns (ReportCommandResultResponse);
+  rpc UploadFile(stream FileChunk) returns (UploadResult);
+}
