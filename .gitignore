@@ -1,8 +1,10 @@
 /build/
+# vcpkg 清单模式在工程根生成的已安装包目录（CI 无此目录名冲突时可删）
+/vcpkg_installed/
 install/windows-inno/Output/
 .onnx_gen_deps/
-# install_static_onnx.sh 默认联调目录（含大体积 .onnx，勿提交）
-/models/
+# 联调 ONNX 勿提交；models/ 目录内 README 等占位文件需入库（Inno 安装包带 models）
+/models/*.onnx
 .venv-proto/
 /tmp
 requirements-dev.txt

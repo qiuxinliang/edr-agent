@@ -3,6 +3,8 @@
 
 #include "edr/config.h"
 
+#include <stdio.h>
+
 void edr_grpc_client_init(const EdrConfig *cfg) { (void)cfg; }
 
 void edr_grpc_client_shutdown(void) {}
@@ -27,6 +29,14 @@ int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *header12, si
 unsigned long edr_grpc_client_rpc_ok(void) { return 0UL; }
 
 unsigned long edr_grpc_client_rpc_fail(void) { return 0UL; }
+
+void edr_grpc_client_diag(char *buf, size_t cap) {
+  if (!buf || cap == 0u) {
+    return;
+  }
+  snprintf(buf, cap, "%s",
+           "stub_no_grpc(CI/Inno_build_uses_EDR_WITH_GRPC=OFF;use_HTTP_ingest_or_rebuild_with_gRPC++)");
+}
 
 int edr_grpc_client_report_command_result(const char *command_id,
                                           const struct EdrSoarCommandMeta *meta, int execution_status,

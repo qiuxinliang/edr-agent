@@ -57,4 +57,15 @@ CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_null.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_size_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_time_t.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_timespec.h
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_timespec.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdio.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_stdio.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_va_list.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/stdio.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_printf.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_seek_set.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_ctermid.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_off_t.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_ssize_t.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_stdio.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_common.h

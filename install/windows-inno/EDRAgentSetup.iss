@@ -49,6 +49,11 @@ Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin 
 
 [Files]
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
+; 与 edr_agent.exe 同目录，供 EDR_WITH_ONNXRUNTIME 链 ORT 的运行时加载（发布 CI 在 ISCC 前复制到 build\Release\）
+Source: "..\..\build\Release\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\build\Release\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; models\：与 config.c 中「exe 同目录\models」及 agent.toml.example [ave] 约定一致；占位文件便于空目录随包安装
+Source: "..\..\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion

@@ -29,8 +29,12 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #include <sys/stat.h>
 
+#include "edr/ave.h"
 #include "edr/grpc_client.h"
+#include "edr/ingest_http.h"
 #include "edr/transport_sink.h"
+
+#include "ave_onnx_infer.h"
 
 struct EdrAgent {
   EdrEventBus *event_bus;
@@ -61,11 +65,22 @@ static int edr_agent_console_heartbeat_interval_s(const EdrAgent *agent) {
 }
 
 static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
+  char grpc_diag[200];
+  int ave_mf = 0, ave_nf = 0, ave_dir = 0;
+  edr_grpc_client_diag(grpc_diag, sizeof(grpc_diag));
+  if (!grpc_diag[0]) {
+    snprintf(grpc_diag, sizeof(grpc_diag), "%s", "-");
+  }
+  edr_ave_get_scan_counts(&ave_mf, &ave_nf, &ave_dir);
   fprintf(stderr,
-          "[heartbeat] grpc_ready=%d target=%s rpc_ok=%lu rpc_fail=%lu wire_events=%lu wire_bytes=%lu\n",
-          edr_grpc_client_ready(), agent->cfg.server.address, edr_grpc_client_rpc_ok(),
+          "[heartbeat] grpc_ready=%d grpc_diag=%s http_ingest=%d batches=%lu target=%s rpc_ok=%lu "
+          "rpc_fail=%lu wire_events=%lu wire_bytes=%lu "
+          "ave_model_files=%d ave_dir_ready=%d onnx_static_ready=%d onnx_behavior_ready=%d\n",
+          edr_grpc_client_ready(), grpc_diag, edr_ingest_http_configured(),
+          edr_transport_batch_count(), agent->cfg.server.address, edr_grpc_client_rpc_ok(),
           edr_grpc_client_rpc_fail(), edr_transport_wire_events_count(),
-          edr_transport_wire_bytes_count());
+          edr_transport_wire_bytes_count(), ave_mf, ave_dir, edr_onnx_runtime_ready(),
+          edr_onnx_behavior_ready());
   fflush(stderr);
 }
 

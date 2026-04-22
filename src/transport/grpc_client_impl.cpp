@@ -241,6 +241,35 @@ extern "C" int edr_grpc_client_ready(void) {
   return s_stub ? 1 : 0;
 }
 
+extern "C" void edr_grpc_client_diag(char *buf, size_t cap) {
+  if (!buf || cap == 0u) {
+    return;
+  }
+  buf[0] = '\0';
+  std::lock_guard<std::mutex> lock(s_mu);
+  if (s_stub) {
+    snprintf(buf, cap, "%s", "ok");
+    return;
+  }
+  if (s_target.empty()) {
+    snprintf(buf, cap, "%s", "empty_server_address");
+    return;
+  }
+  if (s_insecure) {
+    snprintf(buf, cap, "%s", "insecure_no_channel");
+    return;
+  }
+  if (s_ca.empty() && s_cert.empty() && s_key.empty()) {
+    snprintf(buf, cap, "%s", "no_tls_pem_or_EDR_GRPC_INSECURE=1");
+    return;
+  }
+  if (!s_ca.empty() && (s_cert.empty() || s_key.empty())) {
+    snprintf(buf, cap, "%s", "incomplete_mtls_missing_client_cert_or_key");
+    return;
+  }
+  snprintf(buf, cap, "%s", "channel_not_ready");
+}
+
 extern "C" int edr_grpc_client_reconnect_to_target(const char *target) {
   std::string next = target ? target : "";
   if (next.empty()) {

@@ -59,6 +59,8 @@ jobs:
     if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
     runs-on: windows-latest
 
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
     steps:
       - uses: actions/checkout@v6
 
@@ -73,23 +75,66 @@ jobs:
             exit 1
           fi
 
-      - name: Configure (Release, no gRPC)
-        # 精简仓库可无 tests/；仅跑 edr_agent --help（见 EDR_BUILD_TESTS=OFF）
-        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_BUILD_TESTS=OFF
+      - name: ONNX Runtime (CPU, Windows x64)
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zip = Join-Path $dest "ort.zip"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip" -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
+          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected: missing $root" }
+          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install gRPC (vcpkg, manifest vcpkg.json)
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 6f29f12e82a8293156836ad81cc9bf5af41fe836
+          runVcpkgInstall: true
+          doNotCache: false
+
+      - name: Configure (Release, gRPC ON + ONNX Runtime)
+        # vcpkg + triplet x64-windows-static-md：gRPC 静态链入 exe；ORT 为动态库 onnxruntime.dll 随安装包分发。
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          $tc = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
+          cmake -B build `
+            "-DCMAKE_TOOLCHAIN_FILE=$tc" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DEDR_WITH_GRPC=ON `
+            -DEDR_WITH_ONNXRUNTIME=ON `
+            "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DEDR_BUILD_TESTS=OFF
 
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
+      - name: Stage ORT DLLs next to edr_agent.exe
+        run: ./scripts/stage_ort_dlls_build_release.ps1
+
       - name: Test
         shell: bash
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Bundle ONNX (onnx-output → models)
+        shell: pwsh
+        env:
+          EDR_BUNDLE_ONNX_REQUIRED: "1"
+        run: ./scripts/sync_onnx_output_to_models.ps1
 
       - name: Package zip (portable)
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64.zip"
           if (-not (Test-Path -LiteralPath "agent.toml.example")) { throw "missing agent.toml.example for portable zip" }
-          Compress-Archive -Path "build/Release/edr_agent.exe", "agent.toml.example" -DestinationPath $zip -Force
+          if (-not (Test-Path -LiteralPath "models")) { throw "missing models/ for portable zip" }
+          $items = @("build/Release/edr_agent.exe", "agent.toml.example", "models")
+          if (Test-Path -LiteralPath "build/Release/onnxruntime.dll") { $items += "build/Release/onnxruntime.dll" }
+          if (Test-Path -LiteralPath "build/Release/onnxruntime_providers_shared.dll") { $items += "build/Release/onnxruntime_providers_shared.dll" }
+          Compress-Archive -Path $items -DestinationPath $zip -Force
 
       - name: Install Inno Setup 6
         run: choco install innosetup -y
@@ -178,6 +223,11 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      - name: Bundle ONNX (onnx-output → models)
+        env:
+          EDR_BUNDLE_ONNX_REQUIRED: "1"
+        run: ./scripts/sync_onnx_output_to_models.sh
+
       - name: Package zip (binary + install.sh 一键安装)
         run: |
           strip build/edr_agent 2>/dev/null || true
@@ -186,6 +236,7 @@ jobs:
           mkdir -p "$DIST"
           cp build/edr_agent "$DIST/"
           cp agent.toml.example "$DIST/"
+          cp -a models "$DIST/"
           cp install/linux/install.sh "$DIST/"
           chmod +x "$DIST/edr_agent" "$DIST/install.sh"
           {

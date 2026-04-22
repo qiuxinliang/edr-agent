@@ -36,6 +36,12 @@ unsigned long edr_grpc_client_rpc_ok(void);
 unsigned long edr_grpc_client_rpc_fail(void);
 
 /**
+ * 写入简短 ASCII 诊断（为何 `edr_grpc_client_ready` 可能为 0），供控制台心跳等使用。
+ * `cap` 含 NUL；无信息时写入 `"-"`。
+ */
+void edr_grpc_client_diag(char *buf, size_t cap);
+
+/**
  * 上报指令执行结果（ingest.proto ReportCommandResult），供 SOAR 对账。
  * execution_status 使用 `EdrCommandExecutionStatus` 数值（1=OK …）。
  * 未启用 gRPC 或失败时返回 -1。
