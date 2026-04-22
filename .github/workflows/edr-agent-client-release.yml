@@ -1,8 +1,10 @@
 # 本文件位于「仅含 edr-agent」的仓库根目录下的 .github/workflows/。
 # 按标签构建并发布到 GitHub Release。
 #
-# 触发：仅推送标签 win_*（Windows）或 linux_*（Linux 本机二进制）。
-# 权限：GITHUB_TOKEN + contents:write 创建 Release 并上传附件。
+# 触发：
+#   1) 推送标签 win_* / linux_* → 构建 + 上传 Release 附件（需先打 tag 再 push tag）。
+#   2) workflow_dispatch → 仅构建并保留 Artifact（不创建 GitHub Release，便于验证 Actions）。
+# 说明：只 push 分支、不打符合规则的 tag 时，本 workflow 不会出现任何 run，属正常现象。
 #
 # 使用示例：
 #   git tag win_1.0.0 && git push origin win_1.0.0
@@ -15,6 +17,16 @@ on:
     tags:
       - 'win_*'
       - 'linux_*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '手动试跑：选平台（仅产物 Artifact，不发 Release）'
+        required: true
+        default: linux
+        type: choice
+        options:
+          - linux
+          - windows
 
 permissions:
   contents: write
@@ -27,7 +39,7 @@ jobs:
   # ---------- Windows ----------
   windows-build:
     name: Build Windows (edr_agent.exe)
-    if: startsWith(github.ref_name, 'win_')
+    if: startsWith(github.ref_name, 'win_') || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows')
     runs-on: windows-latest
 
     steps:
@@ -58,7 +70,7 @@ jobs:
 
   windows-release:
     name: Publish Windows Release
-    if: startsWith(github.ref_name, 'win_')
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'win_')
     needs: windows-build
     runs-on: ubuntu-latest
     steps:
@@ -85,7 +97,7 @@ jobs:
   # ---------- Linux ----------
   linux-build:
     name: Build Linux (edr_agent)
-    if: startsWith(github.ref_name, 'linux_')
+    if: startsWith(github.ref_name, 'linux_') || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'linux')
     runs-on: ubuntu-latest
 
     steps:
@@ -117,7 +129,7 @@ jobs:
 
   linux-release:
     name: Publish Linux Release
-    if: startsWith(github.ref_name, 'linux_')
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'linux_')
     needs: linux-build
     runs-on: ubuntu-latest
     steps:
