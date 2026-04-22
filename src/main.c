@@ -27,7 +27,44 @@ static void edr_on_sigint(int s) {
 #endif
 
 #ifdef _WIN32
+#include <wchar.h>
 #include <windows.h>
+/** 未传 --config 时，若 exe 同目录存在 agent.toml 则自动加载（安装目录 / 计划任务未带参数时仍可读配置）。 */
+static int win_agent_toml_next_to_exe(char *out_utf8, size_t out_cap) {
+  wchar_t wpath[MAX_PATH];
+  DWORD n = GetModuleFileNameW(NULL, wpath, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) {
+    return 0;
+  }
+  wchar_t *slash = wcsrchr(wpath, L'\\');
+  if (!slash) {
+    slash = wcsrchr(wpath, L'/');
+  }
+  if (!slash) {
+    return 0;
+  }
+  slash++;
+  {
+    const wchar_t *s = L"agent.toml";
+    size_t j = 0;
+    while (s[j] != 0 && (slash + j) < wpath + MAX_PATH - 1) {
+      slash[j] = s[j];
+      j++;
+    }
+    slash[j] = L'\0';
+  }
+  {
+    DWORD at = GetFileAttributesW(wpath);
+    if (at == INVALID_FILE_ATTRIBUTES || (at & FILE_ATTRIBUTE_DIRECTORY)) {
+      return 0;
+    }
+  }
+  if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out_utf8, (int)out_cap, NULL, NULL) <= 1) {
+    return 0;
+  }
+  return 1;
+}
+
 static EdrAgent *g_agent_for_ctrl;
 static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
   if (t == CTRL_C_EVENT || t == CTRL_CLOSE_EVENT || t == CTRL_BREAK_EVENT) {
@@ -43,6 +80,7 @@ static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
 static void print_usage(const char *argv0) {
   fprintf(stderr, "用法: %s [--config <path>]\n", argv0);
   fprintf(stderr,
+          "  Windows: 若未指定 --config 且与 exe 同目录存在 agent.toml，将自动加载该文件。\n"
           "  EDR Agent — 端点实现（初版：采集/预处理/批次/gRPC/指令/AVE 等已接通，见 README「实现状态快照」；"
           "设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md）\n");
 }
@@ -62,6 +100,13 @@ int main(int argc, char **argv) {
     print_usage(argv[0]);
     return 1;
   }
+
+#ifdef _WIN32
+  static char s_win_cfg_auto[4096];
+  if ((!config || !config[0]) && win_agent_toml_next_to_exe(s_win_cfg_auto, sizeof(s_win_cfg_auto))) {
+    config = s_win_cfg_auto;
+  }
+#endif
 
   EdrAgent *agent = edr_agent_create();
   if (!agent) {

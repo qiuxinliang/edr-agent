@@ -346,6 +346,23 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
       EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
 
   ULONG status = StartTrace(&s_session_handle, NULL, prop);
+  if (status != ERROR_SUCCESS) {
+    fprintf(stderr,
+            "[collector_win] StartTrace failed winerr=%lu (session=%ls). Common: 183=stale session name, 5=access denied.\n",
+            (unsigned long)status, g_session_name);
+    /* 上次进程未正常 StopTrace 时，内核仍占用同名实时会话，导致 ERROR_ALREADY_EXISTS。 */
+    if (status == ERROR_ALREADY_EXISTS) {
+      EVENT_TRACE_PROPERTIES st0 = {0};
+      st0.Wnode.BufferSize = sizeof(st0);
+      ULONG stc = ControlTraceW(0, g_session_name, &st0, EVENT_TRACE_CONTROL_STOP);
+      fprintf(stderr, "[collector_win] ControlTrace STOP stale session winerr=%lu, retry StartTrace\n",
+              (unsigned long)stc);
+      status = StartTrace(&s_session_handle, NULL, prop);
+      if (status == ERROR_SUCCESS) {
+        fprintf(stderr, "[collector_win] StartTrace OK after cleanup\n");
+      }
+    }
+  }
   HeapFree(GetProcessHeap(), 0, prop);
 
   if (status != ERROR_SUCCESS) {
