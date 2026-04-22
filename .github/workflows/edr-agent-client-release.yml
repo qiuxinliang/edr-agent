@@ -8,6 +8,7 @@
 #   workflow_dispatch → 仅构建并保留 Artifact（不创建 GitHub Release，便于验证 Actions）。
 # Windows Artifact：zip（便携）+ EDRAgentSetup-<tag>.exe（Inno 图形安装）；Linux：zip 内含 install.sh。
 # 说明：只 push 分支、不打符合规则的 tag 时，本 workflow 不会出现任何 run，属正常现象。
+# 若 Actions 页提示「This workflow graph cannot be shown」：多为尚未有 run，或旧 UI 对「全条件 job」不画静态图；下方 workflow-context 无 if，便于生成图；跑一次后即正常。
 #
 # 使用示例：
 #   git tag win_1.0.1 && git push origin win_1.0.1
@@ -40,6 +41,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 无 if：任意触发下都执行，便于 GitHub 绘制 workflow 图；与构建 job 无依赖关系。
+  workflow-context:
+    name: Workflow context
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print trigger context
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "ref_name=${{ github.ref_name }}"
+          echo "ref=${{ github.ref }}"
+
   # ---------- Windows ----------
   windows-build:
     name: Build Windows (edr_agent.exe)
