@@ -57,8 +57,13 @@ var
   EnrollPage: TInputQueryWizardPage;
 
 function JsonEscape(const S: string): string;
+var
+  Q, B: string;
 begin
-  Result := '"' + StringChange(StringChange(S, '\', '\\'), '"', '\"') + '"';
+  { Do not use '\"' inside single-quoted literals here; compiler reports Variable Expected. }
+  B := Chr(92);
+  Q := Chr(34);
+  Result := Q + StringChange(StringChange(S, B, B + B), Q, B + Q) + Q;
 end;
 
 procedure InitializeWizard;
