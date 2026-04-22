@@ -29,6 +29,9 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #include <sys/stat.h>
 
+#include "edr/grpc_client.h"
+#include "edr/transport_sink.h"
+
 struct EdrAgent {
   EdrEventBus *event_bus;
   char *config_path;
@@ -40,6 +43,31 @@ struct EdrAgent {
   /** §19.6 上次轮询 refresh-request 的时间（ns） */
   uint64_t asurf_last_pending_check_ns;
 };
+
+/** 0 = disabled; unset = use clamped server.keepalive_interval_s. */
+static int edr_agent_console_heartbeat_interval_s(const EdrAgent *agent) {
+  const char *e = getenv("EDR_CONSOLE_HEARTBEAT_SEC");
+  if (e && e[0]) {
+    return atoi(e);
+  }
+  int k = agent->cfg.server.keepalive_interval_s;
+  if (k < 10) {
+    k = 10;
+  }
+  if (k > 600) {
+    k = 600;
+  }
+  return k;
+}
+
+static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
+  fprintf(stderr,
+          "[heartbeat] grpc_ready=%d target=%s rpc_ok=%lu rpc_fail=%lu wire_events=%lu wire_bytes=%lu\n",
+          edr_grpc_client_ready(), agent->cfg.server.address, edr_grpc_client_rpc_ok(),
+          edr_grpc_client_rpc_fail(), edr_transport_wire_events_count(),
+          edr_transport_wire_bytes_count());
+  fflush(stderr);
+}
 
 EdrAgent *edr_agent_create(void) {
   return (EdrAgent *)calloc(1, sizeof(EdrAgent));
@@ -170,8 +198,23 @@ EdrError edr_agent_run(EdrAgent *agent) {
         agent->asurf_last_post_ns = t0;
         agent->asurf_last_pending_check_ns = t0;
       }
+      int hb_sec = edr_agent_console_heartbeat_interval_s(agent);
+      uint64_t hb_period_ns =
+          hb_sec > 0 ? (uint64_t)hb_sec * 1000000000ULL : (uint64_t)0ULL;
+      uint64_t last_hb_ns = 0;
+      if (hb_sec > 0) {
+        edr_agent_print_console_heartbeat_line(agent);
+        last_hb_ns = edr_monotonic_ns();
+      }
       while (!agent->shutdown) {
         edr_ms_sleep(200u);
+        if (hb_period_ns > 0) {
+          uint64_t now = edr_monotonic_ns();
+          if (now - last_hb_ns >= hb_period_ns) {
+            edr_agent_print_console_heartbeat_line(agent);
+            last_hb_ns = now;
+          }
+        }
         edr_resource_poll();
         edr_self_protect_poll();
         edr_agent_poll_config_reload(agent, &last_reload_ns);

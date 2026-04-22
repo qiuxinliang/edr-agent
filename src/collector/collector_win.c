@@ -369,19 +369,27 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   /* Pass session name explicitly; some builds mis-handle NULL SessionName with LoggerNameOffset. */
   ULONG status = StartTraceW(&s_session_handle, g_session_name, prop);
   if (status != ERROR_SUCCESS) {
-    fprintf(stderr,
-            "[collector_win] StartTrace failed winerr=%lu (session=%ls). Common: "
-            "123=invalid name/properties, 183=stale session name, 5=access denied.\n",
-            (unsigned long)status, g_session_name);
-    /* 上次进程未正常 StopTrace 时，内核仍占用同名实时会话，导致 ERROR_ALREADY_EXISTS。 */
+    /* 上次进程未正常 StopTrace 时，内核仍占用同名实时会话 -> ERROR_ALREADY_EXISTS (183)。 */
     if (status == ERROR_ALREADY_EXISTS) {
       ULONG stc = edr_etw_control_trace_stop((TRACEHANDLE)0, g_session_name);
-      fprintf(stderr, "[collector_win] ControlTrace STOP stale session winerr=%lu, retry StartTrace\n",
-              (unsigned long)stc);
       status = StartTraceW(&s_session_handle, g_session_name, prop);
       if (status == ERROR_SUCCESS) {
-        fprintf(stderr, "[collector_win] StartTrace OK after cleanup\n");
+        fprintf(stderr,
+                "[collector_win] ETW session %ls was stale (183); ControlTrace STOP winerr=%lu; "
+                "StartTrace OK\n",
+                g_session_name, (unsigned long)stc);
+      } else {
+        fprintf(stderr,
+                "[collector_win] StartTrace failed: stale session (183), STOP winerr=%lu, retry "
+                "StartTrace winerr=%lu (session=%ls). Common: "
+                "123=invalid name/properties, 5=access denied.\n",
+                (unsigned long)stc, (unsigned long)status, g_session_name);
       }
+    } else {
+      fprintf(stderr,
+              "[collector_win] StartTrace failed winerr=%lu (session=%ls). Common: "
+              "123=invalid name/properties, 183=stale session name, 5=access denied.\n",
+              (unsigned long)status, g_session_name);
     }
   }
   HeapFree(GetProcessHeap(), 0, prop);

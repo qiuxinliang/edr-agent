@@ -91,6 +91,10 @@ static void print_usage(const char *prog) {
           "  --config <path>   加载 agent.toml（推荐始终显式指定）\n"
           "  --etw-uninstall-cleanup   停止本程序使用的 ETW 实时会话（卸载脚本调用；无其它初始化）\n"
           "  -h, --help, -help, /?   显示本说明并退出\n"
+          "\n"
+          "环境变量:\n"
+          "  EDR_CONSOLE_HEARTBEAT_SEC   控制台 [heartbeat] 间隔（秒）；0=关闭；未设置则用 agent.toml\n"
+          "                              的 [server] keepalive_interval_s（钳位 10~600）。\n"
           "\n",
           name, name);
 #ifdef _WIN32
