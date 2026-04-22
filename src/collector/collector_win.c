@@ -38,6 +38,26 @@ static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
 static volatile LONG s_started;
 
+/**
+ * Stop an ETW session by handle and/or name. Buffer must include LoggerName at LoggerNameOffset;
+ * otherwise ControlTraceW often returns ERROR_MORE_DATA (234) with only sizeof(EVENT_TRACE_PROPERTIES).
+ */
+static ULONG edr_etw_control_trace_stop(TRACEHANDLE session_handle, const WCHAR *session_name) {
+  ULONG name_bytes = (ULONG)((wcslen(session_name) + 1u) * sizeof(WCHAR));
+  ULONG buffer_size = (ULONG)sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
+  EVENT_TRACE_PROPERTIES *p =
+      (EVENT_TRACE_PROPERTIES *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, buffer_size);
+  if (!p) {
+    return ERROR_OUTOFMEMORY;
+  }
+  p->Wnode.BufferSize = buffer_size;
+  p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+  memcpy((BYTE *)p + p->LoggerNameOffset, session_name, name_bytes);
+  ULONG stc = ControlTraceW(session_handle, session_name, p, EVENT_TRACE_CONTROL_STOP);
+  HeapFree(GetProcessHeap(), 0, p);
+  return stc;
+}
+
 static uint64_t edr_unix_ns(void) {
   FILETIME ft;
   GetSystemTimePreciseAsFileTime(&ft);
@@ -355,9 +375,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
             (unsigned long)status, g_session_name);
     /* 上次进程未正常 StopTrace 时，内核仍占用同名实时会话，导致 ERROR_ALREADY_EXISTS。 */
     if (status == ERROR_ALREADY_EXISTS) {
-      EVENT_TRACE_PROPERTIES st0 = {0};
-      st0.Wnode.BufferSize = sizeof(st0);
-      ULONG stc = ControlTraceW(0, g_session_name, &st0, EVENT_TRACE_CONTROL_STOP);
+      ULONG stc = edr_etw_control_trace_stop((TRACEHANDLE)0, g_session_name);
       fprintf(stderr, "[collector_win] ControlTrace STOP stale session winerr=%lu, retry StartTrace\n",
               (unsigned long)stc);
       status = StartTraceW(&s_session_handle, g_session_name, prop);
@@ -376,9 +394,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 
   status = edr_enable_providers(s_session_handle, cfg);
   if (status != ERROR_SUCCESS) {
-    EVENT_TRACE_PROPERTIES stop = {0};
-    stop.Wnode.BufferSize = sizeof(stop);
-    ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
+    (void)edr_etw_control_trace_stop(s_session_handle, g_session_name);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_ETW_PROVIDER_ENABLE;
@@ -387,9 +403,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_consumer_thread =
       CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, NULL);
   if (!s_consumer_thread) {
-    EVENT_TRACE_PROPERTIES stop = {0};
-    stop.Wnode.BufferSize = sizeof(stop);
-    ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
+    (void)edr_etw_control_trace_stop(s_session_handle, g_session_name);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_INTERNAL;
@@ -398,15 +412,23 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   return EDR_OK;
 }
 
+void edr_collector_stop_orphan_etw_session(void) {
+  ULONG st = edr_etw_control_trace_stop((TRACEHANDLE)0, g_session_name);
+  if (st != ERROR_SUCCESS) {
+    fprintf(stderr,
+            "[collector_win] ETW uninstall cleanup ControlTrace STOP winerr=%lu (session=%ls; "
+            "nonzero often means session already absent)\n",
+            (unsigned long)st, g_session_name);
+  }
+}
+
 void edr_collector_stop(void) {
   if (InterlockedCompareExchange(&s_started, 0, 1) != 1) {
     return;
   }
 
   if (s_session_handle != INVALID_PROCESSTRACE_HANDLE) {
-    EVENT_TRACE_PROPERTIES stop = {0};
-    stop.Wnode.BufferSize = sizeof(stop);
-    ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
+    (void)edr_etw_control_trace_stop(s_session_handle, g_session_name);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
   }
 

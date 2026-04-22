@@ -11,3 +11,5 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 }
 
 void edr_collector_stop(void) {}
+
+void edr_collector_stop_orphan_etw_session(void) {}

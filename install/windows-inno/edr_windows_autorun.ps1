@@ -2,7 +2,7 @@
 <#
   安装 / 卸载 EDR Agent 的「开机常驻」与可选安装目录 ACL 加固。
   - Install：注册计划任务（SYSTEM、开机触发、无执行时限），并立即启动一次；可选对安装目录做 icacls 加固。
-  - Remove：停止任务、结束 edr_agent 进程、重置 ACL、注销任务（供 Inno UninstallRun 调用）。
+  - Remove：停止任务、结束 edr_agent 进程、按名停止可能残留的 ETW 实时会话、重置 ACL、注销任务（供 Inno UninstallRun 调用）。
 
   说明：edr_agent 为控制台程序，未实现 SCM ServiceMain；以「计划任务 + SYSTEM」实现重启后仍在。
   管理员仍可强制删除文件；加固仅提高普通用户随意改删的成本。正式卸载应使用「程序和功能」中的卸载项（unins000.exe）。
@@ -46,6 +46,12 @@ function Set-InstallDirAclHarden {
 if ($Action -eq "Remove") {
   Remove-ScheduledTaskIfPresent
   Stop-AgentProcess
+  $exeCleanup = Join-Path $instDir "edr_agent.exe"
+  if (Test-Path -LiteralPath $exeCleanup) {
+    try {
+      & $exeCleanup --etw-uninstall-cleanup
+    } catch {}
+  }
   Reset-InstallDirAcl -Dir $instDir
   exit 0
 }

@@ -1,4 +1,5 @@
 #include "edr/agent.h"
+#include "edr/collector.h"
 #include "edr/ave_sdk.h"
 #include "edr/dedup.h"
 #include "edr/event_batch.h"
@@ -88,6 +89,7 @@ static void print_usage(const char *prog) {
           "\n"
           "选项:\n"
           "  --config <path>   加载 agent.toml（推荐始终显式指定）\n"
+          "  --etw-uninstall-cleanup   停止本程序使用的 ETW 实时会话（卸载脚本调用；无其它初始化）\n"
           "  -h, --help, -help, /?   显示本说明并退出\n"
           "\n",
           name, name);
@@ -113,6 +115,13 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
   const char *config = NULL;
   const char *prog = (argc > 0 && argv[0]) ? argv[0] : "edr_agent";
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--etw-uninstall-cleanup") == 0) {
+      edr_collector_stop_orphan_etw_session();
+      return 0;
+    }
+  }
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0 ||

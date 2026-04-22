@@ -19,4 +19,11 @@ EdrError edr_collector_start(struct EdrEventBus *bus, const struct EdrConfig *cf
 /** 停止会话并 join 消费线程（可重复调用）。 */
 void edr_collector_stop(void);
 
+/**
+ * 按固定会话名尝试停止可能残留的 ETW 实时会话（无需本进程曾 StartTrace）。
+ * 供卸载 / 运维脚本调用，避免上次异常退出后内核仍占用 `EDR_Agent_RT_001` 等会话。
+ * 非 Windows 为 no-op。
+ */
+void edr_collector_stop_orphan_etw_session(void);
+
 #endif

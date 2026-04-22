@@ -442,3 +442,5 @@ void edr_collector_stop(void) {
   close_pipe_pair();
   s_bus = NULL;
 }
+
+void edr_collector_stop_orphan_etw_session(void) {}
