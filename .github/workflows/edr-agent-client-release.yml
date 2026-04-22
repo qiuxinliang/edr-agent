@@ -7,6 +7,7 @@
 #   说明：glob 用 win_*.*.* / linux_*.*.* 过滤；job 的 if 仅用 startsWith（兼容无 matches() 的旧 GHE）；semver 精确校验在构建 job 首步 bash。
 #   workflow_dispatch → 仅构建并保留 Artifact（不创建 GitHub Release，便于验证 Actions）。
 # Windows Artifact：zip（便携）+ EDRAgentSetup-<tag>.exe（Inno 图形安装）；Linux：zip 内含 install.sh。
+# Windows 发布构建默认 **EDR_WITH_GRPC=OFF**（不经 vcpkg 编 gRPC，缩短 CI）；需 gRPC 客户端时请本机 vcpkg/MSVC 链或单独 job。
 # 说明：只 push 分支、不打符合规则的 tag 时，本 workflow 不会出现任何 run，属正常现象。
 # 若 Actions 页提示「This workflow graph cannot be shown」：多为尚未有 run，或旧 UI 对「全条件 job」不画静态图；下方 workflow-context 无 if，便于生成图；跑一次后即正常。
 #
@@ -35,8 +36,6 @@ on:
 
 permissions:
   contents: write
-  # vcpkg x-gha binary cache (run-vcpkg + CMake manifest install) needs Actions cache API env on later steps.
-  actions: write
 
 concurrency:
   group: edr-agent-release-${{ github.ref }}
@@ -61,8 +60,6 @@ jobs:
     if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
     runs-on: windows-latest
 
-    env:
-      VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
     steps:
       - uses: actions/checkout@v6
 
@@ -89,23 +86,11 @@ jobs:
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected: missing $root" }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install gRPC (vcpkg, manifest vcpkg.json)
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: 6f29f12e82a8293156836ad81cc9bf5af41fe836
-          runVcpkgInstall: true
-          doNotCache: false
-
-      - name: Configure (Release, gRPC ON + ONNX Runtime)
-        # vcpkg + triplet x64-windows-static-md：gRPC 静态链入 exe；ORT 为动态库 onnxruntime.dll 随安装包分发。
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      - name: Configure (Release, ONNX Runtime, no gRPC)
+        # 不经 vcpkg：显著缩短 Release/安装包 CI；Agent 使用 gRPC stub，HTTP ingest 等仍可按 agent.toml 工作。
         run: |
-          $tc = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
           cmake -B build `
-            "-DCMAKE_TOOLCHAIN_FILE=$tc" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
-            -DEDR_WITH_GRPC=ON `
+            -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             -DCMAKE_BUILD_TYPE=Release `
