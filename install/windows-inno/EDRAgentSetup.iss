@@ -129,7 +129,7 @@ begin
       Json := Json + 'true' + Chr(125)
     else
       Json := Json + 'false' + Chr(125);
-    SaveStringToFile(Path, Json, False, True);
+    SaveStringToFile(Path, Json, False);
   end
   else
   begin
