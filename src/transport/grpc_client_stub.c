@@ -35,7 +35,7 @@ void edr_grpc_client_diag(char *buf, size_t cap) {
     return;
   }
   snprintf(buf, cap, "%s",
-           "stub_no_grpc(CI/Inno_build_uses_EDR_WITH_GRPC=OFF;use_HTTP_ingest_or_rebuild_with_gRPC++)");
+           "stub_no_grpc(EDR_WITH_GRPC=OFF; use HTTP ingest or rebuild with gRPC)");
 }
 
 int edr_grpc_client_report_command_result(const char *command_id,

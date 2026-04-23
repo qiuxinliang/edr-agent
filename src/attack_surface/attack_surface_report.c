@@ -1052,6 +1052,12 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
   if (bearer && bearer[0]) {
     fprintf(cf, "header = \"Authorization: Bearer %s\"\n", bearer);
   }
+  /* 默认 curl 把响应体打 stdout，与 Agent stderr 交错且缺换行；丢弃即可（仅需 HTTP 状态）。 */
+#ifdef _WIN32
+  fprintf(cf, "output = \"NUL\"\n");
+#else
+  fprintf(cf, "output = \"/dev/null\"\n");
+#endif
   /* 正斜杠 jsonpath 可避免 curl 配置双引号内 \\ 被误解析（与 ingest_http 一致）。 */
   fprintf(cf, "data-binary = @%s\n", jsonpath);
   fprintf(cf, "silent\n");

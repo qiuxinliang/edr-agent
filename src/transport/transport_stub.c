@@ -48,7 +48,7 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
     edr_ingest_http_configure(rb, tid, uid, bear, cfg->agent.endpoint_id, NULL);
     if (rb && rb[0]) {
       fprintf(stderr, "[transport] HTTP ingest base: %s (EDR_EVENT_INGEST_SPLIT=1: split frames; "
-                      "gRPC fail→HTTP fallback when HTTP base set, EDR_EVENT_GRPC_FALLBACK_HTTP=0 to disable)\n",
+                      "gRPC fail->HTTP fallback when HTTP base set; EDR_EVENT_GRPC_FALLBACK_HTTP=0 to disable)\n",
               rb);
     }
   }

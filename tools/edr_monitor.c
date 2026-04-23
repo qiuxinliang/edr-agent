@@ -19,6 +19,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <wchar.h>
 #include <windows.h>
 #include <winhttp.h>
 #include <winsock2.h>
@@ -107,6 +108,59 @@ static int edr_parse_host_port(const char *addr, char *host, size_t host_cap, ch
 }
 
 #ifdef _WIN32
+/** 与主进程 `edr_config_win_fixup_model_dir` 一致：无 model_dir 或仍为 Linux 示例时，用本 exe 旁 `models`。 */
+#define EDR_MON_WIN_FALLBACK_MODELS "C:\\ProgramData\\EDR Agent\\models"
+
+static int edr_mon_win_models_next_to_exe(char *out_utf8, size_t out_cap) {
+  wchar_t wpath[MAX_PATH];
+  DWORD nexe = GetModuleFileNameW(NULL, wpath, MAX_PATH);
+  if (nexe == 0 || nexe >= MAX_PATH) {
+    return 0;
+  }
+  wchar_t *slash = wcsrchr(wpath, L'\\');
+  if (!slash) {
+    slash = wcsrchr(wpath, L'/');
+  }
+  if (!slash) {
+    return 0;
+  }
+  *slash = L'\0';
+  if (wcslen(wpath) + wcslen(L"\\models") + 1u >= (size_t)MAX_PATH) {
+    return 0;
+  }
+  wcscat(wpath, L"\\models");
+  if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out_utf8, (int)out_cap, NULL, NULL) <= 1) {
+    return 0;
+  }
+  return 1;
+}
+
+static int edr_mon_model_dir_is_unix_example(const char *md) {
+  if (!md) {
+    return 0;
+  }
+  while (*md == ' ' || *md == '\t') {
+    md++;
+  }
+  size_t n = strlen(md);
+  while (n > 0 && (md[n - 1] == ' ' || md[n - 1] == '\t' || md[n - 1] == '/')) {
+    n--;
+  }
+  return (n == strlen("/opt/edr/models") && strncmp(md, "/opt/edr/models", n) == 0) ? 1 : 0;
+}
+
+static void edr_mon_apply_win_model_dir(EdrMonSnapshot *s) {
+  if (!s) {
+    return;
+  }
+  if (s->model_dir[0] && !edr_mon_model_dir_is_unix_example(s->model_dir)) {
+    return;
+  }
+  if (!edr_mon_win_models_next_to_exe(s->model_dir, sizeof(s->model_dir))) {
+    edr_strcpy(s->model_dir, sizeof(s->model_dir), EDR_MON_WIN_FALLBACK_MODELS);
+  }
+}
+
 static int edr_tcp_probe_win(const char *host, const char *port) {
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -543,7 +597,7 @@ static int edr_load_snapshot(const char *path, EdrMonSnapshot *out, char *err, s
 
 static void print_usage(const char *p) {
   fprintf(stderr,
-          "%s — EDR Agent terminal monitor (read-only probes; see EDR_端点详细设计 §1.2 / §14)\n"
+          "%s - EDR Agent terminal monitor (read-only probes; design doc section 1.2 / 14)\n"
           "\n"
           "Usage:\n"
           "  %s --config <agent.toml> [--json] [--no-probe]\n"
@@ -578,6 +632,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "%s\n", err);
     return 1;
   }
+#ifdef _WIN32
+  edr_mon_apply_win_model_dir(&s);
+#endif
 
   char origin[EDR_MON_STR_CAP];
   edr_api_origin_from_rest_base(s.rest_base, origin, sizeof(origin));
@@ -669,7 +726,7 @@ int main(int argc, char **argv) {
   printf("=== EDR Monitor (design view: transport / engine / offline) ===\n");
   printf("config: %s\n\n", cfg);
 
-  printf("[7 gRPC target — TCP connect to server.address]\n");
+  printf("[7 gRPC target - TCP connect to server.address]\n");
   if (!probe) {
     printf("  (probe disabled)\n");
   } else if (!s.server_addr[0]) {
@@ -683,14 +740,14 @@ int main(int argc, char **argv) {
     }
   }
 
-  printf("\n[6 REST / platform — healthz on API origin]\n");
+  printf("\n[6 REST / platform - healthz on API origin]\n");
   printf("  rest_base_url=%s\n", s.rest_base[0] ? s.rest_base : "(unset)");
   printf("  api_origin=%s\n", origin[0] ? origin : "(n/a)");
   printf("  rest_bearer_token: %s\n", s.bearer_set ? "configured (value hidden)" : "(empty)");
   if (!probe) {
     printf("  GET .../healthz: (probe disabled)\n");
   } else if (!origin[0]) {
-    printf("  GET .../healthz: (no rest_base_url — cannot derive API origin)\n");
+    printf("  GET .../healthz: (no rest_base_url; cannot derive API origin)\n");
   } else if (http_st >= 200 && http_st < 300) {
     printf("  GET .../healthz: HTTP %d OK\n", http_st);
   } else if (http_st > 0) {
@@ -700,14 +757,14 @@ int main(int argc, char **argv) {
     printf("  GET .../healthz: fail (%s)\n", http_err[0] ? http_err : "no HTTP status");
 #else
     if (strncmp(origin, "http://", 7) != 0) {
-      printf("  GET .../healthz: (https origin — use Windows build of edr_monitor or curl)\n");
+      printf("  GET .../healthz: (https origin: use Windows build of edr_monitor or curl)\n");
     } else {
       printf("  GET .../healthz: FAIL or unreachable (plain HTTP probe)\n");
     }
 #endif
   }
 
-  printf("\n[5 AVE — model_dir]\n");
+  printf("\n[5 AVE - model_dir]\n");
   printf("  model_dir=%s\n", s.model_dir[0] ? s.model_dir : "(unset)");
   printf("  *.onnx count: %d\n", onnx_n);
 
