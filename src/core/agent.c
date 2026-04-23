@@ -36,6 +36,12 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #include "ave_onnx_infer.h"
 
+/** Non-NULL required: behavior pipeline only emits protobuf alerts when on_behavior_alert is set. */
+static void edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
+  (void)alert;
+  (void)user_data;
+}
+
 struct EdrAgent {
   EdrEventBus *event_bus;
   char *config_path;
@@ -141,6 +147,19 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
     int ar = AVE_InitFromEdrConfig(&agent->cfg);
     if (ar != AVE_OK) {
       fprintf(stderr, "[ave] AVE_InitFromEdrConfig failed: %d\n", ar);
+    } else {
+      AVECallbacks acb;
+      memset(&acb, 0, sizeof(acb));
+      acb.on_behavior_alert = edr_agent_on_behavior_alert;
+      int reg = AVE_RegisterCallbacks(&acb);
+      if (reg != AVE_OK) {
+        fprintf(stderr, "[ave] AVE_RegisterCallbacks failed: %d (behavior alerts will not be emitted)\n", reg);
+      } else {
+        int sm = AVE_StartBehaviorMonitor();
+        if (sm != AVE_OK) {
+          fprintf(stderr, "[ave] AVE_StartBehaviorMonitor failed: %d (behavior queue may run sync-only)\n", sm);
+        }
+      }
     }
   }
 #if defined(EDR_WITH_FL_TRAINER)
