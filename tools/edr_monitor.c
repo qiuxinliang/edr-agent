@@ -723,10 +723,10 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  printf("=== EDR Monitor (design view: transport / engine / offline) ===\n");
+  printf("=== EDR Monitor (build %s %s) design: transport, engine, offline ===\n", __DATE__, __TIME__);
   printf("config: %s\n\n", cfg);
 
-  printf("[7 gRPC target - TCP connect to server.address]\n");
+  printf("[7] gRPC: TCP connect to server.address\n");
   if (!probe) {
     printf("  (probe disabled)\n");
   } else if (!s.server_addr[0]) {
@@ -740,7 +740,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  printf("\n[6 REST / platform - healthz on API origin]\n");
+  printf("\n[6] REST: GET /healthz at API origin\n");
   printf("  rest_base_url=%s\n", s.rest_base[0] ? s.rest_base : "(unset)");
   printf("  api_origin=%s\n", origin[0] ? origin : "(n/a)");
   printf("  rest_bearer_token: %s\n", s.bearer_set ? "configured (value hidden)" : "(empty)");
@@ -764,7 +764,7 @@ int main(int argc, char **argv) {
 #endif
   }
 
-  printf("\n[5 AVE - model_dir]\n");
+  printf("\n[5] AVE: model_dir, onnx file count\n");
   printf("  model_dir=%s\n", s.model_dir[0] ? s.model_dir : "(unset)");
   printf("  *.onnx count: %d\n", onnx_n);
 
