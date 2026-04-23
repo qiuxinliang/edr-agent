@@ -1,0 +1,317 @@
+# 本文件面向「独立 edr-agent 仓库」：GHA 工作目录 = 本仓库根（vcpkg.json 在根目录）。
+# 若你在 **monorepo**（如 AI Agent/edr-agent 为子目录）中发版，应使用**仓库根**的
+# `.github/workflows/edr-agent-client-release.yml`（内使用 working-directory: edr-agent 与 `edr-agent/…` 路径）；
+# 与 monorepo 的 workflow 在逻辑上应对齐，发版前请手动核对差异。
+#
+# 触发展平标准：仅
+#  (1) `git push origin <tag>`，且 tag 名匹配 `win_M.m.p` 或 `linux_M.m.p`；或
+#  (2) Actions 中 Run workflow；普通分支 **push 不会** 触发本 workflow。
+
+name: edr-agent client release
+
+on:
+  push:
+    tags:
+      - 'win_*.*.*'
+      - 'linux_*.*.*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '手动试跑：选平台（仅产物 Artifact，不发 Release）'
+        required: true
+        default: linux
+        type: choice
+        options:
+          - linux
+          - windows
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edr-agent-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+  VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+  VCPKG_BINARY_SOURCES: "clear"
+
+jobs:
+  workflow-context:
+    name: Workflow context
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print trigger context
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "ref_name=${{ github.ref_name }}"
+          echo "ref=${{ github.ref }}"
+
+  windows-build:
+    name: Build Windows (edr_agent.exe, gRPC+vcpkg+ORT)
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare vcpkg download cache directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+
+      - name: Validate release tag (semver)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
+            echo "::error::Invalid tag '${ref}'."
+            exit 1
+          fi
+
+      - name: Cache vcpkg (manifest installed + source downloads)
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            vcpkg_installed
+          key: vcpkg-x64-win-grpc-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
+          restore-keys: |
+            vcpkg-x64-win-grpc-${{ hashFiles('vcpkg.json') }}-
+
+      - name: Clone and bootstrap vcpkg
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          }
+          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: vcpkg install (manifest, grpc for x64-windows)
+        working-directory: ${{ github.workspace }}
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
+          $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
+          $env:VCPKG_ROOT = $vroot
+          $env:Path = $vroot + ";" + $env:Path
+          $tc = Join-Path $vroot "vcpkg.exe"
+          if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
+          & $tc install
+          if (-not (Test-Path "vcpkg_installed\x64-windows\tools\protobuf\protoc.exe")) { throw "vcpkg install: protoc not found" }
+          "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
+        shell: pwsh
+        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
+
+      - name: ONNX Runtime (CPU, Windows x64)
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zip = Join-Path $dest "ort.zip"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip" -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
+          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
+          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure (MSVC, Release, gRPC+ORT)
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        shell: pwsh
+        run: |
+          $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
+          if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            -DEDR_WITH_GRPC=ON `
+            -DEDR_WITH_ONNXRUNTIME=ON `
+            "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+            -DEDR_BUILD_TESTS=OFF
+          if (-not $?) { throw "cmake configure failed" }
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Stage ORT + vcpkg runtime DLLs
+        shell: pwsh
+        run: |
+          $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
+          ./scripts/stage_ort_dlls_build_release.ps1
+          ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Bundle ONNX (onnx-output → models)
+        shell: pwsh
+        env:
+          EDR_BUNDLE_ONNX_REQUIRED: "1"
+        run: ./scripts/sync_onnx_output_to_models.ps1
+
+      - name: Package zip (portable)
+        shell: pwsh
+        run: |
+          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64.zip"
+          if (-not (Test-Path "agent.toml.example")) { throw "missing agent.toml.example" }
+          if (-not (Test-Path "models")) { throw "missing models/" }
+          $items = New-Object System.Collections.Generic.List[string]
+          $null = $items.Add("build\Release\edr_agent.exe")
+          $null = $items.Add("agent.toml.example")
+          $null = $items.Add("models")
+          if (Test-Path "build\Release\edr_monitor.exe") { $null = $items.Add("build\Release\edr_monitor.exe") }
+          Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup -y
+
+      - name: Build Windows installer (EDRAgentSetup.exe)
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          if ($ref -match "^win_(.+)$") { $v = $Matches[1] } else { $v = "0.0.$($env:GITHUB_RUN_NUMBER)" }
+          $iss = Join-Path (Get-Location) "install\windows-inno\EDRAgentSetup.iss"
+          $agent = Join-Path (Get-Location) "build\Release\edr_agent.exe"
+          if (-not (Test-Path $agent)) { throw "missing $agent" }
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          & $iscc "/DEDR_AGENT_EXE=$agent" "/DMyAppVersion=$v" $iss
+          $out = Join-Path (Get-Location) "install\windows-inno\Output\EDRAgentSetup.exe"
+          if (-not (Test-Path $out)) { throw "installer output missing" }
+          Copy-Item $out -Destination (Join-Path (Get-Location) "EDRAgentSetup-$ref.exe") -Force
+
+      - name: Artifacts to upload (short names for release job)
+        shell: pwsh
+        run: |
+          Copy-Item -Path "edr-agent-${{ github.ref_name }}-windows-amd64.zip" -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win.zip") -Force
+          Copy-Item -Path "EDRAgentSetup-${{ github.ref_name }}.exe" -Destination (Join-Path $env:GITHUB_WORKSPACE "EDRAgentSetup-win.exe") -Force
+          if (-not (Test-Path (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win.zip"))) { throw "zip not found" }
+          if (-not (Test-Path (Join-Path $env:GITHUB_WORKSPACE "EDRAgentSetup-win.exe"))) { throw "setup exe not found" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edr-agent-windows-${{ github.ref_name }}
+          path: |
+            edr-agent-win.zip
+            EDRAgentSetup-win.exe
+          retention-days: 14
+          if-no-files-found: error
+
+  windows-release:
+    name: Publish Windows Release
+    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
+    needs: windows-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: edr-agent-windows-${{ github.ref_name }}
+          path: dist
+      - name: Verify artifact
+        run: ls -la dist/
+      - name: Rename to tag names
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref_name }}"
+          test -f "dist/edr-agent-win.zip"
+          test -f "dist/EDRAgentSetup-win.exe"
+          mv "dist/edr-agent-win.zip" "dist/edr-agent-${ref}-windows-amd64.zip"
+          mv "dist/EDRAgentSetup-win.exe" "dist/EDRAgentSetup-${ref}.exe"
+      - uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: edr-agent ${{ github.ref_name }} (Windows amd64, gRPC)
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.exe
+          fail_on_unmatched_files: true
+
+  linux-build:
+    name: Build Linux (edr_agent)
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'linux_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'linux') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate release tag (semver)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          if [[ ! "${ref}" =~ ^linux_[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
+            echo "::error::Invalid tag"
+            exit 1
+          fi
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyara-dev zip
+      - name: Configure (Release, no gRPC)
+        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_WITH_YARA=ON -DEDR_BUILD_TESTS=OFF
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Bundle ONNX (onnx-output → models)
+        env:
+          EDR_BUNDLE_ONNX_REQUIRED: "1"
+        run: ./scripts/sync_onnx_output_to_models.sh
+      - name: Package zip
+        run: |
+          strip build/edr_agent 2>/dev/null || true
+          DIST="edr-agent-${{ github.ref_name }}-linux-amd64"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+          cp build/edr_agent "$DIST/"
+          cp agent.toml.example "$DIST/"
+          cp -a models "$DIST/"
+          cp install/linux/install.sh "$DIST/"
+          chmod +x "$DIST/edr_agent" "$DIST/install.sh"
+          { echo "解压后在本目录执行: sudo ./install.sh"; } > "$DIST/README-INSTALL.txt"
+          zip -9 -r "edr-agent-${{ github.ref_name }}-linux-amd64.zip" "$DIST"
+      - name: Move zip to workspace
+        run: |
+          cp "edr-agent-${{ github.ref_name }}-linux-amd64.zip" "$GITHUB_WORKSPACE/."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edr-agent-linux-${{ github.ref_name }}
+          path: edr-agent-${{ github.ref_name }}-linux-amd64.zip
+          retention-days: 14
+          if-no-files-found: error
+
+  linux-release:
+    name: Publish Linux Release
+    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'linux_') }}
+    needs: linux-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: edr-agent-linux-${{ github.ref_name }}
+          path: dist
+      - name: Verify artifact
+        run: ls -la dist/
+      - uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: edr-agent ${{ github.ref_name }} (Linux amd64)
+          generate_release_notes: true
+          files: dist/*.zip
+          fail_on_unmatched_files: true
