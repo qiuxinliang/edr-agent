@@ -1,12 +1,11 @@
 # 本文件面向「独立 edr-agent 仓库」：GHA 工作目录 = 本仓库根（vcpkg.json 在根目录）。
-# 若你在 **monorepo**（如 AI Agent/edr-agent 为子目录）中发版，应使用**仓库根**的
-# `.github/workflows/edr-agent-client-release.yml`（内使用 working-directory: edr-agent 与 `edr-agent/…` 路径）；
-# 与 monorepo 的 workflow 在逻辑上应对齐，发版前请手动核对差异。
-# 排障：vcpkg 编 grpc 时 “The operation is canceled” → 常为 cancel-in-progress 或 timeout；见根仓库 workflow 内注释。
+# **仅**编 Windows；产物为 edr_agent.exe 及同目录下运行时 DLL（一个 zip），**不含** models、Inno、Linux。
+# 若你在 **monorepo** 中发版，应使用**仓库根**的 `.github/workflows/edr-agent-client-release.yml`（`edr-agent/…` 路径）。
+# 发版前请与 monorepo 版逻辑对齐。排障：vcpkg 编 grpc 时 “The operation is canceled” → 常为 cancel-in-progress 或 timeout。
 #
-# 触发展平标准：仅
-#  (1) `git push origin <tag>`，且 tag 名匹配 `win_M.m.p` 或 `linux_M.m.p`；或
-#  (2) Actions 中 Run workflow；普通分支 **push 不会** 触发本 workflow。
+# 触发展平：仅
+#  (1) `git push origin <tag>`，且 tag 名匹配 `win_M.m.p`；或
+#  (2) Actions 中 Run workflow；普通分支 **push 不会**触发。已移除 `linux_*`。
 
 name: edr-agent client release
 
@@ -14,17 +13,7 @@ on:
   push:
     tags:
       - 'win_*.*.*'
-      - 'linux_*.*.*'
   workflow_dispatch:
-    inputs:
-      target:
-        description: '手动试跑：选平台（仅产物 Artifact，不发 Release）'
-        required: true
-        default: linux
-        type: choice
-        options:
-          - linux
-          - windows
 
 permissions:
   contents: write
@@ -39,19 +28,9 @@ env:
   VCPKG_BINARY_SOURCES: "clear"
 
 jobs:
-  workflow-context:
-    name: Workflow context
-    runs-on: ubuntu-latest
-    steps:
-      - name: Print trigger context
-        run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "ref_name=${{ github.ref_name }}"
-          echo "ref=${{ github.ref }}"
-
   windows-build:
-    name: Build Windows (edr_agent.exe, gRPC+vcpkg+ORT)
-    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
+    name: Build Windows (edr_agent.exe + runtime DLLs, gRPC+vcpkg+ORT)
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || github.event_name == 'workflow_dispatch' }}
     runs-on: windows-latest
     timeout-minutes: 360
     env:
@@ -154,59 +133,28 @@ jobs:
         shell: bash
         run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Bundle ONNX (onnx-output → models)
-        shell: pwsh
-        env:
-          EDR_BUNDLE_ONNX_REQUIRED: "1"
-        run: ./scripts/sync_onnx_output_to_models.ps1
-
-      - name: Package zip (portable)
+      - name: Package (exe + runtime DLLs only)
         shell: pwsh
         run: |
-          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64.zip"
-          if (-not (Test-Path "agent.toml.example")) { throw "missing agent.toml.example" }
-          if (-not (Test-Path "models")) { throw "missing models/" }
+          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          if (-not (Test-Path "build\Release\edr_agent.exe")) { throw "missing build\Release\edr_agent.exe" }
           $items = New-Object System.Collections.Generic.List[string]
           $null = $items.Add("build\Release\edr_agent.exe")
-          $null = $items.Add("agent.toml.example")
-          $null = $items.Add("models")
           if (Test-Path "build\Release\edr_monitor.exe") { $null = $items.Add("build\Release\edr_monitor.exe") }
           Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
 
-      - name: Install Inno Setup 6
-        run: choco install innosetup -y
-
-      - name: Build Windows installer (EDRAgentSetup.exe)
+      - name: Move artifact to workspace
         shell: pwsh
         run: |
-          $ref = "${{ github.ref_name }}"
-          if ($ref -match "^win_(.+)$") { $v = $Matches[1] } else { $v = "0.0.$($env:GITHUB_RUN_NUMBER)" }
-          $iss = Join-Path (Get-Location) "install\windows-inno\EDRAgentSetup.iss"
-          $agent = Join-Path (Get-Location) "build\Release\edr_agent.exe"
-          if (-not (Test-Path $agent)) { throw "missing $agent" }
-          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe" }
-          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
-          & $iscc "/DEDR_AGENT_EXE=$agent" "/DMyAppVersion=$v" $iss
-          $out = Join-Path (Get-Location) "install\windows-inno\Output\EDRAgentSetup.exe"
-          if (-not (Test-Path $out)) { throw "installer output missing" }
-          Copy-Item $out -Destination (Join-Path (Get-Location) "EDRAgentSetup-$ref.exe") -Force
-
-      - name: Artifacts to upload (short names for release job)
-        shell: pwsh
-        run: |
-          Copy-Item -Path "edr-agent-${{ github.ref_name }}-windows-amd64.zip" -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win.zip") -Force
-          Copy-Item -Path "EDRAgentSetup-${{ github.ref_name }}.exe" -Destination (Join-Path $env:GITHUB_WORKSPACE "EDRAgentSetup-win.exe") -Force
-          if (-not (Test-Path (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win.zip"))) { throw "zip not found" }
-          if (-not (Test-Path (Join-Path $env:GITHUB_WORKSPACE "EDRAgentSetup-win.exe"))) { throw "setup exe not found" }
+          $src = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
+          Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-exe.zip") -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: edr-agent-windows-${{ github.ref_name }}
-          path: |
-            edr-agent-win.zip
-            EDRAgentSetup-win.exe
+          path: edr-agent-win-exe.zip
           retention-days: 14
           if-no-files-found: error
 
@@ -223,96 +171,18 @@ jobs:
           path: dist
       - name: Verify artifact
         run: ls -la dist/
-      - name: Rename to tag names
+      - name: Rename to tag name
         run: |
           set -euo pipefail
           ref="${{ github.ref_name }}"
-          test -f "dist/edr-agent-win.zip"
-          test -f "dist/EDRAgentSetup-win.exe"
-          mv "dist/edr-agent-win.zip" "dist/edr-agent-${ref}-windows-amd64.zip"
-          mv "dist/EDRAgentSetup-win.exe" "dist/EDRAgentSetup-${ref}.exe"
+          test -f "dist/edr-agent-win-exe.zip"
+          mv "dist/edr-agent-win-exe.zip" "dist/edr-agent-${ref}-windows-amd64-exe.zip"
       - uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64, gRPC)
-          generate_release_notes: true
-          files: |
-            dist/*.zip
-            dist/*.exe
-          fail_on_unmatched_files: true
-
-  linux-build:
-    name: Build Linux (edr_agent)
-    if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'linux_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'linux') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Validate release tag (semver)
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ref="${GITHUB_REF_NAME}"
-          if [[ ! "${ref}" =~ ^linux_[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
-            echo "::error::Invalid tag"
-            exit 1
-          fi
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libyara-dev zip
-      - name: Configure (Release, no gRPC)
-        run: cmake -B build -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release -DEDR_WITH_YARA=ON -DEDR_BUILD_TESTS=OFF
-      - name: Build
-        run: cmake --build build -j "$(nproc)"
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
-      - name: Bundle ONNX (onnx-output → models)
-        env:
-          EDR_BUNDLE_ONNX_REQUIRED: "1"
-        run: ./scripts/sync_onnx_output_to_models.sh
-      - name: Package zip
-        run: |
-          strip build/edr_agent 2>/dev/null || true
-          DIST="edr-agent-${{ github.ref_name }}-linux-amd64"
-          rm -rf "$DIST"
-          mkdir -p "$DIST"
-          cp build/edr_agent "$DIST/"
-          cp agent.toml.example "$DIST/"
-          cp -a models "$DIST/"
-          cp install/linux/install.sh "$DIST/"
-          chmod +x "$DIST/edr_agent" "$DIST/install.sh"
-          { echo "解压后在本目录执行: sudo ./install.sh"; } > "$DIST/README-INSTALL.txt"
-          zip -9 -r "edr-agent-${{ github.ref_name }}-linux-amd64.zip" "$DIST"
-      - name: Move zip to workspace
-        run: |
-          cp "edr-agent-${{ github.ref_name }}-linux-amd64.zip" "$GITHUB_WORKSPACE/."
-      - uses: actions/upload-artifact@v4
-        with:
-          name: edr-agent-linux-${{ github.ref_name }}
-          path: edr-agent-${{ github.ref_name }}-linux-amd64.zip
-          retention-days: 14
-          if-no-files-found: error
-
-  linux-release:
-    name: Publish Linux Release
-    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'linux_') }}
-    needs: linux-build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
-        with:
-          name: edr-agent-linux-${{ github.ref_name }}
-          path: dist
-      - name: Verify artifact
-        run: ls -la dist/
-      - uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Linux amd64)
+          name: edr-agent ${{ github.ref_name }} (Windows amd64 exe+DLL, gRPC)
           generate_release_notes: true
           files: dist/*.zip
           fail_on_unmatched_files: true
