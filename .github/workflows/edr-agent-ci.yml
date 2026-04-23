@@ -1,6 +1,4 @@
-# 独立 edr-agent 仓库：GHA 工作目录 = 本仓库根（与 vcpkg.json、CMakeLists.txt 同级）。
-# 若你用的是 **monorepo**（edr-agent 是子目录），应使用**上层仓库**里的
-# `.github/workflows/edr-agent-ci.yml`（其中带 `working-directory: edr-agent`），勿用本文件。
+# 无 gRPC 快编。全链 **gRPC+ONNX+ctest** 见同目录 `edr-agent-build-grpc-ort.yml`（对 push/PR/手动 均可触发）。monorepo 用根目录的 workflows。
 
 name: edr-agent build
 
