@@ -1430,11 +1430,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
 
   cfg->attack_surface.enabled = false;
-  cfg->attack_surface.port_interval_s = 300u;
+  /* min(port, service, policy, full) 驱动周期与 ETW/刷新 POST 共享间隔；默认 2h 降频 */
+  cfg->attack_surface.port_interval_s = 7200u;
   cfg->attack_surface.conn_interval_s = 300u;
-  cfg->attack_surface.service_interval_s = 600u;
-  cfg->attack_surface.policy_interval_s = 3600u;
-  cfg->attack_surface.full_snapshot_interval_s = 1800u;
+  cfg->attack_surface.service_interval_s = 7200u;
+  cfg->attack_surface.policy_interval_s = 7200u;
+  cfg->attack_surface.full_snapshot_interval_s = 7200u;
   cfg->attack_surface.outbound_top_n = 128u;
   cfg->attack_surface.egress_top_n = 32u;
   cfg->attack_surface.outbound_exclude_loopback = true;

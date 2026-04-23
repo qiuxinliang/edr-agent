@@ -20,14 +20,15 @@ tenant_id            = "tenant_default"
 # rest_user_id       = "edr-agent"
 # rest_bearer_token  = ""
 
-# §19.8 攻击面 TOML（与《EDR_端点详细设计》§19.8 对齐；主循环周期 POST 间隔 = min(port,service,policy,full)；enabled 默认 false 避免误报）。
+# §19.8 攻击面 TOML（与《EDR_端点详细设计》§19.8 对齐；**成功 POST 最小间隔** = min(port,service,policy,full)；ETW/按需刷新/周期共享；enabled 默认 false）。
+# 快照 JSON 的 collectedAt 为 **UTC**（...Z），与「本地时区显示」需自行换算。
 # [attack_surface]
 # enabled                  = false
-# port_interval_s          = 300
+# port_interval_s          = 7200
 # conn_interval_s          = 300
-# service_interval_s       = 600
-# policy_interval_s        = 3600
-# full_snapshot_interval_s = 1800
+# service_interval_s       = 7200
+# policy_interval_s        = 7200
+# full_snapshot_interval_s = 7200
 # outbound_top_n           = 128
 # outbound_exclude_loopback = true
 # geoip_db_path            = "/opt/edr/data/GeoLite2-City.mmdb"

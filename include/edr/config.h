@@ -167,10 +167,10 @@ typedef struct EdrConfig {
     uint16_t *high_risk_immediate_ports;
     size_t high_risk_immediate_ports_count;
     /**
-     * 为 true（默认）时，§19.10 ETW（tcpip/wf）经预处理去抖后触发一次 `edr_attack_surface_execute`（command_id `etw_tcpip_wf`）。
+     * 为 true（默认）时，§19.10 ETW 去抖后触发 `etw_tcpip_wf`；**POST 仍受** `min(port,service,policy,full)` 全局限流。
      */
     bool etw_refresh_triggers_snapshot;
-    /** 上述 ETW 触发的攻击面 POST 最小间隔（秒），钳 1～300；防连接类 ETW 洪峰。 */
+    /** §19.10 去抖窗口（秒，钳 1～300），仅与 ETW 批处理节奏有关，**不能**短于全局限流间隔。 */
     uint32_t etw_refresh_debounce_s;
     /**
      * Windows：`edr_win_listen_collect_rows` 进程内快照缓存 TTL（毫秒）。`0` 表示关闭缓存（每次枚举打 API）。

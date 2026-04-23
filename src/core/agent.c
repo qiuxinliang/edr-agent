@@ -422,8 +422,9 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
 /**
  * §19.8 周期快照：仅当 `[attack_surface].enabled=true` 时，按
  * `edr_attack_surface_effective_periodic_interval_s`（`min(port, service, policy, full)`，钳 60～604800s）
- * 调用 `edr_attack_surface_execute`（与 Subscribe 指令路径共用实现）。
- * 按需刷新：按 `conn_interval_s`（钳 15～120s）轮询 GET .../attack-surface/refresh-request。
+ * 且 **ETW/按需刷新 POST 与周期 POST 共享同一间隔**：避免 etw_tcpip_wf 单独打满带宽。
+ * 按需轮询：按 `conn_interval_s`（钳 15～120s）GET .../attack-surface/refresh-request；仅当
+ * 距上次成功 POST 已满间隔且平台 refreshPending 时 POST。
  */
 static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   if (!agent || agent->shutdown) {
@@ -438,8 +439,11 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   }
 
   uint64_t now = edr_monotonic_ns();
+  const uint32_t post_iv_sec = edr_attack_surface_effective_periodic_interval_s(cfg);
+  const uint64_t post_iv_ns = (uint64_t)post_iv_sec * 1000000000ULL;
+  int asurf_may_post = (now - agent->asurf_last_post_ns) >= post_iv_ns;
 
-  if (cfg->attack_surface.etw_refresh_triggers_snapshot) {
+  if (cfg->attack_surface.etw_refresh_triggers_snapshot && asurf_may_post) {
     uint32_t ds = cfg->attack_surface.etw_refresh_debounce_s;
     if (ds < 1u) {
       ds = 1u;
@@ -454,6 +458,8 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
       if (r != 0) {
         fprintf(stderr, "[attack_surface] etw_tcpip_wf failed: %s\n", detail);
       } else if (strncmp(detail, "uploaded_", 9) == 0) {
+        agent->asurf_last_post_ns = now;
+        asurf_may_post = 0;
         fprintf(stderr, "[attack_surface] etw_tcpip_wf %s\n", detail);
       }
     }
@@ -470,21 +476,21 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   if (now - agent->asurf_last_pending_check_ns >= pend_iv_ns) {
     agent->asurf_last_pending_check_ns = now;
     int pr = edr_attack_surface_refresh_pending(cfg);
-    if (pr == 1) {
+    asurf_may_post = (now - agent->asurf_last_post_ns) >= post_iv_ns;
+    if (pr == 1 && asurf_may_post) {
       char detail[256];
       int r = edr_attack_surface_execute("refresh_request", cfg, detail, sizeof(detail));
       if (r != 0) {
         fprintf(stderr, "[attack_surface] refresh_request failed: %s\n", detail);
       } else if (strncmp(detail, "uploaded_", 9) == 0) {
+        agent->asurf_last_post_ns = now;
+        asurf_may_post = 0;
         fprintf(stderr, "[attack_surface] refresh_request %s\n", detail);
       }
     }
   }
 
-  uint32_t sec = edr_attack_surface_effective_periodic_interval_s(cfg);
-  const uint64_t interval_ns = (uint64_t)sec * 1000000000ULL;
-
-  if (now - agent->asurf_last_post_ns < interval_ns) {
+  if ((now - agent->asurf_last_post_ns) < post_iv_ns) {
     return;
   }
   agent->asurf_last_post_ns = now;

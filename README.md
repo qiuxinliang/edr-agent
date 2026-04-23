@@ -263,7 +263,7 @@ cmake --build build
 
 ### 重新生成 `ingest` 桩代码
 
-若修改了 `proto/edr/v1/ingest.proto`，执行 **`./scripts/regen_ingest_proto.sh`**（或手动用 `protoc` + `grpc_cpp_plugin` 生成至 `src/grpc_gen/edr/v1/`）。**protobuf 主版本**须与链接的 `libprotobuf` 一致。
+若修改了 `proto/edr/v1/ingest.proto`，执行 **`./scripts/regen_ingest_proto.sh`**（macOS/Linux；**Windows** 上在同一套 vcpkg 的 `vcpkg_installed\x64-windows` 下用 **`./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 <该路径>`**），或手动用 `protoc` + `grpc_cpp_plugin` 生成至 `src/grpc_gen/edr/v1/`）。**protobuf 主版本**须与链接的 `libprotobuf` 一致；正式 Windows 发版由 **`.github/workflows/edr-agent-client-release.yml`** 在 CI 内用 vcpkg 的 `protoc` 重生成后编译。
 
 ---
 

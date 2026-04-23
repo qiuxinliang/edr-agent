@@ -305,7 +305,7 @@ static void resolve_rest_base(const EdrConfig *cfg, char *out, size_t cap) {
 
 uint32_t edr_attack_surface_effective_periodic_interval_s(const EdrConfig *cfg) {
   if (!cfg) {
-    return 1800u;
+    return 7200u;
   }
   uint32_t m = cfg->attack_surface.port_interval_s;
   if (cfg->attack_surface.service_interval_s < m) {
@@ -616,6 +616,7 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   if (!f) {
     return -1;
   }
+  /* collectedAt: UTC (trailing Z). Compare with local OS clock by converting local -> UTC. */
   time_t now = time(NULL);
 #ifdef _WIN32
   struct tm tmb;
