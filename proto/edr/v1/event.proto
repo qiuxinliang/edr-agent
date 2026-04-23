@@ -89,6 +89,8 @@ message BehaviorEvent {
   string exe_path = 11;
   string username = 12;
   uint32 session_id = 13;
+  // 自根进程向上的父链跳数（与平台 dynamic_rules `process_chain_depth_gt` 对齐；0 表示未计算/未携带）
+  uint32 process_chain_depth = 14;
 
   oneof detail {
     ProcessDetail process = 20;

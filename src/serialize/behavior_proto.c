@@ -167,6 +167,7 @@ size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *
   copy_str(msg.exe_path, sizeof(msg.exe_path), r->exe_path);
   copy_str(msg.username, sizeof(msg.username), r->username);
   msg.session_id = r->session_id;
+  msg.process_chain_depth = r->process_chain_depth;
   if (r->pmfe_snapshot[0]) {
     copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), r->pmfe_snapshot);
   } else {

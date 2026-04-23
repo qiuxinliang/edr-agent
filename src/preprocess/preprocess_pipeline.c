@@ -14,6 +14,7 @@
 #include "edr/ave_cross_engine_feed.h"
 #include "edr/pid_history_pmfe.h"
 #include "edr/pmfe.h"
+#include "edr/process_chain_depth.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #include "edr/types.h"
@@ -80,6 +81,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   uint8_t buf[16384];
   EdrBehaviorRecord br;
   edr_behavior_from_slot(slot, &br);
+  edr_behavior_record_fill_process_chain_depth(&br);
   apply_agent_ids_to_record(&br);
   edr_pid_history_pmfe_fill_record(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);

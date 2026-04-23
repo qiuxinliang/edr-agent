@@ -103,6 +103,7 @@ set(EDR_AGENT_SOURCES
   src/core/time_util.c
   src/config/config.c
   src/preprocess/behavior_record.c
+  src/preprocess/process_chain_depth.c
   src/preprocess/behavior_from_slot.c
   src/preprocess/dedup.c
   src/preprocess/emit_rules.c

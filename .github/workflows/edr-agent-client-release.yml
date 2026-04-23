@@ -2,6 +2,7 @@
 # 若你在 **monorepo**（如 AI Agent/edr-agent 为子目录）中发版，应使用**仓库根**的
 # `.github/workflows/edr-agent-client-release.yml`（内使用 working-directory: edr-agent 与 `edr-agent/…` 路径）；
 # 与 monorepo 的 workflow 在逻辑上应对齐，发版前请手动核对差异。
+# 排障：vcpkg 编 grpc 时 “The operation is canceled” → 常为 cancel-in-progress 或 timeout；见根仓库 workflow 内注释。
 #
 # 触发展平标准：仅
 #  (1) `git push origin <tag>`，且 tag 名匹配 `win_M.m.p` 或 `linux_M.m.p`；或
@@ -52,7 +53,7 @@ jobs:
     name: Build Windows (edr_agent.exe, gRPC+vcpkg+ORT)
     if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'windows') }}
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:

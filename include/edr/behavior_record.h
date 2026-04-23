@@ -27,6 +27,8 @@ typedef struct {
   char exe_path[EDR_BR_STR_LONG];
   char username[EDR_BR_STR_SHORT];
   uint32_t session_id;
+  /** 自根向上的父链跳数（与平台 `process_chain_depth` / R-ANOM-001 对齐）；0=未算 */
+  uint32_t process_chain_depth;
   EdrEventType type;
   uint32_t priority;
 

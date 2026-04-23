@@ -107,6 +107,7 @@ typedef struct _edr_v1_BehaviorEvent {
     char exe_path[1024];
     char username[256];
     uint32_t session_id;
+    uint32_t process_chain_depth;
     pb_size_t which_detail;
     union {
         edr_v1_ProcessDetail process;
@@ -139,7 +140,7 @@ extern "C" {
    false, false, false, false, false, 0.0f, 0, "", false, 0}
 #define edr_v1_AveBehaviorEventFeed_init_zero edr_v1_AveBehaviorEventFeed_init_default
 #define edr_v1_BehaviorEvent_init_default                                                                      \
-  {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0,               \
+  {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0,            \
    {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false,                        \
    edr_v1_AveBehaviorEventFeed_init_default}
 #define edr_v1_ProcessDetail_init_default        {"", "", ""}
@@ -150,7 +151,7 @@ extern "C" {
 #define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
 #define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
 #define edr_v1_BehaviorEvent_init_zero                                                                           \
-  {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0,                 \
+  {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0,               \
    {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false,                           \
    edr_v1_AveBehaviorEventFeed_init_zero}
 #define edr_v1_ProcessDetail_init_zero           {"", "", ""}
@@ -191,6 +192,7 @@ extern "C" {
 #define edr_v1_BehaviorEvent_exe_path_tag        11
 #define edr_v1_BehaviorEvent_username_tag        12
 #define edr_v1_BehaviorEvent_session_id_tag      13
+#define edr_v1_BehaviorEvent_process_chain_depth_tag 14
 #define edr_v1_BehaviorEvent_process_tag         20
 #define edr_v1_BehaviorEvent_file_tag            21
 #define edr_v1_BehaviorEvent_network_tag         22
@@ -289,6 +291,7 @@ X(a, STATIC,   SINGULAR, STRING,   exe_hash,         10) \
 X(a, STATIC,   SINGULAR, STRING,   exe_path,         11) \
 X(a, STATIC,   SINGULAR, STRING,   username,         12) \
 X(a, STATIC,   SINGULAR, UINT32,   session_id,       13) \
+X(a, STATIC,   SINGULAR, UINT32,   process_chain_depth, 14) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (detail,process,detail.process),  20) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (detail,file,detail.file),  21) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (detail,network,detail.network),  22) \

@@ -147,6 +147,32 @@ cmake --build build
 
 仅配置 `ca_cert`、不配客户端证书时，为**单向 TLS**（校验服务端），与完整 mTLS 不同。
 
+#### 本地用 **mkcert** 跑通 TLS / mTLS（本机/内网联调）
+
+1. 安装并信任本机 **CA**（各环境一次）  
+   - **macOS**：`brew install mkcert nss`（Firefox 用 nss），然后 `mkcert -install`  
+   - **Windows**（或 PowerShell）：[mkcert 发布页](https://github.com/FiloSottile/mkcert/releases) 下可执行档；`choco install mkcert` 亦可。执行 `mkcert -install`，把**本地根 CA** 加进本机受信任区。
+
+2. 为 gRPC 监听地址**签发**证书（名字需与 `server.address` 里 `host:port` 的 **host** 能对应上；多个名字写在一行里）：  
+   ```text
+   mkcert localhost 127.0.0.1 192.168.1.35
+   ```  
+   会生成如 `localhost+2.pem` / `localhost+2-key.pem`（**服务端** 给平台进程挂 TLS 用）。
+
+3. 若要做 **mTLS**（与 `client_cert` / `client_key` 对应），**再**签一套**客户端** 证书与私钥：  
+   ```text
+   mkcert -client edr-endpoint-1
+   ```  
+   会生成如 `edr-endpoint-1-client.pem` / `edr-endpoint-1-client-key.pem`（**Agent 侧**）。
+
+4. **根 CA 路径** 给 TOML 的 `ca_cert`（所有 mkcert 证书都由它签发，校验链正确）：  
+   - `mkcert -CAROOT` 会打印目录，其中 `rootCA.pem` 即常用填给 `ca_cert` 的 PEM。  
+5. 在 `agent.toml` 中配：  
+   - `ca_cert` = 上述 `rootCA.pem`  
+   - `client_cert` / `client_key` = 第 3 步的客户端 PEM（**单向 TLS** 可只设 `ca_cert` + 服务端，不配客户端两项；仅调试验证链时可临时用 `EDR_GRPC_INSECURE=1`，**勿用于生产**）。
+
+平台侧 gRPC 服务需加载第 2 步的**服务端**证书/私钥；**CN/SAN 与 Agent 所连的 host 一致**即可。若使用其它能导出 PEM 的工具，只要**根 CA、服务端、（可选）客户端**与上述 TOML 项对应即可。
+
 `POST /api/v1/enroll` 返回的 `server_addr` 语义应与 `server.address` 一致（即 **Agent gRPC 接入地址**，不是 REST 基址）。平台当前解析优先级为：
 
 1. 租户 `features.grpcServerAddress`
@@ -317,6 +343,7 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 - 运行时库：`third_party/nanopb`（`pb_encode.c`、`pb_common.c`），定义 `EDR_HAVE_NANOPB`。
 - 生成文件：`src/proto/edr/v1/event.pb.h`、`event.pb.c`（由 `proto/edr/v1/event.proto` + `event.options` 生成）。
 - 重新生成：`chmod +x scripts/regen_event_proto.sh && ./scripts/regen_event_proto.sh`（需 Python3，且建议 `pip install protobuf` 与系统 `protoc` 主版本一致，否则 nanopb 生成器可能报错）。
+- **发版前（产品 / 工程约定）**：须在 **CI 或本地与发版机一致的** `protoc` + `protobuf`（Python）版本下重生成 `event.pb.{h,c}` 后再出包；**禁止**手工改 `event.pb.*` 与 `event.proto` 长期不一致。涉及 **`process_chain_depth`（`BehaviorEvent` 字段 14）** 的链深检测在 **非 Windows 端**可能不填，平台规则侧见 `edr-backend` 的 `README_dynamic_rules_v1.md` / `INGEST_EVENT_PAYLOAD.md`。
 - 编码 API：`edr_behavior_record_encode_protobuf()`（`include/edr/behavior_proto.h`）。
 - 默认预处理仍输出 **BER1 线格式**；设置环境变量 `EDR_BEHAVIOR_ENCODING=protobuf` 时尝试 nanopb；`protobuf_c` 时调用 `edr_behavior_record_encode_protobuf_c()`（当前与 nanopb **同一套 protobuf 二进制**，可与 `libprotobuf-c` 解包兼容；若需原生 `*_pack`，见 `third_party/protobuf-c/README_EDR.txt` 与 `scripts/regen_event_proto_c.sh`）；失败则回退 BER1。
 
