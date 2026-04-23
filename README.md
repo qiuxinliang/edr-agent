@@ -90,6 +90,8 @@ cmake --build build
 
 若已安装 gRPC（如 macOS `brew install grpc`），CMake 会搜索 `/usr/local` 与 `/opt/homebrew`。**不要**在工程中再单独 `find_package(Protobuf)`，以免与 gRPC 自带的 Protobuf 目标冲突。
 
+**Windows 清单模式（`vcpkg.json`）**：仓库内仅声明 `dependencies: [grpc]`；CI 对 vcpkg 作浅克隆，**不**在清单里写过旧的 `builtin-baseline`（老 commit 可能缺 `versions/baseline.json` 与浅克隆不兼容）。若需钉死 port 版本，在**全量** vcpkg 克隆上执行 `vcpkg x-update-baseline` 后提交，并在 CI 中改为**非** `--depth 1` 的 vcpkg 克隆，或 `git fetch` 到该基线。
+
 ### §17 Shellcode 检测引擎（Windows）
 
 - 配置节 **`[shellcode_detector]`**（见 `agent.toml.example`），默认 **`enabled = false`**，不改变既有部署行为。
