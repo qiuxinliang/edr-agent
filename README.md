@@ -233,6 +233,7 @@ cmake --build build
 | `EDR_QUEUE_MAX_RETRIES` | 单条补传最大重试次数，默认 `100`；`0` 表示不限制。 |
 | `EDR_QUEUE_MAX_DB_MB` | 队列库文件大小上限（MB，粗粒度 `stat`），超出则拒绝新入队；未设置则不限制。（当前非 Windows 生效） |
 | `EDR_BEHAVIOR_ENCODING` | 见「Protobuf（nanopb）」：`protobuf` / `protobuf_c` / 默认 BER1。 |
+| `EDR_BEHAVIOR_USER_SUBJECT_JSON` | 若设为以 `{` 开头的 JSON 串且长度 < 1KiB，行为告警触发时写入 **`AVEBehaviorAlert.user_subject_json`**，经 ingest 入平台 `alerts.user_subject_json`（**调试用/专线**；与 `edr-backend` 000057 对账）。 |
 | `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / forensic**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
 | `EDR_CMD_KILL_ALLOWLIST` | 若设置（逗号分隔 PID 列表），**kill** 仅允许终止列表内进程（仍须先满足高危策略）；未设置则不限制 PID。 |
 | `EDR_CMD_AUDIT_PATH` | 若设置，高危指令审计**追加**写入该文件（带时间戳）；stderr 仍会打印 `[command][audit]`。 |
