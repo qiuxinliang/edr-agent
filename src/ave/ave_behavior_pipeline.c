@@ -770,6 +770,16 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     }
     al.needs_l2_review = true;
     al.skip_ai_analysis = false;
+    /* 可选：与平台 alerts.user_subject_json 对齐的 JSON 真源（调试用/专线注入；生产建议由策略填 AVEBehaviorAlert） */
+    {
+      const char *ujs = getenv("EDR_BEHAVIOR_USER_SUBJECT_JSON");
+      if (ujs && ujs[0] == '{') {
+        size_t n = strlen(ujs);
+        if (n < sizeof(al.user_subject_json)) {
+          memcpy(al.user_subject_json, ujs, n + 1u);
+        }
+      }
+    }
     edr_behavior_alert_emit_to_batch(&al);
     cb(&al, ud);
   }

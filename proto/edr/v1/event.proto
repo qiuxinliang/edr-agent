@@ -72,6 +72,10 @@ message BehaviorAlert {
   uint32 pid = 7;
   string process_name = 8;
   string process_path = 9; // 对应 BehaviorEvent.exe_path
+  // 与 `alerts.related_iocs_json` 对齐的 JSON 文本；单帧长度受 Agent nanopb 静态缓冲上界约 4KiB（与 event.options 对账）。
+  string related_iocs_json = 10;
+  // 跨端并案主键真源：与平台 `alerts.user_subject_json` 一致，如 {"subject_type":"ad_sid","value":"S-1-5-21-..."}。
+  string user_subject_json = 11;
 }
 
 // BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。

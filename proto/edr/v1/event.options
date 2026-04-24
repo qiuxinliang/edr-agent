@@ -35,6 +35,9 @@ edr.v1.BehaviorAlert.tactic_probs max_count:14
 edr.v1.BehaviorAlert.triggered_tactics max_size:512
 edr.v1.BehaviorAlert.process_name max_size:256
 edr.v1.BehaviorAlert.process_path max_size:1024
+# 受 nanopb PB_FIELDINFO width=2 下 `data_size` 12 位上界约 4KiB-1 约束
+edr.v1.BehaviorAlert.related_iocs_json max_size:4090
+edr.v1.BehaviorAlert.user_subject_json max_size:1024
 
 # 《11》§4.1 / `AVEBehaviorEvent` — `AveBehaviorEventFeed`
 edr.v1.AveBehaviorEventFeed.target_path max_size:1024

@@ -71,6 +71,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o"
   "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o.d"
+  "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o"
+  "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o.d"
   "CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o"
   "CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o.d"
   "CMakeFiles/edr_agent.dir/src/resource/resource.c.o"

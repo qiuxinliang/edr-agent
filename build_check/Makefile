@@ -1016,6 +1016,30 @@ src/preprocess/preprocess_pipeline.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.s
 .PHONY : src/preprocess/preprocess_pipeline.c.s
 
+src/preprocess/process_chain_depth.o: src/preprocess/process_chain_depth.c.o
+.PHONY : src/preprocess/process_chain_depth.o
+
+# target to build an object file
+src/preprocess/process_chain_depth.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o
+.PHONY : src/preprocess/process_chain_depth.c.o
+
+src/preprocess/process_chain_depth.i: src/preprocess/process_chain_depth.c.i
+.PHONY : src/preprocess/process_chain_depth.i
+
+# target to preprocess a source file
+src/preprocess/process_chain_depth.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.i
+.PHONY : src/preprocess/process_chain_depth.c.i
+
+src/preprocess/process_chain_depth.s: src/preprocess/process_chain_depth.c.s
+.PHONY : src/preprocess/process_chain_depth.s
+
+# target to generate assembly for a file
+src/preprocess/process_chain_depth.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.s
+.PHONY : src/preprocess/process_chain_depth.c.s
+
 src/proto/edr/v1/event.pb.o: src/proto/edr/v1/event.pb.c.o
 .PHONY : src/proto/edr/v1/event.pb.o
 
@@ -1738,6 +1762,9 @@ help:
 	@echo "... src/preprocess/preprocess_pipeline.o"
 	@echo "... src/preprocess/preprocess_pipeline.i"
 	@echo "... src/preprocess/preprocess_pipeline.s"
+	@echo "... src/preprocess/process_chain_depth.o"
+	@echo "... src/preprocess/process_chain_depth.i"
+	@echo "... src/preprocess/process_chain_depth.s"
 	@echo "... src/proto/edr/v1/event.pb.o"
 	@echo "... src/proto/edr/v1/event.pb.i"
 	@echo "... src/proto/edr/v1/event.pb.s"

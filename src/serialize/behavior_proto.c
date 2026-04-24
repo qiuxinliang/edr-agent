@@ -233,6 +233,10 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
            a->process_name[0] ? a->process_name : "");
   copy_str(msg.behavior_alert.process_path, sizeof(msg.behavior_alert.process_path),
            a->process_path[0] ? a->process_path : "");
+  copy_str(msg.behavior_alert.related_iocs_json, sizeof(msg.behavior_alert.related_iocs_json),
+           a->related_iocs_json[0] ? a->related_iocs_json : "");
+  copy_str(msg.behavior_alert.user_subject_json, sizeof(msg.behavior_alert.user_subject_json),
+           a->user_subject_json[0] ? a->user_subject_json : "");
 
   pb_ostream_t stream = pb_ostream_from_buffer(out, out_cap);
   if (!pb_encode(&stream, edr_v1_BehaviorEvent_fields, &msg)) {

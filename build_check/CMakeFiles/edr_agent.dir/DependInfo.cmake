@@ -44,6 +44,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/dedup.c" "CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/emit_rules.c" "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_pipeline.c" "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o.d"
+  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/process_chain_depth.c" "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/proto/edr/v1/event.pb.c" "CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/resource/resource.c" "CMakeFiles/edr_agent.dir/src/resource/resource.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/resource/resource.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/self_protect/self_protect.c" "CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o.d"

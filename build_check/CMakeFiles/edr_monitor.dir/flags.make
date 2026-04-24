@@ -6,7 +6,5 @@ C_DEFINES = -DEDR_OS_POSIX=1
 
 C_INCLUDES = -I"/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/tomlc99"
 
-C_FLAGSarm64 = -std=gnu11 -arch arm64 -Wall -Wextra -Wno-unused-parameter
-
-C_FLAGS = -std=gnu11 -arch arm64 -Wall -Wextra -Wno-unused-parameter
+C_FLAGS = -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 

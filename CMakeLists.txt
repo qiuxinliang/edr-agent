@@ -5,6 +5,11 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# MSVC：stdatomic.h 需 /experimental:c11atomics 与 /std:c11+。仅用 target 的
+# COMPILE_LANGUAGE:C 在 vcpkg 工具链 + VS 下部分 .c 未带上，会 C1189 "C atomic support is not enabled"
+if(MSVC)
+  string(APPEND CMAKE_C_FLAGS " /experimental:c11atomics /std:c17")
+endif()
 
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
@@ -412,10 +417,7 @@ endif()
 
 if(MSVC)
   target_compile_options(edr_agent PRIVATE /W4 /WX-)
-  # MSVC：C11 stdatomic 需 /std:c11+ 且显式 /experimental:c11atomics，否则 vcruntime_c11_stdatomic.h 报
-  # "C atomic support is not enabled"（见 VS 17.5+ C11 atomics 文档）
-  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c17>)
-  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+  # C11 atomics：见 project() 后 CMAKE_C_FLAGS
   target_compile_definitions(edr_agent PRIVATE
     $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>
     $<$<COMPILE_LANGUAGE:C>:_CRT_NONSTDC_NO_WARNINGS>)

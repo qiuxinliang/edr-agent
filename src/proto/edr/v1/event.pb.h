@@ -57,6 +57,8 @@ typedef struct _edr_v1_BehaviorAlert {
     uint32_t pid;
     char process_name[256];
     char process_path[1024];
+    char related_iocs_json[4090];
+    char user_subject_json[1024];
 } edr_v1_BehaviorAlert;
 
 /** 《11》§4.1 / `AVEBehaviorEvent` — wire 与 `AveBehaviorEventFeed` 一致 */
@@ -133,8 +135,8 @@ extern "C" {
 #endif
 
 /* Initializer values for message structs */
-#define edr_v1_BehaviorAlert_init_default        {0.0f, 0, {0}, "", false, false, 0, 0, "", ""}
-#define edr_v1_BehaviorAlert_init_zero           {0.0f, 0, {0}, "", false, false, 0, 0, "", ""}
+#define edr_v1_BehaviorAlert_init_default        {0.0f, 0, {0}, "", false, false, 0, 0, "", "", "", ""}
+#define edr_v1_BehaviorAlert_init_zero           {0.0f, 0, {0}, "", false, false, 0, 0, "", "", "", ""}
 #define edr_v1_AveBehaviorEventFeed_init_default                                                                 \
   {0, "", 0.0f, false, false, false, 0, false, "", "", 0, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, \
    false, false, false, false, false, 0.0f, 0, "", false, 0}
@@ -323,7 +325,9 @@ X(a, STATIC,   SINGULAR, BOOL,     needs_l2_review,   5) \
 X(a, STATIC,   SINGULAR, INT64,    timestamp_ns,      6) \
 X(a, STATIC,   SINGULAR, UINT32,   pid,               7) \
 X(a, STATIC,   SINGULAR, STRING,   process_name,      8) \
-X(a, STATIC,   SINGULAR, STRING,   process_path,      9)
+X(a, STATIC,   SINGULAR, STRING,   process_path,      9) \
+X(a, STATIC,   SINGULAR, STRING,   related_iocs_json, 10) \
+X(a, STATIC,   SINGULAR, STRING,   user_subject_json, 11)
 #define edr_v1_BehaviorAlert_CALLBACK NULL
 #define edr_v1_BehaviorAlert_DEFAULT NULL
 
@@ -393,8 +397,8 @@ extern const pb_msgdesc_t edr_v1_RegistryDetail_msg;
 /* Maximum encoded size of messages (where known) */
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         2700
-#define edr_v1_BehaviorEvent_size                23000
-#define edr_v1_BehaviorAlert_size                1900
+#define edr_v1_BehaviorEvent_size                35000
+#define edr_v1_BehaviorAlert_size                12000
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   1072
 #define edr_v1_NetworkDetail_size                159
