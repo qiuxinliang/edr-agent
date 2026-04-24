@@ -402,6 +402,14 @@ if(EDR_GRPC_CLIENT_AVAILABLE)
   endif()
 endif()
 
+# third_party tomlc99：不修改上游；MSVC /W4 下 C4244/C4267/C4702 在部分 CI（或 /WX）下会当错误
+if(MSVC)
+  set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99/toml.c"
+    PROPERTIES COMPILE_OPTIONS "/wd4244;/wd4267;/wd4702"
+  )
+endif()
+
 if(MSVC)
   target_compile_options(edr_agent PRIVATE /W4 /WX-)
   # MSVC：C11 stdatomic 需 /std:c11+ 且显式 /experimental:c11atomics，否则 vcruntime_c11_stdatomic.h 报
