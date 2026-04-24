@@ -1,8 +1,12 @@
-# 独立 edr-agent 仓库：测试用 **gRPC + ORT** 全链，跑 **ctest**（DEDR_BUILD_TESTS=ON）；任意 push/PR/手动均可触发；冷 vcpkg 可能极久。
+# 测试用 gRPC+ORT+ctest。push 仅**分支**（不响应纯 tag 推送，避免与分支 push 重复各跑一条）。手动的 workflow_dispatch 也可。
 
 name: edr-agent build (Windows gRPC + ORT)
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,13 +28,13 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Prepare vcpkg download cache directory
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
 
       - name: Cache vcpkg (manifest installed + source downloads)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .cache/vcpkg-downloads
