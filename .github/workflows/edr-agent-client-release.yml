@@ -1,5 +1,5 @@
 # 本文件面向「独立 edr-agent 仓库」：GHA 工作目录 = 本仓库根（vcpkg.json 在根目录）。
-# **仅**编 Windows；产物为 edr_agent.exe 及同目录下运行时 DLL（一个 zip），**不含** models、Inno、Linux。
+# **仅**编 Windows（no-gRPC）；产物为 edr_agent.exe 及同目录下运行时 DLL（一个 zip），**不含** models、Inno、Linux。
 # 若你在 **monorepo** 中发版，应使用**仓库根**的 `.github/workflows/edr-agent-client-release.yml`（`edr-agent/…` 路径）。
 # 发版前请与 monorepo 版逻辑对齐。排障：vcpkg 编 grpc 时 “The operation is canceled” → 常为 cancel-in-progress 或 timeout。
 #
@@ -30,7 +30,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (edr_agent.exe + runtime DLLs, gRPC+vcpkg+ORT)
+    name: Build Windows (edr_agent.exe + runtime DLLs, no-gRPC+vcpkg+curl)
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
     runs-on: windows-latest
     timeout-minutes: 360
@@ -69,9 +69,9 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-grpc-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
+          key: vcpkg-x64-win-nogrpc-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-grpc-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-x64-win-nogrpc-${{ hashFiles('vcpkg.json') }}-
 
       - name: Clone and bootstrap vcpkg
         working-directory: ${{ github.workspace }}
@@ -82,7 +82,7 @@ jobs:
           }
           & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
 
-      - name: vcpkg install (manifest, curl + grpc feature)
+      - name: vcpkg install (manifest, no-gRPC)
         working-directory: ${{ github.workspace }}
         env:
           VCPKG_DEFAULT_TRIPLET: x64-windows
@@ -94,28 +94,10 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          & $tc install --x-feature=grpc-client
-          if (-not (Test-Path "vcpkg_installed\x64-windows\tools\protobuf\protoc.exe")) { throw "vcpkg install: protoc not found" }
+          & $tc install
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
-        shell: pwsh
-        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
-
-      - name: ONNX Runtime (CPU, Windows x64)
-        working-directory: ${{ github.workspace }}
-        shell: pwsh
-        run: |
-          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $zip = Join-Path $dest "ort.zip"
-          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip" -OutFile $zip
-          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
-          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
-          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
-          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Configure (Ninja, Release, gRPC+ORT, sccache)
+      - name: Configure (Ninja, Release, no-gRPC, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -126,20 +108,18 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DEDR_WITH_GRPC=ON `
-            -DEDR_WITH_ONNXRUNTIME=ON `
-            "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+            -DEDR_WITH_GRPC=OFF `
+            -DEDR_WITH_ONNXRUNTIME=OFF `
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build
         run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 
-      - name: Stage ORT + vcpkg runtime DLLs
+      - name: Stage vcpkg runtime DLLs
         shell: pwsh
         run: |
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
-          ./scripts/stage_ort_dlls_build_release.ps1
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
 
       - name: Test
@@ -195,7 +175,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64 exe+DLL, gRPC)
+          name: edr-agent ${{ github.ref_name }} (Windows amd64 exe+DLL, no-gRPC)
           generate_release_notes: true
           files: dist/*.zip
           fail_on_unmatched_files: true
