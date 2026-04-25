@@ -55,6 +55,8 @@ Source: "..\..\build\Release\edr_monitor.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "..\..\build\Release\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; models\：与 config.c 中「exe 同目录\models」及 agent.toml.example [ave] 约定一致；占位文件便于空目录随包安装
 Source: "..\..\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 第一版动态前置规则包（由 edr-backend/platform/config/generate_agent_preprocess_rules.py 生成）
+Source: "..\..\..\edr-backend\platform\config\agent_preprocess_rules_v1.toml"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion

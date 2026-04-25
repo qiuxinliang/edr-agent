@@ -46,10 +46,13 @@ static uint32_t s_l3_pressure_high_pct;
 static uint32_t s_l3_pressure_recover_pct;
 static uint32_t s_l3_drop_permille;
 static int s_l3_pressure_active;
+static int s_procname_gate_enabled;
+static uint32_t s_procname_gate_keep_unknown_permille;
 static uint32_t s_drop_l2_unmatched;
 static uint32_t s_drop_l3_pressure;
 static int s_strict_behavior_gate_enabled;
 static uint32_t s_drop_strict_behavior_gate;
+static uint32_t s_drop_procname_gate;
 static uint32_t s_rng_state = 0x12345678u;
 
 /** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 gRPC endpoint_id 一致） */
@@ -106,6 +109,48 @@ static int slot_is_behavior_engine_process_event(const EdrEventSlot *slot) {
     default:
       return 0;
   }
+}
+
+static int str_ieq_ascii(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    char ca = *a++;
+    char cb = *b++;
+    if (ca >= 'A' && ca <= 'Z') {
+      ca = (char)(ca - 'A' + 'a');
+    }
+    if (cb >= 'A' && cb <= 'Z') {
+      cb = (char)(cb - 'A' + 'a');
+    }
+    if (ca != cb) {
+      return 0;
+    }
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int process_name_in_gate_allowlist(const char *name) {
+  static const char *const kHotProcNames[] = {
+      "powershell.exe", "pwsh.exe",       "cmd.exe",       "wscript.exe",
+      "cscript.exe",    "mshta.exe",      "rundll32.exe",  "regsvr32.exe",
+      "wmic.exe",       "certutil.exe",   "bitsadmin.exe", "msiexec.exe",
+      "schtasks.exe",   "sc.exe",         "cmdkey.exe",    "bcdedit.exe",
+      "vssadmin.exe",   "wbadmin.exe",    "forfiles.exe",  "installutil.exe",
+      "msxsl.exe",      "cmstp.exe",      "psexec.exe",    "procdump.exe",
+      "net.exe",        "net1.exe",       "curl.exe",      "wget.exe",
+      "rclone.exe",     "7z.exe",         "winrar.exe",    "rar.exe",
+      "wevtutil.exe",   "reg.exe",        "mimikatz.exe"};
+  if (!name || !name[0]) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(kHotProcNames) / sizeof(kHotProcNames[0]); i++) {
+    if (str_ieq_ascii(name, kHotProcNames[i])) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static uint32_t rng_next_u32(void) {
@@ -168,22 +213,30 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
   s_l3_pressure_high_pct = clamp_u32(s_l3_pressure_high_pct, 50u, 99u);
   s_l3_pressure_recover_pct = clamp_u32(s_l3_pressure_recover_pct, 10u, s_l3_pressure_high_pct);
   s_l3_drop_permille = clamp_u32(s_l3_drop_permille, 0u, 1000u);
+  s_procname_gate_enabled = getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE", 1) == 1 ? 1 : 0;
+  s_procname_gate_keep_unknown_permille =
+      (uint32_t)getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE", 100);
+  s_procname_gate_keep_unknown_permille =
+      clamp_u32(s_procname_gate_keep_unknown_permille, 0u, 1000u);
   s_l3_pressure_active = 0;
   s_drop_l2_unmatched = 0u;
   s_drop_l3_pressure = 0u;
   s_strict_behavior_gate_enabled =
       getenv_int_default("EDR_PREPROCESS_STRICT_BEHAVIOR_GATE", 0) == 1 ? 1 : 0;
   s_drop_strict_behavior_gate = 0u;
+  s_drop_procname_gate = 0u;
   if (cfg) {
     s_rng_state ^= cfg->collection.max_event_queue_size;
     s_rng_state ^= cfg->upload.batch_max_events << 1;
   }
   fprintf(stderr,
           "[preprocess/config] L2_SPLIT=%d L2_KEEP_RATIO=%.3f L3_PRESSURE=%d L3_HIGH_PCT=%u "
-          "L3_RECOVER_PCT=%u L3_DROP_PERMILLE=%u STRICT_BEHAVIOR_GATE=%d\n",
+          "L3_RECOVER_PCT=%u L3_DROP_PERMILLE=%u PROCNAME_GATE=%d PROCNAME_KEEP_UNKNOWN_PERMILLE=%u "
+          "STRICT_BEHAVIOR_GATE=%d\n",
           s_l2_split_enabled, s_l2_unmatched_keep_ratio, s_l3_pressure_enabled,
           (unsigned)s_l3_pressure_high_pct, (unsigned)s_l3_pressure_recover_pct,
-          (unsigned)s_l3_drop_permille, s_strict_behavior_gate_enabled);
+          (unsigned)s_l3_drop_permille, s_procname_gate_enabled,
+          (unsigned)s_procname_gate_keep_unknown_permille, s_strict_behavior_gate_enabled);
 }
 
 static void process_one_slot(const EdrEventSlot *slot) {
@@ -206,6 +259,14 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_behavior_from_slot(slot, &br);
   edr_behavior_record_fill_process_chain_depth(&br);
   apply_agent_ids_to_record(&br);
+  if (s_procname_gate_enabled && br.priority != 0u &&
+      slot && slot->type == EDR_EVENT_PROCESS_CREATE &&
+      !process_name_in_gate_allowlist(br.process_name)) {
+    if (!rng_hit_permille(s_procname_gate_keep_unknown_permille)) {
+      s_drop_procname_gate++;
+      return;
+    }
+  }
   edr_pid_history_pmfe_fill_record(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);
   if (s_l2_split_enabled && br.priority != 0u &&
@@ -414,10 +475,13 @@ void edr_preprocess_stop(void) {
   s_bus = NULL;
   s_preprocess_active = 0;
   if (s_drop_l2_unmatched > 0u || s_drop_l3_pressure > 0u ||
+      s_drop_procname_gate > 0u ||
       s_drop_strict_behavior_gate > 0u) {
     fprintf(stderr,
-            "[preprocess/l2l3] strict_behavior_gate_drop=%u l2_unmatched_drop=%u l3_pressure_drop=%u\n",
-            s_drop_strict_behavior_gate, s_drop_l2_unmatched, s_drop_l3_pressure);
+            "[preprocess/l2l3] strict_behavior_gate_drop=%u procname_gate_drop=%u "
+            "l2_unmatched_drop=%u l3_pressure_drop=%u\n",
+            s_drop_strict_behavior_gate, s_drop_procname_gate, s_drop_l2_unmatched,
+            s_drop_l3_pressure);
   }
   edr_event_batch_shutdown();
   edr_emit_rules_configure(NULL);

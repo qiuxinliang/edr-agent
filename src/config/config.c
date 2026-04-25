@@ -77,6 +77,7 @@ static void edr_config_win_fixup_model_dir_from_unix_example(EdrConfig *cfg) {
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
 #define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r218-9ae52519"
+#define EDR_PREPROCESS_RULES_BUNDLE_NAME "agent_preprocess_rules_v1.toml"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -638,6 +639,96 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "rules_version"), cfg->preprocessing.rules_version,
               sizeof(cfg->preprocessing.rules_version));
   load_preprocessing_rules(t, cfg);
+}
+
+static int edr_file_exists(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  fclose(f);
+  return 1;
+}
+
+static void edr_dir_of_path(const char *path, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!path || !path[0]) {
+    return;
+  }
+  size_t n = strlen(path);
+  if (n + 1u > cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, path, n);
+  out[n] = '\0';
+  while (n > 0u) {
+    char c = out[n - 1u];
+    if (c == '/' || c == '\\') {
+      out[n - 1u] = '\0';
+      return;
+    }
+    n--;
+  }
+  out[0] = '\0';
+}
+
+static int load_preprocess_rules_bundle_file(const char *bundle_path, EdrConfig *cfg) {
+  if (!bundle_path || !bundle_path[0] || !cfg || !edr_file_exists(bundle_path)) {
+    return 0;
+  }
+  FILE *fp = fopen(bundle_path, "r");
+  if (!fp) {
+    return 0;
+  }
+  char errbuf[512];
+  memset(errbuf, 0, sizeof(errbuf));
+  toml_table_t *root = toml_parse_file(fp, errbuf, (int)sizeof(errbuf));
+  fclose(fp);
+  if (!root) {
+    fprintf(stderr, "[config] preprocess bundle parse failed: %s (%s)\n",
+            errbuf[0] ? errbuf : "unknown error", bundle_path);
+    return 0;
+  }
+  toml_table_t *t = toml_table_in(root, "preprocessing");
+  if (!t) {
+    toml_free(root);
+    fprintf(stderr, "[config] preprocess bundle has no [preprocessing]: %s\n", bundle_path);
+    return 0;
+  }
+  load_preprocessing(t, cfg);
+  toml_free(root);
+  fprintf(stderr, "[config] preprocess bundle loaded: %s rules=%u version=%s\n",
+          bundle_path, (unsigned)cfg->preprocessing.rules_count, cfg->preprocessing.rules_version);
+  return 1;
+}
+
+static void try_auto_load_preprocess_rules_bundle(const char *config_path, int has_user_preprocess_rules,
+                                                  EdrConfig *cfg) {
+  if (!cfg || has_user_preprocess_rules) {
+    return;
+  }
+  {
+    const char *envp = getenv("EDR_PREPROCESS_RULES_BUNDLE_PATH");
+    if (envp && envp[0]) {
+      (void)load_preprocess_rules_bundle_file(envp, cfg);
+      return;
+    }
+  }
+  if (config_path && config_path[0]) {
+    char dir[1024];
+    char cand[1200];
+    edr_dir_of_path(config_path, dir, sizeof(dir));
+    if (dir[0]) {
+      snprintf(cand, sizeof(cand), "%s/%s", dir, EDR_PREPROCESS_RULES_BUNDLE_NAME);
+      (void)load_preprocess_rules_bundle_file(cand, cfg);
+    }
+  }
 }
 
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {
@@ -1851,9 +1942,13 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
       load_collection(t, cfg);
     }
   }
+  int has_user_preprocess_rules = 0;
   {
     toml_table_t *t = toml_table_in(root, "preprocessing");
     if (t) {
+      if (toml_array_in(t, "rules")) {
+        has_user_preprocess_rules = 1;
+      }
       load_preprocessing(t, cfg);
     }
   }
@@ -1931,6 +2026,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
   }
 
   toml_free(root);
+  try_auto_load_preprocess_rules_bundle(path, has_user_preprocess_rules, cfg);
 #ifdef _WIN32
   edr_config_win_fixup_model_dir_from_unix_example(cfg);
 #endif

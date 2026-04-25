@@ -61,9 +61,14 @@ sampling_rate_whitelist = 0.1
 #   EDR_PREPROCESS_L3_HIGH_PCT=90            # 进入高压模式阈值
 #   EDR_PREPROCESS_L3_RECOVER_PCT=70         # 退出高压模式阈值（滞回）
 #   EDR_PREPROCESS_L3_DROP_PERMILLE=800      # 高压下低价值事件丢弃千分比（0~1000）
+#   EDR_PREPROCESS_PROCNAME_GATE=1           # B方案：仅对 process_create 做“规则进程名门控”降载（默认开启；设0可关闭）
+#   EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE=100
+#                                          # 非门控进程名保留千分比（默认100=10%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
 rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
+# 若本文件未显式配置 [[preprocessing.rules]]，Agent 会尝试从与 agent.toml 同目录的
+# agent_preprocess_rules_v1.toml 自动加载第一版动态前置规则（可用 EDR_PREPROCESS_RULES_BUNDLE_PATH 覆盖路径）。
 
 # 可选：见 docs/PREPROCESS_RULES.md — 在 dedup/限流 之前匹配，action = drop | emit_always
 # [[preprocessing.rules]]
