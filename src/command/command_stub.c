@@ -14,18 +14,22 @@
 #include "edr/edr_log.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #ifdef _WIN32
+#include <direct.h>
+#include <process.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -37,6 +41,7 @@ static unsigned long s_exec_fail;
 
 /** main 在 edr_agent_init 后绑定，供 ave_infer 使用 */
 static const EdrConfig *s_bound_cfg;
+static int run_hook_no_shell(const char *hook_cmdline);
 
 void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
 
@@ -514,11 +519,11 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
 #ifndef _WIN32
     (void)setenv("EDR_CMD_ID", cmd_id ? cmd_id : "", 1);
 #endif
-    int r = system(hook);
+    int r = run_hook_no_shell(hook);
     if (r == 0) {
       audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 执行成功");
     } else {
-      audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 返回非零");
+      audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 执行失败（仅支持无 shell 参数）");
       soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolate hook non-zero");
       return;
     }
@@ -622,6 +627,153 @@ static void forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t le
   }
 }
 
+static void sanitize_job_name(const char *src, char *dst, size_t cap) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  size_t j = 0u;
+  if (src) {
+    for (size_t i = 0u; src[i] && j + 1u < cap; i++) {
+      unsigned char c = (unsigned char)src[i];
+      if (isalnum(c) || c == '-' || c == '_' || c == '.') {
+        dst[j++] = (char)c;
+      } else {
+        dst[j++] = '_';
+      }
+    }
+  }
+  if (j == 0u) {
+    snprintf(dst, cap, "%s", "job");
+    return;
+  }
+  dst[j] = '\0';
+}
+
+static int mkdir_p(const char *path) {
+  if (!path || !path[0]) {
+    return -1;
+  }
+  char tmp[1024];
+  size_t n = strlen(path);
+  if (n >= sizeof(tmp)) {
+    return -1;
+  }
+  memcpy(tmp, path, n + 1u);
+  for (char *p = tmp + 1; *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      char bak = *p;
+      *p = '\0';
+#ifdef _WIN32
+      if (_mkdir(tmp) != 0 && errno != EEXIST) {
+        return -1;
+      }
+#else
+      if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        return -1;
+      }
+#endif
+      *p = bak;
+    }
+  }
+#ifdef _WIN32
+  if (_mkdir(tmp) != 0 && errno != EEXIST) {
+    return -1;
+  }
+#else
+  if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+    return -1;
+  }
+#endif
+  return 0;
+}
+
+static int make_tar_bundle(const char *dir, const char *bundle_path) {
+  if (!dir || !dir[0] || !bundle_path || !bundle_path[0]) {
+    return -1;
+  }
+#ifdef _WIN32
+  intptr_t rc = _spawnlp(_P_WAIT, "tar", "tar", "czf", bundle_path, "-C", dir, ".", NULL);
+  return (rc == 0) ? 0 : -1;
+#else
+  pid_t pid = fork();
+  if (pid < 0) {
+    return -1;
+  }
+  if (pid == 0) {
+    execlp("tar", "tar", "czf", bundle_path, "-C", dir, ".", (char *)NULL);
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) {
+    return -1;
+  }
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+#endif
+}
+
+static int split_args(char *buf, char *argv[], size_t argv_cap) {
+  if (!buf || !argv || argv_cap < 2u) {
+    return -1;
+  }
+  size_t argc = 0u;
+  char *p = buf;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      p++;
+    }
+    if (!*p) {
+      break;
+    }
+    if (argc + 1u >= argv_cap) {
+      return -1;
+    }
+    argv[argc++] = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+      p++;
+    }
+    if (*p) {
+      *p++ = '\0';
+    }
+  }
+  argv[argc] = NULL;
+  return (argc > 0u) ? (int)argc : -1;
+}
+
+static int run_hook_no_shell(const char *hook_cmdline) {
+  if (!hook_cmdline || !hook_cmdline[0]) {
+    return -1;
+  }
+  char cmd[1024];
+  size_t n = strlen(hook_cmdline);
+  if (n >= sizeof(cmd)) {
+    return -1;
+  }
+  memcpy(cmd, hook_cmdline, n + 1u);
+  char *argv[32];
+  int argc = split_args(cmd, argv, sizeof(argv) / sizeof(argv[0]));
+  if (argc <= 0) {
+    return -1;
+  }
+#ifdef _WIN32
+  intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+  return (rc == 0) ? 0 : -1;
+#else
+  pid_t pid = fork();
+  if (pid < 0) {
+    return -1;
+  }
+  if (pid == 0) {
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) {
+    return -1;
+  }
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+#endif
+}
+
 static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
@@ -647,23 +799,20 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
     snprintf(base, sizeof(base), "%s", "/tmp/edr_forensic");
 #endif
   }
-  const char *job = (cmd_id && cmd_id[0]) ? cmd_id : "job";
+  char job[96];
+  sanitize_job_name(cmd_id, job, sizeof(job));
   char dir[700];
 #ifdef _WIN32
   snprintf(dir, sizeof(dir), "%s\\%s", base, job);
-  {
-    char cmdline[900];
-    snprintf(cmdline, sizeof(cmdline), "cmd /c mkdir \"%s\" 2>nul", dir);
-    (void)system(cmdline);
-  }
 #else
   snprintf(dir, sizeof(dir), "%s/%s", base, job);
-  {
-    char cmdline[800];
-    snprintf(cmdline, sizeof(cmdline), "mkdir -p \"%s\" 2>/dev/null", dir);
-    (void)system(cmdline);
-  }
 #endif
+  if (mkdir_p(dir) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "forensic: 创建输出目录失败");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "mkdir failed");
+    return;
+  }
   char manifest[800];
 #ifdef _WIN32
   snprintf(manifest, sizeof(manifest), "%s\\manifest.txt", dir);
@@ -713,18 +862,13 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   fclose(f);
   forensic_copy_lines(dir, pl, len);
 #ifdef _WIN32
-  {
-    char tarcmd[1100];
-    snprintf(tarcmd, sizeof(tarcmd), "cmd /c tar czf \"%s\\bundle.tgz\" -C \"%s\" . 2>nul", dir, dir);
-    (void)system(tarcmd);
-  }
+  char bundle[1100];
+  snprintf(bundle, sizeof(bundle), "%s\\bundle.tgz", dir);
 #else
-  {
-    char tarcmd[1000];
-    snprintf(tarcmd, sizeof(tarcmd), "tar czf \"%s/bundle.tgz\" -C \"%s\" . 2>/dev/null", dir, dir);
-    (void)system(tarcmd);
-  }
+  char bundle[1000];
+  snprintf(bundle, sizeof(bundle), "%s/bundle.tgz", dir);
 #endif
+  (void)make_tar_bundle(dir, bundle);
   s_exec_ok++;
   audit_both(cmd_id, "forensic: manifest + bundle.tgz（可选路径复制见 EDR_FORENSIC_COPY_PATHS）");
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "forensic bundle ok");

@@ -1,6 +1,8 @@
 /* §5 AV Engine — 模型目录、扩展名过滤、文件指纹 */
 
 #include "edr/ave.h"
+#include "edr/edr_log.h"
+#include "edr/sha256.h"
 #include "ave_onnx_infer.h"
 
 #include <stdio.h>
@@ -152,22 +154,38 @@ static int find_behavior_onnx_path(const char *dir, char *out, size_t cap) {
 }
 
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
-  if (!path || !path[0] || !out_hex || cap < 17u) {
+  if (!path || !path[0] || !out_hex || cap < 65u) {
     return -1;
   }
   FILE *f = fopen(path, "rb");
   if (!f) {
     return -1;
   }
-  uint8_t buf[256];
-  size_t n = fread(buf, 1, sizeof(buf), f);
-  fclose(f);
-  uint64_t h = 14695981039346656037ULL;
-  for (size_t i = 0; i < n; i++) {
-    h ^= (uint64_t)buf[i];
-    h *= 1099511628211ULL;
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  uint8_t buf[4096];
+  edr_sha256_init(&ctx);
+  for (;;) {
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    if (n > 0u) {
+      edr_sha256_update(&ctx, buf, n);
+    }
+    if (n < sizeof(buf)) {
+      if (ferror(f)) {
+        fclose(f);
+        return -1;
+      }
+      break;
+    }
   }
-  snprintf(out_hex, cap, "%016llx", (unsigned long long)h);
+  fclose(f);
+  edr_sha256_final(&ctx, digest);
+  static const char *hx = "0123456789abcdef";
+  for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; i++) {
+    out_hex[i * 2u] = hx[digest[i] >> 4];
+    out_hex[i * 2u + 1u] = hx[digest[i] & 0x0f];
+  }
+  out_hex[64] = '\0';
   return 0;
 }
 
@@ -180,24 +198,23 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   s_n_files = 0;
   const char *dir = cfg->ave.model_dir;
   if (!dir || !dir[0]) {
-    fprintf(stderr, "[ave] model_dir empty, skip AVE scan init\n");
+    EDR_LOGV("%s", "[ave] model_dir empty, skip AVE scan init\n");
     return EDR_OK;
   }
   int n_model = 0, n_all = 0;
   scan_dir(dir, &n_model, &n_all);
   s_n_model = n_model;
   s_n_files = n_all;
-  fprintf(stderr,
-          "[ave] model_dir=%s onnx_files=%d total_files=%d sensitivity=%s threads=%d\n",
-          dir, n_model, n_all, cfg->ave.sensitivity, cfg->ave.scan_threads);
+  EDR_LOGV("[ave] model_dir=%s onnx_files=%d total_files=%d sensitivity=%s threads=%d\n", dir, n_model,
+           n_all, cfg->ave.sensitivity, cfg->ave.scan_threads);
   s_ready = n_model > 0 ? 1 : 0;
 
   char onnx_path[2048];
   if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
     EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
     if (oe != EDR_OK) {
-      fprintf(stderr, "[ave] ONNX Runtime load failed (%d); inference falls back to dry-run / NOT_IMPL\n",
-              (int)oe);
+      EDR_LOGE("[ave] ONNX Runtime load failed (%d); inference falls back to dry-run / NOT_IMPL\n",
+               (int)oe);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
@@ -206,7 +223,7 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
     EdrError be = edr_onnx_behavior_load(beh_path, cfg);
     if (be != EDR_OK) {
-      fprintf(stderr, "[ave] behavior.onnx load failed (%d); behavior score uses heuristics\n", (int)be);
+      EDR_LOGE("[ave] behavior.onnx load failed (%d); behavior score uses heuristics\n", (int)be);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
@@ -226,7 +243,7 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
   if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
     EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
     if (oe != EDR_OK) {
-      fprintf(stderr, "[ave] reload static ONNX failed (%d)\n", (int)oe);
+      EDR_LOGE("[ave] reload static ONNX failed (%d)\n", (int)oe);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
@@ -235,7 +252,7 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
   if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
     EdrError be = edr_onnx_behavior_load(beh_path, cfg);
     if (be != EDR_OK) {
-      fprintf(stderr, "[ave] reload behavior.onnx failed (%d)\n", (int)be);
+      EDR_LOGE("[ave] reload behavior.onnx failed (%d)\n", (int)be);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
@@ -278,8 +295,8 @@ EdrError edr_ave_infer_file(const EdrConfig *cfg, const char *path, EdrAveInferR
   if (edr_onnx_runtime_ready()) {
     return edr_onnx_infer_file(cfg, path, out);
   }
-  fprintf(stderr,
-          "[ave] infer not implemented (set EDR_AVE_INFER_DRY_RUN=1 for dev; production: "
-          "CMake -DEDR_WITH_ONNXRUNTIME=ON and install ONNX Runtime)\n");
+  EDR_LOGE("%s",
+           "[ave] infer not implemented (set EDR_AVE_INFER_DRY_RUN=1 for dev; production: "
+           "CMake -DEDR_WITH_ONNXRUNTIME=ON and install ONNX Runtime)\n");
   return EDR_ERR_NOT_IMPL;
 }

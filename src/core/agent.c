@@ -37,6 +37,10 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #include "ave_onnx_infer.h"
 
+#ifdef EDR_HAVE_LIBCURL
+#include <curl/curl.h>
+#endif
+
 /** Non-NULL required: behavior pipeline only emits protobuf alerts when on_behavior_alert is set. */
 static void edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
   (void)alert;
@@ -203,6 +207,88 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
 
+#ifdef EDR_HAVE_LIBCURL
+static int edr_remote_curl_init(void) {
+  static int done = 0;
+  if (!done) {
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+      return -1;
+    }
+    done = 1;
+  }
+  return 0;
+}
+#endif
+
+static int edr_remote_tmp_path(char *out, size_t cap) {
+  if (!out || cap < 16u) {
+    return -1;
+  }
+#ifdef _WIN32
+  char td[MAX_PATH];
+  DWORD nn = GetTempPathA((DWORD)sizeof(td), td);
+  if (nn == 0 || nn >= sizeof(td)) {
+    snprintf(td, sizeof(td), ".\\");
+  }
+  UINT rc = GetTempFileNameA(td, "edr", 0, out);
+  if (rc == 0) {
+    return -1;
+  }
+  return 0;
+#else
+  snprintf(out, cap, "%s", "/tmp/edr_remote_XXXXXX.toml");
+  int fd = mkstemps(out, 5);
+  if (fd < 0) {
+    return -1;
+  }
+  close(fd);
+  return 0;
+#endif
+}
+
+static int edr_remote_fetch_toml(const char *url, const char *out_path) {
+  if (!url || !url[0] || !out_path || !out_path[0]) {
+    return -1;
+  }
+#ifndef EDR_HAVE_LIBCURL
+  (void)url;
+  (void)out_path;
+  return -1;
+#else
+  if (edr_remote_curl_init() != 0) {
+    return -1;
+  }
+  CURL *curl = curl_easy_init();
+  if (!curl) {
+    return -1;
+  }
+  FILE *f = fopen(out_path, "wb");
+  if (!f) {
+    curl_easy_cleanup(curl);
+    return -1;
+  }
+  char errbuf[CURL_ERROR_SIZE];
+  errbuf[0] = 0;
+  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)f);
+  CURLcode cc = curl_easy_perform(curl);
+  fclose(f);
+  curl_easy_cleanup(curl);
+  if (cc != CURLE_OK) {
+    (void)remove(out_path);
+    const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cc);
+    EDR_LOGE("[config] 远程 TOML 拉取失败: %s\n", em);
+    return -1;
+  }
+  return 0;
+#endif
+}
+
 EdrError edr_agent_run(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
     return EDR_ERR_INVALID_ARG;
@@ -358,31 +444,13 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   *last_remote_ns = now;
 
   char tmp[520];
-#ifdef _WIN32
-  const char *t = getenv("TEMP");
-  if (!t || !t[0]) {
-    t = ".";
+  if (edr_remote_tmp_path(tmp, sizeof(tmp)) != 0) {
+    EDR_LOGE("%s", "[config] 远程 TOML 临时文件创建失败\n");
+    return;
   }
-  snprintf(tmp, sizeof(tmp), "%s\\edr_remote_%lu.toml", t, (unsigned long)GetCurrentProcessId());
-  {
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "curl -fsSL \"%s\" -o \"%s\" 1>nul 2>nul", url, tmp);
-    if (system(cmd) != 0) {
-      fprintf(stderr, "[config] 远程 TOML 拉取失败（需系统 PATH 中有 curl）\n");
-      return;
-    }
+  if (edr_remote_fetch_toml(url, tmp) != 0) {
+    return;
   }
-#else
-  snprintf(tmp, sizeof(tmp), "/tmp/edr_remote_%d.toml", (int)getpid());
-  {
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "curl -fsSL '%s' -o '%s' 2>/dev/null", url, tmp);
-    if (system(cmd) != 0) {
-      fprintf(stderr, "[config] 远程 TOML 拉取失败（curl 非零退出）\n");
-      return;
-    }
-  }
-#endif
 
   EdrError ce = edr_config_load(tmp, &agent->cfg);
   char fp[80];

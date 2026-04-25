@@ -24,6 +24,12 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot);
  */
 bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot);
 
+/**
+ * 批量弹出最多 max_count 条事件，返回实际弹出数量；0 表示当前无事件。
+ * 用于减少高频加锁开销（处理顺序与单条 pop 一致）。
+ */
+uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, uint32_t max_count);
+
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus);
 uint32_t edr_event_bus_used_approx(EdrEventBus *bus);
 uint64_t edr_event_bus_dropped_total(EdrEventBus *bus);

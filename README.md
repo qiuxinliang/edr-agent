@@ -63,11 +63,13 @@ cmake --build build
 
 - **对最终功能的影响**：在**相同 CMake 选项、相同 triplet/依赖**下，下述只缩短编链与 IO；**不**为「加速」单独关功能开关或改源码。杀软排除、盘符、vcpkg 二进制缓存、sccache 均为**环境/缓存层**。详见 Windows 专篇 **[docs/WINDOWS_BUILD_SPEED.md](docs/WINDOWS_BUILD_SPEED.md)**。
 - **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
-  - 本机已装 vcpkg 且已 `vcpkg install`：先 `set VCPKG_ROOT=...`（PowerShell 为 `$env:VCPKG_ROOT=...`），再 `cmake --preset w-vcpkg-ninja-dev` → `cmake --build --preset w-vcpkg-ninja-dev`（**无 ORT/无 YARA**，省大量时间）。全量 gRPC+ORT 用 `w-vcpkg-ninja-grpc-ort` 并设置 `ONNXRUNTIME_ROOT`。  
+  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认**只装 `curl`**（`EDR_WITH_GRPC=OFF` 时须内嵌 libcurl）。需要 **gRPC 客户端**时再装 **`vcpkg install --x-feature=grpc-client`**（会拉 `grpc` 等）。`set VCPKG_ROOT=...` 后 `cmake --preset w-vcpkg-ninja-dev` → `cmake --build`（**无 ORT/无 YARA**）。全量 gRPC+ORT 用 `w-vcpkg-ninja-grpc-ort` 并设 `ONNXRUNTIME_ROOT`（仍须已启用 `grpc-client` 特性与 `EDR_WITH_GRPC=ON`）。  
   - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
+  - **跨平台快编预设**：`any-ninja-fast-dev`（默认开 `EDR_ENABLE_COMPILER_CACHE=ON`），`any-ninja-fast-release-lto`（额外开 `EDR_ENABLE_IPO=ON`，工具链不支持时自动降级并告警）。
 - **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
   `$env:VCPKG_BINARY_SOURCES="clear;files,$HOME\.vcpkg-bincache,readwrite"` 后再 `vcpkg install`，gRPC/SSL 等命中缓存时冷启动明显变短；或参考 **`scripts/vcpkg_binary_cache_env.example.ps1`**。CI 中已用 `VCPKG_BINARY_SOURCES` + 缓存目录，与本地思路一致。
 - **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须已进 **vcvars / x64 本机工具** 环境）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-build-grpc-ort` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
+- **统一加速开关**（可显式覆盖）：`EDR_ENABLE_COMPILER_CACHE`（默认 `ON`，自动探测 `sccache` 优先于 `ccache`）、`EDR_ENABLE_UNITY_BUILD`（默认 `OFF`）、`EDR_ENABLE_IPO`（默认 `OFF`）。
 
 **终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、模型目录与离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
 

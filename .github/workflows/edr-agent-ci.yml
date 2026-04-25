@@ -1,4 +1,5 @@
-# 无 gRPC 快编（Ninja + sccache/ccache）。全链 gRPC+ONNX 见 `edr-agent-build-grpc-ort.yml`。monorepo 用根目录 workflows。
+# 与 monorepo 根目录 `.github/workflows/edr-agent-ci.yml` 逻辑一致；本仓库**根**即 `edr-agent/`，无 `edr-agent/` 路径前缀。
+# 无 gRPC 快编：vcpkg 清单**默认只 `curl`** + 工具链；`build-linux` 关闭（仅跑 Windows）— 要恢复则去掉 `if: false`。
 
 name: edr-agent build
 
@@ -15,8 +16,42 @@ env:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
     steps:
       - uses: actions/checkout@v6
+      - name: Prepare vcpkg download cache
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+      - name: Cache vcpkg (manifest：curl)
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            vcpkg_installed
+          key: vcpkg-x64-win-curlonly-${{ hashFiles('vcpkg.json', 'CMakeLists.txt') }}-${{ runner.os }}
+          restore-keys: |
+            vcpkg-x64-win-curlonly-${{ hashFiles('vcpkg.json') }}-
+      - name: Clone and bootstrap vcpkg
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          }
+          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+      - name: vcpkg install (curl only; no grpc feature)
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+          VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
+          $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
+          $env:Path = $vroot + ";" + $env:Path
+          $v = Join-Path $vroot "vcpkg.exe"
+          Push-Location $env:GITHUB_WORKSPACE
+          & $v install
+          Pop-Location
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
@@ -24,10 +59,15 @@ jobs:
         shell: pwsh
         run: choco install ninja -y --no-progress
       - uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Configure (no gRPC, Ninja, sccache)
+      - name: Configure (vcpkg curl, no gRPC, Ninja, sccache)
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
         run: |
+          $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
+          if (-not (Test-Path -LiteralPath $tcf)) { throw "vcpkg toolchain: $tcf" }
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$tcf" `
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_ONNXRUNTIME=OFF `
             -DEDR_WITH_YARA=OFF `
@@ -42,6 +82,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   build-linux:
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -66,7 +66,7 @@ jobs:
           }
           & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
 
-      - name: vcpkg install (manifest, grpc for x64-windows)
+      - name: vcpkg install (manifest, curl + grpc feature)
         working-directory: ${{ github.workspace }}
         env:
           VCPKG_DEFAULT_TRIPLET: x64-windows
@@ -78,7 +78,7 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          & $tc install
+          & $tc install --x-feature=grpc-client
           if (-not (Test-Path "vcpkg_installed\x64-windows\tools\protobuf\protoc.exe")) { throw "vcpkg install: protoc not found" }
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 

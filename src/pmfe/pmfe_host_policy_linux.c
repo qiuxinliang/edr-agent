@@ -8,6 +8,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define PMFE_LISTEN_CAP 512
@@ -151,8 +152,43 @@ static void pmfe_linux_agg_note(PmfeListenAgg *a, const char *bind, int port) {
   }
 }
 
+static FILE *open_ss_ltnp_reader(pid_t *child_out) {
+  if (child_out) {
+    *child_out = -1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    return NULL;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return NULL;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    (void)dup2(pfd[1], STDOUT_FILENO);
+    close(pfd[1]);
+    execlp("ss", "ss", "-ltnp", (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+  FILE *pf = fdopen(pfd[0], "r");
+  if (!pf) {
+    close(pfd[0]);
+    (void)waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  if (child_out) {
+    *child_out = pid;
+  }
+  return pf;
+}
+
 void edr_pmfe_listen_table_refresh(void) {
-  FILE *pf = popen("ss -ltnp 2>/dev/null", "r");
+  pid_t child = -1;
+  FILE *pf = open_ss_ltnp_reader(&child);
   if (!pf) {
     return;
   }
@@ -207,7 +243,10 @@ void edr_pmfe_listen_table_refresh(void) {
     pmfe_linux_agg_note(a, bind, port);
   }
   pthread_mutex_unlock(&s_listen_mu);
-  (void)pclose(pf);
+  (void)fclose(pf);
+  if (child > 0) {
+    (void)waitpid(child, NULL, 0);
+  }
   if (truncated) {
     const char *q = getenv("EDR_PMFE_LISTEN_TRUNC_QUIET");
     if (!q || q[0] != '1') {

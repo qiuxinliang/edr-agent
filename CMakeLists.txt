@@ -5,10 +5,47 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# MSVC：stdatomic.h 需 /experimental:c11atomics 与 /std:c11+。仅用 target 的
-# COMPILE_LANGUAGE:C 在 vcpkg 工具链 + VS 下部分 .c 未带上，会 C1189 "C atomic support is not enabled"
+
+option(EDR_ENABLE_COMPILER_CACHE "Use ccache/sccache as compiler launcher when available" ON)
+option(EDR_ENABLE_UNITY_BUILD "Enable CMake UNITY_BUILD for faster local builds" OFF)
+option(EDR_ENABLE_IPO "Enable interprocedural optimization (IPO/LTO) when supported" OFF)
+
+if(EDR_ENABLE_COMPILER_CACHE)
+  if(NOT CMAKE_C_COMPILER_LAUNCHER OR NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(EDR_CCACHE_BIN ccache)
+    find_program(EDR_SCCACHE_BIN sccache)
+    if(EDR_SCCACHE_BIN)
+      if(NOT CMAKE_C_COMPILER_LAUNCHER)
+        set(CMAKE_C_COMPILER_LAUNCHER "${EDR_SCCACHE_BIN}" CACHE STRING "C compiler launcher" FORCE)
+      endif()
+      if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${EDR_SCCACHE_BIN}" CACHE STRING "CXX compiler launcher" FORCE)
+      endif()
+      message(STATUS "Compiler launcher: sccache")
+    elseif(EDR_CCACHE_BIN)
+      if(NOT CMAKE_C_COMPILER_LAUNCHER)
+        set(CMAKE_C_COMPILER_LAUNCHER "${EDR_CCACHE_BIN}" CACHE STRING "C compiler launcher" FORCE)
+      endif()
+      if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${EDR_CCACHE_BIN}" CACHE STRING "CXX compiler launcher" FORCE)
+      endif()
+      message(STATUS "Compiler launcher: ccache")
+    else()
+      message(STATUS "Compiler launcher: none (ccache/sccache not found)")
+    endif()
+  endif()
+endif()
+# MSVC：stdatomic.h 需 /experimental:c11atomics 与 /std:c11+。
+# 在目录级统一为所有 C 目标注入，避免 CI/生成器差异导致个别 .c 漏选项触发 C1189。
 if(MSVC)
-  string(APPEND CMAKE_C_FLAGS " /experimental:c11atomics /std:c17")
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C>:/std:c17>
+    $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
+  )
+  add_compile_definitions(
+    _CRT_SECURE_NO_WARNINGS
+    _CRT_NONSTDC_NO_WARNINGS
+  )
 endif()
 
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" ON)
@@ -345,6 +382,22 @@ else()
 endif()
 
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
+if(EDR_ENABLE_UNITY_BUILD)
+  set_target_properties(edr_agent PROPERTIES UNITY_BUILD ON)
+  set(_EDR_UNITY_SKIP
+    src/ave/ave_behavior_features.c
+    src/ave/ave_behavior_pipeline.c
+    src/ave/ave_rules_meta.c
+    src/ave/ave_suppression.c
+    third_party/tomlc99/toml.c
+    third_party/lz4/lz4.c
+  )
+  foreach(_src IN LISTS _EDR_UNITY_SKIP)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
+      set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/${_src}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    endif()
+  endforeach()
+endif()
 
 # Windows、单配置生成器（Ninja/Unix Makefiles）时，可执行档默认在 build/ 根下；而 Inno/CI/zip
 # 约定为 build/Release/（与 VS 多配置一致）。统一输出到 build/<配置名>/ 避免「未找到 edr_agent.exe」。
@@ -468,13 +521,13 @@ if(MSVC)
 endif()
 
 if(MSVC)
-  target_compile_options(edr_agent PRIVATE /W4 /WX-)
-  # 与 SetConsole*CP(65001) 一致：C/C++ 源与 stderr 中文
-  target_compile_options(edr_agent PRIVATE /utf-8)
-  # C11 atomics：见 project() 后 CMAKE_C_FLAGS
-  target_compile_definitions(edr_agent PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>
-    $<$<COMPILE_LANGUAGE:C>:_CRT_NONSTDC_NO_WARNINGS>)
+  target_compile_options(edr_agent PRIVATE
+    /W4
+    /WX-
+    /utf-8
+    $<$<COMPILE_LANGUAGE:C>:/std:c17>
+    $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
+  )
 else()
   target_compile_options(edr_agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
@@ -507,6 +560,9 @@ endif()
 
 if(EDR_BUILD_AVE_SHARED_LIB)
   add_library(edr_ave_shared SHARED ${EDR_AVE_CORE_SOURCES})
+  if(EDR_ENABLE_UNITY_BUILD)
+    set_target_properties(edr_ave_shared PROPERTIES UNITY_BUILD ON)
+  endif()
   target_include_directories(edr_ave_shared PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ave
@@ -538,6 +594,9 @@ endif()
 
 # 终端联调：读 agent.toml，按《EDR_端点详细设计》§1.2/§14 对通信 / AVE / 离线队列做黑盒探针（独立进程，不嵌入 Agent）。
 add_executable(edr_monitor tools/edr_monitor.c third_party/tomlc99/toml.c)
+if(EDR_ENABLE_UNITY_BUILD)
+  set_target_properties(edr_monitor PROPERTIES UNITY_BUILD ON)
+endif()
 target_include_directories(edr_monitor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99)
 if(MSVC)
   target_compile_options(edr_monitor PRIVATE /W4 /WX- $<$<COMPILE_LANGUAGE:C>:/std:c17>)
@@ -1170,3 +1229,20 @@ add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smo
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
 
 endif() # EDR_BUILD_TESTS
+
+if(EDR_ENABLE_IPO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT EDR_IPO_OK OUTPUT EDR_IPO_MSG)
+  if(EDR_IPO_OK)
+    set_property(TARGET edr_agent PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    if(TARGET edr_ave_shared)
+      set_property(TARGET edr_ave_shared PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    if(TARGET edr_monitor)
+      set_property(TARGET edr_monitor PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    message(STATUS "IPO/LTO enabled")
+  else()
+    message(WARNING "EDR_ENABLE_IPO=ON but toolchain does not support IPO: ${EDR_IPO_MSG}")
+  endif()
+endif()

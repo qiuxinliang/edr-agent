@@ -21,6 +21,42 @@ static sqlite3 *s_db;
 static char s_path[512];
 static uint64_t s_pending;
 static uint64_t s_max_db_bytes;
+static uint64_t s_retry_not_before_ns;
+static unsigned s_retry_fail_streak;
+
+static unsigned queue_retry_backoff_base_ms(void) {
+  static int cached = -1;
+  if (cached >= 0) {
+    return (unsigned)cached;
+  }
+  const char *e = getenv("EDR_QUEUE_RETRY_BACKOFF_BASE_MS");
+  int v = e && e[0] ? atoi(e) : 200;
+  if (v < 10) {
+    v = 10;
+  }
+  if (v > 5000) {
+    v = 5000;
+  }
+  cached = v;
+  return (unsigned)cached;
+}
+
+static unsigned queue_retry_backoff_max_ms(void) {
+  static int cached = -1;
+  if (cached >= 0) {
+    return (unsigned)cached;
+  }
+  const char *e = getenv("EDR_QUEUE_RETRY_BACKOFF_MAX_MS");
+  int v = e && e[0] ? atoi(e) : 5000;
+  if (v < 100) {
+    v = 100;
+  }
+  if (v > 60000) {
+    v = 60000;
+  }
+  cached = v;
+  return (unsigned)cached;
+}
 
 static int max_retry_limit(void) {
   static int cached = -999;
@@ -206,6 +242,8 @@ EdrError edr_storage_queue_open(const char *path) {
     }
     sqlite3_finalize(st);
   }
+  s_retry_not_before_ns = 0;
+  s_retry_fail_streak = 0u;
   return EDR_OK;
 }
 
@@ -215,6 +253,8 @@ void edr_storage_queue_close(void) {
     s_db = NULL;
   }
   s_pending = 0;
+  s_retry_not_before_ns = 0;
+  s_retry_fail_streak = 0u;
 }
 
 int edr_storage_queue_is_open(void) { return s_db ? 1 : 0; }
@@ -279,6 +319,9 @@ void edr_storage_queue_poll_drain(void) {
     last_ns = now;
     return;
   }
+  if (s_retry_not_before_ns > now) {
+    return;
+  }
   last_ns = now;
 
   for (unsigned k = 0; k < 32u; k++) {
@@ -287,7 +330,18 @@ void edr_storage_queue_poll_drain(void) {
       break;
     }
     if (r == 2) {
+      s_retry_fail_streak++;
+      unsigned shift = s_retry_fail_streak > 8u ? 8u : s_retry_fail_streak;
+      uint64_t backoff_ms = (uint64_t)queue_retry_backoff_base_ms() << shift;
+      if (backoff_ms > (uint64_t)queue_retry_backoff_max_ms()) {
+        backoff_ms = (uint64_t)queue_retry_backoff_max_ms();
+      }
+      s_retry_not_before_ns = now + backoff_ms * 1000000ULL;
       break;
+    }
+    if (s_retry_fail_streak != 0u) {
+      s_retry_fail_streak = 0u;
+      s_retry_not_before_ns = 0;
     }
   }
 }

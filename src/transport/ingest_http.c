@@ -23,6 +23,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -226,6 +227,55 @@ static int curl_ensure_init(void) {
 }
 #endif
 
+/** 默认禁用 shell curl fallback；仅 `EDR_ALLOW_SHELL_CURL_FALLBACK=1` 时启用。 */
+static int shell_curl_fallback_allowed(void) {
+  const char *e = getenv("EDR_ALLOW_SHELL_CURL_FALLBACK");
+  return (e && e[0] == '1') ? 1 : 0;
+}
+
+static int run_curl_config_no_shell(const char *resp_path, const char *cfg_path, const char *bearer) {
+  if (!resp_path || !resp_path[0] || !cfg_path || !cfg_path[0]) {
+    return -1;
+  }
+#ifdef _WIN32
+  char auth[768];
+  if (bearer && bearer[0]) {
+    if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
+      return -1;
+    }
+    const char *argv[] = {"curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, "-H", auth, NULL};
+    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
+    return (rc == 0) ? 0 : -1;
+  } else {
+    const char *argv[] = {"curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, NULL};
+    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
+    return (rc == 0) ? 0 : -1;
+  }
+#else
+  pid_t pid = fork();
+  if (pid < 0) {
+    return -1;
+  }
+  if (pid == 0) {
+    if (bearer && bearer[0]) {
+      char auth[768];
+      if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
+        _exit(127);
+      }
+      execlp("curl", "curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, "-H", auth, (char *)NULL);
+    } else {
+      execlp("curl", "curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, (char *)NULL);
+    }
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) {
+    return -1;
+  }
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+#endif
+}
+
 /**
  * 成功返回 0（HTTP 2xx），失败 -1。relpath 为 ingest/report-events 等（无前导/）。
  */
@@ -295,6 +345,11 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   }
 #endif
 
+  if (!shell_curl_fallback_allowed()) {
+    EDR_LOGE("%s", "[ingest-http] shell curl fallback disabled (set EDR_ALLOW_SHELL_CURL_FALLBACK=1 to enable)\n");
+    return -1;
+  }
+
   (void)body_len;
   char jsonpath[512];
   char cfgpath[512];
@@ -340,48 +395,17 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
   fputs("\"\n", cf);
   fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
-  if (s_bearer[0]) {
-    fputs("header = \"Authorization: Bearer ", cf);
-    fprint_curl_cfg_dquoted_body(cf, s_bearer);
-    fputs("\"\n", cf);
-  }
   fprintf(cf, "data = @%s\n", jsonpath);
   fprintf(cf, "silent\n");
   fclose(cf);
 
-  char cmd[2048];
-#ifdef _WIN32
-  snprintf(cmd, sizeof(cmd), "curl -sS -o \"%s\" -w \"%%{http_code}\" --config \"%s\"", resp_path, cfgpath);
-#else
-  snprintf(cmd, sizeof(cmd), "curl -sS -o '%s' -w '%%{http_code}' --config '%s'", resp_path, cfgpath);
-#endif
-
-  char codebuf[32];
-  size_t code_n = 0;
-  memset(codebuf, 0, sizeof(codebuf));
-#ifdef _WIN32
-  FILE *pf = _popen(cmd, "r");
-#else
-  FILE *pf = popen(cmd, "r");
-#endif
-  if (!pf) {
+  int curl_ok = (run_curl_config_no_shell(resp_path, cfgpath, s_bearer) == 0) ? 1 : 0;
+  if (!curl_ok) {
     (void)remove(jsonpath);
     (void)remove(cfgpath);
-    EDR_LOGE("[ingest-http] curl popen failed (rest=%s)\n", s_rest);
-    return -1;
+    EDR_LOGE("[ingest-http] curl fallback failed (rest=%s)\n", s_rest);
   }
-  code_n = fread(codebuf, 1, sizeof(codebuf) - 1u, pf);
-#ifdef _WIN32
-  (void)_pclose(pf);
-#else
-  (void)pclose(pf);
-#endif
-
-  int http_code = 0;
-  if (code_n > 0u) {
-    codebuf[code_n] = 0;
-    http_code = (int)strtol(codebuf, NULL, 10);
-  }
+  int http_code = curl_ok ? 200 : 0;
 
   int ok = (http_code >= 200 && http_code < 300);
   if (!ok) {
@@ -408,34 +432,71 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   return ok ? 0 : -1;
 }
 
-static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
-  static const char tbl[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t o = 0;
-  for (size_t i = 0; i < len; i += 3u) {
-    size_t rem = len - i;
-    uint32_t b = (uint32_t)in[i] << 16;
-    if (rem >= 2u) {
-      b |= (uint32_t)in[i + 1u] << 8;
+static int b64_encode_join2(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, char *out,
+                            size_t cap) {
+  static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t o = 0u;
+  size_t i = 0u;
+  uint8_t carry[2];
+  size_t carry_len = 0u;
+  for (i = 0u; i < alen; i++) {
+    uint8_t c = a[i];
+    if (carry_len == 0u) {
+      carry[carry_len++] = c;
+      continue;
     }
-    if (rem >= 3u) {
-      b |= (uint32_t)in[i + 2u];
+    if (carry_len == 1u) {
+      carry[carry_len++] = c;
+      continue;
     }
     if (o + 4u >= cap) {
       return -1;
     }
-    out[o++] = tbl[(b >> 18) & 63u];
-    out[o++] = tbl[(b >> 12) & 63u];
-    if (rem >= 2u) {
-      out[o++] = tbl[(b >> 6) & 63u];
-    } else {
-      out[o++] = '=';
+    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8) | (uint32_t)c;
+    out[o++] = tbl[(v >> 18) & 63u];
+    out[o++] = tbl[(v >> 12) & 63u];
+    out[o++] = tbl[(v >> 6) & 63u];
+    out[o++] = tbl[v & 63u];
+    carry_len = 0u;
+  }
+  for (i = 0u; i < blen; i++) {
+    uint8_t c = b[i];
+    if (carry_len == 0u) {
+      carry[carry_len++] = c;
+      continue;
     }
-    if (rem >= 3u) {
-      out[o++] = tbl[b & 63u];
-    } else {
-      out[o++] = '=';
+    if (carry_len == 1u) {
+      carry[carry_len++] = c;
+      continue;
     }
+    if (o + 4u >= cap) {
+      return -1;
+    }
+    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8) | (uint32_t)c;
+    out[o++] = tbl[(v >> 18) & 63u];
+    out[o++] = tbl[(v >> 12) & 63u];
+    out[o++] = tbl[(v >> 6) & 63u];
+    out[o++] = tbl[v & 63u];
+    carry_len = 0u;
+  }
+  if (carry_len == 1u) {
+    if (o + 4u >= cap) {
+      return -1;
+    }
+    uint32_t v = (uint32_t)carry[0] << 16;
+    out[o++] = tbl[(v >> 18) & 63u];
+    out[o++] = tbl[(v >> 12) & 63u];
+    out[o++] = '=';
+    out[o++] = '=';
+  } else if (carry_len == 2u) {
+    if (o + 4u >= cap) {
+      return -1;
+    }
+    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8);
+    out[o++] = tbl[(v >> 18) & 63u];
+    out[o++] = tbl[(v >> 12) & 63u];
+    out[o++] = tbl[(v >> 6) & 63u];
+    out[o++] = '=';
   }
   if (o >= cap) {
     return -1;
@@ -456,19 +517,10 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   if (!b64) {
     return -1;
   }
-  uint8_t *raw = (uint8_t *)malloc(raw_len);
-  if (!raw) {
+  if (b64_encode_join2(header12, header_len, payload, payload_len, b64, b64_cap) < 0) {
     free(b64);
     return -1;
   }
-  memcpy(raw, header12, header_len);
-  memcpy(raw + header_len, payload, payload_len);
-  if (b64_encode(raw, raw_len, b64, b64_cap) < 0) {
-    free(b64);
-    free(raw);
-    return -1;
-  }
-  free(raw);
 
   const size_t cap = 128u + json_escaped_size(s_endpoint) + json_escaped_size(batch_id) + json_escaped_size(s_agent_ver) +
                     strlen(b64) + 32u;
@@ -477,35 +529,24 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
     free(b64);
     return -1;
   }
-  char *ept = (char *)malloc(256u + json_escaped_size(s_endpoint));
-  char *bid = (char *)malloc(256u + json_escaped_size(batch_id));
-  char *agv = (char *)malloc(256u + json_escaped_size(s_agent_ver));
-  if (!ept || !bid || !agv) {
+  char ept[300];
+  char bid[300];
+  char agv[300];
+  if (!json_escape_to_buf(s_endpoint, ept, sizeof(ept)) || !json_escape_to_buf(batch_id, bid, sizeof(bid)) ||
+      !json_escape_to_buf(s_agent_ver, agv, sizeof(agv))) {
     free(b64);
     free(json);
-    free(ept);
-    free(bid);
-    free(agv);
     return -1;
   }
-  (void)json_escape_to_buf(s_endpoint, ept, 256u + json_escaped_size(s_endpoint));
-  (void)json_escape_to_buf(batch_id, bid, 256u + json_escaped_size(batch_id));
-  (void)json_escape_to_buf(s_agent_ver, agv, 256u + json_escaped_size(s_agent_ver));
 
   int w = snprintf(json, cap, "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}\n", ept,
           bid, agv, b64);
   if (w < 0 || (size_t)w >= cap) {
     free(b64);
     free(json);
-    free(ept);
-    free(bid);
-    free(agv);
     return -1;
   }
   free(b64);
-  free(ept);
-  free(bid);
-  free(agv);
 
   int rc = ingest_post_json_relpath("ingest/report-events", json, "report-events");
   free(json);
@@ -983,6 +1024,10 @@ static int ingest_get_json_relpath_shell(const char *relpath, char **out_body, i
   if (!s_rest[0] || !relpath || !out_body || !out_http) {
     return -1;
   }
+  if (!shell_curl_fallback_allowed()) {
+    EDR_LOGE("%s", "[ingest-http] GET shell curl fallback disabled\n");
+    return -1;
+  }
   *out_body = NULL;
   *out_http = 0;
   char jsonpath[512], cfgpath[512], resp_path[512];
@@ -1009,6 +1054,10 @@ static int ingest_get_json_relpath_shell(const char *relpath, char **out_body, i
     (void)snprintf(resp_path, sizeof(resp_path), "/tmp/edr_getresp_%d.http", pp);
   }
 #endif
+  if (!shell_curl_fallback_allowed()) {
+    EDR_LOGE("%s", "[ingest-http] upload shell curl fallback disabled\n");
+    return -1;
+  }
   {
     char url[1024];
     if (snprintf(url, sizeof(url), "%s/%s", s_rest, relpath) >= (int)sizeof(url)) {
@@ -1026,45 +1075,16 @@ static int ingest_get_json_relpath_shell(const char *relpath, char **out_body, i
     fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
     fputs("\"\n", cf);
     fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
-    if (s_bearer[0]) {
-      fputs("header = \"Authorization: Bearer ", cf);
-      fprint_curl_cfg_dquoted_body(cf, s_bearer);
-      fputs("\"\n", cf);
-    }
     fprintf(cf, "output = \"%s\"\n", resp_path);
     fprintf(cf, "silent\n");
     fclose(cf);
   }
-  char cmd[2560];
-#ifdef _WIN32
-  snprintf(cmd, sizeof(cmd), "curl -sS -o \"%s\" -w \"%%{http_code}\" --config \"%s\"", resp_path, cfgpath);
-#else
-  snprintf(cmd, sizeof(cmd), "curl -sS -o '%s' -w '%%{http_code}' --config '%s'", resp_path, cfgpath);
-#endif
-  char codebuf[32];
-  size_t code_n = 0;
-  memset(codebuf, 0, sizeof(codebuf));
-#ifdef _WIN32
-  FILE *pf = _popen(cmd, "r");
-#else
-  FILE *pf = popen(cmd, "r");
-#endif
-  if (!pf) {
+  if (run_curl_config_no_shell(resp_path, cfgpath, s_bearer) != 0) {
     (void)remove(cfgpath);
-    EDR_LOGE("%s", "[ingest-http] GET curl popen failed\n");
+    EDR_LOGE("%s", "[ingest-http] GET curl fallback failed\n");
     return -1;
   }
-  code_n = fread(codebuf, 1, sizeof(codebuf) - 1u, pf);
-#ifdef _WIN32
-  (void)_pclose(pf);
-#else
-  (void)pclose(pf);
-#endif
-  int http_code = 0;
-  if (code_n > 0u) {
-    codebuf[code_n] = 0;
-    http_code = (int)strtol(codebuf, NULL, 10);
-  }
+  int http_code = 200;
   (void)remove(cfgpath);
   *out_http = http_code;
   {
@@ -1455,43 +1475,13 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       fprint_curl_cfg_dquoted_body(cfx, s_user[0] ? s_user : "edr-agent");
       fputs("\"\n", cfx);
       fprintf(cfx, "header = \"X-Permission-Set: telemetry:write\"\n");
-      if (s_bearer[0]) {
-        fputs("header = \"Authorization: Bearer ", cfx);
-        fprint_curl_cfg_dquoted_body(cfx, s_bearer);
-        fputs("\"\n", cfx);
-      }
       fprintf(cfx, "output = \"%s\"\n", rpath);
       fprintf(cfx, "silent\n");
       fclose(cfx);
     }
-    char cmd2[3000];
-#ifdef _WIN32
-    snprintf(cmd2, sizeof(cmd2), "curl -sS -o \"%s\" -w \"%%{http_code}\" --config \"%s\"", rpath, cfg2);
-#else
-    snprintf(cmd2, sizeof(cmd2), "curl -sS -o '%s' -w '%%{http_code}' --config '%s'", rpath, cfg2);
-#endif
-    char cbuf2[12];
-    memset(cbuf2, 0, sizeof(cbuf2));
-#ifdef _WIN32
-    {
-      FILE *p2 = _popen(cmd2, "r");
-      if (p2) {
-        (void)fread(cbuf2, 1, sizeof(cbuf2) - 1u, p2);
-        (void)_pclose(p2);
-      }
-    }
-#else
-    {
-      FILE *p2 = popen(cmd2, "r");
-      if (p2) {
-        (void)fread(cbuf2, 1, sizeof(cbuf2) - 1u, p2);
-        (void)pclose(p2);
-      }
-    }
-#endif
+    int curl_ok = run_curl_config_no_shell(rpath, cfg2, s_bearer);
     (void)remove(cfg2);
-    int h2 = (int)strtol(cbuf2, NULL, 10);
-    if (h2 < 200 || h2 >= 300) {
+    if (curl_ok != 0) {
       (void)remove(rpath);
       return -1;
     }

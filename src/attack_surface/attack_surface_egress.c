@@ -10,6 +10,9 @@
 
 #ifdef __linux__
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #define EDR_ASURF_EG_BUCKETS 2048
 
 typedef struct {
@@ -149,6 +152,40 @@ static int cmp_bucket_desc(const void *a, const void *b) {
   return (y->cnt > x->cnt) - (x->cnt > y->cnt);
 }
 
+static FILE *open_ss_established_reader(pid_t *child_out) {
+  if (child_out) {
+    *child_out = -1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    return NULL;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return NULL;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    (void)dup2(pfd[1], STDOUT_FILENO);
+    close(pfd[1]);
+    execlp("ss", "ss", "-tanp", "state", "established", (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+  FILE *pf = fdopen(pfd[0], "r");
+  if (!pf) {
+    close(pfd[0]);
+    (void)waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  if (child_out) {
+    *child_out = pid;
+  }
+  return pf;
+}
+
 void edr_asurf_collect_egress(const EdrConfig *cfg, EdrAsurfEgressRow *out, int max_out, int *n_out,
                               int *suspicious_conn_total, int *truncated) {
   *n_out = 0;
@@ -171,7 +208,8 @@ void edr_asurf_collect_egress(const EdrConfig *cfg, EdrAsurfEgressRow *out, int 
   }
   int nb = 0;
 
-  FILE *pf = popen("ss -tanp state established 2>/dev/null", "r");
+  pid_t child = -1;
+  FILE *pf = open_ss_established_reader(&child);
   if (!pf) {
     free(B);
     return;
@@ -227,7 +265,10 @@ void edr_asurf_collect_egress(const EdrConfig *cfg, EdrAsurfEgressRow *out, int 
     }
     B[idx].cnt++;
   }
-  (void)pclose(pf);
+  (void)fclose(pf);
+  if (child > 0) {
+    (void)waitpid(child, NULL, 0);
+  }
 
   if (nb == 0) {
     free(B);

@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <winreg.h>
 #else
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -127,22 +128,131 @@ static int parse_netsh_fw_policy(const char *line, char *inb, size_t in_cap, cha
   return 0;
 }
 
+static int run_command_capture_first_line(const char *cmdline, char *line, size_t cap) {
+  if (!cmdline || !cmdline[0] || !line || cap < 2u) {
+    return -1;
+  }
+  line[0] = 0;
+  SECURITY_ATTRIBUTES sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  HANDLE rd = NULL, wr = NULL;
+  if (!CreatePipe(&rd, &wr, &sa, 0)) {
+    return -1;
+  }
+  (void)SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+  memset(&si, 0, sizeof(si));
+  memset(&pi, 0, sizeof(pi));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = wr;
+  si.hStdError = wr;
+  char cmd[2048];
+  snprintf(cmd, sizeof(cmd), "%s", cmdline);
+  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  CloseHandle(wr);
+  if (!ok) {
+    CloseHandle(rd);
+    return -1;
+  }
+  DWORD got = 0;
+  size_t off = 0u;
+  char tmp[128];
+  while (ReadFile(rd, tmp, sizeof(tmp), &got, NULL) && got > 0) {
+    for (DWORD i = 0; i < got; i++) {
+      if (off + 1u >= cap) {
+        break;
+      }
+      line[off++] = tmp[i];
+      if (tmp[i] == '\n') {
+        goto done_read;
+      }
+    }
+    if (off + 1u >= cap) {
+      break;
+    }
+  }
+done_read:
+  line[off] = 0;
+  CloseHandle(rd);
+  (void)WaitForSingleObject(pi.hProcess, 15000);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  if (off == 0u) {
+    return -1;
+  }
+  return 0;
+}
+
+static int run_command_capture_all(const char *cmdline, char *out, size_t cap) {
+  if (!cmdline || !cmdline[0] || !out || cap < 2u) {
+    return -1;
+  }
+  out[0] = 0;
+  SECURITY_ATTRIBUTES sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  HANDLE rd = NULL, wr = NULL;
+  if (!CreatePipe(&rd, &wr, &sa, 0)) {
+    return -1;
+  }
+  (void)SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+  memset(&si, 0, sizeof(si));
+  memset(&pi, 0, sizeof(pi));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = wr;
+  si.hStdError = wr;
+  char cmd[2048];
+  snprintf(cmd, sizeof(cmd), "%s", cmdline);
+  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  CloseHandle(wr);
+  if (!ok) {
+    CloseHandle(rd);
+    return -1;
+  }
+  DWORD got = 0;
+  size_t off = 0u;
+  char tmp[256];
+  while (ReadFile(rd, tmp, sizeof(tmp), &got, NULL) && got > 0) {
+    if (off + (size_t)got >= cap) {
+      got = (DWORD)(cap - off - 1u);
+    }
+    if (got == 0) {
+      break;
+    }
+    memcpy(out + off, tmp, (size_t)got);
+    off += (size_t)got;
+    if (off + 1u >= cap) {
+      break;
+    }
+  }
+  out[off] = 0;
+  CloseHandle(rd);
+  (void)WaitForSingleObject(pi.hProcess, 15000);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return (off > 0u) ? 0 : -1;
+}
+
 static int ps_count_rules(const char *filter_expr) {
-  char cmd[1400];
+  char cmd[1800];
   snprintf(cmd, sizeof(cmd),
            "powershell.exe -NoProfile -NoLogo -Command "
            "\"(Get-NetFirewallRule | Where-Object { %s } | Measure-Object).Count\"",
            filter_expr);
-  FILE *pf = _popen(cmd, "r");
-  if (!pf) {
-    return -1;
-  }
   char line[64];
-  if (!fgets(line, sizeof(line), pf)) {
-    (void)_pclose(pf);
+  if (run_command_capture_first_line(cmd, line, sizeof(line)) != 0) {
     return -1;
   }
-  (void)_pclose(pf);
   trim_crlf(line);
   return (int)strtol(line, NULL, 10);
 }
@@ -178,16 +288,10 @@ static void collect_win_high_risk_allow_ports(const EdrConfig *cfg, EdrSecurityP
     if (nw <= 0 || (size_t)nw >= sizeof(cmd)) {
       continue;
     }
-    FILE *pf = _popen(cmd, "r");
-    if (!pf) {
-      continue;
-    }
     char line[8];
-    if (!fgets(line, sizeof(line), pf)) {
-      (void)_pclose(pf);
+    if (run_command_capture_first_line(cmd, line, sizeof(line)) != 0) {
       continue;
     }
-    (void)_pclose(pf);
     trim_crlf(line);
     if (line[0] != '1') {
       continue;
@@ -209,27 +313,32 @@ static void collect_win_firewall(const EdrConfig *cfg, EdrSecurityPolicySnap *o)
   snprintf(pub_in, sizeof(pub_in), "%s", "UNKNOWN");
   snprintf(pub_out, sizeof(pub_out), "%s", "UNKNOWN");
 
-  FILE *pf = _popen("netsh advfirewall show allprofiles 2>nul", "r");
-  if (!pf) {
+  char dump[16384];
+  if (run_command_capture_all("netsh advfirewall show allprofiles", dump, sizeof(dump)) != 0) {
     return;
   }
-  char line[512];
+  char *save = NULL;
+  char *line = strtok_s(dump, "\n", &save);
   enum { SEC_NONE, SEC_DOMAIN, SEC_PRIVATE, SEC_PUBLIC } sec = SEC_NONE;
-  while (fgets(line, sizeof(line), pf)) {
+  while (line) {
     trim_crlf(line);
     if (strncmp(line, "Domain Profile", 14) == 0) {
       sec = SEC_DOMAIN;
+      line = strtok_s(NULL, "\n", &save);
       continue;
     }
     if (strncmp(line, "Private Profile", 15) == 0) {
       sec = SEC_PRIVATE;
+      line = strtok_s(NULL, "\n", &save);
       continue;
     }
     if (strncmp(line, "Public Profile", 14) == 0) {
       sec = SEC_PUBLIC;
+      line = strtok_s(NULL, "\n", &save);
       continue;
     }
     if (strstr(line, "----")) {
+      line = strtok_s(NULL, "\n", &save);
       continue;
     }
     int st = 0;
@@ -244,6 +353,7 @@ static void collect_win_firewall(const EdrConfig *cfg, EdrSecurityPolicySnap *o)
         u_on = st;
         u_ok = 1;
       }
+      line = strtok_s(NULL, "\n", &save);
       continue;
     }
     if (strstr(line, "Firewall Policy")) {
@@ -255,8 +365,8 @@ static void collect_win_firewall(const EdrConfig *cfg, EdrSecurityPolicySnap *o)
         parse_netsh_fw_policy(line, pub_in, sizeof(pub_in), pub_out, sizeof(pub_out));
       }
     }
+    line = strtok_s(NULL, "\n", &save);
   }
-  (void)_pclose(pf);
 
   if (d_ok || p_ok || u_ok) {
     o->top_fw_enabled_known = 1;
@@ -324,19 +434,18 @@ static void collect_win_os(EdrSecurityPolicySnap *o) {
     o->os_rdp_nla = (int)(v != 0);
   }
   /* DEP：策略注册表项在不同 SKU 上不一致，P1 不填 */
-  FILE *pf = _popen("powershell.exe -NoProfile -NoLogo -Command \"try { if (Confirm-SecureBootUEFI) { '1' } "
-                    "else { '0' } } catch { 'x' }\" 2>nul",
-                    "r");
-  if (pf) {
+  {
     char line[16];
-    if (fgets(line, sizeof(line), pf)) {
+    if (run_command_capture_first_line(
+            "powershell.exe -NoProfile -NoLogo -Command \"try { if (Confirm-SecureBootUEFI) { '1' } "
+            "else { '0' } } catch { 'x' }\"",
+            line, sizeof(line)) == 0) {
       trim_crlf(line);
       if (line[0] == '1' || line[0] == '0') {
         o->os_secure_boot_known = 1;
         o->os_secure_boot = line[0] == '1' ? 1 : 0;
       }
     }
-    (void)_pclose(pf);
   }
   char bn[32] = "";
   char dv[64] = "";
@@ -383,32 +492,82 @@ static int read_small_file(const char *path, char *buf, size_t cap) {
   return 0;
 }
 
+static FILE *run_cmd_reader(char *const argv[], pid_t *child_out) {
+  if (child_out) {
+    *child_out = -1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    return NULL;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return NULL;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    (void)dup2(pfd[1], STDOUT_FILENO);
+    close(pfd[1]);
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+  close(pfd[1]);
+  FILE *pf = fdopen(pfd[0], "r");
+  if (!pf) {
+    close(pfd[0]);
+    (void)waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  if (child_out) {
+    *child_out = pid;
+  }
+  return pf;
+}
+
 static int popen_one_line(const char *cmd, char *buf, size_t cap) {
-  FILE *pf = popen(cmd, "r");
+  char *const argv[] = {"sh", "-c", (char *)cmd, NULL};
+  pid_t child = -1;
+  FILE *pf = run_cmd_reader(argv, &child);
   if (!pf) {
     return -1;
   }
   if (!fgets(buf, (int)cap, pf)) {
     buf[0] = 0;
-    (void)pclose(pf);
+    (void)fclose(pf);
+    if (child > 0) {
+      (void)waitpid(child, NULL, 0);
+    }
     return -1;
   }
-  (void)pclose(pf);
+  (void)fclose(pf);
+  if (child > 0) {
+    (void)waitpid(child, NULL, 0);
+  }
   trim_crlf(buf);
   return 0;
 }
 
 static int popen_count_lines(const char *cmd) {
-  FILE *pf = popen(cmd, "r");
+  char *const argv[] = {"sh", "-c", (char *)cmd, NULL};
+  pid_t child = -1;
+  FILE *pf = run_cmd_reader(argv, &child);
   if (!pf) {
     return -1;
   }
   char line[64];
   if (!fgets(line, sizeof(line), pf)) {
-    (void)pclose(pf);
+    (void)fclose(pf);
+    if (child > 0) {
+      (void)waitpid(child, NULL, 0);
+    }
     return -1;
   }
-  (void)pclose(pf);
+  (void)fclose(pf);
+  if (child > 0) {
+    (void)waitpid(child, NULL, 0);
+  }
   trim_crlf(line);
   return (int)strtol(line, NULL, 10);
 }
@@ -427,7 +586,9 @@ static void collect_linux_fw(EdrSecurityPolicySnap *o) {
   }
   char pol_in[24] = "UNKNOWN";
   char pol_out[24] = "UNKNOWN";
-  FILE *pf = popen("iptables -S 2>/dev/null", "r");
+  char *const argv[] = {"iptables", "-S", NULL};
+  pid_t child = -1;
+  FILE *pf = run_cmd_reader(argv, &child);
   if (pf) {
     char line[256];
     while (fgets(line, sizeof(line), pf)) {
@@ -446,7 +607,10 @@ static void collect_linux_fw(EdrSecurityPolicySnap *o) {
         }
       }
     }
-    (void)pclose(pf);
+    (void)fclose(pf);
+    if (child > 0) {
+      (void)waitpid(child, NULL, 0);
+    }
   }
   nlines = popen_count_lines("sh -c \"iptables-save 2>/dev/null | wc -l\"");
   if (nlines >= 0) {

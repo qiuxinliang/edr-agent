@@ -14,11 +14,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <process.h>
 #include "edr/attack_surface_win_util.h"
 #include "edr/listen_table_win.h"
 #define EDR_GETPID (int)GetCurrentProcessId
 #else
 #include <pthread.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #define EDR_GETPID (int)getpid
 #endif
@@ -157,6 +159,40 @@ static int parse_pid_users(const char *proc, int *pid_out) {
   return sscanf(p + 4, "%d", pid_out) == 1 ? 0 : -1;
 }
 
+static FILE *open_ss_ltnp_reader(pid_t *child_out) {
+  if (child_out) {
+    *child_out = -1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    return NULL;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return NULL;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    (void)dup2(pfd[1], STDOUT_FILENO);
+    close(pfd[1]);
+    execlp("ss", "ss", "-ltnp", (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+  FILE *pf = fdopen(pfd[0], "r");
+  if (!pf) {
+    close(pfd[0]);
+    (void)waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  if (child_out) {
+    *child_out = pid;
+  }
+  return pf;
+}
+
 static void proc_name_from_users(const char *proc, char *name, size_t cap) {
   name[0] = 0;
   const char *q = strstr(proc, "((\"");
@@ -177,7 +213,8 @@ static void proc_name_from_users(const char *proc, char *name, size_t cap) {
 }
 
 static int collect_listeners_linux(AsListener *out, int max_out, int *truncated) {
-  FILE *pf = popen("ss -ltnp 2>/dev/null", "r");
+  pid_t child = -1;
+  FILE *pf = open_ss_ltnp_reader(&child);
   if (!pf) {
     return 0;
   }
@@ -235,7 +272,10 @@ static int collect_listeners_linux(AsListener *out, int max_out, int *truncated)
     snprintf(L->id, sizeof(L->id), "l-%d", n);
     n++;
   }
-  (void)pclose(pf);
+  (void)fclose(pf);
+  if (child > 0) {
+    (void)waitpid(child, NULL, 0);
+  }
   return n;
 }
 #elif defined(_WIN32)
@@ -860,23 +900,64 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   return 0;
 }
 
-static int run_curl_upload(const char *cfg_path, char *errbuf, size_t errlen) {
-#ifdef _WIN32
-  char cfg_slash[768];
-  snprintf(cfg_slash, sizeof(cfg_slash), "%s", cfg_path ? cfg_path : "");
-  win_path_fwd_slashes(cfg_slash);
-  char cmd[1536];
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config \"%s\"", cfg_slash);
-#else
-  char cmd[1536];
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config '%s'", cfg_path);
-#endif
-  int rc = system(cmd);
-  if (rc != 0) {
-    snprintf(errbuf, errlen, "curl_exit_%d", rc);
+static int run_curl_upload(const char *cfg_path, const char *bearer, char *errbuf, size_t errlen) {
+  if (!cfg_path || !cfg_path[0]) {
+    snprintf(errbuf, errlen, "%s", "curl_cfg_empty");
     return -1;
   }
-  snprintf(errbuf, errlen, "http_ok");
+#ifdef _WIN32
+  char cfg_slash[768];
+  snprintf(cfg_slash, sizeof(cfg_slash), "%s", cfg_path);
+  win_path_fwd_slashes(cfg_slash);
+  if (bearer && bearer[0]) {
+    char auth[1024];
+    if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
+      snprintf(errbuf, errlen, "%s", "curl_auth_header_too_long");
+      return -1;
+    }
+    const char *argv[] = {"curl", "-fsS", "--config", cfg_slash, "-H", auth, NULL};
+    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
+    if (rc != 0) {
+      snprintf(errbuf, errlen, "curl_exit_%d", (int)rc);
+      return -1;
+    }
+  } else {
+    const char *argv[] = {"curl", "-fsS", "--config", cfg_slash, NULL};
+    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
+    if (rc != 0) {
+      snprintf(errbuf, errlen, "curl_exit_%d", (int)rc);
+      return -1;
+    }
+  }
+#else
+  pid_t pid = fork();
+  if (pid < 0) {
+    snprintf(errbuf, errlen, "%s", "fork_failed");
+    return -1;
+  }
+  if (pid == 0) {
+    if (bearer && bearer[0]) {
+      char auth[1024];
+      if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
+        _exit(127);
+      }
+      execlp("curl", "curl", "-fsS", "--config", cfg_path, "-H", auth, (char *)NULL);
+    } else {
+      execlp("curl", "curl", "-fsS", "--config", cfg_path, (char *)NULL);
+    }
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) {
+    snprintf(errbuf, errlen, "%s", "waitpid_failed");
+    return -1;
+  }
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    snprintf(errbuf, errlen, "curl_exit_%d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return -1;
+  }
+#endif
+  snprintf(errbuf, errlen, "%s", "http_ok");
   return 0;
 }
 
@@ -951,14 +1032,11 @@ int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
   } else if (cfg->platform.rest_bearer_token[0]) {
     bearer = cfg->platform.rest_bearer_token;
   }
-  if (bearer && bearer[0]) {
-    fprintf(cf, "header = \"Authorization: Bearer %s\"\n", bearer);
-  }
   fprintf(cf, "silent\n");
   fclose(cf);
 
   char errbuf[128];
-  if (run_curl_upload(cfgpath, errbuf, sizeof(errbuf)) != 0) {
+  if (run_curl_upload(cfgpath, bearer, errbuf, sizeof(errbuf)) != 0) {
     (void)remove(outpath);
     (void)remove(cfgpath);
     return -1;
@@ -1050,9 +1128,6 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
   fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", tenant);
   fprintf(cf, "header = \"X-User-ID: %s\"\n", user);
   fprintf(cf, "header = \"X-Permission-Set: endpoint:attack_surface_report\"\n");
-  if (bearer && bearer[0]) {
-    fprintf(cf, "header = \"Authorization: Bearer %s\"\n", bearer);
-  }
   /* 默认 curl 把响应体打 stdout，与 Agent stderr 交错且缺换行；丢弃即可（仅需 HTTP 状态）。 */
 #ifdef _WIN32
   fprintf(cf, "output = \"NUL\"\n");
@@ -1065,7 +1140,7 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
   fclose(cf);
 
   char errbuf[128];
-  int ur = run_curl_upload(cfgpath, errbuf, sizeof(errbuf));
+  int ur = run_curl_upload(cfgpath, bearer, errbuf, sizeof(errbuf));
   (void)remove(jsonpath);
   (void)remove(cfgpath);
   if (ur != 0) {

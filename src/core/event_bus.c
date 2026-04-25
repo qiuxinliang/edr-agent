@@ -123,6 +123,20 @@ bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {
   return true;
 }
 
+uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, uint32_t max_count) {
+  if (!bus || !out_slots || max_count == 0u) {
+    return 0u;
+  }
+  lock(bus);
+  uint32_t n = 0u;
+  while (n < max_count && bus->head != bus->tail) {
+    out_slots[n++] = bus->slots[bus->head];
+    bus->head = (bus->head + 1u) % bus->cap;
+  }
+  unlock(bus);
+  return n;
+}
+
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus) {
   return bus ? bus->cap : 0u;
 }

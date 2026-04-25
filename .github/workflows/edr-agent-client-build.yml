@@ -1,0 +1,152 @@
+# 独立 edr-agent 仓库：仅构建 Windows 客户端产物（exe + 运行时 DLL zip），不创建 GitHub Release。
+# 正式发版请推 win_* tag 触发 edr-agent-client-release.yml。
+
+name: edr-agent client build (Windows)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edr-agent-client-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+  VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  windows-build:
+    name: Build Windows (edr_agent.exe + runtime DLLs, gRPC+vcpkg+ORT)
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Prepare vcpkg cache directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
+
+      - name: Cache vcpkg (installed + downloads + binary cache)
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+            vcpkg_installed
+          key: vcpkg-x64-win-grpc-build-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}
+          restore-keys: |
+            vcpkg-x64-win-grpc-build-${{ hashFiles('vcpkg.json') }}-
+
+      - name: Clone and bootstrap vcpkg
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          }
+          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: vcpkg install (manifest, curl + grpc feature)
+        working-directory: ${{ github.workspace }}
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
+          $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
+          $env:VCPKG_ROOT = $vroot
+          $env:Path = $vroot + ";" + $env:Path
+          $tc = Join-Path $vroot "vcpkg.exe"
+          if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
+          & $tc install --x-feature=grpc-client
+          if (-not (Test-Path "vcpkg_installed\x64-windows\tools\protobuf\protoc.exe")) { throw "vcpkg install: protoc not found" }
+          "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
+        shell: pwsh
+        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
+
+      - name: ONNX Runtime (CPU, Windows x64)
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zip = Join-Path $dest "ort.zip"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip" -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
+          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
+          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure (Ninja, Release, gRPC+ORT, sccache)
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        shell: pwsh
+        run: |
+          $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
+          if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DEDR_WITH_GRPC=ON `
+            -DEDR_WITH_ONNXRUNTIME=ON `
+            "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+            -DEDR_BUILD_TESTS=OFF
+          if (-not $?) { throw "cmake configure failed" }
+
+      - name: Build
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Stage ORT + vcpkg runtime DLLs
+        shell: pwsh
+        run: |
+          $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
+          ./scripts/stage_ort_dlls_build_release.ps1
+          ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package (exe + runtime DLLs only)
+        shell: pwsh
+        run: |
+          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          if (-not (Test-Path "build\Release\edr_agent.exe")) { throw "missing build\Release\edr_agent.exe" }
+          $items = New-Object System.Collections.Generic.List[string]
+          $null = $items.Add("build\Release\edr_agent.exe")
+          if (Test-Path "build\Release\edr_monitor.exe") { $null = $items.Add("build\Release\edr_monitor.exe") }
+          Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
+
+      - name: Move artifact to workspace
+        shell: pwsh
+        run: |
+          $src = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
+          Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-exe.zip") -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edr-agent-windows-${{ github.ref_name }}
+          path: edr-agent-win-exe.zip
+          retention-days: 14
+          if-no-files-found: error

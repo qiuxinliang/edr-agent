@@ -1,3 +1,11 @@
 {
-  "dependencies": ["curl", "grpc"]
+  "name": "edr-agent",
+  "version-string": "0.0.0",
+  "dependencies": ["curl"],
+  "features": {
+    "grpc-client": {
+      "description": "gRPC++ EventIngest (protobuf, protoc, grpc plugin)",
+      "dependencies": ["grpc"]
+    }
+  }
 }

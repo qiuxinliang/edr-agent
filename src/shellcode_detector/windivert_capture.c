@@ -157,9 +157,21 @@ static void mkdir_p_win(const char *dir) {
   if (!dir || !dir[0]) {
     return;
   }
-  char cmd[1200];
-  snprintf(cmd, sizeof(cmd), "cmd /c mkdir \"%s\" 2>nul", dir);
-  (void)system(cmd);
+  char tmp[1024];
+  size_t n = strlen(dir);
+  if (n >= sizeof(tmp)) {
+    return;
+  }
+  memcpy(tmp, dir, n + 1u);
+  for (char *p = tmp + 1; *p; p++) {
+    if (*p == '\\' || *p == '/') {
+      char bak = *p;
+      *p = '\0';
+      (void)CreateDirectoryA(tmp, NULL);
+      *p = bak;
+    }
+  }
+  (void)CreateDirectoryA(tmp, NULL);
 }
 
 static void pcap_write_global_header(FILE *f, uint32_t linktype) {

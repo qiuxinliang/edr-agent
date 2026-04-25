@@ -12,6 +12,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
 
 /** 非 0/false/off 时：gRPC 未就绪仍走 HTTP 时每批都打日志（默认只打一次）。 */
 static int transport_env_truthy(const char *name) {
@@ -25,53 +32,40 @@ static int transport_env_truthy(const char *name) {
   return 1;
 }
 
+typedef struct EdrSendJob {
+  int use_http;
+  char *batch_id;
+  size_t header_len;
+  size_t payload_len;
+  uint8_t *wire;
+  struct EdrSendJob *next;
+} EdrSendJob;
+
 static char s_target[256];
-
-void edr_transport_init_from_config(const EdrConfig *cfg) {
-  memset(s_target, 0, sizeof(s_target));
-  if (!cfg) {
-    return;
-  }
-  snprintf(s_target, sizeof(s_target), "%s", cfg->server.address);
-  if (s_target[0]) {
-    EDR_LOGV("[transport] gRPC target: %s\n", s_target);
-  }
-  {
-    const char *erb = getenv("EDR_PLATFORM_REST_BASE");
-    const char *rb =
-        (erb && erb[0]) ? erb : (cfg->platform.rest_base_url[0] ? cfg->platform.rest_base_url : "");
-    const char *br = getenv("EDR_PLATFORM_BEARER");
-    const char *bear =
-        (br && br[0]) ? br : (cfg->platform.rest_bearer_token[0] ? cfg->platform.rest_bearer_token : "");
-    const char *tid = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "demo-tenant";
-    const char *uid =
-        cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
-    edr_ingest_http_configure(rb, tid, uid, bear, cfg->agent.endpoint_id, NULL);
-    if (rb && rb[0]) {
-      fprintf(stderr, "[transport] HTTP ingest: %s\n", rb);
-      EDR_LOGV(
-          "%s",
-          "  (verbose) EDR_EVENT_INGEST_SPLIT=1 split; gRPC fail->HTTP if base set; EDR_EVENT_GRPC_FALLBACK_HTTP=0 disables fallback.\n");
-    }
-  }
-  edr_grpc_client_init(cfg);
-  edr_ingest_http_start_command_poll();
-}
-
-void edr_transport_shutdown(void) {
-  edr_ingest_http_stop_command_poll();
-  edr_grpc_client_shutdown();
-}
-
 static volatile unsigned long s_wire_events;
 static volatile unsigned long s_wire_bytes;
 static volatile unsigned long s_batch_count;
 static volatile unsigned long s_batch_bytes;
 static volatile unsigned long s_batch_lz4;
+static EdrSendJob *s_q_head;
+static EdrSendJob *s_q_tail;
+static size_t s_q_len;
+static size_t s_q_cap = 256u;
+static int s_q_started;
+#ifdef _WIN32
+static CRITICAL_SECTION s_q_mu;
+static CONDITION_VARIABLE s_q_cv;
+static HANDLE s_q_thr;
+static volatile LONG s_q_run;
+#else
+static pthread_mutex_t s_q_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_q_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t s_q_thr;
+static volatile int s_q_run;
+#endif
 
 static uint32_t rd_u32_le(const uint8_t *p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-         ((uint32_t)p[3] << 24);
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 void edr_transport_on_behavior_wire(const uint8_t *data, size_t len) {
@@ -115,8 +109,8 @@ static void enqueue_wire_on_fail(const char *batch_id, const uint8_t *header12, 
   free(wire);
 }
 
-void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const uint8_t *header12,
-                                      size_t header_len, const uint8_t *payload, size_t payload_len) {
+static void edr_transport_send_ingest_batch_now(int use_http, const char *batch_id, const uint8_t *header12,
+                                                size_t header_len, const uint8_t *payload, size_t payload_len) {
   if (header_len < 12u || payload_len == 0u) {
     return;
   }
@@ -138,8 +132,7 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const u
           if (!s_logged_grpc_stub_http) {
             s_logged_grpc_stub_http = 1;
           }
-          EDR_LOGV("[transport] gRPC not ready; HTTP ingest batch_id=%s (EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK=1 "
-                   "repeats)\n",
+          EDR_LOGV("[transport] gRPC not ready; HTTP ingest batch_id=%s (EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK=1 repeats)\n",
                    batch_id ? batch_id : "");
         }
       }
@@ -158,17 +151,299 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const u
   }
 }
 
+static EdrSendJob *make_send_job(int use_http, const char *batch_id, const uint8_t *header12, size_t header_len,
+                                 const uint8_t *payload, size_t payload_len) {
+  if (!header12 || !payload || header_len < 12u || payload_len == 0u) {
+    return NULL;
+  }
+  EdrSendJob *j = (EdrSendJob *)calloc(1, sizeof(*j));
+  if (!j) {
+    return NULL;
+  }
+  j->wire = (uint8_t *)malloc(header_len + payload_len);
+  if (!j->wire) {
+    free(j);
+    return NULL;
+  }
+  memcpy(j->wire, header12, header_len);
+  memcpy(j->wire + header_len, payload, payload_len);
+  if (batch_id && batch_id[0]) {
+    size_t n = strlen(batch_id);
+    j->batch_id = (char *)malloc(n + 1u);
+    if (!j->batch_id) {
+      free(j->wire);
+      free(j);
+      return NULL;
+    }
+    memcpy(j->batch_id, batch_id, n + 1u);
+  }
+  j->use_http = use_http;
+  j->header_len = header_len;
+  j->payload_len = payload_len;
+  return j;
+}
+
+static void free_send_job(EdrSendJob *j) {
+  if (!j) {
+    return;
+  }
+  free(j->wire);
+  free(j->batch_id);
+  free(j);
+}
+
+static int queue_push_job(EdrSendJob *j) {
+  if (!j) {
+    return -1;
+  }
+#ifdef _WIN32
+  EnterCriticalSection(&s_q_mu);
+  if (!s_q_run || s_q_len >= s_q_cap) {
+    LeaveCriticalSection(&s_q_mu);
+    return -1;
+  }
+  if (s_q_tail) {
+    s_q_tail->next = j;
+  } else {
+    s_q_head = j;
+  }
+  s_q_tail = j;
+  s_q_len++;
+  WakeConditionVariable(&s_q_cv);
+  LeaveCriticalSection(&s_q_mu);
+#else
+  pthread_mutex_lock(&s_q_mu);
+  if (!s_q_run || s_q_len >= s_q_cap) {
+    pthread_mutex_unlock(&s_q_mu);
+    return -1;
+  }
+  if (s_q_tail) {
+    s_q_tail->next = j;
+  } else {
+    s_q_head = j;
+  }
+  s_q_tail = j;
+  s_q_len++;
+  pthread_cond_signal(&s_q_cv);
+  pthread_mutex_unlock(&s_q_mu);
+#endif
+  return 0;
+}
+
+static EdrSendJob *queue_pop_wait(void) {
+#ifdef _WIN32
+  EnterCriticalSection(&s_q_mu);
+  while (s_q_run && !s_q_head) {
+    SleepConditionVariableCS(&s_q_cv, &s_q_mu, INFINITE);
+  }
+  EdrSendJob *j = s_q_head;
+  if (j) {
+    s_q_head = j->next;
+    if (!s_q_head) {
+      s_q_tail = NULL;
+    }
+    s_q_len--;
+    j->next = NULL;
+  }
+  LeaveCriticalSection(&s_q_mu);
+  return j;
+#else
+  pthread_mutex_lock(&s_q_mu);
+  while (s_q_run && !s_q_head) {
+    pthread_cond_wait(&s_q_cv, &s_q_mu);
+  }
+  EdrSendJob *j = s_q_head;
+  if (j) {
+    s_q_head = j->next;
+    if (!s_q_head) {
+      s_q_tail = NULL;
+    }
+    s_q_len--;
+    j->next = NULL;
+  }
+  pthread_mutex_unlock(&s_q_mu);
+  return j;
+#endif
+}
+
+#ifdef _WIN32
+static unsigned __stdcall transport_sender_thread(void *unused) {
+  (void)unused;
+  for (;;) {
+    EdrSendJob *j = queue_pop_wait();
+    if (!j) {
+      if (!s_q_run) {
+        break;
+      }
+      continue;
+    }
+    edr_transport_send_ingest_batch_now(j->use_http, j->batch_id, j->wire, j->header_len, j->wire + j->header_len,
+                                        j->payload_len);
+    free_send_job(j);
+  }
+  return 0;
+}
+#else
+static void *transport_sender_thread(void *unused) {
+  (void)unused;
+  for (;;) {
+    EdrSendJob *j = queue_pop_wait();
+    if (!j) {
+      if (!s_q_run) {
+        break;
+      }
+      continue;
+    }
+    edr_transport_send_ingest_batch_now(j->use_http, j->batch_id, j->wire, j->header_len, j->wire + j->header_len,
+                                        j->payload_len);
+    free_send_job(j);
+  }
+  return NULL;
+}
+#endif
+
+static void transport_queue_start(void) {
+  const char *e = getenv("EDR_TRANSPORT_SEND_QUEUE_CAP");
+  if (e && e[0]) {
+    long v = strtol(e, NULL, 10);
+    if (v >= 8 && v <= 8192) {
+      s_q_cap = (size_t)v;
+    }
+  }
+#ifdef _WIN32
+  InitializeCriticalSection(&s_q_mu);
+  InitializeConditionVariable(&s_q_cv);
+  s_q_run = 1;
+  s_q_thr = (HANDLE)_beginthreadex(NULL, 0, transport_sender_thread, NULL, 0, NULL);
+  if (!s_q_thr) {
+    s_q_run = 0;
+    s_q_started = 0;
+  } else {
+    s_q_started = 1;
+  }
+#else
+  s_q_run = 1;
+  if (pthread_create(&s_q_thr, NULL, transport_sender_thread, NULL) != 0) {
+    s_q_run = 0;
+    s_q_started = 0;
+  } else {
+    s_q_started = 1;
+  }
+#endif
+}
+
+static void transport_queue_stop(void) {
+  if (!s_q_started) {
+    return;
+  }
+#ifdef _WIN32
+  EnterCriticalSection(&s_q_mu);
+  s_q_run = 0;
+  WakeConditionVariable(&s_q_cv);
+  LeaveCriticalSection(&s_q_mu);
+  if (s_q_thr) {
+    WaitForSingleObject(s_q_thr, 30000);
+    CloseHandle(s_q_thr);
+    s_q_thr = NULL;
+  }
+  for (;;) {
+    EdrSendJob *j = NULL;
+    EnterCriticalSection(&s_q_mu);
+    if (s_q_head) {
+      j = s_q_head;
+      s_q_head = j->next;
+      if (!s_q_head) {
+        s_q_tail = NULL;
+      }
+      s_q_len--;
+    }
+    LeaveCriticalSection(&s_q_mu);
+    if (!j) {
+      break;
+    }
+    free_send_job(j);
+  }
+  DeleteCriticalSection(&s_q_mu);
+#else
+  pthread_mutex_lock(&s_q_mu);
+  s_q_run = 0;
+  pthread_cond_signal(&s_q_cv);
+  pthread_mutex_unlock(&s_q_mu);
+  pthread_join(s_q_thr, NULL);
+  for (;;) {
+    pthread_mutex_lock(&s_q_mu);
+    EdrSendJob *j = s_q_head;
+    if (j) {
+      s_q_head = j->next;
+      if (!s_q_head) {
+        s_q_tail = NULL;
+      }
+      s_q_len--;
+    }
+    pthread_mutex_unlock(&s_q_mu);
+    if (!j) {
+      break;
+    }
+    free_send_job(j);
+  }
+#endif
+  s_q_started = 0;
+}
+
+void edr_transport_init_from_config(const EdrConfig *cfg) {
+  memset(s_target, 0, sizeof(s_target));
+  if (!cfg) {
+    return;
+  }
+  snprintf(s_target, sizeof(s_target), "%s", cfg->server.address);
+  if (s_target[0]) {
+    EDR_LOGV("[transport] gRPC target: %s\n", s_target);
+  }
+  {
+    const char *erb = getenv("EDR_PLATFORM_REST_BASE");
+    const char *rb = (erb && erb[0]) ? erb : (cfg->platform.rest_base_url[0] ? cfg->platform.rest_base_url : "");
+    const char *br = getenv("EDR_PLATFORM_BEARER");
+    const char *bear = (br && br[0]) ? br : (cfg->platform.rest_bearer_token[0] ? cfg->platform.rest_bearer_token : "");
+    const char *tid = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "demo-tenant";
+    const char *uid = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
+    edr_ingest_http_configure(rb, tid, uid, bear, cfg->agent.endpoint_id, NULL);
+    if (rb && rb[0]) {
+      fprintf(stderr, "[transport] HTTP ingest: %s\n", rb);
+      EDR_LOGV("%s",
+               "  (verbose) EDR_EVENT_INGEST_SPLIT=1 split; gRPC fail->HTTP if base set; EDR_EVENT_GRPC_FALLBACK_HTTP=0 disables fallback.\n");
+    }
+  }
+  transport_queue_start();
+  edr_grpc_client_init(cfg);
+  edr_ingest_http_start_command_poll();
+}
+
+void edr_transport_shutdown(void) {
+  transport_queue_stop();
+  edr_ingest_http_stop_command_poll();
+  edr_grpc_client_shutdown();
+}
+
+void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const uint8_t *header12,
+                                      size_t header_len, const uint8_t *payload, size_t payload_len) {
+  EdrSendJob *j = make_send_job(use_http, batch_id, header12, header_len, payload, payload_len);
+  if (!j) {
+    edr_transport_send_ingest_batch_now(use_http, batch_id, header12, header_len, payload, payload_len);
+    return;
+  }
+  if (queue_push_job(j) != 0) {
+    edr_transport_send_ingest_batch_now(use_http, batch_id, header12, header_len, payload, payload_len);
+    free_send_job(j);
+  }
+}
+
 void edr_transport_on_event_batch(const char *batch_id, const uint8_t *header12, size_t header_len,
                                   const uint8_t *payload, size_t payload_len) {
   edr_transport_send_ingest_batch(0, batch_id, header12, header_len, payload, payload_len);
 }
 
 unsigned long edr_transport_wire_events_count(void) { return s_wire_events; }
-
 unsigned long edr_transport_wire_bytes_count(void) { return s_wire_bytes; }
-
 unsigned long edr_transport_batch_count(void) { return s_batch_count; }
-
 unsigned long edr_transport_batch_bytes_count(void) { return s_batch_bytes; }
-
 unsigned long edr_transport_batch_lz4_count(void) { return s_batch_lz4; }

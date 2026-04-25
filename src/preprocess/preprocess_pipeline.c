@@ -36,6 +36,7 @@ static volatile int s_stop_preprocess;
 #endif
 
 static int s_preprocess_active;
+enum { EDR_PREPROCESS_POP_BURST = 32 };
 
 static EdrEventBus *s_bus;
 
@@ -119,9 +120,12 @@ static void *preprocess_main(void *arg) {
 #endif
   (void)arg;
   for (;;) {
-    EdrEventSlot slot;
-    if (edr_event_bus_try_pop(s_bus, &slot)) {
-      process_one_slot(&slot);
+    EdrEventSlot slots[EDR_PREPROCESS_POP_BURST];
+    uint32_t n = edr_event_bus_try_pop_many(s_bus, slots, EDR_PREPROCESS_POP_BURST);
+    if (n > 0u) {
+      for (uint32_t i = 0; i < n; i++) {
+        process_one_slot(&slots[i]);
+      }
       edr_event_batch_poll_timeout();
       edr_storage_queue_poll_drain();
       continue;
@@ -130,8 +134,14 @@ static void *preprocess_main(void *arg) {
     edr_storage_queue_poll_drain();
 #ifdef _WIN32
     if (s_stop_preprocess) {
-      while (edr_event_bus_try_pop(s_bus, &slot)) {
-        process_one_slot(&slot);
+      for (;;) {
+        uint32_t rn = edr_event_bus_try_pop_many(s_bus, slots, EDR_PREPROCESS_POP_BURST);
+        if (rn == 0u) {
+          break;
+        }
+        for (uint32_t i = 0; i < rn; i++) {
+          process_one_slot(&slots[i]);
+        }
       }
       edr_storage_queue_poll_drain();
       break;
@@ -139,8 +149,14 @@ static void *preprocess_main(void *arg) {
     Sleep(1);
 #else
     if (s_stop_preprocess) {
-      while (edr_event_bus_try_pop(s_bus, &slot)) {
-        process_one_slot(&slot);
+      for (;;) {
+        uint32_t rn = edr_event_bus_try_pop_many(s_bus, slots, EDR_PREPROCESS_POP_BURST);
+        if (rn == 0u) {
+          break;
+        }
+        for (uint32_t i = 0; i < rn; i++) {
+          process_one_slot(&slots[i]);
+        }
       }
       edr_storage_queue_poll_drain();
       break;

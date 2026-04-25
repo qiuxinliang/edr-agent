@@ -25,6 +25,23 @@
       }
     },
     {
+      "name": "w-vcpkg-ninja-nogrpc",
+      "displayName": "Win vcpkg+Ninja 无 gRPC（仅 curl/HTTP；先 vcpkg install）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Ninja",
+      "description": "不编 gRPC；须 vcpkg 的 libcurl（`EDR_NO_GRPC` 时 CMake 强制 find CURL）。在 edr-agent 下执行 vcpkg install 默认只装 curl，设 VCPKG_ROOT 后 cmake --preset。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
       "name": "w-vcpkg-ninja-grpc-ort",
       "displayName": "Win vcpkg+Ninja 全量（gRPC+ONNXRuntime，与 CI 长链一致）",
       "inherits": "base",
@@ -70,12 +87,50 @@
         "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
+    },
+    {
+      "name": "any-ninja-fast-dev",
+      "displayName": "任意 OS：Ninja 快编（缓存优先，调试友好）",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF",
+        "EDR_ENABLE_COMPILER_CACHE": "ON",
+        "EDR_ENABLE_UNITY_BUILD": "OFF",
+        "EDR_ENABLE_IPO": "OFF"
+      }
+    },
+    {
+      "name": "any-ninja-fast-release-lto",
+      "displayName": "任意 OS：Ninja Release 快编+LTO（发版候选）",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF",
+        "EDR_ENABLE_COMPILER_CACHE": "ON",
+        "EDR_ENABLE_UNITY_BUILD": "OFF",
+        "EDR_ENABLE_IPO": "ON"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "w-vcpkg-ninja-dev",
       "configurePreset": "w-vcpkg-ninja-dev"
+    },
+    {
+      "name": "w-vcpkg-ninja-nogrpc",
+      "configurePreset": "w-vcpkg-ninja-nogrpc"
     },
     {
       "name": "w-vcpkg-ninja-grpc-ort",
@@ -88,6 +143,14 @@
     {
       "name": "any-ninja-smoke",
       "configurePreset": "any-ninja-smoke"
+    },
+    {
+      "name": "any-ninja-fast-dev",
+      "configurePreset": "any-ninja-fast-dev"
+    },
+    {
+      "name": "any-ninja-fast-release-lto",
+      "configurePreset": "any-ninja-fast-release-lto"
     }
   ],
   "testPresets": [
