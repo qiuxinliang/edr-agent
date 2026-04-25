@@ -9,13 +9,23 @@ if (-not $V) {
 }
 $bin = Join-Path $V "bin"
 $EdrRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$rel = Join-Path $EdrRoot "build\Release"
+$rel = $null
+foreach ($c in @(
+    (Join-Path $EdrRoot "build\Release"),
+    (Join-Path $EdrRoot "build")
+  )) {
+  $exe = Join-Path $c "edr_agent.exe"
+  if (Test-Path -LiteralPath $exe) {
+    $rel = $c
+    break
+  }
+}
 if (-not (Test-Path -LiteralPath $bin)) {
   Write-Error "No bin: $bin"
   exit 1
 }
-if (-not (Test-Path -LiteralPath $rel)) {
-  Write-Error "Missing $rel (build Release first)"
+if (-not $rel) {
+  Write-Error "edr_agent.exe not found under build\Release or build (Ninja). Build first."
   exit 1
 }
 $n = 0

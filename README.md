@@ -59,6 +59,15 @@ cmake --build build
 ./build/edr_monitor --config agent.toml.example --json
 ```
 
+### 加速编译（Windows / Linux）
+
+- **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
+  - 本机已装 vcpkg 且已 `vcpkg install`：先 `set VCPKG_ROOT=...`（PowerShell 为 `$env:VCPKG_ROOT=...`），再 `cmake --preset w-vcpkg-ninja-dev` → `cmake --build --preset w-vcpkg-ninja-dev`（**无 ORT/无 YARA**，省大量时间）。全量 gRPC+ORT 用 `w-vcpkg-ninja-grpc-ort` 并设置 `ONNXRUNTIME_ROOT`。  
+  - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
+- **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
+  `$env:VCPKG_BINARY_SOURCES="clear;files,$HOME\.vcpkg-bincache,readwrite"` 后再 `vcpkg install`，gRPC/SSL 等命中缓存时冷启动明显变短；或参考 **`scripts/vcpkg_binary_cache_env.example.ps1`**。CI 中已用 `VCPKG_BINARY_SOURCES` + 缓存目录，与本地思路一致。
+- **Ninja / 并行 / sccache**：与 Preset 或 `cmake -G Ninja` 一致；本机可安装 [sccache](https://github.com/mozilla/sccache) 并加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（需已配置好 MSVC 或 gcc 的「开发者环境」）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-build-grpc-ort` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
+
 **终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、模型目录与离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
 
 **首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。从 **GitHub Release** 下载安装时，优先用 **`EDRAgentSetup-*.exe`（Windows）** 或 zip 内 **`install.sh`（Linux）**，见 **`docs/AGENT_INSTALLER.md`** 中「Release 一键安装」。

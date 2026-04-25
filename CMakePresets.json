@@ -1,0 +1,100 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/out/build/${presetName}"
+    },
+    {
+      "name": "w-vcpkg-ninja-dev",
+      "displayName": "Win vcpkg+Ninja 快编（gRPC 开，无 ORT/无 YARA/无 FL）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Ninja",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置。vcpkg install 后再 cmake --preset。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "EDR_WITH_GRPC": "ON",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "w-vcpkg-ninja-grpc-ort",
+      "displayName": "Win vcpkg+Ninja 全量（gRPC+ONNXRuntime，与 CI 长链一致）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Ninja",
+      "description": "需环境变量 ONNXRUNTIME_ROOT=解压的 onnxruntime 根目录。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "EDR_WITH_GRPC": "ON",
+        "EDR_WITH_ONNXRUNTIME": "ON",
+        "ONNXRUNTIME_ROOT": "$env{ONNXRUNTIME_ROOT}",
+        "EDR_WITH_YARA": "ON",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "l-ninja-dev",
+      "displayName": "Linux+Ninja 快编（无 gRPC/无 ORT/无 YARA）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "any-ninja-smoke",
+      "displayName": "任意 OS：Ninja 最小编译（无 gRPC；无 vcpkg 时联调用）",
+      "inherits": "base",
+      "generator": "Ninja",
+      "description": "不限 Windows/Linux，便于在其它系统上 `cmake --list-presets` 可见、快速冒烟。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "w-vcpkg-ninja-dev",
+      "configurePreset": "w-vcpkg-ninja-dev"
+    },
+    {
+      "name": "w-vcpkg-ninja-grpc-ort",
+      "configurePreset": "w-vcpkg-ninja-grpc-ort"
+    },
+    {
+      "name": "l-ninja-dev",
+      "configurePreset": "l-ninja-dev"
+    },
+    {
+      "name": "any-ninja-smoke",
+      "configurePreset": "any-ninja-smoke"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "l-ninja-dev",
+      "configurePreset": "l-ninja-dev",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

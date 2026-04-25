@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <locale.h>
+#endif
 
 #ifndef _WIN32
 static EdrAgent *g_agent_for_sig;
@@ -118,9 +121,18 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
-  /* 控制台/管道默认多为一页 GBK(936)；进程内改为 UTF-8(65001)，与源码字面量(UTF-8)一致，避免 [grpc]/[self_protect] 等中文在 cmd 乱码 */
-  (void)SetConsoleOutputCP(65001);
-  (void)SetConsoleCP(65001);
+  /* 控制台/管道默认常为一页 GBK(936)。需同时：① conhost 代码页 ② UCRT 窄字符与 UTF-8 对齐（/utf-8 源文件下）。设 EDR_NO_CONSOLE_UTF8=1 可禁用。 */
+  {
+    const char *nou8 = getenv("EDR_NO_CONSOLE_UTF8");
+    if (!nou8 || strcmp(nou8, "1") != 0) {
+      (void)SetConsoleOutputCP(CP_UTF8);
+      (void)SetConsoleCP(CP_UTF8);
+      /* Windows 10 1803+ UCRT：与 SetConsole*CP(65001) 配套，减少 fprintf(stderr, 中文) 仍乱码 */
+      if (!setlocale(LC_ALL, ".UTF-8")) {
+        (void)setlocale(LC_CTYPE, ".utf8");
+      }
+    }
+  }
 #endif
   const char *config = NULL;
   const char *prog = (argc > 0 && argv[0]) ? argv[0] : "edr_agent";

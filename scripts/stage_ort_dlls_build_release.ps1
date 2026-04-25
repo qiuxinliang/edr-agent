@@ -6,9 +6,19 @@ if (-not $env:ONNXRUNTIME_ROOT) {
     exit 1
 }
 $Root = Split-Path -Parent $PSScriptRoot
-$rel = Join-Path $Root 'build\Release'
-if (-not (Test-Path -LiteralPath $rel)) {
-    Write-Error "Missing Release output directory: $rel (build Release first)"
+$rel = $null
+foreach ($c in @(
+        (Join-Path $Root 'build\Release'),
+        (Join-Path $Root 'build')
+    )) {
+    $exe = Join-Path $c 'edr_agent.exe'
+    if (Test-Path -LiteralPath $exe) {
+        $rel = $c
+        break
+    }
+}
+if (-not $rel) {
+    Write-Error "edr_agent.exe not found under build\Release or build (Ninja single-config). Build first."
     exit 1
 }
 $lib = Join-Path $env:ONNXRUNTIME_ROOT 'lib'

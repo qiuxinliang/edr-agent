@@ -1,4 +1,5 @@
 # 测试用 gRPC+ORT+ctest。push 仅**分支**（不响应纯 tag 推送，避免与分支 push 重复各跑一条）。手动的 workflow_dispatch 也可。
+# 与 monorepo 根目录 `.github/workflows/edr-agent-build-grpc-ort.yml` 保持：Ninja、sccache、vcpkg binary 缓存。独立仓库时路径无 `edr-agent/` 前缀。
 
 name: edr-agent build (Windows gRPC + ORT)
 
@@ -18,26 +19,38 @@ concurrency:
 env:
   VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
-  VCPKG_BINARY_SOURCES: "clear"
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
-    name: gRPC (vcpkg) + ORT, MSVC
+    name: gRPC (vcpkg) + ORT, Ninja, sccache
     runs-on: windows-latest
     timeout-minutes: 360
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
-      - name: Prepare vcpkg download cache directory
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Ninja
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+        run: choco install ninja -y --no-progress
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Prepare vcpkg cache directories
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
 
-      - name: Cache vcpkg (manifest installed + source downloads)
+      - name: Cache vcpkg (installed + downloads + binary cache)
         uses: actions/cache@v5
         with:
           path: |
             .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
             vcpkg_installed
           key: vcpkg-x64-win-grpc-ci-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/edr-agent-build-grpc-ort.yml', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
           restore-keys: |
@@ -85,15 +98,17 @@ jobs:
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure (MSVC, Release, gRPC+ORT)
+      - name: Configure (Ninja, gRPC+ORT, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
         run: |
           $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
-          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DEDR_WITH_GRPC=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
@@ -101,7 +116,7 @@ jobs:
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build
-        run: cmake --build build --config Release --parallel 4
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: Stage ORT + vcpkg runtime DLLs
         shell: pwsh
@@ -112,4 +127,4 @@ jobs:
 
       - name: Test
         shell: bash
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build --output-on-failure
