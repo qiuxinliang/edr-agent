@@ -178,6 +178,12 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
     s_rng_state ^= cfg->collection.max_event_queue_size;
     s_rng_state ^= cfg->upload.batch_max_events << 1;
   }
+  fprintf(stderr,
+          "[preprocess/config] L2_SPLIT=%d L2_KEEP_RATIO=%.3f L3_PRESSURE=%d L3_HIGH_PCT=%u "
+          "L3_RECOVER_PCT=%u L3_DROP_PERMILLE=%u STRICT_BEHAVIOR_GATE=%d\n",
+          s_l2_split_enabled, s_l2_unmatched_keep_ratio, s_l3_pressure_enabled,
+          (unsigned)s_l3_pressure_high_pct, (unsigned)s_l3_pressure_recover_pct,
+          (unsigned)s_l3_drop_permille, s_strict_behavior_gate_enabled);
 }
 
 static void process_one_slot(const EdrEventSlot *slot) {

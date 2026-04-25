@@ -475,6 +475,15 @@ int AVE_InitFromEdrConfig(const EdrConfig *cfg) {
     return edr_err_to_ave(e);
   }
 
+  {
+    const char *vkw = getenv("EDR_AVE_TRUSTED_VENDOR_KEYWORDS");
+    if (vkw && vkw[0]) {
+      fprintf(stderr, "[ave/config] EDR_AVE_TRUSTED_VENDOR_KEYWORDS=%s\n", vkw);
+    } else {
+      fprintf(stderr, "%s", "[ave/config] EDR_AVE_TRUSTED_VENDOR_KEYWORDS=<builtin_only>\n");
+    }
+  }
+
   ensure_scan_mutex();
 
   edr_ave_bp_init();
