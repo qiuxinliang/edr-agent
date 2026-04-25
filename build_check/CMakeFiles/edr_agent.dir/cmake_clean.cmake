@@ -47,6 +47,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/edr_agent.dir/src/config/config.c.o.d"
   "CMakeFiles/edr_agent.dir/src/core/agent.c.o"
   "CMakeFiles/edr_agent.dir/src/core/agent.c.o.d"
+  "CMakeFiles/edr_agent.dir/src/core/edr_log.c.o"
+  "CMakeFiles/edr_agent.dir/src/core/edr_log.c.o.d"
   "CMakeFiles/edr_agent.dir/src/core/event_bus.c.o"
   "CMakeFiles/edr_agent.dir/src/core/event_bus.c.o.d"
   "CMakeFiles/edr_agent.dir/src/core/time_util.c.o"

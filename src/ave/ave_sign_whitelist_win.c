@@ -481,6 +481,119 @@ static int org_is_mozilla(const char *org) {
   return org && org[0] && _stricmp(org, "Mozilla Corporation") == 0;
 }
 
+static int str_has_ci_ascii(const char *hay, const char *needle) {
+  if (!needle || !needle[0]) {
+    return 1;
+  }
+  if (!hay) {
+    return 0;
+  }
+  for (; *hay; hay++) {
+    const char *a = hay;
+    const char *b = needle;
+    for (; *b; a++, b++) {
+      if (!*a) {
+        return 0;
+      }
+      char ca = *a;
+      char cb = *b;
+      if (ca >= 'A' && ca <= 'Z') {
+        ca = (char)(ca - 'A' + 'a');
+      }
+      if (cb >= 'A' && cb <= 'Z') {
+        cb = (char)(cb - 'A' + 'a');
+      }
+      if (ca != cb) {
+        break;
+      }
+    }
+    if (!*b) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int org_matches_any_keyword(const char *org, const char *const *keywords, size_t n) {
+  if (!org || !org[0] || !keywords) {
+    return 0;
+  }
+  for (size_t i = 0; i < n; i++) {
+    if (keywords[i] && keywords[i][0] && str_has_ci_ascii(org, keywords[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int org_is_known_av_vendor(const char *org) {
+  static const char *const kAvKeywords[] = {
+      "microsoft",
+      "symantec",
+      "broadcom",
+      "mcafee",
+      "trellix",
+      "kaspersky",
+      "eset",
+      "bitdefender",
+      "trend micro",
+      "sophos",
+      "crowdstrike",
+      "sentinelone",
+      "carbon black",
+      "vmware",
+      "palo alto",
+      "cortex",
+      "cybereason",
+      "checkpoint",
+      "fortinet",
+      "secureworks",
+      "kingsoft",
+      "huorong",
+      "beijing huorong"};
+  return org_matches_any_keyword(org, kAvKeywords, sizeof(kAvKeywords) / sizeof(kAvKeywords[0]));
+}
+
+static int org_is_known_major_software_vendor(const char *org) {
+  static const char *const kMajorKeywords[] = {
+      "google", "mozilla", "adobe", "oracle", "intel", "amd", "nvidia",
+      "apple",  "lenovo",  "dell",  "hp",     "ibm",   "sap"};
+  return org_matches_any_keyword(org, kMajorKeywords, sizeof(kMajorKeywords) / sizeof(kMajorKeywords[0]));
+}
+
+/* 环境变量 EDR_AVE_TRUSTED_VENDOR_KEYWORDS="vendor1,vendor2,..." 可扩展厂商关键词 */
+static int org_matches_env_vendor_keywords(const char *org) {
+  const char *env = getenv("EDR_AVE_TRUSTED_VENDOR_KEYWORDS");
+  if (!org || !org[0] || !env || !env[0]) {
+    return 0;
+  }
+  const char *p = env;
+  char token[96];
+  while (*p) {
+    size_t t = 0u;
+    while (*p == ' ' || *p == '\t' || *p == ',') {
+      p++;
+    }
+    while (*p && *p != ',' && t + 1u < sizeof(token)) {
+      token[t++] = *p++;
+    }
+    token[t] = '\0';
+    while (t > 0u && (token[t - 1u] == ' ' || token[t - 1u] == '\t')) {
+      token[--t] = '\0';
+    }
+    if (t > 0u && str_has_ci_ascii(org, token)) {
+      return 1;
+    }
+    while (*p && *p != ',') {
+      p++;
+    }
+    if (*p == ',') {
+      p++;
+    }
+  }
+  return 0;
+}
+
 static void fill_trusted_l1(AVEScanResult *res, const char *org, const char *cn, const char *rule_tag,
                             SignatureVerifyResult sig, TrustLevel tl) {
   res->raw_ai_verdict = VERDICT_CLEAN;
@@ -659,8 +772,10 @@ int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const cha
     return 0;
   }
 
-  if ((org_is_google(act.subject_org) || org_is_mozilla(act.subject_org)) && path_under_program_files(path) && wv) {
-    fill_trusted_l1(res, act.subject_org, act.subject_cn, "sign_whitelist:T1_vendor", SIG_VALID_KNOWN_VENDOR,
+  if ((org_is_google(act.subject_org) || org_is_mozilla(act.subject_org) || org_is_known_av_vendor(act.subject_org) ||
+       org_is_known_major_software_vendor(act.subject_org) || org_matches_env_vendor_keywords(act.subject_org)) &&
+      (path_under_program_files(path) || path_under_system_tree(path)) && wv) {
+    fill_trusted_l1(res, act.subject_org, act.subject_cn, "sign_whitelist:known_vendor", SIG_VALID_KNOWN_VENDOR,
                     TRUST_MAJOR_SW);
     if (skip_onnx_out) {
       *skip_onnx_out = 1;

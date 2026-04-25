@@ -32,6 +32,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/command/sha256.c" "CMakeFiles/edr_agent.dir/src/command/sha256.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/command/sha256.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/config/config.c" "CMakeFiles/edr_agent.dir/src/config/config.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/config/config.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/core/agent.c" "CMakeFiles/edr_agent.dir/src/core/agent.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/core/agent.c.o.d"
+  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/core/edr_log.c" "CMakeFiles/edr_agent.dir/src/core/edr_log.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/core/edr_log.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/core/event_bus.c" "CMakeFiles/edr_agent.dir/src/core/event_bus.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/core/event_bus.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/core/time_util.c" "CMakeFiles/edr_agent.dir/src/core/time_util.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/core/time_util.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/main.c" "CMakeFiles/edr_agent.dir/src/main.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/main.c.o.d"

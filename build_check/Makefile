@@ -728,6 +728,30 @@ src/core/agent.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/agent.c.s
 .PHONY : src/core/agent.c.s
 
+src/core/edr_log.o: src/core/edr_log.c.o
+.PHONY : src/core/edr_log.o
+
+# target to build an object file
+src/core/edr_log.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/edr_log.c.o
+.PHONY : src/core/edr_log.c.o
+
+src/core/edr_log.i: src/core/edr_log.c.i
+.PHONY : src/core/edr_log.i
+
+# target to preprocess a source file
+src/core/edr_log.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/edr_log.c.i
+.PHONY : src/core/edr_log.c.i
+
+src/core/edr_log.s: src/core/edr_log.c.s
+.PHONY : src/core/edr_log.s
+
+# target to generate assembly for a file
+src/core/edr_log.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/edr_log.c.s
+.PHONY : src/core/edr_log.c.s
+
 src/core/event_bus.o: src/core/event_bus.c.o
 .PHONY : src/core/event_bus.o
 
@@ -1726,6 +1750,9 @@ help:
 	@echo "... src/core/agent.o"
 	@echo "... src/core/agent.i"
 	@echo "... src/core/agent.s"
+	@echo "... src/core/edr_log.o"
+	@echo "... src/core/edr_log.i"
+	@echo "... src/core/edr_log.s"
 	@echo "... src/core/event_bus.o"
 	@echo "... src/core/event_bus.i"
 	@echo "... src/core/event_bus.s"

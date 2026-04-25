@@ -54,6 +54,13 @@ max_event_queue_size = 4096
 dedup_window_s       = 30
 high_freq_threshold  = 100
 sampling_rate_whitelist = 0.1
+# L2/L3 首版（默认关闭）通过环境变量控制：
+#   EDR_PREPROCESS_L2_SPLIT=1                # 启用“未命中规则事件”的抽样保留
+#   EDR_PREPROCESS_L2_KEEP_RATIO=0.10        # 未命中规则保留比例（0~1，默认取 sampling_rate_whitelist）
+#   EDR_PREPROCESS_L3_PRESSURE=1             # 启用总线高压分流
+#   EDR_PREPROCESS_L3_HIGH_PCT=90            # 进入高压模式阈值
+#   EDR_PREPROCESS_L3_RECOVER_PCT=70         # 退出高压模式阈值（滞回）
+#   EDR_PREPROCESS_L3_DROP_PERMILLE=800      # 高压下低价值事件丢弃千分比（0~1000）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
 rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
 
@@ -133,6 +140,12 @@ max_log_files        = 10
 # job_object_windows              = false
 # watchdog_log_interval_s         = 0
 # event_bus_pressure_warn_pct     = 90
+#
+# Windows 签名白名单（Stage0）可通过环境变量补充可信厂商关键词（逗号分隔，大小写不敏感）：
+#   EDR_AVE_TRUSTED_VENDOR_KEYWORDS="tencent,aliyun,huawei,qihoo,360,total defense,kingsoft,beijing huorong,"
+#   "sangfor,dbappsecurity,venustech,topsec,nsfocus,beyondtrust,citrix,zoom,slack,notion,microsoft,google,mozilla,"
+#   "adobe,oracle,intel,amd,nvidia,apple,dell,lenovo,hp,ibm,sap"
+# 建议：先在灰度环境按你们资产画像裁剪，再全量推广。
 
 # §10 联邦学习（T-015 frozen_layers）：与 `docs/FL_ROUND_TRAINING_SEMANTICS.md` 一致；默认关闭。
 # [fl]
