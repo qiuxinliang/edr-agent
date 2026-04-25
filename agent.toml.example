@@ -61,6 +61,7 @@ sampling_rate_whitelist = 0.1
 #   EDR_PREPROCESS_L3_HIGH_PCT=90            # 进入高压模式阈值
 #   EDR_PREPROCESS_L3_RECOVER_PCT=70         # 退出高压模式阈值（滞回）
 #   EDR_PREPROCESS_L3_DROP_PERMILLE=800      # 高压下低价值事件丢弃千分比（0~1000）
+#   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
 rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
 

@@ -48,6 +48,8 @@ static uint32_t s_l3_drop_permille;
 static int s_l3_pressure_active;
 static uint32_t s_drop_l2_unmatched;
 static uint32_t s_drop_l3_pressure;
+static int s_strict_behavior_gate_enabled;
+static uint32_t s_drop_strict_behavior_gate;
 static uint32_t s_rng_state = 0x12345678u;
 
 /** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 gRPC endpoint_id 一致） */
@@ -169,6 +171,9 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
   s_l3_pressure_active = 0;
   s_drop_l2_unmatched = 0u;
   s_drop_l3_pressure = 0u;
+  s_strict_behavior_gate_enabled =
+      getenv_int_default("EDR_PREPROCESS_STRICT_BEHAVIOR_GATE", 0) == 1 ? 1 : 0;
+  s_drop_strict_behavior_gate = 0u;
   if (cfg) {
     s_rng_state ^= cfg->collection.max_event_queue_size;
     s_rng_state ^= cfg->upload.batch_max_events << 1;
@@ -258,6 +263,11 @@ static void *preprocess_main(void *arg) {
     uint32_t n = edr_event_bus_try_pop_many(s_bus, slots, EDR_PREPROCESS_POP_BURST);
     if (n > 0u) {
       for (uint32_t i = 0; i < n; i++) {
+        if (s_strict_behavior_gate_enabled &&
+            !slot_is_behavior_engine_process_event(&slots[i])) {
+          s_drop_strict_behavior_gate++;
+          continue;
+        }
         if (s_l3_pressure_active && !slot_is_high_value(&slots[i])) {
           if (!rng_hit_permille(1000u - s_l3_drop_permille)) {
             s_drop_l3_pressure++;
@@ -397,9 +407,11 @@ void edr_preprocess_stop(void) {
 #endif
   s_bus = NULL;
   s_preprocess_active = 0;
-  if (s_drop_l2_unmatched > 0u || s_drop_l3_pressure > 0u) {
-    fprintf(stderr, "[preprocess/l2l3] l2_unmatched_drop=%u l3_pressure_drop=%u\n",
-            s_drop_l2_unmatched, s_drop_l3_pressure);
+  if (s_drop_l2_unmatched > 0u || s_drop_l3_pressure > 0u ||
+      s_drop_strict_behavior_gate > 0u) {
+    fprintf(stderr,
+            "[preprocess/l2l3] strict_behavior_gate_drop=%u l2_unmatched_drop=%u l3_pressure_drop=%u\n",
+            s_drop_strict_behavior_gate, s_drop_l2_unmatched, s_drop_l3_pressure);
   }
   edr_event_batch_shutdown();
   edr_emit_rules_configure(NULL);
