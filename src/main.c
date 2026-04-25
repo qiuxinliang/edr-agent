@@ -12,6 +12,7 @@
 #include "edr/pmfe.h"
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
+#include "edr/edr_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +99,11 @@ static void print_usage(const char *prog) {
           "环境变量:\n"
           "  EDR_CONSOLE_HEARTBEAT_SEC   控制台 [heartbeat] 间隔（秒）；0=关闭；未设置则用 agent.toml\n"
           "                              的 [server] keepalive_interval_s（钳位 10~600）。\n"
+          "  EDR_AGENT_VERBOSE           1=详细 stderr（ONNX/传输/攻击面上报成功等，默认关）。\n"
+          "  EDR_AGENT_SHUTDOWN_LOG      1=退出时打印 [preprocess]/[grpc] 等统计行（默认同关，\n"
+          "                              与 EDR_AGENT_VERBOSE=1 时也会打印）。\n"
+          "  EDR_SHELCODE_LOG            1=壳代码/WinDivert 逐包与 pcap 提示（细粒度，默认同上）。\n"
+          "  EDR_NO_CONSOLE_UTF8=1        (仅 Windows) 不切换控制台为 UTF-8 代码页。\n"
           "\n",
           name, name);
 #ifdef _WIN32
@@ -121,15 +127,40 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
-  /* 控制台/管道默认常为一页 GBK(936)。需同时：① conhost 代码页 ② UCRT 窄字符与 UTF-8 对齐（/utf-8 源文件下）。设 EDR_NO_CONSOLE_UTF8=1 可禁用。 */
   {
     const char *nou8 = getenv("EDR_NO_CONSOLE_UTF8");
     if (!nou8 || strcmp(nou8, "1") != 0) {
-      (void)SetConsoleOutputCP(CP_UTF8);
-      (void)SetConsoleCP(CP_UTF8);
-      /* Windows 10 1803+ UCRT：与 SetConsole*CP(65001) 配套，减少 fprintf(stderr, 中文) 仍乱码 */
-      if (!setlocale(LC_ALL, ".UTF-8")) {
-        (void)setlocale(LC_CTYPE, ".utf8");
+      (void)SetConsoleOutputCP(65001);
+      (void)SetConsoleCP(65001);
+      {
+        static const char *loc_cands[] = {".UTF-8", ".utf8", "C.UTF-8", "C.utf8", "en_US.UTF-8", "zh_CN.UTF-8", NULL};
+        int loc_set = 0;
+        for (int li = 0; loc_cands[li] && !loc_set; li++) {
+          if (setlocale(LC_ALL, loc_cands[li])) {
+            loc_set = 1;
+          }
+        }
+        if (!loc_set) {
+          (void)setlocale(LC_CTYPE, ".utf8");
+        }
+      }
+      (void)fflush(stdout);
+      (void)fflush(stderr);
+      {
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        if (h && h != INVALID_HANDLE_VALUE) {
+          DWORD m = 0;
+          if (GetConsoleMode(h, &m)) {
+            (void)SetConsoleMode(h, m | 0x0004u);
+          }
+        }
+        h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (h && h != INVALID_HANDLE_VALUE) {
+          DWORD m = 0;
+          if (GetConsoleMode(h, &m)) {
+            (void)SetConsoleMode(h, m | 0x0004u);
+          }
+        }
       }
     }
   }
@@ -223,7 +254,7 @@ int main(int argc, char **argv) {
     }
   }
   e = edr_agent_run(agent);
-  {
+  if (edr_log_want_shutdown_stats()) {
     uint64_t dd = 0, rr = 0;
     edr_dedup_get_stats(&dd, &rr);
     fprintf(stderr,

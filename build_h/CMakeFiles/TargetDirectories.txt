@@ -1,0 +1,5 @@
+/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_h/CMakeFiles/edr_agent.dir
+/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_h/CMakeFiles/edr_monitor.dir
+/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_h/CMakeFiles/test.dir
+/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_h/CMakeFiles/edit_cache.dir
+/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_h/CMakeFiles/rebuild_cache.dir

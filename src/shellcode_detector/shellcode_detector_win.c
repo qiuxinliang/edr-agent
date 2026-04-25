@@ -5,8 +5,6 @@
 #error "shellcode_detector_win.c is Windows-only"
 #endif
 
-#include <stdio.h>
-
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
@@ -41,6 +39,5 @@ void edr_shellcode_detector_shutdown(void) {
     return;
   }
   edr_windivert_capture_stop();
-  fprintf(stderr, "[shellcode_detector] 已关闭\n");
   s_active = 0;
 }

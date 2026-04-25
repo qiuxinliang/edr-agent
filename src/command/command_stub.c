@@ -7,9 +7,11 @@
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/grpc_client.h"
+#include "edr/ingest_http.h"
 #include "edr/pmfe.h"
 #include "edr/self_protect.h"
 #include "edr/sha256.h"
+#include "edr/edr_log.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -127,7 +129,13 @@ static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrComma
   if (!soar_want_report(sm)) {
     return;
   }
-  (void)edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+  int ok = -1;
+  if (edr_grpc_client_ready()) {
+    ok = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+  }
+  if (ok != 0 && edr_ingest_http_configured()) {
+    (void)edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+  }
 }
 
 static int parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
@@ -757,14 +765,14 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   const char *id = command_id ? command_id : "";
 
   if (streq(t, "noop") || streq(t, "ping")) {
-    fprintf(stderr, "[command] ok id=%s type=%s\n", id, t);
+    EDR_LOGV("[command] ok id=%s type=%s\n", id, t);
     s_handled++;
     soar_emit(id, sm, EdrCmdExecOk, 0, t);
     return;
   }
 
   if (streq(t, "echo")) {
-    fprintf(stderr, "[command] echo id=%s len=%zu\n", id, payload_len);
+    EDR_LOGV("[command] echo id=%s len=%zu\n", id, payload_len);
     if (payload && payload_len > 0u && payload_len < 4096u) {
       fwrite(payload, 1, payload_len, stderr);
       fputc('\n', stderr);

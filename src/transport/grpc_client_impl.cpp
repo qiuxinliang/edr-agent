@@ -2,6 +2,11 @@
 
 #include "edr/command.h"
 #include "edr/config.h"
+#include "edr/ingest_http.h"
+
+extern "C" {
+#include "edr/edr_log.h"
+}
 
 #include <cstring>
 
@@ -96,19 +101,21 @@ static bool grpc_client_connect_locked(const std::string &target) {
   s_upload_tb_inited = false;
   s_upload_token_bytes = 0.0;
 
-  if (s_insecure) {
-    fprintf(stderr, "[grpc] 非加密 gRPC: %s (ReportEvents + Subscribe", target.c_str());
-  } else if (!s_cert.empty() && !s_key.empty()) {
-    fprintf(stderr, "[grpc] mTLS 通道: %s (ReportEvents + Subscribe", target.c_str());
-  } else {
-    fprintf(stderr, "[grpc] TLS(仅验服务端) 通道: %s (ReportEvents + Subscribe", target.c_str());
+  if (edr_log_verbose()) {
+    if (s_insecure) {
+      fprintf(stderr, "[grpc] 非加密 gRPC: %s (ReportEvents + Subscribe", target.c_str());
+    } else if (!s_cert.empty() && !s_key.empty()) {
+      fprintf(stderr, "[grpc] mTLS 通道: %s (ReportEvents + Subscribe", target.c_str());
+    } else {
+      fprintf(stderr, "[grpc] TLS(仅验服务端) 通道: %s (ReportEvents + Subscribe", target.c_str());
+    }
+    if (s_max_upload_mbps > 0u) {
+      fprintf(stderr, "；上传节流 max_upload_mbps=%u", (unsigned)s_max_upload_mbps);
+    } else {
+      fprintf(stderr, "；上传节流关闭（max_upload_mbps=0）");
+    }
+    fprintf(stderr, ")\n");
   }
-  if (s_max_upload_mbps > 0u) {
-    fprintf(stderr, "；上传节流 max_upload_mbps=%u", (unsigned)s_max_upload_mbps);
-  } else {
-    fprintf(stderr, "；上传节流关闭（max_upload_mbps=0）");
-  }
-  fprintf(stderr, ")\n");
 
   s_sub_stop = false;
   s_sub_thr = std::thread(subscribe_thread_main, s_endpoint_id);
@@ -192,8 +199,10 @@ static void subscribe_thread_main(std::string endpoint_id) {
         }
         grpc::Status st = reader->Finish();
         if (!st.ok() && st.error_code() != grpc::StatusCode::CANCELLED) {
-          fprintf(stderr, "[grpc] Subscribe 流结束: %d %s\n", (int)st.error_code(),
-                  st.error_message().c_str());
+          if (edr_log_verbose()) {
+            fprintf(stderr, "[grpc] Subscribe 流结束: %d %s\n", (int)st.error_code(),
+                    st.error_message().c_str());
+          }
         }
       }
       s_sub_ctx.reset();
@@ -201,7 +210,9 @@ static void subscribe_thread_main(std::string endpoint_id) {
     if (s_sub_stop.load()) {
       break;
     }
-    fprintf(stderr, "[grpc] Subscribe %u ms 后重连…\n", backoff_ms);
+    if (edr_log_verbose()) {
+      fprintf(stderr, "[grpc] Subscribe %u ms 后重连…\n", backoff_ms);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     backoff_ms = std::min<unsigned>(backoff_ms * 2, 60000u);
   }
@@ -215,7 +226,9 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
 
   std::string target(cfg->server.address);
   if (target.empty()) {
-    fprintf(stderr, "[grpc] server.address 为空，跳过 gRPC\n");
+    if (edr_log_verbose()) {
+      fprintf(stderr, "[grpc] server.address 为空，跳过 gRPC\n");
+    }
     return;
   }
 
@@ -445,14 +458,32 @@ extern "C" unsigned long edr_grpc_client_rpc_ok(void) { return s_rpc_ok.load(); 
 
 extern "C" unsigned long edr_grpc_client_rpc_fail(void) { return s_rpc_fail.load(); }
 
+static int edr_try_ingest_http_file_upload(const char *file_path, const char *sha256_hex, char *out_minio_key,
+                                            size_t out_minio_key_cap) {
+  if (!edr_ingest_http_configured()) {
+    return -1;
+  }
+  return edr_ingest_http_upload_file_multipart(nullptr, file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+}
+
 extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *file_path, const char *sha256_hex,
                                            char *out_minio_key, size_t out_minio_key_cap) {
+  (void)alert_id;
   std::lock_guard<std::mutex> lock(s_mu);
   if (out_minio_key && out_minio_key_cap > 0u) {
     out_minio_key[0] = '\0';
   }
-  if (!s_stub || !file_path || !file_path[0]) {
+  if (!file_path || !file_path[0]) {
     return -1;
+  }
+  if (!s_stub) {
+    int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+    if (hr == 0) {
+      s_rpc_ok++;
+    } else {
+      s_rpc_fail++;
+    }
+    return hr;
   }
   std::ifstream f(file_path, std::ios::binary);
   if (!f) {
@@ -470,7 +501,13 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
   edr::v1::UploadResult resp;
   std::unique_ptr<grpc::ClientWriter<edr::v1::FileChunk>> wr = s_stub->UploadFile(&ctx, &resp);
   if (!wr) {
-    return -1;
+    int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+    if (hr == 0) {
+      s_rpc_ok++;
+    } else {
+      s_rpc_fail++;
+    }
+    return hr;
   }
 
   std::string name = file_path;
@@ -510,16 +547,26 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
       (void)wr->WritesDone();
       grpc::Status st = wr->Finish();
       (void)st;
-      s_rpc_fail++;
-      return -1;
+      int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+      if (hr == 0) {
+        s_rpc_ok++;
+      } else {
+        s_rpc_fail++;
+      }
+      return hr;
     }
     offset += (uint64_t)n;
   }
   (void)wr->WritesDone();
   grpc::Status st = wr->Finish();
   if (!st.ok() || !resp.success()) {
-    s_rpc_fail++;
-    return -1;
+    int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+    if (hr == 0) {
+      s_rpc_ok++;
+    } else {
+      s_rpc_fail++;
+    }
+    return hr;
   }
   if (out_minio_key && out_minio_key_cap > 0u) {
     snprintf(out_minio_key, out_minio_key_cap, "%s", resp.minio_key().c_str());

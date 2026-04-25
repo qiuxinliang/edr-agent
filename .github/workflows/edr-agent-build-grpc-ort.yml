@@ -17,6 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
@@ -31,13 +32,13 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - name: Prepare vcpkg cache directories
         working-directory: ${{ github.workspace }}
         shell: pwsh

@@ -10,6 +10,7 @@
 
 #include "edr/ave.h"
 #include "edr/config.h"
+#include "edr/edr_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -628,7 +629,7 @@ static void bind_static_spec_outputs(OrtSession *sess) {
   }
   if (g_out_spec_verdict && g_out_spec_family && g_out_spec_packer) {
     g_static_spec_triple = 1;
-    fprintf(stderr, "[ave/onnx] static triple outputs (spec 7.2): %s / %s / %s\n", g_out_spec_verdict,
+    EDR_LOGV("[ave/onnx] static triple outputs (spec 7.2): %s / %s / %s\n", g_out_spec_verdict,
             g_out_spec_family, g_out_spec_packer);
   }
 }
@@ -717,7 +718,7 @@ EdrError edr_onnx_runtime_load(const char *onnx_path, const EdrConfig *cfg) {
     return ce;
   }
   bind_static_spec_outputs(g_session);
-  fprintf(stderr, "[ave/onnx] static ONNX loaded path=%s ndim=%d nelem=%lld triple=%d\n", onnx_path, g_in_ndim,
+  EDR_LOGV("[ave/onnx] static ONNX loaded path=%s ndim=%d nelem=%lld triple=%d\n", onnx_path, g_in_ndim,
           (long long)g_in_nelem, g_static_spec_triple);
   snprintf(g_static_model_path, sizeof(g_static_model_path), "%s", onnx_path);
   copy_static_tag(onnx_path);
@@ -761,7 +762,7 @@ EdrError edr_onnx_behavior_load(const char *behavior_onnx_path, const EdrConfig 
   bind_behavior_outputs(g_beh_session);
   copy_behavior_tag(behavior_onnx_path);
   snprintf(g_beh_model_path, sizeof(g_beh_model_path), "%s", behavior_onnx_path);
-  fprintf(stderr, "[ave/onnx] behavior ONNX loaded path=%s ndim=%d nelem=%lld dual_tactic=%d\n", behavior_onnx_path,
+  EDR_LOGV("[ave/onnx] behavior ONNX loaded path=%s ndim=%d nelem=%lld dual_tactic=%d\n", behavior_onnx_path,
           g_beh_in_ndim, (long long)g_beh_in_nelem, g_beh_dual_out);
   g_beh_ready = 1;
   return EDR_OK;

@@ -1,6 +1,7 @@
 /* §21 PMFE：预处理阶段自动入队 — Windows：ETW shellcode；Linux：`EDR_PMFE_ETW_AUTO` + webshell 检测 */
 
 #include "edr/pmfe.h"
+#include "edr/edr_log.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -120,7 +121,7 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
   }
   EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
   if (edr_pmfe_submit_etw_scan_ex("webshell", br->pid, band, 0) == 0) {
-    fprintf(stderr, "[pmfe][pre] linux auto_queued webshell pid=%u band=%u\n", (unsigned)br->pid, (unsigned)band);
+    EDR_LOGV("[pmfe][pre] linux auto_queued webshell pid=%u band=%u\n", (unsigned)br->pid, (unsigned)band);
   }
 #elif defined(_WIN32)
   const char *en = getenv("EDR_PMFE_ETW_AUTO");
@@ -170,7 +171,7 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
   EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
 
   if (edr_pmfe_submit_etw_scan_ex("shellcode", target, band, hint_va) == 0) {
-    fprintf(stderr, "[pmfe][etw] auto_queued shellcode score=%.4f target_pid=%u band=%u hint=0x%llx\n", score,
+    EDR_LOGV("[pmfe][etw] auto_queued shellcode score=%.4f target_pid=%u band=%u hint=0x%llx\n", score,
             (unsigned)target, (unsigned)band, (unsigned long long)hint_va);
   }
 #else

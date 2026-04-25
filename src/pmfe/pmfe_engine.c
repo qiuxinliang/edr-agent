@@ -16,6 +16,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #endif
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
+#include "edr/edr_log.h"
 #include "edr/error.h"
 #include "edr/sha256.h"
 
@@ -118,7 +119,7 @@ static uint32_t s_etw_cd_pid[PMFE_ETW_CD_CAP];
 static uint64_t s_etw_cd_ms[PMFE_ETW_CD_CAP];
 
 static void audit_pmfe_line(const char *cmd_id, const char *msg) {
-  fprintf(stderr, "[pmfe][audit] id=%s %s\n", cmd_id ? cmd_id : "", msg);
+  EDR_LOGV("[pmfe][audit] id=%s %s\n", cmd_id ? cmd_id : "", msg);
   const char *ap = getenv("EDR_CMD_AUDIT_PATH");
   if (!ap || !ap[0]) {
     return;
@@ -1725,7 +1726,7 @@ static void pmfe_worker_body(void) {
     if (detail[0] == '\0') {
       snprintf(detail, sizeof(detail), "pid=%u scan_failed", task.pid);
     }
-    fprintf(stderr, "[pmfe] scan_done %s\n", detail);
+    EDR_LOGV("[pmfe] scan_done %s\n", detail);
     audit_pmfe_line(task.cmd_id[0] ? task.cmd_id : "-", detail);
     edr_pid_history_pmfe_ingest_scan_detail(task.pid, detail);
     pmfe_try_emit_scan_result(&task, detail);
@@ -1865,7 +1866,7 @@ void edr_pmfe_on_process_lifecycle_hint(void) {}
 EdrError edr_pmfe_init(void) {
   const char *dis = getenv("EDR_PMFE_DISABLED");
   if (dis && dis[0] == '1') {
-    fprintf(stderr, "[pmfe] disabled (EDR_PMFE_DISABLED=1)\n");
+    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_DISABLED=1)\n");
     return EDR_OK;
   }
 #ifdef _WIN32
@@ -1954,8 +1955,8 @@ EdrError edr_pmfe_init(void) {
   }
 #endif
   edr_pid_history_pmfe_init();
-  fprintf(stderr, "[pmfe] init workers=%d queue=%d (listen_table: 60s + deferred; Windows/Linux)\n", PMFE_NUM_WORKERS,
-          PMFE_TASK_CAP);
+  EDR_LOGV("[pmfe] init workers=%d queue=%d (listen_table: 60s + deferred; Windows/Linux)\n", PMFE_NUM_WORKERS,
+           PMFE_TASK_CAP);
   return EDR_OK;
 }
 
@@ -2006,11 +2007,11 @@ void edr_pmfe_shutdown(void) {
   __atomic_store_n(&s_inited, 0, __ATOMIC_RELEASE);
 #endif
 #ifdef _WIN32
-  fprintf(stderr, "[pmfe] shutdown submitted=%ld completed=%ld dropped=%ld\n", (long)s_stat_submitted,
+  EDR_LOGV("[pmfe] shutdown submitted=%ld completed=%ld dropped=%ld\n", (long)s_stat_submitted,
           (long)s_stat_completed, (long)s_stat_dropped);
 #else
-  fprintf(stderr, "[pmfe] shutdown submitted=%lu completed=%lu dropped=%lu\n",
-          (unsigned long)s_stat_submitted, (unsigned long)s_stat_completed, (unsigned long)s_stat_dropped);
+  EDR_LOGV("[pmfe] shutdown submitted=%lu completed=%lu dropped=%lu\n", (unsigned long)s_stat_submitted,
+           (unsigned long)s_stat_completed, (unsigned long)s_stat_dropped);
 #endif
   edr_pid_history_pmfe_shutdown();
 }

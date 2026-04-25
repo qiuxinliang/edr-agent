@@ -10,6 +10,7 @@
 #include "edr/grpc_client.h"
 #include "edr/types.h"
 #include "edr/webshell_forensic.h"
+#include "edr/edr_log.h"
 
 #include <direct.h>
 #include <io.h>
@@ -285,8 +286,8 @@ static int yara_compile_cb(int level, const char *file_name, int line_number, co
   (void)level;
   (void)rule;
   (void)user_data;
-  fprintf(stderr, "[webshell_detector] yara compile error file=%s line=%d msg=%s\n", file_name ? file_name : "-",
-          line_number, msg ? msg : "-");
+  EDR_LOGE("[webshell_detector] yara compile error file=%s line=%d msg=%s\n", file_name ? file_name : "-", line_number,
+          msg ? msg : "-");
   return 0;
 }
 
@@ -366,7 +367,7 @@ static int load_yara(const char *dir) {
     return -1;
   }
   yr_compiler_destroy(c);
-  fprintf(stderr, "[webshell_detector] yara rules loaded=%d from %s\n", loaded, dir);
+  EDR_LOGV("[webshell_detector] yara rules loaded=%d from %s\n", loaded, dir);
   return loaded;
 }
 #endif
@@ -540,7 +541,7 @@ static void handle_change(const char *full_path, const char *action) {
     return;
   }
   push_alert(full_path, action, root, &m);
-  fprintf(stderr, "[webshell_detector] alert %.2f rule=%s file=%s\n", m.confidence, m.rule_name, full_path);
+  EDR_LOGV("[webshell_detector] alert %.2f rule=%s file=%s\n", m.confidence, m.rule_name, full_path);
 }
 
 static DWORD WINAPI watch_thread_main(LPVOID param) {
@@ -604,12 +605,12 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
   s_bus = bus;
   discover_web_roots();
   if (s_root_count == 0u) {
-    fprintf(stderr, "[webshell_detector] no web roots discovered; set EDR_WEBSHELL_ROOTS to enable\n");
+    EDR_LOGE("%s", "[webshell_detector] no web roots discovered; set EDR_WEBSHELL_ROOTS to enable\n");
     return EDR_OK;
   }
 #ifdef EDR_HAVE_YARA
   if (load_yara(cfg->webshell_detector.webshell_rules_dir) < 0) {
-    fprintf(stderr, "[webshell_detector] yara unavailable, fallback to builtin rules\n");
+    EDR_LOGV("%s", "[webshell_detector] yara unavailable, fallback to builtin rules\n");
   }
 #endif
   InterlockedExchange(&s_stop, 0);
@@ -641,7 +642,7 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
     return EDR_OK;
   }
   s_started = 1;
-  fprintf(stderr, "[webshell_detector] Windows watcher started roots=%zu watches=%zu\n", s_root_count, s_watch_count);
+  EDR_LOGV("[webshell_detector] Windows watcher started roots=%zu watches=%zu\n", s_root_count, s_watch_count);
   return EDR_OK;
 }
 

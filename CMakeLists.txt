@@ -67,6 +67,36 @@ option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAK
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 
 find_package(OpenSSL QUIET)
+
+# libcurl：ingest HTTP 内嵌 POST。
+# - gRPC 未启用/不可用时：HTTP 为唯一上送/回执路径，必须 find 到 libcurl，禁止仅依赖系统 curl 可执行文件。
+# - gRPC 可用时：libcurl 可选，未找到则 ingest 在运行时可回退到 popen(curl)。
+set(EDR_LIBCURL_AVAILABLE 0)
+if(EDR_GRPC_CLIENT_AVAILABLE)
+  find_package(CURL CONFIG QUIET)
+  if(NOT TARGET CURL::libcurl)
+    find_package(CURL QUIET)
+  endif()
+  if(TARGET CURL::libcurl)
+    set(EDR_LIBCURL_AVAILABLE 1)
+  endif()
+  message(STATUS "edr_agent: libcurl = ${EDR_LIBCURL_AVAILABLE} (0=ingest 可回退到 curl 子进程)")
+else()
+  find_package(CURL CONFIG QUIET)
+  if(NOT TARGET CURL::libcurl)
+    find_package(CURL REQUIRED)
+  endif()
+  if(TARGET CURL::libcurl)
+    set(EDR_LIBCURL_AVAILABLE 1)
+  else()
+    message(
+      FATAL_ERROR
+        "gRPC 未启用或未找到，但未能找到 libcurl。无 gRPC 的 edr_agent 必须链接 libcurl，不能只在运行时依赖 curl 可执行文件。请：\n"
+        "  使用 vcpkg 时在 vcpkg.json 中包含 curl，并传入 -DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake；或\n"
+        "  安装系统 libcurl 开发包，并令 find_package(CURL) 能解析到目标 CURL::libcurl。")
+  endif()
+  message(STATUS "edr_agent: libcurl = 必须 (gRPC 关)")
+endif()
 set(EDR_LIBTORCH_AVAILABLE 0)
 if(EDR_WITH_LIBTORCH)
   list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}" "$ENV{TORCH_ROOT}")
@@ -104,6 +134,7 @@ endif()
 set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
+  src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c
   src/config/config.c
@@ -315,6 +346,18 @@ endif()
 
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
 
+# Windows、单配置生成器（Ninja/Unix Makefiles）时，可执行档默认在 build/ 根下；而 Inno/CI/zip
+# 约定为 build/Release/（与 VS 多配置一致）。统一输出到 build/<配置名>/ 避免「未找到 edr_agent.exe」。
+if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES)
+  if(CMAKE_BUILD_TYPE)
+    set(_EDR_WIN_RUNTIME_DIR "${CMAKE_BINARY_DIR}/${CMAKE_BUILD_TYPE}")
+  else()
+    set(_EDR_WIN_RUNTIME_DIR "${CMAKE_BINARY_DIR}/Release")
+  endif()
+  set_target_properties(edr_agent PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}")
+  message(STATUS "edr_agent: WIN32 single-config → RUNTIME_OUTPUT_DIRECTORY=${_EDR_WIN_RUNTIME_DIR}")
+endif()
+
 target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ave
@@ -381,6 +424,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4
   )
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LZ4=1)
+endif()
+
+if(EDR_LIBCURL_AVAILABLE)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LIBCURL=1)
+  target_link_libraries(edr_agent PRIVATE CURL::libcurl)
+endif()
+
+if(NOT EDR_GRPC_CLIENT_AVAILABLE)
+  target_compile_definitions(edr_agent PRIVATE EDR_NO_GRPC_CLIENT=1)
 endif()
 
 if(EDR_GRPC_CLIENT_AVAILABLE)
@@ -500,6 +552,10 @@ else()
   target_compile_definitions(edr_monitor PRIVATE EDR_OS_POSIX=1)
 endif()
 
+if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES AND DEFINED _EDR_WIN_RUNTIME_DIR)
+  set_target_properties(edr_monitor PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}")
+endif()
+
 # 精简仓库未包含 tests/ 时默认关闭单元测试，避免 CMake 找不到 tests/*.c。
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ave_fp.c")
   set(_EDR_DEFAULT_BUILD_TESTS ON)
@@ -557,6 +613,7 @@ set(_edr_test_behavior_emit_sources
   src/transport/transport_stub.c
   src/transport/grpc_client_stub.c
   src/core/time_util.c
+  src/core/edr_log.c
   src/storage/queue_sqlite.c
   tests/stub_preprocess_agent_ids.c
 )

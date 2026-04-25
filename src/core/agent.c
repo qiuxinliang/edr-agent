@@ -33,6 +33,7 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/transport_sink.h"
+#include "edr/edr_log.h"
 
 #include "ave_onnx_infer.h"
 
@@ -78,15 +79,21 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
     snprintf(grpc_diag, sizeof(grpc_diag), "%s", "-");
   }
   edr_ave_get_scan_counts(&ave_mf, &ave_nf, &ave_dir);
-  fprintf(stderr,
-          "[heartbeat] grpc_ready=%d grpc_diag=%s http_ingest=%d batches=%lu target=%s rpc_ok=%lu "
-          "rpc_fail=%lu wire_events=%lu wire_bytes=%lu "
-          "ave_model_files=%d ave_dir_ready=%d onnx_static_ready=%d onnx_behavior_ready=%d\n",
-          edr_grpc_client_ready(), grpc_diag, edr_ingest_http_configured(),
-          edr_transport_batch_count(), agent->cfg.server.address, edr_grpc_client_rpc_ok(),
-          edr_grpc_client_rpc_fail(), edr_transport_wire_events_count(),
-          edr_transport_wire_bytes_count(), ave_mf, ave_dir, edr_onnx_runtime_ready(),
-          edr_onnx_behavior_ready());
+  if (edr_log_verbose()) {
+    fprintf(stderr,
+            "[heartbeat] grpc_ready=%d grpc_diag=%s http_ingest=%d batches=%lu target=%s rpc_ok=%lu "
+            "rpc_fail=%lu wire_events=%lu wire_bytes=%lu "
+            "ave_model_files=%d ave_dir_ready=%d onnx_static_ready=%d onnx_behavior_ready=%d\n",
+            edr_grpc_client_ready(), grpc_diag, edr_ingest_http_configured(),
+            edr_transport_batch_count(), agent->cfg.server.address, edr_grpc_client_rpc_ok(),
+            edr_grpc_client_rpc_fail(), edr_transport_wire_events_count(),
+            edr_transport_wire_bytes_count(), ave_mf, ave_dir, edr_onnx_runtime_ready(),
+            edr_onnx_behavior_ready());
+  } else {
+    fprintf(stderr,
+            "[heartbeat] grpc=%d http=%d batches=%lu\n", edr_grpc_client_ready(), edr_ingest_http_configured(),
+            edr_transport_batch_count());
+  }
   fflush(stderr);
 }
 
@@ -137,7 +144,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       char fp[80];
       edr_config_fingerprint(load_path, fp, sizeof(fp));
       if (fp[0]) {
-        fprintf(stderr, "[config] fingerprint=%s path=%s\n", fp, load_path);
+        EDR_LOGV("[config] fingerprint=%s path=%s\n", fp, load_path);
       }
     }
   }
@@ -222,9 +229,9 @@ EdrError edr_agent_run(EdrAgent *agent) {
         char d[256];
         int sr = edr_attack_surface_execute("agent_start", &agent->cfg, d, sizeof(d));
         if (sr != 0) {
-          fprintf(stderr, "[attack_surface] startup snapshot failed: %s\n", d);
+          EDR_LOGE("[attack_surface] startup snapshot failed: %s\n", d);
         } else if (strncmp(d, "uploaded_", 9) == 0) {
-          fprintf(stderr, "[attack_surface] startup %s\n", d);
+          EDR_LOGV("[attack_surface] startup %s\n", d);
         }
       }
       {
@@ -312,9 +319,9 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
         char d[256];
         int sr = edr_attack_surface_execute("config_reload", &agent->cfg, d, sizeof(d));
         if (sr != 0) {
-          fprintf(stderr, "[attack_surface] config_reload POST failed: %s\n", d);
+          EDR_LOGE("[attack_surface] config_reload POST failed: %s\n", d);
         } else if (strncmp(d, "uploaded_", 9) == 0) {
-          fprintf(stderr, "[attack_surface] config_reload %s\n", d);
+          EDR_LOGV("[attack_surface] config_reload %s\n", d);
         }
       }
     }
@@ -324,11 +331,11 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
         fprintf(stderr, "[ave] AVE_SyncFromEdrConfig 失败: %d\n", av);
       }
     }
-    fprintf(stderr, "[config] 热重载: preprocessing + resource_limit + self_protect + attack_surface tick + ave\n");
+    EDR_LOGV("%s", "[config] 热重载: preprocessing + resource_limit + self_protect + attack_surface tick + ave\n");
     char fp[80];
     edr_config_fingerprint(agent->config_path, fp, sizeof(fp));
     if (fp[0]) {
-      fprintf(stderr, "[config] 热重载 fingerprint=%s\n", fp);
+      EDR_LOGV("[config] 热重载 fingerprint=%s\n", fp);
     }
   }
 }
@@ -395,9 +402,9 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
       char d[256];
       int sr = edr_attack_surface_execute("config_reload", &agent->cfg, d, sizeof(d));
       if (sr != 0) {
-        fprintf(stderr, "[attack_surface] remote config_reload POST failed: %s\n", d);
+        EDR_LOGE("[attack_surface] remote config_reload POST failed: %s\n", d);
       } else if (strncmp(d, "uploaded_", 9) == 0) {
-        fprintf(stderr, "[attack_surface] remote config_reload %s\n", d);
+        EDR_LOGV("[attack_surface] remote config_reload %s\n", d);
       }
     }
   }
@@ -412,11 +419,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
       fprintf(stderr, "[ave] AVE_SyncFromEdrConfig(远程) 失败: %d\n", av);
     }
   }
-  fprintf(stderr, "[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave");
-  if (fp[0]) {
-    fprintf(stderr, " fingerprint=%s", fp);
-  }
-  fprintf(stderr, "\n");
+  EDR_LOGV("[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave%s%s\n",
+           fp[0] ? " fingerprint=" : "", fp[0] ? fp : "");
 }
 
 /**
@@ -456,11 +460,11 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
       char detail[256];
       int r = edr_attack_surface_execute("etw_tcpip_wf", cfg, detail, sizeof(detail));
       if (r != 0) {
-        fprintf(stderr, "[attack_surface] etw_tcpip_wf failed: %s\n", detail);
+        EDR_LOGE("[attack_surface] etw_tcpip_wf failed: %s\n", detail);
       } else if (strncmp(detail, "uploaded_", 9) == 0) {
         agent->asurf_last_post_ns = now;
         asurf_may_post = 0;
-        fprintf(stderr, "[attack_surface] etw_tcpip_wf %s\n", detail);
+        EDR_LOGV("[attack_surface] etw_tcpip_wf %s\n", detail);
       }
     }
   }
@@ -481,11 +485,11 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
       char detail[256];
       int r = edr_attack_surface_execute("refresh_request", cfg, detail, sizeof(detail));
       if (r != 0) {
-        fprintf(stderr, "[attack_surface] refresh_request failed: %s\n", detail);
+        EDR_LOGE("[attack_surface] refresh_request failed: %s\n", detail);
       } else if (strncmp(detail, "uploaded_", 9) == 0) {
         agent->asurf_last_post_ns = now;
         asurf_may_post = 0;
-        fprintf(stderr, "[attack_surface] refresh_request %s\n", detail);
+        EDR_LOGV("[attack_surface] refresh_request %s\n", detail);
       }
     }
   }
@@ -498,10 +502,10 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   char detail[256];
   int r = edr_attack_surface_execute("periodic_attack_surface", cfg, detail, sizeof(detail));
   if (r != 0) {
-    fprintf(stderr, "[attack_surface] periodic failed: %s\n", detail);
+    EDR_LOGE("[attack_surface] periodic failed: %s\n", detail);
     return;
   }
   if (strncmp(detail, "uploaded_", 9) == 0) {
-    fprintf(stderr, "[attack_surface] periodic %s\n", detail);
+    EDR_LOGV("[attack_surface] periodic %s\n", detail);
   }
 }

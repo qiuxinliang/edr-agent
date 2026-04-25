@@ -1,6 +1,7 @@
 /* §21 PMFE（Linux）：`ss -ltnp` 监听聚合 + `/proc` 有效用户 + 关键进程名 — 对齐 §2.2.4（无 Windows 服务规则） */
 
 #include "edr/pmfe.h"
+#include "edr/edr_log.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -210,7 +211,7 @@ void edr_pmfe_listen_table_refresh(void) {
   if (truncated) {
     const char *q = getenv("EDR_PMFE_LISTEN_TRUNC_QUIET");
     if (!q || q[0] != '1') {
-      fprintf(stderr, "[pmfe][listen] linux agg truncated (cap=%d), priority table may miss listeners\n", PMFE_LISTEN_CAP);
+      EDR_LOGE("[pmfe][listen] linux agg truncated (cap=%d), priority table may miss listeners\n", PMFE_LISTEN_CAP);
     }
   }
 }

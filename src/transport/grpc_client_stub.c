@@ -1,5 +1,6 @@
 /* gRPC 占位：无 libgRPC 或未链接 impl 时使用；SOAR ReportCommandResult 等 RPC 恒失败（-1），见 docs/SOAR_CONTRACT.md §5.1 */
 #include "edr/grpc_client.h"
+#include "edr/ingest_http.h"
 
 #include "edr/config.h"
 
@@ -52,10 +53,12 @@ int edr_grpc_client_report_command_result(const char *command_id,
 int edr_grpc_client_upload_file(const char *alert_id, const char *file_path, const char *sha256_hex,
                                 char *out_minio_key, size_t out_minio_key_cap) {
   (void)alert_id;
-  (void)file_path;
-  (void)sha256_hex;
   if (out_minio_key && out_minio_key_cap > 0u) {
     out_minio_key[0] = '\0';
   }
+  if (file_path && file_path[0] && edr_ingest_http_configured()) {
+    return edr_ingest_http_upload_file_multipart(NULL, file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+  }
+  (void)sha256_hex;
   return -1;
 }

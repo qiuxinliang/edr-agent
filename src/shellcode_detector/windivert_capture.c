@@ -22,6 +22,7 @@
 #include "edr/shellcode_known.h"
 #include "edr/shellcode_detector.h"
 #include "edr/types.h"
+#include "edr/edr_log.h"
 
 #include "windivert_abi.h"
 
@@ -373,16 +374,16 @@ static void log_windivert_service_hint(void) {
     }
     SERVICE_STATUS ss;
     if (QueryServiceStatus(svc, &ss)) {
-      fprintf(stderr, "[shellcode_detector] SCM service '%s' state=%lu (RUNNING=4)\n", names[i],
-              (unsigned long)ss.dwCurrentState);
+      EDR_LOGV_SHEL("[shellcode_detector] SCM service '%s' state=%lu (RUNNING=4)\n", names[i],
+                    (unsigned long)ss.dwCurrentState);
       CloseServiceHandle(svc);
       CloseServiceHandle(scm);
       return;
     }
     CloseServiceHandle(svc);
   }
-  fprintf(stderr,
-          "[shellcode_detector] no WinDivert service in SCM (driver may still load; WinDivertOpen will confirm)\n");
+  EDR_LOGV_SHEL("%s", "[shellcode_detector] no WinDivert service in SCM (driver may still load; WinDivertOpen will "
+                      "confirm)\n");
   CloseServiceHandle(scm);
 }
 
@@ -438,8 +439,8 @@ static int push_alert(double score, const char *detector_label, const char *rule
                       uint16_t dpt, uint16_t spt, const char *src, const char *dst, const uint8_t *evidence,
                       uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6) {
   if (!s_bus) {
-    fprintf(stderr, "[shellcode_detector] score=%.3f proto=%s %s:%u -> %s:%u (no event bus)\n", score, proto_label,
-            src, (unsigned)spt, dst, (unsigned)dpt);
+    EDR_LOGV_SHEL("[shellcode_detector] score=%.3f proto=%s %s:%u -> %s:%u (no event bus)\n", score, proto_label, src,
+                  (unsigned)spt, dst, (unsigned)dpt);
     return 0;
   }
   int wrote_pcap_ok = 0;
@@ -461,8 +462,8 @@ static int push_alert(double score, const char *detector_label, const char *rule
         forensic_kind = "ring";
         forensic_frames = s_ring_count;
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_ring_%llu_%lu", tsn, pid);
-        fprintf(stderr, "[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", pcap_path,
-                (unsigned)s_ring_count);
+        EDR_LOGV_SHEL("[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", pcap_path,
+                    (unsigned)s_ring_count);
       }
     } else if (ip_packet && ip_len > 0u) {
       snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
@@ -471,7 +472,7 @@ static int push_alert(double score, const char *detector_label, const char *rule
         wrote_pcap_ok = 1;
         forensic_kind = "single";
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_%llu_%lu", tsn, pid);
-        fprintf(stderr, "[shellcode_detector] wrote pcap %s\n", pcap_path);
+        EDR_LOGV_SHEL("[shellcode_detector] wrote pcap %s\n", pcap_path);
       }
     }
   }
@@ -732,7 +733,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) {
       s_wsa_started = 1;
     } else {
-      fprintf(stderr, "[shellcode_detector] WSAStartup failed (IPv6 地址显示可能异常)\n");
+      EDR_LOGE("[shellcode_detector] WSAStartup failed (IPv6 地址显示可能异常)\n");
     }
   }
   UINT64 flags = (UINT64)(WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
@@ -746,11 +747,11 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
   const char *wd_filter = kWdFilter;
   if (cfg->shellcode_detector.windivert_ports_is_custom && cfg->shellcode_detector.windivert_tcp_ports_parsed_count > 0u) {
     if (build_windivert_filter_string(cfg, s_wd_filter_dyn, sizeof(s_wd_filter_dyn)) != 0) {
-      fprintf(stderr, "[shellcode_detector] WinDivert 过滤器字符串过长，回退内置端口表\n");
+      EDR_LOGV_SHEL("%s", "[shellcode_detector] WinDivert 过滤器字符串过长，回退内置端口表\n");
     } else {
       wd_filter = s_wd_filter_dyn;
-      fprintf(stderr, "[shellcode_detector] WinDivert 自定义 TCP 端口数=%zu\n",
-              cfg->shellcode_detector.windivert_tcp_ports_parsed_count);
+      EDR_LOGV_SHEL("[shellcode_detector] WinDivert 自定义 TCP 端口数=%zu\n",
+                    cfg->shellcode_detector.windivert_tcp_ports_parsed_count);
     }
   }
   s_handle = s_open(wd_filter, (WINDIVERT_LAYER)0, pri, flags);
@@ -776,14 +777,14 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     size_t need = (size_t)slots * (size_t)s_ring_stride;
     s_ring_mem = (uint8_t *)calloc(1, need);
     if (!s_ring_mem) {
-      fprintf(stderr, "[shellcode_detector] ring buffer alloc failed (need %zu bytes), ring disabled\n", need);
+      EDR_LOGE("[shellcode_detector] ring buffer alloc failed (need %zu bytes), ring disabled\n", need);
     } else {
       s_ring_slots = slots;
       s_ring_w = 0;
       s_ring_r = 0;
       s_ring_count = 0;
-      fprintf(stderr, "[shellcode_detector] ring buffer: slots=%u max_pkt=%u (~%zu KiB)\n", slots, maxp,
-              (need + 1023u) / 1024u);
+      EDR_LOGV_SHEL("[shellcode_detector] ring buffer: slots=%u max_pkt=%u (~%zu KiB)\n", slots, maxp,
+                    (need + 1023u) / 1024u);
     }
   }
 
@@ -799,7 +800,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     s_wd_dll = NULL;
     return EDR_ERR_INTERNAL;
   }
-  fprintf(stderr, "[shellcode_detector] WinDivert 捕获线程已启动（SNIFF+RECV_ONLY）\n");
+  EDR_LOGV_SHEL("%s", "[shellcode_detector] WinDivert 捕获线程已启动（SNIFF+RECV_ONLY）\n");
   return EDR_OK;
 }
 

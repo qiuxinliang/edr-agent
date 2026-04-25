@@ -9,6 +9,7 @@ on:
   workflow_dispatch:
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -16,13 +17,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.10
       - name: Configure (no gRPC, Ninja, sccache)
         shell: pwsh
         run: |

@@ -5,6 +5,7 @@
 #include "edr/ingest_http.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
+#include "edr/edr_log.h"
 
 #include <stdio.h>
 #include <stddef.h>
@@ -33,7 +34,7 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
   }
   snprintf(s_target, sizeof(s_target), "%s", cfg->server.address);
   if (s_target[0]) {
-    fprintf(stderr, "[transport] gRPC target: %s\n", s_target);
+    EDR_LOGV("[transport] gRPC target: %s\n", s_target);
   }
   {
     const char *erb = getenv("EDR_PLATFORM_REST_BASE");
@@ -47,15 +48,20 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
         cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
     edr_ingest_http_configure(rb, tid, uid, bear, cfg->agent.endpoint_id, NULL);
     if (rb && rb[0]) {
-      fprintf(stderr, "[transport] HTTP ingest base: %s (EDR_EVENT_INGEST_SPLIT=1: split frames; "
-                      "gRPC fail->HTTP fallback when HTTP base set; EDR_EVENT_GRPC_FALLBACK_HTTP=0 to disable)\n",
-              rb);
+      fprintf(stderr, "[transport] HTTP ingest: %s\n", rb);
+      EDR_LOGV(
+          "%s",
+          "  (verbose) EDR_EVENT_INGEST_SPLIT=1 split; gRPC fail->HTTP if base set; EDR_EVENT_GRPC_FALLBACK_HTTP=0 disables fallback.\n");
     }
   }
   edr_grpc_client_init(cfg);
+  edr_ingest_http_start_command_poll();
 }
 
-void edr_transport_shutdown(void) { edr_grpc_client_shutdown(); }
+void edr_transport_shutdown(void) {
+  edr_ingest_http_stop_command_poll();
+  edr_grpc_client_shutdown();
+}
 
 static volatile unsigned long s_wire_events;
 static volatile unsigned long s_wire_bytes;
@@ -132,11 +138,9 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const u
           if (!s_logged_grpc_stub_http) {
             s_logged_grpc_stub_http = 1;
           }
-          fprintf(stderr,
-                  "[transport] gRPC not ready; sent via HTTP ingest (batch_id=%s). "
-                  "Further identical notices suppressed; set EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK=1 "
-                  "to log every batch.\n",
-                  batch_id ? batch_id : "");
+          EDR_LOGV("[transport] gRPC not ready; HTTP ingest batch_id=%s (EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK=1 "
+                   "repeats)\n",
+                   batch_id ? batch_id : "");
         }
       }
     } else {
@@ -144,10 +148,7 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const u
       if (send_rc != 0 && grpc_fallback_http_enabled()) {
         send_rc = edr_ingest_http_post_report_events(batch_id, header12, header_len, payload, payload_len);
         if (send_rc == 0) {
-          fprintf(stderr,
-                  "[transport] gRPC ReportEvents failed; fell back to HTTP ingest same payload "
-                  "(batch_id=%s)\n",
-                  batch_id ? batch_id : "");
+          EDR_LOGV("[transport] gRPC ReportEvents failed; HTTP fallback ok batch_id=%s\n", batch_id ? batch_id : "");
         }
       }
     }
