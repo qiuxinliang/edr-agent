@@ -4,6 +4,9 @@
 
 [server]
 address              = "127.0.0.1:50051"
+# Plaintext gRPC to local `edr-api` Ingest (same as EDR_GRPC_INSECURE=1); use false in production w/ mTLS
+# 与 EDR_GRPC_INSECURE=1 等效；仅明文联调。也可写 1/0
+grpc_insecure        = false
 ca_cert              = ""
 client_cert          = ""
 client_key           = ""

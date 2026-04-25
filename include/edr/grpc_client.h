@@ -37,6 +37,8 @@ unsigned long edr_grpc_client_rpc_fail(void);
 
 /**
  * 写入简短 ASCII 诊断（为何 `edr_grpc_client_ready` 可能为 0），供控制台心跳等使用。
+ * 可能值含：`ok`、`empty_server_address`、`insecure_not_connected`、`no_tls_pem_or_EDR_GRPC_INSECURE=1`、
+ * `incomplete_mtls_missing_client_cert_or_key`、`channel_not_ready`。
  * `cap` 含 NUL；无信息时写入 `"-"`。
  */
 void edr_grpc_client_diag(char *buf, size_t cap);

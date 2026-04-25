@@ -26,6 +26,8 @@ typedef struct EdrConfig {
     char client_key[1024];
     int connect_timeout_s;
     int keepalive_interval_s;
+    /** 与 EDR_GRPC_INSECURE=1 等效：连平台明文 gRPC Ingest；生产应 false 并配 mTLS */
+    bool grpc_insecure;
   } server;
 
   struct {

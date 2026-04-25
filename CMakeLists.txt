@@ -417,6 +417,8 @@ endif()
 
 if(MSVC)
   target_compile_options(edr_agent PRIVATE /W4 /WX-)
+  # 与 SetConsole*CP(65001) 一致：C/C++ 源与 stderr 中文
+  target_compile_options(edr_agent PRIVATE /utf-8)
   # C11 atomics：见 project() 后 CMAKE_C_FLAGS
   target_compile_definitions(edr_agent PRIVATE
     $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>

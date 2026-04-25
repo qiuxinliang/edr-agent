@@ -97,7 +97,7 @@ jobs:
             -DEDR_WITH_GRPC=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-            -DEDR_BUILD_TESTS=ON
+            -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build

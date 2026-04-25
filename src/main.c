@@ -117,6 +117,11 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  /* 控制台/管道默认多为一页 GBK(936)；进程内改为 UTF-8(65001)，与源码字面量(UTF-8)一致，避免 [grpc]/[self_protect] 等中文在 cmd 乱码 */
+  (void)SetConsoleOutputCP(65001);
+  (void)SetConsoleCP(65001);
+#endif
   const char *config = NULL;
   const char *prog = (argc > 0 && argv[0]) ? argv[0] : "edr_agent";
 

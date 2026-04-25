@@ -23,6 +23,9 @@
 #include <string>
 #include <thread>
 
+/** 与 edr_event_batch 批次上限/ReportEvents 负载大体匹配；gRPC 默认 4MB 会拒大包 */
+static const int kEdrGrpcMaxMessageBytes = 32 * 1024 * 1024;
+
 #ifndef EDR_AGENT_VERSION_STRING
 #define EDR_AGENT_VERSION_STRING "0.3.0"
 #endif
@@ -57,9 +60,9 @@ static std::shared_ptr<grpc::ClientContext> s_sub_ctx;
 static void subscribe_thread_main(std::string endpoint_id);
 
 static bool grpc_client_connect_locked(const std::string &target) {
+  s_target = target;
   std::shared_ptr<grpc::ChannelCredentials> creds;
   if (s_insecure) {
-    fprintf(stderr, "[grpc] 警告: EDR_GRPC_INSECURE=1，使用非加密通道\n");
     creds = grpc::InsecureChannelCredentials();
   } else if (!s_ca.empty() && !s_cert.empty() && !s_key.empty()) {
     grpc::SslCredentialsOptions ssl;
@@ -84,15 +87,22 @@ static bool grpc_client_connect_locked(const std::string &target) {
   args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
   args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 200);
   args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 5000);
+  args.SetInt(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH, kEdrGrpcMaxMessageBytes);
+  args.SetInt(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH, kEdrGrpcMaxMessageBytes);
 
-  s_target = target;
   s_channel = grpc::CreateCustomChannel(target, creds, args);
   s_stub = edr::v1::EventIngest::NewStub(s_channel);
   s_report_fail_streak = 0;
   s_upload_tb_inited = false;
   s_upload_token_bytes = 0.0;
 
-  fprintf(stderr, "[grpc] mTLS 通道: %s (ReportEvents + Subscribe", target.c_str());
+  if (s_insecure) {
+    fprintf(stderr, "[grpc] 非加密 gRPC: %s (ReportEvents + Subscribe", target.c_str());
+  } else if (!s_cert.empty() && !s_key.empty()) {
+    fprintf(stderr, "[grpc] mTLS 通道: %s (ReportEvents + Subscribe", target.c_str());
+  } else {
+    fprintf(stderr, "[grpc] TLS(仅验服务端) 通道: %s (ReportEvents + Subscribe", target.c_str());
+  }
   if (s_max_upload_mbps > 0u) {
     fprintf(stderr, "；上传节流 max_upload_mbps=%u", (unsigned)s_max_upload_mbps);
   } else {
@@ -218,7 +228,7 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
   s_cert = read_pem_file(cfg->server.client_cert);
   s_key = read_pem_file(cfg->server.client_key);
   const char *insec = std::getenv("EDR_GRPC_INSECURE");
-  s_insecure = (insec && insec[0] == '1');
+  s_insecure = (insec && insec[0] == '1') || cfg->server.grpc_insecure;
   s_max_upload_mbps = cfg->upload.max_upload_mbps;
   (void)grpc_client_connect_locked(target);
 }
@@ -233,6 +243,7 @@ extern "C" void edr_grpc_client_shutdown(void) {
   }
   s_stub.reset();
   s_channel.reset();
+  s_target.clear();
   s_upload_tb_inited = false;
 }
 
@@ -256,7 +267,8 @@ extern "C" void edr_grpc_client_diag(char *buf, size_t cap) {
     return;
   }
   if (s_insecure) {
-    snprintf(buf, cap, "%s", "insecure_no_channel");
+    /* stub 在上方已判空：明文 gRPC 未建链/已 shutdown */
+    snprintf(buf, cap, "%s", "insecure_not_connected");
     return;
   }
   if (s_ca.empty() && s_cert.empty() && s_key.empty()) {
@@ -362,10 +374,22 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
             st.error_message().c_str());
     return -1;
   }
+  // 与 HTTP ingest 对齐：平台对 200 且 accepted=false 仍算「传输成功」（本批可能 0 条落库）；
+  // 旧逻辑把 accepted=false 当失败会触发 HTTP 重试同批，误报 rpc_fail 且重复请求。
   if (!resp.accepted()) {
-    s_rpc_fail++;
-    s_report_fail_streak++;
-    return -1;
+    static unsigned s_warn_accept_false;
+    if (s_warn_accept_false < 5u) {
+      s_warn_accept_false++;
+      std::string msg = resp.message();
+      if (msg.size() > 200u) {
+        msg.resize(200u);
+        msg += "...";
+      }
+      fprintf(stderr,
+              "[grpc] ReportEvents: RPC OK 但 accepted=false（与 HTTP 200 一致；本批可能未写入事件）"
+              " message=%s\n",
+              msg.c_str());
+    }
   }
   s_report_fail_streak = 0;
   s_rpc_ok++;

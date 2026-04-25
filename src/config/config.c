@@ -393,6 +393,17 @@ static void load_server(toml_table_t *t, EdrConfig *cfg) {
       cfg->server.keepalive_interval_s = (int)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_bool_in(t, "grpc_insecure");
+    if (d.ok) {
+      cfg->server.grpc_insecure = d.u.b ? true : false;
+    } else {
+      toml_datum_t n = toml_int_in(t, "grpc_insecure");
+      if (n.ok) {
+        cfg->server.grpc_insecure = n.u.i != 0;
+      }
+    }
+  }
 }
 
 static void load_agent(toml_table_t *t, EdrConfig *cfg) {
