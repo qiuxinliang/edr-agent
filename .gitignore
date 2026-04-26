@@ -10,4 +10,4 @@ install/windows-inno/Output/
 .venv-proto/
 /tmp
 requirements-dev.txt
-/docs
+# 勿用 `/docs` 全目录 ignore：会阻止新的 Runbook（如 WP9）`git add`，且 CI 无法检出 → verify_ave_behavior_chain_invariants 失败。生成物可写具体路径，如 `/docs/.cache/` 等。
