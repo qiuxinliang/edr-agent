@@ -3,6 +3,8 @@
 #include "edr/behavior_record.h"
 #include "cJSON.h"
 
+/* pcre2.h 要求：在包含前设定宽度；本文件使用 8 位 API（与 PCRE2_UCHAR8 / char* 一致） */
+#define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 #include <ctype.h>
 #include <stddef.h>
