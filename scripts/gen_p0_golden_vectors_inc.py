@@ -61,9 +61,11 @@ def render_inc(cases: List[Any]) -> str:
         lines += ["#endif", ""]
         return "\n".join(lines)
 
+    exps: List[int] = []
     for i, c in enumerate(cases):
         rid = c.get("rule_id", "")
         exp = 1 if c.get("expect_hit") else 0
+        exps.append(exp)
         ev = c.get("ev") or {}
         pn = str(ev.get("process_name", "") or "")
         cmd = str(ev.get("cmdline", "") or "")
@@ -73,7 +75,6 @@ def render_inc(cases: List[Any]) -> str:
         lines.append(f'static const char p0_gv_r{i}[] = "{c_string_escape(rid)}";')
         lines.append(f'static const char p0_gv_p{i}[] = "{c_string_escape(pn)}";')
         lines.append(f'static const char p0_gv_c{i}[] = "{c_string_escape(cmd)}";')
-        lines.append(f"static const int p0_gv_e{i} = {exp};")
 
     lines.append("static const char *p0_golden_rule_id[] = {")
     lines.append(", ".join(f"p0_gv_r{i}" for i in range(len(cases))) + ", };")
@@ -81,8 +82,9 @@ def render_inc(cases: List[Any]) -> str:
     lines.append(", ".join(f"p0_gv_p{i}" for i in range(len(cases))) + ", };")
     lines.append("static const char *p0_golden_cmdline[] = {")
     lines.append(", ".join(f"p0_gv_c{i}" for i in range(len(cases))) + ", };")
+    # MSVC C：静态数组初始化器须为整型常量表达式，不能引用其他 static const int 对象（C2099）
     lines.append("static const int p0_golden_expect[] = {")
-    lines.append(", ".join(f"p0_gv_e{i}" for i in range(len(cases))) + ", };")
+    lines.append(", ".join(str(e) for e in exps) + ", };")
     lines.append("#endif")
     lines.append("")
     return "\n".join(lines) + "\n"

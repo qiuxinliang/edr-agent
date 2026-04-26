@@ -519,7 +519,7 @@ static void lower_inplace_buf(char *buf, size_t cap) {
 }
 
 static int reg_name_exact_fold(
-    const char *name, char name_in_list[][128], int n_name) {
+    const char *name, const char name_in_list[][128], int n_name) {
   char low[512];
   ascii_lower_truncate(low, sizeof(low), name);
   int i;
@@ -532,7 +532,7 @@ static int reg_name_exact_fold(
 }
 
 static int reg_data_substring_any(
-    const char *data, char subs[][256], int n_sub) {
+    const char *data, const char subs[][256], int n_sub) {
   char hay[10240];
   size_t l = 0;
   if (data) {

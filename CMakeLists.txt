@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(edr_agent C CXX)
 
-set(CMAKE_C_STANDARD 11)
+# 非 MSVC 保持 C11；MSVC 用 C17 以便 CMake 只发一条 /std:c17，避免与 CMAKE 因 C11 发的 /std:c11 再叠手动 /std:c17 出现 D9025
+if(MSVC)
+  set(CMAKE_C_STANDARD 17)
+else()
+  set(CMAKE_C_STANDARD 11)
+endif()
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,11 +40,10 @@ if(EDR_ENABLE_COMPILER_CACHE)
     endif()
   endif()
 endif()
-# MSVC：stdatomic.h 需 /experimental:c11atomics 与 /std:c11+。
+# MSVC：stdatomic.h 需 /experimental:c11atomics；/std 由 CMAKE_C_STANDARD=17 统一为 /std:c17（勿再手写 /std:c17 以免 D9025）
 # 在目录级统一为所有 C 目标注入，避免 CI/生成器差异导致个别 .c 漏选项触发 C1189。
 if(MSVC)
   add_compile_options(
-    $<$<COMPILE_LANGUAGE:C>:/std:c17>
     $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
   )
   add_compile_definitions(
@@ -657,8 +661,6 @@ if(MSVC)
     /W4
     /WX-
     /utf-8
-    $<$<COMPILE_LANGUAGE:C>:/std:c17>
-    $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
   )
 else()
   target_compile_options(edr_agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -734,7 +736,7 @@ if(EDR_ENABLE_UNITY_BUILD)
 endif()
 target_include_directories(edr_monitor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99)
 if(MSVC)
-  target_compile_options(edr_monitor PRIVATE /W4 /WX- $<$<COMPILE_LANGUAGE:C>:/std:c17>)
+  target_compile_options(edr_monitor PRIVATE /W4 /WX-)
   target_compile_definitions(edr_monitor PRIVATE $<$<COMPILE_LANGUAGE:C>:_CRT_SECURE_NO_WARNINGS>)
 else()
   target_compile_options(edr_monitor PRIVATE -Wall -Wextra -Wno-unused-parameter)
