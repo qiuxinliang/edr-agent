@@ -40,6 +40,34 @@ static size_t append_utf8(char *base, size_t cap, size_t *off, const char *fmt, 
   return (size_t)n;
 }
 
+static int looks_like_utf16le_string(const BYTE *buf, ULONG cb) {
+  if (!buf || cb < 4 || (cb % 2u) != 0u) {
+    return 0;
+  }
+  ULONG pairs = cb / 2u;
+  ULONG inspect = pairs > 512u ? 512u : pairs;
+  ULONG ascii_like = 0;
+  ULONG has_wide_nul = 0;
+  for (ULONG i = 0; i < inspect; i++) {
+    BYTE lo = buf[i * 2u];
+    BYTE hi = buf[i * 2u + 1u];
+    if (lo == 0 && hi == 0) {
+      has_wide_nul = 1;
+      break;
+    }
+    if (hi == 0 &&
+        ((lo >= 0x20 && lo <= 0x7e) || lo == '\\' || lo == '/' || lo == ':' || lo == '.' || lo == '-' ||
+         lo == '_' || lo == ' ' || lo == '\t')) {
+      ascii_like++;
+    }
+  }
+  if (has_wide_nul) {
+    return 1;
+  }
+  /* Binary properties are often even-length; require a reasonable UTF-16LE signal before decoding as wide chars. */
+  return inspect > 0 && ascii_like >= (inspect / 3u);
+}
+
 static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
                            size_t out_cap) {
   if (!rec || !prop_name || !out || out_cap == 0) {
@@ -67,7 +95,7 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
     return st;
   }
 
-  if (cb >= 2 && (cb % 2u) == 0) {
+  if (looks_like_utf16le_string(tmp, cb)) {
     int nchars = (int)(cb / sizeof(WCHAR));
     int n = WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)tmp, nchars, out, (int)out_cap - 1,
                                 NULL, NULL);

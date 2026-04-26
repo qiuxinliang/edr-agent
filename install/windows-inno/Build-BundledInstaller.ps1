@@ -53,12 +53,9 @@ if (-not (Test-Path -LiteralPath $Inno)) {
     throw "Inno Setup compiler not found: $Inno. Install Inno Setup 6 or pass -Inno to ISCC.exe"
 }
 
-$args = @(
-    "/DEDR_BIN_DIR=$BinDir"
-    "/DMyAppVersion=$AppVersion"
-    $iss
-)
-& $Inno @args
+# ISCC: paths with spaces need /DNAME="C:\a b"
+if ($BinDir -match "\s") { $binDef = '/DEDR_BIN_DIR="' + $BinDir + '"' } else { $binDef = "/DEDR_BIN_DIR=$BinDir" }
+& $Inno $binDef "/DMyAppVersion=$AppVersion" $iss
 if ($LASTEXITCODE -ne 0) {
     throw "ISCC failed with exit $LASTEXITCODE"
 }

@@ -1,5 +1,7 @@
 Optional SQLite data files (EDR Agent)
 
+For the full list of what the bundled zip covers vs what ships separately, see BUNDLE_README.txt next to edr_agent.exe.
+
 - edr_queue.db: Created at runtime if offline queue is used (default path may be under install dir
   or overridden by agent.toml / environment). Not shipped; no action needed for a clean install.
 

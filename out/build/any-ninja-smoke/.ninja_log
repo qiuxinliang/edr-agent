@@ -65,3 +65,7 @@
 972	1003	1777123969441825105	edr_monitor	9ce8e829a5356b24
 748	1484	1777123969217352374	CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o	65c4152881b7e461
 1484	1518	1777123969954292785	edr_agent	fe961b792fba393d
+9	115	1777169641413718598	CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o	15bb1e40144075f4
+9	127	1777169641413842348	CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o	60f0c8fd744fc318
+9	158	1777169641413471180	CMakeFiles/edr_agent.dir/src/config/config.c.o	8482fc92d96a5c44
+158	193	1777169641563104111	edr_agent	fe961b792fba393d
