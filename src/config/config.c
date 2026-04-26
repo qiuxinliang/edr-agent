@@ -1179,6 +1179,65 @@ static void load_webshell_detector(toml_table_t *t, EdrConfig *cfg) {
   }
 }
 
+static int edr_streq_icase(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  for (; *a && *b; a++, b++) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return 0;
+    }
+  }
+  return *a == 0 && *b == 0;
+}
+
+static int edr_has_prefix_icase(const char *s, const char *pre) {
+  if (!s || !pre) {
+    return 0;
+  }
+  for (; *pre; s++, pre++) {
+    if (!*s) {
+      return 0;
+    }
+    if (tolower((unsigned char)*s) != tolower((unsigned char)*pre)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+void edr_config_log_semantic_warnings(const EdrConfig *cfg) {
+  if (!cfg) {
+    return;
+  }
+  const char *e = getenv("EDR_PLATFORM_REST_BASE");
+  const char *rest = (e && e[0]) ? e : cfg->platform.rest_base_url;
+  if (!rest || !rest[0]) {
+    return;
+  }
+  if (!edr_has_prefix_icase(rest, "http://") && !edr_has_prefix_icase(rest, "https://")) {
+    fprintf(stderr, "[config] WARN: EDR_PLATFORM_REST_BASE / [platform].rest_base_url should start with http:// or "
+                    "https:// (effective: %.400s)\n",
+            rest);
+  } else if (!strstr(rest, "/api/")) {
+    fprintf(stderr,
+            "[config] WARN: rest base has no path segment '/api/' (effective: %.400s). If you only need /healthz, this "
+            "is OK; for ingest/attack-surface, use a full API root e.g. http://host:port/api/v1. See "
+            "docs/WP3_CONFIG_VALIDATION.md.\n",
+            rest);
+  }
+  if (!cfg->agent.endpoint_id[0] || edr_streq_icase(cfg->agent.endpoint_id, "auto")) {
+    fprintf(stderr,
+            "[config] WARN: [agent].endpoint_id is empty or 'auto' while platform REST is configured; set a concrete "
+            "id registered in the platform. See edr-backend/docs/LOCAL_STACK_INTEGRATION.md and "
+            "docs/WP3_CONFIG_VALIDATION.md.\n");
+  }
+  if (!cfg->agent.tenant_id[0] || edr_streq_icase(cfg->agent.tenant_id, "tenant_default")) {
+    fprintf(stderr, "[config] WARN: [agent].tenant_id is empty or still 'tenant_default' (placeholder) while platform "
+                    "REST is configured; set your real tenant. See docs/WP3_CONFIG_VALIDATION.md.\n");
+  }
+}
+
 static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size < 256u) {
     cfg->collection.max_event_queue_size = 4096u;
@@ -1987,6 +2046,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
             "[config] no TOML file (--config not set); using built-in defaults (server.address=%s). "
             "Install: use --config with agent.toml next to edr_agent.exe.\n",
             cfg->server.address);
+    edr_config_log_semantic_warnings(cfg);
     return EDR_OK;
   }
 
@@ -2114,6 +2174,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
   edr_config_win_fixup_model_dir_from_unix_example(cfg);
 #endif
   edr_config_clamp(cfg);
+  edr_config_log_semantic_warnings(cfg);
 #ifdef _WIN32
   edr_win_listen_apply_config(cfg);
 #endif

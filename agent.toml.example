@@ -1,6 +1,12 @@
 # 与《EDR 端点详细设计 v1.0》§11.1 对齐 — 复制为 agent.toml 后按需修改
 #
 # 使用说明、gRPC/mTLS、SQLite 队列与环境变量：见同目录 README.md
+# 与平台 REST 联调时的 `endpoint_id` / `tenant_id` / `rest_base_url` 语义与启动 [config] WARN：见 docs/WP3_CONFIG_VALIDATION.md
+# HTTP·gRPC 传输、`EDR_EVENT_INGEST_SPLIT`、ingest 排障：见 docs/WP4_HTTP_TRANSPORT_OPS.md
+# 规则母版 → 预处理 TOML / P0 IR / 版本对账（WP-5）：见 docs/WP5_RULES_ENGINEERING.md；TOML 子串规则：见 docs/PREPROCESS_RULES.md
+# 批处理/上送先量化后调优（WP-6）：见 docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md
+# 离线队列、失败落盘与出队重试/退避（WP-7）：见 docs/WP7_OFFLINE_QUEUE_RETRY.md
+# ETW/采集 profile 与 P0 字段矩阵底线（WP-8）：见 docs/WP8_ETW_COLLECTION_PROFILE.md、config/profiles/wp8_compliance_baseline.env.example
 
 [server]
 address              = "127.0.0.1:50051"
@@ -42,6 +48,7 @@ tenant_id            = "tenant_default"
 # etw_refresh_debounce_s        = 8
 
 [collection]
+# WP-8：可观测 profile / 与 P0 会签的边界 — docs/WP8_ETW_COLLECTION_PROFILE.md；合规基线 env 见 config/profiles/wp8_compliance_baseline.env.example
 etw_enabled          = true
 # Windows A4.3 + §19.10：各可选 Provider 独立开关（默认 true）。Kernel-Process/File/Net/Reg 为 mandatory 不可关。
 # 关闭 DNS / PS / Sec / WMI 前请对照 `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` 与 P0 规则，避免无计划漏报。
@@ -63,6 +70,7 @@ max_event_queue_size = 4096
 dedup_window_s       = 60
 high_freq_threshold  = 40
 sampling_rate_whitelist = 0.03
+# WP-2：总线背压、L2/L3、进程门控的实验室/生产档与验收 — docs/WP2_EVENT_BUS_PREPROCESS.md；config/profiles/wp2_*.env.example
 # L2/L3 首版（默认关闭）通过环境变量控制：
 #   EDR_PREPROCESS_L2_SPLIT=1                # 启用“未命中规则事件”的抽样保留
 #   EDR_PREPROCESS_L2_KEEP_RATIO=0.03        # 未命中规则保留比例（0~1，默认取 sampling_rate_whitelist）
@@ -93,6 +101,7 @@ rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
 # 静态 ONNX：将 static.onnx 放到本目录（与仓库 onnx-output 中产物一致）。
 # 安装：./scripts/install_static_onnx.sh（默认安装到本路径；无权限时用 --dest-dir $PWD/models 做本机联调）。
 # 加载：目录内首个非 behavior.onnx 的 .onnx 作为 static；behavior.onnx 单独用于行为模型。
+# 行为回调、跨引擎喂入、入批与 P0/静态扫 边界见 docs/WP9_BEHAVIOR_AVE.md
 #
 # 本仓库开发/测试：训练产物在**仓库根目录** `model/releases/<release_id>/`（见根目录 `model/releases/current.json`）。
 # 将 model_dir 设为该目录的绝对路径即可，例如（按本机路径与 release 名修改）：
@@ -123,12 +132,14 @@ sensitivity          = "MEDIUM"
 # cert_whitelist_db_path = ""
 # cert_whitelist_enabled = true
 
+# 批次/上送：先采 shutdown 指标再调 `batch_*`、发送队列等 —见 docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md
 [upload]
 batch_max_events     = 200
 batch_max_size_mb    = 2
 batch_timeout_s      = 2
 max_upload_mbps      = 1
 
+# 须与 EDR_PERSIST_STRATEGY / EDR_PERSIST_QUEUE / EDR_QUEUE_* 一起理解，见 docs/WP7_OFFLINE_QUEUE_RETRY.md
 [offline]
 queue_db_path        = "edr_queue.db"
 max_queue_size_mb    = 512

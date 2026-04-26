@@ -1,5 +1,6 @@
 # 测试用 gRPC+ORT+ctest。push 仅**分支**（不响应纯 tag 推送，避免与分支 push 重复各跑一条）。手动的 workflow_dispatch 也可。
 # 与 monorepo 根目录 `.github/workflows/edr-agent-build-grpc-ort.yml` 保持：Ninja、sccache、vcpkg binary 缓存。独立仓库时路径无 `edr-agent/` 前缀。
+# 首步 `verify_ave_behavior_chain_invariants.sh`（`./scripts/...`，**无** vcpkg，与根目录 workflow 一致）。
 
 name: edr-agent build (Windows gRPC + ORT)
 
@@ -32,6 +33,11 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
+      - name: AVE / behavior chain invariants (no vcpkg, bash)
+        shell: bash
+        run: |
+          chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
+          ./scripts/verify_ave_behavior_chain_invariants.sh
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64

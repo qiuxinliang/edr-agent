@@ -1,0 +1,53 @@
+# =============================================================================
+# 客户端自测用「行为检测 / 预处理」规则（TOML）
+# -----------------------------------------------------------------------------
+# 用法（与 agent.toml 同目录）二选一：
+#   1) 复制/重命名：将本文件存为与 agent 同目录下的 agent_preprocess_rules_v1.toml（会覆盖/合并需自行取舍）
+#   2) 环境变量：   EDR_PREPROCESS_RULES_BUNDLE_PATH=本文件绝对路径
+# 若 agent.toml 里已写了 [[preprocessing.rules]]，则**不会**自动再加载同目录的 bundle，请以 (2) 或内嵌规则为准。
+#
+# 验证探针 A（推荐，唯一、不误报其他软件）——在 cmd 或 PowerShell 执行，应命中「client-smoke-probe-cmdline」并走 emit_always 上送：
+#   cmd /c "echo EDR_CLIENT_SMOKE_PROBE_A1B2"
+# 或
+#   powershell -NoP -Command "Write-Output 'EDR_CLIENT_SMOKE_PROBE_A1B2'"
+#
+# 验证探针 B（与主仓 R-EXEC-001 思路一致，便于与平台/金体对照）——谨慎使用，仅作联调：
+#   powershell -NoP -EncodedCommand cwBwAA==
+# =============================================================================
+
+[preprocessing]
+dedup_window_s = 60
+high_freq_threshold = 40
+# 自测可单独成版本，便于在日志/平台上区分；与平台对账时可改为与 dynamic_rules_v1.json 根 version 一致
+rules_version = "client-smoke-test-v1"
+
+# --- 唯一子串探针：命令行需含固定标记 ---
+[[preprocessing.rules]]
+name = "client-smoke-probe-cmdline"
+action = "emit_always"
+event_type = "PROCESS_CREATE"
+cmdline_contains = "EDR_CLIENT_SMOKE_PROBE_A1B2"
+icase_cmdline = true
+
+# --- 与仓库 agent_preprocess 中 EncodedCommand 子规则同型（联调 P0/预处理用）---
+[[preprocessing.rules]]
+name = "client-smoke-r-exec-encodedcommand"
+action = "emit_always"
+event_type = "PROCESS_CREATE"
+cmdline_contains = "EncodedCommand"
+icase_cmdline = true
+
+[[preprocessing.rules]]
+name = "client-smoke-r-exec-frombase64"
+action = "emit_always"
+event_type = "PROCESS_CREATE"
+cmdline_contains = "frombase64string"
+icase_cmdline = true
+
+# --- 文件类（需对应 FILE_WRITE 事件进入预处理链；按端实现是否上报为准）---
+[[preprocessing.rules]]
+name = "client-smoke-ntds-dit-write"
+action = "emit_always"
+event_type = "FILE_WRITE"
+file_path_contains = "ntds.dit"
+icase_file_path = true

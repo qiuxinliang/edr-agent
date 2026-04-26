@@ -1,5 +1,6 @@
 # 与 monorepo 根目录 `.github/workflows/edr-agent-ci.yml` 逻辑一致；本仓库**根**即 `edr-agent/`，无 `edr-agent/` 路径前缀。
 # 无 gRPC 快编：vcpkg 清单**默认只 `curl`** + 工具链；`build-linux` 关闭（仅跑 Windows）— 要恢复则去掉 `if: false`。
+# `build-windows` 首步：`./scripts/verify_ave_behavior_chain_invariants.sh`（**无**编译，与根目录 `precheck` 中同名检查同源）。
 
 name: edr-agent build
 
@@ -20,6 +21,11 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
     steps:
       - uses: actions/checkout@v6
+      - name: AVE / behavior chain invariants (no vcpkg, bash)
+        shell: bash
+        run: |
+          chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
+          ./scripts/verify_ave_behavior_chain_invariants.sh
       - name: Prepare vcpkg download cache
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null

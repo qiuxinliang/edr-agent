@@ -1,4 +1,6 @@
 /build/
+# 与仓库根 .gitignore 的 edr-agent/build-*/ 对齐；仅 clone 本目录时也不提交实验 CMake 输出
+/build-*/
 # vcpkg 清单模式在工程根生成的已安装包目录（CI 无此目录名冲突时可删）
 /vcpkg_installed/
 install/windows-inno/Output/

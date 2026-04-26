@@ -321,6 +321,13 @@ void edr_config_apply_defaults(EdrConfig *cfg);
 void edr_config_free_heap(EdrConfig *cfg);
 
 /**
+ * 启动/重载后打印与平台联调相关的语义类 WARN（stderr），避免静默误配。
+ * 前提：`edr_config_load` 在 `edr_config_clamp` 之后（或等价的 defaults + 已解析的 cfg）调用本函数效果最佳。
+ * 见 `docs/WP3_CONFIG_VALIDATION.md`。
+ */
+void edr_config_log_semantic_warnings(const EdrConfig *cfg);
+
+/**
  * 从 path 加载 TOML（先 apply_defaults，再由解析结果覆盖）。
  * path 为 NULL 或空串：仅 apply_defaults。
  * 文件不可读或解析失败返回 EDR_ERR_CONFIG_PARSE。

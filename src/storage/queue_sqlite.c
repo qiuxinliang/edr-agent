@@ -244,6 +244,19 @@ EdrError edr_storage_queue_open(const char *path) {
   }
   s_retry_not_before_ns = 0;
   s_retry_fail_streak = 0u;
+  {
+    const char *ps = getenv("EDR_PERSIST_STRATEGY");
+    int on_fail = (ps && strcmp(ps, "on_fail") == 0) ? 1 : 0;
+    const char *pq = getenv("EDR_PERSIST_QUEUE");
+    int every = (pq && pq[0] == '1') ? 1 : 0;
+    int lim = max_retry_limit();
+    unsigned b0 = queue_retry_backoff_base_ms();
+    unsigned b1 = queue_retry_backoff_max_ms();
+    fprintf(stderr,
+            "[queue] sqlite=%s on_fail_persist=%d persist_every_batch=%d max_retries=%d "
+            "backoff_ms=%u..%u (unified policy: docs/WP7_OFFLINE_QUEUE_RETRY.md)\n",
+            s_path, on_fail, every, lim, b0, b1);
+  }
   return EDR_OK;
 }
 

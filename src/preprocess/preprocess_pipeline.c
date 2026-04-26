@@ -412,6 +412,12 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
     if (be != EDR_OK) {
       return be;
     }
+    fprintf(stderr,
+            "[batch] batch_max_size_mb=%u batch_max_events=%u batch_timeout_s=%d (exit stats: "
+            "EDR_AGENT_SHUTDOWN_LOG=1 or EDR_AGENT_VERBOSE=1; tune after metrics: "
+            "docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md)\n",
+            (unsigned)cfg->upload.batch_max_size_mb, (unsigned)cfg->upload.batch_max_events,
+            cfg->upload.batch_timeout_s);
   }
   edr_dedup_configure(cfg->preprocessing.dedup_window_s,
                       cfg->preprocessing.high_freq_threshold);

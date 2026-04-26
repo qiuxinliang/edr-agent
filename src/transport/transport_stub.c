@@ -330,6 +330,12 @@ static void transport_queue_start(void) {
     s_q_started = 1;
   }
 #endif
+  if (s_q_started) {
+    fprintf(stderr,
+            "[transport] send_queue_cap=%zu (EDR_TRANSPORT_SEND_QUEUE_CAP; see "
+            "docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md)\n",
+            s_q_cap);
+  }
 }
 
 static void transport_queue_stop(void) {
@@ -408,9 +414,16 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
     const char *uid = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
     edr_ingest_http_configure(rb, tid, uid, bear, cfg->agent.endpoint_id, NULL);
     if (rb && rb[0]) {
+      const char *sp = getenv("EDR_EVENT_INGEST_SPLIT");
+      int split_on = (sp && sp[0] && strcmp(sp, "0") != 0);
       fprintf(stderr, "[transport] HTTP ingest: %s\n", rb);
+      fprintf(stderr,
+              "[transport] EDR_EVENT_INGEST_SPLIT=%s (non-zero: split BehaviorAlert->gRPC path vs rest->HTTP; 0: single "
+              "edr_transport_on_event_batch path. See docs/WP4_HTTP_TRANSPORT_OPS.md)\n",
+              split_on ? "on" : "off");
       EDR_LOGV("%s",
-               "  (verbose) EDR_EVENT_INGEST_SPLIT=1 split; gRPC fail->HTTP if base set; EDR_EVENT_GRPC_FALLBACK_HTTP=0 disables fallback.\n");
+               "  (verbose) EDR_EVENT_GRPC_FALLBACK_HTTP=0 disables gRPC->HTTP on ReportEvents fail; "
+               "EDR_TRANSPORT_LOG_EVERY_HTTP_FALLBACK=1 repeats stub-path HTTP logs.\n");
     }
   }
   transport_queue_start();

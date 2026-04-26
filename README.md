@@ -19,7 +19,25 @@
 | §17 WinDivert Shellcode | 是 | 否 | 否 |
 | §1.2 API / IAT 用户态 Hook | **本期不做**（**`docs/AGT004_API_MONITOR_DESCope.md`**，AGT-004 descope） | — | — |
 
-**AVE / ONNX 首次真推理（AGT-005）**：**[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**；一键脚本 **`scripts/onnx_local_stack_smoke.sh`**（`bash ./scripts/onnx_local_stack_smoke.sh`）。与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
+**AVE / ONNX 首次真推理（AGT-005）**：**[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**；一键脚本 **`scripts/onnx_local_stack_smoke.sh`**（`bash ./scripts/onnx_local_stack_smoke.sh`）。**行为链 / ingest 与 ORT 分工**见 **[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**；CI/本地**无模型**符号锚点 **`scripts/verify_ave_behavior_chain_invariants.sh`**。与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
+
+**平台 ingest → `alerts` 先验（WP-1，不依赖本机先跑 Agent）**：**[edr-backend/docs/WP1_ALERT_INGEST_E2E.md](../edr-backend/docs/WP1_ALERT_INGEST_E2E.md)**；脚本 **`edr-backend/scripts/verify_ingest_alert_e2e.sh`** / **`verify_ingest_alert_e2e.ps1`**。真机 P0/告警直出仍见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。
+
+**总线/预处理可运营（WP-2）**：**[docs/WP2_EVENT_BUS_PREPROCESS.md](docs/WP2_EVENT_BUS_PREPROCESS.md)**；环境档示例 **`config/profiles/wp2_lab_e2e.env.example`**、**`config/profiles/wp2_prod_default.env.example`**（见同目录 `README.md`）。
+
+**配置语义与启动 WARN（WP-3）**：**[docs/WP3_CONFIG_VALIDATION.md](docs/WP3_CONFIG_VALIDATION.md)**（`EDR_PLATFORM_REST_BASE` / `[platform].rest_base_url`、**`endpoint_id` / `tenant_id` 在启用平台 REST 时** 的误配提示）。
+
+**HTTP / gRPC 传输与 `EDR_EVENT_INGEST_SPLIT` 排障（WP-4）**：**[docs/WP4_HTTP_TRANSPORT_OPS.md](docs/WP4_HTTP_TRANSPORT_OPS.md)**（`[transport]` / `[ingest-http]`、回退与队列相关环境变量）。
+
+**规则工程化：母版 → 预处理 TOML + P0 IR + 版本对账（WP-5）**：**[docs/WP5_RULES_ENGINEERING.md](docs/WP5_RULES_ENGINEERING.md)**；预处理 **`[[preprocessing.rules]]`** 见 **`[docs/PREPROCESS_RULES.md](docs/PREPROCESS_RULES.md)`**（与 P0 包**并列**）。
+
+**批处理与上送「先量化再调参」（WP-6）**：**[docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md](docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md)**（`[upload]` / `EDR_AGENT_SHUTDOWN_LOG`、`EDR_TRANSPORT_SEND_QUEUE_CAP` 与 **shutdown** 指标）。
+
+**SQLite 离线队列与重试/退避（WP-7）**：**[docs/WP7_OFFLINE_QUEUE_RETRY.md](docs/WP7_OFFLINE_QUEUE_RETRY.md)**（`EDR_PERSIST_STRATEGY` / `EDR_PERSIST_QUEUE`、`EDR_QUEUE_*`、与 gRPC/HTTP 补传）。
+
+**ETW/采集 profile 与 P0 合规底线（WP-8）**：**[docs/WP8_ETW_COLLECTION_PROFILE.md](docs/WP8_ETW_COLLECTION_PROFILE.md)**；合规基线环境示例 **`config/profiles/wp8_compliance_baseline.env.example`**（与 `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` 对表）。
+
+**行为回调、AVE 行为管线与 ingest 编码（WP-9）**：**[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**；stderr 在初始化成功后会有一行 **`[ave] on_behavior_alert=…`** 与 TOML 对表；**管道/本机构建目录** 与 **启动行** 可观测性见该文档 **§2.1**，环境档示例 **`config/profiles/wp9_behavior_ave.env.example`**（与 **WP-5/6/8** 分工不混谈）。
 
 ## 目录与 DDD 章节对应
 
@@ -327,7 +345,7 @@ cmake --build build
 
 ### 重新生成 `ingest` 桩代码
 
-若修改了 `proto/edr/v1/ingest.proto`，执行 **`./scripts/regen_ingest_proto.sh`**（macOS/Linux；**Windows** 上在同一套 vcpkg 的 `vcpkg_installed\x64-windows` 下用 **`./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 <该路径>`**），或手动用 `protoc` + `grpc_cpp_plugin` 生成至 `src/grpc_gen/edr/v1/`）。**protobuf 主版本**须与链接的 `libprotobuf` 一致；正式 Windows 发版由 **`.github/workflows/edr-agent-client-release.yml`** 在 CI 内用 vcpkg 的 `protoc` 重生成后编译。
+若修改了 `proto/edr/v1/ingest.proto`，执行 **`./scripts/regen_ingest_proto.sh`**（macOS/Linux；**Windows** 上在同一套 vcpkg 的 `vcpkg_installed\x64-windows` 下用 **`./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 <该路径>`**），或手动用 `protoc` + `grpc_cpp_plugin` 生成至 `src/grpc_gen/edr/v1/`）。**protobuf 主版本**须与链接的 `libprotobuf` 一致；正式 Windows 发版由 **`.github/workflows/edr-agent-client-release.yml`** 在 CI 内用 vcpkg 的 `protoc` 重生成后编译。推 **`win_*.*.*` tag** 时 **同一 GitHub Release** 会附 **两枚** zip：`*-windows-amd64-exe.zip`（**无 gRPC**+ONNX，与历史一致）与 `*-windows-amd64-grpc-exe.zip`（**gRPC+ONNX**，需 **gRPC EventIngest/Subscribe** 时选用）；见该 workflow 文件头注释。
 
 ---
 

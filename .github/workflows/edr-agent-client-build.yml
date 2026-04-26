@@ -1,5 +1,6 @@
 # 独立 edr-agent 仓库：仅构建 Windows 客户端产物（exe + 运行时 DLL zip），不创建 GitHub Release。
 # 正式发版请推 win_* tag 触发 edr-agent-client-release.yml。
+# 首步 `./scripts/verify_ave_behavior_chain_invariants.sh`（与 monorepo 同锚点，**无**编译）。
 
 name: edr-agent client build (Windows)
 
@@ -29,6 +30,11 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
+      - name: AVE / behavior chain invariants (no vcpkg, bash)
+        shell: bash
+        run: |
+          chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
+          ./scripts/verify_ave_behavior_chain_invariants.sh
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64

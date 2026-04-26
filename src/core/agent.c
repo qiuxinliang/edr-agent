@@ -76,6 +76,43 @@ static int edr_agent_console_heartbeat_interval_s(const EdrAgent *agent) {
   return k;
 }
 
+static void edr_agent_log_collection_profile(const EdrConfig *cfg) {
+  if (!cfg) {
+    return;
+  }
+  fprintf(stderr,
+          "[collection] etw_on=%d tcpip=%d fw=%d dns=%d ps=%d secaudit=%d wmi=%d "
+          "ebpf=%d poll_s=%d queue_size=%u etw_buf_kb=%u etw_flush_s=%u (P0: "
+          "Cauld Design/EDR_P0_Field_Matrix_Signoff.md; WP-8: "
+          "edr-agent/docs/WP8_ETW_COLLECTION_PROFILE.md)\n",
+          (int)cfg->collection.etw_enabled, (int)cfg->collection.etw_tcpip_provider,
+          (int)cfg->collection.etw_firewall_provider, (int)cfg->collection.etw_dns_client_provider,
+          (int)cfg->collection.etw_powershell_provider, (int)cfg->collection.etw_security_audit_provider,
+          (int)cfg->collection.etw_wmi_provider, (int)cfg->collection.ebpf_enabled,
+          cfg->collection.poll_interval_s, (unsigned)cfg->collection.max_event_queue_size,
+          (unsigned)cfg->collection.etw_buffer_kb, (unsigned)cfg->collection.etw_flush_timer_s);
+}
+
+/** 与 agent.toml 对表，便于对照 WP-9 行为/AVE 数据链。Monitor：1=起线程成功 0=失败 na=未试（如 Register 失败） */
+static void edr_agent_log_ave_profile(const EdrConfig *cfg, int on_behavior_alert_registered, int start_monitor) {
+  if (!cfg) {
+    return;
+  }
+  const char *mon = "na";
+  if (start_monitor == 1) {
+    mon = "1";
+  } else if (start_monitor < 0) {
+    mon = "0";
+  }
+  fprintf(
+      stderr,
+      "[ave] on_behavior_alert=%d behavior_monitor_toml=%d behavior_monitor=%s model_dir=%.300s "
+      "onnx_static=%d onnx_behavior=%d l4_th=%.3f (WP-9: edr-agent/docs/WP9_BEHAVIOR_AVE.md)\n",
+      (int)on_behavior_alert_registered, (int)cfg->ave.behavior_monitor_enabled, mon,
+      (cfg->ave.model_dir[0] ? cfg->ave.model_dir : "-"), edr_onnx_runtime_ready(), edr_onnx_behavior_ready(),
+      (double)cfg->ave.l4_realtime_anomaly_threshold);
+}
+
 static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
   char grpc_diag[200];
   int ave_mf = 0, ave_nf = 0, ave_dir = 0;
@@ -168,6 +205,8 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
     if (ar != AVE_OK) {
       fprintf(stderr, "[ave] AVE_InitFromEdrConfig failed: %d\n", ar);
     } else {
+      int start_monitor = 0;
+      int on_reg = 0;
       AVECallbacks acb;
       memset(&acb, 0, sizeof(acb));
       acb.on_behavior_alert = edr_agent_on_behavior_alert;
@@ -175,11 +214,14 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       if (reg != AVE_OK) {
         fprintf(stderr, "[ave] AVE_RegisterCallbacks failed: %d (behavior alerts will not be emitted)\n", reg);
       } else {
+        on_reg = 1;
         int sm = AVE_StartBehaviorMonitor();
+        start_monitor = (sm == AVE_OK) ? 1 : -1;
         if (sm != AVE_OK) {
           fprintf(stderr, "[ave] AVE_StartBehaviorMonitor failed: %d (behavior queue may run sync-only)\n", sm);
         }
       }
+      edr_agent_log_ave_profile(&agent->cfg, on_reg, start_monitor);
     }
   }
 #if defined(EDR_WITH_FL_TRAINER)
@@ -308,6 +350,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
       return pe;
     }
   }
+  edr_agent_log_collection_profile(&agent->cfg);
   {
     uint64_t last_reload_ns = 0;
     uint64_t last_remote_ns = 0;

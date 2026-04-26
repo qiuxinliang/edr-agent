@@ -145,6 +145,10 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+  /* 管道/重定向时 glibc 等常对 stderr 全缓冲，排障时首条含换行日志会迟滞；行缓冲后 [ave]/[config] 等尽快可见。 */
+#if !defined(_WIN32)
+  (void)setvbuf(stderr, NULL, _IOLBF, 0);
+#endif
 #ifdef _WIN32
   {
     const char *nou8 = getenv("EDR_NO_CONSOLE_UTF8");
