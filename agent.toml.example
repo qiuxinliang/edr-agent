@@ -43,27 +43,36 @@ tenant_id            = "tenant_default"
 
 [collection]
 etw_enabled          = true
+# Windows A4.3 + §19.10：各可选 Provider 独立开关（默认 true）。Kernel-Process/File/Net/Reg 为 mandatory 不可关。
+# 关闭 DNS / PS / Sec / WMI 前请对照 `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` 与 P0 规则，避免无计划漏报。
+# etw_dns_client_provider   = true
+# etw_powershell_provider   = true
+# etw_security_audit_provider = true
+# etw_wmi_provider         = true
 # Windows §19.10：Microsoft-Windows-TCPIP / WFAS 防火墙 ETW（需管理员；失败时跳过并打日志）
 etw_tcpip_provider   = true
 etw_firewall_provider = true
 ebpf_enabled         = true
 poll_interval_s      = 1
 max_event_queue_size = 4096
+# Windows 实时 ETW 会话：每缓冲大小（KB）与刷写周期（秒）；0=默认 64/1。亦可 EDR_ETW_BUFFER_KB / EDR_ETW_FLUSH_TIMER_S（见 README · A4.2）
+# etw_buffer_kb        = 64
+# etw_flush_timer_s    = 1
 
 [preprocessing]
-dedup_window_s       = 30
-high_freq_threshold  = 100
-sampling_rate_whitelist = 0.1
+dedup_window_s       = 60
+high_freq_threshold  = 40
+sampling_rate_whitelist = 0.03
 # L2/L3 首版（默认关闭）通过环境变量控制：
 #   EDR_PREPROCESS_L2_SPLIT=1                # 启用“未命中规则事件”的抽样保留
-#   EDR_PREPROCESS_L2_KEEP_RATIO=0.10        # 未命中规则保留比例（0~1，默认取 sampling_rate_whitelist）
+#   EDR_PREPROCESS_L2_KEEP_RATIO=0.03        # 未命中规则保留比例（0~1，默认取 sampling_rate_whitelist）
 #   EDR_PREPROCESS_L3_PRESSURE=1             # 启用总线高压分流
-#   EDR_PREPROCESS_L3_HIGH_PCT=90            # 进入高压模式阈值
-#   EDR_PREPROCESS_L3_RECOVER_PCT=70         # 退出高压模式阈值（滞回）
-#   EDR_PREPROCESS_L3_DROP_PERMILLE=800      # 高压下低价值事件丢弃千分比（0~1000）
+#   EDR_PREPROCESS_L3_HIGH_PCT=80            # 进入高压模式阈值
+#   EDR_PREPROCESS_L3_RECOVER_PCT=60         # 退出高压模式阈值（滞回）
+#   EDR_PREPROCESS_L3_DROP_PERMILLE=900      # 高压下低价值事件丢弃千分比（0~1000）
 #   EDR_PREPROCESS_PROCNAME_GATE=1           # B方案：仅对 process_create 做“规则进程名门控”降载（默认开启；设0可关闭）
-#   EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE=100
-#                                          # 非门控进程名保留千分比（默认100=10%）；告警判定仍走完整规则
+#   EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE=30
+#                                          # 非门控进程名保留千分比（默认30=3%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
 rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
@@ -115,9 +124,9 @@ sensitivity          = "MEDIUM"
 # cert_whitelist_enabled = true
 
 [upload]
-batch_max_events     = 500
-batch_max_size_mb    = 4
-batch_timeout_s      = 5
+batch_max_events     = 200
+batch_max_size_mb    = 2
+batch_timeout_s      = 2
 max_upload_mbps      = 1
 
 [offline]

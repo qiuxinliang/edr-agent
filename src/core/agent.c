@@ -15,6 +15,7 @@
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
 #ifdef _WIN32
+#include "edr/etw_observability_win.h"
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
 #else
@@ -98,6 +99,14 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
             "[heartbeat] grpc=%d http=%d batches=%lu\n", edr_grpc_client_ready(), edr_ingest_http_configured(),
             edr_transport_batch_count());
   }
+#if defined(_WIN32)
+  {
+    const char *e = getenv("EDR_ETW_OBS");
+    if (e && (e[0] == '1' || (e[0] == 'y' && e[1] == '\0') || (e[0] == 'Y' && e[1] == '\0'))) {
+      edr_etw_observability_print_line(agent->event_bus);
+    }
+  }
+#endif
   fflush(stderr);
 }
 

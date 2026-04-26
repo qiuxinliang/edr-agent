@@ -41,7 +41,7 @@ static uint64_t fnv64_update(uint64_t h, const unsigned char *p, size_t n) {
 static uint64_t edr_target_fingerprint(const EdrBehaviorRecord *r) {
   uint64_t h = 14695981039346656037ULL;
   const char *parts[] = {r->cmdline, r->exe_path,  r->file_path, r->dns_query,
-                           r->net_dst, r->script_snippet, r->pmfe_snapshot,
+                           r->net_dst, r->network_aux_path, r->script_snippet, r->pmfe_snapshot,
                            r->reg_key_path, r->reg_value_name, r->reg_value_data};
   size_t k;
   for (k = 0; k < sizeof(parts) / sizeof(parts[0]); k++) {

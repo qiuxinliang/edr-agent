@@ -147,6 +147,8 @@ message NetworkDetail {
   string dst_ip = 3;
   uint32 dst_port = 4;
   string protocol = 5;
+  // 与 EdrBehaviorRecord.network_aux_path / 平台 `network_aux_path` 一致（如进程映像路径，供规则侧与 ingest 对拍）
+  string network_aux_path = 6;
 }
 
 message DnsDetail {

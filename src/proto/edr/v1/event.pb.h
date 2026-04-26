@@ -10,6 +10,71 @@
 #endif
 
 /* Struct definitions */
+/* 《11_behavior.onnx详细设计》§4.1：`AVEBehaviorEvent` 标准载荷（ETW/预处理 → 行为 ONNX）。
+ 与 `include/edr/ave_sdk.h` 中 `AVEBehaviorEvent` 字段语义一致；嵌于 `BehaviorEvent` 供平台强类型入库与特征重建。
+ `BehaviorEvent.type` 为平台 `EdrEventType`；`ave_event_type` 为 **AVEEventType**（0–13），二者缺省可独立填写。 */
+typedef struct _edr_v1_AveBehaviorEventFeed {
+    uint32_t severity_hint;
+    /* 文件 / 注册表 / DLL 等路径类目标（§4.1 目标字段） */
+    char target_path[1024];
+    float target_path_entropy;
+    bool target_is_system_dir;
+    bool target_is_temp_dir;
+    bool target_is_network_path;
+    /* 0=普通 1=脚本 2=PE 可执行（与端侧 `target_file_ext_risk` 枚举一致） */
+    uint32_t target_file_ext_risk;
+    bool target_has_motw;
+    /* 网络类 NET_CONNECT / NET_DNS */
+    char target_ip[64];
+    char target_domain[512];
+    uint32_t target_port;
+    bool target_ip_is_public;
+    float target_ip_geoip_risk;
+    float target_port_risk;
+    float target_domain_entropy;
+    /* 注册表 REG_WRITE */
+    float reg_key_risk;
+    /* §4.1 E 组：SHELLCODE_SIGNAL / WEBSHELL_SIGNAL / PMFE_RESULT */
+    float shellcode_score;
+    float webshell_score;
+    float pmfe_confidence;
+    bool pmfe_pe_found;
+    bool pmfe_dns_tunnel;
+    /* TIP / IOC（§4.1） */
+    bool ioc_ip_hit;
+    bool ioc_domain_hit;
+    bool ioc_sha256_hit;
+    /* 证书白名单子系统 */
+    bool cert_revoked_ancestor;
+    /* 端侧 `AVEBehaviorEvent` 扩展：静态扫描置信度、行为位域、文件哈希（供 IOC / E 组） */
+    float ave_confidence;
+    uint64_t behavior_flags;
+    char file_sha256_hex[65];
+    /* `AVEEventType`：与平台 `BehaviorEvent.type`（EdrEventType）区分；未设置时由平台按 type 映射或忽略 */
+    bool has_ave_event_type;
+    int32_t ave_event_type;
+} edr_v1_AveBehaviorEventFeed;
+
+/* §12.4 behavior.onnx → 平台：与《11_behavior.onnx详细设计》AVEBehaviorAlert 对齐（嵌于 BehaviorEvent 或单独帧）。 */
+typedef struct _edr_v1_BehaviorAlert {
+    float anomaly_score; /* 0–1 */
+    /* 固定 14 维；nanopb 默认对 repeated 标量走 packed（LEN）；ingest 侧仍归一为 14 浮点再入库。 */
+    pb_size_t tactic_probs_count;
+    float tactic_probs[14];
+    /* 逗号分隔；推荐 MITRE 战术 id（如 T1059）；端上亦可填英文展示名（平台 mitre_ttps 存 JSON 字符串数组）。 */
+    char triggered_tactics[512];
+    bool skip_ai_analysis;
+    bool needs_l2_review;
+    int64_t timestamp_ns;
+    uint32_t pid;
+    char process_name[256];
+    char process_path[1024]; /* 对应 BehaviorEvent.exe_path */
+    /* 与 `alerts.related_iocs_json` 对齐的 JSON 文本；单帧长度受 Agent nanopb 静态缓冲上界约 4KiB（与 event.options 对账）。 */
+    char related_iocs_json[4090];
+    /* 跨端并案主键真源：与平台 `alerts.user_subject_json` 一致，如 {"subject_type":"ad_sid","value":"S-1-5-21-..."}。 */
+    char user_subject_json[1024];
+} edr_v1_BehaviorAlert;
+
 typedef struct _edr_v1_ProcessDetail {
     char parent_name[256];
     char parent_path[512];
@@ -20,8 +85,19 @@ typedef struct _edr_v1_FileDetail {
     char operation[32];
     char target_path[1024];
     uint64_t file_size;
+    /* * 《11》§5.3 维 35：与 `AVEBehaviorEvent.target_has_motw` 对齐（MOTW / Zone.Identifier 等） */
     bool target_has_motw;
 } edr_v1_FileDetail;
+
+/* 注册表事件明细；与平台 `endpoint_events.payload_json`（category=registry）字段对齐。 */
+typedef struct _edr_v1_RegistryDetail {
+    char key_path[1024];
+    char value_name[512];
+    /* 文本/可打印表示；二进制数据建议端上编码为十六进制或省略（平台侧截断见 ingest） */
+    char value_data[8192];
+    /* 如 set_value、create_key、delete_key（小写约定，可选） */
+    char operation[32];
+} edr_v1_RegistryDetail;
 
 typedef struct _edr_v1_NetworkDetail {
     char src_ip[64];
@@ -29,6 +105,8 @@ typedef struct _edr_v1_NetworkDetail {
     char dst_ip[64];
     uint32_t dst_port;
     char protocol[16];
+    /* 与 EdrBehaviorRecord.network_aux_path / 平台 `network_aux_path` 一致（如进程映像路径，供规则侧与 ingest 对拍） */
+    char network_aux_path[1024];
 } edr_v1_NetworkDetail;
 
 typedef struct _edr_v1_DnsDetail {
@@ -39,62 +117,7 @@ typedef struct _edr_v1_ScriptDetail {
     char snippet[1024];
 } edr_v1_ScriptDetail;
 
-typedef struct _edr_v1_RegistryDetail {
-    char key_path[1024];
-    char value_name[512];
-    char value_data[8192];
-    char operation[32];
-} edr_v1_RegistryDetail;
-
-typedef struct _edr_v1_BehaviorAlert {
-    float anomaly_score;
-    pb_size_t tactic_probs_count;
-    float tactic_probs[14];
-    char triggered_tactics[512];
-    bool skip_ai_analysis;
-    bool needs_l2_review;
-    int64_t timestamp_ns;
-    uint32_t pid;
-    char process_name[256];
-    char process_path[1024];
-    char related_iocs_json[4090];
-    char user_subject_json[1024];
-} edr_v1_BehaviorAlert;
-
-/** 《11》§4.1 / `AVEBehaviorEvent` — wire 与 `AveBehaviorEventFeed` 一致 */
-typedef struct _edr_v1_AveBehaviorEventFeed {
-    uint32_t severity_hint;
-    char target_path[1024];
-    float target_path_entropy;
-    bool target_is_system_dir;
-    bool target_is_temp_dir;
-    bool target_is_network_path;
-    uint32_t target_file_ext_risk;
-    bool target_has_motw;
-    char target_ip[64];
-    char target_domain[512];
-    uint32_t target_port;
-    bool target_ip_is_public;
-    float target_ip_geoip_risk;
-    float target_port_risk;
-    float target_domain_entropy;
-    float reg_key_risk;
-    float shellcode_score;
-    float webshell_score;
-    float pmfe_confidence;
-    bool pmfe_pe_found;
-    bool pmfe_dns_tunnel;
-    bool ioc_ip_hit;
-    bool ioc_domain_hit;
-    bool ioc_sha256_hit;
-    bool cert_revoked_ancestor;
-    float ave_confidence;
-    uint64_t behavior_flags;
-    char file_sha256_hex[65];
-    bool has_ave_event_type;
-    int32_t ave_event_type;
-} edr_v1_AveBehaviorEventFeed;
-
+/* BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。 */
 typedef struct _edr_v1_BehaviorEvent {
     char event_id[48];
     char endpoint_id[48];
@@ -109,12 +132,14 @@ typedef struct _edr_v1_BehaviorEvent {
     char exe_path[1024];
     char username[256];
     uint32_t session_id;
+    /* 自根进程向上的父链跳数（与平台 dynamic_rules `process_chain_depth_gt` 对齐；0 表示未计算/未携带） */
     uint32_t process_chain_depth;
     pb_size_t which_detail;
     union {
         edr_v1_ProcessDetail process;
         edr_v1_FileDetail file;
         edr_v1_NetworkDetail network;
+        /* 注册表 REG_CREATE_KEY / REG_SET_VALUE / REG_DELETE_KEY（与 `EdrEventType` 30–32 对齐）；ingest 写入 payload_json category=registry */
         edr_v1_RegistryDetail registry;
         edr_v1_DnsDetail dns;
         edr_v1_ScriptDetail script;
@@ -123,8 +148,10 @@ typedef struct _edr_v1_BehaviorEvent {
     pb_size_t mitre_ttps_count;
     char mitre_ttps[8][16];
     uint32_t priority;
+    /* 行为 ONNX 高危/中危告警载荷（与 ave_result_json 二选一或并存；上报时优先填本字段便于平台强类型入库） */
     bool has_behavior_alert;
     edr_v1_BehaviorAlert behavior_alert;
+    /* 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台 ONNX/检索优先读本消息） */
     bool has_ave_behavior_feed;
     edr_v1_AveBehaviorEventFeed ave_behavior_feed;
 } edr_v1_BehaviorEvent;
@@ -135,77 +162,26 @@ extern "C" {
 #endif
 
 /* Initializer values for message structs */
-#define edr_v1_BehaviorAlert_init_default        {0.0f, 0, {0}, "", false, false, 0, 0, "", "", "", ""}
-#define edr_v1_BehaviorAlert_init_zero           {0.0f, 0, {0}, "", false, false, 0, 0, "", "", "", ""}
-#define edr_v1_AveBehaviorEventFeed_init_default                                                                 \
-  {0, "", 0.0f, false, false, false, 0, false, "", "", 0, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, \
-   false, false, false, false, false, 0.0f, 0, "", false, 0}
-#define edr_v1_AveBehaviorEventFeed_init_zero edr_v1_AveBehaviorEventFeed_init_default
-#define edr_v1_BehaviorEvent_init_default                                                                      \
-  {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0,            \
-   {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false,                        \
-   edr_v1_AveBehaviorEventFeed_init_default}
+#define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
+#define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", ""}
+#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default}
 #define edr_v1_ProcessDetail_init_default        {"", "", ""}
-#define edr_v1_FileDetail_init_default           {"", "", 0, false}
-#define edr_v1_NetworkDetail_init_default        {"", 0, "", 0, ""}
+#define edr_v1_FileDetail_init_default           {"", "", 0, 0}
+#define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
+#define edr_v1_NetworkDetail_init_default        {"", 0, "", 0, "", ""}
 #define edr_v1_DnsDetail_init_default            {""}
 #define edr_v1_ScriptDetail_init_default         {""}
-#define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
-#define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
-#define edr_v1_BehaviorEvent_init_zero                                                                           \
-  {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0,               \
-   {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false,                           \
-   edr_v1_AveBehaviorEventFeed_init_zero}
+#define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
+#define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", ""}
+#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero}
 #define edr_v1_ProcessDetail_init_zero           {"", "", ""}
-#define edr_v1_FileDetail_init_zero              {"", "", 0, false}
-#define edr_v1_NetworkDetail_init_zero           {"", 0, "", 0, ""}
+#define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
+#define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
+#define edr_v1_NetworkDetail_init_zero           {"", 0, "", 0, "", ""}
 #define edr_v1_DnsDetail_init_zero               {""}
 #define edr_v1_ScriptDetail_init_zero            {""}
 
 /* Field tags (for use in manual encoding/decoding) */
-#define edr_v1_ProcessDetail_parent_name_tag     1
-#define edr_v1_ProcessDetail_parent_path_tag     2
-#define edr_v1_ProcessDetail_integrity_level_tag 3
-#define edr_v1_FileDetail_operation_tag          1
-#define edr_v1_FileDetail_target_path_tag        2
-#define edr_v1_FileDetail_file_size_tag          3
-#define edr_v1_FileDetail_target_has_motw_tag    4
-#define edr_v1_NetworkDetail_src_ip_tag          1
-#define edr_v1_NetworkDetail_src_port_tag        2
-#define edr_v1_NetworkDetail_dst_ip_tag          3
-#define edr_v1_NetworkDetail_dst_port_tag        4
-#define edr_v1_NetworkDetail_protocol_tag        5
-#define edr_v1_DnsDetail_query_name_tag          1
-#define edr_v1_ScriptDetail_snippet_tag          1
-#define edr_v1_RegistryDetail_key_path_tag       1
-#define edr_v1_RegistryDetail_value_name_tag     2
-#define edr_v1_RegistryDetail_value_data_tag     3
-#define edr_v1_RegistryDetail_operation_tag      4
-#define edr_v1_BehaviorEvent_event_id_tag        1
-#define edr_v1_BehaviorEvent_endpoint_id_tag     2
-#define edr_v1_BehaviorEvent_tenant_id_tag       3
-#define edr_v1_BehaviorEvent_type_tag            4
-#define edr_v1_BehaviorEvent_event_time_ns_tag   5
-#define edr_v1_BehaviorEvent_pid_tag             6
-#define edr_v1_BehaviorEvent_ppid_tag            7
-#define edr_v1_BehaviorEvent_process_name_tag    8
-#define edr_v1_BehaviorEvent_cmdline_tag         9
-#define edr_v1_BehaviorEvent_exe_hash_tag        10
-#define edr_v1_BehaviorEvent_exe_path_tag        11
-#define edr_v1_BehaviorEvent_username_tag        12
-#define edr_v1_BehaviorEvent_session_id_tag      13
-#define edr_v1_BehaviorEvent_process_chain_depth_tag 14
-#define edr_v1_BehaviorEvent_process_tag         20
-#define edr_v1_BehaviorEvent_file_tag            21
-#define edr_v1_BehaviorEvent_network_tag         22
-#define edr_v1_BehaviorEvent_registry_tag        23
-#define edr_v1_BehaviorEvent_dns_tag             24
-#define edr_v1_BehaviorEvent_script_tag          25
-#define edr_v1_BehaviorEvent_ave_result_json_tag 30
-#define edr_v1_BehaviorEvent_mitre_ttps_tag      31
-#define edr_v1_BehaviorEvent_priority_tag        32
-#define edr_v1_BehaviorEvent_behavior_alert_tag  40
-#define edr_v1_BehaviorEvent_ave_behavior_feed_tag 41
 #define edr_v1_AveBehaviorEventFeed_severity_hint_tag 1
 #define edr_v1_AveBehaviorEventFeed_target_path_tag 2
 #define edr_v1_AveBehaviorEventFeed_target_path_entropy_tag 3
@@ -235,49 +211,110 @@ extern "C" {
 #define edr_v1_AveBehaviorEventFeed_behavior_flags_tag 27
 #define edr_v1_AveBehaviorEventFeed_file_sha256_hex_tag 28
 #define edr_v1_AveBehaviorEventFeed_ave_event_type_tag 29
-#define edr_v1_BehaviorAlert_anomaly_score_tag         1
-#define edr_v1_BehaviorAlert_tactic_probs_tag          2
-#define edr_v1_BehaviorAlert_triggered_tactics_tag     3
-#define edr_v1_BehaviorAlert_skip_ai_analysis_tag      4
-#define edr_v1_BehaviorAlert_needs_l2_review_tag       5
-#define edr_v1_BehaviorAlert_timestamp_ns_tag          6
-#define edr_v1_BehaviorAlert_pid_tag                   7
-#define edr_v1_BehaviorAlert_process_name_tag          8
-#define edr_v1_BehaviorAlert_process_path_tag          9
+#define edr_v1_BehaviorAlert_anomaly_score_tag   1
+#define edr_v1_BehaviorAlert_tactic_probs_tag    2
+#define edr_v1_BehaviorAlert_triggered_tactics_tag 3
+#define edr_v1_BehaviorAlert_skip_ai_analysis_tag 4
+#define edr_v1_BehaviorAlert_needs_l2_review_tag 5
+#define edr_v1_BehaviorAlert_timestamp_ns_tag    6
+#define edr_v1_BehaviorAlert_pid_tag             7
+#define edr_v1_BehaviorAlert_process_name_tag    8
+#define edr_v1_BehaviorAlert_process_path_tag    9
+#define edr_v1_BehaviorAlert_related_iocs_json_tag 10
+#define edr_v1_BehaviorAlert_user_subject_json_tag 11
+#define edr_v1_ProcessDetail_parent_name_tag     1
+#define edr_v1_ProcessDetail_parent_path_tag     2
+#define edr_v1_ProcessDetail_integrity_level_tag 3
+#define edr_v1_FileDetail_operation_tag          1
+#define edr_v1_FileDetail_target_path_tag        2
+#define edr_v1_FileDetail_file_size_tag          3
+#define edr_v1_FileDetail_target_has_motw_tag    4
+#define edr_v1_RegistryDetail_key_path_tag       1
+#define edr_v1_RegistryDetail_value_name_tag     2
+#define edr_v1_RegistryDetail_value_data_tag     3
+#define edr_v1_RegistryDetail_operation_tag      4
+#define edr_v1_NetworkDetail_src_ip_tag          1
+#define edr_v1_NetworkDetail_src_port_tag        2
+#define edr_v1_NetworkDetail_dst_ip_tag          3
+#define edr_v1_NetworkDetail_dst_port_tag        4
+#define edr_v1_NetworkDetail_protocol_tag        5
+#define edr_v1_NetworkDetail_network_aux_path_tag 6
+#define edr_v1_DnsDetail_query_name_tag          1
+#define edr_v1_ScriptDetail_snippet_tag          1
+#define edr_v1_BehaviorEvent_event_id_tag        1
+#define edr_v1_BehaviorEvent_endpoint_id_tag     2
+#define edr_v1_BehaviorEvent_tenant_id_tag       3
+#define edr_v1_BehaviorEvent_type_tag            4
+#define edr_v1_BehaviorEvent_event_time_ns_tag   5
+#define edr_v1_BehaviorEvent_pid_tag             6
+#define edr_v1_BehaviorEvent_ppid_tag            7
+#define edr_v1_BehaviorEvent_process_name_tag    8
+#define edr_v1_BehaviorEvent_cmdline_tag         9
+#define edr_v1_BehaviorEvent_exe_hash_tag        10
+#define edr_v1_BehaviorEvent_exe_path_tag        11
+#define edr_v1_BehaviorEvent_username_tag        12
+#define edr_v1_BehaviorEvent_session_id_tag      13
+#define edr_v1_BehaviorEvent_process_chain_depth_tag 14
+#define edr_v1_BehaviorEvent_process_tag         20
+#define edr_v1_BehaviorEvent_file_tag            21
+#define edr_v1_BehaviorEvent_network_tag         22
+#define edr_v1_BehaviorEvent_registry_tag        23
+#define edr_v1_BehaviorEvent_dns_tag             24
+#define edr_v1_BehaviorEvent_script_tag          25
+#define edr_v1_BehaviorEvent_ave_result_json_tag 30
+#define edr_v1_BehaviorEvent_mitre_ttps_tag      31
+#define edr_v1_BehaviorEvent_priority_tag        32
+#define edr_v1_BehaviorEvent_behavior_alert_tag  40
+#define edr_v1_BehaviorEvent_ave_behavior_feed_tag 41
 
 /* Struct field encoding specification for nanopb */
 #define edr_v1_AveBehaviorEventFeed_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, UINT32,   severity_hint,        1) \
-X(a, STATIC,   SINGULAR, STRING,   target_path,          2) \
-X(a, STATIC,   SINGULAR, FLOAT,    target_path_entropy,  3) \
-X(a, STATIC,   SINGULAR, BOOL,     target_is_system_dir, 4) \
+X(a, STATIC,   SINGULAR, UINT32,   severity_hint,     1) \
+X(a, STATIC,   SINGULAR, STRING,   target_path,       2) \
+X(a, STATIC,   SINGULAR, FLOAT,    target_path_entropy,   3) \
+X(a, STATIC,   SINGULAR, BOOL,     target_is_system_dir,   4) \
 X(a, STATIC,   SINGULAR, BOOL,     target_is_temp_dir,   5) \
-X(a, STATIC,   SINGULAR, BOOL,     target_is_network_path, 6) \
-X(a, STATIC,   SINGULAR, UINT32,   target_file_ext_risk, 7) \
-X(a, STATIC,   SINGULAR, BOOL,     target_has_motw,      8) \
-X(a, STATIC,   SINGULAR, STRING,   target_ip,            9) \
-X(a, STATIC,   SINGULAR, STRING,   target_domain,       10) \
-X(a, STATIC,   SINGULAR, UINT32,   target_port,         11) \
-X(a, STATIC,   SINGULAR, BOOL,     target_ip_is_public, 12) \
-X(a, STATIC,   SINGULAR, FLOAT,    target_ip_geoip_risk, 13) \
-X(a, STATIC,   SINGULAR, FLOAT,    target_port_risk,    14) \
-X(a, STATIC,   SINGULAR, FLOAT,    target_domain_entropy, 15) \
-X(a, STATIC,   SINGULAR, FLOAT,    reg_key_risk,        16) \
-X(a, STATIC,   SINGULAR, FLOAT,    shellcode_score,     17) \
-X(a, STATIC,   SINGULAR, FLOAT,    webshell_score,      18) \
-X(a, STATIC,   SINGULAR, FLOAT,    pmfe_confidence,     19) \
-X(a, STATIC,   SINGULAR, BOOL,     pmfe_pe_found,       20) \
-X(a, STATIC,   SINGULAR, BOOL,     pmfe_dns_tunnel,     21) \
-X(a, STATIC,   SINGULAR, BOOL,     ioc_ip_hit,          22) \
-X(a, STATIC,   SINGULAR, BOOL,     ioc_domain_hit,      23) \
-X(a, STATIC,   SINGULAR, BOOL,     ioc_sha256_hit,      24) \
-X(a, STATIC,   SINGULAR, BOOL,     cert_revoked_ancestor, 25) \
-X(a, STATIC,   SINGULAR, FLOAT,    ave_confidence,      26) \
-X(a, STATIC,   SINGULAR, UINT64,   behavior_flags,      27) \
-X(a, STATIC,   SINGULAR, STRING,   file_sha256_hex,     28) \
-X(a, STATIC,   OPTIONAL, INT32,    ave_event_type,      29)
+X(a, STATIC,   SINGULAR, BOOL,     target_is_network_path,   6) \
+X(a, STATIC,   SINGULAR, UINT32,   target_file_ext_risk,   7) \
+X(a, STATIC,   SINGULAR, BOOL,     target_has_motw,   8) \
+X(a, STATIC,   SINGULAR, STRING,   target_ip,         9) \
+X(a, STATIC,   SINGULAR, STRING,   target_domain,    10) \
+X(a, STATIC,   SINGULAR, UINT32,   target_port,      11) \
+X(a, STATIC,   SINGULAR, BOOL,     target_ip_is_public,  12) \
+X(a, STATIC,   SINGULAR, FLOAT,    target_ip_geoip_risk,  13) \
+X(a, STATIC,   SINGULAR, FLOAT,    target_port_risk,  14) \
+X(a, STATIC,   SINGULAR, FLOAT,    target_domain_entropy,  15) \
+X(a, STATIC,   SINGULAR, FLOAT,    reg_key_risk,     16) \
+X(a, STATIC,   SINGULAR, FLOAT,    shellcode_score,  17) \
+X(a, STATIC,   SINGULAR, FLOAT,    webshell_score,   18) \
+X(a, STATIC,   SINGULAR, FLOAT,    pmfe_confidence,  19) \
+X(a, STATIC,   SINGULAR, BOOL,     pmfe_pe_found,    20) \
+X(a, STATIC,   SINGULAR, BOOL,     pmfe_dns_tunnel,  21) \
+X(a, STATIC,   SINGULAR, BOOL,     ioc_ip_hit,       22) \
+X(a, STATIC,   SINGULAR, BOOL,     ioc_domain_hit,   23) \
+X(a, STATIC,   SINGULAR, BOOL,     ioc_sha256_hit,   24) \
+X(a, STATIC,   SINGULAR, BOOL,     cert_revoked_ancestor,  25) \
+X(a, STATIC,   SINGULAR, FLOAT,    ave_confidence,   26) \
+X(a, STATIC,   SINGULAR, UINT64,   behavior_flags,   27) \
+X(a, STATIC,   SINGULAR, STRING,   file_sha256_hex,  28) \
+X(a, STATIC,   OPTIONAL, INT32,    ave_event_type,   29)
 #define edr_v1_AveBehaviorEventFeed_CALLBACK NULL
 #define edr_v1_AveBehaviorEventFeed_DEFAULT NULL
+
+#define edr_v1_BehaviorAlert_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, FLOAT,    anomaly_score,     1) \
+X(a, STATIC,   REPEATED, FLOAT,    tactic_probs,      2) \
+X(a, STATIC,   SINGULAR, STRING,   triggered_tactics,   3) \
+X(a, STATIC,   SINGULAR, BOOL,     skip_ai_analysis,   4) \
+X(a, STATIC,   SINGULAR, BOOL,     needs_l2_review,   5) \
+X(a, STATIC,   SINGULAR, INT64,    timestamp_ns,      6) \
+X(a, STATIC,   SINGULAR, UINT32,   pid,               7) \
+X(a, STATIC,   SINGULAR, STRING,   process_name,      8) \
+X(a, STATIC,   SINGULAR, STRING,   process_path,      9) \
+X(a, STATIC,   SINGULAR, STRING,   related_iocs_json,  10) \
+X(a, STATIC,   SINGULAR, STRING,   user_subject_json,  11)
+#define edr_v1_BehaviorAlert_CALLBACK NULL
+#define edr_v1_BehaviorAlert_DEFAULT NULL
 
 #define edr_v1_BehaviorEvent_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   event_id,          1) \
@@ -293,7 +330,7 @@ X(a, STATIC,   SINGULAR, STRING,   exe_hash,         10) \
 X(a, STATIC,   SINGULAR, STRING,   exe_path,         11) \
 X(a, STATIC,   SINGULAR, STRING,   username,         12) \
 X(a, STATIC,   SINGULAR, UINT32,   session_id,       13) \
-X(a, STATIC,   SINGULAR, UINT32,   process_chain_depth, 14) \
+X(a, STATIC,   SINGULAR, UINT32,   process_chain_depth,  14) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (detail,process,detail.process),  20) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (detail,file,detail.file),  21) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (detail,network,detail.network),  22) \
@@ -304,7 +341,7 @@ X(a, STATIC,   SINGULAR, STRING,   ave_result_json,  30) \
 X(a, STATIC,   REPEATED, STRING,   mitre_ttps,       31) \
 X(a, STATIC,   SINGULAR, UINT32,   priority,         32) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  behavior_alert,   40) \
-X(a, STATIC,   OPTIONAL, MESSAGE,  ave_behavior_feed, 41)
+X(a, STATIC,   OPTIONAL, MESSAGE,  ave_behavior_feed,  41)
 #define edr_v1_BehaviorEvent_CALLBACK NULL
 #define edr_v1_BehaviorEvent_DEFAULT NULL
 #define edr_v1_BehaviorEvent_detail_process_MSGTYPE edr_v1_ProcessDetail
@@ -315,21 +352,6 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  ave_behavior_feed, 41)
 #define edr_v1_BehaviorEvent_detail_script_MSGTYPE edr_v1_ScriptDetail
 #define edr_v1_BehaviorEvent_behavior_alert_MSGTYPE edr_v1_BehaviorAlert
 #define edr_v1_BehaviorEvent_ave_behavior_feed_MSGTYPE edr_v1_AveBehaviorEventFeed
-
-#define edr_v1_BehaviorAlert_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, FLOAT,    anomaly_score,     1) \
-X(a, STATIC,   REPEATED, FLOAT,    tactic_probs,      2) \
-X(a, STATIC,   SINGULAR, STRING,   triggered_tactics, 3) \
-X(a, STATIC,   SINGULAR, BOOL,     skip_ai_analysis,  4) \
-X(a, STATIC,   SINGULAR, BOOL,     needs_l2_review,   5) \
-X(a, STATIC,   SINGULAR, INT64,    timestamp_ns,      6) \
-X(a, STATIC,   SINGULAR, UINT32,   pid,               7) \
-X(a, STATIC,   SINGULAR, STRING,   process_name,      8) \
-X(a, STATIC,   SINGULAR, STRING,   process_path,      9) \
-X(a, STATIC,   SINGULAR, STRING,   related_iocs_json, 10) \
-X(a, STATIC,   SINGULAR, STRING,   user_subject_json, 11)
-#define edr_v1_BehaviorAlert_CALLBACK NULL
-#define edr_v1_BehaviorAlert_DEFAULT NULL
 
 #define edr_v1_ProcessDetail_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   parent_name,       1) \
@@ -346,12 +368,21 @@ X(a, STATIC,   SINGULAR, BOOL,     target_has_motw,   4)
 #define edr_v1_FileDetail_CALLBACK NULL
 #define edr_v1_FileDetail_DEFAULT NULL
 
+#define edr_v1_RegistryDetail_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   key_path,          1) \
+X(a, STATIC,   SINGULAR, STRING,   value_name,        2) \
+X(a, STATIC,   SINGULAR, STRING,   value_data,        3) \
+X(a, STATIC,   SINGULAR, STRING,   operation,         4)
+#define edr_v1_RegistryDetail_CALLBACK NULL
+#define edr_v1_RegistryDetail_DEFAULT NULL
+
 #define edr_v1_NetworkDetail_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   src_ip,            1) \
 X(a, STATIC,   SINGULAR, UINT32,   src_port,          2) \
 X(a, STATIC,   SINGULAR, STRING,   dst_ip,            3) \
 X(a, STATIC,   SINGULAR, UINT32,   dst_port,          4) \
-X(a, STATIC,   SINGULAR, STRING,   protocol,          5)
+X(a, STATIC,   SINGULAR, STRING,   protocol,          5) \
+X(a, STATIC,   SINGULAR, STRING,   network_aux_path,   6)
 #define edr_v1_NetworkDetail_CALLBACK NULL
 #define edr_v1_NetworkDetail_DEFAULT NULL
 
@@ -365,46 +396,38 @@ X(a, STATIC,   SINGULAR, STRING,   snippet,           1)
 #define edr_v1_ScriptDetail_CALLBACK NULL
 #define edr_v1_ScriptDetail_DEFAULT NULL
 
-#define edr_v1_RegistryDetail_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, STRING,   key_path,          1) \
-X(a, STATIC,   SINGULAR, STRING,   value_name,        2) \
-X(a, STATIC,   SINGULAR, STRING,   value_data,        3) \
-X(a, STATIC,   SINGULAR, STRING,   operation,         4)
-#define edr_v1_RegistryDetail_CALLBACK NULL
-#define edr_v1_RegistryDetail_DEFAULT NULL
-
-extern const pb_msgdesc_t edr_v1_BehaviorEvent_msg;
 extern const pb_msgdesc_t edr_v1_AveBehaviorEventFeed_msg;
 extern const pb_msgdesc_t edr_v1_BehaviorAlert_msg;
+extern const pb_msgdesc_t edr_v1_BehaviorEvent_msg;
 extern const pb_msgdesc_t edr_v1_ProcessDetail_msg;
 extern const pb_msgdesc_t edr_v1_FileDetail_msg;
+extern const pb_msgdesc_t edr_v1_RegistryDetail_msg;
 extern const pb_msgdesc_t edr_v1_NetworkDetail_msg;
 extern const pb_msgdesc_t edr_v1_DnsDetail_msg;
 extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
-extern const pb_msgdesc_t edr_v1_RegistryDetail_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
-#define edr_v1_BehaviorEvent_fields &edr_v1_BehaviorEvent_msg
 #define edr_v1_AveBehaviorEventFeed_fields &edr_v1_AveBehaviorEventFeed_msg
 #define edr_v1_BehaviorAlert_fields &edr_v1_BehaviorAlert_msg
+#define edr_v1_BehaviorEvent_fields &edr_v1_BehaviorEvent_msg
 #define edr_v1_ProcessDetail_fields &edr_v1_ProcessDetail_msg
 #define edr_v1_FileDetail_fields &edr_v1_FileDetail_msg
+#define edr_v1_RegistryDetail_fields &edr_v1_RegistryDetail_msg
 #define edr_v1_NetworkDetail_fields &edr_v1_NetworkDetail_msg
 #define edr_v1_DnsDetail_fields &edr_v1_DnsDetail_msg
 #define edr_v1_ScriptDetail_fields &edr_v1_ScriptDetail_msg
-#define edr_v1_RegistryDetail_fields &edr_v1_RegistryDetail_msg
 
 /* Maximum encoded size of messages (where known) */
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
-#define edr_v1_AveBehaviorEventFeed_size         2700
-#define edr_v1_BehaviorEvent_size                35000
-#define edr_v1_BehaviorAlert_size                12000
+#define edr_v1_AveBehaviorEventFeed_size         1792
+#define edr_v1_BehaviorAlert_size                7012
+#define edr_v1_BehaviorEvent_size                25676
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   1072
-#define edr_v1_NetworkDetail_size                159
+#define edr_v1_NetworkDetail_size                1185
 #define edr_v1_ProcessDetail_size                837
+#define edr_v1_RegistryDetail_size               9767
 #define edr_v1_ScriptDetail_size                 1026
-#define edr_v1_RegistryDetail_size               9800
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -6,11 +6,13 @@
 #error Regenerate this file with the current version of nanopb generator.
 #endif
 
+PB_BIND(edr_v1_AveBehaviorEventFeed, edr_v1_AveBehaviorEventFeed, 2)
+
+
 PB_BIND(edr_v1_BehaviorAlert, edr_v1_BehaviorAlert, 2)
 
-PB_BIND(edr_v1_AveBehaviorEventFeed, edr_v1_AveBehaviorEventFeed, 8)
 
-PB_BIND(edr_v1_BehaviorEvent, edr_v1_BehaviorEvent, 8)
+PB_BIND(edr_v1_BehaviorEvent, edr_v1_BehaviorEvent, 4)
 
 
 PB_BIND(edr_v1_ProcessDetail, edr_v1_ProcessDetail, 2)
@@ -19,7 +21,10 @@ PB_BIND(edr_v1_ProcessDetail, edr_v1_ProcessDetail, 2)
 PB_BIND(edr_v1_FileDetail, edr_v1_FileDetail, 2)
 
 
-PB_BIND(edr_v1_NetworkDetail, edr_v1_NetworkDetail, AUTO)
+PB_BIND(edr_v1_RegistryDetail, edr_v1_RegistryDetail, 4)
+
+
+PB_BIND(edr_v1_NetworkDetail, edr_v1_NetworkDetail, 2)
 
 
 PB_BIND(edr_v1_DnsDetail, edr_v1_DnsDetail, 2)
@@ -27,6 +32,5 @@ PB_BIND(edr_v1_DnsDetail, edr_v1_DnsDetail, 2)
 
 PB_BIND(edr_v1_ScriptDetail, edr_v1_ScriptDetail, 2)
 
-PB_BIND(edr_v1_RegistryDetail, edr_v1_RegistryDetail, 4)
 
 

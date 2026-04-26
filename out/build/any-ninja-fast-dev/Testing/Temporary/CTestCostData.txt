@@ -1,0 +1,2 @@
+test_event_bus_mpmc_stress 1 0.726541
+---

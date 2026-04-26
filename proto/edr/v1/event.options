@@ -20,6 +20,7 @@ edr.v1.FileDetail.target_path max_size:1024
 edr.v1.NetworkDetail.src_ip max_size:64
 edr.v1.NetworkDetail.dst_ip max_size:64
 edr.v1.NetworkDetail.protocol max_size:16
+edr.v1.NetworkDetail.network_aux_path max_size:1024
 
 edr.v1.DnsDetail.query_name max_size:512
 

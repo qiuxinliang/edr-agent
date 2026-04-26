@@ -44,6 +44,8 @@ typedef struct {
   uint32_t net_sport;
   uint32_t net_dport;
   char net_proto[16];
+  /** 少数 network 规则用 `file_path_regex_any` 时对 `NetworkAuxPath` 求值（与平台 payload 一致） */
+  char network_aux_path[EDR_BR_STR_LONG];
 
   char dns_query[EDR_BR_STR_MID];
   /** 注册表（ETW Kernel-Registry → `RegistryDetail` / payload category=registry） */

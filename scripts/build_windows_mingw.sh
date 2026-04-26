@@ -14,6 +14,22 @@ OUTDIR="${ROOT}/build-mingw"
 REQUIRE_GRPC="${EDR_REQUIRE_GRPC:-1}"
 GRPC_PREFIX="${EDR_MINGW_GRPC_PREFIX:-}"
 
+print_build_fingerprint() {
+  local bin_path="$1"
+  local git_short git_dirty bin_sha bin_mtime
+  git_short="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  git_dirty="$(git -C "$ROOT" diff --quiet 2>/dev/null; rc=$?; [[ $rc -eq 0 ]] && echo clean || echo dirty)"
+  if command -v shasum >/dev/null 2>&1; then
+    bin_sha="$(shasum -a 256 "$bin_path" 2>/dev/null | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    bin_sha="$(sha256sum "$bin_path" 2>/dev/null | awk '{print $1}')"
+  else
+    bin_sha="unknown"
+  fi
+  bin_mtime="$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%S%z" "$bin_path" 2>/dev/null || stat -c "%y" "$bin_path" 2>/dev/null || echo unknown)"
+  echo "OK: build fingerprint git=${git_short}(${git_dirty}) sha256=${bin_sha} mtime=${bin_mtime} bin=${bin_path}"
+}
+
 mingw_gcc_path() {
   if [[ -n "${MINGW_PREFIX:-}" ]]; then
     echo "${MINGW_PREFIX%/}/bin/x86_64-w64-mingw32-gcc"
@@ -49,6 +65,11 @@ build_local() {
   cmake --build "$OUTDIR" --target edr_agent -j"${NPROC:-4}"
   echo "OK: $OUTDIR/edr_agent.exe (MinGW)"
   ls -la "$OUTDIR"/edr_agent.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent 2>/dev/null || true
+  if [[ -f "$OUTDIR/edr_agent.exe" ]]; then
+    print_build_fingerprint "$OUTDIR/edr_agent.exe"
+  elif [[ -f "$OUTDIR/edr_agent" ]]; then
+    print_build_fingerprint "$OUTDIR/edr_agent"
+  fi
 }
 
 if [[ -n "${MINGW_PREFIX:-}" ]]; then

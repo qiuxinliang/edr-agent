@@ -1,5 +1,7 @@
 ﻿#Requires -Version 5.1
 # Harmless EDR end-to-end smoke. Run only on lab/VM. Rule IDs: see edr-backend .../dynamic_rules_v1.json
+# P0 直出联调：Agent 上设 EDR_P0_DIRECT_EMIT=1 且 EDR_BEHAVIOR_ENCODING=protobuf 后，平台 alerts 应出现
+#   user_subject_json.subject_type=edr_dynamic_rule 或 Title 为 [规则] R-…（见 EDR_P0_DIRECT_EMIT_E2E.md）
 # Do not use multiline <# #> help here: some hosts save UTF-8 without BOM; PS 5.1 may break parsing.
 # Install copy: keep file as UTF-8 with BOM, or use ASCII-only. See README in repo.
 param(

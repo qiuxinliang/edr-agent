@@ -233,6 +233,7 @@ cmake --build build
 - `collection.max_event_queue_size`：事件总线槽数。
 - `preprocessing.*`：去重窗口、高频阈值、白名单采样等；**`[[preprocessing.rules]]`** 可配置路径/命令行等 **子串规则**（`drop` / `emit_always`），在 dedup 之前匹配，**条数无 64 条硬顶**（堆分配），详见 **`docs/PREPROCESS_RULES.md`**。
 - `collection.etw_enabled`（仅 Windows）：是否启用 ETW 采集；`false` 可关闭 ETW。
+- `collection.etw_*_provider`（仅 Windows，**A4.3**）：除 **Kernel-Process / Kernel-File / Kernel-Network / Kernel-Registry** 为 mandatory 外，**DNS-Client、PowerShell、Security-Auditing、WMI、TCPIP、WFAS** 各有独立布尔（`agent.toml.example`）；默认 **true**。**关**某 Provider 会缩内核/解析负载，**须与** `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` **对表**，避免 P0 漏报。
 
 ### 环境变量索引（运行时）
 
@@ -246,6 +247,16 @@ cmake --build build
 | `EDR_QUEUE_MAX_DB_MB` | 队列库文件大小上限（MB，粗粒度 `stat`），超出则拒绝新入队；未设置则不限制。（当前非 Windows 生效） |
 | `EDR_BEHAVIOR_ENCODING` | 见「Protobuf（nanopb）」：`protobuf` / `protobuf_c` / 默认 BER1。 |
 | `EDR_BEHAVIOR_USER_SUBJECT_JSON` | 若设为以 `{` 开头的 JSON 串且长度 < 1KiB，行为告警触发时写入 **`AVEBehaviorAlert.user_subject_json`**，经 ingest 入平台 `alerts.user_subject_json`（**调试用/专线**；与 `edr-backend` 000057 对账）。 |
+| `EDR_P0_DIRECT_EMIT` | `=1` 时，预处理在 **P0 子集**上直出 `BehaviorAlert`（`user_subject_json.subject_type=edr_dynamic_rule`）；**默认关**，见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。 |
+| `EDR_P0_DEDUP_SEC` | P0 直出对同一 `(rule_id,endpoint_id,pid)` 的**秒级去重**；默认 `2`；`0` 关。 |
+| `EDR_P0_MAX_EMITS_PER_MIN` | P0 直出**全进程**滑动 60s 内条数上限；`0` 或未设=不限制。 |
+| `EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT` | 按 **tenant_id** 独立滑动 60s 内条数上限；**默认 60/分**；`0` 为关闭**每租户**限流（仍受上项全局限制，若有）。`tenant_id` 空串视为同桶。 |
+| `EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT` | 按 **endpoint_id** 独立滑动 60s 内条数上限；**默认 0=关闭**；与上两项叠加。`endpoint_id` 空串同桶。 |
+| （编译期）`EDR_P0_RULES_BUNDLE_VERSION` | 由 **CMake** `-D` / 默认串 注入 `p0_rule_direct_emit.c`，须与 `config/p0_rule_bundle_manifest.json`、**`p0_rule_bundle_ir_v1.json`** 及平台 `dynamic_rules_v1.json` 根 `version` **一致**；发版前跑 **`edr-backend/scripts/verify_p0_bundle_version_alignment.sh`**（四处对账）。 |
+| （CMake）`EDR_P0_IR_EMBED` | 默认 **ON**（需 **Python3**）：构建时从 `config/p0_rule_bundle_ir_v1.json` 生成 `edr_p0_rule_ir_embed.c` 并入链接；运行期**先**读外置 JSON（`EDR_P0_IR_PATH` / `edr_config/`），读失败或**无可求值** P0 规则时再 **回退** 到嵌入字节。`p0_rule_bundle_ir_v1` 中 `event_type` 与 Go `dynamicrules` 同构（如 `process_create` / `file_write` / `network_connect` / `registry_set`）。设为 **OFF** 可跳过生成（无 Python 的极简环境）。 |
+| （开发）P0 C 对拍 | 改 `p0_golden_vectors.json` 后 **`python3 edr-agent/scripts/gen_p0_golden_vectors_inc.py`**（**仅** `process_create` 写入 `p0_golden_vectors_data.inc`；其它 event 由 Go 金线 + **`edr_p0_ir_record_golden_test`** 覆盖，需 **PCRE2**）。`ctest -R edr_p0_` 或跑 `edr_p0_golden_test` / `edr_p0_ir_record_golden_test`。无 PCRE2 时 PC 行仍 **legacy** 与 Go 对拍。 |
+| （开发）A4.1 总线 | **`ctest -R test_event_bus_mpmc_stress`** 或 **`bash scripts/run_event_bus_mpmc_stress.sh`**；长 soak 见 `docs/OPS_PROFILE_AND_RELEASE.md` 与测试源 `tests/test_event_bus_mpmc_stress.c`（`[ms] [producers] [cap]`）。 |
+| （monorepo）合并前**推荐** | 仓库根 **`bash edr-backend/scripts/recommended_p0_pr_gates.sh`**：六段**机读**（version、金线、TDH try-order、ETW1 槽文本、**A2.3 P3 UserData 十六进制金体**、**Go P0 manifest**）。`edr-agent` **CI** Ubuntu **precheck** 与上式 **6/6** 一致（另含 preprocess gray-release 预检）。全量 B2.4 留档用 **`bash edr-backend/scripts/collect_p0_b24_evidence.sh`** 或一键 **`bash edr-backend/scripts/p0_pack_machine_gates.sh`**。 |
 | `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / forensic**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
 | `EDR_CMD_KILL_ALLOWLIST` | 若设置（逗号分隔 PID 列表），**kill** 仅允许终止列表内进程（仍须先满足高危策略）；未设置则不限制 PID。 |
 | `EDR_CMD_AUDIT_PATH` | 若设置，高危指令审计**追加**写入该文件（带时间戳）；stderr 仍会打印 `[command][audit]`。 |
@@ -257,6 +268,18 @@ cmake --build build
 | `EDR_REMOTE_CONFIG_POLL_S` | 与上一项配合：轮询间隔秒数；未设置或 `0` 则禁用远程拉取。 |
 | `EDR_AVE_INFER_DRY_RUN` | `=1` 时 **`edr_ave_infer_file`** 不调用真实后端，返回占位 **`EdrAveInferResult`**（集成测试/联调；生产应启用 **`EDR_WITH_ONNXRUNTIME`** 并勿依赖此项）。 |
 | `EDR_AVE_ONNX_IN_LEN` | （可选）ONNX 输入含**动态长度**轴时，用作该轴默认元素个数（默认 **4096**）；需与模型一致。 |
+| `EDR_AVE_ETW_FEED` | **仅 Windows**：`=0` 关闭 ETW→`AVE_FeedEvent`；默认开。`AVE_NotifyProcessExit` 仍随进程结束上报。见 **`Cauld Design/EDR_P0_Field_Matrix_Signoff.md`（A3）**。 |
+| `EDR_AVE_ETW_FEED_EVERY_N` | **仅 Windows、仅 AVE**：`N>1` 时对**非** `PROCESS_TERMINATE` 的 `AVE_FeedEvent` 做 1/**N** 分频，**不**影响 TDH 建槽与总线。用于行为 ONNX/启发式**减负**；与 P0 规则/漏报策略 **会签** 后启用。`N=1` 或未设置=全量。 |
+| `EDR_AVE_ETW_ASYNC` | **仅 Windows、仅 AVE、默认关**（A3.2 大全套）：`1` 或 `true`/`yes` 时，非 terminate 事件 `AVE_FeedEvent` 先入队（**256 槽**）再经**单工作线程**调用，与 TDH/入总线**解耦**；`PROCESS_TERMINATE` 仍**同步** `AVE_NotifyProcessExit`。**队列满**时回退**同回调线程同步** `AVE_FeedEvent`，不丢项。可与此表上一行**叠加**分频。 |
+| `EDR_ETW_BUFFER_KB` | **仅 Windows**：覆盖 `[collection] etw_buffer_kb`，实时 ETW 会话每缓冲 **KB**（4–1024，缺省 64）。与内核侧丢包/驻留有关；调参见 A4.2 / `docs/OPS_PROFILE_AND_RELEASE.md`。 |
+| `EDR_ETW_FLUSH_TIMER_S` | **仅 Windows**：覆盖 `[collection] etw_flush_timer_s`，`FlushTimer` **秒**（1–300，缺省 1）。 |
+| `EDR_TDH_LIGHT_PATH` | **仅 Windows、A3.3 首版**：`1`/`y` 时，**Microsoft-Windows-DNS-Client** 在已解出 `qname` 时**不**再拉 `QueryType`；未解出时与关时相同走全量 `dns_try`。缺省/未设/`0` = 与旧版一致（始终试 qname+qtype）。依赖 `qtype` 的规则在开启时可能无 `qtype` 行。 |
+| `EDR_TDH_LIGHT_PATH_PS` | **仅 Windows、A3.3+（会签 v1.1+ / 白名单 建议）**：`1`/`y` 时，**Microsoft-Windows-PowerShell** 先只试 `ScriptBlockText`；若**未**解出 `script` 行再全量 `ScriptBlockText`+`Path`（与关时相同）。仅 `path` 的 P0 在「有 script 行」时可能**少** `path` 行，须与 [`EDR_P0_Field_Matrix_Signoff`](../Cauld%20Design/EDR_P0_Field_Matrix_Signoff.md) 附录对表。 |
+| `EDR_TDH_LIGHT_PATH_TCPIP` | **仅 Windows、A3.3+ P1 扩面（默认关）**：`1`/`y` 时，**Microsoft-Windows-TCPIP** 且 **EventId=1002**（监听/绑定类）**先** 试 `LocalAddress` / `LocalPort` / `PID` 子集，**任一线条未产生槽文本** 再回退**全** `tcpip_try`。其它 EventId 行为不变。会签/P0 对表后启用；与 `EDR_TDH_LIGHT_PATH`（DNS）/ `EDR_TDH_LIGHT_PATH_PS` 独立。 |
+| `EDR_A44_SPLIT_PATH` | **仅 Windows、A4.4 第二期**（**默认关**）：`1`/`y` 时，ETW 回调在 `UserData` ≤32KiB 且 `ExtendedDataCount==0` 时**有界 入队**；**解线程** 再跑与 `edr_collector_tdh_to_bus` 等价的 `Tdh* → 入总线`。`ExtendedData` 或 超长 走**同线程**同步解。队满时 `a44_q_drops` 累计并**同线程**重试、**不**丢。与 `EDR_A44_CB_PHASE_MEAS` 可叠。见 [ADR A4.4](../Cauld%20Design/ADR_A4.4_ETW_Receive_Path_Decouple.md) **§5**。 |
+| `EDR_A44_CB_PHASE_MEAS` | **仅 Windows、A4.4 第一期**：`1`/`y` 时在 `EventRecordCallback` 对 **pre-TDH**（map+AVE+slot 初始化）、`edr_tdh_build_slot_payload`、`edr_event_bus_try_push` 三段**分别**做 QPC 纳秒累计；在 **`EDR_ETW_OBS=1` 的 `[etw_obs]` 行**末尾追加 `a44_us_avg[pre,tdh,bus]=[…] a44_n=[…]`（**各段** 平均 us 与样本数，bus 段仅非空载荷）。**不**开 `EDR_ETW_OBS` 时仍累加、但不打印。见 Cauld [`ADR_A4.4`](../Cauld%20Design/ADR_A4.4_ETW_Receive_Path_Decouple.md)。多 Provider 早返扩面见 [`EDR_A3.3_P1_Light_Path_Expansion`](../Cauld%20Design/EDR_A3.3_P1_Light_Path_Expansion.md)。 |
+| `EDR_ETW_OBS` | **仅 Windows**：`=1`（或 `y`/`Y`）时，在 **`EDR_CONSOLE_HEARTBEAT_SEC` 同周期** 的 `[heartbeat]` 后多打一行 `[etw_obs]`（累计：非本机 ETW 回调、按 `prov` tag 分桶、`edr_tdh_build_slot_payload` 空载荷次数、总线 `push`/`drop`/占用、`TdhGetProperty*` API 错误与行成功、粗 `err%`）。**A1.2 同机基线 10+ min 步骤**见 `scripts/etw_observability_baseline.sh` 与 **[`Cauld Design/EDR_A1.2_ETW_Observability_Baseline.md`](../Cauld%20Design/EDR_A1.2_ETW_Observability_Baseline.md)**；TDH 回归范围见 **`../Cauld Design/EDR_A2.3_TDH_Regression_Coverage.md`**；**B3.1 / D1.1 简表**见 `docs/OPS_PROFILE_AND_RELEASE.md`。 |
+| `EDR_ETW_OBS_EXPORT_PATH` | **仅 Windows、P2**：在 **`EDR_ETW_OBS=1` 时** 将**同一条** `[etw_obs]` 行以追加方式写入该路径（ASCII/UTF-8 路径；`fopen` 失败时 stderr 提示一次并关镜像）。便于本机/共享盘上由 **log shipper** 外送。 |
 | `EDR_RESOURCE_STRICT` | `=1` 时即使 `cpu_limit_percent` &lt; 5 也做 CPU 监控（否则跳过以免默认 1% 刷屏）。 |
 | `EDR_SELF_PROTECT_WATCHDOG` | `=1` 时周期性 stderr 心跳（极粗看门狗）；与 TOML **`[self_protect] watchdog_log_interval_s`** 可并存。 |
 | `EDR_SELF_PROTECT_PIDFILE` | 若设置，启动时写入当前 PID（退出时尝试 `remove`）；便于外部进程管理。 |

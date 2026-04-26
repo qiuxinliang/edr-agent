@@ -19,16 +19,29 @@
 #include "edr/config.h"
 #include "edr/etw_guids_win.h"
 #include "edr/etw_tdh_win.h"
+#include "edr/etw_observability_win.h"
+#include "edr/edr_a44_split_path_win.h"
 #include "edr/event_bus.h"
 #include "edr/pmfe.h"
 #include "edr/types.h"
 
 #include "ave_etw_feed_win.h"
-#include "edr/etw_tdh_win.h"
 
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <wchar.h>
+
+/* A4.4 第一期：QPC 差分 → 纳秒（`EDR_A44_CB_PHASE_MEAS=1`） */
+static int64_t edr_win_qpc_elapsed_ns(const LARGE_INTEGER *a, const LARGE_INTEGER *b, const LARGE_INTEGER *freq) {
+  if (!a || !b || !freq || freq->QuadPart == 0) {
+    return 0;
+  }
+  if (b->QuadPart <= a->QuadPart) {
+    return 0;
+  }
+  return (int64_t)((b->QuadPart - a->QuadPart) * 1000000000LL / freq->QuadPart);
+}
 
 static WCHAR g_session_name[] = L"EDR_Agent_RT_001";
 
@@ -97,8 +110,13 @@ static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     *out_tag = "kfile";
+    /* Kernel-File：15=Read（Task 值；12/14/16 为既有 create/write/delete 口径） */
     if (op == 12) {
       *out_type = EDR_EVENT_FILE_CREATE;
+      return;
+    }
+    if (op == 15) {
+      *out_type = EDR_EVENT_FILE_READ;
       return;
     }
     if (op == 14) {
@@ -215,6 +233,79 @@ static uint8_t edr_priority_from_utf8_payload(const uint8_t *data, uint32_t len)
   return 1;
 }
 
+/**
+ * A4.4：解线程/同线程 共用（不再跑 map/pmfe/可观测 回调 计数）。
+ * `edr_collector_decode_from_a44_item` 在 edr_a44_split_path_win.c 侧声明。
+ */
+static void edr_collector_tdh_to_bus(PEVENT_RECORD rec, EdrEventType ty, const char *tag, uint64_t ts_ns) {
+  int a44_meas = edr_etw_observability_a44_cb_phase_meas_enabled();
+  LARGE_INTEGER a44_freq;
+  LARGE_INTEGER t_a44_pre0;
+  LARGE_INTEGER t_a44_pre1;
+  LARGE_INTEGER t_a44_tdh1;
+  if (a44_meas) {
+    (void)QueryPerformanceFrequency(&a44_freq);
+    (void)QueryPerformanceCounter(&t_a44_pre0);
+  }
+  char ave_ip[46];
+  char ave_dom[256];
+  edr_tdh_extract_ave_net_fields(rec, ty, ave_ip, sizeof(ave_ip), ave_dom, sizeof(ave_dom));
+  edr_ave_etw_feed_from_event(rec, ty, ts_ns, ave_ip[0] ? ave_ip : NULL, ave_dom[0] ? ave_dom : NULL);
+
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = ts_ns;
+  slot.type = ty;
+  slot.consumed = false;
+  if (a44_meas) {
+    (void)QueryPerformanceCounter(&t_a44_pre1);
+  }
+  size_t plen = edr_tdh_build_slot_payload(rec, tag, slot.data, EDR_MAX_EVENT_PAYLOAD);
+  if (a44_meas) {
+    (void)QueryPerformanceCounter(&t_a44_tdh1);
+    (void)edr_etw_observability_add_a44_phase_ns(0u, edr_win_qpc_elapsed_ns(&t_a44_pre0, &t_a44_pre1, &a44_freq));
+    (void)edr_etw_observability_add_a44_phase_ns(1u, edr_win_qpc_elapsed_ns(&t_a44_pre1, &t_a44_tdh1, &a44_freq));
+  }
+  if (plen == 0) {
+    edr_etw_observability_on_slot_payload_empty();
+    return;
+  }
+  if (plen > EDR_MAX_EVENT_PAYLOAD) {
+    plen = EDR_MAX_EVENT_PAYLOAD;
+  }
+  slot.size = (uint32_t)plen;
+  slot.priority = edr_priority_from_utf8_payload(slot.data, slot.size);
+  {
+    const GUID *g = &rec->EventHeader.ProviderId;
+    if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
+      USHORT eid = rec->EventHeader.EventDescriptor.Id;
+      slot.priority = (eid == 1002u) ? 1u : 2u;
+      slot.attack_surface_hint = 1u;
+    } else if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
+      slot.priority = 0u;
+      slot.attack_surface_hint = 1u;
+    }
+  }
+  LARGE_INTEGER t_a44_b0, t_a44_b1;
+  if (a44_meas) {
+    (void)QueryPerformanceCounter(&t_a44_b0);
+  }
+  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (a44_meas) {
+    (void)QueryPerformanceCounter(&t_a44_b1);
+    (void)edr_etw_observability_add_a44_phase_ns(2u, edr_win_qpc_elapsed_ns(&t_a44_b0, &t_a44_b1, &a44_freq));
+  }
+}
+
+void edr_collector_decode_from_a44_item(const EdrA44QueueItem *it) {
+  if (!it || !s_bus) {
+    return;
+  }
+  EVENT_RECORD ev;
+  edr_a44_item_to_event_record(it, &ev);
+  edr_collector_tdh_to_bus(&ev, it->ty, it->tag, it->ts_ns);
+}
+
 static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (!s_bus || !event_record) {
     return;
@@ -228,42 +319,19 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
     return;
   }
+  edr_etw_observability_on_callback(tag);
 
   const uint64_t ts_ns = edr_unix_ns();
-  char ave_ip[46];
-  char ave_dom[256];
-  edr_tdh_extract_ave_net_fields(event_record, ty, ave_ip, sizeof(ave_ip), ave_dom, sizeof(ave_dom));
-  edr_ave_etw_feed_from_event(event_record, ty, ts_ns, ave_ip[0] ? ave_ip : NULL, ave_dom[0] ? ave_dom : NULL);
-
-  EdrEventSlot slot;
-  memset(&slot, 0, sizeof(slot));
-  slot.timestamp_ns = ts_ns;
-  slot.type = ty;
-  slot.consumed = false;
-
-  size_t plen =
-      edr_tdh_build_slot_payload(event_record, tag, slot.data, EDR_MAX_EVENT_PAYLOAD);
-  if (plen == 0) {
-    return;
-  }
-  if (plen > EDR_MAX_EVENT_PAYLOAD) {
-    plen = EDR_MAX_EVENT_PAYLOAD;
-  }
-  slot.size = (uint32_t)plen;
-  slot.priority = edr_priority_from_utf8_payload(slot.data, slot.size);
-  {
-    const GUID *g = &event_record->EventHeader.ProviderId;
-    if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
-      USHORT eid = event_record->EventHeader.EventDescriptor.Id;
-      slot.priority = (eid == 1002u) ? 1u : 2u;
-      slot.attack_surface_hint = 1u;
-    } else if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
-      slot.priority = 0u;
-      slot.attack_surface_hint = 1u;
+  if (edr_a44_split_path_enabled()) {
+    EdrA44QueueItem qit;
+    int rsn = 0;
+    if (edr_a44_item_pack(event_record, ts_ns, ty, tag, &qit, &rsn) == 0) {
+      if (edr_a44_try_push(&qit)) {
+        return; /* 解线程 继续 Tdh+总线；满队时 try_push=0 则同线程 回落 */
+      }
     }
   }
-
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  edr_collector_tdh_to_bus(event_record, ty, tag, ts_ns);
 }
 
 static DWORD WINAPI edr_etw_consumer_thread(void *arg) {
@@ -310,10 +378,10 @@ static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
     int want;
   } OptProv;
   OptProv optional[] = {
-      {&EDR_ETW_GUID_DNS_CLIENT, 1},
-      {&EDR_ETW_GUID_POWERSHELL, 1},
-      {&EDR_ETW_GUID_SECURITY_AUDIT, 1},
-      {&EDR_ETW_GUID_WMI_ACTIVITY, 1},
+      {&EDR_ETW_GUID_DNS_CLIENT, cfg && cfg->collection.etw_dns_client_provider},
+      {&EDR_ETW_GUID_POWERSHELL, cfg && cfg->collection.etw_powershell_provider},
+      {&EDR_ETW_GUID_SECURITY_AUDIT, cfg && cfg->collection.etw_security_audit_provider},
+      {&EDR_ETW_GUID_WMI_ACTIVITY, cfg && cfg->collection.etw_wmi_provider},
       {&EDR_ETW_GUID_MICROSOFT_TCPIP, cfg && cfg->collection.etw_tcpip_provider},
       {&EDR_ETW_GUID_WINFIREWALL_WFAS, cfg && cfg->collection.etw_firewall_provider},
   };
@@ -359,10 +427,28 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
    * ERROR_INVALID_NAME (123). LoggerName at LoggerNameOffset identifies the session. */
   prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
   memcpy((BYTE *)prop + prop->LoggerNameOffset, g_session_name, name_bytes);
-  prop->BufferSize = 64;
+  {
+    ULONG kb = cfg->collection.etw_buffer_kb;
+    if (kb < 4u) {
+      kb = 64u;
+    }
+    if (kb > 1024u) {
+      kb = 1024u;
+    }
+    prop->BufferSize = kb;
+  }
   prop->MinimumBuffers = 32;
   prop->MaximumBuffers = 128;
-  prop->FlushTimer = 1;
+  {
+    ULONG fts = cfg->collection.etw_flush_timer_s;
+    if (fts < 1u) {
+      fts = 1u;
+    }
+    if (fts > 300u) {
+      fts = 300u;
+    }
+    prop->FlushTimer = fts;
+  }
   prop->LogFileMode =
       EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
 
@@ -408,9 +494,17 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     return EDR_ERR_ETW_PROVIDER_ENABLE;
   }
 
+  {
+    EdrError a44e = edr_a44_split_path_start(bus);
+    if (a44e != EDR_OK) {
+      fprintf(stderr, "[collector_win] edr_a44_split_path_start failed: %d (A4.4 收/解 不启用，仍走同线程 Tdh)\n",
+              (int)a44e);
+    }
+  }
   s_consumer_thread =
       CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, NULL);
   if (!s_consumer_thread) {
+    edr_a44_split_path_stop();
     (void)edr_etw_control_trace_stop(s_session_handle, g_session_name);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
     InterlockedExchange(&s_started, 0);
@@ -445,6 +539,7 @@ void edr_collector_stop(void) {
     CloseHandle(s_consumer_thread);
     s_consumer_thread = NULL;
   }
+  edr_a44_split_path_stop();
 
   s_bus = NULL;
 }

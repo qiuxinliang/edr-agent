@@ -1,0 +1,68 @@
+# P2 B3.1：一键 **events-only** 瘦配置模板（复制为 agent.toml 后改 server/tenant/路径）
+# 真源对表与模块说明见 docs/OPS_PROFILE_AND_RELEASE.md §B3.1 与根目录 agent.toml.example。
+
+[server]
+address              = "127.0.0.1:50051"
+grpc_insecure        = true
+connect_timeout_s    = 10
+keepalive_interval_s = 30
+
+[agent]
+endpoint_id          = "auto"
+tenant_id            = "tenant_default"
+
+# 不启用 [platform] / [attack_surface] — 无周期 REST/攻击面
+
+[collection]
+etw_enabled          = true
+ebpf_enabled         = true
+poll_interval_s      = 1
+max_event_queue_size = 4096
+# 可选 A4.3：在会签/测试对表后再关各 Provider
+# etw_dns_client_provider = true
+# etw_powershell_provider = true
+# etw_security_audit_provider = true
+# etw_wmi_provider = true
+# etw_tcpip_provider = true
+# etw_firewall_provider = true
+
+[preprocessing]
+dedup_window_s       = 60
+high_freq_threshold  = 40
+sampling_rate_whitelist = 0.03
+rules_version        = "edr-dynamic-rules-v1-r218-9ae52519"
+
+[ave]
+# 指向无 .onnx 的目录 → 不跑推理；与 CMake EDR_WITH_ONNXRUNTIME=OFF 构建可叠加
+model_dir            = "/opt/edr/models_empty"
+scan_threads         = 1
+max_file_size_mb     = 256
+sensitivity          = "MEDIUM"
+behavior_monitor_enabled = false
+# 可选关 ETW→行为喂入（不碰 TDH/总线；见 README）
+# 仍可在环境变量中设 EDR_AVE_ETW_FEED=0 进一步减负
+
+[upload]
+batch_max_events     = 200
+batch_max_size_mb    = 2
+batch_timeout_s      = 2
+max_upload_mbps      = 1
+
+[offline]
+queue_db_path        = "edr_queue.db"
+max_queue_size_mb    = 256
+retention_hours      = 48
+
+[resource_limit]
+cpu_limit_percent    = 1
+memory_limit_mb      = 100
+emergency_cpu_limit  = 5
+
+[logging]
+level                = "info"
+log_dir              = "/var/log/edr"
+max_log_size_mb      = 50
+max_log_files        = 5
+
+# 不含 [fl] [shellcode_detector] [webshell_detector] [command] — 默认不启重模块
+# 不含 [self_protect] — 按需开 event_bus 背压等

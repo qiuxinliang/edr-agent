@@ -1,0 +1,76 @@
+{
+  "kind": "edr_p0_rule_bundle_ir_v1",
+  "ir_schema_version": 1,
+  "rules_bundle_version": "edr-dynamic-rules-v1-r218-9ae52519",
+  "source_ids_file": "p0_rule_ids_v1.example.txt",
+  "source_dynamic_rules": "dynamic_rules_v1.json",
+  "rule_count": 3,
+  "rules": [
+    {
+      "id": "R-EXEC-001",
+      "title": "PowerShell 编码命令执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.001"
+      ],
+      "description": "powershell/pwsh 命令行包含 -enc/-encodedcommand/frombase64string",
+      "condition": {
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
+        ],
+        "command_regex_any": [
+          "(?i)\\-(enc|encodedcommand)\\b",
+          "(?i)frombase64string"
+        ]
+      }
+    },
+    {
+      "id": "R-CRED-001",
+      "title": "导出 SAM/SYSTEM/SECURITY",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.002"
+      ],
+      "description": "reg save hklm\\sam/system/security",
+      "condition": {
+        "process_name_in": [
+          "reg.exe"
+        ],
+        "command_regex_any": [
+          "(?i)save\\s+hklm\\\\sam",
+          "(?i)save\\s+hklm\\\\system",
+          "(?i)save\\s+hklm\\\\security"
+        ]
+      }
+    },
+    {
+      "id": "R-FILELESS-001",
+      "title": "PowerShell 反射/IEX 无文件执行特征",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.001",
+        "T1027"
+      ],
+      "description": "命令行含 Invoke-Expression/IEX 或 Assembly::Load/LoadFrom 等内存加载特征",
+      "condition": {
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
+        ],
+        "command_regex_any": [
+          "(?i)invoke-expression",
+          "(?i)\\biex\\b",
+          "(?i)\\[reflection\\.assembly\\]::load",
+          "(?i)::loadfrom\\b"
+        ]
+      }
+    }
+  ]
+}

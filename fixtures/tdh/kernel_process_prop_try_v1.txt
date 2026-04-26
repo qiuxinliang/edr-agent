@@ -1,0 +1,13 @@
+# A2.3：与 etw_tdh_win.c 中 kernel-process Provider 的 proc_try[] 属性名顺序一致（L"..." 名，一行一个，含 # 注释可）
+# 改序会影响「先试高频名」的 TDH 命中统计；调序请同步更新本文件并提 MR 说明。
+CommandLine
+Commandline
+ImageFileName
+ImageName
+Filename
+ParentProcessId
+ParentProcessID
+ParentImage
+ParentFileName
+ProcessId
+ProcessID

@@ -24,6 +24,8 @@ typedef enum {
   EDR_EVENT_PROCESS_INJECT = 3,
   EDR_EVENT_DLL_LOAD = 4,
   EDR_EVENT_THREAD_CREATE_REMOTE = 5,
+  /** 文件读（与 `file_read` 动态规则对齐；采集路径可按需映射） */
+  EDR_EVENT_FILE_READ = 6,
   EDR_EVENT_FILE_CREATE = 10,
   EDR_EVENT_FILE_WRITE = 11,
   EDR_EVENT_FILE_DELETE = 12,

@@ -30,6 +30,7 @@ static int32_t edr_event_type_to_ave_event_type(EdrEventType t) {
     return (int32_t)AVE_EVT_PROCESS_INJECT;
   case EDR_EVENT_DLL_LOAD:
     return (int32_t)AVE_EVT_DLL_LOAD;
+  case EDR_EVENT_FILE_READ:
   case EDR_EVENT_FILE_CREATE:
   case EDR_EVENT_FILE_WRITE:
   case EDR_EVENT_FILE_DELETE:
@@ -112,13 +113,15 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
     copy_str(m->detail.registry.operation, sizeof(m->detail.registry.operation), r->reg_op);
     return;
   }
-  if (r->net_dst[0] || r->net_src[0]) {
+  if (r->net_dst[0] || r->net_src[0] || r->network_aux_path[0]) {
     m->which_detail = edr_v1_BehaviorEvent_network_tag;
     copy_str(m->detail.network.src_ip, sizeof(m->detail.network.src_ip), r->net_src);
     m->detail.network.src_port = r->net_sport;
     copy_str(m->detail.network.dst_ip, sizeof(m->detail.network.dst_ip), r->net_dst);
     m->detail.network.dst_port = r->net_dport;
     copy_str(m->detail.network.protocol, sizeof(m->detail.network.protocol), r->net_proto);
+    copy_str(m->detail.network.network_aux_path, sizeof(m->detail.network.network_aux_path),
+             r->network_aux_path);
     return;
   }
   if (r->file_path[0] || r->file_op[0]) {

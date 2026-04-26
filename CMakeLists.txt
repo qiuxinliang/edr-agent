@@ -145,6 +145,12 @@ if(EDR_WITH_LIBTORCH)
     message(STATUS "LibTorch not found (set TORCH_ROOT or CMAKE_PREFIX_PATH to libtorch)")
   endif()
 endif()
+# P0 直出规则包版本字串（与 config/p0_rule_bundle_manifest.json 中 rules_bundle_version 一致，供 user_subject_json）
+set(EDR_P0_RULES_BUNDLE_VERSION
+    "edr-dynamic-rules-v1-r218-9ae52519"
+    CACHE STRING
+    "P0 dynamic rules bundle id (align with edr-agent/config/p0_rule_bundle_manifest.json and platform)")
+
 set(EDR_YARA_AVAILABLE 0)
 if(EDR_WITH_YARA)
   find_path(YARA_INCLUDE_DIR NAMES yara.h
@@ -180,6 +186,8 @@ set(EDR_AGENT_SOURCES
   src/preprocess/behavior_from_slot.c
   src/preprocess/dedup.c
   src/preprocess/emit_rules.c
+  src/preprocess/p0_rule_match.c
+  src/preprocess/p0_rule_direct_emit.c
   src/preprocess/preprocess_pipeline.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c
@@ -239,7 +247,9 @@ if(WIN32)
   list(APPEND EDR_AGENT_SOURCES
     src/collector/collector_win.c
     src/collector/etw_tdh_win.c
+    src/collector/etw_observability_win.c
     src/collector/ave_etw_feed_win.c
+    src/collector/edr_a44_split_path_win.c
   )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EDR_WITH_LINUX_COLLECTOR)
   list(APPEND EDR_AGENT_SOURCES src/collector/collector_linux.c)
@@ -357,6 +367,91 @@ else()
   list(APPEND EDR_AGENT_SOURCES src/transport/grpc_client_stub.c)
 endif()
 
+# P0 IR：cJSON + PCRE2（vcpkg pcre2 或本机 Homebrew/系统；找不到则桩 + legacy）
+set(EDR_P0_IR_PCRE2 0)
+set(EDR_PCRE2_TARGET "")
+find_package(pcre2 CONFIG QUIET)
+if(TARGET PCRE2::8BIT)
+  set(EDR_PCRE2_TARGET PCRE2::8BIT)
+endif()
+if(NOT EDR_PCRE2_TARGET)
+  # Homebrew/通用前缀（.pc 里若含已删路径会失败，故直接查头文件与库）
+  find_path(
+    PCRE2_INCLUDE_DIR
+    NAMES pcre2.h
+    PATHS
+      "$ENV{HOMEBREW_PREFIX}/include"
+      /opt/homebrew/include
+      /usr/local/include
+  )
+  find_library(
+    PCRE2_8_LIB
+    NAMES pcre2-8
+    pcre2-8.lib
+    PATHS
+      "$ENV{HOMEBREW_PREFIX}/lib"
+      /opt/homebrew/lib
+      /usr/local/lib
+  )
+  if(PCRE2_INCLUDE_DIR AND PCRE2_8_LIB)
+    add_library(edr_pcre2_vendor UNKNOWN IMPORTED)
+    set_target_properties(
+      edr_pcre2_vendor
+      PROPERTIES
+        IMPORTED_LOCATION
+        "${PCRE2_8_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES
+        "${PCRE2_INCLUDE_DIR}"
+    )
+    set(EDR_PCRE2_TARGET edr_pcre2_vendor)
+  endif()
+endif()
+if(EDR_PCRE2_TARGET)
+  list(APPEND EDR_AGENT_SOURCES
+    src/preprocess/p0_rule_ir.c
+    third_party/cjson/cJSON.c
+  )
+  set(EDR_P0_IR_PCRE2 1)
+  message(STATUS "edr_agent: P0 IR (pcre2 + cJSON) enabled, link: ${EDR_PCRE2_TARGET}")
+else()
+  set(EDR_P0_IR_PCRE2 0)
+  list(APPEND EDR_AGENT_SOURCES src/preprocess/p0_rule_ir_stub.c)
+  message(
+    STATUS
+    "edr_agent: pcre2 not found — P0 uses legacy in-process matcher; install pcre2 (vcpkg/brew) + reconfigure to load p0_rule_bundle_ir_v1.json at runtime"
+  )
+endif()
+
+# P0 IR：编译期嵌入 JSON（B1.1；需 Python3 + 与 POST_BUILD 复制二选一/并存：运行期**优先**读外置文件，失败再回退到 embed）
+set(EDR_P0_IR_HAS_EMBED 0)
+set(EDR_P0_IR_EMBED_C "")
+option(EDR_P0_IR_EMBED "Generate compile-time byte array from config/p0_rule_bundle_ir_v1.json" ON)
+if(EDR_P0_IR_PCRE2 AND EDR_P0_IR_EMBED AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(EDR_P0_IR_EMBED_C "${CMAKE_CURRENT_BINARY_DIR}/edr_p0_rule_ir_embed.c")
+  add_custom_command(
+    OUTPUT "${EDR_P0_IR_EMBED_C}"
+    COMMAND
+      ${Python3_EXECUTABLE}
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
+      --input
+      "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+      --output
+      "${EDR_P0_IR_EMBED_C}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
+    COMMENT "Generate P0 IR compile-time embed (edr_p0_rule_ir_embed.c)"
+    VERBATIM
+  )
+  set(EDR_P0_IR_HAS_EMBED 1)
+  list(APPEND EDR_AGENT_SOURCES "${EDR_P0_IR_EMBED_C}")
+  message(STATUS "P0 IR compile-time embed: ON -> ${EDR_P0_IR_EMBED_C}")
+elseif(EDR_P0_IR_PCRE2 AND EDR_P0_IR_EMBED)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+    message(STATUS "P0 IR embed skipped: config/p0_rule_bundle_ir_v1.json missing (set EDR_P0_IR_EMBED=OFF to silence if intentional)")
+  endif()
+endif()
+
 set(EDR_AVE_CORE_SOURCES
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
@@ -422,7 +517,44 @@ target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/windivert
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 )
-target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
+if(EDR_P0_IR_PCRE2)
+  target_include_directories(edr_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson)
+endif()
+target_compile_definitions(
+  edr_agent
+  PRIVATE
+    EDR_HAVE_NANOPB=1
+    "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
+)
+if(EDR_P0_IR_PCRE2)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
+  target_compile_definitions(edr_agent PRIVATE "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}")
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_manifest.json")
+  add_custom_command(
+    TARGET edr_agent
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:edr_agent>/edr_config"
+    COMMAND
+      ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_manifest.json"
+      "$<TARGET_FILE_DIR:edr_agent>/edr_config/p0_rule_bundle_manifest.json"
+    COMMENT "Stage P0 rule manifest next to edr_agent (edr_config/p0_rule_bundle_manifest.json)"
+  )
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+  add_custom_command(
+    TARGET edr_agent
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:edr_agent>/edr_config"
+    COMMAND
+      ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+      "$<TARGET_FILE_DIR:edr_agent>/edr_config/p0_rule_bundle_ir_v1.json"
+    COMMENT "Stage P0 rule IR bundle (edr_config/p0_rule_bundle_ir_v1.json)"
+  )
+  # B1.1：另见 EDR_P0_IR_EMBED（同内容 embed 进 .text）；运行期仍**先**读外置 JSON，再回退 embed。
+endif()
 if(EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)
 endif()
@@ -544,6 +676,9 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(edr_agent PRIVATE Threads::Threads)
+if(EDR_P0_IR_PCRE2)
+  target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_TARGET})
+endif()
 if(UNIX AND NOT WIN32)
   target_link_libraries(edr_agent PRIVATE m)
 endif()
@@ -628,6 +763,184 @@ endif()
 
 enable_testing()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
+
+# P0 规则：C 与 p0_golden_vectors.json 同构对拍（有 pcre2 时自 IR 求值，否则与 legacy 一致）
+set(
+  _EDR_P0_GOLDEN_SRCS
+  src/preprocess/p0_rule_golden_test.c
+  src/preprocess/p0_rule_match.c
+)
+if(EDR_P0_IR_PCRE2)
+  list(
+    APPEND
+    _EDR_P0_GOLDEN_SRCS
+    src/preprocess/p0_rule_ir.c
+    third_party/cjson/cJSON.c
+  )
+else()
+  list(APPEND _EDR_P0_GOLDEN_SRCS src/preprocess/p0_rule_ir_stub.c)
+endif()
+if(EDR_P0_IR_PCRE2 AND EDR_P0_IR_HAS_EMBED AND EDR_P0_IR_EMBED_C)
+  list(APPEND _EDR_P0_GOLDEN_SRCS "${EDR_P0_IR_EMBED_C}")
+endif()
+add_executable(edr_p0_golden_test ${_EDR_P0_GOLDEN_SRCS})
+target_include_directories(
+  edr_p0_golden_test
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess
+)
+if(EDR_P0_IR_PCRE2)
+  target_include_directories(
+    edr_p0_golden_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
+  )
+  target_compile_definitions(edr_p0_golden_test PRIVATE EDR_HAVE_PCRE2=1)
+  target_compile_definitions(
+    edr_p0_golden_test PRIVATE "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}"
+  )
+  target_link_libraries(edr_p0_golden_test PRIVATE ${EDR_PCRE2_TARGET})
+endif()
+if(MSVC)
+  target_compile_options(edr_p0_golden_test PRIVATE /W3 /WX-)
+  target_compile_definitions(
+    edr_p0_golden_test
+    PRIVATE
+      _CRT_SECURE_NO_WARNINGS
+  )
+else()
+  target_compile_options(edr_p0_golden_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES AND DEFINED _EDR_WIN_RUNTIME_DIR)
+  set_target_properties(edr_p0_golden_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}")
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+  set(_EDR_P0_IR_JSON "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+else()
+  set(_EDR_P0_IR_JSON "")
+endif()
+add_test(NAME edr_p0_golden COMMAND edr_p0_golden_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# A4.1：MPMC 事件总线短时压测 + 对拍（主线程=唯一消费者）
+add_executable(
+  test_event_bus_mpmc_stress
+  tests/test_event_bus_mpmc_stress.c
+  src/core/event_bus.c
+)
+target_include_directories(
+  test_event_bus_mpmc_stress
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(MSVC)
+  target_compile_options(test_event_bus_mpmc_stress PRIVATE /W3 /WX-)
+  target_compile_definitions(
+    test_event_bus_mpmc_stress
+    PRIVATE
+      _CRT_SECURE_NO_WARNINGS
+  )
+else()
+  target_compile_options(
+    test_event_bus_mpmc_stress
+    PRIVATE
+      -Wall
+      -Wextra
+      -Wno-unused-parameter
+  )
+endif()
+if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES AND DEFINED _EDR_WIN_RUNTIME_DIR)
+  set_target_properties(
+    test_event_bus_mpmc_stress
+    PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}"
+  )
+endif()
+# test_event_bus_mpmc_stress：250ms / 4 生产者 / cap 64，CI 友好
+add_test(
+  NAME test_event_bus_mpmc_stress
+  COMMAND
+    test_event_bus_mpmc_stress
+    250
+    4
+    64
+  WORKING_DIRECTORY
+    ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(
+  test_event_bus_mpmc_stress
+  PROPERTIES
+    TIMEOUT
+    30
+    LABELS
+    "A4.1;event_bus"
+)
+if(_EDR_P0_IR_JSON)
+  set_tests_properties(
+    edr_p0_golden
+    PROPERTIES
+      ENVIRONMENT
+      "EDR_P0_IR_PATH=${_EDR_P0_IR_JSON}"
+  )
+endif()
+
+# P0 IR：file / network / registry 对拍（同 p0_golden_vectors.json 非 process 段）
+if(EDR_P0_IR_PCRE2)
+  set(
+    _EDR_P0_REC_SRCS
+    src/preprocess/p0_rule_ir_record_golden_test.c
+    src/preprocess/behavior_record.c
+  )
+  if(EDR_P0_IR_HAS_EMBED AND EDR_P0_IR_EMBED_C)
+    list(APPEND _EDR_P0_REC_SRCS "${EDR_P0_IR_EMBED_C}")
+  endif()
+  list(
+    APPEND
+    _EDR_P0_REC_SRCS
+    src/preprocess/p0_rule_ir.c
+    third_party/cjson/cJSON.c
+  )
+  add_executable(edr_p0_ir_record_golden_test ${_EDR_P0_REC_SRCS})
+  target_include_directories(
+    edr_p0_ir_record_golden_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
+  )
+  target_compile_definitions(
+    edr_p0_ir_record_golden_test
+    PRIVATE
+      EDR_HAVE_PCRE2=1
+      "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}"
+  )
+  target_link_libraries(edr_p0_ir_record_golden_test PRIVATE ${EDR_PCRE2_TARGET})
+  if(NOT MSVC)
+    target_compile_options(
+      edr_p0_ir_record_golden_test
+      PRIVATE
+        -Wall
+        -Wextra
+        -Wno-unused-parameter
+    )
+  endif()
+  add_test(
+    NAME
+      edr_p0_ir_record_golden
+    COMMAND
+      edr_p0_ir_record_golden_test
+    WORKING_DIRECTORY
+      ${CMAKE_BINARY_DIR}
+  )
+  if(_EDR_P0_IR_JSON)
+    set_tests_properties(
+      edr_p0_ir_record_golden
+      PROPERTIES
+        ENVIRONMENT
+        "EDR_P0_IR_PATH=${_EDR_P0_IR_JSON}"
+    )
+  endif()
+endif()
 
 if(EDR_BUILD_TESTS)
 add_executable(test_ave_fp tests/test_ave_fp.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c

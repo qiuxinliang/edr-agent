@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_golden_test.c.o CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.o -o edr_p0_golden_test

@@ -25,6 +25,20 @@ static const char *basename_c(const char *path) {
   return p;
 }
 
+static int is_mostly_printable_ascii(const uint8_t *p, size_t n) {
+  if (!p || n == 0u) {
+    return 0;
+  }
+  size_t printable = 0u;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t c = p[i];
+    if ((c >= 0x20 && c <= 0x7eu) || c == '\t' || c == '\r' || c == '\n') {
+      printable++;
+    }
+  }
+  return printable >= (n * 8u) / 10u;
+}
+
 typedef struct {
   char prov[48];
   char img[EDR_BR_STR_LONG];
@@ -68,6 +82,9 @@ typedef struct {
   int has_cmd;
   int has_dport;
   int has_sport;
+  char pimg[EDR_BR_STR_LONG];
+  int has_pimg;
+  char naux[EDR_BR_STR_LONG];
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
@@ -86,6 +103,9 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->epid = strtoul(val, NULL, 10);
   } else if (strcmp(key, "ppid") == 0) {
     f->ppid = strtoul(val, NULL, 10);
+  } else if (strcmp(key, "pimg") == 0) {
+    snprintf(f->pimg, sizeof(f->pimg), "%s", val);
+    f->has_pimg = 1;
   } else if (strcmp(key, "img") == 0) {
     snprintf(f->img, sizeof(f->img), "%s", val);
     f->has_img = 1;
@@ -174,6 +194,8 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->regdata, sizeof(f->regdata), "%s", val);
   } else if (strcmp(key, "regop") == 0) {
     snprintf(f->regop, sizeof(f->regop), "%s", val);
+  } else if (strcmp(key, "naux") == 0) {
+    snprintf(f->naux, sizeof(f->naux), "%s", val);
   }
 }
 
@@ -274,12 +296,41 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       snprintf(r->exe_path, sizeof(r->exe_path), "%s", ef.img);
       snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
     }
+    if (ef.has_pimg) {
+      snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.pimg);
+      snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.pimg));
+    }
     if (ef.has_cmd) {
       snprintf(r->cmdline, sizeof(r->cmdline), "%s", ef.cmd);
     }
     if (ef.file[0]) {
       snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
-      snprintf(r->file_op, sizeof(r->file_op), "event");
+      switch (r->type) {
+      case EDR_EVENT_FILE_READ:
+        snprintf(r->file_op, sizeof(r->file_op), "read");
+        break;
+      case EDR_EVENT_FILE_WRITE:
+        snprintf(r->file_op, sizeof(r->file_op), "write");
+        break;
+      case EDR_EVENT_FILE_CREATE:
+        snprintf(r->file_op, sizeof(r->file_op), "create");
+        break;
+      case EDR_EVENT_FILE_DELETE:
+        snprintf(r->file_op, sizeof(r->file_op), "delete");
+        break;
+      case EDR_EVENT_FILE_RENAME:
+        snprintf(r->file_op, sizeof(r->file_op), "rename");
+        break;
+      case EDR_EVENT_FILE_PERMISSION_CHANGE:
+        snprintf(r->file_op, sizeof(r->file_op), "permission");
+        break;
+      default:
+        snprintf(r->file_op, sizeof(r->file_op), "event");
+        break;
+      }
+    }
+    if (ef.naux[0]) {
+      snprintf(r->network_aux_path, sizeof(r->network_aux_path), "%s", ef.naux);
     }
     if (ef.qname[0]) {
       snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.qname);
@@ -360,8 +411,14 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (n >= sizeof(r->cmdline)) {
       n = sizeof(r->cmdline) - 1u;
     }
-    memcpy(r->cmdline, slot->data, n);
-    r->cmdline[n] = '\0';
+    /* Parsing failed: avoid dumping raw binary bytes into cmdline (causes control-char garbage downstream). */
+    if (is_mostly_printable_ascii(slot->data, n)) {
+      memcpy(r->cmdline, slot->data, n);
+      r->cmdline[n] = '\0';
+    } else {
+      r->cmdline[0] = '\0';
+      snprintf(r->script_snippet, sizeof(r->script_snippet), "raw_etw_payload_bytes=%u parse=failed", (unsigned)slot->size);
+    }
   }
 
   apply_mitre_hints(r);

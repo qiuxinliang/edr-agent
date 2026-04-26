@@ -4512,3 +4512,715 @@ events:
         - "/Network/Library/Frameworks"
         - "/System/Library/Frameworks"
 ...
+
+---
+events:
+  -
+    kind: "find_package-v1"
+    backtrace:
+      - "CMakeLists.txt:372 (find_package)"
+    name: "pcre2"
+    configs:
+      -
+        filename: "pcre2.cps"
+        kind: "cps"
+      -
+        filename: "pcre2Config.cmake"
+        kind: "cmake"
+      -
+        filename: "pcre2-config.cmake"
+        kind: "cmake"
+    version_request:
+      exact: false
+    settings:
+      required: "optional"
+      quiet: true
+      global: false
+      policy_scope: true
+      bypass_provider: false
+      names:
+        - "pcre2"
+      path_suffixes:
+        - ""
+      paths:
+        CMAKE_FIND_USE_CMAKE_PATH: true
+        CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+        CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+        CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+        CMAKE_FIND_USE_INSTALL_PREFIX: true
+        CMAKE_FIND_USE_PACKAGE_ROOT_PATH: true
+        CMAKE_FIND_USE_CMAKE_PACKAGE_REGISTRY: true
+        CMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY: true
+        CMAKE_FIND_ROOT_PATH_MODE: "BOTH"
+    candidates:
+      -
+        path: "/Users/qiuxinliang/\u5de5\u7a0b\u533a/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/CMakeFiles/pkgRedirects/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/\u5de5\u7a0b\u533a/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/CMakeFiles/pkgRedirects/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/\u5de5\u7a0b\u533a/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/CMakeFiles/pkgRedirects/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/\u5de5\u7a0b\u533a/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/CMakeFiles/pkgRedirects/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/\u5de5\u7a0b\u533a/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/CMakeFiles/pkgRedirects/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/grpc/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/grpc/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/grpc/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/grpc/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/opt/grpc/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/usr/local/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/usr/local/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/usr/local/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/usr/local/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/usr/local/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/homebrew/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/node/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/node/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/node/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/node/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/node/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/go/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/go/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/go/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/go/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Users/qiuxinliang/.local/go/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/System/Cryptexes/App/usr/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/System/Cryptexes/App/usr/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/System/Cryptexes/App/usr/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/System/Cryptexes/App/usr/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/System/Cryptexes/App/usr/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/usr/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/usr/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/usr/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/usr/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/usr/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/opt/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/opt/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/Library/Frameworks/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/Library/Frameworks/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/Library/Frameworks/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/Library/Frameworks/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Developer/CommandLineTools/Library/Frameworks/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Frameworks/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Frameworks/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Library/Frameworks/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Frameworks/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Library/Frameworks/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/System/Library/Frameworks/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/System/Library/Frameworks/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/System/Library/Frameworks/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/System/Library/Frameworks/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/System/Library/Frameworks/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Applications/pcre2Config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Applications/pcre2-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "/Applications/lib64/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Applications/lib/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "/Applications/share/cps/pcre2.cps"
+        mode: "cps"
+        reason: "no_exist"
+    found: null
+    search_context:
+      CMAKE_PREFIX_PATH:
+        - "/usr/local/opt/grpc"
+        - "/opt/homebrew/opt/grpc"
+        - "/usr/local"
+        - "/opt/homebrew"
+      ENV{PATH}:
+        - "/Users/qiuxinliang/.local/node/bin"
+        - "/Users/qiuxinliang/.local/go/bin"
+        - "/usr/local/bin"
+        - "/System/Cryptexes/App/usr/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin"
+        - "/opt/pkg/env/active/bin"
+        - "/opt/pmk/env/global/bin"
+        - "/opt/homebrew/bin"
+        - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers"
+        - "/Users/qiuxinliang/.local/node/bin"
+        - "/Users/qiuxinliang/.local/go/bin"
+      CMAKE_INSTALL_PREFIX: "/usr/local"
+      CMAKE_SYSTEM_PREFIX_PATH:
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr"
+        - "/"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr/X11R6"
+        - "/usr/pkg"
+        - "/opt"
+        - "/sw"
+        - "/opt/local"
+      CMAKE_SYSTEM_FRAMEWORK_PATH:
+        - "~/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/Library/Frameworks"
+        - "/Library/Frameworks"
+        - "/Network/Library/Frameworks"
+        - "/System/Library/Frameworks"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "CMakeLists.txt:378 (find_path)"
+    mode: "path"
+    variable: "PCRE2_INCLUDE_DIR"
+    description: "Path to a file."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "pcre2.h"
+    candidate_directories:
+      - "/usr/local/opt/grpc/include/"
+      - "/usr/local/opt/grpc/"
+      - "/opt/homebrew/opt/grpc/include/"
+      - "/opt/homebrew/opt/grpc/"
+      - "/usr/local/include/"
+      - "/usr/local/"
+      - "/opt/homebrew/include/"
+      - "/opt/homebrew/"
+      - "/Users/qiuxinliang/.local/node/bin/"
+      - "/Users/qiuxinliang/.local/go/bin/"
+      - "/usr/local/bin/"
+      - "/System/Cryptexes/App/usr/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin/"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin/"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin/"
+      - "/opt/pkg/env/active/bin/"
+      - "/opt/pmk/env/global/bin/"
+      - "/opt/homebrew/bin/"
+      - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/"
+      - "/usr/include/"
+      - "/usr/"
+      - "/include/"
+      - "/usr/X11R6/include/"
+      - "/usr/X11R6/"
+      - "/usr/pkg/include/"
+      - "/usr/pkg/"
+      - "/opt/include/"
+      - "/opt/"
+      - "/sw/include/"
+      - "/sw/"
+      - "/opt/local/include/"
+      - "/opt/local/"
+      - "/usr/include/X11/"
+      - "/Users/qiuxinliang/Library/Frameworks/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/"
+      - "/Library/Developer/CommandLineTools/Library/Frameworks/"
+      - "/Library/Frameworks/"
+      - "/Network/Library/Frameworks/"
+      - "/System/Library/Frameworks/"
+      - "/include/"
+      - "/opt/homebrew/include/"
+      - "/usr/local/include/"
+    searched_directories:
+      - "/usr/local/opt/grpc/include/pcre2.h"
+      - "/usr/local/opt/grpc/pcre2.h"
+      - "/opt/homebrew/opt/grpc/include/pcre2.h"
+      - "/opt/homebrew/opt/grpc/pcre2.h"
+      - "/usr/local/include/pcre2.h"
+      - "/usr/local/pcre2.h"
+      - "/opt/homebrew/include/pcre2.h"
+      - "/opt/homebrew/pcre2.h"
+      - "/Users/qiuxinliang/.local/node/bin/pcre2.h"
+      - "/Users/qiuxinliang/.local/go/bin/pcre2.h"
+      - "/usr/local/bin/pcre2.h"
+      - "/System/Cryptexes/App/usr/bin/pcre2.h"
+      - "/usr/bin/pcre2.h"
+      - "/bin/pcre2.h"
+      - "/usr/sbin/pcre2.h"
+      - "/sbin/pcre2.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin/pcre2.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin/pcre2.h"
+      - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin/pcre2.h"
+      - "/opt/pkg/env/active/bin/pcre2.h"
+      - "/opt/pmk/env/global/bin/pcre2.h"
+      - "/opt/homebrew/bin/pcre2.h"
+      - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/pcre2.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/pcre2.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/pcre2.h"
+      - "/usr/include/pcre2.h"
+      - "/usr/pcre2.h"
+      - "/include/pcre2.h"
+      - "/usr/X11R6/include/pcre2.h"
+      - "/usr/X11R6/pcre2.h"
+      - "/usr/pkg/include/pcre2.h"
+      - "/usr/pkg/pcre2.h"
+      - "/opt/include/pcre2.h"
+      - "/opt/pcre2.h"
+      - "/sw/include/pcre2.h"
+      - "/sw/pcre2.h"
+      - "/opt/local/include/pcre2.h"
+      - "/opt/local/pcre2.h"
+      - "/usr/include/X11/pcre2.h"
+      - "/Users/qiuxinliang/Library/Frameworks/pcre2.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks/pcre2.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks/pcre2.h"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/pcre2.h"
+      - "/Library/Developer/CommandLineTools/Library/Frameworks/pcre2.h"
+      - "/Library/Frameworks/pcre2.h"
+      - "/Network/Library/Frameworks/pcre2.h"
+      - "/System/Library/Frameworks/pcre2.h"
+      - "/include/pcre2.h"
+      - "/opt/homebrew/include/pcre2.h"
+      - "/usr/local/include/pcre2.h"
+    found: false
+    search_context:
+      CMAKE_PREFIX_PATH:
+        - "/usr/local/opt/grpc"
+        - "/opt/homebrew/opt/grpc"
+        - "/usr/local"
+        - "/opt/homebrew"
+      ENV{PATH}:
+        - "/Users/qiuxinliang/.local/node/bin"
+        - "/Users/qiuxinliang/.local/go/bin"
+        - "/usr/local/bin"
+        - "/System/Cryptexes/App/usr/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin"
+        - "/opt/pkg/env/active/bin"
+        - "/opt/pmk/env/global/bin"
+        - "/opt/homebrew/bin"
+        - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers"
+        - "/Users/qiuxinliang/.local/node/bin"
+        - "/Users/qiuxinliang/.local/go/bin"
+      CMAKE_INSTALL_PREFIX: "/usr/local"
+      CMAKE_SYSTEM_PREFIX_PATH:
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr"
+        - "/"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr/X11R6"
+        - "/usr/pkg"
+        - "/opt"
+        - "/sw"
+        - "/opt/local"
+      CMAKE_SYSTEM_INCLUDE_PATH:
+        - "/usr/include/X11"
+      CMAKE_SYSTEM_FRAMEWORK_PATH:
+        - "~/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/Library/Frameworks"
+        - "/Library/Frameworks"
+        - "/Network/Library/Frameworks"
+        - "/System/Library/Frameworks"
+  -
+    kind: "find-v1"
+    backtrace:
+      - "CMakeLists.txt:386 (find_library)"
+    mode: "library"
+    variable: "PCRE2_8_LIB"
+    description: "Path to a library."
+    settings:
+      SearchFramework: "FIRST"
+      SearchAppBundle: "FIRST"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "pcre2-8"
+      - "pcre2-8.lib"
+    candidate_directories:
+      - "/opt/homebrew/opt/grpc/lib/"
+      - "/opt/homebrew/opt/grpc/"
+      - "/usr/local/"
+      - "/opt/homebrew/lib/"
+      - "/opt/homebrew/"
+      - "/Users/qiuxinliang/.local/node/bin/"
+      - "/Users/qiuxinliang/.local/go/bin/"
+      - "/usr/local/bin/"
+      - "/System/Cryptexes/App/usr/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/opt/homebrew/bin/"
+      - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/"
+      - "/usr/lib/"
+      - "/usr/"
+      - "/opt/"
+      - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/"
+      - "/Library/Developer/CommandLineTools/Library/Frameworks/"
+      - "/Library/Frameworks/"
+      - "/System/Library/Frameworks/"
+      - "/opt/homebrew/lib/"
+    searched_directories:
+      - "/opt/homebrew/opt/grpc/lib/"
+      - "/opt/homebrew/opt/grpc/"
+      - "/usr/local/"
+      - "/opt/homebrew/lib/"
+      - "/opt/homebrew/"
+      - "/Users/qiuxinliang/.local/node/bin/"
+      - "/Users/qiuxinliang/.local/go/bin/"
+      - "/usr/local/bin/"
+      - "/System/Cryptexes/App/usr/bin/"
+      - "/usr/bin/"
+      - "/bin/"
+      - "/usr/sbin/"
+      - "/sbin/"
+      - "/opt/homebrew/bin/"
+      - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/"
+    found: "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libpcre2-8.tbd"
+    search_context:
+      CMAKE_PREFIX_PATH:
+        - "/usr/local/opt/grpc"
+        - "/opt/homebrew/opt/grpc"
+        - "/usr/local"
+        - "/opt/homebrew"
+      ENV{PATH}:
+        - "/Users/qiuxinliang/.local/node/bin"
+        - "/Users/qiuxinliang/.local/go/bin"
+        - "/usr/local/bin"
+        - "/System/Cryptexes/App/usr/bin"
+        - "/usr/bin"
+        - "/bin"
+        - "/usr/sbin"
+        - "/sbin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin"
+        - "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin"
+        - "/opt/pkg/env/active/bin"
+        - "/opt/pmk/env/global/bin"
+        - "/opt/homebrew/bin"
+        - "/Applications/Cursor.app/Contents/Resources/app/resources/helpers"
+        - "/Users/qiuxinliang/.local/node/bin"
+        - "/Users/qiuxinliang/.local/go/bin"
+      CMAKE_INSTALL_PREFIX: "/usr/local"
+      CMAKE_SYSTEM_PREFIX_PATH:
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr"
+        - "/"
+        - "/opt/homebrew"
+        - "/usr/local"
+        - "/usr/X11R6"
+        - "/usr/pkg"
+        - "/opt"
+        - "/sw"
+        - "/opt/local"
+      CMAKE_SYSTEM_LIBRARY_PATH:
+        - "/usr/lib/X11"
+      CMAKE_SYSTEM_FRAMEWORK_PATH:
+        - "~/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/Network/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/Library/Frameworks"
+        - "/Library/Developer/CommandLineTools/Library/Frameworks"
+        - "/Library/Frameworks"
+        - "/Network/Library/Frameworks"
+        - "/System/Library/Frameworks"
+...

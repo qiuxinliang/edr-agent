@@ -433,6 +433,30 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "etw_dns_client_provider");
+    if (d.ok) {
+      cfg->collection.etw_dns_client_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_powershell_provider");
+    if (d.ok) {
+      cfg->collection.etw_powershell_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_security_audit_provider");
+    if (d.ok) {
+      cfg->collection.etw_security_audit_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_wmi_provider");
+    if (d.ok) {
+      cfg->collection.etw_wmi_provider = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "ebpf_enabled");
     if (d.ok) {
       cfg->collection.ebpf_enabled = d.u.b ? true : false;
@@ -448,6 +472,18 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "max_event_queue_size");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->collection.max_event_queue_size = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "etw_buffer_kb");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->collection.etw_buffer_kb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "etw_flush_timer_s");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->collection.etw_flush_timer_s = (uint32_t)d.u.i;
     }
   }
 }
@@ -474,6 +510,7 @@ static int32_t edr_parse_event_type_filter(const char *s) {
       {"PROCESS_INJECT", EDR_EVENT_PROCESS_INJECT},
       {"DLL_LOAD", EDR_EVENT_DLL_LOAD},
       {"THREAD_CREATE_REMOTE", EDR_EVENT_THREAD_CREATE_REMOTE},
+      {"FILE_READ", EDR_EVENT_FILE_READ},
       {"FILE_CREATE", EDR_EVENT_FILE_CREATE},
       {"FILE_WRITE", EDR_EVENT_FILE_WRITE},
       {"FILE_DELETE", EDR_EVENT_FILE_DELETE},
@@ -1149,6 +1186,46 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size > 65536u) {
     cfg->collection.max_event_queue_size = 65536u;
   }
+  /* A4.2：ETW 实时会话缓冲/刷写；0 表示使用默认。有效区间与 Win32 常见实践对齐。 */
+  if (cfg->collection.etw_buffer_kb == 0u) {
+    cfg->collection.etw_buffer_kb = 64u;
+  }
+  if (cfg->collection.etw_buffer_kb < 4u) {
+    cfg->collection.etw_buffer_kb = 4u;
+  }
+  if (cfg->collection.etw_buffer_kb > 1024u) {
+    cfg->collection.etw_buffer_kb = 1024u;
+  }
+  if (cfg->collection.etw_flush_timer_s == 0u) {
+    cfg->collection.etw_flush_timer_s = 1u;
+  }
+  if (cfg->collection.etw_flush_timer_s > 300u) {
+    cfg->collection.etw_flush_timer_s = 300u;
+  }
+#if defined(_WIN32)
+  {
+    const char *e = getenv("EDR_ETW_BUFFER_KB");
+    if (e && e[0]) {
+      char *end = NULL;
+      unsigned long v = strtoul(e, &end, 10);
+      (void)end;
+      if (v >= 4ul && v <= 1024ul) {
+        cfg->collection.etw_buffer_kb = (uint32_t)v;
+      }
+    }
+  }
+  {
+    const char *e = getenv("EDR_ETW_FLUSH_TIMER_S");
+    if (e && e[0]) {
+      char *end = NULL;
+      unsigned long v = strtoul(e, &end, 10);
+      (void)end;
+      if (v >= 1ul && v <= 300ul) {
+        cfg->collection.etw_flush_timer_s = (uint32_t)v;
+      }
+    }
+  }
+#endif
   if (cfg->upload.batch_max_size_mb < 1u) {
     cfg->upload.batch_max_size_mb = 4u;
   }
@@ -1412,9 +1489,15 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.etw_enabled = true;
   cfg->collection.etw_tcpip_provider = true;
   cfg->collection.etw_firewall_provider = true;
+  cfg->collection.etw_dns_client_provider = true;
+  cfg->collection.etw_powershell_provider = true;
+  cfg->collection.etw_security_audit_provider = true;
+  cfg->collection.etw_wmi_provider = true;
   cfg->collection.ebpf_enabled = true;
   cfg->collection.poll_interval_s = 1;
   cfg->collection.max_event_queue_size = 4096u;
+  cfg->collection.etw_buffer_kb = 0u;
+  cfg->collection.etw_flush_timer_s = 0u;
 
   cfg->preprocessing.dedup_window_s = 30u;
   cfg->preprocessing.high_freq_threshold = 100u;

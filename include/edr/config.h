@@ -41,9 +41,20 @@ typedef struct EdrConfig {
     bool etw_tcpip_provider;
     /** Windows：订阅 WFAS 防火墙 ETW（§19.10）；失败时跳过不致命 */
     bool etw_firewall_provider;
+    /** Windows 可选：DNS-Client / PowerShell / Security-Auditing / WMI（A4.3）；**关前须与 P0/字段矩阵对表** */
+    bool etw_dns_client_provider;
+    bool etw_powershell_provider;
+    bool etw_security_audit_provider;
+    bool etw_wmi_provider;
     bool ebpf_enabled;
     int poll_interval_s;
     uint32_t max_event_queue_size;
+    /**
+     * Windows 实时 ETW 会话 `EVENT_TRACE_PROPERTIES`：`BufferSize`（**KB**）、`FlushTimer`（**秒**）。
+     * **0** = 在 `edr_config_clamp` 中置默认（64 KB、1s）；亦可用 **`EDR_ETW_BUFFER_KB`** / **`EDR_ETW_FLUSH_TIMER_S`** 覆盖（见 A4.2）。
+     */
+    uint32_t etw_buffer_kb;
+    uint32_t etw_flush_timer_s;
   } collection;
 
   struct {

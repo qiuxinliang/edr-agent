@@ -1,0 +1,24 @@
+Start testing: Apr 26 15:33 CST
+----------------------------------------------------------
+3/3 Testing: test_event_bus_mpmc_stress
+3/3 Test: test_event_bus_mpmc_stress
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/test_event_bus_mpmc_stress" "250" "4" "64"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev
+"test_event_bus_mpmc_stress" start time: Apr 26 15:33 CST
+Output:
+----------------------------------------------------------
+[event_bus] A4.1 mpmc: duration=250ms nprod=4 cap=64 pops=push=707826 dropped=6378241 hwm_hits=421448
+<end of output>
+Test time =   0.73 sec
+----------------------------------------------------------
+Test Passed.
+"test_event_bus_mpmc_stress" end time: Apr 26 15:33 CST
+"test_event_bus_mpmc_stress" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 26 15:33 CST
+
+A4.1 =   0.73 sec*proc
+
+event_bus =   0.73 sec*proc
+

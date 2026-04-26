@@ -1,0 +1,58 @@
+Start testing: Apr 26 14:23 CST
+----------------------------------------------------------
+1/2 Testing: edr_agent_help
+1/2 Test: edr_agent_help
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent" "--help"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
+"edr_agent_help" start time: Apr 26 14:23 CST
+Output:
+----------------------------------------------------------
+/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent — EDR 端点 Agent
+
+用法:
+  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent [--config <path>]
+  不带任何参数时显示本说明并退出。
+
+选项:
+  --config <path>   加载 agent.toml（推荐始终显式指定）
+  --etw-uninstall-cleanup   停止本程序使用的 ETW 实时会话（卸载脚本调用；无其它初始化）
+  -h, --help, -help, /?   显示本说明并退出
+
+环境变量:
+  EDR_CONSOLE_HEARTBEAT_SEC   控制台 [heartbeat] 间隔（秒）；0=关闭；未设置则用 agent.toml
+                              的 [server] keepalive_interval_s（钳位 10~600）。
+  EDR_ETW_OBS=1  (仅 Windows) 在 [heartbeat] 同周期多打一行 [etw_obs]：ETW 回调、按 tag 分桶、
+                              空 slot 载荷、总线 push/drop、TDH 属性 API 错误率等（累计量）。
+  EDR_AVE_ETW_FEED_EVERY_N=K  (仅 Windows) 仅对 AVE 行为喂入 1/K 分频，不影响 TDH/总线；见 README。
+  EDR_AGENT_VERBOSE           1=详细 stderr（ONNX/传输/攻击面上报成功等，默认关）。
+  EDR_AGENT_SHUTDOWN_LOG      1=退出时打印 [preprocess]/[grpc] 等统计行（默认同关，
+                              与 EDR_AGENT_VERBOSE=1 时也会打印）。
+  EDR_SHELCODE_LOG            1=壳代码/WinDivert 逐包与 pcap 提示（细粒度，默认同上）。
+  EDR_NO_CONSOLE_UTF8=1        (仅 Windows) 不切换控制台为 UTF-8 代码页。
+
+更多: README「实现状态快照」与仓库内设计文档。
+<end of output>
+Test time =   0.95 sec
+----------------------------------------------------------
+Test Passed.
+"edr_agent_help" end time: Apr 26 14:23 CST
+"edr_agent_help" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/2 Testing: edr_p0_golden
+2/2 Test: edr_p0_golden
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_p0_golden_test"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
+"edr_p0_golden" start time: Apr 26 14:23 CST
+Output:
+----------------------------------------------------------
+[p0_golden] ok 7 cases
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"edr_p0_golden" end time: Apr 26 14:23 CST
+"edr_p0_golden" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 26 14:23 CST

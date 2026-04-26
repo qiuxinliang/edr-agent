@@ -1,0 +1,19 @@
+Start testing: Apr 26 13:25 CST
+----------------------------------------------------------
+2/2 Testing: edr_p0_golden
+2/2 Test: edr_p0_golden
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build-ir/edr_p0_golden_test"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build-ir
+"edr_p0_golden" start time: Apr 26 13:25 CST
+Output:
+----------------------------------------------------------
+[p0_golden] ok 7 cases
+<end of output>
+Test time =   0.51 sec
+----------------------------------------------------------
+Test Passed.
+"edr_p0_golden" end time: Apr 26 13:25 CST
+"edr_p0_golden" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 26 13:25 CST

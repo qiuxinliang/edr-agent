@@ -1,0 +1,39 @@
+{
+  "kind": "edr_p0_rule_bundle_manifest",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r218-9ae52519",
+  "source_ids_file": "p0_rule_ids_v1.example.txt",
+  "rule_count": 3,
+  "rules": [
+    {
+      "id": "R-EXEC-001",
+      "title": "PowerShell 编码命令执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.001"
+      ]
+    },
+    {
+      "id": "R-CRED-001",
+      "title": "导出 SAM/SYSTEM/SECURITY",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.002"
+      ]
+    },
+    {
+      "id": "R-FILELESS-001",
+      "title": "PowerShell 反射/IEX 无文件执行特征",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.001",
+        "T1027"
+      ]
+    }
+  ]
+}

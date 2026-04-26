@@ -9,6 +9,7 @@
 #include "edr/behavior_wire.h"
 #include "edr/dedup.h"
 #include "edr/emit_rules.h"
+#include "edr/p0_rule_direct_emit.h"
 #include "edr/event_batch.h"
 #include "edr/event_bus.h"
 #include "edr/ave_cross_engine_feed.h"
@@ -305,6 +306,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (n > 0) {
     (void)edr_event_batch_push(buf, n);
   }
+  edr_p0_rule_try_emit(&br);
 }
 
 #ifdef _WIN32

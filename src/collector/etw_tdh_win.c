@@ -23,6 +23,79 @@
 #include <stdint.h>
 #include <string.h>
 
+/* A3.3：可选轻量 TDH（默认关）。=1 时 Microsoft-Windows-DNS-Client 在已解析出 qname 时跳过 QueryType 试探。 */
+static int edr_tdh_light_path_a33_enabled(void) {
+  const char *e = getenv("EDR_TDH_LIGHT_PATH");
+  if (!e || !e[0]) {
+    return 0;
+  }
+  {
+    char *endp = NULL;
+    long v = strtol(e, &endp, 10);
+    if (endp != e && *endp == 0) {
+      return v != 0L;
+    }
+  }
+  return (e[0] | 32) == 'y' || (e[0] | 32) == 't';
+}
+
+/* A3.3 扩面：Microsoft-Windows-PowerShell，先 ScriptBlock 再全量；须 v1.1+ 会签/白名单 与 EDR_TDH_LIGHT_PATH_PS=1 */
+static int edr_tdh_light_path_ps_p1_enabled(void) {
+  const char *e = getenv("EDR_TDH_LIGHT_PATH_PS");
+  if (!e || !e[0]) {
+    return 0;
+  }
+  {
+    char *endp = NULL;
+    long v = strtol(e, &endp, 10);
+    if (endp != e && *endp == 0) {
+      return v != 0L;
+    }
+  }
+  return (e[0] | 32) == 'y' || (e[0] | 32) == 't';
+}
+
+/* A3.3+ P1：Microsoft-Windows-TCPIP、EventId 1002（NET_LISTEN）时先试 Local* / PID 子集，未出槽行再全量；默认关。须 EDR_TDH_LIGHT_PATH_TCPIP=1 与会签/P0 对表。 */
+static int edr_tdh_light_path_tcpip_p1_enabled(void) {
+  const char *e = getenv("EDR_TDH_LIGHT_PATH_TCPIP");
+  if (!e || !e[0]) {
+    return 0;
+  }
+  {
+    char *endp = NULL;
+    long v = strtol(e, &endp, 10);
+    if (endp != e && *endp == 0) {
+      return v != 0L;
+    }
+  }
+  return (e[0] | 32) == 'y' || (e[0] | 32) == 't';
+}
+
+/* A2.1：Tdh 属性拉取复用 thread-local 缓冲，避免每属性 HeapAlloc/HeapFree（仍保留 realloc 失败时单次 Heap 回退） */
+#if defined(_MSC_VER)
+#define EDR_TL_BUF __declspec(thread)
+#else
+#define EDR_TL_BUF __thread
+#endif
+static EDR_TL_BUF BYTE *s_tdh_prop_scratch;
+static EDR_TL_BUF size_t s_tdh_prop_scratch_cap;
+
+static volatile LONG64 s_tdh_api_err;
+static volatile LONG64 s_tdh_line_ok;
+
+static void tdh_stat_api_err_1(void) { (void)InterlockedAdd64(&s_tdh_api_err, 1); }
+
+static void tdh_stat_line_ok_1(void) { (void)InterlockedAdd64(&s_tdh_line_ok, 1); }
+
+void edr_tdh_win_get_property_stats(int64_t *out_tdh_api_err, int64_t *out_tdh_line_ok) {
+  if (out_tdh_api_err) {
+    *out_tdh_api_err = s_tdh_api_err;
+  }
+  if (out_tdh_line_ok) {
+    *out_tdh_line_ok = s_tdh_line_ok;
+  }
+}
+
 static size_t append_utf8(char *base, size_t cap, size_t *off, const char *fmt, ...) {
   if (*off >= cap) {
     return 0;
@@ -47,6 +120,7 @@ static int looks_like_utf16le_string(const BYTE *buf, ULONG cb) {
   ULONG pairs = cb / 2u;
   ULONG inspect = pairs > 512u ? 512u : pairs;
   ULONG ascii_like = 0;
+  ULONG hi_zero = 0;
   ULONG has_wide_nul = 0;
   for (ULONG i = 0; i < inspect; i++) {
     BYTE lo = buf[i * 2u];
@@ -55,17 +129,30 @@ static int looks_like_utf16le_string(const BYTE *buf, ULONG cb) {
       has_wide_nul = 1;
       break;
     }
+    if (hi == 0) {
+      hi_zero++;
+    }
     if (hi == 0 &&
         ((lo >= 0x20 && lo <= 0x7e) || lo == '\\' || lo == '/' || lo == ':' || lo == '.' || lo == '-' ||
          lo == '_' || lo == ' ' || lo == '\t')) {
       ascii_like++;
     }
   }
-  if (has_wide_nul) {
-    return 1;
+  if (inspect == 0u) {
+    return 0;
   }
-  /* Binary properties are often even-length; require a reasonable UTF-16LE signal before decoding as wide chars. */
-  return inspect > 0 && ascii_like >= (inspect / 3u);
+  /* Binary properties are often even-length; only decode as UTF-16LE with strong signal:
+   * high-byte-zero dominates, and low bytes look printable.
+   */
+  if (hi_zero < (inspect * 8u) / 10u) {
+    return 0;
+  }
+  if (ascii_like < (inspect / 2u)) {
+    return 0;
+  }
+  /* Optional wide NUL strengthens confidence but is not mandatory. */
+  (void)has_wide_nul;
+  return 1;
 }
 
 static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
@@ -81,17 +168,37 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   ULONG cb = 0;
   ULONG st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
   if (st != ERROR_SUCCESS || cb == 0 || cb > 65536) {
+    if (st != ERROR_SUCCESS) {
+      tdh_stat_api_err_1();
+    }
     return st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
   }
 
-  BYTE *tmp = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cb);
+  int tmp_is_heap = 0;
+  BYTE *tmp = NULL;
+  if (s_tdh_prop_scratch && cb <= s_tdh_prop_scratch_cap) {
+    tmp = s_tdh_prop_scratch;
+  } else {
+    void *n = realloc(s_tdh_prop_scratch, cb);
+    if (n) {
+      s_tdh_prop_scratch = (BYTE *)n;
+      s_tdh_prop_scratch_cap = cb;
+      tmp = s_tdh_prop_scratch;
+    } else {
+      tmp = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cb);
+      tmp_is_heap = 1;
+    }
+  }
   if (!tmp) {
     return ERROR_NOT_ENOUGH_MEMORY;
   }
 
   st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, tmp);
   if (st != ERROR_SUCCESS) {
-    HeapFree(GetProcessHeap(), 0, tmp);
+    tdh_stat_api_err_1();
+    if (tmp_is_heap) {
+      HeapFree(GetProcessHeap(), 0, tmp);
+    }
     return st;
   }
 
@@ -101,18 +208,26 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
                                 NULL, NULL);
     if (n > 0) {
       out[n] = '\0';
-      HeapFree(GetProcessHeap(), 0, tmp);
+      if (tmp_is_heap) {
+        HeapFree(GetProcessHeap(), 0, tmp);
+      }
+      tdh_stat_line_ok_1();
       return ERROR_SUCCESS;
     }
   }
   if (cb == 4) {
     ULONG v = *(ULONG *)tmp;
     snprintf(out, out_cap, "%lu", (unsigned long)v);
-    HeapFree(GetProcessHeap(), 0, tmp);
+    if (tmp_is_heap) {
+      HeapFree(GetProcessHeap(), 0, tmp);
+    }
+    tdh_stat_line_ok_1();
     return ERROR_SUCCESS;
   }
 
-  HeapFree(GetProcessHeap(), 0, tmp);
+  if (tmp_is_heap) {
+    HeapFree(GetProcessHeap(), 0, tmp);
+  }
   return ERROR_NOT_FOUND;
 }
 
@@ -128,6 +243,20 @@ static void edr_try_append_all(PEVENT_RECORD rec, const EdrPropTry *tries, size_
     if (edr_prop_utf8(rec, tries[i].name, line_buf, line_cap) == ERROR_SUCCESS &&
         line_buf[0]) {
       append_utf8(out, out_cap, off, "%s=%s\n", tries[i].key, line_buf);
+    }
+  }
+}
+
+/* 网络/TCPIP：补充进程映像路径，供 P0 规则对 network_aux_path 的 file_path_regex 匹配。 */
+static void edr_try_append_naux_for_net(PEVENT_RECORD rec, char *out, size_t out_cap, size_t *off,
+                                        char *line, size_t line_cap) {
+  static const PCWSTR naux_names[] = {
+      L"Image", L"Module", L"ProcessImage",
+  };
+  for (size_t i = 0; i < sizeof(naux_names) / sizeof(naux_names[0]); i++) {
+    if (edr_prop_utf8(rec, naux_names[i], line, line_cap) == ERROR_SUCCESS && line[0]) {
+      append_utf8(out, out_cap, off, "naux=%s\n", line);
+      return;
     }
   }
 }
@@ -165,11 +294,19 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
 
   const size_t off_after_hdr = off;
 
+  /* A2.2：高频 Provider 优先尝试检测常用字段，减少无效 Tdh 调用；名称集合不变（尾部仍覆盖 manifest 差异） */
   static const EdrPropTry proc_try[] = {
-      {L"ImageFileName", "img"}, {L"ImageName", "img"}, {L"Filename", "img"},
-      {L"CommandLine", "cmd"}, {L"Commandline", "cmd"},
-      {L"ParentProcessId", "ppid"}, {L"ParentProcessID", "ppid"},
-      {L"ProcessId", "epid"}, {L"ProcessID", "epid"},
+      {L"CommandLine", "cmd"},
+      {L"Commandline", "cmd"},
+      {L"ImageFileName", "img"},
+      {L"ImageName", "img"},
+      {L"Filename", "img"},
+      {L"ParentProcessId", "ppid"},
+      {L"ParentProcessID", "ppid"},
+      {L"ParentImage", "pimg"},
+      {L"ParentFileName", "pimg"},
+      {L"ProcessId", "epid"},
+      {L"ProcessID", "epid"},
   };
   static const EdrPropTry file_try[] = {
       {L"FileName", "file"},
@@ -177,7 +314,14 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"OpenPath", "file"},
   };
   static const EdrPropTry net_try[] = {
-      {L"daddr", "dst"}, {L"saddr", "src"}, {L"dport", "dpt"}, {L"sport", "spt"},
+      {L"daddr", "dst"},
+      {L"saddr", "src"},
+      {L"dport", "dpt"},
+      {L"sport", "spt"},
+      {L"RemoteAddress", "raddr"},
+      {L"LocalAddress", "laddr"},
+      {L"RemoteIP", "rip"},
+      {L"LocalIP", "lip"},
   };
   static const EdrPropTry reg_try[] = {
       {L"KeyName", "regkey"},
@@ -232,15 +376,42 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, net_try, sizeof(net_try) / sizeof(net_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
+    edr_try_append_naux_for_net(rec, (char *)out, out_cap, &off, line, sizeof(line));
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, dns_try, sizeof(dns_try) / sizeof(dns_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    if (edr_tdh_light_path_a33_enabled()) {
+      static const EdrPropTry dns_qname_only[] = {
+          {L"QueryName", "qname"},
+      };
+      const size_t off_before = off;
+      edr_try_append_all(rec, dns_qname_only, sizeof(dns_qname_only) / sizeof(dns_qname_only[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+      if (off == off_before) {
+        edr_try_append_all(rec, dns_try, sizeof(dns_try) / sizeof(dns_try[0]), line,
+                           sizeof(line), (char *)out, out_cap, &off);
+      }
+    } else {
+      edr_try_append_all(rec, dns_try, sizeof(dns_try) / sizeof(dns_try[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+    }
   } else if (memcmp(g, &EDR_ETW_GUID_POWERSHELL, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, ps_try, sizeof(ps_try) / sizeof(ps_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    if (edr_tdh_light_path_ps_p1_enabled()) {
+      static const EdrPropTry ps_script_first[] = {
+          {L"ScriptBlockText", "script"},
+      };
+      const size_t off_ps = off;
+      edr_try_append_all(rec, ps_script_first, sizeof(ps_script_first) / sizeof(ps_script_first[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+      if (off == off_ps) {
+        edr_try_append_all(rec, ps_try, sizeof(ps_try) / sizeof(ps_try[0]), line, sizeof(line), (char *)out, out_cap,
+                           &off);
+      }
+    } else {
+      edr_try_append_all(rec, ps_try, sizeof(ps_try) / sizeof(ps_try[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+    }
   } else if (memcmp(g, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, sec_try, sizeof(sec_try) / sizeof(sec_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
@@ -248,8 +419,26 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     edr_try_append_all(rec, wmi_try, sizeof(wmi_try) / sizeof(wmi_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, tcpip_try, sizeof(tcpip_try) / sizeof(tcpip_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    USHORT tcp_ev = rec->EventHeader.EventDescriptor.Id;
+    if (edr_tdh_light_path_tcpip_p1_enabled() && tcp_ev == 1002u) {
+      static const EdrPropTry tcpip_listen_light[] = {
+          {L"LocalAddress", "laddr"},
+          {L"LocalPort", "lport"},
+          {L"PID", "epid"},
+          {L"ProcessId", "epid"},
+      };
+      const size_t off_tcp_before = off;
+      edr_try_append_all(rec, tcpip_listen_light, sizeof(tcpip_listen_light) / sizeof(tcpip_listen_light[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+      if (off == off_tcp_before) {
+        edr_try_append_all(rec, tcpip_try, sizeof(tcpip_try) / sizeof(tcpip_try[0]), line,
+                           sizeof(line), (char *)out, out_cap, &off);
+      }
+    } else {
+      edr_try_append_all(rec, tcpip_try, sizeof(tcpip_try) / sizeof(tcpip_try[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+    }
+    edr_try_append_naux_for_net(rec, (char *)out, out_cap, &off, line, sizeof(line));
   } else if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, wf_try, sizeof(wf_try) / sizeof(wf_try[0]), line, sizeof(line),
                        (char *)out, out_cap, &off);
