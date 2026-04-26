@@ -25,7 +25,8 @@ typedef struct {
   uint16_t udlen;
   uint16_t edcount;
   uint8_t resv[4];
-  uint64_t buffer_context;
+  /** 与 `EVENT_RECORD::BufferContext` 一致（新 SDK 为 `ETW_BUFFER_CONTEXT`，非 uint64） */
+  ETW_BUFFER_CONTEXT buffer_context;
   uint8_t ud[EDR_A44_MAX_USERDATA];
 } EdrA44QueueItem;
 

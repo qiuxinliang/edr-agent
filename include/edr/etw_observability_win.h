@@ -10,6 +10,8 @@
 #error etw observability is Windows-only
 #endif
 
+#include <stdint.h>
+
 struct EdrEventBus;
 
 void edr_etw_observability_on_callback(const char *prov_tag);
