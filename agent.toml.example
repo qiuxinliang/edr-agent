@@ -67,9 +67,11 @@ max_event_queue_size = 4096
 # etw_flush_timer_s    = 1
 
 [preprocessing]
-dedup_window_s       = 60
-high_freq_threshold  = 40
-sampling_rate_whitelist = 0.03
+# 稍长去重窗 + 略严秒级频控 + 略低白名单抽样，减轻高噪机通信与平台 endpoint_events 压力（与 wp2_prod 联调）
+dedup_window_s       = 90
+high_freq_threshold  = 30
+sampling_rate_whitelist = 0.02
+# 端上默认丢弃「ETW1 非可打印、仅 parse=failed 无有效 reg/file/网络等」槽位；对拍时设 EDR_PREPROCESS_ALLOW_UNPARSED_NET_EVENTS=1 或 true/yes
 # WP-2：总线背压、L2/L3、进程门控的实验室/生产档与验收 — docs/WP2_EVENT_BUS_PREPROCESS.md；config/profiles/wp2_*.env.example
 # L2/L3 首版（默认关闭）通过环境变量控制：
 #   EDR_PREPROCESS_L2_SPLIT=1                # 启用“未命中规则事件”的抽样保留

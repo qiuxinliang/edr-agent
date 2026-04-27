@@ -1,6 +1,8 @@
 #include "edr/dedup.h"
 #include "edr/emit_rules.h"
+#include "edr/types.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* §4.3：去重窗口与高频阈值由 edr_dedup_configure（§11）设定 */
@@ -28,6 +30,7 @@ static RateSlot s_rate[EDR_RATE_SLOTS];
 
 static uint64_t s_stat_dedup_drop;
 static uint64_t s_stat_rate_drop;
+static uint64_t s_stat_junk_parse_failed;
 
 static uint64_t fnv64_update(uint64_t h, const unsigned char *p, size_t n) {
   size_t i;
@@ -137,10 +140,94 @@ void edr_dedup_reset(void) {
   memset(s_rate, 0, sizeof(s_rate));
   s_stat_dedup_drop = 0;
   s_stat_rate_drop = 0;
+  s_stat_junk_parse_failed = 0;
 }
+
+/* ASCII: 1 / true / yes / on 视为允许上送（恢复默认丢弃的 parse=failed 噪声） */
+static int str_ieq_ascii(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  for (; *a && *b; a++, b++) {
+    char ca = *a;
+    char cb = *b;
+    if (ca >= 'A' && ca <= 'Z') {
+      ca = (char)(ca - 'A' + 'a');
+    }
+    if (cb >= 'A' && cb <= 'Z') {
+      cb = (char)(cb - 'A' + 'a');
+    }
+    if (ca != cb) {
+      return 0;
+    }
+  }
+  return *a == *b;
+}
+
+static int allow_parse_failed_reemit(void) {
+  const char *e = getenv("EDR_PREPROCESS_ALLOW_UNPARSED_NET_EVENTS");
+  if (!e || e[0] == '\0') {
+    return 0;
+  }
+  if (e[0] == '1' && e[1] == '\0') {
+    return 1;
+  }
+  return str_ieq_ascii(e, "true") || str_ieq_ascii(e, "yes") || str_ieq_ascii(e, "on");
+}
+
+static int is_high_value_event_type(EdrEventType t) {
+  switch (t) {
+  case EDR_EVENT_PROTOCOL_SHELLCODE:
+  case EDR_EVENT_WEBSHELL_DETECTED:
+  case EDR_EVENT_FIREWALL_RULE_CHANGE:
+  case EDR_EVENT_PMFE_SCAN_RESULT:
+  case EDR_EVENT_BEHAVIOR_ONNX_ALERT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/**
+ * `behavior_from_slot` 在 ETW1 失败且原 payload 非可打印时仅填 `raw_etw…parse=failed`、清 cmdline；
+ * 可打印副本则进 cmdline，不视为垃圾。高价值/专用事件类型不丢弃。
+ */
+static int is_junk_parse_failed_event(const EdrBehaviorRecord *r) {
+  const char *ss;
+  if (!r) {
+    return 0;
+  }
+  if (r->cmdline[0] != '\0') {
+    return 0; /* 可打印原始字节在 cmdline，保留下游可见 */
+  }
+  ss = r->script_snippet;
+  if (ss[0] == '\0' || strstr(ss, "raw_etw_payload_bytes") == NULL || strstr(ss, "parse=failed") == NULL) {
+    return 0;
+  }
+  if (r->reg_key_path[0] || r->reg_value_name[0] || r->file_path[0] || r->file_op[0] || r->dns_query[0] ||
+      r->net_dst[0] || r->net_src[0] || r->network_aux_path[0] || r->pmfe_snapshot[0]) {
+    return 0;
+  }
+  if (r->net_dport != 0u || r->net_sport != 0u) {
+    return 0;
+  }
+  if (r->net_proto[0]) {
+    return 0;
+  }
+  if (is_high_value_event_type(r->type)) {
+    return 0;
+  }
+  return 1;
+}
+
+uint64_t edr_dedup_junk_parse_failed_drops(void) { return s_stat_junk_parse_failed; }
 
 int edr_preprocess_should_emit(const EdrBehaviorRecord *r) {
   if (!r) {
+    return 0;
+  }
+  if (!allow_parse_failed_reemit() && is_junk_parse_failed_event(r)) {
+    s_stat_junk_parse_failed++;
     return 0;
   }
   if (r->priority == 0u) {

@@ -284,7 +284,7 @@ int main(int argc, char **argv) {
             "[preprocess] wire_events=%lu wire_bytes=%lu batches=%lu "
             "batch_bytes=%lu batch_lz4=%lu batch_timeout_flushes=%llu "
             "bus_hw80=%llu bus_dropped=%llu dedup_drops=%llu rate_drops=%llu "
-            "queue_pending=%llu\n",
+            "junk_parse_failed_drops=%llu queue_pending=%llu\n",
             edr_transport_wire_events_count(), edr_transport_wire_bytes_count(),
             edr_transport_batch_count(), edr_transport_batch_bytes_count(),
             edr_transport_batch_lz4_count(),
@@ -294,6 +294,7 @@ int main(int argc, char **argv) {
             (unsigned long long)edr_event_bus_dropped_total(
                 edr_agent_event_bus(agent)),
             (unsigned long long)dd, (unsigned long long)rr,
+            (unsigned long long)edr_dedup_junk_parse_failed_drops(),
             (unsigned long long)edr_storage_queue_pending_count());
     fprintf(stderr, "[grpc] rpc_ok=%lu rpc_fail=%lu\n", edr_grpc_client_rpc_ok(),
             edr_grpc_client_rpc_fail());

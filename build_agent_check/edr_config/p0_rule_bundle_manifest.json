@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
   "rules_bundle_version": "edr-dynamic-rules-v1-r218-9ae52519",
-  "source_ids_file": "p0_rule_ids_v1.example.txt",
-  "rule_count": 3,
+  "source_ids_file": "p0_rule_ids_v1.txt",
+  "rule_count": 132,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -12,6 +12,189 @@
       "enabled": true,
       "mitre_ttps": [
         "T1059.001"
+      ]
+    },
+    {
+      "id": "R-EXEC-002",
+      "title": "PowerShell 隐蔽执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1564.003",
+        "T1059.001"
+      ]
+    },
+    {
+      "id": "R-EXEC-003",
+      "title": "Office 启动高风险子进程",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.002",
+        "T1059"
+      ]
+    },
+    {
+      "id": "R-EXEC-004",
+      "title": "浏览器启动高风险子进程",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.001",
+        "T1059"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-001",
+      "title": "Regsvr32 远程脚本执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.010"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-002",
+      "title": "Rundll32 可疑远程执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.011"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-003",
+      "title": "Certutil 下载文件",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1105"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-004",
+      "title": "Mshta 可疑脚本执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.005"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-005",
+      "title": "WMIC 远程命令执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1047"
+      ]
+    },
+    {
+      "id": "R-PERSIST-001",
+      "title": "注册表 Run 键持久化",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1547.001"
+      ]
+    },
+    {
+      "id": "R-PERSIST-002",
+      "title": "Winlogon 持久化",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1547.004"
+      ]
+    },
+    {
+      "id": "R-PERSIST-003",
+      "title": "计划任务可疑创建",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1053.005"
+      ]
+    },
+    {
+      "id": "R-PERSIST-004",
+      "title": "IFEO Debugger 劫持",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.012"
+      ]
+    },
+    {
+      "id": "R-PERSIST-005",
+      "title": "AppInit DLL 持久化",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.010"
+      ]
+    },
+    {
+      "id": "R-PERSIST-006",
+      "title": "AppCert DLL 持久化",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.009"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-001",
+      "title": "关闭 UAC",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-002",
+      "title": "关闭注册表编辑器",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-003",
+      "title": "关闭任务管理器",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-004",
+      "title": "关闭防火墙/Defender 关键项",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.001"
       ]
     },
     {
@@ -25,6 +208,315 @@
       ]
     },
     {
+      "id": "R-CRED-002",
+      "title": "LSASS Dump 命令痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.001"
+      ]
+    },
+    {
+      "id": "R-CRED-003",
+      "title": "可疑读取浏览器凭据库",
+      "severity": 2,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1555.003"
+      ]
+    },
+    {
+      "id": "R-CRED-004",
+      "title": "读取 ntds.dit",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.003"
+      ]
+    },
+    {
+      "id": "R-LMOVE-001",
+      "title": "SMB 横向异常访问",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.002"
+      ]
+    },
+    {
+      "id": "R-LMOVE-002",
+      "title": "RDP 横向异常访问",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.001"
+      ]
+    },
+    {
+      "id": "R-LMOVE-003",
+      "title": "WinRM 横向异常访问",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.006"
+      ]
+    },
+    {
+      "id": "R-WEBSHELL-001",
+      "title": "Web 服务进程写入脚本文件",
+      "severity": 3,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1505.003"
+      ]
+    },
+    {
+      "id": "R-WEBSHELL-002",
+      "title": "Web 服务进程执行系统命令",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1505.003",
+        "T1059"
+      ]
+    },
+    {
+      "id": "R-RANSOM-001",
+      "title": "勒索关键破坏指令",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1490"
+      ]
+    },
+    {
+      "id": "R-RANSOM-002",
+      "title": "可疑释放勒索说明文件",
+      "severity": 3,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1486"
+      ]
+    },
+    {
+      "id": "R-ANOM-001",
+      "title": "深层异常进程链",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059"
+      ]
+    },
+    {
+      "id": "R-RMM-001",
+      "title": "RMM 工具静默安装",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219"
+      ]
+    },
+    {
+      "id": "R-RMM-002",
+      "title": "RMM 工具可疑无人值守配置",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219"
+      ]
+    },
+    {
+      "id": "R-RMM-003",
+      "title": "办公软件或脚本拉起 RMM 工具",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1204.002"
+      ]
+    },
+    {
+      "id": "R-RMM-004",
+      "title": "RMM 工具服务持久化",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1543.003"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-006",
+      "title": "Msiexec 远程安装可疑包",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.007",
+        "T1105"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-007",
+      "title": "Cmstp 可疑 INF 执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.003"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-008",
+      "title": "Msxsl 执行远程脚本",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1220"
+      ]
+    },
+    {
+      "id": "R-PERSIST-007",
+      "title": "SC 创建可疑服务持久化",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1543.003"
+      ]
+    },
+    {
+      "id": "R-PERSIST-008",
+      "title": "启动目录投放可执行/脚本",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1547.001"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-005",
+      "title": "可疑放行防火墙规则",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.004"
+      ]
+    },
+    {
+      "id": "R-LMOVE-004",
+      "title": "PsExec 远程命令执行痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1569.002",
+        "T1021.002"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-009",
+      "title": "BITSAdmin 可疑下载任务",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1197",
+        "T1105"
+      ]
+    },
+    {
+      "id": "R-PERSIST-009",
+      "title": "WMI 事件订阅持久化",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.003"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-006",
+      "title": "清除安全日志",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1070.001"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-007",
+      "title": "停用安全服务",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.001"
+      ]
+    },
+    {
+      "id": "R-EXEC-005",
+      "title": "PowerShell Web 下载执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.001",
+        "T1105"
+      ]
+    },
+    {
+      "id": "R-CRED-005",
+      "title": "Cmdkey 凭据枚举/注入",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1555"
+      ]
+    },
+    {
+      "id": "R-LMOVE-005",
+      "title": "可疑 SMB 共享枚举",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1135"
+      ]
+    },
+    {
+      "id": "R-DISC-001",
+      "title": "系统与账户发现命令链",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1082",
+        "T1033",
+        "T1057"
+      ]
+    },
+    {
       "id": "R-FILELESS-001",
       "title": "PowerShell 反射/IEX 无文件执行特征",
       "severity": 3,
@@ -33,6 +525,829 @@
       "mitre_ttps": [
         "T1059.001",
         "T1027"
+      ]
+    },
+    {
+      "id": "R-FILELESS-002",
+      "title": "Regsvr32 脚本组件(scrobj/SCT)无文件执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.010",
+        "T1553.005"
+      ]
+    },
+    {
+      "id": "R-FILELESS-003",
+      "title": ".NET LOLBin 可疑远程或卸载参数",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.004",
+        "T1127.001"
+      ]
+    },
+    {
+      "id": "R-FILELESS-004",
+      "title": "脚本宿主无文件引擎(.sct//e:)",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.005",
+        "T1059.007"
+      ]
+    },
+    {
+      "id": "R-FILELESS-005",
+      "title": "Forfiles 代理执行解释器",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1202",
+        "T1059"
+      ]
+    },
+    {
+      "id": "R-FILELESS-006",
+      "title": "Odbcconf 加载 DLL(regsvr)",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.008"
+      ]
+    },
+    {
+      "id": "R-LMOVE-006",
+      "title": "DNS TXT 记录查询（外带/隧道常见入口）",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1071.004"
+      ]
+    },
+    {
+      "id": "R-LMOVE-011",
+      "title": "DNS 超长子域标签查询（隧道可疑）",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1071.004"
+      ]
+    },
+    {
+      "id": "R-LMOVE-007",
+      "title": "端口与服务发现扫描工具",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1046"
+      ]
+    },
+    {
+      "id": "R-LMOVE-008",
+      "title": "远程认证爆破/口令喷洒类工具",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1110.001",
+        "T1110.003"
+      ]
+    },
+    {
+      "id": "R-LMOVE-009",
+      "title": "ICMP 非标准隧道工具",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1095"
+      ]
+    },
+    {
+      "id": "R-LMOVE-010",
+      "title": "DCSync / 域复制凭据导出痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.006"
+      ]
+    },
+    {
+      "id": "R-CRED-006",
+      "title": "Kerberoasting 与服务票据请求痕迹",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1558.003"
+      ]
+    },
+    {
+      "id": "R-CRED-007",
+      "title": "Pass-the-Hash / NTLM 哈希横向痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1550.002"
+      ]
+    },
+    {
+      "id": "R-EXFIL-001",
+      "title": "敏感目录压缩打包（数据暂存）",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1560.001",
+        "T1074"
+      ]
+    },
+    {
+      "id": "R-EXFIL-002",
+      "title": "命令行外传文件（HTTP/SFTP/SCP）",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1048",
+        "T1041"
+      ]
+    },
+    {
+      "id": "R-EXFIL-003",
+      "title": "公有云/网盘同步外传工具",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1567.002"
+      ]
+    },
+    {
+      "id": "R-EXFIL-004",
+      "title": "剪贴板内容窃取脚本",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1115"
+      ]
+    },
+    {
+      "id": "R-EXFIL-005",
+      "title": "键盘记录 API 调用（脚本）",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1056.001"
+      ]
+    },
+    {
+      "id": "R-SIDELOAD-001",
+      "title": "可疑 DLL 侧载执行（用户可写路径）",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1574.002"
+      ]
+    },
+    {
+      "id": "R-INJECT-001",
+      "title": "进程注入/内存装载可疑命令行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055"
+      ]
+    },
+    {
+      "id": "R-UAC-002",
+      "title": "UAC 绕过可疑执行与参数",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1548.002"
+      ]
+    },
+    {
+      "id": "R-TOKEN-001",
+      "title": "访问令牌窃取/伪造命令行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1134",
+        "T1134.001",
+        "T1134.002"
+      ]
+    },
+    {
+      "id": "R-AMSI-001",
+      "title": "AMSI 绕过脚本痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.010"
+      ]
+    },
+    {
+      "id": "R-SAND-001",
+      "title": "沙箱/虚拟机环境探测",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1497",
+        "T1497.001",
+        "T1497.003"
+      ]
+    },
+    {
+      "id": "R-KERNEL-001",
+      "title": "内核驱动服务创建 / 可疑驱动安装",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1014",
+        "T1547.006"
+      ]
+    },
+    {
+      "id": "R-WIPE-001",
+      "title": "数据破坏与安全擦除工具",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1485"
+      ]
+    },
+    {
+      "id": "R-MINER-001",
+      "title": "加密货币挖矿典型特征",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1496"
+      ]
+    },
+    {
+      "id": "R-DDOS-001",
+      "title": "DDoS / 网络洪泛类工具命令行",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1498"
+      ]
+    },
+    {
+      "id": "R-SUPPLY-001",
+      "title": "远程包安装/注册可疑组件（供应链入口）",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1195.002"
+      ]
+    },
+    {
+      "id": "R-SIGN-001",
+      "title": "从用户目录对二进制签名（证书滥用嫌疑）",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1553.002"
+      ]
+    },
+    {
+      "id": "R-BOOT-001",
+      "title": "引导扇区 / BCD 异常修改",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1542.001",
+        "T1542.003"
+      ]
+    },
+    {
+      "id": "R-ACCT-001",
+      "title": "创建本地用户账户",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1136.001"
+      ]
+    },
+    {
+      "id": "R-ACCT-002",
+      "title": "域/本地账户属性与口令操纵",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1098"
+      ]
+    },
+    {
+      "id": "R-DBEX-001",
+      "title": "数据库客户端批量导出/落地",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1213"
+      ]
+    },
+    {
+      "id": "R-AMSI-002",
+      "title": "AMSI Providers 注册表被篡改",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.010"
+      ]
+    },
+    {
+      "id": "R-UAC-003",
+      "title": "UAC 绕过：mscfile 协议劫持键",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1548.002"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1004",
+      "title": "Winlogon Helper DLL",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1004"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1006",
+      "title": "File System Logical Offsets",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1006"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1012",
+      "title": "Query Registry",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1012"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1013",
+      "title": "Port Monitors",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1013"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1015",
+      "title": "Accessibility Features",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1015"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1023",
+      "title": "Shortcut Modification",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1023"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1028",
+      "title": "Windows Remote Management",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1028"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1031",
+      "title": "Modify Existing Service",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1031"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1034",
+      "title": "Path Interception",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1034"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1037",
+      "title": "Logon Scripts",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1037"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1042",
+      "title": "Change Default File Association",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1042"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1044",
+      "title": "File System Permissions Weakness",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1044"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1050",
+      "title": "New Service",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1050"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1051",
+      "title": "Shared Webroot",
+      "severity": 1,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1051"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1054",
+      "title": "Indicator Blocking",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1054"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1060",
+      "title": "Registry Run Keys / Start Folder",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1060"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1073",
+      "title": "DLL Side-Loading",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1073"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1075",
+      "title": "Pass the Hash",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1075"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1084",
+      "title": "Windows Management Instrumentation Event Subscription",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1084"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1088",
+      "title": "Bypass User Account Control",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1088"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1089",
+      "title": "Disabling Security Tools",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1089"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1091",
+      "title": "Replication Through Removable Media",
+      "severity": 1,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1091"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1097",
+      "title": "Pass the Ticket",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1097"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1100",
+      "title": "Web Shell",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1100"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1101",
+      "title": "Security Support Provider",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1101"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1103",
+      "title": "AppInit DLLs",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1103"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1107",
+      "title": "File Deletion",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1107"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1117",
+      "title": "Regsvr32",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1117"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1118",
+      "title": "InstallUtil",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1118"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1121",
+      "title": "Regsvcs/Regasm",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1121"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1122",
+      "title": "Component Object Model Hijacking",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1122"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1128",
+      "title": "Netsh Helper DLL",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1128"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1130",
+      "title": "Install Root Certificate",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1130"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1131",
+      "title": "Authentication Package",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1131"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1137",
+      "title": "Office Application Startup",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1137"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1138",
+      "title": "Application Shimming",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1138"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1170",
+      "title": "Mshta",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1170"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1171",
+      "title": "LLMNR/NBT-NS Poisoning",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1171"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1173",
+      "title": "Dynamic Data Exchange",
+      "severity": 1,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1173"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1174",
+      "title": "Password Filter DLL",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1174"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1175",
+      "title": "Distributed Component Object Model",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1175"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1177",
+      "title": "LSASS Driver",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1177"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1180",
+      "title": "Screensaver",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1180"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1182",
+      "title": "AppCert DLLs",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1182"
+      ]
+    },
+    {
+      "id": "R-MITRE-WIN-T1183",
+      "title": "Image File Execution Options Injection",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1183"
       ]
     }
   ]

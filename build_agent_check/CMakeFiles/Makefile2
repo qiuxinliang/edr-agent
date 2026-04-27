@@ -66,12 +66,14 @@ CMAKE_BINARY_DIR = "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/buil
 all: CMakeFiles/edr_agent.dir/all
 all: CMakeFiles/edr_monitor.dir/all
 all: CMakeFiles/edr_p0_golden_test.dir/all
+all: CMakeFiles/test_event_bus_mpmc_stress.dir/all
 .PHONY : all
 
 # The main recursive "codegen" target.
 codegen: CMakeFiles/edr_agent.dir/codegen
 codegen: CMakeFiles/edr_monitor.dir/codegen
 codegen: CMakeFiles/edr_p0_golden_test.dir/codegen
+codegen: CMakeFiles/test_event_bus_mpmc_stress.dir/codegen
 .PHONY : codegen
 
 # The main recursive "preinstall" target.
@@ -82,6 +84,7 @@ preinstall:
 clean: CMakeFiles/edr_agent.dir/clean
 clean: CMakeFiles/edr_monitor.dir/clean
 clean: CMakeFiles/edr_p0_golden_test.dir/clean
+clean: CMakeFiles/test_event_bus_mpmc_stress.dir/clean
 .PHONY : clean
 
 #=============================================================================
@@ -179,6 +182,38 @@ CMakeFiles/edr_p0_golden_test.dir/codegen:
 CMakeFiles/edr_p0_golden_test.dir/clean:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/clean
 .PHONY : CMakeFiles/edr_p0_golden_test.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/test_event_bus_mpmc_stress.dir
+
+# All Build rule for target.
+CMakeFiles/test_event_bus_mpmc_stress.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_agent_check/CMakeFiles" --progress-num=76,77,78 "Built target test_event_bus_mpmc_stress"
+.PHONY : CMakeFiles/test_event_bus_mpmc_stress.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/test_event_bus_mpmc_stress.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_agent_check/CMakeFiles" 3
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/test_event_bus_mpmc_stress.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_agent_check/CMakeFiles" 0
+.PHONY : CMakeFiles/test_event_bus_mpmc_stress.dir/rule
+
+# Convenience name for target.
+test_event_bus_mpmc_stress: CMakeFiles/test_event_bus_mpmc_stress.dir/rule
+.PHONY : test_event_bus_mpmc_stress
+
+# codegen rule for target.
+CMakeFiles/test_event_bus_mpmc_stress.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_agent_check/CMakeFiles" --progress-num=76,77,78 "Finished codegen for target test_event_bus_mpmc_stress"
+.PHONY : CMakeFiles/test_event_bus_mpmc_stress.dir/codegen
+
+# clean rule for target.
+CMakeFiles/test_event_bus_mpmc_stress.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/clean
+.PHONY : CMakeFiles/test_event_bus_mpmc_stress.dir/clean
 
 #=============================================================================
 # Special targets to cleanup operation of make.

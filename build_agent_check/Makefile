@@ -165,6 +165,19 @@ edr_p0_golden_test/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/build
 .PHONY : edr_p0_golden_test/fast
 
+#=============================================================================
+# Target rules for targets named test_event_bus_mpmc_stress
+
+# Build rule for target.
+test_event_bus_mpmc_stress: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_event_bus_mpmc_stress
+.PHONY : test_event_bus_mpmc_stress
+
+# fast build rule for target.
+test_event_bus_mpmc_stress/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/build
+.PHONY : test_event_bus_mpmc_stress/fast
+
 src/attack_surface/attack_surface_egress.o: src/attack_surface/attack_surface_egress.c.o
 .PHONY : src/attack_surface/attack_surface_egress.o
 
@@ -771,6 +784,7 @@ src/core/event_bus.o: src/core/event_bus.c.o
 # target to build an object file
 src/core/event_bus.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/event_bus.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.o
 .PHONY : src/core/event_bus.c.o
 
 src/core/event_bus.i: src/core/event_bus.c.i
@@ -779,6 +793,7 @@ src/core/event_bus.i: src/core/event_bus.c.i
 # target to preprocess a source file
 src/core/event_bus.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/event_bus.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.i
 .PHONY : src/core/event_bus.c.i
 
 src/core/event_bus.s: src/core/event_bus.c.s
@@ -787,6 +802,7 @@ src/core/event_bus.s: src/core/event_bus.c.s
 # target to generate assembly for a file
 src/core/event_bus.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/event_bus.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.s
 .PHONY : src/core/event_bus.c.s
 
 src/core/time_util.o: src/core/time_util.c.o
@@ -1683,6 +1699,30 @@ src/webshell_detector/webshell_forensic.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.s
 .PHONY : src/webshell_detector/webshell_forensic.c.s
 
+tests/test_event_bus_mpmc_stress.o: tests/test_event_bus_mpmc_stress.c.o
+.PHONY : tests/test_event_bus_mpmc_stress.o
+
+# target to build an object file
+tests/test_event_bus_mpmc_stress.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.o
+.PHONY : tests/test_event_bus_mpmc_stress.c.o
+
+tests/test_event_bus_mpmc_stress.i: tests/test_event_bus_mpmc_stress.c.i
+.PHONY : tests/test_event_bus_mpmc_stress.i
+
+# target to preprocess a source file
+tests/test_event_bus_mpmc_stress.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.i
+.PHONY : tests/test_event_bus_mpmc_stress.c.i
+
+tests/test_event_bus_mpmc_stress.s: tests/test_event_bus_mpmc_stress.c.s
+.PHONY : tests/test_event_bus_mpmc_stress.s
+
+# target to generate assembly for a file
+tests/test_event_bus_mpmc_stress.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.s
+.PHONY : tests/test_event_bus_mpmc_stress.c.s
+
 third_party/lz4/lz4.o: third_party/lz4/lz4.c.o
 .PHONY : third_party/lz4/lz4.o
 
@@ -1842,6 +1882,7 @@ help:
 	@echo "... edr_agent"
 	@echo "... edr_monitor"
 	@echo "... edr_p0_golden_test"
+	@echo "... test_event_bus_mpmc_stress"
 	@echo "... src/attack_surface/attack_surface_egress.o"
 	@echo "... src/attack_surface/attack_surface_egress.i"
 	@echo "... src/attack_surface/attack_surface_egress.s"
@@ -2031,6 +2072,9 @@ help:
 	@echo "... src/webshell_detector/webshell_forensic.o"
 	@echo "... src/webshell_detector/webshell_forensic.i"
 	@echo "... src/webshell_detector/webshell_forensic.s"
+	@echo "... tests/test_event_bus_mpmc_stress.o"
+	@echo "... tests/test_event_bus_mpmc_stress.i"
+	@echo "... tests/test_event_bus_mpmc_stress.s"
 	@echo "... third_party/lz4/lz4.o"
 	@echo "... third_party/lz4/lz4.i"
 	@echo "... third_party/lz4/lz4.s"
