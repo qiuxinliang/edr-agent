@@ -284,6 +284,8 @@ static void process_one_slot(const EdrEventSlot *slot) {
   /* P2 T9：Shellcode / Webshell / PMFE → AVE 行为槽（E 组 46–47、53–54） */
   edr_ave_cross_engine_feed_from_record(&br);
   if (!edr_preprocess_should_emit(&br)) {
+    /* P0 直出与主行为上送（dedup/限流/动态规则门控）解耦；否则应上送主路径为 0 时 P0 永不执行 */
+    edr_p0_rule_try_emit(&br);
     return;
   }
   size_t n = 0;

@@ -14,6 +14,7 @@ if ($env:EDR_SMOKE_LOOPS -match '^\d+$') { $Iterations = [int]$env:EDR_SMOKE_LOO
 if ($env:EDR_SMOKE_STAGGER_MS -match '^\d+$') { $StaggerMs = [int]$env:EDR_SMOKE_STAGGER_MS }
 
 $ErrorActionPreference = 'Continue'
+Write-Host "edr_platform_stack_smoke.ps1: starting  Iterations=$Iterations  StaggerMs=${StaggerMs}ms  DryRun=$DryRun  (PID=$PID)" -ForegroundColor Cyan
 $round = 0
 $outDir = Join-Path $env:TEMP ("edr_smoke_{0:yyyyMMdd_HHmmss}" -f (Get-Date))
 if (-not $DryRun) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }

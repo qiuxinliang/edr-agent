@@ -1,7 +1,3 @@
-# 全量端上预处理规则包（与 edr-backend/platform/config/agent_preprocess_rules_v1.toml 由同一脚本生成）
-# 更新：edr-backend/platform/config 下执行 python3 generate_agent_preprocess_rules.py 后覆盖本文件
-# 说明：见 platform/config/README_dynamic_rules_v1.md（Agent 短 TOML 为保守可下沉子集，非 JSON 全量 R-* 一一对应）
-#
 [preprocessing]
 dedup_window_s = 60
 high_freq_threshold = 40
@@ -17,6 +13,24 @@ rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
 # event_type = "PROCESS_CREATE"
 # exe_path_contains = "\\Windows\\Temp\\"
 # icase_exe_path = true
+
+[[preprocessing.rules]]
+name = "noise-drop-reg-set-value"
+action = "drop"
+event_type = "REG_SET_VALUE"
+
+[[preprocessing.rules]]
+name = "noise-drop-reg-create-key"
+action = "drop"
+event_type = "REG_CREATE_KEY"
+
+[[preprocessing.rules]]
+name = "noise-drop-reg-delete-key"
+action = "drop"
+event_type = "REG_DELETE_KEY"
+
+# Registry events dropped above (tunable via AGENT_PREPROCESS_DROP_REGISTRY in this script).
+# P0 IR rules with event_type=registry_set will not see these events on the agent.
 
 [[preprocessing.rules]]
 name = "r-exec-001_1"
