@@ -1,5 +1,6 @@
 #include "edr/p0_rule_ir.h"
 
+#include "edr/preprocess.h"
 #include "edr/behavior_record.h"
 #include "cJSON.h"
 
@@ -79,7 +80,7 @@ static uint64_t s_rule_hit_count[P0_IR_RULES_MAX];
 static int s_stats_enabled;
 
 static void p0_ir_stats_init(void) {
-  s_stats_enabled = getenv_int_default("EDR_P0_STATS", 0);
+  s_stats_enabled = edr_getenv_int_default("EDR_P0_STATS", 0);
   if (s_stats_enabled) {
     memset(s_rule_evaluate_count, 0, sizeof(s_rule_evaluate_count));
     memset(s_rule_hit_count, 0, sizeof(s_rule_hit_count));

@@ -16,4 +16,7 @@ void edr_preprocess_apply_config(const EdrConfig *cfg);
 /** 拷贝当前缓存的 agent endpoint_id / tenant_id（供行为告警批次编码与 §12.4 对齐）。 */
 void edr_preprocess_copy_agent_ids(char *endpoint_id, size_t endpoint_cap, char *tenant_id, size_t tenant_cap);
 
+/** getenv(key) 按十进制解析为 int；未设置或空串则返回 defv（供预处理链与 P0 IR 等共用）。 */
+int edr_getenv_int_default(const char *key, int defv);
+
 #endif

@@ -247,7 +247,7 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
   return v;
 }
 
-static int getenv_int_default(const char *key, int defv) {
+int edr_getenv_int_default(const char *key, int defv) {
   const char *v = getenv(key);
   if (!v || !v[0]) {
     return defv;
@@ -265,9 +265,9 @@ static double getenv_double_default(const char *key, double defv) {
 
 static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
   /* 默认去重窗口5秒（严格模式），可通过环境变量 EDR_DEDUP_WINDOW_SECONDS 覆盖 */
-  uint32_t dedup_window_s = (uint32_t)getenv_int_default("EDR_DEDUP_WINDOW_SECONDS", cfg ? cfg->preprocessing.dedup_window_s : 5);
+  uint32_t dedup_window_s = (uint32_t)edr_getenv_int_default("EDR_DEDUP_WINDOW_SECONDS", cfg ? cfg->preprocessing.dedup_window_s : 5);
   /* 默认速率限制20/秒/PID（严格模式），可通过环境变量 EDR_RATE_LIMIT_PER_SEC 覆盖 */
-  uint32_t rate_limit_per_sec = (uint32_t)getenv_int_default("EDR_RATE_LIMIT_PER_SEC", cfg ? cfg->preprocessing.high_freq_threshold : 20);
+  uint32_t rate_limit_per_sec = (uint32_t)edr_getenv_int_default("EDR_RATE_LIMIT_PER_SEC", cfg ? cfg->preprocessing.high_freq_threshold : 20);
   if (dedup_window_s == 0) {
     dedup_window_s = 5;
   }
@@ -282,7 +282,7 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
   }
   edr_dedup_configure(dedup_window_s, rate_limit_per_sec);
 
-  s_l2_split_enabled = getenv_int_default("EDR_PREPROCESS_L2_SPLIT", 0) == 1 ? 1 : 0;
+  s_l2_split_enabled = edr_getenv_int_default("EDR_PREPROCESS_L2_SPLIT", 0) == 1 ? 1 : 0;
   s_l2_unmatched_keep_ratio = cfg ? cfg->preprocessing.sampling_rate_whitelist : 0.1;
   s_l2_unmatched_keep_ratio =
       getenv_double_default("EDR_PREPROCESS_L2_KEEP_RATIO", s_l2_unmatched_keep_ratio);
@@ -293,23 +293,23 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
     s_l2_unmatched_keep_ratio = 0.10;
   }
 
-  s_l3_pressure_enabled = getenv_int_default("EDR_PREPROCESS_L3_PRESSURE", 0) == 1 ? 1 : 0;
-  s_l3_pressure_high_pct = (uint32_t)getenv_int_default("EDR_PREPROCESS_L3_HIGH_PCT", 90);
-  s_l3_pressure_recover_pct = (uint32_t)getenv_int_default("EDR_PREPROCESS_L3_RECOVER_PCT", 70);
-  s_l3_drop_permille = (uint32_t)getenv_int_default("EDR_PREPROCESS_L3_DROP_PERMILLE", 800);
+  s_l3_pressure_enabled = edr_getenv_int_default("EDR_PREPROCESS_L3_PRESSURE", 0) == 1 ? 1 : 0;
+  s_l3_pressure_high_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_HIGH_PCT", 90);
+  s_l3_pressure_recover_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_RECOVER_PCT", 70);
+  s_l3_drop_permille = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_DROP_PERMILLE", 800);
   s_l3_pressure_high_pct = clamp_u32(s_l3_pressure_high_pct, 50u, 99u);
   s_l3_pressure_recover_pct = clamp_u32(s_l3_pressure_recover_pct, 10u, s_l3_pressure_high_pct);
   s_l3_drop_permille = clamp_u32(s_l3_drop_permille, 0u, 1000u);
-  s_procname_gate_enabled = getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE", 1) == 1 ? 1 : 0;
+  s_procname_gate_enabled = edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE", 1) == 1 ? 1 : 0;
   s_procname_gate_keep_unknown_permille =
-      (uint32_t)getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE", 100);
+      (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE", 100);
   s_procname_gate_keep_unknown_permille =
       clamp_u32(s_procname_gate_keep_unknown_permille, 0u, 1000u);
   s_l3_pressure_active = 0;
   s_drop_l2_unmatched = 0u;
   s_drop_l3_pressure = 0u;
   s_strict_behavior_gate_enabled =
-      getenv_int_default("EDR_PREPROCESS_STRICT_BEHAVIOR_GATE", 0) == 1 ? 1 : 0;
+      edr_getenv_int_default("EDR_PREPROCESS_STRICT_BEHAVIOR_GATE", 0) == 1 ? 1 : 0;
   s_drop_strict_behavior_gate = 0u;
   s_drop_procname_gate = 0u;
   if (cfg) {
