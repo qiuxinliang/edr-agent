@@ -26,7 +26,7 @@
 
 typedef LONG EDR_NTSTATUS;
 #define EDR_STATUS_SUCCESS ((EDR_NTSTATUS)0x00000000L)
-#define EDR_PROCESS_BASIC_INFORMATION 0
+#define EDR_PBI_CLASS 0
 
 typedef struct _EDR_UNICODE_STRING {
     USHORT Length;
@@ -35,12 +35,12 @@ typedef struct _EDR_UNICODE_STRING {
 } EDR_UNICODE_STRING;
 
 typedef struct _EDR_PROCESS_BASIC_INFORMATION {
-    PVOID ExitStatus;
-    PVOID PebBaseAddress;
-    PVOID AffinityMask;
+    void *ExitStatus;
+    void *PebBaseAddress;
+    void *AffinityMask;
     LONG BasePriority;
-    HANDLE UniqueProcessId;
-    HANDLE InheritedFromUniqueProcessId;
+    void *UniqueProcessId;
+    void *InheritedFromUniqueProcessId;
 } EDR_PROCESS_BASIC_INFORMATION;
 
 /* A3.3：可选轻量 TDH（默认关）。=1 时 Microsoft-Windows-DNS-Client 在已解析出 qname 时跳过 QueryType 试探。 */
@@ -323,7 +323,7 @@ static int edr_get_process_cmdline_by_pid(DWORD pid, char *out, size_t out_cap) 
   }
 
   EDR_PROCESS_BASIC_INFORMATION pbi;
-  EDR_NTSTATUS status = pNtQueryInformationProcess(hProcess, EDR_PROCESS_BASIC_INFORMATION, &pbi, sizeof(pbi), NULL);
+  EDR_NTSTATUS status = pNtQueryInformationProcess(hProcess, EDR_PBI_CLASS, &pbi, sizeof(pbi), NULL);
   if (status != EDR_STATUS_SUCCESS || !pbi.PebBaseAddress) {
     CloseHandle(hProcess);
     return -1;
