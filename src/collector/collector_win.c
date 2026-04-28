@@ -12,8 +12,12 @@
 #endif
 #include <windows.h>
 
+#include <guiddef.h>
+#include <basetsd.h>
+#include <initguid.h>
+
 #include <evntcons.h>
-#include <evntrace.h>
+#include <evnttrace.h>
 
 #include "edr/collector.h"
 #include "edr/config.h"
