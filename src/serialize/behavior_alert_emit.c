@@ -31,7 +31,7 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
   char ep[128];
   char te[128];
   edr_preprocess_copy_agent_ids(ep, sizeof(ep), te, sizeof(te));
-  uint8_t buf[13000];
+  uint8_t buf[32768];
   size_t n = edr_behavior_alert_encode_protobuf(a, ep, te, buf, sizeof(buf));
   if (n > 0) {
     (void)edr_event_batch_push(buf, n);
