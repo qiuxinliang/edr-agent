@@ -315,6 +315,21 @@ static int slot_is_p0_eligible(const EdrEventSlot *slot) {
   }
 }
 
+static int process_name_looks_like_exe(const char *name) {
+  size_t len;
+  if (!name || !name[0]) return 0;
+  len = strlen(name);
+  if (len < 5) return 0;
+  {
+    const char *s = name + len - 4;
+    char c0 = (char)(s[0] | 32);
+    char c1 = (char)(s[1] | 32);
+    char c2 = (char)(s[2] | 32);
+    char c3 = (char)(s[3] | 32);
+    return c0 == '.' && c1 == 'e' && c2 == 'x' && c3 == 'e';
+  }
+}
+
 static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
@@ -325,7 +340,10 @@ static void process_one_slot(const EdrEventSlot *slot) {
       edr_behavior_from_slot(slot, &br);
       edr_behavior_record_fill_process_chain_depth(&br);
       apply_agent_ids_to_record(&br);
-      edr_p0_rule_try_emit(&br);
+      if (slot->type != EDR_EVENT_PROCESS_CREATE ||
+          !br.process_name[0] || process_name_looks_like_exe(br.process_name)) {
+        edr_p0_rule_try_emit(&br);
+      }
     }
     return;
   }
@@ -343,6 +361,12 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_behavior_from_slot(slot, &br);
   edr_behavior_record_fill_process_chain_depth(&br);
   apply_agent_ids_to_record(&br);
+
+  /* 丢弃 PROCESS_CREATE 事件中非可执行程序的进程名（img= 指向 DLL/SYS 等非 exe 模块） */
+  if (slot && slot->type == EDR_EVENT_PROCESS_CREATE &&
+      br.process_name[0] && !process_name_looks_like_exe(br.process_name)) {
+    return;
+  }
 
   /* P0检测：尽早执行，确保关键告警不被后续丢弃逻辑遗漏 */
   if (slot_is_p0_eligible(slot)) {

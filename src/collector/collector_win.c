@@ -296,7 +296,8 @@ static uint64_t edr_unix_ns(void) {
   return (t - epoch_100ns) * 100ULL;
 }
 
-static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
+/** 返回 1 = 应处理此事件；0 = 跳过（opcode/EventId 不在已知范围内）。 */
+static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
                                  const char **out_tag) {
   const GUID *g = &rec->EventHeader.ProviderId;
   USHORT ev_id = rec->EventHeader.EventDescriptor.Id;
@@ -306,131 +307,123 @@ static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
     *out_tag = "kproc";
     if (op == 1) {
       *out_type = EDR_EVENT_PROCESS_CREATE;
-      return;
+      return 1;
     }
     if (op == 2) {
       *out_type = EDR_EVENT_PROCESS_TERMINATE;
-      return;
+      return 1;
     }
     if (op == 3 || op == 4 || op == 5) {
       *out_type = EDR_EVENT_DLL_LOAD;
-      return;
+      return 1;
     }
     /* opcode 32-36: ImageLoad/ImageUnload/HyperCallPage/etc.
-     * ImageFileName 此时返回被加载的模块路径（DLL），不应归为进程创建。 */
+     * ImageFileName 返回被加载的模块路径（DLL），归为 DLL_LOAD。 */
     if (op >= 32 && op <= 36) {
       *out_type = EDR_EVENT_DLL_LOAD;
-      return;
+      return 1;
     }
-    *out_type = EDR_EVENT_PROCESS_CREATE;
-    return;
+    /* op=37+ 等未识别 opcode → 不处理 */
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     *out_tag = "kfile";
-    /* Kernel-File：15=Read（Task 值；12/14/16 为既有 create/write/delete 口径） */
     if (op == 12) {
       *out_type = EDR_EVENT_FILE_CREATE;
-      return;
+      return 1;
     }
     if (op == 15) {
       *out_type = EDR_EVENT_FILE_READ;
-      return;
+      return 1;
     }
     if (op == 14) {
       *out_type = EDR_EVENT_FILE_WRITE;
-      return;
+      return 1;
     }
     if (op == 16) {
       *out_type = EDR_EVENT_FILE_DELETE;
-      return;
+      return 1;
     }
-    *out_type = EDR_EVENT_FILE_WRITE;
-    return;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
     *out_tag = "knet";
     if (op == 15) {
       *out_type = EDR_EVENT_NET_DNS_QUERY;
-      return;
+      return 1;
     }
     *out_type = EDR_EVENT_NET_CONNECT;
-    return;
+    return 1;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
     *out_tag = "kreg";
-    /* Kernel-Registry manifest：Opcode 常见为 Task 序号（Create=1 Open=2 DeleteKey=3 SetValue=6 DeleteValue=7） */
     if (op == 1u) {
       *out_type = EDR_EVENT_REG_CREATE_KEY;
-      return;
+      return 1;
     }
     if (op == 2u) {
       *out_type = EDR_EVENT_REG_CREATE_KEY;
-      return;
+      return 1;
     }
     if (op == 3u || op == 7u) {
       *out_type = EDR_EVENT_REG_DELETE_KEY;
-      return;
+      return 1;
     }
     if (op == 6u) {
       *out_type = EDR_EVENT_REG_SET_VALUE;
-      return;
+      return 1;
     }
     (void)ev_id;
-    *out_type = EDR_EVENT_REG_SET_VALUE;
-    return;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
     *out_tag = "dns";
     *out_type = EDR_EVENT_NET_DNS_QUERY;
     (void)ev_id;
-    return;
+    return 1;
   }
   if (memcmp(g, &EDR_ETW_GUID_POWERSHELL, sizeof(GUID)) == 0) {
     *out_tag = "ps";
     *out_type = EDR_EVENT_SCRIPT_POWERSHELL;
-    return;
+    return 1;
   }
   if (memcmp(g, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) {
     *out_tag = "sec";
     if (ev_id == 4624) {
       *out_type = EDR_EVENT_AUTH_LOGIN;
-      return;
+      return 1;
     }
     if (ev_id == 4688) {
       *out_type = EDR_EVENT_PROCESS_CREATE;
-      return;
+      return 1;
     }
-    /* 其他审计事件占位：后续按 ID 细分（如 4625 失败登录） */
-    *out_type = EDR_EVENT_AUTH_LOGIN;
-    return;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_WMI_ACTIVITY, sizeof(GUID)) == 0) {
     *out_tag = "wmi";
     *out_type = EDR_EVENT_SCRIPT_WMI;
     (void)op;
-    return;
+    return 1;
   }
   if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
     *out_tag = "tcpip";
-    /* 设计 §19.10：1001 新连接 / 1002 端口绑定等；其余按连接类处理 */
     if (ev_id == 1002u) {
       *out_type = EDR_EVENT_NET_LISTEN;
     } else {
       *out_type = EDR_EVENT_NET_CONNECT;
     }
     (void)op;
-    return;
+    return 1;
   }
   if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
     *out_tag = "wf";
     *out_type = EDR_EVENT_FIREWALL_RULE_CHANGE;
     (void)op;
     (void)ev_id;
-    return;
+    return 1;
   }
 
-  *out_tag = "unk";
-  *out_type = EDR_EVENT_PROCESS_CREATE;
+  return 0;
 }
 
 static uint8_t edr_priority_from_utf8_payload(const uint8_t *data, uint32_t len) {
@@ -993,7 +986,9 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   }
   EdrEventType ty;
   const char *tag;
-  edr_map_type_and_tag(event_record, &ty, &tag);
+  if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
+    return;
+  }
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
     edr_pmfe_on_process_lifecycle_hint();
   }
