@@ -6,7 +6,8 @@ name: edr-agent build (Windows grpc-client vcpkg + ORT; stub ingest)
 
 on:
   push:
-    branches: ['**']
+    tags:
+      - 'win_*.*.*'
   pull_request:
   workflow_dispatch:
 

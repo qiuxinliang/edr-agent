@@ -83,10 +83,13 @@ static EDR_TL_BUF size_t s_tdh_prop_scratch_cap;
 
 static volatile LONG64 s_tdh_api_err;
 static volatile LONG64 s_tdh_line_ok;
+static volatile LONG64 s_tdh_prop_not_found;
 
 static void tdh_stat_api_err_1(void) { (void)InterlockedAdd64(&s_tdh_api_err, 1); }
 
 static void tdh_stat_line_ok_1(void) { (void)InterlockedAdd64(&s_tdh_line_ok, 1); }
+
+static void tdh_stat_not_found_1(void) { (void)InterlockedAdd64(&s_tdh_prop_not_found, 1); }
 
 void edr_tdh_win_get_property_stats(int64_t *out_tdh_api_err, int64_t *out_tdh_line_ok) {
   if (out_tdh_api_err) {
@@ -95,6 +98,13 @@ void edr_tdh_win_get_property_stats(int64_t *out_tdh_api_err, int64_t *out_tdh_l
   if (out_tdh_line_ok) {
     *out_tdh_line_ok = s_tdh_line_ok;
   }
+}
+
+void edr_tdh_win_get_property_stats_ext(int64_t *out_api_err, int64_t *out_line_ok,
+                                        int64_t *out_prop_not_found) {
+  if (out_api_err)       *out_api_err       = s_tdh_api_err;
+  if (out_line_ok)       *out_line_ok       = s_tdh_line_ok;
+  if (out_prop_not_found) *out_prop_not_found = s_tdh_prop_not_found;
 }
 
 static size_t append_utf8(char *base, size_t cap, size_t *off, const char *fmt, ...) {
@@ -169,7 +179,9 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   ULONG cb = 0;
   ULONG st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
   if (st != ERROR_SUCCESS || cb == 0 || cb > 65536) {
-    if (st != ERROR_SUCCESS) {
+    if (st == ERROR_NOT_FOUND) {
+      tdh_stat_not_found_1();
+    } else if (st != ERROR_SUCCESS) {
       tdh_stat_api_err_1();
     }
     return st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;

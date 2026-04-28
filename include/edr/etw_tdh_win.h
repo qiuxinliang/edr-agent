@@ -39,4 +39,10 @@ size_t edr_tdh_extract_ave_net_fields(PEVENT_RECORD rec, EdrEventType ty, char *
  */
 void edr_tdh_win_get_property_stats(int64_t *out_tdh_api_err, int64_t *out_tdh_line_ok);
 
+/**
+ * 扩展统计：区分真正的 TDH API 错误 与 属性在事件中不存在（ERROR_NOT_FOUND，正常行为）。
+ */
+void edr_tdh_win_get_property_stats_ext(int64_t *out_api_err, int64_t *out_line_ok,
+                                        int64_t *out_prop_not_found);
+
 #endif

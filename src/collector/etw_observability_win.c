@@ -106,14 +106,17 @@ static void edr_etw_observability_fprint(const EdrEventBus *bus, FILE *out) {
   if (!bus || !out) {
     return;
   }
-  int64_t tdh_err = 0, tdh_ok = 0;
-  edr_tdh_win_get_property_stats(&tdh_err, &tdh_ok);
-  int64_t tdh_denom = tdh_err + tdh_ok;
-  int pct = 0;
-  if (tdh_denom > 0 && tdh_err > 0) {
-    pct = (int)((100LL * tdh_err) / tdh_denom);
-    if (pct > 100) {
-      pct = 100;
+  int64_t tdh_err = 0, tdh_ok = 0, tdh_nf = 0;
+  edr_tdh_win_get_property_stats_ext(&tdh_err, &tdh_ok, &tdh_nf);
+  int64_t tdh_denom = tdh_err + tdh_ok + tdh_nf;
+  int pct = 0, nf_pct = 0;
+  if (tdh_denom > 0) {
+    if (tdh_err > 0) {
+      pct = (int)((100LL * (tdh_err + tdh_nf)) / tdh_denom);
+      if (pct > 100) { pct = 100; }
+    }
+    if (tdh_nf > 0) {
+      nf_pct = (int)((100LL * tdh_nf) / tdh_denom);
     }
   }
   uint64_t pushed = edr_event_bus_pushed_total((EdrEventBus *)bus);
@@ -128,10 +131,10 @@ static void edr_etw_observability_fprint(const EdrEventBus *bus, FILE *out) {
           "] pl0=%" PRId64
           " bus{push=%" PRIu64 " drop=%" PRIu64 " use=%" PRIu32 " hw80=%" PRIu64
           "}"
-          " tdh{api_err=%" PRId64 " line_ok=%" PRId64 " err~%d%%"
+          " tdh{api_err=%" PRId64 " nf=%" PRId64 " line_ok=%" PRId64 " total~%d%% nf~%d%%"
           "}",
           s_etw_callback_total, s_by_tag[0], s_by_tag[1], s_by_tag[2], s_by_tag[3], s_by_tag[4], s_by_tag[5],
-          s_by_tag[6], s_by_tag[7], s_by_tag[8], s_by_tag[9], s_by_tag[10], s_by_tag[11], s_slot_payload_empty, pushed, dropped, used, hw, tdh_err, tdh_ok, pct);
+          s_by_tag[6], s_by_tag[7], s_by_tag[8], s_by_tag[9], s_by_tag[10], s_by_tag[11], s_slot_payload_empty, pushed, dropped, used, hw, tdh_err, tdh_nf, tdh_ok, pct, nf_pct);
   if (s_a44_ph_cnt[0] > 0 || s_a44_ph_cnt[1] > 0 || s_a44_ph_cnt[2] > 0) {
     int a0 = 0, a1 = 0, a2 = 0;
     if (s_a44_ph_cnt[0] > 0) {
