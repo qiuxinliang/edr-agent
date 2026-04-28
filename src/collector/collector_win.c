@@ -10,7 +10,7 @@
 #include <windows.h>
 
 #include <evntcons.h>
-#include <evnttrace.h>
+#include "edr/evnttrace_stub.h"
 
 #include "edr/collector.h"
 #include "edr/config.h"
