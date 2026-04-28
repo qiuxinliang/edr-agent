@@ -35,6 +35,20 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
   size_t n = edr_behavior_alert_encode_protobuf(a, ep, te, buf, sizeof(buf));
   if (n > 0) {
     (void)edr_event_batch_push(buf, n);
+    static int s_debug_enabled = -1;
+    if (s_debug_enabled < 0) {
+      s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
+    }
+    if (s_debug_enabled) {
+      fprintf(stderr, "[P0 DEBUG] Alert emitted: endpoint=%s tenant=%s size=%zu\n", 
+              ep, te, n);
+    }
+  } else {
+    static int s_logged_once = 0;
+    if (!s_logged_once) {
+      fprintf(stderr, "[P0 WARN] Alert encode failed: endpoint=%s tenant=%s\n", ep, te);
+      s_logged_once = 1;
+    }
   }
 #else
   (void)a;
