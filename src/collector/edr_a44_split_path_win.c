@@ -202,6 +202,33 @@ static volatile int64_t s_last_scale_time_ns;
 static volatile double s_trend_slope;
 static volatile double s_prediction_accuracy;
 
+static EdrA44DynamicConfig s_dynamic_config = {
+    .enabled = 0,
+    .min_threads = 1,
+    .max_threads = EDR_A44_MAX_THREADS,
+    .high_water_mark = 80,
+    .low_water_mark = 20,
+    .cooldown_ms = 5000
+};
+static volatile LONG64 s_last_adjust_time = 0;
+static CRITICAL_SECTION s_thread_reconfig_lock;
+
+static void edr_a44_init_dynamic_config(void) {
+  if (edr_a44_yes(getenv("EDR_A44_DYNAMIC_THREADS"))) {
+    s_dynamic_config.enabled = 1;
+    s_dynamic_config.min_threads = edr_get_env_int("EDR_A44_DYNAMIC_MIN", 1, 1, EDR_A44_MAX_THREADS);
+    s_dynamic_config.max_threads = edr_get_env_int("EDR_A44_DYNAMIC_MAX", EDR_A44_MAX_THREADS, 1, EDR_A44_MAX_THREADS);
+    s_dynamic_config.high_water_mark = edr_get_env_int("EDR_A44_DYNAMIC_HIGH", 80, 50, 95);
+    s_dynamic_config.low_water_mark = edr_get_env_int("EDR_A44_DYNAMIC_LOW", 20, 5, 50);
+    s_dynamic_config.cooldown_ms = edr_get_env_int("EDR_A44_DYNAMIC_COOLDOWN", 5000, 1000, 30000);
+    InitializeCriticalSection(&s_thread_reconfig_lock);
+    fprintf(stderr, "[collector_win] A4.4 dynamic threads enabled: min=%d max=%d high=%d%% low=%d%% cooldown=%dms\n",
+            s_dynamic_config.min_threads, s_dynamic_config.max_threads,
+            s_dynamic_config.high_water_mark, s_dynamic_config.low_water_mark,
+            s_dynamic_config.cooldown_ms);
+  }
+}
+
 static void edr_a44_decode_one_popped(EdrA44QueueItem *it) {
   edr_collector_decode_from_a44_item(it);
 }
@@ -1121,33 +1148,6 @@ int edr_a44_adaptive_execute_scale(int target_threads) {
     return result;
 }
 
-static EdrA44DynamicConfig s_dynamic_config = {
-    .enabled = 0,
-    .min_threads = 1,
-    .max_threads = EDR_A44_MAX_THREADS,
-    .high_water_mark = 80,
-    .low_water_mark = 20,
-    .cooldown_ms = 5000
-};
-static volatile LONG64 s_last_adjust_time = 0;
-static CRITICAL_SECTION s_thread_reconfig_lock;
-
-static void edr_a44_init_dynamic_config(void) {
-    if (edr_a44_yes(getenv("EDR_A44_DYNAMIC_THREADS"))) {
-        s_dynamic_config.enabled = 1;
-        s_dynamic_config.min_threads = edr_get_env_int("EDR_A44_DYNAMIC_MIN", 1, 1, EDR_A44_MAX_THREADS);
-        s_dynamic_config.max_threads = edr_get_env_int("EDR_A44_DYNAMIC_MAX", EDR_A44_MAX_THREADS, 1, EDR_A44_MAX_THREADS);
-        s_dynamic_config.high_water_mark = edr_get_env_int("EDR_A44_DYNAMIC_HIGH", 80, 50, 95);
-        s_dynamic_config.low_water_mark = edr_get_env_int("EDR_A44_DYNAMIC_LOW", 20, 5, 50);
-        s_dynamic_config.cooldown_ms = edr_get_env_int("EDR_A44_DYNAMIC_COOLDOWN", 5000, 1000, 30000);
-        InitializeCriticalSection(&s_thread_reconfig_lock);
-        fprintf(stderr, "[collector_win] A4.4 dynamic threads enabled: min=%d max=%d high=%d%% low=%d%% cooldown=%dms\n",
-                s_dynamic_config.min_threads, s_dynamic_config.max_threads,
-                s_dynamic_config.high_water_mark, s_dynamic_config.low_water_mark,
-                s_dynamic_config.cooldown_ms);
-    }
-}
-
 int edr_a44_set_thread_count(int target_count) {
     if (!s_a44_threads || !s_dynamic_config.enabled) {
         return -1;
@@ -1282,24 +1282,24 @@ int edr_a44_get_health_report(EdrA44HealthReport *out_report) {
     return 0;
 }
 
-static volatile int s_e2e_tracking_enabled;
-static volatile uint64_t s_e2e_total_events;
-static volatile uint64_t s_e2e_dropped_events;
-static volatile uint64_t s_e2e_latency_min_ns;
-static volatile uint64_t s_e2e_latency_max_ns;
-static volatile uint64_t s_e2e_latency_sum_ns;
-static volatile uint64_t s_e2e_latency_count;
+/* LONG/LONG64 for Win32 Interlocked* (MSVC C4057); pipeline flags below same. */
+static volatile LONG s_e2e_tracking_enabled;
+static volatile LONG64 s_e2e_total_events;
+static volatile LONG64 s_e2e_dropped_events;
+static volatile LONG64 s_e2e_latency_min_ns;
+static volatile LONG64 s_e2e_latency_max_ns;
+static volatile LONG64 s_e2e_latency_sum_ns;
+static volatile LONG64 s_e2e_latency_count;
 static volatile uint64_t s_e2e_latency_samples[1000];
-static volatile uint32_t s_e2e_latency_sample_head;
-static volatile uint32_t s_e2e_latency_sample_count;
-/* LONG for InterlockedExchange (volatile LONG *); int * triggers MSVC C4057. */
+static volatile LONG s_e2e_latency_sample_head;
+static volatile LONG s_e2e_latency_sample_count;
 static volatile LONG s_pipeline_prefetch_enabled;
 static volatile LONG s_pipeline_parallel_enabled;
 static volatile LONG s_pipeline_batch_timeout_ms;
 static volatile LONG s_pipeline_max_batch_size;
 
 int edr_a44_e2e_enable_tracking(int enable) {
-    (void)InterlockedExchange(&s_e2e_tracking_enabled, enable);
+    (void)InterlockedExchange(&s_e2e_tracking_enabled, (LONG)enable);
     return 0;
 }
 
@@ -1318,19 +1318,19 @@ int edr_a44_e2e_record_event(uint64_t timestamp_ns) {
         uint64_t latency = now_ns - timestamp_ns;
         uint64_t old_min = (uint64_t)s_e2e_latency_min_ns;
         while (latency < old_min && old_min != 0) {
-            (void)InterlockedCompareExchange64((volatile LONG64 *)&s_e2e_latency_min_ns, latency, old_min);
+            (void)InterlockedCompareExchange64(&s_e2e_latency_min_ns, (LONG64)latency, (LONG64)old_min);
             old_min = (uint64_t)s_e2e_latency_min_ns;
         }
         uint64_t old_max = (uint64_t)s_e2e_latency_max_ns;
         while (latency > old_max) {
-            (void)InterlockedCompareExchange64((volatile LONG64 *)&s_e2e_latency_max_ns, latency, old_max);
+            (void)InterlockedCompareExchange64(&s_e2e_latency_max_ns, (LONG64)latency, (LONG64)old_max);
             old_max = (uint64_t)s_e2e_latency_max_ns;
         }
-        (void)InterlockedAdd64(&s_e2e_latency_sum_ns, latency);
+        (void)InterlockedAdd64(&s_e2e_latency_sum_ns, (LONG64)latency);
         (void)InterlockedIncrement64(&s_e2e_latency_count);
-        uint32_t idx = (uint32_t)InterlockedIncrement((volatile LONG *)&s_e2e_latency_sample_head) % 1000;
+        uint32_t idx = (uint32_t)InterlockedIncrement(&s_e2e_latency_sample_head) % 1000;
         s_e2e_latency_samples[idx] = latency;
-        (void)InterlockedIncrement((volatile LONG *)&s_e2e_latency_sample_count);
+        (void)InterlockedIncrement(&s_e2e_latency_sample_count);
     }
     return 0;
 }
@@ -1380,14 +1380,14 @@ int edr_a44_e2e_get_stats(EdrA44EndToEndStats *out_stats) {
 }
 
 int edr_a44_e2e_reset_stats(void) {
-    (void)InterlockedExchange64((volatile LONG64 *)&s_e2e_total_events, 0);
-    (void)InterlockedExchange64((volatile LONG64 *)&s_e2e_dropped_events, 0);
-    (void)InterlockedExchange64((volatile LONG64 *)&s_e2e_latency_min_ns, 0);
-    (void)InterlockedExchange64((volatile LONG64 *)&s_e2e_latency_max_ns, 0);
-    (void)InterlockedExchange64((volatile LONG64 *)&s_e2e_latency_sum_ns, 0);
-    (void)InterlockedExchange64((volatile LONG64 *)&s_e2e_latency_count, 0);
-    (void)InterlockedExchange((volatile LONG *)&s_e2e_latency_sample_head, 0);
-    (void)InterlockedExchange((volatile LONG *)&s_e2e_latency_sample_count, 0);
+    (void)InterlockedExchange64(&s_e2e_total_events, 0);
+    (void)InterlockedExchange64(&s_e2e_dropped_events, 0);
+    (void)InterlockedExchange64(&s_e2e_latency_min_ns, 0);
+    (void)InterlockedExchange64(&s_e2e_latency_max_ns, 0);
+    (void)InterlockedExchange64(&s_e2e_latency_sum_ns, 0);
+    (void)InterlockedExchange64(&s_e2e_latency_count, 0);
+    (void)InterlockedExchange(&s_e2e_latency_sample_head, 0);
+    (void)InterlockedExchange(&s_e2e_latency_sample_count, 0);
     return 0;
 }
 

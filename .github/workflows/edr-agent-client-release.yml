@@ -1,12 +1,7 @@
-# 本文件面向「独立 edr-agent 仓库」：GHA 工作目录 = 本仓库根（vcpkg.json 在根目录）。
-# `win_*` tag 发 **两枚** zip（② 文件名仍带 grpc；CMake **EDR_GRPC_BUILD_SUSPENDED=1** 时 **不链接 gRPC 客户端**，ingest 与 ① 同为 stub）；**不含** models、Inno、Linux。
-# 若你在 **monorepo** 中发版，应使用**仓库根**的 `.github/workflows/edr-agent-client-release.yml`（`edr-agent/…` 路径）。
-# 发版前请与 monorepo 版逻辑对齐。排障：vcpkg 编 grpc 时 “The operation is canceled” → 常为 cancel-in-progress 或 timeout。
+# 独立 edr-agent 仓库：工作目录 = 本仓库根。**仅一条**发版编线：`win_*` tag → **no-gRPC + vcpkg(curl) + ONNX** → `edr-agent-<tag>-windows-amd64-exe.zip`。
+# **-*-grpc-exe.zip** 第二枚已暂停；monorepo 请用仓库根同名 workflow。
 #
-# 触发展平：仅
-#  (1) `git push origin <tag>`，且 tag 名匹配 `win_M.m.p`；或
-#  (2) Actions 中 Run workflow；普通分支 **push 不会**触发。已移除 `linux_*`。
-# 首步 `./scripts/verify_ave_behavior_chain_invariants.sh`（**无** vcpkg，与 monorepo 发版 workflow 一致）。
+# 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
 
 name: edr-agent client release
 
@@ -172,146 +167,16 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  windows-build-grpc:
-    name: Build Windows (ONNX, vcpkg grpc-client feature; ingest stub)
-    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
-    runs-on: windows-latest
-    timeout-minutes: 360
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-    steps:
-      - uses: actions/checkout@v6
-      - name: AVE / behavior chain invariants (no vcpkg, bash)
-        shell: bash
-        run: |
-          chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
-          ./scripts/verify_ave_behavior_chain_invariants.sh
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
-      - name: Install Ninja
-        shell: pwsh
-        run: choco install ninja -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Prepare vcpkg cache directories
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
-      - name: Cache vcpkg (gRPC+installed, separate key)
-        uses: actions/cache@v5
-        with:
-          path: |
-            .cache/vcpkg-downloads
-            .cache/vcpkg-bincache
-            vcpkg_installed
-          key: vcpkg-x64-win-grpc-release-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
-          restore-keys: |
-            vcpkg-x64-win-grpc-release-${{ hashFiles('vcpkg.json') }}-
-      - name: Clone and bootstrap vcpkg
-        working-directory: ${{ github.workspace }}
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          }
-          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
-      - name: vcpkg install (manifest, grpc feature)
-        working-directory: ${{ github.workspace }}
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
-          $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
-          $env:VCPKG_ROOT = $vroot
-          $env:Path = $vroot + ";" + $env:Path
-          $tc = Join-Path $vroot "vcpkg.exe"
-          if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          Push-Location $env:GITHUB_WORKSPACE
-          & $tc install --x-feature=grpc-client
-          if (-not (Test-Path "vcpkg_installed\x64-windows\tools\protobuf\protoc.exe")) { throw "vcpkg install: protoc not found" }
-          Pop-Location
-          "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
-        shell: pwsh
-        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
-      - name: ONNX Runtime (CPU, Windows x64)
-        working-directory: ${{ github.workspace }}
-        shell: pwsh
-        run: |
-          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win-grpc"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $zip = Join-Path $dest "ort.zip"
-          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip" -OutFile $zip
-          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
-          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
-          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
-          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Configure (Ninja, Release, ONNX; stub ingest — CMake may force EDR_GRPC off)
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-        shell: pwsh
-        run: |
-          $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
-          if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$tcf" `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DEDR_WITH_GRPC=ON `
-            -DEDR_WITH_ONNXRUNTIME=ON `
-            "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-            -DEDR_BUILD_TESTS=OFF
-          if (-not $?) { throw "cmake configure failed" }
-      - name: Build
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
-      - name: Stage ORT + vcpkg runtime DLLs
-        shell: pwsh
-        run: |
-          $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
-          ./scripts/stage_ort_dlls_build_release.ps1
-          ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
-      - name: Test
-        shell: bash
-        run: ctest --test-dir build --output-on-failure
-      - name: Package (exe + DLLs; legacy *-grpc-exe.zip name)
-        shell: pwsh
-        run: |
-          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-grpc-exe.zip"
-          if (-not (Test-Path "build\Release\edr_agent.exe")) { throw "missing build\Release\edr_agent.exe" }
-          $items = New-Object System.Collections.Generic.List[string]
-          $null = $items.Add("build\Release\edr_agent.exe")
-          if (Test-Path "build\Release\edr_monitor.exe") { $null = $items.Add("build\Release\edr_monitor.exe") }
-          Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
-          Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
-      - name: Move grpc-deps zip artifact to workspace
-        shell: pwsh
-        run: |
-          $src = "edr-agent-${{ github.ref_name }}-windows-amd64-grpc-exe.zip"
-          if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
-          Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-grpc-exe.zip") -Force
-      - uses: actions/upload-artifact@v4
-        with:
-          name: edr-agent-windows-grpc-${{ github.ref_name }}
-          path: edr-agent-win-grpc-exe.zip
-          retention-days: 14
-          if-no-files-found: error
-
   windows-release:
     name: Publish Windows Release
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
-    needs: [windows-build, windows-build-grpc]
+    needs: [windows-build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           name: edr-agent-windows-${{ github.ref_name }}
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: edr-agent-windows-grpc-${{ github.ref_name }}
           path: dist
       - name: Verify artifacts
         run: ls -la dist/
@@ -320,15 +185,13 @@ jobs:
           set -euo pipefail
           ref="${{ github.ref_name }}"
           test -f "dist/edr-agent-win-exe.zip"
-          test -f "dist/edr-agent-win-grpc-exe.zip"
           mv "dist/edr-agent-win-exe.zip" "dist/edr-agent-${ref}-windows-amd64-exe.zip"
-          mv "dist/edr-agent-win-grpc-exe.zip" "dist/edr-agent-${ref}-windows-amd64-grpc-exe.zip"
       - uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64 ONNX — curl-only zip + grpc-client vcpkg zip; stub ingest if CMake suspended)
+          name: edr-agent ${{ github.ref_name }} (Windows amd64, no-gRPC+vcpkg+ONNX)
           generate_release_notes: true
           files: dist/*.zip
           fail_on_unmatched_files: true
