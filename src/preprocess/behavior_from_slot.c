@@ -299,6 +299,9 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
       }
     }
+    if (!r->process_name[0] && ef.has_cmd && ef.cmd[0]) {
+      snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.cmd));
+    }
     if (ef.has_pimg) {
       snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.pimg);
       snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.pimg));
