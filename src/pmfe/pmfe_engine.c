@@ -1864,9 +1864,17 @@ void edr_pmfe_on_process_lifecycle_hint(void) {}
 #endif
 
 EdrError edr_pmfe_init(void) {
-  const char *dis = getenv("EDR_PMFE_DISABLED");
-  if (dis && dis[0] == '1') {
-    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_DISABLED=1)\n");
+  const char *en = getenv("EDR_PMFE_ENABLED");
+  if (en && en[0] == '0') {
+    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_ENABLED=0)\n");
+    return EDR_OK;
+  }
+  if (en && en[0] != '1') {
+    EDR_LOGV("%s", "[pmfe] disabled by default, set EDR_PMFE_ENABLED=1 to enable\n");
+    return EDR_OK;
+  }
+  if (!en) {
+    EDR_LOGV("%s", "[pmfe] disabled by default, set EDR_PMFE_ENABLED=1 to enable\n");
     return EDR_OK;
   }
 #ifdef _WIN32

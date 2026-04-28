@@ -73,6 +73,49 @@ static int s_n;
 static int s_inited; /* 1 tried */
 static int s_ready;
 
+/* P0规则命中率统计 - 性能优化辅助数据 */
+static uint64_t s_rule_evaluate_count[P0_IR_RULES_MAX];
+static uint64_t s_rule_hit_count[P0_IR_RULES_MAX];
+static int s_stats_enabled;
+
+static void p0_ir_stats_init(void) {
+  s_stats_enabled = getenv_int_default("EDR_P0_STATS", 0);
+  if (s_stats_enabled) {
+    memset(s_rule_evaluate_count, 0, sizeof(s_rule_evaluate_count));
+    memset(s_rule_hit_count, 0, sizeof(s_rule_hit_count));
+    fprintf(stderr, "[p0_rule_ir] stats enabled (EDR_P0_STATS=1)\n");
+  }
+}
+
+static void p0_ir_stats_record(int rule_idx, int hit) {
+  if (!s_stats_enabled || rule_idx < 0 || rule_idx >= s_n) {
+    return;
+  }
+  s_rule_evaluate_count[rule_idx]++;
+  if (hit) {
+    s_rule_hit_count[rule_idx]++;
+  }
+}
+
+static void p0_ir_stats_dump(void) {
+  if (!s_stats_enabled) {
+    return;
+  }
+  fprintf(stderr, "\n=== P0 Rule Statistics ===\n");
+  fprintf(stderr, "%-12s %-10s %-10s %-8s %s\n", "Rule ID", "Evaluated", "Hits", "Hit Rate", "Event Type");
+  fprintf(stderr, "----------------------------------------------------------------\n");
+  for (int i = 0; i < s_n; i++) {
+    if (!s_rule[i].in_use) continue;
+    double hit_rate = s_rule_evaluate_count[i] > 0
+                         ? (double)s_rule_hit_count[i] / (double)s_rule_evaluate_count[i] * 100.0
+                         : 0.0;
+    fprintf(stderr, "%-12s %-10llu %-10llu %-7.1f%% %s\n", s_rule[i].id,
+            (unsigned long long)s_rule_evaluate_count[i],
+            (unsigned long long)s_rule_hit_count[i], hit_rate, s_rule[i].event_type);
+  }
+  fprintf(stderr, "======================\n\n");
+}
+
 static void ascii_lower_truncate(char *dst, size_t cap, const char *src) {
   size_t i = 0;
   if (!dst || cap == 0) {
@@ -805,6 +848,7 @@ void edr_p0_rule_ir_lazy_init(void) {
     return;
   }
   s_inited = 1;
+  p0_ir_stats_init();
   int loaded = 0;
   char path[2048];
   char *buf = NULL;
@@ -941,4 +985,12 @@ int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) {
     return 0;
   }
   return p0_ir_match_rule_to_br(&s_rule[index], br) ? 1 : 0;
+}
+
+void edr_p0_rule_ir_stats_record(int rule_idx, int hit) {
+  p0_ir_stats_record(rule_idx, hit);
+}
+
+void edr_p0_rule_ir_stats_dump(void) {
+  p0_ir_stats_dump();
 }

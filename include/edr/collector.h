@@ -5,9 +5,54 @@
 #define EDR_COLLECTOR_H
 
 #include "edr/error.h"
+#include <stdint.h>
 
 struct EdrEventBus;
 struct EdrConfig;
+
+#define EDR_COLLECTOR_MAX_EVENTID_FILTER 64
+#define EDR_COLLECTOR_MAX_EVENTID_RANGES 16
+
+typedef enum {
+    EDR_EVENT_FILTER_MODE_NONE = 0,
+    EDR_EVENT_FILTER_MODE_WHITELIST = 1,
+    EDR_EVENT_FILTER_MODE_BLACKLIST = 2,
+} EdrEventFilterMode;
+
+typedef struct {
+    uint16_t start;
+    uint16_t end;
+} EdrEventIdRange;
+
+typedef struct {
+    EdrEventFilterMode mode;
+    uint16_t event_ids[EDR_COLLECTOR_MAX_EVENTID_FILTER];
+    uint32_t event_id_count;
+    EdrEventIdRange ranges[EDR_COLLECTOR_MAX_EVENTID_RANGES];
+    uint32_t range_count;
+} EdrEventIdFilter;
+
+typedef struct {
+    EdrEventIdFilter dns_client;
+    EdrEventIdFilter powershell;
+    EdrEventIdFilter tcpip;
+    EdrEventIdFilter wmi_activity;
+    int filtering_enabled;
+} EdrCollectorEventFilterConfig;
+
+typedef struct {
+    uint64_t dns_client_filtered;
+    uint64_t powershell_filtered;
+    uint64_t tcpip_filtered;
+    uint64_t wmi_activity_filtered;
+    uint64_t total_filtered;
+} EdrCollectorFilterStats;
+
+int edr_collector_get_event_filter_config(EdrCollectorEventFilterConfig *out_config);
+
+int edr_collector_should_filter_event(const char *provider_name, uint16_t event_id);
+
+int edr_collector_get_filter_stats(EdrCollectorFilterStats *out_stats);
 
 /**
  * 启动采集：Windows 为 ETW 会话（Kernel-Process / File / Network 等）；Linux（M1）为 inotify 目录监视；其它 POSIX 为 stub。

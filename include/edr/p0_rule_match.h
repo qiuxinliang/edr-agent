@@ -6,6 +6,8 @@
 #ifndef EDR_P0_RULE_MATCH_H
 #define EDR_P0_RULE_MATCH_H
 
+#include <stdint.h>
+
 /**
  * 若 (process_name, cmdline) 对给定 rule_id 应命中则返回 1，否则 0。未知 rule_id 恒为 0。
  * rule_id 形如 "R-EXEC-001"。`process_chain_depth` 为 0 表示未知/无链深（与金线用例一致）。
@@ -21,5 +23,23 @@ int edr_p0_rule_matches2(
 
 /* 与金线/旧调用兼容：无父名、链深 0。 */
 #define edr_p0_rule_matches(rid, pn, cmd) edr_p0_rule_matches3((rid), (pn), (cmd), NULL, 0)
+
+typedef struct {
+    uint64_t total_calls;
+    uint64_t env_not_set_skip;
+    uint64_t ir_mode_matches;
+    uint64_t fallback_mode_matches;
+    uint64_t rule_r_exec_001_hits;
+    uint64_t rule_r_cred_001_hits;
+    uint64_t rule_r_fileless_001_hits;
+    uint64_t rule_other_hits;
+    uint64_t powershell_detected;
+    uint64_t encoded_cmd_detected;
+    uint64_t base64_string_detected;
+    uint64_t remote_download_detected;
+} EdrP0RuleStats;
+
+int edr_p0_rule_get_stats(EdrP0RuleStats *out_stats);
+void edr_p0_rule_reset_stats(void);
 
 #endif

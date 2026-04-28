@@ -26,6 +26,10 @@ static int persist_strategy_on_fail_only(void) {
 #define EDR_LZ4_MIN_IN 1024u
 #endif
 
+#ifndef EDR_LZ4_COMPRESSION_LEVEL
+#define EDR_LZ4_COMPRESSION_LEVEL 6
+#endif
+
 static uint8_t *s_buf;
 static size_t s_cap;
 static uint32_t s_max_frames;
@@ -35,6 +39,7 @@ static uint64_t s_batch_seq;
 static int s_flush_timeout_s;
 static uint64_t s_deadline_ns;
 static uint64_t s_timeout_flush_count;
+static int s_lz4_compression_level;
 
 static void batch_note_write(void) {
   if (s_flush_timeout_s <= 0) {
@@ -280,6 +285,7 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
   s_flush_timeout_s = flush_timeout_s;
   s_deadline_ns = 0;
   s_timeout_flush_count = 0;
+  s_lz4_compression_level = EDR_LZ4_COMPRESSION_LEVEL;
   if (max_bytes < 4096u) {
     max_bytes = 4096u;
   }

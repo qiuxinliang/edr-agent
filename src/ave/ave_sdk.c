@@ -596,6 +596,56 @@ static void ave_bp_merge_static_if_subject(uint32_t subject_pid, const AVEScanRe
   edr_ave_bp_merge_static_scan(subject_pid, r->final_confidence, (int)r->final_verdict);
 }
 
+static int env_skip_ext_enabled(void) {
+  const char *e = getenv("EDR_AVE_SKIP_BY_EXT");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;  // 默认启用
+}
+
+static const char *safe_file_ext(const char *path) {
+  if (!path) return NULL;
+  const char *base = strrchr(path, '/');
+  if (!base) base = strrchr(path, '\\');
+  if (!base) base = path;
+  else base++;
+  const char *dot = strrchr(base, '.');
+  if (!dot || dot == base) return NULL;
+  return dot + 1;
+}
+
+static int is_known_safe_ext(const char *ext) {
+  static const char *safe_exts[] = {
+    "jpg", "jpeg", "png", "gif", "bmp", "ico", "webp", "svg",  // 图片
+    "mp3", "wav", "ogg", "flac", "aac", "m4a",               // 音频
+    "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm",         // 视频
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz",             // 压缩包
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",        // 文档
+    "txt", "rtf", "csv", "json", "xml", "html", "htm",        // 文本
+    "css", "js", "ts", "jsx", "tsx",                           // Web
+    "ttf", "otf", "woff", "woff2",                            // 字体
+  };
+  if (!ext) return 0;
+  for (size_t i = 0; i < sizeof(safe_exts) / sizeof(safe_exts[0]); i++) {
+#ifdef _WIN32
+    if (_stricmp(ext, safe_exts[i]) == 0) return 1;
+#else
+    if (strcasecmp(ext, safe_exts[i]) == 0) return 1;
+#endif
+  }
+  return 0;
+}
+
+static int64_t get_file_size_fast(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  fseek(f, 0, SEEK_END);
+  int64_t sz = (int64_t)ftell(f);
+  fclose(f);
+  return sz;
+}
+
 static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVEScanResult *result_out) {
   if (!g_initialized) {
     return AVE_ERR_NOT_INITIALIZED;
@@ -606,6 +656,29 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
 
   memset(result_out, 0, sizeof(*result_out));
   snprintf(result_out->scanned_path, sizeof(result_out->scanned_path), "%s", file_path);
+
+  if (env_skip_ext_enabled()) {
+    const char *ext = safe_file_ext(file_path);
+    if (ext && is_known_safe_ext(ext)) {
+      result_out->final_verdict = VERDICT_WHITELISTED;
+      result_out->final_confidence = 0.01f;
+      result_out->scan_duration_ms = 0;
+      snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "ext_filter");
+      return AVE_OK;
+    }
+  }
+
+  int64_t fsize = get_file_size_fast(file_path);
+  if (fsize < 0) {
+    return AVE_ERR_INTERNAL;
+  }
+  if (fsize == 0) {
+    result_out->final_verdict = VERDICT_WHITELISTED;
+    result_out->final_confidence = 0.0f;
+    result_out->scan_duration_ms = 0;
+    snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "empty_file");
+    return AVE_OK;
+  }
 
   FILE *probe = fopen(file_path, "rb");
   if (!probe) {

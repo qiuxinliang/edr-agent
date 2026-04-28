@@ -133,21 +133,89 @@ static int str_ieq_ascii(const char *a, const char *b) {
 }
 
 static int process_name_in_gate_allowlist(const char *name) {
-  static const char *const kHotProcNames[] = {
-      "powershell.exe", "pwsh.exe",       "cmd.exe",       "wscript.exe",
-      "cscript.exe",    "mshta.exe",      "rundll32.exe",  "regsvr32.exe",
-      "wmic.exe",       "certutil.exe",   "bitsadmin.exe", "msiexec.exe",
-      "schtasks.exe",   "sc.exe",         "cmdkey.exe",    "bcdedit.exe",
-      "vssadmin.exe",   "wbadmin.exe",    "forfiles.exe",  "installutil.exe",
-      "msxsl.exe",      "cmstp.exe",      "psexec.exe",    "procdump.exe",
-      "net.exe",        "net1.exe",       "curl.exe",      "wget.exe",
-      "rclone.exe",     "7z.exe",         "winrar.exe",    "rar.exe",
-      "wevtutil.exe",   "reg.exe",        "mimikatz.exe"};
+  /* procname_gate 白名单：只采集高风险进程的完整行为
+   * 可通过环境变量 EDR_PROCNAME_GATE_WHITELIST 覆盖
+   * 默认配置包含常见攻击工具和脚本解释器
+   */
+  static const char *const kDefaultHotProcNames[] = {
+      // 脚本引擎 (最高风险)
+      "powershell.exe",
+      "pwsh.exe",
+      "cmd.exe",
+      "wscript.exe",
+      "cscript.exe",
+      // 可执行文件生成/下载 (高风险)
+      "mshta.exe",
+      "rundll32.exe",
+      "regsvr32.exe",
+      "msiexec.exe",
+      "cmstp.exe",
+      "msbuild.exe",
+      "certutil.exe",
+      "bitsadmin.exe",
+      // 下载/网络工具
+      "curl.exe",
+      "wget.exe",
+      "ftp.exe",
+      "nc.exe",
+      "netcat.exe",
+      // 渗透/远程工具
+      "psexec.exe",
+      "PsExec64.exe",
+      "wmic.exe",
+      "atbroker.exe",
+      "cmdex.exe",
+      // 脚本语言
+      "python.exe",
+      "python3.exe",
+      "perl.exe",
+      "ruby.exe",
+      "java.exe",
+      "javaw.exe",
+      "node.exe",
+  };
+  static const char *s_custom_whitelist = NULL;
+  static char *s_whitelist_copy = NULL;
+  static int s_whitelist_initialized = 0;
+
   if (!name || !name[0]) {
     return 0;
   }
-  for (size_t i = 0; i < sizeof(kHotProcNames) / sizeof(kHotProcNames[0]); i++) {
-    if (str_ieq_ascii(name, kHotProcNames[i])) {
+
+  if (!s_whitelist_initialized) {
+    s_whitelist_initialized = 1;
+    s_custom_whitelist = getenv("EDR_PROCNAME_GATE_WHITELIST");
+    if (s_custom_whitelist && s_custom_whitelist[0]) {
+      size_t len = strlen(s_custom_whitelist) + 1;
+      s_whitelist_copy = (char *)malloc(len);
+      if (s_whitelist_copy) {
+        memcpy(s_whitelist_copy, s_custom_whitelist, len);
+      }
+    }
+  }
+
+  if (s_whitelist_copy && s_whitelist_copy[0]) {
+    const char *p = s_whitelist_copy;
+    while (*p) {
+      const char *end = strchr(p, ',');
+      size_t len = end ? (size_t)(end - p) : strlen(p);
+      if (len > 0) {
+        char proc_name[64] = {0};
+        if (len >= sizeof(proc_name)) {
+          len = sizeof(proc_name) - 1;
+        }
+        memcpy(proc_name, p, len);
+        if (str_ieq_ascii(name, proc_name)) {
+          return 1;
+        }
+      }
+      p = end ? end + 1 : p + strlen(p);
+    }
+    return 0;
+  }
+
+  for (size_t i = 0; i < sizeof(kDefaultHotProcNames) / sizeof(kDefaultHotProcNames[0]); i++) {
+    if (str_ieq_ascii(name, kDefaultHotProcNames[i])) {
       return 1;
     }
   }
@@ -196,6 +264,24 @@ static double getenv_double_default(const char *key, double defv) {
 }
 
 static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
+  /* 默认去重窗口5秒（严格模式），可通过环境变量 EDR_DEDUP_WINDOW_SECONDS 覆盖 */
+  uint32_t dedup_window_s = (uint32_t)getenv_int_default("EDR_DEDUP_WINDOW_SECONDS", cfg ? cfg->preprocessing.dedup_window_s : 5);
+  /* 默认速率限制20/秒/PID（严格模式），可通过环境变量 EDR_RATE_LIMIT_PER_SEC 覆盖 */
+  uint32_t rate_limit_per_sec = (uint32_t)getenv_int_default("EDR_RATE_LIMIT_PER_SEC", cfg ? cfg->preprocessing.high_freq_threshold : 20);
+  if (dedup_window_s == 0) {
+    dedup_window_s = 5;
+  }
+  if (rate_limit_per_sec == 0) {
+    rate_limit_per_sec = 50;
+  }
+  if (dedup_window_s > 3600) {
+    dedup_window_s = 3600;
+  }
+  if (rate_limit_per_sec > 1000) {
+    rate_limit_per_sec = 1000;
+  }
+  edr_dedup_configure(dedup_window_s, rate_limit_per_sec);
+
   s_l2_split_enabled = getenv_int_default("EDR_PREPROCESS_L2_SPLIT", 0) == 1 ? 1 : 0;
   s_l2_unmatched_keep_ratio = cfg ? cfg->preprocessing.sampling_rate_whitelist : 0.1;
   s_l2_unmatched_keep_ratio =
@@ -244,6 +330,14 @@ static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
       slot->attack_surface_hint == 0u) {
+    /* 即使在资源压力下被丢弃，仍然尝试P0检测（关键告警不应被压制） */
+    if (slot && slot->type == EDR_EVENT_PROCESS_CREATE) {
+      EdrBehaviorRecord br;
+      edr_behavior_from_slot(slot, &br);
+      edr_behavior_record_fill_process_chain_depth(&br);
+      apply_agent_ids_to_record(&br);
+      edr_p0_rule_try_emit(&br);
+    }
     return;
   }
   if (slot && slot->attack_surface_hint) {
@@ -260,6 +354,12 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_behavior_from_slot(slot, &br);
   edr_behavior_record_fill_process_chain_depth(&br);
   apply_agent_ids_to_record(&br);
+
+  /* P0检测：尽早执行，确保关键告警不被后续丢弃逻辑遗漏 */
+  if (slot && slot->type == EDR_EVENT_PROCESS_CREATE) {
+    edr_p0_rule_try_emit(&br);
+  }
+
   if (s_procname_gate_enabled && br.priority != 0u &&
       slot && slot->type == EDR_EVENT_PROCESS_CREATE &&
       !process_name_in_gate_allowlist(br.process_name)) {
@@ -285,6 +385,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_ave_cross_engine_feed_from_record(&br);
   if (!edr_preprocess_should_emit(&br)) {
     /* P0 直出与主行为上送（dedup/限流/动态规则门控）解耦；否则应上送主路径为 0 时 P0 永不执行 */
+    /* 注意：上面已执行过P0检测，但edr_p0_rule_try_emit内部有幂等保护 */
     edr_p0_rule_try_emit(&br);
     return;
   }
@@ -308,7 +409,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (n > 0) {
     (void)edr_event_batch_push(buf, n);
   }
-  edr_p0_rule_try_emit(&br);
+  /* P0检测已在早期执行，避免重复调用 */
 }
 
 #ifdef _WIN32

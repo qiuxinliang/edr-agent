@@ -14,6 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(EDR_ENABLE_COMPILER_CACHE "Use ccache/sccache as compiler launcher when available" ON)
 option(EDR_ENABLE_UNITY_BUILD "Enable CMake UNITY_BUILD for faster local builds" OFF)
 option(EDR_ENABLE_IPO "Enable interprocedural optimization (IPO/LTO) when supported" OFF)
+option(EDR_ENABLE_OPTIMIZATION "Enable aggressive compiler optimizations" ON)
+option(EDR_ENABLE_ARCH_OPTIMIZATION "Enable architecture-specific optimizations" ON)
 
 if(EDR_ENABLE_COMPILER_CACHE)
   if(NOT CMAKE_C_COMPILER_LAUNCHER OR NOT CMAKE_CXX_COMPILER_LAUNCHER)
@@ -52,7 +54,45 @@ if(MSVC)
   )
 endif()
 
-option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" ON)
+if(EDR_ENABLE_OPTIMIZATION)
+  if(MSVC)
+    add_compile_options(
+      $<$<CONFIG:Release>:/O2>
+      $<$<CONFIG:Release>:/Oi>
+      $<$<CONFIG:Release>:/Ot>
+      $<$<CONFIG:Release>:/GL>
+      $<$<CONFIG:Release>:/Gy>
+      $<$<CONFIG:Release>:/fp:fast>
+    )
+    add_link_options(
+      $<$<CONFIG:Release>:/LTCG>
+      $<$<CONFIG:Release>:/OPT:REF>
+      $<$<CONFIG:Release>:/OPT:ICF>
+    )
+  else()
+    add_compile_options(
+      $<$<CONFIG:Release>:-O3>
+      $<$<CONFIG:Release>:-ffast-math>
+      $<$<CONFIG:Release>:-funroll-loops>
+      $<$<CONFIG:Release>:-fomit-frame-pointer>
+      $<$<CONFIG:Release>:-fstrict-aliasing>
+      $<$<CONFIG:Release>:-flto>
+    )
+    add_link_options(
+      $<$<CONFIG:Release>:-flto>
+    )
+  endif()
+endif()
+
+if(EDR_ENABLE_ARCH_OPTIMIZATION)
+  if(MSVC)
+    add_compile_options(/arch:AVX2)
+  else()
+    add_compile_options(-march=native -mtune=native)
+  endif()
+endif()
+
+option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 list(APPEND CMAKE_PREFIX_PATH
   /usr/local/opt/grpc
@@ -190,6 +230,7 @@ set(EDR_AGENT_SOURCES
   src/preprocess/behavior_from_slot.c
   src/preprocess/dedup.c
   src/preprocess/emit_rules.c
+  src/preprocess/enrich_parent_info.c
   src/preprocess/p0_rule_match.c
   src/preprocess/p0_rule_direct_emit.c
   src/preprocess/preprocess_pipeline.c

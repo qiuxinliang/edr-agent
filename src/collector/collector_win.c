@@ -32,6 +32,221 @@
 #include <stdio.h>
 #include <wchar.h>
 
+static volatile LONG s_filter_initialized;
+static EdrCollectorEventFilterConfig s_filter_config;
+static volatile LONG64 s_filter_stats_dns_client;
+static volatile LONG64 s_filter_stats_powershell;
+static volatile LONG64 s_filter_stats_tcpip;
+static volatile LONG64 s_filter_stats_wmi_activity;
+
+static int edr_parse_uint16_list_with_ranges(const char *str, uint16_t *out_ids, uint32_t max_ids, uint32_t *out_id_count,
+                                              EdrEventIdRange *out_ranges, uint32_t max_ranges, uint32_t *out_range_count) {
+  if (!str || !str[0]) {
+    *out_id_count = 0;
+    *out_range_count = 0;
+    return 0;
+  }
+  uint32_t id_count = 0;
+  uint32_t range_count = 0;
+  const char *p = str;
+  while (*p) {
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (*p == '\0') {
+      break;
+    }
+    char *end = NULL;
+    unsigned long start_val = strtoul(p, &end, 10);
+    if (end == p || start_val > 65535) {
+      break;
+    }
+    if (*end == '-') {
+      p = end + 1;
+      unsigned long end_val = strtoul(p, &end, 10);
+      if (end == p || end_val > 65535) {
+        break;
+      }
+      if (range_count < max_ranges) {
+        out_ranges[range_count].start = (uint16_t)start_val;
+        out_ranges[range_count].end = (uint16_t)end_val;
+        range_count++;
+      }
+    } else {
+      if (id_count < max_ids) {
+        out_ids[id_count++] = (uint16_t)start_val;
+      }
+    }
+    p = end;
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (*p == ',') {
+      p++;
+    }
+  }
+  *out_id_count = id_count;
+  *out_range_count = range_count;
+  return 0;
+}
+
+static void edr_init_filter_config(void) {
+  if (InterlockedCompareExchange(&s_filter_initialized, 1, 0) != 0) {
+    return;
+  }
+  memset(&s_filter_config, 0, sizeof(s_filter_config));
+  const char *mode_str = getenv("EDR_COLLECTOR_EVENTID_FILTER_MODE");
+  if (!mode_str || !mode_str[0]) {
+    s_filter_config.filtering_enabled = 0;
+    return;
+  }
+  s_filter_config.filtering_enabled = 1;
+  if (strcmp(mode_str, "whitelist") == 0 || strcmp(mode_str, "WHITELIST") == 0) {
+    s_filter_config.dns_client.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
+    s_filter_config.powershell.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
+    s_filter_config.tcpip.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
+    s_filter_config.wmi_activity.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
+  } else if (strcmp(mode_str, "blacklist") == 0 || strcmp(mode_str, "BLACKLIST") == 0) {
+    s_filter_config.dns_client.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
+    s_filter_config.powershell.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
+    s_filter_config.tcpip.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
+    s_filter_config.wmi_activity.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
+  }
+  const char *dns_list = getenv("EDR_COLLECTOR_EVENTID_DNS_CLIENT_LIST");
+  if (dns_list) {
+    edr_parse_uint16_list_with_ranges(dns_list, s_filter_config.dns_client.event_ids,
+                                      EDR_COLLECTOR_MAX_EVENTID_FILTER, &s_filter_config.dns_client.event_id_count,
+                                      s_filter_config.dns_client.ranges,
+                                      EDR_COLLECTOR_MAX_EVENTID_RANGES, &s_filter_config.dns_client.range_count);
+  }
+  const char *ps_list = getenv("EDR_COLLECTOR_EVENTID_POWERSHELL_LIST");
+  if (ps_list) {
+    edr_parse_uint16_list_with_ranges(ps_list, s_filter_config.powershell.event_ids,
+                                      EDR_COLLECTOR_MAX_EVENTID_FILTER, &s_filter_config.powershell.event_id_count,
+                                      s_filter_config.powershell.ranges,
+                                      EDR_COLLECTOR_MAX_EVENTID_RANGES, &s_filter_config.powershell.range_count);
+  }
+  const char *tcp_list = getenv("EDR_COLLECTOR_EVENTID_TCPIP_LIST");
+  if (tcp_list) {
+    edr_parse_uint16_list_with_ranges(tcp_list, s_filter_config.tcpip.event_ids,
+                                      EDR_COLLECTOR_MAX_EVENTID_FILTER, &s_filter_config.tcpip.event_id_count,
+                                      s_filter_config.tcpip.ranges,
+                                      EDR_COLLECTOR_MAX_EVENTID_RANGES, &s_filter_config.tcpip.range_count);
+  }
+  const char *wmi_list = getenv("EDR_COLLECTOR_EVENTID_WMI_LIST");
+  if (wmi_list) {
+    edr_parse_uint16_list_with_ranges(wmi_list, s_filter_config.wmi_activity.event_ids,
+                                      EDR_COLLECTOR_MAX_EVENTID_FILTER, &s_filter_config.wmi_activity.event_id_count,
+                                      s_filter_config.wmi_activity.ranges,
+                                      EDR_COLLECTOR_MAX_EVENTID_RANGES, &s_filter_config.wmi_activity.range_count);
+  }
+  fprintf(stderr, "[collector_win] EventId filter enabled: mode=%s dns=%u/%u ps=%u/%u tcp=%u/%u wmi=%u/%u\n",
+          mode_str,
+          (unsigned)s_filter_config.dns_client.event_id_count, (unsigned)s_filter_config.dns_client.range_count,
+          (unsigned)s_filter_config.powershell.event_id_count, (unsigned)s_filter_config.powershell.range_count,
+          (unsigned)s_filter_config.tcpip.event_id_count, (unsigned)s_filter_config.tcpip.range_count,
+          (unsigned)s_filter_config.wmi_activity.event_id_count, (unsigned)s_filter_config.wmi_activity.range_count);
+}
+
+int edr_collector_get_event_filter_config(EdrCollectorEventFilterConfig *out_config) {
+  if (!out_config) {
+    return -1;
+  }
+  if (InterlockedCompareExchange(&s_filter_initialized, 0, 0) == 0) {
+    edr_init_filter_config();
+  }
+  memcpy(out_config, &s_filter_config, sizeof(s_filter_config));
+  return 0;
+}
+
+static int edr_event_id_in_range(uint16_t event_id, const EdrEventIdRange *ranges, uint32_t range_count) {
+  for (uint32_t i = 0; i < range_count; i++) {
+    if (event_id >= ranges[i].start && event_id <= ranges[i].end) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int edr_collector_should_filter_event(const char *provider_name, uint16_t event_id) {
+  if (InterlockedCompareExchange(&s_filter_initialized, 0, 0) == 0) {
+    edr_init_filter_config();
+  }
+  if (!s_filter_config.filtering_enabled) {
+    return 0;
+  }
+  const EdrEventIdFilter *filter = NULL;
+  int provider_index = -1;
+  if (provider_name) {
+    if (strcmp(provider_name, "DNS_CLIENT") == 0 || strcmp(provider_name, "Microsoft-Windows-DNS-Client") == 0) {
+      filter = &s_filter_config.dns_client;
+      provider_index = 0;
+    } else if (strcmp(provider_name, "POWERSHELL") == 0 || strcmp(provider_name, "Microsoft-Windows-PowerShell") == 0) {
+      filter = &s_filter_config.powershell;
+      provider_index = 1;
+    } else if (strcmp(provider_name, "TCPIP") == 0 || strcmp(provider_name, "Microsoft-Windows-TCPIP") == 0) {
+      filter = &s_filter_config.tcpip;
+      provider_index = 2;
+    } else if (strcmp(provider_name, "WMI_ACTIVITY") == 0 || strcmp(provider_name, "Microsoft-Windows-WMI-Activity") == 0) {
+      filter = &s_filter_config.wmi_activity;
+      provider_index = 3;
+    }
+  }
+  if (!filter || filter->mode == EDR_EVENT_FILTER_MODE_NONE) {
+    return 0;
+  }
+  if (filter->event_id_count == 0 && filter->range_count == 0) {
+    return 0;
+  }
+  int found = 0;
+  for (uint32_t i = 0; i < filter->event_id_count; i++) {
+    if (filter->event_ids[i] == event_id) {
+      found = 1;
+      break;
+    }
+  }
+  if (!found) {
+    found = edr_event_id_in_range(event_id, filter->ranges, filter->range_count);
+  }
+  int should_filter = 0;
+  if (filter->mode == EDR_EVENT_FILTER_MODE_WHITELIST) {
+    should_filter = found ? 0 : 1;
+  } else {
+    should_filter = found ? 1 : 0;
+  }
+  if (should_filter && provider_index >= 0) {
+    switch (provider_index) {
+      case 0:
+        (void)InterlockedIncrement64(&s_filter_stats_dns_client);
+        break;
+      case 1:
+        (void)InterlockedIncrement64(&s_filter_stats_powershell);
+        break;
+      case 2:
+        (void)InterlockedIncrement64(&s_filter_stats_tcpip);
+        break;
+      case 3:
+        (void)InterlockedIncrement64(&s_filter_stats_wmi_activity);
+        break;
+    }
+  }
+  return should_filter;
+}
+
+int edr_collector_get_filter_stats(EdrCollectorFilterStats *out_stats) {
+  if (!out_stats) {
+    return -1;
+  }
+  memset(out_stats, 0, sizeof(*out_stats));
+  out_stats->dns_client_filtered = (uint64_t)s_filter_stats_dns_client;
+  out_stats->powershell_filtered = (uint64_t)s_filter_stats_powershell;
+  out_stats->tcpip_filtered = (uint64_t)s_filter_stats_tcpip;
+  out_stats->wmi_activity_filtered = (uint64_t)s_filter_stats_wmi_activity;
+  out_stats->total_filtered = out_stats->dns_client_filtered + out_stats->powershell_filtered +
+                              out_stats->tcpip_filtered + out_stats->wmi_activity_filtered;
+  return 0;
+}
+
 /* A4.4 第一期：QPC 差分 → 纳秒（`EDR_A44_CB_PHASE_MEAS=1`） */
 static int64_t edr_win_qpc_elapsed_ns(const LARGE_INTEGER *a, const LARGE_INTEGER *b, const LARGE_INTEGER *freq) {
   if (!a || !b || !freq || freq->QuadPart == 0) {
@@ -237,6 +452,408 @@ static uint8_t edr_priority_from_utf8_payload(const uint8_t *data, uint32_t len)
  * A4.4：解线程/同线程 共用（不再跑 map/pmfe/可观测 回调 计数）。
  * `edr_collector_decode_from_a44_item` 在 edr_a44_split_path_win.c 侧声明。
  */
+static int env_file_read_filter_enabled(void) {
+  const char *e = getenv("EDR_ETW_FILE_READ_FILTER");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;
+}
+
+static int env_file_write_filter_enabled(void) {
+  const char *e = getenv("EDR_ETW_FILE_WRITE_FILTER");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;
+}
+
+static int is_high_risk_file_read_path(const char *path) {
+  if (!path || !path[0]) return 0;
+  const char *high_risk_paths[] = {
+    "\\Chrome\\User Data\\",
+    "\\Chromium\\User Data\\",
+    "\\Microsoft\\Edge\\User Data\\",
+    "\\Mozilla\\Firefox\\",
+    "\\Opera Software\\",
+    "\\NTDS\\",
+    "\\config\\sam",
+    "\\config\\system",
+    "\\config\\security",
+    "\\AppData\\Local\\Microsoft\\Credentials\\",
+    "\\AppData\\Roaming\\Microsoft\\Credentials\\",
+  };
+  for (size_t i = 0; i < sizeof(high_risk_paths) / sizeof(high_risk_paths[0]); i++) {
+    if (strstr(path, high_risk_paths[i]) != NULL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int is_low_value_file_write_path(const char *path) {
+  if (!path || !path[0]) return 0;
+  const char *low_value_paths[] = {
+    "\\Temp\\",
+    "\\tmp\\",
+    "\\Windows\\Temp\\",
+    "\\AppData\\Local\\Temp\\",
+    "\\Microsoft\\Windows\\INetCache\\",
+    "\\Microsoft\\Windows\\WER\\",
+    "\\config\\Update\\",
+    "\\SoftwareDistribution\\Update\\",
+    "\\SoftwareDistribution\\DataStore\\",
+    "\\Windows\\SoftwareDistribution\\",
+    "\\$Recycle.Bin\\",
+    "\\Recycler\\",
+    "\\System Volume Information\\",
+    "\\Windows\\WinSxS\\",
+    "\\Microsoft\\Windows\Installer\\",
+    "\\Prefetch\\",
+    "\\Offline Web Pages\\",
+  };
+  for (size_t i = 0; i < sizeof(low_value_paths) / sizeof(low_value_paths[0]); i++) {
+    if (strstr(path, low_value_paths[i]) != NULL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int should_collect_file_read(const char *payload, size_t payload_len) {
+  if (!env_file_read_filter_enabled()) {
+    return 1;
+  }
+  const char *file_prefix = "\nfile=";
+  const char *p = strstr(payload, file_prefix);
+  if (!p) {
+    return 0;
+  }
+  p += strlen(file_prefix);
+  size_t remaining = payload_len - (size_t)(p - payload);
+  char file_path[1024];
+  size_t copy_len = remaining < sizeof(file_path) - 1 ? remaining : sizeof(file_path) - 1;
+  memcpy(file_path, p, copy_len);
+  file_path[copy_len] = '\0';
+  char *newline = strchr(file_path, '\n');
+  if (newline) *newline = '\0';
+  return is_high_risk_file_read_path(file_path);
+}
+
+static int should_collect_file_write(const char *payload, size_t payload_len) {
+  if (!env_file_write_filter_enabled()) {
+    return 1;
+  }
+  const char *file_prefix = "\nfile=";
+  const char *p = strstr(payload, file_prefix);
+  if (!p) {
+    return 0;
+  }
+  p += strlen(file_prefix);
+  size_t remaining = payload_len - (size_t)(p - payload);
+  char file_path[1024];
+  size_t copy_len = remaining < sizeof(file_path) - 1 ? remaining : sizeof(file_path) - 1;
+  memcpy(file_path, p, copy_len);
+  file_path[copy_len] = '\0';
+  char *newline = strchr(file_path, '\n');
+  if (newline) *newline = '\0';
+  return !is_low_value_file_write_path(file_path);
+}
+
+static int env_registry_filter_enabled(void) {
+  const char *e = getenv("EDR_ETW_REGISTRY_FILTER");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;
+}
+
+static int is_high_risk_registry_path(const char *path) {
+  if (!path || !path[0]) return 0;
+  const char *high_risk_paths[] = {
+    "\\Services\\",
+    "\\Run\\",
+    "\\RunOnce\\",
+    "\\CurrentVersion\\Run\\",
+    "\\CurrentVersion\\RunOnce\\",
+    "\\Windows\\CurrentVersion\\Run\\",
+    "\\Windows\\CurrentVersion\\RunOnce\\",
+    "\\Group Policy\\",
+    "\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\",
+    "\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\",
+    "\\System\\CurrentControlSet\\Services\\",
+    "\\Control\\Session Manager\\",
+    "\\Environment\\",
+    "\\Windows\\CurrentVersion\\Explorer\\",
+    "\\AppInit_DLLs\\",
+    "\\LoadAppInit_DLLs\\",
+    "\\CodeIdentities\\",
+    "\\Windows Defender\\",
+    "\\Microsoft\\Antimalware\\",
+    "\\Symantec\\",
+    "\\McAfee\\",
+    "\\Norton\\",
+    "\\Kaspersky\\",
+    "\\ESET\\",
+  };
+  for (size_t i = 0; i < sizeof(high_risk_paths) / sizeof(high_risk_paths[0]); i++) {
+    if (strstr(path, high_risk_paths[i]) != NULL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int should_collect_registry(const char *payload, size_t payload_len) {
+  if (!env_registry_filter_enabled()) {
+    return 1;
+  }
+  const char *reg_prefix = "\nreg=";
+  const char *p = strstr(payload, reg_prefix);
+  if (!p) {
+    return 0;
+  }
+  p += strlen(reg_prefix);
+  size_t remaining = payload_len - (size_t)(p - payload);
+  char reg_path[1024];
+  size_t copy_len = remaining < sizeof(reg_path) - 1 ? remaining : sizeof(reg_path) - 1;
+  memcpy(reg_path, p, copy_len);
+  reg_path[copy_len] = '\0';
+  char *newline = strchr(reg_path, '\n');
+  if (newline) *newline = '\0';
+  return is_high_risk_registry_path(reg_path);
+}
+
+#define DNS_DEDUP_SLOTS 256
+#define DNS_DEDUP_WINDOW_MS 5000
+
+typedef struct {
+  uint32_t pid;
+  char qname[256];
+  uint64_t last_ts;
+} DnsDedupSlot;
+
+static DnsDedupSlot s_dns_dedup[DNS_DEDUP_SLOTS];
+static uint32_t s_dns_dedup_next;
+
+static int env_dns_dedup_enabled(void) {
+  const char *e = getenv("EDR_ETW_DNS_DEDUP");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;
+}
+
+static int env_dns_suspicious_only(void) {
+  const char *e = getenv("EDR_ETW_DNS_SUSPICIOUS_ONLY");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;
+}
+
+static int is_suspicious_dns_process(const char *procname) {
+  if (!procname || !procname[0]) return 0;
+  const char *suspicious_procs[] = {
+    "powershell.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+    "certutil.exe",
+    "bitsadmin.exe",
+    "regsvr32.exe",
+    "rundll32.exe",
+    "msiexec.exe",
+    "cmstp.exe",
+    "msbuild.exe",
+    "ftp.exe",
+    "telnet.exe",
+    "nslookup.exe",
+    "nc.exe",
+    "netcat.exe",
+    "nmap.exe",
+    "python.exe",
+    "python3.exe",
+    "perl.exe",
+    "ruby.exe",
+    "java.exe",
+    "javaw.exe",
+    "node.exe",
+    "npm.cmd",
+    "nodejs",
+    "curl.exe",
+    "wget.exe",
+    "iexplore.exe",
+    "edge.exe",
+    "chrome.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "svchost.exe",
+    "services.exe",
+    "lsass.exe",
+    "winlogon.exe",
+    "explorer.exe",
+    "taskhostw.exe",
+    "dllhost.exe",
+    "conhost.exe",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "fontdrvhost.exe",
+    "dwm.exe",
+    "runtimebroker.exe",
+    "searchui.exe",
+    "shellExperienceHost.exe",
+    "StartMenuExperienceHost.exe",
+    "TextInputHost.exe",
+    "SystemSettings.exe",
+    "LockApp.exe",
+    "UserService.exe",
+    "TimeService.exe",
+    "WpnService.exe",
+    "PushToInstall.exe",
+    "OneDrive.exe",
+    "SkypeApp.exe",
+    "Teams.exe",
+    "Outlook.exe",
+    "WINWORD.EXE",
+    "EXCEL.EXE",
+    "POWERPNT.EXE",
+    "OUTLOOK.EXE",
+    "Lync.exe",
+    "EQNEDT32.EXE",
+    "fltMC.exe",
+    "psinfo.exe",
+    "psexec.exe",
+    "PsExec64.exe",
+    "wmic.exe",
+    "cmdex.exe",
+    "atbroker.exe",
+    "pkgmgr.exe",
+    "infdefaultinstall.exe",
+    "spoolsv.exe",
+    "jucheck.exe",
+    "jusched.exe",
+    "GoogleUpdate.exe",
+    "OneDriveStandaloneUpdater.exe",
+    "AVP.exe",
+    "avp.exe",
+    "ekrn.exe",
+    "Ntrtscan.exe",
+    "FMiser.exe",
+    "McShield.exe",
+    "engineserver.exe",
+    "mcuihost.exe",
+    "mcshield.exe",
+    "vstskmgr.exe",
+    "workfolders.exe",
+    "wmiadap.exe",
+    "wmiprvse.exe",
+    "repadmin.exe",
+    "adInsight.exe",
+    "ldifde.exe",
+    "csvde.exe",
+    "dsquery.exe",
+    "ntdsutil.exe",
+    "dnscmd.exe",
+    "nltest.exe",
+    "portqry.exe",
+    "qwinsta.exe",
+    "quser.exe",
+    "tasklist.exe",
+    "sc.exe",
+    "net.exe",
+    "net1.exe",
+    "netsh.exe",
+    "ipconfig.exe",
+    "arp.exe",
+    "route.exe",
+    "hostname.exe",
+    "whoami.exe",
+    "gpresult.exe",
+    "gpupdate.exe",
+    "dir.exe",
+    "type.exe",
+    "copy.exe",
+    "move.exe",
+    "del.exe",
+    "rd.exe",
+    "mkdir.exe",
+    "rmdir.exe",
+    "icacls.exe",
+    "cacls.exe",
+    "takeown.exe",
+    "cipher.exe",
+    "fsutil.exe",
+    "compact.exe",
+    "attrib.exe",
+    "findstr.exe",
+    "find.exe",
+    "where.exe",
+    "set.exe",
+    "setlocal.exe",
+    "endlocal.exe",
+    "cd.exe",
+    "pushd.exe",
+    "popd.exe",
+    "prompt.exe",
+    "title.exe",
+    "ver.exe",
+    "color.exe",
+    "cls.exe",
+    "pause.exe",
+    "exit.exe",
+    "cmd.exe",
+  };
+  for (size_t i = 0; i < sizeof(suspicious_procs) / sizeof(suspicious_procs[0]); i++) {
+#ifdef _WIN32
+    if (_stricmp(procname, suspicious_procs[i]) == 0) {
+      return 1;
+    }
+#else
+    if (strcasecmp(procname, suspicious_procs[i]) == 0) {
+      return 1;
+    }
+#endif
+  }
+  return 0;
+}
+
+static int should_collect_dns_query(uint32_t pid, const char *qname, uint64_t ts_ns) {
+  if (!env_dns_dedup_enabled()) {
+    return 1;
+  }
+  if (!qname || !qname[0]) {
+    return 1;
+  }
+  uint64_t window_ms = DNS_DEDUP_WINDOW_MS;
+  const char *win_env = getenv("EDR_ETW_DNS_DEDUP_WINDOW_MS");
+  if (win_env) {
+    window_ms = (uint64_t)atoi(win_env);
+    if (window_ms == 0) window_ms = DNS_DEDUP_WINDOW_MS;
+  }
+  uint64_t now_ms = ts_ns / 1000000ULL;
+  for (int i = 0; i < DNS_DEDUP_SLOTS; i++) {
+    DnsDedupSlot *s = &s_dns_dedup[i];
+    if (s->pid == pid && strcmp(s->qname, qname) == 0) {
+      if (now_ms < s->last_ts + window_ms) {
+        return 0;
+      }
+      s->last_ts = now_ms;
+      return 1;
+    }
+  }
+  DnsDedupSlot *s = &s_dns_dedup[s_dns_dedup_next % DNS_DEDUP_SLOTS];
+  s_dns_dedup_next++;
+  s->pid = pid;
+  snprintf(s->qname, sizeof(s->qname), "%s", qname);
+  s->last_ts = now_ms;
+  return 1;
+}
+
 static void edr_collector_tdh_to_bus(PEVENT_RECORD rec, EdrEventType ty, const char *tag, uint64_t ts_ns) {
   int a44_meas = edr_etw_observability_a44_cb_phase_meas_enabled();
   LARGE_INTEGER a44_freq;
@@ -272,6 +889,56 @@ static void edr_collector_tdh_to_bus(PEVENT_RECORD rec, EdrEventType ty, const c
   }
   if (plen > EDR_MAX_EVENT_PAYLOAD) {
     plen = EDR_MAX_EVENT_PAYLOAD;
+  }
+  if (ty == EDR_EVENT_FILE_READ && !should_collect_file_read((const char *)slot.data, plen)) {
+    return;
+  }
+  if ((ty == EDR_EVENT_FILE_WRITE || ty == EDR_EVENT_FILE_DELETE) &&
+      !should_collect_file_write((const char *)slot.data, plen)) {
+    return;
+  }
+  if ((ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE || ty == EDR_EVENT_REG_DELETE_KEY) &&
+      !should_collect_registry((const char *)slot.data, plen)) {
+    return;
+  }
+  if (ty == EDR_EVENT_NET_DNS_QUERY) {
+    if (env_dns_suspicious_only()) {
+      const char *proc_prefix = "\nproc=";
+      const char *p = strstr((const char *)slot.data, proc_prefix);
+      if (!p) {
+        return;
+      }
+      p += strlen(proc_prefix);
+      char *newline = strchr(p, '\n');
+      size_t proc_len = newline ? (size_t)(newline - p) : strlen(p);
+      char procname[64];
+      if (proc_len >= sizeof(procname)) proc_len = sizeof(procname) - 1;
+      memcpy(procname, p, proc_len);
+      procname[proc_len] = '\0';
+      if (!is_suspicious_dns_process(procname)) {
+        return;
+      }
+    }
+    uint32_t pid = 0;
+    const char *pid_prefix = "\nepid=";
+    const char *p = strstr((const char *)slot.data, pid_prefix);
+    if (p) {
+      pid = (uint32_t)atoi(p + strlen(pid_prefix));
+    }
+    const char *qname_prefix = "\nqname=";
+    p = strstr((const char *)slot.data, qname_prefix);
+    if (p) {
+      p += strlen(qname_prefix);
+      char *newline = strchr(p, '\n');
+      size_t qname_len = newline ? (size_t)(newline - p) : strlen(p);
+      char qname[256];
+      if (qname_len >= sizeof(qname)) qname_len = sizeof(qname) - 1;
+      memcpy(qname, p, qname_len);
+      qname[qname_len] = '\0';
+      if (!should_collect_dns_query(pid, qname, ts_ns)) {
+        return;
+      }
+    }
   }
   slot.size = (uint32_t)plen;
   slot.priority = edr_priority_from_utf8_payload(slot.data, slot.size);
@@ -318,6 +985,32 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   }
   if (event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
     return;
+  }
+  const GUID *provider_g = &event_record->EventHeader.ProviderId;
+  int is_mandatory_channel = 0;
+  if (memcmp(provider_g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 ||
+      memcmp(provider_g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 ||
+      memcmp(provider_g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 ||
+      memcmp(provider_g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
+    is_mandatory_channel = 1;
+  }
+  if (!is_mandatory_channel) {
+    const char *provider_name = NULL;
+    if (memcmp(provider_g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
+      provider_name = "DNS_CLIENT";
+    } else if (memcmp(provider_g, &EDR_ETW_GUID_POWERSHELL, sizeof(GUID)) == 0) {
+      provider_name = "POWERSHELL";
+    } else if (memcmp(provider_g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
+      provider_name = "TCPIP";
+    } else if (memcmp(provider_g, &EDR_ETW_GUID_WMI_ACTIVITY, sizeof(GUID)) == 0) {
+      provider_name = "WMI_ACTIVITY";
+    }
+    if (provider_name) {
+      USHORT ev_id = event_record->EventHeader.EventDescriptor.Id;
+      if (edr_collector_should_filter_event(provider_name, ev_id)) {
+        return;
+      }
+    }
   }
   edr_etw_observability_on_callback(tag);
 

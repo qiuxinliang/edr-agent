@@ -75,6 +75,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o"
   "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o.d"
+  "CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.o"
+  "CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o"
   "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o"

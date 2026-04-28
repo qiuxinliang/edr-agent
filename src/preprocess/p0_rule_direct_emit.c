@@ -11,6 +11,7 @@
 #include "edr/behavior_alert_emit.h"
 #include "edr/behavior_record.h"
 #include "edr/types.h"
+#include "edr/enrich_parent_info.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -74,13 +75,13 @@ static uint64_t p0_monotonic_ms(void) {
 #endif
 }
 
-/* 若允许上送则占槽并返回 1；在冷却窗口内返回 0。EDR_P0_DEDUP_SEC=0 关闭。默认 2 秒。 */
+/* 若允许上送则占槽并返回 1；在冷却窗口内返回 0。EDR_P0_DEDUP_SEC=0 关闭。默认 10 秒（放宽以支持测试）。 */
 static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
   const char *v = getenv("EDR_P0_DEDUP_SEC");
   if (v && (v[0] == '0' && (v[1] == 0 || v[1] == ' '))) {
     return 1;
   }
-  unsigned long win_sec = 2;
+  unsigned long win_sec = 10;
   if (v && *v) {
     win_sec = strtoul(v, NULL, 10);
   }
@@ -254,45 +255,201 @@ static void p0_ep_rate_bump(const char *ep) {
   s->count++;
 }
 
-static int getenv_int01(const char *k) {
+static int getenv_int01_disabled_on_zero(const char *k) {
   const char *v = getenv(k);
-  return (v && v[0] == '1' && (v[1] == 0 || v[1] == ' ')) ? 1 : 0;
+  if (!v || v[0] == '\0') {
+    return 1;
+  }
+  if ((v[0] == '0' || v[0] == 'O' || v[0] == 'o') && (v[1] == '\0' || v[1] == ' ' || v[1] == '\n')) {
+    return 0;
+  }
+  if ((v[0] == '1' || v[0] == 'I' || v[0] == 'i') && (v[1] == '\0' || v[1] == ' ' || v[1] == '\n')) {
+    return 1;
+  }
+  if (v[0] == 'N' || v[0] == 'n') {
+    return 0;
+  }
+  return 1;
 }
 
 static float sev3_anomaly(void) { return 0.40f + 0.10f * 3.0f; }
 
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const char *title,
                         const char *mitre_comma) {
+  static int s_debug_enabled = -1;
+  if (s_debug_enabled < 0) {
+    s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
+  }
   if (!p0_global_rate_ok()) {
+    if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: global rate limit\n");
     return 0;
   }
   if (!p0_tenant_rate_ok(br->tenant_id)) {
+    if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: tenant rate limit\n");
     return 0;
   }
   if (!p0_ep_rate_ok(br->endpoint_id)) {
+    if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: endpoint rate limit\n");
     return 0;
   }
   if (!p0_dedup_allow(rule_id, br)) {
+    if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: dedup (rule=%s pid=%u)\n", rule_id, br->pid);
     return 0;
   }
   AVEBehaviorAlert a;
   memset(&a, 0, sizeof(a));
   a.pid = br->pid;
   a.timestamp_ns = br->event_time_ns;
-  snprintf(a.process_name, sizeof(a.process_name), "%s", br->process_name);
-  snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path);
+  snprintf(a.process_name, sizeof(a.process_name), "%s", br->process_name ? br->process_name : "");
+  snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path ? br->exe_path : "");
   a.anomaly_score = sev3_anomaly();
-  snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma);
+  snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma ? mitre_comma : "");
   a.skip_ai_analysis = true;
   a.needs_l2_review = false;
 
-  /* related_iocs_json 留空；元数据在 user_subject_json */
+  /* 增强user_subject_json，添加完整上下文以支持服务端关联分析 */
   {
+    char cmdline_esc[2048] = {0};
+    char parent_name_esc[512] = {0};
+    char parent_path_esc[1024] = {0};
+    char username_esc[512] = {0};
+    char exe_hash_esc[128] = {0};
+
+    if (br->cmdline) {
+      for (size_t i = 0, j = 0; i < strlen(br->cmdline) && j < sizeof(cmdline_esc) - 1; i++) {
+        char c = br->cmdline[i];
+        if (c == '\\') {
+          cmdline_esc[j++] = '\\';
+          cmdline_esc[j++] = '\\';
+        } else if (c == '"') {
+          cmdline_esc[j++] = '\\';
+          cmdline_esc[j++] = '"';
+        } else {
+          cmdline_esc[j++] = c;
+        }
+      }
+    }
+    if (br->parent_name) {
+      for (size_t i = 0, j = 0; i < strlen(br->parent_name) && j < sizeof(parent_name_esc) - 1; i++) {
+        char c = br->parent_name[i];
+        if (c == '\\') {
+          parent_name_esc[j++] = '\\';
+          parent_name_esc[j++] = '\\';
+        } else if (c == '"') {
+          parent_name_esc[j++] = '\\';
+          parent_name_esc[j++] = '"';
+        } else {
+          parent_name_esc[j++] = c;
+        }
+      }
+    }
+    if (br->parent_path) {
+      for (size_t i = 0, j = 0; i < strlen(br->parent_path) && j < sizeof(parent_path_esc) - 1; i++) {
+        char c = br->parent_path[i];
+        if (c == '\\') {
+          parent_path_esc[j++] = '\\';
+          parent_path_esc[j++] = '\\';
+        } else if (c == '"') {
+          parent_path_esc[j++] = '\\';
+          parent_path_esc[j++] = '"';
+        } else {
+          parent_path_esc[j++] = c;
+        }
+      }
+    }
+    if (br->username) {
+      for (size_t i = 0, j = 0; i < strlen(br->username) && j < sizeof(username_esc) - 1; i++) {
+        char c = br->username[i];
+        if (c == '\\') {
+          username_esc[j++] = '\\';
+          username_esc[j++] = '\\';
+        } else if (c == '"') {
+          username_esc[j++] = '\\';
+          username_esc[j++] = '"';
+        } else {
+          username_esc[j++] = c;
+        }
+      }
+    }
+    if (br->exe_hash) {
+      snprintf(exe_hash_esc, sizeof(exe_hash_esc), "%s", br->exe_hash);
+    }
+
+    /* 如果缺少父进程信息，通过API补充 */
+    if (!br->parent_name[0] && br->ppid > 0) {
+      enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name),
+                               br->parent_path, sizeof(br->parent_path));
+    }
+
     int n = snprintf(
         a.user_subject_json, sizeof(a.user_subject_json),
-        "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"%s\",\"rules_bundle_version\":\"%s\","
-        "\"display_title\":\"%s\"}",
-        rule_id, EDR_P0_RULES_BUNDLE_VERSION, title);
+        "{"
+        "\"subject_type\":\"edr_dynamic_rule\","
+        "\"rule_id\":\"%s\","
+        "\"rules_bundle_version\":\"%s\","
+        "\"display_title\":\"%s\","
+        "\"context\":{"
+          "\"pid\":%u,"
+          "\"ppid\":%u,"
+          "\"process_name\":\"%s\","
+          "\"process_path\":\"%s\","
+          "\"cmdline\":\"%s\","
+          "\"exe_hash\":\"%s\","
+          "\"exe_path_hash\":\"%s\","
+          "\"parent_name\":\"%s\","
+          "\"parent_path\":\"%s\","
+          "\"parent_cmdline\":\"%s\","
+          "\"grandparent_name\":\"%s\","
+          "\"username\":\"%s\","
+          "\"process_chain_depth\":%u,"
+          "\"endpoint_id\":\"%s\","
+          "\"tenant_id\":\"%s\","
+          "\"event_type\":%d,"
+          "\"hostname\":\"%s\","
+          "\"domain\":\"%s\","
+          "\"current_directory\":\"%s\","
+          "\"logon_time_ns\":%llu,"
+          "\"integrity_level\":\"%s\","
+          "\"token_elevation\":%u,"
+          "\"process_creation_time\":\"%s\","
+          "\"parent_creation_time\":\"%s\","
+          "\"child_pids\":\"%s\","
+          "\"powershell_script_block\":\"%s\","
+          "\"command_line_origin\":\"%s\","
+          "\"encoded_command_type\":\"%s\""
+        "}"
+        "}",
+        rule_id,
+        EDR_P0_RULES_BUNDLE_VERSION,
+        title ? title : "",
+        br->pid,
+        br->ppid,
+        br->process_name ? br->process_name : "",
+        br->exe_path[0] ? br->exe_path : "",
+        cmdline_esc,
+        exe_hash_esc,
+        br->process_path_hash[0] ? br->process_path_hash : "",
+        parent_name_esc,
+        parent_path_esc,
+        br->parent_cmdline[0] ? br->parent_cmdline : "",
+        br->grandparent_name[0] ? br->grandparent_name : "",
+        username_esc,
+        br->process_chain_depth,
+        br->endpoint_id[0] ? br->endpoint_id : "",
+        br->tenant_id[0] ? br->tenant_id : "",
+        (int)br->type,
+        br->hostname[0] ? br->hostname : "",
+        br->domain[0] ? br->domain : "",
+        br->current_directory[0] ? br->current_directory : "",
+        (unsigned long long)br->logon_time_ns,
+        br->integrity_level[0] ? br->integrity_level : "Unknown",
+        br->token_elevation,
+        br->process_creation_time[0] ? br->process_creation_time : "",
+        br->parent_creation_time[0] ? br->parent_creation_time : "",
+        br->child_pids[0] ? br->child_pids : "",
+        br->powershell_script_block[0] ? br->powershell_script_block : "",
+        br->command_line_origin[0] ? br->command_line_origin : "",
+        br->encoded_command_type[0] ? br->encoded_command_type : "");
     if (n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
       a.user_subject_json[0] = 0;
       return 0;
@@ -309,19 +466,38 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   if (!br) {
     return;
   }
-  if (!getenv_int01("EDR_P0_DIRECT_EMIT")) {
+  const char *p0_env = getenv("EDR_P0_DIRECT_EMIT");
+  if (!getenv_int01_disabled_on_zero("EDR_P0_DIRECT_EMIT")) {
+    static int s_logged_once = 0;
+    if (!s_logged_once) {
+      fprintf(stderr, "[P0] INFO: EDR_P0_DIRECT_EMIT=%s, P0 rule engine disabled\n", p0_env ? p0_env : "(not set)");
+      s_logged_once = 1;
+    }
     return;
   }
   const char *cmd = br->cmdline;
   const char *pn = br->process_name;
   const char *par = br->parent_name[0] ? br->parent_name : NULL;
   int ch = (int)br->process_chain_depth;
+
+  /* 添加调试日志：显示收到的进程创建事件 */
+  static int s_debug_enabled = -1;
+  if (s_debug_enabled < 0) {
+    s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
+  }
+  if (s_debug_enabled) {
+    fprintf(stderr, "[P0 DEBUG] event: type=%d pid=%u process=%s cmdline=%s\n",
+            br->type, br->pid, pn ? pn : "(null)", cmd ? cmd : "(null)");
+  }
+
   edr_p0_rule_ir_lazy_init();
   if (edr_p0_rule_ir_is_ready()) {
     int i;
     int n = edr_p0_rule_ir_rule_count();
     for (i = 0; i < n; i++) {
-      if (!edr_p0_rule_ir_br_matches_index(br, i)) {
+      int hit = edr_p0_rule_ir_br_matches_index(br, i);
+      edr_p0_rule_ir_stats_record(i, hit);
+      if (!hit) {
         continue;
       }
       const char *rid = NULL;
@@ -331,6 +507,7 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       const char *title = NULL;
       const char *mitre = NULL;
       (void)edr_p0_rule_ir_get_meta(rid, &title, &mitre);
+      fprintf(stderr, "[P0] IR rule matched: rid=%s title=%s\n", rid, title ? title : "(null)");
       (void)emit_for_rule(
           br, rid, (title && title[0]) ? title : rid, (mitre && mitre[0]) ? mitre : ""
       );

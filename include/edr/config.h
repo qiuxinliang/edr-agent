@@ -73,6 +73,8 @@ typedef struct EdrConfig {
     int scan_threads;
     int max_file_size_mb;
     char sensitivity[16];
+    /** 默认 false（需要显式启用）；可由环境变量 EDR_AVE_ENABLED=1 覆盖 */
+    bool enabled;
     /** §08 签名白名单 Stage0：Windows 默认 true；见 `ave_sign_whitelist_*` */
     bool cert_whitelist_enabled;
     /** 可选 SQLite（`sign_blacklist` / `sign_whitelist` / `sign_cache` 等，见 08 设计文档） */

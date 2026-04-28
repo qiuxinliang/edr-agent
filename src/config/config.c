@@ -1575,6 +1575,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->ave.scan_threads = 2;
   cfg->ave.max_file_size_mb = 256;
   snprintf(cfg->ave.sensitivity, sizeof(cfg->ave.sensitivity), "%s", "MEDIUM");
+  cfg->ave.enabled = false;
 #ifdef _WIN32
   cfg->ave.cert_whitelist_enabled = true;
 #else

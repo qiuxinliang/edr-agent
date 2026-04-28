@@ -193,6 +193,13 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   if (!cfg) {
     return EDR_ERR_INVALID_ARG;
   }
+  const char *en = getenv("EDR_AVE_ENABLED");
+  if (en && en[0] == '1') {
+    /* 显式启用 */
+  } else if (!cfg->ave.enabled && (!en || en[0] != '1')) {
+    EDR_LOGV("%s", "[ave] disabled by default, set EDR_AVE_ENABLED=1 to enable\n");
+    return EDR_OK;
+  }
   s_ready = 0;
   s_n_model = 0;
   s_n_files = 0;

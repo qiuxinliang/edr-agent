@@ -1,0 +1,37 @@
+# 片段：仅 [collection] — 供合并进安装目录 `agent.toml` 或从本文件复制段。
+# 目的：在 **总线 dropped 极高** 的 Windows 联调/空机压测时，**尽量关掉可选 ETW provider**（见 `collector_win.c` `edr_enable_providers`）。
+# 重要：
+#   - **Kernel-Process / Kernel-File / Kernel-Network / Kernel-Registry 为 mandatory，代码中始终 EnableTrace，本段无法关闭**；若仍 `dropped` 很高，需 L3/规则/产品过滤/架构（多消费）等，见 docs/EDR_AGENT_ETW_PERF_TASK_PACK.md。
+#   - 每一项设 `false` 前请对照 Cauld《EDR_P0_Field_Matrix_Signoff》与 docs/WP8（若存在）及检测签字，避免无计划漏报。
+
+[collection]
+etw_enabled = true
+
+# —— 下面均为「可选」；未写时默认 true ——
+# 已关：高噪 / 常可先关做 A-B
+etw_dns_client_provider = false
+etw_wmi_provider = false
+
+# 强烈建议先关以降压（TCPIP / 防火墙 事件量往往极大）
+etw_tcpip_provider = false
+etw_firewall_provider = false
+
+# 按场景二选一或分阶段关：
+# - 需 PowerShell/脚本类检测时：先 **true**，仍满再关
+# - 纯验证总线/管道：可 **false**
+etw_powershell_provider = true
+
+# 安全审计 4688/4689 等：对登录/权限场景重要，但量也可观；总线仍爆时可试 **false** 做对照
+etw_security_audit_provider = true
+
+# Windows 端 `ebpf_enabled` 仅参与配置/日志；与 ETW 使能无直接等价，写 false 避免误解
+ebpf_enabled = false
+
+poll_interval_s = 1
+# 抗突刺可略增（钳位 256–65536）；**不能**替代收窄入口
+max_event_queue_size = 32768
+etw_buffer_kb = 64
+# 降 ETW 刷写频率，略减系统侧开销；与迟延折中
+etw_flush_timer_s = 3
+
+# —— 若仍高：再单步将 etw_powershell_provider / etw_security_audit_provider 改为 false，并记录实验窗口与回滚。 ——

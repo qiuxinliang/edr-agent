@@ -3,8 +3,23 @@
 #include "edr/p0_rule_ir.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+
+static _Atomic uint64_t s_p0_total_calls = 0;
+static _Atomic uint64_t s_p0_env_not_set_skip = 0;
+static _Atomic uint64_t s_p0_ir_mode_matches = 0;
+static _Atomic uint64_t s_p0_fallback_mode_matches = 0;
+static _Atomic uint64_t s_p0_rule_r_exec_001_hits = 0;
+static _Atomic uint64_t s_p0_rule_r_cred_001_hits = 0;
+static _Atomic uint64_t s_p0_rule_r_fileless_001_hits = 0;
+static _Atomic uint64_t s_p0_rule_other_hits = 0;
+static _Atomic uint64_t s_p0_powershell_detected = 0;
+static _Atomic uint64_t s_p0_encoded_cmd_detected = 0;
+static _Atomic uint64_t s_p0_base64_string_detected = 0;
+static _Atomic uint64_t s_p0_remote_download_detected = 0;
 
 static void ascii_lower_in_place(char *p) {
   for (; p && *p; p++) {
@@ -60,13 +75,66 @@ static int proc_name_ends(const char *name, const char *exe) {
 }
 
 static int is_powershell_name(const char *name) {
-  return proc_name_ends(name, "powershell.exe") || proc_name_ends(name, "pwsh.exe");
+  if (!name) return 0;
+  const char *base = strrchr(name, '\\');
+  base = base ? base + 1 : name;
+  return proc_name_ends(base, "powershell.exe") ||
+         proc_name_ends(base, "pwsh.exe") ||
+         proc_name_ends(base, "powershell_ise.exe") ||
+         proc_name_ends(base, "powershellfx.exe") ||
+         proc_name_ends(base, "wsmprovhost.exe") ||
+         proc_name_ends(base, "winrshost.exe") ||
+         proc_name_ends(base, "powershell") ||
+         proc_name_ends(base, "pwsh");
 }
 
 static int match_r_exec_001(const char *cmd) {
-  if (cistr_find(cmd, "encodedcommand") || cistr_find(cmd, "frombase64string")) {
+  if (!cmd) return 0;
+
+  // 检查编码命令参数变体
+  static const char *enc_args[] = {
+      "encodedcommand", "enc", "-enc", "/enc",
+      "-encodedcommand", "/encodedcommand", "-e", "/e",
+      "-encoded", "/encoded"
+  };
+  for (int i = 0; i < 9; i++) {
+    if (cistr_find(cmd, enc_args[i])) {
+      return 1;
+    }
+  }
+
+  // 检查Base64相关函数
+  if (cistr_find(cmd, "frombase64string") ||
+      cistr_find(cmd, "convert.frombase64string") ||
+      cistr_find(cmd, "[system.convert]::frombase64") ||
+      cistr_find(cmd, "-join") ||
+      cistr_find(cmd, "[io.file]::readallbytes")) {
     return 1;
   }
+
+  // 检查IEX/Invoke-Expression变体
+  if (cistr_find(cmd, "iex ") ||
+      cistr_find(cmd, "& {") ||
+      cistr_find(cmd, ".downloadstring") ||
+      cistr_find(cmd, ".downloadfile") ||
+      cistr_find(cmd, "invoke-expression") ||
+      cistr_find(cmd, "invoke-webrequest") ||
+      cistr_find(cmd, "new-object net.webclient") ||
+      cistr_find(cmd, "net.webclient") ||
+      cistr_find(cmd, "[net.webclient]") ||
+      cistr_find(cmd, "system.net.webclient")) {
+    return 1;
+  }
+
+  // 检查远程脚本下载
+  if (cistr_find(cmd, "http://") || cistr_find(cmd, "https://")) {
+    if (cistr_find(cmd, ".ps1") || cistr_find(cmd, ".txt") ||
+        cistr_find(cmd, "downloadstring") || cistr_find(cmd, "downloadfile")) {
+      return 1;
+    }
+  }
+
+  // 检查可疑的编码格式（以-或/开头，后面跟着可疑的字符串）
   for (const char *p = cmd; p && *p; p++) {
     if (p[0] != '-' && p[0] != '/') {
       continue;
@@ -79,6 +147,23 @@ static int match_r_exec_001(const char *cmd) {
       }
     }
   }
+
+  // 检查Base64字符串模式（以空格开头，后面跟着长Base64字符串）
+  const char *b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  for (const char *p = cmd; p && *p; p++) {
+    if (*p == ' ' && *(p + 1) && strchr(b64_chars, *(p + 1))) {
+      int b64_len = 0;
+      const char *q = p + 1;
+      while (*q && strchr(b64_chars, *q)) {
+        b64_len++;
+        q++;
+      }
+      if (b64_len >= 20) {
+        return 1;
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -143,14 +228,58 @@ static int p0_match_legacy(
 
 int edr_p0_rule_matches3(
     const char *rule_id, const char *process_name, const char *cmdline, const char *parent_name, int process_chain_depth) {
+  atomic_fetch_add_explicit(&s_p0_total_calls, 1, memory_order_relaxed);
   edr_p0_rule_ir_lazy_init();
   if (edr_p0_rule_ir_is_ready()) {
-    return edr_p0_rule_ir_matches(rule_id, process_name, cmdline, parent_name, process_chain_depth) ? 1 : 0;
+    int result = edr_p0_rule_ir_matches(rule_id, process_name, cmdline, parent_name, process_chain_depth) ? 1 : 0;
+    if (result) {
+      atomic_fetch_add_explicit(&s_p0_ir_mode_matches, 1, memory_order_relaxed);
+    }
+    return result;
   }
-  return p0_match_legacy(rule_id, process_name, cmdline, process_chain_depth);
+  int result = p0_match_legacy(rule_id, process_name, cmdline, process_chain_depth);
+  if (result) {
+    atomic_fetch_add_explicit(&s_p0_fallback_mode_matches, 1, memory_order_relaxed);
+  }
+  return result;
 }
 
 int edr_p0_rule_matches2(
     const char *rule_id, const char *process_name, const char *cmdline, int process_chain_depth) {
   return edr_p0_rule_matches3(rule_id, process_name, cmdline, NULL, process_chain_depth);
+}
+
+int edr_p0_rule_get_stats(EdrP0RuleStats *out_stats) {
+  if (!out_stats) {
+    return -1;
+  }
+  memset(out_stats, 0, sizeof(*out_stats));
+  out_stats->total_calls = (uint64_t)s_p0_total_calls;
+  out_stats->env_not_set_skip = (uint64_t)s_p0_env_not_set_skip;
+  out_stats->ir_mode_matches = (uint64_t)s_p0_ir_mode_matches;
+  out_stats->fallback_mode_matches = (uint64_t)s_p0_fallback_mode_matches;
+  out_stats->rule_r_exec_001_hits = (uint64_t)s_p0_rule_r_exec_001_hits;
+  out_stats->rule_r_cred_001_hits = (uint64_t)s_p0_rule_r_cred_001_hits;
+  out_stats->rule_r_fileless_001_hits = (uint64_t)s_p0_rule_r_fileless_001_hits;
+  out_stats->rule_other_hits = (uint64_t)s_p0_rule_other_hits;
+  out_stats->powershell_detected = (uint64_t)s_p0_powershell_detected;
+  out_stats->encoded_cmd_detected = (uint64_t)s_p0_encoded_cmd_detected;
+  out_stats->base64_string_detected = (uint64_t)s_p0_base64_string_detected;
+  out_stats->remote_download_detected = (uint64_t)s_p0_remote_download_detected;
+  return 0;
+}
+
+void edr_p0_rule_reset_stats(void) {
+  s_p0_total_calls = 0;
+  s_p0_env_not_set_skip = 0;
+  s_p0_ir_mode_matches = 0;
+  s_p0_fallback_mode_matches = 0;
+  s_p0_rule_r_exec_001_hits = 0;
+  s_p0_rule_r_cred_001_hits = 0;
+  s_p0_rule_r_fileless_001_hits = 0;
+  s_p0_rule_other_hits = 0;
+  s_p0_powershell_detected = 0;
+  s_p0_encoded_cmd_detected = 0;
+  s_p0_base64_string_detected = 0;
+  s_p0_remote_download_detected = 0;
 }

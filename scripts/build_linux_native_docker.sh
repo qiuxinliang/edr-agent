@@ -10,7 +10,7 @@
 #   EDR_CONTAINER           容器 CLI，默认自动探测 docker → podman（与 build_windows_mingw_docker.sh 一致）
 #   EDR_LINUX_DOCKER_IMAGE  默认 ubuntu:22.04
 #   EDR_LINUX_DOCKER_EXTRA  附加 docker run 参数，如 '--network host'
-#   EDR_WITH_GRPC           默认 ON；设为 OFF 则仅编 gRPC stub（依赖更少，适合纯 CMake/链路冒烟）
+#   EDR_WITH_GRPC           默认 OFF；设为 ON 则 apt 装 gRPC 并链接真实客户端
 #   EDR_RUN_CTEST           设为 1 时在构建后执行 ctest（部分测试依赖环境，失败时可关）
 #   http_proxy / https_proxy  传入容器（宿主机已设时自动 -e）
 set -euo pipefail
@@ -19,7 +19,7 @@ cd "$ROOT"
 OUTDIR="build-linux"
 IMAGE="${EDR_LINUX_DOCKER_IMAGE:-ubuntu:22.04}"
 EXTRA="${EDR_LINUX_DOCKER_EXTRA:-}"
-REQUIRE_GRPC="${EDR_WITH_GRPC:-ON}"
+REQUIRE_GRPC="${EDR_WITH_GRPC:-OFF}"
 
 ENGINE="${EDR_CONTAINER:-}"
 if [[ -z "$ENGINE" ]]; then

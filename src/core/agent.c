@@ -14,8 +14,10 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
+#include "edr/p0_rule_match.h"
 #ifdef _WIN32
 #include "edr/etw_observability_win.h"
+#include "edr/edr_a44_split_path_win.h"
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
 #else
@@ -141,6 +143,35 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
     const char *e = getenv("EDR_ETW_OBS");
     if (e && (e[0] == '1' || (e[0] == 'y' && e[1] == '\0') || (e[0] == 'Y' && e[1] == '\0'))) {
       edr_etw_observability_print_line(agent->event_bus);
+    }
+  }
+  EdrA44Stats a44_stats;
+  if (edr_a44_get_stats(&a44_stats) == 0 && a44_stats.active_threads > 0) {
+    fprintf(stderr,
+            "[a44] threads=%u cap=%u depth=%u(%.1f%%) avg=%.2f drop=%lu backoff=%lu rps=%.1f\n",
+            (unsigned)a44_stats.active_threads,
+            (unsigned)a44_stats.queue_capacity,
+            (unsigned)a44_stats.current_depth,
+            a44_stats.queue_utilization_pct,
+            a44_stats.queue_depth_avg,
+            (unsigned long)a44_stats.dropped_total,
+            (unsigned long)a44_stats.backoff_sync_total,
+            a44_stats.throughput_rps);
+    (void)edr_a44_adjust_threads_dynamically();
+  }
+  {
+    EdrP0RuleStats p0_stats;
+    if (edr_p0_rule_get_stats(&p0_stats) == 0) {
+      fprintf(stderr,
+              "[p0] total=%lu env_skip=%lu ir_match=%lu fb_match=%lu "
+              "r_exec=%lu r_cred=%lu r_filess=%lu\n",
+              (unsigned long)p0_stats.total_calls,
+              (unsigned long)p0_stats.env_not_set_skip,
+              (unsigned long)p0_stats.ir_mode_matches,
+              (unsigned long)p0_stats.fallback_mode_matches,
+              (unsigned long)p0_stats.rule_r_exec_001_hits,
+              (unsigned long)p0_stats.rule_r_cred_001_hits,
+              (unsigned long)p0_stats.rule_r_fileless_001_hits);
     }
   }
 #endif

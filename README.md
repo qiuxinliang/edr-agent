@@ -81,7 +81,7 @@ cmake --build build
 
 - **对最终功能的影响**：在**相同 CMake 选项、相同 triplet/依赖**下，下述只缩短编链与 IO；**不**为「加速」单独关功能开关或改源码。杀软排除、盘符、vcpkg 二进制缓存、sccache 均为**环境/缓存层**。详见 Windows 专篇 **[docs/WINDOWS_BUILD_SPEED.md](docs/WINDOWS_BUILD_SPEED.md)**。
 - **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
-  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认**只装 `curl`**（`EDR_WITH_GRPC=OFF` 时须内嵌 libcurl）。需要 **gRPC 客户端**时再装 **`vcpkg install --x-feature=grpc-client`**（会拉 `grpc` 等）。`set VCPKG_ROOT=...` 后 `cmake --preset w-vcpkg-ninja-dev` → `cmake --build`（**无 ORT/无 YARA**）。全量 gRPC+ORT 用 `w-vcpkg-ninja-grpc-ort` 并设 `ONNXRUNTIME_ROOT`（仍须已启用 `grpc-client` 特性与 `EDR_WITH_GRPC=ON`）。  
+  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认**只装 `curl`**（`EDR_WITH_GRPC=OFF` 时须内嵌 libcurl）。`cmake --preset w-vcpkg-ninja-dev` 默认**不编 gRPC**（快）。需要 **gRPC 客户端**时再装 **`vcpkg install --x-feature=grpc-client`** 并用 **`w-vcpkg-ninja-grpc-ort`** 或 **`-DEDR_WITH_GRPC=ON`**。全量 gRPC+ORT 用 `w-vcpkg-ninja-grpc-ort` 并设 `ONNXRUNTIME_ROOT`。  
   - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
   - **跨平台快编预设**：`any-ninja-fast-dev`（默认开 `EDR_ENABLE_COMPILER_CACHE=ON`），`any-ninja-fast-release-lto`（额外开 `EDR_ENABLE_IPO=ON`，工具链不支持时自动降级并告警）。
 - **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
@@ -97,14 +97,14 @@ cmake --build build
 
 **无 MSVC、仅验证 Windows 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、**gRPC/protobuf/vcpkg** 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查）。
 
-**本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；仅需 CMake 链路冒烟时可设 **`EDR_WITH_GRPC=OFF`**。
+**本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；**默认不装 gRPC**；需要真实 gRPC 客户端时设 **`EDR_WITH_GRPC=ON`**。
 
 ### CMake 与 gRPC 可选依赖
 
 | 选项 | 含义 |
 |------|------|
-| `EDR_WITH_GRPC`（默认 `ON`） | 为 `ON` 且系统能 `find_package(gRPC CONFIG)` 时，链接 **gRPC++** 与 **protobuf**，编译真实 `grpc_client_impl.cpp` 与 `src/grpc_gen/edr/v1/*.cc`。 |
-| `EDR_WITH_GRPC=OFF` | 不依赖 gRPC，改用 `grpc_client_stub.c`，进程仍可运行，上报与补传 RPC 恒为失败（返回码 `-1`）。 |
+| `EDR_WITH_GRPC`（默认 `OFF`） | 为 `ON` 且系统能 `find_package(gRPC CONFIG)` 时，链接 **gRPC++** 与 **protobuf**，编译真实 `grpc_client_impl.cpp` 与 `src/grpc_gen/edr/v1/*.cc`。 |
+| `EDR_WITH_GRPC=OFF`（默认） | 不依赖 gRPC，改用 `grpc_client_stub.c`；gRPC 批上送等不启用，**事件**走已配置的 **HTTP** 上送。 |
 | `EDR_WITH_LINUX_COLLECTOR`（默认 `ON`，**仅 Linux**） | 为 `ON` 时编入 `src/collector/collector_linux.c`；为 `OFF` 时在 Linux 上退回 `collector_stub.c`（与其它 POSIX 一致）。**Windows 不受影响**（始终使用 `collector_win.c`）。 |
 | `EDR_WITH_ONNXRUNTIME`（默认 `OFF`） | 为 `ON` 且能 `find_path`/`find_library` 找到 **ONNX Runtime**（头文件 `onnxruntime_c_api.h` 与 `libonnxruntime`）时，定义 **`EDR_HAVE_ONNXRUNTIME`**；主进程在 **`edr_agent_init`** 中通过 **`AVE_InitFromEdrConfig(&cfg)`**（见 `ave_sdk.h`）在 **`[ave] model_dir`** 下加载**首个** `.onnx` 做真推理；未找到库时 CMake **告警**并仍按无 ONNX 编译。可通过 **`ONNXRUNTIME_ROOT`** 指向解压的预编译包。**联调步骤**见 **[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**。 |
 
@@ -265,7 +265,7 @@ cmake --build build
 | `EDR_QUEUE_MAX_DB_MB` | 队列库文件大小上限（MB，粗粒度 `stat`），超出则拒绝新入队；未设置则不限制。（当前非 Windows 生效） |
 | `EDR_BEHAVIOR_ENCODING` | 见「Protobuf（nanopb）」：`protobuf` / `protobuf_c` / 默认 BER1。 |
 | `EDR_BEHAVIOR_USER_SUBJECT_JSON` | 若设为以 `{` 开头的 JSON 串且长度 < 1KiB，行为告警触发时写入 **`AVEBehaviorAlert.user_subject_json`**，经 ingest 入平台 `alerts.user_subject_json`（**调试用/专线**；与 `edr-backend` 000057 对账）。 |
-| `EDR_P0_DIRECT_EMIT` | `=1` 时，预处理在 **P0 子集**上直出 `BehaviorAlert`（`user_subject_json.subject_type=edr_dynamic_rule`）；**默认关**，见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。 |
+| `EDR_P0_DIRECT_EMIT` | `=0` 时禁用 P0 直出；**默认启用**（未设置或设置为1），见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。 |
 | `EDR_P0_DEDUP_SEC` | P0 直出对同一 `(rule_id,endpoint_id,pid)` 的**秒级去重**；默认 `2`；`0` 关。 |
 | `EDR_P0_MAX_EMITS_PER_MIN` | P0 直出**全进程**滑动 60s 内条数上限；`0` 或未设=不限制。 |
 | `EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT` | 按 **tenant_id** 独立滑动 60s 内条数上限；**默认 60/分**；`0` 为关闭**每租户**限流（仍受上项全局限制，若有）。`tenant_id` 空串视为同桶。 |

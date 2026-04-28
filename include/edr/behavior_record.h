@@ -66,6 +66,31 @@ typedef struct {
 
   char mitre_ttps[EDR_BR_MAX_MITRE][16];
   int mitre_ttp_count;
+
+  /* 取证增强字段 */
+  char hostname[EDR_BR_STR_SHORT];
+  char domain[EDR_BR_STR_SHORT];
+  char desktop_session[EDR_BR_STR_SHORT];
+  uint32_t desktop_session_id;
+  char current_directory[EDR_BR_STR_LONG];
+  char logon_guid[64];
+  uint64_t logon_time_ns;
+  char integrity_level[32];
+  uint32_t token_elevation;
+  char process_path_hash[65];
+  char parent_cmdline[EDR_BR_STR_LONG];
+  char grandparent_name[EDR_BR_STR_SHORT];
+  char grandparent_path[EDR_BR_STR_MID];
+  char sibling_names[EDR_BR_STR_LONG];
+  char child_pids[256];
+  char network_isolation_level[32];
+  char process_creation_time[64];
+  char parent_creation_time[64];
+  char command_line_origin[64];
+  char encoded_command_type[32];
+  char powershell_script_block[4096];
+  char wmi_filter[512];
+  char scheduled_task_path[1024];
 } EdrBehaviorRecord;
 
 void edr_behavior_record_init(EdrBehaviorRecord *r);

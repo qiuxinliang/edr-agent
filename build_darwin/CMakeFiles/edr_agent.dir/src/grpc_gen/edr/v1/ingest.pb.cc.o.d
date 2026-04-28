@@ -886,10 +886,6 @@ CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o: \
   /opt/homebrew/include/absl/crc/crc32c.h \
   /opt/homebrew/include/absl/crc/internal/crc32c_inline.h \
   /opt/homebrew/include/absl/crc/internal/crc32_x86_arm_combined_simd.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_acle.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_neon.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_bf16.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_vector_types.h \
   /opt/homebrew/include/absl/strings/str_format.h \
   /opt/homebrew/include/absl/strings/internal/str_format/arg.h \
   /opt/homebrew/include/absl/numeric/int128.h \
@@ -946,6 +942,7 @@ CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__filesystem/path_iterator.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__filesystem/recursive_directory_iterator.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__filesystem/u8path.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_acle.h \
   /opt/homebrew/include/absl/strings/cord_buffer.h \
   /opt/homebrew/include/absl/strings/internal/cord_rep_flat.h \
   /opt/homebrew/include/absl/strings/internal/cord_data_edge.h \
@@ -1048,6 +1045,9 @@ CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o: \
   /opt/homebrew/include/absl/container/internal/raw_hash_set.h \
   /opt/homebrew/include/absl/container/internal/hash_policy_traits.h \
   /opt/homebrew/include/absl/container/internal/hashtable_control_bytes.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_neon.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_bf16.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/arm_vector_types.h \
   /opt/homebrew/include/absl/container/internal/hashtable_debug_hooks.h \
   /opt/homebrew/include/absl/container/internal/hashtablez_sampler.h \
   /opt/homebrew/include/absl/profiling/internal/sample_recorder.h \

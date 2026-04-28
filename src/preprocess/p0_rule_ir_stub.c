@@ -50,3 +50,14 @@ int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) {
   (void)index;
   return 0;
 }
+
+void edr_p0_rule_ir_stats_record(int rule_idx, int hit) {
+  (void)rule_idx;
+  (void)hit;
+}
+
+void edr_p0_rule_ir_stats_dump(void) {
+}
+
+void edr_p0_rule_ir_stats_init(void) {
+}

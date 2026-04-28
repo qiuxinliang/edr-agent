@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  edr_agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: edr_agent
+    restart: unless-stopped
+    environment:
+      - EDR_CONFIG_PATH=/etc/edr/config
+      - EDR_LOG_PATH=/var/log/edr
+      - EDR_DATA_PATH=/var/lib/edr
+      - EDR_MAX_THREADS=4
+      - EDR_MEMORY_LIMIT_MB=256
+    volumes:
+      - ./config:/etc/edr/config:ro
+      - edr_logs:/var/log/edr
+      - edr_data:/var/lib/edr
+    resources:
+      limits:
+        cpus: '2.0'
+        memory: 512M
+      reservations:
+        cpus: '0.5'
+        memory: 128M
+    network_mode: host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  edr_logs:
+  edr_data:

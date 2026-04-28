@@ -58,6 +58,14 @@ static void l2_normalize_512(float *v) {
   }
 }
 
+static int env_smart_read_enabled(void) {
+  const char *e = getenv("EDR_AVE_STATIC_READ_SMART");
+  if (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y')) {
+    return 1;
+  }
+  return 1;  // 默认启用
+}
+
 int edr_ave_static_features_lite_512(const char *path, float *out512) {
   if (!path || !path[0] || !out512) {
     return -1;
@@ -74,7 +82,31 @@ int edr_ave_static_features_lite_512(const char *path, float *out512) {
     free(buf);
     return -1;
   }
-  size_t n = fread(buf, 1u, cap, f);
+  
+  // 智能读取策略
+  size_t n = 0;
+  if (env_smart_read_enabled()) {
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (file_size <= (long)cap) {
+      // 小文件：全读
+      n = fread(buf, 1u, (size_t)file_size, f);
+    } else {
+      // 大文件：读头部 + 尾部（各占一半容量）
+      size_t half = cap / 2;
+      n = fread(buf, 1u, half, f);  // 读取前半部分
+      
+      fseek(f, -((long)half), SEEK_END);  // 移动到文件尾部前 half 处
+      size_t tail_n = fread(buf + n, 1u, half, f);  // 读取后半部分
+      n += tail_n;
+    }
+  } else {
+    // 传统模式：全读
+    n = fread(buf, 1u, cap, f);
+  }
+  
   fclose(f);
   if (n == 0u) {
     free(buf);

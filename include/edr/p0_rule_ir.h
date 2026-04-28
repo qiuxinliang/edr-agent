@@ -32,4 +32,9 @@ int edr_p0_rule_ir_rule_id_at(int index, const char **out_id);
 /* 根据 br 的 type 与规则 event_type 是否一致 + 条件求值；用于直出遍历。 */
 int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index);
 
+/* P0规则命中率统计 - 性能优化辅助数据 */
+void edr_p0_rule_ir_stats_record(int rule_idx, int hit);
+void edr_p0_rule_ir_stats_dump(void);
+void edr_p0_rule_ir_stats_init(void);
+
 #endif

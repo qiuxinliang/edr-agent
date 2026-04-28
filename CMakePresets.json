@@ -9,15 +9,15 @@
     },
     {
       "name": "w-vcpkg-ninja-dev",
-      "displayName": "Win vcpkg+Ninja 快编（gRPC 开，无 ORT/无 YARA/无 FL）",
+      "displayName": "Win vcpkg+Ninja 快编（无 gRPC/无 ORT/无 YARA/无 FL）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置。vcpkg install 后再 cmake --preset。",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置。vcpkg install 后再 cmake --preset。gRPC 需 vcpkg --x-feature=grpc-client 且 EDR_WITH_GRPC=ON 或 w-vcpkg-ninja-grpc-ort。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_GRPC": "ON",
+        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_ONNXRUNTIME": "OFF",
         "EDR_WITH_YARA": "OFF",
         "EDR_WITH_FL_TRAINER": "OFF",

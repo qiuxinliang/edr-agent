@@ -42,4 +42,28 @@ uint64_t edr_event_bus_pushed_total(EdrEventBus *bus);
 /** 占用槽位 ≥ 容量 80% 时的累计命中次数（§2.3 背压观测） */
 uint64_t edr_event_bus_high_water_hits(EdrEventBus *bus);
 
+typedef enum {
+    EDR_BUS_TYPE_NORMAL = 0,
+    EDR_BUS_TYPE_HIGH_PRIORITY = 1,
+    EDR_BUS_TYPE_LOW_PRIORITY = 2,
+} EdrBusType;
+
+int edr_dual_bus_enabled(void);
+
+EdrEventBus *edr_event_bus_create_dual(uint32_t high_priority_slot_count, uint32_t low_priority_slot_count);
+
+int edr_event_bus_try_push_dual(EdrBusType bus_type, const EdrEventSlot *slot);
+
+bool edr_event_bus_try_pop_high_priority(EdrEventBus *bus, EdrEventSlot *out_slot);
+
+bool edr_event_bus_try_pop_low_priority(EdrEventBus *bus, EdrEventSlot *out_slot);
+
+uint32_t edr_event_bus_used_approx_high_priority(EdrEventBus *bus);
+
+uint32_t edr_event_bus_used_approx_low_priority(EdrEventBus *bus);
+
+uint64_t edr_event_bus_dropped_total_high_priority(EdrEventBus *bus);
+
+uint64_t edr_event_bus_dropped_total_low_priority(EdrEventBus *bus);
+
 #endif

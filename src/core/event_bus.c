@@ -178,3 +178,136 @@ uint64_t edr_event_bus_high_water_hits(EdrEventBus *bus) {
   }
   return atomic_load_explicit(&bus->high_water_hits, memory_order_relaxed);
 }
+
+static int edr_is_high_value_event(const EdrEventSlot *slot) {
+  if (!slot) {
+    return 0;
+  }
+  if (slot->priority == 0) {
+    return 1;
+  }
+  if (slot->attack_surface_hint != 0) {
+    return 1;
+  }
+  switch (slot->type) {
+    case EDR_EVENT_PROCESS_INJECT:
+    case EDR_EVENT_THREAD_CREATE_REMOTE:
+    case EDR_EVENT_PROTOCOL_SHELLCODE:
+    case EDR_EVENT_WEBSHELL_DETECTED:
+    case EDR_EVENT_FIREWALL_RULE_CHANGE:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+static volatile int s_dual_bus_enabled;
+static EdrEventBus *s_high_priority_bus;
+static EdrEventBus *s_low_priority_bus;
+
+static int edr_dual_bus_yes(const char *e) {
+  if (!e || !e[0]) {
+    return 0;
+  }
+  if (e[0] == '1' && e[1] == 0) {
+    return 1;
+  }
+  {
+    int a = (e[0] | 32);
+    return a == (int)'y' || a == (int)'t';
+  }
+}
+
+int edr_dual_bus_enabled(void) {
+  if (!s_dual_bus_enabled) {
+    s_dual_bus_enabled = edr_dual_bus_yes(getenv("EDR_DUAL_BUS_ENABLED")) ? 1 : -1;
+  }
+  return s_dual_bus_enabled > 0 ? 1 : 0;
+}
+
+EdrEventBus *edr_event_bus_create_dual(uint32_t high_priority_slot_count, uint32_t low_priority_slot_count) {
+  if (high_priority_slot_count < 2u || low_priority_slot_count < 2u) {
+    return NULL;
+  }
+  s_high_priority_bus = edr_event_bus_create(high_priority_slot_count);
+  if (!s_high_priority_bus) {
+    return NULL;
+  }
+  s_low_priority_bus = edr_event_bus_create(low_priority_slot_count);
+  if (!s_low_priority_bus) {
+    edr_event_bus_destroy(s_high_priority_bus);
+    s_high_priority_bus = NULL;
+    return NULL;
+  }
+  return s_high_priority_bus;
+}
+
+int edr_event_bus_try_push_dual(EdrBusType bus_type, const EdrEventSlot *slot) {
+  if (!slot) {
+    return 0;
+  }
+  EdrEventBus *target_bus = NULL;
+  if (bus_type == EDR_BUS_TYPE_HIGH_PRIORITY) {
+    target_bus = s_high_priority_bus;
+  } else if (bus_type == EDR_BUS_TYPE_LOW_PRIORITY) {
+    target_bus = s_low_priority_bus;
+  } else {
+    if (edr_is_high_value_event(slot)) {
+      target_bus = s_high_priority_bus;
+    } else {
+      target_bus = s_low_priority_bus;
+    }
+  }
+  if (!target_bus) {
+    return 0;
+  }
+  return edr_event_bus_try_push(target_bus, slot) ? 1 : 0;
+}
+
+bool edr_event_bus_try_pop_high_priority(EdrEventBus *bus, EdrEventSlot *out_slot) {
+  (void)bus;
+  if (!s_high_priority_bus) {
+    return false;
+  }
+  return edr_event_bus_try_pop(s_high_priority_bus, out_slot);
+}
+
+bool edr_event_bus_try_pop_low_priority(EdrEventBus *bus, EdrEventSlot *out_slot) {
+  (void)bus;
+  if (!s_low_priority_bus) {
+    return false;
+  }
+  return edr_event_bus_try_pop(s_low_priority_bus, out_slot);
+}
+
+uint32_t edr_event_bus_used_approx_high_priority(EdrEventBus *bus) {
+  (void)bus;
+  if (!s_high_priority_bus) {
+    return 0u;
+  }
+  return edr_event_bus_used_approx(s_high_priority_bus);
+}
+
+uint32_t edr_event_bus_used_approx_low_priority(EdrEventBus *bus) {
+  (void)bus;
+  if (!s_low_priority_bus) {
+    return 0u;
+  }
+  return edr_event_bus_used_approx(s_low_priority_bus);
+}
+
+uint64_t edr_event_bus_dropped_total_high_priority(EdrEventBus *bus) {
+  (void)bus;
+  if (!s_high_priority_bus) {
+    return 0u;
+  }
+  return edr_event_bus_dropped_total(s_high_priority_bus);
+}
+
+uint64_t edr_event_bus_dropped_total_low_priority(EdrEventBus *bus) {
+  (void)bus;
+  if (!s_low_priority_bus) {
+    return 0u;
+  }
+  return edr_event_bus_dropped_total(s_low_priority_bus);
+}

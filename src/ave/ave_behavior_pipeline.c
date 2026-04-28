@@ -95,6 +95,14 @@ static int bp_infer_immediate(const AVEBehaviorEvent *e) {
   return 0;
 }
 
+static int env_dynamic_threshold_enabled(void) {
+  const char *e = getenv("EDR_AVE_BEH_DYNAMIC_THRESHOLD");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;  // 默认启用
+}
+
 static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, const EdrPidHistory *sl) {
   if (bp_infer_immediate(e)) {
     return 1u;
@@ -103,6 +111,17 @@ static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, con
   if (sl->consecutive_medium_scores >= EDR_AVE_BEH_MEDIUM_RUN_LEN_FOR_STEP_TIGHT) {
     step = EDR_AVE_BEH_INFER_STEP_TIGHT;
   }
+  
+  // 动态调整：根据当前异常分数调整阈值（性能优化）
+  if (env_dynamic_threshold_enabled()) {
+    if (sl->anomaly < 0.1f) {
+      return step * 2;  // 低风险，降低推理频率
+    } else if (sl->anomaly > 0.7f) {
+      // 高风险，提高推理频率
+      return (step > 1) ? (step / 2) : step;
+    }
+  }
+  
   return step;
 }
 

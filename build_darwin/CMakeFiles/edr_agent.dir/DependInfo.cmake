@@ -44,6 +44,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/behavior_record.c" "CMakeFiles/edr_agent.dir/src/preprocess/behavior_record.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/behavior_record.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/dedup.c" "CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/emit_rules.c" "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o.d"
+  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/enrich_parent_info.c" "CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_direct_emit.c" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_ir_stub.c" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_match.c" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o.d"
