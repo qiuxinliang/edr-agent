@@ -4,6 +4,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+
+static int edr_get_process_path_by_pid(DWORD pid, char *out, size_t out_cap) {
+  if (!out || out_cap < 2) {
+    return -1;
+  }
+  *out = '\0';
+
+  HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!hProcess) {
+    return -1;
+  }
+
+  WCHAR wpath[MAX_PATH];
+  DWORD size = MAX_PATH;
+  if (!QueryFullProcessImageNameW(hProcess, 0, wpath, &size)) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  int n = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out, (int)out_cap - 1, NULL, NULL);
+  if (n > 0) {
+    out[n] = '\0';
+  }
+
+  CloseHandle(hProcess);
+  return 0;
+}
+#endif
+
 static uint64_t g_event_seq;
 
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
@@ -299,9 +330,15 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
       }
     }
-    if (!r->process_name[0] && ef.has_cmd && ef.cmd[0]) {
-      snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.cmd));
+
+    if (!r->process_name[0] && r->pid != 0) {
+      char process_path[MAX_PATH];
+      if (edr_get_process_path_by_pid((DWORD)r->pid, process_path, sizeof(process_path)) == 0 && process_path[0]) {
+        snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(process_path));
+        snprintf(r->exe_path, sizeof(r->exe_path), "%s", process_path);
+      }
     }
+    
     if (ef.has_pimg) {
       snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.pimg);
       snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.pimg));
