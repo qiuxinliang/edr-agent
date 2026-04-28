@@ -9,6 +9,11 @@
 #include "edr/error.h"
 #include "edr/event_bus.h"
 #include "edr/types.h"
+
+#include <guiddef.h>
+#include <basetsd.h>
+#include <initguid.h>
+
 #include <evntcons.h>
 #include <stdint.h>
 
