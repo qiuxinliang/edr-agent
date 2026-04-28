@@ -10,25 +10,7 @@
 #include <windows.h>
 
 #include <evntcons.h>
-
-#if defined(_MSC_VER)
-#pragma push_macro("WIN32_LEAN_AND_MEAN")
-#undef WIN32_LEAN_AND_MEAN
-#endif
-
-#if defined(__has_include)
-#if __has_include(<evnttrace.h>)
 #include <evnttrace.h>
-#else
-#include "edr/evnttrace_stub.h"
-#endif
-#else
-#include <evnttrace.h>
-#endif
-
-#if defined(_MSC_VER)
-#pragma pop_macro("WIN32_LEAN_AND_MEAN")
-#endif
 
 #include "edr/collector.h"
 #include "edr/config.h"
