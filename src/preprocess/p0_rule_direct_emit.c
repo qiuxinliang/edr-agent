@@ -274,6 +274,76 @@ static int getenv_int01_disabled_on_zero(const char *k) {
 
 static float sev3_anomaly(void) { return 0.40f + 0.10f * 3.0f; }
 
+/**
+ * RFC 8259 JSON string escape into out. max_in caps raw input bytes (0 = use full C string until NUL).
+ * Returns 1 on success; 0 if output buffer too small — caller should treat as empty string.
+ */
+static int p0_json_escape(const char *in, char *out, size_t out_cap, size_t max_in) {
+  if (!out || out_cap < 2u) {
+    return 0;
+  }
+  if (!in) {
+    in = "";
+  }
+  size_t lim = max_in > 0 ? max_in : strlen(in);
+  size_t w = 0;
+  for (size_t n = 0; n < lim && in[n]; n++) {
+    if (w + 8u >= out_cap) {
+      return 0;
+    }
+    unsigned char c = (unsigned char)in[n];
+    switch (c) {
+      case '"':
+        out[w++] = '\\';
+        out[w++] = '"';
+        break;
+      case '\\':
+        out[w++] = '\\';
+        out[w++] = '\\';
+        break;
+      case '\b':
+        memcpy(out + w, "\\b", 2u);
+        w += 2u;
+        break;
+      case '\f':
+        memcpy(out + w, "\\f", 2u);
+        w += 2u;
+        break;
+      case '\n':
+        memcpy(out + w, "\\n", 2u);
+        w += 2u;
+        break;
+      case '\r':
+        memcpy(out + w, "\\r", 2u);
+        w += 2u;
+        break;
+      case '\t':
+        memcpy(out + w, "\\t", 2u);
+        w += 2u;
+        break;
+      default:
+        if (c < 0x20u) {
+          int k = snprintf((char *)out + w, out_cap - w, "\\u%04x", (unsigned)c);
+          if (k < 0 || (size_t)k >= out_cap - w) {
+            return 0;
+          }
+          w += (size_t)k;
+        } else {
+          out[w++] = (char)c;
+        }
+        break;
+    }
+  }
+  out[w] = '\0';
+  return 1;
+}
+
+static void p0_json_escape_or_empty(const char *in, char *out, size_t out_cap, size_t max_in) {
+  if (!p0_json_escape(in, out, out_cap, max_in)) {
+    out[0] = '\0';
+  }
+}
+
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const char *title,
                         const char *mitre_comma) {
   static int s_debug_enabled = -1;
@@ -307,79 +377,74 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
   a.skip_ai_analysis = true;
   a.needs_l2_review = false;
 
-  /* 增强user_subject_json，添加完整上下文以支持服务端关联分析 */
+  /* user_subject_json：所有嵌入字符串必须 JSON 转义，否则 \\ 未写成 \\\\ 会导致非法 JSON，ingest 不入库、标题退回默认。 */
   {
-    char cmdline_esc[2048] = {0};
-    char parent_name_esc[512] = {0};
-    char parent_path_esc[1024] = {0};
-    char username_esc[512] = {0};
-    char exe_hash_esc[128] = {0};
+    char esc_rule_id[80];
+    char esc_bundle[160];
+    char esc_title[640];
+    char esc_proc[384];
+    char esc_exe[1024];
+    char cmdline_esc[2048];
+    char esc_exe_hash[160];
+    char esc_path_hash[160];
+    char parent_name_esc[384];
+    char parent_path_esc[1024];
+    char esc_parent_cmdline[2048];
+    char esc_gp[256];
+    char username_esc[512];
+    char esc_ep[96];
+    char esc_tenant[96];
+    char esc_host[256];
+    char esc_domain[256];
+    char esc_cwd[512];
+    char esc_il[96];
+    char esc_pct[192];
+    char esc_ppt[192];
+    char esc_child[384];
+    char esc_psb[1024];
+    char esc_clo[256];
+    char esc_ect[96];
 
-    if (br->cmdline) {
-      for (size_t i = 0, j = 0; i < strlen(br->cmdline) && j < sizeof(cmdline_esc) - 1; i++) {
-        char c = br->cmdline[i];
-        if (c == '\\') {
-          cmdline_esc[j++] = '\\';
-          cmdline_esc[j++] = '\\';
-        } else if (c == '"') {
-          cmdline_esc[j++] = '\\';
-          cmdline_esc[j++] = '"';
-        } else {
-          cmdline_esc[j++] = c;
-        }
-      }
-    }
-    if (br->parent_name) {
-      for (size_t i = 0, j = 0; i < strlen(br->parent_name) && j < sizeof(parent_name_esc) - 1; i++) {
-        char c = br->parent_name[i];
-        if (c == '\\') {
-          parent_name_esc[j++] = '\\';
-          parent_name_esc[j++] = '\\';
-        } else if (c == '"') {
-          parent_name_esc[j++] = '\\';
-          parent_name_esc[j++] = '"';
-        } else {
-          parent_name_esc[j++] = c;
-        }
-      }
-    }
-    if (br->parent_path) {
-      for (size_t i = 0, j = 0; i < strlen(br->parent_path) && j < sizeof(parent_path_esc) - 1; i++) {
-        char c = br->parent_path[i];
-        if (c == '\\') {
-          parent_path_esc[j++] = '\\';
-          parent_path_esc[j++] = '\\';
-        } else if (c == '"') {
-          parent_path_esc[j++] = '\\';
-          parent_path_esc[j++] = '"';
-        } else {
-          parent_path_esc[j++] = c;
-        }
-      }
-    }
-    if (br->username) {
-      for (size_t i = 0, j = 0; i < strlen(br->username) && j < sizeof(username_esc) - 1; i++) {
-        char c = br->username[i];
-        if (c == '\\') {
-          username_esc[j++] = '\\';
-          username_esc[j++] = '\\';
-        } else if (c == '"') {
-          username_esc[j++] = '\\';
-          username_esc[j++] = '"';
-        } else {
-          username_esc[j++] = c;
-        }
-      }
-    }
-    if (br->exe_hash) {
-      snprintf(exe_hash_esc, sizeof(exe_hash_esc), "%s", br->exe_hash);
-    }
-
-    /* 如果缺少父进程信息，通过API补充 */
+    /* 如果缺少父进程信息，通过API补充（须在 JSON 转义前填充 br） */
     if (!br->parent_name[0] && br->ppid > 0) {
-      enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name),
-                               br->parent_path, sizeof(br->parent_path));
+      enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name), br->parent_path,
+                                sizeof(br->parent_path));
     }
+
+    p0_json_escape_or_empty(rule_id, esc_rule_id, sizeof(esc_rule_id), 48);
+    p0_json_escape_or_empty(EDR_P0_RULES_BUNDLE_VERSION, esc_bundle, sizeof(esc_bundle), 128);
+    p0_json_escape_or_empty(title ? title : "", esc_title, sizeof(esc_title), 240);
+    p0_json_escape_or_empty(br->process_name ? br->process_name : "", esc_proc, sizeof(esc_proc), 160);
+    p0_json_escape_or_empty(br->exe_path[0] ? br->exe_path : "", esc_exe, sizeof(esc_exe), 400);
+    p0_json_escape_or_empty(br->cmdline ? br->cmdline : "", cmdline_esc, sizeof(cmdline_esc), 480);
+    p0_json_escape_or_empty(br->exe_hash[0] ? br->exe_hash : "", esc_exe_hash, sizeof(esc_exe_hash), 96);
+    p0_json_escape_or_empty(br->process_path_hash[0] ? br->process_path_hash : "", esc_path_hash,
+                            sizeof(esc_path_hash), 96);
+    p0_json_escape_or_empty(br->parent_name[0] ? br->parent_name : "", parent_name_esc, sizeof(parent_name_esc),
+                            160);
+    p0_json_escape_or_empty(br->parent_path[0] ? br->parent_path : "", parent_path_esc, sizeof(parent_path_esc),
+                            400);
+    p0_json_escape_or_empty(br->parent_cmdline[0] ? br->parent_cmdline : "", esc_parent_cmdline,
+                            sizeof(esc_parent_cmdline), 480);
+    p0_json_escape_or_empty(br->grandparent_name[0] ? br->grandparent_name : "", esc_gp, sizeof(esc_gp), 128);
+    p0_json_escape_or_empty(br->username[0] ? br->username : "", username_esc, sizeof(username_esc), 160);
+    p0_json_escape_or_empty(br->endpoint_id[0] ? br->endpoint_id : "", esc_ep, sizeof(esc_ep), 80);
+    p0_json_escape_or_empty(br->tenant_id[0] ? br->tenant_id : "", esc_tenant, sizeof(esc_tenant), 64);
+    p0_json_escape_or_empty(br->hostname[0] ? br->hostname : "", esc_host, sizeof(esc_host), 128);
+    p0_json_escape_or_empty(br->domain[0] ? br->domain : "", esc_domain, sizeof(esc_domain), 128);
+    p0_json_escape_or_empty(br->current_directory[0] ? br->current_directory : "", esc_cwd, sizeof(esc_cwd), 240);
+    p0_json_escape_or_empty(br->integrity_level[0] ? br->integrity_level : "Unknown", esc_il, sizeof(esc_il), 48);
+    p0_json_escape_or_empty(br->process_creation_time[0] ? br->process_creation_time : "", esc_pct, sizeof(esc_pct),
+                            96);
+    p0_json_escape_or_empty(br->parent_creation_time[0] ? br->parent_creation_time : "", esc_ppt, sizeof(esc_ppt),
+                            96);
+    p0_json_escape_or_empty(br->child_pids[0] ? br->child_pids : "", esc_child, sizeof(esc_child), 160);
+    p0_json_escape_or_empty(br->powershell_script_block[0] ? br->powershell_script_block : "", esc_psb,
+                            sizeof(esc_psb), 360);
+    p0_json_escape_or_empty(br->command_line_origin[0] ? br->command_line_origin : "", esc_clo, sizeof(esc_clo),
+                            96);
+    p0_json_escape_or_empty(br->encoded_command_type[0] ? br->encoded_command_type : "", esc_ect, sizeof(esc_ect),
+                            64);
 
     int n = snprintf(
         a.user_subject_json, sizeof(a.user_subject_json),
@@ -419,37 +484,37 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
           "\"encoded_command_type\":\"%s\""
         "}"
         "}",
-        rule_id,
-        EDR_P0_RULES_BUNDLE_VERSION,
-        title ? title : "",
+        esc_rule_id,
+        esc_bundle,
+        esc_title,
         br->pid,
         br->ppid,
-        br->process_name ? br->process_name : "",
-        br->exe_path[0] ? br->exe_path : "",
+        esc_proc,
+        esc_exe,
         cmdline_esc,
-        exe_hash_esc,
-        br->process_path_hash[0] ? br->process_path_hash : "",
+        esc_exe_hash,
+        esc_path_hash,
         parent_name_esc,
         parent_path_esc,
-        br->parent_cmdline[0] ? br->parent_cmdline : "",
-        br->grandparent_name[0] ? br->grandparent_name : "",
+        esc_parent_cmdline,
+        esc_gp,
         username_esc,
         br->process_chain_depth,
-        br->endpoint_id[0] ? br->endpoint_id : "",
-        br->tenant_id[0] ? br->tenant_id : "",
+        esc_ep,
+        esc_tenant,
         (int)br->type,
-        br->hostname[0] ? br->hostname : "",
-        br->domain[0] ? br->domain : "",
-        br->current_directory[0] ? br->current_directory : "",
+        esc_host,
+        esc_domain,
+        esc_cwd,
         (unsigned long long)br->logon_time_ns,
-        br->integrity_level[0] ? br->integrity_level : "Unknown",
+        esc_il,
         br->token_elevation,
-        br->process_creation_time[0] ? br->process_creation_time : "",
-        br->parent_creation_time[0] ? br->parent_creation_time : "",
-        br->child_pids[0] ? br->child_pids : "",
-        br->powershell_script_block[0] ? br->powershell_script_block : "",
-        br->command_line_origin[0] ? br->command_line_origin : "",
-        br->encoded_command_type[0] ? br->encoded_command_type : "");
+        esc_pct,
+        esc_ppt,
+        esc_child,
+        esc_psb,
+        esc_clo,
+        esc_ect);
     if (n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
       a.user_subject_json[0] = 0;
       return 0;
