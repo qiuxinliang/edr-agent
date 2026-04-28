@@ -316,6 +316,12 @@ static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
       *out_type = EDR_EVENT_DLL_LOAD;
       return;
     }
+    /* opcode 32-36: ImageLoad/ImageUnload/HyperCallPage/etc.
+     * ImageFileName 此时返回被加载的模块路径（DLL），不应归为进程创建。 */
+    if (op >= 32 && op <= 36) {
+      *out_type = EDR_EVENT_DLL_LOAD;
+      return;
+    }
     *out_type = EDR_EVENT_PROCESS_CREATE;
     return;
   }

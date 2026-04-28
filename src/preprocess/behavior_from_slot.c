@@ -294,7 +294,10 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
     if (ef.has_img) {
       snprintf(r->exe_path, sizeof(r->exe_path), "%s", ef.img);
-      snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
+      /* DLL/DRIVER 加载事件：img 是模块路径而非进程路径，不应作为 process_name */
+      if (r->type != EDR_EVENT_DLL_LOAD && r->type != EDR_EVENT_DRIVER_LOAD) {
+        snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
+      }
     }
     if (ef.has_pimg) {
       snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.pimg);

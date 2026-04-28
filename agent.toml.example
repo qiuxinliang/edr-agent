@@ -50,24 +50,35 @@ tenant_id            = "tenant_default"
 [collection]
 # WP-8：可观测 profile / 与 P0 会签的边界 — docs/WP8_ETW_COLLECTION_PROFILE.md；合规基线 env 见 config/profiles/wp8_compliance_baseline.env.example
 etw_enabled          = true
-# Windows A4.3 + §19.10：各可选 Provider 独立开关（默认 true）。Kernel-Process/File/Net/Reg 为 mandatory 不可关。
-# 关闭 DNS / PS / Sec / WMI 前请对照 `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` 与 P0 规则，避免无计划漏报。
-# etw_dns_client_provider   = true
-# etw_powershell_provider   = true
-# etw_security_audit_provider = true
-# etw_wmi_provider         = true
-# Windows §19.10：Microsoft-Windows-TCPIP / WFAS 防火墙 ETW（需管理员；失败时跳过并打日志）
-etw_tcpip_provider   = true
-etw_firewall_provider = true
+# Windows A4.3 + §19.10：各可选 Provider 独立开关。Kernel-Process/File/Net/Reg 为 mandatory 不可关。
+#
+# ===== 高噪 Provider：默认关闭，按需打开（与安全团队会签后） =====
+# DNS Client：事件量极大（1000+/s），非 DNS 隧道检测场景建议保持关闭
+etw_dns_client_provider   = false
+# WMI Activity：事件量中-高，多数 P0 规则不依赖 WMI 原始事件
+etw_wmi_provider          = false
+# TCPIP：事件量极大，仅攻击面检测需要；关闭不影响进程/文件/网络核心采集
+etw_tcpip_provider        = false
+# WFAS 防火墙：事件量中-高，仅攻击面检测需要
+etw_firewall_provider     = false
+#
+# ===== 推荐保留的 Provider =====
+# PowerShell：脚本类 P0 规则依赖，量中低，建议保留
+etw_powershell_provider   = true
+# Security Audit（4624/4688 等）：登录、进程创建审计，合规基线建议保留
+etw_security_audit_provider = true
+#
 ebpf_enabled         = true
 poll_interval_s      = 1
 max_event_queue_size = 4096
 # Windows 实时 ETW 会话：每缓冲大小（KB）与刷写周期（秒）；0=默认 64/1。亦可 EDR_ETW_BUFFER_KB / EDR_ETW_FLUSH_TIMER_S（见 README · A4.2）
 # etw_buffer_kb        = 64
-# etw_flush_timer_s    = 1
+# 降低 ETW 刷写频率以减少回调 CPU 开销；默认 3s（与延迟折中，安全敏感服务器可调回 1）
+etw_flush_timer_s    = 3
 
 [preprocessing]
-# 稍长去重窗 + 略严秒级频控 + 略低白名单抽样，减轻高噪机通信与平台 endpoint_events 压力（与 wp2_prod 联调）
+# 去重窗口：90s（关闭高噪 Provider 后事件量大幅下降，可适当放宽以保留更多行为特征）
+# 高频阈值：30/秒/PID（高于此值视为突刺，触发限流）
 dedup_window_s       = 90
 high_freq_threshold  = 30
 sampling_rate_whitelist = 0.02

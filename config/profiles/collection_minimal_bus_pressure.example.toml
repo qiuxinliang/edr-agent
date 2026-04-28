@@ -35,3 +35,6 @@ etw_buffer_kb = 64
 etw_flush_timer_s = 3
 
 # —— 若仍高：再单步将 etw_powershell_provider / etw_security_audit_provider 改为 false，并记录实验窗口与回滚。 ——
+#
+# —— 若 ONNX 推理 CPU 高：配合环境变量 EDR_AVE_ETW_FEED_EVERY_N=4 做 AVE 分频 ——
+# —— 参见 config/profiles/wp9_behavior_ave.env.example ——

@@ -480,14 +480,24 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   const char *par = br->parent_name[0] ? br->parent_name : NULL;
   int ch = (int)br->process_chain_depth;
 
-  /* 添加调试日志：显示收到的进程创建事件 */
+  /* 调试日志：仅打印含有效数据的 P0 事件，统计空事件（原因：TDH 未产生 img/cmd 行） */
   static int s_debug_enabled = -1;
+  static uint64_t s_debug_empty_count;
   if (s_debug_enabled < 0) {
     s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
   }
   if (s_debug_enabled) {
-    fprintf(stderr, "[P0 DEBUG] event: type=%d pid=%u process=%s cmdline=%s\n",
-            br->type, br->pid, pn ? pn : "(null)", cmd ? cmd : "(null)");
+    int has_data = ((pn && pn[0]) || (cmd && cmd[0]));
+    if (has_data) {
+      fprintf(stderr, "[P0 DEBUG] event: type=%d pid=%u process=%s cmdline=%s\n",
+              br->type, br->pid, pn ? pn : "(null)", cmd ? cmd : "(null)");
+    } else {
+      s_debug_empty_count++;
+      if (s_debug_empty_count == 1u || (s_debug_empty_count & 1023u) == 0u) {
+        fprintf(stderr, "[P0 DEBUG] empty events skipped (no img/cmd): count=%llu (last: type=%d pid=%u)\n",
+                (unsigned long long)s_debug_empty_count, br->type, br->pid);
+      }
+    }
   }
 
   edr_p0_rule_ir_lazy_init();

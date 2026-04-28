@@ -189,6 +189,7 @@ CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.o: /Users/qiuxi
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_size_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_wchar_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/ptrcheck.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdatomic.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h \
@@ -197,6 +198,8 @@ CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.o: /Users/qiuxi
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/p0_rule_match.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h
 
+
+/Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdatomic.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_rsize_t.h:
 
