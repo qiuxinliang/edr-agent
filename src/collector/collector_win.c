@@ -9,7 +9,6 @@
 
 #include <windows.h>
 
-#include <evntcons.h>
 #include "edr/evnttrace_stub.h"
 
 #include "edr/collector.h"
@@ -505,7 +504,7 @@ static int is_low_value_file_write_path(const char *path) {
     "\\Recycler\\",
     "\\System Volume Information\\",
     "\\Windows\\WinSxS\\",
-    "\\Microsoft\\Windows\Installer\\",
+    "\\Microsoft\\Windows\\Installer\\",
     "\\Prefetch\\",
     "\\Offline Web Pages\\",
   };

@@ -100,6 +100,11 @@ if(EDR_ENABLE_ARCH_OPTIMIZATION)
 endif()
 
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
+# 暂时停用 gRPC 客户端（grpc_client_impl、protobuf 生成码、gRPC++ 链接）。恢复编译时：置 0 并删除本段。
+set(EDR_GRPC_BUILD_SUSPENDED 1)
+if(EDR_GRPC_BUILD_SUSPENDED)
+  set(EDR_WITH_GRPC OFF CACHE BOOL "Build with gRPC++ EventIngest client (mTLS)" FORCE)
+endif()
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 list(APPEND CMAKE_PREFIX_PATH
   /usr/local/opt/grpc
