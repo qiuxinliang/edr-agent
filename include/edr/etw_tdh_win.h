@@ -15,6 +15,7 @@
 #include <guiddef.h>
 #include <basetsd.h>
 #include <initguid.h>
+#include <ntdef.h>
 
 #include <evntcons.h>
 

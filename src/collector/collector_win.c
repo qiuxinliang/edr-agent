@@ -15,9 +15,9 @@
 #include <guiddef.h>
 #include <basetsd.h>
 #include <initguid.h>
-
+#include <ntdef.h>
 #include <evntcons.h>
-#include <evnttrace.h>
+#include <evntrace.h>
 
 #include "edr/collector.h"
 #include "edr/config.h"
