@@ -247,14 +247,6 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
   return v;
 }
 
-int edr_getenv_int_default(const char *key, int defv) {
-  const char *v = getenv(key);
-  if (!v || !v[0]) {
-    return defv;
-  }
-  return atoi(v);
-}
-
 static double getenv_double_default(const char *key, double defv) {
   const char *v = getenv(key);
   if (!v || !v[0]) {

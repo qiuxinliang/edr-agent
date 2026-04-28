@@ -246,6 +246,7 @@ set(EDR_AGENT_SOURCES
   src/preprocess/p0_rule_match.c
   src/preprocess/p0_rule_direct_emit.c
   src/preprocess/preprocess_pipeline.c
+  src/preprocess/preprocess_env.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c
   src/serialize/behavior_alert_emit.c
@@ -830,6 +831,7 @@ if(EDR_P0_IR_PCRE2)
     APPEND
     _EDR_P0_GOLDEN_SRCS
     src/preprocess/p0_rule_ir.c
+    src/preprocess/preprocess_env.c
     third_party/cjson/cJSON.c
   )
 else()
@@ -953,6 +955,7 @@ if(EDR_P0_IR_PCRE2)
     APPEND
     _EDR_P0_REC_SRCS
     src/preprocess/p0_rule_ir.c
+    src/preprocess/preprocess_env.c
     third_party/cjson/cJSON.c
   )
   add_executable(edr_p0_ir_record_golden_test ${_EDR_P0_REC_SRCS})
