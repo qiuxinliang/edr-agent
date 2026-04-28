@@ -161,9 +161,9 @@ static CRITICAL_SECTION s_a44_aggr_lock;
 static EdrEventSlot *s_a44_aggr_buf;
 static uint32_t s_a44_aggr_cap;
 static uint32_t s_a44_aggr_count;
-static volatile uint64_t s_a44_aggr_total_count;
-static volatile uint64_t s_a44_aggr_flush_count;
-static volatile int64_t s_a44_aggr_last_flush_ns;
+static volatile LONG64 s_a44_aggr_total_count;
+static volatile LONG64 s_a44_aggr_flush_count;
+static volatile LONG64 s_a44_aggr_last_flush_ns;
 static CRITICAL_SECTION s_a44_mempool_lock;
 static void **s_a44_mempool_blocks;
 static uint32_t s_a44_mempool_item_size;
@@ -704,7 +704,7 @@ int edr_a44_aggr_flush(void) {
     ULARGE_INTEGER u;
     u.LowPart = ft.dwLowDateTime;
     u.HighPart = ft.dwHighDateTime;
-    (void)InterlockedExchange64(&s_a44_aggr_last_flush_ns, (int64_t)(u.QuadPart * 100));
+    (void)InterlockedExchange64(&s_a44_aggr_last_flush_ns, (LONG64)((uint64_t)u.QuadPart * 100ULL));
     (void)count;
     return 0;
 }

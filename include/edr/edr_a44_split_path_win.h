@@ -132,6 +132,7 @@ typedef struct {
     uint64_t total_bus_push_ns;
     uint64_t bus_push_count;
     uint64_t avg_bus_push_ns;
+    uint64_t max_bus_push_ns;
 } EdrA44PerfProfile;
 
 int edr_a44_get_perf_profile(EdrA44PerfProfile *out_profile);
