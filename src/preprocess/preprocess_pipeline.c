@@ -321,13 +321,43 @@ static int process_name_looks_like_exe(const char *name) {
   len = strlen(name);
   if (len < 5) return 0;
   {
-    const char *s = name + len - 4;
-    char c0 = (char)(s[0] | 32);
-    char c1 = (char)(s[1] | 32);
-    char c2 = (char)(s[2] | 32);
-    char c3 = (char)(s[3] | 32);
-    return c0 == '.' && c1 == 'e' && c2 == 'x' && c3 == 'e';
+    const char *ext = name + len - 4;
+    char c0 = (char)(ext[0] | 32);
+    char c1 = (char)(ext[1] | 32);
+    char c2 = (char)(ext[2] | 32);
+    char c3 = (char)(ext[3] | 32);
+    if (c0 == '.' && c1 == 'e' && c2 == 'x' && c3 == 'e') return 1;
+    if (c0 == '.' && c1 == 'c' && c2 == 'o' && c3 == 'm') return 1;
+    if (c0 == '.' && c1 == 'b' && c2 == 'a' && c3 == 't') return 1;
+    if (c0 == '.' && c1 == 'c' && c2 == 'm' && c3 == 'd') return 1;
+    if (c0 == '.' && c1 == 'p' && c2 == 's' && c3 == '1') return 1;
+    if (c0 == '.' && c1 == 'p' && c2 == 's' && c3 == '2') return 1;
+    if (c0 == '.' && c1 == 'v' && c2 == 'b' && c3 == 's') return 1;
+    if (c0 == '.' && c1 == 'j' && c2 == 's' && c3 == 's') return 1;
+    if (c0 == '.' && c1 == 'j' && c2 == 's' && c3 == 'e') return 1;
+    if (c0 == '.' && c1 == 'v' && c2 == 'b' && c3 == 'e') return 1;
+    if (c0 == '.' && c1 == 'w' && c2 == 's' && c3 == 'f') return 1;
+    if (c0 == '.' && c1 == 'w' && c2 == 's' && c3 == 'h') return 1;
+    if (c0 == '.' && c1 == 'm' && c2 == 's' && c3 == 'i') return 1;
+    if (c0 == '.' && c1 == 'm' && c2 == 's' && c3 == 'p') return 1;
+    if (c0 == '.' && c1 == 'm' && c2 == 's' && c3 == 'c') return 1;
+    if (c0 == '.' && c1 == 'c' && c2 == 'p' && c3 == 'l') return 1;
+    if (c0 == '.' && c1 == 'c' && c2 == 'x' && c3 == 'x') return 1;
+    if (c0 == '.' && c1 == 'g' && c2 == 'a' && c3 == 'd') return 1;
+    if (c0 == '.' && c1 == 'r' && c2 == 'e' && c3 == 'g') return 1;
+    if (c0 == '.' && c1 == 's' && c2 == 'c' && c3 == 'f') return 1;
+    if (c0 == '.' && c1 == 'i' && c2 == 'n' && c3 == 'i') return 1;
+    if (c0 == '.' && c1 == 'l' && c2 == 'n' && c3 == 'k') return 1;
+    if (c0 == '.' && c1 == 'p' && c2 == 'i' && c3 == 'f') return 1;
+    if (c0 == '.' && c1 == 's' && c2 == 'c' && c3 == 'r') return 1;
+    if (c0 == '.' && c1 == 'h' && c2 == 't' && c3 == 'a') return 1;
+    if (c0 == '.' && c1 == 'a' && c2 == 'p' && c3 == 'p') return 1;
+    if (c0 == '.' && c1 == 'a' && c2 == 'p' && c3 == 'p' && len > 4) {
+      char c4 = (char)(name[len - 5] | 32);
+      if (c4 == 'x' || c4 == 'e') return 1;
+    }
   }
+  return 0;
 }
 
 static void process_one_slot(const EdrEventSlot *slot) {

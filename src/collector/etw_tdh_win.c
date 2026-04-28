@@ -24,6 +24,62 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef NTSTATUS
+typedef LONG NTSTATUS;
+#endif
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#endif
+#ifndef ProcessBasicInformation
+#define ProcessBasicInformation 0
+#endif
+#ifndef ProcessParameters
+#define ProcessParameters 0x21
+#endif
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS {
+    ULONG   MaximumLength;
+    ULONG   InitialValue;
+    PVOID   ProcessEnvironmentBlock;
+    ULONG   SubSystemKey;
+    UNICODE_STRING CurrentDirectoryName;
+    HANDLE  CurrentDirectoryHandle;
+    UNICODE_STRING DllPath;
+    UNICODE_STRING ImagePathName;
+    UNICODE_STRING CommandLine;
+} RTL_USER_PROCESS_PARAMETERS;
+
+typedef struct _PEB {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    PVOID Reserved3[2];
+    PVOID AtlanticCityServiceFlags;
+    PVOID ImageBaseAddress;
+    RTL_USER_PROCESS_PARAMETERS *ProcessParameters;
+    BYTE Reserved4[104];
+    PVOID Reserved5[52];
+    PVOID PostProcessInitRoutine;
+    BYTE Reserved6[128];
+    PVOID Reserved7[1];
+    ULONG SessionId;
+} PEB;
+
+typedef struct _PROCESS_BASIC_INFORMATION {
+    PVOID ExitStatus;
+    PEB *PebBaseAddress;
+    PVOID AffinityMask;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION;
+
 /* A3.3：可选轻量 TDH（默认关）。=1 时 Microsoft-Windows-DNS-Client 在已解析出 qname 时跳过 QueryType 试探。 */
 static int edr_tdh_light_path_a33_enabled(void) {
   const char *e = getenv("EDR_TDH_LIGHT_PATH");
@@ -274,6 +330,80 @@ static void edr_try_append_naux_for_net(PEVENT_RECORD rec, char *out, size_t out
   }
 }
 
+static int edr_get_process_cmdline_by_pid(DWORD pid, char *out, size_t out_cap) {
+  if (!out || out_cap < 2) {
+    return -1;
+  }
+  *out = '\0';
+
+  HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+  if (!hProcess) {
+    return -1;
+  }
+
+  typedef NTSTATUS (WINAPI *PNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+  static PNtQueryInformationProcess pNtQueryInformationProcess = NULL;
+  if (!pNtQueryInformationProcess) {
+    pNtQueryInformationProcess = (PNtQueryInformationProcess)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!pNtQueryInformationProcess) {
+      CloseHandle(hProcess);
+      return -1;
+    }
+  }
+
+  PROCESS_BASIC_INFORMATION pbi;
+  NTSTATUS status = pNtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
+  if (status != STATUS_SUCCESS || !pbi.PebBaseAddress) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  PEB peb;
+  if (!ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), NULL)) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  if (!peb.ProcessParameters) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  RTL_USER_PROCESS_PARAMETERS params;
+  if (!ReadProcessMemory(hProcess, peb.ProcessParameters, &params, sizeof(params), NULL)) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  if (!params.CommandLine.Buffer || params.CommandLine.Length == 0) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  WCHAR *wcmd = (WCHAR *)malloc(params.CommandLine.Length + sizeof(WCHAR));
+  if (!wcmd) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  if (!ReadProcessMemory(hProcess, params.CommandLine.Buffer, wcmd, params.CommandLine.Length, NULL)) {
+    free(wcmd);
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  int n = WideCharToMultiByte(CP_UTF8, 0, wcmd, params.CommandLine.Length / sizeof(WCHAR),
+                             out, (int)out_cap - 1, NULL, NULL);
+  if (n > 0) {
+    out[n] = '\0';
+  }
+
+  free(wcmd);
+  CloseHandle(hProcess);
+  return 0;
+}
+
 static void edr_fallback_raw(PEVENT_RECORD rec, uint8_t *out, size_t out_cap,
                              size_t *written) {
   USHORT n = rec->UserDataLength;
@@ -357,6 +487,9 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"CommandLine", "cmd"},
       {L"IpAddress", "ip"},
       {L"WorkstationName", "ws"},
+      {L"ParentProcessName", "pimg"},
+      {L"ProcessId", "epid"},
+      {L"ParentProcessId", "ppid"},
   };
   static const EdrPropTry wmi_try[] = {
       {L"Query", "query"},
@@ -455,6 +588,17 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   } else if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, wf_try, sizeof(wf_try) / sizeof(wf_try[0]), line, sizeof(line),
                        (char *)out, out_cap, &off);
+  }
+
+  const GUID *provider_g = &rec->EventHeader.ProviderId;
+  if ((memcmp(provider_g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 ||
+       memcmp(provider_g, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) &&
+      strstr((const char *)out, "\ncmd=") == NULL) {
+    char cmd_fallback[8192];
+    if (edr_get_process_cmdline_by_pid(rec->EventHeader.ProcessId, cmd_fallback, sizeof(cmd_fallback)) == 0 &&
+        cmd_fallback[0]) {
+      append_utf8((char *)out, out_cap, &off, "cmd=%s\n", cmd_fallback);
+    }
   }
 
   if (off == off_after_hdr && rec->UserDataLength > 0) {
