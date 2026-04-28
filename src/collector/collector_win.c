@@ -533,6 +533,12 @@ static int should_collect_file_read(const char *payload, size_t payload_len) {
   file_path[copy_len] = '\0';
   char *newline = strchr(file_path, '\n');
   if (newline) *newline = '\0';
+
+  char *colon = strchr(file_path, ':');
+  if (colon && (strcmp(colon, ":WofCompressedData") == 0 || strcmp(colon, ":Zone.Identifier") == 0)) {
+    return 0;
+  }
+
   return is_high_risk_file_read_path(file_path);
 }
 
@@ -553,6 +559,12 @@ static int should_collect_file_write(const char *payload, size_t payload_len) {
   file_path[copy_len] = '\0';
   char *newline = strchr(file_path, '\n');
   if (newline) *newline = '\0';
+
+  char *colon = strchr(file_path, ':');
+  if (colon && (strcmp(colon, ":WofCompressedData") == 0 || strcmp(colon, ":Zone.Identifier") == 0)) {
+    return 0;
+  }
+
   return !is_low_value_file_write_path(file_path);
 }
 
@@ -889,7 +901,7 @@ static void edr_collector_tdh_to_bus(PEVENT_RECORD rec, EdrEventType ty, const c
   if (ty == EDR_EVENT_FILE_READ && !should_collect_file_read((const char *)slot.data, plen)) {
     return;
   }
-  if ((ty == EDR_EVENT_FILE_WRITE || ty == EDR_EVENT_FILE_DELETE) &&
+  if ((ty == EDR_EVENT_FILE_WRITE || ty == EDR_EVENT_FILE_DELETE || ty == EDR_EVENT_FILE_CREATE || ty == EDR_EVENT_FILE_RENAME) &&
       !should_collect_file_write((const char *)slot.data, plen)) {
     return;
   }

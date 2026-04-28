@@ -133,22 +133,18 @@ static int str_ieq_ascii(const char *a, const char *b) {
 }
 
 static int process_name_in_gate_allowlist(const char *name) {
-  /* procname_gate 白名单：只采集高风险进程的完整行为
+  /* procname_gate 白名单：只采集最高风险进程的完整行为
    * 可通过环境变量 EDR_PROCNAME_GATE_WHITELIST 覆盖
-   * 默认配置包含常见攻击工具和脚本解释器
+   * 默认配置仅包含最关键的攻击工具（精简版）
    */
   static const char *const kDefaultHotProcNames[] = {
       // 脚本引擎 (最高风险)
       "powershell.exe",
       "pwsh.exe",
-      "cmd.exe",
-      "wscript.exe",
-      "cscript.exe",
       // 可执行文件生成/下载 (高风险)
       "mshta.exe",
       "rundll32.exe",
       "regsvr32.exe",
-      "msiexec.exe",
       "cmstp.exe",
       "msbuild.exe",
       "certutil.exe",
@@ -156,23 +152,6 @@ static int process_name_in_gate_allowlist(const char *name) {
       // 下载/网络工具
       "curl.exe",
       "wget.exe",
-      "ftp.exe",
-      "nc.exe",
-      "netcat.exe",
-      // 渗透/远程工具
-      "psexec.exe",
-      "PsExec64.exe",
-      "wmic.exe",
-      "atbroker.exe",
-      "cmdex.exe",
-      // 脚本语言
-      "python.exe",
-      "python3.exe",
-      "perl.exe",
-      "ruby.exe",
-      "java.exe",
-      "javaw.exe",
-      "node.exe",
   };
   static const char *s_custom_whitelist = NULL;
   static char *s_whitelist_copy = NULL;
@@ -285,16 +264,16 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
     s_l2_unmatched_keep_ratio = 0.10;
   }
 
-  s_l3_pressure_enabled = edr_getenv_int_default("EDR_PREPROCESS_L3_PRESSURE", 0) == 1 ? 1 : 0;
-  s_l3_pressure_high_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_HIGH_PCT", 90);
-  s_l3_pressure_recover_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_RECOVER_PCT", 70);
-  s_l3_drop_permille = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_DROP_PERMILLE", 800);
+  s_l3_pressure_enabled = edr_getenv_int_default("EDR_PREPROCESS_L3_PRESSURE", 1) == 1 ? 1 : 0;
+  s_l3_pressure_high_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_HIGH_PCT", 70);
+  s_l3_pressure_recover_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_RECOVER_PCT", 50);
+  s_l3_drop_permille = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_DROP_PERMILLE", 950);
   s_l3_pressure_high_pct = clamp_u32(s_l3_pressure_high_pct, 50u, 99u);
   s_l3_pressure_recover_pct = clamp_u32(s_l3_pressure_recover_pct, 10u, s_l3_pressure_high_pct);
   s_l3_drop_permille = clamp_u32(s_l3_drop_permille, 0u, 1000u);
   s_procname_gate_enabled = edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE", 1) == 1 ? 1 : 0;
   s_procname_gate_keep_unknown_permille =
-      (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE", 100);
+      (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE", 10);
   s_procname_gate_keep_unknown_permille =
       clamp_u32(s_procname_gate_keep_unknown_permille, 0u, 1000u);
   s_l3_pressure_active = 0;
