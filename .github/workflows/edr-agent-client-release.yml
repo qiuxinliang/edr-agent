@@ -1,5 +1,5 @@
 # 本文件面向「独立 edr-agent 仓库」：GHA 工作目录 = 本仓库根（vcpkg.json 在根目录）。
-# `win_*` tag 发 **两枚** zip：① `…-windows-amd64-exe.zip`（**no-gRPC+ONNX**，与历史一致）② `…-windows-amd64-grpc-exe.zip`（**gRPC+ONNX**）；**不含** models、Inno、Linux。
+# `win_*` tag 发 **两枚** zip（② 文件名仍带 grpc；CMake **EDR_GRPC_BUILD_SUSPENDED=1** 时 **不链接 gRPC 客户端**，ingest 与 ① 同为 stub）；**不含** models、Inno、Linux。
 # 若你在 **monorepo** 中发版，应使用**仓库根**的 `.github/workflows/edr-agent-client-release.yml`（`edr-agent/…` 路径）。
 # 发版前请与 monorepo 版逻辑对齐。排障：vcpkg 编 grpc 时 “The operation is canceled” → 常为 cancel-in-progress 或 timeout。
 #
@@ -173,7 +173,7 @@ jobs:
           if-no-files-found: error
 
   windows-build-grpc:
-    name: Build Windows (gRPC+ONNX, vcpkg grpc feature)
+    name: Build Windows (ONNX, vcpkg grpc-client feature; ingest stub)
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
     runs-on: windows-latest
     timeout-minutes: 360
@@ -248,7 +248,7 @@ jobs:
           $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Configure (Ninja, Release, gRPC+ONNX, sccache)
+      - name: Configure (Ninja, Release, ONNX; stub ingest — CMake may force EDR_GRPC off)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -275,7 +275,7 @@ jobs:
       - name: Test
         shell: bash
         run: ctest --test-dir build --output-on-failure
-      - name: Package (exe + runtime DLLs only, gRPC build)
+      - name: Package (exe + DLLs; legacy *-grpc-exe.zip name)
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-grpc-exe.zip"
@@ -285,7 +285,7 @@ jobs:
           if (Test-Path "build\Release\edr_monitor.exe") { $null = $items.Add("build\Release\edr_monitor.exe") }
           Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
-      - name: Move gRPC artifact to workspace
+      - name: Move grpc-deps zip artifact to workspace
         shell: pwsh
         run: |
           $src = "edr-agent-${{ github.ref_name }}-windows-amd64-grpc-exe.zip"
@@ -328,7 +328,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64, no-gRPC+ONNX + gRPC+ONNX zips)
+          name: edr-agent ${{ github.ref_name }} (Windows amd64 ONNX — curl-only zip + grpc-client vcpkg zip; stub ingest if CMake suspended)
           generate_release_notes: true
           files: dist/*.zip
           fail_on_unmatched_files: true

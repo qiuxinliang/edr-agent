@@ -1,8 +1,8 @@
-# 测试用 gRPC+ORT+ctest。push 仅**分支**（不响应纯 tag 推送，避免与分支 push 重复各跑一条）。手动的 workflow_dispatch 也可。
+# 测试用 grpc-client vcpkg + ORT + ctest；CMake **EDR_GRPC_BUILD_SUSPENDED** 时仍为 ingest stub。push 仅**分支**（不响应纯 tag…）。workflow_dispatch 也可。
 # 与 monorepo 根目录 `.github/workflows/edr-agent-build-grpc-ort.yml` 保持：Ninja、sccache、vcpkg binary 缓存。独立仓库时路径无 `edr-agent/` 前缀。
 # 首步 `verify_ave_behavior_chain_invariants.sh`（`./scripts/...`，**无** vcpkg，与根目录 workflow 一致）。
 
-name: edr-agent build (Windows gRPC + ORT)
+name: edr-agent build (Windows grpc-client vcpkg + ORT; stub ingest)
 
 on:
   push:
@@ -26,7 +26,7 @@ env:
 
 jobs:
   build:
-    name: gRPC (vcpkg) + ORT, Ninja, sccache
+    name: grpc-client vcpkg + ORT (stub ingest), Ninja, sccache
     runs-on: windows-latest
     timeout-minutes: 360
     env:
@@ -105,7 +105,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure (Ninja, gRPC+ORT, sccache)
+      - name: Configure (Ninja, ORT; CMake may force stub ingest)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh

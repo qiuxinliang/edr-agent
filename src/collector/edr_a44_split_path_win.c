@@ -1292,10 +1292,11 @@ static volatile uint64_t s_e2e_latency_count;
 static volatile uint64_t s_e2e_latency_samples[1000];
 static volatile uint32_t s_e2e_latency_sample_head;
 static volatile uint32_t s_e2e_latency_sample_count;
-static volatile int s_pipeline_prefetch_enabled;
-static volatile int s_pipeline_parallel_enabled;
-static volatile int s_pipeline_batch_timeout_ms;
-static volatile int s_pipeline_max_batch_size;
+/* LONG for InterlockedExchange (volatile LONG *); int * triggers MSVC C4057. */
+static volatile LONG s_pipeline_prefetch_enabled;
+static volatile LONG s_pipeline_parallel_enabled;
+static volatile LONG s_pipeline_batch_timeout_ms;
+static volatile LONG s_pipeline_max_batch_size;
 
 int edr_a44_e2e_enable_tracking(int enable) {
     (void)InterlockedExchange(&s_e2e_tracking_enabled, enable);
