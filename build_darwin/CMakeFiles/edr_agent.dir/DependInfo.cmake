@@ -48,6 +48,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_direct_emit.c" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_ir_stub.c" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_match.c" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o.d"
+  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_env.c" "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_pipeline.c" "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/process_chain_depth.c" "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/proto/edr/v1/event.pb.c" "CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o.d"
@@ -64,6 +65,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/shellcode_detector/shellcode_known.c" "CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/storage/queue_sqlite.c" "CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/event_batch.c" "CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o.d"
+  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_stub.c" "CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/ingest_http.c" "CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/transport_stub.c" "CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/webshell_detector/webshell_detector_none.c" "CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o" "gcc" "CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o.d"
@@ -73,9 +75,6 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/nanopb/pb_decode.c" "CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o" "gcc" "CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/nanopb/pb_encode.c" "CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o" "gcc" "CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o.d"
   "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/tomlc99/toml.c" "CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o" "gcc" "CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o.d"
-  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.grpc.pb.cc" "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o" "gcc" "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o.d"
-  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.pb.cc" "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o" "gcc" "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o.d"
-  "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_impl.cpp" "CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o" "gcc" "CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o.d"
   )
 
 # Targets to which this target links which contain Fortran sources.

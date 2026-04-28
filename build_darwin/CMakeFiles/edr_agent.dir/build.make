@@ -282,10 +282,24 @@ CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_pipeline.c" -o CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.s
 
+CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o: CMakeFiles/edr_agent.dir/flags.make
+CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/preprocess/preprocess_env.c
+CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_16) "Building C object CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o -MF CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o.d -o CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_env.c"
+
+CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_env.c" > CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.i
+
+CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/preprocess_env.c" -o CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.s
+
 CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/serialize/behavior_wire.c
 CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_16) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_17) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o -MF CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o.d -o CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/serialize/behavior_wire.c"
 
 CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.i: cmake_force
@@ -299,7 +313,7 @@ CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/serialize/behavior_proto.c
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_17) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_18) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o -MF CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o.d -o CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/serialize/behavior_proto.c"
 
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.i: cmake_force
@@ -313,7 +327,7 @@ CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/serialize/behavior_alert_emit.c
 CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_18) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_19) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o -MF CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o.d -o CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/serialize/behavior_alert_emit.c"
 
 CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.i: cmake_force
@@ -327,7 +341,7 @@ CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/serialize/behavior_proto_c.c
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_19) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_20) "Building C object CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o -MF CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o.d -o CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/serialize/behavior_proto_c.c"
 
 CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.i: cmake_force
@@ -341,7 +355,7 @@ CMakeFiles/edr_agent.dir/src/serialize/behavior_proto_c.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/proto/edr/v1/event.pb.c
 CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_20) "Building C object CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_21) "Building C object CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o -MF CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o.d -o CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/proto/edr/v1/event.pb.c"
 
 CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.i: cmake_force
@@ -355,7 +369,7 @@ CMakeFiles/edr_agent.dir/src/proto/edr/v1/event.pb.c.s: cmake_force
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb_common.c
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_21) "Building C object CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_22) "Building C object CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o -MF CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o.d -o CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/nanopb/pb_common.c"
 
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.i: cmake_force
@@ -369,7 +383,7 @@ CMakeFiles/edr_agent.dir/third_party/nanopb/pb_common.c.s: cmake_force
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb_encode.c
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_22) "Building C object CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_23) "Building C object CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o -MF CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o.d -o CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/nanopb/pb_encode.c"
 
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.i: cmake_force
@@ -383,7 +397,7 @@ CMakeFiles/edr_agent.dir/third_party/nanopb/pb_encode.c.s: cmake_force
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb_decode.c
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_23) "Building C object CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_24) "Building C object CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o -MF CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o.d -o CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/nanopb/pb_decode.c"
 
 CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.i: cmake_force
@@ -397,7 +411,7 @@ CMakeFiles/edr_agent.dir/third_party/nanopb/pb_decode.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/transport/event_batch.c
 CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_24) "Building C object CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_25) "Building C object CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o -MF CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o.d -o CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/event_batch.c"
 
 CMakeFiles/edr_agent.dir/src/transport/event_batch.c.i: cmake_force
@@ -411,7 +425,7 @@ CMakeFiles/edr_agent.dir/src/transport/event_batch.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/transport/ingest_http.c
 CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_25) "Building C object CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_26) "Building C object CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o -MF CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o.d -o CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/ingest_http.c"
 
 CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.i: cmake_force
@@ -425,7 +439,7 @@ CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/transport/transport_stub.c
 CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_26) "Building C object CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_27) "Building C object CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o -MF CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/transport_stub.c"
 
 CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.i: cmake_force
@@ -439,7 +453,7 @@ CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/storage/queue_sqlite.c
 CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_27) "Building C object CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_28) "Building C object CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o -MF CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o.d -o CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/storage/queue_sqlite.c"
 
 CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.i: cmake_force
@@ -453,7 +467,7 @@ CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/command/command_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/command/command_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/command/command_stub.c
 CMakeFiles/edr_agent.dir/src/command/command_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_28) "Building C object CMakeFiles/edr_agent.dir/src/command/command_stub.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_29) "Building C object CMakeFiles/edr_agent.dir/src/command/command_stub.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/command/command_stub.c.o -MF CMakeFiles/edr_agent.dir/src/command/command_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/command/command_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/command/command_stub.c"
 
 CMakeFiles/edr_agent.dir/src/command/command_stub.c.i: cmake_force
@@ -467,7 +481,7 @@ CMakeFiles/edr_agent.dir/src/command/command_stub.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/command/sha256.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/command/sha256.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/command/sha256.c
 CMakeFiles/edr_agent.dir/src/command/sha256.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_29) "Building C object CMakeFiles/edr_agent.dir/src/command/sha256.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_30) "Building C object CMakeFiles/edr_agent.dir/src/command/sha256.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/command/sha256.c.o -MF CMakeFiles/edr_agent.dir/src/command/sha256.c.o.d -o CMakeFiles/edr_agent.dir/src/command/sha256.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/command/sha256.c"
 
 CMakeFiles/edr_agent.dir/src/command/sha256.c.i: cmake_force
@@ -481,7 +495,7 @@ CMakeFiles/edr_agent.dir/src/command/sha256.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/pmfe/pmfe_engine.c
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_30) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_31) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o -MF CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o.d -o CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/pmfe/pmfe_engine.c"
 
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.i: cmake_force
@@ -495,7 +509,7 @@ CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/pmfe/pmfe_etw_preprocess.c
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_31) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_32) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o -MF CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o.d -o CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/pmfe/pmfe_etw_preprocess.c"
 
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.i: cmake_force
@@ -509,7 +523,7 @@ CMakeFiles/edr_agent.dir/src/pmfe/pmfe_etw_preprocess.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/pmfe/pid_history_pmfe.c
 CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_32) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_33) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o -MF CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o.d -o CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/pmfe/pid_history_pmfe.c"
 
 CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.i: cmake_force
@@ -523,7 +537,7 @@ CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/attack_surface/attack_surface_report.c
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_33) "Building C object CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_34) "Building C object CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o -MF CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o.d -o CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/attack_surface/attack_surface_report.c"
 
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.i: cmake_force
@@ -537,7 +551,7 @@ CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.s: cmake_for
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/attack_surface/attack_surface_egress.c
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_34) "Building C object CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_35) "Building C object CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o -MF CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o.d -o CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/attack_surface/attack_surface_egress.c"
 
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.i: cmake_force
@@ -551,7 +565,7 @@ CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.s: cmake_for
 CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/attack_surface/security_policy_collect.c
 CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_35) "Building C object CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_36) "Building C object CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o -MF CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o.d -o CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/attack_surface/security_policy_collect.c"
 
 CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.i: cmake_force
@@ -565,7 +579,7 @@ CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.s: cmake_f
 CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/self_protect/self_protect.c
 CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_36) "Building C object CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_37) "Building C object CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o -MF CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o.d -o CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/self_protect/self_protect.c"
 
 CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.i: cmake_force
@@ -579,7 +593,7 @@ CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/resource/resource.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/resource/resource.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/resource/resource.c
 CMakeFiles/edr_agent.dir/src/resource/resource.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_37) "Building C object CMakeFiles/edr_agent.dir/src/resource/resource.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_38) "Building C object CMakeFiles/edr_agent.dir/src/resource/resource.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/resource/resource.c.o -MF CMakeFiles/edr_agent.dir/src/resource/resource.c.o.d -o CMakeFiles/edr_agent.dir/src/resource/resource.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/resource/resource.c"
 
 CMakeFiles/edr_agent.dir/src/resource/resource.c.i: cmake_force
@@ -593,7 +607,7 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_engine.c
 CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_38) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_39) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_engine.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.i: cmake_force
@@ -607,7 +621,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_onnx_infer.c
 CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_39) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_40) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_onnx_infer.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.i: cmake_force
@@ -621,7 +635,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/edr_onnx_behavior_fl_tensor_export.c
 CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_40) "Building C object CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_41) "Building C object CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o -MF CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/edr_onnx_behavior_fl_tensor_export.c"
 
 CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.i: cmake_force
@@ -635,7 +649,7 @@ CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.s: cmake_f
 CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_sdk.c
 CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_41) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_42) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_sdk.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.i: cmake_force
@@ -649,7 +663,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_suppression.c
 CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_42) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_43) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_suppression.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.i: cmake_force
@@ -663,7 +677,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_rules_meta.c
 CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_43) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_44) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_rules_meta.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.i: cmake_force
@@ -677,7 +691,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_behavior_pipeline.c
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_44) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_45) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_behavior_pipeline.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.i: cmake_force
@@ -691,7 +705,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_behavior_features.c
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_45) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_46) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_behavior_features.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.i: cmake_force
@@ -705,7 +719,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_behavior_features.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_cross_engine_parse.c
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_46) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_47) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_cross_engine_parse.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.i: cmake_force
@@ -719,7 +733,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_parse.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_cross_engine_feed.c
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_47) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_48) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_cross_engine_feed.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.i: cmake_force
@@ -733,7 +747,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_lf_mpmc.c
 CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_48) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_49) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_lf_mpmc.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.i: cmake_force
@@ -747,7 +761,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_lf_mpmc.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_hotfix.c
 CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_49) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_50) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_hotfix.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.i: cmake_force
@@ -761,7 +775,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_hotfix.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_db_update.c
 CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_50) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_51) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_db_update.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.i: cmake_force
@@ -775,7 +789,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_db_update.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_static_features.c
 CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_51) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_52) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_static_features.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.i: cmake_force
@@ -789,7 +803,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_static_features.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/fl_feature_provider.c
 CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_52) "Building C object CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_53) "Building C object CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o -MF CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/fl_feature_provider.c"
 
 CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.i: cmake_force
@@ -803,7 +817,7 @@ CMakeFiles/edr_agent.dir/src/ave/fl_feature_provider.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_sign_whitelist_stub.c
 CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_53) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_54) "Building C object CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o -MF CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_sign_whitelist_stub.c"
 
 CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.i: cmake_force
@@ -817,7 +831,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_sign_whitelist_stub.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/pmfe/pmfe_host_policy_stub.c
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_54) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_55) "Building C object CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o -MF CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/pmfe/pmfe_host_policy_stub.c"
 
 CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.i: cmake_force
@@ -831,7 +845,7 @@ CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/collector/collector_stub.c
 CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_55) "Building C object CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_56) "Building C object CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o -MF CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/collector/collector_stub.c"
 
 CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.i: cmake_force
@@ -845,7 +859,7 @@ CMakeFiles/edr_agent.dir/src/collector/collector_stub.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/shellcode_entropy.c
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_56) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_57) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o -MF CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o.d -o CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/shellcode_detector/shellcode_entropy.c"
 
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.i: cmake_force
@@ -859,7 +873,7 @@ CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_entropy.c.s: cmake_for
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/shellcode_heuristic.c
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_57) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_58) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o -MF CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o.d -o CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/shellcode_detector/shellcode_heuristic.c"
 
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.i: cmake_force
@@ -873,7 +887,7 @@ CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_heuristic.c.s: cmake_f
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/shellcode_known.c
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_58) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_59) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o -MF CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o.d -o CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/shellcode_detector/shellcode_known.c"
 
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.i: cmake_force
@@ -887,7 +901,7 @@ CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/proto_parse.c
 CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_59) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_60) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o -MF CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o.d -o CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/shellcode_detector/proto_parse.c"
 
 CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.i: cmake_force
@@ -901,7 +915,7 @@ CMakeFiles/edr_agent.dir/src/shellcode_detector/proto_parse.c.s: cmake_force
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/shellcode_detector_none.c
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_60) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_61) "Building C object CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o -MF CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o.d -o CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/shellcode_detector/shellcode_detector_none.c"
 
 CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.i: cmake_force
@@ -915,7 +929,7 @@ CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_detector_none.c.s: cma
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/webshell_detector/webshell_forensic.c
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_61) "Building C object CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_62) "Building C object CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o -MF CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o.d -o CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/webshell_detector/webshell_forensic.c"
 
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.i: cmake_force
@@ -929,7 +943,7 @@ CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.s: cmake_forc
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/webshell_detector/webshell_detector_none.c
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_62) "Building C object CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_63) "Building C object CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o -MF CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o.d -o CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/webshell_detector/webshell_detector_none.c"
 
 CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.i: cmake_force
@@ -943,7 +957,7 @@ CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.s: cmake
 CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/tomlc99/toml.c
 CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_63) "Building C object CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_64) "Building C object CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o -MF CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o.d -o CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/tomlc99/toml.c"
 
 CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.i: cmake_force
@@ -957,7 +971,7 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.s: cmake_force
 CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/lz4/lz4.c
 CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_64) "Building C object CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_65) "Building C object CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o -MF CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o.d -o CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/lz4/lz4.c"
 
 CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.i: cmake_force
@@ -968,52 +982,24 @@ CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/third_party/lz4/lz4.c" -o CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.s
 
-CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o: CMakeFiles/edr_agent.dir/flags.make
-CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/transport/grpc_client_impl.cpp
-CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_65) "Building CXX object CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -MD -MT CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o -MF CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o.d -o CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_impl.cpp"
+CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
+CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/transport/grpc_client_stub.c
+CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_66) "Building C object CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o -MF CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_stub.c"
 
-CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -E "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_impl.cpp" > CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.i
+CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_stub.c" > CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.i
 
-CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_impl.cpp" -o CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.s
-
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o: CMakeFiles/edr_agent.dir/flags.make
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/grpc_gen/edr/v1/ingest.pb.cc
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_66) "Building CXX object CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -MD -MT CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o -MF CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o.d -o CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.pb.cc"
-
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -E "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.pb.cc" > CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.i
-
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.pb.cc" -o CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.s
-
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o: CMakeFiles/edr_agent.dir/flags.make
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/grpc_gen/edr/v1/ingest.grpc.pb.cc
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_67) "Building CXX object CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -MD -MT CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o -MF CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o.d -o CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.grpc.pb.cc"
-
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -E "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.grpc.pb.cc" > CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i
-
-CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -Wno-deprecated-declarations -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/grpc_gen/edr/v1/ingest.grpc.pb.cc" -o CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s
+CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/transport/grpc_client_stub.c" -o CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.s
 
 CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o: CMakeFiles/edr_agent.dir/flags.make
 CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/preprocess/p0_rule_ir_stub.c
 CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o: CMakeFiles/edr_agent.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_68) "Building C object CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_67) "Building C object CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o -MF CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o.d -o CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o -c "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/preprocess/p0_rule_ir_stub.c"
 
 CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.i: cmake_force
@@ -1041,6 +1027,7 @@ edr_agent_OBJECTS = \
 "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o" \
 "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o" \
 "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o" \
+"CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o" \
 "CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o" \
 "CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o" \
 "CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o" \
@@ -1090,9 +1077,7 @@ edr_agent_OBJECTS = \
 "CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o" \
 "CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o" \
 "CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o" \
-"CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o" \
-"CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o" \
-"CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o" \
+"CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o" \
 "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o"
 
 # External object files for target edr_agent
@@ -1113,6 +1098,7 @@ edr_agent: CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o
+edr_agent: CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/serialize/behavior_proto.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o
@@ -1162,117 +1148,14 @@ edr_agent: CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_detector_none.c.o
 edr_agent: CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o
 edr_agent: CMakeFiles/edr_agent.dir/third_party/lz4/lz4.c.o
-edr_agent: CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o
-edr_agent: CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o
-edr_agent: CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o
+edr_agent: CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o
 edr_agent: CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o
 edr_agent: CMakeFiles/edr_agent.dir/build.make
 edr_agent: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd
-edr_agent: /opt/homebrew/opt/grpc/lib/libgrpc++.1.80.0.dylib
-edr_agent: /opt/homebrew/lib/libprotobuf.34.1.0.dylib
 edr_agent: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libsqlite3.tbd
 edr_agent: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd
-edr_agent: /opt/homebrew/lib/libabsl_die_if_null.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_initialize.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libutf8_validity.34.1.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libgrpc.53.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_statusor.2601.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_json_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_textformat_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_lex_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_reflection_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_mini_descriptor_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_wire_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libutf8_range_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_message_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_mini_table_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_hash_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_base_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libupb_mem_lib.53.0.0.dylib
-edr_agent: /opt/homebrew/lib/libre2.11.0.0.dylib
-edr_agent: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libz.tbd
-edr_agent: /opt/homebrew/lib/libcares.2.19.5.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libgpr.53.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_reflection.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_raw_hash_set.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_hashtablez_sampler.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_config.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_program_name.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_private_handle_accessor.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_commandlineflag.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_commandlineflag_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_distributions.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_seed_sequences.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_entropy_pool.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_randen.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_randen_hwaes.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_randen_hwaes_impl.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_randen_slow.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_platform.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_internal_seed_material.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_random_seed_gen_exception.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_status.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_cord.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_cordz_info.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_cord_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_cordz_functions.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_exponential_biased.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_cordz_handle.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_crc_cord_state.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_crc32c.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_crc_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_crc_cpu_detect.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_flags_marshalling.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_check_op.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_leak_check.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_conditions.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_message.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_strerror.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_nullguard.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_examine_stack.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_format.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_str_format_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_structured_proto.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_log_sink_set.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_globals.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_vlog_config_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_fnmatch.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_synchronization.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_stacktrace.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_borrowed_fixup_buffer.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_hash.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_city.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_symbolize.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_debugging_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_demangle_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_demangle_rust.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_decode_rust_punycode.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_utf8_for_code_point.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_graphcycles_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_kernel_timeout_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_malloc_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_tracing_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_globals.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_sink.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_entry.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_time.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_civil_time.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_time_zone.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_internal_proto.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_strings.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_strings_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_throw_delegate.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_int128.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_base.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_raw_logging_internal.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_log_severity.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libabsl_spinlock_wait.2601.0.0.dylib
-edr_agent: /opt/homebrew/lib/libssl.dylib
-edr_agent: /opt/homebrew/lib/libcrypto.dylib
-edr_agent: /opt/homebrew/opt/grpc/lib/libaddress_sorting.53.0.0.dylib
 edr_agent: CMakeFiles/edr_agent.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_69) "Linking CXX executable edr_agent"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir="/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/CMakeFiles" --progress-num=$(CMAKE_PROGRESS_68) "Linking C executable edr_agent"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/edr_agent.dir/link.txt --verbose=$(VERBOSE)
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold "Stage P0 rule manifest next to edr_agent (edr_config/p0_rule_bundle_manifest.json)"
 	/opt/homebrew/bin/cmake -E make_directory /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/build_darwin/edr_config

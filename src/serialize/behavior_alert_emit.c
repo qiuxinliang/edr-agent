@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef EDR_HAVE_NANOPB
+#pragma message("WARNING: EDR_HAVE_NANOPB not defined; ALL P0 and AVE behavior alerts will be silently dropped. Build with nanopb support for production use.")
+#endif
+
 static void warn_encoding_once(void) {
   static int s_done;
   const char *enc = getenv("EDR_BEHAVIOR_ENCODING");
@@ -51,6 +55,16 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
     }
   }
 #else
+  {
+    static int s_no_nanopb_logged = 0;
+    if (!s_no_nanopb_logged) {
+      fprintf(stderr,
+              "[edr] FATAL: EDR_HAVE_NANOPB is not defined; ALL behavior alerts "
+              "(P0 direct emit + AVE ONNX) are being SILENTLY DISCARDED. "
+              "Rebuild with nanopb support enabled.\n");
+      s_no_nanopb_logged = 1;
+    }
+  }
   (void)a;
 #endif
 }

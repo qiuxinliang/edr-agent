@@ -21,6 +21,7 @@ static sqlite3 *s_db;
 static char s_path[512];
 static uint64_t s_pending;
 static uint64_t s_max_db_bytes;
+static uint64_t s_max_entries;
 static uint64_t s_retry_not_before_ns;
 static unsigned s_retry_fail_streak;
 
@@ -78,14 +79,34 @@ static int max_retry_limit(void) {
 static void load_queue_db_limit(void) {
   s_max_db_bytes = 0;
   const char *e = getenv("EDR_QUEUE_MAX_DB_MB");
-  if (!e || !e[0]) {
-    return;
+  if (e && e[0]) {
+    unsigned long mb = strtoul(e, NULL, 10);
+    if (mb > 0 && mb <= 65535UL) {
+      s_max_db_bytes = mb * 1024UL * 1024UL;
+    }
   }
-  unsigned long mb = strtoul(e, NULL, 10);
-  if (mb == 0 || mb > 65535UL) {
-    return;
+  
+  s_max_entries = 0;
+  const char *e_entries = getenv("EDR_QUEUE_MAX_ENTRIES");
+  if (e_entries && e_entries[0]) {
+    unsigned long entries = strtoul(e_entries, NULL, 10);
+    if (entries > 0 && entries <= 1000000UL) {
+      s_max_entries = entries;
+      return;
+    }
   }
-  s_max_db_bytes = mb * 1024UL * 1024UL;
+  
+  const char *q_cap = getenv("EDR_TRANSPORT_SEND_QUEUE_CAP");
+  unsigned long queue_cap = 256UL;
+  if (q_cap && q_cap[0]) {
+    queue_cap = strtoul(q_cap, NULL, 10);
+    if (queue_cap < 8UL) {
+      queue_cap = 8UL;
+    } else if (queue_cap > 8192UL) {
+      queue_cap = 8192UL;
+    }
+  }
+  s_max_entries = queue_cap * 5UL;
 }
 
 static uint32_t rd_u32_le(const uint8_t *p) {
@@ -224,15 +245,19 @@ EdrError edr_storage_queue_open(const char *path) {
       "created_at INTEGER NOT NULL,"
       "compressed INTEGER NOT NULL DEFAULT 0,"
       "retry_count INTEGER NOT NULL DEFAULT 0,"
-      "status TEXT NOT NULL DEFAULT 'pending'"
+      "status TEXT NOT NULL DEFAULT 'pending',"
+      "severity INTEGER NOT NULL DEFAULT 0"
       ");"
-      "CREATE INDEX IF NOT EXISTS idx_event_queue_status ON event_queue(status, created_at);";
+      "CREATE INDEX IF NOT EXISTS idx_event_queue_status ON event_queue(status, created_at);"
+      "CREATE INDEX IF NOT EXISTS idx_event_queue_severity ON event_queue(severity, created_at);";
 
   if (exec_simple(s_db, schema) != SQLITE_OK) {
     sqlite3_close(s_db);
     s_db = NULL;
     return EDR_ERR_SQLITE_WRITE;
   }
+
+  exec_simple(s_db, "PRAGMA journal_mode=WAL;");
 
   sqlite3_stmt *st = NULL;
   const char *cnt = "SELECT COUNT(*) FROM event_queue WHERE status='pending';";
@@ -272,8 +297,35 @@ void edr_storage_queue_close(void) {
 
 int edr_storage_queue_is_open(void) { return s_db ? 1 : 0; }
 
+
+static void trim_queue_if_full(void) {
+  if (s_max_entries == 0 || s_pending < s_max_entries) {
+    return;
+  }
+  
+  sqlite3_stmt *st = NULL;
+  const char *sql = "DELETE FROM event_queue WHERE id IN ("
+                    "SELECT id FROM event_queue WHERE status='pending' "
+                    "ORDER BY severity ASC, created_at ASC LIMIT 1);";
+  
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+    return;
+  }
+  
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  
+  if (rc == SQLITE_DONE) {
+    if (s_pending > 0u) {
+      s_pending--;
+    }
+    fprintf(stderr, "[queue] trimmed oldest low-severity entry, pending=%llu\n", 
+            (unsigned long long)s_pending);
+  }
+}
+
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
-                                   size_t payload_len, int compressed) {
+                                   size_t payload_len, int compressed, int severity) {
   if (!s_db || !batch_id || !payload || payload_len == 0) {
     return EDR_ERR_INVALID_ARG;
   }
@@ -294,10 +346,14 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
 #endif
   }
 
+  if (s_max_entries > 0u && s_pending >= s_max_entries) {
+    trim_queue_if_full();
+  }
+
   sqlite3_stmt *st = NULL;
   const char *ins =
-      "INSERT INTO event_queue(batch_id,payload,created_at,compressed,status) "
-      "VALUES(?,?,?,?,'pending');";
+      "INSERT INTO event_queue(batch_id,payload,created_at,compressed,status,severity) "
+      "VALUES(?,?,?,?,?,?);";
   if (sqlite3_prepare_v2(s_db, ins, -1, &st, NULL) != SQLITE_OK) {
     return EDR_ERR_SQLITE_WRITE;
   }
@@ -307,6 +363,8 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
   sqlite3_bind_blob(st, 2, payload, (int)payload_len, SQLITE_TRANSIENT);
   sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
   sqlite3_bind_int(st, 4, compressed ? 1 : 0);
+  sqlite3_bind_text(st, 5, "pending", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int(st, 6, severity);
 
   int rc = sqlite3_step(st);
   sqlite3_finalize(st);
@@ -368,12 +426,40 @@ EdrError edr_storage_queue_open(const char *path) {
 
 void edr_storage_queue_close(void) {}
 
+
+static void trim_queue_if_full(void) {
+  if (s_max_entries == 0 || s_pending < s_max_entries) {
+    return;
+  }
+  
+  sqlite3_stmt *st = NULL;
+  const char *sql = "DELETE FROM event_queue WHERE id IN ("
+                    "SELECT id FROM event_queue WHERE status='pending' "
+                    "ORDER BY severity ASC, created_at ASC LIMIT 1);";
+  
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+    return;
+  }
+  
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  
+  if (rc == SQLITE_DONE) {
+    if (s_pending > 0u) {
+      s_pending--;
+    }
+    fprintf(stderr, "[queue] trimmed oldest low-severity entry, pending=%llu\n", 
+            (unsigned long long)s_pending);
+  }
+}
+
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
-                                   size_t payload_len, int compressed) {
+                                   size_t payload_len, int compressed, int severity) {
   (void)batch_id;
   (void)payload;
   (void)payload_len;
   (void)compressed;
+  (void)severity;
   return EDR_OK;
 }
 

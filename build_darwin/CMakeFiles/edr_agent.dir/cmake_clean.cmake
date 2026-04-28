@@ -53,10 +53,6 @@ file(REMOVE_RECURSE
   "CMakeFiles/edr_agent.dir/src/core/event_bus.c.o.d"
   "CMakeFiles/edr_agent.dir/src/core/time_util.c.o"
   "CMakeFiles/edr_agent.dir/src/core/time_util.c.o.d"
-  "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o"
-  "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o.d"
-  "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o"
-  "CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o.d"
   "CMakeFiles/edr_agent.dir/src/main.c.o"
   "CMakeFiles/edr_agent.dir/src/main.c.o.d"
   "CMakeFiles/edr_agent.dir/src/pmfe/pid_history_pmfe.c.o"
@@ -83,6 +79,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir_stub.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o"
   "CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o.d"
+  "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o"
+  "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o"
   "CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o.d"
   "CMakeFiles/edr_agent.dir/src/preprocess/process_chain_depth.c.o"
@@ -115,8 +113,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/edr_agent.dir/src/storage/queue_sqlite.c.o.d"
   "CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o"
   "CMakeFiles/edr_agent.dir/src/transport/event_batch.c.o.d"
-  "CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o"
-  "CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o.d"
+  "CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o"
+  "CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o.d"
   "CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o"
   "CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o.d"
   "CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o"
@@ -140,6 +138,6 @@ file(REMOVE_RECURSE
 )
 
 # Per-language clean rules from dependency scanning.
-foreach(lang C CXX)
+foreach(lang C)
   include(CMakeFiles/edr_agent.dir/cmake_clean_${lang}.cmake OPTIONAL)
 endforeach()

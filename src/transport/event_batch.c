@@ -30,6 +30,17 @@ static int persist_strategy_on_fail_only(void) {
 #define EDR_LZ4_COMPRESSION_LEVEL 6
 #endif
 
+static int env_lz4_compression_level(void) {
+  const char *e = getenv("EDR_LZ4_COMPRESSION_LEVEL");
+  if (!e || !e[0]) {
+    return EDR_LZ4_COMPRESSION_LEVEL;
+  }
+  int v = atoi(e);
+  if (v < 1) { v = 1; }
+  if (v > 12) { v = 12; }
+  return v;
+}
+
 static uint8_t *s_buf;
 static size_t s_cap;
 static uint32_t s_max_frames;
@@ -64,7 +75,7 @@ static void make_batch_id(char *out, size_t cap) {
 }
 
 static void maybe_persist(const char *batch_id, const uint8_t *header12, const uint8_t *payload,
-                            size_t payload_len, int compressed) {
+                            size_t payload_len, int compressed, int use_http) {
   if (persist_strategy_on_fail_only()) {
     return;
   }
@@ -72,6 +83,7 @@ static void maybe_persist(const char *batch_id, const uint8_t *header12, const u
   if (!e || e[0] != '1') {
     return;
   }
+  int severity = (use_http == 0) ? 1 : 0;
   size_t wire_len = 12u + payload_len;
   uint8_t *wire = (uint8_t *)malloc(wire_len);
   if (!wire) {
@@ -79,7 +91,7 @@ static void maybe_persist(const char *batch_id, const uint8_t *header12, const u
   }
   memcpy(wire, header12, 12u);
   memcpy(wire + 12u, payload, payload_len);
-  (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed);
+  (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed, severity);
   free(wire);
 }
 
@@ -172,7 +184,7 @@ static void emit_one_channel(const char *batch_id, const uint8_t *raw_body, size
           wr_u32_le(header + 8, (uint32_t)raw_used);
           edr_transport_send_ingest_batch(use_http, batch_id, header, sizeof(header), dst,
                                           (size_t)clen);
-          maybe_persist(batch_id, header, dst, (size_t)clen, 1);
+          maybe_persist(batch_id, header, dst, (size_t)clen, 1, use_http);
           free(dst);
           return;
         }
@@ -185,7 +197,7 @@ static void emit_one_channel(const char *batch_id, const uint8_t *raw_body, size
   wr_u32_le(header + 4, frame_count);
   wr_u32_le(header + 8, (uint32_t)raw_used);
   edr_transport_send_ingest_batch(use_http, batch_id, header, sizeof(header), raw_body, raw_used);
-  maybe_persist(batch_id, header, raw_body, raw_used, 0);
+  maybe_persist(batch_id, header, raw_body, raw_used, 0, use_http);
 }
 
 static void flush_split(const char *batch_id_base) {
@@ -259,7 +271,7 @@ static void flush_locked(void) {
           wr_u32_le(header + 4, s_frame_count);
           wr_u32_le(header + 8, (uint32_t)s_used);
           edr_transport_on_event_batch(batch_id, header, sizeof(header), dst, (size_t)clen);
-          maybe_persist(batch_id, header, dst, (size_t)clen, 1);
+          maybe_persist(batch_id, header, dst, (size_t)clen, 1, 0);
           free(dst);
           s_used = 0;
           s_frame_count = 0;
@@ -274,7 +286,7 @@ static void flush_locked(void) {
   wr_u32_le(header + 4, s_frame_count);
   wr_u32_le(header + 8, (uint32_t)s_used);
   edr_transport_on_event_batch(batch_id, header, sizeof(header), s_buf, s_used);
-  maybe_persist(batch_id, header, s_buf, s_used, 0);
+  maybe_persist(batch_id, header, s_buf, s_used, 0, 0);
   s_used = 0;
   s_frame_count = 0;
 }
@@ -285,7 +297,7 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
   s_flush_timeout_s = flush_timeout_s;
   s_deadline_ns = 0;
   s_timeout_flush_count = 0;
-  s_lz4_compression_level = EDR_LZ4_COMPRESSION_LEVEL;
+  s_lz4_compression_level = env_lz4_compression_level();
   if (max_bytes < 4096u) {
     max_bytes = 4096u;
   }

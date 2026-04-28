@@ -92,12 +92,13 @@ static int grpc_fallback_http_enabled(void) {
 }
 
 static void enqueue_wire_on_fail(const char *batch_id, const uint8_t *header12, size_t header_len,
-                                 const uint8_t *payload, size_t payload_len) {
+                                 const uint8_t *payload, size_t payload_len, int use_http) {
   if (!persist_strategy_on_fail_only() || !edr_storage_queue_is_open()) {
     return;
   }
   uint32_t mag = rd_u32_le(header12);
   int compressed = (mag == EDR_TRANSPORT_BATCH_MAGIC_LZ4) ? 1 : 0;
+  int severity = (use_http == 0) ? 1 : 0;
   size_t wlen = header_len + payload_len;
   uint8_t *wire = (uint8_t *)malloc(wlen);
   if (!wire) {
@@ -105,7 +106,7 @@ static void enqueue_wire_on_fail(const char *batch_id, const uint8_t *header12, 
   }
   memcpy(wire, header12, header_len);
   memcpy(wire + header_len, payload, payload_len);
-  (void)edr_storage_queue_enqueue(batch_id, wire, wlen, compressed);
+  (void)edr_storage_queue_enqueue(batch_id, wire, wlen, compressed, severity);
   free(wire);
 }
 
@@ -147,7 +148,7 @@ static void edr_transport_send_ingest_batch_now(int use_http, const char *batch_
     }
   }
   if (send_rc != 0) {
-    enqueue_wire_on_fail(batch_id, header12, header_len, payload, payload_len);
+    enqueue_wire_on_fail(batch_id, header12, header_len, payload, payload_len, use_http);
   }
 }
 
@@ -200,6 +201,20 @@ static int queue_push_job(EdrSendJob *j) {
   EnterCriticalSection(&s_q_mu);
   if (!s_q_run || s_q_len >= s_q_cap) {
     LeaveCriticalSection(&s_q_mu);
+    if (edr_storage_queue_is_open()) {
+      int severity = 0;
+      if (j->use_http == 0) {
+        severity = 1;
+      }
+      EdrError rc = edr_storage_queue_enqueue(j->batch_id, j->wire, 
+                                              j->header_len + j->payload_len, 
+                                              0, severity);
+      if (rc == EDR_OK) {
+        fprintf(stderr, "[transport] queue full, persisted to offline buffer\n");
+        free_send_job(j);
+        return 0;
+      }
+    }
     return -1;
   }
   if (s_q_tail) {
@@ -215,6 +230,20 @@ static int queue_push_job(EdrSendJob *j) {
   pthread_mutex_lock(&s_q_mu);
   if (!s_q_run || s_q_len >= s_q_cap) {
     pthread_mutex_unlock(&s_q_mu);
+    if (edr_storage_queue_is_open()) {
+      int severity = 0;
+      if (j->use_http == 0) {
+        severity = 1;
+      }
+      EdrError rc = edr_storage_queue_enqueue(j->batch_id, j->wire, 
+                                              j->header_len + j->payload_len, 
+                                              0, severity);
+      if (rc == EDR_OK) {
+        fprintf(stderr, "[transport] queue full, persisted to offline buffer\n");
+        free_send_job(j);
+        return 0;
+      }
+    }
     return -1;
   }
   if (s_q_tail) {
@@ -427,6 +456,19 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
     }
   }
   transport_queue_start();
+  {
+    const char *split = getenv("EDR_EVENT_INGEST_SPLIT");
+    const char *grpc_fb = getenv("EDR_EVENT_GRPC_FALLBACK_HTTP");
+    const char *persist = getenv("EDR_PERSIST_QUEUE");
+    const char *persist_strat = getenv("EDR_PERSIST_STRATEGY");
+    fprintf(stderr,
+            "[transport] EDR_EVENT_INGEST_SPLIT=%s EDR_EVENT_GRPC_FALLBACK_HTTP=%s "
+            "EDR_PERSIST_QUEUE=%s EDR_PERSIST_STRATEGY=%s\n",
+            split ? split : "0",
+            grpc_fb ? grpc_fb : "1(default)",
+            persist ? persist : "0",
+            persist_strat ? persist_strat : "always(default)");
+  }
   edr_grpc_client_init(cfg);
   edr_ingest_http_start_command_poll();
 }

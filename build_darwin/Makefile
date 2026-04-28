@@ -829,54 +829,6 @@ src/core/time_util.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/time_util.c.s
 .PHONY : src/core/time_util.c.s
 
-src/grpc_gen/edr/v1/ingest.grpc.pb.o: src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o
-.PHONY : src/grpc_gen/edr/v1/ingest.grpc.pb.o
-
-# target to build an object file
-src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o
-.PHONY : src/grpc_gen/edr/v1/ingest.grpc.pb.cc.o
-
-src/grpc_gen/edr/v1/ingest.grpc.pb.i: src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i
-.PHONY : src/grpc_gen/edr/v1/ingest.grpc.pb.i
-
-# target to preprocess a source file
-src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i
-.PHONY : src/grpc_gen/edr/v1/ingest.grpc.pb.cc.i
-
-src/grpc_gen/edr/v1/ingest.grpc.pb.s: src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s
-.PHONY : src/grpc_gen/edr/v1/ingest.grpc.pb.s
-
-# target to generate assembly for a file
-src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s
-.PHONY : src/grpc_gen/edr/v1/ingest.grpc.pb.cc.s
-
-src/grpc_gen/edr/v1/ingest.pb.o: src/grpc_gen/edr/v1/ingest.pb.cc.o
-.PHONY : src/grpc_gen/edr/v1/ingest.pb.o
-
-# target to build an object file
-src/grpc_gen/edr/v1/ingest.pb.cc.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.o
-.PHONY : src/grpc_gen/edr/v1/ingest.pb.cc.o
-
-src/grpc_gen/edr/v1/ingest.pb.i: src/grpc_gen/edr/v1/ingest.pb.cc.i
-.PHONY : src/grpc_gen/edr/v1/ingest.pb.i
-
-# target to preprocess a source file
-src/grpc_gen/edr/v1/ingest.pb.cc.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.i
-.PHONY : src/grpc_gen/edr/v1/ingest.pb.cc.i
-
-src/grpc_gen/edr/v1/ingest.pb.s: src/grpc_gen/edr/v1/ingest.pb.cc.s
-.PHONY : src/grpc_gen/edr/v1/ingest.pb.s
-
-# target to generate assembly for a file
-src/grpc_gen/edr/v1/ingest.pb.cc.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/grpc_gen/edr/v1/ingest.pb.cc.s
-.PHONY : src/grpc_gen/edr/v1/ingest.pb.cc.s
-
 src/main.o: src/main.c.o
 .PHONY : src/main.o
 
@@ -1218,6 +1170,30 @@ src/preprocess/p0_rule_match.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.s
 .PHONY : src/preprocess/p0_rule_match.c.s
+
+src/preprocess/preprocess_env.o: src/preprocess/preprocess_env.c.o
+.PHONY : src/preprocess/preprocess_env.o
+
+# target to build an object file
+src/preprocess/preprocess_env.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o
+.PHONY : src/preprocess/preprocess_env.c.o
+
+src/preprocess/preprocess_env.i: src/preprocess/preprocess_env.c.i
+.PHONY : src/preprocess/preprocess_env.i
+
+# target to preprocess a source file
+src/preprocess/preprocess_env.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.i
+.PHONY : src/preprocess/preprocess_env.c.i
+
+src/preprocess/preprocess_env.s: src/preprocess/preprocess_env.c.s
+.PHONY : src/preprocess/preprocess_env.s
+
+# target to generate assembly for a file
+src/preprocess/preprocess_env.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.s
+.PHONY : src/preprocess/preprocess_env.c.s
 
 src/preprocess/preprocess_pipeline.o: src/preprocess/preprocess_pipeline.c.o
 .PHONY : src/preprocess/preprocess_pipeline.o
@@ -1603,29 +1579,29 @@ src/transport/event_batch.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/event_batch.c.s
 .PHONY : src/transport/event_batch.c.s
 
-src/transport/grpc_client_impl.o: src/transport/grpc_client_impl.cpp.o
-.PHONY : src/transport/grpc_client_impl.o
+src/transport/grpc_client_stub.o: src/transport/grpc_client_stub.c.o
+.PHONY : src/transport/grpc_client_stub.o
 
 # target to build an object file
-src/transport/grpc_client_impl.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.o
-.PHONY : src/transport/grpc_client_impl.cpp.o
+src/transport/grpc_client_stub.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.o
+.PHONY : src/transport/grpc_client_stub.c.o
 
-src/transport/grpc_client_impl.i: src/transport/grpc_client_impl.cpp.i
-.PHONY : src/transport/grpc_client_impl.i
+src/transport/grpc_client_stub.i: src/transport/grpc_client_stub.c.i
+.PHONY : src/transport/grpc_client_stub.i
 
 # target to preprocess a source file
-src/transport/grpc_client_impl.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.i
-.PHONY : src/transport/grpc_client_impl.cpp.i
+src/transport/grpc_client_stub.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.i
+.PHONY : src/transport/grpc_client_stub.c.i
 
-src/transport/grpc_client_impl.s: src/transport/grpc_client_impl.cpp.s
-.PHONY : src/transport/grpc_client_impl.s
+src/transport/grpc_client_stub.s: src/transport/grpc_client_stub.c.s
+.PHONY : src/transport/grpc_client_stub.s
 
 # target to generate assembly for a file
-src/transport/grpc_client_impl.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/grpc_client_impl.cpp.s
-.PHONY : src/transport/grpc_client_impl.cpp.s
+src/transport/grpc_client_stub.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/transport/grpc_client_stub.c.s
+.PHONY : src/transport/grpc_client_stub.c.s
 
 src/transport/ingest_http.o: src/transport/ingest_http.c.o
 .PHONY : src/transport/ingest_http.o
@@ -1988,12 +1964,6 @@ help:
 	@echo "... src/core/time_util.o"
 	@echo "... src/core/time_util.i"
 	@echo "... src/core/time_util.s"
-	@echo "... src/grpc_gen/edr/v1/ingest.grpc.pb.o"
-	@echo "... src/grpc_gen/edr/v1/ingest.grpc.pb.i"
-	@echo "... src/grpc_gen/edr/v1/ingest.grpc.pb.s"
-	@echo "... src/grpc_gen/edr/v1/ingest.pb.o"
-	@echo "... src/grpc_gen/edr/v1/ingest.pb.i"
-	@echo "... src/grpc_gen/edr/v1/ingest.pb.s"
 	@echo "... src/main.o"
 	@echo "... src/main.i"
 	@echo "... src/main.s"
@@ -2036,6 +2006,9 @@ help:
 	@echo "... src/preprocess/p0_rule_match.o"
 	@echo "... src/preprocess/p0_rule_match.i"
 	@echo "... src/preprocess/p0_rule_match.s"
+	@echo "... src/preprocess/preprocess_env.o"
+	@echo "... src/preprocess/preprocess_env.i"
+	@echo "... src/preprocess/preprocess_env.s"
 	@echo "... src/preprocess/preprocess_pipeline.o"
 	@echo "... src/preprocess/preprocess_pipeline.i"
 	@echo "... src/preprocess/preprocess_pipeline.s"
@@ -2084,9 +2057,9 @@ help:
 	@echo "... src/transport/event_batch.o"
 	@echo "... src/transport/event_batch.i"
 	@echo "... src/transport/event_batch.s"
-	@echo "... src/transport/grpc_client_impl.o"
-	@echo "... src/transport/grpc_client_impl.i"
-	@echo "... src/transport/grpc_client_impl.s"
+	@echo "... src/transport/grpc_client_stub.o"
+	@echo "... src/transport/grpc_client_stub.i"
+	@echo "... src/transport/grpc_client_stub.s"
 	@echo "... src/transport/ingest_http.o"
 	@echo "... src/transport/ingest_http.i"
 	@echo "... src/transport/ingest_http.s"

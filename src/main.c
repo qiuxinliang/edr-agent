@@ -243,6 +243,29 @@ int main(int argc, char **argv) {
     return 1;
   }
   {
+    const char *p0_emit = getenv("EDR_P0_DIRECT_EMIT");
+    const char *beh_enc = getenv("EDR_BEHAVIOR_ENCODING");
+    const char *p0_debug = getenv("EDR_P0_DEBUG");
+    fprintf(stderr,
+            "[startup] EDR_P0_DIRECT_EMIT=%s EDR_BEHAVIOR_ENCODING=%s EDR_P0_DEBUG=%s\n",
+            p0_emit ? p0_emit : "(unset)",
+            beh_enc ? beh_enc : "(unset)",
+            p0_debug ? "1" : "(unset)");
+    if (!p0_emit || strcmp(p0_emit, "1") != 0) {
+      fprintf(stderr,
+              "[startup] HINT: P0 direct emit is OFF. Set EDR_P0_DIRECT_EMIT=1 to enable "
+              "P0 rule alerts (required for smoke test).\n");
+    }
+    if (!beh_enc || (strcmp(beh_enc, "protobuf") != 0 && strcmp(beh_enc, "protobuf_c") != 0)) {
+      fprintf(stderr,
+              "[startup] HINT: EDR_BEHAVIOR_ENCODING is not 'protobuf'. "
+              "Set EDR_BEHAVIOR_ENCODING=protobuf for platform ingest compatibility.\n");
+    }
+#ifndef EDR_HAVE_NANOPB
+    fprintf(stderr, "[startup] FATAL: EDR_HAVE_NANOPB not defined; behavior alerts will be DISCARDED.\n");
+#endif
+  }
+  {
     const char *qpath = getenv("EDR_QUEUE_PATH");
     const EdrConfig *ac = edr_agent_get_config(agent);
     if ((!qpath || !qpath[0]) && ac && ac->offline.queue_db_path[0]) {

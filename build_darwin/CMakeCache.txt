@@ -273,7 +273,7 @@ EDR_WITH_FL_KAFKA:BOOL=OFF
 EDR_WITH_FL_TRAINER:BOOL=OFF
 
 //Build with gRPC++ EventIngest client (mTLS)
-EDR_WITH_GRPC:BOOL=ON
+EDR_WITH_GRPC:BOOL=OFF
 
 //FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAKE_PREFIX_PATH）
 EDR_WITH_LIBTORCH:BOOL=OFF
@@ -537,7 +537,9 @@ CURL_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CURL_LIBRARY_RELEASE
 CURL_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 //EDR gRPC client availability
-EDR_GRPC_CLIENT_AVAILABLE:INTERNAL=1
+EDR_GRPC_CLIENT_AVAILABLE:INTERNAL=0
+//Details about finding CURL
+FIND_PACKAGE_MESSAGE_DETAILS_CURL:INTERNAL=[/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd][/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include][ ][v8.7.1()]
 //Details about finding OpenSSL
 FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[/opt/homebrew/lib/libcrypto.dylib][/opt/homebrew/include][ ][v3.6.2()]
 //Details about finding Threads

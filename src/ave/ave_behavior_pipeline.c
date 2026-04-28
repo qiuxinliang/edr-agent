@@ -935,7 +935,6 @@ void edr_ave_bp_feed(const AVEBehaviorEvent *event) {
   (void)atomic_fetch_add_explicit(&s_bp_feed_total, 1u, memory_order_relaxed);
   if (!s_monitor_started) {
     (void)atomic_fetch_add_explicit(&s_bp_feed_sync_bypass, 1u, memory_order_relaxed);
-    process_one_event(event);
     return;
   }
   if (s_q) {

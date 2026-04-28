@@ -238,6 +238,34 @@ EDR_BUILD_AVE_SHARED_LIB:BOOL=OFF
 // tree)
 EDR_BUILD_TESTS:BOOL=OFF
 
+//Path to a program.
+EDR_CCACHE_BIN:FILEPATH=EDR_CCACHE_BIN-NOTFOUND
+
+//Enable architecture-specific optimizations
+EDR_ENABLE_ARCH_OPTIMIZATION:BOOL=ON
+
+//Use ccache/sccache as compiler launcher when available
+EDR_ENABLE_COMPILER_CACHE:BOOL=ON
+
+//Enable interprocedural optimization (IPO/LTO) when supported
+EDR_ENABLE_IPO:BOOL=OFF
+
+//Enable aggressive compiler optimizations
+EDR_ENABLE_OPTIMIZATION:BOOL=ON
+
+//Enable CMake UNITY_BUILD for faster local builds
+EDR_ENABLE_UNITY_BUILD:BOOL=OFF
+
+//Generate compile-time byte array from config/p0_rule_bundle_ir_v1.json
+EDR_P0_IR_EMBED:BOOL=ON
+
+//P0 dynamic rules bundle id (align with edr-agent/config/p0_rule_bundle_manifest.json
+// and platform)
+EDR_P0_RULES_BUNDLE_VERSION:STRING=edr-dynamic-rules-v1-r218-9ae52519
+
+//Path to a program.
+EDR_SCCACHE_BIN:FILEPATH=EDR_SCCACHE_BIN-NOTFOUND
+
 //FL: consume round announces via librdkafka (requires EDR_WITH_FL_TRAINER)
 EDR_WITH_FL_KAFKA:BOOL=OFF
 
@@ -268,6 +296,12 @@ OPENSSL_INCLUDE_DIR:PATH=/opt/homebrew/include
 //Path to a library.
 OPENSSL_SSL_LIBRARY:FILEPATH=/opt/homebrew/lib/libssl.dylib
 
+//Path to a library.
+PCRE2_8_LIB:FILEPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libpcre2-8.tbd
+
+//Path to a file.
+PCRE2_INCLUDE_DIR:PATH=PCRE2_INCLUDE_DIR-NOTFOUND
+
 //Arguments to supply to pkg-config
 PKG_CONFIG_ARGN:STRING=
 
@@ -297,6 +331,9 @@ edr_agent_IS_TOP_LEVEL:STATIC=ON
 
 //Value Computed by CMake
 edr_agent_SOURCE_DIR:STATIC=/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent
+
+//The directory containing a CMake configuration file for pcre2.
+pcre2_DIR:PATH=pcre2_DIR-NOTFOUND
 
 //Path to a library.
 pkgcfg_lib_PC_CURL_curl:FILEPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd
@@ -605,5 +642,5 @@ pkgcfg_lib_PC_SQLite3_sqlite3-ADVANCED:INTERNAL=1
 pkgcfg_lib__OPENSSL_crypto-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib__OPENSSL_ssl
 pkgcfg_lib__OPENSSL_ssl-ADVANCED:INTERNAL=1
-prefix_result:INTERNAL=/usr/lib
+prefix_result:INTERNAL=alt-svc;AsynchDNS;GSS-API;HSTS;HTTP2;HTTPS-proxy;IPv6;Kerberos;Largefile;libz;MultiSSL;NTLM;SPNEGO;SSL;threadsafe;UnixSockets
 

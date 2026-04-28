@@ -297,12 +297,30 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
           (unsigned)s_procname_gate_keep_unknown_permille, s_strict_behavior_gate_enabled);
 }
 
+/** 高价值安全事件类型——即使资源受限也应触发 P0 检测 */
+static int slot_is_p0_eligible(const EdrEventSlot *slot) {
+  if (!slot) {
+    return 0;
+  }
+  switch (slot->type) {
+    case EDR_EVENT_PROCESS_CREATE:
+    case EDR_EVENT_PROCESS_INJECT:
+    case EDR_EVENT_THREAD_CREATE_REMOTE:
+    case EDR_EVENT_PROTOCOL_SHELLCODE:
+    case EDR_EVENT_WEBSHELL_DETECTED:
+    case EDR_EVENT_PMFE_SCAN_RESULT:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
       slot->attack_surface_hint == 0u) {
     /* 即使在资源压力下被丢弃，仍然尝试P0检测（关键告警不应被压制） */
-    if (slot && slot->type == EDR_EVENT_PROCESS_CREATE) {
+    if (slot_is_p0_eligible(slot)) {
       EdrBehaviorRecord br;
       edr_behavior_from_slot(slot, &br);
       edr_behavior_record_fill_process_chain_depth(&br);
@@ -327,7 +345,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   apply_agent_ids_to_record(&br);
 
   /* P0检测：尽早执行，确保关键告警不被后续丢弃逻辑遗漏 */
-  if (slot && slot->type == EDR_EVENT_PROCESS_CREATE) {
+  if (slot_is_p0_eligible(slot)) {
     edr_p0_rule_try_emit(&br);
   }
 
