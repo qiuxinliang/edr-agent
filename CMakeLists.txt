@@ -52,9 +52,12 @@ if(MSVC)
     _CRT_SECURE_NO_WARNINGS
     _CRT_NONSTDC_NO_WARNINGS
   )
-  # Ensure Windows SDK shared directory is included for evnttrace.h
+  # Ensure Windows SDK directories are included for ETW headers
   if(DEFINED ENV{WindowsSDKVersion})
+    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}um")
     include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}shared")
+    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}winrt")
+    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}ucrt")
   endif()
 endif()
 
