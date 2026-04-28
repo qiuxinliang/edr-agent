@@ -52,6 +52,10 @@ if(MSVC)
     _CRT_SECURE_NO_WARNINGS
     _CRT_NONSTDC_NO_WARNINGS
   )
+  # Ensure Windows SDK um directory is included for evnttrace.h
+  if(DEFINED ENV{WindowsSDKVersion})
+    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}um")
+  endif()
 endif()
 
 if(EDR_ENABLE_OPTIMIZATION)
