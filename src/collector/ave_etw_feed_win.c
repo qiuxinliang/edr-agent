@@ -7,15 +7,11 @@
 #error ave_etw_feed_win.c is Windows-only
 #endif
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
 #include <windows.h>
 
 #include <guiddef.h>
 #include <basetsd.h>
 #include <initguid.h>
-#include <ntdef.h>
 
 #include <evntcons.h>
 

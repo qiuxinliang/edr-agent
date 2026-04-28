@@ -6,14 +6,10 @@
 #define EDR_EDR_A44_SPLIT_PATH_WIN_H
 
 #if defined(_WIN32)
+#include <windows.h>
 #include "edr/error.h"
 #include "edr/event_bus.h"
 #include "edr/types.h"
-
-#include <guiddef.h>
-#include <basetsd.h>
-#include <initguid.h>
-#include <ntdef.h>
 
 #include <evntcons.h>
 #include <stdint.h>

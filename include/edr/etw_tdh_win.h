@@ -11,12 +11,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <windows.h>
-
-#include <guiddef.h>
-#include <basetsd.h>
-#include <initguid.h>
-#include <ntdef.h>
-
 #include <evntcons.h>
 
 #include "edr/types.h"
