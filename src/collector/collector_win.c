@@ -1028,6 +1028,17 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   }
   edr_etw_observability_on_callback(tag);
 
+  {
+    static int s_sec_diag_done;
+    if (!s_sec_diag_done && tag && strcmp(tag, "sec") == 0) {
+      s_sec_diag_done = 1;
+      fprintf(stderr, "[collector_win] SEC-AUDIT: first event received: EventId=%u Opcode=%u Pid=%lu\n",
+              (unsigned)event_record->EventHeader.EventDescriptor.Id,
+              (unsigned)event_record->EventHeader.EventDescriptor.Opcode,
+              (unsigned long)event_record->EventHeader.ProcessId);
+    }
+  }
+
   const uint64_t ts_ns = edr_unix_ns();
   if (edr_a44_split_path_enabled()) {
     EdrA44QueueItem qit;
