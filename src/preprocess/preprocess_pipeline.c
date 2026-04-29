@@ -360,16 +360,18 @@ static int process_name_looks_like_exe(const char *name) {
   return 0;
 }
 
-/** 判断 behavior record 是否含有可上送的实质数据。无进程名、无命令行、无脚本/文件/网络/注册表字段的时间件应跳过。 */
+/** 判断 behavior record 是否含有可上送的实质数据。无进程上下文的事件应跳过。 */
 static int behavior_record_has_meaningful_data(const EdrBehaviorRecord *br, EdrEventType slot_type) {
   if (!br) return 0;
   if (br->process_name[0] || br->cmdline[0] || br->exe_path[0]) return 1;
   if (br->script_snippet[0]) return 1;
-  if (br->file_path[0] || br->dns_query[0] || br->net_dst[0] || br->reg_key_path[0]) return 1;
+  if (br->file_path[0] || br->dns_query[0] || br->reg_key_path[0]) return 1;
+  /* NET_CONNECT/LISTEN：仅有 dest_ip 无进程上下文 → 跳过 */
+  if (slot_type == EDR_EVENT_NET_CONNECT || slot_type == EDR_EVENT_NET_LISTEN) return 0;
   /* PROCESS_TERMINATE：进程已退出，TDH 不可回溯。仅 pid 无其他字段 → 跳过 */
   if (slot_type == EDR_EVENT_PROCESS_TERMINATE) return 0;
-  /* NET_CONNECT/LISTEN：pid=0 的内核态网络事件无进程上下文 */
-  if ((slot_type == EDR_EVENT_NET_CONNECT || slot_type == EDR_EVENT_NET_LISTEN) && br->pid == 0) return 0;
+  /* PROCESS_CREATE：有 process_chain_depth 但无进程名/命令行 → 跳过 */
+  if (slot_type == EDR_EVENT_PROCESS_CREATE) return 0;
   /* SCRIPT 事件：无脚本片段、无命令行 → 跳过 */
   if (slot_type == EDR_EVENT_SCRIPT_POWERSHELL || slot_type == EDR_EVENT_SCRIPT_WMI) return 0;
   return 1;
