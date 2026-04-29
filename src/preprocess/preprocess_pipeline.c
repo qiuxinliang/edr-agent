@@ -411,6 +411,14 @@ static void process_one_slot(const EdrEventSlot *slot) {
       return;
     }
   }
+  /* 将进程名门控扩展到非进程事件：仅 hot 进程产生的 file/registry/network 事件才送入下游 */
+  if (s_procname_gate_enabled && br.priority != 0u &&
+      slot && slot->type != EDR_EVENT_PROCESS_CREATE &&
+      br.process_name[0] && !process_name_in_gate_allowlist(br.process_name)) {
+    if (!rng_hit_permille(s_procname_gate_keep_unknown_permille)) {
+      return;
+    }
+  }
   edr_pid_history_pmfe_fill_record(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);
   if (s_l2_split_enabled && br.priority != 0u &&
