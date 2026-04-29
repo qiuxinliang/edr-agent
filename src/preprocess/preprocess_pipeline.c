@@ -360,6 +360,21 @@ static int process_name_looks_like_exe(const char *name) {
   return 0;
 }
 
+/** 判断 behavior record 是否含有可上送的实质数据。无进程名、无命令行、无脚本/文件/网络/注册表字段的时间件应跳过。 */
+static int behavior_record_has_meaningful_data(const EdrBehaviorRecord *br, EdrEventType slot_type) {
+  if (!br) return 0;
+  if (br->process_name[0] || br->cmdline[0] || br->exe_path[0]) return 1;
+  if (br->script_snippet[0]) return 1;
+  if (br->file_path[0] || br->dns_query[0] || br->net_dst[0] || br->reg_key_path[0]) return 1;
+  /* PROCESS_TERMINATE：进程已退出，TDH 不可回溯。仅 pid 无其他字段 → 跳过 */
+  if (slot_type == EDR_EVENT_PROCESS_TERMINATE) return 0;
+  /* NET_CONNECT/LISTEN：pid=0 的内核态网络事件无进程上下文 */
+  if ((slot_type == EDR_EVENT_NET_CONNECT || slot_type == EDR_EVENT_NET_LISTEN) && br->pid == 0) return 0;
+  /* SCRIPT 事件：无脚本片段、无命令行 → 跳过 */
+  if (slot_type == EDR_EVENT_SCRIPT_POWERSHELL || slot_type == EDR_EVENT_SCRIPT_WMI) return 0;
+  return 1;
+}
+
 static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
@@ -395,6 +410,13 @@ static void process_one_slot(const EdrEventSlot *slot) {
   /* 丢弃 PROCESS_CREATE 事件中非可执行程序的进程名（img= 指向 DLL/SYS 等非 exe 模块） */
   if (slot && slot->type == EDR_EVENT_PROCESS_CREATE &&
       br.process_name[0] && !process_name_looks_like_exe(br.process_name)) {
+    return;
+  }
+
+  /* 空事件过滤：无进程名、无有效数据的 PROCESS_TERMINATE/NET_CONNECT/SCRIPT 等跳过。
+   * 仅在非 P0 类型上生效，P0 eligible 事件仍走 P0 检测路径（某些规则匹配 file_path 等非进程字段）。 */
+  if (!slot_is_p0_eligible(slot) &&
+      !behavior_record_has_meaningful_data(&br, slot->type)) {
     return;
   }
 

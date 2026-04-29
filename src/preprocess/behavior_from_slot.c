@@ -332,11 +332,13 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
 
     if (!r->process_name[0] && r->pid != 0) {
+#ifdef _WIN32
       char process_path[MAX_PATH];
       if (edr_get_process_path_by_pid((DWORD)r->pid, process_path, sizeof(process_path)) == 0 && process_path[0]) {
         snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(process_path));
         snprintf(r->exe_path, sizeof(r->exe_path), "%s", process_path);
       }
+#endif
     }
     
     if (ef.has_pimg) {
