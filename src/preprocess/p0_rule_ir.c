@@ -876,6 +876,17 @@ void edr_p0_rule_ir_lazy_init(void) {
       free(buf);
     } else {
       fprintf(stderr, "[p0_rule_ir] cannot read %s\n", path);
+      /* retry with .enc extension for encrypted external bundles */
+      size_t plen = strlen(path);
+      if (plen + 5 < sizeof(path)) {
+        memcpy(path + plen, ".enc", 5);
+        if (read_full_file(path, &buf, &blen)) {
+          loaded = p0_ir_load_from_json_text(path, buf, blen) ? 1 : 0;
+          free(buf);
+        } else {
+          fprintf(stderr, "[p0_rule_ir] cannot read %s either\n", path);
+        }
+      }
     }
   } else {
     fprintf(

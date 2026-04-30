@@ -160,6 +160,11 @@ option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAK
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 
 find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  message(STATUS "OpenSSL found: ${OPENSSL_VERSION} — P0 rule encryption will work")
+else()
+  message(STATUS "OpenSSL NOT found — P0 rule encryption will not work; encrypted external bundles won't be loaded (embed fallback only)")
+endif()
 
 # libcurl：ingest HTTP 内嵌 POST。
 # - gRPC 未启用/不可用时：HTTP 为唯一上送/回执路径，必须 find 到 libcurl，禁止仅依赖系统 curl 可执行文件。
@@ -654,6 +659,14 @@ if(EDR_WITH_FL_TRAINER AND EDR_LIBTORCH_AVAILABLE)
   endif()
 endif()
 if(EDR_WITH_FL_TRAINER AND OpenSSL_FOUND)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_FL=1)
+  if(TARGET OpenSSL::SSL)
+    target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  else()
+    target_link_libraries(edr_agent PRIVATE OpenSSL::Crypto)
+  endif()
+endif()
+if(OpenSSL_FOUND AND NOT EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_FL=1)
   if(TARGET OpenSSL::SSL)
     target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
