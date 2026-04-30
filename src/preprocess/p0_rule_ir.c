@@ -872,9 +872,24 @@ void edr_p0_rule_ir_lazy_init(void) {
   char path[2048];
   char *buf = NULL;
   size_t blen = 0;
+  char *decrypted = NULL;
   if (build_default_path(path, sizeof(path))) {
     if (read_full_file(path, &buf, &blen)) {
-      loaded = p0_ir_load_from_json_text(path, buf, blen) ? 1 : 0;
+      if (edr_p0_encrypt_is_edr1((const uint8_t *)buf, blen)) {
+        uint8_t *plain = NULL;
+        size_t plain_len = 0;
+        int dr = edr_p0_encrypt_decrypt_edr1((const uint8_t *)buf, blen, &plain, &plain_len);
+        if (dr == 0) {
+          decrypted = (char *)plain;
+          loaded = p0_ir_load_from_json_text(path, decrypted, plain_len) ? 1 : 0;
+          free(decrypted);
+          decrypted = NULL;
+        } else {
+          fprintf(stderr, "[p0_rule_ir] decrypt %s failed: %d\n", path, dr);
+        }
+      } else {
+        loaded = p0_ir_load_from_json_text(path, buf, blen) ? 1 : 0;
+      }
       free(buf);
     } else {
       fprintf(stderr, "[p0_rule_ir] cannot read %s\n", path);
