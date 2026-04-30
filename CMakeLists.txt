@@ -866,6 +866,7 @@ if(EDR_P0_IR_PCRE2)
     APPEND
     _EDR_P0_GOLDEN_SRCS
     src/preprocess/p0_rule_ir.c
+    src/preprocess/encrypt_p0_rules.c
     src/preprocess/preprocess_env.c
     third_party/cjson/cJSON.c
   )

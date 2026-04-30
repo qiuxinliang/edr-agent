@@ -96,7 +96,7 @@ sampling_rate_whitelist = 0.02
 #                                          # 非门控进程名保留千分比（默认30=3%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
-rules_version = "edr-dynamic-rules-v1-r218-9ae52519"
+rules_version = "edr-dynamic-rules-v1-r218-9c557678"
 # 若本文件未显式配置 [[preprocessing.rules]]，Agent 会尝试从与 agent.toml 同目录的
 # agent_preprocess_rules_v1.toml 自动加载第一版动态前置规则（可用 EDR_PREPROCESS_RULES_BUNDLE_PATH 覆盖路径）。
 

@@ -76,7 +76,7 @@ static void edr_config_win_fixup_model_dir_from_unix_example(EdrConfig *cfg) {
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r218-9ae52519"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r218-9c557678"
 #define EDR_PREPROCESS_RULES_BUNDLE_NAME "agent_preprocess_rules_v1.toml"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
