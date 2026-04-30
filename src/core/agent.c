@@ -582,6 +582,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
         if (edr_remote_fetch_toml(p0_url, p0_tmp) == 0) {
           char p0_dst[1024];
           if (edr_p0_bundle_dst_path(p0_dst, sizeof(p0_dst)) == 0) {
+            (void)remove(p0_dst);
             if (rename(p0_tmp, p0_dst) != 0) {
               (void)remove(p0_tmp);
               EDR_LOGE("[config] P0 bundle 写入失败: %s\n", p0_dst);
