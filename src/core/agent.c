@@ -572,6 +572,32 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   EDR_LOGV("[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave%s%s\n",
            fp[0] ? " fingerprint=" : "", fp[0] ? fp : "");
+
+  /* 远程 P0 规则包热加载 (B1.1) */
+  {
+    const char *p0_url = getenv("EDR_REMOTE_P0_BUNDLE_URL");
+    if (p0_url && p0_url[0]) {
+      char p0_tmp[520];
+      if (edr_remote_tmp_path(p0_tmp, sizeof(p0_tmp)) == 0) {
+        if (edr_remote_fetch_toml(p0_url, p0_tmp) == 0) {
+          char p0_dst[1024];
+          if (edr_p0_bundle_dst_path(p0_dst, sizeof(p0_dst)) == 0) {
+            if (rename(p0_tmp, p0_dst) != 0) {
+              (void)remove(p0_tmp);
+              EDR_LOGE("[config] P0 bundle 写入失败: %s\n", p0_dst);
+            } else {
+              EDR_LOGI("[config] P0 bundle 热加载成功 (%s)\n", p0_dst);
+              edr_p0_rule_ir_reload();
+            }
+          } else {
+            (void)remove(p0_tmp);
+          }
+        } else {
+          (void)remove(p0_tmp);
+        }
+      }
+    }
+  }
 }
 
 /**

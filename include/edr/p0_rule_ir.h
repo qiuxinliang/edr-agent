@@ -11,6 +11,12 @@
 /* 在首次需匹配时惰性加载；可多次调用。 */
 void edr_p0_rule_ir_lazy_init(void);
 
+/* 热重载：清空已加载规则，重新从外部文件 / embed 加载。 */
+void edr_p0_rule_ir_reload(void);
+
+/* 获取 P0 bundle 目标路径（edr_config/ 下的 .json 文件）。返回值 0=成功，-1=无法解析路径。 */
+int edr_p0_bundle_dst_path(char *out, size_t cap);
+
 /* 1 = 已从 JSON 成功编译至少一条 P0 规则。 */
 int edr_p0_rule_ir_is_ready(void);
 

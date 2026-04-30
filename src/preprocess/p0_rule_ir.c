@@ -876,17 +876,6 @@ void edr_p0_rule_ir_lazy_init(void) {
       free(buf);
     } else {
       fprintf(stderr, "[p0_rule_ir] cannot read %s\n", path);
-      /* retry with .enc extension for encrypted external bundles */
-      size_t plen = strlen(path);
-      if (plen + 5 < sizeof(path)) {
-        memcpy(path + plen, ".enc", 5);
-        if (read_full_file(path, &buf, &blen)) {
-          loaded = p0_ir_load_from_json_text(path, buf, blen) ? 1 : 0;
-          free(buf);
-        } else {
-          fprintf(stderr, "[p0_rule_ir] cannot read %s either\n", path);
-        }
-      }
     }
   } else {
     fprintf(
@@ -924,6 +913,40 @@ void edr_p0_rule_ir_lazy_init(void) {
         "with EDR_P0_IR_EMBED)\n"
     );
   }
+}
+
+void edr_p0_rule_ir_reload(void) {
+  int i;
+  for (i = 0; i < s_n; i++) {
+    p0_ir_free_pcre_in_rule(&s_rule[i]);
+  }
+  memset(s_rule, 0, sizeof(s_rule));
+  s_n = 0;
+  s_ready = 0;
+  s_inited = 0;
+  edr_p0_rule_ir_lazy_init();
+}
+
+int edr_p0_bundle_dst_path(char *out, size_t cap) {
+  char tmp[2048];
+  const char *e = getenv("EDR_P0_IR_PATH");
+  if (e && *e) {
+    snprintf(out, cap, "%s", e);
+    return 0;
+  }
+#ifdef _WIN32
+  char ex[1024];
+  if (edr_win_exe_dir(ex, sizeof(ex))) {
+    snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json", ex);
+    return 0;
+  }
+#else
+  if (try_linux_proc_exe(tmp, sizeof(tmp))) {
+    snprintf(out, cap, "%s", tmp);
+    return 0;
+  }
+#endif
+  return -1;
 }
 
 int edr_p0_rule_ir_is_ready(void) { return s_ready; }
