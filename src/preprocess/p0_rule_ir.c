@@ -36,7 +36,7 @@ extern const size_t edr_p0_rule_ir_embed_len;
 #define P0_IR_NAME_IN_MAX 24
 #define P0_IR_PAT 40
 #define P0_IR_ID_MAX 64
-#define P0_IR_RULES_MAX 80
+#define P0_IR_RULES_MAX 256
 #define P0_IR_STR 512
 
 struct p0_ir_one {

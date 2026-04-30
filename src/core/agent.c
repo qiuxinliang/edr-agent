@@ -330,13 +330,14 @@ static int edr_remote_tmp_path(char *out, size_t cap) {
 #endif
 }
 
-static int edr_remote_fetch_toml(const char *url, const char *out_path) {
+static int edr_remote_fetch_toml(const char *url, const char *out_path, const char *endpoint_id) {
   if (!url || !url[0] || !out_path || !out_path[0]) {
     return -1;
   }
 #ifndef EDR_HAVE_LIBCURL
   (void)url;
   (void)out_path;
+  (void)endpoint_id;
   return -1;
 #else
   if (edr_remote_curl_init() != 0) {
@@ -360,6 +361,24 @@ static int edr_remote_fetch_toml(const char *url, const char *out_path) {
   curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)f);
+  if (endpoint_id && endpoint_id[0] && strcmp(endpoint_id, "auto") != 0) {
+    struct curl_slist *headers = NULL;
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "X-Endpoint-ID: %s", endpoint_id);
+    headers = curl_slist_append(headers, hdr);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    CURLcode cc = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    fclose(f);
+    curl_easy_cleanup(curl);
+    if (cc != CURLE_OK) {
+      (void)remove(out_path);
+      const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cc);
+      EDR_LOGE("[config] 远程 TOML 拉取失败: %s\n", em);
+      return -1;
+    }
+    return 0;
+  }
   CURLcode cc = curl_easy_perform(curl);
   fclose(f);
   curl_easy_cleanup(curl);
@@ -542,7 +561,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     EDR_LOGE("%s", "[config] 远程 TOML 临时文件创建失败\n");
     return;
   }
-  if (edr_remote_fetch_toml(url, tmp) != 0) {
+  if (edr_remote_fetch_toml(url, tmp, agent->cfg.agent.endpoint_id) != 0) {
     return;
   }
 
@@ -621,7 +640,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     if (p0_url && p0_url[0]) {
       char p0_tmp[520];
       if (edr_remote_tmp_path(p0_tmp, sizeof(p0_tmp)) == 0) {
-        if (edr_remote_fetch_toml(p0_url, p0_tmp) == 0) {
+        if (edr_remote_fetch_toml(p0_url, p0_tmp, agent->cfg.agent.endpoint_id) == 0) {
           char p0_dst[1024];
           if (edr_p0_bundle_dst_path(p0_dst, sizeof(p0_dst)) == 0) {
             (void)remove(p0_dst);

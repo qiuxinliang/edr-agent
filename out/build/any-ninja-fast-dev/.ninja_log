@@ -144,3 +144,11 @@
 93	327	1777565783661416732	CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.o	638fff3183eda7ba
 93	341	1777565783661178728	CMakeFiles/edr_agent.dir/src/config/config.c.o	2338dd6aa0b9788d
 341	462	1777565783908935207	edr_agent	fc14cad4f6aae27
+11	122	1777568542191370328	edr_p0_rule_ir_embed.c	45340adee7c986e
+11	122	1777568542191370328	/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/out/build/any-ninja-fast-dev/edr_p0_rule_ir_embed.c	45340adee7c986e
+122	261	1777568542194297856	CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.o	aa650e79456c573d
+122	354	1777568542194143730	CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.o	638fff3183eda7ba
+122	368	1777568542193851310	CMakeFiles/edr_agent.dir/src/config/config.c.o	2338dd6aa0b9788d
+368	497	1777568542439786715	edr_agent	fc14cad4f6aae27
+4	84	1777568869342403295	CMakeFiles/edr_agent.dir/src/core/agent.c.o	754161a1db013360
+84	144	1777568869421646140	edr_agent	fc14cad4f6aae27
