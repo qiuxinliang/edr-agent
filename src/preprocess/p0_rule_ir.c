@@ -706,6 +706,8 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
 static int p0_ir_load_from_json_text(const char *source_label, const char *data, size_t data_len) {
   s_n = 0;
   s_ready = 0;
+  fprintf(stderr, "[p0_rule_ir] loading %s (%zu bytes, %s)\n", source_label, data_len,
+          (data_len >= 4 && memcmp(data, "EDR1", 4) == 0) ? "EDR1" : (data_len >= 1 && data[0] == '{') ? "JSON" : "unknown");
   cJSON *root = cJSON_ParseWithLength(data, data_len);
   if (!root) {
     fprintf(stderr, "[p0_rule_ir] JSON parse failed: %s\n", source_label);

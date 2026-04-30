@@ -627,9 +627,9 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
             (void)remove(p0_dst);
             if (rename(p0_tmp, p0_dst) != 0) {
               (void)remove(p0_tmp);
-              EDR_LOGE("[config] P0 bundle 写入失败: %s\n", p0_dst);
+              fprintf(stderr, "[config] P0 bundle 写入失败: %s\n", p0_dst);
             } else {
-              EDR_LOGV("[config] P0 bundle 热加载成功 (%s)\n", p0_dst);
+              fprintf(stderr, "[config] P0 bundle 已更新 (%s)\n", p0_dst);
               edr_p0_rule_ir_reload();
             }
           } else {
