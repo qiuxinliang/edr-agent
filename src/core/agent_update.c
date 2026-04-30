@@ -15,7 +15,9 @@
 #include <unistd.h>
 #endif
 
+#ifndef _MSC_VER
 #include <strings.h>
+#endif
 
 #ifdef EDR_HAVE_OPENSSL_FL
 #include <openssl/sha.h>
@@ -286,7 +288,11 @@ int edr_agent_check_update(const EdrConfig *cfg) {
     return 0;
   }
 
+#ifdef _MSC_VER
+  if (_stricmp(actual_sha, expected_sha) != 0) {
+#else
   if (strcasecmp(actual_sha, expected_sha) != 0) {
+#endif
     fprintf(stderr, "[update] sha256 mismatch: got %s, expected %s\n", actual_sha, expected_sha);
     (void)remove(staged);
     return 0;
