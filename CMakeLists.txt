@@ -467,10 +467,11 @@ endif()
 if(EDR_PCRE2_TARGET)
   list(APPEND EDR_AGENT_SOURCES
     src/preprocess/p0_rule_ir.c
+    src/preprocess/encrypt_p0_rules.c
     third_party/cjson/cJSON.c
   )
   set(EDR_P0_IR_PCRE2 1)
-  message(STATUS "edr_agent: P0 IR (pcre2 + cJSON) enabled, link: ${EDR_PCRE2_TARGET}")
+  message(STATUS "edr_agent: P0 IR (pcre2 + cJSON + encrypt_p0_rules) enabled, link: ${EDR_PCRE2_TARGET}")
 else()
   set(EDR_P0_IR_PCRE2 0)
   list(APPEND EDR_AGENT_SOURCES src/preprocess/p0_rule_ir_stub.c)
@@ -484,26 +485,53 @@ endif()
 set(EDR_P0_IR_HAS_EMBED 0)
 set(EDR_P0_IR_EMBED_C "")
 option(EDR_P0_IR_EMBED "Generate compile-time byte array from config/p0_rule_bundle_ir_v1.json" ON)
+option(EDR_P0_IR_ENCRYPT_EMBED "Encrypt the embed byte array with AES-256-GCM (requires Python3 + cryptography)" OFF)
 if(EDR_P0_IR_PCRE2 AND EDR_P0_IR_EMBED AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   set(EDR_P0_IR_EMBED_C "${CMAKE_CURRENT_BINARY_DIR}/edr_p0_rule_ir_embed.c")
-  add_custom_command(
-    OUTPUT "${EDR_P0_IR_EMBED_C}"
-    COMMAND
-      ${Python3_EXECUTABLE}
-      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
-      --input
-      "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-      --output
-      "${EDR_P0_IR_EMBED_C}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
-    COMMENT "Generate P0 IR compile-time embed (edr_p0_rule_ir_embed.c)"
-    VERBATIM
-  )
+
+  if(EDR_P0_IR_ENCRYPT_EMBED)
+    set(EDR_P0_IR_ENC_TMP "${CMAKE_CURRENT_BINARY_DIR}/edr_p0_rule_ir_enc.tmp")
+    add_custom_command(
+      OUTPUT "${EDR_P0_IR_EMBED_C}"
+      COMMAND
+        ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/encrypt_p0_rules.py"
+        --input "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+        --output "${EDR_P0_IR_ENC_TMP}"
+        --no-crypto-check
+      COMMAND
+        ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
+        --input "${EDR_P0_IR_ENC_TMP}"
+        --output "${EDR_P0_IR_EMBED_C}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/encrypt_p0_rules.py"
+      COMMENT "Encrypt + embed P0 IR rules (EDR1 format)"
+      VERBATIM
+    )
+    message(STATUS "P0 IR compile-time embed: ON (encrypted, AES-256-GCM)")
+  else()
+    add_custom_command(
+      OUTPUT "${EDR_P0_IR_EMBED_C}"
+      COMMAND
+        ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
+        --input
+        "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+        --output
+        "${EDR_P0_IR_EMBED_C}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
+      COMMENT "Generate P0 IR compile-time embed (edr_p0_rule_ir_embed.c)"
+      VERBATIM
+    )
+    message(STATUS "P0 IR compile-time embed: ON -> ${EDR_P0_IR_EMBED_C}")
+  endif()
+
   set(EDR_P0_IR_HAS_EMBED 1)
   list(APPEND EDR_AGENT_SOURCES "${EDR_P0_IR_EMBED_C}")
-  message(STATUS "P0 IR compile-time embed: ON -> ${EDR_P0_IR_EMBED_C}")
 elseif(EDR_P0_IR_PCRE2 AND EDR_P0_IR_EMBED)
   if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
     message(STATUS "P0 IR embed skipped: config/p0_rule_bundle_ir_v1.json missing (set EDR_P0_IR_EMBED=OFF to silence if intentional)")

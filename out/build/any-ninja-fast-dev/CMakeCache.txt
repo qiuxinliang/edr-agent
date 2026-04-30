@@ -22,7 +22,7 @@ CMAKE_AR:FILEPATH=/usr/bin/ar
 
 //Choose the type of build, options are: None Debug Release RelWithDebInfo
 // MinSizeRel ...
-CMAKE_BUILD_TYPE:STRING=Debug
+CMAKE_BUILD_TYPE:STRING=RelWithDebInfo
 
 //CXX compiler
 CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++
@@ -241,17 +241,27 @@ EDR_BUILD_TESTS:BOOL=OFF
 //Path to a program.
 EDR_CCACHE_BIN:FILEPATH=EDR_CCACHE_BIN-NOTFOUND
 
+//Enable architecture-specific optimizations
+EDR_ENABLE_ARCH_OPTIMIZATION:BOOL=ON
+
 //Use ccache/sccache as compiler launcher when available
 EDR_ENABLE_COMPILER_CACHE:BOOL=ON
 
 //Enable interprocedural optimization (IPO/LTO) when supported
 EDR_ENABLE_IPO:BOOL=OFF
 
+//Enable aggressive compiler optimizations
+EDR_ENABLE_OPTIMIZATION:BOOL=ON
+
 //Enable CMake UNITY_BUILD for faster local builds
 EDR_ENABLE_UNITY_BUILD:BOOL=OFF
 
 //Generate compile-time byte array from config/p0_rule_bundle_ir_v1.json
 EDR_P0_IR_EMBED:BOOL=ON
+
+//Encrypt the embed byte array with AES-256-GCM (requires Python3
+// + cryptography)
+EDR_P0_IR_ENCRYPT_EMBED:BOOL=ON
 
 //P0 dynamic rules bundle id (align with edr-agent/config/p0_rule_bundle_manifest.json
 // and platform)
@@ -294,7 +304,7 @@ OPENSSL_SSL_LIBRARY:FILEPATH=/opt/homebrew/lib/libssl.dylib
 PCRE2_8_LIB:FILEPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libpcre2-8.tbd
 
 //Path to a file.
-PCRE2_INCLUDE_DIR:PATH=PCRE2_INCLUDE_DIR-NOTFOUND
+PCRE2_INCLUDE_DIR:PATH=/opt/homebrew/include
 
 //Arguments to supply to pkg-config
 PKG_CONFIG_ARGN:STRING=
@@ -495,6 +505,8 @@ CURL_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 EDR_GRPC_CLIENT_AVAILABLE:INTERNAL=0
 //Details about finding CURL
 FIND_PACKAGE_MESSAGE_DETAILS_CURL:INTERNAL=[/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurl.tbd][/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include][ ][v8.7.1()]
+//Details about finding Python3
+FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9][found components: Interpreter ][v3.9.6()]
 //Details about finding Threads
 FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
 //ADVANCED property for variable: OPENSSL_CRYPTO_LIBRARY
@@ -616,6 +628,17 @@ _OPENSSL_openssl_INCLUDEDIR:INTERNAL=
 _OPENSSL_openssl_LIBDIR:INTERNAL=
 _OPENSSL_openssl_PREFIX:INTERNAL=
 _OPENSSL_openssl_VERSION:INTERNAL=
+//Compiler reason failure
+_Python3_Compiler_REASON_FAILURE:INTERNAL=
+//Development reason failure
+_Python3_Development_REASON_FAILURE:INTERNAL=
+//Path to a program.
+_Python3_EXECUTABLE:INTERNAL=/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9
+//Python3 Properties
+_Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;9;6;64;32;<none>;cpython-39-darwin;abi3;/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9;/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9;/Library/Python/3.9/site-packages;/Library/Python/3.9/site-packages
+_Python3_INTERPRETER_SIGNATURE:INTERNAL=716f6fe6cca06b8c12e315e94cfea4ac
+//NumPy reason failure
+_Python3_NumPy_REASON_FAILURE:INTERNAL=
 __pkg_config_arguments_PC_CURL:INTERNAL=QUIET;libcurl
 __pkg_config_arguments_PC_SQLite3:INTERNAL=QUIET;sqlite3
 __pkg_config_arguments__OPENSSL:INTERNAL=QUIET;openssl

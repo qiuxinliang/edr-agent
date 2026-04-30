@@ -2,6 +2,7 @@
 
 #include "edr/preprocess.h"
 #include "edr/behavior_record.h"
+#include "edr/encrypt_p0_rules.h"
 #include "cJSON.h"
 
 /* pcre2.h 要求：在包含前设定宽度；本文件使用 8 位 API（与 PCRE2_UCHAR8 / char* 一致） */
@@ -355,6 +356,21 @@ static int read_full_file(const char *path, char **out, size_t *out_len) {
   }
   size_t n = fread(b, 1, (size_t)sz, f);
   fclose(f);
+
+  if (edr_p0_encrypt_is_edr1((const uint8_t *)b, n)) {
+    uint8_t *plain = NULL;
+    size_t plain_len = 0;
+    int dr = edr_p0_encrypt_decrypt_edr1((const uint8_t *)b, n, &plain, &plain_len);
+    free(b);
+    if (dr != 0) {
+      fprintf(stderr, "[p0_rule_ir] decrypt %s failed: %d\n", path, dr);
+      return 0;
+    }
+    *out = (char *)plain;
+    *out_len = plain_len;
+    return 1;
+  }
+
   b[n] = 0;
   *out = b;
   *out_len = n;
@@ -870,10 +886,24 @@ void edr_p0_rule_ir_lazy_init(void) {
   }
 #if defined(EDR_P0_IR_HAS_EMBED) && EDR_P0_IR_HAS_EMBED
   if (!loaded) {
+    const char *embed_data = (const char *)edr_p0_rule_ir_embed_bytes;
+    size_t embed_len = edr_p0_rule_ir_embed_len;
+    char *decrypted = NULL;
+    if (edr_p0_encrypt_is_edr1((const uint8_t *)embed_data, embed_len)) {
+      uint8_t *plain = NULL;
+      size_t plain_len = 0;
+      int dr = edr_p0_encrypt_decrypt_edr1((const uint8_t *)embed_data, embed_len, &plain, &plain_len);
+      if (dr == 0) {
+        decrypted = (char *)plain;
+        embed_data = decrypted;
+        embed_len = plain_len;
+      }
+    }
     loaded = p0_ir_load_from_json_text(
-        "embedded: p0_rule_bundle_ir_v1.json", (const char *)edr_p0_rule_ir_embed_bytes,
-        edr_p0_rule_ir_embed_len
-    );
+        "embedded: p0_rule_bundle_ir_v1.json", embed_data, embed_len);
+    if (decrypted) {
+      free(decrypted);
+    }
   }
 #endif
   if (!loaded) {
