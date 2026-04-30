@@ -646,9 +646,9 @@
       "mitre_ttps": [
         "T1059"
       ],
-      "description": "父链深度异常（>20）",
+      "description": "父链深度异常（>80，系统进程自动钳制至≤10）",
       "condition": {
-        "process_chain_depth_gt": 20
+        "process_chain_depth_gt": 80
       }
     },
     {
