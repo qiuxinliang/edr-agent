@@ -13,6 +13,8 @@
 #endif
 
 #include "edr/attack_surface_report.h"
+#include "edr/p0_rule_ir.h"
+#include "edr/agent_update.h"
 #include "edr/collector.h"
 #include "edr/p0_rule_match.h"
 #ifdef _WIN32
@@ -512,6 +514,15 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns) {
   const char *url = getenv("EDR_REMOTE_CONFIG_URL");
   const char *ps = getenv("EDR_REMOTE_CONFIG_POLL_S");
+  /* remote section in agent.toml takes precedence over env vars */
+  if (agent && agent->cfg.remote.rules_url[0]) {
+    url = agent->cfg.remote.rules_url;
+  }
+  if (agent && agent->cfg.remote.poll_interval_s > 0) {
+    static char poll_buf[16];
+    snprintf(poll_buf, sizeof(poll_buf), "%d", agent->cfg.remote.poll_interval_s);
+    ps = poll_buf;
+  }
   if (!agent || !url || !url[0] || !ps || !ps[0]) {
     return;
   }
@@ -573,9 +584,15 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   EDR_LOGV("[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave%s%s\n",
            fp[0] ? " fingerprint=" : "", fp[0] ? fp : "");
 
+  /* Agent 自更新检查 (每个轮询周期执行一次，内部限频) */
+  edr_agent_check_update(&agent->cfg);
+
   /* 远程 P0 规则包热加载 (B1.1) */
   {
     const char *p0_url = getenv("EDR_REMOTE_P0_BUNDLE_URL");
+    if (agent && agent->cfg.remote.p0_bundle_url[0]) {
+      p0_url = agent->cfg.remote.p0_bundle_url;
+    }
     if (p0_url && p0_url[0]) {
       char p0_tmp[520];
       if (edr_remote_tmp_path(p0_tmp, sizeof(p0_tmp)) == 0) {

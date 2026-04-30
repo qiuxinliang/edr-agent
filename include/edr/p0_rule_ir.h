@@ -6,6 +6,7 @@
 #ifndef EDR_P0_RULE_IR_H
 #define EDR_P0_RULE_IR_H
 
+#include <stddef.h>
 #include "edr/behavior_record.h"
 
 /* 在首次需匹配时惰性加载；可多次调用。 */

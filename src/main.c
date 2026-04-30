@@ -12,6 +12,7 @@
 #include "edr/pmfe.h"
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
+#include "edr/agent_update.h"
 #include "edr/edr_log.h"
 
 #include <stdio.h>
@@ -242,6 +243,7 @@ int main(int argc, char **argv) {
     edr_agent_destroy(agent);
     return 1;
   }
+  edr_agent_startup_update(edr_agent_get_config(agent));
   {
     const char *p0_emit = getenv("EDR_P0_DIRECT_EMIT");
     const char *beh_enc = getenv("EDR_BEHAVIOR_ENCODING");

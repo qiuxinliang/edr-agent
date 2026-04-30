@@ -236,3 +236,25 @@ max_log_files        = 10
 # upload_webshell_files    = true
 # upload_timeout_s         = 60
 # max_upload_size_mb       = 10
+
+# =========================
+# [remote] 远程配置拉取
+# Agent 定时向平台轮询拉取最新的预处理规则（TOML）与 P0 加密规则包。
+# 若配置了本 section，将覆盖 EDR_REMOTE_CONFIG_URL / EDR_REMOTE_CONFIG_POLL_S / EDR_REMOTE_P0_BUNDLE_URL 环境变量。
+# =========================
+[remote]
+# 平台 REST API 地址（对应 GET /api/v1/agent/rules.toml）
+rules_url = "http://192.168.1.10:8080/api/v1/agent/rules.toml"
+
+# P0 加密规则包拉取地址（对应 GET /api/v1/agent/p0-bundle.enc）
+p0_bundle_url = "http://192.168.1.10:8080/api/v1/agent/p0-bundle.enc"
+
+# 轮询间隔秒数（>=5，推荐 30）
+poll_interval_s = 30
+
+# Agent 自更新: 版本清单地址（GET 返回 JSON: {version, sha256, ...}）
+# version_url = "http://192.168.1.10:8080/api/v1/agent/version"
+# Agent 自更新: 二进制下载地址
+# download_url = "http://192.168.1.10:8080/api/v1/agent/download/latest"
+# 是否启用自更新（默认 false）
+# auto_update = true

@@ -238,6 +238,7 @@ endif()
 set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
+  src/core/agent_update.c
   src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c

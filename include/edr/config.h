@@ -314,6 +314,15 @@ typedef struct EdrConfig {
     size_t frozen_layer_count_behavior;
     char frozen_layer_behavior[EDR_FL_FROZEN_MAX][EDR_FL_FROZEN_NAME_MAX];
   } fl;
+
+  struct {
+    char rules_url[512];
+    char p0_bundle_url[512];
+    int poll_interval_s;
+    char version_url[512];
+    char download_url[512];
+    bool auto_update;
+  } remote;
 } EdrConfig;
 
 /** 设计文档默认值（无文件或未指定键时使用） */

@@ -1697,6 +1697,13 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->self_protect.job_object_windows = false;
   cfg->self_protect.watchdog_log_interval_s = 0u;
   cfg->self_protect.event_bus_pressure_warn_pct = 90u;
+
+  cfg->remote.rules_url[0] = '\0';
+  cfg->remote.p0_bundle_url[0] = '\0';
+  cfg->remote.poll_interval_s = 0;
+  cfg->remote.version_url[0] = '\0';
+  cfg->remote.download_url[0] = '\0';
+  cfg->remote.auto_update = false;
 }
 
 static void load_command(toml_table_t *t, EdrConfig *cfg) {
@@ -1713,6 +1720,27 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.rest_user_id));
   take_string(toml_string_in(t, "rest_bearer_token"), cfg->platform.rest_bearer_token,
               sizeof(cfg->platform.rest_bearer_token));
+}
+
+static void load_remote(toml_table_t *t, EdrConfig *cfg) {
+  take_string(toml_string_in(t, "rules_url"), cfg->remote.rules_url,
+              sizeof(cfg->remote.rules_url));
+  take_string(toml_string_in(t, "p0_bundle_url"), cfg->remote.p0_bundle_url,
+              sizeof(cfg->remote.p0_bundle_url));
+  take_string(toml_string_in(t, "version_url"), cfg->remote.version_url,
+              sizeof(cfg->remote.version_url));
+  take_string(toml_string_in(t, "download_url"), cfg->remote.download_url,
+              sizeof(cfg->remote.download_url));
+  toml_datum_t d = toml_int_in(t, "poll_interval_s");
+  if (d.ok && d.u.i >= 5 && d.u.i <= 86400) {
+    cfg->remote.poll_interval_s = (int)d.u.i;
+  }
+  {
+    toml_datum_t b = toml_bool_in(t, "auto_update");
+    if (b.ok) {
+      cfg->remote.auto_update = b.u.b ? true : false;
+    }
+  }
 }
 
 /** 解析 `[fl] coordinator_secp256r1_pubkey_hex` → SEC1 点（33 或 65 字节） */
@@ -2166,6 +2194,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "fl");
     if (t) {
       load_fl(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "remote");
+    if (t) {
+      load_remote(t, cfg);
     }
   }
 
