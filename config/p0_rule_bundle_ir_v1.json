@@ -1,10 +1,10 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r218-9c557678",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r239-97acafca",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 132,
+  "rule_count": 149,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -2696,6 +2696,445 @@
           "(?i)Windows NT\\\\\\\\CurrentVersion\\\\\\\\Image File Execution Options\\\\\\\\"
         ]
       }
+    },
+    {
+      "id": "R-RMM-005",
+      "title": "RMM工具DLL侧加载/非标准子进程",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1574.001",
+        "T1059"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)cmd\\.exe",
+          "(?i)powershell\\.exe",
+          "(?i)net\\.exe\\s",
+          "(?i)whoami",
+          "(?i)systeminfo",
+          "(?i)rundll32\\.exe"
+        ],
+        "parent_name_in": [
+          "anydesk.exe",
+          "teamviewer.exe",
+          "screenconnect.exe"
+        ]
+      },
+      "description": "RMM 工具加载非签名或非标准路径的 DLL，或启动异常子进程(如 cmd/ps)"
+    },
+    {
+      "id": "R-LOLBIN-010",
+      "title": "非系统目录下的伪装系统文件执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059",
+        "T1218"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\\\Temp\\\\|\\\\AppData\\\\Local\\\\Temp\\\\",
+          "(?i)\\\\AppData\\\\Roaming\\\\",
+          "(?i)\\\\Users\\\\.+\\\\Downloads\\\\"
+        ]
+      },
+      "description": "cmd/powershell/wmic/certutil/regsvr32 等系统文件从 %TEMP%/%APPDATA% 等非系统目录执行(攻击者重命名绕过进程名白名单)"
+    },
+    {
+      "id": "R-LOLBIN-011",
+      "title": "临时目录可执行文件执行可疑命令",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059.001",
+        "T1218"
+      ],
+      "condition": {
+        "command_regex_all": [
+          "(?i)(\\\\Temp\\\\|\\\\AppData\\\\)",
+          "(?i)(powershell|cscript|wscript|mshta|rundll32)"
+        ],
+        "command_regex_any": [
+          "(?i)\\-enc\\b",
+          "(?i)\\-encodedcommand\\b",
+          "(?i)invoke-expression",
+          "(?i)iex\\s",
+          "(?i)frombase64string",
+          "(?i)downloadstring",
+          "(?i)downloadfile",
+          "(?i)virtualalloc",
+          "(?i)createremotethread",
+          "(?i)writeprocessmemory"
+        ]
+      },
+      "description": "从 %TEMP%/%APPDATA% 等临时目录运行的可执行文件带有编码、IEX、下载、注入等恶意参数模式"
+    },
+    {
+      "id": "R-LOLBIN-012",
+      "title": "脚本宿主重命名执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059",
+        "T1027"
+      ],
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\-(enc|encodedcommand)\\b",
+          "(?i)\\-(w|windowstyle)\\s+hidden",
+          "(?i)\\-(nop|noprofile)\\b",
+          "(?i)\\-(ex|executionpolicy)\\s+bypass"
+        ]
+      },
+      "description": "非powershell.exe/cscript.exe名称的进程执行了典型脚本/下载/远程调用参数；攻击者将脚本宿主重命名以绕过进程名监控"
+    },
+    {
+      "id": "R-INJECT-002",
+      "title": "Process Hollowing 征兆",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055.012",
+        "T1620"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)NtUnmapViewOfSection",
+          "(?i)ZwUnmapViewOfSection",
+          "(?i)CreateProcess.*CREATE_SUSPENDED",
+          "(?i)PROCESS_CREATION_FLAGS_SUSPENDED",
+          "(?i)0x00000004.*CreateProcess"
+        ]
+      },
+      "description": "CreateProcess(SUSPENDED)+NtUnmapViewOfSection+VirtualAllocEx+WriteProcessMemory+ResumeThread 链条特征；无PE文件落地就加载恶意代码"
+    },
+    {
+      "id": "R-INJECT-003",
+      "title": "进程注入通用API调用痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055.001",
+        "T1055.002",
+        "T1055"
+      ],
+      "condition": {
+        "command_regex_all": [
+          "(?i)virtualallocex",
+          "(?i)writeprocessmemory"
+        ],
+        "command_regex_any": [
+          "(?i)createremotethread",
+          "(?i)ntqueueapcthread",
+          "(?i)rtlcreateuserthread",
+          "(?i)setthreadcontext",
+          "(?i)ntmapviewofsection"
+        ]
+      },
+      "description": "VirtualAllocEx+WriteProcessMemory+CreateRemoteThread 经典DLL/Shellcode注入三联调用"
+    },
+    {
+      "id": "R-INJECT-004",
+      "title": "ETW/AMSI 防御篡改",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.006",
+        "T1562.001",
+        "T1562.010"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)etweventwrite",
+          "(?i)nttraceevent",
+          "(?i)e\"?t\"?w\"?p\"?a\"?t\"?c\"?h",
+          "(?i)amsiscanbuffer",
+          "(?i)a\"?m\"?s\"?i\"?i\"?n\"?i\"?t\"?f\"?a\"?i\"?l\"?e\"?d",
+          "(?i)amsi.*(patch|bypass|hook|unload)",
+          "(?i)set-amsi.*0",
+          "(?i)\\[Runtime.InteropServices.Marshal\\]::",
+          "(?i)\\[Ref\\]\\.Assembly"
+        ]
+      },
+      "description": "通过修补 EtwEventWrite/NtTraceEvent/AmsiScanBuffer 绕过EDR遥测和脚本扫描；无文件攻防对抗的关键一步"
+    },
+    {
+      "id": "R-INJECT-005",
+      "title": "DLL侧加载从用户可写目录",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1574.001",
+        "T1574.002"
+      ],
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\.dll",
+          "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Desktop\\\\)"
+        ],
+        "process_name_in": [
+          "rundll32.exe",
+          "regsvr32.exe"
+        ]
+      },
+      "description": "非Program Files/System32目录下加载的DLL配合rundll32/regsvr32执行；DLL Search Order Hijacking 特征"
+    },
+    {
+      "id": "R-FILELESS-007",
+      "title": "注册表存储可执行代码(PowerShell/VBS)被读取执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112",
+        "T1059.001",
+        "T1547"
+      ],
+      "condition": {
+        "command_regex_all": [
+          "(?i)(get-itemproperty|get-itempropertyvalue)",
+          "(?i)(hklm\\\\|hkcu\\\\)"
+        ],
+        "command_regex_any": [
+          "(?i)invoke-expression",
+          "(?i)iex\\s",
+          "(?i)cscript",
+          "(?i)wscript\\.shell",
+          "(?i)start-process",
+          "(?i)\\$env:"
+        ]
+      },
+      "description": "检测从HKCU/HKLM注册表读取超长值(>1KB)并传给Invoke-Expression/IEX/cscript等解释器执行的链式攻击(如SUBTLE#PAWS)。攻击者将恶意脚本分片存入注册表，用Get-ItemProperty读取后直接执行。"
+    },
+    {
+      "id": "R-FILELESS-008",
+      "title": ".NET Assembly.Load(byte[]) 从非文件源加载执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1027.004",
+        "T1055",
+        "T1620"
+      ],
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\[Reflection\\.Assembly\\]",
+          "(?i)\\.load\\("
+        ],
+        "command_regex_any": [
+          "(?i)frombase64string",
+          "(?i)\\[System\\.Convert\\]",
+          "(?i)\\[IO\\.File\\]::ReadAllBytes",
+          "(?i)downloadstring",
+          "(?i)invoke-webrequest",
+          "(?i)get-itemproperty"
+        ]
+      },
+      "description": "检测 Reflection.Assembly.Load 从Base64/网络流/注册表等非PE文件的字节数组加载.NET Assembly执行。无文件攻击的关键一步(T1027.004)。"
+    },
+    {
+      "id": "R-FILELESS-009",
+      "title": "Office宏/OLE对象启动脚本解释器无文件链",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.002",
+        "T1059.001",
+        "T1059.005",
+        "T1566.001"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)downloadstring",
+          "(?i)downloadfile",
+          "(?i)invoke-expression",
+          "(?i)iex\\s",
+          "(?i)frombase64string",
+          "(?i)virtualalloc",
+          "(?i)net\\.webclient",
+          "(?i)start-bitstransfer",
+          "(?i)new-object.*net\\.webclient",
+          "(?i)\\.sct",
+          "(?i)javascript:",
+          "(?i)vbscript:"
+        ],
+        "parent_name_in": [
+          "winword.exe",
+          "excel.exe",
+          "powerpnt.exe",
+          "outlook.exe",
+          "eqnedt32.exe",
+          "msaccess.exe"
+        ]
+      },
+      "description": "检测Office应用(WinWord/Excel/PowerPoint)启动cmd/powershell/wscript/mshta，且命令行包含递归下载/反射注入/内存执行特征。典型的Office宏无文件攻击链。"
+    },
+    {
+      "id": "R-FILELESS-010",
+      "title": "WMI持久化无文件触发(ActiveScriptEventConsumer)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.003",
+        "T1059.005",
+        "T1059.007"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)ActiveScriptEventConsumer",
+          "(?i)__EventConsumer",
+          "(?i)__EventFilter.*Query",
+          "(?i)CommandLineEventConsumer",
+          "(?i)Set-WmiInstance",
+          "(?i)wmi.*__FilterToConsumerBinding",
+          "(?i)wmic.*/namespace",
+          "(?i)\\.mof\\b"
+        ]
+      },
+      "description": "检测WMI通过ActiveScriptEventConsumer注册VBScript/JScript持久化(无文件方式)——攻击者通过WMI事件订阅使恶意脚本在系统事件触发时自动执行(如SUBTLE#PAWS)。"
+    },
+    {
+      "id": "R-LMOVE-012",
+      "title": "Pass-the-Cookie/浏览器会话劫持横向移动",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1550.004",
+        "T1539",
+        "T1555.003"
+      ],
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",
+          "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Login Data$",
+          "(?i)\\\\Microsoft\\\\Edge\\\\.*\\\\Cookies$",
+          "(?i)\\\\Mozilla\\\\Firefox\\\\.*\\\\cookies\\.sqlite$",
+          "(?i)sharpchromium",
+          "(?i)dploot",
+          "(?i)lazagne",
+          "(?i)webbrowserpassview"
+        ]
+      },
+      "description": "检测浏览器Cookie/Session数据被复制或读取后用于横向认证绕过(如从Chrome/Edge/Firefox读取Login Data/Cookies，配合sharpchromium/rubeus等工具进行基于Web/Cloud的横向移动)。"
+    },
+    {
+      "id": "R-LMOVE-013",
+      "title": "SSH代理链/隧道建立(端口转发/反向代理)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1090",
+        "T1021.004",
+        "T1572"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)ssh.*\\-(L|R|D)\\s+\\d+",
+          "(?i)plink.*\\-(L|R|D)\\s+\\d+",
+          "(?i)chisel.*(client|server)",
+          "(?i)ngrok.*tcp",
+          "(?i)frp.*\\-c",
+          "(?i)\\-(L|R|D)\\s+[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"
+        ]
+      },
+      "description": "检测通过SSH建立本地/远程端口转发隧道实现代理横向移动(ssh -L/-R/-D)，或通过plink/chisel等工具建立隧道。"
+    },
+    {
+      "id": "R-LMOVE-014",
+      "title": "DCOM远程执行(WMI/MMC/ShellWindows/ExcelDDE)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.003",
+        "T1175",
+        "T1003"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)MMC20\\.Application",
+          "(?i)ShellWindows",
+          "(?i)ShellBrowserWindow",
+          "(?i)Excel\\.Application.*DDE",
+          "(?i)OutlookApplication",
+          "(?i)MSXML2\\.ServerXMLHTTP",
+          "(?i)\\{0002DF01-0000-0000-C000-000000000046\\}",
+          "(?i)\\{9BA05972-F6A8-11CF-A442-00A0C90A8F39\\}",
+          "(?i)GetTypeFromProgID",
+          "(?i)\\[Activator\\]::CreateInstance",
+          "(?i)New-Object.*\\-ComObject"
+        ]
+      },
+      "description": "检测通过DCOM远程激活Office/WMI/ShellWindows等AppID进行横向代码执行——MITRE T1021.003最活跃的横向移动技术之一"
+    },
+    {
+      "id": "R-CLOUD-001",
+      "title": "云CLI工具从端点执行(Azure CLI/gcloud/aws)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1525",
+        "T1527",
+        "T1530"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)az\\s+vm\\s+list",
+          "(?i)az\\s+storage\\s+",
+          "(?i)az\\s+ad\\s+",
+          "(?i)az\\s+login",
+          "(?i)gcloud\\s+compute\\s+",
+          "(?i)gcloud\\s+auth\\s+",
+          "(?i)gcloud\\s+storage\\s+",
+          "(?i)aws\\s+s3\\s+",
+          "(?i)aws\\s+ec2\\s+describe",
+          "(?i)aws\\s+sts\\s+get-caller",
+          "(?i)aws\\s+iam\\s+list"
+        ]
+      },
+      "description": "检测从Windows端点执行az/gcloud/aws等云管理CLI工具——攻击者获取凭证后通过CLI进行云资源枚举/数据外传/横向渗透。2025年云入侵同比增136%(CrowdStrike)。"
+    },
+    {
+      "id": "R-CLOUD-002",
+      "title": "云存储工具从非标准环境大量上传/下载",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1567.002",
+        "T1530",
+        "T1048"
+      ],
+      "condition": {
+        "command_regex_any": [
+          "(?i)rclone\\s+(copy|sync|move|copyto)",
+          "(?i)azcopy\\s+(copy|sync)",
+          "(?i)gsutil\\s+(cp|rsync)\\s+\\-r",
+          "(?i)aws\\s+s3\\s+(cp|sync|mv).*\\-\\-recursive",
+          "(?i)megatools\\s+(dl|put)",
+          "(?i)onedrive\\-uploader"
+        ]
+      },
+      "description": "检测rclone/azcopy/gsutil/aws s3 cp/sync等云存储同步工具在非系统目录下执行大量数据传输——常为数据外传或勒索前数据收集。"
     }
   ]
 }
