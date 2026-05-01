@@ -2708,6 +2708,7 @@
         "T1574.001",
         "T1059"
       ],
+      "description": "RMM 工具加载非签名或非标准路径的 DLL，或启动异常子进程(如 cmd/ps)",
       "condition": {
         "command_regex_any": [
           "(?i)cmd\\.exe",
@@ -2722,8 +2723,7 @@
           "teamviewer.exe",
           "screenconnect.exe"
         ]
-      },
-      "description": "RMM 工具加载非签名或非标准路径的 DLL，或启动异常子进程(如 cmd/ps)"
+      }
     },
     {
       "id": "R-LOLBIN-010",
@@ -2736,14 +2736,14 @@
         "T1059",
         "T1218"
       ],
+      "description": "cmd/powershell/wmic/certutil/regsvr32 等系统文件从 %TEMP%/%APPDATA% 等非系统目录执行(攻击者重命名绕过进程名白名单)",
       "condition": {
         "command_regex_any": [
           "(?i)\\\\Temp\\\\|\\\\AppData\\\\Local\\\\Temp\\\\",
           "(?i)\\\\AppData\\\\Roaming\\\\",
           "(?i)\\\\Users\\\\.+\\\\Downloads\\\\"
         ]
-      },
-      "description": "cmd/powershell/wmic/certutil/regsvr32 等系统文件从 %TEMP%/%APPDATA% 等非系统目录执行(攻击者重命名绕过进程名白名单)"
+      }
     },
     {
       "id": "R-LOLBIN-011",
@@ -2756,6 +2756,7 @@
         "T1059.001",
         "T1218"
       ],
+      "description": "从 %TEMP%/%APPDATA% 等临时目录运行的可执行文件带有编码、IEX、下载、注入等恶意参数模式",
       "condition": {
         "command_regex_all": [
           "(?i)(\\\\Temp\\\\|\\\\AppData\\\\)",
@@ -2773,8 +2774,7 @@
           "(?i)createremotethread",
           "(?i)writeprocessmemory"
         ]
-      },
-      "description": "从 %TEMP%/%APPDATA% 等临时目录运行的可执行文件带有编码、IEX、下载、注入等恶意参数模式"
+      }
     },
     {
       "id": "R-LOLBIN-012",
@@ -2787,6 +2787,7 @@
         "T1059",
         "T1027"
       ],
+      "description": "非powershell.exe/cscript.exe名称的进程执行了典型脚本/下载/远程调用参数；攻击者将脚本宿主重命名以绕过进程名监控",
       "condition": {
         "command_regex_all": [
           "(?i)\\-(enc|encodedcommand)\\b",
@@ -2794,8 +2795,7 @@
           "(?i)\\-(nop|noprofile)\\b",
           "(?i)\\-(ex|executionpolicy)\\s+bypass"
         ]
-      },
-      "description": "非powershell.exe/cscript.exe名称的进程执行了典型脚本/下载/远程调用参数；攻击者将脚本宿主重命名以绕过进程名监控"
+      }
     },
     {
       "id": "R-INJECT-002",
@@ -2807,6 +2807,7 @@
         "T1055.012",
         "T1620"
       ],
+      "description": "CreateProcess(SUSPENDED)+NtUnmapViewOfSection+VirtualAllocEx+WriteProcessMemory+ResumeThread 链条特征；无PE文件落地就加载恶意代码",
       "condition": {
         "command_regex_any": [
           "(?i)NtUnmapViewOfSection",
@@ -2815,8 +2816,7 @@
           "(?i)PROCESS_CREATION_FLAGS_SUSPENDED",
           "(?i)0x00000004.*CreateProcess"
         ]
-      },
-      "description": "CreateProcess(SUSPENDED)+NtUnmapViewOfSection+VirtualAllocEx+WriteProcessMemory+ResumeThread 链条特征；无PE文件落地就加载恶意代码"
+      }
     },
     {
       "id": "R-INJECT-003",
@@ -2829,6 +2829,7 @@
         "T1055.002",
         "T1055"
       ],
+      "description": "VirtualAllocEx+WriteProcessMemory+CreateRemoteThread 经典DLL/Shellcode注入三联调用",
       "condition": {
         "command_regex_all": [
           "(?i)virtualallocex",
@@ -2841,8 +2842,7 @@
           "(?i)setthreadcontext",
           "(?i)ntmapviewofsection"
         ]
-      },
-      "description": "VirtualAllocEx+WriteProcessMemory+CreateRemoteThread 经典DLL/Shellcode注入三联调用"
+      }
     },
     {
       "id": "R-INJECT-004",
@@ -2855,6 +2855,7 @@
         "T1562.001",
         "T1562.010"
       ],
+      "description": "通过修补 EtwEventWrite/NtTraceEvent/AmsiScanBuffer 绕过EDR遥测和脚本扫描；无文件攻防对抗的关键一步",
       "condition": {
         "command_regex_any": [
           "(?i)etweventwrite",
@@ -2867,8 +2868,7 @@
           "(?i)\\[Runtime.InteropServices.Marshal\\]::",
           "(?i)\\[Ref\\]\\.Assembly"
         ]
-      },
-      "description": "通过修补 EtwEventWrite/NtTraceEvent/AmsiScanBuffer 绕过EDR遥测和脚本扫描；无文件攻防对抗的关键一步"
+      }
     },
     {
       "id": "R-INJECT-005",
@@ -2880,6 +2880,7 @@
         "T1574.001",
         "T1574.002"
       ],
+      "description": "非Program Files/System32目录下加载的DLL配合rundll32/regsvr32执行；DLL Search Order Hijacking 特征",
       "condition": {
         "command_regex_all": [
           "(?i)\\.dll",
@@ -2889,8 +2890,7 @@
           "rundll32.exe",
           "regsvr32.exe"
         ]
-      },
-      "description": "非Program Files/System32目录下加载的DLL配合rundll32/regsvr32执行；DLL Search Order Hijacking 特征"
+      }
     },
     {
       "id": "R-FILELESS-007",
@@ -2903,6 +2903,7 @@
         "T1059.001",
         "T1547"
       ],
+      "description": "检测从HKCU/HKLM注册表读取超长值(>1KB)并传给Invoke-Expression/IEX/cscript等解释器执行的链式攻击(如SUBTLE#PAWS)。攻击者将恶意脚本分片存入注册表，用Get-ItemProperty读取后直接执行。",
       "condition": {
         "command_regex_all": [
           "(?i)(get-itemproperty|get-itempropertyvalue)",
@@ -2916,8 +2917,7 @@
           "(?i)start-process",
           "(?i)\\$env:"
         ]
-      },
-      "description": "检测从HKCU/HKLM注册表读取超长值(>1KB)并传给Invoke-Expression/IEX/cscript等解释器执行的链式攻击(如SUBTLE#PAWS)。攻击者将恶意脚本分片存入注册表，用Get-ItemProperty读取后直接执行。"
+      }
     },
     {
       "id": "R-FILELESS-008",
@@ -2930,6 +2930,7 @@
         "T1055",
         "T1620"
       ],
+      "description": "检测 Reflection.Assembly.Load 从Base64/网络流/注册表等非PE文件的字节数组加载.NET Assembly执行。无文件攻击的关键一步(T1027.004)。",
       "condition": {
         "command_regex_all": [
           "(?i)\\[Reflection\\.Assembly\\]",
@@ -2943,8 +2944,7 @@
           "(?i)invoke-webrequest",
           "(?i)get-itemproperty"
         ]
-      },
-      "description": "检测 Reflection.Assembly.Load 从Base64/网络流/注册表等非PE文件的字节数组加载.NET Assembly执行。无文件攻击的关键一步(T1027.004)。"
+      }
     },
     {
       "id": "R-FILELESS-009",
@@ -2958,6 +2958,7 @@
         "T1059.005",
         "T1566.001"
       ],
+      "description": "检测Office应用(WinWord/Excel/PowerPoint)启动cmd/powershell/wscript/mshta，且命令行包含递归下载/反射注入/内存执行特征。典型的Office宏无文件攻击链。",
       "condition": {
         "command_regex_any": [
           "(?i)downloadstring",
@@ -2981,8 +2982,7 @@
           "eqnedt32.exe",
           "msaccess.exe"
         ]
-      },
-      "description": "检测Office应用(WinWord/Excel/PowerPoint)启动cmd/powershell/wscript/mshta，且命令行包含递归下载/反射注入/内存执行特征。典型的Office宏无文件攻击链。"
+      }
     },
     {
       "id": "R-FILELESS-010",
@@ -2995,6 +2995,7 @@
         "T1059.005",
         "T1059.007"
       ],
+      "description": "检测WMI通过ActiveScriptEventConsumer注册VBScript/JScript持久化(无文件方式)——攻击者通过WMI事件订阅使恶意脚本在系统事件触发时自动执行(如SUBTLE#PAWS)。",
       "condition": {
         "command_regex_any": [
           "(?i)ActiveScriptEventConsumer",
@@ -3006,8 +3007,7 @@
           "(?i)wmic.*/namespace",
           "(?i)\\.mof\\b"
         ]
-      },
-      "description": "检测WMI通过ActiveScriptEventConsumer注册VBScript/JScript持久化(无文件方式)——攻击者通过WMI事件订阅使恶意脚本在系统事件触发时自动执行(如SUBTLE#PAWS)。"
+      }
     },
     {
       "id": "R-LMOVE-012",
@@ -3020,6 +3020,7 @@
         "T1539",
         "T1555.003"
       ],
+      "description": "检测浏览器Cookie/Session数据被复制或读取后用于横向认证绕过(如从Chrome/Edge/Firefox读取Login Data/Cookies，配合sharpchromium/rubeus等工具进行基于Web/Cloud的横向移动)。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",
@@ -3031,8 +3032,7 @@
           "(?i)lazagne",
           "(?i)webbrowserpassview"
         ]
-      },
-      "description": "检测浏览器Cookie/Session数据被复制或读取后用于横向认证绕过(如从Chrome/Edge/Firefox读取Login Data/Cookies，配合sharpchromium/rubeus等工具进行基于Web/Cloud的横向移动)。"
+      }
     },
     {
       "id": "R-LMOVE-013",
@@ -3045,6 +3045,7 @@
         "T1021.004",
         "T1572"
       ],
+      "description": "检测通过SSH建立本地/远程端口转发隧道实现代理横向移动(ssh -L/-R/-D)，或通过plink/chisel等工具建立隧道。",
       "condition": {
         "command_regex_any": [
           "(?i)ssh.*\\-(L|R|D)\\s+\\d+",
@@ -3054,8 +3055,7 @@
           "(?i)frp.*\\-c",
           "(?i)\\-(L|R|D)\\s+[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"
         ]
-      },
-      "description": "检测通过SSH建立本地/远程端口转发隧道实现代理横向移动(ssh -L/-R/-D)，或通过plink/chisel等工具建立隧道。"
+      }
     },
     {
       "id": "R-LMOVE-014",
@@ -3068,6 +3068,7 @@
         "T1175",
         "T1003"
       ],
+      "description": "检测通过DCOM远程激活Office/WMI/ShellWindows等AppID进行横向代码执行——MITRE T1021.003最活跃的横向移动技术之一",
       "condition": {
         "command_regex_any": [
           "(?i)MMC20\\.Application",
@@ -3082,8 +3083,7 @@
           "(?i)\\[Activator\\]::CreateInstance",
           "(?i)New-Object.*\\-ComObject"
         ]
-      },
-      "description": "检测通过DCOM远程激活Office/WMI/ShellWindows等AppID进行横向代码执行——MITRE T1021.003最活跃的横向移动技术之一"
+      }
     },
     {
       "id": "R-CLOUD-001",
@@ -3096,6 +3096,7 @@
         "T1527",
         "T1530"
       ],
+      "description": "检测从Windows端点执行az/gcloud/aws等云管理CLI工具——攻击者获取凭证后通过CLI进行云资源枚举/数据外传/横向渗透。2025年云入侵同比增136%(CrowdStrike)。",
       "condition": {
         "command_regex_any": [
           "(?i)az\\s+vm\\s+list",
@@ -3110,8 +3111,7 @@
           "(?i)aws\\s+sts\\s+get-caller",
           "(?i)aws\\s+iam\\s+list"
         ]
-      },
-      "description": "检测从Windows端点执行az/gcloud/aws等云管理CLI工具——攻击者获取凭证后通过CLI进行云资源枚举/数据外传/横向渗透。2025年云入侵同比增136%(CrowdStrike)。"
+      }
     },
     {
       "id": "R-CLOUD-002",
@@ -3124,6 +3124,7 @@
         "T1530",
         "T1048"
       ],
+      "description": "检测rclone/azcopy/gsutil/aws s3 cp/sync等云存储同步工具在非系统目录下执行大量数据传输——常为数据外传或勒索前数据收集。",
       "condition": {
         "command_regex_any": [
           "(?i)rclone\\s+(copy|sync|move|copyto)",
@@ -3133,8 +3134,7 @@
           "(?i)megatools\\s+(dl|put)",
           "(?i)onedrive\\-uploader"
         ]
-      },
-      "description": "检测rclone/azcopy/gsutil/aws s3 cp/sync等云存储同步工具在非系统目录下执行大量数据传输——常为数据外传或勒索前数据收集。"
+      }
     }
   ]
 }
