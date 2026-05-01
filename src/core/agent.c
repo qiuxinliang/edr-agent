@@ -367,6 +367,7 @@ static int edr_remote_fetch_toml(const char *url, const char *out_path, const ch
     snprintf(hdr, sizeof(hdr), "X-Endpoint-ID: %s", endpoint_id);
     headers = curl_slist_append(headers, hdr);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    fprintf(stderr, "[remote] downloading %s with X-Endpoint-ID: %s\n", url, endpoint_id);
     CURLcode cc = curl_easy_perform(curl);
     curl_slist_free_all(headers);
     fclose(f);
@@ -565,7 +566,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     return;
   }
 
-  /* 保存 [remote] section，防止远程 TOML 覆盖后丢失轮询参数 */
+  /* 保存 [remote] + [agent] section，防止远程 TOML 覆盖后丢失关键参数 */
   struct {
     char rules_url[512];
     char p0_bundle_url[512];
@@ -573,6 +574,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     char download_url[512];
     int poll_interval_s;
     bool auto_update;
+    char endpoint_id[128];
+    char tenant_id[128];
   } saved_remote;
   memcpy(saved_remote.rules_url, agent->cfg.remote.rules_url, sizeof(saved_remote.rules_url));
   memcpy(saved_remote.p0_bundle_url, agent->cfg.remote.p0_bundle_url, sizeof(saved_remote.p0_bundle_url));
@@ -580,16 +583,20 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   memcpy(saved_remote.download_url, agent->cfg.remote.download_url, sizeof(saved_remote.download_url));
   saved_remote.poll_interval_s = agent->cfg.remote.poll_interval_s;
   saved_remote.auto_update = agent->cfg.remote.auto_update;
+  memcpy(saved_remote.endpoint_id, agent->cfg.agent.endpoint_id, sizeof(saved_remote.endpoint_id));
+  memcpy(saved_remote.tenant_id, agent->cfg.agent.tenant_id, sizeof(saved_remote.tenant_id));
 
   EdrError ce = edr_config_load(tmp, &agent->cfg);
 
-  /* 恢复 [remote] section，保留首次 agent.toml 中配置的远程拉取参数 */
+  /* 恢复 [remote] + [agent] section，保留首次 agent.toml 中配置的参数 */
   memcpy(agent->cfg.remote.rules_url, saved_remote.rules_url, sizeof(agent->cfg.remote.rules_url));
   memcpy(agent->cfg.remote.p0_bundle_url, saved_remote.p0_bundle_url, sizeof(agent->cfg.remote.p0_bundle_url));
   memcpy(agent->cfg.remote.version_url, saved_remote.version_url, sizeof(agent->cfg.remote.version_url));
   memcpy(agent->cfg.remote.download_url, saved_remote.download_url, sizeof(agent->cfg.remote.download_url));
   agent->cfg.remote.poll_interval_s = saved_remote.poll_interval_s;
   agent->cfg.remote.auto_update = saved_remote.auto_update;
+  memcpy(agent->cfg.agent.endpoint_id, saved_remote.endpoint_id, sizeof(agent->cfg.agent.endpoint_id));
+  memcpy(agent->cfg.agent.tenant_id, saved_remote.tenant_id, sizeof(agent->cfg.agent.tenant_id));
 
   char fp[80];
   edr_config_fingerprint(tmp, fp, sizeof(fp));
