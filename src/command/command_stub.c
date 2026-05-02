@@ -1281,7 +1281,7 @@ static void do_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
   char hitBuf[512];
   hitBuf[0] = '\0';
   for (int pi = 0; patterns[pi]; pi++) {
-    if (memmem(buf, (size_t)fsz, patterns[pi], strlen(patterns[pi]))) {
+    if (edr_memmem(buf, (size_t)fsz, patterns[pi], strlen(patterns[pi]))) {
       matches++;
       if (hitBuf[0]) strncat(hitBuf, ",", sizeof(hitBuf)-strlen(hitBuf)-1);
       strncat(hitBuf, patterns[pi], sizeof(hitBuf)-strlen(hitBuf)-1);
@@ -1299,7 +1299,7 @@ static void do_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
 }
 
-static void *memmem(const void *haystack, size_t haystack_len,
+static void *edr_memmem(const void *haystack, size_t haystack_len,
                     const void *needle, size_t needle_len) {
   if (!needle_len) return (void *)haystack;
   if (haystack_len < needle_len) return NULL;

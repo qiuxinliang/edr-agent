@@ -48,11 +48,12 @@ int edr_shell_is_allowed(const char *command) {
     if (strstr(lower, g_shell_block[i])) return 0;
   }
 
-  while (*lower == ' ' || *lower == '\t') lower++;
+  char *low = lower;
+  while (*low == ' ' || *low == '\t') low++;
   char cmd[64];
   size_t j = 0;
-  while (lower[j] && lower[j] != ' ' && lower[j] != '\t' && j < sizeof(cmd) - 1) {
-    cmd[j] = lower[j];
+  while (low[j] && low[j] != ' ' && low[j] != '\t' && j < sizeof(cmd) - 1) {
+    cmd[j] = low[j];
     j++;
   }
   cmd[j] = '\0';
