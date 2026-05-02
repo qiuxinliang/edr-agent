@@ -924,7 +924,7 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len, cons
   if (!dangerous_enabled()) {
     s_rejected++;
     audit_both(cmd_id, "reject rtr_shell: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   char command[2048];
@@ -935,13 +935,13 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len, cons
   if (!command[0]) {
     s_exec_fail++;
     audit_both(cmd_id, "rtr_shell: 缺少 command");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing command");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "missing command");
     return;
   }
   if (!edr_shell_is_allowed(command)) {
     s_rejected++;
     audit_both(cmd_id, "rtr_shell: 命令不在白名单或命中黑名单");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 3, "command blocked by policy");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecRejected, 3, "command blocked by policy");
     return;
   }
   char out[8192];
@@ -950,13 +950,13 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len, cons
   if (r != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "rtr_shell: 执行失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, exit_code, out[0] ? out : "exec failed");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, exit_code, out[0] ? out : "exec failed");
     return;
   }
   s_handled++;
   s_exec_ok++;
   audit_both(cmd_id, "rtr_shell: ok");
-  soar_emit(cmd_id, sm, EdrCmdExecOk, exit_code, out);
+  cmd_emit_always(cmd_id, sm, EdrCmdExecOk, exit_code, out);
 }
 
 /* ── RTR Get (文件获取, PE校验) ── */
