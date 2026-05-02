@@ -151,8 +151,14 @@ static void cmd_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm, Ed
                             int exit_code, const char *detail) {
   audit_both(cmd_id, detail);
   soar_emit(cmd_id, sm, st, exit_code, detail);
-  if (!soar_want_report(sm) && edr_ingest_http_configured()) {
-    (void)edr_ingest_http_post_command_result(cmd_id, NULL, (int)st, exit_code, detail ? detail : "");
+  if (!soar_want_report(sm)) {
+    if (edr_ingest_http_configured()) {
+      fprintf(stderr, "[cmd_emit_always] HTTP reporting id=%s st=%d\n", cmd_id ? cmd_id : "", (int)st);
+      int rc = edr_ingest_http_post_command_result(cmd_id, NULL, (int)st, exit_code, detail ? detail : "");
+      fprintf(stderr, "[cmd_emit_always] HTTP report rc=%d\n", rc);
+    } else {
+      fprintf(stderr, "[cmd_emit_always] HTTP NOT configured id=%s\n", cmd_id ? cmd_id : "");
+    }
   }
 }
 
