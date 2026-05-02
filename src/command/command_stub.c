@@ -1230,6 +1230,8 @@ static void do_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len, co
 }
 
 /* ── P1: YARA Scan ── */
+static void *edr_memmem(const void *haystack, size_t haystack_len,
+                        const void *needle, size_t needle_len);
 static void do_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
