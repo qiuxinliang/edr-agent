@@ -65,6 +65,9 @@ struct EdrAgent {
 };
 
 /** 0 = disabled; unset = use clamped server.keepalive_interval_s. */
+
+#define EDR_NET_HEARTBEAT_INTERVAL_S 30
+
 static int edr_agent_console_heartbeat_interval_s(const EdrAgent *agent) {
   const char *e = getenv("EDR_CONSOLE_HEARTBEAT_SEC");
   if (e && e[0]) {
@@ -438,6 +441,9 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_print_console_heartbeat_line(agent);
         last_hb_ns = edr_monotonic_ns();
       }
+      int net_hb_sec = EDR_NET_HEARTBEAT_INTERVAL_S;
+      uint64_t net_hb_period_ns = (uint64_t)net_hb_sec * 1000000000ULL;
+      uint64_t last_net_hb_ns = edr_monotonic_ns();
       while (!agent->shutdown) {
         edr_ms_sleep(200u);
         if (hb_period_ns > 0) {
@@ -445,6 +451,13 @@ EdrError edr_agent_run(EdrAgent *agent) {
           if (now - last_hb_ns >= hb_period_ns) {
             edr_agent_print_console_heartbeat_line(agent);
             last_hb_ns = now;
+          }
+        }
+        {
+          uint64_t now = edr_monotonic_ns();
+          if (now - last_net_hb_ns >= net_hb_period_ns) {
+            edr_ingest_http_post_heartbeat();
+            last_net_hb_ns = now;
           }
         }
         edr_resource_poll();

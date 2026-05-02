@@ -647,6 +647,18 @@ int edr_ingest_http_post_command_result(const char *command_id, const EdrSoarCom
   return rc;
 }
 
+int edr_ingest_http_post_heartbeat(void) {
+  if (!edr_ingest_http_configured()) {
+    return -1;
+  }
+  char body[256];
+  int n = snprintf(body, sizeof(body), "{\"endpoint_id\":\"%s\"}", s_endpoint);
+  if (n < 0 || (size_t)n >= sizeof(body)) {
+    return -1;
+  }
+  return ingest_post_json_relpath("ingest/heartbeat", body, "heartbeat");
+}
+
 /* --- HTTP poll-commands 与 upload-file，与 gRPC 对等，见 /api/v1/ingest/... --- */
 
 static int transport_env_cmd_poll_disabled(void) {

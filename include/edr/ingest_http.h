@@ -8,6 +8,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/**
+ * POST /ingest/heartbeat 轻量心跳；用于在没有事件/攻击面上报时维持端点在线状态。
+ * 成功返回 0（HTTP 2xx），否则 -1。
+ */
+int edr_ingest_http_post_heartbeat(void);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
