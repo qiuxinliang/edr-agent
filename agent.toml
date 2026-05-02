@@ -1,0 +1,48 @@
+[server]
+address              = "192.168.1.10:50051"
+grpc_insecure        = true
+ca_cert              = ""
+client_cert          = ""
+client_key           = ""
+connect_timeout_s    = 10
+keepalive_interval_s = 30
+
+[agent]
+endpoint_id          = "ep-1034b1b3efa151f827915be41eba37b3"
+tenant_id            = "demo-tenant"
+
+[collection]
+etw_enabled          = false
+ebpf_enabled         = false
+poll_interval_s      = 1
+max_event_queue_size = 4096
+
+[platform]
+rest_base_url        = "http://192.168.1.10:8080/api/v1"
+rest_user_id         = "edr-agent"
+
+[attack_surface]
+enabled              = false
+port_interval_s          = 300
+conn_interval_s          = 300
+service_interval_s       = 600
+policy_interval_s        = 3600
+full_snapshot_interval_s = 1800
+outbound_top_n           = 128
+outbound_exclude_loopback = true
+high_risk_immediate_ports = [23, 445, 3389, 6379, 27017, 1433, 3306]
+firewall_rule_detail_max = 500
+
+[offline]
+queue_db_path        = "edr_queue.db"
+max_queue_size_mb    = 128
+retention_hours      = 72
+
+[command]
+allow_dangerous      = true
+
+[logging]
+level                = "debug"
+log_dir              = "."
+max_log_size_mb      = 50
+max_log_files        = 5

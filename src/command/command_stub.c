@@ -26,6 +26,8 @@
 #include <direct.h>
 #include <process.h>
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #else
 #include <fcntl.h>
 #include <signal.h>
