@@ -147,6 +147,15 @@ static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrComma
   }
 }
 
+static void cmd_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
+                            int exit_code, const char *detail) {
+  audit_both(cmd_id, detail);
+  soar_emit(cmd_id, sm, st, exit_code, detail);
+  if (!soar_want_report(sm) && edr_ingest_http_configured()) {
+    (void)edr_ingest_http_post_command_result(cmd_id, NULL, (int)st, exit_code, detail ? detail : "");
+  }
+}
+
 static int parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
   *out_pid = -1;
   if (!p || len == 0u) {
@@ -782,7 +791,7 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   if (!dangerous_enabled()) {
     s_rejected++;
     audit_both(cmd_id, "reject forensic: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   char base[512];
@@ -814,7 +823,7 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   if (mkdir_p(dir) != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "forensic: 创建输出目录失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "mkdir failed");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "mkdir failed");
     return;
   }
   char manifest[800];
@@ -827,7 +836,7 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   if (!f) {
     s_exec_fail++;
     audit_both(cmd_id, "forensic: 写 manifest 失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "manifest write failed");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "manifest write failed");
     return;
   }
   fprintf(f, "command_id=%s\npayload_len=%zu\n", cmd_id ? cmd_id : "", len);
@@ -872,10 +881,16 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   char bundle[1000];
   snprintf(bundle, sizeof(bundle), "%s/bundle.tgz", dir);
 #endif
-  (void)make_tar_bundle(dir, bundle);
-  s_exec_ok++;
-  audit_both(cmd_id, "forensic: manifest + bundle.tgz（可选路径复制见 EDR_FORENSIC_COPY_PATHS）");
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "forensic bundle ok");
+  if (make_tar_bundle(dir, bundle) == 0) {
+    s_exec_ok++;
+    audit_both(cmd_id, "forensic: manifest + bundle.tgz");
+    edr_ingest_http_upload_file_multipart(cmd_id, bundle, NULL, NULL, 0);
+    cmd_emit_always(cmd_id, sm, EdrCmdExecOk, 0, "forensic bundle ok");
+  } else {
+    s_exec_fail++;
+    audit_both(cmd_id, "forensic: tar bundle 失败");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "tar bundle failed");
+  }
 }
 
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
