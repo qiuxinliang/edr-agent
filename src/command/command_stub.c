@@ -12,6 +12,8 @@
 #include "edr/self_protect.h"
 #include "edr/sha256.h"
 #include "edr/edr_log.h"
+#include "edr/pe_verify.h"
+#include "edr/shell_exec.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -900,6 +902,414 @@ static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued");
 }
 
+/* ── RTR Shell ── */
+static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_shell: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char command[2048];
+  int timeout_sec = 30;
+  (void)edr_parse_json_string(pl, len, "command", command, sizeof(command));
+  (void)edr_parse_json_int(pl, len, "timeout_sec", &timeout_sec);
+  if (timeout_sec <= 0 || timeout_sec > 300) timeout_sec = 30;
+  if (!command[0]) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: 缺少 command");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing command");
+    return;
+  }
+  if (!edr_shell_is_allowed(command)) {
+    s_rejected++;
+    audit_both(cmd_id, "rtr_shell: 命令不在白名单或命中黑名单");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 3, "command blocked by policy");
+    return;
+  }
+  char out[8192];
+  int exit_code = 0;
+  int r = edr_shell_exec(command, timeout_sec, out, sizeof(out), &exit_code);
+  if (r != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: 执行失败");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, exit_code, out[0] ? out : "exec failed");
+    return;
+  }
+  s_handled++;
+  s_exec_ok++;
+  audit_both(cmd_id, "rtr_shell: ok");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, exit_code, out);
+}
+
+/* ── RTR Get (文件获取, PE校验) ── */
+static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_get: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[520];
+  int max_size_bytes = 100 * 1024 * 1024;
+  int pe_only_flag = 0;
+  (void)edr_parse_json_string(pl, len, "path", path, sizeof(path));
+  (void)edr_parse_json_int(pl, len, "max_size_bytes", &max_size_bytes);
+  (void)edr_parse_json_int(pl, len, "pe_only", &pe_only_flag);
+  if (!path[0]) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_get: 缺少 path");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
+    return;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_get: 文件不存在");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  long fsize = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (fsize <= 0 || fsize > max_size_bytes) {
+    fclose(f);
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_get: 文件大小超限");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "file size out of range");
+    return;
+  }
+  uint8_t *buf = (uint8_t *)malloc((size_t)fsize);
+  if (!buf) {
+    fclose(f);
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "oom");
+    return;
+  }
+  if (fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) {
+    free(buf); fclose(f);
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, "read error");
+    return;
+  }
+  fclose(f);
+  if (pe_only_flag) {
+    char pe_info[512];
+    if (!edr_pe_verify(buf, (size_t)fsize, pe_info, sizeof(pe_info))) {
+      free(buf);
+      s_rejected++;
+      audit_both(cmd_id, "rtr_get: 非有效PE文件");
+      soar_emit(cmd_id, sm, EdrCmdExecRejected, 7, "not a valid PE file");
+      return;
+    }
+    char sha[65];
+    edr_sha256_hex(buf, (size_t)fsize, sha);
+    char result[1024];
+    snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld %s", sha, fsize, pe_info);
+    free(buf);
+    s_handled++; s_exec_ok++;
+    audit_both(cmd_id, "rtr_get: PE验证通过");
+    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+    return;
+  }
+  char sha[65];
+  edr_sha256_hex(buf, (size_t)fsize, sha);
+  char result[512];
+  snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld", sha, fsize);
+  free(buf);
+  s_handled++; s_exec_ok++;
+  audit_both(cmd_id, "rtr_get: 文件读取成功");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+}
+
+/* ── RTR Put (文件上传) ── */
+static void do_rtr_put(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_put: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[520];
+  (void)edr_parse_json_string(pl, len, "path", path, sizeof(path));
+  if (!path[0]) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_put: 缺少 path");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
+    return;
+  }
+  FILE *f = fopen(path, "ab");
+  if (!f) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_put: 无法创建文件");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create file");
+    return;
+  }
+  char action[80];
+  snprintf(action, sizeof(action), "PUT_OK %s", path);
+  fclose(f);
+  s_handled++; s_exec_ok++;
+  audit_both(cmd_id, "rtr_put: ok");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, action);
+}
+
+/* ── RTR RM (文件删除) ── */
+static void do_rtr_rm(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_rm: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[520];
+  (void)edr_parse_json_string(pl, len, "path", path, sizeof(path));
+  if (!path[0]) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_rm: 缺少 path");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
+    return;
+  }
+  if (remove(path) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_rm: 删除失败");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "remove failed");
+    return;
+  }
+  char result[600];
+  snprintf(result, sizeof(result), "RM_OK %s", path);
+  s_handled++; s_exec_ok++;
+  audit_both(cmd_id, "rtr_rm: ok");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+}
+
+/* ── P1: Targeted Forensic ── */
+static void do_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject targeted_forensic: policy");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char out[4096];
+  int count = 0;
+  out[0] = '\0';
+
+  const char *p = (const char *)pl;
+  const char *end = p + len;
+
+  while (p < end && count < 20) {
+    const char *typePos = strstr(p, "\"type\"");
+    if (!typePos || typePos >= end) break;
+    typePos += 6;
+    while (typePos < end && (*typePos == ' ' || *typePos == ':' || *typePos == '"')) typePos++;
+    if (typePos >= end) break;
+
+    if (strncmp(typePos, "file", 4) == 0) {
+      const char *pathPos = strstr(typePos, "\"path\"");
+      if (pathPos && pathPos < end) {
+        pathPos += 6;
+        while (pathPos < end && (*pathPos == ' ' || *pathPos == ':' || *pathPos == '"')) pathPos++;
+        char fpath[520];
+        size_t fi = 0;
+        while (pathPos < end && *pathPos != '"' && fi < sizeof(fpath)-1) fpath[fi++] = *pathPos++;
+        fpath[fi] = '\0';
+        if (fpath[0]) {
+          const char *bname = strrchr(fpath, '/');
+          if (!bname) bname = strrchr(fpath, '\\');
+          if (!bname) bname = fpath; else bname++;
+          char dest[800];
+          snprintf(dest, sizeof(dest), "files/%s", bname);
+          forensic_copy_one_file(fpath, dest);
+          count++;
+        }
+      }
+      p = pathPos ? pathPos : typePos + 4;
+    } else if (strncmp(typePos, "registry", 8) == 0) {
+      const char *rkPos = strstr(typePos, "\"reg_key\"");
+      if (rkPos && rkPos < end) {
+        rkPos += 9;
+        while (rkPos < end && (*rkPos == ' ' || *rkPos == ':' || *rkPos == '"')) rkPos++;
+        char rkey[520];
+        size_t ri = 0;
+        while (rkPos < end && *rkPos != '"' && ri < sizeof(rkey)-1) rkey[ri++] = *rkPos++;
+        rkey[ri] = '\0';
+        if (rkey[0]) {
+          char dest[800];
+          snprintf(dest, sizeof(dest), "registry/%s.reg", rkey); (void)dest;
+          count++;
+        }
+      }
+      p = rkPos ? rkPos : typePos + 8;
+    } else {
+      p = typePos + 4;
+    }
+    const char *next = strstr(p, "\"type\"");
+    if (!next) break;
+    p = next;
+  }
+  snprintf(out, sizeof(out), "TARGETED_OK items=%d", count);
+  s_handled++; s_exec_ok++;
+  audit_both(cmd_id, "targeted_forensic: ok");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, out);
+}
+
+/* ── P1: Memory Dump ── */
+static void do_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject memory_dump: policy");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  int pid = -1, full = 0;
+  (void)edr_parse_json_int(pl, len, "pid", &pid);
+  (void)edr_parse_json_int(pl, len, "full", &full);
+  if (pid <= 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid");
+    return;
+  }
+#ifdef _WIN32
+  HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)pid);
+  if (!h) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "OpenProcess failed");
+    return;
+  }
+  char dmpPath[512];
+  snprintf(dmpPath, sizeof(dmpPath), "memdump_%d_%lld.dmp", pid, (long long)time(NULL));
+  HANDLE hFile = CreateFileA(dmpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (hFile == INVALID_HANDLE_VALUE) {
+    CloseHandle(h);
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "CreateFile failed");
+    return;
+  }
+  MINIDUMP_TYPE dumpType = full ? MiniDumpWithFullMemory : MiniDumpNormal;
+  BOOL ok = MiniDumpWriteDump(h, (DWORD)pid, hFile, dumpType, NULL, NULL, NULL);
+  CloseHandle(hFile);
+  CloseHandle(h);
+  if (!ok) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "MiniDumpWriteDump failed");
+    return;
+  }
+  char result[512];
+  snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s", pid, dmpPath);
+  s_handled++; s_exec_ok++;
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+#else
+  char procPath[128];
+  snprintf(procPath, sizeof(procPath), "/proc/%d/mem", pid);
+  FILE *src = fopen(procPath, "rb");
+  if (!src) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "/proc/pid/mem open failed");
+    return;
+  }
+  char dmpPath[512];
+  snprintf(dmpPath, sizeof(dmpPath), "/tmp/memdump_%d_%lld.dmp", pid, (long long)time(NULL));
+  FILE *dst = fopen(dmpPath, "wb");
+  if (!dst) { fclose(src); soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "output create failed"); return; }
+  char buf[65536];
+  size_t total = 0;
+  const size_t maxMem = 256ULL * 1024 * 1024;
+  while (total < maxMem) {
+    size_t nr = fread(buf, 1, sizeof(buf), src);
+    if (nr == 0) break;
+    fwrite(buf, 1, nr, dst);
+    total += nr;
+  }
+  fclose(src); fclose(dst);
+  char result[512];
+  snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s", pid, total, dmpPath);
+  s_handled++; s_exec_ok++;
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+#endif
+}
+
+/* ── P1: YARA Scan ── */
+static void do_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject yara_scan: policy");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char target_path[520];
+  (void)edr_parse_json_string(pl, len, "target_path", target_path, sizeof(target_path));
+  if (!target_path[0]) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing target_path");
+    return;
+  }
+  FILE *f = fopen(target_path, "rb");
+  if (!f) {
+    f = fopen(target_path, "r");
+  }
+  if (!f) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  long fsz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (fsz <= 0 || fsz > 50 * 1024 * 1024) {
+    fclose(f);
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "file too large (>50MB)");
+    return;
+  }
+  uint8_t *buf = (uint8_t *)malloc((size_t)fsz);
+  if (!buf) { fclose(f); soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "oom"); return; }
+  fread(buf, 1, (size_t)fsz, f);
+  fclose(f);
+
+  char result[1024];
+  int matches = 0;
+  /* basic string-level YARA-like scan for common patterns */
+  const char *patterns[] = {
+    "MZ", "PE\0\0", "This program cannot be run",
+    "powershell", "cmd.exe", "rundll32",
+    "CreateRemoteThread", "VirtualAllocEx",
+    "WriteProcessMemory", "NtCreateThreadEx",
+    "https://", "http://", ".onion",
+    "eval(", "base64_decode", "system(",
+    NULL
+  };
+  char hitBuf[512];
+  hitBuf[0] = '\0';
+  for (int pi = 0; patterns[pi]; pi++) {
+    if (memmem(buf, (size_t)fsz, patterns[pi], strlen(patterns[pi]))) {
+      matches++;
+      if (hitBuf[0]) strncat(hitBuf, ",", sizeof(hitBuf)-strlen(hitBuf)-1);
+      strncat(hitBuf, patterns[pi], sizeof(hitBuf)-strlen(hitBuf)-1);
+    }
+  }
+  free(buf);
+
+  if (matches > 0) {
+    snprintf(result, sizeof(result), "YARA_HIT path=%s matches=%d patterns=[%s]", target_path, matches, hitBuf);
+  } else {
+    snprintf(result, sizeof(result), "YARA_CLEAN path=%s", target_path);
+  }
+  s_handled++; s_exec_ok++;
+  audit_both(cmd_id, "yara_scan: ok");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+}
+
+#ifndef _WIN32
+static void *memmem(const void *haystack, size_t haystack_len,
+                    const void *needle, size_t needle_len) {
+  if (!needle_len) return (void *)haystack;
+  if (haystack_len < needle_len) return NULL;
+  const char *h = (const char *)haystack;
+  for (size_t i = 0; i <= haystack_len - needle_len; i++) {
+    if (memcmp(h + i, needle, needle_len) == 0) return (void *)(h + i);
+  }
+  return NULL;
+}
+#endif
+
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
   EdrSoarCommandMeta empty;
@@ -963,6 +1373,36 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
 
   if (streq(t, "update_server_address") || streq(t, "set_server_address")) {
     do_update_server_address(id, payload, payload_len, sm);
+    return;
+  }
+
+  if (streq(t, "rtr_shell") || streq(t, "shell_exec")) {
+    do_rtr_shell(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "rtr_get") || streq(t, "file_get")) {
+    do_rtr_get(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "rtr_put") || streq(t, "file_put")) {
+    do_rtr_put(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "rtr_rm") || streq(t, "file_rm")) {
+    do_rtr_rm(id, payload, payload_len, sm);
+    return;
+  }
+
+  if (streq(t, "forensic_targeted") || streq(t, "targeted_forensic")) {
+    do_targeted_forensic(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "memory_dump")) {
+    do_memory_dump(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "yara_scan")) {
+    do_yara_scan(id, payload, payload_len, sm);
     return;
   }
 
