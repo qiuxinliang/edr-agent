@@ -584,14 +584,14 @@ int edr_ingest_http_post_command_result(const char *command_id, const EdrSoarCom
 
   const size_t cap = 400u + json_escaped_size(s_endpoint) * 2u + json_escaped_size(command_id) + json_escaped_size(s_agent_ver) +
                     json_escaped_size(sc) + json_escaped_size(pr) + json_escaped_size(ps) + json_escaped_size(det) + 32u;
-  char *e_ep0 = (char *)malloc(4u + json_escaped_size(s_endpoint));
-  char *e_cid = (char *)malloc(4u + json_escaped_size(command_id));
-  char *e_ep1 = (char *)malloc(4u + json_escaped_size(s_endpoint));
-  char *e_agv = (char *)malloc(4u + json_escaped_size(s_agent_ver));
-  char *e_sc = (char *)malloc(4u + json_escaped_size(sc));
-  char *e_pr = (char *)malloc(4u + json_escaped_size(pr));
-  char *e_ps = (char *)malloc(4u + json_escaped_size(ps));
-  char *e_det = (char *)malloc(4u + json_escaped_size(det));
+  char *e_ep0 = (char *)malloc(8u + json_escaped_size(s_endpoint));
+  char *e_cid = (char *)malloc(8u + json_escaped_size(command_id));
+  char *e_ep1 = (char *)malloc(8u + json_escaped_size(s_endpoint));
+  char *e_agv = (char *)malloc(8u + json_escaped_size(s_agent_ver));
+  char *e_sc = (char *)malloc(8u + json_escaped_size(sc));
+  char *e_pr = (char *)malloc(8u + json_escaped_size(pr));
+  char *e_ps = (char *)malloc(8u + json_escaped_size(ps));
+  char *e_det = (char *)malloc(8u + json_escaped_size(det));
   char *j = (char *)malloc(cap);
   if (!e_ep0 || !e_cid || !e_ep1 || !e_agv || !e_sc || !e_pr || !e_ps || !e_det || !j) {
     free(det);
@@ -606,14 +606,14 @@ int edr_ingest_http_post_command_result(const char *command_id, const EdrSoarCom
     free(j);
     return -1;
   }
-  (void)json_escape_to_buf(s_endpoint, e_ep0, 4u + json_escaped_size(s_endpoint));
-  (void)json_escape_to_buf(command_id, e_cid, 4u + json_escaped_size(command_id));
-  (void)json_escape_to_buf(s_endpoint, e_ep1, 4u + json_escaped_size(s_endpoint));
-  (void)json_escape_to_buf(s_agent_ver, e_agv, 4u + json_escaped_size(s_agent_ver));
-  (void)json_escape_to_buf(sc, e_sc, 4u + json_escaped_size(sc));
-  (void)json_escape_to_buf(pr, e_pr, 4u + json_escaped_size(pr));
-  (void)json_escape_to_buf(ps, e_ps, 4u + json_escaped_size(ps));
-  (void)json_escape_to_buf(det, e_det, 4u + json_escaped_size(det));
+  (void)json_escape_to_buf(s_endpoint, e_ep0, 8u + json_escaped_size(s_endpoint));
+  (void)json_escape_to_buf(command_id, e_cid, 8u + json_escaped_size(command_id));
+  (void)json_escape_to_buf(s_endpoint, e_ep1, 8u + json_escaped_size(s_endpoint));
+  (void)json_escape_to_buf(s_agent_ver, e_agv, 8u + json_escaped_size(s_agent_ver));
+  (void)json_escape_to_buf(sc, e_sc, 8u + json_escaped_size(sc));
+  (void)json_escape_to_buf(pr, e_pr, 8u + json_escaped_size(pr));
+  (void)json_escape_to_buf(ps, e_ps, 8u + json_escaped_size(ps));
+  (void)json_escape_to_buf(det, e_det, 8u + json_escaped_size(det));
 
   int64_t fin = edr_ingest_wall_time_ms();
   int w = snprintf(
