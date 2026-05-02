@@ -1299,7 +1299,6 @@ static void do_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
 }
 
-#ifndef _WIN32
 static void *memmem(const void *haystack, size_t haystack_len,
                     const void *needle, size_t needle_len) {
   if (!needle_len) return (void *)haystack;
@@ -1310,7 +1309,6 @@ static void *memmem(const void *haystack, size_t haystack_len,
   }
   return NULL;
 }
-#endif
 
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta) {

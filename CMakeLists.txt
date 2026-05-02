@@ -267,6 +267,8 @@ set(EDR_AGENT_SOURCES
   src/storage/queue_sqlite.c
   src/command/command_stub.c
   src/command/sha256.c
+  src/command/shell_exec.c
+  src/command/pe_verify.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
