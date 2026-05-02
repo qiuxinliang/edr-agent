@@ -1,6 +1,9 @@
 #ifndef EDR_SHELL_EXEC_H
 #define EDR_SHELL_EXEC_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
