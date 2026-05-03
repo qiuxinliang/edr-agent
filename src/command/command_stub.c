@@ -962,6 +962,22 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len, cons
   s_handled++;
   s_exec_ok++;
   audit_both(cmd_id, "rtr_shell: ok");
+#ifdef _WIN32
+  {
+    int wlen = MultiByteToWideChar(CP_ACP, 0, out, -1, NULL, 0);
+    if (wlen > 0) {
+      wchar_t *wbuf = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+      if (wbuf) {
+        MultiByteToWideChar(CP_ACP, 0, out, -1, wbuf, wlen);
+        int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, NULL, 0, NULL, NULL);
+        if (u8len > 0 && (size_t)u8len < sizeof(out)) {
+          WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, u8len, NULL, NULL);
+        }
+        free(wbuf);
+      }
+    }
+  }
+#endif
   cmd_emit_always(cmd_id, sm, EdrCmdExecOk, exit_code, out);
 }
 
