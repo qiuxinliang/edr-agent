@@ -225,6 +225,37 @@ static int curl_ensure_init(void) {
   }
   return 0;
 }
+
+static CURL *curl_conn_acquire(void) {
+#ifdef EDR_HAVE_LIBCURL
+  static CURL *s_persist = NULL;
+  if (curl_ensure_init() != 0) return NULL;
+  if (!s_persist) {
+    s_persist = curl_easy_init();
+    if (s_persist) {
+      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPALIVE, 1L);
+      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPIDLE, 30L);
+      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPINTVL, 10L);
+      curl_easy_setopt(s_persist, CURLOPT_MAXAGE_CONN, 300L);
+      curl_easy_setopt(s_persist, CURLOPT_USERAGENT, "edr-agent/ingest");
+    }
+  }
+  if (s_persist) {
+    curl_easy_reset(s_persist);
+    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPINTVL, 10L);
+    curl_easy_setopt(s_persist, CURLOPT_MAXAGE_CONN, 300L);
+    curl_easy_setopt(s_persist, CURLOPT_USERAGENT, "edr-agent/ingest");
+    return s_persist;
+  }
+#endif
+  return NULL;
+}
+
+static void curl_conn_release(CURL *curl) {
+  (void)curl;
+}
 #endif
 
 /** 默认禁用 shell curl fallback；仅 `EDR_ALLOW_SHELL_CURL_FALLBACK=1` 时启用。 */
@@ -286,16 +317,17 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   size_t body_len = strlen(json_body);
 
 #ifdef EDR_HAVE_LIBCURL
-  if (curl_ensure_init() == 0) {
-    CURL *curl = curl_easy_init();
-    if (curl) {
-      char errbuf[CURL_ERROR_SIZE];
-      errbuf[0] = 0;
-      char url[768];
-      if ((size_t)snprintf(url, sizeof(url), "%s/%s", s_rest, relpath) >= sizeof(url)) {
-        curl_easy_cleanup(curl);
-      } else {
-        struct curl_slist *hdrs = NULL;
+  CURL *curl = curl_conn_acquire();
+  if (curl) {
+    char errbuf[CURL_ERROR_SIZE];
+    errbuf[0] = 0;
+    char url[768];
+    if ((size_t)snprintf(url, sizeof(url), "%s/%s", s_rest, relpath) >= sizeof(url)) {
+      curl_conn_release(curl);
+      return -1;
+    }
+    {
+    struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     char tbuf[160];
     snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
@@ -327,7 +359,7 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     }
     curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
+    curl_conn_release(curl);
 
     if (cres != CURLE_OK) {
       const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cres);
@@ -340,8 +372,6 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
     } else {
       return 0;
     }
-    }
-  }
   }
 #endif
 
@@ -980,7 +1010,7 @@ static int ingest_get_json_relpath_curl(const char *relpath, char **out_body, in
   }
   struct edr_ingest_membuf mb;
   memset(&mb, 0, sizeof(mb));
-  CURL *curl = curl_easy_init();
+  CURL *curl = curl_conn_acquire();
   if (!curl) {
     return -1;
   }
@@ -1013,7 +1043,7 @@ static int ingest_get_json_relpath_curl(const char *relpath, char **out_body, in
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   }
   curl_slist_free_all(hdrs);
-  curl_easy_cleanup(curl);
+  curl_conn_release(curl);
   if (cres != CURLE_OK) {
     const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cres);
     EDR_LOGE("[ingest-http] GET %s: %s\n", relpath, em);
@@ -1362,13 +1392,12 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     snprintf(bname, sizeof(bname), "%s", "upload.bin");
   }
 #ifdef EDR_HAVE_LIBCURL
-  if (curl_ensure_init() == 0) {
-    CURL *curl = curl_easy_init();
-    if (curl) {
+  CURL *curl = curl_conn_acquire();
+  if (curl) {
       char errbuf[CURL_ERROR_SIZE], url[800];
       errbuf[0] = 0;
       if (snprintf(url, sizeof(url), "%s/ingest/upload-file", s_rest) >= (int)sizeof(url)) {
-        curl_easy_cleanup(curl);
+        curl_conn_release(curl);
         return -1;
       }
       struct curl_slist *hdrs = NULL;
@@ -1418,7 +1447,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
         }
         curl_mime_free(mime);
         curl_slist_free_all(hdrs);
-        curl_easy_cleanup(curl);
+        curl_conn_release(curl);
         if (cres == CURLE_OK && code >= 200 && code < 300) {
           if (mb.p && out_minio_key) {
             (void)copy_minio_key_from_json(mb.p, out_minio_key, out_minio_key_cap);
@@ -1434,10 +1463,9 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
         free(mb.p);
       } else {
         curl_slist_free_all(hdrs);
-        curl_easy_cleanup(curl);
+        curl_conn_release(curl);
       }
     }
-  }
 #endif
   {
     char rpath[512], cfg2[800];
