@@ -563,9 +563,17 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   if (interval < 1) {
     return;
   }
+  static int s_remote_consecutive_failures = 0;
+  uint64_t eff_interval_ns = (uint64_t)interval * 1000000000ULL;
+  if (s_remote_consecutive_failures > 0) {
+    int backoff = interval;
+    for (int i = 0; i < s_remote_consecutive_failures && backoff < 3600; i++) {
+      backoff *= 2;
+    }
+    eff_interval_ns = (uint64_t)backoff * 1000000000ULL;
+  }
   uint64_t now = edr_monotonic_ns();
-  if (*last_remote_ns != 0u &&
-      now - *last_remote_ns < (uint64_t)interval * 1000000000ULL) {
+  if (*last_remote_ns != 0u && now - *last_remote_ns < eff_interval_ns) {
     return;
   }
   *last_remote_ns = now;
@@ -576,8 +584,14 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     return;
   }
   if (edr_remote_fetch_toml(url, tmp, agent->cfg.agent.endpoint_id) != 0) {
+    s_remote_consecutive_failures++;
+    if (s_remote_consecutive_failures <= 1 || s_remote_consecutive_failures % 10 == 0) {
+      fprintf(stderr, "[config] 远程 TOML 拉取连续失败 %d 次，退避 %ds 后重试\n",
+              s_remote_consecutive_failures, (int)(eff_interval_ns / 1000000000ULL));
+    }
     return;
   }
+  s_remote_consecutive_failures = 0;
 
   /* 保存 [remote] + [agent] section，防止远程 TOML 覆盖后丢失关键参数 */
   struct {
