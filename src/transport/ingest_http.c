@@ -373,6 +373,7 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
       return 0;
     }
   }
+  }
 #endif
 
   if (!shell_curl_fallback_allowed()) {
