@@ -986,7 +986,7 @@ static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const 
   if (!dangerous_enabled()) {
     s_rejected++;
     audit_both(cmd_id, "reject rtr_get: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   char path[520];
@@ -998,14 +998,14 @@ static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const 
   if (!path[0]) {
     s_exec_fail++;
     audit_both(cmd_id, "rtr_get: 缺少 path");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
     return;
   }
   FILE *f = fopen(path, "rb");
   if (!f) {
     s_exec_fail++;
     audit_both(cmd_id, "rtr_get: 文件不存在");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
     return;
   }
   fseek(f, 0, SEEK_END);
@@ -1015,20 +1015,20 @@ static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const 
     fclose(f);
     s_exec_fail++;
     audit_both(cmd_id, "rtr_get: 文件大小超限");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "file size out of range");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 4, "file size out of range");
     return;
   }
   uint8_t *buf = (uint8_t *)malloc((size_t)fsize);
   if (!buf) {
     fclose(f);
     s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "oom");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 5, "oom");
     return;
   }
   if (fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) {
     free(buf); fclose(f);
     s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, "read error");
+    cmd_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, "read error");
     return;
   }
   fclose(f);
@@ -1038,7 +1038,7 @@ static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const 
       free(buf);
       s_rejected++;
       audit_both(cmd_id, "rtr_get: 非有效PE文件");
-      soar_emit(cmd_id, sm, EdrCmdExecRejected, 7, "not a valid PE file");
+      cmd_emit_always(cmd_id, sm, EdrCmdExecRejected, 7, "not a valid PE file");
       return;
     }
     char sha[65];
@@ -1048,7 +1048,7 @@ static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const 
     free(buf);
     s_handled++; s_exec_ok++;
     audit_both(cmd_id, "rtr_get: PE验证通过");
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+    cmd_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
     return;
   }
   char sha[65];
@@ -1058,7 +1058,7 @@ static void do_rtr_get(const char *cmd_id, const uint8_t *pl, size_t len, const 
   free(buf);
   s_handled++; s_exec_ok++;
   audit_both(cmd_id, "rtr_get: 文件读取成功");
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+  cmd_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 }
 
 /* ── RTR Put (文件上传) ── */
