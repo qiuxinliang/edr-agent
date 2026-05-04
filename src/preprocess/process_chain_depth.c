@@ -4,43 +4,6 @@
 #include <string.h>
 
 #ifdef _WIN32
-static int lookup_process_name_path(uint32_t pid, char *name_out, size_t name_cap, char *path_out, size_t path_cap) {
-  if (pid == 0u && name_out) name_out[0] = '\0';
-  if (pid == 0u && path_out) path_out[0] = '\0';
-  if (pid == 0u) return -1;
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snap == INVALID_HANDLE_VALUE) return -1;
-  PROCESSENTRY32W pe;
-  pe.dwSize = (DWORD)sizeof(pe);
-  int found = 0;
-  if (Process32FirstW(snap, &pe)) {
-    do {
-      if (pe.th32ProcessID == (DWORD)pid) {
-        if (path_out && path_cap > 0) {
-          WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, path_out, (int)path_cap - 1, NULL, NULL);
-          path_out[path_cap - 1] = '\0';
-        }
-        if (name_out && name_cap > 0) {
-          const char *bn = NULL;
-          if (path_out && path_out[0]) {
-            bn = basename_c(path_out);
-          }
-          if (!bn || !bn[0]) {
-            char tmp[260];
-            WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, tmp, (int)sizeof(tmp) - 1, NULL, NULL);
-            bn = basename_c(tmp);
-          }
-          snprintf(name_out, name_cap, "%s", bn && bn[0] ? bn : "");
-        }
-        found = 1;
-        break;
-      }
-    } while (Process32NextW(snap, &pe));
-  }
-  CloseHandle(snap);
-  return found ? 0 : -1;
-}
-#endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -86,6 +49,41 @@ static int is_untrusted_depth(const char *exe_path) {
 }
 
 #ifdef _WIN32
+static int lookup_process_name_path(uint32_t pid, char *name_out, size_t name_cap,
+                                     char *path_out, size_t path_cap) {
+  if (pid == 0u) {
+    if (name_out && name_cap > 0) name_out[0] = '\0';
+    if (path_out && path_cap > 0) path_out[0] = '\0';
+    return -1;
+  }
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return -1;
+  PROCESSENTRY32W pe;
+  pe.dwSize = (DWORD)sizeof(pe);
+  int found = 0;
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (pe.th32ProcessID == (DWORD)pid) {
+        if (path_out && path_cap > 0) {
+          WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, path_out, (int)path_cap - 1, NULL, NULL);
+          path_out[path_cap - 1] = '\0';
+        }
+        if (name_out && name_cap > 0) {
+          if (path_out && path_out[0]) {
+            snprintf(name_out, name_cap, "%s", basename_c(path_out));
+          } else {
+            name_out[0] = '\0';
+          }
+        }
+        found = 1;
+        break;
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  return found ? 0 : -1;
+}
+
 static uint32_t win_ppid_of(uint32_t pid) {
   if (pid == 0u) {
     return 0u;
@@ -150,7 +148,8 @@ void edr_behavior_record_fill_process_chain_depth(EdrBehaviorRecord *r) {
     if (gp_pid != 0u) {
       char gp_name[EDR_BR_STR_SHORT];
       char gp_path[EDR_BR_STR_MID];
-      if (lookup_process_name_path(gp_pid, gp_name, sizeof(gp_name), gp_path, sizeof(gp_path)) == 0) {
+      if (lookup_process_name_path(gp_pid, gp_name, sizeof(gp_name),
+                                   gp_path, sizeof(gp_path)) == 0) {
         snprintf(r->grandparent_name, sizeof(r->grandparent_name), "%s", gp_name);
         snprintf(r->grandparent_path, sizeof(r->grandparent_path), "%s", gp_path);
       }
