@@ -345,6 +345,36 @@ static int edr_remote_tmp_path(char *out, size_t cap) {
   return 0;
 #endif
 }
+#ifdef EDR_HAVE_LIBCURL
+static size_t edr_curl_capture_header(char *buffer, size_t size, size_t nitems, void *userdata) {
+  size_t total = size * nitems;
+  if (total < 18 || !userdata) return total;
+  struct { char *buf; size_t cap; } *ctx = (void *)userdata;
+  if (ctx->buf[0] != '\0') return total;
+  const char *pfx = "x-rules-version:";
+  int match = 1;
+  int i;
+  for (i = 0; i < 16; i++) {
+    char a = (char)(buffer[i] | (char)0x20);
+    if (a != pfx[i]) { match = 0; break; }
+  }
+  if (!match) return total;
+  const char *val = buffer + 16;
+  while (*val == ' ' || *val == '\t') val++;
+  size_t n = 0;
+  while (val[n] != '\0' && val[n] != '\r' && val[n] != '\n' && n < ctx->cap - 1) {
+    ctx->buf[n] = val[n];
+    n++;
+  }
+  ctx->buf[n] = '\0';
+  return total;
+}
+static size_t edr_curl_discard_body(char *buffer, size_t size, size_t nitems, void *userdata) {
+  (void)buffer;
+  (void)userdata;
+  return size * nitems;
+}
+#endif
 
 /* 检查远程规则版本号（HEAD 请求，仅下载响应头，不下载体） */
 static int edr_remote_check_version(const char *url, const char *endpoint_id, char *ver_out, size_t ver_out_cap) {
@@ -359,40 +389,42 @@ static int edr_remote_check_version(const char *url, const char *endpoint_id, ch
   if (edr_remote_curl_init() != 0) {
     return -1;
   }
-  static CURL *s_curl = NULL;
-  static struct curl_slist *s_accept_hdr = NULL;
-  if (!s_curl) {
-    s_curl = curl_easy_init();
-    if (!s_curl) return -1;
+  static CURL *s_h_curl = NULL;
+  if (!s_h_curl) {
+    s_h_curl = curl_easy_init();
+    if (!s_h_curl) return -1;
   } else {
-    curl_easy_reset(s_curl);
+    curl_easy_reset(s_h_curl);
   }
-  if (!s_accept_hdr) {
-    s_accept_hdr = curl_slist_append(NULL, "Accept: text/plain");
-  }
+  /* 用于 header_callback 捕获 X-Rules-Version 的上下文 */
+  struct {
+    char *buf;
+    size_t cap;
+  } hv_ctx;
+  hv_ctx.buf = ver_out;
+  hv_ctx.cap = ver_out_cap;
+
   char errbuf[CURL_ERROR_SIZE];
   errbuf[0] = 0;
-  curl_easy_setopt(s_curl, CURLOPT_ERRORBUFFER, errbuf);
-  curl_easy_setopt(s_curl, CURLOPT_URL, url);
-  curl_easy_setopt(s_curl, CURLOPT_NOBODY, 1L);       /* HEAD request */
-  curl_easy_setopt(s_curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(s_curl, CURLOPT_TIMEOUT, 10L);
-  curl_easy_setopt(s_curl, CURLOPT_FORBID_REUSE, 0L);
-  curl_easy_setopt(s_curl, CURLOPT_TCP_KEEPALIVE, 1L);
-  curl_easy_setopt(s_curl, CURLOPT_HEADERFUNCTION, NULL);
-  curl_easy_setopt(s_curl, CURLOPT_WRITEFUNCTION, NULL);
-  curl_easy_setopt(s_curl, CURLOPT_WRITEDATA, NULL);
-  curl_easy_setopt(s_curl, CURLOPT_HTTPHEADER, s_accept_hdr);
-  CURLcode cc = curl_easy_perform(s_curl);
+  curl_easy_setopt(s_h_curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(s_h_curl, CURLOPT_URL, url);
+  curl_easy_setopt(s_h_curl, CURLOPT_NOBODY, 1L);
+  curl_easy_setopt(s_h_curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(s_h_curl, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERFUNCTION, edr_curl_capture_header);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERDATA, &hv_ctx);
+  curl_easy_setopt(s_h_curl, CURLOPT_WRITEFUNCTION, edr_curl_discard_body);
+  curl_easy_setopt(s_h_curl, CURLOPT_WRITEDATA, NULL);
+  CURLcode cc = curl_easy_perform(s_h_curl);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERFUNCTION, NULL);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERDATA, NULL);
+  curl_easy_setopt(s_h_curl, CURLOPT_WRITEFUNCTION, NULL);
   if (cc != CURLE_OK) {
     return -1;
   }
-  char *hv = NULL;
-  CURLHcode hc = curl_easy_header(s_curl, "X-Rules-Version", 0, CURLH_HEADER, -1, &hv);
-  if (hc != CURLHE_OK || !hv || !hv[0]) {
+  if (ver_out[0] == '\0') {
     return -1;
   }
-  snprintf(ver_out, ver_out_cap, "%s", hv);
   return 0;
 #endif
 }
