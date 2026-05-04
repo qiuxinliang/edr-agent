@@ -593,37 +593,105 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   s_remote_consecutive_failures = 0;
 
-  /* 保存 [remote] + [agent] section，防止远程 TOML 覆盖后丢失关键参数 */
+  /* 保存 [server]/[agent]/[collection]/[remote] section，防止远程 TOML 覆盖后丢失关键参数 */
   struct {
+    /* server */
+    char srv_address[256];
+    char srv_ca_cert[1024];
+    char srv_client_cert[1024];
+    char srv_client_key[1024];
+    int srv_connect_timeout_s;
+    int srv_keepalive_interval_s;
+    bool srv_grpc_insecure;
+    /* agent */
+    char endpoint_id[128];
+    char tenant_id[128];
+    /* collection */
+    bool col_etw_enabled;
+    bool col_etw_tcpip_provider;
+    bool col_etw_firewall_provider;
+    bool col_etw_dns_client_provider;
+    bool col_etw_powershell_provider;
+    bool col_etw_security_audit_provider;
+    bool col_etw_wmi_provider;
+    bool col_ebpf_enabled;
+    int col_poll_interval_s;
+    uint32_t col_max_event_queue_size;
+    uint32_t col_etw_buffer_kb;
+    uint32_t col_etw_flush_timer_s;
+    /* remote */
     char rules_url[512];
     char p0_bundle_url[512];
     char version_url[512];
     char download_url[512];
     int poll_interval_s;
     bool auto_update;
-    char endpoint_id[128];
-    char tenant_id[128];
-  } saved_remote;
-  memcpy(saved_remote.rules_url, agent->cfg.remote.rules_url, sizeof(saved_remote.rules_url));
-  memcpy(saved_remote.p0_bundle_url, agent->cfg.remote.p0_bundle_url, sizeof(saved_remote.p0_bundle_url));
-  memcpy(saved_remote.version_url, agent->cfg.remote.version_url, sizeof(saved_remote.version_url));
-  memcpy(saved_remote.download_url, agent->cfg.remote.download_url, sizeof(saved_remote.download_url));
-  saved_remote.poll_interval_s = agent->cfg.remote.poll_interval_s;
-  saved_remote.auto_update = agent->cfg.remote.auto_update;
-  memcpy(saved_remote.endpoint_id, agent->cfg.agent.endpoint_id, sizeof(saved_remote.endpoint_id));
-  memcpy(saved_remote.tenant_id, agent->cfg.agent.tenant_id, sizeof(saved_remote.tenant_id));
+  } saved;
+  /* save server */
+  memcpy(saved.srv_address, agent->cfg.server.address, sizeof(saved.srv_address));
+  memcpy(saved.srv_ca_cert, agent->cfg.server.ca_cert, sizeof(saved.srv_ca_cert));
+  memcpy(saved.srv_client_cert, agent->cfg.server.client_cert, sizeof(saved.srv_client_cert));
+  memcpy(saved.srv_client_key, agent->cfg.server.client_key, sizeof(saved.srv_client_key));
+  saved.srv_connect_timeout_s = agent->cfg.server.connect_timeout_s;
+  saved.srv_keepalive_interval_s = agent->cfg.server.keepalive_interval_s;
+  saved.srv_grpc_insecure = agent->cfg.server.grpc_insecure;
+  /* save agent */
+  memcpy(saved.endpoint_id, agent->cfg.agent.endpoint_id, sizeof(saved.endpoint_id));
+  memcpy(saved.tenant_id, agent->cfg.agent.tenant_id, sizeof(saved.tenant_id));
+  /* save collection */
+  saved.col_etw_enabled = agent->cfg.collection.etw_enabled;
+  saved.col_etw_tcpip_provider = agent->cfg.collection.etw_tcpip_provider;
+  saved.col_etw_firewall_provider = agent->cfg.collection.etw_firewall_provider;
+  saved.col_etw_dns_client_provider = agent->cfg.collection.etw_dns_client_provider;
+  saved.col_etw_powershell_provider = agent->cfg.collection.etw_powershell_provider;
+  saved.col_etw_security_audit_provider = agent->cfg.collection.etw_security_audit_provider;
+  saved.col_etw_wmi_provider = agent->cfg.collection.etw_wmi_provider;
+  saved.col_ebpf_enabled = agent->cfg.collection.ebpf_enabled;
+  saved.col_poll_interval_s = agent->cfg.collection.poll_interval_s;
+  saved.col_max_event_queue_size = agent->cfg.collection.max_event_queue_size;
+  saved.col_etw_buffer_kb = agent->cfg.collection.etw_buffer_kb;
+  saved.col_etw_flush_timer_s = agent->cfg.collection.etw_flush_timer_s;
+  /* save remote */
+  memcpy(saved.rules_url, agent->cfg.remote.rules_url, sizeof(saved.rules_url));
+  memcpy(saved.p0_bundle_url, agent->cfg.remote.p0_bundle_url, sizeof(saved.p0_bundle_url));
+  memcpy(saved.version_url, agent->cfg.remote.version_url, sizeof(saved.version_url));
+  memcpy(saved.download_url, agent->cfg.remote.download_url, sizeof(saved.download_url));
+  saved.poll_interval_s = agent->cfg.remote.poll_interval_s;
+  saved.auto_update = agent->cfg.remote.auto_update;
 
   EdrError ce = edr_config_load(tmp, &agent->cfg);
 
-  /* 恢复 [remote] + [agent] section，保留首次 agent.toml 中配置的参数 */
-  memcpy(agent->cfg.remote.rules_url, saved_remote.rules_url, sizeof(agent->cfg.remote.rules_url));
-  memcpy(agent->cfg.remote.p0_bundle_url, saved_remote.p0_bundle_url, sizeof(agent->cfg.remote.p0_bundle_url));
-  memcpy(agent->cfg.remote.version_url, saved_remote.version_url, sizeof(agent->cfg.remote.version_url));
-  memcpy(agent->cfg.remote.download_url, saved_remote.download_url, sizeof(agent->cfg.remote.download_url));
-  agent->cfg.remote.poll_interval_s = saved_remote.poll_interval_s;
-  agent->cfg.remote.auto_update = saved_remote.auto_update;
-  memcpy(agent->cfg.agent.endpoint_id, saved_remote.endpoint_id, sizeof(agent->cfg.agent.endpoint_id));
-  memcpy(agent->cfg.agent.tenant_id, saved_remote.tenant_id, sizeof(agent->cfg.agent.tenant_id));
+  /* restore server */
+  memcpy(agent->cfg.server.address, saved.srv_address, sizeof(agent->cfg.server.address));
+  memcpy(agent->cfg.server.ca_cert, saved.srv_ca_cert, sizeof(agent->cfg.server.ca_cert));
+  memcpy(agent->cfg.server.client_cert, saved.srv_client_cert, sizeof(agent->cfg.server.client_cert));
+  memcpy(agent->cfg.server.client_key, saved.srv_client_key, sizeof(agent->cfg.server.client_key));
+  agent->cfg.server.connect_timeout_s = saved.srv_connect_timeout_s;
+  agent->cfg.server.keepalive_interval_s = saved.srv_keepalive_interval_s;
+  agent->cfg.server.grpc_insecure = saved.srv_grpc_insecure;
+  /* restore agent */
+  memcpy(agent->cfg.agent.endpoint_id, saved.endpoint_id, sizeof(agent->cfg.agent.endpoint_id));
+  memcpy(agent->cfg.agent.tenant_id, saved.tenant_id, sizeof(agent->cfg.agent.tenant_id));
+  /* restore collection */
+  agent->cfg.collection.etw_enabled = saved.col_etw_enabled;
+  agent->cfg.collection.etw_tcpip_provider = saved.col_etw_tcpip_provider;
+  agent->cfg.collection.etw_firewall_provider = saved.col_etw_firewall_provider;
+  agent->cfg.collection.etw_dns_client_provider = saved.col_etw_dns_client_provider;
+  agent->cfg.collection.etw_powershell_provider = saved.col_etw_powershell_provider;
+  agent->cfg.collection.etw_security_audit_provider = saved.col_etw_security_audit_provider;
+  agent->cfg.collection.etw_wmi_provider = saved.col_etw_wmi_provider;
+  agent->cfg.collection.ebpf_enabled = saved.col_ebpf_enabled;
+  agent->cfg.collection.poll_interval_s = saved.col_poll_interval_s;
+  agent->cfg.collection.max_event_queue_size = saved.col_max_event_queue_size;
+  agent->cfg.collection.etw_buffer_kb = saved.col_etw_buffer_kb;
+  agent->cfg.collection.etw_flush_timer_s = saved.col_etw_flush_timer_s;
+  /* restore remote */
+  memcpy(agent->cfg.remote.rules_url, saved.rules_url, sizeof(agent->cfg.remote.rules_url));
+  memcpy(agent->cfg.remote.p0_bundle_url, saved.p0_bundle_url, sizeof(agent->cfg.remote.p0_bundle_url));
+  memcpy(agent->cfg.remote.version_url, saved.version_url, sizeof(agent->cfg.remote.version_url));
+  memcpy(agent->cfg.remote.download_url, saved.download_url, sizeof(agent->cfg.remote.download_url));
+  agent->cfg.remote.poll_interval_s = saved.poll_interval_s;
+  agent->cfg.remote.auto_update = saved.auto_update;
 
   char fp[80];
   edr_config_fingerprint(tmp, fp, sizeof(fp));
