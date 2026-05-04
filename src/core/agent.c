@@ -346,6 +346,57 @@ static int edr_remote_tmp_path(char *out, size_t cap) {
 #endif
 }
 
+/* 检查远程规则版本号（HEAD 请求，仅下载响应头，不下载体） */
+static int edr_remote_check_version(const char *url, const char *endpoint_id, char *ver_out, size_t ver_out_cap) {
+  if (!url || !url[0] || !ver_out || ver_out_cap == 0) {
+    return -1;
+  }
+  ver_out[0] = '\0';
+#ifndef EDR_HAVE_LIBCURL
+  (void)endpoint_id;
+  return -1;
+#else
+  if (edr_remote_curl_init() != 0) {
+    return -1;
+  }
+  static CURL *s_curl = NULL;
+  static struct curl_slist *s_accept_hdr = NULL;
+  if (!s_curl) {
+    s_curl = curl_easy_init();
+    if (!s_curl) return -1;
+  } else {
+    curl_easy_reset(s_curl);
+  }
+  if (!s_accept_hdr) {
+    s_accept_hdr = curl_slist_append(NULL, "Accept: text/plain");
+  }
+  char errbuf[CURL_ERROR_SIZE];
+  errbuf[0] = 0;
+  curl_easy_setopt(s_curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(s_curl, CURLOPT_URL, url);
+  curl_easy_setopt(s_curl, CURLOPT_NOBODY, 1L);       /* HEAD request */
+  curl_easy_setopt(s_curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(s_curl, CURLOPT_FORBID_REUSE, 0L);
+  curl_easy_setopt(s_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_HEADERFUNCTION, NULL);
+  curl_easy_setopt(s_curl, CURLOPT_WRITEFUNCTION, NULL);
+  curl_easy_setopt(s_curl, CURLOPT_WRITEDATA, NULL);
+  curl_easy_setopt(s_curl, CURLOPT_HTTPHEADER, s_accept_hdr);
+  CURLcode cc = curl_easy_perform(s_curl);
+  if (cc != CURLE_OK) {
+    return -1;
+  }
+  char *hv = NULL;
+  CURLHcode hc = curl_easy_header(s_curl, "X-Rules-Version", 0, CURLH_HEADER, -1, &hv);
+  if (hc != CURLHE_OK || !hv || !hv[0]) {
+    return -1;
+  }
+  snprintf(ver_out, ver_out_cap, "%s", hv);
+  return 0;
+#endif
+}
+
 static int edr_remote_fetch_toml(const char *url, const char *out_path, const char *endpoint_id) {
   if (!url || !url[0] || !out_path || !out_path[0]) {
     return -1;
@@ -594,6 +645,22 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     EDR_LOGE("%s", "[config] 远程 TOML 临时文件创建失败\n");
     return;
   }
+  /* 先检查版本号，若与本地相同则跳过下载 */
+  {
+    char remote_ver[64];
+    if (edr_remote_check_version(url, agent->cfg.agent.endpoint_id, remote_ver, sizeof(remote_ver)) == 0) {
+      if (remote_ver[0] && agent->cfg.preprocessing.rules_version[0]) {
+        if (strcmp(remote_ver, agent->cfg.preprocessing.rules_version) == 0) {
+          fprintf(stderr, "[config] 远程规则版本未变 (%s), 跳过下载\n", remote_ver);
+          return;
+        }
+      }
+      fprintf(stderr, "[config] 远程规则版本已更新: local=%s remote=%s\n",
+              agent->cfg.preprocessing.rules_version[0] ? agent->cfg.preprocessing.rules_version : "(none)",
+              remote_ver);
+    }
+  }
+
   if (edr_remote_fetch_toml(url, tmp, agent->cfg.agent.endpoint_id) != 0) {
     s_remote_consecutive_failures++;
     if (s_remote_consecutive_failures <= 1 || s_remote_consecutive_failures % 10 == 0) {
