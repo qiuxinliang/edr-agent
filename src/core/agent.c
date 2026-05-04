@@ -346,46 +346,44 @@ static int edr_remote_fetch_toml(const char *url, const char *out_path, const ch
   if (edr_remote_curl_init() != 0) {
     return -1;
   }
-  CURL *curl = curl_easy_init();
-  if (!curl) {
-    return -1;
+  static CURL *s_curl = NULL;
+  if (!s_curl) {
+    s_curl = curl_easy_init();
+    if (!s_curl) return -1;
+  } else {
+    curl_easy_reset(s_curl);
   }
   FILE *f = fopen(out_path, "wb");
   if (!f) {
-    curl_easy_cleanup(curl);
     return -1;
   }
   char errbuf[CURL_ERROR_SIZE];
   errbuf[0] = 0;
-  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)f);
+  curl_easy_setopt(s_curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(s_curl, CURLOPT_URL, url);
+  curl_easy_setopt(s_curl, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(s_curl, CURLOPT_FORBID_REUSE, 0L);
+  curl_easy_setopt(s_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_WRITEDATA, (void *)f);
+  struct curl_slist *headers = NULL;
   if (endpoint_id && endpoint_id[0] && strcmp(endpoint_id, "auto") != 0) {
-    struct curl_slist *headers = NULL;
     char hdr[256];
     snprintf(hdr, sizeof(hdr), "X-Endpoint-ID: %s", endpoint_id);
     headers = curl_slist_append(headers, hdr);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    fprintf(stderr, "[remote] downloading %s with X-Endpoint-ID: %s\n", url, endpoint_id);
-    CURLcode cc = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
-    fclose(f);
-    curl_easy_cleanup(curl);
-    if (cc != CURLE_OK) {
-      (void)remove(out_path);
-      const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cc);
-      EDR_LOGE("[config] 远程 TOML 拉取失败: %s\n", em);
-      return -1;
-    }
-    return 0;
   }
-  CURLcode cc = curl_easy_perform(curl);
+  if (headers) {
+    curl_easy_setopt(s_curl, CURLOPT_HTTPHEADER, headers);
+  }
+  fprintf(stderr, "[remote] downloading %s with X-Endpoint-ID: %s\n", url, endpoint_id ? endpoint_id : "(none)");
+  CURLcode cc = curl_easy_perform(s_curl);
   fclose(f);
-  curl_easy_cleanup(curl);
+  if (headers) {
+    curl_slist_free_all(headers);
+    curl_easy_setopt(s_curl, CURLOPT_HTTPHEADER, NULL);
+  }
   if (cc != CURLE_OK) {
     (void)remove(out_path);
     const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cc);
