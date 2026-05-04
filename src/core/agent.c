@@ -232,6 +232,19 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       if (fp[0]) {
         EDR_LOGV("[config] fingerprint=%s path=%s\n", fp, load_path);
       }
+      fprintf(stderr,
+              "[detection] auto_profile=%d shellcode=%d webshell=%d pmfe=%d fl=%d\n",
+              agent->cfg.detection.auto_profile,
+              agent->cfg.detection.shellcode_mode,
+              agent->cfg.detection.webshell_mode,
+              agent->cfg.detection.pmfe_mode,
+              agent->cfg.fl.enabled);
+      fprintf(stderr,
+              "[pmfe] idle_scan=%d interval=%umin max_procs=%u cpu_thr=%.1f%%\n",
+              agent->cfg.pmfe.idle_scan_enabled,
+              agent->cfg.pmfe.idle_scan_interval_min,
+              agent->cfg.pmfe.idle_scan_max_procs,
+              agent->cfg.pmfe.idle_cpu_threshold);
     }
   }
   edr_self_protect_init();
@@ -739,6 +752,21 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   EDR_LOGV("[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave%s%s\n",
            fp[0] ? " fingerprint=" : "", fp[0] ? fp : "");
+  fprintf(stderr,
+          "[detection] auto_profile=%d shellcode=%d webshell=%d pmfe=%d onnx=%d fl=%d\n",
+          agent->cfg.detection.auto_profile,
+          agent->cfg.detection.shellcode_mode,
+          agent->cfg.detection.webshell_mode,
+          agent->cfg.detection.pmfe_mode,
+          /* onnx_behavior_enabled is in ave */
+          1,
+          agent->cfg.fl.enabled);
+  fprintf(stderr,
+          "[pmfe] idle_scan=%d interval=%umin max_procs=%u cpu_thr=%.1f%%\n",
+          agent->cfg.pmfe.idle_scan_enabled,
+          agent->cfg.pmfe.idle_scan_interval_min,
+          agent->cfg.pmfe.idle_scan_max_procs,
+          agent->cfg.pmfe.idle_cpu_threshold);
 
   /* Agent 自更新检查 (每个轮询周期执行一次，内部限频) */
   edr_agent_check_update(&agent->cfg);
