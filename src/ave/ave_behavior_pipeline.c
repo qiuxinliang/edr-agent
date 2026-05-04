@@ -759,6 +759,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   }
 
   int fire = 0;
+  int onnx_ready = edr_onnx_behavior_ready();
   if (s_callbacks_set && s_callbacks.on_behavior_alert && sl->anomaly >= AVE_BP_ALERT_THRESH &&
       (sl->last_alert_ns == 0 || now - sl->last_alert_ns >= AVE_BP_ALERT_COOLDOWN_NS)) {
     fire = 1;
@@ -766,12 +767,16 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   }
 
   float an_copy = sl->anomaly;
-  AVEBehaviorFlags fl_copy = sl->flags;
+  uint32_t fl_copy = sl->flags;
   uint32_t pid_copy = e->pid;
   AVEBehaviorCallback cb = s_callbacks.on_behavior_alert;
   void *ud = s_callbacks.user_data;
   float tactic_copy[14];
   memcpy(tactic_copy, last_tactic_probs, sizeof(tactic_copy));
+  char sl_proc_name[256];
+  memcpy(sl_proc_name, sl->process_name, sizeof(sl_proc_name));
+  char ev_tgt_path[1024];
+  memcpy(ev_tgt_path, e->target_path, sizeof(ev_tgt_path));
   unlock_bp();
 
   if (fire && cb) {
@@ -780,15 +785,31 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     al.pid = pid_copy;
     al.anomaly_score = an_copy;
     memcpy(al.tactic_probs, tactic_copy, sizeof(al.tactic_probs));
-    fill_triggered_tactics(tactic_copy, al.triggered_tactics, sizeof(al.triggered_tactics));
-    al.behavior_flags = fl_copy;
-    al.timestamp_ns = now;
-    snprintf(al.process_name, sizeof(al.process_name), "pid:%u", (unsigned)pid_copy);
-    if (e->target_path[0]) {
-      snprintf(al.process_path, sizeof(al.process_path), "%s", e->target_path);
+    if (!onnx_ready) {
+      al.triggered_tactics[0] = '\0';
+      al.skip_ai_analysis = true;
+      al.needs_l2_review = true;
+    } else {
+      fill_triggered_tactics(tactic_copy, al.triggered_tactics, sizeof(al.triggered_tactics));
+      al.needs_l2_review = true;
+      al.skip_ai_analysis = false;
     }
-    al.needs_l2_review = true;
-    al.skip_ai_analysis = false;
+    al.behavior_flags = (AVEBehaviorFlags)fl_copy;
+    al.timestamp_ns = now;
+    if (sl_proc_name[0] && strncmp(sl_proc_name, "pid:", 4) != 0) {
+      snprintf(al.process_name, sizeof(al.process_name), "%s", sl_proc_name);
+    } else if (ev_tgt_path[0]) {
+      const char *bn = ev_tgt_path;
+      for (const char *c = ev_tgt_path; *c; c++) {
+        if (*c == '\\' || *c == '/') bn = c + 1;
+      }
+      snprintf(al.process_name, sizeof(al.process_name), "%s", bn);
+    } else {
+      snprintf(al.process_name, sizeof(al.process_name), "pid:%u", (unsigned)pid_copy);
+    }
+    if (ev_tgt_path[0]) {
+      snprintf(al.process_path, sizeof(al.process_path), "%s", ev_tgt_path);
+    }
     /* 可选：与平台 alerts.user_subject_json 对齐的 JSON 真源（调试用/专线注入；生产建议由策略填 AVEBehaviorAlert） */
     {
       const char *ujs = getenv("EDR_BEHAVIOR_USER_SUBJECT_JSON");
