@@ -272,6 +272,27 @@ typedef struct EdrConfig {
     uint32_t max_upload_size_mb;
   } webshell_detector;
 
+  /** §19 检测引擎自适应策略 — TOML `[detection]` */
+  struct {
+    /** 自适应探测：Agent 启动时根据环境特征自动启用 shellcode/webshell */
+    bool auto_profile;
+    /** 手工强制 shellcode 检测（覆盖自适应） */
+    int shellcode_mode; /* 0=关 1=开 -1=自适应(默认) */
+    /** 手工强制 webshell 检测（覆盖自适应） */
+    int webshell_mode; /* 0=关 1=开 -1=自适应(默认) */
+    /** PMFE 内存取证: 0=关 1=仅空闲扫描 2=告警触发+空闲 (默认0) */
+    int pmfe_mode;
+  } detection;
+
+  /** §20 PMFE 内存取证空闲扫描 — TOML `[pmfe]` */
+  struct {
+    bool idle_scan_enabled;
+    uint32_t idle_scan_interval_min;
+    uint32_t idle_scan_max_procs;
+    double idle_cpu_threshold;
+    bool idle_skip_on_battery;
+  } pmfe;
+
   /**
    * 联邦学习本地训练（FL §10）；TOML `[fl]`。
    */

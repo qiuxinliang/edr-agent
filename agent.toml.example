@@ -238,6 +238,36 @@ max_log_files        = 10
 # max_upload_size_mb       = 10
 
 # =========================
+# [detection] 检测引擎自适应策略
+# 控制 shellcode / webshell / PMFE 的启停模式。
+# =========================
+# [detection]
+# # Agent 启动时探测环境（端口/服务）并按策略自动启用引擎
+# auto_profile = true
+# # shellcode 检测: -1=自适应 0=关 1=开（默认 -1）
+# shellcode_mode = -1
+# # webshell 检测: -1=自适应 0=关 1=开（默认 -1）
+# webshell_mode = -1
+# # PMFE 内存取证: 0=关 1=仅空闲扫描 (默认 0)
+# pmfe_mode = 0
+
+# =========================
+# [pmfe] PMFE 空闲内存取证扫描
+# 在 CPU 空闲时针对有网络活动的系统服务进程做 VAD 深度扫描。
+# =========================
+# [pmfe]
+# # 启用空闲扫描
+# idle_scan_enabled = false
+# # 扫描间隔（分钟）
+# idle_scan_interval_min = 15
+# # 单轮最多扫描进程数
+# idle_scan_max_procs = 8
+# # CPU 低于此百分比才启动扫描
+# idle_cpu_threshold = 15.0
+# # 笔记本电池模式跳过
+# idle_skip_on_battery = true
+
+# =========================
 # [remote] 远程配置拉取
 # Agent 定时向平台轮询拉取最新的预处理规则（TOML）与 P0 加密规则包。
 # 若配置了本 section，将覆盖 EDR_REMOTE_CONFIG_URL / EDR_REMOTE_CONFIG_POLL_S / EDR_REMOTE_P0_BUNDLE_URL 环境变量。

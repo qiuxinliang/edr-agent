@@ -10,6 +10,7 @@
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #include "edr/pmfe.h"
+#include "edr/pmfe_idle_scanner.h"
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
 #include "edr/agent_update.h"
@@ -287,6 +288,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "edr_pmfe_init 失败: %d\n", (int)pe);
     }
   }
+  pmfe_idle_scanner_init(edr_agent_get_config(agent));
   edr_transport_init_from_config(edr_agent_get_config(agent));
   {
     EdrError se =

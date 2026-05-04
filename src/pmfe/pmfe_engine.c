@@ -31,6 +31,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #include <string.h>
 #include <time.h>
 
+#include "edr/pmfe_idle_scanner.h"
 #ifdef _WIN32
 static const EdrConfig *s_pmfe_cfg;
 #endif
@@ -1799,6 +1800,7 @@ static DWORD WINAPI pmfe_listen_poll_main(void *arg) {
       break;
     }
     edr_pmfe_listen_table_refresh();
+    pmfe_idle_scanner_tick();
   }
   return 0;
 }
