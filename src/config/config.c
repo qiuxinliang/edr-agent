@@ -1572,7 +1572,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
-  cfg->ave.scan_threads = 2;
+  cfg->ave.scan_threads = 1;
   cfg->ave.max_file_size_mb = 256;
   snprintf(cfg->ave.sensitivity, sizeof(cfg->ave.sensitivity), "%s", "MEDIUM");
   cfg->ave.enabled = false;
@@ -1743,7 +1743,7 @@ static void load_pmfe(toml_table_t *t, EdrConfig *cfg) {
   }
   {
     toml_datum_t d = toml_int_in(t, "idle_scan_interval_min");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 1440) { cfg->pmfe.idle_scan_interval_min = (uint32_t)d.u.i; }
+    if (d.ok && d.u.i >= 5 && d.u.i <= 1440) { cfg->pmfe.idle_scan_interval_min = (uint32_t)d.u.i; }
   }
   {
     toml_datum_t d = toml_int_in(t, "idle_scan_max_procs");
