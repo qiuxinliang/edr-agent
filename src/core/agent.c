@@ -626,6 +626,10 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     char download_url[512];
     int poll_interval_s;
     bool auto_update;
+    /* platform (HTTP ingest target) */
+    char platform_rest_base_url[512];
+    char platform_rest_user_id[128];
+    char platform_rest_bearer_token[512];
   } saved;
   /* save server */
   memcpy(saved.srv_address, agent->cfg.server.address, sizeof(saved.srv_address));
@@ -658,6 +662,10 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   memcpy(saved.download_url, agent->cfg.remote.download_url, sizeof(saved.download_url));
   saved.poll_interval_s = agent->cfg.remote.poll_interval_s;
   saved.auto_update = agent->cfg.remote.auto_update;
+  /* save platform */
+  memcpy(saved.platform_rest_base_url, agent->cfg.platform.rest_base_url, sizeof(saved.platform_rest_base_url));
+  memcpy(saved.platform_rest_user_id, agent->cfg.platform.rest_user_id, sizeof(saved.platform_rest_user_id));
+  memcpy(saved.platform_rest_bearer_token, agent->cfg.platform.rest_bearer_token, sizeof(saved.platform_rest_bearer_token));
 
   EdrError ce = edr_config_load(tmp, &agent->cfg);
 
@@ -692,6 +700,10 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   memcpy(agent->cfg.remote.download_url, saved.download_url, sizeof(agent->cfg.remote.download_url));
   agent->cfg.remote.poll_interval_s = saved.poll_interval_s;
   agent->cfg.remote.auto_update = saved.auto_update;
+  /* restore platform (HTTP ingest target) */
+  memcpy(agent->cfg.platform.rest_base_url, saved.platform_rest_base_url, sizeof(agent->cfg.platform.rest_base_url));
+  memcpy(agent->cfg.platform.rest_user_id, saved.platform_rest_user_id, sizeof(agent->cfg.platform.rest_user_id));
+  memcpy(agent->cfg.platform.rest_bearer_token, saved.platform_rest_bearer_token, sizeof(agent->cfg.platform.rest_bearer_token));
 
   char fp[80];
   edr_config_fingerprint(tmp, fp, sizeof(fp));
