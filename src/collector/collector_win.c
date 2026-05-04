@@ -102,11 +102,13 @@ static void edr_init_filter_config(void) {
     s_filter_config.powershell.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
     s_filter_config.tcpip.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
     s_filter_config.wmi_activity.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
+    s_filter_config.service_ctrl_mgr.mode = EDR_EVENT_FILTER_MODE_WHITELIST;
   } else if (strcmp(mode_str, "blacklist") == 0 || strcmp(mode_str, "BLACKLIST") == 0) {
     s_filter_config.dns_client.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
     s_filter_config.powershell.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
     s_filter_config.tcpip.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
     s_filter_config.wmi_activity.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
+    s_filter_config.service_ctrl_mgr.mode = EDR_EVENT_FILTER_MODE_BLACKLIST;
   }
   const char *dns_list = getenv("EDR_COLLECTOR_EVENTID_DNS_CLIENT_LIST");
   if (dns_list) {
@@ -421,6 +423,14 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
     (void)op;
     (void)ev_id;
     return 1;
+  }
+  if (memcmp(g, &EDR_ETW_GUID_SERVICE_CTRL_MGR, sizeof(GUID)) == 0) {
+    *out_tag = "svc";
+    if (ev_id == 7045u || ev_id == 4697u) {
+      *out_type = EDR_EVENT_SERVICE_CREATE;
+      return 1;
+    }
+    return 0;
   }
 
   return 0;
@@ -1097,6 +1107,7 @@ static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
       {&EDR_ETW_GUID_WMI_ACTIVITY, cfg && cfg->collection.etw_wmi_provider},
       {&EDR_ETW_GUID_MICROSOFT_TCPIP, cfg && cfg->collection.etw_tcpip_provider},
       {&EDR_ETW_GUID_WINFIREWALL_WFAS, cfg && cfg->collection.etw_firewall_provider},
+      {&EDR_ETW_GUID_SERVICE_CTRL_MGR, cfg && cfg->collection.etw_service_control_manager_provider},
   };
   for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); i++) {
     if (!optional[i].want) {

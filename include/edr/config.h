@@ -46,6 +46,8 @@ typedef struct EdrConfig {
     bool etw_powershell_provider;
     bool etw_security_audit_provider;
     bool etw_wmi_provider;
+    /** P0-1: Service Control Manager — 服务创建/删除 (7045/7036/4697) */
+    bool etw_service_control_manager_provider;
     bool ebpf_enabled;
     int poll_interval_s;
     uint32_t max_event_queue_size;

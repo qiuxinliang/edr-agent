@@ -457,6 +457,12 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "etw_service_control_manager_provider");
+    if (d.ok) {
+      cfg->collection.etw_service_control_manager_provider = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "ebpf_enabled");
     if (d.ok) {
       cfg->collection.ebpf_enabled = d.u.b ? true : false;
@@ -1552,6 +1558,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.etw_powershell_provider = true;
   cfg->collection.etw_security_audit_provider = true;
   cfg->collection.etw_wmi_provider = true;
+  cfg->collection.etw_service_control_manager_provider = true;
   cfg->collection.ebpf_enabled = true;
   cfg->collection.poll_interval_s = 1;
   cfg->collection.max_event_queue_size = 4096u;

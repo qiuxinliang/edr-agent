@@ -37,6 +37,7 @@ typedef struct {
     EdrEventIdFilter powershell;
     EdrEventIdFilter tcpip;
     EdrEventIdFilter wmi_activity;
+    EdrEventIdFilter service_ctrl_mgr;
     int filtering_enabled;
 } EdrCollectorEventFilterConfig;
 
