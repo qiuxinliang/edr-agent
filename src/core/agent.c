@@ -456,7 +456,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
       uint64_t net_hb_period_ns = (uint64_t)net_hb_sec * 1000000000ULL;
       uint64_t last_net_hb_ns = edr_monotonic_ns();
       while (!agent->shutdown) {
-        edr_ms_sleep(200u);
+        edr_ms_sleep(500u);
         if (hb_period_ns > 0) {
           uint64_t now = edr_monotonic_ns();
           if (now - last_hb_ns >= hb_period_ns) {

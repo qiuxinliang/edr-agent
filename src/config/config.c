@@ -1247,7 +1247,7 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   /* A4.2：ETW 实时会话缓冲/刷写；0 表示使用默认。有效区间与 Win32 常见实践对齐。 */
   if (cfg->collection.etw_buffer_kb == 0u) {
-    cfg->collection.etw_buffer_kb = 64u;
+    cfg->collection.etw_buffer_kb = 128u;
   }
   if (cfg->collection.etw_buffer_kb < 4u) {
     cfg->collection.etw_buffer_kb = 4u;
