@@ -451,6 +451,9 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"ParentProcessName", "pimg"},
       {L"ProcessId", "epid"},
       {L"ParentProcessId", "ppid"},
+      {L"TokenElevationType", "token_elev"},
+      {L"MandatoryLabel", "integ"},
+      {L"SubjectLogonId", "sess_id"},
   };
   static const EdrPropTry wmi_try[] = {
       {L"Query", "query"},

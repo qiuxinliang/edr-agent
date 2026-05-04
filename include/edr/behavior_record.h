@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 #define EDR_BR_STR_SHORT 256u
-#define EDR_BR_STR_LONG 1024u
+#define EDR_BR_STR_LONG 4096u
 #define EDR_BR_STR_MID 512u
 #define EDR_BR_ID_LEN 48u
 #define EDR_BR_MAX_MITRE 8u
