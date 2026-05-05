@@ -228,33 +228,28 @@ static int curl_ensure_init(void) {
 
 static CURL *curl_conn_acquire(void) {
 #ifdef EDR_HAVE_LIBCURL
-  static CURL *s_persist = NULL;
   if (curl_ensure_init() != 0) return NULL;
-  if (!s_persist) {
-    s_persist = curl_easy_init();
-    if (s_persist) {
-      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPALIVE, 1L);
-      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPIDLE, 30L);
-      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPINTVL, 10L);
-      curl_easy_setopt(s_persist, CURLOPT_MAXAGE_CONN, 300L);
-      curl_easy_setopt(s_persist, CURLOPT_USERAGENT, "edr-agent/ingest");
-    }
+  CURL *curl = curl_easy_init();
+  if (curl) {
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 10L);
+    curl_easy_setopt(curl, CURLOPT_MAXAGE_CONN, 300L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
   }
-  if (s_persist) {
-    curl_easy_reset(s_persist);
-    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPIDLE, 30L);
-    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPINTVL, 10L);
-    curl_easy_setopt(s_persist, CURLOPT_MAXAGE_CONN, 300L);
-    curl_easy_setopt(s_persist, CURLOPT_USERAGENT, "edr-agent/ingest");
-    return s_persist;
-  }
+  return curl;
 #endif
   return NULL;
 }
 
 static void curl_conn_release(CURL *curl) {
+#ifdef EDR_HAVE_LIBCURL
+  if (curl) {
+    curl_easy_cleanup(curl);
+  }
+#else
   (void)curl;
+#endif
 }
 #endif
 
