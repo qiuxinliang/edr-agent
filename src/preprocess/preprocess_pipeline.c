@@ -543,7 +543,7 @@ static void *preprocess_main(void *arg) {
       edr_storage_queue_poll_drain();
       break;
     }
-    Sleep(1);
+    Sleep(10);
 #else
     if (s_stop_preprocess) {
       for (;;) {
@@ -558,7 +558,7 @@ static void *preprocess_main(void *arg) {
       edr_storage_queue_poll_drain();
       break;
     }
-    usleep(1000);
+    usleep(10000);
 #endif
   }
 #ifdef _WIN32

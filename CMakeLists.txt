@@ -272,6 +272,7 @@ set(EDR_AGENT_SOURCES
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
+  src/pmfe/pmfe_idle_scanner.c
   src/attack_surface/attack_surface_report.c
   src/attack_surface/attack_surface_egress.c
   src/attack_surface/security_policy_collect.c

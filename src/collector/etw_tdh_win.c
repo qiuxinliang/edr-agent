@@ -451,6 +451,9 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"ParentProcessName", "pimg"},
       {L"ProcessId", "epid"},
       {L"ParentProcessId", "ppid"},
+      {L"TokenElevationType", "token_elev"},
+      {L"MandatoryLabel", "integ"},
+      {L"SubjectLogonId", "sess_id"},
   };
   static const EdrPropTry wmi_try[] = {
       {L"Query", "query"},
@@ -470,6 +473,11 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"FilterOrigin", "fw_origin"},
       {L"RemoteAddresses", "fw_remote"},
       {L"LocalPorts", "fw_lports"},
+  };
+  static const EdrPropTry svc_try[] = {
+      {L"ServiceName", "img"},
+      {L"ImagePath", "cmd"},
+      {L"ServiceFileName", "img"},
   };
 
   const GUID *g = &rec->EventHeader.ProviderId;
@@ -548,6 +556,9 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     edr_try_append_naux_for_net(rec, (char *)out, out_cap, &off, line, sizeof(line));
   } else if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, wf_try, sizeof(wf_try) / sizeof(wf_try[0]), line, sizeof(line),
+                       (char *)out, out_cap, &off);
+  } else if (memcmp(g, &EDR_ETW_GUID_SERVICE_CTRL_MGR, sizeof(GUID)) == 0) {
+    edr_try_append_all(rec, svc_try, sizeof(svc_try) / sizeof(svc_try[0]), line, sizeof(line),
                        (char *)out, out_cap, &off);
   }
 

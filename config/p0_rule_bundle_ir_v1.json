@@ -4,7 +4,7 @@
   "rules_bundle_version": "edr-dynamic-rules-v1-r239-97acafca",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 149,
+  "rule_count": 150,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -3133,6 +3133,40 @@
           "(?i)aws\\s+s3\\s+(cp|sync|mv).*\\-\\-recursive",
           "(?i)megatools\\s+(dl|put)",
           "(?i)onedrive\\-uploader"
+        ]
+      }
+    },
+    {
+      "id": "R-C2-001",
+      "title": "443 port C2 communication from non-browser process",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1071.001",
+        "T1043"
+      ],
+      "description": "Non-browser process connecting to 443/8443 - potential HTTPS C2 beacon. Process whitelist excludes known browsers.",
+      "condition": {
+        "remote_port_in": [
+          443,
+          8443
+        ],
+        "process_name_not_in": [
+          "chrome.exe",
+          "firefox.exe",
+          "msedge.exe",
+          "iexplore.exe",
+          "brave.exe",
+          "opera.exe",
+          "safari.exe",
+          "browser_broker.exe",
+          "webviewhost.exe",
+          "msedgewebview2.exe",
+          "svchost.exe",
+          "searchapp.exe",
+          "searchhost.exe",
+          "startmenuexperiencehost.exe"
         ]
       }
     }
