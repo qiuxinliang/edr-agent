@@ -8,6 +8,7 @@
 #include "edr/preprocess.h"
 #include "edr/process_tree_cache.h"
 #include "edr/resource.h"
+#include "edr/response.h"
 #include "edr/self_protect.h"
 #include "edr/shell_session.h"
 #include "edr/time_util.h"

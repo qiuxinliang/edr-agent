@@ -1,5 +1,7 @@
 #include "edr/config.h"
 
+#include <stdio.h>
+
 #ifdef _WIN32
 #include <wchar.h>
 #include <windows.h>
