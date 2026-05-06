@@ -14,7 +14,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 
-#include "edr/command.h"
+#include "edr/response.h"
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
@@ -593,7 +593,7 @@ static int push_alert(double score, const char *detector_label, const char *rule
     fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
   }
   if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
-    edr_isolate_auto_from_shellcode_alarm();
+    edr_response_isolate_auto_from_shellcode();
   }
   return 0;
 }

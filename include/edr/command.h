@@ -17,15 +17,9 @@ struct EdrConfig;
 
 /**
  * 绑定当前进程配置（main 在 edr_agent_init 成功后调用），供 AVE 等指令使用 `EdrConfig`。
+ * 实际由 command_util 模块实现。
  */
 void edr_command_bind_config(const struct EdrConfig *cfg);
-
-/**
- * WinDivert shellcode 告警分数 ≥ `auto_isolate_threshold` 时，在显式启用（`EDR_SHELLCODE_AUTO_ISOLATE=1`
- * 或 TOML `auto_isolate_execute`）且高危策略允许时，执行与 `isolate` 相同的标记 + `EDR_ISOLATE_HOOK`。
- * 同一进程至多成功一次。仅 Windows 端实现。
- */
-void edr_isolate_auto_from_shellcode_alarm(void);
 
 /** 与 ingest.proto CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由 gRPC 层写入） */
 typedef struct EdrSoarCommandMeta {

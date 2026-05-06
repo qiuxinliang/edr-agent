@@ -246,6 +246,7 @@ void pmfe_idle_scanner_tick(void) {
   uint32_t submitted = 0;
   uint32_t max_procs = s_cfg->pmfe.idle_scan_max_procs;
 
+#ifdef _WIN32
   if (init_nt_query()) {
     /* 使用 NtQuerySystemInformation 单次内核调用枚举进程 (比 Toolhelp 快 ~40%) */
     ULONG buf_size = 512 * 1024;
@@ -289,6 +290,12 @@ void pmfe_idle_scanner_tick(void) {
       free(buf);
     }
   }
+#else
+  (void)tcp_pids;
+  (void)tcp_count;
+  (void)max_procs;
+  (void)submitted;
+#endif
 
   if (submitted > 0) {
     fprintf(stderr, "[pmfe] idle scan round: tcp_procs=%d submitted=%u\n", tcp_count, submitted);
