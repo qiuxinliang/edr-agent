@@ -152,6 +152,75 @@ edr_monitor/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/build
 .PHONY : edr_monitor/fast
 
+#=============================================================================
+# Target rules for targets named edr_p0_golden_test
+
+# Build rule for target.
+edr_p0_golden_test: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 edr_p0_golden_test
+.PHONY : edr_p0_golden_test
+
+# fast build rule for target.
+edr_p0_golden_test/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/build
+.PHONY : edr_p0_golden_test/fast
+
+#=============================================================================
+# Target rules for targets named test_event_bus_mpmc_stress
+
+# Build rule for target.
+test_event_bus_mpmc_stress: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_event_bus_mpmc_stress
+.PHONY : test_event_bus_mpmc_stress
+
+# fast build rule for target.
+test_event_bus_mpmc_stress/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/build
+.PHONY : test_event_bus_mpmc_stress/fast
+
+#=============================================================================
+# Target rules for targets named edr_p0_ir_record_golden_test
+
+# Build rule for target.
+edr_p0_ir_record_golden_test: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 edr_p0_ir_record_golden_test
+.PHONY : edr_p0_ir_record_golden_test
+
+# fast build rule for target.
+edr_p0_ir_record_golden_test/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/build
+.PHONY : edr_p0_ir_record_golden_test/fast
+
+edr_p0_rule_ir_embed.o: edr_p0_rule_ir_embed.c.o
+.PHONY : edr_p0_rule_ir_embed.o
+
+# target to build an object file
+edr_p0_rule_ir_embed.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/edr_p0_rule_ir_embed.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/edr_p0_rule_ir_embed.c.o
+.PHONY : edr_p0_rule_ir_embed.c.o
+
+edr_p0_rule_ir_embed.i: edr_p0_rule_ir_embed.c.i
+.PHONY : edr_p0_rule_ir_embed.i
+
+# target to preprocess a source file
+edr_p0_rule_ir_embed.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/edr_p0_rule_ir_embed.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/edr_p0_rule_ir_embed.c.i
+.PHONY : edr_p0_rule_ir_embed.c.i
+
+edr_p0_rule_ir_embed.s: edr_p0_rule_ir_embed.c.s
+.PHONY : edr_p0_rule_ir_embed.s
+
+# target to generate assembly for a file
+edr_p0_rule_ir_embed.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/edr_p0_rule_ir_embed.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/edr_p0_rule_ir_embed.c.s
+.PHONY : edr_p0_rule_ir_embed.c.s
+
 src/attack_surface/attack_surface_egress.o: src/attack_surface/attack_surface_egress.c.o
 .PHONY : src/attack_surface/attack_surface_egress.o
 
@@ -656,6 +725,54 @@ src/command/command_stub.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/command_stub.c.s
 .PHONY : src/command/command_stub.c.s
 
+src/command/command_util.o: src/command/command_util.c.o
+.PHONY : src/command/command_util.o
+
+# target to build an object file
+src/command/command_util.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/command_util.c.o
+.PHONY : src/command/command_util.c.o
+
+src/command/command_util.i: src/command/command_util.c.i
+.PHONY : src/command/command_util.i
+
+# target to preprocess a source file
+src/command/command_util.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/command_util.c.i
+.PHONY : src/command/command_util.c.i
+
+src/command/command_util.s: src/command/command_util.c.s
+.PHONY : src/command/command_util.s
+
+# target to generate assembly for a file
+src/command/command_util.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/command_util.c.s
+.PHONY : src/command/command_util.c.s
+
+src/command/pe_verify.o: src/command/pe_verify.c.o
+.PHONY : src/command/pe_verify.o
+
+# target to build an object file
+src/command/pe_verify.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/pe_verify.c.o
+.PHONY : src/command/pe_verify.c.o
+
+src/command/pe_verify.i: src/command/pe_verify.c.i
+.PHONY : src/command/pe_verify.i
+
+# target to preprocess a source file
+src/command/pe_verify.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/pe_verify.c.i
+.PHONY : src/command/pe_verify.c.i
+
+src/command/pe_verify.s: src/command/pe_verify.c.s
+.PHONY : src/command/pe_verify.s
+
+# target to generate assembly for a file
+src/command/pe_verify.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/pe_verify.c.s
+.PHONY : src/command/pe_verify.c.s
+
 src/command/sha256.o: src/command/sha256.c.o
 .PHONY : src/command/sha256.o
 
@@ -679,6 +796,30 @@ src/command/sha256.s: src/command/sha256.c.s
 src/command/sha256.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/sha256.c.s
 .PHONY : src/command/sha256.c.s
+
+src/command/shell_exec.o: src/command/shell_exec.c.o
+.PHONY : src/command/shell_exec.o
+
+# target to build an object file
+src/command/shell_exec.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/shell_exec.c.o
+.PHONY : src/command/shell_exec.c.o
+
+src/command/shell_exec.i: src/command/shell_exec.c.i
+.PHONY : src/command/shell_exec.i
+
+# target to preprocess a source file
+src/command/shell_exec.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/shell_exec.c.i
+.PHONY : src/command/shell_exec.c.i
+
+src/command/shell_exec.s: src/command/shell_exec.c.s
+.PHONY : src/command/shell_exec.s
+
+# target to generate assembly for a file
+src/command/shell_exec.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/shell_exec.c.s
+.PHONY : src/command/shell_exec.c.s
 
 src/config/config.o: src/config/config.c.o
 .PHONY : src/config/config.o
@@ -728,6 +869,30 @@ src/core/agent.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/agent.c.s
 .PHONY : src/core/agent.c.s
 
+src/core/agent_update.o: src/core/agent_update.c.o
+.PHONY : src/core/agent_update.o
+
+# target to build an object file
+src/core/agent_update.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/agent_update.c.o
+.PHONY : src/core/agent_update.c.o
+
+src/core/agent_update.i: src/core/agent_update.c.i
+.PHONY : src/core/agent_update.i
+
+# target to preprocess a source file
+src/core/agent_update.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/agent_update.c.i
+.PHONY : src/core/agent_update.c.i
+
+src/core/agent_update.s: src/core/agent_update.c.s
+.PHONY : src/core/agent_update.s
+
+# target to generate assembly for a file
+src/core/agent_update.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/agent_update.c.s
+.PHONY : src/core/agent_update.c.s
+
 src/core/edr_log.o: src/core/edr_log.c.o
 .PHONY : src/core/edr_log.o
 
@@ -758,6 +923,7 @@ src/core/event_bus.o: src/core/event_bus.c.o
 # target to build an object file
 src/core/event_bus.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/event_bus.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.o
 .PHONY : src/core/event_bus.c.o
 
 src/core/event_bus.i: src/core/event_bus.c.i
@@ -766,6 +932,7 @@ src/core/event_bus.i: src/core/event_bus.c.i
 # target to preprocess a source file
 src/core/event_bus.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/event_bus.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.i
 .PHONY : src/core/event_bus.c.i
 
 src/core/event_bus.s: src/core/event_bus.c.s
@@ -774,6 +941,7 @@ src/core/event_bus.s: src/core/event_bus.c.s
 # target to generate assembly for a file
 src/core/event_bus.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/event_bus.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.s
 .PHONY : src/core/event_bus.c.s
 
 src/core/time_util.o: src/core/time_util.c.o
@@ -920,6 +1088,30 @@ src/pmfe/pmfe_host_policy_stub.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/pmfe/pmfe_host_policy_stub.c.s
 .PHONY : src/pmfe/pmfe_host_policy_stub.c.s
 
+src/pmfe/pmfe_idle_scanner.o: src/pmfe/pmfe_idle_scanner.c.o
+.PHONY : src/pmfe/pmfe_idle_scanner.o
+
+# target to build an object file
+src/pmfe/pmfe_idle_scanner.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/pmfe/pmfe_idle_scanner.c.o
+.PHONY : src/pmfe/pmfe_idle_scanner.c.o
+
+src/pmfe/pmfe_idle_scanner.i: src/pmfe/pmfe_idle_scanner.c.i
+.PHONY : src/pmfe/pmfe_idle_scanner.i
+
+# target to preprocess a source file
+src/pmfe/pmfe_idle_scanner.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/pmfe/pmfe_idle_scanner.c.i
+.PHONY : src/pmfe/pmfe_idle_scanner.c.i
+
+src/pmfe/pmfe_idle_scanner.s: src/pmfe/pmfe_idle_scanner.c.s
+.PHONY : src/pmfe/pmfe_idle_scanner.s
+
+# target to generate assembly for a file
+src/pmfe/pmfe_idle_scanner.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/pmfe/pmfe_idle_scanner.c.s
+.PHONY : src/pmfe/pmfe_idle_scanner.c.s
+
 src/preprocess/behavior_from_slot.o: src/preprocess/behavior_from_slot.c.o
 .PHONY : src/preprocess/behavior_from_slot.o
 
@@ -950,6 +1142,7 @@ src/preprocess/behavior_record.o: src/preprocess/behavior_record.c.o
 # target to build an object file
 src/preprocess/behavior_record.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/behavior_record.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/behavior_record.c.o
 .PHONY : src/preprocess/behavior_record.c.o
 
 src/preprocess/behavior_record.i: src/preprocess/behavior_record.c.i
@@ -958,6 +1151,7 @@ src/preprocess/behavior_record.i: src/preprocess/behavior_record.c.i
 # target to preprocess a source file
 src/preprocess/behavior_record.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/behavior_record.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/behavior_record.c.i
 .PHONY : src/preprocess/behavior_record.c.i
 
 src/preprocess/behavior_record.s: src/preprocess/behavior_record.c.s
@@ -966,6 +1160,7 @@ src/preprocess/behavior_record.s: src/preprocess/behavior_record.c.s
 # target to generate assembly for a file
 src/preprocess/behavior_record.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/behavior_record.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/behavior_record.c.s
 .PHONY : src/preprocess/behavior_record.c.s
 
 src/preprocess/dedup.o: src/preprocess/dedup.c.o
@@ -1015,6 +1210,219 @@ src/preprocess/emit_rules.s: src/preprocess/emit_rules.c.s
 src/preprocess/emit_rules.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.s
 .PHONY : src/preprocess/emit_rules.c.s
+
+src/preprocess/encrypt_p0_rules.o: src/preprocess/encrypt_p0_rules.c.o
+.PHONY : src/preprocess/encrypt_p0_rules.o
+
+# target to build an object file
+src/preprocess/encrypt_p0_rules.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/encrypt_p0_rules.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/encrypt_p0_rules.c.o
+.PHONY : src/preprocess/encrypt_p0_rules.c.o
+
+src/preprocess/encrypt_p0_rules.i: src/preprocess/encrypt_p0_rules.c.i
+.PHONY : src/preprocess/encrypt_p0_rules.i
+
+# target to preprocess a source file
+src/preprocess/encrypt_p0_rules.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/encrypt_p0_rules.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/encrypt_p0_rules.c.i
+.PHONY : src/preprocess/encrypt_p0_rules.c.i
+
+src/preprocess/encrypt_p0_rules.s: src/preprocess/encrypt_p0_rules.c.s
+.PHONY : src/preprocess/encrypt_p0_rules.s
+
+# target to generate assembly for a file
+src/preprocess/encrypt_p0_rules.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/encrypt_p0_rules.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/encrypt_p0_rules.c.s
+.PHONY : src/preprocess/encrypt_p0_rules.c.s
+
+src/preprocess/enrich_parent_info.o: src/preprocess/enrich_parent_info.c.o
+.PHONY : src/preprocess/enrich_parent_info.o
+
+# target to build an object file
+src/preprocess/enrich_parent_info.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.o
+.PHONY : src/preprocess/enrich_parent_info.c.o
+
+src/preprocess/enrich_parent_info.i: src/preprocess/enrich_parent_info.c.i
+.PHONY : src/preprocess/enrich_parent_info.i
+
+# target to preprocess a source file
+src/preprocess/enrich_parent_info.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.i
+.PHONY : src/preprocess/enrich_parent_info.c.i
+
+src/preprocess/enrich_parent_info.s: src/preprocess/enrich_parent_info.c.s
+.PHONY : src/preprocess/enrich_parent_info.s
+
+# target to generate assembly for a file
+src/preprocess/enrich_parent_info.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/enrich_parent_info.c.s
+.PHONY : src/preprocess/enrich_parent_info.c.s
+
+src/preprocess/p0_rule_direct_emit.o: src/preprocess/p0_rule_direct_emit.c.o
+.PHONY : src/preprocess/p0_rule_direct_emit.o
+
+# target to build an object file
+src/preprocess/p0_rule_direct_emit.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.o
+.PHONY : src/preprocess/p0_rule_direct_emit.c.o
+
+src/preprocess/p0_rule_direct_emit.i: src/preprocess/p0_rule_direct_emit.c.i
+.PHONY : src/preprocess/p0_rule_direct_emit.i
+
+# target to preprocess a source file
+src/preprocess/p0_rule_direct_emit.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.i
+.PHONY : src/preprocess/p0_rule_direct_emit.c.i
+
+src/preprocess/p0_rule_direct_emit.s: src/preprocess/p0_rule_direct_emit.c.s
+.PHONY : src/preprocess/p0_rule_direct_emit.s
+
+# target to generate assembly for a file
+src/preprocess/p0_rule_direct_emit.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_direct_emit.c.s
+.PHONY : src/preprocess/p0_rule_direct_emit.c.s
+
+src/preprocess/p0_rule_golden_test.o: src/preprocess/p0_rule_golden_test.c.o
+.PHONY : src/preprocess/p0_rule_golden_test.o
+
+# target to build an object file
+src/preprocess/p0_rule_golden_test.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_golden_test.c.o
+.PHONY : src/preprocess/p0_rule_golden_test.c.o
+
+src/preprocess/p0_rule_golden_test.i: src/preprocess/p0_rule_golden_test.c.i
+.PHONY : src/preprocess/p0_rule_golden_test.i
+
+# target to preprocess a source file
+src/preprocess/p0_rule_golden_test.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_golden_test.c.i
+.PHONY : src/preprocess/p0_rule_golden_test.c.i
+
+src/preprocess/p0_rule_golden_test.s: src/preprocess/p0_rule_golden_test.c.s
+.PHONY : src/preprocess/p0_rule_golden_test.s
+
+# target to generate assembly for a file
+src/preprocess/p0_rule_golden_test.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_golden_test.c.s
+.PHONY : src/preprocess/p0_rule_golden_test.c.s
+
+src/preprocess/p0_rule_ir.o: src/preprocess/p0_rule_ir.c.o
+.PHONY : src/preprocess/p0_rule_ir.o
+
+# target to build an object file
+src/preprocess/p0_rule_ir.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_ir.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.o
+.PHONY : src/preprocess/p0_rule_ir.c.o
+
+src/preprocess/p0_rule_ir.i: src/preprocess/p0_rule_ir.c.i
+.PHONY : src/preprocess/p0_rule_ir.i
+
+# target to preprocess a source file
+src/preprocess/p0_rule_ir.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_ir.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.i
+.PHONY : src/preprocess/p0_rule_ir.c.i
+
+src/preprocess/p0_rule_ir.s: src/preprocess/p0_rule_ir.c.s
+.PHONY : src/preprocess/p0_rule_ir.s
+
+# target to generate assembly for a file
+src/preprocess/p0_rule_ir.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_ir.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.s
+.PHONY : src/preprocess/p0_rule_ir.c.s
+
+src/preprocess/p0_rule_ir_record_golden_test.o: src/preprocess/p0_rule_ir_record_golden_test.c.o
+.PHONY : src/preprocess/p0_rule_ir_record_golden_test.o
+
+# target to build an object file
+src/preprocess/p0_rule_ir_record_golden_test.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir_record_golden_test.c.o
+.PHONY : src/preprocess/p0_rule_ir_record_golden_test.c.o
+
+src/preprocess/p0_rule_ir_record_golden_test.i: src/preprocess/p0_rule_ir_record_golden_test.c.i
+.PHONY : src/preprocess/p0_rule_ir_record_golden_test.i
+
+# target to preprocess a source file
+src/preprocess/p0_rule_ir_record_golden_test.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir_record_golden_test.c.i
+.PHONY : src/preprocess/p0_rule_ir_record_golden_test.c.i
+
+src/preprocess/p0_rule_ir_record_golden_test.s: src/preprocess/p0_rule_ir_record_golden_test.c.s
+.PHONY : src/preprocess/p0_rule_ir_record_golden_test.s
+
+# target to generate assembly for a file
+src/preprocess/p0_rule_ir_record_golden_test.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir_record_golden_test.c.s
+.PHONY : src/preprocess/p0_rule_ir_record_golden_test.c.s
+
+src/preprocess/p0_rule_match.o: src/preprocess/p0_rule_match.c.o
+.PHONY : src/preprocess/p0_rule_match.o
+
+# target to build an object file
+src/preprocess/p0_rule_match.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.o
+.PHONY : src/preprocess/p0_rule_match.c.o
+
+src/preprocess/p0_rule_match.i: src/preprocess/p0_rule_match.c.i
+.PHONY : src/preprocess/p0_rule_match.i
+
+# target to preprocess a source file
+src/preprocess/p0_rule_match.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.i
+.PHONY : src/preprocess/p0_rule_match.c.i
+
+src/preprocess/p0_rule_match.s: src/preprocess/p0_rule_match.c.s
+.PHONY : src/preprocess/p0_rule_match.s
+
+# target to generate assembly for a file
+src/preprocess/p0_rule_match.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.s
+.PHONY : src/preprocess/p0_rule_match.c.s
+
+src/preprocess/preprocess_env.o: src/preprocess/preprocess_env.c.o
+.PHONY : src/preprocess/preprocess_env.o
+
+# target to build an object file
+src/preprocess/preprocess_env.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/preprocess_env.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.o
+.PHONY : src/preprocess/preprocess_env.c.o
+
+src/preprocess/preprocess_env.i: src/preprocess/preprocess_env.c.i
+.PHONY : src/preprocess/preprocess_env.i
+
+# target to preprocess a source file
+src/preprocess/preprocess_env.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/preprocess_env.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.i
+.PHONY : src/preprocess/preprocess_env.c.i
+
+src/preprocess/preprocess_env.s: src/preprocess/preprocess_env.c.s
+.PHONY : src/preprocess/preprocess_env.s
+
+# target to generate assembly for a file
+src/preprocess/preprocess_env.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/preprocess_env.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.s
+.PHONY : src/preprocess/preprocess_env.c.s
 
 src/preprocess/preprocess_pipeline.o: src/preprocess/preprocess_pipeline.c.o
 .PHONY : src/preprocess/preprocess_pipeline.o
@@ -1111,6 +1519,30 @@ src/resource/resource.s: src/resource/resource.c.s
 src/resource/resource.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/resource/resource.c.s
 .PHONY : src/resource/resource.c.s
+
+src/response/response_actions.o: src/response/response_actions.c.o
+.PHONY : src/response/response_actions.o
+
+# target to build an object file
+src/response/response_actions.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_actions.c.o
+.PHONY : src/response/response_actions.c.o
+
+src/response/response_actions.i: src/response/response_actions.c.i
+.PHONY : src/response/response_actions.i
+
+# target to preprocess a source file
+src/response/response_actions.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_actions.c.i
+.PHONY : src/response/response_actions.c.i
+
+src/response/response_actions.s: src/response/response_actions.c.s
+.PHONY : src/response/response_actions.s
+
+# target to generate assembly for a file
+src/response/response_actions.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_actions.c.s
+.PHONY : src/response/response_actions.c.s
 
 src/self_protect/self_protect.o: src/self_protect/self_protect.c.o
 .PHONY : src/self_protect/self_protect.o
@@ -1520,6 +1952,60 @@ src/webshell_detector/webshell_forensic.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.s
 .PHONY : src/webshell_detector/webshell_forensic.c.s
 
+tests/test_event_bus_mpmc_stress.o: tests/test_event_bus_mpmc_stress.c.o
+.PHONY : tests/test_event_bus_mpmc_stress.o
+
+# target to build an object file
+tests/test_event_bus_mpmc_stress.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.o
+.PHONY : tests/test_event_bus_mpmc_stress.c.o
+
+tests/test_event_bus_mpmc_stress.i: tests/test_event_bus_mpmc_stress.c.i
+.PHONY : tests/test_event_bus_mpmc_stress.i
+
+# target to preprocess a source file
+tests/test_event_bus_mpmc_stress.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.i
+.PHONY : tests/test_event_bus_mpmc_stress.c.i
+
+tests/test_event_bus_mpmc_stress.s: tests/test_event_bus_mpmc_stress.c.s
+.PHONY : tests/test_event_bus_mpmc_stress.s
+
+# target to generate assembly for a file
+tests/test_event_bus_mpmc_stress.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.s
+.PHONY : tests/test_event_bus_mpmc_stress.c.s
+
+third_party/cjson/cJSON.o: third_party/cjson/cJSON.c.o
+.PHONY : third_party/cjson/cJSON.o
+
+# target to build an object file
+third_party/cjson/cJSON.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/cjson/cJSON.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/third_party/cjson/cJSON.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.o
+.PHONY : third_party/cjson/cJSON.c.o
+
+third_party/cjson/cJSON.i: third_party/cjson/cJSON.c.i
+.PHONY : third_party/cjson/cJSON.i
+
+# target to preprocess a source file
+third_party/cjson/cJSON.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/cjson/cJSON.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/third_party/cjson/cJSON.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.i
+.PHONY : third_party/cjson/cJSON.c.i
+
+third_party/cjson/cJSON.s: third_party/cjson/cJSON.c.s
+.PHONY : third_party/cjson/cJSON.s
+
+# target to generate assembly for a file
+third_party/cjson/cJSON.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/cjson/cJSON.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/third_party/cjson/cJSON.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.s
+.PHONY : third_party/cjson/cJSON.c.s
+
 third_party/lz4/lz4.o: third_party/lz4/lz4.c.o
 .PHONY : third_party/lz4/lz4.o
 
@@ -1678,6 +2164,12 @@ help:
 	@echo "... test"
 	@echo "... edr_agent"
 	@echo "... edr_monitor"
+	@echo "... edr_p0_golden_test"
+	@echo "... edr_p0_ir_record_golden_test"
+	@echo "... test_event_bus_mpmc_stress"
+	@echo "... edr_p0_rule_ir_embed.o"
+	@echo "... edr_p0_rule_ir_embed.i"
+	@echo "... edr_p0_rule_ir_embed.s"
 	@echo "... src/attack_surface/attack_surface_egress.o"
 	@echo "... src/attack_surface/attack_surface_egress.i"
 	@echo "... src/attack_surface/attack_surface_egress.s"
@@ -1741,15 +2233,27 @@ help:
 	@echo "... src/command/command_stub.o"
 	@echo "... src/command/command_stub.i"
 	@echo "... src/command/command_stub.s"
+	@echo "... src/command/command_util.o"
+	@echo "... src/command/command_util.i"
+	@echo "... src/command/command_util.s"
+	@echo "... src/command/pe_verify.o"
+	@echo "... src/command/pe_verify.i"
+	@echo "... src/command/pe_verify.s"
 	@echo "... src/command/sha256.o"
 	@echo "... src/command/sha256.i"
 	@echo "... src/command/sha256.s"
+	@echo "... src/command/shell_exec.o"
+	@echo "... src/command/shell_exec.i"
+	@echo "... src/command/shell_exec.s"
 	@echo "... src/config/config.o"
 	@echo "... src/config/config.i"
 	@echo "... src/config/config.s"
 	@echo "... src/core/agent.o"
 	@echo "... src/core/agent.i"
 	@echo "... src/core/agent.s"
+	@echo "... src/core/agent_update.o"
+	@echo "... src/core/agent_update.i"
+	@echo "... src/core/agent_update.s"
 	@echo "... src/core/edr_log.o"
 	@echo "... src/core/edr_log.i"
 	@echo "... src/core/edr_log.s"
@@ -1774,6 +2278,9 @@ help:
 	@echo "... src/pmfe/pmfe_host_policy_stub.o"
 	@echo "... src/pmfe/pmfe_host_policy_stub.i"
 	@echo "... src/pmfe/pmfe_host_policy_stub.s"
+	@echo "... src/pmfe/pmfe_idle_scanner.o"
+	@echo "... src/pmfe/pmfe_idle_scanner.i"
+	@echo "... src/pmfe/pmfe_idle_scanner.s"
 	@echo "... src/preprocess/behavior_from_slot.o"
 	@echo "... src/preprocess/behavior_from_slot.i"
 	@echo "... src/preprocess/behavior_from_slot.s"
@@ -1786,6 +2293,30 @@ help:
 	@echo "... src/preprocess/emit_rules.o"
 	@echo "... src/preprocess/emit_rules.i"
 	@echo "... src/preprocess/emit_rules.s"
+	@echo "... src/preprocess/encrypt_p0_rules.o"
+	@echo "... src/preprocess/encrypt_p0_rules.i"
+	@echo "... src/preprocess/encrypt_p0_rules.s"
+	@echo "... src/preprocess/enrich_parent_info.o"
+	@echo "... src/preprocess/enrich_parent_info.i"
+	@echo "... src/preprocess/enrich_parent_info.s"
+	@echo "... src/preprocess/p0_rule_direct_emit.o"
+	@echo "... src/preprocess/p0_rule_direct_emit.i"
+	@echo "... src/preprocess/p0_rule_direct_emit.s"
+	@echo "... src/preprocess/p0_rule_golden_test.o"
+	@echo "... src/preprocess/p0_rule_golden_test.i"
+	@echo "... src/preprocess/p0_rule_golden_test.s"
+	@echo "... src/preprocess/p0_rule_ir.o"
+	@echo "... src/preprocess/p0_rule_ir.i"
+	@echo "... src/preprocess/p0_rule_ir.s"
+	@echo "... src/preprocess/p0_rule_ir_record_golden_test.o"
+	@echo "... src/preprocess/p0_rule_ir_record_golden_test.i"
+	@echo "... src/preprocess/p0_rule_ir_record_golden_test.s"
+	@echo "... src/preprocess/p0_rule_match.o"
+	@echo "... src/preprocess/p0_rule_match.i"
+	@echo "... src/preprocess/p0_rule_match.s"
+	@echo "... src/preprocess/preprocess_env.o"
+	@echo "... src/preprocess/preprocess_env.i"
+	@echo "... src/preprocess/preprocess_env.s"
 	@echo "... src/preprocess/preprocess_pipeline.o"
 	@echo "... src/preprocess/preprocess_pipeline.i"
 	@echo "... src/preprocess/preprocess_pipeline.s"
@@ -1798,6 +2329,9 @@ help:
 	@echo "... src/resource/resource.o"
 	@echo "... src/resource/resource.i"
 	@echo "... src/resource/resource.s"
+	@echo "... src/response/response_actions.o"
+	@echo "... src/response/response_actions.i"
+	@echo "... src/response/response_actions.s"
 	@echo "... src/self_protect/self_protect.o"
 	@echo "... src/self_protect/self_protect.i"
 	@echo "... src/self_protect/self_protect.s"
@@ -1849,6 +2383,12 @@ help:
 	@echo "... src/webshell_detector/webshell_forensic.o"
 	@echo "... src/webshell_detector/webshell_forensic.i"
 	@echo "... src/webshell_detector/webshell_forensic.s"
+	@echo "... tests/test_event_bus_mpmc_stress.o"
+	@echo "... tests/test_event_bus_mpmc_stress.i"
+	@echo "... tests/test_event_bus_mpmc_stress.s"
+	@echo "... third_party/cjson/cJSON.o"
+	@echo "... third_party/cjson/cJSON.i"
+	@echo "... third_party/cjson/cJSON.s"
 	@echo "... third_party/lz4/lz4.o"
 	@echo "... third_party/lz4/lz4.i"
 	@echo "... third_party/lz4/lz4.s"

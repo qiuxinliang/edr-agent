@@ -143,7 +143,8 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
              r->parent_name);
     copy_str(m->detail.process.parent_path, sizeof(m->detail.process.parent_path),
              r->parent_path);
-    copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level), "");
+    copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level),
+             r->integrity_level[0] ? r->integrity_level : "");
     return;
   }
 }

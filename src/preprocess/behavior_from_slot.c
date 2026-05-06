@@ -116,6 +116,16 @@ typedef struct {
   char pimg[EDR_BR_STR_LONG];
   int has_pimg;
   char naux[EDR_BR_STR_LONG];
+  char user[EDR_BR_STR_SHORT];
+  char integ[32];
+  unsigned long token_elev;
+  unsigned long sess_id;
+  int has_user;
+  int has_integ;
+  int has_token_elev;
+  int has_sess_id;
+  char query[EDR_BR_STR_LONG];
+  char consumer[EDR_BR_STR_LONG];
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
@@ -227,6 +237,22 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->regop, sizeof(f->regop), "%s", val);
   } else if (strcmp(key, "naux") == 0) {
     snprintf(f->naux, sizeof(f->naux), "%s", val);
+  } else if (strcmp(key, "user") == 0) {
+    snprintf(f->user, sizeof(f->user), "%s", val);
+    f->has_user = 1;
+  } else if (strcmp(key, "integ") == 0) {
+    snprintf(f->integ, sizeof(f->integ), "%s", val);
+    f->has_integ = 1;
+  } else if (strcmp(key, "token_elev") == 0) {
+    f->token_elev = strtoul(val, NULL, 10);
+    f->has_token_elev = 1;
+  } else if (strcmp(key, "sess_id") == 0) {
+    f->sess_id = strtoul(val, NULL, 10);
+    f->has_sess_id = 1;
+  } else if (strcmp(key, "query") == 0) {
+    snprintf(f->query, sizeof(f->query), "%s", val);
+  } else if (strcmp(key, "consumer") == 0) {
+    snprintf(f->consumer, sizeof(f->consumer), "%s", val);
   }
 }
 
@@ -376,6 +402,26 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
     if (ef.naux[0]) {
       snprintf(r->network_aux_path, sizeof(r->network_aux_path), "%s", ef.naux);
+    }
+    if (ef.has_user) {
+      snprintf(r->username, sizeof(r->username), "%s", ef.user);
+    }
+    if (ef.has_integ) {
+      snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integ);
+    }
+    if (ef.has_token_elev) {
+      r->token_elevation = (uint32_t)ef.token_elev;
+    }
+    if (ef.has_sess_id) {
+      r->session_id = (uint32_t)ef.sess_id;
+    }
+    if (ef.query[0]) {
+      snprintf(r->wmi_filter, sizeof(r->wmi_filter), "query=%s", ef.query);
+    }
+    if (ef.consumer[0]) {
+      size_t L = strlen(r->wmi_filter);
+      if (L > 0) snprintf(r->wmi_filter + L, sizeof(r->wmi_filter) - L, " consumer=%s", ef.consumer);
+      else snprintf(r->wmi_filter, sizeof(r->wmi_filter), "consumer=%s", ef.consumer);
     }
     if (ef.qname[0]) {
       snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.qname);

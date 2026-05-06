@@ -457,6 +457,12 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "etw_service_control_manager_provider");
+    if (d.ok) {
+      cfg->collection.etw_service_control_manager_provider = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "ebpf_enabled");
     if (d.ok) {
       cfg->collection.ebpf_enabled = d.u.b ? true : false;
@@ -1247,7 +1253,7 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   /* A4.2：ETW 实时会话缓冲/刷写；0 表示使用默认。有效区间与 Win32 常见实践对齐。 */
   if (cfg->collection.etw_buffer_kb == 0u) {
-    cfg->collection.etw_buffer_kb = 64u;
+    cfg->collection.etw_buffer_kb = 128u;
   }
   if (cfg->collection.etw_buffer_kb < 4u) {
     cfg->collection.etw_buffer_kb = 4u;
@@ -1552,6 +1558,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.etw_powershell_provider = true;
   cfg->collection.etw_security_audit_provider = true;
   cfg->collection.etw_wmi_provider = true;
+  cfg->collection.etw_service_control_manager_provider = true;
   cfg->collection.ebpf_enabled = true;
   cfg->collection.poll_interval_s = 1;
   cfg->collection.max_event_queue_size = 4096u;
@@ -1572,7 +1579,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
-  cfg->ave.scan_threads = 2;
+  cfg->ave.scan_threads = 1;
   cfg->ave.max_file_size_mb = 256;
   snprintf(cfg->ave.sensitivity, sizeof(cfg->ave.sensitivity), "%s", "MEDIUM");
   cfg->ave.enabled = false;
@@ -1651,6 +1658,17 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->webshell_detector.upload_timeout_s = 60u;
   cfg->webshell_detector.max_upload_size_mb = 10u;
 
+  cfg->detection.auto_profile = true;
+  cfg->detection.shellcode_mode = -1;
+  cfg->detection.webshell_mode = -1;
+  cfg->detection.pmfe_mode = 0;
+
+  cfg->pmfe.idle_scan_enabled = false;
+  cfg->pmfe.idle_scan_interval_min = 15u;
+  cfg->pmfe.idle_scan_max_procs = 8u;
+  cfg->pmfe.idle_cpu_threshold = 15.0;
+  cfg->pmfe.idle_skip_on_battery = true;
+
   cfg->fl.enabled = false;
   cfg->fl.coordinator_grpc_addr[0] = '\0';
   cfg->fl.coordinator_http_url[0] = '\0';
@@ -1704,6 +1722,48 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->remote.version_url[0] = '\0';
   cfg->remote.download_url[0] = '\0';
   cfg->remote.auto_update = false;
+}
+
+static void load_detection(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "auto_profile");
+    if (d.ok) { cfg->detection.auto_profile = d.u.b ? true : false; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "shellcode_mode");
+    if (d.ok) { cfg->detection.shellcode_mode = (int)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "webshell_mode");
+    if (d.ok) { cfg->detection.webshell_mode = (int)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "pmfe_mode");
+    if (d.ok) { cfg->detection.pmfe_mode = (int)d.u.i; }
+  }
+}
+
+static void load_pmfe(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "idle_scan_enabled");
+    if (d.ok) { cfg->pmfe.idle_scan_enabled = d.u.b ? true : false; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "idle_scan_interval_min");
+    if (d.ok && d.u.i >= 5 && d.u.i <= 1440) { cfg->pmfe.idle_scan_interval_min = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "idle_scan_max_procs");
+    if (d.ok && d.u.i >= 1 && d.u.i <= 64) { cfg->pmfe.idle_scan_max_procs = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_double_in(t, "idle_cpu_threshold");
+    if (d.ok && d.u.d >= 1.0 && d.u.d <= 90.0) { cfg->pmfe.idle_cpu_threshold = d.u.d; }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "idle_skip_on_battery");
+    if (d.ok) { cfg->pmfe.idle_skip_on_battery = d.u.b ? true : false; }
+  }
 }
 
 static void load_command(toml_table_t *t, EdrConfig *cfg) {
@@ -2188,6 +2248,18 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "webshell_detector");
     if (t) {
       load_webshell_detector(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "detection");
+    if (t) {
+      load_detection(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "pmfe");
+    if (t) {
+      load_pmfe(t, cfg);
     }
   }
   {

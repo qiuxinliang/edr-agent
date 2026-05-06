@@ -228,33 +228,28 @@ static int curl_ensure_init(void) {
 
 static CURL *curl_conn_acquire(void) {
 #ifdef EDR_HAVE_LIBCURL
-  static CURL *s_persist = NULL;
   if (curl_ensure_init() != 0) return NULL;
-  if (!s_persist) {
-    s_persist = curl_easy_init();
-    if (s_persist) {
-      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPALIVE, 1L);
-      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPIDLE, 30L);
-      curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPINTVL, 10L);
-      curl_easy_setopt(s_persist, CURLOPT_MAXAGE_CONN, 300L);
-      curl_easy_setopt(s_persist, CURLOPT_USERAGENT, "edr-agent/ingest");
-    }
+  CURL *curl = curl_easy_init();
+  if (curl) {
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 10L);
+    curl_easy_setopt(curl, CURLOPT_MAXAGE_CONN, 300L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
   }
-  if (s_persist) {
-    curl_easy_reset(s_persist);
-    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPIDLE, 30L);
-    curl_easy_setopt(s_persist, CURLOPT_TCP_KEEPINTVL, 10L);
-    curl_easy_setopt(s_persist, CURLOPT_MAXAGE_CONN, 300L);
-    curl_easy_setopt(s_persist, CURLOPT_USERAGENT, "edr-agent/ingest");
-    return s_persist;
-  }
+  return curl;
 #endif
   return NULL;
 }
 
 static void curl_conn_release(CURL *curl) {
+#ifdef EDR_HAVE_LIBCURL
+  if (curl) {
+    curl_easy_cleanup(curl);
+  }
+#else
   (void)curl;
+#endif
 }
 #endif
 
@@ -463,53 +458,45 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   return ok ? 0 : -1;
 }
 
+static int b64_encode_chunk(const uint8_t *in, size_t len, uint8_t carry[2], size_t *carry_len,
+                            const char tbl[64], char *out, size_t *out_pos, size_t cap) {
+  for (size_t i = 0u; i < len; i++) {
+    uint8_t c = in[i];
+    if (*carry_len == 0u) {
+      carry[(*carry_len)++] = c;
+      continue;
+    }
+    if (*carry_len == 1u) {
+      carry[(*carry_len)++] = c;
+      continue;
+    }
+    if (*out_pos + 4u >= cap) {
+      return -1;
+    }
+    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8) | (uint32_t)c;
+    out[(*out_pos)++] = tbl[(v >> 18) & 63u];
+    out[(*out_pos)++] = tbl[(v >> 12) & 63u];
+    out[(*out_pos)++] = tbl[(v >> 6) & 63u];
+    out[(*out_pos)++] = tbl[v & 63u];
+    *carry_len = 0u;
+  }
+  return 0;
+}
+
 static int b64_encode_join2(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, char *out,
                             size_t cap) {
   static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   size_t o = 0u;
-  size_t i = 0u;
   uint8_t carry[2];
   size_t carry_len = 0u;
-  for (i = 0u; i < alen; i++) {
-    uint8_t c = a[i];
-    if (carry_len == 0u) {
-      carry[carry_len++] = c;
-      continue;
-    }
-    if (carry_len == 1u) {
-      carry[carry_len++] = c;
-      continue;
-    }
-    if (o + 4u >= cap) {
-      return -1;
-    }
-    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8) | (uint32_t)c;
-    out[o++] = tbl[(v >> 18) & 63u];
-    out[o++] = tbl[(v >> 12) & 63u];
-    out[o++] = tbl[(v >> 6) & 63u];
-    out[o++] = tbl[v & 63u];
-    carry_len = 0u;
+
+  if (b64_encode_chunk(a, alen, carry, &carry_len, tbl, out, &o, cap) != 0) {
+    return -1;
   }
-  for (i = 0u; i < blen; i++) {
-    uint8_t c = b[i];
-    if (carry_len == 0u) {
-      carry[carry_len++] = c;
-      continue;
-    }
-    if (carry_len == 1u) {
-      carry[carry_len++] = c;
-      continue;
-    }
-    if (o + 4u >= cap) {
-      return -1;
-    }
-    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8) | (uint32_t)c;
-    out[o++] = tbl[(v >> 18) & 63u];
-    out[o++] = tbl[(v >> 12) & 63u];
-    out[o++] = tbl[(v >> 6) & 63u];
-    out[o++] = tbl[v & 63u];
-    carry_len = 0u;
+  if (b64_encode_chunk(b, blen, carry, &carry_len, tbl, out, &o, cap) != 0) {
+    return -1;
   }
+
   if (carry_len == 1u) {
     if (o + 4u >= cap) {
       return -1;

@@ -1,0 +1,1 @@
+/usr/bin/cc  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.o CMakeFiles/test_event_bus_mpmc_stress.dir/src/core/event_bus.c.o -o test_event_bus_mpmc_stress

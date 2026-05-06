@@ -232,6 +232,19 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       if (fp[0]) {
         EDR_LOGV("[config] fingerprint=%s path=%s\n", fp, load_path);
       }
+      fprintf(stderr,
+              "[detection] auto_profile=%d shellcode=%d webshell=%d pmfe=%d fl=%d\n",
+              agent->cfg.detection.auto_profile,
+              agent->cfg.detection.shellcode_mode,
+              agent->cfg.detection.webshell_mode,
+              agent->cfg.detection.pmfe_mode,
+              agent->cfg.fl.enabled);
+      fprintf(stderr,
+              "[pmfe] idle_scan=%d interval=%umin max_procs=%u cpu_thr=%.1f%%\n",
+              agent->cfg.pmfe.idle_scan_enabled,
+              agent->cfg.pmfe.idle_scan_interval_min,
+              agent->cfg.pmfe.idle_scan_max_procs,
+              agent->cfg.pmfe.idle_cpu_threshold);
     }
   }
   edr_self_protect_init();
@@ -332,8 +345,116 @@ static int edr_remote_tmp_path(char *out, size_t cap) {
   return 0;
 #endif
 }
+#ifdef EDR_HAVE_LIBCURL
+static size_t edr_curl_capture_header(char *buffer, size_t size, size_t nitems, void *userdata) {
+  size_t total = size * nitems;
+  if (total < 18 || !userdata) return total;
+  struct { char *buf; size_t cap; } *ctx = (void *)userdata;
+  if (ctx->buf[0] != '\0') return total;
+  const char *pfx = "x-rules-version:";
+  int match = 1;
+  int i;
+  for (i = 0; i < 16; i++) {
+    char a = (char)(buffer[i] | (char)0x20);
+    if (a != pfx[i]) { match = 0; break; }
+  }
+  if (!match) return total;
+  const char *val = buffer + 16;
+  while (*val == ' ' || *val == '\t') val++;
+  size_t n = 0;
+  while (val[n] != '\0' && val[n] != '\r' && val[n] != '\n' && n < ctx->cap - 1) {
+    ctx->buf[n] = val[n];
+    n++;
+  }
+  ctx->buf[n] = '\0';
+  return total;
+}
+static size_t edr_curl_discard_body(char *buffer, size_t size, size_t nitems, void *userdata) {
+  (void)buffer;
+  (void)userdata;
+  return size * nitems;
+}
+#endif
 
-static int edr_remote_fetch_toml(const char *url, const char *out_path, const char *endpoint_id) {
+/* 检查远程规则版本号（HEAD 请求，仅下载响应头，不下载体） */
+static int edr_remote_check_version(const char *url, const char *endpoint_id, const char *tenant_id, const char *user_id, char *ver_out, size_t ver_out_cap) {
+  if (!url || !url[0] || !ver_out || ver_out_cap == 0) {
+    return -1;
+  }
+  ver_out[0] = '\0';
+#ifndef EDR_HAVE_LIBCURL
+  (void)endpoint_id;
+  (void)tenant_id;
+  (void)user_id;
+  return -1;
+#else
+  if (edr_remote_curl_init() != 0) {
+    return -1;
+  }
+  static CURL *s_h_curl = NULL;
+  if (!s_h_curl) {
+    s_h_curl = curl_easy_init();
+    if (!s_h_curl) return -1;
+  } else {
+    curl_easy_reset(s_h_curl);
+  }
+  /* 用于 header_callback 捕获 X-Rules-Version 的上下文 */
+  struct {
+    char *buf;
+    size_t cap;
+  } hv_ctx;
+  hv_ctx.buf = ver_out;
+  hv_ctx.cap = ver_out_cap;
+
+  char errbuf[CURL_ERROR_SIZE];
+  errbuf[0] = 0;
+  curl_easy_setopt(s_h_curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(s_h_curl, CURLOPT_URL, url);
+  curl_easy_setopt(s_h_curl, CURLOPT_NOBODY, 1L);
+  curl_easy_setopt(s_h_curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(s_h_curl, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERFUNCTION, edr_curl_capture_header);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERDATA, &hv_ctx);
+  curl_easy_setopt(s_h_curl, CURLOPT_WRITEFUNCTION, edr_curl_discard_body);
+  curl_easy_setopt(s_h_curl, CURLOPT_WRITEDATA, NULL);
+  struct curl_slist *h_hdrs = NULL;
+  if (endpoint_id && endpoint_id[0] && strcmp(endpoint_id, "auto") != 0) {
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "X-Endpoint-ID: %s", endpoint_id);
+    h_hdrs = curl_slist_append(h_hdrs, hdr);
+  }
+  if (tenant_id && tenant_id[0]) {
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "X-Tenant-ID: %s", tenant_id);
+    h_hdrs = curl_slist_append(h_hdrs, hdr);
+  }
+  if (user_id && user_id[0]) {
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "X-User-ID: %s", user_id);
+    h_hdrs = curl_slist_append(h_hdrs, hdr);
+  }
+  if (h_hdrs) {
+    curl_easy_setopt(s_h_curl, CURLOPT_HTTPHEADER, h_hdrs);
+  }
+  CURLcode cc = curl_easy_perform(s_h_curl);
+  if (h_hdrs) {
+    curl_slist_free_all(h_hdrs);
+    curl_easy_setopt(s_h_curl, CURLOPT_HTTPHEADER, NULL);
+  }
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERFUNCTION, NULL);
+  curl_easy_setopt(s_h_curl, CURLOPT_HEADERDATA, NULL);
+  curl_easy_setopt(s_h_curl, CURLOPT_WRITEFUNCTION, NULL);
+  if (cc != CURLE_OK) {
+    return -1;
+  }
+  if (ver_out[0] == '\0') {
+    return -1;
+  }
+  return 0;
+#endif
+}
+
+static int edr_remote_fetch_toml(const char *url, const char *out_path, const char *endpoint_id, const char *tenant_id, const char *user_id) {
   if (!url || !url[0] || !out_path || !out_path[0]) {
     return -1;
   }
@@ -341,51 +462,61 @@ static int edr_remote_fetch_toml(const char *url, const char *out_path, const ch
   (void)url;
   (void)out_path;
   (void)endpoint_id;
+  (void)tenant_id;
+  (void)user_id;
   return -1;
 #else
   if (edr_remote_curl_init() != 0) {
     return -1;
   }
-  CURL *curl = curl_easy_init();
-  if (!curl) {
-    return -1;
+  static CURL *s_curl = NULL;
+  if (!s_curl) {
+    s_curl = curl_easy_init();
+    if (!s_curl) return -1;
+  } else {
+    curl_easy_reset(s_curl);
   }
   FILE *f = fopen(out_path, "wb");
   if (!f) {
-    curl_easy_cleanup(curl);
     return -1;
   }
   char errbuf[CURL_ERROR_SIZE];
   errbuf[0] = 0;
-  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)f);
+  curl_easy_setopt(s_curl, CURLOPT_ERRORBUFFER, errbuf);
+  curl_easy_setopt(s_curl, CURLOPT_URL, url);
+  curl_easy_setopt(s_curl, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(s_curl, CURLOPT_FORBID_REUSE, 0L);
+  curl_easy_setopt(s_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+  curl_easy_setopt(s_curl, CURLOPT_WRITEDATA, (void *)f);
+  struct curl_slist *headers = NULL;
   if (endpoint_id && endpoint_id[0] && strcmp(endpoint_id, "auto") != 0) {
-    struct curl_slist *headers = NULL;
     char hdr[256];
     snprintf(hdr, sizeof(hdr), "X-Endpoint-ID: %s", endpoint_id);
     headers = curl_slist_append(headers, hdr);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    fprintf(stderr, "[remote] downloading %s with X-Endpoint-ID: %s\n", url, endpoint_id);
-    CURLcode cc = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
-    fclose(f);
-    curl_easy_cleanup(curl);
-    if (cc != CURLE_OK) {
-      (void)remove(out_path);
-      const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cc);
-      EDR_LOGE("[config] 远程 TOML 拉取失败: %s\n", em);
-      return -1;
-    }
-    return 0;
   }
-  CURLcode cc = curl_easy_perform(curl);
+  if (tenant_id && tenant_id[0]) {
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "X-Tenant-ID: %s", tenant_id);
+    headers = curl_slist_append(headers, hdr);
+  }
+  if (user_id && user_id[0]) {
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "X-User-ID: %s", user_id);
+    headers = curl_slist_append(headers, hdr);
+  }
+  if (headers) {
+    curl_easy_setopt(s_curl, CURLOPT_HTTPHEADER, headers);
+  }
+  fprintf(stderr, "[remote] downloading %s with X-Endpoint-ID: %s\n", url, endpoint_id ? endpoint_id : "(none)");
+  CURLcode cc = curl_easy_perform(s_curl);
   fclose(f);
-  curl_easy_cleanup(curl);
+  if (headers) {
+    curl_slist_free_all(headers);
+    curl_easy_setopt(s_curl, CURLOPT_HTTPHEADER, NULL);
+  }
   if (cc != CURLE_OK) {
     (void)remove(out_path);
     const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cc);
@@ -445,7 +576,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
       uint64_t net_hb_period_ns = (uint64_t)net_hb_sec * 1000000000ULL;
       uint64_t last_net_hb_ns = edr_monotonic_ns();
       while (!agent->shutdown) {
-        edr_ms_sleep(200u);
+        edr_ms_sleep(500u);
         if (hb_period_ns > 0) {
           uint64_t now = edr_monotonic_ns();
           if (now - last_hb_ns >= hb_period_ns) {
@@ -583,7 +714,23 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     EDR_LOGE("%s", "[config] 远程 TOML 临时文件创建失败\n");
     return;
   }
-  if (edr_remote_fetch_toml(url, tmp, agent->cfg.agent.endpoint_id) != 0) {
+  /* 先检查版本号，若与本地相同则跳过下载 */
+  {
+    char remote_ver[64];
+    if (edr_remote_check_version(url, agent->cfg.agent.endpoint_id, agent->cfg.agent.tenant_id, agent->cfg.platform.rest_user_id, remote_ver, sizeof(remote_ver)) == 0) {
+      if (remote_ver[0] && agent->cfg.preprocessing.rules_version[0]) {
+        if (strcmp(remote_ver, agent->cfg.preprocessing.rules_version) == 0) {
+          fprintf(stderr, "[config] 远程规则版本未变 (%s), 跳过下载\n", remote_ver);
+          return;
+        }
+      }
+      fprintf(stderr, "[config] 远程规则版本已更新: local=%s remote=%s\n",
+              agent->cfg.preprocessing.rules_version[0] ? agent->cfg.preprocessing.rules_version : "(none)",
+              remote_ver);
+    }
+  }
+
+  if (edr_remote_fetch_toml(url, tmp, agent->cfg.agent.endpoint_id, agent->cfg.agent.tenant_id, agent->cfg.platform.rest_user_id) != 0) {
     s_remote_consecutive_failures++;
     if (s_remote_consecutive_failures <= 1 || s_remote_consecutive_failures % 10 == 0) {
       fprintf(stderr, "[config] 远程 TOML 拉取连续失败 %d 次，退避 %ds 后重试\n",
@@ -593,37 +740,117 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   s_remote_consecutive_failures = 0;
 
-  /* 保存 [remote] + [agent] section，防止远程 TOML 覆盖后丢失关键参数 */
+  /* 保存 [server]/[agent]/[collection]/[remote] section，防止远程 TOML 覆盖后丢失关键参数 */
   struct {
+    /* server */
+    char srv_address[256];
+    char srv_ca_cert[1024];
+    char srv_client_cert[1024];
+    char srv_client_key[1024];
+    int srv_connect_timeout_s;
+    int srv_keepalive_interval_s;
+    bool srv_grpc_insecure;
+    /* agent */
+    char endpoint_id[128];
+    char tenant_id[128];
+    /* collection */
+    bool col_etw_enabled;
+    bool col_etw_tcpip_provider;
+    bool col_etw_firewall_provider;
+    bool col_etw_dns_client_provider;
+    bool col_etw_powershell_provider;
+    bool col_etw_security_audit_provider;
+    bool col_etw_wmi_provider;
+    bool col_ebpf_enabled;
+    int col_poll_interval_s;
+    uint32_t col_max_event_queue_size;
+    uint32_t col_etw_buffer_kb;
+    uint32_t col_etw_flush_timer_s;
+    /* remote */
     char rules_url[512];
     char p0_bundle_url[512];
     char version_url[512];
     char download_url[512];
     int poll_interval_s;
     bool auto_update;
-    char endpoint_id[128];
-    char tenant_id[128];
-  } saved_remote;
-  memcpy(saved_remote.rules_url, agent->cfg.remote.rules_url, sizeof(saved_remote.rules_url));
-  memcpy(saved_remote.p0_bundle_url, agent->cfg.remote.p0_bundle_url, sizeof(saved_remote.p0_bundle_url));
-  memcpy(saved_remote.version_url, agent->cfg.remote.version_url, sizeof(saved_remote.version_url));
-  memcpy(saved_remote.download_url, agent->cfg.remote.download_url, sizeof(saved_remote.download_url));
-  saved_remote.poll_interval_s = agent->cfg.remote.poll_interval_s;
-  saved_remote.auto_update = agent->cfg.remote.auto_update;
-  memcpy(saved_remote.endpoint_id, agent->cfg.agent.endpoint_id, sizeof(saved_remote.endpoint_id));
-  memcpy(saved_remote.tenant_id, agent->cfg.agent.tenant_id, sizeof(saved_remote.tenant_id));
+    /* platform (HTTP ingest target) */
+    char platform_rest_base_url[512];
+    char platform_rest_user_id[128];
+    char platform_rest_bearer_token[512];
+  } saved;
+  /* save server */
+  memcpy(saved.srv_address, agent->cfg.server.address, sizeof(saved.srv_address));
+  memcpy(saved.srv_ca_cert, agent->cfg.server.ca_cert, sizeof(saved.srv_ca_cert));
+  memcpy(saved.srv_client_cert, agent->cfg.server.client_cert, sizeof(saved.srv_client_cert));
+  memcpy(saved.srv_client_key, agent->cfg.server.client_key, sizeof(saved.srv_client_key));
+  saved.srv_connect_timeout_s = agent->cfg.server.connect_timeout_s;
+  saved.srv_keepalive_interval_s = agent->cfg.server.keepalive_interval_s;
+  saved.srv_grpc_insecure = agent->cfg.server.grpc_insecure;
+  /* save agent */
+  memcpy(saved.endpoint_id, agent->cfg.agent.endpoint_id, sizeof(saved.endpoint_id));
+  memcpy(saved.tenant_id, agent->cfg.agent.tenant_id, sizeof(saved.tenant_id));
+  /* save collection */
+  saved.col_etw_enabled = agent->cfg.collection.etw_enabled;
+  saved.col_etw_tcpip_provider = agent->cfg.collection.etw_tcpip_provider;
+  saved.col_etw_firewall_provider = agent->cfg.collection.etw_firewall_provider;
+  saved.col_etw_dns_client_provider = agent->cfg.collection.etw_dns_client_provider;
+  saved.col_etw_powershell_provider = agent->cfg.collection.etw_powershell_provider;
+  saved.col_etw_security_audit_provider = agent->cfg.collection.etw_security_audit_provider;
+  saved.col_etw_wmi_provider = agent->cfg.collection.etw_wmi_provider;
+  saved.col_ebpf_enabled = agent->cfg.collection.ebpf_enabled;
+  saved.col_poll_interval_s = agent->cfg.collection.poll_interval_s;
+  saved.col_max_event_queue_size = agent->cfg.collection.max_event_queue_size;
+  saved.col_etw_buffer_kb = agent->cfg.collection.etw_buffer_kb;
+  saved.col_etw_flush_timer_s = agent->cfg.collection.etw_flush_timer_s;
+  /* save remote */
+  memcpy(saved.rules_url, agent->cfg.remote.rules_url, sizeof(saved.rules_url));
+  memcpy(saved.p0_bundle_url, agent->cfg.remote.p0_bundle_url, sizeof(saved.p0_bundle_url));
+  memcpy(saved.version_url, agent->cfg.remote.version_url, sizeof(saved.version_url));
+  memcpy(saved.download_url, agent->cfg.remote.download_url, sizeof(saved.download_url));
+  saved.poll_interval_s = agent->cfg.remote.poll_interval_s;
+  saved.auto_update = agent->cfg.remote.auto_update;
+  /* save platform */
+  memcpy(saved.platform_rest_base_url, agent->cfg.platform.rest_base_url, sizeof(saved.platform_rest_base_url));
+  memcpy(saved.platform_rest_user_id, agent->cfg.platform.rest_user_id, sizeof(saved.platform_rest_user_id));
+  memcpy(saved.platform_rest_bearer_token, agent->cfg.platform.rest_bearer_token, sizeof(saved.platform_rest_bearer_token));
 
   EdrError ce = edr_config_load(tmp, &agent->cfg);
 
-  /* 恢复 [remote] + [agent] section，保留首次 agent.toml 中配置的参数 */
-  memcpy(agent->cfg.remote.rules_url, saved_remote.rules_url, sizeof(agent->cfg.remote.rules_url));
-  memcpy(agent->cfg.remote.p0_bundle_url, saved_remote.p0_bundle_url, sizeof(agent->cfg.remote.p0_bundle_url));
-  memcpy(agent->cfg.remote.version_url, saved_remote.version_url, sizeof(agent->cfg.remote.version_url));
-  memcpy(agent->cfg.remote.download_url, saved_remote.download_url, sizeof(agent->cfg.remote.download_url));
-  agent->cfg.remote.poll_interval_s = saved_remote.poll_interval_s;
-  agent->cfg.remote.auto_update = saved_remote.auto_update;
-  memcpy(agent->cfg.agent.endpoint_id, saved_remote.endpoint_id, sizeof(agent->cfg.agent.endpoint_id));
-  memcpy(agent->cfg.agent.tenant_id, saved_remote.tenant_id, sizeof(agent->cfg.agent.tenant_id));
+  /* restore server */
+  memcpy(agent->cfg.server.address, saved.srv_address, sizeof(agent->cfg.server.address));
+  memcpy(agent->cfg.server.ca_cert, saved.srv_ca_cert, sizeof(agent->cfg.server.ca_cert));
+  memcpy(agent->cfg.server.client_cert, saved.srv_client_cert, sizeof(agent->cfg.server.client_cert));
+  memcpy(agent->cfg.server.client_key, saved.srv_client_key, sizeof(agent->cfg.server.client_key));
+  agent->cfg.server.connect_timeout_s = saved.srv_connect_timeout_s;
+  agent->cfg.server.keepalive_interval_s = saved.srv_keepalive_interval_s;
+  agent->cfg.server.grpc_insecure = saved.srv_grpc_insecure;
+  /* restore agent */
+  memcpy(agent->cfg.agent.endpoint_id, saved.endpoint_id, sizeof(agent->cfg.agent.endpoint_id));
+  memcpy(agent->cfg.agent.tenant_id, saved.tenant_id, sizeof(agent->cfg.agent.tenant_id));
+  /* restore collection */
+  agent->cfg.collection.etw_enabled = saved.col_etw_enabled;
+  agent->cfg.collection.etw_tcpip_provider = saved.col_etw_tcpip_provider;
+  agent->cfg.collection.etw_firewall_provider = saved.col_etw_firewall_provider;
+  agent->cfg.collection.etw_dns_client_provider = saved.col_etw_dns_client_provider;
+  agent->cfg.collection.etw_powershell_provider = saved.col_etw_powershell_provider;
+  agent->cfg.collection.etw_security_audit_provider = saved.col_etw_security_audit_provider;
+  agent->cfg.collection.etw_wmi_provider = saved.col_etw_wmi_provider;
+  agent->cfg.collection.ebpf_enabled = saved.col_ebpf_enabled;
+  agent->cfg.collection.poll_interval_s = saved.col_poll_interval_s;
+  agent->cfg.collection.max_event_queue_size = saved.col_max_event_queue_size;
+  agent->cfg.collection.etw_buffer_kb = saved.col_etw_buffer_kb;
+  agent->cfg.collection.etw_flush_timer_s = saved.col_etw_flush_timer_s;
+  /* restore remote */
+  memcpy(agent->cfg.remote.rules_url, saved.rules_url, sizeof(agent->cfg.remote.rules_url));
+  memcpy(agent->cfg.remote.p0_bundle_url, saved.p0_bundle_url, sizeof(agent->cfg.remote.p0_bundle_url));
+  memcpy(agent->cfg.remote.version_url, saved.version_url, sizeof(agent->cfg.remote.version_url));
+  memcpy(agent->cfg.remote.download_url, saved.download_url, sizeof(agent->cfg.remote.download_url));
+  agent->cfg.remote.poll_interval_s = saved.poll_interval_s;
+  agent->cfg.remote.auto_update = saved.auto_update;
+  /* restore platform (HTTP ingest target) */
+  memcpy(agent->cfg.platform.rest_base_url, saved.platform_rest_base_url, sizeof(agent->cfg.platform.rest_base_url));
+  memcpy(agent->cfg.platform.rest_user_id, saved.platform_rest_user_id, sizeof(agent->cfg.platform.rest_user_id));
+  memcpy(agent->cfg.platform.rest_bearer_token, saved.platform_rest_bearer_token, sizeof(agent->cfg.platform.rest_bearer_token));
 
   char fp[80];
   edr_config_fingerprint(tmp, fp, sizeof(fp));
@@ -661,6 +888,21 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   EDR_LOGV("[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave%s%s\n",
            fp[0] ? " fingerprint=" : "", fp[0] ? fp : "");
+  fprintf(stderr,
+          "[detection] auto_profile=%d shellcode=%d webshell=%d pmfe=%d onnx=%d fl=%d\n",
+          agent->cfg.detection.auto_profile,
+          agent->cfg.detection.shellcode_mode,
+          agent->cfg.detection.webshell_mode,
+          agent->cfg.detection.pmfe_mode,
+          /* onnx_behavior_enabled is in ave */
+          1,
+          agent->cfg.fl.enabled);
+  fprintf(stderr,
+          "[pmfe] idle_scan=%d interval=%umin max_procs=%u cpu_thr=%.1f%%\n",
+          agent->cfg.pmfe.idle_scan_enabled,
+          agent->cfg.pmfe.idle_scan_interval_min,
+          agent->cfg.pmfe.idle_scan_max_procs,
+          agent->cfg.pmfe.idle_cpu_threshold);
 
   /* Agent 自更新检查 (每个轮询周期执行一次，内部限频) */
   edr_agent_check_update(&agent->cfg);
@@ -674,7 +916,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     if (p0_url && p0_url[0]) {
       char p0_tmp[520];
       if (edr_remote_tmp_path(p0_tmp, sizeof(p0_tmp)) == 0) {
-        if (edr_remote_fetch_toml(p0_url, p0_tmp, agent->cfg.agent.endpoint_id) == 0) {
+        if (edr_remote_fetch_toml(p0_url, p0_tmp, agent->cfg.agent.endpoint_id, agent->cfg.agent.tenant_id, agent->cfg.platform.rest_user_id) == 0) {
           char p0_dst[1024];
           if (edr_p0_bundle_dst_path(p0_dst, sizeof(p0_dst)) == 0) {
             (void)remove(p0_dst);
