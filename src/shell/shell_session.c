@@ -117,7 +117,7 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   HANDLE job = CreateJobObject(NULL, NULL);
   if (job) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
-    jeli.BasicLimit.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                             &jeli, sizeof(jeli));
   }

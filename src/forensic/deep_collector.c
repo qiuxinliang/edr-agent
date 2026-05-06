@@ -38,10 +38,10 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
   HANDLE job = CreateJobObject(NULL, NULL);
   if (job) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
-    jeli.BasicLimit.LimitFlags =
+    jeli.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
         JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    jeli.BasicLimit.PerProcessUserTimeLimit.QuadPart =
+    jeli.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart =
         (int64_t)params->timeout_s * 10000000LL;
     SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                             &jeli, sizeof(jeli));
