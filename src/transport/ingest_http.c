@@ -780,7 +780,7 @@ static int copy_json_string_val(const char *j, const char *key, char *out, size_
   }
   kbuf[n] = 0;
   char need[80];
-  if (snprintf(need, sizeof(need), "\"%s\":\"", kbuf) >= (int)sizeof(need) || need[0] == 0) {
+  if (snprintf(need, sizeof(need), "\"%s\"", kbuf) >= (int)sizeof(need) || need[0] == 0) {
     return -1;
   }
   const char *p = strstr(j, need);
@@ -788,6 +788,16 @@ static int copy_json_string_val(const char *j, const char *key, char *out, size_
     return -1;
   }
   p += strlen(need);
+  for (; p[0] && p[0] != ':'; p++) {}
+  if (p[0] != ':') {
+    return -1;
+  }
+  p++;
+  for (; p[0] == ' ' || p[0] == '\t' || p[0] == '\r' || p[0] == '\n'; p++) {}
+  if (p[0] != '"') {
+    return -1;
+  }
+  p++;
   size_t o = 0u;
   for (; p[0] && p[0] != '"';) {
     if (p[0] == '\\' && p[1] != 0) {

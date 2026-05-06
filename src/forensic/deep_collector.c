@@ -140,23 +140,113 @@ int edr_deep_collector_is_running(void) {
   return g_running ? 1 : 0;
 }
 
-#else /* POSIX stub */
+#else /* POSIX */
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static pid_t g_collector_pid = 0;
+static int g_running = 0;
+static char g_detail[512];
+
+static const char *find_collector_bin(void) {
+  if (access("./forensic_collector", X_OK) == 0) return "./forensic_collector";
+#ifdef __APPLE__
+  const char *home = getenv("HOME");
+  static char path[1024];
+  snprintf(path, sizeof(path), "%s/.edr/collector/forensic_collector", home ? home : "/tmp");
+  if (access(path, X_OK) == 0) return path;
+#endif
+  return "forensic_collector";
+}
 
 int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
-  (void)params;
-  return EDR_DC_ERR_DISABLED;
+  if (!params) return EDR_DC_ERR_DISABLED;
+
+  if (g_collector_pid && g_running) {
+    int st = 0;
+    pid_t w = waitpid(g_collector_pid, &st, WNOHANG);
+    if (w == 0) return EDR_DC_ERR_SPAWN;
+    g_collector_pid = 0;
+  }
+  g_running = 0;
+  g_detail[0] = '\0';
+
+  const char *bin = find_collector_bin();
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    snprintf(g_detail, sizeof(g_detail), "fork failed");
+    return EDR_DC_ERR_SPAWN;
+  }
+
+  if (pid == 0) {
+    char scope_str[32];
+    snprintf(scope_str, sizeof(scope_str), "%s", params->scope ? params->scope : "standard");
+
+    char timeout_str[32];
+    snprintf(timeout_str, sizeof(timeout_str), "%u",
+             params->timeout_s > 0 ? (unsigned)params->timeout_s : 300u);
+
+    const char *output_dir = params->output_dir ? params->output_dir : "/tmp/edr_forensic";
+
+    execl(bin, bin,
+          "--scope", scope_str,
+          "--timeout", timeout_str,
+          "--output-dir", output_dir,
+          (char *)NULL);
+
+    _exit(127);
+  }
+
+  g_collector_pid = pid;
+  g_running = 1;
+  snprintf(g_detail, sizeof(g_detail), "collector pid=%d started", (int)pid);
+  return EDR_DC_OK;
 }
 
 int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
                             size_t detail_cap) {
-  (void)out_exit_code;
-  (void)out_detail;
-  (void)detail_cap;
+  if (!g_collector_pid || !g_running) return 0;
+
+  int st = 0;
+  pid_t w = waitpid(g_collector_pid, &st, WNOHANG);
+  if (w == 0) return 1;
+  if (w < 0) {
+    if (out_exit_code) *out_exit_code = -1;
+    if (out_detail) snprintf(out_detail, detail_cap, "waitpid error");
+    g_collector_pid = 0;
+    g_running = 0;
+    return EDR_DC_ERR_CRASH;
+  }
+
+  int ec = 0;
+  if (WIFEXITED(st)) ec = WEXITSTATUS(st);
+  else if (WIFSIGNALED(st)) ec = 128 + WTERMSIG(st);
+
+  if (out_exit_code) *out_exit_code = ec;
+  if (out_detail) snprintf(out_detail, detail_cap, "%s",
+                            ec == 0 ? "completed" : "exited with error");
+
+  g_collector_pid = 0;
+  g_running = 0;
   return 0;
 }
 
-void edr_deep_collector_kill(void) {}
+void edr_deep_collector_kill(void) {
+  if (g_collector_pid && g_running) {
+    kill(g_collector_pid, SIGKILL);
+    waitpid(g_collector_pid, NULL, 0);
+  }
+  g_collector_pid = 0;
+  g_running = 0;
+}
 
-int edr_deep_collector_is_running(void) { return 0; }
+int edr_deep_collector_is_running(void) {
+  return g_running ? 1 : 0;
+}
 
 #endif

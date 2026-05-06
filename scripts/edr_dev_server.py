@@ -14,7 +14,11 @@ import os
 import sys
 import json
 import argparse
+import time
+import base64
+import threading
 from io import BytesIO
+from collections import defaultdict
 
 
 class EdrDevHandler(http.server.BaseHTTPRequestHandler):
@@ -23,11 +27,15 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
     p0_bundle_path = None
     rules_version = None
 
+    # --- 内存指令队列 (endpoint_id -> list of command dicts) ---
+    _cmd_queue = defaultdict(list)
+    _cmd_lock = threading.Lock()
+
     def log_message(self, format, *args):
         print(f"[edr-server] {self.client_address[0]} {format % args}")
 
     def _send_json(self, code, body):
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        data = json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -91,17 +99,85 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
         """POST /api/v1/ingest/report-command-result"""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
+        print(f"[edr-server] report-command-result: {body.decode('utf-8', errors='replace')[:500]}")
         self._send_json(200, {"code": "OK", "message": "command result received"})
 
     def _handle_ingest_poll_commands(self):
         """GET /api/v1/ingest/poll-commands"""
-        self._send_json(200, {"commands": []})
+        from urllib.parse import urlparse, parse_qs
+        query = parse_qs(urlparse(self.path).query)
+        endpoint_ids = query.get("endpoint_id", [])
+        limit_str = query.get("limit", ["8"])
+        limit = int(limit_str[0]) if limit_str else 8
+
+        commands = []
+        with self._cmd_lock:
+            for eid in endpoint_ids:
+                q = self._cmd_queue.get(eid, [])
+                if q:
+                    take = min(limit - len(commands), len(q))
+                    commands.extend(q[:take])
+                    self._cmd_queue[eid] = q[take:]
+                    if len(commands) >= limit:
+                        break
+
+        self._send_json(200, {"commands": commands})
+        if commands:
+            print(f"[edr-server] poll response endpoint={endpoint_ids} returning {len(commands)} commands")
 
     def _handle_ingest_upload_file(self):
         """POST /api/v1/ingest/upload-file"""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
         self._send_json(200, {"code": "OK", "upload_id": "fake-upload-001"})
+
+    def _handle_dev_commands(self):
+        """POST /dev/commands — 向指定端点下发指令"""
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            req = json.loads(body)
+        except json.JSONDecodeError as e:
+            self._send_json(400, {"code": "INVALID_ARGUMENT", "message": str(e)})
+            return
+
+        endpoint_id = req.get("endpoint_id", "").strip()
+        command_type = req.get("command_type", "").strip()
+        payload = req.get("payload", {})
+        session_id = req.get("session_id", "")
+        input_cmd = req.get("input", "")
+
+        if not endpoint_id or not command_type:
+            self._send_json(400, {"code": "INVALID_ARGUMENT",
+                                  "message": "endpoint_id and command_type are required"})
+            return
+
+        if command_type in ("shell_open", "forensic_deep"):
+            if isinstance(payload, dict):
+                payload_bytes = json.dumps(payload).encode("utf-8")
+            else:
+                payload_bytes = str(payload).encode("utf-8")
+        elif command_type == "shell_input":
+            payload_bytes = json.dumps({"session_id": session_id or "0", "input": input_cmd}).encode("utf-8")
+        elif command_type == "shell_close":
+            payload_bytes = json.dumps({"session_id": session_id or "0"}).encode("utf-8")
+        else:
+            payload_bytes = json.dumps(payload).encode("utf-8") if isinstance(payload, dict) else str(payload).encode("utf-8")
+
+        task_id = f"cmd_{command_type}_{int(time.time() * 1000000)}"
+        cmd_obj = {
+            "command_id": task_id,
+            "command_type": command_type,
+            "payload_b64": base64.b64encode(payload_bytes).decode("ascii"),
+            "idempotency_key": task_id,
+            "issued_at_unix_ms": str(int(time.time() * 1000)),
+        }
+
+        with self._cmd_lock:
+            self._cmd_queue[endpoint_id].append(cmd_obj)
+
+        print(f"[edr-server] enqueued {command_type} → endpoint={endpoint_id} task_id={task_id}")
+        self._send_json(200, {"code": "OK", "task_id": task_id, "status": "queued"})
 
     # --- 路由表 ---
     ROUTES = {
@@ -114,6 +190,7 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
         ("POST", "/api/v1/ingest/report-command-result"): "_handle_ingest_report_command_result",
         ("GET", "/api/v1/ingest/poll-commands"): "_handle_ingest_poll_commands",
         ("POST", "/api/v1/ingest/upload-file"): "_handle_ingest_upload_file",
+        ("POST", "/dev/commands"): "_handle_dev_commands",
     }
 
     def do_GET(self):
@@ -197,6 +274,7 @@ def main():
     print(f"  POST /api/v1/ingest/report-command-result")
     print(f"  GET  /api/v1/ingest/poll-commands")
     print(f"  POST /api/v1/ingest/upload-file")
+    print(f"  POST /dev/commands   ← 手动下发指令")
     print("=" * 60)
 
     handler = configure_handler(config_dir)
