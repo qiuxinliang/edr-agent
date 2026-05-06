@@ -2,6 +2,7 @@
 #define EDR_RESPONSE_H
 
 #include "edr/command.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
