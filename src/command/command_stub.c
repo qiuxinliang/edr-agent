@@ -292,6 +292,24 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
 
+  if (edr_command_streq(t, "shell_open")) {
+    edr_response_shell_open(id, payload, payload_len, sm);
+    return;
+  }
+  if (edr_command_streq(t, "shell_input")) {
+    edr_response_shell_input(id, payload, payload_len, sm);
+    return;
+  }
+  if (edr_command_streq(t, "shell_close")) {
+    edr_response_shell_close(id, payload, payload_len, sm);
+    return;
+  }
+
+  if (edr_command_streq(t, "forensic_deep")) {
+    edr_response_deep_forensic(id, payload, payload_len, sm);
+    return;
+  }
+
   if (edr_command_streq(t, "GET_ATTACK_SURFACE") || edr_command_streq(t, "get_attack_surface") || edr_command_streq(t, "REFRESH_ATTACK_SURFACE")) {
     char detail[256];
     int r = edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail));

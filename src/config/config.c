@@ -1669,6 +1669,22 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->pmfe.idle_cpu_threshold = 15.0;
   cfg->pmfe.idle_skip_on_battery = true;
 
+  cfg->forensic_auto.enabled = false;
+  cfg->forensic_auto.cooldown_s = 30u;
+  cfg->forensic_auto.max_per_hour = 20u;
+  cfg->forensic_auto.max_concurrent = 2u;
+  cfg->forensic_auto.per_mitre_cooldown_s = 300u;
+  cfg->forensic_auto.mitre_trigger_count = 0u;
+  (void)memset(cfg->forensic_auto.trigger_mitre, 0, sizeof(cfg->forensic_auto.trigger_mitre));
+  cfg->forensic_auto.trigger_on_p0 = true;
+  cfg->forensic_auto.collect_process_tree = true;
+  cfg->forensic_auto.collect_network_state = true;
+  cfg->forensic_auto.collect_autoruns = true;
+
+  cfg->shell.max_sessions = 3u;
+  cfg->shell.session_timeout_s = 600u;
+  cfg->shell.max_output_per_command_kb = 1024u;
+
   cfg->fl.enabled = false;
   cfg->fl.coordinator_grpc_addr[0] = '\0';
   cfg->fl.coordinator_http_url[0] = '\0';
@@ -1763,6 +1779,77 @@ static void load_pmfe(toml_table_t *t, EdrConfig *cfg) {
   {
     toml_datum_t d = toml_bool_in(t, "idle_skip_on_battery");
     if (d.ok) { cfg->pmfe.idle_skip_on_battery = d.u.b ? true : false; }
+  }
+}
+
+static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) { cfg->forensic_auto.enabled = d.u.b ? true : false; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "cooldown_s");
+    if (d.ok && d.u.i >= 5 && d.u.i <= 600) { cfg->forensic_auto.cooldown_s = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "max_per_hour");
+    if (d.ok && d.u.i >= 1 && d.u.i <= 60) { cfg->forensic_auto.max_per_hour = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "max_concurrent");
+    if (d.ok && d.u.i >= 1 && d.u.i <= 8) { cfg->forensic_auto.max_concurrent = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "per_mitre_cooldown_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 3600) { cfg->forensic_auto.per_mitre_cooldown_s = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "trigger_on_p0");
+    if (d.ok) { cfg->forensic_auto.trigger_on_p0 = d.u.b ? true : false; }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "collect_process_tree");
+    if (d.ok) { cfg->forensic_auto.collect_process_tree = d.u.b ? true : false; }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "collect_network_state");
+    if (d.ok) { cfg->forensic_auto.collect_network_state = d.u.b ? true : false; }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "collect_autoruns");
+    if (d.ok) { cfg->forensic_auto.collect_autoruns = d.u.b ? true : false; }
+  }
+  {
+    toml_array_t *arr = toml_array_in(t, "trigger_on_mitre");
+    if (arr) {
+      int n = toml_array_nelem(arr);
+      if (n > 16) n = 16;
+      cfg->forensic_auto.mitre_trigger_count = 0u;
+      for (int i = 0; i < n; i++) {
+        toml_datum_t d = toml_string_at(arr, i);
+        if (d.ok) {
+          strncpy(cfg->forensic_auto.trigger_mitre[i], d.u.s, 15);
+          cfg->forensic_auto.trigger_mitre[i][15] = '\0';
+          cfg->forensic_auto.mitre_trigger_count++;
+          free(d.u.s);
+        }
+      }
+    }
+  }
+}
+
+static void load_shell(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_int_in(t, "max_sessions");
+    if (d.ok && d.u.i >= 1 && d.u.i <= 10) { cfg->shell.max_sessions = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "session_timeout_s");
+    if (d.ok && d.u.i >= 30 && d.u.i <= 3600) { cfg->shell.session_timeout_s = (uint32_t)d.u.i; }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "max_output_per_command_kb");
+    if (d.ok && d.u.i >= 64 && d.u.i <= 4096) { cfg->shell.max_output_per_command_kb = (uint32_t)d.u.i; }
   }
 }
 
@@ -2260,6 +2347,18 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "pmfe");
     if (t) {
       load_pmfe(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "forensic_auto");
+    if (t) {
+      load_forensic_auto(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "shell");
+    if (t) {
+      load_shell(t, cfg);
     }
   }
   {

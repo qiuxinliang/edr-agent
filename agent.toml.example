@@ -268,6 +268,30 @@ idle_cpu_threshold = 15.0
 idle_skip_on_battery = true
 
 # =========================
+# [forensic_auto] 取证自动触发策略
+# 当 P0 事件或指定 MITRE 技术命中时，自动触发取证收集。
+# =========================
+[forensic_auto]
+enabled = false
+cooldown_s = 30
+max_per_hour = 20
+max_concurrent = 2
+per_mitre_cooldown_s = 300
+trigger_on_p0 = true
+collect_process_tree = true
+collect_network_state = true
+collect_autoruns = true
+trigger_on_mitre = ["T1059", "T1547", "T1543", "T1003"]
+
+# =========================
+# [shell] 远程 Shell 会话配置
+# =========================
+[shell]
+max_sessions = 3
+session_timeout_s = 600
+max_output_per_command_kb = 1024
+
+# =========================
 # [detection] 检测引擎自适应策略
 # 控制 shellcode / webshell / PMFE 的启停模式。
 # =========================

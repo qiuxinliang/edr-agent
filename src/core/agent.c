@@ -2,10 +2,14 @@
 
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
+#include "edr/deep_collector.h"
 #include "edr/event_bus.h"
+#include "edr/forensic_trigger.h"
 #include "edr/preprocess.h"
+#include "edr/process_tree_cache.h"
 #include "edr/resource.h"
 #include "edr/self_protect.h"
+#include "edr/shell_session.h"
 #include "edr/time_util.h"
 
 #if defined(EDR_WITH_FL_TRAINER)
@@ -249,6 +253,12 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   }
   edr_self_protect_init();
   edr_resource_init(&agent->cfg);
+  edr_pt_cache_init();
+  edr_forensic_trigger_init(&agent->cfg.forensic_auto);
+  edr_shell_session_init(agent->cfg.shell.max_sessions,
+                          agent->cfg.shell.session_timeout_s,
+                          agent->cfg.shell.max_output_per_command_kb,
+                          edr_shell_stream_output_cb, NULL);
   {
     int ar = AVE_InitFromEdrConfig(&agent->cfg);
     if (ar != AVE_OK) {
@@ -596,11 +606,24 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_poll_config_reload(agent, &last_reload_ns);
         edr_agent_poll_remote_config(agent, &last_remote_ns);
         edr_agent_poll_attack_surface(agent);
+        edr_shell_session_poll();
+        edr_deep_collector_poll(NULL, NULL, 0);
+        {
+          EdrForensicTrigger trigger;
+          while (edr_forensic_trigger_try_pop(&trigger)) {
+            fprintf(stderr, "[forensic_trigger] drained: reason=%s pid=%u scope=%d\n",
+                    trigger.reason, trigger.target_pid, (int)trigger.scope);
+          }
+        }
       }
       edr_collector_stop();
     }
   }
   edr_preprocess_stop();
+  edr_shell_session_shutdown();
+  edr_deep_collector_kill();
+  edr_forensic_trigger_shutdown();
+  edr_pt_cache_shutdown();
   return EDR_OK;
 }
 

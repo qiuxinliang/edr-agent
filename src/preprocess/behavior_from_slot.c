@@ -1,4 +1,6 @@
 #include "edr/behavior_from_slot.h"
+#include "edr/forensic_trigger.h"
+#include "edr/process_tree_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -513,4 +515,23 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   }
 
   apply_mitre_hints(r);
+
+  if (slot->type == EDR_EVENT_PROCESS_CREATE) {
+    edr_pt_cache_put(r->pid, r->ppid,
+                     r->process_name, r->cmdline,
+                     r->exe_path, r->parent_name,
+                     (uint64_t)slot->timestamp_ns);
+  } else if (slot->type == EDR_EVENT_PROCESS_TERMINATE) {
+    edr_pt_cache_remove(r->pid);
+  }
+
+  if (slot->priority == 0) {
+    edr_pt_cache_fill_record(r->pid,
+                             r->grandparent_name, sizeof(r->grandparent_name),
+                             r->grandparent_path, sizeof(r->grandparent_path),
+                             r->parent_cmdline,   sizeof(r->parent_cmdline),
+                             &r->process_chain_depth);
+  }
+
+  edr_forensic_trigger_evaluate(slot, r);
 }

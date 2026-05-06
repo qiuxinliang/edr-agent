@@ -7,6 +7,7 @@
 
 #include "edr/error.h"
 #include "edr/emit_rules.h"
+#include "edr/forensic_trigger.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -294,6 +295,16 @@ typedef struct EdrConfig {
     double idle_cpu_threshold;
     bool idle_skip_on_battery;
   } pmfe;
+
+  /** 取证自动触发策略 — TOML `[forensic_auto]` */
+  EdrForensicAutoConfig forensic_auto;
+
+  /** 远程 Shell 配置 — TOML `[shell]` */
+  struct {
+    uint32_t max_sessions;
+    uint32_t session_timeout_s;
+    uint32_t max_output_per_command_kb;
+  } shell;
 
   /**
    * 联邦学习本地训练（FL §10）；TOML `[fl]`。

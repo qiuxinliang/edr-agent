@@ -1,11 +1,13 @@
 #include "edr/response.h"
 #include "edr/command_util.h"
 #include "edr/config.h"
+#include "edr/deep_collector.h"
 #include "edr/error.h"
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/pmfe.h"
 #include "edr/sha256.h"
+#include "edr/shell_session.h"
 #include "edr/edr_log.h"
 #include "edr/pe_verify.h"
 #include "edr/shell_exec.h"
@@ -1061,4 +1063,129 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   g_cmd_handled++; g_cmd_exec_ok++;
   edr_command_audit_both(cmd_id, "yara_scan: ok");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+}
+
+void edr_shell_stream_output_cb(const char *sid, const char *data, size_t len,
+                                int exit_code, bool closed, void *user) {
+  (void)user;
+  if (!sid) return;
+  char detail[4096];
+  if (closed && data == NULL) {
+    snprintf(detail, sizeof(detail), "shell session %s closed, exit=%d", sid, exit_code);
+  } else if (data && len > 0) {
+    size_t cp = len < sizeof(detail) - 1 ? len : sizeof(detail) - 1;
+    (void)memcpy(detail, data, cp);
+    detail[cp] = '\0';
+  } else {
+    return;
+  }
+  EdrSoarCommandMeta dummy = {0};
+  strncpy(dummy.soar_correlation_id, sid, sizeof(dummy.soar_correlation_id) - 1);
+  edr_command_soar_emit(sid, &dummy,
+                        closed ? EdrCmdExecOk : EdrCmdExecOk,
+                        exit_code, detail);
+}
+
+void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
+                             const EdrSoarCommandMeta *sm) {
+  if (!edr_command_dangerous_enabled()) {
+    g_cmd_rejected++;
+    edr_command_audit_both(cmd_id, "shell_open: rejected (dangerous disabled)");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 0, "dangerous commands disabled");
+    return;
+  }
+
+  char shell_type[64] = "cmd.exe";
+  if (pl && len > 0 && len < 64) {
+    (void)memcpy(shell_type, pl, len);
+    shell_type[len] = '\0';
+  }
+
+  int rc = edr_shell_session_open(cmd_id, shell_type);
+  if (rc != 0) {
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "shell_open: failed");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, rc, "shell_open failed");
+    return;
+  }
+
+  g_cmd_handled++;
+  g_cmd_exec_ok++;
+  char detail[128];
+  snprintf(detail, sizeof(detail), "shell session opened: %s", shell_type);
+  edr_command_audit_both(cmd_id, "shell_open: ok");
+  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+}
+
+void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
+                              const EdrSoarCommandMeta *sm) {
+  if (pl && len > 0) {
+    int rc = edr_shell_session_input(cmd_id, (const char *)pl, len);
+    if (rc != 0) {
+      g_cmd_exec_fail++;
+      edr_command_audit_both(cmd_id, "shell_input: write failed");
+      edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, rc, "shell_input write failed");
+      return;
+    }
+  }
+
+  char detail[64];
+  snprintf(detail, sizeof(detail), "shell_input sent %zu bytes", len);
+  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+}
+
+void edr_response_shell_close(const char *cmd_id, const uint8_t *pl, size_t len,
+                              const EdrSoarCommandMeta *sm) {
+  (void)pl;
+  (void)len;
+  edr_shell_session_close(cmd_id);
+  g_cmd_handled++;
+  g_cmd_exec_ok++;
+  edr_command_audit_both(cmd_id, "shell_close: ok");
+  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "shell session closed");
+}
+
+void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
+                                const EdrSoarCommandMeta *sm) {
+  if (!edr_command_dangerous_enabled()) {
+    g_cmd_rejected++;
+    edr_command_audit_both(cmd_id, "forensic_deep: rejected (dangerous disabled)");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 0, "dangerous commands disabled");
+    return;
+  }
+
+  EdrDeepCollectorParams params;
+  (void)memset(&params, 0, sizeof(params));
+  params.download_url = NULL;
+  params.expected_sha256 = NULL;
+  params.output_dir = NULL;
+  params.upload_url = NULL;
+  params.scope = "standard";
+  params.timeout_s = 900;
+
+  if (pl && len > 0 && len < 64) {
+    char scope[64];
+    (void)memcpy(scope, pl, len);
+    scope[len] = '\0';
+    if (strcmp(scope, "triage") == 0) params.scope = "triage";
+    else if (strcmp(scope, "full") == 0) params.scope = "full";
+    else if (strcmp(scope, "standard") == 0) params.scope = "standard";
+  }
+
+  int rc = edr_deep_collector_launch(&params);
+  if (rc != EDR_DC_OK) {
+    g_cmd_exec_fail++;
+    char detail[128];
+    snprintf(detail, sizeof(detail), "forensic_deep: launch failed, err=%d", rc);
+    edr_command_audit_both(cmd_id, detail);
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, rc, detail);
+    return;
+  }
+
+  g_cmd_handled++;
+  g_cmd_exec_ok++;
+  char detail[128];
+  snprintf(detail, sizeof(detail), "forensic_deep launched, scope=%s", params.scope);
+  edr_command_audit_both(cmd_id, "forensic_deep: launched");
+  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }

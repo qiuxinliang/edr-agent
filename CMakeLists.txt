@@ -271,6 +271,10 @@ set(EDR_AGENT_SOURCES
   src/command/shell_exec.c
   src/command/pe_verify.c
   src/response/response_actions.c
+  src/forensic/process_tree_cache.c
+  src/forensic/forensic_trigger.c
+  src/forensic/deep_collector.c
+  src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
