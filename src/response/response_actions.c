@@ -408,6 +408,50 @@ void edr_response_isolate_auto_from_shellcode(void) {
 
 /* ── File Actions ── */
 
+static int response_get_tmp_path(const char *cmd_id, char *out, size_t out_cap) {
+  const char *tmp = getenv("EDR_FILE_TMP");
+  if (!tmp || !tmp[0]) {
+#ifdef _WIN32
+    tmp = getenv("TEMP");
+    if (!tmp || !tmp[0]) tmp = getenv("TMP");
+    if (!tmp || !tmp[0]) tmp = ".";
+    snprintf(out, out_cap, "%s\\edr_get_%s", tmp, cmd_id ? cmd_id : "unknown");
+#else
+    snprintf(out, out_cap, "/tmp/edr_get_%s", cmd_id ? cmd_id : "unknown");
+#endif
+  } else {
+    snprintf(out, out_cap, "%s%sedr_get_%s", tmp,
+#ifdef _WIN32
+             "\\",
+#else
+             "/",
+#endif
+             cmd_id ? cmd_id : "unknown");
+  }
+  return 0;
+}
+
+static int response_b64_decode(const char *in, size_t in_len, uint8_t *out, size_t out_cap) {
+  static const uint8_t tbl[256] = {
+    ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,['I']=8,['J']=9,
+    ['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,['Q']=16,['R']=17,['S']=18,['T']=19,
+    ['U']=20,['V']=21,['W']=22,['X']=23,['Y']=24,['Z']=25,['a']=26,['b']=27,['c']=28,['d']=29,
+    ['e']=30,['f']=31,['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,
+    ['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,['w']=48,['x']=49,
+    ['y']=50,['z']=51,['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,
+    ['8']=60,['9']=61,['+']=62,['-']=62,['/']=63,['_']=63,
+  };
+  size_t o = 0;
+  for (size_t i = 0; i + 3 < in_len && o + 2 < out_cap; i += 4) {
+    uint8_t a = tbl[(uint8_t)in[i]], b = tbl[(uint8_t)in[i+1]];
+    uint8_t c = tbl[(uint8_t)in[i+2]], d = tbl[(uint8_t)in[i+3]];
+    out[o++] = (uint8_t)((a << 2) | (b >> 4));
+    if (in[i+2] != '=' && in[i+2] != 0) out[o++] = (uint8_t)((b << 4) | (c >> 2));
+    if (in[i+3] != '=' && in[i+3] != 0) out[o++] = (uint8_t)((c << 6) | d);
+  }
+  return (int)o;
+}
+
 void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
     g_cmd_rejected++;
@@ -458,6 +502,10 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     return;
   }
   fclose(f);
+
+  char sha[65];
+  edr_sha256_hex(buf, (size_t)fsize, sha);
+
   if (pe_only_flag) {
     char pe_info[512];
     if (!edr_pe_verify(buf, (size_t)fsize, pe_info, sizeof(pe_info))) {
@@ -467,24 +515,58 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
       edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 7, "not a valid PE file");
       return;
     }
-    char sha[65];
-    edr_sha256_hex(buf, (size_t)fsize, sha);
-    char result[1024];
-    snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld %s", sha, fsize, pe_info);
-    free(buf);
-    g_cmd_handled++; g_cmd_exec_ok++;
-    edr_command_audit_both(cmd_id, "rtr_get: PE验证通过");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    char tmp_path[1024];
+    response_get_tmp_path(cmd_id, tmp_path, sizeof(tmp_path));
+    FILE *tf = fopen(tmp_path, "wb");
+    if (tf) {
+      fwrite(buf, 1, (size_t)fsize, tf);
+      fclose(tf);
+      char minio_key[256] = {0};
+      edr_ingest_http_upload_file_multipart(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
+      remove(tmp_path);
+      char result[1280];
+      snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld minio_key=%s %s",
+               sha, fsize, minio_key[0] ? minio_key : "", pe_info);
+      free(buf);
+      g_cmd_handled++; g_cmd_exec_ok++;
+      edr_command_audit_both(cmd_id, "rtr_get: PE验证通过+上传");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    } else {
+      free(buf);
+      char result[1024];
+      snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld (upload failed) %s", sha, fsize, pe_info);
+      g_cmd_handled++; g_cmd_exec_ok++;
+      edr_command_audit_both(cmd_id, "rtr_get: PE验证通过, 上传失败");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    }
     return;
   }
-  char sha[65];
-  edr_sha256_hex(buf, (size_t)fsize, sha);
-  char result[512];
-  snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld", sha, fsize);
-  free(buf);
-  g_cmd_handled++; g_cmd_exec_ok++;
-  edr_command_audit_both(cmd_id, "rtr_get: 文件读取成功");
-  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+
+  char tmp_path[1024];
+  response_get_tmp_path(cmd_id, tmp_path, sizeof(tmp_path));
+  FILE *tf = fopen(tmp_path, "wb");
+  if (tf) {
+    fwrite(buf, 1, (size_t)fsize, tf);
+    fclose(tf);
+    char minio_key[256] = {0};
+    edr_ingest_http_upload_file_multipart(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
+    remove(tmp_path);
+    char result[768];
+    snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld minio_key=%s",
+             sha, fsize, minio_key[0] ? minio_key : "");
+    free(buf);
+    g_cmd_handled++; g_cmd_exec_ok++;
+    edr_command_audit_both(cmd_id, "rtr_get: 文件读取+上传成功");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+  } else {
+    char result[512];
+    snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld (upload to backend failed, tmp write error)",
+             sha, fsize);
+    free(buf);
+    g_cmd_handled++; g_cmd_exec_ok++;
+    edr_command_audit_both(cmd_id, "rtr_get: 文件读取成功, tmp写入失败");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+  }
 }
 
 void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -502,16 +584,77 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
     return;
   }
-  FILE *f = fopen(path, "ab");
-  if (!f) {
-    g_cmd_exec_fail++;
-    edr_command_audit_both(cmd_id, "rtr_put: 无法创建文件");
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create file");
+  char data_b64[512 * 1024];
+  (void)edr_parse_json_string(pl, len, "data_b64", data_b64, sizeof(data_b64));
+  if (!data_b64[0]) {
+    FILE *f = fopen(path, "ab");
+    if (!f) {
+      g_cmd_exec_fail++;
+      edr_command_audit_both(cmd_id, "rtr_put: 无法创建文件");
+      edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create file");
+      return;
+    }
+    fclose(f);
+    char action[80];
+    snprintf(action, sizeof(action), "PUT_OK (empty) %s", path);
+    g_cmd_handled++; g_cmd_exec_ok++;
+    edr_command_audit_both(cmd_id, "rtr_put: ok (empty file)");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, action);
     return;
   }
-  char action[80];
-  snprintf(action, sizeof(action), "PUT_OK %s", path);
+  size_t b64_len = strlen(data_b64);
+  size_t dec_cap = (b64_len / 4 * 3) + 16;
+  uint8_t *dec = (uint8_t *)malloc(dec_cap);
+  if (!dec) {
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "rtr_put: oom");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "oom");
+    return;
+  }
+  int dlen = response_b64_decode(data_b64, b64_len, dec, dec_cap);
+  if (dlen <= 0) {
+    free(dec);
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "rtr_put: base64 decode failed");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "base64 decode failed");
+    return;
+  }
+  {
+    char dir_copy[520];
+    snprintf(dir_copy, sizeof(dir_copy), "%s", path);
+#ifdef _WIN32
+    char *slash = strrchr(dir_copy, '\\');
+#else
+    char *slash = strrchr(dir_copy, '/');
+#endif
+    if (slash) { *slash = '\0'; response_mkdir_p(dir_copy); }
+  }
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    free(dec);
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "rtr_put: 无法创建文件");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, "cannot create file");
+    return;
+  }
+  size_t written = fwrite(dec, 1, (size_t)dlen, f);
   fclose(f);
+  char sha[65] = {0};
+  if (written > 0) edr_sha256_hex(dec, written, sha);
+  free(dec);
+  char expected_sha[65] = {0};
+  (void)edr_parse_json_string(pl, len, "sha256", expected_sha, sizeof(expected_sha));
+  if (expected_sha[0] && sha[0] && strcmp(expected_sha, sha) != 0) {
+    remove(path);
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "rtr_put: sha256 mismatch");
+    char msg[300];
+    snprintf(msg, sizeof(msg), "SHA256_MISMATCH expected=%s actual=%s", expected_sha, sha);
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, msg);
+    return;
+  }
+  char action[200];
+  snprintf(action, sizeof(action), "PUT_OK %s size=%d sha256=%s", path, dlen, sha);
   g_cmd_handled++; g_cmd_exec_ok++;
   edr_command_audit_both(cmd_id, "rtr_put: ok");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, action);

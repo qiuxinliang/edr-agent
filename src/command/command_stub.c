@@ -326,6 +326,21 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
 
+  if (edr_command_streq(t, "eventlog_view")) {
+    edr_response_eventlog_view(id, payload, payload_len, sm);
+    return;
+  }
+
+  if (edr_command_streq(t, "reg_query")) {
+    edr_response_reg_query(id, payload, payload_len, sm);
+    return;
+  }
+
+  if (edr_command_streq(t, "rtq_execute")) {
+    edr_response_rtq_execute(id, payload, payload_len, sm);
+    return;
+  }
+
   fprintf(stderr, "[command] 未知类型 id=%s type=%s\n", id, t);
   s_unknown++;
   edr_command_soar_emit(id, sm, EdrCmdExecUnknownType, 1, "unknown command_type");
