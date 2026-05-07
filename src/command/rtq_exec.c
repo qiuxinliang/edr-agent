@@ -148,7 +148,7 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
     int count = 0;
     if (Process32FirstW(h, &pe)) {
         do {
-            char name[260] = {0}, cmdline[4096] = {0};
+            char name[260] = {0};
             WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, name, sizeof(name), NULL, NULL);
 
             int ok = 1;
