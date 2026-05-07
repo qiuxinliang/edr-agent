@@ -1,6 +1,7 @@
 package realtime
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,14 +49,21 @@ func TestBroadcastShellOutput_ConnectedClientReceives(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	got := string(msg)
-	if !strings.Contains(got, `"type":"shell:output"`) {
-		t.Fatalf("expected shell:output, got %s", got)
+	var out map[string]interface{}
+	if err := json.Unmarshal(msg, &out); err != nil {
+		t.Fatalf("unmarshal: %v, raw=%s", err, string(msg))
 	}
-	if !strings.Contains(got, `"endpoint_id":"ep-1"`) {
-		t.Fatalf("expected endpoint_id=ep-1, got %s", got)
+
+	if tp, _ := out["type"].(string); tp != "shell:output" {
+		t.Fatalf("expected type=shell:output, got type=%v", out["type"])
 	}
-	if !strings.Contains(got, `C:\\Users>`) {
-		t.Fatalf("expected output, got %s", got)
+	if eid, _ := out["endpoint_id"].(string); eid != "ep-1" {
+		t.Fatalf("expected endpoint_id=ep-1, got %v", out["endpoint_id"])
+	}
+	if op, _ := out["output"].(string); !strings.Contains(op, "C:\\Users") {
+		t.Fatalf("expected output containing C:\\Users, got %v", out["output"])
+	}
+	if st, _ := out["is_stderr"].(bool); st != false {
+		t.Fatalf("expected is_stderr=false, got %v", out["is_stderr"])
 	}
 }

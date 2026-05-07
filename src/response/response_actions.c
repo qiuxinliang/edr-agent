@@ -1095,8 +1095,13 @@ void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
     return;
   }
 
-  char shell_type[64] = "cmd.exe";
-  if (pl && len > 0 && len < 64) {
+  char shell_type[64];
+#ifdef _WIN32
+  strcpy(shell_type, "cmd.exe");
+#else
+  strcpy(shell_type, "/bin/sh");
+#endif
+  if (pl && len > 0 && len < 64 && pl[0] != '{') {
     (void)memcpy(shell_type, pl, len);
     shell_type[len] = '\0';
   }
