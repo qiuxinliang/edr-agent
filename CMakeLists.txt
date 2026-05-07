@@ -270,6 +270,9 @@ set(EDR_AGENT_SOURCES
   src/command/sha256.c
   src/command/shell_exec.c
   src/command/pe_verify.c
+  src/command/eventlog.c
+  src/command/registry.c
+  src/command/rtq_exec.c
   src/response/response_actions.c
   src/forensic/process_tree_cache.c
   src/forensic/forensic_trigger.c
