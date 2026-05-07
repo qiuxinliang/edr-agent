@@ -1053,14 +1053,14 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
   snprintf(out, sizeof(out), "TARGETED_OK items=%d", count);
   g_cmd_handled++; g_cmd_exec_ok++;
   edr_command_audit_both(cmd_id, "targeted_forensic: ok");
-  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, out);
+  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, out);
 }
 
 void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
     g_cmd_rejected++;
     edr_command_audit_both(cmd_id, "reject memory_dump: policy");
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   int pid = -1, full = 0;
@@ -1068,14 +1068,14 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   (void)edr_parse_json_int(pl, len, "full", &full);
   if (pid <= 0) {
     g_cmd_exec_fail++;
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid");
     return;
   }
 #ifdef _WIN32
   HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)pid);
   if (!h) {
     g_cmd_exec_fail++;
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "OpenProcess failed");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "OpenProcess failed");
     return;
   }
   char dmpPath[512];
@@ -1083,7 +1083,7 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   HANDLE hFile = CreateFileA(dmpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (hFile == INVALID_HANDLE_VALUE) {
     CloseHandle(h);
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "CreateFile failed");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 4, "CreateFile failed");
     return;
   }
   MINIDUMP_TYPE dumpType = full ? MiniDumpWithFullMemory : MiniDumpNormal;
@@ -1092,26 +1092,26 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   CloseHandle(h);
   if (!ok) {
     g_cmd_exec_fail++;
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "MiniDumpWriteDump failed");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 5, "MiniDumpWriteDump failed");
     return;
   }
   char result[512];
   snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s", pid, dmpPath);
   g_cmd_handled++; g_cmd_exec_ok++;
-  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 #else
   char procPath[128];
   snprintf(procPath, sizeof(procPath), "/proc/%d/mem", pid);
   FILE *src = fopen(procPath, "rb");
   if (!src) {
     g_cmd_exec_fail++;
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "/proc/pid/mem open failed");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "/proc/pid/mem open failed");
     return;
   }
   char dmpPath[512];
   snprintf(dmpPath, sizeof(dmpPath), "/tmp/memdump_%d_%lld.dmp", pid, (long long)time(NULL));
   FILE *dst = fopen(dmpPath, "wb");
-  if (!dst) { fclose(src); edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "output create failed"); return; }
+  if (!dst) { fclose(src); edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 4, "output create failed"); return; }
   char buf[65536];
   size_t total = 0;
   const size_t maxMem = 256ULL * 1024 * 1024;
@@ -1125,7 +1125,7 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   char result[512];
   snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s", pid, total, dmpPath);
   g_cmd_handled++; g_cmd_exec_ok++;
-  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 #endif
 }
 
@@ -1144,14 +1144,14 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   if (!edr_command_dangerous_enabled()) {
     g_cmd_rejected++;
     edr_command_audit_both(cmd_id, "reject yara_scan: policy");
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   char target_path[520];
   (void)edr_parse_json_string(pl, len, "target_path", target_path, sizeof(target_path));
   if (!target_path[0]) {
     g_cmd_exec_fail++;
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing target_path");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "missing target_path");
     return;
   }
   FILE *f = fopen(target_path, "rb");
@@ -1160,7 +1160,7 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   }
   if (!f) {
     g_cmd_exec_fail++;
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
     return;
   }
   fseek(f, 0, SEEK_END);
@@ -1168,11 +1168,11 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   fseek(f, 0, SEEK_SET);
   if (fsz <= 0 || fsz > 50 * 1024 * 1024) {
     fclose(f);
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "file too large (>50MB)");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 4, "file too large (>50MB)");
     return;
   }
   uint8_t *buf = (uint8_t *)malloc((size_t)fsz);
-  if (!buf) { fclose(f); edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "oom"); return; }
+  if (!buf) { fclose(f); edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 5, "oom"); return; }
   fread(buf, 1, (size_t)fsz, f);
   fclose(f);
 
@@ -1205,7 +1205,7 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   }
   g_cmd_handled++; g_cmd_exec_ok++;
   edr_command_audit_both(cmd_id, "yara_scan: ok");
-  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, result);
+  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 }
 
 void edr_shell_stream_output_cb(const char *sid, const char *data, size_t len,
