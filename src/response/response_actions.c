@@ -1124,26 +1124,43 @@ void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
 
 void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm) {
-  if (pl && len > 0) {
-    int rc = edr_shell_session_input(cmd_id, (const char *)pl, len);
+  char session_id[EDR_SS_ID_LEN];
+  char input[4096];
+  (void)edr_parse_json_string(pl, len, "session_id", session_id, sizeof(session_id));
+  (void)edr_parse_json_string(pl, len, "input", input, sizeof(input));
+
+  if (session_id[0] && input[0]) {
+    int rc = edr_shell_session_input(session_id, input, strlen(input));
     if (rc != 0) {
       g_cmd_exec_fail++;
       edr_command_audit_both(cmd_id, "shell_input: write failed");
       edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, rc, "shell_input write failed");
       return;
     }
+  } else {
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "shell_input: missing session_id or input");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 1, "missing session_id or input");
+    return;
   }
 
-  char detail[64];
-  snprintf(detail, sizeof(detail), "shell_input sent %zu bytes", len);
+  char detail[128];
+  snprintf(detail, sizeof(detail), "shell_input sent %zu bytes to session %s",
+           strlen(input), session_id);
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
 void edr_response_shell_close(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm) {
-  (void)pl;
-  (void)len;
-  edr_shell_session_close(cmd_id);
+  char session_id[EDR_SS_ID_LEN];
+  (void)edr_parse_json_string(pl, len, "session_id", session_id, sizeof(session_id));
+  if (!session_id[0]) {
+    g_cmd_exec_fail++;
+    edr_command_audit_both(cmd_id, "shell_close: missing session_id");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 1, "missing session_id");
+    return;
+  }
+  edr_shell_session_close(session_id);
   g_cmd_handled++;
   g_cmd_exec_ok++;
   edr_command_audit_both(cmd_id, "shell_close: ok");
