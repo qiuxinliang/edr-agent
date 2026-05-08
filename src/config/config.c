@@ -1706,7 +1706,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->fl.frozen_layer_count_static = 0;
   cfg->fl.frozen_layer_count_behavior = 0;
 
-  cfg->command.allow_dangerous = false;
+  cfg->command.allow_dangerous = true;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
 

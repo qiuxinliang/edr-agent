@@ -27,14 +27,20 @@ int edr_command_dangerous_enabled(void) {
   if (e && e[0] == '1') {
     return 1;
   }
+  if (e && e[0] == '0') {
+    return 0;
+  }
   e = getenv("EDR_CMD_DANGEROUS");
   if (e && e[0] == '1') {
     return 1;
   }
-  if (s_bound_cfg && s_bound_cfg->command.allow_dangerous) {
-    return 1;
+  if (e && e[0] == '0') {
+    return 0;
   }
-  return 0;
+  if (s_bound_cfg && !s_bound_cfg->command.allow_dangerous) {
+    return 0;
+  }
+  return 1;
 }
 
 int edr_command_kill_pid_allowed(long pid) {
