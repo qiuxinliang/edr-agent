@@ -379,12 +379,6 @@ static void take_string(toml_datum_t d, char *dst, size_t cap) {
   }
 }
 
-static void take_int(toml_datum_t d, int *dst) {
-  if (d.ok) {
-    *dst = (int)d.u.i;
-  }
-}
-
 static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "address"), cfg->server.address, sizeof(cfg->server.address));
   take_string(toml_string_in(t, "ca_cert"), cfg->server.ca_cert, sizeof(cfg->server.ca_cert));
@@ -1872,19 +1866,6 @@ static void load_shell(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "max_output_per_command_kb");
     if (d.ok && d.u.i >= 64 && d.u.i <= 4096) { cfg->shell.max_output_per_command_kb = (uint32_t)d.u.i; }
   }
-}
-
-static void load_command(toml_table_t *t, EdrConfig *cfg) {
-  toml_datum_t d = toml_bool_in(t, "allow_dangerous");
-  if (d.ok) {
-    cfg->command.allow_dangerous = d.u.b ? true : false;
-  }
-}
-
-static void load_shell(toml_table_t *t, EdrConfig *cfg) {
-  take_int(toml_int_in(t, "max_sessions"), &cfg->shell.max_sessions);
-  take_int(toml_int_in(t, "session_timeout_s"), &cfg->shell.session_timeout_s);
-  take_int(toml_int_in(t, "max_output_per_command_kb"), &cfg->shell.max_output_per_command_kb);
 
   toml_array_t *allow = toml_array_in(t, "allow");
   if (allow) {
@@ -1916,6 +1897,13 @@ static void load_shell(toml_table_t *t, EdrConfig *cfg) {
         }
       }
     }
+  }
+}
+
+static void load_command(toml_table_t *t, EdrConfig *cfg) {
+  toml_datum_t d = toml_bool_in(t, "allow_dangerous");
+  if (d.ok) {
+    cfg->command.allow_dangerous = d.u.b ? true : false;
   }
 }
 
