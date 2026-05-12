@@ -1,10 +1,10 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r218-9ae52519",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r239-97acafca",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 132,
+  "rule_count": 150,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -17,13 +17,13 @@
       ],
       "description": "powershell/pwsh 命令行包含 -enc/-encodedcommand/frombase64string",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)\\-(enc|encodedcommand)\\b",
           "(?i)frombase64string"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -39,13 +39,13 @@
       ],
       "description": "PowerShell 使用隐藏窗口并禁用 profile",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_all": [
           "(?i)\\-(w|windowstyle)\\s+hidden",
           "(?i)\\-(nop|noprofile)\\b"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -120,12 +120,12 @@
       ],
       "description": "regsvr32 使用 /i:http(s)/ftp 或 UNC 路径",
       "condition": {
-        "process_name_in": [
-          "regsvr32.exe"
-        ],
         "command_regex_any": [
           "(?i)\\s[/-]i:(https?|ftp)://",
           "(?i)\\s[/-]i:\\\\\\\\"
+        ],
+        "process_name_in": [
+          "regsvr32.exe"
         ]
       }
     },
@@ -140,14 +140,14 @@
       ],
       "description": "rundll32 命令行出现 javascript/vbscript/http(s)/ftp",
       "condition": {
-        "process_name_in": [
-          "rundll32.exe"
-        ],
         "command_regex_any": [
           "(?i)javascript:",
           "(?i)vbscript:",
           "(?i)(https?|ftp)://",
           "(?i)mshtml,runhtmlapplication"
+        ],
+        "process_name_in": [
+          "rundll32.exe"
         ]
       }
     },
@@ -162,12 +162,12 @@
       ],
       "description": "certutil 使用 -urlcache/-verifyctl 并下载 URL",
       "condition": {
-        "process_name_in": [
-          "certutil.exe"
-        ],
         "command_regex_all": [
           "(?i)\\-(urlcache|verifyctl)",
           "(?i)\\-f\\s+(https?|ftp)://"
+        ],
+        "process_name_in": [
+          "certutil.exe"
         ]
       }
     },
@@ -182,13 +182,13 @@
       ],
       "description": "mshta 加载远程脚本或 javascript/vbscript",
       "condition": {
-        "process_name_in": [
-          "mshta.exe"
-        ],
         "command_regex_any": [
           "(?i)javascript:",
           "(?i)vbscript",
           "(?i)(https?|ftp)://"
+        ],
+        "process_name_in": [
+          "mshta.exe"
         ]
       }
     },
@@ -203,12 +203,12 @@
       ],
       "description": "wmic /node + process call create",
       "condition": {
-        "process_name_in": [
-          "wmic.exe"
-        ],
         "command_regex_all": [
           "(?i)(/node:|\\-node:)",
           "(?i)process\\s+call\\s+create"
+        ],
+        "process_name_in": [
+          "wmic.exe"
         ]
       }
     },
@@ -263,9 +263,6 @@
       ],
       "description": "schtasks /create 且目标含脚本解释器或 URL",
       "condition": {
-        "process_name_in": [
-          "schtasks.exe"
-        ],
         "command_regex_all": [
           "(?i)\\s/create\\s"
         ],
@@ -273,6 +270,9 @@
           "(?i)powershell|pwsh|cmd|wscript|cscript|rundll32|regsvr32",
           "(?i)(https?|ftp)://",
           "(?i)\\\\temp\\\\"
+        ],
+        "process_name_in": [
+          "schtasks.exe"
         ]
       }
     },
@@ -307,11 +307,11 @@
       ],
       "description": "appinit_dlls 被修改",
       "condition": {
-        "registry_value_name_in": [
-          "appinit_dlls"
-        ],
         "registry_path_regex_any": [
           "(?i)\\\\windows nt\\\\currentversion\\\\windows"
+        ],
+        "registry_value_name_in": [
+          "appinit_dlls"
         ]
       }
     },
@@ -345,12 +345,12 @@
         "registry_path_regex_any": [
           "(?i)\\\\windows\\\\currentversion\\\\policies\\\\system"
         ],
-        "registry_value_name_in": [
-          "enablelua"
-        ],
         "registry_value_data_in": [
           "0",
           "0x00000000"
+        ],
+        "registry_value_name_in": [
+          "enablelua"
         ]
       }
     },
@@ -365,12 +365,12 @@
       ],
       "description": "DisableRegistryTools 被设置为 1",
       "condition": {
-        "registry_value_name_in": [
-          "disableregistrytools"
-        ],
         "registry_value_data_in": [
           "1",
           "0x00000001"
+        ],
+        "registry_value_name_in": [
+          "disableregistrytools"
         ]
       }
     },
@@ -385,12 +385,12 @@
       ],
       "description": "DisableTaskMgr 被设置为 1",
       "condition": {
-        "registry_value_name_in": [
-          "disabletaskmgr"
-        ],
         "registry_value_data_in": [
           "1",
           "0x00000001"
+        ],
+        "registry_value_name_in": [
+          "disabletaskmgr"
         ]
       }
     },
@@ -429,13 +429,13 @@
       ],
       "description": "reg save hklm\\sam/system/security",
       "condition": {
-        "process_name_in": [
-          "reg.exe"
-        ],
         "command_regex_any": [
           "(?i)save\\s+hklm\\\\sam",
           "(?i)save\\s+hklm\\\\system",
           "(?i)save\\s+hklm\\\\security"
+        ],
+        "process_name_in": [
+          "reg.exe"
         ]
       }
     },
@@ -551,14 +551,14 @@
       ],
       "description": "w3wp/httpd/nginx/php-cgi 写入 php/jsp/asp/aspx/war 等",
       "condition": {
+        "file_path_regex_any": [
+          "(?i)\\.(php|phtml|jsp|jspx|asp|aspx|ashx|asmx|war)$"
+        ],
         "process_name_regex_any": [
           "(?i)w3wp\\.exe$",
           "(?i)httpd\\.exe$",
           "(?i)nginx\\.exe$",
           "(?i)php\\-cgi\\.exe$"
-        ],
-        "file_path_regex_any": [
-          "(?i)\\.(php|phtml|jsp|jspx|asp|aspx|ashx|asmx|war)$"
         ]
       }
     },
@@ -603,17 +603,17 @@
       ],
       "description": "vssadmin/wbadmin/bcdedit/wevtutil 删除恢复或日志",
       "condition": {
-        "process_name_in": [
-          "vssadmin.exe",
-          "wbadmin.exe",
-          "bcdedit.exe",
-          "wevtutil.exe"
-        ],
         "command_regex_any": [
           "(?i)delete\\s+shadows",
           "(?i)shadowcopy\\s+delete",
           "(?i)recoveryenabled\\s+no",
           "(?i)clear\\-log"
+        ],
+        "process_name_in": [
+          "vssadmin.exe",
+          "wbadmin.exe",
+          "bcdedit.exe",
+          "wevtutil.exe"
         ]
       }
     },
@@ -646,9 +646,9 @@
       "mitre_ttps": [
         "T1059"
       ],
-      "description": "父链深度异常（>20）",
+      "description": "父链深度异常（>80，系统进程自动钳制至≤10）",
       "condition": {
-        "process_chain_depth_gt": 20
+        "process_chain_depth_gt": 80
       }
     },
     {
@@ -662,11 +662,11 @@
       ],
       "description": "AnyDesk/TeamViewer/RustDesk/ScreenConnect/Splashtop 等远程管理工具以静默参数安装",
       "condition": {
-        "command_regex_any": [
-          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
-        ],
         "command_regex_all": [
           "(?i)(/silent|--silent|/verysilent|/quiet|/qn|--install)"
+        ],
+        "command_regex_any": [
+          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
         ]
       }
     },
@@ -681,11 +681,11 @@
       ],
       "description": "远程管理工具命令行包含 unattended/password/assignment 等高风险参数",
       "condition": {
-        "command_regex_any": [
-          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
-        ],
         "command_regex_all": [
           "(?i)(unattended|set\\-password|--password|assignment|grant\\-easy\\-access)"
+        ],
+        "command_regex_any": [
+          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
         ]
       }
     },
@@ -701,6 +701,9 @@
       ],
       "description": "Office/脚本宿主/命令解释器作为父进程启动远程管理工具",
       "condition": {
+        "command_regex_any": [
+          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
+        ],
         "parent_name_in": [
           "winword.exe",
           "excel.exe",
@@ -710,9 +713,6 @@
           "powershell.exe",
           "pwsh.exe",
           "cmd.exe"
-        ],
-        "command_regex_any": [
-          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
         ]
       }
     },
@@ -745,12 +745,12 @@
       ],
       "description": "msiexec 使用 http(s) 远程 MSI 或静默安装参数",
       "condition": {
-        "process_name_in": [
-          "msiexec.exe"
-        ],
         "command_regex_any": [
           "(?i)(https?|ftp)://",
           "(?i)\\s(/[iq]|/quiet|/qn)\\b"
+        ],
+        "process_name_in": [
+          "msiexec.exe"
         ]
       }
     },
@@ -765,16 +765,16 @@
       ],
       "description": "cmstp 执行远程或临时目录 INF，并带静默参数",
       "condition": {
-        "process_name_in": [
-          "cmstp.exe"
+        "command_regex_all": [
+          "(?i)\\s(/[squ]|/s)\\b"
         ],
         "command_regex_any": [
           "(?i)\\.(inf)\\b",
           "(?i)(https?|ftp)://",
           "(?i)\\\\temp\\\\|\\\\appdata\\\\"
         ],
-        "command_regex_all": [
-          "(?i)\\s(/[squ]|/s)\\b"
+        "process_name_in": [
+          "cmstp.exe"
         ]
       }
     },
@@ -789,11 +789,11 @@
       ],
       "description": "msxsl 参数包含远程 XML/XSL 来源",
       "condition": {
-        "process_name_in": [
-          "msxsl.exe"
-        ],
         "command_regex_any": [
           "(?i)(https?|ftp)://"
+        ],
+        "process_name_in": [
+          "msxsl.exe"
         ]
       }
     },
@@ -808,9 +808,6 @@
       ],
       "description": "sc create 指向 Temp/AppData/Public 等可疑路径的服务二进制",
       "condition": {
-        "process_name_in": [
-          "sc.exe"
-        ],
         "command_regex_all": [
           "(?i)\\screate\\s",
           "(?i)binpath\\s*=\\s*"
@@ -819,6 +816,9 @@
           "(?i)\\\\temp\\\\",
           "(?i)\\\\users\\\\public\\\\",
           "(?i)\\\\appdata\\\\"
+        ],
+        "process_name_in": [
+          "sc.exe"
         ]
       }
     },
@@ -849,9 +849,6 @@
       ],
       "description": "netsh advfirewall 添加 allow/inbound 规则，疑似放行后门通道",
       "condition": {
-        "process_name_in": [
-          "netsh.exe"
-        ],
         "command_regex_all": [
           "(?i)advfirewall",
           "(?i)add\\s+rule"
@@ -859,6 +856,9 @@
         "command_regex_any": [
           "(?i)\\baction\\s*=\\s*allow\\b",
           "(?i)\\bdir\\s*=\\s*in\\b"
+        ],
+        "process_name_in": [
+          "netsh.exe"
         ]
       }
     },
@@ -893,14 +893,14 @@
       ],
       "description": "bitsadmin 创建/添加下载任务并指向 URL",
       "condition": {
-        "process_name_in": [
-          "bitsadmin.exe"
-        ],
         "command_regex_all": [
           "(?i)(/transfer|/create|/addfile)"
         ],
         "command_regex_any": [
           "(?i)(https?|ftp)://"
+        ],
+        "process_name_in": [
+          "bitsadmin.exe"
         ]
       }
     },
@@ -915,9 +915,6 @@
       ],
       "description": "wmic 在 root\\subscription 下创建 EventFilter/Consumer/Binding",
       "condition": {
-        "process_name_in": [
-          "wmic.exe"
-        ],
         "command_regex_all": [
           "(?i)root\\\\subscription"
         ],
@@ -925,6 +922,9 @@
           "(?i)__eventfilter",
           "(?i)commandlineeventconsumer",
           "(?i)__filtertoconsumerbinding"
+        ],
+        "process_name_in": [
+          "wmic.exe"
         ]
       }
     },
@@ -939,12 +939,12 @@
       ],
       "description": "wevtutil cl/clear-log 清理日志",
       "condition": {
-        "process_name_in": [
-          "wevtutil.exe"
-        ],
         "command_regex_any": [
           "(?i)\\scl\\s",
           "(?i)clear\\-log"
+        ],
+        "process_name_in": [
+          "wevtutil.exe"
         ]
       }
     },
@@ -959,14 +959,14 @@
       ],
       "description": "sc stop/config 禁用 Defender/EDR/防火墙相关服务",
       "condition": {
-        "process_name_in": [
-          "sc.exe"
+        "command_regex_all": [
+          "(?i)(windefend|sense|mpssvc|wscsvc|securityhealthservice)"
         ],
         "command_regex_any": [
           "(?i)\\s(stop|config)\\s"
         ],
-        "command_regex_all": [
-          "(?i)(windefend|sense|mpssvc|wscsvc|securityhealthservice)"
+        "process_name_in": [
+          "sc.exe"
         ]
       }
     },
@@ -982,13 +982,13 @@
       ],
       "description": "PowerShell 命令行包含 iwr/irm/downloadstring + URL",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_all": [
           "(?i)(invoke\\-webrequest|iwr|invoke\\-restmethod|irm|downloadstring)",
           "(?i)(https?|ftp)://"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1003,13 +1003,13 @@
       ],
       "description": "cmdkey 列举/写入凭据",
       "condition": {
-        "process_name_in": [
-          "cmdkey.exe"
-        ],
         "command_regex_any": [
           "(?i)/list",
           "(?i)/add:",
           "(?i)/user:"
+        ],
+        "process_name_in": [
+          "cmdkey.exe"
         ]
       }
     },
@@ -1024,13 +1024,13 @@
       ],
       "description": "net view/use 枚举远程共享或连接管理共享",
       "condition": {
-        "process_name_in": [
-          "net.exe",
-          "net1.exe"
-        ],
         "command_regex_any": [
           "(?i)\\sview\\s+\\\\",
           "(?i)\\suse\\s+\\\\[^\\\\]+\\\\(admin\\$|c\\$|ipc\\$)"
+        ],
+        "process_name_in": [
+          "net.exe",
+          "net1.exe"
         ]
       }
     },
@@ -1047,17 +1047,17 @@
       ],
       "description": "whoami/systeminfo/tasklist/hostname/ipconfig 高频发现命令",
       "condition": {
-        "process_name_in": [
-          "cmd.exe",
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)\\bwhoami\\b",
           "(?i)\\bsysteminfo\\b",
           "(?i)\\btasklist\\b",
           "(?i)\\bhostname\\b",
           "(?i)\\bipconfig\\b"
+        ],
+        "process_name_in": [
+          "cmd.exe",
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1073,15 +1073,15 @@
       ],
       "description": "命令行含 Invoke-Expression/IEX 或 Assembly::Load/LoadFrom 等内存加载特征",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)invoke-expression",
           "(?i)\\biex\\b",
           "(?i)\\[reflection\\.assembly\\]::load",
           "(?i)::loadfrom\\b"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1097,12 +1097,12 @@
       ],
       "description": "regsvr32 加载 scrobj 或 .sct 脚本组件",
       "condition": {
-        "process_name_in": [
-          "regsvr32.exe"
-        ],
         "command_regex_any": [
           "(?i)scrobj",
           "(?i)\\.sct"
+        ],
+        "process_name_in": [
+          "regsvr32.exe"
         ]
       }
     },
@@ -1118,15 +1118,15 @@
       ],
       "description": "InstallUtil/RegAsm/MSBuild 命令行含 URL 或典型辅助安装参数",
       "condition": {
-        "process_name_in": [
-          "installutil.exe",
-          "regasm.exe",
-          "msbuild.exe"
-        ],
         "command_regex_any": [
           "(?i)(https?|ftp)://",
           "(?i)/log",
           "(?i)/(u|uninstall)\\b"
+        ],
+        "process_name_in": [
+          "installutil.exe",
+          "regasm.exe",
+          "msbuild.exe"
         ]
       }
     },
@@ -1142,13 +1142,13 @@
       ],
       "description": "wscript/cscript 使用 .sct 或 //e:jscript|vbscript",
       "condition": {
-        "process_name_in": [
-          "wscript.exe",
-          "cscript.exe"
-        ],
         "command_regex_any": [
           "(?i)\\.sct\\b",
           "(?i)//e:(j|vb)script"
+        ],
+        "process_name_in": [
+          "wscript.exe",
+          "cscript.exe"
         ]
       }
     },
@@ -1164,9 +1164,6 @@
       ],
       "description": "forfiles /c 调用 cmd 或 PowerShell",
       "condition": {
-        "process_name_in": [
-          "forfiles.exe"
-        ],
         "command_regex_all": [
           "(?i)/c\\s"
         ],
@@ -1174,6 +1171,9 @@
           "(?i)cmd(\\.exe)?\\b",
           "(?i)powershell",
           "(?i)pwsh"
+        ],
+        "process_name_in": [
+          "forfiles.exe"
         ]
       }
     },
@@ -1188,12 +1188,12 @@
       ],
       "description": "odbcconf 使用 regsvr 装载 DLL 的无文件执行链",
       "condition": {
-        "process_name_in": [
-          "odbcconf.exe"
-        ],
         "command_regex_any": [
           "(?i)regsvr",
           "(?i)\\.dll"
+        ],
+        "process_name_in": [
+          "odbcconf.exe"
         ]
       }
     },
@@ -1208,15 +1208,15 @@
       ],
       "description": "仅匹配显式 TXT 查询：nslookup /querytype、PowerShell Resolve-DnsName -Type Txt；与超长标签规则拆分以降低误报分级",
       "condition": {
-        "process_name_in": [
-          "nslookup.exe",
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)-type\\s*=\\s*txt",
           "(?i)/querytype\\s*=\\s*txt",
           "(?i)Resolve-DnsName[^\\n]{0,200}-Type[^\\n]{0,40}Txt"
+        ],
+        "process_name_in": [
+          "nslookup.exe",
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1231,13 +1231,13 @@
       ],
       "description": "nslookup/pwsh 命令行出现极长子域标签（≥48 字符标签），常与 DNS 隧道编码负载相关；易有 FP，建议与高置信告警或降噪策略联用",
       "condition": {
+        "command_regex_any": [
+          "(?i)\\s[a-z0-9][a-z0-9-]{48,}\\.[a-z0-9.-]+\\s"
+        ],
         "process_name_in": [
           "nslookup.exe",
           "powershell.exe",
           "pwsh.exe"
-        ],
-        "command_regex_any": [
-          "(?i)\\s[a-z0-9][a-z0-9-]{48,}\\.[a-z0-9.-]+\\s"
         ]
       }
     },
@@ -1377,6 +1377,11 @@
       ],
       "description": "rar/7z/winrar 对 Users/Documents/Desktop 等路径打包，或 PowerShell Compress-Archive",
       "condition": {
+        "command_regex_any": [
+          "(?i)\\\\(Users|Documents and Settings)\\\\[^\\\\\\s\"]+\\\\(Documents|Desktop|Downloads)",
+          "(?i)Compress-Archive",
+          "(?i)\\s[ae]\\s+[^\\n]{0,240}\\\\Users\\\\"
+        ],
         "process_name_in": [
           "rar.exe",
           "winrar.exe",
@@ -1384,11 +1389,6 @@
           "7za.exe",
           "powershell.exe",
           "pwsh.exe"
-        ],
-        "command_regex_any": [
-          "(?i)\\\\(Users|Documents and Settings)\\\\[^\\\\\\s\"]+\\\\(Documents|Desktop|Downloads)",
-          "(?i)Compress-Archive",
-          "(?i)\\s[ae]\\s+[^\\n]{0,240}\\\\Users\\\\"
         ]
       }
     },
@@ -1404,6 +1404,11 @@
       ],
       "description": "curl/wget/scp/sftp 将本地文件推送到远程；常与 C2/备用协议外传重叠",
       "condition": {
+        "command_regex_any": [
+          "(?i)(https?|ftp)://[^\\s]+\\s+(-T|--upload-file|-d\\s+@|--data-binary\\s+@)",
+          "(?i)scp\\s+[^\\s]+\\s+\\S+@\\S+:",
+          "(?i)sftp\\s+\\S+@\\S+"
+        ],
         "process_name_in": [
           "curl.exe",
           "wget.exe",
@@ -1411,11 +1416,6 @@
           "sftp.exe",
           "pscp.exe",
           "plink.exe"
-        ],
-        "command_regex_any": [
-          "(?i)(https?|ftp)://[^\\s]+\\s+(-T|--upload-file|-d\\s+@|--data-binary\\s+@)",
-          "(?i)scp\\s+[^\\s]+\\s+\\S+@\\S+:",
-          "(?i)sftp\\s+\\S+@\\S+"
         ]
       }
     },
@@ -1452,14 +1452,14 @@
       ],
       "description": "PowerShell 读取剪贴板并写入变量或文件",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)Get-Clipboard",
           "(?i)\\[Windows\\.Forms\\.Clipboard\\]::GetText",
           "(?i)System\\.Windows\\.Forms\\.Clipboard"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1474,14 +1474,14 @@
       ],
       "description": "PowerShell 中 GetAsyncKeyState、键盘钩子相关 API",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)GetAsyncKeyState",
           "(?i)SetWindowsHookEx",
           "(?i)WH_KEYBOARD(_LL)?"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1496,9 +1496,8 @@
       ],
       "description": "rundll32/regsvr32 从 Users/Temp/AppData/ProgramData 等路径加载 DLL，常见于侧载与非法模块执行",
       "condition": {
-        "process_name_in": [
-          "rundll32.exe",
-          "regsvr32.exe"
+        "command_regex_all": [
+          "(?i)\\.(dll|ocx)\\b"
         ],
         "command_regex_any": [
           "(?i)\\\\Users\\\\",
@@ -1507,8 +1506,9 @@
           "(?i)\\\\ProgramData\\\\",
           "(?i)\\\\Downloads\\\\"
         ],
-        "command_regex_all": [
-          "(?i)\\.(dll|ocx)\\b"
+        "process_name_in": [
+          "rundll32.exe",
+          "regsvr32.exe"
         ]
       }
     },
@@ -1611,10 +1611,6 @@
       ],
       "description": "WMI/CIM 查询 ComputerSystem/BIOS 与明确沙箱自检字符串；已去掉过宽的单关键字与 VideoController 查询以降低误报",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)Get-WmiObject\\s+Win32_ComputerSystem",
           "(?i)Get-CimInstance\\s+Win32_ComputerSystem",
@@ -1624,6 +1620,10 @@
           "(?i)check.*sandbox",
           "(?i)vmware\\s+.{0,40}\\bbios\\b",
           "(?i)virtualbox\\s+.{0,40}\\bbios\\b"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -1657,18 +1657,18 @@
       ],
       "description": "cipher /w、sdelete、fsutil 置零、format 卷等典型擦除/破坏命令",
       "condition": {
+        "command_regex_any": [
+          "(?i)/w:",
+          "(?i)setzerodata",
+          "(?i)-accepteula",
+          "(?i)\\s[a-z]:\\b"
+        ],
         "process_name_in": [
           "cipher.exe",
           "sdelete.exe",
           "sdelete64.exe",
           "fsutil.exe",
           "format.com"
-        ],
-        "command_regex_any": [
-          "(?i)/w:",
-          "(?i)setzerodata",
-          "(?i)-accepteula",
-          "(?i)\\s[a-z]:\\b"
         ]
       }
     },
@@ -1747,9 +1747,6 @@
       ],
       "description": "signtool 在 Temp/AppData/Downloads 下执行 sign；常见于被窃证书或临时木马签名",
       "condition": {
-        "process_name_in": [
-          "signtool.exe"
-        ],
         "command_regex_all": [
           "(?i)\\bsign\\b"
         ],
@@ -1757,6 +1754,9 @@
           "(?i)\\\\Temp\\\\",
           "(?i)\\\\AppData\\\\Local\\\\Temp",
           "(?i)\\\\Downloads\\\\"
+        ],
+        "process_name_in": [
+          "signtool.exe"
         ]
       }
     },
@@ -1794,15 +1794,15 @@
       ],
       "description": "net/net1 user … /add 创建本地账户",
       "condition": {
-        "process_name_in": [
-          "net.exe",
-          "net1.exe"
-        ],
         "command_regex_all": [
           "(?i)\\buser\\b"
         ],
         "command_regex_any": [
           "(?i)\\suser\\s+[^\\s\"]+\\s+/add\\b"
+        ],
+        "process_name_in": [
+          "net.exe",
+          "net1.exe"
         ]
       }
     },
@@ -1837,12 +1837,6 @@
       ],
       "description": "sqlcmd/bcp/mysqldump 等将查询结果或库表导出到文件（信息库数据窃取入口）",
       "condition": {
-        "process_name_in": [
-          "sqlcmd.exe",
-          "bcp.exe",
-          "mysqldump.exe",
-          "mysql.exe"
-        ],
         "command_regex_any": [
           "(?i)sqlcmd[^\\n]{0,200}-o\\s+",
           "(?i)\\bqueryout\\b",
@@ -1850,6 +1844,12 @@
           "(?i)mysqldump\\s+[^\\n]{0,120}-r\\s+",
           "(?i)mysqldump\\s+[^\\n]{0,200}>\\s*",
           "(?i)SELECT[^\\n]{0,120}INTO\\s+OUTFILE"
+        ],
+        "process_name_in": [
+          "sqlcmd.exe",
+          "bcp.exe",
+          "mysqldump.exe",
+          "mysql.exe"
         ]
       }
     },
@@ -1931,15 +1931,15 @@
       ],
       "description": "针对 ATT&CK 父技术「T1012」（Query Registry）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "cmd.exe",
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)\\breg\\s+query\\b",
           "(?i)Get-ItemProperty\\s+-Path\\s+.{0,200}Registry::",
           "(?i)Get-ChildItem\\s+.{0,120}HKLM:\\\\\\\\Software\\\\\\\\Microsoft\\\\\\\\Windows\\\\\\\\CurrentVersion"
+        ],
+        "process_name_in": [
+          "cmd.exe",
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -2003,16 +2003,16 @@
       ],
       "description": "针对 ATT&CK 父技术「T1028」（Windows Remote Management）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe",
-          "wmic.exe"
-        ],
         "command_regex_any": [
           "(?i)\\bwinrm\\b",
           "(?i)Enter-PSSession",
           "(?i)Invoke-Command\\b",
           "(?i)/node:\\s*[^\\s]+.*\\bprocess\\b"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe",
+          "wmic.exe"
         ]
       }
     },
@@ -2027,15 +2027,15 @@
       ],
       "description": "针对 ATT&CK 父技术「T1031」（Modify Existing Service）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "sc.exe",
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)\\bsc\\s+config\\b",
           "(?i)\\bSet-Service\\b",
           "(?i)ChangeServiceConfig"
+        ],
+        "process_name_in": [
+          "sc.exe",
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -2118,15 +2118,15 @@
       ],
       "description": "针对 ATT&CK 父技术「T1050」（New Service）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "sc.exe"
-        ],
         "command_regex_all": [
           "(?i)\\bcreate\\b"
         ],
         "command_regex_any": [
           "(?i)binpath\\s*=\\s*[^\\\"\\n]{0,200}(powershell|cmd|mshta|rundll32)",
           "(?i)\\\\\\\\(Users|Temp|Public)\\\\\\\\"
+        ],
+        "process_name_in": [
+          "sc.exe"
         ]
       }
     },
@@ -2157,13 +2157,13 @@
       ],
       "description": "针对 ATT&CK 父技术「T1054」（Indicator Blocking）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)Remove-Item\\s+.*(Windows Defender|Sense)",
           "(?i)Uninstall-WindowsFeature\\s+.*Windows-Defender"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -2196,12 +2196,12 @@
       ],
       "description": "针对 ATT&CK 父技术「T1073」（DLL Side-Loading）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "rundll32.exe"
-        ],
         "command_regex_any": [
           "(?i)\\\\\\\\Users\\\\\\\\[^\\\\]+\\\\\\\\.{0,80}\\.dll",
           "(?i)\\\\\\\\ProgramData\\\\\\\\.{0,80}\\.dll"
+        ],
+        "process_name_in": [
+          "rundll32.exe"
         ]
       }
     },
@@ -2234,14 +2234,14 @@
       ],
       "description": "针对 ATT&CK 父技术「T1084」（Windows Management Instrumentation Event Subscription）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "powershell.exe",
-          "pwsh.exe"
-        ],
         "command_regex_any": [
           "(?i)__EventFilter",
           "(?i)CommandLineEventConsumer",
           "(?i)Register-WmiEvent"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     },
@@ -2394,12 +2394,12 @@
       ],
       "description": "针对 ATT&CK 父技术「T1117」（Regsvr32）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "regsvr32.exe"
-        ],
         "command_regex_any": [
           "(?i)\\s/sc\\s+scriptlet:",
           "(?i)\\.sct\\b"
+        ],
+        "process_name_in": [
+          "regsvr32.exe"
         ]
       }
     },
@@ -2414,11 +2414,11 @@
       ],
       "description": "针对 ATT&CK 父技术「T1118」（InstallUtil）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "installutil.exe"
-        ],
         "command_regex_any": [
           "(?i)/logfile=|/U"
+        ],
+        "process_name_in": [
+          "installutil.exe"
         ]
       }
     },
@@ -2433,12 +2433,12 @@
       ],
       "description": "针对 ATT&CK 父技术「T1121」（Regsvcs/Regasm）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
+        "command_regex_any": [
+          "(?i)(/codebase|/u)\\b"
+        ],
         "process_name_in": [
           "regsvcs.exe",
           "regasm.exe"
-        ],
-        "command_regex_any": [
-          "(?i)(/codebase|/u)\\b"
         ]
       }
     },
@@ -2485,13 +2485,13 @@
       ],
       "description": "针对 ATT&CK 父技术「T1130」（Install Root Certificate）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "certutil.exe",
-          "certmgr.exe"
-        ],
         "command_regex_any": [
           "(?i)-addstore\\s+root",
           "(?i)installcert"
+        ],
+        "process_name_in": [
+          "certutil.exe",
+          "certmgr.exe"
         ]
       }
     },
@@ -2556,13 +2556,13 @@
       ],
       "description": "针对 ATT&CK 父技术「T1170」（Mshta）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "mshta.exe"
-        ],
         "command_regex_any": [
           "(?i)javascript:",
           "(?i)vbscript:",
           "(?i)(https?|ftp)://"
+        ],
+        "process_name_in": [
+          "mshta.exe"
         ]
       }
     },
@@ -2694,6 +2694,479 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Windows NT\\\\\\\\CurrentVersion\\\\\\\\Image File Execution Options\\\\\\\\"
+        ]
+      }
+    },
+    {
+      "id": "R-RMM-005",
+      "title": "RMM工具DLL侧加载/非标准子进程",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1574.001",
+        "T1059"
+      ],
+      "description": "RMM 工具加载非签名或非标准路径的 DLL，或启动异常子进程(如 cmd/ps)",
+      "condition": {
+        "command_regex_any": [
+          "(?i)cmd\\.exe",
+          "(?i)powershell\\.exe",
+          "(?i)net\\.exe\\s",
+          "(?i)whoami",
+          "(?i)systeminfo",
+          "(?i)rundll32\\.exe"
+        ],
+        "parent_name_in": [
+          "anydesk.exe",
+          "teamviewer.exe",
+          "screenconnect.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-LOLBIN-010",
+      "title": "非系统目录下的伪装系统文件执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059",
+        "T1218"
+      ],
+      "description": "cmd/powershell/wmic/certutil/regsvr32 等系统文件从 %TEMP%/%APPDATA% 等非系统目录执行(攻击者重命名绕过进程名白名单)",
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\\\Temp\\\\|\\\\AppData\\\\Local\\\\Temp\\\\",
+          "(?i)\\\\AppData\\\\Roaming\\\\",
+          "(?i)\\\\Users\\\\.+\\\\Downloads\\\\"
+        ]
+      }
+    },
+    {
+      "id": "R-LOLBIN-011",
+      "title": "临时目录可执行文件执行可疑命令",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059.001",
+        "T1218"
+      ],
+      "description": "从 %TEMP%/%APPDATA% 等临时目录运行的可执行文件带有编码、IEX、下载、注入等恶意参数模式",
+      "condition": {
+        "command_regex_all": [
+          "(?i)(\\\\Temp\\\\|\\\\AppData\\\\)",
+          "(?i)(powershell|cscript|wscript|mshta|rundll32)"
+        ],
+        "command_regex_any": [
+          "(?i)\\-enc\\b",
+          "(?i)\\-encodedcommand\\b",
+          "(?i)invoke-expression",
+          "(?i)iex\\s",
+          "(?i)frombase64string",
+          "(?i)downloadstring",
+          "(?i)downloadfile",
+          "(?i)virtualalloc",
+          "(?i)createremotethread",
+          "(?i)writeprocessmemory"
+        ]
+      }
+    },
+    {
+      "id": "R-LOLBIN-012",
+      "title": "脚本宿主重命名执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059",
+        "T1027"
+      ],
+      "description": "非powershell.exe/cscript.exe名称的进程执行了典型脚本/下载/远程调用参数；攻击者将脚本宿主重命名以绕过进程名监控",
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\-(enc|encodedcommand)\\b",
+          "(?i)\\-(w|windowstyle)\\s+hidden",
+          "(?i)\\-(nop|noprofile)\\b",
+          "(?i)\\-(ex|executionpolicy)\\s+bypass"
+        ]
+      }
+    },
+    {
+      "id": "R-INJECT-002",
+      "title": "Process Hollowing 征兆",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055.012",
+        "T1620"
+      ],
+      "description": "CreateProcess(SUSPENDED)+NtUnmapViewOfSection+VirtualAllocEx+WriteProcessMemory+ResumeThread 链条特征；无PE文件落地就加载恶意代码",
+      "condition": {
+        "command_regex_any": [
+          "(?i)NtUnmapViewOfSection",
+          "(?i)ZwUnmapViewOfSection",
+          "(?i)CreateProcess.*CREATE_SUSPENDED",
+          "(?i)PROCESS_CREATION_FLAGS_SUSPENDED",
+          "(?i)0x00000004.*CreateProcess"
+        ]
+      }
+    },
+    {
+      "id": "R-INJECT-003",
+      "title": "进程注入通用API调用痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055.001",
+        "T1055.002",
+        "T1055"
+      ],
+      "description": "VirtualAllocEx+WriteProcessMemory+CreateRemoteThread 经典DLL/Shellcode注入三联调用",
+      "condition": {
+        "command_regex_all": [
+          "(?i)virtualallocex",
+          "(?i)writeprocessmemory"
+        ],
+        "command_regex_any": [
+          "(?i)createremotethread",
+          "(?i)ntqueueapcthread",
+          "(?i)rtlcreateuserthread",
+          "(?i)setthreadcontext",
+          "(?i)ntmapviewofsection"
+        ]
+      }
+    },
+    {
+      "id": "R-INJECT-004",
+      "title": "ETW/AMSI 防御篡改",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.006",
+        "T1562.001",
+        "T1562.010"
+      ],
+      "description": "通过修补 EtwEventWrite/NtTraceEvent/AmsiScanBuffer 绕过EDR遥测和脚本扫描；无文件攻防对抗的关键一步",
+      "condition": {
+        "command_regex_any": [
+          "(?i)etweventwrite",
+          "(?i)nttraceevent",
+          "(?i)e\"?t\"?w\"?p\"?a\"?t\"?c\"?h",
+          "(?i)amsiscanbuffer",
+          "(?i)a\"?m\"?s\"?i\"?i\"?n\"?i\"?t\"?f\"?a\"?i\"?l\"?e\"?d",
+          "(?i)amsi.*(patch|bypass|hook|unload)",
+          "(?i)set-amsi.*0",
+          "(?i)\\[Runtime.InteropServices.Marshal\\]::",
+          "(?i)\\[Ref\\]\\.Assembly"
+        ]
+      }
+    },
+    {
+      "id": "R-INJECT-005",
+      "title": "DLL侧加载从用户可写目录",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1574.001",
+        "T1574.002"
+      ],
+      "description": "非Program Files/System32目录下加载的DLL配合rundll32/regsvr32执行；DLL Search Order Hijacking 特征",
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\.dll",
+          "(?i)(\\\\Temp\\\\|\\\\AppData\\\\|\\\\Downloads\\\\|\\\\Desktop\\\\)"
+        ],
+        "process_name_in": [
+          "rundll32.exe",
+          "regsvr32.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-FILELESS-007",
+      "title": "注册表存储可执行代码(PowerShell/VBS)被读取执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112",
+        "T1059.001",
+        "T1547"
+      ],
+      "description": "检测从HKCU/HKLM注册表读取超长值(>1KB)并传给Invoke-Expression/IEX/cscript等解释器执行的链式攻击(如SUBTLE#PAWS)。攻击者将恶意脚本分片存入注册表，用Get-ItemProperty读取后直接执行。",
+      "condition": {
+        "command_regex_all": [
+          "(?i)(get-itemproperty|get-itempropertyvalue)",
+          "(?i)(hklm\\\\|hkcu\\\\)"
+        ],
+        "command_regex_any": [
+          "(?i)invoke-expression",
+          "(?i)iex\\s",
+          "(?i)cscript",
+          "(?i)wscript\\.shell",
+          "(?i)start-process",
+          "(?i)\\$env:"
+        ]
+      }
+    },
+    {
+      "id": "R-FILELESS-008",
+      "title": ".NET Assembly.Load(byte[]) 从非文件源加载执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1027.004",
+        "T1055",
+        "T1620"
+      ],
+      "description": "检测 Reflection.Assembly.Load 从Base64/网络流/注册表等非PE文件的字节数组加载.NET Assembly执行。无文件攻击的关键一步(T1027.004)。",
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\[Reflection\\.Assembly\\]",
+          "(?i)\\.load\\("
+        ],
+        "command_regex_any": [
+          "(?i)frombase64string",
+          "(?i)\\[System\\.Convert\\]",
+          "(?i)\\[IO\\.File\\]::ReadAllBytes",
+          "(?i)downloadstring",
+          "(?i)invoke-webrequest",
+          "(?i)get-itemproperty"
+        ]
+      }
+    },
+    {
+      "id": "R-FILELESS-009",
+      "title": "Office宏/OLE对象启动脚本解释器无文件链",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.002",
+        "T1059.001",
+        "T1059.005",
+        "T1566.001"
+      ],
+      "description": "检测Office应用(WinWord/Excel/PowerPoint)启动cmd/powershell/wscript/mshta，且命令行包含递归下载/反射注入/内存执行特征。典型的Office宏无文件攻击链。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)downloadstring",
+          "(?i)downloadfile",
+          "(?i)invoke-expression",
+          "(?i)iex\\s",
+          "(?i)frombase64string",
+          "(?i)virtualalloc",
+          "(?i)net\\.webclient",
+          "(?i)start-bitstransfer",
+          "(?i)new-object.*net\\.webclient",
+          "(?i)\\.sct",
+          "(?i)javascript:",
+          "(?i)vbscript:"
+        ],
+        "parent_name_in": [
+          "winword.exe",
+          "excel.exe",
+          "powerpnt.exe",
+          "outlook.exe",
+          "eqnedt32.exe",
+          "msaccess.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-FILELESS-010",
+      "title": "WMI持久化无文件触发(ActiveScriptEventConsumer)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.003",
+        "T1059.005",
+        "T1059.007"
+      ],
+      "description": "检测WMI通过ActiveScriptEventConsumer注册VBScript/JScript持久化(无文件方式)——攻击者通过WMI事件订阅使恶意脚本在系统事件触发时自动执行(如SUBTLE#PAWS)。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)ActiveScriptEventConsumer",
+          "(?i)__EventConsumer",
+          "(?i)__EventFilter.*Query",
+          "(?i)CommandLineEventConsumer",
+          "(?i)Set-WmiInstance",
+          "(?i)wmi.*__FilterToConsumerBinding",
+          "(?i)wmic.*/namespace",
+          "(?i)\\.mof\\b"
+        ]
+      }
+    },
+    {
+      "id": "R-LMOVE-012",
+      "title": "Pass-the-Cookie/浏览器会话劫持横向移动",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1550.004",
+        "T1539",
+        "T1555.003"
+      ],
+      "description": "检测浏览器Cookie/Session数据被复制或读取后用于横向认证绕过(如从Chrome/Edge/Firefox读取Login Data/Cookies，配合sharpchromium/rubeus等工具进行基于Web/Cloud的横向移动)。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",
+          "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Login Data$",
+          "(?i)\\\\Microsoft\\\\Edge\\\\.*\\\\Cookies$",
+          "(?i)\\\\Mozilla\\\\Firefox\\\\.*\\\\cookies\\.sqlite$",
+          "(?i)sharpchromium",
+          "(?i)dploot",
+          "(?i)lazagne",
+          "(?i)webbrowserpassview"
+        ]
+      }
+    },
+    {
+      "id": "R-LMOVE-013",
+      "title": "SSH代理链/隧道建立(端口转发/反向代理)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1090",
+        "T1021.004",
+        "T1572"
+      ],
+      "description": "检测通过SSH建立本地/远程端口转发隧道实现代理横向移动(ssh -L/-R/-D)，或通过plink/chisel等工具建立隧道。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)ssh.*\\-(L|R|D)\\s+\\d+",
+          "(?i)plink.*\\-(L|R|D)\\s+\\d+",
+          "(?i)chisel.*(client|server)",
+          "(?i)ngrok.*tcp",
+          "(?i)frp.*\\-c",
+          "(?i)\\-(L|R|D)\\s+[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"
+        ]
+      }
+    },
+    {
+      "id": "R-LMOVE-014",
+      "title": "DCOM远程执行(WMI/MMC/ShellWindows/ExcelDDE)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.003",
+        "T1175",
+        "T1003"
+      ],
+      "description": "检测通过DCOM远程激活Office/WMI/ShellWindows等AppID进行横向代码执行——MITRE T1021.003最活跃的横向移动技术之一",
+      "condition": {
+        "command_regex_any": [
+          "(?i)MMC20\\.Application",
+          "(?i)ShellWindows",
+          "(?i)ShellBrowserWindow",
+          "(?i)Excel\\.Application.*DDE",
+          "(?i)OutlookApplication",
+          "(?i)MSXML2\\.ServerXMLHTTP",
+          "(?i)\\{0002DF01-0000-0000-C000-000000000046\\}",
+          "(?i)\\{9BA05972-F6A8-11CF-A442-00A0C90A8F39\\}",
+          "(?i)GetTypeFromProgID",
+          "(?i)\\[Activator\\]::CreateInstance",
+          "(?i)New-Object.*\\-ComObject"
+        ]
+      }
+    },
+    {
+      "id": "R-CLOUD-001",
+      "title": "云CLI工具从端点执行(Azure CLI/gcloud/aws)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1525",
+        "T1527",
+        "T1530"
+      ],
+      "description": "检测从Windows端点执行az/gcloud/aws等云管理CLI工具——攻击者获取凭证后通过CLI进行云资源枚举/数据外传/横向渗透。2025年云入侵同比增136%(CrowdStrike)。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)az\\s+vm\\s+list",
+          "(?i)az\\s+storage\\s+",
+          "(?i)az\\s+ad\\s+",
+          "(?i)az\\s+login",
+          "(?i)gcloud\\s+compute\\s+",
+          "(?i)gcloud\\s+auth\\s+",
+          "(?i)gcloud\\s+storage\\s+",
+          "(?i)aws\\s+s3\\s+",
+          "(?i)aws\\s+ec2\\s+describe",
+          "(?i)aws\\s+sts\\s+get-caller",
+          "(?i)aws\\s+iam\\s+list"
+        ]
+      }
+    },
+    {
+      "id": "R-CLOUD-002",
+      "title": "云存储工具从非标准环境大量上传/下载",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1567.002",
+        "T1530",
+        "T1048"
+      ],
+      "description": "检测rclone/azcopy/gsutil/aws s3 cp/sync等云存储同步工具在非系统目录下执行大量数据传输——常为数据外传或勒索前数据收集。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)rclone\\s+(copy|sync|move|copyto)",
+          "(?i)azcopy\\s+(copy|sync)",
+          "(?i)gsutil\\s+(cp|rsync)\\s+\\-r",
+          "(?i)aws\\s+s3\\s+(cp|sync|mv).*\\-\\-recursive",
+          "(?i)megatools\\s+(dl|put)",
+          "(?i)onedrive\\-uploader"
+        ]
+      }
+    },
+    {
+      "id": "R-C2-001",
+      "title": "443 port C2 communication from non-browser process",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1071.001",
+        "T1043"
+      ],
+      "description": "Non-browser process connecting to 443/8443 - potential HTTPS C2 beacon. Process whitelist excludes known browsers.",
+      "condition": {
+        "remote_port_in": [
+          443,
+          8443
+        ],
+        "process_name_not_in": [
+          "chrome.exe",
+          "firefox.exe",
+          "msedge.exe",
+          "iexplore.exe",
+          "brave.exe",
+          "opera.exe",
+          "safari.exe",
+          "browser_broker.exe",
+          "webviewhost.exe",
+          "msedgewebview2.exe",
+          "svchost.exe",
+          "searchapp.exe",
+          "searchhost.exe",
+          "startmenuexperiencehost.exe"
         ]
       }
     }

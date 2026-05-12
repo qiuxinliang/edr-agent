@@ -15,6 +15,8 @@
 #include "edr/command_util.h"
 #include "edr/ingest_http.h"
 #include "edr/response.h"
+#include "edr/sha256.h"
+#include "edr/shell_exec.h"
 
 #ifdef _WIN32
 #pragma comment(lib, "wevtapi.lib")

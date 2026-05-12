@@ -95,4 +95,6 @@ typedef struct {
 
 void edr_behavior_record_init(EdrBehaviorRecord *r);
 
+void edr_behavior_record_enrich_system_context(EdrBehaviorRecord *r);
+
 #endif

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -13,6 +14,7 @@
 
 #include "edr/command_util.h"
 #include "edr/response.h"
+#include "edr/shell_exec.h"
 
 #define RTQ_MAX_RESULTS    500
 #define RTQ_MAX_RESULT_STR (128 * 1024)

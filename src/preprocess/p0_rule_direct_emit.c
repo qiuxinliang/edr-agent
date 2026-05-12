@@ -350,6 +350,39 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
   if (s_debug_enabled < 0) {
     s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
   }
+
+  /* 拒绝空 process_name 且 cmdline 含 forensic 痕迹的事件（Agent 内部取证命令，非真实攻击进程） */
+  char resolved_pn[64];
+  resolved_pn[0] = '\0';
+  const char *pn = br->process_name;
+  if (!pn || !pn[0]) {
+    const char *cl = br->cmdline;
+    if (cl && cl[0]) {
+      if (strstr(cl, "edr_forensic") != NULL) {
+        if (s_debug_enabled)
+          fprintf(stderr, "[P0 DEBUG] emit blocked: cmdline contains forensic path (pid=%u)\n", br->pid);
+        return 0;
+      }
+      while (*cl == ' ' || *cl == '"') cl++;
+      const char *end = cl;
+      while (*end && *end != ' ' && *end != '"') end++;
+      size_t name_len = (size_t)(end - cl);
+      if (name_len > 0 && name_len < sizeof(resolved_pn)) {
+        memcpy(resolved_pn, cl, name_len);
+        resolved_pn[name_len] = '\0';
+        const char *dot = strrchr(resolved_pn, '.');
+        if (dot && (strcmp(dot, ".exe") == 0 || strcmp(dot, ".EXE") == 0 || strcmp(dot, ".bat") == 0 ||
+                    strcmp(dot, ".cmd") == 0 || strcmp(dot, ".ps1") == 0 || strcmp(dot, ".vbs") == 0)) {
+          pn = resolved_pn;
+        } else if (strncmp(cl, "tar ", 4) == 0 || strncmp(cl, "tar.exe ", 7) == 0 ||
+                   strncmp(cl, "tar\x00", 3) == 0) {
+          snprintf(resolved_pn, sizeof(resolved_pn), "tar.exe");
+          pn = resolved_pn;
+        }
+      }
+    }
+  }
+
   if (!p0_global_rate_ok()) {
     if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: global rate limit\n");
     return 0;
@@ -370,7 +403,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
   memset(&a, 0, sizeof(a));
   a.pid = br->pid;
   a.timestamp_ns = br->event_time_ns;
-  snprintf(a.process_name, sizeof(a.process_name), "%s", br->process_name ? br->process_name : "");
+  snprintf(a.process_name, sizeof(a.process_name), "%s", pn && pn[0] ? pn : "");
   snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path ? br->exe_path : "");
   a.anomaly_score = sev3_anomaly();
   snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma ? mitre_comma : "");
@@ -414,7 +447,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
     p0_json_escape_or_empty(rule_id, esc_rule_id, sizeof(esc_rule_id), 48);
     p0_json_escape_or_empty(EDR_P0_RULES_BUNDLE_VERSION, esc_bundle, sizeof(esc_bundle), 128);
     p0_json_escape_or_empty(title ? title : "", esc_title, sizeof(esc_title), 240);
-    p0_json_escape_or_empty(br->process_name ? br->process_name : "", esc_proc, sizeof(esc_proc), 160);
+    p0_json_escape_or_empty(pn && pn[0] ? pn : "", esc_proc, sizeof(esc_proc), 160);
     p0_json_escape_or_empty(br->exe_path[0] ? br->exe_path : "", esc_exe, sizeof(esc_exe), 400);
     p0_json_escape_or_empty(br->cmdline ? br->cmdline : "", cmdline_esc, sizeof(cmdline_esc), 480);
     p0_json_escape_or_empty(br->exe_hash[0] ? br->exe_hash : "", esc_exe_hash, sizeof(esc_exe_hash), 96);

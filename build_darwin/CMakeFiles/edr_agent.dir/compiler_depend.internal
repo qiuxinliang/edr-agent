@@ -116,6 +116,7 @@ CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_egress.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/config.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
 
 CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o
@@ -267,6 +268,7 @@ CMakeFiles/edr_agent.dir/src/attack_surface/attack_surface_report.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/config.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/security_policy_collect.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
 
@@ -405,6 +407,7 @@ CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/config.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/security_policy_collect.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
 
@@ -690,6 +693,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/config.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/pid_history.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_behavior_pipeline.h
@@ -1146,6 +1150,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/edr_log.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/sha256.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_onnx_infer.h
@@ -1492,6 +1497,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/edr_log.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_onnx_infer.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_static_features.h
@@ -1699,6 +1705,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/fl_feature_provider.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/sha256.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_behavior_pipeline.h
@@ -1964,6 +1971,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/config.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/src/ave/ave_suppression.h
 
@@ -6051,6 +6059,7 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/config.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/resource.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
 
@@ -6372,6 +6381,7 @@ CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/emit_rules.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/error.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/event_bus.h
+ /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/forensic_trigger.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/self_protect.h
  /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include/edr/types.h
 

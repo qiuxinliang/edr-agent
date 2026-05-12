@@ -51,6 +51,13 @@ void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len,
 void edr_response_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
 
+void edr_response_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
+                                const EdrSoarCommandMeta *sm);
+void edr_response_reg_query(const char *cmd_id, const uint8_t *pl, size_t len,
+                            const EdrSoarCommandMeta *sm);
+void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl, size_t len,
+                              const EdrSoarCommandMeta *sm);
+
 #ifdef __cplusplus
 }
 #endif

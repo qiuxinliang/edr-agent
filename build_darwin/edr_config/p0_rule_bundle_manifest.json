@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r218-9ae52519",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r239-97acafca",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 132,
+  "rule_count": 149,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -1348,6 +1348,209 @@
       "enabled": true,
       "mitre_ttps": [
         "T1183"
+      ]
+    },
+    {
+      "id": "R-RMM-005",
+      "title": "RMM工具DLL侧加载/非标准子进程",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1574.001",
+        "T1059"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-010",
+      "title": "非系统目录下的伪装系统文件执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059",
+        "T1218"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-011",
+      "title": "临时目录可执行文件执行可疑命令",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059.001",
+        "T1218"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-012",
+      "title": "脚本宿主重命名执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.003",
+        "T1059",
+        "T1027"
+      ]
+    },
+    {
+      "id": "R-INJECT-002",
+      "title": "Process Hollowing 征兆",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055.012",
+        "T1620"
+      ]
+    },
+    {
+      "id": "R-INJECT-003",
+      "title": "进程注入通用API调用痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1055.001",
+        "T1055.002",
+        "T1055"
+      ]
+    },
+    {
+      "id": "R-INJECT-004",
+      "title": "ETW/AMSI 防御篡改",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.006",
+        "T1562.001",
+        "T1562.010"
+      ]
+    },
+    {
+      "id": "R-INJECT-005",
+      "title": "DLL侧加载从用户可写目录",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1574.001",
+        "T1574.002"
+      ]
+    },
+    {
+      "id": "R-FILELESS-007",
+      "title": "注册表存储可执行代码(PowerShell/VBS)被读取执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112",
+        "T1059.001",
+        "T1547"
+      ]
+    },
+    {
+      "id": "R-FILELESS-008",
+      "title": ".NET Assembly.Load(byte[]) 从非文件源加载执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1027.004",
+        "T1055",
+        "T1620"
+      ]
+    },
+    {
+      "id": "R-FILELESS-009",
+      "title": "Office宏/OLE对象启动脚本解释器无文件链",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.002",
+        "T1059.001",
+        "T1059.005",
+        "T1566.001"
+      ]
+    },
+    {
+      "id": "R-FILELESS-010",
+      "title": "WMI持久化无文件触发(ActiveScriptEventConsumer)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.003",
+        "T1059.005",
+        "T1059.007"
+      ]
+    },
+    {
+      "id": "R-LMOVE-012",
+      "title": "Pass-the-Cookie/浏览器会话劫持横向移动",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1550.004",
+        "T1539",
+        "T1555.003"
+      ]
+    },
+    {
+      "id": "R-LMOVE-013",
+      "title": "SSH代理链/隧道建立(端口转发/反向代理)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1090",
+        "T1021.004",
+        "T1572"
+      ]
+    },
+    {
+      "id": "R-LMOVE-014",
+      "title": "DCOM远程执行(WMI/MMC/ShellWindows/ExcelDDE)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.003",
+        "T1175",
+        "T1003"
+      ]
+    },
+    {
+      "id": "R-CLOUD-001",
+      "title": "云CLI工具从端点执行(Azure CLI/gcloud/aws)",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1525",
+        "T1527",
+        "T1530"
+      ]
+    },
+    {
+      "id": "R-CLOUD-002",
+      "title": "云存储工具从非标准环境大量上传/下载",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1567.002",
+        "T1530",
+        "T1048"
       ]
     }
   ]

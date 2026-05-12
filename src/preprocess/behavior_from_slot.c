@@ -534,4 +534,6 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   }
 
   edr_forensic_trigger_evaluate(slot, r);
+
+  edr_behavior_record_enrich_system_context(r);
 }
