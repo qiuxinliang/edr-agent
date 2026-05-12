@@ -1659,6 +1659,25 @@ else()
   target_compile_options(test_shellcode PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+add_executable(test_shell_policy
+  tests/test_shell_policy.c
+  src/command/shell_exec.c
+)
+target_include_directories(test_shell_policy PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(MSVC)
+  target_compile_options(test_shell_policy PRIVATE /W4 /WX-)
+  target_compile_definitions(test_shell_policy PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+  target_compile_options(test_shell_policy PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(WIN32)
+  target_compile_definitions(test_shell_policy PRIVATE EDR_OS_WINDOWS=1)
+else()
+  target_compile_definitions(test_shell_policy PRIVATE EDR_OS_POSIX=1)
+endif()
+add_test(NAME shell_policy COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
 

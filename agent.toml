@@ -39,7 +39,29 @@ max_queue_size_mb    = 128
 retention_hours      = 72
 
 [command]
-allow_dangerous      = true
+# Admin 可手动启用高危命令（rm / shutdown / reboot ...）
+allow_dangerous = false
+
+[shell]
+allow = [
+  "whoami", "hostname", "systeminfo", "uname",
+  "tasklist", "ps", "top",
+  "netstat", "ss", "lsof",
+  "dir", "ls", "cat", "type", "find", "grep",
+  "net", "sc", "reg", "wmic",
+  "ipconfig", "ifconfig", "route", "arp",
+  "df", "du", "free", "mount",
+  "last", "w", "users",
+  "crontab", "schtasks",
+  "systemctl", "service",
+  "docker", "kubectl",
+  "cmd", "powershell", "bash", "sh",
+]
+block = [
+  "rm ", "del ", "erase ", "rmdir ", "rd ",
+  "format ", "fdisk ",
+  "shutdown", "reboot", "halt", "poweroff", "logoff",
+]
 
 [logging]
 level                = "debug"

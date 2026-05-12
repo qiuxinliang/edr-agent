@@ -304,6 +304,10 @@ typedef struct EdrConfig {
     uint32_t max_sessions;
     uint32_t session_timeout_s;
     uint32_t max_output_per_command_kb;
+    char **shell_allow;
+    size_t shell_allow_count;
+    char **shell_block;
+    size_t shell_block_count;
   } shell;
 
   /**

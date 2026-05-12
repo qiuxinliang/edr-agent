@@ -1,4 +1,5 @@
 #include "edr/config.h"
+#include "edr/shell_exec.h"
 
 #include <stdio.h>
 
@@ -1542,6 +1543,18 @@ void edr_config_free_heap(EdrConfig *cfg) {
   free(cfg->attack_surface.high_risk_immediate_ports);
   cfg->attack_surface.high_risk_immediate_ports = NULL;
   cfg->attack_surface.high_risk_immediate_ports_count = 0;
+  if (cfg->shell.shell_allow) {
+    for (size_t i = 0; i < cfg->shell.shell_allow_count; i++) { free(cfg->shell.shell_allow[i]); }
+    free(cfg->shell.shell_allow);
+    cfg->shell.shell_allow = NULL;
+    cfg->shell.shell_allow_count = 0;
+  }
+  if (cfg->shell.shell_block) {
+    for (size_t i = 0; i < cfg->shell.shell_block_count; i++) { free(cfg->shell.shell_block[i]); }
+    free(cfg->shell.shell_block);
+    cfg->shell.shell_block = NULL;
+    cfg->shell.shell_block_count = 0;
+  }
 }
 
 void edr_config_apply_defaults(EdrConfig *cfg) {
@@ -1859,6 +1872,44 @@ static void load_command(toml_table_t *t, EdrConfig *cfg) {
   toml_datum_t d = toml_bool_in(t, "allow_dangerous");
   if (d.ok) {
     cfg->command.allow_dangerous = d.u.b ? true : false;
+  }
+}
+
+static void load_shell(toml_table_t *t, EdrConfig *cfg) {
+  take_int(toml_int_in(t, "max_sessions"), &cfg->shell.max_sessions);
+  take_int(toml_int_in(t, "session_timeout_s"), &cfg->shell.session_timeout_s);
+  take_int(toml_int_in(t, "max_output_per_command_kb"), &cfg->shell.max_output_per_command_kb);
+
+  toml_array_t *allow = toml_array_in(t, "allow");
+  if (allow) {
+    size_t n = toml_array_nelem(allow);
+    if (n > 0) {
+      cfg->shell.shell_allow = (char **)calloc(n, sizeof(char *));
+      cfg->shell.shell_allow_count = 0;
+      for (size_t i = 0; i < n; i++) {
+        toml_datum_t d = toml_string_at(allow, i);
+        if (d.ok && d.u.s) {
+          cfg->shell.shell_allow[cfg->shell.shell_allow_count++] = strdup(d.u.s);
+          free(d.u.s);
+        }
+      }
+    }
+  }
+
+  toml_array_t *block = toml_array_in(t, "block");
+  if (block) {
+    size_t n = toml_array_nelem(block);
+    if (n > 0) {
+      cfg->shell.shell_block = (char **)calloc(n, sizeof(char *));
+      cfg->shell.shell_block_count = 0;
+      for (size_t i = 0; i < n; i++) {
+        toml_datum_t d = toml_string_at(block, i);
+        if (d.ok && d.u.s) {
+          cfg->shell.shell_block[cfg->shell.shell_block_count++] = strdup(d.u.s);
+          free(d.u.s);
+        }
+      }
+    }
   }
 }
 
@@ -2225,6 +2276,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
             "Install: use --config with agent.toml next to edr_agent.exe.\n",
             cfg->server.address);
     edr_config_log_semantic_warnings(cfg);
+    edr_shell_load_policy(NULL, NULL);
     return EDR_OK;
   }
 
@@ -2386,6 +2438,9 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 #ifdef _WIN32
   edr_win_listen_apply_config(cfg);
 #endif
+  edr_shell_load_policy(
+    (const char **)cfg->shell.shell_allow,
+    (const char **)cfg->shell.shell_block);
   return EDR_OK;
 }
 

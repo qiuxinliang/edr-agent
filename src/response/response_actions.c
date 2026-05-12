@@ -1259,6 +1259,12 @@ void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
 
   g_cmd_handled++;
   g_cmd_exec_ok++;
+
+#ifdef _WIN32
+  const char *init_cmd = "chcp 65001 > nul\r\n";
+  edr_shell_session_input(cmd_id, init_cmd, strlen(init_cmd));
+#endif
+
   char detail[128];
   snprintf(detail, sizeof(detail), "shell session opened: %s", shell_type);
   edr_command_audit_both(cmd_id, "shell_open: ok");
@@ -1273,7 +1279,12 @@ void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
   (void)edr_parse_json_string(pl, len, "input", input, sizeof(input));
 
   if (session_id[0] && input[0]) {
-    int rc = edr_shell_session_input(session_id, input, strlen(input));
+    size_t ilen = strlen(input);
+    if (ilen + 2 <= sizeof(input)) {
+      input[ilen] = '\n';
+      ilen++;
+    }
+    int rc = edr_shell_session_input(session_id, input, ilen);
     if (rc != 0) {
       g_cmd_exec_fail++;
       edr_command_audit_both(cmd_id, "shell_input: write failed");
@@ -1353,4 +1364,160 @@ void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t le
   snprintf(detail, sizeof(detail), "forensic_deep launched, scope=%s", params.scope);
   edr_command_audit_both(cmd_id, "forensic_deep: launched");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+}
+
+void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t len,
+                                  const EdrSoarCommandMeta *sm) {
+  if (!edr_command_dangerous_enabled()) {
+    g_cmd_rejected++;
+    edr_command_audit_both(cmd_id, "collector:start rejected (dangerous disabled)");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "dangerous commands disabled");
+    return;
+  }
+
+  char scope[64];
+  scope[0] = '\0';
+  if (pl && len > 0) {
+    (void)edr_parse_json_string(pl, len, "scope", scope, sizeof(scope));
+  }
+  if (!scope[0]) {
+    snprintf(scope, sizeof(scope), "all");
+  }
+
+  char buf[16384];
+  int off = 0;
+  off += snprintf(buf + off, sizeof(buf) - off, "{\"scope\":\"%s\",", scope);
+
+#ifdef _WIN32
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "process") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"processes\":\"");
+    FILE *pp = _popen("tasklist /FO CSV /NH 2>nul", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      _pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "network") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"network\":\"");
+    FILE *pp = _popen("netstat -ano 2>nul", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      _pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "files") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"files\":\"");
+    FILE *pp = _popen("dir /s /b C:\\Users 2>nul", "r");
+    if (pp) {
+      char lb[512];
+      int line = 0;
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512 && line < 200) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+        line++;
+      }
+      _pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "memory") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"memory\":\"");
+    FILE *pp = _popen("systeminfo 2>nul", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      _pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+#else
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "process") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"processes\":\"");
+    FILE *pp = popen("ps aux --no-headers 2>/dev/null | head -200", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "network") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"network\":\"");
+    FILE *pp = popen("ss -tunap 2>/dev/null || netstat -an 2>/dev/null | head -200", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "files") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"files\":\"");
+    FILE *pp = popen("find /etc /var/log /home -type f -maxdepth 3 2>/dev/null | head -200", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+  if (strcmp(scope, "all") == 0 || strcmp(scope, "memory") == 0) {
+    off += snprintf(buf + off, sizeof(buf) - off, "\"memory\":\"");
+    FILE *pp = popen("free -h 2>/dev/null || vm_stat 2>/dev/null", "r");
+    if (pp) {
+      char lb[512];
+      while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
+        size_t lb_len = strlen(lb);
+        if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
+          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+        }
+      }
+      pclose(pp);
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "\",");
+  }
+#endif
+
+  off += snprintf(buf + off, sizeof(buf) - off, "\"collected_at\":%lld}", (long long)time(NULL));
+
+  g_cmd_handled++;
+  g_cmd_exec_ok++;
+  edr_command_audit_both(cmd_id, "collector:start ok");
+  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, buf);
 }

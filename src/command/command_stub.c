@@ -341,6 +341,11 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
 
+  if (edr_command_streq(t, "collector:start") || edr_command_streq(t, "collector_start")) {
+    edr_response_collector_start(id, payload, payload_len, sm);
+    return;
+  }
+
   fprintf(stderr, "[command] 未知类型 id=%s type=%s\n", id, t);
   s_unknown++;
   edr_command_soar_emit(id, sm, EdrCmdExecUnknownType, 1, "unknown command_type");

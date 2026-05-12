@@ -10,6 +10,10 @@ extern "C" {
 
 int edr_shell_is_allowed(const char *command);
 
+void edr_shell_load_policy(const char **allow, const char **block);
+
+void edr_shell_reset_policy(void);
+
 int edr_shell_exec(const char *command, int timeout_sec,
                    char *output, size_t output_size, int *exit_code);
 

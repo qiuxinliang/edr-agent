@@ -13,7 +13,7 @@
 #include <fcntl.h>
 #endif
 
-static const char *g_shell_allow[] = {
+static const char *g_shell_allow_default[] = {
   "whoami", "hostname", "systeminfo", "uname",
   "tasklist", "ps", "top",
   "netstat", "ss", "lsof",
@@ -29,12 +29,33 @@ static const char *g_shell_allow[] = {
   NULL
 };
 
-static const char *g_shell_block[] = {
+static const char *g_shell_block_default[] = {
   "rm ", "del ", "erase ", "rmdir ", "rd ",
   "format ", "fdisk ",
   "shutdown", "reboot", "halt", "poweroff", "logoff",
   NULL
 };
+
+static const char **g_shell_allow = NULL;
+static const char **g_shell_block = NULL;
+
+void edr_shell_load_policy(const char **allow, const char **block) {
+  g_shell_allow = allow;
+  g_shell_block = block;
+}
+
+void edr_shell_reset_policy(void) {
+  g_shell_allow = NULL;
+  g_shell_block = NULL;
+}
+
+static const char *const *shell_allow(void) {
+  return g_shell_allow ? g_shell_allow : g_shell_allow_default;
+}
+
+static const char *const *shell_block(void) {
+  return g_shell_block ? g_shell_block : g_shell_block_default;
+}
 
 int edr_shell_is_allowed(const char *command) {
   if (!command || !command[0]) return 0;
@@ -44,8 +65,8 @@ int edr_shell_is_allowed(const char *command) {
   for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)command[i]);
   lower[n] = '\0';
 
-  for (int i = 0; g_shell_block[i]; i++) {
-    if (strstr(lower, g_shell_block[i])) return 0;
+  for (int i = 0; shell_block()[i]; i++) {
+    if (strstr(lower, shell_block()[i])) return 0;
   }
 
   char *low = lower;
@@ -62,8 +83,8 @@ int edr_shell_is_allowed(const char *command) {
     memmove(cmd, cmd + 1, strlen(cmd));
   }
 
-  for (int i = 0; g_shell_allow[i]; i++) {
-    if (strcmp(cmd, g_shell_allow[i]) == 0) return 1;
+  for (int i = 0; shell_allow()[i]; i++) {
+    if (strcmp(cmd, shell_allow()[i]) == 0) return 1;
   }
   return 0;
 }
