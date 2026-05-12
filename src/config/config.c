@@ -379,6 +379,12 @@ static void take_string(toml_datum_t d, char *dst, size_t cap) {
   }
 }
 
+static void take_int(toml_datum_t d, int *dst) {
+  if (d.ok) {
+    *dst = (int)d.u.i;
+  }
+}
+
 static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "address"), cfg->server.address, sizeof(cfg->server.address));
   take_string(toml_string_in(t, "ca_cert"), cfg->server.ca_cert, sizeof(cfg->server.ca_cert));
@@ -1882,11 +1888,11 @@ static void load_shell(toml_table_t *t, EdrConfig *cfg) {
 
   toml_array_t *allow = toml_array_in(t, "allow");
   if (allow) {
-    size_t n = toml_array_nelem(allow);
+    int n = toml_array_nelem(allow);
     if (n > 0) {
-      cfg->shell.shell_allow = (char **)calloc(n, sizeof(char *));
+      cfg->shell.shell_allow = (char **)calloc((size_t)n, sizeof(char *));
       cfg->shell.shell_allow_count = 0;
-      for (size_t i = 0; i < n; i++) {
+      for (int i = 0; i < n; i++) {
         toml_datum_t d = toml_string_at(allow, i);
         if (d.ok && d.u.s) {
           cfg->shell.shell_allow[cfg->shell.shell_allow_count++] = strdup(d.u.s);
@@ -1898,11 +1904,11 @@ static void load_shell(toml_table_t *t, EdrConfig *cfg) {
 
   toml_array_t *block = toml_array_in(t, "block");
   if (block) {
-    size_t n = toml_array_nelem(block);
+    int n = toml_array_nelem(block);
     if (n > 0) {
-      cfg->shell.shell_block = (char **)calloc(n, sizeof(char *));
+      cfg->shell.shell_block = (char **)calloc((size_t)n, sizeof(char *));
       cfg->shell.shell_block_count = 0;
-      for (size_t i = 0; i < n; i++) {
+      for (int i = 0; i < n; i++) {
         toml_datum_t d = toml_string_at(block, i);
         if (d.ok && d.u.s) {
           cfg->shell.shell_block[cfg->shell.shell_block_count++] = strdup(d.u.s);
