@@ -20,6 +20,7 @@
 #include "edr/attack_surface_report.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/agent_update.h"
+#include "edr/behavior_from_slot.h"
 #include "edr/collector.h"
 #include "edr/p0_rule_match.h"
 #ifdef _WIN32
@@ -184,6 +185,21 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
               (unsigned long)p0_stats.rule_r_fileless_001_hits);
     }
   }
+  {
+    int64_t pp0 = 0, ptot = 0, pntqi = 0, psnap = 0;
+    edr_behavior_get_ppid_stats(&pp0, &ptot, &psnap, &pntqi);
+    if (ptot > 0) {
+      double pct = (double)pp0 * 100.0 / (double)ptot;
+      fprintf(stderr,
+              "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld\n",
+              (long long)ptot, (long long)pp0, pct,
+              (long long)pntqi, (long long)psnap);
+      if (pct > 5.0 && pp0 > 10) {
+        fprintf(stderr, "[ppid] WARNING: PPID=0 ratio %.1f%% exceeds 5%% threshold — "
+                "possible high short-lived process churn or parent process eviction\n", pct);
+      }
+    }
+  }
 #endif
   fflush(stderr);
 }
@@ -255,6 +271,14 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   edr_self_protect_init();
   edr_resource_init(&agent->cfg);
   edr_pt_cache_init();
+#ifdef _WIN32
+  {
+    int warmed = edr_pt_cache_warmup();
+    if (warmed < 0) {
+      fprintf(stderr, "[pt_cache] 预热失败（权限不足或快照创建失败）\n");
+    }
+  }
+#endif
   edr_forensic_trigger_init(&agent->cfg.forensic_auto);
   edr_shell_session_init(agent->cfg.shell.max_sessions,
                           agent->cfg.shell.session_timeout_s,

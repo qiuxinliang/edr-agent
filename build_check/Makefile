@@ -749,6 +749,30 @@ src/command/command_util.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/command_util.c.s
 .PHONY : src/command/command_util.c.s
 
+src/command/eventlog.o: src/command/eventlog.c.o
+.PHONY : src/command/eventlog.o
+
+# target to build an object file
+src/command/eventlog.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/eventlog.c.o
+.PHONY : src/command/eventlog.c.o
+
+src/command/eventlog.i: src/command/eventlog.c.i
+.PHONY : src/command/eventlog.i
+
+# target to preprocess a source file
+src/command/eventlog.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/eventlog.c.i
+.PHONY : src/command/eventlog.c.i
+
+src/command/eventlog.s: src/command/eventlog.c.s
+.PHONY : src/command/eventlog.s
+
+# target to generate assembly for a file
+src/command/eventlog.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/eventlog.c.s
+.PHONY : src/command/eventlog.c.s
+
 src/command/pe_verify.o: src/command/pe_verify.c.o
 .PHONY : src/command/pe_verify.o
 
@@ -772,6 +796,54 @@ src/command/pe_verify.s: src/command/pe_verify.c.s
 src/command/pe_verify.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/pe_verify.c.s
 .PHONY : src/command/pe_verify.c.s
+
+src/command/registry.o: src/command/registry.c.o
+.PHONY : src/command/registry.o
+
+# target to build an object file
+src/command/registry.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/registry.c.o
+.PHONY : src/command/registry.c.o
+
+src/command/registry.i: src/command/registry.c.i
+.PHONY : src/command/registry.i
+
+# target to preprocess a source file
+src/command/registry.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/registry.c.i
+.PHONY : src/command/registry.c.i
+
+src/command/registry.s: src/command/registry.c.s
+.PHONY : src/command/registry.s
+
+# target to generate assembly for a file
+src/command/registry.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/registry.c.s
+.PHONY : src/command/registry.c.s
+
+src/command/rtq_exec.o: src/command/rtq_exec.c.o
+.PHONY : src/command/rtq_exec.o
+
+# target to build an object file
+src/command/rtq_exec.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/rtq_exec.c.o
+.PHONY : src/command/rtq_exec.c.o
+
+src/command/rtq_exec.i: src/command/rtq_exec.c.i
+.PHONY : src/command/rtq_exec.i
+
+# target to preprocess a source file
+src/command/rtq_exec.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/rtq_exec.c.i
+.PHONY : src/command/rtq_exec.c.i
+
+src/command/rtq_exec.s: src/command/rtq_exec.c.s
+.PHONY : src/command/rtq_exec.s
+
+# target to generate assembly for a file
+src/command/rtq_exec.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/command/rtq_exec.c.s
+.PHONY : src/command/rtq_exec.c.s
 
 src/command/sha256.o: src/command/sha256.c.o
 .PHONY : src/command/sha256.o
@@ -967,6 +1039,78 @@ src/core/time_util.s: src/core/time_util.c.s
 src/core/time_util.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/time_util.c.s
 .PHONY : src/core/time_util.c.s
+
+src/forensic/deep_collector.o: src/forensic/deep_collector.c.o
+.PHONY : src/forensic/deep_collector.o
+
+# target to build an object file
+src/forensic/deep_collector.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/deep_collector.c.o
+.PHONY : src/forensic/deep_collector.c.o
+
+src/forensic/deep_collector.i: src/forensic/deep_collector.c.i
+.PHONY : src/forensic/deep_collector.i
+
+# target to preprocess a source file
+src/forensic/deep_collector.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/deep_collector.c.i
+.PHONY : src/forensic/deep_collector.c.i
+
+src/forensic/deep_collector.s: src/forensic/deep_collector.c.s
+.PHONY : src/forensic/deep_collector.s
+
+# target to generate assembly for a file
+src/forensic/deep_collector.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/deep_collector.c.s
+.PHONY : src/forensic/deep_collector.c.s
+
+src/forensic/forensic_trigger.o: src/forensic/forensic_trigger.c.o
+.PHONY : src/forensic/forensic_trigger.o
+
+# target to build an object file
+src/forensic/forensic_trigger.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/forensic_trigger.c.o
+.PHONY : src/forensic/forensic_trigger.c.o
+
+src/forensic/forensic_trigger.i: src/forensic/forensic_trigger.c.i
+.PHONY : src/forensic/forensic_trigger.i
+
+# target to preprocess a source file
+src/forensic/forensic_trigger.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/forensic_trigger.c.i
+.PHONY : src/forensic/forensic_trigger.c.i
+
+src/forensic/forensic_trigger.s: src/forensic/forensic_trigger.c.s
+.PHONY : src/forensic/forensic_trigger.s
+
+# target to generate assembly for a file
+src/forensic/forensic_trigger.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/forensic_trigger.c.s
+.PHONY : src/forensic/forensic_trigger.c.s
+
+src/forensic/process_tree_cache.o: src/forensic/process_tree_cache.c.o
+.PHONY : src/forensic/process_tree_cache.o
+
+# target to build an object file
+src/forensic/process_tree_cache.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/process_tree_cache.c.o
+.PHONY : src/forensic/process_tree_cache.c.o
+
+src/forensic/process_tree_cache.i: src/forensic/process_tree_cache.c.i
+.PHONY : src/forensic/process_tree_cache.i
+
+# target to preprocess a source file
+src/forensic/process_tree_cache.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/process_tree_cache.c.i
+.PHONY : src/forensic/process_tree_cache.c.i
+
+src/forensic/process_tree_cache.s: src/forensic/process_tree_cache.c.s
+.PHONY : src/forensic/process_tree_cache.s
+
+# target to generate assembly for a file
+src/forensic/process_tree_cache.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/process_tree_cache.c.s
+.PHONY : src/forensic/process_tree_cache.c.s
 
 src/main.o: src/main.c.o
 .PHONY : src/main.o
@@ -1664,6 +1808,30 @@ src/serialize/behavior_wire.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/serialize/behavior_wire.c.s
 .PHONY : src/serialize/behavior_wire.c.s
 
+src/shell/shell_session.o: src/shell/shell_session.c.o
+.PHONY : src/shell/shell_session.o
+
+# target to build an object file
+src/shell/shell_session.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/shell/shell_session.c.o
+.PHONY : src/shell/shell_session.c.o
+
+src/shell/shell_session.i: src/shell/shell_session.c.i
+.PHONY : src/shell/shell_session.i
+
+# target to preprocess a source file
+src/shell/shell_session.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/shell/shell_session.c.i
+.PHONY : src/shell/shell_session.c.i
+
+src/shell/shell_session.s: src/shell/shell_session.c.s
+.PHONY : src/shell/shell_session.s
+
+# target to generate assembly for a file
+src/shell/shell_session.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/shell/shell_session.c.s
+.PHONY : src/shell/shell_session.c.s
+
 src/shellcode_detector/proto_parse.o: src/shellcode_detector/proto_parse.c.o
 .PHONY : src/shellcode_detector/proto_parse.o
 
@@ -2236,9 +2404,18 @@ help:
 	@echo "... src/command/command_util.o"
 	@echo "... src/command/command_util.i"
 	@echo "... src/command/command_util.s"
+	@echo "... src/command/eventlog.o"
+	@echo "... src/command/eventlog.i"
+	@echo "... src/command/eventlog.s"
 	@echo "... src/command/pe_verify.o"
 	@echo "... src/command/pe_verify.i"
 	@echo "... src/command/pe_verify.s"
+	@echo "... src/command/registry.o"
+	@echo "... src/command/registry.i"
+	@echo "... src/command/registry.s"
+	@echo "... src/command/rtq_exec.o"
+	@echo "... src/command/rtq_exec.i"
+	@echo "... src/command/rtq_exec.s"
 	@echo "... src/command/sha256.o"
 	@echo "... src/command/sha256.i"
 	@echo "... src/command/sha256.s"
@@ -2263,6 +2440,15 @@ help:
 	@echo "... src/core/time_util.o"
 	@echo "... src/core/time_util.i"
 	@echo "... src/core/time_util.s"
+	@echo "... src/forensic/deep_collector.o"
+	@echo "... src/forensic/deep_collector.i"
+	@echo "... src/forensic/deep_collector.s"
+	@echo "... src/forensic/forensic_trigger.o"
+	@echo "... src/forensic/forensic_trigger.i"
+	@echo "... src/forensic/forensic_trigger.s"
+	@echo "... src/forensic/process_tree_cache.o"
+	@echo "... src/forensic/process_tree_cache.i"
+	@echo "... src/forensic/process_tree_cache.s"
 	@echo "... src/main.o"
 	@echo "... src/main.i"
 	@echo "... src/main.s"
@@ -2347,6 +2533,9 @@ help:
 	@echo "... src/serialize/behavior_wire.o"
 	@echo "... src/serialize/behavior_wire.i"
 	@echo "... src/serialize/behavior_wire.s"
+	@echo "... src/shell/shell_session.o"
+	@echo "... src/shell/shell_session.i"
+	@echo "... src/shell/shell_session.s"
 	@echo "... src/shellcode_detector/proto_parse.o"
 	@echo "... src/shellcode_detector/proto_parse.i"
 	@echo "... src/shellcode_detector/proto_parse.s"

@@ -51,4 +51,34 @@ void edr_pt_cache_fill_record(uint32_t pid,
                               char *parent_cmdline,    size_t pc_cap,
                               uint32_t *out_chain_depth);
 
+#define EDR_KEY_PROC_MAX 12
+
+typedef struct {
+  uint32_t pid;
+  uint32_t ppid;
+  char name[EDR_PTC_STR_SHORT];
+  int valid;
+} EdrKeyProcSlot;
+
+/**
+ * 进程树缓存预热：Agent 启动时通过 CreateToolhelp32Snapshot 全量枚举当前运行进程，
+ * 预填充 g_pt_table，减少冷启动阶段 PPID=0 事件。
+ * 返回预热条目数；失败返回 -1。
+ * 仅 Windows 有效；非 Windows 返回 0。
+ */
+int edr_pt_cache_warmup(void);
+
+/**
+ * 返回关键系统进程的 PID 信息填充到 `out`（长度 EDR_KEY_PROC_MAX）。
+ * 包括：System, smss.exe, csrss.exe, wininit.exe, services.exe, lsass.exe,
+ *       winlogon.exe, svchost.exe, explorer.exe 等。
+ * 每次调用 edr_pt_cache_warmup 后自动刷新。
+ */
+void edr_pt_cache_get_key_procs(EdrKeyProcSlot *out, int max);
+
+/**
+ * 根据名称查找关键系统进程 PID；返回 0 成功（pid 有效），-1 未找到。
+ */
+int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid);
+
 #endif

@@ -4,6 +4,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
+
 #define PT_HT_CAPACITY 4096u
 
 typedef struct {
@@ -14,6 +22,16 @@ typedef struct {
 static PTHashSlot g_pt_table[PT_HT_CAPACITY];
 static uint64_t g_pt_oldest_ns;
 static bool g_pt_initialized;
+
+#ifdef _WIN32
+static const char *g_key_proc_names[] = {
+    "System", "smss.exe", "csrss.exe", "wininit.exe",
+    "services.exe", "lsass.exe", "winlogon.exe",
+    "svchost.exe", "explorer.exe", "spoolsv.exe",
+    "taskhostw.exe", "dwm.exe",
+};
+static EdrKeyProcSlot g_key_procs[EDR_KEY_PROC_MAX];
+#endif
 
 static size_t pt_hash(uint32_t pid) {
   return ((size_t)pid * 2654435761u) % PT_HT_CAPACITY;
@@ -186,3 +204,129 @@ void edr_pt_cache_fill_record(uint32_t pid,
     *out_chain_depth = edr_pt_cache_chain_depth(pid);
   }
 }
+
+#ifdef _WIN32
+static const char *basename_pt(const char *path) {
+  if (!path || !path[0]) return "";
+  const char *p = path;
+  for (const char *c = path; *c; c++) {
+    if (*c == '\\' || *c == '/') p = c + 1;
+  }
+  return p;
+}
+
+static void edr_pt_cache_refresh_key_procs(void) {
+  (void)memset(g_key_procs, 0, sizeof(g_key_procs));
+  for (int i = 0; i < EDR_KEY_PROC_MAX && i < (int)(sizeof(g_key_procs) / sizeof(g_key_procs[0])); i++) {
+    g_key_procs[i].valid = 0;
+  }
+  size_t found = 0;
+  for (size_t si = 0; si < PT_HT_CAPACITY && found < EDR_KEY_PROC_MAX; si++) {
+    if (!g_pt_table[si].occupied) continue;
+    const char *name = g_pt_table[si].entry.process_name;
+    if (!name[0]) continue;
+    const char *exe_name = basename_pt(g_pt_table[si].entry.exe_path);
+    for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
+      if (g_key_procs[k].valid) continue;
+#ifdef _MSC_VER
+      int match = (_stricmp(name, g_key_proc_names[k]) == 0 ||
+                   (exe_name[0] && _stricmp(exe_name, g_key_proc_names[k]) == 0));
+#else
+      int match = (strcasecmp(name, g_key_proc_names[k]) == 0);
+#endif
+      if (match) {
+        g_key_procs[k].pid = g_pt_table[si].entry.pid;
+        g_key_procs[k].ppid = g_pt_table[si].entry.ppid;
+        snprintf(g_key_procs[k].name, sizeof(g_key_procs[k].name), "%s", name);
+        g_key_procs[k].valid = 1;
+        found++;
+        break;
+      }
+    }
+  }
+}
+
+static int edr_pt_cache_put_raw(uint32_t pid, uint32_t ppid,
+                                const wchar_t *process_name_w, const wchar_t *exe_path_w) {
+  if (!g_pt_initialized) return -1;
+  char name_buf[EDR_PTC_STR_SHORT] = {0};
+  char path_buf[EDR_PTC_STR_PATH] = {0};
+  if (process_name_w && process_name_w[0]) {
+    WideCharToMultiByte(CP_UTF8, 0, process_name_w, -1, name_buf,
+                        (int)sizeof(name_buf) - 1, NULL, NULL);
+  }
+  if (exe_path_w && exe_path_w[0]) {
+    WideCharToMultiByte(CP_UTF8, 0, exe_path_w, -1, path_buf,
+                        (int)sizeof(path_buf) - 1, NULL, NULL);
+  }
+  uint64_t now = 0;
+  {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    now = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  }
+  return edr_pt_cache_put(pid, ppid, name_buf[0] ? name_buf : NULL,
+                          NULL, path_buf[0] ? path_buf : NULL, NULL, now);
+}
+
+int edr_pt_cache_warmup(void) {
+  if (!g_pt_initialized) return -1;
+  int count = 0;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return -1;
+  PROCESSENTRY32W pe;
+  pe.dwSize = (DWORD)sizeof(pe);
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      uint32_t pid = (uint32_t)pe.th32ProcessID;
+      uint32_t ppid = (uint32_t)pe.th32ParentProcessID;
+      if (pid != 0) {
+        int r = edr_pt_cache_put_raw(pid, ppid, pe.szExeFile, NULL);
+        if (r == 0) count++;
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  edr_pt_cache_refresh_key_procs();
+  fprintf(stderr, "[pt_cache] 预热完成: %d 进程入缓存, %zu 关键进程已识别\n",
+          count, (size_t)EDR_KEY_PROC_MAX);
+  for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
+    if (g_key_procs[k].valid) {
+      fprintf(stderr, "[pt_cache]   key[%d] %s pid=%u ppid=%u\n",
+              k, g_key_procs[k].name, (unsigned)g_key_procs[k].pid,
+              (unsigned)g_key_procs[k].ppid);
+    }
+  }
+  return count;
+}
+
+void edr_pt_cache_get_key_procs(EdrKeyProcSlot *out, int max) {
+  if (!out || max <= 0) return;
+  int n = max < EDR_KEY_PROC_MAX ? max : EDR_KEY_PROC_MAX;
+  for (int i = 0; i < n; i++) {
+    memcpy(&out[i], &g_key_procs[i], sizeof(EdrKeyProcSlot));
+  }
+}
+
+int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
+  if (!name || !out_pid) return -1;
+  for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
+    if (!g_key_procs[k].valid) continue;
+    if (strcmp(g_key_procs[k].name, name) == 0) {
+      *out_pid = g_key_procs[k].pid;
+      return 0;
+    }
+  }
+  return -1;
+}
+#else
+int edr_pt_cache_warmup(void) { return 0; }
+void edr_pt_cache_get_key_procs(EdrKeyProcSlot *out, int max) {
+  if (out && max > 0) { (void)memset(out, 0, (size_t)max * sizeof(EdrKeyProcSlot)); }
+}
+int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
+  (void)name;
+  (void)out_pid;
+  return -1;
+}
+#endif

@@ -573,6 +573,24 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     }
     return;
   }
+
+  static int64_t  s_ev_ts_ns;
+  static uint32_t s_ev_pid;
+  static int      s_ev_type;
+  static uint64_t s_ev_dup_skipped;
+  if (br->event_time_ns != 0u && br->event_time_ns == s_ev_ts_ns &&
+      br->pid == s_ev_pid && (int)br->type == s_ev_type) {
+    s_ev_dup_skipped++;
+    if (s_ev_dup_skipped == 1u || (s_ev_dup_skipped & 1023u) == 0u) {
+      fprintf(stderr, "[P0] skipped duplicate event (ts=%llu pid=%u type=%d count=%llu)\n",
+              (unsigned long long)br->event_time_ns, br->pid, (int)br->type,
+              (unsigned long long)s_ev_dup_skipped);
+    }
+    return;
+  }
+  s_ev_ts_ns = br->event_time_ns;
+  s_ev_pid = br->pid;
+  s_ev_type = (int)br->type;
   const char *cmd = br->cmdline;
   const char *pn = br->process_name;
   const char *par = br->parent_name[0] ? br->parent_name : NULL;

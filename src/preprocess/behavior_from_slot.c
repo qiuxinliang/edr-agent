@@ -11,6 +11,53 @@
 #include <Sddl.h>
 #include <TlHelp32.h>
 
+typedef LONG EDR_NTSTATUS;
+#define EDR_STATUS_SUCCESS ((EDR_NTSTATUS)0x00000000L)
+
+typedef struct _EDR_PROCESS_BASIC_INFORMATION_V2 {
+  void    *ExitStatus;
+  void    *PebBaseAddress;
+  void    *AffinityMask;
+  LONG     BasePriority;
+  void    *UniqueProcessId;
+  void    *InheritedFromUniqueProcessId;
+} EDR_PROCESS_BASIC_INFORMATION_V2;
+
+static volatile LONG64 s_ppid_zero_events;
+static volatile LONG64 s_ppid_total_events;
+static volatile LONG64 s_ppid_snapshot_fallback_ok;
+static volatile LONG64 s_ppid_ntqi_fallback_ok;
+
+void edr_behavior_get_ppid_stats(int64_t *out_zero, int64_t *out_total,
+                                 int64_t *out_snap_ok, int64_t *out_ntqi_ok) {
+  if (out_zero)   *out_zero   = s_ppid_zero_events;
+  if (out_total)  *out_total  = s_ppid_total_events;
+  if (out_snap_ok) *out_snap_ok = s_ppid_snapshot_fallback_ok;
+  if (out_ntqi_ok) *out_ntqi_ok = s_ppid_ntqi_fallback_ok;
+}
+
+static int edr_get_ppid_via_ntqi(DWORD pid, DWORD *out_ppid) {
+  if (!out_ppid || pid == 0) return -1;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h) return -1;
+  typedef EDR_NTSTATUS (WINAPI *PNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+  static PNtQueryInformationProcess pNtQIP = NULL;
+  if (!pNtQIP) {
+    pNtQIP = (PNtQueryInformationProcess)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!pNtQIP) { CloseHandle(h); return -1; }
+  }
+  EDR_PROCESS_BASIC_INFORMATION_V2 pbi;
+  (void)memset(&pbi, 0, sizeof(pbi));
+  EDR_NTSTATUS st = pNtQIP(h, 0, &pbi, sizeof(pbi), NULL);
+  CloseHandle(h);
+  if (st != EDR_STATUS_SUCCESS || !pbi.InheritedFromUniqueProcessId) return -1;
+  DWORD ppid = (DWORD)(ULONG_PTR)pbi.InheritedFromUniqueProcessId;
+  if (ppid == 0 || ppid == pid) return -1;
+  *out_ppid = ppid;
+  return 0;
+}
+
 static int edr_get_process_path_by_pid(DWORD pid, char *out, size_t out_cap) {
   if (!out || out_cap < 2) {
     return -1;
@@ -432,10 +479,17 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
 #if defined(_WIN32)
     if (r->ppid == 0u && r->pid != 0u) {
       DWORD sppid = 0;
-      if (edr_get_ppid_from_system((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
+      if (edr_get_ppid_via_ntqi((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
         r->ppid = (uint32_t)sppid;
+        (void)InterlockedAdd64(&s_ppid_ntqi_fallback_ok, 1);
+      } else if (edr_get_ppid_from_system((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
+        r->ppid = (uint32_t)sppid;
+        (void)InterlockedAdd64(&s_ppid_snapshot_fallback_ok, 1);
+      } else {
+        (void)InterlockedAdd64(&s_ppid_zero_events, 1);
       }
     }
+    (void)InterlockedAdd64(&s_ppid_total_events, 1);
 #endif
     if (ef.has_img) {
       snprintf(r->exe_path, sizeof(r->exe_path), "%s", ef.img);
