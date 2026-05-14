@@ -20,6 +20,25 @@ static void copy_str(char *dst, size_t cap, const char *src) {
   snprintf(dst, cap, "%s", src);
 }
 
+static void extract_username_from_usj(const char *usj, char *out, size_t cap) {
+  if (!usj || !usj[0] || !out || cap == 0) {
+    if (out && cap > 0) out[0] = '\0';
+    return;
+  }
+  const char *key = "\"username\":\"";
+  const char *p = strstr(usj, key);
+  if (!p) {
+    out[0] = '\0';
+    return;
+  }
+  p += strlen(key);
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < cap) {
+    out[i++] = *p++;
+  }
+  out[i] = '\0';
+}
+
 /** `EdrEventType` → `AVEEventType`（《11》§4.1）；无对应时返回 -1 */
 static int32_t edr_event_type_to_ave_event_type(EdrEventType t) {
   switch (t) {
@@ -219,6 +238,11 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
   msg.pid = a->pid;
   copy_str(msg.process_name, sizeof(msg.process_name), a->process_name[0] ? a->process_name : "");
   copy_str(msg.exe_path, sizeof(msg.exe_path), a->process_path[0] ? a->process_path : "");
+  {
+    char uname_buf[256];
+    extract_username_from_usj(a->user_subject_json, uname_buf, sizeof(uname_buf));
+    copy_str(msg.username, sizeof(msg.username), uname_buf[0] ? uname_buf : "");
+  }
   msg.priority = 0u;
 
   msg.has_behavior_alert = true;

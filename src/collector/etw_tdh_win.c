@@ -411,6 +411,7 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"ParentFileName", "pimg"},
       {L"ProcessId", "epid"},
       {L"ProcessID", "epid"},
+      {L"SubjectUserName", "user"},
   };
   static const EdrPropTry file_try[] = {
       {L"FileName", "file"},

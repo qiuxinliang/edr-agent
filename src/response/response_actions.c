@@ -1240,7 +1240,7 @@ void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
 
   char shell_type[64];
 #ifdef _WIN32
-  strcpy(shell_type, "cmd.exe");
+  strcpy(shell_type, "cmd.exe /Q /K chcp 65001 > nul");
 #else
   strcpy(shell_type, "/bin/sh");
 #endif
@@ -1260,12 +1260,7 @@ void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
   g_cmd_handled++;
   g_cmd_exec_ok++;
 
-#ifdef _WIN32
-  const char *init_cmd = "chcp 65001 > nul\r\n";
-  edr_shell_session_input(cmd_id, init_cmd, strlen(init_cmd));
-#endif
-
-  char detail[128];
+char detail[128];
   snprintf(detail, sizeof(detail), "shell session opened: %s", shell_type);
   edr_command_audit_both(cmd_id, "shell_open: ok");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
