@@ -72,7 +72,7 @@ typedef struct _edr_v1_BehaviorAlert {
     /* 与 `alerts.related_iocs_json` 对齐的 JSON 文本；单帧长度受 Agent nanopb 静态缓冲上界约 4KiB（与 event.options 对账）。 */
     char related_iocs_json[4090];
     /* 跨端并案主键真源：与平台 `alerts.user_subject_json` 一致，如 {"subject_type":"ad_sid","value":"S-1-5-21-..."}。 */
-    char user_subject_json[8192];
+    char user_subject_json[4090];
 } edr_v1_BehaviorAlert;
 
 typedef struct _edr_v1_ProcessDetail {
@@ -420,8 +420,8 @@ extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
 /* Maximum encoded size of messages (where known) */
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         1792
-#define edr_v1_BehaviorAlert_size                14180
-#define edr_v1_BehaviorEvent_size                32844
+#define edr_v1_BehaviorAlert_size                10078
+#define edr_v1_BehaviorEvent_size                28742
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   1072
 #define edr_v1_NetworkDetail_size                1185
