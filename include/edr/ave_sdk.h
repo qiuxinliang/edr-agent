@@ -213,7 +213,7 @@ typedef struct AVEBehaviorAlert {
   /** 与 `alerts.related_iocs_json` 对齐的 JSON 文本；无则全零（与 nanopb max 4KiB-1 对齐） */
   char related_iocs_json[4090];
   /** 跨端并案主键，与 `alerts.user_subject_json` 同构；无则全零 */
-  char user_subject_json[1024];
+  char user_subject_json[8192];
 } AVEBehaviorAlert;
 
 typedef struct AVEBehaviorEvent {

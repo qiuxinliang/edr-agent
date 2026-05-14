@@ -573,6 +573,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
         esc_ect);
     if (n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
       a.user_subject_json[0] = 0;
+      fprintf(stderr, "[P0] emit_for_rule: user_subject_json overflow (need=%d cap=%zu rule=%s pid=%u)\n",
+              n, sizeof(a.user_subject_json), rule_id, br->pid);
       return 0;
     }
   }
