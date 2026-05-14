@@ -8,6 +8,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <Sddl.h>
 
 static int edr_get_process_path_by_pid(DWORD pid, char *out, size_t out_cap) {
   if (!out || out_cap < 2) {
@@ -34,6 +35,62 @@ static int edr_get_process_path_by_pid(DWORD pid, char *out, size_t out_cap) {
 
   CloseHandle(hProcess);
   return 0;
+}
+
+static int edr_get_process_username_by_pid(DWORD pid, char *out, size_t out_cap) {
+  if (!out || out_cap < 2) return -1;
+  out[0] = '\0';
+
+  HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!hProcess) return -1;
+
+  HANDLE hToken = NULL;
+  if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  DWORD tokenInfoSize = 0;
+  GetTokenInformation(hToken, TokenUser, NULL, 0, &tokenInfoSize);
+  if (tokenInfoSize == 0) {
+    CloseHandle(hToken);
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  PTOKEN_USER pTokenUser = (PTOKEN_USER)HeapAlloc(GetProcessHeap(), 0, tokenInfoSize);
+  if (!pTokenUser) {
+    CloseHandle(hToken);
+    CloseHandle(hProcess);
+    return -1;
+  }
+
+  int result = -1;
+  if (GetTokenInformation(hToken, TokenUser, pTokenUser, tokenInfoSize, &tokenInfoSize)) {
+    WCHAR wUsername[256] = {0};
+    WCHAR wDomain[256] = {0};
+    DWORD cchUsername = 256;
+    DWORD cchDomain = 256;
+    SID_NAME_USE snu;
+    if (LookupAccountSidW(NULL, pTokenUser->User.Sid, wUsername, &cchUsername,
+                          wDomain, &cchDomain, &snu)) {
+      char username[256] = {0};
+      WideCharToMultiByte(CP_UTF8, 0, wUsername, -1, username, (int)sizeof(username) - 1, NULL, NULL);
+      if (wDomain[0]) {
+        char domain[128] = {0};
+        WideCharToMultiByte(CP_UTF8, 0, wDomain, -1, domain, (int)sizeof(domain) - 1, NULL, NULL);
+        snprintf(out, out_cap, "%s\\%s", domain, username);
+      } else {
+        snprintf(out, out_cap, "%s", username);
+      }
+      result = 0;
+    }
+  }
+
+  HeapFree(GetProcessHeap(), 0, pTokenUser);
+  CloseHandle(hToken);
+  CloseHandle(hProcess);
+  return result;
 }
 #endif
 
@@ -408,6 +465,15 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.has_user) {
       snprintf(r->username, sizeof(r->username), "%s", ef.user);
     }
+#if defined(_WIN32)
+    if (!ef.has_user && ef.epid > 0) {
+      DWORD pid = (DWORD)ef.epid;
+      char ubuf[EDR_BR_STR_SHORT];
+      if (edr_get_process_username_by_pid(pid, ubuf, sizeof(ubuf)) == 0 && ubuf[0]) {
+        snprintf(r->username, sizeof(r->username), "%s", ubuf);
+      }
+    }
+#endif
     if (ef.has_integ) {
       snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integ);
     }
