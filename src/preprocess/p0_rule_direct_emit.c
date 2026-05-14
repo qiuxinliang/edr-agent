@@ -28,16 +28,21 @@
 #define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r218-9ae52519"
 #endif
 
-/* 同一 (rule_id, endpoint_id, pid) 在窗口内不重复上送，减轻 alerts 与批次洪泛（B2.3） */
-#define P0_DEDUP_SLOTS 32u
+/* 同一 (rule_id, endpoint_id, pid, event_time_ns) 在窗口内不重复上送。
+ * 短窗口 (默认 3s) 配合 event_time_ns 区分同 PID 的独立事件，避免将攻击链中
+ * 连续的阶段性动作错误抑制为单条告警。EDR_P0_DEDUP_SEC=0 关闭。 */
+#define P0_DEDUP_SLOTS 64u
 struct p0_dedup_slot {
   char rule_id[24];
   char endpoint_id[EDR_BR_ID_LEN];
   uint32_t pid;
+  int64_t  event_time_ns;
   uint64_t last_ms;
+  uint32_t suppressed_count;
 };
 static struct p0_dedup_slot s_p0_dedup[P0_DEDUP_SLOTS];
 static uint32_t s_p0_dedup_next;
+static uint64_t s_p0_dedup_suppressed_total;
 
 /* 全进程滑动 60s 内 BehaviorAlert 直出条数上限（B2.3）；未设置或 0=不限制 */
 static uint64_t s_p0_gwin_start_ms;
@@ -75,13 +80,15 @@ static uint64_t p0_monotonic_ms(void) {
 #endif
 }
 
-/* 若允许上送则占槽并返回 1；在冷却窗口内返回 0。EDR_P0_DEDUP_SEC=0 关闭。默认 10 秒（放宽以支持测试）。 */
+/* 若允许上送则占槽并返回 1；在冷却窗口内返回 0。
+ * 键包含 event_time_ns：同 PID 的不同事件可在窗口外生成独立告警。
+ * EDR_P0_DEDUP_SEC 环境变量覆盖窗口秒数，0=关闭；默认 3 秒。 */
 static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
   const char *v = getenv("EDR_P0_DEDUP_SEC");
   if (v && (v[0] == '0' && (v[1] == 0 || v[1] == ' '))) {
     return 1;
   }
-  unsigned long win_sec = 10;
+  unsigned long win_sec = 3;
   if (v && *v) {
     win_sec = strtoul(v, NULL, 10);
   }
@@ -96,10 +103,24 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
   for (uint32_t i = 0; i < P0_DEDUP_SLOTS; i++) {
     if (s_p0_dedup[i].pid == br->pid && strcmp(s_p0_dedup[i].rule_id, rule_id) == 0 &&
         strcmp(s_p0_dedup[i].endpoint_id, br->endpoint_id) == 0) {
+      if (s_p0_dedup[i].event_time_ns == br->event_time_ns) {
+        s_p0_dedup[i].suppressed_count++;
+        s_p0_dedup_suppressed_total++;
+        fprintf(stderr, "[P0] dedup: skip exact-duplicate event (rule=%s pid=%u ts=%lld)\n",
+                rule_id, br->pid, (long long)br->event_time_ns);
+        return 0;
+      }
       if (now < s_p0_dedup[i].last_ms + window_ms) {
+        s_p0_dedup[i].suppressed_count++;
+        s_p0_dedup_suppressed_total++;
+        fprintf(stderr, "[P0] dedup: suppress (rule=%s pid=%u window=%lus suppressed=%u total_suppressed=%llu)\n",
+                rule_id, br->pid, (unsigned long)win_sec,
+                s_p0_dedup[i].suppressed_count,
+                (unsigned long long)s_p0_dedup_suppressed_total);
         return 0;
       }
       s_p0_dedup[i].last_ms = now;
+      s_p0_dedup[i].event_time_ns = br->event_time_ns;
       return 1;
     }
   }
@@ -108,7 +129,9 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
   snprintf(s->rule_id, sizeof(s->rule_id), "%s", rule_id ? rule_id : "");
   snprintf(s->endpoint_id, sizeof(s->endpoint_id), "%s", br->endpoint_id);
   s->pid = br->pid;
+  s->event_time_ns = br->event_time_ns;
   s->last_ms = now;
+  s->suppressed_count = 0;
   return 1;
 }
 
