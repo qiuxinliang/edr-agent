@@ -9,6 +9,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <Sddl.h>
+#include <TlHelp32.h>
 
 static int edr_get_process_path_by_pid(DWORD pid, char *out, size_t out_cap) {
   if (!out || out_cap < 2) {
@@ -91,6 +92,26 @@ static int edr_get_process_username_by_pid(DWORD pid, char *out, size_t out_cap)
   CloseHandle(hToken);
   CloseHandle(hProcess);
   return result;
+}
+
+static int edr_get_ppid_from_system(DWORD pid, DWORD *out_ppid) {
+  if (!out_ppid || pid == 0) return -1;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return -1;
+  PROCESSENTRY32W pe;
+  pe.dwSize = (DWORD)sizeof(pe);
+  int found = 0;
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (pe.th32ProcessID == pid) {
+        *out_ppid = (DWORD)pe.th32ParentProcessID;
+        found = 1;
+        break;
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  return found ? 0 : -1;
 }
 #endif
 
@@ -408,6 +429,14 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.ppid) {
       r->ppid = (uint32_t)ef.ppid;
     }
+#if defined(_WIN32)
+    if (r->ppid == 0u && r->pid != 0u) {
+      DWORD sppid = 0;
+      if (edr_get_ppid_from_system((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
+        r->ppid = (uint32_t)sppid;
+      }
+    }
+#endif
     if (ef.has_img) {
       snprintf(r->exe_path, sizeof(r->exe_path), "%s", ef.img);
       /* DLL/DRIVER 加载事件：img 是模块路径而非进程路径，不应作为 process_name */
