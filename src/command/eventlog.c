@@ -46,21 +46,28 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
             DWORD bufUsed = 0, propCount = 0;
             EvtRender(NULL, events[i], EvtRenderEventXml, 0, NULL, &bufUsed, &propCount);
             if (bufUsed > 0 && bufUsed < EVT_MAX_XML) {
-                char *xml = (char *)malloc(bufUsed + 1);
-                if (xml) {
+                WCHAR *wxml = (WCHAR *)malloc((bufUsed + 1) * sizeof(WCHAR));
+                if (wxml) {
                     if (EvtRender(NULL, events[i], EvtRenderEventXml,
-                                  bufUsed, xml, &bufUsed, &propCount)) {
-                        xml[bufUsed] = '\0';
-                        if (!first) fprintf(f, ",\n");
-                        first = 0;
-                        for (DWORD k = 0; k < bufUsed; k++) {
-                            if (xml[k] == '\n' || xml[k] == '\r' || xml[k] == '\t')
-                                xml[k] = ' ';
+                                  bufUsed + 1, wxml, &bufUsed, &propCount)) {
+                        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wxml, -1, NULL, 0, NULL, NULL);
+                        if (utf8Len > 1) {
+                            char *utf8 = (char *)malloc(utf8Len);
+                            if (utf8) {
+                                WideCharToMultiByte(CP_UTF8, 0, wxml, -1, utf8, utf8Len, NULL, NULL);
+                                if (!first) fprintf(f, ",\n");
+                                first = 0;
+                                for (int k = 0; k < utf8Len - 1; k++) {
+                                    if (utf8[k] == '\n' || utf8[k] == '\r' || utf8[k] == '\t')
+                                        utf8[k] = ' ';
+                                }
+                                fprintf(f, "%s", utf8);
+                                total++;
+                                free(utf8);
+                            }
                         }
-                        fprintf(f, "%s", xml);
-                        total++;
                     }
-                    free(xml);
+                    free(wxml);
                 }
             }
             EvtClose(events[i]);
