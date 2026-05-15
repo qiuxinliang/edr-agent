@@ -11,7 +11,6 @@
 #include "edr/command_util.h"
 #include "edr/ingest_http.h"
 #include "edr/response.h"
-#include "edr/shell_exec.h"
 
 #ifdef _WIN32
 

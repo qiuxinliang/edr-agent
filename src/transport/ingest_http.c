@@ -1327,7 +1327,7 @@ static int copy_minio_key_from_json(const char *json, char *out, size_t out_cap)
   if (!k) {
     return -1;
   }
-  k += 14; /* past "minio_key":" */
+  k += 13; /* past "minio_key":" */
   {
     const char *e = k;
     for (; *e && *e != '"'; e++) {
