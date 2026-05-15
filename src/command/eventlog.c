@@ -43,13 +43,13 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
         if (!EvtNext(hQuery, 32, events, INFINITE, 0, &returned))
             break;
         for (DWORD i = 0; i < returned && total < max_events; i++) {
-            DWORD bufUsed = 0;
-            EvtRender(NULL, events[i], EvtRenderEventXml, 0, NULL, &bufUsed, &bufUsed);
+            DWORD bufUsed = 0, propCount = 0;
+            EvtRender(NULL, events[i], EvtRenderEventXml, 0, NULL, &bufUsed, &propCount);
             if (bufUsed > 0 && bufUsed < EVT_MAX_XML) {
                 char *xml = (char *)malloc(bufUsed + 1);
                 if (xml) {
                     if (EvtRender(NULL, events[i], EvtRenderEventXml,
-                                  bufUsed, xml, &bufUsed, &bufUsed)) {
+                                  bufUsed, xml, &bufUsed, &propCount)) {
                         xml[bufUsed] = '\0';
                         if (!first) fprintf(f, ",\n");
                         first = 0;
@@ -74,24 +74,25 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
     const char *cmd = "journalctl --output=json -n ";
     char buf[512];
     snprintf(buf, sizeof(buf), "%s%d", cmd, max_events > 0 ? max_events : 100);
-    if (channel && channel[0] && strcmp(channel, "Security") != 0) {
-        FILE *p = popen(buf, "r");
-        if (!p) return -1;
-        char line[8192];
-        int first = 1, count = 0;
-        while (fgets(line, sizeof(line), p) && count < max_events) {
-            size_t l = strlen(line);
-            if (l > 0 && line[l-1] == '\n') line[l-1] = '\0';
-            if (!first) fprintf(f, ",\n");
-            first = 0;
-            fprintf(f, "%s", line);
-            count++;
-        }
-        pclose(p);
-        return count;
+    (void)channel;
+
+    FILE *p = popen(buf, "r");
+    if (!p) {
+        fprintf(f, "[]");
+        return 0;
     }
-    fprintf(f, "[]");
-    return 0;
+    char line[8192];
+    int first = 1, count = 0;
+    while (fgets(line, sizeof(line), p) && count < max_events) {
+        size_t l = strlen(line);
+        if (l > 0 && line[l-1] == '\n') line[l-1] = '\0';
+        if (!first) fprintf(f, ",\n");
+        first = 0;
+        fprintf(f, "%s", line);
+        count++;
+    }
+    pclose(p);
+    return count;
 }
 #endif
 
