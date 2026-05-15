@@ -57,11 +57,14 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
                                 WideCharToMultiByte(CP_UTF8, 0, wxml, -1, utf8, utf8Len, NULL, NULL);
                                 if (!first) fprintf(f, ",\n");
                                 first = 0;
+                                fputc('"', f);
                                 for (int k = 0; k < utf8Len - 1; k++) {
-                                    if (utf8[k] == '\n' || utf8[k] == '\r' || utf8[k] == '\t')
-                                        utf8[k] = ' ';
+                                    char c = utf8[k];
+                                    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+                                    if (c == '"' || c == '\\') fputc('\\', f);
+                                    fputc(c, f);
                                 }
-                                fprintf(f, "%s", utf8);
+                                fputc('"', f);
                                 total++;
                                 free(utf8);
                             }
