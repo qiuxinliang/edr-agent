@@ -52,7 +52,7 @@ static void format_data(FILE *f, DWORD type, const BYTE *data, DWORD size) {
                 else if (tmp[j] == '\r') fprintf(f, "\\r");
                 else if (tmp[j] == '\t') fprintf(f, "\\t");
                 else if ((unsigned char)tmp[j] >= 32) putc(tmp[j], f);
-                else fprintf(f, "\\x%02x", (unsigned char)tmp[j]);
+                else fprintf(f, "\\u%04x", (unsigned char)tmp[j]);
             }
             free(tmp);
         }

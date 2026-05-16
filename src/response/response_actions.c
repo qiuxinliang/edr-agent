@@ -474,8 +474,11 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
   FILE *f = fopen(path, "rb");
   if (!f) {
     g_cmd_exec_fail++;
-    edr_command_audit_both(cmd_id, "rtr_get: 文件不存在");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
+    char errbuf[600];
+    snprintf(errbuf, sizeof(errbuf), "rtr_get: 文件不存在 path=%s", path);
+    edr_command_audit_both(cmd_id, errbuf);
+    snprintf(errbuf, sizeof(errbuf), "file not found: %s", path);
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, errbuf);
     return;
   }
   fseek(f, 0, SEEK_END);
@@ -895,8 +898,16 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
   if (response_make_tar_bundle(dir, bundle) == 0) {
     g_cmd_exec_ok++;
     edr_command_audit_both(cmd_id, "forensic: manifest + bundle.tgz");
-    edr_ingest_http_upload_file_multipart(cmd_id, bundle, NULL, NULL, 0);
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, "forensic bundle ok");
+    char minio_key[512];
+    minio_key[0] = '\0';
+    edr_ingest_http_upload_file_multipart(cmd_id, bundle, NULL, minio_key, sizeof(minio_key));
+    char result[1024];
+    if (minio_key[0]) {
+      snprintf(result, sizeof(result), "forensic bundle ok minio_key=%s", minio_key);
+    } else {
+      snprintf(result, sizeof(result), "forensic bundle ok");
+    }
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
   } else {
     g_cmd_exec_fail++;
     edr_command_audit_both(cmd_id, "forensic: tar bundle 失败");
@@ -1361,6 +1372,21 @@ void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t le
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
+static int collector_escape_append(char *buf, int off, int cap, const char *s) {
+    int w = off;
+    for (; s && *s && w < cap - 8; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"') { w += snprintf(buf + w, (size_t)(cap - w), "\\\""); }
+        else if (c == '\\') { w += snprintf(buf + w, (size_t)(cap - w), "\\\\"); }
+        else if (c == '\n') { w += snprintf(buf + w, (size_t)(cap - w), "\\n"); }
+        else if (c == '\r') { w += snprintf(buf + w, (size_t)(cap - w), "\\r"); }
+        else if (c == '\t') { w += snprintf(buf + w, (size_t)(cap - w), "\\t"); }
+        else if (c < 0x20) { w += snprintf(buf + w, (size_t)(cap - w), "\\u%04x", (unsigned)c); }
+        else { buf[w++] = (char)c; }
+    }
+    return w;
+}
+
 void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t len,
                                   const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
@@ -1392,7 +1418,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       _pclose(pp);
@@ -1407,7 +1433,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       _pclose(pp);
@@ -1423,7 +1449,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512 && line < 200) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
         line++;
       }
@@ -1439,7 +1465,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       _pclose(pp);
@@ -1455,7 +1481,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       pclose(pp);
@@ -1470,7 +1496,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       pclose(pp);
@@ -1485,7 +1511,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       pclose(pp);
@@ -1500,7 +1526,7 @@ void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t 
       while (fgets(lb, sizeof(lb), pp) && off < (int)sizeof(buf) - 512) {
         size_t lb_len = strlen(lb);
         if (off + (int)lb_len + 2 < (int)sizeof(buf)) {
-          off += snprintf(buf + off, sizeof(buf) - off, "%s", lb);
+          off = collector_escape_append(buf, off, (int)sizeof(buf), lb);
         }
       }
       pclose(pp);

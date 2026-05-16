@@ -59,10 +59,14 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
                                 first = 0;
                                 fputc('"', f);
                                 for (int k = 0; k < utf8Len - 1; k++) {
-                                    char c = utf8[k];
-                                    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-                                    if (c == '"' || c == '\\') fputc('\\', f);
-                                    fputc(c, f);
+                                    unsigned char c = (unsigned char)utf8[k];
+                                    if (c == '"') fputs("\\\"", f);
+                                    else if (c == '\\') fputs("\\\\", f);
+                                    else if (c == '\n') fputs("\\n", f);
+                                    else if (c == '\r') fputs("\\r", f);
+                                    else if (c == '\t') fputs("\\t", f);
+                                    else if (c < 0x20) fprintf(f, "\\u%04x", (unsigned)c);
+                                    else fputc((int)c, f);
                                 }
                                 fputc('"', f);
                                 total++;

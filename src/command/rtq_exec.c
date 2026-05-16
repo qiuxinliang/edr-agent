@@ -161,8 +161,14 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
                     "{\"type\":\"process\",\"pid\":%lu,\"name\":\"", (unsigned long)pe.th32ProcessID);
                 for (const char *p = name; *p; p++) {
-                    if (*p == '"' || *p == '\\') buf[(*offset)++] = '\\';
-                    buf[(*offset)++] = *p;
+                    unsigned char c = (unsigned char)*p;
+                    if (c == '"') { buf[(*offset)++] = '\\'; buf[(*offset)++] = '"'; }
+                    else if (c == '\\') { buf[(*offset)++] = '\\'; buf[(*offset)++] = '\\'; }
+                    else if (c == '\n') { buf[(*offset)++] = '\\'; buf[(*offset)++] = 'n'; }
+                    else if (c == '\r') { buf[(*offset)++] = '\\'; buf[(*offset)++] = 'r'; }
+                    else if (c == '\t') { buf[(*offset)++] = '\\'; buf[(*offset)++] = 't'; }
+                    else if (c < 0x20) { (*offset) += snprintf(buf + (*offset), (size_t)(cap - (*offset)), "\\u%04x", (unsigned)c); }
+                    else { buf[(*offset)++] = (char)c; }
                 }
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"ppid\":%lu}",
                     (unsigned long)pe.th32ParentProcessID);
@@ -265,8 +271,14 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
                         "{\"type\":\"process\",\"pid\":%d,\"name\":\"", loc_pid);
                     for (const char *q = loc_comm; *q; q++) {
-                        if (*q == '"' || *q == '\\') result[offset++] = '\\';
-                        result[offset++] = *q;
+                        unsigned char c = (unsigned char)*q;
+                        if (c == '"') { result[offset++] = '\\'; result[offset++] = '"'; }
+                        else if (c == '\\') { result[offset++] = '\\'; result[offset++] = '\\'; }
+                        else if (c == '\n') { result[offset++] = '\\'; result[offset++] = 'n'; }
+                        else if (c == '\r') { result[offset++] = '\\'; result[offset++] = 'r'; }
+                        else if (c == '\t') { result[offset++] = '\\'; result[offset++] = 't'; }
+                        else if (c < 0x20) { offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\\u%04x", (unsigned)c); }
+                        else { result[offset++] = (char)c; }
                     }
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
                         "\",\"user\":\"%s\"}", loc_user);
@@ -287,9 +299,13 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
                         "{\"type\":\"network\",\"line\":\"");
                     for (const char *q = line; *q; q++) {
-                        if (*q == '\n' || *q == '\r') break;
-                        if (*q == '"' || *q == '\\') result[offset++] = '\\';
-                        result[offset++] = *q;
+                        unsigned char c = (unsigned char)*q;
+                        if (c == '\n' || c == '\r') break;
+                        if (c == '"') { result[offset++] = '\\'; result[offset++] = '"'; }
+                        else if (c == '\\') { result[offset++] = '\\'; result[offset++] = '\\'; }
+                        else if (c == '\t') { result[offset++] = '\\'; result[offset++] = 't'; }
+                        else if (c < 0x20) { offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\\u%04x", (unsigned)c); }
+                        else { result[offset++] = (char)c; }
                     }
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\"}");
                     total++;
