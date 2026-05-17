@@ -528,8 +528,8 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
       edr_ingest_http_upload_file_multipart(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
       remove(tmp_path);
       char result[1280];
-      snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld minio_key=%s %s",
-               sha, fsize, minio_key[0] ? minio_key : "", pe_info);
+      snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld path=%s minio_key=%s %s",
+               sha, fsize, path, minio_key[0] ? minio_key : "", pe_info);
       free(buf);
       g_cmd_handled++; g_cmd_exec_ok++;
       edr_command_audit_both(cmd_id, "rtr_get: PE验证通过+上传");
@@ -537,7 +537,7 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     } else {
       free(buf);
       char result[1024];
-      snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld (upload failed) %s", sha, fsize, pe_info);
+      snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld path=%s (upload failed) %s", sha, fsize, path, pe_info);
       g_cmd_handled++; g_cmd_exec_ok++;
       edr_command_audit_both(cmd_id, "rtr_get: PE验证通过, 上传失败");
       edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
@@ -555,16 +555,16 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     edr_ingest_http_upload_file_multipart(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
     remove(tmp_path);
     char result[768];
-    snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld minio_key=%s",
-             sha, fsize, minio_key[0] ? minio_key : "");
+    snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld path=%s minio_key=%s",
+             sha, fsize, path, minio_key[0] ? minio_key : "");
     free(buf);
     g_cmd_handled++; g_cmd_exec_ok++;
     edr_command_audit_both(cmd_id, "rtr_get: 文件读取+上传成功");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
   } else {
     char result[512];
-    snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld (upload to backend failed, tmp write error)",
-             sha, fsize);
+    snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld path=%s (upload to backend failed, tmp write error)",
+             sha, fsize, path);
     free(buf);
     g_cmd_handled++; g_cmd_exec_ok++;
     edr_command_audit_both(cmd_id, "rtr_get: 文件读取成功, tmp写入失败");

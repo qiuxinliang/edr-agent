@@ -17,10 +17,13 @@ typedef struct {
   uint32_t ppid;
   uint64_t start_time_ns;
   uint64_t last_seen_ns;
+  uint64_t terminate_time_ns;
   char process_name[EDR_PTC_STR_SHORT];
   char cmdline[EDR_PTC_STR_LONG];
   char exe_path[EDR_PTC_STR_PATH];
   char parent_name[EDR_PTC_STR_SHORT];
+  uint32_t generation;
+  int terminated;
 } ProcessTreeEntry;
 
 void edr_pt_cache_init(void);
@@ -80,5 +83,54 @@ void edr_pt_cache_get_key_procs(EdrKeyProcSlot *out, int max);
  * 根据名称查找关键系统进程 PID；返回 0 成功（pid 有效），-1 未找到。
  */
 int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid);
+
+/**
+ * 智能推断父进程：当直接获取PPID失败时，基于时间窗口和启发式算法推断父进程
+ * @param pid: 目标进程PID
+ * @param event_time_ns: 事件时间戳（纳秒）
+ * @param out_ppid: 输出推断的父进程PID
+ * @param out_parent_name: 输出父进程名称
+ * @param name_len: 名称缓冲区长度
+ * @return: 0 成功，-1 失败
+ */
+int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
+                              uint32_t *out_ppid, char *out_parent_name, size_t name_len);
+
+/**
+ * 获取历史进程记录（即使已终止也能查询）
+ * @param pid: 目标进程PID
+ * @param timestamp: 查询时间戳（用于处理PID复用）
+ * @param out: 输出进程信息
+ * @return: 0 成功，-1 未找到
+ */
+int edr_pt_cache_get_historical(uint32_t pid, uint64_t timestamp, ProcessTreeEntry *out);
+
+/**
+ * 标记进程终止（保留历史记录）
+ * @param pid: 进程PID
+ * @param terminate_time_ns: 终止时间戳
+ * @return: 0 成功，-1 未找到
+ */
+int edr_pt_cache_mark_terminated(uint32_t pid, uint64_t terminate_time_ns);
+
+/**
+ * 获取PID世代计数器（用于检测PID复用）
+ */
+uint32_t edr_pt_cache_get_generation(void);
+
+/**
+ * 增加PID世代计数器
+ */
+void edr_pt_cache_increment_generation(void);
+
+/**
+ * 设置历史记录保留时间（秒）
+ */
+void edr_pt_cache_set_history_ttl(uint32_t ttl_seconds);
+
+/**
+ * 清理过期历史记录
+ */
+void edr_pt_cache_cleanup_history(void);
 
 #endif

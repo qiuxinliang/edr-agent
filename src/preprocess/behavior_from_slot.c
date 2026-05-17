@@ -27,13 +27,16 @@ static volatile LONG64 s_ppid_zero_events;
 static volatile LONG64 s_ppid_total_events;
 static volatile LONG64 s_ppid_snapshot_fallback_ok;
 static volatile LONG64 s_ppid_ntqi_fallback_ok;
+static volatile LONG64 s_ppid_infer_ok;
 
 void edr_behavior_get_ppid_stats(int64_t *out_zero, int64_t *out_total,
-                                 int64_t *out_snap_ok, int64_t *out_ntqi_ok) {
+                                 int64_t *out_snap_ok, int64_t *out_ntqi_ok,
+                                 int64_t *out_infer_ok) {
   if (out_zero)   *out_zero   = s_ppid_zero_events;
   if (out_total)  *out_total  = s_ppid_total_events;
   if (out_snap_ok) *out_snap_ok = s_ppid_snapshot_fallback_ok;
   if (out_ntqi_ok) *out_ntqi_ok = s_ppid_ntqi_fallback_ok;
+  if (out_infer_ok) *out_infer_ok = s_ppid_infer_ok;
 }
 
 static int edr_get_ppid_via_ntqi(DWORD pid, DWORD *out_ppid) {
@@ -486,7 +489,25 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         r->ppid = (uint32_t)sppid;
         (void)InterlockedAdd64(&s_ppid_snapshot_fallback_ok, 1);
       } else {
-        (void)InterlockedAdd64(&s_ppid_zero_events, 1);
+        uint64_t event_time = 0;
+        if (ef.time_ns) {
+          event_time = (uint64_t)ef.time_ns;
+        } else {
+          FILETIME ft;
+          GetSystemTimeAsFileTime(&ft);
+          event_time = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        }
+        
+        char inferred_parent_name[64] = {0};
+        if (edr_pt_cache_infer_parent(r->pid, event_time, &sppid, inferred_parent_name, sizeof(inferred_parent_name)) == 0 && sppid > 0) {
+          r->ppid = (uint32_t)sppid;
+          if (inferred_parent_name[0] && !r->parent_name[0]) {
+            snprintf(r->parent_name, sizeof(r->parent_name), "%s", inferred_parent_name);
+          }
+          (void)InterlockedAdd64(&s_ppid_infer_ok, 1);
+        } else {
+          (void)InterlockedAdd64(&s_ppid_zero_events, 1);
+        }
       }
     }
     (void)InterlockedAdd64(&s_ppid_total_events, 1);

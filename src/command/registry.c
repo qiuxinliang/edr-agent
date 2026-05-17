@@ -76,6 +76,19 @@ static void format_data(FILE *f, DWORD type, const BYTE *data, DWORD size) {
     }
 }
 
+static void fprint_json_escaped(FILE *f, const char *s) {
+	for (const char *p = s; *p; p++) {
+		unsigned char c = (unsigned char)*p;
+		if (c == '"') fprintf(f, "\\\"");
+		else if (c == '\\') fprintf(f, "\\\\");
+		else if (c == '\n') fprintf(f, "\\n");
+		else if (c == '\r') fprintf(f, "\\r");
+		else if (c == '\t') fprintf(f, "\\t");
+		else if (c >= 32) putc(c, f);
+		else fprintf(f, "\\u%04x", c);
+	}
+}
+
 static void enum_values(FILE *f, HKEY root, const char *subkey,
                         int *first, int *count) {
     HKEY hKey;
@@ -95,7 +108,9 @@ static void enum_values(FILE *f, HKEY root, const char *subkey,
         if (lr != ERROR_SUCCESS) break;
 
         if (!*first) fprintf(f, ",\n");
-        fprintf(f, "    {\"name\":\"%s\",\"type\":%lu,\"data\":\"", name, (unsigned long)type);
+		fprintf(f, "    {\"name\":\"");
+		fprint_json_escaped(f, name);
+		fprintf(f, "\",\"type\":%lu,\"data\":\"", (unsigned long)type);
         format_data(f, type, data, dataSize);
         fprintf(f, "\"}");
         *first = 0;
@@ -167,7 +182,9 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
         return;
     }
 
-    fprintf(f, "{\"key\":\"%s\",\"values\":[\n", key_path);
+    fprintf(f, "{\"key\":\"");
+	fprint_json_escaped(f, key_path);
+	fprintf(f, "\",\"values\":[\n");
     int first = 1, count = 0;
     if (recursive) {
         enum_subkeys_recursive(f, root, subkey, &first, &count, 5, 0);
