@@ -13,7 +13,7 @@
 #include <unistd.h>
 #endif
 
-#define MMAP_MAGIC 0xEDR_PROC_HISTORY
+#define MMAP_MAGIC 0x4544525F50524F43ULL
 #define MMAP_VERSION 1
 
 static MMapStorageHeader *g_mmap = NULL;
@@ -215,7 +215,7 @@ void edr_mmap_storage_cleanup_old(uint64_t max_age_ns) {
   
   uint64_t cutoff = (uint64_t)time(NULL) * 1000000000ULL - max_age_ns;
   
-  size_t write_idx = 0;
+  uint32_t write_idx = 0;
   for (size_t i = 0; i < g_mmap->count; i++) {
     MMapProcessEntry *e = &g_mmap->entries[i];
     if (e->create_time > cutoff) {
