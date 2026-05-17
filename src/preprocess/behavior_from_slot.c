@@ -150,77 +150,9 @@ static int edr_get_process_username_by_pid(DWORD pid, char *out, size_t out_cap)
 }
 
 static int edr_get_ppid_via_wmi(DWORD pid, DWORD *out_ppid) {
-  if (!out_ppid || pid == 0) return -1;
-  
-  HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-  if (FAILED(hr)) return -1;
-  
-  IWbemLocator *pLocator = NULL;
-  hr = CoCreateInstance(&CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, 
-                        &IID_IWbemLocator, (void**)&pLocator);
-  if (FAILED(hr)) {
-    CoUninitialize();
-    return -1;
-  }
-  
-  IWbemServices *pServices = NULL;
-  hr = pLocator->lpVtbl->ConnectServer(pLocator, 
-                                       (BSTR)L"ROOT\\CIMV2", 
-                                       NULL, NULL, NULL, 0, NULL, NULL, 
-                                       &pServices);
-  pLocator->lpVtbl->Release(pLocator);
-  if (FAILED(hr)) {
-    CoUninitialize();
-    return -1;
-  }
-  
-  hr = CoSetProxyBlanket(pServices, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
-                         RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
-                         NULL, EOAC_NONE);
-  if (FAILED(hr)) {
-    pServices->lpVtbl->Release(pServices);
-    CoUninitialize();
-    return -1;
-  }
-  
-  WCHAR query[256];
-  swprintf(query, sizeof(query)/sizeof(WCHAR), 
-           L"SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = %lu", pid);
-  
-  IEnumWbemClassObject *pEnumerator = NULL;
-  hr = pServices->lpVtbl->ExecQuery(pServices, (BSTR)L"WQL", (BSTR)query,
-                                     WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-                                     NULL, &pEnumerator);
-  pServices->lpVtbl->Release(pServices);
-  if (FAILED(hr)) {
-    CoUninitialize();
-    return -1;
-  }
-  
-  int result = -1;
-  IWbemClassObject *pObject = NULL;
-  ULONG uReturn = 0;
-  
-  if (pEnumerator) {
-    if (pEnumerator->lpVtbl->Next(pEnumerator, WBEM_INFINITE, 1, &pObject, &uReturn) == S_OK && uReturn > 0) {
-      VARIANT vtProp;
-      VariantInit(&vtProp);
-      if (pObject->lpVtbl->Get(pObject, (BSTR)L"ParentProcessId", 0, &vtProp, NULL, NULL) == S_OK) {
-        if (vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal != pid) {
-          *out_ppid = (DWORD)vtProp.lVal;
-          result = 0;
-        }
-      }
-      VariantClear(&vtProp);
-      if (pObject) {
-        pObject->lpVtbl->Release(pObject);
-      }
-    }
-    pEnumerator->lpVtbl->Release(pEnumerator);
-  }
-  
-  CoUninitialize();
-  return result;
+  (void)pid;
+  (void)out_ppid;
+  return -1;
 }
 
 static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
