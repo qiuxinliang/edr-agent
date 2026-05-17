@@ -200,20 +200,25 @@ static int edr_get_ppid_via_wmi(DWORD pid, DWORD *out_ppid) {
   int result = -1;
   IWbemClassObject *pObject = NULL;
   ULONG uReturn = 0;
-  if (pEnumerator->lpVtbl->Next(pEnumerator, WBEM_INFINITE, 1, &pObject, &uReturn) == S_OK && uReturn > 0) {
-    VARIANT vtProp;
-    VariantInit(&vtProp);
-    if (pObject->lpVtbl->Get(pObject, (BSTR)L"ParentProcessId", 0, &vtProp, NULL, NULL) == S_OK) {
-      if (vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal != pid) {
-        *out_ppid = (DWORD)vtProp.lVal;
-        result = 0;
+  
+  if (pEnumerator) {
+    if (pEnumerator->lpVtbl->Next(pEnumerator, WBEM_INFINITE, 1, &pObject, &uReturn) == S_OK && uReturn > 0) {
+      VARIANT vtProp;
+      VariantInit(&vtProp);
+      if (pObject->lpVtbl->Get(pObject, (BSTR)L"ParentProcessId", 0, &vtProp, NULL, NULL) == S_OK) {
+        if (vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal != pid) {
+          *out_ppid = (DWORD)vtProp.lVal;
+          result = 0;
+        }
+      }
+      VariantClear(&vtProp);
+      if (pObject) {
+        pObject->lpVtbl->Release(pObject);
       }
     }
-    VariantClear(&vtProp);
-    pObject->lpVtbl->Release(pObject);
+    pEnumerator->lpVtbl->Release(pEnumerator);
   }
   
-  pEnumerator->lpVtbl->Release(pEnumerator);
   CoUninitialize();
   return result;
 }
@@ -230,8 +235,9 @@ static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
     return -1;
   }
   
+  const DWORD tokenEnvInfo = 10;
   DWORD needed = 0;
-  GetTokenInformation(hToken, TokenEnvironment, NULL, 0, &needed);
+  GetTokenInformation(hToken, tokenEnvInfo, NULL, 0, &needed);
   if (needed == 0) {
     CloseHandle(hToken);
     CloseHandle(hProcess);
@@ -246,12 +252,12 @@ static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
   }
   
   int result = -1;
-  if (GetTokenInformation(hToken, TokenEnvironment, envBlock, needed, &needed)) {
+  if (GetTokenInformation(hToken, tokenEnvInfo, envBlock, needed, &needed)) {
     WCHAR *env = (WCHAR*)envBlock;
     while (*env) {
       size_t len = wcslen(env);
       if (len > 10 && wcsncmp(env, L"PPID=", 5) == 0) {
-        DWORD ppid_val = (DWORD)_wcstol(env + 5, NULL, 10);
+        DWORD ppid_val = (DWORD)wcstol(env + 5, NULL, 10);
         if (ppid_val > 0 && ppid_val != pid) {
           *out_ppid = ppid_val;
           result = 0;
@@ -620,8 +626,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         (void)InterlockedAdd64(&s_ppid_env_fallback_ok, 1);
       } else {
         uint64_t event_time = 0;
-        if (ef.time_ns) {
-          event_time = (uint64_t)ef.time_ns;
+        if (r->event_time_ns > 0) {
+          event_time = (uint64_t)r->event_time_ns;
         } else {
           FILETIME ft;
           GetSystemTimeAsFileTime(&ft);
