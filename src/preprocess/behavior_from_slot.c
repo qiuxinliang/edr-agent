@@ -759,6 +759,10 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                      r->process_name, r->cmdline,
                      r->exe_path, r->parent_name,
                      (uint64_t)slot->timestamp_ns);
+    
+    if (strcasecmp(r->process_name, "explorer.exe") == 0) {
+      edr_pt_cache_update_explorer_info(r->pid, (uint64_t)slot->timestamp_ns);
+    }
   } else if (slot->type == EDR_EVENT_PROCESS_TERMINATE) {
     edr_pt_cache_remove(r->pid);
   }
@@ -775,3 +779,18 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
 
   edr_behavior_record_enrich_system_context(r);
 }
+
+#if !defined(_WIN32)
+void edr_behavior_get_ppid_stats(int64_t *out_zero, int64_t *out_total,
+                                 int64_t *out_snap_ok, int64_t *out_ntqi_ok,
+                                 int64_t *out_wmi_ok, int64_t *out_env_ok,
+                                 int64_t *out_infer_ok) {
+  if (out_zero)   *out_zero   = 0;
+  if (out_total)  *out_total  = 0;
+  if (out_snap_ok) *out_snap_ok = 0;
+  if (out_ntqi_ok) *out_ntqi_ok = 0;
+  if (out_wmi_ok)  *out_wmi_ok  = 0;
+  if (out_env_ok)  *out_env_ok  = 0;
+  if (out_infer_ok) *out_infer_ok = 0;
+}
+#endif

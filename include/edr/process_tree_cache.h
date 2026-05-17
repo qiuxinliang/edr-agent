@@ -27,6 +27,7 @@ typedef struct {
 } ProcessTreeEntry;
 
 void edr_pt_cache_init(void);
+void edr_pt_cache_init_with_path(const char *storage_path);
 void edr_pt_cache_shutdown(void);
 
 /**
@@ -132,5 +133,12 @@ void edr_pt_cache_set_history_ttl(uint32_t ttl_seconds);
  * 清理过期历史记录
  */
 void edr_pt_cache_cleanup_history(void);
+
+/**
+ * 更新explorer.exe进程信息（用于运行对话框场景的父进程推断）
+ * @param pid: explorer.exe的PID
+ * @param start_time: 启动时间戳（纳秒）
+ */
+void edr_pt_cache_update_explorer_info(uint32_t pid, uint64_t start_time);
 
 #endif

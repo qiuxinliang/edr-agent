@@ -1,4 +1,5 @@
 #include "edr/process_tree_cache.h"
+#include "edr/mmap_storage.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -105,6 +106,13 @@ static PTNode *pt_lru_evict(void) {
   return victim;
 }
 
+static const char *g_mmap_storage_path = NULL;
+
+void edr_pt_cache_init_with_path(const char *storage_path) {
+  g_mmap_storage_path = storage_path;
+  edr_pt_cache_init();
+}
+
 void edr_pt_cache_init(void) {
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
   (void)memset(g_pt_history, 0, sizeof(g_pt_history));
@@ -120,9 +128,14 @@ void edr_pt_cache_init(void) {
     g_pt_table[i].prev = NULL;
     g_pt_table[i].next = NULL;
   }
+  
+  if (g_mmap_storage_path) {
+    edr_mmap_storage_init(g_mmap_storage_path);
+  }
 }
 
 void edr_pt_cache_shutdown(void) {
+  edr_mmap_storage_cleanup();
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
   (void)memset(g_pt_history, 0, sizeof(g_pt_history));
   g_pt_history_count = 0;
@@ -185,6 +198,27 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
       } else {
         pt_lru_touch(&g_pt_table[probe]);
       }
+      
+      MMapProcessEntry mmap_entry = {0};
+      mmap_entry.pid = pid;
+      mmap_entry.ppid = ppid;
+      mmap_entry.create_time = start_time_ns;
+      mmap_entry.exit_time = 0;
+      mmap_entry.generation = g_pt_generation;
+      if (process_name) {
+        strncpy(mmap_entry.name, process_name, sizeof(mmap_entry.name) - 1);
+      }
+      if (cmdline) {
+        strncpy(mmap_entry.cmdline, cmdline, sizeof(mmap_entry.cmdline) - 1);
+      }
+      if (exe_path) {
+        strncpy(mmap_entry.exe_path, exe_path, sizeof(mmap_entry.exe_path) - 1);
+      }
+      if (parent_name) {
+        strncpy(mmap_entry.parent_name, parent_name, sizeof(mmap_entry.parent_name) - 1);
+      }
+      mmap_entry.exited = 0;
+      edr_mmap_storage_add(&mmap_entry);
       
       return 0;
     }
@@ -296,8 +330,8 @@ static void edr_pt_cache_refresh_key_procs(void) {
     for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
       if (g_key_procs[k].valid) continue;
 #ifdef _MSC_VER
-      int match = (_stricmp(name, g_key_proc_names[k]) == 0 ||
-                   (exe_name[0] && _stricmp(exe_name, g_key_proc_names[k]) == 0));
+      int match = (strcasecmp(name, g_key_proc_names[k]) == 0 ||
+                   (exe_name[0] && strcasecmp(exe_name, g_key_proc_names[k]) == 0));
 #else
       int match = (strcasecmp(name, g_key_proc_names[k]) == 0);
 #endif
@@ -410,6 +444,13 @@ int edr_pt_cache_mark_terminated(uint32_t pid, uint64_t terminate_time_ns) {
         e->terminated = 1;
         e->terminate_time_ns = terminate_time_ns;
         pt_add_to_history(e);
+        
+        MMapProcessEntry mmap_entry = {0};
+        if (edr_mmap_storage_get(pid, terminate_time_ns, &mmap_entry) == 0) {
+          mmap_entry.exit_time = terminate_time_ns;
+          mmap_entry.exited = 1;
+          edr_mmap_storage_add(&mmap_entry);
+        }
       }
       return 0;
     }
@@ -419,6 +460,7 @@ int edr_pt_cache_mark_terminated(uint32_t pid, uint64_t terminate_time_ns) {
 
 int edr_pt_cache_get_historical(uint32_t pid, uint64_t timestamp, ProcessTreeEntry *out) {
   if (!g_pt_initialized || !out) return -1;
+  
   for (size_t i = 0; i < g_pt_history_count; i++) {
     const ProcessTreeEntry *e = &g_pt_history[i];
     if (e->pid == pid && e->terminated) {
@@ -430,6 +472,24 @@ int edr_pt_cache_get_historical(uint32_t pid, uint64_t timestamp, ProcessTreeEnt
       }
     }
   }
+  
+  MMapProcessEntry mmap_entry = {0};
+  if (edr_mmap_storage_get(pid, timestamp, &mmap_entry) == 0) {
+    memset(out, 0, sizeof(ProcessTreeEntry));
+    out->pid = mmap_entry.pid;
+    out->ppid = mmap_entry.ppid;
+    out->start_time_ns = mmap_entry.create_time;
+    out->last_seen_ns = mmap_entry.create_time;
+    out->terminate_time_ns = mmap_entry.exit_time;
+    out->generation = mmap_entry.generation;
+    out->terminated = mmap_entry.exited;
+    strncpy(out->process_name, mmap_entry.name, EDR_PTC_STR_SHORT - 1);
+    strncpy(out->cmdline, mmap_entry.cmdline, EDR_PTC_STR_LONG - 1);
+    strncpy(out->exe_path, mmap_entry.exe_path, EDR_PTC_STR_PATH - 1);
+    strncpy(out->parent_name, mmap_entry.parent_name, EDR_PTC_STR_SHORT - 1);
+    return 0;
+  }
+  
   return -1;
 }
 
@@ -443,6 +503,14 @@ static const char *g_common_parent_processes[] = {
   "conhost.exe",
   NULL
 };
+
+static uint32_t g_explorer_pid = 0;
+static uint64_t g_explorer_start_time = 0;
+
+void edr_pt_cache_update_explorer_info(uint32_t pid, uint64_t start_time) {
+  g_explorer_pid = pid;
+  g_explorer_start_time = start_time;
+}
 
 int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
                               uint32_t *out_ppid, char *out_parent_name, size_t name_len) {
@@ -458,13 +526,27 @@ int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
     return 0;
   }
   
+  if (g_explorer_pid > 0 && g_explorer_start_time > 0) {
+    uint64_t diff = event_time_ns > g_explorer_start_time ? 
+                    event_time_ns - g_explorer_start_time : g_explorer_start_time - event_time_ns;
+    
+    if (diff < PT_INFER_WINDOW_NS * 10) {
+      *out_ppid = g_explorer_pid;
+      if (out_parent_name && name_len > 0) {
+        strncpy(out_parent_name, "explorer.exe", name_len - 1);
+        out_parent_name[name_len - 1] = '\0';
+      }
+      return 0;
+    }
+  }
+  
   for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
     if (!g_pt_table[i].occupied) continue;
     const ProcessTreeEntry *e = &g_pt_table[i].entry;
     if (e->pid == pid || e->terminated) continue;
     
     for (int j = 0; g_common_parent_processes[j]; j++) {
-      if (_stricmp(e->process_name, g_common_parent_processes[j]) == 0) {
+      if (strcasecmp(e->process_name, g_common_parent_processes[j]) == 0) {
         *out_ppid = e->pid;
         if (out_parent_name && name_len > 0) {
           strncpy(out_parent_name, e->process_name, name_len - 1);
@@ -507,7 +589,7 @@ int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
     if (e->pid == pid) continue;
     
     for (int j = 0; g_common_parent_processes[j]; j++) {
-      if (_stricmp(e->process_name, g_common_parent_processes[j]) == 0) {
+      if (strcasecmp(e->process_name, g_common_parent_processes[j]) == 0) {
         uint64_t end_time = e->terminate_time_ns ? e->terminate_time_ns : e->start_time_ns;
         if (event_time_ns >= e->start_time_ns && event_time_ns <= end_time + PT_INFER_WINDOW_NS) {
           *out_ppid = e->pid;

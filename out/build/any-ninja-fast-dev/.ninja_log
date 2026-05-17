@@ -110,3 +110,17 @@
 13	379	1778987336046809514	CMakeFiles/edr_agent.dir/src/pmfe/pmfe_engine.c.o	871a6162c019ee71
 10	394	1778987336043188620	CMakeFiles/edr_agent.dir/src/core/agent.c.o	754161a1db013360
 11	411	1778987336044247126	CMakeFiles/edr_agent.dir/src/response/response_actions.c.o	ba2ec730783c593d
+20	176	1778991334848063348	CMakeFiles/edr_agent.dir/src/ave/ave_rules_meta.c.o	98d7e1d9ab23919b
+11	177	1778991334839968177	CMakeFiles/edr_agent.dir/src/ave/ave_onnx_infer.c.o	5b24d2cfe03c9cde
+8	178	1778991334836107697	CMakeFiles/edr_agent.dir/src/attack_surface/security_policy_collect.c.o	d49ff86964566366
+8	178	1778991334836637991	CMakeFiles/edr_agent.dir/src/resource/resource.c.o	55e30bb1e708f20
+8	179	1778991334836421032	CMakeFiles/edr_agent.dir/src/self_protect/self_protect.c.o	3fe27cbabb3f698f
+19	182	1778991334847833097	CMakeFiles/edr_agent.dir/src/ave/ave_suppression.c.o	b4463c2808cb21ec
+7	182	1778991334835976863	CMakeFiles/edr_agent.dir/src/forensic/process_tree_cache.c.o	4b9cf5d180457499
+11	182	1778991334839380424	CMakeFiles/edr_agent.dir/src/ave/ave_engine.c.o	d0955eb84590a5c2
+7	190	1778991334835382484	CMakeFiles/edr_agent.dir/src/preprocess/preprocess_pipeline.c.o	1b42b8ba6a295c2c
+7	195	1778991334835256525	CMakeFiles/edr_agent.dir/src/preprocess/behavior_from_slot.c.o	a0d18f97709b7ae6
+13	199	1778991334841508686	CMakeFiles/edr_agent.dir/src/ave/edr_onnx_behavior_fl_tensor_export.c.o	1fd592748b468eeb
+16	211	1778991334844370077	CMakeFiles/edr_agent.dir/src/ave/ave_sdk.c.o	fc4ffac3658e9bb9
+6	214	1778991334834963273	CMakeFiles/edr_agent.dir/src/core/agent.c.o	754161a1db013360
+20	233	1778991334848264516	CMakeFiles/edr_agent.dir/src/ave/ave_behavior_pipeline.c.o	c7cb5d4de12e905f
