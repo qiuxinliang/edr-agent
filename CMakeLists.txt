@@ -212,6 +212,21 @@ set(EDR_P0_RULES_BUNDLE_VERSION
     CACHE STRING
     "P0 dynamic rules bundle id (align with edr-agent/config/p0_rule_bundle_manifest.json and platform)")
 
+execute_process(
+  COMMAND git describe --tags --always --dirty
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE EDR_AGENT_VERSION_STRING
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE _GIT_DESCRIBE_RESULT
+)
+if(NOT _GIT_DESCRIBE_RESULT EQUAL 0 OR EDR_AGENT_VERSION_STRING STREQUAL "")
+  set(EDR_AGENT_VERSION_STRING "0.3.0-dev")
+  message(STATUS "git describe failed, fallback agent version: ${EDR_AGENT_VERSION_STRING}")
+else()
+  message(STATUS "Agent version from git: ${EDR_AGENT_VERSION_STRING}")
+endif()
+
 set(EDR_YARA_AVAILABLE 0)
 if(EDR_WITH_YARA)
   find_path(YARA_INCLUDE_DIR NAMES yara.h
@@ -277,6 +292,7 @@ set(EDR_AGENT_SOURCES
   src/forensic/process_tree_cache.c
   src/forensic/forensic_trigger.c
   src/forensic/deep_collector.c
+  src/storage/mmap_storage.c
   src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
@@ -629,6 +645,7 @@ target_compile_definitions(
   PRIVATE
     EDR_HAVE_NANOPB=1
     "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
+    "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
 )
 if(EDR_P0_IR_PCRE2)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)

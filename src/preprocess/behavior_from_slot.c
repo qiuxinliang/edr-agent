@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#define strcasecmp _stricmp
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 #include <Sddl.h>

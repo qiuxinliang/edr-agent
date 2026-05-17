@@ -120,6 +120,7 @@ static int mmap_open_file(const char *path) {
 }
 
 int edr_mmap_storage_init(const char *base_path) {
+  if (!base_path) return -1;
   snprintf(g_file_path, sizeof(g_file_path), "%s/%s", base_path, MMAP_STORAGE_FILE_NAME);
   
   int ret = mmap_open_file(g_file_path);
@@ -134,6 +135,14 @@ int edr_mmap_storage_init(const char *base_path) {
 
 int edr_mmap_storage_add(MMapProcessEntry *entry) {
   if (!g_mmap || !entry) return -1;
+  
+  for (size_t i = 0; i < g_mmap->count; i++) {
+    MMapProcessEntry *e = &g_mmap->entries[i];
+    if (e->pid == entry->pid && e->create_time == entry->create_time) {
+      memcpy(e, entry, sizeof(MMapProcessEntry));
+      return 0;
+    }
+  }
   
   if (g_mmap->count >= g_mmap->capacity) {
     edr_mmap_storage_cleanup_old(604800000000000ULL);
