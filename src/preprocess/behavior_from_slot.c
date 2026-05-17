@@ -27,15 +27,20 @@ static volatile LONG64 s_ppid_zero_events;
 static volatile LONG64 s_ppid_total_events;
 static volatile LONG64 s_ppid_snapshot_fallback_ok;
 static volatile LONG64 s_ppid_ntqi_fallback_ok;
+static volatile LONG64 s_ppid_wmi_fallback_ok;
+static volatile LONG64 s_ppid_env_fallback_ok;
 static volatile LONG64 s_ppid_infer_ok;
 
 void edr_behavior_get_ppid_stats(int64_t *out_zero, int64_t *out_total,
                                  int64_t *out_snap_ok, int64_t *out_ntqi_ok,
+                                 int64_t *out_wmi_ok, int64_t *out_env_ok,
                                  int64_t *out_infer_ok) {
   if (out_zero)   *out_zero   = s_ppid_zero_events;
   if (out_total)  *out_total  = s_ppid_total_events;
   if (out_snap_ok) *out_snap_ok = s_ppid_snapshot_fallback_ok;
   if (out_ntqi_ok) *out_ntqi_ok = s_ppid_ntqi_fallback_ok;
+  if (out_wmi_ok)  *out_wmi_ok  = s_ppid_wmi_fallback_ok;
+  if (out_env_ok)  *out_env_ok  = s_ppid_env_fallback_ok;
   if (out_infer_ok) *out_infer_ok = s_ppid_infer_ok;
 }
 
@@ -139,6 +144,125 @@ static int edr_get_process_username_by_pid(DWORD pid, char *out, size_t out_cap)
   }
 
   HeapFree(GetProcessHeap(), 0, pTokenUser);
+  CloseHandle(hToken);
+  CloseHandle(hProcess);
+  return result;
+}
+
+static int edr_get_ppid_via_wmi(DWORD pid, DWORD *out_ppid) {
+  if (!out_ppid || pid == 0) return -1;
+  
+  HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+  if (FAILED(hr)) return -1;
+  
+  IWbemLocator *pLocator = NULL;
+  hr = CoCreateInstance(&CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, 
+                        &IID_IWbemLocator, (void**)&pLocator);
+  if (FAILED(hr)) {
+    CoUninitialize();
+    return -1;
+  }
+  
+  IWbemServices *pServices = NULL;
+  hr = pLocator->lpVtbl->ConnectServer(pLocator, 
+                                       (BSTR)L"ROOT\\CIMV2", 
+                                       NULL, NULL, NULL, 0, NULL, NULL, 
+                                       &pServices);
+  pLocator->lpVtbl->Release(pLocator);
+  if (FAILED(hr)) {
+    CoUninitialize();
+    return -1;
+  }
+  
+  hr = CoSetProxyBlanket(pServices, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                         RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                         NULL, EOAC_NONE);
+  if (FAILED(hr)) {
+    pServices->lpVtbl->Release(pServices);
+    CoUninitialize();
+    return -1;
+  }
+  
+  WCHAR query[256];
+  swprintf(query, sizeof(query)/sizeof(WCHAR), 
+           L"SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = %lu", pid);
+  
+  IEnumWbemClassObject *pEnumerator = NULL;
+  hr = pServices->lpVtbl->ExecQuery(pServices, (BSTR)L"WQL", (BSTR)query,
+                                     WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                                     NULL, &pEnumerator);
+  pServices->lpVtbl->Release(pServices);
+  if (FAILED(hr)) {
+    CoUninitialize();
+    return -1;
+  }
+  
+  int result = -1;
+  IWbemClassObject *pObject = NULL;
+  ULONG uReturn = 0;
+  if (pEnumerator->lpVtbl->Next(pEnumerator, WBEM_INFINITE, 1, &pObject, &uReturn) == S_OK && uReturn > 0) {
+    VARIANT vtProp;
+    VariantInit(&vtProp);
+    if (pObject->lpVtbl->Get(pObject, (BSTR)L"ParentProcessId", 0, &vtProp, NULL, NULL) == S_OK) {
+      if (vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal != pid) {
+        *out_ppid = (DWORD)vtProp.lVal;
+        result = 0;
+      }
+    }
+    VariantClear(&vtProp);
+    pObject->lpVtbl->Release(pObject);
+  }
+  
+  pEnumerator->lpVtbl->Release(pEnumerator);
+  CoUninitialize();
+  return result;
+}
+
+static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
+  if (!out_ppid || pid == 0) return -1;
+  
+  HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+  if (!hProcess) return -1;
+  
+  HANDLE hToken = NULL;
+  if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+    CloseHandle(hProcess);
+    return -1;
+  }
+  
+  DWORD needed = 0;
+  GetTokenInformation(hToken, TokenEnvironment, NULL, 0, &needed);
+  if (needed == 0) {
+    CloseHandle(hToken);
+    CloseHandle(hProcess);
+    return -1;
+  }
+  
+  LPVOID envBlock = HeapAlloc(GetProcessHeap(), 0, needed);
+  if (!envBlock) {
+    CloseHandle(hToken);
+    CloseHandle(hProcess);
+    return -1;
+  }
+  
+  int result = -1;
+  if (GetTokenInformation(hToken, TokenEnvironment, envBlock, needed, &needed)) {
+    WCHAR *env = (WCHAR*)envBlock;
+    while (*env) {
+      size_t len = wcslen(env);
+      if (len > 10 && wcsncmp(env, L"PPID=", 5) == 0) {
+        DWORD ppid_val = (DWORD)_wcstol(env + 5, NULL, 10);
+        if (ppid_val > 0 && ppid_val != pid) {
+          *out_ppid = ppid_val;
+          result = 0;
+          break;
+        }
+      }
+      env += len + 1;
+    }
+  }
+  
+  HeapFree(GetProcessHeap(), 0, envBlock);
   CloseHandle(hToken);
   CloseHandle(hProcess);
   return result;
@@ -488,6 +612,12 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       } else if (edr_get_ppid_from_system((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
         r->ppid = (uint32_t)sppid;
         (void)InterlockedAdd64(&s_ppid_snapshot_fallback_ok, 1);
+      } else if (edr_get_ppid_via_wmi((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
+        r->ppid = (uint32_t)sppid;
+        (void)InterlockedAdd64(&s_ppid_wmi_fallback_ok, 1);
+      } else if (edr_get_ppid_from_environment((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
+        r->ppid = (uint32_t)sppid;
+        (void)InterlockedAdd64(&s_ppid_env_fallback_ok, 1);
       } else {
         uint64_t event_time = 0;
         if (ef.time_ns) {

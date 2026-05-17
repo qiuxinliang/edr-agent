@@ -186,14 +186,14 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
     }
   }
   {
-    int64_t pp0 = 0, ptot = 0, pntqi = 0, psnap = 0;
-    edr_behavior_get_ppid_stats(&pp0, &ptot, &psnap, &pntqi);
+    int64_t pp0 = 0, ptot = 0, pntqi = 0, psnap = 0, pwmi = 0, penv = 0, pinfer = 0;
+    edr_behavior_get_ppid_stats(&pp0, &ptot, &psnap, &pntqi, &pwmi, &penv, &pinfer);
     if (ptot > 0) {
       double pct = (double)pp0 * 100.0 / (double)ptot;
       fprintf(stderr,
-              "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld\n",
+              "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld wmi_ok=%lld env_ok=%lld infer_ok=%lld\n",
               (long long)ptot, (long long)pp0, pct,
-              (long long)pntqi, (long long)psnap);
+              (long long)pntqi, (long long)psnap, (long long)pwmi, (long long)penv, (long long)pinfer);
       if (pct > 5.0 && pp0 > 10) {
         fprintf(stderr, "[ppid] WARNING: PPID=0 ratio %.1f%% exceeds 5%% threshold — "
                 "possible high short-lived process churn or parent process eviction\n", pct);

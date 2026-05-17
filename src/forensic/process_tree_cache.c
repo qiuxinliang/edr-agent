@@ -15,19 +15,24 @@
 #define PT_HT_CAPACITY 4096u
 #define PT_HISTORY_CAPACITY 8192u
 #define PT_INFER_WINDOW_NS 60000000000ULL
+#define PT_LOAD_FACTOR_THRESHOLD 0.75f
 
-typedef struct {
+typedef struct PTNode {
   ProcessTreeEntry entry;
   bool occupied;
-} PTHashSlot;
+  struct PTNode *prev;
+  struct PTNode *next;
+} PTNode;
 
-static PTHashSlot g_pt_table[PT_HT_CAPACITY];
+static PTNode g_pt_table[PT_HT_CAPACITY];
 static ProcessTreeEntry g_pt_history[PT_HISTORY_CAPACITY];
 static size_t g_pt_history_count;
 static uint32_t g_pt_generation;
-static uint64_t g_pt_oldest_ns;
 static bool g_pt_initialized;
 static uint32_t g_pt_history_ttl_s;
+static PTNode *g_pt_lru_head;
+static PTNode *g_pt_lru_tail;
+static size_t g_pt_occupied_count;
 
 typedef struct {
   uint32_t pid;
@@ -50,24 +55,54 @@ static size_t pt_hash(uint32_t pid) {
   return ((size_t)pid * 2654435761u) % PT_HT_CAPACITY;
 }
 
-static void pt_evict_lru(void) {
-  uint64_t oldest = UINT64_MAX;
-  size_t oldest_i = 0;
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    if (g_pt_table[i].occupied && g_pt_table[i].entry.last_seen_ns < oldest) {
-      oldest = g_pt_table[i].entry.last_seen_ns;
-      oldest_i = i;
-    }
+static void pt_lru_remove(PTNode *node) {
+  if (!node) return;
+  
+  if (node->prev) {
+    node->prev->next = node->next;
+  } else {
+    g_pt_lru_head = node->next;
   }
-  if (oldest != UINT64_MAX) {
-    g_pt_table[oldest_i].occupied = false;
-    g_pt_oldest_ns = 0;
-    for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-      if (g_pt_table[i].occupied && g_pt_table[i].entry.last_seen_ns > g_pt_oldest_ns) {
-        g_pt_oldest_ns = g_pt_table[i].entry.last_seen_ns;
-      }
-    }
+  
+  if (node->next) {
+    node->next->prev = node->prev;
+  } else {
+    g_pt_lru_tail = node->prev;
   }
+  
+  node->prev = NULL;
+  node->next = NULL;
+}
+
+static void pt_lru_add(PTNode *node) {
+  if (!node) return;
+  
+  node->prev = NULL;
+  node->next = g_pt_lru_head;
+  
+  if (g_pt_lru_head) {
+    g_pt_lru_head->prev = node;
+  } else {
+    g_pt_lru_tail = node;
+  }
+  
+  g_pt_lru_head = node;
+}
+
+static void pt_lru_touch(PTNode *node) {
+  if (!node) return;
+  pt_lru_remove(node);
+  pt_lru_add(node);
+}
+
+static PTNode *pt_lru_evict(void) {
+  PTNode *victim = g_pt_lru_tail;
+  if (victim) {
+    pt_lru_remove(victim);
+    victim->occupied = false;
+    g_pt_occupied_count--;
+  }
+  return victim;
 }
 
 void edr_pt_cache_init(void) {
@@ -75,9 +110,16 @@ void edr_pt_cache_init(void) {
   (void)memset(g_pt_history, 0, sizeof(g_pt_history));
   g_pt_history_count = 0;
   g_pt_generation = 1;
-  g_pt_oldest_ns = 0;
   g_pt_initialized = true;
   g_pt_history_ttl_s = 3600;
+  g_pt_lru_head = NULL;
+  g_pt_lru_tail = NULL;
+  g_pt_occupied_count = 0;
+  
+  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+    g_pt_table[i].prev = NULL;
+    g_pt_table[i].next = NULL;
+  }
 }
 
 void edr_pt_cache_shutdown(void) {
@@ -85,8 +127,10 @@ void edr_pt_cache_shutdown(void) {
   (void)memset(g_pt_history, 0, sizeof(g_pt_history));
   g_pt_history_count = 0;
   g_pt_generation = 1;
-  g_pt_oldest_ns = 0;
   g_pt_initialized = false;
+  g_pt_lru_head = NULL;
+  g_pt_lru_tail = NULL;
+  g_pt_occupied_count = 0;
 }
 
 int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
@@ -99,6 +143,8 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
   for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
     size_t probe = (idx + i) % PT_HT_CAPACITY;
     if (!g_pt_table[probe].occupied || g_pt_table[probe].entry.pid == pid) {
+      bool was_occupied = g_pt_table[probe].occupied;
+      
       ProcessTreeEntry *e = &g_pt_table[probe].entry;
       e->pid = pid;
       e->ppid = ppid;
@@ -131,14 +177,23 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
       } else {
         e->parent_name[0] = '\0';
       }
-      g_pt_table[probe].occupied = true;
-      if (start_time_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
-        g_pt_oldest_ns = start_time_ns;
+      
+      if (!was_occupied) {
+        g_pt_table[probe].occupied = true;
+        g_pt_occupied_count++;
+        pt_lru_add(&g_pt_table[probe]);
+      } else {
+        pt_lru_touch(&g_pt_table[probe]);
       }
+      
       return 0;
     }
   }
-  pt_evict_lru();
+  
+  if (g_pt_occupied_count >= (size_t)(PT_HT_CAPACITY * PT_LOAD_FACTOR_THRESHOLD)) {
+    pt_lru_evict();
+  }
+  
   return edr_pt_cache_put(pid, ppid, process_name, cmdline,
                           exe_path, parent_name, start_time_ns);
 }
@@ -149,7 +204,10 @@ const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid) {
   for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
     size_t probe = (idx + i) % PT_HT_CAPACITY;
     if (!g_pt_table[probe].occupied) return NULL;
-    if (g_pt_table[probe].entry.pid == pid) return &g_pt_table[probe].entry;
+    if (g_pt_table[probe].entry.pid == pid) {
+      pt_lru_touch(&g_pt_table[probe]);
+      return &g_pt_table[probe].entry;
+    }
   }
   return NULL;
 }
@@ -489,7 +547,9 @@ int edr_pt_cache_remove(uint32_t pid) {
         e->terminated = 1;
         pt_add_to_history(e);
       }
+      pt_lru_remove(&g_pt_table[probe]);
       g_pt_table[probe].occupied = false;
+      g_pt_occupied_count--;
       return 0;
     }
   }
