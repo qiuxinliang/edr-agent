@@ -433,6 +433,17 @@ int edr_pt_cache_get_historical(uint32_t pid, uint64_t timestamp, ProcessTreeEnt
   return -1;
 }
 
+static const char *g_common_parent_processes[] = {
+  "explorer.exe",
+  "services.exe",
+  "winlogon.exe",
+  "smss.exe",
+  "csrss.exe",
+  "svchost.exe",
+  "conhost.exe",
+  NULL
+};
+
 int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
                               uint32_t *out_ppid, char *out_parent_name, size_t name_len) {
   if (!g_pt_initialized || !out_ppid) return -1;
@@ -447,6 +458,23 @@ int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
     return 0;
   }
   
+  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+    if (!g_pt_table[i].occupied) continue;
+    const ProcessTreeEntry *e = &g_pt_table[i].entry;
+    if (e->pid == pid || e->terminated) continue;
+    
+    for (int j = 0; g_common_parent_processes[j]; j++) {
+      if (_stricmp(e->process_name, g_common_parent_processes[j]) == 0) {
+        *out_ppid = e->pid;
+        if (out_parent_name && name_len > 0) {
+          strncpy(out_parent_name, e->process_name, name_len - 1);
+          out_parent_name[name_len - 1] = '\0';
+        }
+        return 0;
+      }
+    }
+  }
+  
   int best_match = -1;
   uint64_t best_time_diff = UINT64_MAX;
   
@@ -458,7 +486,7 @@ int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
     uint64_t diff = event_time_ns > e->start_time_ns ? 
                     event_time_ns - e->start_time_ns : e->start_time_ns - event_time_ns;
     
-    if (diff < PT_INFER_WINDOW_NS && diff < best_time_diff) {
+    if (diff < PT_INFER_WINDOW_NS * 4 && diff < best_time_diff) {
       best_time_diff = diff;
       best_match = (int)i;
     }
@@ -478,8 +506,27 @@ int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
     const ProcessTreeEntry *e = &g_pt_history[i];
     if (e->pid == pid) continue;
     
+    for (int j = 0; g_common_parent_processes[j]; j++) {
+      if (_stricmp(e->process_name, g_common_parent_processes[j]) == 0) {
+        uint64_t end_time = e->terminate_time_ns ? e->terminate_time_ns : e->start_time_ns;
+        if (event_time_ns >= e->start_time_ns && event_time_ns <= end_time + PT_INFER_WINDOW_NS) {
+          *out_ppid = e->pid;
+          if (out_parent_name && name_len > 0) {
+            strncpy(out_parent_name, e->process_name, name_len - 1);
+            out_parent_name[name_len - 1] = '\0';
+          }
+          return 0;
+        }
+      }
+    }
+  }
+  
+  for (size_t i = 0; i < g_pt_history_count; i++) {
+    const ProcessTreeEntry *e = &g_pt_history[i];
+    if (e->pid == pid) continue;
+    
     uint64_t end_time = e->terminate_time_ns ? e->terminate_time_ns : e->start_time_ns;
-    if (event_time_ns >= e->start_time_ns && event_time_ns <= end_time + PT_INFER_WINDOW_NS) {
+    if (event_time_ns >= e->start_time_ns && event_time_ns <= end_time + PT_INFER_WINDOW_NS * 4) {
       uint64_t diff = event_time_ns > e->start_time_ns ? 
                       event_time_ns - e->start_time_ns : e->start_time_ns - event_time_ns;
       if (diff < best_time_diff) {
