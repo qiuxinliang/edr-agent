@@ -25,6 +25,7 @@
 #include "ave_etw_feed_win.h"
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
 #include <wchar.h>
