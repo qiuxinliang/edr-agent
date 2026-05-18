@@ -1,3 +1,8 @@
-edr_p0_golden 2 0.00531698
-edr_agent_help 1 0.950724
+edr_p0_golden 5 0.00047185
+edr_agent_help 2 0.208205
+edr_dedup_golden 2 0.000683521
+edr_p0_perf 0 0
+test_event_bus_mpmc_stress 1 0.60616
+edr_p0_ir_record_golden 1 0.370835
 ---
+edr_p0_perf

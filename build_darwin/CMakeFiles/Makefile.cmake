@@ -73,6 +73,8 @@ set(CMAKE_DEPEND_INFO_FILES
   "CMakeFiles/edr_agent.dir/DependInfo.cmake"
   "CMakeFiles/edr_monitor.dir/DependInfo.cmake"
   "CMakeFiles/edr_p0_golden_test.dir/DependInfo.cmake"
+  "CMakeFiles/edr_dedup_golden_test.dir/DependInfo.cmake"
+  "CMakeFiles/edr_p0_perf_test.dir/DependInfo.cmake"
   "CMakeFiles/test_event_bus_mpmc_stress.dir/DependInfo.cmake"
   "CMakeFiles/edr_p0_ir_record_golden_test.dir/DependInfo.cmake"
   )

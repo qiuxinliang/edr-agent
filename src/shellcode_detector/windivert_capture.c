@@ -26,6 +26,7 @@
 
 #include "windivert_abi.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -77,6 +78,7 @@ static HANDLE s_thread;
 static volatile LONG s_capture_stop;
 static const EdrConfig *s_cfg;
 static EdrEventBus *s_bus;
+static _Atomic uint64_t s_dropped_windivert;
 static int s_wsa_started;
 
 /** 环形缓冲（仅捕获线程写；告警同线程读） */
@@ -590,7 +592,10 @@ static int push_alert(double score, const char *detector_label, const char *rule
   memcpy(slot.data, wx, off);
   slot.size = (uint32_t)off;
   if (!edr_event_bus_try_push(s_bus, &slot)) {
-    fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
+    uint64_t dn = atomic_fetch_add_explicit(&s_dropped_windivert, 1u, memory_order_relaxed) + 1u;
+    if (dn == 1u || dn % 100u == 0u) {
+      EDR_LOGE("[shellcode_detector] event bus full, dropped %llu events\n", (unsigned long long)dn);
+    }
   }
   if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
     edr_response_isolate_auto_from_shellcode();

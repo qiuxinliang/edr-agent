@@ -332,10 +332,7 @@ static void strip_trailing_slash(char *s) {
 }
 
 static void resolve_rest_base(const EdrConfig *cfg, char *out, size_t cap) {
-  const char *e = getenv("EDR_PLATFORM_REST_BASE");
-  if (e && e[0]) {
-    snprintf(out, cap, "%s", e);
-  } else if (cfg && cfg->platform.rest_base_url[0]) {
+  if (cfg && cfg->platform.rest_base_url[0]) {
     snprintf(out, cap, "%s", cfg->platform.rest_base_url);
   } else {
     out[0] = 0;
@@ -1022,14 +1019,12 @@ int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
   }
   fprintf(cf, "url = \"%s/endpoints/%s/attack-surface/refresh-request\"\n", base, cfg->agent.endpoint_id);
   fprintf(cf, "output = \"%s\"\n", outpath);
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "tenant_default");
+  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "");
   fprintf(cf, "header = \"X-User-ID: %s\"\n",
-          cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent");
+          cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "");
   fprintf(cf, "header = \"X-Permission-Set: endpoint:attack_surface_report\"\n");
   const char *bearer = NULL;
-  if (getenv("EDR_PLATFORM_BEARER") && getenv("EDR_PLATFORM_BEARER")[0]) {
-    bearer = getenv("EDR_PLATFORM_BEARER");
-  } else if (cfg->platform.rest_bearer_token[0]) {
+  if (cfg->platform.rest_bearer_token[0]) {
     bearer = cfg->platform.rest_bearer_token;
   }
   fprintf(cf, "silent\n");
@@ -1091,12 +1086,10 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     return 0;
   }
 
-  const char *tenant = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "tenant_default";
-  const char *user = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
+  const char *tenant = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "";
+  const char *user = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "";
   const char *bearer = NULL;
-  if (getenv("EDR_PLATFORM_BEARER") && getenv("EDR_PLATFORM_BEARER")[0]) {
-    bearer = getenv("EDR_PLATFORM_BEARER");
-  } else if (cfg->platform.rest_bearer_token[0]) {
+  if (cfg->platform.rest_bearer_token[0]) {
     bearer = cfg->platform.rest_bearer_token;
   }
 

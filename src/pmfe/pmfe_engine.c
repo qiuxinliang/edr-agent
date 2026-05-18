@@ -25,6 +25,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #endif
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -35,14 +36,6 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #ifdef _WIN32
 static const EdrConfig *s_pmfe_cfg;
 #endif
-
-void edr_pmfe_bind_config(const EdrConfig *cfg) {
-#ifdef _WIN32
-  s_pmfe_cfg = cfg;
-#else
-  (void)cfg;
-#endif
-}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -114,6 +107,7 @@ static volatile uint64_t s_defer_listen_refresh_at_ms_linux;
 #endif
 
 static EdrEventBus *s_pmfe_bus;
+static _Atomic uint64_t s_dropped_pmfe;
 
 #define PMFE_ETW_CD_CAP 16u
 static uint32_t s_etw_cd_pid[PMFE_ETW_CD_CAP];
@@ -1473,8 +1467,6 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
 #endif
 }
 
-void edr_pmfe_set_event_bus(EdrEventBus *bus) { s_pmfe_bus = bus; }
-
 static unsigned pmfe_detail_u(const char *d, const char *key) {
   const char *p = strstr(d, key);
   if (!p) {
@@ -1684,7 +1676,12 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
     return;
   }
   slot.size = (uint32_t)n;
-  (void)edr_event_bus_try_push(s_pmfe_bus, &slot);
+  if (!edr_event_bus_try_push(s_pmfe_bus, &slot)) {
+    uint64_t dn = atomic_fetch_add_explicit(&s_dropped_pmfe, 1u, memory_order_relaxed) + 1u;
+    if (dn == 1u || dn % 100u == 0u) {
+      EDR_LOGE("[pmfe] event bus full, dropped %llu events\n", (unsigned long long)dn);
+    }
+  }
 }
 
 static void pmfe_worker_body(void) {
@@ -1865,7 +1862,10 @@ void edr_pmfe_on_process_lifecycle_hint(void) {
 void edr_pmfe_on_process_lifecycle_hint(void) {}
 #endif
 
-EdrError edr_pmfe_init(void) {
+EdrError edr_pmfe_init(const EdrConfig *cfg, EdrEventBus *bus) {
+  s_pmfe_cfg = cfg;
+  s_pmfe_bus = bus;
+
   const char *en = getenv("EDR_PMFE_ENABLED");
   if (en && en[0] == '0') {
     EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_ENABLED=0)\n");

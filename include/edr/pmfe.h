@@ -37,34 +37,26 @@ struct EdrConfig;
 struct EdrEventBus;
 
 /**
- * 绑定事件总线，使 PMFE 扫描完成后可将 **ETW1 形态** 事件送入预处理线程（与 ETW/Webshell 同源：`edr_event_batch_push` → gRPC）。
- * 须在 `edr_pmfe_init` 之前调用（通常传入 `edr_agent_event_bus(agent)`）。
+ * 初始化 PMFE 工作线程（幂等）。可通过环境变量 `EDR_PMFE_ENABLED=1` 启用。
+ * @param cfg 全局配置（内部仅存储指针，非拷贝）
+ * @param bus 事件总线（可为 NULL，仅打日志不投递）
  */
-void edr_pmfe_set_event_bus(struct EdrEventBus *bus);
-
-/** 供可选 `AVE_ScanFile` 候选落盘路径使用；在 `edr_pmfe_init` 之前调用一次即可。 */
-void edr_pmfe_bind_config(const struct EdrConfig *cfg);
+EdrError edr_pmfe_init(const struct EdrConfig *cfg, struct EdrEventBus *bus);
 
 /**
  * Windows：刷新 TCP/UDP 监听聚合表（与 §19 共用 `edr_win_listen_collect_rows`）；Linux：`ss -ltnp` 聚合；其它 POSIX 空操作。
- * 行数超内部缓冲被截断时默认 `fprintf` 告警；`EDR_PMFE_LISTEN_TRUNC_QUIET=1` 可关闭。
  */
 void edr_pmfe_listen_table_refresh(void);
 
 /**
  * 按当前监听表 + 关键进程补集计算宿主档位（`IGNORE`=本进程等）。
- * Windows：**`EDR_PMFE_SERVICE_PRIORITY=0`** 时关闭「运行中的 Win32 服务 + 监听 → HIGH」（§2.2.4 规则 3）。
  */
 EdrPmfeScanPriority edr_pmfe_compute_priority(uint32_t pid);
 
 /**
- * 进程创建/退出等生命周期提示（非阻塞）：将监听表刷新**推迟约 1s**（去抖，多次事件合并为「最后一次 +1s」）。
- * Windows：由 ETW Kernel-Process 等路径调用；`EDR_PMFE_LISTEN_REFRESH_ON_PROCESS=0` 可关闭。非 Windows 空操作。
+ * 进程创建/退出等生命周期提示（非阻塞）：将监听表刷新**推迟约 1s**。
  */
 void edr_pmfe_on_process_lifecycle_hint(void);
-
-/** 启动 PMFE 工作线程（幂等）。可通过环境变量 `EDR_PMFE_DISABLED=1` 跳过。 */
-EdrError edr_pmfe_init(void);
 
 /** 停止线程并排空队列（幂等）。 */
 void edr_pmfe_shutdown(void);

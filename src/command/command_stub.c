@@ -22,19 +22,19 @@
 
 static unsigned long s_unknown;
 
-unsigned long edr_command_handled_count(void) { return g_cmd_handled; }
-unsigned long edr_command_unknown_count(void) { return s_unknown; }
-unsigned long edr_command_rejected_count(void) { return g_cmd_rejected; }
-unsigned long edr_command_exec_ok_count(void) { return g_cmd_exec_ok; }
-unsigned long edr_command_exec_fail_count(void) { return g_cmd_exec_fail; }
+unsigned long edr_command_handled_count(void)  { return edr_cmd_count_handled(); }
+unsigned long edr_command_unknown_count(void)  { return s_unknown; }
+unsigned long edr_command_rejected_count(void)  { return edr_cmd_count_rejected(); }
+unsigned long edr_command_exec_ok_count(void)   { return edr_cmd_count_exec_ok(); }
+unsigned long edr_command_exec_fail_count(void) { return edr_cmd_count_exec_fail(); }
 
 static void do_ave_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   int mf = 0, nf = 0, rd = 0;
   edr_ave_get_scan_counts(&mf, &nf, &rd);
   char detail[256];
   snprintf(detail, sizeof(detail), "model_files=%d non_dir_files=%d ready=%d", mf, nf, rd);
-  g_cmd_handled++;
-  g_cmd_exec_ok++;
+  edr_cmd_inc_handled();
+  edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, detail);
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
@@ -70,36 +70,36 @@ static void do_ave_fingerprint(const char *cmd_id, const uint8_t *pl, size_t len
                                 const EdrSoarCommandMeta *sm) {
   char path[4096];
   if (edr_command_parse_path_json(pl, len, path, sizeof(path)) != 0) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_fingerprint: payload 需 JSON {\"path\":\"...\"}");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 10, "invalid path payload");
     return;
   }
   char hex[32];
   if (edr_ave_file_fingerprint(path, hex, sizeof(hex)) != 0) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_fingerprint: 读文件或指纹失败");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 11, "fingerprint failed");
     return;
   }
   char detail[220];
   snprintf(detail, sizeof(detail), "fp=%s", hex);
-  g_cmd_handled++;
-  g_cmd_exec_ok++;
+  edr_cmd_inc_handled();
+  edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, detail);
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
 static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!edr_command_get_config()) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: 未绑定配置（内部错误）");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 20, "config not bound");
     return;
   }
   char path[4096];
   if (edr_command_parse_path_json(pl, len, path, sizeof(path)) != 0) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: payload 需 JSON {\"path\":\"...\"}");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 10, "invalid path payload");
     return;
@@ -108,31 +108,31 @@ static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, cons
   memset(&res, 0, sizeof(res));
   int ar = AVE_ScanFile(path, &res);
   if (ar == AVE_ERR_NOT_INITIALIZED) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: AVE 未初始化（需先 edr_agent_init）");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 22, "ave not initialized");
     return;
   }
   if (ar == AVE_ERR_NOT_IMPL) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: 推理后端未实现（可设 EDR_AVE_INFER_DRY_RUN=1）");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, (int)EDR_ERR_NOT_IMPL, "infer not implemented");
     return;
   }
   if (ar == AVE_ERR_FILE_NOT_FOUND) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: 文件不存在");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 23, "file not found");
     return;
   }
   if (ar == AVE_ERR_ACCESS_DENIED) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: 无读取权限");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 24, "access denied");
     return;
   }
   if (ar != AVE_OK) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "ave_infer: 扫描失败");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 21, "scan error");
     return;
@@ -144,8 +144,8 @@ static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, cons
            ave_verdict_tag(res.final_verdict), ave_verdict_tag(res.raw_ai_verdict),
            (double)res.final_confidence, (double)res.raw_confidence, res.verification_layer, res.sha256,
            (long long)res.scan_duration_ms);
-  g_cmd_handled++;
-  g_cmd_exec_ok++;
+  edr_cmd_inc_handled();
+  edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, detail);
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
@@ -153,8 +153,8 @@ static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, cons
 static void do_self_protect_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   char detail[512];
   edr_self_protect_format_status(detail, sizeof(detail));
-  g_cmd_handled++;
-  g_cmd_exec_ok++;
+  edr_cmd_inc_handled();
+  edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, detail);
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
@@ -163,26 +163,26 @@ static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size
                                      const EdrSoarCommandMeta *sm) {
   char addr[256];
   if (edr_command_parse_server_address_json(pl, len, addr, sizeof(addr)) != 0) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "update_server_address: payload 需 JSON {\"server_address\":\"host:port\"}");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 12, "invalid server address payload");
     return;
   }
   if (strstr(addr, "://") || strchr(addr, '/')) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "update_server_address: 仅支持 host:port");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 13, "server address must be host:port");
     return;
   }
   int rc = edr_grpc_client_reconnect_to_target(addr);
   if (rc != 0) {
-    g_cmd_exec_fail++;
+    edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "update_server_address: gRPC 重连失败");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 14, "grpc reconnect failed");
     return;
   }
-  g_cmd_handled++;
-  g_cmd_exec_ok++;
+  edr_cmd_inc_handled();
+  edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, "update_server_address: gRPC 目标已切换");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "grpc target switched");
 }
@@ -197,7 +197,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
 
   if (edr_command_streq(t, "noop") || edr_command_streq(t, "ping")) {
     EDR_LOGV("[command] ok id=%s type=%s\n", id, t);
-    g_cmd_handled++;
+    edr_cmd_inc_handled();
     edr_command_soar_emit(id, sm, EdrCmdExecOk, 0, t);
     return;
   }
@@ -208,7 +208,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
       fwrite(payload, 1, payload_len, stderr);
       fputc('\n', stderr);
     }
-    g_cmd_handled++;
+    edr_cmd_inc_handled();
     edr_command_soar_emit(id, sm, EdrCmdExecOk, 0, "echo");
     return;
   }
@@ -314,12 +314,12 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     char detail[256];
     int r = edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail));
     if (r != 0) {
-      g_cmd_exec_fail++;
+      edr_cmd_inc_exec_fail();
       edr_command_audit_both(id, "GET_ATTACK_SURFACE: failed");
       edr_command_soar_emit(id, sm, EdrCmdExecFailed, r, detail[0] ? detail : "attack_surface_failed");
     } else {
-      g_cmd_handled++;
-      g_cmd_exec_ok++;
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
       edr_command_audit_both(id, "GET_ATTACK_SURFACE: ok");
       edr_command_soar_emit(id, sm, EdrCmdExecOk, 0, detail[0] ? detail : "attack_surface_ok");
     }

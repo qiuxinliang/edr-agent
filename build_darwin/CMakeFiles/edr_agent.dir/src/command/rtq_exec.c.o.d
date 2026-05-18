@@ -97,10 +97,6 @@ CMakeFiles/edr_agent.dir/src/command/rtq_exec.c.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_clock_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_time_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_timespec.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ctype.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_ctype.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/runetype.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_wint_t.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/command_util.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/command.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
@@ -114,5 +110,4 @@ CMakeFiles/edr_agent.dir/src/command/rtq_exec.c.o: \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_max_align_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_offsetof.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/response.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shell_exec.h
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h

@@ -44,6 +44,9 @@ CMakeFiles/edr_agent.dir/src/serialize/behavior_alert_emit.c.o: \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/config.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/collector.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types.h \

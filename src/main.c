@@ -13,6 +13,7 @@
 #include "edr/pmfe_idle_scanner.h"
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
+#include "edr/detector.h"
 #include "edr/agent_update.h"
 #include "edr/edr_log.h"
 
@@ -280,29 +281,23 @@ int main(int argc, char **argv) {
     }
   }
   edr_command_bind_config(edr_agent_get_config(agent));
-  edr_pmfe_bind_config(edr_agent_get_config(agent));
-  edr_pmfe_set_event_bus(edr_agent_event_bus(agent));
   {
-    EdrError pe = edr_pmfe_init();
-    if (pe != EDR_OK) {
-      fprintf(stderr, "edr_pmfe_init 失败: %d\n", (int)pe);
+    EdrDetector detectors[] = {
+      {"pmfe",              edr_pmfe_init,              edr_pmfe_shutdown},
+      {"shellcode_detector", edr_shellcode_detector_init, edr_shellcode_detector_shutdown},
+      {"webshell_detector",  edr_webshell_detector_init,  edr_webshell_detector_shutdown},
+    };
+    const EdrConfig *cfg = edr_agent_get_config(agent);
+    EdrEventBus *bus = edr_agent_event_bus(agent);
+    for (size_t i = 0; i < sizeof(detectors) / sizeof(detectors[0]); i++) {
+      EdrError err = detectors[i].init(cfg, bus);
+      if (err != EDR_OK) {
+        fprintf(stderr, "%s 初始化失败: %d\n", detectors[i].name, (int)err);
+      }
     }
   }
   pmfe_idle_scanner_init(edr_agent_get_config(agent));
   edr_transport_init_from_config(edr_agent_get_config(agent));
-  {
-    EdrError se =
-        edr_shellcode_detector_init(edr_agent_get_config(agent), edr_agent_event_bus(agent));
-    if (se != EDR_OK) {
-      fprintf(stderr, "shellcode_detector 初始化失败: %d\n", (int)se);
-    }
-  }
-  {
-    EdrError we = edr_webshell_detector_init(edr_agent_get_config(agent), edr_agent_event_bus(agent));
-    if (we != EDR_OK) {
-      fprintf(stderr, "webshell_detector 初始化失败: %d\n", (int)we);
-    }
-  }
   e = edr_agent_run(agent);
   if (edr_log_want_shutdown_stats()) {
     uint64_t dd = 0, rr = 0;

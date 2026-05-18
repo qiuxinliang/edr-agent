@@ -1531,6 +1531,26 @@ static void edr_config_clamp(EdrConfig *cfg) {
       cfg->ave.cert_revocation_check = false;
     }
   }
+  {
+    const char *e = getenv("EDR_PLATFORM_REST_BASE");
+    if (e && e[0]) {
+      strncpy(cfg->platform.rest_base_url, e, sizeof(cfg->platform.rest_base_url) - 1);
+      cfg->platform.rest_base_url[sizeof(cfg->platform.rest_base_url) - 1] = '\0';
+    }
+  }
+  {
+    const char *e = getenv("EDR_PLATFORM_BEARER");
+    if (e && e[0]) {
+      strncpy(cfg->platform.rest_bearer_token, e, sizeof(cfg->platform.rest_bearer_token) - 1);
+      cfg->platform.rest_bearer_token[sizeof(cfg->platform.rest_bearer_token) - 1] = '\0';
+    }
+  }
+  {
+    const char *e = getenv("EDR_CMD_ENABLED");
+    if (e && e[0]) {
+      cfg->command.allow_dangerous = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+    }
+  }
 }
 
 void edr_config_free_heap(EdrConfig *cfg) {
@@ -1721,7 +1741,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 
   cfg->command.allow_dangerous = true;
 
-  snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
+  snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "");
 
   cfg->attack_surface.enabled = false;
   /* min(port, service, policy, full) 驱动周期与 ETW/刷新 POST 共享间隔；默认 2h 降频 */

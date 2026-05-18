@@ -9,10 +9,7 @@
 #include <string.h>
 #include <time.h>
 
-unsigned long g_cmd_handled;
-unsigned long g_cmd_rejected;
-unsigned long g_cmd_exec_ok;
-unsigned long g_cmd_exec_fail;
+EdrCommandMetrics g_cmd_metrics;
 
 static const EdrConfig *s_bound_cfg;
 
@@ -23,14 +20,7 @@ const struct EdrConfig *edr_command_get_config(void) { return s_bound_cfg; }
 int edr_command_streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
 
 int edr_command_dangerous_enabled(void) {
-  const char *e = getenv("EDR_CMD_ENABLED");
-  if (e && e[0] == '1') {
-    return 1;
-  }
-  if (e && e[0] == '0') {
-    return 0;
-  }
-  e = getenv("EDR_CMD_DANGEROUS");
+  const char *e = getenv("EDR_CMD_DANGEROUS");
   if (e && e[0] == '1') {
     return 1;
   }

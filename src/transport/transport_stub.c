@@ -435,12 +435,10 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
     EDR_LOGV("[transport] gRPC target: %s\n", s_target);
   }
   {
-    const char *erb = getenv("EDR_PLATFORM_REST_BASE");
-    const char *rb = (erb && erb[0]) ? erb : (cfg->platform.rest_base_url[0] ? cfg->platform.rest_base_url : "");
-    const char *br = getenv("EDR_PLATFORM_BEARER");
-    const char *bear = (br && br[0]) ? br : (cfg->platform.rest_bearer_token[0] ? cfg->platform.rest_bearer_token : "");
-    const char *tid = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "demo-tenant";
-    const char *uid = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
+    const char *rb = cfg->platform.rest_base_url[0] ? cfg->platform.rest_base_url : "";
+    const char *bear = cfg->platform.rest_bearer_token[0] ? cfg->platform.rest_bearer_token : "";
+    const char *tid = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "";
+    const char *uid = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "";
     edr_ingest_http_configure(rb, tid, uid, bear, cfg->agent.endpoint_id, NULL);
     if (rb && rb[0]) {
       const char *sp = getenv("EDR_EVENT_INGEST_SPLIT");
@@ -475,7 +473,7 @@ void edr_transport_init_from_config(const EdrConfig *cfg) {
 
 void edr_transport_shutdown(void) {
   transport_queue_stop();
-  edr_ingest_http_stop_command_poll();
+  edr_ingest_http_shutdown();
   edr_grpc_client_shutdown();
 }
 

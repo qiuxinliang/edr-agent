@@ -113,7 +113,7 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
 void edr_response_eventlog_view(const char *cmd_id, const uint8_t *pl,
                                  size_t len, const EdrSoarCommandMeta *sm) {
     if (!edr_command_dangerous_enabled()) {
-        g_cmd_rejected++;
+        edr_cmd_inc_rejected();
         edr_command_audit_both(cmd_id, "reject eventlog_view: policy disabled");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
         return;
@@ -136,7 +136,7 @@ void edr_response_eventlog_view(const char *cmd_id, const uint8_t *pl,
 
     FILE *f = fopen(json_path, "w");
     if (!f) {
-        g_cmd_exec_fail++;
+        edr_cmd_inc_exec_fail();
         edr_command_audit_both(cmd_id, "eventlog_view: cannot create output file");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "cannot create output file");
         return;
@@ -171,7 +171,7 @@ void edr_response_eventlog_view(const char *cmd_id, const uint8_t *pl,
     char result[512];
     snprintf(result, sizeof(result), "EVTLOG_OK channel=%s count=%d minio_key=%s",
              channel, count, minio_key[0] ? minio_key : "");
-    g_cmd_handled++; g_cmd_exec_ok++;
+    edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
     edr_command_audit_both(cmd_id, "eventlog_view: ok");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 }

@@ -14,6 +14,7 @@
 
 #include <direct.h>
 #include <io.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,7 @@ typedef struct {
 
 static const EdrConfig *s_cfg;
 static EdrEventBus *s_bus;
+static _Atomic uint64_t s_dropped_webshell;
 static int s_started;
 static volatile LONG s_stop;
 static WebRoot s_roots[WEBSHELL_MAX_ROOTS];
@@ -525,7 +527,12 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
     return;
   }
   slot.size = (uint32_t)n;
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    uint64_t n = atomic_fetch_add_explicit(&s_dropped_webshell, 1u, memory_order_relaxed) + 1u;
+    if (n == 1u || n % 100u == 0u) {
+      EDR_LOGE("[webshell_detector] event bus full, dropped %llu events\n", (unsigned long long)n);
+    }
+  }
 }
 
 static void handle_change(const char *full_path, const char *action) {

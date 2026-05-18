@@ -18,6 +18,7 @@
 #include "edr/etw_observability_win.h"
 #include "edr/edr_a44_split_path_win.h"
 #include "edr/event_bus.h"
+#include "edr/edr_log.h"
 #include "edr/pmfe.h"
 #include "edr/types.h"
 
@@ -34,6 +35,7 @@ static volatile LONG64 s_filter_stats_dns_client;
 static volatile LONG64 s_filter_stats_powershell;
 static volatile LONG64 s_filter_stats_tcpip;
 static volatile LONG64 s_filter_stats_wmi_activity;
+static _Atomic uint64_t s_dropped_collector;
 
 static int edr_parse_uint16_list_with_ranges(const char *str, uint16_t *out_ids, uint32_t max_ids, uint32_t *out_id_count,
                                               EdrEventIdRange *out_ranges, uint32_t max_ranges, uint32_t *out_range_count) {
@@ -974,7 +976,12 @@ static void edr_collector_tdh_to_bus(PEVENT_RECORD rec, EdrEventType ty, const c
   if (a44_meas) {
     (void)QueryPerformanceCounter(&t_a44_b0);
   }
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    uint64_t n = atomic_fetch_add_explicit(&s_dropped_collector, 1u, memory_order_relaxed) + 1u;
+    if (n == 1u || n % 100u == 0u) {
+      EDR_LOGE("[collector] event bus full, dropped %llu events\n", (unsigned long long)n);
+    }
+  }
   if (a44_meas) {
     (void)QueryPerformanceCounter(&t_a44_b1);
     (void)edr_etw_observability_add_a44_phase_ns(2u, edr_win_qpc_elapsed_ns(&t_a44_b0, &t_a44_b1, &a44_freq));

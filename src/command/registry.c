@@ -143,7 +143,7 @@ static void enum_subkeys_recursive(FILE *f, HKEY root, const char *subkey,
 void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
                              size_t len, const EdrSoarCommandMeta *sm) {
     if (!edr_command_dangerous_enabled()) {
-        g_cmd_rejected++;
+        edr_cmd_inc_rejected();
         edr_command_audit_both(cmd_id, "reject reg_query: policy disabled");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
         return;
@@ -155,7 +155,7 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
     (void)edr_parse_json_int(pl, len, "recursive", &recursive);
 
     if (!key_path[0]) {
-        g_cmd_exec_fail++;
+        edr_cmd_inc_exec_fail();
         edr_command_audit_both(cmd_id, "reg_query: missing key");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "missing key");
         return;
@@ -164,7 +164,7 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
     char *subkey = NULL;
     HKEY root = parse_root(key_path, &subkey);
     if (!root || !subkey) {
-        g_cmd_exec_fail++;
+        edr_cmd_inc_exec_fail();
         edr_command_audit_both(cmd_id, "reg_query: invalid key path");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "invalid key path");
         return;
@@ -176,7 +176,7 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
 
     FILE *f = fopen(json_path, "w");
     if (!f) {
-        g_cmd_exec_fail++;
+        edr_cmd_inc_exec_fail();
         edr_command_audit_both(cmd_id, "reg_query: cannot create output file");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 4, "cannot create output");
         return;
@@ -218,7 +218,7 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
     char result[512];
     snprintf(result, sizeof(result), "REG_OK key=%s count=%d minio_key=%s",
              key_path, count, minio_key[0] ? minio_key : "");
-    g_cmd_handled++; g_cmd_exec_ok++;
+    edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
     edr_command_audit_both(cmd_id, "reg_query: ok");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 }
@@ -231,7 +231,7 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
     (void)edr_parse_json_string(pl, len, "key", key_path, sizeof(key_path));
     char result[256];
     snprintf(result, sizeof(result), "REG_UNSUPPORTED key=%s (non-Windows platform)", key_path[0] ? key_path : "");
-    g_cmd_handled++; g_cmd_exec_ok++;
+    edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
     edr_command_audit_both(cmd_id, "reg_query: unsupported platform");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 }

@@ -24,6 +24,8 @@ struct EdrEventBus {
   _Atomic uint64_t dropped;
   _Atomic uint64_t pushed;
   _Atomic uint64_t high_water_hits;
+  EdrEventBusDropFn drop_fn;
+  const char *drop_source;
 };
 
 static inline uint64_t bus_lap(uint64_t pos, uint32_t cap) { return pos / (uint64_t)cap; }
@@ -52,6 +54,8 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
   atomic_init(&bus->dropped, 0u);
   atomic_init(&bus->pushed, 0u);
   atomic_init(&bus->high_water_hits, 0u);
+  bus->drop_fn = NULL;
+  bus->drop_source = NULL;
   return bus;
 }
 
@@ -61,6 +65,14 @@ void edr_event_bus_destroy(EdrEventBus *bus) {
   }
   free(bus->cells);
   free(bus);
+}
+
+void edr_event_bus_set_drop_callback(EdrEventBus *bus, EdrEventBusDropFn fn, const char *source) {
+  if (!bus) {
+    return;
+  }
+  bus->drop_fn = fn;
+  bus->drop_source = source;
 }
 
 bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
@@ -96,10 +108,30 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
       pos = atomic_load_explicit(&bus->head, memory_order_acquire);
       if (pos == prev) {
         (void)atomic_fetch_add_explicit(&bus->dropped, 1u, memory_order_relaxed);
+        if (bus->drop_fn) {
+          bus->drop_fn(slot, bus->drop_source);
+        }
         return false;
       }
     }
   }
+}
+
+bool edr_event_bus_try_push_critical(EdrEventBus *bus, const EdrEventSlot *slot) {
+  if (!bus || !slot) {
+    return false;
+  }
+  if (edr_event_bus_try_push(bus, slot)) {
+    return true;
+  }
+  EdrEventSlot evicted;
+  if (edr_event_bus_try_pop(bus, &evicted)) {
+    (void)atomic_fetch_add_explicit(&bus->dropped, 1u, memory_order_relaxed);
+    if (bus->drop_fn) {
+      bus->drop_fn(&evicted, bus->drop_source);
+    }
+  }
+  return edr_event_bus_try_push(bus, slot);
 }
 
 bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {

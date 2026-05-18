@@ -58,6 +58,26 @@ extern "C" {
 /** `AVE_ExportFeatureVector`：该 SHA256 在 FL 特征缓存中不存在（C1+ 对接 fl_samples / 缓存） */
 #define AVE_ERR_FL_SAMPLE_NOT_FOUND (-103)
 
+typedef struct {
+    char model_dir[1024];
+    int scan_threads;
+    int max_file_size_mb;
+    char sensitivity[16];
+    bool enabled;
+    bool cert_whitelist_enabled;
+    char cert_whitelist_db_path[1024];
+    char file_whitelist_db_path[1024];
+    char ioc_db_path[1024];
+    bool ioc_precheck_enabled;
+    char behavior_policy_db_path[1024];
+    bool behavior_monitor_enabled;
+    bool cert_revocation_check;
+    bool l4_realtime_behavior_link;
+    float l4_realtime_anomaly_threshold;
+    uint32_t static_infer_cache_max_entries;
+    uint32_t static_infer_cache_ttl_s;
+} EdrAveConfig;
+
 typedef enum EDRVerdict {
   VERDICT_CLEAN = 0,
   VERDICT_SUSPICIOUS = 1,
