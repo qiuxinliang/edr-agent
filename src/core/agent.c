@@ -17,19 +17,24 @@
 #include "edr/attack_surface_report.h"
 #include "edr/fl_trainer.h"
 #include "edr/p0_rule_ir.h"
-#include "edr/agent_update.h"
 #include "edr/behavior_from_slot.h"
 #include "edr/collector.h"
 #include "edr/p0_rule_match.h"
 #ifdef _WIN32
 #include "edr/etw_observability_win.h"
 #include "edr/edr_a44_split_path_win.h"
+#endif
+#endif /* EDR_WITH_FL_TRAINER */
+
+#ifdef _WIN32
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
 #else
 #include <unistd.h>
 static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #endif
+
+#include "edr/agent_update.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1040,8 +1045,6 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
     EDR_LOGV("[attack_surface] periodic %s\n", detail);
   }
 }
-
-#endif /* EDR_WITH_FL_TRAINER */
 
 /* stub: 远程配置临时文件路径（待实现为独立模块） */
 static int edr_remote_tmp_path(char *buf, size_t cap) {

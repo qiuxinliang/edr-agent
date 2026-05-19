@@ -275,6 +275,9 @@ set(EDR_AGENT_SOURCES
   src/command/registry.c
   src/command/rtq_exec.c
   src/response/response_actions.c
+  src/response/response_forensic.c
+  src/response/response_file.c
+  src/response/response_utils.c
   src/forensic/process_tree_cache.c
   src/forensic/forensic_trigger.c
   src/forensic/deep_collector.c
