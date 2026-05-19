@@ -239,6 +239,7 @@ set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
   src/core/agent_update.c
+  third_party/cjson/cJSON.c
   src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c
@@ -486,7 +487,6 @@ if(EDR_PCRE2_TARGET)
   list(APPEND EDR_AGENT_SOURCES
     src/preprocess/p0_rule_ir.c
     src/preprocess/encrypt_p0_rules.c
-    third_party/cjson/cJSON.c
   )
   set(EDR_P0_IR_PCRE2 1)
   message(STATUS "edr_agent: P0 IR (pcre2 + cJSON + encrypt_p0_rules) enabled, link: ${EDR_PCRE2_TARGET}")
@@ -619,11 +619,9 @@ target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/windivert
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 )
-if(EDR_P0_IR_PCRE2)
-  target_include_directories(edr_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson)
-endif()
 target_compile_definitions(
   edr_agent
   PRIVATE

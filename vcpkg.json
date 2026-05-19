@@ -5,5 +5,13 @@
   "dependencies": [
     "cjson",
     "curl"
-  ]
+  ],
+  "features": {
+    "grpc-client": {
+      "description": "gRPC client support — protoc codegen + protobuf runtime",
+      "dependencies": [
+        "protobuf"
+      ]
+    }
+  }
 }

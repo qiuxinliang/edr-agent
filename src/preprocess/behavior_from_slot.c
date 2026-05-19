@@ -571,7 +571,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         }
         
         char inferred_parent_name[64] = {0};
-        if (edr_pt_cache_infer_parent(r->pid, event_time, &sppid, inferred_parent_name, sizeof(inferred_parent_name)) == 0 && sppid > 0) {
+        if (edr_pt_cache_infer_parent(r->pid, event_time, (uint32_t *)&sppid, inferred_parent_name, sizeof(inferred_parent_name)) == 0 && sppid > 0) {
           r->ppid = (uint32_t)sppid;
           if (inferred_parent_name[0] && !r->parent_name[0]) {
             snprintf(r->parent_name, sizeof(r->parent_name), "%s", inferred_parent_name);
