@@ -195,14 +195,14 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
       double pct = (double)pp0 * 100.0 / (double)ptot;
       fprintf(stderr,
               "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld wmi_ok=%lld env_ok=%lld infer_ok=%lld\n",
-    int64_t pp0 = 0, ptot = 0, pntqi = 0, psnap = 0;
-    edr_behavior_get_ppid_stats(&pp0, &ptot, &psnap, &pntqi);
+              (long long)ptot, (long long)pp0, pct,
+              (long long)pntqi, (long long)psnap, (long long)pwmi, (long long)penv, (long long)pinfer);
       if (pct > 5.0 && pp0 > 10) {
         fprintf(stderr, "[ppid] WARNING: PPID=0 ratio %.1f%% exceeds 5%% threshold — "
                 "possible high short-lived process churn or parent process eviction\n", pct);
-              "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld\n",
+      }
     }
-              (long long)pntqi, (long long)psnap);
+  }
 #endif
   fflush(stderr);
 }
@@ -221,6 +221,11 @@ void edr_agent_destroy(EdrAgent *agent) {
 #if defined(EDR_WITH_FL_TRAINER)
   FLT_Shutdown();
 #endif
+  AVE_Shutdown();
+  edr_event_bus_destroy(agent->event_bus);
+  edr_config_free_heap(&agent->cfg);
+  free(agent->config_path);
+  free(agent);
 }
 
 EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
