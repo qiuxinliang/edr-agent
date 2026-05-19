@@ -1,6 +1,7 @@
 #include "edr/process_chain_depth.h"
 #include "edr/behavior_record.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #ifdef _WIN32

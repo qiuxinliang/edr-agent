@@ -330,3 +330,15 @@ int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
   return -1;
 }
 #endif
+
+/* stub: PPID 推断预案未实现 */
+int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
+                              uint32_t *out_ppid, char *out_parent_name,
+                              size_t name_cap) {
+  (void)pid;
+  (void)event_time_ns;
+  (void)out_ppid;
+  (void)out_parent_name;
+  (void)name_cap;
+  return -1;
+}

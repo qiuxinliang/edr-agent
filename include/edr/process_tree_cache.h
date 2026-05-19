@@ -81,4 +81,12 @@ void edr_pt_cache_get_key_procs(EdrKeyProcSlot *out, int max);
  */
 int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid);
 
+/**
+ * PPID 推断回退：通过进程树缓存中的时间信息推断 PPID（预案未实现）。
+ * 返回 0 成功，-1 未实现或推断失败。
+ */
+int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
+                              uint32_t *out_ppid, char *out_parent_name,
+                              size_t name_cap);
+
 #endif
