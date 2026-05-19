@@ -14,8 +14,10 @@
 #include "edr/time_util.h"
 
 #if defined(EDR_WITH_FL_TRAINER)
-#include "edr/attack_surface_report.h"
 #include "edr/fl_trainer.h"
+#endif
+
+#include "edr/attack_surface_report.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/behavior_from_slot.h"
 #include "edr/collector.h"
@@ -24,7 +26,6 @@
 #include "edr/etw_observability_win.h"
 #include "edr/edr_a44_split_path_win.h"
 #endif
-#endif /* EDR_WITH_FL_TRAINER */
 
 #ifdef _WIN32
 #include <windows.h>
