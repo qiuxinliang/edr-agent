@@ -426,33 +426,6 @@ EdrError edr_storage_queue_open(const char *path) {
 
 void edr_storage_queue_close(void) {}
 
-
-static void trim_queue_if_full(void) {
-  if (s_max_entries == 0 || s_pending < s_max_entries) {
-    return;
-  }
-  
-  sqlite3_stmt *st = NULL;
-  const char *sql = "DELETE FROM event_queue WHERE id IN ("
-                    "SELECT id FROM event_queue WHERE status='pending' "
-                    "ORDER BY severity ASC, created_at ASC LIMIT 1);";
-  
-  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
-    return;
-  }
-  
-  int rc = sqlite3_step(st);
-  sqlite3_finalize(st);
-  
-  if (rc == SQLITE_DONE) {
-    if (s_pending > 0u) {
-      s_pending--;
-    }
-    fprintf(stderr, "[queue] trimmed oldest low-severity entry, pending=%llu\n", 
-            (unsigned long long)s_pending);
-  }
-}
-
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
                                    size_t payload_len, int compressed, int severity) {
   (void)batch_id;

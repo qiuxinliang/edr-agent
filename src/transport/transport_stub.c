@@ -44,9 +44,9 @@ typedef struct EdrTransportCtx {
 
   /* --- 指标层 --- */
   unsigned long wire_events;
-  unsigned long wire_bytes;
+  size_t wire_bytes;
   unsigned long batch_count;
-  unsigned long batch_bytes;
+  size_t batch_bytes;
   unsigned long batch_lz4;
 
   /* --- 队列层 --- */

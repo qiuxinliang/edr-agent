@@ -308,8 +308,8 @@ int main(int argc, char **argv) {
     uint64_t dd = 0, rr = 0;
     edr_dedup_get_stats(&dd, &rr);
     fprintf(stderr,
-            "[preprocess] wire_events=%lu wire_bytes=%lu batches=%lu "
-            "batch_bytes=%lu batch_lz4=%lu batch_timeout_flushes=%llu "
+            "[preprocess] wire_events=%lu wire_bytes=%zu batches=%lu "
+            "batch_bytes=%zu batch_lz4=%lu batch_timeout_flushes=%llu "
             "bus_hw80=%llu bus_dropped=%llu dedup_drops=%llu rate_drops=%llu "
             "junk_parse_failed_drops=%llu queue_pending=%llu\n",
             edr_transport_wire_events_count(), edr_transport_wire_bytes_count(),

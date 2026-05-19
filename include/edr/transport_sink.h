@@ -39,9 +39,9 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const u
                                       size_t header_len, const uint8_t *payload, size_t payload_len);
 
 unsigned long edr_transport_wire_events_count(void);
-unsigned long edr_transport_wire_bytes_count(void);
+size_t edr_transport_wire_bytes_count(void);
 unsigned long edr_transport_batch_count(void);
-unsigned long edr_transport_batch_bytes_count(void);
+size_t edr_transport_batch_bytes_count(void);
 unsigned long edr_transport_batch_lz4_count(void);
 
 /**
