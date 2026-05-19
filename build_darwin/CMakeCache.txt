@@ -274,7 +274,7 @@ EDR_SCCACHE_BIN:FILEPATH=EDR_SCCACHE_BIN-NOTFOUND
 EDR_WITH_FL_KAFKA:BOOL=OFF
 
 //Build federated learning local trainer threads (stub)
-EDR_WITH_FL_TRAINER:BOOL=OFF
+EDR_WITH_FL_TRAINER:BOOL=ON
 
 //Build with gRPC++ EventIngest client (mTLS)
 EDR_WITH_GRPC:BOOL=OFF

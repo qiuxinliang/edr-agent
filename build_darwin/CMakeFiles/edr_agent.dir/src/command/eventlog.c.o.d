@@ -112,5 +112,5 @@ CMakeFiles/edr_agent.dir/src/command/eventlog.c.o: \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/response.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shell_exec.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/sha256.h
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/sha256.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shell_exec.h

@@ -1,5 +1,5 @@
 /**
- * 预处理 → 传输占位：后续替换为 gRPC EventBatch（§6.2）。
+ * 传输层抽象 — 批次上报、指标、调度注入。
  * 批次头 12B：magic（BAT1 原始帧拼接 / BATL LZ4 压缩块）、frame_count、raw_payload_bytes。
  */
 #ifndef EDR_TRANSPORT_SINK_H
@@ -9,6 +9,13 @@
 #include <stdint.h>
 
 struct EdrConfig;
+struct EdrTransportCtx;
+
+/** 可注入 dispatch 回调：由 transport 内部在工作线程调用，将批次实际发往 gRPC/HTTP。 */
+typedef int (*EdrTransportDispatchFn)(int use_http, const char *batch_id,
+                                      const uint8_t *header12, size_t header_len,
+                                      const uint8_t *payload, size_t payload_len,
+                                      void *userdata);
 
 /** 从配置登记上报目标（gRPC mTLS 使用 server.address / 证书路径） */
 void edr_transport_init_from_config(const struct EdrConfig *cfg);
@@ -36,5 +43,15 @@ unsigned long edr_transport_wire_bytes_count(void);
 unsigned long edr_transport_batch_count(void);
 unsigned long edr_transport_batch_bytes_count(void);
 unsigned long edr_transport_batch_lz4_count(void);
+
+/**
+ * 注入模拟 dispatch 回调（测试/QUIC/MQTT 传输层替换）。
+ * fn 为 NULL 时恢复内置 default_dispatch。
+ * userdata 会在每次 dispatch 调用时透传。
+ */
+void edr_transport_inject_dispatch(EdrTransportDispatchFn fn, void *userdata);
+
+/** 获取内部状态只读指针（测试/监控）。在 init 前返回 NULL。 */
+const struct EdrTransportCtx *edr_transport_ctx(void);
 
 #endif

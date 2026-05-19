@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 
 #include "edr/command_util.h"
 #include "edr/response.h"
+#include "edr/shell_exec.h"
 
 #define RTQ_MAX_RESULTS    500
 #define RTQ_MAX_RESULT_STR (128 * 1024)

@@ -166,32 +166,6 @@ edr_p0_golden_test/fast:
 .PHONY : edr_p0_golden_test/fast
 
 #=============================================================================
-# Target rules for targets named edr_dedup_golden_test
-
-# Build rule for target.
-edr_dedup_golden_test: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 edr_dedup_golden_test
-.PHONY : edr_dedup_golden_test
-
-# fast build rule for target.
-edr_dedup_golden_test/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/build
-.PHONY : edr_dedup_golden_test/fast
-
-#=============================================================================
-# Target rules for targets named edr_p0_perf_test
-
-# Build rule for target.
-edr_p0_perf_test: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 edr_p0_perf_test
-.PHONY : edr_p0_perf_test
-
-# fast build rule for target.
-edr_p0_perf_test/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/build
-.PHONY : edr_p0_perf_test/fast
-
-#=============================================================================
 # Target rules for targets named test_event_bus_mpmc_stress
 
 # Build rule for target.
@@ -224,7 +198,6 @@ edr_p0_rule_ir_embed.o: edr_p0_rule_ir_embed.c.o
 edr_p0_rule_ir_embed.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/edr_p0_rule_ir_embed.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/edr_p0_rule_ir_embed.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/edr_p0_rule_ir_embed.c.o
 .PHONY : edr_p0_rule_ir_embed.c.o
 
@@ -235,7 +208,6 @@ edr_p0_rule_ir_embed.i: edr_p0_rule_ir_embed.c.i
 edr_p0_rule_ir_embed.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/edr_p0_rule_ir_embed.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/edr_p0_rule_ir_embed.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/edr_p0_rule_ir_embed.c.i
 .PHONY : edr_p0_rule_ir_embed.c.i
 
@@ -246,7 +218,6 @@ edr_p0_rule_ir_embed.s: edr_p0_rule_ir_embed.c.s
 edr_p0_rule_ir_embed.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/edr_p0_rule_ir_embed.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/edr_p0_rule_ir_embed.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/edr_p0_rule_ir_embed.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/edr_p0_rule_ir_embed.c.s
 .PHONY : edr_p0_rule_ir_embed.c.s
 
@@ -1069,6 +1040,342 @@ src/core/time_util.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/time_util.c.s
 .PHONY : src/core/time_util.c.s
 
+src/fl_trainer/fl_b64.o: src/fl_trainer/fl_b64.c.o
+.PHONY : src/fl_trainer/fl_b64.o
+
+# target to build an object file
+src/fl_trainer/fl_b64.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_b64.c.o
+.PHONY : src/fl_trainer/fl_b64.c.o
+
+src/fl_trainer/fl_b64.i: src/fl_trainer/fl_b64.c.i
+.PHONY : src/fl_trainer/fl_b64.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_b64.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_b64.c.i
+.PHONY : src/fl_trainer/fl_b64.c.i
+
+src/fl_trainer/fl_b64.s: src/fl_trainer/fl_b64.c.s
+.PHONY : src/fl_trainer/fl_b64.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_b64.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_b64.c.s
+.PHONY : src/fl_trainer/fl_b64.c.s
+
+src/fl_trainer/fl_crypto.o: src/fl_trainer/fl_crypto.c.o
+.PHONY : src/fl_trainer/fl_crypto.o
+
+# target to build an object file
+src/fl_trainer/fl_crypto.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_crypto.c.o
+.PHONY : src/fl_trainer/fl_crypto.c.o
+
+src/fl_trainer/fl_crypto.i: src/fl_trainer/fl_crypto.c.i
+.PHONY : src/fl_trainer/fl_crypto.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_crypto.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_crypto.c.i
+.PHONY : src/fl_trainer/fl_crypto.c.i
+
+src/fl_trainer/fl_crypto.s: src/fl_trainer/fl_crypto.c.s
+.PHONY : src/fl_trainer/fl_crypto.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_crypto.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_crypto.c.s
+.PHONY : src/fl_trainer/fl_crypto.c.s
+
+src/fl_trainer/fl_dp.o: src/fl_trainer/fl_dp.c.o
+.PHONY : src/fl_trainer/fl_dp.o
+
+# target to build an object file
+src/fl_trainer/fl_dp.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_dp.c.o
+.PHONY : src/fl_trainer/fl_dp.c.o
+
+src/fl_trainer/fl_dp.i: src/fl_trainer/fl_dp.c.i
+.PHONY : src/fl_trainer/fl_dp.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_dp.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_dp.c.i
+.PHONY : src/fl_trainer/fl_dp.c.i
+
+src/fl_trainer/fl_dp.s: src/fl_trainer/fl_dp.c.s
+.PHONY : src/fl_trainer/fl_dp.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_dp.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_dp.c.s
+.PHONY : src/fl_trainer/fl_dp.c.s
+
+src/fl_trainer/fl_frozen_layers.o: src/fl_trainer/fl_frozen_layers.c.o
+.PHONY : src/fl_trainer/fl_frozen_layers.o
+
+# target to build an object file
+src/fl_trainer/fl_frozen_layers.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_frozen_layers.c.o
+.PHONY : src/fl_trainer/fl_frozen_layers.c.o
+
+src/fl_trainer/fl_frozen_layers.i: src/fl_trainer/fl_frozen_layers.c.i
+.PHONY : src/fl_trainer/fl_frozen_layers.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_frozen_layers.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_frozen_layers.c.i
+.PHONY : src/fl_trainer/fl_frozen_layers.c.i
+
+src/fl_trainer/fl_frozen_layers.s: src/fl_trainer/fl_frozen_layers.c.s
+.PHONY : src/fl_trainer/fl_frozen_layers.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_frozen_layers.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_frozen_layers.c.s
+.PHONY : src/fl_trainer/fl_frozen_layers.c.s
+
+src/fl_trainer/fl_gradient_upload.o: src/fl_trainer/fl_gradient_upload.c.o
+.PHONY : src/fl_trainer/fl_gradient_upload.o
+
+# target to build an object file
+src/fl_trainer/fl_gradient_upload.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_gradient_upload.c.o
+.PHONY : src/fl_trainer/fl_gradient_upload.c.o
+
+src/fl_trainer/fl_gradient_upload.i: src/fl_trainer/fl_gradient_upload.c.i
+.PHONY : src/fl_trainer/fl_gradient_upload.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_gradient_upload.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_gradient_upload.c.i
+.PHONY : src/fl_trainer/fl_gradient_upload.c.i
+
+src/fl_trainer/fl_gradient_upload.s: src/fl_trainer/fl_gradient_upload.c.s
+.PHONY : src/fl_trainer/fl_gradient_upload.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_gradient_upload.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_gradient_upload.c.s
+.PHONY : src/fl_trainer/fl_gradient_upload.c.s
+
+src/fl_trainer/fl_http_upload.o: src/fl_trainer/fl_http_upload.c.o
+.PHONY : src/fl_trainer/fl_http_upload.o
+
+# target to build an object file
+src/fl_trainer/fl_http_upload.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_http_upload.c.o
+.PHONY : src/fl_trainer/fl_http_upload.c.o
+
+src/fl_trainer/fl_http_upload.i: src/fl_trainer/fl_http_upload.c.i
+.PHONY : src/fl_trainer/fl_http_upload.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_http_upload.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_http_upload.c.i
+.PHONY : src/fl_trainer/fl_http_upload.c.i
+
+src/fl_trainer/fl_http_upload.s: src/fl_trainer/fl_http_upload.c.s
+.PHONY : src/fl_trainer/fl_http_upload.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_http_upload.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_http_upload.c.s
+.PHONY : src/fl_trainer/fl_http_upload.c.s
+
+src/fl_trainer/fl_kafka_poll_noop.o: src/fl_trainer/fl_kafka_poll_noop.c.o
+.PHONY : src/fl_trainer/fl_kafka_poll_noop.o
+
+# target to build an object file
+src/fl_trainer/fl_kafka_poll_noop.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_kafka_poll_noop.c.o
+.PHONY : src/fl_trainer/fl_kafka_poll_noop.c.o
+
+src/fl_trainer/fl_kafka_poll_noop.i: src/fl_trainer/fl_kafka_poll_noop.c.i
+.PHONY : src/fl_trainer/fl_kafka_poll_noop.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_kafka_poll_noop.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_kafka_poll_noop.c.i
+.PHONY : src/fl_trainer/fl_kafka_poll_noop.c.i
+
+src/fl_trainer/fl_kafka_poll_noop.s: src/fl_trainer/fl_kafka_poll_noop.c.s
+.PHONY : src/fl_trainer/fl_kafka_poll_noop.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_kafka_poll_noop.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_kafka_poll_noop.c.s
+.PHONY : src/fl_trainer/fl_kafka_poll_noop.c.s
+
+src/fl_trainer/fl_kafka_stub.o: src/fl_trainer/fl_kafka_stub.c.o
+.PHONY : src/fl_trainer/fl_kafka_stub.o
+
+# target to build an object file
+src/fl_trainer/fl_kafka_stub.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_kafka_stub.c.o
+.PHONY : src/fl_trainer/fl_kafka_stub.c.o
+
+src/fl_trainer/fl_kafka_stub.i: src/fl_trainer/fl_kafka_stub.c.i
+.PHONY : src/fl_trainer/fl_kafka_stub.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_kafka_stub.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_kafka_stub.c.i
+.PHONY : src/fl_trainer/fl_kafka_stub.c.i
+
+src/fl_trainer/fl_kafka_stub.s: src/fl_trainer/fl_kafka_stub.c.s
+.PHONY : src/fl_trainer/fl_kafka_stub.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_kafka_stub.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_kafka_stub.c.s
+.PHONY : src/fl_trainer/fl_kafka_stub.c.s
+
+src/fl_trainer/fl_pb_wire.o: src/fl_trainer/fl_pb_wire.c.o
+.PHONY : src/fl_trainer/fl_pb_wire.o
+
+# target to build an object file
+src/fl_trainer/fl_pb_wire.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_pb_wire.c.o
+.PHONY : src/fl_trainer/fl_pb_wire.c.o
+
+src/fl_trainer/fl_pb_wire.i: src/fl_trainer/fl_pb_wire.c.i
+.PHONY : src/fl_trainer/fl_pb_wire.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_pb_wire.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_pb_wire.c.i
+.PHONY : src/fl_trainer/fl_pb_wire.c.i
+
+src/fl_trainer/fl_pb_wire.s: src/fl_trainer/fl_pb_wire.c.s
+.PHONY : src/fl_trainer/fl_pb_wire.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_pb_wire.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_pb_wire.c.s
+.PHONY : src/fl_trainer/fl_pb_wire.c.s
+
+src/fl_trainer/fl_privacy_budget.o: src/fl_trainer/fl_privacy_budget.c.o
+.PHONY : src/fl_trainer/fl_privacy_budget.o
+
+# target to build an object file
+src/fl_trainer/fl_privacy_budget.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_privacy_budget.c.o
+.PHONY : src/fl_trainer/fl_privacy_budget.c.o
+
+src/fl_trainer/fl_privacy_budget.i: src/fl_trainer/fl_privacy_budget.c.i
+.PHONY : src/fl_trainer/fl_privacy_budget.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_privacy_budget.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_privacy_budget.c.i
+.PHONY : src/fl_trainer/fl_privacy_budget.c.i
+
+src/fl_trainer/fl_privacy_budget.s: src/fl_trainer/fl_privacy_budget.c.s
+.PHONY : src/fl_trainer/fl_privacy_budget.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_privacy_budget.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_privacy_budget.c.s
+.PHONY : src/fl_trainer/fl_privacy_budget.c.s
+
+src/fl_trainer/fl_round.o: src/fl_trainer/fl_round.c.o
+.PHONY : src/fl_trainer/fl_round.o
+
+# target to build an object file
+src/fl_trainer/fl_round.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_round.c.o
+.PHONY : src/fl_trainer/fl_round.c.o
+
+src/fl_trainer/fl_round.i: src/fl_trainer/fl_round.c.i
+.PHONY : src/fl_trainer/fl_round.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_round.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_round.c.i
+.PHONY : src/fl_trainer/fl_round.c.i
+
+src/fl_trainer/fl_round.s: src/fl_trainer/fl_round.c.s
+.PHONY : src/fl_trainer/fl_round.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_round.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_round.c.s
+.PHONY : src/fl_trainer/fl_round.c.s
+
+src/fl_trainer/fl_samples_db.o: src/fl_trainer/fl_samples_db.c.o
+.PHONY : src/fl_trainer/fl_samples_db.o
+
+# target to build an object file
+src/fl_trainer/fl_samples_db.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_samples_db.c.o
+.PHONY : src/fl_trainer/fl_samples_db.c.o
+
+src/fl_trainer/fl_samples_db.i: src/fl_trainer/fl_samples_db.c.i
+.PHONY : src/fl_trainer/fl_samples_db.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_samples_db.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_samples_db.c.i
+.PHONY : src/fl_trainer/fl_samples_db.c.i
+
+src/fl_trainer/fl_samples_db.s: src/fl_trainer/fl_samples_db.c.s
+.PHONY : src/fl_trainer/fl_samples_db.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_samples_db.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_samples_db.c.s
+.PHONY : src/fl_trainer/fl_samples_db.c.s
+
+src/fl_trainer/fl_trainer.o: src/fl_trainer/fl_trainer.c.o
+.PHONY : src/fl_trainer/fl_trainer.o
+
+# target to build an object file
+src/fl_trainer/fl_trainer.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_trainer.c.o
+.PHONY : src/fl_trainer/fl_trainer.c.o
+
+src/fl_trainer/fl_trainer.i: src/fl_trainer/fl_trainer.c.i
+.PHONY : src/fl_trainer/fl_trainer.i
+
+# target to preprocess a source file
+src/fl_trainer/fl_trainer.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_trainer.c.i
+.PHONY : src/fl_trainer/fl_trainer.c.i
+
+src/fl_trainer/fl_trainer.s: src/fl_trainer/fl_trainer.c.s
+.PHONY : src/fl_trainer/fl_trainer.s
+
+# target to generate assembly for a file
+src/fl_trainer/fl_trainer.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/fl_trainer.c.s
+.PHONY : src/fl_trainer/fl_trainer.c.s
+
+src/fl_trainer/local_train_core.o: src/fl_trainer/local_train_core.c.o
+.PHONY : src/fl_trainer/local_train_core.o
+
+# target to build an object file
+src/fl_trainer/local_train_core.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/local_train_core.c.o
+.PHONY : src/fl_trainer/local_train_core.c.o
+
+src/fl_trainer/local_train_core.i: src/fl_trainer/local_train_core.c.i
+.PHONY : src/fl_trainer/local_train_core.i
+
+# target to preprocess a source file
+src/fl_trainer/local_train_core.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/local_train_core.c.i
+.PHONY : src/fl_trainer/local_train_core.c.i
+
+src/fl_trainer/local_train_core.s: src/fl_trainer/local_train_core.c.s
+.PHONY : src/fl_trainer/local_train_core.s
+
+# target to generate assembly for a file
+src/fl_trainer/local_train_core.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/fl_trainer/local_train_core.c.s
+.PHONY : src/fl_trainer/local_train_core.c.s
+
 src/forensic/deep_collector.o: src/forensic/deep_collector.c.o
 .PHONY : src/forensic/deep_collector.o
 
@@ -1342,7 +1649,6 @@ src/preprocess/dedup.o: src/preprocess/dedup.c.o
 # target to build an object file
 src/preprocess/dedup.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup.c.o
 .PHONY : src/preprocess/dedup.c.o
 
 src/preprocess/dedup.i: src/preprocess/dedup.c.i
@@ -1351,7 +1657,6 @@ src/preprocess/dedup.i: src/preprocess/dedup.c.i
 # target to preprocess a source file
 src/preprocess/dedup.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup.c.i
 .PHONY : src/preprocess/dedup.c.i
 
 src/preprocess/dedup.s: src/preprocess/dedup.c.s
@@ -1360,32 +1665,7 @@ src/preprocess/dedup.s: src/preprocess/dedup.c.s
 # target to generate assembly for a file
 src/preprocess/dedup.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/dedup.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup.c.s
 .PHONY : src/preprocess/dedup.c.s
-
-src/preprocess/dedup_golden_test.o: src/preprocess/dedup_golden_test.c.o
-.PHONY : src/preprocess/dedup_golden_test.o
-
-# target to build an object file
-src/preprocess/dedup_golden_test.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup_golden_test.c.o
-.PHONY : src/preprocess/dedup_golden_test.c.o
-
-src/preprocess/dedup_golden_test.i: src/preprocess/dedup_golden_test.c.i
-.PHONY : src/preprocess/dedup_golden_test.i
-
-# target to preprocess a source file
-src/preprocess/dedup_golden_test.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup_golden_test.c.i
-.PHONY : src/preprocess/dedup_golden_test.c.i
-
-src/preprocess/dedup_golden_test.s: src/preprocess/dedup_golden_test.c.s
-.PHONY : src/preprocess/dedup_golden_test.s
-
-# target to generate assembly for a file
-src/preprocess/dedup_golden_test.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup_golden_test.c.s
-.PHONY : src/preprocess/dedup_golden_test.c.s
 
 src/preprocess/emit_rules.o: src/preprocess/emit_rules.c.o
 .PHONY : src/preprocess/emit_rules.o
@@ -1393,7 +1673,6 @@ src/preprocess/emit_rules.o: src/preprocess/emit_rules.c.o
 # target to build an object file
 src/preprocess/emit_rules.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/emit_rules.c.o
 .PHONY : src/preprocess/emit_rules.c.o
 
 src/preprocess/emit_rules.i: src/preprocess/emit_rules.c.i
@@ -1402,7 +1681,6 @@ src/preprocess/emit_rules.i: src/preprocess/emit_rules.c.i
 # target to preprocess a source file
 src/preprocess/emit_rules.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/emit_rules.c.i
 .PHONY : src/preprocess/emit_rules.c.i
 
 src/preprocess/emit_rules.s: src/preprocess/emit_rules.c.s
@@ -1411,7 +1689,6 @@ src/preprocess/emit_rules.s: src/preprocess/emit_rules.c.s
 # target to generate assembly for a file
 src/preprocess/emit_rules.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/emit_rules.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_dedup_golden_test.dir/build.make CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/emit_rules.c.s
 .PHONY : src/preprocess/emit_rules.c.s
 
 src/preprocess/encrypt_p0_rules.o: src/preprocess/encrypt_p0_rules.c.o
@@ -1421,7 +1698,6 @@ src/preprocess/encrypt_p0_rules.o: src/preprocess/encrypt_p0_rules.c.o
 src/preprocess/encrypt_p0_rules.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/encrypt_p0_rules.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/encrypt_p0_rules.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/encrypt_p0_rules.c.o
 .PHONY : src/preprocess/encrypt_p0_rules.c.o
 
@@ -1432,7 +1708,6 @@ src/preprocess/encrypt_p0_rules.i: src/preprocess/encrypt_p0_rules.c.i
 src/preprocess/encrypt_p0_rules.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/encrypt_p0_rules.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/encrypt_p0_rules.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/encrypt_p0_rules.c.i
 .PHONY : src/preprocess/encrypt_p0_rules.c.i
 
@@ -1443,7 +1718,6 @@ src/preprocess/encrypt_p0_rules.s: src/preprocess/encrypt_p0_rules.c.s
 src/preprocess/encrypt_p0_rules.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/encrypt_p0_rules.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/encrypt_p0_rules.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/encrypt_p0_rules.c.s
 .PHONY : src/preprocess/encrypt_p0_rules.c.s
 
@@ -1526,7 +1800,6 @@ src/preprocess/p0_rule_ir.o: src/preprocess/p0_rule_ir.c.o
 src/preprocess/p0_rule_ir.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_ir.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/p0_rule_ir.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.o
 .PHONY : src/preprocess/p0_rule_ir.c.o
 
@@ -1537,7 +1810,6 @@ src/preprocess/p0_rule_ir.i: src/preprocess/p0_rule_ir.c.i
 src/preprocess/p0_rule_ir.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_ir.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/p0_rule_ir.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.i
 .PHONY : src/preprocess/p0_rule_ir.c.i
 
@@ -1548,7 +1820,6 @@ src/preprocess/p0_rule_ir.s: src/preprocess/p0_rule_ir.c.s
 src/preprocess/p0_rule_ir.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_ir.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_ir.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/p0_rule_ir.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.s
 .PHONY : src/preprocess/p0_rule_ir.c.s
 
@@ -1583,7 +1854,6 @@ src/preprocess/p0_rule_match.o: src/preprocess/p0_rule_match.c.o
 src/preprocess/p0_rule_match.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/p0_rule_match.c.o
 .PHONY : src/preprocess/p0_rule_match.c.o
 
 src/preprocess/p0_rule_match.i: src/preprocess/p0_rule_match.c.i
@@ -1593,7 +1863,6 @@ src/preprocess/p0_rule_match.i: src/preprocess/p0_rule_match.c.i
 src/preprocess/p0_rule_match.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/p0_rule_match.c.i
 .PHONY : src/preprocess/p0_rule_match.c.i
 
 src/preprocess/p0_rule_match.s: src/preprocess/p0_rule_match.c.s
@@ -1603,7 +1872,6 @@ src/preprocess/p0_rule_match.s: src/preprocess/p0_rule_match.c.s
 src/preprocess/p0_rule_match.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/p0_rule_match.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/p0_rule_match.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/p0_rule_match.c.s
 .PHONY : src/preprocess/p0_rule_match.c.s
 
 src/preprocess/preprocess_env.o: src/preprocess/preprocess_env.c.o
@@ -1613,7 +1881,6 @@ src/preprocess/preprocess_env.o: src/preprocess/preprocess_env.c.o
 src/preprocess/preprocess_env.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/preprocess_env.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/preprocess_env.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.o
 .PHONY : src/preprocess/preprocess_env.c.o
 
@@ -1624,7 +1891,6 @@ src/preprocess/preprocess_env.i: src/preprocess/preprocess_env.c.i
 src/preprocess/preprocess_env.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/preprocess_env.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/preprocess_env.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.i
 .PHONY : src/preprocess/preprocess_env.c.i
 
@@ -1635,7 +1901,6 @@ src/preprocess/preprocess_env.s: src/preprocess/preprocess_env.c.s
 src/preprocess/preprocess_env.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/preprocess/preprocess_env.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/src/preprocess/preprocess_env.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/src/preprocess/preprocess_env.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.s
 .PHONY : src/preprocess/preprocess_env.c.s
 
@@ -1758,78 +2023,6 @@ src/response/response_actions.s: src/response/response_actions.c.s
 src/response/response_actions.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_actions.c.s
 .PHONY : src/response/response_actions.c.s
-
-src/response/response_file.o: src/response/response_file.c.o
-.PHONY : src/response/response_file.o
-
-# target to build an object file
-src/response/response_file.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_file.c.o
-.PHONY : src/response/response_file.c.o
-
-src/response/response_file.i: src/response/response_file.c.i
-.PHONY : src/response/response_file.i
-
-# target to preprocess a source file
-src/response/response_file.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_file.c.i
-.PHONY : src/response/response_file.c.i
-
-src/response/response_file.s: src/response/response_file.c.s
-.PHONY : src/response/response_file.s
-
-# target to generate assembly for a file
-src/response/response_file.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_file.c.s
-.PHONY : src/response/response_file.c.s
-
-src/response/response_forensic.o: src/response/response_forensic.c.o
-.PHONY : src/response/response_forensic.o
-
-# target to build an object file
-src/response/response_forensic.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_forensic.c.o
-.PHONY : src/response/response_forensic.c.o
-
-src/response/response_forensic.i: src/response/response_forensic.c.i
-.PHONY : src/response/response_forensic.i
-
-# target to preprocess a source file
-src/response/response_forensic.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_forensic.c.i
-.PHONY : src/response/response_forensic.c.i
-
-src/response/response_forensic.s: src/response/response_forensic.c.s
-.PHONY : src/response/response_forensic.s
-
-# target to generate assembly for a file
-src/response/response_forensic.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_forensic.c.s
-.PHONY : src/response/response_forensic.c.s
-
-src/response/response_utils.o: src/response/response_utils.c.o
-.PHONY : src/response/response_utils.o
-
-# target to build an object file
-src/response/response_utils.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_utils.c.o
-.PHONY : src/response/response_utils.c.o
-
-src/response/response_utils.i: src/response/response_utils.c.i
-.PHONY : src/response/response_utils.i
-
-# target to preprocess a source file
-src/response/response_utils.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_utils.c.i
-.PHONY : src/response/response_utils.c.i
-
-src/response/response_utils.s: src/response/response_utils.c.s
-.PHONY : src/response/response_utils.s
-
-# target to generate assembly for a file
-src/response/response_utils.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_utils.c.s
-.PHONY : src/response/response_utils.c.s
 
 src/self_protect/self_protect.o: src/self_protect/self_protect.c.o
 .PHONY : src/self_protect/self_protect.o
@@ -2095,30 +2288,6 @@ src/shellcode_detector/shellcode_known.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/shellcode_detector/shellcode_known.c.s
 .PHONY : src/shellcode_detector/shellcode_known.c.s
 
-src/storage/mmap_storage.o: src/storage/mmap_storage.c.o
-.PHONY : src/storage/mmap_storage.o
-
-# target to build an object file
-src/storage/mmap_storage.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/storage/mmap_storage.c.o
-.PHONY : src/storage/mmap_storage.c.o
-
-src/storage/mmap_storage.i: src/storage/mmap_storage.c.i
-.PHONY : src/storage/mmap_storage.i
-
-# target to preprocess a source file
-src/storage/mmap_storage.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/storage/mmap_storage.c.i
-.PHONY : src/storage/mmap_storage.c.i
-
-src/storage/mmap_storage.s: src/storage/mmap_storage.c.s
-.PHONY : src/storage/mmap_storage.s
-
-# target to generate assembly for a file
-src/storage/mmap_storage.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/storage/mmap_storage.c.s
-.PHONY : src/storage/mmap_storage.c.s
-
 src/storage/queue_sqlite.o: src/storage/queue_sqlite.c.o
 .PHONY : src/storage/queue_sqlite.o
 
@@ -2287,30 +2456,6 @@ src/webshell_detector/webshell_forensic.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.s
 .PHONY : src/webshell_detector/webshell_forensic.c.s
 
-test/p0_rule_perf_test.o: test/p0_rule_perf_test.c.o
-.PHONY : test/p0_rule_perf_test.o
-
-# target to build an object file
-test/p0_rule_perf_test.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/test/p0_rule_perf_test.c.o
-.PHONY : test/p0_rule_perf_test.c.o
-
-test/p0_rule_perf_test.i: test/p0_rule_perf_test.c.i
-.PHONY : test/p0_rule_perf_test.i
-
-# target to preprocess a source file
-test/p0_rule_perf_test.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/test/p0_rule_perf_test.c.i
-.PHONY : test/p0_rule_perf_test.c.i
-
-test/p0_rule_perf_test.s: test/p0_rule_perf_test.c.s
-.PHONY : test/p0_rule_perf_test.s
-
-# target to generate assembly for a file
-test/p0_rule_perf_test.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/test/p0_rule_perf_test.c.s
-.PHONY : test/p0_rule_perf_test.c.s
-
 tests/test_event_bus_mpmc_stress.o: tests/test_event_bus_mpmc_stress.c.o
 .PHONY : tests/test_event_bus_mpmc_stress.o
 
@@ -2342,7 +2487,6 @@ third_party/cjson/cJSON.o: third_party/cjson/cJSON.c.o
 third_party/cjson/cJSON.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/cjson/cJSON.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/third_party/cjson/cJSON.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/third_party/cjson/cJSON.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.o
 .PHONY : third_party/cjson/cJSON.c.o
 
@@ -2353,7 +2497,6 @@ third_party/cjson/cJSON.i: third_party/cjson/cJSON.c.i
 third_party/cjson/cJSON.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/cjson/cJSON.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/third_party/cjson/cJSON.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/third_party/cjson/cJSON.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.i
 .PHONY : third_party/cjson/cJSON.c.i
 
@@ -2364,7 +2507,6 @@ third_party/cjson/cJSON.s: third_party/cjson/cJSON.c.s
 third_party/cjson/cJSON.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/cjson/cJSON.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_golden_test.dir/build.make CMakeFiles/edr_p0_golden_test.dir/third_party/cjson/cJSON.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_perf_test.dir/build.make CMakeFiles/edr_p0_perf_test.dir/third_party/cjson/cJSON.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.s
 .PHONY : third_party/cjson/cJSON.c.s
 
@@ -2525,11 +2667,9 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... edr_agent"
-	@echo "... edr_dedup_golden_test"
 	@echo "... edr_monitor"
 	@echo "... edr_p0_golden_test"
 	@echo "... edr_p0_ir_record_golden_test"
-	@echo "... edr_p0_perf_test"
 	@echo "... test_event_bus_mpmc_stress"
 	@echo "... edr_p0_rule_ir_embed.o"
 	@echo "... edr_p0_rule_ir_embed.i"
@@ -2636,6 +2776,48 @@ help:
 	@echo "... src/core/time_util.o"
 	@echo "... src/core/time_util.i"
 	@echo "... src/core/time_util.s"
+	@echo "... src/fl_trainer/fl_b64.o"
+	@echo "... src/fl_trainer/fl_b64.i"
+	@echo "... src/fl_trainer/fl_b64.s"
+	@echo "... src/fl_trainer/fl_crypto.o"
+	@echo "... src/fl_trainer/fl_crypto.i"
+	@echo "... src/fl_trainer/fl_crypto.s"
+	@echo "... src/fl_trainer/fl_dp.o"
+	@echo "... src/fl_trainer/fl_dp.i"
+	@echo "... src/fl_trainer/fl_dp.s"
+	@echo "... src/fl_trainer/fl_frozen_layers.o"
+	@echo "... src/fl_trainer/fl_frozen_layers.i"
+	@echo "... src/fl_trainer/fl_frozen_layers.s"
+	@echo "... src/fl_trainer/fl_gradient_upload.o"
+	@echo "... src/fl_trainer/fl_gradient_upload.i"
+	@echo "... src/fl_trainer/fl_gradient_upload.s"
+	@echo "... src/fl_trainer/fl_http_upload.o"
+	@echo "... src/fl_trainer/fl_http_upload.i"
+	@echo "... src/fl_trainer/fl_http_upload.s"
+	@echo "... src/fl_trainer/fl_kafka_poll_noop.o"
+	@echo "... src/fl_trainer/fl_kafka_poll_noop.i"
+	@echo "... src/fl_trainer/fl_kafka_poll_noop.s"
+	@echo "... src/fl_trainer/fl_kafka_stub.o"
+	@echo "... src/fl_trainer/fl_kafka_stub.i"
+	@echo "... src/fl_trainer/fl_kafka_stub.s"
+	@echo "... src/fl_trainer/fl_pb_wire.o"
+	@echo "... src/fl_trainer/fl_pb_wire.i"
+	@echo "... src/fl_trainer/fl_pb_wire.s"
+	@echo "... src/fl_trainer/fl_privacy_budget.o"
+	@echo "... src/fl_trainer/fl_privacy_budget.i"
+	@echo "... src/fl_trainer/fl_privacy_budget.s"
+	@echo "... src/fl_trainer/fl_round.o"
+	@echo "... src/fl_trainer/fl_round.i"
+	@echo "... src/fl_trainer/fl_round.s"
+	@echo "... src/fl_trainer/fl_samples_db.o"
+	@echo "... src/fl_trainer/fl_samples_db.i"
+	@echo "... src/fl_trainer/fl_samples_db.s"
+	@echo "... src/fl_trainer/fl_trainer.o"
+	@echo "... src/fl_trainer/fl_trainer.i"
+	@echo "... src/fl_trainer/fl_trainer.s"
+	@echo "... src/fl_trainer/local_train_core.o"
+	@echo "... src/fl_trainer/local_train_core.i"
+	@echo "... src/fl_trainer/local_train_core.s"
 	@echo "... src/forensic/deep_collector.o"
 	@echo "... src/forensic/deep_collector.i"
 	@echo "... src/forensic/deep_collector.s"
@@ -2672,9 +2854,6 @@ help:
 	@echo "... src/preprocess/dedup.o"
 	@echo "... src/preprocess/dedup.i"
 	@echo "... src/preprocess/dedup.s"
-	@echo "... src/preprocess/dedup_golden_test.o"
-	@echo "... src/preprocess/dedup_golden_test.i"
-	@echo "... src/preprocess/dedup_golden_test.s"
 	@echo "... src/preprocess/emit_rules.o"
 	@echo "... src/preprocess/emit_rules.i"
 	@echo "... src/preprocess/emit_rules.s"
@@ -2717,15 +2896,6 @@ help:
 	@echo "... src/response/response_actions.o"
 	@echo "... src/response/response_actions.i"
 	@echo "... src/response/response_actions.s"
-	@echo "... src/response/response_file.o"
-	@echo "... src/response/response_file.i"
-	@echo "... src/response/response_file.s"
-	@echo "... src/response/response_forensic.o"
-	@echo "... src/response/response_forensic.i"
-	@echo "... src/response/response_forensic.s"
-	@echo "... src/response/response_utils.o"
-	@echo "... src/response/response_utils.i"
-	@echo "... src/response/response_utils.s"
 	@echo "... src/self_protect/self_protect.o"
 	@echo "... src/self_protect/self_protect.i"
 	@echo "... src/self_protect/self_protect.s"
@@ -2759,9 +2929,6 @@ help:
 	@echo "... src/shellcode_detector/shellcode_known.o"
 	@echo "... src/shellcode_detector/shellcode_known.i"
 	@echo "... src/shellcode_detector/shellcode_known.s"
-	@echo "... src/storage/mmap_storage.o"
-	@echo "... src/storage/mmap_storage.i"
-	@echo "... src/storage/mmap_storage.s"
 	@echo "... src/storage/queue_sqlite.o"
 	@echo "... src/storage/queue_sqlite.i"
 	@echo "... src/storage/queue_sqlite.s"
@@ -2783,9 +2950,6 @@ help:
 	@echo "... src/webshell_detector/webshell_forensic.o"
 	@echo "... src/webshell_detector/webshell_forensic.i"
 	@echo "... src/webshell_detector/webshell_forensic.s"
-	@echo "... test/p0_rule_perf_test.o"
-	@echo "... test/p0_rule_perf_test.i"
-	@echo "... test/p0_rule_perf_test.s"
 	@echo "... tests/test_event_bus_mpmc_stress.o"
 	@echo "... tests/test_event_bus_mpmc_stress.i"
 	@echo "... tests/test_event_bus_mpmc_stress.s"

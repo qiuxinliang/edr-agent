@@ -41,10 +41,6 @@ CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.o: \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_rsize_t.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ave_sdk.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/collector.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types.h \

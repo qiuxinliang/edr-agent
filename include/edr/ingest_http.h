@@ -49,6 +49,9 @@ int edr_ingest_http_post_command_result(const char *command_id, const struct Edr
 void edr_ingest_http_start_command_poll(void);
 void edr_ingest_http_stop_command_poll(void);
 
+/** 关闭 HTTP ingest 连接资源（与 configure 配对，在 edr_transport_shutdown 中调用）。 */
+void edr_ingest_http_shutdown(void);
+
 /**
  * POST `/ingest/upload-file`（multipart，与 gRPC `UploadFile` 落点一致）。成功 0 并写 minio_key 至 out 缓冲。
  */

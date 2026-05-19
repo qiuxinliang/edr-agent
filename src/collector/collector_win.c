@@ -8,6 +8,7 @@
 #endif
 
 #include <windows.h>
+#include <stdatomic.h>
 
 #include "edr/evnttrace_stub.h"
 

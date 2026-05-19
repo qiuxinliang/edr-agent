@@ -764,9 +764,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                      r->exe_path, r->parent_name,
                      (uint64_t)slot->timestamp_ns);
     
-    if (strcasecmp(r->process_name, "explorer.exe") == 0) {
-      edr_pt_cache_update_explorer_info(r->pid, (uint64_t)slot->timestamp_ns);
-    }
+    /* edr_pt_cache_update_explorer_info 已移除，explorer 信息由 process_tree_cache 统一管理 */
   } else if (slot->type == EDR_EVENT_PROCESS_TERMINATE) {
     edr_pt_cache_remove(r->pid);
   }

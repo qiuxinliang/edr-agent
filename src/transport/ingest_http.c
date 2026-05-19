@@ -1318,6 +1318,17 @@ void edr_ingest_http_stop_command_poll(void) {
   s_cmd_poll_thread_started = 0;
 }
 
+void edr_ingest_http_shutdown(void) {
+  edr_ingest_http_stop_command_poll();
+  /* 清除配置，后续调用 edr_ingest_http_configured() 返回 0 */
+  memset(s_rest, 0, sizeof(s_rest));
+  memset(s_tenant, 0, sizeof(s_tenant));
+  memset(s_user, 0, sizeof(s_user));
+  memset(s_bearer, 0, sizeof(s_bearer));
+  memset(s_endpoint, 0, sizeof(s_endpoint));
+  memset(s_agent_ver, 0, sizeof(s_agent_ver));
+}
+
 static int copy_minio_key_from_json(const char *json, char *out, size_t out_cap) {
   if (!out || out_cap < 2u) {
     return -1;

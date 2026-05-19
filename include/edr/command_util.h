@@ -36,6 +36,11 @@ extern unsigned long g_cmd_rejected;
 extern unsigned long g_cmd_exec_ok;
 extern unsigned long g_cmd_exec_fail;
 
+static inline void edr_cmd_inc_handled(void) { g_cmd_handled++; }
+static inline void edr_cmd_inc_rejected(void) { g_cmd_rejected++; }
+static inline void edr_cmd_inc_exec_ok(void) { g_cmd_exec_ok++; }
+static inline void edr_cmd_inc_exec_fail(void) { g_cmd_exec_fail++; }
+
 #ifdef __cplusplus
 }
 #endif

@@ -331,9 +331,7 @@ CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.o: /User
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ave_sdk.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/behavior_record.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/collector.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/config.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/encrypt_p0_rules.h \
@@ -341,9 +339,7 @@ CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/p0_rule_ir.c.o: /User
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/p0_rule_ir.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/preprocess.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/cjson/cJSON.h \
   /opt/homebrew/include/pcre2.h
 
@@ -508,17 +504,13 @@ CMakeFiles/edr_p0_ir_record_golden_test.dir/src/preprocess/preprocess_env.c.o: /
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ave_sdk.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/behavior_record.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/collector.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/config.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/error.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/preprocess.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h
 
 CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/cjson/cJSON.c \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/Availability.h \
@@ -657,10 +649,6 @@ CMakeFiles/edr_p0_ir_record_golden_test.dir/third_party/cjson/cJSON.c.o: /Users/
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/error.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/config.h:
-
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/collector.h:
-
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ave_sdk.h:
 
 /Library/Developer/CommandLineTools/usr/lib/clang/21/include/inttypes.h:
 
@@ -938,8 +926,6 @@ edr_p0_rule_ir_embed.c:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_errno_t.h:
 
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h:
-
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/preprocess/encrypt_p0_rules.c:
 
 /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_offsetof.h:
@@ -963,8 +949,6 @@ edr_p0_rule_ir_embed.c:
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/encrypt_p0_rules.h:
 
 /Library/Developer/CommandLineTools/usr/lib/clang/21/include/ptrcheck.h:
-
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h:
 
 /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_max_align_t.h:
 

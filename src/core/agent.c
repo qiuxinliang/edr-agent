@@ -8,10 +8,14 @@
 #include "edr/preprocess.h"
 #include "edr/process_tree_cache.h"
 #include "edr/resource.h"
+#include "edr/response.h"
+#include "edr/self_protect.h"
+#include "edr/shell_session.h"
 #include "edr/time_util.h"
 
 #if defined(EDR_WITH_FL_TRAINER)
 #include "edr/attack_surface_report.h"
+#include "edr/fl_trainer.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/agent_update.h"
 #include "edr/behavior_from_slot.h"
@@ -327,6 +331,9 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   return EDR_OK;
 }
 
+/* forward declarations: 待提取到独立 header */
+static int edr_remote_tmp_path(char *buf, size_t cap);
+
 static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_ns);
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
@@ -335,6 +342,13 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static int edr_remote_curl_init(void) {
   static int done = 0;
   if (!done) {
+    done = 1;
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
 static size_t edr_curl_capture_header(char *buffer, size_t size, size_t nitems, void *userdata) {
   size_t total = size * nitems;
   if (total < 18 || !userdata) return total;
@@ -1025,4 +1039,13 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   if (strncmp(detail, "uploaded_", 9) == 0) {
     EDR_LOGV("[attack_surface] periodic %s\n", detail);
   }
+}
+
+#endif /* EDR_WITH_FL_TRAINER */
+
+/* stub: 远程配置临时文件路径（待实现为独立模块） */
+static int edr_remote_tmp_path(char *buf, size_t cap) {
+  (void)cap;
+  snprintf(buf, cap, "remote_config_tmp.toml");
+  return 0;
 }

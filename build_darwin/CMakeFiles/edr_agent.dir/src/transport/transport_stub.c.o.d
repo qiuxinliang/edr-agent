@@ -1,11 +1,15 @@
 CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/transport/transport_stub.c \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/config.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/error.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/behavior_record.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/transport_sink.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stddef.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_header_macro.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_ptrdiff_t.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_size_t.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_wchar_t.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_null.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_max_align_t.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_offsetof.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdint.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_int8_t.h \
@@ -28,21 +32,14 @@ CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_uintptr_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types/_intmax_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types/_uintmax_t.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/config.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/error.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/behavior_record.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
-  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stddef.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_header_macro.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_ptrdiff_t.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_size_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_rsize_t.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_wchar_t.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_null.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_max_align_t.h \
-  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_offsetof.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ave_sdk.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/collector.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types.h \
@@ -62,10 +59,6 @@ CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_size_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_time_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_timespec.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/grpc_client.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/storage_queue.h \
-  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/transport_sink.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/edr_log.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_stdio.h \
@@ -78,6 +71,9 @@ CMakeFiles/edr_agent.dir/src/transport/transport_stub.c.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_ssize_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_common.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/grpc_client.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/storage_queue.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdlib.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_stdlib.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/wait.h \
