@@ -5,8 +5,6 @@
 
 #ifdef EDR_HAVE_OPENSSL_FL
 #include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
 #endif
 
 #ifdef EDR_HAVE_OPENSSL_FL
@@ -23,32 +21,58 @@ static void derive_key(uint8_t key[32]) {
   const uint8_t salt[] = "edr-p0-rule-v1";
   const uint8_t info[] = "aes-256-gcm-rule";
 
+  /* HKDF-extract: PRK = HMAC-SHA256(salt, seed) */
   uint8_t prk[32];
-  unsigned int prk_len = 32;
-  HMAC(EVP_sha256(), salt, (int)(sizeof(salt) - 1), seed, sizeof(seed), prk, &prk_len);
+  {
+    EVP_MAC *hmac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!hmac) return;
 
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(hmac);
+    EVP_MAC_free(hmac);
+    if (!ctx) return;
+
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string("digest", "SHA256", 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    size_t out_len = 32;
+    EVP_MAC_init(ctx, salt, sizeof(salt) - 1, params);
+    EVP_MAC_update(ctx, seed, sizeof(seed));
+    EVP_MAC_final(ctx, prk, &out_len, sizeof(prk));
+    EVP_MAC_CTX_free(ctx);
+  }
+
+  /* HKDF-expand: OKM = T(1) || T(2) || ... until 32 bytes */
   uint8_t okm[32];
-  uint8_t t[32];
-  unsigned int t_len;
   uint8_t ctr = 1;
   size_t off = 0;
 
   while (off < 32) {
-    HMAC_CTX *ctx = HMAC_CTX_new();
-    HMAC_Init_ex(ctx, prk, 32, EVP_sha256(), NULL);
+    EVP_MAC *hmac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!hmac) break;
+
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(hmac);
+    EVP_MAC_free(hmac);
+    if (!ctx) break;
+
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string("digest", "SHA256", 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    EVP_MAC_init(ctx, prk, sizeof(prk), params);
     if (off > 0) {
-      HMAC_Update(ctx, okm, (unsigned int)off);
+      EVP_MAC_update(ctx, okm, off);
     }
-    HMAC_Update(ctx, info, (size_t)(sizeof(info) - 1));
-    HMAC_Update(ctx, &ctr, 1);
-    t_len = 32;
-    HMAC_Final(ctx, t, &t_len);
-    HMAC_CTX_free(ctx);
+    EVP_MAC_update(ctx, info, sizeof(info) - 1);
+    EVP_MAC_update(ctx, &ctr, 1);
+
+    uint8_t t[32];
+    size_t t_len = sizeof(t);
+    EVP_MAC_final(ctx, t, &t_len, sizeof(t));
+    EVP_MAC_CTX_free(ctx);
 
     size_t need = 32 - off;
-    if (need > t_len) {
-      need = t_len;
-    }
+    if (need > t_len) need = t_len;
     memcpy(okm + off, t, need);
     off += need;
     ctr++;

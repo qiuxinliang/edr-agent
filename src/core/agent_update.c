@@ -20,7 +20,7 @@
 #endif
 
 #ifdef EDR_HAVE_OPENSSL_FL
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 #endif
 
 #include "cJSON.h"
@@ -197,12 +197,18 @@ static int sha256_file(const char *path, char out_hex[65]) {
   fclose(f);
   return -1;
 #else
-  SHA256_CTX ctx;
-  SHA256_Init(&ctx);
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    SHA256_Update(&ctx, buf, n);
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  if (!ctx) {
+    fclose(f);
+    return -1;
   }
-  SHA256_Final(hash, &ctx);
+  EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    EVP_DigestUpdate(ctx, buf, n);
+  }
+  unsigned int hash_len = 32;
+  EVP_DigestFinal_ex(ctx, hash, &hash_len);
+  EVP_MD_CTX_free(ctx);
   fclose(f);
 
   for (int i = 0; i < 32; i++) {

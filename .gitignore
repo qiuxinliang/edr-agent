@@ -16,3 +16,4 @@ requirements-dev.txt
 /build_p0g
 /build_p0g
 /build_p0full
+*.md

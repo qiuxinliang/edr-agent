@@ -152,6 +152,9 @@ static int process_name_in_gate_allowlist(const char *name) {
       // 下载/网络工具
       "curl.exe",
       "wget.exe",
+      // 关键系统进程 (进程链追踪必需)
+      "cmd.exe",
+      "explorer.exe",
   };
   static const char *s_custom_whitelist = NULL;
   static char *s_whitelist_copy = NULL;
