@@ -24,8 +24,6 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
 
 int edr_ingest_http_configured(void);
 
-void edr_ingest_http_shutdown(void);
-
 /**
  * 发送一批（12B BAT1/BLZ4 头 + payload）；成功返回 0。
  * JSON 体字段与平台 PostReportEvents 一致。

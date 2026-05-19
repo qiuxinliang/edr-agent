@@ -1,5 +1,4 @@
 #include "edr/response.h"
-#include "edr/response_utils.h"
 #include "edr/command_util.h"
 #include "edr/config.h"
 #include "edr/deep_collector.h"

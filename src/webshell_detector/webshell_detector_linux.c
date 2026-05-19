@@ -6,7 +6,6 @@
 
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
-#include "edr/edr_log.h"
 #include "edr/event_bus.h"
 #include "edr/grpc_client.h"
 #include "edr/types.h"
@@ -18,7 +17,6 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -57,7 +55,6 @@ typedef struct {
 
 static const EdrConfig *s_cfg;
 static EdrEventBus *s_bus;
-static _Atomic uint64_t s_dropped_webshell;
 static int s_started;
 static int s_ifd = -1;
 static int s_pipe[2] = {-1, -1};
@@ -537,10 +534,7 @@ static int push_alert_event(const char *path, const char *action, const WebRoot 
   }
   slot.size = (uint32_t)n;
   if (!edr_event_bus_try_push(s_bus, &slot)) {
-    uint64_t dn = atomic_fetch_add_explicit(&s_dropped_webshell, 1u, memory_order_relaxed) + 1u;
-    if (dn == 1u || dn % 100u == 0u) {
-      EDR_LOGE("[webshell_detector] event bus full, dropped %llu events\n", (unsigned long long)dn);
-    }
+    fprintf(stderr, "[webshell_detector] event bus full, drop alert: %s\n", path);
   }
   return 0;
 }

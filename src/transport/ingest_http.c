@@ -215,65 +215,40 @@ static size_t ingest_curl_discard_cb(char *p, size_t s, size_t n, void *u) {
   return s * n;
 }
 
-static CURL *s_curl_handle = NULL;
-#ifdef _WIN32
-static CRITICAL_SECTION s_curl_mu;
-#define CURL_LOCK()   EnterCriticalSection(&s_curl_mu)
-#define CURL_UNLOCK() LeaveCriticalSection(&s_curl_mu)
-#else
-static pthread_mutex_t s_curl_mu = PTHREAD_MUTEX_INITIALIZER;
-#define CURL_LOCK()   pthread_mutex_lock(&s_curl_mu)
-#define CURL_UNLOCK() pthread_mutex_unlock(&s_curl_mu)
-#endif
-
 static int curl_ensure_init(void) {
-  static int done = 0;
+  static int done;
   if (!done) {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
       return -1;
     }
     done = 1;
-#ifdef _WIN32
-    InitializeCriticalSection(&s_curl_mu);
-#endif
   }
   return 0;
 }
 
 static CURL *curl_conn_acquire(void) {
+#ifdef EDR_HAVE_LIBCURL
   if (curl_ensure_init() != 0) return NULL;
-  CURL_LOCK();
-  if (!s_curl_handle) {
-    s_curl_handle = curl_easy_init();
-    if (!s_curl_handle) {
-      CURL_UNLOCK();
-      return NULL;
-    }
-  } else {
-    curl_easy_reset(s_curl_handle);
+  CURL *curl = curl_easy_init();
+  if (curl) {
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 10L);
+    curl_easy_setopt(curl, CURLOPT_MAXAGE_CONN, 300L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
   }
-  curl_easy_setopt(s_curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
-  curl_easy_setopt(s_curl_handle, CURLOPT_TCP_KEEPIDLE, 30L);
-  curl_easy_setopt(s_curl_handle, CURLOPT_TCP_KEEPINTVL, 10L);
-  curl_easy_setopt(s_curl_handle, CURLOPT_MAXAGE_CONN, 300L);
-  curl_easy_setopt(s_curl_handle, CURLOPT_USERAGENT, "edr-agent/ingest");
-  return s_curl_handle;
+  return curl;
+#endif
+  return NULL;
 }
 
 static void curl_conn_release(CURL *curl) {
-  (void)curl;
-  CURL_UNLOCK();
-}
-
-static void curl_conn_shutdown(void) {
-  CURL_LOCK();
-  if (s_curl_handle) {
-    curl_easy_cleanup(s_curl_handle);
-    s_curl_handle = NULL;
+#ifdef EDR_HAVE_LIBCURL
+  if (curl) {
+    curl_easy_cleanup(curl);
   }
-  CURL_UNLOCK();
-#ifdef _WIN32
-  DeleteCriticalSection(&s_curl_mu);
+#else
+  (void)curl;
 #endif
 }
 #endif
@@ -350,9 +325,9 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     char tbuf[160];
-    snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant);
+    snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
     hdrs = curl_slist_append(hdrs, tbuf);
-    snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user);
+    snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
     hdrs = curl_slist_append(hdrs, tbuf);
     hdrs = curl_slist_append(hdrs, "X-Permission-Set: telemetry:write");
     if (s_bearer[0]) {
@@ -440,10 +415,10 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   fprintf(cf, "url = \"%s/%s\"\n", s_rest, relpath);
   fprintf(cf, "header = \"Content-Type: application/json\"\n");
   fputs("header = \"X-Tenant-ID: ", cf);
-  fprint_curl_cfg_dquoted_body(cf, s_tenant);
+  fprint_curl_cfg_dquoted_body(cf, s_tenant[0] ? s_tenant : "demo-tenant");
   fputs("\"\n", cf);
   fputs("header = \"X-User-ID: ", cf);
-  fprint_curl_cfg_dquoted_body(cf, s_user);
+  fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
   fputs("\"\n", cf);
   fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
   fprintf(cf, "data = @%s\n", jsonpath);
@@ -1041,9 +1016,9 @@ static int ingest_get_json_relpath_curl(const char *relpath, char **out_body, in
   {
     char tbuf[200];
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant);
+    snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
     hdrs = curl_slist_append(hdrs, tbuf);
-    snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user);
+    snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
     hdrs = curl_slist_append(hdrs, tbuf);
     hdrs = curl_slist_append(hdrs, "X-Permission-Set: telemetry:write");
     if (s_bearer[0] && (size_t)snprintf(tbuf, sizeof(tbuf), "Authorization: Bearer %s", s_bearer) < sizeof(tbuf)) {
@@ -1134,10 +1109,10 @@ static int ingest_get_json_relpath_shell(const char *relpath, char **out_body, i
     }
     fprintf(cf, "url = \"%s\"\n", url);
     fprintf(cf, "header = \"X-Tenant-ID: ");
-    fprint_curl_cfg_dquoted_body(cf, s_tenant);
+    fprint_curl_cfg_dquoted_body(cf, s_tenant[0] ? s_tenant : "demo-tenant");
     fputs("\"\n", cf);
     fprintf(cf, "header = \"X-User-ID: ");
-    fprint_curl_cfg_dquoted_body(cf, s_user);
+    fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
     fputs("\"\n", cf);
     fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
     fprintf(cf, "output = \"%s\"\n", resp_path);
@@ -1343,13 +1318,6 @@ void edr_ingest_http_stop_command_poll(void) {
   s_cmd_poll_thread_started = 0;
 }
 
-void edr_ingest_http_shutdown(void) {
-  edr_ingest_http_stop_command_poll();
-#ifdef EDR_HAVE_LIBCURL
-  curl_conn_shutdown();
-#endif
-}
-
 static int copy_minio_key_from_json(const char *json, char *out, size_t out_cap) {
   if (!out || out_cap < 2u) {
     return -1;
@@ -1433,9 +1401,9 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       struct curl_slist *hdrs = NULL;
       {
         char tbuf[200];
-        snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant);
+        snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
         hdrs = curl_slist_append(hdrs, tbuf);
-        snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user);
+        snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
         hdrs = curl_slist_append(hdrs, tbuf);
         hdrs = curl_slist_append(hdrs, "X-Permission-Set: telemetry:write");
         if (s_bearer[0] && (size_t)snprintf(tbuf, sizeof(tbuf), "Authorization: Bearer %s", s_bearer) < sizeof(tbuf)) {
@@ -1539,10 +1507,10 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
         fputs("\"\n", cfx);
       }
       fprintf(cfx, "header = \"X-Tenant-ID: ");
-      fprint_curl_cfg_dquoted_body(cfx, s_tenant);
+      fprint_curl_cfg_dquoted_body(cfx, s_tenant[0] ? s_tenant : "demo-tenant");
       fputs("\"\n", cfx);
       fprintf(cfx, "header = \"X-User-ID: ");
-      fprint_curl_cfg_dquoted_body(cfx, s_user);
+      fprint_curl_cfg_dquoted_body(cfx, s_user[0] ? s_user : "edr-agent");
       fputs("\"\n", cfx);
       fprintf(cfx, "header = \"X-Permission-Set: telemetry:write\"\n");
       fprintf(cfx, "output = \"%s\"\n", rpath);

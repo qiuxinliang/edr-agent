@@ -161,14 +161,8 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
                     "{\"type\":\"process\",\"pid\":%lu,\"name\":\"", (unsigned long)pe.th32ProcessID);
                 for (const char *p = name; *p; p++) {
-                    unsigned char c = (unsigned char)*p;
-                    if (c == '"') { buf[(*offset)++] = '\\'; buf[(*offset)++] = '"'; }
-                    else if (c == '\\') { buf[(*offset)++] = '\\'; buf[(*offset)++] = '\\'; }
-                    else if (c == '\n') { buf[(*offset)++] = '\\'; buf[(*offset)++] = 'n'; }
-                    else if (c == '\r') { buf[(*offset)++] = '\\'; buf[(*offset)++] = 'r'; }
-                    else if (c == '\t') { buf[(*offset)++] = '\\'; buf[(*offset)++] = 't'; }
-                    else if (c < 0x20) { (*offset) += snprintf(buf + (*offset), (size_t)(cap - (*offset)), "\\u%04x", (unsigned)c); }
-                    else { buf[(*offset)++] = (char)c; }
+                    if (*p == '"' || *p == '\\') buf[(*offset)++] = '\\';
+                    buf[(*offset)++] = *p;
                 }
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"ppid\":%lu}",
                     (unsigned long)pe.th32ParentProcessID);
@@ -210,7 +204,7 @@ static int execute_rtq_local(char *result_buf, int cap) {
 void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                                size_t len, const EdrSoarCommandMeta *sm) {
     if (!edr_command_dangerous_enabled()) {
-        edr_cmd_inc_rejected();
+        g_cmd_rejected++;
         edr_command_audit_both(cmd_id, "reject rtq_execute: policy disabled");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
         return;
@@ -218,7 +212,7 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
 
     rtq_filter filter;
     if (parse_rtq_filter(pl, len, &filter) != 0) {
-        edr_cmd_inc_exec_fail();
+        g_cmd_exec_fail++;
         edr_command_audit_both(cmd_id, "rtq_execute: no filter conditions");
         edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "no filter conditions");
         return;
@@ -226,7 +220,7 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
 
     char *result = (char *)malloc(RTQ_MAX_RESULT_STR);
     if (!result) {
-        edr_cmd_inc_exec_fail();
+        g_cmd_exec_fail++;
         edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "oom");
         return;
     }
@@ -271,14 +265,8 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
                         "{\"type\":\"process\",\"pid\":%d,\"name\":\"", loc_pid);
                     for (const char *q = loc_comm; *q; q++) {
-                        unsigned char c = (unsigned char)*q;
-                        if (c == '"') { result[offset++] = '\\'; result[offset++] = '"'; }
-                        else if (c == '\\') { result[offset++] = '\\'; result[offset++] = '\\'; }
-                        else if (c == '\n') { result[offset++] = '\\'; result[offset++] = 'n'; }
-                        else if (c == '\r') { result[offset++] = '\\'; result[offset++] = 'r'; }
-                        else if (c == '\t') { result[offset++] = '\\'; result[offset++] = 't'; }
-                        else if (c < 0x20) { offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\\u%04x", (unsigned)c); }
-                        else { result[offset++] = (char)c; }
+                        if (*q == '"' || *q == '\\') result[offset++] = '\\';
+                        result[offset++] = *q;
                     }
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
                         "\",\"user\":\"%s\"}", loc_user);
@@ -299,13 +287,9 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
                         "{\"type\":\"network\",\"line\":\"");
                     for (const char *q = line; *q; q++) {
-                        unsigned char c = (unsigned char)*q;
-                        if (c == '\n' || c == '\r') break;
-                        if (c == '"') { result[offset++] = '\\'; result[offset++] = '"'; }
-                        else if (c == '\\') { result[offset++] = '\\'; result[offset++] = '\\'; }
-                        else if (c == '\t') { result[offset++] = '\\'; result[offset++] = 't'; }
-                        else if (c < 0x20) { offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\\u%04x", (unsigned)c); }
-                        else { result[offset++] = (char)c; }
+                        if (*q == '\n' || *q == '\r') break;
+                        if (*q == '"' || *q == '\\') result[offset++] = '\\';
+                        result[offset++] = *q;
                     }
                     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\"}");
                     total++;
@@ -320,7 +304,7 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
         "\n],\"total\":%d,\"error\":null}", total);
 
-    edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
+    g_cmd_handled++; g_cmd_exec_ok++;
     edr_command_audit_both(cmd_id, "rtq_execute: ok");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
     free(result);

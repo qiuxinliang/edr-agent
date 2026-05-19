@@ -31,24 +31,10 @@ int edr_command_parse_server_address_json(const uint8_t *p, size_t len, char *ou
 
 int edr_command_streq(const char *a, const char *b);
 
-typedef struct {
-    unsigned long handled;
-    unsigned long rejected;
-    unsigned long exec_ok;
-    unsigned long exec_fail;
-} EdrCommandMetrics;
-
-extern EdrCommandMetrics g_cmd_metrics;
-
-static inline void edr_cmd_inc_handled(void)  { g_cmd_metrics.handled++; }
-static inline void edr_cmd_inc_rejected(void)  { g_cmd_metrics.rejected++; }
-static inline void edr_cmd_inc_exec_ok(void)   { g_cmd_metrics.exec_ok++; }
-static inline void edr_cmd_inc_exec_fail(void) { g_cmd_metrics.exec_fail++; }
-
-static inline unsigned long edr_cmd_count_handled(void)  { return g_cmd_metrics.handled; }
-static inline unsigned long edr_cmd_count_rejected(void) { return g_cmd_metrics.rejected; }
-static inline unsigned long edr_cmd_count_exec_ok(void)  { return g_cmd_metrics.exec_ok; }
-static inline unsigned long edr_cmd_count_exec_fail(void) { return g_cmd_metrics.exec_fail; }
+extern unsigned long g_cmd_handled;
+extern unsigned long g_cmd_rejected;
+extern unsigned long g_cmd_exec_ok;
+extern unsigned long g_cmd_exec_fail;
 
 #ifdef __cplusplus
 }

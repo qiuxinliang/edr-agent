@@ -16,20 +16,10 @@ typedef struct EdrEventBus EdrEventBus;
 EdrEventBus *edr_event_bus_create(uint32_t slot_count);
 void edr_event_bus_destroy(EdrEventBus *bus);
 
-typedef void (*EdrEventBusDropFn)(const EdrEventSlot *slot, const char *source);
-
-void edr_event_bus_set_drop_callback(EdrEventBus *bus, EdrEventBusDropFn fn, const char *source);
-
 /**
  * 非阻塞推送。满则返回 false，调用方应累计 dropped（§2.3 背压）。
  */
 bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot);
-
-/**
- * 关键事件推送：环表满时驱逐最旧未消费事件腾出空间，确保关键事件不丢失。
- * 驱逐的事件会计入 dropped 计数器并触发 drop 回调。
- */
-bool edr_event_bus_try_push_critical(EdrEventBus *bus, const EdrEventSlot *slot);
 
 /**
  * 弹出一条待处理事件；无事件返回 false。

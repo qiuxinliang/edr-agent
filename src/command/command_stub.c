@@ -22,11 +22,11 @@
 
 static unsigned long s_unknown;
 
-unsigned long edr_command_handled_count(void)  { return edr_cmd_count_handled(); }
-unsigned long edr_command_unknown_count(void)  { return s_unknown; }
-unsigned long edr_command_rejected_count(void)  { return edr_cmd_count_rejected(); }
-unsigned long edr_command_exec_ok_count(void)   { return edr_cmd_count_exec_ok(); }
-unsigned long edr_command_exec_fail_count(void) { return edr_cmd_count_exec_fail(); }
+unsigned long edr_command_handled_count(void) { return g_cmd_handled; }
+unsigned long edr_command_unknown_count(void) { return s_unknown; }
+unsigned long edr_command_rejected_count(void) { return g_cmd_rejected; }
+unsigned long edr_command_exec_ok_count(void) { return g_cmd_exec_ok; }
+unsigned long edr_command_exec_fail_count(void) { return g_cmd_exec_fail; }
 
 static void do_ave_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   int mf = 0, nf = 0, rd = 0;

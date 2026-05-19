@@ -1,13 +1,8 @@
 #include "edr/process_tree_cache.h"
-#include "edr/mmap_storage.h"
 
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-
-#ifdef _MSC_VER
-#define strcasecmp _stricmp
-#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -18,33 +13,15 @@
 #endif
 
 #define PT_HT_CAPACITY 4096u
-#define PT_HISTORY_CAPACITY 8192u
-#define PT_INFER_WINDOW_NS 60000000000ULL
-#define PT_LOAD_FACTOR_THRESHOLD 0.75f
-
-typedef struct PTNode {
-  ProcessTreeEntry entry;
-  bool occupied;
-  struct PTNode *prev;
-  struct PTNode *next;
-} PTNode;
-
-static PTNode g_pt_table[PT_HT_CAPACITY];
-static ProcessTreeEntry g_pt_history[PT_HISTORY_CAPACITY];
-static size_t g_pt_history_count;
-static uint32_t g_pt_generation;
-static bool g_pt_initialized;
-static uint32_t g_pt_history_ttl_s;
-static PTNode *g_pt_lru_head;
-static PTNode *g_pt_lru_tail;
-static size_t g_pt_occupied_count;
 
 typedef struct {
-  uint32_t pid;
-  uint64_t create_time;
-  uint64_t terminate_time;
-  char name[EDR_PTC_STR_SHORT];
-} HistoryEntry;
+  ProcessTreeEntry entry;
+  bool occupied;
+} PTHashSlot;
+
+static PTHashSlot g_pt_table[PT_HT_CAPACITY];
+static uint64_t g_pt_oldest_ns;
+static bool g_pt_initialized;
 
 #ifdef _WIN32
 static const char *g_key_proc_names[] = {
@@ -60,94 +37,36 @@ static size_t pt_hash(uint32_t pid) {
   return ((size_t)pid * 2654435761u) % PT_HT_CAPACITY;
 }
 
-static void pt_lru_remove(PTNode *node) {
-  if (!node) return;
-  
-  if (node->prev) {
-    node->prev->next = node->next;
-  } else {
-    g_pt_lru_head = node->next;
+static void pt_evict_lru(void) {
+  uint64_t oldest = UINT64_MAX;
+  size_t oldest_i = 0;
+  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+    if (g_pt_table[i].occupied && g_pt_table[i].entry.last_seen_ns < oldest) {
+      oldest = g_pt_table[i].entry.last_seen_ns;
+      oldest_i = i;
+    }
   }
-  
-  if (node->next) {
-    node->next->prev = node->prev;
-  } else {
-    g_pt_lru_tail = node->prev;
+  if (oldest != UINT64_MAX) {
+    g_pt_table[oldest_i].occupied = false;
+    g_pt_oldest_ns = 0;
+    for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+      if (g_pt_table[i].occupied && g_pt_table[i].entry.last_seen_ns > g_pt_oldest_ns) {
+        g_pt_oldest_ns = g_pt_table[i].entry.last_seen_ns;
+      }
+    }
   }
-  
-  node->prev = NULL;
-  node->next = NULL;
-}
-
-static void pt_lru_add(PTNode *node) {
-  if (!node) return;
-  
-  node->prev = NULL;
-  node->next = g_pt_lru_head;
-  
-  if (g_pt_lru_head) {
-    g_pt_lru_head->prev = node;
-  } else {
-    g_pt_lru_tail = node;
-  }
-  
-  g_pt_lru_head = node;
-}
-
-static void pt_lru_touch(PTNode *node) {
-  if (!node) return;
-  pt_lru_remove(node);
-  pt_lru_add(node);
-}
-
-static PTNode *pt_lru_evict(void) {
-  PTNode *victim = g_pt_lru_tail;
-  if (victim) {
-    pt_lru_remove(victim);
-    victim->occupied = false;
-    g_pt_occupied_count--;
-  }
-  return victim;
-}
-
-static const char *g_mmap_storage_path = NULL;
-
-void edr_pt_cache_init_with_path(const char *storage_path) {
-  g_mmap_storage_path = storage_path;
-  edr_pt_cache_init();
 }
 
 void edr_pt_cache_init(void) {
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
-  (void)memset(g_pt_history, 0, sizeof(g_pt_history));
-  g_pt_history_count = 0;
-  g_pt_generation = 1;
+  g_pt_oldest_ns = 0;
   g_pt_initialized = true;
-  g_pt_history_ttl_s = 3600;
-  g_pt_lru_head = NULL;
-  g_pt_lru_tail = NULL;
-  g_pt_occupied_count = 0;
-  
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    g_pt_table[i].prev = NULL;
-    g_pt_table[i].next = NULL;
-  }
-  
-  if (g_mmap_storage_path) {
-    edr_mmap_storage_init(g_mmap_storage_path);
-  }
 }
 
 void edr_pt_cache_shutdown(void) {
-  edr_mmap_storage_cleanup();
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
-  (void)memset(g_pt_history, 0, sizeof(g_pt_history));
-  g_pt_history_count = 0;
-  g_pt_generation = 1;
+  g_pt_oldest_ns = 0;
   g_pt_initialized = false;
-  g_pt_lru_head = NULL;
-  g_pt_lru_tail = NULL;
-  g_pt_occupied_count = 0;
 }
 
 int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
@@ -160,16 +79,11 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
   for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
     size_t probe = (idx + i) % PT_HT_CAPACITY;
     if (!g_pt_table[probe].occupied || g_pt_table[probe].entry.pid == pid) {
-      bool was_occupied = g_pt_table[probe].occupied;
-      
       ProcessTreeEntry *e = &g_pt_table[probe].entry;
       e->pid = pid;
       e->ppid = ppid;
       e->start_time_ns = start_time_ns;
       e->last_seen_ns = start_time_ns;
-      e->terminate_time_ns = 0;
-      e->generation = g_pt_generation;
-      e->terminated = 0;
       if (process_name) {
         strncpy(e->process_name, process_name, EDR_PTC_STR_SHORT - 1);
         e->process_name[EDR_PTC_STR_SHORT - 1] = '\0';
@@ -194,44 +108,14 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
       } else {
         e->parent_name[0] = '\0';
       }
-      
-      if (!was_occupied) {
-        g_pt_table[probe].occupied = true;
-        g_pt_occupied_count++;
-        pt_lru_add(&g_pt_table[probe]);
-      } else {
-        pt_lru_touch(&g_pt_table[probe]);
+      g_pt_table[probe].occupied = true;
+      if (start_time_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
+        g_pt_oldest_ns = start_time_ns;
       }
-      
-      MMapProcessEntry mmap_entry = {0};
-      mmap_entry.pid = pid;
-      mmap_entry.ppid = ppid;
-      mmap_entry.create_time = start_time_ns;
-      mmap_entry.exit_time = 0;
-      mmap_entry.generation = g_pt_generation;
-      if (process_name) {
-        strncpy(mmap_entry.name, process_name, sizeof(mmap_entry.name) - 1);
-      }
-      if (cmdline) {
-        strncpy(mmap_entry.cmdline, cmdline, sizeof(mmap_entry.cmdline) - 1);
-      }
-      if (exe_path) {
-        strncpy(mmap_entry.exe_path, exe_path, sizeof(mmap_entry.exe_path) - 1);
-      }
-      if (parent_name) {
-        strncpy(mmap_entry.parent_name, parent_name, sizeof(mmap_entry.parent_name) - 1);
-      }
-      mmap_entry.exited = 0;
-      edr_mmap_storage_add(&mmap_entry);
-      
       return 0;
     }
   }
-  
-  if (g_pt_occupied_count >= (size_t)(PT_HT_CAPACITY * PT_LOAD_FACTOR_THRESHOLD)) {
-    pt_lru_evict();
-  }
-  
+  pt_evict_lru();
   return edr_pt_cache_put(pid, ppid, process_name, cmdline,
                           exe_path, parent_name, start_time_ns);
 }
@@ -242,12 +126,23 @@ const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid) {
   for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
     size_t probe = (idx + i) % PT_HT_CAPACITY;
     if (!g_pt_table[probe].occupied) return NULL;
-    if (g_pt_table[probe].entry.pid == pid) {
-      pt_lru_touch(&g_pt_table[probe]);
-      return &g_pt_table[probe].entry;
-    }
+    if (g_pt_table[probe].entry.pid == pid) return &g_pt_table[probe].entry;
   }
   return NULL;
+}
+
+int edr_pt_cache_remove(uint32_t pid) {
+  if (!g_pt_initialized) return -1;
+  size_t idx = pt_hash(pid);
+  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+    size_t probe = (idx + i) % PT_HT_CAPACITY;
+    if (!g_pt_table[probe].occupied) return -1;
+    if (g_pt_table[probe].entry.pid == pid) {
+      g_pt_table[probe].occupied = false;
+      return 0;
+    }
+  }
+  return -1;
 }
 
 uint32_t edr_pt_cache_chain_depth(uint32_t pid) {
@@ -334,8 +229,8 @@ static void edr_pt_cache_refresh_key_procs(void) {
     for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
       if (g_key_procs[k].valid) continue;
 #ifdef _MSC_VER
-      int match = (strcasecmp(name, g_key_proc_names[k]) == 0 ||
-                   (exe_name[0] && strcasecmp(exe_name, g_key_proc_names[k]) == 0));
+      int match = (_stricmp(name, g_key_proc_names[k]) == 0 ||
+                   (exe_name[0] && _stricmp(exe_name, g_key_proc_names[k]) == 0));
 #else
       int match = (strcasecmp(name, g_key_proc_names[k]) == 0);
 #endif
@@ -419,270 +314,6 @@ int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
     if (!g_key_procs[k].valid) continue;
     if (strcmp(g_key_procs[k].name, name) == 0) {
       *out_pid = g_key_procs[k].pid;
-      return 0;
-    }
-  }
-  return -1;
-}
-
-static void pt_add_to_history(const ProcessTreeEntry *entry) {
-  if (!entry) return;
-  if (g_pt_history_count >= PT_HISTORY_CAPACITY) {
-    memmove(g_pt_history, g_pt_history + 1, 
-            (PT_HISTORY_CAPACITY - 1) * sizeof(ProcessTreeEntry));
-    g_pt_history_count--;
-  }
-  memcpy(&g_pt_history[g_pt_history_count], entry, sizeof(ProcessTreeEntry));
-  g_pt_history_count++;
-}
-
-int edr_pt_cache_mark_terminated(uint32_t pid, uint64_t terminate_time_ns) {
-  if (!g_pt_initialized) return -1;
-  size_t idx = pt_hash(pid);
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    size_t probe = (idx + i) % PT_HT_CAPACITY;
-    if (!g_pt_table[probe].occupied) return -1;
-    if (g_pt_table[probe].entry.pid == pid) {
-      ProcessTreeEntry *e = &g_pt_table[probe].entry;
-      if (!e->terminated) {
-        e->terminated = 1;
-        e->terminate_time_ns = terminate_time_ns;
-        pt_add_to_history(e);
-        
-        MMapProcessEntry mmap_entry = {0};
-        if (edr_mmap_storage_get(pid, terminate_time_ns, &mmap_entry) == 0) {
-          mmap_entry.exit_time = terminate_time_ns;
-          mmap_entry.exited = 1;
-          edr_mmap_storage_add(&mmap_entry);
-        }
-      }
-      return 0;
-    }
-  }
-  return -1;
-}
-
-int edr_pt_cache_get_historical(uint32_t pid, uint64_t timestamp, ProcessTreeEntry *out) {
-  if (!g_pt_initialized || !out) return -1;
-  
-  for (size_t i = 0; i < g_pt_history_count; i++) {
-    const ProcessTreeEntry *e = &g_pt_history[i];
-    if (e->pid == pid && e->terminated) {
-      uint64_t entry_time = e->terminate_time_ns ? e->terminate_time_ns : e->start_time_ns;
-      uint64_t diff = timestamp > entry_time ? timestamp - entry_time : entry_time - timestamp;
-      if (diff < PT_INFER_WINDOW_NS) {
-        memcpy(out, e, sizeof(ProcessTreeEntry));
-        return 0;
-      }
-    }
-  }
-  
-  MMapProcessEntry mmap_entry = {0};
-  if (edr_mmap_storage_get(pid, timestamp, &mmap_entry) == 0) {
-    memset(out, 0, sizeof(ProcessTreeEntry));
-    out->pid = mmap_entry.pid;
-    out->ppid = mmap_entry.ppid;
-    out->start_time_ns = mmap_entry.create_time;
-    out->last_seen_ns = mmap_entry.create_time;
-    out->terminate_time_ns = mmap_entry.exit_time;
-    out->generation = mmap_entry.generation;
-    out->terminated = mmap_entry.exited;
-    strncpy(out->process_name, mmap_entry.name, EDR_PTC_STR_SHORT - 1);
-    strncpy(out->cmdline, mmap_entry.cmdline, EDR_PTC_STR_LONG - 1);
-    strncpy(out->exe_path, mmap_entry.exe_path, EDR_PTC_STR_PATH - 1);
-    strncpy(out->parent_name, mmap_entry.parent_name, EDR_PTC_STR_SHORT - 1);
-    return 0;
-  }
-  
-  return -1;
-}
-
-static const char *g_common_parent_processes[] = {
-  "explorer.exe",
-  "services.exe",
-  "winlogon.exe",
-  "smss.exe",
-  "csrss.exe",
-  "svchost.exe",
-  "conhost.exe",
-  NULL
-};
-
-static uint32_t g_explorer_pid = 0;
-static uint64_t g_explorer_start_time = 0;
-
-void edr_pt_cache_update_explorer_info(uint32_t pid, uint64_t start_time) {
-  g_explorer_pid = pid;
-  g_explorer_start_time = start_time;
-}
-
-int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
-                              uint32_t *out_ppid, char *out_parent_name, size_t name_len) {
-  if (!g_pt_initialized || !out_ppid) return -1;
-  
-  const ProcessTreeEntry *entry = edr_pt_cache_get(pid);
-  if (entry && entry->ppid > 0) {
-    *out_ppid = entry->ppid;
-    if (out_parent_name && name_len > 0) {
-      strncpy(out_parent_name, entry->parent_name, name_len - 1);
-      out_parent_name[name_len - 1] = '\0';
-    }
-    return 0;
-  }
-  
-  if (g_explorer_pid > 0 && g_explorer_start_time > 0) {
-    uint64_t diff = event_time_ns > g_explorer_start_time ? 
-                    event_time_ns - g_explorer_start_time : g_explorer_start_time - event_time_ns;
-    
-    if (diff < PT_INFER_WINDOW_NS * 10) {
-      *out_ppid = g_explorer_pid;
-      if (out_parent_name && name_len > 0) {
-        strncpy(out_parent_name, "explorer.exe", name_len - 1);
-        out_parent_name[name_len - 1] = '\0';
-      }
-      return 0;
-    }
-  }
-  
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    if (!g_pt_table[i].occupied) continue;
-    const ProcessTreeEntry *e = &g_pt_table[i].entry;
-    if (e->pid == pid || e->terminated) continue;
-    
-    for (int j = 0; g_common_parent_processes[j]; j++) {
-      if (strcasecmp(e->process_name, g_common_parent_processes[j]) == 0) {
-        *out_ppid = e->pid;
-        if (out_parent_name && name_len > 0) {
-          strncpy(out_parent_name, e->process_name, name_len - 1);
-          out_parent_name[name_len - 1] = '\0';
-        }
-        return 0;
-      }
-    }
-  }
-  
-  int best_match = -1;
-  uint64_t best_time_diff = UINT64_MAX;
-  
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    if (!g_pt_table[i].occupied) continue;
-    const ProcessTreeEntry *e = &g_pt_table[i].entry;
-    if (e->pid == pid || e->terminated) continue;
-    
-    uint64_t diff = event_time_ns > e->start_time_ns ? 
-                    event_time_ns - e->start_time_ns : e->start_time_ns - event_time_ns;
-    
-    if (diff < PT_INFER_WINDOW_NS * 4 && diff < best_time_diff) {
-      best_time_diff = diff;
-      best_match = (int)i;
-    }
-  }
-  
-  if (best_match >= 0) {
-    const ProcessTreeEntry *e = &g_pt_table[(size_t)best_match].entry;
-    *out_ppid = e->pid;
-    if (out_parent_name && name_len > 0) {
-      strncpy(out_parent_name, e->process_name, name_len - 1);
-      out_parent_name[name_len - 1] = '\0';
-    }
-    return 0;
-  }
-  
-  for (size_t i = 0; i < g_pt_history_count; i++) {
-    const ProcessTreeEntry *e = &g_pt_history[i];
-    if (e->pid == pid) continue;
-    
-    for (int j = 0; g_common_parent_processes[j]; j++) {
-      if (strcasecmp(e->process_name, g_common_parent_processes[j]) == 0) {
-        uint64_t end_time = e->terminate_time_ns ? e->terminate_time_ns : e->start_time_ns;
-        if (event_time_ns >= e->start_time_ns && event_time_ns <= end_time + PT_INFER_WINDOW_NS) {
-          *out_ppid = e->pid;
-          if (out_parent_name && name_len > 0) {
-            strncpy(out_parent_name, e->process_name, name_len - 1);
-            out_parent_name[name_len - 1] = '\0';
-          }
-          return 0;
-        }
-      }
-    }
-  }
-  
-  for (size_t i = 0; i < g_pt_history_count; i++) {
-    const ProcessTreeEntry *e = &g_pt_history[i];
-    if (e->pid == pid) continue;
-    
-    uint64_t end_time = e->terminate_time_ns ? e->terminate_time_ns : e->start_time_ns;
-    if (event_time_ns >= e->start_time_ns && event_time_ns <= end_time + PT_INFER_WINDOW_NS * 4) {
-      uint64_t diff = event_time_ns > e->start_time_ns ? 
-                      event_time_ns - e->start_time_ns : e->start_time_ns - event_time_ns;
-      if (diff < best_time_diff) {
-        best_time_diff = diff;
-        *out_ppid = e->pid;
-        if (out_parent_name && name_len > 0) {
-          strncpy(out_parent_name, e->process_name, name_len - 1);
-          out_parent_name[name_len - 1] = '\0';
-        }
-        return 0;
-      }
-    }
-  }
-  
-  return -1;
-}
-
-uint32_t edr_pt_cache_get_generation(void) {
-  return g_pt_generation;
-}
-
-void edr_pt_cache_increment_generation(void) {
-  g_pt_generation++;
-}
-
-void edr_pt_cache_set_history_ttl(uint32_t ttl_seconds) {
-  g_pt_history_ttl_s = ttl_seconds;
-}
-
-void edr_pt_cache_cleanup_history(void) {
-  if (!g_pt_initialized || g_pt_history_count == 0) return;
-  
-  uint64_t now = 0;
-#ifdef _WIN32
-  FILETIME ft;
-  GetSystemTimeAsFileTime(&ft);
-  now = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-#endif
-  
-  uint64_t ttl_ns = (uint64_t)g_pt_history_ttl_s * 1000000000ULL;
-  size_t write_idx = 0;
-  
-  for (size_t i = 0; i < g_pt_history_count; i++) {
-    const ProcessTreeEntry *e = &g_pt_history[i];
-    uint64_t entry_end = e->terminate_time_ns ? e->terminate_time_ns : e->last_seen_ns;
-    if (now - entry_end < ttl_ns) {
-      if (write_idx != i) {
-        memcpy(&g_pt_history[write_idx], e, sizeof(ProcessTreeEntry));
-      }
-      write_idx++;
-    }
-  }
-  g_pt_history_count = write_idx;
-}
-
-int edr_pt_cache_remove(uint32_t pid) {
-  if (!g_pt_initialized) return -1;
-  size_t idx = pt_hash(pid);
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    size_t probe = (idx + i) % PT_HT_CAPACITY;
-    if (!g_pt_table[probe].occupied) return -1;
-    if (g_pt_table[probe].entry.pid == pid) {
-      ProcessTreeEntry *e = &g_pt_table[probe].entry;
-      if (!e->terminated) {
-        e->terminated = 1;
-        pt_add_to_history(e);
-      }
-      pt_lru_remove(&g_pt_table[probe]);
-      g_pt_table[probe].occupied = false;
-      g_pt_occupied_count--;
       return 0;
     }
   }

@@ -107,18 +107,6 @@ static int update_curl_init(void) {
   return 0;
 }
 
-static CURL *s_update_curl = NULL;
-
-static CURL *update_curl_acquire(void) {
-  if (update_curl_init() != 0) return NULL;
-  if (!s_update_curl) {
-    s_update_curl = curl_easy_init();
-  } else {
-    curl_easy_reset(s_update_curl);
-  }
-  return s_update_curl;
-}
-
 typedef struct {
   char *data;
   size_t len;
@@ -144,7 +132,8 @@ static size_t update_write_cb(void *ptr, size_t sz, size_t nmemb, void *userdata
 }
 
 static char *update_http_get(const char *url, size_t *out_len) {
-  CURL *curl = update_curl_acquire();
+  if (update_curl_init() != 0) return NULL;
+  CURL *curl = curl_easy_init();
   if (!curl) return NULL;
 
   update_buf b = {NULL, 0, 0};
@@ -156,6 +145,7 @@ static char *update_http_get(const char *url, size_t *out_len) {
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
 
   CURLcode cc = curl_easy_perform(curl);
+  curl_easy_cleanup(curl);
 
   if (cc != CURLE_OK || !b.data) {
     free(b.data);
@@ -166,11 +156,13 @@ static char *update_http_get(const char *url, size_t *out_len) {
 }
 
 static int update_download_file(const char *url, const char *out_path) {
-  CURL *curl = update_curl_acquire();
+  if (update_curl_init() != 0) return -1;
+  CURL *curl = curl_easy_init();
   if (!curl) return -1;
 
   FILE *f = fopen(out_path, "wb");
   if (!f) {
+    curl_easy_cleanup(curl);
     return -1;
   }
 
@@ -182,6 +174,7 @@ static int update_download_file(const char *url, const char *out_path) {
 
   CURLcode cc = curl_easy_perform(curl);
   fclose(f);
+  curl_easy_cleanup(curl);
 
   if (cc != CURLE_OK) {
     (void)remove(out_path);

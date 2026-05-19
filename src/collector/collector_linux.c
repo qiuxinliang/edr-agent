@@ -15,7 +15,6 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +34,6 @@
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
-#include "edr/edr_log.h"
 #include "edr/pmfe.h"
 #include "edr/types.h"
 
@@ -51,8 +49,6 @@ static watch_entry_t s_watches[MAX_WATCHES];
 static int s_nwatch;
 
 static EdrEventBus *s_bus;
-static _Atomic uint64_t s_dropped_collector;
-static int edr_is_watched_dir(const char *path);
 static int s_ifd = -1;
 static int s_pipe[2] = {-1, -1};
 static volatile int s_stop;

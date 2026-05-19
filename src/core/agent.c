@@ -8,15 +8,9 @@
 #include "edr/preprocess.h"
 #include "edr/process_tree_cache.h"
 #include "edr/resource.h"
-#include "edr/response.h"
-#include "edr/self_protect.h"
-#include "edr/shell_session.h"
 #include "edr/time_util.h"
 
 #if defined(EDR_WITH_FL_TRAINER)
-#include "edr/fl_trainer.h"
-#endif
-
 #include "edr/attack_surface_report.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/agent_update.h"
@@ -192,14 +186,14 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
       double pct = (double)pp0 * 100.0 / (double)ptot;
       fprintf(stderr,
               "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld wmi_ok=%lld env_ok=%lld infer_ok=%lld\n",
-              (long long)ptot, (long long)pp0, pct,
-              (long long)pntqi, (long long)psnap, (long long)pwmi, (long long)penv, (long long)pinfer);
+    int64_t pp0 = 0, ptot = 0, pntqi = 0, psnap = 0;
+    edr_behavior_get_ppid_stats(&pp0, &ptot, &psnap, &pntqi);
       if (pct > 5.0 && pp0 > 10) {
         fprintf(stderr, "[ppid] WARNING: PPID=0 ratio %.1f%% exceeds 5%% threshold — "
                 "possible high short-lived process churn or parent process eviction\n", pct);
-      }
+              "[ppid] events=%lld zero=%lld(%.1f%%) ntqi_ok=%lld snap_ok=%lld\n",
     }
-  }
+              (long long)pntqi, (long long)psnap);
 #endif
   fflush(stderr);
 }
@@ -218,11 +212,6 @@ void edr_agent_destroy(EdrAgent *agent) {
 #if defined(EDR_WITH_FL_TRAINER)
   FLT_Shutdown();
 #endif
-  AVE_Shutdown();
-  edr_event_bus_destroy(agent->event_bus);
-  edr_config_free_heap(&agent->cfg);
-  free(agent->config_path);
-  free(agent);
 }
 
 EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
@@ -346,41 +335,6 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static int edr_remote_curl_init(void) {
   static int done = 0;
   if (!done) {
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-      return -1;
-    }
-    done = 1;
-  }
-  return 0;
-}
-#endif
-
-static int edr_remote_tmp_path(char *out, size_t cap) {
-  if (!out || cap < 16u) {
-    return -1;
-  }
-#ifdef _WIN32
-  char td[MAX_PATH];
-  DWORD nn = GetTempPathA((DWORD)sizeof(td), td);
-  if (nn == 0 || nn >= sizeof(td)) {
-    snprintf(td, sizeof(td), ".\\");
-  }
-  UINT rc = GetTempFileNameA(td, "edr", 0, out);
-  if (rc == 0) {
-    return -1;
-  }
-  return 0;
-#else
-  snprintf(out, cap, "%s", "/tmp/edr_remote_XXXXXX.toml");
-  int fd = mkstemps(out, 5);
-  if (fd < 0) {
-    return -1;
-  }
-  close(fd);
-  return 0;
-#endif
-}
-#ifdef EDR_HAVE_LIBCURL
 static size_t edr_curl_capture_header(char *buffer, size_t size, size_t nitems, void *userdata) {
   size_t total = size * nitems;
   if (total < 18 || !userdata) return total;

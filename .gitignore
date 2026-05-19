@@ -13,15 +13,6 @@ requirements-dev.txt
 # 勿用 `/docs` 全目录 ignore：会阻止新的 Runbook（如 WP9）`git add`，且 CI 无法检出 → verify_ave_behavior_chain_invariants 失败。生成物可写具体路径，如 `/docs/.cache/` 等。
 /INSTALL-PLATFORM
 /.trae/skills
-
-# 本地运行时数据库
-*.db
-
-# Ninja 构建产物
-/out/
-
-# Python 虚拟环境
-/.venv_nanopb/
 /build_p0g
 /build_p0g
 /build_p0full

@@ -5,24 +5,7 @@
 #define EDR_COLLECTOR_H
 
 #include "edr/error.h"
-#include <stdbool.h>
 #include <stdint.h>
-
-typedef struct {
-    bool etw_enabled;
-    bool etw_tcpip_provider;
-    bool etw_firewall_provider;
-    bool etw_dns_client_provider;
-    bool etw_powershell_provider;
-    bool etw_security_audit_provider;
-    bool etw_wmi_provider;
-    bool etw_service_control_manager_provider;
-    bool ebpf_enabled;
-    int poll_interval_s;
-    uint32_t max_event_queue_size;
-    uint32_t etw_buffer_kb;
-    uint32_t etw_flush_timer_s;
-} EdrCollectionConfig;
 
 struct EdrEventBus;
 struct EdrConfig;

@@ -212,21 +212,6 @@ set(EDR_P0_RULES_BUNDLE_VERSION
     CACHE STRING
     "P0 dynamic rules bundle id (align with edr-agent/config/p0_rule_bundle_manifest.json and platform)")
 
-execute_process(
-  COMMAND git describe --tags --always --dirty
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  OUTPUT_VARIABLE EDR_AGENT_VERSION_STRING
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET
-  RESULT_VARIABLE _GIT_DESCRIBE_RESULT
-)
-if(NOT _GIT_DESCRIBE_RESULT EQUAL 0 OR EDR_AGENT_VERSION_STRING STREQUAL "")
-  set(EDR_AGENT_VERSION_STRING "0.3.0-dev")
-  message(STATUS "git describe failed, fallback agent version: ${EDR_AGENT_VERSION_STRING}")
-else()
-  message(STATUS "Agent version from git: ${EDR_AGENT_VERSION_STRING}")
-endif()
-
 set(EDR_YARA_AVAILABLE 0)
 if(EDR_WITH_YARA)
   find_path(YARA_INCLUDE_DIR NAMES yara.h
@@ -289,13 +274,9 @@ set(EDR_AGENT_SOURCES
   src/command/registry.c
   src/command/rtq_exec.c
   src/response/response_actions.c
-  src/response/response_utils.c
-  src/response/response_file.c
-  src/response/response_forensic.c
   src/forensic/process_tree_cache.c
   src/forensic/forensic_trigger.c
   src/forensic/deep_collector.c
-  src/storage/mmap_storage.c
   src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
@@ -648,7 +629,6 @@ target_compile_definitions(
   PRIVATE
     EDR_HAVE_NANOPB=1
     "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
-    "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
 )
 if(EDR_P0_IR_PCRE2)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
@@ -960,95 +940,6 @@ else()
   set(_EDR_P0_IR_JSON "")
 endif()
 add_test(NAME edr_p0_golden COMMAND edr_p0_golden_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-# dedup / rate-limit golden test：FNV1a 指纹、30s 窗口去重、秒级限流、reset 与 stats 对拍
-add_executable(
-  edr_dedup_golden_test
-  src/preprocess/dedup_golden_test.c
-  src/preprocess/dedup.c
-  src/preprocess/emit_rules.c
-)
-target_include_directories(
-  edr_dedup_golden_test
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess
-)
-if(NOT MSVC)
-  target_compile_options(
-    edr_dedup_golden_test
-    PRIVATE
-      -Wall
-      -Wextra
-      -Wno-unused-parameter
-  )
-endif()
-add_test(
-  NAME
-    edr_dedup_golden
-  COMMAND
-    edr_dedup_golden_test
-  WORKING_DIRECTORY
-    ${CMAKE_BINARY_DIR}
-)
-
-# P0 规则功能 + 性能测试（test/ 目录集成，与现有 golden 测试正交）
-set(
-  _EDR_P0_PERF_SRCS
-  test/p0_rule_perf_test.c
-  src/preprocess/p0_rule_match.c
-)
-if(EDR_P0_IR_PCRE2)
-  list(
-    APPEND
-    _EDR_P0_PERF_SRCS
-    src/preprocess/p0_rule_ir.c
-    src/preprocess/encrypt_p0_rules.c
-    src/preprocess/preprocess_env.c
-    third_party/cjson/cJSON.c
-  )
-  if(EDR_P0_IR_HAS_EMBED AND EDR_P0_IR_EMBED_C)
-    list(APPEND _EDR_P0_PERF_SRCS "${EDR_P0_IR_EMBED_C}")
-  endif()
-else()
-  list(APPEND _EDR_P0_PERF_SRCS src/preprocess/p0_rule_ir_stub.c)
-endif()
-add_executable(edr_p0_perf_test ${_EDR_P0_PERF_SRCS})
-target_include_directories(
-  edr_p0_perf_test
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess
-)
-if(EDR_P0_IR_PCRE2)
-  target_include_directories(
-    edr_p0_perf_test
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
-  )
-  target_compile_definitions(edr_p0_perf_test PRIVATE EDR_HAVE_PCRE2=1)
-  target_compile_definitions(
-    edr_p0_perf_test PRIVATE "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}"
-  )
-  target_link_libraries(edr_p0_perf_test PRIVATE ${EDR_PCRE2_TARGET})
-endif()
-if(NOT MSVC)
-  target_compile_options(
-    edr_p0_perf_test
-    PRIVATE
-      -Wall
-      -Wextra
-      -Wno-unused-parameter
-  )
-endif()
-add_test(
-  NAME
-    edr_p0_perf
-  COMMAND
-    edr_p0_perf_test
-  WORKING_DIRECTORY
-    ${CMAKE_BINARY_DIR}
-)
 
 # A4.1：MPMC 事件总线短时压测 + 对拍（主线程=唯一消费者）
 add_executable(
