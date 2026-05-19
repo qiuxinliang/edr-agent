@@ -61,3 +61,11 @@ void edr_p0_rule_ir_stats_dump(void) {
 
 void edr_p0_rule_ir_stats_init(void) {
 }
+
+void edr_p0_rule_ir_reload(void) {}
+
+int edr_p0_bundle_dst_path(char *out, size_t cap) {
+  (void)cap;
+  if (out) out[0] = '\0';
+  return -1;
+}
