@@ -113,17 +113,17 @@ static int is_rule_file_path(const char *path) {
   return (strcmp(dot, ".yar") == 0 || strcmp(dot, ".yara") == 0) ? 1 : 0;
 }
 
-static int compiler_error_cb(int err_level, const char *file_name, int line_number, const YR_RULE *rule,
+static void compiler_error_cb(int err_level, const char *file_name, int line_number, const YR_RULE *rule,
                              const char *message, void *user_data) {
   (void)err_level;
   (void)rule;
   (void)user_data;
   fprintf(stderr, "[shellcode_detector] yara compile error file=%s line=%d msg=%s\n",
           file_name ? file_name : "-", line_number, message ? message : "-");
-  return 0;
 }
 
-static int scan_cb(int message, void *message_data, void *user_data) {
+static int scan_cb(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
+  (void)context;
   YaraScanResult *res = (YaraScanResult *)user_data;
   if (!res) {
     return CALLBACK_CONTINUE;
