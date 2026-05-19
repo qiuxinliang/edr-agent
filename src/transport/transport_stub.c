@@ -395,9 +395,9 @@ void edr_transport_send_ingest_batch(int use_http, const char *batch_id,
 }
 
 unsigned long edr_transport_wire_events_count(void) { return g_ctx.wire_events; }
-unsigned long edr_transport_wire_bytes_count(void) { return g_ctx.wire_bytes; }
+size_t edr_transport_wire_bytes_count(void) { return g_ctx.wire_bytes; }
 unsigned long edr_transport_batch_count(void) { return g_ctx.batch_count; }
-unsigned long edr_transport_batch_bytes_count(void) { return g_ctx.batch_bytes; }
+size_t edr_transport_batch_bytes_count(void) { return g_ctx.batch_bytes; }
 unsigned long edr_transport_batch_lz4_count(void) { return g_ctx.batch_lz4; }
 
 void edr_transport_inject_dispatch(EdrTransportDispatchFn fn, void *userdata) {
