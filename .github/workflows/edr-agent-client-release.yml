@@ -105,7 +105,21 @@ jobs:
           $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $zip = Join-Path $dest "ort.zip"
-          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip" -OutFile $zip
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $progressPreference = 'SilentlyContinue'
+          $wc = New-Object System.Net.WebClient
+          $wc.Headers.Add('User-Agent', 'edr-agent-ci')
+          for ($i = 0; $i -lt 5; $i++) {
+            try {
+              $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip", $zip)
+              Write-Host "ORT download OK"
+              break
+            } catch {
+              Write-Host "ORT download attempt $($i+1)/5 failed: $_"
+              if ($i -ge 4) { throw "ORT download exhausted retries: $_" }
+              Start-Sleep -Seconds 15
+            }
+          }
           Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
           $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
@@ -149,7 +163,6 @@ jobs:
           if (-not (Test-Path "build\Release\edr_agent.exe")) { throw "missing build\Release\edr_agent.exe" }
           $items = New-Object System.Collections.Generic.List[string]
           $null = $items.Add("build\Release\edr_agent.exe")
-          if (Test-Path "build\Release\edr_monitor.exe") { $null = $items.Add("build\Release\edr_monitor.exe") }
           Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
 
