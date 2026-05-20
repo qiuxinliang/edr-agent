@@ -17,3 +17,8 @@ requirements-dev.txt
 /build_p0g
 /build_p0full
 *.md
+scripts/.DS_Store
+src/collector/.DS_Store
+scripts/.DS_Store
+scripts/.DS_Store
+src/preprocess/.DS_Store

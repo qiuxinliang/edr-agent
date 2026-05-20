@@ -83,6 +83,10 @@ jobs:
           & $tc install
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
+        shell: pwsh
+        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
+
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
         shell: pwsh
