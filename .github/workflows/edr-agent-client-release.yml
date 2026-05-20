@@ -114,24 +114,9 @@ jobs:
           & $tc install
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Regenerate ingest gRPC C++ (conditional)
+      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
         shell: pwsh
-        run: |
-          $protoFile = "proto/edr/v1/ingest.proto"
-          $genFile = "src/grpc_gen/edr/v1/ingest.pb.cc"
-          $needRegen = $true
-          if ((Test-Path $genFile) -and (Test-Path $protoFile)) {
-            $protoTime = (Get-Item $protoFile).LastWriteTimeUtc
-            $genTime  = (Get-Item $genFile).LastWriteTimeUtc
-            if ($genTime -gt $protoTime) {
-              $needRegen = $false
-              Write-Host "[skip] Proto stubs up-to-date (proto @ $protoTime, gen @ $genTime)"
-            }
-          }
-          if ($needRegen) {
-            Write-Host "[run] Proto changed or stubs missing — regenerating gRPC stubs ..."
-            ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
-          }
+        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
 
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
