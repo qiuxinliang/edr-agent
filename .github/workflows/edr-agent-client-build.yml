@@ -55,10 +55,15 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-            onnxrt-win
-          key: vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}
+          key: vcpkg-x64-win-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-x64-win-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v5
+        with:
+          path: onnxrt-win
+          key: onnxrt-x64-win-1.17.3-${{ runner.os }}
 
       - name: Cache CMake build directory (incremental)
         uses: actions/cache@v5
@@ -74,6 +79,14 @@ jobs:
           $start = Get-Date
           "BUILD_TIMING_START=$($start.ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Build started at $($start.ToString('HH:mm:ss'))"
+
+      - name: sccache pre-check
+        shell: bash
+        run: |
+          echo "=== sccache version ==="
+          sccache --version || echo "(not found)"
+          echo "=== sccache stats (pre-build) ==="
+          sccache --show-stats || echo "(stats not available)"
 
       - name: Clone and bootstrap vcpkg
         working-directory: ${{ github.workspace }}

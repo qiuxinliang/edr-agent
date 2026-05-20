@@ -447,25 +447,29 @@ if(EDR_GRPC_CLIENT_AVAILABLE)
     find_program(_edr_grpc_p grpc_cpp_plugin)
   endif()
   if(_edr_protoc AND _edr_grpc_p AND EXISTS "${_edr_protoc}" AND EXISTS "${_edr_grpc_p}")
-    # Regenerate stubs from proto as a build-step; outputs live in source tree so
-    # that pre-generated stubs in git are the fallback.
-    add_custom_command(
-      OUTPUT
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.pb.cc
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.pb.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.grpc.pb.cc
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.grpc.pb.h
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1"
-      COMMAND "${_edr_protoc}"
-        -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
-        "--cpp_out=${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen"
-        "--grpc_out=${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen"
-        "--plugin=protoc-gen-grpc=${_edr_grpc_p}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
-      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
-      COMMENT "Generating gRPC C++ stubs to match protobuf version"
-    )
-    message(STATUS "gRPC stub generation: protoc=${_edr_protoc}")
+    # Regenerate stubs at CONFIGURE time (so sources exist before add_executable).
+    # Skip if output already present and proto is older (use pre-generated git stubs).
+    set(_proto_file "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto")
+    set(_grpc_out   "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen")
+    if(NOT EXISTS "${_grpc_out}/edr/v1/ingest.pb.cc"
+       OR "${_proto_file}" IS_NEWER_THAN "${_grpc_out}/edr/v1/ingest.pb.cc")
+      message(STATUS "Generating gRPC C++ stubs (protoc=${_edr_protoc}) ...")
+      execute_process(
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_grpc_out}/edr/v1"
+        COMMAND "${_edr_protoc}"
+          -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
+          "--cpp_out=${_grpc_out}"
+          "--grpc_out=${_grpc_out}"
+          "--plugin=protoc-gen-grpc=${_edr_grpc_p}"
+          "${_proto_file}"
+        RESULT_VARIABLE _grpc_gen_result
+      )
+      if(NOT _grpc_gen_result EQUAL 0)
+        message(WARNING "gRPC stub generation failed, falling back to pre-generated stubs")
+      endif()
+    else()
+      message(STATUS "gRPC stubs up-to-date, using pre-generated")
+    endif()
   else()
     message(WARNING "protoc/grpc_cpp_plugin not found; relying on pre-generated stubs")
   endif()
