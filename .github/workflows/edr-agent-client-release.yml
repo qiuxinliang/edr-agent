@@ -180,13 +180,14 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DEDR_WITH_GRPC=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
+            -DEDR_ENABLE_IPO=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build (Ninja + sccache)
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS -- -v
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: sccache stats
         shell: bash

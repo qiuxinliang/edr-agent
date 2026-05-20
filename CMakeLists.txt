@@ -67,12 +67,10 @@ if(EDR_ENABLE_OPTIMIZATION)
       $<$<CONFIG:Release>:/O2>
       $<$<CONFIG:Release>:/Oi>
       $<$<CONFIG:Release>:/Ot>
-      $<$<CONFIG:Release>:/GL>
       $<$<CONFIG:Release>:/Gy>
       $<$<CONFIG:Release>:/fp:fast>
     )
     add_link_options(
-      $<$<CONFIG:Release>:/LTCG>
       $<$<CONFIG:Release>:/OPT:REF>
       $<$<CONFIG:Release>:/OPT:ICF>
     )
@@ -83,11 +81,18 @@ if(EDR_ENABLE_OPTIMIZATION)
       $<$<CONFIG:Release>:-funroll-loops>
       $<$<CONFIG:Release>:-fomit-frame-pointer>
       $<$<CONFIG:Release>:-fstrict-aliasing>
-      $<$<CONFIG:Release>:-flto>
     )
-    add_link_options(
-      $<$<CONFIG:Release>:-flto>
-    )
+  endif()
+endif()
+
+# LTO / LTCG: heavy link-time cost, only when explicitly requested (off by default)
+if(EDR_ENABLE_IPO)
+  if(MSVC)
+    add_compile_options($<$<CONFIG:Release>:/GL>)
+    add_link_options($<$<CONFIG:Release>:/LTCG>)
+  else()
+    add_compile_options($<$<CONFIG:Release>:-flto>)
+    add_link_options($<$<CONFIG:Release>:-flto>)
   endif()
 endif()
 
