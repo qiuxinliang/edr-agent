@@ -1,4 +1,4 @@
-# 独立 edr-agent 仓库：工作目录 = 本仓库根。**仅一条**发版编线：`win_*` tag → **no-gRPC + vcpkg(curl) + ONNX** → `edr-agent-<tag>-windows-amd64-exe.zip`。
+# 独立 edr-agent 仓库：工作目录 = 本仓库根。**仅一条**发版编线：`win_*` tag → **vcpkg(curl/grpc) + ONNX** → `edr-agent-<tag>-windows-amd64-exe.zip`。
 # **-*-grpc-exe.zip** 第二枚已暂停；monorepo 请用仓库根同名 workflow。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
@@ -26,7 +26,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (edr_agent.exe + runtime DLLs, no-gRPC+vcpkg+ONNX)
+    name: Build Windows (edr_agent.exe + runtime DLLs, vcpkg+ONNX)
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
     runs-on: windows-latest
     timeout-minutes: 360
@@ -125,7 +125,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure (Ninja, Release, no-gRPC+ONNX, sccache)
+      - name: Configure (Ninja, Release, ONNX, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -136,7 +136,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DEDR_WITH_GRPC=OFF `
+            -DEDR_WITH_GRPC=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             -DEDR_BUILD_TESTS=OFF
@@ -204,7 +204,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64, no-gRPC+vcpkg+ONNX)
+          name: edr-agent ${{ github.ref_name }} (Windows amd64, vcpkg+ONNX)
           generate_release_notes: true
           files: dist/*.zip
           fail_on_unmatched_files: true

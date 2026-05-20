@@ -23,7 +23,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (edr_agent.exe + runtime DLLs, no-gRPC+vcpkg+ONNX)
+    name: Build Windows (edr_agent.exe + runtime DLLs, vcpkg+ONNX)
     runs-on: windows-latest
     timeout-minutes: 360
     env:
@@ -110,7 +110,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure (Ninja, Release, no-gRPC+ONNX, sccache)
+      - name: Configure (Ninja, Release, ONNX, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -121,7 +121,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DEDR_WITH_GRPC=OFF `
+            -DEDR_WITH_GRPC=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             -DEDR_BUILD_TESTS=OFF
