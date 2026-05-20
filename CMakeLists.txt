@@ -454,6 +454,11 @@ if(EDR_GRPC_CLIENT_AVAILABLE)
     if(NOT EXISTS "${_grpc_out}/edr/v1/ingest.pb.cc"
        OR "${_proto_file}" IS_NEWER_THAN "${_grpc_out}/edr/v1/ingest.pb.cc")
       message(STATUS "Generating gRPC C++ stubs (protoc=${_edr_protoc}) ...")
+      # protoc.exe needs vcpkg runtime DLLs (e.g. zlib.dll) on PATH
+      if(DEFINED VCPKG_INSTALLED_DIR AND WIN32)
+        set(_edr_path_save "$ENV{PATH}")
+        set(ENV{PATH} "${VCPKG_INSTALLED_DIR}/bin;$ENV{PATH}")
+      endif()
       execute_process(
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_grpc_out}/edr/v1"
         COMMAND "${_edr_protoc}"
@@ -463,9 +468,13 @@ if(EDR_GRPC_CLIENT_AVAILABLE)
           "--plugin=protoc-gen-grpc=${_edr_grpc_p}"
           "${_proto_file}"
         RESULT_VARIABLE _grpc_gen_result
+        ERROR_VARIABLE  _grpc_gen_err
       )
+      if(DEFINED VCPKG_INSTALLED_DIR AND WIN32)
+        set(ENV{PATH} "${_edr_path_save}")
+      endif()
       if(NOT _grpc_gen_result EQUAL 0)
-        message(WARNING "gRPC stub generation failed, falling back to pre-generated stubs")
+        message(WARNING "gRPC stub generation failed (exit=${_grpc_gen_result}): ${_grpc_gen_err}")
       endif()
     else()
       message(STATUS "gRPC stubs up-to-date, using pre-generated")
