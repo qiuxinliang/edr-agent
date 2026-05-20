@@ -55,6 +55,7 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
+            onnxrt-win
           key: vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}
           restore-keys: |
             vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-
@@ -63,10 +64,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build
-          key: build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}-v1
+          key: build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
           restore-keys: |
-            build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v1
-            build-x64-win-${{ hashFiles('CMakeLists.txt') }}-${{ runner.os }}-v1
+            build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
 
       - name: "[Timing] Build start"
         shell: pwsh
@@ -108,26 +108,30 @@ jobs:
         shell: pwsh
         run: |
           $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $zip = Join-Path $dest "ort.zip"
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          $progressPreference = 'SilentlyContinue'
-          $wc = New-Object System.Net.WebClient
-          $wc.Headers.Add('User-Agent', 'edr-agent-ci')
-          for ($i = 0; $i -lt 5; $i++) {
-            try {
-              $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip", $zip)
-              Write-Host "ORT download OK"
-              break
-            } catch {
-              Write-Host "ORT download attempt $($i+1)/5 failed: $_"
-              if ($i -ge 4) { throw "ORT download exhausted retries: $_" }
-              Start-Sleep -Seconds 15
-            }
-          }
-          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
           $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
-          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
+          if (Test-Path (Join-Path $root "include\onnxruntime_c_api.h")) {
+            Write-Host "[skip] ONNX Runtime 1.17.3 already cached at $root"
+          } else {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $zip = Join-Path $dest "ort.zip"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $progressPreference = 'SilentlyContinue'
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add('User-Agent', 'edr-agent-ci')
+            for ($i = 0; $i -lt 5; $i++) {
+              try {
+                $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip", $zip)
+                Write-Host "ORT download OK"
+                break
+              } catch {
+                Write-Host "ORT download attempt $($i+1)/5 failed: $_"
+                if ($i -ge 4) { throw "ORT download exhausted retries: $_" }
+                Start-Sleep -Seconds 15
+              }
+            }
+            Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+            if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
+          }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure (Ninja, Release, ONNX, sccache)
