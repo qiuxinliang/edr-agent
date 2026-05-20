@@ -114,9 +114,27 @@ jobs:
           & $tc install
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
+      - name: Clean stale proto stubs (CMake will regenerate)
         shell: pwsh
-        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
+        run: |
+          $protoc_exe = Join-Path $env:VCPKG_INSTALLED_X64 "tools\protobuf\protoc.exe"
+          if (-not (Test-Path $protoc_exe)) {
+            Write-Host "[skip] protoc not found at $protoc_exe, keeping existing stubs"
+            return
+          }
+          Write-Host "protoc found, cleaning stale stubs ..."
+          $files = @(
+            "src/grpc_gen/edr/v1/ingest.pb.cc",
+            "src/grpc_gen/edr/v1/ingest.pb.h",
+            "src/grpc_gen/edr/v1/ingest.grpc.pb.cc",
+            "src/grpc_gen/edr/v1/ingest.grpc.pb.h"
+          )
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              Remove-Item -Force $f
+              Write-Host "Removed stale stub: $f"
+            }
+          }
 
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
@@ -163,6 +181,7 @@ jobs:
             -DEDR_WITH_GRPC=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+            "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 

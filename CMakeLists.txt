@@ -433,6 +433,38 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
 endif()
 
 if(EDR_GRPC_CLIENT_AVAILABLE)
+  # --- Locate protoc & grpc_cpp_plugin (vcpkg or Homebrew) ---
+  if(DEFINED VCPKG_INSTALLED_DIR)
+    set(_edr_protoc "${VCPKG_INSTALLED_DIR}/tools/protobuf/protoc${VCPKG_TARGET_EXECUTABLE_SUFFIX}")
+    set(_edr_grpc_p "${VCPKG_INSTALLED_DIR}/tools/grpc/grpc_cpp_plugin${VCPKG_TARGET_EXECUTABLE_SUFFIX}")
+  else()
+    find_program(_edr_protoc protoc)
+    find_program(_edr_grpc_p grpc_cpp_plugin)
+  endif()
+  if(_edr_protoc AND _edr_grpc_p AND EXISTS "${_edr_protoc}" AND EXISTS "${_edr_grpc_p}")
+    # Regenerate stubs from proto as a build-step; outputs live in source tree so
+    # that pre-generated stubs in git are the fallback.
+    add_custom_command(
+      OUTPUT
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.pb.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.pb.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.grpc.pb.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1/ingest.grpc.pb.h
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen/edr/v1"
+      COMMAND "${_edr_protoc}"
+        -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
+        "--cpp_out=${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen"
+        "--grpc_out=${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen"
+        "--plugin=protoc-gen-grpc=${_edr_grpc_p}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
+      COMMENT "Generating gRPC C++ stubs to match protobuf version"
+    )
+    message(STATUS "gRPC stub generation: protoc=${_edr_protoc}")
+  else()
+    message(WARNING "protoc/grpc_cpp_plugin not found; relying on pre-generated stubs")
+  endif()
+
   list(APPEND EDR_AGENT_SOURCES
     src/transport/grpc_client_impl.cpp
     src/grpc_gen/edr/v1/ingest.pb.cc
