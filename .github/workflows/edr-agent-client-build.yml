@@ -59,6 +59,22 @@ jobs:
           restore-keys: |
             vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-
 
+      - name: Cache CMake build directory (incremental)
+        uses: actions/cache@v5
+        with:
+          path: build
+          key: build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}-v1
+          restore-keys: |
+            build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v1
+            build-x64-win-${{ hashFiles('CMakeLists.txt') }}-${{ runner.os }}-v1
+
+      - name: "[Timing] Build start"
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          "BUILD_TIMING_START=$($start.ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Build started at $($start.ToString('HH:mm:ss'))"
+
       - name: Clone and bootstrap vcpkg
         working-directory: ${{ github.workspace }}
         shell: pwsh
@@ -83,9 +99,24 @@ jobs:
           & $tc install
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
+      - name: Regenerate ingest gRPC C++ (conditional)
         shell: pwsh
-        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
+        run: |
+          $protoFile = "proto/edr/v1/ingest.proto"
+          $genFile = "src/grpc_gen/edr/v1/ingest.pb.cc"
+          $needRegen = $true
+          if ((Test-Path $genFile) -and (Test-Path $protoFile)) {
+            $protoTime = (Get-Item $protoFile).LastWriteTimeUtc
+            $genTime  = (Get-Item $genFile).LastWriteTimeUtc
+            if ($genTime -gt $protoTime) {
+              $needRegen = $false
+              Write-Host "[skip] Proto stubs up-to-date (proto @ $protoTime, gen @ $genTime)"
+            }
+          }
+          if ($needRegen) {
+            Write-Host "[run] Proto changed or stubs missing — regenerating gRPC stubs ..."
+            ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
+          }
 
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
@@ -131,8 +162,14 @@ jobs:
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 
-      - name: Build
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Build (Ninja + sccache)
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS -- -v
+
+      - name: sccache stats
+        shell: bash
+        run: |
+          echo "=== sccache compilation cache stats ==="
+          sccache --show-stats || echo "(sccache stats unavailable)"
 
       - name: Stage ORT + vcpkg runtime DLLs
         shell: pwsh
@@ -144,6 +181,18 @@ jobs:
       - name: Test
         shell: bash
         run: ctest --test-dir build --output-on-failure
+
+      - name: "[Timing] Build summary"
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:BUILD_TIMING_START) {
+            $start = [DateTime]::Parse($env:BUILD_TIMING_START)
+            $elapsed = (Get-Date) - $start
+            Write-Host "========================================"
+            Write-Host "Total elapsed build time: $($elapsed.TotalMinutes.ToString('F1')) minutes ($($elapsed.TotalSeconds)s)"
+            Write-Host "========================================"
+          }
 
       - name: Package (exe + runtime DLLs only)
         shell: pwsh
