@@ -161,16 +161,16 @@ static int edr_get_ppid_via_wmi(DWORD pid, DWORD *out_ppid) {
 
 static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
   if (!out_ppid || pid == 0) return -1;
-  
+
   HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
   if (!hProcess) return -1;
-  
+
   HANDLE hToken = NULL;
   if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
     CloseHandle(hProcess);
     return -1;
   }
-  
+
   const DWORD tokenEnvInfo = 10;
   DWORD needed = 0;
   GetTokenInformation(hToken, tokenEnvInfo, NULL, 0, &needed);
@@ -179,14 +179,14 @@ static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
     CloseHandle(hProcess);
     return -1;
   }
-  
+
   LPVOID envBlock = HeapAlloc(GetProcessHeap(), 0, needed);
   if (!envBlock) {
     CloseHandle(hToken);
     CloseHandle(hProcess);
     return -1;
   }
-  
+
   int result = -1;
   if (GetTokenInformation(hToken, tokenEnvInfo, envBlock, needed, &needed)) {
     WCHAR *env = (WCHAR*)envBlock;
@@ -203,7 +203,7 @@ static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
       env += len + 1;
     }
   }
-  
+
   HeapFree(GetProcessHeap(), 0, envBlock);
   CloseHandle(hToken);
   CloseHandle(hProcess);
@@ -620,7 +620,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
           GetSystemTimeAsFileTime(&ft);
           event_time = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
         }
-        
+
         char inferred_parent_name[64] = {0};
         if (edr_pt_cache_infer_parent(r->pid, event_time, (uint32_t *)&sppid, inferred_parent_name, sizeof(inferred_parent_name)) == 0 && sppid > 0) {
           r->ppid = (uint32_t)sppid;
@@ -652,7 +652,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       }
 #endif
     }
-    
+
     if (ef.has_pimg) {
       snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.pimg);
       snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.pimg));
@@ -815,7 +815,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                      r->process_name, r->cmdline,
                      r->exe_path, r->parent_name,
                      (uint64_t)slot->timestamp_ns);
-    
+
     /* edr_pt_cache_update_explorer_info 已移除，explorer 信息由 process_tree_cache 统一管理 */
   } else if (slot->type == EDR_EVENT_PROCESS_TERMINATE) {
     edr_pt_cache_remove(r->pid);

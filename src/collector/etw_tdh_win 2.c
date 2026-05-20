@@ -253,39 +253,13 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
     return ERROR_SUCCESS;
   }
   if (cb == 8) {
-    uint64_t v = *(uint64_t *)tmp;
+    ULONGLONG v = *(ULONGLONG *)tmp;
     snprintf(out, out_cap, "%llu", (unsigned long long)v);
     if (tmp_is_heap) {
       HeapFree(GetProcessHeap(), 0, tmp);
     }
     tdh_stat_line_ok_1();
     return ERROR_SUCCESS;
-  }
-  /* hex-string fallback: Windows TDH may return PID fields as "0x..." strings */
-  if (cb >= 3 && cb <= 22) {
-    const char *hex = (const char *)tmp;
-    int is_hex_str = 1;
-    /* must be null-terminated or bounded by cb, and look like hex */
-    for (ULONG i = 0; i < cb && hex[i]; i++) {
-      char c = hex[i];
-      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-            (c >= 'A' && c <= 'F') || c == 'x' || c == 'X')) {
-        is_hex_str = 0;
-        break;
-      }
-    }
-    if (is_hex_str && hex[0]) {
-      char *endp = NULL;
-      unsigned long long v = strtoull(hex, &endp, 16);
-      if (endp != hex) {
-        snprintf(out, out_cap, "%llu", v);
-        if (tmp_is_heap) {
-          HeapFree(GetProcessHeap(), 0, tmp);
-        }
-        tdh_stat_line_ok_1();
-        return ERROR_SUCCESS;
-      }
-    }
   }
 
   if (tmp_is_heap) {
@@ -366,7 +340,7 @@ static int edr_get_process_cmdline_by_pid(DWORD pid, char *out, size_t out_cap) 
 
   uintptr_t peb_addr = (uintptr_t)pbi.PebBaseAddress;
   uintptr_t process_params_addr = 0;
-  
+
   if (!ReadProcessMemory(hProcess, (LPCVOID)(peb_addr + 0x20), &process_params_addr, sizeof(process_params_addr), NULL)) {
     CloseHandle(hProcess);
     return -1;
@@ -459,8 +433,8 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"Filename", "img"},
       {L"ParentProcessId", "ppid"},
       {L"ParentProcessID", "ppid"},
-      {L"ParentID", "ppid"},
       {L"ParentId", "ppid"},
+      {L"ParentID", "ppid"},
       {L"CreatingProcessId", "ppid"},
       {L"CreatingProcessID", "ppid"},
       {L"ParentImage", "pimg"},
@@ -502,16 +476,17 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   };
   static const EdrPropTry sec_try[] = {
       {L"SubjectUserName", "user"},
-      {L"NewProcessId", "epid"},
-      {L"NewProcessID", "epid"},
       {L"NewProcessName", "img"},
       {L"CommandLine", "cmd"},
       {L"IpAddress", "ip"},
       {L"WorkstationName", "ws"},
-      {L"CreatorProcessName", "pimg"},
       {L"ParentProcessName", "pimg"},
+      {L"NewProcessId", "epid"},
+      {L"NewProcessID", "epid"},
       {L"CreatorProcessId", "ppid"},
       {L"CreatorProcessID", "ppid"},
+      {L"ProcessId", "epid"},
+      {L"ParentProcessId", "ppid"},
       {L"TokenElevationType", "token_elev"},
       {L"MandatoryLabel", "integ"},
       {L"SubjectLogonId", "sess_id"},
