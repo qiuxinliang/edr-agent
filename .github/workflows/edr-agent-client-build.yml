@@ -55,9 +55,9 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-nogrpc-build-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}
+          key: vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/edr-agent-client-build.yml') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-nogrpc-build-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-
 
       - name: Clone and bootstrap vcpkg
         working-directory: ${{ github.workspace }}
@@ -68,7 +68,7 @@ jobs:
           }
           & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
 
-      - name: vcpkg install (manifest, no-gRPC)
+      - name: vcpkg install (manifest)
         working-directory: ${{ github.workspace }}
         env:
           VCPKG_DEFAULT_TRIPLET: x64-windows
