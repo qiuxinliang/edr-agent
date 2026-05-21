@@ -10,14 +10,22 @@
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include "edr/command_util.h"
 #include "edr/response.h"
+#include "edr/sha256.h"
 #include "edr/shell_exec.h"
 
 #define RTQ_MAX_RESULTS    500
 #define RTQ_MAX_RESULT_STR (128 * 1024)
+#define RTQ_FILE_HASH_MAX  (64 * 1024 * 1024)
+#define RTQ_FILE_SCAN_MAX  2000
+#define RTQ_FILE_SCAN_DEPTH 3
 
 typedef struct rtq_filter {
     int has_process;
@@ -68,13 +76,15 @@ static int parse_rtq_filter(const uint8_t *pl, size_t len, rtq_filter *f) {
     }
     {
         int v = 0;
-        edr_parse_json_int(pl, len, "process_pid_min", &v);
-        if (v >= 0) { f->has_process = 1; f->process_pid_min = v; }
+        if (edr_parse_json_int(pl, len, "process_pid_min", &v) && v >= 0) {
+            f->has_process = 1; f->process_pid_min = v;
+        }
     }
     {
         int v = 0;
-        edr_parse_json_int(pl, len, "process_pid_max", &v);
-        if (v > 0) { f->has_process = 1; f->process_pid_max = v; }
+        if (edr_parse_json_int(pl, len, "process_pid_max", &v) && v > 0) {
+            f->has_process = 1; f->process_pid_max = v;
+        }
     }
 
     {
@@ -117,6 +127,117 @@ static int parse_rtq_filter(const uint8_t *pl, size_t len, rtq_filter *f) {
     return (f->has_process || f->has_network || f->has_file) ? 0 : -1;
 }
 
+static void append_json_escaped(char *buf, int cap, int *offset, const char *s) {
+    if (!buf || !offset || *offset >= cap || !s) return;
+    for (const char *p = s; *p && *offset < cap - 2; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '"' || ch == '\\') {
+            if (*offset < cap - 2) buf[(*offset)++] = '\\';
+            buf[(*offset)++] = (char)ch;
+        } else if (ch == '\n') {
+            if (*offset < cap - 3) {
+                buf[(*offset)++] = '\\';
+                buf[(*offset)++] = 'n';
+            }
+        } else if (ch == '\r') {
+            if (*offset < cap - 3) {
+                buf[(*offset)++] = '\\';
+                buf[(*offset)++] = 'r';
+            }
+        } else if (ch == '\t') {
+            if (*offset < cap - 3) {
+                buf[(*offset)++] = '\\';
+                buf[(*offset)++] = 't';
+            }
+        } else if (ch >= 32) {
+            buf[(*offset)++] = (char)ch;
+        }
+    }
+    if (*offset < cap) buf[*offset] = '\0';
+}
+
+static void append_json_kv_str(char *buf, int cap, int *offset, const char *key, const char *value) {
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"%s\":\"", key);
+    append_json_escaped(buf, cap, offset, value ? value : "");
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\"");
+}
+
+static int str_contains_icase(const char *haystack, const char *needle);
+
+static int file_has_ext(const char *path, const char *ext) {
+    if (!ext || !ext[0]) return 1;
+    if (!path) return 0;
+    const char *dot = strrchr(path, '.');
+    if (!dot) return 0;
+    return str_contains_icase(dot, ext);
+}
+
+static int hash_file_if_needed(const char *path, const char *expected, char out65[65]) {
+    out65[0] = '\0';
+    if (!expected || !expected[0]) return 1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long sz = ftell(f);
+    if (sz < 0 || sz > RTQ_FILE_HASH_MAX) { fclose(f); return 0; }
+    rewind(f);
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    if (!buf) { fclose(f); return 0; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) { free(buf); return 0; }
+    edr_sha256_hex(buf, (size_t)sz, out65);
+    free(buf);
+    return str_contains_icase(out65, expected);
+}
+
+#ifndef _WIN32
+static int append_file_result(rtq_filter *f, const char *path, char *buf, int cap, int *offset, int *total) {
+    if (!path || !path[0] || *total >= RTQ_MAX_RESULTS || *offset >= cap - 512) return 0;
+    if (f->file_path[0] && !str_contains_icase(path, f->file_path)) return 0;
+    if (!file_has_ext(path, f->file_ext)) return 0;
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (f->file_size_min > 0 && (long long)st.st_size < f->file_size_min) return 0;
+    if (f->file_size_max > 0 && (long long)st.st_size > f->file_size_max) return 0;
+
+    char sha[65] = {0};
+    if (!hash_file_if_needed(path, f->file_sha256, sha)) return 0;
+    if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"file\",\"path\":\"");
+    append_json_escaped(buf, cap, offset, path);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"size\":%lld", (long long)st.st_size);
+    if (sha[0]) append_json_kv_str(buf, cap, offset, "sha256", sha);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+    (*total)++;
+    return 1;
+}
+
+static void scan_files_limited(rtq_filter *f, const char *root, int depth, int *scanned,
+                               char *buf, int cap, int *offset, int *total) {
+    if (!root || !root[0] || depth < 0 || *scanned >= RTQ_FILE_SCAN_MAX || *total >= RTQ_MAX_RESULTS) return;
+    struct stat st;
+    if (stat(root, &st) != 0) return;
+    if (S_ISREG(st.st_mode)) {
+        (*scanned)++;
+        (void)append_file_result(f, root, buf, cap, offset, total);
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) return;
+    DIR *d = opendir(root);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && *scanned < RTQ_FILE_SCAN_MAX && *total < RTQ_MAX_RESULTS) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        char child[1024];
+        snprintf(child, sizeof(child), "%s/%s", root, de->d_name);
+        scan_files_limited(f, child, depth - 1, scanned, buf, cap, offset, total);
+    }
+    closedir(d);
+}
+#endif
+
 static int str_contains_icase(const char *haystack, const char *needle) {
     if (!needle || !needle[0]) return 1;
     if (!haystack) return 0;
@@ -157,17 +278,28 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
             if (f->process_name[0] && !str_contains_icase(name, f->process_name)) ok = 0;
             if (f->process_pid_max > 0 && (int)pe.th32ProcessID > f->process_pid_max) ok = 0;
             if (f->process_pid_min > 0 && (int)pe.th32ProcessID < f->process_pid_min) ok = 0;
+            if (f->process_cmdline[0] || f->process_user[0]) ok = 0;
+
+            char path[520] = {0};
+            if (ok && f->process_path[0]) {
+                HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                if (hp) {
+                    DWORD sz = sizeof(path);
+                    if (!QueryFullProcessImageNameA(hp, 0, path, &sz)) path[0] = '\0';
+                    CloseHandle(hp);
+                }
+                if (!path[0] || !str_contains_icase(path, f->process_path)) ok = 0;
+            }
 
             if (ok && count < RTQ_MAX_RESULTS && *offset < cap - 512) {
                 if (count > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
                     "{\"type\":\"process\",\"pid\":%lu,\"name\":\"", (unsigned long)pe.th32ProcessID);
-                for (const char *p = name; *p; p++) {
-                    if (*p == '"' || *p == '\\') buf[(*offset)++] = '\\';
-                    buf[(*offset)++] = *p;
-                }
-                *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"ppid\":%lu}",
+                append_json_escaped(buf, cap, offset, name);
+                *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"ppid\":%lu",
                     (unsigned long)pe.th32ParentProcessID);
+                if (path[0]) append_json_kv_str(buf, cap, offset, "path", path);
+                *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
                 count++;
             }
         } while (Process32NextW(h, &pe));
@@ -180,28 +312,217 @@ static int match_network(rtq_filter *f, char *buf, int cap, int *offset) {
     (void)f; (void)buf; (void)cap; (void)offset;
     return 0;
 }
-#endif
-
-static int execute_rtq_local(char *result_buf, int cap) {
-    int offset = 0;
-    int total = 0;
-    offset += snprintf(result_buf + offset, (size_t)(cap - offset), "{\"results\":[\n");
-
-    rtq_filter filter;
-    memset(&filter, 0, sizeof(filter));
-
-    if (filter.has_process) {
-#ifdef _WIN32
-        int n = match_processes(&filter, result_buf, cap, &offset);
-        if (n >= 0) total += n;
 #else
-        (void)&filter;
-#endif
+static void read_proc_exe_path(int pid, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    char link_path[64];
+    snprintf(link_path, sizeof(link_path), "/proc/%d/exe", pid);
+    ssize_t n = readlink(link_path, out, out_cap - 1);
+    if (n > 0) out[n] = '\0';
+}
+
+static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    FILE *p = popen("ps -eo pid,ppid,user,comm,args 2>/dev/null", "r");
+    if (!p) return 0;
+
+    int count = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), p) && *total < RTQ_MAX_RESULTS) {
+        int loc_pid = 0, loc_ppid = 0;
+        char loc_user[64] = {0}, loc_comm[256] = {0};
+        char rest[2560] = {0};
+        (void)sscanf(line, "%d %d %63s %255s %2559[^\n]",
+            &loc_pid, &loc_ppid, loc_user, loc_comm, rest);
+        if (loc_pid <= 0) continue;
+
+        char path[1024] = {0};
+        if (f->process_path[0]) read_proc_exe_path(loc_pid, path, sizeof(path));
+
+        int ok = 1;
+        if (f->process_name[0] && !str_contains_icase(loc_comm, f->process_name)) ok = 0;
+        if (f->process_user[0] && !str_contains_icase(loc_user, f->process_user)) ok = 0;
+        if (f->process_pid_max > 0 && loc_pid > f->process_pid_max) ok = 0;
+        if (f->process_pid_min > 0 && loc_pid < f->process_pid_min) ok = 0;
+        if (f->process_cmdline[0] && !str_contains_icase(rest, f->process_cmdline)) ok = 0;
+        if (f->process_path[0] && !str_contains_icase(path, f->process_path)) ok = 0;
+        if (!ok || *offset >= cap - 1024) continue;
+
+        if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
+            "{\"type\":\"process\",\"pid\":%d,\"ppid\":%d,\"name\":\"", loc_pid, loc_ppid);
+        append_json_escaped(buf, cap, offset, loc_comm);
+        append_json_kv_str(buf, cap, offset, "user", loc_user);
+        append_json_kv_str(buf, cap, offset, "cmdline", rest);
+        if (path[0]) append_json_kv_str(buf, cap, offset, "path", path);
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+        (*total)++;
+        count++;
+    }
+    pclose(p);
+    return count;
+}
+
+static void strip_brackets(char *s) {
+    size_t n;
+    if (!s) return;
+    n = strlen(s);
+    if (n >= 2 && s[0] == '[' && s[n - 1] == ']') {
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = '\0';
+    }
+}
+
+static int is_port_text(const char *s) {
+    if (!s || !s[0]) return 0;
+    if (strcmp(s, "*") == 0) return 1;
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+    return 1;
+}
+
+static int split_addr_port(const char *addr, char *ip, size_t ip_cap, int *port) {
+    if (!addr || !ip || ip_cap == 0 || !port) return 0;
+    ip[0] = '\0';
+    *port = 0;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", addr);
+
+    char *sep = strrchr(tmp, ':');
+    if (!sep || !sep[1] || !is_port_text(sep + 1)) {
+        sep = strrchr(tmp, '.');
+    }
+    if (!sep || !sep[1] || !is_port_text(sep + 1)) {
+        snprintf(ip, ip_cap, "%s", tmp);
+        strip_brackets(ip);
+        return 0;
     }
 
-    offset += snprintf(result_buf + offset, (size_t)(cap - offset), "\n],\"total\":%d}", total);
-    return total;
+    *sep = '\0';
+    snprintf(ip, ip_cap, "%s", tmp);
+    strip_brackets(ip);
+    if (strcmp(sep + 1, "*") != 0) *port = atoi(sep + 1);
+    return *port > 0;
 }
+
+static void extract_ss_process(const char *tail, char *proc, size_t proc_cap, int *pid) {
+    if (proc && proc_cap > 0) proc[0] = '\0';
+    if (pid) *pid = 0;
+    if (!tail) return;
+
+    const char *q = strchr(tail, '"');
+    if (q && proc && proc_cap > 0) {
+        const char *e = strchr(q + 1, '"');
+        if (e && e > q + 1) {
+            size_t n = (size_t)(e - q - 1);
+            if (n >= proc_cap) n = proc_cap - 1;
+            memcpy(proc, q + 1, n);
+            proc[n] = '\0';
+        }
+    }
+    const char *p = strstr(tail, "pid=");
+    if (p && pid) *pid = atoi(p + 4);
+}
+
+static int append_network_result(rtq_filter *f, const char *proto, const char *state,
+                                 const char *local_addr, const char *remote_addr,
+                                 const char *tail, char *buf, int cap, int *offset, int *total) {
+    char remote_ip[128] = {0};
+    int remote_port = 0;
+    split_addr_port(remote_addr, remote_ip, sizeof(remote_ip), &remote_port);
+
+    if (f->network_proto[0] && !str_contains_icase(proto, f->network_proto)) return 0;
+    if (f->network_state[0] && !str_contains_icase(state, f->network_state)) return 0;
+    if (f->network_remote_ip[0] &&
+        !str_contains_icase(remote_ip, f->network_remote_ip) &&
+        !str_contains_icase(remote_addr, f->network_remote_ip)) return 0;
+    if (f->network_remote_port > 0 && remote_port != f->network_remote_port) return 0;
+    if (*total >= RTQ_MAX_RESULTS || *offset >= cap - 1024) return 0;
+
+    char local_ip[128] = {0};
+    int local_port = 0;
+    char proc[128] = {0};
+    int pid = 0;
+    split_addr_port(local_addr, local_ip, sizeof(local_ip), &local_port);
+    extract_ss_process(tail, proc, sizeof(proc), &pid);
+
+    if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"network\"");
+    append_json_kv_str(buf, cap, offset, "proto", proto);
+    append_json_kv_str(buf, cap, offset, "state", state);
+    append_json_kv_str(buf, cap, offset, "local_addr", local_addr);
+    append_json_kv_str(buf, cap, offset, "local_ip", local_ip);
+    if (local_port > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"local_port\":%d", local_port);
+    append_json_kv_str(buf, cap, offset, "remote_addr", remote_addr);
+    append_json_kv_str(buf, cap, offset, "remote_ip", remote_ip);
+    if (remote_port > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"remote_port\":%d", remote_port);
+    if (pid > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"pid\":%d", pid);
+    if (proc[0]) append_json_kv_str(buf, cap, offset, "process_name", proc);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+    (*total)++;
+    return 1;
+}
+
+static int scan_ss_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    FILE *p = popen("ss -tunapH 2>/dev/null", "r");
+    if (!p) return 0;
+
+    int count = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), p) && *total < RTQ_MAX_RESULTS) {
+        char proto[16] = {0}, state[32] = {0}, recvq[32] = {0}, sendq[32] = {0};
+        char local_addr[256] = {0}, remote_addr[256] = {0}, tail[1024] = {0};
+        int n = sscanf(line, "%15s %31s %31s %31s %255s %255s %1023[^\n]",
+                       proto, state, recvq, sendq, local_addr, remote_addr, tail);
+        if (n < 6) continue;
+        if (append_network_result(f, proto, state, local_addr, remote_addr, tail, buf, cap, offset, total)) {
+            count++;
+        }
+    }
+    pclose(p);
+    return count;
+}
+
+static int scan_netstat_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    FILE *p = popen("netstat -an 2>/dev/null", "r");
+    if (!p) return 0;
+
+    int count = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), p) && *total < RTQ_MAX_RESULTS) {
+        char proto[16] = {0}, recvq[32] = {0}, sendq[32] = {0};
+        char local_addr[256] = {0}, remote_addr[256] = {0}, state[32] = {0}, tail[1024] = {0};
+        int n = sscanf(line, "%15s %31s %31s %255s %255s %31s %1023[^\n]",
+                       proto, recvq, sendq, local_addr, remote_addr, state, tail);
+        if (n < 5 || (!str_contains_icase(proto, "tcp") && !str_contains_icase(proto, "udp"))) continue;
+        if (n < 6) snprintf(state, sizeof(state), "%s", "");
+        if (append_network_result(f, proto, state, local_addr, remote_addr, tail, buf, cap, offset, total)) {
+            count++;
+        }
+    }
+    pclose(p);
+    return count;
+}
+
+static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    int count = scan_ss_network(f, buf, cap, offset, total);
+    if (count == 0) count += scan_netstat_network(f, buf, cap, offset, total);
+    return count;
+}
+
+static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    int scanned = 0;
+    int before = *total;
+    if (f->file_path[0]) {
+        scan_files_limited(f, f->file_path, RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
+    } else if (f->file_ext[0]) {
+        scan_files_limited(f, "/tmp", RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
+        scan_files_limited(f, "/var/tmp", RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
+    }
+    return *total - before;
+}
+#endif
 
 void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                                size_t len, const EdrSoarCommandMeta *sm) {
@@ -247,58 +568,13 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     }
 #else
     if (has_proc) {
-        FILE *p = popen("ps -eo pid,ppid,user,comm,args --no-headers 2>/dev/null", "r");
-        if (p) {
-            char line[4096];
-            while (fgets(line, sizeof(line), p) && total < RTQ_MAX_RESULTS) {
-                int loc_pid = 0, loc_ppid = 0;
-                char loc_user[64] = {0}, loc_comm[256] = {0};
-                char rest[2560] = {0};
-                (void)sscanf(line, "%d %d %63s %255s %2559[^\n]",
-                    &loc_pid, &loc_ppid, loc_user, loc_comm, rest);
-                int ok = 1;
-                if (filter.process_name[0] && !str_contains_icase(loc_comm, filter.process_name)) ok = 0;
-                if (filter.process_user[0] && !str_contains_icase(loc_user, filter.process_user)) ok = 0;
-                if (filter.process_pid_max > 0 && loc_pid > filter.process_pid_max) ok = 0;
-                if (filter.process_pid_min > 0 && loc_pid < filter.process_pid_min) ok = 0;
-                if (filter.process_cmdline[0] && !str_contains_icase(rest, filter.process_cmdline)) ok = 0;
-                if (ok) {
-                    if (total > 0) offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), ",");
-                    offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
-                        "{\"type\":\"process\",\"pid\":%d,\"name\":\"", loc_pid);
-                    for (const char *q = loc_comm; *q; q++) {
-                        if (*q == '"' || *q == '\\') result[offset++] = '\\';
-                        result[offset++] = *q;
-                    }
-                    offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
-                        "\",\"user\":\"%s\"}", loc_user);
-                    total++;
-                }
-            }
-            pclose(p);
-        }
+        (void)match_processes(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
     if (has_net) {
-        FILE *p = popen("ss -tunap 2>/dev/null || netstat -an 2>/dev/null", "r");
-        if (p) {
-            char line[1024];
-            int net_count = total;
-            while (fgets(line, sizeof(line), p) && total < RTQ_MAX_RESULTS) {
-                if (total > net_count) {
-                    offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), ",");
-                    offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
-                        "{\"type\":\"network\",\"line\":\"");
-                    for (const char *q = line; *q; q++) {
-                        if (*q == '\n' || *q == '\r') break;
-                        if (*q == '"' || *q == '\\') result[offset++] = '\\';
-                        result[offset++] = *q;
-                    }
-                    offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\"}");
-                    total++;
-                }
-            }
-            pclose(p);
-        }
+        (void)match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+    }
+    if (has_file) {
+        (void)match_files(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
 #endif
     (void)has_file;
