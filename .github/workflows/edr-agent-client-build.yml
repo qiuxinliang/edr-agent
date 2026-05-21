@@ -112,27 +112,30 @@ jobs:
           & $tc install
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Clean stale proto stubs (CMake will regenerate)
+      - name: Regenerate gRPC proto stubs
         shell: pwsh
         run: |
           $protoc_exe = Join-Path $env:VCPKG_INSTALLED_X64 "tools\protobuf\protoc.exe"
           if (-not (Test-Path $protoc_exe)) {
-            Write-Host "[skip] protoc not found at $protoc_exe, keeping existing stubs"
+            Write-Host "[skip] protoc not found at $protoc_exe"
             return
           }
-          Write-Host "protoc found, cleaning stale stubs ..."
-          $files = @(
-            "src/grpc_gen/edr/v1/ingest.pb.cc",
-            "src/grpc_gen/edr/v1/ingest.pb.h",
-            "src/grpc_gen/edr/v1/ingest.grpc.pb.cc",
-            "src/grpc_gen/edr/v1/ingest.grpc.pb.h"
-          )
-          foreach ($f in $files) {
-            if (Test-Path $f) {
-              Remove-Item -Force $f
-              Write-Host "Removed stale stub: $f"
-            }
+          $grpc_plugin = Join-Path $env:VCPKG_INSTALLED_X64 "tools\grpc\grpc_cpp_plugin.exe"
+          if (-not (Test-Path $grpc_plugin)) {
+            Write-Host "[skip] grpc_cpp_plugin not found at $grpc_plugin"
+            return
           }
+          # protoc needs vcpkg runtime DLLs (e.g. zlib.dll) on PATH
+          $env:PATH = "$env:VCPKG_INSTALLED_X64\bin;$env:PATH"
+          $out_dir = "src/grpc_gen/edr/v1"
+          New-Item -ItemType Directory -Force -Path $out_dir | Out-Null
+          Write-Host "Regenerating gRPC stubs ..."
+          & $protoc_exe -I proto --cpp_out=src/grpc_gen --grpc_out=src/grpc_gen --plugin=protoc-gen-grpc=$grpc_plugin proto/edr/v1/ingest.proto
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::protoc failed with exit code $LASTEXITCODE"
+            throw "protoc failed"
+          }
+          Write-Host "gRPC stubs regenerated OK"
 
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
