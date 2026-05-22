@@ -39,6 +39,28 @@ jobs:
         run: |
           chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
           ./scripts/verify_ave_behavior_chain_invariants.sh
+
+      - name: Extract version from tag & update source files
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          # Tag format: win_<version>  or  <prefix>_<version>
+          # Extract a.b.c version string
+          if ($tag -match '_(\d+\.\d+\.\d+)$') {
+            $ver = $Matches[1]
+            Write-Host "Extracted version: $ver from tag: $tag"
+          } else {
+            Write-Host "::error::Cannot extract version from tag: $tag (expected format: <prefix>_a.b.c)"
+            throw "Invalid tag format: $tag"
+          }
+          Write-Host "Running update-version.ps1 with version: $ver"
+          & ./scripts/update-version.ps1 $ver
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::update-version.ps1 failed with exit code $LASTEXITCODE"
+            throw "Version update failed"
+          }
+          Write-Host "Version update completed successfully"
+
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
@@ -88,6 +110,40 @@ jobs:
           restore-keys: |
             build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
 
+      - name: Restore vcpkg from pre-built packages (if cache miss)
+        shell: pwsh
+        run: |
+          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          if (Test-Path $installed_marker) {
+            Write-Host "[pre-build-packages] vcpkg cache hit, skip download"
+            "VCPKG_SOURCE=cache" | Out-File -FilePath $env:GITHUB_ENV -Append
+            return
+          }
+          $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
+          $release_tag = "prebuild-x64-windows-$hash"
+          $archive = "vcpkg-installed-x64-windows.7z"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$release_tag/$archive"
+          Write-Host "[pre-build-packages] Cache miss, trying pre-built: $url"
+          try {
+            $progressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
+            Write-Host "[pre-build-packages] Download OK, extracting..."
+            7z x $archive -o"$env:GITHUB_WORKSPACE" -y
+            if ($LASTEXITCODE -ne 0) { throw "7z extract failed" }
+            Remove-Item $archive -Force
+            if (Test-Path $installed_marker) {
+              Write-Host "[pre-build-packages] Pre-built packages restored from $release_tag"
+              "VCPKG_SOURCE=prebuilt:$release_tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+            } else {
+              throw "Extracted but marker not found"
+            }
+          } catch {
+            Write-Host "[pre-build-packages] Download/extract failed: $_"
+            Write-Host "[pre-build-packages] Falling back to source build"
+            "VCPKG_SOURCE=source" | Out-File -FilePath $env:GITHUB_ENV -Append
+            if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
+          }
+
       - name: "[Timing] Build start"
         shell: pwsh
         run: |
@@ -119,6 +175,10 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
+          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          if (Test-Path $installed_marker) {
+            Write-Host "[vcpkg] Packages already installed (from $env:VCPKG_SOURCE), verifying..."
+          }
           $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
           $env:VCPKG_ROOT = $vroot
           $env:Path = $vroot + ";" + $env:Path
@@ -231,6 +291,12 @@ jobs:
             $elapsed = (Get-Date) - $start
             Write-Host "========================================"
             Write-Host "Total elapsed build time: $($elapsed.TotalMinutes.ToString('F1')) minutes ($($elapsed.TotalSeconds)s)"
+            Write-Host "vcpkg source : $env:VCPKG_SOURCE"
+            $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+            if (Test-Path $installed_marker) {
+              $size = [math]::Round(((Get-ChildItem -Path "vcpkg_installed" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
+              Write-Host "vcpkg installed size: ${size} MB"
+            }
             Write-Host "========================================"
           }
 

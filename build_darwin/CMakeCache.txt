@@ -325,10 +325,10 @@ SQLite3_LIBRARY:FILEPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr
 TORCH_ROOT:PATH=
 
 //Path to a file.
-YARA_INCLUDE_DIR:PATH=YARA_INCLUDE_DIR-NOTFOUND
+YARA_INCLUDE_DIR:PATH=/opt/homebrew/include
 
 //Path to a library.
-YARA_LIB:FILEPATH=YARA_LIB-NOTFOUND
+YARA_LIB:FILEPATH=/opt/homebrew/lib/libyara.dylib
 
 //Path to a file.
 ZLIB_INCLUDE_DIR:PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include

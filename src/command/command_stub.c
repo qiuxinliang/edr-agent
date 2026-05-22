@@ -217,6 +217,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     edr_response_isolate(id, sm);
     return;
   }
+  if (edr_command_streq(t, "restore_host") || edr_command_streq(t, "restore")) {
+    edr_response_restore_host(id, sm);
+    return;
+  }
   if (edr_command_streq(t, "kill_process") || edr_command_streq(t, "kill")) {
     edr_response_kill(id, payload, payload_len, sm);
     return;

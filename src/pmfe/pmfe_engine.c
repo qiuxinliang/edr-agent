@@ -32,16 +32,14 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #include <time.h>
 
 #include "edr/pmfe_idle_scanner.h"
-#ifdef _WIN32
 static const EdrConfig *s_pmfe_cfg;
-#endif
 
 void edr_pmfe_bind_config(const EdrConfig *cfg) {
-#ifdef _WIN32
   s_pmfe_cfg = cfg;
-#else
-  (void)cfg;
-#endif
+}
+
+const EdrConfig *edr_pmfe_current_config(void) {
+  return s_pmfe_cfg;
 }
 
 #ifdef _WIN32
@@ -82,10 +80,14 @@ static unsigned s_task_count;
 static volatile LONG s_stat_submitted;
 static volatile LONG s_stat_completed;
 static volatile LONG s_stat_dropped;
+static volatile LONG s_stat_deduped;
+static volatile LONG s_stat_cooldown_skipped;
 #else
 static volatile unsigned long s_stat_submitted;
 static volatile unsigned long s_stat_completed;
 static volatile unsigned long s_stat_dropped;
+static volatile unsigned long s_stat_deduped;
+static volatile unsigned long s_stat_cooldown_skipped;
 #endif
 
 #ifdef _WIN32
@@ -118,6 +120,35 @@ static EdrEventBus *s_pmfe_bus;
 #define PMFE_ETW_CD_CAP 16u
 static uint32_t s_etw_cd_pid[PMFE_ETW_CD_CAP];
 static uint64_t s_etw_cd_ms[PMFE_ETW_CD_CAP];
+
+static void pmfe_stat_inc_deduped(void) {
+#ifdef _WIN32
+  InterlockedIncrement(&s_stat_deduped);
+#else
+  (void)__atomic_add_fetch(&s_stat_deduped, 1ul, __ATOMIC_RELAXED);
+#endif
+}
+
+static void pmfe_stat_inc_cooldown_skipped(void) {
+#ifdef _WIN32
+  InterlockedIncrement(&s_stat_cooldown_skipped);
+#else
+  (void)__atomic_add_fetch(&s_stat_cooldown_skipped, 1ul, __ATOMIC_RELAXED);
+#endif
+}
+
+static int pmfe_task_pending_equiv_locked(const EdrPmfeTask *src) {
+  if (!src || src->force_deep) {
+    return 0;
+  }
+  for (unsigned i = 0, idx = s_task_head; i < s_task_count; i++, idx = (idx + 1u) % PMFE_TASK_CAP) {
+    const EdrPmfeTask *t = &s_task_buf[idx];
+    if (t->pid == src->pid && t->band == src->band && t->vad_hint_va == src->vad_hint_va && !t->force_deep) {
+      return 1;
+    }
+  }
+  return 0;
+}
 
 static void audit_pmfe_line(const char *cmd_id, const char *msg) {
   EDR_LOGV("[pmfe][audit] id=%s %s\n", cmd_id ? cmd_id : "", msg);
@@ -1898,6 +1929,8 @@ EdrError edr_pmfe_init(void) {
   InitializeConditionVariable(&s_q_nonfull);
   s_shutdown = 0;
   s_task_head = s_task_tail = s_task_count = 0;
+  InterlockedExchange(&s_stat_deduped, 0);
+  InterlockedExchange(&s_stat_cooldown_skipped, 0);
   memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
   memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
   for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
@@ -1943,6 +1976,8 @@ EdrError edr_pmfe_init(void) {
 #endif
   s_shutdown = 0;
   s_task_head = s_task_tail = s_task_count = 0;
+  __atomic_store_n(&s_stat_deduped, 0ul, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_stat_cooldown_skipped, 0ul, __ATOMIC_RELAXED);
   memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
   memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
   for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
@@ -2138,6 +2173,11 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
     return -1;
   }
   EnterCriticalSection(&s_q_mu);
+  if (pmfe_task_pending_equiv_locked(src)) {
+    LeaveCriticalSection(&s_q_mu);
+    pmfe_stat_inc_deduped();
+    return 1;
+  }
   while (s_task_count >= PMFE_TASK_CAP && !s_shutdown) {
     SleepConditionVariableCS(&s_q_nonfull, &s_q_mu, 2000);
   }
@@ -2157,6 +2197,11 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
     return -1;
   }
   pthread_mutex_lock(&s_q_mu);
+  if (pmfe_task_pending_equiv_locked(src)) {
+    pthread_mutex_unlock(&s_q_mu);
+    pmfe_stat_inc_deduped();
+    return 1;
+  }
   while (s_task_count >= PMFE_TASK_CAP && !s_shutdown) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -2230,6 +2275,7 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
     }
   }
   if (!pmfe_etw_cooldown_pass(pid, cd_ms)) {
+    pmfe_stat_inc_cooldown_skipped();
     return 1;
   }
   EdrPmfeScanPriority pr = edr_pmfe_compute_priority(pid);
@@ -2259,6 +2305,12 @@ int edr_pmfe_submit_etw_scan(const char *reason, uint32_t pid) {
 }
 
 void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_completed, unsigned long *out_dropped) {
+  edr_pmfe_get_extended_stats(out_submitted, out_completed, out_dropped, NULL, NULL);
+}
+
+void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *out_completed,
+                                 unsigned long *out_dropped, unsigned long *out_deduped,
+                                 unsigned long *out_cooldown_skipped) {
 #ifdef _WIN32
   if (out_submitted) {
     *out_submitted = (unsigned long)(ULONG_PTR)s_stat_submitted;
@@ -2269,6 +2321,12 @@ void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_complet
   if (out_dropped) {
     *out_dropped = (unsigned long)(ULONG_PTR)s_stat_dropped;
   }
+  if (out_deduped) {
+    *out_deduped = (unsigned long)(ULONG_PTR)s_stat_deduped;
+  }
+  if (out_cooldown_skipped) {
+    *out_cooldown_skipped = (unsigned long)(ULONG_PTR)s_stat_cooldown_skipped;
+  }
 #else
   if (out_submitted) {
     *out_submitted = s_stat_submitted;
@@ -2278,6 +2336,12 @@ void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_complet
   }
   if (out_dropped) {
     *out_dropped = s_stat_dropped;
+  }
+  if (out_deduped) {
+    *out_deduped = s_stat_deduped;
+  }
+  if (out_cooldown_skipped) {
+    *out_cooldown_skipped = s_stat_cooldown_skipped;
   }
 #endif
 }

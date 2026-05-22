@@ -190,6 +190,4 @@ CMakeFiles/edr_agent.dir/src/preprocess/encrypt_p0_rules.c.o: \
   /opt/homebrew/include/openssl/obj_mac.h \
   /opt/homebrew/include/openssl/asn1.h \
   /opt/homebrew/include/openssl/asn1err.h \
-  /opt/homebrew/include/openssl/objectserr.h \
-  /opt/homebrew/include/openssl/hmac.h \
-  /opt/homebrew/include/openssl/sha.h
+  /opt/homebrew/include/openssl/objectserr.h

@@ -10,3 +10,5 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
 }
 
 void edr_webshell_detector_shutdown(void) {}
+
+unsigned int edr_webshell_detector_watch_count(void) { return 0u; }

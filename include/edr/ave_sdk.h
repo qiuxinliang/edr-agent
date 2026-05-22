@@ -232,7 +232,18 @@ typedef struct AVEBehaviorEvent {
   float webshell_score;
   float pmfe_confidence;
   float pmfe_dns_tunnel;
+  /** P1：轻量传感器富化信号，0=无/未知，>0 进入 behavior detection_context 与行为特征侧证据。 */
+  float script_content_score;
+  float tls_anomaly_score;
+  float ransom_counter_score;
   uint8_t pmfe_pe_found;
+  uint8_t script_block_present;
+  uint8_t amsi_content_present;
+  uint8_t ja3_anomaly;
+  uint8_t sni_anomaly;
+  uint8_t cert_anomaly;
+  uint8_t suspicious_extension_burst;
+  uint8_t shadow_copy_delete;
   /** 可选：预处理/缓存已算出的文件 SHA256（64 hex + `\\0`），供 `ioc_file_hash` 匹配 */
   char file_sha256_hex[65];
   /** §5.5 E 组 48–50：TIP/IOC 库在本事件上的命中（0/1）；由 `AVE_FillBehaviorEventIocHits` 或上游填写 */

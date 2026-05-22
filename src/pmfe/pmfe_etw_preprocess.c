@@ -1,5 +1,7 @@
-/* §21 PMFE：预处理阶段自动入队 — Windows：ETW shellcode；Linux：`EDR_PMFE_ETW_AUTO` + webshell 检测 */
+/* §21 PMFE：预处理阶段自动入队 — detection_trigger 决策后只扫描关键进程 */
 
+#include "edr/detection_trigger.h"
+#include "edr/forensic_trigger.h"
 #include "edr/pmfe.h"
 #include "edr/edr_log.h"
 
@@ -108,50 +110,44 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
   if (!slot || !br) {
     return;
   }
+  EdrDetectionDecision dec;
+  if (!edr_detection_trigger_evaluate(edr_pmfe_current_config(), slot, br, &dec) || !dec.recommend_pmfe) {
+    return;
+  }
+  edr_forensic_trigger_evaluate_detection(slot, br, dec.pmfe_reason, dec.pmfe_pid, dec.pmfe_priority);
 #if defined(__linux__) && !defined(_WIN32)
-  const char *en = getenv("EDR_PMFE_ETW_AUTO");
-  if (!en || en[0] != '1') {
+  if (dec.pmfe_pid == 0u || dec.pmfe_pid == (uint32_t)getpid()) {
     return;
   }
-  if (br->type != EDR_EVENT_WEBSHELL_DETECTED) {
-    return;
-  }
-  if (br->pid == 0u || br->pid == (uint32_t)getpid()) {
-    return;
-  }
-  EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
-  if (edr_pmfe_submit_etw_scan_ex("webshell", br->pid, band, 0) == 0) {
-    EDR_LOGV("[pmfe][pre] linux auto_queued webshell pid=%u band=%u\n", (unsigned)br->pid, (unsigned)band);
+  EdrPmfeTriggerBand band = dec.pmfe_priority == 0u ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  if (edr_pmfe_submit_etw_scan_ex(dec.pmfe_reason, dec.pmfe_pid, band, 0) == 0) {
+    EDR_LOGV("[pmfe][pre] linux auto_queued reason=%s pid=%u band=%u\n", dec.pmfe_reason,
+             (unsigned)dec.pmfe_pid, (unsigned)band);
   }
 #elif defined(_WIN32)
-  const char *en = getenv("EDR_PMFE_ETW_AUTO");
-  if (!en || en[0] != '1') {
-    return;
-  }
-  if (br->type != EDR_EVENT_PROTOCOL_SHELLCODE) {
-    return;
-  }
+  uint32_t target = dec.pmfe_pid;
+  double score = 0.0;
+  if (br->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
+    char score_s[40];
+    char dpt_s[24];
+    if (etw1_line_value(slot->data, slot->size, "score", score_s, sizeof(score_s)) != 0) {
+      return;
+    }
+    score = strtod(score_s, NULL);
+    double th = 0.65;
+    const char *ts = getenv("EDR_PMFE_ETW_SHELLCODE_SCORE");
+    if (ts && ts[0]) {
+      th = strtod(ts, NULL);
+    }
+    if (score < th) {
+      return;
+    }
 
-  char score_s[40];
-  char dpt_s[24];
-  if (etw1_line_value(slot->data, slot->size, "score", score_s, sizeof(score_s)) != 0) {
-    return;
-  }
-  double score = strtod(score_s, NULL);
-  double th = 0.65;
-  const char *ts = getenv("EDR_PMFE_ETW_SHELLCODE_SCORE");
-  if (ts && ts[0]) {
-    th = strtod(ts, NULL);
-  }
-  if (score < th) {
-    return;
-  }
-
-  uint32_t target = br->pid;
-  if (target == 0u && etw1_line_value(slot->data, slot->size, "dpt", dpt_s, sizeof(dpt_s)) == 0) {
-    unsigned long dpt = strtoul(dpt_s, NULL, 10);
-    if (dpt > 0ul && dpt <= 65535ul) {
-      target = pmfe_tcp_owner_for_local_port_v4((uint16_t)dpt);
+    if (target == 0u && etw1_line_value(slot->data, slot->size, "dpt", dpt_s, sizeof(dpt_s)) == 0) {
+      unsigned long dpt = strtoul(dpt_s, NULL, 10);
+      if (dpt > 0ul && dpt <= 65535ul) {
+        target = pmfe_tcp_owner_for_local_port_v4((uint16_t)dpt);
+      }
     }
   }
 
@@ -168,15 +164,14 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
     hint_va = strtoull(va_s, NULL, 0);
   }
 
-  EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  EdrPmfeTriggerBand band = dec.pmfe_priority == 0u ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
 
-  if (edr_pmfe_submit_etw_scan_ex("shellcode", target, band, hint_va) == 0) {
-    EDR_LOGV("[pmfe][etw] auto_queued shellcode score=%.4f target_pid=%u band=%u hint=0x%llx\n", score,
-            (unsigned)target, (unsigned)band, (unsigned long long)hint_va);
+  if (edr_pmfe_submit_etw_scan_ex(dec.pmfe_reason, target, band, hint_va) == 0) {
+    EDR_LOGV("[pmfe][etw] auto_queued reason=%s score=%.4f target_pid=%u band=%u hint=0x%llx\n",
+            dec.pmfe_reason, score, (unsigned)target, (unsigned)band, (unsigned long long)hint_va);
   }
 #else
   (void)slot;
   (void)br;
 #endif
 }
-

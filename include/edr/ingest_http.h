@@ -8,19 +8,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * POST /ingest/heartbeat 轻量心跳；用于在没有事件/攻击面上报时维持端点在线状态。
  * 成功返回 0（HTTP 2xx），否则 -1。
  */
 int edr_ingest_http_post_heartbeat(void);
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+struct EdrConfig;
+int edr_ingest_http_post_engine_health(const struct EdrConfig *cfg);
 
 /** 在 edr_transport_init_from_config 中调用；rest_base 形如 http://127.0.0.1:8080/api/v1 */
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version);
+
+/** Agent 成功应用远程策略后设置；随后续 `/ingest/heartbeat` 上报到 endpoints.policy_version。 */
+void edr_ingest_http_set_policy_version(const char *policy_version);
+void edr_ingest_http_copy_policy_version(char *out, size_t cap);
 
 int edr_ingest_http_configured(void);
 

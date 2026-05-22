@@ -1,0 +1,158 @@
+# 手动触发：编译全部 vcpkg 依赖 → 归档为 .7z → 发布到 GitHub Release 作为预编译包。
+# 后续 CI build/release workflow 在缓存未命中时会从 GitHub Release 下载预编译包，跳过源码编译。
+
+name: Build Pre-built vcpkg Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+  VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
+
+jobs:
+  prebuild:
+    name: Prebuild vcpkg dependencies → GitHub Release
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Compute vcpkg.json hash (for release tag)
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash
+          $short = $hash.Substring(0, 12)
+          Write-Host "vcpkg.json SHA256: $hash"
+          Write-Host "Short hash: $short"
+          "VCPKG_JSON_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_JSON_SHORT=$short" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PREBUILD_RELEASE_TAG=prebuild-x64-windows-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prepare cache directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
+
+      - name: Clone and bootstrap vcpkg
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          }
+          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: vcpkg install (source build)
+        working-directory: ${{ github.workspace }}
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
+          $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
+          $env:VCPKG_ROOT = $vroot
+          $env:Path = $vroot + ";" + $env:Path
+          $tc = Join-Path $vroot "vcpkg.exe"
+          if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
+          Write-Host "[Prebuild] Installing vcpkg packages from source..."
+          & $tc install --keep-going
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          Write-Host "[Prebuild] vcpkg install completed successfully"
+
+      - name: Archive vcpkg_installed (7z)
+        shell: pwsh
+        run: |
+          $archive = "vcpkg-installed-x64-windows.7z"
+          $size_before = (Get-ChildItem -Path "vcpkg_installed" -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          Write-Host "vcpkg_installed size before compression: $([math]::Round($size_before / 1MB, 1)) MB"
+          7z a -mx=9 -mmt=on $archive "vcpkg_installed\"
+          if ($LASTEXITCODE -ne 0) { throw "7z archive failed" }
+          $size_after = (Get-Item $archive).Length
+          Write-Host "Archive size: $([math]::Round($size_after / 1MB, 1)) MB"
+          "PREBUILD_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PREBUILD_ARCHIVE_SIZE=$size_after" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create/Update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:PREBUILD_RELEASE_TAG
+          $archive = $env:PREBUILD_ARCHIVE
+          # Delete existing release + tag if present
+          try {
+            gh release delete $tag --yes --cleanup-tag 2>$null
+            Write-Host "Deleted existing release: $tag"
+          } catch {
+            Write-Host "No existing release $tag to delete (OK)"
+          }
+          # Recreate
+          $now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss UTC')
+          $notes = @"
+          vcpkg.json SHA256: $env:VCPKG_JSON_SHA256
+          Platform: x64-windows
+          Created: $now
+          Packages: cjson, curl, grpc, protobuf, openssl, yara, pcre2, sqlite3
+          "@
+          gh release create $tag $archive `
+            --title "Pre-built vcpkg packages (x64-windows)" `
+            --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          Write-Host "Release created: $tag"
+          "PREBUILD_RELEASE_CREATED_AT=$now" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Update manifest.json
+        shell: pwsh
+        run: |
+          $manifest = @{
+            platform = "x64-windows"
+            packages = @("cjson", "curl", "grpc", "protobuf", "openssl", "yara", "pcre2", "sqlite3")
+            latest_prebuild = @{
+              vcpkg_json_sha256 = $env:VCPKG_JSON_SHA256
+              release_tag = $env:PREBUILD_RELEASE_TAG
+              archive = "vcpkg-installed-x64-windows.7z"
+              size_bytes = [long]$env:PREBUILD_ARCHIVE_SIZE
+              created_at = $env:PREBUILD_RELEASE_CREATED_AT
+              status = "available"
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Out-File -FilePath "pre-build-packages/manifest.json" -Encoding utf8 -Force
+          Write-Host "manifest.json updated"
+
+      - name: Commit and push manifest.json
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pre-build-packages/manifest.json
+          $diff = git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "ci: update pre-build manifest ($env:PREBUILD_RELEASE_TAG)"
+            git push
+            Write-Host "manifest.json pushed"
+          } else {
+            Write-Host "manifest.json unchanged, skip push"
+          }
+
+      - name: "[Prebuild] Summary"
+        shell: pwsh
+        run: |
+          Write-Host "========================================"
+          Write-Host "Pre-built packages published:"
+          Write-Host "  Release tag : $env:PREBUILD_RELEASE_TAG"
+          Write-Host "  vcpkg hash  : $env:VCPKG_JSON_SHA256"
+          Write-Host "  Archive size: $([math]::Round([long]$env:PREBUILD_ARCHIVE_SIZE / 1MB, 1)) MB"
+          Write-Host "========================================"

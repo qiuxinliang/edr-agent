@@ -39,9 +39,13 @@ typedef struct {
   char trigger_mitre[EDR_FT_MAX_MITRE_TRIGGERS][16];
   uint32_t mitre_trigger_count;
   bool trigger_on_p0;
+  bool trigger_on_detection;
   bool collect_process_tree;
   bool collect_network_state;
   bool collect_autoruns;
+  uint32_t collector_timeout_s;
+  char collector_output_dir[512];
+  char collector_upload_url[512];
 } EdrForensicAutoConfig;
 
 void edr_forensic_trigger_init(const EdrForensicAutoConfig *cfg);
@@ -54,6 +58,17 @@ void edr_forensic_trigger_shutdown(void);
  */
 void edr_forensic_trigger_evaluate(const EdrEventSlot *slot,
                                    const EdrBehaviorRecord *rec);
+
+/**
+ * 由 detection_trigger/PMFE 选择器触发的低成本取证。
+ * 用于 LOLBin 远程载荷、shellcode、webshell 等关键告警，默认 QUICK scope，
+ * 避免把每个告警升级为全量采集或整机 dump。
+ */
+void edr_forensic_trigger_evaluate_detection(const EdrEventSlot *slot,
+                                             const EdrBehaviorRecord *rec,
+                                             const char *reason,
+                                             uint32_t target_pid,
+                                             uint32_t priority);
 
 /**
  * 出队取证触发任务。返回 true 表示弹出成功。

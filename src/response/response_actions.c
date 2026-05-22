@@ -106,17 +106,10 @@ void edr_response_kill(const char *cmd_id, const uint8_t *pl, size_t len, const 
 
 /* ── Host Actions ── */
 
-void edr_response_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
-  if (!edr_command_dangerous_enabled()) {
-    edr_cmd_inc_rejected();
-    edr_command_audit_both(cmd_id, "reject isolate: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
-    return;
-  }
-  char path[512];
+static void response_isolate_stamp_path(const char *cmd_id, char *path, size_t cap) {
   const char *stamp = getenv("EDR_ISOLATE_STAMP_PATH");
   if (stamp && stamp[0]) {
-    snprintf(path, sizeof(path), "%s", stamp);
+    snprintf(path, cap, "%s", stamp);
   } else {
 #ifdef _WIN32
     const char *tmp = getenv("TEMP");
@@ -126,13 +119,24 @@ void edr_response_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     if (!tmp || !tmp[0]) {
       tmp = ".";
     }
-    snprintf(path, sizeof(path), "%s\\edr_isolated_%s", tmp,
+    snprintf(path, cap, "%s\\edr_isolated_%s", tmp,
              (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
 #else
-    snprintf(path, sizeof(path), "/tmp/edr_isolated_%s",
+    snprintf(path, cap, "/tmp/edr_isolated_%s",
              (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
 #endif
   }
+}
+
+void edr_response_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
+  if (!edr_command_dangerous_enabled()) {
+    edr_cmd_inc_rejected();
+    edr_command_audit_both(cmd_id, "reject isolate: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[512];
+  response_isolate_stamp_path(cmd_id, path, sizeof(path));
   FILE *f = fopen(path, "w");
   if (f) {
     (void)fwrite("1", 1, 1, f);
@@ -160,6 +164,45 @@ void edr_response_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     }
   }
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "isolate ok");
+}
+
+void edr_response_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
+  if (!edr_command_dangerous_enabled()) {
+    edr_cmd_inc_rejected();
+    edr_command_audit_both(cmd_id, "reject restore_host: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+
+  const char *hook = getenv("EDR_RESTORE_HOOK");
+  if (!hook || !hook[0]) {
+    hook = getenv("EDR_ISOLATE_RESTORE_HOOK");
+  }
+  if (hook && hook[0]) {
+#ifndef _WIN32
+    (void)setenv("EDR_CMD_ID", cmd_id ? cmd_id : "", 1);
+#endif
+    int r = response_run_hook_no_shell(hook);
+    if (r != 0) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "restore_host: 恢复 hook 执行失败（仅支持无 shell 参数）");
+      edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "restore hook non-zero");
+      return;
+    }
+    edr_command_audit_both(cmd_id, "restore_host: 恢复 hook 执行成功");
+  }
+
+  char path[512];
+  response_isolate_stamp_path(cmd_id, path, sizeof(path));
+  if (remove(path) == 0 || errno == ENOENT) {
+    edr_cmd_inc_exec_ok();
+    edr_command_audit_both(cmd_id, "restore_host: 已清理隔离标记");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "restore_host ok");
+    return;
+  }
+  edr_cmd_inc_exec_fail();
+  edr_command_audit_both(cmd_id, "restore_host: 清理隔离标记失败");
+  edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "stamp remove failed");
 }
 
 void edr_response_isolate_auto_from_shellcode(void) {

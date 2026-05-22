@@ -17,6 +17,7 @@ struct EdrEventBus;
  */
 EdrError edr_shellcode_detector_init(const struct EdrConfig *cfg, struct EdrEventBus *bus);
 void edr_shellcode_detector_shutdown(void);
+int edr_shellcode_detector_active(void);
 
 /** Shannon 熵（bit/byte），供 Layer 3 与单测使用 */
 double edr_shellcode_shannon_entropy_bits(const uint8_t *data, size_t len);

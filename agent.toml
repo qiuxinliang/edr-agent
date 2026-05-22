@@ -119,11 +119,11 @@ max_upload_size_mb       = 10
 [detection]
 # Agent 启动时探测环境（端口/服务）并按策略自动启用引擎
 auto_profile = true
-# shellcode 检测: 0=关 1=开（默认 0）
+# shellcode 检测: 0=强制关 1=强制开 -1=自适应（保守探测）
 shellcode_mode = 0
-# webshell 检测: 0=关 1=开（默认 0）
+# webshell 检测: 0=强制关 1=强制开 -1=自适应（Web 根目录/IIS 配置探测）
 webshell_mode = 0
-# PMFE 内存取证: 0=关 1=仅空闲扫描 (默认 0)
+# PMFE 内存取证: 0=强制关 1=仅空闲扫描 2=空闲+关键告警触发 -1=自适应关键告警触发
 pmfe_mode = 0
 
 # =========================
@@ -141,3 +141,23 @@ idle_scan_max_procs = 8
 idle_cpu_threshold = 15.0
 # 笔记本电池模式跳过
 idle_skip_on_battery = true
+
+# =========================
+# [forensic_auto] 取证自动触发策略
+# 默认关闭；由运维中心策略下发后启用。
+# =========================
+[forensic_auto]
+enabled = false
+cooldown_s = 30
+max_per_hour = 20
+max_concurrent = 2
+per_mitre_cooldown_s = 300
+trigger_on_p0 = true
+trigger_on_detection = true
+collect_process_tree = true
+collect_network_state = true
+collect_autoruns = true
+collector_timeout_s = 300
+collector_output_dir = ""
+collector_upload_url = ""
+trigger_on_mitre = ["T1059", "T1547", "T1543", "T1003"]

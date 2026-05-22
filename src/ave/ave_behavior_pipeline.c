@@ -7,6 +7,7 @@
 #include "edr/behavior_alert_emit.h"
 #include "edr/ave_behavior_features.h"
 #include "edr/ave_behavior_gates.h"
+#include "edr/ingest_http.h"
 #include "edr/pid_history.h"
 
 #include "ave_lf_mpmc.h"
@@ -44,6 +45,151 @@ static void bp_reset_metrics(void) {
   atomic_store_explicit(&s_bp_queue_full_fallback, 0u, memory_order_relaxed);
   atomic_store_explicit(&s_bp_feed_sync_bypass, 0u, memory_order_relaxed);
   atomic_store_explicit(&s_bp_worker_dequeued, 0u, memory_order_relaxed);
+}
+
+static int bp_str_has_ci(const char *hay, const char *needle);
+
+static void json_escape_copy(const char *src, char *dst, size_t cap) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  size_t j = 0u;
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+  for (size_t i = 0u; src[i] && j + 1u < cap; i++) {
+    unsigned char c = (unsigned char)src[i];
+    if ((c == '"' || c == '\\') && j + 2u < cap) {
+      dst[j++] = '\\';
+      dst[j++] = (char)c;
+    } else if (c == '\n' && j + 2u < cap) {
+      dst[j++] = '\\';
+      dst[j++] = 'n';
+    } else if (c == '\r' && j + 2u < cap) {
+      dst[j++] = '\\';
+      dst[j++] = 'r';
+    } else if (c == '\t' && j + 2u < cap) {
+      dst[j++] = '\\';
+      dst[j++] = 't';
+    } else if (c >= 0x20u) {
+      dst[j++] = (char)c;
+    }
+  }
+  dst[j] = '\0';
+}
+
+static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_type, uint32_t parent_pid,
+                                       const char *target_path, const char *file_sha256, const char *remote_ip,
+                                       const char *remote_domain, uint16_t remote_port, float shellcode_score,
+                                       float webshell_score, float pmfe_confidence, float pmfe_dns_tunnel,
+                                       uint8_t pmfe_pe_found, uint8_t ioc_ip_hit, uint8_t ioc_domain_hit,
+                                       uint8_t ioc_sha256_hit, float script_content_score, float tls_anomaly_score,
+                                       float ransom_counter_score, uint8_t script_block_present,
+                                       uint8_t amsi_content_present, uint8_t ja3_anomaly, uint8_t sni_anomaly,
+                                       uint8_t cert_anomaly, uint8_t suspicious_extension_burst,
+                                       uint8_t shadow_copy_delete) {
+  if (!al) {
+    return;
+  }
+  const char *engine = "ave";
+  const char *rule_id = "behavior_anomaly";
+  const char *forensics = "[\"process_tree\",\"timeline_window\",\"targeted_files\",\"pmfe_scan\"]";
+  if (event_type == AVE_EVT_PMFE_RESULT) {
+    engine = "pmfe";
+    rule_id = "pmfe_signal";
+  } else if (event_type == AVE_EVT_SHELLCODE_SIGNAL) {
+    engine = "shellcode";
+    rule_id = "shellcode_signal";
+    forensics = "[\"process_tree\",\"timeline_window\",\"pmfe_scan\",\"single_process_minidump_if_needed\"]";
+  } else if (event_type == AVE_EVT_WEBSHELL_SIGNAL) {
+    engine = "webshell";
+    rule_id = "webshell_signal";
+    forensics = "[\"timeline_window\",\"targeted_files\",\"process_tree\"]";
+  }
+
+  char proc_name[256], proc_path[512], target_path_esc[512], file_sha_esc[80], remote_ip_esc[64], remote_domain_esc[300];
+  char policy_ver[64], policy_esc[96];
+  json_escape_copy(al->process_name, proc_name, sizeof(proc_name));
+  json_escape_copy(al->process_path, proc_path, sizeof(proc_path));
+  json_escape_copy(target_path, target_path_esc, sizeof(target_path_esc));
+  json_escape_copy(file_sha256, file_sha_esc, sizeof(file_sha_esc));
+  json_escape_copy(remote_ip, remote_ip_esc, sizeof(remote_ip_esc));
+  json_escape_copy(remote_domain, remote_domain_esc, sizeof(remote_domain_esc));
+  edr_ingest_http_copy_policy_version(policy_ver, sizeof(policy_ver));
+  json_escape_copy(policy_ver, policy_esc, sizeof(policy_esc));
+
+  char network[512] = "";
+  if (remote_ip_esc[0] || remote_domain_esc[0] || remote_port != 0u) {
+    snprintf(network, sizeof(network),
+             ",\"network\":{\"remote_ip\":\"%s\",\"remote_url\":\"%s\",\"dst_port\":%u}",
+             remote_ip_esc, remote_domain_esc, (unsigned)remote_port);
+  }
+  char file[720] = "";
+  if (target_path_esc[0] || file_sha_esc[0]) {
+    snprintf(file, sizeof(file),
+             ",\"file\":{\"path\":\"%s\",\"sha256\":\"%s\",\"signed\":false,"
+             "\"signature_status\":\"unknown\"}",
+             target_path_esc, file_sha_esc);
+  }
+  char policy[180] = "";
+  if (policy_esc[0]) {
+    snprintf(policy, sizeof(policy), ",\"policy_version\":\"%s\"", policy_esc);
+  }
+
+  snprintf(al->user_subject_json, sizeof(al->user_subject_json),
+           "{\"subject_type\":\"detection_context\",\"detection_context\":{\"engine\":\"%s\","
+           "\"rule_id\":\"%s\",\"confidence\":%.3f,\"process\":{\"pid\":%u,\"name\":\"%s\","
+           "\"path\":\"%s\",\"parent_pid\":%u}%s%s%s,"
+           "\"engine_signals\":{\"shellcode_score\":%.3f,\"webshell_score\":%.3f,"
+           "\"pmfe_confidence\":%.3f,\"pmfe_dns_tunnel\":%.3f,\"pmfe_pe_found\":%s,"
+           "\"script_content_score\":%.3f,\"tls_anomaly_score\":%.3f,\"ransom_counter_score\":%.3f,"
+           "\"script_block_present\":%s,\"amsi_content_present\":%s,\"ja3_anomaly\":%s,"
+           "\"sni_anomaly\":%s,\"cert_anomaly\":%s,\"suspicious_extension_burst\":%s,"
+           "\"shadow_copy_delete\":%s,\"ioc_ip_hit\":%s,\"ioc_domain_hit\":%s,\"ioc_sha256_hit\":%s},"
+           "\"suppression\":{\"applied\":false,\"policy_version\":\"%s\"},"
+           "\"recommended_forensics\":%s}}",
+           engine, rule_id, (double)al->anomaly_score, (unsigned)al->pid, proc_name, proc_path,
+           (unsigned)parent_pid, file, network, policy, (double)shellcode_score, (double)webshell_score,
+           (double)pmfe_confidence, (double)pmfe_dns_tunnel, pmfe_pe_found ? "true" : "false",
+           (double)script_content_score, (double)tls_anomaly_score, (double)ransom_counter_score,
+           script_block_present ? "true" : "false", amsi_content_present ? "true" : "false",
+           ja3_anomaly ? "true" : "false", sni_anomaly ? "true" : "false", cert_anomaly ? "true" : "false",
+           suspicious_extension_burst ? "true" : "false", shadow_copy_delete ? "true" : "false",
+           ioc_ip_hit ? "true" : "false", ioc_domain_hit ? "true" : "false", ioc_sha256_hit ? "true" : "false",
+           policy_esc, forensics);
+}
+
+static int bp_path_has_ransom_ext(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  const char *exts[] = {".locked", ".lockbit", ".encrypted", ".crypt", ".crypted", ".conti", ".ryuk",
+                        ".blackcat", ".akira", ".8base", ".mallox", ".medusa", NULL};
+  for (const char **p = exts; *p; ++p) {
+    if (bp_str_has_ci(path, *p)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static float bp_ransom_counter_score(const EdrPidHistory *sl, const AVEBehaviorEvent *e) {
+  float s = e ? e->ransom_counter_score : 0.f;
+  if (!sl || !e) {
+    return s;
+  }
+  if (e->event_type == AVE_EVT_FILE_WRITE) {
+    if (sl->file_write_count >= 200u) s += 0.40f;
+    else if (sl->file_write_count >= 80u) s += 0.25f;
+    else if (sl->file_write_count >= 30u) s += 0.12f;
+    if (bp_path_has_ransom_ext(e->target_path)) s += 0.35f;
+  }
+  if ((e->behavior_flags & AVE_BEH_SHADOW_COPY_DELETE) || e->shadow_copy_delete) {
+    s += 0.35f;
+  }
+  if (s > 1.f) s = 1.f;
+  return s;
 }
 
 /**
@@ -647,6 +793,21 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   if (e->pmfe_confidence > 0.75f) {
     sl->pmfe_high_value = 1u;
   }
+  {
+    float sig_bump = 0.f;
+    if (e->script_content_score > 0.65f || e->script_block_present || e->amsi_content_present) {
+      sig_bump += 0.06f;
+    }
+    if (e->tls_anomaly_score > 0.60f || e->ja3_anomaly || e->sni_anomaly || e->cert_anomaly) {
+      sig_bump += 0.06f;
+    }
+    if (bp_ransom_counter_score(sl, e) > 0.55f) {
+      sig_bump += 0.10f;
+    }
+    if (sig_bump > 0.f) {
+      sl->anomaly = fminf(1.0f, sl->anomaly + sig_bump);
+    }
+  }
 
   if ((e->event_type == AVE_EVT_NET_CONNECT || e->event_type == AVE_EVT_NET_DNS) && e->target_ip[0]) {
     bp_ip_add(sl, e->target_ip);
@@ -769,6 +930,8 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   float an_copy = sl->anomaly;
   uint32_t fl_copy = sl->flags;
   uint32_t pid_copy = e->pid;
+  uint32_t ppid_copy = e->ppid;
+  AVEEventType evt_copy = e->event_type;
   AVEBehaviorCallback cb = s_callbacks.on_behavior_alert;
   void *ud = s_callbacks.user_data;
   float tactic_copy[14];
@@ -776,7 +939,33 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   char sl_proc_name[256];
   memcpy(sl_proc_name, sl->process_name, sizeof(sl_proc_name));
   char ev_tgt_path[1024];
-  memcpy(ev_tgt_path, e->target_path, sizeof(ev_tgt_path));
+  snprintf(ev_tgt_path, sizeof(ev_tgt_path), "%s", e->target_path);
+  char ev_file_sha[80];
+  snprintf(ev_file_sha, sizeof(ev_file_sha), "%s", e->file_sha256_hex);
+  char ev_tgt_ip[64];
+  snprintf(ev_tgt_ip, sizeof(ev_tgt_ip), "%s", e->target_ip);
+  char ev_tgt_domain[300];
+  snprintf(ev_tgt_domain, sizeof(ev_tgt_domain), "%s", e->target_domain);
+  uint16_t ev_tgt_port = e->target_port;
+  float ev_shellcode_score = e->shellcode_score;
+  float ev_webshell_score = e->webshell_score;
+  float ev_pmfe_confidence = e->pmfe_confidence;
+  float ev_pmfe_dns_tunnel = e->pmfe_dns_tunnel;
+  float ev_script_content_score = e->script_content_score;
+  float ev_tls_anomaly_score = e->tls_anomaly_score;
+  float ev_ransom_counter_score = bp_ransom_counter_score(sl, e);
+  uint8_t ev_pmfe_pe_found = e->pmfe_pe_found;
+  uint8_t ev_script_block_present = e->script_block_present;
+  uint8_t ev_amsi_content_present = e->amsi_content_present;
+  uint8_t ev_ja3_anomaly = e->ja3_anomaly;
+  uint8_t ev_sni_anomaly = e->sni_anomaly;
+  uint8_t ev_cert_anomaly = (uint8_t)(e->cert_anomaly || e->cert_revoked_ancestor);
+  uint8_t ev_suspicious_extension_burst =
+      (uint8_t)(e->suspicious_extension_burst || (e->event_type == AVE_EVT_FILE_WRITE && bp_path_has_ransom_ext(e->target_path)));
+  uint8_t ev_shadow_copy_delete = (uint8_t)(e->shadow_copy_delete || ((e->behavior_flags & AVE_BEH_SHADOW_COPY_DELETE) != 0u));
+  uint8_t ev_ioc_ip_hit = e->ioc_ip_hit;
+  uint8_t ev_ioc_domain_hit = e->ioc_domain_hit;
+  uint8_t ev_ioc_sha256_hit = e->ioc_sha256_hit;
   unlock_bp();
 
   if (fire && cb) {
@@ -819,6 +1008,15 @@ static void process_one_event(const AVEBehaviorEvent *e) {
           memcpy(al.user_subject_json, ujs, n + 1u);
         }
       }
+    }
+    if (!al.user_subject_json[0]) {
+      ave_fill_detection_context(&al, evt_copy, ppid_copy, ev_tgt_path, ev_file_sha, ev_tgt_ip, ev_tgt_domain,
+                                 ev_tgt_port, ev_shellcode_score, ev_webshell_score, ev_pmfe_confidence,
+                                 ev_pmfe_dns_tunnel, ev_pmfe_pe_found, ev_ioc_ip_hit, ev_ioc_domain_hit,
+                                 ev_ioc_sha256_hit, ev_script_content_score, ev_tls_anomaly_score,
+                                 ev_ransom_counter_score, ev_script_block_present, ev_amsi_content_present,
+                                 ev_ja3_anomaly, ev_sni_anomaly, ev_cert_anomaly, ev_suspicious_extension_burst,
+                                 ev_shadow_copy_delete);
     }
     edr_behavior_alert_emit_to_batch(&al);
     cb(&al, ud);

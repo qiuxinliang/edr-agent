@@ -1,8 +1,7 @@
-edr_p0_golden 5 0.00047185
-edr_agent_help 2 0.208205
-edr_dedup_golden 2 0.000683521
-edr_p0_perf 0 0
-test_event_bus_mpmc_stress 1 0.60616
-edr_p0_ir_record_golden 1 0.370835
+detection_profile_trigger 11 0.000553246
+edr_agent_help 10 0.337578
+edr_p0_golden 10 0.000441375
+test_event_bus_mpmc_stress 10 0.0252386
+edr_p0_ir_record_golden 10 0.000562062
+forensic_trigger 10 0.000504871
 ---
-edr_p0_perf

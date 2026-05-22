@@ -92,6 +92,7 @@ static uint64_t s_last_idle_time;
 static int s_idle_ticks;
 static int s_busy_ticks;
 
+#ifdef _WIN32
 static const char *g_system_services[] = {
   "svchost.exe", "lsass.exe",   "spoolsv.exe", "services.exe",
   "winlogon.exe", "csrss.exe",  "dwm.exe",     "taskhostw.exe",
@@ -112,6 +113,7 @@ static int is_system_service(const char *name) {
   }
   return 0;
 }
+#endif
 
 #ifdef _WIN32
 static int build_tcp_pid_set(uint8_t *pid_set, size_t pid_set_cap) {

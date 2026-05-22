@@ -14,6 +14,7 @@ void edr_response_kill(const char *cmd_id, const uint8_t *pl, size_t len,
                        const EdrSoarCommandMeta *sm);
 
 void edr_response_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm);
+void edr_response_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm);
 void edr_response_isolate_auto_from_shellcode(void);
 
 void edr_response_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len,

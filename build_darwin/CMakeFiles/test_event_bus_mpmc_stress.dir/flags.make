@@ -6,7 +6,5 @@ C_DEFINES =
 
 C_INCLUDES = -I"/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/include"
 
-C_FLAGSarm64 = -g -std=gnu11 -arch arm64 -march=native -mtune=native -Wall -Wextra -Wno-unused-parameter
-
-C_FLAGS = -g -std=gnu11 -arch arm64 -march=native -mtune=native -Wall -Wextra -Wno-unused-parameter
+C_FLAGS = -g -std=gnu11 -march=native -mtune=native -Wall -Wextra -Wno-unused-parameter
 

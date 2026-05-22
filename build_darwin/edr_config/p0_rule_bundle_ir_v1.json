@@ -18,7 +18,7 @@
       "description": "powershell/pwsh 命令行包含 -enc/-encodedcommand/frombase64string",
       "condition": {
         "command_regex_any": [
-          "(?i)\\-(e|enc|encoded|encodedcommand)\\b",
+          "(?i)\\-(enc|encodedcommand)\\b",
           "(?i)frombase64string"
         ],
         "process_name_in": [

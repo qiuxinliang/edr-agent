@@ -1,4 +1,5 @@
 #include "edr/config.h"
+#include "edr/detection_profile.h"
 #include "edr/shell_exec.h"
 
 #include <stdio.h>
@@ -1692,9 +1693,13 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->forensic_auto.mitre_trigger_count = 0u;
   (void)memset(cfg->forensic_auto.trigger_mitre, 0, sizeof(cfg->forensic_auto.trigger_mitre));
   cfg->forensic_auto.trigger_on_p0 = true;
+  cfg->forensic_auto.trigger_on_detection = true;
   cfg->forensic_auto.collect_process_tree = true;
   cfg->forensic_auto.collect_network_state = true;
   cfg->forensic_auto.collect_autoruns = true;
+  cfg->forensic_auto.collector_timeout_s = 300u;
+  cfg->forensic_auto.collector_output_dir[0] = '\0';
+  cfg->forensic_auto.collector_upload_url[0] = '\0';
 
   cfg->shell.max_sessions = 3u;
   cfg->shell.session_timeout_s = 600u;
@@ -1823,6 +1828,10 @@ static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
     if (d.ok) { cfg->forensic_auto.trigger_on_p0 = d.u.b ? true : false; }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "trigger_on_detection");
+    if (d.ok) { cfg->forensic_auto.trigger_on_detection = d.u.b ? true : false; }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "collect_process_tree");
     if (d.ok) { cfg->forensic_auto.collect_process_tree = d.u.b ? true : false; }
   }
@@ -1834,6 +1843,16 @@ static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_bool_in(t, "collect_autoruns");
     if (d.ok) { cfg->forensic_auto.collect_autoruns = d.u.b ? true : false; }
   }
+  {
+    toml_datum_t d = toml_int_in(t, "collector_timeout_s");
+    if (d.ok && d.u.i >= 30 && d.u.i <= 3600) { cfg->forensic_auto.collector_timeout_s = (uint32_t)d.u.i; }
+  }
+  take_string(toml_string_in(t, "collector_output_dir"),
+              cfg->forensic_auto.collector_output_dir,
+              sizeof(cfg->forensic_auto.collector_output_dir));
+  take_string(toml_string_in(t, "collector_upload_url"),
+              cfg->forensic_auto.collector_upload_url,
+              sizeof(cfg->forensic_auto.collector_upload_url));
   {
     toml_array_t *arr = toml_array_in(t, "trigger_on_mitre");
     if (arr) {
@@ -2427,6 +2446,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 #ifdef _WIN32
   edr_config_win_fixup_model_dir_from_unix_example(cfg);
 #endif
+  edr_detection_apply_profile(cfg);
   edr_config_clamp(cfg);
   edr_config_log_semantic_warnings(cfg);
 #ifdef _WIN32

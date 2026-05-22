@@ -51,6 +51,7 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #include "edr/edr_log.h"
 
 #include "ave_onnx_infer.h"
+#include "toml.h"
 
 #ifdef EDR_HAVE_LIBCURL
 #include <curl/curl.h>
@@ -74,9 +75,83 @@ struct EdrAgent {
   uint64_t asurf_last_pending_check_ns;
 };
 
+static void edr_agent_forensic_output_dir(const EdrConfig *cfg, char *out, size_t cap) {
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  const char *env = getenv("EDR_FORENSIC_OUTPUT_DIR");
+  if (env && env[0]) {
+    snprintf(out, cap, "%s", env);
+  } else if (cfg && cfg->forensic_auto.collector_output_dir[0]) {
+    snprintf(out, cap, "%s", cfg->forensic_auto.collector_output_dir);
+  } else {
+#ifdef _WIN32
+    const char *pd = getenv("ProgramData");
+    snprintf(out, cap, "%s\\EDR\\forensic", pd && pd[0] ? pd : "C:\\ProgramData");
+#else
+    snprintf(out, cap, "%s", "/tmp/edr_forensic");
+#endif
+  }
+}
+
+static void edr_agent_forensic_upload_url(const EdrConfig *cfg, char *out, size_t cap) {
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  const char *env = getenv("EDR_FORENSIC_UPLOAD_URL");
+  if (env && env[0]) {
+    snprintf(out, cap, "%s", env);
+    return;
+  }
+  if (cfg && cfg->forensic_auto.collector_upload_url[0]) {
+    snprintf(out, cap, "%s", cfg->forensic_auto.collector_upload_url);
+    return;
+  }
+  const char *base = cfg ? cfg->platform.rest_base_url : "";
+  if (base && base[0]) {
+    size_t n = strlen(base);
+    snprintf(out, cap, "%s%singest/upload-file", base, (n > 0 && base[n - 1] == '/') ? "" : "/");
+  }
+}
+
+static void edr_agent_poll_forensic_triggers(EdrAgent *agent) {
+  if (!agent) return;
+
+  (void)edr_deep_collector_poll(NULL, NULL, 0);
+
+  EdrForensicTrigger trigger;
+  while (edr_forensic_trigger_try_pop(&trigger)) {
+    if (edr_deep_collector_is_running()) {
+      fprintf(stderr, "[forensic_trigger] skipped: collector busy reason=%s pid=%u scope=%d\n",
+              trigger.reason, trigger.target_pid, (int)trigger.scope);
+      continue;
+    }
+
+    char output_dir[1024];
+    char upload_url[1024];
+    edr_agent_forensic_output_dir(&agent->cfg, output_dir, sizeof(output_dir));
+    edr_agent_forensic_upload_url(&agent->cfg, upload_url, sizeof(upload_url));
+
+    const char *scope = trigger.scope == EDR_FT_SCOPE_FULL ? "full" : "quick";
+    EdrDeepCollectorParams params;
+    memset(&params, 0, sizeof(params));
+    params.output_dir = output_dir;
+    params.upload_url = upload_url;
+    params.scope = scope;
+    params.timeout_s = agent->cfg.forensic_auto.collector_timeout_s > 0u
+                           ? agent->cfg.forensic_auto.collector_timeout_s
+                           : 300u;
+
+    int rc = edr_deep_collector_launch(&params);
+    fprintf(stderr,
+            "[forensic_trigger] launch rc=%d reason=%s pid=%u scope=%s out=%s upload=%s\n",
+            rc, trigger.reason, trigger.target_pid, scope, output_dir,
+            upload_url[0] ? upload_url : "-");
+  }
+}
+
 /** 0 = disabled; unset = use clamped server.keepalive_interval_s. */
 
 #define EDR_NET_HEARTBEAT_INTERVAL_S 30
+#define EDR_ENGINE_HEALTH_INTERVAL_S 60
 
 static int edr_agent_console_heartbeat_interval_s(const EdrAgent *agent) {
   const char *e = getenv("EDR_CONSOLE_HEARTBEAT_SEC");
@@ -206,6 +281,30 @@ static void edr_agent_print_console_heartbeat_line(const EdrAgent *agent) {
   }
 #endif
   fflush(stderr);
+}
+
+static int edr_agent_remote_toml_has_preprocess_rules(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    return 0;
+  }
+  char errbuf[200];
+  toml_table_t *root = toml_parse_file(f, errbuf, sizeof(errbuf));
+  fclose(f);
+  if (!root) {
+    return 0;
+  }
+  int has_rules = 0;
+  toml_table_t *pre = toml_table_in(root, "preprocessing");
+  if (pre) {
+    toml_array_t *rules = toml_array_in(pre, "rules");
+    has_rules = rules && toml_array_nelem(rules) > 0;
+  }
+  toml_free(root);
+  return has_rules;
 }
 
 EdrAgent *edr_agent_create(void) {
@@ -589,6 +688,8 @@ EdrError edr_agent_run(EdrAgent *agent) {
       int net_hb_sec = EDR_NET_HEARTBEAT_INTERVAL_S;
       uint64_t net_hb_period_ns = (uint64_t)net_hb_sec * 1000000000ULL;
       uint64_t last_net_hb_ns = edr_monotonic_ns();
+      uint64_t engine_health_period_ns = (uint64_t)EDR_ENGINE_HEALTH_INTERVAL_S * 1000000000ULL;
+      uint64_t last_engine_health_ns = 0;
       while (!agent->shutdown) {
         edr_ms_sleep(500u);
         if (hb_period_ns > 0) {
@@ -605,20 +706,20 @@ EdrError edr_agent_run(EdrAgent *agent) {
             last_net_hb_ns = now;
           }
         }
+        {
+          uint64_t now = edr_monotonic_ns();
+          if (last_engine_health_ns == 0 || now - last_engine_health_ns >= engine_health_period_ns) {
+            edr_ingest_http_post_engine_health(&agent->cfg);
+            last_engine_health_ns = now;
+          }
+        }
         edr_resource_poll();
         edr_self_protect_poll();
         edr_agent_poll_config_reload(agent, &last_reload_ns);
         edr_agent_poll_remote_config(agent, &last_remote_ns);
         edr_agent_poll_attack_surface(agent);
         edr_shell_session_poll();
-        edr_deep_collector_poll(NULL, NULL, 0);
-        {
-          EdrForensicTrigger trigger;
-          while (edr_forensic_trigger_try_pop(&trigger)) {
-            fprintf(stderr, "[forensic_trigger] drained: reason=%s pid=%u scope=%d\n",
-                    trigger.reason, trigger.target_pid, (int)trigger.scope);
-          }
-        }
+        edr_agent_poll_forensic_triggers(agent);
       }
       edr_collector_stop();
     }
@@ -705,6 +806,7 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns) {
   const char *url = getenv("EDR_REMOTE_CONFIG_URL");
   const char *ps = getenv("EDR_REMOTE_CONFIG_POLL_S");
+  static char s_remote_applied_version[64] = "";
   /* remote section in agent.toml takes precedence over env vars */
   if (agent && agent->cfg.remote.rules_url[0]) {
     url = agent->cfg.remote.rules_url;
@@ -742,17 +844,16 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     return;
   }
   /* 先检查版本号，若与本地相同则跳过下载 */
+  char remote_ver[64];
+  remote_ver[0] = '\0';
   {
-    char remote_ver[64];
     if (edr_remote_check_version(url, agent->cfg.agent.endpoint_id, agent->cfg.agent.tenant_id, agent->cfg.platform.rest_user_id, remote_ver, sizeof(remote_ver)) == 0) {
-      if (remote_ver[0] && agent->cfg.preprocessing.rules_version[0]) {
-        if (strcmp(remote_ver, agent->cfg.preprocessing.rules_version) == 0) {
-          fprintf(stderr, "[config] 远程规则版本未变 (%s), 跳过下载\n", remote_ver);
-          return;
-        }
+      if (remote_ver[0] && s_remote_applied_version[0] && strcmp(remote_ver, s_remote_applied_version) == 0) {
+        fprintf(stderr, "[config] 远程配置版本未变 (%s), 跳过下载\n", remote_ver);
+        return;
       }
-      fprintf(stderr, "[config] 远程规则版本已更新: local=%s remote=%s\n",
-              agent->cfg.preprocessing.rules_version[0] ? agent->cfg.preprocessing.rules_version : "(none)",
+      fprintf(stderr, "[config] 远程配置版本已更新: local=%s remote=%s\n",
+              s_remote_applied_version[0] ? s_remote_applied_version : "(none)",
               remote_ver);
     }
   }
@@ -804,6 +905,14 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     char platform_rest_base_url[512];
     char platform_rest_user_id[128];
     char platform_rest_bearer_token[512];
+    /* preprocessing: runtime policy may omit rules and only tune detection/forensic sections. */
+    uint32_t pre_dedup_window_s;
+    uint32_t pre_high_freq_threshold;
+    double pre_sampling_rate_whitelist;
+    char pre_rules_version[64];
+    EdrEmitRule *pre_rules;
+    uint32_t pre_rules_count;
+    int pre_rules_copy_ok;
   } saved;
   /* save server */
   memcpy(saved.srv_address, agent->cfg.server.address, sizeof(saved.srv_address));
@@ -840,6 +949,24 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   memcpy(saved.platform_rest_base_url, agent->cfg.platform.rest_base_url, sizeof(saved.platform_rest_base_url));
   memcpy(saved.platform_rest_user_id, agent->cfg.platform.rest_user_id, sizeof(saved.platform_rest_user_id));
   memcpy(saved.platform_rest_bearer_token, agent->cfg.platform.rest_bearer_token, sizeof(saved.platform_rest_bearer_token));
+  saved.pre_dedup_window_s = agent->cfg.preprocessing.dedup_window_s;
+  saved.pre_high_freq_threshold = agent->cfg.preprocessing.high_freq_threshold;
+  saved.pre_sampling_rate_whitelist = agent->cfg.preprocessing.sampling_rate_whitelist;
+  memcpy(saved.pre_rules_version, agent->cfg.preprocessing.rules_version, sizeof(saved.pre_rules_version));
+  saved.pre_rules = NULL;
+  saved.pre_rules_count = agent->cfg.preprocessing.rules_count;
+  saved.pre_rules_copy_ok = 1;
+  if (agent->cfg.preprocessing.rules && agent->cfg.preprocessing.rules_count > 0u) {
+    size_t bytes = (size_t)agent->cfg.preprocessing.rules_count * sizeof(EdrEmitRule);
+    saved.pre_rules = (EdrEmitRule *)malloc(bytes);
+    if (saved.pre_rules) {
+      memcpy(saved.pre_rules, agent->cfg.preprocessing.rules, bytes);
+    } else {
+      saved.pre_rules_copy_ok = 0;
+    }
+  }
+
+  int remote_has_preprocess_rules = edr_agent_remote_toml_has_preprocess_rules(tmp);
 
   EdrError ce = edr_config_load(tmp, &agent->cfg);
 
@@ -878,6 +1005,17 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   memcpy(agent->cfg.platform.rest_base_url, saved.platform_rest_base_url, sizeof(agent->cfg.platform.rest_base_url));
   memcpy(agent->cfg.platform.rest_user_id, saved.platform_rest_user_id, sizeof(agent->cfg.platform.rest_user_id));
   memcpy(agent->cfg.platform.rest_bearer_token, saved.platform_rest_bearer_token, sizeof(agent->cfg.platform.rest_bearer_token));
+  if (!remote_has_preprocess_rules && saved.pre_rules_copy_ok) {
+    free(agent->cfg.preprocessing.rules);
+    agent->cfg.preprocessing.rules = saved.pre_rules;
+    saved.pre_rules = NULL;
+    agent->cfg.preprocessing.rules_count = saved.pre_rules_count;
+    agent->cfg.preprocessing.dedup_window_s = saved.pre_dedup_window_s;
+    agent->cfg.preprocessing.high_freq_threshold = saved.pre_high_freq_threshold;
+    agent->cfg.preprocessing.sampling_rate_whitelist = saved.pre_sampling_rate_whitelist;
+    memcpy(agent->cfg.preprocessing.rules_version, saved.pre_rules_version, sizeof(agent->cfg.preprocessing.rules_version));
+  }
+  free(saved.pre_rules);
 
   char fp[80];
   edr_config_fingerprint(tmp, fp, sizeof(fp));
@@ -886,9 +1024,16 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     fprintf(stderr, "[config] 远程 TOML 解析失败: %d\n", (int)ce);
     return;
   }
+  if (remote_ver[0]) {
+    snprintf(s_remote_applied_version, sizeof(s_remote_applied_version), "%s", remote_ver);
+  } else if (fp[0]) {
+    snprintf(s_remote_applied_version, sizeof(s_remote_applied_version), "%s", fp);
+  }
+  edr_ingest_http_set_policy_version(s_remote_applied_version);
   edr_preprocess_apply_config(&agent->cfg);
   edr_resource_init(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
+  edr_forensic_trigger_init(&agent->cfg.forensic_auto);
   {
     const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
     if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&
@@ -930,6 +1075,14 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
           agent->cfg.pmfe.idle_scan_interval_min,
           agent->cfg.pmfe.idle_scan_max_procs,
           agent->cfg.pmfe.idle_cpu_threshold);
+  fprintf(stderr,
+          "[forensic_auto] enabled=%d p0=%d detection=%d cooldown=%us max_per_hour=%u timeout=%us\n",
+          agent->cfg.forensic_auto.enabled,
+          agent->cfg.forensic_auto.trigger_on_p0,
+          agent->cfg.forensic_auto.trigger_on_detection,
+          agent->cfg.forensic_auto.cooldown_s,
+          agent->cfg.forensic_auto.max_per_hour,
+          agent->cfg.forensic_auto.collector_timeout_s);
 
   /* Agent 自更新检查 (每个轮询周期执行一次，内部限频) */
   edr_agent_check_update(&agent->cfg);

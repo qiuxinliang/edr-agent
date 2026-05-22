@@ -44,6 +44,7 @@ void edr_pmfe_set_event_bus(struct EdrEventBus *bus);
 
 /** 供可选 `AVE_ScanFile` 候选落盘路径使用；在 `edr_pmfe_init` 之前调用一次即可。 */
 void edr_pmfe_bind_config(const struct EdrConfig *cfg);
+const struct EdrConfig *edr_pmfe_current_config(void);
 
 /**
  * Windows：刷新 TCP/UDP 监听聚合表（与 §19 共用 `edr_win_listen_collect_rows`）；Linux：`ss -ltnp` 聚合；其它 POSIX 空操作。
@@ -92,5 +93,8 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
 void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorRecord *br);
 
 void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_completed, unsigned long *out_dropped);
+void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *out_completed,
+                                 unsigned long *out_dropped, unsigned long *out_deduped,
+                                 unsigned long *out_cooldown_skipped);
 
 #endif

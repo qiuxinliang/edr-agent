@@ -244,6 +244,8 @@ set(EDR_AGENT_SOURCES
   src/core/event_bus.c
   src/core/time_util.c
   src/config/config.c
+  src/detection/detection_profile.c
+  src/detection/detection_trigger.c
   src/preprocess/behavior_record.c
   src/preprocess/process_chain_depth.c
   src/preprocess/behavior_from_slot.c
@@ -1705,6 +1707,23 @@ add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smo
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
 
 endif() # EDR_BUILD_TESTS
+
+add_executable(
+  test_detection_profile_trigger
+  tests/test_detection_profile_trigger.c
+  src/detection/detection_profile.c
+  src/detection/detection_trigger.c
+)
+target_include_directories(test_detection_profile_trigger PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME detection_profile_trigger COMMAND test_detection_profile_trigger WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(
+  test_forensic_trigger
+  tests/test_forensic_trigger.c
+  src/forensic/forensic_trigger.c
+)
+target_include_directories(test_forensic_trigger PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME forensic_trigger COMMAND test_forensic_trigger WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 if(EDR_ENABLE_IPO)
   include(CheckIPOSupported)

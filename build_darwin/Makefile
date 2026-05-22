@@ -140,19 +140,6 @@ edr_agent/fast:
 .PHONY : edr_agent/fast
 
 #=============================================================================
-# Target rules for targets named edr_monitor
-
-# Build rule for target.
-edr_monitor: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 edr_monitor
-.PHONY : edr_monitor
-
-# fast build rule for target.
-edr_monitor/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/build
-.PHONY : edr_monitor/fast
-
-#=============================================================================
 # Target rules for targets named edr_p0_golden_test
 
 # Build rule for target.
@@ -190,6 +177,32 @@ edr_p0_ir_record_golden_test: cmake_check_build_system
 edr_p0_ir_record_golden_test/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_p0_ir_record_golden_test.dir/build.make CMakeFiles/edr_p0_ir_record_golden_test.dir/build
 .PHONY : edr_p0_ir_record_golden_test/fast
+
+#=============================================================================
+# Target rules for targets named test_detection_profile_trigger
+
+# Build rule for target.
+test_detection_profile_trigger: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_detection_profile_trigger
+.PHONY : test_detection_profile_trigger
+
+# fast build rule for target.
+test_detection_profile_trigger/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/build
+.PHONY : test_detection_profile_trigger/fast
+
+#=============================================================================
+# Target rules for targets named test_forensic_trigger
+
+# Build rule for target.
+test_forensic_trigger: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_forensic_trigger
+.PHONY : test_forensic_trigger
+
+# fast build rule for target.
+test_forensic_trigger/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/build
+.PHONY : test_forensic_trigger/fast
 
 edr_p0_rule_ir_embed.o: edr_p0_rule_ir_embed.c.o
 .PHONY : edr_p0_rule_ir_embed.o
@@ -1040,6 +1053,60 @@ src/core/time_util.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/core/time_util.c.s
 .PHONY : src/core/time_util.c.s
 
+src/detection/detection_profile.o: src/detection/detection_profile.c.o
+.PHONY : src/detection/detection_profile.o
+
+# target to build an object file
+src/detection/detection_profile.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/detection/detection_profile.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/src/detection/detection_profile.c.o
+.PHONY : src/detection/detection_profile.c.o
+
+src/detection/detection_profile.i: src/detection/detection_profile.c.i
+.PHONY : src/detection/detection_profile.i
+
+# target to preprocess a source file
+src/detection/detection_profile.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/detection/detection_profile.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/src/detection/detection_profile.c.i
+.PHONY : src/detection/detection_profile.c.i
+
+src/detection/detection_profile.s: src/detection/detection_profile.c.s
+.PHONY : src/detection/detection_profile.s
+
+# target to generate assembly for a file
+src/detection/detection_profile.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/detection/detection_profile.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/src/detection/detection_profile.c.s
+.PHONY : src/detection/detection_profile.c.s
+
+src/detection/detection_trigger.o: src/detection/detection_trigger.c.o
+.PHONY : src/detection/detection_trigger.o
+
+# target to build an object file
+src/detection/detection_trigger.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/detection/detection_trigger.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/src/detection/detection_trigger.c.o
+.PHONY : src/detection/detection_trigger.c.o
+
+src/detection/detection_trigger.i: src/detection/detection_trigger.c.i
+.PHONY : src/detection/detection_trigger.i
+
+# target to preprocess a source file
+src/detection/detection_trigger.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/detection/detection_trigger.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/src/detection/detection_trigger.c.i
+.PHONY : src/detection/detection_trigger.c.i
+
+src/detection/detection_trigger.s: src/detection/detection_trigger.c.s
+.PHONY : src/detection/detection_trigger.s
+
+# target to generate assembly for a file
+src/detection/detection_trigger.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/detection/detection_trigger.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/src/detection/detection_trigger.c.s
+.PHONY : src/detection/detection_trigger.c.s
+
 src/fl_trainer/fl_b64.o: src/fl_trainer/fl_b64.c.o
 .PHONY : src/fl_trainer/fl_b64.o
 
@@ -1406,6 +1473,7 @@ src/forensic/forensic_trigger.o: src/forensic/forensic_trigger.c.o
 # target to build an object file
 src/forensic/forensic_trigger.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/forensic_trigger.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/src/forensic/forensic_trigger.c.o
 .PHONY : src/forensic/forensic_trigger.c.o
 
 src/forensic/forensic_trigger.i: src/forensic/forensic_trigger.c.i
@@ -1414,6 +1482,7 @@ src/forensic/forensic_trigger.i: src/forensic/forensic_trigger.c.i
 # target to preprocess a source file
 src/forensic/forensic_trigger.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/forensic_trigger.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/src/forensic/forensic_trigger.c.i
 .PHONY : src/forensic/forensic_trigger.c.i
 
 src/forensic/forensic_trigger.s: src/forensic/forensic_trigger.c.s
@@ -1422,6 +1491,7 @@ src/forensic/forensic_trigger.s: src/forensic/forensic_trigger.c.s
 # target to generate assembly for a file
 src/forensic/forensic_trigger.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/forensic/forensic_trigger.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/src/forensic/forensic_trigger.c.s
 .PHONY : src/forensic/forensic_trigger.c.s
 
 src/forensic/process_tree_cache.o: src/forensic/process_tree_cache.c.o
@@ -2024,6 +2094,78 @@ src/response/response_actions.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_actions.c.s
 .PHONY : src/response/response_actions.c.s
 
+src/response/response_file.o: src/response/response_file.c.o
+.PHONY : src/response/response_file.o
+
+# target to build an object file
+src/response/response_file.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_file.c.o
+.PHONY : src/response/response_file.c.o
+
+src/response/response_file.i: src/response/response_file.c.i
+.PHONY : src/response/response_file.i
+
+# target to preprocess a source file
+src/response/response_file.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_file.c.i
+.PHONY : src/response/response_file.c.i
+
+src/response/response_file.s: src/response/response_file.c.s
+.PHONY : src/response/response_file.s
+
+# target to generate assembly for a file
+src/response/response_file.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_file.c.s
+.PHONY : src/response/response_file.c.s
+
+src/response/response_forensic.o: src/response/response_forensic.c.o
+.PHONY : src/response/response_forensic.o
+
+# target to build an object file
+src/response/response_forensic.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_forensic.c.o
+.PHONY : src/response/response_forensic.c.o
+
+src/response/response_forensic.i: src/response/response_forensic.c.i
+.PHONY : src/response/response_forensic.i
+
+# target to preprocess a source file
+src/response/response_forensic.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_forensic.c.i
+.PHONY : src/response/response_forensic.c.i
+
+src/response/response_forensic.s: src/response/response_forensic.c.s
+.PHONY : src/response/response_forensic.s
+
+# target to generate assembly for a file
+src/response/response_forensic.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_forensic.c.s
+.PHONY : src/response/response_forensic.c.s
+
+src/response/response_utils.o: src/response/response_utils.c.o
+.PHONY : src/response/response_utils.o
+
+# target to build an object file
+src/response/response_utils.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_utils.c.o
+.PHONY : src/response/response_utils.c.o
+
+src/response/response_utils.i: src/response/response_utils.c.i
+.PHONY : src/response/response_utils.i
+
+# target to preprocess a source file
+src/response/response_utils.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_utils.c.i
+.PHONY : src/response/response_utils.c.i
+
+src/response/response_utils.s: src/response/response_utils.c.s
+.PHONY : src/response/response_utils.s
+
+# target to generate assembly for a file
+src/response/response_utils.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/response/response_utils.c.s
+.PHONY : src/response/response_utils.c.s
+
 src/self_protect/self_protect.o: src/self_protect/self_protect.c.o
 .PHONY : src/self_protect/self_protect.o
 
@@ -2456,6 +2598,30 @@ src/webshell_detector/webshell_forensic.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/src/webshell_detector/webshell_forensic.c.s
 .PHONY : src/webshell_detector/webshell_forensic.c.s
 
+tests/test_detection_profile_trigger.o: tests/test_detection_profile_trigger.c.o
+.PHONY : tests/test_detection_profile_trigger.o
+
+# target to build an object file
+tests/test_detection_profile_trigger.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/tests/test_detection_profile_trigger.c.o
+.PHONY : tests/test_detection_profile_trigger.c.o
+
+tests/test_detection_profile_trigger.i: tests/test_detection_profile_trigger.c.i
+.PHONY : tests/test_detection_profile_trigger.i
+
+# target to preprocess a source file
+tests/test_detection_profile_trigger.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/tests/test_detection_profile_trigger.c.i
+.PHONY : tests/test_detection_profile_trigger.c.i
+
+tests/test_detection_profile_trigger.s: tests/test_detection_profile_trigger.c.s
+.PHONY : tests/test_detection_profile_trigger.s
+
+# target to generate assembly for a file
+tests/test_detection_profile_trigger.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_detection_profile_trigger.dir/build.make CMakeFiles/test_detection_profile_trigger.dir/tests/test_detection_profile_trigger.c.s
+.PHONY : tests/test_detection_profile_trigger.c.s
+
 tests/test_event_bus_mpmc_stress.o: tests/test_event_bus_mpmc_stress.c.o
 .PHONY : tests/test_event_bus_mpmc_stress.o
 
@@ -2479,6 +2645,30 @@ tests/test_event_bus_mpmc_stress.s: tests/test_event_bus_mpmc_stress.c.s
 tests/test_event_bus_mpmc_stress.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_event_bus_mpmc_stress.dir/build.make CMakeFiles/test_event_bus_mpmc_stress.dir/tests/test_event_bus_mpmc_stress.c.s
 .PHONY : tests/test_event_bus_mpmc_stress.c.s
+
+tests/test_forensic_trigger.o: tests/test_forensic_trigger.c.o
+.PHONY : tests/test_forensic_trigger.o
+
+# target to build an object file
+tests/test_forensic_trigger.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/tests/test_forensic_trigger.c.o
+.PHONY : tests/test_forensic_trigger.c.o
+
+tests/test_forensic_trigger.i: tests/test_forensic_trigger.c.i
+.PHONY : tests/test_forensic_trigger.i
+
+# target to preprocess a source file
+tests/test_forensic_trigger.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/tests/test_forensic_trigger.c.i
+.PHONY : tests/test_forensic_trigger.c.i
+
+tests/test_forensic_trigger.s: tests/test_forensic_trigger.c.s
+.PHONY : tests/test_forensic_trigger.s
+
+# target to generate assembly for a file
+tests/test_forensic_trigger.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_forensic_trigger.dir/build.make CMakeFiles/test_forensic_trigger.dir/tests/test_forensic_trigger.c.s
+.PHONY : tests/test_forensic_trigger.c.s
 
 third_party/cjson/cJSON.o: third_party/cjson/cJSON.c.o
 .PHONY : third_party/cjson/cJSON.o
@@ -2612,7 +2802,6 @@ third_party/tomlc99/toml.o: third_party/tomlc99/toml.c.o
 # target to build an object file
 third_party/tomlc99/toml.c.o:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/third_party/tomlc99/toml.c.o
 .PHONY : third_party/tomlc99/toml.c.o
 
 third_party/tomlc99/toml.i: third_party/tomlc99/toml.c.i
@@ -2621,7 +2810,6 @@ third_party/tomlc99/toml.i: third_party/tomlc99/toml.c.i
 # target to preprocess a source file
 third_party/tomlc99/toml.c.i:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/third_party/tomlc99/toml.c.i
 .PHONY : third_party/tomlc99/toml.c.i
 
 third_party/tomlc99/toml.s: third_party/tomlc99/toml.c.s
@@ -2630,32 +2818,7 @@ third_party/tomlc99/toml.s: third_party/tomlc99/toml.c.s
 # target to generate assembly for a file
 third_party/tomlc99/toml.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_agent.dir/build.make CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/third_party/tomlc99/toml.c.s
 .PHONY : third_party/tomlc99/toml.c.s
-
-tools/edr_monitor.o: tools/edr_monitor.c.o
-.PHONY : tools/edr_monitor.o
-
-# target to build an object file
-tools/edr_monitor.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/tools/edr_monitor.c.o
-.PHONY : tools/edr_monitor.c.o
-
-tools/edr_monitor.i: tools/edr_monitor.c.i
-.PHONY : tools/edr_monitor.i
-
-# target to preprocess a source file
-tools/edr_monitor.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/tools/edr_monitor.c.i
-.PHONY : tools/edr_monitor.c.i
-
-tools/edr_monitor.s: tools/edr_monitor.c.s
-.PHONY : tools/edr_monitor.s
-
-# target to generate assembly for a file
-tools/edr_monitor.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/edr_monitor.dir/build.make CMakeFiles/edr_monitor.dir/tools/edr_monitor.c.s
-.PHONY : tools/edr_monitor.c.s
 
 # Help Target
 help:
@@ -2667,10 +2830,11 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... edr_agent"
-	@echo "... edr_monitor"
 	@echo "... edr_p0_golden_test"
 	@echo "... edr_p0_ir_record_golden_test"
+	@echo "... test_detection_profile_trigger"
 	@echo "... test_event_bus_mpmc_stress"
+	@echo "... test_forensic_trigger"
 	@echo "... edr_p0_rule_ir_embed.o"
 	@echo "... edr_p0_rule_ir_embed.i"
 	@echo "... edr_p0_rule_ir_embed.s"
@@ -2776,6 +2940,12 @@ help:
 	@echo "... src/core/time_util.o"
 	@echo "... src/core/time_util.i"
 	@echo "... src/core/time_util.s"
+	@echo "... src/detection/detection_profile.o"
+	@echo "... src/detection/detection_profile.i"
+	@echo "... src/detection/detection_profile.s"
+	@echo "... src/detection/detection_trigger.o"
+	@echo "... src/detection/detection_trigger.i"
+	@echo "... src/detection/detection_trigger.s"
 	@echo "... src/fl_trainer/fl_b64.o"
 	@echo "... src/fl_trainer/fl_b64.i"
 	@echo "... src/fl_trainer/fl_b64.s"
@@ -2896,6 +3066,15 @@ help:
 	@echo "... src/response/response_actions.o"
 	@echo "... src/response/response_actions.i"
 	@echo "... src/response/response_actions.s"
+	@echo "... src/response/response_file.o"
+	@echo "... src/response/response_file.i"
+	@echo "... src/response/response_file.s"
+	@echo "... src/response/response_forensic.o"
+	@echo "... src/response/response_forensic.i"
+	@echo "... src/response/response_forensic.s"
+	@echo "... src/response/response_utils.o"
+	@echo "... src/response/response_utils.i"
+	@echo "... src/response/response_utils.s"
 	@echo "... src/self_protect/self_protect.o"
 	@echo "... src/self_protect/self_protect.i"
 	@echo "... src/self_protect/self_protect.s"
@@ -2950,9 +3129,15 @@ help:
 	@echo "... src/webshell_detector/webshell_forensic.o"
 	@echo "... src/webshell_detector/webshell_forensic.i"
 	@echo "... src/webshell_detector/webshell_forensic.s"
+	@echo "... tests/test_detection_profile_trigger.o"
+	@echo "... tests/test_detection_profile_trigger.i"
+	@echo "... tests/test_detection_profile_trigger.s"
 	@echo "... tests/test_event_bus_mpmc_stress.o"
 	@echo "... tests/test_event_bus_mpmc_stress.i"
 	@echo "... tests/test_event_bus_mpmc_stress.s"
+	@echo "... tests/test_forensic_trigger.o"
+	@echo "... tests/test_forensic_trigger.i"
+	@echo "... tests/test_forensic_trigger.s"
 	@echo "... third_party/cjson/cJSON.o"
 	@echo "... third_party/cjson/cJSON.i"
 	@echo "... third_party/cjson/cJSON.s"
@@ -2971,9 +3156,6 @@ help:
 	@echo "... third_party/tomlc99/toml.o"
 	@echo "... third_party/tomlc99/toml.i"
 	@echo "... third_party/tomlc99/toml.s"
-	@echo "... tools/edr_monitor.o"
-	@echo "... tools/edr_monitor.i"
-	@echo "... tools/edr_monitor.s"
 .PHONY : help
 
 

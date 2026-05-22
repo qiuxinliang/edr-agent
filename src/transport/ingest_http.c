@@ -1,8 +1,13 @@
 #include "edr/ingest_http.h"
 
 #include "edr/command.h"
+#include "edr/ave_sdk.h"
+#include "edr/config.h"
 #include "edr/edr_log.h"
 #include "edr/grpc_client.h"
+#include "edr/pmfe.h"
+#include "edr/shellcode_detector.h"
+#include "edr/webshell_detector.h"
 
 /* CMake：EDR_NO_GRPC_CLIENT=1 时必须 EDR_HAVE_LIBCURL=1，否则不生成此翻译单元。 */
 #if defined(EDR_NO_GRPC_CLIENT) && !defined(EDR_HAVE_LIBCURL)
@@ -175,6 +180,7 @@ static char s_user[128];
 static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
+static char s_policy_ver[64];
 
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                const char *bearer, const char *endpoint_id, const char *agent_version) {
@@ -184,6 +190,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   memset(s_bearer, 0, sizeof(s_bearer));
   memset(s_endpoint, 0, sizeof(s_endpoint));
   memset(s_agent_ver, 0, sizeof(s_agent_ver));
+  memset(s_policy_ver, 0, sizeof(s_policy_ver));
   if (rest_base && rest_base[0]) {
     snprintf(s_rest, sizeof(s_rest), "%s", rest_base);
   }
@@ -203,6 +210,23 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
     snprintf(s_agent_ver, sizeof(s_agent_ver), "%s", agent_version);
   } else {
     snprintf(s_agent_ver, sizeof(s_agent_ver), "%s", EDR_AGENT_VERSION_STRING);
+  }
+}
+
+void edr_ingest_http_set_policy_version(const char *policy_version) {
+  memset(s_policy_ver, 0, sizeof(s_policy_ver));
+  if (policy_version && policy_version[0]) {
+    snprintf(s_policy_ver, sizeof(s_policy_ver), "%s", policy_version);
+  }
+}
+
+void edr_ingest_http_copy_policy_version(char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (s_policy_ver[0]) {
+    snprintf(out, cap, "%s", s_policy_ver);
   }
 }
 
@@ -669,12 +693,122 @@ int edr_ingest_http_post_heartbeat(void) {
   if (!edr_ingest_http_configured()) {
     return -1;
   }
-  char body[256];
-  int n = snprintf(body, sizeof(body), "{\"endpoint_id\":\"%s\"}", s_endpoint);
+  char body[420];
+  int n = snprintf(body, sizeof(body),
+                   "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\"}",
+                   s_endpoint, s_agent_ver, s_policy_ver);
   if (n < 0 || (size_t)n >= sizeof(body)) {
     return -1;
   }
   return ingest_post_json_relpath("ingest/heartbeat", body, "heartbeat");
+}
+
+static const char *pmfe_mode_name(const EdrConfig *cfg) {
+  if (!cfg) {
+    return "unknown";
+  }
+  if (cfg->detection.pmfe_mode == 2) {
+    return "alert_trigger_idle";
+  }
+  if (cfg->detection.pmfe_mode == 1 || cfg->pmfe.idle_scan_enabled) {
+    return "idle";
+  }
+  if (cfg->detection.pmfe_mode < 0) {
+    return "adaptive";
+  }
+  return "disabled";
+}
+
+static const char *adaptive_mode_name(int mode, int enabled) {
+  if (mode > 0) {
+    return "enabled";
+  }
+  if (mode < 0) {
+    return enabled ? "adaptive" : "adaptive_off";
+  }
+  return enabled ? "enabled" : "disabled";
+}
+
+int edr_ingest_http_post_engine_health(const EdrConfig *cfg) {
+  if (!cfg || !edr_ingest_http_configured()) {
+    return -1;
+  }
+  AVEStatus avst;
+  memset(&avst, 0, sizeof(avst));
+  (void)AVE_GetStatus(&avst);
+  unsigned long pmfe_sub = 0, pmfe_done = 0, pmfe_drop = 0, pmfe_dedup = 0, pmfe_cd = 0;
+  edr_pmfe_get_extended_stats(&pmfe_sub, &pmfe_done, &pmfe_drop, &pmfe_dedup, &pmfe_cd);
+  unsigned long pmfe_depth = pmfe_sub > pmfe_done ? pmfe_sub - pmfe_done : 0;
+  int shellcode_active = edr_shellcode_detector_active();
+  unsigned int webshell_watches = edr_webshell_detector_watch_count();
+  int webshell_enabled = cfg->webshell_detector.enabled || webshell_watches > 0u;
+  int shellcode_enabled = cfg->shellcode_detector.enabled || shellcode_active;
+  int pmfe_enabled = cfg->detection.pmfe_mode != 0 || cfg->pmfe.idle_scan_enabled || pmfe_depth > 0ul;
+  const char *p0_rules = cfg->preprocessing.rules_version[0] ? cfg->preprocessing.rules_version : "unknown";
+  const char *policy = s_policy_ver[0] ? s_policy_ver : "";
+
+  char ep[260], agv[140], pol[140], p0[160], static_mv[80], behavior_mv[80], ioc_rv[80], wl_rv[80], cert_rv[80];
+  if (!json_escape_to_buf(s_endpoint, ep, sizeof(ep)) || !json_escape_to_buf(s_agent_ver, agv, sizeof(agv)) ||
+      !json_escape_to_buf(policy, pol, sizeof(pol)) || !json_escape_to_buf(p0_rules, p0, sizeof(p0)) ||
+      !json_escape_to_buf(avst.static_model_version, static_mv, sizeof(static_mv)) ||
+      !json_escape_to_buf(avst.behavior_model_version, behavior_mv, sizeof(behavior_mv)) ||
+      !json_escape_to_buf(avst.ioc_rules_version, ioc_rv, sizeof(ioc_rv)) ||
+      !json_escape_to_buf(avst.whitelist_version, wl_rv, sizeof(wl_rv)) ||
+      !json_escape_to_buf(avst.cert_whitelist_version, cert_rv, sizeof(cert_rv))) {
+    return -1;
+  }
+
+  char health[4096];
+  int hn = snprintf(
+      health, sizeof(health),
+      "{\"schema\":\"agent_engine_health_v1\",\"reported_at_ms\":%" PRId64
+      ",\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
+      "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u},"
+      "\"p0_rule\":{\"enabled\":true,\"mode\":\"always_on\",\"rule_version\":\"%s\"},"
+      "\"ave\":{\"enabled\":%s,\"mode\":\"%s\",\"static_model_version\":\"%s\","
+      "\"behavior_model_version\":\"%s\",\"model_version\":\"%s\",\"rule_version\":\"%s\","
+      "\"whitelist_version\":\"%s\",\"cert_whitelist_version\":\"%s\",\"queue_depth\":%d,"
+      "\"queue_capacity\":%u,\"infer_ok\":%" PRIu64 ",\"infer_fail\":%" PRIu64 "},"
+      "\"pmfe\":{\"enabled\":%s,\"mode\":\"%s\",\"queue_depth\":%lu,\"submitted\":%lu,"
+      "\"completed\":%lu,\"dropped\":%lu,\"deduped\":%lu,\"cooldown_skipped\":%lu},"
+      "\"shellcode\":{\"enabled\":%s,\"active\":%s,\"mode\":\"%s\",\"rule_version\":\"%s\","
+      "\"watch_count\":%zu,\"ports_custom\":%s},"
+      "\"webshell\":{\"enabled\":%s,\"mode\":\"%s\",\"rule_version\":\"%s\",\"watch_count\":%u,"
+      "\"max_watch_dirs\":%u}}",
+      edr_ingest_wall_time_ms(), ep, agv, pol, (unsigned)cfg->resource_limit.cpu_limit_percent,
+      (unsigned)cfg->resource_limit.memory_limit_mb, p0, avst.initialized ? "true" : "false",
+      cfg->ave.enabled ? "enabled" : "disabled", static_mv, behavior_mv,
+      behavior_mv[0] ? behavior_mv : static_mv, ioc_rv, wl_rv, cert_rv, avst.behavior_event_queue_size,
+      (unsigned)avst.behavior_queue_capacity, (uint64_t)avst.behavior_infer_ok,
+      (uint64_t)avst.behavior_infer_fail, pmfe_enabled ? "true" : "false", pmfe_mode_name(cfg), pmfe_depth,
+      pmfe_sub, pmfe_done, pmfe_drop, pmfe_dedup, pmfe_cd, shellcode_enabled ? "true" : "false", shellcode_active ? "true" : "false",
+      adaptive_mode_name(cfg->detection.shellcode_mode, shellcode_enabled),
+      cfg->shellcode_detector.yara_rules_dir[0] ? "yara_configured" : "builtin",
+      cfg->shellcode_detector.windivert_tcp_ports_parsed_count,
+      cfg->shellcode_detector.windivert_ports_is_custom ? "true" : "false",
+      webshell_enabled ? "true" : "false", adaptive_mode_name(cfg->detection.webshell_mode, webshell_enabled),
+      cfg->webshell_detector.webshell_rules_dir[0] ? "yara_configured" : "builtin", webshell_watches,
+      (unsigned)cfg->webshell_detector.max_watch_dirs);
+  if (hn < 0 || (size_t)hn >= sizeof(health)) {
+    return -1;
+  }
+
+  size_t cap = (size_t)hn + 512u;
+  char *body = (char *)malloc(cap);
+  if (!body) {
+    return -1;
+  }
+  int bn = snprintf(body, cap,
+                    "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
+                    "\"engine_health\":%s}",
+                    ep, agv, pol, health);
+  if (bn < 0 || (size_t)bn >= cap) {
+    free(body);
+    return -1;
+  }
+  int rc = ingest_post_json_relpath("ingest/engine-health", body, "engine-health");
+  free(body);
+  return rc;
 }
 
 /* --- HTTP poll-commands 与 upload-file，与 gRPC 对等，见 /api/v1/ingest/... --- */

@@ -780,3 +780,7 @@ void edr_webshell_detector_shutdown(void) {
   unload_yara();
 #endif
 }
+
+unsigned int edr_webshell_detector_watch_count(void) {
+  return (unsigned int)s_watch_count;
+}

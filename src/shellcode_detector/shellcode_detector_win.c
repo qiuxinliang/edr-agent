@@ -41,3 +41,5 @@ void edr_shellcode_detector_shutdown(void) {
   edr_windivert_capture_stop();
   s_active = 0;
 }
+
+int edr_shellcode_detector_active(void) { return s_active ? 1 : 0; }
