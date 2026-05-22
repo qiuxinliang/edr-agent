@@ -27,6 +27,10 @@ typedef struct {
 
 void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out);
 
+/** 缓存/读取当前策略版本，供行为告警补齐 policy_version 字段。 */
+void edr_ingest_http_set_policy_version(const char *policy_version);
+void edr_ingest_http_copy_policy_version(char *out, size_t out_cap);
+
 /**
  * 发送一批（12B BAT1/BLZ4 头 + payload）；成功返回 0。
  * JSON 体字段与平台 PostReportEvents 一致。
@@ -36,5 +40,9 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
 
 /** 发送 Agent 引擎运行态 JSON；body 需为完整 JSON 对象。 */
 int edr_ingest_http_post_engine_health_json(const char *body_json);
+
+/** HTTP command long-poll hooks. Current lightweight build keeps these as safe no-ops. */
+void edr_ingest_http_start_command_poll(void);
+void edr_ingest_http_stop_command_poll(void);
 
 #endif

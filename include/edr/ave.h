@@ -19,10 +19,7 @@ void edr_ave_infer_cache_clear(void);
 /** 最近一次 init 时模型目录扫描结果（供 gRPC ave_status 指令） */
 void edr_ave_get_scan_counts(int *out_model_files, int *out_non_dir_files, int *out_ready_flag);
 
-/**
- * 读取文件前 256 字节的 FNV-1a 指纹写入 out_hex（cap≥17）。
- * 返回 0 成功，-1 失败。
- */
+/** 读取文件 SHA256 指纹；缓冲区小于 65 字节时写入偶数字节 hex 前缀（cap≥17）。返回 0 成功，-1 失败。 */
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap);
 
 /** 单文件推理结果（在线检测扩展点） */

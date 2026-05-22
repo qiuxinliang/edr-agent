@@ -319,6 +319,12 @@ static void take_string(toml_datum_t d, char *dst, size_t cap) {
 
 static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "address"), cfg->server.address, sizeof(cfg->server.address));
+  {
+    toml_datum_t d = toml_bool_in(t, "grpc_insecure");
+    if (d.ok) {
+      cfg->server.grpc_insecure = d.u.b ? true : false;
+    }
+  }
   take_string(toml_string_in(t, "ca_cert"), cfg->server.ca_cert, sizeof(cfg->server.ca_cert));
   take_string(toml_string_in(t, "client_cert"), cfg->server.client_cert,
               sizeof(cfg->server.client_cert));
@@ -572,6 +578,12 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
 }
 
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->ave.enabled = d.u.b ? true : false;
+    }
+  }
   take_string(toml_string_in(t, "model_dir"), cfg->ave.model_dir, sizeof(cfg->ave.model_dir));
   {
     toml_datum_t d = toml_int_in(t, "scan_threads");
@@ -718,6 +730,36 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "emergency_cpu_limit");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->resource_limit.emergency_cpu_limit = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "ave_infer_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.ave_infer_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "pmfe_scans_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.pmfe_scans_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "webshell_scan_mb_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.webshell_scan_mb_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "shellcode_packets_per_sec");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.shellcode_packets_per_sec = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "low_priority_keep_percent_under_pressure");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 100) {
+      cfg->resource_limit.low_priority_keep_percent_under_pressure = (uint32_t)d.u.i;
     }
   }
 }
@@ -1263,6 +1305,7 @@ void edr_config_free_heap(EdrConfig *cfg) {
 void edr_config_apply_defaults(EdrConfig *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   snprintf(cfg->server.address, sizeof(cfg->server.address), "%s", "127.0.0.1:50051");
+  cfg->server.grpc_insecure = false;
   cfg->server.connect_timeout_s = 10;
   cfg->server.keepalive_interval_s = 30;
 
@@ -1289,6 +1332,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
+  cfg->ave.enabled = true;
   cfg->ave.scan_threads = 2;
   cfg->ave.max_file_size_mb = 256;
   snprintf(cfg->ave.sensitivity, sizeof(cfg->ave.sensitivity), "%s", "MEDIUM");
@@ -1326,6 +1370,11 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
   cfg->resource_limit.emergency_cpu_limit = 5u;
+  cfg->resource_limit.ave_infer_per_min = 120u;
+  cfg->resource_limit.pmfe_scans_per_min = 3u;
+  cfg->resource_limit.webshell_scan_mb_per_min = 64u;
+  cfg->resource_limit.shellcode_packets_per_sec = 2000u;
+  cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
 
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s", "/var/log/edr");

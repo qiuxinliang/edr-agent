@@ -443,7 +443,7 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
   s_cert = read_pem_file(cfg->server.client_cert);
   s_key = read_pem_file(cfg->server.client_key);
   const char *insec = std::getenv("EDR_GRPC_INSECURE");
-  s_insecure = (insec && insec[0] == '1');
+  s_insecure = cfg->server.grpc_insecure || (insec && insec[0] == '1');
   s_max_upload_mbps = cfg->upload.max_upload_mbps;
   (void)grpc_client_connect_locked(target);
 }

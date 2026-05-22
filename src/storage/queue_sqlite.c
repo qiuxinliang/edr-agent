@@ -150,7 +150,7 @@ static void cleanup_expired_rows(void) {
 static int drain_one_row(void) {
   sqlite3_stmt *st = NULL;
   const char *sql = "SELECT id, batch_id, payload, retry_count FROM event_queue WHERE status='pending' "
-                    "ORDER BY id ASC LIMIT 1;";
+                    "ORDER BY severity DESC, id ASC LIMIT 1;";
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     return 1;
   }
@@ -234,6 +234,7 @@ EdrError edr_storage_queue_open(const char *path) {
       "payload BLOB NOT NULL,"
       "created_at INTEGER NOT NULL,"
       "compressed INTEGER NOT NULL DEFAULT 0,"
+      "severity INTEGER NOT NULL DEFAULT 0,"
       "retry_count INTEGER NOT NULL DEFAULT 0,"
       "status TEXT NOT NULL DEFAULT 'pending'"
       ");"
@@ -244,6 +245,7 @@ EdrError edr_storage_queue_open(const char *path) {
     s_db = NULL;
     return EDR_ERR_SQLITE_WRITE;
   }
+  (void)exec_simple(s_db, "ALTER TABLE event_queue ADD COLUMN severity INTEGER NOT NULL DEFAULT 0;");
 
   sqlite3_stmt *st = NULL;
   const char *cnt = "SELECT COUNT(*) FROM event_queue WHERE status='pending';";
@@ -267,7 +269,7 @@ void edr_storage_queue_close(void) {
 int edr_storage_queue_is_open(void) { return s_db ? 1 : 0; }
 
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
-                                   size_t payload_len, int compressed) {
+                                   size_t payload_len, int compressed, int severity) {
   if (!s_db || !batch_id || !payload || payload_len == 0) {
     return EDR_ERR_INVALID_ARG;
   }
@@ -291,8 +293,8 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
 
   sqlite3_stmt *st = NULL;
   const char *ins =
-      "INSERT INTO event_queue(batch_id,payload,created_at,compressed,status) "
-      "VALUES(?,?,?,?,'pending');";
+      "INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,status) "
+      "VALUES(?,?,?,?,?,'pending');";
   if (sqlite3_prepare_v2(s_db, ins, -1, &st, NULL) != SQLITE_OK) {
     return EDR_ERR_SQLITE_WRITE;
   }
@@ -302,6 +304,7 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
   sqlite3_bind_blob(st, 2, payload, (int)payload_len, SQLITE_TRANSIENT);
   sqlite3_bind_int64(st, 3, (sqlite3_int64)now);
   sqlite3_bind_int(st, 4, compressed ? 1 : 0);
+  sqlite3_bind_int(st, 5, severity > 0 ? 1 : 0);
 
   int rc = sqlite3_step(st);
   sqlite3_finalize(st);
@@ -357,11 +360,12 @@ EdrError edr_storage_queue_open(const char *path) {
 void edr_storage_queue_close(void) {}
 
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
-                                   size_t payload_len, int compressed) {
+                                   size_t payload_len, int compressed, int severity) {
   (void)batch_id;
   (void)payload;
   (void)payload_len;
   (void)compressed;
+  (void)severity;
   return EDR_OK;
 }
 

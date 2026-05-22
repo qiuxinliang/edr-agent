@@ -3,13 +3,29 @@
   "version-string": "1.0.0",
   "description": "EDR Agent — C runtime with vcpkg manifest for Windows client build dependencies.",
   "dependencies": [
-    "cjson",
-    "curl",
-    "grpc",
-    "protobuf",
-    "openssl",
-    "yara",
-    "pcre2",
-    "sqlite3"
-  ]
+    "curl"
+  ],
+  "features": {
+    "grpc-client": {
+      "description": "Enable the real gRPC EventIngest client and proto regeneration toolchain.",
+      "dependencies": [
+        "grpc",
+        "protobuf",
+        "openssl"
+      ]
+    },
+    "sqlite": {
+      "description": "Enable SQLite-backed queues and AVE metadata tests.",
+      "dependencies": [
+        "sqlite3"
+      ]
+    },
+    "yara": {
+      "description": "Enable libyara-backed shellcode known-exploit rules.",
+      "dependencies": [
+        "yara",
+        "pcre2"
+      ]
+    }
+  }
 }

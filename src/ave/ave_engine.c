@@ -154,7 +154,7 @@ static int find_behavior_onnx_path(const char *dir, char *out, size_t cap) {
 }
 
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
-  if (!path || !path[0] || !out_hex || cap < 65u) {
+  if (!path || !path[0] || !out_hex || cap < 17u) {
     return -1;
   }
   FILE *f = fopen(path, "rb");
@@ -181,11 +181,13 @@ int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
   fclose(f);
   edr_sha256_final(&ctx, digest);
   static const char *hx = "0123456789abcdef";
-  for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; i++) {
+  size_t hex_chars = (cap - 1u < 64u) ? cap - 1u : 64u;
+  hex_chars -= hex_chars % 2u;
+  for (size_t i = 0; i < hex_chars / 2u; i++) {
     out_hex[i * 2u] = hx[digest[i] >> 4];
     out_hex[i * 2u + 1u] = hx[digest[i] & 0x0f];
   }
-  out_hex[64] = '\0';
+  out_hex[hex_chars] = '\0';
   return 0;
 }
 

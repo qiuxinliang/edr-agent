@@ -394,6 +394,7 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.rest_bearer_token,
       cfg->agent.endpoint_id,
       NULL /* agent_version */);
+  edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version);
 
   /* 启动命令轮询 */
   edr_ingest_http_start_command_poll();

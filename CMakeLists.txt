@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
 option(EDR_REQUIRE_GRPC "Fail configure when EDR_WITH_GRPC=ON but gRPC is not found" OFF)
 option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active protoc" ON)
+option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 list(APPEND CMAKE_PREFIX_PATH
   /usr/local/opt/grpc
@@ -142,6 +143,7 @@ endif()
 set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
+  src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c
   src/config/config.c
@@ -523,17 +525,21 @@ if(EDR_BUILD_AVE_SHARED_LIB)
   set_target_properties(edr_ave_shared PROPERTIES OUTPUT_NAME "edr_ave")
 endif()
 
+if(EDR_BUILD_TESTS)
 enable_testing()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 add_executable(test_ave_fp tests/test_ave_fp.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
+  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c
+  src/core/edr_log.c src/command/sha256.c)
 target_include_directories(test_ave_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 add_executable(test_ave_infer tests/test_ave_infer.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
+  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c
+  src/core/edr_log.c src/command/sha256.c)
 target_include_directories(test_ave_infer PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 add_executable(test_ave_phase1 tests/test_ave_phase1_contract.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
+  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c
+  src/core/edr_log.c src/command/sha256.c)
 target_include_directories(test_ave_phase1 PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 set(_edr_test_ave_sdk_sources
   src/ave/ave_sdk.c
@@ -551,6 +557,7 @@ set(_edr_test_ave_sdk_sources
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
   src/ave/edr_onnx_behavior_fl_tensor_export.c
+  src/core/edr_log.c
   src/config/config.c
   src/command/sha256.c
   third_party/tomlc99/toml.c
@@ -589,9 +596,12 @@ target_include_directories(test_ave_fl_abi PRIVATE
   ${CMAKE_SOURCE_DIR}/src/proto
 )
 target_compile_definitions(test_ave_fl_abi PRIVATE EDR_HAVE_NANOPB=1)
-target_compile_definitions(test_ave_fl_abi PRIVATE
-  "EDR_TEST_BEH_ONNX=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx\""
-)
+set(_edr_test_behavior_seq128_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx")
+if(EXISTS "${_edr_test_behavior_seq128_fixture}")
+  target_compile_definitions(test_ave_fl_abi PRIVATE
+    "EDR_TEST_BEH_ONNX=\"${_edr_test_behavior_seq128_fixture}\""
+  )
+endif()
 if(WIN32)
   target_sources(test_ave_sdk PRIVATE src/attack_surface/listen_table_win.c)
   target_sources(test_ave_sdk PRIVATE src/ave/ave_sign_whitelist_win.c)
@@ -794,6 +804,7 @@ add_executable(test_ave_pipeline tests/test_ave_pipeline.c
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
   src/ave/edr_onnx_behavior_fl_tensor_export.c
+  src/core/edr_log.c
   src/config/config.c
   src/command/sha256.c
   third_party/tomlc99/toml.c
@@ -1177,3 +1188,4 @@ endif()
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
+endif()

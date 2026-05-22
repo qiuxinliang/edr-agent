@@ -68,7 +68,7 @@ jobs:
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[Prebuild] Installing vcpkg packages from source..."
-          & $tc install --keep-going
+          & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara --keep-going
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
           Write-Host "[Prebuild] vcpkg install completed successfully"
 
@@ -105,7 +105,7 @@ jobs:
           vcpkg.json SHA256: $env:VCPKG_JSON_SHA256
           Platform: x64-windows
           Created: $now
-          Packages: cjson, curl, grpc, protobuf, openssl, yara, pcre2, sqlite3
+          Packages: curl, grpc, protobuf, openssl, yara, pcre2, sqlite3
           "@
           gh release create $tag $archive `
             --title "Pre-built vcpkg packages (x64-windows)" `
@@ -119,7 +119,7 @@ jobs:
         run: |
           $manifest = @{
             platform = "x64-windows"
-            packages = @("cjson", "curl", "grpc", "protobuf", "openssl", "yara", "pcre2", "sqlite3")
+            packages = @("curl", "grpc", "protobuf", "openssl", "yara", "pcre2", "sqlite3")
             latest_prebuild = @{
               vcpkg_json_sha256 = $env:VCPKG_JSON_SHA256
               release_tag = $env:PREBUILD_RELEASE_TAG

@@ -32,6 +32,7 @@ static char s_user[128];
 static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
+static char s_policy_version[64];
 static unsigned long s_http_ok;
 static unsigned long s_http_fail;
 static int64_t s_last_success_ms;
@@ -101,6 +102,20 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->last_success_unix_ms = s_last_success_ms;
   out->last_failure_unix_ms = s_last_failure_ms;
   snprintf(out->last_error, sizeof(out->last_error), "%s", s_last_error);
+}
+
+void edr_ingest_http_set_policy_version(const char *policy_version) {
+  memset(s_policy_version, 0, sizeof(s_policy_version));
+  if (policy_version && policy_version[0]) {
+    snprintf(s_policy_version, sizeof(s_policy_version), "%s", policy_version);
+  }
+}
+
+void edr_ingest_http_copy_policy_version(char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) {
+    return;
+  }
+  snprintf(out, out_cap, "%s", s_policy_version[0] ? s_policy_version : "local");
 }
 
 static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -515,3 +530,9 @@ int edr_ingest_http_post_engine_health_json(const char *body_json) {
   }
   return 0;
 }
+
+void edr_ingest_http_start_command_poll(void) {
+  /* HTTP command polling is optional; gRPC ControlStream remains the primary command path. */
+}
+
+void edr_ingest_http_stop_command_poll(void) {}

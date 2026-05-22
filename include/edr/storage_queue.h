@@ -22,9 +22,10 @@ int edr_storage_queue_is_open(void);
 /**
  * 持久化一批：payload 为 §6.2 完整 wire（12 字节头 + 体），与 ReportEvents 一致，便于出队补传。
  * compressed: 与传输层一致，仅作记录。
+ * severity: 0=普通，1=高优先级；出队时高优先级先补传。
  */
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
-                                   size_t payload_len, int compressed);
+                                   size_t payload_len, int compressed, int severity);
 
 uint64_t edr_storage_queue_pending_count(void);
 

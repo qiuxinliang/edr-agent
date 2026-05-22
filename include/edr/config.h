@@ -21,6 +21,7 @@
 typedef struct EdrConfig {
   struct {
     char address[256];
+    bool grpc_insecure;
     char ca_cert[1024];
     char client_cert[1024];
     char client_key[1024];
@@ -56,6 +57,7 @@ typedef struct EdrConfig {
   } preprocessing;
 
   struct {
+    bool enabled;
     char model_dir[1024];
     int scan_threads;
     int max_file_size_mb;
@@ -121,6 +123,11 @@ typedef struct EdrConfig {
     uint32_t cpu_limit_percent;
     uint32_t memory_limit_mb;
     uint32_t emergency_cpu_limit;
+    uint32_t ave_infer_per_min;
+    uint32_t pmfe_scans_per_min;
+    uint32_t webshell_scan_mb_per_min;
+    uint32_t shellcode_packets_per_sec;
+    uint32_t low_priority_keep_percent_under_pressure;
   } resource_limit;
 
   struct {

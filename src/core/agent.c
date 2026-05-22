@@ -1,6 +1,7 @@
 #include "edr/agent.h"
 
 #include "edr/ave_sdk.h"
+#include "edr/behavior_alert_emit.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
 #include "edr/preprocess.h"
@@ -50,6 +51,39 @@ struct EdrAgent {
   /** §19.6 上次轮询 refresh-request 的时间（ns） */
   uint64_t asurf_last_pending_check_ns;
 };
+
+static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
+  (void)user_data;
+  edr_behavior_alert_emit_to_batch(alert);
+}
+
+static void edr_agent_register_ave_behavior_callbacks(EdrAgent *agent) {
+  AVECallbacks callbacks;
+  memset(&callbacks, 0, sizeof(callbacks));
+  callbacks.on_behavior_alert = edr_agent_on_behavior_alert;
+  callbacks.user_data = agent;
+
+  int cr = AVE_RegisterCallbacks(&callbacks);
+  if (cr != AVE_OK) {
+    fprintf(stderr, "[ave] AVE_RegisterCallbacks failed: %d\n", cr);
+    return;
+  }
+  int mr = AVE_StartBehaviorMonitor();
+  if (mr != AVE_OK) {
+    fprintf(stderr, "[ave] AVE_StartBehaviorMonitor failed: %d\n", mr);
+  }
+  AVEStatus st;
+  memset(&st, 0, sizeof(st));
+  (void)AVE_GetStatus(&st);
+  fprintf(stderr,
+          "[ave] on_behavior_alert=1 behavior_monitor=%d model_dir=%s "
+          "static_model=%s behavior_model=%s l4_th=%.2f\n",
+          st.behavior_monitor_running ? 1 : 0,
+          agent ? agent->cfg.ave.model_dir : "",
+          st.static_model_version,
+          st.behavior_model_version,
+          agent ? (double)agent->cfg.ave.l4_realtime_anomaly_threshold : 0.0);
+}
 
 EdrAgent *edr_agent_create(void) {
   return (EdrAgent *)calloc(1, sizeof(EdrAgent));
@@ -108,6 +142,8 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
     int ar = AVE_InitFromEdrConfig(&agent->cfg);
     if (ar != AVE_OK) {
       fprintf(stderr, "[ave] AVE_InitFromEdrConfig failed: %d\n", ar);
+    } else {
+      edr_agent_register_ave_behavior_callbacks(agent);
     }
   }
 #if defined(EDR_WITH_FL_TRAINER)

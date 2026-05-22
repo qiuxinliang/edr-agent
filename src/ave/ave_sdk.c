@@ -749,13 +749,6 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
   if (fsize < 0) {
     return AVE_ERR_INTERNAL;
   }
-  if (fsize == 0) {
-    result_out->final_verdict = VERDICT_WHITELISTED;
-    result_out->final_confidence = 0.0f;
-    result_out->scan_duration_ms = 0;
-    snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "empty_file");
-    return AVE_OK;
-  }
 
   FILE *probe = fopen(file_path, "rb");
   if (!probe) {
@@ -777,6 +770,23 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
   const EdrConfig *pcfg = active_edr_config();
   if (!pcfg) {
     return AVE_ERR_INTERNAL;
+  }
+  if (fsize == 0) {
+    int ioc_sev_empty = 3;
+    if (edr_ave_ioc_file_hit(pcfg, result_out->sha256, &ioc_sev_empty)) {
+      if (pcfg->ave.ioc_precheck_enabled) {
+        fill_ioc_file_hash(result_out, ioc_sev_empty);
+      } else {
+        edr_ave_overlay_ioc_post_ai(result_out, ioc_sev_empty);
+      }
+    } else {
+      result_out->final_verdict = VERDICT_WHITELISTED;
+      result_out->final_confidence = 0.0f;
+      snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "empty_file");
+    }
+    result_out->scan_duration_ms = 0;
+    ave_bp_merge_static_if_subject(subject_pid, result_out);
+    return AVE_OK;
   }
 
   int skip_onnx = 0;
