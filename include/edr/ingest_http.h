@@ -30,6 +30,11 @@ void edr_ingest_http_set_policy_version(const char *policy_version);
 void edr_ingest_http_copy_policy_version(char *out, size_t cap);
 
 int edr_ingest_http_configured(void);
+unsigned long edr_ingest_http_post_ok(void);
+unsigned long edr_ingest_http_post_fail(void);
+uint64_t edr_ingest_http_last_success_ms(void);
+uint64_t edr_ingest_http_last_failure_ms(void);
+void edr_ingest_http_last_failure_reason(char *buf, size_t cap);
 
 /**
  * 发送一批（12B BAT1/BLZ4 头 + payload）；成功返回 0。

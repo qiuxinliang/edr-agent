@@ -10,6 +10,7 @@
 #include "edr/error.h"
 
 /** 打开/创建队列库；path 为 NULL 时使用 ./edr_queue.db */
+void edr_storage_queue_configure(uint32_t max_queue_size_mb, uint32_t retention_hours);
 EdrError edr_storage_queue_open(const char *path);
 void edr_storage_queue_close(void);
 

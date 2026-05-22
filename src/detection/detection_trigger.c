@@ -1,5 +1,7 @@
 #include "edr/detection_trigger.h"
 
+#include "edr/resource.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,17 +86,21 @@ static int pmfe_alert_trigger_allowed(const EdrConfig *cfg) {
   return cfg->detection.pmfe_mode == 2 || cfg->detection.pmfe_mode == -1;
 }
 
-static int pmfe_budget_allow(uint32_t pid) {
+static int pmfe_budget_allow(const EdrConfig *cfg, uint32_t pid) {
   static time_t s_minute_start;
   static unsigned s_minute_count;
   static uint32_t s_last_pid;
   static time_t s_last_pid_at;
+  unsigned cap = 3u;
+  if (cfg && cfg->resource_limit.pmfe_scans_per_min > 0u) {
+    cap = cfg->resource_limit.pmfe_scans_per_min;
+  }
   time_t now = time(NULL);
   if (s_minute_start == 0 || now - s_minute_start >= 60) {
     s_minute_start = now;
     s_minute_count = 0;
   }
-  if (s_minute_count >= 3) return 0;
+  if (s_minute_count >= cap) return 0;
   if (pid != 0 && pid == s_last_pid && now - s_last_pid_at < 600) return 0;
   s_minute_count++;
   s_last_pid = pid;
@@ -128,7 +134,11 @@ bool edr_detection_trigger_evaluate(const EdrConfig *cfg,
 
   if (!reason) return false;
   if (br->pid == 0u && br->type != EDR_EVENT_PROTOCOL_SHELLCODE) return false;
-  if (br->pid != 0u && !pmfe_budget_allow(br->pid)) return false;
+  if (edr_resource_preprocess_throttle_active() && slot->priority != 0u &&
+      br->type != EDR_EVENT_PROTOCOL_SHELLCODE && br->type != EDR_EVENT_WEBSHELL_DETECTED) {
+    return false;
+  }
+  if (br->pid != 0u && !pmfe_budget_allow(cfg, br->pid)) return false;
 
   out->recommend_pmfe = true;
   out->pmfe_pid = br->pid;

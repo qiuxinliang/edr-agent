@@ -75,7 +75,10 @@ CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_common.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/grpc_client.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/pmfe.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/resource.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/storage_queue.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/transport_sink.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ctype.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_ctype.h \

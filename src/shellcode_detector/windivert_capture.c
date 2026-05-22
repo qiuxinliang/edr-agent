@@ -86,6 +86,9 @@ static uint32_t s_ring_stride;
 static uint32_t s_ring_w;
 static uint32_t s_ring_r;
 static uint32_t s_ring_count;
+static ULONGLONG s_budget_window_ms;
+static uint32_t s_budget_packet_count;
+static volatile LONG64 s_budget_drops;
 
 static uint64_t edr_win_now_ns(void) {
   FILETIME ft;
@@ -277,6 +280,27 @@ static void ring_packet_push(const uint8_t *ip_pkt, UINT ip_len, int is_v6) {
   } else {
     s_ring_r = (s_ring_r + 1u) % s_ring_slots;
   }
+}
+
+static int packet_budget_allow(void) {
+  if (!s_cfg || s_cfg->resource_limit.shellcode_packets_per_sec == 0u) {
+    return 1;
+  }
+  ULONGLONG now = GetTickCount64();
+  if (s_budget_window_ms == 0u || now < s_budget_window_ms || now - s_budget_window_ms >= 1000u) {
+    s_budget_window_ms = now;
+    s_budget_packet_count = 0u;
+  }
+  if (s_budget_packet_count >= s_cfg->resource_limit.shellcode_packets_per_sec) {
+    InterlockedIncrement64(&s_budget_drops);
+    return 0;
+  }
+  s_budget_packet_count++;
+  return 1;
+}
+
+uint64_t edr_windivert_capture_budget_drop_count(void) {
+  return (uint64_t)InterlockedCompareExchange64(&s_budget_drops, 0, 0);
 }
 
 static int write_ring_pcap(const char *path) {
@@ -680,6 +704,9 @@ static DWORD WINAPI wd_thread_main(void *arg) {
     uint16_t sp = tcp->SrcPort;
     uint16_t dp = tcp->DstPort;
     if (!monitor_allows(s_cfg, dp, sp)) {
+      continue;
+    }
+    if (!packet_budget_allow()) {
       continue;
     }
     char src[64], dst[64];

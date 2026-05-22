@@ -115,8 +115,10 @@ void edr_detection_apply_profile(EdrConfig *cfg) {
       cfg->pmfe.idle_scan_enabled = false;
       break;
     case 1:
-    case 2:
       cfg->pmfe.idle_scan_enabled = true;
+      break;
+    case 2:
+      cfg->pmfe.idle_scan_enabled = false;
       break;
     case -1:
       if (cfg->detection.auto_profile) {

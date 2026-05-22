@@ -147,6 +147,7 @@ void edr_behavior_record_fill_process_chain_depth(EdrBehaviorRecord *r) {
     }
     r->process_chain_depth = depth;
     if (gp_pid != 0u) {
+      r->grandparent_pid = gp_pid;
       char gp_name[EDR_BR_STR_SHORT];
       char gp_path[EDR_BR_STR_MID];
       if (lookup_process_name_path(gp_pid, gp_name, sizeof(gp_name),

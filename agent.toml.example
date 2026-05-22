@@ -159,9 +159,15 @@ max_queue_size_mb    = 512
 retention_hours      = 72
 
 [resource_limit]
+profile              = "workstation"
 cpu_limit_percent    = 1
 memory_limit_mb      = 100
 emergency_cpu_limit  = 5
+ave_infer_per_min    = 120
+pmfe_scans_per_min   = 3
+webshell_scan_mb_per_min = 64
+shellcode_packets_per_sec = 2000
+low_priority_keep_percent_under_pressure = 5
 
 [logging]
 level                = "info"
@@ -248,8 +254,8 @@ auto_profile = true
 shellcode_mode = 0
 # webshell 检测: 0=强制关 1=强制开 -1=自适应（Web 根目录/IIS 配置探测）
 webshell_mode = 0
-# PMFE 内存取证: 0=强制关 1=仅空闲扫描 2=空闲+关键告警触发 -1=自适应关键告警触发
-pmfe_mode = 0
+# PMFE 内存取证: 0=强制关 1=仅空闲扫描 2=关键告警触发单进程扫描 -1=自适应关键告警触发
+pmfe_mode = 2
 
 # =========================
 # [pmfe] PMFE 空闲内存取证扫描

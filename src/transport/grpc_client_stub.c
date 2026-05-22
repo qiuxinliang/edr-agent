@@ -31,6 +31,18 @@ unsigned long edr_grpc_client_rpc_ok(void) { return 0UL; }
 
 unsigned long edr_grpc_client_rpc_fail(void) { return 0UL; }
 
+unsigned long edr_grpc_client_report_fail_streak(void) { return 0UL; }
+
+uint64_t edr_grpc_client_last_success_ms(void) { return 0ULL; }
+
+uint64_t edr_grpc_client_last_failure_ms(void) { return 0ULL; }
+
+void edr_grpc_client_last_failure_reason(char *buf, size_t cap) {
+  if (buf && cap > 0u) {
+    buf[0] = '\0';
+  }
+}
+
 void edr_grpc_client_diag(char *buf, size_t cap) {
   if (!buf || cap == 0u) {
     return;

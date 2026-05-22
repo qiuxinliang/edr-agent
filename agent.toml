@@ -1,6 +1,6 @@
 [server]
 address              = "192.168.1.10:50051"
-grpc_insecure        = true
+grpc_insecure        = false
 ca_cert              = ""
 client_cert          = ""
 client_key           = ""
@@ -18,7 +18,7 @@ poll_interval_s      = 1
 max_event_queue_size = 4096
 
 [platform]
-rest_base_url        = "http://127.0.0.1:8080/api/v1"
+rest_base_url        = "https://127.0.0.1:8443/api/v1"
 rest_user_id         = "edr-agent"
 
 [attack_surface]
@@ -37,6 +37,17 @@ firewall_rule_detail_max = 500
 queue_db_path        = "edr_queue.db"
 max_queue_size_mb    = 128
 retention_hours      = 72
+
+[resource_limit]
+profile              = "workstation"
+cpu_limit_percent    = 1
+memory_limit_mb      = 100
+emergency_cpu_limit  = 5
+ave_infer_per_min    = 120
+pmfe_scans_per_min   = 3
+webshell_scan_mb_per_min = 64
+shellcode_packets_per_sec = 2000
+low_priority_keep_percent_under_pressure = 5
 
 [command]
 # Admin 可手动启用高危命令（rm / shutdown / reboot ...）
@@ -123,8 +134,8 @@ auto_profile = true
 shellcode_mode = 0
 # webshell 检测: 0=强制关 1=强制开 -1=自适应（Web 根目录/IIS 配置探测）
 webshell_mode = 0
-# PMFE 内存取证: 0=强制关 1=仅空闲扫描 2=空闲+关键告警触发 -1=自适应关键告警触发
-pmfe_mode = 0
+# PMFE 内存取证: 0=强制关 1=仅空闲扫描 2=关键告警触发单进程扫描 -1=自适应关键告警触发
+pmfe_mode = 2
 
 # =========================
 # [pmfe] PMFE 空闲内存取证扫描

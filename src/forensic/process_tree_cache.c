@@ -163,20 +163,17 @@ uint32_t edr_pt_cache_chain_depth(uint32_t pid) {
 void edr_pt_cache_fill_record(uint32_t pid,
                               char *grandparent_name, size_t gn_cap,
                               char *grandparent_path, size_t gp_cap,
+                              uint32_t *out_grandparent_pid,
                               char *parent_cmdline,    size_t pc_cap,
                               uint32_t *out_chain_depth) {
   if (grandparent_name) grandparent_name[0] = '\0';
   if (grandparent_path) grandparent_path[0] = '\0';
+  if (out_grandparent_pid) *out_grandparent_pid = 0;
   if (parent_cmdline)  parent_cmdline[0] = '\0';
   if (out_chain_depth) *out_chain_depth = 0;
 
   const ProcessTreeEntry *self = edr_pt_cache_get(pid);
   if (!self) return;
-
-  if (parent_cmdline && self->cmdline[0]) {
-    strncpy(parent_cmdline, self->cmdline, pc_cap - 1);
-    parent_cmdline[pc_cap - 1] = '\0';
-  }
 
   if (self->ppid == 0 || self->ppid == pid) {
     if (out_chain_depth) *out_chain_depth = 1;
@@ -184,6 +181,10 @@ void edr_pt_cache_fill_record(uint32_t pid,
   }
 
   const ProcessTreeEntry *parent = edr_pt_cache_get(self->ppid);
+  if (parent && parent_cmdline && parent->cmdline[0]) {
+    strncpy(parent_cmdline, parent->cmdline, pc_cap - 1);
+    parent_cmdline[pc_cap - 1] = '\0';
+  }
   if (!parent || parent->ppid == 0 || parent->ppid == self->ppid) {
     if (out_chain_depth) *out_chain_depth = parent ? 2 : 1;
     return;
@@ -191,6 +192,9 @@ void edr_pt_cache_fill_record(uint32_t pid,
 
   const ProcessTreeEntry *grandparent = edr_pt_cache_get(parent->ppid);
   if (grandparent) {
+    if (out_grandparent_pid) {
+      *out_grandparent_pid = grandparent->pid;
+    }
     if (grandparent_name) {
       strncpy(grandparent_name, grandparent->process_name, gn_cap - 1);
       grandparent_name[gn_cap - 1] = '\0';

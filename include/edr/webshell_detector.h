@@ -3,6 +3,8 @@
 
 #include "edr/error.h"
 
+#include <stdint.h>
+
 struct EdrConfig;
 struct EdrEventBus;
 
@@ -13,5 +15,6 @@ EdrError edr_webshell_detector_init(const struct EdrConfig *cfg, struct EdrEvent
 void edr_webshell_detector_shutdown(void);
 
 unsigned int edr_webshell_detector_watch_count(void);
+uint64_t edr_webshell_detector_budget_drop_count(void);
 
 #endif

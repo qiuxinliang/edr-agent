@@ -1,5 +1,6 @@
 #include "edr/pmfe_idle_scanner.h"
 #include "edr/pmfe_engine_internal.h"
+#include "edr/resource.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -225,7 +226,8 @@ void pmfe_idle_scanner_init(const EdrConfig *cfg) {
 
 void pmfe_idle_scanner_tick(void) {
   if (!s_running || !s_cfg) return;
-  if (s_cfg->detection.pmfe_mode == 0 && !s_cfg->pmfe.idle_scan_enabled) return;
+  if (!s_cfg->pmfe.idle_scan_enabled) return;
+  if (edr_resource_preprocess_throttle_active()) return;
 
   uint64_t now_ms = 0;
 #ifdef _WIN32

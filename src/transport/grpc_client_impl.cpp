@@ -52,6 +52,10 @@ static std::atomic<unsigned long> s_rpc_ok{0};
 static std::atomic<unsigned long> s_rpc_fail{0};
 static std::atomic<int> s_report_fail_streak{0};
 static std::atomic<unsigned long> s_upload_seq{0};
+static std::atomic<uint64_t> s_last_success_ms{0};
+static std::atomic<uint64_t> s_last_failure_ms{0};
+static std::mutex s_last_failure_mu;
+static std::string s_last_failure_reason;
 
 /** ReportEvents 上传带宽（TOML upload.max_upload_mbps）；0 表示不节流 */
 static uint32_t s_max_upload_mbps;
@@ -64,6 +68,24 @@ static std::thread s_sub_thr;
 static std::shared_ptr<grpc::ClientContext> s_sub_ctx;
 
 static void subscribe_thread_main(std::string endpoint_id);
+
+static uint64_t grpc_wall_time_ms() {
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+static void grpc_note_success() {
+  s_last_success_ms.store(grpc_wall_time_ms(), std::memory_order_relaxed);
+}
+
+static void grpc_note_failure(const std::string &reason) {
+  s_last_failure_ms.store(grpc_wall_time_ms(), std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(s_last_failure_mu);
+  s_last_failure_reason = reason;
+  if (s_last_failure_reason.size() > 240u) {
+    s_last_failure_reason.resize(240u);
+  }
+}
 
 static bool grpc_client_connect_locked(const std::string &target) {
   s_target = target;
@@ -344,6 +366,7 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
   {
     std::lock_guard<std::mutex> lock(s_mu);
     if (!s_stub) {
+      grpc_note_failure("grpc_stub_not_ready");
       return -1;
     }
     stub = s_stub;
@@ -392,6 +415,11 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
   if (!st.ok()) {
     s_rpc_fail++;
     s_report_fail_streak++;
+    {
+      std::ostringstream oss;
+      oss << "ReportEvents: " << (int)st.error_code() << " " << st.error_message();
+      grpc_note_failure(oss.str());
+    }
     EDR_LOGE("[grpc] ReportEvents 失败: %d %s\n", (int)st.error_code(), st.error_message().c_str());
     return -1;
   }
@@ -414,6 +442,7 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
   }
   s_report_fail_streak = 0;
   s_rpc_ok++;
+  grpc_note_success();
   return 0;
 }
 
@@ -423,6 +452,7 @@ extern "C" int edr_grpc_client_report_command_result(const char *command_id,
                                                      const char *detail_utf8) {
   std::lock_guard<std::mutex> lock(s_mu);
   if (!s_stub) {
+    grpc_note_failure("ReportCommandResult: grpc_stub_not_ready");
     return -1;
   }
   edr::v1::ReportCommandResultRequest req;
@@ -450,20 +480,48 @@ extern "C" int edr_grpc_client_report_command_result(const char *command_id,
   grpc::Status st = s_stub->ReportCommandResult(&ctx, req, &resp);
   if (!st.ok()) {
     s_rpc_fail++;
+    {
+      std::ostringstream oss;
+      oss << "ReportCommandResult: " << (int)st.error_code() << " " << st.error_message();
+      grpc_note_failure(oss.str());
+    }
     EDR_LOGE("[grpc] ReportCommandResult 失败: %d %s\n", (int)st.error_code(), st.error_message().c_str());
     return -1;
   }
   if (!resp.accepted()) {
     s_rpc_fail++;
+    grpc_note_failure("ReportCommandResult: accepted=false");
     return -1;
   }
   s_rpc_ok++;
+  grpc_note_success();
   return 0;
 }
 
 extern "C" unsigned long edr_grpc_client_rpc_ok(void) { return s_rpc_ok.load(); }
 
 extern "C" unsigned long edr_grpc_client_rpc_fail(void) { return s_rpc_fail.load(); }
+
+extern "C" unsigned long edr_grpc_client_report_fail_streak(void) {
+  return (unsigned long)s_report_fail_streak.load();
+}
+
+extern "C" uint64_t edr_grpc_client_last_success_ms(void) {
+  return s_last_success_ms.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t edr_grpc_client_last_failure_ms(void) {
+  return s_last_failure_ms.load(std::memory_order_relaxed);
+}
+
+extern "C" void edr_grpc_client_last_failure_reason(char *buf, size_t cap) {
+  if (!buf || cap == 0u) {
+    return;
+  }
+  buf[0] = '\0';
+  std::lock_guard<std::mutex> lock(s_last_failure_mu);
+  snprintf(buf, cap, "%s", s_last_failure_reason.empty() ? "" : s_last_failure_reason.c_str());
+}
 
 static int edr_try_ingest_http_file_upload(const char *file_path, const char *sha256_hex, char *out_minio_key,
                                             size_t out_minio_key_cap) {
@@ -487,8 +545,10 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
     int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
     if (hr == 0) {
       s_rpc_ok++;
+      grpc_note_success();
     } else {
       s_rpc_fail++;
+      grpc_note_failure("UploadFile: grpc_stub_not_ready_http_fallback_failed");
     }
     return hr;
   }

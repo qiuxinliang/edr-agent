@@ -24,6 +24,14 @@ static uint64_t s_max_db_bytes;
 static uint64_t s_max_entries;
 static uint64_t s_retry_not_before_ns;
 static unsigned s_retry_fail_streak;
+static uint32_t s_cfg_max_queue_size_mb;
+static uint32_t s_cfg_retention_hours;
+static time_t s_last_ttl_cleanup;
+
+void edr_storage_queue_configure(uint32_t max_queue_size_mb, uint32_t retention_hours) {
+  s_cfg_max_queue_size_mb = max_queue_size_mb;
+  s_cfg_retention_hours = retention_hours;
+}
 
 static unsigned queue_retry_backoff_base_ms(void) {
   static int cached = -1;
@@ -84,6 +92,8 @@ static void load_queue_db_limit(void) {
     if (mb > 0 && mb <= 65535UL) {
       s_max_db_bytes = mb * 1024UL * 1024UL;
     }
+  } else if (s_cfg_max_queue_size_mb > 0u) {
+    s_max_db_bytes = (uint64_t)s_cfg_max_queue_size_mb * 1024ULL * 1024ULL;
   }
   
   s_max_entries = 0;
@@ -107,6 +117,49 @@ static void load_queue_db_limit(void) {
     }
   }
   s_max_entries = queue_cap * 5UL;
+}
+
+static void refresh_pending_count(void) {
+  if (!s_db) {
+    s_pending = 0;
+    return;
+  }
+  sqlite3_stmt *st = NULL;
+  const char *cnt = "SELECT COUNT(*) FROM event_queue WHERE status='pending';";
+  if (sqlite3_prepare_v2(s_db, cnt, -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_step(st) == SQLITE_ROW) {
+      s_pending = (uint64_t)sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+  }
+}
+
+static void cleanup_expired_rows(int force) {
+  if (!s_db || s_cfg_retention_hours == 0u) {
+    return;
+  }
+  time_t now = time(NULL);
+  if (!force && s_last_ttl_cleanup != 0 && now - s_last_ttl_cleanup < 60) {
+    return;
+  }
+  s_last_ttl_cleanup = now;
+  uint64_t keep_s = (uint64_t)s_cfg_retention_hours * 3600ULL;
+  if (keep_s == 0u || (uint64_t)now <= keep_s) {
+    return;
+  }
+  sqlite3_stmt *st = NULL;
+  const char *sql = "DELETE FROM event_queue WHERE created_at < ?;";
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+    return;
+  }
+  sqlite3_bind_int64(st, 1, (sqlite3_int64)((uint64_t)now - keep_s));
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc == SQLITE_DONE && sqlite3_changes(s_db) > 0) {
+    refresh_pending_count();
+    fprintf(stderr, "[queue] ttl cleanup removed expired rows, pending=%llu retention_hours=%u\n",
+            (unsigned long long)s_pending, (unsigned)s_cfg_retention_hours);
+  }
 }
 
 static uint32_t rd_u32_le(const uint8_t *p) {
@@ -258,15 +311,9 @@ EdrError edr_storage_queue_open(const char *path) {
   }
 
   exec_simple(s_db, "PRAGMA journal_mode=WAL;");
+  cleanup_expired_rows(1);
 
-  sqlite3_stmt *st = NULL;
-  const char *cnt = "SELECT COUNT(*) FROM event_queue WHERE status='pending';";
-  if (sqlite3_prepare_v2(s_db, cnt, -1, &st, NULL) == SQLITE_OK) {
-    if (sqlite3_step(st) == SQLITE_ROW) {
-      s_pending = (uint64_t)sqlite3_column_int64(st, 0);
-    }
-    sqlite3_finalize(st);
-  }
+  refresh_pending_count();
   s_retry_not_before_ns = 0;
   s_retry_fail_streak = 0u;
   {
@@ -279,8 +326,10 @@ EdrError edr_storage_queue_open(const char *path) {
     unsigned b1 = queue_retry_backoff_max_ms();
     fprintf(stderr,
             "[queue] sqlite=%s on_fail_persist=%d persist_every_batch=%d max_retries=%d "
-            "backoff_ms=%u..%u (unified policy: docs/WP7_OFFLINE_QUEUE_RETRY.md)\n",
-            s_path, on_fail, every, lim, b0, b1);
+            "backoff_ms=%u..%u max_db_mb=%u retention_hours=%u "
+            "(unified policy: docs/WP7_OFFLINE_QUEUE_RETRY.md)\n",
+            s_path, on_fail, every, lim, b0, b1, (unsigned)s_cfg_max_queue_size_mb,
+            (unsigned)s_cfg_retention_hours);
   }
   return EDR_OK;
 }
@@ -334,17 +383,19 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
 #if defined(_WIN32) && defined(_MSC_VER)
     struct __stat64 stbuf;
     if (_stat64(s_path, &stbuf) == 0 && (uint64_t)stbuf.st_size >= s_max_db_bytes) {
-      fprintf(stderr, "[queue] 库文件超过 EDR_QUEUE_MAX_DB_MB 上限，拒绝入队\n");
+      fprintf(stderr, "[queue] 库文件超过 offline.max_queue_size_mb/EDR_QUEUE_MAX_DB_MB 上限，拒绝入队\n");
       return EDR_ERR_QUEUE_FULL;
     }
 #else
     struct stat stbuf;
     if (stat(s_path, &stbuf) == 0 && (uint64_t)stbuf.st_size >= s_max_db_bytes) {
-      fprintf(stderr, "[queue] 库文件超过 EDR_QUEUE_MAX_DB_MB 上限，拒绝入队\n");
+      fprintf(stderr, "[queue] 库文件超过 offline.max_queue_size_mb/EDR_QUEUE_MAX_DB_MB 上限，拒绝入队\n");
       return EDR_ERR_QUEUE_FULL;
     }
 #endif
   }
+
+  cleanup_expired_rows(0);
 
   if (s_max_entries > 0u && s_pending >= s_max_entries) {
     trim_queue_if_full();
@@ -390,6 +441,7 @@ void edr_storage_queue_poll_drain(void) {
     last_ns = now;
     return;
   }
+  cleanup_expired_rows(0);
   if (s_retry_not_before_ns > now) {
     return;
   }
@@ -422,6 +474,11 @@ void edr_storage_queue_poll_drain(void) {
 EdrError edr_storage_queue_open(const char *path) {
   (void)path;
   return EDR_OK;
+}
+
+void edr_storage_queue_configure(uint32_t max_queue_size_mb, uint32_t retention_hours) {
+  (void)max_queue_size_mb;
+  (void)retention_hours;
 }
 
 void edr_storage_queue_close(void) {}

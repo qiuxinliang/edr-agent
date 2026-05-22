@@ -825,6 +825,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     edr_pt_cache_fill_record(r->pid,
                              r->grandparent_name, sizeof(r->grandparent_name),
                              r->grandparent_path, sizeof(r->grandparent_path),
+                             &r->grandparent_pid,
                              r->parent_cmdline,   sizeof(r->parent_cmdline),
                              &r->process_chain_depth);
   }

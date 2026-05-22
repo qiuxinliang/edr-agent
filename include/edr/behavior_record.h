@@ -79,6 +79,7 @@ typedef struct {
   uint32_t token_elevation;
   char process_path_hash[65];
   char parent_cmdline[EDR_BR_STR_LONG];
+  uint32_t grandparent_pid;
   char grandparent_name[EDR_BR_STR_SHORT];
   char grandparent_path[EDR_BR_STR_MID];
   char sibling_names[EDR_BR_STR_LONG];

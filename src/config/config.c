@@ -895,6 +895,8 @@ static void load_offline(toml_table_t *t, EdrConfig *cfg) {
 }
 
 static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
+  take_string(toml_string_in(t, "profile"), cfg->resource_limit.profile,
+              sizeof(cfg->resource_limit.profile));
   {
     toml_datum_t d = toml_int_in(t, "cpu_limit_percent");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
@@ -911,6 +913,36 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "emergency_cpu_limit");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->resource_limit.emergency_cpu_limit = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "ave_infer_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.ave_infer_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "pmfe_scans_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.pmfe_scans_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "webshell_scan_mb_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.webshell_scan_mb_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "shellcode_packets_per_sec");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.shellcode_packets_per_sec = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "low_priority_keep_percent_under_pressure");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 100LL) {
+      cfg->resource_limit.low_priority_keep_percent_under_pressure = (uint32_t)d.u.i;
     }
   }
 }
@@ -1304,6 +1336,36 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->preprocessing.high_freq_threshold < 1u) {
     cfg->preprocessing.high_freq_threshold = 100u;
   }
+  if (!cfg->resource_limit.profile[0]) {
+    snprintf(cfg->resource_limit.profile, sizeof(cfg->resource_limit.profile), "%s", "workstation");
+  }
+  if (cfg->resource_limit.ave_infer_per_min == 0u) {
+    cfg->resource_limit.ave_infer_per_min = 120u;
+  }
+  if (cfg->resource_limit.ave_infer_per_min > 6000u) {
+    cfg->resource_limit.ave_infer_per_min = 6000u;
+  }
+  if (cfg->resource_limit.pmfe_scans_per_min == 0u) {
+    cfg->resource_limit.pmfe_scans_per_min = 3u;
+  }
+  if (cfg->resource_limit.pmfe_scans_per_min > 120u) {
+    cfg->resource_limit.pmfe_scans_per_min = 120u;
+  }
+  if (cfg->resource_limit.webshell_scan_mb_per_min == 0u) {
+    cfg->resource_limit.webshell_scan_mb_per_min = 64u;
+  }
+  if (cfg->resource_limit.webshell_scan_mb_per_min > 4096u) {
+    cfg->resource_limit.webshell_scan_mb_per_min = 4096u;
+  }
+  if (cfg->resource_limit.shellcode_packets_per_sec == 0u) {
+    cfg->resource_limit.shellcode_packets_per_sec = 2000u;
+  }
+  if (cfg->resource_limit.shellcode_packets_per_sec > 200000u) {
+    cfg->resource_limit.shellcode_packets_per_sec = 200000u;
+  }
+  if (cfg->resource_limit.low_priority_keep_percent_under_pressure > 100u) {
+    cfg->resource_limit.low_priority_keep_percent_under_pressure = 100u;
+  }
   if (cfg->upload.batch_max_events == 0u) {
     cfg->upload.batch_max_events = 500u;
   }
@@ -1626,9 +1688,15 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->offline.max_queue_size_mb = 512u;
   cfg->offline.retention_hours = 72u;
 
+  snprintf(cfg->resource_limit.profile, sizeof(cfg->resource_limit.profile), "%s", "workstation");
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
   cfg->resource_limit.emergency_cpu_limit = 5u;
+  cfg->resource_limit.ave_infer_per_min = 120u;
+  cfg->resource_limit.pmfe_scans_per_min = 3u;
+  cfg->resource_limit.webshell_scan_mb_per_min = 64u;
+  cfg->resource_limit.shellcode_packets_per_sec = 2000u;
+  cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
 
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s", "/var/log/edr");

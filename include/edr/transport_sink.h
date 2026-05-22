@@ -43,6 +43,12 @@ size_t edr_transport_wire_bytes_count(void);
 unsigned long edr_transport_batch_count(void);
 size_t edr_transport_batch_bytes_count(void);
 unsigned long edr_transport_batch_lz4_count(void);
+size_t edr_transport_send_queue_depth(void);
+size_t edr_transport_send_queue_capacity(void);
+unsigned long edr_transport_queue_full_count(void);
+unsigned long edr_transport_queue_full_persisted_count(void);
+unsigned long edr_transport_queue_full_sampled_count(void);
+unsigned long edr_transport_queue_full_dropped_count(void);
 
 /**
  * 注入模拟 dispatch 回调（测试/QUIC/MQTT 传输层替换）。

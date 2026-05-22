@@ -34,6 +34,10 @@ int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *header12, si
 
 unsigned long edr_grpc_client_rpc_ok(void);
 unsigned long edr_grpc_client_rpc_fail(void);
+unsigned long edr_grpc_client_report_fail_streak(void);
+uint64_t edr_grpc_client_last_success_ms(void);
+uint64_t edr_grpc_client_last_failure_ms(void);
+void edr_grpc_client_last_failure_reason(char *buf, size_t cap);
 
 /**
  * 写入简短 ASCII 诊断（为何 `edr_grpc_client_ready` 可能为 0），供控制台心跳等使用。

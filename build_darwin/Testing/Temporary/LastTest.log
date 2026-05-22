@@ -1,10 +1,10 @@
-Start testing: May 22 16:29 CST
+Start testing: May 22 18:07 CST
 ----------------------------------------------------------
 1/6 Testing: edr_agent_help
 1/6 Test: edr_agent_help
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent" "--help"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_agent_help" start time: May 22 16:29 CST
+"edr_agent_help" start time: May 22 18:07 CST
 Output:
 ----------------------------------------------------------
 /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_agent — EDR 端点 Agent
@@ -48,10 +48,10 @@ Output:
 
 更多: README「实现状态快照」与仓库内设计文档。
 <end of output>
-Test time =   3.38 sec
+Test time =   3.71 sec
 ----------------------------------------------------------
 Test Passed.
-"edr_agent_help" end time: May 22 16:29 CST
+"edr_agent_help" end time: May 22 18:07 CST
 "edr_agent_help" time elapsed: 00:00:03
 ----------------------------------------------------------
 
@@ -59,7 +59,7 @@ Test Passed.
 2/6 Test: edr_p0_golden
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_p0_golden_test"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_p0_golden" start time: May 22 16:29 CST
+"edr_p0_golden" start time: May 22 18:07 CST
 Output:
 ----------------------------------------------------------
 [p0_rule_ir] loading /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/config/p0_rule_bundle_ir_v1.json (98369 bytes, JSON)
@@ -69,7 +69,7 @@ Output:
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"edr_p0_golden" end time: May 22 16:29 CST
+"edr_p0_golden" end time: May 22 18:07 CST
 "edr_p0_golden" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -77,15 +77,15 @@ Test Passed.
 3/6 Test: test_event_bus_mpmc_stress
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/test_event_bus_mpmc_stress" "250" "4" "64"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"test_event_bus_mpmc_stress" start time: May 22 16:29 CST
+"test_event_bus_mpmc_stress" start time: May 22 18:07 CST
 Output:
 ----------------------------------------------------------
-[event_bus] A4.1 mpmc: duration=250ms nprod=4 cap=64 pops=push=804211 dropped=4966483 hwm_hits=799674
+[event_bus] A4.1 mpmc: duration=250ms nprod=4 cap=64 pops=push=897930 dropped=5184459 hwm_hits=895803
 <end of output>
 Test time =   0.25 sec
 ----------------------------------------------------------
 Test Passed.
-"test_event_bus_mpmc_stress" end time: May 22 16:29 CST
+"test_event_bus_mpmc_stress" end time: May 22 18:07 CST
 "test_event_bus_mpmc_stress" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -93,7 +93,7 @@ Test Passed.
 4/6 Test: edr_p0_ir_record_golden
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/edr_p0_ir_record_golden_test"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"edr_p0_ir_record_golden" start time: May 22 16:29 CST
+"edr_p0_ir_record_golden" start time: May 22 18:07 CST
 Output:
 ----------------------------------------------------------
 [p0_rule_ir] loading /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/config/p0_rule_bundle_ir_v1.json (98369 bytes, JSON)
@@ -103,7 +103,7 @@ Output:
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"edr_p0_ir_record_golden" end time: May 22 16:29 CST
+"edr_p0_ir_record_golden" end time: May 22 18:07 CST
 "edr_p0_ir_record_golden" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -111,14 +111,14 @@ Test Passed.
 5/6 Test: detection_profile_trigger
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/test_detection_profile_trigger"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"detection_profile_trigger" start time: May 22 16:29 CST
+"detection_profile_trigger" start time: May 22 18:07 CST
 Output:
 ----------------------------------------------------------
 <end of output>
-Test time =   0.01 sec
+Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"detection_profile_trigger" end time: May 22 16:29 CST
+"detection_profile_trigger" end time: May 22 18:07 CST
 "detection_profile_trigger" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -126,18 +126,18 @@ Test Passed.
 6/6 Test: forensic_trigger
 Command: "/Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin/test_forensic_trigger"
 Directory: /Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/build_darwin
-"forensic_trigger" start time: May 22 16:29 CST
+"forensic_trigger" start time: May 22 18:07 CST
 Output:
 ----------------------------------------------------------
 <end of output>
-Test time =   0.01 sec
+Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"forensic_trigger" end time: May 22 16:29 CST
+"forensic_trigger" end time: May 22 18:07 CST
 "forensic_trigger" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-End testing: May 22 16:29 CST
+End testing: May 22 18:07 CST
 
 A4.1 =   0.25 sec*proc
 

@@ -135,6 +135,9 @@ typedef struct {
 
 static AveInferCacheEntry s_infer_cache[EDR_AVE_INFER_CACHE_CAP];
 static size_t s_infer_cache_n;
+static int64_t s_infer_budget_window_ms;
+static uint32_t s_infer_budget_count;
+static uint64_t s_infer_budget_drops;
 
 void edr_ave_infer_cache_clear(void) {
   s_infer_cache_n = 0;
@@ -229,6 +232,24 @@ static void infer_cache_put(const char *sha256, const EdrAveInferResult *infer, 
   s_infer_cache[0].infer = *infer;
   s_infer_cache[0].inserted_ms = mono_ms();
   s_infer_cache_n++;
+}
+
+static int ave_infer_budget_allow(const EdrConfig *pcfg) {
+  if (!pcfg || pcfg->resource_limit.ave_infer_per_min == 0u) {
+    return 1;
+  }
+  int64_t now = mono_ms();
+  if (s_infer_budget_window_ms == 0 || now < s_infer_budget_window_ms ||
+      now - s_infer_budget_window_ms >= 60000) {
+    s_infer_budget_window_ms = now;
+    s_infer_budget_count = 0u;
+  }
+  if (s_infer_budget_count >= pcfg->resource_limit.ave_infer_per_min) {
+    s_infer_budget_drops++;
+    return 0;
+  }
+  s_infer_budget_count++;
+  return 1;
 }
 
 static int hash_file_sha256(const char *path, char out65[65]) {
@@ -744,6 +765,8 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     uint32_t cttl = infer_cache_ttl_effective(pcfg);
     if (!skip_cache && cmax > 0u && infer_cache_get(result_out->sha256, &infer, cttl)) {
       ie = EDR_OK;
+    } else if (!ave_infer_budget_allow(pcfg)) {
+      ie = EDR_ERR_AVE_SCAN_TIMEOUT;
     } else {
       ie = edr_ave_infer_file(pcfg, file_path, &infer);
       if (ie == EDR_OK && !skip_cache && cmax > 0u) {
@@ -800,6 +823,12 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     return AVE_ERR_NOT_IMPL;
   }
 
+  if (ie == EDR_ERR_AVE_SCAN_TIMEOUT) {
+    result_out->raw_ai_verdict = VERDICT_TIMEOUT;
+    result_out->final_verdict = VERDICT_TIMEOUT;
+    snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "%s",
+             "infer_budget_throttle");
+  }
   return edr_err_to_ave(ie);
 }
 

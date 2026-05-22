@@ -15,3 +15,5 @@ EdrError edr_shellcode_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
 void edr_shellcode_detector_shutdown(void) {}
 
 int edr_shellcode_detector_active(void) { return 0; }
+
+uint64_t edr_shellcode_detector_budget_drop_count(void) { return 0u; }

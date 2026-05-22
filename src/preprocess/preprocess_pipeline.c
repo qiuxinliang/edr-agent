@@ -47,6 +47,7 @@ static uint32_t s_l3_pressure_high_pct;
 static uint32_t s_l3_pressure_recover_pct;
 static uint32_t s_l3_drop_permille;
 static int s_l3_pressure_active;
+static uint32_t s_l3_resource_keep_permille;
 static int s_procname_gate_enabled;
 static uint32_t s_procname_gate_keep_unknown_permille;
 static uint32_t s_drop_l2_unmatched;
@@ -271,9 +272,15 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
   s_l3_pressure_high_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_HIGH_PCT", 70);
   s_l3_pressure_recover_pct = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_RECOVER_PCT", 50);
   s_l3_drop_permille = (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_L3_DROP_PERMILLE", 950);
+  s_l3_resource_keep_permille =
+      cfg ? cfg->resource_limit.low_priority_keep_percent_under_pressure * 10u : 50u;
+  s_l3_resource_keep_permille =
+      (uint32_t)edr_getenv_int_default("EDR_RESOURCE_LOWPRI_KEEP_PERMILLE",
+                                       (int)s_l3_resource_keep_permille);
   s_l3_pressure_high_pct = clamp_u32(s_l3_pressure_high_pct, 50u, 99u);
   s_l3_pressure_recover_pct = clamp_u32(s_l3_pressure_recover_pct, 10u, s_l3_pressure_high_pct);
   s_l3_drop_permille = clamp_u32(s_l3_drop_permille, 0u, 1000u);
+  s_l3_resource_keep_permille = clamp_u32(s_l3_resource_keep_permille, 0u, 1000u);
   s_procname_gate_enabled = edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE", 1) == 1 ? 1 : 0;
   s_procname_gate_keep_unknown_permille =
       (uint32_t)edr_getenv_int_default("EDR_PREPROCESS_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE", 10);
@@ -292,11 +299,11 @@ static void preprocess_init_l2_l3_controls(const EdrConfig *cfg) {
   }
   fprintf(stderr,
           "[preprocess/config] L2_SPLIT=%d L2_KEEP_RATIO=%.3f L3_PRESSURE=%d L3_HIGH_PCT=%u "
-          "L3_RECOVER_PCT=%u L3_DROP_PERMILLE=%u PROCNAME_GATE=%d PROCNAME_KEEP_UNKNOWN_PERMILLE=%u "
+          "L3_RECOVER_PCT=%u L3_DROP_PERMILLE=%u RESOURCE_KEEP_PERMILLE=%u PROCNAME_GATE=%d PROCNAME_KEEP_UNKNOWN_PERMILLE=%u "
           "STRICT_BEHAVIOR_GATE=%d\n",
           s_l2_split_enabled, s_l2_unmatched_keep_ratio, s_l3_pressure_enabled,
           (unsigned)s_l3_pressure_high_pct, (unsigned)s_l3_pressure_recover_pct,
-          (unsigned)s_l3_drop_permille, s_procname_gate_enabled,
+          (unsigned)s_l3_drop_permille, (unsigned)s_l3_resource_keep_permille, s_procname_gate_enabled,
           (unsigned)s_procname_gate_keep_unknown_permille, s_strict_behavior_gate_enabled);
 }
 
@@ -384,6 +391,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
       slot->attack_surface_hint == 0u) {
+    edr_resource_note_preprocess_throttle_drop();
     /* 即使在资源压力下被丢弃，仍然尝试P0检测（关键告警不应被压制） */
     if (slot_is_p0_eligible(slot)) {
       EdrBehaviorRecord br;
@@ -518,9 +526,14 @@ static void *preprocess_main(void *arg) {
           s_drop_strict_behavior_gate++;
           continue;
         }
-        if (s_l3_pressure_active && !slot_is_high_value(&slots[i])) {
-          if (!rng_hit_permille(1000u - s_l3_drop_permille)) {
+        if ((s_l3_pressure_active || edr_resource_preprocess_throttle_active()) &&
+            !slot_is_high_value(&slots[i])) {
+          uint32_t keep = s_l3_pressure_active ? 1000u - s_l3_drop_permille : s_l3_resource_keep_permille;
+          if (!rng_hit_permille(keep)) {
             s_drop_l3_pressure++;
+            if (edr_resource_preprocess_throttle_active()) {
+              edr_resource_note_preprocess_throttle_drop();
+            }
             continue;
           }
         }

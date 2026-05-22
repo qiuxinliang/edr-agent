@@ -133,9 +133,15 @@ typedef struct EdrConfig {
   } offline;
 
   struct {
+    char profile[32];
     uint32_t cpu_limit_percent;
     uint32_t memory_limit_mb;
     uint32_t emergency_cpu_limit;
+    uint32_t ave_infer_per_min;
+    uint32_t pmfe_scans_per_min;
+    uint32_t webshell_scan_mb_per_min;
+    uint32_t shellcode_packets_per_sec;
+    uint32_t low_priority_keep_percent_under_pressure;
   } resource_limit;
 
   struct {

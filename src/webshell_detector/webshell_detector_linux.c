@@ -65,6 +65,9 @@ static WebRoot s_roots[WEBSHELL_MAX_ROOTS];
 static size_t s_root_count;
 static WatchEntry s_watches[WEBSHELL_MAX_WATCHES];
 static size_t s_watch_count;
+static uint64_t s_budget_window_ns;
+static uint64_t s_budget_bytes;
+static uint64_t s_budget_drops;
 
 #ifdef EDR_HAVE_YARA
 static YR_RULES *s_yara_rules;
@@ -88,6 +91,25 @@ static uint64_t now_ns(void) {
 }
 
 static void ms_sleep(unsigned ms) { usleep(ms * 1000u); }
+
+static int webshell_scan_budget_allow(uint64_t bytes) {
+  if (!s_cfg || s_cfg->resource_limit.webshell_scan_mb_per_min == 0u) {
+    return 1;
+  }
+  uint64_t now = now_ns();
+  if (s_budget_window_ns == 0u || now < s_budget_window_ns ||
+      now - s_budget_window_ns >= 60000000000ULL) {
+    s_budget_window_ns = now;
+    s_budget_bytes = 0u;
+  }
+  uint64_t cap = (uint64_t)s_cfg->resource_limit.webshell_scan_mb_per_min * 1024ULL * 1024ULL;
+  if (bytes > cap || s_budget_bytes + bytes > cap) {
+    s_budget_drops++;
+    return 0;
+  }
+  s_budget_bytes += bytes;
+  return 1;
+}
 
 static int starts_with_ci(const char *s, const char *prefix) {
   size_t n = strlen(prefix);
@@ -124,6 +146,9 @@ static int pre_filter(const char *full_path) {
   }
   uint64_t max_bytes = (uint64_t)s_cfg->webshell_detector.max_file_size_mb * 1024ULL * 1024ULL;
   if ((uint64_t)st.st_size == 0u || (uint64_t)st.st_size > max_bytes) {
+    return 0;
+  }
+  if (!webshell_scan_budget_allow((uint64_t)st.st_size)) {
     return 0;
   }
   off_t size1 = st.st_size;
@@ -784,3 +809,5 @@ void edr_webshell_detector_shutdown(void) {
 unsigned int edr_webshell_detector_watch_count(void) {
   return (unsigned int)s_watch_count;
 }
+
+uint64_t edr_webshell_detector_budget_drop_count(void) { return s_budget_drops; }

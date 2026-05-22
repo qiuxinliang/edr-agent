@@ -48,6 +48,7 @@ uint32_t edr_pt_cache_chain_depth(uint32_t pid);
 void edr_pt_cache_fill_record(uint32_t pid,
                               char *grandparent_name, size_t gn_cap,
                               char *grandparent_path, size_t gp_cap,
+                              uint32_t *out_grandparent_pid,
                               char *parent_cmdline,    size_t pc_cap,
                               uint32_t *out_chain_depth);
 

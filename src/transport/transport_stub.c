@@ -48,6 +48,10 @@ typedef struct EdrTransportCtx {
   unsigned long batch_count;
   size_t batch_bytes;
   unsigned long batch_lz4;
+  unsigned long queue_full_total;
+  unsigned long queue_full_persisted;
+  unsigned long queue_full_sampled;
+  unsigned long queue_full_dropped;
 
   /* --- 队列层 --- */
   EdrSendJob *q_head;
@@ -73,6 +77,56 @@ typedef struct EdrTransportCtx {
 static EdrTransportCtx g_ctx;
 
 /* ---- dispatch fallback 策略 ---- */
+
+static int env_truthy(const char *name) {
+  const char *v = getenv(name);
+  return v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "TRUE") == 0);
+}
+
+static int target_is_loopback(const char *s) {
+  return s && (strncmp(s, "127.0.0.1", 9) == 0 || strncmp(s, "localhost", 9) == 0 ||
+               strncmp(s, "[::1]", 5) == 0 || strncmp(s, "::1", 3) == 0);
+}
+
+static int url_is_loopback_http(const char *s) {
+  return s && (strncmp(s, "http://127.0.0.1", 16) == 0 || strncmp(s, "http://localhost", 16) == 0 ||
+               strncmp(s, "http://[::1]", 12) == 0);
+}
+
+static int header_lz4(const uint8_t *header12, size_t header_len) {
+  if (!header12 || header_len < 4u) {
+    return 0;
+  }
+  uint32_t m = (uint32_t)header12[0] | ((uint32_t)header12[1] << 8) |
+               ((uint32_t)header12[2] << 16) | ((uint32_t)header12[3] << 24);
+  return m == EDR_TRANSPORT_BATCH_MAGIC_LZ4;
+}
+
+static int persist_wire_batch(const char *batch_id, const uint8_t *header12, size_t header_len,
+                              const uint8_t *payload, size_t payload_len, int severity) {
+  if (!edr_storage_queue_is_open() || !batch_id || !header12 || header_len < 12u || !payload ||
+      payload_len == 0u) {
+    return -1;
+  }
+  size_t wire_len = header_len + payload_len;
+  uint8_t *wire = (uint8_t *)malloc(wire_len);
+  if (!wire) {
+    return -1;
+  }
+  memcpy(wire, header12, header_len);
+  memcpy(wire + header_len, payload, payload_len);
+  EdrError er = edr_storage_queue_enqueue(batch_id, wire, wire_len, header_lz4(header12, header_len), severity);
+  free(wire);
+  return er == EDR_OK ? 0 : -1;
+}
+
+static unsigned low_priority_full_sample_permille(void) {
+  const char *e = getenv("EDR_TRANSPORT_LOWPRI_FULL_SAMPLE_PERMILLE");
+  long v = e && e[0] ? strtol(e, NULL, 10) : 100L;
+  if (v < 0) v = 0;
+  if (v > 1000) v = 1000;
+  return (unsigned)v;
+}
 
 static int default_dispatch(int use_http, const char *batch_id,
                             const uint8_t *header12, size_t header_len,
@@ -107,7 +161,7 @@ static int default_dispatch(int use_http, const char *batch_id,
       if (wire) {
         memcpy(wire, header12, header_len);
         memcpy(wire + header_len, payload, payload_len);
-        (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, 0, 0);
+        (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, header_lz4(header12, header_len), use_http == 0 ? 1 : 0);
         free(wire);
       }
     }
@@ -157,9 +211,37 @@ static int q_push(EdrTransportCtx *ctx, int use_http, const char *batch_id,
                   const uint8_t *payload, size_t payload_len) {
   q_lock(ctx);
   if (ctx->q_len >= ctx->q_cap) {
+    static unsigned long low_sample_seq;
+    int high_priority = (use_http == 0);
+    int persisted = 0;
+    int sampled = 0;
+    ctx->queue_full_total++;
+    if (high_priority) {
+      persisted = (persist_wire_batch(batch_id, header12, header_len, payload, payload_len, 1) == 0);
+    } else {
+      unsigned ppm = low_priority_full_sample_permille();
+      if (ppm > 0u) {
+        unsigned long seq = ++low_sample_seq;
+        sampled = ((seq % 1000ul) < (unsigned long)ppm);
+        if (sampled) {
+          persisted = (persist_wire_batch(batch_id, header12, header_len, payload, payload_len, 0) == 0);
+        }
+      }
+    }
+    if (persisted) {
+      ctx->queue_full_persisted++;
+      if (sampled) {
+        ctx->queue_full_sampled++;
+      }
+    } else {
+      ctx->queue_full_dropped++;
+    }
     q_unlock(ctx);
-    EDR_LOGE("[transport] queue full (%zu/%zu), dropping batch %s\n",
-             ctx->q_len, ctx->q_cap, batch_id ? batch_id : "");
+    EDR_LOGE("[transport] queue full (%zu/%zu), %s batch %s%s\n",
+             ctx->q_len, ctx->q_cap,
+             persisted ? "persisted overflow" : "dropping overflow",
+             batch_id ? batch_id : "",
+             high_priority ? " priority=high" : " priority=low");
     return -1;
   }
 
@@ -265,6 +347,10 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
   c->batch_count = 0;
   c->batch_bytes = 0;
   c->batch_lz4 = 0;
+  c->queue_full_total = 0;
+  c->queue_full_persisted = 0;
+  c->queue_full_sampled = 0;
+  c->queue_full_dropped = 0;
 
   /* 队列容量：环境变量可覆盖 */
   {
@@ -280,12 +366,29 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
   c->q_started = 0;
   c->q_run = 0;
 
+  EdrConfig secure_cfg = *cfg;
+  const int allow_insecure_env =
+      env_truthy("EDR_ALLOW_INSECURE_TRANSPORT") || env_truthy("EDR_DEV_ALLOW_INSECURE_TRANSPORT");
+  const int allow_grpc_insecure = allow_insecure_env || target_is_loopback(cfg->server.address);
+  if (secure_cfg.server.grpc_insecure && !allow_grpc_insecure) {
+    secure_cfg.server.grpc_insecure = false;
+    EDR_LOGE("%s", "[transport] production policy forced grpc_insecure=false; configure mTLS certs or set EDR_ALLOW_INSECURE_TRANSPORT=1 only for lab\n");
+  } else if (secure_cfg.server.grpc_insecure) {
+    EDR_LOGE("%s", "[transport] insecure gRPC allowed for loopback/dev only\n");
+  }
+  const char *rest_base = secure_cfg.platform.rest_base_url;
+  const int allow_rest_insecure = allow_insecure_env || url_is_loopback_http(rest_base);
+  if (rest_base && strncmp(rest_base, "http://", 7) == 0 && !allow_rest_insecure) {
+    rest_base = "";
+    EDR_LOGE("%s", "[transport] production policy disabled non-HTTPS REST ingest; configure platform.rest_base_url=https://...\n");
+  }
+
   /* 初始化 gRPC */
-  edr_grpc_client_init(cfg);
+  edr_grpc_client_init(&secure_cfg);
 
   /* 配置 HTTP ingest */
   edr_ingest_http_configure(
-      cfg->platform.rest_base_url,
+      rest_base,
       cfg->agent.tenant_id,
       cfg->platform.rest_user_id,
       cfg->platform.rest_bearer_token,
@@ -399,6 +502,22 @@ size_t edr_transport_wire_bytes_count(void) { return g_ctx.wire_bytes; }
 unsigned long edr_transport_batch_count(void) { return g_ctx.batch_count; }
 size_t edr_transport_batch_bytes_count(void) { return g_ctx.batch_bytes; }
 unsigned long edr_transport_batch_lz4_count(void) { return g_ctx.batch_lz4; }
+
+size_t edr_transport_send_queue_depth(void) {
+  EdrTransportCtx *c = &g_ctx;
+  size_t n = 0;
+  if (!c->q_started) return 0;
+  q_lock(c);
+  n = c->q_len;
+  q_unlock(c);
+  return n;
+}
+
+size_t edr_transport_send_queue_capacity(void) { return g_ctx.q_cap; }
+unsigned long edr_transport_queue_full_count(void) { return g_ctx.queue_full_total; }
+unsigned long edr_transport_queue_full_persisted_count(void) { return g_ctx.queue_full_persisted; }
+unsigned long edr_transport_queue_full_sampled_count(void) { return g_ctx.queue_full_sampled; }
+unsigned long edr_transport_queue_full_dropped_count(void) { return g_ctx.queue_full_dropped; }
 
 void edr_transport_inject_dispatch(EdrTransportDispatchFn fn, void *userdata) {
   g_ctx.dispatch = fn;

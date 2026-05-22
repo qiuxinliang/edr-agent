@@ -520,6 +520,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
           "\"parent_name\":\"%s\","
           "\"parent_path\":\"%s\","
           "\"parent_cmdline\":\"%s\","
+          "\"grandparent_pid\":%u,"
           "\"grandparent_name\":\"%s\","
           "\"username\":\"%s\","
           "\"process_chain_depth\":%u,"
@@ -553,6 +554,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
         parent_name_esc,
         parent_path_esc,
         esc_parent_cmdline,
+        br->grandparent_pid,
         esc_gp,
         username_esc,
         br->process_chain_depth,

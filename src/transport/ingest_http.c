@@ -6,7 +6,10 @@
 #include "edr/edr_log.h"
 #include "edr/grpc_client.h"
 #include "edr/pmfe.h"
+#include "edr/resource.h"
 #include "edr/shellcode_detector.h"
+#include "edr/storage_queue.h"
+#include "edr/transport_sink.h"
 #include "edr/webshell_detector.h"
 
 /* CMake：EDR_NO_GRPC_CLIENT=1 时必须 EDR_HAVE_LIBCURL=1，否则不生成此翻译单元。 */
@@ -181,6 +184,25 @@ static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
 static char s_policy_ver[64];
+static unsigned long s_http_post_ok;
+static unsigned long s_http_post_fail;
+static uint64_t s_http_last_success_ms;
+static uint64_t s_http_last_failure_ms;
+static char s_http_last_failure_reason[256];
+
+static void http_note_success(void) {
+  s_http_post_ok++;
+  s_http_last_success_ms = (uint64_t)edr_ingest_wall_time_ms();
+}
+
+static void http_note_failure(const char *relpath, const char *reason) {
+  s_http_post_fail++;
+  s_http_last_failure_ms = (uint64_t)edr_ingest_wall_time_ms();
+  snprintf(s_http_last_failure_reason, sizeof(s_http_last_failure_reason), "%s%s%s",
+           relpath && relpath[0] ? relpath : "-",
+           reason && reason[0] ? ": " : "",
+           reason && reason[0] ? reason : "");
+}
 
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                const char *bearer, const char *endpoint_id, const char *agent_version) {
@@ -231,6 +253,17 @@ void edr_ingest_http_copy_policy_version(char *out, size_t cap) {
 }
 
 int edr_ingest_http_configured(void) { return s_rest[0] != 0 && s_endpoint[0] != 0; }
+
+unsigned long edr_ingest_http_post_ok(void) { return s_http_post_ok; }
+unsigned long edr_ingest_http_post_fail(void) { return s_http_post_fail; }
+uint64_t edr_ingest_http_last_success_ms(void) { return s_http_last_success_ms; }
+uint64_t edr_ingest_http_last_failure_ms(void) { return s_http_last_failure_ms; }
+void edr_ingest_http_last_failure_reason(char *buf, size_t cap) {
+  if (!buf || cap == 0u) {
+    return;
+  }
+  snprintf(buf, cap, "%s", s_http_last_failure_reason);
+}
 
 #ifdef EDR_HAVE_LIBCURL
 static size_t ingest_curl_discard_cb(char *p, size_t s, size_t n, void *u) {
@@ -382,13 +415,18 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
 
     if (cres != CURLE_OK) {
       const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cres);
+      http_note_failure(relpath, em);
       EDR_LOGE("[ingest-http] POST %s: %s\n", relpath, em);
       EDR_LOGV("[ingest-http] (verbose) rest=%s path=%s\n", s_rest, relpath);
     } else if (code < 200 || code >= 300) {
+      char reason[64];
+      snprintf(reason, sizeof(reason), "HTTP %ld", code);
+      http_note_failure(relpath, reason);
       EDR_LOGE("[ingest-http] POST %s: HTTP %ld\n", relpath, code);
       EDR_LOGV("[ingest-http] (verbose) rest=%s path=%s extra=%s\n", s_rest, relpath,
                json_path_for_log ? json_path_for_log : "-");
     } else {
+      http_note_success();
       return 0;
     }
   }
@@ -396,6 +434,7 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
 #endif
 
   if (!shell_curl_fallback_allowed()) {
+    http_note_failure(relpath, "shell curl fallback disabled");
     EDR_LOGE("%s", "[ingest-http] shell curl fallback disabled (set EDR_ALLOW_SHELL_CURL_FALLBACK=1 to enable)\n");
     return -1;
   }
@@ -453,12 +492,16 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   if (!curl_ok) {
     (void)remove(jsonpath);
     (void)remove(cfgpath);
+    http_note_failure(relpath, "curl fallback failed");
     EDR_LOGE("[ingest-http] curl fallback failed (rest=%s)\n", s_rest);
   }
   int http_code = curl_ok ? 200 : 0;
 
   int ok = (http_code >= 200 && http_code < 300);
   if (!ok) {
+    char reason[64];
+    snprintf(reason, sizeof(reason), "HTTP %d", http_code);
+    http_note_failure(relpath, reason);
     char snippet[640];
     size_t sn = 0;
     FILE *rf = fopen(resp_path, "rb");
@@ -479,7 +522,11 @@ static int ingest_post_json_relpath(const char *relpath, const char *json_body, 
   (void)remove(cfgpath);
   (void)remove(resp_path);
 
-  return ok ? 0 : -1;
+  if (ok) {
+    http_note_success();
+    return 0;
+  }
+  return -1;
 }
 
 static int b64_encode_chunk(const uint8_t *in, size_t len, uint8_t carry[2], size_t *carry_len,
@@ -708,7 +755,7 @@ static const char *pmfe_mode_name(const EdrConfig *cfg) {
     return "unknown";
   }
   if (cfg->detection.pmfe_mode == 2) {
-    return "alert_trigger_idle";
+    return "alert_trigger";
   }
   if (cfg->detection.pmfe_mode == 1 || cfg->pmfe.idle_scan_enabled) {
     return "idle";
@@ -729,6 +776,12 @@ static const char *adaptive_mode_name(int mode, int enabled) {
   return enabled ? "enabled" : "disabled";
 }
 
+static const char *control_mode_name(int mode, int enabled) {
+  if (mode > 0) return "forced";
+  if (mode < 0) return enabled ? "adaptive" : "adaptive_off";
+  return enabled ? "config_enabled" : "disabled";
+}
+
 int edr_ingest_http_post_engine_health(const EdrConfig *cfg) {
   if (!cfg || !edr_ingest_http_configured()) {
     return -1;
@@ -741,15 +794,48 @@ int edr_ingest_http_post_engine_health(const EdrConfig *cfg) {
   unsigned long pmfe_depth = pmfe_sub > pmfe_done ? pmfe_sub - pmfe_done : 0;
   int shellcode_active = edr_shellcode_detector_active();
   unsigned int webshell_watches = edr_webshell_detector_watch_count();
+  uint64_t shellcode_budget_drops = edr_shellcode_detector_budget_drop_count();
+  uint64_t webshell_budget_drops = edr_webshell_detector_budget_drop_count();
   int webshell_enabled = cfg->webshell_detector.enabled || webshell_watches > 0u;
   int shellcode_enabled = cfg->shellcode_detector.enabled || shellcode_active;
   int pmfe_enabled = cfg->detection.pmfe_mode != 0 || cfg->pmfe.idle_scan_enabled || pmfe_depth > 0ul;
   const char *p0_rules = cfg->preprocessing.rules_version[0] ? cfg->preprocessing.rules_version : "unknown";
   const char *policy = s_policy_ver[0] ? s_policy_ver : "";
+  static uint64_t last_ave_trigger_ms, last_pmfe_trigger_ms, last_shellcode_trigger_ms, last_webshell_trigger_ms;
+  static uint64_t prev_ave_activity, prev_pmfe_sub;
+  static int prev_shellcode_active;
+  static unsigned int prev_webshell_watches;
+  int64_t now_ms = edr_ingest_wall_time_ms();
+  uint64_t ave_activity = avst.behavior_feed_total + avst.behavior_infer_ok + avst.behavior_infer_fail;
+  if (ave_activity != prev_ave_activity) {
+    last_ave_trigger_ms = (uint64_t)now_ms;
+    prev_ave_activity = ave_activity;
+  }
+  if ((uint64_t)pmfe_sub != prev_pmfe_sub) {
+    last_pmfe_trigger_ms = (uint64_t)now_ms;
+    prev_pmfe_sub = (uint64_t)pmfe_sub;
+  }
+  if (shellcode_active && !prev_shellcode_active) {
+    last_shellcode_trigger_ms = (uint64_t)now_ms;
+  }
+  prev_shellcode_active = shellcode_active;
+  if (webshell_watches != prev_webshell_watches) {
+    last_webshell_trigger_ms = (uint64_t)now_ms;
+    prev_webshell_watches = webshell_watches;
+  }
+  char grpc_diag_raw[160], grpc_fail_raw[256], http_fail_raw[256];
+  char resource_pressure_raw[160];
+  edr_grpc_client_diag(grpc_diag_raw, sizeof(grpc_diag_raw));
+  edr_grpc_client_last_failure_reason(grpc_fail_raw, sizeof(grpc_fail_raw));
+  edr_ingest_http_last_failure_reason(http_fail_raw, sizeof(http_fail_raw));
+  edr_resource_pressure_reason(resource_pressure_raw, sizeof(resource_pressure_raw));
 
-  char ep[260], agv[140], pol[140], p0[160], static_mv[80], behavior_mv[80], ioc_rv[80], wl_rv[80], cert_rv[80];
+  char ep[260], agv[140], pol[140], p0[160], profile[80], static_mv[80], behavior_mv[80], ioc_rv[80], wl_rv[80], cert_rv[80];
+  char grpc_diag[220], grpc_fail[340], http_fail[340], resource_pressure[220];
   if (!json_escape_to_buf(s_endpoint, ep, sizeof(ep)) || !json_escape_to_buf(s_agent_ver, agv, sizeof(agv)) ||
       !json_escape_to_buf(policy, pol, sizeof(pol)) || !json_escape_to_buf(p0_rules, p0, sizeof(p0)) ||
+      !json_escape_to_buf(cfg->resource_limit.profile[0] ? cfg->resource_limit.profile : "workstation", profile,
+                          sizeof(profile)) ||
       !json_escape_to_buf(avst.static_model_version, static_mv, sizeof(static_mv)) ||
       !json_escape_to_buf(avst.behavior_model_version, behavior_mv, sizeof(behavior_mv)) ||
       !json_escape_to_buf(avst.ioc_rules_version, ioc_rv, sizeof(ioc_rv)) ||
@@ -757,38 +843,114 @@ int edr_ingest_http_post_engine_health(const EdrConfig *cfg) {
       !json_escape_to_buf(avst.cert_whitelist_version, cert_rv, sizeof(cert_rv))) {
     return -1;
   }
+  if (!json_escape_to_buf(grpc_diag_raw[0] ? grpc_diag_raw : "-", grpc_diag, sizeof(grpc_diag)) ||
+      !json_escape_to_buf(grpc_fail_raw[0] ? grpc_fail_raw : "-", grpc_fail, sizeof(grpc_fail)) ||
+      !json_escape_to_buf(http_fail_raw[0] ? http_fail_raw : "-", http_fail, sizeof(http_fail)) ||
+      !json_escape_to_buf(resource_pressure_raw[0] ? resource_pressure_raw : "ok", resource_pressure,
+                          sizeof(resource_pressure))) {
+    return -1;
+  }
+  uint64_t grpc_last_success = edr_grpc_client_last_success_ms();
+  uint64_t http_last_success = edr_ingest_http_last_success_ms();
+  uint64_t grpc_last_failure = edr_grpc_client_last_failure_ms();
+  uint64_t http_last_failure = edr_ingest_http_last_failure_ms();
+  const char *latest_failure_reason = http_last_failure > grpc_last_failure ? http_fail : grpc_fail;
 
-  char health[4096];
+  char health[8192];
   int hn = snprintf(
       health, sizeof(health),
       "{\"schema\":\"agent_engine_health_v1\",\"reported_at_ms\":%" PRId64
       ",\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
-      "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u},"
-      "\"p0_rule\":{\"enabled\":true,\"mode\":\"always_on\",\"rule_version\":\"%s\"},"
+      "\"communication\":{\"grpc_ready\":%s,\"grpc_diag\":\"%s\",\"http_fallback_configured\":%s,"
+      "\"rpc_ok\":%lu,\"rpc_fail\":%lu,\"consecutive_failures\":%lu,"
+      "\"send_queue_depth\":%zu,\"send_queue_capacity\":%zu,"
+      "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
+      "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
+      "\"offline_pending\":%" PRIu64 ",\"last_success_ms\":%" PRIu64
+      ",\"last_failure_ms\":%" PRIu64 ",\"last_failure_reason\":\"%s\","
+      "\"http_post_ok\":%lu,\"http_post_fail\":%lu,\"http_last_success_ms\":%" PRIu64
+      ",\"http_last_failure_ms\":%" PRIu64 ",\"http_last_failure_reason\":\"%s\"},"
+      "\"resource\":{\"profile\":\"%s\",\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
+      "\"ave_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
+      "\"shellcode_packets_per_sec\":%u,\"low_priority_keep_percent_under_pressure\":%u,"
+      "\"cpu_percent\":%u,\"current_rss_mb\":%lu,\"thread_count\":%u,\"handle_count\":%u,"
+      "\"last_sample_ms\":%" PRIu64 ",\"pressure\":%s,\"pressure_reason\":\"%s\","
+      "\"preprocess_throttle_drops\":%" PRIu64 "},"
+      "\"p0_rule\":{\"enabled\":true,\"mode\":\"always_on\",\"control_mode\":\"forced\","
+      "\"rule_version\":\"%s\",\"cpu_percent\":%u,\"memory_mb\":%lu,\"queue_depth\":%zu,"
+      "\"last_trigger_ms\":0,\"last_degrade_reason\":\"%s\"},"
       "\"ave\":{\"enabled\":%s,\"mode\":\"%s\",\"static_model_version\":\"%s\","
+      "\"control_mode\":\"%s\",\"budget_per_min\":%u,\"cpu_percent\":%u,\"memory_mb\":%lu,"
       "\"behavior_model_version\":\"%s\",\"model_version\":\"%s\",\"rule_version\":\"%s\","
       "\"whitelist_version\":\"%s\",\"cert_whitelist_version\":\"%s\",\"queue_depth\":%d,"
-      "\"queue_capacity\":%u,\"infer_ok\":%" PRIu64 ",\"infer_fail\":%" PRIu64 "},"
+      "\"queue_capacity\":%u,\"infer_ok\":%" PRIu64 ",\"infer_fail\":%" PRIu64
+      ",\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"},"
       "\"pmfe\":{\"enabled\":%s,\"mode\":\"%s\",\"queue_depth\":%lu,\"submitted\":%lu,"
-      "\"completed\":%lu,\"dropped\":%lu,\"deduped\":%lu,\"cooldown_skipped\":%lu},"
+      "\"control_mode\":\"%s\",\"budget_per_min\":%u,\"cpu_percent\":%u,\"memory_mb\":%lu,"
+      "\"completed\":%lu,\"dropped\":%lu,\"deduped\":%lu,\"cooldown_skipped\":%lu,"
+      "\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"},"
       "\"shellcode\":{\"enabled\":%s,\"active\":%s,\"mode\":\"%s\",\"rule_version\":\"%s\","
-      "\"watch_count\":%zu,\"ports_custom\":%s},"
+      "\"control_mode\":\"%s\",\"packet_budget_per_sec\":%u,\"budget_drops\":%" PRIu64 ","
+      "\"cpu_percent\":%u,\"memory_mb\":%lu,"
+      "\"queue_depth\":0,\"watch_count\":%zu,\"ports_custom\":%s,"
+      "\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"},"
       "\"webshell\":{\"enabled\":%s,\"mode\":\"%s\",\"rule_version\":\"%s\",\"watch_count\":%u,"
-      "\"max_watch_dirs\":%u}}",
-      edr_ingest_wall_time_ms(), ep, agv, pol, (unsigned)cfg->resource_limit.cpu_limit_percent,
-      (unsigned)cfg->resource_limit.memory_limit_mb, p0, avst.initialized ? "true" : "false",
-      cfg->ave.enabled ? "enabled" : "disabled", static_mv, behavior_mv,
+      "\"control_mode\":\"%s\",\"scan_mb_per_min\":%u,\"budget_drops\":%" PRIu64 ","
+      "\"cpu_percent\":%u,\"memory_mb\":%lu,\"queue_depth\":%u,"
+      "\"max_watch_dirs\":%u,\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"}}",
+      edr_ingest_wall_time_ms(), ep, agv, pol,
+      edr_grpc_client_ready() ? "true" : "false", grpc_diag,
+      edr_ingest_http_configured() ? "true" : "false",
+      edr_grpc_client_rpc_ok(), edr_grpc_client_rpc_fail(),
+      edr_grpc_client_report_fail_streak(),
+      edr_transport_send_queue_depth(), edr_transport_send_queue_capacity(),
+      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
+      edr_transport_queue_full_sampled_count(), edr_transport_queue_full_dropped_count(),
+      edr_storage_queue_pending_count(),
+      grpc_last_success > http_last_success ? grpc_last_success : http_last_success,
+      grpc_last_failure > http_last_failure ? grpc_last_failure : http_last_failure,
+      latest_failure_reason, edr_ingest_http_post_ok(), edr_ingest_http_post_fail(),
+      http_last_success, http_last_failure, http_fail,
+      profile,
+      (unsigned)cfg->resource_limit.cpu_limit_percent,
+      (unsigned)cfg->resource_limit.memory_limit_mb,
+      (unsigned)cfg->resource_limit.ave_infer_per_min,
+      (unsigned)cfg->resource_limit.pmfe_scans_per_min,
+      (unsigned)cfg->resource_limit.webshell_scan_mb_per_min,
+      (unsigned)cfg->resource_limit.shellcode_packets_per_sec,
+      (unsigned)cfg->resource_limit.low_priority_keep_percent_under_pressure,
+      edr_resource_cpu_percent(), edr_resource_current_rss_mb(), edr_resource_thread_count(),
+      edr_resource_handle_count(), edr_resource_last_sample_ms(),
+      edr_resource_preprocess_throttle_active() ? "true" : "false", resource_pressure,
+      edr_resource_preprocess_throttle_drop_count(),
+      p0, edr_resource_cpu_percent(), edr_resource_current_rss_mb(), edr_transport_send_queue_depth(),
+      resource_pressure,
+      avst.initialized ? "true" : "false",
+      cfg->ave.enabled ? "enabled" : "disabled", static_mv, control_mode_name(cfg->ave.enabled ? 1 : 0, cfg->ave.enabled),
+      (unsigned)cfg->resource_limit.ave_infer_per_min,
+      edr_resource_cpu_percent(), edr_resource_current_rss_mb(), behavior_mv,
       behavior_mv[0] ? behavior_mv : static_mv, ioc_rv, wl_rv, cert_rv, avst.behavior_event_queue_size,
       (unsigned)avst.behavior_queue_capacity, (uint64_t)avst.behavior_infer_ok,
-      (uint64_t)avst.behavior_infer_fail, pmfe_enabled ? "true" : "false", pmfe_mode_name(cfg), pmfe_depth,
-      pmfe_sub, pmfe_done, pmfe_drop, pmfe_dedup, pmfe_cd, shellcode_enabled ? "true" : "false", shellcode_active ? "true" : "false",
+      (uint64_t)avst.behavior_infer_fail, last_ave_trigger_ms, resource_pressure,
+      pmfe_enabled ? "true" : "false", pmfe_mode_name(cfg), pmfe_depth,
+      pmfe_sub, control_mode_name(cfg->detection.pmfe_mode, pmfe_enabled),
+      (unsigned)cfg->resource_limit.pmfe_scans_per_min, edr_resource_cpu_percent(),
+      edr_resource_current_rss_mb(), pmfe_done, pmfe_drop, pmfe_dedup, pmfe_cd,
+      last_pmfe_trigger_ms, resource_pressure, shellcode_enabled ? "true" : "false", shellcode_active ? "true" : "false",
       adaptive_mode_name(cfg->detection.shellcode_mode, shellcode_enabled),
       cfg->shellcode_detector.yara_rules_dir[0] ? "yara_configured" : "builtin",
+      control_mode_name(cfg->detection.shellcode_mode, shellcode_enabled),
+      (unsigned)cfg->resource_limit.shellcode_packets_per_sec, shellcode_budget_drops, edr_resource_cpu_percent(),
+      edr_resource_current_rss_mb(),
       cfg->shellcode_detector.windivert_tcp_ports_parsed_count,
       cfg->shellcode_detector.windivert_ports_is_custom ? "true" : "false",
+      last_shellcode_trigger_ms, resource_pressure,
       webshell_enabled ? "true" : "false", adaptive_mode_name(cfg->detection.webshell_mode, webshell_enabled),
       cfg->webshell_detector.webshell_rules_dir[0] ? "yara_configured" : "builtin", webshell_watches,
-      (unsigned)cfg->webshell_detector.max_watch_dirs);
+      control_mode_name(cfg->detection.webshell_mode, webshell_enabled),
+      (unsigned)cfg->resource_limit.webshell_scan_mb_per_min, webshell_budget_drops, edr_resource_cpu_percent(),
+      edr_resource_current_rss_mb(), webshell_watches, (unsigned)cfg->webshell_detector.max_watch_dirs,
+      last_webshell_trigger_ms, resource_pressure);
   if (hn < 0 || (size_t)hn >= sizeof(health)) {
     return -1;
   }

@@ -715,6 +715,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: /Users/qiuxinliang/�
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_abort.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_bounds.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_ctermid.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_ctype.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_printf.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_stdlib.h \
@@ -734,6 +735,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: /Users/qiuxinliang/�
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/endian.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/signal.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ctype.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libkern/_OSByteOrder.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libkern/arm/_OSByteOrder.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/_structs.h \
@@ -747,6 +749,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: /Users/qiuxinliang/�
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/malloc/_malloc.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/malloc/_malloc_type.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/malloc/_ptrcheck.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/runetype.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_common.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_string.h \
@@ -793,6 +796,7 @@ CMakeFiles/edr_agent.dir/src/ave/ave_cross_engine_feed.c.o: /Users/qiuxinliang/�
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_uintptr_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_va_list.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_wchar_t.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_wint_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/appleapiopts.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/cdefs.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/resource.h \
@@ -4157,6 +4161,7 @@ CMakeFiles/edr_agent.dir/src/detection/detection_trigger.c.o: /Users/qiuxinliang
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/emit_rules.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/error.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/resource.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h
 
 CMakeFiles/edr_agent.dir/src/fl_trainer/fl_b64.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/fl_trainer/fl_b64.c \
@@ -6571,6 +6576,7 @@ CMakeFiles/edr_agent.dir/src/pmfe/pmfe_idle_scanner.c.o: /Users/qiuxinliang/工�
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/forensic_trigger.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/pmfe_engine_internal.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/pmfe_idle_scanner.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/resource.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h
 
 CMakeFiles/edr_agent.dir/src/preprocess/behavior_from_slot.c.o: /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/preprocess/behavior_from_slot.c \
@@ -8028,25 +8034,119 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.o: /Users/qiuxinliang/工程区
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/_types/_uintmax_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/alloca.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/_endian.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/_limits.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/_mcontext.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/arch.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/endian.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/limits.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/signal.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/types.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/gethostuuid.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libkern/OSByteOrder.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libkern/_OSByteOrder.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libkern/arm/OSByteOrder.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/libkern/arm/_OSByteOrder.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/_structs.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/boolean.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/exception.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/kern_return.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/processor_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/rpc.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/thread_state.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/thread_status.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/vm_param.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/vm_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/boolean.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/clock_priv.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/clock_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/dyld_kernel.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/error.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/exception_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_notify.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_priv.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_security.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_special_ports.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/kern_return.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/kmod.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_error.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_host.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_init.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_interface.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_port.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_traps.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_voucher_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/_structs.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/boolean.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/exception.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/kern_return.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/processor_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/rpc.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/thread_state.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/thread_status.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/vm_param.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/vm_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/memory_object_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/message.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mig.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mig_errors.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mig_strncpy_zerofill_support.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/ndr.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/notify.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/policy.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/port.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/processor.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/processor_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/processor_set.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/rpc.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/semaphore.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/std_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/sync_policy.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_inspect.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_policy.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_special_ports.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_act.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_policy.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_special_ports.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_status.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_switch.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/time_value.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_attributes.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_behavior.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_inherit.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_map.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_page_size.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_prot.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_purgable.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_region.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_statistics.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_sync.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/hash_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/ipc_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/lockgroup_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/mach_debug_types.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/page_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/vm_info.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/zone_info.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/_endian.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/_mcontext.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/_types.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/endian.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/limits.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/signal.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/types.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/malloc/_malloc.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/malloc/_malloc_type.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/malloc/_ptrcheck.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/os/base.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_common.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_stdio.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/secure/_string.h \
@@ -8075,6 +8175,8 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.o: /Users/qiuxinliang/工程区
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_fd_set.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_fd_setsize.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_fd_zero.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_fsid_t.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_fsobj_id_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_gid_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_id_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_int16_t.h \
@@ -8082,9 +8184,11 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.o: /Users/qiuxinliang/工程区
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_int64_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_int8_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_intptr_t.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_mach_port_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_mode_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_null.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_off_t.h \
+  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_os_inline.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_pid_t.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_posix_vdisable.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_rsize_t.h \
@@ -8121,6 +8225,12 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.o: /Users/qiuxinliang/工程区
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/wait.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/time.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/unistd.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg___gnuc_va_list.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg___va_copy.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg_header_macro.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg_va_arg.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg_va_copy.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg_va_list.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_header_macro.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_max_align_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_null.h \
@@ -8130,6 +8240,7 @@ CMakeFiles/edr_agent.dir/src/resource/resource.c.o: /Users/qiuxinliang/工程区
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_size_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stddef_wchar_t.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/ptrcheck.h \
+  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdarg.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdbool.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h \
   /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h \
@@ -10445,7 +10556,10 @@ CMakeFiles/edr_agent.dir/src/transport/ingest_http.c.o: /Users/qiuxinliang/工�
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/grpc_client.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ingest_http.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/pmfe.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/resource.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_detector.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/storage_queue.h \
+  /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/transport_sink.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/types.h \
   /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/webshell_detector.h
 
@@ -11365,8 +11479,6 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 
 /opt/homebrew/include/yara/stopwatch.h:
 
-/opt/homebrew/include/yara/scanner.h:
-
 /opt/homebrew/include/yara/rules.h:
 
 /opt/homebrew/include/yara/object.h:
@@ -11393,42 +11505,6 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/shellcode_known.h:
 
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/os/base.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_sync.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_region.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_purgable.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_page_size.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_inherit.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_attributes.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_status.h:
-
-/opt/homebrew/include/yara/re.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_special_ports.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_special_ports.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_policy.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_inspect.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_info.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_notify.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/exception_types.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/clock_types.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/vm_param.h:
-
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/assert.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/tomlc99/toml.c:
@@ -11443,23 +11519,101 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/shellcode_detector_none.c:
 
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/proto_parse.h:
-
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_behavior.h:
-
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/serialize/behavior_proto_c.c:
-
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb_encode.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/response/response_utils.c:
 
-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/dyld_kernel.h:
+/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/response/response_file.c:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/os/base.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/zone_info.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/page_info.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/lockgroup_info.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/hash_info.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_sync.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_region.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_purgable.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_map.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_inherit.h:
+
+/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/serialize/behavior_proto_c.c:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_behavior.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_attributes.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_switch.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_status.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_special_ports.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_policy.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_inspect.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task_info.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/semaphore.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/processor.h:
+
+/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/proto_parse.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/notify.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/ndr.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mig_errors.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_traps.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_interface.h:
+
+/opt/homebrew/include/yara/re.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_special_ports.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_init.h:
+
+/opt/homebrew/include/yara/scanner.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_host.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/thread_act.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_error.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/vm_page_size.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_security.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_notify.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/exception_types.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/shellcode_detector/shellcode_entropy.c:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/response/response_forensic.c:
 
-/Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/response/response_file.c:
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/dyld_kernel.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/clock_types.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/clock_priv.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/vm_param.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/arm/rpc.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb.h:
 
@@ -11492,6 +11646,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/pmfe/pmfe_engine.c:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/third_party/nanopb/pb_encode.c:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/task.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/pid_history_pmfe.h:
 
@@ -11562,6 +11718,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 /opt/homebrew/include/openssl/quic.h:
 
 /opt/homebrew/include/openssl/prov_ssl.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_port.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/fl_trainer/fl_trainer.c:
 
@@ -11779,6 +11937,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/net/net_kev.h:
 
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/machine/rpc.h:
+
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/ave_behavior_features.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/p0_rule_ir.h:
@@ -11809,6 +11969,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/arm/_param.h:
 
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/rpc.h:
+
 /opt/homebrew/include/openssl/ssl.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/detection_profile.h:
@@ -11826,6 +11988,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/signal.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/command/shell_exec.c:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mig.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/command/sha256.c:
 
@@ -11924,6 +12088,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/include/edr/sha256.h:
 
 /Users/qiuxinliang/工程区/EDR\ DEV/AI\ Agent/edr-agent/src/ave/ave_db_update.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/host_priv.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/dirent.h:
 
@@ -12024,6 +12190,8 @@ CMakeFiles/edr_agent.dir/third_party/tomlc99/toml.c.o: /Users/qiuxinliang/工程
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_fd_def.h:
 
 /opt/homebrew/include/openssl/bioerr.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mig_strncpy_zerofill_support.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_u_short.h:
 
@@ -12267,6 +12435,8 @@ edr_p0_rule_ir_embed.c:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stddef.h:
 
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/mach_debug_types.h:
+
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_blkcnt_t.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdlib.h:
@@ -12329,6 +12499,8 @@ edr_p0_rule_ir_embed.c:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/types.h:
 
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/sync_policy.h:
+
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/machine/_types.h:
 
 /Library/Developer/CommandLineTools/usr/lib/clang/21/include/__stdarg_va_copy.h:
@@ -12354,6 +12526,8 @@ edr_p0_rule_ir_embed.c:
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach_time.h:
 
 /opt/homebrew/include/openssl/types.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/mach.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_clock_t.h:
 
@@ -12425,6 +12599,8 @@ edr_p0_rule_ir_embed.c:
 
 /opt/homebrew/include/openssl/core_dispatch.h:
 
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach/processor_set.h:
+
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_pthread/_pthread_rwlock_t.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/types.h:
@@ -12448,6 +12624,8 @@ edr_p0_rule_ir_embed.c:
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/_types/_errno_t.h:
 
 /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/AvailabilityInternal.h:
+
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/mach_debug/vm_info.h:
 
 /opt/homebrew/include/openssl/dsaerr.h:
 

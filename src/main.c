@@ -271,6 +271,9 @@ int main(int argc, char **argv) {
   {
     const char *qpath = getenv("EDR_QUEUE_PATH");
     const EdrConfig *ac = edr_agent_get_config(agent);
+    if (ac) {
+      edr_storage_queue_configure(ac->offline.max_queue_size_mb, ac->offline.retention_hours);
+    }
     if ((!qpath || !qpath[0]) && ac && ac->offline.queue_db_path[0]) {
       qpath = ac->offline.queue_db_path;
     }
