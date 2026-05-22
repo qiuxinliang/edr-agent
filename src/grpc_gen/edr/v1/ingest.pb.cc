@@ -529,7 +529,7 @@ const char descriptor_table_protodef_edr_2fv1_2fingest_2eproto[] ABSL_ATTRIBUTE_
     "\022\037\n\033COMMAND_EXECUTION_STATUS_OK\020\001\022%\n!COM"
     "MAND_EXECUTION_STATUS_REJECTED\020\002\022#\n\037COMM"
     "AND_EXECUTION_STATUS_FAILED\020\003\022)\n%COMMAND"
-    "_EXECUTION_STATUS_UNKNOWN_TYPE\020\0042\263\002\n\013Eve"
+    "_EXECUTION_STATUS_UNKNOWN_TYPE\020\0042\372\002\n\013Eve"
     "ntIngest\022I\n\014ReportEvents\022\033.edr.v1.Report"
     "EventsRequest\032\034.edr.v1.ReportEventsRespo"
     "nse\022@\n\tSubscribe\022\030.edr.v1.SubscribeReque"
@@ -537,15 +537,16 @@ const char descriptor_table_protodef_edr_2fv1_2fingest_2eproto[] ABSL_ATTRIBUTE_
     "ommandResult\022\".edr.v1.ReportCommandResul"
     "tRequest\032#.edr.v1.ReportCommandResultRes"
     "ponse\0227\n\nUploadFile\022\021.edr.v1.FileChunk\032\024"
-    ".edr.v1.UploadResult(\001B1Z/edr-backend/pl"
-    "atform/internal/edrpb/edrv1;edrv1b\006proto"
-    "3"
+    ".edr.v1.UploadResult(\001\022E\n\rControlStream\022"
+    "\027.edr.v1.CommandEnvelope\032\027.edr.v1.Comman"
+    "dEnvelope(\0010\001B1Z/edr-backend/platform/in"
+    "ternal/edrpb/edrv1;edrv1b\006proto3"
 };
 static ::absl::once_flag descriptor_table_edr_2fv1_2fingest_2eproto_once;
 PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_edr_2fv1_2fingest_2eproto = {
     false,
     false,
-    1721,
+    1792,
     descriptor_table_protodef_edr_2fv1_2fingest_2eproto,
     "edr/v1/ingest.proto",
     &descriptor_table_edr_2fv1_2fingest_2eproto_once,

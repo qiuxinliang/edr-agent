@@ -26,6 +26,17 @@ static int open_ro(const char *path, sqlite3 **out) {
   return 0;
 }
 
+static int open_rw(const char *path, sqlite3 **out) {
+  if (sqlite3_open_v2(path, out, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) {
+    if (*out) {
+      sqlite3_close(*out);
+      *out = NULL;
+    }
+    return -1;
+  }
+  return 0;
+}
+
 int edr_ave_file_hash_whitelist_hit(const struct EdrConfig *cfg, const char sha256_hex[65]) {
   if (!cfg || !sha256_hex || !sha256_hex[0]) {
     return 0;
@@ -276,6 +287,123 @@ int edr_ave_l4_non_exempt_hit(const struct EdrConfig *cfg, const char sha256_hex
   return hit;
 }
 
+static void fill_noise_decision(EdrAveTenantNoiseDecision *out, const char *action, const char *policy_version,
+                                float score_delta, float raw_confidence, int gray_percent) {
+  memset(out, 0, sizeof(*out));
+  snprintf(out->action, sizeof(out->action), "%s", action && action[0] ? action : "observe");
+  snprintf(out->policy_version, sizeof(out->policy_version), "%s",
+           policy_version && policy_version[0] ? policy_version : "tenant-noise-policy");
+  out->score_delta = score_delta;
+  out->adjusted_confidence = raw_confidence + score_delta;
+  if (out->adjusted_confidence < 0.0f) {
+    out->adjusted_confidence = 0.0f;
+  } else if (out->adjusted_confidence > 1.0f) {
+    out->adjusted_confidence = 1.0f;
+  }
+  out->gray_percent = gray_percent < 0 ? 0u : (gray_percent > 100 ? 100u : (uint32_t)gray_percent);
+  out->suppress = strcmp(out->action, "suppress") == 0;
+  out->needs_review = strcmp(out->action, "review") == 0;
+  out->observe_only = strcmp(out->action, "observe") == 0;
+}
+
+int edr_ave_tenant_noise_lookup(const struct EdrConfig *cfg, const char *tenant_id, const char *model_version,
+                                const char *rule_name, float raw_confidence, EdrAveTenantNoiseDecision *out) {
+  if (out) {
+    memset(out, 0, sizeof(*out));
+  }
+  if (!cfg || !out || !path_ok(cfg->ave.behavior_policy_db_path)) {
+    return 0;
+  }
+  sqlite3 *db = NULL;
+  if (open_ro(cfg->ave.behavior_policy_db_path, &db) != 0) {
+    return 0;
+  }
+  const char *sql =
+      "SELECT action, COALESCE(score_delta,0), COALESCE(policy_version,''), COALESCE(gray_percent,0) "
+      "FROM ave_tenant_noise_policy "
+      "WHERE COALESCE(is_active,1)=1 "
+      "AND tenant_id IN (?, '*') "
+      "AND model_version IN (?, '*') "
+      "AND rule_name IN (?, '*') "
+      "AND ? >= COALESCE(min_confidence,0) "
+      "AND ? <= COALESCE(max_confidence,1) "
+      "ORDER BY CASE WHEN tenant_id=? THEN 0 ELSE 1 END, "
+      "CASE WHEN model_version=? THEN 0 ELSE 1 END, "
+      "CASE WHEN rule_name=? THEN 0 ELSE 1 END, updated_at DESC LIMIT 1";
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+    sqlite3_close(db);
+    return 0;
+  }
+  const char *tenant = tenant_id && tenant_id[0] ? tenant_id : "*";
+  const char *model = model_version && model_version[0] ? model_version : "*";
+  const char *rule = rule_name && rule_name[0] ? rule_name : "*";
+  sqlite3_bind_text(st, 1, tenant, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, model, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, rule, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_double(st, 4, raw_confidence);
+  sqlite3_bind_double(st, 5, raw_confidence);
+  sqlite3_bind_text(st, 6, tenant, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 7, model, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 8, rule, -1, SQLITE_TRANSIENT);
+  int hit = 0;
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *action = (const char *)sqlite3_column_text(st, 0);
+    float delta = (float)sqlite3_column_double(st, 1);
+    const char *policy = (const char *)sqlite3_column_text(st, 2);
+    int gray = sqlite3_column_int(st, 3);
+    fill_noise_decision(out, action, policy, delta, raw_confidence, gray);
+    hit = 1;
+  }
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return hit;
+}
+
+int edr_ave_gray_eval_record(const struct EdrConfig *cfg, const char *tenant_id, const char *model_version,
+                             const char *policy_version, const char *rule_name, float raw_confidence,
+                             float adjusted_confidence, const char *decision, const char *shadow_verdict) {
+  if (!cfg || !path_ok(cfg->ave.behavior_policy_db_path)) {
+    return -1;
+  }
+  sqlite3 *db = NULL;
+  if (open_rw(cfg->ave.behavior_policy_db_path, &db) != 0) {
+    return -1;
+  }
+  const char *ddl =
+      "CREATE TABLE IF NOT EXISTS ave_model_gray_eval ("
+      "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "tenant_id TEXT, model_version TEXT, policy_version TEXT, rule_name TEXT,"
+      "raw_confidence REAL, adjusted_confidence REAL, decision TEXT, shadow_verdict TEXT,"
+      "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)";
+  char *err = NULL;
+  if (sqlite3_exec(db, ddl, NULL, NULL, &err) != SQLITE_OK) {
+    sqlite3_free(err);
+    sqlite3_close(db);
+    return -1;
+  }
+  sqlite3_stmt *st = NULL;
+  const char *sql =
+      "INSERT INTO ave_model_gray_eval (tenant_id,model_version,policy_version,rule_name,raw_confidence,"
+      "adjusted_confidence,decision,shadow_verdict) VALUES (?,?,?,?,?,?,?,?)";
+  if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+    sqlite3_close(db);
+    return -1;
+  }
+  sqlite3_bind_text(st, 1, tenant_id ? tenant_id : "", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, model_version ? model_version : "", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, policy_version ? policy_version : "", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 4, rule_name ? rule_name : "", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_double(st, 5, raw_confidence);
+  sqlite3_bind_double(st, 6, adjusted_confidence);
+  sqlite3_bind_text(st, 7, decision ? decision : "", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 8, shadow_verdict ? shadow_verdict : "", -1, SQLITE_TRANSIENT);
+  int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return rc;
+}
+
 #else
 
 int edr_ave_file_hash_whitelist_hit(const struct EdrConfig *cfg, const char sha256_hex[65]) {
@@ -314,6 +442,34 @@ int edr_ave_l4_non_exempt_hit(const struct EdrConfig *cfg, const char sha256_hex
   (void)sha256_hex;
   (void)escalate_malware_out;
   return 0;
+}
+
+int edr_ave_tenant_noise_lookup(const struct EdrConfig *cfg, const char *tenant_id, const char *model_version,
+                                const char *rule_name, float raw_confidence, EdrAveTenantNoiseDecision *out) {
+  (void)cfg;
+  (void)tenant_id;
+  (void)model_version;
+  (void)rule_name;
+  (void)raw_confidence;
+  if (out) {
+    memset(out, 0, sizeof(*out));
+  }
+  return 0;
+}
+
+int edr_ave_gray_eval_record(const struct EdrConfig *cfg, const char *tenant_id, const char *model_version,
+                             const char *policy_version, const char *rule_name, float raw_confidence,
+                             float adjusted_confidence, const char *decision, const char *shadow_verdict) {
+  (void)cfg;
+  (void)tenant_id;
+  (void)model_version;
+  (void)policy_version;
+  (void)rule_name;
+  (void)raw_confidence;
+  (void)adjusted_confidence;
+  (void)decision;
+  (void)shadow_verdict;
+  return -1;
 }
 
 #endif

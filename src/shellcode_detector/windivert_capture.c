@@ -12,9 +12,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <wincrypt.h>
 
-#include "edr/response.h"
+#include "edr/command.h"
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
@@ -22,7 +23,6 @@
 #include "edr/shellcode_known.h"
 #include "edr/shellcode_detector.h"
 #include "edr/types.h"
-#include "edr/edr_log.h"
 
 #include "windivert_abi.h"
 
@@ -50,11 +50,13 @@ static const char kWdFilter[] =
     "tcp.DstPort == 445 or tcp.DstPort == 139 or "
     "tcp.DstPort == 3389 or "
     "tcp.DstPort == 5985 or tcp.DstPort == 5986 or "
+    "tcp.DstPort == 443 or tcp.DstPort == 8443 or "
     "tcp.DstPort == 135 or "
     "tcp.DstPort == 389 or tcp.DstPort == 636 or tcp.DstPort == 3268 or tcp.DstPort == 3269 or "
     "tcp.SrcPort == 445 or tcp.SrcPort == 139 or "
     "tcp.SrcPort == 3389 or "
     "tcp.SrcPort == 5985 or tcp.SrcPort == 5986 or "
+    "tcp.SrcPort == 443 or tcp.SrcPort == 8443 or "
     "tcp.SrcPort == 389 or tcp.SrcPort == 636 or tcp.SrcPort == 3268 or tcp.SrcPort == 3269"
     ")";
 
@@ -86,9 +88,6 @@ static uint32_t s_ring_stride;
 static uint32_t s_ring_w;
 static uint32_t s_ring_r;
 static uint32_t s_ring_count;
-static ULONGLONG s_budget_window_ms;
-static uint32_t s_budget_packet_count;
-static volatile LONG64 s_budget_drops;
 
 static uint64_t edr_win_now_ns(void) {
   FILETIME ft;
@@ -160,21 +159,9 @@ static void mkdir_p_win(const char *dir) {
   if (!dir || !dir[0]) {
     return;
   }
-  char tmp[1024];
-  size_t n = strlen(dir);
-  if (n >= sizeof(tmp)) {
-    return;
-  }
-  memcpy(tmp, dir, n + 1u);
-  for (char *p = tmp + 1; *p; p++) {
-    if (*p == '\\' || *p == '/') {
-      char bak = *p;
-      *p = '\0';
-      (void)CreateDirectoryA(tmp, NULL);
-      *p = bak;
-    }
-  }
-  (void)CreateDirectoryA(tmp, NULL);
+  char cmd[1200];
+  snprintf(cmd, sizeof(cmd), "cmd /c mkdir \"%s\" 2>nul", dir);
+  (void)system(cmd);
 }
 
 static void pcap_write_global_header(FILE *f, uint32_t linktype) {
@@ -280,27 +267,6 @@ static void ring_packet_push(const uint8_t *ip_pkt, UINT ip_len, int is_v6) {
   } else {
     s_ring_r = (s_ring_r + 1u) % s_ring_slots;
   }
-}
-
-static int packet_budget_allow(void) {
-  if (!s_cfg || s_cfg->resource_limit.shellcode_packets_per_sec == 0u) {
-    return 1;
-  }
-  ULONGLONG now = GetTickCount64();
-  if (s_budget_window_ms == 0u || now < s_budget_window_ms || now - s_budget_window_ms >= 1000u) {
-    s_budget_window_ms = now;
-    s_budget_packet_count = 0u;
-  }
-  if (s_budget_packet_count >= s_cfg->resource_limit.shellcode_packets_per_sec) {
-    InterlockedIncrement64(&s_budget_drops);
-    return 0;
-  }
-  s_budget_packet_count++;
-  return 1;
-}
-
-uint64_t edr_windivert_capture_budget_drop_count(void) {
-  return (uint64_t)InterlockedCompareExchange64(&s_budget_drops, 0, 0);
 }
 
 static int write_ring_pcap(const char *path) {
@@ -410,16 +376,16 @@ static void log_windivert_service_hint(void) {
     }
     SERVICE_STATUS ss;
     if (QueryServiceStatus(svc, &ss)) {
-      EDR_LOGV_SHEL("[shellcode_detector] SCM service '%s' state=%lu (RUNNING=4)\n", names[i],
-                    (unsigned long)ss.dwCurrentState);
+      fprintf(stderr, "[shellcode_detector] SCM service '%s' state=%lu (RUNNING=4)\n", names[i],
+              (unsigned long)ss.dwCurrentState);
       CloseServiceHandle(svc);
       CloseServiceHandle(scm);
       return;
     }
     CloseServiceHandle(svc);
   }
-  EDR_LOGV_SHEL("%s", "[shellcode_detector] no WinDivert service in SCM (driver may still load; WinDivertOpen will "
-                      "confirm)\n");
+  fprintf(stderr,
+          "[shellcode_detector] no WinDivert service in SCM (driver may still load; WinDivertOpen will confirm)\n");
   CloseServiceHandle(scm);
 }
 
@@ -445,6 +411,9 @@ static int monitor_allows(const EdrConfig *c, uint16_t dp, uint16_t sp) {
   if ((dp == 5985u || dp == 5986u || sp == 5985u || sp == 5986u) && !c->shellcode_detector.monitor_winrm) {
     return 0;
   }
+  if ((dp == 443u || dp == 8443u || sp == 443u || sp == 8443u) && !c->shellcode_detector.monitor_tls) {
+    return 0;
+  }
   if ((dp == 135u || sp == 135u) && !c->shellcode_detector.monitor_msrpc) {
     return 0;
   }
@@ -454,6 +423,34 @@ static int monitor_allows(const EdrConfig *c, uint16_t dp, uint16_t sp) {
     return 0;
   }
   return 1;
+}
+
+static uint32_t tcp_owner_pid_v4(UINT32 src_addr, UINT32 dst_addr, uint16_t sp, uint16_t dp) {
+  DWORD need = 0;
+  if (GetExtendedTcpTable(NULL, &need, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER ||
+      need == 0u) {
+    return 0u;
+  }
+  PMIB_TCPTABLE_OWNER_PID tab = (PMIB_TCPTABLE_OWNER_PID)malloc(need);
+  if (!tab) {
+    return 0u;
+  }
+  uint32_t pid = 0u;
+  if (GetExtendedTcpTable(tab, &need, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+    for (DWORD i = 0; i < tab->dwNumEntries; i++) {
+      MIB_TCPROW_OWNER_PID *r = &tab->table[i];
+      uint16_t lp = ntohs((u_short)r->dwLocalPort);
+      uint16_t rp = ntohs((u_short)r->dwRemotePort);
+      int fwd = (r->dwLocalAddr == src_addr && r->dwRemoteAddr == dst_addr && lp == sp && rp == dp);
+      int rev = (r->dwLocalAddr == dst_addr && r->dwRemoteAddr == src_addr && lp == dp && rp == sp);
+      if (fwd || rev) {
+        pid = (uint32_t)r->dwOwningPid;
+        break;
+      }
+    }
+  }
+  free(tab);
+  return pid;
 }
 
 static const char *kind_name(EdrProtoKind k) {
@@ -473,10 +470,11 @@ static const char *kind_name(EdrProtoKind k) {
 
 static int push_alert(double score, const char *detector_label, const char *rule_name, const char *proto_label,
                       uint16_t dpt, uint16_t spt, const char *src, const char *dst, const uint8_t *evidence,
-                      uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6) {
+                      uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6,
+                      uint32_t owner_pid) {
   if (!s_bus) {
-    EDR_LOGV_SHEL("[shellcode_detector] score=%.3f proto=%s %s:%u -> %s:%u (no event bus)\n", score, proto_label, src,
-                  (unsigned)spt, dst, (unsigned)dpt);
+    fprintf(stderr, "[shellcode_detector] score=%.3f proto=%s %s:%u -> %s:%u (no event bus)\n", score, proto_label,
+            src, (unsigned)spt, dst, (unsigned)dpt);
     return 0;
   }
   int wrote_pcap_ok = 0;
@@ -498,8 +496,8 @@ static int push_alert(double score, const char *detector_label, const char *rule
         forensic_kind = "ring";
         forensic_frames = s_ring_count;
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_ring_%llu_%lu", tsn, pid);
-        EDR_LOGV_SHEL("[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", pcap_path,
-                    (unsigned)s_ring_count);
+        fprintf(stderr, "[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", pcap_path,
+                (unsigned)s_ring_count);
       }
     } else if (ip_packet && ip_len > 0u) {
       snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
@@ -508,7 +506,7 @@ static int push_alert(double score, const char *detector_label, const char *rule
         wrote_pcap_ok = 1;
         forensic_kind = "single";
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_%llu_%lu", tsn, pid);
-        EDR_LOGV_SHEL("[shellcode_detector] wrote pcap %s\n", pcap_path);
+        fprintf(stderr, "[shellcode_detector] wrote pcap %s\n", pcap_path);
       }
     }
   }
@@ -526,7 +524,8 @@ static int push_alert(double score, const char *detector_label, const char *rule
 
   char wx[EDR_MAX_EVENT_PAYLOAD];
   int base = snprintf(wx, sizeof(wx),
-                      "ETW1\nprov=windivert\ndetector=%s\nrule=%s\nscore=%.6f\nproto=%s\ndpt=%u\nspt=%u\nsrc=%s\ndst=%s\n",
+                      "ETW1\nprov=windivert\nepid=%u\ndetector=%s\nrule=%s\nscore=%.6f\nproto=%s\ndpt=%u\nspt=%u\nsrc=%s\ndst=%s\n",
+                      (unsigned)owner_pid,
                       detector_label ? detector_label : "heuristic", rule_name ? rule_name : "-", score, proto_label,
                       (unsigned)dpt, (unsigned)spt, src, dst);
   if (base < 0 || (size_t)base >= sizeof(wx)) {
@@ -617,13 +616,41 @@ static int push_alert(double score, const char *detector_label, const char *rule
     fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
   }
   if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
-    edr_response_isolate_auto_from_shellcode();
+    edr_isolate_auto_from_shellcode_alarm();
   }
   return 0;
 }
 
+static void push_tls_clienthello_event(const EdrTlsClientHelloInfo *ti, uint16_t dpt, uint16_t spt,
+                                       const char *src, const char *dst, uint32_t owner_pid) {
+  if (!s_bus || !ti) {
+    return;
+  }
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_win_now_ns();
+  slot.type = EDR_EVENT_NET_TLS_HANDSHAKE;
+  slot.priority = ti->sni_suspicious ? 1u : 2u;
+  char wx[EDR_MAX_EVENT_PAYLOAD];
+  int n = snprintf(wx, sizeof(wx),
+                   "ETW1\nprov=tls_sensor\nsensor=tls_clienthello\nepid=%u\nproto=tls\nsrc=%s\ndst=%s\nspt=%u\ndpt=%u\n"
+                   "ja3=%s\ntls_sni=%s\nsni_suspicious=%u\n",
+                   (unsigned)owner_pid, src ? src : "", dst ? dst : "", (unsigned)spt, (unsigned)dpt,
+                   ti->ja3[0] ? ti->ja3 : "-", ti->sni[0] ? ti->sni : "-", (unsigned)ti->sni_suspicious);
+  if (n <= 0) {
+    return;
+  }
+  if ((size_t)n >= sizeof(wx)) {
+    n = (int)sizeof(wx) - 1;
+  }
+  memcpy(slot.data, wx, (size_t)n);
+  slot.size = (uint32_t)n;
+  (void)edr_event_bus_try_push(s_bus, &slot);
+}
+
 static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6_pkt, const uint8_t *pl,
-                                uint32_t plen, uint16_t dpt, uint16_t spt, const char *src, const char *dst) {
+                                uint32_t plen, uint16_t dpt, uint16_t spt, const char *src, const char *dst,
+                                uint32_t owner_pid) {
   if (!s_cfg || plen == 0u) {
     return;
   }
@@ -634,6 +661,14 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   uint32_t n = plen;
   if (n > cap) {
     n = cap;
+  }
+  EdrTlsClientHelloInfo tlsi;
+  if (edr_proto_parse_tls_client_hello(pl, n, &tlsi)) {
+    push_tls_clienthello_event(&tlsi, dpt, spt, src, dst, owner_pid);
+    return;
+  }
+  if (n >= 3u && pl[0] == 0x16u && pl[1] == 0x03u) {
+    return;
   }
   EdrProtoShellcodeRegion reg;
   EdrProtoParseResult pr = edr_proto_find_shellcode_region(pl, n, &reg);
@@ -648,7 +683,8 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   char rule_name[96];
   EdrProtoKind k = (pr == EDR_PROTO_PARSE_OK) ? reg.kind : EDR_PROTO_KIND_UNKNOWN;
   if (edr_shellcode_match_known_exploit(scan, slen, k, rule_name, sizeof(rule_name))) {
-    (void)push_alert(1.0, "yara", rule_name, proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt);
+    (void)push_alert(1.0, "yara", rule_name, proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+                     owner_pid);
     return;
   }
   double sc = edr_shellcode_heuristic_score(scan, slen);
@@ -659,7 +695,8 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   if (sc < s_cfg->shellcode_detector.alert_threshold) {
     return;
   }
-  (void)push_alert(sc, "heuristic", "-", proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt);
+  (void)push_alert(sc, "heuristic", "-", proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+                   owner_pid);
 }
 
 static DWORD WINAPI wd_thread_main(void *arg) {
@@ -701,17 +738,16 @@ static DWORD WINAPI wd_thread_main(void *arg) {
     if (!tcp || !data || datalen == 0) {
       continue;
     }
-    uint16_t sp = tcp->SrcPort;
-    uint16_t dp = tcp->DstPort;
+    uint16_t sp = ntohs(tcp->SrcPort);
+    uint16_t dp = ntohs(tcp->DstPort);
     if (!monitor_allows(s_cfg, dp, sp)) {
-      continue;
-    }
-    if (!packet_budget_allow()) {
       continue;
     }
     char src[64], dst[64];
     int is_v6 = 0;
+    uint32_t owner_pid = 0u;
     if (ip) {
+      owner_pid = tcp_owner_pid_v4(ip->SrcAddr, ip->DstAddr, sp, dp);
       ipv4_ntoa(ip->SrcAddr, src, sizeof(src));
       ipv4_ntoa(ip->DstAddr, dst, sizeof(dst));
     } else if (ipv6) {
@@ -721,7 +757,7 @@ static DWORD WINAPI wd_thread_main(void *arg) {
       continue;
     }
     ring_packet_push(buf, recvlen, is_v6);
-    inspect_tcp_payload(buf, recvlen, is_v6, (const uint8_t *)data, (uint32_t)datalen, dp, sp, src, dst);
+    inspect_tcp_payload(buf, recvlen, is_v6, (const uint8_t *)data, (uint32_t)datalen, dp, sp, src, dst, owner_pid);
   }
   return 0;
 }
@@ -772,7 +808,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) {
       s_wsa_started = 1;
     } else {
-      EDR_LOGE("[shellcode_detector] WSAStartup failed (IPv6 地址显示可能异常)\n");
+      fprintf(stderr, "[shellcode_detector] WSAStartup failed (IPv6 地址显示可能异常)\n");
     }
   }
   UINT64 flags = (UINT64)(WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
@@ -786,11 +822,11 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
   const char *wd_filter = kWdFilter;
   if (cfg->shellcode_detector.windivert_ports_is_custom && cfg->shellcode_detector.windivert_tcp_ports_parsed_count > 0u) {
     if (build_windivert_filter_string(cfg, s_wd_filter_dyn, sizeof(s_wd_filter_dyn)) != 0) {
-      EDR_LOGV_SHEL("%s", "[shellcode_detector] WinDivert 过滤器字符串过长，回退内置端口表\n");
+      fprintf(stderr, "[shellcode_detector] WinDivert 过滤器字符串过长，回退内置端口表\n");
     } else {
       wd_filter = s_wd_filter_dyn;
-      EDR_LOGV_SHEL("[shellcode_detector] WinDivert 自定义 TCP 端口数=%zu\n",
-                    cfg->shellcode_detector.windivert_tcp_ports_parsed_count);
+      fprintf(stderr, "[shellcode_detector] WinDivert 自定义 TCP 端口数=%zu\n",
+              cfg->shellcode_detector.windivert_tcp_ports_parsed_count);
     }
   }
   s_handle = s_open(wd_filter, (WINDIVERT_LAYER)0, pri, flags);
@@ -816,14 +852,14 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     size_t need = (size_t)slots * (size_t)s_ring_stride;
     s_ring_mem = (uint8_t *)calloc(1, need);
     if (!s_ring_mem) {
-      EDR_LOGE("[shellcode_detector] ring buffer alloc failed (need %zu bytes), ring disabled\n", need);
+      fprintf(stderr, "[shellcode_detector] ring buffer alloc failed (need %zu bytes), ring disabled\n", need);
     } else {
       s_ring_slots = slots;
       s_ring_w = 0;
       s_ring_r = 0;
       s_ring_count = 0;
-      EDR_LOGV_SHEL("[shellcode_detector] ring buffer: slots=%u max_pkt=%u (~%zu KiB)\n", slots, maxp,
-                    (need + 1023u) / 1024u);
+      fprintf(stderr, "[shellcode_detector] ring buffer: slots=%u max_pkt=%u (~%zu KiB)\n", slots, maxp,
+              (need + 1023u) / 1024u);
     }
   }
 
@@ -839,7 +875,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     s_wd_dll = NULL;
     return EDR_ERR_INTERNAL;
   }
-  EDR_LOGV_SHEL("%s", "[shellcode_detector] WinDivert 捕获线程已启动（SNIFF+RECV_ONLY）\n");
+  fprintf(stderr, "[shellcode_detector] WinDivert 捕获线程已启动（SNIFF+RECV_ONLY）\n");
   return EDR_OK;
 }
 

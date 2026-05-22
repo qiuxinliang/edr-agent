@@ -1,177 +1,26 @@
 #include "edr/ingest_http.h"
 
-#include "edr/command.h"
-#include "edr/ave_sdk.h"
-#include "edr/config.h"
-#include "edr/edr_log.h"
-#include "edr/grpc_client.h"
-#include "edr/pmfe.h"
-#include "edr/resource.h"
-#include "edr/shellcode_detector.h"
-#include "edr/storage_queue.h"
-#include "edr/transport_sink.h"
-#include "edr/webshell_detector.h"
-
-/* CMake：EDR_NO_GRPC_CLIENT=1 时必须 EDR_HAVE_LIBCURL=1，否则不生成此翻译单元。 */
-#if defined(EDR_NO_GRPC_CLIENT) && !defined(EDR_HAVE_LIBCURL)
-#error "EDR：无 gRPC 客户端时必须以 libcurl 内嵌实现 ingest HTTP，请用 CMake 正确 find CURL::libcurl（如 vcpkg 安装 curl）"
-#endif
-
-#include <ctype.h>
-#include <errno.h>
-#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <time.h>
 
 #ifdef _WIN32
-#include <process.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #else
-#include <pthread.h>
-#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
-#ifdef EDR_HAVE_LIBCURL
-#include <curl/curl.h>
+#ifdef EDR_HAVE_OPENSSL_HTTP
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #endif
-
-#ifndef _WIN32
-#include <sys/time.h>
-#endif
-
-#ifdef _WIN32
-static void win_path_fwd_slashes(char *p) {
-  if (!p) {
-    return;
-  }
-  for (; *p; ++p) {
-    if (*p == '\\') {
-      *p = '/';
-    }
-  }
-}
-#endif
-
-static int64_t edr_ingest_wall_time_ms(void) {
-#ifdef _WIN32
-  FILETIME ft;
-  GetSystemTimeAsFileTime(&ft);
-  uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | (uint32_t)ft.dwLowDateTime;
-  t = t / 10000ULL;
-  if (t < 11644473600000ULL) {
-    return 0;
-  }
-  return (int64_t)(t - 11644473600000ULL);
-#else
-  struct timeval tv;
-  if (gettimeofday(&tv, NULL) != 0) {
-    return (int64_t)time(NULL) * 1000;
-  }
-  return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
-#endif
-}
-
-static size_t json_escaped_size(const char *s) {
-  if (!s) {
-    return 0;
-  }
-  size_t tot = 0;
-  for (; *s; ++s) {
-    unsigned char c = (unsigned char)*s;
-    switch (c) {
-      case '"':
-      case '\\':
-        tot += 2u;
-        break;
-      case '\b':
-      case '\f':
-      case '\n':
-      case '\r':
-      case '\t':
-        tot += 2u;
-        break;
-      default:
-        if (c < 0x20u) {
-          tot += 6u; /* \uXXXX */
-        } else {
-          tot += 1u;
-        }
-        break;
-    }
-  }
-  return tot;
-}
-
-static int json_escape_to_buf(const char *s, char *out, size_t cap) {
-  if (!s || !out || cap < 2u) {
-    return 0;
-  }
-  size_t w = 0;
-  for (; *s; ++s) {
-    if (w + 8u >= cap) {
-      return 0;
-    }
-    unsigned char c = (unsigned char)*s;
-    switch (c) {
-      case '"':
-        out[w++] = '\\';
-        out[w++] = '"';
-        break;
-      case '\\':
-        out[w++] = '\\';
-        out[w++] = '\\';
-        break;
-      case '\b':
-        memcpy(out + w, "\\b", 2u);
-        w += 2u;
-        break;
-      case '\f':
-        memcpy(out + w, "\\f", 2u);
-        w += 2u;
-        break;
-      case '\n':
-        memcpy(out + w, "\\n", 2u);
-        w += 2u;
-        break;
-      case '\r':
-        memcpy(out + w, "\\r", 2u);
-        w += 2u;
-        break;
-      case '\t':
-        memcpy(out + w, "\\t", 2u);
-        w += 2u;
-        break;
-      default:
-        if (c < 0x20u) {
-          w += (size_t)snprintf((char *)out + w, cap - w, "\\u%04x", (unsigned)c);
-        } else {
-          out[w++] = (char)c;
-        }
-        break;
-    }
-  }
-  if (w >= cap) {
-    return 0;
-  }
-  out[w] = 0;
-  return (int)w;
-}
-
-static void fprint_curl_cfg_dquoted_body(FILE *f, const char *s) {
-  if (!f || !s) {
-    return;
-  }
-  for (; *s; ++s) {
-    if (*s == '\\' || *s == '"') {
-      fputc('\\', f);
-    }
-    fputc(*s, f);
-  }
-}
 
 #ifndef EDR_AGENT_VERSION_STRING
 #define EDR_AGENT_VERSION_STRING "0.3.0"
@@ -183,36 +32,37 @@ static char s_user[128];
 static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
-static char s_policy_ver[64];
-static unsigned long s_http_post_ok;
-static unsigned long s_http_post_fail;
-static uint64_t s_http_last_success_ms;
-static uint64_t s_http_last_failure_ms;
-static char s_http_last_failure_reason[256];
+static unsigned long s_http_ok;
+static unsigned long s_http_fail;
+static int64_t s_last_success_ms;
+static int64_t s_last_failure_ms;
+static char s_last_error[160];
+static int s_insecure_http;
 
-static void http_note_success(void) {
-  s_http_post_ok++;
-  s_http_last_success_ms = (uint64_t)edr_ingest_wall_time_ms();
+static int64_t unix_ms_now(void) {
+  return (int64_t)time(NULL) * 1000LL;
 }
 
-static void http_note_failure(const char *relpath, const char *reason) {
-  s_http_post_fail++;
-  s_http_last_failure_ms = (uint64_t)edr_ingest_wall_time_ms();
-  snprintf(s_http_last_failure_reason, sizeof(s_http_last_failure_reason), "%s%s%s",
-           relpath && relpath[0] ? relpath : "-",
-           reason && reason[0] ? ": " : "",
-           reason && reason[0] ? reason : "");
+static void runtime_success(void) {
+  s_http_ok++;
+  s_last_success_ms = unix_ms_now();
+  s_last_error[0] = '\0';
+}
+
+static void runtime_failure(const char *msg) {
+  s_http_fail++;
+  s_last_failure_ms = unix_ms_now();
+  snprintf(s_last_error, sizeof(s_last_error), "%s", msg ? msg : "");
 }
 
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
-                               const char *bearer, const char *endpoint_id, const char *agent_version) {
+                                const char *bearer, const char *endpoint_id, const char *agent_version) {
   memset(s_rest, 0, sizeof(s_rest));
   memset(s_tenant, 0, sizeof(s_tenant));
   memset(s_user, 0, sizeof(s_user));
   memset(s_bearer, 0, sizeof(s_bearer));
   memset(s_endpoint, 0, sizeof(s_endpoint));
   memset(s_agent_ver, 0, sizeof(s_agent_ver));
-  memset(s_policy_ver, 0, sizeof(s_policy_ver));
   if (rest_base && rest_base[0]) {
     snprintf(s_rest, sizeof(s_rest), "%s", rest_base);
   }
@@ -233,365 +83,378 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   } else {
     snprintf(s_agent_ver, sizeof(s_agent_ver), "%s", EDR_AGENT_VERSION_STRING);
   }
-}
-
-void edr_ingest_http_set_policy_version(const char *policy_version) {
-  memset(s_policy_ver, 0, sizeof(s_policy_ver));
-  if (policy_version && policy_version[0]) {
-    snprintf(s_policy_ver, sizeof(s_policy_ver), "%s", policy_version);
-  }
-}
-
-void edr_ingest_http_copy_policy_version(char *out, size_t cap) {
-  if (!out || cap == 0u) {
-    return;
-  }
-  out[0] = '\0';
-  if (s_policy_ver[0]) {
-    snprintf(out, cap, "%s", s_policy_ver);
-  }
+  s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
 }
 
 int edr_ingest_http_configured(void) { return s_rest[0] != 0 && s_endpoint[0] != 0; }
 
-unsigned long edr_ingest_http_post_ok(void) { return s_http_post_ok; }
-unsigned long edr_ingest_http_post_fail(void) { return s_http_post_fail; }
-uint64_t edr_ingest_http_last_success_ms(void) { return s_http_last_success_ms; }
-uint64_t edr_ingest_http_last_failure_ms(void) { return s_http_last_failure_ms; }
-void edr_ingest_http_last_failure_reason(char *buf, size_t cap) {
-  if (!buf || cap == 0u) {
+void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
+  if (!out) {
     return;
   }
-  snprintf(buf, cap, "%s", s_http_last_failure_reason);
+  memset(out, 0, sizeof(*out));
+  out->configured = edr_ingest_http_configured();
+  out->http_fallback_available = out->configured;
+  out->insecure_http = s_insecure_http;
+  out->ok_count = s_http_ok;
+  out->fail_count = s_http_fail;
+  out->last_success_unix_ms = s_last_success_ms;
+  out->last_failure_unix_ms = s_last_failure_ms;
+  snprintf(out->last_error, sizeof(out->last_error), "%s", s_last_error);
 }
 
-#ifdef EDR_HAVE_LIBCURL
-static size_t ingest_curl_discard_cb(char *p, size_t s, size_t n, void *u) {
-  (void)p;
-  (void)u;
-  return s * n;
-}
-
-static int curl_ensure_init(void) {
-  static int done;
-  if (!done) {
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
-      return -1;
+static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
+  static const char tbl[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t o = 0;
+  for (size_t i = 0; i < len; i += 3u) {
+    size_t rem = len - i;
+    uint32_t b = (uint32_t)in[i] << 16;
+    if (rem >= 2u) {
+      b |= (uint32_t)in[i + 1u] << 8;
     }
-    done = 1;
-  }
-  return 0;
-}
-
-static CURL *curl_conn_acquire(void) {
-#ifdef EDR_HAVE_LIBCURL
-  if (curl_ensure_init() != 0) return NULL;
-  CURL *curl = curl_easy_init();
-  if (curl) {
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 10L);
-    curl_easy_setopt(curl, CURLOPT_MAXAGE_CONN, 300L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
-  }
-  return curl;
-#endif
-  return NULL;
-}
-
-static void curl_conn_release(CURL *curl) {
-#ifdef EDR_HAVE_LIBCURL
-  if (curl) {
-    curl_easy_cleanup(curl);
-  }
-#else
-  (void)curl;
-#endif
-}
-#endif
-
-/** 默认禁用 shell curl fallback；仅 `EDR_ALLOW_SHELL_CURL_FALLBACK=1` 时启用。 */
-static int shell_curl_fallback_allowed(void) {
-  const char *e = getenv("EDR_ALLOW_SHELL_CURL_FALLBACK");
-  return (e && e[0] == '1') ? 1 : 0;
-}
-
-static int run_curl_config_no_shell(const char *resp_path, const char *cfg_path, const char *bearer) {
-  if (!resp_path || !resp_path[0] || !cfg_path || !cfg_path[0]) {
-    return -1;
-  }
-#ifdef _WIN32
-  char auth[768];
-  if (bearer && bearer[0]) {
-    if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
-      return -1;
+    if (rem >= 3u) {
+      b |= (uint32_t)in[i + 2u];
     }
-    const char *argv[] = {"curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, "-H", auth, NULL};
-    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
-    return (rc == 0) ? 0 : -1;
-  } else {
-    const char *argv[] = {"curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, NULL};
-    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
-    return (rc == 0) ? 0 : -1;
-  }
-#else
-  pid_t pid = fork();
-  if (pid < 0) {
-    return -1;
-  }
-  if (pid == 0) {
-    if (bearer && bearer[0]) {
-      char auth[768];
-      if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
-        _exit(127);
-      }
-      execlp("curl", "curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, "-H", auth, (char *)NULL);
-    } else {
-      execlp("curl", "curl", "-sS", "--fail", "-o", resp_path, "--config", cfg_path, (char *)NULL);
-    }
-    _exit(127);
-  }
-  int st = 0;
-  if (waitpid(pid, &st, 0) < 0) {
-    return -1;
-  }
-  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
-#endif
-}
-
-/**
- * 成功返回 0（HTTP 2xx），失败 -1。relpath 为 ingest/report-events 等（无前导/）。
- */
-static int ingest_post_json_relpath(const char *relpath, const char *json_body, const char *json_path_for_log) {
-  if (!relpath || !relpath[0] || !json_body) {
-    return -1;
-  }
-  size_t body_len = strlen(json_body);
-
-#ifdef EDR_HAVE_LIBCURL
-  CURL *curl = curl_conn_acquire();
-  if (curl) {
-    char errbuf[CURL_ERROR_SIZE];
-    errbuf[0] = 0;
-    char url[768];
-    if ((size_t)snprintf(url, sizeof(url), "%s/%s", s_rest, relpath) >= sizeof(url)) {
-      curl_conn_release(curl);
-      return -1;
-    }
-    {
-    struct curl_slist *hdrs = NULL;
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    char tbuf[160];
-    snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
-    hdrs = curl_slist_append(hdrs, tbuf);
-    snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
-    hdrs = curl_slist_append(hdrs, tbuf);
-    hdrs = curl_slist_append(hdrs, "X-Permission-Set: telemetry:write");
-    if (s_bearer[0]) {
-      char abuf[640];
-      if ((size_t)snprintf(abuf, sizeof(abuf), "Authorization: Bearer %s", s_bearer) < sizeof(abuf)) {
-        hdrs = curl_slist_append(hdrs, abuf);
-      }
-    }
-
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ingest_curl_discard_cb);
-    (void)curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
-
-    CURLcode cres = curl_easy_perform(curl);
-    long code = 0;
-    if (cres == CURLE_OK) {
-      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    }
-    curl_slist_free_all(hdrs);
-    curl_conn_release(curl);
-
-    if (cres != CURLE_OK) {
-      const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cres);
-      http_note_failure(relpath, em);
-      EDR_LOGE("[ingest-http] POST %s: %s\n", relpath, em);
-      EDR_LOGV("[ingest-http] (verbose) rest=%s path=%s\n", s_rest, relpath);
-    } else if (code < 200 || code >= 300) {
-      char reason[64];
-      snprintf(reason, sizeof(reason), "HTTP %ld", code);
-      http_note_failure(relpath, reason);
-      EDR_LOGE("[ingest-http] POST %s: HTTP %ld\n", relpath, code);
-      EDR_LOGV("[ingest-http] (verbose) rest=%s path=%s extra=%s\n", s_rest, relpath,
-               json_path_for_log ? json_path_for_log : "-");
-    } else {
-      http_note_success();
-      return 0;
-    }
-  }
-  }
-#endif
-
-  if (!shell_curl_fallback_allowed()) {
-    http_note_failure(relpath, "shell curl fallback disabled");
-    EDR_LOGE("%s", "[ingest-http] shell curl fallback disabled (set EDR_ALLOW_SHELL_CURL_FALLBACK=1 to enable)\n");
-    return -1;
-  }
-
-  (void)body_len;
-  char jsonpath[512];
-  char cfgpath[512];
-  char resp_path[512];
-#ifdef _WIN32
-  char td[MAX_PATH];
-  DWORD nn = GetTempPathA((DWORD)sizeof(td), td);
-  if (nn == 0 || nn >= sizeof(td)) {
-    snprintf(td, sizeof(td), ".\\");
-  }
-  win_path_fwd_slashes(td);
-  snprintf(jsonpath, sizeof(jsonpath), "%sedr_ingest_%lu.json", td, (unsigned long)GetCurrentProcessId());
-  snprintf(cfgpath, sizeof(cfgpath), "%sedr_ingest_%lu.cfg", td, (unsigned long)GetCurrentProcessId());
-  snprintf(resp_path, sizeof(resp_path), "%sedr_ingest_%lu.http", td, (unsigned long)GetCurrentProcessId());
-#else
-  {
-    int pid = (int)getpid();
-    snprintf(jsonpath, sizeof(jsonpath), "/tmp/edr_ingest_%d.json", pid);
-    snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_ingest_%d.cfg", pid);
-    snprintf(resp_path, sizeof(resp_path), "/tmp/edr_ingest_%d.http", pid);
-  }
-#endif
-
-  FILE *jf = fopen(jsonpath, "wb");
-  if (!jf) {
-    return -1;
-  }
-  (void)fwrite(json_body, 1, strlen(json_body), jf);
-  fputc('\n', jf);
-  fclose(jf);
-
-  FILE *cf = fopen(cfgpath, "wb");
-  if (!cf) {
-    (void)remove(jsonpath);
-    return -1;
-  }
-  fprintf(cf, "url = \"%s/%s\"\n", s_rest, relpath);
-  fprintf(cf, "header = \"Content-Type: application/json\"\n");
-  fputs("header = \"X-Tenant-ID: ", cf);
-  fprint_curl_cfg_dquoted_body(cf, s_tenant[0] ? s_tenant : "demo-tenant");
-  fputs("\"\n", cf);
-  fputs("header = \"X-User-ID: ", cf);
-  fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
-  fputs("\"\n", cf);
-  fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
-  fprintf(cf, "data = @%s\n", jsonpath);
-  fprintf(cf, "silent\n");
-  fclose(cf);
-
-  int curl_ok = (run_curl_config_no_shell(resp_path, cfgpath, s_bearer) == 0) ? 1 : 0;
-  if (!curl_ok) {
-    (void)remove(jsonpath);
-    (void)remove(cfgpath);
-    http_note_failure(relpath, "curl fallback failed");
-    EDR_LOGE("[ingest-http] curl fallback failed (rest=%s)\n", s_rest);
-  }
-  int http_code = curl_ok ? 200 : 0;
-
-  int ok = (http_code >= 200 && http_code < 300);
-  if (!ok) {
-    char reason[64];
-    snprintf(reason, sizeof(reason), "HTTP %d", http_code);
-    http_note_failure(relpath, reason);
-    char snippet[640];
-    size_t sn = 0;
-    FILE *rf = fopen(resp_path, "rb");
-    if (rf) {
-      sn = fread(snippet, 1, sizeof(snippet) - 1u, rf);
-      snippet[sn] = 0;
-      fclose(rf);
-    } else {
-      snippet[0] = 0;
-    }
-    EDR_LOGE("[ingest-http] HTTP %d path=%s (rest=%s)\n", http_code, relpath, s_rest);
-    if (sn > 0u) {
-      EDR_LOGV("[ingest-http] (verbose) body_snippet=%.*s\n", (int)sn, snippet);
-    }
-  }
-
-  (void)remove(jsonpath);
-  (void)remove(cfgpath);
-  (void)remove(resp_path);
-
-  if (ok) {
-    http_note_success();
-    return 0;
-  }
-  return -1;
-}
-
-static int b64_encode_chunk(const uint8_t *in, size_t len, uint8_t carry[2], size_t *carry_len,
-                            const char tbl[64], char *out, size_t *out_pos, size_t cap) {
-  for (size_t i = 0u; i < len; i++) {
-    uint8_t c = in[i];
-    if (*carry_len == 0u) {
-      carry[(*carry_len)++] = c;
-      continue;
-    }
-    if (*carry_len == 1u) {
-      carry[(*carry_len)++] = c;
-      continue;
-    }
-    if (*out_pos + 4u >= cap) {
-      return -1;
-    }
-    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8) | (uint32_t)c;
-    out[(*out_pos)++] = tbl[(v >> 18) & 63u];
-    out[(*out_pos)++] = tbl[(v >> 12) & 63u];
-    out[(*out_pos)++] = tbl[(v >> 6) & 63u];
-    out[(*out_pos)++] = tbl[v & 63u];
-    *carry_len = 0u;
-  }
-  return 0;
-}
-
-static int b64_encode_join2(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, char *out,
-                            size_t cap) {
-  static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t o = 0u;
-  uint8_t carry[2];
-  size_t carry_len = 0u;
-
-  if (b64_encode_chunk(a, alen, carry, &carry_len, tbl, out, &o, cap) != 0) {
-    return -1;
-  }
-  if (b64_encode_chunk(b, blen, carry, &carry_len, tbl, out, &o, cap) != 0) {
-    return -1;
-  }
-
-  if (carry_len == 1u) {
     if (o + 4u >= cap) {
       return -1;
     }
-    uint32_t v = (uint32_t)carry[0] << 16;
-    out[o++] = tbl[(v >> 18) & 63u];
-    out[o++] = tbl[(v >> 12) & 63u];
-    out[o++] = '=';
-    out[o++] = '=';
-  } else if (carry_len == 2u) {
-    if (o + 4u >= cap) {
-      return -1;
+    out[o++] = tbl[(b >> 18) & 63u];
+    out[o++] = tbl[(b >> 12) & 63u];
+    if (rem >= 2u) {
+      out[o++] = tbl[(b >> 6) & 63u];
+    } else {
+      out[o++] = '=';
     }
-    uint32_t v = ((uint32_t)carry[0] << 16) | ((uint32_t)carry[1] << 8);
-    out[o++] = tbl[(v >> 18) & 63u];
-    out[o++] = tbl[(v >> 12) & 63u];
-    out[o++] = tbl[(v >> 6) & 63u];
-    out[o++] = '=';
+    if (rem >= 3u) {
+      out[o++] = tbl[b & 63u];
+    } else {
+      out[o++] = '=';
+    }
   }
   if (o >= cap) {
     return -1;
   }
   out[o] = 0;
   return (int)o;
+}
+
+static int is_local_or_private_host(const char *host) {
+  if (!host || !host[0]) {
+    return 0;
+  }
+  if (strcmp(host, "localhost") == 0 || strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0) {
+    return 1;
+  }
+  if (strncmp(host, "10.", 3u) == 0 || strncmp(host, "192.168.", 8u) == 0) {
+    return 1;
+  }
+  if (strncmp(host, "172.", 4u) == 0) {
+    int b = atoi(host + 4);
+    if (b >= 16 && b <= 31) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int parse_url(const char *url, char *host, size_t host_cap, char *path, size_t path_cap,
+                     int *out_port, int *out_https) {
+  const char *p = NULL;
+  const char *slash = NULL;
+  const char *colon = NULL;
+  size_t host_len = 0;
+  if (!url || !host || !path || !out_port || !out_https) {
+    return -1;
+  }
+  *out_https = 0;
+  *out_port = 80;
+  if (strncmp(url, "https://", 8u) == 0) {
+    p = url + 8u;
+    *out_https = 1;
+    *out_port = 443;
+  } else if (strncmp(url, "http://", 7u) == 0) {
+    p = url + 7u;
+  } else {
+    return -1;
+  }
+  slash = strchr(p, '/');
+  colon = strchr(p, ':');
+  if (colon && (!slash || colon < slash)) {
+    host_len = (size_t)(colon - p);
+    if (host_len == 0u || host_len >= host_cap) {
+      return -1;
+    }
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+    *out_port = atoi(colon + 1);
+  } else {
+    host_len = slash ? (size_t)(slash - p) : strlen(p);
+    if (host_len == 0u || host_len >= host_cap) {
+      return -1;
+    }
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+  }
+  snprintf(path, path_cap, "%s", slash ? slash : "/");
+  if (*out_port <= 0 || *out_port > 65535) {
+    return -1;
+  }
+  return 0;
+}
+
+static int net_init(void) {
+#ifdef _WIN32
+  WSADATA w;
+  return WSAStartup(MAKEWORD(2, 2), &w);
+#else
+  return 0;
+#endif
+}
+
+static void net_done(void) {
+#ifdef _WIN32
+  WSACleanup();
+#endif
+}
+
+static void close_fd(int fd) {
+#ifdef _WIN32
+  closesocket((SOCKET)fd);
+#else
+  close(fd);
+#endif
+}
+
+static int tcp_connect_host(const char *host, int port, int *out_fd) {
+  struct addrinfo hints;
+  struct addrinfo *res = NULL;
+  struct addrinfo *rp = NULL;
+  char portstr[16];
+  int fd = -1;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_family = AF_UNSPEC;
+  snprintf(portstr, sizeof(portstr), "%d", port);
+  if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+    return -1;
+  }
+  for (rp = res; rp; rp = rp->ai_next) {
+#ifdef _WIN32
+    fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+#else
+    fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+#endif
+    if (fd < 0) {
+      continue;
+    }
+    if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+      break;
+    }
+    close_fd(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) {
+    return -1;
+  }
+  *out_fd = fd;
+  return 0;
+}
+
+static int write_all_plain(int fd, const char *p, size_t n) {
+  size_t off = 0;
+  while (off < n) {
+#ifdef _WIN32
+    int w = send((SOCKET)fd, p + off, (int)(n - off), 0);
+#else
+    ssize_t w = send(fd, p + off, n - off, 0);
+#endif
+    if (w <= 0) {
+      return -1;
+    }
+    off += (size_t)w;
+  }
+  return 0;
+}
+
+static int read_status_plain(int fd) {
+  char buf[256];
+#ifdef _WIN32
+  int n = recv((SOCKET)fd, buf, (int)sizeof(buf) - 1, 0);
+#else
+  ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+#endif
+  if (n <= 0) {
+    return -1;
+  }
+  buf[n] = '\0';
+  return (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0) ? 0 : -1;
+}
+
+static int append_headers(char *req, size_t cap, const char *path, const char *host,
+                          const char *body, size_t body_len) {
+  int n = snprintf(req, cap,
+                   "POST %s HTTP/1.1\r\n"
+                   "Host: %s\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Content-Length: %zu\r\n"
+                   "X-Tenant-ID: %s\r\n"
+                   "X-User-ID: %s\r\n"
+                   "X-Permission-Set: telemetry:write\r\n",
+                   path, host, body_len, s_tenant[0] ? s_tenant : "demo-tenant",
+                   s_user[0] ? s_user : "edr-agent");
+  if (n <= 0 || (size_t)n >= cap) {
+    return -1;
+  }
+  if (s_bearer[0]) {
+    size_t used = (size_t)n;
+    int m = snprintf(req + used, cap - used, "Authorization: Bearer %s\r\n", s_bearer);
+    if (m <= 0 || (size_t)m >= cap - used) {
+      return -1;
+    }
+    n += m;
+  }
+  {
+    size_t used = (size_t)n;
+    int m = snprintf(req + used, cap - used, "Connection: close\r\n\r\n");
+    if (m <= 0 || (size_t)m >= cap - used) {
+      return -1;
+    }
+    n += m;
+  }
+  (void)body;
+  return n;
+}
+
+#ifdef EDR_HAVE_OPENSSL_HTTP
+static int post_https_openssl(const char *host, int port, const char *path, const char *body, size_t body_len) {
+  int fd = -1;
+  int ret = -1;
+  SSL_CTX *ctx = NULL;
+  SSL *ssl = NULL;
+  char req[8192];
+  int rn = append_headers(req, sizeof(req), path, host, body, body_len);
+  if (rn <= 0) {
+    return -1;
+  }
+  OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+  ctx = SSL_CTX_new(TLS_client_method());
+  if (!ctx) {
+    return -1;
+  }
+  {
+    const char *cafile = getenv("EDR_INGEST_HTTPS_CA_FILE");
+    if (cafile && cafile[0]) {
+      (void)SSL_CTX_load_verify_locations(ctx, cafile, NULL);
+    } else {
+      (void)SSL_CTX_set_default_verify_paths(ctx);
+    }
+  }
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+  if (tcp_connect_host(host, port, &fd) != 0) {
+    goto done;
+  }
+  ssl = SSL_new(ctx);
+  if (!ssl) {
+    goto done;
+  }
+  SSL_set_fd(ssl, fd);
+  (void)SSL_set_tlsext_host_name(ssl, host);
+  if (SSL_connect(ssl) != 1) {
+    goto done;
+  }
+  if (SSL_write(ssl, req, rn) <= 0 || (body_len > 0u && SSL_write(ssl, body, (int)body_len) <= 0)) {
+    goto done;
+  }
+  {
+    char resp[256];
+    int n = SSL_read(ssl, resp, (int)sizeof(resp) - 1);
+    if (n > 0) {
+      resp[n] = '\0';
+      ret = (strncmp(resp, "HTTP/1.1 2", 10u) == 0 || strncmp(resp, "HTTP/1.0 2", 10u) == 0) ? 0 : -1;
+    }
+  }
+done:
+  if (ssl) {
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+  }
+  if (fd >= 0) {
+    close_fd(fd);
+  }
+  if (ctx) {
+    SSL_CTX_free(ctx);
+  }
+  return ret;
+}
+#endif
+
+static int native_post_json(const char *url, const char *body, size_t body_len) {
+  char host[256];
+  char path[1024];
+  int port = 0;
+  int https = 0;
+  int fd = -1;
+  int rc = -1;
+  char req[8192];
+  if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
+    runtime_failure("invalid ingest url");
+    return -1;
+  }
+  if (!https) {
+    const char *allow = getenv("EDR_ALLOW_INSECURE_HTTP");
+    if ((!allow || allow[0] != '1') && !is_local_or_private_host(host)) {
+      runtime_failure("plain http denied for non-local host");
+      return -1;
+    }
+  }
+  if (net_init() != 0) {
+    runtime_failure("network init failed");
+    return -1;
+  }
+  if (https) {
+#ifdef EDR_HAVE_OPENSSL_HTTP
+    rc = post_https_openssl(host, port, path, body, body_len);
+#else
+    runtime_failure("https requested but OpenSSL disabled");
+    rc = -1;
+#endif
+    net_done();
+    return rc;
+  }
+  {
+    int rn = append_headers(req, sizeof(req), path, host, body, body_len);
+    if (rn <= 0 || tcp_connect_host(host, port, &fd) != 0) {
+      runtime_failure("http connect failed");
+      net_done();
+      return -1;
+    }
+    if (write_all_plain(fd, req, (size_t)rn) == 0 &&
+        (body_len == 0u || write_all_plain(fd, body, body_len) == 0) &&
+        read_status_plain(fd) == 0) {
+      rc = 0;
+    }
+    close_fd(fd);
+  }
+  net_done();
+  if (rc != 0) {
+    runtime_failure("http post failed");
+  }
+  return rc;
+}
+
+static int post_to_suffix(const char *suffix, const char *body) {
+  char url[1024];
+  size_t rb = strlen(s_rest);
+  snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+  int rc = native_post_json(url, body, strlen(body));
+  if (rc == 0) {
+    runtime_success();
+  } else if (!s_last_error[0]) {
+    runtime_failure("native post failed");
+  }
+  return rc;
 }
 
 int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *header12, size_t header_len,
@@ -606,1262 +469,49 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   if (!b64) {
     return -1;
   }
-  if (b64_encode_join2(header12, header_len, payload, payload_len, b64, b64_cap) < 0) {
+  uint8_t *raw = (uint8_t *)malloc(raw_len);
+  if (!raw) {
     free(b64);
     return -1;
   }
+  memcpy(raw, header12, header_len);
+  memcpy(raw + header_len, payload, payload_len);
+  if (b64_encode(raw, raw_len, b64, b64_cap) < 0) {
+    free(b64);
+    free(raw);
+    return -1;
+  }
+  free(raw);
 
-  const size_t cap = 128u + json_escaped_size(s_endpoint) + json_escaped_size(batch_id) + json_escaped_size(s_agent_ver) +
-                    strlen(b64) + 32u;
-  char *json = (char *)malloc(cap);
-  if (!json) {
+  size_t body_cap = strlen(b64) + strlen(s_endpoint) + strlen(batch_id) + strlen(s_agent_ver) + 128u;
+  char *body = (char *)malloc(body_cap);
+  if (!body) {
     free(b64);
     return -1;
   }
-  char ept[300];
-  char bid[300];
-  char agv[300];
-  if (!json_escape_to_buf(s_endpoint, ept, sizeof(ept)) || !json_escape_to_buf(batch_id, bid, sizeof(bid)) ||
-      !json_escape_to_buf(s_agent_ver, agv, sizeof(agv))) {
-    free(b64);
-    free(json);
-    return -1;
-  }
-
-  int w = snprintf(json, cap, "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}\n", ept,
-          bid, agv, b64);
-  if (w < 0 || (size_t)w >= cap) {
-    free(b64);
-    free(json);
-    return -1;
-  }
+  snprintf(body, body_cap,
+           "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}",
+           s_endpoint, batch_id, s_agent_ver, b64);
   free(b64);
-
-  int rc = ingest_post_json_relpath("ingest/report-events", json, "report-events");
-  free(json);
-  return rc;
-}
-
-int edr_ingest_http_post_command_result(const char *command_id, const EdrSoarCommandMeta *meta,
-                                        int execution_status, int exit_code, const char *detail_utf8) {
-  if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
-    return -1;
-  }
-  const char *d = detail_utf8 ? detail_utf8 : "";
-  const size_t dmax = 64u * 1024u;
-  size_t dlen = strlen(d);
-  char *det = (char *)malloc(dmax + 1u);
-  if (!det) {
-    return -1;
-  }
-  if (dlen > dmax) {
-    if (dmax > 3u) {
-      memcpy(det, d, dmax - 3u);
-      memcpy(det + dmax - 3u, "...", 3u);
-      det[dmax] = 0;
-    } else {
-      det[0] = 0;
-    }
-  } else {
-    memcpy(det, d, dlen);
-    det[dlen] = 0;
-  }
-
-  const char *sc = meta && meta->soar_correlation_id[0] ? meta->soar_correlation_id : "";
-  const char *pr = meta && meta->playbook_run_id[0] ? meta->playbook_run_id : "";
-  const char *ps = meta && meta->playbook_step_id[0] ? meta->playbook_step_id : "";
-
-  const size_t cap = 400u + json_escaped_size(s_endpoint) * 2u + json_escaped_size(command_id) + json_escaped_size(s_agent_ver) +
-                    json_escaped_size(sc) + json_escaped_size(pr) + json_escaped_size(ps) + json_escaped_size(det) + 32u;
-  char *e_ep0 = (char *)malloc(8u + json_escaped_size(s_endpoint));
-  char *e_cid = (char *)malloc(8u + json_escaped_size(command_id));
-  char *e_ep1 = (char *)malloc(8u + json_escaped_size(s_endpoint));
-  char *e_agv = (char *)malloc(8u + json_escaped_size(s_agent_ver));
-  char *e_sc = (char *)malloc(8u + json_escaped_size(sc));
-  char *e_pr = (char *)malloc(8u + json_escaped_size(pr));
-  char *e_ps = (char *)malloc(8u + json_escaped_size(ps));
-  char *e_det = (char *)malloc(8u + json_escaped_size(det));
-  char *j = (char *)malloc(cap);
-  if (!e_ep0 || !e_cid || !e_ep1 || !e_agv || !e_sc || !e_pr || !e_ps || !e_det || !j) {
-    free(det);
-    free(e_ep0);
-    free(e_cid);
-    free(e_ep1);
-    free(e_agv);
-    free(e_sc);
-    free(e_pr);
-    free(e_ps);
-    free(e_det);
-    free(j);
-    return -1;
-  }
-  (void)json_escape_to_buf(s_endpoint, e_ep0, 8u + json_escaped_size(s_endpoint));
-  (void)json_escape_to_buf(command_id, e_cid, 8u + json_escaped_size(command_id));
-  (void)json_escape_to_buf(s_endpoint, e_ep1, 8u + json_escaped_size(s_endpoint));
-  (void)json_escape_to_buf(s_agent_ver, e_agv, 8u + json_escaped_size(s_agent_ver));
-  (void)json_escape_to_buf(sc, e_sc, 8u + json_escaped_size(sc));
-  (void)json_escape_to_buf(pr, e_pr, 8u + json_escaped_size(pr));
-  (void)json_escape_to_buf(ps, e_ps, 8u + json_escaped_size(ps));
-  (void)json_escape_to_buf(det, e_det, 8u + json_escaped_size(det));
-
-  int64_t fin = edr_ingest_wall_time_ms();
-  int w = snprintf(
-      j, cap,
-      "{\"endpoint_id\":\"%s\",\"command_type\":\"\",\"result\":{"
-      "\"command_id\":\"%s\","
-      "\"endpoint_id\":\"%s\","
-      "\"agent_version\":\"%s\","
-      "\"soar_correlation_id\":\"%s\","
-      "\"playbook_run_id\":\"%s\","
-      "\"playbook_step_id\":\"%s\","
-      "\"status\":%d,\"exit_code\":%d,"
-      "\"detail_utf8\":\"%s\","
-      "\"finished_unix_ms\":%" PRId64 "}}",
-      e_ep0, e_cid, e_ep1, e_agv, e_sc, e_pr, e_ps, execution_status, exit_code, e_det, fin);
-  free(det);
-  free(e_ep0);
-  free(e_cid);
-  free(e_ep1);
-  free(e_agv);
-  free(e_sc);
-  free(e_pr);
-  free(e_ps);
-  free(e_det);
-  if (w < 0 || (size_t)w >= cap) {
-    free(j);
-    return -1;
-  }
-  int rc = ingest_post_json_relpath("ingest/report-command-result", j, "report-command-result");
-  free(j);
-  return rc;
-}
-
-int edr_ingest_http_post_heartbeat(void) {
-  if (!edr_ingest_http_configured()) {
-    return -1;
-  }
-  char body[420];
-  int n = snprintf(body, sizeof(body),
-                   "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\"}",
-                   s_endpoint, s_agent_ver, s_policy_ver);
-  if (n < 0 || (size_t)n >= sizeof(body)) {
-    return -1;
-  }
-  return ingest_post_json_relpath("ingest/heartbeat", body, "heartbeat");
-}
-
-static const char *pmfe_mode_name(const EdrConfig *cfg) {
-  if (!cfg) {
-    return "unknown";
-  }
-  if (cfg->detection.pmfe_mode == 2) {
-    return "alert_trigger";
-  }
-  if (cfg->detection.pmfe_mode == 1 || cfg->pmfe.idle_scan_enabled) {
-    return "idle";
-  }
-  if (cfg->detection.pmfe_mode < 0) {
-    return "adaptive";
-  }
-  return "disabled";
-}
-
-static const char *adaptive_mode_name(int mode, int enabled) {
-  if (mode > 0) {
-    return "enabled";
-  }
-  if (mode < 0) {
-    return enabled ? "adaptive" : "adaptive_off";
-  }
-  return enabled ? "enabled" : "disabled";
-}
-
-static const char *control_mode_name(int mode, int enabled) {
-  if (mode > 0) return "forced";
-  if (mode < 0) return enabled ? "adaptive" : "adaptive_off";
-  return enabled ? "config_enabled" : "disabled";
-}
-
-int edr_ingest_http_post_engine_health(const EdrConfig *cfg) {
-  if (!cfg || !edr_ingest_http_configured()) {
-    return -1;
-  }
-  AVEStatus avst;
-  memset(&avst, 0, sizeof(avst));
-  (void)AVE_GetStatus(&avst);
-  unsigned long pmfe_sub = 0, pmfe_done = 0, pmfe_drop = 0, pmfe_dedup = 0, pmfe_cd = 0;
-  edr_pmfe_get_extended_stats(&pmfe_sub, &pmfe_done, &pmfe_drop, &pmfe_dedup, &pmfe_cd);
-  unsigned long pmfe_depth = pmfe_sub > pmfe_done ? pmfe_sub - pmfe_done : 0;
-  int shellcode_active = edr_shellcode_detector_active();
-  unsigned int webshell_watches = edr_webshell_detector_watch_count();
-  uint64_t shellcode_budget_drops = edr_shellcode_detector_budget_drop_count();
-  uint64_t webshell_budget_drops = edr_webshell_detector_budget_drop_count();
-  int webshell_enabled = cfg->webshell_detector.enabled || webshell_watches > 0u;
-  int shellcode_enabled = cfg->shellcode_detector.enabled || shellcode_active;
-  int pmfe_enabled = cfg->detection.pmfe_mode != 0 || cfg->pmfe.idle_scan_enabled || pmfe_depth > 0ul;
-  const char *p0_rules = cfg->preprocessing.rules_version[0] ? cfg->preprocessing.rules_version : "unknown";
-  const char *policy = s_policy_ver[0] ? s_policy_ver : "";
-  static uint64_t last_ave_trigger_ms, last_pmfe_trigger_ms, last_shellcode_trigger_ms, last_webshell_trigger_ms;
-  static uint64_t prev_ave_activity, prev_pmfe_sub;
-  static int prev_shellcode_active;
-  static unsigned int prev_webshell_watches;
-  int64_t now_ms = edr_ingest_wall_time_ms();
-  uint64_t ave_activity = avst.behavior_feed_total + avst.behavior_infer_ok + avst.behavior_infer_fail;
-  if (ave_activity != prev_ave_activity) {
-    last_ave_trigger_ms = (uint64_t)now_ms;
-    prev_ave_activity = ave_activity;
-  }
-  if ((uint64_t)pmfe_sub != prev_pmfe_sub) {
-    last_pmfe_trigger_ms = (uint64_t)now_ms;
-    prev_pmfe_sub = (uint64_t)pmfe_sub;
-  }
-  if (shellcode_active && !prev_shellcode_active) {
-    last_shellcode_trigger_ms = (uint64_t)now_ms;
-  }
-  prev_shellcode_active = shellcode_active;
-  if (webshell_watches != prev_webshell_watches) {
-    last_webshell_trigger_ms = (uint64_t)now_ms;
-    prev_webshell_watches = webshell_watches;
-  }
-  char grpc_diag_raw[160], grpc_fail_raw[256], http_fail_raw[256];
-  char resource_pressure_raw[160];
-  edr_grpc_client_diag(grpc_diag_raw, sizeof(grpc_diag_raw));
-  edr_grpc_client_last_failure_reason(grpc_fail_raw, sizeof(grpc_fail_raw));
-  edr_ingest_http_last_failure_reason(http_fail_raw, sizeof(http_fail_raw));
-  edr_resource_pressure_reason(resource_pressure_raw, sizeof(resource_pressure_raw));
-
-  char ep[260], agv[140], pol[140], p0[160], profile[80], static_mv[80], behavior_mv[80], ioc_rv[80], wl_rv[80], cert_rv[80];
-  char grpc_diag[220], grpc_fail[340], http_fail[340], resource_pressure[220];
-  if (!json_escape_to_buf(s_endpoint, ep, sizeof(ep)) || !json_escape_to_buf(s_agent_ver, agv, sizeof(agv)) ||
-      !json_escape_to_buf(policy, pol, sizeof(pol)) || !json_escape_to_buf(p0_rules, p0, sizeof(p0)) ||
-      !json_escape_to_buf(cfg->resource_limit.profile[0] ? cfg->resource_limit.profile : "workstation", profile,
-                          sizeof(profile)) ||
-      !json_escape_to_buf(avst.static_model_version, static_mv, sizeof(static_mv)) ||
-      !json_escape_to_buf(avst.behavior_model_version, behavior_mv, sizeof(behavior_mv)) ||
-      !json_escape_to_buf(avst.ioc_rules_version, ioc_rv, sizeof(ioc_rv)) ||
-      !json_escape_to_buf(avst.whitelist_version, wl_rv, sizeof(wl_rv)) ||
-      !json_escape_to_buf(avst.cert_whitelist_version, cert_rv, sizeof(cert_rv))) {
-    return -1;
-  }
-  if (!json_escape_to_buf(grpc_diag_raw[0] ? grpc_diag_raw : "-", grpc_diag, sizeof(grpc_diag)) ||
-      !json_escape_to_buf(grpc_fail_raw[0] ? grpc_fail_raw : "-", grpc_fail, sizeof(grpc_fail)) ||
-      !json_escape_to_buf(http_fail_raw[0] ? http_fail_raw : "-", http_fail, sizeof(http_fail)) ||
-      !json_escape_to_buf(resource_pressure_raw[0] ? resource_pressure_raw : "ok", resource_pressure,
-                          sizeof(resource_pressure))) {
-    return -1;
-  }
-  uint64_t grpc_last_success = edr_grpc_client_last_success_ms();
-  uint64_t http_last_success = edr_ingest_http_last_success_ms();
-  uint64_t grpc_last_failure = edr_grpc_client_last_failure_ms();
-  uint64_t http_last_failure = edr_ingest_http_last_failure_ms();
-  const char *latest_failure_reason = http_last_failure > grpc_last_failure ? http_fail : grpc_fail;
-
-  char health[8192];
-  int hn = snprintf(
-      health, sizeof(health),
-      "{\"schema\":\"agent_engine_health_v1\",\"reported_at_ms\":%" PRId64
-      ",\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
-      "\"communication\":{\"grpc_ready\":%s,\"grpc_diag\":\"%s\",\"http_fallback_configured\":%s,"
-      "\"rpc_ok\":%lu,\"rpc_fail\":%lu,\"consecutive_failures\":%lu,"
-      "\"send_queue_depth\":%zu,\"send_queue_capacity\":%zu,"
-      "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
-      "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
-      "\"offline_pending\":%" PRIu64 ",\"last_success_ms\":%" PRIu64
-      ",\"last_failure_ms\":%" PRIu64 ",\"last_failure_reason\":\"%s\","
-      "\"http_post_ok\":%lu,\"http_post_fail\":%lu,\"http_last_success_ms\":%" PRIu64
-      ",\"http_last_failure_ms\":%" PRIu64 ",\"http_last_failure_reason\":\"%s\"},"
-      "\"resource\":{\"profile\":\"%s\",\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
-      "\"ave_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
-      "\"shellcode_packets_per_sec\":%u,\"low_priority_keep_percent_under_pressure\":%u,"
-      "\"cpu_percent\":%u,\"current_rss_mb\":%lu,\"thread_count\":%u,\"handle_count\":%u,"
-      "\"last_sample_ms\":%" PRIu64 ",\"pressure\":%s,\"pressure_reason\":\"%s\","
-      "\"preprocess_throttle_drops\":%" PRIu64 "},"
-      "\"p0_rule\":{\"enabled\":true,\"mode\":\"always_on\",\"control_mode\":\"forced\","
-      "\"rule_version\":\"%s\",\"cpu_percent\":%u,\"memory_mb\":%lu,\"queue_depth\":%zu,"
-      "\"last_trigger_ms\":0,\"last_degrade_reason\":\"%s\"},"
-      "\"ave\":{\"enabled\":%s,\"mode\":\"%s\",\"static_model_version\":\"%s\","
-      "\"control_mode\":\"%s\",\"budget_per_min\":%u,\"cpu_percent\":%u,\"memory_mb\":%lu,"
-      "\"behavior_model_version\":\"%s\",\"model_version\":\"%s\",\"rule_version\":\"%s\","
-      "\"whitelist_version\":\"%s\",\"cert_whitelist_version\":\"%s\",\"queue_depth\":%d,"
-      "\"queue_capacity\":%u,\"infer_ok\":%" PRIu64 ",\"infer_fail\":%" PRIu64
-      ",\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"},"
-      "\"pmfe\":{\"enabled\":%s,\"mode\":\"%s\",\"queue_depth\":%lu,\"submitted\":%lu,"
-      "\"control_mode\":\"%s\",\"budget_per_min\":%u,\"cpu_percent\":%u,\"memory_mb\":%lu,"
-      "\"completed\":%lu,\"dropped\":%lu,\"deduped\":%lu,\"cooldown_skipped\":%lu,"
-      "\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"},"
-      "\"shellcode\":{\"enabled\":%s,\"active\":%s,\"mode\":\"%s\",\"rule_version\":\"%s\","
-      "\"control_mode\":\"%s\",\"packet_budget_per_sec\":%u,\"budget_drops\":%" PRIu64 ","
-      "\"cpu_percent\":%u,\"memory_mb\":%lu,"
-      "\"queue_depth\":0,\"watch_count\":%zu,\"ports_custom\":%s,"
-      "\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"},"
-      "\"webshell\":{\"enabled\":%s,\"mode\":\"%s\",\"rule_version\":\"%s\",\"watch_count\":%u,"
-      "\"control_mode\":\"%s\",\"scan_mb_per_min\":%u,\"budget_drops\":%" PRIu64 ","
-      "\"cpu_percent\":%u,\"memory_mb\":%lu,\"queue_depth\":%u,"
-      "\"max_watch_dirs\":%u,\"last_trigger_ms\":%" PRIu64 ",\"last_degrade_reason\":\"%s\"}}",
-      edr_ingest_wall_time_ms(), ep, agv, pol,
-      edr_grpc_client_ready() ? "true" : "false", grpc_diag,
-      edr_ingest_http_configured() ? "true" : "false",
-      edr_grpc_client_rpc_ok(), edr_grpc_client_rpc_fail(),
-      edr_grpc_client_report_fail_streak(),
-      edr_transport_send_queue_depth(), edr_transport_send_queue_capacity(),
-      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
-      edr_transport_queue_full_sampled_count(), edr_transport_queue_full_dropped_count(),
-      edr_storage_queue_pending_count(),
-      grpc_last_success > http_last_success ? grpc_last_success : http_last_success,
-      grpc_last_failure > http_last_failure ? grpc_last_failure : http_last_failure,
-      latest_failure_reason, edr_ingest_http_post_ok(), edr_ingest_http_post_fail(),
-      http_last_success, http_last_failure, http_fail,
-      profile,
-      (unsigned)cfg->resource_limit.cpu_limit_percent,
-      (unsigned)cfg->resource_limit.memory_limit_mb,
-      (unsigned)cfg->resource_limit.ave_infer_per_min,
-      (unsigned)cfg->resource_limit.pmfe_scans_per_min,
-      (unsigned)cfg->resource_limit.webshell_scan_mb_per_min,
-      (unsigned)cfg->resource_limit.shellcode_packets_per_sec,
-      (unsigned)cfg->resource_limit.low_priority_keep_percent_under_pressure,
-      edr_resource_cpu_percent(), edr_resource_current_rss_mb(), edr_resource_thread_count(),
-      edr_resource_handle_count(), edr_resource_last_sample_ms(),
-      edr_resource_preprocess_throttle_active() ? "true" : "false", resource_pressure,
-      edr_resource_preprocess_throttle_drop_count(),
-      p0, edr_resource_cpu_percent(), edr_resource_current_rss_mb(), edr_transport_send_queue_depth(),
-      resource_pressure,
-      avst.initialized ? "true" : "false",
-      cfg->ave.enabled ? "enabled" : "disabled", static_mv, control_mode_name(cfg->ave.enabled ? 1 : 0, cfg->ave.enabled),
-      (unsigned)cfg->resource_limit.ave_infer_per_min,
-      edr_resource_cpu_percent(), edr_resource_current_rss_mb(), behavior_mv,
-      behavior_mv[0] ? behavior_mv : static_mv, ioc_rv, wl_rv, cert_rv, avst.behavior_event_queue_size,
-      (unsigned)avst.behavior_queue_capacity, (uint64_t)avst.behavior_infer_ok,
-      (uint64_t)avst.behavior_infer_fail, last_ave_trigger_ms, resource_pressure,
-      pmfe_enabled ? "true" : "false", pmfe_mode_name(cfg), pmfe_depth,
-      pmfe_sub, control_mode_name(cfg->detection.pmfe_mode, pmfe_enabled),
-      (unsigned)cfg->resource_limit.pmfe_scans_per_min, edr_resource_cpu_percent(),
-      edr_resource_current_rss_mb(), pmfe_done, pmfe_drop, pmfe_dedup, pmfe_cd,
-      last_pmfe_trigger_ms, resource_pressure, shellcode_enabled ? "true" : "false", shellcode_active ? "true" : "false",
-      adaptive_mode_name(cfg->detection.shellcode_mode, shellcode_enabled),
-      cfg->shellcode_detector.yara_rules_dir[0] ? "yara_configured" : "builtin",
-      control_mode_name(cfg->detection.shellcode_mode, shellcode_enabled),
-      (unsigned)cfg->resource_limit.shellcode_packets_per_sec, shellcode_budget_drops, edr_resource_cpu_percent(),
-      edr_resource_current_rss_mb(),
-      cfg->shellcode_detector.windivert_tcp_ports_parsed_count,
-      cfg->shellcode_detector.windivert_ports_is_custom ? "true" : "false",
-      last_shellcode_trigger_ms, resource_pressure,
-      webshell_enabled ? "true" : "false", adaptive_mode_name(cfg->detection.webshell_mode, webshell_enabled),
-      cfg->webshell_detector.webshell_rules_dir[0] ? "yara_configured" : "builtin", webshell_watches,
-      control_mode_name(cfg->detection.webshell_mode, webshell_enabled),
-      (unsigned)cfg->resource_limit.webshell_scan_mb_per_min, webshell_budget_drops, edr_resource_cpu_percent(),
-      edr_resource_current_rss_mb(), webshell_watches, (unsigned)cfg->webshell_detector.max_watch_dirs,
-      last_webshell_trigger_ms, resource_pressure);
-  if (hn < 0 || (size_t)hn >= sizeof(health)) {
-    return -1;
-  }
-
-  size_t cap = (size_t)hn + 512u;
-  char *body = (char *)malloc(cap);
-  if (!body) {
-    return -1;
-  }
-  int bn = snprintf(body, cap,
-                    "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
-                    "\"engine_health\":%s}",
-                    ep, agv, pol, health);
-  if (bn < 0 || (size_t)bn >= cap) {
-    free(body);
-    return -1;
-  }
-  int rc = ingest_post_json_relpath("ingest/engine-health", body, "engine-health");
+  int rc = post_to_suffix("ingest/report-events", body);
   free(body);
-  return rc;
-}
-
-/* --- HTTP poll-commands 与 upload-file，与 gRPC 对等，见 /api/v1/ingest/... --- */
-
-static int transport_env_cmd_poll_disabled(void) {
-  const char *e = getenv("EDR_CMD_HTTP_POLL");
-  return e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0);
-}
-
-static int transport_env_cmd_poll_forced(void) {
-  const char *e = getenv("EDR_CMD_HTTP_POLL");
-  return e && (strcmp(e, "1") == 0 || strcmp(e, "true") == 0 || strcmp(e, "TRUE") == 0);
-}
-
-static int want_http_command_poll(void) {
-  if (transport_env_cmd_poll_disabled() || !edr_ingest_http_configured()) {
-    return 0;
-  }
-  if (transport_env_cmd_poll_forced()) {
-    return 1;
-  }
-  return !edr_grpc_client_ready();
-}
-
-static int b64_value(int c) {
-  if (c >= 'A' && c <= 'Z') {
-    return c - 'A';
-  }
-  if (c >= 'a' && c <= 'z') {
-    return c - 'a' + 26;
-  }
-  if (c >= '0' && c <= '9') {
-    return c - '0' + 52;
-  }
-  if (c == '+') {
-    return 62;
-  }
-  if (c == '/') {
-    return 63;
-  }
-  return -1;
-}
-
-static int b64_decode_in(const char *in, size_t in_len, uint8_t *out, size_t out_cap) {
-  const uint8_t *p = (const uint8_t *)in;
-  size_t o = 0;
-  size_t i = 0u;
-  while (i < in_len && p[i] && p[i] != '"') {
-    while (i < in_len && (p[i] == ' ' || p[i] == '\n' || p[i] == '\r' || p[i] == '\t')) {
-      i++;
-    }
-    if (i + 1u >= in_len || p[i] == 0) {
-      break;
-    }
-    if (i + 3u >= in_len) {
-      break;
-    }
-    int a = b64_value((int)p[i]);
-    int b = b64_value((int)p[i + 1u]);
-    if (a < 0 || b < 0) {
-      break;
-    }
-    int c = b64_value((int)p[i + 2u]);
-    int d4 = b64_value((int)p[i + 3u]);
-    if (c >= 0 && d4 >= 0) {
-      if (o + 3u > out_cap) {
-        return -1;
-      }
-      out[o++] = (uint8_t)((a << 2) | (b >> 4));
-      out[o++] = (uint8_t)(((b & 15) << 4) | (c >> 2));
-      out[o++] = (uint8_t)(((c & 3) << 6) | d4);
-    } else if (p[i + 2u] == '=') {
-      if (o + 1u > out_cap) {
-        return -1;
-      }
-      out[o++] = (uint8_t)((a << 2) | (b >> 4));
-    } else if (p[i + 3u] == '=') {
-      if (c < 0) {
-        break;
-      }
-      if (o + 2u > out_cap) {
-        return -1;
-      }
-      out[o++] = (uint8_t)((a << 2) | (b >> 4));
-      out[o++] = (uint8_t)(((b & 15) << 4) | (c >> 2));
-    } else {
-      break;
-    }
-    i += 4u;
-  }
-  return (int)(o);
-}
-
-static int copy_json_string_val(const char *j, const char *key, char *out, size_t cap) {
-  char kbuf[64];
-  size_t n = 0u;
-  while (key && key[n] && n + 6u < sizeof(kbuf) - 1u) {
-    kbuf[n] = (char)key[n];
-    n++;
-  }
-  if (n == 0u) {
-    return -1;
-  }
-  kbuf[n] = 0;
-  char need[80];
-  if (snprintf(need, sizeof(need), "\"%s\"", kbuf) >= (int)sizeof(need) || need[0] == 0) {
-    return -1;
-  }
-  const char *p = strstr(j, need);
-  if (!p) {
-    return -1;
-  }
-  p += strlen(need);
-  for (; p[0] && p[0] != ':'; p++) {}
-  if (p[0] != ':') {
-    return -1;
-  }
-  p++;
-  for (; p[0] == ' ' || p[0] == '\t' || p[0] == '\r' || p[0] == '\n'; p++) {}
-  if (p[0] != '"') {
-    return -1;
-  }
-  p++;
-  size_t o = 0u;
-  for (; p[0] && p[0] != '"';) {
-    if (p[0] == '\\' && p[1] != 0) {
-      p++;
-    }
-    if (o + 1u < cap) {
-      out[o++] = *p;
-    } else {
-      return -1;
-    }
-    p++;
-  }
-  if (o < cap) {
-    out[o] = 0;
-  }
-  return 0;
-}
-
-static int int32_str_10(const char *s) {
-  long n = 0L;
-  char *endp = NULL;
-  if (!s || !s[0]) {
-    return 0;
-  }
-  errno = 0;
-  n = strtol(s, &endp, 10);
-  if (errno != 0 || (endp && *endp != 0)) {
-    return 0;
-  }
-  if (n > 2147483647L) {
-    n = 2147483647L;
-  }
-  if (n < -2147483647L) {
-    n = -2147483647L;
-  }
-  return (int)n;
-}
-
-static const char *find_json_object_end(const char *o) {
-  int d = 0;
-  for (const char *p = o; *p; p++) {
-    if (*p == '{') {
-      d++;
-    } else if (*p == '}') {
-      d--;
-      if (d == 0) {
-        return p + 1u;
-      }
-    }
-  }
-  return o;
-}
-
-static void try_dispatch_one_object(const char *ojson) {
-  if (!ojson || ojson[0] != '{') {
-    return;
-  }
-  char eid[128], cty[128];
-  const size_t p64_cap = 2u * 1024u * 1024u;
-  char *p64 = (char *)malloc(p64_cap);
-  eid[0] = 0;
-  cty[0] = 0;
-  if (!p64) {
-    return;
-  }
-  p64[0] = 0;
-  (void)copy_json_string_val(ojson, "command_id", eid, sizeof(eid));
-  (void)copy_json_string_val(ojson, "command_type", cty, sizeof(cty));
-  (void)copy_json_string_val(ojson, "payload_b64", p64, p64_cap);
-  if (eid[0] == 0 || cty[0] == 0) {
-    free(p64);
-    return;
-  }
-  EdrSoarCommandMeta m;
-  memset(&m, 0, sizeof(m));
-  char sc[200], pr[200], ps[200], ikey[200];
-  sc[0] = 0;
-  if (copy_json_string_val(ojson, "soar_correlation_id", sc, sizeof(sc)) == 0) {
-    snprintf(m.soar_correlation_id, sizeof(m.soar_correlation_id), "%s", sc);
-  }
-  if (copy_json_string_val(ojson, "playbook_run_id", pr, sizeof(pr)) == 0) {
-    snprintf(m.playbook_run_id, sizeof(m.playbook_run_id), "%s", pr);
-  }
-  if (copy_json_string_val(ojson, "playbook_step_id", ps, sizeof(ps)) == 0) {
-    snprintf(m.playbook_step_id, sizeof(m.playbook_step_id), "%s", ps);
-  }
-  if (copy_json_string_val(ojson, "idempotency_key", ikey, sizeof(ikey)) == 0) {
-    snprintf(m.idempotency_key, sizeof(m.idempotency_key), "%s", ikey);
-  }
-  {
-    char tmp[32];
-    if (copy_json_string_val(ojson, "issued_at_unix_ms", tmp, sizeof(tmp)) == 0) {
-      m.issued_at_unix_ms = (int64_t)strtoll(tmp, NULL, 10);
-    }
-  }
-  {
-    char t[32];
-    if (copy_json_string_val(ojson, "deadline_ms", t, sizeof(t)) == 0) {
-      m.deadline_ms = (uint32_t)int32_str_10(t);
-    }
-  }
-  {
-    const size_t dec_cap = 1u * 1024u * 1024u;
-    uint8_t *pbuf = (uint8_t *)malloc(dec_cap);
-    if (pbuf) {
-      int n = 0;
-      if (p64[0]) {
-        n = b64_decode_in(p64, strlen(p64), pbuf, dec_cap);
-      }
-      if (n < 0) {
-        n = 0;
-      }
-      edr_command_on_envelope(eid, cty, n > 0 ? pbuf : NULL, (size_t)(unsigned)n, &m);
-      free(pbuf);
-    }
-  }
-  free(p64);
-}
-
-static void poll_dispatch_body(const char *body) {
-  if (!body) {
-    return;
-  }
-  const char *cstart = strstr(body, "\"commands\"");
-  if (!cstart) {
-    return;
-  }
-  const char *lb = strchr(cstart, '[');
-  if (!lb) {
-    return;
-  }
-  const char *p = lb;
-  for (;;) {
-    p = strchr(p, '{');
-    if (!p) {
-      return;
-    }
-    const char *e = find_json_object_end(p);
-    if (!e || e == p) {
-      return;
-    }
-    {
-      char *s = (char *)malloc((size_t)(e - p) + 1u);
-      if (s) {
-        memcpy(s, p, (size_t)(e - p));
-        s[(size_t)(e - p)] = 0;
-        try_dispatch_one_object(s);
-        free(s);
-      }
-    }
-    p = e;
-    for (;;) {
-      if (!*p) {
-        return;
-      }
-      if (*p == ']') {
-        return;
-      }
-      if (isspace((unsigned char)*p) || *p == ',') {
-        p++;
-        continue;
-      }
-      if (*p == '{' || *p == '}') {
-        break;
-      }
-      p++;
-    }
-  }
-}
-
-#ifdef EDR_HAVE_LIBCURL
-struct edr_ingest_membuf {
-  char *p;
-  size_t len;
-  size_t cap;
-};
-
-static size_t ingest_curl_grow_write(char *ptr, size_t sz, size_t nmemb, void *u) {
-  size_t a = sz * nmemb;
-  struct edr_ingest_membuf *b = (struct edr_ingest_membuf *)u;
-  if (a == 0u) {
-    return 0u;
-  }
-  if (b->len + a + 1u > b->cap) {
-    size_t nc = (b->cap < 1024u ? 2048u : b->cap * 2u) + a;
-    char *np = (char *)realloc(b->p, nc);
-    if (!np) {
-      return 0u;
-    }
-    b->p = np;
-    b->cap = nc;
-  }
-  memcpy(b->p + b->len, ptr, a);
-  b->len += a;
-  b->p[b->len] = 0;
-  return a;
-}
-
-static int ingest_get_json_relpath_curl(const char *relpath, char **out_body, int *out_http) {
-  if (curl_ensure_init() != 0 || !relpath || !out_body || !out_http) {
-    return -1;
-  }
-  *out_body = NULL;
-  *out_http = 0;
-  char url[1024];
-  if (snprintf(url, sizeof(url), "%s/%s", s_rest, relpath) >= (int)sizeof(url)) {
-    return -1;
-  }
-  struct edr_ingest_membuf mb;
-  memset(&mb, 0, sizeof(mb));
-  CURL *curl = curl_conn_acquire();
-  if (!curl) {
-    return -1;
-  }
-  struct curl_slist *hdrs = NULL;
-  {
-    char tbuf[200];
-    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
-    hdrs = curl_slist_append(hdrs, tbuf);
-    snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
-    hdrs = curl_slist_append(hdrs, tbuf);
-    hdrs = curl_slist_append(hdrs, "X-Permission-Set: telemetry:write");
-    if (s_bearer[0] && (size_t)snprintf(tbuf, sizeof(tbuf), "Authorization: Bearer %s", s_bearer) < sizeof(tbuf)) {
-      hdrs = curl_slist_append(hdrs, tbuf);
-    }
-  }
-  char errbuf[CURL_ERROR_SIZE];
-  errbuf[0] = 0;
-  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-  curl_easy_setopt(curl, CURLOPT_URL, url);
-  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ingest_curl_grow_write);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&mb);
-  (void)curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
-  CURLcode cres = curl_easy_perform(curl);
-  long code = 0;
-  if (cres == CURLE_OK) {
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-  }
-  curl_slist_free_all(hdrs);
-  curl_conn_release(curl);
-  if (cres != CURLE_OK) {
-    const char *em = errbuf[0] ? errbuf : curl_easy_strerror(cres);
-    EDR_LOGE("[ingest-http] GET %s: %s\n", relpath, em);
-    free(mb.p);
-    return -1;
-  }
-  *out_body = mb.p;
-  *out_http = (int)code;
-  if (!mb.p) {
-    *out_body = (char *)malloc(1);
-    if (*out_body) {
-      (*out_body)[0] = 0;
-    }
-  }
-  return 0;
-}
-#endif
-
-static int ingest_get_json_relpath_shell(const char *relpath, char **out_body, int *out_http) {
-  if (!s_rest[0] || !relpath || !out_body || !out_http) {
-    return -1;
-  }
-  if (!shell_curl_fallback_allowed()) {
-    EDR_LOGE("%s", "[ingest-http] GET shell curl fallback disabled\n");
-    return -1;
-  }
-  *out_body = NULL;
-  *out_http = 0;
-  char jsonpath[512], cfgpath[512], resp_path[512];
-#ifdef _WIN32
-  char td[MAX_PATH];
-  DWORD nn = GetTempPathA((DWORD)sizeof(td), td);
-  if (nn == 0 || nn >= sizeof(td)) {
-    snprintf(td, sizeof(td), ".\\");
-  }
-  win_path_fwd_slashes(td);
-  {
-    unsigned long pp = (unsigned long)GetCurrentProcessId();
-    unsigned long t = (unsigned long)GetTickCount() ^ (pp << 1);
-    _snprintf(cfgpath, sizeof(cfgpath) - 1, "%sedr_getcfg_%lu_%lu.curl", td, t, pp);
-    _snprintf(resp_path, sizeof(resp_path) - 1, "%sedr_getresp_%lu_%lu.http", td, t, pp);
-  }
-  (void)jsonpath;
-  jsonpath[0] = 0;
-#else
-  (void)jsonpath;
-  {
-    int pp = (int)getpid();
-    (void)snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_getcfg_%d.curl", pp);
-    (void)snprintf(resp_path, sizeof(resp_path), "/tmp/edr_getresp_%d.http", pp);
-  }
-#endif
-  if (!shell_curl_fallback_allowed()) {
-    EDR_LOGE("%s", "[ingest-http] upload shell curl fallback disabled\n");
-    return -1;
-  }
-  {
-    char url[1024];
-    if (snprintf(url, sizeof(url), "%s/%s", s_rest, relpath) >= (int)sizeof(url)) {
-      return -1;
-    }
-    FILE *cf = fopen(cfgpath, "wb");
-    if (!cf) {
-      return -1;
-    }
-    fprintf(cf, "url = \"%s\"\n", url);
-    fprintf(cf, "header = \"X-Tenant-ID: ");
-    fprint_curl_cfg_dquoted_body(cf, s_tenant[0] ? s_tenant : "demo-tenant");
-    fputs("\"\n", cf);
-    fprintf(cf, "header = \"X-User-ID: ");
-    fprint_curl_cfg_dquoted_body(cf, s_user[0] ? s_user : "edr-agent");
-    fputs("\"\n", cf);
-    fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
-    fprintf(cf, "output = \"%s\"\n", resp_path);
-    fprintf(cf, "silent\n");
-    fclose(cf);
-  }
-  if (run_curl_config_no_shell(resp_path, cfgpath, s_bearer) != 0) {
-    (void)remove(cfgpath);
-    EDR_LOGE("%s", "[ingest-http] GET curl fallback failed\n");
-    return -1;
-  }
-  int http_code = 200;
-  (void)remove(cfgpath);
-  *out_http = http_code;
-  {
-    FILE *rf = fopen(resp_path, "rb");
-    if (!rf) {
-      (void)remove(resp_path);
-      return -1;
-    }
-    if (fseek(rf, 0, SEEK_END) != 0) {
-      fclose(rf);
-      (void)remove(resp_path);
-      return -1;
-    }
-    long fsz = ftell(rf);
-    if (fsz < 0) {
-      fclose(rf);
-      (void)remove(resp_path);
-      return -1;
-    }
-    rewind(rf);
-    *out_body = (char *)malloc((size_t)fsz + 1u);
-    if (!*out_body) {
-      fclose(rf);
-      (void)remove(resp_path);
-      return -1;
-    }
-    (void)fread(*out_body, 1, (size_t)fsz, rf);
-    (*out_body)[(size_t)fsz] = 0;
-    fclose(rf);
-  }
-  (void)remove(resp_path);
-  if (http_code < 200 || http_code >= 300) {
-    free(*out_body);
-    *out_body = NULL;
+  if (rc != 0) {
+    fprintf(stderr, "[ingest-http] native post failed rc=%d (rest=%s err=%s)\n", rc, s_rest, s_last_error);
     return -1;
   }
   return 0;
 }
 
-static int ingest_get_json_relpath(const char *relpath, char **out_body) {
-  int h = 0;
-  char *body = NULL;
-  if (!relpath || !out_body) {
+int edr_ingest_http_post_engine_health_json(const char *body_json) {
+  if (!edr_ingest_http_configured() || !body_json || !body_json[0]) {
     return -1;
   }
-  *out_body = NULL;
-#ifdef EDR_HAVE_LIBCURL
-  {
-    int hc = 0;
-    if (ingest_get_json_relpath_curl(relpath, &body, &hc) == 0) {
-      if (hc >= 200 && hc < 300) {
-        *out_body = body;
-        return 0;
-      }
-      EDR_LOGE("[ingest-http] GET %s: HTTP %d (libcurl)\n", relpath, hc);
-      free(body);
-      body = NULL;
-    }
-  }
-#endif
-  if (ingest_get_json_relpath_shell(relpath, &body, &h) == 0 && body) {
-    *out_body = body;
-    return 0;
-  }
-  return -1;
-}
 
-static int append_pct_encode(const char *in, char *out, size_t cap) {
-  size_t w = 0;
-  const char *p = in;
-  for (; p && p[0]; p++) {
-    unsigned char c = (unsigned char)p[0];
-    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '_' || c == '.'
-        || c == '~') {
-      if (w + 2u >= cap) {
-        return -1;
-      }
-      out[w++] = (char)c;
-    } else {
-      if (w + 4u >= cap) {
-        return -1;
-      }
-      (void)snprintf(out + w, cap - w, "%%%.2X", (unsigned)c);
-      w += 3u;
-    }
-  }
-  if (w < cap) {
-    out[w] = 0;
+  int rc = post_to_suffix("ingest/engine-health", body_json);
+  if (rc != 0) {
+    fprintf(stderr, "[ingest-http] engine_health native post failed rc=%d (rest=%s err=%s)\n", rc, s_rest,
+            s_last_error);
+    return -1;
   }
   return 0;
-}
-
-static void http_poll_once(void) {
-  char relp[640];
-  char eenc[500];
-  eenc[0] = 0;
-  if (append_pct_encode(s_endpoint, eenc, sizeof(eenc)) != 0) {
-    return;
-  }
-  if (snprintf(relp, sizeof(relp), "ingest/poll-commands?endpoint_id=%s&limit=16", eenc) >= (int)sizeof(relp)) {
-    return;
-  }
-  char *body = NULL;
-  if (ingest_get_json_relpath(relp, &body) != 0) {
-    return;
-  }
-  if (body) {
-    poll_dispatch_body(body);
-    free(body);
-  }
-}
-
-static volatile int s_cmd_poll_run;
-static volatile int s_cmd_poll_thread_started;
-#ifdef _WIN32
-static HANDLE s_cmd_poll_thr;
-#else
-static pthread_t s_cmd_poll_thr;
-#endif
-
-static void my_sleep_ms(unsigned n) {
-#ifdef _WIN32
-  if (n > 0u) {
-    Sleep((DWORD)(n < 0xffffffffu ? n : 0xffffffffu));
-  }
-#else
-  (void)usleep((n > 0u) ? n * 1000u : 0u);
-#endif
-}
-
-static unsigned poll_interval_ms(void) {
-  return 8000u;
-}
-
-static void *cmd_poll_thread(void *a) {
-  (void)a;
-  while (s_cmd_poll_run) {
-    if (want_http_command_poll() && edr_ingest_http_configured()) {
-      http_poll_once();
-    }
-    for (unsigned i = 0; i < poll_interval_ms() && s_cmd_poll_run; i += 200u) {
-      my_sleep_ms(200u);
-    }
-  }
-  return NULL;
-}
-
-#ifdef _WIN32
-static unsigned __stdcall win_cmd_poll(void *p) {
-  (void)cmd_poll_thread(p);
-  return 0U;
-}
-#endif
-
-void edr_ingest_http_start_command_poll(void) {
-  if (s_cmd_poll_thread_started) {
-    return;
-  }
-  if (!want_http_command_poll() || !edr_ingest_http_configured()) {
-    return;
-  }
-  s_cmd_poll_run = 1;
-  s_cmd_poll_thread_started = 1;
-#ifdef _WIN32
-  s_cmd_poll_thr = (HANDLE)_beginthreadex(NULL, 0, win_cmd_poll, NULL, 0, NULL);
-  if (s_cmd_poll_thr == 0) {
-    s_cmd_poll_thread_started = 0;
-    s_cmd_poll_run = 0;
-  }
-#else
-  if (pthread_create(&s_cmd_poll_thr, NULL, cmd_poll_thread, NULL) != 0) {
-    s_cmd_poll_thread_started = 0;
-    s_cmd_poll_run = 0;
-  }
-#endif
-}
-
-void edr_ingest_http_stop_command_poll(void) {
-  s_cmd_poll_run = 0;
-  if (s_cmd_poll_thread_started) {
-#ifdef _WIN32
-    if (s_cmd_poll_thr) {
-      WaitForSingleObject(s_cmd_poll_thr, 15000);
-      CloseHandle(s_cmd_poll_thr);
-      s_cmd_poll_thr = 0;
-    }
-#else
-    (void)pthread_join(s_cmd_poll_thr, NULL);
-#endif
-  }
-  s_cmd_poll_thread_started = 0;
-}
-
-void edr_ingest_http_shutdown(void) {
-  edr_ingest_http_stop_command_poll();
-  /* 清除配置，后续调用 edr_ingest_http_configured() 返回 0 */
-  memset(s_rest, 0, sizeof(s_rest));
-  memset(s_tenant, 0, sizeof(s_tenant));
-  memset(s_user, 0, sizeof(s_user));
-  memset(s_bearer, 0, sizeof(s_bearer));
-  memset(s_endpoint, 0, sizeof(s_endpoint));
-  memset(s_agent_ver, 0, sizeof(s_agent_ver));
-}
-
-static int copy_minio_key_from_json(const char *json, char *out, size_t out_cap) {
-  if (!out || out_cap < 2u) {
-    return -1;
-  }
-  out[0] = 0;
-  const char *k = (json && json[0]) ? strstr(json, "\"minio_key\":\"") : NULL;
-  if (!k) {
-    return -1;
-  }
-  k += 13; /* past "minio_key":" */
-  {
-    const char *e = k;
-    for (; *e && *e != '"'; e++) {
-      if (*e == '\\' && e[1] != 0) {
-        e++;
-      }
-    }
-    if (*e != '"') {
-      return -1;
-    }
-    size_t n = (size_t)(e - k);
-    if (n + 1u > out_cap) {
-      n = out_cap - 1u;
-    }
-    memcpy(out, k, n);
-    out[n] = 0;
-  }
-  return 0;
-}
-
-static int file_base_name_to_buf(const char *p, char *b, size_t cap) {
-  if (!p) {
-    return -1;
-  }
-  const char *s = p, *d = s;
-  for (; *d; d++) {
-#ifdef _WIN32
-    if (*d == '/' || *d == '\\') {
-      s = d + 1;
-    }
-#else
-    if (*d == '/') {
-      s = d + 1;
-    }
-#endif
-  }
-  (void)snprintf(b, cap, "%s", s);
-  return 0;
-}
-
-int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path, const char *sha256_hex,
-                                         char *out_minio_key, size_t out_minio_key_cap) {
-  if (!edr_ingest_http_configured() || !file_path || !file_path[0]) {
-    return -1;
-  }
-  char ubuf[160];
-  ubuf[0] = 0;
-  if (upload_id && upload_id[0]) {
-    snprintf(ubuf, sizeof(ubuf), "%s", upload_id);
-  } else {
-    (void)snprintf(ubuf, sizeof(ubuf), "up-c-%" PRId64, (int64_t)edr_ingest_wall_time_ms());
-  }
-  if (out_minio_key && out_minio_key_cap > 0u) {
-    out_minio_key[0] = 0;
-  }
-  char bname[260];
-  bname[0] = 0;
-  (void)file_base_name_to_buf(file_path, bname, sizeof(bname));
-  if (bname[0] == 0) {
-    snprintf(bname, sizeof(bname), "%s", "upload.bin");
-  }
-#ifdef EDR_HAVE_LIBCURL
-  CURL *curl = curl_conn_acquire();
-  if (curl) {
-      char errbuf[CURL_ERROR_SIZE], url[800];
-      errbuf[0] = 0;
-      if (snprintf(url, sizeof(url), "%s/ingest/upload-file", s_rest) >= (int)sizeof(url)) {
-        curl_conn_release(curl);
-        return -1;
-      }
-      struct curl_slist *hdrs = NULL;
-      {
-        char tbuf[200];
-        snprintf(tbuf, sizeof(tbuf), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
-        hdrs = curl_slist_append(hdrs, tbuf);
-        snprintf(tbuf, sizeof(tbuf), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
-        hdrs = curl_slist_append(hdrs, tbuf);
-        hdrs = curl_slist_append(hdrs, "X-Permission-Set: telemetry:write");
-        if (s_bearer[0] && (size_t)snprintf(tbuf, sizeof(tbuf), "Authorization: Bearer %s", s_bearer) < sizeof(tbuf)) {
-          hdrs = curl_slist_append(hdrs, tbuf);
-        }
-      }
-      struct edr_ingest_membuf mb;
-      memset(&mb, 0, sizeof(mb));
-      curl_mime *mime = curl_mime_init(curl);
-      if (mime) {
-        curl_mimepart *part;
-        part = curl_mime_addpart(mime);
-        curl_mime_name(part, "upload_id");
-        curl_mime_data(part, ubuf, CURL_ZERO_TERMINATED);
-        part = curl_mime_addpart(mime);
-        curl_mime_name(part, "file");
-        (void)curl_mime_filedata(part, file_path);
-        (void)curl_mime_filename(part, bname);
-        part = curl_mime_addpart(mime);
-        curl_mime_name(part, "file_name");
-        curl_mime_data(part, bname, CURL_ZERO_TERMINATED);
-        if (sha256_hex && sha256_hex[0]) {
-          part = curl_mime_addpart(mime);
-          curl_mime_name(part, "sha256");
-          curl_mime_data(part, sha256_hex, CURL_ZERO_TERMINATED);
-        }
-        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-        curl_easy_setopt(curl, CURLOPT_URL, url);
-        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ingest_curl_grow_write);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&mb);
-        (void)curl_easy_setopt(curl, CURLOPT_USERAGENT, "edr-agent/ingest");
-        CURLcode cres = curl_easy_perform(curl);
-        long code = 0;
-        if (cres == CURLE_OK) {
-          curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-        }
-        curl_mime_free(mime);
-        curl_slist_free_all(hdrs);
-        curl_conn_release(curl);
-        if (cres == CURLE_OK && code >= 200 && code < 300) {
-          if (mb.p && out_minio_key) {
-            (void)copy_minio_key_from_json(mb.p, out_minio_key, out_minio_key_cap);
-          }
-          free(mb.p);
-          return 0;
-        }
-        if (cres != CURLE_OK) {
-          EDR_LOGE("[ingest-http] upload: %s\n", errbuf[0] ? errbuf : curl_easy_strerror(cres));
-        } else {
-          EDR_LOGE("[ingest-http] upload HTTP %ld (libcurl)\n", code);
-        }
-        free(mb.p);
-      } else {
-        curl_slist_free_all(hdrs);
-        curl_conn_release(curl);
-      }
-    }
-#endif
-  {
-    char rpath[512], cfg2[800];
-    char tbuf2[8];
-    (void)memset(tbuf2, 0, sizeof(tbuf2));
-#ifdef _WIN32
-    char td[MAX_PATH];
-    DWORD nn = GetTempPathA((DWORD)sizeof(td), td);
-    if (nn == 0 || nn >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    win_path_fwd_slashes(td);
-    (void)snprintf(rpath, sizeof(rpath), "%sedr_upr_%lu.http", td, (unsigned long)GetCurrentProcessId());
-    (void)snprintf(cfg2, sizeof(cfg2), "%sedr_upc_%lu.curl", td, (unsigned long)GetCurrentProcessId());
-#else
-    (void)snprintf(rpath, sizeof(rpath), "/tmp/edr_upr_%d.http", (int)getpid());
-    (void)snprintf(cfg2, sizeof(cfg2), "/tmp/edr_upc_%d.curl", (int)getpid());
-#endif
-    {
-      char url0[800];
-      if (snprintf(url0, sizeof(url0), "%s/ingest/upload-file", s_rest) >= (int)sizeof(url0)) {
-        return -1;
-      }
-      FILE *cfx = fopen(cfg2, "wb");
-      if (!cfx) {
-        return -1;
-      }
-      fprintf(cfx, "url = \"%s\"\n", url0);
-      fprintf(cfx, "form = \"upload_id=");
-      fprint_curl_cfg_dquoted_body(cfx, ubuf);
-      fputs("\"\n", cfx);
-      fprintf(cfx, "form = \"file_name=");
-      fprint_curl_cfg_dquoted_body(cfx, bname);
-      fputs("\"\n", cfx);
-      fprintf(cfx, "form = \"file=@");
-      fprint_curl_cfg_dquoted_body(cfx, file_path);
-      fputs("\"\n", cfx);
-      if (sha256_hex && sha256_hex[0]) {
-        fprintf(cfx, "form = \"sha256=");
-        fprint_curl_cfg_dquoted_body(cfx, sha256_hex);
-        fputs("\"\n", cfx);
-      }
-      fprintf(cfx, "header = \"X-Tenant-ID: ");
-      fprint_curl_cfg_dquoted_body(cfx, s_tenant[0] ? s_tenant : "demo-tenant");
-      fputs("\"\n", cfx);
-      fprintf(cfx, "header = \"X-User-ID: ");
-      fprint_curl_cfg_dquoted_body(cfx, s_user[0] ? s_user : "edr-agent");
-      fputs("\"\n", cfx);
-      fprintf(cfx, "header = \"X-Permission-Set: telemetry:write\"\n");
-      fprintf(cfx, "output = \"%s\"\n", rpath);
-      fprintf(cfx, "silent\n");
-      fclose(cfx);
-    }
-    int curl_ok = run_curl_config_no_shell(rpath, cfg2, s_bearer);
-    (void)remove(cfg2);
-    if (curl_ok != 0) {
-      (void)remove(rpath);
-      return -1;
-    }
-    {
-      FILE *rf2 = fopen(rpath, "rb");
-      if (!rf2) {
-        return -1;
-      }
-      if (fseek(rf2, 0, SEEK_END) != 0) {
-        fclose(rf2);
-        (void)remove(rpath);
-        return -1;
-      }
-      long fs2 = ftell(rf2);
-      if (fs2 < 0) {
-        fclose(rf2);
-        (void)remove(rpath);
-        return -1;
-      }
-      rewind(rf2);
-      char *jbuf = (char *)malloc((size_t)fs2 + 1u);
-      if (!jbuf) {
-        fclose(rf2);
-        (void)remove(rpath);
-        return -1;
-      }
-      (void)fread(jbuf, 1, (size_t)fs2, rf2);
-      jbuf[(size_t)fs2] = 0;
-      fclose(rf2);
-      (void)remove(rpath);
-      if (out_minio_key) {
-        (void)copy_minio_key_from_json(jbuf, out_minio_key, out_minio_key_cap);
-      }
-      free(jbuf);
-    }
-    return 0;
-  }
 }

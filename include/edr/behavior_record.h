@@ -57,6 +57,8 @@ typedef struct {
   char script_snippet[EDR_BR_STR_LONG];
   /** 最近一次 PMFE 扫描摘要（JSON，`edr_pid_history_pmfe_fill_record`）；无则空 */
   char pmfe_snapshot[512];
+  /** 轻量检测决策（JSON）：组合评分、降噪原因，供服务端/前端稳定消费。 */
+  char detection_context[4096];
 
   /**
    * 《11》§5.5 维 56：证书链祖先吊销（0/1）。可由 ETW1 载荷键 **`cert_revoked_ancestor` / `cert_ra`** 注入，

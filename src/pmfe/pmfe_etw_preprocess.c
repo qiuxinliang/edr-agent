@@ -1,9 +1,7 @@
-/* §21 PMFE：预处理阶段自动入队 — detection_trigger 决策后只扫描关键进程 */
+/* §21 PMFE：预处理阶段自动入队 — Windows：ETW shellcode；Linux：`EDR_PMFE_ETW_AUTO` + webshell 检测 */
 
-#include "edr/detection_trigger.h"
-#include "edr/forensic_trigger.h"
 #include "edr/pmfe.h"
-#include "edr/edr_log.h"
+#include "edr/detection_decision.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -15,14 +13,10 @@
 #endif
 
 #ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
 #include <iphlpapi.h>
 #include <stdio.h>
+#include <winsock2.h>
+#include <windows.h>
 
 /** 在 ETW1 文本中查找 `key=value` 行（key 不含 '='） */
 static int etw1_line_value(const uint8_t *data, uint32_t len, const char *key, char *out, size_t out_cap) {
@@ -106,48 +100,100 @@ static uint32_t pmfe_tcp_owner_for_local_port_v4(uint16_t port_host_order) {
 }
 #endif
 
+#if defined(__linux__) || defined(_WIN32)
+static int pmfe_auto_allowed_by_profile(const EdrBehaviorRecord *br) {
+  const char *modern = getenv("EDR_DETECTION_PMFE_AUTO");
+  const char *legacy = getenv("EDR_PMFE_ETW_AUTO");
+  if ((modern && modern[0] == '0') || (legacy && legacy[0] == '0')) {
+    return 0;
+  }
+  if (legacy && legacy[0] == '1' && (!modern || modern[0] != '0')) {
+    return 1;
+  }
+  if (!br) {
+    return 0;
+  }
+  EdrBehaviorRecord copy = *br;
+  EdrDetectionDecision d;
+  edr_detection_decision_evaluate(&copy, &d);
+  return d.trigger_pmfe_scan ? 1 : 0;
+}
+
+static int pmfe_is_self_pid(uint32_t pid) {
+  if (pid == 0u) {
+    return 1;
+  }
+#if defined(_WIN32)
+  return pid == (uint32_t)GetCurrentProcessId();
+#elif defined(__linux__)
+  return pid == (uint32_t)getpid();
+#else
+  return 0;
+#endif
+}
+
+static int pmfe_queue_profile_scan(const EdrEventSlot *slot, const EdrBehaviorRecord *br, const char *reason) {
+  if (!slot || !br || br->type == EDR_EVENT_PMFE_SCAN_RESULT || pmfe_is_self_pid(br->pid)) {
+    return -1;
+  }
+  EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  int rc = edr_pmfe_submit_etw_scan_ex(reason && reason[0] ? reason : "profile_trigger", br->pid, band, 0);
+  if (rc == 0) {
+    fprintf(stderr, "[pmfe][pre] profile auto_queued pid=%u type=%d band=%u reason=%s\n", (unsigned)br->pid,
+            (int)br->type, (unsigned)band, reason && reason[0] ? reason : "profile_trigger");
+  }
+  return rc;
+}
+#endif
+
 void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorRecord *br) {
   if (!slot || !br) {
     return;
   }
-  EdrDetectionDecision dec;
-  if (!edr_detection_trigger_evaluate(edr_pmfe_current_config(), slot, br, &dec) || !dec.recommend_pmfe) {
-    return;
-  }
-  edr_forensic_trigger_evaluate_detection(slot, br, dec.pmfe_reason, dec.pmfe_pid, dec.pmfe_priority);
 #if defined(__linux__) && !defined(_WIN32)
-  if (dec.pmfe_pid == 0u || dec.pmfe_pid == (uint32_t)getpid()) {
+  if (!pmfe_auto_allowed_by_profile(br)) {
     return;
   }
-  EdrPmfeTriggerBand band = dec.pmfe_priority == 0u ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
-  if (edr_pmfe_submit_etw_scan_ex(dec.pmfe_reason, dec.pmfe_pid, band, 0) == 0) {
-    EDR_LOGV("[pmfe][pre] linux auto_queued reason=%s pid=%u band=%u\n", dec.pmfe_reason,
-             (unsigned)dec.pmfe_pid, (unsigned)band);
+  if (br->type != EDR_EVENT_WEBSHELL_DETECTED) {
+    (void)pmfe_queue_profile_scan(slot, br, "profile_trigger");
+    return;
+  }
+  if (pmfe_is_self_pid(br->pid)) {
+    return;
+  }
+  EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  if (edr_pmfe_submit_etw_scan_ex("webshell", br->pid, band, 0) == 0) {
+    fprintf(stderr, "[pmfe][pre] linux auto_queued webshell pid=%u band=%u\n", (unsigned)br->pid, (unsigned)band);
   }
 #elif defined(_WIN32)
-  uint32_t target = dec.pmfe_pid;
-  double score = 0.0;
-  if (br->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
-    char score_s[40];
-    char dpt_s[24];
-    if (etw1_line_value(slot->data, slot->size, "score", score_s, sizeof(score_s)) != 0) {
-      return;
-    }
-    score = strtod(score_s, NULL);
-    double th = 0.65;
-    const char *ts = getenv("EDR_PMFE_ETW_SHELLCODE_SCORE");
-    if (ts && ts[0]) {
-      th = strtod(ts, NULL);
-    }
-    if (score < th) {
-      return;
-    }
+  if (!pmfe_auto_allowed_by_profile(br)) {
+    return;
+  }
+  if (br->type != EDR_EVENT_PROTOCOL_SHELLCODE) {
+    (void)pmfe_queue_profile_scan(slot, br, "profile_trigger");
+    return;
+  }
 
-    if (target == 0u && etw1_line_value(slot->data, slot->size, "dpt", dpt_s, sizeof(dpt_s)) == 0) {
-      unsigned long dpt = strtoul(dpt_s, NULL, 10);
-      if (dpt > 0ul && dpt <= 65535ul) {
-        target = pmfe_tcp_owner_for_local_port_v4((uint16_t)dpt);
-      }
+  char score_s[40];
+  char dpt_s[24];
+  if (etw1_line_value(slot->data, slot->size, "score", score_s, sizeof(score_s)) != 0) {
+    return;
+  }
+  double score = strtod(score_s, NULL);
+  double th = 0.65;
+  const char *ts = getenv("EDR_PMFE_ETW_SHELLCODE_SCORE");
+  if (ts && ts[0]) {
+    th = strtod(ts, NULL);
+  }
+  if (score < th) {
+    return;
+  }
+
+  uint32_t target = br->pid;
+  if (target == 0u && etw1_line_value(slot->data, slot->size, "dpt", dpt_s, sizeof(dpt_s)) == 0) {
+    unsigned long dpt = strtoul(dpt_s, NULL, 10);
+    if (dpt > 0ul && dpt <= 65535ul) {
+      target = pmfe_tcp_owner_for_local_port_v4((uint16_t)dpt);
     }
   }
 
@@ -164,11 +210,11 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
     hint_va = strtoull(va_s, NULL, 0);
   }
 
-  EdrPmfeTriggerBand band = dec.pmfe_priority == 0u ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
 
-  if (edr_pmfe_submit_etw_scan_ex(dec.pmfe_reason, target, band, hint_va) == 0) {
-    EDR_LOGV("[pmfe][etw] auto_queued reason=%s score=%.4f target_pid=%u band=%u hint=0x%llx\n",
-            dec.pmfe_reason, score, (unsigned)target, (unsigned)band, (unsigned long long)hint_va);
+  if (edr_pmfe_submit_etw_scan_ex("shellcode", target, band, hint_va) == 0) {
+    fprintf(stderr, "[pmfe][etw] auto_queued shellcode score=%.4f target_pid=%u band=%u hint=0x%llx\n", score,
+            (unsigned)target, (unsigned)band, (unsigned long long)hint_va);
   }
 #else
   (void)slot;

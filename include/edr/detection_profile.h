@@ -1,23 +1,35 @@
 #ifndef EDR_DETECTION_PROFILE_H
 #define EDR_DETECTION_PROFILE_H
 
-#include "edr/config.h"
+#include "edr/behavior_record.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <stdint.h>
 
-/*
- * Apply the lightweight [detection] profile onto concrete engine switches.
- * Mode semantics:
- *   0  force off
- *   1  force on
- *  -1  adaptive, conservative auto-enable
- */
-void edr_detection_apply_profile(EdrConfig *cfg);
+struct EdrDetectionDecision;
 
-#ifdef __cplusplus
-}
-#endif
+typedef struct EdrDetectionProfile {
+  char name[32];
+  uint8_t server_asset;
+  uint8_t high_value_asset;
+  uint8_t aggressive;
+  uint8_t pmfe_auto_enabled;
+  uint8_t minidump_enabled;
+  float pmfe_confidence_threshold;
+  float minidump_confidence_threshold;
+} EdrDetectionProfile;
+
+typedef struct EdrDetectionTrigger {
+  char profile_name[32];
+  uint8_t pmfe_scan;
+  uint8_t single_process_minidump;
+  uint8_t targeted_files;
+  uint8_t ioc_lookup;
+  char reason[192];
+} EdrDetectionTrigger;
+
+void edr_detection_profile_load(EdrDetectionProfile *out);
+void edr_detection_trigger_evaluate(const EdrBehaviorRecord *r, const struct EdrDetectionDecision *d,
+                                    EdrDetectionTrigger *out);
+int edr_detection_trigger_should_auto_pmfe(const EdrBehaviorRecord *r, const struct EdrDetectionDecision *d);
 
 #endif

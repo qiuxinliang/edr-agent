@@ -2345,3 +2345,23 @@ void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *ou
   }
 #endif
 }
+
+unsigned long edr_pmfe_queue_depth(void) {
+  unsigned long n = 0;
+#ifdef _WIN32
+  if (!s_inited) {
+    return 0;
+  }
+  EnterCriticalSection(&s_q_mu);
+  n = (unsigned long)s_task_count;
+  LeaveCriticalSection(&s_q_mu);
+#else
+  if (!__atomic_load_n(&s_inited, __ATOMIC_ACQUIRE)) {
+    return 0;
+  }
+  pthread_mutex_lock(&s_q_mu);
+  n = (unsigned long)s_task_count;
+  pthread_mutex_unlock(&s_q_mu);
+#endif
+  return n;
+}

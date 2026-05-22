@@ -1,110 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
-project(edr_agent C CXX)
+project(edr_agent
+  VERSION 0.1.0
+  DESCRIPTION "EDR endpoint agent"
+  LANGUAGES C CXX
+)
 
-# 非 MSVC 保持 C11；MSVC 用 C17 以便 CMake 只发一条 /std:c17，避免与 CMAKE 因 C11 发的 /std:c11 再叠手动 /std:c17 出现 D9025
-if(MSVC)
-  set(CMAKE_C_STANDARD 17)
-else()
-  set(CMAKE_C_STANDARD 11)
-endif()
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(EDR_ENABLE_COMPILER_CACHE "Use ccache/sccache as compiler launcher when available" ON)
-option(EDR_ENABLE_UNITY_BUILD "Enable CMake UNITY_BUILD for faster local builds" OFF)
-option(EDR_ENABLE_IPO "Enable interprocedural optimization (IPO/LTO) when supported" OFF)
-option(EDR_ENABLE_OPTIMIZATION "Enable aggressive compiler optimizations" ON)
-option(EDR_ENABLE_ARCH_OPTIMIZATION "Enable architecture-specific optimizations" ON)
-
-if(EDR_ENABLE_COMPILER_CACHE)
-  if(NOT CMAKE_C_COMPILER_LAUNCHER OR NOT CMAKE_CXX_COMPILER_LAUNCHER)
-    find_program(EDR_CCACHE_BIN ccache)
-    find_program(EDR_SCCACHE_BIN sccache)
-    if(EDR_SCCACHE_BIN)
-      if(NOT CMAKE_C_COMPILER_LAUNCHER)
-        set(CMAKE_C_COMPILER_LAUNCHER "${EDR_SCCACHE_BIN}" CACHE STRING "C compiler launcher" FORCE)
-      endif()
-      if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${EDR_SCCACHE_BIN}" CACHE STRING "CXX compiler launcher" FORCE)
-      endif()
-      message(STATUS "Compiler launcher: sccache")
-    elseif(EDR_CCACHE_BIN)
-      if(NOT CMAKE_C_COMPILER_LAUNCHER)
-        set(CMAKE_C_COMPILER_LAUNCHER "${EDR_CCACHE_BIN}" CACHE STRING "C compiler launcher" FORCE)
-      endif()
-      if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${EDR_CCACHE_BIN}" CACHE STRING "CXX compiler launcher" FORCE)
-      endif()
-      message(STATUS "Compiler launcher: ccache")
-    else()
-      message(STATUS "Compiler launcher: none (ccache/sccache not found)")
-    endif()
-  endif()
-endif()
-# MSVC：stdatomic.h 需 /experimental:c11atomics；/std 由 CMAKE_C_STANDARD=17 统一为 /std:c17（勿再手写 /std:c17 以免 D9025）
-# 在目录级统一为所有 C 目标注入，避免 CI/生成器差异导致个别 .c 漏选项触发 C1189。
-if(MSVC)
-  add_compile_options(
-    $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
-  )
-  add_compile_definitions(
-    _CRT_SECURE_NO_WARNINGS
-    _CRT_NONSTDC_NO_WARNINGS
-  )
-  # Ensure Windows SDK directories are included for ETW headers
-  if(DEFINED ENV{WindowsSDKVersion})
-    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}um")
-    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}shared")
-    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}winrt")
-    include_directories("$ENV{WindowsSdkDir}include/$ENV{WindowsSDKVersion}ucrt")
-  endif()
-endif()
-
-if(EDR_ENABLE_OPTIMIZATION)
-  if(MSVC)
-    add_compile_options(
-      $<$<CONFIG:Release>:/O2>
-      $<$<CONFIG:Release>:/Oi>
-      $<$<CONFIG:Release>:/Ot>
-      $<$<CONFIG:Release>:/Gy>
-      $<$<CONFIG:Release>:/fp:fast>
-    )
-    add_link_options(
-      $<$<CONFIG:Release>:/OPT:REF>
-      $<$<CONFIG:Release>:/OPT:ICF>
-    )
-  else()
-    add_compile_options(
-      $<$<CONFIG:Release>:-O3>
-      $<$<CONFIG:Release>:-ffast-math>
-      $<$<CONFIG:Release>:-funroll-loops>
-      $<$<CONFIG:Release>:-fomit-frame-pointer>
-      $<$<CONFIG:Release>:-fstrict-aliasing>
-    )
-  endif()
-endif()
-
-# LTO / LTCG: heavy link-time cost, only when explicitly requested (off by default)
-if(EDR_ENABLE_IPO)
-  if(MSVC)
-    add_compile_options($<$<CONFIG:Release>:/GL>)
-    add_link_options($<$<CONFIG:Release>:/LTCG>)
-  else()
-    add_compile_options($<$<CONFIG:Release>:-flto>)
-    add_link_options($<$<CONFIG:Release>:-flto>)
-  endif()
-endif()
-
-if(EDR_ENABLE_ARCH_OPTIMIZATION)
-  if(MSVC)
-    add_compile_options(/arch:AVX2)
-  else()
-    add_compile_options(-march=native -mtune=native)
-  endif()
-endif()
-
-option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" ON)
+option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
+option(EDR_REQUIRE_GRPC "Fail configure when EDR_WITH_GRPC=ON but gRPC is not found" OFF)
+option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active protoc" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 list(APPEND CMAKE_PREFIX_PATH
   /usr/local/opt/grpc
@@ -122,9 +30,46 @@ if(EDR_WITH_GRPC)
 endif()
 set(EDR_GRPC_CLIENT_AVAILABLE ${EDR_GRPC_CLIENT_AVAILABLE} CACHE INTERNAL "EDR gRPC client availability")
 if(NOT EDR_GRPC_CLIENT_AVAILABLE)
+  if(EDR_WITH_GRPC AND EDR_REQUIRE_GRPC)
+    message(FATAL_ERROR "EDR_REQUIRE_GRPC=ON but gRPC::grpc++ was not found")
+  endif()
   message(STATUS "gRPC client disabled (install grpc/protobuf or set EDR_WITH_GRPC=OFF)")
 else()
   message(STATUS "gRPC client enabled (real EventIngest transport)")
+endif()
+
+set(EDR_GRPC_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen")
+set(EDR_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.pb.cc")
+set(EDR_GRPC_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.grpc.pb.cc")
+if(EDR_GRPC_CLIENT_AVAILABLE AND EDR_GRPC_REGENERATE)
+  find_program(EDR_PROTOC_EXECUTABLE protoc)
+  find_program(EDR_GRPC_CPP_PLUGIN grpc_cpp_plugin)
+  if(EDR_PROTOC_EXECUTABLE AND EDR_GRPC_CPP_PLUGIN)
+    set(EDR_GRPC_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/grpc_gen")
+    set(EDR_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.pb.cc")
+    set(EDR_GRPC_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.grpc.pb.cc")
+    add_custom_command(
+      OUTPUT
+        "${EDR_GRPC_PB_CC}"
+        "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.pb.h"
+        "${EDR_GRPC_GRPC_PB_CC}"
+        "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.grpc.pb.h"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${EDR_GRPC_GEN_DIR}"
+      COMMAND "${EDR_PROTOC_EXECUTABLE}"
+        -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
+        "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
+        --cpp_out=${EDR_GRPC_GEN_DIR}
+        --grpc_out=${EDR_GRPC_GEN_DIR}
+        --plugin=protoc-gen-grpc=${EDR_GRPC_CPP_PLUGIN}
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
+      VERBATIM
+    )
+    message(STATUS "gRPC stubs will be regenerated under ${EDR_GRPC_GEN_DIR}")
+  elseif(EDR_REQUIRE_GRPC)
+    message(FATAL_ERROR "EDR_GRPC_REGENERATE=ON requires protoc and grpc_cpp_plugin")
+  else()
+    message(STATUS "protoc/grpc_cpp_plugin not found, using checked-in gRPC stubs")
+  endif()
 endif()
 
 option(EDR_WITH_ONNXRUNTIME "Link ONNX Runtime C API for AVE real inference (optional)" OFF)
@@ -160,41 +105,6 @@ option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAK
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 
 find_package(OpenSSL QUIET)
-if(OpenSSL_FOUND)
-  message(STATUS "OpenSSL found: ${OPENSSL_VERSION} — P0 rule encryption will work")
-else()
-  message(STATUS "OpenSSL NOT found — P0 rule encryption will not work; encrypted external bundles won't be loaded (embed fallback only)")
-endif()
-
-# libcurl：ingest HTTP 内嵌 POST。
-# - gRPC 未启用/不可用时：HTTP 为唯一上送/回执路径，必须 find 到 libcurl，禁止仅依赖系统 curl 可执行文件。
-# - gRPC 可用时：libcurl 可选，未找到则 ingest 在运行时可回退到 popen(curl)。
-set(EDR_LIBCURL_AVAILABLE 0)
-if(EDR_GRPC_CLIENT_AVAILABLE)
-  find_package(CURL CONFIG QUIET)
-  if(NOT TARGET CURL::libcurl)
-    find_package(CURL QUIET)
-  endif()
-  if(TARGET CURL::libcurl)
-    set(EDR_LIBCURL_AVAILABLE 1)
-  endif()
-  message(STATUS "edr_agent: libcurl = ${EDR_LIBCURL_AVAILABLE} (0=ingest 可回退到 curl 子进程)")
-else()
-  find_package(CURL CONFIG QUIET)
-  if(NOT TARGET CURL::libcurl)
-    find_package(CURL REQUIRED)
-  endif()
-  if(TARGET CURL::libcurl)
-    set(EDR_LIBCURL_AVAILABLE 1)
-  else()
-    message(
-      FATAL_ERROR
-        "gRPC 未启用或未找到，但未能找到 libcurl。无 gRPC 的 edr_agent 必须链接 libcurl，不能只在运行时依赖 curl 可执行文件。请：\n"
-        "  使用 vcpkg 时在 vcpkg.json 中包含 curl，并传入 -DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake；或\n"
-        "  安装系统 libcurl 开发包，并令 find_package(CURL) 能解析到目标 CURL::libcurl。")
-  endif()
-  message(STATUS "edr_agent: libcurl = 必须 (gRPC 关)")
-endif()
 set(EDR_LIBTORCH_AVAILABLE 0)
 if(EDR_WITH_LIBTORCH)
   list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}" "$ENV{TORCH_ROOT}")
@@ -206,12 +116,6 @@ if(EDR_WITH_LIBTORCH)
     message(STATUS "LibTorch not found (set TORCH_ROOT or CMAKE_PREFIX_PATH to libtorch)")
   endif()
 endif()
-# P0 直出规则包版本字串（与 config/p0_rule_bundle_manifest.json 中 rules_bundle_version 一致，供 user_subject_json）
-set(EDR_P0_RULES_BUNDLE_VERSION
-    "edr-dynamic-rules-v1-r218-9ae52519"
-    CACHE STRING
-    "P0 dynamic rules bundle id (align with edr-agent/config/p0_rule_bundle_manifest.json and platform)")
-
 set(EDR_YARA_AVAILABLE 0)
 if(EDR_WITH_YARA)
   find_path(YARA_INCLUDE_DIR NAMES yara.h
@@ -238,24 +142,17 @@ endif()
 set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
-  src/core/agent_update.c
-  third_party/cjson/cJSON.c
-  src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c
   src/config/config.c
-  src/detection/detection_profile.c
-  src/detection/detection_trigger.c
   src/preprocess/behavior_record.c
-  src/preprocess/process_chain_depth.c
   src/preprocess/behavior_from_slot.c
   src/preprocess/dedup.c
+  src/preprocess/detection_decision.c
+  src/preprocess/detection_profile.c
   src/preprocess/emit_rules.c
-  src/preprocess/enrich_parent_info.c
-  src/preprocess/p0_rule_match.c
-  src/preprocess/p0_rule_direct_emit.c
+  src/preprocess/windows_event_policy.c
   src/preprocess/preprocess_pipeline.c
-  src/preprocess/preprocess_env.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c
   src/serialize/behavior_alert_emit.c
@@ -268,26 +165,12 @@ set(EDR_AGENT_SOURCES
   src/transport/ingest_http.c
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c
+  src/storage/local_evidence_cache.c
   src/command/command_stub.c
-  src/command/command_util.c
   src/command/sha256.c
-  src/command/shell_exec.c
-  src/command/pe_verify.c
-  src/command/eventlog.c
-  src/command/registry.c
-  src/command/rtq_exec.c
-  src/response/response_actions.c
-  src/response/response_forensic.c
-  src/response/response_file.c
-  src/response/response_utils.c
-  src/forensic/process_tree_cache.c
-  src/forensic/forensic_trigger.c
-  src/forensic/deep_collector.c
-  src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
-  src/pmfe/pmfe_idle_scanner.c
   src/attack_surface/attack_surface_report.c
   src/attack_surface/attack_surface_egress.c
   src/attack_surface/security_policy_collect.c
@@ -329,9 +212,7 @@ if(WIN32)
   list(APPEND EDR_AGENT_SOURCES
     src/collector/collector_win.c
     src/collector/etw_tdh_win.c
-    src/collector/etw_observability_win.c
     src/collector/ave_etw_feed_win.c
-    src/collector/edr_a44_split_path_win.c
   )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EDR_WITH_LINUX_COLLECTOR)
   list(APPEND EDR_AGENT_SOURCES src/collector/collector_linux.c)
@@ -357,7 +238,10 @@ endif()
 list(APPEND EDR_AGENT_SOURCES ${EDR_SHELLCODE_SRCS})
 
 set(EDR_WEBSHELL_SRCS)
-list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_forensic.c)
+list(APPEND EDR_WEBSHELL_SRCS
+  src/webshell_detector/webshell_forensic.c
+  src/webshell_detector/webshell_semantic.c
+)
 if(WIN32)
   list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_detector_win.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -440,170 +324,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
 endif()
 
 if(EDR_GRPC_CLIENT_AVAILABLE)
-  # --- Locate protoc & grpc_cpp_plugin (vcpkg or Homebrew) ---
-  if(DEFINED VCPKG_INSTALLED_DIR)
-    set(_edr_protoc "${VCPKG_INSTALLED_DIR}/tools/protobuf/protoc${VCPKG_TARGET_EXECUTABLE_SUFFIX}")
-    set(_edr_grpc_p "${VCPKG_INSTALLED_DIR}/tools/grpc/grpc_cpp_plugin${VCPKG_TARGET_EXECUTABLE_SUFFIX}")
-  else()
-    find_program(_edr_protoc protoc)
-    find_program(_edr_grpc_p grpc_cpp_plugin)
-  endif()
-  if(_edr_protoc AND _edr_grpc_p AND EXISTS "${_edr_protoc}" AND EXISTS "${_edr_grpc_p}")
-    # Regenerate stubs at CONFIGURE time (so sources exist before add_executable).
-    # Skip if output already present and proto is older (use pre-generated git stubs).
-    set(_proto_file "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto")
-    set(_grpc_out   "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen")
-    if(NOT EXISTS "${_grpc_out}/edr/v1/ingest.pb.cc"
-       OR "${_proto_file}" IS_NEWER_THAN "${_grpc_out}/edr/v1/ingest.pb.cc")
-      message(STATUS "Generating gRPC C++ stubs (protoc=${_edr_protoc}) ...")
-      # protoc.exe needs vcpkg runtime DLLs (e.g. zlib.dll) on PATH
-      if(DEFINED VCPKG_INSTALLED_DIR AND WIN32)
-        set(_edr_path_save "$ENV{PATH}")
-        set(ENV{PATH} "${VCPKG_INSTALLED_DIR}/bin;$ENV{PATH}")
-      endif()
-      execute_process(
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_grpc_out}/edr/v1"
-        COMMAND "${_edr_protoc}"
-          -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
-          "--cpp_out=${_grpc_out}"
-          "--grpc_out=${_grpc_out}"
-          "--plugin=protoc-gen-grpc=${_edr_grpc_p}"
-          "${_proto_file}"
-        RESULT_VARIABLE _grpc_gen_result
-        ERROR_VARIABLE  _grpc_gen_err
-      )
-      if(DEFINED VCPKG_INSTALLED_DIR AND WIN32)
-        set(ENV{PATH} "${_edr_path_save}")
-      endif()
-      if(NOT _grpc_gen_result EQUAL 0)
-        message(WARNING "gRPC stub generation failed (exit=${_grpc_gen_result}): ${_grpc_gen_err}")
-      endif()
-    else()
-      message(STATUS "gRPC stubs up-to-date, using pre-generated")
-    endif()
-  else()
-    message(WARNING "protoc/grpc_cpp_plugin not found; relying on pre-generated stubs")
-  endif()
-
   list(APPEND EDR_AGENT_SOURCES
     src/transport/grpc_client_impl.cpp
-    src/grpc_gen/edr/v1/ingest.pb.cc
-    src/grpc_gen/edr/v1/ingest.grpc.pb.cc
+    "${EDR_GRPC_PB_CC}"
+    "${EDR_GRPC_GRPC_PB_CC}"
   )
 else()
   list(APPEND EDR_AGENT_SOURCES src/transport/grpc_client_stub.c)
-endif()
-
-# P0 IR：cJSON + PCRE2（vcpkg pcre2 或本机 Homebrew/系统；找不到则桩 + legacy）
-set(EDR_P0_IR_PCRE2 0)
-set(EDR_PCRE2_TARGET "")
-find_package(pcre2 CONFIG QUIET)
-if(TARGET PCRE2::8BIT)
-  set(EDR_PCRE2_TARGET PCRE2::8BIT)
-endif()
-if(NOT EDR_PCRE2_TARGET)
-  # Homebrew/通用前缀（.pc 里若含已删路径会失败，故直接查头文件与库）
-  find_path(
-    PCRE2_INCLUDE_DIR
-    NAMES pcre2.h
-    PATHS
-      "$ENV{HOMEBREW_PREFIX}/include"
-      /opt/homebrew/include
-      /usr/local/include
-  )
-  find_library(
-    PCRE2_8_LIB
-    NAMES pcre2-8
-    pcre2-8.lib
-    PATHS
-      "$ENV{HOMEBREW_PREFIX}/lib"
-      /opt/homebrew/lib
-      /usr/local/lib
-  )
-  if(PCRE2_INCLUDE_DIR AND PCRE2_8_LIB)
-    add_library(edr_pcre2_vendor UNKNOWN IMPORTED)
-    set_target_properties(
-      edr_pcre2_vendor
-      PROPERTIES
-        IMPORTED_LOCATION
-        "${PCRE2_8_LIB}"
-        INTERFACE_INCLUDE_DIRECTORIES
-        "${PCRE2_INCLUDE_DIR}"
-    )
-    set(EDR_PCRE2_TARGET edr_pcre2_vendor)
-  endif()
-endif()
-if(EDR_PCRE2_TARGET)
-  list(APPEND EDR_AGENT_SOURCES
-    src/preprocess/p0_rule_ir.c
-    src/preprocess/encrypt_p0_rules.c
-  )
-  set(EDR_P0_IR_PCRE2 1)
-  message(STATUS "edr_agent: P0 IR (pcre2 + cJSON + encrypt_p0_rules) enabled, link: ${EDR_PCRE2_TARGET}")
-else()
-  set(EDR_P0_IR_PCRE2 0)
-  list(APPEND EDR_AGENT_SOURCES src/preprocess/p0_rule_ir_stub.c)
-  message(
-    STATUS
-    "edr_agent: pcre2 not found — P0 uses legacy in-process matcher; install pcre2 (vcpkg/brew) + reconfigure to load p0_rule_bundle_ir_v1.json at runtime"
-  )
-endif()
-
-# P0 IR：编译期嵌入 JSON（B1.1；需 Python3 + 与 POST_BUILD 复制二选一/并存：运行期**优先**读外置文件，失败再回退到 embed）
-set(EDR_P0_IR_HAS_EMBED 0)
-set(EDR_P0_IR_EMBED_C "")
-option(EDR_P0_IR_EMBED "Generate compile-time byte array from config/p0_rule_bundle_ir_v1.json" ON)
-option(EDR_P0_IR_ENCRYPT_EMBED "Encrypt the embed byte array with AES-256-GCM (requires Python3 + cryptography)" OFF)
-if(EDR_P0_IR_PCRE2 AND EDR_P0_IR_EMBED AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
-  set(EDR_P0_IR_EMBED_C "${CMAKE_CURRENT_BINARY_DIR}/edr_p0_rule_ir_embed.c")
-
-  if(EDR_P0_IR_ENCRYPT_EMBED)
-    set(EDR_P0_IR_ENC_TMP "${CMAKE_CURRENT_BINARY_DIR}/edr_p0_rule_ir_enc.tmp")
-    add_custom_command(
-      OUTPUT "${EDR_P0_IR_EMBED_C}"
-      COMMAND
-        ${Python3_EXECUTABLE}
-        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/encrypt_p0_rules.py"
-        --input "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-        --output "${EDR_P0_IR_ENC_TMP}"
-        --no-crypto-check
-      COMMAND
-        ${Python3_EXECUTABLE}
-        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
-        --input "${EDR_P0_IR_ENC_TMP}"
-        --output "${EDR_P0_IR_EMBED_C}"
-      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
-              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/encrypt_p0_rules.py"
-      COMMENT "Encrypt + embed P0 IR rules (EDR1 format)"
-      VERBATIM
-    )
-    message(STATUS "P0 IR compile-time embed: ON (encrypted, AES-256-GCM)")
-  else()
-    add_custom_command(
-      OUTPUT "${EDR_P0_IR_EMBED_C}"
-      COMMAND
-        ${Python3_EXECUTABLE}
-        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
-        --input
-        "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-        --output
-        "${EDR_P0_IR_EMBED_C}"
-      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_p0_rule_ir_embed.py"
-      COMMENT "Generate P0 IR compile-time embed (edr_p0_rule_ir_embed.c)"
-      VERBATIM
-    )
-    message(STATUS "P0 IR compile-time embed: ON -> ${EDR_P0_IR_EMBED_C}")
-  endif()
-
-  set(EDR_P0_IR_HAS_EMBED 1)
-  list(APPEND EDR_AGENT_SOURCES "${EDR_P0_IR_EMBED_C}")
-elseif(EDR_P0_IR_PCRE2 AND EDR_P0_IR_EMBED)
-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
-    message(STATUS "P0 IR embed skipped: config/p0_rule_bundle_ir_v1.json missing (set EDR_P0_IR_EMBED=OFF to silence if intentional)")
-  endif()
 endif()
 
 set(EDR_AVE_CORE_SOURCES
@@ -631,34 +358,6 @@ else()
 endif()
 
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
-if(EDR_ENABLE_UNITY_BUILD)
-  set_target_properties(edr_agent PROPERTIES UNITY_BUILD ON)
-  set(_EDR_UNITY_SKIP
-    src/ave/ave_behavior_features.c
-    src/ave/ave_behavior_pipeline.c
-    src/ave/ave_rules_meta.c
-    src/ave/ave_suppression.c
-    third_party/tomlc99/toml.c
-    third_party/lz4/lz4.c
-  )
-  foreach(_src IN LISTS _EDR_UNITY_SKIP)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
-      set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/${_src}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
-    endif()
-  endforeach()
-endif()
-
-# Windows、单配置生成器（Ninja/Unix Makefiles）时，可执行档默认在 build/ 根下；而 Inno/CI/zip
-# 约定为 build/Release/（与 VS 多配置一致）。统一输出到 build/<配置名>/ 避免「未找到 edr_agent.exe」。
-if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES)
-  if(CMAKE_BUILD_TYPE)
-    set(_EDR_WIN_RUNTIME_DIR "${CMAKE_BINARY_DIR}/${CMAKE_BUILD_TYPE}")
-  else()
-    set(_EDR_WIN_RUNTIME_DIR "${CMAKE_BINARY_DIR}/Release")
-  endif()
-  set_target_properties(edr_agent PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}")
-  message(STATUS "edr_agent: WIN32 single-config → RUNTIME_OUTPUT_DIRECTORY=${_EDR_WIN_RUNTIME_DIR}")
-endif()
 
 target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -669,44 +368,9 @@ target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/windivert
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 )
-target_compile_definitions(
-  edr_agent
-  PRIVATE
-    EDR_HAVE_NANOPB=1
-    "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
-)
-if(EDR_P0_IR_PCRE2)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
-  target_compile_definitions(edr_agent PRIVATE "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}")
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_manifest.json")
-  add_custom_command(
-    TARGET edr_agent
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:edr_agent>/edr_config"
-    COMMAND
-      ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_manifest.json"
-      "$<TARGET_FILE_DIR:edr_agent>/edr_config/p0_rule_bundle_manifest.json"
-    COMMENT "Stage P0 rule manifest next to edr_agent (edr_config/p0_rule_bundle_manifest.json)"
-  )
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
-  add_custom_command(
-    TARGET edr_agent
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:edr_agent>/edr_config"
-    COMMAND
-      ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json"
-      "$<TARGET_FILE_DIR:edr_agent>/edr_config/p0_rule_bundle_ir_v1.json"
-    COMMENT "Stage P0 rule IR bundle (edr_config/p0_rule_bundle_ir_v1.json)"
-  )
-  # B1.1：另见 EDR_P0_IR_EMBED（同内容 embed 进 .text）；运行期仍**先**读外置 JSON，再回退 embed。
-endif()
+target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
 if(EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)
 endif()
@@ -727,8 +391,9 @@ if(EDR_WITH_FL_TRAINER AND OpenSSL_FOUND)
     target_link_libraries(edr_agent PRIVATE OpenSSL::Crypto)
   endif()
 endif()
-if(OpenSSL_FOUND AND NOT EDR_WITH_FL_TRAINER)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_FL=1)
+
+if(OpenSSL_FOUND)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_HTTP=1)
   if(TARGET OpenSSL::SSL)
     target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   else()
@@ -771,17 +436,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LZ4=1)
 endif()
 
-if(EDR_LIBCURL_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LIBCURL=1)
-  target_link_libraries(edr_agent PRIVATE CURL::libcurl)
-endif()
-
-if(NOT EDR_GRPC_CLIENT_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_NO_GRPC_CLIENT=1)
-endif()
-
 if(EDR_GRPC_CLIENT_AVAILABLE)
-  target_include_directories(edr_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen)
+  target_include_directories(edr_agent PRIVATE "${EDR_GRPC_GEN_DIR}")
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_GRPC=1)
   target_link_libraries(edr_agent PRIVATE gRPC::grpc++ protobuf::libprotobuf)
   # gRPC / protobuf 生成代码会触发第三方头里的弃用符号告警，仅对这些源文件压掉
@@ -792,8 +448,8 @@ if(EDR_GRPC_CLIENT_AVAILABLE)
   endif()
   set_source_files_properties(
     src/transport/grpc_client_impl.cpp
-    src/grpc_gen/edr/v1/ingest.pb.cc
-    src/grpc_gen/edr/v1/ingest.grpc.pb.cc
+    "${EDR_GRPC_PB_CC}"
+    "${EDR_GRPC_GRPC_PB_CC}"
     PROPERTIES COMPILE_OPTIONS "${_edr_grpc_no_dep_warn}"
   )
   if(EDR_WITH_FL_TRAINER)
@@ -804,27 +460,15 @@ if(EDR_GRPC_CLIENT_AVAILABLE)
   endif()
 endif()
 
-# third_party tomlc99：不修改上游；MSVC /W4 下 C4244/C4267/C4702 在部分 CI（或 /WX）下会当错误
 if(MSVC)
-  set_source_files_properties(
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99/toml.c"
-    PROPERTIES COMPILE_OPTIONS "/wd4244;/wd4267;/wd4702"
-  )
-endif()
-
-if(MSVC)
-  target_compile_options(edr_agent PRIVATE
-    /W4
-    /WX-
-    /utf-8
-  )
+  target_compile_options(edr_agent PRIVATE /W4 /WX-)
 else()
   target_compile_options(edr_agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(WIN32)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
-  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust dbghelp)
+  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -834,21 +478,11 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(edr_agent PRIVATE Threads::Threads)
-if(EDR_P0_IR_PCRE2)
-  target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_TARGET})
-endif()
 if(UNIX AND NOT WIN32)
   target_link_libraries(edr_agent PRIVATE m)
 endif()
 
 find_package(SQLite3 QUIET)
-if(NOT SQLite3_FOUND)
-  find_package(unofficial-sqlite3 CONFIG QUIET)
-  if(unofficial-sqlite3_FOUND AND NOT TARGET SQLite3::SQLite3)
-    add_library(SQLite3::SQLite3 ALIAS unofficial-sqlite3::unofficial-sqlite3)
-    set(SQLite3_FOUND TRUE)
-  endif()
-endif()
 if(SQLite3_FOUND)
   if(TARGET SQLite3::SQLite3)
     target_link_libraries(edr_agent PRIVATE SQLite3::SQLite3)
@@ -860,9 +494,6 @@ endif()
 
 if(EDR_BUILD_AVE_SHARED_LIB)
   add_library(edr_ave_shared SHARED ${EDR_AVE_CORE_SOURCES})
-  if(EDR_ENABLE_UNITY_BUILD)
-    set_target_properties(edr_ave_shared PROPERTIES UNITY_BUILD ON)
-  endif()
   target_include_directories(edr_ave_shared PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ave
@@ -892,203 +523,9 @@ if(EDR_BUILD_AVE_SHARED_LIB)
   set_target_properties(edr_ave_shared PROPERTIES OUTPUT_NAME "edr_ave")
 endif()
 
-# 精简仓库未包含 tests/ 时默认关闭单元测试，避免 CMake 找不到 tests/*.c。
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ave_fp.c")
-  set(_EDR_DEFAULT_BUILD_TESTS ON)
-else()
-  set(_EDR_DEFAULT_BUILD_TESTS OFF)
-endif()
-option(EDR_BUILD_TESTS "Build CTest targets and tests/*.c executables (requires tests/ tree)" ${_EDR_DEFAULT_BUILD_TESTS})
-if(EDR_BUILD_TESTS AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ave_fp.c")
-  message(FATAL_ERROR "EDR_BUILD_TESTS=ON but tests/test_ave_fp.c is missing. Add tests/ or configure with -DEDR_BUILD_TESTS=OFF.")
-endif()
-
 enable_testing()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
-# P0 规则：C 与 p0_golden_vectors.json 同构对拍（有 pcre2 时自 IR 求值，否则与 legacy 一致）
-set(
-  _EDR_P0_GOLDEN_SRCS
-  src/preprocess/p0_rule_golden_test.c
-  src/preprocess/p0_rule_match.c
-)
-if(EDR_P0_IR_PCRE2)
-  list(
-    APPEND
-    _EDR_P0_GOLDEN_SRCS
-    src/preprocess/p0_rule_ir.c
-    src/preprocess/encrypt_p0_rules.c
-    src/preprocess/preprocess_env.c
-    third_party/cjson/cJSON.c
-  )
-else()
-  list(APPEND _EDR_P0_GOLDEN_SRCS src/preprocess/p0_rule_ir_stub.c)
-endif()
-if(EDR_P0_IR_PCRE2 AND EDR_P0_IR_HAS_EMBED AND EDR_P0_IR_EMBED_C)
-  list(APPEND _EDR_P0_GOLDEN_SRCS "${EDR_P0_IR_EMBED_C}")
-endif()
-add_executable(edr_p0_golden_test ${_EDR_P0_GOLDEN_SRCS})
-target_include_directories(
-  edr_p0_golden_test
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess
-)
-if(EDR_P0_IR_PCRE2)
-  target_include_directories(
-    edr_p0_golden_test
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
-  )
-  target_compile_definitions(edr_p0_golden_test PRIVATE EDR_HAVE_PCRE2=1)
-  target_compile_definitions(
-    edr_p0_golden_test PRIVATE "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}"
-  )
-  target_link_libraries(edr_p0_golden_test PRIVATE ${EDR_PCRE2_TARGET})
-endif()
-if(MSVC)
-  target_compile_options(edr_p0_golden_test PRIVATE /W3 /WX-)
-  target_compile_definitions(
-    edr_p0_golden_test
-    PRIVATE
-      _CRT_SECURE_NO_WARNINGS
-  )
-else()
-  target_compile_options(edr_p0_golden_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
-if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES AND DEFINED _EDR_WIN_RUNTIME_DIR)
-  set_target_properties(edr_p0_golden_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}")
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
-  set(_EDR_P0_IR_JSON "${CMAKE_CURRENT_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
-else()
-  set(_EDR_P0_IR_JSON "")
-endif()
-add_test(NAME edr_p0_golden COMMAND edr_p0_golden_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-# A4.1：MPMC 事件总线短时压测 + 对拍（主线程=唯一消费者）
-add_executable(
-  test_event_bus_mpmc_stress
-  tests/test_event_bus_mpmc_stress.c
-  src/core/event_bus.c
-)
-target_include_directories(
-  test_event_bus_mpmc_stress
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-if(MSVC)
-  target_compile_options(test_event_bus_mpmc_stress PRIVATE /W3 /WX-)
-  target_compile_definitions(
-    test_event_bus_mpmc_stress
-    PRIVATE
-      _CRT_SECURE_NO_WARNINGS
-  )
-else()
-  target_compile_options(
-    test_event_bus_mpmc_stress
-    PRIVATE
-      -Wall
-      -Wextra
-      -Wno-unused-parameter
-  )
-endif()
-if(WIN32 AND NOT CMAKE_CONFIGURATION_TYPES AND DEFINED _EDR_WIN_RUNTIME_DIR)
-  set_target_properties(
-    test_event_bus_mpmc_stress
-    PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${_EDR_WIN_RUNTIME_DIR}"
-  )
-endif()
-# test_event_bus_mpmc_stress：250ms / 4 生产者 / cap 64，CI 友好
-add_test(
-  NAME test_event_bus_mpmc_stress
-  COMMAND
-    test_event_bus_mpmc_stress
-    250
-    4
-    64
-  WORKING_DIRECTORY
-    ${CMAKE_BINARY_DIR}
-)
-set_tests_properties(
-  test_event_bus_mpmc_stress
-  PROPERTIES
-    TIMEOUT
-    30
-    LABELS
-    "A4.1;event_bus"
-)
-if(_EDR_P0_IR_JSON)
-  set_tests_properties(
-    edr_p0_golden
-    PROPERTIES
-      ENVIRONMENT
-      "EDR_P0_IR_PATH=${_EDR_P0_IR_JSON}"
-  )
-endif()
-
-# P0 IR：file / network / registry 对拍（同 p0_golden_vectors.json 非 process 段）
-if(EDR_P0_IR_PCRE2)
-  set(
-    _EDR_P0_REC_SRCS
-    src/preprocess/p0_rule_ir_record_golden_test.c
-    src/preprocess/behavior_record.c
-  )
-  if(EDR_P0_IR_HAS_EMBED AND EDR_P0_IR_EMBED_C)
-    list(APPEND _EDR_P0_REC_SRCS "${EDR_P0_IR_EMBED_C}")
-  endif()
-  list(
-    APPEND
-    _EDR_P0_REC_SRCS
-    src/preprocess/p0_rule_ir.c
-    src/preprocess/encrypt_p0_rules.c
-    src/preprocess/preprocess_env.c
-    third_party/cjson/cJSON.c
-  )
-  add_executable(edr_p0_ir_record_golden_test ${_EDR_P0_REC_SRCS})
-  target_include_directories(
-    edr_p0_ir_record_golden_test
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess
-      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
-  )
-  target_compile_definitions(
-    edr_p0_ir_record_golden_test
-    PRIVATE
-      EDR_HAVE_PCRE2=1
-      "EDR_P0_IR_HAS_EMBED=${EDR_P0_IR_HAS_EMBED}"
-  )
-  target_link_libraries(edr_p0_ir_record_golden_test PRIVATE ${EDR_PCRE2_TARGET})
-  if(NOT MSVC)
-    target_compile_options(
-      edr_p0_ir_record_golden_test
-      PRIVATE
-        -Wall
-        -Wextra
-        -Wno-unused-parameter
-    )
-  endif()
-  add_test(
-    NAME
-      edr_p0_ir_record_golden
-    COMMAND
-      edr_p0_ir_record_golden_test
-    WORKING_DIRECTORY
-      ${CMAKE_BINARY_DIR}
-  )
-  if(_EDR_P0_IR_JSON)
-    set_tests_properties(
-      edr_p0_ir_record_golden
-      PROPERTIES
-        ENVIRONMENT
-        "EDR_P0_IR_PATH=${_EDR_P0_IR_JSON}"
-    )
-  endif()
-endif()
-
-if(EDR_BUILD_TESTS)
 add_executable(test_ave_fp tests/test_ave_fp.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
   src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
 target_include_directories(test_ave_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
@@ -1131,7 +568,6 @@ set(_edr_test_behavior_emit_sources
   src/transport/transport_stub.c
   src/transport/grpc_client_stub.c
   src/core/time_util.c
-  src/core/edr_log.c
   src/storage/queue_sqlite.c
   tests/stub_preprocess_agent_ids.c
 )
@@ -1287,6 +723,61 @@ if(SQLite3_FOUND)
   target_compile_definitions(test_ave_suppression PRIVATE EDR_HAVE_SQLITE=1)
 endif()
 
+add_executable(test_detection_decision tests/test_detection_decision.c
+  src/preprocess/detection_decision.c
+  src/preprocess/detection_profile.c)
+target_include_directories(test_detection_decision PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_detection_decision PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_detection_decision PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME detection_decision_combo COMMAND test_detection_decision WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_detection_regression tests/test_detection_regression.c
+  src/preprocess/detection_decision.c
+  src/preprocess/detection_profile.c)
+target_include_directories(test_detection_regression PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_detection_regression PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_detection_regression PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME detection_regression_scenarios COMMAND test_detection_regression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_webshell_semantic tests/test_webshell_semantic.c src/webshell_detector/webshell_semantic.c)
+target_include_directories(test_webshell_semantic PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_webshell_semantic PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_webshell_semantic PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME webshell_semantic_rules COMMAND test_webshell_semantic WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_detection_sensor_bridge tests/test_detection_sensor_bridge.c
+  src/preprocess/behavior_record.c
+  src/preprocess/behavior_from_slot.c
+  src/preprocess/detection_decision.c
+  src/preprocess/detection_profile.c)
+target_include_directories(test_detection_sensor_bridge PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_detection_sensor_bridge PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_detection_sensor_bridge PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME detection_sensor_bridge COMMAND test_detection_sensor_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_windows_event_policy tests/test_windows_event_policy.c
+  src/preprocess/behavior_record.c
+  src/preprocess/windows_event_policy.c)
+target_include_directories(test_windows_event_policy PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_windows_event_policy PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_windows_event_policy PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME windows_event_policy COMMAND test_windows_event_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_ave_pipeline tests/test_ave_pipeline.c
   src/ave/ave_sdk.c
   src/ave/fl_feature_provider.c
@@ -1432,7 +923,7 @@ if(EDR_WITH_FL_TRAINER)
   if(EDR_GRPC_CLIENT_AVAILABLE)
     target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_HAVE_GRPC_FL=1)
     target_link_libraries(test_fl_trainer_smoke PRIVATE gRPC::grpc++ protobuf::libprotobuf)
-    target_include_directories(test_fl_trainer_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src/grpc_gen)
+    target_include_directories(test_fl_trainer_smoke PRIVATE "${EDR_GRPC_GEN_DIR}")
   endif()
   if(OpenSSL_FOUND)
     add_executable(test_fl_crypto_fl3 tests/test_fl_crypto_fl3.c src/fl_trainer/fl_crypto.c)
@@ -1673,7 +1164,7 @@ if(EDR_YARA_AVAILABLE)
   target_link_libraries(test_shellcode PRIVATE ${YARA_LIB})
 endif()
 if(WIN32)
-  target_link_libraries(test_shellcode PRIVATE advapi32 ws2_32)
+  target_link_libraries(test_shellcode PRIVATE advapi32 ws2_32 iphlpapi)
 endif()
 if(UNIX AND NOT WIN32)
   target_link_libraries(test_shellcode PRIVATE m)
@@ -1684,57 +1175,5 @@ else()
   target_compile_options(test_shellcode PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_executable(test_shell_policy
-  tests/test_shell_policy.c
-  src/command/shell_exec.c
-)
-target_include_directories(test_shell_policy PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-if(MSVC)
-  target_compile_options(test_shell_policy PRIVATE /W4 /WX-)
-  target_compile_definitions(test_shell_policy PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-  target_compile_options(test_shell_policy PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
-if(WIN32)
-  target_compile_definitions(test_shell_policy PRIVATE EDR_OS_WINDOWS=1)
-else()
-  target_compile_definitions(test_shell_policy PRIVATE EDR_OS_POSIX=1)
-endif()
-add_test(NAME shell_policy COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
-
-endif() # EDR_BUILD_TESTS
-
-add_executable(
-  test_detection_profile_trigger
-  tests/test_detection_profile_trigger.c
-  src/detection/detection_profile.c
-  src/detection/detection_trigger.c
-)
-target_include_directories(test_detection_profile_trigger PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME detection_profile_trigger COMMAND test_detection_profile_trigger WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-add_executable(
-  test_forensic_trigger
-  tests/test_forensic_trigger.c
-  src/forensic/forensic_trigger.c
-)
-target_include_directories(test_forensic_trigger PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME forensic_trigger COMMAND test_forensic_trigger WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-if(EDR_ENABLE_IPO)
-  include(CheckIPOSupported)
-  check_ipo_supported(RESULT EDR_IPO_OK OUTPUT EDR_IPO_MSG)
-  if(EDR_IPO_OK)
-    set_property(TARGET edr_agent PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-    if(TARGET edr_ave_shared)
-      set_property(TARGET edr_ave_shared PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-    endif()
-    message(STATUS "IPO/LTO enabled")
-  else()
-    message(WARNING "EDR_ENABLE_IPO=ON but toolchain does not support IPO: ${EDR_IPO_MSG}")
-  endif()
-endif()

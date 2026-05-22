@@ -11,6 +11,7 @@
 #include "edr/types.h"
 #include "edr/webshell_forensic.h"
 #include "edr/edr_log.h"
+#include "edr/webshell_semantic.h"
 
 #include <direct.h>
 #include <io.h>
@@ -36,6 +37,8 @@ typedef struct {
 typedef struct {
   char rule_name[128];
   float confidence;
+  float ast_score;
+  float token_score;
   int matched;
 } WebshellRuleMatch;
 
@@ -432,6 +435,17 @@ static int fallback_match(const char *text, WebshellRuleMatch *m) {
   if (!text || !m) {
     return 0;
   }
+  {
+    EdrWebshellSemanticResult sem;
+    if (edr_webshell_semantic_match_text(text, &sem)) {
+      snprintf(m->rule_name, sizeof(m->rule_name), "%s", sem.rule_name);
+      m->confidence = sem.confidence;
+      m->ast_score = sem.ast_score;
+      m->token_score = sem.token_score;
+      m->matched = 1;
+      return 1;
+    }
+  }
   if ((contains_ci(text, "eval(") && contains_ci(text, "$_POST")) ||
       contains_ci(text, "eval(base64_decode($_POST)")) {
     snprintf(m->rule_name, sizeof(m->rule_name), "%s", "PHP_Webshell_OneLiners");
@@ -542,10 +556,13 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
   slot.priority = (m->confidence >= s_cfg->webshell_detector.l2_review_threshold) ? 0 : 1;
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=webshell\ndetector=yara\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
-                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s\n",
-                   m->rule_name, m->confidence, file_path, root->service_name, action ? action : "-", url, alert_id,
-                   fp[0] ? fp : "-", file_uploaded, object_key[0] ? object_key : "-", staged_path[0] ? staged_path : "-");
+                   "ETW1\nprov=webshell\ndetector=%s\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
+                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s ast_score=%.3f "
+                   "token_score=%.3f\n",
+                   strncmp(m->rule_name, "WebShell_AST_Token_", 19u) == 0 ? "semantic" : "yara", m->rule_name,
+                   m->confidence, file_path, root->service_name, action ? action : "-", url, alert_id,
+                   fp[0] ? fp : "-", file_uploaded, object_key[0] ? object_key : "-",
+                   staged_path[0] ? staged_path : "-", m->ast_score, m->token_score);
   if (n < 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return;
   }

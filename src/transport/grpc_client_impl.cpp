@@ -2,11 +2,6 @@
 
 #include "edr/command.h"
 #include "edr/config.h"
-#include "edr/ingest_http.h"
-
-extern "C" {
-#include "edr/edr_log.h"
-}
 
 #include <cstring>
 
@@ -28,17 +23,13 @@ extern "C" {
 #include <string>
 #include <thread>
 
-/** 与 edr_event_batch 批次上限/ReportEvents 负载大体匹配；gRPC 默认 4MB 会拒大包 */
-static const int kEdrGrpcMaxMessageBytes = 32 * 1024 * 1024;
-
 #ifndef EDR_AGENT_VERSION_STRING
 #define EDR_AGENT_VERSION_STRING "0.3.0"
 #endif
 
 static std::mutex s_mu;
-static std::mutex s_upload_mu;
 static std::shared_ptr<grpc::Channel> s_channel;
-static std::shared_ptr<edr::v1::EventIngest::Stub> s_stub;
+static std::unique_ptr<edr::v1::EventIngest::Stub> s_stub;
 static std::string s_endpoint_id;
 static std::string s_target;
 static int s_timeout_s = 10;
@@ -52,10 +43,10 @@ static std::atomic<unsigned long> s_rpc_ok{0};
 static std::atomic<unsigned long> s_rpc_fail{0};
 static std::atomic<int> s_report_fail_streak{0};
 static std::atomic<unsigned long> s_upload_seq{0};
-static std::atomic<uint64_t> s_last_success_ms{0};
-static std::atomic<uint64_t> s_last_failure_ms{0};
-static std::mutex s_last_failure_mu;
-static std::string s_last_failure_reason;
+static std::atomic<long long> s_last_success_ms{0};
+static std::atomic<long long> s_last_failure_ms{0};
+static std::mutex s_runtime_mu;
+static std::string s_last_error;
 
 /** ReportEvents 上传带宽（TOML upload.max_upload_mbps）；0 表示不节流 */
 static uint32_t s_max_upload_mbps;
@@ -66,31 +57,37 @@ static bool s_upload_tb_inited;
 static std::atomic<bool> s_sub_stop{true};
 static std::thread s_sub_thr;
 static std::shared_ptr<grpc::ClientContext> s_sub_ctx;
+static std::atomic<bool> s_control_ready{false};
+static std::mutex s_control_mu;
+static std::mutex s_control_write_mu;
+static grpc::ClientReaderWriter<edr::v1::CommandEnvelope, edr::v1::CommandEnvelope> *s_control_stream =
+    nullptr;
 
 static void subscribe_thread_main(std::string endpoint_id);
+static void control_stream_thread_main(std::string endpoint_id);
 
-static uint64_t grpc_wall_time_ms() {
-  auto now = std::chrono::system_clock::now().time_since_epoch();
-  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+static long long unix_ms_now(void) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
 }
 
-static void grpc_note_success() {
-  s_last_success_ms.store(grpc_wall_time_ms(), std::memory_order_relaxed);
+static void runtime_success(void) {
+  s_last_success_ms = unix_ms_now();
+  std::lock_guard<std::mutex> lock(s_runtime_mu);
+  s_last_error.clear();
 }
 
-static void grpc_note_failure(const std::string &reason) {
-  s_last_failure_ms.store(grpc_wall_time_ms(), std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lock(s_last_failure_mu);
-  s_last_failure_reason = reason;
-  if (s_last_failure_reason.size() > 240u) {
-    s_last_failure_reason.resize(240u);
-  }
+static void runtime_failure(const std::string &err) {
+  s_last_failure_ms = unix_ms_now();
+  std::lock_guard<std::mutex> lock(s_runtime_mu);
+  s_last_error = err.substr(0, 150);
 }
 
 static bool grpc_client_connect_locked(const std::string &target) {
-  s_target = target;
   std::shared_ptr<grpc::ChannelCredentials> creds;
   if (s_insecure) {
+    fprintf(stderr, "[grpc] 警告: EDR_GRPC_INSECURE=1，使用非加密通道\n");
     creds = grpc::InsecureChannelCredentials();
   } else if (!s_ca.empty() && !s_cert.empty() && !s_key.empty()) {
     grpc::SslCredentialsOptions ssl;
@@ -103,10 +100,10 @@ static bool grpc_client_connect_locked(const std::string &target) {
     ssl.pem_root_certs = s_ca;
     creds = grpc::SslCredentials(ssl);
   } else {
-    EDR_LOGE(
-        "%s",
-        "[grpc] 未找到 CA/客户端证书（server.ca_cert 等），且未设置 EDR_GRPC_INSECURE=1，"
-        "跳过 gRPC。开发可: export EDR_GRPC_INSECURE=1\n");
+    fprintf(stderr,
+            "[grpc] 未找到 CA/客户端证书（server.ca_cert 等），且未设置 EDR_GRPC_INSECURE=1，"
+            "跳过 gRPC。开发可: export EDR_GRPC_INSECURE=1\n");
+    runtime_failure("missing grpc tls credentials");
     return false;
   }
 
@@ -116,29 +113,24 @@ static bool grpc_client_connect_locked(const std::string &target) {
   args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
   args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 200);
   args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 5000);
-  args.SetInt(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH, kEdrGrpcMaxMessageBytes);
-  args.SetInt(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH, kEdrGrpcMaxMessageBytes);
 
+  s_target = target;
   s_channel = grpc::CreateCustomChannel(target, creds, args);
-  std::unique_ptr<edr::v1::EventIngest::Stub> stub_u = edr::v1::EventIngest::NewStub(s_channel);
-  s_stub = std::shared_ptr<edr::v1::EventIngest::Stub>(stub_u.release());
+  s_stub = edr::v1::EventIngest::NewStub(s_channel);
   s_report_fail_streak = 0;
   s_upload_tb_inited = false;
   s_upload_token_bytes = 0.0;
 
-  if (edr_log_verbose()) {
-    const char *sec_mode = s_insecure ? "非加密 gRPC" : ((!s_cert.empty() && !s_key.empty()) ? "mTLS 通道" : "TLS(仅验服务端) 通道");
-    if (s_max_upload_mbps > 0u) {
-      EDR_LOGV("[grpc] %s: %s (ReportEvents + Subscribe；上传节流 max_upload_mbps=%u)\n", sec_mode, target.c_str(),
-               (unsigned)s_max_upload_mbps);
-    } else {
-      EDR_LOGV("[grpc] %s: %s (ReportEvents + Subscribe；上传节流关闭（max_upload_mbps=0）)\n", sec_mode,
-               target.c_str());
-    }
+  fprintf(stderr, "[grpc] mTLS 通道: %s (ReportEvents + ControlStream", target.c_str());
+  if (s_max_upload_mbps > 0u) {
+    fprintf(stderr, "；上传节流 max_upload_mbps=%u", (unsigned)s_max_upload_mbps);
+  } else {
+    fprintf(stderr, "；上传节流关闭（max_upload_mbps=0）");
   }
+  fprintf(stderr, ")\n");
 
   s_sub_stop = false;
-  s_sub_thr = std::thread(subscribe_thread_main, s_endpoint_id);
+  s_sub_thr = std::thread(control_stream_thread_main, s_endpoint_id);
   return true;
 }
 
@@ -177,6 +169,123 @@ static edr::v1::CommandExecutionStatus map_exec_status(int s) {
   }
 }
 
+static void json_escape_append(std::string &out, const std::string &s) {
+  out.push_back('"');
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back((char)c);
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else if (c < 0x20u) {
+      out.push_back(' ');
+    } else {
+      out.push_back((char)c);
+    }
+  }
+  out.push_back('"');
+}
+
+static std::string json_quoted(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8u);
+  json_escape_append(out, s);
+  return out;
+}
+
+static std::string build_result_chunk_detail(const std::string &chunk_id, size_t index,
+                                             size_t count, size_t total_bytes,
+                                             const std::string &data) {
+  std::ostringstream os;
+  os << "{\"chunked\":true,\"chunk_protocol\":\"edr-result-chunk-v1\","
+     << "\"chunk_id\":" << json_quoted(chunk_id) << ","
+     << "\"chunk_index\":" << index << ",\"chunk_count\":" << count << ","
+     << "\"total_bytes\":" << total_bytes << ",\"data\":" << json_quoted(data) << "}";
+  return os.str();
+}
+
+static std::string build_control_result_payload(const char *command_id,
+                                                const EdrSoarCommandMeta *meta,
+                                                int execution_status, int exit_code,
+                                                const std::string &detail,
+                                                long long finished_ms, bool chunked,
+                                                const std::string &chunk_id, size_t chunk_index,
+                                                size_t chunk_count, size_t total_bytes,
+                                                const std::string &chunk_data) {
+  std::ostringstream os;
+  os << "{\"command_id\":" << json_quoted(command_id ? command_id : "")
+     << ",\"status\":" << (int)map_exec_status(execution_status)
+     << ",\"exit_code\":" << exit_code
+     << ",\"finished_unix_ms\":" << finished_ms
+     << ",\"agent_version\":\"" << EDR_AGENT_VERSION_STRING << "\"";
+  if (meta) {
+    os << ",\"soar_correlation_id\":" << json_quoted(meta->soar_correlation_id)
+       << ",\"playbook_run_id\":" << json_quoted(meta->playbook_run_id)
+       << ",\"playbook_step_id\":" << json_quoted(meta->playbook_step_id);
+  }
+  if (chunked) {
+    os << ",\"chunked\":true,\"chunk_protocol\":\"edr-result-chunk-v1\""
+       << ",\"chunk_id\":" << json_quoted(chunk_id)
+       << ",\"chunk_index\":" << chunk_index << ",\"chunk_count\":" << chunk_count
+       << ",\"total_bytes\":" << total_bytes << ",\"data\":" << json_quoted(chunk_data);
+  } else {
+    os << ",\"detail_utf8\":" << json_quoted(detail);
+  }
+  os << "}";
+  return os.str();
+}
+
+static bool control_stream_write(const edr::v1::CommandEnvelope &msg) {
+  std::lock_guard<std::mutex> lock(s_control_mu);
+  if (!s_control_ready.load() || !s_control_stream) {
+    return false;
+  }
+  std::lock_guard<std::mutex> wlock(s_control_write_mu);
+  return s_control_stream->Write(msg);
+}
+
+static bool control_stream_send_result(const char *command_id, const EdrSoarCommandMeta *meta,
+                                       int execution_status, int exit_code,
+                                       const std::string &detail, long long finished_ms) {
+  if (!s_control_ready.load()) {
+    return false;
+  }
+  static const size_t kResultChunk = 24u * 1024u;
+  const size_t n = detail.size();
+  const size_t count = std::max<size_t>(1u, (n + kResultChunk - 1u) / kResultChunk);
+  std::string chunk_id;
+  if (count > 1u) {
+    chunk_id = std::string(command_id ? command_id : "cmd") + "-" + std::to_string(finished_ms);
+  }
+  for (size_t i = 0; i < count; i++) {
+    const size_t off = i * kResultChunk;
+    const std::string part =
+        count > 1u ? detail.substr(off, std::min(kResultChunk, n - off)) : std::string();
+    edr::v1::CommandEnvelope msg;
+    msg.set_command_id(command_id ? command_id : "");
+    msg.set_command_type(count > 1u ? "command_result_chunk" : "command_result");
+    if (meta) {
+      msg.set_soar_correlation_id(meta->soar_correlation_id);
+      msg.set_playbook_run_id(meta->playbook_run_id);
+      msg.set_playbook_step_id(meta->playbook_step_id);
+      msg.set_idempotency_key(meta->idempotency_key);
+    }
+    msg.set_issued_at_unix_ms(finished_ms);
+    std::string payload = build_control_result_payload(
+        command_id, meta, execution_status, exit_code, detail, finished_ms, count > 1u, chunk_id, i,
+        count, n, part);
+    msg.set_payload(payload);
+    if (!control_stream_write(msg)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static std::string read_pem_file(const char *path) {
   if (!path || !path[0]) {
     return "";
@@ -206,7 +315,7 @@ static void subscribe_thread_main(std::string endpoint_id) {
       std::unique_ptr<grpc::ClientReader<edr::v1::CommandEnvelope>> reader(
           stub->Subscribe(ctx.get(), req));
       if (!reader) {
-        EDR_LOGE("%s", "[grpc] Subscribe reader 为空\n");
+        fprintf(stderr, "[grpc] Subscribe reader 为空\n");
         s_sub_ctx.reset();
       } else {
         edr::v1::CommandEnvelope cmd;
@@ -219,9 +328,9 @@ static void subscribe_thread_main(std::string endpoint_id) {
         }
         grpc::Status st = reader->Finish();
         if (!st.ok() && st.error_code() != grpc::StatusCode::CANCELLED) {
-          if (edr_log_verbose()) {
-            EDR_LOGV("[grpc] Subscribe 流结束: %d %s\n", (int)st.error_code(), st.error_message().c_str());
-          }
+          fprintf(stderr, "[grpc] Subscribe 流结束: %d %s\n", (int)st.error_code(),
+                  st.error_message().c_str());
+          runtime_failure("subscribe: " + st.error_message());
         }
       }
       s_sub_ctx.reset();
@@ -229,11 +338,87 @@ static void subscribe_thread_main(std::string endpoint_id) {
     if (s_sub_stop.load()) {
       break;
     }
-    if (edr_log_verbose()) {
-      EDR_LOGV("[grpc] Subscribe %u ms 后重连…\n", backoff_ms);
-    }
+    fprintf(stderr, "[grpc] Subscribe %u ms 后重连…\n", backoff_ms);
     std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     backoff_ms = std::min<unsigned>(backoff_ms * 2, 60000u);
+  }
+}
+
+static void control_stream_thread_main(std::string endpoint_id) {
+  unsigned backoff_ms = 500;
+  while (!s_sub_stop.load()) {
+    if (!s_channel) {
+      break;
+    }
+    auto stub = edr::v1::EventIngest::NewStub(s_channel);
+    auto ctx = std::make_shared<grpc::ClientContext>();
+    s_sub_ctx = ctx;
+    std::unique_ptr<grpc::ClientReaderWriter<edr::v1::CommandEnvelope, edr::v1::CommandEnvelope>>
+        stream(stub->ControlStream(ctx.get()));
+    if (!stream) {
+      runtime_failure("ControlStream: stream is null");
+      s_sub_ctx.reset();
+      std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+      backoff_ms = std::min<unsigned>(backoff_ms * 2, 60000u);
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(s_control_mu);
+      s_control_stream = stream.get();
+      s_control_ready = true;
+    }
+
+    edr::v1::CommandEnvelope hello;
+    hello.set_command_id("agent-hello");
+    hello.set_command_type("agent_hello");
+    hello.set_issued_at_unix_ms(unix_ms_now());
+    std::string payload = std::string("{\"endpoint_id\":") + json_quoted(endpoint_id) +
+                          ",\"agent_version\":\"" EDR_AGENT_VERSION_STRING "\"}";
+    hello.set_payload(payload);
+    if (!control_stream_write(hello)) {
+      runtime_failure("ControlStream: hello write failed");
+    } else {
+      runtime_success();
+      backoff_ms = 500;
+      fprintf(stderr, "[grpc] ControlStream 已建立 endpoint=%s\n", endpoint_id.c_str());
+    }
+
+    edr::v1::CommandEnvelope cmd;
+    while (!s_sub_stop.load() && stream->Read(&cmd)) {
+      EdrSoarCommandMeta sm{};
+      pb_to_soar_meta(cmd, &sm);
+      edr_command_on_envelope(cmd.command_id().c_str(), cmd.command_type().c_str(),
+                              reinterpret_cast<const uint8_t *>(cmd.payload().data()),
+                              cmd.payload().size(), &sm);
+    }
+    {
+      std::lock_guard<std::mutex> lock(s_control_mu);
+      s_control_ready = false;
+      s_control_stream = nullptr;
+    }
+    grpc::Status st = stream->Finish();
+    s_sub_ctx.reset();
+    if (st.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+      fprintf(stderr, "[grpc] ControlStream 未实现，回退 Subscribe 服务端流\n");
+      subscribe_thread_main(endpoint_id);
+      return;
+    }
+    if (!st.ok() && st.error_code() != grpc::StatusCode::CANCELLED) {
+      fprintf(stderr, "[grpc] ControlStream 流结束: %d %s\n", (int)st.error_code(),
+              st.error_message().c_str());
+      runtime_failure("ControlStream: " + st.error_message());
+    }
+    if (s_sub_stop.load()) {
+      break;
+    }
+    fprintf(stderr, "[grpc] ControlStream %u ms 后重连…\n", backoff_ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+    backoff_ms = std::min<unsigned>(backoff_ms * 2, 60000u);
+  }
+  {
+    std::lock_guard<std::mutex> lock(s_control_mu);
+    s_control_ready = false;
+    s_control_stream = nullptr;
   }
 }
 
@@ -245,9 +430,7 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
 
   std::string target(cfg->server.address);
   if (target.empty()) {
-    if (edr_log_verbose()) {
-      EDR_LOGV("%s", "[grpc] server.address 为空，跳过 gRPC\n");
-    }
+    fprintf(stderr, "[grpc] server.address 为空，跳过 gRPC\n");
     return;
   }
 
@@ -260,7 +443,7 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
   s_cert = read_pem_file(cfg->server.client_cert);
   s_key = read_pem_file(cfg->server.client_key);
   const char *insec = std::getenv("EDR_GRPC_INSECURE");
-  s_insecure = (insec && insec[0] == '1') || cfg->server.grpc_insecure;
+  s_insecure = (insec && insec[0] == '1');
   s_max_upload_mbps = cfg->upload.max_upload_mbps;
   (void)grpc_client_connect_locked(target);
 }
@@ -273,9 +456,13 @@ extern "C" void edr_grpc_client_shutdown(void) {
   if (s_sub_thr.joinable()) {
     s_sub_thr.join();
   }
+  {
+    std::lock_guard<std::mutex> lock(s_control_mu);
+    s_control_ready = false;
+    s_control_stream = nullptr;
+  }
   s_stub.reset();
   s_channel.reset();
-  s_target.clear();
   s_upload_tb_inited = false;
 }
 
@@ -284,34 +471,25 @@ extern "C" int edr_grpc_client_ready(void) {
   return s_stub ? 1 : 0;
 }
 
-extern "C" void edr_grpc_client_diag(char *buf, size_t cap) {
-  if (!buf || cap == 0u) {
+extern "C" void edr_grpc_client_get_runtime(EdrGrpcClientRuntime *out) {
+  if (!out) {
     return;
   }
-  buf[0] = '\0';
-  std::lock_guard<std::mutex> lock(s_mu);
-  if (s_stub) {
-    snprintf(buf, cap, "%s", "ok");
-    return;
+  std::memset(out, 0, sizeof(*out));
+  {
+    std::lock_guard<std::mutex> lock(s_mu);
+    out->ready = s_stub ? 1 : 0;
   }
-  if (s_target.empty()) {
-    snprintf(buf, cap, "%s", "empty_server_address");
-    return;
+  out->insecure = s_insecure ? 1 : 0;
+  out->report_fail_streak = s_report_fail_streak.load();
+  out->rpc_ok = s_rpc_ok.load();
+  out->rpc_fail = s_rpc_fail.load();
+  out->last_success_unix_ms = s_last_success_ms.load();
+  out->last_failure_unix_ms = s_last_failure_ms.load();
+  {
+    std::lock_guard<std::mutex> lock(s_runtime_mu);
+    std::snprintf(out->last_error, sizeof(out->last_error), "%s", s_last_error.c_str());
   }
-  if (s_insecure) {
-    /* stub 在上方已判空：明文 gRPC 未建链/已 shutdown */
-    snprintf(buf, cap, "%s", "insecure_not_connected");
-    return;
-  }
-  if (s_ca.empty() && s_cert.empty() && s_key.empty()) {
-    snprintf(buf, cap, "%s", "no_tls_pem_or_EDR_GRPC_INSECURE=1");
-    return;
-  }
-  if (!s_ca.empty() && (s_cert.empty() || s_key.empty())) {
-    snprintf(buf, cap, "%s", "incomplete_mtls_missing_client_cert_or_key");
-    return;
-  }
-  snprintf(buf, cap, "%s", "channel_not_ready");
 }
 
 extern "C" int edr_grpc_client_reconnect_to_target(const char *target) {
@@ -333,6 +511,11 @@ extern "C" int edr_grpc_client_reconnect_to_target(const char *target) {
   if (s_sub_thr.joinable()) {
     s_sub_thr.join();
   }
+  {
+    std::lock_guard<std::mutex> lock(s_control_mu);
+    s_control_ready = false;
+    s_control_stream = nullptr;
+  }
   s_stub.reset();
   s_channel.reset();
   if (!grpc_client_connect_locked(next)) {
@@ -344,7 +527,8 @@ extern "C" int edr_grpc_client_reconnect_to_target(const char *target) {
 extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *header12,
                                           size_t header_len, const uint8_t *payload,
                                           size_t payload_len) {
-  if (!header12 || header_len < 12u || !payload || payload_len == 0u) {
+  std::lock_guard<std::mutex> lock(s_mu);
+  if (!s_stub || !header12 || header_len < 12u || !payload || payload_len == 0u) {
     return -1;
   }
 
@@ -359,25 +543,8 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
   }
 
   const size_t wire_bytes = header_len + payload_len;
-  int timeout_s = 10;
-  uint32_t max_upload_mbps = 0u;
-  std::string endpoint_id;
-  std::shared_ptr<edr::v1::EventIngest::Stub> stub;
-  {
-    std::lock_guard<std::mutex> lock(s_mu);
-    if (!s_stub) {
-      grpc_note_failure("grpc_stub_not_ready");
-      return -1;
-    }
-    stub = s_stub;
-    timeout_s = s_timeout_s;
-    max_upload_mbps = s_max_upload_mbps;
-    endpoint_id = s_endpoint_id;
-  }
-
-  if (max_upload_mbps > 0u && wire_bytes > 0u) {
-    std::lock_guard<std::mutex> tb_lock(s_upload_mu);
-    const double rate_bps = (double)max_upload_mbps * 125000.0;
+  if (s_max_upload_mbps > 0u && wire_bytes > 0u) {
+    const double rate_bps = (double)s_max_upload_mbps * 125000.0;
     auto now = std::chrono::steady_clock::now();
     if (!s_upload_tb_inited) {
       s_upload_last_tp = now;
@@ -386,7 +553,8 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
     } else {
       double dt = std::chrono::duration<double>(now - s_upload_last_tp).count();
       s_upload_last_tp = now;
-      s_upload_token_bytes = std::min(rate_bps * 30.0, s_upload_token_bytes + dt * rate_bps);
+      s_upload_token_bytes =
+          std::min(rate_bps * 30.0, s_upload_token_bytes + dt * rate_bps);
     }
     while (s_upload_token_bytes + 1e-9 < (double)wire_bytes) {
       double deficit = (double)wire_bytes - s_upload_token_bytes;
@@ -395,13 +563,14 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
       now = std::chrono::steady_clock::now();
       double dt = std::chrono::duration<double>(now - s_upload_last_tp).count();
       s_upload_last_tp = now;
-      s_upload_token_bytes = std::min(rate_bps * 30.0, s_upload_token_bytes + dt * rate_bps);
+      s_upload_token_bytes =
+          std::min(rate_bps * 30.0, s_upload_token_bytes + dt * rate_bps);
     }
     s_upload_token_bytes -= (double)wire_bytes;
   }
 
   edr::v1::ReportEventsRequest req;
-  req.set_endpoint_id(endpoint_id);
+  req.set_endpoint_id(s_endpoint_id);
   req.set_batch_id(batch_id ? batch_id : "");
   req.set_agent_version(EDR_AGENT_VERSION_STRING);
   std::string blob(reinterpret_cast<const char *>(header12), header_len);
@@ -409,50 +578,35 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
   req.set_payload(blob);
 
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(timeout_s));
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::seconds(s_timeout_s));
   edr::v1::ReportEventsResponse resp;
-  grpc::Status st = stub->ReportEvents(&ctx, req, &resp);
+  grpc::Status st = s_stub->ReportEvents(&ctx, req, &resp);
   if (!st.ok()) {
     s_rpc_fail++;
     s_report_fail_streak++;
-    {
-      std::ostringstream oss;
-      oss << "ReportEvents: " << (int)st.error_code() << " " << st.error_message();
-      grpc_note_failure(oss.str());
-    }
-    EDR_LOGE("[grpc] ReportEvents 失败: %d %s\n", (int)st.error_code(), st.error_message().c_str());
+    runtime_failure("ReportEvents: " + st.error_message());
+    fprintf(stderr, "[grpc] ReportEvents 失败: %d %s\n", (int)st.error_code(),
+            st.error_message().c_str());
     return -1;
   }
-  // 与 HTTP ingest 对齐：平台对 200 且 accepted=false 仍算「传输成功」（本批可能 0 条落库）；
-  // 旧逻辑把 accepted=false 当失败会触发 HTTP 重试同批，误报 rpc_fail 且重复请求。
   if (!resp.accepted()) {
-    static unsigned s_warn_accept_false;
-    if (s_warn_accept_false < 5u) {
-      s_warn_accept_false++;
-      std::string msg = resp.message();
-      if (msg.size() > 200u) {
-        msg.resize(200u);
-        msg += "...";
-      }
-      EDR_LOGV(
-          "[grpc] ReportEvents: RPC OK 但 accepted=false（与 HTTP 200 一致；本批可能未写入事件）"
-          " message=%s\n",
-          msg.c_str());
-    }
+    s_rpc_fail++;
+    s_report_fail_streak++;
+    runtime_failure("ReportEvents: rejected");
+    return -1;
   }
   s_report_fail_streak = 0;
   s_rpc_ok++;
-  grpc_note_success();
+  runtime_success();
   return 0;
 }
 
-extern "C" int edr_grpc_client_report_command_result(const char *command_id,
-                                                     const EdrSoarCommandMeta *meta,
-                                                     int execution_status, int exit_code,
-                                                     const char *detail_utf8) {
-  std::lock_guard<std::mutex> lock(s_mu);
+static int report_command_result_unary_locked(const char *command_id,
+                                              const EdrSoarCommandMeta *meta,
+                                              int execution_status, int exit_code,
+                                              const char *detail_utf8, long long finished_ms) {
   if (!s_stub) {
-    grpc_note_failure("ReportCommandResult: grpc_stub_not_ready");
     return -1;
   }
   edr::v1::ReportCommandResultRequest req;
@@ -469,10 +623,7 @@ extern "C" int edr_grpc_client_report_command_result(const char *command_id,
   r->set_status(map_exec_status(execution_status));
   r->set_exit_code(exit_code);
   r->set_detail_utf8(detail_utf8 ? detail_utf8 : "");
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
-  r->set_finished_unix_ms(ms);
+  r->set_finished_unix_ms(finished_ms);
 
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(s_timeout_s));
@@ -480,21 +631,58 @@ extern "C" int edr_grpc_client_report_command_result(const char *command_id,
   grpc::Status st = s_stub->ReportCommandResult(&ctx, req, &resp);
   if (!st.ok()) {
     s_rpc_fail++;
-    {
-      std::ostringstream oss;
-      oss << "ReportCommandResult: " << (int)st.error_code() << " " << st.error_message();
-      grpc_note_failure(oss.str());
-    }
-    EDR_LOGE("[grpc] ReportCommandResult 失败: %d %s\n", (int)st.error_code(), st.error_message().c_str());
+    runtime_failure("ReportCommandResult: " + st.error_message());
+    fprintf(stderr, "[grpc] ReportCommandResult 失败: %d %s\n", (int)st.error_code(),
+            st.error_message().c_str());
     return -1;
   }
   if (!resp.accepted()) {
     s_rpc_fail++;
-    grpc_note_failure("ReportCommandResult: accepted=false");
+    runtime_failure("ReportCommandResult: rejected");
     return -1;
   }
   s_rpc_ok++;
-  grpc_note_success();
+  runtime_success();
+  return 0;
+}
+
+extern "C" int edr_grpc_client_report_command_result(const char *command_id,
+                                                     const EdrSoarCommandMeta *meta,
+                                                     int execution_status, int exit_code,
+                                                     const char *detail_utf8) {
+  std::lock_guard<std::mutex> lock(s_mu);
+  if (!s_stub && !s_control_ready.load()) {
+    return -1;
+  }
+  std::string detail(detail_utf8 ? detail_utf8 : "");
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+
+  if (control_stream_send_result(command_id, meta, execution_status, exit_code, detail, ms)) {
+    s_rpc_ok++;
+    runtime_success();
+    return 0;
+  }
+
+  static const size_t kUnaryChunk = 24u * 1024u;
+  if (detail.size() <= kUnaryChunk) {
+    return report_command_result_unary_locked(command_id, meta, execution_status, exit_code,
+                                              detail.c_str(), ms);
+  }
+
+  std::string chunk_id = std::string(command_id ? command_id : "cmd") + "-" + std::to_string(ms);
+  const size_t count = (detail.size() + kUnaryChunk - 1u) / kUnaryChunk;
+  for (size_t i = 0; i < count; i++) {
+    const size_t off = i * kUnaryChunk;
+    std::string part = detail.substr(off, std::min(kUnaryChunk, detail.size() - off));
+    std::string chunk_detail = build_result_chunk_detail(chunk_id, i, count, detail.size(), part);
+    int rc = report_command_result_unary_locked(command_id, meta, execution_status, exit_code,
+                                                chunk_detail.c_str(), ms);
+    if (rc != 0) {
+      return rc;
+    }
+  }
   return 0;
 }
 
@@ -502,55 +690,14 @@ extern "C" unsigned long edr_grpc_client_rpc_ok(void) { return s_rpc_ok.load(); 
 
 extern "C" unsigned long edr_grpc_client_rpc_fail(void) { return s_rpc_fail.load(); }
 
-extern "C" unsigned long edr_grpc_client_report_fail_streak(void) {
-  return (unsigned long)s_report_fail_streak.load();
-}
-
-extern "C" uint64_t edr_grpc_client_last_success_ms(void) {
-  return s_last_success_ms.load(std::memory_order_relaxed);
-}
-
-extern "C" uint64_t edr_grpc_client_last_failure_ms(void) {
-  return s_last_failure_ms.load(std::memory_order_relaxed);
-}
-
-extern "C" void edr_grpc_client_last_failure_reason(char *buf, size_t cap) {
-  if (!buf || cap == 0u) {
-    return;
-  }
-  buf[0] = '\0';
-  std::lock_guard<std::mutex> lock(s_last_failure_mu);
-  snprintf(buf, cap, "%s", s_last_failure_reason.empty() ? "" : s_last_failure_reason.c_str());
-}
-
-static int edr_try_ingest_http_file_upload(const char *file_path, const char *sha256_hex, char *out_minio_key,
-                                            size_t out_minio_key_cap) {
-  if (!edr_ingest_http_configured()) {
-    return -1;
-  }
-  return edr_ingest_http_upload_file_multipart(nullptr, file_path, sha256_hex, out_minio_key, out_minio_key_cap);
-}
-
 extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *file_path, const char *sha256_hex,
                                            char *out_minio_key, size_t out_minio_key_cap) {
-  (void)alert_id;
   std::lock_guard<std::mutex> lock(s_mu);
   if (out_minio_key && out_minio_key_cap > 0u) {
     out_minio_key[0] = '\0';
   }
-  if (!file_path || !file_path[0]) {
+  if (!s_stub || !file_path || !file_path[0]) {
     return -1;
-  }
-  if (!s_stub) {
-    int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
-    if (hr == 0) {
-      s_rpc_ok++;
-      grpc_note_success();
-    } else {
-      s_rpc_fail++;
-      grpc_note_failure("UploadFile: grpc_stub_not_ready_http_fallback_failed");
-    }
-    return hr;
   }
   std::ifstream f(file_path, std::ios::binary);
   if (!f) {
@@ -568,13 +715,7 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
   edr::v1::UploadResult resp;
   std::unique_ptr<grpc::ClientWriter<edr::v1::FileChunk>> wr = s_stub->UploadFile(&ctx, &resp);
   if (!wr) {
-    int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
-    if (hr == 0) {
-      s_rpc_ok++;
-    } else {
-      s_rpc_fail++;
-    }
-    return hr;
+    return -1;
   }
 
   std::string name = file_path;
@@ -614,30 +755,23 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
       (void)wr->WritesDone();
       grpc::Status st = wr->Finish();
       (void)st;
-      int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
-      if (hr == 0) {
-        s_rpc_ok++;
-      } else {
-        s_rpc_fail++;
-      }
-      return hr;
+      s_rpc_fail++;
+      runtime_failure("UploadFile: write failed");
+      return -1;
     }
     offset += (uint64_t)n;
   }
   (void)wr->WritesDone();
   grpc::Status st = wr->Finish();
   if (!st.ok() || !resp.success()) {
-    int hr = edr_try_ingest_http_file_upload(file_path, sha256_hex, out_minio_key, out_minio_key_cap);
-    if (hr == 0) {
-      s_rpc_ok++;
-    } else {
-      s_rpc_fail++;
-    }
-    return hr;
+    s_rpc_fail++;
+    runtime_failure(st.ok() ? "UploadFile: rejected" : ("UploadFile: " + st.error_message()));
+    return -1;
   }
   if (out_minio_key && out_minio_key_cap > 0u) {
     snprintf(out_minio_key, out_minio_key_cap, "%s", resp.minio_key().c_str());
   }
   s_rpc_ok++;
+  runtime_success();
   return 0;
 }

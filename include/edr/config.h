@@ -7,7 +7,6 @@
 
 #include "edr/error.h"
 #include "edr/emit_rules.h"
-#include "edr/forensic_trigger.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -27,8 +26,6 @@ typedef struct EdrConfig {
     char client_key[1024];
     int connect_timeout_s;
     int keepalive_interval_s;
-    /** 与 EDR_GRPC_INSECURE=1 等效：连平台明文 gRPC Ingest；生产应 false 并配 mTLS */
-    bool grpc_insecure;
   } server;
 
   struct {
@@ -42,22 +39,9 @@ typedef struct EdrConfig {
     bool etw_tcpip_provider;
     /** Windows：订阅 WFAS 防火墙 ETW（§19.10）；失败时跳过不致命 */
     bool etw_firewall_provider;
-    /** Windows 可选：DNS-Client / PowerShell / Security-Auditing / WMI（A4.3）；**关前须与 P0/字段矩阵对表** */
-    bool etw_dns_client_provider;
-    bool etw_powershell_provider;
-    bool etw_security_audit_provider;
-    bool etw_wmi_provider;
-    /** P0-1: Service Control Manager — 服务创建/删除 (7045/7036/4697) */
-    bool etw_service_control_manager_provider;
     bool ebpf_enabled;
     int poll_interval_s;
     uint32_t max_event_queue_size;
-    /**
-     * Windows 实时 ETW 会话 `EVENT_TRACE_PROPERTIES`：`BufferSize`（**KB**）、`FlushTimer`（**秒**）。
-     * **0** = 在 `edr_config_clamp` 中置默认（64 KB、1s）；亦可用 **`EDR_ETW_BUFFER_KB`** / **`EDR_ETW_FLUSH_TIMER_S`** 覆盖（见 A4.2）。
-     */
-    uint32_t etw_buffer_kb;
-    uint32_t etw_flush_timer_s;
   } collection;
 
   struct {
@@ -76,8 +60,6 @@ typedef struct EdrConfig {
     int scan_threads;
     int max_file_size_mb;
     char sensitivity[16];
-    /** 默认 false（需要显式启用）；可由环境变量 EDR_AVE_ENABLED=1 覆盖 */
-    bool enabled;
     /** §08 签名白名单 Stage0：Windows 默认 true；见 `ave_sign_whitelist_*` */
     bool cert_whitelist_enabled;
     /** 可选 SQLite（`sign_blacklist` / `sign_whitelist` / `sign_cache` 等，见 08 设计文档） */
@@ -130,18 +112,15 @@ typedef struct EdrConfig {
     char queue_db_path[1024];
     uint32_t max_queue_size_mb;
     uint32_t retention_hours;
+    char evidence_cache_path[1024];
+    uint32_t evidence_cache_max_size_mb;
+    uint32_t evidence_cache_retention_hours;
   } offline;
 
   struct {
-    char profile[32];
     uint32_t cpu_limit_percent;
     uint32_t memory_limit_mb;
     uint32_t emergency_cpu_limit;
-    uint32_t ave_infer_per_min;
-    uint32_t pmfe_scans_per_min;
-    uint32_t webshell_scan_mb_per_min;
-    uint32_t shellcode_packets_per_sec;
-    uint32_t low_priority_keep_percent_under_pressure;
   } resource_limit;
 
   struct {
@@ -191,10 +170,10 @@ typedef struct EdrConfig {
     uint16_t *high_risk_immediate_ports;
     size_t high_risk_immediate_ports_count;
     /**
-     * 为 true（默认）时，§19.10 ETW 去抖后触发 `etw_tcpip_wf`；**POST 仍受** `min(port,service,policy,full)` 全局限流。
+     * 为 true（默认）时，§19.10 ETW（tcpip/wf）经预处理去抖后触发一次 `edr_attack_surface_execute`（command_id `etw_tcpip_wf`）。
      */
     bool etw_refresh_triggers_snapshot;
-    /** §19.10 去抖窗口（秒，钳 1～300），仅与 ETW 批处理节奏有关，**不能**短于全局限流间隔。 */
+    /** 上述 ETW 触发的攻击面 POST 最小间隔（秒），钳 1～300；防连接类 ETW 洪峰。 */
     uint32_t etw_refresh_debounce_s;
     /**
      * Windows：`edr_win_listen_collect_rows` 进程内快照缓存 TTL（毫秒）。`0` 表示关闭缓存（每次枚举打 API）。
@@ -241,6 +220,7 @@ typedef struct EdrConfig {
     bool monitor_winrm;
     bool monitor_msrpc;
     bool monitor_ldap;
+    bool monitor_tls;
     uint32_t detector_threads;
     char yara_rules_dir[1024];
     char forensic_dir[1024];
@@ -280,41 +260,6 @@ typedef struct EdrConfig {
     uint32_t upload_timeout_s;
     uint32_t max_upload_size_mb;
   } webshell_detector;
-
-  /** §19 检测引擎自适应策略 — TOML `[detection]` */
-  struct {
-    /** 自适应探测：Agent 启动时根据环境特征自动启用 shellcode/webshell */
-    bool auto_profile;
-    /** 手工强制 shellcode 检测（覆盖自适应） */
-    int shellcode_mode; /* 0=关 1=开 -1=自适应(默认) */
-    /** 手工强制 webshell 检测（覆盖自适应） */
-    int webshell_mode; /* 0=关 1=开 -1=自适应(默认) */
-    /** PMFE 内存取证: 0=关 1=仅空闲扫描 2=告警触发+空闲 (默认0) */
-    int pmfe_mode;
-  } detection;
-
-  /** §20 PMFE 内存取证空闲扫描 — TOML `[pmfe]` */
-  struct {
-    bool idle_scan_enabled;
-    uint32_t idle_scan_interval_min;
-    uint32_t idle_scan_max_procs;
-    double idle_cpu_threshold;
-    bool idle_skip_on_battery;
-  } pmfe;
-
-  /** 取证自动触发策略 — TOML `[forensic_auto]` */
-  EdrForensicAutoConfig forensic_auto;
-
-  /** 远程 Shell 配置 — TOML `[shell]` */
-  struct {
-    uint32_t max_sessions;
-    uint32_t session_timeout_s;
-    uint32_t max_output_per_command_kb;
-    char **shell_allow;
-    size_t shell_allow_count;
-    char **shell_block;
-    size_t shell_block_count;
-  } shell;
 
   /**
    * 联邦学习本地训练（FL §10）；TOML `[fl]`。
@@ -358,15 +303,6 @@ typedef struct EdrConfig {
     size_t frozen_layer_count_behavior;
     char frozen_layer_behavior[EDR_FL_FROZEN_MAX][EDR_FL_FROZEN_NAME_MAX];
   } fl;
-
-  struct {
-    char rules_url[512];
-    char p0_bundle_url[512];
-    int poll_interval_s;
-    char version_url[512];
-    char download_url[512];
-    bool auto_update;
-  } remote;
 } EdrConfig;
 
 /** 设计文档默认值（无文件或未指定键时使用） */
@@ -374,13 +310,6 @@ void edr_config_apply_defaults(EdrConfig *cfg);
 
 /** 释放 preprocessing.rules、attack_surface.high_risk_immediate_ports 等堆内存；edr_config_load 内部会先调用 */
 void edr_config_free_heap(EdrConfig *cfg);
-
-/**
- * 启动/重载后打印与平台联调相关的语义类 WARN（stderr），避免静默误配。
- * 前提：`edr_config_load` 在 `edr_config_clamp` 之后（或等价的 defaults + 已解析的 cfg）调用本函数效果最佳。
- * 见 `docs/WP3_CONFIG_VALIDATION.md`。
- */
-void edr_config_log_semantic_warnings(const EdrConfig *cfg);
 
 /**
  * 从 path 加载 TOML（先 apply_defaults，再由解析结果覆盖）。

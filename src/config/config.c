@@ -1,69 +1,7 @@
 #include "edr/config.h"
-#include "edr/detection_profile.h"
-#include "edr/shell_exec.h"
-
-#include <stdio.h>
 
 #ifdef _WIN32
-#include <wchar.h>
-#include <windows.h>
 #include "edr/listen_table_win.h"
-
-/** 与 Inno `DefaultDirName`（%ProgramFiles%\\EDR Agent）一致；ProgramData 下勿混用裸 `EDR`。 */
-#define EDR_WIN_FALLBACK_PROGRAMDATA_MODELS "C:\\ProgramData\\EDR Agent\\models"
-
-/** 将 model_dir 设为与当前 edr_agent.exe 同目录下的 `models`（UTF-8）。失败返回 0。 */
-static int edr_win_model_dir_next_to_exe(char *out_utf8, size_t out_cap) {
-  wchar_t wpath[MAX_PATH];
-  DWORD n = GetModuleFileNameW(NULL, wpath, MAX_PATH);
-  if (n == 0 || n >= MAX_PATH) {
-    return 0;
-  }
-  wchar_t *slash = wcsrchr(wpath, L'\\');
-  if (!slash) {
-    slash = wcsrchr(wpath, L'/');
-  }
-  if (!slash) {
-    return 0;
-  }
-  *slash = L'\0';
-  if (wcslen(wpath) + wcslen(L"\\models") + 1u >= (size_t)MAX_PATH) {
-    return 0;
-  }
-  wcscat(wpath, L"\\models");
-  if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out_utf8, (int)out_cap, NULL, NULL) <= 1) {
-    return 0;
-  }
-  return 1;
-}
-
-/** True if model_dir is the Linux example path (optional trailing slash / spaces). */
-static int edr_config_model_dir_is_unix_example(const char *md) {
-  if (!md) {
-    return 0;
-  }
-  while (*md == ' ' || *md == '\t') {
-    md++;
-  }
-  size_t n = strlen(md);
-  while (n > 0 && (md[n - 1] == ' ' || md[n - 1] == '\t' || md[n - 1] == '/')) {
-    n--;
-  }
-  if (n == strlen("/opt/edr/models") && strncmp(md, "/opt/edr/models", n) == 0) {
-    return 1;
-  }
-  return 0;
-}
-
-/** TOML 中仍为 Linux 示例路径时，在 Windows 上改为 exe 同目录\models。 */
-static void edr_config_win_fixup_model_dir_from_unix_example(EdrConfig *cfg) {
-  if (!edr_config_model_dir_is_unix_example(cfg->ave.model_dir)) {
-    return;
-  }
-  if (!edr_win_model_dir_next_to_exe(cfg->ave.model_dir, sizeof(cfg->ave.model_dir))) {
-    snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", EDR_WIN_FALLBACK_PROGRAMDATA_MODELS);
-  }
-}
 #endif
 
 #include "edr/emit_rules.h"
@@ -80,8 +18,7 @@ static void edr_config_win_fixup_model_dir_from_unix_example(EdrConfig *cfg) {
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r239-97acafca"
-#define EDR_PREPROCESS_RULES_BUNDLE_NAME "agent_preprocess_rules_v1.toml"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r218-9ae52519"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -398,17 +335,6 @@ static void load_server(toml_table_t *t, EdrConfig *cfg) {
       cfg->server.keepalive_interval_s = (int)d.u.i;
     }
   }
-  {
-    toml_datum_t d = toml_bool_in(t, "grpc_insecure");
-    if (d.ok) {
-      cfg->server.grpc_insecure = d.u.b ? true : false;
-    } else {
-      toml_datum_t n = toml_int_in(t, "grpc_insecure");
-      if (n.ok) {
-        cfg->server.grpc_insecure = n.u.i != 0;
-      }
-    }
-  }
 }
 
 static void load_agent(toml_table_t *t, EdrConfig *cfg) {
@@ -437,36 +363,6 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
-    toml_datum_t d = toml_bool_in(t, "etw_dns_client_provider");
-    if (d.ok) {
-      cfg->collection.etw_dns_client_provider = d.u.b ? true : false;
-    }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "etw_powershell_provider");
-    if (d.ok) {
-      cfg->collection.etw_powershell_provider = d.u.b ? true : false;
-    }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "etw_security_audit_provider");
-    if (d.ok) {
-      cfg->collection.etw_security_audit_provider = d.u.b ? true : false;
-    }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "etw_wmi_provider");
-    if (d.ok) {
-      cfg->collection.etw_wmi_provider = d.u.b ? true : false;
-    }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "etw_service_control_manager_provider");
-    if (d.ok) {
-      cfg->collection.etw_service_control_manager_provider = d.u.b ? true : false;
-    }
-  }
-  {
     toml_datum_t d = toml_bool_in(t, "ebpf_enabled");
     if (d.ok) {
       cfg->collection.ebpf_enabled = d.u.b ? true : false;
@@ -482,18 +378,6 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "max_event_queue_size");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->collection.max_event_queue_size = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "etw_buffer_kb");
-    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->collection.etw_buffer_kb = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "etw_flush_timer_s");
-    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->collection.etw_flush_timer_s = (uint32_t)d.u.i;
     }
   }
 }
@@ -520,7 +404,6 @@ static int32_t edr_parse_event_type_filter(const char *s) {
       {"PROCESS_INJECT", EDR_EVENT_PROCESS_INJECT},
       {"DLL_LOAD", EDR_EVENT_DLL_LOAD},
       {"THREAD_CREATE_REMOTE", EDR_EVENT_THREAD_CREATE_REMOTE},
-      {"FILE_READ", EDR_EVENT_FILE_READ},
       {"FILE_CREATE", EDR_EVENT_FILE_CREATE},
       {"FILE_WRITE", EDR_EVENT_FILE_WRITE},
       {"FILE_DELETE", EDR_EVENT_FILE_DELETE},
@@ -688,96 +571,6 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
   load_preprocessing_rules(t, cfg);
 }
 
-static int edr_file_exists(const char *path) {
-  if (!path || !path[0]) {
-    return 0;
-  }
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    return 0;
-  }
-  fclose(f);
-  return 1;
-}
-
-static void edr_dir_of_path(const char *path, char *out, size_t cap) {
-  if (!out || cap == 0u) {
-    return;
-  }
-  out[0] = '\0';
-  if (!path || !path[0]) {
-    return;
-  }
-  size_t n = strlen(path);
-  if (n + 1u > cap) {
-    n = cap - 1u;
-  }
-  memcpy(out, path, n);
-  out[n] = '\0';
-  while (n > 0u) {
-    char c = out[n - 1u];
-    if (c == '/' || c == '\\') {
-      out[n - 1u] = '\0';
-      return;
-    }
-    n--;
-  }
-  out[0] = '\0';
-}
-
-static int load_preprocess_rules_bundle_file(const char *bundle_path, EdrConfig *cfg) {
-  if (!bundle_path || !bundle_path[0] || !cfg || !edr_file_exists(bundle_path)) {
-    return 0;
-  }
-  FILE *fp = fopen(bundle_path, "r");
-  if (!fp) {
-    return 0;
-  }
-  char errbuf[512];
-  memset(errbuf, 0, sizeof(errbuf));
-  toml_table_t *root = toml_parse_file(fp, errbuf, (int)sizeof(errbuf));
-  fclose(fp);
-  if (!root) {
-    fprintf(stderr, "[config] preprocess bundle parse failed: %s (%s)\n",
-            errbuf[0] ? errbuf : "unknown error", bundle_path);
-    return 0;
-  }
-  toml_table_t *t = toml_table_in(root, "preprocessing");
-  if (!t) {
-    toml_free(root);
-    fprintf(stderr, "[config] preprocess bundle has no [preprocessing]: %s\n", bundle_path);
-    return 0;
-  }
-  load_preprocessing(t, cfg);
-  toml_free(root);
-  fprintf(stderr, "[config] preprocess bundle loaded: %s rules=%u version=%s\n",
-          bundle_path, (unsigned)cfg->preprocessing.rules_count, cfg->preprocessing.rules_version);
-  return 1;
-}
-
-static void try_auto_load_preprocess_rules_bundle(const char *config_path, int has_user_preprocess_rules,
-                                                  EdrConfig *cfg) {
-  if (!cfg || has_user_preprocess_rules) {
-    return;
-  }
-  {
-    const char *envp = getenv("EDR_PREPROCESS_RULES_BUNDLE_PATH");
-    if (envp && envp[0]) {
-      (void)load_preprocess_rules_bundle_file(envp, cfg);
-      return;
-    }
-  }
-  if (config_path && config_path[0]) {
-    char dir[1024];
-    char cand[1200];
-    edr_dir_of_path(config_path, dir, sizeof(dir));
-    if (dir[0]) {
-      snprintf(cand, sizeof(cand), "%s/%s", dir, EDR_PREPROCESS_RULES_BUNDLE_NAME);
-      (void)load_preprocess_rules_bundle_file(cand, cfg);
-    }
-  }
-}
-
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "model_dir"), cfg->ave.model_dir, sizeof(cfg->ave.model_dir));
   {
@@ -880,6 +673,8 @@ static void load_upload(toml_table_t *t, EdrConfig *cfg) {
 static void load_offline(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "queue_db_path"), cfg->offline.queue_db_path,
               sizeof(cfg->offline.queue_db_path));
+  take_string(toml_string_in(t, "evidence_cache_path"), cfg->offline.evidence_cache_path,
+              sizeof(cfg->offline.evidence_cache_path));
   {
     toml_datum_t d = toml_int_in(t, "max_queue_size_mb");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
@@ -892,11 +687,21 @@ static void load_offline(toml_table_t *t, EdrConfig *cfg) {
       cfg->offline.retention_hours = (uint32_t)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_int_in(t, "evidence_cache_max_size_mb");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->offline.evidence_cache_max_size_mb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "evidence_cache_retention_hours");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->offline.evidence_cache_retention_hours = (uint32_t)d.u.i;
+    }
+  }
 }
 
 static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
-  take_string(toml_string_in(t, "profile"), cfg->resource_limit.profile,
-              sizeof(cfg->resource_limit.profile));
   {
     toml_datum_t d = toml_int_in(t, "cpu_limit_percent");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
@@ -913,36 +718,6 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "emergency_cpu_limit");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->resource_limit.emergency_cpu_limit = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "ave_infer_per_min");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->resource_limit.ave_infer_per_min = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "pmfe_scans_per_min");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->resource_limit.pmfe_scans_per_min = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "webshell_scan_mb_per_min");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->resource_limit.webshell_scan_mb_per_min = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "shellcode_packets_per_sec");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->resource_limit.shellcode_packets_per_sec = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "low_priority_keep_percent_under_pressure");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 100LL) {
-      cfg->resource_limit.low_priority_keep_percent_under_pressure = (uint32_t)d.u.i;
     }
   }
 }
@@ -1090,6 +865,12 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "monitor_tls");
+    if (d.ok) {
+      cfg->shellcode_detector.monitor_tls = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_int_in(t, "detector_threads");
     if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.detector_threads = (uint32_t)d.u.i;
@@ -1221,65 +1002,6 @@ static void load_webshell_detector(toml_table_t *t, EdrConfig *cfg) {
   }
 }
 
-static int edr_streq_icase(const char *a, const char *b) {
-  if (!a || !b) {
-    return 0;
-  }
-  for (; *a && *b; a++, b++) {
-    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
-      return 0;
-    }
-  }
-  return *a == 0 && *b == 0;
-}
-
-static int edr_has_prefix_icase(const char *s, const char *pre) {
-  if (!s || !pre) {
-    return 0;
-  }
-  for (; *pre; s++, pre++) {
-    if (!*s) {
-      return 0;
-    }
-    if (tolower((unsigned char)*s) != tolower((unsigned char)*pre)) {
-      return 0;
-    }
-  }
-  return 1;
-}
-
-void edr_config_log_semantic_warnings(const EdrConfig *cfg) {
-  if (!cfg) {
-    return;
-  }
-  const char *e = getenv("EDR_PLATFORM_REST_BASE");
-  const char *rest = (e && e[0]) ? e : cfg->platform.rest_base_url;
-  if (!rest || !rest[0]) {
-    return;
-  }
-  if (!edr_has_prefix_icase(rest, "http://") && !edr_has_prefix_icase(rest, "https://")) {
-    fprintf(stderr, "[config] WARN: EDR_PLATFORM_REST_BASE / [platform].rest_base_url should start with http:// or "
-                    "https:// (effective: %.400s)\n",
-            rest);
-  } else if (!strstr(rest, "/api/")) {
-    fprintf(stderr,
-            "[config] WARN: rest base has no path segment '/api/' (effective: %.400s). If you only need /healthz, this "
-            "is OK; for ingest/attack-surface, use a full API root e.g. http://host:port/api/v1. See "
-            "docs/WP3_CONFIG_VALIDATION.md.\n",
-            rest);
-  }
-  if (!cfg->agent.endpoint_id[0] || edr_streq_icase(cfg->agent.endpoint_id, "auto")) {
-    fprintf(stderr,
-            "[config] WARN: [agent].endpoint_id is empty or 'auto' while platform REST is configured; set a concrete "
-            "id registered in the platform. See edr-backend/docs/LOCAL_STACK_INTEGRATION.md and "
-            "docs/WP3_CONFIG_VALIDATION.md.\n");
-  }
-  if (!cfg->agent.tenant_id[0] || edr_streq_icase(cfg->agent.tenant_id, "tenant_default")) {
-    fprintf(stderr, "[config] WARN: [agent].tenant_id is empty or still 'tenant_default' (placeholder) while platform "
-                    "REST is configured; set your real tenant. See docs/WP3_CONFIG_VALIDATION.md.\n");
-  }
-}
-
 static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size < 256u) {
     cfg->collection.max_event_queue_size = 4096u;
@@ -1287,46 +1009,6 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size > 65536u) {
     cfg->collection.max_event_queue_size = 65536u;
   }
-  /* A4.2：ETW 实时会话缓冲/刷写；0 表示使用默认。有效区间与 Win32 常见实践对齐。 */
-  if (cfg->collection.etw_buffer_kb == 0u) {
-    cfg->collection.etw_buffer_kb = 128u;
-  }
-  if (cfg->collection.etw_buffer_kb < 4u) {
-    cfg->collection.etw_buffer_kb = 4u;
-  }
-  if (cfg->collection.etw_buffer_kb > 1024u) {
-    cfg->collection.etw_buffer_kb = 1024u;
-  }
-  if (cfg->collection.etw_flush_timer_s == 0u) {
-    cfg->collection.etw_flush_timer_s = 1u;
-  }
-  if (cfg->collection.etw_flush_timer_s > 300u) {
-    cfg->collection.etw_flush_timer_s = 300u;
-  }
-#if defined(_WIN32)
-  {
-    const char *e = getenv("EDR_ETW_BUFFER_KB");
-    if (e && e[0]) {
-      char *end = NULL;
-      unsigned long v = strtoul(e, &end, 10);
-      (void)end;
-      if (v >= 4ul && v <= 1024ul) {
-        cfg->collection.etw_buffer_kb = (uint32_t)v;
-      }
-    }
-  }
-  {
-    const char *e = getenv("EDR_ETW_FLUSH_TIMER_S");
-    if (e && e[0]) {
-      char *end = NULL;
-      unsigned long v = strtoul(e, &end, 10);
-      (void)end;
-      if (v >= 1ul && v <= 300ul) {
-        cfg->collection.etw_flush_timer_s = (uint32_t)v;
-      }
-    }
-  }
-#endif
   if (cfg->upload.batch_max_size_mb < 1u) {
     cfg->upload.batch_max_size_mb = 4u;
   }
@@ -1335,36 +1017,6 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->preprocessing.high_freq_threshold < 1u) {
     cfg->preprocessing.high_freq_threshold = 100u;
-  }
-  if (!cfg->resource_limit.profile[0]) {
-    snprintf(cfg->resource_limit.profile, sizeof(cfg->resource_limit.profile), "%s", "workstation");
-  }
-  if (cfg->resource_limit.ave_infer_per_min == 0u) {
-    cfg->resource_limit.ave_infer_per_min = 120u;
-  }
-  if (cfg->resource_limit.ave_infer_per_min > 6000u) {
-    cfg->resource_limit.ave_infer_per_min = 6000u;
-  }
-  if (cfg->resource_limit.pmfe_scans_per_min == 0u) {
-    cfg->resource_limit.pmfe_scans_per_min = 3u;
-  }
-  if (cfg->resource_limit.pmfe_scans_per_min > 120u) {
-    cfg->resource_limit.pmfe_scans_per_min = 120u;
-  }
-  if (cfg->resource_limit.webshell_scan_mb_per_min == 0u) {
-    cfg->resource_limit.webshell_scan_mb_per_min = 64u;
-  }
-  if (cfg->resource_limit.webshell_scan_mb_per_min > 4096u) {
-    cfg->resource_limit.webshell_scan_mb_per_min = 4096u;
-  }
-  if (cfg->resource_limit.shellcode_packets_per_sec == 0u) {
-    cfg->resource_limit.shellcode_packets_per_sec = 2000u;
-  }
-  if (cfg->resource_limit.shellcode_packets_per_sec > 200000u) {
-    cfg->resource_limit.shellcode_packets_per_sec = 200000u;
-  }
-  if (cfg->resource_limit.low_priority_keep_percent_under_pressure > 100u) {
-    cfg->resource_limit.low_priority_keep_percent_under_pressure = 100u;
   }
   if (cfg->upload.batch_max_events == 0u) {
     cfg->upload.batch_max_events = 500u;
@@ -1606,18 +1258,6 @@ void edr_config_free_heap(EdrConfig *cfg) {
   free(cfg->attack_surface.high_risk_immediate_ports);
   cfg->attack_surface.high_risk_immediate_ports = NULL;
   cfg->attack_surface.high_risk_immediate_ports_count = 0;
-  if (cfg->shell.shell_allow) {
-    for (size_t i = 0; i < cfg->shell.shell_allow_count; i++) { free(cfg->shell.shell_allow[i]); }
-    free(cfg->shell.shell_allow);
-    cfg->shell.shell_allow = NULL;
-    cfg->shell.shell_allow_count = 0;
-  }
-  if (cfg->shell.shell_block) {
-    for (size_t i = 0; i < cfg->shell.shell_block_count; i++) { free(cfg->shell.shell_block[i]); }
-    free(cfg->shell.shell_block);
-    cfg->shell.shell_block = NULL;
-    cfg->shell.shell_block_count = 0;
-  }
 }
 
 void edr_config_apply_defaults(EdrConfig *cfg) {
@@ -1632,16 +1272,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.etw_enabled = true;
   cfg->collection.etw_tcpip_provider = true;
   cfg->collection.etw_firewall_provider = true;
-  cfg->collection.etw_dns_client_provider = true;
-  cfg->collection.etw_powershell_provider = true;
-  cfg->collection.etw_security_audit_provider = true;
-  cfg->collection.etw_wmi_provider = true;
-  cfg->collection.etw_service_control_manager_provider = true;
   cfg->collection.ebpf_enabled = true;
   cfg->collection.poll_interval_s = 1;
   cfg->collection.max_event_queue_size = 4096u;
-  cfg->collection.etw_buffer_kb = 0u;
-  cfg->collection.etw_flush_timer_s = 0u;
 
   cfg->preprocessing.dedup_window_s = 30u;
   cfg->preprocessing.high_freq_threshold = 100u;
@@ -1651,16 +1284,14 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   apply_builtin_preprocess_rules(cfg);
 
 #ifdef _WIN32
-  if (!edr_win_model_dir_next_to_exe(cfg->ave.model_dir, sizeof(cfg->ave.model_dir))) {
-    snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", EDR_WIN_FALLBACK_PROGRAMDATA_MODELS);
-  }
+  /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
+  snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "C:\\ProgramData\\EDR\\models");
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
-  cfg->ave.scan_threads = 1;
+  cfg->ave.scan_threads = 2;
   cfg->ave.max_file_size_mb = 256;
   snprintf(cfg->ave.sensitivity, sizeof(cfg->ave.sensitivity), "%s", "MEDIUM");
-  cfg->ave.enabled = false;
 #ifdef _WIN32
   cfg->ave.cert_whitelist_enabled = true;
 #else
@@ -1687,16 +1318,14 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
            "edr_queue.db");
   cfg->offline.max_queue_size_mb = 512u;
   cfg->offline.retention_hours = 72u;
+  snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
+           "local_evidence_cache.db");
+  cfg->offline.evidence_cache_max_size_mb = 128u;
+  cfg->offline.evidence_cache_retention_hours = 24u;
 
-  snprintf(cfg->resource_limit.profile, sizeof(cfg->resource_limit.profile), "%s", "workstation");
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
   cfg->resource_limit.emergency_cpu_limit = 5u;
-  cfg->resource_limit.ave_infer_per_min = 120u;
-  cfg->resource_limit.pmfe_scans_per_min = 3u;
-  cfg->resource_limit.webshell_scan_mb_per_min = 64u;
-  cfg->resource_limit.shellcode_packets_per_sec = 2000u;
-  cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
 
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s", "/var/log/edr");
@@ -1716,6 +1345,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.monitor_winrm = true;
   cfg->shellcode_detector.monitor_msrpc = true;
   cfg->shellcode_detector.monitor_ldap = true;
+  cfg->shellcode_detector.monitor_tls = true;
   cfg->shellcode_detector.detector_threads = 2u;
   cfg->shellcode_detector.yara_rules_dir[0] = '\0';
   cfg->shellcode_detector.forensic_dir[0] = '\0';
@@ -1742,37 +1372,6 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->webshell_detector.upload_timeout_s = 60u;
   cfg->webshell_detector.max_upload_size_mb = 10u;
 
-  cfg->detection.auto_profile = true;
-  cfg->detection.shellcode_mode = -1;
-  cfg->detection.webshell_mode = -1;
-  cfg->detection.pmfe_mode = 0;
-
-  cfg->pmfe.idle_scan_enabled = false;
-  cfg->pmfe.idle_scan_interval_min = 15u;
-  cfg->pmfe.idle_scan_max_procs = 8u;
-  cfg->pmfe.idle_cpu_threshold = 15.0;
-  cfg->pmfe.idle_skip_on_battery = true;
-
-  cfg->forensic_auto.enabled = false;
-  cfg->forensic_auto.cooldown_s = 30u;
-  cfg->forensic_auto.max_per_hour = 20u;
-  cfg->forensic_auto.max_concurrent = 2u;
-  cfg->forensic_auto.per_mitre_cooldown_s = 300u;
-  cfg->forensic_auto.mitre_trigger_count = 0u;
-  (void)memset(cfg->forensic_auto.trigger_mitre, 0, sizeof(cfg->forensic_auto.trigger_mitre));
-  cfg->forensic_auto.trigger_on_p0 = true;
-  cfg->forensic_auto.trigger_on_detection = true;
-  cfg->forensic_auto.collect_process_tree = true;
-  cfg->forensic_auto.collect_network_state = true;
-  cfg->forensic_auto.collect_autoruns = true;
-  cfg->forensic_auto.collector_timeout_s = 300u;
-  cfg->forensic_auto.collector_output_dir[0] = '\0';
-  cfg->forensic_auto.collector_upload_url[0] = '\0';
-
-  cfg->shell.max_sessions = 3u;
-  cfg->shell.session_timeout_s = 600u;
-  cfg->shell.max_output_per_command_kb = 1024u;
-
   cfg->fl.enabled = false;
   cfg->fl.coordinator_grpc_addr[0] = '\0';
   cfg->fl.coordinator_http_url[0] = '\0';
@@ -1792,17 +1391,16 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->fl.frozen_layer_count_static = 0;
   cfg->fl.frozen_layer_count_behavior = 0;
 
-  cfg->command.allow_dangerous = true;
+  cfg->command.allow_dangerous = false;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
 
   cfg->attack_surface.enabled = false;
-  /* min(port, service, policy, full) 驱动周期与 ETW/刷新 POST 共享间隔；默认 2h 降频 */
-  cfg->attack_surface.port_interval_s = 7200u;
+  cfg->attack_surface.port_interval_s = 300u;
   cfg->attack_surface.conn_interval_s = 300u;
-  cfg->attack_surface.service_interval_s = 7200u;
-  cfg->attack_surface.policy_interval_s = 7200u;
-  cfg->attack_surface.full_snapshot_interval_s = 7200u;
+  cfg->attack_surface.service_interval_s = 600u;
+  cfg->attack_surface.policy_interval_s = 3600u;
+  cfg->attack_surface.full_snapshot_interval_s = 1800u;
   cfg->attack_surface.outbound_top_n = 128u;
   cfg->attack_surface.egress_top_n = 32u;
   cfg->attack_surface.outbound_exclude_loopback = true;
@@ -1819,172 +1417,6 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->self_protect.job_object_windows = false;
   cfg->self_protect.watchdog_log_interval_s = 0u;
   cfg->self_protect.event_bus_pressure_warn_pct = 90u;
-
-  cfg->remote.rules_url[0] = '\0';
-  cfg->remote.p0_bundle_url[0] = '\0';
-  cfg->remote.poll_interval_s = 0;
-  cfg->remote.version_url[0] = '\0';
-  cfg->remote.download_url[0] = '\0';
-  cfg->remote.auto_update = false;
-}
-
-static void load_detection(toml_table_t *t, EdrConfig *cfg) {
-  {
-    toml_datum_t d = toml_bool_in(t, "auto_profile");
-    if (d.ok) { cfg->detection.auto_profile = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "shellcode_mode");
-    if (d.ok) { cfg->detection.shellcode_mode = (int)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "webshell_mode");
-    if (d.ok) { cfg->detection.webshell_mode = (int)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "pmfe_mode");
-    if (d.ok) { cfg->detection.pmfe_mode = (int)d.u.i; }
-  }
-}
-
-static void load_pmfe(toml_table_t *t, EdrConfig *cfg) {
-  {
-    toml_datum_t d = toml_bool_in(t, "idle_scan_enabled");
-    if (d.ok) { cfg->pmfe.idle_scan_enabled = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "idle_scan_interval_min");
-    if (d.ok && d.u.i >= 5 && d.u.i <= 1440) { cfg->pmfe.idle_scan_interval_min = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "idle_scan_max_procs");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 64) { cfg->pmfe.idle_scan_max_procs = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_double_in(t, "idle_cpu_threshold");
-    if (d.ok && d.u.d >= 1.0 && d.u.d <= 90.0) { cfg->pmfe.idle_cpu_threshold = d.u.d; }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "idle_skip_on_battery");
-    if (d.ok) { cfg->pmfe.idle_skip_on_battery = d.u.b ? true : false; }
-  }
-}
-
-static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
-  {
-    toml_datum_t d = toml_bool_in(t, "enabled");
-    if (d.ok) { cfg->forensic_auto.enabled = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "cooldown_s");
-    if (d.ok && d.u.i >= 5 && d.u.i <= 600) { cfg->forensic_auto.cooldown_s = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "max_per_hour");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 60) { cfg->forensic_auto.max_per_hour = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "max_concurrent");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 8) { cfg->forensic_auto.max_concurrent = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "per_mitre_cooldown_s");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 3600) { cfg->forensic_auto.per_mitre_cooldown_s = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "trigger_on_p0");
-    if (d.ok) { cfg->forensic_auto.trigger_on_p0 = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "trigger_on_detection");
-    if (d.ok) { cfg->forensic_auto.trigger_on_detection = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "collect_process_tree");
-    if (d.ok) { cfg->forensic_auto.collect_process_tree = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "collect_network_state");
-    if (d.ok) { cfg->forensic_auto.collect_network_state = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_bool_in(t, "collect_autoruns");
-    if (d.ok) { cfg->forensic_auto.collect_autoruns = d.u.b ? true : false; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "collector_timeout_s");
-    if (d.ok && d.u.i >= 30 && d.u.i <= 3600) { cfg->forensic_auto.collector_timeout_s = (uint32_t)d.u.i; }
-  }
-  take_string(toml_string_in(t, "collector_output_dir"),
-              cfg->forensic_auto.collector_output_dir,
-              sizeof(cfg->forensic_auto.collector_output_dir));
-  take_string(toml_string_in(t, "collector_upload_url"),
-              cfg->forensic_auto.collector_upload_url,
-              sizeof(cfg->forensic_auto.collector_upload_url));
-  {
-    toml_array_t *arr = toml_array_in(t, "trigger_on_mitre");
-    if (arr) {
-      int n = toml_array_nelem(arr);
-      if (n > 16) n = 16;
-      cfg->forensic_auto.mitre_trigger_count = 0u;
-      for (int i = 0; i < n; i++) {
-        toml_datum_t d = toml_string_at(arr, i);
-        if (d.ok) {
-          strncpy(cfg->forensic_auto.trigger_mitre[i], d.u.s, 15);
-          cfg->forensic_auto.trigger_mitre[i][15] = '\0';
-          cfg->forensic_auto.mitre_trigger_count++;
-          free(d.u.s);
-        }
-      }
-    }
-  }
-}
-
-static void load_shell(toml_table_t *t, EdrConfig *cfg) {
-  {
-    toml_datum_t d = toml_int_in(t, "max_sessions");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 10) { cfg->shell.max_sessions = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "session_timeout_s");
-    if (d.ok && d.u.i >= 30 && d.u.i <= 3600) { cfg->shell.session_timeout_s = (uint32_t)d.u.i; }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "max_output_per_command_kb");
-    if (d.ok && d.u.i >= 64 && d.u.i <= 4096) { cfg->shell.max_output_per_command_kb = (uint32_t)d.u.i; }
-  }
-
-  toml_array_t *allow = toml_array_in(t, "allow");
-  if (allow) {
-    int n = toml_array_nelem(allow);
-    if (n > 0) {
-      cfg->shell.shell_allow = (char **)calloc((size_t)n, sizeof(char *));
-      cfg->shell.shell_allow_count = 0;
-      for (int i = 0; i < n; i++) {
-        toml_datum_t d = toml_string_at(allow, i);
-        if (d.ok && d.u.s) {
-          cfg->shell.shell_allow[cfg->shell.shell_allow_count++] = strdup(d.u.s);
-          free(d.u.s);
-        }
-      }
-    }
-  }
-
-  toml_array_t *block = toml_array_in(t, "block");
-  if (block) {
-    int n = toml_array_nelem(block);
-    if (n > 0) {
-      cfg->shell.shell_block = (char **)calloc((size_t)n, sizeof(char *));
-      cfg->shell.shell_block_count = 0;
-      for (int i = 0; i < n; i++) {
-        toml_datum_t d = toml_string_at(block, i);
-        if (d.ok && d.u.s) {
-          cfg->shell.shell_block[cfg->shell.shell_block_count++] = strdup(d.u.s);
-          free(d.u.s);
-        }
-      }
-    }
-  }
 }
 
 static void load_command(toml_table_t *t, EdrConfig *cfg) {
@@ -2001,27 +1433,6 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.rest_user_id));
   take_string(toml_string_in(t, "rest_bearer_token"), cfg->platform.rest_bearer_token,
               sizeof(cfg->platform.rest_bearer_token));
-}
-
-static void load_remote(toml_table_t *t, EdrConfig *cfg) {
-  take_string(toml_string_in(t, "rules_url"), cfg->remote.rules_url,
-              sizeof(cfg->remote.rules_url));
-  take_string(toml_string_in(t, "p0_bundle_url"), cfg->remote.p0_bundle_url,
-              sizeof(cfg->remote.p0_bundle_url));
-  take_string(toml_string_in(t, "version_url"), cfg->remote.version_url,
-              sizeof(cfg->remote.version_url));
-  take_string(toml_string_in(t, "download_url"), cfg->remote.download_url,
-              sizeof(cfg->remote.download_url));
-  toml_datum_t d = toml_int_in(t, "poll_interval_s");
-  if (d.ok && d.u.i >= 5 && d.u.i <= 86400) {
-    cfg->remote.poll_interval_s = (int)d.u.i;
-  }
-  {
-    toml_datum_t b = toml_bool_in(t, "auto_update");
-    if (b.ok) {
-      cfg->remote.auto_update = b.u.b ? true : false;
-    }
-  }
 }
 
 /** 解析 `[fl] coordinator_secp256r1_pubkey_hex` → SEC1 点（33 或 65 字节） */
@@ -2352,12 +1763,6 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 #ifdef _WIN32
     edr_win_listen_apply_config(cfg);
 #endif
-    fprintf(stderr,
-            "[config] no TOML file (--config not set); using built-in defaults (server.address=%s). "
-            "Install: use --config with agent.toml next to edr_agent.exe.\n",
-            cfg->server.address);
-    edr_config_log_semantic_warnings(cfg);
-    edr_shell_load_policy(NULL, NULL);
     return EDR_OK;
   }
 
@@ -2396,13 +1801,9 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
       load_collection(t, cfg);
     }
   }
-  int has_user_preprocess_rules = 0;
   {
     toml_table_t *t = toml_table_in(root, "preprocessing");
     if (t) {
-      if (toml_array_in(t, "rules")) {
-        has_user_preprocess_rules = 1;
-      }
       load_preprocessing(t, cfg);
     }
   }
@@ -2473,56 +1874,17 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
-    toml_table_t *t = toml_table_in(root, "detection");
-    if (t) {
-      load_detection(t, cfg);
-    }
-  }
-  {
-    toml_table_t *t = toml_table_in(root, "pmfe");
-    if (t) {
-      load_pmfe(t, cfg);
-    }
-  }
-  {
-    toml_table_t *t = toml_table_in(root, "forensic_auto");
-    if (t) {
-      load_forensic_auto(t, cfg);
-    }
-  }
-  {
-    toml_table_t *t = toml_table_in(root, "shell");
-    if (t) {
-      load_shell(t, cfg);
-    }
-  }
-  {
     toml_table_t *t = toml_table_in(root, "fl");
     if (t) {
       load_fl(t, cfg);
     }
   }
-  {
-    toml_table_t *t = toml_table_in(root, "remote");
-    if (t) {
-      load_remote(t, cfg);
-    }
-  }
 
   toml_free(root);
-  try_auto_load_preprocess_rules_bundle(path, has_user_preprocess_rules, cfg);
-#ifdef _WIN32
-  edr_config_win_fixup_model_dir_from_unix_example(cfg);
-#endif
-  edr_detection_apply_profile(cfg);
   edr_config_clamp(cfg);
-  edr_config_log_semantic_warnings(cfg);
 #ifdef _WIN32
   edr_win_listen_apply_config(cfg);
 #endif
-  edr_shell_load_policy(
-    (const char **)cfg->shell.shell_allow,
-    (const char **)cfg->shell.shell_block);
   return EDR_OK;
 }
 

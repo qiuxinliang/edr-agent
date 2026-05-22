@@ -72,6 +72,16 @@ class EventIngest final {
     std::unique_ptr< ::grpc::ClientAsyncWriterInterface< ::edr::v1::FileChunk>> PrepareAsyncUploadFile(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncWriterInterface< ::edr::v1::FileChunk>>(PrepareAsyncUploadFileRaw(context, response, cq));
     }
+    // P2 RTR/RTQ 长会话：服务端下发 CommandEnvelope，Agent 同流回传心跳/结果分片。
+    std::unique_ptr< ::grpc::ClientReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>> ControlStream(::grpc::ClientContext* context) {
+      return std::unique_ptr< ::grpc::ClientReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>>(ControlStreamRaw(context));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>> AsyncControlStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>>(AsyncControlStreamRaw(context, cq, tag));
+    }
+    std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>> PrepareAsyncControlStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>>(PrepareAsyncControlStreamRaw(context, cq));
+    }
     class async_interface {
      public:
       virtual ~async_interface() {}
@@ -81,6 +91,8 @@ class EventIngest final {
       virtual void ReportCommandResult(::grpc::ClientContext* context, const ::edr::v1::ReportCommandResultRequest* request, ::edr::v1::ReportCommandResultResponse* response, std::function<void(::grpc::Status)>) = 0;
       virtual void ReportCommandResult(::grpc::ClientContext* context, const ::edr::v1::ReportCommandResultRequest* request, ::edr::v1::ReportCommandResultResponse* response, ::grpc::ClientUnaryReactor* reactor) = 0;
       virtual void UploadFile(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::ClientWriteReactor< ::edr::v1::FileChunk>* reactor) = 0;
+      // P2 RTR/RTQ 长会话：服务端下发 CommandEnvelope，Agent 同流回传心跳/结果分片。
+      virtual void ControlStream(::grpc::ClientContext* context, ::grpc::ClientBidiReactor< ::edr::v1::CommandEnvelope,::edr::v1::CommandEnvelope>* reactor) = 0;
     };
     typedef class async_interface experimental_async_interface;
     virtual class async_interface* async() { return nullptr; }
@@ -96,6 +108,9 @@ class EventIngest final {
     virtual ::grpc::ClientWriterInterface< ::edr::v1::FileChunk>* UploadFileRaw(::grpc::ClientContext* context, ::edr::v1::UploadResult* response) = 0;
     virtual ::grpc::ClientAsyncWriterInterface< ::edr::v1::FileChunk>* AsyncUploadFileRaw(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::CompletionQueue* cq, void* tag) = 0;
     virtual ::grpc::ClientAsyncWriterInterface< ::edr::v1::FileChunk>* PrepareAsyncUploadFileRaw(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::CompletionQueue* cq) = 0;
+    virtual ::grpc::ClientReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* ControlStreamRaw(::grpc::ClientContext* context) = 0;
+    virtual ::grpc::ClientAsyncReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* AsyncControlStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) = 0;
+    virtual ::grpc::ClientAsyncReaderWriterInterface< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* PrepareAsyncControlStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) = 0;
   };
   class Stub final : public StubInterface {
    public:
@@ -132,6 +147,15 @@ class EventIngest final {
     std::unique_ptr< ::grpc::ClientAsyncWriter< ::edr::v1::FileChunk>> PrepareAsyncUploadFile(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::CompletionQueue* cq) {
       return std::unique_ptr< ::grpc::ClientAsyncWriter< ::edr::v1::FileChunk>>(PrepareAsyncUploadFileRaw(context, response, cq));
     }
+    std::unique_ptr< ::grpc::ClientReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>> ControlStream(::grpc::ClientContext* context) {
+      return std::unique_ptr< ::grpc::ClientReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>>(ControlStreamRaw(context));
+    }
+    std::unique_ptr<  ::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>> AsyncControlStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>>(AsyncControlStreamRaw(context, cq, tag));
+    }
+    std::unique_ptr<  ::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>> PrepareAsyncControlStream(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) {
+      return std::unique_ptr< ::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>>(PrepareAsyncControlStreamRaw(context, cq));
+    }
     class async final :
       public StubInterface::async_interface {
      public:
@@ -141,6 +165,7 @@ class EventIngest final {
       void ReportCommandResult(::grpc::ClientContext* context, const ::edr::v1::ReportCommandResultRequest* request, ::edr::v1::ReportCommandResultResponse* response, std::function<void(::grpc::Status)>) override;
       void ReportCommandResult(::grpc::ClientContext* context, const ::edr::v1::ReportCommandResultRequest* request, ::edr::v1::ReportCommandResultResponse* response, ::grpc::ClientUnaryReactor* reactor) override;
       void UploadFile(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::ClientWriteReactor< ::edr::v1::FileChunk>* reactor) override;
+      void ControlStream(::grpc::ClientContext* context, ::grpc::ClientBidiReactor< ::edr::v1::CommandEnvelope,::edr::v1::CommandEnvelope>* reactor) override;
      private:
       friend class Stub;
       explicit async(Stub* stub): stub_(stub) { }
@@ -162,10 +187,14 @@ class EventIngest final {
     ::grpc::ClientWriter< ::edr::v1::FileChunk>* UploadFileRaw(::grpc::ClientContext* context, ::edr::v1::UploadResult* response) override;
     ::grpc::ClientAsyncWriter< ::edr::v1::FileChunk>* AsyncUploadFileRaw(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::CompletionQueue* cq, void* tag) override;
     ::grpc::ClientAsyncWriter< ::edr::v1::FileChunk>* PrepareAsyncUploadFileRaw(::grpc::ClientContext* context, ::edr::v1::UploadResult* response, ::grpc::CompletionQueue* cq) override;
+    ::grpc::ClientReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* ControlStreamRaw(::grpc::ClientContext* context) override;
+    ::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* AsyncControlStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) override;
+    ::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* PrepareAsyncControlStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) override;
     const ::grpc::internal::RpcMethod rpcmethod_ReportEvents_;
     const ::grpc::internal::RpcMethod rpcmethod_Subscribe_;
     const ::grpc::internal::RpcMethod rpcmethod_ReportCommandResult_;
     const ::grpc::internal::RpcMethod rpcmethod_UploadFile_;
+    const ::grpc::internal::RpcMethod rpcmethod_ControlStream_;
   };
   static std::unique_ptr<Stub> NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options = ::grpc::StubOptions());
 
@@ -177,6 +206,8 @@ class EventIngest final {
     virtual ::grpc::Status Subscribe(::grpc::ServerContext* context, const ::edr::v1::SubscribeRequest* request, ::grpc::ServerWriter< ::edr::v1::CommandEnvelope>* writer);
     virtual ::grpc::Status ReportCommandResult(::grpc::ServerContext* context, const ::edr::v1::ReportCommandResultRequest* request, ::edr::v1::ReportCommandResultResponse* response);
     virtual ::grpc::Status UploadFile(::grpc::ServerContext* context, ::grpc::ServerReader< ::edr::v1::FileChunk>* reader, ::edr::v1::UploadResult* response);
+    // P2 RTR/RTQ 长会话：服务端下发 CommandEnvelope，Agent 同流回传心跳/结果分片。
+    virtual ::grpc::Status ControlStream(::grpc::ServerContext* context, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* stream);
   };
   template <class BaseClass>
   class WithAsyncMethod_ReportEvents : public BaseClass {
@@ -258,7 +289,27 @@ class EventIngest final {
       ::grpc::Service::RequestAsyncClientStreaming(3, context, reader, new_call_cq, notification_cq, tag);
     }
   };
-  typedef WithAsyncMethod_ReportEvents<WithAsyncMethod_Subscribe<WithAsyncMethod_ReportCommandResult<WithAsyncMethod_UploadFile<Service > > > > AsyncService;
+  template <class BaseClass>
+  class WithAsyncMethod_ControlStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithAsyncMethod_ControlStream() {
+      ::grpc::Service::MarkMethodAsync(4);
+    }
+    ~WithAsyncMethod_ControlStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status ControlStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestControlStream(::grpc::ServerContext* context, ::grpc::ServerAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* stream, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncBidiStreaming(4, context, stream, new_call_cq, notification_cq, tag);
+    }
+  };
+  typedef WithAsyncMethod_ReportEvents<WithAsyncMethod_Subscribe<WithAsyncMethod_ReportCommandResult<WithAsyncMethod_UploadFile<WithAsyncMethod_ControlStream<Service > > > > > AsyncService;
   template <class BaseClass>
   class WithCallbackMethod_ReportEvents : public BaseClass {
    private:
@@ -357,7 +408,30 @@ class EventIngest final {
     virtual ::grpc::ServerReadReactor< ::edr::v1::FileChunk>* UploadFile(
       ::grpc::CallbackServerContext* /*context*/, ::edr::v1::UploadResult* /*response*/)  { return nullptr; }
   };
-  typedef WithCallbackMethod_ReportEvents<WithCallbackMethod_Subscribe<WithCallbackMethod_ReportCommandResult<WithCallbackMethod_UploadFile<Service > > > > CallbackService;
+  template <class BaseClass>
+  class WithCallbackMethod_ControlStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithCallbackMethod_ControlStream() {
+      ::grpc::Service::MarkMethodCallback(4,
+          new ::grpc::internal::CallbackBidiHandler< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>(
+            [this](
+                   ::grpc::CallbackServerContext* context) { return this->ControlStream(context); }));
+    }
+    ~WithCallbackMethod_ControlStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status ControlStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerBidiReactor< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* ControlStream(
+      ::grpc::CallbackServerContext* /*context*/)
+      { return nullptr; }
+  };
+  typedef WithCallbackMethod_ReportEvents<WithCallbackMethod_Subscribe<WithCallbackMethod_ReportCommandResult<WithCallbackMethod_UploadFile<WithCallbackMethod_ControlStream<Service > > > > > CallbackService;
   typedef CallbackService ExperimentalCallbackService;
   template <class BaseClass>
   class WithGenericMethod_ReportEvents : public BaseClass {
@@ -423,6 +497,23 @@ class EventIngest final {
     }
     // disable synchronous version of this method
     ::grpc::Status UploadFile(::grpc::ServerContext* /*context*/, ::grpc::ServerReader< ::edr::v1::FileChunk>* /*reader*/, ::edr::v1::UploadResult* /*response*/) override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+  };
+  template <class BaseClass>
+  class WithGenericMethod_ControlStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithGenericMethod_ControlStream() {
+      ::grpc::Service::MarkMethodGeneric(4);
+    }
+    ~WithGenericMethod_ControlStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status ControlStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* /*stream*/)  override {
       abort();
       return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
     }
@@ -505,6 +596,26 @@ class EventIngest final {
     }
     void RequestUploadFile(::grpc::ServerContext* context, ::grpc::ServerAsyncReader< ::grpc::ByteBuffer, ::grpc::ByteBuffer>* reader, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
       ::grpc::Service::RequestAsyncClientStreaming(3, context, reader, new_call_cq, notification_cq, tag);
+    }
+  };
+  template <class BaseClass>
+  class WithRawMethod_ControlStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawMethod_ControlStream() {
+      ::grpc::Service::MarkMethodRaw(4);
+    }
+    ~WithRawMethod_ControlStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status ControlStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    void RequestControlStream(::grpc::ServerContext* context, ::grpc::ServerAsyncReaderWriter< ::grpc::ByteBuffer, ::grpc::ByteBuffer>* stream, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
+      ::grpc::Service::RequestAsyncBidiStreaming(4, context, stream, new_call_cq, notification_cq, tag);
     }
   };
   template <class BaseClass>
@@ -594,6 +705,29 @@ class EventIngest final {
     }
     virtual ::grpc::ServerReadReactor< ::grpc::ByteBuffer>* UploadFile(
       ::grpc::CallbackServerContext* /*context*/, ::grpc::ByteBuffer* /*response*/)  { return nullptr; }
+  };
+  template <class BaseClass>
+  class WithRawCallbackMethod_ControlStream : public BaseClass {
+   private:
+    void BaseClassMustBeDerivedFromService(const Service* /*service*/) {}
+   public:
+    WithRawCallbackMethod_ControlStream() {
+      ::grpc::Service::MarkMethodRawCallback(4,
+          new ::grpc::internal::CallbackBidiHandler< ::grpc::ByteBuffer, ::grpc::ByteBuffer>(
+            [this](
+                   ::grpc::CallbackServerContext* context) { return this->ControlStream(context); }));
+    }
+    ~WithRawCallbackMethod_ControlStream() override {
+      BaseClassMustBeDerivedFromService(this);
+    }
+    // disable synchronous version of this method
+    ::grpc::Status ControlStream(::grpc::ServerContext* /*context*/, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* /*stream*/)  override {
+      abort();
+      return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    virtual ::grpc::ServerBidiReactor< ::grpc::ByteBuffer, ::grpc::ByteBuffer>* ControlStream(
+      ::grpc::CallbackServerContext* /*context*/)
+      { return nullptr; }
   };
   template <class BaseClass>
   class WithStreamedUnaryMethod_ReportEvents : public BaseClass {

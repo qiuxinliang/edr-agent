@@ -1,10 +1,7 @@
 /* gRPC 占位：无 libgRPC 或未链接 impl 时使用；SOAR ReportCommandResult 等 RPC 恒失败（-1），见 docs/SOAR_CONTRACT.md §5.1 */
 #include "edr/grpc_client.h"
-#include "edr/ingest_http.h"
 
 #include "edr/config.h"
-
-#include <stdio.h>
 
 void edr_grpc_client_init(const EdrConfig *cfg) { (void)cfg; }
 
@@ -16,6 +13,20 @@ int edr_grpc_client_reconnect_to_target(const char *target) {
 }
 
 int edr_grpc_client_ready(void) { return 0; }
+
+void edr_grpc_client_get_runtime(EdrGrpcClientRuntime *out) {
+  if (!out) {
+    return;
+  }
+  out->ready = 0;
+  out->insecure = 0;
+  out->report_fail_streak = 0;
+  out->rpc_ok = 0;
+  out->rpc_fail = 0;
+  out->last_success_unix_ms = 0;
+  out->last_failure_unix_ms = 0;
+  out->last_error[0] = '\0';
+}
 
 int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *header12, size_t header_len,
                                const uint8_t *payload, size_t payload_len) {
@@ -31,26 +42,6 @@ unsigned long edr_grpc_client_rpc_ok(void) { return 0UL; }
 
 unsigned long edr_grpc_client_rpc_fail(void) { return 0UL; }
 
-unsigned long edr_grpc_client_report_fail_streak(void) { return 0UL; }
-
-uint64_t edr_grpc_client_last_success_ms(void) { return 0ULL; }
-
-uint64_t edr_grpc_client_last_failure_ms(void) { return 0ULL; }
-
-void edr_grpc_client_last_failure_reason(char *buf, size_t cap) {
-  if (buf && cap > 0u) {
-    buf[0] = '\0';
-  }
-}
-
-void edr_grpc_client_diag(char *buf, size_t cap) {
-  if (!buf || cap == 0u) {
-    return;
-  }
-  snprintf(buf, cap, "%s",
-           "stub_no_grpc(EDR_WITH_GRPC=OFF; use HTTP ingest or rebuild with gRPC)");
-}
-
 int edr_grpc_client_report_command_result(const char *command_id,
                                           const struct EdrSoarCommandMeta *meta, int execution_status,
                                           int exit_code, const char *detail_utf8) {
@@ -65,12 +56,10 @@ int edr_grpc_client_report_command_result(const char *command_id,
 int edr_grpc_client_upload_file(const char *alert_id, const char *file_path, const char *sha256_hex,
                                 char *out_minio_key, size_t out_minio_key_cap) {
   (void)alert_id;
+  (void)file_path;
+  (void)sha256_hex;
   if (out_minio_key && out_minio_key_cap > 0u) {
     out_minio_key[0] = '\0';
   }
-  if (file_path && file_path[0] && edr_ingest_http_configured()) {
-    return edr_ingest_http_upload_file_multipart(NULL, file_path, sha256_hex, out_minio_key, out_minio_key_cap);
-  }
-  (void)sha256_hex;
   return -1;
 }

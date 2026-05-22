@@ -2,11 +2,11 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #ifdef EDR_HAVE_YARA
-#include <stdlib.h>
 #include <yara.h>
 #if defined(_WIN32)
 #include <windows.h>
@@ -16,6 +16,60 @@
 #endif
 
 #define EDR_RULE_NAME_MAX 96u
+
+static EdrShellcodeRulesStatus s_rules_status = {
+    "builtin", "builtin-embedded", "", 0u, 0u, 0, 0u, 0, 0, "", 0u, 0u, 0u, 0u, "", ""};
+
+static unsigned long env_ulong(const char *name, unsigned long defv, unsigned long maxv) {
+  const char *s = getenv(name);
+  if (!s || !s[0]) {
+    return defv;
+  }
+  char *end = NULL;
+  unsigned long v = strtoul(s, &end, 10);
+  if (end == s) {
+    return defv;
+  }
+  return v > maxv ? maxv : v;
+}
+
+static void refresh_ops_policy(void) {
+  s_rules_status.gray_percent = (uint32_t)env_ulong("EDR_SHELLCODE_RULES_GRAY_PERCENT", s_rules_status.gray_percent, 100u);
+  const char *rb = getenv("EDR_SHELLCODE_RULES_ROLLBACK_VERSION");
+  if (rb && rb[0]) {
+    snprintf(s_rules_status.rollback_version, sizeof(s_rules_status.rollback_version), "%s", rb);
+    s_rules_status.rollback_available = 1;
+  }
+  const char *ra = getenv("EDR_SHELLCODE_RULES_ROLLBACK");
+  s_rules_status.rollback_active = (ra && ra[0] == '1') ? 1 : 0;
+}
+
+static uint32_t stable_bucket(const char *s) {
+  uint32_t h = 2166136261u;
+  if (!s) {
+    s = "";
+  }
+  for (; *s; s++) {
+    h ^= (unsigned char)*s;
+    h *= 16777619u;
+  }
+  return h % 100u;
+}
+
+static void note_match(const char *source, const char *rule) {
+  refresh_ops_policy();
+  s_rules_status.matches_total++;
+  if (source && strcmp(source, "yara") == 0) {
+    s_rules_status.yara_matches++;
+  } else {
+    s_rules_status.builtin_matches++;
+  }
+  snprintf(s_rules_status.last_match_source, sizeof(s_rules_status.last_match_source), "%s", source ? source : "");
+  snprintf(s_rules_status.last_match_rule, sizeof(s_rules_status.last_match_rule), "%s", rule ? rule : "");
+  if (s_rules_status.gray_percent > 0u && stable_bucket(rule) < s_rules_status.gray_percent) {
+    s_rules_status.gray_shadow_matches++;
+  }
+}
 
 #ifdef EDR_HAVE_YARA
 typedef struct {
@@ -104,7 +158,76 @@ static int match_msrpc_printnightmare(const uint8_t *data, uint32_t len) {
              : 0;
 }
 
+static int match_smb3_smbghost(const uint8_t *data, uint32_t len) {
+  static const uint8_t kCompressedSmb3[] = {0xFCu, 0x53u, 0x4Du, 0x42u};
+  static const uint8_t kInvalidOriginalSize[] = {0xFFu, 0xFFu, 0xFFu, 0xFFu};
+  static const uint8_t kLargeOffset[] = {0x00u, 0x10u, 0x00u, 0x00u};
+  return (has_subseq(data, len, kCompressedSmb3, sizeof(kCompressedSmb3)) &&
+          (has_subseq(data, len, kInvalidOriginalSize, sizeof(kInvalidOriginalSize)) ||
+           has_subseq(data, len, kLargeOffset, sizeof(kLargeOffset))) &&
+          (has_run(data, len, 0x41u, 24u) || has_run(data, len, 0x90u, 16u)))
+             ? 1
+             : 0;
+}
+
+static int match_http_reflective_loader_stager(const uint8_t *data, uint32_t len) {
+  return ((has_ascii(data, len, "ReflectiveLoader") || has_ascii(data, len, "beacon.x64") ||
+           has_ascii(data, len, "beacon.x86") || has_ascii(data, len, "metsrv.dll")) &&
+          (has_ascii(data, len, "MZ") || has_run(data, len, 0x90u, 16u)))
+             ? 1
+             : 0;
+}
+
+static int match_ms17_010_doublepulsar_ping(const uint8_t *data, uint32_t len) {
+  static const uint8_t kTrans2SessionSetup[] = {0x32u, 0x00u, 0x00u, 0x00u};
+  static const uint8_t kMultiplexId[] = {0x51u, 0x00u};
+  return (has_subseq(data, len, kTrans2SessionSetup, sizeof(kTrans2SessionSetup)) &&
+          has_subseq(data, len, kMultiplexId, sizeof(kMultiplexId)) && has_run(data, len, 0x00u, 24u))
+             ? 1
+             : 0;
+}
+
 #ifdef EDR_HAVE_YARA
+static void status_set_error(const char *msg) {
+  snprintf(s_rules_status.last_error, sizeof(s_rules_status.last_error), "%s", msg ? msg : "");
+}
+
+static void read_rules_version(const char *rules_dir, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  const char *env = getenv("EDR_SHELLCODE_YARA_RULES_VERSION");
+  if (env && env[0]) {
+    snprintf(out, cap, "%s", env);
+    return;
+  }
+  if (!rules_dir || !rules_dir[0]) {
+    return;
+  }
+  char path[1024];
+#if defined(_WIN32)
+  snprintf(path, sizeof(path), "%s\\VERSION", rules_dir);
+#else
+  snprintf(path, sizeof(path), "%s/VERSION", rules_dir);
+#endif
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    return;
+  }
+  if (fgets(out, (int)cap, fp) == NULL) {
+    out[0] = '\0';
+  }
+  fclose(fp);
+  out[cap - 1u] = '\0';
+  for (size_t i = 0; out[i]; i++) {
+    if (out[i] == '\r' || out[i] == '\n') {
+      out[i] = '\0';
+      break;
+    }
+  }
+}
+
 static int is_rule_file_path(const char *path) {
   const char *dot = strrchr(path, '.');
   if (!dot) {
@@ -114,7 +237,7 @@ static int is_rule_file_path(const char *path) {
 }
 
 static void compiler_error_cb(int err_level, const char *file_name, int line_number, const YR_RULE *rule,
-                             const char *message, void *user_data) {
+                              const char *message, void *user_data) {
   (void)err_level;
   (void)rule;
   (void)user_data;
@@ -122,8 +245,12 @@ static void compiler_error_cb(int err_level, const char *file_name, int line_num
           file_name ? file_name : "-", line_number, message ? message : "-");
 }
 
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
 static int scan_cb(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
   (void)context;
+#else
+static int scan_cb(int message, void *message_data, void *user_data) {
+#endif
   YaraScanResult *res = (YaraScanResult *)user_data;
   if (!res) {
     return CALLBACK_CONTINUE;
@@ -233,26 +360,49 @@ static int shellcode_yara_replace_rules(const char *rules_dir) {
 #endif
 
 int edr_shellcode_known_init(const char *rules_dir) {
+  memset(&s_rules_status, 0, sizeof(s_rules_status));
+  snprintf(s_rules_status.source, sizeof(s_rules_status.source), "%s", "builtin");
+  snprintf(s_rules_status.version, sizeof(s_rules_status.version), "%s", "builtin-embedded");
+  refresh_ops_policy();
+  if (s_rules_status.rollback_active) {
+    if (s_rules_status.rollback_version[0]) {
+      snprintf(s_rules_status.version, sizeof(s_rules_status.version), "%s", s_rules_status.rollback_version);
+    }
+    snprintf(s_rules_status.last_error, sizeof(s_rules_status.last_error), "%s", "rules_rollback_active");
+    return 0;
+  }
 #ifdef EDR_HAVE_YARA
   if (!rules_dir || !rules_dir[0]) {
     return 0;
   }
+  s_rules_status.yara_enabled = 1;
   if (!s_yara_initialized) {
     if (yr_initialize() != ERROR_SUCCESS) {
       fprintf(stderr, "[shellcode_detector] yara initialize failed, fallback to builtin matcher\n");
+      status_set_error("yara_initialize_failed");
       return -1;
     }
     s_yara_initialized = 1;
   }
   int loaded = shellcode_yara_replace_rules(rules_dir);
   if (loaded < 0) {
+    status_set_error("yara_compile_failed");
     return -1;
   }
   if (loaded == 0) {
     fprintf(stderr, "[shellcode_detector] no yara rules loaded from %s, fallback to builtin matcher\n", rules_dir);
+    status_set_error("no_yara_rules_loaded");
     return 0;
   }
   s_yara_last_reload_unix_s = (uint64_t)time(NULL);
+  snprintf(s_rules_status.source, sizeof(s_rules_status.source), "%s", "yara");
+  read_rules_version(rules_dir, s_rules_status.version, sizeof(s_rules_status.version));
+  if (!s_rules_status.version[0]) {
+    snprintf(s_rules_status.version, sizeof(s_rules_status.version), "yara-files-%d", loaded);
+  }
+  s_rules_status.files_loaded = (uint32_t)loaded;
+  s_rules_status.last_reload_unix_s = s_yara_last_reload_unix_s;
+  status_set_error("");
   fprintf(stderr, "[shellcode_detector] yara rules loaded=%d dir=%s\n", loaded, rules_dir);
 #else
   (void)rules_dir;
@@ -261,6 +411,10 @@ int edr_shellcode_known_init(const char *rules_dir) {
 }
 
 void edr_shellcode_known_reload_periodic(const char *rules_dir, uint32_t interval_s) {
+  refresh_ops_policy();
+  if (s_rules_status.rollback_active) {
+    return;
+  }
 #ifdef EDR_HAVE_YARA
   if (!rules_dir || !rules_dir[0] || interval_s == 0u || !s_yara_initialized) {
     return;
@@ -272,12 +426,30 @@ void edr_shellcode_known_reload_periodic(const char *rules_dir, uint32_t interva
   int loaded = shellcode_yara_replace_rules(rules_dir);
   if (loaded > 0) {
     s_yara_last_reload_unix_s = now;
+    snprintf(s_rules_status.source, sizeof(s_rules_status.source), "%s", "yara");
+    read_rules_version(rules_dir, s_rules_status.version, sizeof(s_rules_status.version));
+    if (!s_rules_status.version[0]) {
+      snprintf(s_rules_status.version, sizeof(s_rules_status.version), "yara-files-%d", loaded);
+    }
+    s_rules_status.files_loaded = (uint32_t)loaded;
+    s_rules_status.last_reload_unix_s = now;
+    status_set_error("");
     fprintf(stderr, "[shellcode_detector] yara rules hot-reloaded files=%d\n", loaded);
+  } else if (loaded < 0) {
+    status_set_error("hot_reload_compile_failed");
   }
 #else
   (void)rules_dir;
   (void)interval_s;
 #endif
+}
+
+void edr_shellcode_known_get_status(EdrShellcodeRulesStatus *out) {
+  if (!out) {
+    return;
+  }
+  refresh_ops_policy();
+  *out = s_rules_status;
 }
 
 void edr_shellcode_known_shutdown(void) {
@@ -306,6 +478,7 @@ int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProt
     memset(&res, 0, sizeof(res));
     if (yr_rules_scan_mem(s_yara_rules, data, len, 0, scan_cb, &res, 0) == ERROR_SUCCESS && res.matched) {
       set_rule_name(rule_name_out, rule_name_cap, res.first_rule);
+      note_match("yara", res.first_rule);
       return 1;
     }
   }
@@ -313,14 +486,32 @@ int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProt
 
   if (kind == EDR_PROTO_KIND_SMB1 && match_smb1_eternalblue(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "EternalBlue_MS17_010");
+    note_match("builtin", rule_name_out);
+    return 1;
+  }
+  if (kind == EDR_PROTO_KIND_SMB1 && match_ms17_010_doublepulsar_ping(data, len)) {
+    set_rule_name(rule_name_out, rule_name_cap, "DoublePulsar_MS17_010_Ping");
+    note_match("builtin", rule_name_out);
+    return 1;
+  }
+  if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_SMB2) && match_smb3_smbghost(data, len)) {
+    set_rule_name(rule_name_out, rule_name_cap, "SMBGhost_CVE_2020_0796");
+    note_match("builtin", rule_name_out);
     return 1;
   }
   if (kind == EDR_PROTO_KIND_RDP && match_rdp_bluekeep(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "BlueKeep_CVE_2019_0708");
+    note_match("builtin", rule_name_out);
     return 1;
   }
   if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_SMB2) && match_msrpc_printnightmare(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "PrintNightmare_CVE_2021_34527");
+    note_match("builtin", rule_name_out);
+    return 1;
+  }
+  if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_HTTP) && match_http_reflective_loader_stager(data, len)) {
+    set_rule_name(rule_name_out, rule_name_cap, "ReflectiveLoader_HTTP_Stager");
+    note_match("builtin", rule_name_out);
     return 1;
   }
   return 0;

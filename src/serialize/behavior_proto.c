@@ -20,25 +20,6 @@ static void copy_str(char *dst, size_t cap, const char *src) {
   snprintf(dst, cap, "%s", src);
 }
 
-static void extract_username_from_usj(const char *usj, char *out, size_t cap) {
-  if (!usj || !usj[0] || !out || cap == 0) {
-    if (out && cap > 0) out[0] = '\0';
-    return;
-  }
-  const char *key = "\"username\":\"";
-  const char *p = strstr(usj, key);
-  if (!p) {
-    out[0] = '\0';
-    return;
-  }
-  p += strlen(key);
-  size_t i = 0;
-  while (*p && *p != '"' && i + 1 < cap) {
-    out[i++] = *p++;
-  }
-  out[i] = '\0';
-}
-
 /** `EdrEventType` → `AVEEventType`（《11》§4.1）；无对应时返回 -1 */
 static int32_t edr_event_type_to_ave_event_type(EdrEventType t) {
   switch (t) {
@@ -49,7 +30,6 @@ static int32_t edr_event_type_to_ave_event_type(EdrEventType t) {
     return (int32_t)AVE_EVT_PROCESS_INJECT;
   case EDR_EVENT_DLL_LOAD:
     return (int32_t)AVE_EVT_DLL_LOAD;
-  case EDR_EVENT_FILE_READ:
   case EDR_EVENT_FILE_CREATE:
   case EDR_EVENT_FILE_WRITE:
   case EDR_EVENT_FILE_DELETE:
@@ -132,15 +112,13 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
     copy_str(m->detail.registry.operation, sizeof(m->detail.registry.operation), r->reg_op);
     return;
   }
-  if (r->net_dst[0] || r->net_src[0] || r->network_aux_path[0]) {
+  if (r->net_dst[0] || r->net_src[0]) {
     m->which_detail = edr_v1_BehaviorEvent_network_tag;
     copy_str(m->detail.network.src_ip, sizeof(m->detail.network.src_ip), r->net_src);
     m->detail.network.src_port = r->net_sport;
     copy_str(m->detail.network.dst_ip, sizeof(m->detail.network.dst_ip), r->net_dst);
     m->detail.network.dst_port = r->net_dport;
     copy_str(m->detail.network.protocol, sizeof(m->detail.network.protocol), r->net_proto);
-    copy_str(m->detail.network.network_aux_path, sizeof(m->detail.network.network_aux_path),
-             r->network_aux_path);
     return;
   }
   if (r->file_path[0] || r->file_op[0]) {
@@ -162,8 +140,7 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
              r->parent_name);
     copy_str(m->detail.process.parent_path, sizeof(m->detail.process.parent_path),
              r->parent_path);
-    copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level),
-             r->integrity_level[0] ? r->integrity_level : "");
+    copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level), "");
     return;
   }
 }
@@ -190,8 +167,9 @@ size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *
   copy_str(msg.exe_path, sizeof(msg.exe_path), r->exe_path);
   copy_str(msg.username, sizeof(msg.username), r->username);
   msg.session_id = r->session_id;
-  msg.process_chain_depth = r->process_chain_depth;
-  if (r->pmfe_snapshot[0]) {
+  if (r->detection_context[0]) {
+    copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), r->detection_context);
+  } else if (r->pmfe_snapshot[0]) {
     copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), r->pmfe_snapshot);
   } else {
     copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), "");
@@ -238,11 +216,6 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
   msg.pid = a->pid;
   copy_str(msg.process_name, sizeof(msg.process_name), a->process_name[0] ? a->process_name : "");
   copy_str(msg.exe_path, sizeof(msg.exe_path), a->process_path[0] ? a->process_path : "");
-  {
-    char uname_buf[256];
-    extract_username_from_usj(a->user_subject_json, uname_buf, sizeof(uname_buf));
-    copy_str(msg.username, sizeof(msg.username), uname_buf[0] ? uname_buf : "");
-  }
   msg.priority = 0u;
 
   msg.has_behavior_alert = true;
@@ -261,10 +234,6 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
            a->process_name[0] ? a->process_name : "");
   copy_str(msg.behavior_alert.process_path, sizeof(msg.behavior_alert.process_path),
            a->process_path[0] ? a->process_path : "");
-  copy_str(msg.behavior_alert.related_iocs_json, sizeof(msg.behavior_alert.related_iocs_json),
-           a->related_iocs_json[0] ? a->related_iocs_json : "");
-  copy_str(msg.behavior_alert.user_subject_json, sizeof(msg.behavior_alert.user_subject_json),
-           a->user_subject_json[0] ? a->user_subject_json : "");
 
   pb_ostream_t stream = pb_ostream_from_buffer(out, out_cap);
   if (!pb_encode(&stream, edr_v1_BehaviorEvent_fields, &msg)) {

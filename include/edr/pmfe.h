@@ -96,5 +96,6 @@ void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_complet
 void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *out_completed,
                                  unsigned long *out_dropped, unsigned long *out_deduped,
                                  unsigned long *out_cooldown_skipped);
+unsigned long edr_pmfe_queue_depth(void);
 
 #endif

@@ -11,7 +11,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `command_id` | string | 指令唯一标识（建议 UUID）；与回传结果 **必填** 对齐。 |
-| `command_type` | string | 逻辑类型，如 `noop`、`ping`、`echo`、`isolate`、`kill`、`forensic`；**PMFE（§21）**：`pmfe_scan` / `CMD_PMFE_SCAN`（内存粗扫入队，见 `pmfe_engine.c`）；**AVE（§5）**：`ave_status` / `ave_fingerprint` / `ave_infer`；**自保护/健康**：`self_protect_status` / `agent_health` / `health_status`（见 `command_stub.c`）；**攻击面（§19）**：`GET_ATTACK_SURFACE` / `get_attack_surface` / `REFRESH_ATTACK_SURFACE`（采集并 `POST` 平台 `.../endpoints/:id/attack-surface`，见 `attack_surface_report.c`）。 |
+| `command_type` | string | 逻辑类型，如 `noop`、`ping`、`echo`、`isolate`、`kill`、`forensic`；**RTQ/RTR P0**：`rtq_query`、`rtr_process_tree`、`rtr_list_connections`、`rtr_file_stat`、`quarantine_file`、`unquarantine_file`；**PMFE（§21）**：`pmfe_scan` / `CMD_PMFE_SCAN`（内存粗扫入队，见 `pmfe_engine.c`）；**AVE（§5）**：`ave_status` / `ave_fingerprint` / `ave_infer`；**自保护/健康**：`self_protect_status` / `agent_health` / `health_status`（见 `command_stub.c`）；**攻击面（§19）**：`GET_ATTACK_SURFACE` / `get_attack_surface` / `REFRESH_ATTACK_SURFACE`（采集并 `POST` 平台 `.../endpoints/:id/attack-surface`，见 `attack_surface_report.c`）。 |
 | `payload` | bytes | 类型相关参数（如 kill 的 `{"pid":1234}` UTF-8 JSON）。 |
 | **SOAR 扩展（可选，空表示非编排下发）** | | |
 | `soar_correlation_id` | string | 与 SOAR **工单 / 全局 run** 关联，建议 UUID。 |
@@ -42,9 +42,20 @@
 - **预处理自动入队 PMFE**：**Windows**：`EDR_PMFE_ETW_AUTO=1` 且 PMFE 已初始化时，对 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（WinDivert ETW1）：当 `score` ≥ **`EDR_PMFE_ETW_SHELLCODE_SCORE`**（默认 **0.65**）时，将 **`br.pid`**（或 ETW1 中 **`hint_pid`** → `epid` 覆盖后的 PID）或按 **`dpt`** 经 **`GetExtendedTcpTable`** 解析的本地 IPv4 端口属主 PID 提交 **`edr_pmfe_submit_etw_scan_ex`**（内部 `etw:shellcode`；**`slot.priority==0`→P0 否则 P1**；ETW1 可选 **`va=`/`hint=`** 为 VAD 精扫 hint）。**`EDR_PMFE_ETW_COOLDOWN_MS`** 同 PID 冷却，默认 **30000**。**不依赖** `EDR_CMD_ENABLED`。**Linux**：同变量下对 **`EDR_EVENT_WEBSHELL_DETECTED`** 提交 **`etw:webshell`**（P0/P1 由 `slot.priority`）。
 - **监听表刷新（Windows / Linux）**：**`edr_pmfe_init`** 后 **60s** 周期 **`edr_pmfe_listen_table_refresh`**。**Windows**：ETW Kernel-Process 的 **`EDR_EVENT_PROCESS_CREATE` / `EDR_EVENT_PROCESS_TERMINATE`** 会触发 **`edr_pmfe_on_process_lifecycle_hint`**（约 **1s** 去抖）。**Linux**：同样 API，可由未来进程事件源调用；设 **`EDR_PMFE_LISTEN_REFRESH_ON_PROCESS=0`** 可关闭去抖。`EDR_PMFE_DISABLED=1` 时不登记延迟刷新。
 
+### RTQ/RTR P0 指令 payload（UTF-8 JSON）
+
+| command_type | payload | 说明 |
+|----------------|---------|------|
+| `rtq_query` / `RTQ_QUERY` | `{"event_type":"process|network|file|registry|script|shellcode|webshell|pmfe","pid":1234,"limit":50,"time_window_s":600}` | 从端侧 **内存 ring** 优先返回最近元数据，SQLite `local_evidence_cache.db` 可用时补历史；支持 `endpoint_id`、`process_name_contains`、`cmdline_contains`、`file_path_contains`、`remote_ip`、`registry_key_contains`。只查元数据，不读取文件内容。 |
+| `rtr_process_tree` / `RTR_PROCESS_TREE` | `{"pid":1234,"endpoint_id":"optional"}` | 从进程缓存返回 root 与直接子进程，用于告警进程树补全。 |
+| `rtr_list_connections` / `RTR_LIST_CONNECTIONS` | `{"pid":1234,"limit":50,"time_window_s":600}` | 等价于带 `event_type=network` 的 RTQ 查询，返回最近连接元数据。 |
+| `rtr_file_stat` / `file_stat` / `RTR_FILE_STAT` | `{"path":"/abs/path"}` | 只读文件元数据：大小、mtime、SHA256。 |
+| `quarantine_file` / `file_quarantine` / `rtr_quarantine_file` | `{"path":"/abs/path","reason":"alert|manual"}` | 文件级隔离：移动文件到本地隔离目录并写 `.meta` 清单，返回 `quarantine_id`。需高危策略允许。 |
+| `unquarantine_file` / `restore_file` / `file_unquarantine` | `{"quarantine_id":"...","restore_path":"optional"}` | 按隔离清单恢复文件；默认恢复到原路径，目标已存在时拒绝。需高危策略允许。 |
+
 ### 高危指令策略
 
-- **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）。
+- **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）/ **`quarantine_file`** / **`unquarantine_file`**。
 - **配置**：`[command] allow_dangerous = true` 与上述环境变量等效（便于生产用 TOML 固定策略）。
 - **kill 白名单**（可选）：设置 `EDR_CMD_KILL_ALLOWLIST=1234,5678` 后，仅允许终止列表内 PID（仍须先满足高危策略）。
 

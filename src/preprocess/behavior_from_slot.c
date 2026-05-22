@@ -1,237 +1,26 @@
 #include "edr/behavior_from_slot.h"
-#include "edr/forensic_trigger.h"
-#include "edr/process_tree_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
-#ifdef _MSC_VER
-#define strcasecmp _stricmp
-#endif
-
-#if defined(_WIN32)
-#include <windows.h>
-#include <Sddl.h>
-#include <TlHelp32.h>
-
-typedef LONG EDR_NTSTATUS;
-#define EDR_STATUS_SUCCESS ((EDR_NTSTATUS)0x00000000L)
-
-typedef struct _EDR_PROCESS_BASIC_INFORMATION_V2 {
-  void    *ExitStatus;
-  void    *PebBaseAddress;
-  void    *AffinityMask;
-  LONG     BasePriority;
-  void    *UniqueProcessId;
-  void    *InheritedFromUniqueProcessId;
-} EDR_PROCESS_BASIC_INFORMATION_V2;
-
-static volatile LONG64 s_ppid_zero_events;
-static volatile LONG64 s_ppid_total_events;
-static volatile LONG64 s_ppid_snapshot_fallback_ok;
-static volatile LONG64 s_ppid_ntqi_fallback_ok;
-static volatile LONG64 s_ppid_wmi_fallback_ok;
-static volatile LONG64 s_ppid_env_fallback_ok;
-static volatile LONG64 s_ppid_infer_ok;
-
-void edr_behavior_get_ppid_stats(int64_t *out_zero, int64_t *out_total,
-                                 int64_t *out_snap_ok, int64_t *out_ntqi_ok,
-                                 int64_t *out_wmi_ok, int64_t *out_env_ok,
-                                 int64_t *out_infer_ok) {
-  if (out_zero)   *out_zero   = s_ppid_zero_events;
-  if (out_total)  *out_total  = s_ppid_total_events;
-  if (out_snap_ok) *out_snap_ok = s_ppid_snapshot_fallback_ok;
-  if (out_ntqi_ok) *out_ntqi_ok = s_ppid_ntqi_fallback_ok;
-  if (out_wmi_ok)  *out_wmi_ok  = s_ppid_wmi_fallback_ok;
-  if (out_env_ok)  *out_env_ok  = s_ppid_env_fallback_ok;
-  if (out_infer_ok) *out_infer_ok = s_ppid_infer_ok;
-}
-
-static int edr_get_ppid_via_ntqi(DWORD pid, DWORD *out_ppid) {
-  if (!out_ppid || pid == 0) return -1;
-  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!h) return -1;
-  typedef EDR_NTSTATUS (WINAPI *PNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-  static PNtQueryInformationProcess pNtQIP = NULL;
-  if (!pNtQIP) {
-    pNtQIP = (PNtQueryInformationProcess)GetProcAddress(
-        GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
-    if (!pNtQIP) { CloseHandle(h); return -1; }
-  }
-  EDR_PROCESS_BASIC_INFORMATION_V2 pbi;
-  (void)memset(&pbi, 0, sizeof(pbi));
-  EDR_NTSTATUS st = pNtQIP(h, 0, &pbi, sizeof(pbi), NULL);
-  CloseHandle(h);
-  if (st != EDR_STATUS_SUCCESS || !pbi.InheritedFromUniqueProcessId) return -1;
-  DWORD ppid = (DWORD)(ULONG_PTR)pbi.InheritedFromUniqueProcessId;
-  if (ppid == 0 || ppid == pid) return -1;
-  *out_ppid = ppid;
-  return 0;
-}
-
-static int edr_get_process_path_by_pid(DWORD pid, char *out, size_t out_cap) {
-  if (!out || out_cap < 2) {
-    return -1;
-  }
-  *out = '\0';
-
-  HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!hProcess) {
-    return -1;
-  }
-
-  WCHAR wpath[MAX_PATH];
-  DWORD size = MAX_PATH;
-  if (!QueryFullProcessImageNameW(hProcess, 0, wpath, &size)) {
-    CloseHandle(hProcess);
-    return -1;
-  }
-
-  int n = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out, (int)out_cap - 1, NULL, NULL);
-  if (n > 0) {
-    out[n] = '\0';
-  }
-
-  CloseHandle(hProcess);
-  return 0;
-}
-
-static int edr_get_process_username_by_pid(DWORD pid, char *out, size_t out_cap) {
-  if (!out || out_cap < 2) return -1;
-  out[0] = '\0';
-
-  HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!hProcess) return -1;
-
-  HANDLE hToken = NULL;
-  if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
-    CloseHandle(hProcess);
-    return -1;
-  }
-
-  DWORD tokenInfoSize = 0;
-  GetTokenInformation(hToken, TokenUser, NULL, 0, &tokenInfoSize);
-  if (tokenInfoSize == 0) {
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-    return -1;
-  }
-
-  PTOKEN_USER pTokenUser = (PTOKEN_USER)HeapAlloc(GetProcessHeap(), 0, tokenInfoSize);
-  if (!pTokenUser) {
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-    return -1;
-  }
-
-  int result = -1;
-  if (GetTokenInformation(hToken, TokenUser, pTokenUser, tokenInfoSize, &tokenInfoSize)) {
-    WCHAR wUsername[256] = {0};
-    WCHAR wDomain[256] = {0};
-    DWORD cchUsername = 256;
-    DWORD cchDomain = 256;
-    SID_NAME_USE snu;
-    if (LookupAccountSidW(NULL, pTokenUser->User.Sid, wUsername, &cchUsername,
-                          wDomain, &cchDomain, &snu)) {
-      char username[256] = {0};
-      WideCharToMultiByte(CP_UTF8, 0, wUsername, -1, username, (int)sizeof(username) - 1, NULL, NULL);
-      if (wDomain[0]) {
-        char domain[128] = {0};
-        WideCharToMultiByte(CP_UTF8, 0, wDomain, -1, domain, (int)sizeof(domain) - 1, NULL, NULL);
-        snprintf(out, out_cap, "%s\\%s", domain, username);
-      } else {
-        snprintf(out, out_cap, "%s", username);
-      }
-      result = 0;
-    }
-  }
-
-  HeapFree(GetProcessHeap(), 0, pTokenUser);
-  CloseHandle(hToken);
-  CloseHandle(hProcess);
-  return result;
-}
-
-static int edr_get_ppid_via_wmi(DWORD pid, DWORD *out_ppid) {
-  (void)pid;
-  (void)out_ppid;
-  return -1;
-}
-
-static int edr_get_ppid_from_environment(DWORD pid, DWORD *out_ppid) {
-  if (!out_ppid || pid == 0) return -1;
-  
-  HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-  if (!hProcess) return -1;
-  
-  HANDLE hToken = NULL;
-  if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
-    CloseHandle(hProcess);
-    return -1;
-  }
-  
-  const DWORD tokenEnvInfo = 10;
-  DWORD needed = 0;
-  GetTokenInformation(hToken, tokenEnvInfo, NULL, 0, &needed);
-  if (needed == 0) {
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-    return -1;
-  }
-  
-  LPVOID envBlock = HeapAlloc(GetProcessHeap(), 0, needed);
-  if (!envBlock) {
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-    return -1;
-  }
-  
-  int result = -1;
-  if (GetTokenInformation(hToken, tokenEnvInfo, envBlock, needed, &needed)) {
-    WCHAR *env = (WCHAR*)envBlock;
-    while (*env) {
-      size_t len = wcslen(env);
-      if (len > 10 && wcsncmp(env, L"PPID=", 5) == 0) {
-        DWORD ppid_val = (DWORD)wcstol(env + 5, NULL, 10);
-        if (ppid_val > 0 && ppid_val != pid) {
-          *out_ppid = ppid_val;
-          result = 0;
-          break;
-        }
-      }
-      env += len + 1;
-    }
-  }
-  
-  HeapFree(GetProcessHeap(), 0, envBlock);
-  CloseHandle(hToken);
-  CloseHandle(hProcess);
-  return result;
-}
-
-static int edr_get_ppid_from_system(DWORD pid, DWORD *out_ppid) {
-  if (!out_ppid || pid == 0) return -1;
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snap == INVALID_HANDLE_VALUE) return -1;
-  PROCESSENTRY32W pe;
-  pe.dwSize = (DWORD)sizeof(pe);
-  int found = 0;
-  if (Process32FirstW(snap, &pe)) {
-    do {
-      if (pe.th32ProcessID == pid) {
-        *out_ppid = (DWORD)pe.th32ParentProcessID;
-        found = 1;
-        break;
-      }
-    } while (Process32NextW(snap, &pe));
-  }
-  CloseHandle(snap);
-  return found ? 0 : -1;
-}
-#endif
-
 static uint64_t g_event_seq;
+
+#define RANSOM_COUNTER_BUCKETS 128u
+#define RANSOM_COUNTER_EXTS 24u
+
+typedef struct {
+  uint32_t pid;
+  char dir[256];
+  int64_t window_start_ns;
+  uint32_t file_events;
+  char exts[RANSOM_COUNTER_EXTS][16];
+  uint8_t ext_count;
+  double entropy_avg;
+} RansomCounterBucket;
+
+static RansomCounterBucket g_ransom_buckets[RANSOM_COUNTER_BUCKETS];
 
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = ++g_event_seq;
@@ -252,62 +41,205 @@ static const char *basename_c(const char *path) {
   return p;
 }
 
-static void fill_process_name_from_cmdline(char *out, size_t out_cap, const char *cmdline) {
-  if (!out || out_cap == 0u || out[0] || !cmdline || !cmdline[0]) {
+static void first_cmd_token(const char *cmd, char *out, size_t cap) {
+  if (!out || cap == 0u) {
     return;
   }
-  const char *p = cmdline;
-  while (*p == ' ' || *p == '\t') {
-    p++;
-  }
-  if (!*p) {
+  out[0] = '\0';
+  if (!cmd || !cmd[0]) {
     return;
   }
-
-  const char *start = p;
-  const char *end = p;
-  if (*p == '"') {
-    start = ++p;
-    while (*p && *p != '"') {
-      p++;
+  while (*cmd == ' ' || *cmd == '\t') {
+    cmd++;
+  }
+  char quote = 0;
+  if (*cmd == '"' || *cmd == '\'') {
+    quote = *cmd++;
+  }
+  size_t n = 0;
+  while (*cmd && n + 1u < cap) {
+    if (quote) {
+      if (*cmd == quote) {
+        break;
+      }
+    } else if (*cmd == ' ' || *cmd == '\t') {
+      break;
     }
-    end = p;
-  } else {
-    while (*p && *p != ' ' && *p != '\t') {
-      p++;
-    }
-    end = p;
+    out[n++] = *cmd++;
   }
-
-  size_t len = (size_t)(end - start);
-  if (len == 0u) {
-    return;
-  }
-  char token[EDR_BR_STR_LONG];
-  if (len >= sizeof(token)) {
-    len = sizeof(token) - 1u;
-  }
-  memcpy(token, start, len);
-  token[len] = '\0';
-
-  const char *base = basename_c(token);
-  if (base[0] && base[0] != '-' && base[0] != '/') {
-    snprintf(out, out_cap, "%s", base);
-  }
+  out[n] = '\0';
 }
 
-static int is_mostly_printable_ascii(const uint8_t *p, size_t n) {
-  if (!p || n == 0u) {
-    return 0;
+static int is_file_activity_event(EdrEventType t) {
+  return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE || t == EDR_EVENT_FILE_RENAME ||
+         t == EDR_EVENT_FILE_DELETE;
+}
+
+static void dirname_c(const char *path, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
   }
-  size_t printable = 0u;
-  for (size_t i = 0; i < n; i++) {
-    uint8_t c = p[i];
-    if ((c >= 0x20 && c <= 0x7eu) || c == '\t' || c == '\r' || c == '\n') {
-      printable++;
+  out[0] = '\0';
+  if (!path || !path[0]) {
+    return;
+  }
+  const char *last = NULL;
+  for (const char *p = path; *p; p++) {
+    if (*p == '\\' || *p == '/') {
+      last = p;
     }
   }
-  return printable >= (n * 8u) / 10u;
+  if (!last) {
+    snprintf(out, cap, "%s", ".");
+    return;
+  }
+  size_t n = (size_t)(last - path);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, path, n);
+  out[n] = '\0';
+}
+
+static void extension_c(const char *path, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  const char *b = basename_c(path);
+  const char *dot = strrchr(b, '.');
+  if (!dot || !dot[1]) {
+    snprintf(out, cap, "%s", "<none>");
+    return;
+  }
+  snprintf(out, cap, "%s", dot + 1);
+}
+
+static double path_entropy_score(const char *path) {
+  const char *b = basename_c(path);
+  if (!b || !b[0]) {
+    return 0.0;
+  }
+  unsigned char seen[256];
+  memset(seen, 0, sizeof(seen));
+  size_t len = 0u;
+  size_t uniq = 0u;
+  for (const unsigned char *p = (const unsigned char *)b; *p && len < 160u; p++, len++) {
+    if (!seen[*p]) {
+      seen[*p] = 1u;
+      uniq++;
+    }
+  }
+  if (len == 0u) {
+    return 0.0;
+  }
+  return ((double)uniq / (double)len) * 8.0;
+}
+
+static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int64_t now_ns, int64_t window_ns) {
+  RansomCounterBucket *empty = NULL;
+  RansomCounterBucket *oldest = &g_ransom_buckets[0];
+  for (size_t i = 0; i < RANSOM_COUNTER_BUCKETS; i++) {
+    RansomCounterBucket *b = &g_ransom_buckets[i];
+    if (b->pid == pid && strcmp(b->dir, dir) == 0) {
+      if (b->window_start_ns <= 0 || now_ns - b->window_start_ns > window_ns) {
+        memset(b, 0, sizeof(*b));
+        b->pid = pid;
+        snprintf(b->dir, sizeof(b->dir), "%s", dir);
+        b->window_start_ns = now_ns;
+      }
+      return b;
+    }
+    if (b->pid == 0u && !empty) {
+      empty = b;
+    }
+    if (b->window_start_ns < oldest->window_start_ns) {
+      oldest = b;
+    }
+  }
+  RansomCounterBucket *b = empty ? empty : oldest;
+  memset(b, 0, sizeof(*b));
+  b->pid = pid ? pid : 1u;
+  snprintf(b->dir, sizeof(b->dir), "%s", dir);
+  b->window_start_ns = now_ns;
+  return b;
+}
+
+static int ext_seen_or_add(RansomCounterBucket *b, const char *ext) {
+  if (!b || !ext || !ext[0]) {
+    return 0;
+  }
+  for (uint8_t i = 0; i < b->ext_count; i++) {
+    if (strcmp(b->exts[i], ext) == 0) {
+      return 1;
+    }
+  }
+  if (b->ext_count < RANSOM_COUNTER_EXTS) {
+    snprintf(b->exts[b->ext_count], sizeof(b->exts[b->ext_count]), "%s", ext);
+    b->ext_count++;
+  }
+  return 0;
+}
+
+static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
+  if (!r || !fmt) {
+    return;
+  }
+  size_t l = strlen(r->script_snippet);
+  if (l + 2u >= sizeof(r->script_snippet)) {
+    return;
+  }
+  if (l > 0u) {
+    r->script_snippet[l++] = ' ';
+    r->script_snippet[l] = '\0';
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  (void)vsnprintf(r->script_snippet + l, sizeof(r->script_snippet) - l, fmt, ap);
+  va_end(ap);
+}
+
+static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
+  if (!r || !is_file_activity_event(r->type) || !r->file_path[0]) {
+    return;
+  }
+  const char *env = getenv("EDR_RANSOM_COUNTER_WINDOW_S");
+  long window_s = env && env[0] ? strtol(env, NULL, 10) : 60L;
+  if (window_s <= 0L) {
+    window_s = 60L;
+  }
+  if (window_s > 600L) {
+    window_s = 600L;
+  }
+  int64_t now_ns = r->event_time_ns > 0 ? r->event_time_ns : 1;
+  int64_t window_ns = (int64_t)window_s * 1000000000LL;
+  char dir[256];
+  char ext[16];
+  dirname_c(r->file_path, dir, sizeof(dir));
+  extension_c(r->file_path, ext, sizeof(ext));
+  RansomCounterBucket *b = ransom_bucket_for(r->pid ? r->pid : 1u, dir, now_ns, window_ns);
+  double entropy = path_entropy_score(r->file_path);
+  double prev = b->entropy_avg;
+  b->file_events++;
+  (void)ext_seen_or_add(b, ext);
+  if (b->file_events == 1u || prev <= 0.0) {
+    b->entropy_avg = entropy;
+  } else {
+    b->entropy_avg = (prev * 0.85) + (entropy * 0.15);
+  }
+  double elapsed_s = (double)(now_ns - b->window_start_ns) / 1000000000.0;
+  if (elapsed_s < 1.0) {
+    elapsed_s = 1.0;
+  }
+  double file_rate = ((double)b->file_events * 60.0) / elapsed_s;
+  double entropy_delta = entropy - prev;
+  if (entropy_delta < 0.0) {
+    entropy_delta = 0.0;
+  }
+  int suspicious = file_rate >= 80.0 || b->ext_count >= 20u || entropy_delta >= 1.5;
+  append_record_kv(r, "file_rate=%.0f ext_burst=%u entropy_delta=%.2f%s",
+                   file_rate, (unsigned)b->ext_count, entropy_delta,
+                   suspicious ? " ransom_counter=1" : "");
 }
 
 typedef struct {
@@ -317,6 +249,8 @@ typedef struct {
   char file[EDR_BR_STR_LONG];
   char qname[EDR_BR_STR_MID];
   char script[EDR_BR_STR_LONG];
+  char url[EDR_BR_STR_MID];
+  char sha256[80];
   char dst[64];
   char src[64];
   char score[32];
@@ -331,6 +265,7 @@ typedef struct {
   char ring_newest_ns[28];
   char ring_span_ns[28];
   char shellcode_json[512];
+  char sensor_detail[2048];
   char fw_id[96];
   char fw_rule[256];
   char fw_mod[512];
@@ -353,28 +288,35 @@ typedef struct {
   int has_cmd;
   int has_dport;
   int has_sport;
-  char pimg[EDR_BR_STR_LONG];
-  int has_pimg;
-  char naux[EDR_BR_STR_LONG];
-  char user[EDR_BR_STR_SHORT];
-  char integ[32];
-  unsigned long token_elev;
-  unsigned long sess_id;
-  int has_user;
-  int has_integ;
-  int has_token_elev;
-  int has_sess_id;
-  char query[EDR_BR_STR_LONG];
-  char consumer[EDR_BR_STR_LONG];
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
 
-static unsigned long etw1_parse_ulong_auto(const char *val) {
-  if (!val || !val[0]) {
-    return 0;
+static void append_sensor_kv(Etw1Fields *f, const char *key, const char *val) {
+  if (!f || !key || !key[0] || !val || !val[0]) {
+    return;
   }
-  return strtoul(val, NULL, 0);
+  size_t l = strlen(f->sensor_detail);
+  if (l + 4u >= sizeof(f->sensor_detail)) {
+    return;
+  }
+  if (l > 0u) {
+    f->sensor_detail[l++] = ' ';
+    f->sensor_detail[l] = '\0';
+  }
+  int n = snprintf(f->sensor_detail + l, sizeof(f->sensor_detail) - l, "%s=", key);
+  if (n <= 0 || (size_t)n >= sizeof(f->sensor_detail) - l) {
+    return;
+  }
+  l += (size_t)n;
+  while (*val && l + 1u < sizeof(f->sensor_detail)) {
+    char c = *val++;
+    if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+      c = '_';
+    }
+    f->sensor_detail[l++] = c;
+  }
+  f->sensor_detail[l] = '\0';
 }
 
 static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
@@ -384,22 +326,21 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   if (strcmp(key, "prov") == 0) {
     snprintf(f->prov, sizeof(f->prov), "%s", val);
   } else if (strcmp(key, "pid") == 0) {
-    f->pid = etw1_parse_ulong_auto(val);
+    f->pid = strtoul(val, NULL, 10);
   } else if (strcmp(key, "epid") == 0) {
-    f->epid = etw1_parse_ulong_auto(val);
+    f->epid = strtoul(val, NULL, 10);
   } else if (strcmp(key, "hint_pid") == 0) {
-    f->epid = etw1_parse_ulong_auto(val);
+    f->epid = strtoul(val, NULL, 10);
   } else if (strcmp(key, "ppid") == 0) {
-    f->ppid = etw1_parse_ulong_auto(val);
-  } else if (strcmp(key, "pimg") == 0) {
-    snprintf(f->pimg, sizeof(f->pimg), "%s", val);
-    f->has_pimg = 1;
+    f->ppid = strtoul(val, NULL, 10);
   } else if (strcmp(key, "img") == 0) {
     snprintf(f->img, sizeof(f->img), "%s", val);
     f->has_img = 1;
   } else if (strcmp(key, "cmd") == 0) {
     snprintf(f->cmd, sizeof(f->cmd), "%s", val);
     f->has_cmd = 1;
+  } else if (strcmp(key, "path") == 0 && !f->file[0]) {
+    snprintf(f->file, sizeof(f->file), "%s", val);
   } else if (strcmp(key, "cert_revoked_ancestor") == 0 || strcmp(key, "cert_ra") == 0) {
     f->cert_revoked_ancestor = (strtoul(val, NULL, 10) != 0u) ? 1u : 0u;
     f->has_cert_revoked_ancestor = 1;
@@ -407,8 +348,43 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->file, sizeof(f->file), "%s", val);
   } else if (strcmp(key, "qname") == 0) {
     snprintf(f->qname, sizeof(f->qname), "%s", val);
+  } else if (strcmp(key, "ip") == 0 && !f->dst[0]) {
+    snprintf(f->dst, sizeof(f->dst), "%s", val);
   } else if (strcmp(key, "script") == 0) {
     snprintf(f->script, sizeof(f->script), "%s", val);
+  } else if (strcmp(key, "url") == 0 || strcmp(key, "remote_url") == 0 || strcmp(key, "domain") == 0) {
+    snprintf(f->url, sizeof(f->url), "%s", val);
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "sha256") == 0 || strcmp(key, "file_sha256") == 0 || strcmp(key, "file_hash") == 0) {
+    snprintf(f->sha256, sizeof(f->sha256), "%s", val);
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "sensor") == 0 || strcmp(key, "provider") == 0 || strcmp(key, "scriptblock_id") == 0 ||
+             strcmp(key, "amsi_content") == 0 || strcmp(key, "amsi_result") == 0 ||
+             strcmp(key, "script_content") == 0 || strcmp(key, "script_text") == 0 ||
+             strcmp(key, "script_hash") == 0 ||
+             strcmp(key, "ja3") == 0 || strcmp(key, "ja3_hash") == 0 ||
+             strcmp(key, "ja3_fingerprint") == 0 || strcmp(key, "ja3_rare") == 0 ||
+             strcmp(key, "ja3_unknown") == 0 || strcmp(key, "sni") == 0 ||
+             strcmp(key, "tls_sni") == 0 || strcmp(key, "sni_suspicious") == 0 ||
+             strcmp(key, "sni_mismatch") == 0 || strcmp(key, "cert_self_signed") == 0 ||
+             strcmp(key, "cert_expired") == 0 || strcmp(key, "cert_mismatch") == 0 ||
+             strcmp(key, "cert_revoked") == 0 || strcmp(key, "cert_chain_anomaly") == 0 ||
+             strcmp(key, "cert_untrusted") == 0 || strcmp(key, "cert_subject") == 0 ||
+             strcmp(key, "cert_issuer") == 0 || strcmp(key, "cert_hash") == 0 ||
+             strcmp(key, "tls_error") == 0 || strcmp(key, "tls_alert") == 0 ||
+             strcmp(key, "app_name") == 0 || strcmp(key, "amsi_session") == 0 ||
+             strcmp(key, "amsi_size") == 0 ||
+             strcmp(key, "file_rate") == 0 || strcmp(key, "ext_burst") == 0 ||
+             strcmp(key, "entropy_delta") == 0 || strcmp(key, "file_entropy_delta") == 0 ||
+             strcmp(key, "ransom_counter") == 0 ||
+             strcmp(key, "mass_rename") == 0 || strcmp(key, "extension_burst") == 0 ||
+             strcmp(key, "rename_burst") == 0 || strcmp(key, "shadow_delete") == 0 ||
+             strcmp(key, "shadowcopy_delete") == 0 || strcmp(key, "ast_score") == 0 ||
+             strcmp(key, "token_score") == 0 || strcmp(key, "semantic_score") == 0 ||
+             strcmp(key, "ast") == 0 || strcmp(key, "token") == 0 ||
+             strcmp(key, "features") == 0 || strcmp(key, "ast_tokens") == 0 ||
+             strcmp(key, "token_features") == 0) {
+    append_sensor_kv(f, key, val);
   } else if (strcmp(key, "dst") == 0) {
     snprintf(f->dst, sizeof(f->dst), "%s", val);
   } else if (strcmp(key, "src") == 0) {
@@ -472,34 +448,20 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->has_ring_meta = 1;
   } else if (strcmp(key, "shellcode_json") == 0) {
     snprintf(f->shellcode_json, sizeof(f->shellcode_json), "%s", val);
-  } else if (strcmp(key, "regkey") == 0) {
+  } else if (strcmp(key, "regkey") == 0 || strcmp(key, "registry_key") == 0 ||
+             strcmp(key, "registry_path") == 0 || strcmp(key, "target_object") == 0) {
     snprintf(f->regkey, sizeof(f->regkey), "%s", val);
-  } else if (strcmp(key, "regpath") == 0 && !f->regkey[0]) {
+  } else if ((strcmp(key, "regpath") == 0 || strcmp(key, "key_path") == 0) && !f->regkey[0]) {
     snprintf(f->regkey, sizeof(f->regkey), "%s", val);
-  } else if (strcmp(key, "regname") == 0) {
+  } else if (strcmp(key, "regname") == 0 || strcmp(key, "registry_value") == 0 ||
+             strcmp(key, "value_name") == 0) {
     snprintf(f->regname, sizeof(f->regname), "%s", val);
-  } else if (strcmp(key, "regdata") == 0) {
+  } else if (strcmp(key, "regdata") == 0 || strcmp(key, "registry_data") == 0 ||
+             strcmp(key, "value_data") == 0 || strcmp(key, "details") == 0) {
     snprintf(f->regdata, sizeof(f->regdata), "%s", val);
-  } else if (strcmp(key, "regop") == 0) {
+  } else if (strcmp(key, "regop") == 0 || strcmp(key, "registry_op") == 0 ||
+             strcmp(key, "operation") == 0) {
     snprintf(f->regop, sizeof(f->regop), "%s", val);
-  } else if (strcmp(key, "naux") == 0) {
-    snprintf(f->naux, sizeof(f->naux), "%s", val);
-  } else if (strcmp(key, "user") == 0) {
-    snprintf(f->user, sizeof(f->user), "%s", val);
-    f->has_user = 1;
-  } else if (strcmp(key, "integ") == 0) {
-    snprintf(f->integ, sizeof(f->integ), "%s", val);
-    f->has_integ = 1;
-  } else if (strcmp(key, "token_elev") == 0) {
-    f->token_elev = strtoul(val, NULL, 10);
-    f->has_token_elev = 1;
-  } else if (strcmp(key, "sess_id") == 0) {
-    f->sess_id = strtoul(val, NULL, 10);
-    f->has_sess_id = 1;
-  } else if (strcmp(key, "query") == 0) {
-    snprintf(f->query, sizeof(f->query), "%s", val);
-  } else if (strcmp(key, "consumer") == 0) {
-    snprintf(f->consumer, sizeof(f->consumer), "%s", val);
   }
 }
 
@@ -566,6 +528,13 @@ static void apply_mitre_hints(EdrBehaviorRecord *r) {
     snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1055");
     r->mitre_ttp_count++;
   }
+  if ((r->type == EDR_EVENT_REG_CREATE_KEY || r->type == EDR_EVENT_REG_SET_VALUE ||
+       r->type == EDR_EVENT_SERVICE_CREATE || r->type == EDR_EVENT_SCHEDULED_TASK_CREATE ||
+       r->type == EDR_EVENT_DRIVER_LOAD) &&
+      r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
+    snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1547.001");
+    r->mitre_ttp_count++;
+  }
   const char *hay = r->cmdline[0] ? r->cmdline : r->script_snippet;
   if (hay[0] && (strstr(hay, "EncodedCommand") != NULL || strstr(hay, "-Enc") != NULL) &&
       r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
@@ -596,131 +565,33 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.ppid) {
       r->ppid = (uint32_t)ef.ppid;
     }
-#if defined(_WIN32)
-    if (r->ppid == 0u && r->pid != 0u) {
-      DWORD sppid = 0;
-      if (edr_get_ppid_via_ntqi((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
-        r->ppid = (uint32_t)sppid;
-        (void)InterlockedAdd64(&s_ppid_ntqi_fallback_ok, 1);
-      } else if (edr_get_ppid_from_system((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
-        r->ppid = (uint32_t)sppid;
-        (void)InterlockedAdd64(&s_ppid_snapshot_fallback_ok, 1);
-      } else if (edr_get_ppid_via_wmi((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
-        r->ppid = (uint32_t)sppid;
-        (void)InterlockedAdd64(&s_ppid_wmi_fallback_ok, 1);
-      } else if (edr_get_ppid_from_environment((DWORD)r->pid, &sppid) == 0 && sppid > 0) {
-        r->ppid = (uint32_t)sppid;
-        (void)InterlockedAdd64(&s_ppid_env_fallback_ok, 1);
-      } else {
-        uint64_t event_time = 0;
-        if (r->event_time_ns > 0) {
-          event_time = (uint64_t)r->event_time_ns;
-        } else {
-          FILETIME ft;
-          GetSystemTimeAsFileTime(&ft);
-          event_time = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-        }
-        
-        char inferred_parent_name[64] = {0};
-        if (edr_pt_cache_infer_parent(r->pid, event_time, (uint32_t *)&sppid, inferred_parent_name, sizeof(inferred_parent_name)) == 0 && sppid > 0) {
-          r->ppid = (uint32_t)sppid;
-          if (inferred_parent_name[0] && !r->parent_name[0]) {
-            snprintf(r->parent_name, sizeof(r->parent_name), "%s", inferred_parent_name);
-          }
-          (void)InterlockedAdd64(&s_ppid_infer_ok, 1);
-        } else {
-          (void)InterlockedAdd64(&s_ppid_zero_events, 1);
-        }
-      }
-    }
-    (void)InterlockedAdd64(&s_ppid_total_events, 1);
-#endif
     if (ef.has_img) {
       snprintf(r->exe_path, sizeof(r->exe_path), "%s", ef.img);
-      /* DLL/DRIVER 加载事件：img 是模块路径而非进程路径，不应作为 process_name */
-      if (r->type != EDR_EVENT_DLL_LOAD && r->type != EDR_EVENT_DRIVER_LOAD) {
-        snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
-      }
-    }
-
-    if (!r->process_name[0] && r->pid != 0) {
-#ifdef _WIN32
-      char process_path[MAX_PATH];
-      if (edr_get_process_path_by_pid((DWORD)r->pid, process_path, sizeof(process_path)) == 0 && process_path[0]) {
-        snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(process_path));
-        snprintf(r->exe_path, sizeof(r->exe_path), "%s", process_path);
-      }
-#endif
-    }
-    
-    if (ef.has_pimg) {
-      snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.pimg);
-      snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.pimg));
+      snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
     }
     if (ef.has_cmd) {
       snprintf(r->cmdline, sizeof(r->cmdline), "%s", ef.cmd);
+      if (!r->exe_path[0]) {
+        char first[EDR_BR_STR_LONG];
+        first_cmd_token(ef.cmd, first, sizeof(first));
+        if (first[0]) {
+          snprintf(r->exe_path, sizeof(r->exe_path), "%s", first);
+          snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(first));
+        }
+      }
     }
-    fill_process_name_from_cmdline(r->process_name, sizeof(r->process_name), r->cmdline);
     if (ef.file[0]) {
       snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
-      switch (r->type) {
-      case EDR_EVENT_FILE_READ:
-        snprintf(r->file_op, sizeof(r->file_op), "read");
-        break;
-      case EDR_EVENT_FILE_WRITE:
-        snprintf(r->file_op, sizeof(r->file_op), "write");
-        break;
-      case EDR_EVENT_FILE_CREATE:
-        snprintf(r->file_op, sizeof(r->file_op), "create");
-        break;
-      case EDR_EVENT_FILE_DELETE:
-        snprintf(r->file_op, sizeof(r->file_op), "delete");
-        break;
-      case EDR_EVENT_FILE_RENAME:
-        snprintf(r->file_op, sizeof(r->file_op), "rename");
-        break;
-      case EDR_EVENT_FILE_PERMISSION_CHANGE:
-        snprintf(r->file_op, sizeof(r->file_op), "permission");
-        break;
-      default:
-        snprintf(r->file_op, sizeof(r->file_op), "event");
-        break;
-      }
-    }
-    if (ef.naux[0]) {
-      snprintf(r->network_aux_path, sizeof(r->network_aux_path), "%s", ef.naux);
-    }
-    if (ef.has_user) {
-      snprintf(r->username, sizeof(r->username), "%s", ef.user);
-    }
-#if defined(_WIN32)
-    if (!ef.has_user && ef.epid > 0) {
-      DWORD pid = (DWORD)ef.epid;
-      char ubuf[EDR_BR_STR_SHORT];
-      if (edr_get_process_username_by_pid(pid, ubuf, sizeof(ubuf)) == 0 && ubuf[0]) {
-        snprintf(r->username, sizeof(r->username), "%s", ubuf);
-      }
-    }
-#endif
-    if (ef.has_integ) {
-      snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integ);
-    }
-    if (ef.has_token_elev) {
-      r->token_elevation = (uint32_t)ef.token_elev;
-    }
-    if (ef.has_sess_id) {
-      r->session_id = (uint32_t)ef.sess_id;
-    }
-    if (ef.query[0]) {
-      snprintf(r->wmi_filter, sizeof(r->wmi_filter), "query=%s", ef.query);
-    }
-    if (ef.consumer[0]) {
-      size_t L = strlen(r->wmi_filter);
-      if (L > 0) snprintf(r->wmi_filter + L, sizeof(r->wmi_filter) - L, " consumer=%s", ef.consumer);
-      else snprintf(r->wmi_filter, sizeof(r->wmi_filter), "consumer=%s", ef.consumer);
+      snprintf(r->file_op, sizeof(r->file_op), "event");
     }
     if (ef.qname[0]) {
       snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.qname);
+    }
+    if (ef.url[0] && !r->dns_query[0]) {
+      snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.url);
+    }
+    if (ef.sha256[0]) {
+      snprintf(r->exe_hash, sizeof(r->exe_hash), "%s", ef.sha256);
     }
     if (ef.script[0]) {
       snprintf(r->script_snippet, sizeof(r->script_snippet), "%s", ef.script);
@@ -793,59 +664,20 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, " | %s", ef.shellcode_json);
       }
     }
+    if (ef.sensor_detail[0]) {
+      size_t L = strlen(r->script_snippet);
+      snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, "%s%s",
+               L > 0u ? " " : "", ef.sensor_detail);
+    }
   } else if (slot->size > 0) {
     size_t n = slot->size;
     if (n >= sizeof(r->cmdline)) {
       n = sizeof(r->cmdline) - 1u;
     }
-    /* Parsing failed: avoid dumping raw binary bytes into cmdline (causes control-char garbage downstream). */
-    if (is_mostly_printable_ascii(slot->data, n)) {
-      memcpy(r->cmdline, slot->data, n);
-      r->cmdline[n] = '\0';
-    } else {
-      r->cmdline[0] = '\0';
-      snprintf(r->script_snippet, sizeof(r->script_snippet), "raw_etw_payload_bytes=%u parse=failed", (unsigned)slot->size);
-    }
+    memcpy(r->cmdline, slot->data, n);
+    r->cmdline[n] = '\0';
   }
 
+  enrich_ransom_file_counters(r);
   apply_mitre_hints(r);
-
-  if (slot->type == EDR_EVENT_PROCESS_CREATE) {
-    edr_pt_cache_put(r->pid, r->ppid,
-                     r->process_name, r->cmdline,
-                     r->exe_path, r->parent_name,
-                     (uint64_t)slot->timestamp_ns);
-    
-    /* edr_pt_cache_update_explorer_info 已移除，explorer 信息由 process_tree_cache 统一管理 */
-  } else if (slot->type == EDR_EVENT_PROCESS_TERMINATE) {
-    edr_pt_cache_remove(r->pid);
-  }
-
-  if (slot->priority == 0) {
-    edr_pt_cache_fill_record(r->pid,
-                             r->grandparent_name, sizeof(r->grandparent_name),
-                             r->grandparent_path, sizeof(r->grandparent_path),
-                             &r->grandparent_pid,
-                             r->parent_cmdline,   sizeof(r->parent_cmdline),
-                             &r->process_chain_depth);
-  }
-
-  edr_forensic_trigger_evaluate(slot, r);
-
-  edr_behavior_record_enrich_system_context(r);
 }
-
-#if !defined(_WIN32)
-void edr_behavior_get_ppid_stats(int64_t *out_zero, int64_t *out_total,
-                                 int64_t *out_snap_ok, int64_t *out_ntqi_ok,
-                                 int64_t *out_wmi_ok, int64_t *out_env_ok,
-                                 int64_t *out_infer_ok) {
-  if (out_zero)   *out_zero   = 0;
-  if (out_total)  *out_total  = 0;
-  if (out_snap_ok) *out_snap_ok = 0;
-  if (out_ntqi_ok) *out_ntqi_ok = 0;
-  if (out_wmi_ok)  *out_wmi_ok  = 0;
-  if (out_env_ok)  *out_env_ok  = 0;
-  if (out_infer_ok) *out_infer_ok = 0;
-}
-#endif

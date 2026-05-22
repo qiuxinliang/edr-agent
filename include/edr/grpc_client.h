@@ -25,6 +25,19 @@ int edr_grpc_client_reconnect_to_target(const char *target);
  */
 int edr_grpc_client_ready(void);
 
+typedef struct {
+  int ready;
+  int insecure;
+  int report_fail_streak;
+  unsigned long rpc_ok;
+  unsigned long rpc_fail;
+  int64_t last_success_unix_ms;
+  int64_t last_failure_unix_ms;
+  char last_error[160];
+} EdrGrpcClientRuntime;
+
+void edr_grpc_client_get_runtime(EdrGrpcClientRuntime *out);
+
 /**
  * 上报一批（header12 + payload 与 §6.2 一致）；batch_id 用于幂等。
  * 返回 0 成功，非 0 失败（未启用 gRPC 或未连接时返回 -1）。
@@ -34,18 +47,6 @@ int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *header12, si
 
 unsigned long edr_grpc_client_rpc_ok(void);
 unsigned long edr_grpc_client_rpc_fail(void);
-unsigned long edr_grpc_client_report_fail_streak(void);
-uint64_t edr_grpc_client_last_success_ms(void);
-uint64_t edr_grpc_client_last_failure_ms(void);
-void edr_grpc_client_last_failure_reason(char *buf, size_t cap);
-
-/**
- * 写入简短 ASCII 诊断（为何 `edr_grpc_client_ready` 可能为 0），供控制台心跳等使用。
- * 可能值含：`ok`、`empty_server_address`、`insecure_not_connected`、`no_tls_pem_or_EDR_GRPC_INSECURE=1`、
- * `incomplete_mtls_missing_client_cert_or_key`、`channel_not_ready`。
- * `cap` 含 NUL；无信息时写入 `"-"`。
- */
-void edr_grpc_client_diag(char *buf, size_t cap);
 
 /**
  * 上报指令执行结果（ingest.proto ReportCommandResult），供 SOAR 对账。

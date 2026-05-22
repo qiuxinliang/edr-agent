@@ -28,6 +28,7 @@ static const char* EventIngest_method_names[] = {
   "/edr.v1.EventIngest/Subscribe",
   "/edr.v1.EventIngest/ReportCommandResult",
   "/edr.v1.EventIngest/UploadFile",
+  "/edr.v1.EventIngest/ControlStream",
 };
 
 std::unique_ptr< EventIngest::Stub> EventIngest::NewStub(const std::shared_ptr< ::grpc::ChannelInterface>& channel, const ::grpc::StubOptions& options) {
@@ -41,6 +42,7 @@ EventIngest::Stub::Stub(const std::shared_ptr< ::grpc::ChannelInterface>& channe
   , rpcmethod_Subscribe_(EventIngest_method_names[1], options.suffix_for_stats(),::grpc::internal::RpcMethod::SERVER_STREAMING, channel)
   , rpcmethod_ReportCommandResult_(EventIngest_method_names[2], options.suffix_for_stats(),::grpc::internal::RpcMethod::NORMAL_RPC, channel)
   , rpcmethod_UploadFile_(EventIngest_method_names[3], options.suffix_for_stats(),::grpc::internal::RpcMethod::CLIENT_STREAMING, channel)
+  , rpcmethod_ControlStream_(EventIngest_method_names[4], options.suffix_for_stats(),::grpc::internal::RpcMethod::BIDI_STREAMING, channel)
   {}
 
 ::grpc::Status EventIngest::Stub::ReportEvents(::grpc::ClientContext* context, const ::edr::v1::ReportEventsRequest& request, ::edr::v1::ReportEventsResponse* response) {
@@ -121,6 +123,22 @@ void EventIngest::Stub::async::UploadFile(::grpc::ClientContext* context, ::edr:
   return ::grpc::internal::ClientAsyncWriterFactory< ::edr::v1::FileChunk>::Create(channel_.get(), cq, rpcmethod_UploadFile_, context, response, false, nullptr);
 }
 
+::grpc::ClientReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* EventIngest::Stub::ControlStreamRaw(::grpc::ClientContext* context) {
+  return ::grpc::internal::ClientReaderWriterFactory< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>::Create(channel_.get(), rpcmethod_ControlStream_, context);
+}
+
+void EventIngest::Stub::async::ControlStream(::grpc::ClientContext* context, ::grpc::ClientBidiReactor< ::edr::v1::CommandEnvelope,::edr::v1::CommandEnvelope>* reactor) {
+  ::grpc::internal::ClientCallbackReaderWriterFactory< ::edr::v1::CommandEnvelope,::edr::v1::CommandEnvelope>::Create(stub_->channel_.get(), stub_->rpcmethod_ControlStream_, context, reactor);
+}
+
+::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* EventIngest::Stub::AsyncControlStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq, void* tag) {
+  return ::grpc::internal::ClientAsyncReaderWriterFactory< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>::Create(channel_.get(), cq, rpcmethod_ControlStream_, context, true, tag);
+}
+
+::grpc::ClientAsyncReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* EventIngest::Stub::PrepareAsyncControlStreamRaw(::grpc::ClientContext* context, ::grpc::CompletionQueue* cq) {
+  return ::grpc::internal::ClientAsyncReaderWriterFactory< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>::Create(channel_.get(), cq, rpcmethod_ControlStream_, context, false, nullptr);
+}
+
 EventIngest::Service::Service() {
   AddMethod(new ::grpc::internal::RpcServiceMethod(
       EventIngest_method_names[0],
@@ -162,6 +180,16 @@ EventIngest::Service::Service() {
              ::edr::v1::UploadResult* resp) {
                return service->UploadFile(ctx, reader, resp);
              }, this)));
+  AddMethod(new ::grpc::internal::RpcServiceMethod(
+      EventIngest_method_names[4],
+      ::grpc::internal::RpcMethod::BIDI_STREAMING,
+      new ::grpc::internal::BidiStreamingHandler< EventIngest::Service, ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>(
+          [](EventIngest::Service* service,
+             ::grpc::ServerContext* ctx,
+             ::grpc::ServerReaderWriter<::edr::v1::CommandEnvelope,
+             ::edr::v1::CommandEnvelope>* stream) {
+               return service->ControlStream(ctx, stream);
+             }, this)));
 }
 
 EventIngest::Service::~Service() {
@@ -192,6 +220,12 @@ EventIngest::Service::~Service() {
   (void) context;
   (void) reader;
   (void) response;
+  return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
+}
+
+::grpc::Status EventIngest::Service::ControlStream(::grpc::ServerContext* context, ::grpc::ServerReaderWriter< ::edr::v1::CommandEnvelope, ::edr::v1::CommandEnvelope>* stream) {
+  (void) context;
+  (void) stream;
   return ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "");
 }
 

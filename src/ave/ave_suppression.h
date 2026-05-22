@@ -5,9 +5,22 @@
 #ifndef EDR_AVE_SUPPRESSION_H
 #define EDR_AVE_SUPPRESSION_H
 
+#include <stdint.h>
+
 struct EdrConfig;
 struct AVEScanResult;
 struct AVEBehaviorEvent;
+
+typedef struct EdrAveTenantNoiseDecision {
+  char action[24];
+  char policy_version[64];
+  float score_delta;
+  float adjusted_confidence;
+  uint32_t gray_percent;
+  int suppress;
+  int needs_review;
+  int observe_only;
+} EdrAveTenantNoiseDecision;
 
 /** @return 1 命中白名单（应跳过 ONNX），0 未命中或不可用 */
 int edr_ave_file_hash_whitelist_hit(const struct EdrConfig *cfg, const char sha256_hex[65]);
@@ -36,6 +49,20 @@ void edr_ave_behavior_event_apply_ioc(const struct EdrConfig *cfg, struct AVEBeh
  */
 int edr_ave_l4_non_exempt_hit(const struct EdrConfig *cfg, const char sha256_hex[65],
                               int *escalate_malware_out);
+
+/**
+ * P2：租户级 AVE 降噪策略。表 `ave_tenant_noise_policy` 支持 tenant/model/rule 通配 `*`，
+ * action: suppress / review / observe / allow；score_delta 用于调低或调高模型置信度。
+ */
+int edr_ave_tenant_noise_lookup(const struct EdrConfig *cfg, const char *tenant_id, const char *model_version,
+                                const char *rule_name, float raw_confidence, EdrAveTenantNoiseDecision *out);
+
+/**
+ * P2：灰度评估流水。写入 `ave_model_gray_eval`，用于后端评估新模型/租户策略的命中、误报和回滚。
+ */
+int edr_ave_gray_eval_record(const struct EdrConfig *cfg, const char *tenant_id, const char *model_version,
+                             const char *policy_version, const char *rule_name, float raw_confidence,
+                             float adjusted_confidence, const char *decision, const char *shadow_verdict);
 
 /** ONNX 之后：若 IOC 命中，将 final_* 置为 IOC_CONFIRMED，保留 raw_ai_* */
 void edr_ave_overlay_ioc_post_ai(struct AVEScanResult *out, int severity);

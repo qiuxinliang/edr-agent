@@ -30,11 +30,27 @@ typedef struct {
   bool is_negotiate;
 } EdrProtoShellcodeRegion;
 
+typedef struct {
+  char sni[256];
+  char ja3[512];
+  uint16_t tls_version;
+  uint16_t cipher_count;
+  uint16_t extension_count;
+  uint8_t sni_suspicious;
+} EdrTlsClientHelloInfo;
+
 /**
  * 在一段已截断的 TCP payload 中查找用于 shellcode 检测的字节区间。
  * 未识别协议时返回 EDR_PROTO_PARSE_UNKNOWN。
  */
 EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_t len,
                                                     EdrProtoShellcodeRegion *out);
+
+/**
+ * Parse a TLS ClientHello from a TCP payload and build the JA3 string plus SNI.
+ * This does not decrypt traffic and never reads application data.
+ */
+int edr_proto_parse_tls_client_hello(const uint8_t *data, uint32_t len,
+                                     EdrTlsClientHelloInfo *out);
 
 #endif

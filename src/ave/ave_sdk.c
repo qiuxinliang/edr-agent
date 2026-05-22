@@ -404,6 +404,62 @@ static void fill_file_hash_whitelist(AVEScanResult *out) {
   out->skip_ai_analysis = true;
 }
 
+static const char *verdict_name(EDRVerdict v) {
+  switch (v) {
+    case VERDICT_CLEAN:
+      return "clean";
+    case VERDICT_SUSPICIOUS:
+      return "suspicious";
+    case VERDICT_MALWARE:
+      return "malware";
+    case VERDICT_IOC_CONFIRMED:
+      return "ioc_confirmed";
+    case VERDICT_WHITELISTED:
+      return "whitelisted";
+    default:
+      return "unknown";
+  }
+}
+
+static void apply_tenant_noise_policy(const EdrConfig *pcfg, AVEScanResult *out) {
+  if (!pcfg || !out) {
+    return;
+  }
+  if (out->final_verdict == VERDICT_IOC_CONFIRMED || out->final_verdict == VERDICT_WHITELISTED) {
+    return;
+  }
+  char model_version[64];
+  const char *override = getenv("EDR_AVE_POLICY_MODEL_VERSION");
+  if (override && override[0]) {
+    snprintf(model_version, sizeof(model_version), "%s", override);
+  } else {
+    edr_onnx_static_model_version(model_version, sizeof(model_version));
+  }
+  EdrAveTenantNoiseDecision dec;
+  if (!edr_ave_tenant_noise_lookup(pcfg, pcfg->agent.tenant_id, model_version, out->rule_name,
+                                   out->final_confidence, &dec)) {
+    return;
+  }
+  const char *shadow = verdict_name(out->final_verdict);
+  if (dec.suppress) {
+    out->final_verdict = VERDICT_WHITELISTED;
+    out->final_confidence = dec.adjusted_confidence;
+    out->skip_ai_analysis = true;
+    snprintf(out->verification_layer, sizeof(out->verification_layer), "TENANT_POLICY");
+    snprintf(out->rule_name, sizeof(out->rule_name), "tenant_noise_suppressed:%s", dec.policy_version);
+  } else if (dec.needs_review) {
+    out->needs_l2_review = true;
+    out->final_confidence = dec.adjusted_confidence;
+    snprintf(out->verification_layer, sizeof(out->verification_layer), "TENANT_REVIEW");
+  } else if (!dec.observe_only) {
+    out->final_confidence = dec.adjusted_confidence;
+  }
+  if (dec.gray_percent > 0u || dec.observe_only) {
+    (void)edr_ave_gray_eval_record(pcfg, pcfg->agent.tenant_id, model_version, dec.policy_version, out->rule_name,
+                                   out->raw_confidence, out->final_confidence, dec.action, shadow);
+  }
+}
+
 int AVE_Init(const AVEConfig *config) {
   if (g_initialized) {
     return AVE_ERR_ALREADY_INIT;
@@ -812,6 +868,7 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
         }
       }
     }
+    apply_tenant_noise_policy(pcfg, result_out);
     ave_bp_merge_static_if_subject(subject_pid, result_out);
     return AVE_OK;
   }
