@@ -36,6 +36,12 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #include <sys/stat.h>
 
+#ifdef _WIN32
+#define EDR_AGENT_STRDUP _strdup
+#else
+#define EDR_AGENT_STRDUP strdup
+#endif
+
 #ifndef EDR_AGENT_VERSION_STRING
 #define EDR_AGENT_VERSION_STRING "0.3.0"
 #endif
@@ -111,7 +117,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
     return EDR_ERR_INVALID_ARG;
   }
   if (config_path && config_path[0]) {
-    agent->config_path = strdup(config_path);
+    agent->config_path = EDR_AGENT_STRDUP(config_path);
     if (!agent->config_path) {
       return EDR_ERR_INTERNAL;
     }

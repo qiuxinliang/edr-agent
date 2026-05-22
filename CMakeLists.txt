@@ -10,6 +10,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+endif()
+
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
 option(EDR_REQUIRE_GRPC "Fail configure when EDR_WITH_GRPC=ON but gRPC is not found" OFF)
 option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active protoc" ON)
