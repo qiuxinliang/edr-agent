@@ -21,6 +21,9 @@ typedef struct EdrCommandStateRecord {
   int final_record;
   int report_pending;
   int64_t updated_unix_ms;
+  char soar_correlation_id[128];
+  char playbook_run_id[128];
+  char playbook_step_id[128];
   char artifacts[1024];
   char detail[2048];
 } EdrCommandStateRecord;
@@ -33,6 +36,10 @@ void edr_command_state_finish(const char *command_id, const char *command_type,
                               const EdrSoarCommandMeta *meta, const char *response_status,
                               int execution_status, int exit_code, const char *detail,
                               const char *artifacts, int report_pending);
+
+int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap);
+void edr_command_state_mark_reported(const EdrCommandStateRecord *record);
+void edr_command_state_compact_if_needed(void);
 
 #ifdef __cplusplus
 }

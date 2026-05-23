@@ -49,11 +49,30 @@ typedef struct {
     uint64_t total_filtered;
 } EdrCollectorFilterStats;
 
+typedef struct {
+    int etw_or_inotify_enabled;
+    int powershell_visible;
+    int amsi_visible;
+    int security_audit_visible;
+    int auditd_enabled;
+    int auditd_running;
+    int ebpf_enabled;
+    int ebpf_loaded;
+    uint64_t auditd_events;
+    uint64_t ebpf_events;
+    uint64_t collector_dropped;
+    uint64_t queue_dropped;
+    char auditd_last_error[128];
+    char ebpf_last_error[128];
+} EdrCollectorHealth;
+
 int edr_collector_get_event_filter_config(EdrCollectorEventFilterConfig *out_config);
 
 int edr_collector_should_filter_event(const char *provider_name, uint16_t event_id);
 
 int edr_collector_get_filter_stats(EdrCollectorFilterStats *out_stats);
+
+int edr_collector_get_health(EdrCollectorHealth *out_health);
 
 /**
  * 启动采集：Windows 为 ETW 会话（Kernel-Process / File / Network 等）；Linux（M1）为 inotify 目录监视；其它 POSIX 为 stub。

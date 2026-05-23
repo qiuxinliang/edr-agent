@@ -20,6 +20,9 @@ option(EDR_REQUIRE_GRPC "Fail configure when EDR_WITH_GRPC=ON but gRPC is not fo
 option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active protoc" ON)
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
+set(EDR_P0_RULES_BUNDLE_VERSION
+  "edr-dynamic-rules-v1-r240-4032d846"
+  CACHE STRING "P0/dynamic rule bundle version")
 list(APPEND CMAKE_PREFIX_PATH
   /usr/local/opt/grpc
   /opt/homebrew/opt/grpc
@@ -185,8 +188,10 @@ set(EDR_AGENT_SOURCES
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
   src/command/command_state.c
+  src/command/rtq_exec.c
   src/command/shell_exec.c
   src/command/sha256.c
+  src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
@@ -389,7 +394,10 @@ target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/windivert
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 )
-target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
+target_compile_definitions(edr_agent PRIVATE
+  EDR_HAVE_NANOPB=1
+  "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
+)
 if(MSVC)
   target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 endif()

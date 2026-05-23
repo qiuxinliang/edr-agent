@@ -1,0 +1,4 @@
+sample_id,sha256,label,business_context,max_allowed_score,notes
+fp-rmm-001,eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,clean,rmm_enterprise,0.45,approved RMM deployment
+fp-backup-001,dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd,clean,backup_agent,0.40,backup archive staging
+fp-dev-ps-001,cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc,clean,developer_powershell,0.45,encoded command test harness

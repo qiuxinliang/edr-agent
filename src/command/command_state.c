@@ -15,7 +15,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #else
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -24,6 +26,8 @@
 static int64_t state_now_ms(void) {
   return (int64_t)time(NULL) * 1000LL;
 }
+
+static void state_ensure_parent_dir(const char *path);
 
 static void state_default_path(char *out, size_t cap) {
   const char *p = getenv("EDR_COMMAND_STATE_DB");
@@ -43,6 +47,47 @@ static void state_default_path(char *out, size_t cap) {
 #else
   snprintf(out, cap, "%s", "/tmp/edr_command_state.jsonl");
 #endif
+}
+
+static FILE *state_lock_acquire(void) {
+  char path[1024], lock_path[1100];
+  state_default_path(path, sizeof(path));
+  state_ensure_parent_dir(path);
+  snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+  FILE *f = fopen(lock_path, "a+b");
+  if (!f) {
+    return NULL;
+  }
+#ifdef _WIN32
+  HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+  OVERLAPPED ov;
+  memset(&ov, 0, sizeof(ov));
+  if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) {
+    fclose(f);
+    return NULL;
+  }
+#else
+  if (flock(fileno(f), LOCK_EX) != 0) {
+    fclose(f);
+    return NULL;
+  }
+#endif
+  return f;
+}
+
+static void state_lock_release(FILE *f) {
+  if (!f) {
+    return;
+  }
+#ifdef _WIN32
+  HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+  OVERLAPPED ov;
+  memset(&ov, 0, sizeof(ov));
+  (void)UnlockFileEx(h, 0, 1, 0, &ov);
+#else
+  (void)flock(fileno(f), LOCK_UN);
+#endif
+  fclose(f);
 }
 
 static int state_mkdir_one(const char *path) {
@@ -203,6 +248,9 @@ static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) 
   parse_json_string_field_line(line, "command_type", out->command_type, sizeof(out->command_type));
   parse_json_string_field_line(line, "idempotency_key", out->idempotency_key, sizeof(out->idempotency_key));
   parse_json_string_field_line(line, "response_status", out->response_status, sizeof(out->response_status));
+  parse_json_string_field_line(line, "soar_correlation_id", out->soar_correlation_id, sizeof(out->soar_correlation_id));
+  parse_json_string_field_line(line, "playbook_run_id", out->playbook_run_id, sizeof(out->playbook_run_id));
+  parse_json_string_field_line(line, "playbook_step_id", out->playbook_step_id, sizeof(out->playbook_step_id));
   parse_json_string_field_line(line, "artifacts", out->artifacts, sizeof(out->artifacts));
   parse_json_string_field_line(line, "detail", out->detail, sizeof(out->detail));
   out->execution_status = parse_json_int_field_line(line, "execution_status", 0);
@@ -225,11 +273,19 @@ static void append_state_line(const char *line) {
   fclose(f);
 }
 
+static void append_state_line_locked(const char *line) {
+  FILE *lock = state_lock_acquire();
+  append_state_line(line);
+  state_lock_release(lock);
+}
+
 static int count_prior_attempts(const char *command_id, const EdrSoarCommandMeta *meta) {
   char path[1024];
   state_default_path(path, sizeof(path));
+  FILE *lock = state_lock_acquire();
   FILE *f = fopen(path, "r");
   if (!f) {
+    state_lock_release(lock);
     return 0;
   }
   char idem_key[128];
@@ -248,6 +304,7 @@ static int count_prior_attempts(const char *command_id, const EdrSoarCommandMeta
     }
   }
   fclose(f);
+  state_lock_release(lock);
   return retry;
 }
 
@@ -262,6 +319,7 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
   }
   char path[1024];
   state_default_path(path, sizeof(path));
+  FILE *lock = state_lock_acquire();
   FILE *f = fopen(path, "r");
   int retry = 0;
   int duplicate = 0;
@@ -309,6 +367,7 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
            "\"exit_code\":0,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld}",
            cid, ctype, idem, retry, (long long)state_now_ms());
   append_state_line(line);
+  state_lock_release(lock);
   return 0;
 }
 
@@ -319,19 +378,136 @@ void edr_command_state_finish(const char *command_id, const char *command_type,
   int retry = count_prior_attempts(command_id, meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
-  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], line[7600];
+  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], scid[300], run[300], step[300], line[12288];
   json_escape_to(cid, sizeof(cid), command_id ? command_id : "");
   json_escape_to(ctype, sizeof(ctype), command_type ? command_type : "");
   json_escape_to(idem, sizeof(idem), idem_key);
   json_escape_to(st, sizeof(st), response_status ? response_status : "failed");
+  json_escape_to(scid, sizeof(scid), meta ? meta->soar_correlation_id : "");
+  json_escape_to(run, sizeof(run), meta ? meta->playbook_run_id : "");
+  json_escape_to(step, sizeof(step), meta ? meta->playbook_step_id : "");
   json_escape_to(det, sizeof(det), detail ? detail : "");
   json_escape_to(art, sizeof(art), artifacts ? artifacts : "");
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
            "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":%d,\"updated_unix_ms\":%lld,"
+           "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
            "\"artifacts\":%s,\"detail\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
-           (long long)state_now_ms(), art, det);
-  append_state_line(line);
+           (long long)state_now_ms(), scid, run, step, art, det);
+  append_state_line_locked(line);
+  edr_command_state_compact_if_needed();
+}
+
+int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return 0;
+  }
+  char path[1024];
+  state_default_path(path, sizeof(path));
+  FILE *lock = state_lock_acquire();
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    state_lock_release(lock);
+    return 0;
+  }
+  size_t n = 0;
+  char line[8192];
+  while (fgets(line, sizeof(line), f) && n < cap) {
+    if (!strstr(line, "\"final\":1") || !strstr(line, "\"report_pending\":1")) {
+      continue;
+    }
+    fill_record_from_line(line, &out[n]);
+    if (out[n].command_id[0] && out[n].detail[0]) {
+      n++;
+    }
+  }
+  fclose(f);
+  state_lock_release(lock);
+  return (int)n;
+}
+
+void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
+  if (!record || !record->command_id[0]) {
+    return;
+  }
+  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], scid[300], run[300], step[300], line[12288];
+  json_escape_to(cid, sizeof(cid), record->command_id);
+  json_escape_to(ctype, sizeof(ctype), record->command_type);
+  json_escape_to(idem, sizeof(idem), record->idempotency_key);
+  json_escape_to(st, sizeof(st), record->response_status[0] ? record->response_status : "ok");
+  json_escape_to(scid, sizeof(scid), record->soar_correlation_id);
+  json_escape_to(run, sizeof(run), record->playbook_run_id);
+  json_escape_to(step, sizeof(step), record->playbook_step_id);
+  json_escape_to(det, sizeof(det), record->detail);
+  json_escape_to(art, sizeof(art), record->artifacts);
+  snprintf(line, sizeof(line),
+           "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
+           "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
+           "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
+           "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
+           "\"artifacts\":%s,\"detail\":%s}",
+           cid, ctype, idem, st, record->execution_status, record->exit_code, record->retry_count,
+           (long long)state_now_ms(), scid, run, step, art, det);
+  append_state_line_locked(line);
+}
+
+void edr_command_state_compact_if_needed(void) {
+  char path[1024];
+  state_default_path(path, sizeof(path));
+  long max_bytes = 1024L * 1024L;
+  const char *env = getenv("EDR_COMMAND_STATE_MAX_BYTES");
+  if (env && env[0]) {
+    long v = strtol(env, NULL, 10);
+    if (v >= 65536L) {
+      max_bytes = v;
+    }
+  }
+  FILE *lock = state_lock_acquire();
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    state_lock_release(lock);
+    return;
+  }
+  if (fseek(f, 0, SEEK_END) != 0 || ftell(f) <= max_bytes) {
+    fclose(f);
+    state_lock_release(lock);
+    return;
+  }
+  rewind(f);
+  enum { KEEP_LINES = 1200 };
+  char **lines = (char **)calloc(KEEP_LINES, sizeof(char *));
+  if (!lines) {
+    fclose(f);
+    state_lock_release(lock);
+    return;
+  }
+  size_t idx = 0;
+  char buf[8192];
+  while (fgets(buf, sizeof(buf), f)) {
+    free(lines[idx % KEEP_LINES]);
+    lines[idx % KEEP_LINES] = strdup(buf);
+    idx++;
+  }
+  fclose(f);
+  char tmp[1100];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  FILE *out = fopen(tmp, "w");
+  if (out) {
+    size_t start = idx > KEEP_LINES ? idx - KEEP_LINES : 0;
+    for (size_t i = start; i < idx; i++) {
+      char *line = lines[i % KEEP_LINES];
+      if (line) {
+        fputs(line, out);
+      }
+    }
+    fclose(out);
+    (void)rename(tmp, path);
+  }
+  for (size_t i = 0; i < KEEP_LINES; i++) {
+    free(lines[i]);
+  }
+  free(lines);
+  state_lock_release(lock);
 }

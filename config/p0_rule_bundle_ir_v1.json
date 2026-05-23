@@ -1,10 +1,10 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r239-97acafca",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r240-4032d846",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 150,
+  "rule_count": 154,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -652,88 +652,6 @@
       }
     },
     {
-      "id": "R-RMM-001",
-      "title": "RMM 工具静默安装",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219"
-      ],
-      "description": "AnyDesk/TeamViewer/RustDesk/ScreenConnect/Splashtop 等远程管理工具以静默参数安装",
-      "condition": {
-        "command_regex_all": [
-          "(?i)(/silent|--silent|/verysilent|/quiet|/qn|--install)"
-        ],
-        "command_regex_any": [
-          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
-        ]
-      }
-    },
-    {
-      "id": "R-RMM-002",
-      "title": "RMM 工具可疑无人值守配置",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219"
-      ],
-      "description": "远程管理工具命令行包含 unattended/password/assignment 等高风险参数",
-      "condition": {
-        "command_regex_all": [
-          "(?i)(unattended|set\\-password|--password|assignment|grant\\-easy\\-access)"
-        ],
-        "command_regex_any": [
-          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
-        ]
-      }
-    },
-    {
-      "id": "R-RMM-003",
-      "title": "办公软件或脚本拉起 RMM 工具",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219",
-        "T1204.002"
-      ],
-      "description": "Office/脚本宿主/命令解释器作为父进程启动远程管理工具",
-      "condition": {
-        "command_regex_any": [
-          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
-        ],
-        "parent_name_in": [
-          "winword.exe",
-          "excel.exe",
-          "powerpnt.exe",
-          "wscript.exe",
-          "cscript.exe",
-          "powershell.exe",
-          "pwsh.exe",
-          "cmd.exe"
-        ]
-      }
-    },
-    {
-      "id": "R-RMM-004",
-      "title": "RMM 工具服务持久化",
-      "severity": 2,
-      "event_type": "registry_set",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219",
-        "T1543.003"
-      ],
-      "description": "远程管理工具相关服务项被新建或修改",
-      "condition": {
-        "registry_path_regex_any": [
-          "(?i)\\\\services\\\\(anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral)"
-        ]
-      }
-    },
-    {
       "id": "R-LOLBIN-006",
       "title": "Msiexec 远程安装可疑包",
       "severity": 3,
@@ -1069,7 +987,7 @@
       "enabled": true,
       "mitre_ttps": [
         "T1059.001",
-        "T1027"
+        "T1620"
       ],
       "description": "命令行含 Invoke-Expression/IEX 或 Assembly::Load/LoadFrom 等内存加载特征",
       "condition": {
@@ -2698,6 +2616,88 @@
       }
     },
     {
+      "id": "R-RMM-001",
+      "title": "RMM 工具静默安装",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219"
+      ],
+      "description": "AnyDesk/TeamViewer/RustDesk/ScreenConnect/Splashtop 等远程管理工具以静默参数安装",
+      "condition": {
+        "command_regex_all": [
+          "(?i)(/silent|--silent|/verysilent|/quiet|/qn|--install)"
+        ],
+        "command_regex_any": [
+          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
+        ]
+      }
+    },
+    {
+      "id": "R-RMM-002",
+      "title": "RMM 工具可疑无人值守配置",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219"
+      ],
+      "description": "远程管理工具命令行包含 unattended/password/assignment 等高风险参数",
+      "condition": {
+        "command_regex_all": [
+          "(?i)(unattended|set\\-password|--password|assignment|grant\\-easy\\-access)"
+        ],
+        "command_regex_any": [
+          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
+        ]
+      }
+    },
+    {
+      "id": "R-RMM-003",
+      "title": "办公软件或脚本拉起 RMM 工具",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1204.002"
+      ],
+      "description": "Office/脚本宿主/命令解释器作为父进程启动远程管理工具",
+      "condition": {
+        "command_regex_any": [
+          "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
+        ],
+        "parent_name_in": [
+          "winword.exe",
+          "excel.exe",
+          "powerpnt.exe",
+          "wscript.exe",
+          "cscript.exe",
+          "powershell.exe",
+          "pwsh.exe",
+          "cmd.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-RMM-004",
+      "title": "RMM 工具服务持久化",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1543.003"
+      ],
+      "description": "远程管理工具相关服务项被新建或修改",
+      "condition": {
+        "registry_path_regex_any": [
+          "(?i)\\\\services\\\\(anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral)"
+        ]
+      }
+    },
+    {
       "id": "R-RMM-005",
       "title": "RMM工具DLL侧加载/非标准子进程",
       "severity": 3,
@@ -3086,6 +3086,125 @@
       }
     },
     {
+      "id": "R-CRED-008",
+      "title": "读取本地凭据注册表Hive",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.002",
+        "T1003.003"
+      ],
+      "description": "检测直接读取本地SAM/SYSTEM/SECURITY注册表Hive的行为，常见于凭据转储、离线哈希提取和勒索前凭据收集。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Windows\\\\System32\\\\config\\\\(SAM|SYSTEM|SECURITY)$",
+          "(?i)\\\\Windows\\\\System32\\\\config\\\\RegBack\\\\(SAM|SYSTEM|SECURITY)$"
+        ]
+      }
+    },
+    {
+      "id": "R-EXFIL-006",
+      "title": "用户数据归档打包落地",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1560.001",
+        "T1074.001"
+      ],
+      "description": "检测常见压缩工具或PowerShell在用户目录、下载目录、临时目录或ProgramData中生成归档文件，覆盖勒索/外传前的数据打包阶段。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Users\\\\[^\\\\]+\\\\(Desktop|Downloads|Documents|AppData\\\\Local\\\\Temp)\\\\.*\\.(zip|7z|rar|tar|gz|tgz)$",
+          "(?i)\\\\ProgramData\\\\.*\\.(zip|7z|rar|tar|gz|tgz)$"
+        ],
+        "process_name_in": [
+          "7z.exe",
+          "7za.exe",
+          "rar.exe",
+          "winrar.exe",
+          "tar.exe",
+          "powershell.exe",
+          "pwsh.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-EXFIL-007",
+      "title": "读取云凭据和命令历史",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1552.001",
+        "T1530",
+        "T1567.002"
+      ],
+      "description": "检测读取云CLI凭据、配置和PowerShell历史记录，覆盖云凭据窃取、命令历史敏感信息泄露和后续云侧横向移动入口。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Users\\\\[^\\\\]+\\\\[.]aws\\\\credentials$",
+          "(?i)\\\\Users\\\\[^\\\\]+\\\\[.]azure\\\\.*",
+          "(?i)\\\\Users\\\\[^\\\\]+\\\\AppData\\\\Roaming\\\\gcloud\\\\.*",
+          "(?i)\\\\Users\\\\[^\\\\]+\\\\AppData\\\\Roaming\\\\Microsoft\\\\Windows\\\\PowerShell\\\\PSReadLine\\\\ConsoleHost_history\\.txt$"
+        ]
+      }
+    },
+    {
+      "id": "R-NET-001",
+      "title": "代理隧道工具连接常见代理端口",
+      "severity": 3,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1090",
+        "T1572"
+      ],
+      "description": "检测chisel/frp/ngrok/cloudflared/plink/ssh/tor等隧道或代理工具连接常见代理端口，用于发现代理链、反连隧道和隐蔽转发。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)(chisel|frpc|frps|ngrok|cloudflared|plink|ssh\\.exe|tor\\.exe)"
+        ],
+        "remote_port_in": [
+          1080,
+          3128,
+          8080,
+          8118,
+          9001,
+          9050
+        ]
+      }
+    },
+    {
+      "id": "R-LMOVE-015",
+      "title": "命令行工具访问内网数据服务端口",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1046",
+        "T1021",
+        "T1018"
+      ],
+      "description": "检测命令行工具、扫描工具或脚本解释器连接数据库/缓存/搜索服务端口，覆盖内网资源发现、凭据复用和横向移动前探测。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)(sqlcmd|mysql|psql|redis-cli|mongosh|mongo\\.exe|nmap|masscan|netcat|nc\\.exe|powershell|pwsh)"
+        ],
+        "remote_port_in": [
+          1433,
+          3306,
+          5432,
+          6379,
+          9200,
+          9300,
+          11211,
+          27017
+        ]
+      }
+    },
+    {
       "id": "R-CLOUD-001",
       "title": "云CLI工具从端点执行(Azure CLI/gcloud/aws)",
       "severity": 3,
@@ -3133,40 +3252,6 @@
           "(?i)aws\\s+s3\\s+(cp|sync|mv).*\\-\\-recursive",
           "(?i)megatools\\s+(dl|put)",
           "(?i)onedrive\\-uploader"
-        ]
-      }
-    },
-    {
-      "id": "R-C2-001",
-      "title": "443 port C2 communication from non-browser process",
-      "severity": 2,
-      "event_type": "network_connect",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1071.001",
-        "T1043"
-      ],
-      "description": "Non-browser process connecting to 443/8443 - potential HTTPS C2 beacon. Process whitelist excludes known browsers.",
-      "condition": {
-        "remote_port_in": [
-          443,
-          8443
-        ],
-        "process_name_not_in": [
-          "chrome.exe",
-          "firefox.exe",
-          "msedge.exe",
-          "iexplore.exe",
-          "brave.exe",
-          "opera.exe",
-          "safari.exe",
-          "browser_broker.exe",
-          "webviewhost.exe",
-          "msedgewebview2.exe",
-          "svchost.exe",
-          "searchapp.exe",
-          "searchhost.exe",
-          "startmenuexperiencehost.exe"
         ]
       }
     }

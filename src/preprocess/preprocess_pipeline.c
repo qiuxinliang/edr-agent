@@ -46,12 +46,27 @@ static EdrEventBus *s_bus;
 static char s_cfg_endpoint_id[128];
 static char s_cfg_tenant_id[128];
 
+static void copy_trunc(char *dst, size_t cap, const char *src) {
+  size_t i = 0;
+  if (!dst || cap == 0u) {
+    return;
+  }
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+  for (; i + 1u < cap && src[i]; i++) {
+    dst[i] = src[i];
+  }
+  dst[i] = '\0';
+}
+
 static void sync_agent_ids_from_cfg(const EdrConfig *cfg) {
   if (!cfg) {
     return;
   }
-  snprintf(s_cfg_endpoint_id, sizeof(s_cfg_endpoint_id), "%s", cfg->agent.endpoint_id);
-  snprintf(s_cfg_tenant_id, sizeof(s_cfg_tenant_id), "%s", cfg->agent.tenant_id);
+  copy_trunc(s_cfg_endpoint_id, sizeof(s_cfg_endpoint_id), cfg->agent.endpoint_id);
+  copy_trunc(s_cfg_tenant_id, sizeof(s_cfg_tenant_id), cfg->agent.tenant_id);
 }
 
 static void apply_agent_ids_to_record(EdrBehaviorRecord *br) {
@@ -59,10 +74,10 @@ static void apply_agent_ids_to_record(EdrBehaviorRecord *br) {
     return;
   }
   if (s_cfg_tenant_id[0]) {
-    snprintf(br->tenant_id, sizeof(br->tenant_id), "%s", s_cfg_tenant_id);
+    copy_trunc(br->tenant_id, sizeof(br->tenant_id), s_cfg_tenant_id);
   }
   if (s_cfg_endpoint_id[0] && strcmp(s_cfg_endpoint_id, "auto") != 0) {
-    snprintf(br->endpoint_id, sizeof(br->endpoint_id), "%s", s_cfg_endpoint_id);
+    copy_trunc(br->endpoint_id, sizeof(br->endpoint_id), s_cfg_endpoint_id);
   }
 }
 

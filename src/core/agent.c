@@ -16,6 +16,7 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
+#include "edr/command.h"
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
@@ -230,6 +231,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_poll_remote_config(agent, &last_remote_ns);
         edr_agent_poll_attack_surface(agent);
         edr_agent_poll_engine_health(agent, &last_health_ns);
+        edr_command_poll_reliable_delivery();
       }
       edr_collector_stop();
     }
@@ -289,22 +291,31 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   int ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
 
   char rules_ver[96], static_ver[48], behavior_ver[48], ioc_ver[48];
+  char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1024];
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
   EdrResourceSample rs;
+  EdrCollectorHealth ch;
   memset(&grpc_rt, 0, sizeof(grpc_rt));
   memset(&http_rt, 0, sizeof(http_rt));
   memset(&rs, 0, sizeof(rs));
+  memset(&ch, 0, sizeof(ch));
   edr_grpc_client_get_runtime(&grpc_rt);
   edr_ingest_http_get_runtime(&http_rt);
   edr_resource_get_sample(&rs);
+  (void)edr_collector_get_health(&ch);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
   EdrShellcodeRulesStatus shell_rules;
   memset(&shell_rules, 0, sizeof(shell_rules));
   edr_shellcode_known_get_status(&shell_rules);
   char shell_source[48], shell_version[128], shell_error[192], shell_rb[128], shell_last_rule[128], shell_last_src[48];
+  char audit_err[192], ebpf_err[192];
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
+  json_escape_small(agent->cfg.detection_policy.source, det_policy_source, sizeof(det_policy_source));
+  json_escape_small(agent->cfg.detection_policy.policy_version, det_policy_version, sizeof(det_policy_version));
+  json_escape_small(agent->cfg.detection_policy.rollback_version, det_policy_rollback, sizeof(det_policy_rollback));
+  json_escape_small(agent->cfg.detection_policy.audit_id, det_policy_audit, sizeof(det_policy_audit));
   json_escape_small(ave_ok ? avst.static_model_version : "", static_ver, sizeof(static_ver));
   json_escape_small(ave_ok ? avst.behavior_model_version : "", behavior_ver, sizeof(behavior_ver));
   json_escape_small(ave_ok ? avst.ioc_rules_version : "", ioc_ver, sizeof(ioc_ver));
@@ -316,6 +327,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(shell_rules.last_match_source, shell_last_src, sizeof(shell_last_src));
   json_escape_small(grpc_rt.last_error, grpc_err, sizeof(grpc_err));
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
+  json_escape_small(ch.auditd_last_error, audit_err, sizeof(audit_err));
+  json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
 
   char body[8192];
   int n = snprintf(
@@ -333,6 +346,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"throttle_active\":%s,\"sample_count\":%llu},"
       "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\",\"rule_version\":\"%s\","
       "\"rules_count\":%u,\"last_degrade_reason\":\"%s\"},"
+      "\"suppression_policy\":{\"source\":\"%s\",\"policy_version\":\"%s\","
+      "\"rollback_version\":\"%s\",\"audit_id\":\"%s\"},"
+      "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,\"powershell_visible\":%s,"
+      "\"amsi_visible\":%s,\"security_audit_visible\":%s,"
+      "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
+      "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
+      "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+      "\"auditd_last_error\":\"%s\",\"ebpf_last_error\":\"%s\"},"
       "\"ave\":{\"enabled\":%s,\"mode\":\"triggered\",\"static_model_version\":\"%s\","
       "\"behavior_model_version\":\"%s\",\"ioc_rules_version\":\"%s\","
       "\"queue_depth\":%d,\"queue_capacity\":%u,\"active_scans\":%d,"
@@ -368,6 +389,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       rs.throttle_active ? "true" : "false", (unsigned long long)rs.sample_count,
       rules_ver, agent->cfg.preprocessing.rules_count,
       rs.throttle_active ? "resource_throttle" : "",
+      det_policy_source, det_policy_version, det_policy_rollback, det_policy_audit,
+      ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
+      ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
+      ch.auditd_enabled ? "true" : "false", ch.auditd_running ? "true" : "false",
+      (unsigned long long)ch.auditd_events,
+      ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
+      (unsigned long long)ch.ebpf_events, (unsigned long long)ch.collector_dropped,
+      (unsigned long long)ch.queue_dropped, audit_err, ebpf_err,
       ave_ok && avst.initialized ? "true" : "false", static_ver, behavior_ver, ioc_ver,
       ave_ok ? avst.behavior_event_queue_size : 0, ave_ok ? avst.behavior_queue_capacity : 0u,
       ave_ok ? avst.active_scan_count : 0,

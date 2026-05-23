@@ -41,6 +41,8 @@ typedef struct EdrConfig {
     /** Windows：订阅 WFAS 防火墙 ETW（§19.10）；失败时跳过不致命 */
     bool etw_firewall_provider;
     bool ebpf_enabled;
+    bool auditd_enabled;
+    char auditd_log_path[512];
     int poll_interval_s;
     uint32_t max_event_queue_size;
   } collection;
@@ -55,6 +57,20 @@ typedef struct EdrConfig {
     EdrEmitRule *rules;
     uint32_t rules_count;
   } preprocessing;
+
+  struct {
+    char source[32];
+    char audit_id[128];
+    char policy_version[64];
+    char rollback_version[64];
+    char fp_policy_version[64];
+    char fp_rollback_version[64];
+    char rmm_policy_version[64];
+    char rmm_rollback_version[64];
+    char allow_paths[2048];
+    char script_dirs[2048];
+    char management_tools[1024];
+  } detection_policy;
 
   struct {
     bool enabled;

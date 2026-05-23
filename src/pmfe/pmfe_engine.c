@@ -1080,9 +1080,11 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
     const char *stomp_path = bm.first_stomp_path[0] ? bm.first_stomp_path : "-";
     snprintf(detail, detail_cap,
              "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
-             "first_stomp=%.200s vad_hint=%.64s%s%.240s",
+             "first_stomp=%.200s thread_start=unknown executable_private_page=%u private_page_origin=unknown "
+             "cross_process_write=unknown module_path_consistency=%s module_signature=unknown vad_hint=%.64s%s%.240s",
              pid, (unsigned)task->priority, (unsigned)task->band, bm.module_count, bm.stomp_suspicious, bm.disk_hash_ok,
-             regions, cand, stomp_path, vh, vad_extra[0] ? " | " : "", vad_extra[0] ? vad_extra : "");
+             regions, cand, stomp_path, cand ? 1u : 0u, bm.stomp_suspicious ? "mismatch" : "ok", vh,
+             vad_extra[0] ? " | " : "", vad_extra[0] ? vad_extra : "");
   }
   return 0;
 }
@@ -1508,9 +1510,12 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
 
   snprintf(detail, detail_cap,
            "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
-           "file_exec_maps=%u first_stomp=%.200s | %s",
+           "file_exec_maps=%u first_stomp=%.200s thread_start=unknown executable_private_page=%u "
+           "private_page_origin=%s cross_process_write=unknown module_path_consistency=%s module_signature=unknown | %s",
            pid_u, (unsigned)task->priority, (unsigned)task->band, baseline_mods_u, stomp, disk_ok, regions,
-           private_exec, file_exec_maps, stomp_disp, extra);
+           private_exec, file_exec_maps, stomp_disp, private_exec ? 1u : 0u,
+           private_exec > file_exec_maps ? "anonymous_or_memfd" : "file_backed",
+           stomp ? "mismatch" : "ok", extra);
   return 0;
 }
 

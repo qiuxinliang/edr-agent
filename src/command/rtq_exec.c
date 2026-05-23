@@ -5,11 +5,15 @@
 #include <time.h>
 
 #ifdef _WIN32
+#include <winsock2.h>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <iphlpapi.h>
+#include <winevt.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#endif
 #else
 #include <dirent.h>
 #include <sys/stat.h>
@@ -48,6 +52,18 @@ typedef struct rtq_filter {
     char file_ext[16];
     long long file_size_min;
     long long file_size_max;
+
+    int has_registry;
+    char registry_path[520];
+    char registry_value[260];
+
+    int has_eventlog;
+    char eventlog_channel[128];
+    char eventlog_query[512];
+
+    int has_script;
+    char script_content[1024];
+    char script_engine[64];
 } rtq_filter;
 
 static int parse_rtq_filter(const uint8_t *pl, size_t len, rtq_filter *f) {
@@ -123,8 +139,43 @@ static int parse_rtq_filter(const uint8_t *pl, size_t len, rtq_filter *f) {
         edr_parse_json_string(pl, len, "file_ext", v, sizeof(v));
         if (v[0]) { f->has_file = 1; snprintf(f->file_ext, sizeof(f->file_ext), "%s", v); }
     }
+    {
+        char v[520] = {0};
+        edr_parse_json_string(pl, len, "registry_path", v, sizeof(v));
+        if (v[0]) { f->has_registry = 1; snprintf(f->registry_path, sizeof(f->registry_path), "%s", v); }
+    }
+    {
+        char v[260] = {0};
+        edr_parse_json_string(pl, len, "registry_value", v, sizeof(v));
+        if (v[0]) { f->has_registry = 1; snprintf(f->registry_value, sizeof(f->registry_value), "%s", v); }
+    }
+    {
+        char v[128] = {0};
+        edr_parse_json_string(pl, len, "eventlog_channel", v, sizeof(v));
+        if (v[0]) { f->has_eventlog = 1; snprintf(f->eventlog_channel, sizeof(f->eventlog_channel), "%s", v); }
+    }
+    {
+        char v[512] = {0};
+        edr_parse_json_string(pl, len, "eventlog_query", v, sizeof(v));
+        if (v[0]) { f->has_eventlog = 1; snprintf(f->eventlog_query, sizeof(f->eventlog_query), "%s", v); }
+    }
+    {
+        char v[1024] = {0};
+        edr_parse_json_string(pl, len, "script_content", v, sizeof(v));
+        if (v[0]) {
+            f->has_script = 1;
+            f->has_process = 1;
+            snprintf(f->script_content, sizeof(f->script_content), "%s", v);
+            if (!f->process_cmdline[0]) snprintf(f->process_cmdline, sizeof(f->process_cmdline), "%s", v);
+        }
+    }
+    {
+        char v[64] = {0};
+        edr_parse_json_string(pl, len, "script_engine", v, sizeof(v));
+        if (v[0]) { f->has_script = 1; snprintf(f->script_engine, sizeof(f->script_engine), "%s", v); }
+    }
 
-    return (f->has_process || f->has_network || f->has_file) ? 0 : -1;
+    return (f->has_process || f->has_network || f->has_file || f->has_registry || f->has_eventlog || f->has_script) ? 0 : -1;
 }
 
 static void append_json_escaped(char *buf, int cap, int *offset, const char *s) {
@@ -263,7 +314,63 @@ static int str_contains_icase(const char *haystack, const char *needle) {
 }
 
 #ifdef _WIN32
-static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
+static void query_process_path(DWORD pid, char *path, size_t cap) {
+    if (!path || cap == 0) return;
+    path[0] = '\0';
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hp) {
+        DWORD sz = (DWORD)cap;
+        if (!QueryFullProcessImageNameA(hp, 0, path, &sz)) path[0] = '\0';
+        CloseHandle(hp);
+    }
+}
+
+static void query_process_user(DWORD pid, char *user, size_t cap) {
+    if (!user || cap == 0) return;
+    user[0] = '\0';
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return;
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(hp, TOKEN_QUERY, &tok)) { CloseHandle(hp); return; }
+    DWORD need = 0;
+    GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+    TOKEN_USER *tu = (TOKEN_USER *)malloc(need);
+    if (tu && GetTokenInformation(tok, TokenUser, tu, need, &need)) {
+        char name[128] = {0}, domain[128] = {0};
+        DWORD nlen = sizeof(name), dlen = sizeof(domain);
+        SID_NAME_USE use;
+        if (LookupAccountSidA(NULL, tu->User.Sid, name, &nlen, domain, &dlen, &use)) {
+            snprintf(user, cap, "%s\\%s", domain, name);
+        }
+    }
+    free(tu);
+    CloseHandle(tok);
+    CloseHandle(hp);
+}
+
+static void query_process_cmdline_wmic(DWORD pid, char *cmd, size_t cap) {
+    if (!cmd || cap == 0) return;
+    cmd[0] = '\0';
+    char q[256];
+    snprintf(q, sizeof(q), "wmic process where ProcessId=%lu get CommandLine /value 2>NUL", (unsigned long)pid);
+    FILE *p = _popen(q, "r");
+    if (!p) return;
+    char line[2048];
+    while (fgets(line, sizeof(line), p)) {
+        char *v = strstr(line, "CommandLine=");
+        if (v) {
+            v += strlen("CommandLine=");
+            size_t n = strcspn(v, "\r\n");
+            if (n >= cap) n = cap - 1;
+            memcpy(cmd, v, n);
+            cmd[n] = '\0';
+            break;
+        }
+    }
+    _pclose(p);
+}
+
+static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
     HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (h == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe;
@@ -278,28 +385,36 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
             if (f->process_name[0] && !str_contains_icase(name, f->process_name)) ok = 0;
             if (f->process_pid_max > 0 && (int)pe.th32ProcessID > f->process_pid_max) ok = 0;
             if (f->process_pid_min > 0 && (int)pe.th32ProcessID < f->process_pid_min) ok = 0;
-            if (f->process_cmdline[0] || f->process_user[0]) ok = 0;
 
             char path[520] = {0};
-            if (ok && f->process_path[0]) {
-                HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-                if (hp) {
-                    DWORD sz = sizeof(path);
-                    if (!QueryFullProcessImageNameA(hp, 0, path, &sz)) path[0] = '\0';
-                    CloseHandle(hp);
-                }
+            char user[260] = {0};
+            char cmdline[2048] = {0};
+            if (ok && (f->process_path[0] || f->process_cmdline[0] || f->script_content[0])) {
+                query_process_path(pe.th32ProcessID, path, sizeof(path));
                 if (!path[0] || !str_contains_icase(path, f->process_path)) ok = 0;
             }
+            if (ok && f->process_user[0]) {
+                query_process_user(pe.th32ProcessID, user, sizeof(user));
+                if (!user[0] || !str_contains_icase(user, f->process_user)) ok = 0;
+            }
+            if (ok && (f->process_cmdline[0] || f->script_content[0] || f->script_engine[0])) {
+                query_process_cmdline_wmic(pe.th32ProcessID, cmdline, sizeof(cmdline));
+                if (f->process_cmdline[0] && !str_contains_icase(cmdline, f->process_cmdline)) ok = 0;
+                if (f->script_engine[0] && !str_contains_icase(cmdline, f->script_engine)) ok = 0;
+            }
 
-            if (ok && count < RTQ_MAX_RESULTS && *offset < cap - 512) {
-                if (count > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+            if (ok && *total < RTQ_MAX_RESULTS && *offset < cap - 1024) {
+                if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
                     "{\"type\":\"process\",\"pid\":%lu,\"name\":\"", (unsigned long)pe.th32ProcessID);
                 append_json_escaped(buf, cap, offset, name);
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"ppid\":%lu",
                     (unsigned long)pe.th32ParentProcessID);
                 if (path[0]) append_json_kv_str(buf, cap, offset, "path", path);
+                if (user[0]) append_json_kv_str(buf, cap, offset, "user", user);
+                if (cmdline[0]) append_json_kv_str(buf, cap, offset, "cmdline", cmdline);
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+                (*total)++;
                 count++;
             }
         } while (Process32NextW(h, &pe));
@@ -308,9 +423,223 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset) {
     return count;
 }
 
-static int match_network(rtq_filter *f, char *buf, int cap, int *offset) {
-    (void)f; (void)buf; (void)cap; (void)offset;
-    return 0;
+static void ipv4_to_text(DWORD addr, char *out, size_t cap) {
+    struct in_addr a;
+    a.S_un.S_addr = addr;
+    snprintf(out, cap, "%s", inet_ntoa(a));
+}
+
+static const char *tcp_state_text(DWORD s) {
+    switch (s) {
+    case MIB_TCP_STATE_CLOSED: return "CLOSED";
+    case MIB_TCP_STATE_LISTEN: return "LISTEN";
+    case MIB_TCP_STATE_SYN_SENT: return "SYN_SENT";
+    case MIB_TCP_STATE_SYN_RCVD: return "SYN_RCVD";
+    case MIB_TCP_STATE_ESTAB: return "ESTABLISHED";
+    case MIB_TCP_STATE_FIN_WAIT1: return "FIN_WAIT1";
+    case MIB_TCP_STATE_FIN_WAIT2: return "FIN_WAIT2";
+    case MIB_TCP_STATE_CLOSE_WAIT: return "CLOSE_WAIT";
+    case MIB_TCP_STATE_CLOSING: return "CLOSING";
+    case MIB_TCP_STATE_LAST_ACK: return "LAST_ACK";
+    case MIB_TCP_STATE_TIME_WAIT: return "TIME_WAIT";
+    case MIB_TCP_STATE_DELETE_TCB: return "DELETE_TCB";
+    default: return "UNKNOWN";
+    }
+}
+
+static int append_win_network(rtq_filter *f, const char *proto, const char *state,
+                              const char *local_ip, int local_port, const char *remote_ip,
+                              int remote_port, DWORD pid, char *buf, int cap, int *offset, int *total) {
+    if (f->network_proto[0] && !str_contains_icase(proto, f->network_proto)) return 0;
+    if (f->network_state[0] && !str_contains_icase(state, f->network_state)) return 0;
+    if (f->network_remote_ip[0] && !str_contains_icase(remote_ip, f->network_remote_ip)) return 0;
+    if (f->network_remote_port > 0 && remote_port != f->network_remote_port) return 0;
+    if (*total >= RTQ_MAX_RESULTS || *offset >= cap - 1024) return 0;
+    if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"network\"");
+    append_json_kv_str(buf, cap, offset, "proto", proto);
+    append_json_kv_str(buf, cap, offset, "state", state);
+    append_json_kv_str(buf, cap, offset, "local_ip", local_ip);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"local_port\":%d", local_port);
+    append_json_kv_str(buf, cap, offset, "remote_ip", remote_ip);
+    if (remote_port > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"remote_port\":%d", remote_port);
+    if (pid > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"pid\":%lu", (unsigned long)pid);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+    (*total)++;
+    return 1;
+}
+
+static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    int count = 0;
+    DWORD sz = 0;
+    GetExtendedTcpTable(NULL, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    PMIB_TCPTABLE_OWNER_PID tcp = (PMIB_TCPTABLE_OWNER_PID)malloc(sz);
+    if (tcp && GetExtendedTcpTable(tcp, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < tcp->dwNumEntries && *total < RTQ_MAX_RESULTS; i++) {
+            char lip[64], rip[64];
+            ipv4_to_text(tcp->table[i].dwLocalAddr, lip, sizeof(lip));
+            ipv4_to_text(tcp->table[i].dwRemoteAddr, rip, sizeof(rip));
+            int lp = ntohs((u_short)tcp->table[i].dwLocalPort);
+            int rp = ntohs((u_short)tcp->table[i].dwRemotePort);
+            if (append_win_network(f, "tcp", tcp_state_text(tcp->table[i].dwState), lip, lp, rip, rp, tcp->table[i].dwOwningPid, buf, cap, offset, total)) count++;
+        }
+    }
+    free(tcp);
+    sz = 0;
+    GetExtendedUdpTable(NULL, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    PMIB_UDPTABLE_OWNER_PID udp = (PMIB_UDPTABLE_OWNER_PID)malloc(sz);
+    if (udp && GetExtendedUdpTable(udp, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < udp->dwNumEntries && *total < RTQ_MAX_RESULTS; i++) {
+            char lip[64];
+            ipv4_to_text(udp->table[i].dwLocalAddr, lip, sizeof(lip));
+            int lp = ntohs((u_short)udp->table[i].dwLocalPort);
+            if (append_win_network(f, "udp", "", lip, lp, "", 0, udp->table[i].dwOwningPid, buf, cap, offset, total)) count++;
+        }
+    }
+    free(udp);
+    return count;
+}
+
+static int append_win_file_result(rtq_filter *f, const char *path, const WIN32_FIND_DATAA *fd,
+                                  char *buf, int cap, int *offset, int *total) {
+    if (!path || !fd || *total >= RTQ_MAX_RESULTS || *offset >= cap - 1024) return 0;
+    if (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return 0;
+    if (f->file_path[0] && !str_contains_icase(path, f->file_path)) return 0;
+    if (!file_has_ext(path, f->file_ext)) return 0;
+    LARGE_INTEGER sz;
+    sz.HighPart = (LONG)fd->nFileSizeHigh;
+    sz.LowPart = fd->nFileSizeLow;
+    if (f->file_size_min > 0 && sz.QuadPart < f->file_size_min) return 0;
+    if (f->file_size_max > 0 && sz.QuadPart > f->file_size_max) return 0;
+    char sha[65] = {0};
+    if (!hash_file_if_needed(path, f->file_sha256, sha)) return 0;
+    if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"file\",\"path\":\"");
+    append_json_escaped(buf, cap, offset, path);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\",\"size\":%lld", (long long)sz.QuadPart);
+    if (sha[0]) append_json_kv_str(buf, cap, offset, "sha256", sha);
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+    (*total)++;
+    return 1;
+}
+
+static void scan_win_files_limited(rtq_filter *f, const char *root, int depth, int *scanned,
+                                   char *buf, int cap, int *offset, int *total) {
+    if (!root || !root[0] || depth < 0 || *scanned >= RTQ_FILE_SCAN_MAX || *total >= RTQ_MAX_RESULTS) return;
+    DWORD attr = GetFileAttributesA(root);
+    if (attr == INVALID_FILE_ATTRIBUTES) return;
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        WIN32_FIND_DATAA fd;
+        memset(&fd, 0, sizeof(fd));
+        HANDLE h = FindFirstFileA(root, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            (*scanned)++;
+            (void)append_win_file_result(f, root, &fd, buf, cap, offset, total);
+            FindClose(h);
+        }
+        return;
+    }
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", root);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        char child[1024];
+        snprintf(child, sizeof(child), "%s\\%s", root, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scan_win_files_limited(f, child, depth - 1, scanned, buf, cap, offset, total);
+        } else {
+            (*scanned)++;
+            (void)append_win_file_result(f, child, &fd, buf, cap, offset, total);
+        }
+    } while (FindNextFileA(h, &fd) && *scanned < RTQ_FILE_SCAN_MAX && *total < RTQ_MAX_RESULTS);
+    FindClose(h);
+}
+
+static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    int scanned = 0;
+    int before = *total;
+    if (f->file_path[0]) {
+        scan_win_files_limited(f, f->file_path, RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
+    } else if (f->file_ext[0]) {
+        scan_win_files_limited(f, "C:\\Windows\\Temp", RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
+        scan_win_files_limited(f, "C:\\Users\\Public", RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
+    }
+    return *total - before;
+}
+
+static int split_registry_path(const char *path, HKEY *root, char *subkey, size_t cap) {
+    if (!path || !root || !subkey || cap == 0) return 0;
+    const char *p = strchr(path, '\\');
+    size_t n = p ? (size_t)(p - path) : strlen(path);
+    char hive[64];
+    if (n >= sizeof(hive)) n = sizeof(hive) - 1;
+    memcpy(hive, path, n);
+    hive[n] = '\0';
+    if (_stricmp(hive, "HKLM") == 0 || _stricmp(hive, "HKEY_LOCAL_MACHINE") == 0) *root = HKEY_LOCAL_MACHINE;
+    else if (_stricmp(hive, "HKCU") == 0 || _stricmp(hive, "HKEY_CURRENT_USER") == 0) *root = HKEY_CURRENT_USER;
+    else if (_stricmp(hive, "HKCR") == 0 || _stricmp(hive, "HKEY_CLASSES_ROOT") == 0) *root = HKEY_CLASSES_ROOT;
+    else if (_stricmp(hive, "HKU") == 0 || _stricmp(hive, "HKEY_USERS") == 0) *root = HKEY_USERS;
+    else return 0;
+    snprintf(subkey, cap, "%s", p ? p + 1 : "");
+    return 1;
+}
+
+static int match_registry(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    HKEY root, key;
+    char subkey[520];
+    if (!split_registry_path(f->registry_path, &root, subkey, sizeof(subkey))) return 0;
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) return 0;
+    int count = 0;
+    for (DWORD i = 0; i < 128 && *total < RTQ_MAX_RESULTS; i++) {
+        char name[260];
+        BYTE data[1024];
+        DWORD name_len = sizeof(name), data_len = sizeof(data), type = 0;
+        LONG rc = RegEnumValueA(key, i, name, &name_len, NULL, &type, data, &data_len);
+        if (rc != ERROR_SUCCESS) break;
+        if (f->registry_value[0] && !str_contains_icase(name, f->registry_value)) continue;
+        if (*offset >= cap - 1024) break;
+        if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"registry\"");
+        append_json_kv_str(buf, cap, offset, "key", f->registry_path);
+        append_json_kv_str(buf, cap, offset, "value", name[0] ? name : "(Default)");
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"reg_type\":%lu", (unsigned long)type);
+        if ((type == REG_SZ || type == REG_EXPAND_SZ) && data_len > 0) append_json_kv_str(buf, cap, offset, "data", (const char *)data);
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+        (*total)++;
+        count++;
+    }
+    RegCloseKey(key);
+    return count;
+}
+
+static int match_eventlog(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    wchar_t channel[128];
+    wchar_t query[512];
+    MultiByteToWideChar(CP_UTF8, 0, f->eventlog_channel[0] ? f->eventlog_channel : "System", -1, channel, 128);
+    MultiByteToWideChar(CP_UTF8, 0, f->eventlog_query[0] ? f->eventlog_query : "*", -1, query, 512);
+    EVT_HANDLE h = EvtQuery(NULL, channel, query, EvtQueryChannelPath | EvtQueryReverseDirection);
+    if (!h) return 0;
+    int count = 0;
+    EVT_HANDLE events[16];
+    DWORD returned = 0;
+    while (*total < RTQ_MAX_RESULTS && EvtNext(h, 16, events, 1000, 0, &returned)) {
+        for (DWORD i = 0; i < returned && *total < RTQ_MAX_RESULTS; i++) {
+            if (*offset >= cap - 512) { EvtClose(events[i]); continue; }
+            if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"eventlog\"");
+            append_json_kv_str(buf, cap, offset, "channel", f->eventlog_channel[0] ? f->eventlog_channel : "System");
+            append_json_kv_str(buf, cap, offset, "query", f->eventlog_query[0] ? f->eventlog_query : "*");
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+            (*total)++;
+            count++;
+            EvtClose(events[i]);
+        }
+    }
+    EvtClose(h);
+    return count;
 }
 #else
 static void read_proc_exe_path(int pid, char *out, size_t out_cap) {
@@ -553,18 +882,27 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     int has_proc = filter.has_process;
     int has_net = filter.has_network;
     int has_file = filter.has_file;
+    int has_registry = filter.has_registry;
+    int has_eventlog = filter.has_eventlog;
 
     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
         "{\"results\":[\n");
 
 #ifdef _WIN32
     if (has_proc) {
-        int n = match_processes(&filter, result, RTQ_MAX_RESULT_STR, &offset);
-        if (n >= 0) total += n;
+        (void)match_processes(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
     if (has_net) {
-        int n = match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset);
-        if (n >= 0) total += n;
+        (void)match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+    }
+    if (has_file) {
+        (void)match_files(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+    }
+    if (has_registry) {
+        (void)match_registry(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+    }
+    if (has_eventlog) {
+        (void)match_eventlog(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
 #else
     if (has_proc) {
@@ -578,6 +916,8 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     }
 #endif
     (void)has_file;
+    (void)has_registry;
+    (void)has_eventlog;
 
     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
         "\n],\"total\":%d,\"error\":null}", total);

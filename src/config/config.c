@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r218-9ae52519"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r240-4032d846"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -375,6 +375,14 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "auditd_enabled");
+    if (d.ok) {
+      cfg->collection.auditd_enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "auditd_log_path"), cfg->collection.auditd_log_path,
+              sizeof(cfg->collection.auditd_log_path));
+  {
     toml_datum_t d = toml_int_in(t, "poll_interval_s");
     if (d.ok) {
       cfg->collection.poll_interval_s = (int)d.u.i;
@@ -575,6 +583,57 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "rules_version"), cfg->preprocessing.rules_version,
               sizeof(cfg->preprocessing.rules_version));
   load_preprocessing_rules(t, cfg);
+}
+
+static void load_detection_policy(toml_table_t *t, EdrConfig *cfg) {
+  take_string(toml_string_in(t, "source"), cfg->detection_policy.source, sizeof(cfg->detection_policy.source));
+  take_string(toml_string_in(t, "audit_id"), cfg->detection_policy.audit_id, sizeof(cfg->detection_policy.audit_id));
+  take_string(toml_string_in(t, "policy_version"), cfg->detection_policy.policy_version,
+              sizeof(cfg->detection_policy.policy_version));
+  take_string(toml_string_in(t, "rollback_version"), cfg->detection_policy.rollback_version,
+              sizeof(cfg->detection_policy.rollback_version));
+  take_string(toml_string_in(t, "fp_policy_version"), cfg->detection_policy.fp_policy_version,
+              sizeof(cfg->detection_policy.fp_policy_version));
+  take_string(toml_string_in(t, "fp_rollback_version"), cfg->detection_policy.fp_rollback_version,
+              sizeof(cfg->detection_policy.fp_rollback_version));
+  take_string(toml_string_in(t, "rmm_policy_version"), cfg->detection_policy.rmm_policy_version,
+              sizeof(cfg->detection_policy.rmm_policy_version));
+  take_string(toml_string_in(t, "rmm_rollback_version"), cfg->detection_policy.rmm_rollback_version,
+              sizeof(cfg->detection_policy.rmm_rollback_version));
+  take_string(toml_string_in(t, "allow_paths"), cfg->detection_policy.allow_paths,
+              sizeof(cfg->detection_policy.allow_paths));
+  take_string(toml_string_in(t, "script_dirs"), cfg->detection_policy.script_dirs,
+              sizeof(cfg->detection_policy.script_dirs));
+  take_string(toml_string_in(t, "management_tools"), cfg->detection_policy.management_tools,
+              sizeof(cfg->detection_policy.management_tools));
+}
+
+static void config_setenv_if_value(const char *name, const char *value) {
+  if (!name || !name[0] || !value || !value[0]) {
+    return;
+  }
+#ifdef _WIN32
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, 1);
+#endif
+}
+
+static void apply_detection_policy_env(const EdrConfig *cfg) {
+  if (!cfg) {
+    return;
+  }
+  config_setenv_if_value("EDR_DETECTION_POLICY_SOURCE", cfg->detection_policy.source);
+  config_setenv_if_value("EDR_DETECTION_POLICY_AUDIT_ID", cfg->detection_policy.audit_id);
+  config_setenv_if_value("EDR_DETECTION_POLICY_VERSION", cfg->detection_policy.policy_version);
+  config_setenv_if_value("EDR_DETECTION_ROLLBACK_VERSION", cfg->detection_policy.rollback_version);
+  config_setenv_if_value("EDR_DETECTION_FP_POLICY_VERSION", cfg->detection_policy.fp_policy_version);
+  config_setenv_if_value("EDR_DETECTION_FP_ROLLBACK_VERSION", cfg->detection_policy.fp_rollback_version);
+  config_setenv_if_value("EDR_DETECTION_RMM_POLICY_VERSION", cfg->detection_policy.rmm_policy_version);
+  config_setenv_if_value("EDR_DETECTION_RMM_ROLLBACK_VERSION", cfg->detection_policy.rmm_rollback_version);
+  config_setenv_if_value("EDR_DETECTION_ALLOW_PATHS", cfg->detection_policy.allow_paths);
+  config_setenv_if_value("EDR_DETECTION_SCRIPT_DIRS", cfg->detection_policy.script_dirs);
+  config_setenv_if_value("EDR_DETECTION_MGMT_TOOLS", cfg->detection_policy.management_tools);
 }
 
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {
@@ -1316,6 +1375,8 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.etw_tcpip_provider = true;
   cfg->collection.etw_firewall_provider = true;
   cfg->collection.ebpf_enabled = true;
+  cfg->collection.auditd_enabled = false;
+  snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;
   cfg->collection.max_event_queue_size = 4096u;
 
@@ -1325,6 +1386,8 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->preprocessing.rules_version, sizeof(cfg->preprocessing.rules_version), "%s",
            EDR_PREPROCESS_RULES_VERSION_DEFAULT);
   apply_builtin_preprocess_rules(cfg);
+  snprintf(cfg->detection_policy.source, sizeof(cfg->detection_policy.source), "%s", "local_default");
+  snprintf(cfg->detection_policy.policy_version, sizeof(cfg->detection_policy.policy_version), "%s", "local-default");
 
 #ifdef _WIN32
   /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
@@ -1809,6 +1872,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
   edr_config_free_heap(cfg);
   edr_config_apply_defaults(cfg);
   if (!path || !path[0]) {
+    apply_detection_policy_env(cfg);
 #ifdef _WIN32
     edr_win_listen_apply_config(cfg);
 #endif
@@ -1854,6 +1918,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "preprocessing");
     if (t) {
       load_preprocessing(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "detection_policy");
+    if (t) {
+      load_detection_policy(t, cfg);
     }
   }
   {
@@ -1931,6 +2001,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 
   toml_free(root);
   edr_config_clamp(cfg);
+  apply_detection_policy_env(cfg);
 #ifdef _WIN32
   edr_win_listen_apply_config(cfg);
 #endif

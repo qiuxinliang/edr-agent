@@ -19,9 +19,11 @@
 #include "edr/grpc_client.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
+#include "edr/response.h"
 #include "edr/self_protect.h"
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
+#include "edr/shell_session.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -48,6 +50,10 @@ static unsigned long s_rejected;
 static unsigned long s_exec_ok;
 static unsigned long s_exec_fail;
 static const char *s_active_command_type;
+unsigned long g_cmd_handled;
+unsigned long g_cmd_rejected;
+unsigned long g_cmd_exec_ok;
+unsigned long g_cmd_exec_fail;
 
 /** main 在 edr_agent_init 后绑定，供 ave_infer 使用 */
 static const EdrConfig *s_bound_cfg;
@@ -214,6 +220,18 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
 static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
                       int exit_code, const char *detail) {
   soar_emit_ex(cmd_id, sm, st, exit_code, detail, NULL, NULL);
+}
+
+int edr_command_dangerous_enabled(void) { return dangerous_enabled(); }
+
+void edr_command_audit_both(const char *cmd_id, const char *msg) {
+  audit_both(cmd_id, msg ? msg : "");
+}
+
+void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
+                             EdrCommandExecutionStatus st, int exit_code, const char *detail) {
+  audit_both(cmd_id, detail ? detail : "");
+  soar_emit(cmd_id, sm, st, exit_code, detail);
 }
 
 static int parse_json_string_field(const uint8_t *p, size_t len, const char *key,
@@ -1424,6 +1442,119 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
 }
 
+static void shell_stream_output_cb(const char *sid, const char *data, size_t len,
+                                   int exit_code, bool closed, void *user) {
+  (void)user;
+  char detail[4096];
+  if (closed && !data) {
+    snprintf(detail, sizeof(detail), "shell session %s closed, exit=%d", sid ? sid : "", exit_code);
+  } else if (data && len > 0u) {
+    size_t cp = len < sizeof(detail) - 1u ? len : sizeof(detail) - 1u;
+    memcpy(detail, data, cp);
+    detail[cp] = '\0';
+  } else {
+    return;
+  }
+  EdrSoarCommandMeta dummy;
+  memset(&dummy, 0, sizeof(dummy));
+  if (sid) {
+    snprintf(dummy.soar_correlation_id, sizeof(dummy.soar_correlation_id), "%s", sid);
+  }
+  soar_emit(sid ? sid : "shell_session", &dummy, EdrCmdExecOk, exit_code, detail);
+}
+
+static void ensure_shell_session_initialized(void) {
+  static int initialized = 0;
+  if (!initialized) {
+    edr_shell_session_init(EDR_SS_MAX_SESSIONS, 600u, EDR_SS_BUF_KB, shell_stream_output_cb, NULL);
+    initialized = 1;
+  }
+}
+
+static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
+                          const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "shell_open: rejected (dangerous disabled)");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 1, "dangerous commands disabled", "denied", NULL);
+    return;
+  }
+  char shell_type[128];
+#ifdef _WIN32
+  snprintf(shell_type, sizeof(shell_type), "%s", "cmd.exe /Q /K chcp 65001 > nul");
+#else
+  snprintf(shell_type, sizeof(shell_type), "%s", "/bin/sh");
+#endif
+  if (pl && len > 0u && len < sizeof(shell_type) - 1u && pl[0] != '{') {
+    memcpy(shell_type, pl, len);
+    shell_type[len] = '\0';
+  }
+  ensure_shell_session_initialized();
+  int rc = edr_shell_session_open(cmd_id, shell_type);
+  if (rc != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "shell_open: failed");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, rc, "shell_open failed", "failed", NULL);
+    return;
+  }
+  s_handled++;
+  s_exec_ok++;
+  char detail[180];
+  snprintf(detail, sizeof(detail), "shell session opened: %s", shell_type);
+  audit_both(cmd_id, "shell_open: ok");
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
+}
+
+static void do_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
+                           const EdrSoarCommandMeta *sm) {
+  char session_id[EDR_SS_ID_LEN];
+  char input[4096];
+  session_id[0] = '\0';
+  input[0] = '\0';
+  (void)edr_parse_json_string(pl, len, "session_id", session_id, sizeof(session_id));
+  (void)edr_parse_json_string(pl, len, "input", input, sizeof(input));
+  if (!session_id[0] || !input[0]) {
+    s_exec_fail++;
+    audit_both(cmd_id, "shell_input: missing session_id or input");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 1, "missing session_id or input", "failed", NULL);
+    return;
+  }
+  size_t ilen = strlen(input);
+  if (ilen + 2u <= sizeof(input)) {
+    input[ilen++] = '\n';
+  }
+  int rc = edr_shell_session_input(session_id, input, ilen);
+  if (rc != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "shell_input: write failed");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, rc, "shell_input write failed", "failed", NULL);
+    return;
+  }
+  s_handled++;
+  s_exec_ok++;
+  char detail[160];
+  snprintf(detail, sizeof(detail), "shell_input sent %zu bytes to session %s", ilen, session_id);
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
+}
+
+static void do_shell_close(const char *cmd_id, const uint8_t *pl, size_t len,
+                           const EdrSoarCommandMeta *sm) {
+  char session_id[EDR_SS_ID_LEN];
+  session_id[0] = '\0';
+  (void)edr_parse_json_string(pl, len, "session_id", session_id, sizeof(session_id));
+  if (!session_id[0]) {
+    s_exec_fail++;
+    audit_both(cmd_id, "shell_close: missing session_id");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 1, "missing session_id", "failed", NULL);
+    return;
+  }
+  edr_shell_session_close(session_id);
+  s_handled++;
+  s_exec_ok++;
+  audit_both(cmd_id, "shell_close: ok");
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, "shell session closed", "ok", NULL);
+}
+
 static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
@@ -2579,7 +2710,8 @@ static int is_internal_auto_command(const char *cmd_id) {
 
 static int is_rtr_shell_command_type(const char *t) {
   return streq(t, "rtr_shell") || streq(t, "RTR_SHELL") ||
-         streq(t, "remote_shell") || streq(t, "shell_exec");
+         streq(t, "remote_shell") || streq(t, "shell_exec") ||
+         streq(t, "shell_open") || streq(t, "shell_input") || streq(t, "shell_close");
 }
 
 static int is_dangerous_command_type(const char *t) {
@@ -2676,6 +2808,43 @@ static int command_deadline_expired(const EdrSoarCommandMeta *sm, char *reason, 
   return 1;
 }
 
+static void flush_command_result_outbox(void) {
+  EdrCommandStateRecord pending[16];
+  int n = edr_command_state_collect_pending(pending, sizeof(pending) / sizeof(pending[0]));
+  if (n <= 0 || !edr_grpc_client_ready()) {
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    EdrSoarCommandMeta sm;
+    memset(&sm, 0, sizeof(sm));
+    snprintf(sm.soar_correlation_id, sizeof(sm.soar_correlation_id), "%s", pending[i].soar_correlation_id);
+    snprintf(sm.playbook_run_id, sizeof(sm.playbook_run_id), "%s", pending[i].playbook_run_id);
+    snprintf(sm.playbook_step_id, sizeof(sm.playbook_step_id), "%s", pending[i].playbook_step_id);
+    if (!soar_want_report(&sm)) {
+      continue;
+    }
+    int rc = edr_grpc_client_report_command_result(pending[i].command_id, &sm,
+                                                   pending[i].execution_status,
+                                                   pending[i].exit_code,
+                                                   pending[i].detail);
+    if (rc == 0) {
+      edr_command_state_mark_reported(&pending[i]);
+    }
+  }
+}
+
+void edr_command_poll_reliable_delivery(void) {
+  static int64_t last_poll_ms;
+  int64_t now = command_now_ms();
+  if (last_poll_ms > 0 && now - last_poll_ms < 5000) {
+    return;
+  }
+  last_poll_ms = now;
+  flush_upload_outbox();
+  flush_command_result_outbox();
+  edr_command_state_compact_if_needed();
+}
+
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
   EdrSoarCommandMeta empty;
@@ -2703,7 +2872,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
 
-  flush_upload_outbox();
+  edr_command_poll_reliable_delivery();
 
   int retry_count = 0;
   EdrCommandStateRecord dup;
@@ -2758,6 +2927,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     do_forensic(id, payload, payload_len, sm);
     return;
   }
+  if (streq(t, "rtq_execute") || streq(t, "RTQ_EXECUTE")) {
+    edr_response_rtq_execute(id, payload, payload_len, sm);
+    return;
+  }
   if (streq(t, "rtq_query") || streq(t, "RTQ_QUERY")) {
     do_rtq_query(id, payload, payload_len, sm);
     return;
@@ -2805,6 +2978,18 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN")) {
     do_pmfe_scan(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "shell_open")) {
+    do_shell_open(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "shell_input")) {
+    do_shell_input(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "shell_close")) {
+    do_shell_close(id, payload, payload_len, sm);
     return;
   }
   if (is_rtr_shell_command_type(t)) {

@@ -69,6 +69,11 @@ etw_powershell_provider   = true
 etw_security_audit_provider = true
 #
 ebpf_enabled         = true
+# Linux：auditd 采集 execve/connect/openat/rename/unlink/chmod/chown/setuid/ptrace/module load。
+# 需要 auditd 已启用并授予读取 audit.log 的权限；eBPF 作为后续内核直连采集路径，健康度会独立上报 loaded 状态。
+# eBPF 联调可设置 EDR_LINUX_EBPF_TRACE_PIPE=1 读取 trace_pipe 中外部 BPF 程序输出的 execve/connect/openat 等事件。
+auditd_enabled       = false
+auditd_log_path      = "/var/log/audit/audit.log"
 poll_interval_s      = 1
 max_event_queue_size = 4096
 # Windows 实时 ETW 会话：每缓冲大小（KB）与刷写周期（秒）；0=默认 64/1。亦可 EDR_ETW_BUFFER_KB / EDR_ETW_FLUSH_TIMER_S（见 README · A4.2）
@@ -96,9 +101,24 @@ sampling_rate_whitelist = 0.02
 #                                          # 非门控进程名保留千分比（默认30=3%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
-rules_version = "edr-dynamic-rules-v1-r239-97acafca"
+rules_version = "edr-dynamic-rules-v1-r240-4032d846"
 # 若本文件未显式配置 [[preprocessing.rules]]，Agent 会尝试从与 agent.toml 同目录的
 # agent_preprocess_rules_v1.toml 自动加载第一版动态前置规则（可用 EDR_PREPROCESS_RULES_BUNDLE_PATH 覆盖路径）。
+
+[detection_policy]
+# 服务端下发的 suppression / allowlist 策略。Agent 会把本节映射到检测引擎的运行策略，
+# 并在 suppression 命中时写入 policy_version / source / audit_id，避免依赖裸环境变量漂移。
+source = "server"
+audit_id = "change-approval-or-policy-id"
+policy_version = "det-pol-2026.05.example"
+rollback_version = ""
+fp_policy_version = "fp-pol-2026.05.example"
+fp_rollback_version = ""
+rmm_policy_version = "rmm-pol-2026.05.example"
+rmm_rollback_version = ""
+allow_paths = ""
+script_dirs = ""
+management_tools = "anydesk,teamviewer,rustdesk,screenconnect,connectwise,splashtop,meshcentral,atera,psexec,paexec"
 
 # 可选：见 docs/PREPROCESS_RULES.md — 在 dedup/限流 之前匹配，action = drop | emit_always
 # [[preprocessing.rules]]

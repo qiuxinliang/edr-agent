@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r239-97acafca",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r240-4032d846",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 149,
+  "rule_count": 154,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -319,48 +319,6 @@
       ]
     },
     {
-      "id": "R-RMM-001",
-      "title": "RMM 工具静默安装",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219"
-      ]
-    },
-    {
-      "id": "R-RMM-002",
-      "title": "RMM 工具可疑无人值守配置",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219"
-      ]
-    },
-    {
-      "id": "R-RMM-003",
-      "title": "办公软件或脚本拉起 RMM 工具",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219",
-        "T1204.002"
-      ]
-    },
-    {
-      "id": "R-RMM-004",
-      "title": "RMM 工具服务持久化",
-      "severity": 2,
-      "event_type": "registry_set",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1219",
-        "T1543.003"
-      ]
-    },
-    {
       "id": "R-LOLBIN-006",
       "title": "Msiexec 远程安装可疑包",
       "severity": 3,
@@ -524,7 +482,7 @@
       "enabled": true,
       "mitre_ttps": [
         "T1059.001",
-        "T1027"
+        "T1620"
       ]
     },
     {
@@ -1351,6 +1309,48 @@
       ]
     },
     {
+      "id": "R-RMM-001",
+      "title": "RMM 工具静默安装",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219"
+      ]
+    },
+    {
+      "id": "R-RMM-002",
+      "title": "RMM 工具可疑无人值守配置",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219"
+      ]
+    },
+    {
+      "id": "R-RMM-003",
+      "title": "办公软件或脚本拉起 RMM 工具",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1204.002"
+      ]
+    },
+    {
+      "id": "R-RMM-004",
+      "title": "RMM 工具服务持久化",
+      "severity": 2,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1219",
+        "T1543.003"
+      ]
+    },
+    {
       "id": "R-RMM-005",
       "title": "RMM工具DLL侧加载/非标准子进程",
       "severity": 3,
@@ -1527,6 +1527,63 @@
         "T1021.003",
         "T1175",
         "T1003"
+      ]
+    },
+    {
+      "id": "R-CRED-008",
+      "title": "读取本地凭据注册表Hive",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.002",
+        "T1003.003"
+      ]
+    },
+    {
+      "id": "R-EXFIL-006",
+      "title": "用户数据归档打包落地",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1560.001",
+        "T1074.001"
+      ]
+    },
+    {
+      "id": "R-EXFIL-007",
+      "title": "读取云凭据和命令历史",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1552.001",
+        "T1530",
+        "T1567.002"
+      ]
+    },
+    {
+      "id": "R-NET-001",
+      "title": "代理隧道工具连接常见代理端口",
+      "severity": 3,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1090",
+        "T1572"
+      ]
+    },
+    {
+      "id": "R-LMOVE-015",
+      "title": "命令行工具访问内网数据服务端口",
+      "severity": 2,
+      "event_type": "network_connect",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1046",
+        "T1021",
+        "T1018"
       ]
     },
     {

@@ -37,6 +37,7 @@ static DWORD s_agent_pid;
 static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
 static volatile LONG s_started;
+static EdrCollectorHealth s_health;
 
 static uint64_t edr_unix_ns(void) {
   FILETIME ft;
@@ -131,11 +132,13 @@ static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
     return;
   }
   if (memcmp(g, &EDR_ETW_GUID_POWERSHELL, sizeof(GUID)) == 0) {
+    s_health.powershell_visible = 1;
     *out_tag = "ps";
     *out_type = EDR_EVENT_SCRIPT_POWERSHELL;
     return;
   }
   if (memcmp(g, &EDR_ETW_GUID_AMSI, sizeof(GUID)) == 0) {
+    s_health.amsi_visible = 1;
     *out_tag = "amsi";
     *out_type = EDR_EVENT_SCRIPT_POWERSHELL;
     return;
@@ -146,6 +149,7 @@ static void edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
     return;
   }
   if (memcmp(g, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) {
+    s_health.security_audit_visible = 1;
     *out_tag = "sec";
     if (ev_id == 4624) {
       *out_type = EDR_EVENT_AUTH_LOGIN;
@@ -282,6 +286,8 @@ static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
 }
 
 static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
+  memset(&s_health, 0, sizeof(s_health));
+  s_health.etw_or_inotify_enabled = 1;
   const GUID *mandatory[] = {
       &EDR_ETW_GUID_KERNEL_PROCESS,
       &EDR_ETW_GUID_KERNEL_FILE,
@@ -317,6 +323,12 @@ static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
     if (err != ERROR_SUCCESS) {
       fprintf(stderr, "[collector_win] optional ETW provider enable skip guid=%p err=%lu\n",
               (void *)optional[i].guid, (unsigned long)err);
+    } else if (memcmp(optional[i].guid, &EDR_ETW_GUID_POWERSHELL, sizeof(GUID)) == 0) {
+      s_health.powershell_visible = 1;
+    } else if (memcmp(optional[i].guid, &EDR_ETW_GUID_AMSI, sizeof(GUID)) == 0) {
+      s_health.amsi_visible = 1;
+    } else if (memcmp(optional[i].guid, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) {
+      s_health.security_audit_visible = 1;
     }
   }
   return ERROR_SUCCESS;
@@ -409,4 +421,16 @@ void edr_collector_stop(void) {
   }
 
   s_bus = NULL;
+}
+
+int edr_collector_get_health(EdrCollectorHealth *out_health) {
+  if (!out_health) {
+    return -1;
+  }
+  *out_health = s_health;
+  out_health->etw_or_inotify_enabled = InterlockedCompareExchange(&s_started, 0, 0) ? 1 : out_health->etw_or_inotify_enabled;
+  if (s_bus) {
+    out_health->queue_dropped = edr_event_bus_dropped_total(s_bus);
+  }
+  return 0;
 }

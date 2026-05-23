@@ -56,6 +56,9 @@ typedef enum EdrCommandExecutionStatus {
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta);
 
+/** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
+void edr_command_poll_reliable_delivery(void);
+
 /**
  * Agent-side automation: map detection_context.recommended_forensics to local
  * response commands. Execution remains gated by command policy.

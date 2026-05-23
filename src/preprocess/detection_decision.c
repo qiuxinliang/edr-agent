@@ -722,6 +722,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
              ",\"confidence_before\":%.3f,\"confidence_after\":%.3f,\"policy_version\":",
              before, d->confidence);
     json_str(r->detection_context, sizeof(r->detection_context), d->suppression_policy_version, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"policy_source\":");
+    json_str(r->detection_context, sizeof(r->detection_context), getenv("EDR_DETECTION_POLICY_SOURCE"), 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"audit_id\":");
+    json_str(r->detection_context, sizeof(r->detection_context), getenv("EDR_DETECTION_POLICY_AUDIT_ID"), 96u);
     json_cat(r->detection_context, sizeof(r->detection_context),
              ",\"hit_count\":%u,\"rollback_available\":%s,\"rollback_version\":",
              d->suppression_hit_count, d->suppression_rollback_version[0] ? "true" : "false");
