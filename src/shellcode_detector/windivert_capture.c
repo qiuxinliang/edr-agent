@@ -88,6 +88,7 @@ static uint32_t s_ring_stride;
 static uint32_t s_ring_w;
 static uint32_t s_ring_r;
 static uint32_t s_ring_count;
+static volatile LONG s_budget_drop_count;
 
 static uint64_t edr_win_now_ns(void) {
   FILETIME ft;
@@ -613,6 +614,7 @@ static int push_alert(double score, const char *detector_label, const char *rule
   memcpy(slot.data, wx, off);
   slot.size = (uint32_t)off;
   if (!edr_event_bus_try_push(s_bus, &slot)) {
+    InterlockedIncrement(&s_budget_drop_count);
     fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
   }
   if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
@@ -914,4 +916,8 @@ void edr_windivert_capture_stop(void) {
     s_wsa_started = 0;
   }
   InterlockedExchange(&s_capture_stop, 0);
+}
+
+uint64_t edr_windivert_capture_budget_drop_count(void) {
+  return (uint64_t)(unsigned long)InterlockedCompareExchange(&s_budget_drop_count, 0, 0);
 }

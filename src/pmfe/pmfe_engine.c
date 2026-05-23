@@ -1840,7 +1840,9 @@ static DWORD WINAPI pmfe_listen_poll_main(void *arg) {
       break;
     }
     edr_pmfe_listen_table_refresh();
+#ifdef EDR_WITH_PMFE_IDLE_SCANNER
     pmfe_idle_scanner_tick();
+#endif
   }
   return 0;
 }
