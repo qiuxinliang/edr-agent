@@ -16,12 +16,12 @@
 #include <process.h>
 #include "edr/attack_surface_win_util.h"
 #include "edr/listen_table_win.h"
-#define EDR_GETPID (int)GetCurrentProcessId
+#define EDR_GETPID() ((int)GetCurrentProcessId())
 #else
 #include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#define EDR_GETPID (int)getpid
+#define EDR_GETPID() ((int)getpid())
 #endif
 
 #ifdef _WIN32
@@ -596,13 +596,15 @@ static void *asurf_thread_egress(void *arg) {
 static void asurf_gather_policy_and_egress(const EdrConfig *cfg, EdrSecurityPolicySnap *sp,
                                            EdrAsurfEgressRow *eg, int eg_max, int *n_eg, int *susp,
                                            int *eg_trunc) {
-  AsurfGatherParallel ctx = {.cfg = cfg,
-                             .sp = sp,
-                             .eg = eg,
-                             .eg_max = eg_max,
-                             .n_eg = n_eg,
-                             .susp = susp,
-                             .eg_trunc = eg_trunc};
+  AsurfGatherParallel ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.cfg = cfg;
+  ctx.sp = sp;
+  ctx.eg = eg;
+  ctx.eg_max = eg_max;
+  ctx.n_eg = n_eg;
+  ctx.susp = susp;
+  ctx.eg_trunc = eg_trunc;
 #ifdef _WIN32
   HANDLE tp = CreateThread(NULL, 0, asurf_thread_policy, &ctx, 0, NULL);
   HANDLE te = CreateThread(NULL, 0, asurf_thread_egress, &ctx, 0, NULL);
@@ -883,9 +885,9 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     if (gp && gp[0]) {
       char note_geo[768];
       if (geoip_db_readable(cfg)) {
-        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 可读: %s", gp);
+        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 可读: %.680s", gp);
       } else {
-        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 未就绪(跳过): %s", gp);
+        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 未就绪(跳过): %.680s", gp);
       }
       fprintf(f, ",");
       json_escape_str(f, note_geo);

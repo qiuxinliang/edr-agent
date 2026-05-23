@@ -56,7 +56,7 @@ static void unlock(void) {
 static uint64_t wall_ns(void) {
 #ifdef _WIN32
   FILETIME ft;
-  GetSystemTimePreciseAsFileTime(&ft);
+  GetSystemTimeAsFileTime(&ft);
   ULARGE_INTEGER u;
   u.LowPart = ft.dwLowDateTime;
   u.HighPart = ft.dwHighDateTime;
@@ -236,7 +236,12 @@ void edr_pid_history_pmfe_fill_record(EdrBehaviorRecord *br) {
   lock();
   for (int i = 0; i < EDR_PID_PMFE_SLOTS; i++) {
     if (s_slots[i].valid && s_slots[i].pid == br->pid) {
-      snprintf(br->pmfe_snapshot, sizeof(br->pmfe_snapshot), "%s", s_slots[i].json);
+      size_t n = strlen(s_slots[i].json);
+      if (n >= sizeof(br->pmfe_snapshot)) {
+        n = sizeof(br->pmfe_snapshot) - 1u;
+      }
+      memcpy(br->pmfe_snapshot, s_slots[i].json, n);
+      br->pmfe_snapshot[n] = '\0';
       break;
     }
   }

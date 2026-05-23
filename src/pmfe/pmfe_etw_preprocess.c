@@ -13,9 +13,9 @@
 #endif
 
 #ifdef _WIN32
-#include <iphlpapi.h>
 #include <stdio.h>
 #include <winsock2.h>
+#include <iphlpapi.h>
 #include <windows.h>
 
 /** 在 ETW1 文本中查找 `key=value` 行（key 不含 '='） */
