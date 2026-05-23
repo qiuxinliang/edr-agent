@@ -65,7 +65,10 @@ Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsou
 Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#EDR_AGENT_PREPROCESS_TOML}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\scripts\windows_service_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\scripts\windows_isolate_host.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "bundle_extra\README_OPTIONAL_DBS.txt"; DestDir: "{app}\data"; DestName: "README_OPTIONAL_DBS.txt"; Flags: ignoreversion skipifsourcedoesntexist

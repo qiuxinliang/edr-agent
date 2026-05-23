@@ -65,6 +65,15 @@ fi
 if [[ -f "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" ]]; then
   cp -a "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" "$OUT_DIR/"
 fi
+for n in "windows_service_install.ps1" "windows_isolate_host.ps1"; do
+  if [[ -f "$EDR_AGENT_DIR/scripts/$n" ]]; then
+    cp -a "$EDR_AGENT_DIR/scripts/$n" "$OUT_DIR/"
+  fi
+done
+if [[ -f "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" ]]; then
+  mkdir -p "$OUT_DIR/config"
+  cp -a "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" "$OUT_DIR/config/"
+fi
 for n in "edr_install_wizard_enroll.ps1" "edr_windows_autorun.ps1"; do
   if [[ -f "$SCRIPT_DIR/$n" ]]; then
     cp -a "$SCRIPT_DIR/$n" "$OUT_DIR/"

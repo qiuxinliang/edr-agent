@@ -1,5 +1,14 @@
 /* §8 响应指令执行器 — Subscribe 分发；高危操作需 EDR_CMD_ENABLED=1；AVE 见 ave_* */
 
+#ifdef _MSC_VER
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef _CRT_NONSTDC_NO_WARNINGS
+#define _CRT_NONSTDC_NO_WARNINGS
+#endif
+#endif
+
 #include "edr/attack_surface_report.h"
 #include "edr/command.h"
 #include "edr/ave.h"
@@ -641,7 +650,9 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   }
   const char *hook = getenv("EDR_ISOLATE_HOOK");
   if (hook && hook[0]) {
-#ifndef _WIN32
+#ifdef _WIN32
+    (void)_putenv_s("EDR_CMD_ID", cmd_id ? cmd_id : "");
+#else
     (void)setenv("EDR_CMD_ID", cmd_id ? cmd_id : "", 1);
 #endif
     int r = system(hook);
@@ -1214,11 +1225,30 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
     (void)system(tarcmd);
   }
 #endif
+  if (!file_exists_c(bundle)) {
+    s_exec_fail++;
+    audit_both(cmd_id, "forensic: bundle.tgz 生成失败");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "forensic bundle create failed");
+    return;
+  }
+  char bundle_sha[65];
+  bundle_sha[0] = '\0';
+  (void)file_sha256_hex(bundle, bundle_sha);
+  char upload_key[1024];
+  upload_key[0] = '\0';
+  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
+                                              upload_key, sizeof(upload_key));
+  s_handled++;
   s_exec_ok++;
-  audit_both(cmd_id, "forensic: manifest + bundle.tgz（可选路径复制见 EDR_FORENSIC_COPY_PATHS）");
+  audit_both(cmd_id, upload_rc == 0
+                         ? "forensic: manifest + bundle.tgz + grpc upload ok"
+                         : "forensic: manifest + bundle.tgz ok; grpc upload failed, kept local copy");
   {
-    char detail[1800];
-    snprintf(detail, sizeof(detail), "forensic bundle ok manifest_path=\"%s\" bundle_path=\"%s\"", manifest, bundle);
+    char detail[2600];
+    snprintf(detail, sizeof(detail),
+             "forensic bundle ok manifest_path=\"%s\" bundle_path=\"%s\" sha256=\"%s\" upload_status=\"%s\" "
+             "minio_key=\"%s\"",
+             manifest, bundle, bundle_sha, upload_rc == 0 ? "ok" : "failed", upload_key);
     soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
   }
 }

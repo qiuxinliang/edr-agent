@@ -253,7 +253,7 @@ jobs:
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build (Ninja + sccache)
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
 
       - name: sccache stats
         shell: bash
@@ -292,7 +292,7 @@ jobs:
             Write-Host "========================================"
           }
 
-      - name: Package (exe + runtime DLLs only)
+      - name: Package (exe + runtime DLLs + Windows ops scripts)
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
@@ -307,6 +307,14 @@ jobs:
           $items = New-Object System.Collections.Generic.List[string]
           $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          foreach ($p in @(
+            "scripts\edr_agent_install.ps1",
+            "scripts\windows_service_install.ps1",
+            "scripts\windows_isolate_host.ps1",
+            "config\agent_windows_production.example.toml"
+          )) {
+            if (Test-Path $p) { $null = $items.Add($p) }
+          }
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
 
       - name: Move artifact to workspace

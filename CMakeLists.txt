@@ -378,6 +378,10 @@ target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 )
 target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
+if(MSVC)
+  target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+endif()
 if(EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)
 endif()

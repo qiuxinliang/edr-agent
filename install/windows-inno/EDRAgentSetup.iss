@@ -58,7 +58,10 @@ Source: "..\..\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recurses
 ; 第一版动态前置规则包（由 edr-backend/platform/config/generate_agent_preprocess_rules.py 生成）
 Source: "..\..\..\edr-backend\platform\config\agent_preprocess_rules_v1.toml"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\scripts\windows_service_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\scripts\windows_isolate_host.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 

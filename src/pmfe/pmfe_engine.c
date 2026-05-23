@@ -1,5 +1,14 @@
 /* §21 PMFE — 队列 + 双扫描线程；Windows：模块基线 + VAD 粗筛 + PE peek + §6 DNS 路径（ASCII 分块）；Linux：maps 粗筛 + process_vm_readv peek + ELF/熵（§9）+ 可选 DNS ASCII */
 
+#ifdef _MSC_VER
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef _CRT_NONSTDC_NO_WARNINGS
+#define _CRT_NONSTDC_NO_WARNINGS
+#endif
+#endif
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

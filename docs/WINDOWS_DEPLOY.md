@@ -13,7 +13,7 @@
 |------|------------|------|
 | 租户注册 + `agent.toml` | **`scripts/edr_agent_install.*`** | 见 [AGENT_INSTALLER.md](AGENT_INSTALLER.md) |
 | 二进制分发与限时 zip | 平台 / **edr-backend** 构建流水线 | 非 `edr-agent` 单独交付 |
-| Windows **服务**安装、账户、开机自启 | **本文 + 下方示例**（草案） | 需与现场组策略 / 运维规范对齐 |
+| Windows **服务**安装、账户、开机自启 | **`edr_agent.exe --service` + `scripts/windows_service_install.ps1`** | 需管理员；与现场组策略 / 运维规范对齐 |
 
 ---
 
@@ -44,27 +44,52 @@
 
 ---
 
-## 4. 服务包装示例（**草案**，需按路径与版本修改）
+## 4. 原生服务安装（推荐生产入口）
 
-以下 **不** 随仓库执行，仅供运维/打包参考；生产应使用 **签名的包装器** 或 **NSSM / 厂商服务框架**。
+`edr_agent.exe` 已支持 Windows SCM 生命周期：服务安装时使用 **`--service`**，停止/关机时 SCM 会触发 Agent 优雅退出。
 
-**PowerShell（节选，需管理员）**：
+1. 放置二进制、脚本与配置：
 
 ```powershell
-# 与 Inno 安装包约定一致：二进制与 agent.toml 均在「EDR Agent」安装目录（默认 %ProgramFiles%\EDR Agent）
-$bin = '"C:\Program Files\EDR Agent\edr_agent.exe" --config "C:\Program Files\EDR Agent\agent.toml"'
-sc.exe create EdrAgent binPath= $bin obj= "NT AUTHORITY\LocalService" start= auto
-# 按需: sc.exe description EdrAgent "EDR Agent"
-# 首次需验证 LocalService 对配置路径、日志路径是否有 ACL
+Copy-Item .\edr_agent.exe "C:\Program Files\EDR Agent\edr_agent.exe" -Force
+Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows_isolate_host.ps1" -Force
 ```
 
-使用 **LOCAL SERVICE** 时，必须为 **`agent.toml`、日志、队列库、取证目录** 配置 **ACL**，否则进程启动即失败。
+2. 生成生产配置。`scripts/edr_agent_install.ps1` 会优先合并 `config/agent_windows_production.example.toml`，并写入 mTLS 证书路径：
+
+```powershell
+$env:EDR_API_BASE="https://edr.example.com"
+$env:EDR_ENROLL_TOKEN="..."
+.\scripts\edr_agent_install.ps1 -Output "C:\ProgramData\EDR Agent\agent.toml"
+```
+
+3. 安装并启动服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -Action Install `
+  -ExePath "C:\Program Files\EDR Agent\edr_agent.exe" `
+  -ConfigPath "C:\ProgramData\EDR Agent\agent.toml" `
+  -EnableResponseActions
+```
+
+安装脚本会执行以下生产约束：
+
+| 项 | 行为 |
+|----|------|
+| **真实 mTLS** | 设置 `EDR_GRPC_REQUIRE_MTLS=1`；缺少 `ca_cert` / `client_cert` / `client_key` 时 gRPC 不启动 |
+| **服务自恢复** | `sc.exe failure` 配置失败重启 |
+| **ACL** | `%ProgramFiles%\EDR Agent` 仅系统/管理员写，普通用户读执行；`%ProgramData%\EDR Agent` 仅服务账户/管理员写 |
+| **自保护** | 生产模板启用 `[self_protect] anti_debug`、`job_object_windows`、watchdog 与事件总线压力告警 |
+| **隔离 hook** | 设置 `EDR_ISOLATE_HOOK` 指向 `windows_isolate_host.ps1 -Action Enable` |
+| **取证上传可靠性** | 设置 `EDR_UPLOAD_FILE_RETRIES=3`；上传失败时保留本地 `bundle.tgz` 并在命令结果中返回路径 |
+
+如需以 **LOCAL SERVICE** 运行，可传 `-Account "NT AUTHORITY\LocalService"`；全量 ETW、WinDivert、取证等能力仍可能需要 LocalSystem 或额外特权。
 
 ---
 
 ## 4.1 Inno `EDRAgentSetup.exe`：开机常驻与卸载（已实现）
 
-`edr_agent` 为**控制台程序**（未实现 Windows SCM 的 `ServiceMain`）。安装包通过 **`install/windows-inno/edr_windows_autorun.ps1`** 实现：
+安装包也可通过 **`install/windows-inno/edr_windows_autorun.ps1`** 注册计划任务，适合开发与兼容旧包的场景：
 
 | 安装向导任务 | 行为 |
 |--------------|------|
@@ -73,7 +98,7 @@ sc.exe create EdrAgent binPath= $bin obj= "NT AUTHORITY\LocalService" start= aut
 
 **卸载**：使用「程序和功能」中的 **EDR Agent** 项（即 Inno 生成的 **`unins000.exe`**）。卸载阶段会先执行 **`edr_windows_autorun.ps1 -Action Remove`**：停止并注销计划任务、结束 **`edr_agent`** 进程、在删除文件前运行 **`edr_agent.exe --etw-uninstall-cleanup`** 按名 **`ControlTrace` STOP** 本程序使用的 ETW 实时会话（避免异常退出后会话名 **`EDR_Agent_RT_001`** 仍占用）；再对安装目录 **`icacls /inheritance:e`** 恢复继承，最后删除文件。**说明**：未单独安装的 **WinDivert** 驱动等不由本卸载移除；若曾启用 shellcode 模块且自行安装过驱动，需按该组件文档单独卸载。
 
-若需 **Windows 服务**形态（`sc create` / WiX），仍见上文 §4 草案；与计划任务二选一或并存由运维决定。
+若需 **Windows 服务**形态，优先使用上文 §4；与计划任务二选一，避免同一主机启动两个 Agent 实例。
 
 **静默 + 命令行注册**：支持 **`/EDR_API_BASE=`** / **`/EDR_ENROLL_TOKEN=`**（或短写法 **`/API=`** / **`/TOK=`**），可选 **`/EDR_INSECURE_TLS=1`** 或 **`/TLS=1`**；须成对或均省略；与 Inno **`/VERYSILENT`** 等组合使用。完整说明与命令行敏感提示见 **[AGENT_INSTALLER.md](AGENT_INSTALLER.md)**「Release 一键安装」Windows 小节。
 

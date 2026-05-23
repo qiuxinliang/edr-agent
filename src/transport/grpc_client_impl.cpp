@@ -62,9 +62,18 @@ static std::mutex s_control_mu;
 static std::mutex s_control_write_mu;
 static grpc::ClientReaderWriter<edr::v1::CommandEnvelope, edr::v1::CommandEnvelope> *s_control_stream =
     nullptr;
+static bool s_require_mtls = false;
 
 static void subscribe_thread_main(std::string endpoint_id);
 static void control_stream_thread_main(std::string endpoint_id);
+
+static bool env_truthy(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || !v[0]) {
+    return false;
+  }
+  return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
+}
 
 static long long unix_ms_now(void) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -96,6 +105,11 @@ static bool grpc_client_connect_locked(const std::string &target) {
     ssl.pem_private_key = s_key;
     creds = grpc::SslCredentials(ssl);
   } else if (!s_ca.empty()) {
+    if (s_require_mtls) {
+      fprintf(stderr, "[grpc] 生产策略要求 mTLS，但 client_cert/client_key 未加载，跳过 gRPC\n");
+      runtime_failure("missing required grpc client certificate");
+      return false;
+    }
     grpc::SslCredentialsOptions ssl;
     ssl.pem_root_certs = s_ca;
     creds = grpc::SslCredentials(ssl);
@@ -444,6 +458,14 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
   s_key = read_pem_file(cfg->server.client_key);
   const char *insec = std::getenv("EDR_GRPC_INSECURE");
   s_insecure = cfg->server.grpc_insecure || (insec && insec[0] == '1');
+  s_require_mtls = env_truthy("EDR_GRPC_REQUIRE_MTLS");
+  if (!s_insecure && s_require_mtls && (s_ca.empty() || s_cert.empty() || s_key.empty())) {
+    fprintf(stderr,
+            "[grpc] EDR_GRPC_REQUIRE_MTLS=1，但证书不完整: ca_cert=\"%s\" client_cert=\"%s\" client_key=\"%s\"\n",
+            cfg->server.ca_cert, cfg->server.client_cert, cfg->server.client_key);
+    runtime_failure("missing required grpc mtls credentials");
+    return;
+  }
   s_max_upload_mbps = cfg->upload.max_upload_mbps;
   (void)grpc_client_connect_locked(target);
 }
@@ -690,9 +712,8 @@ extern "C" unsigned long edr_grpc_client_rpc_ok(void) { return s_rpc_ok.load(); 
 
 extern "C" unsigned long edr_grpc_client_rpc_fail(void) { return s_rpc_fail.load(); }
 
-extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *file_path, const char *sha256_hex,
-                                           char *out_minio_key, size_t out_minio_key_cap) {
-  std::lock_guard<std::mutex> lock(s_mu);
+static int upload_file_once_locked(const char *alert_id, const char *file_path, const char *sha256_hex,
+                                   char *out_minio_key, size_t out_minio_key_cap) {
   if (out_minio_key && out_minio_key_cap > 0u) {
     out_minio_key[0] = '\0';
   }
@@ -774,4 +795,44 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
   s_rpc_ok++;
   runtime_success();
   return 0;
+}
+
+extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *file_path, const char *sha256_hex,
+                                           char *out_minio_key, size_t out_minio_key_cap) {
+  std::lock_guard<std::mutex> lock(s_mu);
+  int retries = 3;
+  int backoff_ms = 500;
+  const char *er = std::getenv("EDR_UPLOAD_FILE_RETRIES");
+  const char *eb = std::getenv("EDR_UPLOAD_FILE_RETRY_BACKOFF_MS");
+  if (er && er[0]) {
+    retries = std::atoi(er);
+  }
+  if (eb && eb[0]) {
+    backoff_ms = std::atoi(eb);
+  }
+  if (retries < 1) {
+    retries = 1;
+  }
+  if (retries > 10) {
+    retries = 10;
+  }
+  if (backoff_ms < 0) {
+    backoff_ms = 0;
+  }
+  if (backoff_ms > 30000) {
+    backoff_ms = 30000;
+  }
+  for (int attempt = 1; attempt <= retries; attempt++) {
+    int rc = upload_file_once_locked(alert_id, file_path, sha256_hex, out_minio_key, out_minio_key_cap);
+    if (rc == 0) {
+      return 0;
+    }
+    if (attempt < retries) {
+      int delay = backoff_ms * attempt;
+      fprintf(stderr, "[grpc] UploadFile 失败，%d/%d，%d ms 后重试: %s\n", attempt, retries, delay,
+              file_path ? file_path : "");
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+  }
+  return -1;
 }

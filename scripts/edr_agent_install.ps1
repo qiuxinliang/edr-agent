@@ -12,6 +12,8 @@
     EDR_OUTPUT              输出路径，默认当前目录下的 agent.toml（相对路径相对「执行脚本时的当前目录」）
     EDR_AGENT_VERSION       默认 0.3.0
     EDR_OVERRIDE_SERVER_ADDR
+    EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
+    EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY
     EDR_INSECURE_TLS=1      [System.Net.ServicePointManager]::ServerCertificateValidationCallback（仅调试）
 
 .EXAMPLE
@@ -21,6 +23,10 @@
 #>
 param(
   [string]$Output = $(if ($env:EDR_OUTPUT) { $env:EDR_OUTPUT } else { "agent.toml" }),
+  [string]$Template = $(if ($env:EDR_AGENT_TEMPLATE) { $env:EDR_AGENT_TEMPLATE } else { "" }),
+  [string]$CaCertPath = $(if ($env:EDR_CA_CERT) { $env:EDR_CA_CERT } else { "C:\ProgramData\EDR Agent\certs\ca.pem" }),
+  [string]$ClientCertPath = $(if ($env:EDR_CLIENT_CERT) { $env:EDR_CLIENT_CERT } else { "C:\ProgramData\EDR Agent\certs\client.pem" }),
+  [string]$ClientKeyPath = $(if ($env:EDR_CLIENT_KEY) { $env:EDR_CLIENT_KEY } else { "C:\ProgramData\EDR Agent\certs\client-key.pem" }),
   [switch]$DryRun,
   # 若同目录存在 agent.toml.example，注册成功后合并为「完整 agent.toml」（保留 collection/ave 等默认），仅覆盖 [server]/[agent]/[platform]。
   [switch]$MinimalTomlOnly
@@ -99,7 +105,10 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$ServerAddr,
     [Parameter(Mandatory = $true)][string]$EndpointId,
     [Parameter(Mandatory = $true)][string]$TenantId,
-    [Parameter(Mandatory = $true)][string]$RestBaseUrl
+    [Parameter(Mandatory = $true)][string]$RestBaseUrl,
+    [Parameter(Mandatory = $true)][string]$CaPath,
+    [Parameter(Mandatory = $true)][string]$CertPath,
+    [Parameter(Mandatory = $true)][string]$KeyPath
   )
   $raw = [System.IO.File]::ReadAllText($ExamplePath)
   if ($raw.StartsWith([char]0xFEFF)) {
@@ -113,6 +122,26 @@ function Merge-EnrollIntoAgentTomlExample {
     $line = $lines[$i]
     if ($line -match '^\s*address\s*=') {
       $out.Add(('address              = "{0}"' -f (Escape-Toml $ServerAddr)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*grpc_insecure\s*=') {
+      $out.Add('grpc_insecure        = false')
+      $i++
+      continue
+    }
+    if ($line -match '^\s*ca_cert\s*=') {
+      $out.Add(('ca_cert              = "{0}"' -f (Escape-Toml $CaPath)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*client_cert\s*=') {
+      $out.Add(('client_cert          = "{0}"' -f (Escape-Toml $CertPath)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*client_key\s*=') {
+      $out.Add(('client_key           = "{0}"' -f (Escape-Toml $KeyPath)))
       $i++
       continue
     }
@@ -164,9 +193,10 @@ $tomlMinimal = @"
 
 [server]
 address              = "$(Escape-Toml $saddr)"
-ca_cert              = ""
-client_cert          = ""
-client_key           = ""
+grpc_insecure        = false
+ca_cert              = "$(Escape-Toml $CaCertPath)"
+client_cert          = "$(Escape-Toml $ClientCertPath)"
+client_key           = "$(Escape-Toml $ClientKeyPath)"
 connect_timeout_s    = 10
 keepalive_interval_s = 30
 
@@ -180,11 +210,20 @@ rest_base_url        = "$(Escape-Toml $rest)"
 "@
 
 $examplePath = Join-Path $PSScriptRoot "agent.toml.example"
+if ($Template) {
+  $examplePath = $Template
+} elseif (-not (Test-Path -LiteralPath $examplePath)) {
+  $repoTemplate = Join-Path (Split-Path -Parent $PSScriptRoot) "config\agent_windows_production.example.toml"
+  if (Test-Path -LiteralPath $repoTemplate) {
+    $examplePath = $repoTemplate
+  }
+}
 $toml = $tomlMinimal
 if (-not $MinimalTomlOnly -and (Test-Path -LiteralPath $examplePath)) {
   try {
     $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -ServerAddr $saddr `
-      -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest
+      -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
+      -CaPath $CaCertPath -CertPath $ClientCertPath -KeyPath $ClientKeyPath
   } catch {
     Write-Warning ("Merge with agent.toml.example failed, writing minimal TOML only: " + $_)
     $toml = $tomlMinimal

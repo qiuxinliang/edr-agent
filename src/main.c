@@ -1,3 +1,12 @@
+#ifdef _MSC_VER
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef _CRT_NONSTDC_NO_WARNINGS
+#define _CRT_NONSTDC_NO_WARNINGS
+#endif
+#endif
+
 #include "edr/agent.h"
 #include "edr/ave_sdk.h"
 #include "edr/dedup.h"
@@ -30,6 +39,10 @@ static void edr_on_sigint(int s) {
 #ifdef _WIN32
 #include <windows.h>
 static EdrAgent *g_agent_for_ctrl;
+static SERVICE_STATUS_HANDLE g_service_status_handle;
+static SERVICE_STATUS g_service_status;
+static const char *g_service_name = "EdrAgent";
+static const char *g_service_config_path;
 static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
   if (t == CTRL_C_EVENT || t == CTRL_CLOSE_EVENT || t == CTRL_BREAK_EVENT) {
     if (g_agent_for_ctrl) {
@@ -42,28 +55,17 @@ static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
 #endif
 
 static void print_usage(const char *argv0) {
-  fprintf(stderr, "用法: %s [--config <path>]\n", argv0);
+  fprintf(stderr, "用法: %s [--config <path>] [--service] [--service-name <name>]\n", argv0);
   fprintf(stderr,
           "  EDR Agent — 端点实现（初版：采集/预处理/批次/gRPC/指令/AVE 等已接通，见 README「实现状态快照」；"
           "设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md）\n");
 }
 
-int main(int argc, char **argv) {
-  const char *config = NULL;
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      print_usage(argv[0]);
-      return 0;
-    }
-    if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
-      config = argv[++i];
-      continue;
-    }
-    fprintf(stderr, "未知参数: %s\n", argv[i]);
-    print_usage(argv[0]);
-    return 1;
-  }
+#ifdef _WIN32
+static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms);
+#endif
 
+static int edr_agent_run_main(const char *config) {
   EdrAgent *agent = edr_agent_create();
   if (!agent) {
     return 1;
@@ -130,6 +132,9 @@ int main(int argc, char **argv) {
       fprintf(stderr, "webshell_detector 初始化失败: %d\n", (int)we);
     }
   }
+#ifdef _WIN32
+  edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
+#endif
   e = edr_agent_run(agent);
   {
     uint64_t dd = 0, rr = 0;
@@ -185,4 +190,96 @@ int main(int argc, char **argv) {
   edr_storage_queue_close();
   edr_agent_destroy(agent);
   return e == EDR_OK ? 0 : 1;
+}
+
+#ifdef _WIN32
+static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms) {
+  if (!g_service_status_handle) {
+    return;
+  }
+  g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+  g_service_status.dwCurrentState = state;
+  g_service_status.dwWin32ExitCode = win32_exit;
+  g_service_status.dwWaitHint = wait_hint_ms;
+  g_service_status.dwControlsAccepted =
+      (state == SERVICE_RUNNING) ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
+  if (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING) {
+    g_service_status.dwCheckPoint++;
+  } else {
+    g_service_status.dwCheckPoint = 0;
+  }
+  SetServiceStatus(g_service_status_handle, &g_service_status);
+}
+
+static void WINAPI edr_service_ctrl_handler(DWORD ctrl) {
+  if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
+    edr_service_set_status(SERVICE_STOP_PENDING, NO_ERROR, 30000);
+    if (g_agent_for_ctrl) {
+      edr_agent_shutdown(g_agent_for_ctrl);
+    }
+  }
+}
+
+static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
+  (void)argc;
+  (void)argv;
+  g_service_status_handle =
+      RegisterServiceCtrlHandlerA(g_service_name, edr_service_ctrl_handler);
+  if (!g_service_status_handle) {
+    return;
+  }
+  edr_service_set_status(SERVICE_START_PENDING, NO_ERROR, 30000);
+  int rc = edr_agent_run_main(g_service_config_path);
+  edr_service_set_status(SERVICE_STOPPED, rc == 0 ? NO_ERROR : ERROR_SERVICE_SPECIFIC_ERROR, 0);
+}
+#endif
+
+int main(int argc, char **argv) {
+  const char *config = NULL;
+  int run_as_service = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      print_usage(argv[0]);
+      return 0;
+    }
+    if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+      config = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--service") == 0) {
+      run_as_service = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--service-name") == 0 && i + 1 < argc) {
+#ifdef _WIN32
+      g_service_name = argv[++i];
+#else
+      i++;
+#endif
+      continue;
+    }
+    fprintf(stderr, "未知参数: %s\n", argv[i]);
+    print_usage(argv[0]);
+    return 1;
+  }
+
+#ifdef _WIN32
+  if (run_as_service) {
+    SERVICE_TABLE_ENTRYA table[] = {
+        {(LPSTR)g_service_name, edr_service_main},
+        {NULL, NULL},
+    };
+    g_service_config_path = config;
+    if (!StartServiceCtrlDispatcherA(table)) {
+      DWORD err = GetLastError();
+      fprintf(stderr, "StartServiceCtrlDispatcher 失败: %lu\n", (unsigned long)err);
+      return 1;
+    }
+    return 0;
+  }
+#else
+  (void)run_as_service;
+#endif
+
+  return edr_agent_run_main(config);
 }
