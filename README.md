@@ -275,11 +275,15 @@ cmake --build build
 | （开发）P0 C 对拍 | 改 `p0_golden_vectors.json` 后 **`python3 edr-agent/scripts/gen_p0_golden_vectors_inc.py`**（**仅** `process_create` 写入 `p0_golden_vectors_data.inc`；其它 event 由 Go 金线 + **`edr_p0_ir_record_golden_test`** 覆盖，需 **PCRE2**）。`ctest -R edr_p0_` 或跑 `edr_p0_golden_test` / `edr_p0_ir_record_golden_test`。无 PCRE2 时 PC 行仍 **legacy** 与 Go 对拍。 |
 | （开发）A4.1 总线 | **`ctest -R test_event_bus_mpmc_stress`** 或 **`bash scripts/run_event_bus_mpmc_stress.sh`**；长 soak 见 `docs/OPS_PROFILE_AND_RELEASE.md` 与测试源 `tests/test_event_bus_mpmc_stress.c`（`[ms] [producers] [cap]`）。 |
 | （monorepo）合并前**推荐** | 仓库根 **`bash edr-backend/scripts/recommended_p0_pr_gates.sh`**：六段**机读**（version、金线、TDH try-order、ETW1 槽文本、**A2.3 P3 UserData 十六进制金体**、**Go P0 manifest**）。`edr-agent` **CI** Ubuntu **precheck** 与上式 **6/6** 一致（另含 preprocess gray-release 预检）。全量 B2.4 留档用 **`bash edr-backend/scripts/collect_p0_b24_evidence.sh`** 或一键 **`bash edr-backend/scripts/p0_pack_machine_gates.sh`**。 |
-| `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / forensic**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
+| `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / restore_host / forensic / RTR 文件与 eventlog/registry / quarantine**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
 | `EDR_CMD_KILL_ALLOWLIST` | 若设置（逗号分隔 PID 列表），**kill** 仅允许终止列表内进程（仍须先满足高危策略）；未设置则不限制 PID。 |
 | `EDR_CMD_AUDIT_PATH` | 若设置，高危指令审计**追加**写入该文件（带时间戳）；stderr 仍会打印 `[command][audit]`。 |
+| `EDR_COMMAND_SIGNING_KEY` | 生产高危指令签名密钥；高危外部命令默认要求 `idempotency_key=<idem>\|sigv1\|<key_id>\|<hmac>`。 |
+| `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` | `=1` 时允许高危命令无签名执行，仅用于本地调试。 |
+| `EDR_COMMAND_STATE_DB` | 覆盖本地命令状态库 JSONL 路径，用于幂等、重启恢复与结果追踪。 |
 | `EDR_SOAR_REPORT_ALWAYS` | `=1` 时对**每条**指令尝试 gRPC **`ReportCommandResult`**（即使无 `soar_correlation_id`）；默认仅在下发含编排字段时上报。 |
 | `EDR_ISOLATE_HOOK` | 若设置，`isolate` 在写标记后执行 `system(hook)`（POSIX 下会 `setenv("EDR_CMD_ID", …)`）。 |
+| `EDR_RESTORE_HOOK` / `EDR_ISOLATE_RESTORE_HOOK` | 若设置，`restore_host` 在清理隔离标记前执行恢复脚本。 |
 | `EDR_SHELLCODE_AUTO_ISOLATE` | `=1` 时，若已允许高危指令且 WinDivert 分数 ≥ **`auto_isolate_threshold`**，执行与 **`isolate`** 相同的标记 + **`EDR_ISOLATE_HOOK`**（每进程最多一次）。亦可由 TOML **`[shellcode_detector] auto_isolate_execute = true`** 开启（仍须高危策略）。 |
 | `EDR_CONFIG_RELOAD_S` | 非 `0` 时每隔 N 秒检测配置文件 mtime，变更则热更 **preprocessing + resource_limit + self_protect**（见 §11.2 初版）。 |
 | `EDR_REMOTE_CONFIG_URL` | 若与 **`EDR_REMOTE_CONFIG_POLL_S`**（秒，≥1）同时设置，则周期性用 **`curl`** 下载 TOML 到临时文件并 **`edr_config_load`**，再应用 **preprocessing + resource_limit + self_protect**（**不**重连 gRPC / 不重初始化传输层，需重启进程才能对齐证书与批次参数）。URL 勿含未转义引号（Windows `cmd` 限制）。 |
@@ -303,7 +307,8 @@ cmake --build build
 | `EDR_SELF_PROTECT_PIDFILE` | 若设置，启动时写入当前 PID（退出时尝试 `remove`）；便于外部进程管理。 |
 | `EDR_FORENSIC_OUT` | 取证输出根目录；未设置时 **POSIX** 默认 `/tmp/edr_forensic`，**Windows** 默认 **`%TEMP%\\edr_forensic`**。 |
 | `EDR_FORENSIC_COPY_PATHS` | `=1` 时按 payload **每行一个路径**复制到作业目录（POSIX：**`open`/`read`/`write`**；Windows：**`CopyFileA`**；`#` 行与空行忽略）。 |
-| `EDR_ISOLATE_STAMP_PATH` | 隔离标记文件路径；未设置时 POSIX 默认 `/tmp/edr_isolated_<command_id>`，Windows 默认 **`%TEMP%\\edr_isolated_<command_id>`**。 |
+| `EDR_ISOLATE_STAMP_PATH` | 隔离标记文件路径；未设置时 POSIX 默认 `/tmp/edr_isolated.state`，Windows 默认 **`%TEMP%\\edr_isolated.state`**。 |
+| `EDR_UPLOAD_OUTBOX_DIR` / `EDR_COMMAND_OUTBOX_DIR` | 覆盖取证/RTR artifact 上传失败后的本地 outbox 路径，后续指令到达时会自动重试。 |
 | `EDR_PLATFORM_REST_BASE` | 覆盖 **`[platform].rest_base_url`**；攻击面 **`POST`** 的 API 前缀（无尾斜杠）。未设置且 TOML 未配时，指令仍成功结束但不发起 HTTP（结果 detail 含 `skip_no_rest_base`）。 |
 | `EDR_PLATFORM_BEARER` | 可选 JWT，作为 **`Authorization: Bearer …`**（优先于 **`[platform].rest_bearer_token`**）。 |
 | `EDR_WIN_LISTEN_CACHE_TTL_MS` | **（Windows）** 覆盖 **`[attack_surface].win_listen_cache_ttl_ms`**：监听表 **`edr_win_listen_collect_rows`** 进程内缓存 TTL（毫秒）。`0` 表示关闭缓存；未设置则沿用 TOML/默认。 |
@@ -329,7 +334,7 @@ cmake --build build
 
 - **`ReportEvents`**：每次批次 flush 时，将 **12 字节批次头 + 载荷**（BAT1 或 BLZ4，见 §6.2）作为 `payload` 上报，并带 `batch_id`（幂等）、`endpoint_id`、`agent_version`。
 - **`upload.max_upload_mbps`**：在 `ReportEvents` 发送前对**本批 wire 字节数**（头+体）做**令牌桶**节流（`0` = 不限制；默认 `1` Mbps）；与失败退避独立，二者可能叠加等待。
-- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `kill` / `forensic` 在启用高危策略时执行（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`** 在 Windows 上同样写 manifest、可选 `copy`、`tar` 打 **`bundle.tgz`**（依赖 **`tar.exe`**）。
+- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `restore_host` / `kill` / `forensic` / `rtr_get_file` / `rtr_rm_file` / `eventlog_view` / `registry_query` 在启用高危策略和生产签名后执行（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`** 在 Windows 上同样写 manifest、可选 `copy`、`tar` 打 **`bundle.tgz`**（依赖 **`tar.exe`**）。
 - **`ReportCommandResult`**： unary，上报 **`CommandExecutionResult`**（状态、exit_code、detail、完成时间等）；与 **`ReportEvents` 事件批次**相互独立。详见 **`docs/SOAR_CONTRACT.md`**。
 - **`ReportEvents` 失败退避**：连续失败后，下一次 RPC 前在持锁侧做 **50ms～5s** 的指数退避（减轻对不可用服务端的冲击）。
 - 通道参数：`GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS` / `MAX_RECONNECT_BACKOFF_MS` 已设置，便于底层重连。

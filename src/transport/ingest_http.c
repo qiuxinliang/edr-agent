@@ -22,6 +22,14 @@
 #include <openssl/err.h>
 #endif
 
+#ifdef _WIN32
+typedef SOCKET EdrSocket;
+#define EDR_SOCKET_INVALID INVALID_SOCKET
+#else
+typedef int EdrSocket;
+#define EDR_SOCKET_INVALID (-1)
+#endif
+
 #ifndef EDR_AGENT_VERSION_STRING
 #define EDR_AGENT_VERSION_STRING "0.3.0"
 #endif
@@ -233,20 +241,20 @@ static void net_done(void) {
 #endif
 }
 
-static void close_fd(int fd) {
+static void close_fd(EdrSocket fd) {
 #ifdef _WIN32
-  closesocket((SOCKET)fd);
+  closesocket(fd);
 #else
   close(fd);
 #endif
 }
 
-static int tcp_connect_host(const char *host, int port, int *out_fd) {
+static int tcp_connect_host(const char *host, int port, EdrSocket *out_fd) {
   struct addrinfo hints;
   struct addrinfo *res = NULL;
   struct addrinfo *rp = NULL;
   char portstr[16];
-  int fd = -1;
+  EdrSocket fd = EDR_SOCKET_INVALID;
   memset(&hints, 0, sizeof(hints));
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_family = AF_UNSPEC;
@@ -256,32 +264,32 @@ static int tcp_connect_host(const char *host, int port, int *out_fd) {
   }
   for (rp = res; rp; rp = rp->ai_next) {
 #ifdef _WIN32
-    fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #else
     fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #endif
-    if (fd < 0) {
+    if (fd == EDR_SOCKET_INVALID) {
       continue;
     }
     if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
       break;
     }
     close_fd(fd);
-    fd = -1;
+    fd = EDR_SOCKET_INVALID;
   }
   freeaddrinfo(res);
-  if (fd < 0) {
+  if (fd == EDR_SOCKET_INVALID) {
     return -1;
   }
   *out_fd = fd;
   return 0;
 }
 
-static int write_all_plain(int fd, const char *p, size_t n) {
+static int write_all_plain(EdrSocket fd, const char *p, size_t n) {
   size_t off = 0;
   while (off < n) {
 #ifdef _WIN32
-    int w = send((SOCKET)fd, p + off, (int)(n - off), 0);
+    int w = send(fd, p + off, (int)(n - off), 0);
 #else
     ssize_t w = send(fd, p + off, n - off, 0);
 #endif
@@ -293,10 +301,10 @@ static int write_all_plain(int fd, const char *p, size_t n) {
   return 0;
 }
 
-static int read_status_plain(int fd) {
+static int read_status_plain(EdrSocket fd) {
   char buf[256];
 #ifdef _WIN32
-  int n = recv((SOCKET)fd, buf, (int)sizeof(buf) - 1, 0);
+  int n = recv(fd, buf, (int)sizeof(buf) - 1, 0);
 #else
   ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
 #endif
@@ -344,7 +352,7 @@ static int append_headers(char *req, size_t cap, const char *path, const char *h
 
 #ifdef EDR_HAVE_OPENSSL_HTTP
 static int post_https_openssl(const char *host, int port, const char *path, const char *body, size_t body_len) {
-  int fd = -1;
+  EdrSocket fd = EDR_SOCKET_INVALID;
   int ret = -1;
   SSL_CTX *ctx = NULL;
   SSL *ssl = NULL;
@@ -374,7 +382,11 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
   if (!ssl) {
     goto done;
   }
+#ifdef _WIN32
+  SSL_set_fd(ssl, (int)fd);
+#else
   SSL_set_fd(ssl, fd);
+#endif
   (void)SSL_set_tlsext_host_name(ssl, host);
   if (SSL_connect(ssl) != 1) {
     goto done;
@@ -395,7 +407,7 @@ done:
     SSL_shutdown(ssl);
     SSL_free(ssl);
   }
-  if (fd >= 0) {
+  if (fd != EDR_SOCKET_INVALID) {
     close_fd(fd);
   }
   if (ctx) {
@@ -410,7 +422,7 @@ static int native_post_json(const char *url, const char *body, size_t body_len) 
   char path[1024];
   int port = 0;
   int https = 0;
-  int fd = -1;
+  EdrSocket fd = EDR_SOCKET_INVALID;
   int rc = -1;
   char req[8192];
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {

@@ -7,12 +7,13 @@ project(edr_agent
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
-  add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS _ENABLE_STDATOMIC)
+  add_compile_options($<$<COMPILE_LANGUAGE:C>:/std:c11> $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
 endif()
 
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
@@ -111,6 +112,16 @@ option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAK
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 
 find_package(OpenSSL QUIET)
+if(MSVC)
+  set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT OFF)
+else()
+  set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT ON)
+endif()
+# Windows production transport uses gRPC/mTLS. Keep the native HTTP HTTPS fallback
+# off by default on MSVC so vcpkg's OpenSSL C headers cannot block curl-only CI.
+option(EDR_WITH_INGEST_HTTPS_OPENSSL
+  "Enable native HTTPS fallback in ingest_http.c through OpenSSL C headers"
+  ${_EDR_INGEST_HTTPS_OPENSSL_DEFAULT})
 set(EDR_LIBTORCH_AVAILABLE 0)
 if(EDR_WITH_LIBTORCH)
   list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}" "$ENV{TORCH_ROOT}")
@@ -174,6 +185,7 @@ set(EDR_AGENT_SOURCES
   src/storage/queue_sqlite.c
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
+  src/command/command_state.c
   src/command/sha256.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
@@ -379,8 +391,8 @@ target_include_directories(edr_agent PRIVATE
 )
 target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
 if(MSVC)
-  target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
-  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+  target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS _ENABLE_STDATOMIC)
+  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c11> $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
 endif()
 if(EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)
@@ -403,7 +415,7 @@ if(EDR_WITH_FL_TRAINER AND OpenSSL_FOUND)
   endif()
 endif()
 
-if(OpenSSL_FOUND)
+if(EDR_WITH_INGEST_HTTPS_OPENSSL AND OpenSSL_FOUND)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_HTTP=1)
   if(TARGET OpenSSL::SSL)
     target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
@@ -479,7 +491,7 @@ endif()
 
 if(WIN32)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
-  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust)
+  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

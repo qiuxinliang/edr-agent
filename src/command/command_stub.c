@@ -11,6 +11,7 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/command.h"
+#include "edr/command_state.h"
 #include "edr/ave.h"
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
@@ -30,7 +31,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winevt.h>
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -43,9 +46,12 @@ static unsigned long s_unknown;
 static unsigned long s_rejected;
 static unsigned long s_exec_ok;
 static unsigned long s_exec_fail;
+static const char *s_active_command_type;
 
 /** main 在 edr_agent_init 后绑定，供 ave_infer 使用 */
 static const EdrConfig *s_bound_cfg;
+
+static int64_t command_now_ms(void);
 
 void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
 
@@ -133,18 +139,18 @@ static int soar_want_report(const EdrSoarCommandMeta *m) {
   return m->soar_correlation_id[0] || m->playbook_run_id[0];
 }
 
-static const char *exec_status_label(EdrCommandExecutionStatus st) {
+static const char *response_status_label(EdrCommandExecutionStatus st) {
   switch (st) {
     case EdrCmdExecOk:
       return "ok";
     case EdrCmdExecRejected:
-      return "rejected";
+      return "denied";
     case EdrCmdExecFailed:
       return "failed";
     case EdrCmdExecUnknownType:
-      return "unknown_type";
+      return "failed";
     default:
-      return "unknown";
+      return "failed";
   }
 }
 
@@ -174,24 +180,39 @@ static void json_escape_to(char *dst, size_t cap, const char *s) {
   dst[o < cap ? o : cap - 1u] = '\0';
 }
 
-static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
-                      int exit_code, const char *detail) {
-  if (!soar_want_report(sm)) {
-    return;
-  }
+static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
+                         int exit_code, const char *detail, const char *response_status,
+                         const char *artifacts) {
   char detail_json[16384];
+  char taskj[300];
+  char statusj[96];
   char raw[12000];
   char err[1600];
+  const char *rstatus = response_status && response_status[0] ? response_status : response_status_label(st);
   int retryable = (st == EdrCmdExecFailed && exit_code != 1 && exit_code != 2 && exit_code != 7) ? 1 : 0;
+  json_escape_to(taskj, sizeof(taskj), cmd_id ? cmd_id : "");
+  json_escape_to(statusj, sizeof(statusj), rstatus);
   json_escape_to(raw, sizeof(raw), detail ? detail : "");
-  json_escape_to(err, sizeof(err), st == EdrCmdExecOk ? "" : (detail ? detail : exec_status_label(st)));
+  json_escape_to(err, sizeof(err), st == EdrCmdExecOk ? "" : (detail ? detail : response_status_label(st)));
   snprintf(detail_json, sizeof(detail_json),
-           "{\"task_id\":\"%s\",\"status\":\"%s\",\"exit_code\":%d,"
-           "\"evidence_refs\":[],\"upload_refs\":[],\"error\":%s,"
+           "{\"task_id\":%s,\"status\":%s,\"exit_code\":%d,"
+           "\"evidence_refs\":[],\"upload_refs\":[],\"artifacts\":%s,\"error\":%s,"
            "\"retryable\":%s,\"raw_detail\":%s}",
-           cmd_id ? cmd_id : "", exec_status_label(st), exit_code, err,
+           taskj, statusj, exit_code, artifacts && artifacts[0] ? artifacts : "[]", err,
            retryable ? "true" : "false", raw);
-  (void)edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+  int report_pending = 0;
+  if (soar_want_report(sm)) {
+    int rc = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+    report_pending = (rc != 0);
+  }
+  edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "", sm, rstatus,
+                           (int)st, exit_code, detail ? detail : "", artifacts ? artifacts : "",
+                           report_pending);
+}
+
+static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
+                      int exit_code, const char *detail) {
+  soar_emit_ex(cmd_id, sm, st, exit_code, detail, NULL, NULL);
 }
 
 static int parse_json_string_field(const uint8_t *p, size_t len, const char *key,
@@ -347,7 +368,7 @@ int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
   if (ctx_has(r, "process_tree") || ctx_has(r, "timeline_window") || ctx_has(r, "targeted_files") ||
       ctx_has(r, "webshell_files") || ctx_has(r, "single_process_minidump")) {
     char id[96];
-    char payload[1800];
+    char payload[4096];
     char ev[192];
     char pname[256];
     char exe[512];
@@ -609,17 +630,10 @@ static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const Edr
 #endif
 }
 
-static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
-  if (!dangerous_enabled()) {
-    s_rejected++;
-    audit_both(cmd_id, "reject isolate: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
-    return;
-  }
-  char path[512];
+static void isolate_stamp_path(char *path, size_t cap) {
   const char *stamp = getenv("EDR_ISOLATE_STAMP_PATH");
   if (stamp && stamp[0]) {
-    snprintf(path, sizeof(path), "%s", stamp);
+    snprintf(path, cap, "%s", stamp);
   } else {
 #ifdef _WIN32
     const char *tmp = getenv("TEMP");
@@ -629,16 +643,26 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     if (!tmp || !tmp[0]) {
       tmp = ".";
     }
-    snprintf(path, sizeof(path), "%s\\edr_isolated_%s", tmp,
-             (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
+    snprintf(path, cap, "%s\\edr_isolated.state", tmp);
 #else
-    snprintf(path, sizeof(path), "/tmp/edr_isolated_%s",
-             (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
+    snprintf(path, cap, "%s", "/tmp/edr_isolated.state");
 #endif
   }
+}
+
+static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject isolate: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[512];
+  isolate_stamp_path(path, sizeof(path));
   FILE *f = fopen(path, "w");
   if (f) {
-    (void)fwrite("1", 1, 1, f);
+    fprintf(f, "isolated=1\ncommand_id=%s\nupdated_unix_ms=%lld\n", cmd_id ? cmd_id : "",
+            (long long)command_now_ms());
     fclose(f);
     s_exec_ok++;
     audit_both(cmd_id, "isolate: 已写标记文件");
@@ -660,11 +684,80 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
       audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 执行成功");
     } else {
       audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 返回非零");
+      (void)remove(path);
       soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolate hook non-zero");
       return;
     }
   }
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "isolate ok");
+  {
+    char pathj[700], detail[1024];
+    json_escape_to(pathj, sizeof(pathj), path);
+    snprintf(detail, sizeof(detail), "{\"status\":\"isolated\",\"stamp_path\":%s,\"hook\":\"%s\"}",
+             pathj, (hook && hook[0]) ? "executed" : "not_configured");
+    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+  }
+}
+
+static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject restore_host: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[512];
+  isolate_stamp_path(path, sizeof(path));
+  const char *hook = getenv("EDR_RESTORE_HOOK");
+  if (!hook || !hook[0]) {
+    hook = getenv("EDR_ISOLATE_RESTORE_HOOK");
+  }
+  if (hook && hook[0]) {
+#ifdef _WIN32
+    (void)_putenv_s("EDR_CMD_ID", cmd_id ? cmd_id : "");
+#else
+    (void)setenv("EDR_CMD_ID", cmd_id ? cmd_id : "", 1);
+#endif
+    int r = system(hook);
+    if (r != 0) {
+      s_exec_fail++;
+      audit_both(cmd_id, "restore_host: restore hook non-zero");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "restore hook non-zero");
+      return;
+    }
+  }
+  if (remove(path) != 0 && errno != ENOENT) {
+    s_exec_fail++;
+    audit_both(cmd_id, "restore_host: stamp remove failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "stamp remove failed");
+    return;
+  }
+  s_handled++;
+  s_exec_ok++;
+  {
+    char pathj[700], detail[1024];
+    json_escape_to(pathj, sizeof(pathj), path);
+    snprintf(detail, sizeof(detail), "{\"status\":\"restored\",\"stamp_path\":%s,\"hook\":\"%s\"}",
+             pathj, (hook && hook[0]) ? "executed" : "not_configured");
+    audit_both(cmd_id, "restore_host: ok");
+    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+  }
+}
+
+static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
+  char path[512];
+  isolate_stamp_path(path, sizeof(path));
+  int exists = 0;
+  FILE *f = fopen(path, "r");
+  if (f) {
+    exists = 1;
+    fclose(f);
+  }
+  char pathj[700], detail[1024];
+  json_escape_to(pathj, sizeof(pathj), path);
+  snprintf(detail, sizeof(detail), "{\"isolated\":%s,\"stamp_path\":%s}", exists ? "true" : "false", pathj);
+  s_handled++;
+  s_exec_ok++;
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
 void edr_isolate_auto_from_shellcode_alarm(void) {
@@ -939,6 +1032,495 @@ static void do_file_stat(const char *cmd_id, const uint8_t *pl, size_t len, cons
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
+static int parse_int_json_default(const uint8_t *p, size_t len, const char *key, int defv) {
+  if (!p || len == 0u || !key) {
+    return defv;
+  }
+  char tmp[4096];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, p, len);
+  tmp[len] = 0;
+  char pat[96];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  char *k = strstr(tmp, pat);
+  if (!k) {
+    return defv;
+  }
+  char *colon = strchr(k + strlen(pat), ':');
+  if (!colon) {
+    return defv;
+  }
+  char *v = colon + 1;
+  while (*v && isspace((unsigned char)*v)) {
+    v++;
+  }
+  return (int)strtol(v, NULL, 10);
+}
+
+static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
+                            const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_get_file: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[1024];
+  if (parse_path_json(pl, len, path, sizeof(path)) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid path payload");
+    return;
+  }
+  unsigned long long sz = 0;
+  long long mt = 0;
+  if (file_size_mtime(path, &sz, &mt) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "file not found or not regular");
+    return;
+  }
+  int max_size = parse_int_json_default(pl, len, "max_size_bytes", 100 * 1024 * 1024);
+  if (max_size <= 0) {
+    max_size = 100 * 1024 * 1024;
+  }
+  if (sz > (unsigned long long)max_size) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "file size exceeds max_size_bytes");
+    return;
+  }
+  char sha[65];
+  sha[0] = '\0';
+  if (file_sha256_hex(path, sha) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "sha256 failed");
+    return;
+  }
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
+                                              minio_key, sizeof(minio_key));
+  char pathj[1400], keyj[1400], artifacts[3600], detail[4096];
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(keyj, sizeof(keyj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"rtr_file\",\"path\":%s,\"sha256\":\"%s\",\"size\":%llu,"
+           "\"mtime\":%lld,\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, sha, sz, mt, upload_rc == 0 ? "ok" : "failed", keyj);
+  snprintf(detail, sizeof(detail),
+           "{\"path\":%s,\"sha256\":\"%s\",\"size\":%llu,\"mtime\":%lld,"
+           "\"upload_status\":\"%s\",\"minio_key\":%s}",
+           pathj, sha, sz, mt, upload_rc == 0 ? "ok" : "failed", keyj);
+  s_handled++;
+  if (upload_rc == 0) {
+    s_exec_ok++;
+    audit_both(cmd_id, "rtr_get_file: upload ok");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+  } else {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_get_file: file readable but upload failed");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  }
+}
+
+static void do_rtr_rm_file(const char *cmd_id, const uint8_t *pl, size_t len,
+                           const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_rm_file: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char path[1024];
+  if (parse_path_json(pl, len, path, sizeof(path)) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid path payload");
+    return;
+  }
+  if (!file_exists_c(path)) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "file not found or not regular");
+    return;
+  }
+  if (remove(path) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_rm_file: remove failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "remove failed");
+    return;
+  }
+  char pathj[1400], detail[1600];
+  json_escape_to(pathj, sizeof(pathj), path);
+  snprintf(detail, sizeof(detail), "{\"removed\":true,\"path\":%s}", pathj);
+  s_handled++;
+  s_exec_ok++;
+  audit_both(cmd_id, "rtr_rm_file: ok");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+}
+
+static void command_artifact_path(const char *cmd_id, const char *prefix, const char *ext,
+                                  char *out, size_t cap) {
+  const char *base = getenv("EDR_RESPONSE_ARTIFACT_DIR");
+  char root[700];
+  if (base && base[0]) {
+    snprintf(root, sizeof(root), "%s", base);
+  } else {
+#ifdef _WIN32
+    const char *tmp = getenv("TEMP");
+    if (!tmp || !tmp[0]) {
+      tmp = getenv("TMP");
+    }
+    if (!tmp || !tmp[0]) {
+      tmp = ".";
+    }
+    snprintf(root, sizeof(root), "%s\\edr_response", tmp);
+#else
+    snprintf(root, sizeof(root), "%s", "/tmp/edr_response");
+#endif
+  }
+  (void)mkdir_p_quiet(root);
+  char safe[180];
+  snprintf(safe, sizeof(safe), "%s", (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
+  sanitize_component(safe);
+#ifdef _WIN32
+  snprintf(out, cap, "%s\\%s_%s_%lld.%s", root, prefix ? prefix : "artifact", safe,
+           (long long)time(NULL), ext ? ext : "json");
+#else
+  snprintf(out, cap, "%s/%s_%s_%lld.%s", root, prefix ? prefix : "artifact", safe,
+           (long long)time(NULL), ext ? ext : "json");
+#endif
+}
+
+static void fprint_json_escaped(FILE *f, const char *s) {
+  if (!f) {
+    return;
+  }
+  if (!s) {
+    s = "";
+  }
+  for (const char *p = s; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c == '"' || c == '\\') {
+      fputc('\\', f);
+      fputc(c, f);
+    } else if (c == '\n') {
+      fputs("\\n", f);
+    } else if (c == '\r') {
+      fputs("\\r", f);
+    } else if (c == '\t') {
+      fputs("\\t", f);
+    } else if (c >= 32u) {
+      fputc(c, f);
+    } else {
+      fputc(' ', f);
+    }
+  }
+}
+
+#ifdef _WIN32
+#define EDR_EVENTLOG_XML_MAX (256u * 1024u)
+static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) {
+  wchar_t wchannel[256];
+  if (!channel || !channel[0]) {
+    channel = "Security";
+  }
+  MultiByteToWideChar(CP_UTF8, 0, channel, -1, wchannel, 256);
+  EVT_HANDLE hq = EvtQuery(NULL, wchannel, L"*", EvtQueryChannelPath);
+  if (!hq) {
+    return -1;
+  }
+  EVT_HANDLE events[16];
+  DWORD returned = 0;
+  int total = 0;
+  int first = 1;
+  while (total < max_events && EvtNext(hq, 16, events, 1000, 0, &returned)) {
+    for (DWORD i = 0; i < returned && total < max_events; i++) {
+      DWORD used = 0;
+      DWORD props = 0;
+      (void)EvtRender(NULL, events[i], EvtRenderEventXml, 0, NULL, &used, &props);
+      if (used > 0u && used < EDR_EVENTLOG_XML_MAX) {
+        WCHAR *wxml = (WCHAR *)calloc(1, (size_t)used + sizeof(WCHAR));
+        if (wxml && EvtRender(NULL, events[i], EvtRenderEventXml, used, wxml, &used, &props)) {
+          int need = WideCharToMultiByte(CP_UTF8, 0, wxml, -1, NULL, 0, NULL, NULL);
+          if (need > 1) {
+            char *utf8 = (char *)malloc((size_t)need);
+            if (utf8) {
+              WideCharToMultiByte(CP_UTF8, 0, wxml, -1, utf8, need, NULL, NULL);
+              if (!first) {
+                fputs(",\n", f);
+              }
+              first = 0;
+              fputc('"', f);
+              fprint_json_escaped(f, utf8);
+              fputc('"', f);
+              total++;
+              free(utf8);
+            }
+          }
+        }
+        free(wxml);
+      }
+      EvtClose(events[i]);
+    }
+  }
+  EvtClose(hq);
+  return total;
+}
+#else
+static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) {
+  (void)channel;
+  if (max_events <= 0) {
+    max_events = 100;
+  }
+  char cmd[160];
+  snprintf(cmd, sizeof(cmd), "journalctl --output=json -n %d 2>/dev/null", max_events);
+  FILE *p = popen(cmd, "r");
+  if (!p) {
+    return -1;
+  }
+  char line[8192];
+  int first = 1;
+  int count = 0;
+  while (fgets(line, sizeof(line), p) && count < max_events) {
+    line[strcspn(line, "\r\n")] = '\0';
+    if (!first) {
+      fputs(",\n", f);
+    }
+    first = 0;
+    fputs(line, f);
+    count++;
+  }
+  (void)pclose(p);
+  return count;
+}
+#endif
+
+static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
+                             const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject eventlog_view: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char channel[96];
+  if (parse_json_string_field(pl, len, "channel", channel, sizeof(channel)) != 0) {
+    snprintf(channel, sizeof(channel), "%s", "Security");
+  }
+  int max_events = parse_int_json_default(pl, len, "max_events", 100);
+  if (max_events <= 0 || max_events > 1000) {
+    max_events = 100;
+  }
+  char path[900];
+  command_artifact_path(cmd_id, "eventlog", "json", path, sizeof(path));
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "cannot create eventlog artifact");
+    return;
+  }
+  fputs("{\"channel\":\"", f);
+  fprint_json_escaped(f, channel);
+  fputs("\",\"events\":[\n", f);
+  int count = eventlog_query_to_file(channel, max_events, f);
+  if (count < 0) {
+    count = 0;
+  }
+  fprintf(f, "\n],\"total\":%d}\n", count);
+  fclose(f);
+  char sha[65];
+  sha[0] = '\0';
+  (void)file_sha256_hex(path, sha);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "eventlog", path, sha, minio_key, sizeof(minio_key));
+  char pathj[1200], channelj[256], keyj[1200], artifacts[3200], detail[4096];
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(channelj, sizeof(channelj), channel);
+  json_escape_to(keyj, sizeof(keyj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"eventlog\",\"path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, sha, upload_rc == 0 ? "ok" : "failed", keyj);
+  snprintf(detail, sizeof(detail),
+           "{\"channel\":%s,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}",
+           channelj, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", keyj);
+  s_handled++;
+  if (upload_rc == 0) {
+    s_exec_ok++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+  } else {
+    s_exec_fail++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  }
+}
+
+#ifdef _WIN32
+static HKEY registry_parse_root(const char *key_path, const char **subkey_out) {
+  if (!key_path || !subkey_out) {
+    return NULL;
+  }
+  if (strncmp(key_path, "HKLM\\", 5) == 0 || strncmp(key_path, "HKLM/", 5) == 0) {
+    *subkey_out = key_path + 5;
+    return HKEY_LOCAL_MACHINE;
+  }
+  if (strncmp(key_path, "HKCU\\", 5) == 0 || strncmp(key_path, "HKCU/", 5) == 0) {
+    *subkey_out = key_path + 5;
+    return HKEY_CURRENT_USER;
+  }
+  if (strncmp(key_path, "HKU\\", 4) == 0 || strncmp(key_path, "HKU/", 4) == 0) {
+    *subkey_out = key_path + 4;
+    return HKEY_USERS;
+  }
+  if (strncmp(key_path, "HKCR\\", 5) == 0 || strncmp(key_path, "HKCR/", 5) == 0) {
+    *subkey_out = key_path + 5;
+    return HKEY_CLASSES_ROOT;
+  }
+  if (strncmp(key_path, "HKCC\\", 5) == 0 || strncmp(key_path, "HKCC/", 5) == 0) {
+    *subkey_out = key_path + 5;
+    return HKEY_CURRENT_CONFIG;
+  }
+  return NULL;
+}
+
+static void registry_format_data(FILE *f, DWORD type, const BYTE *data, DWORD size) {
+  if (!f || !data) {
+    return;
+  }
+  if (type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ) {
+    char *tmp = (char *)calloc(1, (size_t)size + 1u);
+    if (tmp) {
+      memcpy(tmp, data, size);
+      fprint_json_escaped(f, tmp);
+      free(tmp);
+    }
+  } else if (type == REG_DWORD && size >= sizeof(DWORD)) {
+    DWORD v = 0;
+    memcpy(&v, data, sizeof(v));
+    fprintf(f, "0x%08lx", (unsigned long)v);
+  } else if (type == REG_QWORD && size >= 8u) {
+    unsigned long long v = 0;
+    memcpy(&v, data, sizeof(v));
+    fprintf(f, "0x%016llx", v);
+  } else {
+    fputs("hex:", f);
+    DWORD n = size < 128u ? size : 128u;
+    for (DWORD i = 0; i < n; i++) {
+      fprintf(f, "%02x", data[i]);
+    }
+  }
+}
+
+static int registry_values_to_file(const char *key_path, int max_values, FILE *f) {
+  const char *subkey = NULL;
+  HKEY root = registry_parse_root(key_path, &subkey);
+  if (!root || !subkey) {
+    return -1;
+  }
+  HKEY hkey;
+  if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hkey) != ERROR_SUCCESS) {
+    return -1;
+  }
+  int first = 1;
+  int count = 0;
+  for (DWORD idx = 0; count < max_values; idx++) {
+    char name[512];
+    BYTE data[8192];
+    DWORD name_size = sizeof(name);
+    DWORD data_size = sizeof(data);
+    DWORD type = 0;
+    LONG lr = RegEnumValueA(hkey, idx, name, &name_size, NULL, &type, data, &data_size);
+    if (lr != ERROR_SUCCESS) {
+      break;
+    }
+    if (!first) {
+      fputs(",\n", f);
+    }
+    first = 0;
+    fputs("{\"name\":\"", f);
+    fprint_json_escaped(f, name);
+    fprintf(f, "\",\"type\":%lu,\"data\":\"", (unsigned long)type);
+    registry_format_data(f, type, data, data_size);
+    fputs("\"}", f);
+    count++;
+  }
+  RegCloseKey(hkey);
+  return count;
+}
+#endif
+
+static void do_registry_query(const char *cmd_id, const uint8_t *pl, size_t len,
+                              const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject registry_query: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  char key[1024];
+  if (parse_json_string_field(pl, len, "key", key, sizeof(key)) != 0 &&
+      parse_json_string_field(pl, len, "path", key, sizeof(key)) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing registry key");
+    return;
+  }
+  int max_values = parse_int_json_default(pl, len, "max_values", 200);
+  if (max_values <= 0 || max_values > 1000) {
+    max_values = 200;
+  }
+#ifndef _WIN32
+  char keyj[1400], detail[1800];
+  json_escape_to(keyj, sizeof(keyj), key);
+  snprintf(detail, sizeof(detail), "{\"key\":%s,\"supported\":false,\"platform\":\"non_windows\"}", keyj);
+  s_handled++;
+  s_exec_ok++;
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+#else
+  char path[900];
+  command_artifact_path(cmd_id, "registry", "json", path, sizeof(path));
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create registry artifact");
+    return;
+  }
+  fputs("{\"key\":\"", f);
+  fprint_json_escaped(f, key);
+  fputs("\",\"values\":[\n", f);
+  int count = registry_values_to_file(key, max_values, f);
+  if (count < 0) {
+    count = 0;
+  }
+  fprintf(f, "\n],\"total\":%d}\n", count);
+  fclose(f);
+  char sha[65];
+  sha[0] = '\0';
+  (void)file_sha256_hex(path, sha);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "registry", path, sha, minio_key, sizeof(minio_key));
+  char pathj[1200], keyj[1400], minioj[1200], artifacts[4800], detail[4800];
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(keyj, sizeof(keyj), key);
+  json_escape_to(minioj, sizeof(minioj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"registry\",\"path\":%s,\"registry_key\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, keyj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  snprintf(detail, sizeof(detail),
+           "{\"key\":%s,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}",
+           keyj, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  s_handled++;
+  if (upload_rc == 0) {
+    s_exec_ok++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+  } else {
+    s_exec_fail++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  }
+#endif
+}
+
 static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len,
                                const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
@@ -964,11 +1546,27 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine directory create failed");
     return;
   }
-  char stem[180];
+  char stem[512];
+  char safe_cmd[128];
+  char safe_base[256];
+  const char *cmd_name = (cmd_id && cmd_id[0]) ? cmd_id : "cmd";
+  const char *base_name = path_basename_c(path);
+  size_t cmd_n = strlen(cmd_name);
+  size_t base_n = strlen(base_name);
+  if (cmd_n >= sizeof(safe_cmd)) {
+    cmd_n = sizeof(safe_cmd) - 1u;
+  }
+  if (base_n >= sizeof(safe_base)) {
+    base_n = sizeof(safe_base) - 1u;
+  }
+  memcpy(safe_cmd, cmd_name, cmd_n);
+  safe_cmd[cmd_n] = '\0';
+  memcpy(safe_base, base_name, base_n);
+  safe_base[base_n] = '\0';
   snprintf(stem, sizeof(stem), "%lld_%s_%s", (long long)time(NULL),
-           (cmd_id && cmd_id[0]) ? cmd_id : "cmd", path_basename_c(path));
+           safe_cmd, safe_base);
   sanitize_component(stem);
-  char qpath[900], meta[900];
+  char qpath[1400], meta[1400];
 #ifdef _WIN32
   snprintf(qpath, sizeof(qpath), "%s\\%s.bin", base, stem);
   snprintf(meta, sizeof(meta), "%s\\%s.meta", base, stem);
@@ -994,11 +1592,15 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
             stem, path, qpath, sha, sz, mt, reason);
     fclose(mf);
   }
-  char detail[2200];
+  char stemj[700], pathj[1400], qpathj[1600], metaj[1600], detail[5600];
+  json_escape_to(stemj, sizeof(stemj), stem);
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(qpathj, sizeof(qpathj), qpath);
+  json_escape_to(metaj, sizeof(metaj), meta);
   snprintf(detail, sizeof(detail),
-           "{\"quarantine_id\":\"%s\",\"original_path\":\"%s\",\"quarantine_path\":\"%s\","
-           "\"meta_path\":\"%s\",\"sha256\":\"%s\",\"size\":%llu}",
-           stem, path, qpath, meta, sha, sz);
+           "{\"quarantine_id\":%s,\"original_path\":%s,\"quarantine_path\":%s,"
+           "\"meta_path\":%s,\"sha256\":\"%s\",\"size\":%llu}",
+           stemj, pathj, qpathj, metaj, sha, sz);
   s_handled++;
   s_exec_ok++;
   audit_both(cmd_id, "quarantine_file: ok");
@@ -1042,7 +1644,7 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     return;
   }
   sanitize_component(qid);
-  char base[700], meta[900];
+  char base[700], meta[1200];
   quarantine_base_dir(base, sizeof(base));
 #ifdef _WIN32
   snprintf(meta, sizeof(meta), "%s\\%s.meta", base, qid);
@@ -1071,10 +1673,13 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     return;
   }
   (void)remove(meta);
-  char detail[1800];
+  char qidj[700], restorej[1400], originalj[1400], detail[4200];
+  json_escape_to(qidj, sizeof(qidj), qid);
+  json_escape_to(restorej, sizeof(restorej), restore);
+  json_escape_to(originalj, sizeof(originalj), original);
   snprintf(detail, sizeof(detail),
-           "{\"quarantine_id\":\"%s\",\"restored_path\":\"%s\",\"original_path\":\"%s\"}",
-           qid, restore, original);
+           "{\"quarantine_id\":%s,\"restored_path\":%s,\"original_path\":%s}",
+           qidj, restorej, originalj);
   s_handled++;
   s_exec_ok++;
   audit_both(cmd_id, "unquarantine_file: ok");
@@ -1117,6 +1722,116 @@ static void forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t le
     }
     p = nl + 1;
   }
+}
+
+static void upload_outbox_dir(char *out, size_t cap) {
+  const char *e = getenv("EDR_UPLOAD_OUTBOX_DIR");
+  if (!e || !e[0]) {
+    e = getenv("EDR_COMMAND_OUTBOX_DIR");
+  }
+  if (e && e[0]) {
+    snprintf(out, cap, "%s", e);
+    return;
+  }
+#ifdef _WIN32
+  e = getenv("ProgramData");
+  if (!e || !e[0]) {
+    e = getenv("TEMP");
+  }
+  if (!e || !e[0]) {
+    e = ".";
+  }
+  snprintf(out, cap, "%s\\EDR\\upload_outbox", e);
+#else
+  snprintf(out, cap, "%s", "/tmp/edr_upload_outbox");
+#endif
+}
+
+static void write_upload_outbox(const char *cmd_id, const char *bundle, const char *sha,
+                                const char *manifest) {
+  char dir[700];
+  upload_outbox_dir(dir, sizeof(dir));
+  if (mkdir_p_quiet(dir) != 0) {
+    return;
+  }
+  char safe[180];
+  snprintf(safe, sizeof(safe), "%s", (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
+  sanitize_component(safe);
+  char path[900];
+#ifdef _WIN32
+  snprintf(path, sizeof(path), "%s\\upload_%s_%lld.pending", dir, safe, (long long)time(NULL));
+#else
+  snprintf(path, sizeof(path), "%s/upload_%s_%lld.pending", dir, safe, (long long)time(NULL));
+#endif
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    return;
+  }
+  fprintf(f, "command_id=%s\nbundle_path=%s\nsha256=%s\nmanifest_path=%s\ncreated_unix_ms=%lld\n",
+          cmd_id ? cmd_id : "", bundle ? bundle : "", sha ? sha : "", manifest ? manifest : "",
+          (long long)command_now_ms());
+  fclose(f);
+}
+
+static int read_kv_file_value(const char *path, const char *key, char *out, size_t cap) {
+  return read_meta_value(path, key, out, cap);
+}
+
+static void flush_upload_outbox_one(const char *pending_path) {
+  char cmd_id[128], bundle[1024], sha[65];
+  if (read_kv_file_value(pending_path, "command_id", cmd_id, sizeof(cmd_id)) != 0 ||
+      read_kv_file_value(pending_path, "bundle_path", bundle, sizeof(bundle)) != 0 ||
+      read_kv_file_value(pending_path, "sha256", sha, sizeof(sha)) != 0) {
+    return;
+  }
+  if (!file_exists_c(bundle)) {
+    return;
+  }
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  if (edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
+    char done[1100];
+    snprintf(done, sizeof(done), "%s.done", pending_path);
+    (void)rename(pending_path, done);
+  }
+}
+
+static void flush_upload_outbox(void) {
+  char dir[700];
+  upload_outbox_dir(dir, sizeof(dir));
+#ifdef _WIN32
+  char pattern[900];
+  snprintf(pattern, sizeof(pattern), "%s\\*.pending", dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  do {
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      char path[1000];
+      snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+      flush_upload_outbox_one(path);
+    }
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  DIR *d = opendir(dir);
+  if (!d) {
+    return;
+  }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    const char *name = ent->d_name;
+    size_t n = strlen(name);
+    if (n > 8u && strcmp(name + n - 8u, ".pending") == 0) {
+      char path[1000];
+      snprintf(path, sizeof(path), "%s/%s", dir, name);
+      flush_upload_outbox_one(path);
+    }
+  }
+  closedir(d);
+#endif
 }
 
 static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -1213,14 +1928,14 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
 #ifdef _WIN32
   snprintf(bundle, sizeof(bundle), "%s\\bundle.tgz", dir);
   {
-    char tarcmd[1100];
+    char tarcmd[1800];
     snprintf(tarcmd, sizeof(tarcmd), "cmd /c tar czf \"%s\" -C \"%s\" . 2>nul", bundle, dir);
     (void)system(tarcmd);
   }
 #else
   snprintf(bundle, sizeof(bundle), "%s/bundle.tgz", dir);
   {
-    char tarcmd[1000];
+    char tarcmd[1700];
     snprintf(tarcmd, sizeof(tarcmd), "tar czf \"%s\" -C \"%s\" . 2>/dev/null", bundle, dir);
     (void)system(tarcmd);
   }
@@ -1238,18 +1953,54 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   upload_key[0] = '\0';
   int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
                                               upload_key, sizeof(upload_key));
+  if (upload_rc != 0) {
+    write_upload_outbox(cmd_id, bundle, bundle_sha, manifest);
+  }
+  char manifest_json[900];
+#ifdef _WIN32
+  snprintf(manifest_json, sizeof(manifest_json), "%s\\artifact_manifest.json", dir);
+#else
+  snprintf(manifest_json, sizeof(manifest_json), "%s/artifact_manifest.json", dir);
+#endif
+  {
+    FILE *af = fopen(manifest_json, "w");
+    if (af) {
+      char mj[1200], bj[1200], kj[1200];
+      json_escape_to(mj, sizeof(mj), manifest);
+      json_escape_to(bj, sizeof(bj), bundle);
+      json_escape_to(kj, sizeof(kj), upload_key);
+      fprintf(af,
+              "{\"command_id\":\"%s\",\"manifest_path\":%s,\"bundle_path\":%s,"
+              "\"bundle_sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}\n",
+              cmd_id ? cmd_id : "", mj, bj, bundle_sha, upload_rc == 0 ? "ok" : "failed", kj);
+      fclose(af);
+    }
+  }
   s_handled++;
-  s_exec_ok++;
   audit_both(cmd_id, upload_rc == 0
                          ? "forensic: manifest + bundle.tgz + grpc upload ok"
-                         : "forensic: manifest + bundle.tgz ok; grpc upload failed, kept local copy");
+                         : "forensic: manifest + bundle.tgz ok; grpc upload failed, queued outbox");
   {
-    char detail[2600];
+    char manifestj[1200], bundlej[1200], keyj[1200], artifacts[4200], detail[4800];
+    json_escape_to(manifestj, sizeof(manifestj), manifest);
+    json_escape_to(bundlej, sizeof(bundlej), bundle);
+    json_escape_to(keyj, sizeof(keyj), upload_key);
+    snprintf(artifacts, sizeof(artifacts),
+             "[{\"type\":\"forensic_bundle\",\"path\":%s,\"manifest_path\":%s,\"sha256\":\"%s\","
+             "\"upload_status\":\"%s\",\"minio_key\":%s}]",
+             bundlej, manifestj, bundle_sha, upload_rc == 0 ? "ok" : "failed", keyj);
     snprintf(detail, sizeof(detail),
-             "forensic bundle ok manifest_path=\"%s\" bundle_path=\"%s\" sha256=\"%s\" upload_status=\"%s\" "
-             "minio_key=\"%s\"",
-             manifest, bundle, bundle_sha, upload_rc == 0 ? "ok" : "failed", upload_key);
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+             "{\"manifest_path\":%s,\"bundle_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\","
+             "\"minio_key\":%s,\"outbox\":\"%s\"}",
+             manifestj, bundlej, bundle_sha, upload_rc == 0 ? "ok" : "failed", keyj,
+             upload_rc == 0 ? "none" : "queued");
+    if (upload_rc == 0) {
+      s_exec_ok++;
+      soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+    } else {
+      s_exec_fail++;
+      soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 4, detail, "partial_success", artifacts);
+    }
   }
 }
 
@@ -1364,7 +2115,7 @@ static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
   s_handled++;
   s_exec_ok++;
   audit_both(cmd_id, "pmfe_scan: 已入队（异步粗扫）");
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued");
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued", "queued", NULL);
 }
 
 static void hex_from_bytes(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -1440,17 +2191,67 @@ static int command_signature_extract(const char *idempotency_key, char sig65[65]
   return 1;
 }
 
+static void command_signature_idempotency_value(const char *idempotency_key, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!idempotency_key || !idempotency_key[0]) {
+    return;
+  }
+  const char *mark = strstr(idempotency_key, "|sigv1|");
+  size_t n = mark ? (size_t)(mark - idempotency_key) : strlen(idempotency_key);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, idempotency_key, n);
+  out[n] = '\0';
+}
+
+static int is_internal_auto_command(const char *cmd_id) {
+  return cmd_id && (strncmp(cmd_id, "auto-", 5) == 0 || strcmp(cmd_id, "auto-shellcode") == 0);
+}
+
+static int is_dangerous_command_type(const char *t) {
+  return streq(t, "isolate_host") || streq(t, "isolate") ||
+         streq(t, "restore_host") || streq(t, "host_restore") ||
+         streq(t, "kill_process") || streq(t, "kill") ||
+         streq(t, "collect_forensic") || streq(t, "forensic") ||
+         streq(t, "rtr_get_file") || streq(t, "rtr_file_get") || streq(t, "get_file") ||
+         streq(t, "RTR_GET_FILE") || streq(t, "rtr_rm_file") || streq(t, "rtr_file_rm") ||
+         streq(t, "remove_file") || streq(t, "delete_file") || streq(t, "RTR_RM_FILE") ||
+         streq(t, "quarantine_file") || streq(t, "file_quarantine") ||
+         streq(t, "rtr_quarantine_file") || streq(t, "RTR_QUARANTINE_FILE") ||
+         streq(t, "unquarantine_file") || streq(t, "restore_file") ||
+         streq(t, "file_unquarantine") || streq(t, "rtr_unquarantine_file") ||
+         streq(t, "RTR_UNQUARANTINE_FILE") ||
+         streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN") ||
+         streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG") ||
+         streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY");
+}
+
 static int command_signature_verify(const char *cmd_id, const char *cmd_type, const uint8_t *payload,
                                     size_t payload_len, const EdrSoarCommandMeta *sm,
                                     char *reason, size_t reason_cap) {
   const char *require = getenv("EDR_COMMAND_REQUIRE_SIGNATURE");
-  const int required = require && require[0] == '1';
+  int required = require && require[0] == '1';
+  const char *allow_unsigned = getenv("EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS");
+  if (!required && is_dangerous_command_type(cmd_type) && !is_internal_auto_command(cmd_id) &&
+      !(allow_unsigned && allow_unsigned[0] == '1')) {
+    required = 1;
+  }
   const char *key = getenv("EDR_COMMAND_SIGNING_KEY");
   if ((!key || !key[0]) && !required) {
     return 1;
   }
   if (!key || !key[0]) {
     snprintf(reason, reason_cap, "command signature required but EDR_COMMAND_SIGNING_KEY missing");
+    return 0;
+  }
+  char idem[128];
+  command_signature_idempotency_value(sm ? sm->idempotency_key : NULL, idem, sizeof(idem));
+  if (required && !idem[0]) {
+    snprintf(reason, reason_cap, "missing idempotency key");
     return 0;
   }
   char got[65];
@@ -1464,8 +2265,9 @@ static int command_signature_verify(const char *cmd_id, const char *cmd_type, co
   char payload_hash[65];
   (void)edr_sha256_hex(payload ? payload : (const uint8_t *)"", payload_len, payload_hash);
   char canonical[512];
-  snprintf(canonical, sizeof(canonical), "%s\n%s\n%lld\n%u\n%s",
+  snprintf(canonical, sizeof(canonical), "%s\n%s\n%s\n%lld\n%u\n%s",
            cmd_id ? cmd_id : "", cmd_type ? cmd_type : "",
+           idem,
            (long long)(sm ? sm->issued_at_unix_ms : 0), (unsigned)(sm ? sm->deadline_ms : 0),
            payload_hash);
   char want[65];
@@ -1477,6 +2279,24 @@ static int command_signature_verify(const char *cmd_id, const char *cmd_type, co
   return 1;
 }
 
+static int64_t command_now_ms(void) {
+  return (int64_t)time(NULL) * 1000LL;
+}
+
+static int command_deadline_expired(const EdrSoarCommandMeta *sm, char *reason, size_t cap) {
+  if (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u) {
+    return 0;
+  }
+  int64_t deadline = sm->issued_at_unix_ms + (int64_t)sm->deadline_ms;
+  int64_t now = command_now_ms();
+  if (now <= deadline) {
+    return 0;
+  }
+  snprintf(reason, cap, "command expired issued_at=%lld deadline_ms=%u now=%lld",
+           (long long)sm->issued_at_unix_ms, (unsigned)sm->deadline_ms, (long long)now);
+  return 1;
+}
+
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
   EdrSoarCommandMeta empty;
@@ -1484,6 +2304,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
   const char *t = command_type ? command_type : "";
   const char *id = command_id ? command_id : "";
+  s_active_command_type = t;
 
   char sig_reason[160];
   sig_reason[0] = 0;
@@ -1491,6 +2312,32 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     s_rejected++;
     audit_both(id, sig_reason[0] ? sig_reason : "command signature rejected");
     soar_emit(id, sm, EdrCmdExecRejected, 15, sig_reason[0] ? sig_reason : "command signature rejected");
+    return;
+  }
+
+  char deadline_reason[180];
+  deadline_reason[0] = '\0';
+  if (command_deadline_expired(sm, deadline_reason, sizeof(deadline_reason))) {
+    s_rejected++;
+    audit_both(id, deadline_reason);
+    soar_emit_ex(id, sm, EdrCmdExecFailed, 16, deadline_reason, "timeout", NULL);
+    return;
+  }
+
+  flush_upload_outbox();
+
+  int retry_count = 0;
+  EdrCommandStateRecord dup;
+  int dup_rc = edr_command_state_begin(id, t, sm, &retry_count, &dup);
+  (void)retry_count;
+  if (dup_rc == 1) {
+    char detail[2600];
+    snprintf(detail, sizeof(detail), "duplicate command suppressed previous_status=%s previous_exit=%d previous_detail=%s",
+             dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code,
+             dup.detail[0] ? dup.detail : "");
+    audit_both(id, "duplicate command suppressed by local idempotency state");
+    soar_emit_ex(id, sm, (EdrCommandExecutionStatus)(dup.execution_status ? dup.execution_status : EdrCmdExecOk),
+                 dup.exit_code, detail, dup.response_status[0] ? dup.response_status : "ok", NULL);
     return;
   }
 
@@ -1516,6 +2363,14 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     do_isolate(id, sm);
     return;
   }
+  if (streq(t, "restore_host") || streq(t, "host_restore")) {
+    do_restore_host(id, sm);
+    return;
+  }
+  if (streq(t, "isolate_status") || streq(t, "host_isolation_status")) {
+    do_isolate_status(id, sm);
+    return;
+  }
   if (streq(t, "kill_process") || streq(t, "kill")) {
     do_kill(id, payload, payload_len, sm);
     return;
@@ -1538,6 +2393,24 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "rtr_file_stat") || streq(t, "file_stat") || streq(t, "RTR_FILE_STAT")) {
     do_file_stat(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "rtr_get_file") || streq(t, "rtr_file_get") || streq(t, "get_file") ||
+      streq(t, "RTR_GET_FILE")) {
+    do_rtr_get_file(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "rtr_rm_file") || streq(t, "rtr_file_rm") || streq(t, "remove_file") ||
+      streq(t, "delete_file") || streq(t, "RTR_RM_FILE")) {
+    do_rtr_rm_file(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG")) {
+    do_eventlog_view(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY")) {
+    do_registry_query(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "quarantine_file") || streq(t, "file_quarantine") ||
