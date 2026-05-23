@@ -4,7 +4,6 @@
 #include "edr/attack_surface_egress.h"
 #include "edr/security_policy_collect.h"
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1152,22 +1151,38 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
 }
 
 /* §19.10 ETW → 攻击面增量：预处理线程 signal，主线程 take + execute（去抖） */
-static atomic_uint_fast32_t s_asurf_etw_pending;
+#ifdef _WIN32
+static volatile LONG s_asurf_etw_pending;
+#else
+static volatile unsigned s_asurf_etw_pending;
+#endif
 static uint64_t s_asurf_etw_last_flush_ns;
 
 void edr_attack_surface_etw_signal(void) {
-  atomic_store_explicit(&s_asurf_etw_pending, (uint_fast32_t)1, memory_order_release);
+#ifdef _WIN32
+  InterlockedExchange(&s_asurf_etw_pending, 1);
+#else
+  __atomic_store_n(&s_asurf_etw_pending, 1u, __ATOMIC_RELEASE);
+#endif
 }
 
 int edr_attack_surface_take_etw_flush(uint64_t now_monotonic_ns, uint64_t debounce_ns) {
-  if (atomic_load_explicit(&s_asurf_etw_pending, memory_order_acquire) == (uint_fast32_t)0) {
+#ifdef _WIN32
+  if (InterlockedCompareExchange(&s_asurf_etw_pending, 0, 0) == 0) {
+#else
+  if (__atomic_load_n(&s_asurf_etw_pending, __ATOMIC_ACQUIRE) == 0u) {
+#endif
     return 0;
   }
   if (s_asurf_etw_last_flush_ns != 0u &&
       (now_monotonic_ns - s_asurf_etw_last_flush_ns) < debounce_ns) {
     return 0;
   }
-  atomic_store_explicit(&s_asurf_etw_pending, (uint_fast32_t)0, memory_order_release);
+#ifdef _WIN32
+  InterlockedExchange(&s_asurf_etw_pending, 0);
+#else
+  __atomic_store_n(&s_asurf_etw_pending, 0u, __ATOMIC_RELEASE);
+#endif
   s_asurf_etw_last_flush_ns = now_monotonic_ns;
   return 1;
 }

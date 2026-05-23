@@ -3,23 +3,38 @@
 #include "edr/p0_rule_ir.h"
 
 #include <ctype.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-static _Atomic uint64_t s_p0_total_calls = 0;
-static _Atomic uint64_t s_p0_env_not_set_skip = 0;
-static _Atomic uint64_t s_p0_ir_mode_matches = 0;
-static _Atomic uint64_t s_p0_fallback_mode_matches = 0;
-static _Atomic uint64_t s_p0_rule_r_exec_001_hits = 0;
-static _Atomic uint64_t s_p0_rule_r_cred_001_hits = 0;
-static _Atomic uint64_t s_p0_rule_r_fileless_001_hits = 0;
-static _Atomic uint64_t s_p0_rule_other_hits = 0;
-static _Atomic uint64_t s_p0_powershell_detected = 0;
-static _Atomic uint64_t s_p0_encoded_cmd_detected = 0;
-static _Atomic uint64_t s_p0_base64_string_detected = 0;
-static _Atomic uint64_t s_p0_remote_download_detected = 0;
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+typedef volatile LONG64 EdrP0Stat64;
+static void p0_stat_inc(EdrP0Stat64 *p) { (void)InterlockedIncrement64(p); }
+static void p0_stat_store(EdrP0Stat64 *p, uint64_t v) { (void)InterlockedExchange64(p, (LONG64)v); }
+static uint64_t p0_stat_load(EdrP0Stat64 *p) { return (uint64_t)InterlockedCompareExchange64(p, 0, 0); }
+#else
+typedef volatile uint64_t EdrP0Stat64;
+static void p0_stat_inc(EdrP0Stat64 *p) { (void)__atomic_add_fetch(p, 1u, __ATOMIC_RELAXED); }
+static void p0_stat_store(EdrP0Stat64 *p, uint64_t v) { __atomic_store_n(p, v, __ATOMIC_RELAXED); }
+static uint64_t p0_stat_load(EdrP0Stat64 *p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
+#endif
+
+static EdrP0Stat64 s_p0_total_calls;
+static EdrP0Stat64 s_p0_env_not_set_skip;
+static EdrP0Stat64 s_p0_ir_mode_matches;
+static EdrP0Stat64 s_p0_fallback_mode_matches;
+static EdrP0Stat64 s_p0_rule_r_exec_001_hits;
+static EdrP0Stat64 s_p0_rule_r_cred_001_hits;
+static EdrP0Stat64 s_p0_rule_r_fileless_001_hits;
+static EdrP0Stat64 s_p0_rule_other_hits;
+static EdrP0Stat64 s_p0_powershell_detected;
+static EdrP0Stat64 s_p0_encoded_cmd_detected;
+static EdrP0Stat64 s_p0_base64_string_detected;
+static EdrP0Stat64 s_p0_remote_download_detected;
 
 static void ascii_lower_in_place(char *p) {
   for (; p && *p; p++) {
@@ -228,18 +243,18 @@ static int p0_match_legacy(
 
 int edr_p0_rule_matches3(
     const char *rule_id, const char *process_name, const char *cmdline, const char *parent_name, int process_chain_depth) {
-  atomic_fetch_add_explicit(&s_p0_total_calls, 1, memory_order_relaxed);
+  p0_stat_inc(&s_p0_total_calls);
   edr_p0_rule_ir_lazy_init();
   if (edr_p0_rule_ir_is_ready()) {
     int result = edr_p0_rule_ir_matches(rule_id, process_name, cmdline, parent_name, process_chain_depth) ? 1 : 0;
     if (result) {
-      atomic_fetch_add_explicit(&s_p0_ir_mode_matches, 1, memory_order_relaxed);
+      p0_stat_inc(&s_p0_ir_mode_matches);
     }
     return result;
   }
   int result = p0_match_legacy(rule_id, process_name, cmdline, process_chain_depth);
   if (result) {
-    atomic_fetch_add_explicit(&s_p0_fallback_mode_matches, 1, memory_order_relaxed);
+    p0_stat_inc(&s_p0_fallback_mode_matches);
   }
   return result;
 }
@@ -254,32 +269,32 @@ int edr_p0_rule_get_stats(EdrP0RuleStats *out_stats) {
     return -1;
   }
   memset(out_stats, 0, sizeof(*out_stats));
-  out_stats->total_calls = (uint64_t)s_p0_total_calls;
-  out_stats->env_not_set_skip = (uint64_t)s_p0_env_not_set_skip;
-  out_stats->ir_mode_matches = (uint64_t)s_p0_ir_mode_matches;
-  out_stats->fallback_mode_matches = (uint64_t)s_p0_fallback_mode_matches;
-  out_stats->rule_r_exec_001_hits = (uint64_t)s_p0_rule_r_exec_001_hits;
-  out_stats->rule_r_cred_001_hits = (uint64_t)s_p0_rule_r_cred_001_hits;
-  out_stats->rule_r_fileless_001_hits = (uint64_t)s_p0_rule_r_fileless_001_hits;
-  out_stats->rule_other_hits = (uint64_t)s_p0_rule_other_hits;
-  out_stats->powershell_detected = (uint64_t)s_p0_powershell_detected;
-  out_stats->encoded_cmd_detected = (uint64_t)s_p0_encoded_cmd_detected;
-  out_stats->base64_string_detected = (uint64_t)s_p0_base64_string_detected;
-  out_stats->remote_download_detected = (uint64_t)s_p0_remote_download_detected;
+  out_stats->total_calls = p0_stat_load(&s_p0_total_calls);
+  out_stats->env_not_set_skip = p0_stat_load(&s_p0_env_not_set_skip);
+  out_stats->ir_mode_matches = p0_stat_load(&s_p0_ir_mode_matches);
+  out_stats->fallback_mode_matches = p0_stat_load(&s_p0_fallback_mode_matches);
+  out_stats->rule_r_exec_001_hits = p0_stat_load(&s_p0_rule_r_exec_001_hits);
+  out_stats->rule_r_cred_001_hits = p0_stat_load(&s_p0_rule_r_cred_001_hits);
+  out_stats->rule_r_fileless_001_hits = p0_stat_load(&s_p0_rule_r_fileless_001_hits);
+  out_stats->rule_other_hits = p0_stat_load(&s_p0_rule_other_hits);
+  out_stats->powershell_detected = p0_stat_load(&s_p0_powershell_detected);
+  out_stats->encoded_cmd_detected = p0_stat_load(&s_p0_encoded_cmd_detected);
+  out_stats->base64_string_detected = p0_stat_load(&s_p0_base64_string_detected);
+  out_stats->remote_download_detected = p0_stat_load(&s_p0_remote_download_detected);
   return 0;
 }
 
 void edr_p0_rule_reset_stats(void) {
-  s_p0_total_calls = 0;
-  s_p0_env_not_set_skip = 0;
-  s_p0_ir_mode_matches = 0;
-  s_p0_fallback_mode_matches = 0;
-  s_p0_rule_r_exec_001_hits = 0;
-  s_p0_rule_r_cred_001_hits = 0;
-  s_p0_rule_r_fileless_001_hits = 0;
-  s_p0_rule_other_hits = 0;
-  s_p0_powershell_detected = 0;
-  s_p0_encoded_cmd_detected = 0;
-  s_p0_base64_string_detected = 0;
-  s_p0_remote_download_detected = 0;
+  p0_stat_store(&s_p0_total_calls, 0);
+  p0_stat_store(&s_p0_env_not_set_skip, 0);
+  p0_stat_store(&s_p0_ir_mode_matches, 0);
+  p0_stat_store(&s_p0_fallback_mode_matches, 0);
+  p0_stat_store(&s_p0_rule_r_exec_001_hits, 0);
+  p0_stat_store(&s_p0_rule_r_cred_001_hits, 0);
+  p0_stat_store(&s_p0_rule_r_fileless_001_hits, 0);
+  p0_stat_store(&s_p0_rule_other_hits, 0);
+  p0_stat_store(&s_p0_powershell_detected, 0);
+  p0_stat_store(&s_p0_encoded_cmd_detected, 0);
+  p0_stat_store(&s_p0_base64_string_detected, 0);
+  p0_stat_store(&s_p0_remote_download_detected, 0);
 }

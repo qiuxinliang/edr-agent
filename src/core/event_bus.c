@@ -1,8 +1,16 @@
 #include "edr/event_bus.h"
 
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <stdatomic.h>
+#endif
 
 /**
  * A4.1：无互斥的定长 MPMC 环表（多路 try_push、多路 try_pop 安全）。
@@ -10,6 +18,150 @@
  * 本进程 **唯一** 消费者为预处理线程时仍满足该模型（MPMC 为 MPSC 的超集）。
  * 见 `include/edr/event_bus.h` 无锁设计说明。
  */
+
+#ifdef _WIN32
+
+typedef struct {
+  EdrEventSlot data;
+} EdrEventBusCell;
+
+struct EdrEventBus {
+  EdrEventBusCell *cells;
+  uint32_t cap;
+  uint32_t head;
+  uint32_t tail;
+  uint32_t count;
+  uint64_t dropped;
+  uint64_t pushed;
+  uint64_t high_water_hits;
+  CRITICAL_SECTION mu;
+  int mu_inited;
+};
+
+EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
+  if (slot_count < 2u) {
+    return NULL;
+  }
+  EdrEventBus *bus = (EdrEventBus *)calloc(1, sizeof(EdrEventBus));
+  if (!bus) {
+    return NULL;
+  }
+  bus->cells = (EdrEventBusCell *)calloc(slot_count, sizeof(EdrEventBusCell));
+  if (!bus->cells) {
+    free(bus);
+    return NULL;
+  }
+  bus->cap = slot_count;
+  InitializeCriticalSection(&bus->mu);
+  bus->mu_inited = 1;
+  return bus;
+}
+
+void edr_event_bus_destroy(EdrEventBus *bus) {
+  if (!bus) {
+    return;
+  }
+  if (bus->mu_inited) {
+    DeleteCriticalSection(&bus->mu);
+  }
+  free(bus->cells);
+  free(bus);
+}
+
+bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
+  if (!bus || !slot || !bus->mu_inited) {
+    return false;
+  }
+  EnterCriticalSection(&bus->mu);
+  if (bus->count >= bus->cap) {
+    bus->dropped++;
+    LeaveCriticalSection(&bus->mu);
+    return false;
+  }
+  memcpy(&bus->cells[bus->tail].data, slot, sizeof(EdrEventSlot));
+  bus->tail = (bus->tail + 1u) % bus->cap;
+  bus->count++;
+  bus->pushed++;
+  if ((uint64_t)bus->count * 100u >= (uint64_t)bus->cap * 80u) {
+    bus->high_water_hits++;
+  }
+  LeaveCriticalSection(&bus->mu);
+  return true;
+}
+
+bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {
+  if (!bus || !out_slot || !bus->mu_inited) {
+    return false;
+  }
+  EnterCriticalSection(&bus->mu);
+  if (bus->count == 0u) {
+    LeaveCriticalSection(&bus->mu);
+    return false;
+  }
+  memcpy(out_slot, &bus->cells[bus->head].data, sizeof(EdrEventSlot));
+  bus->head = (bus->head + 1u) % bus->cap;
+  bus->count--;
+  LeaveCriticalSection(&bus->mu);
+  return true;
+}
+
+uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, uint32_t max_count) {
+  if (!bus || !out_slots || max_count == 0u) {
+    return 0u;
+  }
+  uint32_t n = 0u;
+  while (n < max_count) {
+    if (!edr_event_bus_try_pop(bus, &out_slots[n])) {
+      break;
+    }
+    n++;
+  }
+  return n;
+}
+
+uint32_t edr_event_bus_capacity(const EdrEventBus *bus) { return bus ? bus->cap : 0u; }
+
+uint32_t edr_event_bus_used_approx(EdrEventBus *bus) {
+  if (!bus || !bus->mu_inited) {
+    return 0u;
+  }
+  EnterCriticalSection(&bus->mu);
+  uint32_t n = bus->count;
+  LeaveCriticalSection(&bus->mu);
+  return n;
+}
+
+uint64_t edr_event_bus_dropped_total(EdrEventBus *bus) {
+  if (!bus || !bus->mu_inited) {
+    return 0u;
+  }
+  EnterCriticalSection(&bus->mu);
+  uint64_t n = bus->dropped;
+  LeaveCriticalSection(&bus->mu);
+  return n;
+}
+
+uint64_t edr_event_bus_pushed_total(EdrEventBus *bus) {
+  if (!bus || !bus->mu_inited) {
+    return 0u;
+  }
+  EnterCriticalSection(&bus->mu);
+  uint64_t n = bus->pushed;
+  LeaveCriticalSection(&bus->mu);
+  return n;
+}
+
+uint64_t edr_event_bus_high_water_hits(EdrEventBus *bus) {
+  if (!bus || !bus->mu_inited) {
+    return 0u;
+  }
+  EnterCriticalSection(&bus->mu);
+  uint64_t n = bus->high_water_hits;
+  LeaveCriticalSection(&bus->mu);
+  return n;
+}
+
+#else
 
 typedef struct {
   _Alignas(64) _Atomic uint64_t turn;
@@ -178,6 +330,8 @@ uint64_t edr_event_bus_high_water_hits(EdrEventBus *bus) {
   }
   return atomic_load_explicit(&bus->high_water_hits, memory_order_relaxed);
 }
+
+#endif
 
 static int edr_is_high_value_event(const EdrEventSlot *slot) {
   if (!slot) {

@@ -18,33 +18,51 @@
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 /** 《11》§6.1 最大展平元素数；热路径 ORT 输入缓冲（T04） */
 #define AVE_BP_ORT_NELEM_MAX (EDR_PID_HISTORY_MAX_SEQ * EDR_PID_HISTORY_FEAT_DIM)
 
 static float s_bp_ort_scratch[AVE_BP_ORT_NELEM_MAX];
-/* 文件作用域 _Atomic 隐式零初始化；ATOMIC_VAR_INIT 在 C17/MSVC 不可用 */
-static _Atomic uint64_t s_bp_beh_infer_ok;
-static _Atomic uint64_t s_bp_beh_infer_fail;
-static _Atomic uint64_t s_bp_feed_total;
-static _Atomic uint64_t s_bp_queue_enqueued;
-static _Atomic uint64_t s_bp_queue_full_fallback;
-static _Atomic uint64_t s_bp_feed_sync_bypass;
-static _Atomic uint64_t s_bp_worker_dequeued;
+
+#ifdef _WIN32
+typedef volatile LONG64 EdrBpMetric64;
+static void bp_metric_store(EdrBpMetric64 *p, uint64_t v) { (void)InterlockedExchange64(p, (LONG64)v); }
+static uint64_t bp_metric_inc(EdrBpMetric64 *p) { return (uint64_t)InterlockedIncrement64(p); }
+static uint64_t bp_metric_load(EdrBpMetric64 *p) { return (uint64_t)InterlockedCompareExchange64(p, 0, 0); }
+#else
+typedef volatile uint64_t EdrBpMetric64;
+static void bp_metric_store(EdrBpMetric64 *p, uint64_t v) { __atomic_store_n(p, v, __ATOMIC_RELAXED); }
+static uint64_t bp_metric_inc(EdrBpMetric64 *p) { return __atomic_add_fetch(p, 1u, __ATOMIC_RELAXED); }
+static uint64_t bp_metric_load(EdrBpMetric64 *p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
+#endif
+
+static EdrBpMetric64 s_bp_beh_infer_ok;
+static EdrBpMetric64 s_bp_beh_infer_fail;
+static EdrBpMetric64 s_bp_feed_total;
+static EdrBpMetric64 s_bp_queue_enqueued;
+static EdrBpMetric64 s_bp_queue_full_fallback;
+static EdrBpMetric64 s_bp_feed_sync_bypass;
+static EdrBpMetric64 s_bp_worker_dequeued;
 
 static void bp_reset_metrics(void) {
-  atomic_store_explicit(&s_bp_beh_infer_ok, 0u, memory_order_relaxed);
-  atomic_store_explicit(&s_bp_beh_infer_fail, 0u, memory_order_relaxed);
-  atomic_store_explicit(&s_bp_feed_total, 0u, memory_order_relaxed);
-  atomic_store_explicit(&s_bp_queue_enqueued, 0u, memory_order_relaxed);
-  atomic_store_explicit(&s_bp_queue_full_fallback, 0u, memory_order_relaxed);
-  atomic_store_explicit(&s_bp_feed_sync_bypass, 0u, memory_order_relaxed);
-  atomic_store_explicit(&s_bp_worker_dequeued, 0u, memory_order_relaxed);
+  bp_metric_store(&s_bp_beh_infer_ok, 0u);
+  bp_metric_store(&s_bp_beh_infer_fail, 0u);
+  bp_metric_store(&s_bp_feed_total, 0u);
+  bp_metric_store(&s_bp_queue_enqueued, 0u);
+  bp_metric_store(&s_bp_queue_full_fallback, 0u);
+  bp_metric_store(&s_bp_feed_sync_bypass, 0u);
+  bp_metric_store(&s_bp_worker_dequeued, 0u);
 }
 
 static int bp_str_has_ci(const char *hay, const char *needle);
@@ -897,9 +915,9 @@ static void process_one_event(const AVEBehaviorEvent *e) {
           } else {
             sl->consecutive_medium_scores = 0u;
           }
-          (void)atomic_fetch_add_explicit(&s_bp_beh_infer_ok, 1u, memory_order_relaxed);
+          (void)bp_metric_inc(&s_bp_beh_infer_ok);
         } else {
-          uint64_t nf = atomic_fetch_add_explicit(&s_bp_beh_infer_fail, 1u, memory_order_relaxed) + 1u;
+          uint64_t nf = bp_metric_inc(&s_bp_beh_infer_fail);
           if ((nf & 63u) == 0u) {
             fprintf(stderr, "[ave/bp] behavior onnx infer failures (count=%llu)\n",
                     (unsigned long long)nf);
@@ -1031,7 +1049,7 @@ static DWORD WINAPI worker_main(LPVOID arg) {
     int drained = 0;
     if (s_q) {
       while (ave_mpmc_try_pop(s_q, &ev) == 0) {
-        (void)atomic_fetch_add_explicit(&s_bp_worker_dequeued, 1u, memory_order_relaxed);
+        (void)bp_metric_inc(&s_bp_worker_dequeued);
         process_one_event(&ev);
         drained = 1;
       }
@@ -1050,7 +1068,7 @@ static void *worker_main(void *arg) {
     int drained = 0;
     if (s_q) {
       while (ave_mpmc_try_pop(s_q, &ev) == 0) {
-        (void)atomic_fetch_add_explicit(&s_bp_worker_dequeued, 1u, memory_order_relaxed);
+        (void)bp_metric_inc(&s_bp_worker_dequeued);
         process_one_event(&ev);
         drained = 1;
       }
@@ -1151,20 +1169,20 @@ void edr_ave_bp_feed(const AVEBehaviorEvent *event) {
   if (!event) {
     return;
   }
-  (void)atomic_fetch_add_explicit(&s_bp_feed_total, 1u, memory_order_relaxed);
+  (void)bp_metric_inc(&s_bp_feed_total);
   if (!s_monitor_started) {
-    (void)atomic_fetch_add_explicit(&s_bp_feed_sync_bypass, 1u, memory_order_relaxed);
+    (void)bp_metric_inc(&s_bp_feed_sync_bypass);
     return;
   }
   if (s_q) {
     if (ave_mpmc_try_push(s_q, event) != 0) {
-      (void)atomic_fetch_add_explicit(&s_bp_queue_full_fallback, 1u, memory_order_relaxed);
+      (void)bp_metric_inc(&s_bp_queue_full_fallback);
       process_one_event(event);
     } else {
-      (void)atomic_fetch_add_explicit(&s_bp_queue_enqueued, 1u, memory_order_relaxed);
+      (void)bp_metric_inc(&s_bp_queue_enqueued);
     }
   } else {
-    (void)atomic_fetch_add_explicit(&s_bp_feed_sync_bypass, 1u, memory_order_relaxed);
+    (void)bp_metric_inc(&s_bp_feed_sync_bypass);
     process_one_event(event);
   }
 }
@@ -1254,14 +1272,13 @@ void edr_ave_bp_fill_metrics(AVEStatus *status_out) {
   if (!status_out) {
     return;
   }
-  status_out->behavior_feed_total = atomic_load_explicit(&s_bp_feed_total, memory_order_relaxed);
-  status_out->behavior_queue_enqueued = atomic_load_explicit(&s_bp_queue_enqueued, memory_order_relaxed);
-  status_out->behavior_queue_full_sync_fallback =
-      atomic_load_explicit(&s_bp_queue_full_fallback, memory_order_relaxed);
-  status_out->behavior_feed_sync_bypass = atomic_load_explicit(&s_bp_feed_sync_bypass, memory_order_relaxed);
-  status_out->behavior_worker_dequeued = atomic_load_explicit(&s_bp_worker_dequeued, memory_order_relaxed);
-  status_out->behavior_infer_ok = atomic_load_explicit(&s_bp_beh_infer_ok, memory_order_relaxed);
-  status_out->behavior_infer_fail = atomic_load_explicit(&s_bp_beh_infer_fail, memory_order_relaxed);
+  status_out->behavior_feed_total = bp_metric_load(&s_bp_feed_total);
+  status_out->behavior_queue_enqueued = bp_metric_load(&s_bp_queue_enqueued);
+  status_out->behavior_queue_full_sync_fallback = bp_metric_load(&s_bp_queue_full_fallback);
+  status_out->behavior_feed_sync_bypass = bp_metric_load(&s_bp_feed_sync_bypass);
+  status_out->behavior_worker_dequeued = bp_metric_load(&s_bp_worker_dequeued);
+  status_out->behavior_infer_ok = bp_metric_load(&s_bp_beh_infer_ok);
+  status_out->behavior_infer_fail = bp_metric_load(&s_bp_beh_infer_fail);
   status_out->behavior_queue_capacity = edr_ave_bp_queue_capacity();
 }
 
