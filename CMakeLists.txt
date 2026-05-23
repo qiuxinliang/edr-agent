@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
   add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
 endif()
 

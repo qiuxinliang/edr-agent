@@ -6,6 +6,12 @@ name: edr-agent client build (Windows)
 
 on:
   workflow_dispatch:
+    inputs:
+      full_features:
+        description: "Build with gRPC + ONNX Runtime + YARA (slow, release-like)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,7 +29,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (edr_agent.exe + runtime DLLs, vcpkg+ONNX)
+    name: Build Windows (edr_agent.exe, fast by default)
     runs-on: windows-latest
     timeout-minutes: 360
     env:
@@ -55,11 +61,12 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: vcpkg-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+            vcpkg-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
 
       - name: Cache ONNX Runtime
+        if: ${{ inputs.full_features }}
         uses: actions/cache@v5
         with:
           path: onnxrt-win
@@ -69,11 +76,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build
-          key: build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
+          key: build-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
           restore-keys: |
-            build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
+            build-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
+        if: ${{ inputs.full_features }}
         shell: pwsh
         run: |
           $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
@@ -147,10 +155,17 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            Write-Host "[vcpkg] full feature build: grpc-client + sqlite + yara"
+            & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara
+          } else {
+            Write-Host "[vcpkg] fast build: manifest defaults only (no grpc/onnx/yara)"
+            & $tc install
+          }
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Regenerate gRPC proto stubs
+        if: ${{ inputs.full_features }}
         shell: pwsh
         run: |
           $protoc_exe = Join-Path $env:VCPKG_INSTALLED_X64 "tools\protobuf\protoc.exe"
@@ -176,6 +191,7 @@ jobs:
           Write-Host "gRPC stubs regenerated OK"
 
       - name: ONNX Runtime (CPU, Windows x64)
+        if: ${{ inputs.full_features }}
         working-directory: ${{ github.workspace }}
         shell: pwsh
         run: |
@@ -206,22 +222,34 @@ jobs:
           }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure (Ninja, Release, ONNX, sccache)
+      - name: Configure (Ninja, Release, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
         run: |
           $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$tcf" `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DEDR_WITH_GRPC=ON `
-            -DEDR_WITH_ONNXRUNTIME=ON `
-            "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-            "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
-            -DEDR_BUILD_TESTS=OFF
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+              -DEDR_WITH_GRPC=ON `
+              -DEDR_WITH_ONNXRUNTIME=ON `
+              "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              -DEDR_BUILD_TESTS=OFF
+          } else {
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+              -DEDR_WITH_GRPC=OFF `
+              -DEDR_WITH_ONNXRUNTIME=OFF `
+              -DEDR_WITH_YARA=OFF `
+              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              -DEDR_BUILD_TESTS=OFF
+          }
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build (Ninja + sccache)
@@ -237,7 +265,9 @@ jobs:
         shell: pwsh
         run: |
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
-          ./scripts/stage_ort_dlls_build_release.ps1
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            ./scripts/stage_ort_dlls_build_release.ps1
+          }
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
 
       - name: Test
@@ -266,10 +296,17 @@ jobs:
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
-          if (-not (Test-Path "build\Release\edr_agent.exe")) { throw "missing build\Release\edr_agent.exe" }
+          $outDir = $null
+          foreach ($c in @("build\Release", "build")) {
+            if (Test-Path (Join-Path $c "edr_agent.exe")) {
+              $outDir = $c
+              break
+            }
+          }
+          if (-not $outDir) { throw "missing edr_agent.exe under build\Release or build" }
           $items = New-Object System.Collections.Generic.List[string]
-          $null = $items.Add("build\Release\edr_agent.exe")
-          Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
+          Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
 
       - name: Move artifact to workspace
