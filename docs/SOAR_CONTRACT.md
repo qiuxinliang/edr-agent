@@ -11,7 +11,7 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `command_id` | string | 指令唯一标识（建议 UUID）；与回传结果 **必填** 对齐。 |
-| `command_type` | string | 逻辑类型，如 `noop`、`ping`、`echo`、`isolate`、`restore_host`、`isolate_status`、`kill`、`forensic`；**RTQ/RTR P0**：`rtq_query`、`rtr_process_tree`、`rtr_list_connections`、`rtr_file_stat`、`rtr_get_file`、`rtr_rm_file`、`eventlog_view`、`registry_query`、`quarantine_file`、`unquarantine_file`；**PMFE（§21）**：`pmfe_scan` / `CMD_PMFE_SCAN`（内存粗扫入队，见 `pmfe_engine.c`）；**AVE（§5）**：`ave_status` / `ave_fingerprint` / `ave_infer`；**自保护/健康**：`self_protect_status` / `agent_health` / `health_status`（见 `command_stub.c`）；**攻击面（§19）**：`GET_ATTACK_SURFACE` / `get_attack_surface` / `REFRESH_ATTACK_SURFACE`（采集并 `POST` 平台 `.../endpoints/:id/attack-surface`，见 `attack_surface_report.c`）。 |
+| `command_type` | string | 逻辑类型，如 `noop`、`ping`、`echo`、`isolate`、`restore_host`、`isolate_status`、`kill`、`forensic`；**RTQ/RTR P0**：`rtq_query`、`rtr_process_tree`、`rtr_list_connections`、`rtr_file_stat`、`rtr_get_file`、`rtr_rm_file`、`eventlog_view`、`registry_query`、`quarantine_file`、`unquarantine_file`、`rtr_shell`；**PMFE（§21）**：`pmfe_scan` / `CMD_PMFE_SCAN`（内存粗扫入队，见 `pmfe_engine.c`）；**AVE（§5）**：`ave_status` / `ave_fingerprint` / `ave_infer`；**自保护/健康**：`self_protect_status` / `agent_health` / `health_status`（见 `command_stub.c`）；**攻击面（§19）**：`GET_ATTACK_SURFACE` / `get_attack_surface` / `REFRESH_ATTACK_SURFACE`（采集并 `POST` 平台 `.../endpoints/:id/attack-surface`，见 `attack_surface_report.c`）。 |
 | `payload` | bytes | 类型相关参数（如 kill 的 `{"pid":1234}` UTF-8 JSON）。 |
 | **SOAR 扩展（可选，空表示非编排下发）** | | |
 | `soar_correlation_id` | string | 与 SOAR **工单 / 全局 run** 关联，建议 UUID。 |
@@ -56,13 +56,15 @@
 | `reg_query` / `registry_query` / `RTR_REG_QUERY` | `{"key":"HKLM\\Software\\...","max_values":200}` | Windows 查询注册表键值并生成 artifact；非 Windows 返回 `supported=false`。产物上传失败返回 `partial_success`。 |
 | `quarantine_file` / `file_quarantine` / `rtr_quarantine_file` | `{"path":"/abs/path","reason":"alert|manual"}` | 文件级隔离：移动文件到本地隔离目录并写 `.meta` 清单，返回 `quarantine_id`。需高危策略允许。 |
 | `unquarantine_file` / `restore_file` / `file_unquarantine` | `{"quarantine_id":"...","restore_path":"optional"}` | 按隔离清单恢复文件；默认恢复到原路径，目标已存在时拒绝。需高危策略允许。 |
+| `rtr_shell` / `RTR_SHELL` | `{"command":"whoami","timeout_sec":10}` | 最后兜底型远程命令执行。除高危策略外，**强制要求生产签名**，且必须提供 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key`；`EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS=1` 对该指令无效。执行前必须配置端侧 `EDR_RTR_SHELL_ALLOWLIST`（逗号分隔首 token，如 `whoami,hostname,ipconfig,tasklist,netstat,dir`），并经过默认破坏性 blocklist、控制操作符拦截、超时钳制、审计与本地状态库记录。超时返回 `response_status=timeout`。 |
 
 ### 高危指令策略
 
-- **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `restore_host` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）/ **RTR 文件、eventlog、registry** / **`quarantine_file`** / **`unquarantine_file`**。
+- **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `restore_host` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）/ **RTR 文件、eventlog、registry、rtr_shell** / **`quarantine_file`** / **`unquarantine_file`**。
 - **配置**：`[command] allow_dangerous = true` 与上述环境变量等效（便于生产用 TOML 固定策略）。
 - **kill 白名单**（可选）：设置 `EDR_CMD_KILL_ALLOWLIST=1234,5678` 后，仅允许终止列表内 PID（仍须先满足高危策略）。
-- **生产签名**：高危指令默认要求 `EDR_COMMAND_SIGNING_KEY` 与 `idempotency_key` 中的 `sigv1` HMAC；仅调试可设 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS=1`。签名 canonical 为 `command_id\ncommand_type\nidempotency\nissued_at_unix_ms\ndeadline_ms\npayload_sha256`。
+- **生产签名**：高危指令默认要求 `EDR_COMMAND_SIGNING_KEY` 与 `idempotency_key` 中的 `sigv1` HMAC；仅调试可设 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS=1`。签名 canonical 为 `command_id\ncommand_type\nidempotency\nissued_at_unix_ms\ndeadline_ms\npayload_sha256`。`rtr_shell` 始终强制签名，并要求 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key` 同时存在。
+- **RTR shell 白名单**：`EDR_RTR_SHELL_ALLOWLIST` 为必填本地策略；`EDR_RTR_SHELL_MAX_TIMEOUT_SEC` 默认 `60`、硬上限 `300`；`EDR_RTR_SHELL_BLOCKLIST` 可追加本地禁用关键字。控制操作符（如 `&&`、管道、重定向、换行）默认拒绝。
 - **本地状态库**：默认写入 `%ProgramData%\\EDR\\command_state.jsonl`（Windows）或 `/tmp/edr_command_state.jsonl`；可用 `EDR_COMMAND_STATE_DB` 覆盖。字段包含 `command_id`、`idempotency_key`、`response_status`、`retry_count`、`artifacts`，用于断网、重启、重复下发时的本地去重与追踪。
 
 ---

@@ -12,8 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS _ENABLE_STDATOMIC)
-  add_compile_options($<$<COMPILE_LANGUAGE:C>:/std:c11> $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 endif()
 
 option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
@@ -186,6 +185,7 @@ set(EDR_AGENT_SOURCES
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
   src/command/command_state.c
+  src/command/shell_exec.c
   src/command/sha256.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
@@ -391,8 +391,7 @@ target_include_directories(edr_agent PRIVATE
 )
 target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
 if(MSVC)
-  target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS _ENABLE_STDATOMIC)
-  target_compile_options(edr_agent PRIVATE $<$<COMPILE_LANGUAGE:C>:/std:c11> $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+  target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 endif()
 if(EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)

@@ -1,8 +1,10 @@
 #include "edr/shell_exec.h"
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -92,14 +94,17 @@ int edr_shell_is_allowed(const char *command) {
 int edr_shell_exec(const char *command, int timeout_sec,
                    char *output, size_t output_size, int *exit_code) {
   if (!command || !output || output_size == 0) return -1;
+  if (timeout_sec <= 0) timeout_sec = 1;
   output[0] = '\0';
 
 #ifdef _WIN32
   HANDLE hRead, hWrite;
   SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
   if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return -1;
-  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 1);
-  STARTUPINFOA si = { sizeof(si) };
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOA si;
+  memset(&si, 0, sizeof(si));
+  si.cb = sizeof(si);
   si.dwFlags = STARTF_USESTDHANDLES;
   si.hStdOutput = hWrite;
   si.hStdError = hWrite;
@@ -111,22 +116,58 @@ int edr_shell_exec(const char *command, int timeout_sec,
     return -1;
   }
   CloseHandle(hWrite);
-  DWORD waited = WaitForSingleObject(pi.hProcess, (DWORD)(timeout_sec * 1000));
-  if (waited == WAIT_TIMEOUT) {
-    TerminateProcess(pi.hProcess, 1);
-    WaitForSingleObject(pi.hProcess, 3000);
+  ULONGLONG deadline = GetTickCount64() + (ULONGLONG)timeout_sec * 1000ull;
+  size_t total = 0;
+  int timed_out = 0;
+  for (;;) {
+    DWORD avail = 0;
+    if (PeekNamedPipe(hRead, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+      char buf[4096];
+      DWORD toread = avail < (DWORD)sizeof(buf) ? avail : (DWORD)sizeof(buf);
+      DWORD read = 0;
+      if (ReadFile(hRead, buf, toread, &read, NULL) && read > 0) {
+        size_t rem = output_size - total - 1u;
+        if (rem > 0u) {
+          size_t tocopy = (size_t)read < rem ? (size_t)read : rem;
+          memcpy(output + total, buf, tocopy);
+          total += tocopy;
+          output[total] = '\0';
+        }
+      }
+    }
+    DWORD waited = WaitForSingleObject(pi.hProcess, 50);
+    if (waited == WAIT_OBJECT_0) {
+      break;
+    }
+    if (GetTickCount64() >= deadline) {
+      timed_out = 1;
+      TerminateProcess(pi.hProcess, 124);
+      WaitForSingleObject(pi.hProcess, 3000);
+      break;
+    }
   }
-  DWORD avail = 0;
-  PeekNamedPipe(hRead, NULL, 0, NULL, &avail, NULL);
-  if (avail > 0) {
-    DWORD toread = avail < (DWORD)(output_size - 1) ? avail : (DWORD)(output_size - 1);
+  for (;;) {
+    DWORD avail = 0;
+    if (!PeekNamedPipe(hRead, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+      break;
+    }
+    char buf[4096];
+    DWORD toread = avail < (DWORD)sizeof(buf) ? avail : (DWORD)sizeof(buf);
     DWORD read = 0;
-    ReadFile(hRead, output, toread, &read, NULL);
-    output[read] = '\0';
+    if (!ReadFile(hRead, buf, toread, &read, NULL) || read == 0) {
+      break;
+    }
+    size_t rem = output_size - total - 1u;
+    if (rem > 0u) {
+      size_t tocopy = (size_t)read < rem ? (size_t)read : rem;
+      memcpy(output + total, buf, tocopy);
+      total += tocopy;
+      output[total] = '\0';
+    }
   }
   DWORD ec = 0;
   GetExitCodeProcess(pi.hProcess, &ec);
-  if (exit_code) *exit_code = (int)ec;
+  if (exit_code) *exit_code = timed_out ? 124 : (int)ec;
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
   CloseHandle(hRead);
@@ -146,36 +187,58 @@ int edr_shell_exec(const char *command, int timeout_sec,
     _exit(127);
   }
   close(pipefd[1]);
-  int elapsed = 0;
+  time_t start = time(NULL);
   size_t total = 0;
-  while (elapsed < timeout_sec) {
-    char buf[4096];
-    ssize_t nread = read(pipefd[0], buf, sizeof(buf) - 1);
-    if (nread > 0) {
-      buf[nread] = '\0';
-      size_t rem = output_size - total - 1;
-      if (rem > 0) {
-        size_t tocopy = (size_t)nread < rem ? (size_t)nread : rem;
-        memcpy(output + total, buf, tocopy);
-        total += tocopy;
-        output[total] = '\0';
+  int completed = 0;
+  for (;;) {
+    for (;;) {
+      char buf[4096];
+      ssize_t nread = read(pipefd[0], buf, sizeof(buf));
+      if (nread > 0) {
+        size_t rem = output_size - total - 1u;
+        if (rem > 0u) {
+          size_t tocopy = (size_t)nread < rem ? (size_t)nread : rem;
+          memcpy(output + total, buf, tocopy);
+          total += tocopy;
+          output[total] = '\0';
+        }
+        continue;
       }
-    } else if (nread == 0) {
+      if (nread == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+        break;
+      }
       break;
     }
     int status;
     pid_t w = waitpid(pid, &status, WNOHANG);
     if (w > 0) {
       if (exit_code) *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+      completed = 1;
       break;
     }
-    usleep(500000);
-    elapsed++;
+    if ((int)(time(NULL) - start) >= timeout_sec) {
+      break;
+    }
+    usleep(100000);
   }
-  if (elapsed >= timeout_sec) {
+  if (!completed) {
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);
     if (exit_code) *exit_code = 124;
+    for (;;) {
+      char buf[4096];
+      ssize_t nread = read(pipefd[0], buf, sizeof(buf));
+      if (nread <= 0) {
+        break;
+      }
+      size_t rem = output_size - total - 1u;
+      if (rem > 0u) {
+        size_t tocopy = (size_t)nread < rem ? (size_t)nread : rem;
+        memcpy(output + total, buf, tocopy);
+        total += tocopy;
+        output[total] = '\0';
+      }
+    }
   }
   close(pipefd[0]);
   return 0;

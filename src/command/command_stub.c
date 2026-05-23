@@ -21,6 +21,7 @@
 #include "edr/pmfe.h"
 #include "edr/self_protect.h"
 #include "edr/sha256.h"
+#include "edr/shell_exec.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1057,6 +1058,370 @@ static int parse_int_json_default(const uint8_t *p, size_t len, const char *key,
     v++;
   }
   return (int)strtol(v, NULL, 10);
+}
+
+static int ascii_case_equal(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int env_int_default(const char *name, int defv) {
+  const char *e = getenv(name);
+  if (!e || !e[0]) {
+    return defv;
+  }
+  char *end = NULL;
+  long v = strtol(e, &end, 10);
+  if (end == e) {
+    return defv;
+  }
+  if (v < 1) {
+    return 1;
+  }
+  if (v > 300) {
+    return 300;
+  }
+  return (int)v;
+}
+
+static void rtr_shell_normalize_token(const char *raw, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!raw) {
+    return;
+  }
+  while (*raw && isspace((unsigned char)*raw)) {
+    raw++;
+  }
+  char tmp[256];
+  size_t n = 0;
+  while (raw[n] && !isspace((unsigned char)raw[n]) && raw[n] != ',' && raw[n] != ';' && n + 1u < sizeof(tmp)) {
+    tmp[n] = raw[n];
+    n++;
+  }
+  tmp[n] = '\0';
+  while (n > 0u && isspace((unsigned char)tmp[n - 1u])) {
+    tmp[--n] = '\0';
+  }
+  if (n >= 2u && ((tmp[0] == '"' && tmp[n - 1u] == '"') || (tmp[0] == '\'' && tmp[n - 1u] == '\''))) {
+    memmove(tmp, tmp + 1u, n - 2u);
+    tmp[n - 2u] = '\0';
+  }
+  const char *base = tmp;
+  for (const char *p = tmp; *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      base = p + 1;
+    }
+  }
+  size_t o = 0;
+  for (const char *p = base; *p && o + 1u < cap; p++) {
+    out[o++] = (char)tolower((unsigned char)*p);
+  }
+  out[o] = '\0';
+  size_t olen = strlen(out);
+  if (olen > 4u && strcmp(out + olen - 4u, ".exe") == 0) {
+    out[olen - 4u] = '\0';
+  } else if (olen > 4u && strcmp(out + olen - 4u, ".com") == 0) {
+    out[olen - 4u] = '\0';
+  }
+}
+
+static void rtr_shell_first_token(const char *command, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!command) {
+    return;
+  }
+  while (*command && isspace((unsigned char)*command)) {
+    command++;
+  }
+  char raw[256];
+  size_t n = 0;
+  if (*command == '"' || *command == '\'') {
+    char quote = *command++;
+    while (*command && *command != quote && n + 1u < sizeof(raw)) {
+      raw[n++] = *command++;
+    }
+  } else {
+    while (*command && !isspace((unsigned char)*command) && n + 1u < sizeof(raw)) {
+      raw[n++] = *command++;
+    }
+  }
+  raw[n] = '\0';
+  rtr_shell_normalize_token(raw, out, cap);
+}
+
+static int rtr_shell_has_control_operator(const char *command) {
+  if (!command) {
+    return 1;
+  }
+  for (const char *p = command; *p; p++) {
+    if (*p == '\n' || *p == '\r' || *p == ';' || *p == '|' || *p == '`' || *p == '<' || *p == '>') {
+      return 1;
+    }
+    if (*p == '&') {
+      return 1;
+    }
+    if (*p == '$' && p[1] == '(') {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void lower_copy(char *dst, size_t cap, const char *src) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  size_t i = 0;
+  if (!src) {
+    src = "";
+  }
+  for (; src[i] && i + 1u < cap; i++) {
+    dst[i] = (char)tolower((unsigned char)src[i]);
+  }
+  dst[i] = '\0';
+}
+
+static int rtr_shell_matches_block_term(const char *lower_cmd, const char *term) {
+  if (!lower_cmd || !term || !term[0]) {
+    return 0;
+  }
+  char padded[2300];
+  snprintf(padded, sizeof(padded), " %s ", lower_cmd);
+  return strstr(padded, term) != NULL || strstr(lower_cmd, term) != NULL;
+}
+
+static int rtr_shell_blocked(const char *command, char *reason, size_t reason_cap) {
+  char lower[2200];
+  lower_copy(lower, sizeof(lower), command);
+  static const char *const defaults[] = {
+      " rm ", " del ", " erase ", " rmdir ", " rd ", " format ", " fdisk ",
+      " shutdown", " reboot", " halt", " poweroff", " logoff", " taskkill",
+      " pkill ", " kill ", " reg delete", " reg add", " reg import", " sc delete",
+      " net user", " net localgroup", " wevtutil cl", " vssadmin delete", " cipher /w",
+      " bcdedit", "-encodedcommand", " encodedcommand", " frombase64string",
+      " invoke-expression", " iex ", " downloadstring", " downloadfile", NULL};
+  for (int i = 0; defaults[i]; i++) {
+    if (rtr_shell_matches_block_term(lower, defaults[i])) {
+      snprintf(reason, reason_cap, "blocked term: %s", defaults[i]);
+      return 1;
+    }
+  }
+  const char *extra = getenv("EDR_RTR_SHELL_BLOCKLIST");
+  if (!extra || !extra[0]) {
+    return 0;
+  }
+  char list[2048];
+  snprintf(list, sizeof(list), "%s", extra);
+  char *p = list;
+  while (p && *p) {
+    char *sep = strpbrk(p, ",;");
+    if (sep) {
+      *sep++ = '\0';
+    }
+    while (*p && isspace((unsigned char)*p)) {
+      p++;
+    }
+    char term[256];
+    lower_copy(term, sizeof(term), p);
+    size_t n = strlen(term);
+    while (n > 0u && isspace((unsigned char)term[n - 1u])) {
+      term[--n] = '\0';
+    }
+    if (term[0] && rtr_shell_matches_block_term(lower, term)) {
+      snprintf(reason, reason_cap, "blocked by EDR_RTR_SHELL_BLOCKLIST: %s", term);
+      return 1;
+    }
+    p = sep;
+  }
+  return 0;
+}
+
+static int rtr_shell_token_allowed(const char *token, char *matched, size_t matched_cap,
+                                   char *reason, size_t reason_cap) {
+  if (matched && matched_cap > 0u) {
+    matched[0] = '\0';
+  }
+  if (!token || !token[0]) {
+    snprintf(reason, reason_cap, "missing executable token");
+    return 0;
+  }
+  const char *list_env = getenv("EDR_RTR_SHELL_ALLOWLIST");
+  if (!list_env || !list_env[0]) {
+    list_env = getenv("EDR_SHELL_ALLOWLIST");
+  }
+  if (!list_env || !list_env[0]) {
+    snprintf(reason, reason_cap, "EDR_RTR_SHELL_ALLOWLIST not configured");
+    return 0;
+  }
+  char list[2048];
+  snprintf(list, sizeof(list), "%s", list_env);
+  char *p = list;
+  while (p && *p) {
+    char *sep = strpbrk(p, ",;");
+    if (sep) {
+      *sep++ = '\0';
+    }
+    while (*p && isspace((unsigned char)*p)) {
+      p++;
+    }
+    char item[128];
+    rtr_shell_normalize_token(p, item, sizeof(item));
+    if (item[0] && ascii_case_equal(token, item)) {
+      if (matched && matched_cap > 0u) {
+        snprintf(matched, matched_cap, "%s", item);
+      }
+      return 1;
+    }
+    p = sep;
+  }
+  snprintf(reason, reason_cap, "command token not in allowlist: %s", token);
+  return 0;
+}
+
+#ifdef _WIN32
+static void rtr_shell_output_to_utf8(char *s, size_t cap) {
+  if (!s || !s[0] || cap == 0u) {
+    return;
+  }
+  int wlen = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+  if (wlen <= 0) {
+    return;
+  }
+  wchar_t *wbuf = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+  if (!wbuf) {
+    return;
+  }
+  if (MultiByteToWideChar(CP_ACP, 0, s, -1, wbuf, wlen) > 0) {
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, NULL, 0, NULL, NULL);
+    if (u8len > 0 && (size_t)u8len < cap) {
+      (void)WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, s, u8len, NULL, NULL);
+    }
+  }
+  free(wbuf);
+}
+#endif
+
+static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
+                         const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject rtr_shell: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled", "denied", NULL);
+    return;
+  }
+  char command[2048];
+  if (parse_json_string_field(pl, len, "command", command, sizeof(command)) != 0 &&
+      parse_json_string_field(pl, len, "cmd", command, sizeof(command)) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: payload 缺少 command");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 2, "missing command", "failed", NULL);
+    return;
+  }
+  if (rtr_shell_has_control_operator(command)) {
+    s_rejected++;
+    audit_both(cmd_id, "rtr_shell: rejected control operator");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 3, "control operators are not allowed", "denied", NULL);
+    return;
+  }
+  char token[128];
+  char allow_item[128];
+  char reason[256];
+  rtr_shell_first_token(command, token, sizeof(token));
+  reason[0] = '\0';
+  if (!rtr_shell_token_allowed(token, allow_item, sizeof(allow_item), reason, sizeof(reason))) {
+    s_rejected++;
+    audit_both(cmd_id, reason[0] ? reason : "rtr_shell: command not allowlisted");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 4,
+                 reason[0] ? reason : "command not allowlisted", "denied", NULL);
+    return;
+  }
+  reason[0] = '\0';
+  if (rtr_shell_blocked(command, reason, sizeof(reason))) {
+    s_rejected++;
+    audit_both(cmd_id, reason[0] ? reason : "rtr_shell: blocked command");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 5,
+                 reason[0] ? reason : "command blocked", "denied", NULL);
+    return;
+  }
+  int timeout_sec = parse_int_json_default(pl, len, "timeout_sec", 30);
+  timeout_sec = parse_int_json_default(pl, len, "timeout_s", timeout_sec);
+  int max_timeout = env_int_default("EDR_RTR_SHELL_MAX_TIMEOUT_SEC", 60);
+  if (timeout_sec <= 0) {
+    timeout_sec = 30;
+  }
+  if (timeout_sec > max_timeout) {
+    timeout_sec = max_timeout;
+  }
+  if (sm && sm->issued_at_unix_ms > 0 && sm->deadline_ms > 0u) {
+    int64_t remaining_ms = sm->issued_at_unix_ms + (int64_t)sm->deadline_ms - command_now_ms();
+    if (remaining_ms <= 0) {
+      s_rejected++;
+      audit_both(cmd_id, "rtr_shell: deadline expired before execution");
+      soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 124, "deadline expired before execution", "timeout", NULL);
+      return;
+    }
+    int remaining_sec = (int)((remaining_ms + 999) / 1000);
+    if (remaining_sec > 0 && timeout_sec > remaining_sec) {
+      timeout_sec = remaining_sec;
+    }
+  }
+  char audit_msg[2400];
+  snprintf(audit_msg, sizeof(audit_msg), "rtr_shell: start token=%s timeout_sec=%d command=%.2000s",
+           token, timeout_sec, command);
+  audit_both(cmd_id, audit_msg);
+
+  char out[8192];
+  int exit_code = 0;
+  int rc = edr_shell_exec(command, timeout_sec, out, sizeof(out), &exit_code);
+#ifdef _WIN32
+  rtr_shell_output_to_utf8(out, sizeof(out));
+#endif
+  char commandj[4300], tokenj[300], outputj[10000], detail[16000];
+  json_escape_to(commandj, sizeof(commandj), command);
+  json_escape_to(tokenj, sizeof(tokenj), token);
+  json_escape_to(outputj, sizeof(outputj), out);
+  snprintf(detail, sizeof(detail),
+           "{\"command\":%s,\"allowed_token\":%s,\"timeout_sec\":%d,"
+           "\"exit_code\":%d,\"output_truncated\":%s,\"output\":%s}",
+           commandj, tokenj, timeout_sec, exit_code,
+           strlen(out) + 1u >= sizeof(out) ? "true" : "false", outputj);
+  s_handled++;
+  if (rc != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: exec failed");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, exit_code ? exit_code : 6, detail, "failed", NULL);
+    return;
+  }
+  if (exit_code == 124) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: timeout");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 124, detail, "timeout", NULL);
+    return;
+  }
+  if (exit_code != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: command returned non-zero");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, exit_code, detail, "failed", NULL);
+    return;
+  }
+  s_exec_ok++;
+  audit_both(cmd_id, "rtr_shell: ok");
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
 }
 
 static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
@@ -2212,6 +2577,11 @@ static int is_internal_auto_command(const char *cmd_id) {
   return cmd_id && (strncmp(cmd_id, "auto-", 5) == 0 || strcmp(cmd_id, "auto-shellcode") == 0);
 }
 
+static int is_rtr_shell_command_type(const char *t) {
+  return streq(t, "rtr_shell") || streq(t, "RTR_SHELL") ||
+         streq(t, "remote_shell") || streq(t, "shell_exec");
+}
+
 static int is_dangerous_command_type(const char *t) {
   return streq(t, "isolate_host") || streq(t, "isolate") ||
          streq(t, "restore_host") || streq(t, "host_restore") ||
@@ -2227,7 +2597,8 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "RTR_UNQUARANTINE_FILE") ||
          streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN") ||
          streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG") ||
-         streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY");
+         streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY") ||
+         is_rtr_shell_command_type(t);
 }
 
 static int command_signature_verify(const char *cmd_id, const char *cmd_type, const uint8_t *payload,
@@ -2235,7 +2606,11 @@ static int command_signature_verify(const char *cmd_id, const char *cmd_type, co
                                     char *reason, size_t reason_cap) {
   const char *require = getenv("EDR_COMMAND_REQUIRE_SIGNATURE");
   int required = require && require[0] == '1';
+  int force_shell_signature = is_rtr_shell_command_type(cmd_type);
   const char *allow_unsigned = getenv("EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS");
+  if (force_shell_signature) {
+    required = 1;
+  }
   if (!required && is_dangerous_command_type(cmd_type) && !is_internal_auto_command(cmd_id) &&
       !(allow_unsigned && allow_unsigned[0] == '1')) {
     required = 1;
@@ -2252,6 +2627,10 @@ static int command_signature_verify(const char *cmd_id, const char *cmd_type, co
   command_signature_idempotency_value(sm ? sm->idempotency_key : NULL, idem, sizeof(idem));
   if (required && !idem[0]) {
     snprintf(reason, reason_cap, "missing idempotency key");
+    return 0;
+  }
+  if (force_shell_signature && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
+    snprintf(reason, reason_cap, "rtr_shell requires issued_at_unix_ms and deadline_ms");
     return 0;
   }
   char got[65];
@@ -2426,6 +2805,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN")) {
     do_pmfe_scan(id, payload, payload_len, sm);
+    return;
+  }
+  if (is_rtr_shell_command_type(t)) {
+    do_rtr_shell(id, payload, payload_len, sm);
     return;
   }
 

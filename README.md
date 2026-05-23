@@ -275,12 +275,15 @@ cmake --build build
 | （开发）P0 C 对拍 | 改 `p0_golden_vectors.json` 后 **`python3 edr-agent/scripts/gen_p0_golden_vectors_inc.py`**（**仅** `process_create` 写入 `p0_golden_vectors_data.inc`；其它 event 由 Go 金线 + **`edr_p0_ir_record_golden_test`** 覆盖，需 **PCRE2**）。`ctest -R edr_p0_` 或跑 `edr_p0_golden_test` / `edr_p0_ir_record_golden_test`。无 PCRE2 时 PC 行仍 **legacy** 与 Go 对拍。 |
 | （开发）A4.1 总线 | **`ctest -R test_event_bus_mpmc_stress`** 或 **`bash scripts/run_event_bus_mpmc_stress.sh`**；长 soak 见 `docs/OPS_PROFILE_AND_RELEASE.md` 与测试源 `tests/test_event_bus_mpmc_stress.c`（`[ms] [producers] [cap]`）。 |
 | （monorepo）合并前**推荐** | 仓库根 **`bash edr-backend/scripts/recommended_p0_pr_gates.sh`**：六段**机读**（version、金线、TDH try-order、ETW1 槽文本、**A2.3 P3 UserData 十六进制金体**、**Go P0 manifest**）。`edr-agent` **CI** Ubuntu **precheck** 与上式 **6/6** 一致（另含 preprocess gray-release 预检）。全量 B2.4 留档用 **`bash edr-backend/scripts/collect_p0_b24_evidence.sh`** 或一键 **`bash edr-backend/scripts/p0_pack_machine_gates.sh`**。 |
-| `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / restore_host / forensic / RTR 文件与 eventlog/registry / quarantine**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
+| `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / restore_host / forensic / RTR 文件与 eventlog/registry / quarantine / rtr_shell**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
 | `EDR_CMD_KILL_ALLOWLIST` | 若设置（逗号分隔 PID 列表），**kill** 仅允许终止列表内进程（仍须先满足高危策略）；未设置则不限制 PID。 |
 | `EDR_CMD_AUDIT_PATH` | 若设置，高危指令审计**追加**写入该文件（带时间戳）；stderr 仍会打印 `[command][audit]`。 |
 | `EDR_COMMAND_SIGNING_KEY` | 生产高危指令签名密钥；高危外部命令默认要求 `idempotency_key=<idem>\|sigv1\|<key_id>\|<hmac>`。 |
-| `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` | `=1` 时允许高危命令无签名执行，仅用于本地调试。 |
+| `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` | `=1` 时允许多数高危命令无签名执行，仅用于本地调试；**不适用于 `rtr_shell`**。 |
 | `EDR_COMMAND_STATE_DB` | 覆盖本地命令状态库 JSONL 路径，用于幂等、重启恢复与结果追踪。 |
+| `EDR_RTR_SHELL_ALLOWLIST` | `rtr_shell` 必填白名单，逗号分隔首 token，如 `whoami,hostname,ipconfig,tasklist,netstat,dir`；该指令始终要求 `EDR_COMMAND_SIGNING_KEY`、`issued_at_unix_ms`、`deadline_ms` 与签名化 `idempotency_key`，不受 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` 放行。 |
+| `EDR_RTR_SHELL_MAX_TIMEOUT_SEC` | `rtr_shell` 本地最大执行秒数，默认 `60`，硬上限 `300`；payload 的 `timeout_sec` 会被钳制到该值和 SOAR deadline 剩余时间。 |
+| `EDR_RTR_SHELL_BLOCKLIST` | `rtr_shell` 追加本地 blocklist 关键字；默认已拒绝破坏性命令、控制操作符、重定向、管道与常见 PowerShell 编码执行形态。 |
 | `EDR_SOAR_REPORT_ALWAYS` | `=1` 时对**每条**指令尝试 gRPC **`ReportCommandResult`**（即使无 `soar_correlation_id`）；默认仅在下发含编排字段时上报。 |
 | `EDR_ISOLATE_HOOK` | 若设置，`isolate` 在写标记后执行 `system(hook)`（POSIX 下会 `setenv("EDR_CMD_ID", …)`）。 |
 | `EDR_RESTORE_HOOK` / `EDR_ISOLATE_RESTORE_HOOK` | 若设置，`restore_host` 在清理隔离标记前执行恢复脚本。 |
@@ -334,7 +337,7 @@ cmake --build build
 
 - **`ReportEvents`**：每次批次 flush 时，将 **12 字节批次头 + 载荷**（BAT1 或 BLZ4，见 §6.2）作为 `payload` 上报，并带 `batch_id`（幂等）、`endpoint_id`、`agent_version`。
 - **`upload.max_upload_mbps`**：在 `ReportEvents` 发送前对**本批 wire 字节数**（头+体）做**令牌桶**节流（`0` = 不限制；默认 `1` Mbps）；与失败退避独立，二者可能叠加等待。
-- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `restore_host` / `kill` / `forensic` / `rtr_get_file` / `rtr_rm_file` / `eventlog_view` / `registry_query` 在启用高危策略和生产签名后执行（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`** 在 Windows 上同样写 manifest、可选 `copy`、`tar` 打 **`bundle.tgz`**（依赖 **`tar.exe`**）。
+- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `restore_host` / `kill` / `forensic` / `rtr_get_file` / `rtr_rm_file` / `eventlog_view` / `registry_query` 在启用高危策略和生产签名后执行；`rtr_shell` 是最后兜底能力，额外强制签名、端侧 allowlist、timeout、审计和本地状态库闭环（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`** 在 Windows 上同样写 manifest、可选 `copy`、`tar` 打 **`bundle.tgz`**（依赖 **`tar.exe`**）。
 - **`ReportCommandResult`**： unary，上报 **`CommandExecutionResult`**（状态、exit_code、detail、完成时间等）；与 **`ReportEvents` 事件批次**相互独立。详见 **`docs/SOAR_CONTRACT.md`**。
 - **`ReportEvents` 失败退避**：连续失败后，下一次 RPC 前在持锁侧做 **50ms～5s** 的指数退避（减轻对不可用服务端的冲击）。
 - 通道参数：`GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS` / `MAX_RECONNECT_BACKOFF_MS` 已设置，便于底层重连。

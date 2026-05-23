@@ -91,6 +91,10 @@ static volatile LONG s_stat_completed;
 static volatile LONG s_stat_dropped;
 static volatile LONG s_stat_deduped;
 static volatile LONG s_stat_cooldown_skipped;
+
+static LONG pmfe_atomic_load_long(volatile LONG *p) {
+  return InterlockedCompareExchange(p, 0, 0);
+}
 #else
 static volatile unsigned long s_stat_submitted;
 static volatile unsigned long s_stat_completed;
@@ -294,6 +298,21 @@ static int pmfe_module_map_build(HANDLE proc, PmfeModuleRange *out, int max, int
   return 0;
 }
 
+static void pmfe_copy_cstr(char *out, size_t cap, const char *src) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!src) {
+    src = "";
+  }
+  size_t n = strlen(src);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, src, n);
+  out[n] = '\0';
+}
+
 static void pmfe_owner_for_va(const PmfeModuleRange *mods, int nmod, const void *va, char *out, size_t cap) {
   out[0] = '\0';
   if (!va || !out || cap == 0u) {
@@ -308,7 +327,7 @@ static void pmfe_owner_for_va(const PmfeModuleRange *mods, int nmod, const void 
           bn = s + 1;
         }
       }
-      snprintf(out, cap, "%s", bn[0] ? bn : mods[i].path);
+      pmfe_copy_cstr(out, cap, bn[0] ? bn : mods[i].path);
       return;
     }
   }
@@ -616,7 +635,7 @@ static void pmfe_scan_dns_ascii_in_buf(const uint8_t *buf, size_t len, unsigned 
     (*hits)++;
     if (sc > *best_score) {
       *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", tmp);
+      pmfe_copy_cstr(best_dom, best_cap, tmp);
       if (best_owner && owner_cap > 0u) {
         void *hit_va = (void *)(region_base + region_off + start);
         pmfe_owner_for_va(mods, nmod, hit_va, best_owner, owner_cap);
@@ -737,7 +756,7 @@ static void pmfe_scan_dns_wire_in_buf(const uint8_t *buf, size_t len, unsigned *
     (*hits)++;
     if (sc > *best_score) {
       *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", qname);
+      pmfe_copy_cstr(best_dom, best_cap, qname);
       if (best_owner && owner_cap > 0u) {
         void *hit_va = (void *)(region_base + region_off + i);
         pmfe_owner_for_va(mods, nmod, hit_va, best_owner, owner_cap);
@@ -800,7 +819,7 @@ static void pmfe_scan_dns_utf16_in_buf(const uint8_t *buf, size_t len, unsigned 
     (*hits)++;
     if (sc > *best_score) {
       *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", tmp);
+      pmfe_copy_cstr(best_dom, best_cap, tmp);
       if (best_owner && owner_cap > 0u) {
         void *hit_va = (void *)(region_base + region_off + start);
         pmfe_owner_for_va(mods, nmod, hit_va, best_owner, owner_cap);
@@ -1054,14 +1073,14 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
 
   if (bm.enum_failed) {
     snprintf(detail, detail_cap,
-             "pid=%u prio=%u band=%u baseline=enum_failed regions=%u private_exec=%u vad_hint=%s%s%s", pid,
+             "pid=%u prio=%u band=%u baseline=enum_failed regions=%u private_exec=%u vad_hint=%.64s%s%.240s", pid,
              (unsigned)task->priority, (unsigned)task->band, regions, cand, vh, vad_extra[0] ? " | " : "",
              vad_extra[0] ? vad_extra : "");
   } else {
     const char *stomp_path = bm.first_stomp_path[0] ? bm.first_stomp_path : "-";
     snprintf(detail, detail_cap,
              "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
-             "first_stomp=%.200s vad_hint=%s%s%s",
+             "first_stomp=%.200s vad_hint=%.64s%s%.240s",
              pid, (unsigned)task->priority, (unsigned)task->band, bm.module_count, bm.stomp_suspicious, bm.disk_hash_ok,
              regions, cand, stomp_path, vh, vad_extra[0] ? " | " : "", vad_extra[0] ? vad_extra : "");
   }
@@ -1563,7 +1582,7 @@ static void pmfe_detail_copy_token(const char *d, const char *key, char *out, si
 static uint64_t pmfe_wall_time_ns(void) {
 #ifdef _WIN32
   FILETIME ft;
-  GetSystemTimePreciseAsFileTime(&ft);
+  GetSystemTimeAsFileTime(&ft);
   ULARGE_INTEGER u;
   u.LowPart = ft.dwLowDateTime;
   u.HighPart = ft.dwHighDateTime;
@@ -1811,7 +1830,7 @@ void edr_pmfe_on_process_lifecycle_hint(void) {
 }
 
 static void pmfe_try_deferred_listen_refresh(void) {
-  LONG64 w = s_defer_listen_refresh_at_ms;
+  LONG64 w = InterlockedCompareExchange64(&s_defer_listen_refresh_at_ms, 0, 0);
   if (w == 0) {
     return;
   }
@@ -1830,13 +1849,13 @@ static DWORD WINAPI pmfe_listen_poll_main(void *arg) {
   InterlockedExchange64(&s_defer_listen_refresh_at_ms, 0);
   for (;;) {
     for (int i = 0; i < 60; i++) {
-      if (s_listen_stop) {
+      if (pmfe_atomic_load_long(&s_listen_stop)) {
         return 0;
       }
       pmfe_try_deferred_listen_refresh();
       Sleep(1000);
     }
-    if (s_listen_stop) {
+    if (pmfe_atomic_load_long(&s_listen_stop)) {
       break;
     }
     edr_pmfe_listen_table_refresh();
@@ -2018,7 +2037,7 @@ EdrError edr_pmfe_init(void) {
 
 void edr_pmfe_shutdown(void) {
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return;
   }
   EnterCriticalSection(&s_q_mu);
@@ -2180,7 +2199,7 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
     return -1;
   }
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return -1;
   }
   EnterCriticalSection(&s_q_mu);
@@ -2239,7 +2258,7 @@ int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
     return -1;
   }
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return -1;
   }
 #else
@@ -2269,7 +2288,7 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
     return -1;
   }
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return -1;
   }
 #else
@@ -2324,19 +2343,19 @@ void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *ou
                                  unsigned long *out_cooldown_skipped) {
 #ifdef _WIN32
   if (out_submitted) {
-    *out_submitted = (unsigned long)(ULONG_PTR)s_stat_submitted;
+    *out_submitted = (unsigned long)pmfe_atomic_load_long(&s_stat_submitted);
   }
   if (out_completed) {
-    *out_completed = (unsigned long)(ULONG_PTR)s_stat_completed;
+    *out_completed = (unsigned long)pmfe_atomic_load_long(&s_stat_completed);
   }
   if (out_dropped) {
-    *out_dropped = (unsigned long)(ULONG_PTR)s_stat_dropped;
+    *out_dropped = (unsigned long)pmfe_atomic_load_long(&s_stat_dropped);
   }
   if (out_deduped) {
-    *out_deduped = (unsigned long)(ULONG_PTR)s_stat_deduped;
+    *out_deduped = (unsigned long)pmfe_atomic_load_long(&s_stat_deduped);
   }
   if (out_cooldown_skipped) {
-    *out_cooldown_skipped = (unsigned long)(ULONG_PTR)s_stat_cooldown_skipped;
+    *out_cooldown_skipped = (unsigned long)pmfe_atomic_load_long(&s_stat_cooldown_skipped);
   }
 #else
   if (out_submitted) {
@@ -2360,7 +2379,7 @@ void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *ou
 unsigned long edr_pmfe_queue_depth(void) {
   unsigned long n = 0;
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return 0;
   }
   EnterCriticalSection(&s_q_mu);
