@@ -41,6 +41,7 @@ static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
 static char s_policy_version[64];
+static char s_ca_file[1024];
 static unsigned long s_http_ok;
 static unsigned long s_http_fail;
 static int64_t s_last_success_ms;
@@ -65,13 +66,15 @@ static void runtime_failure(const char *msg) {
 }
 
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
-                                const char *bearer, const char *endpoint_id, const char *agent_version) {
+                                const char *bearer, const char *endpoint_id, const char *agent_version,
+                                const char *ca_file) {
   memset(s_rest, 0, sizeof(s_rest));
   memset(s_tenant, 0, sizeof(s_tenant));
   memset(s_user, 0, sizeof(s_user));
   memset(s_bearer, 0, sizeof(s_bearer));
   memset(s_endpoint, 0, sizeof(s_endpoint));
   memset(s_agent_ver, 0, sizeof(s_agent_ver));
+  memset(s_ca_file, 0, sizeof(s_ca_file));
   if (rest_base && rest_base[0]) {
     snprintf(s_rest, sizeof(s_rest), "%s", rest_base);
   }
@@ -91,6 +94,9 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
     snprintf(s_agent_ver, sizeof(s_agent_ver), "%s", agent_version);
   } else {
     snprintf(s_agent_ver, sizeof(s_agent_ver), "%s", EDR_AGENT_VERSION_STRING);
+  }
+  if (ca_file && ca_file[0]) {
+    snprintf(s_ca_file, sizeof(s_ca_file), "%s", ca_file);
   }
   s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
 }
@@ -368,6 +374,9 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
   }
   {
     const char *cafile = getenv("EDR_INGEST_HTTPS_CA_FILE");
+    if (!cafile || !cafile[0]) {
+      cafile = s_ca_file;
+    }
     if (cafile && cafile[0]) {
       (void)SSL_CTX_load_verify_locations(ctx, cafile, NULL);
     } else {

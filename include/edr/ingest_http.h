@@ -10,7 +10,8 @@
 
 /** 在 edr_transport_init_from_config 中调用；rest_base 形如 http://127.0.0.1:8080/api/v1 */
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
-                                const char *bearer, const char *endpoint_id, const char *agent_version);
+                                const char *bearer, const char *endpoint_id, const char *agent_version,
+                                const char *ca_file);
 
 int edr_ingest_http_configured(void);
 

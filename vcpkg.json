@@ -3,7 +3,8 @@
   "version-string": "1.0.0",
   "description": "EDR Agent — C runtime with vcpkg manifest for Windows client build dependencies.",
   "dependencies": [
-    "curl"
+    "curl",
+    "openssl"
   ],
   "features": {
     "grpc-client": {

@@ -393,7 +393,8 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.rest_user_id,
       cfg->platform.rest_bearer_token,
       cfg->agent.endpoint_id,
-      NULL /* agent_version */);
+      NULL /* agent_version */,
+      cfg->server.ca_cert);
   edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version);
 
   /* 启动命令轮询 */
