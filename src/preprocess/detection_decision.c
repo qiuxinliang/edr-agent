@@ -211,6 +211,46 @@ static int has_exfil_indicator(const EdrBehaviorRecord *r) {
          has_ci(s, "az storage blob upload") || has_ci(s, "curl -t") || has_ci(s, "scp ");
 }
 
+static int has_silverfox_indicator(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  const char *fields[] = {
+      r->process_name,    r->exe_path,       r->cmdline,        r->file_path,
+      r->reg_key_path,    r->reg_value_name, r->reg_value_data, r->script_snippet,
+  };
+  int setup64_seen = 0;
+  int silverfox_path_seen = 0;
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    const char *s = fields[i] ? fields[i] : "";
+    if (has_ci(s, "\\public\\501\\") || has_ci(s, "/public/501/") ||
+        has_ci(s, "\\programdata\\golden\\") || has_ci(s, "/programdata/golden/")) {
+      silverfox_path_seen = 1;
+    }
+    if (has_ci(s, "setup64.exe")) {
+      setup64_seen = 1;
+    }
+    if (has_ci(s, "winos") || has_ci(s, "valleyrat") ||
+        has_ci(s, "silverfox") || has_ci(s, "silver fox") ||
+        has_ci(s, "wsftprm.sys") || has_ci(s, "amsdk.sys") || has_ci(s, "wamsdk.sys") ||
+        has_ci(s, "zam.exe") || has_ci(s, "zemana") || has_ci(s, "watchdog")) {
+      return 1;
+    }
+    if ((has_ci(s, ".ini") || has_ci(s, "nsis")) && (has_ci(s, "srdi") || has_ci(s, "shellcode"))) {
+      return 1;
+    }
+  }
+  if (setup64_seen && silverfox_path_seen) {
+    return 1;
+  }
+  if (has_ci(r->process_name, "computerdefaults.exe") &&
+      (has_ci(r->cmdline, "debugobject") || has_ci(r->cmdline, "appinfo") ||
+       has_ci(r->cmdline, "\\public\\501\\") || has_ci(r->cmdline, "\\programdata\\golden\\"))) {
+    return 1;
+  }
+  return 0;
+}
+
 static int has_persistence_change_indicator(const EdrBehaviorRecord *r) {
   const char *key = r->reg_key_path;
   const char *name = r->reg_value_name;
@@ -636,6 +676,10 @@ static void build_recommended_forensics(char *dst, size_t cap, const EdrBehavior
   if (d->persistence_change || has_persistence_change_indicator(r)) {
     ADD_ACTION("persistence_changes");
   }
+  if (has_silverfox_indicator(r)) {
+    ADD_ACTION("driver_inventory");
+    ADD_ACTION("silverfox_artifact_review");
+  }
 #undef ADD_ACTION
 }
 
@@ -652,6 +696,7 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   int ransom_burst = has_ransom_burst_indicator(r);
   int webshell_semantic = has_webshell_semantic_indicator(r);
   int persistence = has_persistence_change_indicator(r);
+  int silverfox = has_silverfox_indicator(r);
   int rmm_policy = rmm_enterprise_policy_match(r);
   int fp_feedback = false_positive_feedback_match(r);
   const char *rmm_policy_version = getenv("EDR_DETECTION_RMM_POLICY_VERSION");
@@ -704,13 +749,13 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
            "\"ransom_behavior\":%s,\"webshell_semantic\":%s,\"persistence_change\":%s,"
-           "\"rmm_policy_match\":%s,\"false_positive_feedback\":%s,"
+           "\"silverfox_attack_chain\":%s,\"rmm_policy_match\":%s,\"false_positive_feedback\":%s,"
            "\"process_context\":%s},",
            d->has_remote ? "true" : "false", d->suspicious_parent ? "true" : "false",
            d->allowlisted_path ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false",
            script_sensor ? "true" : "false", tls_anomaly ? "true" : "false",
            ransom_burst ? "true" : "false", webshell_semantic ? "true" : "false",
-           persistence ? "true" : "false", rmm_policy ? "true" : "false",
+           persistence ? "true" : "false", silverfox ? "true" : "false", rmm_policy ? "true" : "false",
            fp_feedback ? "true" : "false",
            d->context_correlated ? "true" : "false");
   if (d->suppress) {
@@ -793,6 +838,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int ransom_burst = has_ransom_burst_indicator(r);
   int webshell_semantic = has_webshell_semantic_indicator(r);
   int persistence = has_persistence_change_indicator(r);
+  int silverfox = has_silverfox_indicator(r);
   int rmm_policy = rmm_enterprise_policy_match(r);
   int fp_feedback = false_positive_feedback_match(r);
   int64_t now_ns = record_time_or_seq(r);
@@ -861,6 +907,10 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     score += 0.16f;
     add_reason(out->reason, sizeof(out->reason), "exfil_staging_or_upload");
   }
+  if (silverfox) {
+    score += 0.46f;
+    add_reason(out->reason, sizeof(out->reason), "silverfox_attack_chain_indicator");
+  }
   if (persistence) {
     score += (remote || script || script_sensor || parent) ? 0.30f : 0.22f;
     add_reason(out->reason, sizeof(out->reason), "persistence_change_indicator");
@@ -920,7 +970,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     }
   }
 
-  if (fp_feedback && !cred && !ransom && !ransom_burst && !exfil && !inject && !persistence &&
+  if (fp_feedback && !cred && !ransom && !ransom_burst && !exfil && !inject && !persistence && !silverfox &&
       r->type != EDR_EVENT_PROTOCOL_SHELLCODE && r->type != EDR_EVENT_WEBSHELL_DETECTED &&
       r->type != EDR_EVENT_PMFE_SCAN_RESULT) {
     set_suppression(out, score, "false_positive_feedback_policy", "EDR_DETECTION_FP_POLICY_VERSION");
@@ -933,19 +983,20 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     add_reason(out->reason, sizeof(out->reason), "management_tool_noise");
   }
   if (mgmt && rmm_policy && !script && !parent && !cred && !ransom && !ransom_burst && !exfil && !inject &&
+      !silverfox &&
       !r->cert_revoked_ancestor) {
     set_suppression(out, score, "rmm_enterprise_allowlist_policy", "EDR_DETECTION_RMM_POLICY_VERSION");
     score -= remote ? 0.18f : 0.28f;
     add_reason(out->reason, sizeof(out->reason), "rmm_enterprise_allowlist_policy");
   }
-  if (allow && !remote && !script && !parent && r->type != EDR_EVENT_PROTOCOL_SHELLCODE &&
+  if (allow && !remote && !script && !parent && !silverfox && r->type != EDR_EVENT_PROTOCOL_SHELLCODE &&
       r->type != EDR_EVENT_WEBSHELL_DETECTED) {
     set_suppression(out, score, "allowlisted_path", "EDR_DETECTION_POLICY_VERSION");
     score -= 0.18f;
     add_reason(out->reason, sizeof(out->reason), "allowlisted_path");
   }
 
-  if (lolbin && !context_correlated && !remote && !script && !script_sensor && !tls_anomaly && !persistence && !cred && !ransom &&
+  if (lolbin && !context_correlated && !remote && !script && !script_sensor && !tls_anomaly && !persistence && !silverfox && !cred && !ransom &&
       !ransom_burst && !exfil && !inject) {
     set_suppression(out, score, "lolbin_without_combo_condition", "EDR_DETECTION_POLICY_VERSION");
     score = score > 0.32f ? 0.32f : score;

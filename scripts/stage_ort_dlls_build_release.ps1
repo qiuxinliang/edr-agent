@@ -6,18 +6,18 @@ if (-not $env:ONNXRUNTIME_ROOT) {
     exit 1
 }
 $Root = Split-Path -Parent $PSScriptRoot
-$rel = $null
-foreach ($c in @(
-        (Join-Path $Root 'build\Release'),
-        (Join-Path $Root 'build')
-    )) {
-    $exe = Join-Path $c 'edr_agent.exe'
-    if (Test-Path -LiteralPath $exe) {
-        $rel = $c
-        break
+$releaseDir = Join-Path $Root 'build\Release'
+$singleConfigDir = Join-Path $Root 'build'
+$releaseExe = Join-Path $releaseDir 'edr_agent.exe'
+$singleConfigExe = Join-Path $singleConfigDir 'edr_agent.exe'
+if (-not (Test-Path -LiteralPath $releaseExe)) {
+    if (Test-Path -LiteralPath $singleConfigExe) {
+        New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+        Copy-Item -LiteralPath $singleConfigExe -Destination $releaseExe -Force
+        Write-Host "Normalized Ninja single-config exe: $singleConfigExe -> $releaseExe"
     }
 }
-if (-not $rel) {
+if (-not (Test-Path -LiteralPath $releaseExe)) {
     Write-Error "edr_agent.exe not found under build\Release or build (Ninja single-config). Build first."
     exit 1
 }
@@ -31,9 +31,9 @@ if (-not $dll) {
     Write-Error "onnxruntime.dll not found under ONNXRUNTIME_ROOT=$($env:ONNXRUNTIME_ROOT)"
     exit 1
 }
-Copy-Item -LiteralPath $dll -Destination $rel -Force
+Copy-Item -LiteralPath $dll -Destination $releaseDir -Force
 $prov = Join-Path $lib 'onnxruntime_providers_shared.dll'
 if (Test-Path -LiteralPath $prov) {
-    Copy-Item -LiteralPath $prov -Destination $rel -Force
+    Copy-Item -LiteralPath $prov -Destination $releaseDir -Force
 }
-Write-Host "Staged ORT DLL(s) into $rel"
+Write-Host "Staged ORT DLL(s) into $releaseDir"

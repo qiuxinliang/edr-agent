@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r240-4032d846",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r246-b6f5a11c",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 154,
+  "rule_count": 160,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -1360,6 +1360,77 @@
         "T1219",
         "T1574.001",
         "T1059"
+      ]
+    },
+    {
+      "id": "R-SILVERFOX-001",
+      "title": "银狐 Public\\501 伪装下载器执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.005",
+        "T1105",
+        "T1204.002"
+      ]
+    },
+    {
+      "id": "R-SILVERFOX-002",
+      "title": "银狐 ProgramData\\Golden / Setup64 执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.005",
+        "T1574.002",
+        "T1204.002"
+      ]
+    },
+    {
+      "id": "R-SILVERFOX-003",
+      "title": "银狐 computerdefaults UAC 绕过迹象",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1548.002",
+        "T1218"
+      ]
+    },
+    {
+      "id": "R-SILVERFOX-004",
+      "title": "银狐 BYOVD 驱动加载/服务创建",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1014",
+        "T1068",
+        "T1562.001"
+      ]
+    },
+    {
+      "id": "R-SILVERFOX-005",
+      "title": "银狐注册表驻留/模块配置",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112",
+        "T1547.001",
+        "T1027"
+      ]
+    },
+    {
+      "id": "R-SILVERFOX-006",
+      "title": "银狐关键工件落地写入",
+      "severity": 3,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1105",
+        "T1574.002",
+        "T1068"
       ]
     },
     {

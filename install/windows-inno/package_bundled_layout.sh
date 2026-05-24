@@ -32,9 +32,6 @@ fi
 
 # --- Binaries (Inno EDR_BIN_DIR) ---
 cp -a "$STAGE_DIR/edr_agent.exe" "$OUT_DIR/"
-if [[ -f "$STAGE_DIR/edr_monitor.exe" ]]; then
-  cp -a "$STAGE_DIR/edr_monitor.exe" "$OUT_DIR/"
-fi
 shopt -s nullglob
 DLL_COUNT=0
 for f in "$STAGE_DIR"/*.dll; do

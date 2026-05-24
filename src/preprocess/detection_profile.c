@@ -101,6 +101,36 @@ static int has_persistence_pattern(const EdrBehaviorRecord *r) {
          has_ci(s, "sc create") || has_ci(s, "new-service");
 }
 
+static int has_silverfox_pattern(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  const char *fields[] = {
+      r->process_name,    r->exe_path,       r->cmdline,        r->file_path,
+      r->reg_key_path,    r->reg_value_name, r->reg_value_data, r->script_snippet,
+  };
+  int setup64_seen = 0;
+  int silverfox_path_seen = 0;
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    const char *s = fields[i] ? fields[i] : "";
+    if (has_ci(s, "\\public\\501\\") || has_ci(s, "\\programdata\\golden\\")) {
+      silverfox_path_seen = 1;
+    }
+    if (has_ci(s, "setup64.exe")) {
+      setup64_seen = 1;
+    }
+    if (has_ci(s, "winos") || has_ci(s, "valleyrat") ||
+        has_ci(s, "wsftprm.sys") || has_ci(s, "amsdk.sys") || has_ci(s, "wamsdk.sys") ||
+        has_ci(s, "zam.exe") || has_ci(s, "zemana") || has_ci(s, "watchdog")) {
+      return 1;
+    }
+  }
+  if (setup64_seen && silverfox_path_seen) {
+    return 1;
+  }
+  return 0;
+}
+
 static int is_memory_event(const EdrBehaviorRecord *r) {
   return r && (r->type == EDR_EVENT_PROCESS_INJECT || r->type == EDR_EVENT_THREAD_CREATE_REMOTE);
 }
@@ -223,6 +253,11 @@ void edr_detection_trigger_evaluate(const EdrBehaviorRecord *r, const EdrDetecti
     } else if (is_memory_event(r)) {
       out->pmfe_scan = 1u;
       add_reason(out->reason, sizeof(out->reason), "memory_event_high_signal");
+    } else if (d->confidence >= 0.70f && has_silverfox_pattern(r)) {
+      out->pmfe_scan = 1u;
+      out->targeted_files = 1u;
+      out->ioc_lookup = 1u;
+      add_reason(out->reason, sizeof(out->reason), "silverfox_attack_chain_review");
     } else if (d->confidence >= 0.70f && has_script_sensor_pattern(r)) {
       out->pmfe_scan = 1u;
       add_reason(out->reason, sizeof(out->reason), "script_sensor_high_signal");

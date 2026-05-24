@@ -1,10 +1,10 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r240-4032d846",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r246-b6f5a11c",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 154,
+  "rule_count": 160,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -2722,6 +2722,139 @@
           "anydesk.exe",
           "teamviewer.exe",
           "screenconnect.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-SILVERFOX-001",
+      "title": "银狐 Public\\501 伪装下载器执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.005",
+        "T1105",
+        "T1204.002"
+      ],
+      "description": "银狐/Winos 近期攻击链中常见的 Public\\501\\url.exe/curl.exe 下载器落地执行形态；要求同时出现 Public\\501 路径、伪装下载器和远程下载语义以降低误报。",
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\\\(Users\\\\Public|Public)\\\\501\\\\",
+          "(?i)\\\\(url|curl)\\.exe\\b"
+        ],
+        "command_regex_any": [
+          "(?i)(https?|ftp)://",
+          "(?i)\\b(download|invoke-webrequest|bitsadmin|certutil)\\b"
+        ]
+      }
+    },
+    {
+      "id": "R-SILVERFOX-002",
+      "title": "银狐 ProgramData\\Golden / Setup64 执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1036.005",
+        "T1574.002",
+        "T1204.002"
+      ],
+      "description": "银狐/Winos 攻击链中 Setup64.exe 与 C:\\ProgramData\\Golden 目录相关的载荷启动、DLL 侧载或安装阶段。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\\\ProgramData\\\\Golden\\\\",
+          "(?i)\\\\(Users\\\\Public|Public)\\\\501\\\\Setup64\\.exe\\b",
+          "(?i)\\bSetup64\\.exe[^\\n]{0,160}\\\\ProgramData\\\\Golden\\\\"
+        ]
+      }
+    },
+    {
+      "id": "R-SILVERFOX-003",
+      "title": "银狐 computerdefaults UAC 绕过迹象",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1548.002",
+        "T1218"
+      ],
+      "description": "computerdefaults.exe 携带 DebugObject/AppInfo 或银狐落地路径上下文，覆盖银狐/Winos 链条中观察到的 UAC 绕过阶段。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)DebugObject|AppInfo",
+          "(?i)\\\\ProgramData\\\\Golden\\\\|\\\\Users\\\\Public\\\\501\\\\|Setup64\\.exe"
+        ],
+        "process_name_in": [
+          "computerdefaults.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-SILVERFOX-004",
+      "title": "银狐 BYOVD 驱动加载/服务创建",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1014",
+        "T1068",
+        "T1562.001"
+      ],
+      "description": "银狐/ValleyRAT 相关 BYOVD 链条中出现的 WatchDog/Zemana 驱动与 wsftprm/amsdk/wamsdk/ZAM 工件，通常用于安全进程终止或内核级防御规避。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)(wsftprm|amsdk|wamsdk)\\.sys\\b",
+          "(?i)\\bZAM\\.exe\\b",
+          "(?i)(WatchDog|Zemana)[^\\n]{0,120}(driver|kernel|service)",
+          "(?i)\\bsc\\.exe\\s+(create|start)\\s+[^\\n]{0,160}(wsftprm|amsdk|wamsdk|ZAM)"
+        ]
+      }
+    },
+    {
+      "id": "R-SILVERFOX-005",
+      "title": "银狐注册表驻留/模块配置",
+      "severity": 3,
+      "event_type": "registry_set",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1112",
+        "T1547.001",
+        "T1027"
+      ],
+      "description": "银狐/Winos 将模块或启动项写入注册表时常见的 Run/RunOnce、Golden、Winos/ValleyRAT 关键词与落地路径组合。",
+      "condition": {
+        "registry_path_regex_any": [
+          "(?i)\\\\CurrentVersion\\\\Run(Once)?\\\\?",
+          "(?i)\\\\(Software|Classes|Microsoft)\\\\[^\\n]{0,160}(Winos|Valley|SilverFox|Golden)"
+        ],
+        "registry_value_data_in": [
+          "winos",
+          "valleyrat",
+          "silver fox",
+          "programdata\\golden",
+          "users\\public\\501",
+          "setup64.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-SILVERFOX-006",
+      "title": "银狐关键工件落地写入",
+      "severity": 3,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1105",
+        "T1574.002",
+        "T1068"
+      ],
+      "description": "银狐/Winos 攻击链关键落地文件写入：Public\\501 下载器/Setup64、ProgramData\\Golden 目录、Zemana/WatchDog BYOVD 驱动文件。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Users\\\\Public\\\\501\\\\(url|curl|Setup64)\\.exe$",
+          "(?i)\\\\ProgramData\\\\Golden\\\\",
+          "(?i)\\\\(wsftprm|amsdk|wamsdk)\\.sys$",
+          "(?i)\\\\ZAM\\.exe$"
         ]
       }
     },
