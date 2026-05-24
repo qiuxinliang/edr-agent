@@ -378,10 +378,12 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
   SSL_CTX *ctx = NULL;
   SSL *ssl = NULL;
   char req[8192];
+  char active_cafile[1024];
   int rn = append_headers(req, sizeof(req), path, host, body, body_len);
   if (rn <= 0) {
     return -1;
   }
+  active_cafile[0] = '\0';
   OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
   ctx = SSL_CTX_new(TLS_client_method());
   if (!ctx) {
@@ -394,6 +396,7 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
       cafile = s_ca_file;
     }
     if (cafile && cafile[0]) {
+      snprintf(active_cafile, sizeof(active_cafile), "%s", cafile);
       if (SSL_CTX_load_verify_locations(ctx, cafile, NULL) != 1) {
         char msg[160];
         snprintf(msg, sizeof(msg), "https ca load failed: %s", cafile);
@@ -425,7 +428,9 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
     long verify = SSL_get_verify_result(ssl);
     if (verify != X509_V_OK) {
       char msg[160];
-      snprintf(msg, sizeof(msg), "https tls verify failed: %s", X509_verify_cert_error_string(verify));
+      snprintf(msg, sizeof(msg), "https tls verify failed: %s ca=%s",
+               X509_verify_cert_error_string(verify),
+               active_cafile[0] ? active_cafile : "<default>");
       runtime_failure(msg);
     } else {
       runtime_failure_openssl("https tls connect failed");
