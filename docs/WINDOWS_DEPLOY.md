@@ -55,13 +55,17 @@ Copy-Item .\edr_agent.exe "C:\Program Files\EDR Agent\edr_agent.exe" -Force
 Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows_isolate_host.ps1" -Force
 ```
 
-2. 生成生产配置。`scripts/edr_agent_install.ps1` 会优先合并 `config/agent_windows_production.example.toml`，并写入 mTLS 证书路径：
+2. 生成生产配置。`scripts/edr_agent_install.ps1` 会优先合并 `config/agent_windows_production.example.toml`，自动生成端侧私钥/CSR，调用 enroll 签发终端唯一客户端证书，并写入 mTLS 证书路径：
 
 ```powershell
-$env:EDR_API_BASE="https://edr.example.com"
-$env:EDR_ENROLL_TOKEN="..."
-.\scripts\edr_agent_install.ps1 -Output "C:\Program Files\EDR Agent\agent.toml"
+.\scripts\edr_agent_install.ps1 `
+  -ApiBase "https://edr.example.com:8080" `
+  -EnrollToken "<token>" `
+  -Output "C:\Program Files\EDR Agent\agent.toml" `
+  -TrustCa
 ```
+
+也可在便携部署中加 `-InstallAutorun`，脚本会在写入 `agent.toml` 后注册开机计划任务；Inno 安装包仍由向导任务完成同样动作。
 
 3. 安装并启动服务：
 

@@ -31,12 +31,14 @@ etw_enabled          = true
 ebpf_enabled         = false
 poll_interval_s      = 1
 max_event_queue_size = 8192
-etw_dns_client_provider = true
+# High-volume providers stay off by default for first install. Enable them
+# only after confirming event bus pressure is stable on the target host.
+etw_dns_client_provider = false
 etw_powershell_provider = true
 etw_security_audit_provider = true
-etw_wmi_provider = true
-etw_tcpip_provider = true
-etw_firewall_provider = true
+etw_wmi_provider = false
+etw_tcpip_provider = false
+etw_firewall_provider = false
 
 [preprocessing]
 dedup_window_s       = 60
@@ -49,7 +51,15 @@ model_dir            = "C:\\Program Files\\EDR Agent\\models"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
-behavior_monitor_enabled = true
+behavior_monitor_enabled = false
+
+[forensic_auto]
+enabled              = false
+cooldown_s           = 30
+per_pid_cooldown_s   = 300
+max_per_hour         = 20
+trigger_on_p0        = true
+collect_process_tree = true
 
 [upload]
 batch_max_events     = 200
@@ -86,7 +96,7 @@ watchdog_log_interval_s = 60
 event_bus_pressure_warn_pct = 80
 
 [attack_surface]
-enabled              = true
+enabled              = false
 tick_interval_s      = 300
 
 [shellcode_detector]

@@ -173,7 +173,7 @@ static int drain_one_row(void) {
   {
     int lim = max_retry_limit();
     if (lim > 0 && retry_count >= lim) {
-      fprintf(stderr, "[queue] 达最大重试 %d，丢弃 batch_id=%s id=%lld\n", lim, batch_id ? batch_id : "",
+      fprintf(stderr, "[queue] max retries reached (%d), dropping batch_id=%s id=%lld\n", lim, batch_id ? batch_id : "",
               (long long)id);
       (void)delete_row_by_id(id);
       return 0;
@@ -181,14 +181,15 @@ static int drain_one_row(void) {
   }
 
   if (!batch_id || !blob || blob_len < 12) {
-    fprintf(stderr, "[queue] 删除损坏队列行 id=%lld\n", (long long)id);
+    fprintf(stderr, "[queue] deleted corrupt queue row id=%lld\n", (long long)id);
     (void)delete_row_by_id(id);
     return 0;
   }
 
   const uint8_t *b = (const uint8_t *)blob;
   if (!batch_header_valid(b)) {
-    fprintf(stderr, "[queue] 丢弃无 §6.2 头的历史批次 id=%lld（请清空旧库或重新落盘）\n", (long long)id);
+    fprintf(stderr, "[queue] dropping legacy batch without v6.2 header id=%lld (clear old queue db or re-enqueue)\n",
+            (long long)id);
     (void)delete_row_by_id(id);
     return 0;
   }
@@ -279,13 +280,13 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
 #if defined(_WIN32) && defined(_MSC_VER)
     struct __stat64 stbuf;
     if (_stat64(s_path, &stbuf) == 0 && (uint64_t)stbuf.st_size >= s_max_db_bytes) {
-      fprintf(stderr, "[queue] 库文件超过 EDR_QUEUE_MAX_DB_MB 上限，拒绝入队\n");
+      fprintf(stderr, "[queue] db file exceeds EDR_QUEUE_MAX_DB_MB, enqueue denied\n");
       return EDR_ERR_QUEUE_FULL;
     }
 #else
     struct stat stbuf;
     if (stat(s_path, &stbuf) == 0 && (uint64_t)stbuf.st_size >= s_max_db_bytes) {
-      fprintf(stderr, "[queue] 库文件超过 EDR_QUEUE_MAX_DB_MB 上限，拒绝入队\n");
+      fprintf(stderr, "[queue] db file exceeds EDR_QUEUE_MAX_DB_MB, enqueue denied\n");
       return EDR_ERR_QUEUE_FULL;
     }
 #endif

@@ -37,18 +37,21 @@ export EDR_API_BASE="..." EDR_ENROLL_TOKEN="..."
 ./scripts/edr_agent_install.sh -o ./agent.toml
 ```
 
-## 方式三：PowerShell（Windows，无 Python）
+## 方式三：PowerShell（Windows，一条命令）
 
-**`scripts/edr_agent_install.ps1`**，使用 `Invoke-RestMethod`。
+**`scripts/edr_agent_install.ps1`**，使用 `Invoke-RestMethod`。默认会自动生成终端私钥和 CSR，调用 enroll 换取 `ca.pem` / `client.pem`，并写入完整 `agent.toml`；不再要求手工设置多条环境变量。
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-$env:EDR_API_BASE="http://127.0.0.1:8080"
-$env:EDR_ENROLL_TOKEN="..."
-.\scripts\edr_agent_install.ps1 -Output "C:\Program Files\EDR Agent\agent.toml"
+.\scripts\edr_agent_install.ps1 `
+  -ApiBase "https://edr.example.com:8080" `
+  -EnrollToken "<token>" `
+  -Output "C:\Program Files\EDR Agent\agent.toml" `
+  -TrustCa `
+  -InstallAutorun
 ```
 
-调试自签：`$env:EDR_INSECURE_TLS="1"`（脚本内使用旧版证书回调，仅用于测试）。
+如果安装包或现场流程已预置 **`C:\Program Files\EDR Agent\certs\ca.pem`**，`-TrustCa` 会先导入 Windows Root 再发起 enroll。调试自签也可临时使用 `$env:EDR_INSECURE_TLS="1"`（仅用于实验环境）。脚本优先使用 PowerShell/.NET 原生能力生成 PEM 私钥和 CSR；若系统版本过旧，会自动查找同目录、Git for Windows、OpenSSL-Win64 等常见位置的 `openssl.exe` 作为回退。
 
 ## 生成内容说明
 
@@ -60,7 +63,7 @@ $env:EDR_ENROLL_TOKEN="..."
 
 **PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：若脚本同目录存在 **`agent.toml.example`**（安装包与 Inno 默认会带上），注册成功后会将上述三项 **合并进完整示例模板** 再写入目标路径，从而保留 **`[collection]`、`[ave]`、`[preprocessing]`** 等默认段落，无需手工拼接。若合并失败则回退为仅含 `[server]`/`[agent]`/`[platform]` 的精简文件。需要旧行为时可传 **`-MinimalTomlOnly`**。
 
-**mTLS**：当前 enroll 响应中证书字段多为空（`mtls_deferred`）；生产需按运维流程下发 CA/客户端证书并补全 `agent.toml` 中 `ca_cert` / `client_cert` / `client_key`。
+**mTLS**：enroll 使用端侧 CSR 签发唯一客户端证书，脚本只保存服务端返回的 `ca.pem` / `client.pem`，不会从服务端接收私钥。默认 PEM 私钥路径为 **`C:\Program Files\EDR Agent\certs\client-key.pem`**；高级模式可用 `EDR_KEY_PROVIDER=cng|tpm|pkcs11` 生成硬件/不可导出 CSR，但当前 gRPC C++ 运行时仍需要 PEM `client_key` 才能启用 RTR 实时通道。
 
 ## 与平台「安装包构建」接口的关系
 
