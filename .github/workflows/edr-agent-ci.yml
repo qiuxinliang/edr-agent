@@ -36,9 +36,9 @@ jobs:
           path: |
             .cache/vcpkg-downloads
             vcpkg_installed
-          key: vcpkg-x64-win-curlonly-${{ hashFiles('vcpkg.json', 'CMakeLists.txt') }}-${{ runner.os }}
+          key: vcpkg-x64-win-https-sqlite-nogrpc-${{ hashFiles('vcpkg.json', 'CMakeLists.txt') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-curlonly-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-x64-win-https-sqlite-nogrpc-${{ hashFiles('vcpkg.json') }}-
       - name: Clone and bootstrap vcpkg
         shell: pwsh
         run: |
@@ -46,7 +46,7 @@ jobs:
             git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
           }
           & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
-      - name: vcpkg install (curl only; no grpc feature)
+      - name: vcpkg install (curl + OpenSSL + SQLite; no grpc feature)
         env:
           VCPKG_DEFAULT_TRIPLET: x64-windows
           VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
@@ -66,7 +66,7 @@ jobs:
         shell: pwsh
         run: choco install ninja -y --no-progress
       - uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Configure (vcpkg curl, no gRPC, Ninja, sccache)
+      - name: Configure (vcpkg HTTPS + SQLite, no gRPC, Ninja, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -76,6 +76,8 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
             -DEDR_WITH_GRPC=OFF `
+            -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+            -DEDR_REQUIRE_SQLITE=ON `
             -DEDR_WITH_ONNXRUNTIME=OFF `
             -DEDR_WITH_YARA=OFF `
             -DEDR_BUILD_TESTS=OFF `
@@ -84,6 +86,14 @@ jobs:
       - name: Build
         shell: pwsh
         run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Verify HTTPS REST and SQLite compiled in
+        shell: pwsh
+        run: |
+          $exe = @("build\edr_agent.exe", "build\Release\edr_agent.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $exe) { throw "edr_agent.exe not found after build" }
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
+          if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
+          if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
       - name: Test
         shell: bash
         run: ctest --test-dir build --output-on-failure

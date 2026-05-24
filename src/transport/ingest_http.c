@@ -65,6 +65,21 @@ static void runtime_failure(const char *msg) {
   snprintf(s_last_error, sizeof(s_last_error), "%s", msg ? msg : "");
 }
 
+#ifdef EDR_HAVE_OPENSSL_HTTP
+static void runtime_failure_openssl(const char *prefix) {
+  unsigned long err = ERR_get_error();
+  char msg[160];
+  if (err != 0ul) {
+    char detail[96];
+    ERR_error_string_n(err, detail, sizeof(detail));
+    snprintf(msg, sizeof(msg), "%s: %s", prefix ? prefix : "openssl failed", detail);
+  } else {
+    snprintf(msg, sizeof(msg), "%s", prefix ? prefix : "openssl failed");
+  }
+  runtime_failure(msg);
+}
+#endif
+
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file) {
@@ -370,6 +385,7 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
   OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
   ctx = SSL_CTX_new(TLS_client_method());
   if (!ctx) {
+    runtime_failure_openssl("https ssl ctx failed");
     return -1;
   }
   {
@@ -378,17 +394,25 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
       cafile = s_ca_file;
     }
     if (cafile && cafile[0]) {
-      (void)SSL_CTX_load_verify_locations(ctx, cafile, NULL);
-    } else {
-      (void)SSL_CTX_set_default_verify_paths(ctx);
+      if (SSL_CTX_load_verify_locations(ctx, cafile, NULL) != 1) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "https ca load failed: %s", cafile);
+        runtime_failure(msg);
+        goto done;
+      }
+    } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+      runtime_failure_openssl("https default ca load failed");
+      goto done;
     }
   }
   SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
   if (tcp_connect_host(host, port, &fd) != 0) {
+    runtime_failure("https tcp connect failed");
     goto done;
   }
   ssl = SSL_new(ctx);
   if (!ssl) {
+    runtime_failure_openssl("https ssl new failed");
     goto done;
   }
 #ifdef _WIN32
@@ -398,9 +422,18 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
 #endif
   (void)SSL_set_tlsext_host_name(ssl, host);
   if (SSL_connect(ssl) != 1) {
+    long verify = SSL_get_verify_result(ssl);
+    if (verify != X509_V_OK) {
+      char msg[160];
+      snprintf(msg, sizeof(msg), "https tls verify failed: %s", X509_verify_cert_error_string(verify));
+      runtime_failure(msg);
+    } else {
+      runtime_failure_openssl("https tls connect failed");
+    }
     goto done;
   }
   if (SSL_write(ssl, req, rn) <= 0 || (body_len > 0u && SSL_write(ssl, body, (int)body_len) <= 0)) {
+    runtime_failure_openssl("https write failed");
     goto done;
   }
   {
@@ -409,6 +442,19 @@ static int post_https_openssl(const char *host, int port, const char *path, cons
     if (n > 0) {
       resp[n] = '\0';
       ret = (strncmp(resp, "HTTP/1.1 2", 10u) == 0 || strncmp(resp, "HTTP/1.0 2", 10u) == 0) ? 0 : -1;
+      if (ret != 0) {
+        char *eol = strstr(resp, "\r\n");
+        if (eol) {
+          *eol = '\0';
+        }
+        {
+          char msg[160];
+          snprintf(msg, sizeof(msg), "https http status: %s", resp);
+          runtime_failure(msg);
+        }
+      }
+    } else {
+      runtime_failure_openssl("https read failed");
     }
   }
 done:

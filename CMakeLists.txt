@@ -112,6 +112,7 @@ option(EDR_WITH_FL_KAFKA "FL: consume round announces via librdkafka (requires E
 set(TORCH_ROOT "" CACHE PATH "LibTorch 根目录（含 share/cmake/Torch），见 pytorch.org/cppdocs/installing.html")
 option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAKE_PREFIX_PATH）" OFF)
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
+option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
 
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
@@ -526,7 +527,10 @@ if(SQLite3_FOUND)
     target_link_libraries(edr_agent PRIVATE SQLite::SQLite3)
   endif()
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_SQLITE=1)
+elseif(EDR_REQUIRE_SQLITE)
+  message(FATAL_ERROR "EDR_REQUIRE_SQLITE=ON but SQLite3 was not found")
 endif()
+message(STATUS "SQLite local storage support: ${SQLite3_FOUND}")
 
 if(EDR_BUILD_AVE_SHARED_LIB)
   add_library(edr_ave_shared SHARED ${EDR_AVE_CORE_SOURCES})

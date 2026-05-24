@@ -235,6 +235,8 @@ jobs:
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
               -DEDR_WITH_GRPC=ON `
+              -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+              -DEDR_REQUIRE_SQLITE=ON `
               -DEDR_WITH_ONNXRUNTIME=ON `
               "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
               "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
@@ -245,6 +247,8 @@ jobs:
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
               -DEDR_WITH_GRPC=OFF `
+              -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+              -DEDR_REQUIRE_SQLITE=ON `
               -DEDR_WITH_ONNXRUNTIME=OFF `
               -DEDR_WITH_YARA=OFF `
               "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
@@ -254,6 +258,15 @@ jobs:
 
       - name: Build (Ninja + sccache)
         run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+
+      - name: Verify HTTPS REST and SQLite compiled in
+        shell: pwsh
+        run: |
+          $exe = @("build\edr_agent.exe", "build\Release\edr_agent.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $exe) { throw "edr_agent.exe not found after build" }
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
+          if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
+          if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
 
       - name: sccache stats
         shell: bash

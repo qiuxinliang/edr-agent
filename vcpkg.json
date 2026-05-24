@@ -4,7 +4,8 @@
   "description": "EDR Agent — C runtime with vcpkg manifest for Windows client build dependencies.",
   "dependencies": [
     "curl",
-    "openssl"
+    "openssl",
+    "sqlite3"
   ],
   "features": {
     "grpc-client": {
