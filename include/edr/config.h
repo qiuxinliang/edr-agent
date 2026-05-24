@@ -168,6 +168,16 @@ typedef struct EdrConfig {
     bool allow_dangerous;
   } command;
 
+  /** 告警推荐取证自动派发。该开关独立于 [command].allow_dangerous，避免开启响应权限后自动风暴。 */
+  struct {
+    bool enabled;
+    uint32_t cooldown_s;
+    uint32_t per_pid_cooldown_s;
+    uint32_t max_per_hour;
+    bool trigger_on_p0;
+    bool collect_process_tree;
+  } forensic_auto;
+
   /**
    * §19 平台 REST（攻击面上报）。`rest_base_url` 形如 `http://127.0.0.1:8080/api/v1`（无尾斜杠）。
    * 可被环境变量 `EDR_PLATFORM_REST_BASE` 覆盖；可选 `EDR_PLATFORM_BEARER` 或 `rest_bearer_token`。

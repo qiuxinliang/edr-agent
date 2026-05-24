@@ -38,7 +38,7 @@ void edr_self_protect_set_shutdown_hook(void (*cb)(int signo)) { s_shutdown_hook
 
 #ifndef _WIN32
 static void edr_sp_on_signal(int s) {
-  fprintf(stderr, "[self_protect] 收到信号 %d（审计）\n", s);
+  fprintf(stderr, "[self_protect] signal received %d (audit)\n", s);
   if (s_shutdown_hook) {
     s_shutdown_hook(s);
   }
@@ -201,7 +201,7 @@ void edr_self_protect_poll(void) {
   if (s_cfg && s_cfg->self_protect.anti_debug) {
     int d = edr_self_protect_debugger_attached();
     if (d && !s_dbg_last) {
-      fprintf(stderr, "[self_protect] 告警：检测到调试器附着（审计，不退出）\n");
+      fprintf(stderr, "[self_protect] warning: debugger attached (audit, no exit)\n");
     }
     s_dbg_last = d;
   }
@@ -213,7 +213,7 @@ void edr_self_protect_poll(void) {
       unsigned pct = (unsigned)(100u * used / cap);
       if (pct >= s_cfg->self_protect.event_bus_pressure_warn_pct) {
         if ((s_pressure_warn_count++ % 25u) == 0u) {
-          fprintf(stderr, "[self_protect] 事件总线占用 %u%%（阈值 %u%%）hw_hits=%llu dropped=%llu\n", pct,
+          fprintf(stderr, "[self_protect] event bus usage %u%% (threshold %u%%) hw_hits=%llu dropped=%llu\n", pct,
                   (unsigned)s_cfg->self_protect.event_bus_pressure_warn_pct,
                   (unsigned long long)edr_event_bus_high_water_hits(s_bus),
                   (unsigned long long)edr_event_bus_dropped_total(s_bus));

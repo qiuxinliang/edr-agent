@@ -70,6 +70,9 @@ EdrError edr_pmfe_init(void);
 /** 停止线程并排空队列（幂等）。 */
 void edr_pmfe_shutdown(void);
 
+/** 返回 PMFE worker/queue 是否已经启动。 */
+int edr_pmfe_is_running(void);
+
 /**
  * 将服务端触发的扫描请求入队（`PMFE_TRIGGER_SERVER_CMD`，设计 P0，不参与同 PID 冷却）。
  * @param command_id 用于审计日志（可为空）

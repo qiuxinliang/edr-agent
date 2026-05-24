@@ -357,15 +357,102 @@ static int ctx_has(const EdrBehaviorRecord *r, const char *needle) {
   return r && needle && needle[0] && strstr(r->detection_context, needle) != NULL;
 }
 
+static int env_truthy_cmd(const char *name) {
+  const char *v = getenv(name);
+  if (!v || !v[0]) {
+    return 0;
+  }
+  return strcmp(v, "1") == 0 || streq(v, "true") || streq(v, "TRUE") || streq(v, "yes") || streq(v, "on");
+}
+
+static int env_falsy_cmd(const char *name) {
+  const char *v = getenv(name);
+  if (!v || !v[0]) {
+    return 0;
+  }
+  return strcmp(v, "0") == 0 || streq(v, "false") || streq(v, "FALSE") || streq(v, "no") || streq(v, "off");
+}
+
+static uint32_t env_u32_cmd(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv) {
+  const char *v = getenv(name);
+  if (!v || !v[0]) {
+    return defv;
+  }
+  char *end = NULL;
+  unsigned long n = strtoul(v, &end, 10);
+  if (end == v) {
+    return defv;
+  }
+  if (n < minv) {
+    n = minv;
+  }
+  if (n > maxv) {
+    n = maxv;
+  }
+  return (uint32_t)n;
+}
+
+static int auto_recommended_rate_allow(uint32_t pid) {
+  static int64_t s_global_last_ms;
+  static uint32_t s_last_pid;
+  static int64_t s_last_pid_ms;
+  static int64_t s_hour_start_ms;
+  static uint32_t s_hour_count;
+  int64_t now = command_now_ms();
+  uint32_t global_cd_s = s_bound_cfg ? s_bound_cfg->forensic_auto.cooldown_s : 30u;
+  uint32_t pid_cd_s = s_bound_cfg ? s_bound_cfg->forensic_auto.per_pid_cooldown_s : 300u;
+  uint32_t max_per_hour = s_bound_cfg ? s_bound_cfg->forensic_auto.max_per_hour : 20u;
+  global_cd_s = env_u32_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_COOLDOWN_S", global_cd_s, 0u, 3600u);
+  pid_cd_s = env_u32_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_PER_PID_COOLDOWN_S", pid_cd_s, 0u, 86400u);
+  max_per_hour = env_u32_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_MAX_PER_HOUR", max_per_hour, 0u, 10000u);
+  if (s_hour_start_ms == 0 || now - s_hour_start_ms >= 3600000LL) {
+    s_hour_start_ms = now;
+    s_hour_count = 0;
+  }
+  if (max_per_hour > 0u && s_hour_count >= max_per_hour) {
+    return 0;
+  }
+  if (global_cd_s > 0u && s_global_last_ms > 0 &&
+      now - s_global_last_ms < (int64_t)global_cd_s * 1000LL) {
+    return 0;
+  }
+  if (pid != 0u && pid_cd_s > 0u && s_last_pid == pid && s_last_pid_ms > 0 &&
+      now - s_last_pid_ms < (int64_t)pid_cd_s * 1000LL) {
+    return 0;
+  }
+  s_global_last_ms = now;
+  s_hour_count++;
+  if (pid != 0u) {
+    s_last_pid = pid;
+    s_last_pid_ms = now;
+  }
+  return 1;
+}
+
+static int auto_pmfe_recommended_enabled(void) {
+  if (env_falsy_cmd("EDR_AUTO_RECOMMENDED_PMFE")) {
+    return 0;
+  }
+  if (env_truthy_cmd("EDR_AUTO_RECOMMENDED_PMFE")) {
+    return 1;
+  }
+  return edr_pmfe_is_running();
+}
+
 int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
   if (!r || !r->detection_context[0] || !ctx_has(r, "\"recommended_forensics\"")) {
     return 0;
   }
-  const char *off = getenv("EDR_AUTO_RECOMMENDED_FORENSICS");
-  if (off && off[0] == '0') {
+  if (env_falsy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
+    return 0;
+  }
+  if (!env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS") && s_bound_cfg && !s_bound_cfg->forensic_auto.enabled) {
     return 0;
   }
   if (!dangerous_enabled()) {
+    return 0;
+  }
+  if (!auto_recommended_rate_allow(r->pid)) {
     return 0;
   }
   EdrSoarCommandMeta sm;
@@ -375,7 +462,7 @@ int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
   sm.issued_at_unix_ms = (int64_t)time(NULL) * 1000LL;
 
   int dispatched = 0;
-  if (r->pid != 0u && ctx_has(r, "pmfe_scan")) {
+  if (r->pid != 0u && ctx_has(r, "pmfe_scan") && auto_pmfe_recommended_enabled()) {
     char id[96];
     char payload[96];
     snprintf(id, sizeof(id), "auto-pmfe-%s", r->event_id[0] ? r->event_id : "event");
@@ -2577,26 +2664,26 @@ static void do_rtr_list_connections(const char *cmd_id, const uint8_t *pl, size_
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
-    audit_both(cmd_id, "reject pmfe_scan: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    audit_both(cmd_id, "reject pmfe_scan: enable EDR_CMD_ENABLED=1 or TOML [command] allow_dangerous=true");
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   long pid = -1;
   if (parse_pid_json(pl, len, &pid) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "pmfe_scan: payload 缺少有效 pid（JSON 需含 \"pid\"）");
+    audit_both(cmd_id, "pmfe_scan: payload missing valid pid (JSON requires \"pid\")");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid json");
     return;
   }
   if (edr_pmfe_submit_server_scan(cmd_id, (uint32_t)pid) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "pmfe_scan: 入队失败（PMFE 未启动或队列满）");
+    audit_both(cmd_id, "pmfe_scan: queue failed (PMFE not running or queue full)");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "pmfe queue full or not running");
     return;
   }
   s_handled++;
   s_exec_ok++;
-  audit_both(cmd_id, "pmfe_scan: 已入队（异步粗扫）");
+  audit_both(cmd_id, "pmfe_scan: queued (async coarse scan)");
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued", "queued", NULL);
 }
 

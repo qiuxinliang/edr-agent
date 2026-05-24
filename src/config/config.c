@@ -1533,6 +1533,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->fl.frozen_layer_count_behavior = 0;
 
   cfg->command.allow_dangerous = false;
+  cfg->forensic_auto.enabled = false;
+  cfg->forensic_auto.cooldown_s = 30u;
+  cfg->forensic_auto.per_pid_cooldown_s = 300u;
+  cfg->forensic_auto.max_per_hour = 20u;
+  cfg->forensic_auto.trigger_on_p0 = true;
+  cfg->forensic_auto.collect_process_tree = true;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
 
@@ -1564,6 +1570,45 @@ static void load_command(toml_table_t *t, EdrConfig *cfg) {
   toml_datum_t d = toml_bool_in(t, "allow_dangerous");
   if (d.ok) {
     cfg->command.allow_dangerous = d.u.b ? true : false;
+  }
+}
+
+static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->forensic_auto.enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "cooldown_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 3600) {
+      cfg->forensic_auto.cooldown_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "per_pid_cooldown_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 86400) {
+      cfg->forensic_auto.per_pid_cooldown_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "max_per_hour");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 10000) {
+      cfg->forensic_auto.max_per_hour = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "trigger_on_p0");
+    if (d.ok) {
+      cfg->forensic_auto.trigger_on_p0 = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "collect_process_tree");
+    if (d.ok) {
+      cfg->forensic_auto.collect_process_tree = d.u.b ? true : false;
+    }
   }
 }
 
@@ -1995,6 +2040,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "command");
     if (t) {
       load_command(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "forensic_auto");
+    if (t) {
+      load_forensic_auto(t, cfg);
     }
   }
   {

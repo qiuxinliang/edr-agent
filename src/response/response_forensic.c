@@ -159,26 +159,26 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
 void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
     edr_cmd_inc_rejected();
-    edr_command_audit_both(cmd_id, "reject pmfe_scan: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    edr_command_audit_both(cmd_id, "reject pmfe_scan: enable EDR_CMD_ENABLED=1 or TOML [command] allow_dangerous=true");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
   long pid = -1;
   if (edr_command_parse_pid_json(pl, len, &pid) != 0) {
     edr_cmd_inc_exec_fail();
-    edr_command_audit_both(cmd_id, "pmfe_scan: payload 缺少有效 pid（JSON 需含 \"pid\"）");
+    edr_command_audit_both(cmd_id, "pmfe_scan: payload missing valid pid (JSON requires \"pid\")");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid json");
     return;
   }
   if (edr_pmfe_submit_server_scan(cmd_id, (uint32_t)pid) != 0) {
     edr_cmd_inc_exec_fail();
-    edr_command_audit_both(cmd_id, "pmfe_scan: 入队失败（PMFE 未启动或队列满）");
+    edr_command_audit_both(cmd_id, "pmfe_scan: queue failed (PMFE not running or queue full)");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "pmfe queue full or not running");
     return;
   }
   edr_cmd_inc_handled();
   edr_cmd_inc_exec_ok();
-  edr_command_audit_both(cmd_id, "pmfe_scan: 已入队（异步粗扫）");
+  edr_command_audit_both(cmd_id, "pmfe_scan: queued (async coarse scan)");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued");
 }
 

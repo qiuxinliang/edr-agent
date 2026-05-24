@@ -2096,6 +2096,14 @@ void edr_pmfe_shutdown(void) {
   edr_pid_history_pmfe_shutdown();
 }
 
+int edr_pmfe_is_running(void) {
+#ifdef _WIN32
+  return pmfe_atomic_load_long(&s_inited) ? 1 : 0;
+#else
+  return __atomic_load_n(&s_inited, __ATOMIC_ACQUIRE) ? 1 : 0;
+#endif
+}
+
 static uint64_t pmfe_now_ms(void) {
 #ifdef _WIN32
   return (uint64_t)GetTickCount64();
