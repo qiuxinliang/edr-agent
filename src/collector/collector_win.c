@@ -369,10 +369,12 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   prop->LogFileMode =
       EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
 
-  ULONG status = StartTrace(&s_session_handle, NULL, prop);
+  ULONG status = StartTraceW(&s_session_handle, g_session_name, prop);
   HeapFree(GetProcessHeap(), 0, prop);
 
   if (status != ERROR_SUCCESS) {
+    fprintf(stderr, "[collector_win] StartTraceW failed session=EDR_Agent_RT_001 status=%lu\n",
+            (unsigned long)status);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_ETW_SESSION_CREATE;
@@ -380,6 +382,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 
   status = edr_enable_providers(s_session_handle, cfg);
   if (status != ERROR_SUCCESS) {
+    fprintf(stderr, "[collector_win] EnableTraceEx2 failed session=EDR_Agent_RT_001 status=%lu\n",
+            (unsigned long)status);
     EVENT_TRACE_PROPERTIES stop = {0};
     stop.Wnode.BufferSize = sizeof(stop);
     ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
