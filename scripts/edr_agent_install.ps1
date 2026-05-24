@@ -99,6 +99,16 @@ function Escape-Toml([string]$s) {
   return $s.Replace('\', '\\').Replace('"', '\"')
 }
 
+function Write-PemNoBom([string]$Path, [string]$Text) {
+  if (-not $Text) { return }
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path $dir)) {
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  }
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text, $utf8NoBom)
+}
+
 function Merge-EnrollIntoAgentTomlExample {
   param(
     [Parameter(Mandatory = $true)][string]$ExamplePath,
@@ -233,6 +243,15 @@ if (-not $MinimalTomlOnly -and (Test-Path -LiteralPath $examplePath)) {
 if ($DryRun) {
   Write-Output $toml
   exit 0
+}
+
+if ($d.ca_cert -or $d.client_cert -or $d.client_key) {
+  if (-not ($d.ca_cert -and $d.client_cert -and $d.client_key)) {
+    Write-Error "enroll response returned an incomplete mTLS bundle"
+  }
+  Write-PemNoBom -Path $CaCertPath -Text $d.ca_cert
+  Write-PemNoBom -Path $ClientCertPath -Text $d.client_cert
+  Write-PemNoBom -Path $ClientKeyPath -Text $d.client_key
 }
 
 $dir = Split-Path -Parent $Output
