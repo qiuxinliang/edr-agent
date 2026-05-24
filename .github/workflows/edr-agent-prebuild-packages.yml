@@ -1,10 +1,16 @@
-# 手动触发：编译全部 vcpkg 依赖 → 归档为 .7z → 发布到 GitHub Release 作为预编译包。
+# 手动触发：编译 vcpkg 依赖 → 归档为 .7z → 发布到 GitHub Release 作为预编译包。
 # 后续 CI build/release workflow 在缓存未命中时会从 GitHub Release 下载预编译包，跳过源码编译。
 
 name: Build Pre-built vcpkg Packages
 
 on:
   workflow_dispatch:
+    inputs:
+      full_features:
+        description: "Prebuild gRPC + YARA full dependency set (slow)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,7 +44,13 @@ jobs:
           Write-Host "Short hash: $short"
           "VCPKG_JSON_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKG_JSON_SHORT=$short" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "PREBUILD_RELEASE_TAG=prebuild-x64-windows-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            "PREBUILD_PROFILE=full" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "PREBUILD_RELEASE_TAG=prebuild-x64-windows-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "PREBUILD_PROFILE=fast" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "PREBUILD_RELEASE_TAG=prebuild-fast-x64-windows-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
 
       - name: Prepare cache directories
         shell: pwsh
@@ -67,8 +79,12 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          Write-Host "[Prebuild] Installing vcpkg packages from source..."
-          & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara --keep-going
+          Write-Host "[Prebuild] Installing vcpkg packages from source (profile=$env:PREBUILD_PROFILE)..."
+          if ($env:PREBUILD_PROFILE -eq "full") {
+            & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara --keep-going
+          } else {
+            & $tc install --x-feature=sqlite --keep-going
+          }
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
           Write-Host "[Prebuild] vcpkg install completed successfully"
 
@@ -101,14 +117,16 @@ jobs:
           }
           # Recreate
           $now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss UTC')
+          $packages = if ($env:PREBUILD_PROFILE -eq "full") { "curl, grpc, protobuf, openssl, yara, pcre2, sqlite3" } else { "curl, sqlite3" }
           $notes = @"
           vcpkg.json SHA256: $env:VCPKG_JSON_SHA256
           Platform: x64-windows
+          Profile: $env:PREBUILD_PROFILE
           Created: $now
-          Packages: curl, grpc, protobuf, openssl, yara, pcre2, sqlite3
+          Packages: $packages
           "@
           gh release create $tag $archive `
-            --title "Pre-built vcpkg packages (x64-windows)" `
+            --title "Pre-built vcpkg packages (x64-windows, $env:PREBUILD_PROFILE)" `
             --notes $notes
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           Write-Host "Release created: $tag"
@@ -117,9 +135,15 @@ jobs:
       - name: Update manifest.json
         shell: pwsh
         run: |
+          $packages = if ($env:PREBUILD_PROFILE -eq "full") {
+            @("curl", "grpc", "protobuf", "openssl", "yara", "pcre2", "sqlite3")
+          } else {
+            @("curl", "sqlite3")
+          }
           $manifest = @{
             platform = "x64-windows"
-            packages = @("curl", "grpc", "protobuf", "openssl", "yara", "pcre2", "sqlite3")
+            profile = $env:PREBUILD_PROFILE
+            packages = $packages
             latest_prebuild = @{
               vcpkg_json_sha256 = $env:VCPKG_JSON_SHA256
               release_tag = $env:PREBUILD_RELEASE_TAG

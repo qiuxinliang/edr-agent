@@ -1421,12 +1421,22 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->upload.batch_timeout_s = 5;
   cfg->upload.max_upload_mbps = 1u;
 
+#ifdef _WIN32
+  snprintf(cfg->offline.queue_db_path, sizeof(cfg->offline.queue_db_path), "%s",
+           "C:\\ProgramData\\EDR Agent\\queue\\edr_queue.db");
+#else
   snprintf(cfg->offline.queue_db_path, sizeof(cfg->offline.queue_db_path), "%s",
            "edr_queue.db");
+#endif
   cfg->offline.max_queue_size_mb = 512u;
   cfg->offline.retention_hours = 72u;
+#ifdef _WIN32
+  snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
+           "C:\\ProgramData\\EDR Agent\\evidence\\local_evidence_cache.db");
+#else
   snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
            "local_evidence_cache.db");
+#endif
   cfg->offline.evidence_cache_max_size_mb = 128u;
   cfg->offline.evidence_cache_retention_hours = 24u;
 
@@ -1440,7 +1450,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
 
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
+#ifdef _WIN32
+  snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s",
+           "C:\\ProgramData\\EDR Agent\\logs");
+#else
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s", "/var/log/edr");
+#endif
   cfg->logging.max_log_size_mb = 100u;
   cfg->logging.max_log_files = 10u;
 

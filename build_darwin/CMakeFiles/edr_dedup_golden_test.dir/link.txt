@@ -1,1 +1,0 @@
-/usr/bin/cc -g -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup_golden_test.c.o CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/dedup.c.o CMakeFiles/edr_dedup_golden_test.dir/src/preprocess/emit_rules.c.o -o edr_dedup_golden_test

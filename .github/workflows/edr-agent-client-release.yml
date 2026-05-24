@@ -1,5 +1,6 @@
-# 独立 edr-agent 仓库：工作目录 = 本仓库根。**仅一条**发版编线：`win_*` tag → **vcpkg(curl/grpc) + ONNX** → `edr-agent-<tag>-windows-amd64-exe.zip`。
-# **-*-grpc-exe.zip** 第二枚已暂停；monorepo 请用仓库根同名 workflow。
+# 独立 edr-agent 仓库：工作目录 = 本仓库根。母库默认发布快速 Windows Agent：
+# `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → `edr-agent-<tag>-windows-amd64-exe.zip`。
+# gRPC/全量依赖长链移至 edr-agent-build-grpc-ort.yml，避免 release 默认编译 grpc/protobuf。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
 
@@ -26,7 +27,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (edr_agent.exe + runtime DLLs, vcpkg+ONNX)
+    name: Build Windows (edr_agent.exe + runtime DLLs, fast no-gRPC)
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
     runs-on: windows-latest
     timeout-minutes: 360
@@ -92,9 +93,9 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: vcpkg-x64-win-release-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-build-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+            vcpkg-x64-win-release-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
 
       - name: Cache ONNX Runtime
         uses: actions/cache@v5
@@ -106,9 +107,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build
-          key: build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
+          key: build-x64-win-release-fast-nogrpc-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
           restore-keys: |
-            build-x64-win-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v2
+            build-x64-win-release-fast-nogrpc-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
@@ -120,7 +121,7 @@ jobs:
             return
           }
           $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
-          $release_tag = "prebuild-x64-windows-$hash"
+          $release_tag = "prebuild-fast-x64-windows-$hash"
           $archive = "vcpkg-installed-x64-windows.7z"
           $url = "https://github.com/${{ github.repository }}/releases/download/$release_tag/$archive"
           Write-Host "[pre-build-packages] Cache miss, trying pre-built: $url"
@@ -184,33 +185,9 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara
+          Write-Host "[vcpkg] release fast path: curl + sqlite only (no grpc/protobuf/yara)"
+          & $tc install --x-feature=sqlite
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Regenerate gRPC proto stubs
-        shell: pwsh
-        run: |
-          $protoc_exe = Join-Path $env:VCPKG_INSTALLED_X64 "tools\protobuf\protoc.exe"
-          if (-not (Test-Path $protoc_exe)) {
-            Write-Host "[skip] protoc not found at $protoc_exe"
-            return
-          }
-          $grpc_plugin = Join-Path $env:VCPKG_INSTALLED_X64 "tools\grpc\grpc_cpp_plugin.exe"
-          if (-not (Test-Path $grpc_plugin)) {
-            Write-Host "[skip] grpc_cpp_plugin not found at $grpc_plugin"
-            return
-          }
-          # protoc needs vcpkg runtime DLLs (e.g. zlib.dll) on PATH
-          $env:PATH = "$env:VCPKG_INSTALLED_X64\bin;$env:PATH"
-          $out_dir = "src/grpc_gen/edr/v1"
-          New-Item -ItemType Directory -Force -Path $out_dir | Out-Null
-          Write-Host "Regenerating gRPC stubs ..."
-          & $protoc_exe -I proto --cpp_out=src/grpc_gen --grpc_out=src/grpc_gen --plugin=protoc-gen-grpc=$grpc_plugin proto/edr/v1/ingest.proto
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::protoc failed with exit code $LASTEXITCODE"
-            throw "protoc failed"
-          }
-          Write-Host "gRPC stubs regenerated OK"
 
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
@@ -243,7 +220,7 @@ jobs:
           }
           "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Configure (Ninja, Release, ONNX, sccache)
+      - name: Configure (Ninja, Release, ONNX, no-gRPC, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -254,8 +231,9 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DEDR_WITH_GRPC=ON `
+            -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_ONNXRUNTIME=ON `
+            -DEDR_WITH_YARA=OFF `
             -DEDR_ENABLE_IPO=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
@@ -304,10 +282,17 @@ jobs:
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
-          if (-not (Test-Path "build\Release\edr_agent.exe")) { throw "missing build\Release\edr_agent.exe" }
+          $outDir = $null
+          foreach ($c in @("build\Release", "build")) {
+            if (Test-Path (Join-Path $c "edr_agent.exe")) {
+              $outDir = $c
+              break
+            }
+          }
+          if (-not $outDir) { throw "missing edr_agent.exe under build\Release or build" }
           $items = New-Object System.Collections.Generic.List[string]
-          $null = $items.Add("build\Release\edr_agent.exe")
-          Get-ChildItem "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
+          Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
             "scripts\windows_service_install.ps1",
@@ -356,7 +341,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64, vcpkg+ONNX)
+          name: edr-agent ${{ github.ref_name }} (Windows amd64, fast no-gRPC + ONNX)
           generate_release_notes: true
           files: dist/*.zip
           fail_on_unmatched_files: true

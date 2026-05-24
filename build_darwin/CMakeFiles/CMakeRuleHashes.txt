@@ -1,2 +1,0 @@
-# Hashes of file build rules.
-3839988b1adaa0a79f4b798db2fa4cb0 edr_p0_rule_ir_embed.c

@@ -52,6 +52,51 @@ static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
   }
   return FALSE;
 }
+
+static int edr_path_is_absolute_win(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+    return path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+  }
+  return (path[0] == '\\' && path[1] == '\\');
+}
+
+static void edr_ensure_parent_dirs_win(const char *path) {
+  char tmp[MAX_PATH * 4];
+  size_t n = 0;
+  if (!path || !path[0]) {
+    return;
+  }
+  n = strlen(path);
+  if (n == 0 || n >= sizeof(tmp)) {
+    return;
+  }
+  memcpy(tmp, path, n + 1u);
+  for (size_t i = 0; tmp[i]; i++) {
+    if (tmp[i] == '/') {
+      tmp[i] = '\\';
+    }
+  }
+  char *last = strrchr(tmp, '\\');
+  if (!last) {
+    return;
+  }
+  *last = '\0';
+  for (char *p = tmp; *p; p++) {
+    if (*p != '\\') {
+      continue;
+    }
+    if (p == tmp || (p > tmp && p[-1] == ':') || (p > tmp && p[-1] == '\\')) {
+      continue;
+    }
+    *p = '\0';
+    (void)CreateDirectoryA(tmp, NULL);
+    *p = '\\';
+  }
+  (void)CreateDirectoryA(tmp, NULL);
+}
 #endif
 
 static void print_usage(const char *argv0) {
@@ -92,9 +137,29 @@ static int edr_agent_run_main(const char *config) {
     if ((!qpath || !qpath[0]) && ac && ac->offline.queue_db_path[0]) {
       qpath = ac->offline.queue_db_path;
     }
+#ifdef _WIN32
+    edr_ensure_parent_dirs_win(qpath);
+#endif
     EdrError sq = edr_storage_queue_open(qpath);
     if (sq != EDR_OK && qpath && qpath[0]) {
+#ifdef _WIN32
+      if (!edr_path_is_absolute_win(qpath)) {
+        char fallback[MAX_PATH * 4];
+        const char *pd = getenv("ProgramData");
+        snprintf(fallback, sizeof(fallback), "%s\\EDR Agent\\queue\\edr_queue.db",
+                 (pd && pd[0]) ? pd : "C:\\ProgramData");
+        edr_ensure_parent_dirs_win(fallback);
+        sq = edr_storage_queue_open(fallback);
+        if (sq == EDR_OK) {
+          fprintf(stderr, "队列使用 ProgramData 路径 (%s)\n", fallback);
+        } else {
+          fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
+        }
+      } else
+#endif
+      {
       fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
+      }
     }
   }
   {
@@ -103,10 +168,31 @@ static int edr_agent_run_main(const char *config) {
     if ((!epath || !epath[0]) && ac && ac->offline.evidence_cache_path[0]) {
       epath = ac->offline.evidence_cache_path;
     }
+#ifdef _WIN32
+    edr_ensure_parent_dirs_win(epath);
+#endif
     if (edr_local_evidence_cache_open(epath,
                                       ac ? ac->offline.evidence_cache_max_size_mb : 128u,
                                       ac ? ac->offline.evidence_cache_retention_hours : 24u) != 0) {
+#ifdef _WIN32
+      if (epath && epath[0] && !edr_path_is_absolute_win(epath)) {
+        char fallback[MAX_PATH * 4];
+        const char *pd = getenv("ProgramData");
+        snprintf(fallback, sizeof(fallback), "%s\\EDR Agent\\evidence\\local_evidence_cache.db",
+                 (pd && pd[0]) ? pd : "C:\\ProgramData");
+        edr_ensure_parent_dirs_win(fallback);
+        if (edr_local_evidence_cache_open(fallback,
+                                          ac ? ac->offline.evidence_cache_max_size_mb : 128u,
+                                          ac ? ac->offline.evidence_cache_retention_hours : 24u) == 0) {
+          fprintf(stderr, "local_evidence_cache 使用 ProgramData 路径 (%s)\n", fallback);
+        } else {
+          fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
+        }
+      } else
+#endif
+      {
       fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
+      }
     }
   }
   edr_command_bind_config(edr_agent_get_config(agent));

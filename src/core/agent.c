@@ -202,11 +202,13 @@ EdrError edr_agent_run(EdrAgent *agent) {
     uint64_t last_reload_ns = 0;
     uint64_t last_remote_ns = 0;
     uint64_t last_health_ns = 0;
+    int collector_started = 0;
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
       if (e != EDR_OK) {
-        edr_preprocess_stop();
-        return e;
+        fprintf(stderr, "[collector] start failed: %d; continuing in degraded mode\n", (int)e);
+      } else {
+        collector_started = 1;
       }
       if (agent->cfg.attack_surface.enabled && agent->cfg.agent.endpoint_id[0] &&
           strcmp(agent->cfg.agent.endpoint_id, "auto") != 0) {
@@ -233,7 +235,9 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_poll_engine_health(agent, &last_health_ns);
         edr_command_poll_reliable_delivery();
       }
-      edr_collector_stop();
+      if (collector_started) {
+        edr_collector_stop();
+      }
     }
   }
   edr_preprocess_stop();

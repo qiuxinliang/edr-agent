@@ -1,7 +1,0 @@
-detection_profile_trigger 18 0.000102972
-edr_agent_help 17 0.218347
-edr_p0_golden 17 0.000238194
-test_event_bus_mpmc_stress 17 0.0148489
-edr_p0_ir_record_golden 17 0.000319404
-forensic_trigger 17 0.000107765
----
