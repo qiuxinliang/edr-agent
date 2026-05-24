@@ -32,7 +32,7 @@
 |----|------|-------------|----------|------|
 | **P0-1** | static 输入语义 | 训练侧为 `[B,512]` 特征 vs 端上可能存在大维 `features` / legacy 字节填充并存 | **已做**：`AVE_ONNX_CONTRACT.md` §1 **P0 门禁**表（Lite512 vs Legacy 字节填充、环境变量 `EDR_AVE_STATIC_LEGACY512`）；`STATIC_ONNX_SPEC_GAP` 已同步 | 文档与 `edr_onnx_infer_file` 分支一致 |
 | **P0-2** | 三输出在 C 侧落地 | 扫描结果需可观测 family/packer | **已做**：`edr_onnx_infer_file` 三输出 + **`apply_infer_verdict`**（`family_name` Top-1、`is_packed`）；差距文档已更新 | 三输出 ONNX + 扫描路径可见上述字段 |
-| **P0-3** | Windows 默认 `model_dir` | 默认仍为 Unix 风格路径，易误用 | **已做**：`config.c` 在 **`#ifdef _WIN32`** 下默认 **`<edr_agent.exe 同目录>\\models`**（`GetModuleFileNameW`）；从示例复制的 **`/opt/edr/models`** 在加载后自动改写；若解析失败则回退 **`C:\\ProgramData\\EDR Agent\\models`**（与 Inno **`%ProgramFiles%\\EDR Agent`** 命名一致） | 无 `[ave]` 或示例 Unix 路径时 Win 与安装目录一致 |
+| **P0-3** | Windows 默认 `model_dir` | 默认仍为 Unix 风格路径，易误用 | **已做**：Windows 默认固定为 **`C:\\Program Files\\EDR Agent\\models`**，与生产配置、安装脚本和服务脚本一致。 | 无 `[ave]` 或示例 Unix 路径时 Win 与安装目录一致 |
 
 ### P1 — 测试与 CI（**已关闭**）
 

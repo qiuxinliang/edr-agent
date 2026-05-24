@@ -6,7 +6,7 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -Action Install `
     -ExePath "C:\Program Files\EDR Agent\edr_agent.exe" `
-    -ConfigPath "C:\ProgramData\EDR Agent\agent.toml" -EnableResponseActions
+    -ConfigPath "C:\Program Files\EDR Agent\agent.toml" -EnableResponseActions
 #>
 param(
   [ValidateSet("Install", "Uninstall", "Start", "Stop", "Status")]
@@ -14,9 +14,9 @@ param(
   [string]$ServiceName = "EdrAgent",
   [string]$DisplayName = "EDR Agent",
   [string]$ExePath = "C:\Program Files\EDR Agent\edr_agent.exe",
-  [string]$ConfigPath = "C:\ProgramData\EDR Agent\agent.toml",
+  [string]$ConfigPath = "C:\Program Files\EDR Agent\agent.toml",
   [string]$InstallDir = "C:\Program Files\EDR Agent",
-  [string]$DataDir = "C:\ProgramData\EDR Agent",
+  [string]$DataDir = "C:\Program Files\EDR Agent",
   [string]$Account = "LocalSystem",
   [switch]$EnableResponseActions
 )

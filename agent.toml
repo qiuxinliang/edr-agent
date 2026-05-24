@@ -1,9 +1,9 @@
 [server]
 address              = "192.168.1.10:50051"
 grpc_insecure        = false
-ca_cert              = ""
-client_cert          = ""
-client_key           = ""
+ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
+client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
 connect_timeout_s    = 10
 keepalive_interval_s = 30
 
@@ -34,9 +34,12 @@ high_risk_immediate_ports = [23, 445, 3389, 6379, 27017, 1433, 3306]
 firewall_rule_detail_max = 500
 
 [offline]
-queue_db_path        = "edr_queue.db"
+queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
 max_queue_size_mb    = 128
 retention_hours      = 72
+evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db"
+evidence_cache_max_size_mb = 128
+evidence_cache_retention_hours = 72
 
 [resource_limit]
 profile              = "workstation"
@@ -76,7 +79,7 @@ block = [
 
 [logging]
 level                = "debug"
-log_dir              = "."
+log_dir              = "C:\\Program Files\\EDR Agent\\logs"
 max_log_size_mb      = 50
 max_log_files        = 5
 

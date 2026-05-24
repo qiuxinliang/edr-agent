@@ -997,14 +997,7 @@ static void quarantine_base_dir(char *out, size_t cap) {
     return;
   }
 #ifdef _WIN32
-  const char *pd = getenv("ProgramData");
-  if (!pd || !pd[0]) {
-    pd = getenv("TEMP");
-  }
-  if (!pd || !pd[0]) {
-    pd = ".";
-  }
-  snprintf(out, cap, "%s\\EDR\\quarantine", pd);
+  snprintf(out, cap, "%s", "C:\\Program Files\\EDR Agent\\quarantine");
 #else
   snprintf(out, cap, "%s", "/tmp/edr_quarantine");
 #endif
@@ -2230,14 +2223,7 @@ static void upload_outbox_dir(char *out, size_t cap) {
     return;
   }
 #ifdef _WIN32
-  e = getenv("ProgramData");
-  if (!e || !e[0]) {
-    e = getenv("TEMP");
-  }
-  if (!e || !e[0]) {
-    e = ".";
-  }
-  snprintf(out, cap, "%s\\EDR\\upload_outbox", e);
+  snprintf(out, cap, "%s", "C:\\Program Files\\EDR Agent\\upload_outbox");
 #else
   snprintf(out, cap, "%s", "/tmp/edr_upload_outbox");
 #endif

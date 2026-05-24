@@ -36,14 +36,7 @@ static void state_default_path(char *out, size_t cap) {
     return;
   }
 #ifdef _WIN32
-  p = getenv("ProgramData");
-  if (!p || !p[0]) {
-    p = getenv("TEMP");
-  }
-  if (!p || !p[0]) {
-    p = ".";
-  }
-  snprintf(out, cap, "%s\\EDR\\command_state.jsonl", p);
+  snprintf(out, cap, "%s", "C:\\Program Files\\EDR Agent\\state\\command_state.jsonl");
 #else
   snprintf(out, cap, "%s", "/tmp/edr_command_state.jsonl");
 #endif

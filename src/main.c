@@ -43,6 +43,16 @@ static SERVICE_STATUS_HANDLE g_service_status_handle;
 static SERVICE_STATUS g_service_status;
 static const char *g_service_name = "EdrAgent";
 static const char *g_service_config_path;
+
+static const char *edr_default_windows_config_path(void) {
+  static const char path[] = "C:\\Program Files\\EDR Agent\\agent.toml";
+  DWORD attrs = GetFileAttributesA(path);
+  if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    return NULL;
+  }
+  return path;
+}
+
 static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
   if (t == CTRL_C_EVENT || t == CTRL_CLOSE_EVENT || t == CTRL_BREAK_EVENT) {
     if (g_agent_for_ctrl) {
@@ -145,20 +155,19 @@ static int edr_agent_run_main(const char *config) {
 #ifdef _WIN32
       if (!edr_path_is_absolute_win(qpath)) {
         char fallback[MAX_PATH * 4];
-        const char *pd = getenv("ProgramData");
-        snprintf(fallback, sizeof(fallback), "%s\\EDR Agent\\queue\\edr_queue.db",
-                 (pd && pd[0]) ? pd : "C:\\ProgramData");
+        snprintf(fallback, sizeof(fallback), "%s",
+                 "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db");
         edr_ensure_parent_dirs_win(fallback);
         sq = edr_storage_queue_open(fallback);
         if (sq == EDR_OK) {
-          fprintf(stderr, "队列使用 ProgramData 路径 (%s)\n", fallback);
+          fprintf(stderr, "队列使用安装目录路径 (%s)\n", fallback);
         } else {
           fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
         }
       } else
 #endif
       {
-      fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
+        fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
       }
     }
   }
@@ -177,21 +186,20 @@ static int edr_agent_run_main(const char *config) {
 #ifdef _WIN32
       if (epath && epath[0] && !edr_path_is_absolute_win(epath)) {
         char fallback[MAX_PATH * 4];
-        const char *pd = getenv("ProgramData");
-        snprintf(fallback, sizeof(fallback), "%s\\EDR Agent\\evidence\\local_evidence_cache.db",
-                 (pd && pd[0]) ? pd : "C:\\ProgramData");
+        snprintf(fallback, sizeof(fallback), "%s",
+                 "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db");
         edr_ensure_parent_dirs_win(fallback);
         if (edr_local_evidence_cache_open(fallback,
                                           ac ? ac->offline.evidence_cache_max_size_mb : 128u,
                                           ac ? ac->offline.evidence_cache_retention_hours : 24u) == 0) {
-          fprintf(stderr, "local_evidence_cache 使用 ProgramData 路径 (%s)\n", fallback);
+          fprintf(stderr, "local_evidence_cache 使用安装目录路径 (%s)\n", fallback);
         } else {
           fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
         }
       } else
 #endif
       {
-      fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
+        fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
       }
     }
   }
@@ -350,6 +358,9 @@ int main(int argc, char **argv) {
   }
 
 #ifdef _WIN32
+  if (!config) {
+    config = edr_default_windows_config_path();
+  }
   if (run_as_service) {
     SERVICE_TABLE_ENTRYA table[] = {
         {(LPSTR)g_service_name, edr_service_main},

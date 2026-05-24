@@ -1,12 +1,12 @@
 # Windows production profile.
-# Copy to C:\ProgramData\EDR Agent\agent.toml, then enroll/replace server and agent values.
+# Copy to C:\Program Files\EDR Agent\agent.toml, then enroll/replace server and agent values.
 
 [server]
 address              = "edr.example.com:50051"
 grpc_insecure        = false
-ca_cert              = "C:\\ProgramData\\EDR Agent\\certs\\ca.pem"
-client_cert          = "C:\\ProgramData\\EDR Agent\\certs\\client.pem"
-client_key           = "C:\\ProgramData\\EDR Agent\\certs\\client-key.pem"
+ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
+client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
 connect_timeout_s    = 10
 keepalive_interval_s = 30
 
@@ -36,7 +36,7 @@ sampling_rate_whitelist = 0.03
 rules_version        = "edr-dynamic-rules-v1"
 
 [ave]
-model_dir            = "C:\\ProgramData\\EDR Agent\\models"
+model_dir            = "C:\\Program Files\\EDR Agent\\models"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
@@ -49,10 +49,10 @@ batch_timeout_s      = 2
 max_upload_mbps      = 4
 
 [offline]
-queue_db_path        = "C:\\ProgramData\\EDR Agent\\queue\\edr_queue.db"
+queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
 max_queue_size_mb    = 512
 retention_hours      = 72
-evidence_cache_path  = "C:\\ProgramData\\EDR Agent\\evidence\\evidence_cache.db"
+evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\evidence_cache.db"
 evidence_cache_max_size_mb = 512
 evidence_cache_retention_hours = 72
 
@@ -63,7 +63,7 @@ emergency_cpu_limit  = 25
 
 [logging]
 level                = "info"
-log_dir              = "C:\\ProgramData\\EDR Agent\\logs"
+log_dir              = "C:\\Program Files\\EDR Agent\\logs"
 max_log_size_mb      = 50
 max_log_files        = 5
 

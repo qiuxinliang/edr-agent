@@ -13,9 +13,9 @@ address              = "127.0.0.1:50051"
 # Plaintext gRPC to local `edr-api` Ingest (same as EDR_GRPC_INSECURE=1); use false in production w/ mTLS
 # 与 EDR_GRPC_INSECURE=1 等效；仅明文联调。也可写 1/0
 grpc_insecure        = false
-ca_cert              = ""
-client_cert          = ""
-client_key           = ""
+ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
+client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
 connect_timeout_s    = 10
 keepalive_interval_s = 30
 
@@ -140,9 +140,8 @@ management_tools = "anydesk,teamviewer,rustdesk,screenconnect,connectwise,splash
 # 将 model_dir 设为该目录的绝对路径即可，例如（按本机路径与 release 名修改）：
 #   macOS/Linux:  /…/AI Agent/model/releases/20260418_053704_UTC
 #   Windows:      C:/…/AI Agent/model/releases/20260418_053704_UTC
-# Linux/macOS 常用示例路径。Windows：若保留本行 Unix 路径，Agent 会自动改为「与 edr_agent.exe 同目录下的 models」；
-# 也可显式写绝对路径（如独立数据盘）。内置默认在 Windows 上亦为 exe 同目录\models。
-model_dir            = "/opt/edr/models"
+# Windows 默认发布布局：所有运行时数据与模型均放在安装目录下。
+model_dir            = "C:\\Program Files\\EDR Agent\\models"
 scan_threads         = 2
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
@@ -174,9 +173,12 @@ max_upload_mbps      = 1
 
 # 须与 EDR_PERSIST_STRATEGY / EDR_PERSIST_QUEUE / EDR_QUEUE_* 一起理解，见 docs/WP7_OFFLINE_QUEUE_RETRY.md
 [offline]
-queue_db_path        = "edr_queue.db"
+queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
 max_queue_size_mb    = 512
 retention_hours      = 72
+evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db"
+evidence_cache_max_size_mb = 128
+evidence_cache_retention_hours = 72
 
 [resource_limit]
 profile              = "workstation"
@@ -191,7 +193,7 @@ low_priority_keep_percent_under_pressure = 5
 
 [logging]
 level                = "info"
-log_dir              = "/var/log/edr"
+log_dir              = "C:\\Program Files\\EDR Agent\\logs"
 max_log_size_mb      = 100
 max_log_files        = 10
 

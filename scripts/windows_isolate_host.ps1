@@ -11,7 +11,7 @@
   Environment:
     EDR_CMD_ID                         command id written by the agent
     EDR_ISOLATE_RULE_PREFIX            default: EDR-Isolate
-    EDR_ISOLATE_STATE_PATH             default: C:\ProgramData\EDR Agent\isolation\state.json
+    EDR_ISOLATE_STATE_PATH             default: C:\Program Files\EDR Agent\isolation\state.json
     EDR_ISOLATE_ALLOW_REMOTE_ADDRS     comma-separated IP/CIDR list
     EDR_ISOLATE_ALLOW_REMOTE_PORTS     comma-separated ports, default 443,50051
     EDR_ISOLATE_DRY_RUN=1              print actions only
@@ -27,7 +27,7 @@ $Prefix = if ($env:EDR_ISOLATE_RULE_PREFIX) { $env:EDR_ISOLATE_RULE_PREFIX } els
 $StatePath = if ($env:EDR_ISOLATE_STATE_PATH) {
   $env:EDR_ISOLATE_STATE_PATH
 } else {
-  "C:\ProgramData\EDR Agent\isolation\state.json"
+  "C:\Program Files\EDR Agent\isolation\state.json"
 }
 $DryRun = $env:EDR_ISOLATE_DRY_RUN -eq "1"
 

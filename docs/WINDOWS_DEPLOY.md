@@ -60,7 +60,7 @@ Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows
 ```powershell
 $env:EDR_API_BASE="https://edr.example.com"
 $env:EDR_ENROLL_TOKEN="..."
-.\scripts\edr_agent_install.ps1 -Output "C:\ProgramData\EDR Agent\agent.toml"
+.\scripts\edr_agent_install.ps1 -Output "C:\Program Files\EDR Agent\agent.toml"
 ```
 
 3. 安装并启动服务：
@@ -68,7 +68,7 @@ $env:EDR_ENROLL_TOKEN="..."
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -Action Install `
   -ExePath "C:\Program Files\EDR Agent\edr_agent.exe" `
-  -ConfigPath "C:\ProgramData\EDR Agent\agent.toml" `
+  -ConfigPath "C:\Program Files\EDR Agent\agent.toml" `
   -EnableResponseActions
 ```
 
@@ -78,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -
 |----|------|
 | **真实 mTLS** | 设置 `EDR_GRPC_REQUIRE_MTLS=1`；缺少 `ca_cert` / `client_cert` / `client_key` 时 gRPC 不启动 |
 | **服务自恢复** | `sc.exe failure` 配置失败重启 |
-| **ACL** | `%ProgramFiles%\EDR Agent` 仅系统/管理员写，普通用户读执行；`%ProgramData%\EDR Agent` 仅服务账户/管理员写 |
+| **ACL** | `%ProgramFiles%\EDR Agent` 仅系统/管理员写；脚本会为服务账户授予队列、日志、取证缓存等运行时子目录写权限 |
 | **自保护** | 生产模板启用 `[self_protect] anti_debug`、`job_object_windows`、watchdog 与事件总线压力告警 |
 | **隔离 hook** | 设置 `EDR_ISOLATE_HOOK` 指向 `windows_isolate_host.ps1 -Action Enable` |
 | **取证上传可靠性** | 设置 `EDR_UPLOAD_FILE_RETRIES=3`；上传失败时保留本地 `bundle.tgz` 并在命令结果中返回路径 |
@@ -108,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -
 
 - **当前 CI / Inno 发布流程**（根目录 **`publish-windows-setup-exe.yml`**、本仓库 **`edr-agent-client-release.yml` Windows job**）：**vcpkg**（`edr-agent/vcpkg.json` → **`grpc`**，`x64-windows-static-md`）+ **`cmake -DEDR_WITH_GRPC=ON -DEDR_WITH_ONNXRUNTIME=ON`**；CI 下载官方 **`onnxruntime-win-x64-1.17.3`** 并设 **`ONNXRUNTIME_ROOT`**，构建后将 **`onnxruntime.dll`**（及若存在的 **`onnxruntime_providers_shared.dll`**）复制到 **`build\Release\`**，由 **`EDRAgentSetup.iss`** 与 **`edr_agent.exe`** 同目录安装。配置好 **`[server]`** 时 **`grpc_ready` 可为 1**；`models` 下有合法 ONNX 且 ORT 加载成功时 **`[heartbeat]`** 中 **`onnx_static_ready` / `onnx_behavior_ready` 可为 1**。
 - **AVE `models` 目录**：发布前运行 **`scripts/sync_onnx_output_to_models.ps1`**（或 `.sh`），将 **`onnx-output/*.onnx`** 复制到 **`models/`** 后打包。本机自编译带 ORT 时，亦需将上述 DLL 放在 **`edr_agent.exe` 同目录**（与 Inno 约定一致）。
-- **路径约定**：**`%ProgramFiles%\EDR Agent`**（Inno 默认安装目录）与 **`%ProgramData%\EDR Agent`**（平台 zip 内 enroll 示例输出、`config.c` 在无法解析 exe 旁路径时 **`model_dir` 回退**）统一使用同一目录名 **「EDR Agent」**，勿再混用裸 **`ProgramData\EDR`** 等旧路径。
+- **路径约定**：Windows 运行时配置、证书、模型、队列、日志、取证缓存、隔离状态与 outbox 均固定在 **`%ProgramFiles%\EDR Agent`**；检测规则/测试样本中出现的 `ProgramData` 仅代表被检测对象路径，勿作为 Agent 自身存储目录。
 - 平台下发的 zip 可能内含 **同一套** `edr_agent_install.ps1`；**服务注册** 可在 **首次运行向导** 或 **单独 GPO 脚本** 中完成。
 - **24h 下载链接、安装包哈希** 等以 **edr-backend** 文档为准。
 

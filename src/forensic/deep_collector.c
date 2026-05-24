@@ -30,10 +30,8 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
   g_detail[0] = '\0';
 
   char collector_path[MAX_PATH];
-  const char *progdata = getenv("ProgramData");
-  if (!progdata) progdata = "C:\\ProgramData";
   snprintf(collector_path, sizeof(collector_path),
-           "%s\\EDR Agent\\collector\\forensic_collector.exe", progdata);
+           "%s", "C:\\Program Files\\EDR Agent\\collector\\forensic_collector.exe");
 
   HANDLE job = CreateJobObject(NULL, NULL);
   if (job) {

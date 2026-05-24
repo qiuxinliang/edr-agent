@@ -9,7 +9,7 @@
     EDR_ENROLL_TOKEN  注册 Token
 
   可选：
-    EDR_OUTPUT              输出路径，Windows 默认 C:\ProgramData\EDR Agent\agent.toml
+    EDR_OUTPUT              输出路径，Windows 默认 C:\Program Files\EDR Agent\agent.toml
     EDR_AGENT_VERSION       默认 0.3.0
     EDR_OVERRIDE_SERVER_ADDR
     EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
@@ -22,11 +22,11 @@
   .\edr_agent_install.ps1
 #>
 param(
-  [string]$Output = $(if ($env:EDR_OUTPUT) { $env:EDR_OUTPUT } else { "C:\ProgramData\EDR Agent\agent.toml" }),
+  [string]$Output = $(if ($env:EDR_OUTPUT) { $env:EDR_OUTPUT } else { "C:\Program Files\EDR Agent\agent.toml" }),
   [string]$Template = $(if ($env:EDR_AGENT_TEMPLATE) { $env:EDR_AGENT_TEMPLATE } else { "" }),
-  [string]$CaCertPath = $(if ($env:EDR_CA_CERT) { $env:EDR_CA_CERT } else { "C:\ProgramData\EDR Agent\certs\ca.pem" }),
-  [string]$ClientCertPath = $(if ($env:EDR_CLIENT_CERT) { $env:EDR_CLIENT_CERT } else { "C:\ProgramData\EDR Agent\certs\client.pem" }),
-  [string]$ClientKeyPath = $(if ($env:EDR_CLIENT_KEY) { $env:EDR_CLIENT_KEY } else { "C:\ProgramData\EDR Agent\certs\client-key.pem" }),
+  [string]$CaCertPath = $(if ($env:EDR_CA_CERT) { $env:EDR_CA_CERT } else { "C:\Program Files\EDR Agent\certs\ca.pem" }),
+  [string]$ClientCertPath = $(if ($env:EDR_CLIENT_CERT) { $env:EDR_CLIENT_CERT } else { "C:\Program Files\EDR Agent\certs\client.pem" }),
+  [string]$ClientKeyPath = $(if ($env:EDR_CLIENT_KEY) { $env:EDR_CLIENT_KEY } else { "C:\Program Files\EDR Agent\certs\client-key.pem" }),
   [switch]$DryRun,
   # 若同目录存在 agent.toml.example，注册成功后合并为「完整 agent.toml」（保留 collection/ave 等默认），仅覆盖 [server]/[agent]/[platform]。
   [switch]$MinimalTomlOnly
@@ -173,7 +173,7 @@ function Merge-EnrollIntoAgentTomlExample {
     $merged += "`n"
   }
   if ($env:OS -match 'Windows') {
-    $logWin = 'C:\ProgramData\EDR Agent\logs'
+    $logWin = 'C:\Program Files\EDR Agent\logs'
     $escLog = (Escape-Toml $logWin)
     $merged = [regex]::Replace(
       $merged,

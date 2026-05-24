@@ -65,7 +65,7 @@
 - **kill 白名单**（可选）：设置 `EDR_CMD_KILL_ALLOWLIST=1234,5678` 后，仅允许终止列表内 PID（仍须先满足高危策略）。
 - **生产签名**：高危指令默认要求 `EDR_COMMAND_SIGNING_KEY` 与 `idempotency_key` 中的 `sigv1` HMAC；仅调试可设 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS=1`。签名 canonical 为 `command_id\ncommand_type\nidempotency\nissued_at_unix_ms\ndeadline_ms\npayload_sha256`。`rtr_shell` 始终强制签名，并要求 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key` 同时存在。
 - **RTR shell 白名单**：`EDR_RTR_SHELL_ALLOWLIST` 为必填本地策略；`EDR_RTR_SHELL_MAX_TIMEOUT_SEC` 默认 `60`、硬上限 `300`；`EDR_RTR_SHELL_BLOCKLIST` 可追加本地禁用关键字。控制操作符（如 `&&`、管道、重定向、换行）默认拒绝。
-- **本地状态库**：默认写入 `%ProgramData%\\EDR\\command_state.jsonl`（Windows）或 `/tmp/edr_command_state.jsonl`；可用 `EDR_COMMAND_STATE_DB` 覆盖。字段包含 `command_id`、`idempotency_key`、`response_status`、`retry_count`、`artifacts`，用于断网、重启、重复下发时的本地去重与追踪。
+- **本地状态库**：默认写入 `C:\\Program Files\\EDR Agent\\state\\command_state.jsonl`（Windows）或 `/tmp/edr_command_state.jsonl`；可用 `EDR_COMMAND_STATE_DB` 覆盖。字段包含 `command_id`、`idempotency_key`、`response_status`、`retry_count`、`artifacts`，用于断网、重启、重复下发时的本地去重与追踪。
 
 ---
 
@@ -113,7 +113,7 @@
 
 调试：设置环境变量 **`EDR_SOAR_REPORT_ALWAYS=1`** 时，对上述字段无要求也会尝试上报（便于联调）。
 
-未连接 gRPC 时，上报 API 失败；不影响本地审计（`EDR_CMD_AUDIT_PATH` 等仍可用）。取证与 artifact 上传失败时，终端写本地 outbox（默认 `%ProgramData%\\EDR\\upload_outbox` 或 `/tmp/edr_upload_outbox`，可用 `EDR_UPLOAD_OUTBOX_DIR` 覆盖），后续收到任意新指令时先尝试补传。
+未连接 gRPC 时，上报 API 失败；不影响本地审计（`EDR_CMD_AUDIT_PATH` 等仍可用）。取证与 artifact 上传失败时，终端写本地 outbox（默认 `C:\\Program Files\\EDR Agent\\upload_outbox` 或 `/tmp/edr_upload_outbox`，可用 `EDR_UPLOAD_OUTBOX_DIR` 覆盖），后续收到任意新指令时先尝试补传。
 
 ---
 
