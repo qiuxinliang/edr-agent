@@ -194,12 +194,18 @@ static int edr_agent_run_main(const char *config) {
                                           ac ? ac->offline.evidence_cache_retention_hours : 24u) == 0) {
           fprintf(stderr, "[local_evidence_cache] using install-dir path (%s)\n", fallback);
         } else {
-          fprintf(stderr, "[local_evidence_cache] open failed (%s)\n", epath ? epath : "");
+          EdrEvidenceCacheStatus st;
+          edr_local_evidence_cache_get_status(&st);
+          fprintf(stderr, "[local_evidence_cache] open failed (%s): %s\n",
+                  epath ? epath : "", st.last_error[0] ? st.last_error : "unknown");
         }
       } else
 #endif
       {
-        fprintf(stderr, "[local_evidence_cache] open failed (%s)\n", epath ? epath : "");
+        EdrEvidenceCacheStatus st;
+        edr_local_evidence_cache_get_status(&st);
+        fprintf(stderr, "[local_evidence_cache] open failed (%s): %s\n",
+                epath ? epath : "", st.last_error[0] ? st.last_error : "unknown");
       }
     }
   }

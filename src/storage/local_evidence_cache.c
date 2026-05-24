@@ -485,8 +485,14 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
 
 #if defined(EDR_HAVE_SQLITE)
   if (sqlite3_open(s_status.path, &s_db) != SQLITE_OK || !s_db) {
+    char err[160];
+    snprintf(err, sizeof(err), "sqlite open failed: %s",
+             s_db ? sqlite3_errmsg(s_db) : "no sqlite handle");
+    if (s_db) {
+      sqlite3_close(s_db);
+    }
     s_db = NULL;
-    set_error("sqlite open failed");
+    set_error(err);
     return -1;
   }
   s_status.db_open = 1;

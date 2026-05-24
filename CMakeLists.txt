@@ -114,16 +114,22 @@ option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAK
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 
 find_package(OpenSSL QUIET)
-set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT OFF)
+if(OpenSSL_FOUND)
+  set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT ON)
+else()
+  set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT OFF)
+endif()
 # no-gRPC Windows production builds still use REST ingest/health over HTTPS.
-# Keep the option explicit so smoke builds without vcpkg stay fast, but fail
-# configure when a release/CI preset asks for HTTPS support and OpenSSL is absent.
+# Default to ON whenever OpenSSL is available; smoke builds without OpenSSL stay
+# fast, while release/CI presets explicitly require this option and fail if the
+# dependency is missing.
 option(EDR_WITH_INGEST_HTTPS_OPENSSL
   "Enable native HTTPS fallback in ingest_http.c through OpenSSL C headers"
   ${_EDR_INGEST_HTTPS_OPENSSL_DEFAULT})
 if(EDR_WITH_INGEST_HTTPS_OPENSSL AND NOT OpenSSL_FOUND)
   message(FATAL_ERROR "EDR_WITH_INGEST_HTTPS_OPENSSL=ON but OpenSSL was not found")
 endif()
+message(STATUS "HTTP HTTPS ingest OpenSSL support: ${EDR_WITH_INGEST_HTTPS_OPENSSL}")
 set(EDR_LIBTORCH_AVAILABLE 0)
 if(EDR_WITH_LIBTORCH)
   list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}" "$ENV{TORCH_ROOT}")
