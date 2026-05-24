@@ -329,6 +329,18 @@ static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "client_cert"), cfg->server.client_cert,
               sizeof(cfg->server.client_cert));
   take_string(toml_string_in(t, "client_key"), cfg->server.client_key, sizeof(cfg->server.client_key));
+  take_string(toml_string_in(t, "client_key_provider"), cfg->server.client_key_provider,
+              sizeof(cfg->server.client_key_provider));
+  take_string(toml_string_in(t, "client_cert_store"), cfg->server.client_cert_store,
+              sizeof(cfg->server.client_cert_store));
+  take_string(toml_string_in(t, "client_cert_thumbprint"), cfg->server.client_cert_thumbprint,
+              sizeof(cfg->server.client_cert_thumbprint));
+  take_string(toml_string_in(t, "pkcs11_module"), cfg->server.pkcs11_module,
+              sizeof(cfg->server.pkcs11_module));
+  take_string(toml_string_in(t, "pkcs11_key_uri"), cfg->server.pkcs11_key_uri,
+              sizeof(cfg->server.pkcs11_key_uri));
+  take_string(toml_string_in(t, "tpm_key_uri"), cfg->server.tpm_key_uri,
+              sizeof(cfg->server.tpm_key_uri));
   {
     toml_datum_t d = toml_int_in(t, "connect_timeout_s");
     if (d.ok) {
@@ -1365,6 +1377,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   snprintf(cfg->server.address, sizeof(cfg->server.address), "%s", "127.0.0.1:50051");
   cfg->server.grpc_insecure = false;
+  snprintf(cfg->server.client_key_provider, sizeof(cfg->server.client_key_provider), "%s", "pem");
   cfg->server.connect_timeout_s = 10;
   cfg->server.keepalive_interval_s = 30;
 

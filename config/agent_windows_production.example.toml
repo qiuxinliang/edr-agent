@@ -7,6 +7,15 @@ grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
 client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
+# P2 hardware/non-exportable key metadata. Runtime gRPC currently consumes PEM
+# client_key; cng/tpm/pkcs11 entries are written by installers for Schannel or
+# hardware-key transport adapters.
+client_key_provider  = "pem" # pem | cng | tpm | pkcs11
+client_cert_store    = ""
+client_cert_thumbprint = ""
+pkcs11_module        = ""
+pkcs11_key_uri       = ""
+tpm_key_uri          = ""
 connect_timeout_s    = 10
 keepalive_interval_s = 30
 

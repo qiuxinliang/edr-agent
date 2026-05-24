@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,7 @@ static int s_keepalive_s = 30;
 static std::string s_ca;
 static std::string s_cert;
 static std::string s_key;
+static std::string s_key_provider;
 static bool s_insecure = false;
 
 static std::atomic<unsigned long> s_rpc_ok{0};
@@ -313,6 +315,15 @@ static std::string read_pem_file(const char *path) {
   return ss.str();
 }
 
+static bool is_pem_key_provider(const char *provider) {
+  if (!provider || !provider[0]) {
+    return true;
+  }
+  std::string p(provider);
+  std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+  return p.empty() || p == "pem" || p == "file";
+}
+
 static void subscribe_thread_main(std::string endpoint_id) {
   unsigned backoff_ms = 500;
   while (!s_sub_stop.load()) {
@@ -455,7 +466,18 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
 
   s_ca = read_pem_file(cfg->server.ca_cert);
   s_cert = read_pem_file(cfg->server.client_cert);
-  s_key = read_pem_file(cfg->server.client_key);
+  s_key_provider = cfg->server.client_key_provider;
+  if (!is_pem_key_provider(cfg->server.client_key_provider)) {
+    fprintf(stderr,
+            "[grpc] client_key_provider=\"%s\" 已配置，但当前 gRPC C++ 传输仅支持 PEM client_key；"
+            "CNG/TPM/PKCS#11 CSR 可用于注册签发，运行时 mTLS 需 Schannel/硬件密钥适配层。\n",
+            cfg->server.client_key_provider);
+    runtime_failure("unsupported grpc client key provider: " + s_key_provider);
+    if (env_truthy("EDR_GRPC_REQUIRE_MTLS")) {
+      return;
+    }
+  }
+  s_key = is_pem_key_provider(cfg->server.client_key_provider) ? read_pem_file(cfg->server.client_key) : "";
   const char *insec = std::getenv("EDR_GRPC_INSECURE");
   s_insecure = cfg->server.grpc_insecure || (insec && insec[0] == '1');
   s_require_mtls = env_truthy("EDR_GRPC_REQUIRE_MTLS");

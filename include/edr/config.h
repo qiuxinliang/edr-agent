@@ -25,6 +25,12 @@ typedef struct EdrConfig {
     char ca_cert[1024];
     char client_cert[1024];
     char client_key[1024];
+    char client_key_provider[32];
+    char client_cert_store[256];
+    char client_cert_thumbprint[128];
+    char pkcs11_module[1024];
+    char pkcs11_key_uri[512];
+    char tpm_key_uri[512];
     int connect_timeout_s;
     int keepalive_interval_s;
   } server;
