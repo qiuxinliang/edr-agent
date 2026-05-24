@@ -308,7 +308,11 @@ jobs:
             "scripts\edr_agent_install.ps1",
             "scripts\windows_service_install.ps1",
             "scripts\windows_isolate_host.ps1",
-            "config\agent_windows_production.example.toml"
+            "config\agent_windows_production.example.toml",
+            "config\p0_rule_bundle_ir_v1.json",
+            "config\p0_rule_bundle_ir_v1.json.enc",
+            "config\p0_rule_bundle_manifest.json",
+            "config\sensor_interest_manifest.json"
           )) {
             if (Test-Path $p) { $null = $items.Add($p) }
           }

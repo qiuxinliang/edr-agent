@@ -16,6 +16,8 @@
 #include "edr/ave_cross_engine_feed.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pid_history_pmfe.h"
+#include "edr/p0_rule_direct_emit.h"
+#include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
@@ -36,6 +38,10 @@ static volatile LONG s_stop_preprocess;
 #include <unistd.h>
 static pthread_t s_thread;
 static volatile int s_stop_preprocess;
+#endif
+
+#ifndef EDR_P0_RULES_BUNDLE_VERSION
+#define EDR_P0_RULES_BUNDLE_VERSION "unknown"
 #endif
 
 static int s_preprocess_active;
@@ -81,6 +87,27 @@ static void apply_agent_ids_to_record(EdrBehaviorRecord *br) {
   }
 }
 
+static int p0_direct_emit_enabled(void) {
+  const char *v = getenv("EDR_P0_DIRECT_EMIT");
+  if (!v || !v[0]) {
+    return 1;
+  }
+  if ((v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'o' || v[0] == 'O') &&
+      (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' || v[1] == '\r' || v[1] == '\n')) {
+    return 0;
+  }
+  return 1;
+}
+
+static void log_p0_runtime_state(void) {
+  edr_p0_rule_ir_lazy_init();
+  fprintf(stderr, "[P0] direct_emit=%s ir_ready=%d rules=%d bundle=%s\n",
+          p0_direct_emit_enabled() ? "on" : "off",
+          edr_p0_rule_ir_is_ready(),
+          edr_p0_rule_ir_rule_count(),
+          EDR_P0_RULES_BUNDLE_VERSION);
+}
+
 static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
@@ -103,6 +130,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
+  edr_p0_rule_try_emit(&br);
   {
     EdrDetectionDecision dd;
     edr_detection_decision_evaluate(&br, &dd);
@@ -119,6 +147,9 @@ static void process_one_slot(const EdrEventSlot *slot) {
     edr_ave_cross_engine_feed_from_record(&br);
   }
   if (!edr_preprocess_should_emit(&br)) {
+    return;
+  }
+  if (!edr_local_evidence_cache_is_candidate(&br)) {
     return;
   }
   size_t n = 0;
@@ -216,6 +247,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   edr_dedup_configure(cfg->preprocessing.dedup_window_s,
                       cfg->preprocessing.high_freq_threshold);
   edr_emit_rules_configure(cfg);
+  log_p0_runtime_state();
   edr_dedup_init();
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;

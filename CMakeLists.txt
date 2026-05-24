@@ -114,6 +114,36 @@ option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAK
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
 
+set(EDR_PCRE2_AVAILABLE 0)
+set(EDR_PCRE2_TARGET "")
+find_package(PCRE2 CONFIG QUIET)
+if(TARGET PCRE2::8BIT)
+  set(EDR_PCRE2_AVAILABLE 1)
+  set(EDR_PCRE2_TARGET PCRE2::8BIT)
+elseif(TARGET PCRE2::pcre2-8)
+  set(EDR_PCRE2_AVAILABLE 1)
+  set(EDR_PCRE2_TARGET PCRE2::pcre2-8)
+else()
+  find_path(EDR_PCRE2_INCLUDE_DIR NAMES pcre2.h
+    PATHS
+      ENV PCRE2_ROOT
+      "$ENV{PCRE2_ROOT}/include"
+      /opt/homebrew/include
+      /usr/local/include
+      "C:/vcpkg/installed/x64-windows/include")
+  find_library(EDR_PCRE2_LIBRARY NAMES pcre2-8 pcre2-8-static
+    PATHS
+      ENV PCRE2_ROOT
+      "$ENV{PCRE2_ROOT}/lib"
+      /opt/homebrew/lib
+      /usr/local/lib
+      "C:/vcpkg/installed/x64-windows/lib")
+  if(EDR_PCRE2_INCLUDE_DIR AND EDR_PCRE2_LIBRARY)
+    set(EDR_PCRE2_AVAILABLE 1)
+  endif()
+endif()
+message(STATUS "P0 IR rule engine PCRE2 support: ${EDR_PCRE2_AVAILABLE}")
+
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
   set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT ON)
@@ -177,7 +207,13 @@ set(EDR_AGENT_SOURCES
   src/preprocess/dedup.c
   src/preprocess/detection_decision.c
   src/preprocess/detection_profile.c
+  src/preprocess/enrich_parent_info.c
   src/preprocess/emit_rules.c
+  src/preprocess/encrypt_p0_rules.c
+  src/preprocess/p0_rule_direct_emit.c
+  src/preprocess/p0_rule_match.c
+  src/preprocess/preprocess_env.c
+  src/preprocess/sensor_interest.c
   src/preprocess/windows_event_policy.c
   src/preprocess/preprocess_pipeline.c
   src/serialize/behavior_wire.c
@@ -222,7 +258,15 @@ set(EDR_AGENT_SOURCES
   src/ave/ave_db_update.c
   src/ave/ave_static_features.c
   src/ave/fl_feature_provider.c
+  third_party/cjson/cJSON.c
 )
+if(EDR_PCRE2_AVAILABLE)
+  list(APPEND EDR_AGENT_SOURCES
+    src/preprocess/p0_rule_ir.c
+  )
+else()
+  list(APPEND EDR_AGENT_SOURCES src/preprocess/p0_rule_ir_stub.c)
+endif()
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_win.c)
 else()
@@ -397,6 +441,7 @@ target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/collector
   ${CMAKE_CURRENT_SOURCE_DIR}/src/pmfe
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/windivert
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
@@ -407,6 +452,16 @@ target_compile_definitions(edr_agent PRIVATE
 )
 if(MSVC)
   target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
+
+if(EDR_PCRE2_AVAILABLE)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(edr_agent PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_LIBRARY})
+  endif()
 endif()
 if(EDR_WITH_FL_TRAINER)
   target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)

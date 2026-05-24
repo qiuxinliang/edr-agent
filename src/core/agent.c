@@ -7,6 +7,7 @@
 #include "edr/preprocess.h"
 #include "edr/resource.h"
 #include "edr/self_protect.h"
+#include "edr/sensor_interest.h"
 #include "edr/shellcode_known.h"
 #include "edr/time_util.h"
 
@@ -185,6 +186,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
 
 static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_ns);
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns);
+static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns);
 
@@ -201,6 +203,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
   {
     uint64_t last_reload_ns = 0;
     uint64_t last_remote_ns = 0;
+    uint64_t last_sensor_interest_ns = 0;
     uint64_t last_health_ns = 0;
     int collector_started = 0;
     {
@@ -231,6 +234,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_self_protect_poll();
         edr_agent_poll_config_reload(agent, &last_reload_ns);
         edr_agent_poll_remote_config(agent, &last_remote_ns);
+        edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns);
         edr_agent_poll_attack_surface(agent);
         edr_agent_poll_engine_health(agent, &last_health_ns);
         edr_command_poll_reliable_delivery();
@@ -296,7 +300,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 
   char rules_ver[96], static_ver[48], behavior_ver[48], ioc_ver[48];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
-  char grpc_err[192], http_err[192], evidence_json[1024];
+  char grpc_err[192], http_err[192], evidence_json[1024], sensor_interest_ver[160], sensor_interest_rules[160];
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
   EdrResourceSample rs;
@@ -333,8 +337,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
   json_escape_small(ch.auditd_last_error, audit_err, sizeof(audit_err));
   json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
+  json_escape_small(ch.sensor_interest_version, sensor_interest_ver, sizeof(sensor_interest_ver));
+  json_escape_small(ch.sensor_interest_rules_version, sensor_interest_rules, sizeof(sensor_interest_rules));
 
-  char body[8192];
+  char body[12288];
   int n = snprintf(
       body, sizeof(body),
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
@@ -357,7 +363,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
-      "\"auditd_last_error\":\"%s\",\"ebpf_last_error\":\"%s\"},"
+      "\"auditd_last_error\":\"%s\",\"ebpf_last_error\":\"%s\","
+      "\"sensor_interest\":{\"enabled\":%s,\"loaded\":%s,\"version\":\"%s\","
+      "\"rules_version\":\"%s\",\"process_names\":%u,\"process_prefixes\":%u,"
+      "\"ports\":%u,\"file_prefixes\":%u,\"file_contains\":%u,"
+      "\"registry_prefixes\":%u,\"registry_contains\":%u,\"cmd_tokens\":%u,"
+      "\"checked\":%llu,\"matched\":%llu,\"dropped\":%llu,"
+      "\"provider_hits\":%llu,\"process_hits\":%llu,\"port_hits\":%llu,"
+      "\"path_hits\":%llu,\"registry_hits\":%llu}},"
       "\"ave\":{\"enabled\":%s,\"mode\":\"triggered\",\"static_model_version\":\"%s\","
       "\"behavior_model_version\":\"%s\",\"ioc_rules_version\":\"%s\","
       "\"queue_depth\":%d,\"queue_capacity\":%u,\"active_scans\":%d,"
@@ -401,6 +414,20 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
       (unsigned long long)ch.ebpf_events, (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped, audit_err, ebpf_err,
+      ch.sensor_interest_enabled ? "true" : "false",
+      ch.sensor_interest_loaded ? "true" : "false",
+      sensor_interest_ver[0] ? sensor_interest_ver : "builtin",
+      sensor_interest_rules[0] ? sensor_interest_rules : rules_ver,
+      ch.sensor_interest_process_names, ch.sensor_interest_process_prefixes,
+      ch.sensor_interest_ports, ch.sensor_interest_file_prefixes, ch.sensor_interest_file_contains,
+      ch.sensor_interest_registry_prefixes, ch.sensor_interest_registry_contains,
+      ch.sensor_interest_cmd_tokens, (unsigned long long)ch.sensor_interest_checked,
+      (unsigned long long)ch.sensor_interest_matched, (unsigned long long)ch.sensor_interest_dropped,
+      (unsigned long long)ch.sensor_interest_provider_hits,
+      (unsigned long long)ch.sensor_interest_process_hits,
+      (unsigned long long)ch.sensor_interest_port_hits,
+      (unsigned long long)ch.sensor_interest_path_hits,
+      (unsigned long long)ch.sensor_interest_registry_hits,
       ave_ok && avst.initialized ? "true" : "false", static_ver, behavior_ver, ioc_ver,
       ave_ok ? avst.behavior_event_queue_size : 0, ave_ok ? avst.behavior_queue_capacity : 0u,
       ave_ok ? avst.active_scan_count : 0,
@@ -590,6 +617,71 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     fprintf(stderr, " fingerprint=%s", fp);
   }
   fprintf(stderr, "\n");
+}
+
+static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns) {
+  const char *url = getenv("EDR_SENSOR_INTEREST_URL");
+  const char *auto_pull = getenv("EDR_SENSOR_INTEREST_AUTO_PULL");
+  int interval = 1800;
+  const char *iv = getenv("EDR_SENSOR_INTEREST_POLL_S");
+  uint64_t now;
+  char derived[768];
+  char tmp[520];
+  if (!agent || !last_sensor_interest_ns) {
+    return;
+  }
+  if (auto_pull && (auto_pull[0] == '0' || auto_pull[0] == 'n' || auto_pull[0] == 'N')) {
+    return;
+  }
+  if (!url || !url[0]) {
+    if (!agent->cfg.platform.rest_base_url[0]) {
+      return;
+    }
+    snprintf(derived, sizeof(derived), "%s/agent/sensor-interest.json", agent->cfg.platform.rest_base_url);
+    url = derived;
+  }
+  if (iv && iv[0]) {
+    int v = atoi(iv);
+    if (v >= 60 && v <= 86400) {
+      interval = v;
+    }
+  }
+  now = edr_monotonic_ns();
+  if (*last_sensor_interest_ns != 0u &&
+      now - *last_sensor_interest_ns < (uint64_t)interval * 1000000000ULL) {
+    return;
+  }
+  *last_sensor_interest_ns = now;
+
+#ifdef _WIN32
+  {
+    const char *t = getenv("TEMP");
+    char cmd[2048];
+    if (!t || !t[0]) {
+      t = ".";
+    }
+    snprintf(tmp, sizeof(tmp), "%s\\edr_sensor_interest_%lu.json", t, (unsigned long)GetCurrentProcessId());
+    snprintf(cmd, sizeof(cmd), "curl -fsSL \"%s\" -H \"X-Endpoint-ID: %s\" -o \"%s\" 1>nul 2>nul",
+             url, agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown", tmp);
+    if (system(cmd) != 0) {
+      return;
+    }
+  }
+#else
+  {
+    char cmd[2048];
+    snprintf(tmp, sizeof(tmp), "/tmp/edr_sensor_interest_%d.json", (int)getpid());
+    snprintf(cmd, sizeof(cmd), "curl -fsSL '%s' -H 'X-Endpoint-ID: %s' -o '%s' 2>/dev/null",
+             url, agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown", tmp);
+    if (system(cmd) != 0) {
+      return;
+    }
+  }
+#endif
+  if (edr_sensor_interest_replace_manifest_from_file(tmp) == 0) {
+    fprintf(stderr, "[sensor_interest] remote manifest applied\n");
+  }
+  (void)remove(tmp);
 }
 
 /**

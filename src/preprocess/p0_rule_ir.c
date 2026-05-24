@@ -21,6 +21,7 @@ extern const size_t edr_p0_rule_ir_embed_len;
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <wchar.h>
 #else
 #include <limits.h>
 #include <unistd.h>
@@ -377,6 +378,18 @@ static int read_full_file(const char *path, char **out, size_t *out_len) {
   return 1;
 }
 
+static int file_readable(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  fclose(f);
+  return 1;
+}
+
 #if defined(_WIN32)
 static int edr_win_exe_dir(char *out, size_t cap) {
   wchar_t wpath[MAX_PATH];
@@ -436,6 +449,22 @@ static int build_default_path(char *out, size_t cap) {
   if (!edr_win_exe_dir(ex, sizeof(ex))) {
     return 0;
   }
+  const char *suffixes[] = {
+      "\\edr_config\\p0_rule_bundle_ir_v1.json",
+      "\\edr_config\\p0_rule_bundle_ir_v1.json.enc",
+      "\\config\\p0_rule_bundle_ir_v1.json",
+      "\\config\\p0_rule_bundle_ir_v1.json.enc",
+      "\\p0_rule_bundle_ir_v1.json",
+      "\\p0_rule_bundle_ir_v1.json.enc",
+  };
+  for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+    if ((size_t)snprintf(out, cap, "%s%s", ex, suffixes[i]) >= cap) {
+      continue;
+    }
+    if (file_readable(out)) {
+      return 1;
+    }
+  }
   snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json", ex);
   return 1;
 #else
@@ -444,7 +473,19 @@ static int build_default_path(char *out, size_t cap) {
   }
   /* 开发/ctest：CWD 下 edr_config/ */
   if ((size_t)snprintf(out, cap, "edr_config/p0_rule_bundle_ir_v1.json") < cap &&
-      access(out, R_OK) == 0) {
+      file_readable(out)) {
+    return 1;
+  }
+  if ((size_t)snprintf(out, cap, "edr_config/p0_rule_bundle_ir_v1.json.enc") < cap &&
+      file_readable(out)) {
+    return 1;
+  }
+  if ((size_t)snprintf(out, cap, "config/p0_rule_bundle_ir_v1.json") < cap &&
+      file_readable(out)) {
+    return 1;
+  }
+  if ((size_t)snprintf(out, cap, "config/p0_rule_bundle_ir_v1.json.enc") < cap &&
+      file_readable(out)) {
     return 1;
   }
   return 0;
@@ -1067,6 +1108,64 @@ int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) {
     return 0;
   }
   return p0_ir_match_rule_to_br(&s_rule[index], br) ? 1 : 0;
+}
+
+int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
+  if (!br) {
+    return 0;
+  }
+  edr_p0_rule_ir_lazy_init();
+  if (!s_ready) {
+    return 0;
+  }
+  for (int i = 0; i < s_n; i++) {
+    if (edr_p0_rule_ir_br_matches_index(br, i)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port) {
+  if (port == 0u) {
+    return 0;
+  }
+  edr_p0_rule_ir_lazy_init();
+  if (!s_ready) {
+    return 0;
+  }
+  for (int i = 0; i < s_n; i++) {
+    if (!s_rule[i].in_use || strcmp(s_rule[i].event_type, "network_connect") != 0) {
+      continue;
+    }
+    for (int j = 0; j < s_rule[i].n_rport; j++) {
+      if ((uint32_t)s_rule[i].rport[j] == port) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int edr_p0_rule_ir_is_interesting_process_name(const char *process_name) {
+  char lower[1024];
+  if (!process_name || !process_name[0]) {
+    return 0;
+  }
+  edr_p0_rule_ir_lazy_init();
+  if (!s_ready) {
+    return 0;
+  }
+  ascii_lower_truncate(lower, sizeof(lower), process_name);
+  for (int i = 0; i < s_n; i++) {
+    if (!s_rule[i].in_use || s_rule[i].n_name_in <= 0) {
+      continue;
+    }
+    if (name_in_list(lower, (const char (*)[128])s_rule[i].name_in, s_rule[i].n_name_in)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 void edr_p0_rule_ir_stats_record(int rule_idx, int hit) {

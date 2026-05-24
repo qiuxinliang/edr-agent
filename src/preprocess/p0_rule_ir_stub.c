@@ -51,6 +51,21 @@ int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) {
   return 0;
 }
 
+int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
+  (void)br;
+  return 0;
+}
+
+int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port) {
+  (void)port;
+  return 0;
+}
+
+int edr_p0_rule_ir_is_interesting_process_name(const char *process_name) {
+  (void)process_name;
+  return 0;
+}
+
 void edr_p0_rule_ir_stats_record(int rule_idx, int hit) {
   (void)rule_idx;
   (void)hit;

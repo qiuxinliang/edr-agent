@@ -1,4 +1,5 @@
 #include "edr/command_state.h"
+#include "edr/local_evidence_cache.h"
 
 #ifdef _MSC_VER
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -390,6 +391,9 @@ void edr_command_state_finish(const char *command_id, const char *command_type,
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
            (long long)state_now_ms(), scid, run, step, art, det);
   append_state_line_locked(line);
+  edr_local_evidence_cache_record_command_result(
+      command_id, command_type, response_status ? response_status : "failed",
+      execution_status, exit_code, detail, artifacts);
   edr_command_state_compact_if_needed();
 }
 

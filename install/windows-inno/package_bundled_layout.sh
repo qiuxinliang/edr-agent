@@ -71,6 +71,12 @@ if [[ -f "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" ]]; then
   mkdir -p "$OUT_DIR/config"
   cp -a "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" "$OUT_DIR/config/"
 fi
+mkdir -p "$OUT_DIR/edr_config"
+for n in "p0_rule_bundle_ir_v1.json" "p0_rule_bundle_ir_v1.json.enc" "p0_rule_bundle_manifest.json" "sensor_interest_manifest.json"; do
+  if [[ -f "$EDR_AGENT_DIR/config/$n" ]]; then
+    cp -a "$EDR_AGENT_DIR/config/$n" "$OUT_DIR/edr_config/"
+  fi
+done
 for n in "edr_install_wizard_enroll.ps1" "edr_windows_autorun.ps1"; do
   if [[ -f "$SCRIPT_DIR/$n" ]]; then
     cp -a "$SCRIPT_DIR/$n" "$OUT_DIR/"

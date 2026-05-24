@@ -7,7 +7,7 @@
 static int is_file_event(EdrEventType t) {
   return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE ||
          t == EDR_EVENT_FILE_DELETE || t == EDR_EVENT_FILE_RENAME ||
-         t == EDR_EVENT_FILE_PERMISSION_CHANGE;
+         t == EDR_EVENT_FILE_PERMISSION_CHANGE || t == EDR_EVENT_FILE_READ;
 }
 
 static int is_registry_event(EdrEventType t) {
@@ -123,19 +123,19 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       ".ps1", ".psm1", ".sct", ".cmd", ".bat",
   };
   static const char *const executable_exts[] = {
-      ".exe", ".dll", ".scr", ".com", ".msi", ".cpl", ".ocx",
+      ".exe", ".dll", ".scr", ".com", ".msi", ".cpl", ".ocx", ".sys",
   };
-  static const char *const initial_access_exts[] = {
-      ".iso", ".img", ".lnk", ".url", ".sct", ".hta", ".chm",
-      ".docm", ".xlsm", ".xlam", ".one",
-  };
-  static const char *const staging_dirs[] = {
-      "\\users\\", "\\downloads\\", "\\desktop\\", "\\appdata\\local\\temp\\",
-      "\\appdata\\roaming\\", "\\windows\\temp\\", "\\programdata\\",
+  static const char *const user_temp_dirs[] = {
+      "\\appdata\\local\\temp\\", "\\appdata\\roaming\\microsoft\\windows\\templates\\",
+      "\\windows\\temp\\", "\\users\\public\\", "\\temp\\",
   };
   static const char *const startup_dirs[] = {
       "\\microsoft\\windows\\start menu\\programs\\startup\\",
       "\\windows\\system32\\tasks\\", "\\windows\\tasks\\",
+  };
+  static const char *const service_driver_dirs[] = {
+      "\\windows\\system32\\drivers\\", "\\windows\\system32\\driverstore\\",
+      "\\windows\\system32\\spool\\drivers\\", "\\windows\\system32\\tasks\\",
   };
   static const char *const noisy_dirs[] = {
       "\\windows\\prefetch\\", "\\windows\\softwaredistribution\\",
@@ -170,18 +170,18 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
   if (any_contains(path, startup_dirs, sizeof(startup_dirs) / sizeof(startup_dirs[0]))) {
     mark_suspicious(p, "startup_or_scheduled_task_path", "persistence_path");
   }
-  if (has_ci_path(path, "\\windows\\system32\\drivers\\") &&
-      (ends_ci_path(path, ".sys") || r->type == EDR_EVENT_FILE_CREATE ||
-       r->type == EDR_EVENT_FILE_WRITE)) {
-    mark_suspicious(p, "driver_path_modified", "driver_persistence");
+  if (any_contains(path, service_driver_dirs, sizeof(service_driver_dirs) / sizeof(service_driver_dirs[0])) &&
+      (any_ends(path, executable_exts, sizeof(executable_exts) / sizeof(executable_exts[0])) ||
+       any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0])) ||
+       r->type == EDR_EVENT_FILE_CREATE || r->type == EDR_EVENT_FILE_WRITE ||
+       r->type == EDR_EVENT_FILE_PERMISSION_CHANGE)) {
+    mark_suspicious(p, "service_or_driver_path_modified", "service_driver_path");
   }
-  if (any_contains(path, staging_dirs, sizeof(staging_dirs) / sizeof(staging_dirs[0]))) {
+  if (any_contains(path, user_temp_dirs, sizeof(user_temp_dirs) / sizeof(user_temp_dirs[0]))) {
     if (any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0]))) {
-      mark_suspicious(p, "script_drop_in_user_or_temp_path", "script_staging");
+      mark_suspicious(p, "script_drop_in_user_temp_path", "script_temp_staging");
     } else if (any_ends(path, executable_exts, sizeof(executable_exts) / sizeof(executable_exts[0]))) {
-      mark_high(p, "executable_drop_in_user_or_temp_path", "executable_staging");
-    } else if (any_ends(path, initial_access_exts, sizeof(initial_access_exts) / sizeof(initial_access_exts[0]))) {
-      mark_suspicious(p, "initial_access_artifact_drop", "phishing_artifact");
+      mark_suspicious(p, "executable_drop_in_user_temp_path", "executable_temp_staging");
     }
   }
   if (any_contains(path, ransom_markers, sizeof(ransom_markers) / sizeof(ransom_markers[0])) ||

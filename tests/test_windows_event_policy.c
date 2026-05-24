@@ -47,14 +47,14 @@ static void test_initial_access_artifact_is_suspicious(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
   init_record(&r, EDR_EVENT_FILE_CREATE);
-  snprintf(r.file_path, sizeof(r.file_path), "C:\\Users\\alice\\Downloads\\invoice.iso");
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\Users\\alice\\AppData\\Local\\Temp\\invoice.js");
   edr_windows_event_policy_apply(&r);
   edr_windows_event_policy_evaluate(&r, &p);
   assert(p.suspicious);
   assert(p.should_emit);
   assert(p.should_persist);
   assert(r.priority == 0u);
-  assert(strstr(r.script_snippet, "phishing_artifact") != NULL);
+  assert(strstr(r.script_snippet, "script_temp_staging") != NULL);
 }
 
 static void test_autorun_registry_is_high_signal(void) {

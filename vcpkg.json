@@ -5,6 +5,7 @@
   "dependencies": [
     "curl",
     "openssl",
+    "pcre2",
     "sqlite3"
   ],
   "features": {

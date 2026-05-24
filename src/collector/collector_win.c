@@ -16,18 +16,23 @@
 #include <evntrace.h>
 
 #include "edr/collector.h"
+#include "edr/behavior_from_slot.h"
 #include "edr/config.h"
 #include "edr/etw_guids_win.h"
 #include "edr/etw_tdh_win.h"
 #include "edr/event_bus.h"
+#include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
+#include "edr/sensor_interest.h"
 #include "edr/types.h"
+#include "edr/windows_event_policy.h"
 
 #include "ave_etw_feed_win.h"
 #include "edr/etw_tdh_win.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 
 static WCHAR g_session_name[] = L"EDR_Agent_RT_001";
@@ -38,6 +43,19 @@ static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
 static volatile LONG s_started;
 static EdrCollectorHealth s_health;
+
+#define EDR_COLLECTOR_PID_CACHE 512u
+
+typedef struct {
+  uint32_t pid;
+  uint64_t last_seen_ns;
+  char process_name[256];
+  char exe_path[512];
+  char cmdline[1024];
+} EdrCollectorPidCacheEntry;
+
+static EdrCollectorPidCacheEntry s_pid_cache[EDR_COLLECTOR_PID_CACHE];
+static uint32_t s_pid_cache_next;
 
 static uint64_t edr_unix_ns(void) {
   FILETIME ft;
@@ -209,6 +227,227 @@ static uint8_t edr_priority_from_utf8_payload(const uint8_t *data, uint32_t len)
   return 1;
 }
 
+static int edr_env_bool_default(const char *name, int fallback) {
+  const char *v = getenv(name);
+  if (!v || !v[0]) {
+    return fallback;
+  }
+  if ((v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'o' || v[0] == 'O') &&
+      (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' || v[1] == '\r' || v[1] == '\n')) {
+    return 0;
+  }
+  return 1;
+}
+
+static char edr_fold_ascii_path_char(char c) {
+  if (c == '/') {
+    c = '\\';
+  }
+  if (c >= 'A' && c <= 'Z') {
+    c = (char)(c - 'A' + 'a');
+  }
+  return c;
+}
+
+static int edr_contains_ci_path(const char *hay, const char *needle) {
+  if (!needle || !needle[0]) {
+    return 1;
+  }
+  if (!hay || !hay[0]) {
+    return 0;
+  }
+  for (; *hay; hay++) {
+    const char *a = hay;
+    const char *b = needle;
+    while (*a && *b && edr_fold_ascii_path_char(*a) == edr_fold_ascii_path_char(*b)) {
+      a++;
+      b++;
+    }
+    if (!*b) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void edr_copy_trunc(char *dst, size_t cap, const char *src) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  snprintf(dst, cap, "%s", src ? src : "");
+}
+
+static void edr_collector_pid_cache_update(const EdrBehaviorRecord *br) {
+  if (!br || br->pid == 0u) {
+    return;
+  }
+  if (!br->process_name[0] && !br->exe_path[0] && !br->cmdline[0]) {
+    return;
+  }
+  EdrCollectorPidCacheEntry *slot = NULL;
+  for (size_t i = 0; i < EDR_COLLECTOR_PID_CACHE; i++) {
+    if (s_pid_cache[i].pid == br->pid) {
+      slot = &s_pid_cache[i];
+      break;
+    }
+  }
+  if (!slot) {
+    slot = &s_pid_cache[s_pid_cache_next++ % EDR_COLLECTOR_PID_CACHE];
+    memset(slot, 0, sizeof(*slot));
+    slot->pid = br->pid;
+  }
+  slot->last_seen_ns = br->event_time_ns > 0 ? (uint64_t)br->event_time_ns : edr_unix_ns();
+  if (br->process_name[0]) {
+    edr_copy_trunc(slot->process_name, sizeof(slot->process_name), br->process_name);
+  }
+  if (br->exe_path[0]) {
+    edr_copy_trunc(slot->exe_path, sizeof(slot->exe_path), br->exe_path);
+  }
+  if (br->cmdline[0]) {
+    edr_copy_trunc(slot->cmdline, sizeof(slot->cmdline), br->cmdline);
+  }
+}
+
+static void edr_collector_pid_cache_enrich(EdrBehaviorRecord *br) {
+  if (!br || br->pid == 0u) {
+    return;
+  }
+  for (size_t i = 0; i < EDR_COLLECTOR_PID_CACHE; i++) {
+    EdrCollectorPidCacheEntry *slot = &s_pid_cache[i];
+    if (slot->pid != br->pid) {
+      continue;
+    }
+    if (!br->process_name[0] && slot->process_name[0]) {
+      edr_copy_trunc(br->process_name, sizeof(br->process_name), slot->process_name);
+    }
+    if (!br->exe_path[0] && slot->exe_path[0]) {
+      edr_copy_trunc(br->exe_path, sizeof(br->exe_path), slot->exe_path);
+    }
+    if (!br->cmdline[0] && slot->cmdline[0]) {
+      edr_copy_trunc(br->cmdline, sizeof(br->cmdline), slot->cmdline);
+    }
+    return;
+  }
+}
+
+static int edr_is_p0_network_port(uint32_t port) {
+  static const uint16_t ports[] = {
+      22, 88, 135, 139, 389, 445, 464, 593, 636, 1080, 1433, 3128, 3306,
+      3389, 5432, 5938, 5985, 5986, 6379, 7070, 8080, 8118, 8443, 9001,
+      9050, 9200, 9300, 11211, 27017, 47001,
+  };
+  for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
+    if (port == ports[i]) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int edr_collector_process_is_suspicious(const EdrBehaviorRecord *br) {
+  static const char *const names[] = {
+      "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe",
+      "rundll32.exe", "regsvr32.exe", "certutil.exe", "bitsadmin.exe", "msiexec.exe",
+      "wmic.exe", "odbcconf.exe", "msbuild.exe", "installutil.exe", "regasm.exe",
+      "regsvcs.exe", "psexec.exe", "psexesvc.exe", "paexec.exe", "anydesk.exe",
+      "teamviewer.exe", "screenconnect", "connectwise", "ngrok.exe", "frpc.exe",
+      "chisel.exe", "plink.exe", "rclone.exe", "curl.exe", "wget.exe",
+  };
+  const char *pn = br ? br->process_name : "";
+  const char *xp = br ? br->exe_path : "";
+  const char *cmd = br ? br->cmdline : "";
+  if (!br) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    if (edr_contains_ci_path(pn, names[i]) || edr_contains_ci_path(xp, names[i]) ||
+        edr_contains_ci_path(cmd, names[i])) {
+      return 1;
+    }
+  }
+  if (edr_p0_rule_ir_is_interesting_process_name(pn) ||
+      edr_p0_rule_ir_is_interesting_process_name(xp)) {
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_network_dest_is_lateral_or_remote_admin(const EdrBehaviorRecord *br) {
+  if (!br || br->net_dport == 0u || !br->net_dst[0]) {
+    return 0;
+  }
+  if (br->net_dport == 445u || br->net_dport == 135u || br->net_dport == 139u ||
+      br->net_dport == 3389u || br->net_dport == 5985u || br->net_dport == 5986u ||
+      br->net_dport == 47001u) {
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
+  if (!slot) {
+    return 0;
+  }
+  if (edr_env_bool_default("EDR_COLLECTOR_ADMIT_ALL", 0)) {
+    return 1;
+  }
+  if (slot->type == EDR_EVENT_PROCESS_TERMINATE || slot->type == EDR_EVENT_DLL_LOAD) {
+    return edr_env_bool_default("EDR_COLLECTOR_KEEP_LIFECYCLE", 0);
+  }
+  if (slot->type == EDR_EVENT_AUTH_LOGIN || slot->type == EDR_EVENT_AUTH_LOGOUT) {
+    return edr_env_bool_default("EDR_COLLECTOR_KEEP_AUTH", 0);
+  }
+
+  EdrBehaviorRecord br;
+  edr_behavior_from_slot(slot, &br);
+  edr_collector_pid_cache_enrich(&br);
+  if ((slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) &&
+      br.exe_path[0] && !br.network_aux_path[0]) {
+    edr_copy_trunc(br.network_aux_path, sizeof(br.network_aux_path), br.exe_path);
+  }
+  if (slot->type == EDR_EVENT_PROCESS_CREATE) {
+    edr_collector_pid_cache_update(&br);
+  }
+  if (br.priority == 0u) {
+    slot->priority = 0u;
+    return 1;
+  }
+  if (edr_p0_rule_ir_br_matches_any(&br)) {
+    slot->priority = 0u;
+    return 1;
+  }
+  if (slot->type == EDR_EVENT_PROCESS_CREATE) {
+    return (br.process_name[0] || br.cmdline[0]) ? 1 : 0;
+  }
+  if (slot->type == EDR_EVENT_FILE_CREATE || slot->type == EDR_EVENT_FILE_WRITE ||
+      slot->type == EDR_EVENT_FILE_DELETE || slot->type == EDR_EVENT_FILE_RENAME ||
+      slot->type == EDR_EVENT_FILE_PERMISSION_CHANGE || slot->type == EDR_EVENT_FILE_READ ||
+      slot->type == EDR_EVENT_REG_CREATE_KEY || slot->type == EDR_EVENT_REG_SET_VALUE ||
+      slot->type == EDR_EVENT_REG_DELETE_KEY) {
+    edr_windows_event_policy_apply(&br);
+    slot->priority = br.priority;
+    return edr_windows_event_policy_should_emit(&br);
+  }
+  if (slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) {
+    if (br.net_dport != 0u &&
+        (edr_p0_rule_ir_is_interesting_remote_port(br.net_dport) ||
+         edr_is_p0_network_port(br.net_dport) ||
+         edr_collector_process_is_suspicious(&br) ||
+         edr_network_dest_is_lateral_or_remote_admin(&br))) {
+      return 1;
+    }
+    return edr_env_bool_default("EDR_COLLECTOR_KEEP_ALL_NET", 0);
+  }
+  if (slot->type == EDR_EVENT_SCRIPT_POWERSHELL || slot->type == EDR_EVENT_SCRIPT_WMI ||
+      slot->type == EDR_EVENT_NET_DNS_QUERY || slot->type == EDR_EVENT_NET_TLS_HANDSHAKE ||
+      slot->type == EDR_EVENT_FIREWALL_RULE_CHANGE || slot->type == EDR_EVENT_PROTOCOL_SHELLCODE ||
+      slot->type == EDR_EVENT_WEBSHELL_DETECTED || slot->type == EDR_EVENT_PMFE_SCAN_RESULT ||
+      slot->type == EDR_EVENT_BEHAVIOR_ONNX_ALERT) {
+    return 1;
+  }
+  return edr_env_bool_default("EDR_COLLECTOR_KEEP_METADATA", 0);
+}
+
 static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (!s_bus || !event_record) {
     return;
@@ -222,16 +461,18 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
     return;
   }
-
-  const uint64_t ts_ns = edr_unix_ns();
-  char ave_ip[46];
-  char ave_dom[256];
-  edr_tdh_extract_ave_net_fields(event_record, ty, ave_ip, sizeof(ave_ip), ave_dom, sizeof(ave_dom));
-  edr_ave_etw_feed_from_event(event_record, ty, ts_ns, ave_ip[0] ? ave_ip : NULL, ave_dom[0] ? ave_dom : NULL);
+  {
+    EdrSensorInterestEvent interest_event;
+    if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event) &&
+        !edr_sensor_interest_should_admit(&interest_event)) {
+      s_health.collector_dropped++;
+      return;
+    }
+  }
 
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
-  slot.timestamp_ns = ts_ns;
+  slot.timestamp_ns = edr_unix_ns();
   slot.type = ty;
   slot.consumed = false;
 
@@ -257,7 +498,22 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     }
   }
 
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (!edr_collector_should_admit_slot(&slot)) {
+    s_health.collector_dropped++;
+    return;
+  }
+
+  {
+    char ave_ip[46];
+    char ave_dom[256];
+    edr_tdh_extract_ave_net_fields(event_record, ty, ave_ip, sizeof(ave_ip), ave_dom, sizeof(ave_dom));
+    edr_ave_etw_feed_from_event(event_record, ty, slot.timestamp_ns, ave_ip[0] ? ave_ip : NULL,
+                                ave_dom[0] ? ave_dom : NULL);
+  }
+
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    s_health.queue_dropped++;
+  }
 }
 
 static DWORD WINAPI edr_etw_consumer_thread(void *arg) {
@@ -347,6 +603,9 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 
   s_bus = bus;
   s_agent_pid = GetCurrentProcessId();
+  memset(s_pid_cache, 0, sizeof(s_pid_cache));
+  s_pid_cache_next = 0u;
+  edr_sensor_interest_lazy_init();
 
   ULONG name_bytes =
       (ULONG)((wcslen(g_session_name) + 1u) * sizeof(WCHAR));
@@ -428,6 +687,7 @@ void edr_collector_stop(void) {
 }
 
 int edr_collector_get_health(EdrCollectorHealth *out_health) {
+  EdrSensorInterestStatus si;
   if (!out_health) {
     return -1;
   }
@@ -436,5 +696,27 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   if (s_bus) {
     out_health->queue_dropped = edr_event_bus_dropped_total(s_bus);
   }
+  memset(&si, 0, sizeof(si));
+  edr_sensor_interest_get_status(&si);
+  out_health->sensor_interest_enabled = si.enabled;
+  out_health->sensor_interest_loaded = si.loaded;
+  snprintf(out_health->sensor_interest_version, sizeof(out_health->sensor_interest_version), "%s", si.version);
+  snprintf(out_health->sensor_interest_rules_version, sizeof(out_health->sensor_interest_rules_version), "%s", si.rules_version);
+  out_health->sensor_interest_process_names = si.process_name_count;
+  out_health->sensor_interest_process_prefixes = si.process_prefix_count;
+  out_health->sensor_interest_ports = si.port_count;
+  out_health->sensor_interest_file_prefixes = si.file_prefix_count;
+  out_health->sensor_interest_file_contains = si.file_contains_count;
+  out_health->sensor_interest_registry_prefixes = si.registry_prefix_count;
+  out_health->sensor_interest_registry_contains = si.registry_contains_count;
+  out_health->sensor_interest_cmd_tokens = si.cmd_token_count;
+  out_health->sensor_interest_checked = si.checked;
+  out_health->sensor_interest_matched = si.matched;
+  out_health->sensor_interest_dropped = si.dropped;
+  out_health->sensor_interest_provider_hits = si.provider_hits;
+  out_health->sensor_interest_process_hits = si.process_hits;
+  out_health->sensor_interest_port_hits = si.port_hits;
+  out_health->sensor_interest_path_hits = si.path_hits;
+  out_health->sensor_interest_registry_hits = si.registry_hits;
   return 0;
 }

@@ -1,6 +1,6 @@
 /**
  * 预处理上送前：P0 动态规则直出 BehaviorAlert（与平台 dynamicrules 对拍，见 p0_golden_test.go）。
- * 默认关：环境变量 EDR_P0_DIRECT_EMIT=1 开启。
+ * 默认开：环境变量 EDR_P0_DIRECT_EMIT=0 可关闭。
  */
 #ifndef EDR_P0_RULE_DIRECT_EMIT_H
 #define EDR_P0_RULE_DIRECT_EMIT_H

@@ -427,7 +427,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
   a.pid = br->pid;
   a.timestamp_ns = br->event_time_ns;
   snprintf(a.process_name, sizeof(a.process_name), "%s", pn && pn[0] ? pn : "");
-  snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path ? br->exe_path : "");
+  snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path);
   a.anomaly_score = sev3_anomaly();
   snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma ? mitre_comma : "");
   a.skip_ai_analysis = true;
@@ -460,11 +460,16 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
     char esc_psb[1024];
     char esc_clo[256];
     char esc_ect[96];
+    char parent_name_buf[sizeof(br->parent_name)];
+    char parent_path_buf[sizeof(br->parent_path)];
 
-    /* 如果缺少父进程信息，通过API补充（须在 JSON 转义前填充 br） */
-    if (!br->parent_name[0] && br->ppid > 0) {
-      enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name), br->parent_path,
-                                sizeof(br->parent_path));
+    snprintf(parent_name_buf, sizeof(parent_name_buf), "%s", br->parent_name);
+    snprintf(parent_path_buf, sizeof(parent_path_buf), "%s", br->parent_path);
+
+    /* Fill parent metadata before JSON escaping when the ETW record lacks it. */
+    if (!parent_name_buf[0] && br->ppid > 0) {
+      enrich_parent_info_by_pid(br->ppid, parent_name_buf, sizeof(parent_name_buf), parent_path_buf,
+                                sizeof(parent_path_buf));
     }
 
     p0_json_escape_or_empty(rule_id, esc_rule_id, sizeof(esc_rule_id), 48);
@@ -472,13 +477,13 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
     p0_json_escape_or_empty(title ? title : "", esc_title, sizeof(esc_title), 240);
     p0_json_escape_or_empty(pn && pn[0] ? pn : "", esc_proc, sizeof(esc_proc), 160);
     p0_json_escape_or_empty(br->exe_path[0] ? br->exe_path : "", esc_exe, sizeof(esc_exe), 400);
-    p0_json_escape_or_empty(br->cmdline ? br->cmdline : "", cmdline_esc, sizeof(cmdline_esc), 480);
+    p0_json_escape_or_empty(br->cmdline, cmdline_esc, sizeof(cmdline_esc), 480);
     p0_json_escape_or_empty(br->exe_hash[0] ? br->exe_hash : "", esc_exe_hash, sizeof(esc_exe_hash), 96);
     p0_json_escape_or_empty(br->process_path_hash[0] ? br->process_path_hash : "", esc_path_hash,
                             sizeof(esc_path_hash), 96);
-    p0_json_escape_or_empty(br->parent_name[0] ? br->parent_name : "", parent_name_esc, sizeof(parent_name_esc),
+    p0_json_escape_or_empty(parent_name_buf[0] ? parent_name_buf : "", parent_name_esc, sizeof(parent_name_esc),
                             160);
-    p0_json_escape_or_empty(br->parent_path[0] ? br->parent_path : "", parent_path_esc, sizeof(parent_path_esc),
+    p0_json_escape_or_empty(parent_path_buf[0] ? parent_path_buf : "", parent_path_esc, sizeof(parent_path_esc),
                             400);
     p0_json_escape_or_empty(br->parent_cmdline[0] ? br->parent_cmdline : "", esc_parent_cmdline,
                             sizeof(esc_parent_cmdline), 480);
@@ -660,7 +665,7 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       const char *title = NULL;
       const char *mitre = NULL;
       (void)edr_p0_rule_ir_get_meta(rid, &title, &mitre);
-      fprintf(stderr, "[P0] IR rule matched: rid=%s title=%s\n", rid, title ? title : "(null)");
+      fprintf(stderr, "[P0] IR rule matched: rid=%s\n", rid);
       (void)emit_for_rule(
           br, rid, (title && title[0]) ? title : rid, (mitre && mitre[0]) ? mitre : ""
       );

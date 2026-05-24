@@ -1,9 +1,8 @@
 /**
  * 端侧轻量证据缓存。
  *
- * 目标：维护最近进程/文件/网络/注册表元数据的内存索引，并可选落 SQLite
- * local_evidence_cache.db，供实时查询、告警取证和进程树补全使用。默认只缓存元数据，
- * 不读取文件内容。
+ * 目标：维护 hot ring、P0/P1 候选、取证产物、命令结果和聚合指标分区。
+ * 普通 ETW 只进入内存 hot ring 与滑动 drop counters，不写 SQLite，不读取文件内容。
  */
 #ifndef EDR_LOCAL_EVIDENCE_CACHE_H
 #define EDR_LOCAL_EVIDENCE_CACHE_H
@@ -18,9 +17,19 @@ typedef struct {
   uint64_t records_written;
   uint64_t records_dropped;
   uint64_t records_skipped;
+  uint64_t hot_ring_ingested;
+  uint64_t p0_candidates_written;
+  uint64_t artifacts_written;
+  uint64_t command_results_written;
+  uint64_t metric_file_drops;
+  uint64_t metric_registry_drops;
+  uint64_t metric_network_drops;
+  uint64_t metric_other_drops;
   uint64_t maintenance_runs;
   uint32_t process_slots_used;
   uint32_t ring_events;
+  uint32_t hot_ring_events;
+  uint32_t metrics_minutes;
   uint32_t max_db_mb;
   uint32_t retention_hours;
   char path[512];
@@ -38,6 +47,14 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r);
 
 /** 记录一条行为元数据；函数内部会维护内存环与 SQLite。 */
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r);
+
+/** 是否属于可落库/可上传的告警候选。普通 ETW 只进入 hot ring 与滑动指标。 */
+int edr_local_evidence_cache_is_candidate(const EdrBehaviorRecord *r);
+
+/** 命令结果分区镜像，供本地可靠投递和运维诊断使用。 */
+void edr_local_evidence_cache_record_command_result(
+    const char *command_id, const char *command_type, const char *status,
+    int execution_status, int exit_code, const char *detail, const char *artifacts);
 
 /** 周期性 TTL 清理、大小水位清理和 WAL checkpoint。 */
 void edr_local_evidence_cache_poll_maintenance(void);

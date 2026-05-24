@@ -25,6 +25,7 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
     # --- 配置 (由 server 启动前注入) ---
     rules_toml_path = None
     p0_bundle_path = None
+    sensor_interest_path = None
     rules_version = None
 
     # --- 内存指令队列 (endpoint_id -> list of command dicts) ---
@@ -82,6 +83,17 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send_file(self.p0_bundle_path, "application/octet-stream",
                         extra_headers={"X-P0-Bundle-Version": "v1"})
+
+    def _handle_agent_sensor_interest(self):
+        """GET / HEAD /api/v1/agent/sensor-interest.json"""
+        if self.command == "HEAD":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("X-Rules-Version", self.rules_version)
+            self.end_headers()
+            return
+        self._send_file(self.sensor_interest_path, "application/json; charset=utf-8",
+                        extra_headers={"X-EDR-Sensor-Interest-Version": "dev"})
 
     def _handle_ingest_heartbeat(self):
         """POST /api/v1/ingest/heartbeat"""
@@ -185,6 +197,8 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
         ("HEAD", "/api/v1/agent/rules.toml"): "_handle_agent_rules_toml",
         ("GET", "/api/v1/agent/p0-bundle.enc"): "_handle_agent_p0_bundle",
         ("HEAD", "/api/v1/agent/p0-bundle.enc"): "_handle_agent_p0_bundle",
+        ("GET", "/api/v1/agent/sensor-interest.json"): "_handle_agent_sensor_interest",
+        ("HEAD", "/api/v1/agent/sensor-interest.json"): "_handle_agent_sensor_interest",
         ("POST", "/api/v1/ingest/heartbeat"): "_handle_ingest_heartbeat",
         ("POST", "/api/v1/ingest/report-events"): "_handle_ingest_report_events",
         ("POST", "/api/v1/ingest/report-command-result"): "_handle_ingest_report_command_result",
@@ -221,6 +235,7 @@ class EdrDevHandler(http.server.BaseHTTPRequestHandler):
 def configure_handler(config_dir):
     rules_toml = os.path.join(config_dir, "agent_preprocess_rules_v1.toml")
     p0_bundle = os.path.join(config_dir, "p0_rule_bundle_ir_v1.json.enc")
+    sensor_interest = os.path.join(config_dir, "sensor_interest_manifest.json")
     version = "edr-dynamic-rules-v1-r218-9ae52519"
     if os.path.isfile(rules_toml):
         try:
@@ -235,6 +250,7 @@ def configure_handler(config_dir):
 
     EdrDevHandler.rules_toml_path = rules_toml
     EdrDevHandler.p0_bundle_path = p0_bundle
+    EdrDevHandler.sensor_interest_path = sensor_interest
     EdrDevHandler.rules_version = version
     return EdrDevHandler
 
@@ -269,6 +285,7 @@ def main():
     print("端点:")
     print(f"  GET  /api/v1/agent/rules.toml")
     print(f"  GET  /api/v1/agent/p0-bundle.enc")
+    print(f"  GET  /api/v1/agent/sensor-interest.json")
     print(f"  POST /api/v1/ingest/heartbeat")
     print(f"  POST /api/v1/ingest/report-events")
     print(f"  POST /api/v1/ingest/report-command-result")

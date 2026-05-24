@@ -104,6 +104,99 @@ static void edr_try_append_all(PEVENT_RECORD rec, const EdrPropTry *tries, size_
   }
 }
 
+static int edr_prop_first_utf8(PEVENT_RECORD rec, const PCWSTR *names, size_t n,
+                               char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  for (size_t i = 0; i < n; i++) {
+    if (edr_prop_utf8(rec, names[i], out, out_cap) == ERROR_SUCCESS && out[0]) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static uint32_t edr_parse_u32_ascii(const char *s) {
+  uint32_t v = 0;
+  if (!s) {
+    return 0;
+  }
+  while (*s == ' ' || *s == '\t') {
+    s++;
+  }
+  while (*s >= '0' && *s <= '9') {
+    uint32_t nv = v * 10u + (uint32_t)(*s - '0');
+    if (nv < v) {
+      return v;
+    }
+    v = nv;
+    s++;
+  }
+  return v;
+}
+
+int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
+                                        const char *prov_tag,
+                                        EdrSensorInterestEvent *out_event) {
+  const GUID *g;
+  char tmp[1536];
+  if (!rec || !out_event) {
+    return 0;
+  }
+  memset(out_event, 0, sizeof(*out_event));
+  out_event->type = type;
+  out_event->event_id = rec->EventHeader.EventDescriptor.Id;
+  out_event->opcode = rec->EventHeader.EventDescriptor.Opcode;
+  out_event->pid = rec->EventHeader.ProcessId;
+  snprintf(out_event->provider, sizeof(out_event->provider), "%s", prov_tag ? prov_tag : "unknown");
+
+  static const PCWSTR proc_try[] = {
+      L"ImageFileName", L"ImageName", L"Filename", L"ProcessName", L"NewProcessName",
+      L"ApplicationName",
+  };
+  static const PCWSTR file_try[] = {
+      L"FileName", L"OpenPath", L"Path", L"FileObject",
+  };
+  static const PCWSTR reg_try[] = {
+      L"KeyName", L"RelativeName", L"ValueName", L"CapturedValueName",
+  };
+  static const PCWSTR port_try[] = {
+      L"dport", L"Dport", L"RemotePort", L"rport", L"DestPort", L"DestinationPort",
+  };
+  static const PCWSTR cmd_try[] = {
+      L"CommandLine", L"Commandline", L"ProcessCommandLine", L"Command", L"ScriptBlockText",
+      L"Content", L"Buffer",
+  };
+
+  (void)edr_prop_first_utf8(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]),
+                            out_event->process_name, sizeof(out_event->process_name));
+  g = &rec->EventHeader.ProviderId;
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
+    (void)edr_prop_first_utf8(rec, file_try, sizeof(file_try) / sizeof(file_try[0]),
+                              out_event->path, sizeof(out_event->path));
+  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
+    (void)edr_prop_first_utf8(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]),
+                              out_event->registry_path, sizeof(out_event->registry_path));
+    if (!out_event->path[0]) {
+      snprintf(out_event->path, sizeof(out_event->path), "%s", out_event->registry_path);
+    }
+  } else if (type == EDR_EVENT_NET_CONNECT || type == EDR_EVENT_NET_LISTEN ||
+             type == EDR_EVENT_NET_DNS_QUERY || type == EDR_EVENT_NET_TLS_HANDSHAKE) {
+    if (edr_prop_first_utf8(rec, port_try, sizeof(port_try) / sizeof(port_try[0]), tmp, sizeof(tmp))) {
+      out_event->remote_port = edr_parse_u32_ascii(tmp);
+    }
+    (void)edr_prop_first_utf8(rec, cmd_try, sizeof(cmd_try) / sizeof(cmd_try[0]),
+                              out_event->path, sizeof(out_event->path));
+  } else if (type == EDR_EVENT_PROCESS_CREATE || type == EDR_EVENT_SCRIPT_POWERSHELL ||
+             type == EDR_EVENT_SCRIPT_WMI) {
+    (void)edr_prop_first_utf8(rec, cmd_try, sizeof(cmd_try) / sizeof(cmd_try[0]),
+                              out_event->path, sizeof(out_event->path));
+  }
+  return 1;
+}
+
 static void edr_fallback_raw(PEVENT_RECORD rec, uint8_t *out, size_t out_cap,
                              size_t *written) {
   USHORT n = rec->UserDataLength;

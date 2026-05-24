@@ -61,7 +61,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 - **`[agent].endpoint_id` / `tenant_id`**：注册结果。
 - **`[platform].rest_base_url`**：`{EDR_API_BASE}/api/v1`，供攻击面等 REST（需本机有 `curl` 时与现有逻辑一致）。
 
-**PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：若脚本同目录存在 **`agent.toml.example`**（安装包与 Inno 默认会带上），注册成功后会将上述三项 **合并进完整示例模板** 再写入目标路径，从而保留 **`[collection]`、`[ave]`、`[preprocessing]`** 等默认段落，无需手工拼接。若合并失败则回退为仅含 `[server]`/`[agent]`/`[platform]` 的精简文件。需要旧行为时可传 **`-MinimalTomlOnly`**。
+**PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：若脚本同目录存在 **`agent.toml.example`**（安装包与 Inno 默认会带上），注册成功后会将上述三项 **合并进完整示例模板** 再写入目标路径，从而保留 **`[collection]`、`[ave]`、`[preprocessing]`** 等默认段落，无需手工拼接。生成文件默认会移除模板注释，仅保留一行简短英文说明，避免中文编码和冗长注释污染现场配置；如需保留模板注释用于调试，可传 **`-KeepTemplateComments`** 或设置 **`EDR_KEEP_TEMPLATE_COMMENTS=1`**。若合并失败则回退为仅含 `[server]`/`[agent]`/`[platform]` 的精简文件。需要旧行为时可传 **`-MinimalTomlOnly`**。
 
 **mTLS**：enroll 使用端侧 CSR 签发唯一客户端证书，脚本只保存服务端返回的 `ca.pem` / `client.pem`，不会从服务端接收私钥。默认 PEM 私钥路径为 **`C:\Program Files\EDR Agent\certs\client-key.pem`**；高级模式可用 `EDR_KEY_PROVIDER=cng|tpm|pkcs11` 生成硬件/不可导出 CSR，但当前 gRPC C++ 运行时仍需要 PEM `client_key` 才能启用 RTR 实时通道。
 

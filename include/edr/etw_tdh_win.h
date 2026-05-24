@@ -14,6 +14,7 @@
 #include <evntcons.h>
 
 #include "edr/types.h"
+#include "edr/sensor_interest.h"
 #include <stdint.h>
 
 /**
@@ -25,6 +26,14 @@
  */
 size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
                                   uint8_t *out, size_t out_cap);
+
+/**
+ * P1 规则驱动采集：只提取 ETW 热路径第一道过滤需要的最小字段。
+ * 通过兴趣集后才调用 `edr_tdh_build_slot_payload` 构造完整 BehaviorRecord 载荷。
+ */
+int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
+                                        const char *prov_tag,
+                                        EdrSensorInterestEvent *out_event);
 
 /**
  * 从网络/DNS 类 ETW 记录提取远端 IP、DNS 查询名（UTF-8），供 `AVEBehaviorEvent.target_*` 与 IOC 匹配。
