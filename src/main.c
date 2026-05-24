@@ -134,7 +134,7 @@ static int edr_agent_run_main(const char *config) {
 #endif
   EdrError e = edr_agent_init(agent, config ? config : "");
   if (e != EDR_OK) {
-    fprintf(stderr, "edr_agent_init 失败: %d\n", (int)e);
+    fprintf(stderr, "edr_agent_init failed: %d\n", (int)e);
     edr_agent_destroy(agent);
     return 1;
   }
@@ -160,14 +160,14 @@ static int edr_agent_run_main(const char *config) {
         edr_ensure_parent_dirs_win(fallback);
         sq = edr_storage_queue_open(fallback);
         if (sq == EDR_OK) {
-          fprintf(stderr, "队列使用安装目录路径 (%s)\n", fallback);
+          fprintf(stderr, "[queue] using install-dir path (%s)\n", fallback);
         } else {
-          fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
+          fprintf(stderr, "[queue] open failed (%s): %d\n", qpath, (int)sq);
         }
       } else
 #endif
       {
-        fprintf(stderr, "队列打开失败 (%s): %d\n", qpath, (int)sq);
+        fprintf(stderr, "[queue] open failed (%s): %d\n", qpath, (int)sq);
       }
     }
   }
@@ -192,14 +192,14 @@ static int edr_agent_run_main(const char *config) {
         if (edr_local_evidence_cache_open(fallback,
                                           ac ? ac->offline.evidence_cache_max_size_mb : 128u,
                                           ac ? ac->offline.evidence_cache_retention_hours : 24u) == 0) {
-          fprintf(stderr, "local_evidence_cache 使用安装目录路径 (%s)\n", fallback);
+          fprintf(stderr, "[local_evidence_cache] using install-dir path (%s)\n", fallback);
         } else {
-          fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
+          fprintf(stderr, "[local_evidence_cache] open failed (%s)\n", epath ? epath : "");
         }
       } else
 #endif
       {
-        fprintf(stderr, "local_evidence_cache 打开失败 (%s)\n", epath ? epath : "");
+        fprintf(stderr, "[local_evidence_cache] open failed (%s)\n", epath ? epath : "");
       }
     }
   }
@@ -209,7 +209,7 @@ static int edr_agent_run_main(const char *config) {
   {
     EdrError pe = edr_pmfe_init();
     if (pe != EDR_OK) {
-      fprintf(stderr, "edr_pmfe_init 失败: %d\n", (int)pe);
+      fprintf(stderr, "edr_pmfe_init failed: %d\n", (int)pe);
     }
   }
   edr_transport_init_from_config(edr_agent_get_config(agent));
@@ -217,13 +217,13 @@ static int edr_agent_run_main(const char *config) {
     EdrError se =
         edr_shellcode_detector_init(edr_agent_get_config(agent), edr_agent_event_bus(agent));
     if (se != EDR_OK) {
-      fprintf(stderr, "shellcode_detector 初始化失败: %d\n", (int)se);
+      fprintf(stderr, "shellcode_detector init failed: %d\n", (int)se);
     }
   }
   {
     EdrError we = edr_webshell_detector_init(edr_agent_get_config(agent), edr_agent_event_bus(agent));
     if (we != EDR_OK) {
-      fprintf(stderr, "webshell_detector 初始化失败: %d\n", (int)we);
+      fprintf(stderr, "webshell_detector init failed: %d\n", (int)we);
     }
   }
 #ifdef _WIN32
@@ -352,7 +352,7 @@ int main(int argc, char **argv) {
 #endif
       continue;
     }
-    fprintf(stderr, "未知参数: %s\n", argv[i]);
+    fprintf(stderr, "unknown argument: %s\n", argv[i]);
     print_usage(argv[0]);
     return 1;
   }
@@ -369,7 +369,7 @@ int main(int argc, char **argv) {
     g_service_config_path = config;
     if (!StartServiceCtrlDispatcherA(table)) {
       DWORD err = GetLastError();
-      fprintf(stderr, "StartServiceCtrlDispatcher 失败: %lu\n", (unsigned long)err);
+      fprintf(stderr, "StartServiceCtrlDispatcher failed: %lu\n", (unsigned long)err);
       return 1;
     }
     return 0;
