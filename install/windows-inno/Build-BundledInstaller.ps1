@@ -36,7 +36,10 @@ if (-not (Test-Path -LiteralPath $binExe)) {
     throw "edr_agent.exe not found: $binExe. Pass -BinDir to your staging folder."
 }
 
-$modelsDir = Join-Path (Join-Path (Join-Path $scriptDir "..\..") "models")
+$agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
+$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
+
+$modelsDir = Join-Path $agentRoot "models"
 if (Test-Path -LiteralPath $modelsDir) {
     $onnx = Get-ChildItem -Path $modelsDir -Filter "*.onnx" -File -Recurse -ErrorAction SilentlyContinue
     if (-not $onnx) {
@@ -44,7 +47,7 @@ if (Test-Path -LiteralPath $modelsDir) {
     }
 }
 
-$pre = Join-Path (Join-Path (Join-Path $scriptDir "..\..\..") "edr-backend\platform\config\agent_preprocess_rules_v1.toml")
+$pre = Join-Path $repoRoot "edr-backend\platform\config\agent_preprocess_rules_v1.toml"
 if (-not (Test-Path -LiteralPath $pre)) {
     Write-Warning "Preprocess TOML missing: $pre — run edr-backend/platform/config/generate_agent_preprocess_rules.py first."
 }
