@@ -95,6 +95,65 @@ static void p0_debug_event(const char *prefix, const EdrBehaviorRecord *br,
           br->cmdline[0] ? "cmdline" : "detail", detail ? detail : "");
 }
 
+static int p0_contains_ci(const char *hay, const char *needle) {
+  if (!needle || !needle[0]) {
+    return 1;
+  }
+  if (!hay || !hay[0]) {
+    return 0;
+  }
+  size_t nn = strlen(needle);
+  for (const char *p = hay; *p; p++) {
+    size_t i = 0u;
+    while (i < nn && p[i]) {
+      char a = p[i];
+      char b = needle[i];
+      if (a == '\\') {
+        a = '/';
+      }
+      if (b == '\\') {
+        b = '/';
+      }
+      if (a >= 'A' && a <= 'Z') {
+        a = (char)(a - 'A' + 'a');
+      }
+      if (b >= 'A' && b <= 'Z') {
+        b = (char)(b - 'A' + 'a');
+      }
+      if (a != b) {
+        break;
+      }
+      i++;
+    }
+    if (i == nn) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int p0_is_agent_internal_command(const EdrBehaviorRecord *br) {
+  const char *cmd = br ? br->cmdline : NULL;
+  if (!cmd || !cmd[0]) {
+    return 0;
+  }
+  if (p0_contains_ci(cmd, "/api/v1/agent/sensor-interest.json") ||
+      p0_contains_ci(cmd, "/agent/sensor-interest.json") ||
+      p0_contains_ci(cmd, "edr_sensor_interest_") ||
+      p0_contains_ci(cmd, "/api/v1/agent/rules.toml") ||
+      p0_contains_ci(cmd, "/agent/rules.toml") ||
+      p0_contains_ci(cmd, "/api/v1/agent/p0-bundle.enc") ||
+      p0_contains_ci(cmd, "/agent/p0-bundle.enc") ||
+      p0_contains_ci(cmd, "/api/v1/agent/version/latest") ||
+      p0_contains_ci(cmd, "/agent/version/latest") ||
+      p0_contains_ci(cmd, "/api/v1/agent/download/latest") ||
+      p0_contains_ci(cmd, "/agent/download/latest") ||
+      p0_contains_ci(cmd, "edr_remote_")) {
+    return 1;
+  }
+  return 0;
+}
+
 static int p0_ends_with_ci(const char *s, const char *suffix) {
   size_t ns;
   size_t nx;
@@ -721,6 +780,13 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   const char *par = br->parent_name[0] ? br->parent_name : NULL;
   int ch = (int)br->process_chain_depth;
 
+  if (p0_is_agent_internal_command(br)) {
+    if (p0_debug_all_enabled()) {
+      p0_debug_event("internal-skip", br, pn, detail);
+    }
+    return;
+  }
+
   /* Debug default prints matches only. Use EDR_P0_DEBUG_ALL=1 to dump every candidate. */
   static uint64_t s_debug_empty_count;
   if (p0_debug_all_enabled()) {
@@ -753,13 +819,13 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       const char *title = NULL;
       const char *mitre = NULL;
       (void)edr_p0_rule_ir_get_meta(rid, &title, &mitre);
-      fprintf(stderr, "[P0] IR rule matched: rid=%s\n", rid);
       if (p0_debug_enabled()) {
         p0_debug_event(rid, br, pn, detail);
       }
-      (void)emit_for_rule(
-          br, rid, (title && title[0]) ? title : rid, (mitre && mitre[0]) ? mitre : ""
-      );
+      if (emit_for_rule(br, rid, (title && title[0]) ? title : rid,
+                        (mitre && mitre[0]) ? mitre : "")) {
+        fprintf(stderr, "[P0] IR rule emitted: rid=%s\n", rid);
+      }
     }
   } else {
     if (br->type != EDR_EVENT_PROCESS_CREATE) {
