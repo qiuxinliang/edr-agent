@@ -327,14 +327,25 @@ jobs:
             "scripts\windows_service_install.ps1",
             "scripts\windows_isolate_host.ps1",
             "config\agent_windows_production.example.toml",
-            "config\p0_rule_bundle_ir_v1.json",
             "config\p0_rule_bundle_ir_v1.json.enc",
             "config\p0_rule_bundle_manifest.json",
             "config\sensor_interest_manifest.json"
           )) {
             if (Test-Path $p) { $null = $items.Add($p) }
           }
+          if (-not (Test-Path "config\p0_rule_bundle_ir_v1.json.enc")) {
+            throw "missing encrypted P0 rule bundle: config\p0_rule_bundle_ir_v1.json.enc"
+          }
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
+          if (-not (Test-Path -LiteralPath $zip)) { throw "package was not created: $zip" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $entries = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip)).Entries.FullName
+          if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
+            throw "plaintext P0 rule bundle must not be packaged"
+          }
+          if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
+            throw "encrypted P0 rule bundle missing from package"
+          }
 
       - name: Move artifact to workspace
         shell: pwsh
