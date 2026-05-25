@@ -72,13 +72,17 @@ if [[ -f "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" ]]; then
   cp -a "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" "$OUT_DIR/config/"
 fi
 mkdir -p "$OUT_DIR/edr_config"
-for n in "p0_rule_bundle_ir_v1.json.enc" "p0_rule_bundle_manifest.json" "sensor_interest_manifest.json"; do
+for n in "p0_rule_bundle_ir_v1.json.enc" "sensor_interest_manifest.json"; do
   if [[ -f "$EDR_AGENT_DIR/config/$n" ]]; then
     cp -a "$EDR_AGENT_DIR/config/$n" "$OUT_DIR/edr_config/"
   fi
 done
 if [[ -f "$OUT_DIR/edr_config/p0_rule_bundle_ir_v1.json" ]]; then
   echo "Error: plaintext p0_rule_bundle_ir_v1.json must not be packaged" >&2
+  exit 1
+fi
+if [[ -f "$OUT_DIR/edr_config/p0_rule_bundle_manifest.json" ]]; then
+  echo "Error: plaintext p0_rule_bundle_manifest.json must not be packaged" >&2
   exit 1
 fi
 if [[ ! -f "$OUT_DIR/edr_config/p0_rule_bundle_ir_v1.json.enc" ]]; then
@@ -146,6 +150,10 @@ find "$OUT_DIR" -name '.DS_Store' -delete 2>/dev/null || true
 
 mkdir -p "$SCRIPT_DIR/Output"
 ( cd "$SCRIPT_DIR/Output" && rm -f "${OUT_NAME}.zip" && zip -r -q "${OUT_NAME}.zip" "$OUT_NAME" )
+if unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bundle_manifest\.json)$' >/dev/null; then
+  echo "Error: plaintext P0 rules were found in $ZIP_PATH" >&2
+  exit 1
+fi
 echo "OK: $ZIP_PATH"
 echo "Read BUNDLE_README inside the zip for full terminal feature coverage and out-of-band items."
 echo "Optional: EDR_BUNDLE_STRICT=1 to require models/behavior.onnx + a static .onnx before zipping."

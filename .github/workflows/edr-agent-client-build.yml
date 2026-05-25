@@ -328,7 +328,6 @@ jobs:
             "scripts\windows_isolate_host.ps1",
             "config\agent_windows_production.example.toml",
             "config\p0_rule_bundle_ir_v1.json.enc",
-            "config\p0_rule_bundle_manifest.json",
             "config\sensor_interest_manifest.json"
           )) {
             if (Test-Path $p) { $null = $items.Add($p) }
@@ -342,6 +341,9 @@ jobs:
           $entries = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip)).Entries.FullName
           if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
             throw "plaintext P0 rule bundle must not be packaged"
+          }
+          if ($entries -match '(^|/|\\)p0_rule_bundle_manifest\.json$') {
+            throw "plaintext P0 rule manifest must not be packaged"
           }
           if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
             throw "encrypted P0 rule bundle missing from package"
