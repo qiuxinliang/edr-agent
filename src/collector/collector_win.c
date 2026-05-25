@@ -91,15 +91,8 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
       *out_type = EDR_EVENT_DLL_LOAD;
       return 1;
     }
-    /*
-     * Kernel-Process opcode/id varies across Windows builds and manifests. Do
-     * not drop unknown process-provider records here; TDH + P0 validation will
-     * reject DLL-only/noise records, while real cmd/powershell starts must keep
-     * their chance to be parsed.
-     */
     (void)ev_id;
-    *out_type = EDR_EVENT_PROCESS_CREATE;
-    return 1;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     *out_tag = "kfile";
@@ -334,14 +327,48 @@ static int edr_collector_debug_tdh_enabled(void) {
   return cached;
 }
 
+static int edr_collector_debug_tdh_tag_allowed(const char *tag) {
+  const char *filter = getenv("EDR_TDH_DEBUG_TAG");
+  if (!filter || !filter[0] || strcmp(filter, "*") == 0) {
+    return 1;
+  }
+  return tag && strstr(filter, tag) != NULL;
+}
+
+static uint64_t edr_collector_debug_tdh_limit(void) {
+  static uint64_t cached;
+  static int inited;
+  if (!inited) {
+    const char *e = getenv("EDR_TDH_DEBUG_LIMIT");
+    cached = (e && e[0]) ? strtoull(e, NULL, 10) : 80ull;
+    inited = 1;
+  }
+  return cached;
+}
+
 static void edr_collector_debug_tdh_payload(const EdrEventSlot *slot, const char *tag) {
+  static uint64_t printed;
+  uint64_t limit;
   if (!edr_collector_debug_tdh_enabled() || !slot || slot->size == 0u) {
+    return;
+  }
+  if (!edr_collector_debug_tdh_tag_allowed(tag)) {
     return;
   }
   if (slot->type != EDR_EVENT_PROCESS_CREATE && slot->type != EDR_EVENT_SCRIPT_POWERSHELL &&
       slot->type != EDR_EVENT_SCRIPT_WMI) {
     return;
   }
+  limit = edr_collector_debug_tdh_limit();
+  if (limit != 0u && printed >= limit) {
+    if (printed == limit) {
+      fprintf(stderr, "[TDH DEBUG] limit reached (%llu); suppressing further TDH debug\n",
+              (unsigned long long)limit);
+    }
+    printed++;
+    return;
+  }
+  printed++;
   fprintf(stderr, "[TDH DEBUG] tag=%s type=%d payload:\n%.*s\n",
           tag ? tag : "unknown", (int)slot->type, (int)slot->size, (const char *)slot->data);
 }
