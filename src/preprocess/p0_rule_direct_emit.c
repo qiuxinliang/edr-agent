@@ -68,6 +68,52 @@ struct p0_ep_rate_slot {
 static struct p0_ep_rate_slot s_ep_rate[P0_EP_RATE_SLOTS];
 static uint32_t s_ep_rate_next;
 
+static int p0_ends_with_ci(const char *s, const char *suffix) {
+  size_t ns;
+  size_t nx;
+  if (!s || !suffix) {
+    return 0;
+  }
+  ns = strlen(s);
+  nx = strlen(suffix);
+  if (ns < nx) {
+    return 0;
+  }
+  s += ns - nx;
+  for (size_t i = 0; i < nx; i++) {
+    char a = s[i];
+    char b = suffix[i];
+    if (a >= 'A' && a <= 'Z') {
+      a = (char)(a - 'A' + 'a');
+    }
+    if (b >= 'A' && b <= 'Z') {
+      b = (char)(b - 'A' + 'a');
+    }
+    if (a != b) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
+  const char *name;
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE) {
+    return 1;
+  }
+  if (br->pid == 0u) {
+    return 0;
+  }
+  if (!br->process_name[0] && !br->exe_path[0] && !br->cmdline[0]) {
+    return 0;
+  }
+  name = br->process_name[0] ? br->process_name : br->exe_path;
+  if (p0_ends_with_ci(name, ".dll") || p0_ends_with_ci(name, ".sys")) {
+    return 0;
+  }
+  return 1;
+}
+
 static uint64_t p0_monotonic_ms(void) {
 #if defined(_WIN32)
   return (uint64_t)GetTickCount64();
@@ -602,6 +648,23 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     if (!s_logged_once) {
       fprintf(stderr, "[P0] INFO: EDR_P0_DIRECT_EMIT=%s, P0 rule engine disabled\n", p0_env ? p0_env : "(not set)");
       s_logged_once = 1;
+    }
+    return;
+  }
+
+  if (!p0_valid_process_create_record(br)) {
+    static uint64_t s_invalid_process_create;
+    static int s_invalid_debug_enabled = -1;
+    if (s_invalid_debug_enabled < 0) {
+      s_invalid_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
+    }
+    s_invalid_process_create++;
+    if (s_invalid_debug_enabled &&
+        (s_invalid_process_create == 1u || (s_invalid_process_create & 1023u) == 0u)) {
+      fprintf(stderr,
+              "[P0 DEBUG] invalid process_create skipped: count=%llu pid=%u process=%s cmdline=%s\n",
+              (unsigned long long)s_invalid_process_create, br->pid,
+              br->process_name[0] ? br->process_name : "", br->cmdline[0] ? br->cmdline : "");
     }
     return;
   }

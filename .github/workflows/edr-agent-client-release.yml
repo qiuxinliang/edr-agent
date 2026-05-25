@@ -233,6 +233,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+            -DEDR_WITH_P0_RULES_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
             -DEDR_WITH_YARA=OFF `

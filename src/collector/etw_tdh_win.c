@@ -40,6 +40,22 @@ static size_t append_utf8(char *base, size_t cap, size_t *off, const char *fmt, 
   return (size_t)n;
 }
 
+static int utf8_looks_text(const char *s) {
+  if (!s || !s[0]) {
+    return 0;
+  }
+  size_t printable = 0;
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    if (*p < 0x20u && *p != '\t') {
+      return 0;
+    }
+    if (*p >= 0x20u && *p != 0x7fu) {
+      printable++;
+    }
+  }
+  return printable >= 2u ? 1 : 0;
+}
+
 static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
                            size_t out_cap) {
   if (!rec || !prop_name || !out || out_cap == 0) {
@@ -67,21 +83,27 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
     return st;
   }
 
+  if (cb == 4) {
+    ULONG v = *(ULONG *)tmp;
+    snprintf(out, out_cap, "%lu", (unsigned long)v);
+    HeapFree(GetProcessHeap(), 0, tmp);
+    return ERROR_SUCCESS;
+  }
+
   if (cb >= 2 && (cb % 2u) == 0) {
     int nchars = (int)(cb / sizeof(WCHAR));
     int n = WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)tmp, nchars, out, (int)out_cap - 1,
                                 NULL, NULL);
     if (n > 0) {
       out[n] = '\0';
+      if (!utf8_looks_text(out)) {
+        HeapFree(GetProcessHeap(), 0, tmp);
+        out[0] = '\0';
+        return ERROR_NOT_FOUND;
+      }
       HeapFree(GetProcessHeap(), 0, tmp);
       return ERROR_SUCCESS;
     }
-  }
-  if (cb == 4) {
-    ULONG v = *(ULONG *)tmp;
-    snprintf(out, out_cap, "%lu", (unsigned long)v);
-    HeapFree(GetProcessHeap(), 0, tmp);
-    return ERROR_SUCCESS;
   }
 
   HeapFree(GetProcessHeap(), 0, tmp);
@@ -195,18 +217,6 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
                               out_event->path, sizeof(out_event->path));
   }
   return 1;
-}
-
-static void edr_fallback_raw(PEVENT_RECORD rec, uint8_t *out, size_t out_cap,
-                             size_t *written) {
-  USHORT n = rec->UserDataLength;
-  if (n > out_cap) {
-    n = (USHORT)out_cap;
-  }
-  if (n > 0 && rec->UserData) {
-    memcpy(out, rec->UserData, n);
-  }
-  *written = n;
 }
 
 size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
@@ -393,10 +403,9 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
                        (char *)out, out_cap, &off);
   }
 
-  if (off == off_after_hdr && rec->UserDataLength > 0) {
-    size_t w = 0;
-    edr_fallback_raw(rec, out, out_cap, &w);
-    return w;
+  if (off == off_after_hdr) {
+    out[0] = '\0';
+    return 0;
   }
 
   if (off < out_cap) {

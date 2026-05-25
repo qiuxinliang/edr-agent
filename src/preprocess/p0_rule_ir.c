@@ -81,6 +81,8 @@ static uint64_t s_rule_evaluate_count[P0_IR_RULES_MAX];
 static uint64_t s_rule_hit_count[P0_IR_RULES_MAX];
 static int s_stats_enabled;
 
+static int p0_ir_load_from_json_text(const char *source_label, const char *data, size_t data_len);
+
 static void p0_ir_stats_init(void) {
   s_stats_enabled = edr_getenv_int_default("EDR_P0_STATS", 0);
   if (s_stats_enabled) {
@@ -438,11 +440,25 @@ static int try_linux_proc_exe(char *out, size_t cap) {
 }
 #endif
 
-static int build_default_path(char *out, size_t cap) {
-  const char *e = getenv("EDR_P0_IR_PATH");
-  if (e && *e) {
-    snprintf(out, cap, "%s", e);
-    return 1;
+static int try_load_ir_path(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  char *buf = NULL;
+  size_t blen = 0;
+  if (!read_full_file(path, &buf, &blen)) {
+    fprintf(stderr, "[p0_rule_ir] cannot read %s\n", path);
+    return 0;
+  }
+  int loaded = p0_ir_load_from_json_text(path, buf, blen) ? 1 : 0;
+  free(buf);
+  return loaded;
+}
+
+static int try_load_default_paths(void) {
+  const char *env_path = getenv("EDR_P0_IR_PATH");
+  if (env_path && env_path[0]) {
+    return try_load_ir_path(env_path);
   }
 #if defined(_WIN32)
   char ex[1024];
@@ -458,34 +474,29 @@ static int build_default_path(char *out, size_t cap) {
       "\\p0_rule_bundle_ir_v1.json.enc",
   };
   for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
-    if ((size_t)snprintf(out, cap, "%s%s", ex, suffixes[i]) >= cap) {
+    char path[2048];
+    if ((size_t)snprintf(path, sizeof(path), "%s%s", ex, suffixes[i]) >= sizeof(path)) {
       continue;
     }
-    if (file_readable(out)) {
+    if (file_readable(path) && try_load_ir_path(path)) {
       return 1;
     }
   }
-  snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json", ex);
-  return 1;
+  return 0;
 #else
-  if (try_linux_proc_exe(out, cap)) {
-    return 1;
+  const char *paths[] = {
+      "edr_config/p0_rule_bundle_ir_v1.json",
+      "edr_config/p0_rule_bundle_ir_v1.json.enc",
+      "config/p0_rule_bundle_ir_v1.json",
+      "config/p0_rule_bundle_ir_v1.json.enc",
+  };
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    if (file_readable(paths[i]) && try_load_ir_path(paths[i])) {
+      return 1;
+    }
   }
-  /* 开发/ctest：CWD 下 edr_config/ */
-  if ((size_t)snprintf(out, cap, "edr_config/p0_rule_bundle_ir_v1.json") < cap &&
-      file_readable(out)) {
-    return 1;
-  }
-  if ((size_t)snprintf(out, cap, "edr_config/p0_rule_bundle_ir_v1.json.enc") < cap &&
-      file_readable(out)) {
-    return 1;
-  }
-  if ((size_t)snprintf(out, cap, "config/p0_rule_bundle_ir_v1.json") < cap &&
-      file_readable(out)) {
-    return 1;
-  }
-  if ((size_t)snprintf(out, cap, "config/p0_rule_bundle_ir_v1.json.enc") < cap &&
-      file_readable(out)) {
+  char proc_path[2048];
+  if (try_linux_proc_exe(proc_path, sizeof(proc_path)) && try_load_ir_path(proc_path)) {
     return 1;
   }
   return 0;
@@ -794,7 +805,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     struct p0_ir_one t;
     memset(&t, 0, sizeof(t));
     snprintf(t.id, sizeof(t.id), "%s", jid->valuestring);
-    snprintf(t.event_type, sizeof(t.event_type), "%s", etbuf);
+    ascii_lower_truncate(t.event_type, sizeof(t.event_type), etbuf);
     cJSON *jtit = cJSON_GetObjectItemCaseSensitive(rnode, "title");
     if (cJSON_IsString(jtit) && jtit->valuestring) {
       snprintf(t.title, sizeof(t.title), "%s", jtit->valuestring);
@@ -910,35 +921,11 @@ void edr_p0_rule_ir_lazy_init(void) {
   s_inited = 1;
   p0_ir_stats_init();
   int loaded = 0;
-  char path[2048];
-  char *buf = NULL;
-  size_t blen = 0;
-  char *decrypted = NULL;
-  if (build_default_path(path, sizeof(path))) {
-    if (read_full_file(path, &buf, &blen)) {
-      if (edr_p0_encrypt_is_edr1((const uint8_t *)buf, blen)) {
-        uint8_t *plain = NULL;
-        size_t plain_len = 0;
-        int dr = edr_p0_encrypt_decrypt_edr1((const uint8_t *)buf, blen, &plain, &plain_len);
-        if (dr == 0) {
-          decrypted = (char *)plain;
-          loaded = p0_ir_load_from_json_text(path, decrypted, plain_len) ? 1 : 0;
-          free(decrypted);
-          decrypted = NULL;
-        } else {
-          fprintf(stderr, "[p0_rule_ir] decrypt %s failed: %d\n", path, dr);
-        }
-      } else {
-        loaded = p0_ir_load_from_json_text(path, buf, blen) ? 1 : 0;
-      }
-      free(buf);
-    } else {
-      fprintf(stderr, "[p0_rule_ir] cannot read %s\n", path);
-    }
-  } else {
+  loaded = try_load_default_paths();
+  if (!loaded) {
     fprintf(
         stderr,
-        "[p0_rule_ir] no file path (set EDR_P0_IR_PATH or place edr_config next to exe); trying "
+        "[p0_rule_ir] no loadable file path (set EDR_P0_IR_PATH or place edr_config next to exe); trying "
         "fallback\n"
     );
   }
@@ -986,7 +973,6 @@ void edr_p0_rule_ir_reload(void) {
 }
 
 int edr_p0_bundle_dst_path(char *out, size_t cap) {
-  char tmp[2048];
   const char *e = getenv("EDR_P0_IR_PATH");
   if (e && *e) {
     snprintf(out, cap, "%s", e);
@@ -999,6 +985,7 @@ int edr_p0_bundle_dst_path(char *out, size_t cap) {
     return 0;
   }
 #else
+  char tmp[2048];
   if (try_linux_proc_exe(tmp, sizeof(tmp))) {
     snprintf(out, cap, "%s", tmp);
     return 0;
