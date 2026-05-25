@@ -108,10 +108,322 @@ static void edr_ensure_parent_dirs_win(const char *path) {
   }
   (void)CreateDirectoryA(tmp, NULL);
 }
+
+typedef struct EdrWindowsInstallOptions {
+  const char *api_base;
+  const char *enroll_token;
+  const char *install_dir;
+  const char *output;
+  const char *ca_cert;
+  int trust_ca;
+  int install_autorun;
+  int install_service;
+  int harden_acl;
+  int force_enroll;
+  int enable_response_actions;
+} EdrWindowsInstallOptions;
+
+static int edr_win_get_exe_dir(char *out, size_t cap) {
+  DWORD n = 0;
+  char *last_slash = NULL;
+  char *last_backslash = NULL;
+  char *last = NULL;
+  if (!out || cap == 0) {
+    return 0;
+  }
+  n = GetModuleFileNameA(NULL, out, (DWORD)cap);
+  if (n == 0 || (size_t)n >= cap) {
+    return 0;
+  }
+  last_slash = strrchr(out, '/');
+  last_backslash = strrchr(out, '\\');
+  last = (last_backslash && (!last_slash || last_backslash > last_slash)) ? last_backslash
+                                                                          : last_slash;
+  if (!last) {
+    return 0;
+  }
+  *last = '\0';
+  return 1;
+}
+
+static int edr_win_join_path(char *out, size_t cap, const char *base, const char *leaf) {
+  size_t nb = 0;
+  int n = 0;
+  if (!out || cap == 0 || !base || !base[0] || !leaf || !leaf[0]) {
+    return 0;
+  }
+  nb = strlen(base);
+  if (base[nb - 1u] == '\\' || base[nb - 1u] == '/') {
+    n = snprintf(out, cap, "%s%s", base, leaf);
+    return n > 0 && (size_t)n < cap;
+  }
+  n = snprintf(out, cap, "%s\\%s", base, leaf);
+  return n > 0 && (size_t)n < cap;
+}
+
+static int edr_win_find_packaged_file(char *out, size_t cap, const char *exe_dir,
+                                      const char *name) {
+  char candidate[MAX_PATH * 4];
+  char scripts_dir[MAX_PATH * 4];
+  if (!edr_win_join_path(candidate, sizeof(candidate), exe_dir, name)) {
+    return 0;
+  }
+  if (GetFileAttributesA(candidate) != INVALID_FILE_ATTRIBUTES) {
+    if (strlen(candidate) >= cap) {
+      return 0;
+    }
+    memcpy(out, candidate, strlen(candidate) + 1u);
+    return 1;
+  }
+  if (!edr_win_join_path(scripts_dir, sizeof(scripts_dir), exe_dir, "scripts")) {
+    return 0;
+  }
+  if (!edr_win_join_path(candidate, sizeof(candidate), scripts_dir, name)) {
+    return 0;
+  }
+  if (GetFileAttributesA(candidate) != INVALID_FILE_ATTRIBUTES) {
+    if (strlen(candidate) >= cap) {
+      return 0;
+    }
+    memcpy(out, candidate, strlen(candidate) + 1u);
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_win_cmd_append_raw(char *cmd, size_t cap, const char *s) {
+  size_t used = 0;
+  size_t add = 0;
+  if (!cmd || !s) {
+    return 0;
+  }
+  used = strlen(cmd);
+  add = strlen(s);
+  if (used + add + 1u >= cap) {
+    return 0;
+  }
+  memcpy(cmd + used, s, add + 1u);
+  return 1;
+}
+
+static int edr_win_cmd_append_arg(char *cmd, size_t cap, const char *arg) {
+  size_t used = 0;
+  size_t backslashes = 0;
+  if (!cmd || !arg) {
+    return 0;
+  }
+  used = strlen(cmd);
+  if (used > 0 && !edr_win_cmd_append_raw(cmd, cap, " ")) {
+    return 0;
+  }
+  if (!edr_win_cmd_append_raw(cmd, cap, "\"")) {
+    return 0;
+  }
+  for (const char *p = arg; *p; p++) {
+    if (*p == '\\') {
+      backslashes++;
+      continue;
+    }
+    if (*p == '"') {
+      while (backslashes > 0) {
+        if (!edr_win_cmd_append_raw(cmd, cap, "\\\\")) {
+          return 0;
+        }
+        backslashes--;
+      }
+      if (!edr_win_cmd_append_raw(cmd, cap, "\\\"")) {
+        return 0;
+      }
+      continue;
+    }
+    while (backslashes > 0) {
+      if (!edr_win_cmd_append_raw(cmd, cap, "\\")) {
+        return 0;
+      }
+      backslashes--;
+    }
+    char tmp[2] = {*p, '\0'};
+    if (!edr_win_cmd_append_raw(cmd, cap, tmp)) {
+      return 0;
+    }
+  }
+  while (backslashes > 0) {
+    if (!edr_win_cmd_append_raw(cmd, cap, "\\\\")) {
+      return 0;
+    }
+    backslashes--;
+  }
+  return edr_win_cmd_append_raw(cmd, cap, "\"");
+}
+
+static int edr_win_append_named_arg(char *cmd, size_t cap, const char *name, const char *value) {
+  if (!edr_win_cmd_append_arg(cmd, cap, name)) {
+    return 0;
+  }
+  return edr_win_cmd_append_arg(cmd, cap, value);
+}
+
+static int edr_win_run_and_wait(const char *cmd, const char *workdir) {
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+  DWORD exit_code = 1;
+  char mutable_cmd[32768];
+  if (!cmd || strlen(cmd) >= sizeof(mutable_cmd)) {
+    return 1;
+  }
+  memset(&si, 0, sizeof(si));
+  memset(&pi, 0, sizeof(pi));
+  si.cb = sizeof(si);
+  snprintf(mutable_cmd, sizeof(mutable_cmd), "%s", cmd);
+  if (!CreateProcessA(NULL, mutable_cmd, NULL, NULL, FALSE, 0, NULL, workdir, &si, &pi)) {
+    fprintf(stderr, "[install] CreateProcess failed: %lu\n", (unsigned long)GetLastError());
+    return 1;
+  }
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  if (!GetExitCodeProcess(pi.hProcess, &exit_code)) {
+    exit_code = 1;
+  }
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return (int)exit_code;
+}
+
+static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
+  char exe_dir[MAX_PATH * 4];
+  char script[MAX_PATH * 4];
+  char service_script[MAX_PATH * 4];
+  char output[MAX_PATH * 4];
+  char exe_path[MAX_PATH * 4];
+  char ca_cert[MAX_PATH * 4];
+  char cmd[32768];
+  int rc = 0;
+  const char *install_dir = NULL;
+  if (!opt || !opt->api_base || !opt->api_base[0] || !opt->enroll_token ||
+      !opt->enroll_token[0]) {
+    fprintf(stderr, "[install] --api-base and --enroll-token are required\n");
+    return 2;
+  }
+  if (opt->install_service && opt->install_autorun) {
+    fprintf(stderr, "[install] choose only one runtime mode: --install-service or --install-autorun\n");
+    return 2;
+  }
+  if (!edr_win_get_exe_dir(exe_dir, sizeof(exe_dir))) {
+    fprintf(stderr, "[install] cannot resolve executable directory\n");
+    return 1;
+  }
+  install_dir = (opt->install_dir && opt->install_dir[0]) ? opt->install_dir : exe_dir;
+  if (!edr_win_find_packaged_file(script, sizeof(script), exe_dir, "edr_agent_install.ps1")) {
+    fprintf(stderr,
+            "[install] edr_agent_install.ps1 not found beside edr_agent.exe or under scripts\\\n");
+    return 1;
+  }
+  if (opt->output && opt->output[0]) {
+    if (strlen(opt->output) >= sizeof(output)) {
+      fprintf(stderr, "[install] output path is too long\n");
+      return 1;
+    }
+    snprintf(output, sizeof(output), "%s", opt->output);
+  } else if (!edr_win_join_path(output, sizeof(output), install_dir, "agent.toml")) {
+    fprintf(stderr, "[install] cannot compose agent.toml path\n");
+    return 1;
+  }
+  if (opt->ca_cert && opt->ca_cert[0]) {
+    if (strlen(opt->ca_cert) >= sizeof(ca_cert)) {
+      fprintf(stderr, "[install] CA certificate path is too long\n");
+      return 1;
+    }
+    snprintf(ca_cert, sizeof(ca_cert), "%s", opt->ca_cert);
+  } else if (!edr_win_join_path(ca_cert, sizeof(ca_cert), install_dir, "certs\\ca.pem")) {
+    fprintf(stderr, "[install] cannot compose CA certificate path\n");
+    return 1;
+  }
+  if (!edr_win_join_path(exe_path, sizeof(exe_path), install_dir, "edr_agent.exe")) {
+    fprintf(stderr, "[install] cannot compose edr_agent.exe path\n");
+    return 1;
+  }
+
+  cmd[0] = '\0';
+  if (!edr_win_cmd_append_arg(cmd, sizeof(cmd), "powershell.exe") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-NoProfile") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-ExecutionPolicy") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "Bypass") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-File") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), script) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-ApiBase", opt->api_base) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-EnrollToken", opt->enroll_token) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-Output", output) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-CaCertPath", ca_cert)) {
+    fprintf(stderr, "[install] command line too long\n");
+    return 1;
+  }
+  if (opt->trust_ca && !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-TrustCa")) {
+    return 1;
+  }
+  if (opt->install_autorun && !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-InstallAutorun")) {
+    return 1;
+  }
+  if (opt->harden_acl && !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-HardenAcl")) {
+    return 1;
+  }
+  if (opt->force_enroll && !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-ForceEnroll")) {
+    return 1;
+  }
+
+  fprintf(stderr, "[install] enrolling endpoint and writing %s\n", output);
+  rc = edr_win_run_and_wait(cmd, exe_dir);
+  if (rc != 0) {
+    fprintf(stderr, "[install] edr_agent_install.ps1 failed: %d\n", rc);
+    return rc;
+  }
+  if (!opt->install_service) {
+    fprintf(stderr, "[install] completed. Start with: edr_agent.exe --config \"%s\"\n", output);
+    return 0;
+  }
+
+  if (!edr_win_find_packaged_file(service_script, sizeof(service_script), exe_dir,
+                                  "windows_service_install.ps1")) {
+    fprintf(stderr,
+            "[install] windows_service_install.ps1 not found beside edr_agent.exe or under scripts\\\n");
+    return 1;
+  }
+  cmd[0] = '\0';
+  if (!edr_win_cmd_append_arg(cmd, sizeof(cmd), "powershell.exe") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-NoProfile") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-ExecutionPolicy") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "Bypass") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-File") ||
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), service_script) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-Action", "Install") ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-ServiceName", g_service_name) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-ExePath", exe_path) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-ConfigPath", output) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-InstallDir", install_dir) ||
+      !edr_win_append_named_arg(cmd, sizeof(cmd), "-DataDir", install_dir)) {
+    fprintf(stderr, "[install] service command line too long\n");
+    return 1;
+  }
+  if (opt->enable_response_actions &&
+      !edr_win_cmd_append_arg(cmd, sizeof(cmd), "-EnableResponseActions")) {
+    return 1;
+  }
+  fprintf(stderr, "[install] installing Windows service %s\n", g_service_name);
+  rc = edr_win_run_and_wait(cmd, exe_dir);
+  if (rc != 0) {
+    fprintf(stderr, "[install] windows_service_install.ps1 failed: %d\n", rc);
+  }
+  return rc;
+}
 #endif
 
 static void print_usage(const char *argv0) {
-  fprintf(stderr, "用法: %s [--config <path>] [--service] [--service-name <name>] [--etw-uninstall-cleanup]\n", argv0);
+  fprintf(stderr,
+          "Usage: %s [--config <path>] [--service] [--service-name <name>] "
+          "[--etw-uninstall-cleanup]\n",
+          argv0);
+  fprintf(stderr,
+          "       %s --install --api-base <url> --enroll-token <token> "
+          "[--trust-ca] [--install-autorun|--install-service] [--force-enroll]\n",
+          argv0);
   fprintf(stderr,
           "  EDR Agent — 端点实现（初版：采集/预处理/批次/gRPC/指令/AVE 等已接通，见 README「实现状态快照」；"
           "设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md）\n");
@@ -338,6 +650,12 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
 int main(int argc, char **argv) {
   const char *config = NULL;
   int run_as_service = 0;
+#ifdef _WIN32
+  int install_mode = 0;
+  int install_arg_seen = 0;
+  EdrWindowsInstallOptions install_opt;
+  memset(&install_opt, 0, sizeof(install_opt));
+#endif
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
       print_usage(argv[0]);
@@ -351,6 +669,78 @@ int main(int argc, char **argv) {
       config = argv[++i];
       continue;
     }
+#ifdef _WIN32
+    if (strcmp(argv[i], "--install") == 0) {
+      install_mode = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--api-base") == 0 && i + 1 < argc) {
+      install_arg_seen = 1;
+      install_opt.api_base = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--enroll-token") == 0 && i + 1 < argc) {
+      install_arg_seen = 1;
+      install_opt.enroll_token = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--install-dir") == 0 && i + 1 < argc) {
+      install_arg_seen = 1;
+      install_opt.install_dir = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+      install_arg_seen = 1;
+      install_opt.output = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--ca-cert") == 0 && i + 1 < argc) {
+      install_arg_seen = 1;
+      install_opt.ca_cert = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--trust-ca") == 0) {
+      install_arg_seen = 1;
+      install_opt.trust_ca = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--install-autorun") == 0) {
+      install_arg_seen = 1;
+      install_opt.install_autorun = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--install-service") == 0) {
+      install_arg_seen = 1;
+      install_opt.install_service = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--harden-acl") == 0) {
+      install_arg_seen = 1;
+      install_opt.harden_acl = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--force-enroll") == 0) {
+      install_arg_seen = 1;
+      install_opt.force_enroll = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--enable-response-actions") == 0) {
+      install_arg_seen = 1;
+      install_opt.enable_response_actions = 1;
+      continue;
+    }
+#else
+    if (strcmp(argv[i], "--install") == 0 || strcmp(argv[i], "--api-base") == 0 ||
+        strcmp(argv[i], "--enroll-token") == 0 || strcmp(argv[i], "--install-dir") == 0 ||
+        strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "--ca-cert") == 0 ||
+        strcmp(argv[i], "--trust-ca") == 0 || strcmp(argv[i], "--install-autorun") == 0 ||
+        strcmp(argv[i], "--install-service") == 0 || strcmp(argv[i], "--harden-acl") == 0 ||
+        strcmp(argv[i], "--force-enroll") == 0 ||
+        strcmp(argv[i], "--enable-response-actions") == 0) {
+      fprintf(stderr, "--install is only supported by Windows packages\n");
+      return 2;
+    }
+#endif
     if (strcmp(argv[i], "--service") == 0) {
       run_as_service = 1;
       continue;
@@ -369,6 +759,16 @@ int main(int argc, char **argv) {
   }
 
 #ifdef _WIN32
+  if (!install_mode && install_arg_seen) {
+    fprintf(stderr, "installer arguments require --install\n");
+    return 2;
+  }
+  if (install_mode) {
+    if (config && !install_opt.output) {
+      install_opt.output = config;
+    }
+    return edr_windows_install(&install_opt);
+  }
   if (!config) {
     config = edr_default_windows_config_path();
   }

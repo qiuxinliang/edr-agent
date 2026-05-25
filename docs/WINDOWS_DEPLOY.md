@@ -55,7 +55,32 @@ Copy-Item .\edr_agent.exe "C:\Program Files\EDR Agent\edr_agent.exe" -Force
 Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows_isolate_host.ps1" -Force
 ```
 
-2. 生成生产配置。`scripts/edr_agent_install.ps1` 默认写入紧凑可运行的 Windows 配置，自动生成端侧私钥/CSR，调用 enroll 签发终端唯一客户端证书，并写入 mTLS 证书路径。输出的 `agent.toml` 只保留一行英文说明，便于现场排障并避免模板注释、中文编码和异常换行问题：
+2. 推荐入口：直接使用 `edr_agent.exe --install`。它会调用同目录或 `scripts\` 下的 `edr_agent_install.ps1` 生成生产配置，自动生成端侧私钥/CSR，调用 enroll 签发终端唯一客户端证书，并写入 mTLS 证书路径；传 `--install-service` 时继续注册并启动 Windows 服务：
+
+```powershell
+cd "C:\Program Files\EDR Agent"
+.\edr_agent.exe --install `
+  --api-base "https://edr.example.com:8080" `
+  --enroll-token "<token>" `
+  --trust-ca `
+  --install-service `
+  --enable-response-actions
+```
+
+输出的 `agent.toml` 只保留一行英文说明，便于现场排障并避免模板注释、中文编码和异常换行问题。便携测试可将 `--install-service` 换成 `--install-autorun`；二者不要同时启用，避免重复启动。
+
+批量分发 zip 时，也可以调用包内 **`scripts\edr_agent_zip_deploy.ps1`**。该脚本会先把包复制到 `C:\Program Files\EDR Agent`，再执行同一套 `edr_agent.exe --install` 流程：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\edr_agent_zip_deploy.ps1 `
+  -ApiBase "https://edr.example.com:8080" `
+  -EnrollToken "<token>" `
+  -TrustCa `
+  -RuntimeMode service `
+  -EnableResponseActions
+```
+
+3. 如需分步排查，可先只生成生产配置：
 
 ```powershell
 .\scripts\edr_agent_install.ps1 `
@@ -67,7 +92,7 @@ Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows
 
 也可在便携部署中加 `-InstallAutorun`，脚本会在写入 `agent.toml` 后注册开机计划任务；Inno 安装包仍由向导任务完成同样动作。
 
-3. 安装并启动服务：
+4. 安装并启动服务：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -Action Install `

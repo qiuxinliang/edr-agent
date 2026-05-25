@@ -53,6 +53,40 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 如果安装包或现场流程已预置 **`C:\Program Files\EDR Agent\certs\ca.pem`**，`-TrustCa` 会先导入 Windows Root 再发起 enroll。调试自签也可临时使用 `$env:EDR_INSECURE_TLS="1"`（仅用于实验环境）。脚本优先使用 PowerShell/.NET 原生能力生成 PEM 私钥和 CSR；若系统版本过旧，会自动查找同目录、Git for Windows、OpenSSL-Win64 等常见位置的 `openssl.exe` 作为回退。
 
+## 方式四：Windows zip 一条 exe 命令（推荐便携包）
+
+`edr_agent.exe` 可作为安装入口调用同目录或 `scripts\` 下的安装脚本。把 zip 解压到 **`C:\Program Files\EDR Agent`** 后，在管理员 PowerShell 执行：
+
+```powershell
+.\edr_agent.exe --install `
+  --api-base "https://edr.example.com:8080" `
+  --enroll-token "<token>" `
+  --trust-ca `
+  --install-service `
+  --enable-response-actions
+```
+
+该入口会完成 enroll、端侧私钥/CSR、唯一客户端证书、紧凑 `agent.toml` 写入，并在 `--install-service` 模式下注册并启动 Windows 服务。开发或临时测试可把 `--install-service` 换成 `--install-autorun`；两者不要同时使用，避免同一主机启动两个 Agent 实例。常用可选参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--install-dir <dir>` | 默认使用 `edr_agent.exe` 所在目录；生产建议为 `C:\Program Files\EDR Agent` |
+| `--output <path>` | 指定 `agent.toml` 输出路径；也可用 `--config <path>` 兼容指定 |
+| `--ca-cert <path>` | 指定 CA 证书路径；默认 `<install-dir>\certs\ca.pem` |
+| `--force-enroll` | 已存在 `agent.toml` 时仍重新 enroll，适合重装或换租户 |
+| `--service-name <name>` | 与 `--install-service` 配合，指定 Windows 服务名 |
+
+批量分发时可使用 zip 内 **`scripts\edr_agent_zip_deploy.ps1`**：它会把解压目录复制到 `C:\Program Files\EDR Agent`，再调用上面的 exe 安装入口，适合 Intune/SCCM/GPO 脚本化部署：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\edr_agent_zip_deploy.ps1 `
+  -ApiBase "https://edr.example.com:8080" `
+  -EnrollToken "<token>" `
+  -TrustCa `
+  -RuntimeMode service `
+  -EnableResponseActions
+```
+
 ## 生成内容说明
 
 安装器会写入：
@@ -81,6 +115,6 @@ Set-ExecutionPolicy -Scope Process Bypass
     - 可选 **`/EDR_INSECURE_TLS=1`**（或 `true` / `yes`）；短参数：**`/TLS=1`**；等价于勾选向导里的 **Skip TLS certificate verification**；也可继续用 Inno 的 **`/MERGETASKS=enrollinsecure`**。
     - 示例：`EDRAgentSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /API=https://platform.example:8080 /TOK=...`
     - **安全提示**：Token 会出现在**安装进程命令行**中，可能被本机管理员或日志采集看到；生产环境更稳妥的做法是由端管注入短期 Token、或装包后立刻调用 **`edr_agent_install.ps1`**（从密钥保管库取 secret，不写进 exe 参数）。
-  - **`edr-agent-<tag>-windows-amd64.zip`**：便携 **`edr_agent.exe`** + **`agent.toml.example`**。解压后请复制为 **`agent.toml`** 并完成注册或编辑；运行须显式指定配置，例如 **`edr_agent.exe --config .\agent.toml`**。不带参数（或 **`--help`** / **`-h`** / **`/?`**）时进程会**打印用法说明后退出**，不会再用无参方式连接内置占位地址。
+  - **`edr-agent-<tag>-windows-amd64-exe.zip`**：便携 **`edr_agent.exe`** + 运行时 DLL + `VERSION` + Windows 运维脚本 + 加密 P0 规则包。解压到 **`C:\Program Files\EDR Agent`** 后优先执行上文 **`edr_agent.exe --install ...`**；已生成 `agent.toml` 后可用 **`edr_agent.exe --config .\agent.toml`** 前台验证。
 - **Linux**
   - **`edr-agent-<tag>-linux-amd64.zip`**：解压进入 **`edr-agent-<tag>-linux-amd64/`**，执行 **`sudo ./install.sh`**，将把二进制安装到 **`/usr/local/bin/edr_agent`**；若不存在 **`/etc/edr-agent/agent.toml`**，则从包内示例复制一份。注册与写全配置仍用上文 **`edr_agent_install`** 脚本或平台安装包流程。

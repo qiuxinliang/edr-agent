@@ -352,6 +352,7 @@ jobs:
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
+            "scripts\edr_agent_zip_deploy.ps1",
             "scripts\windows_service_install.ps1",
             "scripts\windows_isolate_host.ps1",
             "config\agent_windows_production.example.toml",
@@ -378,6 +379,18 @@ jobs:
           }
           if (-not ($entries -match '(^|/|\\)VERSION$')) {
             throw "VERSION file missing from package"
+          }
+          foreach ($required in @(
+            'edr_agent_install\.ps1',
+            'edr_agent_zip_deploy\.ps1',
+            'windows_service_install\.ps1',
+            'windows_isolate_host\.ps1',
+            'agent_windows_production\.example\.toml',
+            'sensor_interest_manifest\.json'
+          )) {
+            if (-not ($entries -match "(^|/|\\)${required}$")) {
+              throw "required package entry missing: $required"
+            }
           }
 
       - name: Move artifact to workspace
