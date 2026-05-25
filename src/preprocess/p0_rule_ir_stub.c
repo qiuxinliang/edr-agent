@@ -29,6 +29,11 @@ int edr_p0_rule_ir_get_meta(
   return 0;
 }
 
+int edr_p0_rule_ir_get_severity(const char *rule_id) {
+  (void)rule_id;
+  return 3;
+}
+
 int edr_p0_rule_ir_process_create_count(void) { return 0; }
 
 int edr_p0_rule_ir_process_create_id_at(int index, const char **out_id) {

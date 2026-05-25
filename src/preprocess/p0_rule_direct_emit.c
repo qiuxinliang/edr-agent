@@ -95,6 +95,16 @@ static void p0_debug_event(const char *prefix, const EdrBehaviorRecord *br,
           br->cmdline[0] ? "cmdline" : "detail", detail ? detail : "");
 }
 
+static int p0_should_log_dedup(uint32_t suppressed_count) {
+  if (!p0_debug_enabled()) {
+    return 0;
+  }
+  return (suppressed_count == 1u || suppressed_count == 2u || suppressed_count == 4u ||
+          suppressed_count == 8u || suppressed_count == 16u || (suppressed_count % 64u) == 0u)
+             ? 1
+             : 0;
+}
+
 static int p0_contains_ci(const char *hay, const char *needle) {
   if (!needle || !needle[0]) {
     return 1;
@@ -238,17 +248,23 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
       if (s_p0_dedup[i].event_time_ns == br->event_time_ns) {
         s_p0_dedup[i].suppressed_count++;
         s_p0_dedup_suppressed_total++;
-        fprintf(stderr, "[P0] dedup: skip exact-duplicate event (rule=%s pid=%u ts=%lld)\n",
-                rule_id, br->pid, (long long)br->event_time_ns);
+        if (p0_should_log_dedup(s_p0_dedup[i].suppressed_count)) {
+          fprintf(stderr, "[P0 DEBUG] dedup: skip exact-duplicate event (rule=%s pid=%u ts=%lld suppressed=%u total_suppressed=%llu)\n",
+                  rule_id, br->pid, (long long)br->event_time_ns,
+                  s_p0_dedup[i].suppressed_count,
+                  (unsigned long long)s_p0_dedup_suppressed_total);
+        }
         return 0;
       }
       if (now < s_p0_dedup[i].last_ms + window_ms) {
         s_p0_dedup[i].suppressed_count++;
         s_p0_dedup_suppressed_total++;
-        fprintf(stderr, "[P0] dedup: suppress (rule=%s pid=%u window=%lus suppressed=%u total_suppressed=%llu)\n",
-                rule_id, br->pid, (unsigned long)win_sec,
-                s_p0_dedup[i].suppressed_count,
-                (unsigned long long)s_p0_dedup_suppressed_total);
+        if (p0_should_log_dedup(s_p0_dedup[i].suppressed_count)) {
+          fprintf(stderr, "[P0 DEBUG] dedup: suppress (rule=%s pid=%u window=%lus suppressed=%u total_suppressed=%llu)\n",
+                  rule_id, br->pid, (unsigned long)win_sec,
+                  s_p0_dedup[i].suppressed_count,
+                  (unsigned long long)s_p0_dedup_suppressed_total);
+        }
         return 0;
       }
       s_p0_dedup[i].last_ms = now;
@@ -427,7 +443,18 @@ static int getenv_int01_disabled_on_zero(const char *k) {
   return 1;
 }
 
-static float sev3_anomaly(void) { return 0.40f + 0.10f * 3.0f; }
+static float p0_anomaly_for_severity(int severity) {
+  if (severity <= 1) {
+    return 0.35f;
+  }
+  if (severity == 2) {
+    return 0.50f;
+  }
+  if (severity >= 4) {
+    return 0.85f;
+  }
+  return 0.70f;
+}
 
 /**
  * RFC 8259 JSON string escape into out. max_in caps raw input bytes (0 = use full C string until NUL).
@@ -499,7 +526,7 @@ static void p0_json_escape_or_empty(const char *in, char *out, size_t out_cap, s
   }
 }
 
-static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const char *title,
+static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
                         const char *mitre_comma) {
   static int s_debug_enabled = -1;
   if (s_debug_enabled < 0) {
@@ -560,7 +587,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, const
   a.timestamp_ns = br->event_time_ns;
   snprintf(a.process_name, sizeof(a.process_name), "%s", pn && pn[0] ? pn : "");
   snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path);
-  a.anomaly_score = sev3_anomaly();
+  a.anomaly_score = p0_anomaly_for_severity(severity);
   snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma ? mitre_comma : "");
   a.skip_ai_analysis = true;
   a.needs_l2_review = false;
@@ -819,10 +846,11 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       const char *title = NULL;
       const char *mitre = NULL;
       (void)edr_p0_rule_ir_get_meta(rid, &title, &mitre);
+      int severity = edr_p0_rule_ir_get_severity(rid);
       if (p0_debug_enabled()) {
         p0_debug_event(rid, br, pn, detail);
       }
-      if (emit_for_rule(br, rid, (title && title[0]) ? title : rid,
+      if (emit_for_rule(br, rid, severity, (title && title[0]) ? title : rid,
                         (mitre && mitre[0]) ? mitre : "")) {
         fprintf(stderr, "[P0] IR rule emitted: rid=%s\n", rid);
       }
@@ -835,19 +863,19 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       if (p0_debug_enabled()) {
         p0_debug_event("R-EXEC-001", br, pn, detail);
       }
-      (void)emit_for_rule(br, "R-EXEC-001", "PowerShell 编码命令执行", "T1059.001");
+      (void)emit_for_rule(br, "R-EXEC-001", 3, "PowerShell 编码命令执行", "T1059.001");
     }
     if (edr_p0_rule_matches3("R-CRED-001", pn, cmd, par, ch)) {
       if (p0_debug_enabled()) {
         p0_debug_event("R-CRED-001", br, pn, detail);
       }
-      (void)emit_for_rule(br, "R-CRED-001", "导出 SAM/SYSTEM/SECURITY", "T1003.002");
+      (void)emit_for_rule(br, "R-CRED-001", 3, "导出 SAM/SYSTEM/SECURITY", "T1003.002");
     }
     if (edr_p0_rule_matches3("R-FILELESS-001", pn, cmd, par, ch)) {
       if (p0_debug_enabled()) {
         p0_debug_event("R-FILELESS-001", br, pn, detail);
       }
-      (void)emit_for_rule(br, "R-FILELESS-001", "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027");
+      (void)emit_for_rule(br, "R-FILELESS-001", 3, "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027");
     }
   }
 }

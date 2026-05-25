@@ -27,6 +27,7 @@ int edr_p0_rule_ir_matches(
 
 /* 为直出取元数据；若未加载或无该 id 则返回 0 且 *title=*mitre= 置空。 */
 int edr_p0_rule_ir_get_meta(const char *rule_id, const char **out_title, const char **out_mitre_csv);
+int edr_p0_rule_ir_get_severity(const char *rule_id);
 
 /* 已加载且 event_type=process_create 的规则条数（供直出遍历）。 */
 int edr_p0_rule_ir_process_create_count(void);

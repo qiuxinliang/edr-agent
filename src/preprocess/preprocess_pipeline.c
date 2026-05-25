@@ -154,7 +154,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   }
   size_t n = 0;
   const char *enc = getenv("EDR_BEHAVIOR_ENCODING");
-  if (enc && strcmp(enc, "protobuf") == 0) {
+  if (!enc || enc[0] == '\0' || strcmp(enc, "protobuf") == 0) {
 #ifdef EDR_HAVE_NANOPB
     n = edr_behavior_record_encode_protobuf(&br, buf, sizeof(buf));
 #endif

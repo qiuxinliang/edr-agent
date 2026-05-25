@@ -45,6 +45,7 @@ struct p0_ir_one {
   char title[P0_IR_STR];
   char mitre_csv[P0_IR_STR];
   char event_type[48];
+  int severity;
   int chain_gt; /* 0 = unset */
   int n_name_in;
   char name_in[P0_IR_NAME_IN_MAX][128];
@@ -683,10 +684,7 @@ static int p0_br_wants_event_type(EdrEventType t, const char *et) {
     return 0;
   }
   if (strcmp(et, "process_create") == 0) {
-    return (t == EDR_EVENT_PROCESS_CREATE || t == EDR_EVENT_SCRIPT_POWERSHELL ||
-            t == EDR_EVENT_SCRIPT_WMI)
-               ? 1
-               : 0;
+    return t == EDR_EVENT_PROCESS_CREATE ? 1 : 0;
   }
   if (strcmp(et, "script_powershell") == 0 || strcmp(et, "powershell_script") == 0) {
     return t == EDR_EVENT_SCRIPT_POWERSHELL ? 1 : 0;
@@ -824,6 +822,13 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     memset(&t, 0, sizeof(t));
     snprintf(t.id, sizeof(t.id), "%s", jid->valuestring);
     ascii_lower_truncate(t.event_type, sizeof(t.event_type), etbuf);
+    t.severity = 3;
+    cJSON *jsev = cJSON_GetObjectItemCaseSensitive(rnode, "severity");
+    if (cJSON_IsNumber(jsev)) {
+      t.severity = jsev->valueint;
+      if (t.severity < 1) t.severity = 1;
+      if (t.severity > 4) t.severity = 4;
+    }
     cJSON *jtit = cJSON_GetObjectItemCaseSensitive(rnode, "title");
     if (cJSON_IsString(jtit) && jtit->valuestring) {
       snprintf(t.title, sizeof(t.title), "%s", jtit->valuestring);
@@ -1065,6 +1070,19 @@ int edr_p0_rule_ir_get_meta(
     }
   }
   return 0;
+}
+
+int edr_p0_rule_ir_get_severity(const char *rule_id) {
+  int i;
+  if (!rule_id || !s_ready) {
+    return 3;
+  }
+  for (i = 0; i < s_n; i++) {
+    if (strcmp(s_rule[i].id, rule_id) == 0 && s_rule[i].in_use) {
+      return s_rule[i].severity > 0 ? s_rule[i].severity : 3;
+    }
+  }
+  return 3;
 }
 
 int edr_p0_rule_ir_process_create_count(void) {
