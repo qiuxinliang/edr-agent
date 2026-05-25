@@ -23,6 +23,9 @@ option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of co
 set(EDR_P0_RULES_BUNDLE_VERSION
   "edr-dynamic-rules-v1-r246-b6f5a11c"
   CACHE STRING "P0/dynamic rule bundle version")
+set(EDR_AGENT_VERSION_STRING
+  "${PROJECT_VERSION}"
+  CACHE STRING "Agent version string reported to the platform")
 list(APPEND CMAKE_PREFIX_PATH
   /usr/local/opt/grpc
   /opt/homebrew/opt/grpc
@@ -455,6 +458,7 @@ target_include_directories(edr_agent PRIVATE
 )
 target_compile_definitions(edr_agent PRIVATE
   EDR_HAVE_NANOPB=1
+  "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
   "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
 )
 if(MSVC)

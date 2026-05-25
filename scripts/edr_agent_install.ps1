@@ -10,7 +10,8 @@
   可选：
     EDR_API_BASE / EDR_ENROLL_TOKEN  兼容旧版环境变量传参
     EDR_OUTPUT              输出路径，Windows 默认 C:\Program Files\EDR Agent\agent.toml
-    EDR_AGENT_VERSION       默认 0.3.0
+    EDR_AGENT_VERSION       默认使用环境变量；否则读取包内 VERSION；再否则 0.3.0
+    EDR_FORCE_ENROLL=1      已存在 agent.toml 时仍强制重新 enroll
     EDR_OVERRIDE_SERVER_ADDR
     EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
     EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
@@ -50,6 +51,7 @@ param(
   [switch]$KeepTemplateComments = $($env:EDR_KEEP_TEMPLATE_COMMENTS -eq "1"),
   [switch]$UseTemplateToml = $($env:EDR_USE_TEMPLATE_TOML -eq "1"),
   [switch]$MinimalTomlOnly,
+  [switch]$ForceEnroll = $($env:EDR_FORCE_ENROLL -eq "1"),
   [switch]$DryRun
 )
 
@@ -69,7 +71,36 @@ if (-not $api -or -not $tok) {
 
 $api = $api.TrimEnd("/")
 $uri = "$api/api/v1/enroll"
-$av = if ($env:EDR_AGENT_VERSION) { $env:EDR_AGENT_VERSION } else { "0.3.0" }
+
+function Resolve-AgentVersion {
+  if ($env:EDR_AGENT_VERSION -and $env:EDR_AGENT_VERSION.Trim()) {
+    return $env:EDR_AGENT_VERSION.Trim()
+  }
+  foreach ($vf in @((Join-Path $PSScriptRoot "VERSION"), (Join-Path (Split-Path -Parent $PSScriptRoot) "VERSION"))) {
+    if (Test-Path -LiteralPath $vf) {
+      $v = ([System.IO.File]::ReadAllText($vf)).Trim()
+      if ($v) { return $v }
+    }
+  }
+  return "0.3.0"
+}
+
+function Read-AgentTomlScalar {
+  param([string]$Path, [string]$Key)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return ""
+  }
+  $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*"([^"]*)"'
+  foreach ($line in [System.IO.File]::ReadLines(([System.IO.Path]::GetFullPath($Path)))) {
+    $m = [regex]::Match($line, $pattern)
+    if ($m.Success) {
+      return $m.Groups[1].Value
+    }
+  }
+  return ""
+}
+
+$av = Resolve-AgentVersion
 
 function Resolve-OpenSSL {
   $candidates = New-Object System.Collections.Generic.List[string]
@@ -165,6 +196,23 @@ function Install-BootstrapCaTrust {
     return
   }
   Invoke-Checked -Exe $certutil.Source -ArgList @("-addstore", "Root", $Path)
+}
+
+function Install-AgentAutorun {
+  $autorun = Join-Path $PSScriptRoot "edr_windows_autorun.ps1"
+  if (-not (Test-Path -LiteralPath $autorun)) {
+    $autorun = Join-Path (Split-Path -Parent $PSScriptRoot) "install\windows-inno\edr_windows_autorun.ps1"
+  }
+  if (-not (Test-Path -LiteralPath $autorun)) {
+    Write-Warning "InstallAutorun requested, but edr_windows_autorun.ps1 was not found next to the installer script"
+    return
+  }
+  $autorunArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $autorun, "-Action", "Install")
+  if ($HardenAcl) {
+    $autorunArgs += "-HardenAcl"
+  }
+  Invoke-Checked -Exe "powershell.exe" -ArgList $autorunArgs
+  Write-Host "Installed EdrAgent startup task"
 }
 
 function Normalize-KeyProvider([string]$Provider) {
@@ -383,6 +431,22 @@ function Ensure-AgentCSR {
   $safeCN = if ($SubjectCN) { $SubjectCN.Replace("/", "-").Replace("\", "-") } else { "edr-agent" }
   Invoke-Checked -Exe $openssl -ArgList @("req", "-new", "-key", $KeyPath, "-out", $CsrPath, "-subj", "/CN=$safeCN")
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
+}
+
+$existingEndpointId = Read-AgentTomlScalar -Path $Output -Key "endpoint_id"
+$existingTenantId = Read-AgentTomlScalar -Path $Output -Key "tenant_id"
+if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
+  if ($TrustCa) {
+    Install-BootstrapCaTrust -Path $CaCertPath
+  }
+  if ($ConfigureSensorPolicy) {
+    Enable-WindowsSensorPolicy
+  }
+  if ($InstallAutorun) {
+    Install-AgentAutorun
+  }
+  Write-Host "Existing agent.toml found (endpoint_id=$existingEndpointId tenant_id=$existingTenantId); skipped enroll. Use -ForceEnroll or EDR_FORCE_ENROLL=1 to re-enroll."
+  exit 0
 }
 
 $keyProviderNorm = Normalize-KeyProvider $KeyProvider
@@ -859,18 +923,5 @@ if ($ConfigureSensorPolicy) {
 }
 
 if ($InstallAutorun) {
-  $autorun = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "edr_windows_autorun.ps1"
-  if (-not (Test-Path -LiteralPath $autorun)) {
-    $autorun = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "install\windows-inno\edr_windows_autorun.ps1"
-  }
-  if (-not (Test-Path -LiteralPath $autorun)) {
-    Write-Warning "InstallAutorun requested, but edr_windows_autorun.ps1 was not found next to the installer script"
-  } else {
-    $autorunArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $autorun, "-Action", "Install")
-    if ($HardenAcl) {
-      $autorunArgs += "-HardenAcl"
-    }
-    Invoke-Checked -Exe "powershell.exe" -ArgList $autorunArgs
-    Write-Host "Installed EdrAgent startup task"
-  }
+  Install-AgentAutorun
 }

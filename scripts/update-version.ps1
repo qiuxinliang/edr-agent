@@ -5,7 +5,8 @@
 .DESCRIPTION
     接收 a.b.c 格式的版本号作为唯一参数，自动扫描并更新以下文件中的版本号：
       - vcpkg.json                  (version-string)
-      - src/transport/ingest_http.c (EDR_AGENT_VERSION_STRING)
+      - include/edr/agent_update.h (EDR_AGENT_VERSION_STRING fallback)
+      - src/transport/ingest_http.c (EDR_AGENT_VERSION_STRING fallback)
       - CMakeLists.txt              (project VERSION)
     支持干跑模式（-DryRun），仅报告将会修改的内容而不实际修改文件。
 
@@ -47,15 +48,21 @@ $Rules = @(
         Desc        = 'vcpkg manifest version-string'
     },
     @{
+        File        = 'include/edr/agent_update.h'
+        Pattern     = '(#define\s+EDR_AGENT_VERSION_STRING\s+)"[^"]*"'
+        Replacement = "`$1`"$Version`""
+        Desc        = 'EDR_AGENT_VERSION_STRING header fallback'
+    },
+    @{
         File        = 'src/transport/ingest_http.c'
         Pattern     = '(#define\s+EDR_AGENT_VERSION_STRING\s+)"[^"]*"'
         Replacement = "`$1`"$Version`""
-        Desc        = 'EDR_AGENT_VERSION_STRING macro'
+        Desc        = 'EDR_AGENT_VERSION_STRING transport fallback'
     },
     @{
         File        = 'CMakeLists.txt'
-        Pattern     = '(project\(\s*edr_agent\s+C\s+CXX)(\s+VERSION\s+[0-9.]+)?(\s*\))'
-        Replacement = "`$1 VERSION $Version`$3"
+        Pattern     = '(?s)(project\(\s*edr_agent\b.*?\bVERSION\s+)[0-9]+\.[0-9]+\.[0-9]+(.*?\))'
+        Replacement = "`$1$Version`$2"
         Desc        = 'CMake project() VERSION'
     }
 )

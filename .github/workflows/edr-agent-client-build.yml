@@ -41,6 +41,28 @@ jobs:
         run: |
           chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
           ./scripts/verify_ave_behavior_chain_invariants.sh
+
+      - name: Resolve agent version
+        shell: pwsh
+        run: |
+          $ref = '${{ github.ref_name }}'
+          if ($ref -match '_(\d+\.\d+\.\d+)$') {
+            $ver = $Matches[1]
+          } elseif ($ref -match '^(\d+\.\d+\.\d+)$') {
+            $ver = $Matches[1]
+          } else {
+            $cmake = [System.IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE "CMakeLists.txt"))
+            if ($cmake -match '(?s)project\(\s*edr_agent\b.*?\bVERSION\s+(\d+\.\d+\.\d+)') {
+              $ver = $Matches[1]
+            } else {
+              $ver = "0.1.0"
+            }
+            Write-Warning "Cannot extract semver from ref '$ref'; using project default $ver"
+          }
+          "EDR_AGENT_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $ver)
+          Write-Host "Agent version: $ver"
+
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
@@ -232,6 +254,7 @@ jobs:
           if ('${{ inputs.full_features }}' -eq 'true') {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
               -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
               -DEDR_WITH_GRPC=ON `
@@ -245,6 +268,7 @@ jobs:
           } else {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
               -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
               -DEDR_WITH_GRPC=OFF `
@@ -320,7 +344,11 @@ jobs:
           }
           if (-not $outDir) { throw "missing edr_agent.exe under build\Release or build" }
           $items = New-Object System.Collections.Generic.List[string]
+          if (-not (Test-Path "VERSION")) {
+            [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
+          }
           $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
+          $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
@@ -347,6 +375,9 @@ jobs:
           }
           if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
             throw "encrypted P0 rule bundle missing from package"
+          }
+          if (-not ($entries -match '(^|/|\\)VERSION$')) {
+            throw "VERSION file missing from package"
           }
 
       - name: Move artifact to workspace

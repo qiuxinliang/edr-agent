@@ -60,6 +60,8 @@ jobs:
             Write-Host "::error::update-version.ps1 failed with exit code $LASTEXITCODE"
             throw "Version update failed"
           }
+          "EDR_AGENT_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $ver)
           Write-Host "Version update completed successfully"
 
       - uses: ilammy/msvc-dev-cmd@v1.13.0
@@ -229,6 +231,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DEDR_WITH_GRPC=OFF `
@@ -303,7 +306,11 @@ jobs:
           }
           if (-not $outDir) { throw "missing edr_agent.exe under build\Release or build" }
           $items = New-Object System.Collections.Generic.List[string]
+          if (-not (Test-Path "VERSION")) {
+            [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
+          }
           $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
+          $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
@@ -330,6 +337,9 @@ jobs:
           }
           if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
             throw "encrypted P0 rule bundle missing from package"
+          }
+          if (-not ($entries -match '(^|/|\\)VERSION$')) {
+            throw "VERSION file missing from package"
           }
 
       - name: Move artifact to workspace
@@ -370,6 +380,7 @@ jobs:
             exit 1
           fi
           unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)p0_rule_bundle_ir_v1\.json\.enc$' >/dev/null
+          unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)VERSION$' >/dev/null
       - uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
