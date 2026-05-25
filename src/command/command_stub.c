@@ -17,6 +17,7 @@
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/grpc_client.h"
+#include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
 #include "edr/response.h"
@@ -146,6 +147,13 @@ static int soar_want_report(const EdrSoarCommandMeta *m) {
   return m->soar_correlation_id[0] || m->playbook_run_id[0];
 }
 
+static int command_should_report(const char *cmd_id, const EdrSoarCommandMeta *m) {
+  if (soar_want_report(m)) {
+    return 1;
+  }
+  return cmd_id && strncmp(cmd_id, "cmd_", 4u) == 0;
+}
+
 static const char *response_status_label(EdrCommandExecutionStatus st) {
   switch (st) {
     case EdrCmdExecOk:
@@ -208,8 +216,11 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
            taskj, statusj, exit_code, artifacts && artifacts[0] ? artifacts : "[]", err,
            retryable ? "true" : "false", raw);
   int report_pending = 0;
-  if (soar_want_report(sm)) {
+  if (command_should_report(cmd_id, sm)) {
     int rc = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+    if (rc != 0) {
+      rc = edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+    }
     report_pending = (rc != 0);
   }
   edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "", sm, rstatus,
@@ -1676,6 +1687,10 @@ static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
   minio_key[0] = '\0';
   int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
                                               minio_key, sizeof(minio_key));
+  if (upload_rc != 0) {
+    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "rtr_get_file", path, sha,
+                                                      minio_key, sizeof(minio_key));
+  }
   char pathj[1400], keyj[1400], artifacts[3600], detail[4096];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(keyj, sizeof(keyj), minio_key);
@@ -1909,6 +1924,10 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   char minio_key[1024];
   minio_key[0] = '\0';
   int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "eventlog", path, sha, minio_key, sizeof(minio_key));
+  if (upload_rc != 0) {
+    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "eventlog", path, sha,
+                                                      minio_key, sizeof(minio_key));
+  }
   char pathj[1200], channelj[256], keyj[1200], artifacts[3200], detail[4096];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(channelj, sizeof(channelj), channel);
@@ -2074,6 +2093,10 @@ static void do_registry_query(const char *cmd_id, const uint8_t *pl, size_t len,
   char minio_key[1024];
   minio_key[0] = '\0';
   int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "registry", path, sha, minio_key, sizeof(minio_key));
+  if (upload_rc != 0) {
+    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "registry", path, sha,
+                                                      minio_key, sizeof(minio_key));
+  }
   char pathj[1200], keyj[1400], minioj[1200], artifacts[4800], detail[4800];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(keyj, sizeof(keyj), key);
@@ -2358,7 +2381,8 @@ static void flush_upload_outbox_one(const char *pending_path) {
   }
   char minio_key[1024];
   minio_key[0] = '\0';
-  if (edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
+  if (edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0 ||
+      edr_ingest_http_upload_file_multipart(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
     char done[1100];
     snprintf(done, sizeof(done), "%s.done", pending_path);
     (void)rename(pending_path, done);
@@ -2522,6 +2546,10 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   upload_key[0] = '\0';
   int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
                                               upload_key, sizeof(upload_key));
+  if (upload_rc != 0) {
+    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
+                                                      upload_key, sizeof(upload_key));
+  }
   if (upload_rc != 0) {
     write_upload_outbox(cmd_id, bundle, bundle_sha, manifest);
   }
@@ -2884,7 +2912,7 @@ static int command_deadline_expired(const EdrSoarCommandMeta *sm, char *reason, 
 static void flush_command_result_outbox(void) {
   EdrCommandStateRecord pending[16];
   int n = edr_command_state_collect_pending(pending, sizeof(pending) / sizeof(pending[0]));
-  if (n <= 0 || !edr_grpc_client_ready()) {
+  if (n <= 0) {
     return;
   }
   for (int i = 0; i < n; i++) {
@@ -2893,13 +2921,22 @@ static void flush_command_result_outbox(void) {
     snprintf(sm.soar_correlation_id, sizeof(sm.soar_correlation_id), "%s", pending[i].soar_correlation_id);
     snprintf(sm.playbook_run_id, sizeof(sm.playbook_run_id), "%s", pending[i].playbook_run_id);
     snprintf(sm.playbook_step_id, sizeof(sm.playbook_step_id), "%s", pending[i].playbook_step_id);
-    if (!soar_want_report(&sm)) {
+    if (!command_should_report(pending[i].command_id, &sm)) {
       continue;
     }
-    int rc = edr_grpc_client_report_command_result(pending[i].command_id, &sm,
-                                                   pending[i].execution_status,
-                                                   pending[i].exit_code,
-                                                   pending[i].detail);
+    int rc = -1;
+    if (edr_grpc_client_ready()) {
+      rc = edr_grpc_client_report_command_result(pending[i].command_id, &sm,
+                                                 pending[i].execution_status,
+                                                 pending[i].exit_code,
+                                                 pending[i].detail);
+    }
+    if (rc != 0) {
+      rc = edr_ingest_http_post_command_result(pending[i].command_id, &sm,
+                                               pending[i].execution_status,
+                                               pending[i].exit_code,
+                                               pending[i].detail);
+    }
     if (rc == 0) {
       edr_command_state_mark_reported(&pending[i]);
     }

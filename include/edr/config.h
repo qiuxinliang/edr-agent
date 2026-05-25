@@ -186,6 +186,12 @@ typedef struct EdrConfig {
     char rest_base_url[512];
     char rest_user_id[128];
     char rest_bearer_token[512];
+    /** off | auto | explicit. auto 默认读取 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY。 */
+    char proxy_mode[32];
+    /** 显式 HTTP CONNECT 代理，例如 http://proxy.corp:8080。 */
+    char proxy_url[512];
+    /** 本地 Relay/Gateway 地址；配置后 Agent 优先连接 relay_url，再由 Relay 转发到 Server。 */
+    char relay_url[512];
   } platform;
 
   /**

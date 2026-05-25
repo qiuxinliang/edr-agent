@@ -301,6 +301,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char rules_ver[96], static_ver[48], behavior_ver[48], ioc_ver[48];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1024], sensor_interest_ver[160], sensor_interest_rules[160];
+  char http_conn_mode[48], http_base_url[640], http_relay_url[640], http_proxy_mode[48];
+  char http_proxy_url[640], http_proxy_status[128];
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
   EdrResourceSample rs;
@@ -335,6 +337,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(shell_rules.last_match_source, shell_last_src, sizeof(shell_last_src));
   json_escape_small(grpc_rt.last_error, grpc_err, sizeof(grpc_err));
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
+  json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
+  json_escape_small(http_rt.effective_base_url, http_base_url, sizeof(http_base_url));
+  json_escape_small(http_rt.relay_url, http_relay_url, sizeof(http_relay_url));
+  json_escape_small(http_rt.proxy_mode, http_proxy_mode, sizeof(http_proxy_mode));
+  json_escape_small(http_rt.proxy_url, http_proxy_url, sizeof(http_proxy_url));
+  json_escape_small(http_rt.proxy_status, http_proxy_status, sizeof(http_proxy_status));
   json_escape_small(ch.auditd_last_error, audit_err, sizeof(audit_err));
   json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
   json_escape_small(ch.sensor_interest_version, sensor_interest_ver, sizeof(sensor_interest_ver));
@@ -350,7 +358,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"http_insecure\":%s,\"grpc_rpc_ok\":%lu,\"grpc_rpc_fail\":%lu,"
       "\"grpc_consecutive_failures\":%d,\"http_ok\":%lu,\"http_fail\":%lu,"
       "\"offline_queue_pending\":%llu,\"last_success_unix_ms\":%lld,"
-      "\"last_failure_unix_ms\":%lld,\"last_failure_reason\":\"%s%s%s\"},"
+      "\"last_failure_unix_ms\":%lld,\"last_failure_reason\":\"%s%s%s\","
+      "\"enterprise\":{\"connection_mode\":\"%s\",\"effective_base_url\":\"%s\","
+      "\"relay_url\":\"%s\",\"mtls_configured\":%s,\"websocket_ready\":%s,"
+      "\"proxy_mode\":\"%s\",\"proxy_url\":\"%s\",\"proxy_status\":\"%s\","
+      "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
+      "\"failure_reason\":\"%s%s%s\",\"poll_backoff_ms\":%d,\"ws_backoff_ms\":%d,"
+      "\"pending_upload_queue\":%llu}},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"cpu_percent\":%u,\"rss_mb\":%llu,\"thread_count\":%u,\"handle_count\":%u,"
       "\"throttle_active\":%s,\"sample_count\":%llu},"
@@ -401,6 +415,16 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
                                                                                 : http_rt.last_failure_unix_ms),
       grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+      http_conn_mode[0] ? http_conn_mode : "direct", http_base_url, http_relay_url,
+      http_rt.mtls_configured ? "true" : "false", http_rt.websocket_ready ? "true" : "false",
+      http_proxy_mode[0] ? http_proxy_mode : "auto", http_proxy_url, http_proxy_status,
+      (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
+                                                                                : http_rt.last_success_unix_ms),
+      (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
+                                                                                : http_rt.last_failure_unix_ms),
+      grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+      http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
+      (unsigned long long)edr_storage_queue_pending_count(),
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       rs.cpu_percent, (unsigned long long)rs.rss_mb, rs.thread_count, rs.handle_count,
       rs.throttle_active ? "true" : "false", (unsigned long long)rs.sample_count,
@@ -634,10 +658,13 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
     return;
   }
   if (!url || !url[0]) {
-    if (!agent->cfg.platform.rest_base_url[0]) {
+    const char *base = agent->cfg.platform.relay_url[0]
+                           ? agent->cfg.platform.relay_url
+                           : agent->cfg.platform.rest_base_url;
+    if (!base[0]) {
       return;
     }
-    snprintf(derived, sizeof(derived), "%s/agent/sensor-interest.json", agent->cfg.platform.rest_base_url);
+    snprintf(derived, sizeof(derived), "%s/agent/sensor-interest.json", base);
     url = derived;
   }
   if (iv && iv[0]) {

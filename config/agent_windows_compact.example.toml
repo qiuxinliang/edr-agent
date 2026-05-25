@@ -21,6 +21,9 @@ tenant_id            = "demo-tenant"
 
 [platform]
 rest_base_url        = "https://192.168.3.56:8080/api/v1"
+proxy_mode           = "auto"
+proxy_url            = ""
+relay_url            = ""
 
 [collection]
 etw_enabled          = true

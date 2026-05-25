@@ -25,6 +25,9 @@ tenant_id            = "tenant_default"
 
 [platform]
 rest_base_url        = "https://edr.example.com/api/v1"
+proxy_mode           = "auto"
+proxy_url            = ""
+relay_url            = ""
 
 [collection]
 etw_enabled          = true

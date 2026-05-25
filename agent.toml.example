@@ -34,6 +34,9 @@ tenant_id            = "tenant_default"
 # rest_base_url      = "http://127.0.0.1:8080/api/v1"
 # rest_user_id       = "edr-agent"
 # rest_bearer_token  = ""
+# proxy_mode         = "auto" # auto | off | explicit
+# proxy_url          = ""     # http://proxy.corp:8080
+# relay_url          = ""     # https://relay.corp:443/api/v1
 
 # §19.8 攻击面 TOML（与《EDR_端点详细设计》§19.8 对齐；**成功 POST 最小间隔** = min(port,service,policy,full)；ETW/按需刷新/周期共享；enabled 默认 false）。
 # 快照 JSON 的 collectedAt 为 **UTC**（...Z），与「本地时区显示」需自行换算。

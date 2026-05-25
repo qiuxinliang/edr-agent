@@ -1541,6 +1541,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->forensic_auto.collect_process_tree = true;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
+  snprintf(cfg->platform.proxy_mode, sizeof(cfg->platform.proxy_mode), "%s", "auto");
 
   cfg->attack_surface.enabled = false;
   cfg->attack_surface.port_interval_s = 300u;
@@ -1619,6 +1620,12 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.rest_user_id));
   take_string(toml_string_in(t, "rest_bearer_token"), cfg->platform.rest_bearer_token,
               sizeof(cfg->platform.rest_bearer_token));
+  take_string(toml_string_in(t, "proxy_mode"), cfg->platform.proxy_mode,
+              sizeof(cfg->platform.proxy_mode));
+  take_string(toml_string_in(t, "proxy_url"), cfg->platform.proxy_url,
+              sizeof(cfg->platform.proxy_url));
+  take_string(toml_string_in(t, "relay_url"), cfg->platform.relay_url,
+              sizeof(cfg->platform.relay_url));
 }
 
 /** 解析 `[fl] coordinator_secp256r1_pubkey_hex` → SEC1 点（33 或 65 字节） */

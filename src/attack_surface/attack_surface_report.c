@@ -334,6 +334,8 @@ static void resolve_rest_base(const EdrConfig *cfg, char *out, size_t cap) {
   const char *e = getenv("EDR_PLATFORM_REST_BASE");
   if (e && e[0]) {
     snprintf(out, cap, "%s", e);
+  } else if (cfg && cfg->platform.relay_url[0]) {
+    snprintf(out, cap, "%s", cfg->platform.relay_url);
   } else if (cfg && cfg->platform.rest_base_url[0]) {
     snprintf(out, cap, "%s", cfg->platform.rest_base_url);
   } else {

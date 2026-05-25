@@ -394,7 +394,12 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.rest_bearer_token,
       cfg->agent.endpoint_id,
       NULL /* agent_version */,
-      cfg->server.ca_cert);
+      cfg->server.ca_cert,
+      cfg->server.client_cert,
+      cfg->server.client_key,
+      cfg->platform.proxy_mode,
+      cfg->platform.proxy_url,
+      cfg->platform.relay_url);
   edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version);
 
   /* 启动命令轮询 */

@@ -13,6 +13,9 @@
     EDR_AGENT_VERSION       默认使用环境变量；否则读取包内 VERSION；再否则 0.3.0
     EDR_FORCE_ENROLL=1      已存在 agent.toml 时仍强制重新 enroll
     EDR_OVERRIDE_SERVER_ADDR
+    EDR_PROXY_MODE=auto|off|explicit
+    EDR_PROXY_URL=http://proxy.corp:8080
+    EDR_RELAY_URL=https://relay.corp:443/api/v1
     EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
     EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
     EDR_KEY_PROVIDER=pem|cng|tpm|pkcs11
@@ -39,6 +42,9 @@ param(
   [string]$KeyProvider = $(if ($env:EDR_KEY_PROVIDER) { $env:EDR_KEY_PROVIDER } else { "pem" }),
   [string]$ApiBase = $(if ($env:EDR_API_BASE) { $env:EDR_API_BASE } else { "" }),
   [string]$EnrollToken = $(if ($env:EDR_ENROLL_TOKEN) { $env:EDR_ENROLL_TOKEN } else { "" }),
+  [string]$ProxyMode = $(if ($env:EDR_PROXY_MODE) { $env:EDR_PROXY_MODE } else { "auto" }),
+  [string]$ProxyUrl = $(if ($env:EDR_PROXY_URL) { $env:EDR_PROXY_URL } else { "" }),
+  [string]$RelayUrl = $(if ($env:EDR_RELAY_URL) { $env:EDR_RELAY_URL } else { "" }),
   [string]$CngProviderName = $(if ($env:EDR_CNG_PROVIDER_NAME) { $env:EDR_CNG_PROVIDER_NAME } else { "" }),
   [string]$CngKeyName = $(if ($env:EDR_CNG_KEY_NAME) { $env:EDR_CNG_KEY_NAME } else { "" }),
   [string]$Pkcs11KeyUri = $(if ($env:EDR_PKCS11_KEY_URI) { $env:EDR_PKCS11_KEY_URI } else { "" }),
@@ -501,6 +507,7 @@ if ($env:EDR_OVERRIDE_SERVER_ADDR) {
 }
 
 $rest = "$api/api/v1"
+$agentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $rest }
 $serverIssuedCert = ($d.ca_cert -and $d.client_cert)
 $useCertPaths = [bool]($serverIssuedCert -or $env:EDR_CA_CERT -or $env:EDR_CLIENT_CERT -or $env:EDR_CLIENT_KEY)
 $EffectiveCaCertPath = if ($useCertPaths) { $CaCertPath } else { "" }
@@ -559,6 +566,9 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$CertPath,
     [Parameter(Mandatory = $true)][string]$KeyPath,
     [Parameter(Mandatory = $true)][string]$KeyProvider,
+    [Parameter(Mandatory = $true)][string]$ProxyMode,
+    [AllowEmptyString()][string]$ProxyUrl,
+    [AllowEmptyString()][string]$RelayUrl,
     [AllowEmptyString()][string]$CertStore,
     [Parameter(Mandatory = $true)][string]$CertThumbprint,
     [AllowEmptyString()][string]$Pkcs11ModulePath,
@@ -569,6 +579,7 @@ function Merge-EnrollIntoAgentTomlExample {
   if ($raw.StartsWith([char]0xFEFF)) {
     $raw = $raw.Substring(1)
   }
+  $AgentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $RestBaseUrl.TrimEnd("/") }
   $raw = $raw -replace "`r`n", "`n"
   $lines = $raw.Split([string[]]@("`n"), [System.StringSplitOptions]::None)
   $out = New-Object System.Collections.Generic.List[string]
@@ -640,12 +651,51 @@ function Merge-EnrollIntoAgentTomlExample {
       $i++
       continue
     }
+    if ($line -match '^\s*rest_base_url\s*=') {
+      $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
+      $out.Add(('proxy_mode           = "{0}"' -f (Escape-Toml $ProxyMode)))
+      $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
+      $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
+      $i++
+      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(proxy_mode|proxy_url|relay_url)\s*=')) {
+        $i++
+      }
+      continue
+    }
+    if ($line -match '^\s*rules_url\s*=') {
+      $out.Add(('rules_url            = "{0}/agent/rules.toml"' -f (Escape-Toml $AgentApiBase)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*p0_bundle_url\s*=') {
+      $out.Add(('p0_bundle_url        = "{0}/agent/p0-bundle.enc"' -f (Escape-Toml $AgentApiBase)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*sensor_interest_url\s*=') {
+      $out.Add(('sensor_interest_url  = "{0}/agent/sensor-interest.json"' -f (Escape-Toml $AgentApiBase)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*version_url\s*=') {
+      $out.Add(('version_url          = "{0}/agent/version/latest"' -f (Escape-Toml $AgentApiBase)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*download_url\s*=') {
+      $out.Add(('download_url         = "{0}/agent/download/latest"' -f (Escape-Toml $AgentApiBase)))
+      $i++
+      continue
+    }
     if ($line -match '^\s*#\s*\[platform\]\s*$') {
       $out.Add('[platform]')
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
+      $out.Add(('proxy_mode           = "{0}"' -f (Escape-Toml $ProxyMode)))
+      $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
+      $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
       # 省略 rest_user_id / rest_bearer_token：Agent 默认 X-User-ID=edr-agent；Bearer 用环境变量或后续手写。
       $i++
-      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*#\s*rest_(base_url|user_id|bearer_token)')) {
+      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*#\s*(rest_(base_url|user_id|bearer_token)|proxy_mode|proxy_url|relay_url)')) {
         $i++
       }
       continue
@@ -757,6 +807,9 @@ tenant_id            = "$(Escape-Toml $d.tenant_id)"
 
 [platform]
 rest_base_url        = "$(Escape-Toml $rest)"
+proxy_mode           = "$(Escape-Toml $ProxyMode)"
+proxy_url            = "$(Escape-Toml $ProxyUrl)"
+relay_url            = "$(Escape-Toml $RelayUrl)"
 
 [collection]
 etw_enabled          = true
@@ -846,12 +899,12 @@ enabled              = false
 enabled              = false
 
 [remote]
-rules_url            = "$(Escape-Toml $rest)/agent/rules.toml"
-p0_bundle_url        = "$(Escape-Toml $rest)/agent/p0-bundle.enc"
-sensor_interest_url  = "$(Escape-Toml $rest)/agent/sensor-interest.json"
+rules_url            = "$(Escape-Toml $agentApiBase)/agent/rules.toml"
+p0_bundle_url        = "$(Escape-Toml $agentApiBase)/agent/p0-bundle.enc"
+sensor_interest_url  = "$(Escape-Toml $agentApiBase)/agent/sensor-interest.json"
 poll_interval_s      = 1800
-version_url          = "$(Escape-Toml $rest)/agent/version/latest"
-download_url         = "$(Escape-Toml $rest)/agent/download/latest"
+version_url          = "$(Escape-Toml $agentApiBase)/agent/version/latest"
+download_url         = "$(Escape-Toml $agentApiBase)/agent/download/latest"
 auto_update          = false
 
 "@
@@ -880,7 +933,8 @@ if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $ex
     $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -ServerAddr $saddr `
       -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
       -CaPath $EffectiveCaCertPath -CertPath $EffectiveClientCertPath -KeyPath $EffectiveClientKeyPath `
-      -KeyProvider $keyProviderNorm -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
+      -KeyProvider $keyProviderNorm -ProxyMode $ProxyMode -ProxyUrl $ProxyUrl -RelayUrl $RelayUrl `
+      -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
       -Pkcs11ModulePath $Pkcs11Module -Pkcs11Uri $Pkcs11KeyUri -TpmUri $TpmKeyUri
   } catch {
     Write-Warning ("Merge with agent.toml.example failed, writing minimal TOML only: " + $_)
