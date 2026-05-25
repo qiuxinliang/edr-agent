@@ -51,7 +51,15 @@ project with VERSION, DESCRIPTION or HOMEPAGE_URL must use LANGUAGES before lang
 
 - `Agent CI`: fast Linux/macOS/Windows build and tests without gRPC.
 - `gRPC Smoke`: manual and weekly Ubuntu gRPC build using `apt` packages.
-- `Publish Windows Setup EXE`: Windows installer only, no gRPC/vcpkg.
+- `Publish Windows Setup EXE`: Windows installer only, no gRPC.
+
+The default Windows package now emits both:
+
+- `edr-agent-<tag>-windows-amd64-exe.zip`: raw executable payload, runtime DLLs,
+  scripts, encrypted P0 bundle, sensor interest manifest, `VERSION`, and
+  `edr_agent_setup.exe` inside the zip.
+- `edr-agent-<tag>-windows-amd64-setup.exe`: the same Inno Setup installer as a
+  direct release asset for operator download.
 
 If a Windows gRPC artifact is required later, create a separate manual workflow
 with vcpkg binary cache enabled. Do not add it to the installer path.
