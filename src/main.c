@@ -9,6 +9,7 @@
 
 #include "edr/agent.h"
 #include "edr/ave_sdk.h"
+#include "edr/collector.h"
 #include "edr/dedup.h"
 #include "edr/event_batch.h"
 #include "edr/command.h"
@@ -110,7 +111,7 @@ static void edr_ensure_parent_dirs_win(const char *path) {
 #endif
 
 static void print_usage(const char *argv0) {
-  fprintf(stderr, "用法: %s [--config <path>] [--service] [--service-name <name>]\n", argv0);
+  fprintf(stderr, "用法: %s [--config <path>] [--service] [--service-name <name>] [--etw-uninstall-cleanup]\n", argv0);
   fprintf(stderr,
           "  EDR Agent — 端点实现（初版：采集/预处理/批次/gRPC/指令/AVE 等已接通，见 README「实现状态快照」；"
           "设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md）\n");
@@ -340,6 +341,10 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
       print_usage(argv[0]);
+      return 0;
+    }
+    if (strcmp(argv[i], "--etw-uninstall-cleanup") == 0) {
+      edr_collector_stop_orphan_etw_session();
       return 0;
     }
     if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {

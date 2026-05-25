@@ -543,6 +543,25 @@ static DWORD WINAPI edr_etw_consumer_thread(void *arg) {
   return 0;
 }
 
+void edr_collector_stop_orphan_etw_session(void) {
+  ULONG name_bytes = (ULONG)((wcslen(g_session_name) + 1u) * sizeof(WCHAR));
+  ULONG buffer_size = (ULONG)sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
+  EVENT_TRACE_PROPERTIES *prop =
+      (EVENT_TRACE_PROPERTIES *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, buffer_size);
+  if (!prop) {
+    return;
+  }
+  prop->Wnode.BufferSize = buffer_size;
+  prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+  memcpy((BYTE *)prop + prop->LoggerNameOffset, g_session_name, name_bytes);
+  ULONG status = ControlTraceW((TRACEHANDLE)0, g_session_name, prop, EVENT_TRACE_CONTROL_STOP);
+  if (status != ERROR_SUCCESS && status != ERROR_WMI_INSTANCE_NOT_FOUND) {
+    fprintf(stderr, "[collector_win] orphan ETW cleanup failed session=EDR_Agent_RT_001 status=%lu\n",
+            (unsigned long)status);
+  }
+  HeapFree(GetProcessHeap(), 0, prop);
+}
+
 static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
   return EnableTraceEx2(session, guid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                         TRACE_LEVEL_VERBOSE, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
@@ -636,6 +655,11 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
       EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
 
   ULONG status = StartTraceW(&s_session_handle, g_session_name, prop);
+  if (status == ERROR_ALREADY_EXISTS) {
+    fprintf(stderr, "[collector_win] ETW session already exists; stopping stale session and retrying\n");
+    edr_collector_stop_orphan_etw_session();
+    status = StartTraceW(&s_session_handle, g_session_name, prop);
+  }
   HeapFree(GetProcessHeap(), 0, prop);
 
   if (status != ERROR_SUCCESS) {
