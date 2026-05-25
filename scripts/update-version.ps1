@@ -62,7 +62,7 @@ $Rules = @(
     @{
         File        = 'CMakeLists.txt'
         Pattern     = '(?s)(project\(\s*edr_agent\b.*?\bVERSION\s+)[0-9]+\.[0-9]+\.[0-9]+(.*?\))'
-        Replacement = "`$1$Version`$2"
+        Replacement = '${1}' + $Version + '${2}'
         Desc        = 'CMake project() VERSION'
     }
 )
@@ -108,6 +108,20 @@ try {
             Write-Host "[OK] $File ($Desc) → $Version"
             $Report += "[OK] $File ($Desc) → $Version"
             $UpdatedCount++
+        }
+    }
+
+    $CMakeFile = 'CMakeLists.txt'
+    if (Test-Path -LiteralPath $CMakeFile) {
+        $CMakeText = Get-Content -LiteralPath $CMakeFile -Raw
+        $EscapedVersion = [regex]::Escape($Version)
+        if ($CMakeText -match '(?m)^\s*\$\d+\.\d+\.\d+') {
+            Write-Error "CMakeLists.txt appears corrupted by a regex replacement (line starts with `$<version>)."
+            exit 1
+        }
+        if ($CMakeText -notmatch "(?s)project\(\s*edr_agent\b.*?\bVERSION\s+$EscapedVersion\b") {
+            Write-Error "CMakeLists.txt project() VERSION was not updated to $Version."
+            exit 1
         }
     }
 }

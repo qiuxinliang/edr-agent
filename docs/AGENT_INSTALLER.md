@@ -3,6 +3,7 @@
 平台在租户下签发 **Enrollment Token** 后，终端上只需能访问 **`POST /api/v1/enroll`**（无需登录 JWT），即可领取 **`endpoint_id`、`tenant_id`、`server_addr`**（gRPC 接入），并生成本地 **`agent.toml`**。
 
 **与「管理端生成安装包 / 限时下载链接」的关系**（能力对照、24h 语义、目标架构）见 **`edr-backend/docs/INSTALLER_AND_DOWNLOAD_DESIGN.md`**。
+**端到端发布主流程**（Agent 二进制、预生成安装包、租户下载的分工）见 **`edr-backend/docs/AGENT_TERMINAL_RELEASE_FLOW.md`**。
 
 平台 **`GET .../admin/tenants/:id/installers/:buildId/download`** 返回的 **zip** 内含与本目录同名的 **`edr_agent_install.{py,ps1,sh}`**（由 **`edr-backend/platform/internal/installer/embedded/`** 嵌入构建；更新脚本时请与这里同步，见该目录下 **`SYNC_FROM_EDR_AGENT.md`**；**发版时**见 **`edr-backend/docs/RELEASE_AGENT_INSTALLER_BUNDLE.md`**）及 **`README.txt`**（不含 Token 明文）。
 
