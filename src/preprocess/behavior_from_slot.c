@@ -352,6 +352,18 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->dst, sizeof(f->dst), "%s", val);
   } else if (strcmp(key, "script") == 0) {
     snprintf(f->script, sizeof(f->script), "%s", val);
+  } else if (strcmp(key, "amsi_content") == 0 || strcmp(key, "script_content") == 0 ||
+             strcmp(key, "script_text") == 0) {
+    if (!f->script[0]) {
+      snprintf(f->script, sizeof(f->script), "%s", val);
+    }
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "app_name") == 0) {
+    if (!f->has_img && val[0]) {
+      snprintf(f->img, sizeof(f->img), "%s", val);
+      f->has_img = 1;
+    }
+    append_sensor_kv(f, key, val);
   } else if (strcmp(key, "url") == 0 || strcmp(key, "remote_url") == 0 || strcmp(key, "domain") == 0) {
     snprintf(f->url, sizeof(f->url), "%s", val);
     append_sensor_kv(f, key, val);
@@ -359,9 +371,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->sha256, sizeof(f->sha256), "%s", val);
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "sensor") == 0 || strcmp(key, "provider") == 0 || strcmp(key, "scriptblock_id") == 0 ||
-             strcmp(key, "amsi_content") == 0 || strcmp(key, "amsi_result") == 0 ||
-             strcmp(key, "script_content") == 0 || strcmp(key, "script_text") == 0 ||
-             strcmp(key, "script_hash") == 0 ||
+             strcmp(key, "amsi_result") == 0 || strcmp(key, "script_hash") == 0 ||
              strcmp(key, "ja3") == 0 || strcmp(key, "ja3_hash") == 0 ||
              strcmp(key, "ja3_fingerprint") == 0 || strcmp(key, "ja3_rare") == 0 ||
              strcmp(key, "ja3_unknown") == 0 || strcmp(key, "sni") == 0 ||
@@ -372,8 +382,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
              strcmp(key, "cert_untrusted") == 0 || strcmp(key, "cert_subject") == 0 ||
              strcmp(key, "cert_issuer") == 0 || strcmp(key, "cert_hash") == 0 ||
              strcmp(key, "tls_error") == 0 || strcmp(key, "tls_alert") == 0 ||
-             strcmp(key, "app_name") == 0 || strcmp(key, "amsi_session") == 0 ||
-             strcmp(key, "amsi_size") == 0 ||
+             strcmp(key, "amsi_session") == 0 || strcmp(key, "amsi_size") == 0 ||
              strcmp(key, "file_rate") == 0 || strcmp(key, "ext_burst") == 0 ||
              strcmp(key, "entropy_delta") == 0 || strcmp(key, "file_entropy_delta") == 0 ||
              strcmp(key, "ransom_counter") == 0 ||

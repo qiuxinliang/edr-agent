@@ -687,7 +687,16 @@ static int p0_br_wants_event_type(EdrEventType t, const char *et) {
     return 0;
   }
   if (strcmp(et, "process_create") == 0) {
-    return t == EDR_EVENT_PROCESS_CREATE ? 1 : 0;
+    return (t == EDR_EVENT_PROCESS_CREATE || t == EDR_EVENT_SCRIPT_POWERSHELL ||
+            t == EDR_EVENT_SCRIPT_WMI)
+               ? 1
+               : 0;
+  }
+  if (strcmp(et, "script_powershell") == 0 || strcmp(et, "powershell_script") == 0) {
+    return t == EDR_EVENT_SCRIPT_POWERSHELL ? 1 : 0;
+  }
+  if (strcmp(et, "script_wmi") == 0 || strcmp(et, "wmi_script") == 0) {
+    return t == EDR_EVENT_SCRIPT_WMI ? 1 : 0;
   }
   if (strcmp(et, "file_read") == 0) {
     return t == EDR_EVENT_FILE_READ ? 1 : 0;
@@ -714,7 +723,9 @@ static int p0_rule_has_constraints(const char *et, const struct p0_ir_one *r) {
   if (!r || !et) {
     return 0;
   }
-  if (strcmp(et, "process_create") == 0) {
+  if (strcmp(et, "process_create") == 0 || strcmp(et, "script_powershell") == 0 ||
+      strcmp(et, "powershell_script") == 0 || strcmp(et, "script_wmi") == 0 ||
+      strcmp(et, "wmi_script") == 0) {
     return r->n_name_in > 0 || r->n_parent_in > 0 || r->n_pn_rx > 0 || r->n_pr_rx > 0 || r->n_cmd_any > 0 ||
            r->n_cmd_all > 0 || r->chain_gt > 0;
   }
@@ -735,9 +746,18 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
   if (!r || !br) {
     return 0;
   }
-  if (strcmp(r->event_type, "process_create") == 0) {
+  if (strcmp(r->event_type, "process_create") == 0 || strcmp(r->event_type, "script_powershell") == 0 ||
+      strcmp(r->event_type, "powershell_script") == 0 || strcmp(r->event_type, "script_wmi") == 0 ||
+      strcmp(r->event_type, "wmi_script") == 0) {
+    const char *cmd = br->cmdline[0] ? br->cmdline : br->script_snippet;
+    const char *pn = br->process_name[0] ? br->process_name : NULL;
+    if (!pn && br->type == EDR_EVENT_SCRIPT_POWERSHELL) {
+      pn = "powershell.exe";
+    } else if (!pn && br->type == EDR_EVENT_SCRIPT_WMI) {
+      pn = "wmiprvse.exe";
+    }
     return one_rule_match_process(
-        r, br->process_name, br->cmdline, br->parent_name[0] ? br->parent_name : NULL, (int)br->process_chain_depth
+        r, pn, cmd, br->parent_name[0] ? br->parent_name : NULL, (int)br->process_chain_depth
     );
   }
   if (strcmp(r->event_type, "file_read") == 0 || strcmp(r->event_type, "file_write") == 0) {
@@ -799,7 +819,9 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     }
     if (strcmp(etbuf, "process_create") != 0 && strcmp(etbuf, "file_read") != 0 &&
         strcmp(etbuf, "file_write") != 0 && strcmp(etbuf, "network_connect") != 0 &&
-        strcmp(etbuf, "registry_set") != 0) {
+        strcmp(etbuf, "registry_set") != 0 && strcmp(etbuf, "script_powershell") != 0 &&
+        strcmp(etbuf, "powershell_script") != 0 && strcmp(etbuf, "script_wmi") != 0 &&
+        strcmp(etbuf, "wmi_script") != 0) {
       continue;
     }
     struct p0_ir_one t;
@@ -833,7 +855,9 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!cJSON_IsObject(jcond)) {
       continue;
     }
-    if (strcmp(etbuf, "process_create") == 0) {
+    if (strcmp(etbuf, "process_create") == 0 || strcmp(etbuf, "script_powershell") == 0 ||
+        strcmp(etbuf, "powershell_script") == 0 || strcmp(etbuf, "script_wmi") == 0 ||
+        strcmp(etbuf, "wmi_script") == 0) {
       add_str_array(
           jcond, "process_name_in", t.name_in, &t.n_name_in, P0_IR_NAME_IN_MAX, 1
       );

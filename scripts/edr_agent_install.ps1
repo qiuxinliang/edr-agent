@@ -21,6 +21,7 @@
     EDR_TPM_KEY_URI              TPM/OpenSSL provider key URI；PowerShell 默认走 Windows Platform Crypto Provider
     EDR_TRUST_CA=1          enroll 前将 EDR_CA_CERT 导入 Windows Root（适合企业私有 CA / lab mkcert）
     EDR_INSECURE_TLS=1      [System.Net.ServicePointManager]::ServerCertificateValidationCallback（仅调试）
+    EDR_CONFIGURE_SENSOR_POLICY=0  跳过 Windows 采集策略配置；默认安装时启用进程命令行审计和 PowerShell ScriptBlock。
 
 .EXAMPLE
   $env:EDR_API_BASE="http://127.0.0.1:8080"
@@ -45,6 +46,7 @@ param(
   [switch]$TrustCa = $($env:EDR_TRUST_CA -eq "1"),
   [switch]$InstallAutorun,
   [switch]$HardenAcl,
+  [switch]$ConfigureSensorPolicy = $($env:EDR_CONFIGURE_SENSOR_POLICY -ne "0"),
   [switch]$KeepTemplateComments = $($env:EDR_KEEP_TEMPLATE_COMMENTS -eq "1"),
   [switch]$DryRun,
   # 若同目录存在 agent.toml.example，注册成功后合并为「完整 agent.toml」（保留 collection/ave 等默认），仅覆盖 [server]/[agent]/[platform]。
@@ -104,6 +106,50 @@ function Invoke-Checked {
   & $Exe @ArgList
   if ($LASTEXITCODE -ne 0) {
     Write-Error ("command failed: " + $Exe + " " + ($ArgList -join " "))
+  }
+}
+
+function Test-IsElevated {
+  if ((Get-EnrollOs) -ne "windows") { return $false }
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch {
+    return $false
+  }
+}
+
+function Enable-WindowsSensorPolicy {
+  if ((Get-EnrollOs) -ne "windows") { return }
+  if (-not (Test-IsElevated)) {
+    Write-Warning "ConfigureSensorPolicy skipped: run the installer as Administrator to enable command line audit and PowerShell ScriptBlock telemetry"
+    return
+  }
+
+  $auditpol = Get-Command "auditpol.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($auditpol) {
+    try {
+      Invoke-Checked -Exe $auditpol.Source -ArgList @("/set", "/subcategory:{0CCE922B-69AE-11D9-BED3-505054503030}", "/success:enable")
+    } catch {
+      Write-Warning ("failed to enable Process Creation audit policy: " + $_)
+    }
+  } else {
+    Write-Warning "auditpol.exe not found; Security 4688 process creation audit was not enabled"
+  }
+
+  try {
+    $auditKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit"
+    New-Item -Path $auditKey -Force | Out-Null
+    New-ItemProperty -Path $auditKey -Name "ProcessCreationIncludeCmdLine_Enabled" -Value 1 -PropertyType DWord -Force | Out-Null
+
+    $psKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+    New-Item -Path $psKey -Force | Out-Null
+    New-ItemProperty -Path $psKey -Name "EnableScriptBlockLogging" -Value 1 -PropertyType DWord -Force | Out-Null
+
+    Write-Host "Configured Windows sensor policy: Security 4688 command line + PowerShell ScriptBlock logging"
+  } catch {
+    Write-Warning ("failed to configure Windows sensor policy: " + $_)
   }
 }
 
@@ -714,6 +760,10 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $outFile = [System.IO.Path]::GetFullPath($Output)
 [System.IO.File]::WriteAllText($outFile, $toml, $utf8NoBom)
 Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_id) server.address=$saddr)"
+
+if ($ConfigureSensorPolicy) {
+  Enable-WindowsSensorPolicy
+}
 
 if ($InstallAutorun) {
   $autorun = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "edr_windows_autorun.ps1"

@@ -686,8 +686,13 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   s_ev_ts_ns = br->event_time_ns;
   s_ev_pid = br->pid;
   s_ev_type = (int)br->type;
-  const char *cmd = br->cmdline;
+  const char *cmd = br->cmdline[0] ? br->cmdline : br->script_snippet;
   const char *pn = br->process_name;
+  if ((!pn || !pn[0]) && br->type == EDR_EVENT_SCRIPT_POWERSHELL) {
+    pn = "powershell.exe";
+  } else if ((!pn || !pn[0]) && br->type == EDR_EVENT_SCRIPT_WMI) {
+    pn = "wmiprvse.exe";
+  }
   const char *par = br->parent_name[0] ? br->parent_name : NULL;
   int ch = (int)br->process_chain_depth;
 

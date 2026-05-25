@@ -91,7 +91,15 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
       *out_type = EDR_EVENT_DLL_LOAD;
       return 1;
     }
-    return 0;
+    /*
+     * Kernel-Process opcode/id varies across Windows builds and manifests. Do
+     * not drop unknown process-provider records here; TDH + P0 validation will
+     * reject DLL-only/noise records, while real cmd/powershell starts must keep
+     * their chance to be parsed.
+     */
+    (void)ev_id;
+    *out_type = EDR_EVENT_PROCESS_CREATE;
+    return 1;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     *out_tag = "kfile";
