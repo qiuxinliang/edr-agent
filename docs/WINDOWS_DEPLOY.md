@@ -55,7 +55,7 @@ Copy-Item .\edr_agent.exe "C:\Program Files\EDR Agent\edr_agent.exe" -Force
 Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows_isolate_host.ps1" -Force
 ```
 
-2. 生成生产配置。`scripts/edr_agent_install.ps1` 会优先合并 `config/agent_windows_production.example.toml`，自动生成端侧私钥/CSR，调用 enroll 签发终端唯一客户端证书，并写入 mTLS 证书路径。输出的 `agent.toml` 默认会移除模板注释，只保留一行英文说明，便于现场排障和避免编码问题：
+2. 生成生产配置。`scripts/edr_agent_install.ps1` 默认写入紧凑可运行的 Windows 配置，自动生成端侧私钥/CSR，调用 enroll 签发终端唯一客户端证书，并写入 mTLS 证书路径。输出的 `agent.toml` 只保留一行英文说明，便于现场排障并避免模板注释、中文编码和异常换行问题：
 
 ```powershell
 .\scripts\edr_agent_install.ps1 `

@@ -48,9 +48,9 @@ param(
   [switch]$HardenAcl,
   [switch]$ConfigureSensorPolicy = $($env:EDR_CONFIGURE_SENSOR_POLICY -ne "0"),
   [switch]$KeepTemplateComments = $($env:EDR_KEEP_TEMPLATE_COMMENTS -eq "1"),
-  [switch]$DryRun,
-  # 若同目录存在 agent.toml.example，注册成功后合并为「完整 agent.toml」（保留 collection/ave 等默认），仅覆盖 [server]/[agent]/[platform]。
-  [switch]$MinimalTomlOnly
+  [switch]$UseTemplateToml = $($env:EDR_USE_TEMPLATE_TOML -eq "1"),
+  [switch]$MinimalTomlOnly,
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -276,9 +276,8 @@ function Try-Ensure-NativePemAgentCSR {
     $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new($dn, $rsa, $hash, $padding)
     $csrDer = $req.CreateSigningRequest()
     $keyDer = Convert-RsaParametersToPrivateKeyDer ($rsa.ExportParameters($true))
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($KeyPath)), (ConvertTo-Pem "RSA PRIVATE KEY" $keyDer), $utf8NoBom)
-    [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($CsrPath)), (ConvertTo-Pem "CERTIFICATE REQUEST" $csrDer), $utf8NoBom)
+    [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($KeyPath)), (ConvertTo-Pem "RSA PRIVATE KEY" $keyDer))
+    [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($CsrPath)), (ConvertTo-Pem "CERTIFICATE REQUEST" $csrDer))
     return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
   } catch {
     Write-Verbose ("Native PEM CSR generation unavailable: " + $_)
@@ -320,8 +319,7 @@ Silent = TRUE
 [EnhancedKeyUsageExtension]
 OID=1.3.6.1.5.5.7.3.2
 "@
-  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($infPath)), $inf, $utf8NoBom)
+  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($infPath)), $inf)
   Invoke-Checked -Exe $certreq.Source -ArgList @("-new", "-machine", $infPath, $CsrPath)
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
 }
@@ -457,8 +455,7 @@ function Write-PemNoBom([string]$Path, [string]$Text) {
   if ($dir -and -not (Test-Path $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
   }
-  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text, $utf8NoBom)
+  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text)
 }
 
 function Get-PemCertificateThumbprint([string]$PemText) {
@@ -697,6 +694,102 @@ tenant_id            = "$(Escape-Toml $d.tenant_id)"
 [platform]
 rest_base_url        = "$(Escape-Toml $rest)"
 
+[collection]
+etw_enabled          = true
+ebpf_enabled         = false
+poll_interval_s      = 1
+max_event_queue_size = 32768
+etw_dns_client_provider = false
+etw_powershell_provider = true
+etw_security_audit_provider = true
+etw_wmi_provider = false
+etw_tcpip_provider = false
+etw_firewall_provider = false
+
+[preprocessing]
+dedup_window_s       = 60
+high_freq_threshold  = 40
+sampling_rate_whitelist = 0.03
+rules_version        = "edr-dynamic-rules-v1"
+
+[ave]
+model_dir            = "C:\\Program Files\\EDR Agent\\models"
+scan_threads         = 1
+max_file_size_mb     = 256
+sensitivity          = "MEDIUM"
+behavior_monitor_enabled = false
+
+[forensic_auto]
+enabled              = false
+cooldown_s           = 30
+trigger_on_p0        = true
+collect_process_tree = true
+
+[upload]
+batch_max_events     = 200
+batch_max_size_mb    = 2
+batch_timeout_s      = 2
+max_upload_mbps      = 4
+
+[offline]
+queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
+max_queue_size_mb    = 512
+retention_hours      = 72
+evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db"
+evidence_cache_max_size_mb = 512
+evidence_cache_retention_hours = 72
+
+[resource_limit]
+cpu_limit_percent    = 10
+memory_limit_mb      = 512
+emergency_cpu_limit  = 25
+
+[logging]
+level                = "info"
+log_dir              = "C:\\Program Files\\EDR Agent\\logs"
+max_log_size_mb      = 50
+max_log_files        = 5
+
+[command]
+allow_dangerous      = false
+
+[self_protect]
+anti_debug           = true
+job_object_windows   = true
+watchdog_log_interval_s = 60
+event_bus_pressure_warn_pct = 80
+
+[attack_surface]
+enabled              = false
+
+[detection]
+auto_profile         = true
+shellcode_mode       = 0
+webshell_mode        = 0
+pmfe_mode            = 2
+
+[pmfe]
+idle_scan_enabled    = false
+idle_scan_interval_min = 15
+idle_scan_max_procs  = 8
+idle_cpu_threshold   = 15.0
+idle_skip_on_battery = true
+
+[shellcode_detector]
+enabled              = false
+
+[webshell_detector]
+enabled              = false
+
+[remote]
+rules_url            = "$(Escape-Toml $rest)/agent/rules.toml"
+p0_bundle_url        = "$(Escape-Toml $rest)/agent/p0-bundle.enc"
+sensor_interest_url  = "$(Escape-Toml $rest)/agent/sensor-interest.json"
+poll_interval_s      = 1800
+version_url          = "$(Escape-Toml $rest)/agent/version/latest"
+download_url         = "$(Escape-Toml $rest)/agent/download/latest"
+auto_update          = false
+
 "@
 
 if ($Template) {
@@ -718,7 +811,7 @@ if ($Template) {
   }
 }
 $toml = $tomlMinimal
-if (-not $MinimalTomlOnly -and (Test-Path -LiteralPath $examplePath)) {
+if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $examplePath)) {
   try {
     $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -ServerAddr $saddr `
       -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
@@ -755,10 +848,10 @@ $dir = Split-Path -Parent $Output
 if ($dir -and -not (Test-Path $dir)) {
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
-# 必须无 UTF-8 BOM：Set-Content -Encoding UTF8 在 Windows PowerShell 5.1 会写 BOM，tomlc99 解析报 line 1 missing =（EDR_ERR_CONFIG_PARSE=7002）
-$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+# File.WriteAllText(path, text) uses UTF-8 without BOM on supported .NET runtimes; avoid
+# passing an Encoding object because older Windows PowerShell hosts can construct it as null.
 $outFile = [System.IO.Path]::GetFullPath($Output)
-[System.IO.File]::WriteAllText($outFile, $toml, $utf8NoBom)
+[System.IO.File]::WriteAllText($outFile, $toml)
 Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_id) server.address=$saddr)"
 
 if ($ConfigureSensorPolicy) {

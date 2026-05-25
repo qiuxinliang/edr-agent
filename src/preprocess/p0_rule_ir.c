@@ -468,10 +468,6 @@ static int try_load_default_paths(void) {
   const char *suffixes[] = {
       "\\edr_config\\p0_rule_bundle_ir_v1.json.enc",
       "\\config\\p0_rule_bundle_ir_v1.json.enc",
-      "\\p0_rule_bundle_ir_v1.json.enc",
-      "\\edr_config\\p0_rule_bundle_ir_v1.json",
-      "\\config\\p0_rule_bundle_ir_v1.json",
-      "\\p0_rule_bundle_ir_v1.json",
   };
   for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
     char path[2048];

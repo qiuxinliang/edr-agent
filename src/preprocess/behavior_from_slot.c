@@ -322,6 +322,13 @@ static void append_sensor_kv(Etw1Fields *f, const char *key, const char *val) {
   f->sensor_detail[l] = '\0';
 }
 
+static unsigned long parse_ulong_auto(const char *val) {
+  if (!val) {
+    return 0ul;
+  }
+  return strtoul(val, NULL, 0);
+}
+
 static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   if (!key || !val) {
     return;
@@ -329,13 +336,13 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   if (strcmp(key, "prov") == 0) {
     snprintf(f->prov, sizeof(f->prov), "%s", val);
   } else if (strcmp(key, "pid") == 0) {
-    f->pid = strtoul(val, NULL, 10);
+    f->pid = parse_ulong_auto(val);
   } else if (strcmp(key, "epid") == 0) {
-    f->epid = strtoul(val, NULL, 10);
+    f->epid = parse_ulong_auto(val);
   } else if (strcmp(key, "hint_pid") == 0) {
-    f->epid = strtoul(val, NULL, 10);
+    f->epid = parse_ulong_auto(val);
   } else if (strcmp(key, "ppid") == 0) {
-    f->ppid = strtoul(val, NULL, 10);
+    f->ppid = parse_ulong_auto(val);
   } else if (strcmp(key, "img") == 0) {
     snprintf(f->img, sizeof(f->img), "%s", val);
     f->has_img = 1;

@@ -107,17 +107,17 @@ static void try_install_job_windows(void) {
   }
   s_job = CreateJobObjectW(NULL, NULL);
   if (!s_job || s_job == INVALID_HANDLE_VALUE) {
-    fprintf(stderr, "[self_protect] CreateJobObject 失败 (%lu)\n", (unsigned long)GetLastError());
+    fprintf(stderr, "[self_protect] CreateJobObject failed (%lu)\n", (unsigned long)GetLastError());
     s_job = NULL;
     return;
   }
   if (!AssignProcessToJobObject(s_job, GetCurrentProcess())) {
-    fprintf(stderr, "[self_protect] AssignProcessToJobObject 失败 (%lu)\n", (unsigned long)GetLastError());
+    fprintf(stderr, "[self_protect] AssignProcessToJobObject failed (%lu)\n", (unsigned long)GetLastError());
     CloseHandle(s_job);
     s_job = NULL;
     return;
   }
-  fprintf(stderr, "[self_protect] 已绑定 Windows Job Object\n");
+  fprintf(stderr, "[self_protect] Windows Job Object assigned\n");
 #else
   (void)0;
 #endif
@@ -153,9 +153,9 @@ void edr_self_protect_init(void) {
 #endif
       fclose(f);
       s_pidfile_written = 1;
-      fprintf(stderr, "[self_protect] 已写 PID 文件 %s\n", s_pidfile_path);
+      fprintf(stderr, "[self_protect] pid file written %s\n", s_pidfile_path);
     } else {
-      fprintf(stderr, "[self_protect] 无法写入 PID 文件 %s\n", s_pidfile_path);
+      fprintf(stderr, "[self_protect] pid file write failed %s\n", s_pidfile_path);
     }
   }
 #ifndef _WIN32
@@ -170,7 +170,7 @@ void edr_self_protect_init(void) {
 #ifdef _WIN32
   fprintf(stderr, "[self_protect] enabled (audit)\n");
 #else
-  fprintf(stderr, "[self_protect] 已启用（SIGTERM/SIGINT 审计）\n");
+  fprintf(stderr, "[self_protect] enabled (SIGTERM/SIGINT audit)\n");
 #endif
 }
 
@@ -183,7 +183,7 @@ void edr_self_protect_shutdown(void) {
 #endif
   if (s_pidfile_written && s_pidfile_path[0]) {
     if (remove(s_pidfile_path) == 0) {
-      fprintf(stderr, "[self_protect] 已删除 PID 文件 %s\n", s_pidfile_path);
+      fprintf(stderr, "[self_protect] pid file removed %s\n", s_pidfile_path);
     }
     s_pidfile_written = 0;
   }

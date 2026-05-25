@@ -14,6 +14,7 @@
 
 #include <evntcons.h>
 #include <evntrace.h>
+#include <winevt.h>
 
 #include "edr/collector.h"
 #include "edr/behavior_from_slot.h"
@@ -41,6 +42,7 @@ static EdrEventBus *s_bus;
 static DWORD s_agent_pid;
 static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
+static EVT_HANDLE s_security_sub;
 static volatile LONG s_started;
 static EdrCollectorHealth s_health;
 
@@ -56,6 +58,8 @@ typedef struct {
 
 static EdrCollectorPidCacheEntry s_pid_cache[EDR_COLLECTOR_PID_CACHE];
 static uint32_t s_pid_cache_next;
+
+static int edr_collector_should_admit_slot(EdrEventSlot *slot);
 
 static uint64_t edr_unix_ns(void) {
   FILETIME ft;
@@ -122,12 +126,9 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
     *out_tag = "kreg";
-    /* Kernel-Registry manifest：Opcode 常见为 Task 序号（Create=1 Open=2 DeleteKey=3 SetValue=6 DeleteValue=7） */
+    /* Keep only mutating registry operations. Open/read-style events are too noisy
+     * and previously caused sensitive-policy false positives. */
     if (op == 1u) {
-      *out_type = EDR_EVENT_REG_CREATE_KEY;
-      return 1;
-    }
-    if (op == 2u) {
       *out_type = EDR_EVENT_REG_CREATE_KEY;
       return 1;
     }
@@ -140,8 +141,7 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
       return 1;
     }
     (void)ev_id;
-    *out_type = EDR_EVENT_REG_SET_VALUE;
-    return 1;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
     *out_tag = "dns";
@@ -371,6 +371,169 @@ static void edr_collector_debug_tdh_payload(const EdrEventSlot *slot, const char
   printed++;
   fprintf(stderr, "[TDH DEBUG] tag=%s type=%d payload:\n%.*s\n",
           tag ? tag : "unknown", (int)slot->type, (int)slot->size, (const char *)slot->data);
+}
+
+static int edr_xml_entity_append(char *out, size_t cap, size_t *off, const char *s, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (c == '&') {
+      if (i + 5u <= n && memcmp(s + i, "&amp;", 5) == 0) {
+        c = '&';
+        i += 4u;
+      } else if (i + 4u <= n && memcmp(s + i, "&lt;", 4) == 0) {
+        c = '<';
+        i += 3u;
+      } else if (i + 4u <= n && memcmp(s + i, "&gt;", 4) == 0) {
+        c = '>';
+        i += 3u;
+      } else if (i + 6u <= n && memcmp(s + i, "&quot;", 6) == 0) {
+        c = '"';
+        i += 5u;
+      } else if (i + 6u <= n && memcmp(s + i, "&apos;", 6) == 0) {
+        c = '\'';
+        i += 5u;
+      }
+    }
+    if (*off + 1u >= cap) {
+      out[cap - 1u] = '\0';
+      return 0;
+    }
+    out[(*off)++] = c;
+  }
+  if (*off < cap) {
+    out[*off] = '\0';
+  }
+  return 1;
+}
+
+static int edr_xml_get_data_utf8(const char *xml, const char *name, char *out, size_t cap) {
+  if (!xml || !name || !out || cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  char needle1[160];
+  char needle2[160];
+  snprintf(needle1, sizeof(needle1), "<Data Name='%s'>", name);
+  snprintf(needle2, sizeof(needle2), "<Data Name=\"%s\">", name);
+  const char *p = strstr(xml, needle1);
+  size_t prefix = strlen(needle1);
+  if (!p) {
+    p = strstr(xml, needle2);
+    prefix = strlen(needle2);
+  }
+  if (!p) {
+    return 0;
+  }
+  p += prefix;
+  const char *e = strstr(p, "</Data>");
+  if (!e || e <= p) {
+    return 0;
+  }
+  size_t off = 0u;
+  (void)edr_xml_entity_append(out, cap, &off, p, (size_t)(e - p));
+  return out[0] ? 1 : 0;
+}
+
+static int edr_evt_render_xml_utf8(EVT_HANDLE event, char **out_xml) {
+  DWORD used = 0;
+  DWORD props = 0;
+  if (!out_xml) {
+    return 0;
+  }
+  *out_xml = NULL;
+  (void)EvtRender(NULL, event, EvtRenderEventXml, 0, NULL, &used, &props);
+  if (used == 0u || used > 262144u) {
+    return 0;
+  }
+  WCHAR *wxml = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (SIZE_T)used + sizeof(WCHAR));
+  if (!wxml) {
+    return 0;
+  }
+  if (!EvtRender(NULL, event, EvtRenderEventXml, used, wxml, &used, &props)) {
+    HeapFree(GetProcessHeap(), 0, wxml);
+    return 0;
+  }
+  int need = WideCharToMultiByte(CP_UTF8, 0, wxml, -1, NULL, 0, NULL, NULL);
+  if (need <= 1) {
+    HeapFree(GetProcessHeap(), 0, wxml);
+    return 0;
+  }
+  char *utf8 = (char *)malloc((size_t)need);
+  if (!utf8) {
+    HeapFree(GetProcessHeap(), 0, wxml);
+    return 0;
+  }
+  WideCharToMultiByte(CP_UTF8, 0, wxml, -1, utf8, need, NULL, NULL);
+  HeapFree(GetProcessHeap(), 0, wxml);
+  *out_xml = utf8;
+  return 1;
+}
+
+static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag) {
+  if (!slot) {
+    return 0;
+  }
+  edr_collector_debug_tdh_payload(slot, debug_tag);
+  slot->priority = edr_priority_from_utf8_payload(slot->data, slot->size);
+  if (!edr_collector_should_admit_slot(slot)) {
+    s_health.collector_dropped++;
+    return 0;
+  }
+  if (!edr_event_bus_try_push(s_bus, slot)) {
+    s_health.queue_dropped++;
+    return 0;
+  }
+  return 1;
+}
+
+static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
+                                                   PVOID user_context,
+                                                   EVT_HANDLE event) {
+  (void)user_context;
+  if (action != EvtSubscribeActionDeliver || !s_bus || !event) {
+    return ERROR_SUCCESS;
+  }
+  char *xml = NULL;
+  if (!edr_evt_render_xml_utf8(event, &xml)) {
+    s_health.collector_dropped++;
+    return ERROR_SUCCESS;
+  }
+  char img[1024];
+  char cmd[2048];
+  char epid[64];
+  char ppid[64];
+  char user[256];
+  (void)edr_xml_get_data_utf8(xml, "NewProcessName", img, sizeof(img));
+  (void)edr_xml_get_data_utf8(xml, "CommandLine", cmd, sizeof(cmd));
+  (void)edr_xml_get_data_utf8(xml, "NewProcessId", epid, sizeof(epid));
+  (void)edr_xml_get_data_utf8(xml, "ProcessId", ppid, sizeof(ppid));
+  (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
+  free(xml);
+  if (!img[0] && !cmd[0]) {
+    s_health.collector_dropped++;
+    return ERROR_SUCCESS;
+  }
+
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_unix_ns();
+  slot.type = EDR_EVENT_PROCESS_CREATE;
+  slot.consumed = false;
+  int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
+                   "ETW1\nprov=sec\npid=%s\neid=4688\nop=0\nimg=%s\ncmd=%s\nepid=%s\nppid=%s\nuser=%s\n",
+                   epid[0] ? epid : "0", img, cmd, epid, ppid, user);
+  if (n <= 0) {
+    s_health.collector_dropped++;
+    return ERROR_SUCCESS;
+  }
+  if ((size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
+    n = (int)EDR_MAX_EVENT_PAYLOAD - 1;
+    slot.data[n] = '\0';
+  }
+  slot.size = (uint32_t)n + 1u;
+  s_health.security_audit_visible = 1;
+  (void)edr_push_slot_after_policy(&slot, "sec");
+  return ERROR_SUCCESS;
 }
 
 static void edr_collector_pid_cache_update(const EdrBehaviorRecord *br) {
@@ -715,6 +878,24 @@ static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
   return ERROR_SUCCESS;
 }
 
+static void edr_start_security_eventlog_subscription(void) {
+  if (s_security_sub) {
+    return;
+  }
+  s_security_sub = EvtSubscribe(NULL, NULL, L"Security", L"*[System[(EventID=4688)]]",
+                                NULL, NULL, edr_security_eventlog_callback,
+                                EvtSubscribeToFutureEvents);
+  if (!s_security_sub) {
+    DWORD err = GetLastError();
+    fprintf(stderr,
+            "[collector_win] Security 4688 eventlog subscription disabled err=%lu "
+            "(run elevated and enable Audit Process Creation)\n",
+            (unsigned long)err);
+  } else {
+    s_health.security_audit_visible = 1;
+  }
+}
+
 EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   if (!bus) {
     return EDR_ERR_INVALID_ARG;
@@ -781,6 +962,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     return EDR_ERR_ETW_PROVIDER_ENABLE;
   }
 
+  edr_start_security_eventlog_subscription();
+
   s_consumer_thread =
       CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, NULL);
   if (!s_consumer_thread) {
@@ -805,6 +988,11 @@ void edr_collector_stop(void) {
     stop.Wnode.BufferSize = sizeof(stop);
     ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
+  }
+
+  if (s_security_sub) {
+    EvtClose(s_security_sub);
+    s_security_sub = NULL;
   }
 
   if (s_consumer_thread) {

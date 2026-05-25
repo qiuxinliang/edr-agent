@@ -68,6 +68,33 @@ struct p0_ep_rate_slot {
 static struct p0_ep_rate_slot s_ep_rate[P0_EP_RATE_SLOTS];
 static uint32_t s_ep_rate_next;
 
+static int p0_debug_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
+  }
+  return cached;
+}
+
+static int p0_debug_all_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *e = getenv("EDR_P0_DEBUG_ALL");
+    cached = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+  }
+  return cached;
+}
+
+static void p0_debug_event(const char *prefix, const EdrBehaviorRecord *br,
+                           const char *pn, const char *detail) {
+  if (!br) {
+    return;
+  }
+  fprintf(stderr, "[P0 DEBUG] %s: type=%d pid=%u process=%s %s=%s\n",
+          prefix ? prefix : "event", br->type, br->pid, pn ? pn : "",
+          br->cmdline[0] ? "cmdline" : "detail", detail ? detail : "");
+}
+
 static int p0_ends_with_ci(const char *s, const char *suffix) {
   size_t ns;
   size_t nx;
@@ -654,12 +681,8 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
 
   if (!p0_valid_process_create_record(br)) {
     static uint64_t s_invalid_process_create;
-    static int s_invalid_debug_enabled = -1;
-    if (s_invalid_debug_enabled < 0) {
-      s_invalid_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
-    }
     s_invalid_process_create++;
-    if (s_invalid_debug_enabled &&
+    if (p0_debug_enabled() &&
         (s_invalid_process_create == 1u || (s_invalid_process_create & 1023u) == 0u)) {
       fprintf(stderr,
               "[P0 DEBUG] invalid process_create skipped: count=%llu pid=%u process=%s cmdline=%s\n",
@@ -676,7 +699,8 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   if (br->event_time_ns != 0u && br->event_time_ns == s_ev_ts_ns &&
       br->pid == s_ev_pid && (int)br->type == s_ev_type) {
     s_ev_dup_skipped++;
-    if (s_ev_dup_skipped == 1u || (s_ev_dup_skipped & 1023u) == 0u) {
+    if (p0_debug_all_enabled() &&
+        (s_ev_dup_skipped == 1u || (s_ev_dup_skipped & 1023u) == 0u)) {
       fprintf(stderr, "[P0] skipped duplicate event (ts=%llu pid=%u type=%d count=%llu)\n",
               (unsigned long long)br->event_time_ns, br->pid, (int)br->type,
               (unsigned long long)s_ev_dup_skipped);
@@ -697,18 +721,12 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   const char *par = br->parent_name[0] ? br->parent_name : NULL;
   int ch = (int)br->process_chain_depth;
 
-  /* 调试日志：仅打印含有效数据的 P0 事件，统计空事件（原因：TDH 未产生 img/cmd 行） */
-  static int s_debug_enabled = -1;
+  /* Debug default prints matches only. Use EDR_P0_DEBUG_ALL=1 to dump every candidate. */
   static uint64_t s_debug_empty_count;
-  if (s_debug_enabled < 0) {
-    s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
-  }
-  if (s_debug_enabled) {
+  if (p0_debug_all_enabled()) {
     int has_data = ((pn && pn[0]) || (detail && detail[0]));
     if (has_data) {
-      fprintf(stderr, "[P0 DEBUG] event: type=%d pid=%u process=%s %s=%s\n",
-              br->type, br->pid, pn ? pn : "(null)",
-              br->cmdline[0] ? "cmdline" : "detail", detail ? detail : "(null)");
+      p0_debug_event("candidate", br, pn, detail);
     } else {
       s_debug_empty_count++;
       if (s_debug_empty_count == 1u || (s_debug_empty_count & 1023u) == 0u) {
@@ -736,6 +754,9 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       const char *mitre = NULL;
       (void)edr_p0_rule_ir_get_meta(rid, &title, &mitre);
       fprintf(stderr, "[P0] IR rule matched: rid=%s\n", rid);
+      if (p0_debug_enabled()) {
+        p0_debug_event(rid, br, pn, detail);
+      }
       (void)emit_for_rule(
           br, rid, (title && title[0]) ? title : rid, (mitre && mitre[0]) ? mitre : ""
       );
@@ -745,12 +766,21 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       return;
     }
     if (edr_p0_rule_matches3("R-EXEC-001", pn, cmd, par, ch)) {
+      if (p0_debug_enabled()) {
+        p0_debug_event("R-EXEC-001", br, pn, detail);
+      }
       (void)emit_for_rule(br, "R-EXEC-001", "PowerShell 编码命令执行", "T1059.001");
     }
     if (edr_p0_rule_matches3("R-CRED-001", pn, cmd, par, ch)) {
+      if (p0_debug_enabled()) {
+        p0_debug_event("R-CRED-001", br, pn, detail);
+      }
       (void)emit_for_rule(br, "R-CRED-001", "导出 SAM/SYSTEM/SECURITY", "T1003.002");
     }
     if (edr_p0_rule_matches3("R-FILELESS-001", pn, cmd, par, ch)) {
+      if (p0_debug_enabled()) {
+        p0_debug_event("R-FILELESS-001", br, pn, detail);
+      }
       (void)emit_for_rule(br, "R-FILELESS-001", "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027");
     }
   }

@@ -39,7 +39,7 @@ export EDR_API_BASE="..." EDR_ENROLL_TOKEN="..."
 
 ## 方式三：PowerShell（Windows，一条命令）
 
-**`scripts/edr_agent_install.ps1`**，使用 `Invoke-RestMethod`。默认会自动生成终端私钥和 CSR，调用 enroll 换取 `ca.pem` / `client.pem`，并写入完整 `agent.toml`；不再要求手工设置多条环境变量。
+**`scripts/edr_agent_install.ps1`**，使用 `Invoke-RestMethod`。默认会自动生成终端私钥和 CSR，调用 enroll 换取 `ca.pem` / `client.pem`，并写入紧凑可运行的 `agent.toml`；不再要求手工设置多条环境变量。
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -61,7 +61,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 - **`[agent].endpoint_id` / `tenant_id`**：注册结果。
 - **`[platform].rest_base_url`**：`{EDR_API_BASE}/api/v1`，供攻击面等 REST（需本机有 `curl` 时与现有逻辑一致）。
 
-**PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：若脚本同目录存在 **`agent.toml.example`**（安装包与 Inno 默认会带上），注册成功后会将上述三项 **合并进完整示例模板** 再写入目标路径，从而保留 **`[collection]`、`[ave]`、`[preprocessing]`** 等默认段落，无需手工拼接。生成文件默认会移除模板注释，仅保留一行简短英文说明，避免中文编码和冗长注释污染现场配置；如需保留模板注释用于调试，可传 **`-KeepTemplateComments`** 或设置 **`EDR_KEEP_TEMPLATE_COMMENTS=1`**。若合并失败则回退为仅含 `[server]`/`[agent]`/`[platform]` 的精简文件。需要旧行为时可传 **`-MinimalTomlOnly`**。
+**PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：注册成功后默认写入紧凑配置，包含 **`[server]`、`[agent]`、`[platform]`、`[collection]`、`[ave]`、`[offline]`** 等运行必需段落，并只保留一行英文说明，避免中文编码、模板注释和异常换行污染现场配置。如确需旧版“合并完整模板”行为，可传 **`-UseTemplateToml`** 或设置 **`EDR_USE_TEMPLATE_TOML=1`**；调试模板注释可同时传 **`-KeepTemplateComments`**。
 
 **mTLS**：enroll 使用端侧 CSR 签发唯一客户端证书，脚本只保存服务端返回的 `ca.pem` / `client.pem`，不会从服务端接收私钥。默认 PEM 私钥路径为 **`C:\Program Files\EDR Agent\certs\client-key.pem`**；高级模式可用 `EDR_KEY_PROVIDER=cng|tpm|pkcs11` 生成硬件/不可导出 CSR，但当前 gRPC C++ 运行时仍需要 PEM `client_key` 才能启用 RTR 实时通道。
 
@@ -74,7 +74,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 打 **`linux_主.次.修订`** / **`win_主.次.修订`** 标签并推送后，Release 附件包含：
 
 - **Windows**
-  - **`EDRAgentSetup-<tag>.exe`**：图形安装向导（默认安装到 `%ProgramFiles%\EDR Agent`），内含 **`edr_agent.exe`**、**`agent.toml.example`** 及 **`edr_agent_install.ps1`**。向导首页下一步为 **「Platform enrollment」**：填写 **平台 REST 根 URL**（与 `EDR_API_BASE` 相同，如 `https://host:8080`）和 **注册 Token** 后，安装结束时会自动调用 **`POST /api/v1/enroll`**，并在安装目录生成 **`agent.toml`**（与 **`edr_agent.exe` 同目录**）：默认将注册结果 **合并进同目录的 `agent.toml.example`**，得到带 **collection / ave / preprocessing** 等默认节的完整配置。若两项均留空则跳过注册，并从示例复制出一份 **`agent.toml`** 便于本地改。可选任务 **「Skip TLS certificate verification…」** 对应自签/实验环境的 **`EDR_INSECURE_TLS=1`**。参数在安装收尾阶段经 **`%TEMP%\edr_wizard_enroll.json`** 传给 PowerShell，成功后即删除。另见 **Runtime** 任务：**开机计划任务（SYSTEM）** 与可选 **安装目录 ACL 加固**；卸载须走「程序和功能」中的卸载程序（会先移除任务与进程）。详见 **[WINDOWS_DEPLOY.md §4.1](WINDOWS_DEPLOY.md)**。
+  - **`EDRAgentSetup-<tag>.exe`**：图形安装向导（默认安装到 `%ProgramFiles%\EDR Agent`），内含 **`edr_agent.exe`**、**`agent.toml.example`** 及 **`edr_agent_install.ps1`**。向导首页下一步为 **「Platform enrollment」**：填写 **平台 REST 根 URL**（与 `EDR_API_BASE` 相同，如 `https://host:8080`）和 **注册 Token** 后，安装结束时会自动调用 **`POST /api/v1/enroll`**，并在安装目录生成紧凑 **`agent.toml`**（与 **`edr_agent.exe` 同目录**）。若两项均留空则跳过注册，并从示例复制出一份 **`agent.toml`** 便于本地改。可选任务 **「Skip TLS certificate verification…」** 对应自签/实验环境的 **`EDR_INSECURE_TLS=1`**。参数在安装收尾阶段经 **`%TEMP%\edr_wizard_enroll.json`** 传给 PowerShell，成功后即删除。另见 **Runtime** 任务：**开机计划任务（SYSTEM）** 与可选 **安装目录 ACL 加固**；卸载须走「程序和功能」中的卸载程序（会先移除任务与进程）。详见 **[WINDOWS_DEPLOY.md §4.1](WINDOWS_DEPLOY.md)**。
   - **静默安装 + 命令行传入 API 与 Token**（便于 Intune/SCCM，无需向导页）：在 Inno 标准静默参数之外增加（**两项须同时出现或同时省略**；仅传其一安装程序会报错退出）：
     - **`/EDR_API_BASE=`**`<平台 REST 根 URL>`（与向导、`EDR_API_BASE` 一致，勿带末尾 `/api/v1`）；**短参数**：**`/API=`**（与长参数二选一，**长参数优先**）
     - **`/EDR_ENROLL_TOKEN=`**`<注册 Token>`**；短参数：**`/TOK=`**
