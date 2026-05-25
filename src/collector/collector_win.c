@@ -281,8 +281,76 @@ static void edr_copy_trunc(char *dst, size_t cap, const char *src) {
   snprintf(dst, cap, "%s", src ? src : "");
 }
 
+static int edr_ends_with_ci(const char *s, const char *suffix) {
+  if (!s || !suffix) {
+    return 0;
+  }
+  size_t n = strlen(s);
+  size_t m = strlen(suffix);
+  if (m == 0u || n < m) {
+    return 0;
+  }
+  s += n - m;
+  for (size_t i = 0; i < m; i++) {
+    char a = s[i];
+    char b = suffix[i];
+    if (a >= 'A' && a <= 'Z') {
+      a = (char)(a - 'A' + 'a');
+    }
+    if (b >= 'A' && b <= 'Z') {
+      b = (char)(b - 'A' + 'a');
+    }
+    if (a != b) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int edr_collector_valid_process_create_record(const EdrBehaviorRecord *br) {
+  const char *name;
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE) {
+    return 1;
+  }
+  if (br->pid == 0u) {
+    return 0;
+  }
+  if (!br->process_name[0] && !br->exe_path[0] && !br->cmdline[0]) {
+    return 0;
+  }
+  name = br->process_name[0] ? br->process_name : br->exe_path;
+  if (edr_ends_with_ci(name, ".dll") || edr_ends_with_ci(name, ".sys")) {
+    return 0;
+  }
+  return 1;
+}
+
+static int edr_collector_debug_tdh_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *e = getenv("EDR_TDH_DEBUG");
+    cached = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+  }
+  return cached;
+}
+
+static void edr_collector_debug_tdh_payload(const EdrEventSlot *slot, const char *tag) {
+  if (!edr_collector_debug_tdh_enabled() || !slot || slot->size == 0u) {
+    return;
+  }
+  if (slot->type != EDR_EVENT_PROCESS_CREATE && slot->type != EDR_EVENT_SCRIPT_POWERSHELL &&
+      slot->type != EDR_EVENT_SCRIPT_WMI) {
+    return;
+  }
+  fprintf(stderr, "[TDH DEBUG] tag=%s type=%d payload:\n%.*s\n",
+          tag ? tag : "unknown", (int)slot->type, (int)slot->size, (const char *)slot->data);
+}
+
 static void edr_collector_pid_cache_update(const EdrBehaviorRecord *br) {
   if (!br || br->pid == 0u) {
+    return;
+  }
+  if (!edr_collector_valid_process_create_record(br)) {
     return;
   }
   if (!br->process_name[0] && !br->exe_path[0] && !br->cmdline[0]) {
@@ -409,7 +477,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
       br.exe_path[0] && !br.network_aux_path[0]) {
     edr_copy_trunc(br.network_aux_path, sizeof(br.network_aux_path), br.exe_path);
   }
-  if (slot->type == EDR_EVENT_PROCESS_CREATE) {
+  if (slot->type == EDR_EVENT_PROCESS_CREATE && edr_collector_valid_process_create_record(&br)) {
     edr_collector_pid_cache_update(&br);
   }
   if (br.priority == 0u) {
@@ -421,6 +489,9 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     return 1;
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
+    if (!edr_collector_valid_process_create_record(&br)) {
+      return 0;
+    }
     return (br.process_name[0] || br.cmdline[0]) ? 1 : 0;
   }
   if (slot->type == EDR_EVENT_FILE_CREATE || slot->type == EDR_EVENT_FILE_WRITE ||
@@ -492,6 +563,7 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     plen = EDR_MAX_EVENT_PAYLOAD;
   }
   slot.size = (uint32_t)plen;
+  edr_collector_debug_tdh_payload(&slot, tag);
   slot.priority = edr_priority_from_utf8_payload(slot.data, slot.size);
   {
     const GUID *g = &event_record->EventHeader.ProviderId;

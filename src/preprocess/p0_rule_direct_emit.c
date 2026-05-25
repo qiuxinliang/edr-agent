@@ -686,7 +686,8 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   s_ev_ts_ns = br->event_time_ns;
   s_ev_pid = br->pid;
   s_ev_type = (int)br->type;
-  const char *cmd = br->cmdline[0] ? br->cmdline : br->script_snippet;
+  const char *detail = br->cmdline[0] ? br->cmdline : br->script_snippet;
+  const char *cmd = detail;
   const char *pn = br->process_name;
   if ((!pn || !pn[0]) && br->type == EDR_EVENT_SCRIPT_POWERSHELL) {
     pn = "powershell.exe";
@@ -703,10 +704,11 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
   }
   if (s_debug_enabled) {
-    int has_data = ((pn && pn[0]) || (cmd && cmd[0]));
+    int has_data = ((pn && pn[0]) || (detail && detail[0]));
     if (has_data) {
-      fprintf(stderr, "[P0 DEBUG] event: type=%d pid=%u process=%s cmdline=%s\n",
-              br->type, br->pid, pn ? pn : "(null)", cmd ? cmd : "(null)");
+      fprintf(stderr, "[P0 DEBUG] event: type=%d pid=%u process=%s %s=%s\n",
+              br->type, br->pid, pn ? pn : "(null)",
+              br->cmdline[0] ? "cmdline" : "detail", detail ? detail : "(null)");
     } else {
       s_debug_empty_count++;
       if (s_debug_empty_count == 1u || (s_debug_empty_count & 1023u) == 0u) {

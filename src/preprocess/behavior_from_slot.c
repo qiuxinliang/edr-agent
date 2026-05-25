@@ -236,7 +236,10 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   if (entropy_delta < 0.0) {
     entropy_delta = 0.0;
   }
-  int suspicious = file_rate >= 80.0 || b->ext_count >= 20u || entropy_delta >= 1.5;
+  int enough_volume = b->file_events >= 20u;
+  int suspicious = (enough_volume && file_rate >= 120.0) ||
+                   (b->file_events >= 12u && b->ext_count >= 8u) ||
+                   (b->file_events >= 8u && entropy_delta >= 1.5);
   append_record_kv(r, "file_rate=%.0f ext_burst=%u entropy_delta=%.2f%s",
                    file_rate, (unsigned)b->ext_count, entropy_delta,
                    suspicious ? " ransom_counter=1" : "");
@@ -372,6 +375,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "sensor") == 0 || strcmp(key, "provider") == 0 || strcmp(key, "scriptblock_id") == 0 ||
              strcmp(key, "amsi_result") == 0 || strcmp(key, "script_hash") == 0 ||
+             strcmp(key, "module") == 0 ||
              strcmp(key, "ja3") == 0 || strcmp(key, "ja3_hash") == 0 ||
              strcmp(key, "ja3_fingerprint") == 0 || strcmp(key, "ja3_rare") == 0 ||
              strcmp(key, "ja3_unknown") == 0 || strcmp(key, "sni") == 0 ||

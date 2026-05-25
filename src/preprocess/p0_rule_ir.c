@@ -428,7 +428,7 @@ static int try_linux_proc_exe(char *out, size_t cap) {
     return 0;
   }
   *sl = 0;
-  if ((size_t)snprintf(out, cap, "%s/edr_config/p0_rule_bundle_ir_v1.json", buf) >= cap) {
+  if ((size_t)snprintf(out, cap, "%s/edr_config/p0_rule_bundle_ir_v1.json.enc", buf) >= cap) {
     return 0;
   }
   return access(out, R_OK) == 0 ? 1 : 0;
@@ -466,12 +466,12 @@ static int try_load_default_paths(void) {
     return 0;
   }
   const char *suffixes[] = {
-      "\\edr_config\\p0_rule_bundle_ir_v1.json",
       "\\edr_config\\p0_rule_bundle_ir_v1.json.enc",
-      "\\config\\p0_rule_bundle_ir_v1.json",
       "\\config\\p0_rule_bundle_ir_v1.json.enc",
-      "\\p0_rule_bundle_ir_v1.json",
       "\\p0_rule_bundle_ir_v1.json.enc",
+      "\\edr_config\\p0_rule_bundle_ir_v1.json",
+      "\\config\\p0_rule_bundle_ir_v1.json",
+      "\\p0_rule_bundle_ir_v1.json",
   };
   for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
     char path[2048];
@@ -485,10 +485,10 @@ static int try_load_default_paths(void) {
   return 0;
 #else
   const char *paths[] = {
-      "edr_config/p0_rule_bundle_ir_v1.json",
       "edr_config/p0_rule_bundle_ir_v1.json.enc",
-      "config/p0_rule_bundle_ir_v1.json",
       "config/p0_rule_bundle_ir_v1.json.enc",
+      "edr_config/p0_rule_bundle_ir_v1.json",
+      "config/p0_rule_bundle_ir_v1.json",
   };
   for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
     if (file_readable(paths[i]) && try_load_ir_path(paths[i])) {
@@ -1005,7 +1005,7 @@ int edr_p0_bundle_dst_path(char *out, size_t cap) {
 #ifdef _WIN32
   char ex[1024];
   if (edr_win_exe_dir(ex, sizeof(ex))) {
-    snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json", ex);
+    snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json.enc", ex);
     return 0;
   }
 #else
