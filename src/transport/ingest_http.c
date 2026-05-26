@@ -5,6 +5,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 
 #ifdef _WIN32
 #include <process.h>
+#include <winreg.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -53,6 +55,8 @@ static char s_policy_version[64];
 static char s_ca_file[1024];
 static char s_client_cert_file[1024];
 static char s_client_key_file[1024];
+static char s_client_key_provider[32];
+static char s_mtls_status[96];
 static char s_relay_url[512];
 static char s_proxy_mode[32];
 static char s_proxy_url_cfg[512];
@@ -65,6 +69,15 @@ static int64_t s_last_success_ms;
 static int64_t s_last_failure_ms;
 static char s_last_error[160];
 static int s_insecure_http;
+static volatile int s_circuit_open;
+static int64_t s_circuit_until_ms;
+static char s_circuit_reason[128];
+static unsigned s_consecutive_failures;
+static unsigned long s_budget_drop_count;
+static int64_t s_budget_window_minute;
+static unsigned long s_budget_requests;
+static uint64_t s_budget_bytes;
+static unsigned long s_budget_tls_handshakes;
 static volatile int s_poll_backoff_ms;
 static volatile int s_ws_backoff_ms;
 static volatile int s_poll_run;
@@ -92,20 +105,163 @@ typedef struct EdrWsConn {
 
 static EdrWsConn *s_ws_conn;
 
+typedef struct EdrHttpConn {
+  int active;
+  int https;
+  int port;
+  char host[256];
+  EdrSocket fd;
+#ifdef EDR_HAVE_OPENSSL_HTTP
+  SSL_CTX *ctx;
+  SSL *ssl;
+#endif
+  int64_t last_used_ms;
+} EdrHttpConn;
+
+static EdrHttpConn s_http_conn;
+#ifdef _WIN32
+static CRITICAL_SECTION s_http_mu;
+static int s_http_mu_init;
+#else
+static pthread_mutex_t s_http_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 static int64_t unix_ms_now(void) {
   return (int64_t)time(NULL) * 1000LL;
+}
+
+static unsigned long env_ul_clamped(const char *name, unsigned long fallback,
+                                    unsigned long min_v, unsigned long max_v) {
+  const char *e = getenv(name);
+  unsigned long v = fallback;
+  if (e && e[0]) {
+    char *endp = NULL;
+    v = strtoul(e, &endp, 10);
+    if (!endp || endp == e) {
+      v = fallback;
+    }
+  }
+  if (v < min_v) v = min_v;
+  if (v > max_v) v = max_v;
+  return v;
+}
+
+static unsigned long request_limit_per_minute(void) {
+  return env_ul_clamped("EDR_HTTP_REQUEST_BUDGET_PER_MIN", 600ul, 30ul, 60000ul);
+}
+
+static uint64_t byte_limit_per_minute(void) {
+  unsigned long mb = env_ul_clamped("EDR_HTTP_BYTE_BUDGET_MB_PER_MIN", 64ul, 1ul, 4096ul);
+  return (uint64_t)mb * 1024ULL * 1024ULL;
+}
+
+static unsigned long tls_handshake_limit_per_minute(void) {
+  return env_ul_clamped("EDR_HTTP_TLS_HANDSHAKE_BUDGET_PER_MIN", 120ul, 5ul, 60000ul);
+}
+
+static void budget_refresh_window(void) {
+  int64_t minute = unix_ms_now() / 60000LL;
+  if (minute != s_budget_window_minute) {
+    s_budget_window_minute = minute;
+    s_budget_requests = 0;
+    s_budget_bytes = 0;
+    s_budget_tls_handshakes = 0;
+  }
+}
+
+static int comm_budget_try(size_t bytes, int tls_handshake) {
+  unsigned long req_lim;
+  uint64_t byte_lim;
+  unsigned long tls_lim;
+  budget_refresh_window();
+  req_lim = request_limit_per_minute();
+  byte_lim = byte_limit_per_minute();
+  tls_lim = tls_handshake_limit_per_minute();
+  if (s_budget_requests + 1ul > req_lim ||
+      s_budget_bytes + (uint64_t)bytes > byte_lim ||
+      (tls_handshake && s_budget_tls_handshakes + 1ul > tls_lim)) {
+    s_budget_drop_count++;
+    snprintf(s_last_error, sizeof(s_last_error), "%s", "communication budget exceeded");
+    s_last_failure_ms = unix_ms_now();
+    return 0;
+  }
+  s_budget_requests++;
+  s_budget_bytes += (uint64_t)bytes;
+  if (tls_handshake) {
+    s_budget_tls_handshakes++;
+  }
+  return 1;
+}
+
+static int comm_tls_handshake_budget_try(void) {
+  unsigned long tls_lim;
+  budget_refresh_window();
+  tls_lim = tls_handshake_limit_per_minute();
+  if (s_budget_tls_handshakes + 1ul > tls_lim) {
+    s_budget_drop_count++;
+    snprintf(s_last_error, sizeof(s_last_error), "%s", "tls handshake budget exceeded");
+    s_last_failure_ms = unix_ms_now();
+    return 0;
+  }
+  s_budget_tls_handshakes++;
+  return 1;
+}
+
+static int failure_should_open_circuit(const char *msg) {
+  if (!msg || !msg[0]) {
+    return 0;
+  }
+  return strstr(msg, "tls verify") || strstr(msg, "certificate") ||
+         strstr(msg, "proxy") || strstr(msg, "connect failed") ||
+         strstr(msg, "tcp connect") || strstr(msg, "network init") ||
+         strstr(msg, "OpenSSL disabled") || strstr(msg, "ca load failed");
+}
+
+static void comm_open_circuit(const char *reason) {
+  int sec = (int)env_ul_clamped("EDR_HTTP_CIRCUIT_OPEN_S", 60ul, 10ul, 3600ul);
+  s_circuit_open = 1;
+  s_circuit_until_ms = unix_ms_now() + (int64_t)sec * 1000LL;
+  snprintf(s_circuit_reason, sizeof(s_circuit_reason), "%s", reason ? reason : "transport failures");
+}
+
+static int comm_circuit_allows(void) {
+  int64_t now;
+  if (!s_circuit_open) {
+    return 1;
+  }
+  now = unix_ms_now();
+  if (now >= s_circuit_until_ms) {
+    s_circuit_open = 0;
+    s_circuit_until_ms = 0;
+    s_circuit_reason[0] = '\0';
+    s_consecutive_failures = 0;
+    return 1;
+  }
+  snprintf(s_last_error, sizeof(s_last_error), "circuit open: %s", s_circuit_reason);
+  s_last_failure_ms = now;
+  return 0;
 }
 
 static void runtime_success(void) {
   s_http_ok++;
   s_last_success_ms = unix_ms_now();
   s_last_error[0] = '\0';
+  s_consecutive_failures = 0;
+  s_circuit_open = 0;
+  s_circuit_until_ms = 0;
+  s_circuit_reason[0] = '\0';
 }
 
 static void runtime_failure(const char *msg) {
+  unsigned threshold;
   s_http_fail++;
   s_last_failure_ms = unix_ms_now();
   snprintf(s_last_error, sizeof(s_last_error), "%s", msg ? msg : "");
+  s_consecutive_failures++;
+  threshold = (unsigned)env_ul_clamped("EDR_HTTP_CIRCUIT_FAILURES", 3ul, 1ul, 100ul);
+  if (!s_circuit_open && s_consecutive_failures >= threshold && failure_should_open_circuit(msg)) {
+    comm_open_circuit(msg);
+  }
 }
 
 static void ws_mu_init_once(void) {
@@ -132,6 +288,37 @@ static void ws_unlock(void) {
 #else
   pthread_mutex_unlock(&s_ws_mu);
 #endif
+}
+
+static void http_mu_init_once(void) {
+#ifdef _WIN32
+  if (!s_http_mu_init) {
+    InitializeCriticalSection(&s_http_mu);
+    s_http_mu_init = 1;
+  }
+#endif
+}
+
+static void http_lock(void) {
+  http_mu_init_once();
+#ifdef _WIN32
+  EnterCriticalSection(&s_http_mu);
+#else
+  pthread_mutex_lock(&s_http_mu);
+#endif
+}
+
+static void http_unlock(void) {
+#ifdef _WIN32
+  LeaveCriticalSection(&s_http_mu);
+#else
+  pthread_mutex_unlock(&s_http_mu);
+#endif
+}
+
+static int http_keepalive_enabled(void) {
+  const char *e = getenv("EDR_HTTP_KEEPALIVE");
+  return !(e && e[0] == '0');
 }
 
 #ifdef EDR_HAVE_OPENSSL_HTTP
@@ -169,7 +356,8 @@ static void copy_base_url(char *dst, size_t cap, const char *url) {
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file, const char *client_cert_file,
-                                const char *client_key_file, const char *proxy_mode,
+                                const char *client_key_file, const char *client_key_provider,
+                                const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url) {
   const char *relay_effective = getenv("EDR_RELAY_URL");
   const char *proxy_mode_effective = getenv("EDR_PROXY_MODE");
@@ -183,12 +371,18 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   memset(s_ca_file, 0, sizeof(s_ca_file));
   memset(s_client_cert_file, 0, sizeof(s_client_cert_file));
   memset(s_client_key_file, 0, sizeof(s_client_key_file));
+  memset(s_client_key_provider, 0, sizeof(s_client_key_provider));
+  memset(s_mtls_status, 0, sizeof(s_mtls_status));
   memset(s_relay_url, 0, sizeof(s_relay_url));
   memset(s_proxy_mode, 0, sizeof(s_proxy_mode));
   memset(s_proxy_url_cfg, 0, sizeof(s_proxy_url_cfg));
   memset(s_proxy_url_active, 0, sizeof(s_proxy_url_active));
   memset(s_proxy_status, 0, sizeof(s_proxy_status));
   memset(s_connection_mode, 0, sizeof(s_connection_mode));
+  s_circuit_open = 0;
+  s_circuit_until_ms = 0;
+  s_circuit_reason[0] = '\0';
+  s_consecutive_failures = 0;
   if (!relay_effective || !relay_effective[0]) {
     relay_effective = relay_url;
   }
@@ -227,6 +421,22 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   if (client_key_file && client_key_file[0]) {
     snprintf(s_client_key_file, sizeof(s_client_key_file), "%s", client_key_file);
   }
+  {
+    const char *kp = getenv("EDR_CLIENT_KEY_PROVIDER");
+    if (!kp || !kp[0]) {
+      kp = client_key_provider;
+    }
+    snprintf(s_client_key_provider, sizeof(s_client_key_provider), "%s",
+             (kp && kp[0]) ? kp : "pem");
+  }
+  if (s_client_cert_file[0] && s_client_key_file[0]) {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "pem_ready");
+  } else if (s_client_cert_file[0] && strcmp(s_client_key_provider, "pem") != 0) {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "native_http_%s_pending_adapter",
+             s_client_key_provider);
+  } else {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "not_configured");
+  }
   snprintf(s_proxy_mode, sizeof(s_proxy_mode), "%s",
            (proxy_mode_effective && proxy_mode_effective[0]) ? proxy_mode_effective : "auto");
   copy_base_url(s_proxy_url_cfg, sizeof(s_proxy_url_cfg), proxy_url_effective);
@@ -248,11 +458,15 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->websocket_ready = s_ws_ready ? 1 : 0;
   out->poll_backoff_ms = s_poll_backoff_ms;
   out->ws_backoff_ms = s_ws_backoff_ms;
+  out->circuit_open = s_circuit_open ? 1 : 0;
+  out->circuit_until_unix_ms = s_circuit_until_ms;
   out->ok_count = s_http_ok;
   out->fail_count = s_http_fail;
+  out->budget_drop_count = s_budget_drop_count;
   out->last_success_unix_ms = s_last_success_ms;
   out->last_failure_unix_ms = s_last_failure_ms;
   snprintf(out->last_error, sizeof(out->last_error), "%s", s_last_error);
+  snprintf(out->circuit_reason, sizeof(out->circuit_reason), "%s", s_circuit_reason);
   snprintf(out->connection_mode, sizeof(out->connection_mode), "%s",
            s_connection_mode[0] ? s_connection_mode : "direct");
   snprintf(out->effective_base_url, sizeof(out->effective_base_url), "%s", s_rest);
@@ -261,6 +475,21 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   snprintf(out->proxy_url, sizeof(out->proxy_url), "%s", s_proxy_url_active);
   snprintf(out->proxy_status, sizeof(out->proxy_status), "%s",
            s_proxy_status[0] ? s_proxy_status : "not_used");
+  snprintf(out->client_key_provider, sizeof(out->client_key_provider), "%s",
+           s_client_key_provider[0] ? s_client_key_provider : "pem");
+  snprintf(out->mtls_status, sizeof(out->mtls_status), "%s",
+           s_mtls_status[0] ? s_mtls_status : "not_configured");
+  budget_refresh_window();
+  out->requests_this_minute = s_budget_requests;
+  out->request_limit_per_minute = request_limit_per_minute();
+  out->bytes_this_minute = s_budget_bytes;
+  out->byte_limit_per_minute = byte_limit_per_minute();
+  out->tls_handshakes_this_minute = s_budget_tls_handshakes;
+  out->tls_handshake_limit_per_minute = tls_handshake_limit_per_minute();
+  {
+    unsigned long total = s_http_ok + s_http_fail;
+    out->slo_success_rate_pct = total ? (unsigned int)((s_http_ok * 100ul) / total) : 100u;
+  }
 }
 
 void edr_ingest_http_set_policy_version(const char *policy_version) {
@@ -311,6 +540,27 @@ static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
   }
   out[o] = 0;
   return (int)o;
+}
+
+static void proxy_auth_b64_from_config(const char *url_userinfo, size_t url_userinfo_len,
+                                       char *out, size_t out_cap) {
+  const char *auth_b64 = getenv("EDR_PROXY_AUTH_B64");
+  const char *auth = getenv("EDR_PROXY_AUTH_BASIC");
+  if (!out || out_cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (auth_b64 && auth_b64[0]) {
+    snprintf(out, out_cap, "%s", auth_b64);
+    return;
+  }
+  if (auth && auth[0]) {
+    (void)b64_encode((const uint8_t *)auth, strlen(auth), out, out_cap);
+    return;
+  }
+  if (url_userinfo && url_userinfo_len > 0u && url_userinfo_len < 192u) {
+    (void)b64_encode((const uint8_t *)url_userinfo, url_userinfo_len, out, out_cap);
+  }
 }
 
 static int b64_value(unsigned char c) {
@@ -556,6 +806,7 @@ typedef struct {
   int active;
   char url[512];
   char host[256];
+  char auth_b64[256];
   int port;
 } EdrProxyRoute;
 
@@ -654,6 +905,72 @@ static const char *proxy_env_for_scheme(int https) {
   return (v && v[0]) ? v : NULL;
 }
 
+#ifdef _WIN32
+static int proxy_server_pick(const char *server, int https, char *out, size_t cap) {
+  char buf[1024];
+  char *p;
+  const char *want = https ? "https=" : "http=";
+  if (!server || !server[0] || !out || cap == 0u) {
+    return -1;
+  }
+  snprintf(buf, sizeof(buf), "%s", server);
+  p = buf;
+  while (*p) {
+    char *tok = p;
+    char *end;
+    while (*p && *p != ';') p++;
+    if (*p == ';') *p++ = '\0';
+    while (*tok && isspace((unsigned char)*tok)) tok++;
+    end = tok + strlen(tok);
+    while (end > tok && isspace((unsigned char)end[-1])) *--end = '\0';
+    if (strncmp(tok, want, strlen(want)) == 0) {
+      tok += strlen(want);
+      snprintf(out, cap, "%s%s", strstr(tok, "://") ? "" : "http://", tok);
+      return 0;
+    }
+  }
+  if (!strchr(server, '=')) {
+    snprintf(out, cap, "%s%s", strstr(server, "://") ? "" : "http://", server);
+    return 0;
+  }
+  return -1;
+}
+
+static int wininet_proxy_for_scheme(int https, char *out, size_t cap) {
+  DWORD enable = 0;
+  DWORD enable_sz = sizeof(enable);
+  char proxy_server[1024];
+  DWORD proxy_sz = sizeof(proxy_server);
+  char auto_config[1024];
+  DWORD auto_sz = sizeof(auto_config);
+  if (!out || cap == 0u) {
+    return -1;
+  }
+  out[0] = '\0';
+  proxy_server[0] = '\0';
+  auto_config[0] = '\0';
+  if (RegGetValueA(HKEY_CURRENT_USER,
+                   "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+                   "ProxyEnable", RRF_RT_REG_DWORD, NULL, &enable, &enable_sz) != ERROR_SUCCESS ||
+      enable == 0) {
+    if (RegGetValueA(HKEY_CURRENT_USER,
+                     "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+                     "AutoConfigURL", RRF_RT_REG_SZ, NULL, auto_config, &auto_sz) == ERROR_SUCCESS &&
+        auto_config[0]) {
+      return -2;
+    }
+    return -1;
+  }
+  if (RegGetValueA(HKEY_CURRENT_USER,
+                   "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+                   "ProxyServer", RRF_RT_REG_SZ, NULL, proxy_server, &proxy_sz) != ERROR_SUCCESS ||
+      !proxy_server[0]) {
+    return -1;
+  }
+  return proxy_server_pick(proxy_server, https, out, cap);
+}
+#endif
+
 static int parse_proxy_url(const char *url, EdrProxyRoute *out) {
   const char *p;
   const char *slash;
@@ -673,7 +990,11 @@ static int parse_proxy_url(const char *url, EdrProxyRoute *out) {
   slash = strchr(p, '/');
   at = strchr(p, '@');
   if (at && (!slash || at < slash)) {
+    size_t cred_len = (size_t)(at - p);
+    proxy_auth_b64_from_config(p, cred_len, out->auth_b64, sizeof(out->auth_b64));
     p = at + 1;
+  } else {
+    proxy_auth_b64_from_config(NULL, 0u, out->auth_b64, sizeof(out->auth_b64));
   }
   slash = strchr(p, '/');
   colon = strchr(p, ':');
@@ -712,6 +1033,18 @@ static int resolve_proxy_route(int https, const char *host, EdrProxyRoute *out) 
     url = s_proxy_url_cfg;
   } else if (ascii_eq_ci(mode, "auto") || ascii_eq_ci(mode, "wpad")) {
     url = proxy_env_for_scheme(https);
+#ifdef _WIN32
+    if (!url || !url[0]) {
+      static char win_proxy_url[512];
+      int wr = wininet_proxy_for_scheme(https, win_proxy_url, sizeof(win_proxy_url));
+      if (wr == 0) {
+        url = win_proxy_url;
+      } else if (wr == -2) {
+        set_proxy_status("auto:pac_unsupported", NULL);
+        return 0;
+      }
+    }
+#endif
   }
   if (!url || !url[0]) {
     set_proxy_status(ascii_eq_ci(mode, "explicit") ? "explicit:missing" : "auto:none", NULL);
@@ -721,14 +1054,30 @@ static int resolve_proxy_route(int https, const char *host, EdrProxyRoute *out) 
     set_proxy_status("invalid", NULL);
     return ascii_eq_ci(mode, "explicit") ? -1 : 0;
   }
-  set_proxy_status(s_proxy_url_cfg[0] ? "explicit" : "auto:env", out->url);
+  set_proxy_status(s_proxy_url_cfg[0] ? "explicit" :
+#ifdef _WIN32
+                   (url && strstr(url, "://") ? "auto" : "auto:wininet"),
+#else
+                   "auto:env",
+#endif
+                   out->url);
   return 0;
 }
 
 static int net_init(void) {
 #ifdef _WIN32
+  static int started = 0;
   WSADATA w;
-  return WSAStartup(MAKEWORD(2, 2), &w);
+  if (started) {
+    return 0;
+  }
+  {
+    int rc = WSAStartup(MAKEWORD(2, 2), &w);
+    if (rc == 0) {
+      started = 1;
+    }
+    return rc;
+  }
 #else
   return 0;
 #endif
@@ -736,7 +1085,7 @@ static int net_init(void) {
 
 static void net_done(void) {
 #ifdef _WIN32
-  WSACleanup();
+  /* Keep Winsock initialized for persistent HTTP/WebSocket connections. */
 #endif
 }
 
@@ -747,6 +1096,8 @@ static void close_fd(EdrSocket fd) {
   close(fd);
 #endif
 }
+
+static void socket_enable_keepalive(EdrSocket fd);
 
 static int tcp_connect_host(const char *host, int port, EdrSocket *out_fd) {
   struct addrinfo hints;
@@ -780,6 +1131,7 @@ static int tcp_connect_host(const char *host, int port, EdrSocket *out_fd) {
   if (fd == EDR_SOCKET_INVALID) {
     return -1;
   }
+  socket_enable_keepalive(fd);
   *out_fd = fd;
   return 0;
 }
@@ -798,6 +1150,23 @@ static void socket_set_timeout_ms(EdrSocket fd, int ms) {
   tv.tv_usec = (ms % 1000) * 1000;
   (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+static void socket_enable_keepalive(EdrSocket fd) {
+  if (fd == EDR_SOCKET_INVALID) {
+    return;
+  }
+#ifdef _WIN32
+  {
+    BOOL on = TRUE;
+    (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof(on));
+  }
+#else
+  {
+    int on = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+  }
 #endif
 }
 
@@ -857,10 +1226,38 @@ static int tcp_connect_http_route(const char *host, int port, int https, EdrSock
   rn = snprintf(req, sizeof(req),
                 "CONNECT %s:%d HTTP/1.1\r\n"
                 "Host: %s:%d\r\n"
-                "Proxy-Connection: Keep-Alive\r\n\r\n",
+                "Proxy-Connection: Keep-Alive\r\n",
                 host, port, host, port);
-  if (rn <= 0 || (size_t)rn >= sizeof(req) ||
-      write_all_plain(*out_fd, req, (size_t)rn) != 0 ||
+  if (rn <= 0 || (size_t)rn >= sizeof(req)) {
+    runtime_failure("proxy CONNECT request build failed");
+    close_fd(*out_fd);
+    *out_fd = EDR_SOCKET_INVALID;
+    return -1;
+  }
+  if (proxy.auth_b64[0]) {
+    size_t used = (size_t)rn;
+    int an = snprintf(req + used, sizeof(req) - used,
+                      "Proxy-Authorization: Basic %s\r\n", proxy.auth_b64);
+    if (an <= 0 || (size_t)an >= sizeof(req) - used) {
+      runtime_failure("proxy auth header build failed");
+      close_fd(*out_fd);
+      *out_fd = EDR_SOCKET_INVALID;
+      return -1;
+    }
+    rn += an;
+  }
+  {
+    size_t used = (size_t)rn;
+    int en = snprintf(req + used, sizeof(req) - used, "\r\n");
+    if (en <= 0 || (size_t)en >= sizeof(req) - used) {
+      runtime_failure("proxy CONNECT request build failed");
+      close_fd(*out_fd);
+      *out_fd = EDR_SOCKET_INVALID;
+      return -1;
+    }
+    rn += en;
+  }
+  if (write_all_plain(*out_fd, req, (size_t)rn) != 0 ||
       read_status_plain(*out_fd) != 0) {
     runtime_failure("proxy CONNECT failed");
     close_fd(*out_fd);
@@ -876,11 +1273,13 @@ static int append_common_headers(char *req, size_t cap, size_t used) {
     return -1;
   }
   n = snprintf(req + used, cap - used,
-               "X-Tenant-ID: %s\r\n"
-               "X-User-ID: %s\r\n"
-               "X-Permission-Set: telemetry:write\r\n",
-               s_tenant[0] ? s_tenant : "demo-tenant",
-               s_user[0] ? s_user : "edr-agent");
+	               "X-Tenant-ID: %s\r\n"
+	               "X-Endpoint-ID: %s\r\n"
+	               "X-User-ID: %s\r\n"
+	               "X-Permission-Set: telemetry:write\r\n",
+	               s_tenant[0] ? s_tenant : "demo-tenant",
+	               s_endpoint[0] ? s_endpoint : "",
+	               s_user[0] ? s_user : "edr-agent");
   if (n <= 0 || (size_t)n >= cap - used) {
     return -1;
   }
@@ -923,71 +1322,128 @@ static int append_request_headers(char *req, size_t cap, const char *method, con
     return -1;
   }
   used = (size_t)n;
-  n = snprintf(req + used, cap - used, "Connection: close\r\n\r\n");
+  n = snprintf(req + used, cap - used, "Connection: %s\r\n\r\n",
+               http_keepalive_enabled() ? "keep-alive" : "close");
   if (n <= 0 || (size_t)n >= cap - used) {
     return -1;
   }
   return (int)(used + (size_t)n);
 }
 
-static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
-                                        char *body, size_t body_cap) {
-  char resp[8192];
-  size_t used = 0;
-  int status_ok = 0;
-  int saw_header = 0;
-  size_t body_used = 0;
-  if (body && body_cap > 0u) {
-    body[0] = '\0';
+static int ascii_starts_ci(const char *s, const char *prefix) {
+  if (!s || !prefix) return 0;
+  while (*prefix) {
+    if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) return 0;
+    s++;
+    prefix++;
   }
+  return 1;
+}
+
+static const char *ascii_find_ci(const char *hay, const char *needle) {
+  size_t nl;
+  if (!hay || !needle || !needle[0]) return NULL;
+  nl = strlen(needle);
+  for (const char *p = hay; *p; p++) {
+    size_t i;
+    for (i = 0; i < nl; i++) {
+      if (!p[i] || tolower((unsigned char)p[i]) != tolower((unsigned char)needle[i])) break;
+    }
+    if (i == nl) return p;
+  }
+  return NULL;
+}
+
+static long parse_content_length_header(const char *headers) {
+  const char *p = ascii_find_ci(headers, "\r\ncontent-length:");
+  char *endp = NULL;
+  if (!p && ascii_starts_ci(headers, "content-length:")) {
+    p = headers;
+  }
+  if (!p) return -1;
+  p = strchr(p, ':');
+  if (!p) return -1;
+  p++;
+  while (*p && isspace((unsigned char)*p)) p++;
+  {
+    long v = strtol(p, &endp, 10);
+    return (endp && endp != p && v >= 0) ? v : -1;
+  }
+}
+
+static int headers_connection_close(const char *headers) {
+  const char *p = ascii_find_ci(headers, "\r\nconnection:");
+  if (!p && ascii_starts_ci(headers, "connection:")) p = headers;
+  if (!p) return 0;
+  return ascii_find_ci(p, "close") != NULL;
+}
+
+static int headers_chunked(const char *headers) {
+  const char *p = ascii_find_ci(headers, "\r\ntransfer-encoding:");
+  if (!p && ascii_starts_ci(headers, "transfer-encoding:")) p = headers;
+  if (!p) return 0;
+  return ascii_find_ci(p, "chunked") != NULL;
+}
+
+static void append_body_copy(char *body, size_t body_cap, size_t *body_used,
+                             const char *src, size_t src_len) {
+  size_t copy;
+  if (!body || body_cap == 0u || !body_used || !src || src_len == 0u) return;
+  if (*body_used >= body_cap - 1u) return;
+  copy = src_len;
+  if (copy > body_cap - 1u - *body_used) copy = body_cap - 1u - *body_used;
+  memcpy(body + *body_used, src, copy);
+  *body_used += copy;
+  body[*body_used] = '\0';
+}
+
+static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
+                                        char *body, size_t body_cap, int *out_reusable) {
+  char buf[8192];
+  size_t used = 0;
+  size_t header_len = 0;
+  size_t body_used = 0;
+  long content_len = -1;
+  int status_ok = 0;
+  int reusable = 0;
+  if (body && body_cap > 0u) body[0] = '\0';
+  if (out_reusable) *out_reusable = 0;
   for (;;) {
-    int n = recvfn(ctx, resp + used, (int)(sizeof(resp) - 1u - used));
-    char *hdr;
-    char *body_start;
-    size_t chunk_body_len;
-    if (n <= 0) {
+    int n;
+    if (used >= sizeof(buf) - 1u) return -1;
+    n = recvfn(ctx, buf + used, (int)(sizeof(buf) - 1u - used));
+    if (n <= 0) return -1;
+    used += (size_t)n;
+    buf[used] = '\0';
+    {
+      char *hdr = strstr(buf, "\r\n\r\n");
+      if (!hdr) continue;
+      header_len = (size_t)(hdr + 4 - buf);
+      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
+      content_len = parse_content_length_header(buf);
+      reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
+      if (used > header_len) {
+        append_body_copy(body, body_cap, &body_used, buf + header_len, used - header_len);
+      }
       break;
     }
-    used += (size_t)n;
-    resp[used] = '\0';
-    if (!saw_header) {
-      hdr = strstr(resp, "\r\n\r\n");
-      if (!hdr) {
-        if (used >= sizeof(resp) - 1u) {
-          return -1;
-        }
-        continue;
-      }
-      status_ok = (strncmp(resp, "HTTP/1.1 2", 10u) == 0 || strncmp(resp, "HTTP/1.0 2", 10u) == 0);
-      saw_header = 1;
-      body_start = hdr + 4;
-      chunk_body_len = used - (size_t)(body_start - resp);
-      if (body && body_cap > 0u && chunk_body_len > 0u) {
-        size_t copy = chunk_body_len;
-        if (copy > body_cap - 1u - body_used) {
-          copy = body_cap - 1u - body_used;
-        }
-        memcpy(body + body_used, body_start, copy);
-        body_used += copy;
-        body[body_used] = '\0';
-      }
-      used = 0;
-    } else if (body && body_cap > 0u) {
-      size_t copy = (size_t)n;
-      if (copy > body_cap - 1u - body_used) {
-        copy = body_cap - 1u - body_used;
-      }
-      if (copy > 0u) {
-        memcpy(body + body_used, resp, copy);
-        body_used += copy;
-        body[body_used] = '\0';
-      }
-      used = 0;
-    } else {
-      used = 0;
-    }
   }
-  return saw_header && status_ok ? 0 : -1;
+  if (content_len >= 0) {
+    while ((long)(used - header_len) < content_len) {
+      char tmp[4096];
+      size_t got = used - header_len;
+      long remain = content_len - (long)got;
+      int want = remain > (long)sizeof(tmp) ? (int)sizeof(tmp) : (int)remain;
+      int n = recvfn(ctx, tmp, want);
+      if (n <= 0) return -1;
+      used += (size_t)n;
+      append_body_copy(body, body_cap, &body_used, tmp, (size_t)n);
+    }
+  } else {
+    reusable = 0;
+  }
+  if (out_reusable) *out_reusable = reusable;
+  return status_ok ? 0 : -1;
 }
 
 static int plain_recv_adapter(void *ctx, char *buf, int cap) {
@@ -1062,6 +1518,134 @@ static SSL_CTX *new_https_ctx(char *active_cafile, size_t active_cafile_cap) {
 }
 #endif
 
+static int http_socket_recv_adapter(void *ctx, char *buf, int cap) {
+  EdrHttpConn *c = (EdrHttpConn *)ctx;
+#ifdef EDR_HAVE_OPENSSL_HTTP
+  if (c && c->ssl) {
+    return SSL_read(c->ssl, buf, cap);
+  }
+#endif
+  if (!c) return -1;
+#ifdef _WIN32
+  return recv(c->fd, buf, cap, 0);
+#else
+  return (int)recv(c->fd, buf, (size_t)cap, 0);
+#endif
+}
+
+static int http_conn_write_all(EdrHttpConn *c, const char *p, size_t n) {
+  if (!c || !c->active || !p) return -1;
+#ifdef EDR_HAVE_OPENSSL_HTTP
+  if (c->ssl) {
+    return write_all_ssl(c->ssl, p, n);
+  }
+#endif
+  return write_all_plain(c->fd, p, n);
+}
+
+static void http_conn_close_locked(void) {
+  if (!s_http_conn.active) {
+    return;
+  }
+#ifdef EDR_HAVE_OPENSSL_HTTP
+  if (s_http_conn.ssl) {
+    SSL_shutdown(s_http_conn.ssl);
+    SSL_free(s_http_conn.ssl);
+    s_http_conn.ssl = NULL;
+  }
+  if (s_http_conn.ctx) {
+    SSL_CTX_free(s_http_conn.ctx);
+    s_http_conn.ctx = NULL;
+  }
+#endif
+  if (s_http_conn.fd != EDR_SOCKET_INVALID) {
+    close_fd(s_http_conn.fd);
+  }
+  memset(&s_http_conn, 0, sizeof(s_http_conn));
+  s_http_conn.fd = EDR_SOCKET_INVALID;
+}
+
+static int http_conn_matches_locked(const char *host, int port, int https) {
+  int64_t idle_ms;
+  if (!http_keepalive_enabled()) {
+    http_conn_close_locked();
+    return 0;
+  }
+  if (!s_http_conn.active || s_http_conn.fd == EDR_SOCKET_INVALID) return 0;
+  idle_ms = unix_ms_now() - s_http_conn.last_used_ms;
+  if (idle_ms > (int64_t)env_ul_clamped("EDR_HTTP_KEEPALIVE_IDLE_MS", 30000ul, 1000ul, 300000ul)) {
+    http_conn_close_locked();
+    return 0;
+  }
+  return s_http_conn.https == https && s_http_conn.port == port &&
+         strcmp(s_http_conn.host, host ? host : "") == 0;
+}
+
+static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https) {
+  if (http_conn_matches_locked(host, port, https)) {
+    return &s_http_conn;
+  }
+  http_conn_close_locked();
+  memset(&s_http_conn, 0, sizeof(s_http_conn));
+  s_http_conn.fd = EDR_SOCKET_INVALID;
+  if (https && !comm_tls_handshake_budget_try()) {
+    return NULL;
+  }
+  if (tcp_connect_http_route(host, port, https, &s_http_conn.fd) != 0) {
+    runtime_failure(https ? "https tcp connect failed" : "http connect failed");
+    return NULL;
+  }
+  socket_set_timeout_ms(s_http_conn.fd, (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
+  snprintf(s_http_conn.host, sizeof(s_http_conn.host), "%s", host ? host : "");
+  s_http_conn.port = port;
+  s_http_conn.https = https;
+#ifdef EDR_HAVE_OPENSSL_HTTP
+  if (https) {
+    char active_cafile[1024];
+    s_http_conn.ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
+    if (!s_http_conn.ctx) {
+      http_conn_close_locked();
+      return NULL;
+    }
+    s_http_conn.ssl = SSL_new(s_http_conn.ctx);
+    if (!s_http_conn.ssl) {
+      runtime_failure_openssl("https ssl new failed");
+      http_conn_close_locked();
+      return NULL;
+    }
+#ifdef _WIN32
+    SSL_set_fd(s_http_conn.ssl, (int)s_http_conn.fd);
+#else
+    SSL_set_fd(s_http_conn.ssl, s_http_conn.fd);
+#endif
+    (void)SSL_set_tlsext_host_name(s_http_conn.ssl, host);
+    if (SSL_connect(s_http_conn.ssl) != 1) {
+      long verify = SSL_get_verify_result(s_http_conn.ssl);
+      if (verify != X509_V_OK) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "https tls verify failed: %s ca=%s",
+                 X509_verify_cert_error_string(verify),
+                 active_cafile[0] ? active_cafile : "<default>");
+        runtime_failure(msg);
+      } else {
+        runtime_failure_openssl("https tls connect failed");
+      }
+      http_conn_close_locked();
+      return NULL;
+    }
+  }
+#else
+  if (https) {
+    runtime_failure("https requested but OpenSSL disabled");
+    http_conn_close_locked();
+    return NULL;
+  }
+#endif
+  s_http_conn.active = 1;
+  s_http_conn.last_used_ms = unix_ms_now();
+  return &s_http_conn;
+}
+
 static int append_headers(char *req, size_t cap, const char *path, const char *host,
                           const char *body, size_t body_len) {
   int n = snprintf(req, cap,
@@ -1069,11 +1653,13 @@ static int append_headers(char *req, size_t cap, const char *path, const char *h
                    "Host: %s\r\n"
                    "Content-Type: application/json\r\n"
                    "Content-Length: %zu\r\n"
-                   "X-Tenant-ID: %s\r\n"
-                   "X-User-ID: %s\r\n"
-                   "X-Permission-Set: telemetry:write\r\n",
-                   path, host, body_len, s_tenant[0] ? s_tenant : "demo-tenant",
-                   s_user[0] ? s_user : "edr-agent");
+	                   "X-Tenant-ID: %s\r\n"
+	                   "X-Endpoint-ID: %s\r\n"
+	                   "X-User-ID: %s\r\n"
+	                   "X-Permission-Set: telemetry:write\r\n",
+	                   path, host, body_len, s_tenant[0] ? s_tenant : "demo-tenant",
+	                   s_endpoint[0] ? s_endpoint : "",
+	                   s_user[0] ? s_user : "edr-agent");
   if (n <= 0 || (size_t)n >= cap) {
     return -1;
   }
@@ -1087,7 +1673,8 @@ static int append_headers(char *req, size_t cap, const char *path, const char *h
   }
   {
     size_t used = (size_t)n;
-    int m = snprintf(req + used, cap - used, "Connection: close\r\n\r\n");
+	    int m = snprintf(req + used, cap - used, "Connection: %s\r\n\r\n",
+	                     http_keepalive_enabled() ? "keep-alive" : "close");
     if (m <= 0 || (size_t)m >= cap - used) {
       return -1;
     }
@@ -1182,7 +1769,15 @@ done:
 }
 #endif
 
+static int native_request(const char *method, const char *url, const char *content_type,
+                          const char *body, size_t body_len, char *resp_body,
+                          size_t resp_body_cap);
+
 static int native_post_json(const char *url, const char *body, size_t body_len) {
+  return native_request("POST", url, "application/json", body, body_len, NULL, 0u);
+}
+
+static int native_post_json_legacy(const char *url, const char *body, size_t body_len) {
   char host[256];
   char path[1024];
   int port = 0;
@@ -1200,6 +1795,12 @@ static int native_post_json(const char *url, const char *body, size_t body_len) 
       runtime_failure("plain http denied for non-local host");
       return -1;
     }
+  }
+  if (!comm_circuit_allows()) {
+    return -1;
+  }
+  if (!comm_budget_try(body_len + 512u, https)) {
+    return -1;
   }
   if (net_init() != 0) {
     runtime_failure("network init failed");
@@ -1243,7 +1844,6 @@ static int native_request(const char *method, const char *url, const char *conte
   char path[1024];
   int port = 0;
   int https = 0;
-  EdrSocket fd = EDR_SOCKET_INVALID;
   int rc = -1;
   char req[8192];
   int rn;
@@ -1258,6 +1858,12 @@ static int native_request(const char *method, const char *url, const char *conte
       return -1;
     }
   }
+  if (!comm_circuit_allows()) {
+    return -1;
+  }
+  if (!comm_budget_try(body_len + 512u, 0)) {
+    return -1;
+  }
   if (net_init() != 0) {
     runtime_failure("network init failed");
     return -1;
@@ -1265,81 +1871,30 @@ static int native_request(const char *method, const char *url, const char *conte
   rn = append_request_headers(req, sizeof(req), method, path, host, content_type, body_len);
   if (rn <= 0) {
     runtime_failure("http request build failed");
-    net_done();
     return -1;
   }
-  if (https) {
-#ifdef EDR_HAVE_OPENSSL_HTTP
-    SSL_CTX *ctx = NULL;
-    SSL *ssl = NULL;
-    char active_cafile[1024];
-    ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
-    if (!ctx) {
-      net_done();
-      return -1;
+  http_lock();
+  for (int attempt = 0; attempt < 2; attempt++) {
+    int reusable = 0;
+    EdrHttpConn *conn = http_conn_get_locked(host, port, https);
+    if (!conn) {
+      break;
     }
-    if (tcp_connect_http_route(host, port, 1, &fd) != 0) {
-      runtime_failure("https tcp connect failed");
-      SSL_CTX_free(ctx);
-      net_done();
-      return -1;
-    }
-    ssl = SSL_new(ctx);
-    if (!ssl) {
-      runtime_failure_openssl("https ssl new failed");
-      close_fd(fd);
-      SSL_CTX_free(ctx);
-      net_done();
-      return -1;
-    }
-#ifdef _WIN32
-    SSL_set_fd(ssl, (int)fd);
-#else
-    SSL_set_fd(ssl, fd);
-#endif
-    (void)SSL_set_tlsext_host_name(ssl, host);
-    if (SSL_connect(ssl) == 1 &&
-        write_all_ssl(ssl, req, (size_t)rn) == 0 &&
-        (body_len == 0u || write_all_ssl(ssl, body, body_len) == 0) &&
-        read_http_response_from_recv(ssl_recv_adapter, ssl, resp_body, resp_body_cap) == 0) {
+    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
+        (body_len == 0u || (body && http_conn_write_all(conn, body, body_len) == 0)) &&
+        read_http_response_from_recv(http_socket_recv_adapter, conn, resp_body, resp_body_cap, &reusable) == 0) {
       rc = 0;
-    } else if (!s_last_error[0]) {
-      long verify = SSL_get_verify_result(ssl);
-      if (verify != X509_V_OK) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "https tls verify failed: %s ca=%s",
-                 X509_verify_cert_error_string(verify),
-                 active_cafile[0] ? active_cafile : "<default>");
-        runtime_failure(msg);
-      } else {
-        runtime_failure_openssl("https request failed");
+      conn->last_used_ms = unix_ms_now();
+      if (!reusable || !http_keepalive_enabled()) {
+        http_conn_close_locked();
       }
+      break;
     }
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close_fd(fd);
-    SSL_CTX_free(ctx);
-#else
-    runtime_failure("https requested but OpenSSL disabled");
-    rc = -1;
-#endif
-    net_done();
-    return rc;
+    http_conn_close_locked();
   }
-  if (tcp_connect_host(host, port, &fd) != 0) {
-    runtime_failure("http connect failed");
-    net_done();
-    return -1;
-  }
-  if (write_all_plain(fd, req, (size_t)rn) == 0 &&
-      (body_len == 0u || write_all_plain(fd, body, body_len) == 0) &&
-      read_http_response_from_recv(plain_recv_adapter, &fd, resp_body, resp_body_cap) == 0) {
-    rc = 0;
-  }
-  close_fd(fd);
-  net_done();
+  http_unlock();
   if (rc != 0 && !s_last_error[0]) {
-    runtime_failure("http request failed");
+    runtime_failure(https ? "https request failed" : "http request failed");
   }
   return rc;
 }
@@ -1655,6 +2210,12 @@ static int ws_connect_once(EdrWsConn *out) {
   snprintf(url, sizeof(url), "%s%singest/control/ws?endpoint_id=%s",
            s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", s_endpoint);
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
+    return -1;
+  }
+  if (!comm_circuit_allows()) {
+    return -1;
+  }
+  if (!comm_budget_try(2048u, https)) {
     return -1;
   }
   if (net_init() != 0) {

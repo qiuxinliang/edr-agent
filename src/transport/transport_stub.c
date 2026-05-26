@@ -397,6 +397,7 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->server.ca_cert,
       cfg->server.client_cert,
       cfg->server.client_key,
+      cfg->server.client_key_provider,
       cfg->platform.proxy_mode,
       cfg->platform.proxy_url,
       cfg->platform.relay_url);

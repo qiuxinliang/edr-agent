@@ -185,9 +185,18 @@ int ingest_http_post(const char *url, const uint8_t *data, size_t len) {
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `EDR_HTTP_KEEPALIVE` | 1 | 启用Keep-Alive（0=禁用） |
-| `EDR_HTTP_CONN_POOL_SIZE` | 4 | 连接池大小 |
-| `EDR_HTTP_CONN_TIMEOUT_S` | 60 | 连接超时（秒） |
-| `EDR_HTTP_MAX_CONCURRENT` | 4 | 最大并发请求数 |
+| `EDR_HTTP_KEEPALIVE_IDLE_MS` | 30000 | 复用连接最大空闲时间 |
+| `EDR_HTTP_SOCKET_TIMEOUT_MS` | 10000 | HTTP socket 读写超时 |
+| `EDR_HTTP_REQUEST_BUDGET_PER_MIN` | 600 | 每分钟 HTTP 请求预算 |
+| `EDR_HTTP_BYTE_BUDGET_MB_PER_MIN` | 64 | 每分钟 HTTP 上传/下载字节预算 |
+| `EDR_HTTP_TLS_HANDSHAKE_BUDGET_PER_MIN` | 120 | 每分钟 TLS 新握手预算 |
+| `EDR_HTTP_CIRCUIT_FAILURES` | 3 | 连续关键失败后打开熔断 |
+| `EDR_HTTP_CIRCUIT_OPEN_S` | 60 | 熔断保持时间 |
+| `EDR_PROXY_AUTH_BASIC` | 空 | 可选代理凭据，格式为 `user:password`；未配置时不发送认证头 |
+| `EDR_PROXY_AUTH_B64` | 空 | 可选代理凭据，已编码的 Basic token；优先级高于 `EDR_PROXY_AUTH_BASIC` |
+| `EDR_QUEUE_BUSY_TIMEOUT_MS` | 5000 | SQLite 队列 busy timeout |
+| `EDR_QUEUE_DRAIN_INTERVAL_MS` | 200 | SQLite 队列补报 worker 最小间隔 |
+| `EDR_QUEUE_DRAIN_MAX_ROWS` | 32 | 单轮最多补报行数 |
 
 ---
 

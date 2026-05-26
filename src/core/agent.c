@@ -23,6 +23,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
 #include "edr/storage_queue.h"
+#include "edr/transport_sink.h"
 #ifdef _WIN32
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
@@ -302,7 +303,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1024], sensor_interest_ver[160], sensor_interest_rules[160];
   char http_conn_mode[48], http_base_url[640], http_relay_url[640], http_proxy_mode[48];
-  char http_proxy_url[640], http_proxy_status[128];
+  char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
+  char http_mtls_status[128], http_key_provider[48];
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
   EdrResourceSample rs;
@@ -343,12 +345,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.proxy_mode, http_proxy_mode, sizeof(http_proxy_mode));
   json_escape_small(http_rt.proxy_url, http_proxy_url, sizeof(http_proxy_url));
   json_escape_small(http_rt.proxy_status, http_proxy_status, sizeof(http_proxy_status));
+  json_escape_small(http_rt.circuit_reason, http_circuit_reason, sizeof(http_circuit_reason));
+  json_escape_small(http_rt.mtls_status, http_mtls_status, sizeof(http_mtls_status));
+  json_escape_small(http_rt.client_key_provider, http_key_provider, sizeof(http_key_provider));
   json_escape_small(ch.auditd_last_error, audit_err, sizeof(audit_err));
   json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
   json_escape_small(ch.sensor_interest_version, sensor_interest_ver, sizeof(sensor_interest_ver));
   json_escape_small(ch.sensor_interest_rules_version, sensor_interest_rules, sizeof(sensor_interest_rules));
 
-  char body[12288];
+  char body[16384];
   int n = snprintf(
       body, sizeof(body),
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
@@ -357,14 +362,24 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"communication\":{\"grpc_ready\":%s,\"grpc_insecure\":%s,\"http_fallback\":%s,"
       "\"http_insecure\":%s,\"grpc_rpc_ok\":%lu,\"grpc_rpc_fail\":%lu,"
       "\"grpc_consecutive_failures\":%d,\"http_ok\":%lu,\"http_fail\":%lu,"
+      "\"send_queue_depth\":%llu,\"send_queue_capacity\":%llu,"
+      "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
+      "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
       "\"offline_queue_pending\":%llu,\"last_success_unix_ms\":%lld,"
       "\"last_failure_unix_ms\":%lld,\"last_failure_reason\":\"%s%s%s\","
       "\"enterprise\":{\"connection_mode\":\"%s\",\"effective_base_url\":\"%s\","
       "\"relay_url\":\"%s\",\"mtls_configured\":%s,\"websocket_ready\":%s,"
+      "\"mtls_status\":\"%s\",\"client_key_provider\":\"%s\","
       "\"proxy_mode\":\"%s\",\"proxy_url\":\"%s\",\"proxy_status\":\"%s\","
       "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
       "\"failure_reason\":\"%s%s%s\",\"poll_backoff_ms\":%d,\"ws_backoff_ms\":%d,"
-      "\"pending_upload_queue\":%llu}},"
+      "\"circuit_open\":%s,\"circuit_until_unix_ms\":%lld,\"circuit_reason\":\"%s\","
+      "\"pending_upload_queue\":%llu,"
+      "\"budget\":{\"requests_this_minute\":%lu,\"request_limit_per_minute\":%lu,"
+      "\"bytes_this_minute\":%llu,\"byte_limit_per_minute\":%llu,"
+      "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
+      "\"budget_drops\":%lu},"
+      "\"slo\":{\"success_rate_pct\":%u}}},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"cpu_percent\":%u,\"rss_mb\":%llu,\"thread_count\":%u,\"handle_count\":%u,"
       "\"throttle_active\":%s,\"sample_count\":%llu},"
@@ -406,25 +421,38 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING, rules_ver[0] ? rules_ver : "local",
       (unsigned long long)(time(NULL) * 1000LL),
-      grpc_rt.ready ? "true" : "false", grpc_rt.insecure ? "true" : "false",
-      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
-      grpc_rt.rpc_ok, grpc_rt.rpc_fail, grpc_rt.report_fail_streak, http_rt.ok_count, http_rt.fail_count,
-      (unsigned long long)edr_storage_queue_pending_count(),
+	      grpc_rt.ready ? "true" : "false", grpc_rt.insecure ? "true" : "false",
+	      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
+	      grpc_rt.rpc_ok, grpc_rt.rpc_fail, grpc_rt.report_fail_streak, http_rt.ok_count, http_rt.fail_count,
+	      (unsigned long long)edr_transport_send_queue_depth(),
+	      (unsigned long long)edr_transport_send_queue_capacity(),
+	      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
+	      edr_transport_queue_full_sampled_count(), edr_transport_queue_full_dropped_count(),
+	      (unsigned long long)edr_storage_queue_pending_count(),
       (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
                                                                                 : http_rt.last_success_unix_ms),
       (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
                                                                                 : http_rt.last_failure_unix_ms),
       grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
-      http_conn_mode[0] ? http_conn_mode : "direct", http_base_url, http_relay_url,
-      http_rt.mtls_configured ? "true" : "false", http_rt.websocket_ready ? "true" : "false",
-      http_proxy_mode[0] ? http_proxy_mode : "auto", http_proxy_url, http_proxy_status,
+	      http_conn_mode[0] ? http_conn_mode : "direct", http_base_url, http_relay_url,
+	      http_rt.mtls_configured ? "true" : "false", http_rt.websocket_ready ? "true" : "false",
+	      http_mtls_status[0] ? http_mtls_status : "not_configured",
+	      http_key_provider[0] ? http_key_provider : "pem",
+	      http_proxy_mode[0] ? http_proxy_mode : "auto", http_proxy_url, http_proxy_status,
       (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
                                                                                 : http_rt.last_success_unix_ms),
       (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
                                                                                 : http_rt.last_failure_unix_ms),
-      grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
-      http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
-      (unsigned long long)edr_storage_queue_pending_count(),
+	      grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+	      http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
+	      http_rt.circuit_open ? "true" : "false", (long long)http_rt.circuit_until_unix_ms,
+	      http_circuit_reason,
+	      (unsigned long long)edr_storage_queue_pending_count(),
+	      http_rt.requests_this_minute, http_rt.request_limit_per_minute,
+	      (unsigned long long)http_rt.bytes_this_minute,
+	      (unsigned long long)http_rt.byte_limit_per_minute,
+	      http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
+	      http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       rs.cpu_percent, (unsigned long long)rs.rss_mb, rs.thread_count, rs.handle_count,
       rs.throttle_active ? "true" : "false", (unsigned long long)rs.sample_count,

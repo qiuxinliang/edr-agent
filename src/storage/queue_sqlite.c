@@ -13,17 +13,30 @@
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
 #include <sys/stat.h>
-#if defined(_WIN32) && defined(_MSC_VER)
+#if defined(_WIN32)
+#include <windows.h>
+#if defined(_MSC_VER)
 #include <stdlib.h>
+#endif
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 
 static sqlite3 *s_db;
 static char s_path[512];
+static char s_lock_path[600];
 static uint64_t s_pending;
 static uint64_t s_max_db_bytes;
 static uint32_t s_cfg_max_db_mb;
 static uint32_t s_cfg_retention_hours;
 static uint64_t s_last_cleanup_ns;
+#if defined(_WIN32)
+static HANDLE s_lock_handle = INVALID_HANDLE_VALUE;
+#else
+static int s_lock_fd = -1;
+#endif
 
 void edr_storage_queue_configure(uint32_t max_db_mb, uint32_t retention_hours) {
   s_cfg_max_db_mb = max_db_mb;
@@ -73,6 +86,22 @@ static uint32_t retention_hours_effective(void) {
     }
   }
   return s_cfg_retention_hours ? s_cfg_retention_hours : 72u;
+}
+
+static unsigned queue_drain_interval_ms(void) {
+  const char *e = getenv("EDR_QUEUE_DRAIN_INTERVAL_MS");
+  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 200UL;
+  if (v < 200UL) v = 200UL;
+  if (v > 30000UL) v = 30000UL;
+  return (unsigned)v;
+}
+
+static unsigned queue_drain_max_rows(void) {
+  const char *e = getenv("EDR_QUEUE_DRAIN_MAX_ROWS");
+  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 32UL;
+  if (v < 1UL) v = 1UL;
+  if (v > 128UL) v = 128UL;
+  return (unsigned)v;
 }
 
 static uint32_t rd_u32_le(const uint8_t *p) {
@@ -220,6 +249,60 @@ static int exec_simple(sqlite3 *db, const char *sql) {
   return SQLITE_OK;
 }
 
+static int queue_lock_acquire(const char *path) {
+  if (!path || !path[0]) {
+    return -1;
+  }
+  snprintf(s_lock_path, sizeof(s_lock_path), "%s.lock", path);
+#if defined(_WIN32)
+  s_lock_handle = CreateFileA(s_lock_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+  if (s_lock_handle == INVALID_HANDLE_VALUE) {
+    fprintf(stderr, "[queue] cannot acquire queue file lock: %s\n", s_lock_path);
+    return -1;
+  }
+  return 0;
+#else
+  s_lock_fd = open(s_lock_path, O_CREAT | O_RDWR, 0600);
+  if (s_lock_fd < 0 || flock(s_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+    if (s_lock_fd >= 0) {
+      close(s_lock_fd);
+      s_lock_fd = -1;
+    }
+    fprintf(stderr, "[queue] cannot acquire queue file lock: %s\n", s_lock_path);
+    return -1;
+  }
+  return 0;
+#endif
+}
+
+static void queue_lock_release(void) {
+#if defined(_WIN32)
+  if (s_lock_handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(s_lock_handle);
+    s_lock_handle = INVALID_HANDLE_VALUE;
+  }
+#else
+  if (s_lock_fd >= 0) {
+    (void)flock(s_lock_fd, LOCK_UN);
+    close(s_lock_fd);
+    s_lock_fd = -1;
+  }
+#endif
+  if (s_lock_path[0]) {
+    (void)remove(s_lock_path);
+    s_lock_path[0] = '\0';
+  }
+}
+
+static int queue_busy_timeout_ms(void) {
+  const char *e = getenv("EDR_QUEUE_BUSY_TIMEOUT_MS");
+  long v = e && e[0] ? strtol(e, NULL, 10) : 5000L;
+  if (v < 100) v = 100;
+  if (v > 60000) v = 60000;
+  return (int)v;
+}
+
 EdrError edr_storage_queue_open(const char *path) {
   edr_storage_queue_close();
   load_queue_db_limit();
@@ -229,11 +312,21 @@ EdrError edr_storage_queue_open(const char *path) {
     snprintf(s_path, sizeof(s_path), "%s", "edr_queue.db");
   }
 
+  if (queue_lock_acquire(s_path) != 0) {
+    return EDR_ERR_SQLITE_OPEN;
+  }
+
   int rc = sqlite3_open(s_path, &s_db);
   if (rc != SQLITE_OK || !s_db) {
     s_db = NULL;
+    queue_lock_release();
     return EDR_ERR_SQLITE_OPEN;
   }
+  sqlite3_busy_timeout(s_db, queue_busy_timeout_ms());
+  (void)exec_simple(s_db, "PRAGMA journal_mode=WAL;");
+  (void)exec_simple(s_db, "PRAGMA synchronous=NORMAL;");
+  (void)exec_simple(s_db, "PRAGMA wal_autocheckpoint=1000;");
+  (void)exec_simple(s_db, "PRAGMA temp_store=MEMORY;");
 
   const char *schema =
       "CREATE TABLE IF NOT EXISTS event_queue ("
@@ -251,6 +344,7 @@ EdrError edr_storage_queue_open(const char *path) {
   if (exec_simple(s_db, schema) != SQLITE_OK) {
     sqlite3_close(s_db);
     s_db = NULL;
+    queue_lock_release();
     return EDR_ERR_SQLITE_WRITE;
   }
   (void)exec_simple(s_db, "ALTER TABLE event_queue ADD COLUMN severity INTEGER NOT NULL DEFAULT 0;");
@@ -271,6 +365,7 @@ void edr_storage_queue_close(void) {
     sqlite3_close(s_db);
     s_db = NULL;
   }
+  queue_lock_release();
   s_pending = 0;
 }
 
@@ -331,7 +426,8 @@ uint64_t edr_storage_queue_pending_count(void) { return s_pending; }
 void edr_storage_queue_poll_drain(void) {
   static uint64_t last_ns;
   uint64_t now = edr_monotonic_ns();
-  if (now - last_ns < 200000000ULL) {
+  uint64_t interval_ns = (uint64_t)queue_drain_interval_ms() * 1000000ULL;
+  if (now - last_ns < interval_ns) {
     return;
   }
   if (!s_db || s_pending == 0u) {
@@ -342,7 +438,7 @@ void edr_storage_queue_poll_drain(void) {
   last_ns = now;
   cleanup_expired_rows();
 
-  for (unsigned k = 0; k < 32u; k++) {
+  for (unsigned k = 0; k < queue_drain_max_rows(); k++) {
     int r = drain_one_row();
     if (r == 1) {
       break;

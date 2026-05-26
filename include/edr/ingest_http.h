@@ -14,7 +14,8 @@ struct EdrSoarCommandMeta;
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file, const char *client_cert_file,
-                                const char *client_key_file, const char *proxy_mode,
+                                const char *client_key_file, const char *client_key_provider,
+                                const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url);
 
 int edr_ingest_http_configured(void);
@@ -27,17 +28,30 @@ typedef struct {
   int websocket_ready;
   int poll_backoff_ms;
   int ws_backoff_ms;
+  int circuit_open;
+  int64_t circuit_until_unix_ms;
   unsigned long ok_count;
   unsigned long fail_count;
+  unsigned long budget_drop_count;
   int64_t last_success_unix_ms;
   int64_t last_failure_unix_ms;
   char last_error[160];
+  char circuit_reason[128];
   char connection_mode[32];
   char effective_base_url[512];
   char relay_url[512];
   char proxy_mode[32];
   char proxy_url[512];
   char proxy_status[96];
+  char client_key_provider[32];
+  char mtls_status[96];
+  unsigned long requests_this_minute;
+  unsigned long request_limit_per_minute;
+  uint64_t bytes_this_minute;
+  uint64_t byte_limit_per_minute;
+  unsigned long tls_handshakes_this_minute;
+  unsigned long tls_handshake_limit_per_minute;
+  unsigned int slo_success_rate_pct;
 } EdrIngestHttpRuntime;
 
 void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out);
