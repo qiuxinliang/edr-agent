@@ -190,8 +190,20 @@ static void json_escape_to(char *dst, size_t cap, const char *s) {
     if (c == '"' || c == '\\') {
       dst[o++] = '\\';
       dst[o++] = (char)c;
+    } else if (c == '\n') {
+      dst[o++] = '\\';
+      dst[o++] = 'n';
+    } else if (c == '\r') {
+      dst[o++] = '\\';
+      dst[o++] = 'r';
+    } else if (c == '\t') {
+      dst[o++] = '\\';
+      dst[o++] = 't';
     } else if (c < 0x20u) {
-      dst[o++] = ' ';
+      if (o + 7u >= cap) {
+        break;
+      }
+      o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", (unsigned)c);
     } else {
       dst[o++] = (char)c;
     }
