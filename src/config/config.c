@@ -369,6 +369,42 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "etw_dns_client_provider");
+    if (d.ok) {
+      cfg->collection.etw_dns_client_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_powershell_provider");
+    if (d.ok) {
+      cfg->collection.etw_powershell_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_amsi_provider");
+    if (d.ok) {
+      cfg->collection.etw_amsi_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_schannel_provider");
+    if (d.ok) {
+      cfg->collection.etw_schannel_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_security_audit_provider");
+    if (d.ok) {
+      cfg->collection.etw_security_audit_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_wmi_provider");
+    if (d.ok) {
+      cfg->collection.etw_wmi_provider = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "etw_tcpip_provider");
     if (d.ok) {
       cfg->collection.etw_tcpip_provider = d.u.b ? true : false;
@@ -1385,6 +1421,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->agent.tenant_id, sizeof(cfg->agent.tenant_id), "%s", "tenant_default");
 
   cfg->collection.etw_enabled = true;
+  cfg->collection.etw_dns_client_provider = true;
+  cfg->collection.etw_powershell_provider = true;
+  cfg->collection.etw_amsi_provider = true;
+  cfg->collection.etw_schannel_provider = true;
+  cfg->collection.etw_security_audit_provider = true;
+  cfg->collection.etw_wmi_provider = true;
   cfg->collection.etw_tcpip_provider = true;
   cfg->collection.etw_firewall_provider = true;
   cfg->collection.ebpf_enabled = true;

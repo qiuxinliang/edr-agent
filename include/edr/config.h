@@ -42,6 +42,13 @@ typedef struct EdrConfig {
 
   struct {
     bool etw_enabled;
+    /** Optional Windows provider switches. Defaults preserve the historical collector posture. */
+    bool etw_dns_client_provider;
+    bool etw_powershell_provider;
+    bool etw_amsi_provider;
+    bool etw_schannel_provider;
+    bool etw_security_audit_provider;
+    bool etw_wmi_provider;
     /** Windows：订阅 Microsoft-Windows-TCPIP（§19.10）；失败时跳过不致命 */
     bool etw_tcpip_provider;
     /** Windows：订阅 WFAS 防火墙 ETW（§19.10）；失败时跳过不致命 */

@@ -49,12 +49,15 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #define EDR_AGENT_VERSION_STRING "0.3.0"
 #endif
 
+#define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
+
 struct EdrAgent {
   EdrEventBus *event_bus;
   char *config_path;
   EdrConfig cfg;
   time_t config_mtime;
   int shutdown;
+  int collector_started;
   /** §19.8 周期快照：上次全量定时采集单调时钟（ns） */
   uint64_t asurf_last_post_ns;
   /** §19.6 上次轮询 refresh-request 的时间（ns） */
@@ -191,6 +194,13 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns);
 
+static int edr_agent_collection_enabled(const EdrConfig *cfg) {
+  if (!cfg) {
+    return 0;
+  }
+  return cfg->collection.etw_enabled || cfg->collection.ebpf_enabled || cfg->collection.auditd_enabled;
+}
+
 EdrError edr_agent_run(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
     return EDR_ERR_INVALID_ARG;
@@ -206,13 +216,12 @@ EdrError edr_agent_run(EdrAgent *agent) {
     uint64_t last_remote_ns = 0;
     uint64_t last_sensor_interest_ns = 0;
     uint64_t last_health_ns = 0;
-    int collector_started = 0;
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
       if (e != EDR_OK) {
         fprintf(stderr, "[collector] start failed: %d; continuing in degraded mode\n", (int)e);
-      } else {
-        collector_started = 1;
+      } else if (edr_agent_collection_enabled(&agent->cfg)) {
+        agent->collector_started = 1;
       }
       if (agent->cfg.attack_surface.enabled && agent->cfg.agent.endpoint_id[0] &&
           strcmp(agent->cfg.agent.endpoint_id, "auto") != 0) {
@@ -240,8 +249,9 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_poll_engine_health(agent, &last_health_ns);
         edr_command_poll_reliable_delivery();
       }
-      if (collector_started) {
+      if (agent->collector_started) {
         edr_collector_stop();
+        agent->collector_started = 0;
       }
     }
   }
@@ -585,15 +595,167 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
   }
 }
 
-static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns) {
-  const char *url = getenv("EDR_REMOTE_CONFIG_URL");
-  const char *ps = getenv("EDR_REMOTE_CONFIG_POLL_S");
-  if (!agent || !url || !url[0] || !ps || !ps[0]) {
+static int edr_agent_toml_has_section(const char *path, const char *section) {
+  FILE *fp;
+  char line[256];
+  char needle[96];
+  size_t nlen;
+  if (!path || !path[0] || !section || !section[0]) {
+    return 0;
+  }
+  snprintf(needle, sizeof(needle), "[%s]", section);
+  nlen = strlen(needle);
+  fp = fopen(path, "r");
+  if (!fp) {
+    return 0;
+  }
+  while (fgets(line, sizeof(line), fp)) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (*p == '#' || *p == '\0' || p[0] != '[' || p[1] == '[') {
+      continue;
+    }
+    if (strncmp(p, needle, nlen) == 0) {
+      char tail = p[nlen];
+      if (tail == '\0' || tail == '\r' || tail == '\n' || tail == ' ' || tail == '\t' || tail == '#') {
+        fclose(fp);
+        return 1;
+      }
+    }
+  }
+  fclose(fp);
+  return 0;
+}
+
+static int edr_collection_policy_changed(const EdrConfig *current, const EdrConfig *remote) {
+  if (!current || !remote) {
+    return 0;
+  }
+  return current->collection.etw_enabled != remote->collection.etw_enabled ||
+         current->collection.etw_dns_client_provider != remote->collection.etw_dns_client_provider ||
+         current->collection.etw_powershell_provider != remote->collection.etw_powershell_provider ||
+         current->collection.etw_amsi_provider != remote->collection.etw_amsi_provider ||
+         current->collection.etw_schannel_provider != remote->collection.etw_schannel_provider ||
+         current->collection.etw_security_audit_provider != remote->collection.etw_security_audit_provider ||
+         current->collection.etw_wmi_provider != remote->collection.etw_wmi_provider ||
+         current->collection.etw_tcpip_provider != remote->collection.etw_tcpip_provider ||
+         current->collection.etw_firewall_provider != remote->collection.etw_firewall_provider;
+}
+
+static void edr_agent_restart_collector(EdrAgent *agent) {
+  if (!agent || !agent->event_bus) {
     return;
   }
-  int interval = atoi(ps);
-  if (interval < 1) {
+  if (agent->collector_started) {
+    edr_collector_stop();
+    agent->collector_started = 0;
+  }
+  if (!edr_agent_collection_enabled(&agent->cfg)) {
+    fprintf(stderr, "[collector] remote policy disabled collection; collector stopped\n");
     return;
+  }
+  {
+    EdrError e = edr_collector_start(agent->event_bus, &agent->cfg);
+    if (e != EDR_OK) {
+      fprintf(stderr, "[collector] remote policy restart failed: %d; continuing in degraded mode\n", (int)e);
+      return;
+    }
+    agent->collector_started = 1;
+    fprintf(stderr, "[collector] remote policy applied; collector restarted\n");
+  }
+}
+
+static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remote, const char *tmp) {
+  int changed = 0;
+  if (!agent || !remote || !tmp || !tmp[0]) {
+    return 0;
+  }
+  if (edr_agent_toml_has_section(tmp, "preprocessing")) {
+    snprintf(agent->cfg.preprocessing.rules_version, sizeof(agent->cfg.preprocessing.rules_version), "%s",
+             remote->preprocessing.rules_version);
+  }
+  if (edr_agent_toml_has_section(tmp, "collection")) {
+    if (edr_collection_policy_changed(&agent->cfg, remote)) {
+      changed |= EDR_REMOTE_POLICY_COLLECTION_CHANGED;
+    }
+    if (agent->cfg.collection.max_event_queue_size != remote->collection.max_event_queue_size) {
+      fprintf(stderr, "[config] remote max_event_queue_size changed; applies after agent restart\n");
+    }
+    agent->cfg.collection.etw_enabled = remote->collection.etw_enabled;
+    agent->cfg.collection.etw_dns_client_provider = remote->collection.etw_dns_client_provider;
+    agent->cfg.collection.etw_powershell_provider = remote->collection.etw_powershell_provider;
+    agent->cfg.collection.etw_amsi_provider = remote->collection.etw_amsi_provider;
+    agent->cfg.collection.etw_schannel_provider = remote->collection.etw_schannel_provider;
+    agent->cfg.collection.etw_security_audit_provider = remote->collection.etw_security_audit_provider;
+    agent->cfg.collection.etw_wmi_provider = remote->collection.etw_wmi_provider;
+    agent->cfg.collection.etw_tcpip_provider = remote->collection.etw_tcpip_provider;
+    agent->cfg.collection.etw_firewall_provider = remote->collection.etw_firewall_provider;
+    agent->cfg.collection.max_event_queue_size = remote->collection.max_event_queue_size;
+  }
+  if (edr_agent_toml_has_section(tmp, "upload")) {
+    agent->cfg.upload = remote->upload;
+  }
+  if (edr_agent_toml_has_section(tmp, "resource_limit")) {
+    agent->cfg.resource_limit = remote->resource_limit;
+  }
+  if (edr_agent_toml_has_section(tmp, "command")) {
+    agent->cfg.command = remote->command;
+  }
+  if (edr_agent_toml_has_section(tmp, "forensic_auto")) {
+    agent->cfg.forensic_auto = remote->forensic_auto;
+  }
+  if (edr_agent_toml_has_section(tmp, "platform")) {
+    snprintf(agent->cfg.platform.proxy_mode, sizeof(agent->cfg.platform.proxy_mode), "%s",
+             remote->platform.proxy_mode);
+    snprintf(agent->cfg.platform.proxy_url, sizeof(agent->cfg.platform.proxy_url), "%s",
+             remote->platform.proxy_url);
+    snprintf(agent->cfg.platform.relay_url, sizeof(agent->cfg.platform.relay_url), "%s",
+             remote->platform.relay_url);
+  }
+  if (edr_agent_toml_has_section(tmp, "ave")) {
+    agent->cfg.ave.behavior_monitor_enabled = remote->ave.behavior_monitor_enabled;
+    agent->cfg.ave.scan_threads = remote->ave.scan_threads;
+    agent->cfg.ave.max_file_size_mb = remote->ave.max_file_size_mb;
+    snprintf(agent->cfg.ave.sensitivity, sizeof(agent->cfg.ave.sensitivity), "%s", remote->ave.sensitivity);
+  }
+  if (edr_agent_toml_has_section(tmp, "attack_surface")) {
+    agent->cfg.attack_surface.enabled = remote->attack_surface.enabled;
+  }
+  if (edr_agent_toml_has_section(tmp, "self_protect")) {
+    agent->cfg.self_protect.event_bus_pressure_warn_pct = remote->self_protect.event_bus_pressure_warn_pct;
+  }
+  return changed;
+}
+
+static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns) {
+  const char *url = getenv("EDR_REMOTE_CONFIG_URL");
+  const char *auto_pull = getenv("EDR_REMOTE_CONFIG_AUTO_PULL");
+  const char *ps = getenv("EDR_REMOTE_CONFIG_POLL_S");
+  char derived[768];
+  int interval = 1800;
+  if (!agent) {
+    return;
+  }
+  if (auto_pull && (auto_pull[0] == '0' || auto_pull[0] == 'n' || auto_pull[0] == 'N')) {
+    return;
+  }
+  if (!url || !url[0]) {
+    const char *base = agent->cfg.platform.relay_url[0]
+                           ? agent->cfg.platform.relay_url
+                           : agent->cfg.platform.rest_base_url;
+    if (!base[0]) {
+      return;
+    }
+    snprintf(derived, sizeof(derived), "%s/agent/runtime-policy.toml", base);
+    url = derived;
+  }
+  if (ps && ps[0]) {
+    int v = atoi(ps);
+    if (v >= 60 && v <= 86400) {
+      interval = v;
+    }
   }
   uint64_t now = edr_monotonic_ns();
   if (*last_remote_ns != 0u &&
@@ -611,7 +773,12 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   snprintf(tmp, sizeof(tmp), "%s\\edr_remote_%lu.toml", t, (unsigned long)GetCurrentProcessId());
   {
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "curl -fsSL \"%s\" -o \"%s\" 1>nul 2>nul", url, tmp);
+    snprintf(cmd, sizeof(cmd),
+             "curl -fsSL \"%s\" -H \"X-Endpoint-ID: %s\" -H \"X-Tenant-ID: %s\" -o \"%s\" 1>nul 2>nul",
+             url,
+             agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown",
+             agent->cfg.agent.tenant_id[0] ? agent->cfg.agent.tenant_id : "unknown",
+             tmp);
     if (system(cmd) != 0) {
       fprintf(stderr, "[config] 远程 TOML 拉取失败（需系统 PATH 中有 curl）\n");
       return;
@@ -621,7 +788,12 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   snprintf(tmp, sizeof(tmp), "/tmp/edr_remote_%d.toml", (int)getpid());
   {
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "curl -fsSL '%s' -o '%s' 2>/dev/null", url, tmp);
+    snprintf(cmd, sizeof(cmd),
+             "curl -fsSL '%s' -H 'X-Endpoint-ID: %s' -H 'X-Tenant-ID: %s' -o '%s' 2>/dev/null",
+             url,
+             agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown",
+             agent->cfg.agent.tenant_id[0] ? agent->cfg.agent.tenant_id : "unknown",
+             tmp);
     if (system(cmd) != 0) {
       fprintf(stderr, "[config] 远程 TOML 拉取失败（curl 非零退出）\n");
       return;
@@ -629,17 +801,27 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
 #endif
 
-  EdrError ce = edr_config_load(tmp, &agent->cfg);
+  EdrConfig remote;
+  memset(&remote, 0, sizeof(remote));
+  EdrError ce = edr_config_load(tmp, &remote);
   char fp[80];
+  int changed = 0;
   edr_config_fingerprint(tmp, fp, sizeof(fp));
-  (void)remove(tmp);
   if (ce != EDR_OK) {
     fprintf(stderr, "[config] 远程 TOML 解析失败: %d\n", (int)ce);
+    (void)remove(tmp);
     return;
+  }
+  changed = edr_agent_apply_remote_policy(agent, &remote, tmp);
+  edr_config_free_heap(&remote);
+  (void)remove(tmp);
+  if ((changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0) {
+    edr_agent_restart_collector(agent);
   }
   edr_preprocess_apply_config(&agent->cfg);
   edr_resource_init(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
+  edr_ingest_http_set_policy_version(agent->cfg.preprocessing.rules_version);
   {
     const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
     if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&

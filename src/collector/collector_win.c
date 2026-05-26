@@ -848,17 +848,17 @@ static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
   typedef struct {
     const GUID *guid;
     int want;
-  } OptProv;
-  OptProv optional[] = {
-      {&EDR_ETW_GUID_DNS_CLIENT, 1},
-      {&EDR_ETW_GUID_POWERSHELL, 1},
-      {&EDR_ETW_GUID_AMSI, 1},
-      {&EDR_ETW_GUID_SCHANNEL, 1},
-      {&EDR_ETW_GUID_SECURITY_AUDIT, 1},
-      {&EDR_ETW_GUID_WMI_ACTIVITY, 1},
-      {&EDR_ETW_GUID_MICROSOFT_TCPIP, cfg && cfg->collection.etw_tcpip_provider},
-      {&EDR_ETW_GUID_WINFIREWALL_WFAS, cfg && cfg->collection.etw_firewall_provider},
-  };
+	  } OptProv;
+	  OptProv optional[] = {
+	      {&EDR_ETW_GUID_DNS_CLIENT, cfg && cfg->collection.etw_dns_client_provider},
+	      {&EDR_ETW_GUID_POWERSHELL, cfg && cfg->collection.etw_powershell_provider},
+	      {&EDR_ETW_GUID_AMSI, cfg && cfg->collection.etw_amsi_provider},
+	      {&EDR_ETW_GUID_SCHANNEL, cfg && cfg->collection.etw_schannel_provider},
+	      {&EDR_ETW_GUID_SECURITY_AUDIT, cfg && cfg->collection.etw_security_audit_provider},
+	      {&EDR_ETW_GUID_WMI_ACTIVITY, cfg && cfg->collection.etw_wmi_provider},
+	      {&EDR_ETW_GUID_MICROSOFT_TCPIP, cfg && cfg->collection.etw_tcpip_provider},
+	      {&EDR_ETW_GUID_WINFIREWALL_WFAS, cfg && cfg->collection.etw_firewall_provider},
+	  };
   for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); i++) {
     if (!optional[i].want) {
       continue;
