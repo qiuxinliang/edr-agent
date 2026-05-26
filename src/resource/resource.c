@@ -148,11 +148,11 @@ void edr_resource_poll(void) {
   s_sample.sample_count++;
   if (cpu_bad) {
     s_emergency++;
-    fprintf(stderr, "[resource] CPU 约 %u%% 超过上限 %u%%（emergency=%lu）\n", pct,
+    fprintf(stderr, "[resource] CPU approx %u%% exceeds limit %u%% (emergency=%lu)\n", pct,
             s_cfg->resource_limit.cpu_limit_percent, s_emergency);
     s_preprocess_throttle = 1;
   } else if (mem_bad) {
-    fprintf(stderr, "[resource] RSS 约 %lu MB 超过 memory_limit_mb=%u\n", rss_mb,
+    fprintf(stderr, "[resource] RSS approx %lu MB exceeds memory_limit_mb=%u\n", rss_mb,
             s_cfg->resource_limit.memory_limit_mb);
     s_preprocess_throttle = 1;
   } else {
@@ -195,14 +195,14 @@ void edr_resource_poll(void) {
 #endif
     if (enforce_limits && rss_mb > (unsigned long)s_cfg->resource_limit.memory_limit_mb) {
       mem_bad = true;
-      fprintf(stderr, "[resource] RSS 约 %lu MB 超过 memory_limit_mb=%u\n", rss_mb,
+      fprintf(stderr, "[resource] RSS approx %lu MB exceeds memory_limit_mb=%u\n", rss_mb,
               s_cfg->resource_limit.memory_limit_mb);
     }
   }
 
   if (cpu_bad) {
     s_emergency++;
-    fprintf(stderr, "[resource] CPU 约 %u%% 超过上限 %u%%（emergency=%lu）\n", pct,
+    fprintf(stderr, "[resource] CPU approx %u%% exceeds limit %u%% (emergency=%lu)\n", pct,
             s_cfg->resource_limit.cpu_limit_percent, s_emergency);
     s_preprocess_throttle = 1;
   } else if (mem_bad) {

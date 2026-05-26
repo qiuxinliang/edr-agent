@@ -300,10 +300,16 @@ void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
 
   if (session_id[0] && input[0]) {
     size_t ilen = strlen(input);
+#ifdef _WIN32
     if (ilen + 2 <= sizeof(input)) {
-      input[ilen] = '\n';
-      ilen++;
+      input[ilen++] = '\r';
+      input[ilen++] = '\n';
     }
+#else
+    if (ilen + 1 <= sizeof(input)) {
+      input[ilen++] = '\n';
+    }
+#endif
     int rc = edr_shell_session_input(session_id, input, ilen);
     if (rc != 0) {
       edr_cmd_inc_exec_fail();

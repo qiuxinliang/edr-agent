@@ -1631,9 +1631,16 @@ static void do_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
     return;
   }
   size_t ilen = strlen(input);
+#ifdef _WIN32
   if (ilen + 2u <= sizeof(input)) {
+    input[ilen++] = '\r';
     input[ilen++] = '\n';
   }
+#else
+  if (ilen + 1u <= sizeof(input)) {
+    input[ilen++] = '\n';
+  }
+#endif
   int rc = edr_shell_session_input(session_id, input, ilen);
   if (rc != 0) {
     s_exec_fail++;

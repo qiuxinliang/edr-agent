@@ -8,6 +8,7 @@
 #include "edr/resource.h"
 #include "edr/self_protect.h"
 #include "edr/sensor_interest.h"
+#include "edr/shell_session.h"
 #include "edr/shellcode_known.h"
 #include "edr/time_util.h"
 
@@ -260,6 +261,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns);
         edr_agent_poll_attack_surface(agent);
         edr_agent_poll_engine_health(agent, &last_health_ns);
+        edr_shell_session_poll();
         edr_command_poll_reliable_delivery();
       }
       if (agent->collector_started) {
