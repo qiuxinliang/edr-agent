@@ -51,6 +51,19 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
 
+static int edr_agent_download_text_file(const char *url, const char *tmp, size_t max_bytes,
+                                        const char *label) {
+  if (!url || !url[0] || !tmp || !tmp[0]) {
+    return -1;
+  }
+  if (edr_ingest_http_get_url_to_file(url, tmp, max_bytes) == 0) {
+    return 0;
+  }
+  fprintf(stderr, "[config] %s pull failed via native HTTPS client\n",
+          label && label[0] ? label : "remote config");
+  return -1;
+}
+
 struct EdrAgent {
   EdrEventBus *event_bus;
   char *config_path;
@@ -771,35 +784,12 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     t = ".";
   }
   snprintf(tmp, sizeof(tmp), "%s\\edr_remote_%lu.toml", t, (unsigned long)GetCurrentProcessId());
-  {
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-             "curl -fsSL \"%s\" -H \"X-Endpoint-ID: %s\" -H \"X-Tenant-ID: %s\" -o \"%s\" 1>nul 2>nul",
-             url,
-             agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown",
-             agent->cfg.agent.tenant_id[0] ? agent->cfg.agent.tenant_id : "unknown",
-             tmp);
-    if (system(cmd) != 0) {
-      fprintf(stderr, "[config] 远程 TOML 拉取失败（需系统 PATH 中有 curl）\n");
-      return;
-    }
-  }
 #else
   snprintf(tmp, sizeof(tmp), "/tmp/edr_remote_%d.toml", (int)getpid());
-  {
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-             "curl -fsSL '%s' -H 'X-Endpoint-ID: %s' -H 'X-Tenant-ID: %s' -o '%s' 2>/dev/null",
-             url,
-             agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown",
-             agent->cfg.agent.tenant_id[0] ? agent->cfg.agent.tenant_id : "unknown",
-             tmp);
-    if (system(cmd) != 0) {
-      fprintf(stderr, "[config] 远程 TOML 拉取失败（curl 非零退出）\n");
-      return;
-    }
-  }
 #endif
+  if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "remote TOML") != 0) {
+    return;
+  }
 
   EdrConfig remote;
   memset(&remote, 0, sizeof(remote));
@@ -893,24 +883,18 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
 #ifdef _WIN32
   {
     const char *t = getenv("TEMP");
-    char cmd[2048];
     if (!t || !t[0]) {
       t = ".";
     }
     snprintf(tmp, sizeof(tmp), "%s\\edr_sensor_interest_%lu.json", t, (unsigned long)GetCurrentProcessId());
-    snprintf(cmd, sizeof(cmd), "curl -fsSL \"%s\" -H \"X-Endpoint-ID: %s\" -o \"%s\" 1>nul 2>nul",
-             url, agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown", tmp);
-    if (system(cmd) != 0) {
+    if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "sensor interest") != 0) {
       return;
     }
   }
 #else
   {
-    char cmd[2048];
     snprintf(tmp, sizeof(tmp), "/tmp/edr_sensor_interest_%d.json", (int)getpid());
-    snprintf(cmd, sizeof(cmd), "curl -fsSL '%s' -H 'X-Endpoint-ID: %s' -o '%s' 2>/dev/null",
-             url, agent->cfg.agent.endpoint_id[0] ? agent->cfg.agent.endpoint_id : "unknown", tmp);
-    if (system(cmd) != 0) {
+    if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "sensor interest") != 0) {
       return;
     }
   }

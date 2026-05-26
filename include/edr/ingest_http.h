@@ -60,6 +60,9 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out);
 void edr_ingest_http_set_policy_version(const char *policy_version);
 void edr_ingest_http_copy_policy_version(char *out, size_t out_cap);
 
+/** Native HTTPS GET using the configured REST/mTLS/proxy stack; writes a text response to file. */
+int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes);
+
 /**
  * 发送一批（12B BAT1/BLZ4 头 + payload）；成功返回 0。
  * JSON 体字段与平台 PostReportEvents 一致。

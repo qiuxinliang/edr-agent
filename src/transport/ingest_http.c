@@ -1273,10 +1273,10 @@ static int append_common_headers(char *req, size_t cap, size_t used) {
     return -1;
   }
   n = snprintf(req + used, cap - used,
-	               "X-Tenant-ID: %s\r\n"
-	               "X-Endpoint-ID: %s\r\n"
-	               "X-User-ID: %s\r\n"
-	               "X-Permission-Set: telemetry:write\r\n",
+		               "X-Tenant-ID: %s\r\n"
+		               "X-Endpoint-ID: %s\r\n"
+		               "X-User-ID: %s\r\n"
+		               "X-Permission-Set: telemetry:write,endpoint:attack_surface_report\r\n",
 	               s_tenant[0] ? s_tenant : "demo-tenant",
 	               s_endpoint[0] ? s_endpoint : "",
 	               s_user[0] ? s_user : "edr-agent");
@@ -1653,10 +1653,10 @@ static int append_headers(char *req, size_t cap, const char *path, const char *h
                    "Host: %s\r\n"
                    "Content-Type: application/json\r\n"
                    "Content-Length: %zu\r\n"
-	                   "X-Tenant-ID: %s\r\n"
-	                   "X-Endpoint-ID: %s\r\n"
-	                   "X-User-ID: %s\r\n"
-	                   "X-Permission-Set: telemetry:write\r\n",
+		                   "X-Tenant-ID: %s\r\n"
+		                   "X-Endpoint-ID: %s\r\n"
+		                   "X-User-ID: %s\r\n"
+		                   "X-Permission-Set: telemetry:write,endpoint:attack_surface_report\r\n",
 	                   path, host, body_len, s_tenant[0] ? s_tenant : "demo-tenant",
 	                   s_endpoint[0] ? s_endpoint : "",
 	                   s_user[0] ? s_user : "edr-agent");
@@ -1908,6 +1908,55 @@ static int request_to_suffix(const char *method, const char *suffix, const char 
   return native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
 }
 
+int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
+  char *resp;
+  FILE *f;
+  size_t cap;
+  size_t n;
+  int rc;
+  if (!url || !url[0] || !file_path || !file_path[0] || !edr_ingest_http_configured()) {
+    return -1;
+  }
+  cap = max_bytes;
+  if (cap < 4096u) {
+    cap = 4096u;
+  }
+  if (cap > 4u * 1024u * 1024u) {
+    cap = 4u * 1024u * 1024u;
+  }
+  resp = (char *)calloc(1u, cap + 1u);
+  if (!resp) {
+    return -1;
+  }
+  rc = native_request("GET", url, NULL, NULL, 0u, resp, cap + 1u);
+  if (rc != 0) {
+    free(resp);
+    return -1;
+  }
+  n = strlen(resp);
+  if (n >= cap) {
+    runtime_failure("http get response too large");
+    free(resp);
+    return -1;
+  }
+  f = fopen(file_path, "wb");
+  if (!f) {
+    runtime_failure("http get output open failed");
+    free(resp);
+    return -1;
+  }
+  if (n > 0u && fwrite(resp, 1u, n, f) != n) {
+    fclose(f);
+    free(resp);
+    runtime_failure("http get output write failed");
+    return -1;
+  }
+  fclose(f);
+  free(resp);
+  runtime_success();
+  return 0;
+}
+
 static int ws_recv_some(EdrWsConn *c, char *buf, int cap) {
   if (!c || cap <= 0) {
     return -1;
@@ -1923,6 +1972,24 @@ static int ws_recv_some(EdrWsConn *c, char *buf, int cap) {
       if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
         return -2;
       }
+#ifdef _WIN32
+      if (e == SSL_ERROR_SYSCALL) {
+        int se = WSAGetLastError();
+        if (se == WSAETIMEDOUT || se == WSAEWOULDBLOCK) {
+          return -2;
+        }
+        if (n < 0 && se == 0 && ERR_peek_error() == 0) {
+          return -2;
+        }
+      }
+#else
+      if (e == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return -2;
+      }
+      if (e == SSL_ERROR_SYSCALL && n < 0 && errno == 0 && ERR_peek_error() == 0) {
+        return -2;
+      }
+#endif
     }
     return -1;
   }
@@ -2837,53 +2904,60 @@ static void *control_ws_thread(void *arg)
       runtime_failure("control ws hello failed");
     }
     next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
-    while (s_poll_run && s_ws_ready) {
-      int opcode = 0;
-      char *payload = NULL;
-      size_t payload_len = 0;
-      int rc;
-      if (unix_ms_now() >= next_hb) {
-        if (ws_send_agent_message(&conn, "agent_heartbeat") != 0) {
+    {
+      const char *disconnect_reason = "read_failed";
+      while (s_poll_run && s_ws_ready) {
+        int opcode = 0;
+        char *payload = NULL;
+        size_t payload_len = 0;
+        int rc;
+        if (unix_ms_now() >= next_hb) {
+          if (ws_send_agent_message(&conn, "agent_heartbeat") != 0) {
+            disconnect_reason = "heartbeat_write_failed";
+            break;
+          }
+          next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
+        }
+        rc = ws_read_frame(&conn, &opcode, &payload, &payload_len);
+        if (rc == -2) {
+          continue;
+        }
+        if (rc != 0) {
           break;
         }
-        next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
-      }
-      rc = ws_read_frame(&conn, &opcode, &payload, &payload_len);
-      if (rc == -2) {
-        continue;
-      }
-      if (rc != 0) {
-        break;
-      }
-      if (opcode == 1 || opcode == 2) {
-        (void)payload_len;
-        (void)poll_dispatch_one(payload);
-      } else if (opcode == 8) {
-        free(payload);
-        break;
-      } else if (opcode == 9) {
-        ws_lock();
-        if (s_ws_conn == &conn) {
-          (void)ws_send_frame(&conn, 10, (const uint8_t *)payload, payload_len);
+        if (opcode == 1 || opcode == 2) {
+          (void)payload_len;
+          (void)poll_dispatch_one(payload);
+        } else if (opcode == 8) {
+          disconnect_reason = "server_close";
+          free(payload);
+          break;
+        } else if (opcode == 9) {
+          ws_lock();
+          if (s_ws_conn == &conn) {
+            (void)ws_send_frame(&conn, 10, (const uint8_t *)payload, payload_len);
+          }
+          ws_unlock();
         }
-        ws_unlock();
+        free(payload);
       }
-      free(payload);
+      ws_lock();
+      if (s_ws_conn == &conn) {
+        s_ws_conn = NULL;
+      }
+      s_ws_ready = 0;
+      ws_unlock();
+      ws_close_conn(&conn);
+      net_done();
+      if (s_poll_run) {
+        fprintf(stderr,
+                "[ingest-ws] control disconnected reason=%s; HTTP long-poll fallback remains active\n",
+                disconnect_reason);
+        s_ws_backoff_ms = backoff_ms;
+        sleep_poll_ms(backoff_ms);
+      }
     }
-    ws_lock();
-    if (s_ws_conn == &conn) {
-      s_ws_conn = NULL;
-    }
-    s_ws_ready = 0;
-    ws_unlock();
-    ws_close_conn(&conn);
-    net_done();
-    if (s_poll_run) {
-      fprintf(stderr, "[ingest-ws] control disconnected; HTTP long-poll fallback remains active\n");
-      s_ws_backoff_ms = backoff_ms;
-      sleep_poll_ms(backoff_ms);
-    }
-  }
+	  }
 #ifdef _WIN32
   return 0;
 #else
