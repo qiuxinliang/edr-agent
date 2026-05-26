@@ -257,8 +257,9 @@ void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
                              const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
     edr_cmd_inc_rejected();
-    edr_command_audit_both(cmd_id, "shell_open: rejected (dangerous disabled)");
-    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 0, "dangerous commands disabled");
+    edr_command_audit_both(cmd_id, "shell_open: rejected (allow_dangerous=false)");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 0,
+                          "interactive shell disabled: enable TOML [command] allow_dangerous=true via Agent policy");
     return;
   }
 
@@ -307,7 +308,8 @@ void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
     if (rc != 0) {
       edr_cmd_inc_exec_fail();
       edr_command_audit_both(cmd_id, "shell_input: write failed");
-      edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, rc, "shell_input write failed");
+      edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, rc,
+                            "shell_input write failed: shell session not open or stdin unavailable");
       return;
     }
   } else {

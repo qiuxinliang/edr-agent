@@ -33,6 +33,13 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(EDR_HAVE_OPENSSL_HTTP) || defined(EDR_HAVE_OPENSSL_FL)
+#define EDR_HAVE_COMMAND_SIGNATURE_OPENSSL 1
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <winevt.h>
@@ -1369,17 +1376,26 @@ static int rtr_shell_token_allowed(const char *token, char *matched, size_t matc
     snprintf(reason, reason_cap, "missing executable token");
     return 0;
   }
-  const char *list_env = getenv("EDR_RTR_SHELL_ALLOWLIST");
-  if (!list_env || !list_env[0]) {
-    list_env = getenv("EDR_SHELL_ALLOWLIST");
+  const char *list_src = NULL;
+  const char *source = "policy";
+  if (s_bound_cfg && s_bound_cfg->command.rtr_shell_allowlist[0]) {
+    list_src = s_bound_cfg->command.rtr_shell_allowlist;
   }
-  if (!list_env || !list_env[0]) {
-    snprintf(reason, reason_cap, "EDR_RTR_SHELL_ALLOWLIST not configured");
+  if (!list_src || !list_src[0]) {
+    list_src = getenv("EDR_RTR_SHELL_ALLOWLIST");
+    source = "EDR_RTR_SHELL_ALLOWLIST";
+  }
+  if (!list_src || !list_src[0]) {
+    list_src = getenv("EDR_SHELL_ALLOWLIST");
+    source = "EDR_SHELL_ALLOWLIST";
+  }
+  if (!list_src || !list_src[0]) {
+    snprintf(reason, reason_cap, "rtr_shell allowlist not configured");
     return 0;
   }
-  char list[2048];
-  snprintf(list, sizeof(list), "%s", list_env);
-  char *p = list;
+  char list_buf[2048];
+  snprintf(list_buf, sizeof(list_buf), "%s", list_src);
+  char *p = list_buf;
   while (p && *p) {
     char *sep = strpbrk(p, ",;");
     if (sep) {
@@ -1398,7 +1414,7 @@ static int rtr_shell_token_allowed(const char *token, char *matched, size_t matc
     }
     p = sep;
   }
-  snprintf(reason, reason_cap, "command token not in allowlist: %s", token);
+  snprintf(reason, reason_cap, "command token not in allowlist (%s): %s", source, token);
   return 0;
 }
 
@@ -1469,7 +1485,9 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   int timeout_sec = parse_int_json_default(pl, len, "timeout_sec", 30);
   timeout_sec = parse_int_json_default(pl, len, "timeout_s", timeout_sec);
-  int max_timeout = env_int_default("EDR_RTR_SHELL_MAX_TIMEOUT_SEC", 60);
+  int max_timeout = s_bound_cfg && s_bound_cfg->command.rtr_shell_max_timeout_sec > 0u
+                        ? (int)s_bound_cfg->command.rtr_shell_max_timeout_sec
+                        : env_int_default("EDR_RTR_SHELL_MAX_TIMEOUT_SEC", 60);
   if (timeout_sec <= 0) {
     timeout_sec = 30;
   }
@@ -1566,8 +1584,10 @@ static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
                           const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
-    audit_both(cmd_id, "shell_open: rejected (dangerous disabled)");
-    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 1, "dangerous commands disabled", "denied", NULL);
+    audit_both(cmd_id, "shell_open: rejected (allow_dangerous=false)");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 1,
+                 "interactive shell disabled: enable TOML [command] allow_dangerous=true via Agent policy",
+                 "denied", NULL);
     return;
   }
   char shell_type[128];
@@ -1618,7 +1638,9 @@ static void do_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
   if (rc != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "shell_input: write failed");
-    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, rc, "shell_input write failed", "failed", NULL);
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, rc,
+                 "shell_input write failed: shell session not open or stdin unavailable",
+                 "failed", NULL);
     return;
   }
   s_handled++;
@@ -2764,7 +2786,7 @@ static void hmac_sha256_hex(const char *key, const uint8_t *data, size_t len, ch
   hex_from_bytes(digest, sizeof(digest), out65, 65u);
 }
 
-static int command_signature_extract(const char *idempotency_key, char sig65[65]) {
+static int command_signature_extract_sigv1(const char *idempotency_key, char sig65[65]) {
   if (!idempotency_key || !sig65) {
     return 0;
   }
@@ -2788,6 +2810,177 @@ static int command_signature_extract(const char *idempotency_key, char sig65[65]
   return 1;
 }
 
+static int b64url_value(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
+  if (c >= 'a' && c <= 'z') return (int)(c - 'a' + 26);
+  if (c >= '0' && c <= '9') return (int)(c - '0' + 52);
+  if (c == '-') return 62;
+  if (c == '_') return 63;
+  return -1;
+}
+
+static int b64url_decode_raw(const char *s, uint8_t *out, size_t out_cap, size_t *out_len) {
+  if (!s || !out || !out_len) {
+    return -1;
+  }
+  uint32_t acc = 0;
+  unsigned bits = 0;
+  size_t o = 0;
+  for (; *s; s++) {
+    if (*s == '=') {
+      break;
+    }
+    int v = b64url_value((unsigned char)*s);
+    if (v < 0) {
+      return -1;
+    }
+    acc = (acc << 6) | (uint32_t)v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (o >= out_cap) {
+        return -1;
+      }
+      out[o++] = (uint8_t)((acc >> bits) & 0xffu);
+    }
+  }
+  *out_len = o;
+  return 0;
+}
+
+static int command_signature_extract_sigv2(const char *idempotency_key, char *alg, size_t alg_cap,
+                                           uint8_t *sig, size_t sig_cap, size_t *sig_len) {
+  if (!idempotency_key || !alg || alg_cap == 0u || !sig || !sig_len) {
+    return 0;
+  }
+  const char *mark = strstr(idempotency_key, "|sigv2|");
+  if (!mark) {
+    return 0;
+  }
+  const char *algp = mark + strlen("|sigv2|");
+  const char *bar1 = strchr(algp, '|');
+  if (!bar1 || bar1 == algp) {
+    return 0;
+  }
+  size_t alg_len = (size_t)(bar1 - algp);
+  if (alg_len >= alg_cap) {
+    alg_len = alg_cap - 1u;
+  }
+  memcpy(alg, algp, alg_len);
+  alg[alg_len] = '\0';
+  const char *keyid = bar1 + 1;
+  const char *bar2 = strchr(keyid, '|');
+  if (!bar2 || bar2 == keyid || !bar2[1]) {
+    return 0;
+  }
+  if (b64url_decode_raw(bar2 + 1, sig, sig_cap, sig_len) != 0) {
+    return 0;
+  }
+  return *sig_len > 0u;
+}
+
+static void normalize_pem_newlines(char *s) {
+  if (!s) {
+    return;
+  }
+  char *r = s;
+  char *w = s;
+  while (*r) {
+    if (r[0] == '\\' && r[1] == 'n') {
+      *w++ = '\n';
+      r += 2;
+    } else {
+      *w++ = *r++;
+    }
+  }
+  *w = '\0';
+}
+
+static int read_text_file_small(const char *path, char *out, size_t cap) {
+  if (!path || !path[0] || !out || cap < 2u) {
+    return -1;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return -1;
+  }
+  size_t n = fread(out, 1, cap - 1u, f);
+  fclose(f);
+  out[n] = '\0';
+  return n > 0u ? 0 : -1;
+}
+
+static int command_public_key_pem(char *out, size_t cap) {
+  if (!out || cap < 2u) {
+    return 0;
+  }
+  out[0] = '\0';
+  const char *inline_pem = getenv("EDR_COMMAND_SIGNING_PUBLIC_KEY");
+  if (!inline_pem || !inline_pem[0]) {
+    inline_pem = getenv("EDR_COMMAND_VERIFY_PUBLIC_KEY");
+  }
+  if (inline_pem && inline_pem[0]) {
+    snprintf(out, cap, "%s", inline_pem);
+    normalize_pem_newlines(out);
+    return out[0] != '\0';
+  }
+  const char *path = getenv("EDR_COMMAND_SIGNING_PUBLIC_KEY_PATH");
+  if (!path || !path[0]) {
+    path = getenv("EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH");
+  }
+  if (path && path[0] && read_text_file_small(path, out, cap) == 0) {
+    normalize_pem_newlines(out);
+    return 1;
+  }
+  if (s_bound_cfg && s_bound_cfg->command.signing_public_key_pem[0]) {
+    snprintf(out, cap, "%s", s_bound_cfg->command.signing_public_key_pem);
+    normalize_pem_newlines(out);
+    return out[0] != '\0';
+  }
+  if (s_bound_cfg && s_bound_cfg->command.signing_public_key_path[0] &&
+      read_text_file_small(s_bound_cfg->command.signing_public_key_path, out, cap) == 0) {
+    normalize_pem_newlines(out);
+    return 1;
+  }
+  return 0;
+}
+
+static int command_verify_ed25519_pem(const char *public_key_pem, const uint8_t *msg, size_t msg_len,
+                                      const uint8_t *sig, size_t sig_len) {
+#ifdef EDR_HAVE_COMMAND_SIGNATURE_OPENSSL
+  if (!public_key_pem || !public_key_pem[0] || !msg || !sig || sig_len == 0u) {
+    return 0;
+  }
+  BIO *bio = BIO_new_mem_buf(public_key_pem, -1);
+  if (!bio) {
+    return 0;
+  }
+  EVP_PKEY *pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+  BIO_free(bio);
+  if (!pkey) {
+    return 0;
+  }
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  int ok = 0;
+  if (ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+      EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len) == 1) {
+    ok = 1;
+  }
+  if (ctx) {
+    EVP_MD_CTX_free(ctx);
+  }
+  EVP_PKEY_free(pkey);
+  return ok;
+#else
+  (void)public_key_pem;
+  (void)msg;
+  (void)msg_len;
+  (void)sig;
+  (void)sig_len;
+  return -1;
+#endif
+}
+
 static void command_signature_idempotency_value(const char *idempotency_key, char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
@@ -2797,6 +2990,10 @@ static void command_signature_idempotency_value(const char *idempotency_key, cha
     return;
   }
   const char *mark = strstr(idempotency_key, "|sigv1|");
+  const char *mark2 = strstr(idempotency_key, "|sigv2|");
+  if (!mark || (mark2 && mark2 < mark)) {
+    mark = mark2;
+  }
   size_t n = mark ? (size_t)(mark - idempotency_key) : strlen(idempotency_key);
   if (n >= cap) {
     n = cap - 1u;
@@ -2848,40 +3045,82 @@ static int command_signature_verify(const char *cmd_id, const char *cmd_type, co
       !(allow_unsigned && allow_unsigned[0] == '1')) {
     required = 1;
   }
-  const char *key = getenv("EDR_COMMAND_SIGNING_KEY");
-  if ((!key || !key[0]) && !required) {
-    return 1;
-  }
-  if (!key || !key[0]) {
-    snprintf(reason, reason_cap, "command signature required but EDR_COMMAND_SIGNING_KEY missing");
+  if (force_shell_signature && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
+    snprintf(reason, reason_cap, "rtr_shell requires issued_at_unix_ms and deadline_ms");
     return 0;
   }
-  char idem[128];
+
+  char idem[512];
   command_signature_idempotency_value(sm ? sm->idempotency_key : NULL, idem, sizeof(idem));
   if (required && !idem[0]) {
     snprintf(reason, reason_cap, "missing idempotency key");
     return 0;
   }
-  if (force_shell_signature && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
-    snprintf(reason, reason_cap, "rtr_shell requires issued_at_unix_ms and deadline_ms");
+  char payload_hash[65];
+  (void)edr_sha256_hex(payload ? payload : (const uint8_t *)"", payload_len, payload_hash);
+  char canonical[1024];
+  snprintf(canonical, sizeof(canonical), "%s\n%s\n%s\n%lld\n%u\n%s",
+           cmd_id ? cmd_id : "", cmd_type ? cmd_type : "",
+           idem,
+           (long long)(sm ? sm->issued_at_unix_ms : 0), (unsigned)(sm ? sm->deadline_ms : 0),
+           payload_hash);
+
+  char alg[32];
+  uint8_t sig2[96];
+  size_t sig2_len = 0u;
+  if (command_signature_extract_sigv2(sm ? sm->idempotency_key : NULL, alg, sizeof(alg),
+                                      sig2, sizeof(sig2), &sig2_len)) {
+    if (strcmp(alg, "ed25519") != 0) {
+      snprintf(reason, reason_cap, "unsupported command signature algorithm: %s", alg);
+      return 0;
+    }
+    if (sig2_len != 64u) {
+      snprintf(reason, reason_cap, "invalid command sigv2 signature length");
+      return 0;
+    }
+    char public_key_pem[4096];
+    if (!command_public_key_pem(public_key_pem, sizeof(public_key_pem))) {
+      snprintf(reason, reason_cap, "command sigv2 public key missing");
+      return 0;
+    }
+    int ok = command_verify_ed25519_pem(public_key_pem, (const uint8_t *)canonical,
+                                        strlen(canonical), sig2, sig2_len);
+    if (ok == -1) {
+      snprintf(reason, reason_cap, "command sigv2 requires OpenSSL verification support");
+      return 0;
+    }
+    if (!ok) {
+      snprintf(reason, reason_cap, "invalid command sigv2 signature");
+      return 0;
+    }
+    return 1;
+  }
+
+  char configured_public_key[4096];
+  int has_public_key = command_public_key_pem(configured_public_key, sizeof(configured_public_key));
+  const char *accept_legacy = getenv("EDR_COMMAND_ACCEPT_LEGACY_HMAC");
+  if (required && has_public_key && !(accept_legacy && accept_legacy[0] == '1')) {
+    snprintf(reason, reason_cap, "missing command sigv2 signature");
     return 0;
   }
+
+  const char *key = getenv("EDR_COMMAND_SIGNING_KEY");
+  if ((!key || !key[0]) && !required) {
+    return 1;
+  }
+  if (!key || !key[0]) {
+    snprintf(reason, reason_cap, "command signature required but no sigv2 public key or EDR_COMMAND_SIGNING_KEY configured");
+    return 0;
+  }
+
   char got[65];
-  if (!command_signature_extract(sm ? sm->idempotency_key : NULL, got)) {
+  if (!command_signature_extract_sigv1(sm ? sm->idempotency_key : NULL, got)) {
     if (required) {
       snprintf(reason, reason_cap, "missing command signature");
       return 0;
     }
     return 1;
   }
-  char payload_hash[65];
-  (void)edr_sha256_hex(payload ? payload : (const uint8_t *)"", payload_len, payload_hash);
-  char canonical[512];
-  snprintf(canonical, sizeof(canonical), "%s\n%s\n%s\n%lld\n%u\n%s",
-           cmd_id ? cmd_id : "", cmd_type ? cmd_type : "",
-           idem,
-           (long long)(sm ? sm->issued_at_unix_ms : 0), (unsigned)(sm ? sm->deadline_ms : 0),
-           payload_hash);
   char want[65];
   hmac_sha256_hex(key, (const uint8_t *)canonical, strlen(canonical), want);
   if (strcmp(got, want) != 0) {

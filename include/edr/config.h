@@ -173,6 +173,10 @@ typedef struct EdrConfig {
      * 环境变量 `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` 仍为最高优先级。
      */
     bool allow_dangerous;
+    char rtr_shell_allowlist[2048];
+    uint32_t rtr_shell_max_timeout_sec;
+    char signing_public_key_path[1024];
+    char signing_public_key_pem[2048];
   } command;
 
   /** 告警推荐取证自动派发。该开关独立于 [command].allow_dangerous，避免开启响应权限后自动风暴。 */

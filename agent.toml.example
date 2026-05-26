@@ -209,6 +209,7 @@ max_log_files        = 10
 # §8 高危指令（kill / isolate / forensic）：默认关闭；亦可由环境变量 EDR_CMD_ENABLED=1 开启
 # [command]
 # allow_dangerous      = false
+# signing_public_key_path = "C:\\Program Files\\EDR Agent\\certs\\command-signing.pub.pem"
 
 # §9 自保护：防调试、事件总线背压告警、可选 Windows Job Object
 # [self_protect]

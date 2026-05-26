@@ -869,6 +869,7 @@ max_log_files        = 5
 
 [command]
 allow_dangerous      = false
+signing_public_key_path = "C:\\Program Files\\EDR Agent\\certs\\command-signing.pub.pem"
 
 [self_protect]
 anti_debug           = true

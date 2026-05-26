@@ -317,6 +317,46 @@ static void take_string(toml_datum_t d, char *dst, size_t cap) {
   }
 }
 
+static void take_string_array_csv(toml_array_t *arr, char *dst, size_t cap) {
+  if (!arr || !dst || cap == 0u) {
+    return;
+  }
+  dst[0] = '\0';
+  int n = toml_array_nelem(arr);
+  size_t used = 0u;
+  for (int i = 0; i < n; i++) {
+    toml_datum_t d = toml_string_at(arr, i);
+    if (!d.ok || !d.u.s) {
+      continue;
+    }
+    const char *s = d.u.s;
+    while (*s && isspace((unsigned char)*s)) {
+      s++;
+    }
+    size_t len = strlen(s);
+    while (len > 0u && isspace((unsigned char)s[len - 1u])) {
+      len--;
+    }
+    if (len > 0u) {
+      if (used > 0u && used + 1u < cap) {
+        dst[used++] = ',';
+        dst[used] = '\0';
+      }
+      size_t room = cap - used - 1u;
+      size_t copy = len < room ? len : room;
+      if (copy > 0u) {
+        memcpy(dst + used, s, copy);
+        used += copy;
+        dst[used] = '\0';
+      }
+    }
+    free(d.u.s);
+    if (used + 1u >= cap) {
+      break;
+    }
+  }
+}
+
 static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "address"), cfg->server.address, sizeof(cfg->server.address));
   {
@@ -1575,6 +1615,10 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->fl.frozen_layer_count_behavior = 0;
 
   cfg->command.allow_dangerous = false;
+  cfg->command.rtr_shell_allowlist[0] = '\0';
+  cfg->command.rtr_shell_max_timeout_sec = 60u;
+  cfg->command.signing_public_key_path[0] = '\0';
+  cfg->command.signing_public_key_pem[0] = '\0';
   cfg->forensic_auto.enabled = false;
   cfg->forensic_auto.cooldown_s = 30u;
   cfg->forensic_auto.per_pid_cooldown_s = 300u;
@@ -1613,6 +1657,29 @@ static void load_command(toml_table_t *t, EdrConfig *cfg) {
   toml_datum_t d = toml_bool_in(t, "allow_dangerous");
   if (d.ok) {
     cfg->command.allow_dangerous = d.u.b ? true : false;
+  }
+  take_string(toml_string_in(t, "rtr_shell_allowlist"), cfg->command.rtr_shell_allowlist,
+              sizeof(cfg->command.rtr_shell_allowlist));
+  take_string(toml_string_in(t, "signing_public_key_path"), cfg->command.signing_public_key_path,
+              sizeof(cfg->command.signing_public_key_path));
+  take_string(toml_string_in(t, "signing_public_key_pem"), cfg->command.signing_public_key_pem,
+              sizeof(cfg->command.signing_public_key_pem));
+  {
+    toml_datum_t mt = toml_int_in(t, "rtr_shell_max_timeout_sec");
+    if (mt.ok && mt.u.i >= 1 && mt.u.i <= 300) {
+      cfg->command.rtr_shell_max_timeout_sec = (uint32_t)mt.u.i;
+    }
+  }
+  toml_table_t *rt = toml_table_in(t, "rtr_shell");
+  if (rt) {
+    take_string(toml_string_in(rt, "allowlist"), cfg->command.rtr_shell_allowlist,
+                sizeof(cfg->command.rtr_shell_allowlist));
+    take_string_array_csv(toml_array_in(rt, "allowlist"), cfg->command.rtr_shell_allowlist,
+                          sizeof(cfg->command.rtr_shell_allowlist));
+    toml_datum_t mt = toml_int_in(rt, "max_timeout_sec");
+    if (mt.ok && mt.u.i >= 1 && mt.u.i <= 300) {
+      cfg->command.rtr_shell_max_timeout_sec = (uint32_t)mt.u.i;
+    }
   }
 }
 

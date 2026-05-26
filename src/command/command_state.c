@@ -225,6 +225,10 @@ static void state_idempotency_key(const EdrSoarCommandMeta *meta, char *out, siz
   }
   const char *raw = meta->idempotency_key;
   const char *sig = strstr(raw, "|sigv1|");
+  const char *sig2 = strstr(raw, "|sigv2|");
+  if (!sig || (sig2 && sig2 < sig)) {
+    sig = sig2;
+  }
   size_t n = sig ? (size_t)(sig - raw) : strlen(raw);
   if (n >= cap) {
     n = cap - 1u;

@@ -13,7 +13,7 @@ extern "C" {
 typedef struct EdrCommandStateRecord {
   char command_id[128];
   char command_type[64];
-  char idempotency_key[128];
+  char idempotency_key[512];
   char response_status[32];
   int execution_status;
   int exit_code;

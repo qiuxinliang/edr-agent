@@ -278,10 +278,13 @@ cmake --build build
 | `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / restore_host / forensic / RTR 文件与 eventlog/registry / quarantine / rtr_shell**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
 | `EDR_CMD_KILL_ALLOWLIST` | 若设置（逗号分隔 PID 列表），**kill** 仅允许终止列表内进程（仍须先满足高危策略）；未设置则不限制 PID。 |
 | `EDR_CMD_AUDIT_PATH` | 若设置，高危指令审计**追加**写入该文件（带时间戳）；stderr 仍会打印 `[command][audit]`。 |
-| `EDR_COMMAND_SIGNING_KEY` | 生产高危指令签名密钥；高危外部命令默认要求 `idempotency_key=<idem>\|sigv1\|<key_id>\|<hmac>`。 |
+| `EDR_COMMAND_SIGNING_PUBLIC_KEY_PATH` / `EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH` | 生产命令验签公钥 PEM 路径；启用后高危外部命令优先要求 `idempotency_key=<idem>\|sigv2\|ed25519\|<key_id>\|<base64url_sig>`。也可用 TOML `[command] signing_public_key_path`。 |
+| `EDR_COMMAND_SIGNING_PUBLIC_KEY` / `EDR_COMMAND_VERIFY_PUBLIC_KEY` | 生产命令验签公钥 PEM 文本；支持 `\n` 转义。优先级高于公钥路径。 |
+| `EDR_COMMAND_ACCEPT_LEGACY_HMAC` | 配置公钥后是否临时接受旧 `sigv1` HMAC，`=1` 仅用于灰度迁移。 |
+| `EDR_COMMAND_SIGNING_KEY` | 旧版 HMAC 签名密钥；未配置公钥时仍可兼容 `idempotency_key=<idem>\|sigv1\|<key_id>\|<hmac>`。 |
 | `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` | `=1` 时允许多数高危命令无签名执行，仅用于本地调试；**不适用于 `rtr_shell`**。 |
 | `EDR_COMMAND_STATE_DB` | 覆盖本地命令状态库 JSONL 路径，用于幂等、重启恢复与结果追踪。 |
-| `EDR_RTR_SHELL_ALLOWLIST` | `rtr_shell` 必填白名单，逗号分隔首 token，如 `whoami,hostname,ipconfig,tasklist,netstat,dir`；该指令始终要求 `EDR_COMMAND_SIGNING_KEY`、`issued_at_unix_ms`、`deadline_ms` 与签名化 `idempotency_key`，不受 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` 放行。 |
+| `EDR_RTR_SHELL_ALLOWLIST` | `rtr_shell` 必填白名单，逗号分隔首 token，如 `whoami,hostname,ipconfig,tasklist,netstat,dir`；该指令始终要求生产签名、`issued_at_unix_ms`、`deadline_ms` 与签名化 `idempotency_key`，不受 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` 放行。 |
 | `EDR_RTR_SHELL_MAX_TIMEOUT_SEC` | `rtr_shell` 本地最大执行秒数，默认 `60`，硬上限 `300`；payload 的 `timeout_sec` 会被钳制到该值和 SOAR deadline 剩余时间。 |
 | `EDR_RTR_SHELL_BLOCKLIST` | `rtr_shell` 追加本地 blocklist 关键字；默认已拒绝破坏性命令、控制操作符、重定向、管道与常见 PowerShell 编码执行形态。 |
 | `EDR_SOAR_REPORT_ALWAYS` | `=1` 时对**每条**指令尝试 gRPC **`ReportCommandResult`**（即使无 `soar_correlation_id`）；默认仅在下发含编排字段时上报。 |

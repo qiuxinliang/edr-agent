@@ -19,7 +19,7 @@
 | `playbook_step_id` | string | playbook 内 **步骤** id。 |
 | `issued_at_unix_ms` | int64 | 服务端签发时间（Unix 毫秒）；`0` 表示未填。 |
 | `deadline_ms` | uint32 | 建议最大执行耗时（毫秒）；`0` 表示未限制。终端按 `issued_at_unix_ms + deadline_ms` 做入站过期校验，过期返回 `response_status=timeout`。 |
-| `idempotency_key` | string | 幂等键，服务端与终端本地状态库共同去重。生产签名格式为 `<idempotency>|sigv1|<key_id>|<hmac_sha256_hex>`；终端去重与签名 canonical 均使用签名前缀 `<idempotency>`。 |
+| `idempotency_key` | string | 幂等键，服务端与终端本地状态库共同去重。生产签名优先格式为 `<idempotency>|sigv2|ed25519|<key_id>|<base64url_signature>`；旧版兼容格式为 `<idempotency>|sigv1|<key_id>|<hmac_sha256_hex>`。终端去重与签名 canonical 均使用签名前缀 `<idempotency>`。 |
 
 **C 侧结构体**：`EdrSoarCommandMeta`（`include/edr/command.h`）与上表一一对应（定长缓冲，由 gRPC 层截断写入）。
 
@@ -63,7 +63,7 @@
 - **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `restore_host` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）/ **RTR 文件、eventlog、registry、rtr_shell** / **`quarantine_file`** / **`unquarantine_file`**。
 - **配置**：`[command] allow_dangerous = true` 与上述环境变量等效（便于生产用 TOML 固定策略）。
 - **kill 白名单**（可选）：设置 `EDR_CMD_KILL_ALLOWLIST=1234,5678` 后，仅允许终止列表内 PID（仍须先满足高危策略）。
-- **生产签名**：高危指令默认要求 `EDR_COMMAND_SIGNING_KEY` 与 `idempotency_key` 中的 `sigv1` HMAC；仅调试可设 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS=1`。签名 canonical 为 `command_id\ncommand_type\nidempotency\nissued_at_unix_ms\ndeadline_ms\npayload_sha256`。`rtr_shell` 始终强制签名，并要求 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key` 同时存在。
+- **生产签名**：高危指令默认要求命令签名；推荐服务端配置 `EDR_COMMAND_SIGNING_PRIVATE_KEY(_PATH)` 生成 `sigv2` Ed25519，Agent 配置 `[command] signing_public_key_path` 或 `EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH` 验签。旧 `EDR_COMMAND_SIGNING_KEY` / `sigv1` HMAC 仅作迁移兼容；Agent 配置公钥后默认不接受旧 HMAC，除非临时设置 `EDR_COMMAND_ACCEPT_LEGACY_HMAC=1`。签名 canonical 为 `command_id\ncommand_type\nidempotency\nissued_at_unix_ms\ndeadline_ms\npayload_sha256`。`rtr_shell` 始终强制签名，并要求 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key` 同时存在。
 - **RTR shell 白名单**：`EDR_RTR_SHELL_ALLOWLIST` 为必填本地策略；`EDR_RTR_SHELL_MAX_TIMEOUT_SEC` 默认 `60`、硬上限 `300`；`EDR_RTR_SHELL_BLOCKLIST` 可追加本地禁用关键字。控制操作符（如 `&&`、管道、重定向、换行）默认拒绝。
 - **本地状态库**：默认写入 `C:\\Program Files\\EDR Agent\\state\\command_state.jsonl`（Windows）或 `/tmp/edr_command_state.jsonl`；可用 `EDR_COMMAND_STATE_DB` 覆盖。字段包含 `command_id`、`idempotency_key`、`response_status`、`retry_count`、`artifacts`，用于断网、重启、重复下发时的本地去重与追踪。
 

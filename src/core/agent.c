@@ -798,7 +798,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   int changed = 0;
   edr_config_fingerprint(tmp, fp, sizeof(fp));
   if (ce != EDR_OK) {
-    fprintf(stderr, "[config] 远程 TOML 解析失败: %d\n", (int)ce);
+    fprintf(stderr, "[config] remote TOML parse failed: %d\n", (int)ce);
     (void)remove(tmp);
     return;
   }
@@ -833,10 +833,10 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   {
     int av = AVE_SyncFromEdrConfig(&agent->cfg);
     if (av != AVE_OK && av != AVE_ERR_NOT_INITIALIZED) {
-      fprintf(stderr, "[ave] AVE_SyncFromEdrConfig(远程) 失败: %d\n", av);
+      fprintf(stderr, "[ave] AVE_SyncFromEdrConfig(remote) failed: %d\n", av);
     }
   }
-  fprintf(stderr, "[config] 远程配置已应用: preprocessing + resource_limit + self_protect + attack_surface tick + ave");
+  fprintf(stderr, "[config] remote policy applied: preprocessing + resource_limit + self_protect + attack_surface tick + ave");
   if (fp[0]) {
     fprintf(stderr, " fingerprint=%s", fp);
   }

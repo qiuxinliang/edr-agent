@@ -100,6 +100,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\edr_agent_zip_deploy.ps1 `
 
 **mTLS**：enroll 使用端侧 CSR 签发唯一客户端证书，脚本只保存服务端返回的 `ca.pem` / `client.pem`，不会从服务端接收私钥。默认 PEM 私钥路径为 **`C:\Program Files\EDR Agent\certs\client-key.pem`**；高级模式可用 `EDR_KEY_PROVIDER=cng|tpm|pkcs11` 生成硬件/不可导出 CSR，但当前 gRPC C++ 运行时仍需要 PEM `client_key` 才能启用 RTR 实时通道。
 
+**RTR shell 签名**：`rtr_shell` / `shell_open` / `shell_close` 始终要求命令签名。推荐服务端使用 **`EDR_COMMAND_SIGNING_PRIVATE_KEY_PATH`** 保存 Ed25519 私钥，Agent 使用 **`[command] signing_public_key_path`** 或 **`EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH`** 保存对应公钥；否则 Agent 会返回 `command sigv2 public key missing` 或 `missing command sigv2 signature`。旧版 HMAC **`EDR_COMMAND_SIGNING_KEY`** 仅作为灰度兼容。Windows 前台验证可临时设置：
+
+```powershell
+$env:EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH="C:\Program Files\EDR Agent\certs\command-signing.pub.pem"
+$env:EDR_RTR_SHELL_ALLOWLIST="whoami,hostname,ipconfig,tasklist,netstat,dir,powershell,cmd"
+.\edr_agent.exe --config .\agent.toml
+```
+
+服务方式运行时请改为机器级环境变量并重启服务/计划任务；生产环境应由密钥管理或证书签名链路下发，不要把共享 HMAC 明文写入安装包。
+
 ## 与平台「安装包构建」接口的关系
 
 `POST /admin/tenants/:id/installers` 当前可能返回占位脚本；**权威安装逻辑**以本目录 **`scripts/edr_agent_install.{py,ps1,sh}`** 为准，发布时可随 **`edr_agent` 二进制**一并打包。

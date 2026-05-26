@@ -34,7 +34,7 @@ typedef struct EdrSoarCommandMeta {
   char soar_correlation_id[128];
   char playbook_run_id[96];
   char playbook_step_id[96];
-  char idempotency_key[128];
+  char idempotency_key[512];
   int64_t issued_at_unix_ms;
   uint32_t deadline_ms;
 } EdrSoarCommandMeta;
