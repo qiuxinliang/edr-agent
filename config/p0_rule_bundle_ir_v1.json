@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r246-b6f5a11c",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r246-01873aec",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 160,
@@ -2457,8 +2457,12 @@
       ],
       "description": "针对 ATT&CK 父技术「T1138」（Application Shimming）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
+        "process_name_in": [
+          "sdbinst.exe"
+        ],
         "command_regex_any": [
-          "(?i)sdbinst\\.exe",
+          "(?i)\\.sdb(?:\\s|$|\\\")",
+          "(?i)(?:^|\\s|[\\\"'])sdbinst(?:\\.exe)?[\\\"']?\\s+(?:/q|-q|/u|-u)",
           "(?i)Shim\\s+Engine|Application\\s+Compatibility\\s+Toolkit"
         ]
       }
