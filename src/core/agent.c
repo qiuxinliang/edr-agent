@@ -1,5 +1,6 @@
 #include "edr/agent.h"
 
+#include "edr/adaptive_collection.h"
 #include "edr/ave_sdk.h"
 #include "edr/behavior_alert_emit.h"
 #include "edr/config.h"
@@ -163,6 +164,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
     }
   }
   edr_self_protect_init();
+  edr_adaptive_collection_configure(&agent->cfg);
   edr_resource_init(&agent->cfg);
   {
     int ar = AVE_InitFromEdrConfig(&agent->cfg);
@@ -327,6 +329,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char rules_ver[96], static_ver[48], behavior_ver[48], ioc_ver[48];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1024], sensor_interest_ver[160], sensor_interest_rules[160];
+  char adaptive_last_rule[96];
   char http_conn_mode[48], http_base_url[640], http_relay_url[640], http_proxy_mode[48];
   char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
   char http_mtls_status[128], http_key_provider[48];
@@ -377,6 +380,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
   json_escape_small(ch.sensor_interest_version, sensor_interest_ver, sizeof(sensor_interest_ver));
   json_escape_small(ch.sensor_interest_rules_version, sensor_interest_rules, sizeof(sensor_interest_rules));
+  json_escape_small(ch.adaptive_collection_last_rule_id, adaptive_last_rule, sizeof(adaptive_last_rule));
 
   char body[16384];
   int n = snprintf(
@@ -421,12 +425,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"auth\":%llu,\"invalid_process\":%llu,\"ordinary_file\":%llu,"
       "\"ordinary_registry\":%llu,\"ordinary_network\":%llu,\"metadata\":%llu},"
       "\"auditd_last_error\":\"%s\",\"ebpf_last_error\":\"%s\","
+      "\"adaptive_collection\":{\"enabled\":%s,\"active\":%s,\"ttl_s\":%u,"
+      "\"remaining_s\":%u,\"min_severity\":%u,\"level\":%d,"
+      "\"boosts\":%llu,\"last_boost_unix_ms\":%llu,\"last_rule_id\":\"%s\"},"
       "\"sensor_interest\":{\"enabled\":%s,\"loaded\":%s,\"version\":\"%s\","
       "\"rules_version\":\"%s\",\"process_names\":%u,\"process_prefixes\":%u,"
       "\"ports\":%u,\"file_prefixes\":%u,\"file_contains\":%u,"
       "\"registry_prefixes\":%u,\"registry_contains\":%u,\"cmd_tokens\":%u,"
       "\"checked\":%llu,\"matched\":%llu,\"dropped\":%llu,"
-      "\"provider_hits\":%llu,\"process_hits\":%llu,\"port_hits\":%llu,"
+      "\"provider_hits\":%llu,\"adaptive_hits\":%llu,\"process_hits\":%llu,\"port_hits\":%llu,"
       "\"path_hits\":%llu,\"registry_hits\":%llu}},"
       "\"ave\":{\"enabled\":%s,\"mode\":\"triggered\",\"static_model_version\":\"%s\","
       "\"behavior_model_version\":\"%s\",\"ioc_rules_version\":\"%s\","
@@ -503,6 +510,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.ordinary_network_dropped,
       (unsigned long long)ch.metadata_dropped,
       audit_err, ebpf_err,
+      ch.adaptive_collection_enabled ? "true" : "false",
+      ch.adaptive_collection_active ? "true" : "false",
+      ch.adaptive_collection_ttl_s,
+      ch.adaptive_collection_remaining_s,
+      ch.adaptive_collection_min_severity,
+      ch.adaptive_collection_level,
+      (unsigned long long)ch.adaptive_collection_boosts,
+      (unsigned long long)ch.adaptive_collection_last_boost_unix_ms,
+      adaptive_last_rule,
       ch.sensor_interest_enabled ? "true" : "false",
       ch.sensor_interest_loaded ? "true" : "false",
       sensor_interest_ver[0] ? sensor_interest_ver : "builtin",
@@ -513,6 +529,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.sensor_interest_cmd_tokens, (unsigned long long)ch.sensor_interest_checked,
       (unsigned long long)ch.sensor_interest_matched, (unsigned long long)ch.sensor_interest_dropped,
       (unsigned long long)ch.sensor_interest_provider_hits,
+      (unsigned long long)ch.sensor_interest_adaptive_hits,
       (unsigned long long)ch.sensor_interest_process_hits,
       (unsigned long long)ch.sensor_interest_port_hits,
       (unsigned long long)ch.sensor_interest_path_hits,
@@ -591,6 +608,7 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
       edr_config_reload_if_modified(agent->config_path, &agent->cfg, &agent->config_mtime, &rel);
   if (cr == EDR_OK && rel) {
     edr_preprocess_apply_config(&agent->cfg);
+    edr_adaptive_collection_configure(&agent->cfg);
     edr_resource_init(&agent->cfg);
     edr_self_protect_apply_config(&agent->cfg);
     agent->asurf_last_post_ns = 0;
@@ -720,6 +738,10 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     agent->cfg.collection.etw_tcpip_provider = remote->collection.etw_tcpip_provider;
     agent->cfg.collection.etw_firewall_provider = remote->collection.etw_firewall_provider;
     agent->cfg.collection.max_event_queue_size = remote->collection.max_event_queue_size;
+    agent->cfg.collection.adaptive_enabled = remote->collection.adaptive_enabled;
+    agent->cfg.collection.adaptive_boost_seconds = remote->collection.adaptive_boost_seconds;
+    agent->cfg.collection.adaptive_min_severity = remote->collection.adaptive_min_severity;
+    edr_adaptive_collection_configure(&agent->cfg);
   }
   if (edr_agent_toml_has_section(tmp, "upload")) {
     agent->cfg.upload = remote->upload;

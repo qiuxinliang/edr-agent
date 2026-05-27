@@ -36,6 +36,7 @@ typedef struct {
   uint64_t matched;
   uint64_t dropped;
   uint64_t provider_hits;
+  uint64_t adaptive_hits;
   uint64_t process_hits;
   uint64_t port_hits;
   uint64_t path_hits;

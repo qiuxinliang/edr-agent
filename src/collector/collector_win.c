@@ -17,6 +17,7 @@
 #include <winevt.h>
 
 #include "edr/collector.h"
+#include "edr/adaptive_collection.h"
 #include "edr/behavior_from_slot.h"
 #include "edr/config.h"
 #include "edr/etw_guids_win.h"
@@ -774,28 +775,13 @@ static int edr_network_dest_is_lateral_or_remote_admin(const EdrBehaviorRecord *
 }
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
+  EdrBehaviorRecord br;
   if (!slot) {
     return 0;
   }
   if (edr_env_bool_default("EDR_COLLECTOR_ADMIT_ALL", 0)) {
     return 1;
   }
-  if (slot->type == EDR_EVENT_PROCESS_TERMINATE || slot->type == EDR_EVENT_DLL_LOAD) {
-    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_LIFECYCLE", 0);
-    if (!keep) {
-      s_health.lifecycle_dropped++;
-    }
-    return keep;
-  }
-  if (slot->type == EDR_EVENT_AUTH_LOGIN || slot->type == EDR_EVENT_AUTH_LOGOUT) {
-    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_AUTH", 0);
-    if (!keep) {
-      s_health.auth_dropped++;
-    }
-    return keep;
-  }
-
-  EdrBehaviorRecord br;
   edr_behavior_from_slot(slot, &br);
   edr_collector_pid_cache_enrich(&br);
   if ((slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) &&
@@ -809,12 +795,38 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     s_health.agent_self_suppressed++;
     return 0;
   }
+  if (slot->type == EDR_EVENT_PROCESS_TERMINATE || slot->type == EDR_EVENT_DLL_LOAD) {
+    if (edr_adaptive_collection_should_admit_record(&br)) {
+      slot->priority = br.priority ? br.priority : 1u;
+      return 1;
+    }
+    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_LIFECYCLE", 0);
+    if (!keep) {
+      s_health.lifecycle_dropped++;
+    }
+    return keep;
+  }
+  if (slot->type == EDR_EVENT_AUTH_LOGIN || slot->type == EDR_EVENT_AUTH_LOGOUT) {
+    if (edr_adaptive_collection_should_admit_record(&br)) {
+      slot->priority = br.priority ? br.priority : 1u;
+      return 1;
+    }
+    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_AUTH", 0);
+    if (!keep) {
+      s_health.auth_dropped++;
+    }
+    return keep;
+  }
   if (br.priority == 0u) {
     slot->priority = 0u;
     return 1;
   }
   if (edr_p0_rule_ir_br_matches_any(&br)) {
     slot->priority = 0u;
+    return 1;
+  }
+  if (edr_adaptive_collection_should_admit_record(&br)) {
+    slot->priority = br.priority ? br.priority : 1u;
     return 1;
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
@@ -1178,6 +1190,7 @@ void edr_collector_stop(void) {
 
 int edr_collector_get_health(EdrCollectorHealth *out_health) {
   EdrSensorInterestStatus si;
+  EdrAdaptiveCollectionStatus adaptive;
   if (!out_health) {
     return -1;
   }
@@ -1204,9 +1217,22 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   out_health->sensor_interest_matched = si.matched;
   out_health->sensor_interest_dropped = si.dropped;
   out_health->sensor_interest_provider_hits = si.provider_hits;
+  out_health->sensor_interest_adaptive_hits = si.adaptive_hits;
   out_health->sensor_interest_process_hits = si.process_hits;
   out_health->sensor_interest_port_hits = si.port_hits;
   out_health->sensor_interest_path_hits = si.path_hits;
   out_health->sensor_interest_registry_hits = si.registry_hits;
+  memset(&adaptive, 0, sizeof(adaptive));
+  edr_adaptive_collection_get_status(&adaptive);
+  out_health->adaptive_collection_enabled = adaptive.enabled;
+  out_health->adaptive_collection_active = adaptive.active;
+  out_health->adaptive_collection_ttl_s = adaptive.ttl_s;
+  out_health->adaptive_collection_remaining_s = adaptive.remaining_s;
+  out_health->adaptive_collection_min_severity = adaptive.min_severity;
+  out_health->adaptive_collection_level = adaptive.level;
+  out_health->adaptive_collection_boosts = adaptive.boosts;
+  out_health->adaptive_collection_last_boost_unix_ms = adaptive.last_boost_unix_ms;
+  snprintf(out_health->adaptive_collection_last_rule_id,
+           sizeof(out_health->adaptive_collection_last_rule_id), "%s", adaptive.last_rule_id);
   return 0;
 }

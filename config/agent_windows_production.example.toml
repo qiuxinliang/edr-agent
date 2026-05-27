@@ -34,6 +34,9 @@ etw_enabled          = true
 ebpf_enabled         = false
 poll_interval_s      = 1
 max_event_queue_size = 8192
+adaptive_enabled = true
+adaptive_boost_seconds = 180
+adaptive_min_severity = 3
 # High-volume providers stay off by default for first install. Enable them
 # only after confirming event bus pressure is stable on the target host.
 etw_dns_client_provider = false

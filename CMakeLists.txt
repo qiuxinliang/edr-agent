@@ -237,6 +237,7 @@ set(EDR_AGENT_SOURCES
   src/config/config.c
   src/preprocess/behavior_record.c
   src/preprocess/behavior_from_slot.c
+  src/preprocess/adaptive_collection.c
   src/preprocess/dedup.c
   src/preprocess/detection_decision.c
   src/preprocess/detection_profile.c

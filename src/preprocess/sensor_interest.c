@@ -1,5 +1,7 @@
 #include "edr/sensor_interest.h"
 
+#include "edr/adaptive_collection.h"
+
 #include "cJSON.h"
 
 #if defined(_WIN32)
@@ -58,6 +60,7 @@ typedef struct {
   volatile uint64_t matched;
   volatile uint64_t dropped;
   volatile uint64_t provider_hits;
+  volatile uint64_t adaptive_hits;
   volatile uint64_t process_hits;
   volatile uint64_t port_hits;
   volatile uint64_t path_hits;
@@ -717,6 +720,11 @@ int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
     return 1;
   }
   edr_si_inc64(&s_si.checked);
+  if (edr_adaptive_collection_should_admit_interest(event)) {
+    edr_si_inc64(&s_si.adaptive_hits);
+    edr_si_inc64(&s_si.matched);
+    return 1;
+  }
 
   switch (event->type) {
   case EDR_EVENT_PROCESS_CREATE:
@@ -817,6 +825,7 @@ void edr_sensor_interest_get_status(EdrSensorInterestStatus *out_status) {
   out_status->matched = edr_si_load64(&s_si.matched);
   out_status->dropped = edr_si_load64(&s_si.dropped);
   out_status->provider_hits = edr_si_load64(&s_si.provider_hits);
+  out_status->adaptive_hits = edr_si_load64(&s_si.adaptive_hits);
   out_status->process_hits = edr_si_load64(&s_si.process_hits);
   out_status->port_hits = edr_si_load64(&s_si.port_hits);
   out_status->path_hits = edr_si_load64(&s_si.path_hits);

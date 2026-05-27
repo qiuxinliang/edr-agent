@@ -77,6 +77,10 @@ etw_powershell_provider   = true
 # Security Audit（4624/4688 等）：登录、进程创建审计，合规基线建议保留
 etw_security_audit_provider = true
 #
+adaptive_enabled = true
+adaptive_boost_seconds = 180
+adaptive_min_severity = 3
+#
 ebpf_enabled         = true
 # Linux：auditd 采集 execve/connect/openat/rename/unlink/chmod/chown/setuid/ptrace/module load。
 # 需要 auditd 已启用并授予读取 audit.log 的权限；eBPF 作为后续内核直连采集路径，健康度会独立上报 loaded 状态。

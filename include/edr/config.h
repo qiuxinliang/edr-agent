@@ -58,6 +58,9 @@ typedef struct EdrConfig {
     char auditd_log_path[512];
     int poll_interval_s;
     uint32_t max_event_queue_size;
+    bool adaptive_enabled;
+    uint32_t adaptive_boost_seconds;
+    uint32_t adaptive_min_severity;
   } collection;
 
   struct {

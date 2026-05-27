@@ -7,6 +7,7 @@
 #include "edr/p0_rule_match.h"
 #include "edr/p0_rule_ir.h"
 
+#include "edr/adaptive_collection.h"
 #include "edr/ave_sdk.h"
 #include "edr/behavior_alert_emit.h"
 #include "edr/behavior_record.h"
@@ -852,6 +853,8 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       }
       if (emit_for_rule(br, rid, severity, (title && title[0]) ? title : rid,
                         (mitre && mitre[0]) ? mitre : "")) {
+        edr_adaptive_collection_raise(severity, rid, br->pid, br->ppid,
+                                      (pn && pn[0]) ? pn : br->process_name);
         fprintf(stderr, "[P0] IR rule emitted: rid=%s\n", rid);
       }
     }
@@ -863,19 +866,28 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       if (p0_debug_enabled()) {
         p0_debug_event("R-EXEC-001", br, pn, detail);
       }
-      (void)emit_for_rule(br, "R-EXEC-001", 3, "PowerShell 编码命令执行", "T1059.001");
+      if (emit_for_rule(br, "R-EXEC-001", 3, "PowerShell 编码命令执行", "T1059.001")) {
+        edr_adaptive_collection_raise(3, "R-EXEC-001", br->pid, br->ppid,
+                                      (pn && pn[0]) ? pn : br->process_name);
+      }
     }
     if (edr_p0_rule_matches3("R-CRED-001", pn, cmd, par, ch)) {
       if (p0_debug_enabled()) {
         p0_debug_event("R-CRED-001", br, pn, detail);
       }
-      (void)emit_for_rule(br, "R-CRED-001", 3, "导出 SAM/SYSTEM/SECURITY", "T1003.002");
+      if (emit_for_rule(br, "R-CRED-001", 3, "导出 SAM/SYSTEM/SECURITY", "T1003.002")) {
+        edr_adaptive_collection_raise(3, "R-CRED-001", br->pid, br->ppid,
+                                      (pn && pn[0]) ? pn : br->process_name);
+      }
     }
     if (edr_p0_rule_matches3("R-FILELESS-001", pn, cmd, par, ch)) {
       if (p0_debug_enabled()) {
         p0_debug_event("R-FILELESS-001", br, pn, detail);
       }
-      (void)emit_for_rule(br, "R-FILELESS-001", 3, "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027");
+      if (emit_for_rule(br, "R-FILELESS-001", 3, "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027")) {
+        edr_adaptive_collection_raise(3, "R-FILELESS-001", br->pid, br->ppid,
+                                      (pn && pn[0]) ? pn : br->process_name);
+      }
     }
   }
 }

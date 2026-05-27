@@ -482,6 +482,24 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
       cfg->collection.max_event_queue_size = (uint32_t)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_bool_in(t, "adaptive_enabled");
+    if (d.ok) {
+      cfg->collection.adaptive_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "adaptive_boost_seconds");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->collection.adaptive_boost_seconds = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "adaptive_min_severity");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->collection.adaptive_min_severity = (uint32_t)d.u.i;
+    }
+  }
 }
 
 static void rule_take_str(toml_table_t *rt, const char *key, char *dst, size_t cap) {
@@ -1474,6 +1492,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;
   cfg->collection.max_event_queue_size = 4096u;
+  cfg->collection.adaptive_enabled = true;
+  cfg->collection.adaptive_boost_seconds = 180u;
+  cfg->collection.adaptive_min_severity = 3u;
 
   cfg->preprocessing.dedup_window_s = 30u;
   cfg->preprocessing.high_freq_threshold = 100u;
