@@ -148,6 +148,26 @@ static uint32_t edr_parse_u32_ascii(const char *s) {
   while (*s == ' ' || *s == '\t') {
     s++;
   }
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+    s += 2;
+    while ((*s >= '0' && *s <= '9') || (*s >= 'a' && *s <= 'f') || (*s >= 'A' && *s <= 'F')) {
+      uint32_t d = 0;
+      if (*s >= '0' && *s <= '9') {
+        d = (uint32_t)(*s - '0');
+      } else if (*s >= 'a' && *s <= 'f') {
+        d = (uint32_t)(*s - 'a' + 10);
+      } else {
+        d = (uint32_t)(*s - 'A' + 10);
+      }
+      uint32_t nv = (v << 4) | d;
+      if (nv < v) {
+        return v;
+      }
+      v = nv;
+      s++;
+    }
+    return v;
+  }
   while (*s >= '0' && *s <= '9') {
     uint32_t nv = v * 10u + (uint32_t)(*s - '0');
     if (nv < v) {
@@ -187,6 +207,12 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
   static const PCWSTR port_try[] = {
       L"dport", L"Dport", L"RemotePort", L"rport", L"DestPort", L"DestinationPort",
   };
+  static const PCWSTR pid_try[] = {
+      L"NewProcessId", L"NewProcessID", L"ProcessId", L"ProcessID", L"PID",
+  };
+  static const PCWSTR parent_pid_try[] = {
+      L"CreatorProcessId", L"ParentProcessId", L"ParentProcessID", L"ParentID", L"ParentId",
+  };
   static const PCWSTR cmd_try[] = {
       L"CommandLine", L"Commandline", L"ProcessCommandLine", L"Command", L"ScriptBlockText",
       L"Content", L"Buffer",
@@ -194,6 +220,15 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
 
   (void)edr_prop_first_utf8(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]),
                             out_event->process_name, sizeof(out_event->process_name));
+  if (edr_prop_first_utf8(rec, pid_try, sizeof(pid_try) / sizeof(pid_try[0]), tmp, sizeof(tmp))) {
+    uint32_t pid = edr_parse_u32_ascii(tmp);
+    if (pid != 0u) {
+      out_event->pid = pid;
+    }
+  }
+  if (edr_prop_first_utf8(rec, parent_pid_try, sizeof(parent_pid_try) / sizeof(parent_pid_try[0]), tmp, sizeof(tmp))) {
+    out_event->parent_pid = edr_parse_u32_ascii(tmp);
+  }
   g = &rec->EventHeader.ProviderId;
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     (void)edr_prop_first_utf8(rec, file_try, sizeof(file_try) / sizeof(file_try[0]),

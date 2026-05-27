@@ -417,6 +417,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+      "\"drop_breakdown\":{\"agent_self\":%llu,\"lifecycle\":%llu,"
+      "\"auth\":%llu,\"invalid_process\":%llu,\"ordinary_file\":%llu,"
+      "\"ordinary_registry\":%llu,\"ordinary_network\":%llu,\"metadata\":%llu},"
       "\"auditd_last_error\":\"%s\",\"ebpf_last_error\":\"%s\","
       "\"sensor_interest\":{\"enabled\":%s,\"loaded\":%s,\"version\":\"%s\","
       "\"rules_version\":\"%s\",\"process_names\":%u,\"process_prefixes\":%u,"
@@ -490,7 +493,16 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.auditd_events,
       ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
       (unsigned long long)ch.ebpf_events, (unsigned long long)ch.collector_dropped,
-      (unsigned long long)ch.queue_dropped, audit_err, ebpf_err,
+      (unsigned long long)ch.queue_dropped,
+      (unsigned long long)ch.agent_self_suppressed,
+      (unsigned long long)ch.lifecycle_dropped,
+      (unsigned long long)ch.auth_dropped,
+      (unsigned long long)ch.invalid_process_dropped,
+      (unsigned long long)ch.ordinary_file_dropped,
+      (unsigned long long)ch.ordinary_registry_dropped,
+      (unsigned long long)ch.ordinary_network_dropped,
+      (unsigned long long)ch.metadata_dropped,
+      audit_err, ebpf_err,
       ch.sensor_interest_enabled ? "true" : "false",
       ch.sensor_interest_loaded ? "true" : "false",
       sensor_interest_ver[0] ? sensor_interest_ver : "builtin",

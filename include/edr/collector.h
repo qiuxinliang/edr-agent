@@ -62,6 +62,14 @@ typedef struct {
     uint64_t ebpf_events;
     uint64_t collector_dropped;
     uint64_t queue_dropped;
+    uint64_t agent_self_suppressed;
+    uint64_t lifecycle_dropped;
+    uint64_t auth_dropped;
+    uint64_t invalid_process_dropped;
+    uint64_t ordinary_file_dropped;
+    uint64_t ordinary_registry_dropped;
+    uint64_t ordinary_network_dropped;
+    uint64_t metadata_dropped;
     int sensor_interest_enabled;
     int sensor_interest_loaded;
     char sensor_interest_version[128];

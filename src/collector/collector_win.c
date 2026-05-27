@@ -47,6 +47,7 @@ static volatile LONG s_started;
 static EdrCollectorHealth s_health;
 
 #define EDR_COLLECTOR_PID_CACHE 512u
+#define EDR_AGENT_SELF_PID_CACHE 128u
 
 typedef struct {
   uint32_t pid;
@@ -58,6 +59,10 @@ typedef struct {
 
 static EdrCollectorPidCacheEntry s_pid_cache[EDR_COLLECTOR_PID_CACHE];
 static uint32_t s_pid_cache_next;
+static uint32_t s_agent_self_pid_cache[EDR_AGENT_SELF_PID_CACHE];
+static uint64_t s_agent_self_seen_ns[EDR_AGENT_SELF_PID_CACHE];
+static uint32_t s_agent_self_pid_next;
+static char s_agent_exe_path[MAX_PATH];
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
 
@@ -272,6 +277,128 @@ static void edr_copy_trunc(char *dst, size_t cap, const char *src) {
     return;
   }
   snprintf(dst, cap, "%s", src ? src : "");
+}
+
+static int edr_collector_keep_agent_self_events(void) {
+  return edr_env_bool_default("EDR_COLLECTOR_KEEP_AGENT_SELF", 0);
+}
+
+static uint64_t edr_agent_self_ttl_ns(void) {
+  const char *e = getenv("EDR_AGENT_SELF_SUPPRESS_TTL_S");
+  long v = e && e[0] ? strtol(e, NULL, 10) : 600L;
+  if (v < 60L) {
+    v = 60L;
+  }
+  if (v > 86400L) {
+    v = 86400L;
+  }
+  return (uint64_t)v * 1000000000ULL;
+}
+
+static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
+  if (pid == 0u) {
+    return;
+  }
+  for (size_t i = 0; i < EDR_AGENT_SELF_PID_CACHE; i++) {
+    if (s_agent_self_pid_cache[i] == pid) {
+      s_agent_self_seen_ns[i] = now_ns;
+      return;
+    }
+  }
+  uint32_t idx = s_agent_self_pid_next++ % EDR_AGENT_SELF_PID_CACHE;
+  s_agent_self_pid_cache[idx] = pid;
+  s_agent_self_seen_ns[idx] = now_ns;
+}
+
+static int edr_agent_self_pid_seen(uint32_t pid, uint64_t now_ns) {
+  uint64_t ttl = edr_agent_self_ttl_ns();
+  if (pid == 0u) {
+    return 0;
+  }
+  if (pid == s_agent_pid) {
+    return 1;
+  }
+  for (size_t i = 0; i < EDR_AGENT_SELF_PID_CACHE; i++) {
+    if (s_agent_self_pid_cache[i] != pid) {
+      continue;
+    }
+    if (now_ns >= s_agent_self_seen_ns[i] && now_ns - s_agent_self_seen_ns[i] <= ttl) {
+      return 1;
+    }
+    s_agent_self_pid_cache[i] = 0u;
+    s_agent_self_seen_ns[i] = 0u;
+    return 0;
+  }
+  return 0;
+}
+
+static int edr_agent_self_text_marker(const char *s) {
+  if (!s || !s[0]) {
+    return 0;
+  }
+  if (s_agent_exe_path[0] && edr_contains_ci_path(s, s_agent_exe_path)) {
+    return 1;
+  }
+  if (edr_contains_ci_path(s, "\\EDR Agent\\edr_agent.exe") ||
+      edr_contains_ci_path(s, "/EDR Agent/edr_agent.exe")) {
+    return 1;
+  }
+  if (edr_contains_ci_path(s, "/api/v1/agent/runtime-policy.toml") ||
+      edr_contains_ci_path(s, "/api/v1/agent/sensor-interest.json") ||
+      edr_contains_ci_path(s, "/api/v1/agent/rules.toml") ||
+      edr_contains_ci_path(s, "/api/v1/agent/p0-bundle") ||
+      edr_contains_ci_path(s, "/api/v1/agent/version/latest") ||
+      edr_contains_ci_path(s, "/api/v1/agent/download/latest") ||
+      edr_contains_ci_path(s, "/api/v1/ingest/engine-health") ||
+      edr_contains_ci_path(s, "\\edr_sensor_interest_") ||
+      edr_contains_ci_path(s, "\\edr_remote_") ||
+      edr_contains_ci_path(s, "/edr_sensor_interest_") ||
+      edr_contains_ci_path(s, "/edr_remote_")) {
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_agent_self_process_name(const char *s) {
+  return edr_contains_ci_path(s, "edr_agent.exe") || edr_contains_ci_path(s, "edr_agent_setup.exe") ||
+         edr_contains_ci_path(s, "edr_agent_install.ps1");
+}
+
+static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
+  if (!ev || edr_collector_keep_agent_self_events()) {
+    return 0;
+  }
+  uint64_t now = edr_unix_ns();
+  if (ev->pid == s_agent_pid || ev->parent_pid == s_agent_pid ||
+      edr_agent_self_pid_seen(ev->pid, now) || edr_agent_self_pid_seen(ev->parent_pid, now)) {
+    edr_agent_self_mark_pid(ev->pid, now);
+    return 1;
+  }
+  if (edr_agent_self_process_name(ev->process_name) || edr_agent_self_text_marker(ev->path) ||
+      edr_agent_self_text_marker(ev->registry_path)) {
+    edr_agent_self_mark_pid(ev->pid, now);
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
+  if (!br || edr_collector_keep_agent_self_events()) {
+    return 0;
+  }
+  uint64_t now = br->event_time_ns > 0 ? (uint64_t)br->event_time_ns : edr_unix_ns();
+  if (br->pid == s_agent_pid || br->ppid == s_agent_pid ||
+      edr_agent_self_pid_seen(br->pid, now) || edr_agent_self_pid_seen(br->ppid, now)) {
+    edr_agent_self_mark_pid(br->pid, now);
+    return 1;
+  }
+  if (edr_agent_self_process_name(br->process_name) || edr_agent_self_text_marker(br->exe_path) ||
+      edr_agent_self_text_marker(br->cmdline) || edr_agent_self_text_marker(br->file_path) ||
+      edr_agent_self_text_marker(br->reg_key_path) || edr_agent_self_text_marker(br->network_aux_path)) {
+    edr_agent_self_mark_pid(br->pid, now);
+    return 1;
+  }
+  return 0;
 }
 
 static int edr_ends_with_ci(const char *s, const char *suffix) {
@@ -654,10 +781,18 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     return 1;
   }
   if (slot->type == EDR_EVENT_PROCESS_TERMINATE || slot->type == EDR_EVENT_DLL_LOAD) {
-    return edr_env_bool_default("EDR_COLLECTOR_KEEP_LIFECYCLE", 0);
+    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_LIFECYCLE", 0);
+    if (!keep) {
+      s_health.lifecycle_dropped++;
+    }
+    return keep;
   }
   if (slot->type == EDR_EVENT_AUTH_LOGIN || slot->type == EDR_EVENT_AUTH_LOGOUT) {
-    return edr_env_bool_default("EDR_COLLECTOR_KEEP_AUTH", 0);
+    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_AUTH", 0);
+    if (!keep) {
+      s_health.auth_dropped++;
+    }
+    return keep;
   }
 
   EdrBehaviorRecord br;
@@ -670,6 +805,10 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   if (slot->type == EDR_EVENT_PROCESS_CREATE && edr_collector_valid_process_create_record(&br)) {
     edr_collector_pid_cache_update(&br);
   }
+  if (edr_agent_self_suppress_record(&br)) {
+    s_health.agent_self_suppressed++;
+    return 0;
+  }
   if (br.priority == 0u) {
     slot->priority = 0u;
     return 1;
@@ -680,6 +819,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
     if (!edr_collector_valid_process_create_record(&br)) {
+      s_health.invalid_process_dropped++;
       return 0;
     }
     return (br.process_name[0] || br.cmdline[0]) ? 1 : 0;
@@ -691,7 +831,16 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
       slot->type == EDR_EVENT_REG_DELETE_KEY) {
     edr_windows_event_policy_apply(&br);
     slot->priority = br.priority;
-    return edr_windows_event_policy_should_emit(&br);
+    if (!edr_windows_event_policy_should_emit(&br)) {
+      if (slot->type == EDR_EVENT_REG_CREATE_KEY || slot->type == EDR_EVENT_REG_SET_VALUE ||
+          slot->type == EDR_EVENT_REG_DELETE_KEY) {
+        s_health.ordinary_registry_dropped++;
+      } else {
+        s_health.ordinary_file_dropped++;
+      }
+      return 0;
+    }
+    return 1;
   }
   if (slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) {
     if (br.net_dport != 0u &&
@@ -701,7 +850,11 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
          edr_network_dest_is_lateral_or_remote_admin(&br))) {
       return 1;
     }
-    return edr_env_bool_default("EDR_COLLECTOR_KEEP_ALL_NET", 0);
+    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_ALL_NET", 0);
+    if (!keep) {
+      s_health.ordinary_network_dropped++;
+    }
+    return keep;
   }
   if (slot->type == EDR_EVENT_SCRIPT_POWERSHELL || slot->type == EDR_EVENT_SCRIPT_WMI ||
       slot->type == EDR_EVENT_NET_DNS_QUERY || slot->type == EDR_EVENT_NET_TLS_HANDSHAKE ||
@@ -710,7 +863,13 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
       slot->type == EDR_EVENT_BEHAVIOR_ONNX_ALERT) {
     return 1;
   }
-  return edr_env_bool_default("EDR_COLLECTOR_KEEP_METADATA", 0);
+  {
+    int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_METADATA", 0);
+    if (!keep) {
+      s_health.metadata_dropped++;
+    }
+    return keep;
+  }
 }
 
 static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
@@ -727,14 +886,22 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     edr_pmfe_on_process_lifecycle_hint();
   }
   if (event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
+    s_health.agent_self_suppressed++;
+    s_health.collector_dropped++;
     return;
   }
   {
     EdrSensorInterestEvent interest_event;
-    if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event) &&
-        !edr_sensor_interest_should_admit(&interest_event)) {
-      s_health.collector_dropped++;
-      return;
+    if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
+      if (edr_agent_self_suppress_interest(&interest_event)) {
+        s_health.agent_self_suppressed++;
+        s_health.collector_dropped++;
+        return;
+      }
+      if (!edr_sensor_interest_should_admit(&interest_event)) {
+        s_health.collector_dropped++;
+        return;
+      }
     }
   }
 
@@ -909,8 +1076,13 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 
   s_bus = bus;
   s_agent_pid = GetCurrentProcessId();
+  s_agent_exe_path[0] = '\0';
+  (void)GetModuleFileNameA(NULL, s_agent_exe_path, (DWORD)sizeof(s_agent_exe_path));
   memset(s_pid_cache, 0, sizeof(s_pid_cache));
   s_pid_cache_next = 0u;
+  memset(s_agent_self_pid_cache, 0, sizeof(s_agent_self_pid_cache));
+  memset(s_agent_self_seen_ns, 0, sizeof(s_agent_self_seen_ns));
+  s_agent_self_pid_next = 0u;
   edr_sensor_interest_lazy_init();
 
   ULONG name_bytes =

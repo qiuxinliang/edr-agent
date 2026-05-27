@@ -12,6 +12,7 @@ typedef struct {
   uint16_t event_id;
   uint8_t opcode;
   uint32_t pid;
+  uint32_t parent_pid;
   uint32_t remote_port;
   char process_name[256];
   char path[1024];
