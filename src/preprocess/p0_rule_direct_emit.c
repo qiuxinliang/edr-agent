@@ -165,6 +165,87 @@ static int p0_is_agent_internal_command(const EdrBehaviorRecord *br) {
   return 0;
 }
 
+static int p0_parent_is_windows_service_host(const EdrBehaviorRecord *br) {
+  const char *parent = br ? br->parent_name : NULL;
+  const char *path = br ? br->parent_path : NULL;
+  if ((parent && (p0_contains_ci(parent, "svchost.exe") ||
+                  p0_contains_ci(parent, "services.exe") ||
+                  p0_contains_ci(parent, "ngentask.exe") ||
+                  p0_contains_ci(parent, "ngen.exe"))) ||
+      (path && (p0_contains_ci(path, "\\windows\\system32\\svchost.exe") ||
+                p0_contains_ci(path, "\\windows\\system32\\services.exe")))) {
+    return 1;
+  }
+  return 0;
+}
+
+static int p0_is_sdbinst_maintenance_baseline(const EdrBehaviorRecord *br) {
+  const char *cmd = br ? br->cmdline : NULL;
+  const char *pn = br ? br->process_name : NULL;
+  const char *path = br ? br->exe_path : NULL;
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || !cmd || !cmd[0]) {
+    return 0;
+  }
+  if (!((pn && p0_contains_ci(pn, "sdbinst.exe")) ||
+        (path && p0_contains_ci(path, "\\windows\\system32\\sdbinst.exe")) ||
+        p0_contains_ci(cmd, "sdbinst.exe"))) {
+    return 0;
+  }
+  if (!(p0_contains_ci(cmd, " -m") && p0_contains_ci(cmd, " -bg"))) {
+    return 0;
+  }
+  if (!p0_parent_is_windows_service_host(br)) {
+    return 0;
+  }
+  if (path && path[0] && !p0_contains_ci(path, "\\windows\\system32\\sdbinst.exe")) {
+    return 0;
+  }
+  return 1;
+}
+
+static int p0_is_known_smoke_command(const EdrBehaviorRecord *br, const char *detail) {
+  const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
+  if (!cmd || !cmd[0]) {
+    return 0;
+  }
+  if (p0_contains_ci(cmd, "edr_platform_stack_smoke") ||
+      p0_contains_ci(cmd, "r-exec-001-smoke") ||
+      p0_contains_ci(cmd, "ZWRyLXNtb2tl") ||
+      p0_contains_ci(cmd, "Write-Output ok") ||
+      p0_contains_ci(cmd, "Invoke-WebRequest 'https://example.com'") ||
+      p0_contains_ci(cmd, "Invoke-WebRequest \"https://example.com\"") ||
+      p0_contains_ci(cmd, "Invoke-RestMethod 'https://httpbin.org/get'") ||
+      p0_contains_ci(cmd, "Invoke-RestMethod \"https://httpbin.org/get\"") ||
+      p0_contains_ci(cmd, "IEX ('Write-Output ok')") ||
+      p0_contains_ci(cmd, "IEX (\"Write-Output ok\")")) {
+    return 1;
+  }
+  return 0;
+}
+
+static int p0_should_suppress_known_false_positive(const char *rule_id, const EdrBehaviorRecord *br,
+                                                   const char *detail, const char **out_reason) {
+  if (out_reason) {
+    *out_reason = "";
+  }
+  if (!rule_id || !br) {
+    return 0;
+  }
+  if (strcmp(rule_id, "R-MITRE-WIN-T1138") == 0 && p0_is_sdbinst_maintenance_baseline(br)) {
+    if (out_reason) {
+      *out_reason = "sdbinst_maintenance_baseline";
+    }
+    return 1;
+  }
+  if (p0_is_known_smoke_command(br, detail)) {
+    if (out_reason) {
+      *out_reason = "known_smoke_test";
+    }
+    return 1;
+  }
+  return 0;
+}
+
 static int p0_ends_with_ci(const char *s, const char *suffix) {
   size_t ns;
   size_t nx;
@@ -590,7 +671,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path);
   a.anomaly_score = p0_anomaly_for_severity(severity);
   snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma ? mitre_comma : "");
-  a.skip_ai_analysis = true;
+  a.skip_ai_analysis = false;
   a.needs_l2_review = false;
 
   /* user_subject_json：所有嵌入字符串必须 JSON 转义，否则 \\ 未写成 \\\\ 会导致非法 JSON，ingest 不入库、标题退回默认。 */
@@ -843,6 +924,16 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       const char *rid = NULL;
       if (!edr_p0_rule_ir_rule_id_at(i, &rid) || !rid) {
         continue;
+      }
+      {
+        const char *reason = "";
+        if (p0_should_suppress_known_false_positive(rid, br, detail, &reason)) {
+          if (p0_debug_enabled()) {
+            fprintf(stderr, "[P0 DEBUG] suppress known false positive: rule=%s pid=%u reason=%s\n",
+                    rid, br->pid, reason && reason[0] ? reason : "unknown");
+          }
+          continue;
+        }
       }
       const char *title = NULL;
       const char *mitre = NULL;

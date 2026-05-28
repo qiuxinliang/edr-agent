@@ -23,6 +23,7 @@
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
@@ -64,6 +65,74 @@ static int edr_agent_download_text_file(const char *url, const char *tmp, size_t
   fprintf(stderr, "[config] %s pull failed via native HTTPS client\n",
           label && label[0] ? label : "remote config");
   return -1;
+}
+
+static int edr_agent_file_has_magic(const char *path, const char *magic, size_t magic_len) {
+  char buf[8];
+  FILE *f;
+  size_t n;
+  if (!path || !path[0] || !magic || magic_len == 0u || magic_len > sizeof(buf)) {
+    return 0;
+  }
+  f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  n = fread(buf, 1u, magic_len, f);
+  fclose(f);
+  return n == magic_len && memcmp(buf, magic, magic_len) == 0 ? 1 : 0;
+}
+
+static int edr_agent_files_equal(const char *a, const char *b) {
+  FILE *fa;
+  FILE *fb;
+  unsigned char ba[8192];
+  unsigned char bb[8192];
+  int equal = 0;
+  if (!a || !a[0] || !b || !b[0]) {
+    return 0;
+  }
+  fa = fopen(a, "rb");
+  if (!fa) {
+    return 0;
+  }
+  fb = fopen(b, "rb");
+  if (!fb) {
+    fclose(fa);
+    return 0;
+  }
+  equal = 1;
+  for (;;) {
+    size_t na = fread(ba, 1u, sizeof(ba), fa);
+    size_t nb = fread(bb, 1u, sizeof(bb), fb);
+    if (na != nb || (na > 0u && memcmp(ba, bb, na) != 0)) {
+      equal = 0;
+      break;
+    }
+    if (na == 0u) {
+      if (ferror(fa) || ferror(fb)) {
+        equal = 0;
+      }
+      break;
+    }
+  }
+  fclose(fa);
+  fclose(fb);
+  return equal;
+}
+
+static int edr_agent_replace_file(const char *src, const char *dst) {
+  if (!src || !src[0] || !dst || !dst[0]) {
+    return -1;
+  }
+#ifdef _WIN32
+  if (MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    return 0;
+  }
+  return -1;
+#else
+  return rename(src, dst);
+#endif
 }
 
 struct EdrAgent {
@@ -206,6 +275,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
 
 static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_ns);
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns);
+static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns);
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns);
@@ -230,6 +300,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
   {
     uint64_t last_reload_ns = 0;
     uint64_t last_remote_ns = 0;
+    uint64_t last_p0_bundle_ns = 0;
     uint64_t last_sensor_interest_ns = 0;
     uint64_t last_health_ns = 0;
     {
@@ -260,6 +331,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_self_protect_poll();
         edr_agent_poll_config_reload(agent, &last_reload_ns);
         edr_agent_poll_remote_config(agent, &last_remote_ns);
+        edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns);
         edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns);
         edr_agent_poll_attack_surface(agent);
         edr_agent_poll_engine_health(agent, &last_health_ns);
@@ -877,6 +949,92 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     fprintf(stderr, " fingerprint=%s", fp);
   }
   fprintf(stderr, "\n");
+}
+
+static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns) {
+  const char *url = getenv("EDR_P0_BUNDLE_URL");
+  const char *auto_pull = getenv("EDR_P0_BUNDLE_AUTO_PULL");
+  const char *iv = getenv("EDR_P0_BUNDLE_POLL_S");
+  int interval = 1800;
+  uint64_t now;
+  char derived[768];
+  char tmp[520];
+  char dst[2048];
+  const char *base;
+  if (!agent || !last_p0_bundle_ns) {
+    return;
+  }
+  if (auto_pull && (auto_pull[0] == '0' || auto_pull[0] == 'n' || auto_pull[0] == 'N')) {
+    return;
+  }
+  if (!url || !url[0]) {
+    base = agent->cfg.platform.relay_url[0]
+               ? agent->cfg.platform.relay_url
+               : agent->cfg.platform.rest_base_url;
+    if (!base[0]) {
+      return;
+    }
+    snprintf(derived, sizeof(derived), "%s/agent/p0-bundle.enc", base);
+    url = derived;
+  }
+  if (iv && iv[0]) {
+    int v = atoi(iv);
+    if (v >= 60 && v <= 86400) {
+      interval = v;
+    }
+  }
+  now = edr_monotonic_ns();
+  if (*last_p0_bundle_ns != 0u &&
+      now - *last_p0_bundle_ns < (uint64_t)interval * 1000000000ULL) {
+    return;
+  }
+  *last_p0_bundle_ns = now;
+
+#ifdef _WIN32
+  {
+    const char *t = getenv("TEMP");
+    if (!t || !t[0]) {
+      t = ".";
+    }
+    snprintf(tmp, sizeof(tmp), "%s\\edr_p0_bundle_%lu.enc", t, (unsigned long)GetCurrentProcessId());
+  }
+#else
+  snprintf(tmp, sizeof(tmp), "/tmp/edr_p0_bundle_%d.enc", (int)getpid());
+#endif
+
+  if (edr_agent_download_text_file(url, tmp, 4u * 1024u * 1024u, "P0 bundle") != 0) {
+    return;
+  }
+  if (!edr_agent_file_has_magic(tmp, "EDR1", 4u)) {
+    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: missing EDR1 header\n");
+    (void)remove(tmp);
+    return;
+  }
+  if (edr_p0_bundle_dst_path(dst, sizeof(dst)) != 0 || !dst[0]) {
+    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: cannot resolve destination path\n");
+    (void)remove(tmp);
+    return;
+  }
+  if (edr_agent_files_equal(tmp, dst)) {
+    (void)remove(tmp);
+    return;
+  }
+  if (edr_agent_replace_file(tmp, dst) != 0) {
+    fprintf(stderr, "[p0_rule_ir] remote bundle install failed: %s\n", dst);
+    (void)remove(tmp);
+    return;
+  }
+  edr_p0_rule_ir_reload();
+  {
+    const char *source = "";
+    const char *sha = "";
+    size_t plain_size = 0u;
+    (void)edr_p0_rule_ir_get_bundle_info(&source, &plain_size, &sha);
+    fprintf(stderr, "[p0_rule_ir] remote bundle applied: rules=%d sha256=%s source=%s\n",
+            edr_p0_rule_ir_rule_count(), sha && sha[0] ? sha : "unknown",
+            source && source[0] ? source : dst);
+    (void)plain_size;
+  }
 }
 
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns) {

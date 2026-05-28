@@ -12,6 +12,7 @@
 #include <time.h>
 
 #ifdef _WIN32
+#include <io.h>
 #include <process.h>
 #include <winreg.h>
 #include <winsock2.h>
@@ -1446,6 +1447,76 @@ static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int 
   return status_ok ? 0 : -1;
 }
 
+static int write_response_chunk_to_file(FILE *f, size_t *written, size_t max_bytes,
+                                        const char *src, size_t src_len) {
+  if (!f || !written || !src || src_len == 0u) {
+    return 0;
+  }
+  if (*written > max_bytes || src_len > max_bytes - *written) {
+    runtime_failure("http get response too large");
+    return -1;
+  }
+  if (fwrite(src, 1u, src_len, f) != src_len) {
+    runtime_failure("http get output write failed");
+    return -1;
+  }
+  *written += src_len;
+  return 0;
+}
+
+static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
+                                                FILE *out, size_t max_bytes, int *out_reusable) {
+  char buf[8192];
+  size_t used = 0;
+  size_t header_len = 0;
+  size_t written = 0;
+  long content_len = -1;
+  int status_ok = 0;
+  int reusable = 0;
+  if (out_reusable) *out_reusable = 0;
+  if (!out || max_bytes == 0u) return -1;
+  for (;;) {
+    int n;
+    if (used >= sizeof(buf) - 1u) return -1;
+    n = recvfn(ctx, buf + used, (int)(sizeof(buf) - 1u - used));
+    if (n <= 0) return -1;
+    used += (size_t)n;
+    buf[used] = '\0';
+    {
+      char *hdr = strstr(buf, "\r\n\r\n");
+      if (!hdr) continue;
+      header_len = (size_t)(hdr + 4 - buf);
+      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
+      content_len = parse_content_length_header(buf);
+      reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
+      if (!status_ok || content_len < 0 || headers_chunked(buf)) {
+        return -1;
+      }
+      if ((unsigned long)content_len > (unsigned long)max_bytes) {
+        runtime_failure("http get response too large");
+        return -1;
+      }
+      if (used > header_len &&
+          write_response_chunk_to_file(out, &written, max_bytes, buf + header_len, used - header_len) != 0) {
+        return -1;
+      }
+      break;
+    }
+  }
+  while ((long)written < content_len) {
+    char tmp[4096];
+    long remain = content_len - (long)written;
+    int want = remain > (long)sizeof(tmp) ? (int)sizeof(tmp) : (int)remain;
+    int n = recvfn(ctx, tmp, want);
+    if (n <= 0) return -1;
+    if (write_response_chunk_to_file(out, &written, max_bytes, tmp, (size_t)n) != 0) {
+      return -1;
+    }
+  }
+  if (out_reusable) *out_reusable = reusable;
+  return 0;
+}
+
 static int plain_recv_adapter(void *ctx, char *buf, int cap) {
 #ifdef _WIN32
   return recv(*(EdrSocket *)ctx, buf, cap, 0);
@@ -1908,11 +1979,77 @@ static int request_to_suffix(const char *method, const char *suffix, const char 
   return native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
 }
 
+static int native_get_to_file(const char *url, FILE *out, size_t max_bytes) {
+  char host[256];
+  char path[1024];
+  int port = 0;
+  int https = 0;
+  int rc = -1;
+  char req[8192];
+  int rn;
+  if (!out || parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
+    runtime_failure("invalid ingest url");
+    return -1;
+  }
+  if (!https) {
+    const char *allow = getenv("EDR_ALLOW_INSECURE_HTTP");
+    if ((!allow || allow[0] != '1') && !is_local_or_private_host(host)) {
+      runtime_failure("plain http denied for non-local host");
+      return -1;
+    }
+  }
+  if (!comm_circuit_allows()) {
+    return -1;
+  }
+  if (!comm_budget_try(512u, 0)) {
+    return -1;
+  }
+  if (net_init() != 0) {
+    runtime_failure("network init failed");
+    return -1;
+  }
+  rn = append_request_headers(req, sizeof(req), "GET", path, host, NULL, 0u);
+  if (rn <= 0) {
+    runtime_failure("http request build failed");
+    net_done();
+    return -1;
+  }
+  http_lock();
+  for (int attempt = 0; attempt < 2; attempt++) {
+    int reusable = 0;
+    EdrHttpConn *conn = http_conn_get_locked(host, port, https);
+    if (!conn) {
+      break;
+    }
+    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
+        read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, out, max_bytes, &reusable) == 0) {
+      rc = 0;
+      conn->last_used_ms = unix_ms_now();
+      if (!reusable || !http_keepalive_enabled()) {
+        http_conn_close_locked();
+      }
+      break;
+    }
+    http_conn_close_locked();
+    if (fseek(out, 0L, SEEK_SET) == 0) {
+#if defined(_WIN32)
+      (void)_chsize(_fileno(out), 0);
+#else
+      (void)ftruncate(fileno(out), 0);
+#endif
+    }
+  }
+  http_unlock();
+  net_done();
+  if (rc != 0 && !s_last_error[0]) {
+    runtime_failure(https ? "https get failed" : "http get failed");
+  }
+  return rc;
+}
+
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
-  char *resp;
   FILE *f;
   size_t cap;
-  size_t n;
   int rc;
   if (!url || !url[0] || !file_path || !file_path[0] || !edr_ingest_http_configured()) {
     return -1;
@@ -1924,35 +2061,17 @@ int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size
   if (cap > 4u * 1024u * 1024u) {
     cap = 4u * 1024u * 1024u;
   }
-  resp = (char *)calloc(1u, cap + 1u);
-  if (!resp) {
-    return -1;
-  }
-  rc = native_request("GET", url, NULL, NULL, 0u, resp, cap + 1u);
-  if (rc != 0) {
-    free(resp);
-    return -1;
-  }
-  n = strlen(resp);
-  if (n >= cap) {
-    runtime_failure("http get response too large");
-    free(resp);
-    return -1;
-  }
   f = fopen(file_path, "wb");
   if (!f) {
     runtime_failure("http get output open failed");
-    free(resp);
     return -1;
   }
-  if (n > 0u && fwrite(resp, 1u, n, f) != n) {
-    fclose(f);
-    free(resp);
-    runtime_failure("http get output write failed");
-    return -1;
-  }
+  rc = native_get_to_file(url, f, cap);
   fclose(f);
-  free(resp);
+  if (rc != 0) {
+    (void)remove(file_path);
+    return -1;
+  }
   runtime_success();
   return 0;
 }
