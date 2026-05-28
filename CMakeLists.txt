@@ -993,14 +993,22 @@ add_executable(test_ave_behavior_features_m3a tests/test_ave_behavior_features_m
 target_include_directories(test_ave_behavior_features_m3a PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_executable(test_ave_cross_engine_parse tests/test_ave_cross_engine_parse.c src/ave/ave_cross_engine_parse.c)
 target_include_directories(test_ave_cross_engine_parse PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_executable(test_ave_cross_engine_feed_quality
+  tests/test_ave_cross_engine_feed_quality.c
+  src/preprocess/behavior_record.c
+  src/ave/ave_cross_engine_feed.c
+  src/ave/ave_cross_engine_parse.c)
+target_include_directories(test_ave_cross_engine_feed_quality PRIVATE ${CMAKE_SOURCE_DIR}/include)
 if(NOT WIN32)
   target_link_libraries(test_ave_cross_engine_parse PRIVATE m)
+  target_link_libraries(test_ave_cross_engine_feed_quality PRIVATE m)
 endif()
 if(NOT WIN32)
   target_link_libraries(test_ave_behavior_features_m3a PRIVATE m)
 endif()
 add_test(NAME ave_behavior_features_m3a COMMAND test_ave_behavior_features_m3a WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_cross_engine_parse COMMAND test_ave_cross_engine_parse WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME ave_cross_engine_feed_quality COMMAND test_ave_cross_engine_feed_quality WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_ave_behavior_features_m3b tests/test_ave_behavior_features_m3b.c src/ave/ave_behavior_features.c)
 target_include_directories(test_ave_behavior_features_m3b PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -24,8 +24,10 @@ float edr_ave_cross_engine_pmfe_snapshot_ave(const char *json);
 int edr_ave_cross_engine_pmfe_snapshot_pe_hint(const char *json);
 
 /**
- * 将单条行为记录中的跨引擎标量写入行为管线（内部 **`AVE_FeedEvent`**）。
- * 仅处理 **`EDR_EVENT_PROTOCOL_SHELLCODE` / `EDR_EVENT_WEBSHELL_DETECTED` / `EDR_EVENT_PMFE_SCAN_RESULT`**。
+ * 将预处理后的 BehaviorRecord 写入 AVE 行为管线（内部 **`AVE_FeedEvent`**）。
+ *
+ * P0 产品化约束：仅接收经过 `behavior_from_slot` / Windows 策略 / 兴趣集后的记录，并在本函数内做字段质量门禁。
+ * 低质量记录（例如只有 pid/type、缺少路径/命令行/目标字段）不会进入 behavior.onnx，只保留在普通计数/缓存路径。
  */
 void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br);
 

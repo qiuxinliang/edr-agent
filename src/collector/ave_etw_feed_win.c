@@ -142,6 +142,7 @@ static int edr_ave_async_try_enqueue(const AVEBehaviorEvent *ev) {
 
 void edr_ave_etw_feed_from_event(PEVENT_RECORD rec, EdrEventType ty, uint64_t ts_ns,
                                  const char *opt_target_ip, const char *opt_target_domain) {
+  const char *direct = getenv("EDR_AVE_ETW_DIRECT_FEED");
   const char *e = getenv("EDR_AVE_ETW_FEED");
   if (e && e[0] == '0') {
     return;
@@ -151,6 +152,9 @@ void edr_ave_etw_feed_from_event(PEVENT_RECORD rec, EdrEventType ty, uint64_t ts
   }
   if (ty == EDR_EVENT_PROCESS_TERMINATE) {
     AVE_NotifyProcessExit((uint32_t)rec->EventHeader.ProcessId);
+    return;
+  }
+  if (!direct || !(direct[0] == '1' && direct[1] == '\0')) {
     return;
   }
   if (edr_ave_feed_every_n_skip()) {

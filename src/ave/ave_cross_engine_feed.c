@@ -84,6 +84,189 @@ static int path_has_ransom_ext(const char *path) {
   return 0;
 }
 
+static int env_int_clamped(const char *name, int fallback, int min_v, int max_v) {
+  const char *e = getenv(name);
+  int v = fallback;
+  if (e && e[0]) {
+    char *end = NULL;
+    long n = strtol(e, &end, 10);
+    if (end != e) {
+      v = (int)n;
+    }
+  }
+  if (v < min_v) {
+    v = min_v;
+  }
+  if (v > max_v) {
+    v = max_v;
+  }
+  return v;
+}
+
+static int record_feed_min_quality(void) {
+  return env_int_clamped("EDR_AVE_RECORD_FEED_MIN_QUALITY", 60, 30, 100);
+}
+
+static int has_text(const char *s) {
+  return s && s[0];
+}
+
+static int has_process_identity(const EdrBehaviorRecord *br) {
+  return br && (has_text(br->process_name) || has_text(br->exe_path));
+}
+
+static int has_parent_context(const EdrBehaviorRecord *br) {
+  return br && (br->ppid != 0u || has_text(br->parent_name) || has_text(br->parent_path) ||
+                has_text(br->parent_cmdline));
+}
+
+static int ave_event_type_from_record(EdrEventType t, AVEEventType *out) {
+  if (!out) {
+    return 0;
+  }
+  switch (t) {
+  case EDR_EVENT_PROCESS_CREATE:
+    *out = AVE_EVT_PROCESS_CREATE;
+    return 1;
+  case EDR_EVENT_PROCESS_INJECT:
+  case EDR_EVENT_THREAD_CREATE_REMOTE:
+    *out = AVE_EVT_PROCESS_INJECT;
+    return 1;
+  case EDR_EVENT_DLL_LOAD:
+  case EDR_EVENT_DRIVER_LOAD:
+    *out = AVE_EVT_DLL_LOAD;
+    return 1;
+  case EDR_EVENT_FILE_CREATE:
+  case EDR_EVENT_FILE_WRITE:
+  case EDR_EVENT_FILE_DELETE:
+  case EDR_EVENT_FILE_RENAME:
+  case EDR_EVENT_FILE_PERMISSION_CHANGE:
+    *out = AVE_EVT_FILE_WRITE;
+    return 1;
+  case EDR_EVENT_NET_CONNECT:
+  case EDR_EVENT_NET_LISTEN:
+    *out = AVE_EVT_NET_CONNECT;
+    return 1;
+  case EDR_EVENT_NET_DNS_QUERY:
+    *out = AVE_EVT_NET_DNS;
+    return 1;
+  case EDR_EVENT_REG_CREATE_KEY:
+  case EDR_EVENT_REG_SET_VALUE:
+  case EDR_EVENT_REG_DELETE_KEY:
+    *out = AVE_EVT_REG_WRITE;
+    return 1;
+  case EDR_EVENT_SCRIPT_POWERSHELL:
+  case EDR_EVENT_SCRIPT_WMI:
+    *out = AVE_EVT_PROCESS_CREATE;
+    return 1;
+  case EDR_EVENT_PROTOCOL_SHELLCODE:
+    *out = AVE_EVT_SHELLCODE_SIGNAL;
+    return 1;
+  case EDR_EVENT_WEBSHELL_DETECTED:
+    *out = AVE_EVT_WEBSHELL_SIGNAL;
+    return 1;
+  case EDR_EVENT_PMFE_SCAN_RESULT:
+    *out = AVE_EVT_PMFE_RESULT;
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int record_is_high_signal(const EdrBehaviorRecord *br, float script_score, int ransom_ext,
+                                 int shadow_delete, int cert_anom) {
+  if (!br) {
+    return 0;
+  }
+  if (br->type == EDR_EVENT_PROTOCOL_SHELLCODE || br->type == EDR_EVENT_WEBSHELL_DETECTED ||
+      br->type == EDR_EVENT_PMFE_SCAN_RESULT || br->type == EDR_EVENT_PROCESS_INJECT ||
+      br->type == EDR_EVENT_THREAD_CREATE_REMOTE) {
+    return 1;
+  }
+  return (script_score > 0.f || ransom_ext || shadow_delete || cert_anom ||
+          br->cert_revoked_ancestor != 0u || br->priority == 0u);
+}
+
+static int ave_record_input_quality(const EdrBehaviorRecord *br, AVEEventType avt, int high_signal) {
+  int q = 0;
+  if (!br || br->pid == 0u) {
+    return 0;
+  }
+  q += 20;
+  if (has_process_identity(br)) {
+    q += 20;
+  }
+  if (has_text(br->cmdline)) {
+    q += 15;
+  }
+  if (has_parent_context(br)) {
+    q += 10;
+  }
+  switch (avt) {
+  case AVE_EVT_PROCESS_CREATE:
+    if (has_text(br->exe_path) || has_text(br->process_name)) {
+      q += 15;
+    }
+    if (has_text(br->cmdline) || has_text(br->powershell_script_block) || has_text(br->script_snippet)) {
+      q += 20;
+    }
+    break;
+  case AVE_EVT_FILE_WRITE:
+  case AVE_EVT_FILE_EXECUTE:
+  case AVE_EVT_DLL_LOAD:
+    if (has_text(br->file_path) || has_text(br->exe_path)) {
+      q += 30;
+    }
+    if (has_text(br->file_op) || br->file_target_has_motw) {
+      q += 5;
+    }
+    break;
+  case AVE_EVT_NET_CONNECT:
+    if (has_text(br->net_dst) || br->net_dport != 0u) {
+      q += 30;
+    }
+    if (has_text(br->network_aux_path)) {
+      q += 5;
+    }
+    break;
+  case AVE_EVT_NET_DNS:
+    if (has_text(br->dns_query)) {
+      q += 35;
+    }
+    break;
+  case AVE_EVT_REG_WRITE:
+    if (has_text(br->reg_key_path)) {
+      q += 30;
+    }
+    if (has_text(br->reg_op) || has_text(br->reg_value_name)) {
+      q += 5;
+    }
+    break;
+  case AVE_EVT_PROCESS_INJECT:
+  case AVE_EVT_MEM_ALLOC_EXEC:
+  case AVE_EVT_LSASS_ACCESS:
+  case AVE_EVT_SHELLCODE_SIGNAL:
+  case AVE_EVT_WEBSHELL_SIGNAL:
+  case AVE_EVT_PMFE_RESULT:
+    if (has_text(br->detection_context) || has_text(br->pmfe_snapshot) ||
+        has_text(br->script_snippet) || has_text(br->cmdline)) {
+      q += 35;
+    }
+    break;
+  default:
+    break;
+  }
+  if (high_signal) {
+    q += 15;
+  }
+  if (!has_process_identity(br) && avt != AVE_EVT_SHELLCODE_SIGNAL && avt != AVE_EVT_WEBSHELL_SIGNAL &&
+      avt != AVE_EVT_PMFE_RESULT && avt != AVE_EVT_PROCESS_INJECT && avt != AVE_EVT_MEM_ALLOC_EXEC &&
+      avt != AVE_EVT_LSASS_ACCESS) {
+    q = q > 50 ? 50 : q;
+  }
+  return q > 100 ? 100 : q;
+}
+
 void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   const char *eo = getenv("EDR_AVE_CROSS_ENGINE_FEED");
   if (eo && eo[0] == '0') {
@@ -98,8 +281,13 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
                       ace_str_has_ci(br->cmdline, "wmic shadowcopy delete") ||
                       ace_str_has_ci(br->cmdline, "delete shadows");
   int cert_anom = br->cert_revoked_ancestor ? 1 : 0;
-  if (br->type != EDR_EVENT_PROTOCOL_SHELLCODE && br->type != EDR_EVENT_WEBSHELL_DETECTED &&
-      br->type != EDR_EVENT_PMFE_SCAN_RESULT && script_score <= 0.f && !ransom_ext && !shadow_delete && !cert_anom) {
+  AVEEventType avt;
+  if (!ave_event_type_from_record(br->type, &avt)) {
+    return;
+  }
+  int high_signal = record_is_high_signal(br, script_score, ransom_ext, shadow_delete, cert_anom);
+  int q = ave_record_input_quality(br, avt, high_signal);
+  if (q < record_feed_min_quality()) {
     return;
   }
 
@@ -107,6 +295,7 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   memset(&ev, 0, sizeof(ev));
   ev.pid = br->pid;
   ev.ppid = br->ppid;
+  ev.event_type = avt;
   ev.cert_revoked_ancestor = br->cert_revoked_ancestor ? 1u : 0u;
   ev.cert_anomaly = br->cert_revoked_ancestor ? 1u : 0u;
   ev.tls_anomaly_score = br->cert_revoked_ancestor ? 0.8f : 0.f;
@@ -149,7 +338,6 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
     ev.webshell_score = sc;
     break;
   case EDR_EVENT_PMFE_SCAN_RESULT:
-    ev.event_type = AVE_EVT_PMFE_RESULT;
     {
       float conf = sc;
       if (conf <= 0.f) {
@@ -160,15 +348,18 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
     }
     break;
   default:
-    if (script_score > 0.f) {
-      ev.event_type = AVE_EVT_PROCESS_CREATE;
+    if (avt == AVE_EVT_FILE_WRITE && br->file_path[0]) {
+      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
+    } else if (avt == AVE_EVT_REG_WRITE && br->reg_key_path[0]) {
+      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->reg_key_path);
+    } else if (avt == AVE_EVT_DLL_LOAD && br->file_path[0]) {
+      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
+    } else if (script_score > 0.f && br->exe_path[0]) {
+      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->exe_path);
     } else if (ransom_ext || shadow_delete) {
-      ev.event_type = AVE_EVT_FILE_WRITE;
       if (br->file_path[0]) {
         snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
       }
-    } else {
-      ev.event_type = AVE_EVT_NET_CONNECT;
     }
     break;
   }
