@@ -631,11 +631,19 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   char epid[64];
   char ppid[64];
   char user[256];
+  char domain[256];
+  char parent_img[1024];
+  char integrity[256];
+  char token_elev[64];
   (void)edr_xml_get_data_utf8(xml, "NewProcessName", img, sizeof(img));
   (void)edr_xml_get_data_utf8(xml, "CommandLine", cmd, sizeof(cmd));
   (void)edr_xml_get_data_utf8(xml, "NewProcessId", epid, sizeof(epid));
   (void)edr_xml_get_data_utf8(xml, "ProcessId", ppid, sizeof(ppid));
   (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
+  (void)edr_xml_get_data_utf8(xml, "SubjectDomainName", domain, sizeof(domain));
+  (void)edr_xml_get_data_utf8(xml, "ParentProcessName", parent_img, sizeof(parent_img));
+  (void)edr_xml_get_data_utf8(xml, "MandatoryLabel", integrity, sizeof(integrity));
+  (void)edr_xml_get_data_utf8(xml, "TokenElevationType", token_elev, sizeof(token_elev));
   free(xml);
   if (!img[0] && !cmd[0]) {
     s_health.collector_dropped++;
@@ -648,8 +656,8 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   slot.type = EDR_EVENT_PROCESS_CREATE;
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=sec\npid=%s\neid=4688\nop=0\nimg=%s\ncmd=%s\nepid=%s\nppid=%s\nuser=%s\n",
-                   epid[0] ? epid : "0", img, cmd, epid, ppid, user);
+                   "ETW1\nprov=sec\npid=%s\neid=4688\nop=0\nimg=%s\ncmd=%s\nepid=%s\nppid=%s\nuser=%s\nuser_domain=%s\nparent_img=%s\nintegrity=%s\ntoken_elevation=%s\n",
+                   epid[0] ? epid : "0", img, cmd, epid, ppid, user, domain, parent_img, integrity, token_elev);
   if (n <= 0) {
     s_health.collector_dropped++;
     return ERROR_SUCCESS;

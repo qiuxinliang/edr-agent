@@ -246,10 +246,12 @@ set(EDR_AGENT_SOURCES
   src/preprocess/encrypt_p0_rules.c
   src/preprocess/p0_rule_direct_emit.c
   src/preprocess/p0_rule_match.c
+  src/preprocess/process_chain_depth.c
   src/preprocess/preprocess_env.c
   src/preprocess/sensor_interest.c
   src/preprocess/windows_event_policy.c
   src/preprocess/preprocess_pipeline.c
+  src/forensic/process_tree_cache.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c
   src/serialize/behavior_alert_emit.c

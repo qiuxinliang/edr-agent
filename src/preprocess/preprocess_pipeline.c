@@ -19,15 +19,20 @@
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
+#include "edr/process_tree_cache.h"
+#include "edr/sha256.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #include "edr/types.h"
 #include "edr/windows_event_policy.h"
+#include "edr/enrich_parent_info.h"
 
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -99,6 +104,152 @@ static int p0_direct_emit_enabled(void) {
   return 1;
 }
 
+static void format_record_time_ns(int64_t ns, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (ns <= 0) {
+    return;
+  }
+  time_t sec = (time_t)(ns / 1000000000LL);
+  struct tm tmv;
+#ifdef _WIN32
+  if (gmtime_s(&tmv, &sec) != 0) {
+    return;
+  }
+#else
+  if (!gmtime_r(&sec, &tmv)) {
+    return;
+  }
+#endif
+  (void)strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+}
+
+static int process_hash_enabled(void) {
+  const char *v = getenv("EDR_PROCESS_EXE_HASH");
+  if (!v || !v[0]) {
+    return 1;
+  }
+  return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'o' || v[0] == 'O');
+}
+
+static uint64_t process_hash_max_bytes(void) {
+  const char *v = getenv("EDR_PROCESS_EXE_HASH_MAX_MB");
+  long mb = v && v[0] ? strtol(v, NULL, 10) : 64L;
+  if (mb < 1L) {
+    mb = 1L;
+  }
+  if (mb > 512L) {
+    mb = 512L;
+  }
+  return (uint64_t)mb * 1024ULL * 1024ULL;
+}
+
+static int is_drive_path(const char *path) {
+  return path && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+         path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+}
+
+static int file_size_within_limit(FILE *f, uint64_t limit) {
+  if (!f) {
+    return 0;
+  }
+#ifdef _WIN32
+  if (_fseeki64(f, 0, SEEK_END) != 0) {
+    rewind(f);
+    return 1;
+  }
+  __int64 sz = _ftelli64(f);
+  rewind(f);
+  if (sz < 0) {
+    return 1;
+  }
+  return (uint64_t)sz <= limit;
+#else
+  if (fseeko(f, 0, SEEK_END) != 0) {
+    rewind(f);
+    return 1;
+  }
+  off_t sz = ftello(f);
+  rewind(f);
+  if (sz < 0) {
+    return 1;
+  }
+  return (uint64_t)sz <= limit;
+#endif
+}
+
+static int hash_file_sha256_bounded(const char *path, char out65[65]) {
+  if (!out65) {
+    return -1;
+  }
+  out65[0] = '\0';
+  if (!process_hash_enabled() || !is_drive_path(path)) {
+    return -1;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return -1;
+  }
+  if (!file_size_within_limit(f, process_hash_max_bytes())) {
+    fclose(f);
+    return -1;
+  }
+  EdrSha256Ctx ctx;
+  edr_sha256_init(&ctx);
+  uint8_t buf[32768];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    edr_sha256_update(&ctx, buf, n);
+  }
+  if (ferror(f)) {
+    fclose(f);
+    out65[0] = '\0';
+    return -1;
+  }
+  fclose(f);
+  uint8_t d[EDR_SHA256_DIGEST_LEN];
+  edr_sha256_final(&ctx, d);
+  static const char hx[] = "0123456789abcdef";
+  for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; i++) {
+    out65[i * 2u] = hx[(d[i] >> 4) & 0xfu];
+    out65[i * 2u + 1u] = hx[d[i] & 0xfu];
+  }
+  out65[64] = '\0';
+  return 0;
+}
+
+static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->pid == 0u) {
+    return;
+  }
+  if (!br->parent_name[0] && br->ppid > 0u) {
+    (void)enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name),
+                                    br->parent_path, sizeof(br->parent_path));
+  }
+  (void)edr_pt_cache_put(br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path,
+                         br->parent_name, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0));
+  {
+    uint32_t chain_depth = 0u;
+    edr_pt_cache_fill_record(br->pid,
+                             br->grandparent_name, sizeof(br->grandparent_name),
+                             br->grandparent_path, sizeof(br->grandparent_path),
+                             &br->grandparent_pid,
+                             br->parent_cmdline, sizeof(br->parent_cmdline),
+                             &chain_depth);
+    if (chain_depth > 0u) {
+      br->process_chain_depth = chain_depth;
+    }
+  }
+  if (!br->process_creation_time[0]) {
+    format_record_time_ns(br->event_time_ns, br->process_creation_time, sizeof(br->process_creation_time));
+  }
+  if (!br->exe_hash[0] && br->exe_path[0]) {
+    (void)hash_file_sha256_bounded(br->exe_path, br->exe_hash);
+  }
+}
+
 static void log_p0_runtime_state(void) {
   edr_p0_rule_ir_lazy_init();
   const char *ir_source = "";
@@ -134,6 +285,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   EdrBehaviorRecord br;
   edr_behavior_from_slot(slot, &br);
   apply_agent_ids_to_record(&br);
+  enrich_process_integrity_context(&br);
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
@@ -256,6 +408,8 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   edr_emit_rules_configure(cfg);
   log_p0_runtime_state();
   edr_dedup_init();
+  edr_pt_cache_init();
+  (void)edr_pt_cache_warmup();
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;
 #ifdef _WIN32
@@ -313,6 +467,7 @@ void edr_preprocess_stop(void) {
 #endif
   s_bus = NULL;
   s_preprocess_active = 0;
+  edr_pt_cache_shutdown();
   edr_event_batch_shutdown();
   edr_emit_rules_configure(NULL);
   edr_dedup_reset();

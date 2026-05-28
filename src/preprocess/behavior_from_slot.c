@@ -128,6 +128,31 @@ static int ends_ci_ascii(const char *s, const char *suffix) {
   return has_ci_ascii(s + (a - b), suffix);
 }
 
+static uint32_t parse_token_elevation_type(const char *s) {
+  if (!s || !s[0]) {
+    return 0u;
+  }
+  if (strcmp(s, "%%1936") == 0) {
+    return 1u; /* TokenElevationTypeDefault */
+  }
+  if (strcmp(s, "%%1937") == 0) {
+    return 2u; /* TokenElevationTypeFull */
+  }
+  if (strcmp(s, "%%1938") == 0) {
+    return 3u; /* TokenElevationTypeLimited */
+  }
+  if (has_ci_ascii(s, "default")) {
+    return 1u;
+  }
+  if (has_ci_ascii(s, "full") || has_ci_ascii(s, "elevated")) {
+    return 2u;
+  }
+  if (has_ci_ascii(s, "limited") || has_ci_ascii(s, "filtered")) {
+    return 3u;
+  }
+  return (uint32_t)strtoul(s, NULL, 0);
+}
+
 static void dirname_c(const char *path, char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
@@ -439,6 +464,11 @@ typedef struct {
   char regname[512];
   char regdata[8192];
   char regop[64];
+  char user[256];
+  char domain[256];
+  char parent_img[EDR_BR_STR_LONG];
+  char integrity[64];
+  char token_elevation[64];
   int has_fw;
   unsigned long forensic_frames;
   int has_forensic_frames;
@@ -454,6 +484,9 @@ typedef struct {
   int has_cmd;
   int has_dport;
   int has_sport;
+  int has_parent_img;
+  int has_integrity;
+  int has_token_elevation;
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
@@ -506,6 +539,19 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->epid = parse_ulong_auto(val);
   } else if (strcmp(key, "ppid") == 0) {
     f->ppid = parse_ulong_auto(val);
+  } else if (strcmp(key, "user") == 0 || strcmp(key, "username") == 0) {
+    snprintf(f->user, sizeof(f->user), "%s", val);
+  } else if (strcmp(key, "user_domain") == 0 || strcmp(key, "subject_domain") == 0) {
+    snprintf(f->domain, sizeof(f->domain), "%s", val);
+  } else if (strcmp(key, "parent_img") == 0 || strcmp(key, "parent_path") == 0) {
+    snprintf(f->parent_img, sizeof(f->parent_img), "%s", val);
+    f->has_parent_img = 1;
+  } else if (strcmp(key, "integrity") == 0 || strcmp(key, "mandatory_label") == 0) {
+    snprintf(f->integrity, sizeof(f->integrity), "%s", val);
+    f->has_integrity = 1;
+  } else if (strcmp(key, "token_elevation") == 0 || strcmp(key, "token_elevation_type") == 0) {
+    snprintf(f->token_elevation, sizeof(f->token_elevation), "%s", val);
+    f->has_token_elevation = 1;
   } else if (strcmp(key, "img") == 0) {
     snprintf(f->img, sizeof(f->img), "%s", val);
     f->has_img = 1;
@@ -762,6 +808,26 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
           snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(first));
         }
       }
+    }
+    if (ef.user[0]) {
+      if (ef.domain[0]) {
+        snprintf(r->username, sizeof(r->username), "%s\\%s", ef.domain, ef.user);
+      } else {
+        snprintf(r->username, sizeof(r->username), "%s", ef.user);
+      }
+    }
+    if (ef.domain[0]) {
+      snprintf(r->domain, sizeof(r->domain), "%s", ef.domain);
+    }
+    if (ef.has_parent_img) {
+      snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.parent_img);
+      snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.parent_img));
+    }
+    if (ef.has_integrity) {
+      snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integrity);
+    }
+    if (ef.has_token_elevation) {
+      r->token_elevation = parse_token_elevation_type(ef.token_elevation);
     }
     if (ef.file[0]) {
       snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
