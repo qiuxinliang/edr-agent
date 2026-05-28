@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r246-01873aec",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r247-ca5faca1",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 160,
@@ -618,22 +618,28 @@
       }
     },
     {
-      "id": "R-RANSOM-002",
-      "title": "可疑释放勒索说明文件",
+      "id": "R-RANSOM-003",
+      "title": "勒索前置安全产品终止",
       "severity": 3,
-      "event_type": "file_write",
+      "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1562.001",
         "T1486"
       ],
-      "description": "短时间释放 readme/notice 类勒索说明",
+      "description": "检测通过 taskkill/tskill/wmic/PowerShell 终止安全产品进程。Agent 侧会在短窗口内聚合多个安全产品目标，并与勒索文件爆发、恢复破坏等信号组合后升为 P0。",
       "condition": {
-        "file_path_regex_any": [
-          "(?i)readme",
-          "(?i)decrypt",
-          "(?i)recover",
-          "(?i)how_to",
-          "(?i)\\.(txt|hta|html)$"
+        "command_regex_all": [
+          "(?i)(taskkill|tskill|wmic\\s+process.*terminate|stop\\-process)",
+          "(?i)(msmpeng\\.exe|windefend|sense\\.exe|securityhealthservice\\.exe|csagent\\.exe|sentinelagent\\.exe|sophos|mcshield\\.exe|avp\\.exe|ekrn\\.exe|symantec|xagt\\.exe|elastic\\-endpoint\\.exe|bdservicehost\\.exe|360sd\\.exe)"
+        ],
+        "process_name_in": [
+          "taskkill.exe",
+          "tskill.exe",
+          "wmic.exe",
+          "powershell.exe",
+          "pwsh.exe",
+          "cmd.exe"
         ]
       }
     },

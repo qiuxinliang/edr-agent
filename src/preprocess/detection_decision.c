@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define EDR_RANSOM_CONTROL_VERSION "ransom-control-v2"
+
 static int has_ci(const char *hay, const char *needle) {
   if (!needle || !needle[0]) {
     return 1;
@@ -93,6 +95,36 @@ static int policy_token_match(const char *env_inline, const char *env_file, cons
     return 1;
   }
   return fallback && fallback[0] && token_list_has_ci(fallback, value);
+}
+
+static int env_int_clamped(const char *name, int fallback, int lo, int hi) {
+  const char *v = getenv(name);
+  long n = v && v[0] ? strtol(v, NULL, 10) : (long)fallback;
+  if (n < (long)lo) {
+    n = (long)lo;
+  }
+  if (n > (long)hi) {
+    n = (long)hi;
+  }
+  return (int)n;
+}
+
+static int ransom_note_policy_min_files(void) {
+  return env_int_clamped("EDR_RANSOM_NOTE_MIN_FILES", 2, 2, 10);
+}
+
+static int ransom_note_policy_window_s(void) {
+  return env_int_clamped("EDR_RANSOM_NOTE_WINDOW_S", 300, 30, 3600);
+}
+
+static int ransom_chain_candidate_threshold(void) {
+  return env_int_clamped("EDR_RANSOM_CHAIN_CANDIDATE_SCORE", 50, 30, 90);
+}
+
+static int ransom_chain_p0_threshold(void) {
+  int candidate = ransom_chain_candidate_threshold();
+  int p0 = env_int_clamped("EDR_RANSOM_CHAIN_P0_SCORE", 70, 50, 100);
+  return p0 <= candidate ? candidate + 1 : p0;
 }
 
 static int has_remote_indicator(const EdrBehaviorRecord *r) {
@@ -200,6 +232,101 @@ static int has_ransom_recovery_tamper_indicator(const EdrBehaviorRecord *r) {
   return has_ci(n, "vssadmin.exe") || has_ci(n, "wbadmin.exe") || has_ci(n, "bcdedit.exe") ||
          has_ci(n, "wevtutil.exe") || has_ci(s, "delete shadows") || has_ci(s, "shadowcopy delete") ||
          has_ci(s, "recoveryenabled no") || has_ci(s, "delete catalog") || has_ci(s, "clear-log");
+}
+
+static int has_ransom_note_indicator(const EdrBehaviorRecord *r) {
+  const char *path = r->file_path[0] ? r->file_path : r->exe_path;
+  const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
+  int note_name = has_ci(path, "readme") || has_ci(path, "decrypt") || has_ci(path, "recover") ||
+                  has_ci(path, "restore-files") || has_ci(path, "how_to_decrypt") ||
+                  has_ci(path, "how-to-decrypt") || has_ci(path, "ransom");
+  int note_ext = has_ci(path, ".txt") || has_ci(path, ".hta") || has_ci(path, ".htm") ||
+                 has_ci(path, ".html");
+  return (note_name && note_ext) || has_ci(s, "ransom_note_burst=1") ||
+         has_ci(s, "win_policy=ransomware_note_or_file_burst") ||
+         has_ci(s, "win_policy_tags=ransomware_behavior");
+}
+
+static int has_ransom_note_burst_indicator(const EdrBehaviorRecord *r) {
+  const char *s = r ? (r->script_snippet[0] ? r->script_snippet : r->cmdline) : "";
+  return has_ci(s, "ransom_note_burst=1");
+}
+
+static int token_list_match_count_ci(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  int count = 0;
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    char tok[256];
+    size_t n = 0;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    tok[n] = '\0';
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t' || tok[n - 1u] == '\n' || tok[n - 1u] == '\r')) {
+      tok[--n] = '\0';
+    }
+    if (tok[0] && has_ci(value, tok)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static int has_security_termination_verb(const EdrBehaviorRecord *r) {
+  const char *s = r->cmdline[0] ? r->cmdline : r->script_snippet;
+  const char *n = r->process_name[0] ? r->process_name : base_name(r->exe_path);
+  return has_ci(n, "taskkill.exe") || has_ci(n, "tskill.exe") || has_ci(n, "wmic.exe") ||
+         has_ci(n, "powershell.exe") || has_ci(n, "pwsh.exe") || has_ci(s, "taskkill") ||
+         has_ci(s, "tskill") || (has_ci(s, "wmic") && has_ci(s, "terminate")) ||
+         has_ci(s, "stop-process") || has_ci(s, "kill -processname");
+}
+
+static int security_product_target_count(const EdrBehaviorRecord *r) {
+  if (!r || !has_security_termination_verb(r)) {
+    return 0;
+  }
+  const char *s = r->cmdline[0] ? r->cmdline : r->script_snippet;
+  static const char *const defaults[] = {
+      "msmpeng.exe", "windefend", "sense.exe", "senseir.exe", "securityhealthservice.exe",
+      "csagent.exe", "falcon", "cybereason", "carbonblack", "cb.exe", "cbdefense",
+      "sentinelagent.exe", "sentinelone", "sophos", "mcshield.exe", "mcafee", "avp.exe",
+      "kaspersky", "ekrn.exe", "eset", "symantec", "sep.exe", "smc.exe", "ccsvchst.exe",
+      "trend", "tmlisten.exe", "pccntmon.exe", "xagt.exe", "elastic-endpoint.exe",
+      "cylancesvc.exe", "cylance", "bdservicehost.exe", "bitdefender", "avastsvc.exe",
+      "avgsvc.exe", "360tray.exe", "360sd.exe", "hipsdaemon.exe",
+  };
+  int count = 0;
+  for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); i++) {
+    if (has_ci(s, defaults[i])) {
+      count++;
+    }
+  }
+  const char *extra = getenv("EDR_RANSOM_SECURITY_PRODUCTS");
+  if (extra && extra[0]) {
+    count += token_list_match_count_ci(extra, s);
+  }
+  return count;
+}
+
+static int has_security_product_kill_indicator(const EdrBehaviorRecord *r) {
+  const char *env = getenv("EDR_RANSOM_SECURITY_KILL_MIN_TARGETS");
+  long min_targets = env && env[0] ? strtol(env, NULL, 10) : 3L;
+  if (min_targets < 1L) {
+    min_targets = 1L;
+  }
+  if (min_targets > 10L) {
+    min_targets = 10L;
+  }
+  return security_product_target_count(r) >= (int)min_targets;
 }
 
 static int has_exfil_indicator(const EdrBehaviorRecord *r) {
@@ -353,6 +480,9 @@ typedef struct {
   uint8_t script_sensor;
   uint8_t tls_anomaly;
   uint8_t ransom_behavior;
+  uint8_t ransom_recovery;
+  uint8_t ransom_note;
+  uint8_t security_product_kill;
   uint8_t webshell_semantic;
   uint8_t credential;
   uint8_t injection;
@@ -370,6 +500,18 @@ typedef struct {
 static EdrProcessContextSlot g_process_context[EDR_PROCESS_CONTEXT_SLOTS];
 static EdrSuppressionCounterSlot g_suppression_counters[EDR_SUPPRESSION_COUNTER_SLOTS];
 static uint64_t g_process_context_seq;
+
+typedef struct {
+  int score;
+  int recovery_tamper;
+  int security_product_kill;
+  int ransom_file_burst;
+  int ransom_note;
+  int ransom_note_burst;
+  int lolbin_or_script;
+  int exfil_or_remote;
+  int context_correlated;
+} EdrRansomChainSignal;
 
 static int64_t process_context_window_ns(void) {
   const char *env = getenv("EDR_DETECTION_CONTEXT_WINDOW_S");
@@ -412,7 +554,8 @@ static const EdrProcessContextSlot *process_context_lookup(const EdrBehaviorReco
 }
 
 static void process_context_update(const EdrBehaviorRecord *r, int64_t now_ns, int remote, int script_sensor,
-                                   int tls_anomaly, int ransom_behavior, int webshell_semantic, int credential,
+                                   int tls_anomaly, int ransom_behavior, int ransom_recovery, int ransom_note,
+                                   int security_product_kill, int webshell_semantic, int credential,
                                    int injection, int persistence) {
   if (!r || r->pid == 0u) {
     return;
@@ -431,6 +574,9 @@ static void process_context_update(const EdrBehaviorRecord *r, int64_t now_ns, i
       s->script_sensor |= script_sensor ? 1u : 0u;
       s->tls_anomaly |= tls_anomaly ? 1u : 0u;
       s->ransom_behavior |= ransom_behavior ? 1u : 0u;
+      s->ransom_recovery |= ransom_recovery ? 1u : 0u;
+      s->ransom_note |= ransom_note ? 1u : 0u;
+      s->security_product_kill |= security_product_kill ? 1u : 0u;
       s->webshell_semantic |= webshell_semantic ? 1u : 0u;
       s->credential |= credential ? 1u : 0u;
       s->injection |= injection ? 1u : 0u;
@@ -456,12 +602,77 @@ static void process_context_update(const EdrBehaviorRecord *r, int64_t now_ns, i
   s->script_sensor = script_sensor ? 1u : 0u;
   s->tls_anomaly = tls_anomaly ? 1u : 0u;
   s->ransom_behavior = ransom_behavior ? 1u : 0u;
+  s->ransom_recovery = ransom_recovery ? 1u : 0u;
+  s->ransom_note = ransom_note ? 1u : 0u;
+  s->security_product_kill = security_product_kill ? 1u : 0u;
   s->webshell_semantic = webshell_semantic ? 1u : 0u;
   s->credential = credential ? 1u : 0u;
   s->injection = injection ? 1u : 0u;
   s->persistence = persistence ? 1u : 0u;
   s->shellcode = (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) ? 1u : 0u;
   s->pmfe = (r->type == EDR_EVENT_PMFE_SCAN_RESULT || r->pmfe_snapshot[0]) ? 1u : 0u;
+}
+
+static EdrRansomChainSignal ransom_chain_signal(const EdrBehaviorRecord *r,
+                                                const EdrProcessContextSlot *ctx,
+                                                const EdrProcessContextSlot *parent_ctx,
+                                                int recovery, int burst, int note, int note_burst,
+                                                int security_kill, int remote,
+                                                int script, int script_sensor,
+                                                int exfil) {
+  EdrRansomChainSignal sig;
+  memset(&sig, 0, sizeof(sig));
+  sig.recovery_tamper = recovery || (ctx && ctx->ransom_recovery) || (parent_ctx && parent_ctx->ransom_recovery);
+  sig.security_product_kill =
+      security_kill || (ctx && ctx->security_product_kill) || (parent_ctx && parent_ctx->security_product_kill);
+  sig.ransom_file_burst = burst || (ctx && ctx->ransom_behavior) || (parent_ctx && parent_ctx->ransom_behavior);
+  sig.ransom_note = note || (ctx && ctx->ransom_note) || (parent_ctx && parent_ctx->ransom_note);
+  sig.ransom_note_burst = note_burst;
+  sig.lolbin_or_script = script || script_sensor || is_lolbin(r->process_name[0] ? r->process_name : r->exe_path) ||
+                         (ctx && ctx->script_sensor) || (parent_ctx && parent_ctx->script_sensor);
+  sig.exfil_or_remote = exfil || remote || (ctx && ctx->remote) || (parent_ctx && parent_ctx->remote);
+  sig.context_correlated = ((ctx && ctx->events > 1u) || (parent_ctx && parent_ctx->events > 0u)) &&
+                           ((sig.recovery_tamper && (sig.ransom_file_burst || sig.ransom_note)) ||
+                            (sig.security_product_kill && (sig.ransom_file_burst || sig.exfil_or_remote)) ||
+                            (sig.ransom_file_burst && sig.ransom_note));
+
+  if (sig.recovery_tamper) {
+    sig.score += 40;
+  }
+  if (sig.security_product_kill) {
+    sig.score += 35;
+  }
+  if (sig.ransom_file_burst) {
+    sig.score += 30;
+  }
+  if (sig.ransom_note_burst) {
+    sig.score += 35;
+  } else if (sig.ransom_note) {
+    sig.score += 20;
+  }
+  if (sig.ransom_note_burst && sig.ransom_file_burst) {
+    sig.score += 10;
+  }
+  if (sig.ransom_note && !sig.ransom_note_burst && !sig.ransom_file_burst &&
+      !sig.recovery_tamper && !sig.security_product_kill) {
+    sig.score -= 5;
+  }
+  if (sig.score < 0) {
+    sig.score = 0;
+  }
+  if (sig.lolbin_or_script) {
+    sig.score += 20;
+  }
+  if (sig.exfil_or_remote) {
+    sig.score += 15;
+  }
+  if (sig.context_correlated) {
+    sig.score += 10;
+  }
+  if (sig.score > 100) {
+    sig.score = 100;
+  }
+  return sig;
 }
 
 static void add_reason(char *dst, size_t cap, const char *s) {
@@ -670,6 +881,15 @@ static void build_recommended_forensics(char *dst, size_t cap, const EdrBehavior
   if (has_ransom_burst_indicator(r)) {
     ADD_ACTION("ransom_activity");
   }
+  if (has_ransom_recovery_tamper_indicator(r)) {
+    ADD_ACTION("recovery_tamper_evidence");
+  }
+  if (has_security_product_kill_indicator(r)) {
+    ADD_ACTION("security_product_termination_evidence");
+  }
+  if (has_ransom_note_indicator(r)) {
+    ADD_ACTION("ransom_note_artifacts");
+  }
   if (has_webshell_semantic_indicator(r)) {
     ADD_ACTION("webshell_semantics");
   }
@@ -694,9 +914,24 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_burst = has_ransom_burst_indicator(r);
+  int ransom_recovery = has_ransom_recovery_tamper_indicator(r);
+  int ransom_note = has_ransom_note_indicator(r);
+  int ransom_note_burst = has_ransom_note_burst_indicator(r);
+  int security_kill = has_security_product_kill_indicator(r);
   int webshell_semantic = has_webshell_semantic_indicator(r);
   int persistence = has_persistence_change_indicator(r);
   int silverfox = has_silverfox_indicator(r);
+  int64_t now_ns = r->event_time_ns > 0 ? r->event_time_ns : 0;
+  const EdrProcessContextSlot *ctx = process_context_lookup(r, now_ns);
+  const EdrProcessContextSlot *parent_ctx = r->ppid ? process_context_lookup_pid(r->ppid, now_ns) : NULL;
+  int chain_candidate_score = ransom_chain_candidate_threshold();
+  int chain_p0_score = ransom_chain_p0_threshold();
+  EdrRansomChainSignal ransom_chain =
+      ransom_chain_signal(r, ctx, parent_ctx, ransom_recovery, ransom_burst, ransom_note, ransom_note_burst, security_kill,
+                          d->has_remote ? 1 : 0, has_lolbin_script_indicator(r), script_sensor,
+                          has_exfil_indicator(r));
+  char note_count_buf[32];
+  detail_value(r->script_snippet, "ransom_note_count", note_count_buf, sizeof(note_count_buf));
   int rmm_policy = rmm_enterprise_policy_match(r);
   int fp_feedback = false_positive_feedback_match(r);
   const char *rmm_policy_version = getenv("EDR_DETECTION_RMM_POLICY_VERSION");
@@ -748,16 +983,34 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   json_cat(r->detection_context, sizeof(r->detection_context),
            "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
-           "\"ransom_behavior\":%s,\"webshell_semantic\":%s,\"persistence_change\":%s,"
+           "\"ransom_behavior\":%s,\"ransom_recovery_tamper\":%s,\"ransom_note\":%s,\"ransom_note_burst\":%s,"
+           "\"security_product_kill\":%s,\"ransom_chain_score\":%d,"
+           "\"webshell_semantic\":%s,\"persistence_change\":%s,"
            "\"silverfox_attack_chain\":%s,\"rmm_policy_match\":%s,\"false_positive_feedback\":%s,"
            "\"process_context\":%s},",
            d->has_remote ? "true" : "false", d->suspicious_parent ? "true" : "false",
            d->allowlisted_path ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false",
            script_sensor ? "true" : "false", tls_anomaly ? "true" : "false",
-           ransom_burst ? "true" : "false", webshell_semantic ? "true" : "false",
+           ransom_burst ? "true" : "false", ransom_recovery ? "true" : "false",
+           ransom_note ? "true" : "false", ransom_note_burst ? "true" : "false",
+           security_kill ? "true" : "false",
+           ransom_chain.score, webshell_semantic ? "true" : "false",
            persistence ? "true" : "false", silverfox ? "true" : "false", rmm_policy ? "true" : "false",
            fp_feedback ? "true" : "false",
            d->context_correlated ? "true" : "false");
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           "\"ransom_control\":{\"version\":");
+  json_str(r->detection_context, sizeof(r->detection_context), EDR_RANSOM_CONTROL_VERSION, 40u);
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"phase\":\"%s\",\"note_count\":%ld,\"note_min_files\":%d,"
+           "\"note_window_s\":%d,\"candidate_score\":%d,\"p0_score\":%d,"
+           "\"direct_emit_single_note\":false},",
+           ransom_chain.score >= chain_p0_score ? "p0" :
+           (ransom_chain.score >= chain_candidate_score ? "candidate" :
+            (ransom_note ? "single_note_observed" : "baseline")),
+           note_count_buf[0] ? strtol(note_count_buf, NULL, 10) : 0L,
+           ransom_note_policy_min_files(), ransom_note_policy_window_s(),
+           chain_candidate_score, chain_p0_score);
   if (d->suppress) {
     float before = d->confidence_before_suppression > 0.0f ? d->confidence_before_suppression : d->confidence;
     json_cat(r->detection_context, sizeof(r->detection_context),
@@ -836,6 +1089,9 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_burst = has_ransom_burst_indicator(r);
+  int ransom_note = has_ransom_note_indicator(r);
+  int ransom_note_burst = has_ransom_note_burst_indicator(r);
+  int security_kill = has_security_product_kill_indicator(r);
   int webshell_semantic = has_webshell_semantic_indicator(r);
   int persistence = has_persistence_change_indicator(r);
   int silverfox = has_silverfox_indicator(r);
@@ -844,6 +1100,11 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int64_t now_ns = record_time_or_seq(r);
   const EdrProcessContextSlot *ctx = process_context_lookup(r, now_ns);
   const EdrProcessContextSlot *parent_ctx = r->ppid ? process_context_lookup_pid(r->ppid, now_ns) : NULL;
+  int chain_candidate_score = ransom_chain_candidate_threshold();
+  int chain_p0_score = ransom_chain_p0_threshold();
+  EdrRansomChainSignal ransom_chain =
+      ransom_chain_signal(r, ctx, parent_ctx, ransom, ransom_burst, ransom_note, ransom_note_burst, security_kill, remote,
+                          script, script_sensor, exfil);
   int context_correlated = 0;
 
   float score = 0.20f;
@@ -902,6 +1163,26 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (ransom_burst) {
     score += ransom ? 0.18f : 0.28f;
     add_reason(out->reason, sizeof(out->reason), "ransom_behavior_counter");
+  }
+  if (ransom_note) {
+    score += ransom_note_burst ? 0.20f : (ransom_burst ? 0.08f : 0.10f);
+    add_reason(out->reason, sizeof(out->reason),
+               ransom_note_burst ? "ransom_note_burst" : "ransom_note_indicator");
+  }
+  if (security_kill) {
+    score += 0.20f;
+    add_reason(out->reason, sizeof(out->reason), "security_product_termination");
+  }
+  if (ransom_chain.score >= chain_p0_score) {
+    if (score < 0.86f) {
+      score = 0.86f;
+    }
+    context_correlated = 1;
+    add_reason(out->reason, sizeof(out->reason), "ransom_kill_chain_p0");
+  } else if (ransom_chain.score >= chain_candidate_score) {
+    score += 0.18f;
+    context_correlated = 1;
+    add_reason(out->reason, sizeof(out->reason), "ransom_kill_chain_candidate");
   }
   if (exfil) {
     score += 0.16f;
@@ -970,7 +1251,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     }
   }
 
-  if (fp_feedback && !cred && !ransom && !ransom_burst && !exfil && !inject && !persistence && !silverfox &&
+  if (fp_feedback && !cred && !ransom && !ransom_burst && !ransom_note && !security_kill && !exfil && !inject && !persistence && !silverfox &&
       r->type != EDR_EVENT_PROTOCOL_SHELLCODE && r->type != EDR_EVENT_WEBSHELL_DETECTED &&
       r->type != EDR_EVENT_PMFE_SCAN_RESULT) {
     set_suppression(out, score, "false_positive_feedback_policy", "EDR_DETECTION_FP_POLICY_VERSION");
@@ -982,7 +1263,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     score -= 0.22f;
     add_reason(out->reason, sizeof(out->reason), "management_tool_noise");
   }
-  if (mgmt && rmm_policy && !script && !parent && !cred && !ransom && !ransom_burst && !exfil && !inject &&
+  if (mgmt && rmm_policy && !script && !parent && !cred && !ransom && !ransom_burst && !ransom_note && !security_kill && !exfil && !inject &&
       !silverfox &&
       !r->cert_revoked_ancestor) {
     set_suppression(out, score, "rmm_enterprise_allowlist_policy", "EDR_DETECTION_RMM_POLICY_VERSION");
@@ -997,7 +1278,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   }
 
   if (lolbin && !context_correlated && !remote && !script && !script_sensor && !tls_anomaly && !persistence && !silverfox && !cred && !ransom &&
-      !ransom_burst && !exfil && !inject) {
+      !ransom_burst && !ransom_note && !security_kill && !exfil && !inject) {
     set_suppression(out, score, "lolbin_without_combo_condition", "EDR_DETECTION_POLICY_VERSION");
     score = score > 0.32f ? 0.32f : score;
     add_reason(out->reason, sizeof(out->reason), "lolbin_without_combo_condition");
@@ -1015,6 +1296,11 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   out->allowlisted_path = allow ? 1u : 0u;
   out->context_correlated = context_correlated ? 1u : 0u;
   out->persistence_change = persistence ? 1u : 0u;
+  if (ransom_chain.score >= chain_p0_score && r->priority > 0u) {
+    r->priority = 0u;
+  } else if (ransom_chain.score >= chain_candidate_score && r->priority > 1u) {
+    r->priority = 1u;
+  }
   if (out->reason[0] == '\0') {
     snprintf(out->reason, sizeof(out->reason), "%s", "baseline");
   }
@@ -1034,6 +1320,6 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (out->suppress && r->priority > 0u) {
     r->priority = 2u;
   }
-  process_context_update(r, now_ns, remote, script_sensor, tls_anomaly, ransom_burst, webshell_semantic, cred, inject,
-                         persistence);
+  process_context_update(r, now_ns, remote, script_sensor, tls_anomaly, ransom_burst, ransom, ransom_note,
+                         security_kill, webshell_semantic, cred, inject, persistence);
 }

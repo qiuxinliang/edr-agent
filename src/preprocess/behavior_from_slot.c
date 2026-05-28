@@ -1,5 +1,6 @@
 #include "edr/behavior_from_slot.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -9,6 +10,8 @@ static uint64_t g_event_seq;
 
 #define RANSOM_COUNTER_BUCKETS 128u
 #define RANSOM_COUNTER_EXTS 24u
+#define RANSOM_NOTE_BUCKETS 128u
+#define RANSOM_NOTE_FILES 16u
 
 typedef struct {
   uint32_t pid;
@@ -20,7 +23,15 @@ typedef struct {
   double entropy_avg;
 } RansomCounterBucket;
 
+typedef struct {
+  uint32_t pid;
+  int64_t window_start_ns;
+  uint32_t note_count;
+  char files[RANSOM_NOTE_FILES][96];
+} RansomNoteBucket;
+
 static RansomCounterBucket g_ransom_buckets[RANSOM_COUNTER_BUCKETS];
+static RansomNoteBucket g_ransom_note_buckets[RANSOM_NOTE_BUCKETS];
 
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = ++g_event_seq;
@@ -73,6 +84,48 @@ static void first_cmd_token(const char *cmd, char *out, size_t cap) {
 static int is_file_activity_event(EdrEventType t) {
   return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE || t == EDR_EVENT_FILE_RENAME ||
          t == EDR_EVENT_FILE_DELETE;
+}
+
+static char fold_ascii(char c) {
+  if (c == '/') {
+    c = '\\';
+  }
+  return (char)tolower((unsigned char)c);
+}
+
+static int has_ci_ascii(const char *hay, const char *needle) {
+  if (!needle || !needle[0]) {
+    return 1;
+  }
+  if (!hay || !hay[0]) {
+    return 0;
+  }
+  for (; *hay; hay++) {
+    const char *a = hay;
+    const char *b = needle;
+    while (*a && *b && fold_ascii(*a) == fold_ascii(*b)) {
+      a++;
+      b++;
+    }
+    if (!*b) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ends_ci_ascii(const char *s, const char *suffix) {
+  size_t a;
+  size_t b;
+  if (!s || !suffix) {
+    return 0;
+  }
+  a = strlen(s);
+  b = strlen(suffix);
+  if (b == 0u || a < b) {
+    return 0;
+  }
+  return has_ci_ascii(s + (a - b), suffix);
 }
 
 static void dirname_c(const char *path, char *out, size_t cap) {
@@ -181,6 +234,109 @@ static int ext_seen_or_add(RansomCounterBucket *b, const char *ext) {
   return 0;
 }
 
+static int note_file_seen_or_add(RansomNoteBucket *b, const char *path) {
+  if (!b || !path || !path[0]) {
+    return 0;
+  }
+  const char *base = basename_c(path);
+  if (!base || !base[0]) {
+    base = path;
+  }
+  char compact[96];
+  size_t n = 0u;
+  while (*base && n + 1u < sizeof(compact)) {
+    char c = fold_ascii(*base++);
+    if (c == ' ' || c == '\t' || c == '_' || c == '-') {
+      c = '_';
+    }
+    compact[n++] = c;
+  }
+  compact[n] = '\0';
+  for (uint32_t i = 0; i < b->note_count && i < RANSOM_NOTE_FILES; i++) {
+    if (strcmp(b->files[i], compact) == 0) {
+      return 1;
+    }
+  }
+  if (b->note_count < RANSOM_NOTE_FILES) {
+    snprintf(b->files[b->note_count], sizeof(b->files[b->note_count]), "%s", compact);
+  }
+  b->note_count++;
+  return 0;
+}
+
+static int ransom_note_threshold(void) {
+  const char *env = getenv("EDR_RANSOM_NOTE_MIN_FILES");
+  long n = env && env[0] ? strtol(env, NULL, 10) : 2L;
+  if (n < 2L) {
+    n = 2L;
+  }
+  if (n > 10L) {
+    n = 10L;
+  }
+  return (int)n;
+}
+
+static int64_t ransom_note_window_ns(void) {
+  const char *env = getenv("EDR_RANSOM_NOTE_WINDOW_S");
+  long sec = env && env[0] ? strtol(env, NULL, 10) : 300L;
+  if (sec <= 0L) {
+    sec = 300L;
+  }
+  if (sec > 3600L) {
+    sec = 3600L;
+  }
+  return (int64_t)sec * 1000000000LL;
+}
+
+static int is_ransom_note_like_path(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  const char *base = basename_c(path);
+  int ext = ends_ci_ascii(base, ".txt") || ends_ci_ascii(base, ".hta") ||
+            ends_ci_ascii(base, ".htm") || ends_ci_ascii(base, ".html");
+  if (!ext) {
+    return 0;
+  }
+  return has_ci_ascii(base, "readme") || has_ci_ascii(base, "read_me") ||
+         has_ci_ascii(base, "read___me") || has_ci_ascii(base, "decrypt") ||
+         has_ci_ascii(base, "encrypted") || has_ci_ascii(base, "recover") ||
+         has_ci_ascii(base, "restore") || has_ci_ascii(base, "restore-files") ||
+         has_ci_ascii(base, "restore_files") || has_ci_ascii(base, "get_your_files_back") ||
+         has_ci_ascii(base, "help_instruction") || has_ci_ascii(base, "help_to_save_files") ||
+         has_ci_ascii(base, "how_to_back") || has_ci_ascii(base, "how_to_restore") ||
+         has_ci_ascii(base, "howtobackyourfiles") || has_ci_ascii(base, "howtorestoreyourfiles") ||
+         has_ci_ascii(base, "return_files") || has_ci_ascii(base, "your_files_back") ||
+         has_ci_ascii(base, "use_to_repair") || has_ci_ascii(base, "ransom");
+}
+
+static RansomNoteBucket *ransom_note_bucket_for(uint32_t pid, int64_t now_ns, int64_t window_ns) {
+  RansomNoteBucket *empty = NULL;
+  RansomNoteBucket *oldest = &g_ransom_note_buckets[0];
+  for (size_t i = 0; i < RANSOM_NOTE_BUCKETS; i++) {
+    RansomNoteBucket *b = &g_ransom_note_buckets[i];
+    if (b->pid == pid) {
+      if (b->window_start_ns <= 0 || now_ns - b->window_start_ns > window_ns) {
+        memset(b, 0, sizeof(*b));
+        b->pid = pid;
+        b->window_start_ns = now_ns;
+      }
+      return b;
+    }
+    if (b->pid == 0u && !empty) {
+      empty = b;
+    }
+    if (b->window_start_ns < oldest->window_start_ns) {
+      oldest = b;
+    }
+  }
+  RansomNoteBucket *b = empty ? empty : oldest;
+  memset(b, 0, sizeof(*b));
+  b->pid = pid ? pid : 1u;
+  b->window_start_ns = now_ns;
+  return b;
+}
+
 static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
   if (!r || !fmt) {
     return;
@@ -243,6 +399,13 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   append_record_kv(r, "file_rate=%.0f ext_burst=%u entropy_delta=%.2f%s",
                    file_rate, (unsigned)b->ext_count, entropy_delta,
                    suspicious ? " ransom_counter=1" : "");
+
+  if (is_ransom_note_like_path(r->file_path)) {
+    RansomNoteBucket *nb = ransom_note_bucket_for(r->pid ? r->pid : 1u, now_ns, ransom_note_window_ns());
+    (void)note_file_seen_or_add(nb, r->file_path);
+    append_record_kv(r, "ransom_note_count=%u%s", nb->note_count,
+                     nb->note_count >= (uint32_t)ransom_note_threshold() ? " ransom_note_burst=1" : "");
+  }
 }
 
 typedef struct {

@@ -43,7 +43,8 @@ int main(void) {
   int i_web = find_rule_index("R-WEBSHELL-001");
   int i_lmove = find_rule_index("R-LMOVE-001");
   int i_def = find_rule_index("R-DEFENSE-001");
-  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_def < 0) {
+  int i_t1138 = find_rule_index("R-MITRE-WIN-T1138");
+  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_def < 0 || i_t1138 < 0) {
     fprintf(stderr, "[p0_ir_record] missing expected rule in bundle (indices)\n");
     return 1;
   }
@@ -121,10 +122,31 @@ int main(void) {
     return 1;
   }
 
+  /* R-MITRE-WIN-T1138 Application Shimming: maintenance scan must not alert. */
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_PROCESS_CREATE;
+  br.pid = 4242u;
+  snprintf(br.process_name, sizeof(br.process_name), "sdbinst.exe");
+  snprintf(br.exe_path, sizeof(br.exe_path), "%s", "C:\\Windows\\System32\\sdbinst.exe");
+  snprintf(br.cmdline, sizeof(br.cmdline), "%s", "C:\\WINDOWS\\System32\\sdbinst.exe -m -bg");
+  snprintf(br.parent_name, sizeof(br.parent_name), "svchost.exe");
+  if (!check_br("T1138 maintenance miss", &br, i_t1138, 0)) {
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_PROCESS_CREATE;
+  br.pid = 4243u;
+  snprintf(br.process_name, sizeof(br.process_name), "sdbinst.exe");
+  snprintf(br.exe_path, sizeof(br.exe_path), "%s", "C:\\Windows\\System32\\sdbinst.exe");
+  snprintf(br.cmdline, sizeof(br.cmdline), "%s", "sdbinst.exe C:\\Users\\Public\\payload.sdb /q");
+  snprintf(br.parent_name, sizeof(br.parent_name), "cmd.exe");
+  if (!check_br("T1138 suspicious hit", &br, i_t1138, 1)) {
+    return 1;
+  }
+
   fprintf(
       stderr,
-      "[p0_ir_record] ok (file_read / file_write / network_connect / registry_set; see network_aux_path for "
-      "net+path 规则)\n"
+      "[p0_ir_record] ok (file_read / file_write / network_connect / registry_set / T1138 process golden)\n"
   );
   return 0;
 }

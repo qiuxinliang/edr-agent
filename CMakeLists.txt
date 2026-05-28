@@ -33,7 +33,7 @@ option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active p
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 set(EDR_P0_RULES_BUNDLE_VERSION
-  "edr-dynamic-rules-v1-r246-01873aec"
+  "edr-dynamic-rules-v1-r247-ca5faca1"
   CACHE STRING "P0/dynamic rule bundle version")
 set(EDR_AGENT_VERSION_STRING
   "${PROJECT_VERSION}"
@@ -904,6 +904,34 @@ else()
   target_compile_options(test_detection_sensor_bridge PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME detection_sensor_bridge COMMAND test_detection_sensor_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+if(EDR_PCRE2_AVAILABLE)
+  add_executable(test_p0_rule_ir_record_golden
+    src/preprocess/p0_rule_ir_record_golden_test.c
+    src/preprocess/p0_rule_ir.c
+    src/preprocess/behavior_record.c
+    src/preprocess/encrypt_p0_rules.c
+    src/preprocess/preprocess_env.c
+    src/command/sha256.c
+    third_party/cjson/cJSON.c)
+  target_include_directories(test_p0_rule_ir_record_golden PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(test_p0_rule_ir_record_golden PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(test_p0_rule_ir_record_golden PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(test_p0_rule_ir_record_golden PRIVATE ${EDR_PCRE2_LIBRARY})
+  endif()
+  if(MSVC)
+    target_compile_options(test_p0_rule_ir_record_golden PRIVATE /W4 /WX-)
+  else()
+    target_compile_options(test_p0_rule_ir_record_golden PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  add_test(NAME p0_rule_ir_record_golden COMMAND test_p0_rule_ir_record_golden WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(p0_rule_ir_record_golden PROPERTIES
+    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+endif()
 
 add_executable(test_windows_event_policy tests/test_windows_event_policy.c
   src/preprocess/behavior_record.c

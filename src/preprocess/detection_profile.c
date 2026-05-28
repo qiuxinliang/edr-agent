@@ -72,12 +72,35 @@ static int has_tls_anomaly_pattern(const EdrBehaviorRecord *r) {
 
 static int has_ransom_or_webshell_semantic_pattern(const EdrBehaviorRecord *r) {
   const char *s = r && r->script_snippet[0] ? r->script_snippet : (r ? r->cmdline : "");
-  return r && (has_ci(s, "ransom_counter=1") || has_ci(s, "mass_rename=1") ||
+  const char *path = r ? (r->file_path[0] ? r->file_path : r->exe_path) : "";
+  int ransom_note = (has_ci(path, "readme") || has_ci(path, "decrypt") || has_ci(path, "recover") ||
+                     has_ci(path, "restore-files") || has_ci(path, "how_to_decrypt") ||
+                     has_ci(path, "how-to-decrypt")) &&
+                    (has_ci(path, ".txt") || has_ci(path, ".hta") ||
+                     has_ci(path, ".htm") || has_ci(path, ".html"));
+  return r && (ransom_note || has_ci(s, "ransom_note_burst=1") ||
+               has_ci(s, "ransom_counter=1") || has_ci(s, "ransom_chain_score") ||
+               has_ci(s, "mass_rename=1") ||
                has_ci(s, "extension_burst=1") || has_ci(s, "rename_burst=1") ||
                has_ci(s, "shadowcopy_delete=1") || has_ci(s, "ast=webshell") ||
                has_ci(s, "token=webshell") || has_ci(s, "ast_score=") ||
                has_ci(s, "token_score=") || has_ci(s, "semantic_score=") ||
                has_ci(s, "ast_tokens=") || has_ci(s, "token_features="));
+}
+
+static int has_security_product_kill_pattern(const EdrBehaviorRecord *r) {
+  const char *s = r && r->cmdline[0] ? r->cmdline : (r ? r->script_snippet : "");
+  const char *n = r ? (r->process_name[0] ? r->process_name : r->exe_path) : "";
+  if (!(has_ci(n, "taskkill.exe") || has_ci(n, "tskill.exe") || has_ci(n, "wmic.exe") ||
+        has_ci(n, "powershell.exe") || has_ci(s, "taskkill") || has_ci(s, "tskill") ||
+        (has_ci(s, "wmic") && has_ci(s, "terminate")) || has_ci(s, "stop-process"))) {
+    return 0;
+  }
+  return has_ci(s, "msmpeng.exe") || has_ci(s, "windefend") || has_ci(s, "sense.exe") ||
+         has_ci(s, "csagent.exe") || has_ci(s, "sentinelagent.exe") || has_ci(s, "sophos") ||
+         has_ci(s, "mcshield.exe") || has_ci(s, "avp.exe") || has_ci(s, "ekrn.exe") ||
+         has_ci(s, "symantec") || has_ci(s, "xagt.exe") || has_ci(s, "elastic-endpoint.exe") ||
+         has_ci(s, "bdservicehost.exe") || has_ci(s, "360sd.exe");
 }
 
 static int has_memory_or_credential_pattern(const EdrBehaviorRecord *r) {
@@ -267,6 +290,9 @@ void edr_detection_trigger_evaluate(const EdrBehaviorRecord *r, const EdrDetecti
     } else if (d->confidence >= 0.55f && has_ransom_or_webshell_semantic_pattern(r)) {
       out->pmfe_scan = 1u;
       add_reason(out->reason, sizeof(out->reason), "semantic_behavior_high_signal");
+    } else if (d->confidence >= 0.55f && has_security_product_kill_pattern(r)) {
+      out->targeted_files = 1u;
+      add_reason(out->reason, sizeof(out->reason), "security_product_termination_review");
     } else if (d->confidence >= 0.55f && has_memory_or_credential_pattern(r)) {
       out->pmfe_scan = 1u;
       add_reason(out->reason, sizeof(out->reason), "credential_memory_combo");

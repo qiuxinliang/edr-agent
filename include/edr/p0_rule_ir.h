@@ -20,6 +20,7 @@ int edr_p0_bundle_dst_path(char *out, size_t cap);
 
 /* 1 = 已从 JSON 成功编译至少一条 P0 规则。 */
 int edr_p0_rule_ir_is_ready(void);
+int edr_p0_rule_ir_get_bundle_info(const char **out_source, size_t *out_plain_size, const char **out_plain_sha256);
 
 /* 在 IR 已就绪时，对单条已加载规则按 rule_id 求值（仅对 event_type=process_create 有效；对拍/legacy）。 */
 int edr_p0_rule_ir_matches(

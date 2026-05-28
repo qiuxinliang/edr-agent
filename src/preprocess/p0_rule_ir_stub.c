@@ -6,6 +6,12 @@
 void edr_p0_rule_ir_lazy_init(void) {}
 
 int edr_p0_rule_ir_is_ready(void) { return 0; }
+int edr_p0_rule_ir_get_bundle_info(const char **out_source, size_t *out_plain_size, const char **out_plain_sha256) {
+  if (out_source) *out_source = "";
+  if (out_plain_size) *out_plain_size = 0u;
+  if (out_plain_sha256) *out_plain_sha256 = "";
+  return 0;
+}
 
 int edr_p0_rule_ir_matches(
     const char *rule_id, const char *process_name, const char *cmdline, const char *parent_name, int process_chain_depth) {

@@ -270,6 +270,37 @@ static void test_false_positive_feedback_policy_suppresses_known_tool(void) {
   test_unsetenv("EDR_DETECTION_FP_ROLLBACK_VERSION");
 }
 
+static void test_ransom_control_threshold_context(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  test_setenv("EDR_RANSOM_CHAIN_CANDIDATE_SCORE", "45");
+  test_setenv("EDR_RANSOM_CHAIN_P0_SCORE", "65");
+  test_setenv("EDR_RANSOM_NOTE_MIN_FILES", "3");
+  test_setenv("EDR_RANSOM_NOTE_WINDOW_S", "600");
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.pid = 9910u;
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "sync_update.exe");
+  snprintf(r.file_path, sizeof(r.file_path), "%s", "C:\\Users\\alice\\Documents\\HOW_TO_RESTORE.txt");
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "ransom_note_count=3 ransom_note_burst=1");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.drop);
+  assert(strstr(d.reason, "ransom_note_burst") != NULL);
+  assert(strstr(r.detection_context, "\"ransom_control\"") != NULL);
+  assert(strstr(r.detection_context, "\"version\":\"ransom-control-v2\"") != NULL);
+  assert(strstr(r.detection_context, "\"note_count\":3") != NULL);
+  assert(strstr(r.detection_context, "\"note_min_files\":3") != NULL);
+  assert(strstr(r.detection_context, "\"note_window_s\":600") != NULL);
+  assert(strstr(r.detection_context, "\"candidate_score\":45") != NULL);
+  assert(strstr(r.detection_context, "\"p0_score\":65") != NULL);
+  assert(strstr(r.detection_context, "\"direct_emit_single_note\":false") != NULL);
+  test_unsetenv("EDR_RANSOM_CHAIN_CANDIDATE_SCORE");
+  test_unsetenv("EDR_RANSOM_CHAIN_P0_SCORE");
+  test_unsetenv("EDR_RANSOM_NOTE_MIN_FILES");
+  test_unsetenv("EDR_RANSOM_NOTE_WINDOW_S");
+}
+
 int main(void) {
   test_regsvr32_remote_combo_high();
   test_regsvr32_without_combo_suppressed();
@@ -282,6 +313,7 @@ int main(void) {
   test_process_tree_context_correlates_parent_child();
   test_file_policy_allowlist_suppresses_known_rmm();
   test_false_positive_feedback_policy_suppresses_known_tool();
+  test_ransom_control_threshold_context();
   puts("detection_decision ok");
   return 0;
 }

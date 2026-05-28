@@ -75,6 +75,19 @@ static int any_ends(const char *s, const char *const *items, size_t count) {
   return 0;
 }
 
+static int ransom_note_like_path(const char *path) {
+  static const char *const note_exts[] = {".txt", ".hta", ".htm", ".html"};
+  static const char *const note_tokens[] = {
+      "readme", "read_me", "read___me", "decrypt", "encrypted", "recover",
+      "restore", "restore-files", "restore_files", "get_your_files_back",
+      "help_instruction", "help_to_save_files", "how_to_decrypt", "how_to_back", "how_to_restore",
+      "howtobackyourfiles", "howtorestoreyourfiles", "return_files",
+      "your_files_back", "use_to_repair", "ransom",
+  };
+  return any_ends(path, note_exts, sizeof(note_exts) / sizeof(note_exts[0])) &&
+         any_contains(path, note_tokens, sizeof(note_tokens) / sizeof(note_tokens[0]));
+}
+
 static void set_reason(EdrWindowsEventPolicy *p, const char *reason) {
   if (p && reason && reason[0] && !p->reason[0]) {
     snprintf(p->reason, sizeof(p->reason), "%s", reason);
@@ -150,10 +163,6 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       "\\ntds.dit", "\\config\\sam", "\\config\\system", "\\config\\security",
       "\\config\\software", "lsass.dmp", "\\lsass", "\\sam.save", "\\system.save",
   };
-  static const char *const ransom_markers[] = {
-      "readme", "decrypt", "recover", "ransom", "restore-files", "how_to_decrypt",
-  };
-
   if (!path || !path[0]) {
     return;
   }
@@ -184,8 +193,8 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       mark_suspicious(p, "executable_drop_in_user_temp_path", "executable_temp_staging");
     }
   }
-  if (any_contains(path, ransom_markers, sizeof(ransom_markers) / sizeof(ransom_markers[0])) ||
-      has_ci_path(r->script_snippet, "ransom_counter=1")) {
+  if (ransom_note_like_path(path) || has_ci_path(r->script_snippet, "ransom_counter=1") ||
+      has_ci_path(r->script_snippet, "ransom_note_burst=1")) {
     mark_suspicious(p, "ransomware_note_or_file_burst", "ransomware_behavior");
   }
   if (has_ci_path(path, "\\users\\public\\") &&

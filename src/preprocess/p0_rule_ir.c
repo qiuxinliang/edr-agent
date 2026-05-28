@@ -3,6 +3,7 @@
 #include "edr/preprocess.h"
 #include "edr/behavior_record.h"
 #include "edr/encrypt_p0_rules.h"
+#include "edr/sha256.h"
 #include "cJSON.h"
 
 /* pcre2.h 要求：在包含前设定宽度；本文件使用 8 位 API（与 PCRE2_UCHAR8 / char* 一致） */
@@ -76,6 +77,9 @@ static struct p0_ir_one s_rule[P0_IR_RULES_MAX];
 static int s_n;
 static int s_inited; /* 1 tried */
 static int s_ready;
+static char s_source_label[1024];
+static size_t s_plain_size;
+static char s_plain_sha256[65];
 
 /* P0规则命中率统计 - 性能优化辅助数据 */
 static uint64_t s_rule_evaluate_count[P0_IR_RULES_MAX];
@@ -772,6 +776,9 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
 static int p0_ir_load_from_json_text(const char *source_label, const char *data, size_t data_len) {
   s_n = 0;
   s_ready = 0;
+  s_source_label[0] = '\0';
+  s_plain_size = 0u;
+  s_plain_sha256[0] = '\0';
   fprintf(stderr, "[p0_rule_ir] loading %s (%zu bytes, %s)\n", source_label, data_len,
           (data_len >= 4 && memcmp(data, "EDR1", 4) == 0) ? "EDR1" : (data_len >= 1 && data[0] == '{') ? "JSON" : "unknown");
   cJSON *root = cJSON_ParseWithLength(data, data_len);
@@ -930,8 +937,12 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
   cJSON_Delete(root);
   if (s_n > 0) {
     s_ready = 1;
+    snprintf(s_source_label, sizeof(s_source_label), "%s", source_label ? source_label : "");
+    s_plain_size = data_len;
+    (void)edr_sha256_hex((const uint8_t *)data, data_len, s_plain_sha256);
     fprintf(
-        stderr, "[p0_rule_ir] loaded %d P0 rules (process/file/net/registry) from %s\n", s_n, source_label
+        stderr, "[p0_rule_ir] loaded %d P0 rules (process/file/net/registry) from %s sha256=%s\n", s_n,
+        source_label, s_plain_sha256[0] ? s_plain_sha256 : "unknown"
     );
     return 1;
   }
@@ -1020,6 +1031,19 @@ int edr_p0_bundle_dst_path(char *out, size_t cap) {
 }
 
 int edr_p0_rule_ir_is_ready(void) { return s_ready; }
+
+int edr_p0_rule_ir_get_bundle_info(const char **out_source, size_t *out_plain_size, const char **out_plain_sha256) {
+  if (out_source) {
+    *out_source = s_source_label;
+  }
+  if (out_plain_size) {
+    *out_plain_size = s_plain_size;
+  }
+  if (out_plain_sha256) {
+    *out_plain_sha256 = s_plain_sha256;
+  }
+  return s_ready ? 1 : 0;
+}
 
 int edr_p0_rule_ir_matches(const char *rule_id, const char *process_name, const char *cmdline,
                            const char *parent_name, int process_chain_depth) {

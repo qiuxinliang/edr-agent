@@ -158,6 +158,33 @@ static void test_ransom_sliding_window_counter(void) {
   assert(strstr(r.detection_context, "\"ransom_behavior\":true") != NULL);
 }
 
+static void test_ransom_note_burst_counter(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+
+  for (int i = 0; i < 2; i++) {
+    char payload[768];
+    snprintf(payload, sizeof(payload),
+             "ETW1\n"
+             "prov=kfile\n"
+             "pid=4998\n"
+             "img=C:\\Users\\alice\\AppData\\Roaming\\sync_update.exe\n"
+             "file=C:\\Users\\alice\\Documents\\HOW_TO_RESTORE_%02d.txt\n",
+             i);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns = 1779338600000000000LL + (int64_t)i * 1000000000LL;
+    edr_behavior_from_slot(&slot, &r);
+  }
+
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.drop);
+  assert(strstr(r.script_snippet, "ransom_note_count=2") != NULL);
+  assert(strstr(r.script_snippet, "ransom_note_burst=1") != NULL);
+  assert(strstr(d.reason, "ransom_note_burst") != NULL);
+  assert(strstr(r.detection_context, "\"ransom_note_burst\":true") != NULL);
+}
+
 static void test_webshell_semantic_bridge_keeps_yara_evidence(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
@@ -256,6 +283,7 @@ int main(void) {
   test_schannel_cert_error_bridge();
   test_ransom_counter_bridge();
   test_ransom_sliding_window_counter();
+  test_ransom_note_burst_counter();
   test_webshell_semantic_bridge_keeps_yara_evidence();
   test_sensor_alias_bridge();
   test_registry_persistence_alias_bridge();

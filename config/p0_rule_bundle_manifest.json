@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r246-01873aec",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r247-ca5faca1",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 160,
   "rules": [
@@ -299,12 +299,13 @@
       ]
     },
     {
-      "id": "R-RANSOM-002",
-      "title": "可疑释放勒索说明文件",
+      "id": "R-RANSOM-003",
+      "title": "勒索前置安全产品终止",
       "severity": 3,
-      "event_type": "file_write",
+      "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1562.001",
         "T1486"
       ]
     },

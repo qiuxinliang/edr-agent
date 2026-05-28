@@ -101,11 +101,18 @@ static int p0_direct_emit_enabled(void) {
 
 static void log_p0_runtime_state(void) {
   edr_p0_rule_ir_lazy_init();
-  fprintf(stderr, "[P0] direct_emit=%s ir_ready=%d rules=%d bundle=%s\n",
+  const char *ir_source = "";
+  const char *ir_sha256 = "";
+  size_t ir_plain_size = 0u;
+  (void)edr_p0_rule_ir_get_bundle_info(&ir_source, &ir_plain_size, &ir_sha256);
+  fprintf(stderr, "[P0] direct_emit=%s ir_ready=%d rules=%d bundle=%s ir_plain_size=%zu ir_sha256=%s ir_source=%s\n",
           p0_direct_emit_enabled() ? "on" : "off",
           edr_p0_rule_ir_is_ready(),
           edr_p0_rule_ir_rule_count(),
-          EDR_P0_RULES_BUNDLE_VERSION);
+          EDR_P0_RULES_BUNDLE_VERSION,
+          ir_plain_size,
+          (ir_sha256 && ir_sha256[0]) ? ir_sha256 : "unknown",
+          (ir_source && ir_source[0]) ? ir_source : "unknown");
 }
 
 static void process_one_slot(const EdrEventSlot *slot) {
