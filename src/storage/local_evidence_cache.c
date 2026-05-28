@@ -33,6 +33,14 @@ typedef struct {
   char cmdline[1024];
   char parent_name[256];
   char parent_path[512];
+  char parent_cmdline[1024];
+  char username[256];
+  char domain[256];
+  char integrity_level[32];
+  uint32_t token_elevation;
+  char exe_hash[65];
+  char current_directory[1024];
+  char process_creation_time[64];
 } ProcSlot;
 
 typedef struct {
@@ -172,7 +180,10 @@ static int should_update_process_cache(const EdrBehaviorRecord *r) {
     return 0;
   }
   return r->process_name[0] || r->exe_path[0] || r->cmdline[0] || r->ppid != 0u ||
-         r->parent_name[0] || r->parent_path[0];
+         r->parent_name[0] || r->parent_path[0] || r->parent_cmdline[0] ||
+         r->username[0] || r->domain[0] || r->integrity_level[0] ||
+         r->token_elevation != 0u || r->exe_hash[0] || r->current_directory[0] ||
+         r->process_creation_time[0];
 }
 
 static void process_cache_update(const EdrBehaviorRecord *r) {
@@ -211,6 +222,30 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   if (r->parent_path[0]) {
     copy_s(p->parent_path, sizeof(p->parent_path), r->parent_path);
   }
+  if (r->parent_cmdline[0]) {
+    copy_s(p->parent_cmdline, sizeof(p->parent_cmdline), r->parent_cmdline);
+  }
+  if (r->username[0]) {
+    copy_s(p->username, sizeof(p->username), r->username);
+  }
+  if (r->domain[0]) {
+    copy_s(p->domain, sizeof(p->domain), r->domain);
+  }
+  if (r->integrity_level[0]) {
+    copy_s(p->integrity_level, sizeof(p->integrity_level), r->integrity_level);
+  }
+  if (r->token_elevation != 0u) {
+    p->token_elevation = r->token_elevation;
+  }
+  if (r->exe_hash[0]) {
+    copy_s(p->exe_hash, sizeof(p->exe_hash), r->exe_hash);
+  }
+  if (r->current_directory[0]) {
+    copy_s(p->current_directory, sizeof(p->current_directory), r->current_directory);
+  }
+  if (r->process_creation_time[0]) {
+    copy_s(p->process_creation_time, sizeof(p->process_creation_time), r->process_creation_time);
+  }
 }
 
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
@@ -236,6 +271,30 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
     }
     if (!r->parent_path[0] && p->parent_path[0]) {
       copy_s(r->parent_path, sizeof(r->parent_path), p->parent_path);
+    }
+    if (!r->parent_cmdline[0] && p->parent_cmdline[0]) {
+      copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), p->parent_cmdline);
+    }
+    if (!r->username[0] && p->username[0]) {
+      copy_s(r->username, sizeof(r->username), p->username);
+    }
+    if (!r->domain[0] && p->domain[0]) {
+      copy_s(r->domain, sizeof(r->domain), p->domain);
+    }
+    if (!r->integrity_level[0] && p->integrity_level[0]) {
+      copy_s(r->integrity_level, sizeof(r->integrity_level), p->integrity_level);
+    }
+    if (r->token_elevation == 0u && p->token_elevation != 0u) {
+      r->token_elevation = p->token_elevation;
+    }
+    if (!r->exe_hash[0] && p->exe_hash[0]) {
+      copy_s(r->exe_hash, sizeof(r->exe_hash), p->exe_hash);
+    }
+    if (!r->current_directory[0] && p->current_directory[0]) {
+      copy_s(r->current_directory, sizeof(r->current_directory), p->current_directory);
+    }
+    if (!r->process_creation_time[0] && p->process_creation_time[0]) {
+      copy_s(r->process_creation_time, sizeof(r->process_creation_time), p->process_creation_time);
     }
   }
   if (!r->parent_name[0] && r->ppid != 0u) {

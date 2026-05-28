@@ -467,8 +467,11 @@ typedef struct {
   char user[256];
   char domain[256];
   char parent_img[EDR_BR_STR_LONG];
+  char parent_cmdline[EDR_BR_STR_LONG];
+  char cwd[EDR_BR_STR_LONG];
   char integrity[64];
   char token_elevation[64];
+  char process_creation_time[96];
   int has_fw;
   unsigned long forensic_frames;
   int has_forensic_frames;
@@ -485,8 +488,11 @@ typedef struct {
   int has_dport;
   int has_sport;
   int has_parent_img;
+  int has_parent_cmdline;
+  int has_cwd;
   int has_integrity;
   int has_token_elevation;
+  int has_process_creation_time;
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
@@ -546,12 +552,21 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "parent_img") == 0 || strcmp(key, "parent_path") == 0) {
     snprintf(f->parent_img, sizeof(f->parent_img), "%s", val);
     f->has_parent_img = 1;
+  } else if (strcmp(key, "parent_cmdline") == 0 || strcmp(key, "parent_cmd") == 0) {
+    snprintf(f->parent_cmdline, sizeof(f->parent_cmdline), "%s", val);
+    f->has_parent_cmdline = 1;
+  } else if (strcmp(key, "current_directory") == 0 || strcmp(key, "cwd") == 0) {
+    snprintf(f->cwd, sizeof(f->cwd), "%s", val);
+    f->has_cwd = 1;
   } else if (strcmp(key, "integrity") == 0 || strcmp(key, "mandatory_label") == 0) {
     snprintf(f->integrity, sizeof(f->integrity), "%s", val);
     f->has_integrity = 1;
   } else if (strcmp(key, "token_elevation") == 0 || strcmp(key, "token_elevation_type") == 0) {
     snprintf(f->token_elevation, sizeof(f->token_elevation), "%s", val);
     f->has_token_elevation = 1;
+  } else if (strcmp(key, "process_creation_time") == 0 || strcmp(key, "create_time") == 0) {
+    snprintf(f->process_creation_time, sizeof(f->process_creation_time), "%s", val);
+    f->has_process_creation_time = 1;
   } else if (strcmp(key, "img") == 0) {
     snprintf(f->img, sizeof(f->img), "%s", val);
     f->has_img = 1;
@@ -823,11 +838,20 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.parent_img);
       snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.parent_img));
     }
+    if (ef.has_parent_cmdline) {
+      snprintf(r->parent_cmdline, sizeof(r->parent_cmdline), "%s", ef.parent_cmdline);
+    }
+    if (ef.has_cwd) {
+      snprintf(r->current_directory, sizeof(r->current_directory), "%s", ef.cwd);
+    }
     if (ef.has_integrity) {
       snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integrity);
     }
     if (ef.has_token_elevation) {
       r->token_elevation = parse_token_elevation_type(ef.token_elevation);
+    }
+    if (ef.has_process_creation_time) {
+      snprintf(r->process_creation_time, sizeof(r->process_creation_time), "%s", ef.process_creation_time);
     }
     if (ef.file[0]) {
       snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
