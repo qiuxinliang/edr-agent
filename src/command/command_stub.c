@@ -87,6 +87,23 @@ static int dangerous_enabled(void) {
   return 0;
 }
 
+static int rtq_readonly_enabled(void) {
+  const char *e = getenv("EDR_RTQ_READONLY_ENABLED");
+  if (e && e[0] == '1') {
+    return 1;
+  }
+  if (e && e[0] == '0') {
+    return 0;
+  }
+  if (dangerous_enabled()) {
+    return 1;
+  }
+  if (s_bound_cfg) {
+    return s_bound_cfg->command.allow_rtq_readonly ? 1 : 0;
+  }
+  return 1;
+}
+
 /** 未设置 `EDR_CMD_KILL_ALLOWLIST` 时不限制；设置后仅允许列表内 pid（逗号分隔） */
 static int kill_pid_allowed(long pid) {
   const char *list = getenv("EDR_CMD_KILL_ALLOWLIST");
@@ -253,6 +270,8 @@ static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrComma
 }
 
 int edr_command_dangerous_enabled(void) { return dangerous_enabled(); }
+
+int edr_command_rtq_readonly_enabled(void) { return rtq_readonly_enabled(); }
 
 void edr_command_audit_both(const char *cmd_id, const char *msg) {
   audit_both(cmd_id, msg ? msg : "");

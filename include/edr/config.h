@@ -176,6 +176,8 @@ typedef struct EdrConfig {
      * 环境变量 `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` 仍为最高优先级。
      */
     bool allow_dangerous;
+    /** Read-only RTQ is separated from RTR/response permissions. */
+    bool allow_rtq_readonly;
     char rtr_shell_allowlist[2048];
     uint32_t rtr_shell_max_timeout_sec;
     char signing_public_key_path[1024];

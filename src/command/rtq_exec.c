@@ -855,10 +855,10 @@ static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *tota
 
 void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                                size_t len, const EdrSoarCommandMeta *sm) {
-    if (!edr_command_dangerous_enabled()) {
+    if (!edr_command_rtq_readonly_enabled()) {
         g_cmd_rejected++;
-        edr_command_audit_both(cmd_id, "reject rtq_execute: policy disabled");
-        edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+        edr_command_audit_both(cmd_id, "reject rtq_execute: readonly RTQ disabled");
+        edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "readonly RTQ disabled");
         return;
     }
 
