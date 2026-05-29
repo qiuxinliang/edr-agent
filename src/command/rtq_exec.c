@@ -10,9 +10,12 @@
 #include <tlhelp32.h>
 #include <iphlpapi.h>
 #include <winevt.h>
+#include <wintrust.h>
+#include <softpub.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "wintrust.lib")
 #endif
 #else
 #include <dirent.h>
@@ -242,6 +245,42 @@ static int hash_file_if_needed(const char *path, const char *expected, char out6
     return str_contains_icase(out65, expected);
 }
 
+#ifdef _WIN32
+static int hash_file_sha256_limited(const char *path, char out65[65]) {
+    out65[0] = '\0';
+    if (!path || !path[0]) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0 || sz > RTQ_FILE_HASH_MAX) { fclose(f); return -1; }
+    rewind(f);
+
+    EdrSha256Ctx ctx;
+    edr_sha256_init(&ctx);
+    unsigned char chunk[32768];
+    for (;;) {
+        size_t n = fread(chunk, 1, sizeof(chunk), f);
+        if (n > 0) edr_sha256_update(&ctx, chunk, n);
+        if (n < sizeof(chunk)) {
+            if (ferror(f)) { fclose(f); return -1; }
+            break;
+        }
+    }
+    fclose(f);
+
+    uint8_t digest[EDR_SHA256_DIGEST_LEN];
+    static const char hx[] = "0123456789abcdef";
+    edr_sha256_final(&ctx, digest);
+    for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; i++) {
+        out65[i * 2] = hx[(digest[i] >> 4) & 0xf];
+        out65[i * 2 + 1] = hx[digest[i] & 0xf];
+    }
+    out65[64] = '\0';
+    return 0;
+}
+#endif
+
 #ifndef _WIN32
 static int append_file_result(rtq_filter *f, const char *path, char *buf, int cap, int *offset, int *total) {
     if (!path || !path[0] || *total >= RTQ_MAX_RESULTS || *offset >= cap - 512) return 0;
@@ -348,6 +387,67 @@ static void query_process_user(DWORD pid, char *user, size_t cap) {
     CloseHandle(hp);
 }
 
+static void query_process_integrity_level(DWORD pid, char *level, size_t cap) {
+    if (!level || cap == 0) return;
+    level[0] = '\0';
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return;
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(hp, TOKEN_QUERY, &tok)) { CloseHandle(hp); return; }
+    DWORD need = 0;
+    GetTokenInformation(tok, TokenIntegrityLevel, NULL, 0, &need);
+    TOKEN_MANDATORY_LABEL *tml = (TOKEN_MANDATORY_LABEL *)malloc(need);
+    if (tml && GetTokenInformation(tok, TokenIntegrityLevel, tml, need, &need)) {
+        DWORD rid = *GetSidSubAuthority(
+            tml->Label.Sid,
+            (DWORD)(*GetSidSubAuthorityCount(tml->Label.Sid) - 1));
+        const char *name = "unknown";
+        if (rid >= SECURITY_MANDATORY_PROTECTED_PROCESS_RID) name = "protected_process";
+        else if (rid >= SECURITY_MANDATORY_SYSTEM_RID) name = "system";
+        else if (rid >= SECURITY_MANDATORY_HIGH_RID) name = "high";
+        else if (rid >= SECURITY_MANDATORY_MEDIUM_RID) name = "medium";
+        else if (rid >= SECURITY_MANDATORY_LOW_RID) name = "low";
+        else if (rid >= SECURITY_MANDATORY_UNTRUSTED_RID) name = "untrusted";
+        snprintf(level, cap, "%s", name);
+    }
+    free(tml);
+    CloseHandle(tok);
+    CloseHandle(hp);
+}
+
+static void query_file_signature_status(const char *path, char *status, size_t cap) {
+    if (!status || cap == 0) return;
+    status[0] = '\0';
+    if (!path || !path[0]) return;
+    wchar_t wpath[MAX_PATH * 2];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0 &&
+        MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0) {
+        snprintf(status, cap, "unknown");
+        return;
+    }
+
+    WINTRUST_FILE_INFO file_info;
+    memset(&file_info, 0, sizeof(file_info));
+    file_info.cbStruct = sizeof(file_info);
+    file_info.pcwszFilePath = wpath;
+
+    WINTRUST_DATA trust_data;
+    memset(&trust_data, 0, sizeof(trust_data));
+    trust_data.cbStruct = sizeof(trust_data);
+    trust_data.dwUIChoice = WTD_UI_NONE;
+    trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trust_data.dwUnionChoice = WTD_CHOICE_FILE;
+    trust_data.pFile = &file_info;
+    trust_data.dwStateAction = WTD_STATEACTION_IGNORE;
+    trust_data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG rc = WinVerifyTrust(NULL, &action, &trust_data);
+    if (rc == ERROR_SUCCESS) snprintf(status, cap, "trusted");
+    else if (rc == TRUST_E_NOSIGNATURE) snprintf(status, cap, "unsigned");
+    else snprintf(status, cap, "untrusted");
+}
+
 static void query_process_cmdline_wmic(DWORD pid, char *cmd, size_t cap) {
     if (!cmd || cap == 0) return;
     cmd[0] = '\0';
@@ -370,6 +470,74 @@ static void query_process_cmdline_wmic(DWORD pid, char *cmd, size_t cap) {
     _pclose(p);
 }
 
+static void ipv4_to_text(DWORD addr, char *out, size_t cap);
+static const char *tcp_state_text(DWORD s);
+
+static void append_process_network_by_pid(DWORD pid, char *buf, int cap, int *offset) {
+    if (!buf || !offset || pid == 0 || *offset >= cap - 256) return;
+    int started = 0;
+    int added = 0;
+    DWORD sz = 0;
+
+#define RTQ_NET_ARRAY_BEGIN() do { \
+    if (!started) { \
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"network_by_pid\":["); \
+        started = 1; \
+    } \
+} while (0)
+#define RTQ_NET_ARRAY_SEP() do { \
+    if (added > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ","); \
+} while (0)
+
+    GetExtendedTcpTable(NULL, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    PMIB_TCPTABLE_OWNER_PID tcp = (PMIB_TCPTABLE_OWNER_PID)malloc(sz);
+    if (tcp && GetExtendedTcpTable(tcp, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < tcp->dwNumEntries && added < 16 && *offset < cap - 512; i++) {
+            if (tcp->table[i].dwOwningPid != pid) continue;
+            char lip[64], rip[64];
+            ipv4_to_text(tcp->table[i].dwLocalAddr, lip, sizeof(lip));
+            ipv4_to_text(tcp->table[i].dwRemoteAddr, rip, sizeof(rip));
+            int lp = ntohs((u_short)tcp->table[i].dwLocalPort);
+            int rp = ntohs((u_short)tcp->table[i].dwRemotePort);
+            RTQ_NET_ARRAY_BEGIN();
+            RTQ_NET_ARRAY_SEP();
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"proto\":\"tcp\"");
+            append_json_kv_str(buf, cap, offset, "state", tcp_state_text(tcp->table[i].dwState));
+            append_json_kv_str(buf, cap, offset, "local_ip", lip);
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"local_port\":%d", lp);
+            append_json_kv_str(buf, cap, offset, "remote_ip", rip);
+            if (rp > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"remote_port\":%d", rp);
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
+            added++;
+        }
+    }
+    free(tcp);
+
+    sz = 0;
+    GetExtendedUdpTable(NULL, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    PMIB_UDPTABLE_OWNER_PID udp = (PMIB_UDPTABLE_OWNER_PID)malloc(sz);
+    if (udp && GetExtendedUdpTable(udp, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+        for (DWORD i = 0; i < udp->dwNumEntries && added < 16 && *offset < cap - 512; i++) {
+            if (udp->table[i].dwOwningPid != pid) continue;
+            char lip[64];
+            ipv4_to_text(udp->table[i].dwLocalAddr, lip, sizeof(lip));
+            int lp = ntohs((u_short)udp->table[i].dwLocalPort);
+            RTQ_NET_ARRAY_BEGIN();
+            RTQ_NET_ARRAY_SEP();
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"proto\":\"udp\"");
+            append_json_kv_str(buf, cap, offset, "local_ip", lip);
+            *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"local_port\":%d}", lp);
+            added++;
+        }
+    }
+    free(udp);
+
+    if (started) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "]");
+
+#undef RTQ_NET_ARRAY_BEGIN
+#undef RTQ_NET_ARRAY_SEP
+}
+
 static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
     HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -389,7 +557,13 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
             char path[520] = {0};
             char user[260] = {0};
             char cmdline[2048] = {0};
-            if (ok && (f->process_path[0] || f->process_cmdline[0] || f->script_content[0])) {
+            char integrity[64] = {0};
+            char exe_sha256[65] = {0};
+            char signature[32] = {0};
+            char parent_path[520] = {0};
+            char parent_cmdline[2048] = {0};
+            char parent_name[260] = {0};
+            if (ok && f->process_path[0]) {
                 query_process_path(pe.th32ProcessID, path, sizeof(path));
                 if (!path[0] || !str_contains_icase(path, f->process_path)) ok = 0;
             }
@@ -403,7 +577,24 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
                 if (f->script_engine[0] && !str_contains_icase(cmdline, f->script_engine)) ok = 0;
             }
 
-            if (ok && *total < RTQ_MAX_RESULTS && *offset < cap - 1024) {
+            if (ok && *total < RTQ_MAX_RESULTS && *offset < cap - 8192) {
+                if (!path[0]) query_process_path(pe.th32ProcessID, path, sizeof(path));
+                if (!user[0]) query_process_user(pe.th32ProcessID, user, sizeof(user));
+                if (!cmdline[0]) query_process_cmdline_wmic(pe.th32ProcessID, cmdline, sizeof(cmdline));
+                query_process_integrity_level(pe.th32ProcessID, integrity, sizeof(integrity));
+                if (path[0]) {
+                    (void)hash_file_sha256_limited(path, exe_sha256);
+                    query_file_signature_status(path, signature, sizeof(signature));
+                }
+                if (pe.th32ParentProcessID > 0) {
+                    query_process_path(pe.th32ParentProcessID, parent_path, sizeof(parent_path));
+                    query_process_cmdline_wmic(pe.th32ParentProcessID, parent_cmdline, sizeof(parent_cmdline));
+                    if (parent_path[0]) {
+                        const char *base = strrchr(parent_path, '\\');
+                        snprintf(parent_name, sizeof(parent_name), "%s", base ? base + 1 : parent_path);
+                    }
+                }
+
                 if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
                     "{\"type\":\"process\",\"pid\":%lu,\"name\":\"", (unsigned long)pe.th32ProcessID);
@@ -413,6 +604,13 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
                 if (path[0]) append_json_kv_str(buf, cap, offset, "path", path);
                 if (user[0]) append_json_kv_str(buf, cap, offset, "user", user);
                 if (cmdline[0]) append_json_kv_str(buf, cap, offset, "cmdline", cmdline);
+                if (integrity[0]) append_json_kv_str(buf, cap, offset, "integrity_level", integrity);
+                if (exe_sha256[0]) append_json_kv_str(buf, cap, offset, "exe_hash", exe_sha256);
+                if (signature[0]) append_json_kv_str(buf, cap, offset, "signature", signature);
+                if (parent_name[0]) append_json_kv_str(buf, cap, offset, "parent_name", parent_name);
+                if (parent_path[0]) append_json_kv_str(buf, cap, offset, "parent_path", parent_path);
+                if (parent_cmdline[0]) append_json_kv_str(buf, cap, offset, "parent_cmdline", parent_cmdline);
+                append_process_network_by_pid(pe.th32ProcessID, buf, cap, offset);
                 *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
                 (*total)++;
                 count++;
