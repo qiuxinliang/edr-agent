@@ -198,6 +198,10 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
       L"ImageFileName", L"ImageName", L"Filename", L"ProcessName", L"NewProcessName",
       L"ApplicationName",
   };
+  static const PCWSTR parent_proc_try[] = {
+      L"ParentProcessName", L"ParentImageName", L"ParentImage", L"ParentProcessPath",
+      L"CreatorProcessName",
+  };
   static const PCWSTR file_try[] = {
       L"FileName", L"OpenPath", L"Path", L"FileObject",
   };
@@ -220,6 +224,10 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
 
   (void)edr_prop_first_utf8(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]),
                             out_event->process_name, sizeof(out_event->process_name));
+  (void)edr_prop_first_utf8(rec, parent_proc_try,
+                            sizeof(parent_proc_try) / sizeof(parent_proc_try[0]),
+                            out_event->parent_process_name,
+                            sizeof(out_event->parent_process_name));
   if (edr_prop_first_utf8(rec, pid_try, sizeof(pid_try) / sizeof(pid_try[0]), tmp, sizeof(tmp))) {
     uint32_t pid = edr_parse_u32_ascii(tmp);
     if (pid != 0u) {
@@ -280,6 +288,13 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"ProcessName", "img"}, {L"NewProcessName", "img"}, {L"ApplicationName", "img"},
       {L"CommandLine", "cmd"}, {L"Commandline", "cmd"},
       {L"ProcessCommandLine", "cmd"}, {L"Command", "cmd"},
+      {L"ParentProcessName", "parent_img"}, {L"ParentImageName", "parent_img"},
+      {L"ParentImage", "parent_img"}, {L"ParentProcessPath", "parent_img"},
+      {L"CreatorProcessName", "parent_img"},
+      {L"ParentCommandLine", "parent_cmdline"},
+      {L"ParentProcessCommandLine", "parent_cmdline"},
+      {L"CreatorCommandLine", "parent_cmdline"},
+      {L"CurrentDirectory", "cwd"}, {L"WorkingDirectory", "cwd"},
       {L"ParentProcessId", "ppid"}, {L"ParentProcessID", "ppid"},
       {L"ParentID", "ppid"}, {L"ParentId", "ppid"}, {L"CreatorProcessId", "ppid"},
       {L"ProcessId", "epid"}, {L"ProcessID", "epid"}, {L"PID", "epid"},
@@ -360,6 +375,16 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"NewProcessName", "img"},
       {L"ProcessName", "img"},
       {L"CommandLine", "cmd"},
+      {L"ParentProcessName", "parent_img"},
+      {L"ParentImageName", "parent_img"},
+      {L"ParentImage", "parent_img"},
+      {L"ParentProcessPath", "parent_img"},
+      {L"CreatorProcessName", "parent_img"},
+      {L"ParentCommandLine", "parent_cmdline"},
+      {L"ParentProcessCommandLine", "parent_cmdline"},
+      {L"CreatorCommandLine", "parent_cmdline"},
+      {L"CurrentDirectory", "cwd"},
+      {L"WorkingDirectory", "cwd"},
       {L"NewProcessId", "epid"},
       {L"NewProcessID", "epid"},
       {L"ProcessId", "epid"},

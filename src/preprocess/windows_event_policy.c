@@ -245,8 +245,10 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
   };
   static const char *const noisy_dirs[] = {
       "\\windows\\prefetch\\", "\\windows\\softwaredistribution\\",
-      "\\windows\\logs\\", "\\windows\\system32\\winevt\\logs\\",
+      "\\windows\\logs\\", "\\windows\\temp\\", "\\windows\\system32\\winevt\\logs\\",
+      "\\windows\\system32\\config\\systemprofile\\appdata\\local\\",
       "\\programdata\\microsoft\\windows defender\\",
+      "\\programdata\\microsoft\\windows\\werm\\",
       "\\appdata\\local\\microsoft\\windows\\inetcache\\",
       "\\appdata\\local\\microsoft\\edge\\user data\\",
       "\\appdata\\local\\google\\chrome\\user data\\",
@@ -309,11 +311,24 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
   }
   if (!p->high_value && g_event_filter_cfg.low_value_file_process &&
       (process_name_is(r, "cleanmgr.exe") || process_name_is(r, "taskmgr.exe") ||
-       process_name_is(r, "wmiprvse.exe"))) {
+       process_name_is(r, "wmiprvse.exe") || process_name_is(r, "trustedinstaller.exe") ||
+       process_name_is(r, "tiworker.exe") || process_name_is(r, "searchindexer.exe") ||
+       process_name_is(r, "searchprotocolhost.exe") ||
+       process_name_is(r, "searchfilterhost.exe") ||
+       process_name_is(r, "compattelrunner.exe") || process_name_is(r, "runtimebroker.exe") ||
+       process_name_is(r, "backgroundtaskhost.exe") ||
+       process_name_is(r, "microsoftedgeupdate.exe") ||
+       process_name_is(r, "officeclicktorun.exe") || process_name_is(r, "msmpeng.exe") ||
+       process_name_is(r, "nissrv.exe"))) {
     mark_noisy(p, "known_low_value_file_process", "noise_process");
   }
   if (!p->high_value && g_event_filter_cfg.low_value_file_suffix &&
-      (has_ci_path(path, ":wofcompresseddata") || has_ci_path(path, ".js.map"))) {
+      (has_ci_path(path, ":wofcompresseddata") || has_ci_path(path, ".js.map") ||
+       has_ci_path(path, ".tmp") || has_ci_path(path, ".etl") || has_ci_path(path, ".blf") ||
+       has_ci_path(path, ".regtrans-ms") || has_ci_path(path, ".cache") ||
+       (has_ci_path(path, "\\appdata\\local\\temp\\") &&
+        (has_ci_path(path, ".log") || has_ci_path(path, ".dat") ||
+         has_ci_path(path, ".json") || has_ci_path(path, ".xml"))))) {
     mark_noisy(p, "known_low_value_file_suffix", "noise_suffix");
   }
 }
@@ -413,10 +428,10 @@ void edr_windows_event_policy_evaluate(const EdrBehaviorRecord *r,
     return;
   }
 
-  if (r->priority == 0u || has_ci_path(r->detection_context, "\"confidence\":0.7") ||
+  if (!out->noisy && (r->priority == 0u || has_ci_path(r->detection_context, "\"confidence\":0.7") ||
       has_ci_path(r->detection_context, "\"confidence\":0.8") ||
       has_ci_path(r->detection_context, "\"confidence\":0.9") ||
-      has_ci_path(r->detection_context, "\"confidence\":1")) {
+      has_ci_path(r->detection_context, "\"confidence\":1"))) {
     out->should_emit = 1u;
     out->should_persist = 1u;
   }

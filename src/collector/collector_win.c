@@ -1225,6 +1225,8 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   out_health->sensor_interest_registry_prefixes = si.registry_prefix_count;
   out_health->sensor_interest_registry_contains = si.registry_contains_count;
   out_health->sensor_interest_cmd_tokens = si.cmd_token_count;
+  out_health->sensor_interest_parent_child_pairs = si.parent_child_pair_count;
+  out_health->sensor_interest_required_fields = si.attack_stage_required_field_count;
   out_health->sensor_interest_checked = si.checked;
   out_health->sensor_interest_matched = si.matched;
   out_health->sensor_interest_dropped = si.dropped;
@@ -1234,6 +1236,7 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   out_health->sensor_interest_port_hits = si.port_hits;
   out_health->sensor_interest_path_hits = si.path_hits;
   out_health->sensor_interest_registry_hits = si.registry_hits;
+  out_health->sensor_interest_parent_child_hits = si.parent_child_hits;
   memset(&adaptive, 0, sizeof(adaptive));
   edr_adaptive_collection_get_status(&adaptive);
   out_health->adaptive_collection_enabled = adaptive.enabled;

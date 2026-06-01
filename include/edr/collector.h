@@ -82,6 +82,8 @@ typedef struct {
     uint32_t sensor_interest_registry_prefixes;
     uint32_t sensor_interest_registry_contains;
     uint32_t sensor_interest_cmd_tokens;
+    uint32_t sensor_interest_parent_child_pairs;
+    uint32_t sensor_interest_required_fields;
     uint64_t sensor_interest_checked;
     uint64_t sensor_interest_matched;
     uint64_t sensor_interest_dropped;
@@ -91,6 +93,7 @@ typedef struct {
     uint64_t sensor_interest_port_hits;
     uint64_t sensor_interest_path_hits;
     uint64_t sensor_interest_registry_hits;
+    uint64_t sensor_interest_parent_child_hits;
     int adaptive_collection_enabled;
     int adaptive_collection_active;
     uint32_t adaptive_collection_ttl_s;

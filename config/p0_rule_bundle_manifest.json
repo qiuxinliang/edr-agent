@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r247-ca5faca1",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r247-471cb221",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 160,
   "rules": [
@@ -279,7 +279,7 @@
     },
     {
       "id": "R-WEBSHELL-002",
-      "title": "Web 服务进程执行系统命令",
+      "title": "Web 服务进程启动高风险子进程",
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,

@@ -24,10 +24,17 @@
 #define EDR_SI_MAX_CONTAINS 256u
 #define EDR_SI_MAX_TOKEN 256u
 #define EDR_SI_MAX_ENTRY 384u
+#define EDR_SI_MAX_PAIR 384u
+#define EDR_SI_MAX_FIELD 512u
 
 typedef struct {
   char value[EDR_SI_MAX_ENTRY];
 } EdrSIEntry;
+
+typedef struct {
+  char parent[128];
+  char child[128];
+} EdrSIPair;
 
 typedef struct {
   char value[128];
@@ -51,11 +58,15 @@ typedef struct {
   EdrSIEntry reg_prefix[EDR_SI_MAX_PREFIX];
   EdrSIEntry reg_contains[EDR_SI_MAX_CONTAINS];
   EdrSIEntry cmd_tokens[EDR_SI_MAX_TOKEN];
+  EdrSIPair parent_child[EDR_SI_MAX_PAIR];
+  EdrSIEntry required_fields[EDR_SI_MAX_FIELD];
   uint32_t n_file_prefix;
   uint32_t n_file_contains;
   uint32_t n_reg_prefix;
   uint32_t n_reg_contains;
   uint32_t n_cmd_tokens;
+  uint32_t n_parent_child;
+  uint32_t n_required_fields;
   volatile uint64_t checked;
   volatile uint64_t matched;
   volatile uint64_t dropped;
@@ -65,6 +76,7 @@ typedef struct {
   volatile uint64_t port_hits;
   volatile uint64_t path_hits;
   volatile uint64_t registry_hits;
+  volatile uint64_t parent_child_hits;
 } EdrSensorInterestState;
 
 static EdrSensorInterestState s_si;
@@ -238,6 +250,51 @@ static void edr_si_add_entry(EdrSIEntry *arr, uint32_t *count, uint32_t max_coun
   (*count)++;
 }
 
+static void edr_si_add_parent_child_pair(const char *parent_name, const char *child_name) {
+  char parent[128];
+  char child[128];
+  if (!parent_name || !parent_name[0] || !child_name || !child_name[0] ||
+      s_si.n_parent_child >= EDR_SI_MAX_PAIR) {
+    return;
+  }
+  edr_si_norm(parent, sizeof(parent), edr_si_basename(parent_name));
+  edr_si_norm(child, sizeof(child), edr_si_basename(child_name));
+  if (!parent[0] || !child[0]) {
+    return;
+  }
+  for (uint32_t i = 0; i < s_si.n_parent_child; i++) {
+    if (strcmp(s_si.parent_child[i].parent, parent) == 0 &&
+        strcmp(s_si.parent_child[i].child, child) == 0) {
+      return;
+    }
+  }
+  snprintf(s_si.parent_child[s_si.n_parent_child].parent,
+           sizeof(s_si.parent_child[s_si.n_parent_child].parent), "%s", parent);
+  snprintf(s_si.parent_child[s_si.n_parent_child].child,
+           sizeof(s_si.parent_child[s_si.n_parent_child].child), "%s", child);
+  s_si.n_parent_child++;
+}
+
+static int edr_si_parent_child_matches(const char *parent_name, const char *child_name) {
+  char parent[128];
+  char child[128];
+  if (!parent_name || !parent_name[0] || !child_name || !child_name[0]) {
+    return 0;
+  }
+  edr_si_norm(parent, sizeof(parent), edr_si_basename(parent_name));
+  edr_si_norm(child, sizeof(child), edr_si_basename(child_name));
+  if (!parent[0] || !child[0]) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < s_si.n_parent_child; i++) {
+    if (strcmp(s_si.parent_child[i].parent, parent) == 0 &&
+        strcmp(s_si.parent_child[i].child, child) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void edr_si_add_process_name(const char *name) {
   char norm[128];
   uint32_t h;
@@ -358,6 +415,46 @@ static void edr_si_add_json_port_array(cJSON *root, const char *name) {
   cJSON_ArrayForEach(it, a) {
     if (cJSON_IsNumber(it) && it->valuedouble > 0 && it->valuedouble <= 65535.0) {
       edr_si_port_set((uint32_t)it->valuedouble);
+    }
+  }
+}
+
+static void edr_si_add_json_parent_child_pairs(cJSON *root, const char *name) {
+  cJSON *a = cJSON_GetObjectItemCaseSensitive(root, name);
+  if (!cJSON_IsArray(a)) {
+    return;
+  }
+  cJSON *it;
+  cJSON_ArrayForEach(it, a) {
+    cJSON *parent = cJSON_GetObjectItemCaseSensitive(it, "parent");
+    cJSON *child = cJSON_GetObjectItemCaseSensitive(it, "child");
+    if (cJSON_IsString(parent) && parent->valuestring &&
+        cJSON_IsString(child) && child->valuestring) {
+      edr_si_add_parent_child_pair(parent->valuestring, child->valuestring);
+    }
+  }
+}
+
+static void edr_si_add_json_required_fields(cJSON *root, const char *name) {
+  cJSON *a = cJSON_GetObjectItemCaseSensitive(root, name);
+  if (!cJSON_IsArray(a)) {
+    return;
+  }
+  cJSON *it;
+  cJSON_ArrayForEach(it, a) {
+    cJSON *fields = cJSON_GetObjectItemCaseSensitive(it, "required_fields");
+    if (!cJSON_IsArray(fields)) {
+      fields = cJSON_GetObjectItemCaseSensitive(it, "fields");
+    }
+    if (!cJSON_IsArray(fields)) {
+      continue;
+    }
+    cJSON *field;
+    cJSON_ArrayForEach(field, fields) {
+      if (cJSON_IsString(field) && field->valuestring) {
+        edr_si_add_entry(s_si.required_fields, &s_si.n_required_fields, EDR_SI_MAX_FIELD,
+                         field->valuestring, 0);
+      }
     }
   }
 }
@@ -507,15 +604,18 @@ static int edr_si_load_json_doc(const char *label, const char *json, size_t len)
                                &s_si.n_reg_prefix, EDR_SI_MAX_PREFIX, 0);
   edr_si_add_json_string_array(root, "registry_path_contains", s_si.reg_contains,
                                &s_si.n_reg_contains, EDR_SI_MAX_CONTAINS, 0);
+  edr_si_add_json_parent_child_pairs(root, "parent_child_pairs");
+  edr_si_add_json_required_fields(root, "attack_stage_required_fields");
   cJSON_Delete(root);
   s_si.loaded = 1;
   if (!s_si.version[0]) {
     snprintf(s_si.version, sizeof(s_si.version), "%s", "sensor-interest-v1-builtin");
   }
   fprintf(stderr,
-          "[sensor_interest] loaded %s ports=%u proc=%u file=%u/%u reg=%u/%u\n",
+          "[sensor_interest] loaded %s ports=%u proc=%u file=%u/%u reg=%u/%u pairs=%u fields=%u\n",
           s_si.version, s_si.n_ports, s_si.n_proc_hash, s_si.n_file_prefix,
-          s_si.n_file_contains, s_si.n_reg_prefix, s_si.n_reg_contains);
+          s_si.n_file_contains, s_si.n_reg_prefix, s_si.n_reg_contains,
+          s_si.n_parent_child, s_si.n_required_fields);
   return 0;
 }
 
@@ -725,6 +825,11 @@ int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
     edr_si_inc64(&s_si.matched);
     return 1;
   }
+  if (edr_si_parent_child_matches(event->parent_process_name, event->process_name)) {
+    edr_si_inc64(&s_si.parent_child_hits);
+    edr_si_inc64(&s_si.matched);
+    return 1;
+  }
 
   switch (event->type) {
   case EDR_EVENT_PROCESS_CREATE:
@@ -821,6 +926,8 @@ void edr_sensor_interest_get_status(EdrSensorInterestStatus *out_status) {
   out_status->registry_prefix_count = s_si.n_reg_prefix;
   out_status->registry_contains_count = s_si.n_reg_contains;
   out_status->cmd_token_count = s_si.n_cmd_tokens;
+  out_status->parent_child_pair_count = s_si.n_parent_child;
+  out_status->attack_stage_required_field_count = s_si.n_required_fields;
   out_status->checked = edr_si_load64(&s_si.checked);
   out_status->matched = edr_si_load64(&s_si.matched);
   out_status->dropped = edr_si_load64(&s_si.dropped);
@@ -830,6 +937,7 @@ void edr_sensor_interest_get_status(EdrSensorInterestStatus *out_status) {
   out_status->port_hits = edr_si_load64(&s_si.port_hits);
   out_status->path_hits = edr_si_load64(&s_si.path_hits);
   out_status->registry_hits = edr_si_load64(&s_si.registry_hits);
+  out_status->parent_child_hits = edr_si_load64(&s_si.parent_child_hits);
 }
 
 int edr_sensor_interest_replace_manifest_from_file(const char *src_path) {

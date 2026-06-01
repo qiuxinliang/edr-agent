@@ -538,9 +538,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"rules_version\":\"%s\",\"process_names\":%u,\"process_prefixes\":%u,"
       "\"ports\":%u,\"file_prefixes\":%u,\"file_contains\":%u,"
       "\"registry_prefixes\":%u,\"registry_contains\":%u,\"cmd_tokens\":%u,"
+      "\"parent_child_pairs\":%u,\"required_fields\":%u,"
       "\"checked\":%llu,\"matched\":%llu,\"dropped\":%llu,"
       "\"provider_hits\":%llu,\"adaptive_hits\":%llu,\"process_hits\":%llu,\"port_hits\":%llu,"
-      "\"path_hits\":%llu,\"registry_hits\":%llu}},"
+      "\"path_hits\":%llu,\"registry_hits\":%llu,\"parent_child_hits\":%llu}},"
       "\"ave\":{\"enabled\":%s,\"mode\":\"triggered\",\"static_model_version\":\"%s\","
       "\"behavior_model_version\":\"%s\",\"ioc_rules_version\":\"%s\","
       "\"queue_depth\":%d,\"queue_capacity\":%u,\"active_scans\":%d,"
@@ -656,7 +657,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.sensor_interest_process_names, ch.sensor_interest_process_prefixes,
       ch.sensor_interest_ports, ch.sensor_interest_file_prefixes, ch.sensor_interest_file_contains,
       ch.sensor_interest_registry_prefixes, ch.sensor_interest_registry_contains,
-      ch.sensor_interest_cmd_tokens, (unsigned long long)ch.sensor_interest_checked,
+      ch.sensor_interest_cmd_tokens, ch.sensor_interest_parent_child_pairs,
+      ch.sensor_interest_required_fields, (unsigned long long)ch.sensor_interest_checked,
       (unsigned long long)ch.sensor_interest_matched, (unsigned long long)ch.sensor_interest_dropped,
       (unsigned long long)ch.sensor_interest_provider_hits,
       (unsigned long long)ch.sensor_interest_adaptive_hits,
@@ -664,6 +666,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.sensor_interest_port_hits,
       (unsigned long long)ch.sensor_interest_path_hits,
       (unsigned long long)ch.sensor_interest_registry_hits,
+      (unsigned long long)ch.sensor_interest_parent_child_hits,
       ave_ok && avst.initialized ? "true" : "false", static_ver, behavior_ver, ioc_ver,
       ave_ok ? avst.behavior_event_queue_size : 0, ave_ok ? avst.behavior_queue_capacity : 0u,
       ave_ok ? avst.active_scan_count : 0,

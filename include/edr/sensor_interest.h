@@ -15,6 +15,7 @@ typedef struct {
   uint32_t parent_pid;
   uint32_t remote_port;
   char process_name[256];
+  char parent_process_name[256];
   char path[1024];
   char registry_path[1024];
 } EdrSensorInterestEvent;
@@ -32,6 +33,8 @@ typedef struct {
   uint32_t registry_prefix_count;
   uint32_t registry_contains_count;
   uint32_t cmd_token_count;
+  uint32_t parent_child_pair_count;
+  uint32_t attack_stage_required_field_count;
   uint64_t checked;
   uint64_t matched;
   uint64_t dropped;
@@ -41,6 +44,7 @@ typedef struct {
   uint64_t port_hits;
   uint64_t path_hits;
   uint64_t registry_hits;
+  uint64_t parent_child_hits;
 } EdrSensorInterestStatus;
 
 void edr_sensor_interest_lazy_init(void);
