@@ -9,6 +9,7 @@
 #include "edr/ave_behavior_gates.h"
 #include "edr/ingest_http.h"
 #include "edr/pid_history.h"
+#include "edr/resource.h"
 
 #include "ave_lf_mpmc.h"
 #include "ave_onnx_infer.h"
@@ -52,8 +53,20 @@ static EdrBpMetric64 s_bp_beh_infer_fail;
 static EdrBpMetric64 s_bp_feed_total;
 static EdrBpMetric64 s_bp_queue_enqueued;
 static EdrBpMetric64 s_bp_queue_full_fallback;
+static EdrBpMetric64 s_bp_queue_full_dropped;
 static EdrBpMetric64 s_bp_feed_sync_bypass;
 static EdrBpMetric64 s_bp_worker_dequeued;
+static EdrBpMetric64 s_bp_infer_budget_dropped;
+static EdrBpMetric64 s_bp_pressure_feed_dropped;
+static EdrBpMetric64 s_bp_pressure_infer_dropped;
+static uint32_t s_bp_behavior_infer_per_min;
+static uint32_t s_bp_low_priority_keep_percent_under_pressure;
+static int64_t s_bp_infer_budget_window_ns;
+static uint32_t s_bp_infer_budget_count;
+static uint32_t s_bp_infer_latency_ms[64];
+static uint32_t s_bp_infer_latency_pos;
+static uint32_t s_bp_infer_latency_count;
+static uint32_t s_bp_infer_latency_last_ms;
 
 static void bp_reset_metrics(void) {
   bp_metric_store(&s_bp_beh_infer_ok, 0u);
@@ -61,8 +74,18 @@ static void bp_reset_metrics(void) {
   bp_metric_store(&s_bp_feed_total, 0u);
   bp_metric_store(&s_bp_queue_enqueued, 0u);
   bp_metric_store(&s_bp_queue_full_fallback, 0u);
+  bp_metric_store(&s_bp_queue_full_dropped, 0u);
   bp_metric_store(&s_bp_feed_sync_bypass, 0u);
   bp_metric_store(&s_bp_worker_dequeued, 0u);
+  bp_metric_store(&s_bp_infer_budget_dropped, 0u);
+  bp_metric_store(&s_bp_pressure_feed_dropped, 0u);
+  bp_metric_store(&s_bp_pressure_infer_dropped, 0u);
+  s_bp_infer_budget_window_ns = 0;
+  s_bp_infer_budget_count = 0u;
+  s_bp_infer_latency_pos = 0u;
+  s_bp_infer_latency_count = 0u;
+  s_bp_infer_latency_last_ms = 0u;
+  memset(s_bp_infer_latency_ms, 0, sizeof(s_bp_infer_latency_ms));
 }
 
 static int bp_str_has_ci(const char *hay, const char *needle);
@@ -275,7 +298,7 @@ static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, con
   if (sl->consecutive_medium_scores >= EDR_AVE_BEH_MEDIUM_RUN_LEN_FOR_STEP_TIGHT) {
     step = EDR_AVE_BEH_INFER_STEP_TIGHT;
   }
-  
+
   // 动态调整：根据当前异常分数调整阈值（性能优化）
   if (env_dynamic_threshold_enabled()) {
     if (sl->anomaly < 0.1f) {
@@ -285,7 +308,7 @@ static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, con
       return (step > 1) ? (step / 2) : step;
     }
   }
-  
+
   return step;
 }
 
@@ -357,6 +380,126 @@ static int64_t wall_ns(void) {
   }
   return (int64_t)tv.tv_sec * 1000000000LL + (int64_t)tv.tv_usec * 1000LL;
 #endif
+}
+
+void edr_ave_bp_configure_resource_limits(const struct EdrConfig *cfg) {
+  uint32_t v = cfg ? cfg->resource_limit.behavior_infer_per_min : 30u;
+  uint32_t keep = cfg ? cfg->resource_limit.low_priority_keep_percent_under_pressure : 5u;
+  if (keep > 100u) {
+    keep = 100u;
+  }
+  lock_bp();
+  s_bp_behavior_infer_per_min = v;
+  s_bp_low_priority_keep_percent_under_pressure = keep;
+  unlock_bp();
+}
+
+static int bp_pressure_active(void) {
+  return edr_resource_preprocess_throttle_active() ? 1 : 0;
+}
+
+static uint32_t bp_effective_behavior_infer_limit(void) {
+  uint32_t limit = s_bp_behavior_infer_per_min;
+  if (limit == 0u || !bp_pressure_active()) {
+    return limit;
+  }
+  uint32_t keep = s_bp_low_priority_keep_percent_under_pressure;
+  if (keep == 0u) {
+    return 0u;
+  }
+  uint64_t scaled = ((uint64_t)limit * (uint64_t)keep + 99ULL) / 100ULL;
+  if (scaled == 0u) {
+    scaled = 1u;
+  }
+  return scaled > 0xffffffffULL ? 0xffffffffu : (uint32_t)scaled;
+}
+
+static int bp_behavior_infer_budget_allow(int64_t now_ns) {
+  uint32_t configured = s_bp_behavior_infer_per_min;
+  uint32_t limit = bp_effective_behavior_infer_limit();
+  if (limit == 0u) {
+    (void)bp_metric_inc(&s_bp_infer_budget_dropped);
+    if (configured > 0u && bp_pressure_active()) {
+      (void)bp_metric_inc(&s_bp_pressure_infer_dropped);
+    }
+    return 0;
+  }
+  if (s_bp_infer_budget_window_ns == 0 || now_ns < s_bp_infer_budget_window_ns ||
+      now_ns - s_bp_infer_budget_window_ns >= 60000000000LL) {
+    s_bp_infer_budget_window_ns = now_ns;
+    s_bp_infer_budget_count = 0u;
+  }
+  if (s_bp_infer_budget_count >= limit) {
+    (void)bp_metric_inc(&s_bp_infer_budget_dropped);
+    if (limit < configured && bp_pressure_active()) {
+      (void)bp_metric_inc(&s_bp_pressure_infer_dropped);
+    }
+    return 0;
+  }
+  s_bp_infer_budget_count++;
+  return 1;
+}
+
+static void bp_record_infer_latency_ms(uint32_t ms) {
+  s_bp_infer_latency_last_ms = ms;
+  s_bp_infer_latency_ms[s_bp_infer_latency_pos++ % 64u] = ms;
+  if (s_bp_infer_latency_count < 64u) {
+    s_bp_infer_latency_count++;
+  }
+}
+
+static uint32_t bp_latency_p95_ms(void) {
+  uint32_t n = s_bp_infer_latency_count;
+  if (n == 0u) {
+    return 0u;
+  }
+  uint32_t tmp[64];
+  for (uint32_t i = 0; i < n; i++) {
+    tmp[i] = s_bp_infer_latency_ms[i];
+  }
+  for (uint32_t i = 1; i < n; i++) {
+    uint32_t v = tmp[i];
+    uint32_t j = i;
+    while (j > 0u && tmp[j - 1u] > v) {
+      tmp[j] = tmp[j - 1u];
+      j--;
+    }
+    tmp[j] = v;
+  }
+  uint32_t idx = (uint32_t)(((uint64_t)n * 95u + 99u) / 100u);
+  if (idx == 0u) {
+    idx = 1u;
+  }
+  if (idx > n) {
+    idx = n;
+  }
+  return tmp[idx - 1u];
+}
+
+static int bp_event_high_value_under_pressure(const AVEBehaviorEvent *event) {
+  if (!event) {
+    return 0;
+  }
+  if (event->severity_hint >= 128u || event->behavior_flags != 0u) {
+    return 1;
+  }
+  if (event->event_type == AVE_EVT_PROCESS_INJECT ||
+      event->event_type == AVE_EVT_MEM_ALLOC_EXEC ||
+      event->event_type == AVE_EVT_LSASS_ACCESS ||
+      event->event_type == AVE_EVT_SHELLCODE_SIGNAL ||
+      event->event_type == AVE_EVT_WEBSHELL_SIGNAL ||
+      event->event_type == AVE_EVT_PMFE_RESULT) {
+    return 1;
+  }
+  if (event->script_content_score >= 0.50f || event->tls_anomaly_score >= 0.60f ||
+      event->ransom_counter_score >= 0.45f || event->pmfe_confidence >= 0.50f ||
+      event->shellcode_score >= 0.50f || event->webshell_score >= 0.50f) {
+    return 1;
+  }
+  return event->script_block_present || event->amsi_content_present ||
+         event->ja3_anomaly || event->sni_anomaly || event->cert_anomaly ||
+         event->suspicious_extension_burst || event->shadow_copy_delete ||
+         event->ioc_ip_hit || event->ioc_domain_hit || event->ioc_sha256_hit;
 }
 
 static int popcount_u32(uint32_t x) {
@@ -893,6 +1036,10 @@ static void process_one_event(const AVEBehaviorEvent *e) {
       min_ev = 4u;
     }
     if (need > 0u && need <= 1024u * 1024u && sl->events_since_last_inference >= min_ev) {
+      if (!bp_behavior_infer_budget_allow(now)) {
+        sl->events_since_last_inference = 0u;
+        goto behavior_infer_done;
+      }
       float *ort_in = NULL;
       int use_stack = (need <= (size_t)AVE_BP_ORT_NELEM_MAX) ? 1 : 0;
       if (use_stack) {
@@ -903,7 +1050,11 @@ static void process_one_event(const AVEBehaviorEvent *e) {
       if (ort_in) {
         ph_build_ort_input(sl, ort_in, need);
         float raw = 0.f;
+        int64_t infer_t0 = wall_ns();
         if (edr_onnx_behavior_infer(ort_in, need, &raw, last_tactic_probs) == EDR_OK) {
+          int64_t infer_t1 = wall_ns();
+          uint32_t ms = (infer_t1 > infer_t0) ? (uint32_t)((infer_t1 - infer_t0) / 1000000LL) : 0u;
+          bp_record_infer_latency_ms(ms);
           float u = score_to_unit(raw);
           sl->anomaly = fminf(1.f, 0.35f * sl->anomaly + 0.65f * u);
           sl->last_anomaly_score = u;
@@ -917,6 +1068,9 @@ static void process_one_event(const AVEBehaviorEvent *e) {
           }
           (void)bp_metric_inc(&s_bp_beh_infer_ok);
         } else {
+          int64_t infer_t1 = wall_ns();
+          uint32_t ms = (infer_t1 > infer_t0) ? (uint32_t)((infer_t1 - infer_t0) / 1000000LL) : 0u;
+          bp_record_infer_latency_ms(ms);
           uint64_t nf = bp_metric_inc(&s_bp_beh_infer_fail);
           if ((nf & 63u) == 0u) {
             fprintf(stderr, "[ave/bp] behavior onnx infer failures (count=%llu)\n",
@@ -928,6 +1082,8 @@ static void process_one_event(const AVEBehaviorEvent *e) {
         }
       }
     }
+behavior_infer_done:
+    ;
   } else {
     float sev = (float)e->severity_hint / 255.0f;
     float bump = sev * 0.12f + (float)popcount_u32(e->behavior_flags) * 0.04f;
@@ -1099,6 +1255,8 @@ void edr_ave_bp_init(void) {
   memset(s_hist, 0, sizeof(s_hist));
   memset(&s_callbacks, 0, sizeof(s_callbacks));
   s_callbacks_set = 0;
+  s_bp_behavior_infer_per_min = 30u;
+  s_bp_low_priority_keep_percent_under_pressure = 5u;
   bp_reset_metrics();
 }
 
@@ -1138,6 +1296,7 @@ int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
   if (!cfg) {
     return AVE_ERR_INVALID_PARAM;
   }
+  edr_ave_bp_configure_resource_limits(cfg);
   if (!cfg->ave.behavior_monitor_enabled) {
     return AVE_OK;
   }
@@ -1170,20 +1329,24 @@ void edr_ave_bp_feed(const AVEBehaviorEvent *event) {
     return;
   }
   (void)bp_metric_inc(&s_bp_feed_total);
+  if (s_monitor_started && bp_pressure_active() && !bp_event_high_value_under_pressure(event)) {
+    (void)bp_metric_inc(&s_bp_pressure_feed_dropped);
+    return;
+  }
   if (!s_monitor_started) {
     (void)bp_metric_inc(&s_bp_feed_sync_bypass);
     return;
   }
   if (s_q) {
     if (ave_mpmc_try_push(s_q, event) != 0) {
-      (void)bp_metric_inc(&s_bp_queue_full_fallback);
-      process_one_event(event);
+      (void)bp_metric_inc(&s_bp_queue_full_dropped);
+      return;
     } else {
       (void)bp_metric_inc(&s_bp_queue_enqueued);
     }
   } else {
     (void)bp_metric_inc(&s_bp_feed_sync_bypass);
-    process_one_event(event);
+    return;
   }
 }
 
@@ -1275,10 +1438,19 @@ void edr_ave_bp_fill_metrics(AVEStatus *status_out) {
   status_out->behavior_feed_total = bp_metric_load(&s_bp_feed_total);
   status_out->behavior_queue_enqueued = bp_metric_load(&s_bp_queue_enqueued);
   status_out->behavior_queue_full_sync_fallback = bp_metric_load(&s_bp_queue_full_fallback);
+  status_out->behavior_queue_full_dropped = bp_metric_load(&s_bp_queue_full_dropped);
   status_out->behavior_feed_sync_bypass = bp_metric_load(&s_bp_feed_sync_bypass);
   status_out->behavior_worker_dequeued = bp_metric_load(&s_bp_worker_dequeued);
   status_out->behavior_infer_ok = bp_metric_load(&s_bp_beh_infer_ok);
   status_out->behavior_infer_fail = bp_metric_load(&s_bp_beh_infer_fail);
+  status_out->behavior_infer_budget_dropped = bp_metric_load(&s_bp_infer_budget_dropped);
+  status_out->behavior_pressure_feed_dropped = bp_metric_load(&s_bp_pressure_feed_dropped);
+  status_out->behavior_pressure_infer_dropped = bp_metric_load(&s_bp_pressure_infer_dropped);
+  status_out->behavior_infer_budget_per_min = s_bp_behavior_infer_per_min;
+  status_out->behavior_infer_effective_budget_per_min = bp_effective_behavior_infer_limit();
+  status_out->behavior_infer_latency_last_ms = s_bp_infer_latency_last_ms;
+  status_out->behavior_infer_latency_p95_ms = bp_latency_p95_ms();
+  status_out->behavior_pressure_active = bp_pressure_active() ? 1u : 0u;
   status_out->behavior_queue_capacity = edr_ave_bp_queue_capacity();
 }
 

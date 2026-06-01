@@ -145,6 +145,22 @@ static int p0_contains_ci(const char *hay, const char *needle) {
 
 static int p0_is_agent_internal_command(const EdrBehaviorRecord *br) {
   const char *cmd = br ? br->cmdline : NULL;
+  if (!br) {
+    return 0;
+  }
+  if ((cmd && cmd[0] && (p0_contains_ci(cmd, "\\edr_forensic\\") ||
+                         p0_contains_ci(cmd, "/edr_forensic/") ||
+                         p0_contains_ci(cmd, "cmd_forensic_") ||
+                         p0_contains_ci(cmd, "auto-forensic-"))) ||
+      p0_contains_ci(br->file_path, "\\edr_forensic\\") ||
+      p0_contains_ci(br->file_path, "/edr_forensic/") ||
+      p0_contains_ci(br->file_path, "cmd_forensic_") ||
+      p0_contains_ci(br->file_path, "auto-forensic-") ||
+      p0_contains_ci(br->script_snippet, "forensic_bundle") ||
+      p0_contains_ci(br->detection_context, "\"edr_internal\":true") ||
+      p0_contains_ci(br->detection_context, "\"source\":\"agent_internal\"")) {
+    return 1;
+  }
   if (!cmd || !cmd[0]) {
     return 0;
   }

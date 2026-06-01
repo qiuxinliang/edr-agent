@@ -297,8 +297,10 @@ typedef struct AVEStatus {
   uint64_t behavior_feed_total;
   /** MPMC **`ave_mpmc_try_push`** 成功次数 */
   uint64_t behavior_queue_enqueued;
-  /** 队列满时 **同步降级** `process_one_event` 次数（背压指标） */
+  /** 保留兼容字段；P0 资源控制后不再队列满同步处理，正常应为 0。 */
   uint64_t behavior_queue_full_sync_fallback;
+  /** MPMC 队列满时丢弃行为输入的次数；用于判断 AVE 是否被高噪声拖住。 */
+  uint64_t behavior_queue_full_dropped;
   /** 未起监控线程或队列未建时，**直接同步**处理次数 */
   uint64_t behavior_feed_sync_bypass;
   /** 消费线程从 MPMC **成功 pop** 次数（与 enqueued+当前深度大致守恒） */
@@ -306,6 +308,14 @@ typedef struct AVEStatus {
   /** **`edr_onnx_behavior_infer`** 成功 / 非 **EDR_OK** 次数 */
   uint64_t behavior_infer_ok;
   uint64_t behavior_infer_fail;
+  uint64_t behavior_infer_budget_dropped;
+  uint64_t behavior_pressure_feed_dropped;
+  uint64_t behavior_pressure_infer_dropped;
+  uint32_t behavior_infer_budget_per_min;
+  uint32_t behavior_infer_effective_budget_per_min;
+  uint32_t behavior_infer_latency_last_ms;
+  uint32_t behavior_infer_latency_p95_ms;
+  uint32_t behavior_pressure_active;
   /** 行为 MPMC 容量（当前实现为 **4096**） */
   uint32_t behavior_queue_capacity;
 } AVEStatus;

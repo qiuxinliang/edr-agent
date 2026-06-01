@@ -57,6 +57,7 @@ retention_hours      = 48
 cpu_limit_percent    = 1
 memory_limit_mb      = 100
 emergency_cpu_limit  = 5
+behavior_infer_per_min = 0
 
 [logging]
 level                = "info"

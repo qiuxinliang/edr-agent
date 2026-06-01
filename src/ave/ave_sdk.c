@@ -529,6 +529,7 @@ int AVE_Init(const AVEConfig *config) {
   ensure_scan_mutex();
 
   edr_ave_bp_init();
+  edr_ave_bp_configure_resource_limits(&g_cfg);
   g_initialized = 1;
   return AVE_OK;
 }
@@ -564,6 +565,7 @@ int AVE_InitFromEdrConfig(const EdrConfig *cfg) {
   ensure_scan_mutex();
 
   edr_ave_bp_init();
+  edr_ave_bp_configure_resource_limits(cfg);
   g_initialized = 1;
   return AVE_OK;
 }
@@ -576,6 +578,7 @@ int AVE_SyncFromEdrConfig(const EdrConfig *cfg) {
     return AVE_ERR_INVALID_PARAM;
   }
   EdrError e = edr_ave_reload_models(cfg);
+  edr_ave_bp_configure_resource_limits(cfg);
   if (e == EDR_OK) {
     edr_ave_infer_cache_clear();
   }
@@ -938,6 +941,9 @@ void AVE_FeedEvent(const AVEBehaviorEvent *event) {
   }
   AVEBehaviorEvent ev = *event;
   const EdrConfig *pcfg = active_edr_config();
+  if (pcfg && !pcfg->ave.behavior_monitor_enabled) {
+    return;
+  }
   if (pcfg) {
     edr_ave_behavior_event_apply_ioc(pcfg, &ev);
   }

@@ -24,6 +24,32 @@ typedef struct {
   char tags[192];
 } EdrWindowsEventPolicy;
 
+typedef struct {
+  uint8_t enabled;
+  uint8_t agent_internal_forensic;
+  uint8_t low_value_file_process;
+  uint8_t low_value_file_suffix;
+  uint8_t temp_xml;
+  char version[64];
+} EdrWindowsEventFilterConfig;
+
+typedef struct {
+  uint8_t enabled;
+  char version[64];
+  uint64_t evaluated;
+  uint64_t dropped;
+  uint64_t agent_internal_forensic;
+  uint64_t low_value_file_process;
+  uint64_t low_value_file_suffix;
+  uint64_t temp_xml;
+} EdrWindowsEventFilterStatus;
+
+/** Configure the lightweight endpoint-side file/registry slimming policy. */
+void edr_windows_event_policy_configure(const EdrWindowsEventFilterConfig *cfg);
+
+/** Snapshot counters for health reporting. */
+void edr_windows_event_policy_get_status(EdrWindowsEventFilterStatus *out);
+
 void edr_windows_event_policy_evaluate(const EdrBehaviorRecord *r,
                                        EdrWindowsEventPolicy *out);
 

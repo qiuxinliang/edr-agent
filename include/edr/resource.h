@@ -23,7 +23,9 @@ typedef struct {
   uint32_t thread_count;
   uint32_t handle_count;
   uint32_t throttle_active;
+  uint32_t pressure_level;
   uint64_t sample_count;
+  char pressure_reason[48];
 } EdrResourceSample;
 
 void edr_resource_get_sample(EdrResourceSample *out);

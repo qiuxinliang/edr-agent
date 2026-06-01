@@ -4,6 +4,66 @@
 #include <stdio.h>
 #include <string.h>
 
+#define EDR_EVENT_FILTER_VERSION_DEFAULT "agent-event-filter-v1"
+
+static EdrWindowsEventFilterConfig g_event_filter_cfg = {
+    1u, 1u, 1u, 1u, 1u, EDR_EVENT_FILTER_VERSION_DEFAULT,
+};
+static uint64_t g_event_filter_evaluated = 0u;
+static uint64_t g_event_filter_dropped = 0u;
+static uint64_t g_event_filter_agent_internal = 0u;
+static uint64_t g_event_filter_low_value_process = 0u;
+static uint64_t g_event_filter_low_value_suffix = 0u;
+static uint64_t g_event_filter_temp_xml = 0u;
+
+static void reset_event_filter_counters(void) {
+  g_event_filter_evaluated = 0u;
+  g_event_filter_dropped = 0u;
+  g_event_filter_agent_internal = 0u;
+  g_event_filter_low_value_process = 0u;
+  g_event_filter_low_value_suffix = 0u;
+  g_event_filter_temp_xml = 0u;
+}
+
+void edr_windows_event_policy_configure(const EdrWindowsEventFilterConfig *cfg) {
+  memset(&g_event_filter_cfg, 0, sizeof(g_event_filter_cfg));
+  if (cfg) {
+    g_event_filter_cfg.enabled = cfg->enabled ? 1u : 0u;
+    g_event_filter_cfg.agent_internal_forensic = cfg->agent_internal_forensic ? 1u : 0u;
+    g_event_filter_cfg.low_value_file_process = cfg->low_value_file_process ? 1u : 0u;
+    g_event_filter_cfg.low_value_file_suffix = cfg->low_value_file_suffix ? 1u : 0u;
+    g_event_filter_cfg.temp_xml = cfg->temp_xml ? 1u : 0u;
+    snprintf(g_event_filter_cfg.version, sizeof(g_event_filter_cfg.version), "%s",
+             cfg->version[0] ? cfg->version : EDR_EVENT_FILTER_VERSION_DEFAULT);
+  } else {
+    g_event_filter_cfg.enabled = 1u;
+    g_event_filter_cfg.agent_internal_forensic = 1u;
+    g_event_filter_cfg.low_value_file_process = 1u;
+    g_event_filter_cfg.low_value_file_suffix = 1u;
+    g_event_filter_cfg.temp_xml = 1u;
+    snprintf(g_event_filter_cfg.version, sizeof(g_event_filter_cfg.version), "%s",
+             EDR_EVENT_FILTER_VERSION_DEFAULT);
+  }
+  reset_event_filter_counters();
+}
+
+void edr_windows_event_policy_get_status(EdrWindowsEventFilterStatus *out) {
+  if (!out) {
+    return;
+  }
+  memset(out, 0, sizeof(*out));
+  out->enabled = g_event_filter_cfg.enabled;
+  snprintf(out->version, sizeof(out->version), "%s",
+           g_event_filter_cfg.version[0] ? g_event_filter_cfg.version
+                                         : EDR_EVENT_FILTER_VERSION_DEFAULT);
+  out->evaluated = g_event_filter_evaluated;
+  out->dropped = g_event_filter_dropped;
+  out->agent_internal_forensic = g_event_filter_agent_internal;
+  out->low_value_file_process = g_event_filter_low_value_process;
+  out->low_value_file_suffix = g_event_filter_low_value_suffix;
+  out->temp_xml = g_event_filter_temp_xml;
+}
+
 static int is_file_event(EdrEventType t) {
   return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE ||
          t == EDR_EVENT_FILE_DELETE || t == EDR_EVENT_FILE_RENAME ||
@@ -73,6 +133,39 @@ static int any_ends(const char *s, const char *const *items, size_t count) {
     }
   }
   return 0;
+}
+
+static int process_name_is(const EdrBehaviorRecord *r, const char *name) {
+  return r && name && name[0] && has_ci_path(r->process_name, name);
+}
+
+static void set_reason(EdrWindowsEventPolicy *p, const char *reason);
+static void add_tag(EdrWindowsEventPolicy *p, const char *tag);
+
+static void mark_noisy(EdrWindowsEventPolicy *p, const char *reason, const char *tag) {
+  p->noisy = 1u;
+  p->should_emit = 0u;
+  p->should_persist = 0u;
+  set_reason(p, reason);
+  add_tag(p, tag);
+}
+
+static int agent_internal_forensic_activity(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  return has_ci_path(r->file_path, "\\edr_forensic\\") ||
+         has_ci_path(r->file_path, "/edr_forensic/") ||
+         has_ci_path(r->file_path, "cmd_forensic_") ||
+         has_ci_path(r->file_path, "auto-forensic-") ||
+         has_ci_path(r->cmdline, "\\edr_forensic\\") ||
+         has_ci_path(r->cmdline, "/edr_forensic/") ||
+         has_ci_path(r->cmdline, "cmd_forensic_") ||
+         has_ci_path(r->cmdline, "auto-forensic-") ||
+         has_ci_path(r->script_snippet, "forensic_bundle") ||
+         has_ci_path(r->script_snippet, "source=agent_internal") ||
+         has_ci_path(r->detection_context, "\"edr_internal\":true") ||
+         has_ci_path(r->detection_context, "\"source\":\"agent_internal\"");
 }
 
 static int ransom_note_like_path(const char *path) {
@@ -158,12 +251,17 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       "\\appdata\\local\\microsoft\\edge\\user data\\",
       "\\appdata\\local\\google\\chrome\\user data\\",
       "\\appdata\\local\\packages\\", "\\appdata\\local\\crashdumps\\",
+      "\\windowsapps\\",
   };
   static const char *const cred_files[] = {
       "\\ntds.dit", "\\config\\sam", "\\config\\system", "\\config\\security",
       "\\config\\software", "lsass.dmp", "\\lsass", "\\sam.save", "\\system.save",
   };
   if (!path || !path[0]) {
+    return;
+  }
+  if (g_event_filter_cfg.agent_internal_forensic && agent_internal_forensic_activity(r)) {
+    mark_noisy(p, "agent_internal_forensic", "agent_internal");
     return;
   }
 
@@ -203,9 +301,20 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_suspicious(p, "public_directory_execution_artifact", "public_staging");
   }
   if (!p->high_value && any_contains(path, noisy_dirs, sizeof(noisy_dirs) / sizeof(noisy_dirs[0]))) {
-    p->noisy = 1u;
-    set_reason(p, "known_windows_noise_path");
-    add_tag(p, "noise_path");
+    mark_noisy(p, "known_windows_noise_path", "noise_path");
+  }
+  if (!p->high_value && g_event_filter_cfg.temp_xml &&
+      has_ci_path(path, "\\appdata\\local\\temp\\xml_file")) {
+    mark_noisy(p, "temp_xml_low_value_file", "noise_temp_xml");
+  }
+  if (!p->high_value && g_event_filter_cfg.low_value_file_process &&
+      (process_name_is(r, "cleanmgr.exe") || process_name_is(r, "taskmgr.exe") ||
+       process_name_is(r, "wmiprvse.exe"))) {
+    mark_noisy(p, "known_low_value_file_process", "noise_process");
+  }
+  if (!p->high_value && g_event_filter_cfg.low_value_file_suffix &&
+      (has_ci_path(path, ":wofcompresseddata") || has_ci_path(path, ".js.map"))) {
+    mark_noisy(p, "known_low_value_file_suffix", "noise_suffix");
   }
 }
 
@@ -272,9 +381,7 @@ static void classify_registry(const EdrBehaviorRecord *r, EdrWindowsEventPolicy 
     mark_high(p, "uac_policy_modified", "uac_policy");
   }
   if (!p->high_value && any_contains(key, noisy_keys, sizeof(noisy_keys) / sizeof(noisy_keys[0]))) {
-    p->noisy = 1u;
-    set_reason(p, "known_windows_registry_noise");
-    add_tag(p, "noise_registry");
+    mark_noisy(p, "known_windows_registry_noise", "noise_registry");
   }
 }
 
@@ -287,6 +394,9 @@ void edr_windows_event_policy_evaluate(const EdrBehaviorRecord *r,
   out->should_emit = 1u;
   out->should_persist = 1u;
   if (!r) {
+    return;
+  }
+  if (!g_event_filter_cfg.enabled) {
     return;
   }
   if (is_file_event(r->type)) {
@@ -345,9 +455,30 @@ void edr_windows_event_policy_apply(EdrBehaviorRecord *r) {
                  n ? " " : "", p.reason, p.tags);
 }
 
+static void record_event_filter_decision(const EdrWindowsEventPolicy *p) {
+  if (!p || !p->applies) {
+    return;
+  }
+  g_event_filter_evaluated++;
+  if (p->should_emit) {
+    return;
+  }
+  g_event_filter_dropped++;
+  if (has_ci_path(p->reason, "agent_internal_forensic")) {
+    g_event_filter_agent_internal++;
+  } else if (has_ci_path(p->reason, "known_low_value_file_process")) {
+    g_event_filter_low_value_process++;
+  } else if (has_ci_path(p->reason, "known_low_value_file_suffix")) {
+    g_event_filter_low_value_suffix++;
+  } else if (has_ci_path(p->reason, "temp_xml_low_value_file")) {
+    g_event_filter_temp_xml++;
+  }
+}
+
 int edr_windows_event_policy_should_emit(const EdrBehaviorRecord *r) {
   EdrWindowsEventPolicy p;
   edr_windows_event_policy_evaluate(r, &p);
+  record_event_filter_decision(&p);
   return (!p.applies || p.should_emit) ? 1 : 0;
 }
 

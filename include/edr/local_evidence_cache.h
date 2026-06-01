@@ -21,6 +21,14 @@ typedef struct {
   uint64_t p0_candidates_written;
   uint64_t artifacts_written;
   uint64_t command_results_written;
+  uint64_t candidate_deduped;
+  uint64_t write_budget_dropped;
+  uint64_t db_budget_dropped;
+  uint64_t pressure_dropped;
+  uint64_t ordinary_coalesced;
+  uint64_t file_coalesced;
+  uint64_t registry_coalesced;
+  uint64_t network_coalesced;
   uint64_t metric_file_drops;
   uint64_t metric_registry_drops;
   uint64_t metric_network_drops;
@@ -30,8 +38,12 @@ typedef struct {
   uint32_t ring_events;
   uint32_t hot_ring_events;
   uint32_t metrics_minutes;
+  uint32_t aggregate_slots_used;
+  uint32_t pressure_active;
   uint32_t max_db_mb;
   uint32_t retention_hours;
+  uint64_t db_bytes;
+  uint64_t wal_bytes;
   char path[512];
   char last_engine[32];
   int64_t last_event_time_ns;

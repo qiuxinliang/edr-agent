@@ -168,8 +168,8 @@ sensitivity          = "MEDIUM"
 # l4_realtime_anomaly_threshold = 0.65
 # L3 IOC 先于 L2 哈希白名单匹配；为 false 时仅 ONNX 后二次核对 IOC。
 # ioc_precheck_enabled = true
-# 行为管线消费线程（AVE_StartBehaviorMonitor）；改此项热载后需进程级策略评估是否重启 Agent。
-# behavior_monitor_enabled = true
+# 行为管线消费线程（AVE_StartBehaviorMonitor）；生产默认关闭，按应急/高价值资产策略触发开启。
+# behavior_monitor_enabled = false
 # 可选 SQLite：空路径表示禁用该层（详见 docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md）
 # file_whitelist_db_path = ""
 # ioc_db_path = ""

@@ -64,6 +64,15 @@ typedef struct EdrConfig {
   } collection;
 
   struct {
+    bool enabled;
+    char version[64];
+    bool agent_internal_forensic;
+    bool low_value_file_process;
+    bool low_value_file_suffix;
+    bool temp_xml;
+  } event_filter;
+
+  struct {
     uint32_t dedup_window_s;
     uint32_t high_freq_threshold;
     double sampling_rate_whitelist;
@@ -108,7 +117,7 @@ typedef struct EdrConfig {
     bool ioc_precheck_enabled;
     /** L4：不可豁免文件哈希（表 `file_behavior_non_exempt`） */
     char behavior_policy_db_path[1024];
-    /** P2：`AVE_StartBehaviorMonitor` 是否拉起消费线程（默认 true） */
+    /** `AVE_StartBehaviorMonitor` 是否拉起消费线程；生产默认关闭，按策略/应急触发开启。 */
     bool behavior_monitor_enabled;
     /**
      * Windows Authenticode：`WinVerifyTrust` 吊销检查（`WTD_REVOKE_WHOLECHAIN`）。
@@ -156,6 +165,7 @@ typedef struct EdrConfig {
     uint32_t memory_limit_mb;
     uint32_t emergency_cpu_limit;
     uint32_t ave_infer_per_min;
+    uint32_t behavior_infer_per_min;
     uint32_t pmfe_scans_per_min;
     uint32_t webshell_scan_mb_per_min;
     uint32_t shellcode_packets_per_sec;

@@ -46,11 +46,24 @@ static void sample_init(void) {
 #endif
 }
 
+static int preprocess_throttle_forced(void) {
+  const char *force = getenv("EDR_PREPROCESS_THROTTLE");
+  return force && force[0] == '1';
+}
+
+static void set_pressure_sample(uint32_t active, uint32_t level, const char *reason) {
+  s_sample.throttle_active = active;
+  s_sample.pressure_level = level;
+  snprintf(s_sample.pressure_reason, sizeof(s_sample.pressure_reason), "%s",
+           reason && reason[0] ? reason : "ok");
+}
+
 void edr_resource_init(const EdrConfig *cfg) {
   s_cfg = cfg;
   s_emergency = 0;
   s_preprocess_throttle = 0;
   memset(&s_sample, 0, sizeof(s_sample));
+  set_pressure_sample(0u, 0u, "ok");
   sample_init();
 }
 
@@ -59,8 +72,7 @@ void edr_resource_shutdown(void) { s_cfg = NULL; }
 unsigned long edr_resource_emergency_count(void) { return s_emergency; }
 
 bool edr_resource_preprocess_throttle_active(void) {
-  const char *force = getenv("EDR_PREPROCESS_THROTTLE");
-  if (force && force[0] == '1') {
+  if (preprocess_throttle_forced()) {
     return true;
   }
   return s_preprocess_throttle != 0;
@@ -151,14 +163,18 @@ void edr_resource_poll(void) {
     fprintf(stderr, "[resource] CPU approx %u%% exceeds limit %u%% (emergency=%lu)\n", pct,
             s_cfg->resource_limit.cpu_limit_percent, s_emergency);
     s_preprocess_throttle = 1;
+    set_pressure_sample(1u, 2u, "cpu");
   } else if (mem_bad) {
     fprintf(stderr, "[resource] RSS approx %lu MB exceeds memory_limit_mb=%u\n", rss_mb,
             s_cfg->resource_limit.memory_limit_mb);
     s_preprocess_throttle = 1;
+    set_pressure_sample(1u, 2u, "memory");
   } else {
     s_preprocess_throttle = 0;
+    set_pressure_sample(preprocess_throttle_forced() ? 1u : 0u,
+                        preprocess_throttle_forced() ? 1u : 0u,
+                        preprocess_throttle_forced() ? "forced" : "ok");
   }
-  s_sample.throttle_active = (uint32_t)s_preprocess_throttle;
 #else
   struct timeval now;
   struct rusage ru;
@@ -205,16 +221,20 @@ void edr_resource_poll(void) {
     fprintf(stderr, "[resource] CPU approx %u%% exceeds limit %u%% (emergency=%lu)\n", pct,
             s_cfg->resource_limit.cpu_limit_percent, s_emergency);
     s_preprocess_throttle = 1;
+    set_pressure_sample(1u, 2u, "cpu");
   } else if (mem_bad) {
     s_preprocess_throttle = 1;
+    set_pressure_sample(1u, 2u, "memory");
   } else {
     s_preprocess_throttle = 0;
+    set_pressure_sample(preprocess_throttle_forced() ? 1u : 0u,
+                        preprocess_throttle_forced() ? 1u : 0u,
+                        preprocess_throttle_forced() ? "forced" : "ok");
   }
   s_sample.cpu_percent = pct;
   s_sample.rss_mb = rss_mb;
   s_sample.thread_count = 0u;
   s_sample.handle_count = 0u;
-  s_sample.throttle_active = (uint32_t)s_preprocess_throttle;
   s_sample.sample_count++;
 #endif
 }
@@ -224,4 +244,9 @@ void edr_resource_get_sample(EdrResourceSample *out) {
     return;
   }
   *out = s_sample;
+  if (preprocess_throttle_forced() && !out->throttle_active) {
+    out->throttle_active = 1u;
+    out->pressure_level = 1u;
+    snprintf(out->pressure_reason, sizeof(out->pressure_reason), "%s", "forced");
+  }
 }

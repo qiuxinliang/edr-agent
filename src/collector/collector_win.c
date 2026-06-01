@@ -354,7 +354,11 @@ static int edr_agent_self_text_marker(const char *s) {
       edr_contains_ci_path(s, "\\edr_sensor_interest_") ||
       edr_contains_ci_path(s, "\\edr_remote_") ||
       edr_contains_ci_path(s, "/edr_sensor_interest_") ||
-      edr_contains_ci_path(s, "/edr_remote_")) {
+      edr_contains_ci_path(s, "/edr_remote_") ||
+      edr_contains_ci_path(s, "\\edr_forensic\\") ||
+      edr_contains_ci_path(s, "/edr_forensic/") ||
+      edr_contains_ci_path(s, "cmd_forensic_") ||
+      edr_contains_ci_path(s, "auto-forensic-")) {
     return 1;
   }
   return 0;

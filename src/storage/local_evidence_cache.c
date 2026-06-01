@@ -1,6 +1,7 @@
 #include "edr/local_evidence_cache.h"
 
 #include "edr/p0_rule_ir.h"
+#include "edr/resource.h"
 #include "edr/time_util.h"
 #include "edr/windows_event_policy.h"
 
@@ -21,6 +22,8 @@
 #define EDR_EVIDENCE_CONTEXT_RING_SLOTS 512u
 #define EDR_EVIDENCE_CONTEXT_WINDOWS 256u
 #define EDR_EVIDENCE_METRIC_SLOTS 180u
+#define EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS 512u
+#define EDR_EVIDENCE_AGG_SLOTS 512u
 
 typedef struct {
   uint32_t pid;
@@ -72,6 +75,25 @@ typedef struct {
   uint64_t other_drops;
 } MetricSlot;
 
+typedef struct {
+  uint8_t used;
+  int64_t last_ns;
+  uint32_t pid;
+  uint32_t type;
+  char endpoint_id[48];
+  char signal[160];
+} CandidateDedupeSlot;
+
+typedef struct {
+  uint8_t used;
+  int64_t minute_unix;
+  uint32_t pid;
+  uint32_t kind;
+  char endpoint_id[48];
+  char prefix[160];
+  uint64_t count;
+} OrdinaryAggregateSlot;
+
 static ProcSlot s_proc[EDR_EVIDENCE_PROC_SLOTS];
 /* candidate/context ring: RTQ-visible, bounded, and fed only by P0/P1 candidates. */
 static RingSlot s_ring[EDR_EVIDENCE_RING_SLOTS];
@@ -79,11 +101,15 @@ static RingSlot s_ring[EDR_EVIDENCE_RING_SLOTS];
 static RingSlot s_context_ring[EDR_EVIDENCE_CONTEXT_RING_SLOTS];
 static ContextWindowSlot s_context_windows[EDR_EVIDENCE_CONTEXT_WINDOWS];
 static MetricSlot s_metrics[EDR_EVIDENCE_METRIC_SLOTS];
+static CandidateDedupeSlot s_candidate_dedupe[EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS];
+static OrdinaryAggregateSlot s_ordinary_agg[EDR_EVIDENCE_AGG_SLOTS];
 static uint32_t s_ring_pos;
 static uint32_t s_context_ring_pos;
 static uint32_t s_context_window_next;
 static EdrEvidenceCacheStatus s_status;
 static uint64_t s_last_maintenance_ns;
+static int64_t s_write_budget_minute;
+static uint32_t s_write_budget_count;
 
 #if defined(EDR_HAVE_SQLITE)
 static sqlite3 *s_db;
@@ -455,7 +481,250 @@ static void candidate_id_for(const EdrBehaviorRecord *r, char *out, size_t cap) 
            (long long)record_time_ns(r), r ? r->pid : 0u);
 }
 
+static uint32_t env_u32_clamped(const char *name, uint32_t fallback, uint32_t min_v,
+                                uint32_t max_v) {
+  const char *e = getenv(name);
+  uint32_t v = fallback;
+  if (e && e[0]) {
+    char *end = NULL;
+    unsigned long n = strtoul(e, &end, 10);
+    if (end != e) {
+      v = (n > 0xffffffffUL) ? 0xffffffffu : (uint32_t)n;
+    }
+  }
+  if (v < min_v) {
+    v = min_v;
+  }
+  if (v > max_v) {
+    v = max_v;
+  }
+  return v;
+}
+
+static int extract_json_string_field(const char *s, const char *key, char *out, size_t cap) {
+  if (!s || !key || !out || cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  const char *p = strstr(s, key);
+  if (!p) {
+    return 0;
+  }
+  p += strlen(key);
+  size_t n = 0;
+  while (p[n] && p[n] != '"' && n + 1u < cap) {
+    out[n] = p[n];
+    n++;
+  }
+  out[n] = '\0';
+  return n > 0u;
+}
+
+static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!r) {
+    return;
+  }
+  if (extract_json_string_field(r->detection_context, "\"rule_id\":\"", out, cap) ||
+      extract_json_string_field(r->detection_context, "\"rid\":\"", out, cap) ||
+      extract_json_string_field(r->detection_context, "\"rule\":\"", out, cap)) {
+    return;
+  }
+  const char *target = r->file_path[0] ? r->file_path :
+                       r->reg_key_path[0] ? r->reg_key_path :
+                       r->net_dst[0] ? r->net_dst :
+                       r->exe_path[0] ? r->exe_path : r->process_name;
+  snprintf(out, cap, "type=%u;proc=%s;target=%s;port=%u",
+           (uint32_t)r->type, r->process_name, target ? target : "", r->net_dport);
+}
+
+static int ordinary_aggregate_kind(const EdrBehaviorRecord *r, uint32_t *kind_out) {
+  if (!r || !kind_out) {
+    return 0;
+  }
+  switch (r->type) {
+  case EDR_EVENT_FILE_READ:
+  case EDR_EVENT_FILE_CREATE:
+  case EDR_EVENT_FILE_WRITE:
+  case EDR_EVENT_FILE_DELETE:
+  case EDR_EVENT_FILE_RENAME:
+  case EDR_EVENT_FILE_PERMISSION_CHANGE:
+    *kind_out = 1u;
+    return 1;
+  case EDR_EVENT_REG_CREATE_KEY:
+  case EDR_EVENT_REG_SET_VALUE:
+  case EDR_EVENT_REG_DELETE_KEY:
+    *kind_out = 2u;
+    return 1;
+  case EDR_EVENT_NET_CONNECT:
+  case EDR_EVENT_NET_LISTEN:
+  case EDR_EVENT_NET_DNS_QUERY:
+    *kind_out = 3u;
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static void normalize_prefix_copy(char *out, size_t cap, const char *s) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!s || !s[0]) {
+    return;
+  }
+  size_t n = 0u;
+  for (; s[n] && n + 1u < cap; n++) {
+    unsigned char c = (unsigned char)s[n];
+    out[n] = (char)tolower(c);
+  }
+  out[n] = '\0';
+}
+
+static void path_parent_prefix(char *out, size_t cap, const char *path) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  char tmp[320];
+  normalize_prefix_copy(tmp, sizeof(tmp), path);
+  char *last = NULL;
+  for (char *p = tmp; *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      last = p;
+    }
+  }
+  if (last && (size_t)(last - tmp) + 1u < sizeof(tmp)) {
+    last[1] = '\0';
+  }
+  copy_s(out, cap, tmp);
+}
+
+static void ordinary_aggregate_prefix(const EdrBehaviorRecord *r, uint32_t kind,
+                                      char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!r) {
+    return;
+  }
+  if (kind == 1u) {
+    path_parent_prefix(out, cap, r->file_path[0] ? r->file_path : r->exe_path);
+  } else if (kind == 2u) {
+    normalize_prefix_copy(out, cap, r->reg_key_path);
+  } else if (kind == 3u) {
+    char tmp[220];
+    snprintf(tmp, sizeof(tmp), "%s:%u:%s", r->net_dst, r->net_dport, r->dns_query);
+    normalize_prefix_copy(out, cap, tmp);
+  }
+  if (!out[0]) {
+    snprintf(out, cap, "kind=%u;type=%u", kind, (uint32_t)r->type);
+  }
+}
+
+static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_t ts) {
+  uint32_t kind = 0u;
+  if (!ordinary_aggregate_kind(r, &kind)) {
+    return 0;
+  }
+  char prefix[160];
+  ordinary_aggregate_prefix(r, kind, prefix, sizeof(prefix));
+  int64_t minute = (ts / 1000000000LL) / 60LL;
+  size_t replace_i = 0u;
+  int64_t oldest = INT64_MAX;
+  for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
+    OrdinaryAggregateSlot *s = &s_ordinary_agg[i];
+    if (!s->used) {
+      replace_i = i;
+      oldest = INT64_MIN;
+      break;
+    }
+    if (s->minute_unix < oldest) {
+      oldest = s->minute_unix;
+      replace_i = i;
+    }
+    if (s->minute_unix == minute && s->pid == r->pid && s->kind == kind &&
+        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
+        strncmp(s->prefix, prefix, sizeof(s->prefix)) == 0) {
+      s->count++;
+      s_status.ordinary_coalesced++;
+      if (kind == 1u) {
+        s_status.file_coalesced++;
+      } else if (kind == 2u) {
+        s_status.registry_coalesced++;
+      } else if (kind == 3u) {
+        s_status.network_coalesced++;
+      }
+      return 1;
+    }
+  }
+  OrdinaryAggregateSlot *slot = &s_ordinary_agg[replace_i];
+  memset(slot, 0, sizeof(*slot));
+  slot->used = 1u;
+  slot->minute_unix = minute;
+  slot->pid = r ? r->pid : 0u;
+  slot->kind = kind;
+  slot->count = 1u;
+  copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r ? r->endpoint_id : "");
+  copy_s(slot->prefix, sizeof(slot->prefix), prefix);
+  return 0;
+}
+
+static int evidence_cache_pressure_active(void) {
+  return edr_resource_preprocess_throttle_active() ? 1 : 0;
+}
+
+static int candidate_dedupe_should_skip(const EdrBehaviorRecord *r, int64_t ts) {
+  if (!r) {
+    return 0;
+  }
+  uint32_t win_s = env_u32_clamped("EDR_EVIDENCE_CACHE_CANDIDATE_DEDUP_WINDOW_S",
+                                   10u, 0u, 600u);
+  if (win_s == 0u) {
+    return 0;
+  }
+  char signal[160];
+  candidate_signal_for(r, signal, sizeof(signal));
+  int64_t cutoff = ts - (int64_t)win_s * 1000000000LL;
+  size_t replace_i = 0;
+  int64_t oldest = INT64_MAX;
+  for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
+    CandidateDedupeSlot *s = &s_candidate_dedupe[i];
+    if (!s->used) {
+      replace_i = i;
+      oldest = INT64_MIN;
+      break;
+    }
+    if (s->last_ns < oldest) {
+      oldest = s->last_ns;
+      replace_i = i;
+    }
+    if (s->last_ns >= cutoff && s->pid == r->pid && s->type == (uint32_t)r->type &&
+        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
+        strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
+      s->last_ns = ts;
+      s_status.candidate_deduped++;
+      return 1;
+    }
+  }
+  CandidateDedupeSlot *slot = &s_candidate_dedupe[replace_i];
+  memset(slot, 0, sizeof(*slot));
+  slot->used = 1u;
+  slot->last_ns = ts;
+  slot->pid = r->pid;
+  slot->type = (uint32_t)r->type;
+  copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r->endpoint_id);
+  copy_s(slot->signal, sizeof(slot->signal), signal);
+  return 0;
+}
+
 #if defined(EDR_HAVE_SQLITE)
+static void sqlite_maintenance(void);
+
 static int exec_sql(const char *sql) {
   char *err = NULL;
   if (!s_db) {
@@ -468,6 +737,78 @@ static int exec_sql(const char *sql) {
     return -1;
   }
   return 0;
+}
+
+static uint64_t path_size_bytes(const char *path) {
+  if (!path || !path[0]) {
+    return 0u;
+  }
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    return 0u;
+  }
+  return st.st_size > 0 ? (uint64_t)st.st_size : 0u;
+}
+
+static void refresh_db_size_status(void) {
+  s_status.db_bytes = path_size_bytes(s_status.path);
+  if (!s_status.path[0]) {
+    s_status.wal_bytes = 0u;
+    return;
+  }
+  char wal_path[640];
+  snprintf(wal_path, sizeof(wal_path), "%s-wal", s_status.path);
+  s_status.wal_bytes = path_size_bytes(wal_path);
+}
+
+static int db_size_over_limit(void) {
+  if (!s_status.path[0] || s_status.max_db_mb == 0u) {
+    return 0;
+  }
+  refresh_db_size_status();
+  uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+  uint64_t total = s_status.db_bytes + s_status.wal_bytes;
+  return limit > 0u && total > limit;
+}
+
+static int sqlite_size_budget_allow(void) {
+  if (!db_size_over_limit()) {
+    return 1;
+  }
+  uint64_t now = edr_monotonic_ns();
+  if (now - s_last_maintenance_ns >= 10000000000ULL) {
+    s_last_maintenance_ns = now;
+    sqlite_maintenance();
+  }
+  if (!db_size_over_limit()) {
+    return 1;
+  }
+  s_status.db_budget_dropped++;
+  set_error("evidence cache size budget exceeded");
+  return 0;
+}
+
+static int sqlite_write_budget_allow(uint32_t units, int64_t ts) {
+  uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
+                                   600u, 0u, 100000u);
+  if (limit == 0u) {
+    return 1;
+  }
+  if (units == 0u) {
+    units = 1u;
+  }
+  int64_t minute = (ts / 1000000000LL) / 60LL;
+  if (minute != s_write_budget_minute) {
+    s_write_budget_minute = minute;
+    s_write_budget_count = 0u;
+  }
+  if (s_write_budget_count >= limit || units > limit - s_write_budget_count) {
+    s_status.write_budget_dropped++;
+    set_error("evidence cache write budget exceeded");
+    return 0;
+  }
+  s_write_budget_count += units;
+  return 1;
 }
 
 static void bind_text(sqlite3_stmt *st, int idx, const char *s) {
@@ -803,18 +1144,6 @@ static void sqlite_flush_metrics(void) {
   }
 }
 
-static int db_size_over_limit(void) {
-  if (!s_status.path[0] || s_status.max_db_mb == 0u) {
-    return 0;
-  }
-  struct stat st;
-  if (stat(s_status.path, &st) != 0) {
-    return 0;
-  }
-  uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
-  return limit > 0u && (uint64_t)st.st_size > limit;
-}
-
 static void sqlite_maintenance(void) {
   if (!s_db) {
     return;
@@ -845,13 +1174,18 @@ static void sqlite_maintenance(void) {
     st = NULL;
   }
   if (db_size_over_limit()) {
-    (void)exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 500);");
-    (void)exec_sql("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 500);");
+    for (int pass = 0; pass < 4 && db_size_over_limit(); pass++) {
+      (void)exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);");
+      (void)exec_sql("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);");
+    }
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
-    (void)exec_sql("VACUUM;");
+    if (db_size_over_limit()) {
+      (void)exec_sql("VACUUM;");
+    }
   } else {
     (void)exec_sql("PRAGMA wal_checkpoint(PASSIVE);");
   }
+  refresh_db_size_status();
 }
 #endif
 
@@ -907,9 +1241,13 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   memset(s_context_ring, 0, sizeof(s_context_ring));
   memset(s_context_windows, 0, sizeof(s_context_windows));
   memset(s_metrics, 0, sizeof(s_metrics));
+  memset(s_candidate_dedupe, 0, sizeof(s_candidate_dedupe));
+  memset(s_ordinary_agg, 0, sizeof(s_ordinary_agg));
   s_ring_pos = 0;
   s_context_ring_pos = 0;
   s_context_window_next = 0;
+  s_write_budget_minute = 0;
+  s_write_budget_count = 0u;
   s_status.max_db_mb = max_db_mb ? max_db_mb : 128u;
   s_status.retention_hours = retention_hours ? retention_hours : 24u;
   copy_s(s_status.path, sizeof(s_status.path), (path && path[0]) ? path : "local_evidence_cache.db");
@@ -1235,6 +1573,13 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   int64_t ts = record_time_ns(r);
   process_cache_update(r);
   int store_candidate = evidence_should_store_record(r);
+  if (store_candidate && candidate_dedupe_should_skip(r, ts)) {
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
+    record_metric_drop(r, ts);
+    s_status.records_skipped++;
+    return;
+  }
   char candidate_id[160] = "";
   char context_candidate_id[160] = "";
   if (store_candidate) {
@@ -1246,6 +1591,17 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   if (store_candidate) {
     pre_count = promote_context_before_window(r, ts);
     post_until_ns = mark_context_window(r, ts, candidate_id);
+  }
+  if (!store_candidate && !store_context && evidence_cache_pressure_active()) {
+    record_metric_drop(r, ts);
+    s_status.pressure_dropped++;
+    s_status.records_skipped++;
+    return;
+  }
+  if (!store_candidate && !store_context && ordinary_aggregate_should_coalesce(r, ts)) {
+    record_metric_drop(r, ts);
+    s_status.records_skipped++;
+    return;
   }
   context_ring_capture(r);
   s_status.hot_ring_ingested++;
@@ -1262,10 +1618,18 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   s_status.last_event_time_ns = ts;
 #if defined(EDR_HAVE_SQLITE)
   if (s_db && store_candidate) {
+    if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts)) {
+      s_status.records_dropped++;
+      return;
+    }
     sqlite_record_candidate(r, pre_count, post_until_ns);
   } else if (!s_db && store_candidate) {
     s_status.records_dropped++;
   } else if (s_db && store_context && context_candidate_id[0]) {
+    if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(1u, ts)) {
+      s_status.records_dropped++;
+      return;
+    }
     sqlite_record_context_artifact(r, context_candidate_id);
   }
 #else
@@ -1298,6 +1662,7 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   uint32_t proc_n = 0;
   uint32_t ring_n = 0;
   uint32_t hot_n = 0;
+  uint32_t agg_n = 0;
   for (size_t i = 0; i < EDR_EVIDENCE_PROC_SLOTS; i++) {
     if (s_proc[i].pid != 0u) {
       proc_n++;
@@ -1313,10 +1678,22 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
       hot_n++;
     }
   }
+  for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
+    if (s_ordinary_agg[i].used) {
+      agg_n++;
+    }
+  }
   st.process_slots_used = proc_n;
   st.ring_events = ring_n;
   st.hot_ring_events = hot_n;
   st.metrics_minutes = metric_slots_used();
+  st.aggregate_slots_used = agg_n;
+  st.pressure_active = evidence_cache_pressure_active() ? 1u : 0u;
+#if defined(EDR_HAVE_SQLITE)
+  refresh_db_size_status();
+  st.db_bytes = s_status.db_bytes;
+  st.wal_bytes = s_status.wal_bytes;
+#endif
   *out = st;
 }
 
@@ -1787,22 +2164,38 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
   json_escape(eng, sizeof(eng), st.last_engine);
   snprintf(out, cap,
            "\"evidence_cache\":{\"db_open\":%s,\"path\":%s,\"max_db_mb\":%u,"
-           "\"retention_hours\":%u,\"records_written\":%llu,\"records_dropped\":%llu,"
+           "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
+           "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
+           "\"candidate_deduped\":%llu,\"write_budget_dropped\":%llu,"
+           "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
+           "\"pressure_active\":%s,\"ordinary_coalesced\":%llu,"
+           "\"aggregate_slots_used\":%u,"
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
            "\"partitions\":{\"hot_ring\":{\"events\":%u},"
            "\"p0_candidates\":{\"written\":%llu},\"artifacts\":{\"written\":%llu},"
            "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
+           "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu}}",
            st.db_open ? "true" : "false", path, st.max_db_mb, st.retention_hours,
+           (unsigned long long)st.db_bytes, (unsigned long long)st.wal_bytes,
            (unsigned long long)st.records_written, (unsigned long long)st.records_dropped,
            (unsigned long long)st.records_skipped, (unsigned long long)st.hot_ring_ingested,
+           (unsigned long long)st.candidate_deduped,
+           (unsigned long long)st.write_budget_dropped,
+           (unsigned long long)st.db_budget_dropped,
+           (unsigned long long)st.pressure_dropped,
+           st.pressure_active ? "true" : "false",
+           (unsigned long long)st.ordinary_coalesced, st.aggregate_slots_used,
            (unsigned long long)st.maintenance_runs, st.process_slots_used, st.ring_events,
            eng, (long long)st.last_event_time_ns, err, st.hot_ring_events,
            (unsigned long long)st.p0_candidates_written,
            (unsigned long long)st.artifacts_written,
            (unsigned long long)st.command_results_written, st.metrics_minutes,
+           (unsigned long long)st.file_coalesced,
+           (unsigned long long)st.registry_coalesced,
+           (unsigned long long)st.network_coalesced,
            (unsigned long long)st.metric_file_drops,
            (unsigned long long)st.metric_registry_drops,
            (unsigned long long)st.metric_network_drops,

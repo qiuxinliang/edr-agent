@@ -502,6 +502,41 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
   }
 }
 
+static void load_event_filter(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->event_filter.enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "version"), cfg->event_filter.version,
+              sizeof(cfg->event_filter.version));
+  {
+    toml_datum_t d = toml_bool_in(t, "agent_internal_forensic");
+    if (d.ok) {
+      cfg->event_filter.agent_internal_forensic = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "low_value_file_process");
+    if (d.ok) {
+      cfg->event_filter.low_value_file_process = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "low_value_file_suffix");
+    if (d.ok) {
+      cfg->event_filter.low_value_file_suffix = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "temp_xml");
+    if (d.ok) {
+      cfg->event_filter.temp_xml = d.u.b ? true : false;
+    }
+  }
+}
+
 static void rule_take_str(toml_table_t *rt, const char *key, char *dst, size_t cap) {
   toml_datum_t d = toml_string_in(rt, key);
   if (d.ok && d.u.s && cap > 0) {
@@ -901,6 +936,12 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "ave_infer_per_min");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->resource_limit.ave_infer_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "behavior_infer_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.behavior_infer_per_min = (uint32_t)d.u.i;
     }
   }
   {
@@ -1496,6 +1537,14 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.adaptive_boost_seconds = 180u;
   cfg->collection.adaptive_min_severity = 3u;
 
+  cfg->event_filter.enabled = true;
+  snprintf(cfg->event_filter.version, sizeof(cfg->event_filter.version), "%s",
+           "agent-event-filter-v1");
+  cfg->event_filter.agent_internal_forensic = true;
+  cfg->event_filter.low_value_file_process = true;
+  cfg->event_filter.low_value_file_suffix = true;
+  cfg->event_filter.temp_xml = true;
+
   cfg->preprocessing.dedup_window_s = 30u;
   cfg->preprocessing.high_freq_threshold = 100u;
   cfg->preprocessing.sampling_rate_whitelist = 0.1;
@@ -1526,7 +1575,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->ave.ioc_db_path[0] = '\0';
   cfg->ave.ioc_precheck_enabled = true;
   cfg->ave.behavior_policy_db_path[0] = '\0';
-  cfg->ave.behavior_monitor_enabled = true;
+  cfg->ave.behavior_monitor_enabled = false;
   cfg->ave.cert_revocation_check = false;
   cfg->ave.l4_realtime_behavior_link = false;
   cfg->ave.l4_realtime_anomaly_threshold = 0.65f;
@@ -1561,6 +1610,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.memory_limit_mb = 100u;
   cfg->resource_limit.emergency_cpu_limit = 5u;
   cfg->resource_limit.ave_infer_per_min = 120u;
+  cfg->resource_limit.behavior_infer_per_min = 30u;
   cfg->resource_limit.pmfe_scans_per_min = 3u;
   cfg->resource_limit.webshell_scan_mb_per_min = 64u;
   cfg->resource_limit.shellcode_packets_per_sec = 2000u;
@@ -2128,6 +2178,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "collection");
     if (t) {
       load_collection(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "event_filter");
+    if (t) {
+      load_event_filter(t, cfg);
     }
   }
   {
