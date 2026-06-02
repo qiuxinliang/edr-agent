@@ -488,6 +488,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"communication\":{\"grpc_ready\":%s,\"grpc_insecure\":%s,\"http_fallback\":%s,"
       "\"http_insecure\":%s,\"grpc_rpc_ok\":%lu,\"grpc_rpc_fail\":%lu,"
       "\"grpc_consecutive_failures\":%d,\"http_ok\":%lu,\"http_fail\":%lu,"
+      "\"counters\":{\"legacy_ok\":%lu,\"legacy_fail\":%lu,"
+      "\"http_request_ok\":%lu,\"http_request_fail\":%lu,"
+      "\"ws_message_ok\":%lu,\"ws_message_fail\":%lu,\"ws_pong\":%lu,"
+      "\"command_result_ok\":%lu,\"command_result_fail\":%lu,"
+      "\"upload_ok\":%lu,\"upload_fail\":%lu,"
+      "\"long_poll_ok\":%lu,\"long_poll_fail\":%lu},"
       "\"send_queue_depth\":%llu,\"send_queue_capacity\":%llu,"
       "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
       "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
@@ -525,6 +531,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
       "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu},"
+      "\"agent_self_sources\":{\"direct_pid\":%llu,\"security_event\":%llu,"
+      "\"record\":%llu,\"interest\":%llu,\"fuse_provider\":%llu},"
       "\"drop_breakdown\":{\"agent_self\":%llu,\"lifecycle\":%llu,"
       "\"auth\":%llu,\"invalid_process\":%llu,\"ordinary_file\":%llu,"
       "\"ordinary_registry\":%llu,\"ordinary_network\":%llu,\"metadata\":%llu},"
@@ -575,6 +583,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      grpc_rt.ready ? "true" : "false", grpc_rt.insecure ? "true" : "false",
 	      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
 	      grpc_rt.rpc_ok, grpc_rt.rpc_fail, grpc_rt.report_fail_streak, http_rt.ok_count, http_rt.fail_count,
+	      http_rt.ok_count, http_rt.fail_count,
+	      http_rt.http_request_ok_count, http_rt.http_request_fail_count,
+	      http_rt.ws_message_ok_count, http_rt.ws_message_fail_count, http_rt.ws_pong_count,
+	      http_rt.command_result_ok_count, http_rt.command_result_fail_count,
+	      http_rt.upload_ok_count, http_rt.upload_fail_count,
+	      http_rt.long_poll_ok_count, http_rt.long_poll_fail_count,
 	      (unsigned long long)edr_transport_send_queue_depth(),
 	      (unsigned long long)edr_transport_send_queue_capacity(),
 	      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
@@ -631,6 +645,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.agent_self_fuse_until_unix_ms,
       (unsigned long long)ch.agent_self_fuse_trips,
       (unsigned long long)ch.agent_self_fuse_suppressed,
+      (unsigned long long)ch.agent_self_direct_pid_suppressed,
+      (unsigned long long)ch.agent_self_security_event_suppressed,
+      (unsigned long long)ch.agent_self_record_suppressed,
+      (unsigned long long)ch.agent_self_interest_suppressed,
+      (unsigned long long)ch.agent_self_fuse_provider_suppressed,
       (unsigned long long)ch.agent_self_suppressed,
       (unsigned long long)ch.lifecycle_dropped,
       (unsigned long long)ch.auth_dropped,

@@ -66,6 +66,17 @@ static char s_proxy_status[96];
 static char s_connection_mode[32];
 static unsigned long s_http_ok;
 static unsigned long s_http_fail;
+static unsigned long s_http_request_ok;
+static unsigned long s_http_request_fail;
+static unsigned long s_ws_message_ok;
+static unsigned long s_ws_message_fail;
+static unsigned long s_ws_pong;
+static unsigned long s_command_result_ok;
+static unsigned long s_command_result_fail;
+static unsigned long s_upload_ok;
+static unsigned long s_upload_fail;
+static unsigned long s_long_poll_ok;
+static unsigned long s_long_poll_fail;
 static int64_t s_last_success_ms;
 static int64_t s_last_failure_ms;
 static char s_last_error[160];
@@ -263,6 +274,49 @@ static void runtime_failure(const char *msg) {
   if (!s_circuit_open && s_consecutive_failures >= threshold && failure_should_open_circuit(msg)) {
     comm_open_circuit(msg);
   }
+}
+
+static void note_http_request_success(void) {
+  s_http_request_ok++;
+  runtime_success();
+}
+
+static void note_http_request_failure(void) {
+  s_http_request_fail++;
+}
+
+static void note_ws_message_success(void) {
+  s_ws_message_ok++;
+  runtime_success();
+}
+
+static void note_ws_message_failure(const char *msg) {
+  s_ws_message_fail++;
+  runtime_failure(msg);
+}
+
+static void note_command_result_success(void) {
+  s_command_result_ok++;
+}
+
+static void note_command_result_failure(void) {
+  s_command_result_fail++;
+}
+
+static void note_upload_success(void) {
+  s_upload_ok++;
+}
+
+static void note_upload_failure(void) {
+  s_upload_fail++;
+}
+
+static void note_long_poll_success(void) {
+  s_long_poll_ok++;
+}
+
+static void note_long_poll_failure(void) {
+  s_long_poll_fail++;
 }
 
 static void ws_mu_init_once(void) {
@@ -463,6 +517,17 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->circuit_until_unix_ms = s_circuit_until_ms;
   out->ok_count = s_http_ok;
   out->fail_count = s_http_fail;
+  out->http_request_ok_count = s_http_request_ok;
+  out->http_request_fail_count = s_http_request_fail;
+  out->ws_message_ok_count = s_ws_message_ok;
+  out->ws_message_fail_count = s_ws_message_fail;
+  out->ws_pong_count = s_ws_pong;
+  out->command_result_ok_count = s_command_result_ok;
+  out->command_result_fail_count = s_command_result_fail;
+  out->upload_ok_count = s_upload_ok;
+  out->upload_fail_count = s_upload_fail;
+  out->long_poll_ok_count = s_long_poll_ok;
+  out->long_poll_fail_count = s_long_poll_fail;
   out->budget_drop_count = s_budget_drop_count;
   out->last_success_unix_ms = s_last_success_ms;
   out->last_failure_unix_ms = s_last_failure_ms;
@@ -2070,9 +2135,10 @@ int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size
   fclose(f);
   if (rc != 0) {
     (void)remove(file_path);
+    note_http_request_failure();
     return -1;
   }
-  runtime_success();
+  note_http_request_success();
   return 0;
 }
 
@@ -2591,9 +2657,12 @@ static int post_to_suffix(const char *suffix, const char *body) {
   snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
   int rc = native_post_json(url, body, strlen(body));
   if (rc == 0) {
-    runtime_success();
+    note_http_request_success();
   } else if (!s_last_error[0]) {
+    note_http_request_failure();
     runtime_failure("native post failed");
+  } else {
+    note_http_request_failure();
   }
   return rc;
 }
@@ -2670,12 +2739,18 @@ int edr_ingest_http_post_command_result(const char *command_id,
   char *body = NULL;
   size_t body_cap;
   int rc;
+  int ws_was_ready;
   if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
     return -1;
   }
+  ws_was_ready = s_ws_ready ? 1 : 0;
   if (ws_send_command_result(command_id, meta, execution_status, exit_code, detail_utf8) == 0) {
-    runtime_success();
+    note_ws_message_success();
+    note_command_result_success();
     return 0;
+  }
+  if (ws_was_ready) {
+    s_ws_message_fail++;
   }
   cmd = json_escape_alloc(command_id);
   detail = json_escape_alloc(detail_utf8 ? detail_utf8 : "");
@@ -2712,9 +2787,15 @@ int edr_ingest_http_post_command_result(const char *command_id,
   rc = request_to_suffix("POST", "ingest/report-command-result", "application/json",
                          body, strlen(body), NULL, 0u);
   if (rc == 0) {
-    runtime_success();
+    note_http_request_success();
+    note_command_result_success();
   } else if (!s_last_error[0]) {
+    note_http_request_failure();
+    note_command_result_failure();
     runtime_failure("command result http post failed");
+  } else {
+    note_http_request_failure();
+    note_command_result_failure();
   }
   free(cmd);
   free(detail);
@@ -2848,12 +2929,18 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   resp[0] = '\0';
   rc = request_to_suffix("POST", "ingest/upload-file", content_type, body, body_len, resp, sizeof(resp));
   if (rc == 0) {
-    runtime_success();
+    note_http_request_success();
+    note_upload_success();
     if (out_minio_key && out_minio_key_cap > 0u) {
       (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
     }
   } else if (!s_last_error[0]) {
+    note_http_request_failure();
+    note_upload_failure();
     runtime_failure("http upload failed");
+  } else {
+    note_http_request_failure();
+    note_upload_failure();
   }
   free(file_buf);
   free(uid);
@@ -3020,12 +3107,12 @@ static void *control_ws_thread(void *arg)
     s_ws_ready = 1;
     ws_unlock();
     if (ws_send_agent_message(&conn, "agent_hello") == 0) {
-      runtime_success();
+      note_ws_message_success();
       backoff_ms = 5000;
       s_ws_backoff_ms = 0;
       fprintf(stderr, "[ingest-ws] control connected endpoint=%s\n", s_endpoint);
     } else {
-      runtime_failure("control ws hello failed");
+      note_ws_message_failure("control ws hello failed");
     }
     next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
     {
@@ -3037,9 +3124,11 @@ static void *control_ws_thread(void *arg)
         int rc;
         if (unix_ms_now() >= next_hb) {
           if (ws_send_agent_message(&conn, "agent_heartbeat") != 0) {
+            note_ws_message_failure("control ws heartbeat failed");
             disconnect_reason = "heartbeat_write_failed";
             break;
           }
+          note_ws_message_success();
           next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
         }
         rc = ws_read_frame(&conn, &opcode, &payload, &payload_len);
@@ -3060,7 +3149,12 @@ static void *control_ws_thread(void *arg)
         } else if (opcode == 9) {
           ws_lock();
           if (s_ws_conn == &conn) {
-            (void)ws_send_frame(&conn, 10, (const uint8_t *)payload, payload_len);
+            if (ws_send_frame(&conn, 10, (const uint8_t *)payload, payload_len) == 0) {
+              s_ws_pong++;
+              note_ws_message_success();
+            } else {
+              note_ws_message_failure("control ws pong failed");
+            }
           }
           ws_unlock();
         }
@@ -3106,9 +3200,12 @@ static int edr_ingest_http_poll_once(void) {
            s_endpoint, wait_s);
   resp[0] = '\0';
   if (request_to_suffix("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp)) != 0) {
+    note_http_request_failure();
+    note_long_poll_failure();
     return -1;
   }
-  runtime_success();
+  note_http_request_success();
+  note_long_poll_success();
   n = poll_dispatch_commands(resp);
   return n < 0 ? -1 : n;
 }

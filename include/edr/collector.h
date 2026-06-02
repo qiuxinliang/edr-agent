@@ -63,6 +63,11 @@ typedef struct {
     uint64_t collector_dropped;
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;
+    uint64_t agent_self_direct_pid_suppressed;
+    uint64_t agent_self_security_event_suppressed;
+    uint64_t agent_self_record_suppressed;
+    uint64_t agent_self_interest_suppressed;
+    uint64_t agent_self_fuse_provider_suppressed;
     int agent_self_fuse_active;
     int agent_self_fuse_provider_degraded;
     uint64_t agent_self_fuse_until_unix_ms;

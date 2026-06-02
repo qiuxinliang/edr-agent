@@ -429,9 +429,32 @@ static void edr_agent_self_note_suppressed(uint64_t now_ns) {
   }
 }
 
-static void edr_agent_self_count_drop(uint64_t now_ns) {
+typedef enum {
+  EDR_AGENT_SELF_DROP_DIRECT_PID = 1,
+  EDR_AGENT_SELF_DROP_SECURITY_EVENT = 2,
+  EDR_AGENT_SELF_DROP_RECORD = 3,
+  EDR_AGENT_SELF_DROP_INTEREST = 4,
+} EdrAgentSelfDropSource;
+
+static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSource source) {
   s_health.agent_self_suppressed++;
   s_health.collector_dropped++;
+  switch (source) {
+  case EDR_AGENT_SELF_DROP_DIRECT_PID:
+    s_health.agent_self_direct_pid_suppressed++;
+    break;
+  case EDR_AGENT_SELF_DROP_SECURITY_EVENT:
+    s_health.agent_self_security_event_suppressed++;
+    break;
+  case EDR_AGENT_SELF_DROP_RECORD:
+    s_health.agent_self_record_suppressed++;
+    break;
+  case EDR_AGENT_SELF_DROP_INTEREST:
+    s_health.agent_self_interest_suppressed++;
+    break;
+  default:
+    break;
+  }
   edr_agent_self_note_suppressed(now_ns);
 }
 
@@ -845,7 +868,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
     return ERROR_SUCCESS;
   }
   if (edr_agent_self_suppress_security_event(img, cmd, epid, ppid, parent_img)) {
-    edr_agent_self_count_drop(edr_unix_ns());
+    edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_SECURITY_EVENT);
     return ERROR_SUCCESS;
   }
 
@@ -999,8 +1022,8 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     edr_collector_pid_cache_update(&br);
   }
   if (edr_agent_self_suppress_record(&br)) {
-    s_health.agent_self_suppressed++;
-    edr_agent_self_note_suppressed(br.event_time_ns > 0 ? (uint64_t)br.event_time_ns : edr_unix_ns());
+    edr_agent_self_count_drop_source(br.event_time_ns > 0 ? (uint64_t)br.event_time_ns : edr_unix_ns(),
+                                     EDR_AGENT_SELF_DROP_RECORD);
     return 0;
   }
   if (slot->type == EDR_EVENT_PROCESS_TERMINATE || slot->type == EDR_EVENT_DLL_LOAD) {
@@ -1098,11 +1121,12 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   }
   if (!edr_collector_keep_agent_self_events() &&
       event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
-    edr_agent_self_count_drop(edr_unix_ns());
+    edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_DIRECT_PID);
     return;
   }
   if (edr_agent_self_fuse_should_drop_provider(event_record)) {
     s_agent_self_fuse_suppressed++;
+    s_health.agent_self_fuse_provider_suppressed++;
     s_health.collector_dropped++;
     return;
   }
@@ -1119,7 +1143,7 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     EdrSensorInterestEvent interest_event;
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
       if (edr_agent_self_suppress_interest(&interest_event)) {
-        edr_agent_self_count_drop(edr_unix_ns());
+        edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_INTEREST);
         return;
       }
       if (!edr_sensor_interest_should_admit(&interest_event)) {

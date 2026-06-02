@@ -32,6 +32,17 @@ typedef struct {
   int64_t circuit_until_unix_ms;
   unsigned long ok_count;
   unsigned long fail_count;
+  unsigned long http_request_ok_count;
+  unsigned long http_request_fail_count;
+  unsigned long ws_message_ok_count;
+  unsigned long ws_message_fail_count;
+  unsigned long ws_pong_count;
+  unsigned long command_result_ok_count;
+  unsigned long command_result_fail_count;
+  unsigned long upload_ok_count;
+  unsigned long upload_fail_count;
+  unsigned long long_poll_ok_count;
+  unsigned long long_poll_fail_count;
   unsigned long budget_drop_count;
   int64_t last_success_unix_ms;
   int64_t last_failure_unix_ms;
