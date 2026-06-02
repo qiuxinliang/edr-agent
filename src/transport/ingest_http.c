@@ -3154,6 +3154,11 @@ static void *command_poll_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
+    if (s_ws_ready) {
+      s_poll_backoff_ms = 0;
+      sleep_poll_ms(5000);
+      continue;
+    }
     rc = edr_ingest_http_poll_once();
     if (rc >= 0) {
       backoff_ms = 5000;
