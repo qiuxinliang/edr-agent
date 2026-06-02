@@ -149,8 +149,8 @@ void edr_resource_poll(void) {
   s_last.kernel = now_kernel;
   s_last.user = now_user;
 
-  bool cpu_bad = enforce_limits && pct > s_cfg->resource_limit.cpu_limit_percent &&
-                 pct > s_cfg->resource_limit.emergency_cpu_limit;
+  bool cpu_soft = enforce_limits && pct > s_cfg->resource_limit.cpu_limit_percent;
+  bool cpu_bad = cpu_soft && pct > s_cfg->resource_limit.emergency_cpu_limit;
   bool mem_bad = enforce_limits && s_cfg->resource_limit.memory_limit_mb > 0u &&
                  rss_mb > (unsigned long)s_cfg->resource_limit.memory_limit_mb;
   s_sample.cpu_percent = pct;
@@ -164,6 +164,9 @@ void edr_resource_poll(void) {
             s_cfg->resource_limit.cpu_limit_percent, s_emergency);
     s_preprocess_throttle = 1;
     set_pressure_sample(1u, 2u, "cpu");
+  } else if (cpu_soft) {
+    s_preprocess_throttle = 1;
+    set_pressure_sample(1u, 1u, "cpu_soft");
   } else if (mem_bad) {
     fprintf(stderr, "[resource] RSS approx %lu MB exceeds memory_limit_mb=%u\n", rss_mb,
             s_cfg->resource_limit.memory_limit_mb);
@@ -198,8 +201,8 @@ void edr_resource_poll(void) {
   s_last.wall = now;
   s_last.ru = ru;
 
-  bool cpu_bad = enforce_limits && pct > s_cfg->resource_limit.cpu_limit_percent &&
-                 pct > s_cfg->resource_limit.emergency_cpu_limit;
+  bool cpu_soft = enforce_limits && pct > s_cfg->resource_limit.cpu_limit_percent;
+  bool cpu_bad = cpu_soft && pct > s_cfg->resource_limit.emergency_cpu_limit;
   bool mem_bad = false;
   unsigned long rss_mb = 0;
 
@@ -222,6 +225,9 @@ void edr_resource_poll(void) {
             s_cfg->resource_limit.cpu_limit_percent, s_emergency);
     s_preprocess_throttle = 1;
     set_pressure_sample(1u, 2u, "cpu");
+  } else if (cpu_soft) {
+    s_preprocess_throttle = 1;
+    set_pressure_sample(1u, 1u, "cpu_soft");
   } else if (mem_bad) {
     s_preprocess_throttle = 1;
     set_pressure_sample(1u, 2u, "memory");

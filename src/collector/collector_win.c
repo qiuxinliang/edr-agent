@@ -64,6 +64,11 @@ static uint32_t s_agent_self_pid_cache[EDR_AGENT_SELF_PID_CACHE];
 static uint64_t s_agent_self_seen_ns[EDR_AGENT_SELF_PID_CACHE];
 static uint32_t s_agent_self_pid_next;
 static char s_agent_exe_path[MAX_PATH];
+static uint64_t s_agent_self_minute_unix;
+static uint64_t s_agent_self_minute_count;
+static uint64_t s_agent_self_fuse_until_ns;
+static uint64_t s_agent_self_fuse_trips;
+static uint64_t s_agent_self_fuse_suppressed;
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
 
@@ -284,6 +289,25 @@ static int edr_collector_keep_agent_self_events(void) {
   return edr_env_bool_default("EDR_COLLECTOR_KEEP_AGENT_SELF", 0);
 }
 
+static uint64_t edr_env_u64_clamped(const char *name, uint64_t defv, uint64_t minv, uint64_t maxv) {
+  const char *e = getenv(name);
+  uint64_t v = defv;
+  if (e && e[0]) {
+    char *end = NULL;
+    unsigned long long parsed = strtoull(e, &end, 10);
+    if (end && *end == '\0') {
+      v = (uint64_t)parsed;
+    }
+  }
+  if (v < minv) {
+    v = minv;
+  }
+  if (v > maxv) {
+    v = maxv;
+  }
+  return v;
+}
+
 static uint64_t edr_agent_self_ttl_ns(void) {
   const char *e = getenv("EDR_AGENT_SELF_SUPPRESS_TTL_S");
   long v = e && e[0] ? strtol(e, NULL, 10) : 600L;
@@ -294,6 +318,56 @@ static uint64_t edr_agent_self_ttl_ns(void) {
     v = 86400L;
   }
   return (uint64_t)v * 1000000000ULL;
+}
+
+static uint64_t edr_agent_self_fuse_threshold_per_min(void) {
+  return edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_PER_MIN", 50000ULL, 1000ULL, 10000000ULL);
+}
+
+static uint64_t edr_agent_self_fuse_cooldown_ns(void) {
+  uint64_t s = edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_COOLDOWN_S", 300ULL, 30ULL, 3600ULL);
+  return s * 1000000000ULL;
+}
+
+static int edr_agent_self_fuse_active(uint64_t now_ns) {
+  if (edr_collector_keep_agent_self_events()) {
+    return 0;
+  }
+  if (s_agent_self_fuse_until_ns == 0u) {
+    return 0;
+  }
+  if (s_agent_self_fuse_until_ns <= now_ns) {
+    s_agent_self_fuse_until_ns = 0u;
+    return 0;
+  }
+  return 1;
+}
+
+static void edr_agent_self_note_suppressed(uint64_t now_ns) {
+  uint64_t minute = (now_ns / 1000000000ULL) / 60ULL;
+  if (s_agent_self_minute_unix != minute) {
+    s_agent_self_minute_unix = minute;
+    s_agent_self_minute_count = 0u;
+  }
+  s_agent_self_minute_count++;
+  if (edr_agent_self_fuse_active(now_ns)) {
+    return;
+  }
+  uint64_t threshold = edr_agent_self_fuse_threshold_per_min();
+  if (s_agent_self_minute_count >= threshold) {
+    s_agent_self_fuse_until_ns = now_ns + edr_agent_self_fuse_cooldown_ns();
+    s_agent_self_fuse_trips++;
+    fprintf(stderr,
+            "[collector_win] agent self-noise fuse active count=%llu threshold=%llu cooldown_s=%llu\n",
+            (unsigned long long)s_agent_self_minute_count, (unsigned long long)threshold,
+            (unsigned long long)(edr_agent_self_fuse_cooldown_ns() / 1000000000ULL));
+  }
+}
+
+static void edr_agent_self_count_drop(uint64_t now_ns) {
+  s_health.agent_self_suppressed++;
+  s_health.collector_dropped++;
+  edr_agent_self_note_suppressed(now_ns);
 }
 
 static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
@@ -369,6 +443,13 @@ static int edr_agent_self_process_name(const char *s) {
          edr_contains_ci_path(s, "edr_agent_install.ps1");
 }
 
+static uint32_t edr_parse_pid_text(const char *s) {
+  if (!s || !s[0]) {
+    return 0u;
+  }
+  return (uint32_t)strtoul(s, NULL, 0);
+}
+
 static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
   if (!ev || edr_collector_keep_agent_self_events()) {
     return 0;
@@ -382,6 +463,29 @@ static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
   if (edr_agent_self_process_name(ev->process_name) || edr_agent_self_text_marker(ev->path) ||
       edr_agent_self_text_marker(ev->registry_path)) {
     edr_agent_self_mark_pid(ev->pid, now);
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_agent_self_suppress_security_event(const char *img, const char *cmd,
+                                                  const char *epid, const char *ppid,
+                                                  const char *parent_img) {
+  if (edr_collector_keep_agent_self_events()) {
+    return 0;
+  }
+  uint64_t now = edr_unix_ns();
+  uint32_t pid = edr_parse_pid_text(epid);
+  uint32_t parent_pid = edr_parse_pid_text(ppid);
+  if (pid == s_agent_pid || parent_pid == s_agent_pid ||
+      edr_agent_self_pid_seen(pid, now) || edr_agent_self_pid_seen(parent_pid, now)) {
+    edr_agent_self_mark_pid(pid, now);
+    return 1;
+  }
+  if (edr_agent_self_process_name(img) || edr_agent_self_process_name(parent_img) ||
+      edr_agent_self_text_marker(img) || edr_agent_self_text_marker(cmd) ||
+      edr_agent_self_text_marker(parent_img)) {
+    edr_agent_self_mark_pid(pid, now);
     return 1;
   }
   return 0;
@@ -401,6 +505,28 @@ static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
       edr_agent_self_text_marker(br->cmdline) || edr_agent_self_text_marker(br->file_path) ||
       edr_agent_self_text_marker(br->reg_key_path) || edr_agent_self_text_marker(br->network_aux_path)) {
     edr_agent_self_mark_pid(br->pid, now);
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_agent_self_fuse_should_drop_provider(PEVENT_RECORD event_record) {
+  if (!event_record || s_agent_self_fuse_until_ns == 0u) {
+    return 0;
+  }
+  if (!edr_agent_self_fuse_active(edr_unix_ns())) {
+    return 0;
+  }
+  const GUID *g = &event_record->EventHeader.ProviderId;
+  UCHAR op = event_record->EventHeader.EventDescriptor.Opcode;
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
+    return 1;
+  }
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 && op != 1u) {
     return 1;
   }
   return 0;
@@ -653,6 +779,10 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
     s_health.collector_dropped++;
     return ERROR_SUCCESS;
   }
+  if (edr_agent_self_suppress_security_event(img, cmd, epid, ppid, parent_img)) {
+    edr_agent_self_count_drop(edr_unix_ns());
+    return ERROR_SUCCESS;
+  }
 
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
@@ -805,6 +935,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   }
   if (edr_agent_self_suppress_record(&br)) {
     s_health.agent_self_suppressed++;
+    edr_agent_self_note_suppressed(br.event_time_ns > 0 ? (uint64_t)br.event_time_ns : edr_unix_ns());
     return 0;
   }
   if (slot->type == EDR_EVENT_PROCESS_TERMINATE || slot->type == EDR_EVENT_DLL_LOAD) {
@@ -900,6 +1031,16 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (!s_bus || !event_record) {
     return;
   }
+  if (!edr_collector_keep_agent_self_events() &&
+      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
+    edr_agent_self_count_drop(edr_unix_ns());
+    return;
+  }
+  if (edr_agent_self_fuse_should_drop_provider(event_record)) {
+    s_agent_self_fuse_suppressed++;
+    s_health.collector_dropped++;
+    return;
+  }
   EdrEventType ty;
   const char *tag;
   if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
@@ -909,17 +1050,11 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
     edr_pmfe_on_process_lifecycle_hint();
   }
-  if (event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
-    s_health.agent_self_suppressed++;
-    s_health.collector_dropped++;
-    return;
-  }
   {
     EdrSensorInterestEvent interest_event;
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
       if (edr_agent_self_suppress_interest(&interest_event)) {
-        s_health.agent_self_suppressed++;
-        s_health.collector_dropped++;
+        edr_agent_self_count_drop(edr_unix_ns());
         return;
       }
       if (!edr_sensor_interest_should_admit(&interest_event)) {
@@ -1107,6 +1242,11 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   memset(s_agent_self_pid_cache, 0, sizeof(s_agent_self_pid_cache));
   memset(s_agent_self_seen_ns, 0, sizeof(s_agent_self_seen_ns));
   s_agent_self_pid_next = 0u;
+  s_agent_self_minute_unix = 0u;
+  s_agent_self_minute_count = 0u;
+  s_agent_self_fuse_until_ns = 0u;
+  s_agent_self_fuse_trips = 0u;
+  s_agent_self_fuse_suppressed = 0u;
   edr_sensor_interest_lazy_init();
 
   ULONG name_bytes =
@@ -1207,6 +1347,14 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
     return -1;
   }
   *out_health = s_health;
+  {
+    uint64_t now = edr_unix_ns();
+    out_health->agent_self_fuse_active = edr_agent_self_fuse_active(now);
+    out_health->agent_self_fuse_until_unix_ms =
+        s_agent_self_fuse_until_ns > 0u ? (s_agent_self_fuse_until_ns / 1000000ULL) : 0u;
+    out_health->agent_self_fuse_trips = s_agent_self_fuse_trips;
+    out_health->agent_self_fuse_suppressed = s_agent_self_fuse_suppressed;
+  }
   out_health->etw_or_inotify_enabled = InterlockedCompareExchange(&s_started, 0, 0) ? 1 : out_health->etw_or_inotify_enabled;
   if (s_bus) {
     out_health->queue_dropped = edr_event_bus_dropped_total(s_bus);
