@@ -2076,6 +2076,8 @@ int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size
   return 0;
 }
 
+static void sleep_poll_ms(int ms);
+
 static int ws_recv_some(EdrWsConn *c, char *buf, int cap) {
   if (!c || cap <= 0) {
     return -1;
@@ -2143,6 +2145,7 @@ static int ws_read_exact(EdrWsConn *c, uint8_t *buf, size_t len) {
       if (off == 0u) {
         return -2;
       }
+      sleep_poll_ms(10);
       continue;
     }
     if (n <= 0) {
@@ -2165,6 +2168,7 @@ static int ws_write_all(EdrWsConn *c, const uint8_t *buf, size_t len) {
       if (n <= 0) {
         int e = SSL_get_error(c->ssl, n);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+          sleep_poll_ms(10);
           continue;
         }
         return -1;
@@ -2186,6 +2190,7 @@ static int ws_write_all(EdrWsConn *c, const uint8_t *buf, size_t len) {
       ssize_t n = send(c->fd, (const char *)buf + off, len - off, 0);
       if (n <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          sleep_poll_ms(10);
           continue;
         }
         return -1;
@@ -3039,6 +3044,7 @@ static void *control_ws_thread(void *arg)
         }
         rc = ws_read_frame(&conn, &opcode, &payload, &payload_len);
         if (rc == -2) {
+          sleep_poll_ms(50);
           continue;
         }
         if (rc != 0) {
