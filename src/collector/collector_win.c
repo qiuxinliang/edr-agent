@@ -357,7 +357,10 @@ static void edr_agent_self_fuse_control_noise_providers(ULONG control_code) {
     const GUID *guid;
     int mandatory;
   } NoiseProvider;
+  /* During a self-noise fuse we temporarily drop kernel process as well:
+   * Security 4688/EventLog remains enabled and keeps ProcessCreate coverage. */
   const NoiseProvider providers[] = {
+      {&EDR_ETW_GUID_KERNEL_PROCESS, 1},
       {&EDR_ETW_GUID_KERNEL_FILE, 1},
       {&EDR_ETW_GUID_KERNEL_NETWORK, 1},
       {&EDR_ETW_GUID_KERNEL_REGISTRY, 1},
