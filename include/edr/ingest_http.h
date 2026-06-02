@@ -20,6 +20,9 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
 
 int edr_ingest_http_configured(void);
 
+/** 当前 native HTTP circuit 是否仍处于打开状态；到期时自动复位。 */
+int edr_ingest_http_circuit_open(void);
+
 typedef struct {
   int configured;
   int http_fallback_available;

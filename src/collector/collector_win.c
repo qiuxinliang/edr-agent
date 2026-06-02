@@ -323,11 +323,11 @@ static uint64_t edr_agent_self_ttl_ns(void) {
 }
 
 static uint64_t edr_agent_self_fuse_threshold_per_min(void) {
-  return edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_PER_MIN", 50000ULL, 1000ULL, 10000000ULL);
+  return edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_PER_MIN", 10000ULL, 1000ULL, 10000000ULL);
 }
 
 static uint64_t edr_agent_self_fuse_cooldown_ns(void) {
-  uint64_t s = edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_COOLDOWN_S", 300ULL, 30ULL, 3600ULL);
+  uint64_t s = edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_COOLDOWN_S", 600ULL, 30ULL, 3600ULL);
   return s * 1000000000ULL;
 }
 

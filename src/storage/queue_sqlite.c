@@ -229,6 +229,9 @@ static int drain_one_row(void) {
     send = edr_grpc_client_send_batch(batch_id, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
   if (send != 0 && edr_ingest_http_configured()) {
+    if (edr_ingest_http_circuit_open()) {
+      return 2;
+    }
     send = edr_ingest_http_post_report_events(batch_id, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
   if (send == 0) {
@@ -433,6 +436,10 @@ void edr_storage_queue_poll_drain(void) {
   if (!s_db || s_pending == 0u) {
     last_ns = now;
     cleanup_expired_rows();
+    return;
+  }
+  if (!edr_grpc_client_ready() && edr_ingest_http_circuit_open()) {
+    last_ns = now;
     return;
   }
   last_ns = now;

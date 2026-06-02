@@ -77,6 +77,8 @@ static unsigned long s_upload_ok;
 static unsigned long s_upload_fail;
 static unsigned long s_long_poll_ok;
 static unsigned long s_long_poll_fail;
+static int64_t s_native_post_fail_log_until_ms;
+static unsigned long s_native_post_fail_log_suppressed;
 static int64_t s_last_success_ms;
 static int64_t s_last_failure_ms;
 static char s_last_error[160];
@@ -236,10 +238,10 @@ static void comm_open_circuit(const char *reason) {
   snprintf(s_circuit_reason, sizeof(s_circuit_reason), "%s", reason ? reason : "transport failures");
 }
 
-static int comm_circuit_allows(void) {
+int edr_ingest_http_circuit_open(void) {
   int64_t now;
   if (!s_circuit_open) {
-    return 1;
+    return 0;
   }
   now = unix_ms_now();
   if (now >= s_circuit_until_ms) {
@@ -247,8 +249,17 @@ static int comm_circuit_allows(void) {
     s_circuit_until_ms = 0;
     s_circuit_reason[0] = '\0';
     s_consecutive_failures = 0;
+    return 0;
+  }
+  return 1;
+}
+
+static int comm_circuit_allows(void) {
+  int64_t now;
+  if (!edr_ingest_http_circuit_open()) {
     return 1;
   }
+  now = unix_ms_now();
   snprintf(s_last_error, sizeof(s_last_error), "circuit open: %s", s_circuit_reason);
   s_last_failure_ms = now;
   return 0;
@@ -317,6 +328,25 @@ static void note_long_poll_success(void) {
 
 static void note_long_poll_failure(void) {
   s_long_poll_fail++;
+}
+
+static void log_native_post_failure(const char *label, int rc) {
+  int64_t now = unix_ms_now();
+  if (s_native_post_fail_log_until_ms > now) {
+    s_native_post_fail_log_suppressed++;
+    return;
+  }
+  unsigned long suppressed = s_native_post_fail_log_suppressed;
+  s_native_post_fail_log_suppressed = 0;
+  s_native_post_fail_log_until_ms =
+      now + (int64_t)env_ul_clamped("EDR_HTTP_FAILURE_LOG_INTERVAL_MS", 60000ul, 1000ul, 600000ul);
+  if (suppressed > 0ul) {
+    fprintf(stderr, "[ingest-http] %s native post failed rc=%d (rest=%s err=%s suppressed=%lu)\n",
+            label ? label : "request", rc, s_rest, s_last_error, suppressed);
+    return;
+  }
+  fprintf(stderr, "[ingest-http] %s native post failed rc=%d (rest=%s err=%s)\n",
+          label ? label : "request", rc, s_rest, s_last_error);
 }
 
 static void ws_mu_init_once(void) {
@@ -2706,7 +2736,7 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   int rc = post_to_suffix("ingest/report-events", body);
   free(body);
   if (rc != 0) {
-    fprintf(stderr, "[ingest-http] native post failed rc=%d (rest=%s err=%s)\n", rc, s_rest, s_last_error);
+    log_native_post_failure("report-events", rc);
     return -1;
   }
   return 0;
@@ -2719,8 +2749,7 @@ int edr_ingest_http_post_engine_health_json(const char *body_json) {
 
   int rc = post_to_suffix("ingest/engine-health", body_json);
   if (rc != 0) {
-    fprintf(stderr, "[ingest-http] engine_health native post failed rc=%d (rest=%s err=%s)\n", rc, s_rest,
-            s_last_error);
+    log_native_post_failure("engine_health", rc);
     return -1;
   }
   return 0;
