@@ -46,6 +46,7 @@ static HANDLE s_consumer_thread;
 static EVT_HANDLE s_security_sub;
 static volatile LONG s_started;
 static EdrCollectorHealth s_health;
+static const EdrConfig *s_collector_cfg;
 
 #define EDR_COLLECTOR_PID_CACHE 512u
 #define EDR_AGENT_SELF_PID_CACHE 128u
@@ -69,6 +70,7 @@ static uint64_t s_agent_self_minute_count;
 static uint64_t s_agent_self_fuse_until_ns;
 static uint64_t s_agent_self_fuse_trips;
 static uint64_t s_agent_self_fuse_suppressed;
+static int s_agent_self_fuse_provider_degraded;
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
 
@@ -329,6 +331,64 @@ static uint64_t edr_agent_self_fuse_cooldown_ns(void) {
   return s * 1000000000ULL;
 }
 
+static ULONG edr_control_trace_provider(const GUID *guid, ULONG control_code) {
+  if (!guid || s_session_handle == INVALID_PROCESSTRACE_HANDLE) {
+    return ERROR_INVALID_HANDLE;
+  }
+  return EnableTraceEx2(s_session_handle, guid, control_code, TRACE_LEVEL_VERBOSE,
+                        0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
+}
+
+static int edr_optional_provider_wanted(const GUID *guid) {
+  if (!guid || !s_collector_cfg) {
+    return 0;
+  }
+  if (memcmp(guid, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
+    return s_collector_cfg->collection.etw_tcpip_provider ? 1 : 0;
+  }
+  if (memcmp(guid, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
+    return s_collector_cfg->collection.etw_firewall_provider ? 1 : 0;
+  }
+  return 0;
+}
+
+static void edr_agent_self_fuse_control_noise_providers(ULONG control_code) {
+  typedef struct {
+    const GUID *guid;
+    int mandatory;
+  } NoiseProvider;
+  const NoiseProvider providers[] = {
+      {&EDR_ETW_GUID_KERNEL_FILE, 1},
+      {&EDR_ETW_GUID_KERNEL_NETWORK, 1},
+      {&EDR_ETW_GUID_KERNEL_REGISTRY, 1},
+      {&EDR_ETW_GUID_MICROSOFT_TCPIP, 0},
+      {&EDR_ETW_GUID_WINFIREWALL_WFAS, 0},
+  };
+  for (size_t i = 0; i < sizeof(providers) / sizeof(providers[0]); i++) {
+    if (control_code == EVENT_CONTROL_CODE_ENABLE_PROVIDER &&
+        !providers[i].mandatory && !edr_optional_provider_wanted(providers[i].guid)) {
+      continue;
+    }
+    (void)edr_control_trace_provider(providers[i].guid, control_code);
+  }
+}
+
+static void edr_agent_self_fuse_degrade_providers(void) {
+  if (s_agent_self_fuse_provider_degraded || edr_collector_keep_agent_self_events()) {
+    return;
+  }
+  edr_agent_self_fuse_control_noise_providers(EVENT_CONTROL_CODE_DISABLE_PROVIDER);
+  s_agent_self_fuse_provider_degraded = 1;
+}
+
+static void edr_agent_self_fuse_restore_providers(void) {
+  if (!s_agent_self_fuse_provider_degraded) {
+    return;
+  }
+  edr_agent_self_fuse_control_noise_providers(EVENT_CONTROL_CODE_ENABLE_PROVIDER);
+  s_agent_self_fuse_provider_degraded = 0;
+}
+
 static int edr_agent_self_fuse_active(uint64_t now_ns) {
   if (edr_collector_keep_agent_self_events()) {
     return 0;
@@ -338,6 +398,7 @@ static int edr_agent_self_fuse_active(uint64_t now_ns) {
   }
   if (s_agent_self_fuse_until_ns <= now_ns) {
     s_agent_self_fuse_until_ns = 0u;
+    edr_agent_self_fuse_restore_providers();
     return 0;
   }
   return 1;
@@ -357,6 +418,7 @@ static void edr_agent_self_note_suppressed(uint64_t now_ns) {
   if (s_agent_self_minute_count >= threshold) {
     s_agent_self_fuse_until_ns = now_ns + edr_agent_self_fuse_cooldown_ns();
     s_agent_self_fuse_trips++;
+    edr_agent_self_fuse_degrade_providers();
     fprintf(stderr,
             "[collector_win] agent self-noise fuse active count=%llu threshold=%llu cooldown_s=%llu\n",
             (unsigned long long)s_agent_self_minute_count, (unsigned long long)threshold,
@@ -1234,6 +1296,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
 
   s_bus = bus;
+  s_collector_cfg = cfg;
   s_agent_pid = GetCurrentProcessId();
   s_agent_exe_path[0] = '\0';
   (void)GetModuleFileNameA(NULL, s_agent_exe_path, (DWORD)sizeof(s_agent_exe_path));
@@ -1247,6 +1310,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_agent_self_fuse_until_ns = 0u;
   s_agent_self_fuse_trips = 0u;
   s_agent_self_fuse_suppressed = 0u;
+  s_agent_self_fuse_provider_degraded = 0;
   edr_sensor_interest_lazy_init();
 
   ULONG name_bytes =
@@ -1337,7 +1401,9 @@ void edr_collector_stop(void) {
     s_consumer_thread = NULL;
   }
 
+  s_agent_self_fuse_provider_degraded = 0;
   s_bus = NULL;
+  s_collector_cfg = NULL;
 }
 
 int edr_collector_get_health(EdrCollectorHealth *out_health) {
@@ -1350,6 +1416,7 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   {
     uint64_t now = edr_unix_ns();
     out_health->agent_self_fuse_active = edr_agent_self_fuse_active(now);
+    out_health->agent_self_fuse_provider_degraded = s_agent_self_fuse_provider_degraded;
     out_health->agent_self_fuse_until_unix_ms =
         s_agent_self_fuse_until_ns > 0u ? (s_agent_self_fuse_until_ns / 1000000ULL) : 0u;
     out_health->agent_self_fuse_trips = s_agent_self_fuse_trips;

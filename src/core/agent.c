@@ -523,8 +523,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
-      "\"agent_self_fuse\":{\"active\":%s,\"until_unix_ms\":%llu,"
-      "\"trips\":%llu,\"suppressed\":%llu},"
+      "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
+      "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu},"
       "\"drop_breakdown\":{\"agent_self\":%llu,\"lifecycle\":%llu,"
       "\"auth\":%llu,\"invalid_process\":%llu,\"ordinary_file\":%llu,"
       "\"ordinary_registry\":%llu,\"ordinary_network\":%llu,\"metadata\":%llu},"
@@ -627,6 +627,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.ebpf_events, (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
       ch.agent_self_fuse_active ? "true" : "false",
+      ch.agent_self_fuse_provider_degraded ? "true" : "false",
       (unsigned long long)ch.agent_self_fuse_until_unix_ms,
       (unsigned long long)ch.agent_self_fuse_trips,
       (unsigned long long)ch.agent_self_fuse_suppressed,
