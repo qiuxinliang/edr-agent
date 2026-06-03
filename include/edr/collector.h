@@ -60,6 +60,7 @@ typedef struct {
     int ebpf_loaded;
     uint64_t auditd_events;
     uint64_t ebpf_events;
+    uint32_t collector_thread_id;
     uint64_t collector_dropped;
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;

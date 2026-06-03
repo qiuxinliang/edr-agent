@@ -22,6 +22,11 @@ typedef struct {
   uint64_t rss_mb;
   uint32_t thread_count;
   uint32_t handle_count;
+  uint32_t hot_thread_id;
+  uint32_t hot_thread_cpu_percent;
+  uint64_t hot_thread_kernel_delta_100ns;
+  uint64_t hot_thread_user_delta_100ns;
+  uint64_t hot_thread_total_delta_100ns;
   uint32_t throttle_active;
   uint32_t pressure_level;
   uint64_t sample_count;

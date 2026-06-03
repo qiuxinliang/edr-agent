@@ -43,6 +43,7 @@ static EdrEventBus *s_bus;
 static DWORD s_agent_pid;
 static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
+static DWORD s_consumer_thread_id;
 static EVT_HANDLE s_security_sub;
 static volatile LONG s_started;
 static EdrCollectorHealth s_health;
@@ -1392,7 +1393,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   edr_start_security_eventlog_subscription();
 
   s_consumer_thread =
-      CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, NULL);
+      CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, &s_consumer_thread_id);
   if (!s_consumer_thread) {
     EVENT_TRACE_PROPERTIES stop = {0};
     stop.Wnode.BufferSize = sizeof(stop);
@@ -1429,6 +1430,7 @@ void edr_collector_stop(void) {
   }
 
   s_agent_self_fuse_provider_degraded = 0;
+  s_consumer_thread_id = 0u;
   s_bus = NULL;
   s_collector_cfg = NULL;
 }
@@ -1450,6 +1452,7 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
     out_health->agent_self_fuse_suppressed = s_agent_self_fuse_suppressed;
   }
   out_health->etw_or_inotify_enabled = InterlockedCompareExchange(&s_started, 0, 0) ? 1 : out_health->etw_or_inotify_enabled;
+  out_health->collector_thread_id = (uint32_t)s_consumer_thread_id;
   if (s_bus) {
     out_health->queue_dropped = edr_event_bus_dropped_total(s_bus);
   }

@@ -10,6 +10,9 @@
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#ifndef THREAD_QUERY_LIMITED_INFORMATION
+#define THREAD_QUERY_LIMITED_INFORMATION 0x0800
+#endif
 #else
 #include <sys/resource.h>
 #include <sys/time.h>
@@ -31,6 +34,18 @@ static struct {
   struct rusage ru;
 #endif
 } s_last;
+
+#ifdef _WIN32
+typedef struct {
+  DWORD tid;
+  uint64_t kernel_100ns;
+  uint64_t user_100ns;
+} EdrThreadCpuPoint;
+
+#define EDR_THREAD_CPU_POINTS_MAX 512u
+static EdrThreadCpuPoint s_thread_cpu_prev[EDR_THREAD_CPU_POINTS_MAX];
+static size_t s_thread_cpu_prev_count;
+#endif
 
 static void sample_init(void) {
 #ifdef _WIN32
@@ -63,6 +78,9 @@ void edr_resource_init(const EdrConfig *cfg) {
   s_emergency = 0;
   s_preprocess_throttle = 0;
   memset(&s_sample, 0, sizeof(s_sample));
+#ifdef _WIN32
+  s_thread_cpu_prev_count = 0u;
+#endif
   set_pressure_sample(0u, 0u, "ok");
   sample_init();
 }
@@ -86,11 +104,35 @@ static uint64_t filetime_u64(FILETIME ft) {
   return u.QuadPart;
 }
 
-static uint32_t count_threads_for_pid(DWORD pid) {
+static int thread_cpu_prev_find(DWORD tid, uint64_t *kernel_100ns, uint64_t *user_100ns) {
+  for (size_t i = 0; i < s_thread_cpu_prev_count; i++) {
+    if (s_thread_cpu_prev[i].tid == tid) {
+      if (kernel_100ns) {
+        *kernel_100ns = s_thread_cpu_prev[i].kernel_100ns;
+      }
+      if (user_100ns) {
+        *user_100ns = s_thread_cpu_prev[i].user_100ns;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static uint32_t sample_threads_for_pid(DWORD pid, uint64_t wall_delta_100ns, DWORD ncpu,
+                                       uint32_t *hot_thread_id, uint32_t *hot_thread_cpu_percent,
+                                       uint64_t *hot_kernel_delta_100ns,
+                                       uint64_t *hot_user_delta_100ns) {
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
   if (snap == INVALID_HANDLE_VALUE) {
     return 0u;
   }
+  EdrThreadCpuPoint current[EDR_THREAD_CPU_POINTS_MAX];
+  size_t current_count = 0u;
+  uint64_t best_delta_100ns = 0u;
+  uint64_t best_kernel_delta_100ns = 0u;
+  uint64_t best_user_delta_100ns = 0u;
+  DWORD best_tid = 0u;
   THREADENTRY32 te;
   memset(&te, 0, sizeof(te));
   te.dwSize = sizeof(te);
@@ -99,10 +141,57 @@ static uint32_t count_threads_for_pid(DWORD pid) {
     do {
       if (te.th32OwnerProcessID == pid) {
         n++;
+        if (current_count < EDR_THREAD_CPU_POINTS_MAX) {
+          HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+          if (th) {
+            FILETIME create_time, exit_time, kernel_time, user_time;
+            if (GetThreadTimes(th, &create_time, &exit_time, &kernel_time, &user_time)) {
+              uint64_t kernel_100ns = filetime_u64(kernel_time);
+              uint64_t user_100ns = filetime_u64(user_time);
+              uint64_t prev_kernel_100ns = 0u;
+              uint64_t prev_user_100ns = 0u;
+              if (thread_cpu_prev_find(te.th32ThreadID, &prev_kernel_100ns, &prev_user_100ns)) {
+                uint64_t kernel_delta_100ns = kernel_100ns >= prev_kernel_100ns
+                                                  ? kernel_100ns - prev_kernel_100ns
+                                                  : 0u;
+                uint64_t user_delta_100ns = user_100ns >= prev_user_100ns ? user_100ns - prev_user_100ns : 0u;
+                uint64_t total_delta_100ns = kernel_delta_100ns + user_delta_100ns;
+                if (total_delta_100ns > best_delta_100ns) {
+                  best_delta_100ns = total_delta_100ns;
+                  best_kernel_delta_100ns = kernel_delta_100ns;
+                  best_user_delta_100ns = user_delta_100ns;
+                  best_tid = te.th32ThreadID;
+                }
+              }
+              current[current_count].tid = te.th32ThreadID;
+              current[current_count].kernel_100ns = kernel_100ns;
+              current[current_count].user_100ns = user_100ns;
+              current_count++;
+            }
+            CloseHandle(th);
+          }
+        }
       }
     } while (Thread32Next(snap, &te));
   }
   CloseHandle(snap);
+  if (current_count > 0u) {
+    memcpy(s_thread_cpu_prev, current, current_count * sizeof(current[0]));
+    s_thread_cpu_prev_count = current_count;
+  }
+  if (hot_thread_id) {
+    *hot_thread_id = best_tid;
+  }
+  if (hot_thread_cpu_percent) {
+    uint64_t denom = wall_delta_100ns * (uint64_t)(ncpu ? ncpu : 1u);
+    *hot_thread_cpu_percent = denom > 0u ? (uint32_t)((best_delta_100ns * 100ULL) / denom) : 0u;
+  }
+  if (hot_kernel_delta_100ns) {
+    *hot_kernel_delta_100ns = best_kernel_delta_100ns;
+  }
+  if (hot_user_delta_100ns) {
+    *hot_user_delta_100ns = best_user_delta_100ns;
+  }
   return n;
 }
 #endif
@@ -144,6 +233,14 @@ void edr_resource_poll(void) {
   }
   DWORD handles = 0;
   (void)GetProcessHandleCount(GetCurrentProcess(), &handles);
+  uint32_t hot_thread_id = 0u;
+  uint32_t hot_thread_cpu_percent = 0u;
+  uint64_t hot_thread_kernel_delta_100ns = 0u;
+  uint64_t hot_thread_user_delta_100ns = 0u;
+  uint32_t thread_count =
+      sample_threads_for_pid(GetCurrentProcessId(), wall_delta, ncpu, &hot_thread_id,
+                             &hot_thread_cpu_percent, &hot_thread_kernel_delta_100ns,
+                             &hot_thread_user_delta_100ns);
 
   s_last.wall = now_wall;
   s_last.kernel = now_kernel;
@@ -155,8 +252,13 @@ void edr_resource_poll(void) {
                  rss_mb > (unsigned long)s_cfg->resource_limit.memory_limit_mb;
   s_sample.cpu_percent = pct;
   s_sample.rss_mb = rss_mb;
-  s_sample.thread_count = count_threads_for_pid(GetCurrentProcessId());
+  s_sample.thread_count = thread_count;
   s_sample.handle_count = (uint32_t)handles;
+  s_sample.hot_thread_id = hot_thread_id;
+  s_sample.hot_thread_cpu_percent = hot_thread_cpu_percent;
+  s_sample.hot_thread_kernel_delta_100ns = hot_thread_kernel_delta_100ns;
+  s_sample.hot_thread_user_delta_100ns = hot_thread_user_delta_100ns;
+  s_sample.hot_thread_total_delta_100ns = hot_thread_kernel_delta_100ns + hot_thread_user_delta_100ns;
   s_sample.sample_count++;
   if (cpu_bad) {
     s_emergency++;
@@ -241,6 +343,11 @@ void edr_resource_poll(void) {
   s_sample.rss_mb = rss_mb;
   s_sample.thread_count = 0u;
   s_sample.handle_count = 0u;
+  s_sample.hot_thread_id = 0u;
+  s_sample.hot_thread_cpu_percent = 0u;
+  s_sample.hot_thread_kernel_delta_100ns = 0u;
+  s_sample.hot_thread_user_delta_100ns = 0u;
+  s_sample.hot_thread_total_delta_100ns = 0u;
   s_sample.sample_count++;
 #endif
 }

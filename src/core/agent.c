@@ -55,6 +55,53 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
 
+typedef enum {
+  EDR_AGENT_POLL_RESOURCE = 0,
+  EDR_AGENT_POLL_SELF_PROTECT,
+  EDR_AGENT_POLL_CONFIG_RELOAD,
+  EDR_AGENT_POLL_REMOTE_CONFIG,
+  EDR_AGENT_POLL_P0_BUNDLE,
+  EDR_AGENT_POLL_SENSOR_INTEREST,
+  EDR_AGENT_POLL_ATTACK_SURFACE,
+  EDR_AGENT_POLL_ENGINE_HEALTH,
+  EDR_AGENT_POLL_SHELL_SESSION,
+  EDR_AGENT_POLL_COMMAND_DELIVERY,
+  EDR_AGENT_POLL_COUNT
+} EdrAgentPollProbeId;
+
+typedef struct {
+  uint64_t calls;
+  uint64_t last_us;
+  uint64_t max_us;
+  uint64_t total_us;
+} EdrAgentPollProbe;
+
+static EdrAgentPollProbe s_agent_poll_probe[EDR_AGENT_POLL_COUNT];
+#ifdef _WIN32
+static uint32_t s_agent_main_thread_id;
+#endif
+
+static void edr_agent_poll_probe_done(EdrAgentPollProbeId id, uint64_t started_ns) {
+  if ((int)id < 0 || id >= EDR_AGENT_POLL_COUNT || started_ns == 0u) {
+    return;
+  }
+  uint64_t now_ns = edr_monotonic_ns();
+  uint64_t elapsed_us = now_ns > started_ns ? (now_ns - started_ns) / 1000ULL : 0u;
+  s_agent_poll_probe[id].calls++;
+  s_agent_poll_probe[id].last_us = elapsed_us;
+  s_agent_poll_probe[id].total_us += elapsed_us;
+  if (elapsed_us > s_agent_poll_probe[id].max_us) {
+    s_agent_poll_probe[id].max_us = elapsed_us;
+  }
+}
+
+#define EDR_AGENT_TIMED_POLL(id, expr)      \
+  do {                                      \
+    uint64_t edr_poll_started_ns__ = edr_monotonic_ns(); \
+    expr;                                  \
+    edr_agent_poll_probe_done((id), edr_poll_started_ns__); \
+  } while (0)
+
 static int edr_agent_download_text_file(const char *url, const char *tmp, size_t max_bytes,
                                         const char *label) {
   if (!url || !url[0] || !tmp || !tmp[0]) {
@@ -309,6 +356,9 @@ EdrError edr_agent_run(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
     return EDR_ERR_INVALID_ARG;
   }
+#ifdef _WIN32
+  s_agent_main_thread_id = (uint32_t)GetCurrentThreadId();
+#endif
   {
     EdrError pe = edr_preprocess_start(agent->event_bus, &agent->cfg);
     if (pe != EDR_OK) {
@@ -345,16 +395,21 @@ EdrError edr_agent_run(EdrAgent *agent) {
       }
       while (!agent->shutdown) {
         edr_ms_sleep(200u);
-        edr_resource_poll();
-        edr_self_protect_poll();
-        edr_agent_poll_config_reload(agent, &last_reload_ns);
-        edr_agent_poll_remote_config(agent, &last_remote_ns);
-        edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns);
-        edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns);
-        edr_agent_poll_attack_surface(agent);
-        edr_agent_poll_engine_health(agent, &last_health_ns);
-        edr_shell_session_poll();
-        edr_command_poll_reliable_delivery();
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RESOURCE, edr_resource_poll());
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SELF_PROTECT, edr_self_protect_poll());
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_CONFIG_RELOAD,
+                             edr_agent_poll_config_reload(agent, &last_reload_ns));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_REMOTE_CONFIG,
+                             edr_agent_poll_remote_config(agent, &last_remote_ns));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_P0_BUNDLE,
+                             edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SENSOR_INTEREST,
+                             edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ATTACK_SURFACE, edr_agent_poll_attack_surface(agent));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ENGINE_HEALTH,
+                             edr_agent_poll_engine_health(agent, &last_health_ns));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
       }
       if (agent->collector_started) {
         edr_collector_stop();
@@ -388,6 +443,56 @@ static void json_escape_small(const char *in, char *out, size_t cap) {
     }
   }
   out[o] = '\0';
+}
+
+static void edr_agent_poll_probe_json(char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  snprintf(
+      out, cap,
+      "\"poll_latency_us\":{\"resource\":%llu,\"self_protect\":%llu,"
+      "\"config_reload\":%llu,\"remote_config\":%llu,\"p0_bundle\":%llu,"
+      "\"sensor_interest\":%llu,\"attack_surface\":%llu,\"engine_health\":%llu,"
+      "\"shell_session\":%llu,\"command_delivery\":%llu},"
+      "\"poll_latency_max_us\":{\"resource\":%llu,\"self_protect\":%llu,"
+      "\"config_reload\":%llu,\"remote_config\":%llu,\"p0_bundle\":%llu,"
+      "\"sensor_interest\":%llu,\"attack_surface\":%llu,\"engine_health\":%llu,"
+      "\"shell_session\":%llu,\"command_delivery\":%llu},"
+      "\"poll_calls\":{\"resource\":%llu,\"self_protect\":%llu,"
+      "\"config_reload\":%llu,\"remote_config\":%llu,\"p0_bundle\":%llu,"
+      "\"sensor_interest\":%llu,\"attack_surface\":%llu,\"engine_health\":%llu,"
+      "\"shell_session\":%llu,\"command_delivery\":%llu},",
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RESOURCE].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SELF_PROTECT].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_CONFIG_RELOAD].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_REMOTE_CONFIG].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_P0_BUNDLE].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SENSOR_INTEREST].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ATTACK_SURFACE].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ENGINE_HEALTH].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SHELL_SESSION].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_COMMAND_DELIVERY].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RESOURCE].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SELF_PROTECT].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_CONFIG_RELOAD].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_REMOTE_CONFIG].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_P0_BUNDLE].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SENSOR_INTEREST].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ATTACK_SURFACE].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ENGINE_HEALTH].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SHELL_SESSION].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_COMMAND_DELIVERY].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RESOURCE].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SELF_PROTECT].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_CONFIG_RELOAD].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_REMOTE_CONFIG].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_P0_BUNDLE].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SENSOR_INTEREST].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ATTACK_SURFACE].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ENGINE_HEALTH].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SHELL_SESSION].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_COMMAND_DELIVERY].calls);
 }
 
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns) {
@@ -425,6 +530,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
   char http_mtls_status[128], http_key_provider[48];
   char resource_pressure_reason[96];
+  char poll_probe_json[1600];
+  const char *hot_thread_role = "unknown";
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
   EdrResourceSample rs;
@@ -439,6 +546,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_ingest_http_get_runtime(&http_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
+#ifdef _WIN32
+  if (rs.hot_thread_id != 0u && ch.collector_thread_id != 0u &&
+      rs.hot_thread_id == ch.collector_thread_id) {
+    hot_thread_role = "collector_etw";
+  } else if (rs.hot_thread_id != 0u && s_agent_main_thread_id != 0u &&
+             rs.hot_thread_id == s_agent_main_thread_id) {
+    hot_thread_role = "agent_main_loop";
+  } else if (rs.hot_thread_id != 0u) {
+    hot_thread_role = "background_worker";
+  }
+#endif
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
   EdrShellcodeRulesStatus shell_rules;
@@ -472,6 +590,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.mtls_status, http_mtls_status, sizeof(http_mtls_status));
   json_escape_small(http_rt.client_key_provider, http_key_provider, sizeof(http_key_provider));
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
+  edr_agent_poll_probe_json(poll_probe_json, sizeof(poll_probe_json));
   json_escape_small(ch.auditd_last_error, audit_err, sizeof(audit_err));
   json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
   json_escape_small(ch.sensor_interest_version, sensor_interest_ver, sizeof(sensor_interest_ver));
@@ -479,7 +598,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(ch.adaptive_collection_last_rule_id, adaptive_last_rule, sizeof(adaptive_last_rule));
   json_escape_small(event_filter_status.version, event_filter_ver, sizeof(event_filter_ver));
 
-  char body[16384];
+  char body[24576];
   int n = snprintf(
       body, sizeof(body),
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
@@ -512,12 +631,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
       "\"budget_drops\":%lu},"
       "\"slo\":{\"success_rate_pct\":%u}}},"
+      "%s"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
       "\"shellcode_packets_per_sec\":%u,\"low_priority_keep_percent_under_pressure\":%u,"
       "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
       "\"thread_count\":%u,\"handle_count\":%u,"
+      "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
+      "\"hot_thread_role\":\"%s\","
+      "\"hot_thread_kernel_delta_100ns\":%llu,\"hot_thread_user_delta_100ns\":%llu,"
+      "\"hot_thread_total_delta_100ns\":%llu,"
       "\"throttle_active\":%s,\"pressure\":%s,\"pressure_level\":%u,"
       "\"pressure_reason\":\"%s\",\"sample_count\":%llu},"
       "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\",\"rule_version\":\"%s\","
@@ -528,6 +652,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"amsi_visible\":%s,\"security_audit_visible\":%s,"
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
+      "\"collector_thread_id\":%u,"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
       "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu},"
@@ -617,7 +742,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      (unsigned long long)http_rt.bytes_this_minute,
 	      (unsigned long long)http_rt.byte_limit_per_minute,
 	      http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
-      http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
+      http_rt.budget_drop_count, http_rt.slo_success_rate_pct, poll_probe_json,
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       agent->cfg.resource_limit.ave_infer_per_min,
       agent->cfg.resource_limit.behavior_infer_per_min,
@@ -627,6 +752,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.resource_limit.low_priority_keep_percent_under_pressure,
       rs.cpu_percent, (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
       rs.thread_count, rs.handle_count,
+      rs.hot_thread_id, rs.hot_thread_cpu_percent, hot_thread_role,
+      (unsigned long long)rs.hot_thread_kernel_delta_100ns,
+      (unsigned long long)rs.hot_thread_user_delta_100ns,
+      (unsigned long long)rs.hot_thread_total_delta_100ns,
       rs.throttle_active ? "true" : "false", rs.throttle_active ? "true" : "false",
       rs.pressure_level, resource_pressure_reason[0] ? resource_pressure_reason : "ok",
       (unsigned long long)rs.sample_count,
@@ -638,7 +767,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.auditd_enabled ? "true" : "false", ch.auditd_running ? "true" : "false",
       (unsigned long long)ch.auditd_events,
       ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
-      (unsigned long long)ch.ebpf_events, (unsigned long long)ch.collector_dropped,
+      (unsigned long long)ch.ebpf_events, ch.collector_thread_id,
+      (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
       ch.agent_self_fuse_active ? "true" : "false",
       ch.agent_self_fuse_provider_degraded ? "true" : "false",
