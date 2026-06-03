@@ -67,6 +67,41 @@ unsigned long g_cmd_exec_fail;
 static const EdrConfig *s_bound_cfg;
 
 static int64_t command_now_ms(void);
+static uint64_t command_monotonic_ms(void);
+
+static EdrCommandDeliveryHealth s_delivery_health;
+static int64_t s_upload_outbox_next_retry_ms;
+static uint32_t s_upload_outbox_fail_streak;
+
+static uint32_t command_u32_env_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv) {
+  const char *e = getenv(name);
+  uint32_t v = defv;
+  if (e && e[0]) {
+    unsigned long parsed = strtoul(e, NULL, 10);
+    if (parsed > 0ul) {
+      v = (uint32_t)parsed;
+    }
+  }
+  if (v < minv) {
+    v = minv;
+  }
+  if (v > maxv) {
+    v = maxv;
+  }
+  return v;
+}
+
+static uint32_t command_elapsed_ms_u32(uint64_t start_ms) {
+  uint64_t now = command_monotonic_ms();
+  uint64_t elapsed = now > start_ms ? now - start_ms : 0u;
+  return elapsed > 0xFFFFFFFFULL ? 0xFFFFFFFFu : (uint32_t)elapsed;
+}
+
+static void command_update_max_u32(uint32_t value, uint32_t *max_value) {
+  if (max_value && value > *max_value) {
+    *max_value = value;
+  }
+}
 
 void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
 
@@ -2433,15 +2468,15 @@ static int read_kv_file_value(const char *path, const char *key, char *out, size
   return read_meta_value(path, key, out, cap);
 }
 
-static void flush_upload_outbox_one(const char *pending_path) {
+static int flush_upload_outbox_one(const char *pending_path) {
   char cmd_id[128], bundle[1024], sha[65];
   if (read_kv_file_value(pending_path, "command_id", cmd_id, sizeof(cmd_id)) != 0 ||
       read_kv_file_value(pending_path, "bundle_path", bundle, sizeof(bundle)) != 0 ||
       read_kv_file_value(pending_path, "sha256", sha, sizeof(sha)) != 0) {
-    return;
+    return 0;
   }
   if (!file_exists_c(bundle)) {
-    return;
+    return 0;
   }
   char minio_key[1024];
   minio_key[0] = '\0';
@@ -2450,12 +2485,22 @@ static void flush_upload_outbox_one(const char *pending_path) {
     char done[1100];
     snprintf(done, sizeof(done), "%s.done", pending_path);
     (void)rename(pending_path, done);
+    return 1;
   }
+  return -1;
 }
 
 static void flush_upload_outbox(void) {
   char dir[700];
   upload_outbox_dir(dir, sizeof(dir));
+  int64_t now_ms = command_now_ms();
+  if (s_upload_outbox_next_retry_ms > now_ms) {
+    s_delivery_health.upload_skipped_backoff++;
+    return;
+  }
+  uint32_t max_per_poll = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_PER_POLL", 1u, 1u, 64u);
+  uint32_t attempted_this_poll = 0u;
+  uint32_t seen_this_poll = 0u;
 #ifdef _WIN32
   char pattern[900];
   snprintf(pattern, sizeof(pattern), "%s\\*.pending", dir);
@@ -2468,7 +2513,30 @@ static void flush_upload_outbox(void) {
     if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
       char path[1000];
       snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
-      flush_upload_outbox_one(path);
+      seen_this_poll++;
+      if (attempted_this_poll >= max_per_poll) {
+        continue;
+      }
+      attempted_this_poll++;
+      s_delivery_health.upload_attempted++;
+      int rc = flush_upload_outbox_one(path);
+      if (rc > 0) {
+        s_delivery_health.upload_succeeded++;
+        s_upload_outbox_fail_streak = 0u;
+        s_upload_outbox_next_retry_ms = 0;
+      } else if (rc < 0) {
+        s_delivery_health.upload_failed++;
+        s_upload_outbox_fail_streak++;
+        uint32_t base_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_RETRY_BACKOFF_S", 60u, 10u, 3600u);
+        uint32_t cap_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_BACKOFF_S", 900u, base_s, 86400u);
+        uint32_t mult = s_upload_outbox_fail_streak > 5u ? 5u : s_upload_outbox_fail_streak;
+        uint64_t backoff_s = (uint64_t)base_s * (uint64_t)(mult ? mult : 1u);
+        if (backoff_s > cap_s) {
+          backoff_s = cap_s;
+        }
+        s_upload_outbox_next_retry_ms = now_ms + (int64_t)backoff_s * 1000LL;
+        break;
+      }
     }
   } while (FindNextFileA(h, &fd));
   FindClose(h);
@@ -2484,11 +2552,37 @@ static void flush_upload_outbox(void) {
     if (n > 8u && strcmp(name + n - 8u, ".pending") == 0) {
       char path[1000];
       snprintf(path, sizeof(path), "%s/%s", dir, name);
-      flush_upload_outbox_one(path);
+      seen_this_poll++;
+      if (attempted_this_poll >= max_per_poll) {
+        continue;
+      }
+      attempted_this_poll++;
+      s_delivery_health.upload_attempted++;
+      int rc = flush_upload_outbox_one(path);
+      if (rc > 0) {
+        s_delivery_health.upload_succeeded++;
+        s_upload_outbox_fail_streak = 0u;
+        s_upload_outbox_next_retry_ms = 0;
+      } else if (rc < 0) {
+        s_delivery_health.upload_failed++;
+        s_upload_outbox_fail_streak++;
+        uint32_t base_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_RETRY_BACKOFF_S", 60u, 10u, 3600u);
+        uint32_t cap_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_BACKOFF_S", 900u, base_s, 86400u);
+        uint32_t mult = s_upload_outbox_fail_streak > 5u ? 5u : s_upload_outbox_fail_streak;
+        uint64_t backoff_s = (uint64_t)base_s * (uint64_t)(mult ? mult : 1u);
+        if (backoff_s > cap_s) {
+          backoff_s = cap_s;
+        }
+        s_upload_outbox_next_retry_ms = now_ms + (int64_t)backoff_s * 1000LL;
+        break;
+      }
     }
   }
   closedir(d);
 #endif
+  s_delivery_health.upload_pending_seen = seen_this_poll;
+  s_delivery_health.upload_fail_streak = s_upload_outbox_fail_streak;
+  s_delivery_health.upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
 }
 
 static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -3176,6 +3270,18 @@ static int64_t command_now_ms(void) {
   return (int64_t)time(NULL) * 1000LL;
 }
 
+static uint64_t command_monotonic_ms(void) {
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0u;
+  }
+  return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+#endif
+}
+
 static int command_deadline_expired(const EdrSoarCommandMeta *sm, char *reason, size_t cap) {
   if (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u) {
     return 0;
@@ -3231,9 +3337,32 @@ void edr_command_poll_reliable_delivery(void) {
     return;
   }
   last_poll_ms = now;
+  uint64_t total_start = command_monotonic_ms();
+  s_delivery_health.poll_count++;
+  s_delivery_health.last_poll_unix_ms = now;
+  uint64_t step_start = command_monotonic_ms();
   flush_upload_outbox();
+  s_delivery_health.last_upload_ms = command_elapsed_ms_u32(step_start);
+  command_update_max_u32(s_delivery_health.last_upload_ms, &s_delivery_health.max_upload_ms);
+  step_start = command_monotonic_ms();
   flush_command_result_outbox();
+  s_delivery_health.last_result_ms = command_elapsed_ms_u32(step_start);
+  command_update_max_u32(s_delivery_health.last_result_ms, &s_delivery_health.max_result_ms);
+  step_start = command_monotonic_ms();
   edr_command_state_compact_if_needed();
+  s_delivery_health.last_compact_ms = command_elapsed_ms_u32(step_start);
+  command_update_max_u32(s_delivery_health.last_compact_ms, &s_delivery_health.max_compact_ms);
+  s_delivery_health.last_total_ms = command_elapsed_ms_u32(total_start);
+  command_update_max_u32(s_delivery_health.last_total_ms, &s_delivery_health.max_total_ms);
+}
+
+void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health) {
+  if (!out_health) {
+    return;
+  }
+  *out_health = s_delivery_health;
+  out_health->upload_fail_streak = s_upload_outbox_fail_streak;
+  out_health->upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
 }
 
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,

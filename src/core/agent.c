@@ -572,16 +572,19 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   EdrIngestHttpRuntime http_rt;
   EdrResourceSample rs;
   EdrCollectorHealth ch;
+  EdrCommandDeliveryHealth cdh;
   EdrWindowsEventFilterStatus event_filter_status;
   memset(&grpc_rt, 0, sizeof(grpc_rt));
   memset(&http_rt, 0, sizeof(http_rt));
   memset(&rs, 0, sizeof(rs));
   memset(&ch, 0, sizeof(ch));
+  memset(&cdh, 0, sizeof(cdh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
   edr_grpc_client_get_runtime(&grpc_rt);
   edr_ingest_http_get_runtime(&http_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
+  edr_command_get_delivery_health(&cdh);
 #ifdef _WIN32
   if (rs.hot_thread_id != 0u && ch.collector_thread_id != 0u &&
       rs.hot_thread_id == ch.collector_thread_id) {
@@ -670,6 +673,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "%s"
       "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
       "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
+      "\"command_delivery\":{\"poll_count\":%llu,\"last_poll_unix_ms\":%lld,"
+      "\"last_total_ms\":%u,\"max_total_ms\":%u,"
+      "\"last_upload_ms\":%u,\"max_upload_ms\":%u,"
+      "\"last_result_ms\":%u,\"max_result_ms\":%u,"
+      "\"last_compact_ms\":%u,\"max_compact_ms\":%u,"
+      "\"upload_pending_seen\":%u,\"upload_attempted\":%u,"
+      "\"upload_succeeded\":%u,\"upload_failed\":%u,"
+      "\"upload_skipped_backoff\":%u,\"upload_fail_streak\":%u,"
+      "\"upload_next_retry_unix_ms\":%lld},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
@@ -788,6 +800,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)s_agent_loop_interval_max_ms,
       (unsigned long long)s_agent_loop_elapsed_last_us,
       (unsigned long long)s_agent_loop_elapsed_max_us,
+      (unsigned long long)cdh.poll_count, (long long)cdh.last_poll_unix_ms,
+      cdh.last_total_ms, cdh.max_total_ms,
+      cdh.last_upload_ms, cdh.max_upload_ms,
+      cdh.last_result_ms, cdh.max_result_ms,
+      cdh.last_compact_ms, cdh.max_compact_ms,
+      cdh.upload_pending_seen, cdh.upload_attempted,
+      cdh.upload_succeeded, cdh.upload_failed,
+      cdh.upload_skipped_backoff, cdh.upload_fail_streak,
+      (long long)cdh.upload_next_retry_unix_ms,
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       agent->cfg.resource_limit.ave_infer_per_min,
       agent->cfg.resource_limit.behavior_infer_per_min,

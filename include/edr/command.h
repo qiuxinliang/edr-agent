@@ -59,6 +59,28 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
 /** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
 void edr_command_poll_reliable_delivery(void);
 
+typedef struct EdrCommandDeliveryHealth {
+  uint64_t poll_count;
+  int64_t last_poll_unix_ms;
+  uint32_t last_total_ms;
+  uint32_t max_total_ms;
+  uint32_t last_upload_ms;
+  uint32_t max_upload_ms;
+  uint32_t last_result_ms;
+  uint32_t max_result_ms;
+  uint32_t last_compact_ms;
+  uint32_t max_compact_ms;
+  uint32_t upload_pending_seen;
+  uint32_t upload_attempted;
+  uint32_t upload_succeeded;
+  uint32_t upload_failed;
+  uint32_t upload_skipped_backoff;
+  uint32_t upload_fail_streak;
+  int64_t upload_next_retry_unix_ms;
+} EdrCommandDeliveryHealth;
+
+void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health);
+
 /**
  * Agent-side automation: map detection_context.recommended_forensics to local
  * response commands. Execution remains gated by command policy.
