@@ -57,6 +57,24 @@ static void test_initial_access_artifact_is_suspicious(void) {
   assert(strstr(r.script_snippet, "script_temp_staging") != NULL);
 }
 
+static void test_localservice_tfs_dav_cache_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "xtac64se.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\TfsStore\\Tfs_DAV\\{390D9B48-C3E2-401C-8CD6-0AAB3475278E}.ps1");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "service_temp_dav_cache") != NULL);
+}
+
 static void test_autorun_registry_is_high_signal(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
@@ -165,6 +183,7 @@ int main(void) {
   test_webshell_path_is_high_signal();
   test_browser_cache_stays_ring_only();
   test_initial_access_artifact_is_suspicious();
+  test_localservice_tfs_dav_cache_is_not_emitted();
   test_autorun_registry_is_high_signal();
   test_registry_noise_is_not_emitted();
   test_agent_forensic_bundle_is_not_emitted();

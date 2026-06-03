@@ -168,6 +168,16 @@ static int agent_internal_forensic_activity(const EdrBehaviorRecord *r) {
          has_ci_path(r->detection_context, "\"source\":\"agent_internal\"");
 }
 
+static int service_temp_dav_cache_activity(const EdrBehaviorRecord *r, const char *path) {
+  if (!r || !path || !path[0]) {
+    return 0;
+  }
+  if (!has_ci_path(path, "\\serviceprofiles\\localservice\\appdata\\local\\temp\\tfsstore\\tfs_dav\\")) {
+    return 0;
+  }
+  return !r->process_name[0] || process_name_is(r, "xtac64se.exe");
+}
+
 static int ransom_note_like_path(const char *path) {
   static const char *const note_exts[] = {".txt", ".hta", ".htm", ".html"};
   static const char *const note_tokens[] = {
@@ -285,6 +295,10 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
        r->type == EDR_EVENT_FILE_CREATE || r->type == EDR_EVENT_FILE_WRITE ||
        r->type == EDR_EVENT_FILE_PERMISSION_CHANGE)) {
     mark_suspicious(p, "service_or_driver_path_modified", "service_driver_path");
+  }
+  if (!p->high_value && service_temp_dav_cache_activity(r, path)) {
+    mark_noisy(p, "service_temp_dav_cache", "noise_service_cache");
+    return;
   }
   if (any_contains(path, user_temp_dirs, sizeof(user_temp_dirs) / sizeof(user_temp_dirs[0]))) {
     if (any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0]))) {
