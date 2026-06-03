@@ -12,7 +12,6 @@ on:
   workflow_dispatch:
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -65,7 +64,7 @@ jobs:
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Configure (vcpkg HTTPS + SQLite, no gRPC, Ninja, sccache)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg

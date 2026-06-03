@@ -19,7 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
@@ -70,7 +69,7 @@ jobs:
       - name: Install build tools
         shell: pwsh
         run: choco install ninja innosetup -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Prepare vcpkg cache directories
         shell: pwsh
         run: |
