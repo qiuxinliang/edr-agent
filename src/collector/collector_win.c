@@ -427,7 +427,11 @@ static int edr_agent_self_fuse_active(uint64_t now_ns) {
   return 1;
 }
 
-static void edr_agent_self_note_suppressed(uint64_t now_ns) {
+static void edr_agent_self_note_suppressed(uint64_t now_ns, int fuse_eligible) {
+  if (!fuse_eligible) {
+    (void)edr_agent_self_fuse_active(now_ns);
+    return;
+  }
   uint64_t minute = (now_ns / 1000000000ULL) / 60ULL;
   if (s_agent_self_minute_unix != minute) {
     s_agent_self_minute_unix = minute;
@@ -477,7 +481,9 @@ static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSo
   default:
     break;
   }
-  edr_agent_self_note_suppressed(now_ns);
+  /* Direct PID events are already dropped at the ETW callback; they should not
+   * degrade unrelated providers. */
+  edr_agent_self_note_suppressed(now_ns, source != EDR_AGENT_SELF_DROP_DIRECT_PID);
 }
 
 static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
