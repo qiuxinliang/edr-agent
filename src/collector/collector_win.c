@@ -481,9 +481,11 @@ static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSo
   default:
     break;
   }
-  /* Direct PID events are already dropped at the ETW callback; they should not
-   * degrade unrelated providers. */
-  edr_agent_self_note_suppressed(now_ns, source != EDR_AGENT_SELF_DROP_DIRECT_PID);
+  /* Direct PID and sensor-interest self events are already dropped before
+   * payload admission; they should not degrade unrelated providers. */
+  edr_agent_self_note_suppressed(now_ns,
+                                 source != EDR_AGENT_SELF_DROP_DIRECT_PID &&
+                                     source != EDR_AGENT_SELF_DROP_INTEREST);
 }
 
 static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
