@@ -405,27 +405,56 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
   if (!out || cap == 0u) {
     return 0;
   }
+  enum { MAX_TRACKED_COMMANDS = 512 };
+  EdrCommandStateRecord *latest =
+      (EdrCommandStateRecord *)calloc(MAX_TRACKED_COMMANDS, sizeof(EdrCommandStateRecord));
+  if (!latest) {
+    return 0;
+  }
   char path[1024];
   state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
   FILE *f = fopen(path, "r");
   if (!f) {
     state_lock_release(lock);
+    free(latest);
     return 0;
   }
-  size_t n = 0;
+  size_t latest_n = 0;
   char line[8192];
-  while (fgets(line, sizeof(line), f) && n < cap) {
-    if (!strstr(line, "\"final\":1") || !strstr(line, "\"report_pending\":1")) {
+  while (fgets(line, sizeof(line), f)) {
+    EdrCommandStateRecord rec;
+    if (!strstr(line, "\"final\":1")) {
       continue;
     }
-    fill_record_from_line(line, &out[n]);
-    if (out[n].command_id[0] && out[n].detail[0]) {
-      n++;
+    fill_record_from_line(line, &rec);
+    if (!rec.command_id[0]) {
+      continue;
     }
+    size_t idx = latest_n;
+    for (size_t i = 0; i < latest_n; i++) {
+      if (strcmp(latest[i].command_id, rec.command_id) == 0) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx == latest_n) {
+      if (latest_n >= MAX_TRACKED_COMMANDS) {
+        continue;
+      }
+      latest_n++;
+    }
+    latest[idx] = rec;
   }
   fclose(f);
   state_lock_release(lock);
+  size_t n = 0;
+  for (size_t i = 0; i < latest_n && n < cap; i++) {
+    if (latest[i].report_pending && latest[i].command_id[0] && latest[i].detail[0]) {
+      out[n++] = latest[i];
+    }
+  }
+  free(latest);
   return (int)n;
 }
 
