@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -19,16 +20,76 @@
 #include <io.h>
 #else
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+
+typedef struct EdrCommandStateFileInfo {
+  long size;
+  long mtime;
+} EdrCommandStateFileInfo;
+
+static EdrCommandStateFileInfo s_collect_cache_info;
+static int s_collect_cache_pending_zero;
+static int64_t s_last_compact_check_ms;
 
 static int64_t state_now_ms(void) {
   return (int64_t)time(NULL) * 1000LL;
 }
 
 static void state_ensure_parent_dir(const char *path);
+
+static long state_env_long_clamped(const char *name, long defv, long minv, long maxv) {
+  const char *e = getenv(name);
+  long v = defv;
+  if (e && e[0]) {
+    char *end = NULL;
+    long parsed = strtol(e, &end, 10);
+    if (end != e && parsed > 0) {
+      v = parsed;
+    }
+  }
+  if (v < minv) {
+    v = minv;
+  }
+  if (v > maxv) {
+    v = maxv;
+  }
+  return v;
+}
+
+static int state_file_info(const char *path, EdrCommandStateFileInfo *out) {
+  if (out) {
+    memset(out, 0, sizeof(*out));
+  }
+  if (!path || !path[0] || !out) {
+    return -1;
+  }
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    return -1;
+  }
+  out->size = (long)st.st_size;
+  out->mtime = (long)st.st_mtime;
+  return 0;
+}
+
+static int state_file_info_same(EdrCommandStateFileInfo a, EdrCommandStateFileInfo b) {
+  return a.size == b.size && a.mtime == b.mtime;
+}
+
+static char *state_strdup_line(const char *s) {
+  if (!s) {
+    return NULL;
+  }
+  size_t n = strlen(s) + 1u;
+  char *p = (char *)malloc(n);
+  if (!p) {
+    return NULL;
+  }
+  memcpy(p, s, n);
+  return p;
+}
 
 static void state_default_path(char *out, size_t cap) {
   const char *p = getenv("EDR_COMMAND_STATE_DB");
@@ -405,14 +466,24 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
   if (!out || cap == 0u) {
     return 0;
   }
+  char path[1024];
+  state_default_path(path, sizeof(path));
+  EdrCommandStateFileInfo info;
+  if (state_file_info(path, &info) != 0) {
+    s_collect_cache_pending_zero = 1;
+    memset(&s_collect_cache_info, 0, sizeof(s_collect_cache_info));
+    return 0;
+  }
+  if (s_collect_cache_pending_zero && state_file_info_same(info, s_collect_cache_info)) {
+    return 0;
+  }
+
   enum { MAX_TRACKED_COMMANDS = 512 };
   EdrCommandStateRecord *latest =
       (EdrCommandStateRecord *)calloc(MAX_TRACKED_COMMANDS, sizeof(EdrCommandStateRecord));
   if (!latest) {
     return 0;
   }
-  char path[1024];
-  state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
   FILE *f = fopen(path, "r");
   if (!f) {
@@ -455,6 +526,12 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
     }
   }
   free(latest);
+  if (n == 0u) {
+    s_collect_cache_info = info;
+    s_collect_cache_pending_zero = 1;
+  } else {
+    s_collect_cache_pending_zero = 0;
+  }
   return (int)n;
 }
 
@@ -481,6 +558,7 @@ void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
            cid, ctype, idem, st, record->execution_status, record->exit_code, record->retry_count,
            (long long)state_now_ms(), scid, run, step, art, det);
   append_state_line_locked(line);
+  s_collect_cache_pending_zero = 0;
 }
 
 void edr_command_state_compact_if_needed(void) {
@@ -494,6 +572,14 @@ void edr_command_state_compact_if_needed(void) {
       max_bytes = v;
     }
   }
+  int64_t now_ms = state_now_ms();
+  long interval_ms = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_INTERVAL_MS",
+                                            60000L, 5000L, 3600000L);
+  if (s_last_compact_check_ms > 0 && now_ms - s_last_compact_check_ms < interval_ms) {
+    return;
+  }
+  s_last_compact_check_ms = now_ms;
+
   FILE *lock = state_lock_acquire();
   FILE *f = fopen(path, "r");
   if (!f) {
@@ -506,28 +592,53 @@ void edr_command_state_compact_if_needed(void) {
     return;
   }
   rewind(f);
-  enum { KEEP_LINES = 1200 };
-  char **lines = (char **)calloc(KEEP_LINES, sizeof(char *));
-  if (!lines) {
+  long keep_lines_long = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_KEEP_LINES",
+                                                300L, 64L, 1200L);
+  long target_bytes = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_TARGET_BYTES",
+                                             max_bytes / 2L, 32768L, max_bytes);
+  size_t keep_lines = (size_t)keep_lines_long;
+  char **lines = (char **)calloc(keep_lines, sizeof(char *));
+  size_t *line_lens = (size_t *)calloc(keep_lines, sizeof(size_t));
+  if (!lines || !line_lens) {
+    free(lines);
+    free(line_lens);
     fclose(f);
     state_lock_release(lock);
     return;
   }
   size_t idx = 0;
+  size_t retained_bytes = 0u;
   char buf[8192];
   while (fgets(buf, sizeof(buf), f)) {
-    free(lines[idx % KEEP_LINES]);
-    lines[idx % KEEP_LINES] = strdup(buf);
+    size_t slot = idx % keep_lines;
+    if (lines[slot]) {
+      retained_bytes = retained_bytes >= line_lens[slot] ? retained_bytes - line_lens[slot] : 0u;
+      free(lines[slot]);
+      lines[slot] = NULL;
+      line_lens[slot] = 0u;
+    }
+    lines[slot] = state_strdup_line(buf);
+    if (lines[slot]) {
+      line_lens[slot] = strlen(lines[slot]);
+      retained_bytes += line_lens[slot];
+    }
     idx++;
   }
   fclose(f);
+  size_t start = idx > keep_lines ? idx - keep_lines : 0u;
+  while (start + 1u < idx && retained_bytes > (size_t)target_bytes) {
+    size_t slot = start % keep_lines;
+    if (lines[slot]) {
+      retained_bytes = retained_bytes >= line_lens[slot] ? retained_bytes - line_lens[slot] : 0u;
+    }
+    start++;
+  }
   char tmp[1100];
   snprintf(tmp, sizeof(tmp), "%s.tmp", path);
   FILE *out = fopen(tmp, "w");
   if (out) {
-    size_t start = idx > KEEP_LINES ? idx - KEEP_LINES : 0;
     for (size_t i = start; i < idx; i++) {
-      char *line = lines[i % KEEP_LINES];
+      char *line = lines[i % keep_lines];
       if (line) {
         fputs(line, out);
       }
@@ -535,9 +646,11 @@ void edr_command_state_compact_if_needed(void) {
     fclose(out);
     (void)rename(tmp, path);
   }
-  for (size_t i = 0; i < KEEP_LINES; i++) {
+  for (size_t i = 0; i < keep_lines; i++) {
     free(lines[i]);
   }
+  free(line_lens);
   free(lines);
+  s_collect_cache_pending_zero = 0;
   state_lock_release(lock);
 }
