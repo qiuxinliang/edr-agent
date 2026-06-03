@@ -77,9 +77,17 @@ typedef struct {
 } EdrAgentPollProbe;
 
 static EdrAgentPollProbe s_agent_poll_probe[EDR_AGENT_POLL_COUNT];
+static uint64_t s_agent_loop_count;
+static uint64_t s_agent_loop_last_start_ns;
+static uint64_t s_agent_loop_interval_last_ms;
+static uint64_t s_agent_loop_interval_max_ms;
+static uint64_t s_agent_loop_elapsed_last_us;
+static uint64_t s_agent_loop_elapsed_max_us;
 #ifdef _WIN32
 static uint32_t s_agent_main_thread_id;
 #endif
+
+static uint64_t edr_ns_to_ms(uint64_t ns) { return ns / 1000000ULL; }
 
 static void edr_agent_poll_probe_done(EdrAgentPollProbeId id, uint64_t started_ns) {
   if ((int)id < 0 || id >= EDR_AGENT_POLL_COUNT || started_ns == 0u) {
@@ -92,6 +100,32 @@ static void edr_agent_poll_probe_done(EdrAgentPollProbeId id, uint64_t started_n
   s_agent_poll_probe[id].total_us += elapsed_us;
   if (elapsed_us > s_agent_poll_probe[id].max_us) {
     s_agent_poll_probe[id].max_us = elapsed_us;
+  }
+}
+
+static uint64_t edr_agent_loop_probe_begin(void) {
+  uint64_t now_ns = edr_monotonic_ns();
+  if (s_agent_loop_last_start_ns != 0u && now_ns > s_agent_loop_last_start_ns) {
+    uint64_t interval_ms = edr_ns_to_ms(now_ns - s_agent_loop_last_start_ns);
+    s_agent_loop_interval_last_ms = interval_ms;
+    if (interval_ms > s_agent_loop_interval_max_ms) {
+      s_agent_loop_interval_max_ms = interval_ms;
+    }
+  }
+  s_agent_loop_last_start_ns = now_ns;
+  s_agent_loop_count++;
+  return now_ns;
+}
+
+static void edr_agent_loop_probe_end(uint64_t started_ns) {
+  if (started_ns == 0u) {
+    return;
+  }
+  uint64_t now_ns = edr_monotonic_ns();
+  uint64_t elapsed_us = now_ns > started_ns ? (now_ns - started_ns) / 1000ULL : 0u;
+  s_agent_loop_elapsed_last_us = elapsed_us;
+  if (elapsed_us > s_agent_loop_elapsed_max_us) {
+    s_agent_loop_elapsed_max_us = elapsed_us;
   }
 }
 
@@ -394,6 +428,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         agent->asurf_last_pending_check_ns = t0;
       }
       while (!agent->shutdown) {
+        uint64_t edr_loop_started_ns = edr_agent_loop_probe_begin();
         edr_ms_sleep(200u);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RESOURCE, edr_resource_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SELF_PROTECT, edr_self_protect_poll());
@@ -410,6 +445,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
                              edr_agent_poll_engine_health(agent, &last_health_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
+        edr_agent_loop_probe_end(edr_loop_started_ns);
       }
       if (agent->collector_started) {
         edr_collector_stop();
@@ -632,6 +668,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"budget_drops\":%lu},"
       "\"slo\":{\"success_rate_pct\":%u}}},"
       "%s"
+      "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
+      "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
@@ -655,7 +693,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"collector_thread_id\":%u,"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
-      "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu},"
+      "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
+      "\"current_minute_count\":%llu,\"threshold_per_min\":%llu,"
+      "\"cooldown_s\":%llu},"
       "\"agent_self_sources\":{\"direct_pid\":%llu,\"security_event\":%llu,"
       "\"record\":%llu,\"interest\":%llu,\"fuse_provider\":%llu},"
       "\"drop_breakdown\":{\"agent_self\":%llu,\"lifecycle\":%llu,"
@@ -743,6 +783,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      (unsigned long long)http_rt.byte_limit_per_minute,
 	      http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
       http_rt.budget_drop_count, http_rt.slo_success_rate_pct, poll_probe_json,
+      (unsigned long long)s_agent_loop_count,
+      (unsigned long long)s_agent_loop_interval_last_ms,
+      (unsigned long long)s_agent_loop_interval_max_ms,
+      (unsigned long long)s_agent_loop_elapsed_last_us,
+      (unsigned long long)s_agent_loop_elapsed_max_us,
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       agent->cfg.resource_limit.ave_infer_per_min,
       agent->cfg.resource_limit.behavior_infer_per_min,
@@ -775,6 +820,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.agent_self_fuse_until_unix_ms,
       (unsigned long long)ch.agent_self_fuse_trips,
       (unsigned long long)ch.agent_self_fuse_suppressed,
+      (unsigned long long)ch.agent_self_fuse_current_minute_count,
+      (unsigned long long)ch.agent_self_fuse_threshold_per_min,
+      (unsigned long long)ch.agent_self_fuse_cooldown_s,
       (unsigned long long)ch.agent_self_direct_pid_suppressed,
       (unsigned long long)ch.agent_self_security_event_suppressed,
       (unsigned long long)ch.agent_self_record_suppressed,

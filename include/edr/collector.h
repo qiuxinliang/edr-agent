@@ -74,6 +74,9 @@ typedef struct {
     uint64_t agent_self_fuse_until_unix_ms;
     uint64_t agent_self_fuse_trips;
     uint64_t agent_self_fuse_suppressed;
+    uint64_t agent_self_fuse_current_minute_count;
+    uint64_t agent_self_fuse_threshold_per_min;
+    uint64_t agent_self_fuse_cooldown_s;
     uint64_t lifecycle_dropped;
     uint64_t auth_dropped;
     uint64_t invalid_process_dropped;

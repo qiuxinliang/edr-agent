@@ -71,6 +71,7 @@ static uint64_t s_agent_self_minute_count;
 static uint64_t s_agent_self_fuse_until_ns;
 static uint64_t s_agent_self_fuse_trips;
 static uint64_t s_agent_self_fuse_suppressed;
+static uint64_t s_agent_self_fuse_last_cooldown_ns;
 static int s_agent_self_fuse_provider_degraded;
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
@@ -332,6 +333,24 @@ static uint64_t edr_agent_self_fuse_cooldown_ns(void) {
   return s * 1000000000ULL;
 }
 
+static uint64_t edr_agent_self_fuse_effective_cooldown_ns(void) {
+  uint64_t base = edr_agent_self_fuse_cooldown_ns();
+  uint64_t max_s = edr_env_u64_clamped("EDR_AGENT_SELF_FUSE_MAX_COOLDOWN_S", 1800ULL, 60ULL, 86400ULL);
+  uint64_t max_ns = max_s * 1000000000ULL;
+  uint64_t next_trip = s_agent_self_fuse_trips + 1u;
+  uint64_t multiplier = 1u;
+  if (next_trip >= 3u) {
+    multiplier = 3u;
+  } else if (next_trip == 2u) {
+    multiplier = 2u;
+  }
+  if (base > max_ns / multiplier) {
+    return max_ns;
+  }
+  uint64_t ns = base * multiplier;
+  return ns > max_ns ? max_ns : ns;
+}
+
 static ULONG edr_control_trace_provider(const GUID *guid, ULONG control_code) {
   if (!guid || s_session_handle == INVALID_PROCESSTRACE_HANDLE) {
     return ERROR_INVALID_HANDLE;
@@ -420,13 +439,15 @@ static void edr_agent_self_note_suppressed(uint64_t now_ns) {
   }
   uint64_t threshold = edr_agent_self_fuse_threshold_per_min();
   if (s_agent_self_minute_count >= threshold) {
-    s_agent_self_fuse_until_ns = now_ns + edr_agent_self_fuse_cooldown_ns();
+    uint64_t cooldown_ns = edr_agent_self_fuse_effective_cooldown_ns();
+    s_agent_self_fuse_last_cooldown_ns = cooldown_ns;
+    s_agent_self_fuse_until_ns = now_ns + cooldown_ns;
     s_agent_self_fuse_trips++;
     edr_agent_self_fuse_degrade_providers();
     fprintf(stderr,
             "[collector_win] agent self-noise fuse active count=%llu threshold=%llu cooldown_s=%llu\n",
             (unsigned long long)s_agent_self_minute_count, (unsigned long long)threshold,
-            (unsigned long long)(edr_agent_self_fuse_cooldown_ns() / 1000000000ULL));
+            (unsigned long long)(cooldown_ns / 1000000000ULL));
   }
 }
 
@@ -1338,6 +1359,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_agent_self_fuse_until_ns = 0u;
   s_agent_self_fuse_trips = 0u;
   s_agent_self_fuse_suppressed = 0u;
+  s_agent_self_fuse_last_cooldown_ns = 0u;
   s_agent_self_fuse_provider_degraded = 0;
   edr_sensor_interest_lazy_init();
 
@@ -1450,6 +1472,10 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
         s_agent_self_fuse_until_ns > 0u ? (s_agent_self_fuse_until_ns / 1000000ULL) : 0u;
     out_health->agent_self_fuse_trips = s_agent_self_fuse_trips;
     out_health->agent_self_fuse_suppressed = s_agent_self_fuse_suppressed;
+    out_health->agent_self_fuse_current_minute_count = s_agent_self_minute_count;
+    out_health->agent_self_fuse_threshold_per_min = edr_agent_self_fuse_threshold_per_min();
+    out_health->agent_self_fuse_cooldown_s =
+        s_agent_self_fuse_last_cooldown_ns > 0u ? s_agent_self_fuse_last_cooldown_ns / 1000000000ULL : 0u;
   }
   out_health->etw_or_inotify_enabled = InterlockedCompareExchange(&s_started, 0, 0) ? 1 : out_health->etw_or_inotify_enabled;
   out_health->collector_thread_id = (uint32_t)s_consumer_thread_id;
