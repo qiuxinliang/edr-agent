@@ -495,7 +495,11 @@ int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
   if (env_falsy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
     return 0;
   }
-  if (!env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS") && s_bound_cfg && !s_bound_cfg->forensic_auto.enabled) {
+  if (s_bound_cfg && !s_bound_cfg->forensic_auto.enabled &&
+      !env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_FORCE")) {
+    return 0;
+  }
+  if (!s_bound_cfg && !env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
     return 0;
   }
   if (!dangerous_enabled()) {
