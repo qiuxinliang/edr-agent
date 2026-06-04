@@ -1494,9 +1494,6 @@ static int evidence_should_store_record(const EdrBehaviorRecord *r) {
   if (evidence_is_low_value_file_noise(r)) {
     return 0;
   }
-  if (edr_p0_rule_ir_br_matches_any(r)) {
-    return 1;
-  }
   switch (r->type) {
   case EDR_EVENT_FILE_READ:
   case EDR_EVENT_FILE_CREATE:
