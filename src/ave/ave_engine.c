@@ -169,6 +169,11 @@ static int should_preload_behavior_onnx(const EdrConfig *cfg) {
   return cfg && cfg->ave.behavior_monitor_enabled;
 }
 
+static int should_preload_static_onnx(const EdrConfig *cfg) {
+  (void)cfg;
+  return ave_env_truthy("EDR_AVE_STATIC_PRELOAD");
+}
+
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
   if (!path || !path[0] || !out_hex || cap < 17u) {
     return -1;
@@ -235,14 +240,19 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   s_ready = n_model > 0 ? 1 : 0;
 
   char onnx_path[2048];
-  if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
-    EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
-    if (oe != EDR_OK) {
-      EDR_LOGE("[ave] ONNX Runtime load failed (%d); inference falls back to dry-run / NOT_IMPL\n",
-               (int)oe);
+  if (should_preload_static_onnx(cfg)) {
+    if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
+      EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
+      if (oe != EDR_OK) {
+        EDR_LOGE("[ave] ONNX Runtime load failed (%d); inference falls back to dry-run / NOT_IMPL\n",
+                 (int)oe);
+      }
+    } else {
+      (void)edr_onnx_runtime_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
+    EDR_LOGV("%s", "[ave] static.onnx preload skipped (enable EDR_AVE_STATIC_PRELOAD=1 for lab scan)\n");
   }
   if (should_preload_behavior_onnx(cfg)) {
     char beh_path[2048];
@@ -270,13 +280,18 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
     return EDR_OK;
   }
   char onnx_path[2048];
-  if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
-    EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
-    if (oe != EDR_OK) {
-      EDR_LOGE("[ave] reload static ONNX failed (%d)\n", (int)oe);
+  if (should_preload_static_onnx(cfg)) {
+    if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
+      EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
+      if (oe != EDR_OK) {
+        EDR_LOGE("[ave] reload static ONNX failed (%d)\n", (int)oe);
+      }
+    } else {
+      (void)edr_onnx_runtime_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
+    EDR_LOGV("%s", "[ave] static.onnx preload skipped on reload\n");
   }
   if (should_preload_behavior_onnx(cfg)) {
     char beh_path[2048];

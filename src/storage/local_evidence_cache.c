@@ -1373,6 +1373,32 @@ static int evidence_contains_ci(const char *haystack, const char *needle) {
   return 0;
 }
 
+static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
+  if (!r || !is_file_event_type((uint32_t)r->type)) {
+    return 0;
+  }
+  const char *path = r->file_path[0] ? r->file_path : r->exe_path;
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if (evidence_contains_ci(path, ":WofCompressedData")) {
+    return 1;
+  }
+  if (evidence_contains_ci(path, "\\Program Files\\WindowsApps\\") ||
+      evidence_contains_ci(path, "/Program Files/WindowsApps/")) {
+    if (evidence_contains_ci(path, "LanguageExperiencePack") ||
+        evidence_contains_ci(path, ".js.map")) {
+      return 1;
+    }
+  }
+  if ((evidence_contains_ci(path, "\\Windows\\System32\\drivers\\") ||
+       evidence_contains_ci(path, "/Windows/System32/drivers/")) &&
+      evidence_contains_ci(path, ".sys.mui")) {
+    return 1;
+  }
+  return 0;
+}
+
 static int evidence_text_has_high_signal(const EdrBehaviorRecord *r) {
   static const char *const tokens[] = {
       "encodedcommand", "-enc", "frombase64string", "invoke-expression", "iex ",
@@ -1591,6 +1617,11 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   if (store_candidate) {
     pre_count = promote_context_before_window(r, ts);
     post_until_ns = mark_context_window(r, ts, candidate_id);
+  }
+  if (!store_candidate && !store_context && evidence_is_low_value_file_noise(r)) {
+    record_metric_drop(r, ts);
+    s_status.records_skipped++;
+    return;
   }
   if (!store_candidate && !store_context && evidence_cache_pressure_active()) {
     record_metric_drop(r, ts);
