@@ -468,17 +468,46 @@ static uint32_t metric_slots_used(void) {
   return n;
 }
 
+static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t cap);
+static uint32_t env_u32_clamped(const char *name, uint32_t fallback, uint32_t min_v,
+                                uint32_t max_v);
+
+static uint32_t candidate_dedupe_window_s(void) {
+  return env_u32_clamped("EDR_EVIDENCE_CACHE_CANDIDATE_DEDUP_WINDOW_S",
+                         60u, 1u, 600u);
+}
+
+static uint64_t evidence_hash_ci(const char *s) {
+  uint64_t h = 1469598103934665603ULL;
+  if (!s) {
+    return h;
+  }
+  for (; *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '/' || c == '\\') {
+      c = '\\';
+    } else {
+      c = (unsigned char)tolower(c);
+    }
+    h ^= (uint64_t)c;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 static void candidate_id_for(const EdrBehaviorRecord *r, char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
   }
-  if (r && r->event_id[0]) {
-    copy_s(out, cap, r->event_id);
-    return;
-  }
-  snprintf(out, cap, "p0-%s-%lld-%u",
+  char signal[160];
+  candidate_signal_for(r, signal, sizeof(signal));
+  uint32_t win_s = candidate_dedupe_window_s();
+  int64_t bucket = record_time_ns(r) / ((int64_t)win_s * 1000000000LL);
+  unsigned long long sig_hash = (unsigned long long)evidence_hash_ci(signal);
+  snprintf(out, cap, "p0-%s-%lld-%u-%u-%016llx",
            (r && r->endpoint_id[0]) ? r->endpoint_id : "unknown",
-           (long long)record_time_ns(r), r ? r->pid : 0u);
+           (long long)bucket, r ? r->pid : 0u, r ? (uint32_t)r->type : 0u,
+           sig_hash);
 }
 
 static uint32_t env_u32_clamped(const char *name, uint32_t fallback, uint32_t min_v,
@@ -533,12 +562,15 @@ static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t c
       extract_json_string_field(r->detection_context, "\"rule\":\"", out, cap)) {
     return;
   }
-  const char *target = r->file_path[0] ? r->file_path :
+  const char *target = r->cmdline[0] ? r->cmdline :
+                       r->script_snippet[0] ? r->script_snippet :
+                       r->file_path[0] ? r->file_path :
                        r->reg_key_path[0] ? r->reg_key_path :
                        r->net_dst[0] ? r->net_dst :
                        r->exe_path[0] ? r->exe_path : r->process_name;
-  snprintf(out, cap, "type=%u;proc=%s;target=%s;port=%u",
-           (uint32_t)r->type, r->process_name, target ? target : "", r->net_dport);
+  unsigned long long target_hash = (unsigned long long)evidence_hash_ci(target);
+  snprintf(out, cap, "type=%u;proc=%s;target_hash=%016llx;port=%u",
+           (uint32_t)r->type, r->process_name, target_hash, r->net_dport);
 }
 
 static int ordinary_aggregate_kind(const EdrBehaviorRecord *r, uint32_t *kind_out) {
@@ -682,8 +714,7 @@ static int candidate_dedupe_should_skip(const EdrBehaviorRecord *r, int64_t ts) 
   if (!r) {
     return 0;
   }
-  uint32_t win_s = env_u32_clamped("EDR_EVIDENCE_CACHE_CANDIDATE_DEDUP_WINDOW_S",
-                                   10u, 0u, 600u);
+  uint32_t win_s = candidate_dedupe_window_s();
   if (win_s == 0u) {
     return 0;
   }
@@ -1185,6 +1216,9 @@ static void sqlite_maintenance(void) {
   } else {
     (void)exec_sql("PRAGMA wal_checkpoint(PASSIVE);");
   }
+  (void)exec_sql("PRAGMA shrink_memory;");
+  (void)sqlite3_db_release_memory(s_db);
+  (void)sqlite3_release_memory(0);
   refresh_db_size_status();
 }
 #endif
@@ -1267,6 +1301,8 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_status.db_open = 1;
   (void)exec_sql("PRAGMA journal_mode=WAL;");
   (void)exec_sql("PRAGMA synchronous=NORMAL;");
+  (void)exec_sql("PRAGMA cache_size=-1024;");
+  (void)exec_sql("PRAGMA mmap_size=0;");
   const char *schema =
       "CREATE TABLE IF NOT EXISTS process_cache ("
       "endpoint_id TEXT NOT NULL,tenant_id TEXT,pid INTEGER NOT NULL,ppid INTEGER,"
@@ -1393,7 +1429,7 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   }
   if ((evidence_contains_ci(path, "\\Windows\\System32\\drivers\\") ||
        evidence_contains_ci(path, "/Windows/System32/drivers/")) &&
-      evidence_contains_ci(path, ".sys.mui")) {
+      (evidence_contains_ci(path, ".sys.mui") || evidence_contains_ci(path, ".sys"))) {
     return 1;
   }
   return 0;
@@ -1446,9 +1482,6 @@ static int evidence_should_store_record(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  if (edr_p0_rule_ir_br_matches_any(r)) {
-    return 1;
-  }
   if (evidence_contains_ci(r->detection_context, "\"severity\":\"P0\"") ||
       evidence_contains_ci(r->detection_context, "\"severity\":\"P1\"") ||
       evidence_contains_ci(r->detection_context, "\"priority\":\"P0\"") ||
@@ -1456,6 +1489,12 @@ static int evidence_should_store_record(const EdrBehaviorRecord *r) {
       evidence_contains_ci(r->detection_context, "\"confidence\":0.8") ||
       evidence_contains_ci(r->detection_context, "\"confidence\":0.9") ||
       evidence_contains_ci(r->detection_context, "\"confidence\":1")) {
+    return 1;
+  }
+  if (evidence_is_low_value_file_noise(r)) {
+    return 0;
+  }
+  if (edr_p0_rule_ir_br_matches_any(r)) {
     return 1;
   }
   switch (r->type) {

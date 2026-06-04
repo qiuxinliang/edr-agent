@@ -253,6 +253,9 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       "\\windows\\system32\\drivers\\", "\\windows\\system32\\driverstore\\",
       "\\windows\\system32\\spool\\drivers\\", "\\windows\\system32\\tasks\\",
   };
+  static const char *const system_driver_exts[] = {
+      ".sys", ".sys.mui",
+  };
   static const char *const noisy_dirs[] = {
       "\\windows\\prefetch\\", "\\windows\\softwaredistribution\\",
       "\\windows\\logs\\", "\\windows\\temp\\", "\\windows\\system32\\winevt\\logs\\",
@@ -288,6 +291,12 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
   }
   if (any_contains(path, startup_dirs, sizeof(startup_dirs) / sizeof(startup_dirs[0]))) {
     mark_suspicious(p, "startup_or_scheduled_task_path", "persistence_path");
+  }
+  if ((has_ci_path(path, "\\windows\\system32\\drivers\\") ||
+       has_ci_path(path, "\\windows\\system32\\driverstore\\")) &&
+      any_ends(path, system_driver_exts, sizeof(system_driver_exts) / sizeof(system_driver_exts[0]))) {
+    mark_noisy(p, "known_windows_driver_enumeration", "noise_driver");
+    return;
   }
   if (any_contains(path, service_driver_dirs, sizeof(service_driver_dirs) / sizeof(service_driver_dirs[0])) &&
       (any_ends(path, executable_exts, sizeof(executable_exts) / sizeof(executable_exts[0])) ||
