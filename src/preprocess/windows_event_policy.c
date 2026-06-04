@@ -279,6 +279,10 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_noisy(p, "agent_internal_forensic", "agent_internal");
     return;
   }
+  if (has_ci_path(path, "__PSScriptPolicyTest_")) {
+    mark_noisy(p, "powershell_script_policy_probe", "noise_powershell_policy");
+    return;
+  }
 
   if (any_contains(path, cred_files, sizeof(cred_files) / sizeof(cred_files[0]))) {
     mark_suspicious(p, "credential_store_or_dump_path", "credential_access");

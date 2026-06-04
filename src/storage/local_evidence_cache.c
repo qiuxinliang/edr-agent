@@ -821,7 +821,7 @@ static int sqlite_size_budget_allow(void) {
 
 static int sqlite_write_budget_allow(uint32_t units, int64_t ts) {
   uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
-                                   600u, 0u, 100000u);
+                                   80u, 0u, 100000u);
   if (limit == 0u) {
     return 1;
   }
@@ -1420,6 +1420,9 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   if (evidence_contains_ci(path, ":WofCompressedData")) {
     return 1;
   }
+  if (evidence_contains_ci(path, "__PSScriptPolicyTest_")) {
+    return 1;
+  }
   if (evidence_contains_ci(path, "\\Program Files\\WindowsApps\\") ||
       evidence_contains_ci(path, "/Program Files/WindowsApps/")) {
     if (evidence_contains_ci(path, "LanguageExperiencePack") ||
@@ -1510,7 +1513,7 @@ static int evidence_should_store_record(const EdrBehaviorRecord *r) {
     return evidence_is_high_risk_port(r->net_dport) || evidence_text_has_high_signal(r);
   case EDR_EVENT_SCRIPT_POWERSHELL:
   case EDR_EVENT_SCRIPT_WMI:
-    return evidence_text_has_high_signal(r);
+    return 0;
   case EDR_EVENT_PROTOCOL_SHELLCODE:
   case EDR_EVENT_WEBSHELL_DETECTED:
   case EDR_EVENT_FIREWALL_RULE_CHANGE:
@@ -1635,6 +1638,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   int64_t ts = record_time_ns(r);
   process_cache_update(r);
   int store_candidate = evidence_should_store_record(r);
+  int low_value_file_noise = evidence_is_low_value_file_noise(r);
   if (store_candidate && candidate_dedupe_should_skip(r, ts)) {
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
@@ -1647,14 +1651,17 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   if (store_candidate) {
     candidate_id_for(r, candidate_id, sizeof(candidate_id));
   }
-  int store_context = in_context_window(r, ts, context_candidate_id, sizeof(context_candidate_id));
+  int store_context = low_value_file_noise
+                          ? 0
+                          : in_context_window(r, ts, context_candidate_id,
+                                              sizeof(context_candidate_id));
   uint32_t pre_count = 0;
   int64_t post_until_ns = 0;
   if (store_candidate) {
     pre_count = promote_context_before_window(r, ts);
     post_until_ns = mark_context_window(r, ts, candidate_id);
   }
-  if (!store_candidate && !store_context && evidence_is_low_value_file_noise(r)) {
+  if (!store_candidate && !store_context && low_value_file_noise) {
     record_metric_drop(r, ts);
     s_status.records_skipped++;
     return;

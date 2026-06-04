@@ -157,6 +157,24 @@ static void test_system_driver_enumeration_is_not_emitted(void) {
   assert(strstr(p.reason, "known_windows_driver_enumeration") != NULL);
 }
 
+static void test_powershell_policy_probe_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "C:\\Users\\alice\\AppData\\Local\\Temp\\__PSScriptPolicyTest_abcd.ps1");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "powershell_script_policy_probe") != NULL);
+}
+
 static void test_policy_can_be_disabled_by_runtime_config(void) {
   EdrWindowsEventFilterConfig cfg;
   EdrBehaviorRecord r;
@@ -206,6 +224,7 @@ int main(void) {
   test_agent_forensic_bundle_is_not_emitted();
   test_cleanmgr_temp_xml_is_not_emitted();
   test_system_driver_enumeration_is_not_emitted();
+  test_powershell_policy_probe_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();
   puts("windows_event_policy ok");
