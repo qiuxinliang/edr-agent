@@ -21,6 +21,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
 #include "edr/response.h"
+#include "edr/resource.h"
 #include "edr/self_protect.h"
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
@@ -72,6 +73,8 @@ static uint64_t command_monotonic_ms(void);
 static EdrCommandDeliveryHealth s_delivery_health;
 static int64_t s_upload_outbox_next_retry_ms;
 static uint32_t s_upload_outbox_fail_streak;
+static int64_t s_result_outbox_next_flush_ms;
+static int64_t s_compact_next_allowed_ms;
 
 static uint32_t command_u32_env_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv) {
   const char *e = getenv(name);
@@ -3333,7 +3336,11 @@ static void flush_command_result_outbox(void) {
 void edr_command_poll_reliable_delivery(void) {
   static int64_t last_poll_ms;
   int64_t now = command_now_ms();
-  if (last_poll_ms > 0 && now - last_poll_ms < 5000) {
+  int pressure = edr_resource_preprocess_throttle_active() ? 1 : 0;
+  uint32_t poll_ms = command_u32_env_clamped(
+      pressure ? "EDR_COMMAND_DELIVERY_PRESSURE_POLL_MS" : "EDR_COMMAND_DELIVERY_POLL_MS",
+      pressure ? 30000u : 5000u, 1000u, 600000u);
+  if (last_poll_ms > 0 && now - last_poll_ms < (int64_t)poll_ms) {
     return;
   }
   last_poll_ms = now;
@@ -3344,14 +3351,38 @@ void edr_command_poll_reliable_delivery(void) {
   flush_upload_outbox();
   s_delivery_health.last_upload_ms = command_elapsed_ms_u32(step_start);
   command_update_max_u32(s_delivery_health.last_upload_ms, &s_delivery_health.max_upload_ms);
-  step_start = command_monotonic_ms();
-  flush_command_result_outbox();
-  s_delivery_health.last_result_ms = command_elapsed_ms_u32(step_start);
-  command_update_max_u32(s_delivery_health.last_result_ms, &s_delivery_health.max_result_ms);
-  step_start = command_monotonic_ms();
-  edr_command_state_compact_if_needed();
-  s_delivery_health.last_compact_ms = command_elapsed_ms_u32(step_start);
-  command_update_max_u32(s_delivery_health.last_compact_ms, &s_delivery_health.max_compact_ms);
+  s_delivery_health.last_result_ms = 0u;
+  if (!pressure || s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
+    step_start = command_monotonic_ms();
+    flush_command_result_outbox();
+    s_delivery_health.last_result_ms = command_elapsed_ms_u32(step_start);
+    command_update_max_u32(s_delivery_health.last_result_ms, &s_delivery_health.max_result_ms);
+    if (pressure) {
+      uint32_t next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_PRESSURE_INTERVAL_MS",
+                                                 60000u, 5000u, 600000u);
+      if (s_delivery_health.last_result_ms >=
+          command_u32_env_clamped("EDR_COMMAND_DELIVERY_SLOW_MS", 750u, 100u, 60000u)) {
+        next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_SLOW_BACKOFF_MS",
+                                          300000u, next_ms, 1800000u);
+      }
+      s_result_outbox_next_flush_ms = now + (int64_t)next_ms;
+    } else {
+      s_result_outbox_next_flush_ms = 0;
+    }
+  }
+  s_delivery_health.last_compact_ms = 0u;
+  if (!pressure && (s_compact_next_allowed_ms <= 0 || now >= s_compact_next_allowed_ms)) {
+    step_start = command_monotonic_ms();
+    edr_command_state_compact_if_needed();
+    s_delivery_health.last_compact_ms = command_elapsed_ms_u32(step_start);
+    command_update_max_u32(s_delivery_health.last_compact_ms, &s_delivery_health.max_compact_ms);
+    if (s_delivery_health.last_compact_ms >=
+        command_u32_env_clamped("EDR_COMMAND_DELIVERY_SLOW_MS", 750u, 100u, 60000u)) {
+      uint32_t next_ms = command_u32_env_clamped("EDR_COMMAND_COMPACT_SLOW_BACKOFF_MS",
+                                                600000u, 60000u, 3600000u);
+      s_compact_next_allowed_ms = now + (int64_t)next_ms;
+    }
+  }
   s_delivery_health.last_total_ms = command_elapsed_ms_u32(total_start);
   command_update_max_u32(s_delivery_health.last_total_ms, &s_delivery_health.max_total_ms);
 }

@@ -11,6 +11,7 @@
 #include "edr/ave_sdk.h"
 #include "edr/behavior_alert_emit.h"
 #include "edr/behavior_record.h"
+#include "edr/resource.h"
 #include "edr/types.h"
 #include "edr/enrich_parent_info.h"
 
@@ -68,6 +69,10 @@ struct p0_ep_rate_slot {
 };
 static struct p0_ep_rate_slot s_ep_rate[P0_EP_RATE_SLOTS];
 static uint32_t s_ep_rate_next;
+
+static uint64_t s_p0_pressure_eval_win_ms;
+static uint32_t s_p0_pressure_eval_count;
+static uint64_t s_p0_pressure_eval_skipped;
 
 static int p0_debug_enabled(void) {
   static int cached = -1;
@@ -318,6 +323,47 @@ static uint64_t p0_monotonic_ms(void) {
   }
   return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 #endif
+}
+
+static unsigned long p0_pressure_max_evals_per_min(void) {
+  const char *e = getenv("EDR_P0_PRESSURE_MAX_EVALS_PER_MIN");
+  if (!e || !*e) {
+    return 300u;
+  }
+  return strtoul(e, NULL, 10);
+}
+
+static int p0_pressure_eval_ok(const EdrBehaviorRecord *br) {
+  if (!edr_resource_preprocess_throttle_active()) {
+    return 1;
+  }
+  unsigned long cap = p0_pressure_max_evals_per_min();
+  if (cap == 0u) {
+    return 1;
+  }
+  uint64_t now = p0_monotonic_ms();
+  if (now == 0u) {
+    return 1;
+  }
+  if (s_p0_pressure_eval_win_ms == 0u ||
+      now - s_p0_pressure_eval_win_ms >= 60000ull) {
+    s_p0_pressure_eval_win_ms = now;
+    s_p0_pressure_eval_count = 0u;
+  }
+  if ((uint64_t)s_p0_pressure_eval_count >= (uint64_t)cap) {
+    s_p0_pressure_eval_skipped++;
+    if (p0_debug_enabled() &&
+        (s_p0_pressure_eval_skipped == 1u ||
+         (s_p0_pressure_eval_skipped & 1023u) == 0u)) {
+      fprintf(stderr,
+              "[P0 DEBUG] pressure eval budget exhausted: skipped=%llu cap_per_min=%lu pid=%u type=%d\n",
+              (unsigned long long)s_p0_pressure_eval_skipped, cap,
+              br ? br->pid : 0u, br ? (int)br->type : 0);
+    }
+    return 0;
+  }
+  s_p0_pressure_eval_count++;
+  return 1;
 }
 
 /* 若允许上送则占槽并返回 1；在冷却窗口内返回 0。
@@ -909,6 +955,10 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     if (p0_debug_all_enabled()) {
       p0_debug_event("internal-skip", br, pn, detail);
     }
+    return;
+  }
+
+  if (!p0_pressure_eval_ok(br)) {
     return;
   }
 
