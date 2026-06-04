@@ -13,6 +13,9 @@
 #endif
 
 #define EDR_ADAPTIVE_PID_CACHE 96u
+#define EDR_ADAPTIVE_BUDGET_WINDOW_MS 60000ULL
+#define EDR_ADAPTIVE_DEFAULT_ADMIT_BUDGET_PER_MIN 1200L
+#define EDR_ADAPTIVE_DEFAULT_SCRIPT_BUDGET_PER_MIN 240L
 
 typedef struct {
   uint32_t pid;
@@ -27,6 +30,11 @@ static volatile long s_level;
 static volatile uint64_t s_until_ms;
 static volatile uint64_t s_boosts;
 static volatile uint64_t s_last_boost_unix_ms;
+static volatile uint64_t s_budget_window_ms;
+static volatile uint64_t s_budget_used;
+static volatile uint64_t s_script_budget_used;
+static volatile long s_admit_budget_per_min = EDR_ADAPTIVE_DEFAULT_ADMIT_BUDGET_PER_MIN;
+static volatile long s_script_budget_per_min = EDR_ADAPTIVE_DEFAULT_SCRIPT_BUDGET_PER_MIN;
 static EdrAdaptivePidEntry s_pid_cache[EDR_ADAPTIVE_PID_CACHE];
 static volatile uint32_t s_pid_next;
 static char s_last_rule_id[64];
@@ -113,6 +121,18 @@ static uint64_t adaptive_inc64(volatile uint64_t *p) {
   return __atomic_add_fetch(p, 1, __ATOMIC_RELAXED);
 #else
   return ++(*p);
+#endif
+}
+
+static uint64_t adaptive_exchange64(volatile uint64_t *p, uint64_t v) {
+#if defined(_WIN32)
+  return (uint64_t)InterlockedExchange64((volatile LONG64 *)p, (LONG64)v);
+#elif defined(__GNUC__) || defined(__clang__)
+  return __atomic_exchange_n(p, v, __ATOMIC_RELAXED);
+#else
+  uint64_t old = *p;
+  *p = v;
+  return old;
 #endif
 }
 
@@ -208,6 +228,33 @@ static int adaptive_remote_admin_port(uint32_t port) {
   }
 }
 
+static int adaptive_event_is_script(EdrEventType type) {
+  return type == EDR_EVENT_SCRIPT_POWERSHELL || type == EDR_EVENT_SCRIPT_WMI;
+}
+
+static int adaptive_budget_allow(EdrEventType type, uint64_t now_ms) {
+  long limit = adaptive_load_long(&s_admit_budget_per_min);
+  long script_limit = adaptive_load_long(&s_script_budget_per_min);
+  uint64_t window = adaptive_load64(&s_budget_window_ms);
+  uint64_t used;
+  if (limit <= 0) {
+    return 1;
+  }
+  if (window == 0u || now_ms < window || now_ms - window >= EDR_ADAPTIVE_BUDGET_WINDOW_MS) {
+    adaptive_store64(&s_budget_window_ms, now_ms);
+    adaptive_exchange64(&s_budget_used, 0u);
+    adaptive_exchange64(&s_script_budget_used, 0u);
+  }
+  if (adaptive_event_is_script(type) && script_limit > 0) {
+    used = adaptive_inc64(&s_script_budget_used);
+    if (used > (uint64_t)script_limit) {
+      return 0;
+    }
+  }
+  used = adaptive_inc64(&s_budget_used);
+  return used <= (uint64_t)limit;
+}
+
 static int adaptive_pid_boosted(uint32_t pid, uint64_t now_ms) {
   if (pid == 0u) {
     return 0;
@@ -259,6 +306,15 @@ void edr_adaptive_collection_configure(const EdrConfig *cfg) {
   enabled = adaptive_env_bool("EDR_ADAPTIVE_COLLECTION", (int)enabled) ? 1 : 0;
   ttl = adaptive_env_long("EDR_ADAPTIVE_COLLECTION_TTL_S", ttl, 30, 1800);
   minsev = adaptive_env_long("EDR_ADAPTIVE_COLLECTION_MIN_SEVERITY", minsev, 1, 5);
+  adaptive_store_long(&s_admit_budget_per_min,
+                      adaptive_env_long("EDR_ADAPTIVE_COLLECTION_ADMIT_BUDGET_PER_MIN",
+                                        EDR_ADAPTIVE_DEFAULT_ADMIT_BUDGET_PER_MIN, 0, 100000));
+  adaptive_store_long(&s_script_budget_per_min,
+                      adaptive_env_long("EDR_ADAPTIVE_COLLECTION_SCRIPT_BUDGET_PER_MIN",
+                                        EDR_ADAPTIVE_DEFAULT_SCRIPT_BUDGET_PER_MIN, 0, 100000));
+  adaptive_store64(&s_budget_window_ms, 0u);
+  adaptive_exchange64(&s_budget_used, 0u);
+  adaptive_exchange64(&s_script_budget_used, 0u);
   adaptive_store_long(&s_enabled, enabled);
   adaptive_store_long(&s_ttl_s, ttl);
   adaptive_store_long(&s_min_severity, minsev);
@@ -306,6 +362,16 @@ int edr_adaptive_collection_should_admit_interest(const EdrSensorInterestEvent *
   if (pid_hit && event->parent_pid && event->pid) {
     adaptive_mark_pid(event->pid, event->process_name, adaptive_load64(&s_until_ms));
   }
+  if (!pid_hit &&
+      !(event->type == EDR_EVENT_NET_CONNECT || event->type == EDR_EVENT_NET_LISTEN ||
+        event->type == EDR_EVENT_NET_DNS_QUERY || event->type == EDR_EVENT_NET_TLS_HANDSHAKE) &&
+      !(event->type == EDR_EVENT_PROTOCOL_SHELLCODE || event->type == EDR_EVENT_WEBSHELL_DETECTED ||
+        event->type == EDR_EVENT_BEHAVIOR_ONNX_ALERT)) {
+    return 0;
+  }
+  if (!adaptive_budget_allow(event->type, now)) {
+    return 0;
+  }
   switch (event->type) {
     case EDR_EVENT_PROCESS_CREATE:
     case EDR_EVENT_SCRIPT_POWERSHELL:
@@ -320,7 +386,7 @@ int edr_adaptive_collection_should_admit_interest(const EdrSensorInterestEvent *
     case EDR_EVENT_NET_TLS_HANDSHAKE:
       return pid_hit || adaptive_process_interesting(event->process_name) ||
              adaptive_remote_admin_port(event->remote_port) ||
-             adaptive_env_bool("EDR_ADAPTIVE_COLLECTION_KEEP_ALL_NET", 1);
+             adaptive_env_bool("EDR_ADAPTIVE_COLLECTION_KEEP_ALL_NET", 0);
     case EDR_EVENT_FILE_CREATE:
     case EDR_EVENT_FILE_WRITE:
     case EDR_EVENT_FILE_DELETE:
@@ -330,9 +396,10 @@ int edr_adaptive_collection_should_admit_interest(const EdrSensorInterestEvent *
     case EDR_EVENT_REG_CREATE_KEY:
     case EDR_EVENT_REG_SET_VALUE:
     case EDR_EVENT_REG_DELETE_KEY:
+      return pid_hit;
     case EDR_EVENT_PROCESS_TERMINATE:
     case EDR_EVENT_DLL_LOAD:
-      return pid_hit || adaptive_process_interesting(event->process_name);
+      return pid_hit && adaptive_env_bool("EDR_ADAPTIVE_COLLECTION_KEEP_LIFECYCLE", 0);
     case EDR_EVENT_AUTH_LOGIN:
     case EDR_EVENT_AUTH_LOGOUT:
     case EDR_EVENT_AUTH_FAILED:

@@ -45,6 +45,22 @@ typedef struct {
 #define EDR_THREAD_CPU_POINTS_MAX 512u
 static EdrThreadCpuPoint s_thread_cpu_prev[EDR_THREAD_CPU_POINTS_MAX];
 static size_t s_thread_cpu_prev_count;
+static uint64_t s_last_working_set_trim_ms;
+
+static long resource_env_long(const char *name, long fallback, long minv, long maxv) {
+  const char *v = getenv(name);
+  long out = fallback;
+  if (v && v[0]) {
+    out = strtol(v, NULL, 10);
+  }
+  if (out < minv) {
+    out = minv;
+  }
+  if (out > maxv) {
+    out = maxv;
+  }
+  return out;
+}
 #endif
 
 static void sample_init(void) {
@@ -80,6 +96,7 @@ void edr_resource_init(const EdrConfig *cfg) {
   memset(&s_sample, 0, sizeof(s_sample));
 #ifdef _WIN32
   s_thread_cpu_prev_count = 0u;
+  s_last_working_set_trim_ms = 0u;
 #endif
   set_pressure_sample(0u, 0u, "ok");
   sample_init();
@@ -194,6 +211,35 @@ static uint32_t sample_threads_for_pid(DWORD pid, uint64_t wall_delta_100ns, DWO
   }
   return n;
 }
+
+static uint64_t resource_monotonic_ms(void) {
+  return (uint64_t)GetTickCount64();
+}
+
+static void maybe_trim_working_set(unsigned pct, unsigned long *rss_mb) {
+  long threshold_mb = resource_env_long("EDR_WORKING_SET_TRIM_MB", 128, 0, 4096);
+  long interval_s = resource_env_long("EDR_WORKING_SET_TRIM_INTERVAL_S", 120, 10, 3600);
+  uint64_t now_ms;
+  PROCESS_MEMORY_COUNTERS_EX pmc;
+  if (!rss_mb || threshold_mb <= 0 || *rss_mb <= (unsigned long)threshold_mb || pct > 5u) {
+    return;
+  }
+  now_ms = resource_monotonic_ms();
+  if (s_last_working_set_trim_ms != 0u &&
+      now_ms - s_last_working_set_trim_ms < (uint64_t)interval_s * 1000ULL) {
+    return;
+  }
+  s_last_working_set_trim_ms = now_ms;
+  (void)HeapCompact(GetProcessHeap(), 0);
+  if (SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1)) {
+    memset(&pmc, 0, sizeof(pmc));
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+      *rss_mb = (unsigned long)(pmc.WorkingSetSize / (1024ULL * 1024ULL));
+    }
+    fprintf(stderr, "[resource] working set trimmed threshold_mb=%ld rss_mb=%lu\n",
+            threshold_mb, *rss_mb);
+  }
+}
 #endif
 
 void edr_resource_poll(void) {
@@ -231,6 +277,7 @@ void edr_resource_poll(void) {
   if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
     rss_mb = (unsigned long)(pmc.WorkingSetSize / (1024ULL * 1024ULL));
   }
+  maybe_trim_working_set(pct, &rss_mb);
   DWORD handles = 0;
   (void)GetProcessHandleCount(GetCurrentProcess(), &handles);
   uint32_t hot_thread_id = 0u;

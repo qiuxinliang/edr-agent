@@ -946,6 +946,20 @@ else()
 endif()
 add_test(NAME windows_event_policy COMMAND test_windows_event_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_collection_admission tests/test_collection_admission.c
+  src/preprocess/adaptive_collection.c
+  src/preprocess/sensor_interest.c
+  third_party/cjson/cJSON.c)
+target_include_directories(test_collection_admission PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(MSVC)
+  target_compile_options(test_collection_admission PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_collection_admission PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME collection_admission COMMAND test_collection_admission WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_ave_pipeline tests/test_ave_pipeline.c
   src/ave/ave_sdk.c
   src/ave/fl_feature_provider.c

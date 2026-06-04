@@ -875,13 +875,15 @@ int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
   case EDR_EVENT_FILE_DELETE:
   case EDR_EVENT_FILE_RENAME:
   case EDR_EVENT_FILE_PERMISSION_CHANGE:
+    if (edr_si_file_candidate(event->path)) {
+      matched = 1;
+      edr_si_inc64(&s_si.path_hits);
+    }
+    break;
   case EDR_EVENT_FILE_READ:
     if (edr_si_file_candidate(event->path)) {
       matched = 1;
       edr_si_inc64(&s_si.path_hits);
-    } else if (edr_si_process_interesting(event->process_name)) {
-      matched = 1;
-      edr_si_inc64(&s_si.process_hits);
     }
     break;
   case EDR_EVENT_REG_CREATE_KEY:
@@ -890,9 +892,6 @@ int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
     if (edr_si_registry_candidate(event->registry_path[0] ? event->registry_path : event->path)) {
       matched = 1;
       edr_si_inc64(&s_si.registry_hits);
-    } else if (edr_si_process_interesting(event->process_name)) {
-      matched = 1;
-      edr_si_inc64(&s_si.process_hits);
     }
     break;
   default:
