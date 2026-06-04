@@ -72,21 +72,33 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
     return st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
   }
 
-  BYTE *tmp = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cb);
-  if (!tmp) {
-    return ERROR_NOT_ENOUGH_MEMORY;
+  BYTE stack_tmp[4096];
+  BYTE *tmp = stack_tmp;
+  int heap_tmp = 0;
+  if (cb > sizeof(stack_tmp)) {
+    tmp = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cb);
+    if (!tmp) {
+      return ERROR_NOT_ENOUGH_MEMORY;
+    }
+    heap_tmp = 1;
+  } else {
+    memset(stack_tmp, 0, cb);
   }
 
   st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, tmp);
   if (st != ERROR_SUCCESS) {
-    HeapFree(GetProcessHeap(), 0, tmp);
+    if (heap_tmp) {
+      HeapFree(GetProcessHeap(), 0, tmp);
+    }
     return st;
   }
 
   if (cb == 4) {
     ULONG v = *(ULONG *)tmp;
     snprintf(out, out_cap, "%lu", (unsigned long)v);
-    HeapFree(GetProcessHeap(), 0, tmp);
+    if (heap_tmp) {
+      HeapFree(GetProcessHeap(), 0, tmp);
+    }
     return ERROR_SUCCESS;
   }
 
@@ -97,16 +109,22 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
     if (n > 0) {
       out[n] = '\0';
       if (!utf8_looks_text(out)) {
-        HeapFree(GetProcessHeap(), 0, tmp);
+        if (heap_tmp) {
+          HeapFree(GetProcessHeap(), 0, tmp);
+        }
         out[0] = '\0';
         return ERROR_NOT_FOUND;
       }
-      HeapFree(GetProcessHeap(), 0, tmp);
+      if (heap_tmp) {
+        HeapFree(GetProcessHeap(), 0, tmp);
+      }
       return ERROR_SUCCESS;
     }
   }
 
-  HeapFree(GetProcessHeap(), 0, tmp);
+  if (heap_tmp) {
+    HeapFree(GetProcessHeap(), 0, tmp);
+  }
   return ERROR_NOT_FOUND;
 }
 

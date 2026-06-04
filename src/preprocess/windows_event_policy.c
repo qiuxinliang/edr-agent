@@ -283,6 +283,11 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_noisy(p, "powershell_script_policy_probe", "noise_powershell_policy");
     return;
   }
+  if (has_ci_path(path,
+                  "\\windows\\system32\\config\\systemprofile\\appdata\\local\\microsoft\\windows\\caches\\")) {
+    mark_noisy(p, "systemprofile_windows_cache_db", "noise_system_cache");
+    return;
+  }
 
   if (any_contains(path, cred_files, sizeof(cred_files) / sizeof(cred_files[0]))) {
     mark_suspicious(p, "credential_store_or_dump_path", "credential_access");

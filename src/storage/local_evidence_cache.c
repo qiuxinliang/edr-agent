@@ -1423,6 +1423,10 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   if (evidence_contains_ci(path, "__PSScriptPolicyTest_")) {
     return 1;
   }
+  if (evidence_contains_ci(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\Caches\\")) {
+    return 1;
+  }
   if (evidence_contains_ci(path, "\\Program Files\\WindowsApps\\") ||
       evidence_contains_ci(path, "/Program Files/WindowsApps/")) {
     if (evidence_contains_ci(path, "LanguageExperiencePack") ||

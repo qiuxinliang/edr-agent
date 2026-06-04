@@ -175,6 +175,25 @@ static void test_powershell_policy_probe_is_not_emitted(void) {
   assert(strstr(p.reason, "powershell_script_policy_probe") != NULL);
 }
 
+static void test_systemprofile_cache_db_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "svchost.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\config\\systemprofile\\AppData\\Local"
+           "\\Microsoft\\Windows\\Caches\\cversions.3.db");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "systemprofile_windows_cache_db") != NULL);
+}
+
 static void test_policy_can_be_disabled_by_runtime_config(void) {
   EdrWindowsEventFilterConfig cfg;
   EdrBehaviorRecord r;
@@ -225,6 +244,7 @@ int main(void) {
   test_cleanmgr_temp_xml_is_not_emitted();
   test_system_driver_enumeration_is_not_emitted();
   test_powershell_policy_probe_is_not_emitted();
+  test_systemprofile_cache_db_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();
   puts("windows_event_policy ok");
