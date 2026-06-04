@@ -132,7 +132,7 @@ void edr_onnx_behavior_model_version(char *buf, size_t cap) {
   if (!buf || cap == 0u) {
     return;
   }
-  snprintf(buf, cap, "heuristic_v1");
+  snprintf(buf, cap, "not_loaded");
 }
 
 void edr_onnx_static_model_version(char *buf, size_t cap) {
@@ -232,7 +232,7 @@ static void release_file_session(void) {
   g_in_nelem = 0;
   memset(g_static_model_path, 0, sizeof(g_static_model_path));
   memset(g_static_ver_tag, 0, sizeof(g_static_ver_tag));
-  
+
   // 释放内存池
   if (s_static_input_buf) {
     free(s_static_input_buf);
@@ -257,7 +257,7 @@ static void release_behavior_session(void) {
   g_beh_in_nelem = 0;
   memset(g_beh_ver_tag, 0, sizeof(g_beh_ver_tag));
   memset(g_beh_model_path, 0, sizeof(g_beh_model_path));
-  
+
   // 释放内存池
   if (s_behavior_input_buf) {
     free(s_behavior_input_buf);
@@ -523,14 +523,14 @@ static EdrError create_session_from_path(const char *onnx_path, const EdrConfig 
     return EDR_ERR_AVE_LOAD_FAILED;
   }
   int th = (cfg && cfg->ave.scan_threads > 0) ? cfg->ave.scan_threads : 1;
-  
+
   // 性能优化：启用图优化和执行优化
   g_ort->SetIntraOpNumThreads(opt, th);
   g_ort->SetInterOpNumThreads(opt, 1);  // 小模型单线程更好
-  
+
   // 设置图优化级别
   g_ort->SetSessionGraphOptimizationLevel(opt, ORT_ENABLE_EXTENDED);
-  
+
   // 设置执行模式为顺序执行（对于小模型更快）
   g_ort->SetSessionExecutionMode(opt, ORT_SEQUENTIAL);
 
@@ -749,7 +749,7 @@ EdrError edr_onnx_runtime_load(const char *onnx_path, const EdrConfig *cfg) {
           (long long)g_in_nelem, g_static_spec_triple);
   snprintf(g_static_model_path, sizeof(g_static_model_path), "%s", onnx_path);
   copy_static_tag(onnx_path);
-  
+
   // 初始化内存池 - 性能优化
   if (g_in_nelem > 0) {
     s_static_input_buf = (float *)calloc((size_t)g_in_nelem, sizeof(float));
@@ -759,7 +759,7 @@ EdrError edr_onnx_runtime_load(const char *onnx_path, const EdrConfig *cfg) {
       EDR_LOGV("[ave/onnx] static input buf pool initialized, nelem=%lld\n", (long long)g_in_nelem);
     }
   }
-  
+
   g_ready = 1;
   return EDR_OK;
 }
@@ -802,7 +802,7 @@ EdrError edr_onnx_behavior_load(const char *behavior_onnx_path, const EdrConfig 
   snprintf(g_beh_model_path, sizeof(g_beh_model_path), "%s", behavior_onnx_path);
   EDR_LOGV("[ave/onnx] behavior ONNX loaded path=%s ndim=%d nelem=%lld dual_tactic=%d\n", behavior_onnx_path,
           g_beh_in_ndim, (long long)g_beh_in_nelem, g_beh_dual_out);
-  
+
   // 初始化内存池 - 性能优化
   if (g_beh_in_nelem > 0) {
     s_behavior_input_buf = (float *)malloc((size_t)g_beh_in_nelem * sizeof(float));
@@ -812,7 +812,7 @@ EdrError edr_onnx_behavior_load(const char *behavior_onnx_path, const EdrConfig 
       EDR_LOGV("[ave/onnx] behavior input buf pool initialized, nelem=%lld\n", (long long)g_beh_in_nelem);
     }
   }
-  
+
   g_beh_ready = 1;
   return EDR_OK;
 }
@@ -856,7 +856,7 @@ void edr_onnx_behavior_model_version(char *buf, size_t cap) {
   if (g_beh_ready && g_beh_ver_tag[0]) {
     snprintf(buf, cap, "%s", g_beh_ver_tag);
   } else {
-    snprintf(buf, cap, "heuristic_v1");
+    snprintf(buf, cap, "not_loaded");
   }
 }
 
@@ -941,7 +941,7 @@ EdrError edr_onnx_infer_file(const EdrConfig *cfg, const char *path, EdrAveInfer
   memset(out, 0, sizeof(*out));
 
   int64_t n = g_in_nelem;
-  
+
   // 使用内存池或按需分配
   float *buf = s_static_input_buf;
   int need_free = 0;

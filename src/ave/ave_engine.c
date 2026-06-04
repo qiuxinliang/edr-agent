@@ -153,6 +153,22 @@ static int find_behavior_onnx_path(const char *dir, char *out, size_t cap) {
   return behavior_onnx_exists(out) ? 1 : 0;
 }
 
+static int ave_env_truthy(const char *name) {
+  const char *v = getenv(name);
+  if (!v || !v[0]) {
+    return 0;
+  }
+  return strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0 ||
+         strcasecmp(v, "on") == 0;
+}
+
+static int should_preload_behavior_onnx(const EdrConfig *cfg) {
+  if (ave_env_truthy("EDR_AVE_BEHAVIOR_PRELOAD")) {
+    return 1;
+  }
+  return cfg && cfg->ave.behavior_monitor_enabled;
+}
+
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
   if (!path || !path[0] || !out_hex || cap < 17u) {
     return -1;
@@ -228,14 +244,19 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
   }
-  char beh_path[2048];
-  if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
-    EdrError be = edr_onnx_behavior_load(beh_path, cfg);
-    if (be != EDR_OK) {
-      EDR_LOGE("[ave] behavior.onnx load failed (%d); behavior score uses heuristics\n", (int)be);
+  if (should_preload_behavior_onnx(cfg)) {
+    char beh_path[2048];
+    if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
+      EdrError be = edr_onnx_behavior_load(beh_path, cfg);
+      if (be != EDR_OK) {
+        EDR_LOGE("[ave] behavior.onnx load failed (%d); behavior score uses heuristics\n", (int)be);
+      }
+    } else {
+      (void)edr_onnx_behavior_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
+    EDR_LOGV("%s", "[ave] behavior.onnx preload skipped (server-side gray eval / monitor disabled)\n");
   }
   return EDR_OK;
 }
@@ -257,11 +278,15 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
   }
-  char beh_path[2048];
-  if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
-    EdrError be = edr_onnx_behavior_load(beh_path, cfg);
-    if (be != EDR_OK) {
-      EDR_LOGE("[ave] reload behavior.onnx failed (%d)\n", (int)be);
+  if (should_preload_behavior_onnx(cfg)) {
+    char beh_path[2048];
+    if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
+      EdrError be = edr_onnx_behavior_load(beh_path, cfg);
+      if (be != EDR_OK) {
+        EDR_LOGE("[ave] reload behavior.onnx failed (%d)\n", (int)be);
+      }
+    } else {
+      (void)edr_onnx_behavior_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);

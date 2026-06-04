@@ -320,7 +320,9 @@ static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, con
 #include <unistd.h>
 #endif
 
-#define AVE_BP_RING_CAP 4096u
+#define AVE_BP_RING_CAP_DEFAULT 1024u
+#define AVE_BP_RING_CAP_MAX 4096u
+#define AVE_BP_RING_CAP_MIN 64u
 #define AVE_BP_PID_SLOTS 512u
 #define AVE_BP_ALERT_THRESH EDR_AVE_BEH_SCORE_HIGH
 #define AVE_BP_ALERT_COOLDOWN_NS (10LL * 1000000000LL)
@@ -333,6 +335,7 @@ static AVECallbacks s_callbacks;
 static int s_callbacks_set;
 
 static AveMpmcQueue *s_q;
+static uint32_t s_q_capacity;
 
 #ifdef _WIN32
 static CRITICAL_SECTION s_mu;
@@ -344,6 +347,29 @@ static pthread_t s_thread;
 
 static volatile int s_worker_stop;
 static volatile int s_monitor_started;
+
+static uint32_t bp_queue_capacity_from_env(void) {
+  const char *e = getenv("EDR_AVE_BP_QUEUE_CAP");
+  uint32_t cap = AVE_BP_RING_CAP_DEFAULT;
+  if (e && e[0]) {
+    char *end = NULL;
+    unsigned long v = strtoul(e, &end, 10);
+    if (end && *end == '\0' && v >= AVE_BP_RING_CAP_MIN && v <= AVE_BP_RING_CAP_MAX) {
+      cap = (uint32_t)v;
+    }
+  }
+  if (cap < AVE_BP_RING_CAP_MIN) {
+    cap = AVE_BP_RING_CAP_MIN;
+  }
+  if (cap > AVE_BP_RING_CAP_MAX) {
+    cap = AVE_BP_RING_CAP_MAX;
+  }
+  uint32_t pow2 = AVE_BP_RING_CAP_MIN;
+  while (pow2 < cap && pow2 < AVE_BP_RING_CAP_MAX) {
+    pow2 <<= 1u;
+  }
+  return pow2;
+}
 
 static void lock_bp(void) {
 #ifdef _WIN32
@@ -1242,10 +1268,7 @@ void edr_ave_bp_init(void) {
     ave_mpmc_destroy(s_q);
     s_q = NULL;
   }
-  if (ave_mpmc_init(&s_q, AVE_BP_RING_CAP) != 0) {
-    s_q = NULL;
-    fprintf(stderr, "[ave/bp] MPMC 初始化失败\n");
-  }
+  s_q_capacity = 0u;
 #ifdef _WIN32
   InitializeCriticalSection(&s_mu);
   s_thread = NULL;
@@ -1304,7 +1327,14 @@ int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
     return AVE_ERR_INVALID_PARAM;
   }
   if (!s_q) {
-    return AVE_ERR_INTERNAL;
+    const uint32_t cap = bp_queue_capacity_from_env();
+    if (ave_mpmc_init(&s_q, cap) != 0) {
+      s_q = NULL;
+      s_q_capacity = 0u;
+      fprintf(stderr, "[ave/bp] MPMC init failed\n");
+      return AVE_ERR_INTERNAL;
+    }
+    s_q_capacity = cap;
   }
   if (s_monitor_started) {
     return AVE_OK;
@@ -1429,7 +1459,7 @@ uint32_t edr_ave_bp_queue_depth(void) {
   return d > 0xffffffffu ? 0xffffffffu : (uint32_t)d;
 }
 
-uint32_t edr_ave_bp_queue_capacity(void) { return AVE_BP_RING_CAP; }
+uint32_t edr_ave_bp_queue_capacity(void) { return s_q_capacity; }
 
 void edr_ave_bp_fill_metrics(AVEStatus *status_out) {
   if (!status_out) {
