@@ -194,6 +194,119 @@ static void test_systemprofile_cache_db_is_not_emitted(void) {
   assert(strstr(p.reason, "systemprofile_windows_cache_db") != NULL);
 }
 
+static void test_installservice_catalog_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "svchost.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\config\\systemprofile\\AppData\\Local"
+           "\\Microsoft\\InstallService\\{17A33966-CC08-4A93-B766-3FF4CF533B5D}.catalogItem"
+           ":$DSC:$LOGGED_UTILITY_STREAM");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "systemprofile_installservice_catalog") != NULL);
+}
+
+static void test_installservice_plain_catalog_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "svchost.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\config\\systemprofile\\AppData\\Local"
+           "\\Microsoft\\InstallService\\{17A33966-CC08-4A93-B766-3FF4CF533B5D}.catalogItem");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "systemprofile_installservice_catalog") != NULL);
+}
+
+static void test_systemprofile_cryptnet_metadata_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow"
+           "\\Microsoft\\CryptnetUrlCache\\MetaData\\7F9657FD5D75F23149C6D23124EB2E79");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "systemprofile_cryptnet_url_cache") != NULL);
+}
+
+static void test_windowsapps_webexperience_assets_are_not_webshell_signal(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "svchost.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Program Files\\WindowsApps"
+           "\\MicrosoftWindows.Client.WebExperience_526.11701.50.0_arm64__cw5n1h2txyewy"
+           "\\Dashboard\\WebContent\\wwwroot\\com-msn-weather\\images");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "windowsapps_webexperience_assets") != NULL);
+}
+
+static void test_windows_update_umdf_mui_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "MoUsoCoreWorker.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\drivers\\UMDF\\zh-CN\\UsbccidDriver.dll.mui");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "windows_update_umdf_mui") != NULL);
+}
+
+static void test_installservice_smartretry_task_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "backgroundTaskHost.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\Tasks\\Microsoft\\Windows\\InstallService\\SmartRetry");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "installservice_smartretry_task") != NULL);
+}
+
 static void test_policy_can_be_disabled_by_runtime_config(void) {
   EdrWindowsEventFilterConfig cfg;
   EdrBehaviorRecord r;
@@ -245,6 +358,12 @@ int main(void) {
   test_system_driver_enumeration_is_not_emitted();
   test_powershell_policy_probe_is_not_emitted();
   test_systemprofile_cache_db_is_not_emitted();
+  test_installservice_catalog_is_not_emitted();
+  test_installservice_plain_catalog_is_not_emitted();
+  test_systemprofile_cryptnet_metadata_is_not_emitted();
+  test_windowsapps_webexperience_assets_are_not_webshell_signal();
+  test_windows_update_umdf_mui_is_not_emitted();
+  test_installservice_smartretry_task_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();
   puts("windows_event_policy ok");

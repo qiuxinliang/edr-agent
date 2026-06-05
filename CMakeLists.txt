@@ -960,6 +960,18 @@ else()
 endif()
 add_test(NAME collection_admission COMMAND test_collection_admission WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_preprocess_dedup tests/test_preprocess_dedup.c
+  src/preprocess/dedup.c
+  src/preprocess/behavior_record.c
+  src/preprocess/windows_event_policy.c)
+target_include_directories(test_preprocess_dedup PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(MSVC)
+  target_compile_options(test_preprocess_dedup PRIVATE /W4 /WX-)
+else()
+  target_compile_options(test_preprocess_dedup PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME preprocess_dedup COMMAND test_preprocess_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_ave_pipeline tests/test_ave_pipeline.c
   src/ave/ave_sdk.c
   src/ave/fl_feature_provider.c

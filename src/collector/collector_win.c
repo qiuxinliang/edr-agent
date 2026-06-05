@@ -1054,6 +1054,33 @@ static int edr_collector_known_low_value_file_record(const EdrBehaviorRecord *br
                            "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\Caches\\")) {
     return 1;
   }
+  if (edr_contains_ci_path(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\InstallService\\") &&
+      edr_contains_ci_path(path, ".catalogItem")) {
+    return 1;
+  }
+  if (edr_contains_ci_path(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow\\Microsoft\\CryptnetUrlCache\\MetaData\\")) {
+    return 1;
+  }
+  if (edr_contains_ci_path(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\WindowsApps")) {
+    return 1;
+  }
+  if (edr_contains_ci_path(br->process_name, "svchost.exe") &&
+      edr_contains_ci_path(path, "\\Program Files\\WindowsApps\\MicrosoftWindows.Client.WebExperience_") &&
+      edr_contains_ci_path(path, "\\Dashboard\\WebContent\\wwwroot\\")) {
+    return 1;
+  }
+  if (edr_contains_ci_path(br->process_name, "MoUsoCoreWorker.exe") &&
+      edr_contains_ci_path(path, "\\Windows\\System32\\drivers\\UMDF\\") &&
+      edr_contains_ci_path(path, ".dll.mui")) {
+    return 1;
+  }
+  if (edr_contains_ci_path(br->process_name, "backgroundTaskHost.exe") &&
+      edr_contains_ci_path(path, "\\Windows\\System32\\Tasks\\Microsoft\\Windows\\InstallService\\SmartRetry")) {
+    return 1;
+  }
   return 0;
 }
 

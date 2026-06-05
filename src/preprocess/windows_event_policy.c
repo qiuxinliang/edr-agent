@@ -288,6 +288,39 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_noisy(p, "systemprofile_windows_cache_db", "noise_system_cache");
     return;
   }
+  if (has_ci_path(path,
+                  "\\windows\\system32\\config\\systemprofile\\appdata\\local\\microsoft\\installservice\\") &&
+      has_ci_path(path, ".catalogitem")) {
+    mark_noisy(p, "systemprofile_installservice_catalog", "noise_installservice_cache");
+    return;
+  }
+  if (has_ci_path(path,
+                  "\\windows\\system32\\config\\systemprofile\\appdata\\locallow\\microsoft\\cryptneturlcache\\metadata\\")) {
+    mark_noisy(p, "systemprofile_cryptnet_url_cache", "noise_cryptnet_cache");
+    return;
+  }
+  if (has_ci_path(path,
+                  "\\windows\\system32\\config\\systemprofile\\appdata\\local\\microsoft\\windowsapps")) {
+    mark_noisy(p, "systemprofile_windowsapps_cache", "noise_windowsapps_cache");
+    return;
+  }
+  if (process_name_is(r, "svchost.exe") &&
+      has_ci_path(path, "\\program files\\windowsapps\\microsoftwindows.client.webexperience_") &&
+      has_ci_path(path, "\\dashboard\\webcontent\\wwwroot\\")) {
+    mark_noisy(p, "windowsapps_webexperience_assets", "noise_windowsapps_cache");
+    return;
+  }
+  if (process_name_is(r, "mousocoreworker.exe") &&
+      has_ci_path(path, "\\windows\\system32\\drivers\\umdf\\") &&
+      has_ci_path(path, ".dll.mui")) {
+    mark_noisy(p, "windows_update_umdf_mui", "noise_windows_update");
+    return;
+  }
+  if (process_name_is(r, "backgroundtaskhost.exe") &&
+      has_ci_path(path, "\\windows\\system32\\tasks\\microsoft\\windows\\installservice\\smartretry")) {
+    mark_noisy(p, "installservice_smartretry_task", "noise_installservice_task");
+    return;
+  }
 
   if (any_contains(path, cred_files, sizeof(cred_files) / sizeof(cred_files[0]))) {
     mark_suspicious(p, "credential_store_or_dump_path", "credential_access");

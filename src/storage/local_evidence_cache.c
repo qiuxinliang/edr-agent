@@ -1427,6 +1427,33 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
                            "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\Caches\\")) {
     return 1;
   }
+  if (evidence_contains_ci(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\InstallService\\") &&
+      evidence_contains_ci(path, ".catalogItem")) {
+    return 1;
+  }
+  if (evidence_contains_ci(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow\\Microsoft\\CryptnetUrlCache\\MetaData\\")) {
+    return 1;
+  }
+  if (evidence_contains_ci(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\WindowsApps")) {
+    return 1;
+  }
+  if (evidence_contains_ci(r->process_name, "svchost.exe") &&
+      evidence_contains_ci(path, "\\Program Files\\WindowsApps\\MicrosoftWindows.Client.WebExperience_") &&
+      evidence_contains_ci(path, "\\Dashboard\\WebContent\\wwwroot\\")) {
+    return 1;
+  }
+  if (evidence_contains_ci(r->process_name, "MoUsoCoreWorker.exe") &&
+      evidence_contains_ci(path, "\\Windows\\System32\\drivers\\UMDF\\") &&
+      evidence_contains_ci(path, ".dll.mui")) {
+    return 1;
+  }
+  if (evidence_contains_ci(r->process_name, "backgroundTaskHost.exe") &&
+      evidence_contains_ci(path, "\\Windows\\System32\\Tasks\\Microsoft\\Windows\\InstallService\\SmartRetry")) {
+    return 1;
+  }
   if (evidence_contains_ci(path, "\\Program Files\\WindowsApps\\") ||
       evidence_contains_ci(path, "/Program Files/WindowsApps/")) {
     if (evidence_contains_ci(path, "LanguageExperiencePack") ||
