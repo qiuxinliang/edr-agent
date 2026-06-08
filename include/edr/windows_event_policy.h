@@ -42,6 +42,8 @@ typedef struct {
   uint64_t low_value_file_process;
   uint64_t low_value_file_suffix;
   uint64_t temp_xml;
+  uint64_t windows_noise_path;
+  uint64_t metadata_only;
   char last_drop_reason[96];
   char last_drop_process[96];
   char last_drop_path[256];

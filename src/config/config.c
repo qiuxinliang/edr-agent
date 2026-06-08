@@ -1166,7 +1166,7 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     if (cfg->shellcode_detector.windivert_tcp_ports_parsed_count > 0) {
       cfg->shellcode_detector.windivert_ports_is_custom = true;
     } else {
-      fprintf(stderr, "[config] shellcode_detector.windivert_tcp_ports 无有效端口，使用内置 WinDivert 端口表\n");
+      fprintf(stderr, "[config] shellcode_detector.windivert_tcp_ports has no valid port; using built-in WinDivert port table\n");
     }
   }
 }

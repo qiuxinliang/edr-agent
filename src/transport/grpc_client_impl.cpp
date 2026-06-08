@@ -98,7 +98,7 @@ static void runtime_failure(const std::string &err) {
 static bool grpc_client_connect_locked(const std::string &target) {
   std::shared_ptr<grpc::ChannelCredentials> creds;
   if (s_insecure) {
-    fprintf(stderr, "[grpc] 警告: EDR_GRPC_INSECURE=1，使用非加密通道\n");
+    fprintf(stderr, "[grpc] warning: EDR_GRPC_INSECURE=1; using insecure channel\n");
     creds = grpc::InsecureChannelCredentials();
   } else if (!s_ca.empty() && !s_cert.empty() && !s_key.empty()) {
     grpc::SslCredentialsOptions ssl;
@@ -108,7 +108,7 @@ static bool grpc_client_connect_locked(const std::string &target) {
     creds = grpc::SslCredentials(ssl);
   } else if (!s_ca.empty()) {
     if (s_require_mtls) {
-      fprintf(stderr, "[grpc] 生产策略要求 mTLS，但 client_cert/client_key 未加载，跳过 gRPC\n");
+      fprintf(stderr, "[grpc] production policy requires mTLS, but client_cert/client_key is missing; skipping gRPC\n");
       runtime_failure("missing required grpc client certificate");
       return false;
     }
@@ -117,8 +117,8 @@ static bool grpc_client_connect_locked(const std::string &target) {
     creds = grpc::SslCredentials(ssl);
   } else {
     fprintf(stderr,
-            "[grpc] 未找到 CA/客户端证书（server.ca_cert 等），且未设置 EDR_GRPC_INSECURE=1，"
-            "跳过 gRPC。开发可: export EDR_GRPC_INSECURE=1\n");
+            "[grpc] CA/client certificates are missing (server.ca_cert, etc.) and EDR_GRPC_INSECURE=1 is not set; "
+            "skipping gRPC. For development: export EDR_GRPC_INSECURE=1\n");
     runtime_failure("missing grpc tls credentials");
     return false;
   }
@@ -137,11 +137,11 @@ static bool grpc_client_connect_locked(const std::string &target) {
   s_upload_tb_inited = false;
   s_upload_token_bytes = 0.0;
 
-  fprintf(stderr, "[grpc] mTLS 通道: %s (ReportEvents + ControlStream", target.c_str());
+  fprintf(stderr, "[grpc] mTLS channel: %s (ReportEvents + ControlStream", target.c_str());
   if (s_max_upload_mbps > 0u) {
-    fprintf(stderr, "；上传节流 max_upload_mbps=%u", (unsigned)s_max_upload_mbps);
+    fprintf(stderr, "; upload throttle max_upload_mbps=%u", (unsigned)s_max_upload_mbps);
   } else {
-    fprintf(stderr, "；上传节流关闭（max_upload_mbps=0）");
+    fprintf(stderr, "; upload throttle disabled (max_upload_mbps=0)");
   }
   fprintf(stderr, ")\n");
 
@@ -340,7 +340,7 @@ static void subscribe_thread_main(std::string endpoint_id) {
       std::unique_ptr<grpc::ClientReader<edr::v1::CommandEnvelope>> reader(
           stub->Subscribe(ctx.get(), req));
       if (!reader) {
-        fprintf(stderr, "[grpc] Subscribe reader 为空\n");
+        fprintf(stderr, "[grpc] Subscribe reader is null\n");
         s_sub_ctx.reset();
       } else {
         edr::v1::CommandEnvelope cmd;
@@ -353,7 +353,7 @@ static void subscribe_thread_main(std::string endpoint_id) {
         }
         grpc::Status st = reader->Finish();
         if (!st.ok() && st.error_code() != grpc::StatusCode::CANCELLED) {
-          fprintf(stderr, "[grpc] Subscribe 流结束: %d %s\n", (int)st.error_code(),
+          fprintf(stderr, "[grpc] Subscribe stream ended: %d %s\n", (int)st.error_code(),
                   st.error_message().c_str());
           runtime_failure("subscribe: " + st.error_message());
         }
@@ -363,7 +363,7 @@ static void subscribe_thread_main(std::string endpoint_id) {
     if (s_sub_stop.load()) {
       break;
     }
-    fprintf(stderr, "[grpc] Subscribe %u ms 后重连…\n", backoff_ms);
+    fprintf(stderr, "[grpc] Subscribe reconnecting after %u ms\n", backoff_ms);
     std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     backoff_ms = std::min<unsigned>(backoff_ms * 2, 60000u);
   }
@@ -405,7 +405,7 @@ static void control_stream_thread_main(std::string endpoint_id) {
     } else {
       runtime_success();
       backoff_ms = 500;
-      fprintf(stderr, "[grpc] ControlStream 已建立 endpoint=%s\n", endpoint_id.c_str());
+      fprintf(stderr, "[grpc] ControlStream established endpoint=%s\n", endpoint_id.c_str());
     }
 
     edr::v1::CommandEnvelope cmd;
@@ -424,19 +424,19 @@ static void control_stream_thread_main(std::string endpoint_id) {
     grpc::Status st = stream->Finish();
     s_sub_ctx.reset();
     if (st.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
-      fprintf(stderr, "[grpc] ControlStream 未实现，回退 Subscribe 服务端流\n");
+      fprintf(stderr, "[grpc] ControlStream is unimplemented; falling back to Subscribe server stream\n");
       subscribe_thread_main(endpoint_id);
       return;
     }
     if (!st.ok() && st.error_code() != grpc::StatusCode::CANCELLED) {
-      fprintf(stderr, "[grpc] ControlStream 流结束: %d %s\n", (int)st.error_code(),
+      fprintf(stderr, "[grpc] ControlStream ended: %d %s\n", (int)st.error_code(),
               st.error_message().c_str());
       runtime_failure("ControlStream: " + st.error_message());
     }
     if (s_sub_stop.load()) {
       break;
     }
-    fprintf(stderr, "[grpc] ControlStream %u ms 后重连…\n", backoff_ms);
+    fprintf(stderr, "[grpc] ControlStream reconnecting after %u ms\n", backoff_ms);
     std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     backoff_ms = std::min<unsigned>(backoff_ms * 2, 60000u);
   }
@@ -455,7 +455,7 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
 
   std::string target(cfg->server.address);
   if (target.empty()) {
-    fprintf(stderr, "[grpc] server.address 为空，跳过 gRPC\n");
+    fprintf(stderr, "[grpc] server.address is empty; skipping gRPC\n");
     return;
   }
 
@@ -469,8 +469,8 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
   s_key_provider = cfg->server.client_key_provider;
   if (!is_pem_key_provider(cfg->server.client_key_provider)) {
     fprintf(stderr,
-            "[grpc] client_key_provider=\"%s\" 已配置，但当前 gRPC C++ 传输仅支持 PEM client_key；"
-            "CNG/TPM/PKCS#11 CSR 可用于注册签发，运行时 mTLS 需 Schannel/硬件密钥适配层。\n",
+            "[grpc] client_key_provider=\"%s\" is configured, but current gRPC C++ transport only supports PEM client_key; "
+            "CNG/TPM/PKCS#11 CSR can be used for enrollment, while runtime mTLS needs a Schannel/hardware-key adapter.\n",
             cfg->server.client_key_provider);
     runtime_failure("unsupported grpc client key provider: " + s_key_provider);
     if (env_truthy("EDR_GRPC_REQUIRE_MTLS")) {
@@ -483,7 +483,7 @@ extern "C" void edr_grpc_client_init(const EdrConfig *cfg) {
   s_require_mtls = env_truthy("EDR_GRPC_REQUIRE_MTLS");
   if (!s_insecure && s_require_mtls && (s_ca.empty() || s_cert.empty() || s_key.empty())) {
     fprintf(stderr,
-            "[grpc] EDR_GRPC_REQUIRE_MTLS=1，但证书不完整: ca_cert=\"%s\" client_cert=\"%s\" client_key=\"%s\"\n",
+            "[grpc] EDR_GRPC_REQUIRE_MTLS=1, but credentials are incomplete: ca_cert=\"%s\" client_cert=\"%s\" client_key=\"%s\"\n",
             cfg->server.ca_cert, cfg->server.client_cert, cfg->server.client_key);
     runtime_failure("missing required grpc mtls credentials");
     return;
@@ -630,7 +630,7 @@ extern "C" int edr_grpc_client_send_batch(const char *batch_id, const uint8_t *h
     s_rpc_fail++;
     s_report_fail_streak++;
     runtime_failure("ReportEvents: " + st.error_message());
-    fprintf(stderr, "[grpc] ReportEvents 失败: %d %s\n", (int)st.error_code(),
+    fprintf(stderr, "[grpc] ReportEvents failed: %d %s\n", (int)st.error_code(),
             st.error_message().c_str());
     return -1;
   }
@@ -676,7 +676,7 @@ static int report_command_result_unary_locked(const char *command_id,
   if (!st.ok()) {
     s_rpc_fail++;
     runtime_failure("ReportCommandResult: " + st.error_message());
-    fprintf(stderr, "[grpc] ReportCommandResult 失败: %d %s\n", (int)st.error_code(),
+    fprintf(stderr, "[grpc] ReportCommandResult failed: %d %s\n", (int)st.error_code(),
             st.error_message().c_str());
     return -1;
   }
@@ -851,7 +851,7 @@ extern "C" int edr_grpc_client_upload_file(const char *alert_id, const char *fil
     }
     if (attempt < retries) {
       int delay = backoff_ms * attempt;
-      fprintf(stderr, "[grpc] UploadFile 失败，%d/%d，%d ms 后重试: %s\n", attempt, retries, delay,
+      fprintf(stderr, "[grpc] UploadFile failed, %d/%d; retrying after %d ms: %s\n", attempt, retries, delay,
               file_path ? file_path : "");
       std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     }

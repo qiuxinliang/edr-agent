@@ -3587,7 +3587,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
 
-  fprintf(stderr, "[command] 未知类型 id=%s type=%s\n", id, t);
+  fprintf(stderr, "[command] unknown type id=%s type=%s\n", id, t);
   s_unknown++;
   soar_emit(id, sm, EdrCmdExecUnknownType, 1, "unknown command_type");
 }

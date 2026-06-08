@@ -15,6 +15,8 @@ static uint64_t g_event_filter_agent_internal = 0u;
 static uint64_t g_event_filter_low_value_process = 0u;
 static uint64_t g_event_filter_low_value_suffix = 0u;
 static uint64_t g_event_filter_temp_xml = 0u;
+static uint64_t g_event_filter_windows_noise_path = 0u;
+static uint64_t g_event_filter_metadata_only = 0u;
 static char g_event_filter_last_drop_reason[96];
 static char g_event_filter_last_drop_process[96];
 static char g_event_filter_last_drop_path[256];
@@ -27,6 +29,8 @@ static void reset_event_filter_counters(void) {
   g_event_filter_low_value_process = 0u;
   g_event_filter_low_value_suffix = 0u;
   g_event_filter_temp_xml = 0u;
+  g_event_filter_windows_noise_path = 0u;
+  g_event_filter_metadata_only = 0u;
   g_event_filter_last_drop_reason[0] = '\0';
   g_event_filter_last_drop_process[0] = '\0';
   g_event_filter_last_drop_path[0] = '\0';
@@ -70,6 +74,8 @@ void edr_windows_event_policy_get_status(EdrWindowsEventFilterStatus *out) {
   out->low_value_file_process = g_event_filter_low_value_process;
   out->low_value_file_suffix = g_event_filter_low_value_suffix;
   out->temp_xml = g_event_filter_temp_xml;
+  out->windows_noise_path = g_event_filter_windows_noise_path;
+  out->metadata_only = g_event_filter_metadata_only;
   snprintf(out->last_drop_reason, sizeof(out->last_drop_reason), "%s",
            g_event_filter_last_drop_reason);
   snprintf(out->last_drop_process, sizeof(out->last_drop_process), "%s",
@@ -360,8 +366,11 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_suspicious(p, "startup_or_scheduled_task_path", "persistence_path");
   }
   if ((has_ci_path(path, "\\windows\\system32\\drivers\\") ||
-       has_ci_path(path, "\\windows\\system32\\driverstore\\")) &&
-      any_ends(path, system_driver_exts, sizeof(system_driver_exts) / sizeof(system_driver_exts[0]))) {
+       has_ci_path(path, "\\windows\\system32\\driverstore\\") ||
+       has_ci_path(path, "/windows/system32/drivers/") ||
+       has_ci_path(path, "/windows/system32/driverstore/")) &&
+      (any_ends(path, system_driver_exts, sizeof(system_driver_exts) / sizeof(system_driver_exts[0])) ||
+       has_ci_path(path, ".sys.mui") || has_ci_path(path, ".sys"))) {
     mark_noisy(p, "known_windows_driver_enumeration", "noise_driver");
     return;
   }
@@ -394,6 +403,12 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
   }
   if (!p->high_value && any_contains(path, noisy_dirs, sizeof(noisy_dirs) / sizeof(noisy_dirs[0]))) {
     mark_noisy(p, "known_windows_noise_path", "noise_path");
+  }
+  if (!p->high_value &&
+      (has_ci_path(path, "\\program files\\windowsapps\\") ||
+       has_ci_path(path, "/program files/windowsapps/")) &&
+      (has_ci_path(path, "languageexperiencepack") || has_ci_path(path, ".js.map"))) {
+    mark_noisy(p, "windowsapps_language_or_sourcemap_noise", "noise_windowsapps_cache");
   }
   if (!p->high_value && g_event_filter_cfg.temp_xml &&
       has_ci_path(path, "\\appdata\\local\\temp\\xml_file")) {
@@ -594,6 +609,12 @@ static void record_event_filter_decision(const EdrBehaviorRecord *r,
     g_event_filter_low_value_suffix++;
   } else if (has_ci_path(p->reason, "temp_xml_low_value_file")) {
     g_event_filter_temp_xml++;
+  } else if (has_ci_path(p->reason, "known_windows_noise_path") ||
+             has_ci_path(p->reason, "windowsapps_language_or_sourcemap_noise") ||
+             has_ci_path(p->reason, "known_windows_driver_enumeration")) {
+    g_event_filter_windows_noise_path++;
+  } else if (has_ci_path(p->reason, "ordinary_windows_metadata_only")) {
+    g_event_filter_metadata_only++;
   }
   snprintf(g_event_filter_last_drop_reason, sizeof(g_event_filter_last_drop_reason), "%s",
            p->reason);

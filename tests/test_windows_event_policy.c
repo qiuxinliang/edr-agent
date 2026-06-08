@@ -327,6 +327,42 @@ static void test_windows_update_umdf_mui_is_not_emitted(void) {
   assert(strstr(p.reason, "windows_update_umdf_mui") != NULL);
 }
 
+static void test_windowsapps_language_pack_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Program Files\\WindowsApps"
+           "\\Microsoft.LanguageExperiencePackzh-CN_22621.50.1.0_neutral__8wekyb3d8bbwe"
+           "\\resources.pri");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(strstr(p.reason, "windowsapps_language_or_sourcemap_noise") != NULL ||
+         strstr(p.reason, "known_windows_noise_path") != NULL);
+}
+
+static void test_driver_ads_enumeration_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\drivers\\ndisuio.sys:"
+           "WofCompressedData");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(strstr(p.reason, "known_windows_driver_enumeration") != NULL);
+}
+
 static void test_installservice_smartretry_task_is_not_emitted(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
@@ -382,6 +418,7 @@ static void test_policy_status_counts_drop_reasons(void) {
   assert(st.evaluated == 1u);
   assert(st.dropped == 1u);
   assert(st.temp_xml == 1u);
+  assert(st.metadata_only == 0u);
   assert(strstr(st.last_drop_reason, "temp_xml_low_value_file") != NULL);
   assert(strstr(st.last_drop_process, "cleanmgr.exe") != NULL);
   assert(strstr(st.last_drop_path, "xml_file_42.xml") != NULL);
@@ -407,6 +444,8 @@ int main(void) {
   test_windowsapps_webexperience_assets_are_not_webshell_signal();
   test_edge_update_temp_staging_is_not_emitted();
   test_windows_update_umdf_mui_is_not_emitted();
+  test_windowsapps_language_pack_is_not_emitted();
+  test_driver_ads_enumeration_is_not_emitted();
   test_installservice_smartretry_task_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();

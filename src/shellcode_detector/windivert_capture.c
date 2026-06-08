@@ -801,7 +801,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
   }
   (void)edr_shellcode_known_init(cfg->shellcode_detector.yara_rules_dir);
   if (load_windivert() != 0) {
-    fprintf(stderr, "[shellcode_detector] WinDivert 不可用，跳过捕获（安装 DLL/驱动至 System32）\n");
+    fprintf(stderr, "[shellcode_detector] WinDivert unavailable; capture skipped (install DLL/driver to System32)\n");
     return EDR_OK;
   }
   log_windivert_service_hint();
@@ -810,7 +810,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) {
       s_wsa_started = 1;
     } else {
-      fprintf(stderr, "[shellcode_detector] WSAStartup failed (IPv6 地址显示可能异常)\n");
+      fprintf(stderr, "[shellcode_detector] WSAStartup failed (IPv6 address display may be incomplete)\n");
     }
   }
   UINT64 flags = (UINT64)(WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
@@ -824,16 +824,16 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
   const char *wd_filter = kWdFilter;
   if (cfg->shellcode_detector.windivert_ports_is_custom && cfg->shellcode_detector.windivert_tcp_ports_parsed_count > 0u) {
     if (build_windivert_filter_string(cfg, s_wd_filter_dyn, sizeof(s_wd_filter_dyn)) != 0) {
-      fprintf(stderr, "[shellcode_detector] WinDivert 过滤器字符串过长，回退内置端口表\n");
+      fprintf(stderr, "[shellcode_detector] WinDivert filter string too long; falling back to built-in port table\n");
     } else {
       wd_filter = s_wd_filter_dyn;
-      fprintf(stderr, "[shellcode_detector] WinDivert 自定义 TCP 端口数=%zu\n",
+      fprintf(stderr, "[shellcode_detector] WinDivert custom TCP ports=%zu\n",
               cfg->shellcode_detector.windivert_tcp_ports_parsed_count);
     }
   }
   s_handle = s_open(wd_filter, (WINDIVERT_LAYER)0, pri, flags);
   if (s_handle == INVALID_HANDLE_VALUE) {
-    fprintf(stderr, "[shellcode_detector] WinDivertOpen 失败 err=%lu（常见：非管理员/驱动未装），继续运行但不捕获\n",
+    fprintf(stderr, "[shellcode_detector] WinDivertOpen failed err=%lu (common: not admin or driver missing); continuing without capture\n",
             GetLastError());
     if (s_wsa_started) {
       (void)WSACleanup();
@@ -877,7 +877,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     s_wd_dll = NULL;
     return EDR_ERR_INTERNAL;
   }
-  fprintf(stderr, "[shellcode_detector] WinDivert 捕获线程已启动（SNIFF+RECV_ONLY）\n");
+  fprintf(stderr, "[shellcode_detector] WinDivert capture thread started (SNIFF+RECV_ONLY)\n");
   return EDR_OK;
 }
 

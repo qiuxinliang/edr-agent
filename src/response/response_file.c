@@ -105,7 +105,7 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
   if (!f) {
     edr_cmd_inc_exec_fail();
     char errbuf[600];
-    snprintf(errbuf, sizeof(errbuf), "rtr_get: 文件不存在 path=%s", path);
+    snprintf(errbuf, sizeof(errbuf), "rtr_get: file not found path=%s", path);
     edr_command_audit_both(cmd_id, errbuf);
     snprintf(errbuf, sizeof(errbuf), "file not found: %s", path);
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, errbuf);

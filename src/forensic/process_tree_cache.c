@@ -292,7 +292,7 @@ int edr_pt_cache_warmup(void) {
   }
   CloseHandle(snap);
   edr_pt_cache_refresh_key_procs();
-  fprintf(stderr, "[pt_cache] 预热完成: %d 进程入缓存, %zu 关键进程已识别\n",
+  fprintf(stderr, "[pt_cache] warmup complete: cached=%d key_procs=%zu\n",
           count, (size_t)EDR_KEY_PROC_MAX);
   for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
     if (g_key_procs[k].valid) {

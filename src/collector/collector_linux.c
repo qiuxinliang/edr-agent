@@ -369,18 +369,18 @@ static int add_watches(int ifd) {
       continue;
     }
     if (s_nwatch >= MAX_WATCHES) {
-      fprintf(stderr, "[collector_linux] 已达 inotify 监视上限 (%d)，忽略后续路径\n", MAX_WATCHES);
+      fprintf(stderr, "[collector_linux] inotify watch limit reached (%d); ignoring remaining paths\n", MAX_WATCHES);
       break;
     }
     struct stat st;
     if (stat(tok, &st) != 0 || !S_ISDIR(st.st_mode)) {
-      fprintf(stderr, "[collector_linux] 跳过非目录或不可访问路径: %s\n", tok);
+      fprintf(stderr, "[collector_linux] skipping non-directory or inaccessible path: %s\n", tok);
       continue;
     }
     uint32_t mask = IN_ALL_EVENTS;
     int wd = inotify_add_watch(ifd, tok, mask);
     if (wd < 0) {
-      fprintf(stderr, "[collector_linux] inotify_add_watch 失败 %s: %s\n", tok, strerror(errno));
+      fprintf(stderr, "[collector_linux] inotify_add_watch failed %s: %s\n", tok, strerror(errno));
       continue;
     }
     s_watches[s_nwatch].wd = wd;
@@ -610,7 +610,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
 
   if (add_watches(s_ifd) != 0) {
-    fprintf(stderr, "[collector_linux] 无有效监视目录。可设置 EDR_INOTIFY_PATHS（逗号分隔），默认 /tmp\n");
+    fprintf(stderr, "[collector_linux] no valid watch directories; set EDR_INOTIFY_PATHS (comma-separated), default /tmp\n");
     close(s_ifd);
     s_ifd = -1;
     close_pipe_pair();

@@ -340,7 +340,7 @@ static EdrError ensure_ort_env(void) {
   }
   g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
   if (!g_ort) {
-    fprintf(stderr, "[ave/onnx] ORT API 版本不匹配\n");
+    fprintf(stderr, "[ave/onnx] ORT API version mismatch\n");
     return EDR_ERR_AVE_LOAD_FAILED;
   }
   OrtStatus *st = g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "edr_ave", &g_env);
@@ -416,7 +416,7 @@ static EdrError parse_input_shape(OrtSession *sess, int64_t def_dyn, int *out_nd
   }
   /* 训练导出的 static 大图乘积可达数 M；上限与 EDR_AVE_STATIC_INPUT_NELEM_MAX 一致 */
   if (nelem <= 0 || nelem > EDR_AVE_STATIC_INPUT_NELEM_MAX) {
-    fprintf(stderr, "[ave/onnx] 输入元素数异常 %lld\n", (long long)nelem);
+    fprintf(stderr, "[ave/onnx] invalid input element count %lld\n", (long long)nelem);
     return EDR_ERR_AVE_LOAD_FAILED;
   }
   *out_nelem = nelem;
@@ -506,7 +506,7 @@ static EdrError refine_behavior_input_dims(OrtSession *sess) {
     g_beh_in_shape[i] = 0;
   }
   if (nelem <= 0 || nelem > 1024 * 1024) {
-    fprintf(stderr, "[ave/onnx] behavior 输入元素数异常 %lld\n", (long long)nelem);
+    fprintf(stderr, "[ave/onnx] invalid behavior input element count %lld\n", (long long)nelem);
     return EDR_ERR_AVE_LOAD_FAILED;
   }
   g_beh_in_nelem = nelem;

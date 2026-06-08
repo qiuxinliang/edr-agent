@@ -728,6 +728,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"evaluated\":%llu,\"dropped\":%llu,"
       "\"agent_internal_forensic\":%llu,\"low_value_file_process\":%llu,"
       "\"low_value_file_suffix\":%llu,\"temp_xml\":%llu,"
+      "\"windows_noise_path\":%llu,\"metadata_only\":%llu,"
       "\"last_drop\":{\"reason\":\"%s\",\"process\":\"%s\","
       "\"path\":\"%s\",\"cmdline\":\"%s\"}},"
       "\"adaptive_collection\":{\"enabled\":%s,\"active\":%s,\"ttl_s\":%u,"
@@ -878,6 +879,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)event_filter_status.low_value_file_process,
       (unsigned long long)event_filter_status.low_value_file_suffix,
       (unsigned long long)event_filter_status.temp_xml,
+      (unsigned long long)event_filter_status.windows_noise_path,
+      (unsigned long long)event_filter_status.metadata_only,
       event_filter_last_reason,
       event_filter_last_process,
       event_filter_last_path,
@@ -1019,15 +1022,15 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
     {
       int av = AVE_SyncFromEdrConfig(&agent->cfg);
       if (av != AVE_OK && av != AVE_ERR_NOT_INITIALIZED) {
-        fprintf(stderr, "[ave] AVE_SyncFromEdrConfig 失败: %d\n", av);
+        fprintf(stderr, "[ave] AVE_SyncFromEdrConfig failed: %d\n", av);
       }
     }
     fprintf(stderr,
-            "[config] 热重载: preprocessing + event_filter + resource_limit + self_protect + attack_surface tick + ave\n");
+            "[config] hot reload applied: preprocessing + event_filter + resource_limit + self_protect + attack_surface tick + ave\n");
     char fp[80];
     edr_config_fingerprint(agent->config_path, fp, sizeof(fp));
     if (fp[0]) {
-      fprintf(stderr, "[config] 热重载 fingerprint=%s\n", fp);
+      fprintf(stderr, "[config] hot reload fingerprint=%s\n", fp);
     }
   }
 }

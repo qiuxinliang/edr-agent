@@ -873,7 +873,7 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   }
   {
     char note_fw[160];
-    snprintf(note_fw, sizeof(note_fw), "firewall_rule_detail_max(配置上限)=%u",
+    snprintf(note_fw, sizeof(note_fw), "firewall_rule_detail_max(config_limit)=%u",
              cfg->attack_surface.firewall_rule_detail_max);
     fprintf(f, ",");
     json_escape_str(f, note_fw);
@@ -887,9 +887,9 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     if (gp && gp[0]) {
       char note_geo[768];
       if (geoip_db_readable(cfg)) {
-        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 可读: %.680s", gp);
+        snprintf(note_geo, sizeof(note_geo), "geoip_db_path readable: %.680s", gp);
       } else {
-        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 未就绪(跳过): %.680s", gp);
+        snprintf(note_geo, sizeof(note_geo), "geoip_db_path not ready (skipped): %.680s", gp);
       }
       fprintf(f, ",");
       json_escape_str(f, note_geo);
