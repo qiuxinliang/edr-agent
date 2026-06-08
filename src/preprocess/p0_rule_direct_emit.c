@@ -244,6 +244,24 @@ static int p0_is_known_smoke_command(const EdrBehaviorRecord *br, const char *de
   return 0;
 }
 
+static int p0_is_edge_update_temp_baseline(const EdrBehaviorRecord *br, const char *detail) {
+  const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
+  if (!br) {
+    return 0;
+  }
+  if (!p0_contains_ci(br->process_name, "MicrosoftEdgeUpdate.exe") &&
+      !p0_contains_ci(br->exe_path, "\\MicrosoftEdgeUpdate.exe") &&
+      !p0_contains_ci(cmd, "\\MicrosoftEdgeUpdate.exe")) {
+    return 0;
+  }
+  if (p0_contains_ci(br->exe_path, "\\Program Files (x86)\\Microsoft\\Temp\\EUF") ||
+      p0_contains_ci(br->cmdline, "\\Program Files (x86)\\Microsoft\\Temp\\EUF") ||
+      p0_contains_ci(cmd, "\\Program Files (x86)\\Microsoft\\Temp\\EUF")) {
+    return 1;
+  }
+  return 0;
+}
+
 static int p0_should_suppress_known_false_positive(const char *rule_id, const EdrBehaviorRecord *br,
                                                    const char *detail, const char **out_reason) {
   if (out_reason) {
@@ -255,6 +273,12 @@ static int p0_should_suppress_known_false_positive(const char *rule_id, const Ed
   if (strcmp(rule_id, "R-MITRE-WIN-T1138") == 0 && p0_is_sdbinst_maintenance_baseline(br)) {
     if (out_reason) {
       *out_reason = "sdbinst_maintenance_baseline";
+    }
+    return 1;
+  }
+  if (strcmp(rule_id, "R-LOLBIN-010") == 0 && p0_is_edge_update_temp_baseline(br, detail)) {
+    if (out_reason) {
+      *out_reason = "microsoft_edge_update_temp_baseline";
     }
     return 1;
   }

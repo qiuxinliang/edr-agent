@@ -173,6 +173,8 @@ static unsigned long tls_handshake_limit_per_minute(void) {
   return env_ul_clamped("EDR_HTTP_TLS_HANDSHAKE_BUDGET_PER_MIN", 120ul, 5ul, 60000ul);
 }
 
+static void comm_open_circuit(const char *reason);
+
 static void budget_refresh_window(void) {
   int64_t minute = unix_ms_now() / 60000LL;
   if (minute != s_budget_window_minute) {
@@ -197,6 +199,7 @@ static int comm_budget_try(size_t bytes, int tls_handshake) {
     s_budget_drop_count++;
     snprintf(s_last_error, sizeof(s_last_error), "%s", "communication budget exceeded");
     s_last_failure_ms = unix_ms_now();
+    comm_open_circuit(s_last_error);
     return 0;
   }
   s_budget_requests++;
@@ -215,6 +218,7 @@ static int comm_tls_handshake_budget_try(void) {
     s_budget_drop_count++;
     snprintf(s_last_error, sizeof(s_last_error), "%s", "tls handshake budget exceeded");
     s_last_failure_ms = unix_ms_now();
+    comm_open_circuit(s_last_error);
     return 0;
   }
   s_budget_tls_handshakes++;

@@ -295,7 +295,9 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     return;
   }
   if (has_ci_path(path,
-                  "\\windows\\system32\\config\\systemprofile\\appdata\\locallow\\microsoft\\cryptneturlcache\\metadata\\")) {
+                  "\\windows\\system32\\config\\systemprofile\\appdata\\locallow\\microsoft\\cryptneturlcache\\metadata\\") ||
+      has_ci_path(path,
+                  "\\windows\\system32\\config\\systemprofile\\appdata\\locallow\\microsoft\\cryptneturlcache\\content\\")) {
     mark_noisy(p, "systemprofile_cryptnet_url_cache", "noise_cryptnet_cache");
     return;
   }
@@ -308,6 +310,13 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       has_ci_path(path, "\\program files\\windowsapps\\microsoftwindows.client.webexperience_") &&
       has_ci_path(path, "\\dashboard\\webcontent\\wwwroot\\")) {
     mark_noisy(p, "windowsapps_webexperience_assets", "noise_windowsapps_cache");
+    return;
+  }
+  if (process_name_is(r, "microsoftedgeupdate.exe") &&
+      (has_ci_path(path, "\\program files (x86)\\microsoft\\temp\\euf") ||
+       has_ci_path(r->exe_path, "\\program files (x86)\\microsoft\\temp\\euf") ||
+       has_ci_path(r->cmdline, "\\program files (x86)\\microsoft\\temp\\euf"))) {
+    mark_noisy(p, "microsoft_edge_update_temp_staging", "noise_edge_update");
     return;
   }
   if (process_name_is(r, "mousocoreworker.exe") &&

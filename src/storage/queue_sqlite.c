@@ -32,6 +32,8 @@ static uint64_t s_max_db_bytes;
 static uint32_t s_cfg_max_db_mb;
 static uint32_t s_cfg_retention_hours;
 static uint64_t s_last_cleanup_ns;
+static uint64_t s_legacy_drop_log_until_ns;
+static uint64_t s_legacy_drop_suppressed;
 #if defined(_WIN32)
 static HANDLE s_lock_handle = INVALID_HANDLE_VALUE;
 #else
@@ -132,6 +134,67 @@ static int delete_row_by_id(sqlite3_int64 id) {
   return -1;
 }
 
+static int delete_bad_wire_rows(unsigned max_rows, unsigned *deleted_out) {
+  sqlite3_stmt *st = NULL;
+  const char *sql = "SELECT id, payload FROM event_queue WHERE status='pending' ORDER BY id ASC LIMIT ?;";
+  sqlite3_int64 ids[512];
+  unsigned id_count = 0u;
+  unsigned deleted = 0u;
+  if (deleted_out) {
+    *deleted_out = 0u;
+  }
+  if (!s_db || max_rows == 0u) {
+    return 0;
+  }
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+    return -1;
+  }
+  if (max_rows > (unsigned)(sizeof(ids) / sizeof(ids[0]))) {
+    max_rows = (unsigned)(sizeof(ids) / sizeof(ids[0]));
+  }
+  sqlite3_bind_int(st, 1, (int)max_rows);
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_int64 id = sqlite3_column_int64(st, 0);
+    const void *blob = sqlite3_column_blob(st, 1);
+    int blob_len = sqlite3_column_bytes(st, 1);
+    const uint8_t *b = (const uint8_t *)blob;
+    if (!blob || blob_len < 12 || !batch_header_valid(b)) {
+      ids[id_count++] = id;
+      if (id_count >= max_rows) {
+        break;
+      }
+    }
+  }
+  sqlite3_finalize(st);
+  for (unsigned i = 0u; i < id_count; i++) {
+    if (delete_row_by_id(ids[i]) == 0) {
+      deleted++;
+    }
+  }
+  if (deleted_out) {
+    *deleted_out = deleted;
+  }
+  return 0;
+}
+
+static void log_legacy_drop(sqlite3_int64 id) {
+  uint64_t now = edr_monotonic_ns();
+  if (s_legacy_drop_log_until_ns > now) {
+    s_legacy_drop_suppressed++;
+    return;
+  }
+  if (s_legacy_drop_suppressed > 0u) {
+    fprintf(stderr,
+            "[queue] dropping legacy batch without v6.2 header id=%lld (suppressed=%llu; old rows are auto-purged)\n",
+            (long long)id, (unsigned long long)s_legacy_drop_suppressed);
+    s_legacy_drop_suppressed = 0u;
+  } else {
+    fprintf(stderr, "[queue] dropping legacy batch without v6.2 header id=%lld (old rows are auto-purged)\n",
+            (long long)id);
+  }
+  s_legacy_drop_log_until_ns = now + 60000000000ULL;
+}
+
 static void bump_retry(sqlite3_int64 id) {
   sqlite3_stmt *st = NULL;
   const char *sql = "UPDATE event_queue SET retry_count = retry_count + 1 WHERE id=?;";
@@ -172,6 +235,12 @@ static void cleanup_expired_rows(void) {
     }
     sqlite3_finalize(st);
   }
+  {
+    unsigned deleted = 0u;
+    if (delete_bad_wire_rows(256u, &deleted) == 0 && deleted > 0u) {
+      fprintf(stderr, "[queue] auto-purged %u legacy/corrupt pending batches\n", deleted);
+    }
+  }
 }
 
 /**
@@ -195,22 +264,27 @@ static int drain_one_row(void) {
 
   sqlite3_int64 id = sqlite3_column_int64(st, 0);
   const char *batch_id = (const char *)sqlite3_column_text(st, 1);
+  char batch_id_copy[128];
   const void *blob = sqlite3_column_blob(st, 2);
   int blob_len = sqlite3_column_bytes(st, 2);
   int retry_count = sqlite3_column_int(st, 3);
+  batch_id_copy[0] = '\0';
+  if (batch_id) {
+    snprintf(batch_id_copy, sizeof(batch_id_copy), "%s", batch_id);
+  }
   sqlite3_finalize(st);
 
   {
     int lim = max_retry_limit();
     if (lim > 0 && retry_count >= lim) {
-      fprintf(stderr, "[queue] max retries reached (%d), dropping batch_id=%s id=%lld\n", lim, batch_id ? batch_id : "",
+      fprintf(stderr, "[queue] max retries reached (%d), dropping batch_id=%s id=%lld\n", lim, batch_id_copy,
               (long long)id);
       (void)delete_row_by_id(id);
       return 0;
     }
   }
 
-  if (!batch_id || !blob || blob_len < 12) {
+  if (!batch_id_copy[0] || !blob || blob_len < 12) {
     fprintf(stderr, "[queue] deleted corrupt queue row id=%lld\n", (long long)id);
     (void)delete_row_by_id(id);
     return 0;
@@ -218,21 +292,20 @@ static int drain_one_row(void) {
 
   const uint8_t *b = (const uint8_t *)blob;
   if (!batch_header_valid(b)) {
-    fprintf(stderr, "[queue] dropping legacy batch without v6.2 header id=%lld (clear old queue db or re-enqueue)\n",
-            (long long)id);
+    log_legacy_drop(id);
     (void)delete_row_by_id(id);
     return 0;
   }
 
   int send = -1;
   if (edr_grpc_client_ready()) {
-    send = edr_grpc_client_send_batch(batch_id, b, 12u, b + 12, (size_t)blob_len - 12u);
+    send = edr_grpc_client_send_batch(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
   if (send != 0 && edr_ingest_http_configured()) {
     if (edr_ingest_http_circuit_open()) {
       return 2;
     }
-    send = edr_ingest_http_post_report_events(batch_id, b, 12u, b + 12, (size_t)blob_len - 12u);
+    send = edr_ingest_http_post_report_events(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
   if (send == 0) {
     (void)delete_row_by_id(id);
@@ -359,6 +432,19 @@ EdrError edr_storage_queue_open(const char *path) {
       s_pending = (uint64_t)sqlite3_column_int64(st, 0);
     }
     sqlite3_finalize(st);
+  }
+  {
+    unsigned deleted = 0u;
+    if (delete_bad_wire_rows(2048u, &deleted) == 0 && deleted > 0u) {
+      fprintf(stderr, "[queue] auto-purged %u legacy/corrupt pending batches on open\n", deleted);
+      st = NULL;
+      if (sqlite3_prepare_v2(s_db, cnt, -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+          s_pending = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+      }
+    }
   }
   return EDR_OK;
 }

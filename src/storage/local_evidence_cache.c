@@ -1433,7 +1433,9 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
     return 1;
   }
   if (evidence_contains_ci(path,
-                           "\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow\\Microsoft\\CryptnetUrlCache\\MetaData\\")) {
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow\\Microsoft\\CryptnetUrlCache\\MetaData\\") ||
+      evidence_contains_ci(path,
+                           "\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow\\Microsoft\\CryptnetUrlCache\\Content\\")) {
     return 1;
   }
   if (evidence_contains_ci(path,
@@ -1443,6 +1445,12 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   if (evidence_contains_ci(r->process_name, "svchost.exe") &&
       evidence_contains_ci(path, "\\Program Files\\WindowsApps\\MicrosoftWindows.Client.WebExperience_") &&
       evidence_contains_ci(path, "\\Dashboard\\WebContent\\wwwroot\\")) {
+    return 1;
+  }
+  if (evidence_contains_ci(r->process_name, "MicrosoftEdgeUpdate.exe") &&
+      (evidence_contains_ci(path, "\\Program Files (x86)\\Microsoft\\Temp\\EUF") ||
+       evidence_contains_ci(r->exe_path, "\\Program Files (x86)\\Microsoft\\Temp\\EUF") ||
+       evidence_contains_ci(r->cmdline, "\\Program Files (x86)\\Microsoft\\Temp\\EUF"))) {
     return 1;
   }
   if (evidence_contains_ci(r->process_name, "MoUsoCoreWorker.exe") &&

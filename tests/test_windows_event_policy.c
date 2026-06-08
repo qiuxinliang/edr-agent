@@ -251,6 +251,24 @@ static void test_systemprofile_cryptnet_metadata_is_not_emitted(void) {
   assert(strstr(p.reason, "systemprofile_cryptnet_url_cache") != NULL);
 }
 
+static void test_systemprofile_cryptnet_content_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Windows\\System32\\config\\systemprofile\\AppData\\LocalLow"
+           "\\Microsoft\\CryptnetUrlCache\\Content\\B76BE66D46C355931939D8CF818D03FD");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "systemprofile_cryptnet_url_cache") != NULL);
+}
+
 static void test_windowsapps_webexperience_assets_are_not_webshell_signal(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
@@ -269,6 +287,26 @@ static void test_windowsapps_webexperience_assets_are_not_webshell_signal(void) 
   assert(!p.should_persist);
   assert(r.priority == 2u);
   assert(strstr(p.reason, "windowsapps_webexperience_assets") != NULL);
+}
+
+static void test_edge_update_temp_staging_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "MicrosoftEdgeUpdate.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path),
+           "C:\\Program Files (x86)\\Microsoft\\Temp\\EUF397.tmp\\MicrosoftEdgeUpdate.exe");
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\Program Files (x86)\\Microsoft\\Temp\\EUF397.tmp\\msedgeupdate.dll");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(r.priority == 2u);
+  assert(strstr(p.reason, "microsoft_edge_update_temp_staging") != NULL);
 }
 
 static void test_windows_update_umdf_mui_is_not_emitted(void) {
@@ -361,7 +399,9 @@ int main(void) {
   test_installservice_catalog_is_not_emitted();
   test_installservice_plain_catalog_is_not_emitted();
   test_systemprofile_cryptnet_metadata_is_not_emitted();
+  test_systemprofile_cryptnet_content_is_not_emitted();
   test_windowsapps_webexperience_assets_are_not_webshell_signal();
+  test_edge_update_temp_staging_is_not_emitted();
   test_windows_update_umdf_mui_is_not_emitted();
   test_installservice_smartretry_task_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
