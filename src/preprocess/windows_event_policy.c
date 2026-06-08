@@ -15,6 +15,10 @@ static uint64_t g_event_filter_agent_internal = 0u;
 static uint64_t g_event_filter_low_value_process = 0u;
 static uint64_t g_event_filter_low_value_suffix = 0u;
 static uint64_t g_event_filter_temp_xml = 0u;
+static char g_event_filter_last_drop_reason[96];
+static char g_event_filter_last_drop_process[96];
+static char g_event_filter_last_drop_path[256];
+static char g_event_filter_last_drop_cmdline[256];
 
 static void reset_event_filter_counters(void) {
   g_event_filter_evaluated = 0u;
@@ -23,6 +27,10 @@ static void reset_event_filter_counters(void) {
   g_event_filter_low_value_process = 0u;
   g_event_filter_low_value_suffix = 0u;
   g_event_filter_temp_xml = 0u;
+  g_event_filter_last_drop_reason[0] = '\0';
+  g_event_filter_last_drop_process[0] = '\0';
+  g_event_filter_last_drop_path[0] = '\0';
+  g_event_filter_last_drop_cmdline[0] = '\0';
 }
 
 void edr_windows_event_policy_configure(const EdrWindowsEventFilterConfig *cfg) {
@@ -62,6 +70,14 @@ void edr_windows_event_policy_get_status(EdrWindowsEventFilterStatus *out) {
   out->low_value_file_process = g_event_filter_low_value_process;
   out->low_value_file_suffix = g_event_filter_low_value_suffix;
   out->temp_xml = g_event_filter_temp_xml;
+  snprintf(out->last_drop_reason, sizeof(out->last_drop_reason), "%s",
+           g_event_filter_last_drop_reason);
+  snprintf(out->last_drop_process, sizeof(out->last_drop_process), "%s",
+           g_event_filter_last_drop_process);
+  snprintf(out->last_drop_path, sizeof(out->last_drop_path), "%s",
+           g_event_filter_last_drop_path);
+  snprintf(out->last_drop_cmdline, sizeof(out->last_drop_cmdline), "%s",
+           g_event_filter_last_drop_cmdline);
 }
 
 static int is_file_event(EdrEventType t) {
@@ -544,7 +560,24 @@ void edr_windows_event_policy_apply(EdrBehaviorRecord *r) {
                  n ? " " : "", p.reason, p.tags);
 }
 
-static void record_event_filter_decision(const EdrWindowsEventPolicy *p) {
+static const char *event_filter_record_path(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return "";
+  }
+  if (r->file_path[0]) {
+    return r->file_path;
+  }
+  if (r->reg_key_path[0]) {
+    return r->reg_key_path;
+  }
+  if (r->exe_path[0]) {
+    return r->exe_path;
+  }
+  return "";
+}
+
+static void record_event_filter_decision(const EdrBehaviorRecord *r,
+                                         const EdrWindowsEventPolicy *p) {
   if (!p || !p->applies) {
     return;
   }
@@ -562,12 +595,20 @@ static void record_event_filter_decision(const EdrWindowsEventPolicy *p) {
   } else if (has_ci_path(p->reason, "temp_xml_low_value_file")) {
     g_event_filter_temp_xml++;
   }
+  snprintf(g_event_filter_last_drop_reason, sizeof(g_event_filter_last_drop_reason), "%s",
+           p->reason);
+  snprintf(g_event_filter_last_drop_process, sizeof(g_event_filter_last_drop_process), "%s",
+           r ? r->process_name : "");
+  snprintf(g_event_filter_last_drop_path, sizeof(g_event_filter_last_drop_path), "%s",
+           event_filter_record_path(r));
+  snprintf(g_event_filter_last_drop_cmdline, sizeof(g_event_filter_last_drop_cmdline), "%s",
+           r ? r->cmdline : "");
 }
 
 int edr_windows_event_policy_should_emit(const EdrBehaviorRecord *r) {
   EdrWindowsEventPolicy p;
   edr_windows_event_policy_evaluate(r, &p);
-  record_event_filter_decision(&p);
+  record_event_filter_decision(r, &p);
   return (!p.applies || p.should_emit) ? 1 : 0;
 }
 

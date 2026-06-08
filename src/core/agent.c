@@ -561,6 +561,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
   char event_filter_ver[96];
+  char event_filter_last_reason[128], event_filter_last_process[128];
+  char event_filter_last_path[320], event_filter_last_cmdline[320];
   char adaptive_last_rule[96];
   char http_conn_mode[48], http_base_url[640], http_relay_url[640], http_proxy_mode[48];
   char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
@@ -636,6 +638,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(ch.sensor_interest_rules_version, sensor_interest_rules, sizeof(sensor_interest_rules));
   json_escape_small(ch.adaptive_collection_last_rule_id, adaptive_last_rule, sizeof(adaptive_last_rule));
   json_escape_small(event_filter_status.version, event_filter_ver, sizeof(event_filter_ver));
+  json_escape_small(event_filter_status.last_drop_reason, event_filter_last_reason,
+                    sizeof(event_filter_last_reason));
+  json_escape_small(event_filter_status.last_drop_process, event_filter_last_process,
+                    sizeof(event_filter_last_process));
+  json_escape_small(event_filter_status.last_drop_path, event_filter_last_path,
+                    sizeof(event_filter_last_path));
+  json_escape_small(event_filter_status.last_drop_cmdline, event_filter_last_cmdline,
+                    sizeof(event_filter_last_cmdline));
 
   char body[24576];
   int n = snprintf(
@@ -717,7 +727,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"event_filter\":{\"enabled\":%s,\"version\":\"%s\","
       "\"evaluated\":%llu,\"dropped\":%llu,"
       "\"agent_internal_forensic\":%llu,\"low_value_file_process\":%llu,"
-      "\"low_value_file_suffix\":%llu,\"temp_xml\":%llu},"
+      "\"low_value_file_suffix\":%llu,\"temp_xml\":%llu,"
+      "\"last_drop\":{\"reason\":\"%s\",\"process\":\"%s\","
+      "\"path\":\"%s\",\"cmdline\":\"%s\"}},"
       "\"adaptive_collection\":{\"enabled\":%s,\"active\":%s,\"ttl_s\":%u,"
       "\"remaining_s\":%u,\"min_severity\":%u,\"level\":%d,"
       "\"boosts\":%llu,\"last_boost_unix_ms\":%llu,\"last_rule_id\":\"%s\"},"
@@ -866,6 +878,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)event_filter_status.low_value_file_process,
       (unsigned long long)event_filter_status.low_value_file_suffix,
       (unsigned long long)event_filter_status.temp_xml,
+      event_filter_last_reason,
+      event_filter_last_process,
+      event_filter_last_path,
+      event_filter_last_cmdline,
       ch.adaptive_collection_enabled ? "true" : "false",
       ch.adaptive_collection_active ? "true" : "false",
       ch.adaptive_collection_ttl_s,

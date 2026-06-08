@@ -42,6 +42,10 @@ typedef struct {
   uint64_t low_value_file_process;
   uint64_t low_value_file_suffix;
   uint64_t temp_xml;
+  char last_drop_reason[96];
+  char last_drop_process[96];
+  char last_drop_path[256];
+  char last_drop_cmdline[256];
 } EdrWindowsEventFilterStatus;
 
 /** Configure the lightweight endpoint-side file/registry slimming policy. */

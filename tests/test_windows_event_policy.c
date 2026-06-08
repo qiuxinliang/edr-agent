@@ -373,6 +373,7 @@ static void test_policy_status_counts_drop_reasons(void) {
   EdrWindowsEventFilterStatus st;
   edr_windows_event_policy_configure(NULL);
   init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "cleanmgr.exe");
   snprintf(r.file_path, sizeof(r.file_path),
            "C:\\Users\\alice\\AppData\\Local\\Temp\\xml_file_42.xml");
   assert(edr_windows_event_policy_should_emit(&r) == 0);
@@ -381,6 +382,9 @@ static void test_policy_status_counts_drop_reasons(void) {
   assert(st.evaluated == 1u);
   assert(st.dropped == 1u);
   assert(st.temp_xml == 1u);
+  assert(strstr(st.last_drop_reason, "temp_xml_low_value_file") != NULL);
+  assert(strstr(st.last_drop_process, "cleanmgr.exe") != NULL);
+  assert(strstr(st.last_drop_path, "xml_file_42.xml") != NULL);
 }
 
 int main(void) {

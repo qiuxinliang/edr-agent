@@ -1034,13 +1034,22 @@ static int edr_network_dest_is_lateral_or_remote_admin(const EdrBehaviorRecord *
   return 0;
 }
 
+static int edr_collector_file_event_type(EdrEventType t) {
+  return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE ||
+         t == EDR_EVENT_FILE_DELETE || t == EDR_EVENT_FILE_RENAME ||
+         t == EDR_EVENT_FILE_PERMISSION_CHANGE || t == EDR_EVENT_FILE_READ;
+}
+
+static int edr_collector_registry_event_type(EdrEventType t) {
+  return t == EDR_EVENT_REG_CREATE_KEY || t == EDR_EVENT_REG_SET_VALUE ||
+         t == EDR_EVENT_REG_DELETE_KEY;
+}
+
 static int edr_collector_known_low_value_file_record(const EdrBehaviorRecord *br) {
   if (!br) {
     return 0;
   }
-  if (!(br->type == EDR_EVENT_FILE_CREATE || br->type == EDR_EVENT_FILE_WRITE ||
-        br->type == EDR_EVENT_FILE_DELETE || br->type == EDR_EVENT_FILE_RENAME ||
-        br->type == EDR_EVENT_FILE_PERMISSION_CHANGE || br->type == EDR_EVENT_FILE_READ)) {
+  if (!edr_collector_file_event_type(br->type)) {
     return 0;
   }
   const char *path = br->file_path[0] ? br->file_path : br->exe_path;
@@ -1113,6 +1122,23 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     edr_agent_self_count_drop_source(br.event_time_ns > 0 ? (uint64_t)br.event_time_ns : edr_unix_ns(),
                                      EDR_AGENT_SELF_DROP_RECORD);
     return 0;
+  }
+  if (edr_collector_file_event_type(slot->type) ||
+      edr_collector_registry_event_type(slot->type)) {
+    edr_windows_event_policy_apply(&br);
+    slot->priority = br.priority;
+    if (!edr_windows_event_policy_should_emit(&br)) {
+      if (edr_collector_registry_event_type(slot->type)) {
+        s_health.ordinary_registry_dropped++;
+      } else {
+        s_health.ordinary_file_dropped++;
+      }
+      return 0;
+    }
+    if (edr_p0_rule_ir_br_matches_any(&br)) {
+      slot->priority = 0u;
+    }
+    return 1;
   }
   if (edr_collector_known_low_value_file_record(&br)) {
     s_health.ordinary_file_dropped++;
