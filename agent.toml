@@ -16,7 +16,7 @@ tenant_id            = "demo-tenant"
 etw_enabled          = false
 ebpf_enabled         = false
 poll_interval_s      = 1
-max_event_queue_size = 2048
+max_event_queue_size = 1024
 
 [platform]
 rest_base_url        = "https://127.0.0.1:8443/api/v1"

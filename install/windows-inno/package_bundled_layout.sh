@@ -62,7 +62,7 @@ fi
 if [[ -f "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" ]]; then
   cp -a "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" "$OUT_DIR/"
 fi
-for n in "windows_service_install.ps1" "windows_isolate_host.ps1"; do
+for n in "edr_agent_preflight.ps1" "windows_service_install.ps1" "windows_isolate_host.ps1"; do
   if [[ -f "$EDR_AGENT_DIR/scripts/$n" ]]; then
     cp -a "$EDR_AGENT_DIR/scripts/$n" "$OUT_DIR/"
   fi

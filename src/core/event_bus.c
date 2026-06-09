@@ -121,6 +121,10 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus) { return bus ? bus->cap : 0u; }
 
+uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus) {
+  return bus ? (uint64_t)sizeof(*bus) + (uint64_t)bus->cap * (uint64_t)sizeof(EdrEventBusCell) : 0u;
+}
+
 uint32_t edr_event_bus_used_approx(EdrEventBus *bus) {
   if (!bus || !bus->mu_inited) {
     return 0u;
@@ -296,6 +300,10 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 }
 
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus) { return bus ? bus->cap : 0u; }
+
+uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus) {
+  return bus ? (uint64_t)sizeof(*bus) + (uint64_t)bus->cap * (uint64_t)sizeof(EdrEventBusCell) : 0u;
+}
 
 uint32_t edr_event_bus_used_approx(EdrEventBus *bus) {
   if (!bus) {

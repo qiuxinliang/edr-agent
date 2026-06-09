@@ -19,6 +19,9 @@ param(
   [switch]$TrustCa,
   [switch]$ForceEnroll,
   [switch]$EnableResponseActions,
+  [switch]$KeepOfflineQueue,
+  [switch]$KeepEvidenceCache,
+  [switch]$SkipPreflight,
   [switch]$NoCopy
 )
 
@@ -42,6 +45,27 @@ function Get-PackageRoot {
 
 Assert-Admin
 $packageRoot = Get-PackageRoot
+
+if (-not $SkipPreflight) {
+  $preflight = Join-Path $packageRoot "scripts\edr_agent_preflight.ps1"
+  if (-not (Test-Path -LiteralPath $preflight)) {
+    $preflight = Join-Path $packageRoot "edr_agent_preflight.ps1"
+  }
+  if (Test-Path -LiteralPath $preflight) {
+    $preArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflight,
+      "-InstallDir", $InstallDir, "-ServiceName", $ServiceName)
+    if ($KeepOfflineQueue) { $preArgs += "-KeepOfflineQueue" }
+    if ($KeepEvidenceCache) { $preArgs += "-KeepEvidenceCache" }
+    & powershell.exe @preArgs
+    if ($LASTEXITCODE -ne 0) {
+      throw "EDR preflight failed with exit code $LASTEXITCODE"
+    }
+  } else {
+    Write-Warning "edr_agent_preflight.ps1 not found; falling back to built-in runtime stop"
+    Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue
+  }
+}
+
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
 $rootFull = [System.IO.Path]::GetFullPath($packageRoot).TrimEnd([char]'\')

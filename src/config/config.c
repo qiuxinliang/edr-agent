@@ -1258,7 +1258,7 @@ static void load_webshell_detector(toml_table_t *t, EdrConfig *cfg) {
 
 static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size < 256u) {
-    cfg->collection.max_event_queue_size = 2048u;
+    cfg->collection.max_event_queue_size = 256u;
   }
   if (cfg->collection.max_event_queue_size > 65536u) {
     cfg->collection.max_event_queue_size = 65536u;
@@ -1539,7 +1539,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.auditd_enabled = false;
   snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;
-  cfg->collection.max_event_queue_size = 2048u;
+  cfg->collection.max_event_queue_size = 1024u;
   cfg->collection.adaptive_enabled = true;
   cfg->collection.adaptive_boost_seconds = 180u;
   cfg->collection.adaptive_min_severity = 3u;

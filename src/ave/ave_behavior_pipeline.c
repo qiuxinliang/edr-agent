@@ -329,7 +329,8 @@ static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, con
 #define AVE_BP_TS_BUF 128u
 #define AVE_BP_IP_SLOTS 8u
 
-static EdrPidHistory s_hist[AVE_BP_PID_SLOTS];
+static EdrPidHistory *s_hist;
+static uint32_t s_hist_capacity;
 
 static AVECallbacks s_callbacks;
 static int s_callbacks_set;
@@ -347,6 +348,25 @@ static pthread_t s_thread;
 
 static volatile int s_worker_stop;
 static volatile int s_monitor_started;
+
+static int bp_hist_ensure(void) {
+  if (s_hist) {
+    return 0;
+  }
+  s_hist = (EdrPidHistory *)calloc((size_t)AVE_BP_PID_SLOTS, sizeof(*s_hist));
+  if (!s_hist) {
+    s_hist_capacity = 0u;
+    return -1;
+  }
+  s_hist_capacity = AVE_BP_PID_SLOTS;
+  return 0;
+}
+
+static void bp_hist_free(void) {
+  free(s_hist);
+  s_hist = NULL;
+  s_hist_capacity = 0u;
+}
 
 static uint32_t bp_queue_capacity_from_env(void) {
   const char *e = getenv("EDR_AVE_BP_QUEUE_CAP");
@@ -740,6 +760,9 @@ static void build_behavior_features(const AVEBehaviorEvent *e, const EdrAveBehav
 }
 
 static int pid_gc_slot_if_expired(uint32_t idx, int64_t now_ns) {
+  if (!s_hist || idx >= s_hist_capacity) {
+    return 0;
+  }
   EdrPidHistory *h = &s_hist[idx];
   if (!h->valid || h->is_active) {
     return 0;
@@ -762,7 +785,10 @@ static int pid_best_existing(uint32_t pid) {
   int bi = -1;
   int64_t best_key = INT64_MIN;
   uint32_t best_ec = 0u;
-  for (uint32_t i = 0u; i < AVE_BP_PID_SLOTS; i++) {
+  if (!s_hist || s_hist_capacity == 0u) {
+    return -1;
+  }
+  for (uint32_t i = 0u; i < s_hist_capacity; i++) {
     if (!s_hist[i].valid || s_hist[i].pid != pid) {
       continue;
     }
@@ -783,7 +809,10 @@ static void pid_drop_duplicate_slots_except(uint32_t pid, int keep) {
   if (pid == 0u || keep < 0) {
     return;
   }
-  for (uint32_t k = 0u; k < AVE_BP_PID_SLOTS; k++) {
+  if (!s_hist || s_hist_capacity == 0u) {
+    return;
+  }
+  for (uint32_t k = 0u; k < s_hist_capacity; k++) {
     if ((int)k == keep) {
       continue;
     }
@@ -798,14 +827,14 @@ static void pid_drop_duplicate_slots_except(uint32_t pid, int keep) {
  * 探测全程不因首个空槽提前返回，避免与链上后段已占槽语义冲突。
  */
 static int pid_find_slot(uint32_t pid) {
-  if (pid == 0u) {
+  if (pid == 0u || !s_hist || s_hist_capacity == 0u) {
     return -1;
   }
   int64_t now_ns = wall_ns();
-  uint32_t start = pid % AVE_BP_PID_SLOTS;
+  uint32_t start = pid % s_hist_capacity;
   int first_empty = -1;
-  for (uint32_t j = 0u; j < AVE_BP_PID_SLOTS; j++) {
-    uint32_t idx = (start + j) % AVE_BP_PID_SLOTS;
+  for (uint32_t j = 0u; j < s_hist_capacity; j++) {
+    uint32_t idx = (start + j) % s_hist_capacity;
     if (!s_hist[idx].valid) {
       if (first_empty < 0) {
         first_empty = (int)idx;
@@ -831,7 +860,10 @@ static int pid_find_slot(uint32_t pid) {
 static void pid_evict_lru(void) {
   int64_t oldest = INT64_MAX;
   int bi = -1;
-  for (uint32_t i = 0; i < AVE_BP_PID_SLOTS; i++) {
+  if (!s_hist || s_hist_capacity == 0u) {
+    return;
+  }
+  for (uint32_t i = 0; i < s_hist_capacity; i++) {
     if (!s_hist[i].valid) {
       continue;
     }
@@ -1022,7 +1054,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   {
     float ssum = 0.f;
     int scnt = 0;
-    for (uint32_t k = 0; k < AVE_BP_PID_SLOTS; k++) {
+    for (uint32_t k = 0; k < s_hist_capacity; k++) {
       if (!s_hist[k].valid) {
         continue;
       }
@@ -1275,7 +1307,7 @@ void edr_ave_bp_init(void) {
 #endif
   s_worker_stop = 0;
   s_monitor_started = 0;
-  memset(s_hist, 0, sizeof(s_hist));
+  bp_hist_free();
   memset(&s_callbacks, 0, sizeof(s_callbacks));
   s_callbacks_set = 0;
   s_bp_behavior_infer_per_min = 30u;
@@ -1325,6 +1357,10 @@ int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
   }
   if (!s_callbacks_set || !s_callbacks.on_behavior_alert) {
     return AVE_ERR_INVALID_PARAM;
+  }
+  if (bp_hist_ensure() != 0) {
+    fprintf(stderr, "[ave/bp] pid history allocation failed\n");
+    return AVE_ERR_INTERNAL;
   }
   if (!s_q) {
     const uint32_t cap = bp_queue_capacity_from_env();
@@ -1422,6 +1458,9 @@ void edr_ave_bp_merge_static_scan(uint32_t pid, float max_confidence, int verdic
   if (pid == 0u) {
     return;
   }
+  if (!s_hist || s_hist_capacity == 0u) {
+    return;
+  }
   lock_bp();
   int si = pid_find_slot(pid);
   if (si < 0) {
@@ -1465,6 +1504,16 @@ void edr_ave_bp_fill_metrics(AVEStatus *status_out) {
   if (!status_out) {
     return;
   }
+  uint32_t hist_used = 0u;
+  lock_bp();
+  if (s_hist && s_hist_capacity > 0u) {
+    for (uint32_t i = 0; i < s_hist_capacity; i++) {
+      if (s_hist[i].valid) {
+        hist_used++;
+      }
+    }
+  }
+  unlock_bp();
   status_out->behavior_feed_total = bp_metric_load(&s_bp_feed_total);
   status_out->behavior_queue_enqueued = bp_metric_load(&s_bp_queue_enqueued);
   status_out->behavior_queue_full_sync_fallback = bp_metric_load(&s_bp_queue_full_fallback);
@@ -1482,6 +1531,10 @@ void edr_ave_bp_fill_metrics(AVEStatus *status_out) {
   status_out->behavior_infer_latency_p95_ms = bp_latency_p95_ms();
   status_out->behavior_pressure_active = bp_pressure_active() ? 1u : 0u;
   status_out->behavior_queue_capacity = edr_ave_bp_queue_capacity();
+  status_out->behavior_pid_history_used = hist_used;
+  status_out->behavior_pid_history_capacity = s_hist_capacity;
+  status_out->behavior_pid_history_static_bytes =
+      s_hist ? (uint64_t)s_hist_capacity * (uint64_t)sizeof(*s_hist) : 0u;
 }
 
 int edr_ave_bp_monitor_running(void) { return s_monitor_started ? 1 : 0; }

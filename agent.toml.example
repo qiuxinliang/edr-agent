@@ -89,7 +89,7 @@ ebpf_enabled         = true
 auditd_enabled       = false
 auditd_log_path      = "/var/log/audit/audit.log"
 poll_interval_s      = 1
-max_event_queue_size = 2048
+max_event_queue_size = 1024
 # Windows 实时 ETW 会话：每缓冲大小（KB）与刷写周期（秒）；0=默认 64/1。亦可 EDR_ETW_BUFFER_KB / EDR_ETW_FLUSH_TIMER_S（见 README · A4.2）
 # etw_buffer_kb        = 64
 # 降低 ETW 刷写频率以减少回调 CPU 开销；默认 3s（与延迟折中，安全敏感服务器可调回 1）

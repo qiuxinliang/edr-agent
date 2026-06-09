@@ -35,6 +35,11 @@ if (-not (Test-Path -LiteralPath $installer)) {
   Write-Error "Missing bundled installer script: $installer"
 }
 
-& $installer -Output $OutToml
+$installDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($OutToml))
+& $installer -Output $OutToml -UseTemplateToml `
+  -CaCertPath (Join-Path $installDir "certs\ca.pem") `
+  -ClientCertPath (Join-Path $installDir "certs\client.pem") `
+  -ClientKeyPath (Join-Path $installDir "certs\client-key.pem") `
+  -ClientCsrPath (Join-Path $installDir "certs\client.csr.pem")
 
 Remove-Item -LiteralPath $ParamsFile -Force -ErrorAction SilentlyContinue

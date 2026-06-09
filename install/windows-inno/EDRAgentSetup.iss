@@ -60,6 +60,7 @@ Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\co
 Source: "..\..\config\p0_rule_bundle_ir_v1.json.enc"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\config\sensor_interest_manifest.json"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\scripts\edr_agent_preflight.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\windows_service_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\windows_isolate_host.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
@@ -71,7 +72,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_install_wizard_enroll.ps1"" ""{tmp}\edr_wizard_enroll.json"" ""{app}\agent.toml"""; StatusMsg: "Registering with platform..."; Flags: waituntilterminated; Check: EnrollParamsFileExists
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""if ((-not (Test-Path -LiteralPath '{app}\agent.toml')) -and (Test-Path -LiteralPath '{app}\agent.toml.example')) {{ Copy-Item -LiteralPath '{app}\agent.toml.example' -Destination '{app}\agent.toml' -Force }}"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$app='{app}'; $cfg=Join-Path $app 'agent.toml'; $ex=Join-Path $app 'agent.toml.example'; if (-not (Test-Path -LiteralPath $cfg)) {{ if (Test-Path -LiteralPath $ex) {{ Copy-Item -LiteralPath $ex -Destination $cfg -Force }} else {{ throw 'agent.toml was not generated and agent.toml.example is missing' }} }}; if (-not (Test-Path -LiteralPath $cfg)) {{ throw 'agent.toml was not generated' }}; $raw=[System.IO.File]::ReadAllText($cfg); $appEsc=$app.Replace('\','\\'); $raw=$raw.Replace('C:\\Program Files\\EDR Agent',$appEsc).Replace('C:\Program Files\EDR Agent',$app); [System.IO.File]::WriteAllText($cfg,$raw)"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start EDR Agent now (console window; skip if startup task is enabled)"; Flags: postinstall nowait skipifsilent; Check: ShouldPostinstallStartExe
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:AutorunInstallPsParameters}"; StatusMsg: "Configuring startup task..."; Flags: waituntilterminated; Check: ShouldInstallAutorun
 
@@ -175,6 +176,58 @@ begin
   Result := Result + QU;
 end;
 
+function SaveEnrollParamsFileIfNeeded: Boolean;
+var
+  Path, U, T, Json: string;
+  Insecure: Boolean;
+begin
+  Result := False;
+  if EdrHasCmdlineEnroll then
+  begin
+    U := EdrCmdApiBase;
+    T := EdrCmdToken;
+  end
+  else
+  begin
+    U := Trim(EnrollPage.Values[0]);
+    T := Trim(EnrollPage.Values[1]);
+  end;
+  if (U = '') or (T = '') then
+    Exit;
+
+  Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
+  Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) + ':' + JsonEscape(T) + ',' +
+    Chr(34) + 'insecure_tls' + Chr(34) + ':';
+  Insecure := EdrCmdInsecureTls or WizardIsTaskSelected('enrollinsecure');
+  if Insecure then
+    Json := Json + 'true' + Chr(125)
+  else
+    Json := Json + 'false' + Chr(125);
+
+  Result := SaveStringToFile(Path, Json, False);
+  if not Result then
+    Log('SaveEnrollParamsFileIfNeeded: failed to write ' + Path);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): string;
+var
+  Code: Integer;
+  Cmd: string;
+begin
+  Result := '';
+  SaveEnrollParamsFileIfNeeded;
+  Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + '$d=''' + ExpandConstant('{app}') + ''';'
+    + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
+    + 'Remove-Item -LiteralPath (Join-Path $d ''edr_agent.pid'') -Force -ErrorAction SilentlyContinue;'
+    + 'Remove-Item -Path (Join-Path $d ''queue\edr_queue.db*'') -Force -ErrorAction SilentlyContinue;'
+    + 'Remove-Item -Path (Join-Path $d ''evidence\local_evidence_cache.db*'') -Force -ErrorAction SilentlyContinue;'
+    + '"';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    Result := 'Failed to run EDR preflight cleanup before installing.';
+end;
+
 procedure InitializeWizard;
 begin
   EnrollPage := CreateInputQueryPage(wpWelcome,
@@ -214,47 +267,26 @@ begin
       MsgBox('Provide both the API base URL and the enrollment token, or leave both empty to skip registration.', mbInformation, MB_OK);
       Result := False;
     end;
+    if Result then
+      SaveEnrollParamsFileIfNeeded;
   end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Path, U, T, Json, AppToml, ExToml: string;
-  Insecure: Boolean;
+  AppToml, ExToml: string;
 begin
   if CurStep <> ssPostInstall then
     Exit;
-  if EdrHasCmdlineEnroll then
+  if SaveEnrollParamsFileIfNeeded then
+    Exit;
+
+  AppToml := ExpandConstant('{app}\agent.toml');
+  ExToml := ExpandConstant('{app}\agent.toml.example');
+  if (not FileExists(AppToml)) and FileExists(ExToml) then
   begin
-    U := EdrCmdApiBase;
-    T := EdrCmdToken;
-  end
-  else
-  begin
-    U := Trim(EnrollPage.Values[0]);
-    T := Trim(EnrollPage.Values[1]);
-  end;
-  if (U <> '') and (T <> '') then
-  begin
-    Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
-    Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) + ':' + JsonEscape(T) + ',' +
-      Chr(34) + 'insecure_tls' + Chr(34) + ':';
-    Insecure := EdrCmdInsecureTls or WizardIsTaskSelected('enrollinsecure');
-    if Insecure then
-      Json := Json + 'true' + Chr(125)
-    else
-      Json := Json + 'false' + Chr(125);
-    SaveStringToFile(Path, Json, False);
-  end
-  else
-  begin
-    AppToml := ExpandConstant('{app}\agent.toml');
-    ExToml := ExpandConstant('{app}\agent.toml.example');
-    if (not FileExists(AppToml)) and FileExists(ExToml) then
-    begin
-      if not FileCopy(ExToml, AppToml, False) then
-        Log('CurStepChanged: FileCopy agent.toml.example -> agent.toml failed');
-    end;
+    if not FileCopy(ExToml, AppToml, False) then
+      Log('CurStepChanged: FileCopy agent.toml.example -> agent.toml failed');
   end;
 end;
 

@@ -35,6 +35,7 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus);
 uint32_t edr_event_bus_used_approx(EdrEventBus *bus);
 uint64_t edr_event_bus_dropped_total(EdrEventBus *bus);
+uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus);
 
 /** 成功入队总次数（与 dropped 对读可估算背压下推送尝试分布） */
 uint64_t edr_event_bus_pushed_total(EdrEventBus *bus);

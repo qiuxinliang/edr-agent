@@ -318,6 +318,9 @@ typedef struct AVEStatus {
   uint32_t behavior_pressure_active;
   /** 行为 MPMC 容量（当前实现为 **4096**） */
   uint32_t behavior_queue_capacity;
+  uint32_t behavior_pid_history_used;
+  uint32_t behavior_pid_history_capacity;
+  uint64_t behavior_pid_history_static_bytes;
 } AVEStatus;
 
 AVE_EXPORT int AVE_CALL AVE_Init(const AVEConfig *config);

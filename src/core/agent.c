@@ -681,6 +681,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"budget_drops\":%lu},"
       "\"slo\":{\"success_rate_pct\":%u}}},"
       "%s"
+      "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"pushed\":%llu,"
+      "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
       "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
       "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
       "\"command_delivery\":{\"poll_count\":%llu,\"last_poll_unix_ms\":%lld,"
@@ -753,6 +755,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"infer_effective_budget_per_min\":%u,\"pressure_active\":%s,"
       "\"pressure_feed_dropped\":%llu,\"pressure_infer_dropped\":%llu,"
       "\"infer_latency_last_ms\":%u,\"infer_latency_p95_ms\":%u,"
+      "\"pid_history_used\":%u,\"pid_history_capacity\":%u,"
+      "\"pid_history_static_bytes\":%llu,"
       "\"last_degrade_reason\":\"%s\"},"
       "\"pmfe\":{\"enabled\":true,\"mode\":\"alert_single_process\",\"queue_depth\":%lu,"
       "\"submitted\":%lu,\"completed\":%lu,\"dropped\":%lu,"
@@ -809,6 +813,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      (unsigned long long)http_rt.byte_limit_per_minute,
 	      http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
       http_rt.budget_drop_count, http_rt.slo_success_rate_pct, poll_probe_json,
+      edr_event_bus_capacity(agent->event_bus),
+      edr_event_bus_used_approx(agent->event_bus),
+      (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
+      (unsigned long long)edr_event_bus_dropped_total(agent->event_bus),
+      (unsigned long long)edr_event_bus_high_water_hits(agent->event_bus),
+      (unsigned long long)edr_event_bus_static_bytes(agent->event_bus),
       (unsigned long long)s_agent_loop_count,
       (unsigned long long)s_agent_loop_interval_last_ms,
       (unsigned long long)s_agent_loop_interval_max_ms,
@@ -934,6 +944,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)(ave_ok ? avst.behavior_pressure_infer_dropped : 0u),
       ave_ok ? avst.behavior_infer_latency_last_ms : 0u,
       ave_ok ? avst.behavior_infer_latency_p95_ms : 0u,
+      ave_ok ? avst.behavior_pid_history_used : 0u,
+      ave_ok ? avst.behavior_pid_history_capacity : 0u,
+      (unsigned long long)(ave_ok ? avst.behavior_pid_history_static_bytes : 0u),
       (ave_ok && avst.behavior_queue_capacity > 0u &&
        avst.behavior_event_queue_size >= (int)avst.behavior_queue_capacity) ? "queue_full" : "",
       pmfe_q, pmfe_sub, pmfe_done, pmfe_drop,

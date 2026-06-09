@@ -18,6 +18,9 @@ param(
   [string]$InstallDir = "C:\Program Files\EDR Agent",
   [string]$DataDir = "C:\Program Files\EDR Agent",
   [string]$Account = "LocalSystem",
+  [switch]$SkipPreflight,
+  [switch]$KeepOfflineQueue,
+  [switch]$KeepEvidenceCache,
   [switch]$EnableResponseActions
 )
 
@@ -65,6 +68,30 @@ function Set-AgentAcl {
   }
 }
 
+function Invoke-AgentPreflight {
+  if ($SkipPreflight) {
+    Write-Host "Preflight skipped"
+    return
+  }
+  $preflight = Join-Path $InstallDir "edr_agent_preflight.ps1"
+  if (-not (Test-Path -LiteralPath $preflight)) {
+    $preflight = Join-Path $PSScriptRoot "edr_agent_preflight.ps1"
+  }
+  if (-not (Test-Path -LiteralPath $preflight)) {
+    Write-Warning "edr_agent_preflight.ps1 not found; falling back to service stop only"
+    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    return
+  }
+  $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflight,
+    "-InstallDir", $InstallDir, "-ServiceName", $ServiceName)
+  if ($KeepOfflineQueue) { $args += "-KeepOfflineQueue" }
+  if ($KeepEvidenceCache) { $args += "-KeepEvidenceCache" }
+  & powershell.exe @args
+  if ($LASTEXITCODE -ne 0) {
+    throw "EDR preflight failed with exit code $LASTEXITCODE"
+  }
+}
+
 function Install-AgentService {
   Assert-Admin
   if (-not (Test-Path -LiteralPath $ExePath)) {
@@ -74,6 +101,7 @@ function Install-AgentService {
     throw "agent.toml not found: $ConfigPath"
   }
 
+  Invoke-AgentPreflight
   Set-AgentAcl
 
   $hook = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$InstallDir\windows_isolate_host.ps1`" -Action Enable"
@@ -89,12 +117,18 @@ function Install-AgentService {
     Set-MachineEnv "EDR_CMD_ENABLED" "1"
   }
 
+  $binPath = "`"$ExePath`" --service --service-name `"$ServiceName`" --config `"$ConfigPath`""
   $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
   if ($existing) {
-    throw "Service $ServiceName already exists. Use -Action Uninstall first."
+    Write-Host "Service $ServiceName already exists; refreshing configuration"
+    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    & sc.exe config $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
+    & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host
+    Start-Service -Name $ServiceName
+    Get-Service -Name $ServiceName
+    return
   }
 
-  $binPath = "`"$ExePath`" --service --service-name `"$ServiceName`" --config `"$ConfigPath`""
   & sc.exe create $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
   & sc.exe description $ServiceName "EDR endpoint agent" | Out-Host
   & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host

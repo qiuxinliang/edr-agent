@@ -54,6 +54,9 @@ param(
   [switch]$InstallAutorun,
   [switch]$HardenAcl,
   [switch]$ConfigureSensorPolicy = $($env:EDR_CONFIGURE_SENSOR_POLICY -ne "0"),
+  [switch]$SkipPreflight = $($env:EDR_SKIP_PREFLIGHT -eq "1"),
+  [switch]$KeepOfflineQueue = $($env:EDR_KEEP_OFFLINE_QUEUE -eq "1"),
+  [switch]$KeepEvidenceCache = $($env:EDR_KEEP_EVIDENCE_CACHE -eq "1"),
   [switch]$KeepTemplateComments = $($env:EDR_KEEP_TEMPLATE_COMMENTS -eq "1"),
   [switch]$UseTemplateToml = $($env:EDR_USE_TEMPLATE_TOML -eq "1"),
   [switch]$MinimalTomlOnly,
@@ -67,6 +70,15 @@ function Get-EnrollOs {
   if ($env:OS -match "Windows_NT" -or $env:OS -like "*Windows*") { return "windows" }
   if ($IsMacOS) { return "darwin" }
   return "linux"
+}
+
+$Output = [System.IO.Path]::GetFullPath($Output)
+$InstallDir = Split-Path -Parent $Output
+if ((Get-EnrollOs) -eq "windows" -and $InstallDir) {
+  if (-not $env:EDR_CA_CERT) { $CaCertPath = Join-Path $InstallDir "certs\ca.pem" }
+  if (-not $env:EDR_CLIENT_CERT) { $ClientCertPath = Join-Path $InstallDir "certs\client.pem" }
+  if (-not $env:EDR_CLIENT_KEY) { $ClientKeyPath = Join-Path $InstallDir "certs\client-key.pem" }
+  if (-not $env:EDR_CLIENT_CSR) { $ClientCsrPath = Join-Path $InstallDir "certs\client.csr.pem" }
 }
 
 $api = $ApiBase
@@ -155,6 +167,26 @@ function Test-IsElevated {
   } catch {
     return $false
   }
+}
+
+function Invoke-AgentPreflightIfNeeded {
+  if ((Get-EnrollOs) -ne "windows") { return }
+  if ($SkipPreflight) { return }
+  if (-not $InstallAutorun -and $env:EDR_INSTALL_PREFLIGHT -ne "1") { return }
+  $installDir = Split-Path -Parent $Output
+  if (-not $installDir) { $installDir = "C:\Program Files\EDR Agent" }
+  $preflight = Join-Path $PSScriptRoot "edr_agent_preflight.ps1"
+  if (-not (Test-Path -LiteralPath $preflight)) {
+    $preflight = Join-Path $installDir "edr_agent_preflight.ps1"
+  }
+  if (-not (Test-Path -LiteralPath $preflight)) {
+    Write-Warning "edr_agent_preflight.ps1 not found; runtime cleanup skipped"
+    return
+  }
+  $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflight, "-InstallDir", $installDir)
+  if ($KeepOfflineQueue) { $args += "-KeepOfflineQueue" }
+  if ($KeepEvidenceCache) { $args += "-KeepEvidenceCache" }
+  Invoke-Checked -Exe "powershell.exe" -ArgList $args
 }
 
 function Enable-WindowsSensorPolicy {
@@ -439,6 +471,8 @@ function Ensure-AgentCSR {
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
 }
 
+Invoke-AgentPreflightIfNeeded
+
 $existingEndpointId = Read-AgentTomlScalar -Path $Output -Key "endpoint_id"
 $existingTenantId = Read-AgentTomlScalar -Path $Output -Key "tenant_id"
 if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
@@ -520,6 +554,13 @@ function Escape-Toml([string]$s) {
   return $s.Replace('\', '\\').Replace('"', '\"')
 }
 
+$InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\EDR Agent" } else { "." }
+$TomlModelDir = Join-Path $InstallDirForToml "models"
+$TomlQueueDbPath = Join-Path $InstallDirForToml "queue\edr_queue.db"
+$TomlEvidenceCachePath = Join-Path $InstallDirForToml "evidence\local_evidence_cache.db"
+$TomlLogDir = Join-Path $InstallDirForToml "logs"
+$TomlSigningPublicKeyPath = Join-Path $InstallDirForToml "certs\command-signing.pub.pem"
+
 function Write-PemNoBom([string]$Path, [string]$Text) {
   if (-not $Text) { return }
   $dir = Split-Path -Parent $Path
@@ -558,6 +599,7 @@ $EffectiveCertThumbprint = Get-PemCertificateThumbprint $d.client_cert
 function Merge-EnrollIntoAgentTomlExample {
   param(
     [Parameter(Mandatory = $true)][string]$ExamplePath,
+    [AllowEmptyString()][string]$InstallDir,
     [Parameter(Mandatory = $true)][string]$ServerAddr,
     [Parameter(Mandatory = $true)][string]$EndpointId,
     [Parameter(Mandatory = $true)][string]$TenantId,
@@ -580,6 +622,12 @@ function Merge-EnrollIntoAgentTomlExample {
     $raw = $raw.Substring(1)
   }
   $AgentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $RestBaseUrl.TrimEnd("/") }
+  $installRoot = if ($InstallDir -and $InstallDir.Trim()) { $InstallDir.Trim() } elseif ($env:OS -match 'Windows') { 'C:\Program Files\EDR Agent' } else { Split-Path -Parent $ExamplePath }
+  $modelDir = Join-Path $installRoot "models"
+  $queueDb = Join-Path $installRoot "queue\edr_queue.db"
+  $evidenceDb = Join-Path $installRoot "evidence\local_evidence_cache.db"
+  $logDir = Join-Path $installRoot "logs"
+  $signingPub = Join-Path $installRoot "certs\command-signing.pub.pem"
   $raw = $raw -replace "`r`n", "`n"
   $lines = $raw.Split([string[]]@("`n"), [System.StringSplitOptions]::None)
   $out = New-Object System.Collections.Generic.List[string]
@@ -656,6 +704,36 @@ function Merge-EnrollIntoAgentTomlExample {
       $i++
       continue
     }
+    if ($line -match '^\s*max_event_queue_size\s*=') {
+      $out.Add('max_event_queue_size = 1024')
+      $i++
+      continue
+    }
+    if ($line -match '^\s*model_dir\s*=') {
+      $out.Add(('model_dir            = "{0}"' -f (Escape-Toml $modelDir)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*queue_db_path\s*=') {
+      $out.Add(('queue_db_path        = "{0}"' -f (Escape-Toml $queueDb)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*evidence_cache_path\s*=') {
+      $out.Add(('evidence_cache_path  = "{0}"' -f (Escape-Toml $evidenceDb)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*log_dir\s*=') {
+      $out.Add(('log_dir              = "{0}"' -f (Escape-Toml $logDir)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*#?\s*signing_public_key_path\s*=') {
+      $out.Add(('signing_public_key_path = "{0}"' -f (Escape-Toml $signingPub)))
+      $i++
+      continue
+    }
     if ($line -match '^\s*rest_base_url\s*=') {
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
       $out.Add(('proxy_mode           = "{0}"' -f (Escape-Toml $ProxyMode)))
@@ -712,9 +790,8 @@ function Merge-EnrollIntoAgentTomlExample {
   if (-not $merged.EndsWith("`n")) {
     $merged += "`n"
   }
-  if ($env:OS -match 'Windows') {
-    $logWin = 'C:\Program Files\EDR Agent\logs'
-    $escLog = (Escape-Toml $logWin)
+  if ($installRoot) {
+    $escLog = (Escape-Toml $logDir)
     $merged = [regex]::Replace(
       $merged,
       '(?m)^(\s*log_dir\s+=\s*")[^"]*(")',
@@ -821,7 +898,7 @@ relay_url            = "$(Escape-Toml $RelayUrl)"
 etw_enabled          = true
 ebpf_enabled         = false
 poll_interval_s      = 1
-max_event_queue_size = 2048
+max_event_queue_size = 1024
 adaptive_enabled = true
 adaptive_boost_seconds = 180
 adaptive_min_severity = 3
@@ -839,7 +916,7 @@ sampling_rate_whitelist = 0.03
 rules_version        = "edr-dynamic-rules-v1"
 
 [ave]
-model_dir            = "C:\\Program Files\\EDR Agent\\models"
+model_dir            = "$(Escape-Toml $TomlModelDir)"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
@@ -858,10 +935,10 @@ batch_timeout_s      = 2
 max_upload_mbps      = 4
 
 [offline]
-queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
+queue_db_path        = "$(Escape-Toml $TomlQueueDbPath)"
 max_queue_size_mb    = 512
 retention_hours      = 72
-evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db"
+evidence_cache_path  = "$(Escape-Toml $TomlEvidenceCachePath)"
 evidence_cache_max_size_mb = 512
 evidence_cache_retention_hours = 72
 
@@ -873,14 +950,14 @@ behavior_infer_per_min = 30
 
 [logging]
 level                = "info"
-log_dir              = "C:\\Program Files\\EDR Agent\\logs"
+log_dir              = "$(Escape-Toml $TomlLogDir)"
 max_log_size_mb      = 50
 max_log_files        = 5
 
 [command]
 allow_dangerous      = false
 allow_rtq_readonly   = true
-signing_public_key_path = "C:\\Program Files\\EDR Agent\\certs\\command-signing.pub.pem"
+signing_public_key_path = "$(Escape-Toml $TomlSigningPublicKeyPath)"
 
 [self_protect]
 anti_debug           = true
@@ -942,7 +1019,7 @@ if ($Template) {
 $toml = $tomlMinimal
 if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $examplePath)) {
   try {
-    $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -ServerAddr $saddr `
+    $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -InstallDir $InstallDirForToml -ServerAddr $saddr `
       -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
       -CaPath $EffectiveCaCertPath -CertPath $EffectiveClientCertPath -KeyPath $EffectiveClientKeyPath `
       -KeyProvider $keyProviderNorm -ProxyMode $ProxyMode -ProxyUrl $ProxyUrl -RelayUrl $RelayUrl `
