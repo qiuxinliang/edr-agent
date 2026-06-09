@@ -360,6 +360,12 @@ static void take_string_array_csv(toml_array_t *arr, char *dst, size_t cap) {
 static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "address"), cfg->server.address, sizeof(cfg->server.address));
   {
+    toml_datum_t d = toml_bool_in(t, "grpc_enabled");
+    if (d.ok) {
+      cfg->server.grpc_enabled = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "grpc_insecure");
     if (d.ok) {
       cfg->server.grpc_insecure = d.u.b ? true : false;
@@ -1252,7 +1258,7 @@ static void load_webshell_detector(toml_table_t *t, EdrConfig *cfg) {
 
 static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size < 256u) {
-    cfg->collection.max_event_queue_size = 4096u;
+    cfg->collection.max_event_queue_size = 2048u;
   }
   if (cfg->collection.max_event_queue_size > 65536u) {
     cfg->collection.max_event_queue_size = 65536u;
@@ -1511,6 +1517,7 @@ void edr_config_free_heap(EdrConfig *cfg) {
 void edr_config_apply_defaults(EdrConfig *cfg) {
   memset(cfg, 0, sizeof(*cfg));
   snprintf(cfg->server.address, sizeof(cfg->server.address), "%s", "127.0.0.1:50051");
+  cfg->server.grpc_enabled = false;
   cfg->server.grpc_insecure = false;
   snprintf(cfg->server.client_key_provider, sizeof(cfg->server.client_key_provider), "%s", "pem");
   cfg->server.connect_timeout_s = 10;
@@ -1532,7 +1539,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->collection.auditd_enabled = false;
   snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;
-  cfg->collection.max_event_queue_size = 4096u;
+  cfg->collection.max_event_queue_size = 2048u;
   cfg->collection.adaptive_enabled = true;
   cfg->collection.adaptive_boost_seconds = 180u;
   cfg->collection.adaptive_min_severity = 3u;

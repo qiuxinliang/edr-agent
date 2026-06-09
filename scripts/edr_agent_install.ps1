@@ -591,6 +591,11 @@ function Merge-EnrollIntoAgentTomlExample {
       $i++
       continue
     }
+    if ($line -match '^\s*grpc_enabled\s*=') {
+      $out.Add('grpc_enabled         = false')
+      $i++
+      continue
+    }
     if ($line -match '^\s*grpc_insecure\s*=') {
       $out.Add('grpc_insecure        = false')
       $i++
@@ -788,6 +793,7 @@ $tomlMinimal = @"
 
 [server]
 address              = "$(Escape-Toml $saddr)"
+grpc_enabled         = false
 grpc_insecure        = false
 ca_cert              = "$(Escape-Toml $EffectiveCaCertPath)"
 client_cert          = "$(Escape-Toml $EffectiveClientCertPath)"
@@ -815,7 +821,7 @@ relay_url            = "$(Escape-Toml $RelayUrl)"
 etw_enabled          = true
 ebpf_enabled         = false
 poll_interval_s      = 1
-max_event_queue_size = 32768
+max_event_queue_size = 2048
 adaptive_enabled = true
 adaptive_boost_seconds = 180
 adaptive_min_severity = 3

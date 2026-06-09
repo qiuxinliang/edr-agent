@@ -383,8 +383,14 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
     EDR_LOGE("%s", "[transport] production policy disabled non-HTTPS REST ingest; configure platform.rest_base_url=https://...\n");
   }
 
-  /* 初始化 gRPC */
-  edr_grpc_client_init(&secure_cfg);
+  /* Initialize gRPC only when explicitly enabled. HTTP/WebSocket is the default control/data path. */
+  const int grpc_enabled =
+      secure_cfg.server.grpc_enabled || env_truthy("EDR_GRPC_ENABLED") || env_truthy("EDR_ENABLE_GRPC");
+  if (grpc_enabled) {
+    edr_grpc_client_init(&secure_cfg);
+  } else {
+    edr_grpc_client_shutdown();
+  }
 
   /* 配置 HTTP ingest */
   edr_ingest_http_configure(

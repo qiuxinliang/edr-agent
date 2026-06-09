@@ -57,6 +57,7 @@ def _emit_toml(
         "",
         "[server]",
         f'address              = "{_toml_escape(server_addr)}"',
+        "grpc_enabled         = false",
         "grpc_insecure        = false",
         f'ca_cert              = "{_toml_escape(ca_cert_path)}"',
         f'client_cert          = "{_toml_escape(client_cert_path)}"',

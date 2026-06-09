@@ -21,6 +21,7 @@
 typedef struct EdrConfig {
   struct {
     char address[256];
+    bool grpc_enabled;
     bool grpc_insecure;
     char ca_cert[1024];
     char client_cert[1024];
