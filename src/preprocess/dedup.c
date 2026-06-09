@@ -13,7 +13,7 @@ static uint32_t s_rate_max_per_sec = 100u;
 #define EDR_DEDUP_SLOTS 8192u
 #define EDR_RATE_SLOTS 512u
 #define EDR_SCRIPT_SENSOR_DEDUP_SLOTS 2048u
-#define EDR_SCRIPT_SENSOR_DEDUP_DEFAULT_WINDOW_S 5u
+#define EDR_SCRIPT_SENSOR_DEDUP_DEFAULT_WINDOW_S 60u
 
 typedef struct {
   uint64_t key;
@@ -106,6 +106,33 @@ static uint64_t fnv64_update_folded_token(uint64_t h, const char *s, size_t max_
   return h;
 }
 
+static uint64_t fnv64_update_folded_line(uint64_t h, const char *s, size_t max_n) {
+  size_t i;
+  int last_space = 0;
+  if (!s) {
+    return h;
+  }
+  for (i = 0; s[i] && i < max_n; i++) {
+    char c = s[i];
+    if (c == '\r' || c == '\n') {
+      break;
+    }
+    if (c == '\t' || c == ' ') {
+      if (last_space) {
+        continue;
+      }
+      c = ' ';
+      last_space = 1;
+    } else {
+      c = fold_ascii(c);
+      last_space = 0;
+    }
+    h ^= (uint64_t)(unsigned char)c;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 static int append_field_value_ci(uint64_t *h, const char *s, const char *key, size_t max_n) {
   const char *p = find_ci(s, key);
   if (!h || !p) {
@@ -115,6 +142,30 @@ static int append_field_value_ci(uint64_t *h, const char *s, const char *key, si
   *h = fnv64_update(*h, (const unsigned char *)key, strlen(key));
   *h = fnv64_update_folded_token(*h, p, max_n);
   *h ^= 0xA5ULL;
+  return 1;
+}
+
+static int append_field_line_ci(uint64_t *h, const char *s, const char *key, size_t max_n) {
+  const char *p = find_ci(s, key);
+  if (!h || !p) {
+    return 0;
+  }
+  p += strlen(key);
+  *h = fnv64_update(*h, (const unsigned char *)key, strlen(key));
+  *h = fnv64_update_folded_line(*h, p, max_n);
+  *h ^= 0x5AULL;
+  return 1;
+}
+
+static int append_raw_line(uint64_t *h, const char *label, const char *s, size_t max_n) {
+  if (!h || !s || !s[0]) {
+    return 0;
+  }
+  if (label && label[0]) {
+    *h = fnv64_update(*h, (const unsigned char *)label, strlen(label));
+  }
+  *h = fnv64_update_folded_line(*h, s, max_n);
+  *h ^= 0x3CULL;
   return 1;
 }
 
@@ -158,6 +209,7 @@ static uint64_t script_sensor_dedup_key(const EdrBehaviorRecord *r) {
   const char *s;
   uint64_t h;
   int has_stable_id = 0;
+  int has_content = 0;
   if (!r || !(r->type == EDR_EVENT_SCRIPT_POWERSHELL || r->type == EDR_EVENT_SCRIPT_WMI)) {
     return 0u;
   }
@@ -181,10 +233,19 @@ static uint64_t script_sensor_dedup_key(const EdrBehaviorRecord *r) {
   } else {
     h = fnv64_update(h, (const unsigned char *)"scriptblock", 11u);
   }
-  has_stable_id |= append_field_value_ci(&h, s, "scriptblock_id=", 128u);
-  has_stable_id |= append_field_value_ci(&h, s, "amsi_session=", 128u);
-  has_stable_id |= append_field_value_ci(&h, s, "script_hash=", 128u);
-  if (!has_stable_id) {
+  has_content |= append_field_line_ci(&h, s, "script=", 2048u);
+  has_content |= append_field_line_ci(&h, s, "script_content=", 2048u);
+  has_content |= append_field_line_ci(&h, s, "script_text=", 2048u);
+  has_content |= append_field_line_ci(&h, s, "amsi_content=", 2048u);
+  has_content |= append_field_value_ci(&h, s, "script_hash=", 128u);
+  if (!has_content) {
+    has_content |= append_raw_line(&h, "cmdline=", r->cmdline, 1024u);
+  }
+  if (!has_content) {
+    has_stable_id |= append_field_value_ci(&h, s, "scriptblock_id=", 128u);
+    has_stable_id |= append_field_value_ci(&h, s, "amsi_session=", 128u);
+  }
+  if (!has_content && !has_stable_id) {
     h = fnv64_update_folded_token(h, s, 512u);
   }
   return h ? h : 1u;
@@ -307,26 +368,22 @@ void edr_dedup_reset(void) {
 }
 
 int edr_preprocess_should_emit(const EdrBehaviorRecord *r) {
+  int rr;
   if (!r) {
     return 0;
   }
-  if (r->priority == 0u) {
-    return 1;
-  }
-  {
-    int rr = edr_emit_rules_evaluate(r);
-    if (rr == 0) {
-      return 0;
-    }
-    if (rr == 1) {
-      return 1;
-    }
+  rr = edr_emit_rules_evaluate(r);
+  if (rr == 0) {
+    return 0;
   }
   if (!edr_windows_event_policy_should_emit(r)) {
     return 0;
   }
   if (!script_sensor_dedup_allow(r)) {
     return 0;
+  }
+  if (r->priority == 0u || rr == 1) {
+    return 1;
   }
   if (!dedup_allow(r)) {
     return 0;

@@ -298,14 +298,14 @@ static void process_one_slot(const EdrEventSlot *slot) {
       return;
     }
   }
+  if (!edr_preprocess_should_emit(&br)) {
+    return;
+  }
   edr_local_evidence_cache_record_behavior(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);
   /* P2 T9：Shellcode / Webshell / PMFE → AVE 行为槽（E 组 46–47、53–54） */
   if (edr_windows_event_policy_should_emit(&br)) {
     edr_ave_cross_engine_feed_from_record(&br);
-  }
-  if (!edr_preprocess_should_emit(&br)) {
-    return;
   }
   (void)edr_command_dispatch_recommended_forensics(&br);
   if (!edr_local_evidence_cache_is_candidate(&br)) {

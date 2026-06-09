@@ -33,6 +33,7 @@ static void test_scriptblock_duplicate_is_coalesced(void) {
               "sensor=scriptblock provider=Microsoft-Windows-PowerShell");
   snprintf(r.exe_path, sizeof(r.exe_path), "%s",
            "\\Device\\HarddiskVolume3\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "powershell.exe -NoProfile");
   assert(edr_preprocess_should_emit(&r) == 1);
 
   init_script(&r, 1234u, 1001000000LL,
@@ -61,7 +62,23 @@ static void test_distinct_scriptblock_id_is_kept(void) {
   assert(edr_preprocess_should_emit(&r) == 1);
 }
 
-static void test_priority_zero_bypasses_script_sensor_coalesce(void) {
+static void test_same_script_content_coalesces_across_scriptblock_ids(void) {
+  EdrBehaviorRecord r;
+  edr_dedup_configure(30u, 1000u);
+  edr_dedup_reset();
+
+  init_script(&r, 4444u, 2500000000LL,
+              "sensor=scriptblock\nprovider=Microsoft-Windows-PowerShell\n"
+              "scriptblock_id=aaa\nscript=Get-Process powershell");
+  assert(edr_preprocess_should_emit(&r) == 1);
+
+  init_script(&r, 4444u, 2501000000LL,
+              "sensor=scriptblock\nprovider=Microsoft-Windows-PowerShell\n"
+              "scriptblock_id=bbb\nscript=get-process   powershell");
+  assert(edr_preprocess_should_emit(&r) == 0);
+}
+
+static void test_priority_zero_script_sensor_still_coalesces(void) {
   EdrBehaviorRecord r;
   edr_dedup_configure(30u, 1000u);
   edr_dedup_reset();
@@ -74,13 +91,14 @@ static void test_priority_zero_bypasses_script_sensor_coalesce(void) {
   init_script(&r, 3333u, 3001000000LL,
               "sensor=amsi provider=Microsoft-Antimalware-Scan-Interface amsi_session=1");
   r.priority = 0u;
-  assert(edr_preprocess_should_emit(&r) == 1);
+  assert(edr_preprocess_should_emit(&r) == 0);
 }
 
 int main(void) {
   test_scriptblock_duplicate_is_coalesced();
   test_distinct_scriptblock_id_is_kept();
-  test_priority_zero_bypasses_script_sensor_coalesce();
+  test_same_script_content_coalesces_across_scriptblock_ids();
+  test_priority_zero_script_sensor_still_coalesces();
   puts("preprocess_dedup ok");
   return 0;
 }
