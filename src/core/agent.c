@@ -697,6 +697,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
       "\"shellcode_packets_per_sec\":%u,\"low_priority_keep_percent_under_pressure\":%u,"
       "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
+      "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
       "\"thread_count\":%u,\"handle_count\":%u,"
       "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
       "\"hot_thread_role\":\"%s\","
@@ -830,6 +831,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.resource_limit.shellcode_packets_per_sec,
       agent->cfg.resource_limit.low_priority_keep_percent_under_pressure,
       rs.cpu_percent, (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
+      (unsigned long long)rs.working_set_mb,
+      (unsigned long long)rs.private_bytes_mb,
+      (unsigned long long)rs.pagefile_mb,
       rs.thread_count, rs.handle_count,
       rs.hot_thread_id, rs.hot_thread_cpu_percent, hot_thread_role,
       (unsigned long long)rs.hot_thread_kernel_delta_100ns,

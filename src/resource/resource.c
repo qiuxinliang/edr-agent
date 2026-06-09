@@ -274,8 +274,12 @@ void edr_resource_poll(void) {
   PROCESS_MEMORY_COUNTERS_EX pmc;
   memset(&pmc, 0, sizeof(pmc));
   unsigned long rss_mb = 0;
+  unsigned long private_mb = 0;
+  unsigned long pagefile_mb = 0;
   if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
     rss_mb = (unsigned long)(pmc.WorkingSetSize / (1024ULL * 1024ULL));
+    private_mb = (unsigned long)(pmc.PrivateUsage / (1024ULL * 1024ULL));
+    pagefile_mb = (unsigned long)(pmc.PagefileUsage / (1024ULL * 1024ULL));
   }
   maybe_trim_working_set(pct, &rss_mb);
   DWORD handles = 0;
@@ -299,6 +303,9 @@ void edr_resource_poll(void) {
                  rss_mb > (unsigned long)s_cfg->resource_limit.memory_limit_mb;
   s_sample.cpu_percent = pct;
   s_sample.rss_mb = rss_mb;
+  s_sample.working_set_mb = rss_mb;
+  s_sample.private_bytes_mb = private_mb;
+  s_sample.pagefile_mb = pagefile_mb;
   s_sample.thread_count = thread_count;
   s_sample.handle_count = (uint32_t)handles;
   s_sample.hot_thread_id = hot_thread_id;
@@ -388,6 +395,9 @@ void edr_resource_poll(void) {
   }
   s_sample.cpu_percent = pct;
   s_sample.rss_mb = rss_mb;
+  s_sample.working_set_mb = rss_mb;
+  s_sample.private_bytes_mb = 0u;
+  s_sample.pagefile_mb = 0u;
   s_sample.thread_count = 0u;
   s_sample.handle_count = 0u;
   s_sample.hot_thread_id = 0u;

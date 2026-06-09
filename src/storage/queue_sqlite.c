@@ -389,7 +389,7 @@ EdrError edr_storage_queue_open(const char *path) {
   }
 
   if (queue_lock_acquire(s_path) != 0) {
-    return EDR_ERR_SQLITE_OPEN;
+    return EDR_ERR_QUEUE_LOCKED;
   }
 
   int rc = sqlite3_open(s_path, &s_db);

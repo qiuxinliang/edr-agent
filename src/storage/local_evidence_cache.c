@@ -1797,10 +1797,21 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
     }
   }
   st.process_slots_used = proc_n;
+  st.process_slots_capacity = EDR_EVIDENCE_PROC_SLOTS;
   st.ring_events = ring_n;
+  st.ring_capacity = EDR_EVIDENCE_RING_SLOTS;
   st.hot_ring_events = hot_n;
+  st.hot_ring_capacity = EDR_EVIDENCE_CONTEXT_RING_SLOTS;
   st.metrics_minutes = metric_slots_used();
+  st.metrics_capacity = EDR_EVIDENCE_METRIC_SLOTS;
   st.aggregate_slots_used = agg_n;
+  st.aggregate_slots_capacity = EDR_EVIDENCE_AGG_SLOTS;
+  st.context_windows_capacity = EDR_EVIDENCE_CONTEXT_WINDOWS;
+  st.candidate_dedup_capacity = EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS;
+  st.static_bytes = (uint64_t)sizeof(s_proc) + (uint64_t)sizeof(s_ring) +
+                    (uint64_t)sizeof(s_context_ring) + (uint64_t)sizeof(s_context_windows) +
+                    (uint64_t)sizeof(s_metrics) + (uint64_t)sizeof(s_candidate_dedupe) +
+                    (uint64_t)sizeof(s_ordinary_agg);
   st.pressure_active = evidence_cache_pressure_active() ? 1u : 0u;
 #if defined(EDR_HAVE_SQLITE)
   refresh_db_size_status();
@@ -2283,7 +2294,10 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"candidate_deduped\":%llu,\"write_budget_dropped\":%llu,"
            "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
            "\"pressure_active\":%s,\"ordinary_coalesced\":%llu,"
-           "\"aggregate_slots_used\":%u,"
+           "\"aggregate_slots_used\":%u,\"static_bytes\":%llu,"
+           "\"capacity\":{\"process_slots\":%u,\"ring_events\":%u,"
+           "\"hot_ring_events\":%u,\"context_windows\":%u,\"metrics\":%u,"
+           "\"candidate_dedup\":%u,\"aggregate_slots\":%u},"
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
            "\"partitions\":{\"hot_ring\":{\"events\":%u},"
@@ -2301,6 +2315,10 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.pressure_dropped,
            st.pressure_active ? "true" : "false",
            (unsigned long long)st.ordinary_coalesced, st.aggregate_slots_used,
+           (unsigned long long)st.static_bytes,
+           st.process_slots_capacity, st.ring_capacity, st.hot_ring_capacity,
+           st.context_windows_capacity, st.metrics_capacity, st.candidate_dedup_capacity,
+           st.aggregate_slots_capacity,
            (unsigned long long)st.maintenance_runs, st.process_slots_used, st.ring_events,
            eng, (long long)st.last_event_time_ns, err, st.hot_ring_events,
            (unsigned long long)st.p0_candidates_written,

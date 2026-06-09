@@ -464,6 +464,12 @@ static int edr_agent_run_main(const char *config) {
     edr_ensure_parent_dirs_win(qpath);
 #endif
     EdrError sq = edr_storage_queue_open(qpath);
+    if (sq == EDR_ERR_QUEUE_LOCKED) {
+      fprintf(stderr,
+              "[queue] another agent instance appears to be running; exiting before collector start\n");
+      edr_agent_destroy(agent);
+      return 1;
+    }
     if (sq != EDR_OK && qpath && qpath[0]) {
 #ifdef _WIN32
       if (!edr_path_is_absolute_win(qpath)) {
@@ -474,6 +480,11 @@ static int edr_agent_run_main(const char *config) {
         sq = edr_storage_queue_open(fallback);
         if (sq == EDR_OK) {
           fprintf(stderr, "[queue] using install-dir path (%s)\n", fallback);
+        } else if (sq == EDR_ERR_QUEUE_LOCKED) {
+          fprintf(stderr,
+                  "[queue] another agent instance appears to be running; exiting before collector start\n");
+          edr_agent_destroy(agent);
+          return 1;
         } else {
           fprintf(stderr, "[queue] open failed (%s): %d\n", qpath, (int)sq);
         }

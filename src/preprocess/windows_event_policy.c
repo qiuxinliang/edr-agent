@@ -161,6 +161,32 @@ static int process_name_is(const EdrBehaviorRecord *r, const char *name) {
   return r && name && name[0] && has_ci_path(r->process_name, name);
 }
 
+static int record_mentions_process(const EdrBehaviorRecord *r, const char *name) {
+  return r && name && name[0] &&
+         (has_ci_path(r->process_name, name) || has_ci_path(r->exe_path, name) ||
+          has_ci_path(r->cmdline, name) || has_ci_path(r->file_path, name));
+}
+
+static int low_value_file_process_record(const EdrBehaviorRecord *r) {
+  static const char *const names[] = {
+      "cleanmgr.exe",       "taskmgr.exe",          "wmiprvse.exe",
+      "trustedinstaller.exe", "tiworker.exe",       "searchindexer.exe",
+      "searchprotocolhost.exe", "searchfilterhost.exe", "ctfmon.exe",
+      "compattelrunner.exe", "runtimebroker.exe",   "backgroundtaskhost.exe",
+      "microsoftedgeupdate.exe", "officeclicktorun.exe", "msmpeng.exe",
+      "nissrv.exe",
+  };
+  if (!r) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    if (record_mentions_process(r, names[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void set_reason(EdrWindowsEventPolicy *p, const char *reason);
 static void add_tag(EdrWindowsEventPolicy *p, const char *tag);
 
@@ -295,6 +321,11 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       "\\config\\software", "lsass.dmp", "\\lsass", "\\sam.save", "\\system.save",
   };
   if (!path || !path[0]) {
+    if (g_event_filter_cfg.low_value_file_process && low_value_file_process_record(r)) {
+      mark_noisy(p, "known_low_value_file_process", "noise_process");
+      return;
+    }
+    mark_noisy(p, "empty_file_metadata", "metadata_only");
     return;
   }
   if (g_event_filter_cfg.agent_internal_forensic && agent_internal_forensic_activity(r)) {
@@ -415,16 +446,7 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_noisy(p, "temp_xml_low_value_file", "noise_temp_xml");
   }
   if (!p->high_value && g_event_filter_cfg.low_value_file_process &&
-      (process_name_is(r, "cleanmgr.exe") || process_name_is(r, "taskmgr.exe") ||
-       process_name_is(r, "wmiprvse.exe") || process_name_is(r, "trustedinstaller.exe") ||
-       process_name_is(r, "tiworker.exe") || process_name_is(r, "searchindexer.exe") ||
-       process_name_is(r, "searchprotocolhost.exe") ||
-       process_name_is(r, "searchfilterhost.exe") ||
-       process_name_is(r, "compattelrunner.exe") || process_name_is(r, "runtimebroker.exe") ||
-       process_name_is(r, "backgroundtaskhost.exe") ||
-       process_name_is(r, "microsoftedgeupdate.exe") ||
-       process_name_is(r, "officeclicktorun.exe") || process_name_is(r, "msmpeng.exe") ||
-       process_name_is(r, "nissrv.exe"))) {
+      low_value_file_process_record(r)) {
     mark_noisy(p, "known_low_value_file_process", "noise_process");
   }
   if (!p->high_value && g_event_filter_cfg.low_value_file_suffix &&
@@ -613,7 +635,8 @@ static void record_event_filter_decision(const EdrBehaviorRecord *r,
              has_ci_path(p->reason, "windowsapps_language_or_sourcemap_noise") ||
              has_ci_path(p->reason, "known_windows_driver_enumeration")) {
     g_event_filter_windows_noise_path++;
-  } else if (has_ci_path(p->reason, "ordinary_windows_metadata_only")) {
+  } else if (has_ci_path(p->reason, "ordinary_windows_metadata_only") ||
+             has_ci_path(p->reason, "empty_file_metadata")) {
     g_event_filter_metadata_only++;
   }
   snprintf(g_event_filter_last_drop_reason, sizeof(g_event_filter_last_drop_reason), "%s",

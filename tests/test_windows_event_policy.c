@@ -381,6 +381,38 @@ static void test_installservice_smartretry_task_is_not_emitted(void) {
   assert(strstr(p.reason, "installservice_smartretry_task") != NULL);
 }
 
+static void test_empty_file_metadata_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  EdrWindowsEventFilterStatus st;
+  edr_windows_event_policy_configure(NULL);
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  assert(edr_windows_event_policy_should_emit(&r) == 0);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(strstr(p.reason, "empty_file_metadata") != NULL);
+  edr_windows_event_policy_get_status(&st);
+  assert(st.metadata_only == 1u);
+}
+
+static void test_search_protocolhost_cmdline_file_noise_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.cmdline, sizeof(r.cmdline),
+           "\"C:\\WINDOWS\\System32\\SearchProtocolHost.exe\" Global\\UsGthrFltPipe");
+  assert(edr_windows_event_policy_should_emit(&r) == 0);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(strstr(p.reason, "known_low_value_file_process") != NULL);
+}
+
 static void test_policy_can_be_disabled_by_runtime_config(void) {
   EdrWindowsEventFilterConfig cfg;
   EdrBehaviorRecord r;
@@ -447,6 +479,8 @@ int main(void) {
   test_windowsapps_language_pack_is_not_emitted();
   test_driver_ads_enumeration_is_not_emitted();
   test_installservice_smartretry_task_is_not_emitted();
+  test_empty_file_metadata_is_not_emitted();
+  test_search_protocolhost_cmdline_file_noise_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();
   puts("windows_event_policy ok");

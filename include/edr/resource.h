@@ -20,6 +20,9 @@ unsigned long edr_resource_emergency_count(void);
 typedef struct {
   uint32_t cpu_percent;
   uint64_t rss_mb;
+  uint64_t working_set_mb;
+  uint64_t private_bytes_mb;
+  uint64_t pagefile_mb;
   uint32_t thread_count;
   uint32_t handle_count;
   uint32_t hot_thread_id;
