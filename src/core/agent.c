@@ -535,11 +535,22 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   if (!agent || !last_health_ns || !edr_ingest_http_configured()) {
     return;
   }
-  int interval = 60;
+  if (!agent->cfg.health_monitor.enabled) {
+    return;
+  }
+  uint64_t wall_ms = (uint64_t)time(NULL) * 1000ULL;
+  if (agent->cfg.health_monitor.expires_at_unix_ms > 0u &&
+      wall_ms >= agent->cfg.health_monitor.expires_at_unix_ms) {
+    return;
+  }
+  int interval = (int)agent->cfg.health_monitor.interval_s;
+  if (interval < 30 || interval > 3600) {
+    interval = 60;
+  }
   const char *iv = getenv("EDR_ENGINE_HEALTH_INTERVAL_S");
   if (iv && iv[0]) {
     int v = atoi(iv);
-    if (v >= 10 && v <= 3600) {
+    if (v >= 30 && v <= 3600) {
       interval = v;
     }
   }
@@ -550,14 +561,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   *last_health_ns = now;
 
   unsigned long pmfe_sub = 0, pmfe_done = 0, pmfe_drop = 0;
-  edr_pmfe_get_stats(&pmfe_sub, &pmfe_done, &pmfe_drop);
-  unsigned long pmfe_q = edr_pmfe_queue_depth();
+  unsigned long pmfe_q = 0;
 
   AVEStatus avst;
   memset(&avst, 0, sizeof(avst));
-  int ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
+  int ave_ok = 0;
 
   char rules_ver[96], static_ver[48], behavior_ver[48], ioc_ver[48];
+  char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
   char event_filter_ver[96];
@@ -598,6 +609,161 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
     hot_thread_role = "background_worker";
   }
 #endif
+  json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
+  json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
+  json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
+  json_escape_small(grpc_rt.last_error, grpc_err, sizeof(grpc_err));
+  json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
+  json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
+  json_escape_small(http_rt.effective_base_url, http_base_url, sizeof(http_base_url));
+  json_escape_small(http_rt.relay_url, http_relay_url, sizeof(http_relay_url));
+  json_escape_small(http_rt.proxy_mode, http_proxy_mode, sizeof(http_proxy_mode));
+  json_escape_small(http_rt.proxy_url, http_proxy_url, sizeof(http_proxy_url));
+  json_escape_small(http_rt.proxy_status, http_proxy_status, sizeof(http_proxy_status));
+  json_escape_small(http_rt.circuit_reason, http_circuit_reason, sizeof(http_circuit_reason));
+  json_escape_small(http_rt.mtls_status, http_mtls_status, sizeof(http_mtls_status));
+  json_escape_small(http_rt.client_key_provider, http_key_provider, sizeof(http_key_provider));
+  json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
+  if (strcmp(health_profile, "diagnostic") != 0) {
+    char body_basic[12288];
+    int n_basic = snprintf(
+        body_basic, sizeof(body_basic),
+        "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
+        "\"engine_health\":{"
+        "\"reported_at_unix_ms\":%llu,"
+        "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
+        "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
+        "\"communication\":{\"grpc_ready\":%s,\"http_fallback\":%s,"
+        "\"http_ok\":%lu,\"http_fail\":%lu,"
+        "\"offline_queue_pending\":%llu,"
+        "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
+        "\"last_failure_reason\":\"%s%s%s\","
+        "\"enterprise\":{\"connection_mode\":\"%s\",\"effective_base_url\":\"%s\","
+        "\"relay_url\":\"%s\",\"mtls_configured\":%s,\"websocket_ready\":%s,"
+        "\"mtls_status\":\"%s\",\"client_key_provider\":\"%s\","
+        "\"proxy_mode\":\"%s\",\"proxy_url\":\"%s\",\"proxy_status\":\"%s\","
+        "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
+        "\"failure_reason\":\"%s%s%s\",\"poll_backoff_ms\":%d,\"ws_backoff_ms\":%d,"
+        "\"circuit_open\":%s,\"circuit_until_unix_ms\":%lld,"
+        "\"circuit_reason\":\"%s\",\"pending_upload_queue\":%llu,"
+        "\"budget\":{\"requests_this_minute\":%lu,\"request_limit_per_minute\":%lu,"
+        "\"bytes_this_minute\":%llu,\"byte_limit_per_minute\":%llu,"
+        "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
+        "\"budget_drops\":%lu},\"slo\":{\"success_rate_pct\":%u}}},"
+        "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"pushed\":%llu,"
+        "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
+        "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
+        "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
+        "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
+        "\"behavior_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,"
+        "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
+        "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
+        "\"thread_count\":%u,\"handle_count\":%u,"
+        "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
+        "\"hot_thread_role\":\"%s\","
+        "\"throttle_active\":%s,\"pressure\":%s,\"pressure_level\":%u,"
+        "\"pressure_reason\":\"%s\",\"sample_count\":%llu},"
+        "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\","
+        "\"rule_version\":\"%s\",\"rules_count\":%u,"
+        "\"last_degrade_reason\":\"%s\"},"
+        "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,"
+        "\"powershell_visible\":%s,\"amsi_visible\":%s,"
+        "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
+        "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+        "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
+        "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
+        "\"current_minute_count\":%llu,\"threshold_per_min\":%llu,"
+        "\"cooldown_s\":%llu},"
+        "\"drop_breakdown\":{\"agent_self\":%llu,\"lifecycle\":%llu,"
+        "\"auth\":%llu,\"invalid_process\":%llu,\"ordinary_file\":%llu,"
+        "\"ordinary_registry\":%llu,\"ordinary_network\":%llu,"
+        "\"metadata\":%llu}}"
+        "}}",
+        agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
+        rules_ver[0] ? rules_ver : "local",
+        (unsigned long long)wall_ms, health_profile[0] ? health_profile : "basic",
+        agent->cfg.health_monitor.interval_s,
+        (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
+        grpc_rt.ready ? "true" : "false",
+        http_rt.http_fallback_available ? "true" : "false", http_rt.ok_count, http_rt.fail_count,
+        (unsigned long long)edr_storage_queue_pending_count(),
+        (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
+                                                                                  : http_rt.last_success_unix_ms),
+        (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
+                                                                                  : http_rt.last_failure_unix_ms),
+        grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+        http_conn_mode[0] ? http_conn_mode : "direct", http_base_url, http_relay_url,
+        http_rt.mtls_configured ? "true" : "false", http_rt.websocket_ready ? "true" : "false",
+        http_mtls_status[0] ? http_mtls_status : "not_configured",
+        http_key_provider[0] ? http_key_provider : "pem",
+        http_proxy_mode[0] ? http_proxy_mode : "auto", http_proxy_url, http_proxy_status,
+        (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
+                                                                                  : http_rt.last_success_unix_ms),
+        (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
+                                                                                  : http_rt.last_failure_unix_ms),
+        grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+        http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
+        http_rt.circuit_open ? "true" : "false", (long long)http_rt.circuit_until_unix_ms,
+        http_circuit_reason, (unsigned long long)edr_storage_queue_pending_count(),
+        http_rt.requests_this_minute, http_rt.request_limit_per_minute,
+        (unsigned long long)http_rt.bytes_this_minute,
+        (unsigned long long)http_rt.byte_limit_per_minute,
+        http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
+        http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
+        edr_event_bus_capacity(agent->event_bus),
+        edr_event_bus_used_approx(agent->event_bus),
+        (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
+        (unsigned long long)edr_event_bus_dropped_total(agent->event_bus),
+        (unsigned long long)edr_event_bus_high_water_hits(agent->event_bus),
+        (unsigned long long)edr_event_bus_static_bytes(agent->event_bus),
+        (unsigned long long)s_agent_loop_count,
+        (unsigned long long)s_agent_loop_interval_last_ms,
+        (unsigned long long)s_agent_loop_interval_max_ms,
+        (unsigned long long)s_agent_loop_elapsed_last_us,
+        (unsigned long long)s_agent_loop_elapsed_max_us,
+        agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
+        agent->cfg.resource_limit.behavior_infer_per_min,
+        agent->cfg.resource_limit.pmfe_scans_per_min,
+        rs.cpu_percent, (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
+        (unsigned long long)rs.working_set_mb,
+        (unsigned long long)rs.private_bytes_mb,
+        (unsigned long long)rs.pagefile_mb,
+        rs.thread_count, rs.handle_count,
+        rs.hot_thread_id, rs.hot_thread_cpu_percent, hot_thread_role,
+        rs.throttle_active ? "true" : "false", rs.throttle_active ? "true" : "false",
+        rs.pressure_level, resource_pressure_reason[0] ? resource_pressure_reason : "ok",
+        (unsigned long long)rs.sample_count, rules_ver, agent->cfg.preprocessing.rules_count,
+        rs.throttle_active ? "resource_throttle" : "",
+        ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
+        ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
+        ch.collector_thread_id,
+        (unsigned long long)ch.collector_dropped,
+        (unsigned long long)ch.queue_dropped,
+        ch.agent_self_fuse_active ? "true" : "false",
+        ch.agent_self_fuse_provider_degraded ? "true" : "false",
+        (unsigned long long)ch.agent_self_fuse_until_unix_ms,
+        (unsigned long long)ch.agent_self_fuse_trips,
+        (unsigned long long)ch.agent_self_fuse_suppressed,
+        (unsigned long long)ch.agent_self_fuse_current_minute_count,
+        (unsigned long long)ch.agent_self_fuse_threshold_per_min,
+        (unsigned long long)ch.agent_self_fuse_cooldown_s,
+        (unsigned long long)ch.agent_self_suppressed,
+        (unsigned long long)ch.lifecycle_dropped,
+        (unsigned long long)ch.auth_dropped,
+        (unsigned long long)ch.invalid_process_dropped,
+        (unsigned long long)ch.ordinary_file_dropped,
+        (unsigned long long)ch.ordinary_registry_dropped,
+        (unsigned long long)ch.ordinary_network_dropped,
+        (unsigned long long)ch.metadata_dropped);
+    if (n_basic > 0 && (size_t)n_basic < sizeof(body_basic)) {
+      (void)edr_ingest_http_post_engine_health_json(body_basic);
+    }
+    return;
+  }
+
+  edr_pmfe_get_stats(&pmfe_sub, &pmfe_done, &pmfe_drop);
+  pmfe_q = edr_pmfe_queue_depth();
+  ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
   EdrShellcodeRulesStatus shell_rules;
@@ -605,6 +771,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_shellcode_known_get_status(&shell_rules);
   char shell_source[48], shell_version[128], shell_error[192], shell_rb[128], shell_last_rule[128], shell_last_src[48];
   char audit_err[192], ebpf_err[192];
+  json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
+  json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
   json_escape_small(agent->cfg.detection_policy.source, det_policy_source, sizeof(det_policy_source));
   json_escape_small(agent->cfg.detection_policy.policy_version, det_policy_version, sizeof(det_policy_version));
@@ -653,6 +821,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
       "\"engine_health\":{"
       "\"reported_at_unix_ms\":%llu,"
+      "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
+      "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
       "\"communication\":{\"grpc_ready\":%s,\"grpc_insecure\":%s,\"http_fallback\":%s,"
       "\"http_insecure\":%s,\"grpc_rpc_ok\":%lu,\"grpc_rpc_fail\":%lu,"
       "\"grpc_consecutive_failures\":%d,\"http_ok\":%lu,\"http_fail\":%lu,"
@@ -774,7 +944,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "%s"
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING, rules_ver[0] ? rules_ver : "local",
-      (unsigned long long)(time(NULL) * 1000LL),
+      (unsigned long long)wall_ms,
+      health_profile[0] ? health_profile : "basic", agent->cfg.health_monitor.interval_s,
+      (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
 	      grpc_rt.ready ? "true" : "false", grpc_rt.insecure ? "true" : "false",
 	      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
 	      grpc_rt.rpc_ok, grpc_rt.rpc_fail, grpc_rt.report_fail_streak, http_rt.ok_count, http_rt.fail_count,
@@ -1164,6 +1336,9 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   }
   if (edr_agent_toml_has_section(tmp, "resource_limit")) {
     agent->cfg.resource_limit = remote->resource_limit;
+  }
+  if (edr_agent_toml_has_section(tmp, "health_monitor")) {
+    agent->cfg.health_monitor = remote->health_monitor;
   }
   if (edr_agent_toml_has_section(tmp, "command")) {
     agent->cfg.command = remote->command;

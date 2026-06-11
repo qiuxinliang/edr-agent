@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r247-471cb221",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-e2377a0d",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 160,
@@ -1828,7 +1828,7 @@
       "description": "针对 ATT&CK 父技术「T1004」（Winlogon Helper DLL）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)Software\\\\\\\\Microsoft\\\\\\\\Windows NT\\\\\\\\CurrentVersion\\\\\\\\Winlogon\\\\\\\\Notify"
+          "(?i)Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon\\\\Notify"
         ]
       }
     },
@@ -1885,7 +1885,7 @@
       "description": "针对 ATT&CK 父技术「T1013」（Port Monitors）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)SYSTEM\\\\\\\\CurrentControlSet\\\\\\\\Control\\\\\\\\Print\\\\\\\\Monitors"
+          "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Print\\\\Monitors"
         ]
       }
     },
@@ -2015,8 +2015,8 @@
       "description": "针对 ATT&CK 父技术「T1042」（Change Default File Association）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)Explorer\\\\\\\\FileExts\\\\\\\\\\.[^\\\\]+\\\\\\\\UserChoice",
-          "(?i)Classes\\\\\\\\\\.[^\\\\]+\\\\\\\\shell\\\\\\\\open\\\\\\\\command"
+          "(?i)Explorer\\\\FileExts\\\\\\.[^\\\\]+\\\\UserChoice",
+          "(?i)Classes\\\\\\.[^\\\\]+\\\\shell\\\\open\\\\command"
         ]
       }
     },
@@ -2274,8 +2274,8 @@
       "description": "针对 ATT&CK 父技术「T1101」（Security Support Provider）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)LSA\\\\\\\\Security Packages",
-          "(?i)Lsa\\\\\\\\OSConfig\\\\\\\\Security Packages"
+          "(?i)LSA\\\\Security Packages",
+          "(?i)Lsa\\\\OSConfig\\\\Security Packages"
         ]
       }
     },
@@ -2384,7 +2384,7 @@
       "description": "针对 ATT&CK 父技术「T1122」（Component Object Model Hijacking）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)Classes\\\\\\\\CLSID\\\\\\\\[^\\\\]+\\\\\\\\InprocServer32"
+          "(?i)Classes\\\\CLSID\\\\[^\\\\]+\\\\InprocServer32"
         ]
       }
     },
@@ -2437,7 +2437,10 @@
       "description": "针对 ATT&CK 父技术「T1131」（Authentication Package）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)SYSTEM\\\\\\\\CurrentControlSet\\\\\\\\Control\\\\\\\\Lsa\\\\\\\\Authentication\\\\\\\\Packages"
+          "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa"
+        ],
+        "registry_value_name_in": [
+          "Authentication Packages"
         ]
       }
     },
@@ -2453,8 +2456,8 @@
       "description": "针对 ATT&CK 父技术「T1137」（Office Application Startup）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)Office\\\\\\\\\\d+\\.\\d+\\\\\\\\Word\\\\\\\\Startup",
-          "(?i)Office\\\\\\\\\\d+\\.\\d+\\\\\\\\Excel\\\\\\\\Startup"
+          "(?i)Office\\\\\\d+\\.\\d+\\\\Word\\\\Startup",
+          "(?i)Office\\\\\\d+\\.\\d+\\\\Excel\\\\Startup"
         ]
       }
     },
@@ -2469,13 +2472,13 @@
       ],
       "description": "针对 ATT&CK 父技术「T1138」（Application Shimming）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
-        "process_name_in": [
-          "sdbinst.exe"
-        ],
         "command_regex_any": [
           "(?i)\\.sdb(?:\\s|$|\\\")",
           "(?i)(?:^|\\s|[\\\"'])sdbinst(?:\\.exe)?[\\\"']?\\s+(?:/q|-q|/u|-u)",
           "(?i)Shim\\s+Engine|Application\\s+Compatibility\\s+Toolkit"
+        ],
+        "process_name_in": [
+          "sdbinst.exe"
         ]
       }
     },
@@ -2546,7 +2549,7 @@
       "description": "针对 ATT&CK 父技术「T1174」（Password Filter DLL）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)SYSTEM\\\\\\\\CurrentControlSet\\\\\\\\Control\\\\\\\\Lsa\\\\\\\\Notification Packages"
+          "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\Notification Packages"
         ]
       }
     },
@@ -2579,7 +2582,7 @@
       "description": "针对 ATT&CK 父技术「T1177」（LSASS Driver）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)SYSTEM\\\\\\\\CurrentControlSet\\\\\\\\Control\\\\\\\\Lsa\\\\\\\\Security Packages"
+          "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\Security Packages"
         ]
       }
     },
@@ -2595,7 +2598,7 @@
       "description": "针对 ATT&CK 父技术「T1180」（Screensaver）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)Control Panel\\\\\\\\Desktop\\\\\\\\SCRNSAVE\\.EXE"
+          "(?i)Control Panel\\\\Desktop\\\\SCRNSAVE\\.EXE"
         ]
       }
     },
@@ -2611,7 +2614,7 @@
       "description": "针对 ATT&CK 父技术「T1182」（AppCert DLLs）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)CurrentControlSet\\\\\\\\Control\\\\\\\\Session Manager\\\\\\\\AppCertDlls"
+          "(?i)CurrentControlSet\\\\Control\\\\Session Manager\\\\AppCertDlls"
         ]
       }
     },
@@ -2627,7 +2630,7 @@
       "description": "针对 ATT&CK 父技术「T1183」（Image File Execution Options Injection）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "registry_path_regex_any": [
-          "(?i)Windows NT\\\\\\\\CurrentVersion\\\\\\\\Image File Execution Options\\\\\\\\"
+          "(?i)Windows NT\\\\CurrentVersion\\\\Image File Execution Options\\\\"
         ]
       }
     },
@@ -3312,7 +3315,7 @@
       ],
       "description": "检测chisel/frp/ngrok/cloudflared/plink/ssh/tor等隧道或代理工具连接常见代理端口，用于发现代理链、反连隧道和隐蔽转发。",
       "condition": {
-        "file_path_regex_any": [
+        "process_name_regex_any": [
           "(?i)(chisel|frpc|frps|ngrok|cloudflared|plink|ssh\\.exe|tor\\.exe)"
         ],
         "remote_port_in": [
@@ -3338,7 +3341,7 @@
       ],
       "description": "检测命令行工具、扫描工具或脚本解释器连接数据库/缓存/搜索服务端口，覆盖内网资源发现、凭据复用和横向移动前探测。",
       "condition": {
-        "file_path_regex_any": [
+        "process_name_regex_any": [
           "(?i)(sqlcmd|mysql|psql|redis-cli|mongosh|mongo\\.exe|nmap|masscan|netcat|nc\\.exe|powershell|pwsh)"
         ],
         "remote_port_in": [

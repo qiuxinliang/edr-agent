@@ -31,6 +31,7 @@ static int has_ci(const char *hay, const char *needle) {
 }
 
 static int detail_value(const char *text, const char *key, char *out, size_t cap);
+static double detail_number(const char *text, const char *key, double fallback);
 
 static const char *base_name(const char *path) {
   const char *b = path && path[0] ? path : "";
@@ -252,6 +253,27 @@ static int has_ransom_note_burst_indicator(const EdrBehaviorRecord *r) {
   return has_ci(s, "ransom_note_burst=1");
 }
 
+static int has_ransom_canary_indicator(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
+  const char *path = r->file_path[0] ? r->file_path : r->exe_path;
+  return has_ci(s, "ransom_canary=1") || has_ci(s, "DETERMINISTIC_ENCRYPTION") ||
+         has_ci(path, "~$canary") || has_ci(path, "edr_canary") || has_ci(path, ".edr-canary") ||
+         has_ci(path, "edr-canary");
+}
+
+static int has_ransom_counter_allowlist_indicator(const EdrBehaviorRecord *r) {
+  const char *s = r ? (r->script_snippet[0] ? r->script_snippet : r->cmdline) : "";
+  return has_ci(s, "ransom_counter_allowlisted=1");
+}
+
+static int has_ransom_signer_allowlist_indicator(const EdrBehaviorRecord *r) {
+  const char *s = r ? (r->script_snippet[0] ? r->script_snippet : r->cmdline) : "";
+  return has_ci(s, "ransom_signer_allowlisted=1");
+}
+
 static int token_list_match_count_ci(const char *list, const char *value) {
   if (!list || !list[0] || !value || !value[0]) {
     return 0;
@@ -419,11 +441,32 @@ static double detail_number(const char *text, const char *key, double fallback) 
   return strtod(tmp, NULL);
 }
 
+static int has_extension_change_indicator(const EdrBehaviorRecord *r) {
+  const char *s = r ? (r->script_snippet[0] ? r->script_snippet : r->cmdline) : "";
+  return has_ci(s, "ext_changed=1");
+}
+
+static int has_high_content_entropy_indicator(const EdrBehaviorRecord *r) {
+  const char *s = r ? (r->script_snippet[0] ? r->script_snippet : r->cmdline) : "";
+  double ent = detail_number(s, "content_entropy", -1.0);
+  double sample = detail_number(s, "content_sample_bytes", 0.0);
+  return ent >= 7.20 && sample >= 512.0;
+}
+
 static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
+  if (has_ransom_canary_indicator(r)) {
+    return 1;
+  }
+  if (has_ransom_counter_allowlist_indicator(r)) {
+    return 0;
+  }
   double file_rate = detail_number(s, "file_rate", -1.0);
   double ext_burst = detail_number(s, "ext_burst", -1.0);
+  double dir_burst = detail_number(s, "dir_burst", -1.0);
   double entropy_delta = detail_number(s, "entropy_delta", -1.0);
+  int ext_changed = has_extension_change_indicator(r);
+  int high_content_entropy = has_high_content_entropy_indicator(r);
   if (entropy_delta < 0.0) {
     entropy_delta = detail_number(s, "file_entropy_delta", -1.0);
   }
@@ -431,7 +474,8 @@ static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
   return has_ci(s, "ransom_counter=1") || has_ci(s, "mass_rename=1") || has_ci(s, "extension_burst=1") ||
          has_ci(s, "rename_burst=1") || has_ci(s, "shadow_delete=1") ||
          has_ci(s, "shadowcopy_delete=1") || file_rate >= 80.0 || ext_burst >= 20.0 ||
-         entropy_delta >= 1.5 || (recovery && (file_rate >= 20.0 || ext_burst >= 8.0));
+         dir_burst >= 4.0 || entropy_delta >= 1.5 || (ext_changed && high_content_entropy) ||
+         (recovery && (file_rate >= 20.0 || ext_burst >= 8.0 || dir_burst >= 2.0));
 }
 
 static int has_webshell_semantic_indicator(const EdrBehaviorRecord *r) {
@@ -551,6 +595,22 @@ static const EdrProcessContextSlot *process_context_lookup_pid(uint32_t pid, int
 
 static const EdrProcessContextSlot *process_context_lookup(const EdrBehaviorRecord *r, int64_t now_ns) {
   return r ? process_context_lookup_pid(r->pid, now_ns) : NULL;
+}
+
+static uint32_t ransomware_tree_root_pid(const EdrBehaviorRecord *r, const EdrProcessContextSlot *parent_ctx) {
+  if (!r) {
+    return 0u;
+  }
+  if (r->ppid != 0u && parent_ctx && parent_ctx->events > 0u) {
+    return r->ppid;
+  }
+  if (r->grandparent_pid != 0u) {
+    return r->grandparent_pid;
+  }
+  if (r->ppid != 0u && !has_ci(r->parent_name, "services.exe") && !has_ci(r->parent_name, "svchost.exe")) {
+    return r->ppid;
+  }
+  return r->pid;
 }
 
 static void process_context_update(const EdrBehaviorRecord *r, int64_t now_ns, int remote, int script_sensor,
@@ -913,7 +973,12 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char evidence_forensic[32];
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
+  int ransom_canary = has_ransom_canary_indicator(r);
+  int ransom_counter_allowlisted = has_ransom_counter_allowlist_indicator(r);
+  int ransom_signer_allowlisted = has_ransom_signer_allowlist_indicator(r);
   int ransom_burst = has_ransom_burst_indicator(r);
+  int extension_changed = has_extension_change_indicator(r);
+  int high_content_entropy = has_high_content_entropy_indicator(r);
   int ransom_recovery = has_ransom_recovery_tamper_indicator(r);
   int ransom_note = has_ransom_note_indicator(r);
   int ransom_note_burst = has_ransom_note_burst_indicator(r);
@@ -924,6 +989,7 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   int64_t now_ns = r->event_time_ns > 0 ? r->event_time_ns : 0;
   const EdrProcessContextSlot *ctx = process_context_lookup(r, now_ns);
   const EdrProcessContextSlot *parent_ctx = r->ppid ? process_context_lookup_pid(r->ppid, now_ns) : NULL;
+  uint32_t tree_root_pid = ransomware_tree_root_pid(r, parent_ctx);
   int chain_candidate_score = ransom_chain_candidate_threshold();
   int chain_p0_score = ransom_chain_p0_threshold();
   EdrRansomChainSignal ransom_chain =
@@ -931,7 +997,35 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
                           d->has_remote ? 1 : 0, has_lolbin_script_indicator(r), script_sensor,
                           has_exfil_indicator(r));
   char note_count_buf[32];
+  char file_rate_buf[32];
+  char ext_burst_buf[32];
+  char dir_burst_buf[32];
+  char entropy_delta_buf[32];
+  char high_entropy_ratio_buf[32];
+  char path_entropy_buf[32];
+  char content_entropy_buf[32];
+  char content_sample_bytes_buf[32];
+  char old_ext_buf[32];
+  char new_ext_buf[32];
+  char signer_buf[160];
+  char signature_status_buf[96];
+  char ransomware_kind_buf[64];
+  char ransomware_severity_buf[16];
   detail_value(r->script_snippet, "ransom_note_count", note_count_buf, sizeof(note_count_buf));
+  detail_value(r->script_snippet, "file_rate", file_rate_buf, sizeof(file_rate_buf));
+  detail_value(r->script_snippet, "ext_burst", ext_burst_buf, sizeof(ext_burst_buf));
+  detail_value(r->script_snippet, "dir_burst", dir_burst_buf, sizeof(dir_burst_buf));
+  detail_value(r->script_snippet, "entropy_delta", entropy_delta_buf, sizeof(entropy_delta_buf));
+  detail_value(r->script_snippet, "high_entropy_ratio", high_entropy_ratio_buf, sizeof(high_entropy_ratio_buf));
+  detail_value(r->script_snippet, "path_entropy", path_entropy_buf, sizeof(path_entropy_buf));
+  detail_value(r->script_snippet, "content_entropy", content_entropy_buf, sizeof(content_entropy_buf));
+  detail_value(r->script_snippet, "content_sample_bytes", content_sample_bytes_buf, sizeof(content_sample_bytes_buf));
+  detail_value(r->script_snippet, "old_ext", old_ext_buf, sizeof(old_ext_buf));
+  detail_value(r->script_snippet, "new_ext", new_ext_buf, sizeof(new_ext_buf));
+  detail_value(r->script_snippet, "signer", signer_buf, sizeof(signer_buf));
+  detail_value(r->script_snippet, "signature_status", signature_status_buf, sizeof(signature_status_buf));
+  detail_value(r->script_snippet, "ransomware_kind", ransomware_kind_buf, sizeof(ransomware_kind_buf));
+  detail_value(r->script_snippet, "ransomware_severity", ransomware_severity_buf, sizeof(ransomware_severity_buf));
   int rmm_policy = rmm_enterprise_policy_match(r);
   int fp_feedback = false_positive_feedback_match(r);
   const char *rmm_policy_version = getenv("EDR_DETECTION_RMM_POLICY_VERSION");
@@ -964,9 +1058,25 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"sha256\":");
   json_str(r->detection_context, sizeof(r->detection_context), r->exe_hash, 80u);
   json_cat(r->detection_context, sizeof(r->detection_context),
-           ",\"signed\":null,\"signature_trust\":{\"status\":\"%s\",\"cert_revoked_ancestor\":%s}},\"network\":{\"remote_url\":",
-           r->cert_revoked_ancestor ? "revoked_ancestor" : "unknown",
-           r->cert_revoked_ancestor ? "true" : "false");
+           ",\"old_ext\":");
+  json_str(r->detection_context, sizeof(r->detection_context), old_ext_buf, 24u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"new_ext\":");
+  json_str(r->detection_context, sizeof(r->detection_context), new_ext_buf, 24u);
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"extension_changed\":%s,\"content_entropy\":%.2f,\"content_sample_bytes\":%ld,"
+           "\"path_entropy\":%.2f,\"signed\":null,\"signature_trust\":{\"status\":",
+           extension_changed ? "true" : "false",
+           content_entropy_buf[0] ? strtod(content_entropy_buf, NULL) : 0.0,
+           content_sample_bytes_buf[0] ? strtol(content_sample_bytes_buf, NULL, 10) : 0L,
+           path_entropy_buf[0] ? strtod(path_entropy_buf, NULL) : 0.0);
+  json_str(r->detection_context, sizeof(r->detection_context),
+           signature_status_buf[0] ? signature_status_buf : (r->cert_revoked_ancestor ? "revoked_ancestor" : "unknown"),
+           80u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"signer\":");
+  json_str(r->detection_context, sizeof(r->detection_context), signer_buf, 150u);
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"signer_allowlisted\":%s,\"cert_revoked_ancestor\":%s}},\"network\":{\"remote_url\":",
+           ransom_signer_allowlisted ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false");
   json_str(r->detection_context, sizeof(r->detection_context), r->dns_query, 180u);
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"remote_ip\":");
   json_str(r->detection_context, sizeof(r->detection_context), r->net_dst, 64u);
@@ -983,7 +1093,9 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   json_cat(r->detection_context, sizeof(r->detection_context),
            "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
-           "\"ransom_behavior\":%s,\"ransom_recovery_tamper\":%s,\"ransom_note\":%s,\"ransom_note_burst\":%s,"
+           "\"ransom_behavior\":%s,\"ransom_canary\":%s,\"ransom_counter_allowlisted\":%s,"
+           "\"ransom_signer_allowlisted\":%s,\"extension_changed\":%s,\"high_content_entropy\":%s,"
+           "\"ransom_recovery_tamper\":%s,\"ransom_note\":%s,\"ransom_note_burst\":%s,"
            "\"security_product_kill\":%s,\"ransom_chain_score\":%d,"
            "\"webshell_semantic\":%s,\"persistence_change\":%s,"
            "\"silverfox_attack_chain\":%s,\"rmm_policy_match\":%s,\"false_positive_feedback\":%s,"
@@ -991,7 +1103,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            d->has_remote ? "true" : "false", d->suspicious_parent ? "true" : "false",
            d->allowlisted_path ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false",
            script_sensor ? "true" : "false", tls_anomaly ? "true" : "false",
-           ransom_burst ? "true" : "false", ransom_recovery ? "true" : "false",
+           ransom_burst ? "true" : "false", ransom_canary ? "true" : "false",
+           ransom_counter_allowlisted ? "true" : "false", ransom_signer_allowlisted ? "true" : "false",
+           extension_changed ? "true" : "false", high_content_entropy ? "true" : "false",
+           ransom_recovery ? "true" : "false",
            ransom_note ? "true" : "false", ransom_note_burst ? "true" : "false",
            security_kill ? "true" : "false",
            ransom_chain.score, webshell_semantic ? "true" : "false",
@@ -1002,15 +1117,55 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            "\"ransom_control\":{\"version\":");
   json_str(r->detection_context, sizeof(r->detection_context), EDR_RANSOM_CONTROL_VERSION, 40u);
   json_cat(r->detection_context, sizeof(r->detection_context),
-           ",\"phase\":\"%s\",\"note_count\":%ld,\"note_min_files\":%d,"
-           "\"note_window_s\":%d,\"candidate_score\":%d,\"p0_score\":%d,"
-           "\"direct_emit_single_note\":false},",
-           ransom_chain.score >= chain_p0_score ? "p0" :
+           ",\"phase\":\"%s\",\"kind\":",
+           ransom_canary ? "p0" : (ransom_chain.score >= chain_p0_score ? "p0" :
            (ransom_chain.score >= chain_candidate_score ? "candidate" :
-            (ransom_note ? "single_note_observed" : "baseline")),
+            (ransom_note ? "single_note_observed" : "baseline"))));
+  if (ransomware_kind_buf[0]) {
+    json_str(r->detection_context, sizeof(r->detection_context), ransomware_kind_buf, 64u);
+  } else if (ransom_canary) {
+    json_str(r->detection_context, sizeof(r->detection_context), "DETERMINISTIC_ENCRYPTION", 64u);
+  } else if (ransom_chain.score >= chain_p0_score) {
+    json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_CONFIRMED", 64u);
+  } else if (ransom_burst || ransom_chain.score >= chain_candidate_score) {
+    json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_SUSPECTED", 64u);
+  } else {
+    json_str(r->detection_context, sizeof(r->detection_context), "", 64u);
+  }
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"severity\":%ld,\"canary\":%s,\"allowlisted\":%s,\"counter_suppressed\":%s,"
+           "\"file_rate_per_min\":%.0f,\"ext_count\":%ld,\"dir_count\":%ld,"
+           "\"extension_changed\":%s,\"old_ext\":",
+           ransomware_severity_buf[0] ? strtol(ransomware_severity_buf, NULL, 10) :
+           (ransom_canary || ransom_chain.score >= chain_p0_score ? 4L :
+            (ransom_burst || ransom_chain.score >= chain_candidate_score ? 3L : 0L)),
+           ransom_canary ? "true" : "false",
+           ransom_counter_allowlisted ? "true" : "false",
+           ransom_counter_allowlisted ? "true" : "false",
+           file_rate_buf[0] ? strtod(file_rate_buf, NULL) : 0.0,
+           ext_burst_buf[0] ? strtol(ext_burst_buf, NULL, 10) : 0L,
+           dir_burst_buf[0] ? strtol(dir_burst_buf, NULL, 10) : 0L,
+           extension_changed ? "true" : "false");
+  json_str(r->detection_context, sizeof(r->detection_context), old_ext_buf, 24u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"new_ext\":");
+  json_str(r->detection_context, sizeof(r->detection_context), new_ext_buf, 24u);
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"entropy_delta\":%.2f,\"high_entropy_ratio\":%.2f,"
+           "\"content_entropy\":%.2f,\"content_sample_bytes\":%ld,\"path_entropy\":%.2f,"
+           "\"signer_allowlisted\":%s,\"tree_root_pid\":%u,"
+           "\"note_count\":%ld,\"note_min_files\":%d,"
+           "\"note_window_s\":%d,\"candidate_score\":%d,\"p0_score\":%d,"
+           "\"direct_emit_single_note\":false,\"attribution_key\":\"tree:%u\"},",
+           entropy_delta_buf[0] ? strtod(entropy_delta_buf, NULL) : 0.0,
+           high_entropy_ratio_buf[0] ? strtod(high_entropy_ratio_buf, NULL) : 0.0,
+           content_entropy_buf[0] ? strtod(content_entropy_buf, NULL) : 0.0,
+           content_sample_bytes_buf[0] ? strtol(content_sample_bytes_buf, NULL, 10) : 0L,
+           path_entropy_buf[0] ? strtod(path_entropy_buf, NULL) : 0.0,
+           ransom_signer_allowlisted ? "true" : "false",
+           (unsigned)tree_root_pid,
            note_count_buf[0] ? strtol(note_count_buf, NULL, 10) : 0L,
            ransom_note_policy_min_files(), ransom_note_policy_window_s(),
-           chain_candidate_score, chain_p0_score);
+           chain_candidate_score, chain_p0_score, (unsigned)tree_root_pid);
   if (d->suppress) {
     float before = d->confidence_before_suppression > 0.0f ? d->confidence_before_suppression : d->confidence;
     json_cat(r->detection_context, sizeof(r->detection_context),
@@ -1088,6 +1243,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int inject = is_injection_event(r);
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
+  int ransom_canary = has_ransom_canary_indicator(r);
   int ransom_burst = has_ransom_burst_indicator(r);
   int ransom_note = has_ransom_note_indicator(r);
   int ransom_note_burst = has_ransom_note_burst_indicator(r);
@@ -1159,6 +1315,11 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (ransom) {
     score += 0.24f;
     add_reason(out->reason, sizeof(out->reason), "ransom_recovery_tamper");
+  }
+  if (ransom_canary) {
+    score = score < 0.95f ? 0.95f : score;
+    context_correlated = 1;
+    add_reason(out->reason, sizeof(out->reason), "ransom_canary_deterministic_encryption");
   }
   if (ransom_burst) {
     score += ransom ? 0.18f : 0.28f;
@@ -1270,7 +1431,8 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     score -= remote ? 0.18f : 0.28f;
     add_reason(out->reason, sizeof(out->reason), "rmm_enterprise_allowlist_policy");
   }
-  if (allow && !remote && !script && !parent && !silverfox && r->type != EDR_EVENT_PROTOCOL_SHELLCODE &&
+  if (allow && !remote && !script && !parent && !silverfox && !ransom_canary && !ransom_burst &&
+      !ransom_note && !security_kill && r->type != EDR_EVENT_PROTOCOL_SHELLCODE &&
       r->type != EDR_EVENT_WEBSHELL_DETECTED) {
     set_suppression(out, score, "allowlisted_path", "EDR_DETECTION_POLICY_VERSION");
     score -= 0.18f;
@@ -1296,7 +1458,9 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   out->allowlisted_path = allow ? 1u : 0u;
   out->context_correlated = context_correlated ? 1u : 0u;
   out->persistence_change = persistence ? 1u : 0u;
-  if (ransom_chain.score >= chain_p0_score && r->priority > 0u) {
+  if (ransom_canary && r->priority > 0u) {
+    r->priority = 0u;
+  } else if (ransom_chain.score >= chain_p0_score && r->priority > 0u) {
     r->priority = 0u;
   } else if (ransom_chain.score >= chain_candidate_score && r->priority > 1u) {
     r->priority = 1u;

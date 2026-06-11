@@ -33,7 +33,7 @@ option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active p
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 set(EDR_P0_RULES_BUNDLE_VERSION
-  "edr-dynamic-rules-v1-r247-471cb221"
+  "edr-dynamic-rules-v1-r252-e2377a0d"
   CACHE STRING "P0/dynamic rule bundle version")
 set(EDR_AGENT_VERSION_STRING
   "${PROJECT_VERSION}"
@@ -904,6 +904,7 @@ if(MSVC)
   target_compile_options(test_detection_sensor_bridge PRIVATE /W4 /WX-)
 else()
   target_compile_options(test_detection_sensor_bridge PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  target_link_libraries(test_detection_sensor_bridge PRIVATE m)
 endif()
 add_test(NAME detection_sensor_bridge COMMAND test_detection_sensor_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 

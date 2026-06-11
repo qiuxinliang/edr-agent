@@ -3,7 +3,17 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <stdlib.h>
+static void test_setenv(const char *k, const char *v) { _putenv_s(k, v); }
+static void test_unsetenv(const char *k) { _putenv_s(k, ""); }
+#else
+static void test_setenv(const char *k, const char *v) { setenv(k, v, 1); }
+static void test_unsetenv(const char *k) { unsetenv(k); }
+#endif
 
 static void fill_slot(EdrEventSlot *slot, EdrEventType type, const char *text) {
   memset(slot, 0, sizeof(*slot));
@@ -18,6 +28,15 @@ static void eval_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r, EdrDetecti
   edr_behavior_from_slot(slot, r);
   edr_detection_decision_evaluate(r, d);
   assert(!d->drop);
+}
+
+static void write_high_entropy_fixture(const char *path) {
+  FILE *f = fopen(path, "wb");
+  assert(f != NULL);
+  for (int i = 0; i < 8192; i++) {
+    fputc(i & 0xff, f);
+  }
+  fclose(f);
 }
 
 static void test_scriptblock_sensor_bridge(void) {
@@ -185,6 +204,109 @@ static void test_ransom_note_burst_counter(void) {
   assert(strstr(r.detection_context, "\"ransom_note_burst\":true") != NULL);
 }
 
+static void test_ransom_canary_deterministic_context(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=5008\n"
+            "img=C:\\Users\\alice\\AppData\\Roaming\\sync_update.exe\n"
+            "file=C:\\Users\\Public\\~$canary.docx\n");
+  eval_slot(&slot, &r, &d);
+  assert(r.priority == 0u);
+  assert(strstr(r.script_snippet, "ransom_canary=1") != NULL);
+  assert(strstr(d.reason, "ransom_canary_deterministic_encryption") != NULL);
+  assert(strstr(r.detection_context, "\"kind\":\"DETERMINISTIC_ENCRYPTION\"") != NULL);
+  assert(strstr(r.detection_context, "\"canary\":true") != NULL);
+  assert(strstr(r.detection_context, "\"severity\":4") != NULL);
+}
+
+static void test_ransom_counter_allowlist_suppresses_rate_only(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  test_setenv("EDR_RANSOM_COUNTER_ALLOWLIST", "C:\\Program Files\\TrustedBackup\\trustedbackup.exe");
+  for (int i = 0; i < 90; i++) {
+    char payload[768];
+    snprintf(payload, sizeof(payload),
+             "ETW1\n"
+             "prov=kfile\n"
+             "pid=5018\n"
+             "img=C:\\Program Files\\TrustedBackup\\trustedbackup.exe\n"
+             "file=C:\\Users\\alice\\Documents\\bulk\\doc%02d.%02dlock\n",
+             i, i);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns = 1779338700000000000LL + (int64_t)i * 10000000LL;
+    edr_behavior_from_slot(&slot, &r);
+  }
+  edr_detection_decision_evaluate(&r, &d);
+  test_unsetenv("EDR_RANSOM_COUNTER_ALLOWLIST");
+  assert(!d.drop);
+  assert(strstr(r.script_snippet, "ransom_counter_allowlisted=1") != NULL);
+  assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
+  assert(strstr(r.detection_context, "\"ransom_counter_allowlisted\":true") != NULL);
+  assert(strstr(r.detection_context, "\"counter_suppressed\":true") != NULL);
+}
+
+static void test_ransom_content_entropy_and_extension_change(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  const char *tmp = getenv("TMPDIR");
+  if (!tmp || !tmp[0]) {
+    tmp = "/tmp";
+  }
+  char path[512];
+  snprintf(path, sizeof(path), "%s/edr_ransom_entropy_fixture.locked", tmp);
+  write_high_entropy_fixture(path);
+  char payload[1024];
+  snprintf(payload, sizeof(payload),
+           "ETW1\n"
+           "prov=kfile\n"
+           "pid=5028\n"
+           "ppid=4028\n"
+           "parent_img=C:\\Users\\alice\\AppData\\Roaming\\dropper.exe\n"
+           "img=C:\\Users\\alice\\AppData\\Roaming\\encryptor.exe\n"
+           "old_file=C:\\Users\\alice\\Documents\\report.docx\n"
+           "file=%s\n",
+           path);
+  fill_slot(&slot, EDR_EVENT_FILE_RENAME, payload);
+  eval_slot(&slot, &r, &d);
+  remove(path);
+  assert(strstr(r.script_snippet, "old_ext=docx") != NULL);
+  assert(strstr(r.script_snippet, "new_ext=locked") != NULL);
+  assert(strstr(r.script_snippet, "ext_changed=1") != NULL);
+  assert(strstr(r.script_snippet, "content_entropy_ok=1") != NULL);
+  assert(strstr(r.detection_context, "\"extension_changed\":true") != NULL);
+  assert(strstr(r.detection_context, "\"content_entropy\":") != NULL);
+  assert(strstr(r.detection_context, "\"attribution_key\":\"tree:4028\"") != NULL);
+}
+
+static void test_ransom_signer_path_allowlist_suppresses_counter(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  test_setenv("EDR_RANSOM_SIGNER_ALLOWLIST", "TrustedBackup");
+  test_setenv("EDR_RANSOM_SIGNED_PATH_ALLOWLIST", "C:\\Program Files\\TrustedBackup\\");
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=5038\n"
+            "img=C:\\Program Files\\TrustedBackup\\trustedbackup.exe\n"
+            "signer=TrustedBackup Corp\n"
+            "signature_status=trusted\n"
+            "file=C:\\Users\\alice\\Documents\\bulk\\doc01.locked\n");
+  eval_slot(&slot, &r, &d);
+  test_unsetenv("EDR_RANSOM_SIGNER_ALLOWLIST");
+  test_unsetenv("EDR_RANSOM_SIGNED_PATH_ALLOWLIST");
+  assert(strstr(r.script_snippet, "ransom_counter_allowlisted=1") != NULL);
+  assert(strstr(r.script_snippet, "ransom_signer_allowlisted=1") != NULL);
+  assert(strstr(r.detection_context, "\"ransom_signer_allowlisted\":true") != NULL);
+  assert(strstr(r.detection_context, "\"signer_allowlisted\":true") != NULL);
+}
+
 static void test_webshell_semantic_bridge_keeps_yara_evidence(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
@@ -284,6 +406,10 @@ int main(void) {
   test_ransom_counter_bridge();
   test_ransom_sliding_window_counter();
   test_ransom_note_burst_counter();
+  test_ransom_canary_deterministic_context();
+  test_ransom_counter_allowlist_suppresses_rate_only();
+  test_ransom_content_entropy_and_extension_change();
+  test_ransom_signer_path_allowlist_suppresses_counter();
   test_webshell_semantic_bridge_keeps_yara_evidence();
   test_sensor_alias_bridge();
   test_registry_persistence_alias_bridge();

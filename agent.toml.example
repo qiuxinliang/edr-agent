@@ -115,7 +115,7 @@ sampling_rate_whitelist = 0.02
 #                                          # 非门控进程名保留千分比（默认30=3%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
-rules_version = "edr-dynamic-rules-v1-r247-471cb221"
+rules_version = "edr-dynamic-rules-v1-r252-e2377a0d"
 # 若本文件未显式配置 [[preprocessing.rules]]，Agent 会尝试从与 agent.toml 同目录的
 # agent_preprocess_rules_v1.toml 自动加载第一版动态前置规则（可用 EDR_PREPROCESS_RULES_BUNDLE_PATH 覆盖路径）。
 
@@ -332,6 +332,17 @@ collector_output_dir = ""
 # 留空则由 [platform].rest_base_url 推导；也可用 EDR_FORENSIC_UPLOAD_URL 覆盖
 collector_upload_url = ""
 trigger_on_mitre = ["T1059", "T1547", "T1543", "T1003"]
+
+# =========================
+# [health_monitor] Agent 健康监测
+# 默认关闭；通常由终端管理详情页按主机临时开启，并带 TTL 自动停止。
+# =========================
+[health_monitor]
+enabled = false
+profile = "basic"
+interval_s = 60
+expires_at_unix_ms = 0
+request_id = ""
 
 # =========================
 # [shell] 远程 Shell 会话配置

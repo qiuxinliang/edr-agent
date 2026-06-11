@@ -52,12 +52,12 @@
     "file_path_contains": 28,
     "file_path_prefixes": 0,
     "process_name_prefixes": 0,
-    "process_names": 81,
+    "process_names": 86,
     "registry_path_contains": 18,
     "registry_path_prefixes": 0,
     "remote_ports": 31
   },
-  "enabled_rules": 161,
+  "enabled_rules": 166,
   "file_path_contains": [
     "\\apache\\htdocs\\",
     "\\appdata\\local\\temp\\",
@@ -89,8 +89,8 @@
     "restore-files"
   ],
   "file_path_prefixes": [],
-  "generated_at": "2026-06-01T12:38:51.786975Z",
-  "interest_version": "sensor-interest-v1-95d8daf9d180",
+  "generated_at": "2026-06-11T03:49:24.096257Z",
+  "interest_version": "sensor-interest-v1-d5e20ae77f22",
   "kind": "edr_sensor_interest_manifest",
   "process_name_prefixes": [],
   "process_names": [
@@ -109,11 +109,15 @@
     "cmdkey.exe",
     "cmstp.exe",
     "computerdefaults.exe",
+    "conhost.exe",
     "cscript.exe",
     "curl.exe",
+    "desktopimgdownldr.exe",
     "eqnedt32.exe",
     "et.exe",
     "excel.exe",
+    "explorer.exe",
+    "finger.exe",
     "firefox.exe",
     "forfiles.exe",
     "format.com",
@@ -121,6 +125,7 @@
     "fsutil.exe",
     "iexplore.exe",
     "installutil.exe",
+    "mpcmdrun.exe",
     "msaccess.exe",
     "msbuild.exe",
     "msedge.exe",
@@ -230,7 +235,7 @@
     27017,
     47001
   ],
-  "rules_bundle_version": "edr-dynamic-rules-v1-r247-471cb221",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-e2377a0d",
   "schema_version": 1,
   "source_dynamic_rules": "dynamic_rules_v1.json"
 }

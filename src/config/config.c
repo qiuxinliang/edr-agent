@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r247-471cb221"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r252-e2377a0d"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -976,6 +976,31 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
   }
 }
 
+static void load_health_monitor(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->health_monitor.enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "profile"), cfg->health_monitor.profile,
+              sizeof(cfg->health_monitor.profile));
+  {
+    toml_datum_t d = toml_int_in(t, "interval_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->health_monitor.interval_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "expires_at_unix_ms");
+    if (d.ok && d.u.i >= 0) {
+      cfg->health_monitor.expires_at_unix_ms = (uint64_t)d.u.i;
+    }
+  }
+  take_string(toml_string_in(t, "request_id"), cfg->health_monitor.request_id,
+              sizeof(cfg->health_monitor.request_id));
+}
+
 static void load_logging(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "level"), cfg->logging.level, sizeof(cfg->logging.level));
   take_string(toml_string_in(t, "log_dir"), cfg->logging.log_dir, sizeof(cfg->logging.log_dir));
@@ -1491,6 +1516,23 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->ave.static_infer_cache_ttl_s > 864000u) {
     cfg->ave.static_infer_cache_ttl_s = 864000u;
   }
+  if (cfg->health_monitor.profile[0] == '\0') {
+    snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+  } else {
+    for (size_t i = 0; i < sizeof(cfg->health_monitor.profile) && cfg->health_monitor.profile[i]; i++) {
+      cfg->health_monitor.profile[i] = (char)tolower((unsigned char)cfg->health_monitor.profile[i]);
+    }
+    if (strcmp(cfg->health_monitor.profile, "basic") != 0 &&
+        strcmp(cfg->health_monitor.profile, "diagnostic") != 0) {
+      snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+    }
+  }
+  if (cfg->health_monitor.interval_s < 30u) {
+    cfg->health_monitor.interval_s = 30u;
+  }
+  if (cfg->health_monitor.interval_s > 3600u) {
+    cfg->health_monitor.interval_s = 3600u;
+  }
   {
     const char *e = getenv("EDR_AVE_CERT_REVOCATION");
     if (e && e[0] == '1') {
@@ -1622,6 +1664,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.webshell_scan_mb_per_min = 64u;
   cfg->resource_limit.shellcode_packets_per_sec = 2000u;
   cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
+
+  cfg->health_monitor.enabled = false;
+  snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+  cfg->health_monitor.interval_s = 60u;
+  cfg->health_monitor.expires_at_unix_ms = 0u;
+  cfg->health_monitor.request_id[0] = '\0';
 
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
 #ifdef _WIN32
@@ -2227,6 +2275,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "resource_limit");
     if (t) {
       load_resource_limit(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "health_monitor");
+    if (t) {
+      load_health_monitor(t, cfg);
     }
   }
   {

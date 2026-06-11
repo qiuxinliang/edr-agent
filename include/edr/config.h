@@ -173,6 +173,15 @@ typedef struct EdrConfig {
     uint32_t low_priority_keep_percent_under_pressure;
   } resource_limit;
 
+  /** Agent health monitor is opt-in and usually enabled per endpoint from the platform. */
+  struct {
+    bool enabled;
+    char profile[32];
+    uint32_t interval_s;
+    uint64_t expires_at_unix_ms;
+    char request_id[128];
+  } health_monitor;
+
   struct {
     char level[16];
     char log_dir[1024];

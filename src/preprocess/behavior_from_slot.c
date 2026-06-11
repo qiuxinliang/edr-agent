@@ -1,6 +1,7 @@
 #include "edr/behavior_from_slot.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -10,6 +11,7 @@ static uint64_t g_event_seq;
 
 #define RANSOM_COUNTER_BUCKETS 128u
 #define RANSOM_COUNTER_EXTS 24u
+#define RANSOM_COUNTER_DIRS 16u
 #define RANSOM_NOTE_BUCKETS 128u
 #define RANSOM_NOTE_FILES 16u
 
@@ -18,8 +20,11 @@ typedef struct {
   char dir[256];
   int64_t window_start_ns;
   uint32_t file_events;
+  uint32_t high_entropy_events;
   char exts[RANSOM_COUNTER_EXTS][16];
+  char dirs[RANSOM_COUNTER_DIRS][128];
   uint8_t ext_count;
+  uint8_t dir_count;
   double entropy_avg;
 } RansomCounterBucket;
 
@@ -112,6 +117,74 @@ static int has_ci_ascii(const char *hay, const char *needle) {
     }
   }
   return 0;
+}
+
+static int token_list_has_ci_ascii(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ' ') {
+      p++;
+    }
+    char tok[256];
+    size_t n = 0u;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t')) {
+      n--;
+    }
+    tok[n] = '\0';
+    if (tok[0] && has_ci_ascii(value, tok)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int file_token_list_has_ci_ascii(const char *path, const char *value) {
+  if (!path || !path[0] || !value || !value[0]) {
+    return 0;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  char buf[4096];
+  size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+  fclose(f);
+  buf[n] = '\0';
+  return token_list_has_ci_ascii(buf, value);
+}
+
+static int ransom_policy_token_match(const char *env_inline, const char *env_file, const char *fallback,
+                                     const char *value) {
+  const char *list = getenv(env_inline);
+  if (list && list[0] && token_list_has_ci_ascii(list, value)) {
+    return 1;
+  }
+  const char *file = getenv(env_file);
+  if (file && file[0] && file_token_list_has_ci_ascii(file, value)) {
+    return 1;
+  }
+  return fallback && fallback[0] && token_list_has_ci_ascii(fallback, value);
+}
+
+static int env_int_clamped(const char *name, int fallback, int lo, int hi) {
+  const char *v = getenv(name);
+  long n = v && v[0] ? strtol(v, NULL, 10) : (long)fallback;
+  if (n < (long)lo) {
+    n = (long)lo;
+  }
+  if (n > (long)hi) {
+    n = (long)hi;
+  }
+  return (int)n;
 }
 
 static int ends_ci_ascii(const char *s, const char *suffix) {
@@ -214,15 +287,73 @@ static double path_entropy_score(const char *path) {
   return ((double)uniq / (double)len) * 8.0;
 }
 
+static int file_content_entropy_sample(const char *path, double *out_entropy, size_t *out_bytes) {
+  if (out_entropy) {
+    *out_entropy = 0.0;
+  }
+  if (out_bytes) {
+    *out_bytes = 0u;
+  }
+  if (!path || !path[0]) {
+    return 0;
+  }
+  int cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
+  if (cap <= 0) {
+    return 0;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  unsigned long counts[256];
+  memset(counts, 0, sizeof(counts));
+  unsigned char buf[4096];
+  size_t total = 0u;
+  while (total < (size_t)cap) {
+    size_t want = sizeof(buf);
+    if ((size_t)cap - total < want) {
+      want = (size_t)cap - total;
+    }
+    size_t n = fread(buf, 1u, want, f);
+    if (n == 0u) {
+      break;
+    }
+    for (size_t i = 0; i < n; i++) {
+      counts[buf[i]]++;
+    }
+    total += n;
+  }
+  fclose(f);
+  if (out_bytes) {
+    *out_bytes = total;
+  }
+  if (total == 0u) {
+    return 0;
+  }
+  double entropy = 0.0;
+  for (size_t i = 0; i < 256u; i++) {
+    if (counts[i] == 0ul) {
+      continue;
+    }
+    double p = (double)counts[i] / (double)total;
+    entropy -= p * (log(p) / log(2.0));
+  }
+  if (out_entropy) {
+    *out_entropy = entropy;
+  }
+  return 1;
+}
+
 static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int64_t now_ns, int64_t window_ns) {
   RansomCounterBucket *empty = NULL;
   RansomCounterBucket *oldest = &g_ransom_buckets[0];
+  uint32_t key_pid = pid ? pid : 1u;
   for (size_t i = 0; i < RANSOM_COUNTER_BUCKETS; i++) {
     RansomCounterBucket *b = &g_ransom_buckets[i];
-    if (b->pid == pid && strcmp(b->dir, dir) == 0) {
+    if (b->pid == key_pid) {
       if (b->window_start_ns <= 0 || now_ns - b->window_start_ns > window_ns) {
         memset(b, 0, sizeof(*b));
-        b->pid = pid;
+        b->pid = key_pid;
         snprintf(b->dir, sizeof(b->dir), "%s", dir);
         b->window_start_ns = now_ns;
       }
@@ -237,7 +368,7 @@ static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int
   }
   RansomCounterBucket *b = empty ? empty : oldest;
   memset(b, 0, sizeof(*b));
-  b->pid = pid ? pid : 1u;
+  b->pid = key_pid;
   snprintf(b->dir, sizeof(b->dir), "%s", dir);
   b->window_start_ns = now_ns;
   return b;
@@ -255,6 +386,29 @@ static int ext_seen_or_add(RansomCounterBucket *b, const char *ext) {
   if (b->ext_count < RANSOM_COUNTER_EXTS) {
     snprintf(b->exts[b->ext_count], sizeof(b->exts[b->ext_count]), "%s", ext);
     b->ext_count++;
+  }
+  return 0;
+}
+
+static int dir_seen_or_add(RansomCounterBucket *b, const char *dir) {
+  if (!b || !dir || !dir[0]) {
+    return 0;
+  }
+  char compact[128];
+  size_t n = 0u;
+  while (*dir && n + 1u < sizeof(compact)) {
+    char c = fold_ascii(*dir++);
+    compact[n++] = c;
+  }
+  compact[n] = '\0';
+  for (uint8_t i = 0; i < b->dir_count; i++) {
+    if (strcmp(b->dirs[i], compact) == 0) {
+      return 1;
+    }
+  }
+  if (b->dir_count < RANSOM_COUNTER_DIRS) {
+    snprintf(b->dirs[b->dir_count], sizeof(b->dirs[b->dir_count]), "%s", compact);
+    b->dir_count++;
   }
   return 0;
 }
@@ -335,6 +489,62 @@ static int is_ransom_note_like_path(const char *path) {
          has_ci_ascii(base, "use_to_repair") || has_ci_ascii(base, "ransom");
 }
 
+static int is_ransom_canary_path(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  const char *fallback =
+      "~$canary,edr_canary,.edr-canary,edr-canary,canary.doc,canary.docx,canary.xlsx,canary.txt,"
+      "~edr_canary,~$edr_canary";
+  return ransom_policy_token_match("EDR_RANSOM_CANARY_TOKENS", "EDR_RANSOM_CANARY_TOKENS_FILE",
+                                   fallback, path);
+}
+
+static int ransom_signature_trusted(const EdrBehaviorRecord *r) {
+  const char *s = r ? r->script_snippet : "";
+  return has_ci_ascii(s, "signature_status=trusted") || has_ci_ascii(s, "signature_status=valid") ||
+         has_ci_ascii(s, "signature_status=verified") || has_ci_ascii(s, "signature_status=ok") ||
+         has_ci_ascii(s, "signed=1") || has_ci_ascii(s, "signed=true");
+}
+
+static int ransom_signer_allowlisted(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  char subject[12288];
+  snprintf(subject, sizeof(subject), "%s %s %s %s %s",
+           r->process_name, r->exe_path, r->cmdline, r->file_path, r->script_snippet);
+  int signer_ok = ransom_policy_token_match("EDR_RANSOM_SIGNER_ALLOWLIST",
+                                             "EDR_RANSOM_SIGNER_ALLOWLIST_FILE", "", subject);
+  if (!signer_ok) {
+    return 0;
+  }
+  char path_subject[8192];
+  snprintf(path_subject, sizeof(path_subject), "%s %s %s", r->exe_path, r->cmdline, r->process_name);
+  int path_ok = ransom_policy_token_match("EDR_RANSOM_SIGNED_PATH_ALLOWLIST",
+                                           "EDR_RANSOM_SIGNED_PATH_ALLOWLIST_FILE", "", path_subject);
+  if (!path_ok) {
+    return 0;
+  }
+  const char *require = getenv("EDR_RANSOM_REQUIRE_TRUSTED_SIGNATURE");
+  if (require && require[0] && strcmp(require, "0") != 0 && !ransom_signature_trusted(r)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int ransom_counter_allowlisted(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  char subject[8192];
+  snprintf(subject, sizeof(subject), "%s %s %s %s",
+           r->process_name, r->exe_path, r->cmdline, r->file_path);
+  return ransom_policy_token_match("EDR_RANSOM_COUNTER_ALLOWLIST", "EDR_RANSOM_COUNTER_ALLOWLIST_FILE",
+                                   "", subject) ||
+         ransom_signer_allowlisted(r);
+}
+
 static RansomNoteBucket *ransom_note_bucket_for(uint32_t pid, int64_t now_ns, int64_t window_ns) {
   RansomNoteBucket *empty = NULL;
   RansomNoteBucket *oldest = &g_ransom_note_buckets[0];
@@ -398,11 +608,25 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   char ext[16];
   dirname_c(r->file_path, dir, sizeof(dir));
   extension_c(r->file_path, ext, sizeof(ext));
+  int ext_changed = has_ci_ascii(r->script_snippet, "ext_changed=1");
+  int canary = is_ransom_canary_path(r->file_path);
+  if (canary) {
+    append_record_kv(r, "ransom_canary=1 ransomware_kind=DETERMINISTIC_ENCRYPTION ransomware_severity=4");
+  }
+  if (!canary && ransom_counter_allowlisted(r)) {
+    append_record_kv(r, "ransom_counter_allowlisted=1%s", ransom_signer_allowlisted(r) ? " ransom_signer_allowlisted=1" : "");
+    return;
+  }
   RansomCounterBucket *b = ransom_bucket_for(r->pid ? r->pid : 1u, dir, now_ns, window_ns);
-  double entropy = path_entropy_score(r->file_path);
+  double path_entropy = path_entropy_score(r->file_path);
+  double content_entropy = 0.0;
+  size_t content_sample = 0u;
+  int content_ok = file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
+  double entropy = content_ok ? content_entropy : path_entropy;
   double prev = b->entropy_avg;
   b->file_events++;
   (void)ext_seen_or_add(b, ext);
+  (void)dir_seen_or_add(b, dir);
   if (b->file_events == 1u || prev <= 0.0) {
     b->entropy_avg = entropy;
   } else {
@@ -417,13 +641,36 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   if (entropy_delta < 0.0) {
     entropy_delta = 0.0;
   }
+  int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
+  if (content_high || entropy >= 4.0 || entropy_delta >= 1.5) {
+    b->high_entropy_events++;
+  }
+  int warn_files = env_int_clamped("EDR_RANSOM_RATE_WARN_FILES", 60, 8, 500);
+  int confirm_files = env_int_clamped("EDR_RANSOM_RATE_CONFIRM_FILES", 200, 20, 2000);
+  int warn_dirs = env_int_clamped("EDR_RANSOM_RATE_WARN_DIRS", 4, 1, 32);
+  int confirm_dirs = env_int_clamped("EDR_RANSOM_RATE_CONFIRM_DIRS", 8, 1, 64);
   int enough_volume = b->file_events >= 20u;
   int suspicious = (enough_volume && file_rate >= 120.0) ||
                    (b->file_events >= 12u && b->ext_count >= 8u) ||
-                   (b->file_events >= 8u && entropy_delta >= 1.5);
-  append_record_kv(r, "file_rate=%.0f ext_burst=%u entropy_delta=%.2f%s",
-                   file_rate, (unsigned)b->ext_count, entropy_delta,
-                   suspicious ? " ransom_counter=1" : "");
+                   (b->file_events >= 8u && entropy_delta >= 1.5) ||
+                   (b->file_events >= 6u && ext_changed && content_high) ||
+                   ((int)b->file_events >= warn_files &&
+                    ((int)b->dir_count >= warn_dirs || b->ext_count >= 8u));
+  double high_entropy_ratio = b->file_events > 0u ? (double)b->high_entropy_events / (double)b->file_events : 0.0;
+  int confirmed = canary ||
+                  ((int)b->file_events >= confirm_files &&
+                   ((int)b->dir_count >= confirm_dirs || b->ext_count >= 12u || high_entropy_ratio >= 0.70)) ||
+                  (suspicious && file_rate >= 300.0 && b->ext_count >= 12u) ||
+                  (suspicious && ext_changed && content_high && b->file_events >= 20u);
+  append_record_kv(r,
+                   "file_rate=%.0f ext_burst=%u dir_burst=%u entropy_delta=%.2f high_entropy_ratio=%.2f "
+                   "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d%s%s%s",
+                   file_rate, (unsigned)b->ext_count, (unsigned)b->dir_count, entropy_delta,
+                   high_entropy_ratio, path_entropy, content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
+                   (suspicious || confirmed) ? " ransom_counter=1" : "",
+                   confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
+                   (suspicious ? " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3" : ""),
+                   canary ? " canary_counter_bypass=1" : "");
 
   if (is_ransom_note_like_path(r->file_path)) {
     RansomNoteBucket *nb = ransom_note_bucket_for(r->pid ? r->pid : 1u, now_ns, ransom_note_window_ns());
@@ -438,6 +685,9 @@ typedef struct {
   char img[EDR_BR_STR_LONG];
   char cmd[EDR_BR_STR_LONG];
   char file[EDR_BR_STR_LONG];
+  char old_file[EDR_BR_STR_LONG];
+  char signer[512];
+  char signature_status[96];
   char qname[EDR_BR_STR_MID];
   char script[EDR_BR_STR_LONG];
   char url[EDR_BR_STR_MID];
@@ -575,11 +825,28 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->has_cmd = 1;
   } else if (strcmp(key, "path") == 0 && !f->file[0]) {
     snprintf(f->file, sizeof(f->file), "%s", val);
+  } else if (strcmp(key, "old_file") == 0 || strcmp(key, "old_path") == 0 ||
+             strcmp(key, "source_file") == 0 || strcmp(key, "source_path") == 0 ||
+             strcmp(key, "previous_file") == 0 || strcmp(key, "previous_path") == 0 ||
+             strcmp(key, "rename_from") == 0) {
+    snprintf(f->old_file, sizeof(f->old_file), "%s", val);
+  } else if (strcmp(key, "new_file") == 0 || strcmp(key, "new_path") == 0 ||
+             strcmp(key, "target_file") == 0 || strcmp(key, "target_path") == 0 ||
+             strcmp(key, "rename_to") == 0) {
+    snprintf(f->file, sizeof(f->file), "%s", val);
   } else if (strcmp(key, "cert_revoked_ancestor") == 0 || strcmp(key, "cert_ra") == 0) {
     f->cert_revoked_ancestor = (strtoul(val, NULL, 10) != 0u) ? 1u : 0u;
     f->has_cert_revoked_ancestor = 1;
   } else if (strcmp(key, "file") == 0) {
     snprintf(f->file, sizeof(f->file), "%s", val);
+  } else if (strcmp(key, "signer") == 0 || strcmp(key, "publisher") == 0 ||
+             strcmp(key, "signature_publisher") == 0 || strcmp(key, "cert_subject") == 0) {
+    snprintf(f->signer, sizeof(f->signer), "%s", val);
+    append_sensor_kv(f, "signer", val);
+  } else if (strcmp(key, "signature_status") == 0 || strcmp(key, "signature_trust") == 0 ||
+             strcmp(key, "signed") == 0 || strcmp(key, "verified") == 0) {
+    snprintf(f->signature_status, sizeof(f->signature_status), "%s", val);
+    append_sensor_kv(f, "signature_status", val);
   } else if (strcmp(key, "qname") == 0) {
     snprintf(f->qname, sizeof(f->qname), "%s", val);
   } else if (strcmp(key, "ip") == 0 && !f->dst[0]) {
@@ -856,6 +1123,14 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.file[0]) {
       snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
       snprintf(r->file_op, sizeof(r->file_op), "event");
+    }
+    if (ef.old_file[0]) {
+      char old_ext[16];
+      char new_ext[16];
+      extension_c(ef.old_file, old_ext, sizeof(old_ext));
+      extension_c(r->file_path[0] ? r->file_path : ef.file, new_ext, sizeof(new_ext));
+      append_record_kv(r, "old_ext=%s new_ext=%s ext_changed=%d",
+                       old_ext, new_ext, strcmp(old_ext, new_ext) != 0 ? 1 : 0);
     }
     if (ef.qname[0]) {
       snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.qname);

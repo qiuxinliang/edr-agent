@@ -98,6 +98,14 @@ static unsigned queue_drain_interval_ms(void) {
   return (unsigned)v;
 }
 
+static unsigned queue_circuit_backoff_ms(void) {
+  const char *e = getenv("EDR_QUEUE_CIRCUIT_BACKOFF_MS");
+  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 5000UL;
+  if (v < 500UL) v = 500UL;
+  if (v > 60000UL) v = 60000UL;
+  return (unsigned)v;
+}
+
 static unsigned queue_drain_max_rows(void) {
   const char *e = getenv("EDR_QUEUE_DRAIN_MAX_ROWS");
   unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 32UL;
@@ -516,16 +524,20 @@ void edr_storage_queue_poll_drain(void) {
   static uint64_t last_ns;
   uint64_t now = edr_monotonic_ns();
   uint64_t interval_ns = (uint64_t)queue_drain_interval_ms() * 1000000ULL;
+  if (!edr_grpc_client_ready() && edr_ingest_http_circuit_open()) {
+    uint64_t circuit_interval_ns = (uint64_t)queue_circuit_backoff_ms() * 1000000ULL;
+    if (now - last_ns < circuit_interval_ns) {
+      return;
+    }
+    last_ns = now;
+    return;
+  }
   if (now - last_ns < interval_ns) {
     return;
   }
   if (!s_db || s_pending == 0u) {
     last_ns = now;
     cleanup_expired_rows();
-    return;
-  }
-  if (!edr_grpc_client_ready() && edr_ingest_http_circuit_open()) {
-    last_ns = now;
     return;
   }
   last_ns = now;
