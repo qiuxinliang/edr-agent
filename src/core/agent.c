@@ -567,7 +567,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&avst, 0, sizeof(avst));
   int ave_ok = 0;
 
-  char rules_ver[96], static_ver[48], behavior_ver[48], ioc_ver[48];
+  char rules_ver[96], runtime_policy_raw[96], runtime_policy_ver[96];
+  char static_ver[48], behavior_ver[48], ioc_ver[48];
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char grpc_err[192], http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
@@ -612,6 +613,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
   json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
+  runtime_policy_raw[0] = '\0';
+  edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
+  json_escape_small(runtime_policy_raw, runtime_policy_ver, sizeof(runtime_policy_ver));
   json_escape_small(grpc_rt.last_error, grpc_err, sizeof(grpc_err));
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
   json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
@@ -680,7 +684,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"metadata\":%llu}}"
         "}}",
         agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
-        rules_ver[0] ? rules_ver : "local",
+        runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
         (unsigned long long)wall_ms, health_profile[0] ? health_profile : "basic",
         agent->cfg.health_monitor.interval_s,
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
@@ -774,6 +778,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
   json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
+  runtime_policy_raw[0] = '\0';
+  edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
+  json_escape_small(runtime_policy_raw, runtime_policy_ver, sizeof(runtime_policy_ver));
   json_escape_small(agent->cfg.detection_policy.source, det_policy_source, sizeof(det_policy_source));
   json_escape_small(agent->cfg.detection_policy.policy_version, det_policy_version, sizeof(det_policy_version));
   json_escape_small(agent->cfg.detection_policy.rollback_version, det_policy_rollback, sizeof(det_policy_rollback));
@@ -943,7 +950,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"max_file_size_mb\":%u,\"scan_threads\":%u,\"last_degrade_reason\":\"%s\"},"
       "%s"
       "}}",
-      agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING, rules_ver[0] ? rules_ver : "local",
+      agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
+      runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
       (unsigned long long)wall_ms,
       health_profile[0] ? health_profile : "basic", agent->cfg.health_monitor.interval_s,
       (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
