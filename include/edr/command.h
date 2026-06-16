@@ -1,7 +1,7 @@
 /**
- * §8 响应指令 — Subscribe 收到 CommandEnvelope 后转入此入口（隔离/杀进程/取证/PMFE/AVE/自保护状态等）。
+ * §8 响应指令 — HTTPS control stream / long-poll 收到 CommandEnvelope 后转入此入口（隔离/杀进程/取证/PMFE/AVE/自保护状态等）。
  * 高危操作需 **`EDR_CMD_ENABLED=1`** / **`EDR_CMD_DANGEROUS=1`** 或配置 **`[command] allow_dangerous`**。
- * SOAR：编排字段见 `EdrSoarCommandMeta`；执行结果经 gRPC `ReportCommandResult` 回传（见 docs/SOAR_CONTRACT.md）。
+ * SOAR：编排字段见 `EdrSoarCommandMeta`；执行结果优先经 HTTPS ingest 回传，legacy gRPC 仅显式启用时 fallback。
  */
 #ifndef EDR_COMMAND_H
 #define EDR_COMMAND_H
@@ -49,7 +49,7 @@ typedef enum EdrCommandExecutionStatus {
 } EdrCommandExecutionStatus;
 
 /**
- * 处理服务端下发的指令（来自 gRPC Subscribe 流）。
+ * 处理服务端下发的指令（来自 HTTPS control stream / long-poll；legacy gRPC Subscribe 仅兼容期使用）。
  * command_id / command_type 为 UTF-8 字符串；payload 可为空。
  * soar_meta 为 NULL 表示无非编排扩展（旧服务端或纯本地指令）。
  */

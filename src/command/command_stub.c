@@ -292,9 +292,9 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
            retryable ? "true" : "false", raw);
   int report_pending = 0;
   if (command_should_report(cmd_id, sm)) {
-    int rc = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+    int rc = edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
     if (rc != 0) {
-      rc = edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+      rc = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
     }
     report_pending = (rc != 0);
   }
@@ -872,6 +872,13 @@ static void do_self_protect_status(const char *cmd_id, const EdrSoarCommandMeta 
 static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size_t len,
                                      const EdrSoarCommandMeta *sm) {
   char addr[256];
+  if (!(s_bound_cfg && s_bound_cfg->server.grpc_enabled) &&
+      !env_truthy_cmd("EDR_ENABLE_LEGACY_GRPC") && !env_truthy_cmd("EDR_LEGACY_GRPC_ENABLED")) {
+    s_rejected++;
+    audit_both(cmd_id, "update_server_address: legacy gRPC 未启用，拒绝切换 gRPC 目标");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 15, "legacy grpc disabled");
+    return;
+  }
   if (parse_server_address_json(pl, len, addr, sizeof(addr)) != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "update_server_address: payload 需 JSON {\"server_address\":\"host:port\"}");
@@ -1923,11 +1930,11 @@ static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   char minio_key[1024];
   minio_key[0] = '\0';
-  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
-                                              minio_key, sizeof(minio_key));
+  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "rtr_get_file", path, sha,
+                                                        minio_key, sizeof(minio_key));
   if (upload_rc != 0) {
-    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "rtr_get_file", path, sha,
-                                                      minio_key, sizeof(minio_key));
+    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
+                                            minio_key, sizeof(minio_key));
   }
   char pathj[1400], keyj[1400], artifacts[3600], detail[4096];
   json_escape_to(pathj, sizeof(pathj), path);
@@ -2161,10 +2168,10 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   (void)file_sha256_hex(path, sha);
   char minio_key[1024];
   minio_key[0] = '\0';
-  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "eventlog", path, sha, minio_key, sizeof(minio_key));
+  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "eventlog", path, sha,
+                                                        minio_key, sizeof(minio_key));
   if (upload_rc != 0) {
-    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "eventlog", path, sha,
-                                                      minio_key, sizeof(minio_key));
+    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "eventlog", path, sha, minio_key, sizeof(minio_key));
   }
   char pathj[1200], channelj[256], keyj[1200], artifacts[3200], detail[4096];
   json_escape_to(pathj, sizeof(pathj), path);
@@ -2330,10 +2337,10 @@ static void do_registry_query(const char *cmd_id, const uint8_t *pl, size_t len,
   (void)file_sha256_hex(path, sha);
   char minio_key[1024];
   minio_key[0] = '\0';
-  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "registry", path, sha, minio_key, sizeof(minio_key));
+  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "registry", path, sha,
+                                                        minio_key, sizeof(minio_key));
   if (upload_rc != 0) {
-    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "registry", path, sha,
-                                                      minio_key, sizeof(minio_key));
+    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "registry", path, sha, minio_key, sizeof(minio_key));
   }
   char pathj[1200], keyj[1400], minioj[1200], artifacts[4800], detail[4800];
   json_escape_to(pathj, sizeof(pathj), path);
@@ -2619,8 +2626,8 @@ static int flush_upload_outbox_one(const char *pending_path) {
   }
   char minio_key[1024];
   minio_key[0] = '\0';
-  if (edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0 ||
-      edr_ingest_http_upload_file_multipart(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
+  if (edr_ingest_http_upload_file_multipart(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0 ||
+      edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
     char done[1100];
     snprintf(done, sizeof(done), "%s.done", pending_path);
     (void)rename(pending_path, done);
@@ -2841,11 +2848,11 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   (void)file_sha256_hex(bundle, bundle_sha);
   char upload_key[1024];
   upload_key[0] = '\0';
-  int upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
-                                              upload_key, sizeof(upload_key));
+  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
+                                                        upload_key, sizeof(upload_key));
   if (upload_rc != 0) {
-    upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
-                                                      upload_key, sizeof(upload_key));
+    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
+                                            upload_key, sizeof(upload_key));
   }
   if (upload_rc != 0) {
     write_upload_outbox(cmd_id, bundle, bundle_sha, manifest);
@@ -3451,17 +3458,17 @@ static void flush_command_result_outbox(void) {
       continue;
     }
     int rc = -1;
-    if (edr_grpc_client_ready()) {
-      rc = edr_grpc_client_report_command_result(pending[i].command_id, &sm,
-                                                 pending[i].execution_status,
-                                                 pending[i].exit_code,
-                                                 pending[i].detail);
-    }
-    if (rc != 0) {
+    if (edr_ingest_http_configured()) {
       rc = edr_ingest_http_post_command_result(pending[i].command_id, &sm,
                                                pending[i].execution_status,
                                                pending[i].exit_code,
                                                pending[i].detail);
+    }
+    if (rc != 0 && edr_grpc_client_ready()) {
+      rc = edr_grpc_client_report_command_result(pending[i].command_id, &sm,
+                                                 pending[i].execution_status,
+                                                 pending[i].exit_code,
+                                                 pending[i].detail);
     }
     if (rc == 0) {
       edr_command_state_mark_reported(&pending[i]);

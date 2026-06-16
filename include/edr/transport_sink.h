@@ -17,7 +17,7 @@ typedef int (*EdrTransportDispatchFn)(int use_http, const char *batch_id,
                                       const uint8_t *payload, size_t payload_len,
                                       void *userdata);
 
-/** 从配置登记上报目标（gRPC mTLS 使用 server.address / 证书路径） */
+/** 从配置登记上报目标；默认使用 HTTPS/TLS，legacy gRPC 仅显式启用时读取 server.address。 */
 void edr_transport_init_from_config(const struct EdrConfig *cfg);
 
 /** 与 init 配对：停止 Subscribe 线程并释放 gRPC 资源 */

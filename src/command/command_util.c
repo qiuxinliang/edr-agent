@@ -132,11 +132,11 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
     return;
   }
   int ok = -1;
-  if (edr_grpc_client_ready()) {
-    ok = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+  if (edr_ingest_http_configured()) {
+    ok = edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
   }
-  if (ok != 0 && edr_ingest_http_configured()) {
-    (void)edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+  if (ok != 0 && edr_grpc_client_ready()) {
+    (void)edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
   }
 }
 

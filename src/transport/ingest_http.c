@@ -34,6 +34,10 @@
 #include <openssl/rand.h>
 #endif
 
+#ifdef EDR_HAVE_CURL_HTTP2
+#include <curl/curl.h>
+#endif
+
 #ifdef _WIN32
 typedef SOCKET EdrSocket;
 #define EDR_SOCKET_INVALID INVALID_SOCKET
@@ -84,6 +88,17 @@ static unsigned long s_upload_ok;
 static unsigned long s_upload_fail;
 static unsigned long s_long_poll_ok;
 static unsigned long s_long_poll_fail;
+static unsigned long s_control_stream_ok;
+static unsigned long s_control_stream_fail;
+static unsigned long s_control_stream_heartbeat;
+static unsigned long s_control_ack_ok;
+static unsigned long s_control_ack_fail;
+static unsigned long s_http2_request_ok;
+static unsigned long s_http2_request_fail;
+static unsigned long s_http2_negotiated_count;
+static unsigned long s_http2_fallback_count;
+static volatile int s_http2_negotiated;
+static char s_negotiated_protocol[16];
 static int64_t s_native_post_fail_log_until_ms;
 static unsigned long s_native_post_fail_log_suppressed;
 static int64_t s_last_success_ms;
@@ -104,6 +119,7 @@ static volatile int s_ws_backoff_ms;
 static volatile int s_poll_run;
 static int s_poll_started;
 static volatile int s_ws_ready;
+static volatile int s_stream_ready;
 static int s_ws_started;
 static volatile int s_control_hello_ok;
 static int64_t s_control_hello_last_ms;
@@ -192,6 +208,14 @@ static int env_bool_default(const char *name, int fallback) {
 static const char *env_str_default(const char *name, const char *fallback) {
   const char *e = getenv(name);
   return (e && e[0]) ? e : fallback;
+}
+
+static int http2_client_enabled(void) {
+#ifdef EDR_HAVE_CURL_HTTP2
+  return env_bool_default("EDR_HTTP2_CLIENT", 1) && env_bool_default("EDR_DATA_PLANE_HTTP2", 1);
+#else
+  return 0;
+#endif
 }
 
 static unsigned long request_limit_per_minute(void) {
@@ -366,6 +390,26 @@ static void note_long_poll_success(void) {
 
 static void note_long_poll_failure(void) {
   s_long_poll_fail++;
+}
+
+static void note_control_stream_success(void) {
+  s_control_stream_ok++;
+}
+
+static void note_control_stream_failure(void) {
+  s_control_stream_fail++;
+}
+
+static void note_control_stream_heartbeat(void) {
+  s_control_stream_heartbeat++;
+}
+
+static void note_control_ack_success(void) {
+  s_control_ack_ok++;
+}
+
+static void note_control_ack_failure(void) {
+  s_control_ack_fail++;
 }
 
 static void log_native_post_failure(const char *label, int rc) {
@@ -583,7 +627,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
            env_str_default("EDR_TELEMETRY_PROFILE_THRESHOLD", "medium"));
   s_control_sampling_pct = (unsigned)env_ul_clamped("EDR_TELEMETRY_PROFILE_SAMPLING_PCT", 100ul, 1ul, 100ul);
   s_control_backpressure_enabled = env_bool_default("EDR_BACKPRESSURE_PUSH_PROFILE_THROTTLE", 1);
-  s_control_h2 = env_bool_default("EDR_CONTROL_CAP_H2", 0);
+  s_control_h2 = env_bool_default("EDR_CONTROL_CAP_H2", 1);
   s_control_zstd = env_bool_default("EDR_CONTROL_CAP_ZSTD", 0);
   s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
 }
@@ -599,7 +643,9 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->http_fallback_available = out->configured;
   out->insecure_http = s_insecure_http;
   out->mtls_configured = (s_client_cert_file[0] && s_client_key_file[0]) ? 1 : 0;
-  out->websocket_ready = s_ws_ready ? 1 : 0;
+  out->websocket_ready = (s_ws_ready || s_stream_ready) ? 1 : 0;
+  out->http2_enabled = http2_client_enabled();
+  out->http2_negotiated = s_http2_negotiated ? 1 : 0;
   out->poll_backoff_ms = s_poll_backoff_ms;
   out->ws_backoff_ms = s_ws_backoff_ms;
   out->circuit_open = s_circuit_open ? 1 : 0;
@@ -617,6 +663,15 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->upload_fail_count = s_upload_fail;
   out->long_poll_ok_count = s_long_poll_ok;
   out->long_poll_fail_count = s_long_poll_fail;
+  out->control_stream_ok_count = s_control_stream_ok;
+  out->control_stream_fail_count = s_control_stream_fail;
+  out->control_stream_heartbeat_count = s_control_stream_heartbeat;
+  out->control_ack_ok_count = s_control_ack_ok;
+  out->control_ack_fail_count = s_control_ack_fail;
+  out->http2_request_ok_count = s_http2_request_ok;
+  out->http2_request_fail_count = s_http2_request_fail;
+  out->http2_negotiated_count = s_http2_negotiated_count;
+  out->http2_fallback_count = s_http2_fallback_count;
   out->budget_drop_count = s_budget_drop_count;
   out->last_success_unix_ms = s_last_success_ms;
   out->last_failure_unix_ms = s_last_failure_ms;
@@ -634,6 +689,8 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
            s_client_key_provider[0] ? s_client_key_provider : "pem");
   snprintf(out->mtls_status, sizeof(out->mtls_status), "%s",
            s_mtls_status[0] ? s_mtls_status : "not_configured");
+  snprintf(out->negotiated_protocol, sizeof(out->negotiated_protocol), "%s",
+           s_negotiated_protocol[0] ? s_negotiated_protocol : (s_http2_negotiated ? "h2" : "http/1.1"));
   budget_refresh_window();
   out->requests_this_minute = s_budget_requests;
   out->request_limit_per_minute = request_limit_per_minute();
@@ -2064,10 +2121,253 @@ done:
 static int native_request(const char *method, const char *url, const char *content_type,
                           const char *body, size_t body_len, char *resp_body,
                           size_t resp_body_cap);
+static int stream_consume_bytes(char *line, size_t line_cap, size_t *line_len,
+                                const char *buf, size_t len);
+static const char *base_name_ptr(const char *path);
 
 static int native_post_json(const char *url, const char *body, size_t body_len) {
   return native_request("POST", url, "application/json", body, body_len, NULL, 0u);
 }
+
+#ifdef EDR_HAVE_CURL_HTTP2
+typedef struct {
+  char *buf;
+  size_t cap;
+  size_t len;
+} EdrCurlBuffer;
+
+typedef struct {
+  char line[262144];
+  size_t line_len;
+  int failed;
+} EdrCurlStreamCtx;
+
+static int curl_global_ready(void) {
+  static int ready = 0;
+  if (ready) {
+    return 1;
+  }
+  if (curl_global_init(CURL_GLOBAL_DEFAULT) == 0) {
+    ready = 1;
+  }
+  return ready;
+}
+
+static size_t curl_write_buffer_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+  size_t n = size * nmemb;
+  EdrCurlBuffer *b = (EdrCurlBuffer *)userdata;
+  if (!b || !b->buf || b->cap == 0u || !ptr || n == 0u) {
+    return n;
+  }
+  if (b->len < b->cap - 1u) {
+    size_t copy = n;
+    if (copy > b->cap - 1u - b->len) {
+      copy = b->cap - 1u - b->len;
+    }
+    memcpy(b->buf + b->len, ptr, copy);
+    b->len += copy;
+    b->buf[b->len] = '\0';
+  }
+  return n;
+}
+
+static size_t curl_stream_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+  size_t n = size * nmemb;
+  EdrCurlStreamCtx *ctx = (EdrCurlStreamCtx *)userdata;
+  if (!ctx || !ptr || n == 0u) {
+    return n;
+  }
+  if (stream_consume_bytes(ctx->line, sizeof(ctx->line), &ctx->line_len, ptr, n) != 0) {
+    ctx->failed = 1;
+    return 0;
+  }
+  return n;
+}
+
+static struct curl_slist *curl_common_headers(const char *content_type) {
+  char h[1024];
+  struct curl_slist *headers = NULL;
+  snprintf(h, sizeof(h), "X-Tenant-ID: %s", s_tenant[0] ? s_tenant : "demo-tenant");
+  headers = curl_slist_append(headers, h);
+  snprintf(h, sizeof(h), "X-Endpoint-ID: %s", s_endpoint[0] ? s_endpoint : "");
+  headers = curl_slist_append(headers, h);
+  snprintf(h, sizeof(h), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
+  headers = curl_slist_append(headers, h);
+  headers = curl_slist_append(headers, "X-Permission-Set: telemetry:write,endpoint:attack_surface_report");
+  if (content_type && content_type[0]) {
+    snprintf(h, sizeof(h), "Content-Type: %s", content_type);
+    headers = curl_slist_append(headers, h);
+  }
+  if (s_bearer[0]) {
+    snprintf(h, sizeof(h), "Authorization: Bearer %s", s_bearer);
+    headers = curl_slist_append(headers, h);
+  }
+  return headers;
+}
+
+static void curl_apply_common_options(CURL *curl, const char *url, struct curl_slist *headers, long timeout_s) {
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+#ifdef CURL_HTTP_VERSION_2TLS
+  curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+#else
+  curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_0);
+#endif
+#ifdef CURLOPT_SSL_ENABLE_ALPN
+  curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
+#endif
+#ifdef CURLOPT_PIPEWAIT
+  curl_easy_setopt(curl, CURLOPT_PIPEWAIT, 1L);
+#endif
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  if (timeout_s > 0) {
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
+  }
+  if (s_ca_file[0]) {
+    curl_easy_setopt(curl, CURLOPT_CAINFO, s_ca_file);
+  }
+  if (s_client_cert_file[0] && s_client_key_file[0]) {
+    curl_easy_setopt(curl, CURLOPT_SSLCERT, s_client_cert_file);
+    curl_easy_setopt(curl, CURLOPT_SSLKEY, s_client_key_file);
+  }
+  if (ascii_eq_ci(s_proxy_mode, "off") || ascii_eq_ci(s_proxy_mode, "none") ||
+      ascii_eq_ci(s_proxy_mode, "direct")) {
+    curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+  } else if (s_proxy_url_cfg[0]) {
+    curl_easy_setopt(curl, CURLOPT_PROXY, s_proxy_url_cfg);
+  }
+}
+
+static int curl_note_http_version(CURL *curl) {
+#ifdef CURLINFO_HTTP_VERSION
+  long version = 0;
+  if (curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &version) == CURLE_OK) {
+#ifdef CURL_HTTP_VERSION_2_0
+    if (version == CURL_HTTP_VERSION_2_0) {
+      s_http2_negotiated = 1;
+      s_http2_negotiated_count++;
+      snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "h2");
+      return 1;
+    }
+#endif
+  }
+#else
+  (void)curl;
+#endif
+  s_http2_fallback_count++;
+  if (!s_negotiated_protocol[0]) {
+    snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
+  }
+  return 0;
+}
+
+static int curl_h2_allowed_for_url(const char *url) {
+  if (!http2_client_enabled() || !url || strncmp(url, "https://", 8u) != 0) {
+    return 0;
+  }
+  return 1;
+}
+
+static int curl_h2_request(const char *method, const char *url, const char *content_type,
+                           const char *body, size_t body_len, char *resp_body,
+                           size_t resp_body_cap) {
+  CURL *curl = NULL;
+  struct curl_slist *headers = NULL;
+  EdrCurlBuffer rb;
+  long code = 0;
+  CURLcode cc;
+  int h2;
+  if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
+    return -2;
+  }
+  if (!comm_circuit_allows() || !comm_budget_try(body_len + 512u, 0)) {
+    return -1;
+  }
+  curl = curl_easy_init();
+  if (!curl) {
+    return -2;
+  }
+  if (resp_body && resp_body_cap > 0u) {
+    resp_body[0] = '\0';
+  }
+  memset(&rb, 0, sizeof(rb));
+  rb.buf = resp_body;
+  rb.cap = resp_body_cap;
+  headers = curl_common_headers(content_type);
+  curl_apply_common_options(curl, url, headers,
+                            (long)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul) / 1000L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rb);
+  if (strcmp(method, "GET") == 0) {
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+  } else if (strcmp(method, "POST") == 0) {
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
+  } else {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    if (body_len > 0u) {
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
+    }
+  }
+  cc = curl_easy_perform(curl);
+  h2 = curl_note_http_version(curl);
+  (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  if (cc == CURLE_OK && code >= 200 && code < 300 &&
+      (h2 || !env_bool_default("EDR_HTTP2_REQUIRE", 0))) {
+    s_http2_request_ok++;
+    return 0;
+  }
+  s_http2_request_fail++;
+  return -1;
+}
+
+static int curl_h2_stream_loop(const char *url) {
+  CURL *curl = NULL;
+  struct curl_slist *headers = NULL;
+  EdrCurlStreamCtx ctx;
+  long code = 0;
+  CURLcode cc;
+  int h2;
+  if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
+    return -2;
+  }
+  if (!comm_circuit_allows() || !comm_budget_try(2048u, 0)) {
+    return -1;
+  }
+  memset(&ctx, 0, sizeof(ctx));
+  curl = curl_easy_init();
+  if (!curl) {
+    return -2;
+  }
+  headers = curl_common_headers(NULL);
+  headers = curl_slist_append(headers, "Accept: application/x-ndjson");
+  headers = curl_slist_append(headers, "Cache-Control: no-cache");
+  curl_apply_common_options(curl, url, headers, 0L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_stream_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)env_ul_clamped("EDR_HTTP2_STREAM_LOW_SPEED_S", 120ul, 30ul, 3600ul));
+  cc = curl_easy_perform(curl);
+  h2 = curl_note_http_version(curl);
+  (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  if (cc == CURLE_OK && code >= 200 && code < 300 && !ctx.failed &&
+      (h2 || !env_bool_default("EDR_HTTP2_REQUIRE", 0))) {
+    s_http2_request_ok++;
+    return 0;
+  }
+  s_http2_request_fail++;
+  return -1;
+}
+#endif
 
 static int native_post_json_legacy(const char *url, const char *body, size_t body_len) {
   char host[256];
@@ -2142,6 +2442,17 @@ static int native_request(const char *method, const char *url, const char *conte
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
+  }
+  if (https && http2_client_enabled()) {
+#ifdef EDR_HAVE_CURL_HTTP2
+    int h2rc = curl_h2_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+    if (h2rc == 0) {
+      return 0;
+    }
+    if (h2rc != -2) {
+      s_http2_fallback_count++;
+    }
+#endif
   }
   if (!https) {
     const char *allow = getenv("EDR_ALLOW_INSECURE_HTTP");
@@ -2299,6 +2610,7 @@ int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size
 }
 
 static void sleep_poll_ms(int ms);
+static int poll_dispatch_one(const char *obj);
 
 static int ws_recv_some(EdrWsConn *c, char *buf, int cap) {
   if (!c || cap <= 0) {
@@ -2715,6 +3027,216 @@ static int ws_connect_once(EdrWsConn *out) {
   return 0;
 }
 
+static void build_control_stream_url(char *url, size_t cap) {
+  size_t rb = strlen(s_rest);
+  if (!url || cap == 0u) {
+    return;
+  }
+  snprintf(url, cap,
+           "%s%singest/control/stream?endpoint_id=%s&agent_version=%s&policy_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
+           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", s_endpoint,
+           s_agent_ver, s_policy_version[0] ? s_policy_version : "local",
+           s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+           s_control_h2 ? 1 : 0, s_control_zstd ? 1 : 0);
+}
+
+static int stream_connect_once(EdrWsConn *out) {
+  char url[1400];
+  char host[256];
+  char path[1024];
+  char req[4096];
+  int port = 0;
+  int https = 0;
+  int rn;
+  if (!out || !edr_ingest_http_configured()) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  out->fd = EDR_SOCKET_INVALID;
+  build_control_stream_url(url, sizeof(url));
+  if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
+    return -1;
+  }
+  if (!comm_circuit_allows() || !comm_budget_try(2048u, https) || net_init() != 0) {
+    return -1;
+  }
+  if (tcp_connect_http_route(host, port, https, &out->fd) != 0) {
+    net_done();
+    return -1;
+  }
+  socket_set_timeout_ms(out->fd, 1000);
+  if (https) {
+#ifdef EDR_HAVE_OPENSSL_HTTP
+    char active_cafile[1024];
+    out->ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
+    if (!out->ctx) {
+      ws_close_conn(out);
+      net_done();
+      return -1;
+    }
+    out->ssl = SSL_new(out->ctx);
+    if (!out->ssl) {
+      ws_close_conn(out);
+      net_done();
+      return -1;
+    }
+#ifdef _WIN32
+    SSL_set_fd(out->ssl, (int)out->fd);
+#else
+    SSL_set_fd(out->ssl, out->fd);
+#endif
+    (void)SSL_set_tlsext_host_name(out->ssl, host);
+    if (SSL_connect(out->ssl) != 1) {
+      runtime_failure_openssl("control stream tls connect failed");
+      ws_close_conn(out);
+      net_done();
+      return -1;
+    }
+#else
+    runtime_failure("control stream https requested but OpenSSL disabled");
+    ws_close_conn(out);
+    net_done();
+    return -1;
+#endif
+  }
+  rn = snprintf(req, sizeof(req),
+                "GET %s HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "Accept: application/x-ndjson\r\n"
+                "Cache-Control: no-cache\r\n",
+                path, host);
+  if (rn <= 0 || (size_t)rn >= sizeof(req)) {
+    ws_close_conn(out);
+    net_done();
+    return -1;
+  }
+  rn = append_common_headers(req, sizeof(req), (size_t)rn);
+  if (rn <= 0) {
+    ws_close_conn(out);
+    net_done();
+    return -1;
+  }
+  {
+    size_t used = (size_t)rn;
+    int m = snprintf(req + used, sizeof(req) - used, "Connection: keep-alive\r\n\r\n");
+    if (m <= 0 || (size_t)m >= sizeof(req) - used ||
+        ws_write_all(out, (const uint8_t *)req, used + (size_t)m) != 0) {
+      ws_close_conn(out);
+      net_done();
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static void stream_process_line(const char *line) {
+  if (!line || !line[0]) {
+    return;
+  }
+  if (!strchr(line, '{')) {
+    return;
+  }
+  if (strstr(line, "\"type\":\"command_envelope\"") || strstr(line, "\"command_id\"")) {
+    (void)poll_dispatch_one(line);
+  } else if (strstr(line, "\"type\":\"server_hello\"")) {
+    (void)json_get_string(line, "dict_ver", s_control_dict_ver, sizeof(s_control_dict_ver));
+    (void)json_get_string(line, "schema_ver", s_control_schema_ver, sizeof(s_control_schema_ver));
+    (void)json_get_string(line, "profile_id", s_control_profile_id, sizeof(s_control_profile_id));
+    (void)json_get_bool(line, "h2", &s_control_h2);
+    (void)json_get_bool(line, "zstd", &s_control_zstd);
+    s_control_hello_ok = 1;
+  } else if (strstr(line, "\"type\":\"heartbeat\"")) {
+    note_control_stream_heartbeat();
+  }
+}
+
+static int stream_consume_bytes(char *line, size_t line_cap, size_t *line_len,
+                                const char *buf, size_t len) {
+  size_t i;
+  if (!line || !line_len || !buf || line_cap == 0u) {
+    return -1;
+  }
+  for (i = 0; i < len; i++) {
+    char c = buf[i];
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      line[*line_len] = '\0';
+      stream_process_line(line);
+      *line_len = 0;
+      continue;
+    }
+    if (*line_len + 1u < line_cap) {
+      line[(*line_len)++] = c;
+    } else {
+      *line_len = 0;
+      runtime_failure("control stream line too large");
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static int stream_read_loop(EdrWsConn *conn) {
+  char buf[8192];
+  size_t used = 0;
+  char line[262144];
+  size_t line_len = 0;
+  int status_ok = 0;
+  if (!conn) {
+    return -1;
+  }
+  for (;;) {
+    int n;
+    if (used >= sizeof(buf) - 1u) {
+      return -1;
+    }
+    n = ws_recv_some(conn, buf + used, (int)(sizeof(buf) - 1u - used));
+    if (n == -2) {
+      if (!s_poll_run) {
+        return -1;
+      }
+      continue;
+    }
+    if (n <= 0) {
+      return -1;
+    }
+    used += (size_t)n;
+    buf[used] = '\0';
+    {
+      char *hdr = strstr(buf, "\r\n\r\n");
+      if (!hdr) {
+        continue;
+      }
+      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
+      if (!status_ok) {
+        return -1;
+      }
+      if (used > (size_t)(hdr + 4 - buf)) {
+        if (stream_consume_bytes(line, sizeof(line), &line_len, hdr + 4,
+                                 used - (size_t)(hdr + 4 - buf)) != 0) {
+          return -1;
+        }
+      }
+      break;
+    }
+  }
+  while (s_poll_run) {
+    int n = ws_recv_some(conn, buf, (int)(sizeof(buf) - 1u));
+    if (n == -2) {
+      continue;
+    }
+    if (n <= 0) {
+      return -1;
+    }
+    if (stream_consume_bytes(line, sizeof(line), &line_len, buf, (size_t)n) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
 static int ws_send_agent_message(EdrWsConn *c, const char *command_type) {
   char payload[512];
   char payload_b64[1024];
@@ -2964,6 +3486,50 @@ int edr_ingest_http_post_command_result(const char *command_id,
   return rc;
 }
 
+static int edr_ingest_http_post_control_ack(const char *command_id, const char *transport, int64_t last_seq) {
+  char *cmd = NULL;
+  char *tr = NULL;
+  char *body = NULL;
+  size_t body_cap;
+  int rc;
+  if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
+    return -1;
+  }
+  cmd = json_escape_alloc(command_id);
+  tr = json_escape_alloc((transport && transport[0]) ? transport : "https_control");
+  if (!cmd || !tr) {
+    free(cmd);
+    free(tr);
+    return -1;
+  }
+  body_cap = strlen(s_endpoint) + strlen(cmd) + strlen(tr) + 256u;
+  body = (char *)malloc(body_cap);
+  if (!body) {
+    free(cmd);
+    free(tr);
+    return -1;
+  }
+  snprintf(body, body_cap,
+           "{\"endpoint_id\":\"%s\",\"command_id\":\"%s\",\"status\":\"processed\","
+           "\"transport\":\"%s\",\"last_seq\":%lld}",
+           s_endpoint, cmd, tr, (long long)last_seq);
+  rc = request_to_suffix("POST", "ingest/control/ack", "application/json", body, strlen(body), NULL, 0u);
+  if (rc == 0) {
+    note_http_request_success();
+    note_control_ack_success();
+  } else {
+    note_http_request_failure();
+    note_control_ack_failure();
+    if (!s_last_error[0]) {
+      runtime_failure("control ack http post failed");
+    }
+  }
+  free(cmd);
+  free(tr);
+  free(body);
+  return rc;
+}
+
 static const char *base_name_ptr(const char *path) {
   const char *b1;
   const char *b2;
@@ -2978,50 +3544,187 @@ static const char *base_name_ptr(const char *path) {
   return b1 ? b1 + 1 : path;
 }
 
-static int read_file_alloc(const char *path, uint8_t **out, size_t *out_len) {
-  FILE *f;
-  long sz;
-  uint8_t *buf;
+static long upload_max_mb(void) {
   const char *max_mb_env = getenv("EDR_HTTP_UPLOAD_MAX_MB");
   long max_mb = max_mb_env && max_mb_env[0] ? strtol(max_mb_env, NULL, 10) : 256L;
-  if (!path || !out || !out_len) {
-    return -1;
-  }
   if (max_mb < 1) max_mb = 1;
-  if (max_mb > 2048) max_mb = 2048;
-  *out = NULL;
-  *out_len = 0;
-  f = fopen(path, "rb");
-  if (!f) {
+  if (max_mb > 65536) max_mb = 65536;
+  return max_mb;
+}
+
+#ifdef EDR_HAVE_CURL_HTTP2
+static int curl_h2_upload_multipart_file(const char *upload_id, const char *file_path,
+                                         const char *sha256_hex, char *resp_body,
+                                         size_t resp_body_cap) {
+  char url[1400];
+  size_t rb;
+  CURL *curl = NULL;
+  curl_mime *mime = NULL;
+  curl_mimepart *part = NULL;
+  struct curl_slist *headers = NULL;
+  EdrCurlBuffer out;
+  long code = 0;
+  CURLcode cc;
+  int h2;
+  const char *filename;
+  if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0] ||
+      !http2_client_enabled() || strncmp(s_rest, "https://", 8u) != 0 || !curl_global_ready()) {
+    return -2;
+  }
+  if (!comm_circuit_allows() || !comm_budget_try(4096u, 0)) {
     return -1;
   }
-  if (fseek(f, 0, SEEK_END) != 0) {
-    fclose(f);
+  curl = curl_easy_init();
+  if (!curl) {
+    return -2;
+  }
+  if (resp_body && resp_body_cap > 0u) {
+    resp_body[0] = '\0';
+  }
+  memset(&out, 0, sizeof(out));
+  out.buf = resp_body;
+  out.cap = resp_body_cap;
+  rb = strlen(s_rest);
+  snprintf(url, sizeof(url), "%s%singest/upload-file",
+           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/");
+  filename = base_name_ptr(file_path);
+  mime = curl_mime_init(curl);
+  if (!mime) {
+    curl_easy_cleanup(curl);
+    return -2;
+  }
+  part = curl_mime_addpart(mime);
+  curl_mime_name(part, "upload_id");
+  curl_mime_data(part, upload_id, CURL_ZERO_TERMINATED);
+  part = curl_mime_addpart(mime);
+  curl_mime_name(part, "sha256");
+  curl_mime_data(part, sha256_hex ? sha256_hex : "", CURL_ZERO_TERMINATED);
+  part = curl_mime_addpart(mime);
+  curl_mime_name(part, "file_name");
+  curl_mime_data(part, filename, CURL_ZERO_TERMINATED);
+  part = curl_mime_addpart(mime);
+  curl_mime_name(part, "file");
+  curl_mime_filename(part, filename);
+  curl_mime_type(part, "application/octet-stream");
+  if (curl_mime_filedata(part, file_path) != CURLE_OK) {
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+    return -2;
+  }
+  headers = curl_common_headers(NULL);
+  curl_apply_common_options(curl, url, headers,
+                            (long)env_ul_clamped("EDR_HTTP_UPLOAD_TIMEOUT_S", 600ul, 30ul, 86400ul));
+  curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+  cc = curl_easy_perform(curl);
+  h2 = curl_note_http_version(curl);
+  (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  curl_slist_free_all(headers);
+  curl_mime_free(mime);
+  curl_easy_cleanup(curl);
+  if (cc == CURLE_OK && code >= 200 && code < 300 &&
+      (h2 || !env_bool_default("EDR_HTTP2_REQUIRE", 0))) {
+    s_http2_request_ok++;
+    return 0;
+  }
+  s_http2_request_fail++;
+  return -1;
+}
+#endif
+
+static int http_conn_write_file(EdrHttpConn *conn, FILE *f, size_t file_len) {
+  char chunk[65536];
+  size_t remaining = file_len;
+  if (!conn || !f) {
     return -1;
   }
-  sz = ftell(f);
-  if (sz < 0 || (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
-    fclose(f);
-    return -1;
+  while (remaining > 0u) {
+    size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+    size_t got = fread(chunk, 1u, want, f);
+    if (got == 0u) {
+      return -1;
+    }
+    if (http_conn_write_all(conn, chunk, got) != 0) {
+      return -1;
+    }
+    remaining -= got;
   }
-  if (fseek(f, 0, SEEK_SET) != 0) {
-    fclose(f);
-    return -1;
-  }
-  buf = (uint8_t *)malloc((size_t)sz + 1u);
-  if (!buf) {
-    fclose(f);
-    return -1;
-  }
-  if (sz > 0 && fread(buf, 1u, (size_t)sz, f) != (size_t)sz) {
-    free(buf);
-    fclose(f);
-    return -1;
-  }
-  fclose(f);
-  *out = buf;
-  *out_len = (size_t)sz;
   return 0;
+}
+
+static int request_to_suffix_multipart_file(const char *suffix, const char *content_type,
+                                            const char *pre, size_t pre_len,
+                                            FILE *file, size_t file_len,
+                                            const char *post, size_t post_len,
+                                            char *resp_body, size_t resp_body_cap) {
+  char url[1400];
+  char host[256];
+  char path[1024];
+  int port = 0;
+  int https = 0;
+  int rc = -1;
+  char req[8192];
+  int rn;
+  size_t rb = strlen(s_rest);
+  size_t body_len = pre_len + file_len + post_len;
+  snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+  if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
+    runtime_failure("invalid upload url");
+    return -1;
+  }
+  if (!https) {
+    const char *allow = getenv("EDR_ALLOW_INSECURE_HTTP");
+    if ((!allow || allow[0] != '1') && !is_local_or_private_host(host)) {
+      runtime_failure("plain http denied for non-local host");
+      return -1;
+    }
+  }
+  if (!comm_circuit_allows()) {
+    return -1;
+  }
+  if (!comm_budget_try(4096u, 0)) {
+    return -1;
+  }
+  if (net_init() != 0) {
+    runtime_failure("network init failed");
+    return -1;
+  }
+  rn = append_request_headers(req, sizeof(req), "POST", path, host, content_type, body_len);
+  if (rn <= 0) {
+    runtime_failure("http upload request build failed");
+    return -1;
+  }
+  http_lock();
+  for (int attempt = 0; attempt < 2; attempt++) {
+    int reusable = 0;
+    EdrHttpConn *conn;
+    if (fseek(file, 0, SEEK_SET) != 0) {
+      break;
+    }
+    conn = http_conn_get_locked(host, port, https);
+    if (!conn) {
+      break;
+    }
+    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
+        http_conn_write_all(conn, pre, pre_len) == 0 &&
+        http_conn_write_file(conn, file, file_len) == 0 &&
+        http_conn_write_all(conn, post, post_len) == 0 &&
+        read_http_response_from_recv(http_socket_recv_adapter, conn, resp_body, resp_body_cap, &reusable) == 0) {
+      rc = 0;
+      conn->last_used_ms = unix_ms_now();
+      if (!reusable || !http_keepalive_enabled()) {
+        http_conn_close_locked();
+      }
+      break;
+    }
+    http_conn_close_locked();
+  }
+  http_unlock();
+  if (rc != 0 && !s_last_error[0]) {
+    runtime_failure(https ? "https upload failed" : "http upload failed");
+  }
+  return rc;
 }
 
 int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,
@@ -3029,7 +3732,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
                                           size_t out_minio_key_cap) {
   const char *boundary = "----edr-agent-upload-boundary-v1";
   const char *filename;
-  uint8_t *file_buf = NULL;
+  FILE *file = NULL;
   size_t file_len = 0;
   char *uid = NULL;
   char *sha = NULL;
@@ -3038,25 +3741,67 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   char resp[4096];
   char pre[2048];
   char post[96];
-  char *body = NULL;
-  size_t body_len;
   int rc;
+  long sz;
+  long max_mb;
   if (out_minio_key && out_minio_key_cap > 0u) {
     out_minio_key[0] = '\0';
   }
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0]) {
     return -1;
   }
-  if (read_file_alloc(file_path, &file_buf, &file_len) != 0) {
+  file = fopen(file_path, "rb");
+  if (!file) {
     runtime_failure("http upload file read failed");
     return -1;
   }
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fclose(file);
+    runtime_failure("http upload file seek failed");
+    return -1;
+  }
+  sz = ftell(file);
+  max_mb = upload_max_mb();
+  if (sz < 0 || (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
+    fclose(file);
+    runtime_failure("http upload file too large");
+    return -1;
+  }
+  file_len = (size_t)sz;
+  if (fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    runtime_failure("http upload file seek failed");
+    return -1;
+  }
+#ifdef EDR_HAVE_CURL_HTTP2
+  if (http2_client_enabled()) {
+    resp[0] = '\0';
+    rc = curl_h2_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
+    if (rc == 0) {
+      note_http_request_success();
+      note_upload_success();
+      if (out_minio_key && out_minio_key_cap > 0u) {
+        (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
+      }
+      fclose(file);
+      return 0;
+    }
+    if (rc != -2) {
+      s_http2_fallback_count++;
+      if (fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        runtime_failure("http upload file seek failed");
+        return -1;
+      }
+    }
+  }
+#endif
   filename = base_name_ptr(file_path);
   uid = json_escape_alloc(upload_id);
   sha = json_escape_alloc(sha256_hex ? sha256_hex : "");
   fname = json_escape_alloc(filename);
   if (!uid || !sha || !fname) {
-    free(file_buf);
+    fclose(file);
     free(uid);
     free(sha);
     free(fname);
@@ -3070,22 +3815,11 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
            "Content-Type: application/octet-stream\r\n\r\n",
            boundary, uid, boundary, sha, boundary, fname, boundary, fname);
   snprintf(post, sizeof(post), "\r\n--%s--\r\n", boundary);
-  body_len = strlen(pre) + file_len + strlen(post);
-  body = (char *)malloc(body_len + 1u);
-  if (!body) {
-    free(file_buf);
-    free(uid);
-    free(sha);
-    free(fname);
-    return -1;
-  }
-  memcpy(body, pre, strlen(pre));
-  memcpy(body + strlen(pre), file_buf, file_len);
-  memcpy(body + strlen(pre) + file_len, post, strlen(post));
-  body[body_len] = '\0';
   snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
   resp[0] = '\0';
-  rc = request_to_suffix("POST", "ingest/upload-file", content_type, body, body_len, resp, sizeof(resp));
+  rc = request_to_suffix_multipart_file("ingest/upload-file", content_type,
+                                        pre, strlen(pre), file, file_len,
+                                        post, strlen(post), resp, sizeof(resp));
   if (rc == 0) {
     note_http_request_success();
     note_upload_success();
@@ -3100,22 +3834,23 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     note_http_request_failure();
     note_upload_failure();
   }
-  free(file_buf);
+  fclose(file);
   free(uid);
   free(sha);
   free(fname);
-  free(body);
   return rc;
 }
 
 static int poll_dispatch_one(const char *obj) {
   char command_id[160];
   char command_type[96];
+  char transport[96];
   char *payload_b64 = NULL;
   EdrSoarCommandMeta sm;
   uint8_t *payload = NULL;
   size_t payload_len = 0;
   int64_t v;
+  int64_t seq = 0;
   memset(&sm, 0, sizeof(sm));
   if (json_get_string(obj, "command_id", command_id, sizeof(command_id)) != 0 ||
       json_get_string(obj, "command_type", command_type, sizeof(command_type)) != 0) {
@@ -3138,10 +3873,17 @@ static int poll_dispatch_one(const char *obj) {
   if (json_get_int64(obj, "issued_at_unix_ms", &v) == 0) {
     sm.issued_at_unix_ms = v;
   }
+  if (json_get_int64(obj, "seq", &seq) != 0) {
+    seq = sm.issued_at_unix_ms;
+  }
+  if (json_get_string(obj, "transport", transport, sizeof(transport)) != 0 || !transport[0]) {
+    snprintf(transport, sizeof(transport), "%s", s_stream_ready ? "https_control_stream" : "https_long_poll");
+  }
   if (json_get_int64(obj, "deadline_ms", &v) == 0 && v > 0 && v <= 0xffffffffLL) {
     sm.deadline_ms = (uint32_t)v;
   }
   edr_command_on_envelope(command_id, command_type, payload, payload_len, &sm);
+  (void)edr_ingest_http_post_control_ack(command_id, transport, seq);
   free(payload_b64);
   free(payload);
   return 0;
@@ -3317,17 +4059,50 @@ static void *control_ws_thread(void *arg)
   s_ws_backoff_ms = backoff_ms;
   while (s_poll_run) {
     EdrWsConn conn;
-    int64_t next_hb;
     if (!edr_ingest_http_configured()) {
       sleep_poll_ms(5000);
       continue;
     }
-    if (edr_grpc_client_ready() || s_ws_ready) {
+    if (s_stream_ready || s_ws_ready) {
       sleep_poll_ms(5000);
       continue;
     }
     (void)edr_ingest_http_control_hello_once();
-    if (ws_connect_once(&conn) != 0) {
+#ifdef EDR_HAVE_CURL_HTTP2
+    if (http2_client_enabled()) {
+      char stream_url[1400];
+      int h2rc;
+      build_control_stream_url(stream_url, sizeof(stream_url));
+      s_stream_ready = 1;
+      note_control_stream_success();
+      backoff_ms = 5000;
+      s_ws_backoff_ms = 0;
+      fprintf(stderr, "[ingest-stream] HTTP/2 control stream connecting endpoint=%s\n", s_endpoint);
+      h2rc = curl_h2_stream_loop(stream_url);
+      s_stream_ready = 0;
+      if (h2rc == 0) {
+        continue;
+      }
+      note_control_stream_failure();
+      if (h2rc != -2 && env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
+        fprintf(stderr,
+                "[ingest-stream] HTTP/2 control stream unavailable; falling back to HTTP/1.1 stream\n");
+      } else if (h2rc != -2) {
+        s_ws_backoff_ms = backoff_ms;
+        sleep_poll_ms(backoff_ms);
+        if (backoff_ms < 60000) {
+          backoff_ms *= 2;
+          if (backoff_ms > 60000) {
+            backoff_ms = 60000;
+          }
+        }
+        s_ws_backoff_ms = backoff_ms;
+        continue;
+      }
+    }
+#endif
+    if (stream_connect_once(&conn) != 0) {
+      note_control_stream_failure();
       s_ws_backoff_ms = backoff_ms;
       sleep_poll_ms(backoff_ms);
       if (backoff_ms < 60000) {
@@ -3339,81 +4114,25 @@ static void *control_ws_thread(void *arg)
       s_ws_backoff_ms = backoff_ms;
       continue;
     }
-    ws_lock();
-    s_ws_conn = &conn;
-    s_ws_ready = 1;
-    ws_unlock();
-    if (ws_send_agent_message(&conn, "agent_hello") == 0) {
-      note_ws_message_success();
-      backoff_ms = 5000;
-      s_ws_backoff_ms = 0;
-      fprintf(stderr, "[ingest-ws] control connected endpoint=%s\n", s_endpoint);
-    } else {
-      note_ws_message_failure("control ws hello failed");
+    s_stream_ready = 1;
+    note_http_request_success();
+    note_control_stream_success();
+    backoff_ms = 5000;
+    s_ws_backoff_ms = 0;
+    fprintf(stderr, "[ingest-stream] control stream connected endpoint=%s\n", s_endpoint);
+    if (stream_read_loop(&conn) != 0) {
+      note_control_stream_failure();
     }
-    next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
-    {
-      const char *disconnect_reason = "read_failed";
-      while (s_poll_run && s_ws_ready) {
-        int opcode = 0;
-        char *payload = NULL;
-        size_t payload_len = 0;
-        int rc;
-        if (unix_ms_now() >= next_hb) {
-          if (ws_send_agent_message(&conn, "agent_heartbeat") != 0) {
-            note_ws_message_failure("control ws heartbeat failed");
-            disconnect_reason = "heartbeat_write_failed";
-            break;
-          }
-          note_ws_message_success();
-          next_hb = unix_ms_now() + (int64_t)ws_heartbeat_seconds() * 1000LL;
-        }
-        rc = ws_read_frame(&conn, &opcode, &payload, &payload_len);
-        if (rc == -2) {
-          sleep_poll_ms(50);
-          continue;
-        }
-        if (rc != 0) {
-          break;
-        }
-        if (opcode == 1 || opcode == 2) {
-          (void)payload_len;
-          (void)poll_dispatch_one(payload);
-        } else if (opcode == 8) {
-          disconnect_reason = "server_close";
-          free(payload);
-          break;
-        } else if (opcode == 9) {
-          ws_lock();
-          if (s_ws_conn == &conn) {
-            if (ws_send_frame(&conn, 10, (const uint8_t *)payload, payload_len) == 0) {
-              s_ws_pong++;
-              note_ws_message_success();
-            } else {
-              note_ws_message_failure("control ws pong failed");
-            }
-          }
-          ws_unlock();
-        }
-        free(payload);
-      }
-      ws_lock();
-      if (s_ws_conn == &conn) {
-        s_ws_conn = NULL;
-      }
-      s_ws_ready = 0;
-      ws_unlock();
-      ws_close_conn(&conn);
-      net_done();
-      if (s_poll_run) {
-        fprintf(stderr,
-                "[ingest-ws] control disconnected reason=%s; HTTP long-poll fallback remains active\n",
-                disconnect_reason);
-        s_ws_backoff_ms = backoff_ms;
-        sleep_poll_ms(backoff_ms);
-      }
+    s_stream_ready = 0;
+    ws_close_conn(&conn);
+    net_done();
+    if (s_poll_run) {
+      fprintf(stderr,
+              "[ingest-stream] control stream disconnected; HTTP long-poll fallback remains active\n");
+      s_ws_backoff_ms = backoff_ms;
+      sleep_poll_ms(backoff_ms);
     }
-	  }
+  }
 #ifdef _WIN32
   return 0;
 #else
@@ -3493,11 +4212,7 @@ static void *command_poll_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
-    if (edr_grpc_client_ready()) {
-      sleep_poll_ms(5000);
-      continue;
-    }
-    if (s_ws_ready) {
+    if (s_stream_ready || s_ws_ready) {
       s_poll_backoff_ms = 0;
       sleep_poll_ms(5000);
       continue;
@@ -3529,7 +4244,7 @@ static void *command_poll_thread(void *arg)
 
 void edr_ingest_http_start_command_poll(void) {
   const char *off = getenv("EDR_HTTP_COMMAND_POLL");
-  const char *wsoff = getenv("EDR_HTTP_CONTROL_WS");
+  const char *streamoff = getenv("EDR_HTTP_CONTROL_STREAM");
   if (off && strcmp(off, "0") == 0) {
     return;
   }
@@ -3538,19 +4253,19 @@ void edr_ingest_http_start_command_poll(void) {
   }
   s_poll_run = 1;
   ws_mu_init_once();
-  if (!wsoff || strcmp(wsoff, "0") != 0) {
+  if (!streamoff || strcmp(streamoff, "0") != 0) {
 #ifdef _WIN32
     s_ws_thread = (HANDLE)_beginthreadex(NULL, 0, control_ws_thread, NULL, 0, NULL);
     if (s_ws_thread) {
       s_ws_started = 1;
     } else {
-      runtime_failure("control ws thread create failed");
+      runtime_failure("control stream thread create failed");
     }
 #else
     if (pthread_create(&s_ws_thread, NULL, control_ws_thread, NULL) == 0) {
       s_ws_started = 1;
     } else {
-      runtime_failure("control ws thread create failed");
+      runtime_failure("control stream thread create failed");
     }
 #endif
   }
@@ -3576,6 +4291,7 @@ void edr_ingest_http_stop_command_poll(void) {
     return;
   }
   s_poll_run = 0;
+  s_stream_ready = 0;
   ws_lock();
   if (s_ws_conn) {
     if (s_ws_conn->fd != EDR_SOCKET_INVALID) {

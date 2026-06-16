@@ -165,6 +165,12 @@ if(OpenSSL_FOUND)
 else()
   set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT OFF)
 endif()
+find_package(CURL QUIET)
+if(CURL_FOUND)
+  set(_EDR_HTTP2_CURL_DEFAULT ON)
+else()
+  set(_EDR_HTTP2_CURL_DEFAULT OFF)
+endif()
 # no-gRPC Windows production builds still use REST ingest/health over HTTPS.
 # Default to ON whenever OpenSSL is available; smoke builds without OpenSSL stay
 # fast, while release/CI presets explicitly require this option and fail if the
@@ -187,6 +193,13 @@ if(EDR_REQUIRE_HTTPS_REST AND NOT EDR_WITH_GRPC AND NOT EDR_WITH_INGEST_HTTPS_OP
   message(FATAL_ERROR "EDR_REQUIRE_HTTPS_REST=ON requires EDR_WITH_INGEST_HTTPS_OPENSSL=ON for no-gRPC builds")
 endif()
 message(STATUS "HTTP HTTPS ingest OpenSSL support: ${EDR_WITH_INGEST_HTTPS_OPENSSL}")
+option(EDR_WITH_HTTP2_CURL
+  "Enable real HTTP/2 ingest/control client through libcurl ALPN/nghttp2 when available"
+  ${_EDR_HTTP2_CURL_DEFAULT})
+if(EDR_WITH_HTTP2_CURL AND NOT CURL_FOUND)
+  message(FATAL_ERROR "EDR_WITH_HTTP2_CURL=ON but libcurl was not found")
+endif()
+message(STATUS "HTTP/2 ingest libcurl support: ${EDR_WITH_HTTP2_CURL}")
 option(EDR_WITH_P0_RULES_OPENSSL
   "Enable AES-GCM decrypt support for encrypted P0 rule bundles"
   ${_EDR_INGEST_HTTPS_OPENSSL_DEFAULT})
@@ -527,6 +540,15 @@ if(EDR_WITH_INGEST_HTTPS_OPENSSL AND OpenSSL_FOUND)
     target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   else()
     target_link_libraries(edr_agent PRIVATE OpenSSL::Crypto)
+  endif()
+endif()
+if(EDR_WITH_HTTP2_CURL AND CURL_FOUND)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_CURL_HTTP2=1)
+  if(TARGET CURL::libcurl)
+    target_link_libraries(edr_agent PRIVATE CURL::libcurl)
+  else()
+    target_include_directories(edr_agent PRIVATE ${CURL_INCLUDE_DIRS})
+    target_link_libraries(edr_agent PRIVATE ${CURL_LIBRARIES})
   endif()
 endif()
 if(EDR_WITH_FL_TRAINER AND EDR_GRPC_CLIENT_AVAILABLE)

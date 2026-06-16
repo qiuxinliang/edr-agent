@@ -1,6 +1,6 @@
 /**
- * HTTP POST /ingest/report-events（与 gRPC ReportEvents payload 同源）。
- * 供行为告警走 gRPC、其余事件走 HTTP 的分流策略使用。
+ * HTTPS/TLS ingest 主路径：ReportEvents / command result / artifact upload / control stream。
+ * legacy gRPC 仅在显式启用时作为 fallback。
  */
 #ifndef EDR_INGEST_HTTP_H
 #define EDR_INGEST_HTTP_H
@@ -29,6 +29,8 @@ typedef struct {
   int insecure_http;
   int mtls_configured;
   int websocket_ready;
+  int http2_enabled;
+  int http2_negotiated;
   int poll_backoff_ms;
   int ws_backoff_ms;
   int circuit_open;
@@ -46,6 +48,15 @@ typedef struct {
   unsigned long upload_fail_count;
   unsigned long long_poll_ok_count;
   unsigned long long_poll_fail_count;
+  unsigned long control_stream_ok_count;
+  unsigned long control_stream_fail_count;
+  unsigned long control_stream_heartbeat_count;
+  unsigned long control_ack_ok_count;
+  unsigned long control_ack_fail_count;
+  unsigned long http2_request_ok_count;
+  unsigned long http2_request_fail_count;
+  unsigned long http2_negotiated_count;
+  unsigned long http2_fallback_count;
   unsigned long budget_drop_count;
   int64_t last_success_unix_ms;
   int64_t last_failure_unix_ms;
@@ -59,6 +70,7 @@ typedef struct {
   char proxy_status[96];
   char client_key_provider[32];
   char mtls_status[96];
+  char negotiated_protocol[16];
   unsigned long requests_this_minute;
   unsigned long request_limit_per_minute;
   uint64_t bytes_this_minute;
@@ -105,7 +117,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
                                           const char *sha256_hex, char *out_minio_key,
                                           size_t out_minio_key_cap);
 
-/** HTTP command long-poll hooks. gRPC ready 时保持休眠，no-gRPC/断链时接管命令面。 */
+/** HTTPS h2 control stream 优先；stream 不可用时由 long-poll 接管命令面。 */
 void edr_ingest_http_start_command_poll(void);
 void edr_ingest_http_stop_command_poll(void);
 

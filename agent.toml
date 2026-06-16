@@ -1,5 +1,5 @@
 [server]
-address              = "192.168.1.10:50051"
+address              = ""
 grpc_enabled         = false
 grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"

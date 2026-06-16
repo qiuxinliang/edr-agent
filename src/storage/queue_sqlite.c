@@ -306,14 +306,14 @@ static int drain_one_row(void) {
   }
 
   int send = -1;
-  if (edr_grpc_client_ready()) {
-    send = edr_grpc_client_send_batch(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
-  }
-  if (send != 0 && edr_ingest_http_configured()) {
+  if (edr_ingest_http_configured()) {
     if (edr_ingest_http_circuit_open()) {
       return 2;
     }
     send = edr_ingest_http_post_report_events(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
+  }
+  if (send != 0 && edr_grpc_client_ready()) {
+    send = edr_grpc_client_send_batch(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
   if (send == 0) {
     (void)delete_row_by_id(id);

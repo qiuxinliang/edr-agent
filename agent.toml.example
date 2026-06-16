@@ -1,18 +1,18 @@
 # 与《EDR 端点详细设计 v1.0》§11.1 对齐 — 复制为 agent.toml 后按需修改
 #
-# 使用说明、gRPC/mTLS、SQLite 队列与环境变量：见同目录 README.md
+# 使用说明、HTTPS/TLS 采集与控制面、SQLite 队列与环境变量：见同目录 README.md
 # 与平台 REST 联调时的 `endpoint_id` / `tenant_id` / `rest_base_url` 语义与启动 [config] WARN：见 docs/WP3_CONFIG_VALIDATION.md
-# HTTP·gRPC 传输、`EDR_EVENT_INGEST_SPLIT`、ingest 排障：见 docs/WP4_HTTP_TRANSPORT_OPS.md
+# HTTPS/TLS 传输、`EDR_EVENT_INGEST_SPLIT`、ingest 排障：见 docs/WP4_HTTP_TRANSPORT_OPS.md
 # 规则母版 → 预处理 TOML / P0 IR / 版本对账（WP-5）：见 docs/WP5_RULES_ENGINEERING.md；TOML 子串规则：见 docs/PREPROCESS_RULES.md
 # 批处理/上送先量化后调优（WP-6）：见 docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md
 # 离线队列、失败落盘与出队重试/退避（WP-7）：见 docs/WP7_OFFLINE_QUEUE_RETRY.md
 # ETW/采集 profile 与 P0 字段矩阵底线（WP-8）：见 docs/WP8_ETW_COLLECTION_PROFILE.md、config/profiles/wp8_compliance_baseline.env.example
 
 [server]
-address              = "127.0.0.1:50051"
+# Legacy EventIngest gRPC 兼容地址。默认留空；只有旧平台迁移期才填写 host:port 并设置 grpc_enabled=true。
+address              = ""
 grpc_enabled         = false
-# Plaintext gRPC to local `edr-api` Ingest (same as EDR_GRPC_INSECURE=1); use false in production w/ mTLS
-# 与 EDR_GRPC_INSECURE=1 等效；仅明文联调。也可写 1/0
+# Plaintext legacy gRPC; 仅旧链路联调使用，生产保持 false。
 grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
@@ -32,7 +32,7 @@ tenant_id            = "tenant_default"
 
 # §19 攻击面：GET_ATTACK_SURFACE 采集后 POST 至平台（需 PATH 中有 curl）。endpoint_id 不可为 auto。
 # [platform]
-# rest_base_url      = "http://127.0.0.1:8080/api/v1"
+# rest_base_url      = "https://edr.example.com/api/v1"
 # rest_user_id       = "edr-agent"
 # rest_bearer_token  = ""
 # proxy_mode         = "auto" # auto | off | explicit

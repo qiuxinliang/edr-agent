@@ -538,8 +538,8 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
       if (s_cfg->agent.tenant_id[0]) {
         tenant = s_cfg->agent.tenant_id;
       }
-      if ((edr_grpc_client_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 ||
-           edr_ingest_http_upload_file_multipart(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0) &&
+      if ((edr_ingest_http_upload_file_multipart(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 ||
+           edr_grpc_client_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0) &&
           object_key[0]) {
         file_uploaded = 1;
       } else {

@@ -838,7 +838,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"ws_message_ok\":%lu,\"ws_message_fail\":%lu,\"ws_pong\":%lu,"
       "\"command_result_ok\":%lu,\"command_result_fail\":%lu,"
       "\"upload_ok\":%lu,\"upload_fail\":%lu,"
-      "\"long_poll_ok\":%lu,\"long_poll_fail\":%lu},"
+      "\"long_poll_ok\":%lu,\"long_poll_fail\":%lu,"
+      "\"control_stream_ok\":%lu,\"control_stream_fail\":%lu,"
+      "\"control_stream_heartbeat\":%lu,"
+      "\"control_ack_ok\":%lu,\"control_ack_fail\":%lu,"
+      "\"http2_request_ok\":%lu,\"http2_request_fail\":%lu,"
+      "\"http2_negotiated\":%lu,\"http2_fallback\":%lu},"
       "\"send_queue_depth\":%llu,\"send_queue_capacity\":%llu,"
       "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
       "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
@@ -964,6 +969,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      http_rt.command_result_ok_count, http_rt.command_result_fail_count,
 	      http_rt.upload_ok_count, http_rt.upload_fail_count,
 	      http_rt.long_poll_ok_count, http_rt.long_poll_fail_count,
+	      http_rt.control_stream_ok_count, http_rt.control_stream_fail_count,
+	      http_rt.control_stream_heartbeat_count,
+	      http_rt.control_ack_ok_count, http_rt.control_ack_fail_count,
+	      http_rt.http2_request_ok_count, http_rt.http2_request_fail_count,
+	      http_rt.http2_negotiated_count, http_rt.http2_fallback_count,
 	      (unsigned long long)edr_transport_send_queue_depth(),
 	      (unsigned long long)edr_transport_send_queue_capacity(),
 	      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),

@@ -1558,7 +1558,7 @@ void edr_config_free_heap(EdrConfig *cfg) {
 
 void edr_config_apply_defaults(EdrConfig *cfg) {
   memset(cfg, 0, sizeof(*cfg));
-  snprintf(cfg->server.address, sizeof(cfg->server.address), "%s", "127.0.0.1:50051");
+  cfg->server.address[0] = '\0';
   cfg->server.grpc_enabled = false;
   cfg->server.grpc_insecure = false;
   snprintf(cfg->server.client_key_provider, sizeof(cfg->server.client_key_provider), "%s", "pem");
