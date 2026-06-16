@@ -222,6 +222,21 @@ typedef struct EdrConfig {
     char rest_base_url[512];
     char rest_user_id[128];
     char rest_bearer_token[512];
+    /** HTTPS/TLS transport v2: HTTP/2 is the default, HTTP/1.1 remains an explicit fallback unless required. */
+    bool http2_enabled;
+    bool http2_require;
+    bool control_stream_enabled;
+    bool long_poll_fallback;
+    bool report_events_v2_enabled;
+    char data_plane_encoding[32];
+    char data_plane_compression[32];
+    char control_dict_version[64];
+    char control_schema_version[64];
+    char control_profile_id[64];
+    char qos_dscp[32];
+    char telemetry_threshold[32];
+    uint32_t telemetry_sampling_pct;
+    bool backpressure_enabled;
     /** off | auto | explicit. auto 默认读取 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY。 */
     char proxy_mode[32];
     /** 显式 HTTP CONNECT 代理，例如 http://proxy.corp:8080。 */

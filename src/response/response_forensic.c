@@ -11,6 +11,7 @@
 #include "edr/edr_log.h"
 #include "edr/pe_verify.h"
 #include "edr/shell_exec.h"
+#include "edr/transport_v2.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -141,7 +142,7 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     edr_command_audit_both(cmd_id, "forensic: manifest + bundle.tgz");
     char minio_key[512];
     minio_key[0] = '\0';
-    edr_ingest_http_upload_file_multipart(cmd_id, bundle, NULL, minio_key, sizeof(minio_key));
+    edr_transport_v2_upload_file(cmd_id, bundle, NULL, minio_key, sizeof(minio_key));
     char result[1024];
     if (minio_key[0]) {
       snprintf(result, sizeof(result), "forensic bundle ok minio_key=%s", minio_key);

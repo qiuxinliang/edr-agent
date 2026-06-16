@@ -21,6 +21,20 @@ max_event_queue_size = 1024
 [platform]
 rest_base_url        = "https://127.0.0.1:8443/api/v1"
 rest_user_id         = "edr-agent"
+http2_enabled        = true
+http2_require        = false
+control_stream_enabled = true
+long_poll_fallback   = true
+report_events_v2_enabled = true
+data_plane_encoding  = "protobuf"
+data_plane_compression = "identity"
+control_dict_version = "edr-zstd-dict-v1"
+control_schema_version = "edr-control-schema-v1"
+control_profile_id   = "default-h2-zstd"
+qos_dscp             = "AF21"
+telemetry_threshold  = "medium"
+telemetry_sampling_pct = 100
+backpressure_enabled = true
 
 [attack_surface]
 enabled              = false

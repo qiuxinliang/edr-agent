@@ -11,6 +11,7 @@
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/storage_queue.h"
+#include "edr/transport_v2.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,7 +146,7 @@ static int default_dispatch(int use_http, const char *batch_id,
     const char *e = getenv("EDR_EVENT_GRPC_FALLBACK_HTTP");
     int allow_fallback = (!e || e[0] == '\0' || strcmp(e, "0") != 0);
     if (use_http == 1 || allow_fallback) {
-      ok = edr_ingest_http_post_report_events(batch_id, header12, header_len, payload, payload_len);
+      ok = edr_transport_v2_report_events(batch_id, header12, header_len, payload, payload_len);
       if (ok == 0) return 0;
     }
   }
@@ -411,6 +412,15 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.proxy_url,
       cfg->platform.relay_url);
   edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version);
+  edr_ingest_http_configure_transport_options(
+      cfg->platform.http2_enabled ? 1 : 0,
+      cfg->platform.http2_require ? 1 : 0,
+      cfg->platform.control_stream_enabled ? 1 : 0,
+      cfg->platform.long_poll_fallback ? 1 : 0,
+      cfg->platform.report_events_v2_enabled ? 1 : 0,
+      cfg->platform.data_plane_encoding,
+      cfg->platform.data_plane_compression);
+  edr_transport_v2_init_from_config(cfg);
 
   /* 启动命令轮询 */
   edr_ingest_http_start_command_poll();

@@ -12,6 +12,7 @@
 #include "edr/ingest_http.h"
 #include "edr/response.h"
 #include "edr/shell_exec.h"
+#include "edr/transport_v2.h"
 
 #ifdef _WIN32
 
@@ -213,7 +214,7 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl,
     }
 
     char minio_key[256] = {0};
-    edr_ingest_http_upload_file_multipart(cmd_id, json_path, sha, minio_key, sizeof(minio_key));
+    edr_transport_v2_upload_file(cmd_id, json_path, sha, minio_key, sizeof(minio_key));
     remove(json_path);
 
     char result[512];

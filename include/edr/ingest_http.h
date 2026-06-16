@@ -18,6 +18,13 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
                                 const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url);
 
+void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_required,
+                                                 int control_stream_enabled,
+                                                 int long_poll_fallback,
+                                                 int report_events_v2_enabled,
+                                                 const char *data_plane_encoding,
+                                                 const char *data_plane_compression);
+
 int edr_ingest_http_configured(void);
 
 /** 当前 native HTTP circuit 是否仍处于打开状态；到期时自动复位。 */
@@ -30,7 +37,17 @@ typedef struct {
   int mtls_configured;
   int websocket_ready;
   int http2_enabled;
+  int http2_required;
   int http2_negotiated;
+  int control_stream_enabled;
+  int control_stream_ready;
+  int long_poll_fallback;
+  int report_events_v2_enabled;
+  int zstd_requested;
+  int zstd_available;
+  int zstd_dict_loaded;
+  int http2_multiplex_enabled;
+  int http2_multiplex_active;
   int poll_backoff_ms;
   int ws_backoff_ms;
   int circuit_open;
@@ -57,6 +74,12 @@ typedef struct {
   unsigned long http2_request_fail_count;
   unsigned long http2_negotiated_count;
   unsigned long http2_fallback_count;
+  unsigned long report_events_v2_ok_count;
+  unsigned long report_events_v2_fail_count;
+  unsigned long zstd_compress_ok_count;
+  unsigned long zstd_compress_fail_count;
+  unsigned long http2_multiplex_ok_count;
+  unsigned long http2_multiplex_fail_count;
   unsigned long budget_drop_count;
   int64_t last_success_unix_ms;
   int64_t last_failure_unix_ms;
@@ -71,6 +94,21 @@ typedef struct {
   char client_key_provider[32];
   char mtls_status[96];
   char negotiated_protocol[16];
+  char control_stream_status[32];
+  char upload_status[32];
+  char data_plane_encoding[32];
+  char data_plane_compression[32];
+  char envelope_format[48];
+  char dict_ver[64];
+  char schema_ver[64];
+  char profile_id[64];
+  char zstd_dict_path[512];
+  char qos_dscp[32];
+  char telemetry_threshold[32];
+  unsigned int telemetry_sampling_pct;
+  uint64_t zstd_raw_bytes;
+  uint64_t zstd_wire_bytes;
+  uint64_t zstd_dict_bytes;
   unsigned long requests_this_minute;
   unsigned long request_limit_per_minute;
   uint64_t bytes_this_minute;
@@ -91,6 +129,9 @@ void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *s
                                              const char *profile_id, int h2, int zstd,
                                              const char *qos_dscp, unsigned sampling_pct,
                                              const char *threshold, int backpressure_enabled);
+void edr_ingest_http_apply_transport_flags(int http2_required, int control_stream_enabled,
+                                           int long_poll_fallback,
+                                           int report_events_v2_enabled);
 
 /** Native HTTPS GET using the configured REST/mTLS/proxy stack; writes a binary-safe response to file. */
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes);

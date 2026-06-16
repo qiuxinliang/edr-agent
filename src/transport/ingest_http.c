@@ -1,7 +1,9 @@
 #include "edr/ingest_http.h"
 
 #include "edr/command.h"
+#include "edr/event_batch.h"
 #include "edr/grpc_client.h"
+#include "edr/transport_v2.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -36,6 +38,10 @@
 
 #ifdef EDR_HAVE_CURL_HTTP2
 #include <curl/curl.h>
+#endif
+
+#ifdef EDR_HAVE_ZSTD
+#include <zstd.h>
 #endif
 
 #ifdef _WIN32
@@ -73,8 +79,31 @@ static char s_control_schema_ver[64];
 static char s_control_profile_id[64];
 static char s_control_qos_dscp[32];
 static char s_control_threshold[32];
+static char s_data_plane_encoding[32] = "protobuf";
+static char s_data_plane_compression[32] = "identity";
 static unsigned s_control_sampling_pct;
 static int s_control_backpressure_enabled;
+static int s_http2_enabled_cfg = 1;
+static int s_http2_required_cfg;
+static int s_control_stream_enabled_cfg = 1;
+static int s_long_poll_fallback_cfg = 1;
+static int s_report_events_v2_enabled_cfg = 1;
+static unsigned long s_report_events_v2_ok;
+static unsigned long s_report_events_v2_fail;
+static unsigned long s_zstd_compress_ok;
+static unsigned long s_zstd_compress_fail;
+static uint64_t s_zstd_raw_bytes;
+static uint64_t s_zstd_wire_bytes;
+static uint64_t s_zstd_dict_bytes;
+static volatile int s_zstd_dict_loaded;
+static char s_zstd_dict_path[512];
+#ifdef EDR_HAVE_ZSTD
+static uint8_t *s_zstd_dict;
+static size_t s_zstd_dict_len;
+static int s_zstd_dict_load_attempted;
+#endif
+static char s_control_stream_status[32] = "idle";
+static char s_upload_status[32] = "idle";
 static unsigned long s_http_ok;
 static unsigned long s_http_fail;
 static unsigned long s_http_request_ok;
@@ -97,6 +126,9 @@ static unsigned long s_http2_request_ok;
 static unsigned long s_http2_request_fail;
 static unsigned long s_http2_negotiated_count;
 static unsigned long s_http2_fallback_count;
+static unsigned long s_http2_multiplex_ok;
+static unsigned long s_http2_multiplex_fail;
+static volatile int s_http2_multiplex_active;
 static volatile int s_http2_negotiated;
 static char s_negotiated_protocol[16];
 static int64_t s_native_post_fail_log_until_ms;
@@ -212,10 +244,16 @@ static const char *env_str_default(const char *name, const char *fallback) {
 
 static int http2_client_enabled(void) {
 #ifdef EDR_HAVE_CURL_HTTP2
-  return env_bool_default("EDR_HTTP2_CLIENT", 1) && env_bool_default("EDR_DATA_PLANE_HTTP2", 1);
+  return s_http2_enabled_cfg &&
+         env_bool_default("EDR_HTTP2_CLIENT", 1) &&
+         env_bool_default("EDR_DATA_PLANE_HTTP2", 1);
 #else
   return 0;
 #endif
+}
+
+static int http2_required(void) {
+  return s_http2_required_cfg || env_bool_default("EDR_HTTP2_REQUIRE", 0);
 }
 
 static unsigned long request_limit_per_minute(void) {
@@ -551,6 +589,10 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   memset(s_control_profile_id, 0, sizeof(s_control_profile_id));
   memset(s_control_qos_dscp, 0, sizeof(s_control_qos_dscp));
   memset(s_control_threshold, 0, sizeof(s_control_threshold));
+  snprintf(s_data_plane_encoding, sizeof(s_data_plane_encoding), "%s",
+           env_str_default("EDR_DATA_PLANE_ENCODING", "protobuf"));
+  snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s",
+           env_str_default("EDR_DATA_PLANE_COMPRESSION", "identity"));
   s_circuit_open = 0;
   s_circuit_until_ms = 0;
   s_circuit_reason[0] = '\0';
@@ -629,10 +671,53 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   s_control_backpressure_enabled = env_bool_default("EDR_BACKPRESSURE_PUSH_PROFILE_THROTTLE", 1);
   s_control_h2 = env_bool_default("EDR_CONTROL_CAP_H2", 1);
   s_control_zstd = env_bool_default("EDR_CONTROL_CAP_ZSTD", 0);
+  s_http2_enabled_cfg = env_bool_default("EDR_DATA_PLANE_HTTP2", 1);
+  s_http2_required_cfg = env_bool_default("EDR_HTTP2_REQUIRE", 0);
+  s_control_stream_enabled_cfg = env_bool_default("EDR_HTTP_CONTROL_STREAM", 1);
+  s_long_poll_fallback_cfg = env_bool_default("EDR_CONTROL_LONG_POLL_FALLBACK", 1);
+  s_report_events_v2_enabled_cfg = env_bool_default("EDR_REPORT_EVENTS_V2", 1);
   s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
 }
 
 int edr_ingest_http_configured(void) { return s_rest[0] != 0 && s_endpoint[0] != 0; }
+
+void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_required,
+                                                 int control_stream_enabled,
+                                                 int long_poll_fallback,
+                                                 int report_events_v2_enabled,
+                                                 const char *data_plane_encoding,
+                                                 const char *data_plane_compression) {
+  s_http2_enabled_cfg = http2_enabled ? 1 : 0;
+  s_http2_required_cfg = http2_required ? 1 : 0;
+  s_control_stream_enabled_cfg = control_stream_enabled ? 1 : 0;
+  s_long_poll_fallback_cfg = long_poll_fallback ? 1 : 0;
+  s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
+  s_control_h2 = s_http2_enabled_cfg;
+  if (data_plane_encoding && data_plane_encoding[0]) {
+    snprintf(s_data_plane_encoding, sizeof(s_data_plane_encoding), "%s", data_plane_encoding);
+  }
+  if (data_plane_compression && data_plane_compression[0]) {
+    snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s", data_plane_compression);
+  }
+  s_control_zstd = strcmp(s_data_plane_compression, "zstd") == 0 ? 1 : s_control_zstd;
+}
+
+void edr_ingest_http_apply_transport_flags(int http2_required, int control_stream_enabled,
+                                           int long_poll_fallback,
+                                           int report_events_v2_enabled) {
+  if (http2_required >= 0) {
+    s_http2_required_cfg = http2_required ? 1 : 0;
+  }
+  if (control_stream_enabled >= 0) {
+    s_control_stream_enabled_cfg = control_stream_enabled ? 1 : 0;
+  }
+  if (long_poll_fallback >= 0) {
+    s_long_poll_fallback_cfg = long_poll_fallback ? 1 : 0;
+  }
+  if (report_events_v2_enabled >= 0) {
+    s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
+  }
+}
 
 void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   if (!out) {
@@ -645,7 +730,21 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->mtls_configured = (s_client_cert_file[0] && s_client_key_file[0]) ? 1 : 0;
   out->websocket_ready = (s_ws_ready || s_stream_ready) ? 1 : 0;
   out->http2_enabled = http2_client_enabled();
+  out->http2_required = http2_required();
   out->http2_negotiated = s_http2_negotiated ? 1 : 0;
+  out->control_stream_enabled = s_control_stream_enabled_cfg;
+  out->control_stream_ready = s_stream_ready ? 1 : 0;
+  out->long_poll_fallback = s_long_poll_fallback_cfg;
+  out->report_events_v2_enabled = s_report_events_v2_enabled_cfg;
+  out->zstd_requested = strcmp(s_data_plane_compression, "zstd") == 0 || s_control_zstd;
+#ifdef EDR_HAVE_ZSTD
+  out->zstd_available = 1;
+#else
+  out->zstd_available = 0;
+#endif
+  out->zstd_dict_loaded = s_zstd_dict_loaded ? 1 : 0;
+  out->http2_multiplex_enabled = env_bool_default("EDR_HTTP2_MULTIPLEX", 1);
+  out->http2_multiplex_active = s_http2_multiplex_active ? 1 : 0;
   out->poll_backoff_ms = s_poll_backoff_ms;
   out->ws_backoff_ms = s_ws_backoff_ms;
   out->circuit_open = s_circuit_open ? 1 : 0;
@@ -672,6 +771,12 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->http2_request_fail_count = s_http2_request_fail;
   out->http2_negotiated_count = s_http2_negotiated_count;
   out->http2_fallback_count = s_http2_fallback_count;
+  out->report_events_v2_ok_count = s_report_events_v2_ok;
+  out->report_events_v2_fail_count = s_report_events_v2_fail;
+  out->zstd_compress_ok_count = s_zstd_compress_ok;
+  out->zstd_compress_fail_count = s_zstd_compress_fail;
+  out->http2_multiplex_ok_count = s_http2_multiplex_ok;
+  out->http2_multiplex_fail_count = s_http2_multiplex_fail;
   out->budget_drop_count = s_budget_drop_count;
   out->last_success_unix_ms = s_last_success_ms;
   out->last_failure_unix_ms = s_last_failure_ms;
@@ -691,6 +796,31 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
            s_mtls_status[0] ? s_mtls_status : "not_configured");
   snprintf(out->negotiated_protocol, sizeof(out->negotiated_protocol), "%s",
            s_negotiated_protocol[0] ? s_negotiated_protocol : (s_http2_negotiated ? "h2" : "http/1.1"));
+  snprintf(out->control_stream_status, sizeof(out->control_stream_status), "%s",
+           s_control_stream_status[0] ? s_control_stream_status : "idle");
+  snprintf(out->upload_status, sizeof(out->upload_status), "%s",
+           s_upload_status[0] ? s_upload_status : "idle");
+  snprintf(out->data_plane_encoding, sizeof(out->data_plane_encoding), "%s",
+           s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf");
+  snprintf(out->data_plane_compression, sizeof(out->data_plane_compression), "%s",
+           s_data_plane_compression[0] ? s_data_plane_compression : "identity");
+  snprintf(out->envelope_format, sizeof(out->envelope_format), "%s",
+           s_report_events_v2_enabled_cfg ? "protobuf:edr.transport.envelope.v1" : "legacy_json_b64");
+  snprintf(out->dict_ver, sizeof(out->dict_ver), "%s",
+           s_control_dict_ver[0] ? s_control_dict_ver : "edr-zstd-dict-v1");
+  snprintf(out->schema_ver, sizeof(out->schema_ver), "%s",
+           s_control_schema_ver[0] ? s_control_schema_ver : "edr-control-schema-v1");
+  snprintf(out->profile_id, sizeof(out->profile_id), "%s",
+           s_control_profile_id[0] ? s_control_profile_id : "default-h2-zstd");
+  snprintf(out->zstd_dict_path, sizeof(out->zstd_dict_path), "%s", s_zstd_dict_path);
+  snprintf(out->qos_dscp, sizeof(out->qos_dscp), "%s",
+           s_control_qos_dscp[0] ? s_control_qos_dscp : "AF21");
+  snprintf(out->telemetry_threshold, sizeof(out->telemetry_threshold), "%s",
+           s_control_threshold[0] ? s_control_threshold : "medium");
+  out->telemetry_sampling_pct = s_control_sampling_pct;
+  out->zstd_raw_bytes = s_zstd_raw_bytes;
+  out->zstd_wire_bytes = s_zstd_wire_bytes;
+  out->zstd_dict_bytes = s_zstd_dict_bytes;
   budget_refresh_window();
   out->requests_this_minute = s_budget_requests;
   out->request_limit_per_minute = request_limit_per_minute();
@@ -754,6 +884,8 @@ void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *s
   }
   s_control_hello_ok = 1;
   s_control_hello_last_ms = unix_ms_now();
+  edr_transport_v2_apply_profile(dict_ver, schema_ver, profile_id, h2, zstd, qos_dscp,
+                                 s_control_sampling_pct, threshold, backpressure_enabled);
 }
 
 static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -877,6 +1009,251 @@ static int b64_decode_alloc(const char *in, uint8_t **out, size_t *out_len) {
   }
   *out = buf;
   *out_len = o;
+  return 0;
+}
+
+static size_t pb_varint_len(uint64_t v) {
+  size_t n = 1u;
+  while (v >= 0x80u) {
+    v >>= 7;
+    n++;
+  }
+  return n;
+}
+
+static size_t pb_write_varint(uint8_t *out, uint64_t v) {
+  size_t n = 0u;
+  while (v >= 0x80u) {
+    out[n++] = (uint8_t)(v | 0x80u);
+    v >>= 7;
+  }
+  out[n++] = (uint8_t)v;
+  return n;
+}
+
+static size_t pb_field_len(int field_no, size_t len) {
+  return pb_varint_len((uint64_t)((field_no << 3) | 2)) + pb_varint_len((uint64_t)len) + len;
+}
+
+static size_t pb_write_bytes(uint8_t *out, int field_no, const void *data, size_t len) {
+  size_t n = 0u;
+  n += pb_write_varint(out + n, (uint64_t)((field_no << 3) | 2));
+  n += pb_write_varint(out + n, (uint64_t)len);
+  if (len > 0u && data) {
+    memcpy(out + n, data, len);
+    n += len;
+  }
+  return n;
+}
+
+static int ci_equals(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int report_events_v2_should_use(void) {
+  if (!s_report_events_v2_enabled_cfg) {
+    return 0;
+  }
+  if (ci_equals(s_data_plane_encoding, "json")) {
+    return 0;
+  }
+  return 1;
+}
+
+#ifdef EDR_HAVE_ZSTD
+static int zstd_read_dict_file(const char *path, uint8_t **out, size_t *out_len) {
+  FILE *f;
+  long sz;
+  uint8_t *buf;
+  if (!path || !path[0] || !out || !out_len) {
+    return -1;
+  }
+  *out = NULL;
+  *out_len = 0u;
+  f = fopen(path, "rb");
+  if (!f) {
+    return -1;
+  }
+  if (fseek(f, 0L, SEEK_END) != 0) {
+    fclose(f);
+    return -1;
+  }
+  sz = ftell(f);
+  if (sz <= 0L || sz > 4L * 1024L * 1024L) {
+    fclose(f);
+    return -1;
+  }
+  if (fseek(f, 0L, SEEK_SET) != 0) {
+    fclose(f);
+    return -1;
+  }
+  buf = (uint8_t *)malloc((size_t)sz);
+  if (!buf) {
+    fclose(f);
+    return -1;
+  }
+  if (fread(buf, 1u, (size_t)sz, f) != (size_t)sz) {
+    free(buf);
+    fclose(f);
+    return -1;
+  }
+  fclose(f);
+  *out = buf;
+  *out_len = (size_t)sz;
+  return 0;
+}
+
+static void zstd_load_dict_once(void) {
+  const char *path;
+  if (s_zstd_dict_load_attempted) {
+    return;
+  }
+  s_zstd_dict_load_attempted = 1;
+  path = getenv("EDR_ZSTD_DICT_PATH");
+  if (!path || !path[0]) {
+    path = getenv("EDR_CONTROL_DICT_PATH");
+  }
+  if (!path || !path[0]) {
+    return;
+  }
+  snprintf(s_zstd_dict_path, sizeof(s_zstd_dict_path), "%s", path);
+  if (zstd_read_dict_file(path, &s_zstd_dict, &s_zstd_dict_len) == 0) {
+    s_zstd_dict_loaded = 1;
+    s_zstd_dict_bytes = (uint64_t)s_zstd_dict_len;
+  }
+}
+#endif
+
+static int zstd_requested_for_data_plane(void) {
+  return ci_equals(s_data_plane_compression, "zstd") || s_control_zstd;
+}
+
+static int maybe_zstd_compress_payload(const uint8_t *raw, size_t raw_len,
+                                       uint8_t **out, size_t *out_len,
+                                       const char **codec) {
+  if (!out || !out_len || !codec) {
+    return -1;
+  }
+  *out = NULL;
+  *out_len = 0u;
+  *codec = "identity";
+  if (!zstd_requested_for_data_plane()) {
+    return 0;
+  }
+#ifdef EDR_HAVE_ZSTD
+  {
+    size_t bound;
+    uint8_t *dst;
+    size_t n;
+    int level = (int)env_ul_clamped("EDR_ZSTD_LEVEL", 3ul, 1ul, 19ul);
+    ZSTD_CCtx *cctx;
+    zstd_load_dict_once();
+    bound = ZSTD_compressBound(raw_len);
+    dst = (uint8_t *)malloc(bound);
+    if (!dst) {
+      s_zstd_compress_fail++;
+      return 0;
+    }
+    cctx = ZSTD_createCCtx();
+    if (!cctx) {
+      free(dst);
+      s_zstd_compress_fail++;
+      return 0;
+    }
+    if (s_zstd_dict && s_zstd_dict_len > 0u) {
+      n = ZSTD_compress_usingDict(cctx, dst, bound, raw, raw_len,
+                                  s_zstd_dict, s_zstd_dict_len, level);
+    } else {
+      n = ZSTD_compressCCtx(cctx, dst, bound, raw, raw_len, level);
+    }
+    ZSTD_freeCCtx(cctx);
+    if (ZSTD_isError(n)) {
+      free(dst);
+      s_zstd_compress_fail++;
+      return 0;
+    }
+    *out = dst;
+    *out_len = n;
+    *codec = "zstd";
+    s_zstd_compress_ok++;
+    s_zstd_raw_bytes += (uint64_t)raw_len;
+    s_zstd_wire_bytes += (uint64_t)n;
+    return 0;
+  }
+#else
+  s_zstd_compress_fail++;
+  return 0;
+#endif
+}
+
+static int build_report_events_v2_envelope(const char *batch_id,
+                                           const uint8_t *header12, size_t header_len,
+                                           const uint8_t *payload, size_t payload_len,
+                                           uint8_t **out, size_t *out_len) {
+  const char *version = "edr.transport.envelope.v1";
+  const char *codec = "identity";
+  size_t raw_len = header_len + payload_len;
+  const uint8_t *wire_payload;
+  size_t wire_payload_len;
+  uint8_t *compressed = NULL;
+  size_t compressed_len = 0u;
+  size_t cap;
+  uint8_t *buf;
+  uint8_t *raw;
+  size_t n = 0u;
+  if (!out || !out_len || !batch_id || !header12 || header_len == 0u || !payload || payload_len == 0u) {
+    return -1;
+  }
+  raw = (uint8_t *)malloc(raw_len);
+  if (!raw) {
+    return -1;
+  }
+  memcpy(raw, header12, header_len);
+  memcpy(raw + header_len, payload, payload_len);
+  if (maybe_zstd_compress_payload(raw, raw_len, &compressed, &compressed_len, &codec) != 0) {
+    free(raw);
+    return -1;
+  }
+  wire_payload = compressed ? compressed : raw;
+  wire_payload_len = compressed ? compressed_len : raw_len;
+  cap = pb_field_len(1, strlen(version)) +
+        pb_field_len(2, strlen(s_endpoint)) +
+        pb_field_len(3, strlen(batch_id)) +
+        pb_field_len(4, strlen(s_agent_ver)) +
+        pb_field_len(5, strlen(s_control_dict_ver)) +
+        pb_field_len(6, strlen(s_control_schema_ver)) +
+        pb_field_len(7, strlen(s_control_profile_id)) +
+        pb_field_len(8, strlen(codec)) +
+        pb_field_len(9, wire_payload_len) + 32u;
+  buf = (uint8_t *)malloc(cap);
+  if (!buf) {
+    free(compressed);
+    free(raw);
+    return -1;
+  }
+  n += pb_write_bytes(buf + n, 1, version, strlen(version));
+  n += pb_write_bytes(buf + n, 2, s_endpoint, strlen(s_endpoint));
+  n += pb_write_bytes(buf + n, 3, batch_id, strlen(batch_id));
+  n += pb_write_bytes(buf + n, 4, s_agent_ver, strlen(s_agent_ver));
+  n += pb_write_bytes(buf + n, 5, s_control_dict_ver, strlen(s_control_dict_ver));
+  n += pb_write_bytes(buf + n, 6, s_control_schema_ver, strlen(s_control_schema_ver));
+  n += pb_write_bytes(buf + n, 7, s_control_profile_id, strlen(s_control_profile_id));
+  n += pb_write_bytes(buf + n, 8, codec, strlen(codec));
+  n += pb_write_bytes(buf + n, 9, wire_payload, wire_payload_len);
+  free(compressed);
+  free(raw);
+  *out = buf;
+  *out_len = n;
   return 0;
 }
 
@@ -2142,6 +2519,35 @@ typedef struct {
   int failed;
 } EdrCurlStreamCtx;
 
+typedef struct EdrCurlMultiJob {
+  CURL *easy;
+  int done;
+  int status;
+  CURLcode result;
+  long response_code;
+  int h2;
+  EdrCurlStreamCtx *stream_ctx;
+  struct EdrCurlMultiJob *next;
+} EdrCurlMultiJob;
+
+static int curl_note_http_version(CURL *curl);
+
+#ifdef _WIN32
+static CRITICAL_SECTION s_curl_multi_mu;
+static CONDITION_VARIABLE s_curl_multi_cv;
+static HANDLE s_curl_multi_thread;
+static int s_curl_multi_mu_init;
+#else
+static pthread_mutex_t s_curl_multi_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_curl_multi_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t s_curl_multi_thread;
+#endif
+static int s_curl_multi_started;
+static CURLM *s_curl_multi;
+static EdrCurlMultiJob *s_curl_multi_pending_head;
+static EdrCurlMultiJob *s_curl_multi_pending_tail;
+static unsigned s_curl_multi_active_count;
+
 static int curl_global_ready(void) {
   static int ready = 0;
   if (ready) {
@@ -2151,6 +2557,220 @@ static int curl_global_ready(void) {
     ready = 1;
   }
   return ready;
+}
+
+static int curl_h2_multiplex_enabled(void) {
+  return env_bool_default("EDR_HTTP2_MULTIPLEX", 1);
+}
+
+static void curl_multi_sync_init(void) {
+#ifdef _WIN32
+  if (!s_curl_multi_mu_init) {
+    InitializeCriticalSection(&s_curl_multi_mu);
+    InitializeConditionVariable(&s_curl_multi_cv);
+    s_curl_multi_mu_init = 1;
+  }
+#endif
+}
+
+static void curl_multi_lock(void) {
+  curl_multi_sync_init();
+#ifdef _WIN32
+  EnterCriticalSection(&s_curl_multi_mu);
+#else
+  pthread_mutex_lock(&s_curl_multi_mu);
+#endif
+}
+
+static void curl_multi_unlock(void) {
+#ifdef _WIN32
+  LeaveCriticalSection(&s_curl_multi_mu);
+#else
+  pthread_mutex_unlock(&s_curl_multi_mu);
+#endif
+}
+
+static void curl_multi_signal(void) {
+#ifdef _WIN32
+  WakeAllConditionVariable(&s_curl_multi_cv);
+#else
+  pthread_cond_broadcast(&s_curl_multi_cv);
+#endif
+}
+
+static void curl_multi_wait_cv(void) {
+#ifdef _WIN32
+  SleepConditionVariableCS(&s_curl_multi_cv, &s_curl_multi_mu, INFINITE);
+#else
+  pthread_cond_wait(&s_curl_multi_cv, &s_curl_multi_mu);
+#endif
+}
+
+static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode result) {
+  int ok = 0;
+  if (!job) {
+    return;
+  }
+  if (multi && job->easy) {
+    curl_multi_remove_handle(multi, job->easy);
+  }
+  job->result = result;
+  job->h2 = job->easy ? curl_note_http_version(job->easy) : 0;
+  if (job->easy) {
+    (void)curl_easy_getinfo(job->easy, CURLINFO_RESPONSE_CODE, &job->response_code);
+  }
+  ok = result == CURLE_OK && job->response_code >= 200 && job->response_code < 300 &&
+       (!job->stream_ctx || !job->stream_ctx->failed) && (job->h2 || !http2_required());
+  job->status = ok ? 0 : -1;
+  if (ok) {
+    s_http2_request_ok++;
+    s_http2_multiplex_ok++;
+  } else {
+    s_http2_request_fail++;
+    s_http2_multiplex_fail++;
+  }
+  curl_multi_lock();
+  if (s_curl_multi_active_count > 0u) {
+    s_curl_multi_active_count--;
+  }
+  s_http2_multiplex_active = s_curl_multi_active_count > 0u ? 1 : 0;
+  job->done = 1;
+  curl_multi_signal();
+  curl_multi_unlock();
+}
+
+#ifdef _WIN32
+static DWORD WINAPI curl_multi_worker_main(LPVOID arg)
+#else
+static void *curl_multi_worker_main(void *arg)
+#endif
+{
+  int running = 0;
+  (void)arg;
+  for (;;) {
+    EdrCurlMultiJob *pending;
+    curl_multi_lock();
+    while (!s_curl_multi_pending_head && s_curl_multi_active_count == 0u) {
+      s_http2_multiplex_active = 0;
+      curl_multi_wait_cv();
+    }
+    pending = s_curl_multi_pending_head;
+    s_curl_multi_pending_head = NULL;
+    s_curl_multi_pending_tail = NULL;
+    curl_multi_unlock();
+
+    while (pending) {
+      EdrCurlMultiJob *next = pending->next;
+      pending->next = NULL;
+      if (curl_multi_add_handle(s_curl_multi, pending->easy) == CURLM_OK) {
+        curl_multi_lock();
+        s_curl_multi_active_count++;
+        s_http2_multiplex_active = 1;
+        curl_multi_unlock();
+      } else {
+        curl_multi_complete_job(NULL, pending, CURLE_FAILED_INIT);
+      }
+      pending = next;
+    }
+
+    (void)curl_multi_perform(s_curl_multi, &running);
+
+    for (;;) {
+      int msgs_left = 0;
+      CURLMsg *msg = curl_multi_info_read(s_curl_multi, &msgs_left);
+      if (!msg) {
+        break;
+      }
+      if (msg->msg == CURLMSG_DONE) {
+        EdrCurlMultiJob *job = NULL;
+        (void)curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &job);
+        curl_multi_complete_job(s_curl_multi, job, msg->data.result);
+      }
+    }
+
+    if (s_curl_multi_active_count > 0u || s_curl_multi_pending_head) {
+      int numfds = 0;
+      (void)curl_multi_wait(s_curl_multi, NULL, 0u, 250, &numfds);
+    }
+  }
+#ifdef _WIN32
+  return 0;
+#else
+  return NULL;
+#endif
+}
+
+static int curl_multi_worker_start(void) {
+  if (!curl_h2_multiplex_enabled() || !curl_global_ready()) {
+    return 0;
+  }
+  curl_multi_sync_init();
+  curl_multi_lock();
+  if (s_curl_multi_started) {
+    curl_multi_unlock();
+    return 1;
+  }
+  s_curl_multi = curl_multi_init();
+  if (!s_curl_multi) {
+    curl_multi_unlock();
+    return 0;
+  }
+#ifdef CURLMOPT_PIPELINING
+#ifdef CURLPIPE_MULTIPLEX
+  curl_multi_setopt(s_curl_multi, CURLMOPT_PIPELINING, (long)CURLPIPE_MULTIPLEX);
+#endif
+#endif
+#ifdef CURLMOPT_MAX_HOST_CONNECTIONS
+  curl_multi_setopt(s_curl_multi, CURLMOPT_MAX_HOST_CONNECTIONS, 1L);
+#endif
+#ifdef CURLMOPT_MAX_TOTAL_CONNECTIONS
+  curl_multi_setopt(s_curl_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 1L);
+#endif
+#ifdef _WIN32
+  s_curl_multi_thread = CreateThread(NULL, 0, curl_multi_worker_main, NULL, 0, NULL);
+  if (!s_curl_multi_thread) {
+    curl_multi_cleanup(s_curl_multi);
+    s_curl_multi = NULL;
+    curl_multi_unlock();
+    return 0;
+  }
+  CloseHandle(s_curl_multi_thread);
+#else
+  if (pthread_create(&s_curl_multi_thread, NULL, curl_multi_worker_main, NULL) != 0) {
+    curl_multi_cleanup(s_curl_multi);
+    s_curl_multi = NULL;
+    curl_multi_unlock();
+    return 0;
+  }
+  pthread_detach(s_curl_multi_thread);
+#endif
+  s_curl_multi_started = 1;
+  curl_multi_unlock();
+  return 1;
+}
+
+static int curl_h2_multi_perform(CURL *curl, EdrCurlStreamCtx *stream_ctx) {
+  EdrCurlMultiJob job;
+  if (!curl || !curl_h2_multiplex_enabled() || !curl_multi_worker_start()) {
+    return -2;
+  }
+  memset(&job, 0, sizeof(job));
+  job.easy = curl;
+  job.stream_ctx = stream_ctx;
+  curl_easy_setopt(curl, CURLOPT_PRIVATE, &job);
+  curl_multi_lock();
+  if (s_curl_multi_pending_tail) {
+    s_curl_multi_pending_tail->next = &job;
+  } else {
+    s_curl_multi_pending_head = &job;
+  }
+  s_curl_multi_pending_tail = &job;
+  curl_multi_signal();
+  while (!job.done) {
+    curl_multi_wait_cv();
+  }
+  curl_multi_unlock();
+  return job.status;
 }
 
 static size_t curl_write_buffer_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
@@ -2314,13 +2934,21 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
       curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
     }
   }
+  {
+    int mrc = curl_h2_multi_perform(curl, NULL);
+    if (mrc != -2) {
+      curl_slist_free_all(headers);
+      curl_easy_cleanup(curl);
+      return mrc;
+    }
+  }
   cc = curl_easy_perform(curl);
   h2 = curl_note_http_version(curl);
   (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 &&
-      (h2 || !env_bool_default("EDR_HTTP2_REQUIRE", 0))) {
+      (h2 || !http2_required())) {
     s_http2_request_ok++;
     return 0;
   }
@@ -2354,13 +2982,21 @@ static int curl_h2_stream_loop(const char *url) {
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)env_ul_clamped("EDR_HTTP2_STREAM_LOW_SPEED_S", 120ul, 30ul, 3600ul));
+  {
+    int mrc = curl_h2_multi_perform(curl, &ctx);
+    if (mrc != -2) {
+      curl_slist_free_all(headers);
+      curl_easy_cleanup(curl);
+      return mrc;
+    }
+  }
   cc = curl_easy_perform(curl);
   h2 = curl_note_http_version(curl);
   (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 && !ctx.failed &&
-      (h2 || !env_bool_default("EDR_HTTP2_REQUIRE", 0))) {
+      (h2 || !http2_required())) {
     s_http2_request_ok++;
     return 0;
   }
@@ -3137,16 +3773,40 @@ static void stream_process_line(const char *line) {
     return;
   }
   if (strstr(line, "\"type\":\"command_envelope\"") || strstr(line, "\"command_id\"")) {
+    edr_transport_v2_on_control("command_envelope");
     (void)poll_dispatch_one(line);
   } else if (strstr(line, "\"type\":\"server_hello\"")) {
+    int64_t batch_events = 0;
+    int64_t flush_s = 0;
+    int64_t sampling_pct = 0;
     (void)json_get_string(line, "dict_ver", s_control_dict_ver, sizeof(s_control_dict_ver));
     (void)json_get_string(line, "schema_ver", s_control_schema_ver, sizeof(s_control_schema_ver));
     (void)json_get_string(line, "profile_id", s_control_profile_id, sizeof(s_control_profile_id));
+    (void)json_get_string(line, "qos_dscp", s_control_qos_dscp, sizeof(s_control_qos_dscp));
+    (void)json_get_string(line, "threshold", s_control_threshold, sizeof(s_control_threshold));
     (void)json_get_bool(line, "h2", &s_control_h2);
     (void)json_get_bool(line, "zstd", &s_control_zstd);
+    if (json_get_int64(line, "batch_events", &batch_events) == 0 ||
+        json_get_int64(line, "flush_interval_s", &flush_s) == 0) {
+      if (batch_events < 0) batch_events = 0;
+      if (batch_events > 50000) batch_events = 50000;
+      if (flush_s < 0) flush_s = 0;
+      if (flush_s > 300) flush_s = 300;
+      edr_event_batch_apply_profile((uint32_t)batch_events, (int)flush_s);
+    }
+    if (json_get_int64(line, "sampling_pct", &sampling_pct) == 0 && sampling_pct > 0) {
+      if (sampling_pct > 100) sampling_pct = 100;
+      s_control_sampling_pct = (unsigned)sampling_pct;
+    }
     s_control_hello_ok = 1;
+    edr_transport_v2_apply_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+                                   s_control_h2, s_control_zstd, s_control_qos_dscp,
+                                   s_control_sampling_pct, s_control_threshold,
+                                   s_control_backpressure_enabled);
+    edr_transport_v2_on_control("server_hello");
   } else if (strstr(line, "\"type\":\"heartbeat\"")) {
     note_control_stream_heartbeat();
+    edr_transport_v2_on_control("heartbeat");
   }
 }
 
@@ -3354,6 +4014,34 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       payload_len == 0u) {
     return -1;
   }
+  if (report_events_v2_should_use()) {
+    uint8_t *env = NULL;
+    size_t env_len = 0u;
+    int v2rc;
+    if (build_report_events_v2_envelope(batch_id, header12, header_len, payload, payload_len,
+                                        &env, &env_len) == 0) {
+      v2rc = request_to_suffix("POST", "ingest/report-events", "application/x-protobuf",
+                               (const char *)env, env_len, NULL, 0u);
+      free(env);
+      if (v2rc == 0) {
+        s_report_events_v2_ok++;
+        note_http_request_success();
+        return 0;
+      }
+      s_report_events_v2_fail++;
+      note_http_request_failure();
+      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 1)) {
+        log_native_post_failure("report-events-v2", v2rc);
+        return -1;
+      }
+    } else {
+      s_report_events_v2_fail++;
+      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 1)) {
+        runtime_failure("report-events-v2 envelope build failed");
+        return -1;
+      }
+    }
+  }
   size_t raw_len = header_len + payload_len;
   size_t b64_cap = (raw_len / 3u + 2u) * 4u + 16u;
   char *b64 = (char *)malloc(b64_cap);
@@ -3517,9 +4205,11 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
   if (rc == 0) {
     note_http_request_success();
     note_control_ack_success();
+    edr_transport_v2_ack(command_id, 1);
   } else {
     note_http_request_failure();
     note_control_ack_failure();
+    edr_transport_v2_ack(command_id, 0);
     if (!s_last_error[0]) {
       runtime_failure("control ack http post failed");
     }
@@ -3617,6 +4307,15 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+  {
+    int mrc = curl_h2_multi_perform(curl, NULL);
+    if (mrc != -2) {
+      curl_slist_free_all(headers);
+      curl_mime_free(mime);
+      curl_easy_cleanup(curl);
+      return mrc;
+    }
+  }
   cc = curl_easy_perform(curl);
   h2 = curl_note_http_version(curl);
   (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -3624,7 +4323,7 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   curl_mime_free(mime);
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 &&
-      (h2 || !env_bool_default("EDR_HTTP2_REQUIRE", 0))) {
+      (h2 || !http2_required())) {
     s_http2_request_ok++;
     return 0;
   }
@@ -3750,8 +4449,10 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0]) {
     return -1;
   }
+  snprintf(s_upload_status, sizeof(s_upload_status), "%s", "opening");
   file = fopen(file_path, "rb");
   if (!file) {
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_open");
     runtime_failure("http upload file read failed");
     return -1;
   }
@@ -3764,22 +4465,26 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   max_mb = upload_max_mb();
   if (sz < 0 || (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
     fclose(file);
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_too_large");
     runtime_failure("http upload file too large");
     return -1;
   }
   file_len = (size_t)sz;
   if (fseek(file, 0, SEEK_SET) != 0) {
     fclose(file);
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
     runtime_failure("http upload file seek failed");
     return -1;
   }
 #ifdef EDR_HAVE_CURL_HTTP2
   if (http2_client_enabled()) {
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_h2");
     resp[0] = '\0';
     rc = curl_h2_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
     if (rc == 0) {
       note_http_request_success();
       note_upload_success();
+      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "ok_h2");
       if (out_minio_key && out_minio_key_cap > 0u) {
         (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
       }
@@ -3817,12 +4522,14 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   snprintf(post, sizeof(post), "\r\n--%s--\r\n", boundary);
   snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
   resp[0] = '\0';
+  snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_http");
   rc = request_to_suffix_multipart_file("ingest/upload-file", content_type,
                                         pre, strlen(pre), file, file_len,
                                         post, strlen(post), resp, sizeof(resp));
   if (rc == 0) {
     note_http_request_success();
     note_upload_success();
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "ok_http");
     if (out_minio_key && out_minio_key_cap > 0u) {
       (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
     }
@@ -3833,6 +4540,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   } else {
     note_http_request_failure();
     note_upload_failure();
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed");
   }
   fclose(file);
   free(uid);
@@ -4031,8 +4739,31 @@ static int edr_ingest_http_control_hello_once(void) {
   (void)json_get_string(resp, "dict_ver", s_control_dict_ver, sizeof(s_control_dict_ver));
   (void)json_get_string(resp, "schema_ver", s_control_schema_ver, sizeof(s_control_schema_ver));
   (void)json_get_string(resp, "profile_id", s_control_profile_id, sizeof(s_control_profile_id));
+  (void)json_get_string(resp, "qos_dscp", s_control_qos_dscp, sizeof(s_control_qos_dscp));
+  (void)json_get_string(resp, "threshold", s_control_threshold, sizeof(s_control_threshold));
   (void)json_get_bool(resp, "h2", &s_control_h2);
   (void)json_get_bool(resp, "zstd", &s_control_zstd);
+  {
+    int64_t batch_events = 0;
+    int64_t flush_s = 0;
+    int64_t sampling_pct = 0;
+    if (json_get_int64(resp, "batch_events", &batch_events) == 0 ||
+        json_get_int64(resp, "flush_interval_s", &flush_s) == 0) {
+      if (batch_events < 0) batch_events = 0;
+      if (batch_events > 50000) batch_events = 50000;
+      if (flush_s < 0) flush_s = 0;
+      if (flush_s > 300) flush_s = 300;
+      edr_event_batch_apply_profile((uint32_t)batch_events, (int)flush_s);
+    }
+    if (json_get_int64(resp, "sampling_pct", &sampling_pct) == 0 && sampling_pct > 0) {
+      if (sampling_pct > 100) sampling_pct = 100;
+      s_control_sampling_pct = (unsigned)sampling_pct;
+    }
+  }
+  edr_transport_v2_apply_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+                                 s_control_h2, s_control_zstd, s_control_qos_dscp,
+                                 s_control_sampling_pct, s_control_threshold,
+                                 s_control_backpressure_enabled);
   s_control_hello_ok = 1;
   rc = 0;
 done:
@@ -4063,6 +4794,16 @@ static void *control_ws_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
+    if (!s_long_poll_fallback_cfg && s_control_stream_enabled_cfg) {
+      s_poll_backoff_ms = 0;
+      sleep_poll_ms(5000);
+      continue;
+    }
+    if (!s_control_stream_enabled_cfg) {
+      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "disabled");
+      sleep_poll_ms(5000);
+      continue;
+    }
     if (s_stream_ready || s_ws_ready) {
       sleep_poll_ms(5000);
       continue;
@@ -4074,6 +4815,7 @@ static void *control_ws_thread(void *arg)
       int h2rc;
       build_control_stream_url(stream_url, sizeof(stream_url));
       s_stream_ready = 1;
+      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connecting_h2");
       note_control_stream_success();
       backoff_ms = 5000;
       s_ws_backoff_ms = 0;
@@ -4084,7 +4826,8 @@ static void *control_ws_thread(void *arg)
         continue;
       }
       note_control_stream_failure();
-      if (h2rc != -2 && env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
+      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "h2_failed");
+      if (h2rc != -2 && s_long_poll_fallback_cfg && env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
         fprintf(stderr,
                 "[ingest-stream] HTTP/2 control stream unavailable; falling back to HTTP/1.1 stream\n");
       } else if (h2rc != -2) {
@@ -4115,6 +4858,7 @@ static void *control_ws_thread(void *arg)
       continue;
     }
     s_stream_ready = 1;
+    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connected");
     note_http_request_success();
     note_control_stream_success();
     backoff_ms = 5000;
@@ -4124,6 +4868,7 @@ static void *control_ws_thread(void *arg)
       note_control_stream_failure();
     }
     s_stream_ready = 0;
+    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "disconnected");
     ws_close_conn(&conn);
     net_done();
     if (s_poll_run) {
@@ -4253,7 +4998,7 @@ void edr_ingest_http_start_command_poll(void) {
   }
   s_poll_run = 1;
   ws_mu_init_once();
-  if (!streamoff || strcmp(streamoff, "0") != 0) {
+  if (s_control_stream_enabled_cfg && (!streamoff || strcmp(streamoff, "0") != 0)) {
 #ifdef _WIN32
     s_ws_thread = (HANDLE)_beginthreadex(NULL, 0, control_ws_thread, NULL, 0, NULL);
     if (s_ws_thread) {

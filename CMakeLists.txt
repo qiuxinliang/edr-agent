@@ -171,6 +171,42 @@ if(CURL_FOUND)
 else()
   set(_EDR_HTTP2_CURL_DEFAULT OFF)
 endif()
+set(EDR_ZSTD_AVAILABLE 0)
+set(EDR_ZSTD_TARGET "")
+find_package(zstd CONFIG QUIET)
+if(TARGET zstd::libzstd_shared)
+  set(EDR_ZSTD_AVAILABLE 1)
+  set(EDR_ZSTD_TARGET zstd::libzstd_shared)
+elseif(TARGET zstd::libzstd_static)
+  set(EDR_ZSTD_AVAILABLE 1)
+  set(EDR_ZSTD_TARGET zstd::libzstd_static)
+elseif(TARGET zstd::zstd)
+  set(EDR_ZSTD_AVAILABLE 1)
+  set(EDR_ZSTD_TARGET zstd::zstd)
+else()
+  find_path(EDR_ZSTD_INCLUDE_DIR NAMES zstd.h
+    PATHS
+      ENV ZSTD_ROOT
+      "$ENV{ZSTD_ROOT}/include"
+      /opt/homebrew/include
+      /usr/local/include
+      "C:/vcpkg/installed/x64-windows/include")
+  find_library(EDR_ZSTD_LIBRARY NAMES zstd libzstd
+    PATHS
+      ENV ZSTD_ROOT
+      "$ENV{ZSTD_ROOT}/lib"
+      /opt/homebrew/lib
+      /usr/local/lib
+      "C:/vcpkg/installed/x64-windows/lib")
+  if(EDR_ZSTD_INCLUDE_DIR AND EDR_ZSTD_LIBRARY)
+    set(EDR_ZSTD_AVAILABLE 1)
+  endif()
+endif()
+if(EDR_ZSTD_AVAILABLE)
+  set(_EDR_ZSTD_DEFAULT ON)
+else()
+  set(_EDR_ZSTD_DEFAULT OFF)
+endif()
 # no-gRPC Windows production builds still use REST ingest/health over HTTPS.
 # Default to ON whenever OpenSSL is available; smoke builds without OpenSSL stay
 # fast, while release/CI presets explicitly require this option and fail if the
@@ -200,6 +236,13 @@ if(EDR_WITH_HTTP2_CURL AND NOT CURL_FOUND)
   message(FATAL_ERROR "EDR_WITH_HTTP2_CURL=ON but libcurl was not found")
 endif()
 message(STATUS "HTTP/2 ingest libcurl support: ${EDR_WITH_HTTP2_CURL}")
+option(EDR_WITH_ZSTD
+  "Enable zstd compression for HTTPS transport v2 report-events envelopes"
+  ${_EDR_ZSTD_DEFAULT})
+if(EDR_WITH_ZSTD AND NOT EDR_ZSTD_AVAILABLE)
+  message(FATAL_ERROR "EDR_WITH_ZSTD=ON but libzstd was not found")
+endif()
+message(STATUS "HTTPS transport zstd support: ${EDR_WITH_ZSTD}")
 option(EDR_WITH_P0_RULES_OPENSSL
   "Enable AES-GCM decrypt support for encrypted P0 rule bundles"
   ${_EDR_INGEST_HTTPS_OPENSSL_DEFAULT})
@@ -275,6 +318,7 @@ set(EDR_AGENT_SOURCES
   third_party/nanopb/pb_decode.c
   src/transport/event_batch.c
   src/transport/ingest_http.c
+  src/transport/transport_v2.c
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c
   src/storage/local_evidence_cache.c
@@ -551,6 +595,15 @@ if(EDR_WITH_HTTP2_CURL AND CURL_FOUND)
     target_link_libraries(edr_agent PRIVATE ${CURL_LIBRARIES})
   endif()
 endif()
+if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_ZSTD=1)
+  if(EDR_ZSTD_TARGET)
+    target_link_libraries(edr_agent PRIVATE ${EDR_ZSTD_TARGET})
+  else()
+    target_include_directories(edr_agent PRIVATE ${EDR_ZSTD_INCLUDE_DIR})
+    target_link_libraries(edr_agent PRIVATE ${EDR_ZSTD_LIBRARY})
+  endif()
+endif()
 if(EDR_WITH_FL_TRAINER AND EDR_GRPC_CLIENT_AVAILABLE)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_GRPC_FL=1)
 endif()
@@ -724,6 +777,7 @@ set(_edr_test_behavior_emit_sources
   third_party/nanopb/pb_decode.c
   src/transport/event_batch.c
   src/transport/ingest_http.c
+  src/transport/transport_v2.c
   src/transport/transport_stub.c
   src/transport/grpc_client_stub.c
   src/core/time_util.c

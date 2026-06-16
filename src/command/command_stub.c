@@ -23,6 +23,7 @@
 #include "edr/pmfe.h"
 #include "edr/response.h"
 #include "edr/resource.h"
+#include "edr/transport_v2.h"
 #include "edr/self_protect.h"
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
@@ -292,7 +293,7 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
            retryable ? "true" : "false", raw);
   int report_pending = 0;
   if (command_should_report(cmd_id, sm)) {
-    int rc = edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+    int rc = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
     if (rc != 0) {
       rc = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
     }
@@ -477,7 +478,11 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   long flush_s = 0;
   long sampling_pct = 100;
   int h2 = -1;
+  int h2_required = -1;
   int zstd = -1;
+  int control_stream_enabled = -1;
+  int long_poll_fallback = -1;
+  int report_events_v2_enabled = -1;
   int backpressure = -1;
 
   (void)parse_json_string_field(pl, len, "dict_ver", dict_ver, sizeof(dict_ver));
@@ -489,7 +494,11 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   (void)parse_json_int_field(pl, len, "flush_interval_s", &flush_s);
   (void)parse_json_int_field(pl, len, "sampling_pct", &sampling_pct);
   (void)parse_json_bool_field(pl, len, "h2", &h2);
+  (void)parse_json_bool_field(pl, len, "h2_required", &h2_required);
   (void)parse_json_bool_field(pl, len, "zstd", &zstd);
+  (void)parse_json_bool_field(pl, len, "control_stream_enabled", &control_stream_enabled);
+  (void)parse_json_bool_field(pl, len, "long_poll_fallback", &long_poll_fallback);
+  (void)parse_json_bool_field(pl, len, "report_events_v2_enabled", &report_events_v2_enabled);
   (void)parse_json_bool_field(pl, len, "backpressure_enabled", &backpressure);
 
   if (batch_events < 0) {
@@ -515,6 +524,8 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   edr_ingest_http_apply_telemetry_profile(dict_ver, schema_ver, profile_id, h2, zstd,
                                           qos_dscp, (unsigned)sampling_pct, threshold,
                                           backpressure);
+  edr_ingest_http_apply_transport_flags(h2_required, control_stream_enabled, long_poll_fallback,
+                                        report_events_v2_enabled);
 
   char detail[512];
   snprintf(detail, sizeof(detail),
@@ -1930,7 +1941,7 @@ static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   char minio_key[1024];
   minio_key[0] = '\0';
-  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "rtr_get_file", path, sha,
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
                                                         minio_key, sizeof(minio_key));
   if (upload_rc != 0) {
     upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
@@ -2168,7 +2179,7 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   (void)file_sha256_hex(path, sha);
   char minio_key[1024];
   minio_key[0] = '\0';
-  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "eventlog", path, sha,
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "eventlog", path, sha,
                                                         minio_key, sizeof(minio_key));
   if (upload_rc != 0) {
     upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "eventlog", path, sha, minio_key, sizeof(minio_key));
@@ -2337,7 +2348,7 @@ static void do_registry_query(const char *cmd_id, const uint8_t *pl, size_t len,
   (void)file_sha256_hex(path, sha);
   char minio_key[1024];
   minio_key[0] = '\0';
-  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "registry", path, sha,
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "registry", path, sha,
                                                         minio_key, sizeof(minio_key));
   if (upload_rc != 0) {
     upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "registry", path, sha, minio_key, sizeof(minio_key));
@@ -2626,7 +2637,7 @@ static int flush_upload_outbox_one(const char *pending_path) {
   }
   char minio_key[1024];
   minio_key[0] = '\0';
-  if (edr_ingest_http_upload_file_multipart(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0 ||
+  if (edr_transport_v2_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0 ||
       edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
     char done[1100];
     snprintf(done, sizeof(done), "%s.done", pending_path);
@@ -2848,7 +2859,7 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   (void)file_sha256_hex(bundle, bundle_sha);
   char upload_key[1024];
   upload_key[0] = '\0';
-  int upload_rc = edr_ingest_http_upload_file_multipart(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
                                                         upload_key, sizeof(upload_key));
   if (upload_rc != 0) {
     upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
@@ -3459,7 +3470,7 @@ static void flush_command_result_outbox(void) {
     }
     int rc = -1;
     if (edr_ingest_http_configured()) {
-      rc = edr_ingest_http_post_command_result(pending[i].command_id, &sm,
+      rc = edr_transport_v2_command_result(pending[i].command_id, &sm,
                                                pending[i].execution_status,
                                                pending[i].exit_code,
                                                pending[i].detail);

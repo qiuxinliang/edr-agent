@@ -1303,6 +1303,12 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->upload.batch_max_events > 50000u) {
     cfg->upload.batch_max_events = 50000u;
   }
+  if (cfg->platform.telemetry_sampling_pct < 1u) {
+    cfg->platform.telemetry_sampling_pct = 1u;
+  }
+  if (cfg->platform.telemetry_sampling_pct > 100u) {
+    cfg->platform.telemetry_sampling_pct = 100u;
+  }
   if (cfg->shellcode_detector.alert_threshold < 0.0) {
     cfg->shellcode_detector.alert_threshold = 0.0;
   }
@@ -1754,6 +1760,20 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->forensic_auto.collect_process_tree = true;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
+  cfg->platform.http2_enabled = true;
+  cfg->platform.http2_require = false;
+  cfg->platform.control_stream_enabled = true;
+  cfg->platform.long_poll_fallback = true;
+  cfg->platform.report_events_v2_enabled = true;
+  snprintf(cfg->platform.data_plane_encoding, sizeof(cfg->platform.data_plane_encoding), "%s", "protobuf");
+  snprintf(cfg->platform.data_plane_compression, sizeof(cfg->platform.data_plane_compression), "%s", "identity");
+  snprintf(cfg->platform.control_dict_version, sizeof(cfg->platform.control_dict_version), "%s", "edr-zstd-dict-v1");
+  snprintf(cfg->platform.control_schema_version, sizeof(cfg->platform.control_schema_version), "%s", "edr-control-schema-v1");
+  snprintf(cfg->platform.control_profile_id, sizeof(cfg->platform.control_profile_id), "%s", "default-h2-zstd");
+  snprintf(cfg->platform.qos_dscp, sizeof(cfg->platform.qos_dscp), "%s", "AF21");
+  snprintf(cfg->platform.telemetry_threshold, sizeof(cfg->platform.telemetry_threshold), "%s", "medium");
+  cfg->platform.telemetry_sampling_pct = 100u;
+  cfg->platform.backpressure_enabled = true;
   snprintf(cfg->platform.proxy_mode, sizeof(cfg->platform.proxy_mode), "%s", "auto");
 
   cfg->attack_surface.enabled = false;
@@ -1860,6 +1880,62 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.rest_user_id));
   take_string(toml_string_in(t, "rest_bearer_token"), cfg->platform.rest_bearer_token,
               sizeof(cfg->platform.rest_bearer_token));
+  {
+    toml_datum_t d = toml_bool_in(t, "http2_enabled");
+    if (d.ok) {
+      cfg->platform.http2_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "http2_require");
+    if (d.ok) {
+      cfg->platform.http2_require = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_stream_enabled");
+    if (d.ok) {
+      cfg->platform.control_stream_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "long_poll_fallback");
+    if (d.ok) {
+      cfg->platform.long_poll_fallback = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "report_events_v2_enabled");
+    if (d.ok) {
+      cfg->platform.report_events_v2_enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "data_plane_encoding"), cfg->platform.data_plane_encoding,
+              sizeof(cfg->platform.data_plane_encoding));
+  take_string(toml_string_in(t, "data_plane_compression"), cfg->platform.data_plane_compression,
+              sizeof(cfg->platform.data_plane_compression));
+  take_string(toml_string_in(t, "control_dict_version"), cfg->platform.control_dict_version,
+              sizeof(cfg->platform.control_dict_version));
+  take_string(toml_string_in(t, "control_schema_version"), cfg->platform.control_schema_version,
+              sizeof(cfg->platform.control_schema_version));
+  take_string(toml_string_in(t, "control_profile_id"), cfg->platform.control_profile_id,
+              sizeof(cfg->platform.control_profile_id));
+  take_string(toml_string_in(t, "qos_dscp"), cfg->platform.qos_dscp,
+              sizeof(cfg->platform.qos_dscp));
+  take_string(toml_string_in(t, "telemetry_threshold"), cfg->platform.telemetry_threshold,
+              sizeof(cfg->platform.telemetry_threshold));
+  {
+    toml_datum_t d = toml_int_in(t, "telemetry_sampling_pct");
+    if (d.ok) {
+      cfg->platform.telemetry_sampling_pct = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "backpressure_enabled");
+    if (d.ok) {
+      cfg->platform.backpressure_enabled = d.u.b ? true : false;
+    }
+  }
   take_string(toml_string_in(t, "proxy_mode"), cfg->platform.proxy_mode,
               sizeof(cfg->platform.proxy_mode));
   take_string(toml_string_in(t, "proxy_url"), cfg->platform.proxy_url,

@@ -27,6 +27,7 @@
 #include "edr/pmfe.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
+#include "edr/transport_v2.h"
 #include "edr/windows_event_policy.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -579,23 +580,33 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char http_conn_mode[48], http_base_url[640], http_relay_url[640], http_proxy_mode[48];
   char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
   char http_mtls_status[128], http_key_provider[48];
+  char http_negotiated_protocol[32], http_control_status[48], http_upload_status[48];
+  char http_data_encoding[48], http_data_compression[48], http_envelope_format[64];
+  char http_dict_ver[96], http_schema_ver[96], http_profile_id[96];
+  char http_zstd_dict_path[640];
+  char http_qos_dscp[48], http_threshold[48];
+  char tv2_active_channel[48], tv2_last_operation[48], tv2_last_error[192];
+  char tv2_envelope_format[64];
   char resource_pressure_reason[96];
   char poll_probe_json[1600];
   const char *hot_thread_role = "unknown";
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
+  EdrTransportV2Runtime tv2_rt;
   EdrResourceSample rs;
   EdrCollectorHealth ch;
   EdrCommandDeliveryHealth cdh;
   EdrWindowsEventFilterStatus event_filter_status;
   memset(&grpc_rt, 0, sizeof(grpc_rt));
   memset(&http_rt, 0, sizeof(http_rt));
+  memset(&tv2_rt, 0, sizeof(tv2_rt));
   memset(&rs, 0, sizeof(rs));
   memset(&ch, 0, sizeof(ch));
   memset(&cdh, 0, sizeof(cdh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
   edr_grpc_client_get_runtime(&grpc_rt);
   edr_ingest_http_get_runtime(&http_rt);
+  edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
   edr_command_get_delivery_health(&cdh);
@@ -627,6 +638,22 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.circuit_reason, http_circuit_reason, sizeof(http_circuit_reason));
   json_escape_small(http_rt.mtls_status, http_mtls_status, sizeof(http_mtls_status));
   json_escape_small(http_rt.client_key_provider, http_key_provider, sizeof(http_key_provider));
+  json_escape_small(http_rt.negotiated_protocol, http_negotiated_protocol, sizeof(http_negotiated_protocol));
+  json_escape_small(http_rt.control_stream_status, http_control_status, sizeof(http_control_status));
+  json_escape_small(http_rt.upload_status, http_upload_status, sizeof(http_upload_status));
+  json_escape_small(http_rt.data_plane_encoding, http_data_encoding, sizeof(http_data_encoding));
+  json_escape_small(http_rt.data_plane_compression, http_data_compression, sizeof(http_data_compression));
+  json_escape_small(http_rt.envelope_format, http_envelope_format, sizeof(http_envelope_format));
+  json_escape_small(http_rt.dict_ver, http_dict_ver, sizeof(http_dict_ver));
+  json_escape_small(http_rt.schema_ver, http_schema_ver, sizeof(http_schema_ver));
+  json_escape_small(http_rt.profile_id, http_profile_id, sizeof(http_profile_id));
+  json_escape_small(http_rt.zstd_dict_path, http_zstd_dict_path, sizeof(http_zstd_dict_path));
+  json_escape_small(http_rt.qos_dscp, http_qos_dscp, sizeof(http_qos_dscp));
+  json_escape_small(http_rt.telemetry_threshold, http_threshold, sizeof(http_threshold));
+  json_escape_small(tv2_rt.active_channel, tv2_active_channel, sizeof(tv2_active_channel));
+  json_escape_small(tv2_rt.last_operation, tv2_last_operation, sizeof(tv2_last_operation));
+  json_escape_small(tv2_rt.last_error, tv2_last_error, sizeof(tv2_last_error));
+  json_escape_small(tv2_rt.envelope_format, tv2_envelope_format, sizeof(tv2_envelope_format));
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
   if (strcmp(health_profile, "diagnostic") != 0) {
     char body_basic[12288];
@@ -653,7 +680,27 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"budget\":{\"requests_this_minute\":%lu,\"request_limit_per_minute\":%lu,"
         "\"bytes_this_minute\":%llu,\"byte_limit_per_minute\":%llu,"
         "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
-        "\"budget_drops\":%lu},\"slo\":{\"success_rate_pct\":%u}}},"
+        "\"budget_drops\":%lu},\"slo\":{\"success_rate_pct\":%u},"
+        "\"protocol\":{\"http2_enabled\":%s,\"http2_required\":%s,"
+        "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
+        "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
+        "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
+        "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
+        "\"report_events_v2_ok\":%lu,\"report_events_v2_fail\":%lu,"
+        "\"data_plane_encoding\":\"%s\",\"data_plane_compression\":\"%s\","
+        "\"envelope_format\":\"%s\",\"dict_ver\":\"%s\",\"schema_ver\":\"%s\","
+        "\"profile_id\":\"%s\",\"qos_dscp\":\"%s\",\"telemetry_threshold\":\"%s\","
+        "\"telemetry_sampling_pct\":%u,"
+        "\"zstd_runtime\":{\"available\":%s,\"dict_loaded\":%s,"
+        "\"dict_path\":\"%s\",\"raw_bytes\":%llu,\"wire_bytes\":%llu,"
+        "\"dict_bytes\":%llu,\"compress_ok\":%lu,\"compress_fail\":%lu},"
+        "\"http2_multiplex\":{\"enabled\":%s,\"active\":%s,"
+        "\"ok\":%lu,\"fail\":%lu},"
+        "\"transport_v2\":{\"enabled\":%s,\"opened_streams\":%lu,"
+        "\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
+        "\"resume_count\":%lu,\"control_frames\":%lu,"
+        "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
+        "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
         "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"pushed\":%llu,"
         "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
         "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
@@ -714,6 +761,29 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)http_rt.byte_limit_per_minute,
         http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
         http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
+        http_rt.http2_enabled ? "true" : "false", http_rt.http2_required ? "true" : "false",
+        http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
+        http_rt.control_stream_enabled ? "true" : "false",
+        http_rt.control_stream_ready ? "true" : "false", http_control_status,
+        http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
+        http_rt.report_events_v2_enabled ? "true" : "false",
+        http_rt.report_events_v2_ok_count, http_rt.report_events_v2_fail_count,
+        http_data_encoding, http_data_compression, http_envelope_format,
+        http_dict_ver, http_schema_ver, http_profile_id, http_qos_dscp, http_threshold,
+        http_rt.telemetry_sampling_pct,
+        http_rt.zstd_available ? "true" : "false", http_rt.zstd_dict_loaded ? "true" : "false",
+        http_zstd_dict_path,
+        (unsigned long long)http_rt.zstd_raw_bytes,
+        (unsigned long long)http_rt.zstd_wire_bytes,
+        (unsigned long long)http_rt.zstd_dict_bytes,
+        http_rt.zstd_compress_ok_count, http_rt.zstd_compress_fail_count,
+        http_rt.http2_multiplex_enabled ? "true" : "false",
+        http_rt.http2_multiplex_active ? "true" : "false",
+        http_rt.http2_multiplex_ok_count, http_rt.http2_multiplex_fail_count,
+        tv2_rt.enabled ? "true" : "false", tv2_rt.opened_streams,
+        tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
+        tv2_rt.resume_count, tv2_rt.control_frames,
+        tv2_active_channel, tv2_last_operation, tv2_envelope_format, tv2_last_error,
         edr_event_bus_capacity(agent->event_bus),
         edr_event_bus_used_approx(agent->event_bus),
         (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
@@ -861,7 +931,30 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"bytes_this_minute\":%llu,\"byte_limit_per_minute\":%llu,"
       "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
       "\"budget_drops\":%lu},"
-      "\"slo\":{\"success_rate_pct\":%u}}},"
+      "\"slo\":{\"success_rate_pct\":%u},"
+      "\"protocol\":{\"http2_enabled\":%s,\"http2_required\":%s,"
+      "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
+      "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
+      "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
+      "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
+      "\"report_events_v2_ok\":%lu,\"report_events_v2_fail\":%lu,"
+      "\"data_plane_encoding\":\"%s\",\"data_plane_compression\":\"%s\","
+      "\"envelope_format\":\"%s\",\"dict_ver\":\"%s\",\"schema_ver\":\"%s\","
+      "\"profile_id\":\"%s\",\"qos_dscp\":\"%s\",\"telemetry_threshold\":\"%s\","
+      "\"telemetry_sampling_pct\":%u,"
+      "\"zstd_runtime\":{\"available\":%s,\"dict_loaded\":%s,"
+      "\"dict_path\":\"%s\",\"raw_bytes\":%llu,\"wire_bytes\":%llu,"
+      "\"dict_bytes\":%llu,\"compress_ok\":%lu,\"compress_fail\":%lu},"
+      "\"http2_multiplex\":{\"enabled\":%s,\"active\":%s,"
+      "\"ok\":%lu,\"fail\":%lu},"
+      "\"transport_v2\":{\"enabled\":%s,\"opened_streams\":%lu,"
+      "\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
+      "\"resume_count\":%lu,\"control_frames\":%lu,"
+      "\"channel_control\":%lu,\"channel_high_sev\":%lu,"
+      "\"channel_normal\":%lu,\"channel_backfill\":%lu,"
+      "\"channel_upload\":%lu,\"channel_command_result\":%lu,"
+      "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
+      "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
       "%s"
       "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"pushed\":%llu,"
       "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
@@ -1002,7 +1095,33 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      (unsigned long long)http_rt.bytes_this_minute,
 	      (unsigned long long)http_rt.byte_limit_per_minute,
 	      http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
-      http_rt.budget_drop_count, http_rt.slo_success_rate_pct, poll_probe_json,
+      http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
+      http_rt.http2_enabled ? "true" : "false", http_rt.http2_required ? "true" : "false",
+      http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
+      http_rt.control_stream_enabled ? "true" : "false",
+      http_rt.control_stream_ready ? "true" : "false", http_control_status,
+      http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
+      http_rt.report_events_v2_enabled ? "true" : "false",
+      http_rt.report_events_v2_ok_count, http_rt.report_events_v2_fail_count,
+      http_data_encoding, http_data_compression, http_envelope_format,
+      http_dict_ver, http_schema_ver, http_profile_id, http_qos_dscp, http_threshold,
+      http_rt.telemetry_sampling_pct,
+      http_rt.zstd_available ? "true" : "false", http_rt.zstd_dict_loaded ? "true" : "false",
+      http_zstd_dict_path,
+      (unsigned long long)http_rt.zstd_raw_bytes,
+      (unsigned long long)http_rt.zstd_wire_bytes,
+      (unsigned long long)http_rt.zstd_dict_bytes,
+      http_rt.zstd_compress_ok_count, http_rt.zstd_compress_fail_count,
+      http_rt.http2_multiplex_enabled ? "true" : "false",
+      http_rt.http2_multiplex_active ? "true" : "false",
+      http_rt.http2_multiplex_ok_count, http_rt.http2_multiplex_fail_count,
+      tv2_rt.enabled ? "true" : "false", tv2_rt.opened_streams,
+      tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
+      tv2_rt.resume_count, tv2_rt.control_frames,
+      tv2_rt.channel_control, tv2_rt.channel_high_sev, tv2_rt.channel_normal,
+      tv2_rt.channel_backfill, tv2_rt.channel_upload, tv2_rt.channel_command_result,
+      tv2_active_channel, tv2_last_operation, tv2_envelope_format, tv2_last_error,
+      poll_probe_json,
       edr_event_bus_capacity(agent->event_bus),
       edr_event_bus_used_approx(agent->event_bus),
       (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),

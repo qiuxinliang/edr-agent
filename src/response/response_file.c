@@ -11,6 +11,7 @@
 #include "edr/edr_log.h"
 #include "edr/pe_verify.h"
 #include "edr/shell_exec.h"
+#include "edr/transport_v2.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -155,7 +156,7 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
       fwrite(buf, 1, (size_t)fsize, tf);
       fclose(tf);
       char minio_key[256] = {0};
-      edr_ingest_http_upload_file_multipart(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
+      edr_transport_v2_upload_file(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
       remove(tmp_path);
       char result[1280];
       snprintf(result, sizeof(result), "PE_OK sha256=%s size=%ld path=%s minio_key=%s %s",
@@ -182,7 +183,7 @@ void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     fwrite(buf, 1, (size_t)fsize, tf);
     fclose(tf);
     char minio_key[256] = {0};
-    edr_ingest_http_upload_file_multipart(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
+    edr_transport_v2_upload_file(cmd_id, tmp_path, sha, minio_key, sizeof(minio_key));
     remove(tmp_path);
     char result[768];
     snprintf(result, sizeof(result), "FILE_OK sha256=%s size=%ld path=%s minio_key=%s",

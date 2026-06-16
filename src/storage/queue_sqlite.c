@@ -4,6 +4,7 @@
 #include "edr/ingest_http.h"
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
+#include "edr/transport_v2.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -310,7 +311,7 @@ static int drain_one_row(void) {
     if (edr_ingest_http_circuit_open()) {
       return 2;
     }
-    send = edr_ingest_http_post_report_events(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
+    send = edr_transport_v2_report_events(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
   if (send != 0 && edr_grpc_client_ready()) {
     send = edr_grpc_client_send_batch(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);

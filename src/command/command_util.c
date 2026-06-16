@@ -2,6 +2,7 @@
 #include "edr/config.h"
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
+#include "edr/transport_v2.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -133,7 +134,7 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
   }
   int ok = -1;
   if (edr_ingest_http_configured()) {
-    ok = edr_ingest_http_post_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+    ok = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
   }
   if (ok != 0 && edr_grpc_client_ready()) {
     (void)edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
@@ -147,7 +148,7 @@ void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
   if (!edr_command_soar_want_report(sm)) {
     if (edr_ingest_http_configured()) {
       fprintf(stderr, "[cmd_emit_always] HTTP reporting id=%s st=%d\n", cmd_id ? cmd_id : "", (int)st);
-      int rc = edr_ingest_http_post_command_result(cmd_id, NULL, (int)st, exit_code, detail ? detail : "");
+      int rc = edr_transport_v2_command_result(cmd_id, NULL, (int)st, exit_code, detail ? detail : "");
       fprintf(stderr, "[cmd_emit_always] HTTP report rc=%d\n", rc);
     } else {
       fprintf(stderr, "[cmd_emit_always] HTTP NOT configured id=%s\n", cmd_id ? cmd_id : "");
