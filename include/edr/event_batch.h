@@ -22,6 +22,9 @@
 EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
                               int flush_timeout_s);
 
+/** 运行时画像热更新：仅调整批量条数与 flush 间隔，不重分配批次缓冲。 */
+void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s);
+
 /** 刷批并释放缓冲（进程退出 / 预处理线程停止时调用） */
 void edr_event_batch_shutdown(void);
 

@@ -64,6 +64,13 @@ static char s_proxy_url_cfg[512];
 static char s_proxy_url_active[512];
 static char s_proxy_status[96];
 static char s_connection_mode[32];
+static char s_control_dict_ver[64];
+static char s_control_schema_ver[64];
+static char s_control_profile_id[64];
+static char s_control_qos_dscp[32];
+static char s_control_threshold[32];
+static unsigned s_control_sampling_pct;
+static int s_control_backpressure_enabled;
 static unsigned long s_http_ok;
 static unsigned long s_http_fail;
 static unsigned long s_http_request_ok;
@@ -98,6 +105,10 @@ static volatile int s_poll_run;
 static int s_poll_started;
 static volatile int s_ws_ready;
 static int s_ws_started;
+static volatile int s_control_hello_ok;
+static int64_t s_control_hello_last_ms;
+static int s_control_h2;
+static int s_control_zstd;
 #ifdef _WIN32
 static HANDLE s_poll_thread;
 static HANDLE s_ws_thread;
@@ -158,6 +169,29 @@ static unsigned long env_ul_clamped(const char *name, unsigned long fallback,
   if (v < min_v) v = min_v;
   if (v > max_v) v = max_v;
   return v;
+}
+
+static int env_bool_default(const char *name, int fallback) {
+  const char *e = getenv(name);
+  if (!e || !e[0]) {
+    return fallback ? 1 : 0;
+  }
+  if (strcmp(e, "1") == 0 || strcmp(e, "true") == 0 || strcmp(e, "TRUE") == 0 ||
+      strcmp(e, "yes") == 0 || strcmp(e, "YES") == 0 || strcmp(e, "on") == 0 ||
+      strcmp(e, "ON") == 0) {
+    return 1;
+  }
+  if (strcmp(e, "0") == 0 || strcmp(e, "false") == 0 || strcmp(e, "FALSE") == 0 ||
+      strcmp(e, "no") == 0 || strcmp(e, "NO") == 0 || strcmp(e, "off") == 0 ||
+      strcmp(e, "OFF") == 0) {
+    return 0;
+  }
+  return fallback ? 1 : 0;
+}
+
+static const char *env_str_default(const char *name, const char *fallback) {
+  const char *e = getenv(name);
+  return (e && e[0]) ? e : fallback;
 }
 
 static unsigned long request_limit_per_minute(void) {
@@ -468,10 +502,17 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   memset(s_proxy_url_active, 0, sizeof(s_proxy_url_active));
   memset(s_proxy_status, 0, sizeof(s_proxy_status));
   memset(s_connection_mode, 0, sizeof(s_connection_mode));
+  memset(s_control_dict_ver, 0, sizeof(s_control_dict_ver));
+  memset(s_control_schema_ver, 0, sizeof(s_control_schema_ver));
+  memset(s_control_profile_id, 0, sizeof(s_control_profile_id));
+  memset(s_control_qos_dscp, 0, sizeof(s_control_qos_dscp));
+  memset(s_control_threshold, 0, sizeof(s_control_threshold));
   s_circuit_open = 0;
   s_circuit_until_ms = 0;
   s_circuit_reason[0] = '\0';
   s_consecutive_failures = 0;
+  s_control_hello_ok = 0;
+  s_control_hello_last_ms = 0;
   if (!relay_effective || !relay_effective[0]) {
     relay_effective = relay_url;
   }
@@ -530,6 +571,20 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
            (proxy_mode_effective && proxy_mode_effective[0]) ? proxy_mode_effective : "auto");
   copy_base_url(s_proxy_url_cfg, sizeof(s_proxy_url_cfg), proxy_url_effective);
   snprintf(s_proxy_status, sizeof(s_proxy_status), "%s", "not_used");
+  snprintf(s_control_dict_ver, sizeof(s_control_dict_ver), "%s",
+           env_str_default("EDR_CONTROL_DICT_VERSION", "edr-zstd-dict-v1"));
+  snprintf(s_control_schema_ver, sizeof(s_control_schema_ver), "%s",
+           env_str_default("EDR_CONTROL_SCHEMA_VERSION", "edr-control-schema-v1"));
+  snprintf(s_control_profile_id, sizeof(s_control_profile_id), "%s",
+           env_str_default("EDR_CONTROL_PROFILE_ID", "default-h2-zstd"));
+  snprintf(s_control_qos_dscp, sizeof(s_control_qos_dscp), "%s",
+           env_str_default("EDR_NET_QOS_DSCP", "AF21"));
+  snprintf(s_control_threshold, sizeof(s_control_threshold), "%s",
+           env_str_default("EDR_TELEMETRY_PROFILE_THRESHOLD", "medium"));
+  s_control_sampling_pct = (unsigned)env_ul_clamped("EDR_TELEMETRY_PROFILE_SAMPLING_PCT", 100ul, 1ul, 100ul);
+  s_control_backpressure_enabled = env_bool_default("EDR_BACKPRESSURE_PUSH_PROFILE_THROTTLE", 1);
+  s_control_h2 = env_bool_default("EDR_CONTROL_CAP_H2", 0);
+  s_control_zstd = env_bool_default("EDR_CONTROL_CAP_ZSTD", 0);
   s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
 }
 
@@ -604,6 +659,44 @@ void edr_ingest_http_copy_policy_version(char *out, size_t out_cap) {
     return;
   }
   snprintf(out, out_cap, "%s", s_policy_version[0] ? s_policy_version : "local");
+}
+
+void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *schema_ver,
+                                             const char *profile_id, int h2, int zstd,
+                                             const char *qos_dscp, unsigned sampling_pct,
+                                             const char *threshold, int backpressure_enabled) {
+  if (dict_ver && dict_ver[0]) {
+    snprintf(s_control_dict_ver, sizeof(s_control_dict_ver), "%s", dict_ver);
+  }
+  if (schema_ver && schema_ver[0]) {
+    snprintf(s_control_schema_ver, sizeof(s_control_schema_ver), "%s", schema_ver);
+  }
+  if (profile_id && profile_id[0]) {
+    snprintf(s_control_profile_id, sizeof(s_control_profile_id), "%s", profile_id);
+  }
+  if (qos_dscp && qos_dscp[0]) {
+    snprintf(s_control_qos_dscp, sizeof(s_control_qos_dscp), "%s", qos_dscp);
+  }
+  if (threshold && threshold[0]) {
+    snprintf(s_control_threshold, sizeof(s_control_threshold), "%s", threshold);
+  }
+  if (sampling_pct > 0u) {
+    if (sampling_pct > 100u) {
+      sampling_pct = 100u;
+    }
+    s_control_sampling_pct = sampling_pct;
+  }
+  if (h2 >= 0) {
+    s_control_h2 = h2 ? 1 : 0;
+  }
+  if (zstd >= 0) {
+    s_control_zstd = zstd ? 1 : 0;
+  }
+  if (backpressure_enabled >= 0) {
+    s_control_backpressure_enabled = backpressure_enabled ? 1 : 0;
+  }
+  s_control_hello_ok = 1;
+  s_control_hello_last_ms = unix_ms_now();
 }
 
 static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -813,6 +906,35 @@ static int json_get_string(const char *obj, const char *key, char *out, size_t c
   }
   out[o] = '\0';
   return (*q == '"') ? 0 : -1;
+}
+
+static int json_get_bool(const char *obj, const char *key, int *out) {
+  char needle[96];
+  const char *p;
+  if (!obj || !key || !out) {
+    return -1;
+  }
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  p = strstr(obj, needle);
+  if (!p) {
+    return -1;
+  }
+  p += strlen(needle);
+  while (*p && isspace((unsigned char)*p)) p++;
+  if (*p != ':') {
+    return -1;
+  }
+  p++;
+  while (*p && isspace((unsigned char)*p)) p++;
+  if (strncmp(p, "true", 4u) == 0) {
+    *out = 1;
+    return 0;
+  }
+  if (strncmp(p, "false", 5u) == 0) {
+    *out = 0;
+    return 0;
+  }
+  return -1;
 }
 
 static int json_get_int64(const char *obj, const char *key, int64_t *out) {
@@ -2498,8 +2620,11 @@ static int ws_connect_once(EdrWsConn *out) {
   memset(out, 0, sizeof(*out));
   out->fd = EDR_SOCKET_INVALID;
   rb = strlen(s_rest);
-  snprintf(url, sizeof(url), "%s%singest/control/ws?endpoint_id=%s",
-           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", s_endpoint);
+  snprintf(url, sizeof(url),
+           "%s%singest/control/ws?endpoint_id=%s&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
+           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", s_endpoint,
+           s_agent_ver, s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+           s_control_h2 ? 1 : 0, s_control_zstd ? 1 : 0);
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     return -1;
   }
@@ -3101,6 +3226,84 @@ static int ws_heartbeat_seconds(void) {
   return hb;
 }
 
+static int edr_ingest_http_control_hello_once(void) {
+  char resp[8192];
+  char *endpoint = NULL;
+  char *agent = NULL;
+  char *policy = NULL;
+  char *dict = NULL;
+  char *schema = NULL;
+  char *profile = NULL;
+  char *body = NULL;
+  size_t body_cap;
+  int rc = -1;
+  int64_t now = unix_ms_now();
+  int retry_ms = (int)env_ul_clamped("EDR_CONTROL_HELLO_RETRY_MS", 30000ul, 5000ul, 300000ul);
+  if (!edr_ingest_http_configured()) {
+    return -1;
+  }
+  if (s_control_hello_ok) {
+    return 0;
+  }
+  if (s_control_hello_last_ms > 0 && now - s_control_hello_last_ms < (int64_t)retry_ms) {
+    return -1;
+  }
+  s_control_hello_last_ms = now;
+  endpoint = json_escape_alloc(s_endpoint);
+  agent = json_escape_alloc(s_agent_ver);
+  policy = json_escape_alloc(s_policy_version[0] ? s_policy_version : "local");
+  dict = json_escape_alloc(s_control_dict_ver[0] ? s_control_dict_ver : "edr-zstd-dict-v1");
+  schema = json_escape_alloc(s_control_schema_ver[0] ? s_control_schema_ver : "edr-control-schema-v1");
+  profile = json_escape_alloc(s_control_profile_id[0] ? s_control_profile_id : "default-h2-zstd");
+  if (!endpoint || !agent || !policy || !dict || !schema || !profile) {
+    goto done;
+  }
+  body_cap = strlen(endpoint) + strlen(agent) + strlen(policy) + strlen(dict) +
+             strlen(schema) + strlen(profile) + 1024u;
+  body = (char *)malloc(body_cap);
+  if (!body) {
+    goto done;
+  }
+  snprintf(body, body_cap,
+           "{\"type\":\"client_hello\",\"endpoint_id\":\"%s\",\"agent_version\":\"%s\","
+           "\"policy_version\":\"%s\",\"h2\":%s,\"zstd\":%s,"
+           "\"dict_ver\":\"%s\",\"schema_ver\":\"%s\",\"profile_id\":\"%s\","
+           "\"capabilities\":{\"h2\":%s,\"zstd\":%s,\"dict_ver\":\"%s\","
+           "\"schema_ver\":\"%s\",\"profile_id\":\"%s\"},"
+           "\"supported_schema\":[\"%s\"],\"supported_dicts\":[\"%s\"],\"profiles\":[\"%s\"]}",
+           endpoint, agent, policy,
+           s_control_h2 ? "true" : "false",
+           s_control_zstd ? "true" : "false",
+           dict, schema, profile,
+           s_control_h2 ? "true" : "false",
+           s_control_zstd ? "true" : "false",
+           dict, schema, profile,
+           schema, dict, profile);
+  resp[0] = '\0';
+  if (request_to_suffix("POST", "ingest/control/hello", "application/json",
+                        body, strlen(body), resp, sizeof(resp)) != 0) {
+    note_http_request_failure();
+    goto done;
+  }
+  note_http_request_success();
+  (void)json_get_string(resp, "dict_ver", s_control_dict_ver, sizeof(s_control_dict_ver));
+  (void)json_get_string(resp, "schema_ver", s_control_schema_ver, sizeof(s_control_schema_ver));
+  (void)json_get_string(resp, "profile_id", s_control_profile_id, sizeof(s_control_profile_id));
+  (void)json_get_bool(resp, "h2", &s_control_h2);
+  (void)json_get_bool(resp, "zstd", &s_control_zstd);
+  s_control_hello_ok = 1;
+  rc = 0;
+done:
+  free(endpoint);
+  free(agent);
+  free(policy);
+  free(dict);
+  free(schema);
+  free(profile);
+  free(body);
+  return rc;
+}
+
 static void sleep_poll_ms(int ms);
 
 #ifdef _WIN32
@@ -3123,6 +3326,7 @@ static void *control_ws_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
+    (void)edr_ingest_http_control_hello_once();
     if (ws_connect_once(&conn) != 0) {
       s_ws_backoff_ms = backoff_ms;
       sleep_poll_ms(backoff_ms);
@@ -3229,8 +3433,11 @@ static int edr_ingest_http_poll_once(void) {
       wait_s = v;
     }
   }
-  snprintf(suffix, sizeof(suffix), "ingest/poll-commands?endpoint_id=%s&limit=8&wait_s=%d",
-           s_endpoint, wait_s);
+  (void)edr_ingest_http_control_hello_once();
+  snprintf(suffix, sizeof(suffix),
+           "ingest/poll-commands?endpoint_id=%s&limit=8&wait_s=%d&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
+           s_endpoint, wait_s, s_agent_ver, s_control_dict_ver, s_control_schema_ver,
+           s_control_profile_id, s_control_h2 ? 1 : 0, s_control_zstd ? 1 : 0);
   resp[0] = '\0';
   if (request_to_suffix("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp)) != 0) {
     note_http_request_failure();

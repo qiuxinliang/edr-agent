@@ -74,6 +74,12 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out);
 void edr_ingest_http_set_policy_version(const char *policy_version);
 void edr_ingest_http_copy_policy_version(char *out, size_t out_cap);
 
+/** 控制面热更新字典 / Schema / 上报画像 / QoS / 背压治理状态。 */
+void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *schema_ver,
+                                             const char *profile_id, int h2, int zstd,
+                                             const char *qos_dscp, unsigned sampling_pct,
+                                             const char *threshold, int backpressure_enabled);
+
 /** Native HTTPS GET using the configured REST/mTLS/proxy stack; writes a binary-safe response to file. */
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes);
 

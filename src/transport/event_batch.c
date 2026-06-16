@@ -316,6 +316,23 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
   return EDR_OK;
 }
 
+void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s) {
+  if (flush_timeout_s < 0) {
+    flush_timeout_s = 0;
+  }
+  if (flush_timeout_s > 300) {
+    flush_timeout_s = 300;
+  }
+  s_max_frames = max_frames_per_batch;
+  s_flush_timeout_s = flush_timeout_s;
+  if (s_used > 0u) {
+    batch_note_write();
+  }
+  if (s_max_frames > 0u && s_frame_count >= s_max_frames) {
+    flush_locked();
+  }
+}
+
 void edr_event_batch_shutdown(void) {
   flush_locked();
   free(s_buf);

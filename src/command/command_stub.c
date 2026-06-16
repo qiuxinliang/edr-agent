@@ -16,6 +16,7 @@
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
 #include "edr/error.h"
+#include "edr/event_batch.h"
 #include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
@@ -365,6 +366,76 @@ static int parse_json_string_field(const uint8_t *p, size_t len, const char *key
   return out[0] ? 0 : -1;
 }
 
+static int parse_json_int_field(const uint8_t *p, size_t len, const char *key, long *out) {
+  if (!p || len == 0u || !key || !out) {
+    return -1;
+  }
+  char tmp[8192];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, p, len);
+  tmp[len] = 0;
+  char pat[96];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  char *keyp = strstr(tmp, pat);
+  if (!keyp) {
+    return -1;
+  }
+  char *colon = strchr(keyp + strlen(pat), ':');
+  if (!colon) {
+    return -1;
+  }
+  char *start = colon + 1;
+  while (*start && (isspace((unsigned char)*start) || *start == '"' || *start == '\'')) {
+    start++;
+  }
+  char *end = NULL;
+  long v = strtol(start, &end, 10);
+  if (!end || end == start) {
+    return -1;
+  }
+  *out = v;
+  return 0;
+}
+
+static int parse_json_bool_field(const uint8_t *p, size_t len, const char *key, int *out) {
+  if (!p || len == 0u || !key || !out) {
+    return -1;
+  }
+  char tmp[8192];
+  if (len >= sizeof(tmp)) {
+    len = sizeof(tmp) - 1u;
+  }
+  memcpy(tmp, p, len);
+  tmp[len] = 0;
+  char pat[96];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  char *keyp = strstr(tmp, pat);
+  if (!keyp) {
+    return -1;
+  }
+  char *colon = strchr(keyp + strlen(pat), ':');
+  if (!colon) {
+    return -1;
+  }
+  char *start = colon + 1;
+  while (*start && isspace((unsigned char)*start)) {
+    start++;
+  }
+  if (strncmp(start, "true", 4u) == 0 || strncmp(start, "\"true\"", 6u) == 0 ||
+      strncmp(start, "1", 1u) == 0 || strncmp(start, "\"1\"", 3u) == 0) {
+    *out = 1;
+    return 0;
+  }
+  if (strncmp(start, "false", 5u) == 0 || strncmp(start, "\"false\"", 7u) == 0 ||
+      strncmp(start, "0", 1u) == 0 || strncmp(start, "\"0\"", 3u) == 0) {
+    *out = 0;
+    return 0;
+  }
+  return -1;
+}
+
 static int parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
   *out_pid = -1;
   if (!p || len == 0u) {
@@ -393,6 +464,71 @@ static int parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
     return -1;
   }
   return 0;
+}
+
+static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, size_t len,
+                                        const EdrSoarCommandMeta *sm) {
+  char dict_ver[64] = "";
+  char schema_ver[64] = "";
+  char profile_id[64] = "";
+  char qos_dscp[32] = "";
+  char threshold[32] = "";
+  long batch_events = 0;
+  long flush_s = 0;
+  long sampling_pct = 100;
+  int h2 = -1;
+  int zstd = -1;
+  int backpressure = -1;
+
+  (void)parse_json_string_field(pl, len, "dict_ver", dict_ver, sizeof(dict_ver));
+  (void)parse_json_string_field(pl, len, "schema_ver", schema_ver, sizeof(schema_ver));
+  (void)parse_json_string_field(pl, len, "profile_id", profile_id, sizeof(profile_id));
+  (void)parse_json_string_field(pl, len, "qos_dscp", qos_dscp, sizeof(qos_dscp));
+  (void)parse_json_string_field(pl, len, "threshold", threshold, sizeof(threshold));
+  (void)parse_json_int_field(pl, len, "batch_max_events", &batch_events);
+  (void)parse_json_int_field(pl, len, "flush_interval_s", &flush_s);
+  (void)parse_json_int_field(pl, len, "sampling_pct", &sampling_pct);
+  (void)parse_json_bool_field(pl, len, "h2", &h2);
+  (void)parse_json_bool_field(pl, len, "zstd", &zstd);
+  (void)parse_json_bool_field(pl, len, "backpressure_enabled", &backpressure);
+
+  if (batch_events < 0) {
+    batch_events = 0;
+  }
+  if (batch_events > 50000) {
+    batch_events = 50000;
+  }
+  if (flush_s < 0) {
+    flush_s = 0;
+  }
+  if (flush_s > 300) {
+    flush_s = 300;
+  }
+  if (sampling_pct < 1) {
+    sampling_pct = 1;
+  }
+  if (sampling_pct > 100) {
+    sampling_pct = 100;
+  }
+
+  edr_event_batch_apply_profile((uint32_t)batch_events, (int)flush_s);
+  edr_ingest_http_apply_telemetry_profile(dict_ver, schema_ver, profile_id, h2, zstd,
+                                          qos_dscp, (unsigned)sampling_pct, threshold,
+                                          backpressure);
+
+  char detail[512];
+  snprintf(detail, sizeof(detail),
+           "telemetry profile applied profile=%s dict=%s schema=%s batch=%ld flush=%lds sampling=%ld%% dscp=%s backpressure=%s",
+           profile_id[0] ? profile_id : "-",
+           dict_ver[0] ? dict_ver : "-",
+           schema_ver[0] ? schema_ver : "-",
+           batch_events, flush_s, sampling_pct,
+           qos_dscp[0] ? qos_dscp : "-",
+           backpressure == 1 ? "on" : (backpressure == 0 ? "off" : "inherit"));
+  s_handled++;
+  s_exec_ok++;
+  audit_both(cmd_id, detail);
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
 /** payload UTF-8 JSON：`{"path":"C:\\file.exe"}` 或含 `"path":"..."` */
@@ -3455,6 +3591,11 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     }
     s_handled++;
     soar_emit(id, sm, EdrCmdExecOk, 0, "echo");
+    return;
+  }
+
+  if (streq(t, "telemetry_profile_update") || streq(t, "runtime_profile_update")) {
+    do_telemetry_profile_update(id, payload, payload_len, sm);
     return;
   }
 
