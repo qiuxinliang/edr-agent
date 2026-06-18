@@ -3,7 +3,12 @@
   "version-string": "1.0.0",
   "description": "EDR Agent — C runtime with vcpkg manifest for Windows client build dependencies.",
   "dependencies": [
-    "curl",
+    {
+      "name": "curl",
+      "features": [
+        "http2"
+      ]
+    },
     "openssl",
     "pcre2",
     "sqlite3"

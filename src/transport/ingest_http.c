@@ -131,6 +131,8 @@ static unsigned long s_http2_multiplex_fail;
 static volatile int s_http2_multiplex_active;
 static volatile int s_http2_negotiated;
 static char s_negotiated_protocol[16];
+static int s_transport_capability_logged;
+static int s_alpn_log_state;
 static int64_t s_native_post_fail_log_until_ms;
 static unsigned long s_native_post_fail_log_suppressed;
 static int64_t s_last_success_ms;
@@ -254,6 +256,50 @@ static int http2_client_enabled(void) {
 
 static int http2_required(void) {
   return s_http2_required_cfg || env_bool_default("EDR_HTTP2_REQUIRE", 0);
+}
+
+static void log_transport_capabilities_once(void) {
+  if (s_transport_capability_logged) {
+    return;
+  }
+  s_transport_capability_logged = 1;
+#ifdef EDR_HAVE_CURL_HTTP2
+  {
+    curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+    long features = info ? (long)info->features : 0L;
+    int feature_http2 = 0;
+#ifdef CURL_VERSION_HTTP2
+    feature_http2 = (features & CURL_VERSION_HTTP2) ? 1 : 0;
+#endif
+    fprintf(stderr,
+            "[transport] EDR_HAVE_CURL_HTTP2=1 libcurl=%s ssl=%s features_http2=%d "
+            "http2_enabled=%d http2_required=%d control_stream_enabled=%d long_poll_fallback=%d "
+            "data_encoding=%s data_compression=%s\n",
+            info && info->version ? info->version : "unknown",
+            info && info->ssl_version ? info->ssl_version : "unknown",
+            feature_http2,
+            http2_client_enabled(),
+            http2_required(),
+            s_control_stream_enabled_cfg,
+            s_long_poll_fallback_cfg,
+            s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf",
+            s_data_plane_compression[0] ? s_data_plane_compression : "identity");
+    if (!feature_http2) {
+      fprintf(stderr,
+              "[transport] warning: EDR_HAVE_CURL_HTTP2=1 but runtime libcurl does not advertise "
+              "CURL_VERSION_HTTP2; install libcurl built with nghttp2\n");
+    }
+  }
+#else
+  fprintf(stderr,
+          "[transport] EDR_HAVE_CURL_HTTP2=0 http2_enabled=0 http2_required=%d "
+          "control_stream_enabled=%d long_poll_fallback=%d data_encoding=%s data_compression=%s\n",
+          http2_required(),
+          s_control_stream_enabled_cfg,
+          s_long_poll_fallback_cfg,
+          s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf",
+          s_data_plane_compression[0] ? s_data_plane_compression : "identity");
+#endif
 }
 
 static unsigned long request_limit_per_minute(void) {
@@ -700,6 +746,7 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
     snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s", data_plane_compression);
   }
   s_control_zstd = strcmp(s_data_plane_compression, "zstd") == 0 ? 1 : s_control_zstd;
+  log_transport_capabilities_once();
 }
 
 void edr_ingest_http_apply_transport_flags(int http2_required, int control_stream_enabled,
@@ -2870,6 +2917,12 @@ static int curl_note_http_version(CURL *curl) {
       s_http2_negotiated = 1;
       s_http2_negotiated_count++;
       snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "h2");
+      if (s_alpn_log_state != 1) {
+        s_alpn_log_state = 1;
+        fprintf(stderr, "[transport] ALPN negotiated h2 control_stream_status=%s endpoint=%s\n",
+                s_control_stream_status[0] ? s_control_stream_status : "idle",
+                s_endpoint[0] ? s_endpoint : "-");
+      }
       return 1;
     }
 #endif
@@ -2880,6 +2933,16 @@ static int curl_note_http_version(CURL *curl) {
   s_http2_fallback_count++;
   if (!s_negotiated_protocol[0]) {
     snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
+  }
+  if (s_alpn_log_state != 2) {
+    s_alpn_log_state = 2;
+    fprintf(stderr,
+            "[transport] ALPN did not negotiate h2; negotiated_protocol=%s "
+            "http2_required=%d control_stream_status=%s fallback_count=%lu\n",
+            s_negotiated_protocol[0] ? s_negotiated_protocol : "http/1.1",
+            http2_required(),
+            s_control_stream_status[0] ? s_control_stream_status : "idle",
+            s_http2_fallback_count);
   }
   return 0;
 }

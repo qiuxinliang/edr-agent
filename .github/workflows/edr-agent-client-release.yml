@@ -88,10 +88,18 @@ jobs:
         run: |
           set -euo pipefail
           ref="${GITHUB_REF_NAME}"
-          if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
+          if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Invalid tag '${ref}'."
             exit 1
           fi
+          version="${ref#win_}"
+          printf '%s\n' "${version}" > VERSION
+          {
+            echo "EDR_AGENT_RELEASE_TAG=${ref}"
+            echo "EDR_AGENT_VERSION=${version}"
+          } >> "${GITHUB_ENV}"
+          echo "release tag: ${ref}"
+          echo "agent version: ${version}"
 
       - name: Cache vcpkg (installed + downloads + binary cache)
         uses: actions/cache@v5
@@ -262,6 +270,12 @@ jobs:
           $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
           if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
           if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
+          if (-not $env:EDR_AGENT_VERSION) {
+            throw "EDR_AGENT_VERSION was not resolved from the release tag"
+          }
+          if (-not $text.Contains($env:EDR_AGENT_VERSION)) {
+            throw "edr_agent.exe does not contain release version '$env:EDR_AGENT_VERSION'"
+          }
 
       - name: sccache stats
         shell: bash
@@ -311,9 +325,8 @@ jobs:
           }
           if (-not $outDir) { throw "missing edr_agent.exe under build\Release or build" }
           $items = New-Object System.Collections.Generic.List[string]
-          if (-not (Test-Path "VERSION")) {
-            [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
-          }
+          if (-not $env:EDR_AGENT_VERSION) { throw "EDR_AGENT_VERSION was not resolved from the release tag" }
+          [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
           $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
@@ -347,34 +360,51 @@ jobs:
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
           if (-not (Test-Path -LiteralPath $zip)) { throw "package was not created: $zip" }
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $entries = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip)).Entries.FullName
-          if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
-            throw "plaintext P0 rule bundle must not be packaged"
-          }
-          if ($entries -match '(^|/|\\)p0_rule_bundle_manifest\.json$') {
-            throw "plaintext P0 rule manifest must not be packaged"
-          }
-          if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
-            throw "encrypted P0 rule bundle missing from package"
-          }
-          if (-not ($entries -match '(^|/|\\)VERSION$')) {
-            throw "VERSION file missing from package"
-          }
-          if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
-            throw "edr_agent_setup.exe missing from package"
-          }
-          foreach ($required in @(
-            'edr_agent_install\.ps1',
-            'edr_agent_preflight\.ps1',
-            'edr_agent_zip_deploy\.ps1',
-            'windows_service_install\.ps1',
-            'windows_isolate_host\.ps1',
-            'agent_windows_production\.example\.toml',
-            'sensor_interest_manifest\.json'
-          )) {
-            if (-not ($entries -match "(^|/|\\)${required}$")) {
-              throw "required package entry missing: $required"
+          $zipObj = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $entries = $zipObj.Entries.FullName
+            if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
+              throw "plaintext P0 rule bundle must not be packaged"
             }
+            if ($entries -match '(^|/|\\)p0_rule_bundle_manifest\.json$') {
+              throw "plaintext P0 rule manifest must not be packaged"
+            }
+            if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
+              throw "encrypted P0 rule bundle missing from package"
+            }
+            $versionEntry = $zipObj.Entries | Where-Object { $_.FullName -match '(^|/|\\)VERSION$' } | Select-Object -First 1
+            if (-not $versionEntry) {
+              throw "VERSION file missing from package"
+            }
+            $reader = New-Object System.IO.StreamReader($versionEntry.Open())
+            try {
+              $packagedVersion = $reader.ReadToEnd().Trim()
+            }
+            finally {
+              $reader.Dispose()
+            }
+            if ($packagedVersion -ne $env:EDR_AGENT_VERSION) {
+              throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
+            }
+            if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
+              throw "edr_agent_setup.exe missing from package"
+            }
+            foreach ($required in @(
+              'edr_agent_install\.ps1',
+              'edr_agent_preflight\.ps1',
+              'edr_agent_zip_deploy\.ps1',
+              'windows_service_install\.ps1',
+              'windows_isolate_host\.ps1',
+              'agent_windows_production\.example\.toml',
+              'sensor_interest_manifest\.json'
+            )) {
+              if (-not ($entries -match "(^|/|\\)${required}$")) {
+                throw "required package entry missing: $required"
+              }
+            }
+          }
+          finally {
+            $zipObj.Dispose()
           }
 
       - name: Move artifact to workspace

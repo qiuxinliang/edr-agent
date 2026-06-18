@@ -44,6 +44,8 @@ build_local() {
     -G Ninja
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
     -DEDR_WITH_GRPC=ON
+    -DEDR_WITH_HTTP2_CURL=ON
+    -DEDR_REQUIRE_CURL_HTTP2=ON
     -S "$ROOT"
   )
   if [[ -n "$GRPC_PREFIX" ]]; then

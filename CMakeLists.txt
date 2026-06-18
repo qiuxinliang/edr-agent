@@ -235,6 +235,28 @@ option(EDR_WITH_HTTP2_CURL
 if(EDR_WITH_HTTP2_CURL AND NOT CURL_FOUND)
   message(FATAL_ERROR "EDR_WITH_HTTP2_CURL=ON but libcurl was not found")
 endif()
+option(EDR_REQUIRE_CURL_HTTP2
+  "Fail configure when EDR_WITH_HTTP2_CURL=ON but curl headers do not expose HTTP/2 support"
+  OFF)
+if(EDR_WITH_HTTP2_CURL)
+  include(CheckCSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${CURL_INCLUDE_DIRS})
+  if(TARGET CURL::libcurl)
+    set(CMAKE_REQUIRED_LIBRARIES CURL::libcurl)
+  else()
+    set(CMAKE_REQUIRED_LIBRARIES ${CURL_LIBRARIES})
+  endif()
+  check_c_source_compiles("
+    #include <curl/curl.h>
+    #ifndef CURL_VERSION_HTTP2
+    #error CURL_VERSION_HTTP2 missing
+    #endif
+    int main(void) { return 0; }
+  " EDR_CURL_HEADERS_EXPOSE_HTTP2)
+  if(EDR_REQUIRE_CURL_HTTP2 AND NOT EDR_CURL_HEADERS_EXPOSE_HTTP2)
+    message(FATAL_ERROR "EDR_REQUIRE_CURL_HTTP2=ON but curl headers do not expose CURL_VERSION_HTTP2; install libcurl built with nghttp2")
+  endif()
+endif()
 message(STATUS "HTTP/2 ingest libcurl support: ${EDR_WITH_HTTP2_CURL}")
 option(EDR_WITH_ZSTD
   "Enable zstd compression for HTTPS transport v2 report-events envelopes"
