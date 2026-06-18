@@ -561,6 +561,8 @@ begin
     EdrFailureReason := Title + ' failed with exit code ' + IntToStr(Code)
   else
     EdrFailureReason := Title + ' could not be started';
+  if Title = 'Enroll and write configuration' then
+    EdrFailureReason := EdrFailureReason + '; enroll log: ' + EdrDiagnosticsFile('enroll-output.log');
   EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
   if Critical then
   begin
@@ -633,7 +635,8 @@ end;
 function EdrEnrollPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_install_wizard_enroll.ps1') + '" "'
-    + ExpandConstant('{tmp}\edr_wizard_enroll.json') + '" "' + ExpandConstant('{app}\agent.toml') + '"';
+    + ExpandConstant('{tmp}\edr_wizard_enroll.json') + '" "' + ExpandConstant('{app}\agent.toml') + '" "'
+    + EdrDiagnosticsDir + '"';
 end;
 
 function EdrEnsureTomlPsParameters: string;

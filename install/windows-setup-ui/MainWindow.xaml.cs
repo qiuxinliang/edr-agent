@@ -329,7 +329,14 @@ public partial class MainWindow : Window
 
             if (proc.ExitCode != 0)
             {
-                throw new InvalidOperationException($"安装器返回失败代码 {proc.ExitCode}");
+                var stageState = ReadInstallStageState(installPath);
+                var detail = stageState == null ? "" : $"；{stageState.Stage}：{stageState.Detail}";
+                var enrollLog = Path.Combine(installPath, "diagnostics", "enroll-output.log");
+                if (File.Exists(enrollLog))
+                {
+                    detail += $"；注册日志：{enrollLog}";
+                }
+                throw new InvalidOperationException($"安装器返回失败代码 {proc.ExitCode}{detail}");
             }
 
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
@@ -963,6 +970,7 @@ public partial class MainWindow : Window
             ["proxy_mode"] = NormalizeProxyMode(request.ProxyMode),
             ["proxy_url"] = effectiveProxyUrl,
             ["relay_url"] = effectiveRelayUrl,
+            ["key_provider"] = "pem",
             ["install_mode"] = normalizedMode,
             ["runtime_mode"] = runtimeMode,
             ["trust_ca"] = request.TrustCa,
