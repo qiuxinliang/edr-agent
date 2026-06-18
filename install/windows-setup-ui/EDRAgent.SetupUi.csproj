@@ -8,6 +8,7 @@
     <AssemblyName>edr_agent_setup_ui</AssemblyName>
     <RootNamespace>EDRAgent.SetupUi</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SatelliteResourceLanguages>zh-CN;en-US</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>

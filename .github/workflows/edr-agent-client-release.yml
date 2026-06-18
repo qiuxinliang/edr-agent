@@ -365,7 +365,7 @@ jobs:
           & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
-          $null = $items.Add($setupUiZip)
+          Write-Host "Setup UI package is uploaded as a separate release asset and is not nested into the runtime zip."
 
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
           if (-not (Test-Path -LiteralPath $zip)) { throw "package was not created: $zip" }
@@ -398,9 +398,6 @@ jobs:
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"
-            }
-            if (-not ($entries -match '(^|/|\\)edr_agent_setup_ui\.zip$')) {
-              throw "edr_agent_setup_ui.zip missing from package"
             }
             foreach ($required in @(
               'edr_agent_install\.ps1',
@@ -468,7 +465,6 @@ jobs:
           fi
           unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)p0_rule_bundle_ir_v1\.json\.enc$' >/dev/null
           unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)VERSION$' >/dev/null
-          unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)edr_agent_setup_ui\.zip$' >/dev/null
       - uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

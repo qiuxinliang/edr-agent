@@ -105,12 +105,17 @@ foreach ($candidate in $publishDirCandidates) {
     Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+$readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { "false" }
 dotnet publish $project `
     -c $Configuration `
     -r win-x64 `
     --self-contained true `
     -p:Version=$AppVersion `
-    -p:PublishSingleFile=false
+    -p:PublishSingleFile=false `
+    "-p:PublishReadyToRun=$readyToRun" `
+    -p:DebugType=None `
+    -p:DebugSymbols=false `
+    "-p:SatelliteResourceLanguages=zh-CN;en-US"
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit $LASTEXITCODE"
 }
@@ -172,7 +177,7 @@ if ($outParent) {
 }
 Remove-Item -LiteralPath $OutputZip -Force -ErrorAction SilentlyContinue
 
-$items = Get-ChildItem -LiteralPath $publishDir -Force
+$items = Get-ChildItem -LiteralPath $publishDir -Force | Where-Object { $_.Name -notmatch '\.(pdb|xml)$' }
 Compress-Archive -Path $items.FullName -DestinationPath $OutputZip -Force
 if (-not (Test-Path -LiteralPath $OutputZip)) {
     throw "Setup UI package was not created: $OutputZip"

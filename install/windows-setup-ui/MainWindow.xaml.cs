@@ -11,11 +11,14 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
+using System.Windows.Interop;
 
 namespace EDRAgent.SetupUi;
 
 public partial class MainWindow : Window
 {
+    private const int WmNcLButtonDown = 0x00A1;
+    private const int HtCaption = 2;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _baseDir = AppContext.BaseDirectory;
     private string _setupPath = string.Empty;
@@ -168,6 +171,7 @@ public partial class MainWindow : Window
             setupFound = File.Exists(_setupPath),
             setupPath = _setupPath,
             agentVersion = ResolveVersion(),
+            architecture = DescribeArchitectureForHeader(),
             elevated = IsElevated(),
             webView2Version = Browser.CoreWebView2?.Environment.BrowserVersionString ?? "",
             preconfig = _preconfig
@@ -207,9 +211,7 @@ public partial class MainWindow : Window
         var checks = new List<CheckItem>
         {
             CheckItem.Ok("操作系统", RuntimeInformation.OSDescription.Trim()),
-            RuntimeInformation.OSArchitecture == Architecture.X64
-                ? CheckItem.Ok("系统架构", "x64 / AMD64")
-                : CheckItem.Fail("系统架构", $"当前为 {RuntimeInformation.OSArchitecture}，此安装包要求 x64"),
+            CheckSystemArchitecture(),
             File.Exists(_setupPath)
                 ? CheckItem.Ok("安装包", Path.GetFileName(_setupPath))
                 : CheckItem.Fail("安装包", "未找到同目录 edr_agent_setup.exe"),
@@ -1028,6 +1030,36 @@ public partial class MainWindow : Window
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
+    private static CheckItem CheckSystemArchitecture()
+    {
+        var os = RuntimeInformation.OSArchitecture;
+        var process = RuntimeInformation.ProcessArchitecture;
+        if (os == Architecture.X64 && process == Architecture.X64)
+        {
+            return CheckItem.Ok("系统架构", "x64 / AMD64");
+        }
+        if (os == Architecture.Arm64 && process == Architecture.X64)
+        {
+            return CheckItem.Warn("系统架构", "ARM64 Windows，当前通过 x64 仿真运行；虚拟机/兼容场景可继续安装");
+        }
+        if (os == Architecture.Arm64)
+        {
+            return CheckItem.Warn("系统架构", $"ARM64 Windows / 进程 {process}；安装包为 x64，将尝试兼容安装");
+        }
+        return CheckItem.Fail("系统架构", $"当前为 OS={os}, Process={process}，此安装包要求 x64 或 ARM64+x64 仿真");
+    }
+
+    private static string DescribeArchitectureForHeader()
+    {
+        var os = RuntimeInformation.OSArchitecture;
+        var process = RuntimeInformation.ProcessArchitecture;
+        if (os == Architecture.Arm64 && process == Architecture.X64)
+        {
+            return "ARM64 / x64 emulation";
+        }
+        return os == process ? os.ToString().ToLowerInvariant() : $"{os}/{process}".ToLowerInvariant();
+    }
+
     private static string Quote(string value)
     {
         return "\"" + value.Replace("\"", "\\\"") + "\"";
@@ -1138,6 +1170,16 @@ public partial class MainWindow : Window
     {
         try
         {
+            if (OperatingSystem.IsWindows())
+            {
+                var handle = new WindowInteropHelper(this).Handle;
+                if (handle != IntPtr.Zero)
+                {
+                    ReleaseCapture();
+                    SendMessage(handle, WmNcLButtonDown, new IntPtr(HtCaption), IntPtr.Zero);
+                    return;
+                }
+            }
             DragMove();
         }
         catch
@@ -1145,6 +1187,12 @@ public partial class MainWindow : Window
             // WebView can emit drag messages after the mouse has moved away; ignore.
         }
     }
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 }
 
 public sealed class InstallRequest
