@@ -15,6 +15,8 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file, const char *client_cert_file,
                                 const char *client_key_file, const char *client_key_provider,
+                                const char *client_cert_store,
+                                const char *client_cert_thumbprint,
                                 const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url);
 

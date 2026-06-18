@@ -67,6 +67,8 @@ static char s_ca_file[1024];
 static char s_client_cert_file[1024];
 static char s_client_key_file[1024];
 static char s_client_key_provider[32];
+static char s_client_cert_store[256];
+static char s_client_cert_thumbprint[128];
 static char s_mtls_status[96];
 static char s_relay_url[512];
 static char s_proxy_mode[32];
@@ -90,6 +92,10 @@ static int s_long_poll_fallback_cfg = 1;
 static int s_report_events_v2_enabled_cfg = 1;
 static unsigned long s_report_events_v2_ok;
 static unsigned long s_report_events_v2_fail;
+
+static int ascii_eq_ci(const char *a, const char *b);
+static int ascii_contains_ci(const char *s, const char *needle);
+
 static unsigned long s_zstd_compress_ok;
 static unsigned long s_zstd_compress_fail;
 static uint64_t s_zstd_raw_bytes;
@@ -132,6 +138,7 @@ static volatile int s_http2_multiplex_active;
 static volatile int s_http2_negotiated;
 static char s_negotiated_protocol[16];
 static int s_transport_capability_logged;
+static int s_schannel_pem_warned;
 static int s_alpn_log_state;
 static int64_t s_native_post_fail_log_until_ms;
 static unsigned long s_native_post_fail_log_suppressed;
@@ -258,6 +265,61 @@ static int http2_required(void) {
   return s_http2_required_cfg || env_bool_default("EDR_HTTP2_REQUIRE", 0);
 }
 
+static int curl_ssl_backend_is_schannel(void) {
+#ifdef EDR_HAVE_CURL_HTTP2
+  curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+  const char *ssl = (info && info->ssl_version) ? info->ssl_version : "";
+  return ascii_contains_ci(ssl, "schannel");
+#else
+  return 0;
+#endif
+}
+
+static int str_ends_with_ci(const char *s, const char *suffix) {
+  size_t slen, tlen;
+  if (!s || !suffix) {
+    return 0;
+  }
+  slen = strlen(s);
+  tlen = strlen(suffix);
+  if (tlen > slen) {
+    return 0;
+  }
+  return ascii_eq_ci(s + slen - tlen, suffix);
+}
+
+static void compact_thumbprint(char *dst, size_t cap, const char *src) {
+  size_t n = 0u;
+  if (!dst || cap == 0u) {
+    return;
+  }
+  dst[0] = '\0';
+  if (!src) {
+    return;
+  }
+  for (; *src && n + 1u < cap; ++src) {
+    if (isxdigit((unsigned char)*src)) {
+      dst[n++] = (char)toupper((unsigned char)*src);
+    }
+  }
+  dst[n] = '\0';
+}
+
+static int build_schannel_cert_selector(char *dst, size_t cap) {
+  char thumb[128];
+  const char *store = s_client_cert_store[0] ? s_client_cert_store : "CurrentUser\\MY";
+  compact_thumbprint(thumb, sizeof(thumb), s_client_cert_thumbprint);
+  if (!dst || cap == 0u || !thumb[0]) {
+    return 0;
+  }
+  if (str_ends_with_ci(store, thumb)) {
+    snprintf(dst, cap, "%s", store);
+  } else {
+    snprintf(dst, cap, "%s\\%s", store, thumb);
+  }
+  return dst[0] != '\0';
+}
+
 static void log_transport_capabilities_once(void) {
   if (s_transport_capability_logged) {
     return;
@@ -274,7 +336,7 @@ static void log_transport_capabilities_once(void) {
     fprintf(stderr,
             "[transport] EDR_HAVE_CURL_HTTP2=1 libcurl=%s ssl=%s features_http2=%d "
             "http2_enabled=%d http2_required=%d control_stream_enabled=%d long_poll_fallback=%d "
-            "data_encoding=%s data_compression=%s\n",
+            "data_encoding=%s data_compression=%s mtls_status=%s cert_store=%s thumbprint=%s\n",
             info && info->version ? info->version : "unknown",
             info && info->ssl_version ? info->ssl_version : "unknown",
             feature_http2,
@@ -283,7 +345,10 @@ static void log_transport_capabilities_once(void) {
             s_control_stream_enabled_cfg,
             s_long_poll_fallback_cfg,
             s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf",
-            s_data_plane_compression[0] ? s_data_plane_compression : "identity");
+            s_data_plane_compression[0] ? s_data_plane_compression : "identity",
+            s_mtls_status[0] ? s_mtls_status : "not_configured",
+            s_client_cert_store[0] ? s_client_cert_store : "-",
+            s_client_cert_thumbprint[0] ? s_client_cert_thumbprint : "-");
     if (!feature_http2) {
       fprintf(stderr,
               "[transport] warning: EDR_HAVE_CURL_HTTP2=1 but runtime libcurl does not advertise "
@@ -293,12 +358,13 @@ static void log_transport_capabilities_once(void) {
 #else
   fprintf(stderr,
           "[transport] EDR_HAVE_CURL_HTTP2=0 http2_enabled=0 http2_required=%d "
-          "control_stream_enabled=%d long_poll_fallback=%d data_encoding=%s data_compression=%s\n",
+          "control_stream_enabled=%d long_poll_fallback=%d data_encoding=%s data_compression=%s mtls_status=%s\n",
           http2_required(),
           s_control_stream_enabled_cfg,
           s_long_poll_fallback_cfg,
           s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf",
-          s_data_plane_compression[0] ? s_data_plane_compression : "identity");
+          s_data_plane_compression[0] ? s_data_plane_compression : "identity",
+          s_mtls_status[0] ? s_mtls_status : "not_configured");
 #endif
 }
 
@@ -608,6 +674,8 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file, const char *client_cert_file,
                                 const char *client_key_file, const char *client_key_provider,
+                                const char *client_cert_store,
+                                const char *client_cert_thumbprint,
                                 const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url) {
   const char *relay_effective = getenv("EDR_RELAY_URL");
@@ -623,6 +691,8 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   memset(s_client_cert_file, 0, sizeof(s_client_cert_file));
   memset(s_client_key_file, 0, sizeof(s_client_key_file));
   memset(s_client_key_provider, 0, sizeof(s_client_key_provider));
+  memset(s_client_cert_store, 0, sizeof(s_client_cert_store));
+  memset(s_client_cert_thumbprint, 0, sizeof(s_client_cert_thumbprint));
   memset(s_mtls_status, 0, sizeof(s_mtls_status));
   memset(s_relay_url, 0, sizeof(s_relay_url));
   memset(s_proxy_mode, 0, sizeof(s_proxy_mode));
@@ -683,6 +753,13 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   if (client_key_file && client_key_file[0]) {
     snprintf(s_client_key_file, sizeof(s_client_key_file), "%s", client_key_file);
   }
+  if (client_cert_store && client_cert_store[0]) {
+    snprintf(s_client_cert_store, sizeof(s_client_cert_store), "%s", client_cert_store);
+  }
+  if (client_cert_thumbprint && client_cert_thumbprint[0]) {
+    compact_thumbprint(s_client_cert_thumbprint, sizeof(s_client_cert_thumbprint),
+                       client_cert_thumbprint);
+  }
   {
     const char *kp = getenv("EDR_CLIENT_KEY_PROVIDER");
     if (!kp || !kp[0]) {
@@ -691,7 +768,9 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
     snprintf(s_client_key_provider, sizeof(s_client_key_provider), "%s",
              (kp && kp[0]) ? kp : "pem");
   }
-  if (s_client_cert_file[0] && s_client_key_file[0]) {
+  if (s_client_cert_thumbprint[0]) {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "schannel_store_ready");
+  } else if (s_client_cert_file[0] && s_client_key_file[0]) {
     snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "pem_ready");
   } else if (s_client_cert_file[0] && strcmp(s_client_key_provider, "pem") != 0) {
     snprintf(s_mtls_status, sizeof(s_mtls_status), "native_http_%s_pending_adapter",
@@ -1525,6 +1604,29 @@ static int ascii_eq_ci(const char *a, const char *b) {
     b++;
   }
   return *a == 0 && *b == 0;
+}
+
+static int ascii_contains_ci(const char *s, const char *needle) {
+  size_t nlen;
+  if (!s || !needle) {
+    return 0;
+  }
+  nlen = strlen(needle);
+  if (nlen == 0u) {
+    return 1;
+  }
+  for (; *s; ++s) {
+    size_t i;
+    for (i = 0u; i < nlen; ++i) {
+      if (!s[i] || tolower((unsigned char)s[i]) != tolower((unsigned char)needle[i])) {
+        break;
+      }
+    }
+    if (i == nlen) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static void set_proxy_status(const char *status, const char *active_url) {
@@ -2901,7 +3003,19 @@ static void curl_apply_common_options(CURL *curl, const char *url, struct curl_s
   if (s_ca_file[0]) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, s_ca_file);
   }
-  if (s_client_cert_file[0] && s_client_key_file[0]) {
+  if (curl_ssl_backend_is_schannel()) {
+    char selector[512];
+    if (build_schannel_cert_selector(selector, sizeof(selector))) {
+      curl_easy_setopt(curl, CURLOPT_SSLCERT, selector);
+    } else if (s_client_cert_file[0] && s_client_key_file[0] && !s_schannel_pem_warned) {
+      s_schannel_pem_warned = 1;
+      snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "schannel_needs_store_cert");
+      fprintf(stderr,
+              "[transport] Schannel libcurl cannot use PEM client_cert/client_key reliably; "
+              "import client cert with private key into Windows cert store and set "
+              "client_cert_thumbprint/client_cert_store, or use OpenSSL libcurl\n");
+    }
+  } else if (s_client_cert_file[0] && s_client_key_file[0]) {
     curl_easy_setopt(curl, CURLOPT_SSLCERT, s_client_cert_file);
     curl_easy_setopt(curl, CURLOPT_SSLKEY, s_client_key_file);
   }
