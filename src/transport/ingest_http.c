@@ -166,6 +166,16 @@ static volatile int s_control_hello_ok;
 static int64_t s_control_hello_last_ms;
 static int s_control_h2;
 static int s_control_zstd;
+static char s_route_bases[8][512];
+static int s_route_count;
+static int s_route_active;
+static int s_route_failures;
+static int s_route_failover_after = 2;
+static int64_t s_route_failover_cooldown_ms = 30000;
+static int64_t s_route_last_failover_ms;
+static int64_t s_route_profile_last_ms;
+static char s_route_profile_version[96];
+static unsigned long s_route_failover_count;
 #ifdef _WIN32
 static HANDLE s_poll_thread;
 static HANDLE s_ws_thread;
@@ -176,6 +186,9 @@ static pthread_t s_poll_thread;
 static pthread_t s_ws_thread;
 static pthread_mutex_t s_ws_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
+
+static int edr_ingest_http_refresh_route_profile(int force);
+static void http_conn_close_locked(void);
 
 typedef struct EdrWsConn {
   EdrSocket fd;
@@ -670,6 +683,94 @@ static void copy_base_url(char *dst, size_t cap, const char *url) {
   }
 }
 
+static void route_seed_initial(const char *base) {
+  memset(s_route_bases, 0, sizeof(s_route_bases));
+  s_route_count = 0;
+  s_route_active = 0;
+  s_route_failures = 0;
+  s_route_last_failover_ms = 0;
+  s_route_profile_last_ms = 0;
+  s_route_profile_version[0] = '\0';
+  if (base && base[0]) {
+    copy_base_url(s_route_bases[0], sizeof(s_route_bases[0]), base);
+    s_route_count = s_route_bases[0][0] ? 1 : 0;
+  }
+}
+
+static int route_base_exists(const char *base) {
+  int i;
+  if (!base || !base[0]) {
+    return 1;
+  }
+  for (i = 0; i < s_route_count; i++) {
+    if (strcmp(s_route_bases[i], base) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void route_add_base(const char *base) {
+  char normalized[512];
+  if (s_route_count >= (int)(sizeof(s_route_bases) / sizeof(s_route_bases[0]))) {
+    return;
+  }
+  copy_base_url(normalized, sizeof(normalized), base);
+  if (!normalized[0] || route_base_exists(normalized)) {
+    return;
+  }
+  snprintf(s_route_bases[s_route_count], sizeof(s_route_bases[s_route_count]), "%s", normalized);
+  s_route_count++;
+}
+
+static void route_apply_active(void) {
+  if (s_route_count <= 0) {
+    return;
+  }
+  if (s_route_active < 0 || s_route_active >= s_route_count) {
+    s_route_active = 0;
+  }
+  if (s_route_bases[s_route_active][0]) {
+    copy_base_url(s_rest, sizeof(s_rest), s_route_bases[s_route_active]);
+  }
+}
+
+static int route_failover_next(const char *reason) {
+  int64_t now;
+  if (s_route_count <= 1) {
+    return 0;
+  }
+  now = unix_ms_now();
+  if (s_route_last_failover_ms > 0 &&
+      now - s_route_last_failover_ms < s_route_failover_cooldown_ms) {
+    return 0;
+  }
+  s_route_active = (s_route_active + 1) % s_route_count;
+  route_apply_active();
+  s_route_failures = 0;
+  s_route_last_failover_ms = now;
+  s_route_failover_count++;
+  s_control_hello_ok = 0;
+  http_lock();
+  http_conn_close_locked();
+  http_unlock();
+  fprintf(stderr, "[route] switched active region route=%d/%d base=%s reason=%s\n",
+          s_route_active + 1, s_route_count, s_rest, reason ? reason : "failover");
+  return 1;
+}
+
+static int route_note_failure(const char *reason) {
+  s_route_failures++;
+  if (s_route_failures >= s_route_failover_after) {
+    return route_failover_next(reason);
+  }
+  return 0;
+}
+
+static void route_note_success(void) {
+  s_route_failures = 0;
+}
+
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file, const char *client_cert_file,
@@ -726,6 +827,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   }
   copy_base_url(s_relay_url, sizeof(s_relay_url), relay_effective);
   copy_base_url(s_rest, sizeof(s_rest), s_relay_url[0] ? s_relay_url : rest_base);
+  route_seed_initial(s_rest);
   snprintf(s_connection_mode, sizeof(s_connection_mode), "%s", s_relay_url[0] ? "relay" : "direct");
   if (tenant_id && tenant_id[0]) {
     snprintf(s_tenant, sizeof(s_tenant), "%s", tenant_id);
@@ -911,6 +1013,12 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   snprintf(out->connection_mode, sizeof(out->connection_mode), "%s",
            s_connection_mode[0] ? s_connection_mode : "direct");
   snprintf(out->effective_base_url, sizeof(out->effective_base_url), "%s", s_rest);
+  snprintf(out->route_profile_version, sizeof(out->route_profile_version), "%s",
+           s_route_profile_version[0] ? s_route_profile_version : "local");
+  snprintf(out->active_route_url, sizeof(out->active_route_url), "%s", s_rest);
+  out->route_count = s_route_count;
+  out->active_route_index = s_route_active;
+  out->route_failover_count = s_route_failover_count;
   snprintf(out->relay_url, sizeof(out->relay_url), "%s", s_relay_url);
   snprintf(out->proxy_mode, sizeof(out->proxy_mode), "%s", s_proxy_mode[0] ? s_proxy_mode : "auto");
   snprintf(out->proxy_url, sizeof(out->proxy_url), "%s", s_proxy_url_active);
@@ -3396,8 +3504,121 @@ static int request_to_suffix(const char *method, const char *suffix, const char 
                              size_t resp_body_cap) {
   char url[1400];
   size_t rb = strlen(s_rest);
+  int rc;
   snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
-  return native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+  rc = native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+  if (rc == 0) {
+    route_note_success();
+    return 0;
+  }
+  if (route_note_failure(s_last_error[0] ? s_last_error : "request_failed") &&
+      method && strcmp(method, "GET") == 0) {
+    rb = strlen(s_rest);
+    snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+    rc = native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+    if (rc == 0) {
+      route_note_success();
+    }
+  }
+  return rc;
+}
+
+static void route_apply_csv(const char *csv, const char *primary) {
+  char buf[4096];
+  char current[512];
+  int old_active = s_route_active;
+  char *start;
+  char *p;
+  if (!csv || !csv[0]) {
+    return;
+  }
+  snprintf(current, sizeof(current), "%s", s_rest);
+  memset(s_route_bases, 0, sizeof(s_route_bases));
+  s_route_count = 0;
+  if (primary && primary[0]) {
+    route_add_base(primary);
+  }
+  snprintf(buf, sizeof(buf), "%s", csv);
+  start = buf;
+  for (p = buf; ; p++) {
+    if (*p == ',' || *p == '\0') {
+      char saved = *p;
+      char *end;
+      *p = '\0';
+      while (*start && isspace((unsigned char)*start)) start++;
+      end = start + strlen(start);
+      while (end > start && isspace((unsigned char)*(end - 1))) {
+        *(--end) = '\0';
+      }
+      route_add_base(start);
+      if (saved == '\0') {
+        break;
+      }
+      start = p + 1;
+    }
+  }
+  if (s_route_count <= 0 && current[0]) {
+    route_add_base(current);
+  }
+  s_route_active = 0;
+  if (current[0]) {
+    int i;
+    for (i = 0; i < s_route_count; i++) {
+      if (strcmp(s_route_bases[i], current) == 0) {
+        s_route_active = i;
+        break;
+      }
+    }
+  }
+  if (old_active != s_route_active) {
+    route_apply_active();
+  }
+}
+
+static int edr_ingest_http_refresh_route_profile(int force) {
+  char suffix[512];
+  char resp[32768];
+  char csv[4096];
+  char primary[512];
+  char version[96];
+  int64_t v = 0;
+  int64_t now = unix_ms_now();
+  int64_t interval_ms = (int64_t)env_ul_clamped("EDR_ROUTE_PROFILE_REFRESH_MS", 300000ul, 30000ul, 3600000ul);
+  if (!edr_ingest_http_configured() || s_relay_url[0]) {
+    return -1;
+  }
+  if (!force && s_route_profile_last_ms > 0 && now - s_route_profile_last_ms < interval_ms) {
+    return 0;
+  }
+  s_route_profile_last_ms = now;
+  snprintf(suffix, sizeof(suffix), "agent/comms-route-profile?endpoint_id=%s&tenant_id=%s",
+           s_endpoint, s_tenant);
+  resp[0] = '\0';
+  if (request_to_suffix("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp)) != 0) {
+    return -1;
+  }
+  csv[0] = '\0';
+  primary[0] = '\0';
+  version[0] = '\0';
+  (void)json_get_string(resp, "base_urls_csv", csv, sizeof(csv));
+  (void)json_get_string(resp, "primary_base_url", primary, sizeof(primary));
+  (void)json_get_string(resp, "profile_version", version, sizeof(version));
+  if (json_get_int64(resp, "failover_after_failures", &v) == 0 && v >= 1 && v <= 10) {
+    s_route_failover_after = (int)v;
+  }
+  if (json_get_int64(resp, "failover_cooldown_ms", &v) == 0 && v >= 1000 && v <= 3600000) {
+    s_route_failover_cooldown_ms = v;
+  }
+  if (csv[0] || primary[0]) {
+    route_apply_csv(csv[0] ? csv : primary, primary);
+    if (version[0]) {
+      snprintf(s_route_profile_version, sizeof(s_route_profile_version), "%s", version);
+    }
+    fprintf(stderr, "[route] profile applied version=%s routes=%d active=%d base=%s\n",
+            s_route_profile_version[0] ? s_route_profile_version : "unknown",
+            s_route_count, s_route_active + 1, s_rest);
+  }
+  return 0;
 }
 
 static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
@@ -5139,6 +5360,7 @@ static void *control_ws_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
+    (void)edr_ingest_http_refresh_route_profile(0);
     (void)edr_ingest_http_control_hello_once();
 #ifdef EDR_HAVE_CURL_HTTP2
     if (http2_client_enabled()) {
@@ -5158,6 +5380,7 @@ static void *control_ws_thread(void *arg)
       }
       note_control_stream_failure();
       snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "h2_failed");
+      (void)route_note_failure("h2_stream_failed");
       if (h2rc != -2 && s_long_poll_fallback_cfg && env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
         fprintf(stderr,
                 "[ingest-stream] HTTP/2 control stream unavailable; falling back to HTTP/1.1 stream\n");
@@ -5177,6 +5400,7 @@ static void *control_ws_thread(void *arg)
 #endif
     if (stream_connect_once(&conn) != 0) {
       note_control_stream_failure();
+      (void)route_note_failure("http1_stream_connect_failed");
       s_ws_backoff_ms = backoff_ms;
       sleep_poll_ms(backoff_ms);
       if (backoff_ms < 60000) {
@@ -5192,6 +5416,7 @@ static void *control_ws_thread(void *arg)
     snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connected");
     note_http_request_success();
     note_control_stream_success();
+    route_note_success();
     backoff_ms = 5000;
     s_ws_backoff_ms = 0;
     fprintf(stderr, "[ingest-stream] control stream connected endpoint=%s\n", s_endpoint);
@@ -5229,6 +5454,7 @@ static int edr_ingest_http_poll_once(void) {
     }
   }
   (void)edr_ingest_http_control_hello_once();
+  (void)edr_ingest_http_refresh_route_profile(0);
   snprintf(suffix, sizeof(suffix),
            "ingest/poll-commands?endpoint_id=%s&limit=8&wait_s=%d&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
            s_endpoint, wait_s, s_agent_ver, s_control_dict_ver, s_control_schema_ver,

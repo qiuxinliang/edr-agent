@@ -89,6 +89,11 @@ typedef struct {
   char circuit_reason[128];
   char connection_mode[32];
   char effective_base_url[512];
+  char route_profile_version[96];
+  char active_route_url[512];
+  int route_count;
+  int active_route_index;
+  unsigned long route_failover_count;
   char relay_url[512];
   char proxy_mode[32];
   char proxy_url[512];

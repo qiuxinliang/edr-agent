@@ -952,6 +952,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
   json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
   json_escape_small(http_rt.effective_base_url, http_base_url, sizeof(http_base_url));
+  char http_route_profile[128];
+  char http_active_route_url[640];
+  json_escape_small(http_rt.route_profile_version, http_route_profile, sizeof(http_route_profile));
+  json_escape_small(http_rt.active_route_url, http_active_route_url, sizeof(http_active_route_url));
   json_escape_small(http_rt.relay_url, http_relay_url, sizeof(http_relay_url));
   json_escape_small(http_rt.proxy_mode, http_proxy_mode, sizeof(http_proxy_mode));
   json_escape_small(http_rt.proxy_url, http_proxy_url, sizeof(http_proxy_url));
@@ -998,6 +1002,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"failure_reason\":\"%s%s%s\",\"poll_backoff_ms\":%d,\"ws_backoff_ms\":%d,"
         "\"circuit_open\":%s,\"circuit_until_unix_ms\":%lld,"
         "\"circuit_reason\":\"%s\",\"pending_upload_queue\":%llu,"
+        "\"route\":{\"profile_version\":\"%s\",\"active_base_url\":\"%s\","
+        "\"route_count\":%d,\"active_index\":%d,\"failover_count\":%lu},"
         "\"budget\":{\"requests_this_minute\":%lu,\"request_limit_per_minute\":%lu,"
         "\"bytes_this_minute\":%llu,\"byte_limit_per_minute\":%llu,"
         "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
@@ -1077,6 +1083,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
         http_rt.circuit_open ? "true" : "false", (long long)http_rt.circuit_until_unix_ms,
         http_circuit_reason, (unsigned long long)edr_storage_queue_pending_count(),
+        http_route_profile, http_active_route_url, http_rt.route_count,
+        http_rt.active_route_index, http_rt.route_failover_count,
         http_rt.requests_this_minute, http_rt.request_limit_per_minute,
         (unsigned long long)http_rt.bytes_this_minute,
         (unsigned long long)http_rt.byte_limit_per_minute,

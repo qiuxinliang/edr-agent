@@ -9,6 +9,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,25 @@ static int state_file_info(const char *path, EdrCommandStateFileInfo *out) {
 
 static int state_file_info_same(EdrCommandStateFileInfo a, EdrCommandStateFileInfo b) {
   return a.size == b.size && a.mtime == b.mtime;
+}
+
+static int state_replace_file(const char *tmp_path, const char *dst_path) {
+  if (!tmp_path || !tmp_path[0] || !dst_path || !dst_path[0]) {
+    return -1;
+  }
+#ifdef _WIN32
+  if (MoveFileExA(tmp_path, dst_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    return 0;
+  }
+  (void)DeleteFileA(tmp_path);
+  return -1;
+#else
+  if (rename(tmp_path, dst_path) == 0) {
+    return 0;
+  }
+  (void)remove(tmp_path);
+  return -1;
+#endif
 }
 
 static char *state_strdup_line(const char *s) {
@@ -559,6 +579,7 @@ void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
            (long long)state_now_ms(), scid, run, step, art, det);
   append_state_line_locked(line);
   s_collect_cache_pending_zero = 0;
+  edr_command_state_compact_if_needed();
 }
 
 void edr_command_state_compact_if_needed(void) {
@@ -575,7 +596,11 @@ void edr_command_state_compact_if_needed(void) {
   int64_t now_ms = state_now_ms();
   long interval_ms = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_INTERVAL_MS",
                                             60000L, 5000L, 3600000L);
-  if (s_last_compact_check_ms > 0 && now_ms - s_last_compact_check_ms < interval_ms) {
+  EdrCommandStateFileInfo current_info;
+  int have_current_info = state_file_info(path, &current_info) == 0;
+  long emergency_bytes = max_bytes > 0 && max_bytes <= (LONG_MAX / 2L) ? max_bytes * 2L : max_bytes;
+  int emergency_compact = have_current_info && current_info.size > emergency_bytes;
+  if (!emergency_compact && s_last_compact_check_ms > 0 && now_ms - s_last_compact_check_ms < interval_ms) {
     return;
   }
   s_last_compact_check_ms = now_ms;
@@ -644,7 +669,7 @@ void edr_command_state_compact_if_needed(void) {
       }
     }
     fclose(out);
-    (void)rename(tmp, path);
+    (void)state_replace_file(tmp, path);
   }
   for (size_t i = 0; i < keep_lines; i++) {
     free(lines[i]);
