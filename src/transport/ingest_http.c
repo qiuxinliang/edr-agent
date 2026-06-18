@@ -2675,6 +2675,11 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
   } else {
     s_http2_request_fail++;
     s_http2_multiplex_fail++;
+    fprintf(stderr,
+            "[transport] HTTP/2 request failed result=%d(%s) http_status=%ld h2=%d "
+            "http2_required=%d stream=%d\n",
+            (int)result, curl_easy_strerror(result), job->response_code, job->h2,
+            http2_required(), job->stream_ctx ? 1 : 0);
   }
   curl_multi_lock();
   if (s_curl_multi_active_count > 0u) {
@@ -2963,6 +2968,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   long code = 0;
   CURLcode cc;
   int h2;
+  char errbuf[CURL_ERROR_SIZE];
   if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
     return -2;
   }
@@ -2976,12 +2982,14 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   if (resp_body && resp_body_cap > 0u) {
     resp_body[0] = '\0';
   }
+  errbuf[0] = '\0';
   memset(&rb, 0, sizeof(rb));
   rb.buf = resp_body;
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
   curl_apply_common_options(curl, url, headers,
                             (long)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul) / 1000L);
+  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rb);
   if (strcmp(method, "GET") == 0) {
@@ -3016,6 +3024,11 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
     return 0;
   }
   s_http2_request_fail++;
+  fprintf(stderr,
+          "[transport] HTTP/2 request failed method=%s result=%d(%s) http_status=%ld h2=%d "
+          "http2_required=%d err=%s\n",
+          method ? method : "-", (int)cc, curl_easy_strerror(cc), code, h2,
+          http2_required(), errbuf[0] ? errbuf : "-");
   return -1;
 }
 
@@ -3026,6 +3039,7 @@ static int curl_h2_stream_loop(const char *url) {
   long code = 0;
   CURLcode cc;
   int h2;
+  char errbuf[CURL_ERROR_SIZE];
   if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
     return -2;
   }
@@ -3037,10 +3051,12 @@ static int curl_h2_stream_loop(const char *url) {
   if (!curl) {
     return -2;
   }
+  errbuf[0] = '\0';
   headers = curl_common_headers(NULL);
   headers = curl_slist_append(headers, "Accept: application/x-ndjson");
   headers = curl_slist_append(headers, "Cache-Control: no-cache");
   curl_apply_common_options(curl, url, headers, 0L);
+  curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_stream_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
@@ -3064,6 +3080,11 @@ static int curl_h2_stream_loop(const char *url) {
     return 0;
   }
   s_http2_request_fail++;
+  fprintf(stderr,
+          "[ingest-stream] HTTP/2 control stream failed result=%d(%s) http_status=%ld "
+          "h2=%d http2_required=%d parser_failed=%d err=%s\n",
+          (int)cc, curl_easy_strerror(cc), code, h2, http2_required(), ctx.failed,
+          errbuf[0] ? errbuf : "-");
   return -1;
 }
 #endif
