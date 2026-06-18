@@ -114,8 +114,7 @@ dotnet publish $project `
     -p:PublishSingleFile=false `
     "-p:PublishReadyToRun=$readyToRun" `
     -p:DebugType=None `
-    -p:DebugSymbols=false `
-    "-p:SatelliteResourceLanguages=zh-CN;en-US"
+    -p:DebugSymbols=false
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit $LASTEXITCODE"
 }
