@@ -18,7 +18,7 @@
     EDR_RELAY_URL=https://relay.corp:443/api/v1
     EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
     EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
-    EDR_KEY_PROVIDER=pem|cng|tpm|pkcs11
+    EDR_KEY_PROVIDER=pem|cng|tpm|pkcs11（Windows 默认 cng，Linux/macOS 默认 pem）
     EDR_CNG_PROVIDER_NAME        默认 cng=Microsoft Software Key Storage Provider，tpm=Microsoft Platform Crypto Provider
     EDR_CNG_KEY_NAME             默认 EDR-Agent-$COMPUTERNAME
     EDR_PKCS11_KEY_URI           PKCS#11 key URI；需本机 openssl engine/provider 可用
@@ -39,7 +39,7 @@ param(
   [string]$ClientCertPath = $(if ($env:EDR_CLIENT_CERT) { $env:EDR_CLIENT_CERT } else { "C:\Program Files\EDR Agent\certs\client.pem" }),
   [string]$ClientKeyPath = $(if ($env:EDR_CLIENT_KEY) { $env:EDR_CLIENT_KEY } else { "C:\Program Files\EDR Agent\certs\client-key.pem" }),
   [string]$ClientCsrPath = $(if ($env:EDR_CLIENT_CSR) { $env:EDR_CLIENT_CSR } else { "C:\Program Files\EDR Agent\certs\client.csr.pem" }),
-  [string]$KeyProvider = $(if ($env:EDR_KEY_PROVIDER) { $env:EDR_KEY_PROVIDER } else { "pem" }),
+  [string]$KeyProvider = $(if ($env:EDR_KEY_PROVIDER) { $env:EDR_KEY_PROVIDER } else { "" }),
   [string]$ApiBase = $(if ($env:EDR_API_BASE) { $env:EDR_API_BASE } else { "" }),
   [string]$EnrollToken = $(if ($env:EDR_ENROLL_TOKEN) { $env:EDR_ENROLL_TOKEN } else { "" }),
   [string]$ProxyMode = $(if ($env:EDR_PROXY_MODE) { $env:EDR_PROXY_MODE } else { "auto" }),
@@ -55,6 +55,9 @@ param(
   [switch]$HardenAcl,
   [switch]$ConfigureSensorPolicy = $($env:EDR_CONFIGURE_SENSOR_POLICY -ne "0"),
   [switch]$SkipPreflight = $($env:EDR_SKIP_PREFLIGHT -eq "1"),
+  [switch]$SkipHealthCheck = $($env:EDR_SKIP_HEALTH_CHECK -eq "1"),
+  [switch]$StrictHealthCheck = $($env:EDR_INSTALL_HEALTH_STRICT -eq "1"),
+  [string]$HealthReportPath = $(if ($env:EDR_INSTALL_HEALTH_REPORT) { $env:EDR_INSTALL_HEALTH_REPORT } else { "" }),
   [switch]$KeepOfflineQueue = $($env:EDR_KEEP_OFFLINE_QUEUE -eq "1"),
   [switch]$KeepEvidenceCache = $($env:EDR_KEEP_EVIDENCE_CACHE -eq "1"),
   [switch]$KeepTemplateComments = $($env:EDR_KEEP_TEMPLATE_COMMENTS -eq "1"),
@@ -254,7 +257,10 @@ function Install-AgentAutorun {
 }
 
 function Normalize-KeyProvider([string]$Provider) {
-  $p = if ($Provider) { $Provider.Trim().ToLowerInvariant() } else { "pem" }
+  $p = if ($Provider) { $Provider.Trim().ToLowerInvariant() } else { "" }
+  if (-not $p) {
+    $p = if ((Get-EnrollOs) -eq "windows") { "cng" } else { "pem" }
+  }
   if ($p -eq "file") { return "pem" }
   if (@("pem", "cng", "tpm", "pkcs11") -notcontains $p) {
     Write-Error "unsupported EDR_KEY_PROVIDER=$Provider (expected pem|cng|tpm|pkcs11)"
@@ -540,18 +546,41 @@ if ($env:EDR_OVERRIDE_SERVER_ADDR) {
   $saddr = $env:EDR_OVERRIDE_SERVER_ADDR.Trim()
 }
 
-$rest = "$api/api/v1"
+$rest = if ($d.rest_base_url) { ([string]$d.rest_base_url).TrimEnd("/") } else { "$api/api/v1" }
 $agentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $rest }
 $serverIssuedCert = ($d.ca_cert -and $d.client_cert)
 $useCertPaths = [bool]($serverIssuedCert -or $env:EDR_CA_CERT -or $env:EDR_CLIENT_CERT -or $env:EDR_CLIENT_KEY)
+$UseNativeWindowsStore = ((Get-EnrollOs) -eq "windows" -and ($keyProviderNorm -eq "cng" -or ($keyProviderNorm -eq "tpm" -and -not $TpmKeyUri)))
 $EffectiveCaCertPath = if ($useCertPaths) { $CaCertPath } else { "" }
-$EffectiveClientCertPath = if ($useCertPaths) { $ClientCertPath } else { "" }
+$EffectiveClientCertPath = if ($useCertPaths -and -not $UseNativeWindowsStore) { $ClientCertPath } else { "" }
 $EffectiveClientKeyPath = if ($useCertPaths -and $keyProviderNorm -eq "pem") { $ClientKeyPath } else { "" }
-$EffectiveCertStore = if ($keyProviderNorm -eq "cng" -or $keyProviderNorm -eq "tpm") { "LocalMachine\\My" } else { "" }
+$EffectiveCertStore = if ($UseNativeWindowsStore) { "LocalMachine\\MY" } else { "" }
 $EffectiveCertThumbprint = ""
+
+$Http2Enabled = if ($null -ne $d.http2_enabled) { [bool]$d.http2_enabled } else { $true }
+$Http2Require = if ($null -ne $d.http2_require) { [bool]$d.http2_require } else { $false }
+$ControlStreamEnabled = if ($null -ne $d.control_stream_enabled) { [bool]$d.control_stream_enabled } else { $true }
+$LongPollFallback = if ($null -ne $d.long_poll_fallback) { [bool]$d.long_poll_fallback } else { $true }
+$ReportEventsV2Enabled = if ($null -ne $d.report_events_v2_enabled) { [bool]$d.report_events_v2_enabled } else { $true }
+$DataPlaneEncoding = if ($d.data_plane_encoding) { [string]$d.data_plane_encoding } else { "protobuf" }
+$DataPlaneCompression = if ($d.data_plane_compression) { [string]$d.data_plane_compression } else { "identity" }
+$ControlDictVersion = if ($d.control_dict_version) { [string]$d.control_dict_version } else { "edr-zstd-dict-v1" }
+$ControlSchemaVersion = if ($d.control_schema_version) { [string]$d.control_schema_version } else { "edr-control-schema-v1" }
+$ControlProfileID = if ($d.control_profile_id) { [string]$d.control_profile_id } else { "default-h2-zstd" }
+$RulesURL = if ($d.rules_url) { [string]$d.rules_url } else { "$agentApiBase/agent/rules.toml" }
+$P0BundleURL = if ($d.p0_bundle_url) { [string]$d.p0_bundle_url } else { "$agentApiBase/agent/p0-bundle.enc" }
+$SensorInterestURL = if ($d.sensor_interest_url) { [string]$d.sensor_interest_url } else { "$agentApiBase/agent/sensor-interest.json" }
+$RuntimePolicyURL = if ($d.runtime_policy_url) { [string]$d.runtime_policy_url } else { "$agentApiBase/agent/runtime-policy.toml" }
+$VersionURL = if ($d.version_url) { [string]$d.version_url } else { "$agentApiBase/agent/version/latest" }
+$DownloadURL = if ($d.download_url) { [string]$d.download_url } else { "$agentApiBase/agent/download/latest" }
 
 function Escape-Toml([string]$s) {
   return $s.Replace('\', '\\').Replace('"', '\"')
+}
+
+function Format-TomlBool([object]$v) {
+  if ([bool]$v) { return "true" }
+  return "false"
 }
 
 $InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\EDR Agent" } else { "." }
@@ -560,6 +589,9 @@ $TomlQueueDbPath = Join-Path $InstallDirForToml "queue\edr_queue.db"
 $TomlEvidenceCachePath = Join-Path $InstallDirForToml "evidence\local_evidence_cache.db"
 $TomlLogDir = Join-Path $InstallDirForToml "logs"
 $TomlSigningPublicKeyPath = Join-Path $InstallDirForToml "certs\command-signing.pub.pem"
+if (-not $HealthReportPath) {
+  $HealthReportPath = Join-Path $TomlLogDir "install-bootstrap-report.json"
+}
 
 function Write-PemNoBom([string]$Path, [string]$Text) {
   if (-not $Text) { return }
@@ -594,6 +626,123 @@ function Accept-CngIssuedCertificate([string]$CertPath, [string]$Provider) {
   Invoke-Checked -Exe $certreq.Source -ArgList @("-accept", "-machine", $CertPath)
 }
 
+function Write-InstallDiagnosticReport {
+  param([string]$Path, [object]$Report)
+  if (-not $Path) { return }
+  try {
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) {
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $json = $Report | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $json)
+  } catch {
+    Write-Warning ("failed to write install diagnostic report: " + $_)
+  }
+}
+
+function Test-EndpointCertStore {
+  param([string]$StorePath, [string]$Thumbprint)
+  if (-not $Thumbprint) {
+    return @{ ok = $false; message = "missing client certificate thumbprint" }
+  }
+  if (-not $StorePath) {
+    return @{ ok = $false; message = "missing client certificate store" }
+  }
+  if ((Get-EnrollOs) -ne "windows") {
+    return @{ ok = $true; message = "certificate store check skipped on non-Windows" }
+  }
+  $store = $StorePath.Replace("\\", "\")
+  $psPath = "Cert:\" + $store + "\" + ($Thumbprint -replace '\s+', '')
+  try {
+    $cert = Get-Item -LiteralPath $psPath -ErrorAction Stop
+    return @{ ok = $true; message = ("found client certificate subject={0} not_after={1:o}" -f $cert.Subject, $cert.NotAfter.ToUniversalTime()) }
+  } catch {
+    return @{ ok = $false; message = ("client certificate not found in {0}: {1}" -f $StorePath, $_) }
+  }
+}
+
+function Test-HttpBootstrapReachability {
+  param([string]$RestBaseUrl)
+  if (-not $RestBaseUrl) {
+    return @{ ok = $false; message = "missing rest_base_url" }
+  }
+  try {
+    $null = Invoke-WebRequest -Uri $RestBaseUrl -Method Head -UseBasicParsing -TimeoutSec 8
+    return @{ ok = $true; message = "HTTP/TLS reachable" }
+  } catch {
+    $resp = $null
+    try { $resp = $_.Exception.Response } catch { $resp = $null }
+    if ($resp) {
+      return @{ ok = $true; message = ("HTTP/TLS reachable status={0}" -f [int]$resp.StatusCode) }
+    }
+    return @{ ok = $false; message = ("HTTP/TLS probe failed: " + $_.Exception.Message) }
+  }
+}
+
+function Test-AgentBootstrapHealth {
+  param(
+    [string]$TomlPath,
+    [string]$EndpointId,
+    [string]$TenantId,
+    [string]$RestBaseUrl,
+    [string]$CaPath,
+    [string]$Provider,
+    [string]$CertStore,
+    [string]$CertThumbprint,
+    [string]$ReportPath,
+    [bool]$Strict
+  )
+  $checks = New-Object System.Collections.Generic.List[object]
+  function Add-Check([string]$Name, [bool]$Ok, [string]$Message) {
+    $checks.Add([ordered]@{ name = $Name; ok = $Ok; message = $Message }) | Out-Null
+  }
+
+  Add-Check "agent.toml" (Test-Path -LiteralPath $TomlPath) ("path=" + $TomlPath)
+  Add-Check "identity" ([bool]($EndpointId -and $TenantId)) ("endpoint_id=" + $EndpointId + " tenant_id=" + $TenantId)
+  if ($CaPath) {
+    Add-Check "ca_cert_file" (Test-Path -LiteralPath $CaPath) ("path=" + $CaPath)
+  }
+  if ($Provider -eq "cng" -or $Provider -eq "tpm") {
+    $storeCheck = Test-EndpointCertStore -StorePath $CertStore -Thumbprint $CertThumbprint
+    Add-Check "client_cert_store" ([bool]$storeCheck.ok) ([string]$storeCheck.message)
+  } elseif ($CertThumbprint) {
+    Add-Check "client_cert_thumbprint" $true ("thumbprint=" + $CertThumbprint)
+  }
+  $httpCheck = Test-HttpBootstrapReachability -RestBaseUrl $RestBaseUrl
+  Add-Check "rest_tls_reachability" ([bool]$httpCheck.ok) ([string]$httpCheck.message)
+
+  $ok = $true
+  foreach ($check in $checks) {
+    if (-not $check.ok) {
+      $ok = $false
+      break
+    }
+  }
+  $report = [ordered]@{
+    created_at = (Get-Date).ToUniversalTime().ToString("o")
+    status = if ($ok) { "ok" } else { "failed" }
+    strict = $Strict
+    endpoint_id = $EndpointId
+    tenant_id = $TenantId
+    rest_base_url = $RestBaseUrl
+    key_provider = $Provider
+    client_cert_store = $CertStore
+    client_cert_thumbprint = $CertThumbprint
+    checks = $checks
+  }
+  Write-InstallDiagnosticReport -Path $ReportPath -Report $report
+  if ($ok) {
+    Write-Host "Install bootstrap health OK (report=$ReportPath)"
+    return
+  }
+  $msg = "Install bootstrap health check failed; report=" + $ReportPath
+  if ($Strict) {
+    Write-Error $msg
+  }
+  Write-Warning $msg
+}
+
 $EffectiveCertThumbprint = Get-PemCertificateThumbprint $d.client_cert
 
 function Merge-EnrollIntoAgentTomlExample {
@@ -611,6 +760,22 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$ProxyMode,
     [AllowEmptyString()][string]$ProxyUrl,
     [AllowEmptyString()][string]$RelayUrl,
+    [Parameter(Mandatory = $true)][bool]$Http2Enabled,
+    [Parameter(Mandatory = $true)][bool]$Http2Require,
+    [Parameter(Mandatory = $true)][bool]$ControlStreamEnabled,
+    [Parameter(Mandatory = $true)][bool]$LongPollFallback,
+    [Parameter(Mandatory = $true)][bool]$ReportEventsV2Enabled,
+    [Parameter(Mandatory = $true)][string]$DataPlaneEncoding,
+    [Parameter(Mandatory = $true)][string]$DataPlaneCompression,
+    [Parameter(Mandatory = $true)][string]$ControlDictVersion,
+    [Parameter(Mandatory = $true)][string]$ControlSchemaVersion,
+    [Parameter(Mandatory = $true)][string]$ControlProfileID,
+    [Parameter(Mandatory = $true)][string]$RulesURL,
+    [Parameter(Mandatory = $true)][string]$P0BundleURL,
+    [Parameter(Mandatory = $true)][string]$SensorInterestURL,
+    [Parameter(Mandatory = $true)][string]$RuntimePolicyURL,
+    [Parameter(Mandatory = $true)][string]$VersionURL,
+    [Parameter(Mandatory = $true)][string]$DownloadURL,
     [AllowEmptyString()][string]$CertStore,
     [Parameter(Mandatory = $true)][string]$CertThumbprint,
     [AllowEmptyString()][string]$Pkcs11ModulePath,
@@ -736,43 +901,68 @@ function Merge-EnrollIntoAgentTomlExample {
     }
     if ($line -match '^\s*rest_base_url\s*=') {
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
+      $out.Add(('http2_enabled        = {0}' -f (Format-TomlBool $Http2Enabled)))
+      $out.Add(('http2_require        = {0}' -f (Format-TomlBool $Http2Require)))
+      $out.Add(('control_stream_enabled = {0}' -f (Format-TomlBool $ControlStreamEnabled)))
+      $out.Add(('long_poll_fallback   = {0}' -f (Format-TomlBool $LongPollFallback)))
+      $out.Add(('report_events_v2_enabled = {0}' -f (Format-TomlBool $ReportEventsV2Enabled)))
+      $out.Add(('data_plane_encoding  = "{0}"' -f (Escape-Toml $DataPlaneEncoding)))
+      $out.Add(('data_plane_compression = "{0}"' -f (Escape-Toml $DataPlaneCompression)))
+      $out.Add(('control_dict_version = "{0}"' -f (Escape-Toml $ControlDictVersion)))
+      $out.Add(('control_schema_version = "{0}"' -f (Escape-Toml $ControlSchemaVersion)))
+      $out.Add(('control_profile_id   = "{0}"' -f (Escape-Toml $ControlProfileID)))
       $out.Add(('proxy_mode           = "{0}"' -f (Escape-Toml $ProxyMode)))
       $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
       $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
       $i++
-      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(proxy_mode|proxy_url|relay_url)\s*=')) {
+      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(http2_enabled|http2_require|control_stream_enabled|long_poll_fallback|report_events_v2_enabled|data_plane_encoding|data_plane_compression|control_dict_version|control_schema_version|control_profile_id|proxy_mode|proxy_url|relay_url)\s*=')) {
         $i++
       }
       continue
     }
     if ($line -match '^\s*rules_url\s*=') {
-      $out.Add(('rules_url            = "{0}/agent/rules.toml"' -f (Escape-Toml $AgentApiBase)))
+      $out.Add(('rules_url            = "{0}"' -f (Escape-Toml $RulesURL)))
       $i++
       continue
     }
     if ($line -match '^\s*p0_bundle_url\s*=') {
-      $out.Add(('p0_bundle_url        = "{0}/agent/p0-bundle.enc"' -f (Escape-Toml $AgentApiBase)))
+      $out.Add(('p0_bundle_url        = "{0}"' -f (Escape-Toml $P0BundleURL)))
       $i++
       continue
     }
     if ($line -match '^\s*sensor_interest_url\s*=') {
-      $out.Add(('sensor_interest_url  = "{0}/agent/sensor-interest.json"' -f (Escape-Toml $AgentApiBase)))
+      $out.Add(('sensor_interest_url  = "{0}"' -f (Escape-Toml $SensorInterestURL)))
+      $i++
+      continue
+    }
+    if ($line -match '^\s*runtime_policy_url\s*=') {
+      $out.Add(('runtime_policy_url   = "{0}"' -f (Escape-Toml $RuntimePolicyURL)))
       $i++
       continue
     }
     if ($line -match '^\s*version_url\s*=') {
-      $out.Add(('version_url          = "{0}/agent/version/latest"' -f (Escape-Toml $AgentApiBase)))
+      $out.Add(('version_url          = "{0}"' -f (Escape-Toml $VersionURL)))
       $i++
       continue
     }
     if ($line -match '^\s*download_url\s*=') {
-      $out.Add(('download_url         = "{0}/agent/download/latest"' -f (Escape-Toml $AgentApiBase)))
+      $out.Add(('download_url         = "{0}"' -f (Escape-Toml $DownloadURL)))
       $i++
       continue
     }
     if ($line -match '^\s*#\s*\[platform\]\s*$') {
       $out.Add('[platform]')
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
+      $out.Add(('http2_enabled        = {0}' -f (Format-TomlBool $Http2Enabled)))
+      $out.Add(('http2_require        = {0}' -f (Format-TomlBool $Http2Require)))
+      $out.Add(('control_stream_enabled = {0}' -f (Format-TomlBool $ControlStreamEnabled)))
+      $out.Add(('long_poll_fallback   = {0}' -f (Format-TomlBool $LongPollFallback)))
+      $out.Add(('report_events_v2_enabled = {0}' -f (Format-TomlBool $ReportEventsV2Enabled)))
+      $out.Add(('data_plane_encoding  = "{0}"' -f (Escape-Toml $DataPlaneEncoding)))
+      $out.Add(('data_plane_compression = "{0}"' -f (Escape-Toml $DataPlaneCompression)))
+      $out.Add(('control_dict_version = "{0}"' -f (Escape-Toml $ControlDictVersion)))
+      $out.Add(('control_schema_version = "{0}"' -f (Escape-Toml $ControlSchemaVersion)))
+      $out.Add(('control_profile_id   = "{0}"' -f (Escape-Toml $ControlProfileID)))
       $out.Add(('proxy_mode           = "{0}"' -f (Escape-Toml $ProxyMode)))
       $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
       $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
@@ -890,6 +1080,16 @@ tenant_id            = "$(Escape-Toml $d.tenant_id)"
 
 [platform]
 rest_base_url        = "$(Escape-Toml $rest)"
+http2_enabled        = $(Format-TomlBool $Http2Enabled)
+http2_require        = $(Format-TomlBool $Http2Require)
+control_stream_enabled = $(Format-TomlBool $ControlStreamEnabled)
+long_poll_fallback   = $(Format-TomlBool $LongPollFallback)
+report_events_v2_enabled = $(Format-TomlBool $ReportEventsV2Enabled)
+data_plane_encoding  = "$(Escape-Toml $DataPlaneEncoding)"
+data_plane_compression = "$(Escape-Toml $DataPlaneCompression)"
+control_dict_version = "$(Escape-Toml $ControlDictVersion)"
+control_schema_version = "$(Escape-Toml $ControlSchemaVersion)"
+control_profile_id   = "$(Escape-Toml $ControlProfileID)"
 proxy_mode           = "$(Escape-Toml $ProxyMode)"
 proxy_url            = "$(Escape-Toml $ProxyUrl)"
 relay_url            = "$(Escape-Toml $RelayUrl)"
@@ -988,12 +1188,13 @@ enabled              = false
 enabled              = false
 
 [remote]
-rules_url            = "$(Escape-Toml $agentApiBase)/agent/rules.toml"
-p0_bundle_url        = "$(Escape-Toml $agentApiBase)/agent/p0-bundle.enc"
-sensor_interest_url  = "$(Escape-Toml $agentApiBase)/agent/sensor-interest.json"
+rules_url            = "$(Escape-Toml $RulesURL)"
+p0_bundle_url        = "$(Escape-Toml $P0BundleURL)"
+sensor_interest_url  = "$(Escape-Toml $SensorInterestURL)"
+runtime_policy_url   = "$(Escape-Toml $RuntimePolicyURL)"
 poll_interval_s      = 1800
-version_url          = "$(Escape-Toml $agentApiBase)/agent/version/latest"
-download_url         = "$(Escape-Toml $agentApiBase)/agent/download/latest"
+version_url          = "$(Escape-Toml $VersionURL)"
+download_url         = "$(Escape-Toml $DownloadURL)"
 auto_update          = false
 
 "@
@@ -1023,6 +1224,13 @@ if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $ex
       -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
       -CaPath $EffectiveCaCertPath -CertPath $EffectiveClientCertPath -KeyPath $EffectiveClientKeyPath `
       -KeyProvider $keyProviderNorm -ProxyMode $ProxyMode -ProxyUrl $ProxyUrl -RelayUrl $RelayUrl `
+      -Http2Enabled $Http2Enabled -Http2Require $Http2Require `
+      -ControlStreamEnabled $ControlStreamEnabled -LongPollFallback $LongPollFallback `
+      -ReportEventsV2Enabled $ReportEventsV2Enabled -DataPlaneEncoding $DataPlaneEncoding `
+      -DataPlaneCompression $DataPlaneCompression -ControlDictVersion $ControlDictVersion `
+      -ControlSchemaVersion $ControlSchemaVersion -ControlProfileID $ControlProfileID `
+      -RulesURL $RulesURL -P0BundleURL $P0BundleURL -SensorInterestURL $SensorInterestURL `
+      -RuntimePolicyURL $RuntimePolicyURL -VersionURL $VersionURL -DownloadURL $DownloadURL `
       -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
       -Pkcs11ModulePath $Pkcs11Module -Pkcs11Uri $Pkcs11KeyUri -TpmUri $TpmKeyUri
   } catch {
@@ -1045,6 +1253,9 @@ if ($d.ca_cert -or $d.client_cert) {
   }
   Write-PemNoBom -Path $CaCertPath -Text $d.ca_cert
   Write-PemNoBom -Path $ClientCertPath -Text $d.client_cert
+  if ($TrustCa) {
+    Install-BootstrapCaTrust -Path $CaCertPath
+  }
   Accept-CngIssuedCertificate -CertPath $ClientCertPath -Provider $keyProviderNorm
 }
 if ($d.client_key) {
@@ -1060,6 +1271,13 @@ if ($dir -and -not (Test-Path $dir)) {
 $outFile = [System.IO.Path]::GetFullPath($Output)
 [System.IO.File]::WriteAllText($outFile, $toml)
 Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_id) server.address=$saddr)"
+
+if (-not $SkipHealthCheck) {
+  Test-AgentBootstrapHealth -TomlPath $outFile -EndpointId $d.endpoint_id -TenantId $d.tenant_id `
+    -RestBaseUrl $rest -CaPath $EffectiveCaCertPath -Provider $keyProviderNorm `
+    -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
+    -ReportPath $HealthReportPath -Strict ([bool]$StrictHealthCheck)
+}
 
 if ($ConfigureSensorPolicy) {
   Enable-WindowsSensorPolicy

@@ -19,6 +19,7 @@ param(
   [switch]$TrustCa,
   [switch]$ForceEnroll,
   [switch]$EnableResponseActions,
+  [string]$ExpectedAgentSha256 = $(if ($env:EDR_EXPECTED_AGENT_SHA256) { $env:EDR_EXPECTED_AGENT_SHA256 } else { "" }),
   [switch]$KeepOfflineQueue,
   [switch]$KeepEvidenceCache,
   [switch]$SkipPreflight,
@@ -41,6 +42,33 @@ function Get-PackageRoot {
     return (Split-Path -Parent $scriptDir)
   }
   return $scriptDir
+}
+
+function Assert-FileSha256 {
+  param([string]$Path, [string]$Expected)
+  $Expected = ($Expected -replace '\s+', '').ToLowerInvariant()
+  if (-not $Expected) { return }
+  if (-not (Test-Path -LiteralPath $Path)) {
+    throw "Hash check failed: file not found: $Path"
+  }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+  if ($actual -ne $Expected) {
+    throw "Hash check failed for $Path. expected=$Expected actual=$actual"
+  }
+  Write-Host "SHA256 verified: $Path"
+}
+
+function Write-DeployReport {
+  param([string]$InstallDir, [object]$Report)
+  try {
+    $logDir = Join-Path $InstallDir "logs"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $path = Join-Path $logDir "zip-deploy-report.json"
+    [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($path)), ($Report | ConvertTo-Json -Depth 6))
+    Write-Host "Deploy report: $path"
+  } catch {
+    Write-Warning ("failed to write deploy report: " + $_)
+  }
 }
 
 Assert-Admin
@@ -83,6 +111,11 @@ $exe = Join-Path $InstallDir "edr_agent.exe"
 if (-not (Test-Path -LiteralPath $exe)) {
   throw "edr_agent.exe not found after package copy: $exe"
 }
+$shaSidecar = Join-Path $packageRoot "edr_agent.exe.sha256"
+if (-not $ExpectedAgentSha256 -and (Test-Path -LiteralPath $shaSidecar)) {
+  $ExpectedAgentSha256 = ((Get-Content -LiteralPath $shaSidecar -TotalCount 1) -split '\s+')[0]
+}
+Assert-FileSha256 -Path $exe -Expected $ExpectedAgentSha256
 
 $args = @(
   "--install",
@@ -100,4 +133,16 @@ if ($EnableResponseActions) { $args += "--enable-response-actions" }
 
 Write-Host "Running edr_agent.exe --install (token redacted)"
 & $exe @args
-exit $LASTEXITCODE
+$rc = $LASTEXITCODE
+Write-DeployReport -InstallDir $InstallDir -Report ([ordered]@{
+  created_at = (Get-Date).ToUniversalTime().ToString("o")
+  api_base = $ApiBase
+  install_dir = $InstallDir
+  runtime_mode = $RuntimeMode
+  force_enroll = [bool]$ForceEnroll
+  trust_ca = [bool]$TrustCa
+  expected_agent_sha256 = $ExpectedAgentSha256
+  exit_code = $rc
+  status = if ($rc -eq 0) { "ok" } else { "failed" }
+})
+exit $rc
