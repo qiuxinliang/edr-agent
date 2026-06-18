@@ -681,7 +681,7 @@ begin
     EdrProgressPage.SetProgress(StageNo, StageTotal);
     Exit;
   end;
-  if FileExists(ExToml) and FileCopy(ExToml, AppToml, False) then
+  if FileExists(ExToml) and CopyFile(ExToml, AppToml, False) then
   begin
     EdrAppendStageLog('OK [Write local configuration] copied agent.toml.example');
     EdrProgressPage.SetProgress(StageNo, StageTotal);

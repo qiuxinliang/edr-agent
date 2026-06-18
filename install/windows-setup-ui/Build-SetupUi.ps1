@@ -95,8 +95,15 @@ function Invoke-SignIfConfigured([string] $Path) {
     }
 }
 
-$publishDir = Join-Path $scriptDir "bin\$Configuration\net8.0-windows10.0.17763.0\win-x64\publish"
-Remove-Item -LiteralPath $publishDir -Recurse -Force -ErrorAction SilentlyContinue
+$targetFramework = "net8.0-windows10.0.17763.0"
+$runtime = "win-x64"
+$publishDirCandidates = @(
+    (Join-Path $scriptDir "bin\$Configuration\$targetFramework\$runtime\publish"),
+    (Join-Path $scriptDir "bin\x64\$Configuration\$targetFramework\$runtime\publish")
+)
+foreach ($candidate in $publishDirCandidates) {
+    Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 dotnet publish $project `
     -c $Configuration `
@@ -108,8 +115,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit $LASTEXITCODE"
 }
 
-if (-not (Test-Path -LiteralPath $publishDir)) {
-    throw "Publish directory not found: $publishDir"
+$publishDir = $null
+foreach ($candidate in $publishDirCandidates) {
+    if (Test-Path -LiteralPath $candidate) {
+        $publishDir = (Resolve-Path -LiteralPath $candidate).Path
+        break
+    }
+}
+
+if (-not $publishDir) {
+    throw "Publish directory not found. Checked: $($publishDirCandidates -join '; ')"
 }
 
 Copy-Item -LiteralPath $SetupExe -Destination (Join-Path $publishDir "edr_agent_setup.exe") -Force
