@@ -280,17 +280,19 @@ end;
 function SaveEnrollParamsFileIfNeeded: Boolean;
 var
   Path, U, T, ProxyMode, ProxyUrl, RelayUrl, Json: string;
+  JsonFromFile: AnsiString;
   Insecure, KeepQueue, KeepEvidence, StrictHealth: Boolean;
 begin
   Result := False;
   Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
   if EdrCmdParamsFile <> '' then
   begin
-    if not LoadStringFromFile(EdrCmdParamsFile, Json) then
+    if not LoadStringFromFile(EdrCmdParamsFile, JsonFromFile) then
     begin
       Log('SaveEnrollParamsFileIfNeeded: failed to read params file ' + EdrCmdParamsFile);
       Exit;
     end;
+    Json := JsonFromFile;
     Result := SaveStringToFile(Path, Json, False);
     if not Result then
       Log('SaveEnrollParamsFileIfNeeded: failed to copy params file to ' + Path);
@@ -809,6 +811,7 @@ end;
 procedure CurPageChanged(CurPageID: Integer);
 var
   HealthReport, PreflightReport, RuntimeReport, S, Msg: string;
+  RawHealthReport: AnsiString;
 begin
   if CurPageID = ReviewPage.ID then
     ReviewPage.MsgLabel.Caption := EdrDeploymentPlanText;
@@ -819,8 +822,9 @@ begin
   HealthReport := EdrDiagnosticsFile('install_health_report.json');
   PreflightReport := EdrDiagnosticsFile('install_preflight_report.json');
   RuntimeReport := EdrDiagnosticsFile('install_runtime_verify.json');
-  if LoadStringFromFile(HealthReport, S) then
+  if LoadStringFromFile(HealthReport, RawHealthReport) then
   begin
+    S := RawHealthReport;
     if (Pos('"status":"ok"', S) > 0) or (Pos('"status": "ok"', S) > 0) then
       WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed and bootstrap checks passed'
     else
