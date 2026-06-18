@@ -135,8 +135,41 @@ void edr_ingest_http_apply_transport_flags(int http2_required, int control_strea
                                            int long_poll_fallback,
                                            int report_events_v2_enabled);
 
+typedef struct {
+  char config_hash[65];
+  char sequence[32];
+  char previous_hash[65];
+  char signing_key_id[96];
+  char signature[192];
+  char nonce[96];
+  char expires_at[64];
+  char signed_payload_b64[2048];
+  char rollout_id[96];
+  char rollout_stage[48];
+  char rollout_bucket[32];
+  char rollout_percent[16];
+} EdrAgentConfigHeaders;
+
 /** Native HTTPS GET using the configured REST/mTLS/proxy stack; writes a binary-safe response to file. */
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes);
+int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
+                                         size_t max_bytes, EdrAgentConfigHeaders *headers);
+
+int edr_ingest_http_post_config_status(const char *tenant_id,
+                                       const char *endpoint_id,
+                                       const char *agent_version,
+                                       const char *policy_version,
+                                       const char *config_hash,
+                                       const char *config_sequence,
+                                       const char *config_nonce,
+                                       const char *config_signature,
+                                       const char *signing_key_id,
+                                       int verified,
+                                       const char *reject_reason,
+                                       const char *desired_version,
+                                       const char *desired_hash,
+                                       const char *apply_status,
+                                       int restart_required);
 
 /**
  * 发送一批（12B BAT1/BLZ4 头 + payload）；成功返回 0。

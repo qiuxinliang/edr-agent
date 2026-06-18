@@ -7,6 +7,9 @@
 
 # Windows installer output.
 install/windows-inno/Output/
+install/windows-setup-ui/bin/
+install/windows-setup-ui/obj/
+install/windows-setup-ui/Output/
 
 # Generated dependencies / virtualenvs / temporary workspaces.
 /.onnx_gen_deps/

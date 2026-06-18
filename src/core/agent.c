@@ -9,6 +9,7 @@
 #include "edr/resource.h"
 #include "edr/self_protect.h"
 #include "edr/sensor_interest.h"
+#include "edr/sha256.h"
 #include "edr/shell_session.h"
 #include "edr/shellcode_known.h"
 #include "edr/time_util.h"
@@ -43,6 +44,13 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #include <time.h>
 
 #include <sys/stat.h>
+
+#ifdef EDR_HAVE_OPENSSL_HTTP
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/pem.h>
+#endif
 
 #ifdef _WIN32
 #define EDR_AGENT_STRDUP _strdup
@@ -138,16 +146,329 @@ static void edr_agent_loop_probe_end(uint64_t started_ns) {
   } while (0)
 
 static int edr_agent_download_text_file(const char *url, const char *tmp, size_t max_bytes,
-                                        const char *label) {
+                                        const char *label, EdrAgentConfigHeaders *headers) {
+  int rc;
   if (!url || !url[0] || !tmp || !tmp[0]) {
     return -1;
   }
-  if (edr_ingest_http_get_url_to_file(url, tmp, max_bytes) == 0) {
+  rc = headers
+           ? edr_ingest_http_get_url_to_file_meta(url, tmp, max_bytes, headers)
+           : edr_ingest_http_get_url_to_file(url, tmp, max_bytes);
+  if (rc == 0) {
     return 0;
   }
   fprintf(stderr, "[config] %s pull failed via native HTTPS client\n",
           label && label[0] ? label : "remote config");
   return -1;
+}
+
+static int edr_agent_config_signature_required(const EdrConfig *cfg) {
+  const char *v = getenv("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED");
+  if (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')) {
+    return 1;
+  }
+  return cfg && cfg->config_signing.signature_required;
+}
+
+static const char *edr_agent_config_signing_secret(void) {
+  const char *v = getenv("EDR_AGENT_CONFIG_SIGNING_SECRET");
+  if (v && v[0]) {
+    return v;
+  }
+  return "dev-agent-config-signing-secret";
+}
+
+static const char *edr_agent_config_public_key_pem(const EdrConfig *cfg) {
+  const char *v = getenv("EDR_AGENT_CONFIG_SIGNING_PUBLIC_KEY_PEM");
+  if (v && v[0]) {
+    return v;
+  }
+  if (cfg && cfg->config_signing.public_key_pem[0]) {
+    return cfg->config_signing.public_key_pem;
+  }
+  return "";
+}
+
+static const char *edr_agent_config_signing_key_id(const EdrConfig *cfg) {
+  const char *v = getenv("EDR_AGENT_CONFIG_SIGNING_KEY_ID");
+  if (v && v[0]) {
+    return v;
+  }
+  if (cfg && cfg->config_signing.signing_key_id[0]) {
+    return cfg->config_signing.signing_key_id;
+  }
+  return "";
+}
+
+static int b64url_val(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '-' || c == '+') return 62;
+  if (c == '_' || c == '/') return 63;
+  return -1;
+}
+
+static int b64url_decode(const char *in, unsigned char *out, size_t out_cap, size_t *out_len) {
+  int val = 0;
+  int valb = -8;
+  size_t n = 0;
+  if (!in || !out || !out_len) {
+    return -1;
+  }
+  for (; *in; in++) {
+    if (*in == '=') break;
+    int d = b64url_val(*in);
+    if (d < 0) {
+      if (*in == '\r' || *in == '\n' || *in == ' ' || *in == '\t') continue;
+      return -1;
+    }
+    val = (val << 6) | d;
+    valb += 6;
+    if (valb >= 0) {
+      if (n >= out_cap) return -1;
+      out[n++] = (unsigned char)((val >> valb) & 0xFF);
+      valb -= 8;
+    }
+  }
+  *out_len = n;
+  return 0;
+}
+
+static void b64url_encode(const unsigned char *in, size_t in_len, char *out, size_t out_cap) {
+  static const char *tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  size_t o = 0;
+  unsigned int val = 0;
+  int valb = -6;
+  if (!out || out_cap == 0u) return;
+  for (size_t i = 0; i < in_len; i++) {
+    val = (val << 8) | in[i];
+    valb += 8;
+    while (valb >= 0) {
+      if (o + 1u >= out_cap) {
+        out[o] = '\0';
+        return;
+      }
+      out[o++] = tab[(val >> valb) & 0x3F];
+      valb -= 6;
+    }
+  }
+  if (valb > -6 && o + 1u < out_cap) {
+    out[o++] = tab[((val << 8) >> (valb + 8)) & 0x3F];
+  }
+  out[o < out_cap ? o : out_cap - 1u] = '\0';
+}
+
+static time_t edr_agent_timegm_utc(struct tm *tmv) {
+#ifdef _WIN32
+  return _mkgmtime(tmv);
+#else
+  return timegm(tmv);
+#endif
+}
+
+static int edr_agent_rfc3339_expired(const char *raw) {
+  int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+  struct tm tmv;
+  time_t t;
+  if (!raw || !raw[0]) {
+    return 0;
+  }
+  if (sscanf(raw, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) {
+    return 0;
+  }
+  memset(&tmv, 0, sizeof(tmv));
+  tmv.tm_year = y - 1900;
+  tmv.tm_mon = mo - 1;
+  tmv.tm_mday = d;
+  tmv.tm_hour = h;
+  tmv.tm_min = mi;
+  tmv.tm_sec = s;
+  t = edr_agent_timegm_utc(&tmv);
+  if (t <= 0) {
+    return 0;
+  }
+  return time(NULL) > t ? 1 : 0;
+}
+
+#ifdef EDR_HAVE_OPENSSL_HTTP
+static int edr_agent_verify_ed25519_signature(const char *public_key_pem,
+                                              const unsigned char *payload, size_t payload_len,
+                                              const unsigned char *sig, size_t sig_len) {
+  BIO *bio = NULL;
+  EVP_PKEY *pkey = NULL;
+  EVP_MD_CTX *ctx = NULL;
+  int ok = 0;
+  if (!public_key_pem || !public_key_pem[0] || !payload || !sig || sig_len == 0u) {
+    return -1;
+  }
+  bio = BIO_new_mem_buf(public_key_pem, -1);
+  if (!bio) {
+    return -1;
+  }
+  pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+  BIO_free(bio);
+  if (!pkey) {
+    return -1;
+  }
+  ctx = EVP_MD_CTX_new();
+  if (ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+      EVP_DigestVerify(ctx, sig, sig_len, payload, payload_len) == 1) {
+    ok = 1;
+  }
+  EVP_MD_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  return ok ? 0 : -1;
+}
+#endif
+
+static int edr_agent_file_sha256_hex(const char *path, char out65[65]) {
+  FILE *fp;
+  unsigned char buf[8192];
+  EdrSha256Ctx ctx;
+  size_t n;
+  uint8_t d[EDR_SHA256_DIGEST_LEN];
+  static const char *hx = "0123456789abcdef";
+  if (!path || !out65) return -1;
+  fp = fopen(path, "rb");
+  if (!fp) return -1;
+  edr_sha256_init(&ctx);
+  while ((n = fread(buf, 1u, sizeof(buf), fp)) > 0u) {
+    edr_sha256_update(&ctx, buf, n);
+  }
+  fclose(fp);
+  edr_sha256_final(&ctx, d);
+  for (int i = 0; i < 32; i++) {
+    out65[i * 2] = hx[d[i] >> 4];
+    out65[i * 2 + 1] = hx[d[i] & 15];
+  }
+  out65[64] = '\0';
+  return 0;
+}
+
+static void edr_agent_config_state_path(const char *queue_db_path, char *out, size_t cap) {
+  const char *base = queue_db_path && queue_db_path[0] ? queue_db_path : "edr_queue.db";
+  size_t len;
+  if (!out || cap == 0u) return;
+  snprintf(out, cap, "%s", base);
+  len = strlen(out);
+  while (len > 0u && out[len - 1u] != '/' && out[len - 1u] != '\\') {
+    out[--len] = '\0';
+  }
+  if (len == 0u) {
+    snprintf(out, cap, "agent_config_sequence.state");
+  } else {
+    snprintf(out + len, cap - len, "agent_config_sequence.state");
+  }
+}
+
+static long long edr_agent_read_config_sequence_state(const char *queue_db_path) {
+  char path[1024];
+  FILE *fp;
+  long long v = 0;
+  edr_agent_config_state_path(queue_db_path, path, sizeof(path));
+  fp = fopen(path, "r");
+  if (!fp) return 0;
+  if (fscanf(fp, "%lld", &v) != 1) v = 0;
+  fclose(fp);
+  return v;
+}
+
+static void edr_agent_write_config_sequence_state(const char *queue_db_path, long long seq) {
+  char path[1024];
+  FILE *fp;
+  if (seq <= 0) return;
+  edr_agent_config_state_path(queue_db_path, path, sizeof(path));
+  fp = fopen(path, "w");
+  if (!fp) return;
+  fprintf(fp, "%lld\n", seq);
+  fclose(fp);
+}
+
+static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *queue_db_path, const char *tmp,
+                                           const EdrAgentConfigHeaders *headers,
+                                           char *reason, size_t reason_cap) {
+  char actual_hash[65];
+  long long seq;
+  long long seen;
+  const char *trusted_key_id;
+  const char *public_key_pem;
+  if (reason && reason_cap) reason[0] = '\0';
+  if (!headers || !headers->signature[0] || !headers->signed_payload_b64[0] || !headers->sequence[0] || !headers->config_hash[0]) {
+    if (edr_agent_config_signature_required(cfg)) {
+      snprintf(reason, reason_cap, "missing signed config headers");
+      return -1;
+    }
+    return 0;
+  }
+  trusted_key_id = edr_agent_config_signing_key_id(cfg);
+  if (trusted_key_id && trusted_key_id[0] && strcmp(trusted_key_id, headers->signing_key_id) != 0) {
+    snprintf(reason, reason_cap, "untrusted signing key id expected=%s got=%s", trusted_key_id, headers->signing_key_id);
+    return -1;
+  }
+  if (edr_agent_rfc3339_expired(headers->expires_at)) {
+    snprintf(reason, reason_cap, "signed config expired at %s", headers->expires_at);
+    return -1;
+  }
+  if (edr_agent_file_sha256_hex(tmp, actual_hash) != 0 || strcmp(actual_hash, headers->config_hash) != 0) {
+    snprintf(reason, reason_cap, "config hash mismatch");
+    return -1;
+  }
+  seq = atoll(headers->sequence);
+  seen = edr_agent_read_config_sequence_state(queue_db_path);
+  if (seq > 0 && seen > 0 && seq < seen) {
+    snprintf(reason, reason_cap, "config rollback detected sequence=%lld seen=%lld", seq, seen);
+    return -1;
+  }
+  public_key_pem = edr_agent_config_public_key_pem(cfg);
+#ifdef EDR_HAVE_OPENSSL_HTTP
+  if (public_key_pem && public_key_pem[0]) {
+    unsigned char payload[2048];
+    size_t payload_len = 0u;
+    unsigned char sig[128];
+    size_t sig_len = 0u;
+    if (b64url_decode(headers->signed_payload_b64, payload, sizeof(payload), &payload_len) != 0) {
+      snprintf(reason, reason_cap, "signed payload decode failed");
+      return -1;
+    }
+    if (b64url_decode(headers->signature, sig, sizeof(sig), &sig_len) != 0) {
+      snprintf(reason, reason_cap, "signature decode failed");
+      return -1;
+    }
+    if (edr_agent_verify_ed25519_signature(public_key_pem, payload, payload_len, sig, sig_len) != 0) {
+      snprintf(reason, reason_cap, "ed25519 signature mismatch");
+      return -1;
+    }
+    return 0;
+  }
+  {
+    unsigned char payload[2048];
+    size_t payload_len = 0u;
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len = 0u;
+    char encoded[192];
+    const char *secret = edr_agent_config_signing_secret();
+    if (b64url_decode(headers->signed_payload_b64, payload, sizeof(payload), &payload_len) != 0) {
+      snprintf(reason, reason_cap, "signed payload decode failed");
+      return -1;
+    }
+    if (!HMAC(EVP_sha256(), secret, (int)strlen(secret), payload, payload_len, mac, &mac_len)) {
+      snprintf(reason, reason_cap, "hmac failed");
+      return -1;
+    }
+    b64url_encode(mac, mac_len, encoded, sizeof(encoded));
+    if (strcmp(encoded, headers->signature) != 0) {
+      snprintf(reason, reason_cap, "signature mismatch");
+      return -1;
+    }
+  }
+#else
+  if (edr_agent_config_signature_required(cfg)) {
+    snprintf(reason, reason_cap, "OpenSSL signature verification unavailable");
+    return -1;
+  }
+#endif
+  return 0;
 }
 
 static int edr_agent_file_has_magic(const char *path, const char *magic, size_t magic_len) {
@@ -1551,8 +1872,33 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
 #else
   snprintf(tmp, sizeof(tmp), "/tmp/edr_remote_%d.toml", (int)getpid());
 #endif
-  if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "remote TOML") != 0) {
+  EdrAgentConfigHeaders config_headers;
+  memset(&config_headers, 0, sizeof(config_headers));
+  if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "remote TOML", &config_headers) != 0) {
     return;
+  }
+  {
+    char verify_reason[192];
+    if (edr_agent_verify_config_headers(&agent->cfg, agent->cfg.offline.queue_db_path, tmp, &config_headers, verify_reason, sizeof(verify_reason)) != 0) {
+      fprintf(stderr, "[config] remote TOML signature rejected: %s\n", verify_reason);
+      (void)edr_ingest_http_post_config_status(agent->cfg.agent.tenant_id,
+                                               agent->cfg.agent.endpoint_id,
+                                               EDR_AGENT_VERSION_STRING,
+                                               config_headers.sequence[0] ? agent->cfg.preprocessing.rules_version : "local",
+                                               config_headers.config_hash,
+                                               config_headers.sequence,
+                                               config_headers.nonce,
+                                               config_headers.signature,
+                                               config_headers.signing_key_id,
+                                               0,
+                                               verify_reason,
+                                               agent->cfg.preprocessing.rules_version,
+                                               config_headers.config_hash,
+                                               "failed",
+                                               0);
+      (void)remove(tmp);
+      return;
+    }
   }
 
   EdrConfig remote;
@@ -1576,6 +1922,32 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_resource_init(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
   edr_ingest_http_set_policy_version(agent->cfg.preprocessing.rules_version);
+  if (config_headers.sequence[0] || config_headers.config_hash[0]) {
+    long long seq = atoll(config_headers.sequence);
+    if (seq > 0) {
+      edr_agent_write_config_sequence_state(agent->cfg.offline.queue_db_path, seq);
+    }
+    (void)edr_ingest_http_post_config_status(agent->cfg.agent.tenant_id,
+                                             agent->cfg.agent.endpoint_id,
+                                             EDR_AGENT_VERSION_STRING,
+                                             agent->cfg.preprocessing.rules_version,
+                                             config_headers.config_hash,
+                                             config_headers.sequence,
+                                             config_headers.nonce,
+                                             config_headers.signature,
+                                             config_headers.signing_key_id,
+                                             1,
+                                             "",
+                                             agent->cfg.preprocessing.rules_version,
+                                             config_headers.config_hash,
+                                             "applied",
+                                             (changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0);
+    fprintf(stderr, "[config] signed remote policy applied sequence=%s hash=%s rollout=%s/%s\n",
+            config_headers.sequence[0] ? config_headers.sequence : "0",
+            config_headers.config_hash[0] ? config_headers.config_hash : "-",
+            config_headers.rollout_id[0] ? config_headers.rollout_id : "-",
+            config_headers.rollout_bucket[0] ? config_headers.rollout_bucket : "-");
+  }
   {
     const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
     if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&
@@ -1659,7 +2031,7 @@ static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_n
   snprintf(tmp, sizeof(tmp), "/tmp/edr_p0_bundle_%d.enc", (int)getpid());
 #endif
 
-  if (edr_agent_download_text_file(url, tmp, 4u * 1024u * 1024u, "P0 bundle") != 0) {
+  if (edr_agent_download_text_file(url, tmp, 4u * 1024u * 1024u, "P0 bundle", NULL) != 0) {
     return;
   }
   if (!edr_agent_file_has_magic(tmp, "EDR1", 4u)) {
@@ -1738,14 +2110,14 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
       t = ".";
     }
     snprintf(tmp, sizeof(tmp), "%s\\edr_sensor_interest_%lu.json", t, (unsigned long)GetCurrentProcessId());
-    if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "sensor interest") != 0) {
+    if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "sensor interest", NULL) != 0) {
       return;
     }
   }
 #else
   {
     snprintf(tmp, sizeof(tmp), "/tmp/edr_sensor_interest_%d.json", (int)getpid());
-    if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "sensor interest") != 0) {
+    if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "sensor interest", NULL) != 0) {
       return;
     }
   }

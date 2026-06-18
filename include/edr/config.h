@@ -42,6 +42,12 @@ typedef struct EdrConfig {
   } agent;
 
   struct {
+    bool signature_required;
+    char signing_key_id[96];
+    char public_key_pem[4096];
+  } config_signing;
+
+  struct {
     bool etw_enabled;
     /** Optional Windows provider switches. Defaults preserve the historical collector posture. */
     bool etw_dns_client_provider;

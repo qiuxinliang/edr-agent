@@ -15,7 +15,9 @@ param(
   [switch]$SkipRuntimeCleanup,
   [switch]$KeepOfflineQueue,
   [switch]$KeepEvidenceCache,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [switch]$CheckOnly,
+  [string]$ReportPath = $(if ($env:EDR_PREFLIGHT_REPORT) { $env:EDR_PREFLIGHT_REPORT } else { "" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +28,81 @@ function Write-Preflight([string]$Message) {
 
 function Test-IsWindows {
   return ($env:OS -match "Windows_NT" -or $PSVersionTable.Platform -eq "Win32NT" -or -not $PSVersionTable.Platform)
+}
+
+function Test-IsElevated {
+  if (-not (Test-IsWindows)) { return $true }
+  try {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch {
+    return $false
+  }
+}
+
+function Get-PathCount {
+  param([string]$Pattern)
+  if (-not $Pattern) { return 0 }
+  try {
+    return @((Get-ChildItem -Path $Pattern -Force -ErrorAction SilentlyContinue)).Count
+  } catch {
+    return 0
+  }
+}
+
+function New-Check {
+  param([string]$Name, [string]$Status, [string]$Message)
+  return [ordered]@{
+    name = $Name
+    status = $Status
+    message = $Message
+  }
+}
+
+function New-PreflightReport {
+  param([string]$Phase)
+  $dir = [System.IO.Path]::GetFullPath($InstallDir)
+  $isWindows = Test-IsWindows
+  $isElevated = Test-IsElevated
+  $svc = $null
+  if ($isWindows) {
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+  }
+  $procCount = @((Get-Process -Name "edr_agent" -ErrorAction SilentlyContinue)).Count
+  $queueCount = Get-PathCount -Pattern (Join-Path $dir "queue\edr_queue.db*")
+  $evidenceCount = Get-PathCount -Pattern (Join-Path $dir "evidence\local_evidence_cache.db*")
+  $checks = New-Object System.Collections.Generic.List[object]
+  $checks.Add((New-Check -Name "windows" -Status $(if ($isWindows) { "ok" } else { "failed" }) -Message $(if ($isWindows) { "Windows endpoint" } else { "not Windows" }))) | Out-Null
+  $checks.Add((New-Check -Name "elevated" -Status $(if ($isElevated) { "ok" } else { "warning" }) -Message $(if ($isElevated) { "running with administrator privilege" } else { "administrator privilege recommended" }))) | Out-Null
+  $checks.Add((New-Check -Name "install_dir" -Status $(if (Test-Path -LiteralPath $dir) { "ok" } else { "warning" }) -Message $dir)) | Out-Null
+  $checks.Add((New-Check -Name "service" -Status "ok" -Message $(if ($svc) { "$ServiceName status=$($svc.Status)" } else { "$ServiceName not installed" }))) | Out-Null
+  $checks.Add((New-Check -Name "process" -Status $(if ($procCount -gt 0) { "warning" } else { "ok" }) -Message "edr_agent process count=$procCount")) | Out-Null
+  $checks.Add((New-Check -Name "offline_queue" -Status "ok" -Message "files=$queueCount action=$(if ($KeepOfflineQueue) { 'keep' } else { 'cleanup' })")) | Out-Null
+  $checks.Add((New-Check -Name "evidence_cache" -Status "ok" -Message "files=$evidenceCount action=$(if ($KeepEvidenceCache) { 'keep' } else { 'cleanup' })")) | Out-Null
+  return [ordered]@{
+    created_at = (Get-Date).ToUniversalTime().ToString("o")
+    status = $(if ($isWindows) { "ok" } else { "failed" })
+    phase = $Phase
+    mode = $(if ($CheckOnly) { "check_only" } elseif ($DryRun) { "dry_run" } else { "apply" })
+    install_dir = $dir
+    service_name = $ServiceName
+    keep_offline_queue = [bool]$KeepOfflineQueue
+    keep_evidence_cache = [bool]$KeepEvidenceCache
+    checks = $checks
+  }
+}
+
+function Write-PreflightReport {
+  param([object]$Report)
+  if (-not $ReportPath) { return }
+  $path = [System.IO.Path]::GetFullPath($ReportPath)
+  $dir = Split-Path -Parent $path
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  }
+  $Report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+  Write-Preflight "report=$path"
 }
 
 function Remove-PathPattern {
@@ -120,6 +197,13 @@ function Invoke-RuntimeCleanup {
   Remove-PathPattern -Pattern (Join-Path $dir "edr_agent.pid") -Label "pid file"
 }
 
+if ($CheckOnly) {
+  Write-Preflight "check-only complete"
+  Write-PreflightReport -Report (New-PreflightReport -Phase "check_only")
+  return
+}
+
 Stop-AgentRuntime
 Invoke-RuntimeCleanup
+Write-PreflightReport -Report (New-PreflightReport -Phase "completed")
 Write-Preflight "complete"

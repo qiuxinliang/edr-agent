@@ -1760,6 +1760,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->forensic_auto.collect_process_tree = true;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
+  cfg->config_signing.signature_required = false;
+  cfg->config_signing.signing_key_id[0] = '\0';
+  cfg->config_signing.public_key_pem[0] = '\0';
   cfg->platform.http2_enabled = true;
   cfg->platform.http2_require = false;
   cfg->platform.control_stream_enabled = true;
@@ -1942,6 +1945,31 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.proxy_url));
   take_string(toml_string_in(t, "relay_url"), cfg->platform.relay_url,
               sizeof(cfg->platform.relay_url));
+}
+
+static void load_config_signing(toml_table_t *t, EdrConfig *cfg) {
+  toml_datum_t d = toml_bool_in(t, "signature_required");
+  if (d.ok) {
+    cfg->config_signing.signature_required = d.u.b ? true : false;
+  }
+  take_string(toml_string_in(t, "signing_key_id"), cfg->config_signing.signing_key_id,
+              sizeof(cfg->config_signing.signing_key_id));
+  take_string(toml_string_in(t, "public_key_pem"), cfg->config_signing.public_key_pem,
+              sizeof(cfg->config_signing.public_key_pem));
+  if (cfg->config_signing.public_key_pem[0]) {
+    char expanded[sizeof(cfg->config_signing.public_key_pem)];
+    size_t o = 0u;
+    for (size_t i = 0u; cfg->config_signing.public_key_pem[i] && o + 1u < sizeof(expanded); i++) {
+      if (cfg->config_signing.public_key_pem[i] == '\\' && cfg->config_signing.public_key_pem[i + 1u] == 'n') {
+        expanded[o++] = '\n';
+        i++;
+      } else {
+        expanded[o++] = cfg->config_signing.public_key_pem[i];
+      }
+    }
+    expanded[o] = '\0';
+    snprintf(cfg->config_signing.public_key_pem, sizeof(cfg->config_signing.public_key_pem), "%s", expanded);
+  }
 }
 
 /** 解析 `[fl] coordinator_secp256r1_pubkey_hex` → SEC1 点（33 或 65 字节） */
@@ -2387,6 +2415,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "platform");
     if (t) {
       load_platform(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "config_signing");
+    if (t) {
+      load_config_signing(t, cfg);
     }
   }
   {

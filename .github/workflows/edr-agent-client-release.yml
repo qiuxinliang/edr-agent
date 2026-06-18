@@ -312,6 +312,10 @@ jobs:
             Write-Host "========================================"
           }
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
       - name: Package (setup exe + runtime zip)
         shell: pwsh
         run: |
@@ -357,6 +361,12 @@ jobs:
           Copy-Item -LiteralPath $setupSrc -Destination $setupDest -Force
           $null = $items.Add($setupDest)
 
+          $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -OutputZip $setupUiZip
+          if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
+          if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
+          $null = $items.Add($setupUiZip)
+
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
           if (-not (Test-Path -LiteralPath $zip)) { throw "package was not created: $zip" }
           Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -389,6 +399,9 @@ jobs:
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"
             }
+            if (-not ($entries -match '(^|/|\\)edr_agent_setup_ui\.zip$')) {
+              throw "edr_agent_setup_ui.zip missing from package"
+            }
             foreach ($required in @(
               'edr_agent_install\.ps1',
               'edr_agent_preflight\.ps1',
@@ -414,6 +427,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
           Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-exe.zip") -Force
           if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
+          if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -421,6 +435,7 @@ jobs:
           path: |
             edr-agent-win-exe.zip
             edr_agent_setup.exe
+            edr_agent_setup_ui.zip
           retention-days: 14
           if-no-files-found: error
 
@@ -443,14 +458,17 @@ jobs:
           ref="${{ github.ref_name }}"
           test -f "dist/edr-agent-win-exe.zip"
           test -f "dist/edr_agent_setup.exe"
+          test -f "dist/edr_agent_setup_ui.zip"
           mv "dist/edr-agent-win-exe.zip" "dist/edr-agent-${ref}-windows-amd64-exe.zip"
           mv "dist/edr_agent_setup.exe" "dist/edr-agent-${ref}-windows-amd64-setup.exe"
+          mv "dist/edr_agent_setup_ui.zip" "dist/edr-agent-${ref}-windows-amd64-setup-ui.zip"
           if unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bundle_manifest\.json)$'; then
             echo "plaintext P0 rules must not be published" >&2
             exit 1
           fi
           unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)p0_rule_bundle_ir_v1\.json\.enc$' >/dev/null
           unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)VERSION$' >/dev/null
+          unzip -Z1 "dist/edr-agent-${ref}-windows-amd64-exe.zip" | grep -E '(^|/)edr_agent_setup_ui\.zip$' >/dev/null
       - uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

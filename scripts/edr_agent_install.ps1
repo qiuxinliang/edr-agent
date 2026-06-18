@@ -16,6 +16,7 @@
     EDR_PROXY_MODE=auto|off|explicit
     EDR_PROXY_URL=http://proxy.corp:8080
     EDR_RELAY_URL=https://relay.corp:443/api/v1
+    EDR_MAX_EVENT_QUEUE_SIZE=8192
     EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
     EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
     EDR_KEY_PROVIDER=pem|cng|tpm|pkcs11（Windows 默认 cng，Linux/macOS 默认 pem）
@@ -45,6 +46,7 @@ param(
   [string]$ProxyMode = $(if ($env:EDR_PROXY_MODE) { $env:EDR_PROXY_MODE } else { "auto" }),
   [string]$ProxyUrl = $(if ($env:EDR_PROXY_URL) { $env:EDR_PROXY_URL } else { "" }),
   [string]$RelayUrl = $(if ($env:EDR_RELAY_URL) { $env:EDR_RELAY_URL } else { "" }),
+  [int]$MaxEventQueueSize = 8192,
   [string]$CngProviderName = $(if ($env:EDR_CNG_PROVIDER_NAME) { $env:EDR_CNG_PROVIDER_NAME } else { "" }),
   [string]$CngKeyName = $(if ($env:EDR_CNG_KEY_NAME) { $env:EDR_CNG_KEY_NAME } else { "" }),
   [string]$Pkcs11KeyUri = $(if ($env:EDR_PKCS11_KEY_URI) { $env:EDR_PKCS11_KEY_URI } else { "" }),
@@ -90,8 +92,90 @@ if (-not $api -or -not $tok) {
   Write-Error "Provide -ApiBase and -EnrollToken, for example: .\edr_agent_install.ps1 -ApiBase https://edr.example:8080 -EnrollToken <token>"
 }
 
-$api = $api.TrimEnd("/")
+function Normalize-ApiBaseForEnroll {
+  param([Parameter(Mandatory = $true)][string]$Value)
+  $v = $Value.Trim().TrimEnd("/")
+  if (-not $v) {
+    Write-Error "ApiBase is empty"
+  }
+  try {
+    $u = [System.Uri]$v
+  } catch {
+    Write-Error "ApiBase must be an absolute http(s) URL: $Value"
+  }
+  if ($u.Scheme -ne "http" -and $u.Scheme -ne "https") {
+    Write-Error "ApiBase must use http or https: $Value"
+  }
+  $path = $u.AbsolutePath.TrimEnd("/")
+  $apiSuffix = "/api/v1"
+  if ($path -match '(?i)/api/v1$') {
+    $prefix = $path.Substring(0, $path.Length - $apiSuffix.Length)
+    $b = [System.UriBuilder]::new($u)
+    $b.Path = $prefix
+    $b.Query = ""
+    $b.Fragment = ""
+    return $b.Uri.AbsoluteUri.TrimEnd("/")
+  }
+  return $v
+}
+
+function Normalize-ProxyModeValue {
+  param([string]$Value)
+  $v = if ($Value) { $Value.Trim().ToLowerInvariant() } else { "auto" }
+  switch ($v) {
+    "off" { return "off" }
+    "direct" { return "off" }
+    "none" { return "off" }
+    "explicit" { return "explicit" }
+    "manual" { return "explicit" }
+    "proxy" { return "explicit" }
+    default { return "auto" }
+  }
+}
+
+function Get-WebRequestProxyOptions {
+  param([string]$Mode, [string]$Url)
+  $opts = @{}
+  if ($Mode -ne "explicit") {
+    return $opts
+  }
+  $raw = if ($Url) { $Url.Trim() } else { "" }
+  if (-not $raw) {
+    Write-Error "ProxyMode=explicit requires ProxyUrl"
+  }
+  try {
+    $u = [System.Uri]$raw
+  } catch {
+    Write-Error "ProxyUrl must be an absolute http(s) URL: $Url"
+  }
+  if ($u.Scheme -ne "http" -and $u.Scheme -ne "https") {
+    Write-Error "ProxyUrl must use http or https: $Url"
+  }
+  $b = [System.UriBuilder]::new($u)
+  if ($u.UserInfo) {
+    $parts = $u.UserInfo.Split(":", 2)
+    $user = [System.Uri]::UnescapeDataString($parts[0])
+    $pass = if ($parts.Count -gt 1) { [System.Uri]::UnescapeDataString($parts[1]) } else { "" }
+    $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+    $opts["ProxyCredential"] = [System.Management.Automation.PSCredential]::new($user, $secure)
+    $b.UserName = ""
+    $b.Password = ""
+  }
+  $opts["Proxy"] = $b.Uri.AbsoluteUri
+  return $opts
+}
+
+$api = Normalize-ApiBaseForEnroll $api
 $uri = "$api/api/v1/enroll"
+if ($RelayUrl -and $RelayUrl.Trim()) {
+  $RelayUrl = (Normalize-ApiBaseForEnroll $RelayUrl) + "/api/v1"
+}
+$ProxyMode = Normalize-ProxyModeValue $ProxyMode
+$ProxyUrl = if ($ProxyUrl) { $ProxyUrl.Trim() } else { "" }
+if ($ProxyMode -eq "off") {
+  [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
+}
+$WebRequestProxyOptions = Get-WebRequestProxyOptions -Mode $ProxyMode -Url $ProxyUrl
 
 function Resolve-AgentVersion {
   if ($env:EDR_AGENT_VERSION -and $env:EDR_AGENT_VERSION.Trim()) {
@@ -122,6 +206,14 @@ function Read-AgentTomlScalar {
 }
 
 $av = Resolve-AgentVersion
+if ($env:EDR_MAX_EVENT_QUEUE_SIZE) {
+  try {
+    $MaxEventQueueSize = [int]$env:EDR_MAX_EVENT_QUEUE_SIZE
+  } catch {
+    Write-Warning "Invalid EDR_MAX_EVENT_QUEUE_SIZE=$($env:EDR_MAX_EVENT_QUEUE_SIZE); using $MaxEventQueueSize"
+  }
+}
+$TomlMaxEventQueueSize = [Math]::Min(65536, [Math]::Max(1024, $MaxEventQueueSize))
 
 function Resolve-OpenSSL {
   $candidates = New-Object System.Collections.Generic.List[string]
@@ -527,7 +619,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 }
 
 try {
-  $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body $json
+  $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body $json @WebRequestProxyOptions
 } catch {
   Write-Error ("enroll failed: " + $_)
 }
@@ -668,7 +760,7 @@ function Test-HttpBootstrapReachability {
     return @{ ok = $false; message = "missing rest_base_url" }
   }
   try {
-    $null = Invoke-WebRequest -Uri $RestBaseUrl -Method Head -UseBasicParsing -TimeoutSec 8
+    $null = Invoke-WebRequest -Uri $RestBaseUrl -Method Head -UseBasicParsing -TimeoutSec 8 @WebRequestProxyOptions
     return @{ ok = $true; message = "HTTP/TLS reachable" }
   } catch {
     $resp = $null
@@ -870,7 +962,7 @@ function Merge-EnrollIntoAgentTomlExample {
       continue
     }
     if ($line -match '^\s*max_event_queue_size\s*=') {
-      $out.Add('max_event_queue_size = 1024')
+      $out.Add(('max_event_queue_size = {0}' -f $TomlMaxEventQueueSize))
       $i++
       continue
     }
@@ -1098,7 +1190,7 @@ relay_url            = "$(Escape-Toml $RelayUrl)"
 etw_enabled          = true
 ebpf_enabled         = false
 poll_interval_s      = 1
-max_event_queue_size = 1024
+max_event_queue_size = $TomlMaxEventQueueSize
 adaptive_enabled = true
 adaptive_boost_seconds = 180
 adaptive_min_severity = 3

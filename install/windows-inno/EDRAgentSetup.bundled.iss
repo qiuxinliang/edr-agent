@@ -43,6 +43,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
+LicenseFile=bundle_extra\EULA.txt
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -59,7 +60,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "enrollinsecure"; Description: "Skip TLS certificate verification during enrollment (self-signed / lab only)"; GroupDescription: "Enrollment:"; Flags: unchecked
 Name: "windowsautorun"; Description: "Run at startup (scheduled task as SYSTEM, survives reboot)"; GroupDescription: "Runtime:"; Flags: checkedonce
+Name: "windowsservice"; Description: "Run as native Windows service (advanced)"; GroupDescription: "Runtime:"; Flags: unchecked
 Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin full, Users read+execute; use Add/Remove Programs to uninstall)"; GroupDescription: "Runtime:"; Flags: unchecked
+Name: "keepofflinequeue"; Description: "Keep existing offline event queue during upgrade"; GroupDescription: "Upgrade cleanup:"; Flags: unchecked
+Name: "keepevidencecache"; Description: "Keep existing local evidence cache during upgrade"; GroupDescription: "Upgrade cleanup:"; Flags: unchecked
+Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fails"; GroupDescription: "Validation:"; Flags: unchecked
 
 [Files]
 Source: "{#EDR_BIN_DIR}\edr_agent.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -73,6 +78,7 @@ Source: "..\..\config\p0_rule_bundle_ir_v1.json.enc"; DestDir: "{app}\edr_config
 Source: "..\..\config\sensor_interest_manifest.json"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\edr_agent_preflight.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\scripts\edr_agent_postinstall_verify.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\windows_service_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\windows_isolate_host.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
@@ -84,21 +90,30 @@ Source: "bundle_extra\BUNDLE_README.txt"; DestDir: "{app}"; DestName: "BUNDLE_RE
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""; Tasks: desktopicon
 
-[Run]
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_install_wizard_enroll.ps1"" ""{tmp}\edr_wizard_enroll.json"" ""{app}\agent.toml"""; StatusMsg: "Registering with platform..."; Flags: waituntilterminated; Check: EnrollParamsFileExists
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$app='{app}'; $cfg=Join-Path $app 'agent.toml'; $ex=Join-Path $app 'agent.toml.example'; if (-not (Test-Path -LiteralPath $cfg)) {{ if (Test-Path -LiteralPath $ex) {{ Copy-Item -LiteralPath $ex -Destination $cfg -Force }} else {{ throw 'agent.toml was not generated and agent.toml.example is missing' }} }}; if (-not (Test-Path -LiteralPath $cfg)) {{ throw 'agent.toml was not generated' }}; $raw=[System.IO.File]::ReadAllText($cfg); $appEsc=$app.Replace('\','\\'); $raw=$raw.Replace('C:\\Program Files\\EDR Agent',$appEsc).Replace('C:\Program Files\EDR Agent',$app); [System.IO.File]::WriteAllText($cfg,$raw)"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start EDR Agent now (console window; skip if startup task is enabled)"; Flags: postinstall nowait skipifsilent; Check: ShouldPostinstallStartExe
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:AutorunInstallPsParameters}"; StatusMsg: "Configuring startup task..."; Flags: waituntilterminated; Check: ShouldInstallAutorun
-
 [UninstallRun]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
 
 [Code]
 var
   EnrollPage: TInputQueryWizardPage;
+  ReviewPage: TOutputMsgWizardPage;
+  EdrProgressPage: TOutputProgressWizardPage;
   EdrCmdApiBase: string;
   EdrCmdToken: string;
+  EdrCmdParamsFile: string;
+  EdrCmdProxyMode: string;
+  EdrCmdProxyUrl: string;
+  EdrCmdRelayUrl: string;
   EdrCmdInsecureTls: Boolean;
+  EdrCmdKeepOfflineQueue: Boolean;
+  EdrCmdKeepEvidenceCache: Boolean;
+  EdrInstallFailed: Boolean;
+  EdrFailureReason: string;
+  EdrDiagnosticsDir: string;
+  EdrDiagnosticsBundle: string;
+  EdrStageLog: string;
+  EdrCurrentStage: string;
 
 function EdrCmdLineParamValue(const Flag: string): string;
 var
@@ -133,6 +148,47 @@ begin
   Result := (V = '1') or (V = 'TRUE') or (V = 'YES');
 end;
 
+function EdrBoolJson(B: Boolean): string;
+begin
+  if B then
+    Result := 'true'
+  else
+    Result := 'false';
+end;
+
+function EdrPsBool(B: Boolean): string;
+begin
+  if B then
+    Result := '$true'
+  else
+    Result := '$false';
+end;
+
+function EdrNormalizeProxyMode(const S: string): string;
+var
+  V: string;
+begin
+  V := UpperCase(Trim(S));
+  if (V = '') or (V = 'AUTO') or (V = 'SYSTEM') or (V = 'WPAD') then
+    Result := 'auto'
+  else if (V = 'OFF') or (V = 'DIRECT') or (V = 'NONE') then
+    Result := 'off'
+  else if (V = 'EXPLICIT') or (V = 'MANUAL') or (V = 'PROXY') then
+    Result := 'explicit'
+  else
+    Result := 'auto';
+end;
+
+function ShouldKeepOfflineQueue: Boolean;
+begin
+  Result := EdrCmdKeepOfflineQueue or WizardIsTaskSelected('keepofflinequeue');
+end;
+
+function ShouldKeepEvidenceCache: Boolean;
+begin
+  Result := EdrCmdKeepEvidenceCache or WizardIsTaskSelected('keepevidencecache');
+end;
+
 procedure EdrLoadCmdlineEnroll;
 begin
   EdrCmdApiBase := Trim(EdrCmdLineParamValue('/EDR_API_BASE'));
@@ -141,12 +197,20 @@ begin
   EdrCmdToken := Trim(EdrCmdLineParamValue('/EDR_ENROLL_TOKEN'));
   if EdrCmdToken = '' then
     EdrCmdToken := Trim(EdrCmdLineParamValue('/TOK'));
+  EdrCmdParamsFile := Trim(EdrCmdLineParamValue('/EDR_ENROLL_PARAMS_FILE'));
+  if EdrCmdParamsFile = '' then
+    EdrCmdParamsFile := Trim(EdrCmdLineParamValue('/EDR_PARAMS_FILE'));
+  EdrCmdProxyMode := EdrNormalizeProxyMode(EdrCmdLineParamValue('/EDR_PROXY_MODE'));
+  EdrCmdProxyUrl := Trim(EdrCmdLineParamValue('/EDR_PROXY_URL'));
+  EdrCmdRelayUrl := Trim(EdrCmdLineParamValue('/EDR_RELAY_URL'));
   EdrCmdInsecureTls := EdrParseTruthyParam('/EDR_INSECURE_TLS', '/TLS');
+  EdrCmdKeepOfflineQueue := EdrParseTruthyParam('/EDR_KEEP_OFFLINE_QUEUE', '/KEEPQ');
+  EdrCmdKeepEvidenceCache := EdrParseTruthyParam('/EDR_KEEP_EVIDENCE_CACHE', '/KEEPE');
 end;
 
 function EdrHasCmdlineEnroll: Boolean;
 begin
-  Result := (EdrCmdApiBase <> '') and (EdrCmdToken <> '');
+  Result := (EdrCmdParamsFile <> '') or ((EdrCmdApiBase <> '') and (EdrCmdToken <> ''));
 end;
 
 function InitializeSetup(): Boolean;
@@ -155,10 +219,33 @@ var
 begin
   EdrCmdApiBase := '';
   EdrCmdToken := '';
+  EdrCmdParamsFile := '';
+  EdrCmdProxyMode := 'auto';
+  EdrCmdProxyUrl := '';
+  EdrCmdRelayUrl := '';
   EdrCmdInsecureTls := False;
+  EdrCmdKeepOfflineQueue := False;
+  EdrCmdKeepEvidenceCache := False;
   EdrLoadCmdlineEnroll;
   A := EdrCmdApiBase;
   T := EdrCmdToken;
+  if EdrCmdParamsFile <> '' then
+  begin
+    if (A <> '') or (T <> '') then
+    begin
+      MsgBox('EDR: use either /EDR_ENROLL_PARAMS_FILE or /EDR_API_BASE + /EDR_ENROLL_TOKEN, not both.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if not FileExists(EdrCmdParamsFile) then
+    begin
+      MsgBox('EDR: enroll params file not found: ' + EdrCmdParamsFile, mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    Result := True;
+    Exit;
+  end;
   if ((A <> '') and (T = '')) or ((A = '') and (T <> '')) then
   begin
     MsgBox('EDR: provide both API base and enroll token (/EDR_API_BASE= + /EDR_ENROLL_TOKEN= or /API= + /TOK=), or omit both.', mbError, MB_OK);
@@ -192,31 +279,61 @@ end;
 
 function SaveEnrollParamsFileIfNeeded: Boolean;
 var
-  Path, U, T, Json: string;
-  Insecure: Boolean;
+  Path, U, T, ProxyMode, ProxyUrl, RelayUrl, Json: string;
+  Insecure, KeepQueue, KeepEvidence, StrictHealth: Boolean;
 begin
   Result := False;
+  Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
+  if EdrCmdParamsFile <> '' then
+  begin
+    if not LoadStringFromFile(EdrCmdParamsFile, Json) then
+    begin
+      Log('SaveEnrollParamsFileIfNeeded: failed to read params file ' + EdrCmdParamsFile);
+      Exit;
+    end;
+    Result := SaveStringToFile(Path, Json, False);
+    if not Result then
+      Log('SaveEnrollParamsFileIfNeeded: failed to copy params file to ' + Path);
+    Exit;
+  end;
+
   if EdrHasCmdlineEnroll then
   begin
     U := EdrCmdApiBase;
     T := EdrCmdToken;
+    ProxyMode := EdrCmdProxyMode;
+    ProxyUrl := EdrCmdProxyUrl;
+    RelayUrl := EdrCmdRelayUrl;
+    KeepQueue := ShouldKeepOfflineQueue;
+    KeepEvidence := ShouldKeepEvidenceCache;
   end
   else
   begin
     U := Trim(EnrollPage.Values[0]);
     T := Trim(EnrollPage.Values[1]);
+    ProxyMode := EdrNormalizeProxyMode(EnrollPage.Values[2]);
+    ProxyUrl := Trim(EnrollPage.Values[3]);
+    RelayUrl := Trim(EnrollPage.Values[4]);
+    KeepQueue := ShouldKeepOfflineQueue;
+    KeepEvidence := ShouldKeepEvidenceCache;
   end;
   if (U = '') or (T = '') then
     Exit;
-
-  Path := ExpandConstant('{tmp}\edr_wizard_enroll.json');
-  Json := Chr(123) + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ',' + Chr(34) + 'token' + Chr(34) + ':' + JsonEscape(T) + ',' +
-    Chr(34) + 'insecure_tls' + Chr(34) + ':';
   Insecure := EdrCmdInsecureTls or WizardIsTaskSelected('enrollinsecure');
-  if Insecure then
-    Json := Json + 'true' + Chr(125)
-  else
-    Json := Json + 'false' + Chr(125);
+  StrictHealth := WizardIsTaskSelected('stricthealthcheck');
+
+  Json := Chr(123)
+    + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ','
+    + Chr(34) + 'token' + Chr(34) + ':' + JsonEscape(T) + ','
+    + Chr(34) + 'insecure_tls' + Chr(34) + ':' + EdrBoolJson(Insecure) + ','
+    + Chr(34) + 'proxy_mode' + Chr(34) + ':' + JsonEscape(ProxyMode) + ','
+    + Chr(34) + 'proxy_url' + Chr(34) + ':' + JsonEscape(ProxyUrl) + ','
+    + Chr(34) + 'relay_url' + Chr(34) + ':' + JsonEscape(RelayUrl) + ','
+    + Chr(34) + 'keep_offline_queue' + Chr(34) + ':' + EdrBoolJson(KeepQueue) + ','
+    + Chr(34) + 'keep_evidence_cache' + Chr(34) + ':' + EdrBoolJson(KeepEvidence) + ','
+    + Chr(34) + 'strict_health_check' + Chr(34) + ':' + EdrBoolJson(StrictHealth) + ','
+    + Chr(34) + 'health_report' + Chr(34) + ':' + JsonEscape(ExpandConstant('{app}\diagnostics\install_health_report.json'))
+    + Chr(125);
 
   Result := SaveStringToFile(Path, Json, False);
   if not Result then
@@ -232,34 +349,69 @@ begin
   SaveEnrollParamsFileIfNeeded;
   Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$d=''' + ExpandConstant('{app}') + ''';'
+    + '$keepQ=' + EdrPsBool(ShouldKeepOfflineQueue) + ';'
+    + '$keepE=' + EdrPsBool(ShouldKeepEvidenceCache) + ';'
     + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
     + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
     + 'Remove-Item -LiteralPath (Join-Path $d ''edr_agent.pid'') -Force -ErrorAction SilentlyContinue;'
-    + 'Remove-Item -Path (Join-Path $d ''queue\edr_queue.db*'') -Force -ErrorAction SilentlyContinue;'
-    + 'Remove-Item -Path (Join-Path $d ''evidence\local_evidence_cache.db*'') -Force -ErrorAction SilentlyContinue;'
+    + 'if(-not $keepQ){Remove-Item -Path (Join-Path $d ''queue\edr_queue.db*'') -Force -ErrorAction SilentlyContinue};'
+    + 'if(-not $keepE){Remove-Item -Path (Join-Path $d ''evidence\local_evidence_cache.db*'') -Force -ErrorAction SilentlyContinue};'
     + '"';
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
     Result := 'Failed to run EDR preflight cleanup before installing.';
 end;
 
+function EdrDeploymentPlanText: string;
+begin
+  Result :=
+    'EDR Agent setup will run the following controlled stages:' + #13#10 + #13#10 +
+    '  01  Stop old EDR Agent process and service' + #13#10 +
+    '  02  Clean runtime cache and stale queue locks' + #13#10 +
+    '  03  Enroll endpoint and write agent.toml' + #13#10 +
+    '  04  Validate and normalize configuration paths' + #13#10 +
+    '  05  Install service/startup task according to selected options' + #13#10 +
+    '  06  Start Agent runtime' + #13#10 +
+    '  07  Pull runtime policy with endpoint identity' + #13#10 +
+    '  08  Write health summary and diagnostics' + #13#10 + #13#10 +
+    'Diagnostics will be written under:' + #13#10 +
+    '  ' + ExpandConstant('{app}\diagnostics') + #13#10 + #13#10 +
+    'If setup fails, the error dialog will include the failed stage and a copyable diagnostics bundle path.';
+end;
+
 procedure InitializeWizard;
 begin
-  EnrollPage := CreateInputQueryPage(wpWelcome,
-    'Platform enrollment',
-    'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.',
-    'When both fields are filled, the installer calls POST /api/v1/enroll and writes a complete agent.toml next to edr_agent.exe (bundled template + your server/tenant/endpoint). Leave both empty to skip and start from a copy of agent.toml.example instead.');
+  EnrollPage := CreateInputQueryPage(wpSelectDir,
+    'Platform enrollment and network',
+    'Enter the platform connection settings issued by the EDR management center.',
+    'When API base URL and token are filled, setup enrolls this endpoint and writes a complete agent.toml. Leave both empty only for offline lab packaging.');
   EnrollPage.Add('Platform API base URL (example: https://platform.example:8080):', False);
   EnrollPage.Add('Enrollment token:', False);
+  EnrollPage.Add('Proxy mode (auto, off, explicit):', False);
+  EnrollPage.Add('Explicit proxy URL (optional, example: http://proxy.corp:8080):', False);
+  EnrollPage.Add('Relay/Gateway URL (optional, example: https://relay.corp:443/api/v1):', False);
   if EdrHasCmdlineEnroll then
   begin
     EnrollPage.Values[0] := EdrCmdApiBase;
     EnrollPage.Values[1] := EdrCmdToken;
+    EnrollPage.Values[2] := EdrCmdProxyMode;
+    EnrollPage.Values[3] := EdrCmdProxyUrl;
+    EnrollPage.Values[4] := EdrCmdRelayUrl;
   end
   else
   begin
     EnrollPage.Values[0] := '';
     EnrollPage.Values[1] := '';
+    EnrollPage.Values[2] := 'auto';
+    EnrollPage.Values[3] := '';
+    EnrollPage.Values[4] := '';
   end;
+
+  ReviewPage := CreateOutputMsgPage(wpSelectTasks,
+    'Deployment plan',
+    'Review the controlled installation stages before setup changes the endpoint.',
+    EdrDeploymentPlanText);
+
+  EdrProgressPage := CreateOutputProgressPage('Installing EDR Agent', 'Preparing controlled deployment...');
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
@@ -269,38 +421,27 @@ end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
-  U, T: string;
+  U, T, ProxyMode, ProxyUrl: string;
 begin
   Result := True;
   if CurPageID = EnrollPage.ID then
   begin
     U := Trim(EnrollPage.Values[0]);
     T := Trim(EnrollPage.Values[1]);
+    ProxyMode := EdrNormalizeProxyMode(EnrollPage.Values[2]);
+    ProxyUrl := Trim(EnrollPage.Values[3]);
     if ((U <> '') and (T = '')) or ((U = '') and (T <> '')) then
     begin
       MsgBox('Provide both the API base URL and the enrollment token, or leave both empty to skip registration.', mbInformation, MB_OK);
       Result := False;
     end;
+    if Result and (ProxyMode = 'explicit') and (ProxyUrl = '') then
+    begin
+      MsgBox('Proxy mode is explicit, so provide a proxy URL or change proxy mode to auto/off.', mbInformation, MB_OK);
+      Result := False;
+    end;
     if Result then
       SaveEnrollParamsFileIfNeeded;
-  end;
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  AppToml, ExToml: string;
-begin
-  if CurStep <> ssPostInstall then
-    Exit;
-  if SaveEnrollParamsFileIfNeeded then
-    Exit;
-
-  AppToml := ExpandConstant('{app}\agent.toml');
-  ExToml := ExpandConstant('{app}\agent.toml.example');
-  if (not FileExists(AppToml)) and FileExists(ExToml) then
-  begin
-    if not FileCopy(ExToml, AppToml, False) then
-      Log('CurStepChanged: FileCopy agent.toml.example -> agent.toml failed');
   end;
 end;
 
@@ -314,14 +455,239 @@ begin
   Result := FileExists(ExpandConstant('{app}\agent.toml'));
 end;
 
-function ShouldPostinstallStartExe: Boolean;
+function EdrPowerShellPath: string;
 begin
-  Result := AgentTomlExistsForRun and (not WizardIsTaskSelected('windowsautorun'));
+  Result := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
 end;
 
-function ShouldInstallAutorun: Boolean;
+function EdrPsSq(const S: string): string;
+var
+  V: string;
 begin
-  Result := WizardIsTaskSelected('windowsautorun') and AgentTomlExistsForRun;
+  V := S;
+  StringChange(V, '''', '''''');
+  Result := '''' + V + '''';
+end;
+
+function EdrDiagnosticsFile(const FileName: string): string;
+begin
+  if EdrDiagnosticsDir <> '' then
+    Result := EdrDiagnosticsDir + '\' + FileName
+  else
+    Result := ExpandConstant('{app}\diagnostics\') + FileName;
+end;
+
+procedure EdrAppendStageLog(const Message: string);
+var
+  Line: string;
+begin
+  Line := GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' ' + Message + #13#10;
+  Log('EDR setup: ' + Message);
+  if EdrStageLog <> '' then
+    SaveStringToFile(EdrStageLog, Line, True);
+end;
+
+procedure EdrInitDiagnostics;
+begin
+  EdrDiagnosticsDir := ExpandConstant('{app}\diagnostics');
+  if not DirExists(EdrDiagnosticsDir) then
+    CreateDir(EdrDiagnosticsDir);
+  EdrDiagnosticsBundle := ExpandConstant('{app}\install-diagnostics.zip');
+  EdrStageLog := EdrDiagnosticsDir + '\install-stage.log';
+  SaveStringToFile(EdrStageLog, 'EDR Agent setup diagnostics' + #13#10, False);
+  EdrAppendStageLog('diagnostics_dir=' + EdrDiagnosticsDir);
+end;
+
+procedure EdrSetProgress(StageNo, StageTotal: Integer; const Title, Detail: string);
+begin
+  EdrCurrentStage := Title;
+  EdrProgressPage.SetText(Title, Detail);
+  EdrProgressPage.SetProgress(StageNo - 1, StageTotal);
+  WizardForm.StatusLabel.Caption := Title;
+end;
+
+procedure EdrCreateDiagnosticsBundle;
+var
+  Code: Integer;
+  Cmd: string;
+begin
+  if EdrDiagnosticsDir = '' then
+    Exit;
+  Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + 'if(Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsBundle) + '){Remove-Item -LiteralPath ' + EdrPsSq(EdrDiagnosticsBundle) + ' -Force -ErrorAction SilentlyContinue};'
+    + 'Compress-Archive -Path ' + EdrPsSq(EdrDiagnosticsDir + '\*') + ' -DestinationPath ' + EdrPsSq(EdrDiagnosticsBundle) + ' -Force'
+    + '"';
+  if Exec(EdrPowerShellPath, Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    EdrAppendStageLog('diagnostics_bundle=' + EdrDiagnosticsBundle + ' exit=' + IntToStr(Code))
+  else
+    EdrAppendStageLog('diagnostics_bundle_failed path=' + EdrDiagnosticsBundle);
+end;
+
+procedure EdrAbortInstall;
+var
+  Msg: string;
+begin
+  EdrInstallFailed := True;
+  EdrCreateDiagnosticsBundle;
+  EdrProgressPage.Hide;
+  Msg := 'EDR Agent setup failed.' + #13#10 + #13#10
+    + 'Stage: ' + EdrCurrentStage + #13#10
+    + 'Reason: ' + EdrFailureReason + #13#10 + #13#10
+    + 'Diagnostics bundle:' + #13#10 + EdrDiagnosticsBundle + #13#10 + #13#10
+    + 'Stage log:' + #13#10 + EdrStageLog;
+  MsgBox(Msg, mbError, MB_OK);
+  RaiseException(EdrFailureReason);
+end;
+
+function EdrRunCommandStage(StageNo, StageTotal: Integer; const Title, Detail, FileName, Params: string; Critical: Boolean): Boolean;
+var
+  Code: Integer;
+  Ok: Boolean;
+begin
+  Result := True;
+  EdrSetProgress(StageNo, StageTotal, Title, Detail);
+  EdrAppendStageLog('START [' + Title + '] ' + FileName + ' ' + Params);
+  Ok := Exec(FileName, Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if Ok and (Code = 0) then
+  begin
+    EdrAppendStageLog('OK [' + Title + '] exit=0');
+    EdrProgressPage.SetProgress(StageNo, StageTotal);
+    Exit;
+  end;
+
+  if Ok then
+    EdrFailureReason := Title + ' failed with exit code ' + IntToStr(Code)
+  else
+    EdrFailureReason := Title + ' could not be started';
+  EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
+  if Critical then
+  begin
+    Result := False;
+    Exit;
+  end;
+  EdrAppendStageLog('NONCRITICAL [' + Title + '] continuing');
+  EdrProgressPage.SetProgress(StageNo, StageTotal);
+end;
+
+function EdrRunPowerShellStage(StageNo, StageTotal: Integer; const Title, Detail, Params: string; Critical: Boolean): Boolean;
+begin
+  Result := EdrRunCommandStage(StageNo, StageTotal, Title, Detail, EdrPowerShellPath, Params, Critical);
+end;
+
+function EdrRunNoWaitStage(StageNo, StageTotal: Integer; const Title, Detail, FileName, Params, WorkDir: string; Critical: Boolean): Boolean;
+var
+  Code: Integer;
+  Ok: Boolean;
+begin
+  Result := True;
+  EdrSetProgress(StageNo, StageTotal, Title, Detail);
+  EdrAppendStageLog('START_NOWAIT [' + Title + '] ' + FileName + ' ' + Params);
+  Ok := Exec(FileName, Params, WorkDir, SW_HIDE, ewNoWait, Code);
+  if Ok then
+  begin
+    EdrAppendStageLog('OK_NOWAIT [' + Title + ']');
+    EdrProgressPage.SetProgress(StageNo, StageTotal);
+    Exit;
+  end;
+  EdrFailureReason := Title + ' could not be started';
+  EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
+  if Critical then
+  begin
+    Result := False;
+    Exit;
+  end;
+  EdrAppendStageLog('NONCRITICAL [' + Title + '] continuing');
+  EdrProgressPage.SetProgress(StageNo, StageTotal);
+end;
+
+procedure EdrSkipStage(StageNo, StageTotal: Integer; const Title, Detail: string);
+begin
+  EdrSetProgress(StageNo, StageTotal, Title, Detail);
+  EdrAppendStageLog('SKIP [' + Title + '] ' + Detail);
+  EdrProgressPage.SetProgress(StageNo, StageTotal);
+end;
+
+function EdrStopRuntimePsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
+    + 'Remove-Item -LiteralPath ' + EdrPsSq(ExpandConstant('{app}\edr_agent.pid')) + ' -Force -ErrorAction SilentlyContinue'
+    + '"';
+end;
+
+function PreflightPsParameters(Param: string): string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_agent_preflight.ps1') + '"'
+    + ' -InstallDir "' + ExpandConstant('{app}') + '"'
+    + ' -SkipStop'
+    + ' -ReportPath "' + EdrDiagnosticsFile('install_preflight_report.json') + '"';
+  if ShouldKeepOfflineQueue then
+    Result := Result + ' -KeepOfflineQueue';
+  if ShouldKeepEvidenceCache then
+    Result := Result + ' -KeepEvidenceCache';
+end;
+
+function EdrEnrollPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_install_wizard_enroll.ps1') + '" "'
+    + ExpandConstant('{tmp}\edr_wizard_enroll.json') + '" "' + ExpandConstant('{app}\agent.toml') + '"';
+end;
+
+function EdrEnsureTomlPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + '$app=''' + ExpandConstant('{app}') + ''';'
+    + '$cfg=Join-Path $app ''agent.toml'';'
+    + '$ex=Join-Path $app ''agent.toml.example'';'
+    + 'if(-not (Test-Path -LiteralPath $cfg)){if(Test-Path -LiteralPath $ex){Copy-Item -LiteralPath $ex -Destination $cfg -Force}else{throw ''agent.toml was not generated and agent.toml.example is missing''}};'
+    + 'if(-not (Test-Path -LiteralPath $cfg)){throw ''agent.toml was not generated''};'
+    + '$raw=[System.IO.File]::ReadAllText($cfg);'
+    + '$appEsc=$app.Replace(''\'',''\\'');'
+    + '$raw=$raw.Replace(''C:\\Program Files\\EDR Agent'',$appEsc).Replace(''C:\Program Files\EDR Agent'',$app);'
+    + '[System.IO.File]::WriteAllText($cfg,$raw)'
+    + '"';
+end;
+
+function EdrPolicyVerifyPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_agent_postinstall_verify.ps1') + '"'
+    + ' -InstallDir "' + ExpandConstant('{app}') + '"'
+    + ' -ConfigPath "' + ExpandConstant('{app}\agent.toml') + '"'
+    + ' -ReportPath "' + EdrDiagnosticsFile('install_runtime_verify.json') + '"';
+end;
+
+function EdrHealthSummaryPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + 'if(-not (Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ')){throw ''runtime verification report missing''};'
+    + 'Write-Host ''runtime verification report ready: ' + EdrDiagnosticsFile('install_runtime_verify.json') + ''''
+    + '"';
+end;
+
+function EdrCopyLocalConfigStage(StageNo, StageTotal: Integer): Boolean;
+var
+  AppToml, ExToml: string;
+begin
+  Result := True;
+  EdrSetProgress(StageNo, StageTotal, 'Write local configuration', 'No enrollment token was provided; copying bundled template.');
+  AppToml := ExpandConstant('{app}\agent.toml');
+  ExToml := ExpandConstant('{app}\agent.toml.example');
+  if FileExists(AppToml) then
+  begin
+    EdrAppendStageLog('OK [Write local configuration] existing agent.toml=' + AppToml);
+    EdrProgressPage.SetProgress(StageNo, StageTotal);
+    Exit;
+  end;
+  if FileExists(ExToml) and FileCopy(ExToml, AppToml, False) then
+  begin
+    EdrAppendStageLog('OK [Write local configuration] copied agent.toml.example');
+    EdrProgressPage.SetProgress(StageNo, StageTotal);
+    Exit;
+  end;
+  EdrFailureReason := 'agent.toml was not generated and agent.toml.example is missing';
+  EdrAppendStageLog('FAILED [Write local configuration] ' + EdrFailureReason);
+  Result := False;
 end;
 
 function AutorunInstallPsParameters(Param: string): string;
@@ -331,7 +697,156 @@ begin
     Result := Result + ' -HardenAcl';
 end;
 
+function WindowsServiceInstallPsParameters(Param: string): string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\windows_service_install.ps1') + '"'
+    + ' -Action Install'
+    + ' -ExePath "' + ExpandConstant('{app}\{#MyAppExeName}') + '"'
+    + ' -ConfigPath "' + ExpandConstant('{app}\agent.toml') + '"'
+    + ' -InstallDir "' + ExpandConstant('{app}') + '"'
+    + ' -DataDir "' + ExpandConstant('{app}') + '"'
+    + ' -SkipPreflight';
+  if ShouldKeepOfflineQueue then
+    Result := Result + ' -KeepOfflineQueue';
+  if ShouldKeepEvidenceCache then
+    Result := Result + ' -KeepEvidenceCache';
+end;
+
+function EdrHardenAclPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + '$d=' + EdrPsSq(ExpandConstant('{app}')) + ';'
+    + 'if(Test-Path -LiteralPath $d){'
+    + '& icacls.exe $d /inheritance:r /grant:r ''*S-1-5-18:(OI)(CI)F'' /grant:r ''*S-1-5-32-544:(OI)(CI)F'' /grant:r ''*S-1-5-32-545:(OI)(CI)RX'' /T /C /Q | Out-Null'
+    + '}"';
+end;
+
+procedure EdrRunInstallWorkflow;
+var
+  Total: Integer;
+  Enrolled: Boolean;
+begin
+  Total := 8;
+  EdrInstallFailed := False;
+  EdrFailureReason := '';
+  EdrInitDiagnostics;
+  SaveEnrollParamsFileIfNeeded;
+  Enrolled := EnrollParamsFileExists;
+
+  EdrProgressPage.Show;
+  if not EdrRunPowerShellStage(1, Total, 'Stop old Agent runtime', 'Stopping service/process and removing stale PID files.', EdrStopRuntimePsParameters, True) then
+    EdrAbortInstall;
+
+  if not EdrRunPowerShellStage(2, Total, 'Clean runtime cache', 'Cleaning queue locks and local evidence cache according to selected options.', PreflightPsParameters(''), True) then
+    EdrAbortInstall;
+
+  if Enrolled then
+  begin
+    if not EdrRunPowerShellStage(3, Total, 'Enroll and write configuration', 'Calling platform enrollment API and writing agent.toml.', EdrEnrollPsParameters, True) then
+      EdrAbortInstall;
+  end
+  else
+  begin
+    if not EdrCopyLocalConfigStage(3, Total) then
+      EdrAbortInstall;
+  end;
+
+  if not EdrRunPowerShellStage(4, Total, 'Validate configuration', 'Ensuring agent.toml exists and normalizing install paths.', EdrEnsureTomlPsParameters, True) then
+    EdrAbortInstall;
+
+  if WizardIsTaskSelected('windowsservice') then
+  begin
+    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing native Windows service for EDR Agent.', WindowsServiceInstallPsParameters(''), True) then
+      EdrAbortInstall;
+  end
+  else if WizardIsTaskSelected('windowsautorun') then
+  begin
+    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for EDR Agent.', AutorunInstallPsParameters(''), True) then
+      EdrAbortInstall;
+  end
+  else if WizardIsTaskSelected('hardeninstalldir') then
+  begin
+    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Applying install directory ACL hardening.', EdrHardenAclPsParameters, True) then
+      EdrAbortInstall;
+  end
+  else
+    EdrSkipStage(5, Total, 'Install service/startup task', 'Startup task disabled by installer option.');
+
+  if WizardIsTaskSelected('windowsservice') then
+  begin
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent Windows service.', '-NoProfile -ExecutionPolicy Bypass -Command "Start-Service -Name ''EdrAgent'' -ErrorAction SilentlyContinue"', False) then
+      EdrAbortInstall;
+  end
+  else if WizardIsTaskSelected('windowsautorun') then
+  begin
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent scheduled task.', '-NoProfile -ExecutionPolicy Bypass -Command "Start-ScheduledTask -TaskName ''EdrAgent'' -ErrorAction SilentlyContinue"', False) then
+      EdrAbortInstall;
+  end
+  else
+  begin
+    if not EdrRunNoWaitStage(6, Total, 'Start Agent runtime', 'Starting edr_agent.exe with generated agent.toml.', ExpandConstant('{app}\{#MyAppExeName}'), '--config "' + ExpandConstant('{app}\agent.toml') + '"', ExpandConstant('{app}'), False) then
+      EdrAbortInstall;
+  end;
+
+  if not EdrRunPowerShellStage(7, Total, 'Pull runtime policy', 'Verifying endpoint identity and pulling runtime policy when reachable.', EdrPolicyVerifyPsParameters, Enrolled) then
+    EdrAbortInstall;
+
+  if not EdrRunPowerShellStage(8, Total, 'Write health summary', 'Writing installation health report and diagnostics bundle.', EdrHealthSummaryPsParameters, False) then
+    EdrAbortInstall;
+
+  EdrCreateDiagnosticsBundle;
+  EdrProgressPage.SetProgress(Total, Total);
+  EdrAppendStageLog('INSTALL_WORKFLOW_OK');
+  EdrProgressPage.Hide;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    EdrRunInstallWorkflow;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+var
+  HealthReport, PreflightReport, RuntimeReport, S, Msg: string;
+begin
+  if CurPageID = ReviewPage.ID then
+    ReviewPage.MsgLabel.Caption := EdrDeploymentPlanText;
+
+  if CurPageID <> wpFinished then
+    Exit;
+
+  HealthReport := EdrDiagnosticsFile('install_health_report.json');
+  PreflightReport := EdrDiagnosticsFile('install_preflight_report.json');
+  RuntimeReport := EdrDiagnosticsFile('install_runtime_verify.json');
+  if LoadStringFromFile(HealthReport, S) then
+  begin
+    if (Pos('"status":"ok"', S) > 0) or (Pos('"status": "ok"', S) > 0) then
+      WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed and bootstrap checks passed'
+    else
+      WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed; review bootstrap health report';
+    Msg := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
+      + 'Health report: ' + HealthReport + #13#10
+      + 'Preflight report: ' + PreflightReport + #13#10
+      + 'Runtime report: ' + RuntimeReport + #13#10
+      + 'Diagnostics bundle: ' + EdrDiagnosticsBundle;
+    WizardForm.FinishedLabel.Caption := Msg;
+  end
+  else if AgentTomlExistsForRun then
+  begin
+    WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed';
+    WizardForm.FinishedLabel.Caption := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
+      + 'No bootstrap health report was generated. Check enrollment settings if the agent cannot connect.' + #13#10
+      + 'Diagnostics directory: ' + EdrDiagnosticsDir;
+  end;
+end;
+
 function AutorunScriptPresentForUninstall: Boolean;
 begin
   Result := FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
+end;
+
+function ServiceScriptPresentForUninstall: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
 end;

@@ -2190,6 +2190,57 @@ static int headers_chunked(const char *headers) {
   return ascii_find_ci(p, "chunked") != NULL;
 }
 
+static void copy_header_value(const char *headers, const char *name, char *out, size_t cap) {
+  char needle[128];
+  const char *p;
+  size_t name_len;
+  if (!headers || !name || !out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  name_len = strlen(name);
+  if (name_len == 0u || name_len + 4u >= sizeof(needle)) {
+    return;
+  }
+  snprintf(needle, sizeof(needle), "\r\n%s:", name);
+  p = ascii_find_ci(headers, needle);
+  if (p) {
+    p += 2u + name_len + 1u;
+  } else if (ascii_starts_ci(headers, name) && headers[name_len] == ':') {
+    p = headers + name_len + 1u;
+  } else {
+    return;
+  }
+  while (*p == ' ' || *p == '\t') {
+    p++;
+  }
+  size_t n = 0;
+  while (p[n] && p[n] != '\r' && p[n] != '\n' && n + 1u < cap) {
+    out[n] = p[n];
+    n++;
+  }
+  out[n] = '\0';
+}
+
+static void parse_agent_config_headers(const char *headers, EdrAgentConfigHeaders *out) {
+  if (!out) {
+    return;
+  }
+  memset(out, 0, sizeof(*out));
+  copy_header_value(headers, "X-Agent-Config-Hash", out->config_hash, sizeof(out->config_hash));
+  copy_header_value(headers, "X-Agent-Config-Sequence", out->sequence, sizeof(out->sequence));
+  copy_header_value(headers, "X-Agent-Config-Previous-Hash", out->previous_hash, sizeof(out->previous_hash));
+  copy_header_value(headers, "X-Agent-Config-Signing-Key", out->signing_key_id, sizeof(out->signing_key_id));
+  copy_header_value(headers, "X-Agent-Config-Signature", out->signature, sizeof(out->signature));
+  copy_header_value(headers, "X-Agent-Config-Nonce", out->nonce, sizeof(out->nonce));
+  copy_header_value(headers, "X-Agent-Config-Expires-At", out->expires_at, sizeof(out->expires_at));
+  copy_header_value(headers, "X-Agent-Config-Signed-Payload", out->signed_payload_b64, sizeof(out->signed_payload_b64));
+  copy_header_value(headers, "X-Agent-Config-Rollout-ID", out->rollout_id, sizeof(out->rollout_id));
+  copy_header_value(headers, "X-Agent-Config-Rollout-Stage", out->rollout_stage, sizeof(out->rollout_stage));
+  copy_header_value(headers, "X-Agent-Config-Rollout-Bucket", out->rollout_bucket, sizeof(out->rollout_bucket));
+  copy_header_value(headers, "X-Agent-Config-Rollout-Percent", out->rollout_percent, sizeof(out->rollout_percent));
+}
+
 static void append_body_copy(char *body, size_t body_cap, size_t *body_used,
                              const char *src, size_t src_len) {
   size_t copy;
@@ -2269,7 +2320,8 @@ static int write_response_chunk_to_file(FILE *f, size_t *written, size_t max_byt
 }
 
 static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
-                                                FILE *out, size_t max_bytes, int *out_reusable) {
+                                                FILE *out, size_t max_bytes, int *out_reusable,
+                                                EdrAgentConfigHeaders *out_agent_config) {
   char buf[8192];
   size_t used = 0;
   size_t header_len = 0;
@@ -2293,6 +2345,9 @@ static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *b
       status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
       content_len = parse_content_length_header(buf);
       reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
+      if (status_ok) {
+        parse_agent_config_headers(buf, out_agent_config);
+      }
       if (!status_ok || content_len < 0 || headers_chunked(buf)) {
         return -1;
       }
@@ -3345,7 +3400,8 @@ static int request_to_suffix(const char *method, const char *suffix, const char 
   return native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
 }
 
-static int native_get_to_file(const char *url, FILE *out, size_t max_bytes) {
+static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
+                              EdrAgentConfigHeaders *out_agent_config) {
   char host[256];
   char path[1024];
   int port = 0;
@@ -3388,7 +3444,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes) {
       break;
     }
     if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
-        read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, out, max_bytes, &reusable) == 0) {
+        read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config) == 0) {
       rc = 0;
       conn->last_used_ms = unix_ms_now();
       if (!reusable || !http_keepalive_enabled()) {
@@ -3413,10 +3469,11 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes) {
   return rc;
 }
 
-int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
-  FILE *f;
-  size_t cap;
-  int rc;
+int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
+                                         size_t max_bytes, EdrAgentConfigHeaders *headers) {
+	FILE *f;
+	size_t cap;
+	int rc;
   if (!url || !url[0] || !file_path || !file_path[0] || !edr_ingest_http_configured()) {
     return -1;
   }
@@ -3428,19 +3485,26 @@ int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size
     cap = 4u * 1024u * 1024u;
   }
   f = fopen(file_path, "wb");
-  if (!f) {
-    runtime_failure("http get output open failed");
-    return -1;
-  }
-  rc = native_get_to_file(url, f, cap);
-  fclose(f);
-  if (rc != 0) {
-    (void)remove(file_path);
+	if (!f) {
+		runtime_failure("http get output open failed");
+		return -1;
+	}
+	if (headers) {
+		memset(headers, 0, sizeof(*headers));
+	}
+	rc = native_get_to_file(url, f, cap, headers);
+	fclose(f);
+	if (rc != 0) {
+		(void)remove(file_path);
     note_http_request_failure();
     return -1;
   }
-  note_http_request_success();
-  return 0;
+	note_http_request_success();
+	return 0;
+}
+
+int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
+  return edr_ingest_http_get_url_to_file_meta(url, file_path, max_bytes, NULL);
 }
 
 static void sleep_poll_ms(int ms);
@@ -4287,6 +4351,75 @@ int edr_ingest_http_post_engine_health_json(const char *body_json) {
   int rc = post_to_suffix("ingest/engine-health", body_json);
   if (rc != 0) {
     log_native_post_failure("engine_health", rc);
+    return -1;
+  }
+  return 0;
+}
+
+int edr_ingest_http_post_config_status(const char *tenant_id,
+                                       const char *endpoint_id,
+                                       const char *agent_version,
+                                       const char *policy_version,
+                                       const char *config_hash,
+                                       const char *config_sequence,
+                                       const char *config_nonce,
+                                       const char *config_signature,
+                                       const char *signing_key_id,
+                                       int verified,
+                                       const char *reject_reason,
+                                       const char *desired_version,
+                                       const char *desired_hash,
+                                       const char *apply_status,
+                                       int restart_required) {
+  char *tenant = NULL;
+  char *endpoint = NULL;
+  char *agent = NULL;
+  char *policy = NULL;
+  char *hash = NULL;
+  char *nonce = NULL;
+  char *sig = NULL;
+  char *key_id = NULL;
+  char *reject = NULL;
+  char *desired_ver = NULL;
+  char *desired_h = NULL;
+  char *status = NULL;
+  char body[4096];
+  int rc;
+  if (!edr_ingest_http_configured()) {
+    return -1;
+  }
+  tenant = json_escape_alloc(tenant_id && tenant_id[0] ? tenant_id : s_tenant);
+  endpoint = json_escape_alloc(endpoint_id && endpoint_id[0] ? endpoint_id : s_endpoint);
+  agent = json_escape_alloc(agent_version && agent_version[0] ? agent_version : s_agent_ver);
+  policy = json_escape_alloc(policy_version && policy_version[0] ? policy_version : (s_policy_version[0] ? s_policy_version : "local"));
+  hash = json_escape_alloc(config_hash ? config_hash : "");
+  nonce = json_escape_alloc(config_nonce ? config_nonce : "");
+  sig = json_escape_alloc(config_signature ? config_signature : "");
+  key_id = json_escape_alloc(signing_key_id ? signing_key_id : "");
+  reject = json_escape_alloc(reject_reason ? reject_reason : "");
+  desired_ver = json_escape_alloc(desired_version && desired_version[0] ? desired_version : (policy_version ? policy_version : ""));
+  desired_h = json_escape_alloc(desired_hash && desired_hash[0] ? desired_hash : (config_hash ? config_hash : ""));
+  status = json_escape_alloc(apply_status && apply_status[0] ? apply_status : "reported");
+  if (!tenant || !endpoint || !agent || !policy || !hash || !nonce || !sig || !key_id || !reject || !desired_ver || !desired_h || !status) {
+    free(tenant); free(endpoint); free(agent); free(policy); free(hash); free(nonce); free(sig); free(key_id); free(reject); free(desired_ver); free(desired_h); free(status);
+    return -1;
+  }
+  snprintf(body, sizeof(body),
+           "{\"tenant_id\":\"%s\",\"endpoint_id\":\"%s\",\"agent_version\":\"%s\","
+           "\"policy_version\":\"%s\",\"config_hash\":\"%s\",\"config_sequence\":%lld,"
+           "\"config_nonce\":\"%s\",\"config_signature\":\"%s\",\"signing_key_id\":\"%s\","
+           "\"verified\":%s,\"reject_reason\":\"%s\",\"desired_version\":\"%s\","
+           "\"desired_hash\":\"%s\",\"apply_status\":\"%s\",\"restart_required\":%s,"
+           "\"payload\":{\"source\":\"agent-runtime-policy\",\"verified\":%s}}",
+           tenant, endpoint, agent, policy, hash,
+           (long long)(config_sequence && config_sequence[0] ? atoll(config_sequence) : 0),
+           nonce, sig, key_id, verified ? "true" : "false", reject, desired_ver, desired_h, status,
+           restart_required ? "true" : "false",
+           verified ? "true" : "false");
+  rc = request_to_suffix("POST", "ingest/config-status", "application/json", body, strlen(body), NULL, 0u);
+  free(tenant); free(endpoint); free(agent); free(policy); free(hash); free(nonce); free(sig); free(key_id); free(reject); free(desired_ver); free(desired_h); free(status);
+  if (rc != 0) {
+    log_native_post_failure("config_status", rc);
     return -1;
   }
   return 0;

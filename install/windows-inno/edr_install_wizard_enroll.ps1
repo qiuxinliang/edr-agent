@@ -29,6 +29,15 @@ if ($j.insecure_tls -eq $true) {
   Remove-Item Env:EDR_INSECURE_TLS -ErrorAction SilentlyContinue
 }
 
+$proxyMode = if ($j.proxy_mode) { [string]$j.proxy_mode } else { "auto" }
+$proxyUrl = if ($j.proxy_url) { [string]$j.proxy_url } else { "" }
+$relayUrl = if ($j.relay_url) { [string]$j.relay_url } else { "" }
+$healthReport = if ($j.health_report) { [string]$j.health_report } else { "" }
+$keepOfflineQueue = ($j.keep_offline_queue -eq $true)
+$keepEvidenceCache = ($j.keep_evidence_cache -eq $true)
+$strictHealthCheck = ($j.strict_health_check -eq $true)
+$trustCa = ($j.trust_ca -eq $true)
+
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $installer = Join-Path $here "edr_agent_install.ps1"
 if (-not (Test-Path -LiteralPath $installer)) {
@@ -36,10 +45,28 @@ if (-not (Test-Path -LiteralPath $installer)) {
 }
 
 $installDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($OutToml))
-& $installer -Output $OutToml -UseTemplateToml `
-  -CaCertPath (Join-Path $installDir "certs\ca.pem") `
-  -ClientCertPath (Join-Path $installDir "certs\client.pem") `
-  -ClientKeyPath (Join-Path $installDir "certs\client-key.pem") `
-  -ClientCsrPath (Join-Path $installDir "certs\client.csr.pem")
+$installerArgs = @(
+  "-Output", $OutToml,
+  "-UseTemplateToml",
+  "-CaCertPath", (Join-Path $installDir "certs\ca.pem"),
+  "-ClientCertPath", (Join-Path $installDir "certs\client.pem"),
+  "-ClientKeyPath", (Join-Path $installDir "certs\client-key.pem"),
+  "-ClientCsrPath", (Join-Path $installDir "certs\client.csr.pem"),
+  "-ProxyMode", $proxyMode,
+  "-ProxyUrl", $proxyUrl,
+  "-RelayUrl", $relayUrl
+)
+
+if ($healthReport) {
+  $installerArgs += @("-HealthReportPath", $healthReport)
+} else {
+  $installerArgs += @("-HealthReportPath", (Join-Path $installDir "install_health_report.json"))
+}
+if ($keepOfflineQueue) { $installerArgs += "-KeepOfflineQueue" }
+if ($keepEvidenceCache) { $installerArgs += "-KeepEvidenceCache" }
+if ($strictHealthCheck) { $installerArgs += "-StrictHealthCheck" }
+if ($trustCa) { $installerArgs += "-TrustCa" }
+
+& $installer @installerArgs
 
 Remove-Item -LiteralPath $ParamsFile -Force -ErrorAction SilentlyContinue
