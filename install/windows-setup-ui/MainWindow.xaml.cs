@@ -260,9 +260,10 @@ public partial class MainWindow : Window
             "EDR Agent",
             "setup-ui");
         Directory.CreateDirectory(uiLogDir);
+        var handoffDir = ResolveSetupHandoffDirectory(uiLogDir);
         _lastDiagnosticsPath = Path.Combine(uiLogDir, $"install-ui-{DateTime.UtcNow:yyyyMMddHHmmss}.zip");
         var uiLog = Path.Combine(uiLogDir, "setup-ui.log");
-        var innoLog = Path.Combine(uiLogDir, "inno-setup.log");
+        var innoLog = Path.Combine(handoffDir, "inno-setup.log");
         string? paramsFile = null;
 
         try
@@ -278,7 +279,7 @@ public partial class MainWindow : Window
             }
 
             await PostAsync("installProgress", new { stage = "准备安装环境", progress = 6, detail = "正在生成静默安装参数" });
-            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] start install setup={_setupPath} dir={installPath}");
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] start install setup={_setupPath} dir={installPath} handoff={handoffDir}");
 
             var endpoint = NormalizeEndpointInput(request.ApiBase);
             if (string.IsNullOrWhiteSpace(request.EnrollToken))
@@ -297,11 +298,13 @@ public partial class MainWindow : Window
             }
             var effectiveProxyUrl = BuildEffectiveProxyUrl(request);
             var effectiveRelayUrl = NormalizeOptionalRelayUrl(request.RelayUrl);
-            paramsFile = WriteEnrollParamsFile(request, endpoint, effectiveProxyUrl, effectiveRelayUrl, installPath, uiLogDir);
+            paramsFile = WriteEnrollParamsFile(request, endpoint, effectiveProxyUrl, effectiveRelayUrl, installPath, handoffDir);
             var args = BuildInnoArguments(request, installPath, innoLog, paramsFile);
+            var setupToRun = PrepareSetupForElevation(_setupPath, handoffDir, uiLog);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] prepared setup={setupToRun} params={paramsFile} inno_log={innoLog}");
             await PostAsync("installProgress", new { stage = "请求管理员权限", progress = 12, detail = "如系统弹出 UAC，请确认继续安装" });
 
-            using var proc = StartSetup(args);
+            using var proc = StartSetup(setupToRun, args);
             await PostAsync("installProgress", new { stage = "执行安装器", progress = 22, detail = "正在停止旧进程、清理运行缓存并写入配置" });
 
             var progress = 22;
@@ -329,13 +332,7 @@ public partial class MainWindow : Window
 
             if (proc.ExitCode != 0)
             {
-                var stageState = ReadInstallStageState(installPath);
-                var detail = stageState == null ? "" : $"；{stageState.Stage}：{stageState.Detail}";
-                var enrollLog = Path.Combine(installPath, "diagnostics", "enroll-output.log");
-                if (File.Exists(enrollLog))
-                {
-                    detail += $"；注册日志：{enrollLog}";
-                }
+                var detail = BuildInstallFailureDetail(installPath, innoLog);
                 throw new InvalidOperationException($"安装器返回失败代码 {proc.ExitCode}{detail}");
             }
 
@@ -371,14 +368,14 @@ public partial class MainWindow : Window
         }
     }
 
-    private Process StartSetup(string arguments)
+    private Process StartSetup(string setupPath, string arguments)
     {
         var psi = new ProcessStartInfo
         {
-            FileName = _setupPath,
+            FileName = setupPath,
             Arguments = arguments,
             UseShellExecute = true,
-            WorkingDirectory = Path.GetDirectoryName(_setupPath) ?? _baseDir
+            WorkingDirectory = Path.GetDirectoryName(setupPath) ?? _baseDir
         };
         if (!IsElevated())
         {
@@ -1038,6 +1035,116 @@ public partial class MainWindow : Window
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
+    private static string ResolveSetupHandoffDirectory(string fallbackDir)
+    {
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EDR Agent", "setup-ui"),
+            Path.Combine(Path.GetTempPath(), "EDR Agent", "setup-ui"),
+            fallbackDir
+        };
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+            try
+            {
+                Directory.CreateDirectory(candidate);
+                var probe = Path.Combine(candidate, ".write-test-" + Guid.NewGuid().ToString("N"));
+                File.WriteAllText(probe, "ok");
+                File.Delete(probe);
+                return candidate;
+            }
+            catch
+            {
+                // Try the next location; handoff must be readable by the elevated setup process.
+            }
+        }
+        return fallbackDir;
+    }
+
+    private static string PrepareSetupForElevation(string setupPath, string handoffDir, string uiLog)
+    {
+        try
+        {
+            var hash = ComputeSHA256(setupPath);
+            var cacheDir = Path.Combine(handoffDir, "setup-cache");
+            Directory.CreateDirectory(cacheDir);
+            var ext = Path.GetExtension(setupPath);
+            if (string.IsNullOrWhiteSpace(ext))
+            {
+                ext = ".exe";
+            }
+            var cached = Path.Combine(cacheDir, "edr_agent_setup_" + hash[..12] + ext);
+            if (!File.Exists(cached) || !string.Equals(ComputeSHA256(cached), hash, StringComparison.OrdinalIgnoreCase))
+            {
+                File.Copy(setupPath, cached, true);
+            }
+            return cached;
+        }
+        catch (Exception ex)
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup cache copy skipped: {ex.Message}");
+            return setupPath;
+        }
+    }
+
+    private static string BuildInstallFailureDetail(string installPath, string innoLog)
+    {
+        var parts = new List<string>();
+        var stageState = ReadInstallStageState(installPath);
+        if (stageState != null)
+        {
+            parts.Add($"{stageState.Stage}：{stageState.Detail}");
+        }
+
+        var enrollLog = Path.Combine(installPath, "diagnostics", "enroll-output.log");
+        if (File.Exists(enrollLog))
+        {
+            parts.Add("注册日志：" + enrollLog);
+            var enrollTail = ReadLogTail(enrollLog, 1000);
+            if (!string.IsNullOrWhiteSpace(enrollTail))
+            {
+                parts.Add("注册日志尾部：" + enrollTail);
+            }
+        }
+
+        if (File.Exists(innoLog))
+        {
+            parts.Add("Inno日志：" + innoLog);
+            var innoTail = ReadLogTail(innoLog, 1200);
+            if (!string.IsNullOrWhiteSpace(innoTail))
+            {
+                parts.Add("Inno日志尾部：" + innoTail);
+            }
+        }
+
+        return parts.Count == 0 ? "" : "；" + string.Join("；", parts);
+    }
+
+    private static string ReadLogTail(string path, int maxChars)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return "";
+            }
+            var text = File.ReadAllText(path);
+            if (text.Length > maxChars)
+            {
+                text = text[^maxChars..];
+            }
+            return Regex.Replace(text, @"\s+", " ").Trim();
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     private static CheckItem CheckSystemArchitecture()
     {
         var os = RuntimeInformation.OSArchitecture;
@@ -1112,6 +1219,11 @@ public partial class MainWindow : Window
         Directory.CreateDirectory(staging);
 
         CopyDirectoryIfExists(uiLogDir, Path.Combine(staging, "setup-ui"));
+        var commonHandoffDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EDR Agent", "setup-ui");
+        if (!string.Equals(Path.GetFullPath(uiLogDir), Path.GetFullPath(commonHandoffDir), StringComparison.OrdinalIgnoreCase))
+        {
+            CopyDirectoryIfExists(commonHandoffDir, Path.Combine(staging, "setup-handoff"));
+        }
         CopyDirectoryIfExists(Path.Combine(installPath, "diagnostics"), Path.Combine(staging, "agent-diagnostics"));
 
         if (File.Exists(zipPath))
@@ -1134,6 +1246,11 @@ public partial class MainWindow : Window
         foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(source, file);
+            if (relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                .Any(part => part.Equals("setup-cache", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
             var target = Path.Combine(dest, relative);
             Directory.CreateDirectory(Path.GetDirectoryName(target) ?? dest);
             File.Copy(file, target, true);
