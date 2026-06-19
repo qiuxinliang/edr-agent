@@ -617,9 +617,11 @@ end;
 function EdrStopRuntimePsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
-    + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
-    + 'Remove-Item -LiteralPath ' + EdrPsSq(ExpandConstant('{app}\edr_agent.pid')) + ' -Force -ErrorAction SilentlyContinue'
+    + '$ErrorActionPreference=''SilentlyContinue'';'
+    + 'try { $svc=Get-Service -Name ''EdrAgent'' -ErrorAction SilentlyContinue; if($svc -and $svc.Status -ne ''Stopped''){Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue} } catch {};'
+    + 'try { Get-Process -Name ''edr_agent'' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {};'
+    + 'try { Remove-Item -LiteralPath ' + EdrPsSq(ExpandConstant('{app}\edr_agent.pid')) + ' -Force -ErrorAction SilentlyContinue } catch {};'
+    + 'exit 0'
     + '"';
 end;
 

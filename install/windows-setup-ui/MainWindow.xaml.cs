@@ -277,11 +277,11 @@ public partial class MainWindow : Window
 
         if (endpoint != null && proxyCheck.Severity != "fail")
         {
-            checks.Add(await ProbeHttpAsync("服务端连通", endpoint.EnrollUrl, request, "enroll API"));
+            checks.Add(await ProbeHttpAsync("服务端连通", endpoint.ReadyUrl, request, "platform ready"));
         }
         if (!string.IsNullOrWhiteSpace(normalizedRelayUrl) && proxyCheck.Severity != "fail")
         {
-            checks.Add(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/enroll", request, "relay API"));
+            checks.Add(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/healthz", request, "relay healthz"));
         }
 
         await PostAsync("checkResult", new
@@ -974,12 +974,12 @@ public partial class MainWindow : Window
             builder.Path = prefix;
             var serverBase = builder.Uri.ToString().TrimEnd('/');
             var restBase = serverBase + "/api/v1";
-            return new EndpointConfig(serverBase, restBase, restBase + "/enroll");
+            return new EndpointConfig(serverBase, restBase, restBase + "/enroll", serverBase + "/ready");
         }
 
         var baseUrl = builder.Uri.ToString().TrimEnd('/');
         var rest = baseUrl + "/api/v1";
-        return new EndpointConfig(baseUrl, rest, rest + "/enroll");
+        return new EndpointConfig(baseUrl, rest, rest + "/enroll", baseUrl + "/ready");
     }
 
     private static string NormalizeOptionalRelayUrl(string? raw)
@@ -1213,7 +1213,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (IsElevated())
+            if (IsElevated() && !IsUncPath(setupPath))
             {
                 return setupPath;
             }
@@ -1248,6 +1248,11 @@ public partial class MainWindow : Window
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup cache copy skipped: {ex.Message}");
             return setupPath;
         }
+    }
+
+    private static bool IsUncPath(string path)
+    {
+        return path.StartsWith(@"\\", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildInstallFailureDetail(string installPath, string innoLog)
@@ -1605,6 +1610,6 @@ public sealed class CheckItem
     public static CheckItem Fail(string key, string value) => new() { Key = key, Value = value, Severity = "fail" };
 }
 
-public sealed record EndpointConfig(string ServerBase, string RestBase, string EnrollUrl);
+public sealed record EndpointConfig(string ServerBase, string RestBase, string EnrollUrl, string ReadyUrl);
 
 public sealed record InstallStageState(string Stage, string Detail, int Progress);
