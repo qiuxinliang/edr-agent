@@ -1,4 +1,5 @@
 using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -12,6 +13,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 
 namespace EDRAgent.SetupUi;
 
@@ -19,6 +21,7 @@ public partial class MainWindow : Window
 {
     private const int WmNcLButtonDown = 0x00A1;
     private const int HtCaption = 2;
+    private const int ProbeTimeoutSeconds = 15;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _baseDir = AppContext.BaseDirectory;
     private string _setupPath = string.Empty;
@@ -28,6 +31,7 @@ public partial class MainWindow : Window
     private string _setupHashKey = string.Empty;
     private string _setupHashCache = string.Empty;
     private CheckItem? _setupIntegrityCache;
+    private WebView2? _browser;
     private bool _installRunning;
     private static readonly Dictionary<string, int> InstallStageProgress = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -45,19 +49,24 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Loaded += OnLoaded;
+        ContentRendered += OnContentRendered;
     }
 
-    private async void OnLoaded(object sender, RoutedEventArgs e)
+    private async void OnContentRendered(object? sender, EventArgs e)
     {
+        ContentRendered -= OnContentRendered;
         LoadingPanel.Visibility = Visibility.Visible;
         LoadingText.Text = "正在定位安装包...";
         _setupPath = ResolveSetupPath();
         _preconfig = LoadPreconfig();
+        await Dispatcher.Yield(DispatcherPriority.Background);
         try
         {
             LoadingText.Text = "正在初始化 WebView2...";
-            await Browser.EnsureCoreWebView2Async();
+            _browser = new WebView2();
+            BrowserHost.Children.Add(_browser);
+            var env = await CreateWebViewEnvironmentAsync();
+            await Browser.EnsureCoreWebView2Async(env);
         }
         catch (Exception ex)
         {
@@ -123,6 +132,7 @@ public partial class MainWindow : Window
                 case "ready":
                     HideLoadingPanel();
                     await PostNativeStatusAsync();
+                    BeginSetupIntegrityWarmup();
                     break;
                 case "dragWindow":
                     TryDragMove();
@@ -167,6 +177,21 @@ public partial class MainWindow : Window
     private void HideLoadingPanel()
     {
         LoadingPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private WebView2 Browser => _browser ?? throw new InvalidOperationException("WebView2 is not initialized");
+
+    private static async Task<CoreWebView2Environment> CreateWebViewEnvironmentAsync()
+    {
+        var userDataFolder = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "EDR Agent",
+            "setup-ui",
+            "webview2");
+        Directory.CreateDirectory(userDataFolder);
+        var options = new CoreWebView2EnvironmentOptions(
+            "--disable-background-networking --disable-component-update --disable-default-apps --disable-sync --metrics-recording-only --no-first-run");
+        return await CoreWebView2Environment.CreateAsync(null, userDataFolder, options);
     }
 
     private InstallRequest ReadRequest(JsonElement root)
@@ -230,7 +255,7 @@ public partial class MainWindow : Window
             File.Exists(_setupPath)
                 ? CheckItem.Ok("安装包", Path.GetFileName(_setupPath))
                 : CheckItem.Fail("安装包", "未找到同目录 edr_agent_setup.exe"),
-            VerifySetupIntegrity(),
+            GetSetupIntegrityPrecheck(),
             freeMb <= 0
                 ? CheckItem.Warn("磁盘空间", "无法读取可用空间，安装阶段会再次校验")
                 : freeMb >= 512
@@ -252,11 +277,11 @@ public partial class MainWindow : Window
 
         if (endpoint != null && proxyCheck.Severity != "fail")
         {
-            checks.Add(await ProbeHttpAsync("服务端连通", endpoint.EnrollUrl, request, "enroll endpoint"));
+            checks.Add(await ProbeHttpAsync("服务端连通", endpoint.EnrollUrl, request, "enroll API"));
         }
         if (!string.IsNullOrWhiteSpace(normalizedRelayUrl) && proxyCheck.Severity != "fail")
         {
-            checks.Add(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/enroll", request, "relay endpoint"));
+            checks.Add(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/enroll", request, "relay API"));
         }
 
         await PostAsync("checkResult", new
@@ -782,6 +807,52 @@ public partial class MainWindow : Window
         }
     }
 
+    private CheckItem GetSetupIntegrityPrecheck()
+    {
+        if (_setupIntegrityCache != null)
+        {
+            return _setupIntegrityCache;
+        }
+        var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
+        if (!File.Exists(manifest))
+        {
+            return CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，安装开始时跳过哈希校验");
+        }
+        if (!File.Exists(_setupPath))
+        {
+            return CheckItem.Fail("完整性校验", "安装器不存在，无法校验");
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+            var root = doc.RootElement;
+            var hasExpected = (root.TryGetProperty("setup_exe_sha256", out var snake) && !string.IsNullOrWhiteSpace(snake.GetString())) ||
+                              (root.TryGetProperty("setupExeSha256", out var camel) && !string.IsNullOrWhiteSpace(camel.GetString()));
+            return hasExpected
+                ? CheckItem.Ok("完整性校验", "安装开始前执行 SHA256 校验")
+                : CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，安装开始时跳过哈希校验");
+        }
+        catch (Exception ex)
+        {
+            return CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message);
+        }
+    }
+
+    private void BeginSetupIntegrityWarmup()
+    {
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                VerifySetupIntegrity();
+            }
+            catch
+            {
+                // Warmup only; install start still performs the authoritative check.
+            }
+        });
+    }
+
     private CheckItem CacheSetupIntegrity(CheckItem item)
     {
         _setupIntegrityCache = item;
@@ -1064,15 +1135,22 @@ public partial class MainWindow : Window
                 handler.UseProxy = true;
             }
 
-            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
+            using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
             using var msg = new HttpRequestMessage(HttpMethod.Get, url);
-            using var resp = await client.SendAsync(msg);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(ProbeTimeoutSeconds));
+            using var resp = await client.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             var code = (int)resp.StatusCode;
             if (code < 500)
             {
                 return CheckItem.Ok(key, $"{label} 可达，HTTP {code}");
             }
             return CheckItem.Warn(key, $"{label} 可达但服务端返回 HTTP {code}");
+        }
+        catch (TaskCanceledException)
+        {
+            return CheckItem.Warn(
+                key,
+                $"{label} {ProbeTimeoutSeconds}s 内未响应；请检查地址、端口、防火墙、代理模式和 TLS。可继续安装，注册阶段会再次 POST enroll。");
         }
         catch (Exception ex)
         {
@@ -1121,6 +1199,10 @@ public partial class MainWindow : Window
     {
         try
         {
+            if (IsElevated())
+            {
+                return setupPath;
+            }
             var hash = ComputeSetupSHA256Cached(setupPath);
             var sourceInfo = new FileInfo(setupPath);
             var cacheDir = Path.Combine(handoffDir, "setup-cache");
