@@ -186,7 +186,7 @@ public partial class MainWindow : Window
         var userDataFolder = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "EDR Agent",
-            "setup-ui",
+            "setup-ui-runtime",
             "webview2");
         Directory.CreateDirectory(userDataFolder);
         var options = new CoreWebView2EnvironmentOptions(
@@ -379,7 +379,7 @@ public partial class MainWindow : Window
 
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
             var summary = ReadInstallSummary(installPath, innoLog);
-            CreateDiagnosticsBundle(uiLogDir, installPath, _lastDiagnosticsPath);
+            TryCreateDiagnosticsBundle(uiLogDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installComplete", new
             {
                 installPath,
@@ -1110,52 +1110,66 @@ public partial class MainWindow : Window
 
     private async Task<CheckItem> ProbeHttpAsync(string key, string url, InstallRequest request, string label)
     {
-        try
+        for (var attempt = 1; attempt <= 2; attempt++)
         {
-            using var handler = new HttpClientHandler();
-            if (request.InsecureTls)
+            try
             {
-                handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-            }
-
-            var proxyMode = NormalizeProxyMode(request.ProxyMode);
-            if (proxyMode == "off")
-            {
-                handler.UseProxy = false;
-            }
-            else if (proxyMode == "explicit")
-            {
-                var webProxy = new WebProxy(request.ProxyUrl.Trim());
-                if (NormalizeProxyAuthMode(request.ProxyAuthMode) == "basic" &&
-                    !string.IsNullOrWhiteSpace(request.ProxyUser))
+                using var handler = new HttpClientHandler();
+                if (request.InsecureTls)
                 {
-                    webProxy.Credentials = new NetworkCredential(request.ProxyUser.Trim(), request.ProxyPassword ?? "");
+                    handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
                 }
-                handler.Proxy = webProxy;
-                handler.UseProxy = true;
-            }
 
-            using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-            using var msg = new HttpRequestMessage(HttpMethod.Get, url);
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(ProbeTimeoutSeconds));
-            using var resp = await client.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, cts.Token);
-            var code = (int)resp.StatusCode;
-            if (code < 500)
-            {
-                return CheckItem.Ok(key, $"{label} 可达，HTTP {code}");
+                var proxyMode = NormalizeProxyMode(request.ProxyMode);
+                if (proxyMode == "off")
+                {
+                    handler.UseProxy = false;
+                }
+                else if (proxyMode == "explicit")
+                {
+                    var webProxy = new WebProxy(request.ProxyUrl.Trim());
+                    if (NormalizeProxyAuthMode(request.ProxyAuthMode) == "basic" &&
+                        !string.IsNullOrWhiteSpace(request.ProxyUser))
+                    {
+                        webProxy.Credentials = new NetworkCredential(request.ProxyUser.Trim(), request.ProxyPassword ?? "");
+                    }
+                    handler.Proxy = webProxy;
+                    handler.UseProxy = true;
+                }
+
+                using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+                using var msg = new HttpRequestMessage(HttpMethod.Get, url);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(ProbeTimeoutSeconds));
+                using var resp = await client.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                var code = (int)resp.StatusCode;
+                var suffix = attempt > 1 ? "，重试成功" : "";
+                if (code < 500)
+                {
+                    return CheckItem.Ok(key, $"{label} 可达，HTTP {code}{suffix}");
+                }
+                return CheckItem.Warn(key, $"{label} 可达但服务端返回 HTTP {code}{suffix}");
             }
-            return CheckItem.Warn(key, $"{label} 可达但服务端返回 HTTP {code}");
+            catch (TaskCanceledException) when (attempt < 2)
+            {
+                await Task.Delay(600);
+            }
+            catch (HttpRequestException) when (attempt < 2)
+            {
+                await Task.Delay(600);
+            }
+            catch (TaskCanceledException)
+            {
+                return CheckItem.Warn(
+                    key,
+                    $"{label} {ProbeTimeoutSeconds}s 内未响应；请检查地址、端口、防火墙、代理模式和 TLS。可继续安装，注册阶段会再次 POST enroll。");
+            }
+            catch (Exception ex)
+            {
+                return CheckItem.Fail(key, $"{label} 不可达：{ex.Message}");
+            }
         }
-        catch (TaskCanceledException)
-        {
-            return CheckItem.Warn(
-                key,
-                $"{label} {ProbeTimeoutSeconds}s 内未响应；请检查地址、端口、防火墙、代理模式和 TLS。可继续安装，注册阶段会再次 POST enroll。");
-        }
-        catch (Exception ex)
-        {
-            return CheckItem.Fail(key, $"{label} 不可达：{ex.Message}");
-        }
+
+        return CheckItem.Warn(key, $"{label} 预检未完成；注册阶段会再次 POST enroll。");
     }
 
     private static bool IsElevated()
@@ -1362,14 +1376,19 @@ public partial class MainWindow : Window
     {
         var staging = Path.Combine(Path.GetTempPath(), "edr_setup_ui_diag_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(staging);
+        var skipped = new List<string>();
 
-        CopyDirectoryIfExists(uiLogDir, Path.Combine(staging, "setup-ui"));
+        CopyDirectoryIfExists(uiLogDir, Path.Combine(staging, "setup-ui"), skipped);
         var commonHandoffDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EDR Agent", "setup-ui");
         if (!string.Equals(Path.GetFullPath(uiLogDir), Path.GetFullPath(commonHandoffDir), StringComparison.OrdinalIgnoreCase))
         {
-            CopyDirectoryIfExists(commonHandoffDir, Path.Combine(staging, "setup-handoff"));
+            CopyDirectoryIfExists(commonHandoffDir, Path.Combine(staging, "setup-handoff"), skipped);
         }
-        CopyDirectoryIfExists(Path.Combine(installPath, "diagnostics"), Path.Combine(staging, "agent-diagnostics"));
+        CopyDirectoryIfExists(Path.Combine(installPath, "diagnostics"), Path.Combine(staging, "agent-diagnostics"), skipped);
+        if (skipped.Count > 0)
+        {
+            File.WriteAllLines(Path.Combine(staging, "diagnostics-skipped-files.txt"), skipped, new UTF8Encoding(false));
+        }
 
         if (File.Exists(zipPath))
         {
@@ -1380,7 +1399,7 @@ public partial class MainWindow : Window
         Directory.Delete(staging, true);
     }
 
-    private static void CopyDirectoryIfExists(string source, string dest)
+    private static void CopyDirectoryIfExists(string source, string dest, List<string> skipped)
     {
         if (!Directory.Exists(source))
         {
@@ -1388,18 +1407,87 @@ public partial class MainWindow : Window
         }
 
         Directory.CreateDirectory(dest);
-        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        CopyDirectoryContents(source, source, dest, skipped);
+    }
+
+    private static void CopyDirectoryContents(string root, string current, string destRoot, List<string> skipped)
+    {
+        IEnumerable<string> files;
+        try
         {
-            var relative = Path.GetRelativePath(source, file);
-            if (relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                .Any(part => part.Equals("setup-cache", StringComparison.OrdinalIgnoreCase)))
+            files = Directory.EnumerateFiles(current);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            skipped.Add("directory skipped: " + current + " (" + ex.Message + ")");
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            var relative = Path.GetRelativePath(root, file);
+            if (ShouldSkipDiagnosticsFile(relative))
             {
+                skipped.Add("skipped by policy: " + Path.Combine(root, relative));
                 continue;
             }
-            var target = Path.Combine(dest, relative);
-            Directory.CreateDirectory(Path.GetDirectoryName(target) ?? dest);
-            File.Copy(file, target, true);
+            var target = Path.Combine(destRoot, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target) ?? destRoot);
+            try
+            {
+                File.Copy(file, target, true);
+            }
+            catch (IOException ex)
+            {
+                skipped.Add("locked: " + Path.Combine(root, relative) + " (" + ex.Message + ")");
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                skipped.Add("denied: " + Path.Combine(root, relative) + " (" + ex.Message + ")");
+            }
         }
+
+        IEnumerable<string> directories;
+        try
+        {
+            directories = Directory.EnumerateDirectories(current);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            skipped.Add("directory skipped: " + current + " (" + ex.Message + ")");
+            return;
+        }
+
+        foreach (var directory in directories)
+        {
+            var relative = Path.GetRelativePath(root, directory);
+            if (ShouldSkipDiagnosticsPath(relative))
+            {
+                skipped.Add("skipped by policy: " + directory);
+                continue;
+            }
+            CopyDirectoryContents(root, directory, destRoot, skipped);
+        }
+    }
+
+    private static bool ShouldSkipDiagnosticsFile(string relative)
+    {
+        var name = Path.GetFileName(relative);
+        return ShouldSkipDiagnosticsPath(relative) ||
+               (name.StartsWith("enroll-params-", StringComparison.OrdinalIgnoreCase) &&
+                name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) ||
+               name.Equals("Cookies", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".lock", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldSkipDiagnosticsPath(string relative)
+    {
+        var parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return parts.Any(part =>
+            part.Equals("setup-cache", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("webview2", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("EBWebView", StringComparison.OrdinalIgnoreCase));
     }
 
     private static string TryReadJsonString(string path, string property)
