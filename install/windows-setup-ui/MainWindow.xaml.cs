@@ -1481,6 +1481,9 @@ public partial class MainWindow : Window
         return ShouldSkipDiagnosticsPath(relative) ||
                (name.StartsWith("enroll-params-", StringComparison.OrdinalIgnoreCase) &&
                 name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) ||
+               (name.StartsWith("install-ui-", StringComparison.OrdinalIgnoreCase) &&
+                name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) ||
+               name.Equals("install-diagnostics.zip", StringComparison.OrdinalIgnoreCase) ||
                name.Equals("Cookies", StringComparison.OrdinalIgnoreCase) ||
                name.EndsWith(".lock", StringComparison.OrdinalIgnoreCase) ||
                name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase);

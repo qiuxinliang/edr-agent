@@ -46,6 +46,35 @@ function Get-RedactedUrl {
   }
 }
 
+function Format-ArgForLog {
+  param([string]$Value)
+  if ($null -eq $Value) { return "<null>" }
+  $v = [string]$Value
+  if ($v.Length -eq 0) { return '""' }
+  if ($v -match '\s|["]') {
+    return ('"{0}"' -f ($v -replace '"', '\"'))
+  }
+  return $v
+}
+
+function Format-ArgsForLog {
+  param([string[]]$Args)
+  $out = New-Object System.Collections.Generic.List[string]
+  $redactNext = $false
+  foreach ($arg in $Args) {
+    if ($redactNext) {
+      $out.Add((Format-ArgForLog (Get-RedactedUrl $arg))) | Out-Null
+      $redactNext = $false
+      continue
+    }
+    $out.Add((Format-ArgForLog $arg)) | Out-Null
+    if ($arg -eq "-ProxyUrl" -or $arg -eq "-RelayUrl") {
+      $redactNext = $true
+    }
+  }
+  return ($out -join " ")
+}
+
 if (-not (Test-Path -LiteralPath $ParamsFile)) {
   Write-EnrollLog "ERROR missing params file: $ParamsFile"
   Write-Error "Missing params file: $ParamsFile"
@@ -92,10 +121,23 @@ $installerArgs = @(
   "-ClientCertPath", (Join-Path $installDir "certs\client.pem"),
   "-ClientKeyPath", (Join-Path $installDir "certs\client-key.pem"),
   "-ClientCsrPath", (Join-Path $installDir "certs\client.csr.pem"),
-  "-ProxyMode", $proxyMode,
-  "-ProxyUrl", $proxyUrl,
-  "-RelayUrl", $relayUrl
+  "-ProxyMode", $proxyMode
 )
+
+$proxyUrl = if ($proxyUrl) { $proxyUrl.Trim() } else { "" }
+$relayUrl = if ($relayUrl) { $relayUrl.Trim() } else { "" }
+if ($proxyUrl) {
+  $env:EDR_PROXY_URL = $proxyUrl
+  $installerArgs += @("-ProxyUrl", $proxyUrl)
+} else {
+  Remove-Item Env:EDR_PROXY_URL -ErrorAction SilentlyContinue
+}
+if ($relayUrl) {
+  $env:EDR_RELAY_URL = $relayUrl
+  $installerArgs += @("-RelayUrl", $relayUrl)
+} else {
+  Remove-Item Env:EDR_RELAY_URL -ErrorAction SilentlyContinue
+}
 
 if ($healthReport) {
   $installerArgs += @("-HealthReportPath", $healthReport)
@@ -118,13 +160,21 @@ $ps = Get-Command "powershell.exe" -ErrorAction SilentlyContinue | Select-Object
 $psExe = if ($ps) { $ps.Source } else { "powershell.exe" }
 $childArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $installer) + $installerArgs
 Write-EnrollLog ("invoking bundled installer script: {0}" -f $installer)
+Write-EnrollLog ("child_command={0} {1}" -f (Format-ArgForLog $psExe), (Format-ArgsForLog $childArgs))
 
-& $psExe @childArgs *>&1 | ForEach-Object {
-  $line = [string]$_
-  Write-EnrollLog $line
-  Write-Host $line
+$exitCode = 0
+try {
+  & $psExe @childArgs *>&1 | ForEach-Object {
+    $line = [string]$_
+    Write-EnrollLog ("child: {0}" -f $line)
+    Write-Host $line
+  }
+  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+} catch {
+  $msg = $_.Exception.Message
+  Write-EnrollLog ("ERROR child invocation failed: {0}" -f $msg)
+  Write-Error ("bundled installer script invocation failed; log={0}; error={1}" -f $EnrollLogPath, $msg)
 }
-$exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
 if ($exitCode -ne 0) {
   Write-EnrollLog ("ERROR bundled installer script failed exit_code={0}" -f $exitCode)
   Write-Error ("bundled installer script failed with exit code {0}; log={1}" -f $exitCode, $EnrollLogPath)
