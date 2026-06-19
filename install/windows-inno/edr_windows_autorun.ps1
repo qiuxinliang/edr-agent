@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
   安装 / 卸载 EDR Agent 的「开机常驻」与可选安装目录 ACL 加固。
-  - Install：注册计划任务（SYSTEM、开机触发、无执行时限），并立即启动一次；可选对安装目录做 icacls 加固。
+  - Install：注册计划任务（SYSTEM、开机触发、无执行时限）；默认立即启动一次，传 -NoStart 时只注册不启动。
   - Remove：停止任务、结束 edr_agent 进程、按名停止可能残留的 ETW 实时会话、重置 ACL、注销任务（供 Inno UninstallRun 调用）。
 
   说明：edr_agent 为控制台程序，未实现 SCM ServiceMain；以「计划任务 + SYSTEM」实现重启后仍在。
@@ -11,7 +11,8 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet("Install", "Remove")]
   [string]$Action,
-  [switch]$HardenAcl
+  [switch]$HardenAcl,
+  [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,6 +83,8 @@ $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnB
   -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
 Register-ScheduledTask -TaskName $TaskName -Action $sta -Trigger $trg -Principal $prc -Settings $set -Force | Out-Null
-Start-ScheduledTask -TaskName $TaskName
+if (-not $NoStart) {
+  Start-ScheduledTask -TaskName $TaskName
+}
 
 exit 0

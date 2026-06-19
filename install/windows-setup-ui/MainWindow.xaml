@@ -13,5 +13,27 @@
         Background="#070A12">
   <Grid Background="#070A12">
     <wv2:WebView2 x:Name="Browser" />
+    <Grid x:Name="LoadingPanel" Background="#070A12">
+      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+        <TextBlock Text="EDR Agent"
+                   Foreground="#FFFFFF"
+                   FontSize="18"
+                   FontWeight="Bold"
+                   HorizontalAlignment="Center"
+                   Margin="0,0,0,8" />
+        <TextBlock x:Name="LoadingText"
+                   Text="正在加载安装向导..."
+                   Foreground="#7B8A9A"
+                   FontSize="12"
+                   HorizontalAlignment="Center"
+                   Margin="0,0,0,18" />
+        <ProgressBar Width="220"
+                     Height="4"
+                     IsIndeterminate="True"
+                     Foreground="#4D7CFF"
+                     Background="#141B29"
+                     BorderThickness="0" />
+      </StackPanel>
+    </Grid>
   </Grid>
 </Window>

@@ -24,6 +24,10 @@ public partial class MainWindow : Window
     private string _setupPath = string.Empty;
     private string _lastDiagnosticsPath = string.Empty;
     private Dictionary<string, object?> _preconfig = new(StringComparer.OrdinalIgnoreCase);
+    private string _setupIntegrityKey = string.Empty;
+    private string _setupHashKey = string.Empty;
+    private string _setupHashCache = string.Empty;
+    private CheckItem? _setupIntegrityCache;
     private bool _installRunning;
     private static readonly Dictionary<string, int> InstallStageProgress = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -46,10 +50,13 @@ public partial class MainWindow : Window
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
+        LoadingPanel.Visibility = Visibility.Visible;
+        LoadingText.Text = "正在定位安装包...";
         _setupPath = ResolveSetupPath();
         _preconfig = LoadPreconfig();
         try
         {
+            LoadingText.Text = "正在初始化 WebView2...";
             await Browser.EnsureCoreWebView2Async();
         }
         catch (Exception ex)
@@ -90,6 +97,7 @@ public partial class MainWindow : Window
         Browser.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
         Browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
         Browser.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+        Browser.CoreWebView2.NavigationCompleted += (_, _) => HideLoadingPanel();
 
         var html = Path.Combine(_baseDir, "Assets", "installer.html");
         if (!File.Exists(html))
@@ -99,6 +107,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        LoadingText.Text = "正在加载安装页面...";
         Browser.Source = new Uri(html);
     }
 
@@ -112,6 +121,7 @@ public partial class MainWindow : Window
             switch (action)
             {
                 case "ready":
+                    HideLoadingPanel();
                     await PostNativeStatusAsync();
                     break;
                 case "dragWindow":
@@ -152,6 +162,11 @@ public partial class MainWindow : Window
         {
             await PostAsync("installFailed", new { reason = ex.Message, diagnostics = _lastDiagnosticsPath });
         }
+    }
+
+    private void HideLoadingPanel()
+    {
+        LoadingPanel.Visibility = Visibility.Collapsed;
     }
 
     private InstallRequest ReadRequest(JsonElement root)
@@ -272,6 +287,7 @@ public partial class MainWindow : Window
             {
                 throw new FileNotFoundException("未找到 edr_agent_setup.exe，请确认 UI 安装器与 setup 位于同一目录。", _setupPath);
             }
+            await PostAsync("installProgress", new { stage = "准备安装环境", progress = 4, detail = "正在校验安装包并准备提权缓存" });
             var integrity = VerifySetupIntegrity();
             if (integrity.Severity == "fail")
             {
@@ -721,10 +737,17 @@ public partial class MainWindow : Window
 
     private CheckItem VerifySetupIntegrity()
     {
+        var key = GetFileCacheKey(_setupPath);
+        if (_setupIntegrityCache != null && string.Equals(_setupIntegrityKey, key, StringComparison.OrdinalIgnoreCase))
+        {
+            return _setupIntegrityCache;
+        }
+
+        _setupIntegrityKey = key;
         var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
         if (!File.Exists(manifest))
         {
-            return CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，跳过安装器哈希校验");
+            return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，跳过安装器哈希校验"));
         }
         try
         {
@@ -742,21 +765,50 @@ public partial class MainWindow : Window
             expected = expected.Trim().ToLowerInvariant();
             if (expected == "")
             {
-                return CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，跳过安装器哈希校验");
+                return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，跳过安装器哈希校验"));
             }
             if (!File.Exists(_setupPath))
             {
-                return CheckItem.Fail("完整性校验", "安装器不存在，无法校验");
+                return CacheSetupIntegrity(CheckItem.Fail("完整性校验", "安装器不存在，无法校验"));
             }
-            var actual = ComputeSHA256(_setupPath);
-            return string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase)
+            var actual = ComputeSetupSHA256Cached(_setupPath);
+            return CacheSetupIntegrity(string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase)
                 ? CheckItem.Ok("完整性校验", "setup exe SHA256 匹配")
-                : CheckItem.Fail("完整性校验", $"setup exe SHA256 不匹配：{actual}");
+                : CheckItem.Fail("完整性校验", $"setup exe SHA256 不匹配：{actual}"));
         }
         catch (Exception ex)
         {
-            return CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message);
+            return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message));
         }
+    }
+
+    private CheckItem CacheSetupIntegrity(CheckItem item)
+    {
+        _setupIntegrityCache = item;
+        return item;
+    }
+
+    private string ComputeSetupSHA256Cached(string path)
+    {
+        var key = GetFileCacheKey(path);
+        if (!string.IsNullOrWhiteSpace(_setupHashCache) &&
+            string.Equals(_setupHashKey, key, StringComparison.OrdinalIgnoreCase))
+        {
+            return _setupHashCache;
+        }
+        _setupHashKey = key;
+        _setupHashCache = ComputeSHA256(path);
+        return _setupHashCache;
+    }
+
+    private static string GetFileCacheKey(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return path;
+        }
+        var info = new FileInfo(path);
+        return string.Join("|", info.FullName, info.Length.ToString(), info.LastWriteTimeUtc.Ticks.ToString());
     }
 
     private static string ComputeSHA256(string path)
@@ -1065,11 +1117,12 @@ public partial class MainWindow : Window
         return fallbackDir;
     }
 
-    private static string PrepareSetupForElevation(string setupPath, string handoffDir, string uiLog)
+    private string PrepareSetupForElevation(string setupPath, string handoffDir, string uiLog)
     {
         try
         {
-            var hash = ComputeSHA256(setupPath);
+            var hash = ComputeSetupSHA256Cached(setupPath);
+            var sourceInfo = new FileInfo(setupPath);
             var cacheDir = Path.Combine(handoffDir, "setup-cache");
             Directory.CreateDirectory(cacheDir);
             var ext = Path.GetExtension(setupPath);
@@ -1078,9 +1131,19 @@ public partial class MainWindow : Window
                 ext = ".exe";
             }
             var cached = Path.Combine(cacheDir, "edr_agent_setup_" + hash[..12] + ext);
-            if (!File.Exists(cached) || !string.Equals(ComputeSHA256(cached), hash, StringComparison.OrdinalIgnoreCase))
+            var sidecar = cached + ".sha256";
+            var cachedOk = false;
+            if (File.Exists(cached) && File.Exists(sidecar))
+            {
+                var cachedInfo = new FileInfo(cached);
+                var cachedHash = File.ReadAllText(sidecar).Trim();
+                cachedOk = cachedInfo.Length == sourceInfo.Length &&
+                           string.Equals(cachedHash, hash, StringComparison.OrdinalIgnoreCase);
+            }
+            if (!cachedOk)
             {
                 File.Copy(setupPath, cached, true);
+                File.WriteAllText(sidecar, hash, new UTF8Encoding(false));
             }
             return cached;
         }

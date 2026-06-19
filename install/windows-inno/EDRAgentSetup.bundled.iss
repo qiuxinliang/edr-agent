@@ -351,20 +351,23 @@ begin
   SaveEnrollParamsFileIfNeeded;
   Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$d=''' + ExpandConstant('{app}') + ''';'
-    + '$keepQ=' + EdrPsBool(ShouldKeepOfflineQueue) + ';'
-    + '$keepE=' + EdrPsBool(ShouldKeepEvidenceCache) + ';'
     + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
     + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
     + 'Remove-Item -LiteralPath (Join-Path $d ''edr_agent.pid'') -Force -ErrorAction SilentlyContinue;'
-    + 'if(-not $keepQ){Remove-Item -Path (Join-Path $d ''queue\edr_queue.db*'') -Force -ErrorAction SilentlyContinue};'
-    + 'if(-not $keepE){Remove-Item -Path (Join-Path $d ''evidence\local_evidence_cache.db*'') -Force -ErrorAction SilentlyContinue};'
     + '"';
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
     Result := 'Failed to run EDR preflight cleanup before installing.';
 end;
 
 function EdrDeploymentPlanText: string;
+var
+  DiagnosticsPath: string;
 begin
+  DiagnosticsPath := WizardDirValue;
+  if DiagnosticsPath = '' then
+    DiagnosticsPath := ExpandConstant('{autopf}\{#MyAppName}');
+  DiagnosticsPath := DiagnosticsPath + '\diagnostics';
+
   Result :=
     'EDR Agent setup will run the following controlled stages:' + #13#10 + #13#10 +
     '  01  Stop old EDR Agent process and service' + #13#10 +
@@ -376,7 +379,7 @@ begin
     '  07  Pull runtime policy with endpoint identity' + #13#10 +
     '  08  Write health summary and diagnostics' + #13#10 + #13#10 +
     'Diagnostics will be written under:' + #13#10 +
-    '  ' + ExpandConstant('{app}\diagnostics') + #13#10 + #13#10 +
+    '  ' + DiagnosticsPath + #13#10 + #13#10 +
     'If setup fails, the error dialog will include the failed stage and a copyable diagnostics bundle path.';
 end;
 
@@ -697,7 +700,7 @@ end;
 
 function AutorunInstallPsParameters(Param: string): string;
 begin
-  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_windows_autorun.ps1') + '" -Action Install';
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_windows_autorun.ps1') + '" -Action Install -NoStart';
   if WizardIsTaskSelected('hardeninstalldir') then
     Result := Result + ' -HardenAcl';
 end;
@@ -710,11 +713,44 @@ begin
     + ' -ConfigPath "' + ExpandConstant('{app}\agent.toml') + '"'
     + ' -InstallDir "' + ExpandConstant('{app}') + '"'
     + ' -DataDir "' + ExpandConstant('{app}') + '"'
-    + ' -SkipPreflight';
+    + ' -SkipPreflight'
+    + ' -NoStart';
   if ShouldKeepOfflineQueue then
     Result := Result + ' -KeepOfflineQueue';
   if ShouldKeepEvidenceCache then
     Result := Result + ' -KeepEvidenceCache';
+end;
+
+function EdrStartServicePsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + 'Start-Sleep -Seconds 2;'
+    + 'Start-Service -Name ''EdrAgent'' -ErrorAction SilentlyContinue;'
+    + 'Start-Sleep -Seconds 2;'
+    + 'Get-Process -Name ''edr_agent'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
+    + '"';
+end;
+
+function EdrStartScheduledTaskPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + 'Start-Sleep -Seconds 2;'
+    + 'Start-ScheduledTask -TaskName ''EdrAgent'' -ErrorAction SilentlyContinue;'
+    + 'Start-Sleep -Seconds 2;'
+    + 'Get-Process -Name ''edr_agent'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
+    + '"';
+end;
+
+function EdrStartManualPsParameters: string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + 'Start-Sleep -Seconds 2;'
+    + '$p=Start-Process -FilePath ' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}'))
+    + ' -ArgumentList @(''--config'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ')'
+    + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
+    + ' -WindowStyle Hidden -PassThru;'
+    + 'try { $p.PriorityClass = ''BelowNormal'' } catch {}'
+    + '"';
 end;
 
 function EdrHardenAclPsParameters: string;
@@ -779,17 +815,17 @@ begin
 
   if WizardIsTaskSelected('windowsservice') then
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent Windows service.', '-NoProfile -ExecutionPolicy Bypass -Command "Start-Service -Name ''EdrAgent'' -ErrorAction SilentlyContinue"', False) then
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent Windows service.', EdrStartServicePsParameters, False) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('windowsautorun') then
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent scheduled task.', '-NoProfile -ExecutionPolicy Bypass -Command "Start-ScheduledTask -TaskName ''EdrAgent'' -ErrorAction SilentlyContinue"', False) then
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent scheduled task.', EdrStartScheduledTaskPsParameters, False) then
       EdrAbortInstall;
   end
   else
   begin
-    if not EdrRunNoWaitStage(6, Total, 'Start Agent runtime', 'Starting edr_agent.exe with generated agent.toml.', ExpandConstant('{app}\{#MyAppExeName}'), '--config "' + ExpandConstant('{app}\agent.toml') + '"', ExpandConstant('{app}'), False) then
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting edr_agent.exe with generated agent.toml.', EdrStartManualPsParameters, False) then
       EdrAbortInstall;
   end;
 

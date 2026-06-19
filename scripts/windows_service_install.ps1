@@ -21,6 +21,7 @@ param(
   [switch]$SkipPreflight,
   [switch]$KeepOfflineQueue,
   [switch]$KeepEvidenceCache,
+  [switch]$NoStart,
   [switch]$EnableResponseActions
 )
 
@@ -124,7 +125,9 @@ function Install-AgentService {
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
     & sc.exe config $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
     & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host
-    Start-Service -Name $ServiceName
+    if (-not $NoStart) {
+      Start-Service -Name $ServiceName
+    }
     Get-Service -Name $ServiceName
     return
   }
@@ -132,7 +135,9 @@ function Install-AgentService {
   & sc.exe create $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
   & sc.exe description $ServiceName "EDR endpoint agent" | Out-Host
   & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host
-  Start-Service -Name $ServiceName
+  if (-not $NoStart) {
+    Start-Service -Name $ServiceName
+  }
   Get-Service -Name $ServiceName
 }
 

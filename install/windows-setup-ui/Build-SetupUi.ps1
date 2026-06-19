@@ -105,7 +105,7 @@ foreach ($candidate in $publishDirCandidates) {
     Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { "false" }
+$readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { "true" }
 dotnet publish $project `
     -c $Configuration `
     -r win-x64 `
