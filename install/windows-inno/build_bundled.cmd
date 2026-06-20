@@ -22,4 +22,7 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo OK: %~dp0Output\FDSecuritySetup-bundled.exe
+copy /Y "%~dp0Output\FDSecuritySetup-bundled.exe" "%~dp0Output\EDRAgentSetup-bundled.exe" >nul
+if errorlevel 1 exit /b 1
+echo OK: legacy compatibility alias: %~dp0Output\EDRAgentSetup-bundled.exe
 exit /b 0

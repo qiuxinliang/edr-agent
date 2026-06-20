@@ -72,6 +72,9 @@ $outDir = Join-Path $scriptDir "Output"
 $out = Join-Path $outDir "FDSecuritySetup-bundled.exe"
 if (Test-Path -LiteralPath $out) {
     Write-Host "OK: $out"
+    $legacyOut = Join-Path $outDir "EDRAgentSetup-bundled.exe"
+    Copy-Item -LiteralPath $out -Destination $legacyOut -Force
+    Write-Host "OK: legacy compatibility alias: $legacyOut"
 } else {
     Write-Warning "ISCC reported success but $out not found; check ISCC log."
 }
