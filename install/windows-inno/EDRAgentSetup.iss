@@ -72,12 +72,32 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_install_wizard_enroll.ps1"" ""{tmp}\edr_wizard_enroll.json"" ""{app}\agent.toml"""; StatusMsg: "Registering with platform..."; Flags: waituntilterminated; Check: EnrollParamsFileExists
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$app='{app}'; $cfg=Join-Path $app 'agent.toml'; $ex=Join-Path $app 'agent.toml.example'; if (-not (Test-Path -LiteralPath $cfg)) {{ if (Test-Path -LiteralPath $ex) {{ Copy-Item -LiteralPath $ex -Destination $cfg -Force }} else {{ throw 'agent.toml was not generated and agent.toml.example is missing' }} }}; if (-not (Test-Path -LiteralPath $cfg)) {{ throw 'agent.toml was not generated' }}; $raw=[System.IO.File]::ReadAllText($cfg); $appEsc=$app.Replace('\','\\'); $raw=$raw.Replace('C:\\Program Files\\EDR Agent',$appEsc).Replace('C:\Program Files\EDR Agent',$app).Replace('C:\\Program Files\\FDSecurity',$appEsc).Replace('C:\Program Files\FDSecurity',$app); [System.IO.File]::WriteAllText($cfg,$raw)"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$app='{app}'; $cfg=Join-Path $app 'agent.toml'; $ex=Join-Path $app 'agent.toml.example'; if (-not (Test-Path -LiteralPath $cfg)) {{ if (Test-Path -LiteralPath $ex) {{ Copy-Item -LiteralPath $ex -Destination $cfg -Force }} else {{ throw 'agent.toml was not generated and agent.toml.example is missing' }} }}; if (-not (Test-Path -LiteralPath $cfg)) {{ throw 'agent.toml was not generated' }}; $takeown=Get-Command 'takeown.exe' -ErrorAction SilentlyContinue; if($takeown){{try{{& $takeown.Source /F $cfg /A | Out-Null}}catch{{}}}}; $icacls=Get-Command 'icacls.exe' -ErrorAction SilentlyContinue; if($icacls){{try{{& $icacls.Source $cfg /inheritance:r /grant:r '*S-1-5-18:F' /grant:r '*S-1-5-32-544:F' /C /Q | Out-Null}}catch{{}}}}; $raw=[System.IO.File]::ReadAllText($cfg); $appEsc=$app.Replace('\','\\'); $raw=$raw.Replace('C:\\Program Files\\EDR Agent',$appEsc).Replace('C:\Program Files\EDR Agent',$app).Replace('C:\\Program Files\\FDSecurity',$appEsc).Replace('C:\Program Files\FDSecurity',$app); [System.IO.File]::WriteAllText($cfg,$raw); if($icacls){{try{{& $icacls.Source $cfg /inheritance:r /grant:r '*S-1-5-18:F' /grant:r '*S-1-5-32-544:F' /C /Q | Out-Null}}catch{{}}}}"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start FDSecurity now (console window; skip if startup task is enabled)"; Flags: postinstall nowait skipifsilent; Check: ShouldPostinstallStartExe
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:AutorunInstallPsParameters}"; StatusMsg: "Configuring startup task..."; Flags: waituntilterminated; Check: ShouldInstallAutorun
 
 [UninstallRun]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
+
+[UninstallDelete]
+Type: files; Name: "{app}\*.pid"
+Type: files; Name: "{app}\edr_queue.db*"
+Type: files; Name: "{app}\local_evidence_cache.db*"
+Type: files; Name: "{app}\command_state.jsonl*"
+Type: files; Name: "{app}\state\command_state.jsonl*"
+Type: filesandordirs; Name: "{app}\agent.toml"
+Type: filesandordirs; Name: "{app}\certs"
+Type: filesandordirs; Name: "{app}\queue"
+Type: filesandordirs; Name: "{app}\evidence"
+Type: filesandordirs; Name: "{app}\state"
+Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\forensic"
+Type: filesandordirs; Name: "{app}\isolation"
+Type: filesandordirs; Name: "{app}\diagnostics"
+Type: filesandordirs; Name: "{app}\upload_outbox"
+Type: filesandordirs; Name: "{commonappdata}\FDSecurity\setup-ui"
+Type: dirifempty; Name: "{commonappdata}\FDSecurity"
 
 [Code]
 var
@@ -323,4 +343,9 @@ end;
 function AutorunScriptPresentForUninstall: Boolean;
 begin
   Result := FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
+end;
+
+function ServiceScriptPresentForUninstall: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
 end;

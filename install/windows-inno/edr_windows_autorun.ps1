@@ -44,7 +44,8 @@ function Reset-InstallDirAcl {
 function Set-InstallDirAclHarden {
   param([string]$Dir)
   if (-not (Test-Path -LiteralPath $Dir)) { return }
-  # SID：SYSTEM / Administrators 完全控制；Users 仅读取+执行（否则普通用户无法运行 FDSensor.exe 或读 agent.toml，会报「拒绝访问」）
+  # SID: SYSTEM / Administrators full control; Users read+execute for binaries.
+  # agent.toml is tightened separately because it contains endpoint identity.
   & icacls.exe $Dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
 }
 
@@ -53,7 +54,22 @@ function Set-AgentTomlAcl {
   if (-not (Test-Path -LiteralPath $Path)) { return }
   # agent.toml contains endpoint identity and policy URLs. Keep it readable by
   # SYSTEM and elevated administrators, but do not inherit broad Users read ACLs.
+  try {
+    & takeown.exe /F $Path /A 2>$null | Out-Null
+  } catch {}
   & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+}
+
+function Repair-ExecutableAcl {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  try {
+    & takeown.exe /F $Path /A 2>$null | Out-Null
+  } catch {}
+  & icacls.exe $Path /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r "*S-1-5-32-545:RX" /C /Q | Out-Null
+  try {
+    Unblock-File -LiteralPath $Path -ErrorAction SilentlyContinue
+  } catch {}
 }
 
 if ($Action -eq "Remove") {
@@ -93,6 +109,7 @@ if ($HardenAcl) {
   Set-InstallDirAclHarden -Dir $instDir
   Set-AgentTomlAcl -Path $cfg
 }
+Repair-ExecutableAcl -Path $exe
 
 $argLine = '--config "' + $cfg + '"'
 $sta = New-ScheduledTaskAction -Execute $exe -Argument $argLine -WorkingDirectory $instDir

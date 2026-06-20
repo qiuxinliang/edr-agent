@@ -97,6 +97,25 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
 
+[UninstallDelete]
+Type: files; Name: "{app}\*.pid"
+Type: files; Name: "{app}\edr_queue.db*"
+Type: files; Name: "{app}\local_evidence_cache.db*"
+Type: files; Name: "{app}\command_state.jsonl*"
+Type: files; Name: "{app}\state\command_state.jsonl*"
+Type: filesandordirs; Name: "{app}\agent.toml"
+Type: filesandordirs; Name: "{app}\certs"
+Type: filesandordirs; Name: "{app}\queue"
+Type: filesandordirs; Name: "{app}\evidence"
+Type: filesandordirs; Name: "{app}\state"
+Type: filesandordirs; Name: "{app}\logs"
+Type: filesandordirs; Name: "{app}\forensic"
+Type: filesandordirs; Name: "{app}\isolation"
+Type: filesandordirs; Name: "{app}\diagnostics"
+Type: filesandordirs; Name: "{app}\upload_outbox"
+Type: filesandordirs; Name: "{commonappdata}\FDSecurity\setup-ui"
+Type: dirifempty; Name: "{commonappdata}\FDSecurity"
+
 [Code]
 var
   EnrollPage: TInputQueryWizardPage;
@@ -658,11 +677,16 @@ begin
     + '$app=''' + ExpandConstant('{app}') + ''';'
     + '$cfg=Join-Path $app ''agent.toml'';'
     + 'if(-not (Test-Path -LiteralPath $cfg)){throw ''agent.toml was not generated''};'
+    + '$takeown=Get-Command ''takeown.exe'' -ErrorAction SilentlyContinue;'
+    + 'if($takeown){try { & $takeown.Source /F $cfg /A | Out-Null } catch {}};'
+    + '$icacls=Get-Command ''icacls.exe'' -ErrorAction SilentlyContinue;'
+    + 'if($icacls){try { & $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null } catch {}};'
     + '$raw=[System.IO.File]::ReadAllText($cfg);'
     + '$appEsc=$app.Replace(''\'',''\\'');'
     + '$raw=$raw.Replace(''C:\\Program Files\\EDR Agent'',$appEsc).Replace(''C:\Program Files\EDR Agent'',$app);'
     + '$raw=$raw.Replace(''C:\\Program Files\\FDSecurity'',$appEsc).Replace(''C:\Program Files\FDSecurity'',$app);'
-    + '[System.IO.File]::WriteAllText($cfg,$raw)'
+    + '[System.IO.File]::WriteAllText($cfg,$raw);'
+    + 'if($icacls){try { & $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null } catch {}}'
     + '"';
 end;
 
@@ -758,8 +782,17 @@ begin
     + '$exe=' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}')) + ';'
     + '$cfg=' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ';'
     + '$wd=' + EdrPsSq(ExpandConstant('{app}')) + ';'
+    + '$takeown=Get-Command ''takeown.exe'' -ErrorAction SilentlyContinue;'
+    + '$icacls=Get-Command ''icacls.exe'' -ErrorAction SilentlyContinue;'
+    + 'function FixAcl{param($p,$cfgOnly) if(-not (Test-Path -LiteralPath $p)){L (''missing=''+$p);return};try{if($takeown){& $takeown.Source /F $p /A | Out-Null}}catch{L (''takeown_failed=''+$p+'' msg=''+$_.Exception.Message)};try{if($icacls){if($cfgOnly){& $icacls.Source $p /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null}else{& $icacls.Source $p /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /grant:r ''*S-1-5-32-545:RX'' /C /Q | Out-Null}}}catch{L (''icacls_failed=''+$p+'' msg=''+$_.Exception.Message)}};'
+    + 'FixAcl $exe $false;'
+    + 'FixAcl $cfg $true;'
+    + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
+    + 'try { L (''whoami=''+(& whoami.exe)) } catch {};'
+    + 'try { L (''exe_acl=''+((& icacls.exe $exe) -join '' | '')) } catch {};'
+    + 'try { L (''cfg_acl=''+((& icacls.exe $cfg) -join '' | '')) } catch {};'
     + 'Start-Sleep -Seconds 1;'
-    + 'try { Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; L ''Start-ScheduledTask invoked'' } catch { L (''Start-ScheduledTask error: ''+$_.Exception.Message) };'
+    + 'try { Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction Stop; L ''Start-ScheduledTask invoked'' } catch { L (''Start-ScheduledTask error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 3;'
     + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
     + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
@@ -768,6 +801,7 @@ begin
     + '};'
     + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
     + 'try { $task=Get-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($task){L (''task_state=''+$task.State)}; $info=Get-ScheduledTaskInfo -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($info){L (''task_last_result=''+$info.LastTaskResult)} } catch {};'
+    + 'if(-not (Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue)){L ''runtime_not_started''};'
     + 'exit 0'
     + '"';
 end;
@@ -776,9 +810,18 @@ function EdrStartManualPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$ErrorActionPreference=''SilentlyContinue'';'
+    + '$exe=' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}')) + ';'
+    + '$cfg=' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ';'
+    + '$takeown=Get-Command ''takeown.exe'' -ErrorAction SilentlyContinue;'
+    + '$icacls=Get-Command ''icacls.exe'' -ErrorAction SilentlyContinue;'
+    + 'try { if($takeown){& $takeown.Source /F $exe /A | Out-Null} } catch {};'
+    + 'try { if($icacls){& $icacls.Source $exe /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /grant:r ''*S-1-5-32-545:RX'' /C /Q | Out-Null} } catch {};'
+    + 'try { if($takeown){& $takeown.Source /F $cfg /A | Out-Null} } catch {};'
+    + 'try { if($icacls){& $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null} } catch {};'
+    + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
     + 'Start-Sleep -Seconds 1;'
-    + '$p=Start-Process -FilePath ' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}'))
-    + ' -ArgumentList @(''--config'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ')'
+    + '$p=Start-Process -FilePath $exe'
+    + ' -ArgumentList @(''--config'',$cfg)'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
     + ' -WindowStyle Hidden -PassThru;'
     + 'try { $p.PriorityClass = ''BelowNormal'' } catch {};'
@@ -795,6 +838,7 @@ begin
     + '};'
     + '$cfg=Join-Path $d ''agent.toml'';'
     + 'if(Test-Path -LiteralPath $cfg){'
+    + 'try { & takeown.exe /F $cfg /A | Out-Null } catch {};'
     + '& icacls.exe $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null'
     + '};'
     + 'exit 0'

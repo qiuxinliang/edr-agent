@@ -245,6 +245,27 @@ function Read-AgentTomlScalar {
   return ""
 }
 
+function Repair-AgentTomlAcl {
+  param([string]$Path)
+  if ((Get-EnrollOs) -ne "windows") { return }
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+  try {
+    $takeown = Get-Command "takeown.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($takeown) {
+      & $takeown.Source /F $Path /A 2>$null | Out-Null
+    }
+  } catch {
+    Write-Warning ("failed to take ownership of agent.toml: " + $_.Exception.Message)
+  }
+  $icacls = Get-Command "icacls.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $icacls) { return }
+  try {
+    & $icacls.Source $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+  } catch {
+    Write-Warning ("failed to repair agent.toml ACL: " + $_.Exception.Message)
+  }
+}
+
 $av = Resolve-AgentVersion
 Write-Host "Resolved agent_version=$av"
 if ($env:EDR_MAX_EVENT_QUEUE_SIZE) {
@@ -639,6 +660,7 @@ function Ensure-AgentCSR {
 
 Invoke-AgentPreflightIfNeeded
 
+Repair-AgentTomlAcl -Path $Output
 $existingEndpointId = Read-AgentTomlScalar -Path $Output -Key "endpoint_id"
 $existingTenantId = Read-AgentTomlScalar -Path $Output -Key "tenant_id"
 if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
@@ -933,19 +955,6 @@ function Write-PemNoBom([string]$Path, [string]$Text) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
   }
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text)
-}
-
-function Repair-AgentTomlAcl {
-  param([string]$Path)
-  if ((Get-EnrollOs) -ne "windows") { return }
-  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
-  $icacls = Get-Command "icacls.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $icacls) { return }
-  try {
-    & $icacls.Source $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
-  } catch {
-    Write-Warning ("failed to repair agent.toml ACL: " + $_.Exception.Message)
-  }
 }
 
 function Get-PemCertificateThumbprint([string]$PemText) {
