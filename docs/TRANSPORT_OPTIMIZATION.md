@@ -192,11 +192,13 @@ int ingest_http_post(const char *url, const uint8_t *data, size_t len) {
 | `EDR_HTTP_TLS_HANDSHAKE_BUDGET_PER_MIN` | 120 | 每分钟 TLS 新握手预算 |
 | `EDR_HTTP_CIRCUIT_FAILURES` | 3 | 连续关键失败后打开熔断 |
 | `EDR_HTTP_CIRCUIT_OPEN_S` | 60 | 熔断保持时间 |
+| `EDR_HTTP2_STREAM_RETRY_MS` | 300000 | HTTP/2 控制流失败后的重试冷却时间，避免反复 h2 探测造成短连接 |
+| `EDR_REPORT_EVENTS_V2_FALLBACK_JSON` | 0 | `report-events` protobuf 失败后是否回退 JSON 兼容格式；默认关闭以避免失败时双发 |
 | `EDR_PROXY_AUTH_BASIC` | 空 | 可选代理凭据，格式为 `user:password`；未配置时不发送认证头 |
 | `EDR_PROXY_AUTH_B64` | 空 | 可选代理凭据，已编码的 Basic token；优先级高于 `EDR_PROXY_AUTH_BASIC` |
 | `EDR_QUEUE_BUSY_TIMEOUT_MS` | 5000 | SQLite 队列 busy timeout |
-| `EDR_QUEUE_DRAIN_INTERVAL_MS` | 200 | SQLite 队列补报 worker 最小间隔 |
-| `EDR_QUEUE_DRAIN_MAX_ROWS` | 32 | 单轮最多补报行数 |
+| `EDR_QUEUE_DRAIN_INTERVAL_MS` | 1000 | SQLite 队列补报 worker 最小间隔 |
+| `EDR_QUEUE_DRAIN_MAX_ROWS` | 8 | 单轮最多补报行数 |
 
 ---
 

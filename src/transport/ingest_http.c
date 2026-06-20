@@ -164,6 +164,7 @@ static volatile int s_stream_ready;
 static int s_ws_started;
 static volatile int s_control_hello_ok;
 static int64_t s_control_hello_last_ms;
+static int64_t s_h2_stream_retry_after_ms;
 static int s_control_h2;
 static int s_control_zstd;
 static char s_route_bases[8][512];
@@ -2875,6 +2876,10 @@ static int curl_h2_multiplex_enabled(void) {
   return env_bool_default("EDR_HTTP2_MULTIPLEX", 1);
 }
 
+static int h2_stream_retry_cooldown_ms(void) {
+  return (int)env_ul_clamped("EDR_HTTP2_STREAM_RETRY_MS", 300000ul, 30000ul, 3600000ul);
+}
+
 static void curl_multi_sync_init(void) {
 #ifdef _WIN32
   if (!s_curl_multi_mu_init) {
@@ -4513,13 +4518,13 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       }
       s_report_events_v2_fail++;
       note_http_request_failure();
-      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 1)) {
+      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 0)) {
         log_native_post_failure("report-events-v2", v2rc);
         return -1;
       }
     } else {
       s_report_events_v2_fail++;
-      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 1)) {
+      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 0)) {
         runtime_failure("report-events-v2 envelope build failed");
         return -1;
       }
@@ -5363,7 +5368,7 @@ static void *control_ws_thread(void *arg)
     (void)edr_ingest_http_refresh_route_profile(0);
     (void)edr_ingest_http_control_hello_once();
 #ifdef EDR_HAVE_CURL_HTTP2
-    if (http2_client_enabled()) {
+    if (http2_client_enabled() && unix_ms_now() >= s_h2_stream_retry_after_ms) {
       char stream_url[1400];
       int h2rc;
       build_control_stream_url(stream_url, sizeof(stream_url));
@@ -5381,9 +5386,12 @@ static void *control_ws_thread(void *arg)
       note_control_stream_failure();
       snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "h2_failed");
       (void)route_note_failure("h2_stream_failed");
+      s_h2_stream_retry_after_ms = unix_ms_now() + (int64_t)h2_stream_retry_cooldown_ms();
       if (h2rc != -2 && s_long_poll_fallback_cfg && env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
         fprintf(stderr,
-                "[ingest-stream] HTTP/2 control stream unavailable; falling back to HTTP/1.1 stream\n");
+                "[ingest-stream] HTTP/2 control stream unavailable; falling back to HTTP/1.1 stream "
+                "(h2 retry cooldown=%dms)\n",
+                h2_stream_retry_cooldown_ms());
       } else if (h2rc != -2) {
         s_ws_backoff_ms = backoff_ms;
         sleep_poll_ms(backoff_ms);

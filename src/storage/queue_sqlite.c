@@ -93,7 +93,7 @@ static uint32_t retention_hours_effective(void) {
 
 static unsigned queue_drain_interval_ms(void) {
   const char *e = getenv("EDR_QUEUE_DRAIN_INTERVAL_MS");
-  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 200UL;
+  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 1000UL;
   if (v < 200UL) v = 200UL;
   if (v > 30000UL) v = 30000UL;
   return (unsigned)v;
@@ -109,7 +109,7 @@ static unsigned queue_circuit_backoff_ms(void) {
 
 static unsigned queue_drain_max_rows(void) {
   const char *e = getenv("EDR_QUEUE_DRAIN_MAX_ROWS");
-  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 32UL;
+  unsigned long v = e && e[0] ? strtoul(e, NULL, 10) : 8UL;
   if (v < 1UL) v = 1UL;
   if (v > 128UL) v = 128UL;
   return (unsigned)v;
