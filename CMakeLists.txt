@@ -550,6 +550,12 @@ endif()
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
 if(WIN32)
   set_target_properties(edr_agent PROPERTIES OUTPUT_NAME "FDSensor")
+  add_custom_command(TARGET edr_agent POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "$<TARGET_FILE:edr_agent>"
+      "$<TARGET_FILE_DIR:edr_agent>/edr_agent$<TARGET_FILE_SUFFIX:edr_agent>"
+    COMMENT "Creating legacy edr_agent.exe alias for CI/install compatibility"
+    VERBATIM)
 endif()
 
 target_include_directories(edr_agent PRIVATE
