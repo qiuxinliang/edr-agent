@@ -1,4 +1,4 @@
-EDR Agent End User License Agreement
+FDSecurity End User License Agreement
 
 This software is provided for authorized enterprise endpoint security use only.
 By installing this agent, you confirm that you are authorized to deploy it on

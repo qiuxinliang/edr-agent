@@ -1,7 +1,7 @@
 ; Inno Setup 6 — Windows x64 安装向导骨架（选项 B）。
-; 平台 setup_exe 默认对象键：installers/setup-exe/<os_type>/<agent_version>/EDRAgentSetup.exe
+; 平台 setup_exe 默认对象键：installers/setup-exe/<os_type>/<agent_version>/FDSecuritySetup.exe
 ; 本地编译示例（在 edr-agent 仓库根）：
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DEDR_AGENT_EXE=build\Release\edr_agent.exe /DMyAppVersion=1.0.1 install\windows-inno\EDRAgentSetup.iss
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DEDR_AGENT_EXE=build\Release\FDSensor.exe /DMyAppVersion=1.0.1 install\windows-inno\EDRAgentSetup.iss
 ;
 ; 静默 + 命令行注册（与向导页二选一；Token 会出现在进程命令行，见 docs/AGENT_INSTALLER.md）：
 ;   长参数：/EDR_API_BASE=... /EDR_ENROLL_TOKEN=...  可选 /EDR_INSECURE_TLS=1
@@ -9,11 +9,11 @@
 ;   示例：... /VERYSILENT /API=https://host:8080 /TOK=your-token
 ;   /MERGETASKS=enrollinsecure 与 /TLS=1 同类效果
 
-#define MyAppName "EDR Agent"
-#define MyAppPublisher "EDR"
-#define MyAppExeName "edr_agent.exe"
+#define MyAppName "FDSecurity"
+#define MyAppPublisher "FDSecurity"
+#define MyAppExeName "FDSensor.exe"
 #ifndef EDR_AGENT_EXE
-  #define EDR_AGENT_EXE "..\..\build\Release\edr_agent.exe"
+  #define EDR_AGENT_EXE "..\..\build\Release\FDSensor.exe"
 #endif
 #ifndef EDR_AGENT_TOML_EXAMPLE
   #define EDR_AGENT_TOML_EXAMPLE "..\..\agent.toml.example"
@@ -33,7 +33,7 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=Output
-OutputBaseFilename=EDRAgentSetup
+OutputBaseFilename=FDSecuritySetup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -49,7 +49,7 @@ Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin 
 
 [Files]
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
-; 与 edr_agent.exe 同目录：ONNX + vcpkg 运行时 DLL（发布 CI 在 ISCC 前 stage 到 build\Release\）
+; 与 FDSensor.exe 同目录：ONNX + vcpkg 运行时 DLL（发布 CI 在 ISCC 前 stage 到 build\Release\）
 Source: "..\..\build\Release\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; models\：与 config.c 中「exe 同目录\models」及 agent.toml.example [ave] 约定一致；占位文件便于空目录随包安装
 Source: "..\..\models\*"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -72,8 +72,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_install_wizard_enroll.ps1"" ""{tmp}\edr_wizard_enroll.json"" ""{app}\agent.toml"""; StatusMsg: "Registering with platform..."; Flags: waituntilterminated; Check: EnrollParamsFileExists
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$app='{app}'; $cfg=Join-Path $app 'agent.toml'; $ex=Join-Path $app 'agent.toml.example'; if (-not (Test-Path -LiteralPath $cfg)) {{ if (Test-Path -LiteralPath $ex) {{ Copy-Item -LiteralPath $ex -Destination $cfg -Force }} else {{ throw 'agent.toml was not generated and agent.toml.example is missing' }} }}; if (-not (Test-Path -LiteralPath $cfg)) {{ throw 'agent.toml was not generated' }}; $raw=[System.IO.File]::ReadAllText($cfg); $appEsc=$app.Replace('\','\\'); $raw=$raw.Replace('C:\\Program Files\\EDR Agent',$appEsc).Replace('C:\Program Files\EDR Agent',$app); [System.IO.File]::WriteAllText($cfg,$raw)"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start EDR Agent now (console window; skip if startup task is enabled)"; Flags: postinstall nowait skipifsilent; Check: ShouldPostinstallStartExe
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$app='{app}'; $cfg=Join-Path $app 'agent.toml'; $ex=Join-Path $app 'agent.toml.example'; if (-not (Test-Path -LiteralPath $cfg)) {{ if (Test-Path -LiteralPath $ex) {{ Copy-Item -LiteralPath $ex -Destination $cfg -Force }} else {{ throw 'agent.toml was not generated and agent.toml.example is missing' }} }}; if (-not (Test-Path -LiteralPath $cfg)) {{ throw 'agent.toml was not generated' }}; $raw=[System.IO.File]::ReadAllText($cfg); $appEsc=$app.Replace('\','\\'); $raw=$raw.Replace('C:\\Program Files\\EDR Agent',$appEsc).Replace('C:\Program Files\EDR Agent',$app).Replace('C:\\Program Files\\FDSecurity',$appEsc).Replace('C:\Program Files\FDSecurity',$app); [System.IO.File]::WriteAllText($cfg,$raw)"""; StatusMsg: "Ensuring agent.toml..."; Flags: runhidden waituntilterminated
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; WorkingDir: "{app}"; Description: "Start FDSecurity now (console window; skip if startup task is enabled)"; Flags: postinstall nowait skipifsilent; Check: ShouldPostinstallStartExe
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:AutorunInstallPsParameters}"; StatusMsg: "Configuring startup task..."; Flags: waituntilterminated; Check: ShouldInstallAutorun
 
 [UninstallRun]
@@ -218,8 +218,11 @@ begin
   SaveEnrollParamsFileIfNeeded;
   Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$d=''' + ExpandConstant('{app}') + ''';'
+    + 'Stop-Service -Name ''FDSecurityAgent'' -Force -ErrorAction SilentlyContinue;'
     + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Process -Name FDSensor -Force -ErrorAction SilentlyContinue;'
     + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
+    + 'Remove-Item -LiteralPath (Join-Path $d ''FDSensor.pid'') -Force -ErrorAction SilentlyContinue;'
     + 'Remove-Item -LiteralPath (Join-Path $d ''edr_agent.pid'') -Force -ErrorAction SilentlyContinue;'
     + 'Remove-Item -Path (Join-Path $d ''queue\edr_queue.db*'') -Force -ErrorAction SilentlyContinue;'
     + 'Remove-Item -Path (Join-Path $d ''evidence\local_evidence_cache.db*'') -Force -ErrorAction SilentlyContinue;'
@@ -233,7 +236,7 @@ begin
   EnrollPage := CreateInputQueryPage(wpWelcome,
     'Platform enrollment',
     'Enter your platform REST base URL and enrollment token. Your administrator issues the token after creating the endpoint.',
-    'When both fields are filled, the installer calls POST /api/v1/enroll and writes a complete agent.toml next to edr_agent.exe (bundled template + your server/tenant/endpoint). Leave both empty to skip and start from a copy of agent.toml.example instead.');
+    'When both fields are filled, the installer calls POST /api/v1/enroll and writes a complete agent.toml next to FDSensor.exe (bundled template + your server/tenant/endpoint). Leave both empty to skip and start from a copy of agent.toml.example instead.');
   EnrollPage.Add('Platform API base URL (example: https://platform.example:8080):', False);
   EnrollPage.Add('Enrollment token:', False);
   if EdrHasCmdlineEnroll then

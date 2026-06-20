@@ -1,5 +1,5 @@
-# 将 vcpkg x64-windows 的 bin\*.dll 复制到 build\Release\，与 edr_agent.exe 同目录分发。
-# 在 edr-agent 根目录、Release 已生成 edr_agent.exe 后执行。
+# 将 vcpkg x64-windows 的 bin\*.dll 复制到 build\Release\，与 FDSensor.exe 同目录分发。
+# 在 edr-agent 根目录、Release 已生成 FDSensor.exe 后执行。
 # 由 CI 在构建后调用；VCPKG_INSTALLED_X64 为 .../vcpkg_installed/x64-windows
 $ErrorActionPreference = "Stop"
 $V = $env:VCPKG_INSTALLED_X64
@@ -11,8 +11,10 @@ $bin = Join-Path $V "bin"
 $EdrRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $releaseDir = Join-Path $EdrRoot "build\Release"
 $singleConfigDir = Join-Path $EdrRoot "build"
-$releaseExe = Join-Path $releaseDir "edr_agent.exe"
-$singleConfigExe = Join-Path $singleConfigDir "edr_agent.exe"
+$releaseExe = Join-Path $releaseDir "FDSensor.exe"
+$singleConfigExe = Join-Path $singleConfigDir "FDSensor.exe"
+$legacyReleaseExe = Join-Path $releaseDir "edr_agent.exe"
+$legacySingleConfigExe = Join-Path $singleConfigDir "edr_agent.exe"
 if (-not (Test-Path -LiteralPath $bin)) {
   Write-Error "No bin: $bin"
   exit 1
@@ -22,10 +24,17 @@ if (-not (Test-Path -LiteralPath $releaseExe)) {
     New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
     Copy-Item -LiteralPath $singleConfigExe -Destination $releaseExe -Force
     Write-Host "Normalized Ninja single-config exe: $singleConfigExe -> $releaseExe"
+  } elseif (Test-Path -LiteralPath $legacyReleaseExe) {
+    Copy-Item -LiteralPath $legacyReleaseExe -Destination $releaseExe -Force
+    Write-Host "Created compatibility product exe: $legacyReleaseExe -> $releaseExe"
+  } elseif (Test-Path -LiteralPath $legacySingleConfigExe) {
+    New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+    Copy-Item -LiteralPath $legacySingleConfigExe -Destination $releaseExe -Force
+    Write-Host "Created compatibility product exe: $legacySingleConfigExe -> $releaseExe"
   }
 }
 if (-not (Test-Path -LiteralPath $releaseExe)) {
-  Write-Error "edr_agent.exe not found under build\Release or build (Ninja). Build first."
+  Write-Error "FDSensor.exe not found under build\Release or build (Ninja). Build first."
   exit 1
 }
 $n = 0

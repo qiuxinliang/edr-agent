@@ -1329,7 +1329,7 @@ static void quarantine_base_dir(char *out, size_t cap) {
     return;
   }
 #ifdef _WIN32
-  snprintf(out, cap, "%s", "C:\\Program Files\\EDR Agent\\quarantine");
+  snprintf(out, cap, "%s", "C:\\Program Files\\FDSecurity\\quarantine");
 #else
   snprintf(out, cap, "%s", "/tmp/edr_quarantine");
 #endif
@@ -2589,7 +2589,7 @@ static void upload_outbox_dir(char *out, size_t cap) {
     return;
   }
 #ifdef _WIN32
-  snprintf(out, cap, "%s", "C:\\Program Files\\EDR Agent\\upload_outbox");
+  snprintf(out, cap, "%s", "C:\\Program Files\\FDSecurity\\upload_outbox");
 #else
   snprintf(out, cap, "%s", "/tmp/edr_upload_outbox");
 #endif

@@ -23,7 +23,9 @@ print_build_fingerprint() {
 echo "=== CMake: EDR_WITH_GRPC=OFF ==="
 cmake -B build-nogrpc -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build-nogrpc -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-if [[ -f "$ROOT/build-nogrpc/edr_agent" ]]; then
+if [[ -f "$ROOT/build-nogrpc/FDSensor.exe" ]]; then
+  print_build_fingerprint "$ROOT/build-nogrpc/FDSensor.exe"
+elif [[ -f "$ROOT/build-nogrpc/edr_agent" ]]; then
   print_build_fingerprint "$ROOT/build-nogrpc/edr_agent"
 elif [[ -f "$ROOT/build-nogrpc/edr_agent.exe" ]]; then
   print_build_fingerprint "$ROOT/build-nogrpc/edr_agent.exe"
@@ -33,7 +35,9 @@ ctest --test-dir build-nogrpc --output-on-failure
 if cmake -B build-grpc -DCMAKE_BUILD_TYPE=Release 2>/dev/null; then
   echo "=== CMake: default (gRPC if found) ==="
   cmake --build build-grpc -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-  if [[ -f "$ROOT/build-grpc/edr_agent" ]]; then
+  if [[ -f "$ROOT/build-grpc/FDSensor.exe" ]]; then
+    print_build_fingerprint "$ROOT/build-grpc/FDSensor.exe"
+  elif [[ -f "$ROOT/build-grpc/edr_agent" ]]; then
     print_build_fingerprint "$ROOT/build-grpc/edr_agent"
   elif [[ -f "$ROOT/build-grpc/edr_agent.exe" ]]; then
     print_build_fingerprint "$ROOT/build-grpc/edr_agent.exe"

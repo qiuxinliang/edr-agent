@@ -3,21 +3,23 @@
   Builds the WebView2 product installer shell.
 
   The UI shell is intentionally separate from the Inno installer:
-  - edr_agent_setup_ui.exe renders the HTML-quality installer experience.
-  - edr_agent_setup.exe remains the authoritative elevated installer.
+  - FDSecuritySetupUI.exe renders the HTML-quality installer experience.
+  - FDSecuritySetup.exe remains the authoritative elevated installer.
 
   Example:
     .\install\windows-setup-ui\Build-SetupUi.ps1 `
-      -SetupExe .\edr_agent_setup.exe `
+      -SetupExe .\FDSecuritySetup.exe `
       -AppVersion 2.1.150 `
-      -OutputZip .\edr_agent_setup_ui.zip
+      -BootstrapTrustPublicKeyPem .\bootstrap_trust_public_key.pem `
+      -OutputZip .\FDSecuritySetupUI.zip
 #>
 param(
     [string] $SetupExe = "",
     [string] $AppVersion = "0.0.0",
     [string] $Configuration = "Release",
     [string] $OutputZip = "",
-    [string] $PreconfigJson = ""
+    [string] $PreconfigJson = "",
+    [string] $BootstrapTrustPublicKeyPem = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,13 +30,16 @@ if (-not (Test-Path -LiteralPath $project)) {
 }
 
 if (-not $SetupExe) {
-    $candidate = Join-Path (Join-Path $scriptDir "..\windows-inno\Output") "EDRAgentSetup-bundled.exe"
+    $candidate = Join-Path (Join-Path $scriptDir "..\windows-inno\Output") "FDSecuritySetup-bundled.exe"
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        $candidate = Join-Path (Join-Path $scriptDir "..\windows-inno\Output") "EDRAgentSetup-bundled.exe"
+    }
     if (Test-Path -LiteralPath $candidate) {
         $SetupExe = (Resolve-Path -LiteralPath $candidate).Path
     }
 }
 if (-not (Test-Path -LiteralPath $SetupExe)) {
-    throw "Missing setup exe. Pass -SetupExe or build install\windows-inno\Output\EDRAgentSetup-bundled.exe first."
+    throw "Missing setup exe. Pass -SetupExe or build install\windows-inno\Output\FDSecuritySetup-bundled.exe first."
 }
 
 function Get-FileSha256Hex([string] $Path) {
@@ -131,9 +136,9 @@ if (-not $publishDir) {
     throw "Publish directory not found. Checked: $($publishDirCandidates -join '; ')"
 }
 
-Copy-Item -LiteralPath $SetupExe -Destination (Join-Path $publishDir "edr_agent_setup.exe") -Force
-$uiExe = Join-Path $publishDir "edr_agent_setup_ui.exe"
-$bundledSetupExe = Join-Path $publishDir "edr_agent_setup.exe"
+Copy-Item -LiteralPath $SetupExe -Destination (Join-Path $publishDir "FDSecuritySetup.exe") -Force
+$uiExe = Join-Path $publishDir "FDSecuritySetupUI.exe"
+$bundledSetupExe = Join-Path $publishDir "FDSecuritySetup.exe"
 $uiSigned = Invoke-SignIfConfigured $uiExe
 $setupSigned = Invoke-SignIfConfigured $bundledSetupExe
 
@@ -144,6 +149,18 @@ if ($PreconfigJson) {
     Copy-Item -LiteralPath $PreconfigJson -Destination (Join-Path $publishDir "setup-preconfig.json") -Force
 }
 
+$bootstrapTrustPublicKey = ""
+if ($BootstrapTrustPublicKeyPem) {
+    if (-not (Test-Path -LiteralPath $BootstrapTrustPublicKeyPem)) {
+        throw "Missing bootstrap trust public key PEM: $BootstrapTrustPublicKeyPem"
+    }
+    $bootstrapTrustPublicKey = Get-Content -LiteralPath $BootstrapTrustPublicKeyPem -Raw -Encoding UTF8
+    if ($bootstrapTrustPublicKey -notmatch "-----BEGIN (RSA )?PUBLIC KEY-----") {
+        throw "Bootstrap trust public key must be a PEM public key, not a certificate or private key"
+    }
+    Copy-Item -LiteralPath $BootstrapTrustPublicKeyPem -Destination (Join-Path $publishDir "bootstrap_trust_public_key.pem") -Force
+}
+
 $versionFile = Join-Path (Resolve-Path (Join-Path $scriptDir "..\..")).Path "VERSION"
 if (Test-Path -LiteralPath $versionFile) {
     Copy-Item -LiteralPath $versionFile -Destination (Join-Path $publishDir "VERSION") -Force
@@ -152,15 +169,17 @@ if (Test-Path -LiteralPath $versionFile) {
 }
 
 $manifest = @{
-    name = "EDR Agent Setup UI"
+    name = "FDSecurity Setup UI"
     version = $AppVersion
-    setup_exe = "edr_agent_setup.exe"
-    ui_exe = "edr_agent_setup_ui.exe"
+    setup_exe = "FDSecuritySetup.exe"
+    ui_exe = "FDSecuritySetupUI.exe"
     setup_exe_sha256 = Get-FileSha256Hex $bundledSetupExe
     ui_exe_sha256 = Get-FileSha256Hex $uiExe
     setup_exe_signed = [bool]$setupSigned
     ui_exe_signed = [bool]$uiSigned
     preconfig_embedded = [bool]$PreconfigJson
+    bootstrap_trust_public_key_file = if ($bootstrapTrustPublicKey) { "bootstrap_trust_public_key.pem" } else { "" }
+    bootstrap_trust_public_key_pem = $bootstrapTrustPublicKey
     generated_at_utc = [DateTime]::UtcNow.ToString("o")
     dotnet_runtime = "Self-contained .NET Desktop runtime"
     webview2_runtime = "Evergreen runtime required; Windows 11 normally includes it"
@@ -168,7 +187,7 @@ $manifest = @{
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $publishDir "setup-ui-manifest.json") -Encoding UTF8
 
 if (-not $OutputZip) {
-    $OutputZip = Join-Path $scriptDir "Output\EDRAgentSetupUI-win-x64.zip"
+    $OutputZip = Join-Path $scriptDir "Output\FDSecuritySetupUI-win-x64.zip"
 }
 $outParent = Split-Path -Parent $OutputZip
 if ($outParent) {
@@ -187,8 +206,8 @@ $zipObj = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $
 try {
     $entries = $zipObj.Entries.FullName
     foreach ($required in @(
-        'edr_agent_setup_ui.exe',
-        'edr_agent_setup.exe',
+        'FDSecuritySetupUI.exe',
+        'FDSecuritySetup.exe',
         'Assets/installer.html',
         'setup-ui-manifest.json',
         'VERSION'
@@ -196,6 +215,11 @@ try {
         $pattern = [regex]::Escape($required).Replace('/', '[/\\]')
         if (-not ($entries -match "(^|[/\\])$pattern$")) {
             throw "Setup UI package missing required entry: $required"
+        }
+    }
+    if ($bootstrapTrustPublicKey) {
+        if (-not ($entries -match '(^|[/\\])bootstrap_trust_public_key\.pem$')) {
+            throw "Setup UI package missing required entry: bootstrap_trust_public_key.pem"
         }
     }
 }

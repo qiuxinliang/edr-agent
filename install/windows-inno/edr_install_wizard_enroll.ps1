@@ -2,7 +2,7 @@
 <#
   由 EDRAgentSetup.iss 的 [Run] 调用：读取向导写入的 JSON，调用同目录 edr_agent_install.ps1 完成 enroll。
   参数 1：JSON 路径（含 api_base、token、insecure_tls）
-  参数 2：输出的 agent.toml 绝对路径（安装器传 {app}\agent.toml，与 edr_agent.exe 同目录）
+  参数 2：输出的 agent.toml 绝对路径（安装器传 {app}\agent.toml，与 FDSensor.exe 同目录）
   参数 3：诊断目录（可选；用于写 enroll-output.log）
 #>
 param(
@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Path $DiagnosticsDir -Force | Out-Null
 $EnrollLogPath = Join-Path $DiagnosticsDir "enroll-output.log"
 [System.IO.File]::WriteAllText(
   ([System.IO.Path]::GetFullPath($EnrollLogPath)),
-  ("EDR Agent enroll stage log`r`ncreated_at={0:o}`r`n" -f (Get-Date).ToUniversalTime())
+  ("FDSecurity enroll stage log`r`ncreated_at={0:o}`r`n" -f (Get-Date).ToUniversalTime())
 )
 
 function Write-EnrollLog {
@@ -103,7 +103,15 @@ $keepOfflineQueue = ($j.keep_offline_queue -eq $true)
 $keepEvidenceCache = ($j.keep_evidence_cache -eq $true)
 $strictHealthCheck = ($j.strict_health_check -eq $true)
 $trustCa = ($j.trust_ca -eq $true)
-$keyProvider = if ($j.key_provider) { [string]$j.key_provider } else { "pem" }
+$keyProvider = if ($j.key_provider) { [string]$j.key_provider } else { "cng" }
+$bootstrapVerified = ($j.bootstrap_manifest_verified -eq $true)
+$bootstrapCaPem = if ($j.bootstrap_ca_pem) { [string]$j.bootstrap_ca_pem } else { "" }
+$bootstrapLeafSha256 = if ($j.bootstrap_tls_leaf_sha256) { [string]$j.bootstrap_tls_leaf_sha256 } else { "" }
+$bootstrapKeyID = if ($j.bootstrap_manifest_key_id) { [string]$j.bootstrap_manifest_key_id } else { "" }
+if (($bootstrapCaPem -or $bootstrapLeafSha256) -and -not $bootstrapVerified) {
+  Write-EnrollLog "ERROR bootstrap TLS material was provided without verified manifest"
+  Write-Error "bootstrap TLS material requires bootstrap_manifest_verified=true"
+}
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $installer = Join-Path $here "edr_agent_install.ps1"
@@ -113,6 +121,14 @@ if (-not (Test-Path -LiteralPath $installer)) {
 }
 
 $installDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($OutToml))
+$bootstrapCaPath = ""
+if ($bootstrapCaPem) {
+  $certDir = Join-Path $installDir "certs"
+  New-Item -ItemType Directory -Path $certDir -Force | Out-Null
+  $bootstrapCaPath = Join-Path $certDir "bootstrap-ca.pem"
+  $bootstrapCaText = $bootstrapCaPem.Replace("`r`n", "`n").Replace("\r\n", "`n").Replace("\n", "`n")
+  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($bootstrapCaPath)), $bootstrapCaText)
+}
 $installerArgs = @(
   "-Output", $OutToml,
   "-UseTemplateToml",
@@ -138,6 +154,18 @@ if ($relayUrl) {
 } else {
   Remove-Item Env:EDR_RELAY_URL -ErrorAction SilentlyContinue
 }
+if ($bootstrapCaPath) {
+  $env:EDR_BOOTSTRAP_CA_CERT = $bootstrapCaPath
+  $installerArgs += @("-BootstrapCaCertPath", $bootstrapCaPath)
+} else {
+  Remove-Item Env:EDR_BOOTSTRAP_CA_CERT -ErrorAction SilentlyContinue
+}
+if ($bootstrapLeafSha256) {
+  $env:EDR_BOOTSTRAP_TLS_LEAF_SHA256 = $bootstrapLeafSha256
+  $installerArgs += @("-BootstrapTlsLeafSha256", $bootstrapLeafSha256)
+} else {
+  Remove-Item Env:EDR_BOOTSTRAP_TLS_LEAF_SHA256 -ErrorAction SilentlyContinue
+}
 
 if ($healthReport) {
   $installerArgs += @("-HealthReportPath", $healthReport)
@@ -155,6 +183,9 @@ Write-EnrollLog ("api_base={0}" -f (Get-RedactedUrl $env:EDR_API_BASE))
 Write-EnrollLog ("proxy_mode={0} proxy_url={1}" -f $proxyMode, (Get-RedactedUrl $proxyUrl))
 Write-EnrollLog ("relay_url={0}" -f (Get-RedactedUrl $relayUrl))
 Write-EnrollLog ("key_provider={0} trust_ca={1} insecure_tls={2}" -f $keyProvider, $trustCa, ($j.insecure_tls -eq $true))
+if ($bootstrapVerified) {
+  Write-EnrollLog ("bootstrap_manifest_verified=true key_id={0} ca_path={1} leaf_pin={2}" -f $bootstrapKeyID, $bootstrapCaPath, [bool]$bootstrapLeafSha256)
+}
 
 $ps = Get-Command "powershell.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 $psExe = if ($ps) { $ps.Source } else { "powershell.exe" }

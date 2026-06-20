@@ -42,16 +42,21 @@ static void edr_on_sigint(int s) {
 static EdrAgent *g_agent_for_ctrl;
 static SERVICE_STATUS_HANDLE g_service_status_handle;
 static SERVICE_STATUS g_service_status;
-static const char *g_service_name = "EdrAgent";
+static const char *g_service_name = "FDSecurityAgent";
 static const char *g_service_config_path;
 
 static const char *edr_default_windows_config_path(void) {
-  static const char path[] = "C:\\Program Files\\EDR Agent\\agent.toml";
+  static const char path[] = "C:\\Program Files\\FDSecurity\\agent.toml";
+  static const char legacy_path[] = "C:\\Program Files\\EDR Agent\\agent.toml";
   DWORD attrs = GetFileAttributesA(path);
-  if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-    return NULL;
+  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    return path;
   }
-  return path;
+  attrs = GetFileAttributesA(legacy_path);
+  if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    return legacy_path;
+  }
+  return NULL;
 }
 
 static BOOL WINAPI edr_on_console_ctrl(DWORD t) {
@@ -314,7 +319,7 @@ static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
   install_dir = (opt->install_dir && opt->install_dir[0]) ? opt->install_dir : exe_dir;
   if (!edr_win_find_packaged_file(script, sizeof(script), exe_dir, "edr_agent_install.ps1")) {
     fprintf(stderr,
-            "[install] edr_agent_install.ps1 not found beside edr_agent.exe or under scripts\\\n");
+            "[install] edr_agent_install.ps1 not found beside FDSensor.exe or under scripts\\\n");
     return 1;
   }
   if (opt->output && opt->output[0]) {
@@ -337,8 +342,8 @@ static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
     fprintf(stderr, "[install] cannot compose CA certificate path\n");
     return 1;
   }
-  if (!edr_win_join_path(exe_path, sizeof(exe_path), install_dir, "edr_agent.exe")) {
-    fprintf(stderr, "[install] cannot compose edr_agent.exe path\n");
+  if (!edr_win_join_path(exe_path, sizeof(exe_path), install_dir, "FDSensor.exe")) {
+    fprintf(stderr, "[install] cannot compose FDSensor.exe path\n");
     return 1;
   }
 
@@ -376,14 +381,14 @@ static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
     return rc;
   }
   if (!opt->install_service) {
-    fprintf(stderr, "[install] completed. Start with: edr_agent.exe --config \"%s\"\n", output);
+    fprintf(stderr, "[install] completed. Start with: FDSensor.exe --config \"%s\"\n", output);
     return 0;
   }
 
   if (!edr_win_find_packaged_file(service_script, sizeof(service_script), exe_dir,
                                   "windows_service_install.ps1")) {
     fprintf(stderr,
-            "[install] windows_service_install.ps1 not found beside edr_agent.exe or under scripts\\\n");
+            "[install] windows_service_install.ps1 not found beside FDSensor.exe or under scripts\\\n");
     return 1;
   }
   cmd[0] = '\0';
@@ -425,8 +430,8 @@ static void print_usage(const char *argv0) {
           "[--trust-ca] [--install-autorun|--install-service] [--force-enroll]\n",
           argv0);
   fprintf(stderr,
-          "  EDR Agent — 端点实现（初版：采集/预处理/批次/gRPC/指令/AVE 等已接通，见 README「实现状态快照」；"
-          "设计见 ../Cauld Design/EDR_端点详细设计_v1.0.md）\n");
+          "  FDSecurity Sensor - endpoint runtime "
+          "(collection/preprocess/batch/HTTP control/RTR/RTQ/AVE paths enabled)\n");
 }
 
 #ifdef _WIN32
@@ -475,7 +480,7 @@ static int edr_agent_run_main(const char *config) {
       if (!edr_path_is_absolute_win(qpath)) {
         char fallback[MAX_PATH * 4];
         snprintf(fallback, sizeof(fallback), "%s",
-                 "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db");
+                 "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db");
         edr_ensure_parent_dirs_win(fallback);
         sq = edr_storage_queue_open(fallback);
         if (sq == EDR_OK) {
@@ -511,7 +516,7 @@ static int edr_agent_run_main(const char *config) {
       if (epath && epath[0] && !edr_path_is_absolute_win(epath)) {
         char fallback[MAX_PATH * 4];
         snprintf(fallback, sizeof(fallback), "%s",
-                 "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db");
+                 "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db");
         edr_ensure_parent_dirs_win(fallback);
         if (edr_local_evidence_cache_open(fallback,
                                           ac ? ac->offline.evidence_cache_max_size_mb : 128u,

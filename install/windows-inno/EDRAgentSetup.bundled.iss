@@ -1,4 +1,4 @@
-; EDR Agent — 完整/本地暂存版安装脚本（Inno 6, x64）
+; FDSecurity — 完整/本地暂存版安装脚本（Inno 6, x64）
 ; 与 EDRAgentSetup.iss 行为一致（注册/开机任务等），但主程序与 DLL 来自**单独目录**（如 CI/本机
 ; 输出目录 monorepo\edr-agent-win_2-2），并打齐：models、agent_preprocess 规则、脚本、data 说明。
 ;
@@ -13,9 +13,12 @@
 ; 说明: ONNX .onnx 应事先放入 edr-agent\models\（本仓库内 models 常仅含 README，需从流水线复制）；
 ; 证书/IOC 等 SQLite 为可选，若 agent.toml 未指路径可不带库文件；{app}\data\README_OPTIONAL_DBS.txt 有说明。
 
-#define MyAppName "EDR Agent"
-#define MyAppPublisher "EDR"
-#define MyAppExeName "edr_agent.exe"
+#define MyAppName "FDSecurity"
+#define MyAppPublisher "FDSecurity"
+#define MyAppExeName "FDSensor.exe"
+#define MyServiceName "FDSecurityAgent"
+#define MyLegacyServiceName "EdrAgent"
+#define MyLegacyProcessName "edr_agent"
 ; 与 build\Release\ 相对位置不同：指向 monorepo 根下 edr-agent-win_2-2
 #ifndef EDR_BIN_DIR
   #define EDR_BIN_DIR "..\..\..\edr-agent-win_2-2"
@@ -48,7 +51,7 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=Output
-OutputBaseFilename=EDRAgentSetup-bundled
+OutputBaseFilename=FDSecuritySetup-bundled
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -67,7 +70,7 @@ Name: "keepevidencecache"; Description: "Keep existing local evidence cache duri
 Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fails"; GroupDescription: "Validation:"; Flags: unchecked
 
 [Files]
-Source: "{#EDR_BIN_DIR}\edr_agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
@@ -331,6 +334,7 @@ begin
     + Chr(34) + 'proxy_mode' + Chr(34) + ':' + JsonEscape(ProxyMode) + ','
     + Chr(34) + 'proxy_url' + Chr(34) + ':' + JsonEscape(ProxyUrl) + ','
     + Chr(34) + 'relay_url' + Chr(34) + ':' + JsonEscape(RelayUrl) + ','
+    + Chr(34) + 'key_provider' + Chr(34) + ':' + JsonEscape('cng') + ','
     + Chr(34) + 'keep_offline_queue' + Chr(34) + ':' + EdrBoolJson(KeepQueue) + ','
     + Chr(34) + 'keep_evidence_cache' + Chr(34) + ':' + EdrBoolJson(KeepEvidence) + ','
     + Chr(34) + 'strict_health_check' + Chr(34) + ':' + EdrBoolJson(StrictHealth) + ','
@@ -351,8 +355,11 @@ begin
   SaveEnrollParamsFileIfNeeded;
   Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$d=''' + ExpandConstant('{app}') + ''';'
-    + 'Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue;'
-    + 'Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Service -Name ''{#MyServiceName}'' -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Service -Name ''{#MyLegacyServiceName}'' -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Process -Name ''FDSensor'' -Force -ErrorAction SilentlyContinue;'
+    + 'Stop-Process -Name ''{#MyLegacyProcessName}'' -Force -ErrorAction SilentlyContinue;'
+    + 'Remove-Item -LiteralPath (Join-Path $d ''FDSensor.pid'') -Force -ErrorAction SilentlyContinue;'
     + 'Remove-Item -LiteralPath (Join-Path $d ''edr_agent.pid'') -Force -ErrorAction SilentlyContinue;'
     + '"';
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
@@ -369,8 +376,8 @@ begin
   DiagnosticsPath := DiagnosticsPath + '\diagnostics';
 
   Result :=
-    'EDR Agent setup will run the following controlled stages:' + #13#10 + #13#10 +
-    '  01  Stop old EDR Agent process and service' + #13#10 +
+    'FDSecurity setup will run the following controlled stages:' + #13#10 + #13#10 +
+    '  01  Stop old FDSecurity process and legacy runtime' + #13#10 +
     '  02  Clean runtime cache and stale queue locks' + #13#10 +
     '  03  Enroll endpoint and write agent.toml' + #13#10 +
     '  04  Validate and normalize configuration paths' + #13#10 +
@@ -416,7 +423,7 @@ begin
     'Review the controlled installation stages before setup changes the endpoint.',
     EdrDeploymentPlanText);
 
-  EdrProgressPage := CreateOutputProgressPage('Installing EDR Agent', 'Preparing controlled deployment...');
+  EdrProgressPage := CreateOutputProgressPage('Installing FDSecurity', 'Preparing controlled deployment...');
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
@@ -499,7 +506,7 @@ begin
     CreateDir(EdrDiagnosticsDir);
   EdrDiagnosticsBundle := ExpandConstant('{app}\install-diagnostics.zip');
   EdrStageLog := EdrDiagnosticsDir + '\install-stage.log';
-  SaveStringToFile(EdrStageLog, 'EDR Agent setup diagnostics' + #13#10, False);
+  SaveStringToFile(EdrStageLog, 'FDSecurity setup diagnostics' + #13#10, False);
   EdrAppendStageLog('diagnostics_dir=' + EdrDiagnosticsDir);
 end;
 
@@ -535,7 +542,7 @@ begin
   EdrInstallFailed := True;
   EdrCreateDiagnosticsBundle;
   EdrProgressPage.Hide;
-  Msg := 'EDR Agent setup failed.' + #13#10 + #13#10
+  Msg := 'FDSecurity setup failed.' + #13#10 + #13#10
     + 'Stage: ' + EdrCurrentStage + #13#10
     + 'Reason: ' + EdrFailureReason + #13#10 + #13#10
     + 'Diagnostics bundle:' + #13#10 + EdrDiagnosticsBundle + #13#10 + #13#10
@@ -618,9 +625,12 @@ function EdrStopRuntimePsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$ErrorActionPreference=''SilentlyContinue'';'
-    + 'try { $svc=Get-Service -Name ''EdrAgent'' -ErrorAction SilentlyContinue; if($svc -and $svc.Status -ne ''Stopped''){Stop-Service -Name ''EdrAgent'' -Force -ErrorAction SilentlyContinue} } catch {};'
-    + 'try { Get-Process -Name ''edr_agent'' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {};'
+    + 'try { $svc=Get-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($svc -and $svc.Status -ne ''Stopped''){Stop-Service -Name ''{#MyServiceName}'' -Force -ErrorAction SilentlyContinue} } catch {};'
+    + 'try { $svc=Get-Service -Name ''{#MyLegacyServiceName}'' -ErrorAction SilentlyContinue; if($svc -and $svc.Status -ne ''Stopped''){Stop-Service -Name ''{#MyLegacyServiceName}'' -Force -ErrorAction SilentlyContinue} } catch {};'
+    + 'try { Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {};'
+    + 'try { Get-Process -Name ''{#MyLegacyProcessName}'' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {};'
     + 'try { Remove-Item -LiteralPath ' + EdrPsSq(ExpandConstant('{app}\edr_agent.pid')) + ' -Force -ErrorAction SilentlyContinue } catch {};'
+    + 'try { Remove-Item -LiteralPath ' + EdrPsSq(ExpandConstant('{app}\FDSensor.pid')) + ' -Force -ErrorAction SilentlyContinue } catch {};'
     + 'exit 0'
     + '"';
 end;
@@ -649,12 +659,11 @@ begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$app=''' + ExpandConstant('{app}') + ''';'
     + '$cfg=Join-Path $app ''agent.toml'';'
-    + '$ex=Join-Path $app ''agent.toml.example'';'
-    + 'if(-not (Test-Path -LiteralPath $cfg)){if(Test-Path -LiteralPath $ex){Copy-Item -LiteralPath $ex -Destination $cfg -Force}else{throw ''agent.toml was not generated and agent.toml.example is missing''}};'
     + 'if(-not (Test-Path -LiteralPath $cfg)){throw ''agent.toml was not generated''};'
     + '$raw=[System.IO.File]::ReadAllText($cfg);'
     + '$appEsc=$app.Replace(''\'',''\\'');'
     + '$raw=$raw.Replace(''C:\\Program Files\\EDR Agent'',$appEsc).Replace(''C:\Program Files\EDR Agent'',$app);'
+    + '$raw=$raw.Replace(''C:\\Program Files\\FDSecurity'',$appEsc).Replace(''C:\Program Files\FDSecurity'',$app);'
     + '[System.IO.File]::WriteAllText($cfg,$raw)'
     + '"';
 end;
@@ -712,6 +721,8 @@ begin
   Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\windows_service_install.ps1') + '"'
     + ' -Action Install'
     + ' -ExePath "' + ExpandConstant('{app}\{#MyAppExeName}') + '"'
+    + ' -ServiceName "{#MyServiceName}"'
+    + ' -DisplayName "FDSecurity Endpoint Agent"'
     + ' -ConfigPath "' + ExpandConstant('{app}\agent.toml') + '"'
     + ' -InstallDir "' + ExpandConstant('{app}') + '"'
     + ' -DataDir "' + ExpandConstant('{app}') + '"'
@@ -727,9 +738,9 @@ function EdrStartServicePsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + 'Start-Sleep -Seconds 2;'
-    + 'Start-Service -Name ''EdrAgent'' -ErrorAction SilentlyContinue;'
+    + 'Start-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue;'
     + 'Start-Sleep -Seconds 2;'
-    + 'Get-Process -Name ''edr_agent'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
+    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
     + '"';
 end;
 
@@ -737,9 +748,9 @@ function EdrStartScheduledTaskPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + 'Start-Sleep -Seconds 2;'
-    + 'Start-ScheduledTask -TaskName ''EdrAgent'' -ErrorAction SilentlyContinue;'
+    + 'Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue;'
     + 'Start-Sleep -Seconds 2;'
-    + 'Get-Process -Name ''edr_agent'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
+    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
     + '"';
 end;
 
@@ -799,12 +810,12 @@ begin
 
   if WizardIsTaskSelected('windowsservice') then
   begin
-    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing native Windows service for EDR Agent.', WindowsServiceInstallPsParameters(''), True) then
+    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing native Windows service for FDSecurity.', WindowsServiceInstallPsParameters(''), True) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('windowsautorun') then
   begin
-    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for EDR Agent.', AutorunInstallPsParameters(''), True) then
+    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for FDSecurity.', AutorunInstallPsParameters(''), True) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('hardeninstalldir') then
@@ -817,17 +828,17 @@ begin
 
   if WizardIsTaskSelected('windowsservice') then
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent Windows service.', EdrStartServicePsParameters, False) then
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrStartServicePsParameters, False) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('windowsautorun') then
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting EdrAgent scheduled task.', EdrStartScheduledTaskPsParameters, False) then
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent scheduled task.', EdrStartScheduledTaskPsParameters, False) then
       EdrAbortInstall;
   end
   else
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting edr_agent.exe with generated agent.toml.', EdrStartManualPsParameters, False) then
+    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrStartManualPsParameters, False) then
       EdrAbortInstall;
   end;
 
@@ -867,9 +878,9 @@ begin
   begin
     S := RawHealthReport;
     if (Pos('"status":"ok"', S) > 0) or (Pos('"status": "ok"', S) > 0) then
-      WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed and bootstrap checks passed'
+      WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed and bootstrap checks passed'
     else
-      WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed; review bootstrap health report';
+      WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed; review bootstrap health report';
     Msg := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
       + 'Health report: ' + HealthReport + #13#10
       + 'Preflight report: ' + PreflightReport + #13#10
@@ -879,7 +890,7 @@ begin
   end
   else if AgentTomlExistsForRun then
   begin
-    WizardForm.FinishedHeadingLabel.Caption := 'EDR Agent installed';
+    WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed';
     WizardForm.FinishedLabel.Caption := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
       + 'No bootstrap health report was generated. Check enrollment settings if the agent cannot connect.' + #13#10
       + 'Diagnostics directory: ' + EdrDiagnosticsDir;

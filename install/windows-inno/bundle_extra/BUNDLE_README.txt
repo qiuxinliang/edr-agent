@@ -1,4 +1,4 @@
-EDR Agent — 本 zip / Inno 完整负载说明（与 package_bundled_layout.sh / EDRAgentSetup.bundled.iss 一致）
+FDSecurity — 本 zip / Inno 完整负载说明（与 package_bundled_layout.sh / EDRAgentSetup.bundled.iss 一致）
 ================================================================================
 
 一、本包意图：覆盖「标准 Windows 端点」全部核心能力
@@ -25,7 +25,7 @@ EDR Agent — 本 zip / Inno 完整负载说明（与 package_bundled_layout.sh 
 三、打包容器自检（发布前在构建机执行）
 ------------------------------------
   • models\ 下应至少包含 behavior.onnx 及用于静态推理的另一 .onnx（常见名 static.onnx；以引擎逻辑为准）
-  • 与 edr_agent.exe 同目录应含完整运行时 DLL（与 CMake/vcpkg 实际链接一致，不仅 onnxruntime/libcurl）
+  • 与 FDSensor.exe 同目录应含完整运行时 DLL（与 CMake/vcpkg 实际链接一致，不仅 onnxruntime/libcurl）
   • 从 agent.toml.example 复制为 agent.toml 后按环境填写 [server] / 平台相关段
 
 四、与「仅 GitHub Release exe+DLL zip」的区别

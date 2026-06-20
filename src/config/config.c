@@ -1612,7 +1612,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 #ifdef _WIN32
   /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s",
-           "C:\\Program Files\\EDR Agent\\models");
+           "C:\\Program Files\\FDSecurity\\models");
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
@@ -1644,7 +1644,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 
 #ifdef _WIN32
   snprintf(cfg->offline.queue_db_path, sizeof(cfg->offline.queue_db_path), "%s",
-           "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db");
+           "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db");
 #else
   snprintf(cfg->offline.queue_db_path, sizeof(cfg->offline.queue_db_path), "%s",
            "edr_queue.db");
@@ -1653,7 +1653,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->offline.retention_hours = 72u;
 #ifdef _WIN32
   snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
-           "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db");
+           "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db");
 #else
   snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
            "local_evidence_cache.db");
@@ -1680,7 +1680,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
 #ifdef _WIN32
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s",
-           "C:\\Program Files\\EDR Agent\\logs");
+           "C:\\Program Files\\FDSecurity\\logs");
 #else
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s", "/var/log/edr");
 #endif

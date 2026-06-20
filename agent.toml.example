@@ -14,9 +14,9 @@ address              = ""
 grpc_enabled         = false
 # Plaintext legacy gRPC; 仅旧链路联调使用，生产保持 false。
 grpc_insecure        = false
-ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
-client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
-client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
+ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
+client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
 client_key_provider  = "pem" # pem | cng | tpm | pkcs11
 client_cert_store    = ""
 client_cert_thumbprint = ""
@@ -169,7 +169,7 @@ management_tools = "anydesk,teamviewer,rustdesk,screenconnect,connectwise,splash
 #   macOS/Linux:  /…/AI Agent/model/releases/20260418_053704_UTC
 #   Windows:      C:/…/AI Agent/model/releases/20260418_053704_UTC
 # Windows 默认发布布局：所有运行时数据与模型均放在安装目录下。
-model_dir            = "C:\\Program Files\\EDR Agent\\models"
+model_dir            = "C:\\Program Files\\FDSecurity\\models"
 scan_threads         = 2
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
@@ -201,10 +201,10 @@ max_upload_mbps      = 1
 
 # 须与 EDR_PERSIST_STRATEGY / EDR_PERSIST_QUEUE / EDR_QUEUE_* 一起理解，见 docs/WP7_OFFLINE_QUEUE_RETRY.md
 [offline]
-queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
+queue_db_path        = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db"
 max_queue_size_mb    = 512
 retention_hours      = 72
-evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db"
+evidence_cache_path  = "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db"
 evidence_cache_max_size_mb = 128
 evidence_cache_retention_hours = 72
 
@@ -221,7 +221,7 @@ low_priority_keep_percent_under_pressure = 5
 
 [logging]
 level                = "info"
-log_dir              = "C:\\Program Files\\EDR Agent\\logs"
+log_dir              = "C:\\Program Files\\FDSecurity\\logs"
 max_log_size_mb      = 100
 max_log_files        = 10
 
@@ -229,7 +229,7 @@ max_log_files        = 10
 # [command]
 # allow_dangerous      = false
 # allow_rtq_readonly   = true
-# signing_public_key_path = "C:\\Program Files\\EDR Agent\\certs\\command-signing.pub.pem"
+# signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
 
 # §9 自保护：防调试、事件总线背压告警、可选 Windows Job Object
 # [self_protect]

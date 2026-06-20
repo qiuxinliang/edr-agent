@@ -118,7 +118,7 @@ static void state_default_path(char *out, size_t cap) {
     return;
   }
 #ifdef _WIN32
-  snprintf(out, cap, "%s", "C:\\Program Files\\EDR Agent\\state\\command_state.jsonl");
+  snprintf(out, cap, "%s", "C:\\Program Files\\FDSecurity\\state\\command_state.jsonl");
 #else
   snprintf(out, cap, "%s", "/tmp/edr_command_state.jsonl");
 #endif

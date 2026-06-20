@@ -22,16 +22,20 @@ mkdir -p "$OUT_DIR/models" "$OUT_DIR/data"
 
 if [[ ! -d "$STAGE_DIR" ]]; then
   echo "Error: STAGE_DIR not found: $STAGE_DIR" >&2
-  echo "Set EDR_BIN_DIR to your folder with edr_agent.exe and .dll" >&2
+  echo "Set EDR_BIN_DIR to your folder with FDSensor.exe and .dll" >&2
   exit 1
 fi
-if [[ ! -f "$STAGE_DIR/edr_agent.exe" ]]; then
-  echo "Error: missing: $STAGE_DIR/edr_agent.exe" >&2
+if [[ -f "$STAGE_DIR/FDSensor.exe" ]]; then
+  AGENT_EXE="$STAGE_DIR/FDSensor.exe"
+elif [[ -f "$STAGE_DIR/edr_agent.exe" ]]; then
+  AGENT_EXE="$STAGE_DIR/edr_agent.exe"
+else
+  echo "Error: missing: $STAGE_DIR/FDSensor.exe" >&2
   exit 1
 fi
 
 # --- Binaries (Inno EDR_BIN_DIR) ---
-cp -a "$STAGE_DIR/edr_agent.exe" "$OUT_DIR/"
+cp -a "$AGENT_EXE" "$OUT_DIR/FDSensor.exe"
 shopt -s nullglob
 DLL_COUNT=0
 for f in "$STAGE_DIR"/*.dll; do
@@ -40,7 +44,7 @@ for f in "$STAGE_DIR"/*.dll; do
 done
 shopt -u nullglob
 if [[ "$DLL_COUNT" -lt 1 ]]; then
-  echo "Warning: no .dll next to edr_agent.exe; Windows runtime will not start." >&2
+  echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start." >&2
 fi
 
 # models: recursive (onnx, pca_*.npy, etc.)

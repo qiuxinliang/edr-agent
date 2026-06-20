@@ -9,7 +9,7 @@
   JSON report consumed by the Inno installer summary/diagnostics bundle.
 #>
 param(
-  [string]$InstallDir = $(if ($env:EDR_INSTALL_DIR) { $env:EDR_INSTALL_DIR } else { "C:\Program Files\EDR Agent" }),
+  [string]$InstallDir = $(if ($env:EDR_INSTALL_DIR) { $env:EDR_INSTALL_DIR } else { "C:\Program Files\FDSecurity" }),
   [string]$ConfigPath = "",
   [string]$ReportPath = "",
   [int]$PolicyTimeoutSec = 8
@@ -223,16 +223,23 @@ if ($runtimePolicyUrl) {
 }
 $checks.Add((New-Check -Name "runtime_policy_pull" -Status $policyStatus -Message $policyMessage)) | Out-Null
 
-$procCount = @((Get-Process -Name "edr_agent" -ErrorAction SilentlyContinue)).Count
+$procCount = 0
+foreach ($procName in @("FDSensor", "edr_agent")) {
+  $procCount += @((Get-Process -Name $procName -ErrorAction SilentlyContinue)).Count
+}
 $taskState = ""
 $serviceState = ""
 try {
-  $task = Get-ScheduledTask -TaskName "EdrAgent" -ErrorAction SilentlyContinue
-  if ($task) { $taskState = [string]$task.State }
+  foreach ($taskName in @("FDSecurityAgent", "EdrAgent")) {
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) { $taskState = [string]$task.State; break }
+  }
 } catch {}
 try {
-  $svc = Get-Service -Name "EdrAgent" -ErrorAction SilentlyContinue
-  if ($svc) { $serviceState = [string]$svc.Status }
+  foreach ($svcName in @("FDSecurityAgent", "EdrAgent")) {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($svc) { $serviceState = [string]$svc.Status; break }
+  }
 } catch {}
 $runtimeOk = ($procCount -gt 0 -or $taskState -or $serviceState)
 $runtimeMsg = "process_count=$procCount"

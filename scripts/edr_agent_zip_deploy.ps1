@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Copy an unpacked Windows zip package into the install directory and run edr_agent.exe --install.
+  Copy an unpacked Windows zip package into the install directory and run FDSensor.exe --install.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\scripts\edr_agent_zip_deploy.ps1 `
@@ -12,10 +12,10 @@ param(
   [string]$ApiBase,
   [Parameter(Mandatory = $true)]
   [string]$EnrollToken,
-  [string]$InstallDir = "C:\Program Files\EDR Agent",
+  [string]$InstallDir = "C:\Program Files\FDSecurity",
   [ValidateSet("service", "autorun", "none")]
   [string]$RuntimeMode = "service",
-  [string]$ServiceName = "EdrAgent",
+  [string]$ServiceName = "FDSecurityAgent",
   [switch]$TrustCa,
   [switch]$ForceEnroll,
   [switch]$EnableResponseActions,
@@ -90,6 +90,7 @@ if (-not $SkipPreflight) {
     }
   } else {
     Write-Warning "edr_agent_preflight.ps1 not found; falling back to built-in runtime stop"
+    Stop-Process -Name FDSensor -Force -ErrorAction SilentlyContinue
     Stop-Process -Name edr_agent -Force -ErrorAction SilentlyContinue
   }
 }
@@ -107,11 +108,20 @@ if (-not $NoCopy -and ($rootFull -ine $installFull)) {
   }
 }
 
-$exe = Join-Path $InstallDir "edr_agent.exe"
+$exe = Join-Path $InstallDir "FDSensor.exe"
 if (-not (Test-Path -LiteralPath $exe)) {
-  throw "edr_agent.exe not found after package copy: $exe"
+  $legacyExe = Join-Path $InstallDir "edr_agent.exe"
+  if (Test-Path -LiteralPath $legacyExe) {
+    Copy-Item -LiteralPath $legacyExe -Destination $exe -Force
+    Write-Warning "FDSensor.exe was missing; created compatibility alias from edr_agent.exe."
+  } else {
+    throw "FDSensor.exe not found after package copy: $exe"
+  }
 }
-$shaSidecar = Join-Path $packageRoot "edr_agent.exe.sha256"
+$shaSidecar = Join-Path $packageRoot "FDSensor.exe.sha256"
+if (-not (Test-Path -LiteralPath $shaSidecar)) {
+  $shaSidecar = Join-Path $packageRoot "edr_agent.exe.sha256"
+}
 if (-not $ExpectedAgentSha256 -and (Test-Path -LiteralPath $shaSidecar)) {
   $ExpectedAgentSha256 = ((Get-Content -LiteralPath $shaSidecar -TotalCount 1) -split '\s+')[0]
 }
@@ -131,7 +141,7 @@ if ($RuntimeMode -eq "service") { $args += "--install-service" }
 if ($RuntimeMode -eq "autorun") { $args += "--install-autorun" }
 if ($EnableResponseActions) { $args += "--enable-response-actions" }
 
-Write-Host "Running edr_agent.exe --install (token redacted)"
+Write-Host "Running FDSensor.exe --install (token redacted)"
 & $exe @args
 $rc = $LASTEXITCODE
 Write-DeployReport -InstallDir $InstallDir -Report ([ordered]@{

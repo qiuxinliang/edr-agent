@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EDR Agent 安装向导</title>
+<title>FDSecurity 安装向导</title>
 <style>
 :root{
   --bg:#070a12;--bg1:#0a0e18;--bg2:#0e131f;--bg3:#141b29;--bg4:#1a2433;
@@ -69,7 +69,7 @@ button{background:none;border:0;cursor:pointer}
 <div class="win">
   <div class="titlebar" id="titlebar">
     <svg class="mark" viewBox="0 0 48 54"><defs><linearGradient id="mg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4d7cff"/><stop offset="1" stop-color="#36c5e0"/></linearGradient></defs><polygon points="24,2 44,13 44,37 24,52 4,37 4,13" fill="none" stroke="url(#mg)" stroke-width="2.5"/><path d="M16 26 L22 33 L33 20" fill="none" stroke="url(#mg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <div class="tt">EDR Agent<span>安装向导</span></div>
+    <div class="tt">FDSecurity<span>安装向导</span></div>
     <div class="grow"></div>
     <div class="wc"><i class="mn" id="winMin"></i><i class="cl" id="winClose"></i></div>
   </div>
@@ -91,7 +91,7 @@ button{background:none;border:0;cursor:pointer}
       <section class="panel on" data-step="0">
         <div class="hero">
           <svg width="76" height="86" viewBox="0 0 48 54"><defs><linearGradient id="hg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4d7cff"/><stop offset="1" stop-color="#36c5e0"/></linearGradient></defs><polygon points="24,2 44,13 44,37 24,52 4,37 4,13" fill="rgba(77,124,255,.05)" stroke="url(#hg)" stroke-width="2"/><path d="M15 26 L22 34 L34 19" fill="none" stroke="url(#hg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          <div><div class="ph">欢迎安装 EDR Agent</div><div class="psub">向导将部署端点传感器、写入 enroll 配置、安装开机任务并等待健康回执。真实安装动作由同目录的 edr_agent_setup.exe 执行。</div></div>
+          <div><div class="ph">欢迎安装 FDSecurity</div><div class="psub">向导将部署端点传感器、写入 enroll 配置、安装开机任务并等待健康回执。真实安装动作由同目录的 FDSecuritySetup.exe 执行。</div></div>
         </div>
         <div class="feat">
           <div class="fi"><span class="fic">◉</span><div><div class="ft">产品化安装流程</div><div class="fd">预检、参数、提权、安装、诊断路径全部可见</div></div></div>
@@ -107,7 +107,7 @@ button{background:none;border:0;cursor:pointer}
         <div class="psub">请阅读并接受以下条款以继续安装。</div>
         <div class="hr"></div>
         <div class="eula">
-          <h4>EDR Agent 最终用户许可协议</h4>
+          <h4>FDSecurity 最终用户许可协议</h4>
           <p>1. 本软件仅允许在组织授权的受管终端上安装和运行，用于终端安全检测、响应、取证和运维管理。</p>
           <p>2. 本软件会采集必要的安全遥测，包括进程、命令行、文件、网络、注册表和运行健康指标，用于威胁检测、误报治理和响应闭环。</p>
           <p>3. 您不得绕过安全控制、篡改安装目录或将本软件部署在未授权环境。卸载、升级和策略变更应通过组织授权流程完成。</p>
@@ -125,7 +125,7 @@ button{background:none;border:0;cursor:pointer}
         <div class="form">
           <div class="frow wide"><div class="flabel">服务端地址<span class="req">*</span><span class="opt">支持 https://server:8080 或 https://server:8080/api/v1</span><button class="testc" id="testConn">检查格式</button></div><input class="fin" id="apiBase" placeholder="https://server:8080"></div>
           <div class="frow"><div class="flabel">注册令牌<span class="req">*</span></div><input class="fin" id="token" placeholder="粘贴 enroll token"></div>
-          <div class="frow"><div class="flabel">安装路径</div><input class="fin" id="installPath" value="C:\Program Files\EDR Agent"></div>
+          <div class="frow"><div class="flabel">安装路径</div><input class="fin" id="installPath" value="C:\Program Files\FDSecurity"></div>
           <div class="frow"><div class="flabel">安装模式</div><select class="fsel" id="installMode"><option value="upgrade_keep">标准安装 / 升级保留</option><option value="fresh">首次安装</option><option value="repair_clean">修复安装 / 清理运行缓存</option><option value="reset_all">完全重置 / 清理本地数据</option></select></div>
           <div class="frow"><div class="flabel">代理模式</div><select class="fsel" id="proxyMode"><option value="auto">系统代理 / 自动发现</option><option value="off">直连</option><option value="explicit">显式代理</option></select></div>
           <div class="subpanel hide" id="proxyPanel">
@@ -256,6 +256,9 @@ function payload(){
     relayUrl:$('#relayUrl').value.trim(),
     managementUrl:nativePreconfig.managementUrl||'',
     autoOpenEndpoint:!!nativePreconfig.autoOpenEndpoint,
+    bootstrapManifestUrl:nativePreconfig.bootstrapManifestUrl||'',
+    bootstrapManifestPath:nativePreconfig.bootstrapManifestPath||'',
+    bootstrapManifestJson:nativePreconfig.bootstrapManifestJson||(nativePreconfig.bootstrapManifest?JSON.stringify(nativePreconfig.bootstrapManifest):''),
     installAutorun:$('#runtimeMode').value==='scheduled_task',
     trustCa:$('#trustCa').classList.contains('on'),
     hardenAcl:$('#hardenAcl').classList.contains('on'),
@@ -325,7 +328,7 @@ function onNativeStatus(s){
   $('#agentVersion').textContent=s.agentVersion||'unknown';
   $('#archLabel').textContent=s.architecture||'x64';
   applyPreconfig(s.preconfig||{});
-  if(!s.setupFound)toast('未找到安装包','请将 edr_agent_setup.exe 放在安装器 UI 同目录','warn');
+  if(!s.setupFound)toast('未找到安装包','请将 FDSecuritySetup.exe 放在安装器 UI 同目录','warn');
 }
 function setSelectValue(id,value){
   if(value===undefined||value===null||value==='')return;
@@ -360,7 +363,8 @@ function applyPreconfig(c){
   syncProxyPanel();
   const note=$('#preconfigNote');
   note.classList.add('on');
-  note.textContent=`预配置安装包已加载 · 租户 ${nativePreconfig.tenantId||'-'} · 构建 ${nativePreconfig.buildId||'-'} · 安装完成后自动打开终端详情`;
+  const boot=(nativePreconfig.bootstrapManifestUrl||nativePreconfig.bootstrapManifestPath||nativePreconfig.bootstrapManifest||nativePreconfig.bootstrapManifestJson)?' · Bootstrap manifest':'';
+  note.textContent=`预配置已加载${boot} · 租户 ${nativePreconfig.tenantId||'-'} · 构建 ${nativePreconfig.buildId||'-'} · 安装完成后自动打开终端详情`;
 }
 function runChecks(){
   checkOk=false;renderFooter();

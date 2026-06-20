@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 无 MSVC 时用 MinGW-w64 交叉编译 Windows 版 edr_agent，验证 iphlpapi / MIB_TCP6* 等能否通过编译。
+# 无 MSVC 时用 MinGW-w64 交叉编译 Windows 版 FDSensor，验证 iphlpapi / MIB_TCP6* 等能否通过编译。
 # 依赖（任选其一）：
 #   - 本机 PATH 中有 x86_64-w64-mingw32-gcc（如 brew / MacPorts 等）
 #   - 环境变量 MINGW_PREFIX 指向工具链根目录（其下须有 bin/x86_64-w64-mingw32-gcc），可不依赖 Homebrew
@@ -65,9 +65,11 @@ build_local() {
     fi
   fi
   cmake --build "$OUTDIR" --target edr_agent -j"${NPROC:-4}"
-  echo "OK: $OUTDIR/edr_agent.exe (MinGW)"
-  ls -la "$OUTDIR"/edr_agent.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent 2>/dev/null || true
-  if [[ -f "$OUTDIR/edr_agent.exe" ]]; then
+  echo "OK: $OUTDIR/FDSensor.exe (MinGW)"
+  ls -la "$OUTDIR"/FDSensor.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent 2>/dev/null || true
+  if [[ -f "$OUTDIR/FDSensor.exe" ]]; then
+    print_build_fingerprint "$OUTDIR/FDSensor.exe"
+  elif [[ -f "$OUTDIR/edr_agent.exe" ]]; then
     print_build_fingerprint "$OUTDIR/edr_agent.exe"
   elif [[ -f "$OUTDIR/edr_agent" ]]; then
     print_build_fingerprint "$OUTDIR/edr_agent"

@@ -21,5 +21,5 @@ echo.
 if errorlevel 1 exit /b 1
 
 echo.
-echo OK: %~dp0Output\EDRAgentSetup-bundled.exe
+echo OK: %~dp0Output\FDSecuritySetup-bundled.exe
 exit /b 0

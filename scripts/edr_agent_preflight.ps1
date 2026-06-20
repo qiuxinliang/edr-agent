@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Prepare an installed EDR Agent directory for upgrade/redeploy.
+  Prepare an installed FDSecurity directory for upgrade/redeploy.
 
 .DESCRIPTION
   Stops the Windows service/process and removes runtime-only queue/evidence
@@ -9,8 +9,8 @@
   agent.toml, certificates, models, rules, logs, and forensic artifacts.
 #>
 param(
-  [string]$InstallDir = $(if ($env:EDR_INSTALL_DIR) { $env:EDR_INSTALL_DIR } else { "C:\Program Files\EDR Agent" }),
-  [string]$ServiceName = $(if ($env:EDR_SERVICE_NAME) { $env:EDR_SERVICE_NAME } else { "EdrAgent" }),
+  [string]$InstallDir = $(if ($env:EDR_INSTALL_DIR) { $env:EDR_INSTALL_DIR } else { "C:\Program Files\FDSecurity" }),
+  [string]$ServiceName = $(if ($env:EDR_SERVICE_NAME) { $env:EDR_SERVICE_NAME } else { "FDSecurityAgent" }),
   [switch]$SkipStop,
   [switch]$SkipRuntimeCleanup,
   [switch]$KeepOfflineQueue,
@@ -21,6 +21,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$AgentProcessNames = @("FDSensor", "edr_agent")
+$ServiceNames = @($ServiceName, "EdrAgent") | Select-Object -Unique
 
 function Write-Preflight([string]$Message) {
   Write-Host "[preflight] $Message"
@@ -67,9 +69,15 @@ function New-PreflightReport {
   $isElevated = Test-IsElevated
   $svc = $null
   if ($isWindows) {
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    foreach ($name in $ServiceNames) {
+      $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+      if ($svc) { break }
+    }
   }
-  $procCount = @((Get-Process -Name "edr_agent" -ErrorAction SilentlyContinue)).Count
+  $procCount = 0
+  foreach ($name in $AgentProcessNames) {
+    $procCount += @((Get-Process -Name $name -ErrorAction SilentlyContinue)).Count
+  }
   $queueCount = Get-PathCount -Pattern (Join-Path $dir "queue\edr_queue.db*")
   $evidenceCount = Get-PathCount -Pattern (Join-Path $dir "evidence\local_evidence_cache.db*")
   $checks = New-Object System.Collections.Generic.List[object]
@@ -77,7 +85,7 @@ function New-PreflightReport {
   $checks.Add((New-Check -Name "elevated" -Status $(if ($isElevated) { "ok" } else { "warning" }) -Message $(if ($isElevated) { "running with administrator privilege" } else { "administrator privilege recommended" }))) | Out-Null
   $checks.Add((New-Check -Name "install_dir" -Status $(if (Test-Path -LiteralPath $dir) { "ok" } else { "warning" }) -Message $dir)) | Out-Null
   $checks.Add((New-Check -Name "service" -Status "ok" -Message $(if ($svc) { "$ServiceName status=$($svc.Status)" } else { "$ServiceName not installed" }))) | Out-Null
-  $checks.Add((New-Check -Name "process" -Status $(if ($procCount -gt 0) { "warning" } else { "ok" }) -Message "edr_agent process count=$procCount")) | Out-Null
+  $checks.Add((New-Check -Name "process" -Status $(if ($procCount -gt 0) { "warning" } else { "ok" }) -Message "agent process count=$procCount")) | Out-Null
   $checks.Add((New-Check -Name "offline_queue" -Status "ok" -Message "files=$queueCount action=$(if ($KeepOfflineQueue) { 'keep' } else { 'cleanup' })")) | Out-Null
   $checks.Add((New-Check -Name "evidence_cache" -Status "ok" -Message "files=$evidenceCount action=$(if ($KeepEvidenceCache) { 'keep' } else { 'cleanup' })")) | Out-Null
   return [ordered]@{
@@ -146,34 +154,38 @@ function Stop-AgentRuntime {
   if (-not (Test-IsWindows)) {
     return
   }
-  $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-  if ($svc) {
-    if ($svc.Status -ne "Stopped") {
-      if ($DryRun) {
-        Write-Preflight "would stop service $ServiceName"
-      } else {
-        Write-Preflight "stopping service $ServiceName"
-        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-        $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20))
+  foreach ($name in $ServiceNames) {
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if ($svc) {
+      if ($svc.Status -ne "Stopped") {
+        if ($DryRun) {
+          Write-Preflight "would stop service $name"
+        } else {
+          Write-Preflight "stopping service $name"
+          Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+          $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20))
+        }
       }
     }
   }
   $skipPid = Get-ParentProcessId
-  $procs = Get-Process -Name "edr_agent" -ErrorAction SilentlyContinue
-  foreach ($p in $procs) {
-    if ($skipPid -gt 0 -and $p.Id -eq $skipPid) {
-      Write-Preflight "skipping installer parent process edr_agent pid=$($p.Id)"
-      continue
-    }
-    if ($DryRun) {
-      Write-Preflight "would stop process edr_agent pid=$($p.Id)"
-      continue
-    }
-    try {
-      Write-Preflight "stopping process edr_agent pid=$($p.Id)"
-      Stop-Process -Id $p.Id -Force -ErrorAction Stop
-    } catch {
-      Write-Warning "[preflight] failed to stop edr_agent pid=$($p.Id): $_"
+  foreach ($procName in $AgentProcessNames) {
+    $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+    foreach ($p in $procs) {
+      if ($skipPid -gt 0 -and $p.Id -eq $skipPid) {
+        Write-Preflight "skipping installer parent process $procName pid=$($p.Id)"
+        continue
+      }
+      if ($DryRun) {
+        Write-Preflight "would stop process $procName pid=$($p.Id)"
+        continue
+      }
+      try {
+        Write-Preflight "stopping process $procName pid=$($p.Id)"
+        Stop-Process -Id $p.Id -Force -ErrorAction Stop
+      } catch {
+        Write-Warning "[preflight] failed to stop $procName pid=$($p.Id): $_"
+      }
     }
   }
 }
@@ -194,7 +206,8 @@ function Invoke-RuntimeCleanup {
   if (-not $KeepEvidenceCache) {
     Remove-PathPattern -Pattern (Join-Path $dir "evidence\local_evidence_cache.db*") -Label "evidence cache"
   }
-  Remove-PathPattern -Pattern (Join-Path $dir "edr_agent.pid") -Label "pid file"
+  Remove-PathPattern -Pattern (Join-Path $dir "FDSensor.pid") -Label "pid file"
+  Remove-PathPattern -Pattern (Join-Path $dir "edr_agent.pid") -Label "legacy pid file"
 }
 
 if ($CheckOnly) {

@@ -94,5 +94,5 @@ fi
 cmake --build build-mingw --target edr_agent -j4
 '
 
-echo "OK: ${ROOT}/${OUTDIR}/ 下生成 Windows 目标（见 edr_agent.exe 或构建日志）"
-ls -la "${ROOT}/${OUTDIR}/"edr_agent.exe 2>/dev/null || ls -la "${ROOT}/${OUTDIR}/"edr_agent 2>/dev/null || true
+echo "OK: ${ROOT}/${OUTDIR}/ 下生成 Windows 目标（见 FDSensor.exe 或构建日志）"
+ls -la "${ROOT}/${OUTDIR}/"FDSensor.exe 2>/dev/null || ls -la "${ROOT}/${OUTDIR}/"edr_agent.exe 2>/dev/null || ls -la "${ROOT}/${OUTDIR}/"edr_agent 2>/dev/null || true

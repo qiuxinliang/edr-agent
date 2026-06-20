@@ -1,4 +1,4 @@
-# 将 ONNX Runtime 的 DLL 复制到 build\Release\，供 Inno / 便携 zip 与 edr_agent.exe 同目录分发。
+# 将 ONNX Runtime 的 DLL 复制到 build\Release\，供 Inno / 便携 zip 与 FDSensor.exe 同目录分发。
 # 前提：已设置环境变量 ONNXRUNTIME_ROOT（官方 onnxruntime-win-x64-* 解压根目录）；在 edr-agent 仓库根执行。
 $ErrorActionPreference = 'Stop'
 if (-not $env:ONNXRUNTIME_ROOT) {
@@ -8,17 +8,26 @@ if (-not $env:ONNXRUNTIME_ROOT) {
 $Root = Split-Path -Parent $PSScriptRoot
 $releaseDir = Join-Path $Root 'build\Release'
 $singleConfigDir = Join-Path $Root 'build'
-$releaseExe = Join-Path $releaseDir 'edr_agent.exe'
-$singleConfigExe = Join-Path $singleConfigDir 'edr_agent.exe'
+$releaseExe = Join-Path $releaseDir 'FDSensor.exe'
+$singleConfigExe = Join-Path $singleConfigDir 'FDSensor.exe'
+$legacyReleaseExe = Join-Path $releaseDir 'edr_agent.exe'
+$legacySingleConfigExe = Join-Path $singleConfigDir 'edr_agent.exe'
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     if (Test-Path -LiteralPath $singleConfigExe) {
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
         Copy-Item -LiteralPath $singleConfigExe -Destination $releaseExe -Force
         Write-Host "Normalized Ninja single-config exe: $singleConfigExe -> $releaseExe"
+    } elseif (Test-Path -LiteralPath $legacyReleaseExe) {
+        Copy-Item -LiteralPath $legacyReleaseExe -Destination $releaseExe -Force
+        Write-Host "Created compatibility product exe: $legacyReleaseExe -> $releaseExe"
+    } elseif (Test-Path -LiteralPath $legacySingleConfigExe) {
+        New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+        Copy-Item -LiteralPath $legacySingleConfigExe -Destination $releaseExe -Force
+        Write-Host "Created compatibility product exe: $legacySingleConfigExe -> $releaseExe"
     }
 }
 if (-not (Test-Path -LiteralPath $releaseExe)) {
-    Write-Error "edr_agent.exe not found under build\Release or build (Ninja single-config). Build first."
+    Write-Error "FDSensor.exe not found under build\Release or build (Ninja single-config). Build first."
     exit 1
 }
 $lib = Join-Path $env:ONNXRUNTIME_ROOT 'lib'

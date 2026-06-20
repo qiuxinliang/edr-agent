@@ -1,6 +1,6 @@
-Optional SQLite data files (EDR Agent)
+Optional SQLite data files (FDSecurity)
 
-For the full list of what the bundled zip covers vs what ships separately, see BUNDLE_README.txt next to edr_agent.exe.
+For the full list of what the bundled zip covers vs what ships separately, see BUNDLE_README.txt next to FDSensor.exe.
 
 - edr_queue.db: Created at runtime if offline queue is used (default path may be under install dir
   or overridden by agent.toml / environment). Not shipped; no action needed for a clean install.

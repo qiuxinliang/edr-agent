@@ -367,7 +367,7 @@ void edr_response_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t 
   if (!bname) bname = path; else bname++;
   char qpath[1024];
 #ifdef _WIN32
-  snprintf(qpath, sizeof(qpath), "C:\\Program Files\\EDR Agent\\quarantine\\%s_%s", sha, bname);
+  snprintf(qpath, sizeof(qpath), "C:\\Program Files\\FDSecurity\\quarantine\\%s_%s", sha, bname);
 #else
   snprintf(qpath, sizeof(qpath), "/var/lib/edr/quarantine/%s_%s", sha, bname);
 #endif

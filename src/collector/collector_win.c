@@ -532,7 +532,9 @@ static int edr_agent_self_text_marker(const char *s) {
   if (s_agent_exe_path[0] && edr_contains_ci_path(s, s_agent_exe_path)) {
     return 1;
   }
-  if (edr_contains_ci_path(s, "\\EDR Agent\\edr_agent.exe") ||
+  if (edr_contains_ci_path(s, "\\FDSecurity\\FDSensor.exe") ||
+      edr_contains_ci_path(s, "/FDSecurity/FDSensor.exe") ||
+      edr_contains_ci_path(s, "\\EDR Agent\\edr_agent.exe") ||
       edr_contains_ci_path(s, "/EDR Agent/edr_agent.exe")) {
     return 1;
   }
@@ -557,7 +559,8 @@ static int edr_agent_self_text_marker(const char *s) {
 }
 
 static int edr_agent_self_process_name(const char *s) {
-  return edr_contains_ci_path(s, "edr_agent.exe") || edr_contains_ci_path(s, "edr_agent_setup.exe") ||
+  return edr_contains_ci_path(s, "FDSensor.exe") || edr_contains_ci_path(s, "edr_agent.exe") ||
+         edr_contains_ci_path(s, "edr_agent_setup.exe") ||
          edr_contains_ci_path(s, "edr_agent_install.ps1");
 }
 

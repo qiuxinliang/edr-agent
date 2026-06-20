@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  Builds EDRAgentSetup-bundled.exe (full layout: staged exe/DLLs + models dir + preprocess TOML + scripts).
+  Builds FDSecuritySetup-bundled.exe (full layout: staged exe/DLLs + models dir + preprocess TOML + scripts).
   Run on Windows from the monorepo root OR from this directory.
 
   Default staging folder (relative to this .iss file): ..\..\..\edr-agent-win_2-2
@@ -31,9 +31,15 @@ if (-not $BinDir) {
     $monorepoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
     $BinDir = Join-Path $monorepoRoot "edr-agent-win_2-2"
 }
-$binExe = Join-Path $BinDir "edr_agent.exe"
+$binExe = Join-Path $BinDir "FDSensor.exe"
+$legacyBinExe = Join-Path $BinDir "edr_agent.exe"
 if (-not (Test-Path -LiteralPath $binExe)) {
-    throw "edr_agent.exe not found: $binExe. Pass -BinDir to your staging folder."
+    if (Test-Path -LiteralPath $legacyBinExe) {
+        Copy-Item -LiteralPath $legacyBinExe -Destination $binExe -Force
+        Write-Warning "FDSensor.exe was not found; created compatibility alias from edr_agent.exe in staging folder."
+    } else {
+        throw "FDSensor.exe not found: $binExe. Pass -BinDir to your staging folder."
+    }
 }
 
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
@@ -63,7 +69,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "ISCC failed with exit $LASTEXITCODE"
 }
 $outDir = Join-Path $scriptDir "Output"
-$out = Join-Path $outDir "EDRAgentSetup-bundled.exe"
+$out = Join-Path $outDir "FDSecuritySetup-bundled.exe"
 if (Test-Path -LiteralPath $out) {
     Write-Host "OK: $out"
 } else {

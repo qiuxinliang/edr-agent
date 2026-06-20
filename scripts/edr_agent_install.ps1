@@ -9,7 +9,7 @@
 
   可选：
     EDR_API_BASE / EDR_ENROLL_TOKEN  兼容旧版环境变量传参
-    EDR_OUTPUT              输出路径，Windows 默认 C:\Program Files\EDR Agent\agent.toml
+    EDR_OUTPUT              输出路径，Windows 默认 C:\Program Files\FDSecurity\agent.toml
     EDR_AGENT_VERSION       默认使用环境变量；否则读取包内 VERSION；再否则 0.3.0
     EDR_FORCE_ENROLL=1      已存在 agent.toml 时仍强制重新 enroll
     EDR_OVERRIDE_SERVER_ADDR
@@ -34,18 +34,20 @@
   .\edr_agent_install.ps1
 #>
 param(
-  [string]$Output = $(if ($env:EDR_OUTPUT) { $env:EDR_OUTPUT } else { "C:\Program Files\EDR Agent\agent.toml" }),
+  [string]$Output = $(if ($env:EDR_OUTPUT) { $env:EDR_OUTPUT } else { "C:\Program Files\FDSecurity\agent.toml" }),
   [string]$Template = $(if ($env:EDR_AGENT_TEMPLATE) { $env:EDR_AGENT_TEMPLATE } else { "" }),
-  [string]$CaCertPath = $(if ($env:EDR_CA_CERT) { $env:EDR_CA_CERT } else { "C:\Program Files\EDR Agent\certs\ca.pem" }),
-  [string]$ClientCertPath = $(if ($env:EDR_CLIENT_CERT) { $env:EDR_CLIENT_CERT } else { "C:\Program Files\EDR Agent\certs\client.pem" }),
-  [string]$ClientKeyPath = $(if ($env:EDR_CLIENT_KEY) { $env:EDR_CLIENT_KEY } else { "C:\Program Files\EDR Agent\certs\client-key.pem" }),
-  [string]$ClientCsrPath = $(if ($env:EDR_CLIENT_CSR) { $env:EDR_CLIENT_CSR } else { "C:\Program Files\EDR Agent\certs\client.csr.pem" }),
+  [string]$CaCertPath = $(if ($env:EDR_CA_CERT) { $env:EDR_CA_CERT } else { "C:\Program Files\FDSecurity\certs\ca.pem" }),
+  [string]$ClientCertPath = $(if ($env:EDR_CLIENT_CERT) { $env:EDR_CLIENT_CERT } else { "C:\Program Files\FDSecurity\certs\client.pem" }),
+  [string]$ClientKeyPath = $(if ($env:EDR_CLIENT_KEY) { $env:EDR_CLIENT_KEY } else { "C:\Program Files\FDSecurity\certs\client-key.pem" }),
+  [string]$ClientCsrPath = $(if ($env:EDR_CLIENT_CSR) { $env:EDR_CLIENT_CSR } else { "C:\Program Files\FDSecurity\certs\client.csr.pem" }),
   [string]$KeyProvider = $(if ($env:EDR_KEY_PROVIDER) { $env:EDR_KEY_PROVIDER } else { "" }),
   [string]$ApiBase = $(if ($env:EDR_API_BASE) { $env:EDR_API_BASE } else { "" }),
   [string]$EnrollToken = $(if ($env:EDR_ENROLL_TOKEN) { $env:EDR_ENROLL_TOKEN } else { "" }),
   [string]$ProxyMode = $(if ($env:EDR_PROXY_MODE) { $env:EDR_PROXY_MODE } else { "auto" }),
   [string]$ProxyUrl = $(if ($env:EDR_PROXY_URL) { $env:EDR_PROXY_URL } else { "" }),
   [string]$RelayUrl = $(if ($env:EDR_RELAY_URL) { $env:EDR_RELAY_URL } else { "" }),
+  [string]$BootstrapCaCertPath = $(if ($env:EDR_BOOTSTRAP_CA_CERT) { $env:EDR_BOOTSTRAP_CA_CERT } else { "" }),
+  [string]$BootstrapTlsLeafSha256 = $(if ($env:EDR_BOOTSTRAP_TLS_LEAF_SHA256) { $env:EDR_BOOTSTRAP_TLS_LEAF_SHA256 } else { "" }),
   [int]$MaxEventQueueSize = 8192,
   [string]$CngProviderName = $(if ($env:EDR_CNG_PROVIDER_NAME) { $env:EDR_CNG_PROVIDER_NAME } else { "" }),
   [string]$CngKeyName = $(if ($env:EDR_CNG_KEY_NAME) { $env:EDR_CNG_KEY_NAME } else { "" }),
@@ -269,7 +271,7 @@ function Invoke-AgentPreflightIfNeeded {
   if ($SkipPreflight) { return }
   if (-not $InstallAutorun -and $env:EDR_INSTALL_PREFLIGHT -ne "1") { return }
   $installDir = Split-Path -Parent $Output
-  if (-not $installDir) { $installDir = "C:\Program Files\EDR Agent" }
+  if (-not $installDir) { $installDir = "C:\Program Files\FDSecurity" }
   $preflight = Join-Path $PSScriptRoot "edr_agent_preflight.ps1"
   if (-not (Test-Path -LiteralPath $preflight)) {
     $preflight = Join-Path $installDir "edr_agent_preflight.ps1"
@@ -345,7 +347,7 @@ function Install-AgentAutorun {
     $autorunArgs += "-HardenAcl"
   }
   Invoke-Checked -Exe "powershell.exe" -ArgList $autorunArgs
-  Write-Host "Installed EdrAgent startup task"
+  Write-Host "Installed FDSecurityAgent startup task"
 }
 
 function Normalize-KeyProvider([string]$Provider) {
@@ -601,6 +603,99 @@ $bodyObj = @{
 }
 $json = $bodyObj | ConvertTo-Json -Compress
 
+function Write-BootstrapPemNoBom([string]$Path, [string]$Text) {
+  if (-not $Path -or -not $Text) { return }
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path $dir)) {
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  }
+  [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text)
+}
+
+function Get-NormalizedSha256List([string]$Value) {
+  $out = New-Object System.Collections.Generic.List[string]
+  if (-not $Value) { return $out.ToArray() }
+  foreach ($part in ($Value -split '[,;\s]+')) {
+    $p = ($part -replace '[:\-]', '').Trim().ToLowerInvariant()
+    if ($p -match '^[0-9a-f]{64}$') {
+      $out.Add($p) | Out-Null
+    }
+  }
+  return $out.ToArray()
+}
+
+function Read-PemCertificates([string]$Path) {
+  $certs = New-Object System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return $certs
+  }
+  $raw = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($Path)))
+  foreach ($m in [regex]::Matches($raw, '-----BEGIN CERTIFICATE-----\s*(?<b64>.*?)\s*-----END CERTIFICATE-----', 'Singleline')) {
+    try {
+      $bytes = [Convert]::FromBase64String(($m.Groups['b64'].Value -replace '\s+', ''))
+      $certs.Add((New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$bytes))) | Out-Null
+    } catch {
+      Write-Warning ("failed to parse bootstrap CA certificate: " + $_)
+    }
+  }
+  return $certs
+}
+
+function Enable-BootstrapTlsValidation([string]$CaPath, [string]$LeafSha256) {
+  $pins = @(Get-NormalizedSha256List $LeafSha256)
+  $certs = Read-PemCertificates $CaPath
+  if ($pins.Count -eq 0 -and $certs.Count -eq 0) {
+    return
+  }
+  $thumbprints = New-Object System.Collections.Generic.List[string]
+  foreach ($ca in $certs) {
+    if ($ca.Thumbprint) {
+      $thumbprints.Add(($ca.Thumbprint -replace '\s+', '').ToUpperInvariant()) | Out-Null
+    }
+  }
+  $script:EDR_BOOTSTRAP_TLS_LEAF_SHA256 = @($pins)
+  $script:EDR_BOOTSTRAP_TLS_CA_CERTS = @($certs)
+  $script:EDR_BOOTSTRAP_TLS_CA_THUMBPRINTS = @($thumbprints)
+  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
+    param($sender, $certificate, $chain, $sslPolicyErrors)
+    try {
+      $cert2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
+      $sha = [System.Security.Cryptography.SHA256]::Create()
+      try {
+        $leaf = ([BitConverter]::ToString($sha.ComputeHash($cert2.RawData)) -replace '-', '').ToLowerInvariant()
+      } finally {
+        $sha.Dispose()
+      }
+      if ($script:EDR_BOOTSTRAP_TLS_LEAF_SHA256 -contains $leaf) {
+        return $true
+      }
+      if ($script:EDR_BOOTSTRAP_TLS_CA_CERTS.Count -gt 0) {
+        $customChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+        $customChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $customChain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
+        foreach ($ca in $script:EDR_BOOTSTRAP_TLS_CA_CERTS) {
+          $customChain.ChainPolicy.ExtraStore.Add($ca) | Out-Null
+        }
+        [void]$customChain.Build($cert2)
+        foreach ($el in $customChain.ChainElements) {
+          $tp = ($el.Certificate.Thumbprint -replace '\s+', '').ToUpperInvariant()
+          if ($script:EDR_BOOTSTRAP_TLS_CA_THUMBPRINTS -contains $tp) {
+            return $true
+          }
+        }
+      }
+    } catch {
+      return $false
+    }
+    return $false
+  }
+  Write-Host "Enabled bootstrap TLS validation for enrollment"
+}
+
+if ($BootstrapCaCertPath -or $BootstrapTlsLeafSha256) {
+  Enable-BootstrapTlsValidation -CaPath $BootstrapCaCertPath -LeafSha256 $BootstrapTlsLeafSha256
+}
+
 if ($TrustCa) {
   Install-BootstrapCaTrust -Path $CaCertPath
 }
@@ -641,7 +736,8 @@ if ($env:EDR_OVERRIDE_SERVER_ADDR) {
 $rest = if ($d.rest_base_url) { ([string]$d.rest_base_url).TrimEnd("/") } else { "$api/api/v1" }
 $agentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $rest }
 $serverIssuedCert = ($d.ca_cert -and $d.client_cert)
-$useCertPaths = [bool]($serverIssuedCert -or $env:EDR_CA_CERT -or $env:EDR_CLIENT_CERT -or $env:EDR_CLIENT_KEY)
+$bootstrapCaAvailable = [bool]($BootstrapCaCertPath -and (Test-Path -LiteralPath $BootstrapCaCertPath))
+$useCertPaths = [bool]($serverIssuedCert -or $bootstrapCaAvailable -or $env:EDR_CA_CERT -or $env:EDR_CLIENT_CERT -or $env:EDR_CLIENT_KEY)
 $UseNativeWindowsStore = ((Get-EnrollOs) -eq "windows" -and ($keyProviderNorm -eq "cng" -or ($keyProviderNorm -eq "tpm" -and -not $TpmKeyUri)))
 $EffectiveCaCertPath = if ($useCertPaths) { $CaCertPath } else { "" }
 $EffectiveClientCertPath = if ($useCertPaths -and -not $UseNativeWindowsStore) { $ClientCertPath } else { "" }
@@ -675,7 +771,7 @@ function Format-TomlBool([object]$v) {
   return "false"
 }
 
-$InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\EDR Agent" } else { "." }
+$InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\FDSecurity" } else { "." }
 $TomlModelDir = Join-Path $InstallDirForToml "models"
 $TomlQueueDbPath = Join-Path $InstallDirForToml "queue\edr_queue.db"
 $TomlEvidenceCachePath = Join-Path $InstallDirForToml "evidence\local_evidence_cache.db"
@@ -879,7 +975,7 @@ function Merge-EnrollIntoAgentTomlExample {
     $raw = $raw.Substring(1)
   }
   $AgentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $RestBaseUrl.TrimEnd("/") }
-  $installRoot = if ($InstallDir -and $InstallDir.Trim()) { $InstallDir.Trim() } elseif ($env:OS -match 'Windows') { 'C:\Program Files\EDR Agent' } else { Split-Path -Parent $ExamplePath }
+  $installRoot = if ($InstallDir -and $InstallDir.Trim()) { $InstallDir.Trim() } elseif ($env:OS -match 'Windows') { 'C:\Program Files\FDSecurity' } else { Split-Path -Parent $ExamplePath }
   $modelDir = Join-Path $installRoot "models"
   $queueDb = Join-Path $installRoot "queue\edr_queue.db"
   $evidenceDb = Join-Path $installRoot "evidence\local_evidence_cache.db"
@@ -1115,7 +1211,7 @@ function Optimize-GeneratedToml([string]$TomlText) {
   $raw = $TomlText -replace "`r`n", "`n"
   $lines = $raw.Split([string[]]@("`n"), [System.StringSplitOptions]::None)
   $out = New-Object System.Collections.Generic.List[string]
-  $out.Add("# Generated by EDR Agent installer. Keep endpoint-specific values in this file.") | Out-Null
+  $out.Add("# Generated by FDSecurity installer. Keep endpoint-specific values in this file.") | Out-Null
   $out.Add("") | Out-Null
   $blank = $true
   foreach ($line in $lines) {
@@ -1148,7 +1244,7 @@ function Optimize-GeneratedToml([string]$TomlText) {
 }
 
 $tomlMinimal = @"
-# Generated by EDR Agent installer. Keep endpoint-specific values in this file.
+# Generated by FDSecurity installer. Keep endpoint-specific values in this file.
 
 [server]
 address              = "$(Escape-Toml $saddr)"
@@ -1352,6 +1448,9 @@ if ($d.ca_cert -or $d.client_cert) {
 }
 if ($d.client_key) {
   Write-Warning "enroll response included deprecated client_key; ignoring it because the endpoint private key is generated locally"
+}
+if (-not $d.ca_cert -and $bootstrapCaAvailable) {
+  Write-PemNoBom -Path $CaCertPath -Text ([System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($BootstrapCaCertPath))))
 }
 
 $dir = Split-Path -Parent $Output

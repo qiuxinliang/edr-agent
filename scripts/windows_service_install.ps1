@@ -1,22 +1,22 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Install or manage EDR Agent as a native Windows service.
+  Install or manage FDSecurity as a native Windows service.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -Action Install `
-    -ExePath "C:\Program Files\EDR Agent\edr_agent.exe" `
-    -ConfigPath "C:\Program Files\EDR Agent\agent.toml" -EnableResponseActions
+    -ExePath "C:\Program Files\FDSecurity\FDSensor.exe" `
+    -ConfigPath "C:\Program Files\FDSecurity\agent.toml" -EnableResponseActions
 #>
 param(
   [ValidateSet("Install", "Uninstall", "Start", "Stop", "Status")]
   [string]$Action = "Install",
-  [string]$ServiceName = "EdrAgent",
-  [string]$DisplayName = "EDR Agent",
-  [string]$ExePath = "C:\Program Files\EDR Agent\edr_agent.exe",
-  [string]$ConfigPath = "C:\Program Files\EDR Agent\agent.toml",
-  [string]$InstallDir = "C:\Program Files\EDR Agent",
-  [string]$DataDir = "C:\Program Files\EDR Agent",
+  [string]$ServiceName = "FDSecurityAgent",
+  [string]$DisplayName = "FDSecurity Endpoint Agent",
+  [string]$ExePath = "C:\Program Files\FDSecurity\FDSensor.exe",
+  [string]$ConfigPath = "C:\Program Files\FDSecurity\agent.toml",
+  [string]$InstallDir = "C:\Program Files\FDSecurity",
+  [string]$DataDir = "C:\Program Files\FDSecurity",
   [string]$Account = "LocalSystem",
   [switch]$SkipPreflight,
   [switch]$KeepOfflineQueue,
@@ -96,7 +96,7 @@ function Invoke-AgentPreflight {
 function Install-AgentService {
   Assert-Admin
   if (-not (Test-Path -LiteralPath $ExePath)) {
-    throw "edr_agent.exe not found: $ExePath"
+    throw "FDSensor.exe not found: $ExePath"
   }
   if (-not (Test-Path -LiteralPath $ConfigPath)) {
     throw "agent.toml not found: $ConfigPath"
@@ -111,7 +111,7 @@ function Install-AgentService {
   Set-MachineEnv "EDR_UPLOAD_FILE_RETRY_BACKOFF_MS" "750"
   Set-MachineEnv "EDR_FORENSIC_OUT" (Join-Path $DataDir "forensic")
   Set-MachineEnv "EDR_CMD_AUDIT_PATH" (Join-Path $DataDir "logs\command_audit.log")
-  Set-MachineEnv "EDR_SELF_PROTECT_PIDFILE" (Join-Path $DataDir "edr_agent.pid")
+  Set-MachineEnv "EDR_SELF_PROTECT_PIDFILE" (Join-Path $DataDir "FDSensor.pid")
   Set-MachineEnv "EDR_ISOLATE_STAMP_PATH" (Join-Path $DataDir "isolation\isolated.stamp")
   Set-MachineEnv "EDR_ISOLATE_HOOK" $hook
   if ($EnableResponseActions) {
@@ -133,7 +133,7 @@ function Install-AgentService {
   }
 
   & sc.exe create $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
-  & sc.exe description $ServiceName "EDR endpoint agent" | Out-Host
+  & sc.exe description $ServiceName "FDSecurity endpoint sensor" | Out-Host
   & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host
   if (-not $NoStart) {
     Start-Service -Name $ServiceName
@@ -143,13 +143,21 @@ function Install-AgentService {
 
 function Uninstall-AgentService {
   Assert-Admin
-  $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-  if ($svc) {
-    if ($svc.Status -ne "Stopped") {
-      Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+  foreach ($name in @($ServiceName, "EdrAgent")) {
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if ($svc) {
+      if ($svc.Status -ne "Stopped") {
+        Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+      }
+      & sc.exe delete $name | Out-Host
+    }
+  }
+  foreach ($procName in @("FDSensor", "edr_agent")) {
+    Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object {
+      Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
       Start-Sleep -Seconds 2
     }
-    & sc.exe delete $ServiceName | Out-Host
   }
   foreach ($name in @(
       "EDR_GRPC_REQUIRE_MTLS",

@@ -161,7 +161,7 @@ def enroll(api_base: str, token: str, agent_version: str, csr_pem: str) -> Dict[
 
 def _default_cert_paths() -> tuple[str, str, str]:
     if sys.platform.lower().startswith("win"):
-        base = r"C:\Program Files\EDR Agent\certs"
+        base = r"C:\Program Files\FDSecurity\certs"
     else:
         base = os.path.abspath("certs")
     return (
@@ -314,7 +314,7 @@ def _write_pem(path: str, text: str) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="EDR Agent enroll → agent.toml")
+    p = argparse.ArgumentParser(description="FDSecurity enroll -> agent.toml")
     p.add_argument(
         "-o",
         "--output",

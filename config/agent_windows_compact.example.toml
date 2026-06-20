@@ -3,9 +3,9 @@
 [server]
 address              = "192.168.3.56:50052"
 grpc_insecure        = false
-ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
-client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
-client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
+ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
+client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
 client_key_provider  = "pem"
 client_cert_store    = ""
 client_cert_thumbprint = ""
@@ -47,7 +47,7 @@ sampling_rate_whitelist = 0.03
 rules_version        = "edr-dynamic-rules-v1"
 
 [ave]
-model_dir            = "C:\\Program Files\\EDR Agent\\models"
+model_dir            = "C:\\Program Files\\FDSecurity\\models"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
@@ -66,10 +66,10 @@ batch_timeout_s      = 2
 max_upload_mbps      = 4
 
 [offline]
-queue_db_path        = "C:\\Program Files\\EDR Agent\\queue\\edr_queue.db"
+queue_db_path        = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db"
 max_queue_size_mb    = 512
 retention_hours      = 72
-evidence_cache_path  = "C:\\Program Files\\EDR Agent\\evidence\\local_evidence_cache.db"
+evidence_cache_path  = "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db"
 evidence_cache_max_size_mb = 512
 evidence_cache_retention_hours = 72
 
@@ -81,14 +81,14 @@ behavior_infer_per_min = 30
 
 [logging]
 level                = "info"
-log_dir              = "C:\\Program Files\\EDR Agent\\logs"
+log_dir              = "C:\\Program Files\\FDSecurity\\logs"
 max_log_size_mb      = 50
 max_log_files        = 5
 
 [command]
 allow_dangerous      = false
 allow_rtq_readonly   = true
-signing_public_key_path = "C:\\Program Files\\EDR Agent\\certs\\command-signing.pub.pem"
+signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
 
 [self_protect]
 anti_debug           = true

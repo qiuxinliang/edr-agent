@@ -71,9 +71,9 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             var choice = MessageBox.Show(
-                "EDR Agent 图形安装向导需要 Microsoft Edge WebView2 Runtime。\n\n" +
+                "FDSecurity 图形安装向导需要 Microsoft Edge WebView2 Runtime。\n\n" +
                 "可选 fallback：\n" +
-                "是：使用同目录传统 edr_agent_setup.exe 继续安装。\n" +
+                "是：使用同目录传统 FDSecuritySetup.exe 继续安装。\n" +
                 "否：打开 Microsoft WebView2 Evergreen Runtime 下载页。\n" +
                 "取消：退出安装。\n\n" +
                 "详细错误：" + ex.Message,
@@ -88,7 +88,7 @@ public partial class MainWindow : Window
                 }
                 else
                 {
-                    MessageBox.Show($"未找到传统安装器: {_setupPath}", "EDR Agent Setup", MessageBoxButton.OK, MessageBoxImage.Error);
+                    MessageBox.Show($"未找到传统安装器: {_setupPath}", "FDSecurity Setup", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             }
             else if (choice == MessageBoxResult.No)
@@ -111,7 +111,7 @@ public partial class MainWindow : Window
         var html = Path.Combine(_baseDir, "Assets", "installer.html");
         if (!File.Exists(html))
         {
-            MessageBox.Show($"安装器页面缺失: {html}", "EDR Agent Setup", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show($"安装器页面缺失: {html}", "FDSecurity Setup", MessageBoxButton.OK, MessageBoxImage.Error);
             Close();
             return;
         }
@@ -185,7 +185,7 @@ public partial class MainWindow : Window
     {
         var userDataFolder = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "EDR Agent",
+            "FDSecurity",
             "setup-ui-runtime",
             "webview2");
         Directory.CreateDirectory(userDataFolder);
@@ -232,6 +232,21 @@ public partial class MainWindow : Window
             // Best-effort only; setup will do the final filesystem validation.
         }
 
+        BootstrapTrustMaterial bootstrap = BootstrapTrustMaterial.Empty;
+        CheckItem bootstrapCheck;
+        try
+        {
+            bootstrap = await ResolveBootstrapTrustAsync(request);
+            bootstrapCheck = bootstrap.Enabled
+                ? CheckItem.Ok("Bootstrap 信任", $"manifest 已验签 key={bootstrap.KeyId}")
+                : CheckItem.Ok("Bootstrap 信任", "未配置，使用系统信任库");
+        }
+        catch (Exception ex)
+        {
+            bootstrapCheck = CheckItem.Fail("Bootstrap 信任", ex.Message);
+            await PostAsync("toast", new { title = "Bootstrap 信任失败", message = ex.Message, level = "warn" });
+        }
+
         EndpointConfig? endpoint = null;
         try
         {
@@ -254,8 +269,9 @@ public partial class MainWindow : Window
             CheckSystemArchitecture(),
             File.Exists(_setupPath)
                 ? CheckItem.Ok("安装包", Path.GetFileName(_setupPath))
-                : CheckItem.Fail("安装包", "未找到同目录 edr_agent_setup.exe"),
+                : CheckItem.Fail("安装包", "未找到同目录 FDSecuritySetup.exe"),
             GetSetupIntegrityPrecheck(),
+            bootstrapCheck,
             freeMb <= 0
                 ? CheckItem.Warn("磁盘空间", "无法读取可用空间，安装阶段会再次校验")
                 : freeMb >= 512
@@ -297,7 +313,7 @@ public partial class MainWindow : Window
         var installPath = NormalizeInstallPath(request.InstallPath);
         var uiLogDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "EDR Agent",
+            "FDSecurity",
             "setup-ui");
         Directory.CreateDirectory(uiLogDir);
         var handoffDir = ResolveSetupHandoffDirectory(uiLogDir);
@@ -310,7 +326,7 @@ public partial class MainWindow : Window
         {
             if (!File.Exists(_setupPath))
             {
-                throw new FileNotFoundException("未找到 edr_agent_setup.exe，请确认 UI 安装器与 setup 位于同一目录。", _setupPath);
+                throw new FileNotFoundException("未找到 FDSecuritySetup.exe，请确认 UI 安装器与 setup 位于同一目录。", _setupPath);
             }
             await PostAsync("installProgress", new { stage = "准备安装环境", progress = 4, detail = "正在校验安装包并准备提权缓存" });
             var integrity = VerifySetupIntegrity();
@@ -322,6 +338,7 @@ public partial class MainWindow : Window
             await PostAsync("installProgress", new { stage = "准备安装环境", progress = 6, detail = "正在生成静默安装参数" });
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] start install setup={_setupPath} dir={installPath} handoff={handoffDir}");
 
+            var bootstrap = await ResolveBootstrapTrustAsync(request);
             var endpoint = NormalizeEndpointInput(request.ApiBase);
             if (string.IsNullOrWhiteSpace(request.EnrollToken))
             {
@@ -339,7 +356,7 @@ public partial class MainWindow : Window
             }
             var effectiveProxyUrl = BuildEffectiveProxyUrl(request);
             var effectiveRelayUrl = NormalizeOptionalRelayUrl(request.RelayUrl);
-            paramsFile = WriteEnrollParamsFile(request, endpoint, effectiveProxyUrl, effectiveRelayUrl, installPath, handoffDir);
+            paramsFile = WriteEnrollParamsFile(request, endpoint, effectiveProxyUrl, effectiveRelayUrl, bootstrap, installPath, handoffDir);
             var args = BuildInnoArguments(request, installPath, innoLog, paramsFile);
             var setupToRun = PrepareSetupForElevation(_setupPath, handoffDir, uiLog);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] prepared setup={setupToRun} params={paramsFile} inno_log={innoLog}");
@@ -423,7 +440,7 @@ public partial class MainWindow : Window
             psi.Verb = "runas";
         }
 
-        return Process.Start(psi) ?? throw new InvalidOperationException("无法启动 edr_agent_setup.exe");
+        return Process.Start(psi) ?? throw new InvalidOperationException("无法启动 FDSecuritySetup.exe");
     }
 
     private string BuildInnoArguments(InstallRequest request, string installPath, string innoLog, string paramsFile)
@@ -616,7 +633,7 @@ public partial class MainWindow : Window
             : Path.GetDirectoryName(_lastDiagnosticsPath);
         if (string.IsNullOrWhiteSpace(target) || (!File.Exists(target) && !Directory.Exists(target)))
         {
-            target = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "EDR Agent", "setup-ui");
+            target = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FDSecurity", "setup-ui");
         }
 
         Process.Start(new ProcessStartInfo { FileName = target, UseShellExecute = true });
@@ -682,6 +699,9 @@ public partial class MainWindow : Window
 
         foreach (var candidate in new[]
         {
+            Path.Combine(_baseDir, "FDSecuritySetup.exe"),
+            Path.Combine(_baseDir, "FDSecuritySetup-bundled.exe"),
+            Path.GetFullPath(Path.Combine(_baseDir, "..", "windows-inno", "Output", "FDSecuritySetup-bundled.exe")),
             Path.Combine(_baseDir, "edr_agent_setup.exe"),
             Path.Combine(_baseDir, "EDRAgentSetup-bundled.exe"),
             Path.GetFullPath(Path.Combine(_baseDir, "..", "windows-inno", "Output", "EDRAgentSetup-bundled.exe"))
@@ -693,7 +713,7 @@ public partial class MainWindow : Window
             }
         }
 
-        return Path.Combine(_baseDir, "edr_agent_setup.exe");
+        return Path.Combine(_baseDir, "FDSecuritySetup.exe");
     }
 
     private Dictionary<string, object?> LoadPreconfig()
@@ -893,7 +913,7 @@ public partial class MainWindow : Window
     {
         if (string.IsNullOrWhiteSpace(path))
         {
-            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "EDR Agent");
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "FDSecurity");
         }
 
         return Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
@@ -1071,11 +1091,252 @@ public partial class MainWindow : Window
         return builder.Uri.ToString();
     }
 
+    private async Task<BootstrapTrustMaterial> ResolveBootstrapTrustAsync(InstallRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.BootstrapManifestJson) &&
+            string.IsNullOrWhiteSpace(request.BootstrapManifestPath) &&
+            string.IsNullOrWhiteSpace(request.BootstrapManifestUrl))
+        {
+            return BootstrapTrustMaterial.Empty;
+        }
+
+        var manifestJson = await ReadBootstrapManifestSourceAsync(request);
+        var trustPublicKey = LoadBootstrapTrustPublicKeyPem();
+        if (string.IsNullOrWhiteSpace(trustPublicKey))
+        {
+            throw new InvalidOperationException("已配置 bootstrap manifest，但缺少 bootstrap_trust_public_key.pem 或 setup-ui-manifest 中的 bootstrap_trust_public_key_pem");
+        }
+
+        var payloadJson = VerifyBootstrapManifest(manifestJson, trustPublicKey);
+        using var payloadDoc = JsonDocument.Parse(payloadJson);
+        var payload = payloadDoc.RootElement;
+
+        var notBefore = JsonString(payload, "not_before", "notBefore");
+        var notAfter = JsonString(payload, "not_after", "notAfter");
+        if (!string.IsNullOrWhiteSpace(notBefore) &&
+            DateTimeOffset.TryParse(notBefore, out var nbf) &&
+            DateTimeOffset.UtcNow < nbf.ToUniversalTime())
+        {
+            throw new InvalidOperationException("bootstrap manifest 尚未生效");
+        }
+        if (!string.IsNullOrWhiteSpace(notAfter) &&
+            DateTimeOffset.TryParse(notAfter, out var exp) &&
+            DateTimeOffset.UtcNow > exp.ToUniversalTime())
+        {
+            throw new InvalidOperationException("bootstrap manifest 已过期");
+        }
+
+        var apiBase = JsonString(payload, "api_base", "apiBase", "server_base", "serverBase");
+        var enrollToken = JsonString(payload, "enroll_token", "enrollToken", "token");
+        var relayUrl = JsonString(payload, "relay_url", "relayUrl");
+        var proxyMode = JsonString(payload, "proxy_mode", "proxyMode");
+        var tlsCaPem = NormalizePemNewlines(JsonString(payload, "tls_ca_pem", "tlsCaPem", "ca_pem", "caPem"));
+        var leafSha256 = NormalizeSha256List(JsonString(payload, "tls_leaf_sha256", "tlsLeafSha256", "certificate_sha256", "certificateSha256"));
+        if (string.IsNullOrWhiteSpace(leafSha256) &&
+            (payload.TryGetProperty("tls_leaf_sha256", out var pins) || payload.TryGetProperty("tlsLeafSha256", out pins)))
+        {
+            leafSha256 = NormalizeSha256Array(pins);
+        }
+
+        if (!string.IsNullOrWhiteSpace(apiBase))
+        {
+            request.ApiBase = apiBase;
+        }
+        if (!string.IsNullOrWhiteSpace(enrollToken))
+        {
+            request.EnrollToken = enrollToken;
+        }
+        if (!string.IsNullOrWhiteSpace(relayUrl))
+        {
+            request.RelayUrl = relayUrl;
+        }
+        if (!string.IsNullOrWhiteSpace(proxyMode))
+        {
+            request.ProxyMode = proxyMode;
+        }
+
+        if (string.IsNullOrWhiteSpace(tlsCaPem) && string.IsNullOrWhiteSpace(leafSha256))
+        {
+            throw new InvalidOperationException("bootstrap manifest 已验签，但未包含 tls_ca_pem 或 tls_leaf_sha256");
+        }
+
+        return new BootstrapTrustMaterial(
+            Enabled: true,
+            KeyId: JsonStringFromManifest(manifestJson, "key_id", "keyId"),
+            CaPem: tlsCaPem,
+            LeafSha256: leafSha256);
+    }
+
+    private static async Task<string> ReadBootstrapManifestSourceAsync(InstallRequest request)
+    {
+        if (!string.IsNullOrWhiteSpace(request.BootstrapManifestJson))
+        {
+            return request.BootstrapManifestJson.Trim();
+        }
+        if (!string.IsNullOrWhiteSpace(request.BootstrapManifestPath))
+        {
+            return await File.ReadAllTextAsync(Environment.ExpandEnvironmentVariables(request.BootstrapManifestPath.Trim().Trim('"')));
+        }
+        if (!string.IsNullOrWhiteSpace(request.BootstrapManifestUrl))
+        {
+            using var handler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+            };
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+            return await client.GetStringAsync(request.BootstrapManifestUrl.Trim());
+        }
+        throw new InvalidOperationException("bootstrap manifest 来源为空");
+    }
+
+    private string LoadBootstrapTrustPublicKeyPem()
+    {
+        var env = Environment.GetEnvironmentVariable("EDR_BOOTSTRAP_TRUST_PUBLIC_KEY_PEM");
+        if (!string.IsNullOrWhiteSpace(env))
+        {
+            return NormalizePemNewlines(env);
+        }
+        var keyFile = Path.Combine(_baseDir, "bootstrap_trust_public_key.pem");
+        if (File.Exists(keyFile))
+        {
+            return File.ReadAllText(keyFile);
+        }
+        var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
+        if (File.Exists(manifest))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+                return NormalizePemNewlines(JsonString(doc.RootElement, "bootstrap_trust_public_key_pem", "bootstrapTrustPublicKeyPem"));
+            }
+            catch
+            {
+                return "";
+            }
+        }
+        return "";
+    }
+
+    private static string VerifyBootstrapManifest(string manifestJson, string trustPublicKeyPem)
+    {
+        using var doc = JsonDocument.Parse(manifestJson);
+        var root = doc.RootElement;
+        var payloadB64 = JsonString(root, "payload_b64", "payloadB64");
+        var signatureB64 = JsonString(root, "signature", "sig");
+        if (string.IsNullOrWhiteSpace(signatureB64) && root.TryGetProperty("signature", out var sigObj) && sigObj.ValueKind == JsonValueKind.Object)
+        {
+            signatureB64 = JsonString(sigObj, "value", "signature", "sig");
+        }
+        var alg = JsonString(root, "alg", "algorithm", "signature_alg", "signatureAlg");
+        if (string.IsNullOrWhiteSpace(alg) && root.TryGetProperty("signature", out var sigAlgObj) && sigAlgObj.ValueKind == JsonValueKind.Object)
+        {
+            alg = JsonString(sigAlgObj, "alg", "algorithm");
+        }
+        if (!string.Equals(alg, "RS256", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("bootstrap manifest 仅支持 RS256 签名");
+        }
+        if (string.IsNullOrWhiteSpace(payloadB64) || string.IsNullOrWhiteSpace(signatureB64))
+        {
+            throw new InvalidOperationException("bootstrap manifest 缺少 payload_b64 或 signature");
+        }
+
+        using var rsa = RSA.Create();
+        rsa.ImportFromPem(trustPublicKeyPem.AsSpan());
+        var ok = rsa.VerifyData(
+            Encoding.ASCII.GetBytes(payloadB64),
+            Base64UrlDecode(signatureB64),
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+        if (!ok)
+        {
+            throw new InvalidOperationException("bootstrap manifest 签名校验失败");
+        }
+        return Encoding.UTF8.GetString(Base64UrlDecode(payloadB64));
+    }
+
+    private static byte[] Base64UrlDecode(string value)
+    {
+        var s = value.Trim().Replace('-', '+').Replace('_', '/');
+        switch (s.Length % 4)
+        {
+            case 2: s += "=="; break;
+            case 3: s += "="; break;
+        }
+        return Convert.FromBase64String(s);
+    }
+
+    private static string JsonStringFromManifest(string manifestJson, params string[] names)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(manifestJson);
+            return JsonString(doc.RootElement, names);
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string JsonString(JsonElement element, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String)
+            {
+                return value.GetString() ?? "";
+            }
+        }
+        return "";
+    }
+
+    private static string NormalizePemNewlines(string value)
+    {
+        return (value ?? "").Replace("\\r\\n", "\n").Replace("\\n", "\n").Trim();
+    }
+
+    private static string NormalizeSha256Array(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            var pins = new List<string>();
+            foreach (var item in element.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    var pin = NormalizeSha256List(item.GetString() ?? "");
+                    if (!string.IsNullOrWhiteSpace(pin))
+                    {
+                        pins.Add(pin);
+                    }
+                }
+            }
+            return string.Join(",", pins);
+        }
+        return element.ValueKind == JsonValueKind.String ? NormalizeSha256List(element.GetString() ?? "") : "";
+    }
+
+    private static string NormalizeSha256List(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "";
+        }
+        var pins = value
+            .Split(new[] { ',', ';', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => x.Trim().Replace(":", "").Replace("-", "").ToLowerInvariant())
+            .Where(x => Regex.IsMatch(x, "^[0-9a-f]{64}$"))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+        return string.Join(",", pins);
+    }
+
     private static string WriteEnrollParamsFile(
         InstallRequest request,
         EndpointConfig endpoint,
         string effectiveProxyUrl,
         string effectiveRelayUrl,
+        BootstrapTrustMaterial bootstrap,
         string installPath,
         string uiLogDir)
     {
@@ -1090,7 +1351,11 @@ public partial class MainWindow : Window
             ["proxy_mode"] = NormalizeProxyMode(request.ProxyMode),
             ["proxy_url"] = effectiveProxyUrl,
             ["relay_url"] = effectiveRelayUrl,
-            ["key_provider"] = "pem",
+            ["key_provider"] = "cng",
+            ["bootstrap_manifest_verified"] = bootstrap.Enabled,
+            ["bootstrap_manifest_key_id"] = bootstrap.KeyId,
+            ["bootstrap_ca_pem"] = bootstrap.CaPem,
+            ["bootstrap_tls_leaf_sha256"] = bootstrap.LeafSha256,
             ["install_mode"] = normalizedMode,
             ["runtime_mode"] = runtimeMode,
             ["trust_ca"] = request.TrustCa,
@@ -1183,8 +1448,8 @@ public partial class MainWindow : Window
     {
         var candidates = new[]
         {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EDR Agent", "setup-ui"),
-            Path.Combine(Path.GetTempPath(), "EDR Agent", "setup-ui"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "FDSecurity", "setup-ui"),
+            Path.Combine(Path.GetTempPath(), "FDSecurity", "setup-ui"),
             fallbackDir
         };
         foreach (var candidate in candidates)
@@ -1226,7 +1491,7 @@ public partial class MainWindow : Window
             {
                 ext = ".exe";
             }
-            var cached = Path.Combine(cacheDir, "edr_agent_setup_" + hash[..12] + ext);
+            var cached = Path.Combine(cacheDir, "FDSecuritySetup_" + hash[..12] + ext);
             var sidecar = cached + ".sha256";
             var cachedOk = false;
             if (File.Exists(cached) && File.Exists(sidecar))
@@ -1384,7 +1649,7 @@ public partial class MainWindow : Window
         var skipped = new List<string>();
 
         CopyDirectoryIfExists(uiLogDir, Path.Combine(staging, "setup-ui"), skipped);
-        var commonHandoffDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EDR Agent", "setup-ui");
+        var commonHandoffDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "FDSecurity", "setup-ui");
         if (!string.Equals(Path.GetFullPath(uiLogDir), Path.GetFullPath(commonHandoffDir), StringComparison.OrdinalIgnoreCase))
         {
             CopyDirectoryIfExists(commonHandoffDir, Path.Combine(staging, "setup-handoff"), skipped);
@@ -1574,6 +1839,9 @@ public sealed class InstallRequest
     public string ProxyUser { get; set; } = "";
     public string ProxyPassword { get; set; } = "";
     public string RelayUrl { get; set; } = "";
+    public string BootstrapManifestUrl { get; set; } = "";
+    public string BootstrapManifestPath { get; set; } = "";
+    public string BootstrapManifestJson { get; set; } = "";
     public string InstallPath { get; set; } = "";
     public bool InstallAutorun { get; set; } = true;
     public bool TrustCa { get; set; }
@@ -1616,3 +1884,8 @@ public sealed class CheckItem
 public sealed record EndpointConfig(string ServerBase, string RestBase, string EnrollUrl, string ReadyUrl);
 
 public sealed record InstallStageState(string Stage, string Detail, int Progress);
+
+public sealed record BootstrapTrustMaterial(bool Enabled, string KeyId, string CaPem, string LeafSha256)
+{
+    public static BootstrapTrustMaterial Empty { get; } = new(false, "", "", "");
+}

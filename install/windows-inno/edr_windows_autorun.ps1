@@ -1,10 +1,10 @@
 #Requires -Version 5.1
 <#
-  安装 / 卸载 EDR Agent 的「开机常驻」与可选安装目录 ACL 加固。
+  安装 / 卸载 FDSecurity 的「开机常驻」与可选安装目录 ACL 加固。
   - Install：注册计划任务（SYSTEM、开机触发、无执行时限）；默认立即启动一次，传 -NoStart 时只注册不启动。
-  - Remove：停止任务、结束 edr_agent 进程、按名停止可能残留的 ETW 实时会话、重置 ACL、注销任务（供 Inno UninstallRun 调用）。
+  - Remove：停止任务、结束 FDSensor 进程、按名停止可能残留的 ETW 实时会话、重置 ACL、注销任务（供 Inno UninstallRun 调用）。
 
-  说明：edr_agent 为控制台程序，未实现 SCM ServiceMain；以「计划任务 + SYSTEM」实现重启后仍在。
+  说明：FDSensor 为控制台程序，未实现 SCM ServiceMain；以「计划任务 + SYSTEM」实现重启后仍在。
   管理员仍可强制删除文件；加固仅提高普通用户随意改删的成本。正式卸载应使用「程序和功能」中的卸载项（unins000.exe）。
 #>
 param(
@@ -16,19 +16,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$TaskName = "EdrAgent"
+$TaskName = "FDSecurityAgent"
+$LegacyTaskName = "EdrAgent"
 $instDir = $PSScriptRoot
 
 function Stop-AgentProcess {
+  Stop-Process -Name "FDSensor" -Force -ErrorAction SilentlyContinue
   Stop-Process -Name "edr_agent" -Force -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 400
 }
 
 function Remove-ScheduledTaskIfPresent {
-  try {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  } catch {}
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+  foreach ($name in @($TaskName, $LegacyTaskName)) {
+    try {
+      Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    } catch {}
+    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+  }
 }
 
 function Reset-InstallDirAcl {
@@ -40,14 +44,17 @@ function Reset-InstallDirAcl {
 function Set-InstallDirAclHarden {
   param([string]$Dir)
   if (-not (Test-Path -LiteralPath $Dir)) { return }
-  # SID：SYSTEM / Administrators 完全控制；Users 仅读取+执行（否则普通用户无法运行 edr_agent.exe 或读 agent.toml，会报「拒绝访问」）
+  # SID：SYSTEM / Administrators 完全控制；Users 仅读取+执行（否则普通用户无法运行 FDSensor.exe 或读 agent.toml，会报「拒绝访问」）
   & icacls.exe $Dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
 }
 
 if ($Action -eq "Remove") {
   Remove-ScheduledTaskIfPresent
   Stop-AgentProcess
-  $exeCleanup = Join-Path $instDir "edr_agent.exe"
+  $exeCleanup = Join-Path $instDir "FDSensor.exe"
+  if (-not (Test-Path -LiteralPath $exeCleanup)) {
+    $exeCleanup = Join-Path $instDir "edr_agent.exe"
+  }
   if (Test-Path -LiteralPath $exeCleanup) {
     try {
       & $exeCleanup --etw-uninstall-cleanup
@@ -58,7 +65,10 @@ if ($Action -eq "Remove") {
 }
 
 # --- Install ---
-$exe = Join-Path $instDir "edr_agent.exe"
+$exe = Join-Path $instDir "FDSensor.exe"
+if (-not (Test-Path -LiteralPath $exe)) {
+  $exe = Join-Path $instDir "edr_agent.exe"
+}
 $cfg = Join-Path $instDir "agent.toml"
 
 if (-not (Test-Path -LiteralPath $exe)) {

@@ -548,6 +548,9 @@ else()
 endif()
 
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
+if(WIN32)
+  set_target_properties(edr_agent PROPERTIES OUTPUT_NAME "FDSensor")
+endif()
 
 target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include

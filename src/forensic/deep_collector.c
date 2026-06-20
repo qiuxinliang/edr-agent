@@ -31,7 +31,7 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
 
   char collector_path[MAX_PATH];
   snprintf(collector_path, sizeof(collector_path),
-           "%s", "C:\\Program Files\\EDR Agent\\collector\\forensic_collector.exe");
+           "%s", "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe");
 
   HANDLE job = CreateJobObject(NULL, NULL);
   if (job) {
