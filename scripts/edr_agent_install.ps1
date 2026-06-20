@@ -1218,6 +1218,7 @@ $ControlProfileID = if ($d.control_profile_id) { [string]$d.control_profile_id }
 $ConfigSigningKeyID = if ($d.config_signing_key_id) { [string]$d.config_signing_key_id } else { "" }
 $ConfigSigningPublicKeyPEM = if ($d.config_signing_public_key_pem) { [string]$d.config_signing_public_key_pem } else { "" }
 $ConfigSignatureRequired = if ($null -ne $d.config_signature_required) { [bool]$d.config_signature_required } else { [bool]($ConfigSigningKeyID -and $ConfigSigningPublicKeyPEM) }
+$CommandSigningPublicKeyPEM = if ($d.command_signing_public_key_pem) { [string]$d.command_signing_public_key_pem } else { "" }
 $RulesURL = if ($d.rules_url) { [string]$d.rules_url } else { "$agentApiBase/agent/rules.toml" }
 $P0BundleURL = if ($d.p0_bundle_url) { [string]$d.p0_bundle_url } else { "$agentApiBase/agent/p0-bundle.enc" }
 $SensorInterestURL = if ($d.sensor_interest_url) { [string]$d.sensor_interest_url } else { "$agentApiBase/agent/sensor-interest.json" }
@@ -2062,6 +2063,9 @@ if ($d.client_key) {
 }
 if (-not $d.ca_cert -and $bootstrapCaAvailable) {
   Write-PemNoBom -Path $CaCertPath -Text ([System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($BootstrapCaCertPath))))
+}
+if ($CommandSigningPublicKeyPEM) {
+  Write-PemNoBom -Path $TomlSigningPublicKeyPath -Text $CommandSigningPublicKeyPEM
 }
 
 $dir = Split-Path -Parent $Output

@@ -21,6 +21,7 @@ namespace EDRAgent.SetupUi;
 
 public partial class MainWindow : Window
 {
+    private const string StagedSetupUiEnvVar = "FDSECURITY_SETUP_UI_STAGED";
     private const int WmNcLButtonDown = 0x00A1;
     private const int HtCaption = 2;
     private const int ProbeTimeoutSeconds = 15;
@@ -61,6 +62,11 @@ public partial class MainWindow : Window
         ContentRendered -= OnContentRendered;
         var uiLog = Path.Combine(ResolveSetupUiLogDirectory(), "setup-ui.log");
         AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] content_rendered base={_baseDir}");
+        if (TryRelaunchFromLocalCache(uiLog))
+        {
+            Close();
+            return;
+        }
         LoadingPanel.Visibility = Visibility.Visible;
         LoadingText.Text = "正在定位安装包...";
         _setupPath = ResolveSetupPath();
@@ -843,6 +849,59 @@ public partial class MainWindow : Window
         }
 
         return Path.Combine(_baseDir, "FDSecuritySetup.exe");
+    }
+
+    private bool TryRelaunchFromLocalCache(string uiLog)
+    {
+        try
+        {
+            if (string.Equals(Environment.GetEnvironmentVariable(StagedSetupUiEnvVar), "1", StringComparison.Ordinal))
+            {
+                return false;
+            }
+            if (!ShouldStageSetupUiDirectory(_baseDir))
+            {
+                return false;
+            }
+            var processPath = Environment.ProcessPath ?? "";
+            if (string.IsNullOrWhiteSpace(processPath) || !File.Exists(processPath))
+            {
+                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_skipped reason=process_path_missing base={_baseDir}");
+                return false;
+            }
+            var sourceRoot = Path.GetFullPath(_baseDir);
+            var cacheRoot = ResolveSetupUiAppCacheRoot();
+            var cacheKey = ComputeShortHash(sourceRoot + "|" + GetFileCacheKey(processPath));
+            var targetRoot = Path.Combine(cacheRoot, cacheKey);
+            Directory.CreateDirectory(targetRoot);
+            CopySetupUiRuntime(sourceRoot, targetRoot, uiLog);
+            var stagedExe = Path.Combine(targetRoot, Path.GetFileName(processPath));
+            if (!File.Exists(stagedExe))
+            {
+                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_failed missing={stagedExe}");
+                return false;
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = stagedExe,
+                UseShellExecute = false,
+                WorkingDirectory = targetRoot
+            };
+            foreach (var arg in Environment.GetCommandLineArgs().Skip(1))
+            {
+                psi.ArgumentList.Add(arg);
+            }
+            psi.Environment[StagedSetupUiEnvVar] = "1";
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_relaunch source={sourceRoot} target={targetRoot} exe={stagedExe}");
+            Process.Start(psi);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_skipped error={ex.Message}");
+            return false;
+        }
     }
 
     private Dictionary<string, object?> LoadPreconfig()
@@ -1818,6 +1877,120 @@ public partial class MainWindow : Window
         {
             return false;
         }
+    }
+
+    private static bool ShouldStageSetupUiDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+        {
+            return false;
+        }
+        if (IsUncPath(path) ||
+            path.Contains(@"\DavWWWRoot\", StringComparison.OrdinalIgnoreCase) ||
+            path.Contains(@"@9843\", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                return false;
+            }
+            var drive = new DriveInfo(root);
+            return drive.DriveType == DriveType.Network || drive.DriveType == DriveType.Removable;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ResolveSetupUiAppCacheRoot()
+    {
+        var candidates = new List<string>();
+        AddAbsoluteCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "FDSecurity", "setup-ui", "app-cache");
+        AddAbsoluteCandidate(candidates, Environment.GetEnvironmentVariable("ProgramData") ?? "", "FDSecurity", "setup-ui", "app-cache");
+        AddAbsoluteCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FDSecurity", "setup-ui", "app-cache");
+        AddAbsoluteCandidate(candidates, Path.GetTempPath(), "FDSecurity", "setup-ui", "app-cache");
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                Directory.CreateDirectory(candidate);
+                var probe = Path.Combine(candidate, ".write-test-" + Guid.NewGuid().ToString("N"));
+                File.WriteAllText(probe, "ok");
+                File.Delete(probe);
+                return candidate;
+            }
+            catch
+            {
+                // Try next cache root.
+            }
+        }
+        return Path.Combine(Path.GetTempPath(), "FDSecurity", "setup-ui", "app-cache");
+    }
+
+    private static string ComputeShortHash(string value)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes).ToLowerInvariant()[..16];
+    }
+
+    private static void CopySetupUiRuntime(string sourceRoot, string targetRoot, string uiLog)
+    {
+        foreach (var directory in Directory.EnumerateDirectories(sourceRoot, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(sourceRoot, directory);
+            if (ShouldSkipSetupUiStagePath(relative))
+            {
+                continue;
+            }
+            Directory.CreateDirectory(Path.Combine(targetRoot, relative));
+        }
+        foreach (var file in Directory.EnumerateFiles(sourceRoot, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(sourceRoot, file);
+            if (ShouldSkipSetupUiStagePath(relative))
+            {
+                continue;
+            }
+            var target = Path.Combine(targetRoot, relative);
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(target) ?? targetRoot);
+                if (File.Exists(target))
+                {
+                    var srcInfo = new FileInfo(file);
+                    var dstInfo = new FileInfo(target);
+                    if (srcInfo.Length == dstInfo.Length && srcInfo.LastWriteTimeUtc <= dstInfo.LastWriteTimeUtc)
+                    {
+                        continue;
+                    }
+                }
+                File.Copy(file, target, true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_copy_skipped file={file} error={ex.Message}");
+            }
+        }
+    }
+
+    private static bool ShouldSkipSetupUiStagePath(string relative)
+    {
+        var parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return parts.Any(part =>
+            part.Equals("setup-cache", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("app-cache", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("setup-ui-runtime", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("webview2", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("EBWebView", StringComparison.OrdinalIgnoreCase) ||
+            part.Equals("diagnostics", StringComparison.OrdinalIgnoreCase)) ||
+            relative.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ||
+            relative.EndsWith(".log", StringComparison.OrdinalIgnoreCase) ||
+            relative.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildInstallFailureDetail(string installPath, string innoLog, string handoffDir)
