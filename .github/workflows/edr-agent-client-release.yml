@@ -26,7 +26,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (edr_agent.exe + runtime DLLs, fast no-gRPC)
+    name: Build Windows (FDSensor.exe + runtime DLLs, fast no-gRPC)
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
     runs-on: windows-latest
     timeout-minutes: 360
@@ -265,8 +265,8 @@ jobs:
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
         run: |
-          $exe = @("build\edr_agent.exe", "build\Release\edr_agent.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-          if (-not $exe) { throw "edr_agent.exe not found after build" }
+          $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe", "build\edr_agent.exe", "build\Release\edr_agent.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $exe) { throw "FDSensor.exe not found after build" }
           $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
           if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
           if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
@@ -274,7 +274,7 @@ jobs:
             throw "EDR_AGENT_VERSION was not resolved from the release tag"
           }
           if (-not $text.Contains($env:EDR_AGENT_VERSION)) {
-            throw "edr_agent.exe does not contain release version '$env:EDR_AGENT_VERSION'"
+            throw "FDSensor.exe does not contain release version '$env:EDR_AGENT_VERSION'"
           }
 
       - name: sccache stats
@@ -321,18 +321,27 @@ jobs:
         run: |
           $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
           $outDir = $null
+          $agentExe = $null
           foreach ($c in @("build\Release", "build")) {
-            if (Test-Path (Join-Path $c "edr_agent.exe")) {
+            $preferred = Join-Path $c "FDSensor.exe"
+            $legacy = Join-Path $c "edr_agent.exe"
+            if (Test-Path -LiteralPath $preferred) {
               $outDir = $c
+              $agentExe = $preferred
+              break
+            }
+            if (Test-Path -LiteralPath $legacy) {
+              $outDir = $c
+              $agentExe = $legacy
               break
             }
           }
-          if (-not $outDir) { throw "missing edr_agent.exe under build\Release or build" }
+          if (-not $outDir -or -not $agentExe) { throw "missing FDSensor.exe under build\Release or build" }
           $items = New-Object System.Collections.Generic.List[string]
           if (-not $env:EDR_AGENT_VERSION) { throw "EDR_AGENT_VERSION was not resolved from the release tag" }
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
-          $null = $items.Add((Join-Path $outDir "edr_agent.exe"))
+          $null = $items.Add($agentExe)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @(

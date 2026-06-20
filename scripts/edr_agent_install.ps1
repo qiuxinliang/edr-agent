@@ -10,7 +10,7 @@
   可选：
     EDR_API_BASE / EDR_ENROLL_TOKEN  兼容旧版环境变量传参
     EDR_OUTPUT              输出路径，Windows 默认 C:\Program Files\FDSecurity\agent.toml
-    EDR_AGENT_VERSION       默认使用环境变量；否则读取包内 VERSION；再否则 0.3.0
+    EDR_AGENT_VERSION       默认使用环境变量；否则读取包内 VERSION / 可执行文件版本；再否则 unknown
     EDR_FORCE_ENROLL=1      已存在 agent.toml 时仍强制重新 enroll
     EDR_OVERRIDE_SERVER_ADDR
     EDR_PROXY_MODE=auto|off|explicit
@@ -185,13 +185,49 @@ function Resolve-AgentVersion {
   if ($env:EDR_AGENT_VERSION -and $env:EDR_AGENT_VERSION.Trim()) {
     return $env:EDR_AGENT_VERSION.Trim()
   }
-  foreach ($vf in @((Join-Path $PSScriptRoot "VERSION"), (Join-Path (Split-Path -Parent $PSScriptRoot) "VERSION"))) {
+
+  $dirs = @()
+  if ($PSScriptRoot) {
+    $dirs += $PSScriptRoot
+    $parent = Split-Path -Parent $PSScriptRoot
+    if ($parent) { $dirs += $parent }
+  }
+  if ($Output) {
+    $outDir = Split-Path -Parent $Output
+    if ($outDir) { $dirs += $outDir }
+  }
+  try {
+    $cwd = (Get-Location).Path
+    if ($cwd) { $dirs += $cwd }
+  } catch {
+  }
+
+  foreach ($dir in ($dirs | Where-Object { $_ } | Select-Object -Unique)) {
+    $vf = Join-Path $dir "VERSION"
     if (Test-Path -LiteralPath $vf) {
       $v = ([System.IO.File]::ReadAllText($vf)).Trim()
       if ($v) { return $v }
     }
   }
-  return "0.3.0"
+
+  foreach ($dir in ($dirs | Where-Object { $_ } | Select-Object -Unique)) {
+    foreach ($exeName in @("FDSensor.exe", "edr_agent.exe")) {
+      $exe = Join-Path $dir $exeName
+      if (Test-Path -LiteralPath $exe) {
+        try {
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          foreach ($candidate in @($info.ProductVersion, $info.FileVersion)) {
+            if ($candidate -and $candidate.Trim() -and $candidate.Trim() -ne "0.0.0.0") {
+              return $candidate.Trim()
+            }
+          }
+        } catch {
+        }
+      }
+    }
+  }
+
+  return "unknown"
 }
 
 function Read-AgentTomlScalar {
@@ -210,6 +246,7 @@ function Read-AgentTomlScalar {
 }
 
 $av = Resolve-AgentVersion
+Write-Host "Resolved agent_version=$av"
 if ($env:EDR_MAX_EVENT_QUEUE_SIZE) {
   try {
     $MaxEventQueueSize = [int]$env:EDR_MAX_EVENT_QUEUE_SIZE

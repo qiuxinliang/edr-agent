@@ -59,7 +59,7 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #endif
 
 #ifndef EDR_AGENT_VERSION_STRING
-#define EDR_AGENT_VERSION_STRING "0.3.0"
+#define EDR_AGENT_VERSION_STRING "unknown"
 #endif
 
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01

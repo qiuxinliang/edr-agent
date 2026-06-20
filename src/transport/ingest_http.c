@@ -53,7 +53,7 @@ typedef int EdrSocket;
 #endif
 
 #ifndef EDR_AGENT_VERSION_STRING
-#define EDR_AGENT_VERSION_STRING "0.3.0"
+#define EDR_AGENT_VERSION_STRING "unknown"
 #endif
 
 static char s_rest[512];

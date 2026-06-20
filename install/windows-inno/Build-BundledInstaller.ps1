@@ -7,13 +7,13 @@
 
   Examples:
     .\edr-agent\install\windows-inno\Build-BundledInstaller.ps1
-    .\Build-BundledInstaller.ps1 -AppVersion 2.2.0
+    .\Build-BundledInstaller.ps1 -AppVersion 3.2.0
     .\Build-BundledInstaller.ps1 -BinDir "D:\staged\edr-release" -Inno "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 #>
 param(
     [string] $Inno = "",
     [string] $BinDir = "",
-    [string] $AppVersion = "2.2.0"
+    [string] $AppVersion = ""
 )
 if (-not $Inno) {
     $pf86 = [Environment]::GetFolderPath("ProgramFilesX86")
@@ -44,6 +44,25 @@ if (-not (Test-Path -LiteralPath $binExe)) {
 
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
+
+$versionFile = Join-Path $BinDir "VERSION"
+$sourceVersionFile = Join-Path $agentRoot "VERSION"
+if (-not $AppVersion) {
+    foreach ($candidate in @($versionFile, $sourceVersionFile)) {
+        if (Test-Path -LiteralPath $candidate) {
+            $candidateVersion = ([System.IO.File]::ReadAllText($candidate)).Trim()
+            if ($candidateVersion) {
+                $AppVersion = $candidateVersion
+                break
+            }
+        }
+    }
+}
+if (-not $AppVersion) {
+    throw "AppVersion was not provided and no VERSION file was found. Pass -AppVersion or stage a VERSION file next to FDSensor.exe."
+}
+[System.IO.File]::WriteAllText($versionFile, $AppVersion + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
+Write-Host "Staged VERSION: $AppVersion"
 
 $modelsDir = Join-Path $agentRoot "models"
 if (Test-Path -LiteralPath $modelsDir) {

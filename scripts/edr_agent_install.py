@@ -8,7 +8,7 @@
 
 可选：
   EDR_OUTPUT              输出路径，默认当前目录 agent.toml
-  EDR_AGENT_VERSION       默认 0.3.0
+  EDR_AGENT_VERSION       默认读取 VERSION；再否则 unknown
   EDR_OVERRIDE_SERVER_ADDR  覆盖响应中的 server_addr 写入 [server].address
   EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
   EDR_INSECURE_TLS=1      跳过 TLS 证书校验（仅调试）
@@ -91,6 +91,36 @@ def _detect_os() -> str:
     if plat == "darwin":
         return "darwin"
     return "linux"
+
+
+def _resolve_agent_version(output_path: str) -> str:
+    env_version = os.environ.get("EDR_AGENT_VERSION", "").strip()
+    if env_version:
+        return env_version
+
+    dirs = [
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent.parent,
+    ]
+    if output_path:
+        dirs.append(Path(output_path).expanduser().resolve().parent)
+    dirs.append(Path.cwd())
+
+    seen = set()
+    for directory in dirs:
+        key = str(directory)
+        if key in seen:
+            continue
+        seen.add(key)
+        version_file = directory / "VERSION"
+        try:
+            version = version_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if version:
+            return version
+
+    return "unknown"
 
 
 def _hostname() -> str:
@@ -334,7 +364,8 @@ def main() -> None:
         print("Set EDR_API_BASE and EDR_ENROLL_TOKEN", file=sys.stderr)
         sys.exit(2)
 
-    av = os.environ.get("EDR_AGENT_VERSION", "0.3.0").strip() or "0.3.0"
+    av = _resolve_agent_version(args.output)
+    print(f"Resolved agent_version={av}")
     ca_path, cert_path, key_path = _default_cert_paths()
     csr_path = _default_csr_path(key_path)
     key_provider = _normalize_key_provider()
