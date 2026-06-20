@@ -1536,11 +1536,15 @@ function Optimize-GeneratedToml([string]$TomlText) {
       continue
     }
     $clean = Remove-TomlCommentSuffix $line
-    if ($clean.Trim() -eq "") {
+    $cleanTrim = $clean.Trim()
+    if ($cleanTrim -eq "") {
       if (-not $blank -and $out.Count -gt 0) {
         $out.Add("") | Out-Null
         $blank = $true
       }
+      continue
+    }
+    if (-not $cleanTrim.Contains("=") -and -not ($cleanTrim.StartsWith("[") -and $cleanTrim.EndsWith("]"))) {
       continue
     }
     $out.Add($clean) | Out-Null

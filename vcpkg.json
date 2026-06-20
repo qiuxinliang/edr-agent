@@ -14,14 +14,6 @@
     "sqlite3"
   ],
   "features": {
-    "grpc-client": {
-      "description": "Enable the real gRPC EventIngest client and proto regeneration toolchain.",
-      "dependencies": [
-        "grpc",
-        "protobuf",
-        "openssl"
-      ]
-    },
     "sqlite": {
       "description": "Enable SQLite-backed queues and AVE metadata tests.",
       "dependencies": [

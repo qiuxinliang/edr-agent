@@ -88,6 +88,10 @@ else()
   endif()
 endif()
 
+target_link_libraries(test_ave_fp PRIVATE edr_ave_test_common)
+target_link_libraries(test_ave_infer PRIVATE edr_ave_test_common)
+target_link_libraries(test_ave_phase1 PRIVATE edr_ave_test_common)
+
 add_executable(test_ave_sdk ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_sdk.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
 target_link_libraries(test_ave_sdk PRIVATE edr_ave_test_common)
 add_executable(test_ave_fl_abi ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_fl_abi.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
@@ -106,29 +110,6 @@ if(WIN32)
 else()
   target_sources(test_ave_sdk PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
   target_sources(test_ave_fl_abi PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
-endif()
-if(FALSE AND SQLite3_FOUND)
-  add_executable(test_fl_ave_samples_bridge ${CMAKE_CURRENT_SOURCE_DIR}/test_fl_ave_samples_bridge.c
-    ${CMAKE_SOURCE_DIR}/src/fl_trainer/fl_samples_db.c
-    ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
-  target_link_libraries(test_fl_ave_samples_bridge PRIVATE edr_ave_test_common)
-  target_include_directories(test_fl_ave_samples_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src/fl_trainer)
-  if(WIN32)
-    target_sources(test_fl_ave_samples_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src/attack_surface/listen_table_win.c)
-    target_sources(test_fl_ave_samples_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_win.c)
-  else()
-    target_sources(test_fl_ave_samples_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
-  endif()
-  edr_apply_common_warnings(test_fl_ave_samples_bridge)
-  if(EDR_ONNXRUNTIME_AVAILABLE)
-    target_compile_definitions(test_fl_ave_samples_bridge PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-    target_include_directories(test_fl_ave_samples_bridge PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-    target_link_libraries(test_fl_ave_samples_bridge PRIVATE ${ONNXRUNTIME_LIB})
-    if(APPLE)
-      get_filename_component(_edr_ort_libdir_bridge "${ONNXRUNTIME_LIB}" DIRECTORY)
-      set_target_properties(test_fl_ave_samples_bridge PROPERTIES BUILD_RPATH "${_edr_ort_libdir_bridge}")
-    endif()
-  endif()
 endif()
 
 # static + behavior ONNX 同一进程全流程（须 ORT + model_dir 下 release 产物）
@@ -155,15 +136,7 @@ add_executable(test_ave_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_suppres
   ${CMAKE_SOURCE_DIR}/src/ave/ave_suppression.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_rules_meta.c
 )
-target_include_directories(test_ave_suppression PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
-if(SQLite3_FOUND)
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_ave_suppression PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_ave_suppression PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_ave_suppression PRIVATE EDR_HAVE_SQLITE=1)
-endif()
+target_link_libraries(test_ave_suppression PRIVATE edr_ave_test_common)
 
 add_executable(test_detection_decision ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
@@ -245,26 +218,10 @@ target_include_directories(test_preprocess_dedup PRIVATE ${CMAKE_SOURCE_DIR}/inc
 edr_apply_common_warnings(test_preprocess_dedup)
 add_test(NAME preprocess_dedup COMMAND test_preprocess_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+set(_edr_test_ave_pipeline_sources ${_edr_test_ave_sdk_sources})
+list(REMOVE_ITEM _edr_test_ave_pipeline_sources ${CMAKE_SOURCE_DIR}/src/ave/fl_feature_provider.c)
 add_executable(test_ave_pipeline ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_pipeline.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_sdk.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_suppression.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_rules_meta.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_behavior_pipeline.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_behavior_features.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_feed.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_lf_mpmc.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_hotfix.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_db_update.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-  ${CMAKE_SOURCE_DIR}/src/core/edr_log.c
-  ${CMAKE_SOURCE_DIR}/src/config/config.c
-  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
-  ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
-  ${_edr_test_behavior_emit_sources}
-)
+  ${_edr_test_ave_pipeline_sources} ${_edr_test_behavior_emit_sources})
 target_link_libraries(test_ave_pipeline PRIVATE edr_ave_test_common)
 if(WIN32)
   target_sources(test_ave_pipeline PRIVATE ${CMAKE_SOURCE_DIR}/src/attack_surface/listen_table_win.c)
@@ -393,48 +350,22 @@ if(EDR_WITH_FL_TRAINER)
   add_test(NAME fl_pb_gradient_chunk COMMAND test_fl_pb_gradient_chunk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()
 
-if(WIN32)
-  target_compile_definitions(test_ave_fp PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_infer PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_suppression PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_OS_WINDOWS=1)
-else()
-  target_compile_definitions(test_ave_fp PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_infer PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_suppression PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_OS_POSIX=1)
-endif()
-
 if(EDR_ONNXRUNTIME_AVAILABLE)
-  target_compile_definitions(test_ave_fp PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_infer PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_include_directories(test_ave_fp PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_infer PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_sdk PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_fl_abi PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_pipeline PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_e2e_full PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_hotfix_smoke PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(test_ave_fp PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_infer PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_sdk PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_fl_abi PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_pipeline PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_e2e_full PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_hotfix_smoke PRIVATE ${ONNXRUNTIME_LIB})
+  add_library(edr_ave_onnx_test_common INTERFACE)
+  target_compile_definitions(edr_ave_onnx_test_common INTERFACE EDR_HAVE_ONNXRUNTIME=1)
+  target_include_directories(edr_ave_onnx_test_common INTERFACE ${ONNXRUNTIME_INCLUDE_DIR})
+  target_link_libraries(edr_ave_onnx_test_common INTERFACE ${ONNXRUNTIME_LIB})
+
+  foreach(_edr_onnx_test_target IN ITEMS
+      test_ave_fp
+      test_ave_infer
+      test_ave_sdk
+      test_ave_fl_abi
+      test_ave_pipeline
+      test_ave_e2e_full
+      test_ave_hotfix_smoke)
+    target_link_libraries(${_edr_onnx_test_target} PRIVATE edr_ave_onnx_test_common)
+  endforeach()
 
   add_executable(test_ave_static_onnx_integration ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_static_onnx_integration.c
     ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c
@@ -448,12 +379,10 @@ if(EDR_ONNXRUNTIME_AVAILABLE)
     ${CMAKE_SOURCE_DIR}/src/ave
     ${CMAKE_SOURCE_DIR}/third_party/tomlc99
   )
-  target_compile_definitions(test_ave_static_onnx_integration PRIVATE EDR_HAVE_ONNXRUNTIME=1)
   target_compile_definitions(test_ave_static_onnx_integration PRIVATE
     "EDR_TEST_FIXTURE_ONNX=\"${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx\""
   )
-  target_include_directories(test_ave_static_onnx_integration PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(test_ave_static_onnx_integration PRIVATE ${ONNXRUNTIME_LIB} Threads::Threads)
+  target_link_libraries(test_ave_static_onnx_integration PRIVATE edr_ave_onnx_test_common Threads::Threads)
   if(UNIX AND NOT WIN32)
     target_link_libraries(test_ave_static_onnx_integration PRIVATE m)
   endif()
@@ -485,13 +414,12 @@ if(EDR_ONNXRUNTIME_AVAILABLE)
       ${CMAKE_SOURCE_DIR}/src/ave
       ${CMAKE_SOURCE_DIR}/third_party/tomlc99
     )
-    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_HAVE_ONNXRUNTIME=1 EDR_WITH_AVE_BEHAVIOR_ONNX=1)
+    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_WITH_AVE_BEHAVIOR_ONNX=1)
     target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE
       "EDR_TEST_BEHAVIOR_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx\""
       "EDR_TEST_BEHAVIOR_SEQ128_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx\""
     )
-    target_include_directories(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-    target_link_libraries(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_LIB} Threads::Threads)
+    target_link_libraries(test_ave_behavior_onnx_integration PRIVATE edr_ave_onnx_test_common Threads::Threads)
     if(UNIX AND NOT WIN32)
       target_link_libraries(test_ave_behavior_onnx_integration PRIVATE m)
     endif()
@@ -576,9 +504,6 @@ target_include_directories(test_ave_static_features PRIVATE ${CMAKE_SOURCE_DIR}/
 add_test(NAME ave_static_features_lite512 COMMAND test_ave_static_features WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_sdk_smoke COMMAND test_ave_sdk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_fl_abi_c0 COMMAND test_ave_fl_abi WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-if(FALSE AND SQLite3_FOUND)
-  add_test(NAME fl_ave_samples_bridge COMMAND test_fl_ave_samples_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-endif()
 add_test(NAME ave_suppression_sqlite COMMAND test_ave_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_scan_pipeline COMMAND test_ave_pipeline WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME config_fingerprint COMMAND test_config_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

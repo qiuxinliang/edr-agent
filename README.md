@@ -81,12 +81,12 @@ cmake --build build
 
 - **对最终功能的影响**：在**相同 CMake 选项、相同 triplet/依赖**下，下述只缩短编链与 IO；**不**为「加速」单独关功能开关或改源码。杀软排除、盘符、vcpkg 二进制缓存、sccache 均为**环境/缓存层**。详见 Windows 专篇 **[docs/WINDOWS_BUILD_SPEED.md](docs/WINDOWS_BUILD_SPEED.md)**。
 - **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
-  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认**只装 `curl`**（`EDR_WITH_GRPC=OFF` 时须内嵌 libcurl）。`cmake --preset w-vcpkg-ninja-dev` 默认**不编 gRPC**（快）。需要 **gRPC 客户端**时再装 **`vcpkg install --x-feature=grpc-client`** 并用 **`w-vcpkg-ninja-grpc-ort`** 或 **`-DEDR_WITH_GRPC=ON`**。全量 gRPC+ORT 用 `w-vcpkg-ninja-grpc-ort` 并设 `ONNXRUNTIME_ROOT`。  
+  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认安装产品主线依赖（HTTPS REST/SQLite 等）。`cmake --preset w-vcpkg-ninja-dev` 用于日常快编；需要带 static ONNX Runtime 与 YARA 的发版候选时用 **`w-vcpkg-ninja-ort-yara`** 并设置 `ONNXRUNTIME_ROOT`。历史 preset **`w-vcpkg-ninja-grpc-ort`** 仅保留为兼容别名，实际仍是 no-gRPC 构建。
   - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
   - **跨平台快编预设**：`any-ninja-fast-dev`（默认开 `EDR_ENABLE_COMPILER_CACHE=ON`），`any-ninja-fast-release-lto`（额外开 `EDR_ENABLE_IPO=ON`，工具链不支持时自动降级并告警）。
 - **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
-  `$env:VCPKG_BINARY_SOURCES="clear;files,$HOME\.vcpkg-bincache,readwrite"` 后再 `vcpkg install`，gRPC/SSL 等命中缓存时冷启动明显变短；或参考 **`scripts/vcpkg_binary_cache_env.example.ps1`**。CI 中已用 `VCPKG_BINARY_SOURCES` + 缓存目录，与本地思路一致。
-- **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须已进 **vcvars / x64 本机工具** 环境）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-build-grpc-ort` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
+  `$env:VCPKG_BINARY_SOURCES="clear;files,$HOME\.vcpkg-bincache,readwrite"` 后再 `vcpkg install`，curl/OpenSSL/SQLite 等命中缓存时冷启动明显变短；或参考 **`scripts/vcpkg_binary_cache_env.example.ps1`**。CI 中已用 `VCPKG_BINARY_SOURCES` + 缓存目录，与本地思路一致。
+- **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须已进 **vcvars / x64 本机工具** 环境）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-client-release` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
 - **统一加速开关**（可显式覆盖）：`EDR_ENABLE_COMPILER_CACHE`（默认 `ON`，自动探测 `sccache` 优先于 `ccache`）、`EDR_ENABLE_UNITY_BUILD`（默认 `OFF`）、`EDR_ENABLE_IPO`（默认 `OFF`）。
 
 **终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、模型目录与离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
@@ -95,16 +95,17 @@ cmake --build build
 
 **Windows 生产部署（服务账户、ETW/WinDivert 预检、`sc` 示例草案）**：见 **`docs/WINDOWS_DEPLOY.md`**（**AGT-006 已关闭**）；索引见 **`deploy/README.md`**。管理端 zip / MSI 流水线以 **edr-backend** 文档为准。
 
-**无 MSVC、仅验证 Windows 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、**gRPC/protobuf/vcpkg** 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查）。
+**无 MSVC、仅验证 Windows 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、MinGW 依赖与 vcpkg 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查）。
 
-**本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；**默认不装 gRPC**；需要真实 gRPC 客户端时设 **`EDR_WITH_GRPC=ON`**。
+**本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；产品主线不再编译端侧 gRPC 客户端，事件与控制面走 HTTPS REST/HTTP 长轮询。
 
-### CMake 与 gRPC 可选依赖
+### CMake 与传输 / 模型可选依赖
 
 | 选项 | 含义 |
 |------|------|
-| `EDR_WITH_GRPC`（默认 `OFF`） | 为 `ON` 且系统能 `find_package(gRPC CONFIG)` 时，链接 **gRPC++** 与 **protobuf**，编译真实 `grpc_client_impl.cpp` 与 `src/grpc_gen/edr/v1/*.cc`。 |
-| `EDR_WITH_GRPC=OFF`（默认） | 不依赖 gRPC，改用 `grpc_client_stub.c`；gRPC 批上送等不启用，**事件**走已配置的 **HTTP** 上送。 |
+| `EDR_WITH_GRPC` | 已废弃。设为 `ON` 会在 CMake 阶段失败；端侧产品构建统一使用 HTTPS REST ingest/control。 |
+| `EDR_WITH_INGEST_HTTPS_OPENSSL` | 启用 native HTTPS REST 上报路径；Windows 产品构建默认要求可用。 |
+| `EDR_WITH_HTTP2_CURL` / `EDR_REQUIRE_CURL_HTTP2` | 启用 libcurl HTTP/2 控制/上报能力；需要 curl headers 暴露 `CURL_VERSION_HTTP2`。 |
 | `EDR_WITH_LINUX_COLLECTOR`（默认 `ON`，**仅 Linux**） | 为 `ON` 时编入 `src/collector/collector_linux.c`；为 `OFF` 时在 Linux 上退回 `collector_stub.c`（与其它 POSIX 一致）。**Windows 不受影响**（始终使用 `collector_win.c`）。 |
 | `EDR_WITH_ONNXRUNTIME`（默认 `OFF`） | 为 `ON` 且能 `find_path`/`find_library` 找到 **ONNX Runtime**（头文件 `onnxruntime_c_api.h` 与 `libonnxruntime`）时，定义 **`EDR_HAVE_ONNXRUNTIME`**；主进程在 **`edr_agent_init`** 中通过 **`AVE_InitFromEdrConfig(&cfg)`**（见 `ave_sdk.h`）在 **`[ave] model_dir`** 下加载**首个** `.onnx` 做真推理；未找到库时 CMake **告警**并仍按无 ONNX 编译。可通过 **`ONNXRUNTIME_ROOT`** 指向解压的预编译包。**联调步骤**见 **[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**。 |
 
@@ -118,9 +119,7 @@ cmake --build build
 
 若 `etw_enabled = false`，不创建 inotify 线程（与 Windows 下不启 ETW 会话一致）。监视目录不存在或不可读时，启动会失败并打印 `[collector_linux]` 提示。
 
-若已安装 gRPC（如 macOS `brew install grpc`），CMake 会搜索 `/usr/local` 与 `/opt/homebrew`。**不要**在工程中再单独 `find_package(Protobuf)`，以免与 gRPC 自带的 Protobuf 目标冲突。
-
-**Windows 清单模式（`vcpkg.json`）**：仓库内仅声明 `dependencies: [grpc]`；CI 对 vcpkg 作浅克隆，**不**在清单里写过旧的 `builtin-baseline`（老 commit 可能缺 `versions/baseline.json` 与浅克隆不兼容）。若需钉死 port 版本，在**全量** vcpkg 克隆上执行 `vcpkg x-update-baseline` 后提交，并在 CI 中改为**非** `--depth 1` 的 vcpkg 克隆，或 `git fetch` 到该基线。
+**Windows 清单模式（`vcpkg.json`）**：仓库内声明产品主线依赖（curl/OpenSSL/SQLite/PCRE2 等），不再包含 `grpc-client` feature。CI 对 vcpkg 作浅克隆，**不**在清单里写过旧的 `builtin-baseline`（老 commit 可能缺 `versions/baseline.json` 与浅克隆不兼容）。若需钉死 port 版本，在**全量** vcpkg 克隆上执行 `vcpkg x-update-baseline` 后提交，并在 CI 中改为**非** `--depth 1` 的 vcpkg 克隆，或 `git fetch` 到该基线。
 
 ### §17 Shellcode 检测引擎（Windows）
 

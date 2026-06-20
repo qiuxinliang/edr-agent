@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在 Linux 容器（Docker / Podman）内用 apt 安装 CMake、Ninja 与依赖，编译 **本机 Linux** 版 edr_agent。
-# 适用于：本机未装 CMake/gRPC、CI、或 IDE 沙箱等隔离环境，与 Trae/云端沙箱「干净环境装依赖再编」同一思路。
+# 适用于：本机未装 CMake、CI、或 IDE 沙箱等隔离环境，与 Trae/云端沙箱「干净环境装依赖再编」同一思路。
 #
 # 用法（在 edr-agent 仓库根）：
 #   chmod +x scripts/build_linux_native_docker.sh
@@ -10,7 +10,7 @@
 #   EDR_CONTAINER           容器 CLI，默认自动探测 docker → podman（与 build_windows_mingw_docker.sh 一致）
 #   EDR_LINUX_DOCKER_IMAGE  默认 ubuntu:22.04
 #   EDR_LINUX_DOCKER_EXTRA  附加 docker run 参数，如 '--network host'
-#   EDR_WITH_GRPC           默认 OFF；设为 ON 则 apt 装 gRPC 并链接真实客户端
+#   EDR_WITH_GRPC           已废弃；脚本固定产品主线 no-gRPC，并忽略该旧环境变量
 #   EDR_RUN_CTEST           设为 1 时在构建后执行 ctest（部分测试依赖环境，失败时可关）
 #   http_proxy / https_proxy  传入容器（宿主机已设时自动 -e）
 set -euo pipefail
@@ -19,7 +19,9 @@ cd "$ROOT"
 OUTDIR="build-linux"
 IMAGE="${EDR_LINUX_DOCKER_IMAGE:-ubuntu:22.04}"
 EXTRA="${EDR_LINUX_DOCKER_EXTRA:-}"
-REQUIRE_GRPC="${EDR_WITH_GRPC:-OFF}"
+if [[ -n "${EDR_WITH_GRPC:-}" && "${EDR_WITH_GRPC}" != "OFF" && "${EDR_WITH_GRPC}" != "0" && "${EDR_WITH_GRPC}" != "off" ]]; then
+  echo "[warn] EDR_WITH_GRPC is deprecated and ignored; endpoint product builds use HTTP ingest/control only."
+fi
 
 ENGINE="${EDR_CONTAINER:-}"
 if [[ -z "$ENGINE" ]]; then
@@ -44,7 +46,6 @@ if [[ -n "${HTTPS_PROXY:-}" ]]; then PROXY_ARGS+=(-e "HTTPS_PROXY=${HTTPS_PROXY}
 # shellcheck disable=SC2086
 "$ENGINE" run --rm \
   "${PROXY_ARGS[@]}" \
-  -e "EDR_WITH_GRPC=${REQUIRE_GRPC}" \
   -e "EDR_RUN_CTEST=${EDR_RUN_CTEST:-0}" \
   ${EXTRA} \
   -v "$ROOT:/work" \
@@ -60,18 +61,11 @@ for attempt in 1 2 3 4 5; do
 done
 
 BASE_PKGS="build-essential cmake ninja-build pkg-config ca-certificates libsqlite3-dev"
-if [[ "${EDR_WITH_GRPC}" == "ON" ]] || [[ "${EDR_WITH_GRPC}" == "1" ]] || [[ "${EDR_WITH_GRPC}" == "on" ]]; then
-  apt-get install -y -qq --no-install-recommends ${BASE_PKGS} \
-    libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc libssl-dev
-else
-  apt-get install -y -qq --no-install-recommends ${BASE_PKGS}
-fi
+apt-get install -y -qq --no-install-recommends ${BASE_PKGS}
 
 rm -rf build-linux
 cmake -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DEDR_WITH_GRPC="$(
-    if [[ "${EDR_WITH_GRPC}" == "OFF" ]] || [[ "${EDR_WITH_GRPC}" == "0" ]] || [[ "${EDR_WITH_GRPC}" == "off" ]]; then echo OFF; else echo ON; fi
-  )" \
+  -DEDR_WITH_GRPC=OFF \
   -S .
 cmake --build build-linux --target edr_agent -j"$(nproc 2>/dev/null || echo 4)"
 

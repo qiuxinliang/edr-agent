@@ -210,6 +210,21 @@ if (-not $publishDir) {
     throw "Publish directory not found. Checked: $($publishDirCandidates -join '; ')"
 }
 
+$requiredPublishFiles = @(
+    "FDSecuritySetupUI.exe",
+    "Microsoft.Web.WebView2.Core.dll",
+    "Microsoft.Web.WebView2.Wpf.dll"
+)
+if ($selfContained -eq "true") {
+    $requiredPublishFiles += "System.Drawing.dll"
+}
+foreach ($requiredPublishFile in $requiredPublishFiles) {
+    $requiredPath = Join-Path $publishDir $requiredPublishFile
+    if (-not (Test-Path -LiteralPath $requiredPath)) {
+        throw "Publish missing required runtime file: $requiredPublishFile"
+    }
+}
+
 Copy-Item -LiteralPath $SetupExe -Destination (Join-Path $publishDir "FDSecuritySetup.exe") -Force
 $uiExe = Join-Path $publishDir "FDSecuritySetupUI.exe"
 $bundledSetupExe = Join-Path $publishDir "FDSecuritySetup.exe"

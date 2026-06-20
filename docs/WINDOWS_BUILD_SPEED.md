@@ -13,7 +13,7 @@
 
 ## 发版/验收
 
-- **Release 安装包**应继续使用既有流水线（如 `w-vcpkg-ninja-grpc-ort` 全特性或与 `edr-agent-client-release` 一致选项），在 CI 中做**可复现**构建；上表措施与「开发机日常调试」不冲突。  
+- **Release 安装包**应继续使用既有流水线（如 `w-vcpkg-ninja-ort-yara` 或与 `edr-agent-client-release` 一致选项），在 CI 中做**可复现**构建；历史 preset `w-vcpkg-ninja-grpc-ort` 仅保留为 no-gRPC 兼容别名。上表措施与「开发机日常调试」不冲突。
 - **仅当**你刻意换 `CMAKE_BUILD_TYPE`（如 Debug / RelWithDebInfo / Release）时，**优化与调试符号**会不同，这是预期差异，**不是**因缓存/杀软排除本身引入的逻辑分支。
 
 ## 与「只 MinGW/交叉编」的区分

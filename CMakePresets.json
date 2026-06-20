@@ -50,12 +50,12 @@
       }
     },
     {
-      "name": "w-vcpkg-ninja-grpc-ort",
-      "displayName": "Win vcpkg+Ninja 全量（static ONNXRuntime，legacy preset name）",
+      "name": "w-vcpkg-ninja-ort-yara",
+      "displayName": "Win vcpkg+Ninja 全量（HTTPS REST + static ONNXRuntime + YARA）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "需环境变量 ONNXRUNTIME_ROOT=解压的 onnxruntime 根目录。",
+      "description": "产品主线固定 no-gRPC/no-FL；需环境变量 ONNXRUNTIME_ROOT=解压的 onnxruntime 根目录。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -70,6 +70,12 @@
         "EDR_WITH_FL_KAFKA": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
+    },
+    {
+      "name": "w-vcpkg-ninja-grpc-ort",
+      "displayName": "DEPRECATED alias: use w-vcpkg-ninja-ort-yara",
+      "inherits": "w-vcpkg-ninja-ort-yara",
+      "description": "历史兼容别名；实际仍为 no-gRPC 产品构建，请改用 w-vcpkg-ninja-ort-yara。"
     },
     {
       "name": "l-ninja-dev",
@@ -144,6 +150,10 @@
     {
       "name": "w-vcpkg-ninja-nogrpc",
       "configurePreset": "w-vcpkg-ninja-nogrpc"
+    },
+    {
+      "name": "w-vcpkg-ninja-ort-yara",
+      "configurePreset": "w-vcpkg-ninja-ort-yara"
     },
     {
       "name": "w-vcpkg-ninja-grpc-ort",

@@ -1,6 +1,6 @@
-# Legacy gRPC专项构建已退出产品主线。保留文件用于历史追溯，默认不再运行。
+# Legacy ORT 专项构建已退出产品主线。保留文件用于历史追溯，默认不再运行。
 
-name: edr-agent legacy gRPC build (disabled)
+name: edr-agent legacy ORT build (disabled)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: edr-agent-grpc-ort-ci-${{ github.ref }}
+  group: edr-agent-legacy-ort-ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -54,9 +54,9 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-grpc-ci-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/edr-agent-build-grpc-ort.yml', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
+          key: vcpkg-x64-win-legacy-ort-ci-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/edr-agent-build-grpc-ort.yml', '.github/workflows/edr-agent-client-release.yml') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-grpc-ci-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-x64-win-legacy-ort-ci-${{ hashFiles('vcpkg.json') }}-
 
       - name: Clone and bootstrap vcpkg
         working-directory: ${{ github.workspace }}
@@ -79,13 +79,8 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara
-          if (-not (Test-Path "vcpkg_installed\x64-windows\tools\protobuf\protoc.exe")) { throw "vcpkg install: protoc not found" }
+          & $tc install --x-feature=sqlite --x-feature=yara
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Regenerate ingest gRPC C++ (match vcpkg protobuf)
-        shell: pwsh
-        run: ./scripts/regen_ingest_proto.ps1 -VcpkgInstalledX64 $env:VCPKG_INSTALLED_X64
 
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}

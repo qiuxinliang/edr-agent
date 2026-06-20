@@ -96,35 +96,31 @@ EDR_MINGW_DOCKER_IMAGE=ubuntu:24.04 ./scripts/build_windows_mingw_docker.sh
 - **不要随意**对构建目录做 `rm -rf` 后再排错：失败分析依赖目录内保留的 **`CMakeCache.txt`**、**`build.ninja`**、目标文件 **`*.obj`**、依赖 **`*.d`**，以及若生成的 **`compile_commands.json`**。
 - 约定：本地与终端流水线在**未有意全量清理**前，保留上一次完整配置与编译产物，便于对照日志、复现链接行与头文件路径。
 
-### 2. gRPC 真客户端与脚本默认行为（重要）
+### 2. 产品主线 no-gRPC 与脚本默认行为（重要）
 
-为避免「CMake 过了但实际仍编进 **`grpc_client_stub.c`**」：
+端点产品构建已移除 gRPC 客户端，MinGW 交叉编译只验证 Windows 目标主线代码是否能通过编译：
 
-- `scripts/build_windows_mingw.sh` / `scripts/build_windows_mingw_docker.sh` 默认 **`EDR_REQUIRE_GRPC=1`**：若 **`build-mingw/CMakeCache.txt`** 中 **`EDR_GRPC_CLIENT_AVAILABLE:INTERNAL`** 不为 **`1`**，脚本直接失败。
-- 临时只想验证非 gRPC 模块时：
-
-```bash
-EDR_REQUIRE_GRPC=0 ./scripts/build_windows_mingw.sh
-```
-
-集成与发布环境建议始终保持 **`EDR_REQUIRE_GRPC=1`**，确保产物含真实 gRPC 客户端。
-
-### 3. MinGW 侧 gRPC / Protobuf（vcpkg 等）
-
-**让 CMake 找到 Windows 目标的包**（常见为 **vcpkg** 的 `x64-mingw-static` 安装树）：
-
-- **CONFIG 路径（vcpkg 典型布局）**：`<prefix>/share/grpc/gRPCConfig.cmake`、`<prefix>/share/protobuf/protobuf-config.cmake`（部分发行版也可能在 `lib/cmake/...`，以实际树为准）。
-- 构建时传入前缀，例如：
+- `scripts/build_windows_mingw.sh` / `scripts/build_windows_mingw_docker.sh` 固定传入 **`-DEDR_WITH_GRPC=OFF`**。
+- `EDR_REQUIRE_GRPC` 已废弃，不再参与脚本检查。
+- 需要 curl/nghttp2 等 Windows 目标依赖时，设置 **`EDR_MINGW_DEPS_PREFIX`** 指向 vcpkg `installed/<triplet>`。
 
 ```bash
-EDR_MINGW_GRPC_PREFIX=/path/to/vcpkg/installed/x64-mingw-static \
+EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-static \
 ./scripts/build_windows_mingw.sh
 ```
 
-**交叉编译时 `protoc`：** `gRPCConfig.cmake` 会拉取 **Protobuf**；宿主机跑 CMake 时必须能解析 **`Protobuf_PROTOC_EXECUTABLE`**。本仓库 **`cmake/mingw-w64-x86_64.cmake`** 在设置了 **`EDR_MINGW_GRPC_PREFIX`** 时，会将 **`Protobuf_PROTOC_EXECUTABLE`** 指到 **`<prefix>/tools/protobuf/protoc`**（vcpkg 提供的可在 macOS 上运行的生成器）。若仍失败，请确认该路径存在且与前缀一致。
+旧变量 **`EDR_MINGW_GRPC_PREFIX`** 仅作为兼容别名保留，建议新脚本和文档统一使用 **`EDR_MINGW_DEPS_PREFIX`**。
 
-**vcpkg 根目录路径：** 含**空格**的路径曾导致部分 port（如 OpenSSL）配置失败；可将 **`vcpkg`** 目录同步到无空格路径（例如 **`/tmp/vcpkg-mingw-grpc`**）再执行 **`install`**。**edr-agent** 源码可仍在原路径。
+### 3. MinGW 侧目标依赖（vcpkg 等）
 
-**生成代码与库版本一致：** `proto/edr/v1/ingest.proto` 生成的 **`src/grpc_gen/edr/v1/ingest.{pb.h,pb.cc,grpc.pb.h,grpc.pb.cc}`** 必须与**实际链接的** `libprotobuf` / 头文件版本一致（`ingest.pb.h` 内有 **`PROTOBUF_VERSION`** 检查）。升级 vcpkg 中的 **protobuf/grpc** 后，请用**同一安装前缀**下的 **`protoc`**，以及宿主机可用的 **`grpc_cpp_plugin`**（vcpkg 常见在 **`installed/<host-triplet>/tools/grpc/grpc_cpp_plugin`**）重新生成，避免不完整类型或 `#error` 版本不匹配。
+**让 CMake 找到 Windows 目标的包**（常见为 **vcpkg** 的 `x64-mingw-static` 安装树）：
 
-**可选：grpc 大对象：** 若 MinGW 编 **grpc** 时出现 **`.obj` file too big**，可在对应 **triplet** 中为 **`VCPKG_C_FLAGS` / `VCPKG_CXX_FLAGS`** 增加 **`-Wa,-mbig-obj`**（见 vcpkg **community** triplet 实践）。
+- **CONFIG 路径（vcpkg 典型布局）**：`<prefix>/share/curl/CURLConfig.cmake`、`<prefix>/share/openssl/OpenSSLConfig.cmake`、`<prefix>/share/sqlite3/SQLite3Config.cmake` 等（部分发行版也可能在 `lib/cmake/...`，以实际树为准）。
+- 构建时传入前缀，例如：
+
+```bash
+EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-static \
+./scripts/build_windows_mingw.sh
+```
+
+**vcpkg 根目录路径：** 含**空格**的路径曾导致部分 port（如 OpenSSL）配置失败；可将 **`vcpkg`** 目录同步到无空格路径（例如 **`/tmp/vcpkg-mingw-deps`**）再执行 **`install`**。**edr-agent** 源码可仍在原路径。

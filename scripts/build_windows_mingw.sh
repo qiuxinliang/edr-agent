@@ -11,8 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 TOOLCHAIN="$ROOT/cmake/mingw-w64-x86_64.cmake"
 OUTDIR="${ROOT}/build-mingw"
-REQUIRE_GRPC="${EDR_REQUIRE_GRPC:-1}"
-GRPC_PREFIX="${EDR_MINGW_GRPC_PREFIX:-}"
+DEPS_PREFIX="${EDR_MINGW_DEPS_PREFIX:-${EDR_MINGW_GRPC_PREFIX:-}}"
 
 print_build_fingerprint() {
   local bin_path="$1"
@@ -50,22 +49,11 @@ build_local() {
     -DEDR_REQUIRE_CURL_HTTP2=ON
     -S "$ROOT"
   )
-  if [[ -n "$GRPC_PREFIX" ]]; then
-    export EDR_MINGW_GRPC_PREFIX="$GRPC_PREFIX"
-    cmake_args+=("-DCMAKE_PREFIX_PATH=$GRPC_PREFIX")
+  if [[ -n "$DEPS_PREFIX" ]]; then
+    export EDR_MINGW_DEPS_PREFIX="$DEPS_PREFIX"
+    cmake_args+=("-DCMAKE_PREFIX_PATH=$DEPS_PREFIX")
   fi
   cmake "${cmake_args[@]}"
-  if [[ "$REQUIRE_GRPC" == "1" ]]; then
-    if ! awk 'BEGIN{ok=0} $0=="EDR_GRPC_CLIENT_AVAILABLE:INTERNAL=1"{ok=1} END{exit(ok?0:1)}' "$OUTDIR/CMakeCache.txt"; then
-      echo "ERROR: configure succeeded but gRPC client is unavailable (would fall back to stub)."
-      echo "Hint:"
-      echo "  - provide MinGW-targeted grpc/protobuf via EDR_MINGW_GRPC_PREFIX"
-      echo "  - verify gRPC CMake package: <prefix>/share/grpc/gRPCConfig.cmake (vcpkg layout)"
-      echo "  - verify protobuf CMake package: <prefix>/share/protobuf/protobuf-config.cmake"
-      echo "  - to bypass check temporarily: EDR_REQUIRE_GRPC=0 $0"
-      exit 2
-    fi
-  fi
   cmake --build "$OUTDIR" --target edr_agent -j"${NPROC:-4}"
   echo "OK: $OUTDIR/FDSensor.exe (MinGW)"
   ls -la "$OUTDIR"/FDSensor.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent 2>/dev/null || true

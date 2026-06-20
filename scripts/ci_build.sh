@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本地/CI：无 gRPC 与有 gRPC 两种配置各构建一次（第二段在已安装 grpc 的机器上可选）
+# 本地/CI：产品主线构建。gRPC 客户端已从 Agent 产品构建移除，当前仅验证 HTTP ingest/control 路径。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -20,29 +20,18 @@ print_build_fingerprint() {
   echo "=== build fingerprint: git=${git_short}(${git_dirty}) sha256=${bin_sha} mtime=${bin_mtime} bin=${bin_path}"
 }
 
-echo "=== CMake: EDR_WITH_GRPC=OFF ==="
-cmake -B build-nogrpc -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build-nogrpc -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-if [[ -f "$ROOT/build-nogrpc/FDSensor.exe" ]]; then
-  print_build_fingerprint "$ROOT/build-nogrpc/FDSensor.exe"
-elif [[ -f "$ROOT/build-nogrpc/edr_agent" ]]; then
-  print_build_fingerprint "$ROOT/build-nogrpc/edr_agent"
-elif [[ -f "$ROOT/build-nogrpc/edr_agent.exe" ]]; then
-  print_build_fingerprint "$ROOT/build-nogrpc/edr_agent.exe"
-fi
-ctest --test-dir build-nogrpc --output-on-failure
+BUILD_DIR="$ROOT/build-product"
 
-if cmake -B build-grpc -DCMAKE_BUILD_TYPE=Release 2>/dev/null; then
-  echo "=== CMake: default (gRPC if found) ==="
-  cmake --build build-grpc -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-  if [[ -f "$ROOT/build-grpc/FDSensor.exe" ]]; then
-    print_build_fingerprint "$ROOT/build-grpc/FDSensor.exe"
-  elif [[ -f "$ROOT/build-grpc/edr_agent" ]]; then
-    print_build_fingerprint "$ROOT/build-grpc/edr_agent"
-  elif [[ -f "$ROOT/build-grpc/edr_agent.exe" ]]; then
-    print_build_fingerprint "$ROOT/build-grpc/edr_agent.exe"
-  fi
-  ctest --test-dir build-grpc --output-on-failure || true
+echo "=== CMake: product build (HTTP ingest/control, no gRPC) ==="
+cmake -B "$BUILD_DIR" -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build "$BUILD_DIR" -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+if [[ -f "$BUILD_DIR/FDSensor.exe" ]]; then
+  print_build_fingerprint "$BUILD_DIR/FDSensor.exe"
+elif [[ -f "$BUILD_DIR/edr_agent" ]]; then
+  print_build_fingerprint "$BUILD_DIR/edr_agent"
+elif [[ -f "$BUILD_DIR/edr_agent.exe" ]]; then
+  print_build_fingerprint "$BUILD_DIR/edr_agent.exe"
 fi
+ctest --test-dir "$BUILD_DIR" --output-on-failure
 
 echo "ci_build.sh 完成"

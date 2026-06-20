@@ -11,7 +11,8 @@
 #   EDR_MINGW_DOCKER_IMAGE   默认 ubuntu:22.04（可改为 ubuntu:24.04 等）
 #   EDR_MINGW_DOCKER_EXTRA   附加 docker run 参数，例如 '--network host'（部分网络环境 apt 更稳）
 #   http_proxy / https_proxy  传入容器（若宿主机已设，会自动 -e 传入）
-#   EDR_MINGW_GRPC_PREFIX     Windows 目标依赖前缀，需含 curl+nghttp2+grpc/protobuf（vcpkg installed/<triplet>）
+#   EDR_MINGW_DEPS_PREFIX     Windows 目标依赖前缀，需含 curl+nghttp2（vcpkg installed/<triplet>）
+#   EDR_MINGW_GRPC_PREFIX     兼容旧变量名，等同于 EDR_MINGW_DEPS_PREFIX
 # 终端编译注意：宿主机侧 build-mingw/ 与容器内产物宜保留以便后查，勿习惯性全删（见 docs/WINDOWS_CROSS_COMPILE.md「终端编译注意要点」）。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,8 +21,7 @@ TOOLCHAIN="cmake/mingw-w64-x86_64.cmake"
 OUTDIR="build-mingw"
 IMAGE="${EDR_MINGW_DOCKER_IMAGE:-ubuntu:22.04}"
 EXTRA="${EDR_MINGW_DOCKER_EXTRA:-}"
-REQUIRE_GRPC="${EDR_REQUIRE_GRPC:-1}"
-DEPS_PREFIX="${EDR_MINGW_GRPC_PREFIX:-}"
+DEPS_PREFIX="${EDR_MINGW_DEPS_PREFIX:-${EDR_MINGW_GRPC_PREFIX:-}}"
 
 ENGINE="${EDR_CONTAINER:-}"
 if [[ -z "$ENGINE" ]]; then
@@ -59,8 +59,7 @@ fi
 # shellcheck disable=SC2086
 "$ENGINE" run --rm \
   "${PROXY_ARGS[@]}" \
-  -e "EDR_REQUIRE_GRPC=${REQUIRE_GRPC}" \
-  -e "EDR_MINGW_GRPC_PREFIX=${DEPS_PREFIX}" \
+  -e "EDR_MINGW_DEPS_PREFIX=${DEPS_PREFIX}" \
   ${EXTRA} \
   -v "$ROOT:/work" \
   -w /work \
@@ -77,20 +76,13 @@ for attempt in 1 2 3 4 5; do
 done
 apt-get install -y -qq --no-install-recommends \
   mingw-w64 cmake ninja-build ca-certificates
-if [[ -z "${EDR_MINGW_GRPC_PREFIX:-}" || ! -f "${EDR_MINGW_GRPC_PREFIX}/include/curl/curl.h" ]]; then
+if [[ -z "${EDR_MINGW_DEPS_PREFIX:-}" || ! -f "${EDR_MINGW_DEPS_PREFIX}/include/curl/curl.h" ]]; then
   echo "ERROR: EDR_WITH_HTTP2_CURL=ON requires a Windows-target dependency prefix with curl/nghttp2."
-  echo "Set EDR_MINGW_GRPC_PREFIX to vcpkg installed/<triplet> containing include/curl/curl.h and libcurl."
+  echo "Set EDR_MINGW_DEPS_PREFIX to vcpkg installed/<triplet> containing include/curl/curl.h and libcurl."
   exit 2
 fi
 rm -rf build-mingw
-cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -S .
-if [[ "${EDR_REQUIRE_GRPC:-0}" == "1" ]]; then
-  if ! awk '"'"'BEGIN{ok=0} $0=="EDR_GRPC_CLIENT_AVAILABLE:INTERNAL=1"{ok=1} END{exit(ok?0:1)}'"'"' build-mingw/CMakeCache.txt; then
-    echo "ERROR: container MinGW toolchain missing gRPC/protobuf for Windows target (stub would be used)."
-    echo "Set EDR_REQUIRE_GRPC=0 only if you intentionally want stub transport."
-    exit 2
-  fi
-fi
+cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -S .
 cmake --build build-mingw --target edr_agent -j4
 '
 

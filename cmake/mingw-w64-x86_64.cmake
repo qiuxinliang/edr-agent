@@ -17,14 +17,14 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 
-# vcpkg MinGW deps (e.g. gRPC): headers/libs and CONFIG packages under <prefix>/include, lib/, share/.
+# vcpkg MinGW deps: headers/libs and CONFIG packages under <prefix>/include, lib/, share/.
 # Without listing the prefix here, CMAKE_FIND_ROOT_PATH is empty and *_ONLY modes skip the install tree.
-if(DEFINED ENV{EDR_MINGW_GRPC_PREFIX} AND NOT "$ENV{EDR_MINGW_GRPC_PREFIX}" STREQUAL "")
-  list(PREPEND CMAKE_FIND_ROOT_PATH "$ENV{EDR_MINGW_GRPC_PREFIX}")
-  # gRPCConfig.cmake pulls find_dependency(Protobuf). Cross-compiling MinGW from macOS, CMake does not
-  # infer Protobuf_PROTOC_EXECUTABLE; vcpkg installs a host-runnable protoc under tools/protobuf/.
-  set(_edr_mingw_protoc "$ENV{EDR_MINGW_GRPC_PREFIX}/tools/protobuf/protoc")
-  if(EXISTS "${_edr_mingw_protoc}")
-    set(Protobuf_PROTOC_EXECUTABLE "${_edr_mingw_protoc}" CACHE FILEPATH "protoc (vcpkg tools/protobuf)" FORCE)
-  endif()
+set(_edr_mingw_deps_prefix "")
+if(DEFINED ENV{EDR_MINGW_DEPS_PREFIX} AND NOT "$ENV{EDR_MINGW_DEPS_PREFIX}" STREQUAL "")
+  set(_edr_mingw_deps_prefix "$ENV{EDR_MINGW_DEPS_PREFIX}")
+elseif(DEFINED ENV{EDR_MINGW_GRPC_PREFIX} AND NOT "$ENV{EDR_MINGW_GRPC_PREFIX}" STREQUAL "")
+  set(_edr_mingw_deps_prefix "$ENV{EDR_MINGW_GRPC_PREFIX}")
+endif()
+if(NOT "${_edr_mingw_deps_prefix}" STREQUAL "")
+  list(PREPEND CMAKE_FIND_ROOT_PATH "${_edr_mingw_deps_prefix}")
 endif()

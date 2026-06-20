@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
-  edr_agent:
+  fdsensor:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: edr_agent
+    container_name: fdsensor
     restart: unless-stopped
     environment:
       - EDR_CONFIG_PATH=/etc/edr/config
@@ -17,13 +15,14 @@ services:
       - ./config:/etc/edr/config:ro
       - edr_logs:/var/log/edr
       - edr_data:/var/lib/edr
-    resources:
-      limits:
-        cpus: '2.0'
-        memory: 512M
-      reservations:
-        cpus: '0.5'
-        memory: 128M
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
     network_mode: host
     cap_drop:
       - ALL

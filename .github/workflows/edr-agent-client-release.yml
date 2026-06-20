@@ -1,6 +1,6 @@
 # 独立 edr-agent 仓库：工作目录 = 本仓库根。母库默认发布快速 Windows Agent：
 # `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → `edr-agent-<tag>-windows-amd64-exe.zip`。
-# gRPC/全量依赖长链移至 edr-agent-build-grpc-ort.yml，避免 release 默认编译 grpc/protobuf。
+# YARA/ORT 全量依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
 

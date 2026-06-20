@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       full_features:
-        description: "Prebuild gRPC + YARA full dependency set (slow)"
+        description: "Prebuild YARA full dependency set (slow)"
         required: false
         type: boolean
         default: false
@@ -81,7 +81,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[Prebuild] Installing vcpkg packages from source (profile=$env:PREBUILD_PROFILE)..."
           if ($env:PREBUILD_PROFILE -eq "full") {
-            & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara --keep-going
+            & $tc install --x-feature=sqlite --x-feature=yara --keep-going
           } else {
             & $tc install --x-feature=sqlite --keep-going
           }
@@ -117,7 +117,7 @@ jobs:
           }
           # Recreate
           $now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss UTC')
-          $packages = if ($env:PREBUILD_PROFILE -eq "full") { "curl, grpc, protobuf, openssl, yara, pcre2, sqlite3" } else { "curl, sqlite3" }
+          $packages = if ($env:PREBUILD_PROFILE -eq "full") { "curl, openssl, yara, pcre2, sqlite3" } else { "curl, sqlite3" }
           $notes = @"
           vcpkg.json SHA256: $env:VCPKG_JSON_SHA256
           Platform: x64-windows
@@ -136,7 +136,7 @@ jobs:
         shell: pwsh
         run: |
           $packages = if ($env:PREBUILD_PROFILE -eq "full") {
-            @("curl", "grpc", "protobuf", "openssl", "yara", "pcre2", "sqlite3")
+            @("curl", "openssl", "yara", "pcre2", "sqlite3")
           } else {
             @("curl", "sqlite3")
           }

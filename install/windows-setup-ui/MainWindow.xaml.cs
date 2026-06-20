@@ -72,6 +72,7 @@ public partial class MainWindow : Window
         {
             LoadingText.Text = "正在初始化 WebView2...";
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_create_begin");
+            EnsureWebView2WpfDependencies();
             _browser = new WebView2();
             BrowserHost.Children.Add(_browser);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_env_begin");
@@ -84,7 +85,7 @@ public partial class MainWindow : Window
         {
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_failed {ex}");
             var choice = MessageBox.Show(
-                "FDSecurity 图形安装向导需要 Microsoft Edge WebView2 Runtime。\n\n" +
+                "FDSecurity 图形安装向导需要 Microsoft Edge WebView2 Runtime 和完整图形运行时依赖。\n\n" +
                 "可选 fallback：\n" +
                 "是：使用同目录传统 FDSecuritySetup.exe 继续安装。\n" +
                 "否：打开 Microsoft WebView2 Evergreen Runtime 下载页。\n" +
@@ -582,20 +583,33 @@ public partial class MainWindow : Window
         var healthPath = Path.Combine(diagnosticsDir, "install_health_report.json");
         var verifyPath = Path.Combine(diagnosticsDir, "install_runtime_verify.json");
         var startRuntimeLog = Path.Combine(diagnosticsDir, "start-runtime.log");
-        var taskLastResult = TryReadLastLogValue(startRuntimeLog, "task_last_result=");
-        var manualFallbackPid = TryReadLastLogValue(startRuntimeLog, "manual fallback pid=");
-        var runtimeNotStarted = LogContainsMarker(startRuntimeLog, "runtime_not_started");
-        var processPid = TryReadLastLogValue(startRuntimeLog, "process_pid=");
+        var startRuntimeLines = ReadLatestStartRuntimeLogLines(startRuntimeLog);
+        var taskLastResult = TryReadLastLogValue(startRuntimeLines, "task_last_result=");
+        var manualFallbackPid = TryReadLastLogValue(startRuntimeLines, "manual fallback pid=");
+        var processPid = TryReadLastLogValue(startRuntimeLines, "process_pid=");
+        var latestLogProcessAlive = LogContainsMarker(startRuntimeLines, "process_alive");
+        var latestLogRuntimeNotStarted = LogContainsMarker(startRuntimeLines, "runtime_not_started") &&
+            !latestLogProcessAlive &&
+            string.IsNullOrWhiteSpace(processPid);
+        var verifyStatus = TryReadJsonString(verifyPath, "status");
+        var verifyAgentRunning = TryReadJsonBool(verifyPath, "agent_process_running");
+        var agentRunning = verifyAgentRunning || latestLogProcessAlive || !string.IsNullOrWhiteSpace(processPid);
         var healthStatus = TryReadJsonString(healthPath, "status");
-        if (string.IsNullOrWhiteSpace(healthStatus))
+        if (!string.IsNullOrWhiteSpace(verifyStatus))
         {
-            healthStatus = TryReadJsonString(verifyPath, "status");
+            healthStatus = verifyStatus;
         }
-        if (runtimeNotStarted)
+        if (agentRunning && (string.IsNullOrWhiteSpace(healthStatus) ||
+                             healthStatus.Equals("ok", StringComparison.OrdinalIgnoreCase)))
+        {
+            healthStatus = "ok";
+        }
+        else if (!agentRunning && latestLogRuntimeNotStarted)
         {
             healthStatus = "error_runtime_not_started";
         }
-        if ((string.IsNullOrWhiteSpace(healthStatus) || healthStatus.Equals("ok", StringComparison.OrdinalIgnoreCase)) &&
+        if (!agentRunning &&
+            (string.IsNullOrWhiteSpace(healthStatus) || healthStatus.Equals("ok", StringComparison.OrdinalIgnoreCase)) &&
             !string.IsNullOrWhiteSpace(taskLastResult) &&
             !taskLastResult.Equals("0", StringComparison.OrdinalIgnoreCase))
         {
@@ -616,7 +630,7 @@ public partial class MainWindow : Window
             AgentVersion = TryReadJsonString(verifyPath, "agent_version"),
             HealthStatus = healthStatus,
             RuntimeMode = TryReadJsonString(verifyPath, "runtime_mode"),
-            AgentRunning = TryReadJsonBool(verifyPath, "agent_process_running") || (!runtimeNotStarted && !string.IsNullOrWhiteSpace(processPid)),
+            AgentRunning = agentRunning,
             ScheduledTaskLastResult = taskLastResult,
             ManualFallbackPid = manualFallbackPid
         };
@@ -2119,6 +2133,11 @@ public partial class MainWindow : Window
         return string.Empty;
     }
 
+    private static void EnsureWebView2WpfDependencies()
+    {
+        _ = System.Reflection.Assembly.Load("System.Drawing");
+    }
+
     private static bool TryReadJsonBool(string path, string property)
     {
         try
@@ -2136,15 +2155,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string TryReadLastLogValue(string path, string marker)
+    private static string TryReadLastLogValue(IReadOnlyList<string> lines, string marker)
     {
         try
         {
-            if (!File.Exists(path))
-            {
-                return string.Empty;
-            }
-            foreach (var line in File.ReadLines(path).Reverse())
+            foreach (var line in lines.Reverse())
             {
                 var idx = line.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
                 if (idx < 0)
@@ -2161,19 +2176,37 @@ public partial class MainWindow : Window
         return string.Empty;
     }
 
-    private static bool LogContainsMarker(string path, string marker)
+    private static bool LogContainsMarker(IReadOnlyList<string> lines, string marker)
+    {
+        return lines.Any(line => line.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static IReadOnlyList<string> ReadLatestStartRuntimeLogLines(string path)
     {
         try
         {
             if (!File.Exists(path))
             {
-                return false;
+                return Array.Empty<string>();
             }
-            return File.ReadLines(path).Any(line => line.Contains(marker, StringComparison.OrdinalIgnoreCase));
+            var lines = File.ReadAllLines(path);
+            var start = 0;
+            for (var i = lines.Length - 1; i >= 0; i--)
+            {
+                if (lines[i].Contains("stage=start-runtime begin", StringComparison.OrdinalIgnoreCase) ||
+                    lines[i].Contains("whoami=", StringComparison.OrdinalIgnoreCase) ||
+                    lines[i].Contains("Start-Service invoked", StringComparison.OrdinalIgnoreCase) ||
+                    lines[i].Contains("Start-ScheduledTask invoked", StringComparison.OrdinalIgnoreCase))
+                {
+                    start = i;
+                    break;
+                }
+            }
+            return lines.Skip(start).ToArray();
         }
         catch
         {
-            return false;
+            return Array.Empty<string>();
         }
     }
 

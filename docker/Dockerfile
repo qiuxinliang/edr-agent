@@ -6,7 +6,9 @@ RUN apt-get update && apt-get install -y \
     libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY edr_agent /usr/local/bin/
+ARG FDSENSOR_BIN=edr_agent
+
+COPY ${FDSENSOR_BIN} /usr/local/bin/FDSensor
 COPY config/ /etc/edr/config/
 
 RUN useradd -r -s /usr/sbin/nologin edragent
@@ -19,6 +21,4 @@ ENV EDR_CONFIG_PATH=/etc/edr/config
 ENV EDR_LOG_PATH=/var/log/edr
 ENV EDR_DATA_PATH=/var/lib/edr
 
-EXPOSE 8080
-
-ENTRYPOINT ["edr_agent"]
+ENTRYPOINT ["FDSensor"]
