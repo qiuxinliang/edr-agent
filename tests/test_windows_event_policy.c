@@ -398,6 +398,38 @@ static void test_empty_file_metadata_is_not_emitted(void) {
   assert(st.metadata_only == 1u);
 }
 
+static void test_invalid_file_path_metadata_is_not_emitted(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "ECAgent.exe");
+  snprintf(r.file_path, sizeof(r.file_path), "badname");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(strstr(p.reason, "invalid_file_path_metadata") != NULL);
+}
+
+static void test_ecagent_file_write_is_low_value_process(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventPolicy p;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  snprintf(r.process_name, sizeof(r.process_name), "ECAgent.exe");
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\ProgramData\\Sangfor\\SSL\\cache\\agent-state.dat");
+  edr_windows_event_policy_apply(&r);
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.applies);
+  assert(p.noisy);
+  assert(!p.high_value);
+  assert(!p.should_emit);
+  assert(!p.should_persist);
+  assert(strstr(p.reason, "known_low_value_file_process") != NULL);
+}
+
 static void test_search_protocolhost_cmdline_file_noise_is_not_emitted(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
@@ -480,6 +512,8 @@ int main(void) {
   test_driver_ads_enumeration_is_not_emitted();
   test_installservice_smartretry_task_is_not_emitted();
   test_empty_file_metadata_is_not_emitted();
+  test_invalid_file_path_metadata_is_not_emitted();
+  test_ecagent_file_write_is_low_value_process();
   test_search_protocolhost_cmdline_file_noise_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();

@@ -43,6 +43,41 @@ static const char *base_name(const char *path) {
   return b;
 }
 
+static int decision_is_file_event(EdrEventType t) {
+  return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE ||
+         t == EDR_EVENT_FILE_DELETE || t == EDR_EVENT_FILE_RENAME ||
+         t == EDR_EVENT_FILE_PERMISSION_CHANGE || t == EDR_EVENT_FILE_READ;
+}
+
+static int decision_file_path_usable_for_ransom(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if (!(strchr(path, '\\') || strchr(path, '/') ||
+        (isalpha((unsigned char)path[0]) && path[1] == ':') ||
+        has_ci(path, "\\device\\") || has_ci(path, "\\??\\"))) {
+    return 0;
+  }
+  const char *base = base_name(path);
+  return base && strlen(base) >= 3u;
+}
+
+static int decision_low_value_ransom_process(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  const char *s = r->process_name[0] ? r->process_name : r->exe_path;
+  return has_ci(s, "taskmgr.exe") || has_ci(s, "usoclient.exe") ||
+         has_ci(s, "taskhostw.exe") || has_ci(s, "ecagent.exe") ||
+         has_ci(s, "checknetisolation.exe") || has_ci(s, "conhost.exe");
+}
+
+static int decision_suppress_ransom_file_signal(const EdrBehaviorRecord *r) {
+  return r && decision_is_file_event(r->type) &&
+         (!decision_file_path_usable_for_ransom(r->file_path) ||
+          decision_low_value_ransom_process(r));
+}
+
 static int token_list_has_ci(const char *list, const char *value) {
   if (!list || !list[0] || !value || !value[0]) {
     return 0;
@@ -238,6 +273,9 @@ static int has_ransom_recovery_tamper_indicator(const EdrBehaviorRecord *r) {
 static int has_ransom_note_indicator(const EdrBehaviorRecord *r) {
   const char *path = r->file_path[0] ? r->file_path : r->exe_path;
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
+  if (decision_suppress_ransom_file_signal(r)) {
+    return 0;
+  }
   int note_name = has_ci(path, "readme") || has_ci(path, "decrypt") || has_ci(path, "recover") ||
                   has_ci(path, "restore-files") || has_ci(path, "how_to_decrypt") ||
                   has_ci(path, "how-to-decrypt") || has_ci(path, "ransom");
@@ -457,6 +495,9 @@ static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
   if (has_ransom_canary_indicator(r)) {
     return 1;
+  }
+  if (decision_suppress_ransom_file_signal(r)) {
+    return 0;
   }
   if (has_ransom_counter_allowlist_indicator(r)) {
     return 0;
@@ -1262,6 +1303,12 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
       ransom_chain_signal(r, ctx, parent_ctx, ransom, ransom_burst, ransom_note, ransom_note_burst, security_kill, remote,
                           script, script_sensor, exfil);
   int context_correlated = 0;
+  if (decision_suppress_ransom_file_signal(r)) {
+    ransom_burst = 0;
+    ransom_note = 0;
+    ransom_note_burst = 0;
+    memset(&ransom_chain, 0, sizeof(ransom_chain));
+  }
 
   float score = 0.20f;
   if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {

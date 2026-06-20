@@ -161,6 +161,24 @@ static int process_name_is(const EdrBehaviorRecord *r, const char *name) {
   return r && name && name[0] && has_ci_path(r->process_name, name);
 }
 
+static int file_path_usable_for_policy(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if (!(strchr(path, '\\') || strchr(path, '/') ||
+        (isalpha((unsigned char)path[0]) && path[1] == ':') ||
+        has_ci_path(path, "\\device\\") || has_ci_path(path, "\\??\\"))) {
+    return 0;
+  }
+  const char *base = path;
+  for (const char *p = path; *p; p++) {
+    if (*p == '\\' || *p == '/') {
+      base = p + 1;
+    }
+  }
+  return base && strlen(base) >= 3u;
+}
+
 static int record_mentions_process(const EdrBehaviorRecord *r, const char *name) {
   return r && name && name[0] &&
          (has_ci_path(r->process_name, name) || has_ci_path(r->exe_path, name) ||
@@ -174,7 +192,8 @@ static int low_value_file_process_record(const EdrBehaviorRecord *r) {
       "searchprotocolhost.exe", "searchfilterhost.exe", "ctfmon.exe",
       "compattelrunner.exe", "runtimebroker.exe",   "backgroundtaskhost.exe",
       "microsoftedgeupdate.exe", "officeclicktorun.exe", "msmpeng.exe",
-      "nissrv.exe",
+      "nissrv.exe",          "taskhostw.exe",       "usoclient.exe",
+      "checknetisolation.exe", "conhost.exe",       "ecagent.exe",
   };
   if (!r) {
     return 0;
@@ -320,6 +339,10 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       "\\ntds.dit", "\\config\\sam", "\\config\\system", "\\config\\security",
       "\\config\\software", "lsass.dmp", "\\lsass", "\\sam.save", "\\system.save",
   };
+  if (r->file_path[0] && !file_path_usable_for_policy(r->file_path)) {
+    mark_noisy(p, "invalid_file_path_metadata", "metadata_only");
+    return;
+  }
   if (!path || !path[0]) {
     if (g_event_filter_cfg.low_value_file_process && low_value_file_process_record(r)) {
       mark_noisy(p, "known_low_value_file_process", "noise_process");
@@ -636,7 +659,8 @@ static void record_event_filter_decision(const EdrBehaviorRecord *r,
              has_ci_path(p->reason, "known_windows_driver_enumeration")) {
     g_event_filter_windows_noise_path++;
   } else if (has_ci_path(p->reason, "ordinary_windows_metadata_only") ||
-             has_ci_path(p->reason, "empty_file_metadata")) {
+             has_ci_path(p->reason, "empty_file_metadata") ||
+             has_ci_path(p->reason, "invalid_file_path_metadata")) {
     g_event_filter_metadata_only++;
   }
   snprintf(g_event_filter_last_drop_reason, sizeof(g_event_filter_last_drop_reason), "%s",

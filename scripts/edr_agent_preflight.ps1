@@ -53,6 +53,24 @@ function Get-PathCount {
   }
 }
 
+function Test-CngKeyContainerExists {
+  param([string]$Name)
+  if (-not (Test-IsWindows) -or -not $Name) { return $false }
+  $certutil = Get-Command "certutil.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $certutil) { return $false }
+  try {
+    $out = & $certutil.Source -csp "Microsoft Software Key Storage Provider" -key 2>&1
+    foreach ($line in $out) {
+      if (([string]$line).Trim() -eq $Name) {
+        return $true
+      }
+    }
+  } catch {
+    return $false
+  }
+  return $false
+}
+
 function New-Check {
   param([string]$Name, [string]$Status, [string]$Message)
   return [ordered]@{
@@ -80,10 +98,15 @@ function New-PreflightReport {
   }
   $queueCount = Get-PathCount -Pattern (Join-Path $dir "queue\edr_queue.db*")
   $evidenceCount = Get-PathCount -Pattern (Join-Path $dir "evidence\local_evidence_cache.db*")
+  $legacyKeyName = if ($env:COMPUTERNAME) { "EDR-Agent-$($env:COMPUTERNAME)" } else { "" }
+  $legacyKeyExists = Test-CngKeyContainerExists -Name $legacyKeyName
   $checks = New-Object System.Collections.Generic.List[object]
   $checks.Add((New-Check -Name "windows" -Status $(if ($isWindows) { "ok" } else { "failed" }) -Message $(if ($isWindows) { "Windows endpoint" } else { "not Windows" }))) | Out-Null
   $checks.Add((New-Check -Name "elevated" -Status $(if ($isElevated) { "ok" } else { "warning" }) -Message $(if ($isElevated) { "running with administrator privilege" } else { "administrator privilege recommended" }))) | Out-Null
   $checks.Add((New-Check -Name "install_dir" -Status $(if (Test-Path -LiteralPath $dir) { "ok" } else { "warning" }) -Message $dir)) | Out-Null
+  if ($legacyKeyName) {
+    $checks.Add((New-Check -Name "legacy_cng_key" -Status $(if ($legacyKeyExists) { "warning" } else { "ok" }) -Message $(if ($legacyKeyExists) { "legacy fixed key container exists: $legacyKeyName; current installer uses a unique CNG key name" } else { "legacy fixed key container not found: $legacyKeyName" }))) | Out-Null
+  }
   $checks.Add((New-Check -Name "service" -Status "ok" -Message $(if ($svc) { "$ServiceName status=$($svc.Status)" } else { "$ServiceName not installed" }))) | Out-Null
   $checks.Add((New-Check -Name "process" -Status $(if ($procCount -gt 0) { "warning" } else { "ok" }) -Message "agent process count=$procCount")) | Out-Null
   $checks.Add((New-Check -Name "offline_queue" -Status "ok" -Message "files=$queueCount action=$(if ($KeepOfflineQueue) { 'keep' } else { 'cleanup' })")) | Out-Null

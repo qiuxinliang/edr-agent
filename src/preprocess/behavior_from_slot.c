@@ -91,6 +91,56 @@ static int is_file_activity_event(EdrEventType t) {
          t == EDR_EVENT_FILE_DELETE;
 }
 
+static int has_ci_ascii(const char *hay, const char *needle);
+
+static int file_path_has_root_or_separator(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if ((isalpha((unsigned char)path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) ||
+      (path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1]) ||
+      has_ci_ascii(path, "\\device\\") || has_ci_ascii(path, "\\??\\") ||
+      has_ci_ascii(path, "\\global??\\")) {
+    return 1;
+  }
+  return strchr(path, '\\') != NULL || strchr(path, '/') != NULL;
+}
+
+static int file_path_usable_for_ransom(const char *path) {
+  if (!path || !path[0] || !file_path_has_root_or_separator(path)) {
+    return 0;
+  }
+  const char *base = basename_c(path);
+  if (!base || strlen(base) < 3u) {
+    return 0;
+  }
+  size_t printable = 0u;
+  size_t ascii = 0u;
+  size_t len = 0u;
+  for (const unsigned char *p = (const unsigned char *)path; *p && len < 512u; p++, len++) {
+    if ((*p >= 0x20u && *p < 0x7fu) || *p >= 0x80u) {
+      printable++;
+    }
+    if (*p < 0x80u) {
+      ascii++;
+    }
+  }
+  if (len == 0u || printable * 100u < len * 90u) {
+    return 0;
+  }
+  return ascii > 0u;
+}
+
+static int known_low_value_ransom_counter_process(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  const char *s = r->process_name[0] ? r->process_name : r->exe_path;
+  return has_ci_ascii(s, "taskmgr.exe") || has_ci_ascii(s, "usoclient.exe") ||
+         has_ci_ascii(s, "taskhostw.exe") || has_ci_ascii(s, "ecagent.exe") ||
+         has_ci_ascii(s, "checknetisolation.exe") || has_ci_ascii(s, "conhost.exe");
+}
+
 static char fold_ascii(char c) {
   if (c == '/') {
     c = '\\';
@@ -592,6 +642,14 @@ static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
 
 static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   if (!r || !is_file_activity_event(r->type) || !r->file_path[0]) {
+    return;
+  }
+  if (!file_path_usable_for_ransom(r->file_path)) {
+    append_record_kv(r, "invalid_file_path=1 ransom_counter_suppressed=1");
+    return;
+  }
+  if (known_low_value_ransom_counter_process(r)) {
+    append_record_kv(r, "ransom_counter_suppressed=1 low_value_ransom_process=1");
     return;
   }
   const char *env = getenv("EDR_RANSOM_COUNTER_WINDOW_S");

@@ -22,7 +22,7 @@
     EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
     EDR_KEY_PROVIDER=pem|cng|tpm|pkcs11（Windows 默认 cng，Linux/macOS 默认 pem）
     EDR_CNG_PROVIDER_NAME        默认 cng=Microsoft Software Key Storage Provider，tpm=Microsoft Platform Crypto Provider
-    EDR_CNG_KEY_NAME             默认 EDR-Agent-$COMPUTERNAME
+    EDR_CNG_KEY_NAME             默认 FDSecurity-Agent-$COMPUTERNAME-<random>
     EDR_PKCS11_KEY_URI           PKCS#11 key URI；需本机 openssl engine/provider 可用
     EDR_TPM_KEY_URI              TPM/OpenSSL provider key URI；PowerShell 默认走 Windows Platform Crypto Provider
     EDR_TRUST_CA=1          enroll 前将 EDR_CA_CERT 导入 Windows Root（适合企业私有 CA / lab mkcert）
@@ -802,8 +802,20 @@ function Ensure-CngAgentCSR {
     New-Item -ItemType Directory -Path $csrDir -Force | Out-Null
   }
   $safeCN = if ($SubjectCN) { $SubjectCN.Replace("/", "-").Replace("\", "-").Replace('"', '') } else { "edr-agent" }
-  $safeKeyName = if ($KeyName) { $KeyName } else { "EDR-Agent-$safeCN" }
+  $safeKeyName = if ($KeyName) {
+    $KeyName
+  } else {
+    $suffix = ([guid]::NewGuid().ToString("N")).Substring(0, 12)
+    "FDSecurity-Agent-$safeCN-$suffix"
+  }
+  $script:EDR_CNG_KEY_CONTAINER = $safeKeyName
+  Write-Host "Using CNG key container: $safeKeyName"
   $infPath = [System.IO.Path]::ChangeExtension($CsrPath, ".inf")
+  foreach ($stalePath in @($CsrPath, $infPath)) {
+    if ($stalePath -and (Test-Path -LiteralPath $stalePath)) {
+      Remove-Item -LiteralPath $stalePath -Force -ErrorAction SilentlyContinue
+    }
+  }
   $inf = @"
 [Version]
 Signature="`$Windows NT`$"
@@ -1188,6 +1200,9 @@ $DataPlaneCompression = if ($d.data_plane_compression) { [string]$d.data_plane_c
 $ControlDictVersion = if ($d.control_dict_version) { [string]$d.control_dict_version } else { "edr-zstd-dict-v1" }
 $ControlSchemaVersion = if ($d.control_schema_version) { [string]$d.control_schema_version } else { "edr-control-schema-v1" }
 $ControlProfileID = if ($d.control_profile_id) { [string]$d.control_profile_id } else { "default-h2-zstd" }
+$ConfigSigningKeyID = if ($d.config_signing_key_id) { [string]$d.config_signing_key_id } else { "" }
+$ConfigSigningPublicKeyPEM = if ($d.config_signing_public_key_pem) { [string]$d.config_signing_public_key_pem } else { "" }
+$ConfigSignatureRequired = if ($null -ne $d.config_signature_required) { [bool]$d.config_signature_required } else { [bool]($ConfigSigningKeyID -and $ConfigSigningPublicKeyPEM) }
 $RulesURL = if ($d.rules_url) { [string]$d.rules_url } else { "$agentApiBase/agent/rules.toml" }
 $P0BundleURL = if ($d.p0_bundle_url) { [string]$d.p0_bundle_url } else { "$agentApiBase/agent/p0-bundle.enc" }
 $SensorInterestURL = if ($d.sensor_interest_url) { [string]$d.sensor_interest_url } else { "$agentApiBase/agent/sensor-interest.json" }
@@ -1202,6 +1217,11 @@ function Escape-Toml([string]$s) {
 function Format-TomlBool([object]$v) {
   if ([bool]$v) { return "true" }
   return "false"
+}
+
+function Format-TomlInlinePem([string]$Value) {
+  if (-not $Value) { return "" }
+  return (($Value -replace "`r`n", "`n") -replace "`r", "`n") -replace "`n", "\n"
 }
 
 $InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\FDSecurity" } else { "." }
@@ -1356,6 +1376,7 @@ function Test-AgentBootstrapHealth {
     tenant_id = $TenantId
     rest_base_url = $RestBaseUrl
     key_provider = $Provider
+    cng_key_container = if ($script:EDR_CNG_KEY_CONTAINER) { [string]$script:EDR_CNG_KEY_CONTAINER } else { "" }
     client_cert_path = $CertPath
     client_key_path = $KeyPath
     client_cert_store = $CertStore
@@ -1410,6 +1431,9 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$RuntimePolicyURL,
     [Parameter(Mandatory = $true)][string]$VersionURL,
     [Parameter(Mandatory = $true)][string]$DownloadURL,
+    [AllowEmptyString()][string]$ConfigSigningKeyID,
+    [AllowEmptyString()][string]$ConfigSigningPublicKeyPEM,
+    [Parameter(Mandatory = $true)][bool]$ConfigSignatureRequired,
     [AllowEmptyString()][string]$CertStore,
     [AllowEmptyString()][string]$CertThumbprint,
     [AllowEmptyString()][string]$Pkcs11ModulePath,
@@ -1625,6 +1649,16 @@ function Merge-EnrollIntoAgentTomlExample {
       },
       1
     )
+  }
+  if (($ConfigSigningKeyID -or $ConfigSigningPublicKeyPEM -or $ConfigSignatureRequired) -and $merged -notmatch '(?m)^\s*\[config_signing\]\s*$') {
+    $merged += "`n[config_signing]`n"
+    $merged += ('signature_required = {0}' -f (Format-TomlBool $ConfigSignatureRequired)) + "`n"
+    if ($ConfigSigningKeyID) {
+      $merged += ('signing_key_id = "{0}"' -f (Escape-Toml $ConfigSigningKeyID)) + "`n"
+    }
+    if ($ConfigSigningPublicKeyPEM) {
+      $merged += ('public_key_pem = "{0}"' -f (Escape-Toml (Format-TomlInlinePem $ConfigSigningPublicKeyPEM))) + "`n"
+    }
   }
   return $merged
 }
@@ -1875,6 +1909,11 @@ allow_dangerous      = false
 allow_rtq_readonly   = true
 signing_public_key_path = "$(Escape-Toml $TomlSigningPublicKeyPath)"
 
+[config_signing]
+signature_required = $(Format-TomlBool $ConfigSignatureRequired)
+signing_key_id = "$(Escape-Toml $ConfigSigningKeyID)"
+public_key_pem = "$(Escape-Toml (Format-TomlInlinePem $ConfigSigningPublicKeyPEM))"
+
 [self_protect]
 anti_debug           = true
 job_object_windows   = true
@@ -1948,6 +1987,8 @@ if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $ex
       -ControlSchemaVersion $ControlSchemaVersion -ControlProfileID $ControlProfileID `
       -RulesURL $RulesURL -P0BundleURL $P0BundleURL -SensorInterestURL $SensorInterestURL `
       -RuntimePolicyURL $RuntimePolicyURL -VersionURL $VersionURL -DownloadURL $DownloadURL `
+      -ConfigSigningKeyID $ConfigSigningKeyID -ConfigSigningPublicKeyPEM $ConfigSigningPublicKeyPEM `
+      -ConfigSignatureRequired $ConfigSignatureRequired `
       -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
       -Pkcs11ModulePath $Pkcs11Module -Pkcs11Uri $Pkcs11KeyUri -TpmUri $TpmKeyUri
     $tomlSource = "template:$examplePath"

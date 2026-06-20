@@ -177,6 +177,52 @@ static void test_ransom_sliding_window_counter(void) {
   assert(strstr(r.detection_context, "\"ransom_behavior\":true") != NULL);
 }
 
+static void test_invalid_file_path_does_not_raise_ransom_counter(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=4889\n"
+            "img=C:\\Program Files (x86)\\Sangfor\\SSL\\ECAgent\\ECAgent.exe\n"
+            "file=badname\n");
+  edr_behavior_from_slot(&slot, &r);
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(r.script_snippet, "invalid_file_path=1") != NULL);
+  assert(strstr(r.script_snippet, "ransom_counter_suppressed=1") != NULL);
+  assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
+  assert(strstr(d.reason, "ransom_behavior_counter") == NULL);
+  assert(strstr(d.reason, "ransom_kill_chain_candidate") == NULL);
+}
+
+static void test_low_value_process_does_not_raise_ransom_counter(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+
+  for (int i = 0; i < 90; i++) {
+    char payload[768];
+    snprintf(payload, sizeof(payload),
+             "ETW1\n"
+             "prov=kfile\n"
+             "pid=4890\n"
+             "img=C:\\Program Files (x86)\\Sangfor\\SSL\\ECAgent\\ECAgent.exe\n"
+             "file=C:\\ProgramData\\Sangfor\\SSL\\cache\\doc%02d.%02dlock\n",
+             i, i);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns = 1779338550000000000LL + (int64_t)i * 10000000LL;
+    edr_behavior_from_slot(&slot, &r);
+  }
+
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(r.script_snippet, "low_value_ransom_process=1") != NULL);
+  assert(strstr(r.script_snippet, "ransom_counter_suppressed=1") != NULL);
+  assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
+  assert(strstr(d.reason, "ransom_behavior_counter") == NULL);
+  assert(strstr(d.reason, "ransom_kill_chain_candidate") == NULL);
+}
+
 static void test_ransom_note_burst_counter(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
@@ -405,6 +451,8 @@ int main(void) {
   test_schannel_cert_error_bridge();
   test_ransom_counter_bridge();
   test_ransom_sliding_window_counter();
+  test_invalid_file_path_does_not_raise_ransom_counter();
+  test_low_value_process_does_not_raise_ransom_counter();
   test_ransom_note_burst_counter();
   test_ransom_canary_deterministic_context();
   test_ransom_counter_allowlist_suppresses_rate_only();
