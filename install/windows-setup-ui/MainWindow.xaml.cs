@@ -29,6 +29,7 @@ public partial class MainWindow : Window
     private readonly string _baseDir = AppContext.BaseDirectory;
     private string _setupPath = string.Empty;
     private string _lastDiagnosticsPath = string.Empty;
+    private string _lastHandoffDir = string.Empty;
     private Dictionary<string, object?> _preconfig = new(StringComparer.OrdinalIgnoreCase);
     private string _setupIntegrityKey = string.Empty;
     private string _setupHashKey = string.Empty;
@@ -342,12 +343,10 @@ public partial class MainWindow : Window
     {
         _installRunning = true;
         var installPath = NormalizeInstallPath(request.InstallPath);
-        var uiLogDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "FDSecurity",
-            "setup-ui");
+        var uiLogDir = ResolveSetupUiLogDirectory();
         Directory.CreateDirectory(uiLogDir);
         var handoffDir = ResolveSetupHandoffDirectory(uiLogDir);
+        _lastHandoffDir = handoffDir;
         _lastDiagnosticsPath = Path.Combine(uiLogDir, $"install-ui-{DateTime.UtcNow:yyyyMMddHHmmss}.zip");
         var uiLog = Path.Combine(uiLogDir, "setup-ui.log");
         var innoLog = Path.Combine(handoffDir, "inno-setup.log");
@@ -434,7 +433,7 @@ public partial class MainWindow : Window
 
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
             var summary = ReadInstallSummary(installPath, innoLog);
-            TryCreateDiagnosticsBundle(uiLogDir, installPath, _lastDiagnosticsPath);
+            TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installComplete", new
             {
                 installPath,
@@ -447,7 +446,7 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] failed: {ex}");
-            TryCreateDiagnosticsBundle(uiLogDir, installPath, _lastDiagnosticsPath);
+            TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installFailed", new
             {
                 reason = ex.Message,
@@ -671,7 +670,7 @@ public partial class MainWindow : Window
             : Path.GetDirectoryName(_lastDiagnosticsPath);
         if (string.IsNullOrWhiteSpace(target) || (!File.Exists(target) && !Directory.Exists(target)))
         {
-            target = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FDSecurity", "setup-ui");
+            target = Directory.Exists(_lastHandoffDir) ? _lastHandoffDir : ResolveSetupUiLogDirectory();
         }
 
         Process.Start(new ProcessStartInfo { FileName = target, UseShellExecute = true });
@@ -1389,7 +1388,7 @@ public partial class MainWindow : Window
             ["proxy_mode"] = NormalizeProxyMode(request.ProxyMode),
             ["proxy_url"] = effectiveProxyUrl,
             ["relay_url"] = effectiveRelayUrl,
-            ["key_provider"] = "cng",
+            ["key_provider"] = NormalizeKeyProvider(request.KeyProvider),
             ["bootstrap_manifest_verified"] = bootstrap.Enabled,
             ["bootstrap_manifest_key_id"] = bootstrap.KeyId,
             ["bootstrap_ca_pem"] = bootstrap.CaPem,
@@ -1409,6 +1408,16 @@ public partial class MainWindow : Window
         var json = JsonSerializer.Serialize(data, new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = false });
         File.WriteAllText(path, json, new UTF8Encoding(false));
         return path;
+    }
+
+    private static string NormalizeKeyProvider(string? raw)
+    {
+        var value = (raw ?? "").Trim().ToLowerInvariant();
+        return value switch
+        {
+            "cng" or "tpm" or "pkcs11" => value,
+            _ => "pem"
+        };
     }
 
     private static bool ValidateBootstrapServerCertificate(X509Certificate2? certificate, BootstrapTrustMaterial bootstrap)
@@ -1590,20 +1599,29 @@ public partial class MainWindow : Window
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
+    private static string ResolveSetupUiLogDirectory()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(localAppData) || !Path.IsPathFullyQualified(localAppData))
+        {
+            localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? "";
+        }
+        if (string.IsNullOrWhiteSpace(localAppData) || !Path.IsPathFullyQualified(localAppData))
+        {
+            localAppData = Path.GetTempPath();
+        }
+        return Path.Combine(localAppData, "FDSecurity", "setup-ui");
+    }
+
     private static string ResolveSetupHandoffDirectory(string fallbackDir)
     {
-        var candidates = new[]
-        {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "FDSecurity", "setup-ui"),
-            Path.Combine(Path.GetTempPath(), "FDSecurity", "setup-ui"),
-            fallbackDir
-        };
+        var candidates = new List<string>();
+        AddAbsoluteCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "FDSecurity", "setup-ui");
+        AddAbsoluteCandidate(candidates, Environment.GetEnvironmentVariable("ProgramData") ?? "", "FDSecurity", "setup-ui");
+        AddAbsoluteCandidate(candidates, Path.GetTempPath(), "FDSecurity", "setup-ui");
+        AddAbsoluteCandidate(candidates, fallbackDir);
         foreach (var candidate in candidates)
         {
-            if (string.IsNullOrWhiteSpace(candidate))
-            {
-                continue;
-            }
             try
             {
                 Directory.CreateDirectory(candidate);
@@ -1617,14 +1635,32 @@ public partial class MainWindow : Window
                 // Try the next location; handoff must be readable by the elevated setup process.
             }
         }
-        return fallbackDir;
+        return Path.GetFullPath(fallbackDir);
+    }
+
+    private static void AddAbsoluteCandidate(List<string> candidates, string root, params string[] parts)
+    {
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return;
+        }
+        var candidate = parts.Length == 0 ? root : Path.Combine(new[] { root }.Concat(parts).ToArray());
+        if (!Path.IsPathFullyQualified(candidate))
+        {
+            return;
+        }
+        if (candidates.Any(x => string.Equals(x, candidate, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+        candidates.Add(candidate);
     }
 
     private string PrepareSetupForElevation(string setupPath, string handoffDir, string uiLog)
     {
         try
         {
-            if (IsElevated() && !IsUncPath(setupPath))
+            if (IsElevated() && !ShouldStageSetupExecutable(setupPath))
             {
                 return setupPath;
             }
@@ -1664,6 +1700,32 @@ public partial class MainWindow : Window
     private static bool IsUncPath(string path)
     {
         return path.StartsWith(@"\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldStageSetupExecutable(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+        {
+            return true;
+        }
+        if (IsUncPath(path))
+        {
+            return true;
+        }
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                return true;
+            }
+            var drive = new DriveInfo(root);
+            return drive.DriveType == DriveType.Network || drive.DriveType == DriveType.Removable;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string BuildInstallFailureDetail(string installPath, string innoLog)
@@ -1776,11 +1838,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void TryCreateDiagnosticsBundle(string uiLogDir, string installPath, string zipPath)
+    private static void TryCreateDiagnosticsBundle(string uiLogDir, string handoffDir, string installPath, string zipPath)
     {
         try
         {
-            CreateDiagnosticsBundle(uiLogDir, installPath, zipPath);
+            CreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, zipPath);
         }
         catch
         {
@@ -1788,19 +1850,39 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void CreateDiagnosticsBundle(string uiLogDir, string installPath, string zipPath)
+    private static void CreateDiagnosticsBundle(string uiLogDir, string handoffDir, string installPath, string zipPath)
     {
         var staging = Path.Combine(Path.GetTempPath(), "edr_setup_ui_diag_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(staging);
         var skipped = new List<string>();
 
         CopyDirectoryIfExists(uiLogDir, Path.Combine(staging, "setup-ui"), skipped);
-        var commonHandoffDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "FDSecurity", "setup-ui");
-        if (!string.Equals(Path.GetFullPath(uiLogDir), Path.GetFullPath(commonHandoffDir), StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrWhiteSpace(handoffDir) &&
+            Path.IsPathFullyQualified(handoffDir) &&
+            !string.Equals(Path.GetFullPath(uiLogDir), Path.GetFullPath(handoffDir), StringComparison.OrdinalIgnoreCase))
         {
-            CopyDirectoryIfExists(commonHandoffDir, Path.Combine(staging, "setup-handoff"), skipped);
+            CopyDirectoryIfExists(handoffDir, Path.Combine(staging, "setup-handoff"), skipped);
+        }
+        var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        if (string.IsNullOrWhiteSpace(programData) || !Path.IsPathFullyQualified(programData))
+        {
+            programData = Environment.GetEnvironmentVariable("ProgramData") ?? "";
+        }
+        if (!string.IsNullOrWhiteSpace(programData) && Path.IsPathFullyQualified(programData))
+        {
+            var commonHandoffDir = Path.Combine(programData, "FDSecurity", "setup-ui");
+            if (!string.Equals(Path.GetFullPath(commonHandoffDir), Path.GetFullPath(uiLogDir), StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrWhiteSpace(handoffDir) || !Path.IsPathFullyQualified(handoffDir) ||
+                 !string.Equals(Path.GetFullPath(commonHandoffDir), Path.GetFullPath(handoffDir), StringComparison.OrdinalIgnoreCase)))
+            {
+                CopyDirectoryIfExists(commonHandoffDir, Path.Combine(staging, "setup-handoff-common"), skipped);
+            }
         }
         CopyDirectoryIfExists(Path.Combine(installPath, "diagnostics"), Path.Combine(staging, "agent-diagnostics"), skipped);
+        CopyFileIfExists(
+            Path.Combine(installPath, "install-diagnostics.zip"),
+            Path.Combine(staging, "agent-install-diagnostics.zip"),
+            skipped);
         if (skipped.Count > 0)
         {
             File.WriteAllLines(Path.Combine(staging, "diagnostics-skipped-files.txt"), skipped, new UTF8Encoding(false));
@@ -1824,6 +1906,27 @@ public partial class MainWindow : Window
 
         Directory.CreateDirectory(dest);
         CopyDirectoryContents(source, source, dest, skipped);
+    }
+
+    private static void CopyFileIfExists(string source, string dest, List<string> skipped)
+    {
+        if (!File.Exists(source))
+        {
+            return;
+        }
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? ".");
+            File.Copy(source, dest, true);
+        }
+        catch (IOException ex)
+        {
+            skipped.Add("locked: " + source + " (" + ex.Message + ")");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            skipped.Add("denied: " + source + " (" + ex.Message + ")");
+        }
     }
 
     private static void CopyDirectoryContents(string root, string current, string destRoot, List<string> skipped)
@@ -1985,6 +2088,7 @@ public sealed class InstallRequest
     public string ProxyUser { get; set; } = "";
     public string ProxyPassword { get; set; } = "";
     public string RelayUrl { get; set; } = "";
+    public string KeyProvider { get; set; } = "pem";
     public string BootstrapManifestUrl { get; set; } = "";
     public string BootstrapManifestPath { get; set; } = "";
     public string BootstrapManifestJson { get; set; } = "";
