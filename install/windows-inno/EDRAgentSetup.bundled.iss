@@ -334,11 +334,11 @@ begin
     + Chr(34) + 'proxy_mode' + Chr(34) + ':' + JsonEscape(ProxyMode) + ','
     + Chr(34) + 'proxy_url' + Chr(34) + ':' + JsonEscape(ProxyUrl) + ','
     + Chr(34) + 'relay_url' + Chr(34) + ':' + JsonEscape(RelayUrl) + ','
-    + Chr(34) + 'key_provider' + Chr(34) + ':' + JsonEscape('cng') + ','
+    + Chr(34) + 'key_provider' + Chr(34) + ':' + JsonEscape('pem') + ','
     + Chr(34) + 'keep_offline_queue' + Chr(34) + ':' + EdrBoolJson(KeepQueue) + ','
     + Chr(34) + 'keep_evidence_cache' + Chr(34) + ':' + EdrBoolJson(KeepEvidence) + ','
     + Chr(34) + 'strict_health_check' + Chr(34) + ':' + EdrBoolJson(StrictHealth) + ','
-    + Chr(34) + 'health_report' + Chr(34) + ':' + JsonEscape(ExpandConstant('{app}\diagnostics\install_health_report.json'))
+    + Chr(34) + 'health_report' + Chr(34) + ':' + JsonEscape(ExpandConstant('{commonappdata}\FDSecurity\setup-ui\agent-diagnostics\install_health_report.json'))
     + Chr(125);
 
   Result := SaveStringToFile(Path, Json, False);
@@ -370,10 +370,7 @@ function EdrDeploymentPlanText: string;
 var
   DiagnosticsPath: string;
 begin
-  DiagnosticsPath := WizardDirValue;
-  if DiagnosticsPath = '' then
-    DiagnosticsPath := ExpandConstant('{autopf}\{#MyAppName}');
-  DiagnosticsPath := DiagnosticsPath + '\diagnostics';
+  DiagnosticsPath := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\agent-diagnostics');
 
   Result :=
     'FDSecurity setup will run the following controlled stages:' + #13#10 + #13#10 +
@@ -486,7 +483,7 @@ begin
   if EdrDiagnosticsDir <> '' then
     Result := EdrDiagnosticsDir + '\' + FileName
   else
-    Result := ExpandConstant('{app}\diagnostics\') + FileName;
+    Result := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\agent-diagnostics\') + FileName;
 end;
 
 procedure EdrAppendStageLog(const Message: string);
@@ -501,10 +498,10 @@ end;
 
 procedure EdrInitDiagnostics;
 begin
-  EdrDiagnosticsDir := ExpandConstant('{app}\diagnostics');
+  EdrDiagnosticsDir := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\agent-diagnostics');
   if not DirExists(EdrDiagnosticsDir) then
-    CreateDir(EdrDiagnosticsDir);
-  EdrDiagnosticsBundle := ExpandConstant('{app}\install-diagnostics.zip');
+    ForceDirectories(EdrDiagnosticsDir);
+  EdrDiagnosticsBundle := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\install-diagnostics.zip');
   EdrStageLog := EdrDiagnosticsDir + '\install-stage.log';
   SaveStringToFile(EdrStageLog, 'FDSecurity setup diagnostics' + #13#10, False);
   EdrAppendStageLog('diagnostics_dir=' + EdrDiagnosticsDir);

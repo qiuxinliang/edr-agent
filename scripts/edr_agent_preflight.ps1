@@ -211,12 +211,32 @@ function Invoke-RuntimeCleanup {
 }
 
 if ($CheckOnly) {
-  Write-Preflight "check-only complete"
-  Write-PreflightReport -Report (New-PreflightReport -Phase "check_only")
-  return
+  try {
+    Write-Preflight "check-only complete"
+    Write-PreflightReport -Report (New-PreflightReport -Phase "check_only")
+  } catch {
+    Write-Warning "[preflight] check-only report failed: $_"
+    if ($env:EDR_PREFLIGHT_STRICT -eq "1") { exit 1 }
+  }
+  exit 0
 }
 
-Stop-AgentRuntime
-Invoke-RuntimeCleanup
-Write-PreflightReport -Report (New-PreflightReport -Phase "completed")
-Write-Preflight "complete"
+try {
+  Stop-AgentRuntime
+  Invoke-RuntimeCleanup
+  Write-PreflightReport -Report (New-PreflightReport -Phase "completed")
+  Write-Preflight "complete"
+  exit 0
+} catch {
+  Write-Warning "[preflight] non-fatal preflight failure: $_"
+  try {
+    $report = New-PreflightReport -Phase "completed_with_warning"
+    $report.status = "warning"
+    $report.error = [string]$_
+    Write-PreflightReport -Report $report
+  } catch {
+    Write-Warning "[preflight] failed to write warning report: $_"
+  }
+  if ($env:EDR_PREFLIGHT_STRICT -eq "1") { exit 1 }
+  exit 0
+}

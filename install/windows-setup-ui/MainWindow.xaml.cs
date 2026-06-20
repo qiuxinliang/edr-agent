@@ -400,7 +400,7 @@ public partial class MainWindow : Window
             {
                 await Task.Delay(1200);
                 progress = Math.Min(86, progress + 4);
-                var stageState = ReadInstallStageState(installPath);
+                var stageState = ReadInstallStageState(installPath, handoffDir);
                 if (stageState != null)
                 {
                     progress = Math.Max(progress, stageState.Progress);
@@ -413,26 +413,26 @@ public partial class MainWindow : Window
                 }
                 else
                 {
-                    var detail = DescribeCurrentInstallState(installPath, innoLog);
+                    var detail = DescribeCurrentInstallState(installPath, innoLog, handoffDir);
                     await PostAsync("installProgress", new { stage = "安装进行中", progress, detail });
                 }
             }
 
             if (proc.ExitCode != 0)
             {
-                var detail = BuildInstallFailureDetail(installPath, innoLog);
+                var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
                 throw new InvalidOperationException($"安装器返回失败代码 {proc.ExitCode}{detail}");
             }
-            var finalStageState = ReadInstallStageState(installPath);
+            var finalStageState = ReadInstallStageState(installPath, handoffDir);
             if (finalStageState != null &&
                 finalStageState.Stage.StartsWith("安装阶段失败：", StringComparison.OrdinalIgnoreCase))
             {
-                var detail = BuildInstallFailureDetail(installPath, innoLog);
+                var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
                 throw new InvalidOperationException($"安装阶段失败{detail}");
             }
 
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
-            var summary = ReadInstallSummary(installPath, innoLog);
+            var summary = ReadInstallSummary(installPath, innoLog, handoffDir);
             TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installComplete", new
             {
@@ -544,9 +544,9 @@ public partial class MainWindow : Window
         return string.Join(" ", parts);
     }
 
-    private InstallSummary ReadInstallSummary(string installPath, string innoLog)
+    private InstallSummary ReadInstallSummary(string installPath, string innoLog, string handoffDir)
     {
-        var diagnosticsDir = Path.Combine(installPath, "diagnostics");
+        var diagnosticsDir = ResolveInstallDiagnosticsDirectory(installPath, handoffDir);
         var healthPath = Path.Combine(diagnosticsDir, "install_health_report.json");
         var verifyPath = Path.Combine(diagnosticsDir, "install_runtime_verify.json");
         var healthStatus = TryReadJsonString(healthPath, "status");
@@ -573,9 +573,9 @@ public partial class MainWindow : Window
         };
     }
 
-    private string DescribeCurrentInstallState(string installPath, string innoLog)
+    private string DescribeCurrentInstallState(string installPath, string innoLog, string handoffDir)
     {
-        var diagnosticsDir = Path.Combine(installPath, "diagnostics");
+        var diagnosticsDir = ResolveInstallDiagnosticsDirectory(installPath, handoffDir);
         if (File.Exists(Path.Combine(diagnosticsDir, "install_runtime_verify.json")))
         {
             return "Agent 已启动，正在校验运行状态";
@@ -595,10 +595,10 @@ public partial class MainWindow : Window
         return "等待安装器返回状态";
     }
 
-    private static InstallStageState? ReadInstallStageState(string installPath)
+    private static InstallStageState? ReadInstallStageState(string installPath, string handoffDir)
     {
-        var path = Path.Combine(installPath, "diagnostics", "install-stage.log");
-        if (!File.Exists(path))
+        var path = ResolveInstallDiagnosticsFile(installPath, handoffDir, "install-stage.log");
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             return null;
         }
@@ -644,6 +644,31 @@ public partial class MainWindow : Window
         }
 
         return null;
+    }
+
+    private static string ResolveInstallDiagnosticsDirectory(string installPath, string handoffDir)
+    {
+        var handoffDiagnostics = string.IsNullOrWhiteSpace(handoffDir)
+            ? ""
+            : Path.Combine(handoffDir, "agent-diagnostics");
+        if (!string.IsNullOrWhiteSpace(handoffDiagnostics) && Directory.Exists(handoffDiagnostics))
+        {
+            return handoffDiagnostics;
+        }
+        return Path.Combine(installPath, "diagnostics");
+    }
+
+    private static string ResolveInstallDiagnosticsFile(string installPath, string handoffDir, string fileName)
+    {
+        var handoffDiagnostics = string.IsNullOrWhiteSpace(handoffDir)
+            ? ""
+            : Path.Combine(handoffDir, "agent-diagnostics", fileName);
+        if (!string.IsNullOrWhiteSpace(handoffDiagnostics) && File.Exists(handoffDiagnostics))
+        {
+            return handoffDiagnostics;
+        }
+        var legacy = Path.Combine(installPath, "diagnostics", fileName);
+        return File.Exists(legacy) ? legacy : handoffDiagnostics;
     }
 
     private static string TranslateInstallStage(string stage)
@@ -1728,16 +1753,16 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string BuildInstallFailureDetail(string installPath, string innoLog)
+    private static string BuildInstallFailureDetail(string installPath, string innoLog, string handoffDir)
     {
         var parts = new List<string>();
-        var stageState = ReadInstallStageState(installPath);
+        var stageState = ReadInstallStageState(installPath, handoffDir);
         if (stageState != null)
         {
             parts.Add($"{stageState.Stage}：{stageState.Detail}");
         }
 
-        var enrollLog = Path.Combine(installPath, "diagnostics", "enroll-output.log");
+        var enrollLog = ResolveInstallDiagnosticsFile(installPath, handoffDir, "enroll-output.log");
         if (File.Exists(enrollLog))
         {
             parts.Add("注册日志：" + enrollLog);
