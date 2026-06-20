@@ -5,8 +5,10 @@ using System.IO;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http;
+using System.Net.Security;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
@@ -233,22 +235,6 @@ public partial class MainWindow : Window
             // Best-effort only; setup will do the final filesystem validation.
         }
 
-        EndpointConfig? endpoint = null;
-        try
-        {
-            endpoint = NormalizeEndpointInput(request.ApiBase);
-        }
-        catch (Exception ex)
-        {
-            // Keep collecting other local checks so the operator can fix everything in one pass.
-            endpoint = null;
-            request.ApiBase = "";
-            await PostAsync("toast", new { title = "服务端地址无效", message = ex.Message, level = "warn" });
-        }
-
-        var proxyCheck = ValidateProxyRequest(request);
-        var relayCheck = ValidateRelayRequest(request, out var normalizedRelayUrl);
-
         var checks = new List<CheckItem>();
         async Task AddCheckAsync(CheckItem item)
         {
@@ -278,6 +264,22 @@ public partial class MainWindow : Window
             await PostAsync("toast", new { title = "Bootstrap 信任失败", message = ex.Message, level = "warn" });
         }
 
+        EndpointConfig? endpoint = null;
+        try
+        {
+            endpoint = NormalizeEndpointInput(request.ApiBase);
+        }
+        catch (Exception ex)
+        {
+            // Keep collecting other local checks so the operator can fix everything in one pass.
+            endpoint = null;
+            request.ApiBase = "";
+            await PostAsync("toast", new { title = "服务端地址无效", message = ex.Message, level = "warn" });
+        }
+
+        var proxyCheck = ValidateProxyRequest(request);
+        var relayCheck = ValidateRelayRequest(request, out var normalizedRelayUrl);
+
         await AddCheckAsync(freeMb <= 0
             ? CheckItem.Warn("磁盘空间", "无法读取可用空间，安装阶段会再次校验")
             : freeMb >= 512
@@ -298,17 +300,21 @@ public partial class MainWindow : Window
 
         if (endpoint != null && proxyCheck.Severity != "fail")
         {
-            await AddCheckAsync(await ProbeHttpAsync("服务端连通", endpoint.ReadyUrl, request, "platform ready"));
+            await AddCheckAsync(await ProbeHttpAsync("服务端连通", endpoint.ReadyUrl, request, bootstrap, "platform ready"));
+            await AddCheckAsync(await ProbeHttpAsync("注册入口", endpoint.EnrollUrl, request, bootstrap, "enroll endpoint", required: true));
         }
         else
         {
             await AddCheckAsync(CheckItem.Warn(
                 "服务端连通",
                 endpoint == null ? "服务端地址无效，跳过连通性预检" : "代理配置未通过，跳过连通性预检"));
+            await AddCheckAsync(CheckItem.Warn(
+                "注册入口",
+                endpoint == null ? "服务端地址无效，跳过注册入口预检" : "代理配置未通过，跳过注册入口预检"));
         }
         if (!string.IsNullOrWhiteSpace(normalizedRelayUrl) && proxyCheck.Severity != "fail")
         {
-            await AddCheckAsync(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/healthz", request, "relay healthz"));
+            await AddCheckAsync(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/healthz", request, BootstrapTrustMaterial.Empty, "relay healthz"));
         }
         else
         {
@@ -1397,17 +1403,106 @@ public partial class MainWindow : Window
         return path;
     }
 
-    private async Task<CheckItem> ProbeHttpAsync(string key, string url, InstallRequest request, string label)
+    private static bool ValidateBootstrapServerCertificate(X509Certificate2? certificate, BootstrapTrustMaterial bootstrap)
+    {
+        if (certificate == null || !bootstrap.Enabled)
+        {
+            return false;
+        }
+
+        var pins = NormalizeSha256List(bootstrap.LeafSha256)
+            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (pins.Count > 0)
+        {
+            using var sha = SHA256.Create();
+            var leaf = BitConverter.ToString(sha.ComputeHash(certificate.RawData)).Replace("-", "").ToLowerInvariant();
+            if (pins.Contains(leaf))
+            {
+                return true;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(bootstrap.CaPem))
+        {
+            return false;
+        }
+
+        var roots = new List<X509Certificate2>();
+        try
+        {
+            foreach (Match match in Regex.Matches(
+                         bootstrap.CaPem,
+                         "-----BEGIN CERTIFICATE-----\\s*(?<b64>.*?)\\s*-----END CERTIFICATE-----",
+                         RegexOptions.Singleline))
+            {
+                var b64 = Regex.Replace(match.Groups["b64"].Value, "\\s+", "");
+                roots.Add(new X509Certificate2(Convert.FromBase64String(b64)));
+            }
+            if (roots.Count == 0)
+            {
+                return false;
+            }
+
+            using var chain = new X509Chain();
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            foreach (var root in roots)
+            {
+                chain.ChainPolicy.CustomTrustStore.Add(root);
+            }
+            return chain.Build(certificate);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            foreach (var root in roots)
+            {
+                root.Dispose();
+            }
+        }
+    }
+
+    private static void ConfigureTlsValidation(HttpClientHandler handler, InstallRequest request, BootstrapTrustMaterial bootstrap)
+    {
+        if (request.InsecureTls)
+        {
+            handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+            return;
+        }
+
+        if (!bootstrap.Enabled)
+        {
+            return;
+        }
+
+        handler.ServerCertificateCustomValidationCallback = (_, certificate, _, errors) =>
+        {
+            if (errors == SslPolicyErrors.None)
+            {
+                return true;
+            }
+            return ValidateBootstrapServerCertificate(certificate, bootstrap);
+        };
+    }
+
+    private async Task<CheckItem> ProbeHttpAsync(
+        string key,
+        string url,
+        InstallRequest request,
+        BootstrapTrustMaterial bootstrap,
+        string label,
+        bool required = false)
     {
         for (var attempt = 1; attempt <= 2; attempt++)
         {
             try
             {
                 using var handler = new HttpClientHandler();
-                if (request.InsecureTls)
-                {
-                    handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-                }
+                ConfigureTlsValidation(handler, request, bootstrap);
 
                 var proxyMode = NormalizeProxyMode(request.ProxyMode);
                 if (proxyMode == "off")
@@ -1432,6 +1527,10 @@ public partial class MainWindow : Window
                 using var resp = await client.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, cts.Token);
                 var code = (int)resp.StatusCode;
                 var suffix = attempt > 1 ? "，重试成功" : "";
+                if (required && code == 404)
+                {
+                    return CheckItem.Fail(key, $"{label} 路由不存在，HTTP 404{suffix}");
+                }
                 if (code < 500)
                 {
                     return CheckItem.Ok(key, $"{label} 可达，HTTP {code}{suffix}");
@@ -1448,13 +1547,15 @@ public partial class MainWindow : Window
             }
             catch (TaskCanceledException)
             {
-                return CheckItem.Warn(
-                    key,
-                    $"{label} {ProbeTimeoutSeconds}s 内未响应；请检查地址、端口、防火墙、代理模式和 TLS。可继续安装，注册阶段会再次 POST enroll。");
+                var msg = $"{label} {ProbeTimeoutSeconds}s 内未响应；请检查地址、端口、防火墙、代理模式和 TLS。";
+                return required
+                    ? CheckItem.Fail(key, msg + "注册阶段需要该入口可达。")
+                    : CheckItem.Warn(key, msg + "可继续安装，注册阶段会再次 POST enroll。");
             }
             catch (Exception ex)
             {
-                return CheckItem.Fail(key, $"{label} 不可达：{ex.Message}");
+                var msg = $"{label} 不可达：{ex.Message}";
+                return required ? CheckItem.Fail(key, msg) : CheckItem.Fail(key, msg);
             }
         }
 

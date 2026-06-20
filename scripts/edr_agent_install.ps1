@@ -17,6 +17,7 @@
     EDR_PROXY_URL=http://proxy.corp:8080
     EDR_RELAY_URL=https://relay.corp:443/api/v1
     EDR_MAX_EVENT_QUEUE_SIZE=8192
+    EDR_ENROLL_TIMEOUT_SEC=30
     EDR_AGENT_TEMPLATE      默认优先使用 config\agent_windows_production.example.toml
     EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
     EDR_KEY_PROVIDER=pem|cng|tpm|pkcs11（Windows 默认 cng，Linux/macOS 默认 pem）
@@ -49,6 +50,7 @@ param(
   [string]$BootstrapCaCertPath = $(if ($env:EDR_BOOTSTRAP_CA_CERT) { $env:EDR_BOOTSTRAP_CA_CERT } else { "" }),
   [string]$BootstrapTlsLeafSha256 = $(if ($env:EDR_BOOTSTRAP_TLS_LEAF_SHA256) { $env:EDR_BOOTSTRAP_TLS_LEAF_SHA256 } else { "" }),
   [int]$MaxEventQueueSize = 8192,
+  [int]$EnrollTimeoutSec = 30,
   [string]$CngProviderName = $(if ($env:EDR_CNG_PROVIDER_NAME) { $env:EDR_CNG_PROVIDER_NAME } else { "" }),
   [string]$CngKeyName = $(if ($env:EDR_CNG_KEY_NAME) { $env:EDR_CNG_KEY_NAME } else { "" }),
   [string]$Pkcs11KeyUri = $(if ($env:EDR_PKCS11_KEY_URI) { $env:EDR_PKCS11_KEY_URI } else { "" }),
@@ -215,7 +217,15 @@ if ($env:EDR_MAX_EVENT_QUEUE_SIZE) {
     Write-Warning "Invalid EDR_MAX_EVENT_QUEUE_SIZE=$($env:EDR_MAX_EVENT_QUEUE_SIZE); using $MaxEventQueueSize"
   }
 }
+if ($env:EDR_ENROLL_TIMEOUT_SEC) {
+  try {
+    $EnrollTimeoutSec = [int]$env:EDR_ENROLL_TIMEOUT_SEC
+  } catch {
+    Write-Warning "Invalid EDR_ENROLL_TIMEOUT_SEC=$($env:EDR_ENROLL_TIMEOUT_SEC); using $EnrollTimeoutSec"
+  }
+}
 $TomlMaxEventQueueSize = [Math]::Min(65536, [Math]::Max(1024, $MaxEventQueueSize))
+$EnrollTimeoutSec = [Math]::Min(120, [Math]::Max(5, $EnrollTimeoutSec))
 
 function Resolve-OpenSSL {
   $candidates = New-Object System.Collections.Generic.List[string]
@@ -506,8 +516,6 @@ ProviderName = "$ProviderName"
 KeyContainer = "$safeKeyName"
 MachineKeySet = TRUE
 Exportable = FALSE
-KeyExportPolicy = 0
-KeySpec = 1
 RequestType = PKCS10
 Silent = TRUE
 
@@ -548,6 +556,7 @@ function Ensure-ExternalKeyCSR {
 function Ensure-AgentCSR {
   param([string]$KeyPath, [string]$CsrPath, [string]$SubjectCN, [string]$Provider)
   $Provider = Normalize-KeyProvider $Provider
+  $script:EDR_EFFECTIVE_KEY_PROVIDER = $Provider
   if ($Provider -eq "cng" -or ($Provider -eq "tpm" -and -not $TpmKeyUri)) {
     $pn = $CngProviderName
     if (-not $pn) {
@@ -561,12 +570,15 @@ function Ensure-AgentCSR {
       }
       Write-Warning ("CNG CSR generation failed, falling back to PEM key for install continuity: " + $_.Exception.Message)
       $Provider = "pem"
+      $script:EDR_EFFECTIVE_KEY_PROVIDER = "pem"
     }
   }
   if ($Provider -eq "pkcs11" -or $Provider -eq "tpm") {
+    $script:EDR_EFFECTIVE_KEY_PROVIDER = $Provider
     $uri = if ($Provider -eq "pkcs11") { $Pkcs11KeyUri } else { $TpmKeyUri }
     return Ensure-ExternalKeyCSR -CsrPath $CsrPath -SubjectCN $SubjectCN -Provider $Provider -KeyUri $uri -ModulePath $Pkcs11Module
   }
+  $script:EDR_EFFECTIVE_KEY_PROVIDER = "pem"
   $nativeCsr = Try-Ensure-NativePemAgentCSR -KeyPath $KeyPath -CsrPath $CsrPath -SubjectCN $SubjectCN
   if ($nativeCsr) {
     return $nativeCsr
@@ -608,6 +620,13 @@ if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
 
 $keyProviderNorm = Normalize-KeyProvider $KeyProvider
 $csrPem = Ensure-AgentCSR -KeyPath $ClientKeyPath -CsrPath $ClientCsrPath -SubjectCN $env:COMPUTERNAME -Provider $keyProviderNorm
+$effectiveKeyProvider = if ($script:EDR_EFFECTIVE_KEY_PROVIDER) { [string]$script:EDR_EFFECTIVE_KEY_PROVIDER } else { $keyProviderNorm }
+if ($keyProviderNorm -eq "cng" -and $effectiveKeyProvider -eq "pem") {
+  # CNG can fall back to a local PEM key on hosts where certreq/KSP enrollment is
+  # unavailable. Keep the rest of the install path aligned with the key material
+  # that was actually generated.
+  Write-Warning "CNG key provider fell back to PEM; using file-based client certificate configuration"
+}
 
 $bodyObj = @{
   token         = $tok
@@ -730,10 +749,82 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
   [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 }
 
+function Get-RedactedUrlForDiagnostics {
+  param([string]$Value)
+  if (-not $Value) { return "" }
+  try {
+    $u = [System.Uri]$Value
+    $b = [System.UriBuilder]::new($u)
+    if ($u.UserInfo) {
+      $b.UserName = "***"
+      $b.Password = "***"
+    }
+    return $b.Uri.AbsoluteUri
+  } catch {
+    return $Value
+  }
+}
+
+function Get-ExceptionChainText {
+  param([object]$Exception)
+  $items = New-Object System.Collections.Generic.List[string]
+  $e = $Exception
+  while ($e) {
+    $msg = ([string]$e.Message).Trim()
+    if ($msg) {
+      $items.Add(("{0}: {1}" -f $e.GetType().FullName, $msg)) | Out-Null
+    }
+    $e = $e.InnerException
+  }
+  return ($items -join " | ")
+}
+
+function Get-EnrollFailureHint {
+  param([object]$Exception)
+  $text = (Get-ExceptionChainText $Exception).ToLowerInvariant()
+  if ($text -match "trust|certificate|ssl|tls|认证|证书") {
+    return "TLS/certificate validation failed; provide a signed bootstrap manifest with tls_ca_pem or tls_leaf_sha256, enable TrustCa for a local CA, or use InsecureTls only for lab testing."
+  }
+  if ($text -match "proxy|407") {
+    return "Proxy failed; verify proxy mode, proxy URL, and optional proxy credentials."
+  }
+  if ($text -match "timed out|timeout|超时|canceled") {
+    return "Enroll endpoint timed out; verify address, port, firewall/NAT, proxy, and that the backend is listening on the selected HTTPS port."
+  }
+  if ($text -match "refused|actively refused|无法连接|no connection|unreachable|name resolution|dns") {
+    return "Enroll endpoint is unreachable; verify IP/port, backend bind address, firewall, routing, and proxy mode."
+  }
+  return "Enroll request failed; check backend /api/v1/enroll availability, TLS trust, proxy settings, and enroll token validity."
+}
+
+function Format-EnrollFailure {
+  param([object]$ErrorRecord)
+  $ex = $ErrorRecord.Exception
+  $parts = New-Object System.Collections.Generic.List[string]
+  $parts.Add("enroll failed") | Out-Null
+  $parts.Add(("url={0}" -f (Get-RedactedUrlForDiagnostics $uri))) | Out-Null
+  $parts.Add(("timeout_sec={0}" -f $EnrollTimeoutSec)) | Out-Null
+  $parts.Add(("proxy_mode={0}" -f $ProxyMode)) | Out-Null
+  $parts.Add(("proxy_url={0}" -f (Get-RedactedUrlForDiagnostics $ProxyUrl))) | Out-Null
+  $parts.Add(("trust_ca={0}" -f [bool]$TrustCa)) | Out-Null
+  $parts.Add(("insecure_tls={0}" -f ($env:EDR_INSECURE_TLS -eq "1"))) | Out-Null
+  $parts.Add(("bootstrap_ca={0}" -f [bool]$BootstrapCaCertPath)) | Out-Null
+  $parts.Add(("bootstrap_leaf_pin={0}" -f [bool]$BootstrapTlsLeafSha256)) | Out-Null
+  if ($ex -is [System.Net.WebException]) {
+    $parts.Add(("web_status={0}" -f $ex.Status)) | Out-Null
+    if ($ex.Response -is [System.Net.HttpWebResponse]) {
+      $parts.Add(("http_status={0}" -f [int]$ex.Response.StatusCode)) | Out-Null
+    }
+  }
+  $parts.Add(("error_chain={0}" -f (Get-ExceptionChainText $ex))) | Out-Null
+  $parts.Add(("hint={0}" -f (Get-EnrollFailureHint $ex))) | Out-Null
+  return ($parts -join "; ")
+}
+
 try {
-  $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body $json @WebRequestProxyOptions
+  $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body $json -TimeoutSec $EnrollTimeoutSec @WebRequestProxyOptions
 } catch {
-  Write-Error ("enroll failed: " + $_)
+  Write-Error (Format-EnrollFailure $_)
 }
 
 if ($resp.code -and $resp.code -ne "OK") {
@@ -755,10 +846,10 @@ $agentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd(
 $serverIssuedCert = ($d.ca_cert -and $d.client_cert)
 $bootstrapCaAvailable = [bool]($BootstrapCaCertPath -and (Test-Path -LiteralPath $BootstrapCaCertPath))
 $useCertPaths = [bool]($serverIssuedCert -or $bootstrapCaAvailable -or $env:EDR_CA_CERT -or $env:EDR_CLIENT_CERT -or $env:EDR_CLIENT_KEY)
-$UseNativeWindowsStore = ((Get-EnrollOs) -eq "windows" -and ($keyProviderNorm -eq "cng" -or ($keyProviderNorm -eq "tpm" -and -not $TpmKeyUri)))
+$UseNativeWindowsStore = ((Get-EnrollOs) -eq "windows" -and ($effectiveKeyProvider -eq "cng" -or ($effectiveKeyProvider -eq "tpm" -and -not $TpmKeyUri)))
 $EffectiveCaCertPath = if ($useCertPaths) { $CaCertPath } else { "" }
 $EffectiveClientCertPath = if ($useCertPaths -and -not $UseNativeWindowsStore) { $ClientCertPath } else { "" }
-$EffectiveClientKeyPath = if ($useCertPaths -and $keyProviderNorm -eq "pem") { $ClientKeyPath } else { "" }
+$EffectiveClientKeyPath = if ($useCertPaths -and $effectiveKeyProvider -eq "pem") { $ClientKeyPath } else { "" }
 $EffectiveCertStore = if ($UseNativeWindowsStore) { "LocalMachine\\MY" } else { "" }
 $EffectiveCertThumbprint = ""
 
@@ -958,9 +1049,9 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$EndpointId,
     [Parameter(Mandatory = $true)][string]$TenantId,
     [Parameter(Mandatory = $true)][string]$RestBaseUrl,
-    [Parameter(Mandatory = $true)][string]$CaPath,
-    [Parameter(Mandatory = $true)][string]$CertPath,
-    [Parameter(Mandatory = $true)][string]$KeyPath,
+    [AllowEmptyString()][string]$CaPath,
+    [AllowEmptyString()][string]$CertPath,
+    [AllowEmptyString()][string]$KeyPath,
     [Parameter(Mandatory = $true)][string]$KeyProvider,
     [Parameter(Mandatory = $true)][string]$ProxyMode,
     [AllowEmptyString()][string]$ProxyUrl,
@@ -1270,7 +1361,7 @@ grpc_insecure        = false
 ca_cert              = "$(Escape-Toml $EffectiveCaCertPath)"
 client_cert          = "$(Escape-Toml $EffectiveClientCertPath)"
 client_key           = "$(Escape-Toml $EffectiveClientKeyPath)"
-client_key_provider  = "$(Escape-Toml $keyProviderNorm)"
+client_key_provider  = "$(Escape-Toml $effectiveKeyProvider)"
 client_cert_store    = "$(Escape-Toml $EffectiveCertStore)"
 client_cert_thumbprint = "$(Escape-Toml $EffectiveCertThumbprint)"
 pkcs11_module        = "$(Escape-Toml $Pkcs11Module)"
@@ -1428,7 +1519,7 @@ if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $ex
     $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -InstallDir $InstallDirForToml -ServerAddr $saddr `
       -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
       -CaPath $EffectiveCaCertPath -CertPath $EffectiveClientCertPath -KeyPath $EffectiveClientKeyPath `
-      -KeyProvider $keyProviderNorm -ProxyMode $ProxyMode -ProxyUrl $ProxyUrl -RelayUrl $RelayUrl `
+      -KeyProvider $effectiveKeyProvider -ProxyMode $ProxyMode -ProxyUrl $ProxyUrl -RelayUrl $RelayUrl `
       -Http2Enabled $Http2Enabled -Http2Require $Http2Require `
       -ControlStreamEnabled $ControlStreamEnabled -LongPollFallback $LongPollFallback `
       -ReportEventsV2Enabled $ReportEventsV2Enabled -DataPlaneEncoding $DataPlaneEncoding `
@@ -1461,7 +1552,7 @@ if ($d.ca_cert -or $d.client_cert) {
   if ($TrustCa) {
     Install-BootstrapCaTrust -Path $CaCertPath
   }
-  Accept-CngIssuedCertificate -CertPath $ClientCertPath -Provider $keyProviderNorm
+  Accept-CngIssuedCertificate -CertPath $ClientCertPath -Provider $effectiveKeyProvider
 }
 if ($d.client_key) {
   Write-Warning "enroll response included deprecated client_key; ignoring it because the endpoint private key is generated locally"
@@ -1482,7 +1573,7 @@ Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_
 
 if (-not $SkipHealthCheck) {
   Test-AgentBootstrapHealth -TomlPath $outFile -EndpointId $d.endpoint_id -TenantId $d.tenant_id `
-    -RestBaseUrl $rest -CaPath $EffectiveCaCertPath -Provider $keyProviderNorm `
+    -RestBaseUrl $rest -CaPath $EffectiveCaCertPath -Provider $effectiveKeyProvider `
     -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
     -ReportPath $HealthReportPath -Strict ([bool]$StrictHealthCheck)
 }
