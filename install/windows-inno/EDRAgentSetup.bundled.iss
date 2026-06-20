@@ -99,6 +99,7 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.pid"
+Type: files; Name: "{app}\FDSensorTaskLaunch.ps1"
 Type: files; Name: "{app}\edr_queue.db*"
 Type: files; Name: "{app}\local_evidence_cache.db*"
 Type: files; Name: "{app}\command_state.jsonl*"
@@ -695,17 +696,24 @@ begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$out=' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.output.log')) + ';'
     + '$script=' + EdrPsSq(ExpandConstant('{app}\edr_agent_postinstall_verify.ps1')) + ';'
-    + '$args=@('
+    + 'try{New-Item -ItemType File -Path $out -Force | Out-Null;Add-Content -LiteralPath $out -Value ((Get-Date).ToString(''o'')+'' wrapper_start script=''+$script) -Encoding UTF8}catch{};'
+    + '$argv=@('
     + '''-InstallDir'',' + EdrPsSq(ExpandConstant('{app}')) + ','
     + '''-ConfigPath'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ','
     + '''-ReportPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ','
     + '''-LogPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.log'))
     + ');'
-    + '& $script @args *> $out;'
+    + 'try{'
+    + '& $script @argv *>> $out;'
     + '$ok=$?;'
     + '$code=1;if($ok){$code=0};'
     + 'if($LASTEXITCODE -ne $null){$code=$LASTEXITCODE};'
-    + 'try{Get-Content -LiteralPath $out -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }}catch{};'
+    + 'try{Add-Content -LiteralPath $out -Value ((Get-Date).ToString(''o'')+'' wrapper_exit_code=''+$code) -Encoding UTF8}catch{};'
+    + '}catch{'
+    + '$code=1;'
+    + 'try{Add-Content -LiteralPath $out -Value ((Get-Date).ToString(''o'')+'' wrapper_exception=''+$_.Exception.Message) -Encoding UTF8}catch{};'
+    + '};'
+    + 'try{Get-Content -LiteralPath $out -Tail 80 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }}catch{};'
     + 'exit $code'
     + '"';
 end;
@@ -808,10 +816,12 @@ begin
     + 'try { $task0=Get-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($task0){foreach($a in @($task0.Actions)){L (''task_action execute=''+$a.Execute+'' args=''+$a.Arguments+'' wd=''+$a.WorkingDirectory)}; L (''task_principal user=''+$task0.Principal.UserId+'' logon=''+$task0.Principal.LogonType+'' runlevel=''+$task0.Principal.RunLevel)} } catch {};'
     + 'Start-Sleep -Seconds 1;'
     + 'try { Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction Stop; L ''Start-ScheduledTask invoked'' } catch { L (''Start-ScheduledTask error: ''+$_.Exception.Message) };'
-    + 'Start-Sleep -Seconds 3;'
+    + 'Start-Sleep -Seconds 5;'
+    + '$startupLog=Join-Path $wd ''logs\startup-task.log'';'
+    + 'try { if(Test-Path -LiteralPath $startupLog){Get-Content -LiteralPath $startupLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { L (''task_launcher ''+$_) }} } catch {};'
     + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
     + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
-    + 'try { $p=Start-Process -FilePath $exe -ArgumentList @(''--config'',$cfg) -WorkingDirectory $wd -WindowStyle Hidden -PassThru; L (''manual fallback pid=''+$p.Id) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
+    + 'try { $p=Start-Process -FilePath $exe -ArgumentList @(''--config'',$cfg) -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 2;'
     + '};'
     + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
@@ -838,7 +848,7 @@ begin
     + '$p=Start-Process -FilePath $exe'
     + ' -ArgumentList @(''--config'',$cfg)'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
-    + ' -WindowStyle Hidden -PassThru;'
+    + ' -WindowStyle Hidden -PassThru -ErrorAction Stop;'
     + 'try { $p.PriorityClass = ''BelowNormal'' } catch {};'
     + 'exit 0'
     + '"';

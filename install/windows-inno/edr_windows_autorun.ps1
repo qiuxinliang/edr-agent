@@ -89,6 +89,67 @@ function Repair-RuntimeDependencyAcls {
   }
 }
 
+function Quote-ForSingleQuotedPowerShell {
+  param([string]$Value)
+  return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Write-TaskLauncher {
+  param([string]$Exe, [string]$Config, [string]$Dir)
+  $launcher = Join-Path $Dir "FDSensorTaskLaunch.ps1"
+  $logDir = Join-Path $Dir "logs"
+  $logPath = Join-Path $logDir "startup-task.log"
+  $exeLit = Quote-ForSingleQuotedPowerShell $Exe
+  $cfgLit = Quote-ForSingleQuotedPowerShell $Config
+  $dirLit = Quote-ForSingleQuotedPowerShell $Dir
+  $logDirLit = Quote-ForSingleQuotedPowerShell $logDir
+  $logPathLit = Quote-ForSingleQuotedPowerShell $logPath
+  $body = @"
+#Requires -Version 5.1
+`$ErrorActionPreference = "SilentlyContinue"
+`$exe = $exeLit
+`$cfg = $cfgLit
+`$wd = $dirLit
+`$logDir = $logDirLit
+`$logPath = $logPathLit
+function Write-FDTaskLog {
+  param([string]`$Message)
+  try {
+    if (-not (Test-Path -LiteralPath `$logDir)) {
+      New-Item -ItemType Directory -Path `$logDir -Force | Out-Null
+    }
+    Add-Content -LiteralPath `$logPath -Value ((Get-Date).ToString("o") + " " + `$Message) -Encoding UTF8
+  } catch {}
+}
+Write-FDTaskLog "launcher_start user=`$([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+Write-FDTaskLog "exe=`$exe cfg=`$cfg wd=`$wd"
+try {
+  if (-not (Test-Path -LiteralPath `$exe)) { Write-FDTaskLog "missing_exe"; exit 2 }
+  if (-not (Test-Path -LiteralPath `$cfg)) { Write-FDTaskLog "missing_config"; exit 3 }
+  try { Unblock-File -LiteralPath `$exe -ErrorAction SilentlyContinue } catch {}
+  `$p = Start-Process -FilePath `$exe -ArgumentList @("--config", `$cfg) -WorkingDirectory `$wd -WindowStyle Hidden -PassThru -ErrorAction Stop
+  Write-FDTaskLog ("started_pid=" + `$p.Id)
+  Start-Sleep -Seconds 4
+  `$alive = Get-Process -Id `$p.Id -ErrorAction SilentlyContinue
+  if (-not `$alive) {
+    Write-FDTaskLog "process_exited_early"
+    exit 4
+  }
+  Write-FDTaskLog "process_alive"
+  exit 0
+} catch {
+  Write-FDTaskLog ("launcher_error=" + `$_.Exception.Message)
+  exit 1
+}
+"@
+  Set-Content -LiteralPath $launcher -Value $body -Encoding UTF8
+  try { Unblock-File -LiteralPath $launcher -ErrorAction SilentlyContinue } catch {}
+  try {
+    & icacls.exe $launcher /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r "*S-1-5-32-545:RX" /C /Q | Out-Null
+  } catch {}
+  return $launcher
+}
+
 if ($Action -eq "Remove") {
   Remove-ScheduledTaskIfPresent
   Stop-AgentProcess
@@ -130,8 +191,13 @@ Repair-RuntimeDependencyAcls -Dir $instDir
 Set-AgentTomlAcl -Path $cfg
 Repair-ExecutableAcl -Path $exe
 
-$argLine = '--config "' + $cfg + '"'
-$sta = New-ScheduledTaskAction -Execute $exe -Argument $argLine -WorkingDirectory $instDir
+$launcher = Write-TaskLauncher -Exe $exe -Config $cfg -Dir $instDir
+$psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (-not (Test-Path -LiteralPath $psExe)) {
+  $psExe = "powershell.exe"
+}
+$argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $launcher + '"'
+$sta = New-ScheduledTaskAction -Execute $psExe -Argument $argLine -WorkingDirectory $instDir
 $trg = New-ScheduledTaskTrigger -AtStartup
 $prc = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
