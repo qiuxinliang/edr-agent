@@ -374,12 +374,12 @@ function Repair-InstallRuntimeAcls {
   if (-not $icacls) { return }
 
   try {
-    & $icacls.Source $InstallRoot /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
+    & $icacls.Source $InstallRoot /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /C /Q | Out-Null
   } catch {
     Write-Warning ("failed to grant runtime ACLs on install dir: " + $_.Exception.Message)
   }
 
-  foreach ($sub in @("certs", "queue", "evidence", "state", "logs", "diagnostics", "upload_outbox")) {
+  foreach ($sub in @("certs", "queue", "evidence", "state", "logs", "diagnostics", "upload_outbox", "forensic", "isolation")) {
     $path = Join-Path $InstallRoot $sub
     try {
       if (-not (Test-Path -LiteralPath $path)) {
@@ -409,6 +409,21 @@ function Repair-InstallRuntimeAcls {
           try { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue } catch {}
         }
     } catch {}
+  }
+
+  foreach ($uninstaller in @(
+    @{ Name = "unins000.exe"; Grant = "*S-1-5-32-545:RX" },
+    @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" }
+  )) {
+    $path = Join-Path $InstallRoot $uninstaller.Name
+    try {
+      if (Test-Path -LiteralPath $path) {
+        & $icacls.Source $path /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r $uninstaller.Grant /C /Q | Out-Null
+        try { Unblock-File -LiteralPath $path -ErrorAction SilentlyContinue } catch {}
+      }
+    } catch {
+      Write-Warning ("failed to repair uninstaller ACL: " + $path + " " + $_.Exception.Message)
+    }
   }
 }
 

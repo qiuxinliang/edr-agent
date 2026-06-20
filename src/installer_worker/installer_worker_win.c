@@ -2,10 +2,12 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 
 static const wchar_t *DEFAULT_INSTALL_DIR = L"C:\\Program Files\\FDSecurity";
 static const wchar_t *DEFAULT_SERVICE_NAME = L"FDSecurityAgent";
@@ -106,6 +108,81 @@ static void quote_arg(wchar_t *out, size_t cap, const wchar_t *value) {
     out[pos++] = *p;
   }
   if (pos + 1 < cap) out[pos++] = L'"';
+  out[pos] = 0;
+}
+
+static void trim_ascii(char *s) {
+  if (!s) return;
+  char *p = s;
+  while (*p && isspace((unsigned char)*p)) ++p;
+  if (p != s) memmove(s, p, strlen(p) + 1);
+  size_t n = strlen(s);
+  while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = 0;
+}
+
+static int read_toml_scalar(const wchar_t *path, const char *key, wchar_t *out, size_t out_cap) {
+  if (!out || out_cap == 0) return 0;
+  out[0] = 0;
+  if (!path || !path[0] || !key || !key[0]) return 0;
+
+  FILE *f = _wfopen(path, L"rb");
+  if (!f) return 0;
+  char line[4096];
+  size_t key_len = strlen(key);
+  while (fgets(line, sizeof(line), f)) {
+    char *p = line;
+    while (*p && isspace((unsigned char)*p)) ++p;
+    if (*p == '#' || *p == 0) continue;
+    if (strncmp(p, key, key_len) != 0) continue;
+    p += key_len;
+    while (*p && isspace((unsigned char)*p)) ++p;
+    if (*p != '=') continue;
+    ++p;
+    while (*p && isspace((unsigned char)*p)) ++p;
+
+    char value[2048];
+    value[0] = 0;
+    if (*p == '"') {
+      ++p;
+      size_t pos = 0;
+      while (*p && *p != '"' && pos + 1 < sizeof(value)) {
+        value[pos++] = *p++;
+      }
+      value[pos] = 0;
+    } else {
+      size_t pos = 0;
+      while (*p && *p != '#' && *p != '\r' && *p != '\n' && pos + 1 < sizeof(value)) {
+        value[pos++] = *p++;
+      }
+      value[pos] = 0;
+      trim_ascii(value);
+    }
+    fclose(f);
+    if (!value[0]) return 0;
+    int n = MultiByteToWideChar(CP_UTF8, 0, value, -1, out, (int)out_cap);
+    if (n <= 0) {
+      n = MultiByteToWideChar(CP_ACP, 0, value, -1, out, (int)out_cap);
+    }
+    if (n <= 0) {
+      out[0] = 0;
+      return 0;
+    }
+    out[out_cap - 1] = 0;
+    return 1;
+  }
+  fclose(f);
+  return 0;
+}
+
+static void sanitize_thumbprint(const wchar_t *in, wchar_t *out, size_t cap) {
+  if (!out || cap == 0) return;
+  size_t pos = 0;
+  for (const wchar_t *p = in ? in : L""; *p && pos + 1 < cap; ++p) {
+    wchar_t ch = *p;
+    if ((ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F')) {
+      out[pos++] = (wchar_t)towupper(ch);
+    }
+  }
   out[pos] = 0;
 }
 
@@ -424,7 +501,7 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
   quote_arg(qdir, sizeof(qdir) / sizeof(qdir[0]), install_dir);
 
   _snwprintf(args, sizeof(args) / sizeof(args[0]),
-             L"%ls /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /grant:r \"*S-1-5-32-545:(OI)(CI)RX\" /T /C /Q",
+             L"%ls /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /grant:r \"*S-1-5-32-545:(OI)(CI)RX\" /C /Q",
              qdir);
   args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
   run_icacls(args, install_dir, log_path);
@@ -439,6 +516,26 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
                qpath);
     args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
     run_icacls(args, install_dir, log_path);
+  }
+
+  const struct {
+    const wchar_t *name;
+    const wchar_t *users_grant;
+  } uninstaller_files[] = {
+      {L"unins000.exe", L"RX"},
+      {L"unins000.dat", L"R"},
+      {NULL, NULL},
+  };
+  for (int i = 0; uninstaller_files[i].name; ++i) {
+    join_path(path, sizeof(path) / sizeof(path[0]), install_dir, uninstaller_files[i].name);
+    if (file_exists(path)) {
+      quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), path);
+      _snwprintf(args, sizeof(args) / sizeof(args[0]),
+                 L"%ls /grant:r \"*S-1-5-18:F\" /grant:r \"*S-1-5-32-544:F\" /grant:r \"*S-1-5-32-545:%ls\" /C /Q",
+                 qpath, uninstaller_files[i].users_grant);
+      args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+      run_icacls(args, install_dir, log_path);
+    }
   }
 
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"agent.toml");
@@ -731,18 +828,90 @@ static int stage_start_runtime(const wchar_t *install_dir, const wchar_t *exe_pa
   return 23;
 }
 
+static void run_etw_uninstall_cleanup(const wchar_t *install_dir, const wchar_t *log_path) {
+  wchar_t exe[MAX_PATH * 2];
+  join_path(exe, sizeof(exe) / sizeof(exe[0]), install_dir, L"FDSensor.exe");
+  if (!file_exists(exe)) {
+    join_path(exe, sizeof(exe) / sizeof(exe[0]), install_dir, L"edr_agent.exe");
+  }
+  if (!file_exists(exe)) {
+    append_log_utf8(log_path, L"etw_cleanup_skipped exe_missing");
+    return;
+  }
+  append_log_utf8(log_path, L"etw_cleanup_begin");
+  run_process_wait(exe, L"--etw-uninstall-cleanup", install_dir, log_path, 30000);
+  append_log_utf8(log_path, L"etw_cleanup_done");
+}
+
+static void remove_client_certificate_from_store(const wchar_t *install_dir, const wchar_t *log_path,
+                                                 const wchar_t *store, const wchar_t *thumbprint) {
+  wchar_t tp[160];
+  sanitize_thumbprint(thumbprint, tp, sizeof(tp) / sizeof(tp[0]));
+  if (!tp[0]) {
+    append_log_utf8(log_path, L"client_cert_cleanup_skipped thumbprint_missing");
+    return;
+  }
+
+  const wchar_t *scope = L"LocalMachine";
+  if (store && wcsstr(store, L"CurrentUser")) scope = L"CurrentUser";
+
+  wchar_t line[512];
+  _snwprintf(line, sizeof(line) / sizeof(line[0]), L"client_cert_cleanup_begin store=%ls\\My thumbprint=%ls", scope, tp);
+  line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+  append_log_utf8(log_path, line);
+
+  wchar_t powershell[MAX_PATH * 2], args[4096];
+  system_exe_path(powershell, sizeof(powershell) / sizeof(powershell[0]), L"WindowsPowerShell\\v1.0\\powershell.exe");
+  if (!file_exists(powershell)) {
+    system_exe_path(powershell, sizeof(powershell) / sizeof(powershell[0]), L"powershell.exe");
+  }
+  _snwprintf(args, sizeof(args) / sizeof(args[0]),
+             L"-NoProfile -ExecutionPolicy Bypass -Command \"try{$tp='%ls';$p='Cert:\\%ls\\My\\'+$tp;if(Test-Path -LiteralPath $p){Remove-Item -LiteralPath $p -DeleteKey -Force -ErrorAction Stop;Write-Host 'client_cert_removed'}else{Write-Host 'client_cert_not_found'}}catch{Write-Host ('client_cert_remove_failed='+$_.Exception.Message)};exit 0\"",
+             tp, scope);
+  args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+  run_process_wait(powershell, args, install_dir, log_path, 30000);
+
+  wchar_t certutil[MAX_PATH * 2], cert_args[512];
+  system_exe_path(certutil, sizeof(certutil) / sizeof(certutil[0]), L"certutil.exe");
+  if (file_exists(certutil)) {
+    _snwprintf(cert_args, sizeof(cert_args) / sizeof(cert_args[0]), L"%ls-delstore My %ls",
+               wcscmp(scope, L"CurrentUser") == 0 ? L"-user " : L"", tp);
+    cert_args[(sizeof(cert_args) / sizeof(cert_args[0])) - 1] = 0;
+    run_process_wait(certutil, cert_args, install_dir, log_path, 30000);
+  }
+  append_log_utf8(log_path, L"client_cert_cleanup_done");
+}
+
 static int stage_uninstall_runtime(const wchar_t *install_dir, const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=uninstall-runtime begin");
+  wchar_t config_path[MAX_PATH * 2], endpoint_id[256], tenant_id[256], cert_store[256], cert_thumbprint[256];
+  join_path(config_path, sizeof(config_path) / sizeof(config_path[0]), install_dir, L"agent.toml");
+  endpoint_id[0] = tenant_id[0] = cert_store[0] = cert_thumbprint[0] = 0;
+  read_toml_scalar(config_path, "endpoint_id", endpoint_id, sizeof(endpoint_id) / sizeof(endpoint_id[0]));
+  read_toml_scalar(config_path, "tenant_id", tenant_id, sizeof(tenant_id) / sizeof(tenant_id[0]));
+  read_toml_scalar(config_path, "client_cert_store", cert_store, sizeof(cert_store) / sizeof(cert_store[0]));
+  read_toml_scalar(config_path, "client_cert_thumbprint", cert_thumbprint,
+                   sizeof(cert_thumbprint) / sizeof(cert_thumbprint[0]));
+  wchar_t identity_line[1024];
+  _snwprintf(identity_line, sizeof(identity_line) / sizeof(identity_line[0]),
+             L"uninstall_identity endpoint_id=%ls tenant_id=%ls client_cert_store=%ls client_cert_thumbprint=%ls",
+             endpoint_id[0] ? endpoint_id : L"-", tenant_id[0] ? tenant_id : L"-", cert_store[0] ? cert_store : L"-",
+             cert_thumbprint[0] ? cert_thumbprint : L"-");
+  identity_line[(sizeof(identity_line) / sizeof(identity_line[0])) - 1] = 0;
+  append_log_utf8(log_path, identity_line);
+
   stop_service_by_name(DEFAULT_SERVICE_NAME, log_path);
   stop_service_by_name(L"EdrAgent", log_path);
   delete_service_by_name(DEFAULT_SERVICE_NAME, log_path);
   delete_service_by_name(L"EdrAgent", log_path);
+  run_etw_uninstall_cleanup(install_dir, log_path);
   stop_process_by_name(L"FDSensor.exe", log_path);
   stop_process_by_name(L"edr_agent.exe", log_path);
   wchar_t schtasks[MAX_PATH * 2];
   system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
   run_process_wait(schtasks, L"/Delete /F /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
   run_process_wait(schtasks, L"/Delete /F /TN \"EdrAgent\"", install_dir, log_path, 30000);
+  remove_client_certificate_from_store(install_dir, log_path, cert_store, cert_thumbprint);
   clear_runtime_env(log_path);
   append_log_utf8(log_path, L"stage=uninstall-runtime ok");
   return 0;

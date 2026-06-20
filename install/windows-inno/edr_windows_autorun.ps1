@@ -46,7 +46,7 @@ function Set-InstallDirAclHarden {
   if (-not (Test-Path -LiteralPath $Dir)) { return }
   # SID: SYSTEM / Administrators full control; Users read+execute for binaries.
   # agent.toml is tightened separately because it contains endpoint identity.
-  & icacls.exe $Dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
+  & icacls.exe $Dir /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /C /Q | Out-Null
 }
 
 function Set-AgentTomlAcl {
@@ -72,11 +72,30 @@ function Repair-ExecutableAcl {
   } catch {}
 }
 
+function Repair-UninstallerAcls {
+  param([string]$Dir)
+  if (-not (Test-Path -LiteralPath $Dir)) { return }
+
+  $entries = @(
+    @{ Name = "unins000.exe"; Grant = "*S-1-5-32-545:RX" },
+    @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" }
+  )
+  foreach ($entry in $entries) {
+    $path = Join-Path $Dir $entry.Name
+    try {
+      if (Test-Path -LiteralPath $path) {
+        & icacls.exe $path /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r $entry.Grant /C /Q | Out-Null
+        try { Unblock-File -LiteralPath $path -ErrorAction SilentlyContinue } catch {}
+      }
+    } catch {}
+  }
+}
+
 function Repair-RuntimeDependencyAcls {
   param([string]$Dir)
   if (-not (Test-Path -LiteralPath $Dir)) { return }
   try {
-    & icacls.exe $Dir /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
+    & icacls.exe $Dir /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /C /Q | Out-Null
   } catch {}
 
   foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.toml", "*.json", "*.enc", "models\*", "edr_config\*")) {
@@ -87,6 +106,7 @@ function Repair-RuntimeDependencyAcls {
         }
     } catch {}
   }
+  Repair-UninstallerAcls -Dir $Dir
 }
 
 function Repair-SensitiveRuntimeAcls {
@@ -122,6 +142,7 @@ function Repair-SensitiveRuntimeAcls {
         }
     } catch {}
   }
+  Repair-UninstallerAcls -Dir $Dir
 }
 
 function Quote-ForSingleQuotedPowerShell {

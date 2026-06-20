@@ -77,7 +77,7 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--config ""{app}\agent.toml"""; 
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:AutorunInstallPsParameters}"; StatusMsg: "Configuring startup task..."; Flags: waituntilterminated; Check: ShouldInstallAutorun
 
 [UninstallRun]
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"" -ExePath ""{app}\FDSensor.exe"" -ConfigPath ""{app}\agent.toml"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
 
 [UninstallDelete]
@@ -98,6 +98,8 @@ Type: filesandordirs; Name: "{app}\diagnostics"
 Type: filesandordirs; Name: "{app}\upload_outbox"
 Type: filesandordirs; Name: "{commonappdata}\FDSecurity\setup-ui"
 Type: dirifempty; Name: "{commonappdata}\FDSecurity"
+Type: filesandordirs; Name: "{localappdata}\FDSecurity\setup-ui"
+Type: dirifempty; Name: "{localappdata}\FDSecurity"
 
 [Code]
 var

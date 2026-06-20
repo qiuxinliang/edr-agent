@@ -96,7 +96,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 
 [UninstallRun]
 Filename: "{app}\FDSecurityInstallerWorker.exe"; Parameters: "--stage uninstall-runtime --install-dir ""{app}"" --log ""{commonappdata}\FDSecurity\setup-ui\uninstall-worker.log"""; RunOnceId: "FDSecurityNativeRuntimeRemove"; Flags: runhidden waituntilterminated; Check: InstallerWorkerPresentForUninstall
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"" -ExePath ""{app}\FDSensor.exe"" -ConfigPath ""{app}\agent.toml"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
 
 [UninstallDelete]
@@ -118,6 +118,8 @@ Type: filesandordirs; Name: "{app}\diagnostics"
 Type: filesandordirs; Name: "{app}\upload_outbox"
 Type: filesandordirs; Name: "{commonappdata}\FDSecurity\setup-ui"
 Type: dirifempty; Name: "{commonappdata}\FDSecurity"
+Type: filesandordirs; Name: "{localappdata}\FDSecurity\setup-ui"
+Type: dirifempty; Name: "{localappdata}\FDSecurity"
 
 [Code]
 var
@@ -967,7 +969,9 @@ begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$d=' + EdrPsSq(ExpandConstant('{app}')) + ';'
     + 'if(Test-Path -LiteralPath $d){'
-    + '& icacls.exe $d /inheritance:r /grant:r ''*S-1-5-18:(OI)(CI)F'' /grant:r ''*S-1-5-32-544:(OI)(CI)F'' /grant:r ''*S-1-5-32-545:(OI)(CI)RX'' /T /C /Q | Out-Null'
+    + '& icacls.exe $d /grant:r ''*S-1-5-18:(OI)(CI)F'' /grant:r ''*S-1-5-32-544:(OI)(CI)F'' /grant:r ''*S-1-5-32-545:(OI)(CI)RX'' /C /Q | Out-Null;'
+    + '$ux=Join-Path $d ''unins000.exe'';if(Test-Path -LiteralPath $ux){& icacls.exe $ux /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /grant:r ''*S-1-5-32-545:RX'' /C /Q | Out-Null};'
+    + '$ud=Join-Path $d ''unins000.dat'';if(Test-Path -LiteralPath $ud){& icacls.exe $ud /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /grant:r ''*S-1-5-32-545:R'' /C /Q | Out-Null}'
     + '};'
     + '$cfg=Join-Path $d ''agent.toml'';'
     + 'if(Test-Path -LiteralPath $cfg){'

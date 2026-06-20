@@ -50,6 +50,63 @@ function Remove-MachineEnv([string]$Name) {
   [Environment]::SetEnvironmentVariable($Name, $null, "Machine")
 }
 
+function Read-AgentTomlScalar {
+  param([string]$Path, [string]$Key)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return "" }
+  $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*"([^"]*)"'
+  try {
+    foreach ($line in [System.IO.File]::ReadLines(([System.IO.Path]::GetFullPath($Path)))) {
+      $m = [regex]::Match($line, $pattern)
+      if ($m.Success) { return $m.Groups[1].Value }
+    }
+  } catch {}
+  return ""
+}
+
+function Invoke-AgentEtwUninstallCleanup {
+  $exe = $ExePath
+  if (-not (Test-Path -LiteralPath $exe)) {
+    $exe = Join-Path $InstallDir "FDSensor.exe"
+  }
+  if (-not (Test-Path -LiteralPath $exe)) {
+    $exe = Join-Path $InstallDir "edr_agent.exe"
+  }
+  if (-not (Test-Path -LiteralPath $exe)) {
+    Write-Host "ETW cleanup skipped: Agent executable not found"
+    return
+  }
+  try {
+    & $exe --etw-uninstall-cleanup | Out-Host
+  } catch {
+    Write-Warning ("ETW cleanup failed: " + $_.Exception.Message)
+  }
+}
+
+function Remove-AgentClientCertificate {
+  $thumbprint = (Read-AgentTomlScalar -Path $ConfigPath -Key "client_cert_thumbprint") -replace '\s+', ''
+  $store = Read-AgentTomlScalar -Path $ConfigPath -Key "client_cert_store"
+  $endpointID = Read-AgentTomlScalar -Path $ConfigPath -Key "endpoint_id"
+  if ($endpointID) {
+    Write-Host "Uninstall endpoint_id=$endpointID"
+  }
+  if (-not $thumbprint) {
+    Write-Host "Client certificate cleanup skipped: thumbprint not found in agent.toml"
+    return
+  }
+  $scope = if ($store -match "CurrentUser") { "CurrentUser" } else { "LocalMachine" }
+  $certPath = "Cert:\$scope\My\$thumbprint"
+  try {
+    if (Test-Path -LiteralPath $certPath) {
+      Remove-Item -LiteralPath $certPath -DeleteKey -Force -ErrorAction Stop
+      Write-Host "Removed client certificate and private key: $scope\My\$thumbprint"
+    } else {
+      Write-Host "Client certificate not found: $scope\My\$thumbprint"
+    }
+  } catch {
+    Write-Warning ("Client certificate cleanup failed: " + $_.Exception.Message)
+  }
+}
+
 function Set-AgentAcl {
   Ensure-Dir $InstallDir
   Ensure-Dir $DataDir
@@ -60,12 +117,28 @@ function Set-AgentAcl {
   Ensure-Dir (Join-Path $DataDir "isolation")
   Ensure-Dir (Join-Path $DataDir "certs")
 
-  & icacls.exe $InstallDir /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" /T | Out-Host
-  & icacls.exe $DataDir /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" /T | Out-Host
+  & icacls.exe $InstallDir /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" /C | Out-Host
+
+  foreach ($runtimeDir in @("logs", "queue", "evidence", "forensic", "isolation", "certs")) {
+    $path = Join-Path $DataDir $runtimeDir
+    if (Test-Path -LiteralPath $path) {
+      & icacls.exe $path /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" /T /C | Out-Host
+    }
+  }
   if ($Account -match "LocalService") {
     & icacls.exe $DataDir /grant "NT AUTHORITY\LOCAL SERVICE:(OI)(CI)M" /T | Out-Host
   } elseif ($Account -match "NetworkService") {
     & icacls.exe $DataDir /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T | Out-Host
+  }
+
+  foreach ($uninstaller in @(
+    @{ Name = "unins000.exe"; Grant = "Users:RX" },
+    @{ Name = "unins000.dat"; Grant = "Users:R" }
+  )) {
+    $path = Join-Path $InstallDir $uninstaller.Name
+    if (Test-Path -LiteralPath $path) {
+      & icacls.exe $path /grant:r "SYSTEM:F" "Administrators:F" $uninstaller.Grant /C | Out-Host
+    }
   }
 }
 
@@ -153,12 +226,14 @@ function Uninstall-AgentService {
       & sc.exe delete $name | Out-Host
     }
   }
+  Invoke-AgentEtwUninstallCleanup
   foreach ($procName in @("FDSensor", "edr_agent")) {
     Get-Process -Name $procName -ErrorAction SilentlyContinue | ForEach-Object {
       Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
       Start-Sleep -Seconds 2
     }
   }
+  Remove-AgentClientCertificate
   foreach ($name in @(
       "EDR_GRPC_REQUIRE_MTLS",
       "EDR_UPLOAD_FILE_RETRIES",
