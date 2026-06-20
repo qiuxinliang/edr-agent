@@ -1508,7 +1508,7 @@ public partial class MainWindow : Window
         return value switch
         {
             "cng" or "tpm" or "pkcs11" => value,
-            _ => "pem"
+            _ => "cng"
         };
     }
 
@@ -2252,7 +2252,7 @@ public sealed class InstallRequest
     public string ProxyUser { get; set; } = "";
     public string ProxyPassword { get; set; } = "";
     public string RelayUrl { get; set; } = "";
-    public string KeyProvider { get; set; } = "pem";
+    public string KeyProvider { get; set; } = "cng";
     public string BootstrapManifestUrl { get; set; } = "";
     public string BootstrapManifestPath { get; set; } = "";
     public string BootstrapManifestJson { get; set; } = "";

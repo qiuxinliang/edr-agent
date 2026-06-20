@@ -281,6 +281,25 @@ function Get-ExistingAgentTomlSanityIssue {
   return ""
 }
 
+function Get-ExistingAgentTomlMtlsIssue {
+  param([string]$Path)
+  if ((Get-EnrollOs) -ne "windows" -or -not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return ""
+  }
+  $provider = (Read-AgentTomlScalar -Path $Path -Key "client_key_provider").Trim().ToLowerInvariant()
+  $certPath = Read-AgentTomlScalar -Path $Path -Key "client_cert"
+  $keyPath = Read-AgentTomlScalar -Path $Path -Key "client_key"
+  $store = Read-AgentTomlScalar -Path $Path -Key "client_cert_store"
+  $thumbprint = Read-AgentTomlScalar -Path $Path -Key "client_cert_thumbprint"
+  if ($thumbprint -and -not $store) {
+    return "client_cert_thumbprint is set without client_cert_store; Schannel will search CurrentUser\\MY and miss LocalMachine certificates"
+  }
+  if ($provider -eq "pem" -and ($certPath -or $keyPath)) {
+    return "client_key_provider=pem is incompatible with the current Windows Schannel transport; re-enroll with CNG certificate store"
+  }
+  return ""
+}
+
 function Test-ExistingAgentTomlWithAgent {
   param([string]$InstallRoot, [string]$ConfigPath)
   if (-not $InstallRoot -or -not $ConfigPath) {
@@ -567,11 +586,15 @@ function Normalize-KeyProvider([string]$Provider) {
 }
 
 function Join-Bytes {
-  param([byte[][]]$Parts)
+  param([object[]]$Parts)
   $ms = New-Object System.IO.MemoryStream
   foreach ($part in $Parts) {
-    if ($part -and $part.Length -gt 0) {
-      $ms.Write($part, 0, $part.Length)
+    if ($null -eq [object]$part) {
+      continue
+    }
+    $bytes = [byte[]]$part
+    if ($bytes.Length -gt 0) {
+      $ms.Write($bytes, 0, $bytes.Length)
     }
   }
   return ,$ms.ToArray()
@@ -625,6 +648,83 @@ function ConvertTo-Pem([string]$Label, [byte[]]$DerBytes) {
   return (($lines -join "`n") + "`n")
 }
 
+function Read-Asn1LengthValue {
+  param([byte[]]$Data, [ref]$Offset)
+  if ($Offset.Value -ge $Data.Length) {
+    throw "ASN.1 length offset out of range"
+  }
+  $b = [int]$Data[$Offset.Value]
+  $Offset.Value++
+  if (($b -band 0x80) -eq 0) {
+    return $b
+  }
+  $count = $b -band 0x7f
+  if ($count -le 0 -or $count -gt 4 -or ($Offset.Value + $count) -gt $Data.Length) {
+    throw "invalid ASN.1 long-form length"
+  }
+  $len = 0
+  for ($i = 0; $i -lt $count; $i++) {
+    $len = (($len -shl 8) -bor [int]$Data[$Offset.Value])
+    $Offset.Value++
+  }
+  return $len
+}
+
+function Test-PemRsaPrivateKeyReadable {
+  param([string]$Path)
+  try {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $text = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($Path)))
+    $m = [regex]::Match($text, '-----BEGIN RSA PRIVATE KEY-----\s*(?<b64>.*?)\s*-----END RSA PRIVATE KEY-----', 'Singleline')
+    if (-not $m.Success) { return $false }
+    $der = [Convert]::FromBase64String(($m.Groups['b64'].Value -replace '\s+', ''))
+    $offset = 0
+    if ($der.Length -lt 16 -or $der[$offset] -ne [byte]0x30) { return $false }
+    $offset++
+    $seqLen = Read-Asn1LengthValue -Data $der -Offset ([ref]$offset)
+    if ($seqLen -le 0 -or ($offset + $seqLen) -gt $der.Length) { return $false }
+    if ($der[$offset] -ne [byte]0x02) { return $false }
+    $offset++
+    $versionLen = Read-Asn1LengthValue -Data $der -Offset ([ref]$offset)
+    if ($versionLen -lt 1 -or ($offset + $versionLen) -gt $der.Length) { return $false }
+    $versionOk = $true
+    for ($i = 0; $i -lt $versionLen; $i++) {
+      if ($der[$offset + $i] -ne [byte]0x00) {
+        $versionOk = $false
+        break
+      }
+    }
+    if (-not $versionOk) { return $false }
+    $offset += $versionLen
+    $integerCount = 1
+    while ($offset -lt $der.Length) {
+      if ($der[$offset] -ne [byte]0x02) { break }
+      $offset++
+      $len = Read-Asn1LengthValue -Data $der -Offset ([ref]$offset)
+      if ($len -le 0 -or ($offset + $len) -gt $der.Length) { return $false }
+      $offset += $len
+      $integerCount++
+    }
+    return ($integerCount -ge 9)
+  } catch {
+    return $false
+  }
+}
+
+function Backup-InvalidPemMaterial {
+  param([string]$KeyPath, [string]$CsrPath)
+  $stamp = Get-Date -Format "yyyyMMddHHmmss"
+  foreach ($p in @($KeyPath, $CsrPath)) {
+    if ($p -and (Test-Path -LiteralPath $p)) {
+      try {
+        Move-Item -LiteralPath $p -Destination ($p + ".invalid-" + $stamp) -Force
+      } catch {
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
+}
+
 function Convert-RsaParametersToPrivateKeyDer([System.Security.Cryptography.RSAParameters]$P) {
   $body = Join-Bytes @(
     (New-Asn1Integer ([byte[]]@(0))),
@@ -643,6 +743,22 @@ function Convert-RsaParametersToPrivateKeyDer([System.Security.Cryptography.RSAP
 function Try-Ensure-NativePemAgentCSR {
   param([string]$KeyPath, [string]$CsrPath, [string]$SubjectCN)
   try {
+    if ((Test-Path -LiteralPath $KeyPath) -and (Test-Path -LiteralPath $CsrPath)) {
+      if (-not (Test-PemRsaPrivateKeyReadable -Path $KeyPath)) {
+        Write-Warning "Existing PEM private key is invalid; backing it up and regenerating key material"
+        Backup-InvalidPemMaterial -KeyPath $KeyPath -CsrPath $CsrPath
+      } else {
+        return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
+      }
+    }
+    if (Test-Path -LiteralPath $KeyPath) {
+      if (-not (Test-PemRsaPrivateKeyReadable -Path $KeyPath)) {
+        Write-Warning "Existing PEM private key is invalid; backing it up and regenerating key material"
+        Backup-InvalidPemMaterial -KeyPath $KeyPath -CsrPath $CsrPath
+      } else {
+        return $null
+      }
+    }
     if ((Test-Path -LiteralPath $KeyPath) -and (Test-Path -LiteralPath $CsrPath)) {
       return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
     }
@@ -753,6 +869,11 @@ function Ensure-AgentCSR {
       if ($Provider -ne "cng") {
         throw
       }
+      if ((Get-EnrollOs) -eq "windows" -and $env:EDR_ALLOW_WINDOWS_PEM_FALLBACK -ne "1") {
+        throw ("CNG CSR generation failed; Windows Schannel transport requires a certificate-store backed client certificate. " +
+          "Fix certreq/CNG enrollment or set EDR_ALLOW_WINDOWS_PEM_FALLBACK=1 only when using an OpenSSL libcurl build. " +
+          "Cause: " + $_.Exception.Message)
+      }
       Write-Warning ("CNG CSR generation failed, falling back to PEM key for install continuity: " + $_.Exception.Message)
       $Provider = "pem"
       $script:EDR_EFFECTIVE_KEY_PROVIDER = "pem"
@@ -797,6 +918,9 @@ if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
   $existingTomlIssue = Get-ExistingAgentTomlSanityIssue -Path $Output
   if (-not $existingTomlIssue) {
     $existingTomlIssue = Test-ExistingAgentTomlWithAgent -InstallRoot $existingInstallRoot -ConfigPath $Output
+  }
+  if (-not $existingTomlIssue) {
+    $existingTomlIssue = Get-ExistingAgentTomlMtlsIssue -Path $Output
   }
   if ($existingTomlIssue) {
     Write-Warning ("Existing agent.toml is invalid ({0}); backing it up and re-enrolling." -f $existingTomlIssue)
@@ -1185,6 +1309,8 @@ function Test-AgentBootstrapHealth {
     [string]$RestBaseUrl,
     [string]$CaPath,
     [string]$Provider,
+    [string]$CertPath,
+    [string]$KeyPath,
     [string]$CertStore,
     [string]$CertThumbprint,
     [string]$ReportPath,
@@ -1203,8 +1329,14 @@ function Test-AgentBootstrapHealth {
   if ($Provider -eq "cng" -or $Provider -eq "tpm") {
     $storeCheck = Test-EndpointCertStore -StorePath $CertStore -Thumbprint $CertThumbprint
     Add-Check "client_cert_store" ([bool]$storeCheck.ok) ([string]$storeCheck.message)
-  } elseif ($CertThumbprint) {
-    Add-Check "client_cert_thumbprint" $true ("thumbprint=" + $CertThumbprint)
+  } elseif ($Provider -eq "pem") {
+    if ($CertPath) {
+      Add-Check "client_cert_file" (Test-Path -LiteralPath $CertPath) ("path=" + $CertPath)
+    }
+    if ($KeyPath) {
+      $keyOk = Test-PemRsaPrivateKeyReadable -Path $KeyPath
+      Add-Check "client_key_file" ([bool]$keyOk) ("path=" + $KeyPath)
+    }
   }
   $httpCheck = Test-HttpBootstrapReachability -RestBaseUrl $RestBaseUrl
   Add-Check "rest_tls_reachability" ([bool]$httpCheck.ok) ([string]$httpCheck.message)
@@ -1224,6 +1356,8 @@ function Test-AgentBootstrapHealth {
     tenant_id = $TenantId
     rest_base_url = $RestBaseUrl
     key_provider = $Provider
+    client_cert_path = $CertPath
+    client_key_path = $KeyPath
     client_cert_store = $CertStore
     client_cert_thumbprint = $CertThumbprint
     checks = $checks
@@ -1240,7 +1374,10 @@ function Test-AgentBootstrapHealth {
   Write-Warning $msg
 }
 
-$EffectiveCertThumbprint = Get-PemCertificateThumbprint $d.client_cert
+$issuedCertThumbprint = Get-PemCertificateThumbprint $d.client_cert
+if ($UseNativeWindowsStore) {
+  $EffectiveCertThumbprint = $issuedCertThumbprint
+}
 
 function Merge-EnrollIntoAgentTomlExample {
   param(
@@ -1274,7 +1411,7 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$VersionURL,
     [Parameter(Mandatory = $true)][string]$DownloadURL,
     [AllowEmptyString()][string]$CertStore,
-    [Parameter(Mandatory = $true)][string]$CertThumbprint,
+    [AllowEmptyString()][string]$CertThumbprint,
     [AllowEmptyString()][string]$Pkcs11ModulePath,
     [AllowEmptyString()][string]$Pkcs11Uri,
     [AllowEmptyString()][string]$TpmUri
@@ -1857,6 +1994,12 @@ if ($d.ca_cert -or $d.client_cert) {
     Install-BootstrapCaTrust -Path $CaCertPath
   }
   Accept-CngIssuedCertificate -CertPath $ClientCertPath -Provider $effectiveKeyProvider
+  if ($UseNativeWindowsStore) {
+    $storeCheck = Test-EndpointCertStore -StorePath $EffectiveCertStore -Thumbprint $EffectiveCertThumbprint
+    if (-not $storeCheck.ok) {
+      throw ("client certificate was not accepted into Windows certificate store: " + [string]$storeCheck.message)
+    }
+  }
 }
 if ($d.client_key) {
   Write-Warning "enroll response included deprecated client_key; ignoring it because the endpoint private key is generated locally"
@@ -1880,6 +2023,7 @@ Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_
 if (-not $SkipHealthCheck) {
   Test-AgentBootstrapHealth -TomlPath $outFile -EndpointId $d.endpoint_id -TenantId $d.tenant_id `
     -RestBaseUrl $rest -CaPath $EffectiveCaCertPath -Provider $effectiveKeyProvider `
+    -CertPath $EffectiveClientCertPath -KeyPath $EffectiveClientKeyPath `
     -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
     -ReportPath $HealthReportPath -Strict ([bool]$StrictHealthCheck)
 }

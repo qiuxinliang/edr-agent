@@ -356,7 +356,7 @@ begin
     + Chr(34) + 'proxy_mode' + Chr(34) + ':' + JsonEscape(ProxyMode) + ','
     + Chr(34) + 'proxy_url' + Chr(34) + ':' + JsonEscape(ProxyUrl) + ','
     + Chr(34) + 'relay_url' + Chr(34) + ':' + JsonEscape(RelayUrl) + ','
-    + Chr(34) + 'key_provider' + Chr(34) + ':' + JsonEscape('pem') + ','
+    + Chr(34) + 'key_provider' + Chr(34) + ':' + JsonEscape('cng') + ','
     + Chr(34) + 'keep_offline_queue' + Chr(34) + ':' + EdrBoolJson(KeepQueue) + ','
     + Chr(34) + 'keep_evidence_cache' + Chr(34) + ':' + EdrBoolJson(KeepEvidence) + ','
     + Chr(34) + 'strict_health_check' + Chr(34) + ':' + EdrBoolJson(StrictHealth) + ','
