@@ -249,9 +249,18 @@ function Resolve-OpenSSL {
 
 function Invoke-Checked {
   param([string]$Exe, [string[]]$ArgList)
-  & $Exe @ArgList
-  if ($LASTEXITCODE -ne 0) {
-    Write-Error ("command failed: " + $Exe + " " + ($ArgList -join " "))
+  $output = & $Exe @ArgList 2>&1
+  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+  if ($output) {
+    $output | ForEach-Object { Write-Host ([string]$_) }
+  }
+  if ($exitCode -ne 0) {
+    $detail = if ($output) { (($output | ForEach-Object { [string]$_ }) -join "`n").Trim() } else { "" }
+    $cmd = $Exe + " " + ($ArgList -join " ")
+    if ($detail) {
+      Write-Error ("command failed exit_code={0}: {1}`n{2}" -f $exitCode, $cmd, $detail)
+    }
+    Write-Error ("command failed exit_code={0}: {1}" -f $exitCode, $cmd)
   }
 }
 
@@ -544,7 +553,15 @@ function Ensure-AgentCSR {
     if (-not $pn) {
       $pn = if ($Provider -eq "tpm") { "Microsoft Platform Crypto Provider" } else { "Microsoft Software Key Storage Provider" }
     }
-    return Ensure-CngAgentCSR -CsrPath $CsrPath -SubjectCN $SubjectCN -ProviderName $pn -KeyName $CngKeyName
+    try {
+      return Ensure-CngAgentCSR -CsrPath $CsrPath -SubjectCN $SubjectCN -ProviderName $pn -KeyName $CngKeyName
+    } catch {
+      if ($Provider -ne "cng") {
+        throw
+      }
+      Write-Warning ("CNG CSR generation failed, falling back to PEM key for install continuity: " + $_.Exception.Message)
+      $Provider = "pem"
+    }
   }
   if ($Provider -eq "pkcs11" -or $Provider -eq "tpm") {
     $uri = if ($Provider -eq "pkcs11") { $Pkcs11KeyUri } else { $TpmKeyUri }

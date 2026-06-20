@@ -23,13 +23,31 @@ Run on Windows after the bundled Inno installer has been built:
 The output zip contains:
 
 - `FDSecuritySetupUI.exe`
-- self-contained .NET Desktop runtime files
+- .NET Desktop runtime files when built in `self-contained` or `compact` mode
 - WebView2 loader/runtime files from the NuGet package
 - `Assets\installer.html`
 - adjacent `FDSecuritySetup.exe`
 - `VERSION`
 - `setup-ui-manifest.json`
 - optional `bootstrap_trust_public_key.pem`
+
+Runtime modes:
+
+- `self-contained` is the default enterprise-safe package. It includes the .NET Desktop runtime and enables ReadyToRun for faster startup, but it is the largest package.
+- `compact` still includes the .NET Desktop runtime, but disables ReadyToRun to reduce package size at the cost of a slightly slower first launch.
+- `framework-dependent` is the smallest package and requires .NET Desktop Runtime 8 to already exist on the endpoint.
+
+Example compact build:
+
+```powershell
+.\install\windows-setup-ui\Build-SetupUi.ps1 `
+  -SetupExe .\FDSecuritySetup.exe `
+  -AppVersion 2.1.150 `
+  -RuntimeMode compact `
+  -OutputZip .\FDSecuritySetupUI-compact.zip
+```
+
+Every build prints a size report for the zip, bundled setup, estimated .NET/WPF runtime files, and the largest files in the publish directory.
 
 ## Unified Private Deployment Bootstrap
 

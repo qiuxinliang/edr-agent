@@ -19,7 +19,9 @@ param(
     [string] $Configuration = "Release",
     [string] $OutputZip = "",
     [string] $PreconfigJson = "",
-    [string] $BootstrapTrustPublicKeyPem = ""
+    [string] $BootstrapTrustPublicKeyPem = "",
+    [ValidateSet("", "self-contained", "compact", "framework-dependent")]
+    [string] $RuntimeMode = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,6 +102,67 @@ function Invoke-SignIfConfigured([string] $Path) {
     }
 }
 
+function Format-SetupUiBytes([Int64] $Bytes) {
+    if ($Bytes -ge 1GB) {
+        return ("{0:N2} GB" -f ($Bytes / 1GB))
+    }
+    if ($Bytes -ge 1MB) {
+        return ("{0:N2} MB" -f ($Bytes / 1MB))
+    }
+    if ($Bytes -ge 1KB) {
+        return ("{0:N2} KB" -f ($Bytes / 1KB))
+    }
+    return ("{0} B" -f $Bytes)
+}
+
+function Write-SetupUiSizeReport([string] $PublishDir, [string] $OutputZipPath) {
+    Write-Host ""
+    Write-Host "Setup UI package size report"
+    if (Test-Path -LiteralPath $OutputZipPath) {
+        $zipItem = Get-Item -LiteralPath $OutputZipPath
+        Write-Host ("  zip: {0} ({1})" -f $zipItem.FullName, (Format-SetupUiBytes $zipItem.Length))
+    }
+    if (-not (Test-Path -LiteralPath $PublishDir)) {
+        return
+    }
+    $files = Get-ChildItem -LiteralPath $PublishDir -File -Recurse -Force
+    $total = ($files | Measure-Object -Property Length -Sum).Sum
+    Write-Host ("  publish dir total: {0}" -f (Format-SetupUiBytes ([Int64]$total)))
+
+    $setupExe = $files | Where-Object { $_.Name -eq "FDSecuritySetup.exe" } | Select-Object -First 1
+    if ($setupExe) {
+        Write-Host ("  bundled setup: {0}" -f (Format-SetupUiBytes $setupExe.Length))
+    }
+
+    $runtimePrefixes = @(
+        "coreclr", "clrjit", "hostfxr", "hostpolicy", "System.", "Microsoft.",
+        "Presentation", "WindowsBase", "DirectWriteForwarder", "wpfgfx"
+    )
+    $runtimeBytes = 0L
+    foreach ($file in $files) {
+        foreach ($prefix in $runtimePrefixes) {
+            if ($file.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $runtimeBytes += [Int64]$file.Length
+                break
+            }
+        }
+    }
+    if ($runtimeBytes -gt 0) {
+        Write-Host ("  estimated .NET/WPF runtime files: {0}" -f (Format-SetupUiBytes $runtimeBytes))
+    }
+
+    Write-Host "  top files:"
+    $files |
+        Sort-Object Length -Descending |
+        Select-Object -First 12 |
+        ForEach-Object {
+            $rel = $_.FullName.Substring($PublishDir.Length).TrimStart('\', '/')
+            $sizeText = Format-SetupUiBytes ([Int64]$_.Length)
+            Write-Host ("    {0,10}  {1}" -f $sizeText, $rel)
+        }
+    Write-Host ""
+}
+
 $targetFramework = "net8.0-windows10.0.17763.0"
 $runtime = "win-x64"
 $publishDirCandidates = @(
@@ -110,16 +173,27 @@ foreach ($candidate in $publishDirCandidates) {
     Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { "true" }
-dotnet publish $project `
-    -c $Configuration `
-    -r win-x64 `
-    --self-contained true `
-    -p:Version=$AppVersion `
-    -p:PublishSingleFile=false `
-    "-p:PublishReadyToRun=$readyToRun" `
-    -p:DebugType=None `
-    -p:DebugSymbols=false
+$resolvedRuntimeMode = if ($RuntimeMode) { $RuntimeMode } elseif ($env:EDR_SETUP_UI_RUNTIME_MODE) { [string]$env:EDR_SETUP_UI_RUNTIME_MODE } else { "self-contained" }
+if ($resolvedRuntimeMode -notin @("self-contained", "compact", "framework-dependent")) {
+    throw "Invalid RuntimeMode: $resolvedRuntimeMode"
+}
+$selfContained = if ($resolvedRuntimeMode -eq "framework-dependent") { "false" } else { "true" }
+$defaultReadyToRun = if ($resolvedRuntimeMode -eq "self-contained") { "true" } else { "false" }
+$readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { $defaultReadyToRun }
+Write-Host "Setup UI runtime mode: $resolvedRuntimeMode (self-contained=$selfContained, readyToRun=$readyToRun)"
+
+$publishArgs = @(
+    $project,
+    "-c", $Configuration,
+    "-r", "win-x64",
+    "--self-contained", $selfContained,
+    "-p:Version=$AppVersion",
+    "-p:PublishSingleFile=false",
+    "-p:PublishReadyToRun=$readyToRun",
+    "-p:DebugType=None",
+    "-p:DebugSymbols=false"
+)
+dotnet publish @publishArgs
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit $LASTEXITCODE"
 }
@@ -171,6 +245,7 @@ if (Test-Path -LiteralPath $versionFile) {
 $manifest = @{
     name = "FDSecurity Setup UI"
     version = $AppVersion
+    runtime_mode = $resolvedRuntimeMode
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"
     setup_exe_sha256 = Get-FileSha256Hex $bundledSetupExe
@@ -181,7 +256,7 @@ $manifest = @{
     bootstrap_trust_public_key_file = if ($bootstrapTrustPublicKey) { "bootstrap_trust_public_key.pem" } else { "" }
     bootstrap_trust_public_key_pem = $bootstrapTrustPublicKey
     generated_at_utc = [DateTime]::UtcNow.ToString("o")
-    dotnet_runtime = "Self-contained .NET Desktop runtime"
+    dotnet_runtime = if ($selfContained -eq "true") { "Self-contained .NET Desktop runtime" } else { "Requires .NET Desktop Runtime 8 on the endpoint" }
     webview2_runtime = "Evergreen runtime required; Windows 11 normally includes it"
 }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $publishDir "setup-ui-manifest.json") -Encoding UTF8
@@ -196,7 +271,7 @@ if ($outParent) {
 Remove-Item -LiteralPath $OutputZip -Force -ErrorAction SilentlyContinue
 
 $items = Get-ChildItem -LiteralPath $publishDir -Force | Where-Object { $_.Name -notmatch '\.(pdb|xml)$' }
-Compress-Archive -Path $items.FullName -DestinationPath $OutputZip -Force
+Compress-Archive -Path $items.FullName -DestinationPath $OutputZip -CompressionLevel Optimal -Force
 if (-not (Test-Path -LiteralPath $OutputZip)) {
     throw "Setup UI package was not created: $OutputZip"
 }
@@ -227,4 +302,5 @@ finally {
     $zipObj.Dispose()
 }
 
+Write-SetupUiSizeReport $publishDir $OutputZip
 Write-Host "OK: $OutputZip"

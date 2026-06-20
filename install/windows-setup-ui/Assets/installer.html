@@ -215,12 +215,14 @@ button{background:none;border:0;cursor:pointer}
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const STEPS=['欢迎','许可协议','部署配置','环境检查','安装','完成'];
 const INSTALL=['停止旧运行态','清理运行缓存','注册并写入配置','校验配置','安装服务/计划任务','启动 Agent','拉取运行策略','写入健康摘要'];
+const CHECKS=['操作系统','系统架构','安装包','完整性校验','Bootstrap 信任','磁盘空间','管理员权限','服务端地址','注册令牌','代理配置','Relay/Gateway','WebView2 Runtime','服务端连通','Relay 连通'];
 let cur=0,accepted=false,checkOk=false,installDone=false,lastDiagnostics='',nativePreconfig={};
 
 function nativePost(message){ if(window.chrome && window.chrome.webview){ window.chrome.webview.postMessage(message); } }
 window.nativeBridge={receive(msg){
   if(!msg||!msg.type)return;
   if(msg.type==='nativeStatus')onNativeStatus(msg.payload||{});
+  if(msg.type==='checkProgress')onCheckProgress(msg.payload||{});
   if(msg.type==='checkResult')onCheckResult(msg.payload||{});
   if(msg.type==='installProgress')onInstallProgress(msg.payload||{});
   if(msg.type==='installComplete')onInstallComplete(msg.payload||{});
@@ -268,8 +270,13 @@ function payload(){
     insecureTls:$('#insecureTls').classList.contains('on')
   };
 }
+function esc(v){return String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+function checkIcon(severity){return severity==='ok'?'✓':severity==='warn'?'!':severity==='fail'?'✕':'';}
+function renderCheckRow(key,severity='run',value='检测中…',index=0){
+  return `<div class="chk ${esc(severity)}" id="chk${index}" data-key="${esc(key)}"><span class="ci">${checkIcon(severity)}</span><span class="ck">${esc(key)}</span><span class="cv">${esc(value)}</span></div>`;
+}
 function toast(t,m,k='pri'){
-  const e=document.createElement('div');e.className='toast '+k;e.innerHTML=`<div class="bar"></div><div class="tc"><div class="t">${t}</div><div class="m">${m||''}</div></div>`;
+  const e=document.createElement('div');e.className='toast '+k;e.innerHTML=`<div class="bar"></div><div class="tc"><div class="t">${esc(t)}</div><div class="m">${esc(m||'')}</div></div>`;
   $('#toasts').appendChild(e);setTimeout(()=>{e.style.transition='opacity .25s';e.style.opacity='0';setTimeout(()=>e.remove(),260);},2800);
 }
 function validateConfig(){
@@ -369,12 +376,28 @@ function applyPreconfig(c){
 function runChecks(){
   checkOk=false;renderFooter();
   $('#checksum').className='checksum';$('#checksum').textContent='正在执行安装前检查。';
-  $('#checklist').innerHTML=['操作系统','系统架构','安装包','完整性校验','磁盘空间','管理员权限','服务端地址','注册令牌','代理配置','Relay/Gateway','WebView2 Runtime','服务端连通','Relay 连通'].map((k,i)=>`<div class="chk run" id="chk${i}"><span class="ci"></span><span class="ck">${k}</span><span class="cv">检测中…</span></div>`).join('');
+  $('#checklist').innerHTML=CHECKS.map((k,i)=>renderCheckRow(k,'run','等待检测…',i)).join('');
   nativePost({action:'check',payload:payload()});
+}
+function onCheckProgress(r){
+  const c=r.check||r;
+  if(!c.key)return;
+  $('#checksum').className='checksum';
+  $('#checksum').textContent=`正在检查：${c.key}`;
+  const rows=$$('#checklist .chk');
+  let row=rows.find(x=>x.dataset.key===c.key);
+  if(!row){
+    const index=rows.length;
+    $('#checklist').insertAdjacentHTML('beforeend',renderCheckRow(c.key,c.severity||'run',c.value||'',index));
+    return;
+  }
+  row.className='chk '+(c.severity||'run');
+  row.querySelector('.ci').textContent=checkIcon(c.severity);
+  row.querySelector('.cv').textContent=c.value||'';
 }
 function onCheckResult(r){
   const checks=r.checks||[];
-  $('#checklist').innerHTML=checks.map(c=>`<div class="chk ${c.severity}"><span class="ci">${c.severity==='ok'?'✓':c.severity==='warn'?'!':'✕'}</span><span class="ck">${c.key}</span><span class="cv">${c.value||''}</span></div>`).join('');
+  $('#checklist').innerHTML=checks.map((c,i)=>renderCheckRow(c.key,c.severity,c.value||'',i)).join('');
   checkOk=!!r.ok;
   const hasWarn=checks.some(c=>c.severity==='warn');
   $('#checksum').className='checksum '+(checkOk?(hasWarn?'warn':''):'fail');

@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private const int WmNcLButtonDown = 0x00A1;
     private const int HtCaption = 2;
     private const int ProbeTimeoutSeconds = 15;
+    private const int CheckProgressPauseMs = 70;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _baseDir = AppContext.BaseDirectory;
     private string _setupPath = string.Empty;
@@ -232,21 +233,6 @@ public partial class MainWindow : Window
             // Best-effort only; setup will do the final filesystem validation.
         }
 
-        BootstrapTrustMaterial bootstrap = BootstrapTrustMaterial.Empty;
-        CheckItem bootstrapCheck;
-        try
-        {
-            bootstrap = await ResolveBootstrapTrustAsync(request);
-            bootstrapCheck = bootstrap.Enabled
-                ? CheckItem.Ok("Bootstrap 信任", $"manifest 已验签 key={bootstrap.KeyId}")
-                : CheckItem.Ok("Bootstrap 信任", "未配置，使用系统信任库");
-        }
-        catch (Exception ex)
-        {
-            bootstrapCheck = CheckItem.Fail("Bootstrap 信任", ex.Message);
-            await PostAsync("toast", new { title = "Bootstrap 信任失败", message = ex.Message, level = "warn" });
-        }
-
         EndpointConfig? endpoint = null;
         try
         {
@@ -263,41 +249,72 @@ public partial class MainWindow : Window
         var proxyCheck = ValidateProxyRequest(request);
         var relayCheck = ValidateRelayRequest(request, out var normalizedRelayUrl);
 
-        var checks = new List<CheckItem>
+        var checks = new List<CheckItem>();
+        async Task AddCheckAsync(CheckItem item)
         {
-            CheckItem.Ok("操作系统", RuntimeInformation.OSDescription.Trim()),
-            CheckSystemArchitecture(),
-            File.Exists(_setupPath)
-                ? CheckItem.Ok("安装包", Path.GetFileName(_setupPath))
-                : CheckItem.Fail("安装包", "未找到同目录 FDSecuritySetup.exe"),
-            GetSetupIntegrityPrecheck(),
-            bootstrapCheck,
-            freeMb <= 0
-                ? CheckItem.Warn("磁盘空间", "无法读取可用空间，安装阶段会再次校验")
-                : freeMb >= 512
-                    ? CheckItem.Ok("磁盘空间", $"{freeMb:N0} MB 可用")
-                    : CheckItem.Fail("磁盘空间", $"{freeMb:N0} MB 可用，建议至少 512 MB"),
-            IsElevated()
-                ? CheckItem.Ok("管理员权限", "当前进程已具备管理员权限")
-                : CheckItem.Warn("管理员权限", "安装阶段将触发 UAC 提权"),
-            endpoint != null
-                ? CheckItem.Ok("服务端地址", $"{endpoint.ServerBase}  =>  {endpoint.RestBase}")
-                : CheckItem.Fail("服务端地址", "必须填写有效的 http(s) 地址"),
-            !string.IsNullOrWhiteSpace(request.EnrollToken)
-                ? CheckItem.Ok("注册令牌", "已填写")
-                : CheckItem.Fail("注册令牌", "必须填写 enroll token"),
-            proxyCheck,
-            relayCheck,
-            CheckItem.Ok("WebView2 Runtime", Browser.CoreWebView2?.Environment.BrowserVersionString ?? "active")
-        };
+            checks.Add(item);
+            await PostAsync("checkProgress", new { check = item, index = checks.Count - 1 });
+            await Task.Delay(CheckProgressPauseMs);
+        }
+
+        await AddCheckAsync(CheckItem.Ok("操作系统", RuntimeInformation.OSDescription.Trim()));
+        await AddCheckAsync(CheckSystemArchitecture());
+        await AddCheckAsync(File.Exists(_setupPath)
+            ? CheckItem.Ok("安装包", Path.GetFileName(_setupPath))
+            : CheckItem.Fail("安装包", "未找到同目录 FDSecuritySetup.exe"));
+        await AddCheckAsync(GetSetupIntegrityPrecheck());
+
+        BootstrapTrustMaterial bootstrap = BootstrapTrustMaterial.Empty;
+        try
+        {
+            bootstrap = await ResolveBootstrapTrustAsync(request);
+            await AddCheckAsync(bootstrap.Enabled
+                ? CheckItem.Ok("Bootstrap 信任", $"manifest 已验签 key={bootstrap.KeyId}")
+                : CheckItem.Ok("Bootstrap 信任", "未配置，使用系统信任库"));
+        }
+        catch (Exception ex)
+        {
+            await AddCheckAsync(CheckItem.Fail("Bootstrap 信任", ex.Message));
+            await PostAsync("toast", new { title = "Bootstrap 信任失败", message = ex.Message, level = "warn" });
+        }
+
+        await AddCheckAsync(freeMb <= 0
+            ? CheckItem.Warn("磁盘空间", "无法读取可用空间，安装阶段会再次校验")
+            : freeMb >= 512
+                ? CheckItem.Ok("磁盘空间", $"{freeMb:N0} MB 可用")
+                : CheckItem.Fail("磁盘空间", $"{freeMb:N0} MB 可用，建议至少 512 MB"));
+        await AddCheckAsync(IsElevated()
+            ? CheckItem.Ok("管理员权限", "当前进程已具备管理员权限")
+            : CheckItem.Warn("管理员权限", "安装阶段将触发 UAC 提权"));
+        await AddCheckAsync(endpoint != null
+            ? CheckItem.Ok("服务端地址", $"{endpoint.ServerBase}  =>  {endpoint.RestBase}")
+            : CheckItem.Fail("服务端地址", "必须填写有效的 http(s) 地址"));
+        await AddCheckAsync(!string.IsNullOrWhiteSpace(request.EnrollToken)
+            ? CheckItem.Ok("注册令牌", "已填写")
+            : CheckItem.Fail("注册令牌", "必须填写 enroll token"));
+        await AddCheckAsync(proxyCheck);
+        await AddCheckAsync(relayCheck);
+        await AddCheckAsync(CheckItem.Ok("WebView2 Runtime", Browser.CoreWebView2?.Environment.BrowserVersionString ?? "active"));
 
         if (endpoint != null && proxyCheck.Severity != "fail")
         {
-            checks.Add(await ProbeHttpAsync("服务端连通", endpoint.ReadyUrl, request, "platform ready"));
+            await AddCheckAsync(await ProbeHttpAsync("服务端连通", endpoint.ReadyUrl, request, "platform ready"));
+        }
+        else
+        {
+            await AddCheckAsync(CheckItem.Warn(
+                "服务端连通",
+                endpoint == null ? "服务端地址无效，跳过连通性预检" : "代理配置未通过，跳过连通性预检"));
         }
         if (!string.IsNullOrWhiteSpace(normalizedRelayUrl) && proxyCheck.Severity != "fail")
         {
-            checks.Add(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/healthz", request, "relay healthz"));
+            await AddCheckAsync(await ProbeHttpAsync("Relay 连通", normalizedRelayUrl.TrimEnd('/') + "/healthz", request, "relay healthz"));
+        }
+        else
+        {
+            await AddCheckAsync(CheckItem.Ok(
+                "Relay 连通",
+                string.IsNullOrWhiteSpace(normalizedRelayUrl) ? "未配置 Relay/Gateway，跳过" : "代理配置未通过，跳过"));
         }
 
         await PostAsync("checkResult", new
@@ -392,6 +409,13 @@ public partial class MainWindow : Window
             {
                 var detail = BuildInstallFailureDetail(installPath, innoLog);
                 throw new InvalidOperationException($"安装器返回失败代码 {proc.ExitCode}{detail}");
+            }
+            var finalStageState = ReadInstallStageState(installPath);
+            if (finalStageState != null &&
+                finalStageState.Stage.StartsWith("安装阶段失败：", StringComparison.OrdinalIgnoreCase))
+            {
+                var detail = BuildInstallFailureDetail(installPath, innoLog);
+                throw new InvalidOperationException($"安装阶段失败{detail}");
             }
 
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
