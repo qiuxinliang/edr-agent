@@ -11,8 +11,8 @@
 param(
   [string]$InstallDir = $(if ($env:EDR_INSTALL_DIR) { $env:EDR_INSTALL_DIR } else { "C:\Program Files\FDSecurity" }),
   [string]$ConfigPath = "",
-  [string]$ReportPath = "",
-  [string]$LogPath = "",
+  [string]$ReportPath = $(if ($env:EDR_VERIFY_REPORT_PATH) { $env:EDR_VERIFY_REPORT_PATH } else { "" }),
+  [string]$LogPath = $(if ($env:EDR_VERIFY_LOG_PATH) { $env:EDR_VERIFY_LOG_PATH } else { "" }),
   [int]$PolicyTimeoutSec = 8
 )
 

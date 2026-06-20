@@ -683,10 +683,9 @@ begin
     + '$icacls=Get-Command ''icacls.exe'' -ErrorAction SilentlyContinue;'
     + 'if($icacls){try { & $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null } catch {}};'
     + '$raw=[System.IO.File]::ReadAllText($cfg);'
-    + '$appEsc=$app.Replace(''\'',''\\'');'
-    + '$raw=$raw.Replace(''C:\\Program Files\\EDR Agent'',$appEsc).Replace(''C:\Program Files\EDR Agent'',$app);'
-    + '$raw=$raw.Replace(''C:\\Program Files\\FDSecurity'',$appEsc).Replace(''C:\Program Files\FDSecurity'',$app);'
-    + '[System.IO.File]::WriteAllText($cfg,$raw);'
+    + 'if([string]::IsNullOrWhiteSpace($raw)){throw ''agent.toml is empty''};'
+    + '$sha=(Get-FileHash -Algorithm SHA256 -LiteralPath $cfg -ErrorAction SilentlyContinue).Hash;'
+    + 'Write-Host (''agent.toml present size=''+(Get-Item -LiteralPath $cfg).Length+'' sha256=''+$sha);'
     + 'if($icacls){try { & $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null } catch {}}'
     + '"';
 end;
@@ -696,21 +695,16 @@ begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$out=' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.output.log')) + ';'
     + '$script=' + EdrPsSq(ExpandConstant('{app}\edr_agent_postinstall_verify.ps1')) + ';'
+    + '$env:EDR_VERIFY_REPORT_PATH=' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ';'
+    + '$env:EDR_VERIFY_LOG_PATH=' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.log')) + ';'
     + 'try{New-Item -ItemType File -Path $out -Force | Out-Null;Add-Content -LiteralPath $out -Value ((Get-Date).ToString(''o'')+'' wrapper_start script=''+$script) -Encoding UTF8}catch{};'
     + '$takeown=Get-Command ''takeown.exe'' -ErrorAction SilentlyContinue;'
     + '$icacls=Get-Command ''icacls.exe'' -ErrorAction SilentlyContinue;'
     + 'try{if((Test-Path -LiteralPath $script) -and $takeown){& $takeown.Source /F $script /A | Out-Null}}catch{};'
     + 'try{if((Test-Path -LiteralPath $script) -and $icacls){& $icacls.Source $script /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /grant:r ''*S-1-5-32-545:RX'' /C /Q | Out-Null}}catch{};'
     + 'try{if(Test-Path -LiteralPath $script){Unblock-File -LiteralPath $script -ErrorAction SilentlyContinue}}catch{};'
-    + '$argv=@('
-    + '''-InstallDir'',' + EdrPsSq(ExpandConstant('{app}')) + ','
-    + '''-ConfigPath'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ','
-    + '''-ReportPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ','
-    + '''-LogPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.log')) + ','
-    + '''-PolicyTimeoutSec'',''15'''
-    + ');'
     + 'try{'
-    + '& $script @argv *>> $out;'
+    + '& $script -InstallDir ' + EdrPsSq(ExpandConstant('{app}')) + ' -ConfigPath ' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ' -PolicyTimeoutSec 15 *>> $out;'
     + '$ok=$?;'
     + '$code=1;if($ok){$code=0};'
     + 'if($LASTEXITCODE -ne $null){$code=$LASTEXITCODE};'
@@ -833,7 +827,7 @@ begin
     + 'try { if(Test-Path -LiteralPath $startupLog){Get-Content -LiteralPath $startupLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { L (''task_launcher ''+$_) }} } catch {};'
     + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
     + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
-    + 'try { $agentArgs=''--config "''+$cfg.Replace(''"'',''\"'')+''"''; $p=Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id+'' args=''+$agentArgs) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
+    + 'try { $agentArgs=''--config ''+(''"''+($cfg -replace ''"'',''\"'')+''"''); $p=Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id+'' args=''+$agentArgs) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 2;'
     + '};'
     + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
@@ -857,8 +851,9 @@ begin
     + 'try { if($icacls){& $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null} } catch {};'
     + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
     + 'Start-Sleep -Seconds 1;'
+    + '$agentArgs=''--config ''+(''"''+($cfg -replace ''"'',''\"'')+''"'');'
     + '$p=Start-Process -FilePath $exe'
-    + ' -ArgumentList (''--config "''+$cfg.Replace(''"'',''\"'')+''"'')'
+    + ' -ArgumentList $agentArgs'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
     + ' -WindowStyle Hidden -PassThru -ErrorAction Stop;'
     + 'try { $p.PriorityClass = ''BelowNormal'' } catch {};'
@@ -912,7 +907,7 @@ begin
       EdrAbortInstall;
   end;
 
-  if not EdrRunPowerShellStage(4, Total, 'Validate configuration', 'Ensuring agent.toml exists and normalizing install paths.', EdrEnsureTomlPsParameters, True) then
+  if not EdrRunPowerShellStage(4, Total, 'Validate configuration', 'Ensuring agent.toml exists and applying protected ACLs.', EdrEnsureTomlPsParameters, True) then
     EdrAbortInstall;
 
   if WizardIsTaskSelected('windowsservice') then
