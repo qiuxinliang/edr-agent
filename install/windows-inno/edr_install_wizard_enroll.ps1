@@ -170,7 +170,7 @@ if ($bootstrapLeafSha256) {
 if ($healthReport) {
   $installerArgs += @("-HealthReportPath", $healthReport)
 } else {
-  $installerArgs += @("-HealthReportPath", (Join-Path $installDir "install_health_report.json"))
+  $installerArgs += @("-HealthReportPath", (Join-Path $DiagnosticsDir "install_health_report.json"))
 }
 if ($keepOfflineQueue) { $installerArgs += "-KeepOfflineQueue" }
 if ($keepEvidenceCache) { $installerArgs += "-KeepEvidenceCache" }

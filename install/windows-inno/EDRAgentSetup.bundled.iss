@@ -570,12 +570,13 @@ begin
     EdrFailureReason := Title + ' could not be started';
   if Title = 'Enroll and write configuration' then
     EdrFailureReason := EdrFailureReason + '; enroll log: ' + EdrDiagnosticsFile('enroll-output.log');
-  EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
   if Critical then
   begin
+    EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
     Result := False;
     Exit;
   end;
+  EdrAppendStageLog('WARN [' + Title + '] ' + EdrFailureReason);
   EdrAppendStageLog('NONCRITICAL [' + Title + '] continuing');
   EdrProgressPage.SetProgress(StageNo, StageTotal);
 end;
@@ -676,8 +677,10 @@ end;
 function EdrHealthSummaryPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + 'if(-not (Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ')){throw ''runtime verification report missing''};'
+    + 'if(Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + '){'
     + 'Write-Host ''runtime verification report ready: ' + EdrDiagnosticsFile('install_runtime_verify.json') + ''''
+    + '}else{Write-Warning ''runtime verification report missing; install will continue and endpoint health can be checked from console''};'
+    + 'exit 0'
     + '"';
 end;
 
@@ -734,32 +737,52 @@ end;
 function EdrStartServicePsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + 'Start-Sleep -Seconds 2;'
-    + 'Start-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue;'
-    + 'Start-Sleep -Seconds 2;'
-    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
+    + '$ErrorActionPreference=''SilentlyContinue'';'
+    + '$log=' + EdrPsSq(EdrDiagnosticsFile('start-runtime.log')) + ';'
+    + 'function L($m){try{Add-Content -LiteralPath $log -Value ((Get-Date).ToString(''o'')+'' ''+$m) -Encoding UTF8}catch{}};'
+    + 'Start-Sleep -Seconds 1;'
+    + 'try { Start-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue; L ''Start-Service invoked'' } catch { L (''Start-Service error: ''+$_.Exception.Message) };'
+    + 'Start-Sleep -Seconds 3;'
+    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} };'
+    + 'try { $svc=Get-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($svc){L (''service_status=''+$svc.Status)} } catch {};'
+    + 'exit 0'
     + '"';
 end;
 
 function EdrStartScheduledTaskPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + '$ErrorActionPreference=''SilentlyContinue'';'
+    + '$log=' + EdrPsSq(EdrDiagnosticsFile('start-runtime.log')) + ';'
+    + 'function L($m){try{Add-Content -LiteralPath $log -Value ((Get-Date).ToString(''o'')+'' ''+$m) -Encoding UTF8}catch{}};'
+    + '$exe=' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}')) + ';'
+    + '$cfg=' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ';'
+    + '$wd=' + EdrPsSq(ExpandConstant('{app}')) + ';'
+    + 'Start-Sleep -Seconds 1;'
+    + 'try { Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; L ''Start-ScheduledTask invoked'' } catch { L (''Start-ScheduledTask error: ''+$_.Exception.Message) };'
+    + 'Start-Sleep -Seconds 3;'
+    + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
+    + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
+    + 'try { $p=Start-Process -FilePath $exe -ArgumentList @(''--config'',$cfg) -WorkingDirectory $wd -WindowStyle Hidden -PassThru; L (''manual fallback pid=''+$p.Id) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 2;'
-    + 'Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue;'
-    + 'Start-Sleep -Seconds 2;'
-    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} }'
+    + '};'
+    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
+    + 'try { $task=Get-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($task){L (''task_state=''+$task.State)}; $info=Get-ScheduledTaskInfo -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($info){L (''task_last_result=''+$info.LastTaskResult)} } catch {};'
+    + 'exit 0'
     + '"';
 end;
 
 function EdrStartManualPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + 'Start-Sleep -Seconds 2;'
+    + '$ErrorActionPreference=''SilentlyContinue'';'
+    + 'Start-Sleep -Seconds 1;'
     + '$p=Start-Process -FilePath ' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}'))
     + ' -ArgumentList @(''--config'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ')'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
     + ' -WindowStyle Hidden -PassThru;'
-    + 'try { $p.PriorityClass = ''BelowNormal'' } catch {}'
+    + 'try { $p.PriorityClass = ''BelowNormal'' } catch {};'
+    + 'exit 0'
     + '"';
 end;
 
@@ -839,7 +862,7 @@ begin
       EdrAbortInstall;
   end;
 
-  if not EdrRunPowerShellStage(7, Total, 'Pull runtime policy', 'Verifying endpoint identity and pulling runtime policy when reachable.', EdrPolicyVerifyPsParameters, Enrolled) then
+  if not EdrRunPowerShellStage(7, Total, 'Pull runtime policy', 'Verifying endpoint identity and pulling runtime policy when reachable.', EdrPolicyVerifyPsParameters, False) then
     EdrAbortInstall;
 
   if not EdrRunPowerShellStage(8, Total, 'Write health summary', 'Writing installation health report and diagnostics bundle.', EdrHealthSummaryPsParameters, False) then

@@ -620,7 +620,7 @@ public partial class MainWindow : Window
                 return new InstallStageState("安装完成", "所有安装阶段已完成", 98);
             }
 
-            var match = Regex.Match(line, @"\b(?<status>START|OK|FAILED|SKIP)\s+\[(?<stage>[^\]]+)\]\s*(?<detail>.*)$");
+            var match = Regex.Match(line, @"\b(?<status>START|OK|WARN|FAILED|SKIP)\s+\[(?<stage>[^\]]+)\]\s*(?<detail>.*)$");
             if (!match.Success)
             {
                 continue;
@@ -638,6 +638,10 @@ public partial class MainWindow : Window
             if (status.Equals("FAILED", StringComparison.OrdinalIgnoreCase))
             {
                 return new InstallStageState("安装阶段失败：" + stage, detail, progress);
+            }
+            if (status.Equals("WARN", StringComparison.OrdinalIgnoreCase))
+            {
+                return new InstallStageState("安装阶段提示：" + stage, detail, Math.Min(98, progress + 3));
             }
 
             return new InstallStageState(TranslateInstallStage(stage), detail, progress);
@@ -1425,7 +1429,7 @@ public partial class MainWindow : Window
             ["keep_offline_queue"] = ShouldKeepOfflineQueue(request, normalizedMode),
             ["keep_evidence_cache"] = ShouldKeepEvidenceCache(request, normalizedMode),
             ["strict_health_check"] = request.StrictHealthCheck,
-            ["health_report"] = Path.Combine(installPath, "diagnostics", "install_health_report.json")
+            ["health_report"] = Path.Combine(uiLogDir, "agent-diagnostics", "install_health_report.json")
         };
 
         Directory.CreateDirectory(uiLogDir);

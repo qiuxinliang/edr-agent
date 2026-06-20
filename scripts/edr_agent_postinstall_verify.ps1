@@ -174,6 +174,43 @@ function Write-Report {
   Write-Host "postinstall_verify_report=$path"
 }
 
+trap {
+  $err = $_
+  $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+  try {
+    if (-not $script:checks) {
+      $script:checks = New-Object System.Collections.Generic.List[object]
+    }
+    $script:checks.Add((New-Check -Name "script_exception" -Status "failed" -Message $msg)) | Out-Null
+    $fallbackReport = [ordered]@{
+      created_at = (Get-Date).ToUniversalTime().ToString("o")
+      status = "failed"
+      install_dir = $(try { [System.IO.Path]::GetFullPath($InstallDir) } catch { $InstallDir })
+      config_path = $(try { [System.IO.Path]::GetFullPath($ConfigPath) } catch { $ConfigPath })
+      endpoint_id = $script:endpointId
+      tenant_id = $script:tenantId
+      rest_base_url = $script:restBase
+      runtime_policy_url = $script:runtimePolicyUrl
+      policy_version = ""
+      p0_rule_version = ""
+      p0_rule_count = ""
+      agent_version = ""
+      agent_process_running = $false
+      scheduled_task_state = ""
+      service_state = ""
+      runtime_mode = "unknown"
+      proxy_mode = ""
+      proxy = ""
+      checks = $script:checks
+    }
+    Write-Report -Report $fallbackReport
+  } catch {
+    Write-Warning ("postinstall verifier could not write failure report: " + $_.Exception.Message)
+  }
+  Write-Host ("post-install verification exception; report={0}; error={1}" -f $ReportPath, $msg)
+  exit 1
+}
+
 $checks = New-Object System.Collections.Generic.List[object]
 $configExists = Test-Path -LiteralPath $ConfigPath
 $configStatus = if ($configExists) { "ok" } else { "failed" }
@@ -290,5 +327,7 @@ $report = [ordered]@{
 
 Write-Report -Report $report
 if ($failed -gt 0) {
-  Write-Error "post-install verification failed; report=$ReportPath"
+  Write-Host "post-install verification failed; report=$ReportPath"
+  exit 1
 }
+exit 0
