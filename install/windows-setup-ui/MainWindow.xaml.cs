@@ -579,10 +579,16 @@ public partial class MainWindow : Window
         var startRuntimeLog = Path.Combine(diagnosticsDir, "start-runtime.log");
         var taskLastResult = TryReadLastLogValue(startRuntimeLog, "task_last_result=");
         var manualFallbackPid = TryReadLastLogValue(startRuntimeLog, "manual fallback pid=");
+        var runtimeNotStarted = LogContainsMarker(startRuntimeLog, "runtime_not_started");
+        var processPid = TryReadLastLogValue(startRuntimeLog, "process_pid=");
         var healthStatus = TryReadJsonString(healthPath, "status");
         if (string.IsNullOrWhiteSpace(healthStatus))
         {
             healthStatus = TryReadJsonString(verifyPath, "status");
+        }
+        if (runtimeNotStarted)
+        {
+            healthStatus = "error_runtime_not_started";
         }
         if ((string.IsNullOrWhiteSpace(healthStatus) || healthStatus.Equals("ok", StringComparison.OrdinalIgnoreCase)) &&
             !string.IsNullOrWhiteSpace(taskLastResult) &&
@@ -605,7 +611,7 @@ public partial class MainWindow : Window
             AgentVersion = TryReadJsonString(verifyPath, "agent_version"),
             HealthStatus = healthStatus,
             RuntimeMode = TryReadJsonString(verifyPath, "runtime_mode"),
-            AgentRunning = TryReadJsonBool(verifyPath, "agent_process_running") || !string.IsNullOrWhiteSpace(manualFallbackPid),
+            AgentRunning = TryReadJsonBool(verifyPath, "agent_process_running") || (!runtimeNotStarted && !string.IsNullOrWhiteSpace(processPid)),
             ScheduledTaskLastResult = taskLastResult,
             ManualFallbackPid = manualFallbackPid
         };
@@ -2148,6 +2154,22 @@ public partial class MainWindow : Window
             return string.Empty;
         }
         return string.Empty;
+    }
+
+    private static bool LogContainsMarker(string path, string marker)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return false;
+            }
+            return File.ReadLines(path).Any(line => line.Contains(marker, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void TryDragMove()

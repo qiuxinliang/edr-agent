@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath $SrcDir)) {
 $onnx = @(Get-ChildItem -LiteralPath $SrcDir -Filter '*.onnx' -File -ErrorAction SilentlyContinue)
 if ($onnx.Count -eq 0) {
     if ($env:EDR_BUNDLE_ONNX_REQUIRED -eq '1') {
-        Write-Error "sync_onnx_output_to_models: no *.onnx under $SrcDir — add static.onnx / behavior.onnx and commit for release bundle."
+        Write-Error "sync_onnx_output_to_models: no *.onnx under $SrcDir — add static.onnx and commit for release bundle."
         exit 1
     }
     Write-Warning "sync_onnx_output_to_models: no *.onnx in $SrcDir; leaving models/ as-is."

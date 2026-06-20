@@ -1525,6 +1525,7 @@ model_dir            = "$(Escape-Toml $TomlModelDir)"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
+static_model_enabled = true
 behavior_monitor_enabled = false
 
 [forensic_auto]

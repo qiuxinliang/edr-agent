@@ -2,7 +2,7 @@
 # Copy to C:\Program Files\FDSecurity\agent.toml, then enroll/replace server and agent values.
 
 [server]
-address              = "edr.example.com:50051"
+address              = ""
 grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
@@ -57,6 +57,7 @@ model_dir            = "C:\\Program Files\\FDSecurity\\models"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
+static_model_enabled = true
 behavior_monitor_enabled = false
 
 [forensic_auto]

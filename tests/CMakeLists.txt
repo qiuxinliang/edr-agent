@@ -13,20 +13,19 @@ function(edr_absolutize_sources output_var)
 endfunction()
 
 add_executable(test_ave_fp ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_fp.c ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-  ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
   ${CMAKE_SOURCE_DIR}/src/core/edr_log.c ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_ave_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 add_executable(test_ave_infer ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_infer.c ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-  ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
   ${CMAKE_SOURCE_DIR}/src/core/edr_log.c ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_ave_infer PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 add_executable(test_ave_phase1 ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_phase1_contract.c ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-  ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
   ${CMAKE_SOURCE_DIR}/src/core/edr_log.c ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_ave_phase1 PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 set(_edr_test_ave_sdk_sources
   ${CMAKE_SOURCE_DIR}/src/ave/ave_sdk.c
-  ${CMAKE_SOURCE_DIR}/src/ave/fl_feature_provider.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_suppression.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_rules_meta.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_behavior_pipeline.c
@@ -39,7 +38,6 @@ set(_edr_test_ave_sdk_sources
   ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-  ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c
   ${CMAKE_SOURCE_DIR}/src/core/edr_log.c
   ${CMAKE_SOURCE_DIR}/src/config/config.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
@@ -95,7 +93,7 @@ target_link_libraries(test_ave_sdk PRIVATE edr_ave_test_common)
 add_executable(test_ave_fl_abi ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_fl_abi.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
 target_link_libraries(test_ave_fl_abi PRIVATE edr_ave_test_common)
 set(_edr_test_behavior_seq128_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx")
-if(EXISTS "${_edr_test_behavior_seq128_fixture}")
+if(EDR_WITH_AVE_BEHAVIOR_ONNX AND EXISTS "${_edr_test_behavior_seq128_fixture}")
   target_compile_definitions(test_ave_fl_abi PRIVATE
     "EDR_TEST_BEH_ONNX=\"${_edr_test_behavior_seq128_fixture}\""
   )
@@ -109,7 +107,7 @@ else()
   target_sources(test_ave_sdk PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
   target_sources(test_ave_fl_abi PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
 endif()
-if(SQLite3_FOUND)
+if(FALSE AND SQLite3_FOUND)
   add_executable(test_fl_ave_samples_bridge ${CMAKE_CURRENT_SOURCE_DIR}/test_fl_ave_samples_bridge.c
     ${CMAKE_SOURCE_DIR}/src/fl_trainer/fl_samples_db.c
     ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
@@ -249,7 +247,6 @@ add_test(NAME preprocess_dedup COMMAND test_preprocess_dedup WORKING_DIRECTORY $
 
 add_executable(test_ave_pipeline ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_pipeline.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_sdk.c
-  ${CMAKE_SOURCE_DIR}/src/ave/fl_feature_provider.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_suppression.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_rules_meta.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_behavior_pipeline.c
@@ -262,7 +259,6 @@ add_executable(test_ave_pipeline ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_pipeline.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-  ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c
   ${CMAKE_SOURCE_DIR}/src/core/edr_log.c
   ${CMAKE_SOURCE_DIR}/src/config/config.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
@@ -443,7 +439,6 @@ if(EDR_ONNXRUNTIME_AVAILABLE)
   add_executable(test_ave_static_onnx_integration ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_static_onnx_integration.c
     ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c
     ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-    ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c
     ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
     ${CMAKE_SOURCE_DIR}/src/config/config.c
     ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
@@ -477,41 +472,43 @@ if(EDR_ONNXRUNTIME_AVAILABLE)
   add_test(NAME ave_static_onnx_triple_integration COMMAND test_ave_static_onnx_integration
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-  add_executable(test_ave_behavior_onnx_integration ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_behavior_onnx_integration.c
-    ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
-    ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c
-    ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
-    ${CMAKE_SOURCE_DIR}/src/config/config.c
-    ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
-  )
-  target_include_directories(test_ave_behavior_onnx_integration PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src/ave
-    ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  )
-  target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE
-    "EDR_TEST_BEHAVIOR_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx\""
-    "EDR_TEST_BEHAVIOR_SEQ128_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx\""
-  )
-  target_include_directories(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_LIB} Threads::Threads)
-  if(UNIX AND NOT WIN32)
-    target_link_libraries(test_ave_behavior_onnx_integration PRIVATE m)
-  endif()
-  if(WIN32)
-    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_OS_WINDOWS=1)
-  else()
-    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_OS_POSIX=1)
-  endif()
+  if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+    add_executable(test_ave_behavior_onnx_integration ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_behavior_onnx_integration.c
+      ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
+      ${CMAKE_SOURCE_DIR}/src/ave/edr_onnx_behavior_fl_tensor_export.c
+      ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
+      ${CMAKE_SOURCE_DIR}/src/config/config.c
+      ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
+    )
+    target_include_directories(test_ave_behavior_onnx_integration PRIVATE
+      ${CMAKE_SOURCE_DIR}/include
+      ${CMAKE_SOURCE_DIR}/src/ave
+      ${CMAKE_SOURCE_DIR}/third_party/tomlc99
+    )
+    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_HAVE_ONNXRUNTIME=1 EDR_WITH_AVE_BEHAVIOR_ONNX=1)
+    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE
+      "EDR_TEST_BEHAVIOR_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx\""
+      "EDR_TEST_BEHAVIOR_SEQ128_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx\""
+    )
+    target_include_directories(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+    target_link_libraries(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_LIB} Threads::Threads)
+    if(UNIX AND NOT WIN32)
+      target_link_libraries(test_ave_behavior_onnx_integration PRIVATE m)
+    endif()
+    if(WIN32)
+      target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_OS_WINDOWS=1)
+    else()
+      target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_OS_POSIX=1)
+    endif()
 
-  if(APPLE)
-    get_filename_component(_edr_ort_libdir_beh "${ONNXRUNTIME_LIB}" DIRECTORY)
-    set_target_properties(test_ave_behavior_onnx_integration PROPERTIES BUILD_RPATH "${_edr_ort_libdir_beh}")
-  endif()
+    if(APPLE)
+      get_filename_component(_edr_ort_libdir_beh "${ONNXRUNTIME_LIB}" DIRECTORY)
+      set_target_properties(test_ave_behavior_onnx_integration PROPERTIES BUILD_RPATH "${_edr_ort_libdir_beh}")
+    endif()
 
-  add_test(NAME ave_behavior_onnx_dual_integration COMMAND test_ave_behavior_onnx_integration
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    add_test(NAME ave_behavior_onnx_dual_integration COMMAND test_ave_behavior_onnx_integration
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  endif()
 
   # P1：小 fixture 拷成 model_dir 命名（static.onnx + behavior.onnx），与 Agent 真链一致
   set(EDR_E2E_MODEL_FIXTURE_DIR "${CMAKE_BINARY_DIR}/test_models_e2e")
@@ -566,7 +563,9 @@ foreach(_edr_warning_target IN ITEMS
 endforeach()
 if(EDR_ONNXRUNTIME_AVAILABLE)
   edr_apply_common_warnings(test_ave_static_onnx_integration)
-  edr_apply_common_warnings(test_ave_behavior_onnx_integration)
+  if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+    edr_apply_common_warnings(test_ave_behavior_onnx_integration)
+  endif()
 endif()
 
 add_test(NAME ave_file_fingerprint COMMAND test_ave_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -577,7 +576,7 @@ target_include_directories(test_ave_static_features PRIVATE ${CMAKE_SOURCE_DIR}/
 add_test(NAME ave_static_features_lite512 COMMAND test_ave_static_features WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_sdk_smoke COMMAND test_ave_sdk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_fl_abi_c0 COMMAND test_ave_fl_abi WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-if(SQLite3_FOUND)
+if(FALSE AND SQLite3_FOUND)
   add_test(NAME fl_ave_samples_bridge COMMAND test_fl_ave_samples_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()
 add_test(NAME ave_suppression_sqlite COMMAND test_ave_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

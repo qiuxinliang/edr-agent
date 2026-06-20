@@ -35,9 +35,9 @@ function(edr_apply_common_warnings target_name)
   endif()
 endfunction()
 
-option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" OFF)
-option(EDR_REQUIRE_GRPC "Fail configure when EDR_WITH_GRPC=ON but gRPC is not found" OFF)
-option(EDR_GRPC_REGENERATE "Regenerate C++ gRPC/protobuf stubs with the active protoc" ON)
+option(EDR_WITH_GRPC "Deprecated: endpoint product builds use HTTP ingest/control only" OFF)
+option(EDR_REQUIRE_GRPC "Deprecated compatibility option; gRPC client has been removed from product builds" OFF)
+option(EDR_GRPC_REGENERATE "Deprecated compatibility option; generated gRPC stubs are no longer used" OFF)
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 set(EDR_P0_RULES_BUNDLE_VERSION
@@ -46,65 +46,15 @@ set(EDR_P0_RULES_BUNDLE_VERSION
 set(EDR_AGENT_VERSION_STRING
   "${PROJECT_VERSION}"
   CACHE STRING "Agent version string reported to the platform")
-list(APPEND CMAKE_PREFIX_PATH
-  /usr/local/opt/grpc
-  /opt/homebrew/opt/grpc
-  /usr/local
-  /opt/homebrew
-)
 set(EDR_GRPC_CLIENT_AVAILABLE 0)
 if(EDR_WITH_GRPC)
-  # 只通过 gRPC CONFIG 拉取 protobuf，避免与独立 Protobuf 包重复定义目标
-  find_package(gRPC CONFIG QUIET)
-  if(TARGET gRPC::grpc++)
-    set(EDR_GRPC_CLIENT_AVAILABLE 1)
-  endif()
+  message(FATAL_ERROR "EDR_WITH_GRPC is no longer supported in endpoint product builds; use HTTP ingest/control.")
 endif()
 set(EDR_GRPC_CLIENT_AVAILABLE ${EDR_GRPC_CLIENT_AVAILABLE} CACHE INTERNAL "EDR gRPC client availability")
-if(NOT EDR_GRPC_CLIENT_AVAILABLE)
-  if(EDR_WITH_GRPC AND EDR_REQUIRE_GRPC)
-    message(FATAL_ERROR "EDR_REQUIRE_GRPC=ON but gRPC::grpc++ was not found")
-  endif()
-  message(STATUS "gRPC client disabled (install grpc/protobuf or set EDR_WITH_GRPC=OFF)")
-else()
-  message(STATUS "gRPC client enabled (real EventIngest transport)")
-endif()
-
-set(EDR_GRPC_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen")
-set(EDR_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.pb.cc")
-set(EDR_GRPC_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.grpc.pb.cc")
-if(EDR_GRPC_CLIENT_AVAILABLE AND EDR_GRPC_REGENERATE)
-  find_program(EDR_PROTOC_EXECUTABLE protoc)
-  find_program(EDR_GRPC_CPP_PLUGIN grpc_cpp_plugin)
-  if(EDR_PROTOC_EXECUTABLE AND EDR_GRPC_CPP_PLUGIN)
-    set(EDR_GRPC_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/grpc_gen")
-    set(EDR_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.pb.cc")
-    set(EDR_GRPC_GRPC_PB_CC "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.grpc.pb.cc")
-    add_custom_command(
-      OUTPUT
-        "${EDR_GRPC_PB_CC}"
-        "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.pb.h"
-        "${EDR_GRPC_GRPC_PB_CC}"
-        "${EDR_GRPC_GEN_DIR}/edr/v1/ingest.grpc.pb.h"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory "${EDR_GRPC_GEN_DIR}"
-      COMMAND "${EDR_PROTOC_EXECUTABLE}"
-        -I "${CMAKE_CURRENT_SOURCE_DIR}/proto"
-        "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
-        --cpp_out=${EDR_GRPC_GEN_DIR}
-        --grpc_out=${EDR_GRPC_GEN_DIR}
-        --plugin=protoc-gen-grpc=${EDR_GRPC_CPP_PLUGIN}
-      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/proto/edr/v1/ingest.proto"
-      VERBATIM
-    )
-    message(STATUS "gRPC stubs will be regenerated under ${EDR_GRPC_GEN_DIR}")
-  elseif(EDR_REQUIRE_GRPC)
-    message(FATAL_ERROR "EDR_GRPC_REGENERATE=ON requires protoc and grpc_cpp_plugin")
-  else()
-    message(STATUS "protoc/grpc_cpp_plugin not found, using checked-in gRPC stubs")
-  endif()
-endif()
+message(STATUS "gRPC client removed from product build; HTTP ingest/control only")
 
 option(EDR_WITH_ONNXRUNTIME "Link ONNX Runtime C API for AVE real inference (optional)" OFF)
+option(EDR_WITH_AVE_BEHAVIOR_ONNX "Deprecated: run behavior.onnx on endpoint instead of server-side evaluation" OFF)
 set(EDR_ONNXRUNTIME_AVAILABLE 0)
 if(EDR_WITH_ONNXRUNTIME)
   find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_c_api.h
@@ -130,11 +80,14 @@ if(EDR_WITH_ONNXRUNTIME)
 endif()
 
 option(EDR_BUILD_AVE_SHARED_LIB "Build standalone edr_ave_shared (AVE DLL/so for embedding)" OFF)
-option(EDR_WITH_FL_TRAINER "Build federated learning local trainer threads (stub)" OFF)
-option(EDR_WITH_FL_KAFKA "FL: consume round announces via librdkafka (requires EDR_WITH_FL_TRAINER)" OFF)
+option(EDR_WITH_FL_TRAINER "Deprecated: federated learning trainer is removed from endpoint product builds" OFF)
+option(EDR_WITH_FL_KAFKA "Deprecated: federated learning Kafka consumer is removed from endpoint product builds" OFF)
 option(EDR_CREATE_LEGACY_AGENT_ALIAS "Create legacy edr_agent.exe alias next to FDSensor.exe on Windows" OFF)
-set(TORCH_ROOT "" CACHE PATH "LibTorch 根目录（含 share/cmake/Torch），见 pytorch.org/cppdocs/installing.html")
-option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAKE_PREFIX_PATH）" OFF)
+set(TORCH_ROOT "" CACHE PATH "Deprecated: LibTorch was used only by the removed endpoint FL trainer")
+option(EDR_WITH_LIBTORCH "Deprecated: LibTorch local FL training is removed from endpoint product builds" OFF)
+if(EDR_WITH_FL_TRAINER OR EDR_WITH_FL_KAFKA OR EDR_WITH_LIBTORCH)
+  message(FATAL_ERROR "Endpoint FL training has been removed from product builds; keep model learning server-side.")
+endif()
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
 
@@ -234,8 +187,8 @@ option(EDR_REQUIRE_HTTPS_REST
 if(EDR_WITH_INGEST_HTTPS_OPENSSL AND NOT OpenSSL_FOUND)
   message(FATAL_ERROR "EDR_WITH_INGEST_HTTPS_OPENSSL=ON but OpenSSL was not found")
 endif()
-if(EDR_REQUIRE_HTTPS_REST AND NOT EDR_WITH_GRPC AND NOT EDR_WITH_INGEST_HTTPS_OPENSSL)
-  message(FATAL_ERROR "EDR_REQUIRE_HTTPS_REST=ON requires EDR_WITH_INGEST_HTTPS_OPENSSL=ON for no-gRPC builds")
+if(EDR_REQUIRE_HTTPS_REST AND NOT EDR_WITH_INGEST_HTTPS_OPENSSL)
+  message(FATAL_ERROR "EDR_REQUIRE_HTTPS_REST=ON requires EDR_WITH_INGEST_HTTPS_OPENSSL=ON")
 endif()
 message(STATUS "HTTP HTTPS ingest OpenSSL support: ${EDR_WITH_INGEST_HTTPS_OPENSSL}")
 option(EDR_WITH_HTTP2_CURL
@@ -282,16 +235,6 @@ if(EDR_WITH_P0_RULES_OPENSSL AND NOT OpenSSL_FOUND)
 endif()
 message(STATUS "P0 encrypted rule bundle OpenSSL support: ${EDR_WITH_P0_RULES_OPENSSL}")
 set(EDR_LIBTORCH_AVAILABLE 0)
-if(EDR_WITH_LIBTORCH)
-  list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}" "$ENV{TORCH_ROOT}")
-  find_package(Torch QUIET)
-  if(Torch_FOUND)
-    set(EDR_LIBTORCH_AVAILABLE 1)
-    message(STATUS "LibTorch found for FL local_train")
-  else()
-    message(STATUS "LibTorch not found (set TORCH_ROOT or CMAKE_PREFIX_PATH to libtorch)")
-  endif()
-endif()
 set(EDR_YARA_AVAILABLE 0)
 if(EDR_WITH_YARA)
   find_path(YARA_INCLUDE_DIR NAMES yara.h
@@ -369,7 +312,6 @@ set(EDR_AGENT_SOURCES
   src/resource/resource.c
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c
   src/ave/ave_sdk.c
   src/ave/ave_suppression.c
   src/ave/ave_rules_meta.c
@@ -381,9 +323,11 @@ set(EDR_AGENT_SOURCES
   src/ave/ave_hotfix.c
   src/ave/ave_db_update.c
   src/ave/ave_static_features.c
-  src/ave/fl_feature_provider.c
   third_party/cjson/cJSON.c
 )
+if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  list(APPEND EDR_AGENT_SOURCES src/ave/edr_onnx_behavior_fl_tensor_export.c)
+endif()
 if(EDR_PCRE2_AVAILABLE)
   list(APPEND EDR_AGENT_SOURCES
     src/preprocess/p0_rule_ir.c
@@ -449,69 +393,7 @@ else()
   list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_detector_none.c)
 endif()
 list(APPEND EDR_AGENT_SOURCES ${EDR_WEBSHELL_SRCS})
-
 set(EDR_FL_KAFKA_AVAILABLE 0)
-if(EDR_WITH_FL_KAFKA AND NOT EDR_WITH_FL_TRAINER)
-  message(FATAL_ERROR "EDR_WITH_FL_KAFKA requires EDR_WITH_FL_TRAINER=ON")
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_WITH_FL_KAFKA)
-  find_package(PkgConfig QUIET)
-  if(PkgConfig_FOUND)
-    pkg_check_modules(RDKAFKA QUIET IMPORTED_TARGET rdkafka)
-  endif()
-  if(RDKAFKA_FOUND AND TARGET PkgConfig::RDKAFKA)
-    set(EDR_FL_KAFKA_AVAILABLE 1)
-  else()
-    find_path(RDKAFKA_INCLUDE_DIR NAMES librdkafka/rdkafka.h
-      PATHS
-        /opt/homebrew/include
-        /usr/local/include
-        "$ENV{HOMEBREW_PREFIX}/include"
-        "C:/vcpkg/installed/x64-windows/include")
-    find_library(RDKAFKA_LIBRARY NAMES rdkafka
-      PATHS
-        /opt/homebrew/lib
-        /usr/local/lib
-        "$ENV{HOMEBREW_PREFIX}/lib"
-        "C:/vcpkg/installed/x64-windows/lib")
-    if(RDKAFKA_INCLUDE_DIR AND RDKAFKA_LIBRARY)
-      set(EDR_FL_KAFKA_AVAILABLE 1)
-    endif()
-  endif()
-  if(NOT EDR_FL_KAFKA_AVAILABLE)
-    message(FATAL_ERROR "EDR_WITH_FL_KAFKA=ON but librdkafka not found (install librdkafka; pkg-config rdkafka or set CMAKE_PREFIX_PATH)")
-  endif()
-endif()
-
-set(EDR_FL_TRAINER_SOURCES
-  src/fl_trainer/fl_trainer.c
-  src/fl_trainer/fl_round.c
-  src/fl_trainer/fl_samples_db.c
-  src/fl_trainer/local_train_core.c
-  src/fl_trainer/fl_dp.c
-  src/fl_trainer/fl_privacy_budget.c
-  src/fl_trainer/fl_crypto.c
-  src/fl_trainer/fl_gradient_upload.c
-  src/fl_trainer/fl_frozen_layers.c
-  src/fl_trainer/fl_pb_wire.c
-  src/fl_trainer/fl_b64.c
-  src/fl_trainer/fl_http_upload.c
-  src/fl_trainer/fl_kafka_stub.c
-)
-if(EDR_WITH_FL_TRAINER AND EDR_FL_KAFKA_AVAILABLE)
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/fl_kafka_rdkafka.c)
-else()
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/fl_kafka_poll_noop.c)
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_LIBTORCH_AVAILABLE)
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/local_train_torch.cpp)
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_GRPC_CLIENT_AVAILABLE)
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/fl_grpc_upload.cpp)
-endif()
-if(EDR_WITH_FL_TRAINER)
-  list(APPEND EDR_AGENT_SOURCES ${EDR_FL_TRAINER_SOURCES})
-endif()
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99/toml.c")
   message(FATAL_ERROR "tomlc99 required: third_party/tomlc99/toml.c (see third_party/tomlc99/README.txt)")
@@ -522,23 +404,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
   list(APPEND EDR_AGENT_SOURCES third_party/lz4/lz4.c)
 endif()
 
-if(EDR_GRPC_CLIENT_AVAILABLE)
-  list(APPEND EDR_AGENT_SOURCES
-    src/transport/grpc_client_impl.cpp
-    "${EDR_GRPC_PB_CC}"
-    "${EDR_GRPC_GRPC_PB_CC}"
-  )
-else()
-  list(APPEND EDR_AGENT_SOURCES src/transport/grpc_client_stub.c)
-endif()
+list(APPEND EDR_AGENT_SOURCES src/transport/grpc_client_stub.c)
 
 set(EDR_AVE_CORE_SOURCES
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c
   src/ave/ave_static_features.c
   src/ave/ave_sdk.c
-  src/ave/fl_feature_provider.c
   src/ave/ave_suppression.c
   src/ave/ave_rules_meta.c
   src/ave/ave_behavior_pipeline.c
@@ -550,6 +422,9 @@ set(EDR_AVE_CORE_SOURCES
   src/ave/ave_db_update.c
   src/command/sha256.c
 )
+if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  list(APPEND EDR_AVE_CORE_SOURCES src/ave/edr_onnx_behavior_fl_tensor_export.c)
+endif()
 if(WIN32)
   list(APPEND EDR_AVE_CORE_SOURCES src/ave/ave_sign_whitelist_win.c)
 else()
@@ -572,7 +447,6 @@ endif()
 target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ave
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/fl_trainer
   ${CMAKE_CURRENT_SOURCE_DIR}/src/collector
   ${CMAKE_CURRENT_SOURCE_DIR}/src/pmfe
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99
@@ -589,6 +463,9 @@ target_compile_definitions(edr_agent PRIVATE
 if(MSVC)
   target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 endif()
+if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  target_compile_definitions(edr_agent PRIVATE EDR_WITH_AVE_BEHAVIOR_ONNX=1)
+endif()
 
 if(EDR_PCRE2_AVAILABLE)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
@@ -599,19 +476,7 @@ if(EDR_PCRE2_AVAILABLE)
     target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_LIBRARY})
   endif()
 endif()
-if(EDR_WITH_FL_TRAINER)
-  target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_LIBTORCH_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LIBTORCH=1)
-  target_link_libraries(edr_agent PRIVATE ${TORCH_LIBRARIES})
-  if(TORCH_CXX_FLAGS)
-    separate_arguments(_edr_torch_cxx_flags UNIX_COMMAND "${TORCH_CXX_FLAGS}")
-    set_property(SOURCE src/fl_trainer/local_train_torch.cpp APPEND PROPERTY COMPILE_OPTIONS
-                 ${_edr_torch_cxx_flags})
-  endif()
-endif()
-if((EDR_WITH_FL_TRAINER OR EDR_WITH_P0_RULES_OPENSSL) AND OpenSSL_FOUND)
+if(EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_FL=1)
   if(TARGET OpenSSL::SSL)
     target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
@@ -646,18 +511,6 @@ if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
     target_link_libraries(edr_agent PRIVATE ${EDR_ZSTD_LIBRARY})
   endif()
 endif()
-if(EDR_WITH_FL_TRAINER AND EDR_GRPC_CLIENT_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_GRPC_FL=1)
-endif()
-
-if(EDR_WITH_FL_TRAINER AND EDR_FL_KAFKA_AVAILABLE)
-  if(TARGET PkgConfig::RDKAFKA)
-    target_link_libraries(edr_agent PRIVATE PkgConfig::RDKAFKA)
-  else()
-    target_include_directories(edr_agent PRIVATE ${RDKAFKA_INCLUDE_DIR})
-    target_link_libraries(edr_agent PRIVATE ${RDKAFKA_LIBRARY})
-  endif()
-endif()
 
 if(EDR_ONNXRUNTIME_AVAILABLE)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_ONNXRUNTIME=1)
@@ -680,30 +533,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4
   )
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LZ4=1)
-endif()
-
-if(EDR_GRPC_CLIENT_AVAILABLE)
-  target_include_directories(edr_agent PRIVATE "${EDR_GRPC_GEN_DIR}")
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_GRPC=1)
-  target_link_libraries(edr_agent PRIVATE gRPC::grpc++ protobuf::libprotobuf)
-  # gRPC / protobuf 生成代码会触发第三方头里的弃用符号告警，仅对这些源文件压掉
-  if(MSVC)
-    set(_edr_grpc_no_dep_warn /wd4996)
-  else()
-    set(_edr_grpc_no_dep_warn -Wno-deprecated-declarations)
-  endif()
-  set_source_files_properties(
-    src/transport/grpc_client_impl.cpp
-    "${EDR_GRPC_PB_CC}"
-    "${EDR_GRPC_GRPC_PB_CC}"
-    PROPERTIES COMPILE_OPTIONS "${_edr_grpc_no_dep_warn}"
-  )
-  if(EDR_WITH_FL_TRAINER)
-    set_source_files_properties(
-      src/fl_trainer/fl_grpc_upload.cpp
-      PROPERTIES COMPILE_OPTIONS "${_edr_grpc_no_dep_warn}"
-    )
-  endif()
 endif()
 
 edr_apply_common_warnings(edr_agent)

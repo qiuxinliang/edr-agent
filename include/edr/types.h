@@ -55,9 +55,9 @@ typedef enum {
   EDR_EVENT_WEBSHELL_DETECTED = 64,
   /** §19.10 Microsoft-Windows-Windows Firewall With Advanced Security（规则增删改等） */
   EDR_EVENT_FIREWALL_RULE_CHANGE = 65,
-  /** §21 PMFE 内存扫描结论（经预处理 → 行为批次 → gRPC，与 ETW 路径一致） */
+  /** §21 PMFE 内存扫描结论（经预处理 → 统一 HTTP 行为批次，与 ETW 路径一致） */
   EDR_EVENT_PMFE_SCAN_RESULT = 66,
-  /** behavior.onnx 告警帧（`BehaviorEvent.behavior_alert`，§12.4） */
+  /** 主机行为告警帧（protobuf `BehaviorEvent.behavior_alert`，P0/PMFE/脚本等可复用） */
   EDR_EVENT_BEHAVIOR_ONNX_ALERT = 70,
 } EdrEventType;
 

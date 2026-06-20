@@ -5,7 +5,7 @@
 # Usage:
 #   ./package_bundled_layout.sh
 #   EDR_BIN_DIR=/path/to/stage EDR_BUNDLE_STRICT=1 ./package_bundled_layout.sh
-# EDR_BUNDLE_STRICT=1: fail if models miss behavior.onnx or if no static-capable .onnx is present
+# EDR_BUNDLE_STRICT=1: fail if no static-capable .onnx is present
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +50,7 @@ fi
 # models: recursive (onnx, pca_*.npy, etc.)
 if [[ -d "$EDR_AGENT_DIR/models" ]]; then
   cp -a "$EDR_AGENT_DIR/models/." "$OUT_DIR/models/"
+  find "$OUT_DIR/models" -type f -name 'behavior.onnx' -delete 2>/dev/null || true
 fi
 
 PREP_TOML="$REPO_ROOT/edr-backend/platform/config/agent_preprocess_rules_v1.toml"
@@ -107,16 +108,13 @@ fi
 
 # --- Full-stack checks (ONNX + rules) ---
 ONNX_LIST=0
-HAS_BEHAVIOR=0
 STATIC_CAND=0
 shopt -s nullglob
 for f in "$OUT_DIR/models"/*.onnx; do
   [[ -f "$f" ]] || continue
   ONNX_LIST=$((ONNX_LIST + 1))
   b=$(basename "$f")
-  if [[ "$b" == "behavior.onnx" ]]; then
-    HAS_BEHAVIOR=1
-  else
+  if [[ "$b" != "behavior.onnx" ]]; then
     STATIC_CAND=1
   fi
 done
@@ -131,13 +129,10 @@ check_fail() {
 }
 
 if [[ "$ONNX_LIST" -eq 0 ]]; then
-  check_fail "models/ has no .onnx — AVE static/behavior will not run; not a full detection stack."
+  check_fail "models/ has no .onnx — AVE static EPP will not run; not a full endpoint protection stack."
 else
-  if [[ "$HAS_BEHAVIOR" -ne 1 ]]; then
-    check_fail "models/behavior.onnx missing — behavior pipeline disabled."
-  fi
   if [[ "$STATIC_CAND" -ne 1 ]]; then
-    check_fail "no second .onnx besides behavior — static engine needs a non-behavior .onnx (e.g. static.onnx)."
+    check_fail "static engine needs a non-behavior .onnx (e.g. static.onnx)."
   fi
 fi
 
@@ -160,4 +155,4 @@ if unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bun
 fi
 echo "OK: $ZIP_PATH"
 echo "Read BUNDLE_README inside the zip for full terminal feature coverage and out-of-band items."
-echo "Optional: EDR_BUNDLE_STRICT=1 to require models/behavior.onnx + a static .onnx before zipping."
+echo "Optional: EDR_BUNDLE_STRICT=1 to require a static .onnx before zipping."

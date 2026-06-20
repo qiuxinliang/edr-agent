@@ -19,7 +19,7 @@ shopt -s nullglob
 files=("$SRC"/*.onnx)
 if ((${#files[@]} == 0)); then
   if [[ "${EDR_BUNDLE_ONNX_REQUIRED:-}" == "1" ]]; then
-    echo "::error::sync_onnx_output_to_models: no *.onnx under $SRC — add static.onnx / behavior.onnx (or train export) and commit for release bundle." >&2
+    echo "::error::sync_onnx_output_to_models: no *.onnx under $SRC — add static.onnx and commit for release bundle." >&2
     exit 1
   fi
   echo "sync_onnx_output_to_models: warning: no *.onnx in $SRC; leaving models/ as-is (README only is ok for dev)." >&2

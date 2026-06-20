@@ -122,6 +122,8 @@ typedef struct EdrConfig {
      * 为 true（默认）时 ONNX 前做 IOC 预检；为 false 时仅 ONNX 后二次核对 IOC（便于与模型并行或热库后写）。
      */
     bool ioc_precheck_enabled;
+    /** Static ONNX file model for EPP-style file verdicts. Product builds keep this enabled. */
+    bool static_model_enabled;
     /** L4：不可豁免文件哈希（表 `file_behavior_non_exempt`） */
     char behavior_policy_db_path[1024];
     /** `AVE_StartBehaviorMonitor` 是否拉起消费线程；生产默认关闭，按策略/应急触发开启。 */

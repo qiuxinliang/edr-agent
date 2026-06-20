@@ -153,6 +153,11 @@ function Write-TaskLauncher {
 `$logPath = $logPathLit
 `$stdoutPath = $stdoutPathLit
 `$stderrPath = $stderrPathLit
+function Quote-FDNativeArg {
+  param([string]`$Value)
+  if (`$null -eq `$Value) { return '""' }
+  return '"' + (`$Value -replace '"', '\"') + '"'
+}
 function Write-FDTaskLog {
   param([string]`$Message)
   try {
@@ -170,7 +175,9 @@ try {
   try { Unblock-File -LiteralPath `$exe -ErrorAction SilentlyContinue } catch {}
   try { Remove-Item -LiteralPath `$stdoutPath -Force -ErrorAction SilentlyContinue } catch {}
   try { Remove-Item -LiteralPath `$stderrPath -Force -ErrorAction SilentlyContinue } catch {}
-  `$p = Start-Process -FilePath `$exe -ArgumentList @("--config", `$cfg) -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop
+  `$agentArgs = "--config " + (Quote-FDNativeArg `$cfg)
+  Write-FDTaskLog ("args=`$agentArgs")
+  `$p = Start-Process -FilePath `$exe -ArgumentList `$agentArgs -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop
   Write-FDTaskLog ("started_pid=" + `$p.Id)
   Start-Sleep -Seconds 4
   `$alive = Get-Process -Id `$p.Id -ErrorAction SilentlyContinue

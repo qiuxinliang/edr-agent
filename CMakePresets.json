@@ -13,7 +13,7 @@
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置。vcpkg install 后再 cmake --preset。gRPC 需 vcpkg --x-feature=grpc-client 且 EDR_WITH_GRPC=ON 或 w-vcpkg-ninja-grpc-ort。",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置。产品主线固定 no-gRPC/no-FL。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -51,7 +51,7 @@
     },
     {
       "name": "w-vcpkg-ninja-grpc-ort",
-      "displayName": "Win vcpkg+Ninja 全量（gRPC+ONNXRuntime，与 CI 长链一致）",
+      "displayName": "Win vcpkg+Ninja 全量（static ONNXRuntime，legacy preset name）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
@@ -59,13 +59,15 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_GRPC": "ON",
+        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
         "EDR_WITH_ONNXRUNTIME": "ON",
         "ONNXRUNTIME_ROOT": "$env{ONNXRUNTIME_ROOT}",
         "EDR_WITH_YARA": "ON",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_WITH_FL_KAFKA": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },

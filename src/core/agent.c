@@ -558,6 +558,17 @@ static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, 
 }
 
 static void edr_agent_register_ave_behavior_callbacks(EdrAgent *agent) {
+  if (!agent || !agent->cfg.ave.behavior_monitor_enabled) {
+    AVEStatus st;
+    memset(&st, 0, sizeof(st));
+    (void)AVE_GetStatus(&st);
+    fprintf(stderr,
+            "[ave] behavior_monitor=0 static_model=%s behavior_model=%s l4_th=%.2f\n",
+            st.static_model_version,
+            st.behavior_model_version,
+            agent ? (double)agent->cfg.ave.l4_realtime_anomaly_threshold : 0.0);
+    return;
+  }
   AVECallbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
   callbacks.on_behavior_alert = edr_agent_on_behavior_alert;
@@ -1821,7 +1832,8 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
              remote->platform.relay_url);
   }
   if (edr_agent_toml_has_section(tmp, "ave")) {
-    agent->cfg.ave.behavior_monitor_enabled = remote->ave.behavior_monitor_enabled;
+    agent->cfg.ave.behavior_monitor_enabled = false;
+    agent->cfg.ave.static_model_enabled = remote->ave.static_model_enabled;
     agent->cfg.ave.scan_threads = remote->ave.scan_threads;
     agent->cfg.ave.max_file_size_mb = remote->ave.max_file_size_mb;
     snprintf(agent->cfg.ave.sensitivity, sizeof(agent->cfg.ave.sensitivity), "%s", remote->ave.sensitivity);

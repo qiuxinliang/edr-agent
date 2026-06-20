@@ -4,8 +4,6 @@
 
 #include "edr/ave_sdk.h"
 
-#include "edr/fl_feature_provider.h"
-
 #include "edr/ave.h"
 #include "edr/config.h"
 #include "edr/sha256.h"
@@ -668,7 +666,7 @@ int AVE_GetStatus(AVEStatus *status_out) {
   return AVE_OK;
 }
 
-/** B3b：将 static 扫描结论写入行为槽（§5.5 维 44–45），供 behavior.onnx 特征使用 */
+/** 将 static 扫描结论写入行为槽，供主机行为上下文与服务端关联分析使用。 */
 static void ave_bp_merge_static_if_subject(uint32_t subject_pid, const AVEScanResult *r) {
   if (subject_pid == 0u || !r) {
     return;
@@ -1118,7 +1116,7 @@ int AVE_IsWhitelisted(const char *sha256) {
   return edr_ave_file_hash_whitelist_hit(pcfg, sha256) ? 1 : 0;
 }
 
-/** 64 位十六进制 + '\0'（联邦 FL 样本 SHA256） */
+/** 64 位十六进制 + '\0'。 */
 static int is_sha256_hex64(const char *s) {
   if (!s) {
     return 0;
@@ -1149,16 +1147,8 @@ int AVE_ExportFeatureVector(const char *sha256, float *out_512d) {
   if (!is_sha256_hex64(sha256)) {
     return AVE_ERR_INVALID_PARAM;
   }
-  {
-    int r = edr_fl_feature_lookup_dispatch(sha256, out_512d, 512u, EDR_FL_TARGET_STATIC);
-    if (r == 0) {
-      return AVE_OK;
-    }
-    if (r == 1) {
-      return AVE_ERR_FL_SAMPLE_NOT_FOUND;
-    }
-  }
-  /* 无注册或内部错误：C0 兼容全零 */
+  /* Endpoint FL training was removed from product builds. Keep this SDK
+   * compatibility API deterministic by returning a zero feature vector. */
   for (int i = 0; i < 512; i++) {
     out_512d[i] = 0.0f;
   }
@@ -1177,15 +1167,7 @@ int AVE_ExportFeatureVectorEx(const char *sha256, float *out, size_t dim, int ta
   if (!is_sha256_hex64(sha256)) {
     return AVE_ERR_INVALID_PARAM;
   }
-  {
-    int r = edr_fl_feature_lookup_dispatch(sha256, out, dim, target);
-    if (r == 0) {
-      return AVE_OK;
-    }
-    if (r == 1) {
-      return AVE_ERR_FL_SAMPLE_NOT_FOUND;
-    }
-  }
+  (void)target;
   for (i = 0; i < dim; i++) {
     out[i] = 0.0f;
   }
@@ -1218,7 +1200,7 @@ int AVE_ExportModelWeights(const char *target, void *buf, size_t *size) {
     }
     return AVE_OK;
   }
-  /* behavior：导出磁盘 behavior.onnx 整文件字节（联邦 / P3 T10·T11），与 ORT 加载源一致；≠ 实施计划 §0「B3c」（M3b+§7/§8） */
+  /* Legacy behavior model export: product builds normally return AVE_ERR_NOT_IMPL. */
   int r = edr_onnx_behavior_export_weights(buf, size);
   if (r == -1) {
     return AVE_ERR_INVALID_PARAM;
@@ -1271,11 +1253,11 @@ int AVE_ImportModelWeights(const char *target, const void *buf, size_t size) {
   if (strcmp(target, "static") != 0 && strcmp(target, "behavior") != 0) {
     return AVE_ERR_INVALID_PARAM;
   }
-  /* FL3 梯度封装（协调方解密）；勿当作 ONNX 权重导入。 */
+  /* Historical FL3 gradient envelopes are not ONNX model weights. */
   if (buf && size >= 4u && memcmp(buf, "FL3", 3) == 0 && ((const uint8_t *)buf)[3] == 2u) {
     return AVE_ERR_NOT_SUPPORTED;
   }
-  /* C6：开发占位——`FLSTUB1` / `FL2` 前缀视为校验通过（非生产权重加载）。梯度 **FL3**（`fl_crypto_seal_gradient`）由协调方持有私钥解密，端上 `fl_crypto_open_gradient` 对 FL3 返回 `-5`，不用于本接口。 */
+  /* Legacy development markers are accepted for compatibility only. */
   if (buf && size >= 7u && memcmp(buf, "FLSTUB1", 7) == 0) {
     return AVE_OK;
   }

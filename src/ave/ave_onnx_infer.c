@@ -75,6 +75,21 @@ int edr_onnx_static_export_weights(void *buf, size_t *size_io) {
   return export_onnx_file_blob(g_static_model_path, buf, size_io);
 }
 
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+int edr_onnx_behavior_export_fl_trainable_floats(float *out_floats, size_t *out_nelem_io,
+                                                 char *manifest_json, size_t manifest_cap) {
+  (void)out_floats;
+  if (!out_nelem_io) {
+    return -1;
+  }
+  *out_nelem_io = 0u;
+  if (manifest_json && manifest_cap > 0u) {
+    snprintf(manifest_json, manifest_cap, "{\"status\":\"endpoint_behavior_onnx_disabled\"}");
+  }
+  return 1;
+}
+#endif
+
 #if defined(EDR_HAVE_ONNXRUNTIME)
 #include <ctype.h>
 #endif
@@ -765,6 +780,12 @@ EdrError edr_onnx_runtime_load(const char *onnx_path, const EdrConfig *cfg) {
 }
 
 EdrError edr_onnx_behavior_load(const char *behavior_onnx_path, const EdrConfig *cfg) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  (void)behavior_onnx_path;
+  (void)cfg;
+  release_behavior_session();
+  return EDR_OK;
+#else
   release_behavior_session();
   if (!behavior_onnx_path || !behavior_onnx_path[0]) {
     return EDR_OK;
@@ -815,19 +836,33 @@ EdrError edr_onnx_behavior_load(const char *behavior_onnx_path, const EdrConfig 
 
   g_beh_ready = 1;
   return EDR_OK;
+#endif
 }
 
 void edr_onnx_runtime_cleanup(void) { release_ort_full(); }
 
 int edr_onnx_runtime_ready(void) { return g_ready; }
 
-int edr_onnx_behavior_ready(void) { return g_beh_ready; }
+int edr_onnx_behavior_ready(void) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  return 0;
+#else
+  return g_beh_ready;
+#endif
+}
 
 size_t edr_onnx_behavior_input_nelem(void) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  return 0u;
+#else
   return g_beh_ready && g_beh_in_nelem > 0 ? (size_t)g_beh_in_nelem : 0u;
+#endif
 }
 
 size_t edr_onnx_behavior_input_seq_len(void) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  return 1u;
+#else
   if (!g_beh_ready || g_beh_in_nelem <= 0) {
     return 1u;
   }
@@ -847,17 +882,22 @@ size_t edr_onnx_behavior_input_seq_len(void) {
     }
   }
   return 1u;
+#endif
 }
 
 void edr_onnx_behavior_model_version(char *buf, size_t cap) {
   if (!buf || cap == 0u) {
     return;
   }
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  snprintf(buf, cap, "not_loaded");
+#else
   if (g_beh_ready && g_beh_ver_tag[0]) {
     snprintf(buf, cap, "%s", g_beh_ver_tag);
   } else {
     snprintf(buf, cap, "not_loaded");
   }
+#endif
 }
 
 void edr_onnx_static_model_version(char *buf, size_t cap) {
@@ -1105,6 +1145,15 @@ static void copy_tactic_probs_from_tensor(OrtValue *tval, float *tactic_probs) {
 
 EdrError edr_onnx_behavior_infer(const float *feature, size_t n_float, float *out_score,
                                  float *tactic_probs) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  (void)feature;
+  (void)n_float;
+  (void)out_score;
+  if (tactic_probs) {
+    memset(tactic_probs, 0, 14u * sizeof(float));
+  }
+  return EDR_ERR_INVALID_ARG;
+#else
   if (!g_beh_ready || !g_ort || !g_beh_session || !feature || !out_score) {
     return EDR_ERR_INVALID_ARG;
   }
@@ -1216,6 +1265,7 @@ EdrError edr_onnx_behavior_infer(const float *feature, size_t n_float, float *ou
     memset(tactic_probs, 0, 14u * sizeof(float));
   }
   return EDR_OK;
+#endif
 }
 
 #endif

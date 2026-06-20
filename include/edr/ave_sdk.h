@@ -55,7 +55,7 @@ extern "C" {
 #define AVE_ERR_NOT_IMPL (-101)
 /** `AVE_ExportModelWeights`：输出缓冲区不足；`*size` 回写所需最小字节数（C0+ 实现） */
 #define AVE_ERR_BUFFER_TOO_SMALL (-102)
-/** `AVE_ExportFeatureVector`：该 SHA256 在 FL 特征缓存中不存在（C1+ 对接 fl_samples / 缓存） */
+/** Legacy compatibility: feature cache miss; endpoint FL training is no longer part of product builds. */
 #define AVE_ERR_FL_SAMPLE_NOT_FOUND (-103)
 
 typedef enum EDRVerdict {
@@ -135,6 +135,7 @@ typedef struct AVEConfig {
   const char *behavior_policy_db_path;
   const char *cert_whitelist_db_path;
   const char *yara_rules_dir;
+  /** Legacy compatibility only; endpoint product builds ignore local FL sample DBs. */
   const char *fl_samples_db_path;
 
   int max_concurrent_scans;
@@ -157,6 +158,7 @@ typedef struct AVEConfig {
   float cert_min_confidence_floor;
 
   bool behavior_monitor_enabled;
+  /** Legacy compatibility only; learning/evaluation is handled server-side. */
   bool federated_learning_enabled;
   bool yara_scan_enabled;
   bool cert_whitelist_enabled;
@@ -364,25 +366,25 @@ AVE_EXPORT void AVE_CALL AVE_NotifyProcessExit(uint32_t pid);
 
 AVE_EXPORT int AVE_CALL AVE_ReportFalsePositive(const char *sha256, const char *file_path);
 AVE_EXPORT int AVE_CALL AVE_ReportTruePositive(const char *sha256);
+/** Legacy compatibility no-op: product builds return 0/0 samples. */
 AVE_EXPORT int AVE_CALL AVE_GetFLSampleCount(int *confirmed_malware_count, int *confirmed_clean_count);
 
 /**
- * 联邦学习：按 SHA256 导出 static 模型用 **512 维 float** 特征（见《10_联邦学习FL组件详细设计》§2.9）。
- * 若已注册 `edr_fl_register_feature_lookup` 且命中样本则写库中向量；未注册或未命中时写全零并保持 `AVE_OK`（C0 兼容）。
- * 显式未命中（回调返回「未找到」）时返回 `AVE_ERR_FL_SAMPLE_NOT_FOUND`。
+ * Legacy compatibility: export a deterministic zero 512-float vector.
+ * Endpoint product builds do not read local FL sample stores.
  */
 AVE_EXPORT int AVE_CALL AVE_ExportFeatureVector(const char *sha256, float *out_512d);
 
-/** static 联邦特征默认维度（与 static ONNX 嵌入一致） */
+/** Legacy feature vector dimension kept for SDK ABI compatibility. */
 #define AVE_FL_FEATURE_DIM_STATIC 512u
-/** behavior：与《11_behavior.onnx详细设计》§6.1 **CLS Token** 表征维 **256** 一致（联邦导出默认） */
+/** Legacy behavior feature dimension kept for SDK ABI compatibility. */
 #define AVE_FL_FEATURE_DIM_BEHAVIOR_DEFAULT 256u
-/** 行为序列长度（`features` 张量 `seq_len`，与 §6.1 输入 shape `(1,128,64)` 一致；非 FL 向量维数） */
+/** Behavior feature sequence length retained for compatibility and server-side analysis. */
 #define AVE_FL_BEHAVIOR_SEQ_LEN 128u
 #define AVE_FL_FEATURE_DIM_MAX 4096u
 
 /**
- * C7：按目标与维度导出特征；`target` 使用 `EDR_FL_TARGET_*`（见 `fl_feature_provider.h`）。
+ * Legacy compatibility: writes a zero vector for the requested dimension.
  */
 AVE_EXPORT int AVE_CALL AVE_ExportFeatureVectorEx(const char *sha256, float *out, size_t dim, int target);
 
@@ -393,8 +395,8 @@ AVE_EXPORT int AVE_CALL AVE_ExportFeatureVectorEx(const char *sha256, float *out
 AVE_EXPORT int AVE_CALL AVE_ExportModelWeights(const char *target, void *buf, size_t *size);
 
 /**
- * 《11》§9.4：**张量级**导出可联邦训练的 **FP32** 初始值（从 **behavior.onnx** 解析 initializer，排除战术头相关张量）。
- * 与 **`AVE_ExportModelWeights("behavior",…)`**（整文件字节）**并存**；平台按任务选择其一。
+ * Legacy compatibility: endpoint product builds return `AVE_ERR_NOT_IMPL`.
+ * Historical builds used this for behavior.onnx trainable tensor export.
  * `out == NULL`：`*out_nelem` ← 所需 float 元素数；`manifest_json` 若非空则写入 JSON 切片说明（`cap` 含 NUL）。
  * `out != NULL`：`*out_nelem` 入参为缓冲可容元素数，成功时回写实际写入数。
  */

@@ -161,8 +161,8 @@ management_tools = "anydesk,teamviewer,rustdesk,screenconnect,connectwise,splash
 [ave]
 # 静态 ONNX：将 static.onnx 放到本目录（与仓库 onnx-output 中产物一致）。
 # 安装：./scripts/install_static_onnx.sh（默认安装到本路径；无权限时用 --dest-dir $PWD/models 做本机联调）。
-# 加载：目录内首个非 behavior.onnx 的 .onnx 作为 static；behavior.onnx 单独用于行为模型。
-# 行为回调、跨引擎喂入、入批与 P0/静态扫 边界见 docs/WP9_BEHAVIOR_AVE.md
+# 加载：目录内首个非 behavior.onnx 的 .onnx 作为 static；端侧 behavior.onnx 已退出产品默认形态。
+# 动态行为检测由 P0 主机行为检测引擎承担，服务端可基于精选事件做后续行为模型评估。
 #
 # 本仓库开发/测试：训练产物在**仓库根目录** `model/releases/<release_id>/`（见根目录 `model/releases/current.json`）。
 # 将 model_dir 设为该目录的绝对路径即可，例如（按本机路径与 release 名修改）：
@@ -173,6 +173,7 @@ model_dir            = "C:\\Program Files\\FDSecurity\\models"
 scan_threads         = 2
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
+static_model_enabled = true
 # P2：static ONNX 推理结果进程内缓存（键为文件 SHA256；0=关闭）。TTL 秒；0=仅 LRU、不按时间过期。
 # static_infer_cache_max_entries = 0
 # static_infer_cache_ttl_s       = 0
@@ -183,7 +184,7 @@ sensitivity          = "MEDIUM"
 # l4_realtime_anomaly_threshold = 0.65
 # L3 IOC 先于 L2 哈希白名单匹配；为 false 时仅 ONNX 后二次核对 IOC。
 # ioc_precheck_enabled = true
-# 行为管线消费线程（AVE_StartBehaviorMonitor）；生产默认关闭，按应急/高价值资产策略触发开启。
+# 行为管线消费线程（AVE_StartBehaviorMonitor）；生产默认关闭，P0 阶段不由远程策略自动开启。
 # behavior_monitor_enabled = false
 # 可选 SQLite：空路径表示禁用该层（详见 docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md）
 # file_whitelist_db_path = ""

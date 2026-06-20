@@ -1,7 +1,7 @@
 # Compact Windows Agent config. Replace endpoint values after enroll.
 
 [server]
-address              = "192.168.3.56:50052"
+address              = ""
 grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
@@ -51,6 +51,7 @@ model_dir            = "C:\\Program Files\\FDSecurity\\models"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
+static_model_enabled = true
 behavior_monitor_enabled = false
 
 [forensic_auto]

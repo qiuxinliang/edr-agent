@@ -706,7 +706,8 @@ begin
     + '''-InstallDir'',' + EdrPsSq(ExpandConstant('{app}')) + ','
     + '''-ConfigPath'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ','
     + '''-ReportPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ','
-    + '''-LogPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.log'))
+    + '''-LogPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.log')) + ','
+    + '''-PolicyTimeoutSec'',''15'''
     + ');'
     + 'try{'
     + '& $script @argv *>> $out;'
@@ -832,7 +833,7 @@ begin
     + 'try { if(Test-Path -LiteralPath $startupLog){Get-Content -LiteralPath $startupLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { L (''task_launcher ''+$_) }} } catch {};'
     + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
     + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
-    + 'try { $p=Start-Process -FilePath $exe -ArgumentList @(''--config'',$cfg) -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
+    + 'try { $agentArgs=''--config "''+$cfg.Replace(''"'',''\"'')+''"''; $p=Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id+'' args=''+$agentArgs) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 2;'
     + '};'
     + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
@@ -857,7 +858,7 @@ begin
     + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
     + 'Start-Sleep -Seconds 1;'
     + '$p=Start-Process -FilePath $exe'
-    + ' -ArgumentList @(''--config'',$cfg)'
+    + ' -ArgumentList (''--config "''+$cfg.Replace(''"'',''\"'')+''"'')'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
     + ' -WindowStyle Hidden -PassThru -ErrorAction Stop;'
     + 'try { $p.PriorityClass = ''BelowNormal'' } catch {};'

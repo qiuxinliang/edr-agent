@@ -252,6 +252,8 @@ jobs:
             -DEDR_WITH_P0_RULES_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
+            -DEDR_WITH_FL_TRAINER=OFF `
+            -DEDR_WITH_FL_KAFKA=OFF `
             -DEDR_WITH_YARA=OFF `
             -DEDR_ENABLE_IPO=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `

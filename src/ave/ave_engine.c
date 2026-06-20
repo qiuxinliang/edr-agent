@@ -163,15 +163,22 @@ static int ave_env_truthy(const char *name) {
 }
 
 static int should_preload_behavior_onnx(const EdrConfig *cfg) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  (void)cfg;
+  return 0;
+#else
   if (ave_env_truthy("EDR_AVE_BEHAVIOR_PRELOAD")) {
     return 1;
   }
   return cfg && cfg->ave.behavior_monitor_enabled;
+#endif
 }
 
 static int should_preload_static_onnx(const EdrConfig *cfg) {
-  (void)cfg;
-  return ave_env_truthy("EDR_AVE_STATIC_PRELOAD");
+  if (ave_env_truthy("EDR_AVE_STATIC_PRELOAD")) {
+    return 1;
+  }
+  return cfg && cfg->ave.static_model_enabled;
 }
 
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
@@ -252,7 +259,7 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
-    EDR_LOGV("%s", "[ave] static.onnx preload skipped (enable EDR_AVE_STATIC_PRELOAD=1 for lab scan)\n");
+    EDR_LOGV("%s", "[ave] static.onnx preload skipped (static_model_enabled=false)\n");
   }
   if (should_preload_behavior_onnx(cfg)) {
     char beh_path[2048];

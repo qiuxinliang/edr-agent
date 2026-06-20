@@ -5,9 +5,6 @@
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
 
-#include "edr/v1/event.pb.h"
-#include <pb_decode.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,31 +96,10 @@ static uint32_t rd_u32_le(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/**
- * 与《11》§12.4 及 ingest 划分表一致：仅 **BehaviorEvent.behavior_alert（字段 40）** 走 gRPC；
- * 其余（含 webshell/shellcode/PMFE 等无嵌套 behavior_alert 的 protobuf、以及 wire 帧）走 HTTP。
- */
-static int frame_prefers_grpc_path(const uint8_t *frame, size_t frame_len) {
-#if defined(EDR_HAVE_NANOPB)
-  edr_v1_BehaviorEvent msg = edr_v1_BehaviorEvent_init_zero;
-  pb_istream_t st = pb_istream_from_buffer(frame, frame_len);
-  if (!pb_decode(&st, edr_v1_BehaviorEvent_fields, &msg)) {
-    return 0;
-  }
-  return msg.has_behavior_alert ? 1 : 0;
-#else
-  (void)frame;
-  (void)frame_len;
-  return 0;
-#endif
-}
-
 static int ingest_split_enabled(void) {
-  const char *e = getenv("EDR_EVENT_INGEST_SPLIT");
-  if (!e || e[0] == '\0' || strcmp(e, "0") == 0) {
-    return 0;
-  }
-  return edr_ingest_http_configured();
+  /* Product builds use one HTTP ingest path. Keep the function so legacy
+   * diagnostics can report the setting without reintroducing gRPC routing. */
+  return 0;
 }
 
 static int append_frame_bytes(uint8_t **buf, size_t *bcap, size_t *used, const uint8_t *frame,
@@ -201,9 +177,8 @@ static void emit_one_channel(const char *batch_id, const uint8_t *raw_body, size
 }
 
 static void flush_split(const char *batch_id_base) {
-  uint8_t *grpc_acc = NULL;
   uint8_t *http_acc = NULL;
-  size_t gcap = 0, hcap = 0, gused = 0, hused = 0;
+  size_t hcap = 0, hused = 0;
   size_t off = 0;
   while (off + 4u <= s_used) {
     uint32_t fl = rd_u32_le(s_buf + off);
@@ -211,34 +186,20 @@ static void flush_split(const char *batch_id_base) {
       break;
     }
     const uint8_t *frame = s_buf + off + 4u;
-    int g = frame_prefers_grpc_path(frame, (size_t)fl);
-    if (g) {
-      if (append_frame_bytes(&grpc_acc, &gcap, &gused, frame, (size_t)fl) != 0) {
-        break;
-      }
-    } else {
-      if (append_frame_bytes(&http_acc, &hcap, &hused, frame, (size_t)fl) != 0) {
-        break;
-      }
+    if (append_frame_bytes(&http_acc, &hcap, &hused, frame, (size_t)fl) != 0) {
+      break;
     }
     off += 4u + (size_t)fl;
   }
 
-  char bid_g[80];
   char bid_h[80];
-  snprintf(bid_g, sizeof(bid_g), "%s-g", batch_id_base);
   snprintf(bid_h, sizeof(bid_h), "%s-h", batch_id_base);
 
-  uint32_t gfc = count_frames_in_buf(grpc_acc, gused);
   uint32_t hfc = count_frames_in_buf(http_acc, hused);
 
-  if (gused > 0u && gfc > 0u) {
-    emit_one_channel(bid_g, grpc_acc, gused, gfc, 0);
-  }
   if (hused > 0u && hfc > 0u) {
     emit_one_channel(bid_h, http_acc, hused, hfc, 1);
   }
-  free(grpc_acc);
   free(http_acc);
 }
 

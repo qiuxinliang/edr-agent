@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       full_features:
-        description: "Build with gRPC + ONNX Runtime + YARA (slow, release-like)"
+        description: "Build with static ONNX Runtime + YARA (release-like, no gRPC/FL)"
         required: false
         type: boolean
         default: false
@@ -183,39 +183,13 @@ jobs:
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           if ('${{ inputs.full_features }}' -eq 'true') {
-            Write-Host "[vcpkg] full feature build: grpc-client + sqlite + yara"
-            & $tc install --x-feature=grpc-client --x-feature=sqlite --x-feature=yara
+            Write-Host "[vcpkg] full detection build: sqlite + yara + static ONNX support (no grpc/fl)"
+            & $tc install --x-feature=sqlite --x-feature=yara
           } else {
             Write-Host "[vcpkg] fast build: manifest defaults only (no grpc/onnx/yara)"
             & $tc install
           }
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Regenerate gRPC proto stubs
-        if: ${{ inputs.full_features }}
-        shell: pwsh
-        run: |
-          $protoc_exe = Join-Path $env:VCPKG_INSTALLED_X64 "tools\protobuf\protoc.exe"
-          if (-not (Test-Path $protoc_exe)) {
-            Write-Host "[skip] protoc not found at $protoc_exe"
-            return
-          }
-          $grpc_plugin = Join-Path $env:VCPKG_INSTALLED_X64 "tools\grpc\grpc_cpp_plugin.exe"
-          if (-not (Test-Path $grpc_plugin)) {
-            Write-Host "[skip] grpc_cpp_plugin not found at $grpc_plugin"
-            return
-          }
-          # protoc needs vcpkg runtime DLLs (e.g. zlib.dll) on PATH
-          $env:PATH = "$env:VCPKG_INSTALLED_X64\bin;$env:PATH"
-          $out_dir = "src/grpc_gen/edr/v1"
-          New-Item -ItemType Directory -Force -Path $out_dir | Out-Null
-          Write-Host "Regenerating gRPC stubs ..."
-          & $protoc_exe -I proto --cpp_out=src/grpc_gen --grpc_out=src/grpc_gen --plugin=protoc-gen-grpc=$grpc_plugin proto/edr/v1/ingest.proto
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::protoc failed with exit code $LASTEXITCODE"
-            throw "protoc failed"
-          }
-          Write-Host "gRPC stubs regenerated OK"
 
       - name: ONNX Runtime (CPU, Windows x64)
         if: ${{ inputs.full_features }}
@@ -262,11 +236,13 @@ jobs:
               "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-              -DEDR_WITH_GRPC=ON `
+              -DEDR_WITH_GRPC=OFF `
               -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
               -DEDR_WITH_P0_RULES_OPENSSL=ON `
               -DEDR_REQUIRE_SQLITE=ON `
               -DEDR_WITH_ONNXRUNTIME=ON `
+              -DEDR_WITH_FL_TRAINER=OFF `
+              -DEDR_WITH_FL_KAFKA=OFF `
               "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
               "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
               -DEDR_BUILD_TESTS=OFF
@@ -281,6 +257,8 @@ jobs:
               -DEDR_WITH_P0_RULES_OPENSSL=ON `
               -DEDR_REQUIRE_SQLITE=ON `
               -DEDR_WITH_ONNXRUNTIME=OFF `
+              -DEDR_WITH_FL_TRAINER=OFF `
+              -DEDR_WITH_FL_KAFKA=OFF `
               -DEDR_WITH_YARA=OFF `
               "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
               -DEDR_BUILD_TESTS=OFF

@@ -83,8 +83,8 @@ if [[ -z "${EDR_MINGW_GRPC_PREFIX:-}" || ! -f "${EDR_MINGW_GRPC_PREFIX}/include/
   exit 2
 fi
 rm -rf build-mingw
-cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DEDR_WITH_GRPC=ON -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -S .
-if [[ "${EDR_REQUIRE_GRPC:-1}" == "1" ]]; then
+cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -S .
+if [[ "${EDR_REQUIRE_GRPC:-0}" == "1" ]]; then
   if ! awk '"'"'BEGIN{ok=0} $0=="EDR_GRPC_CLIENT_AVAILABLE:INTERNAL=1"{ok=1} END{exit(ok?0:1)}'"'"' build-mingw/CMakeCache.txt; then
     echo "ERROR: container MinGW toolchain missing gRPC/protobuf for Windows target (stub would be used)."
     echo "Set EDR_REQUIRE_GRPC=0 only if you intentionally want stub transport."

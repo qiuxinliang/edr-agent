@@ -821,6 +821,12 @@ static void load_ave(toml_table_t *t, EdrConfig *cfg) {
       cfg->ave.ioc_precheck_enabled = d.u.b ? true : false;
     }
   }
+  {
+    toml_datum_t d = toml_bool_in(t, "static_model_enabled");
+    if (d.ok) {
+      cfg->ave.static_model_enabled = d.u.b ? true : false;
+    }
+  }
   take_string(toml_string_in(t, "behavior_policy_db_path"), cfg->ave.behavior_policy_db_path,
               sizeof(cfg->ave.behavior_policy_db_path));
   {
@@ -1629,6 +1635,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->ave.file_whitelist_db_path[0] = '\0';
   cfg->ave.ioc_db_path[0] = '\0';
   cfg->ave.ioc_precheck_enabled = true;
+  cfg->ave.static_model_enabled = true;
   cfg->ave.behavior_policy_db_path[0] = '\0';
   cfg->ave.behavior_monitor_enabled = false;
   cfg->ave.cert_revocation_check = false;
