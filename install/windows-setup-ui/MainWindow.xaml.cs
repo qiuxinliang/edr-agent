@@ -301,7 +301,15 @@ public partial class MainWindow : Window
         if (endpoint != null && proxyCheck.Severity != "fail")
         {
             await AddCheckAsync(await ProbeHttpAsync("服务端连通", endpoint.ReadyUrl, request, bootstrap, "platform ready"));
-            await AddCheckAsync(await ProbeHttpAsync("注册入口", endpoint.EnrollUrl, request, bootstrap, "enroll endpoint", required: true));
+            await AddCheckAsync(await ProbeHttpAsync(
+                "注册入口",
+                endpoint.EnrollUrl,
+                request,
+                bootstrap,
+                "enroll endpoint",
+                required: true,
+                method: HttpMethod.Post,
+                body: "{}"));
         }
         else
         {
@@ -1495,7 +1503,9 @@ public partial class MainWindow : Window
         InstallRequest request,
         BootstrapTrustMaterial bootstrap,
         string label,
-        bool required = false)
+        bool required = false,
+        HttpMethod? method = null,
+        string? body = null)
     {
         for (var attempt = 1; attempt <= 2; attempt++)
         {
@@ -1522,7 +1532,12 @@ public partial class MainWindow : Window
                 }
 
                 using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-                using var msg = new HttpRequestMessage(HttpMethod.Get, url);
+                var probeMethod = method ?? HttpMethod.Get;
+                using var msg = new HttpRequestMessage(probeMethod, url);
+                if (body != null)
+                {
+                    msg.Content = new StringContent(body, Encoding.UTF8, "application/json");
+                }
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(ProbeTimeoutSeconds));
                 using var resp = await client.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, cts.Token);
                 var code = (int)resp.StatusCode;
@@ -1530,6 +1545,12 @@ public partial class MainWindow : Window
                 if (required && code == 404)
                 {
                     return CheckItem.Fail(key, $"{label} 路由不存在，HTTP 404{suffix}");
+                }
+                if (probeMethod == HttpMethod.Post &&
+                    label.Contains("enroll", StringComparison.OrdinalIgnoreCase) &&
+                    code == 400)
+                {
+                    return CheckItem.Ok(key, $"{label} 路由存在，HTTP 400（空探测请求被正确拒绝）{suffix}");
                 }
                 if (code < 500)
                 {
