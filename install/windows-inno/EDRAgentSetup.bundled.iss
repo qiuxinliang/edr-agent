@@ -792,7 +792,13 @@ begin
     + '$d=' + EdrPsSq(ExpandConstant('{app}')) + ';'
     + 'if(Test-Path -LiteralPath $d){'
     + '& icacls.exe $d /inheritance:r /grant:r ''*S-1-5-18:(OI)(CI)F'' /grant:r ''*S-1-5-32-544:(OI)(CI)F'' /grant:r ''*S-1-5-32-545:(OI)(CI)RX'' /T /C /Q | Out-Null'
-    + '}"';
+    + '};'
+    + '$cfg=Join-Path $d ''agent.toml'';'
+    + 'if(Test-Path -LiteralPath $cfg){'
+    + '& icacls.exe $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null'
+    + '};'
+    + 'exit 0'
+    + '"';
 end;
 
 procedure EdrRunInstallWorkflow;

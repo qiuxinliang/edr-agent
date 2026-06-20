@@ -48,6 +48,14 @@ function Set-InstallDirAclHarden {
   & icacls.exe $Dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
 }
 
+function Set-AgentTomlAcl {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  # agent.toml contains endpoint identity and policy URLs. Keep it readable by
+  # SYSTEM and elevated administrators, but do not inherit broad Users read ACLs.
+  & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+}
+
 if ($Action -eq "Remove") {
   Remove-ScheduledTaskIfPresent
   Stop-AgentProcess
@@ -83,6 +91,7 @@ Stop-AgentProcess
 
 if ($HardenAcl) {
   Set-InstallDirAclHarden -Dir $instDir
+  Set-AgentTomlAcl -Path $cfg
 }
 
 $argLine = '--config "' + $cfg + '"'

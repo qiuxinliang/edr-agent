@@ -898,6 +898,19 @@ function Write-PemNoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text)
 }
 
+function Repair-AgentTomlAcl {
+  param([string]$Path)
+  if ((Get-EnrollOs) -ne "windows") { return }
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+  $icacls = Get-Command "icacls.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $icacls) { return }
+  try {
+    & $icacls.Source $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+  } catch {
+    Write-Warning ("failed to repair agent.toml ACL: " + $_.Exception.Message)
+  }
+}
+
 function Get-PemCertificateThumbprint([string]$PemText) {
   if (-not $PemText) { return "" }
   $m = [regex]::Match($PemText, '-----BEGIN CERTIFICATE-----\s*(?<b64>.*?)\s*-----END CERTIFICATE-----', 'Singleline')
@@ -1569,6 +1582,7 @@ if ($dir -and -not (Test-Path $dir)) {
 # passing an Encoding object because older Windows PowerShell hosts can construct it as null.
 $outFile = [System.IO.Path]::GetFullPath($Output)
 [System.IO.File]::WriteAllText($outFile, $toml)
+Repair-AgentTomlAcl -Path $outFile
 Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_id) server.address=$saddr)"
 
 if (-not $SkipHealthCheck) {
