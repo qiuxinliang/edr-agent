@@ -695,7 +695,8 @@ begin
   Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_agent_postinstall_verify.ps1') + '"'
     + ' -InstallDir "' + ExpandConstant('{app}') + '"'
     + ' -ConfigPath "' + ExpandConstant('{app}\agent.toml') + '"'
-    + ' -ReportPath "' + EdrDiagnosticsFile('install_runtime_verify.json') + '"';
+    + ' -ReportPath "' + EdrDiagnosticsFile('install_runtime_verify.json') + '"'
+    + ' -LogPath "' + EdrDiagnosticsFile('install_runtime_verify.log') + '"';
 end;
 
 function EdrHealthSummaryPsParameters: string;

@@ -12,6 +12,7 @@ param(
   [string]$InstallDir = $(if ($env:EDR_INSTALL_DIR) { $env:EDR_INSTALL_DIR } else { "C:\Program Files\FDSecurity" }),
   [string]$ConfigPath = "",
   [string]$ReportPath = "",
+  [string]$LogPath = "",
   [int]$PolicyTimeoutSec = 8
 )
 
@@ -22,6 +23,25 @@ if (-not $ConfigPath) {
 }
 if (-not $ReportPath) {
   $ReportPath = Join-Path $InstallDir "install_runtime_verify.json"
+}
+if (-not $LogPath) {
+  $reportDirForLog = Split-Path -Parent ([System.IO.Path]::GetFullPath($ReportPath))
+  if (-not $reportDirForLog) { $reportDirForLog = $InstallDir }
+  $LogPath = Join-Path $reportDirForLog "install_runtime_verify.log"
+}
+
+function Write-VerifyLog {
+  param([string]$Message)
+  try {
+    $path = [System.IO.Path]::GetFullPath($LogPath)
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    Add-Content -LiteralPath $path -Value ("{0:o} {1}" -f (Get-Date).ToUniversalTime(), $Message) -Encoding UTF8
+  } catch {
+    Write-Warning ("postinstall verifier could not write log: " + $_.Exception.Message)
+  }
 }
 
 function Read-TomlString {
@@ -170,13 +190,21 @@ function Write-Report {
   if ($dir -and -not (Test-Path -LiteralPath $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
   }
-  $Report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+  $json = $Report | ConvertTo-Json -Depth 8
+  try {
+    $json | Set-Content -LiteralPath $path -Encoding UTF8
+  } catch {
+    Write-VerifyLog ("report Set-Content failed: " + $_.Exception.Message)
+    [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+  }
+  Write-VerifyLog ("report=" + $path)
   Write-Host "postinstall_verify_report=$path"
 }
 
 trap {
   $err = $_
   $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+  Write-VerifyLog ("ERROR " + $msg)
   try {
     if (-not $script:checks) {
       $script:checks = New-Object System.Collections.Generic.List[object]
@@ -206,11 +234,13 @@ trap {
     Write-Report -Report $fallbackReport
   } catch {
     Write-Warning ("postinstall verifier could not write failure report: " + $_.Exception.Message)
+    Write-VerifyLog ("ERROR failure report write failed: " + $_.Exception.Message)
   }
   Write-Host ("post-install verification exception; report={0}; error={1}" -f $ReportPath, $msg)
   exit 1
 }
 
+Write-VerifyLog ("start install_dir={0} config={1} report={2}" -f $InstallDir, $ConfigPath, $ReportPath)
 $checks = New-Object System.Collections.Generic.List[object]
 $configExists = Test-Path -LiteralPath $ConfigPath
 $configStatus = if ($configExists) { "ok" } else { "failed" }
@@ -245,6 +275,7 @@ $policyMessage = "runtime_policy_url missing"
 $policyVersion = ""
 if ($runtimePolicyUrl) {
   try {
+    Write-VerifyLog ("runtime_policy_pull url=" + $runtimePolicyUrl)
     $headers = @{}
     if ($endpointId) { $headers["X-Endpoint-ID"] = $endpointId }
     if ($tenantId) { $headers["X-Tenant-ID"] = $tenantId }
@@ -256,6 +287,7 @@ if ($runtimePolicyUrl) {
   } catch {
     $policyStatus = "warning"
     $policyMessage = "policy pull failed: $($_.Exception.Message)"
+    Write-VerifyLog ($policyMessage)
   }
 }
 $checks.Add((New-Check -Name "runtime_policy_pull" -Status $policyStatus -Message $policyMessage)) | Out-Null
@@ -265,11 +297,25 @@ foreach ($procName in @("FDSensor", "edr_agent")) {
   $procCount += @((Get-Process -Name $procName -ErrorAction SilentlyContinue)).Count
 }
 $taskState = ""
+$taskLastResult = ""
 $serviceState = ""
 try {
   foreach ($taskName in @("FDSecurityAgent", "EdrAgent")) {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task) { $taskState = [string]$task.State; break }
+    if ($task) {
+      $taskState = [string]$task.State
+      try {
+        $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($info) { $taskLastResult = [string]$info.LastTaskResult }
+      } catch {}
+      try {
+        foreach ($action in @($task.Actions)) {
+          Write-VerifyLog ("scheduled_task_action task={0} execute={1} args={2} wd={3}" -f $taskName, $action.Execute, $action.Arguments, $action.WorkingDirectory)
+        }
+        Write-VerifyLog ("scheduled_task_state task={0} state={1} last_result={2}" -f $taskName, $taskState, $taskLastResult)
+      } catch {}
+      break
+    }
   }
 } catch {}
 try {
@@ -281,8 +327,13 @@ try {
 $runtimeOk = ($procCount -gt 0 -or $taskState -or $serviceState)
 $runtimeMsg = "process_count=$procCount"
 if ($taskState) { $runtimeMsg += " scheduled_task=$taskState" }
+if ($taskLastResult) { $runtimeMsg += " task_last_result=$taskLastResult" }
 if ($serviceState) { $runtimeMsg += " service=$serviceState" }
-$runtimeStatus = if ($runtimeOk) { "ok" } else { "warning" }
+$taskResultWarn = $false
+if ($taskLastResult) {
+  try { $taskResultWarn = ([int64]$taskLastResult -ne 0) } catch { $taskResultWarn = $true }
+}
+$runtimeStatus = if (-not $runtimeOk) { "warning" } elseif ($taskResultWarn) { "warning" } else { "ok" }
 $checks.Add((New-Check -Name "runtime_presence" -Status $runtimeStatus -Message $runtimeMsg)) | Out-Null
 
 $reportDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($ReportPath))
@@ -318,6 +369,7 @@ $report = [ordered]@{
   agent_version = $agentVersion
   agent_process_running = ($procCount -gt 0)
   scheduled_task_state = $taskState
+  scheduled_task_last_result = $taskLastResult
   service_state = $serviceState
   runtime_mode = $(if ($serviceState) { "windows_service" } elseif ($taskState) { "scheduled_task" } else { "manual" })
   proxy_mode = $proxyMode
@@ -327,7 +379,9 @@ $report = [ordered]@{
 
 Write-Report -Report $report
 if ($failed -gt 0) {
+  Write-VerifyLog ("failed_checks=" + $failed)
   Write-Host "post-install verification failed; report=$ReportPath"
   exit 1
 }
+Write-VerifyLog "ok"
 exit 0

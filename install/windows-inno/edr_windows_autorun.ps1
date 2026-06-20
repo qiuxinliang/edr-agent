@@ -72,6 +72,23 @@ function Repair-ExecutableAcl {
   } catch {}
 }
 
+function Repair-RuntimeDependencyAcls {
+  param([string]$Dir)
+  if (-not (Test-Path -LiteralPath $Dir)) { return }
+  try {
+    & icacls.exe $Dir /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
+  } catch {}
+
+  foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.toml", "*.json", "*.enc", "models\*", "edr_config\*")) {
+    try {
+      Get-ChildItem -Path (Join-Path $Dir $pattern) -Force -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object {
+          try { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+  }
+}
+
 if ($Action -eq "Remove") {
   Remove-ScheduledTaskIfPresent
   Stop-AgentProcess
@@ -109,6 +126,8 @@ if ($HardenAcl) {
   Set-InstallDirAclHarden -Dir $instDir
   Set-AgentTomlAcl -Path $cfg
 }
+Repair-RuntimeDependencyAcls -Dir $instDir
+Set-AgentTomlAcl -Path $cfg
 Repair-ExecutableAcl -Path $exe
 
 $argLine = '--config "' + $cfg + '"'

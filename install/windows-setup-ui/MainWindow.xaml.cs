@@ -59,21 +59,30 @@ public partial class MainWindow : Window
     private async void OnContentRendered(object? sender, EventArgs e)
     {
         ContentRendered -= OnContentRendered;
+        var uiLog = Path.Combine(ResolveSetupUiLogDirectory(), "setup-ui.log");
+        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] content_rendered base={_baseDir}");
         LoadingPanel.Visibility = Visibility.Visible;
         LoadingText.Text = "正在定位安装包...";
         _setupPath = ResolveSetupPath();
+        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_resolved path={_setupPath} exists={File.Exists(_setupPath)} elevated={IsElevated()} arch={DescribeArchitectureForHeader()}");
         _preconfig = LoadPreconfig();
+        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] preconfig_loaded keys={_preconfig.Count}");
         await Dispatcher.Yield(DispatcherPriority.Background);
         try
         {
             LoadingText.Text = "正在初始化 WebView2...";
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_create_begin");
             _browser = new WebView2();
             BrowserHost.Children.Add(_browser);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_env_begin");
             var env = await CreateWebViewEnvironmentAsync();
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ensure_begin");
             await Browser.EnsureCoreWebView2Async(env);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ready version={Browser.CoreWebView2?.Environment.BrowserVersionString ?? ""}");
         }
         catch (Exception ex)
         {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_failed {ex}");
             var choice = MessageBox.Show(
                 "FDSecurity 图形安装向导需要 Microsoft Edge WebView2 Runtime。\n\n" +
                 "可选 fallback：\n" +
@@ -110,17 +119,23 @@ public partial class MainWindow : Window
         Browser.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
         Browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
         Browser.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
-        Browser.CoreWebView2.NavigationCompleted += (_, _) => HideLoadingPanel();
+        Browser.CoreWebView2.NavigationCompleted += (_, _) =>
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_navigation_completed");
+            HideLoadingPanel();
+        };
 
         var html = Path.Combine(_baseDir, "Assets", "installer.html");
         if (!File.Exists(html))
         {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] installer_html_missing path={html}");
             MessageBox.Show($"安装器页面缺失: {html}", "FDSecurity Setup", MessageBoxButton.OK, MessageBoxImage.Error);
             Close();
             return;
         }
 
         LoadingText.Text = "正在加载安装页面...";
+        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] installer_html_load path={html}");
         Browser.Source = new Uri(html);
     }
 
@@ -358,8 +373,10 @@ public partial class MainWindow : Window
             {
                 throw new FileNotFoundException("未找到 FDSecuritySetup.exe，请确认 UI 安装器与 setup 位于同一目录。", _setupPath);
             }
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] verify_integrity_begin setup={_setupPath}");
             await PostAsync("installProgress", new { stage = "准备安装环境", progress = 4, detail = "正在校验安装包并准备提权缓存" });
             var integrity = VerifySetupIntegrity();
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] verify_integrity_result severity={integrity.Severity} value={integrity.Value}");
             if (integrity.Severity == "fail")
             {
                 throw new InvalidOperationException(integrity.Value);
@@ -368,8 +385,12 @@ public partial class MainWindow : Window
             await PostAsync("installProgress", new { stage = "准备安装环境", progress = 6, detail = "正在生成静默安装参数" });
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] start install setup={_setupPath} dir={installPath} handoff={handoffDir}");
 
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] bootstrap_trust_begin");
             var bootstrap = await ResolveBootstrapTrustAsync(request);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] bootstrap_trust_result enabled={bootstrap.Enabled} key={bootstrap.KeyId}");
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] endpoint_normalize_begin api_base={request.ApiBase}");
             var endpoint = NormalizeEndpointInput(request.ApiBase);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] endpoint_normalized server={endpoint.ServerBase} rest={endpoint.RestBase}");
             if (string.IsNullOrWhiteSpace(request.EnrollToken))
             {
                 throw new InvalidOperationException("注册令牌不能为空");
@@ -387,11 +408,14 @@ public partial class MainWindow : Window
             var effectiveProxyUrl = BuildEffectiveProxyUrl(request);
             var effectiveRelayUrl = NormalizeOptionalRelayUrl(request.RelayUrl);
             paramsFile = WriteEnrollParamsFile(request, endpoint, effectiveProxyUrl, effectiveRelayUrl, bootstrap, installPath, handoffDir);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] enroll_params_written path={paramsFile}");
             var args = BuildInnoArguments(request, installPath, innoLog, paramsFile);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_stage_begin source={_setupPath}");
             var setupToRun = PrepareSetupForElevation(_setupPath, handoffDir, uiLog);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] prepared setup={setupToRun} params={paramsFile} inno_log={innoLog}");
             await PostAsync("installProgress", new { stage = "请求管理员权限", progress = 12, detail = "如系统弹出 UAC，请确认继续安装" });
 
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_start file={setupToRun}");
             using var proc = StartSetup(setupToRun, args);
             await PostAsync("installProgress", new { stage = "执行安装器", progress = 22, detail = "正在停止旧进程、清理运行缓存并写入配置" });
 
@@ -417,6 +441,7 @@ public partial class MainWindow : Window
                     await PostAsync("installProgress", new { stage = "安装进行中", progress, detail });
                 }
             }
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_exit code={proc.ExitCode}");
 
             if (proc.ExitCode != 0)
             {
@@ -434,6 +459,7 @@ public partial class MainWindow : Window
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
             var summary = ReadInstallSummary(installPath, innoLog, handoffDir);
             TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_complete endpoint={summary.EndpointId} tenant={summary.TenantId} health={summary.HealthStatus} diagnostics={_lastDiagnosticsPath}");
             await PostAsync("installComplete", new
             {
                 installPath,

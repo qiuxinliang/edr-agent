@@ -367,7 +367,10 @@ jobs:
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
           & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
-          $setupSrc = Join-Path $innoOut "EDRAgentSetup-bundled.exe"
+          $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
+          if (-not (Test-Path -LiteralPath $setupSrc)) {
+            $setupSrc = Join-Path $innoOut "EDRAgentSetup-bundled.exe"
+          }
           if (-not (Test-Path -LiteralPath $setupSrc)) { throw "missing bundled setup exe: $setupSrc" }
           $setupDest = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup.exe"
           Copy-Item -LiteralPath $setupSrc -Destination $setupDest -Force
