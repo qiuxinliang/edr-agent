@@ -298,6 +298,15 @@ jobs:
           $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
           if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
           if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
+          if (-not $env:EDR_AGENT_VERSION) {
+            throw "EDR_AGENT_VERSION was not resolved"
+          }
+          if (-not $text.Contains($env:EDR_AGENT_VERSION)) {
+            throw "FDSensor.exe does not contain agent version '$env:EDR_AGENT_VERSION'"
+          }
+          if ($text.Contains("0.3.0")) {
+            throw "FDSensor.exe still contains legacy agent version fallback 0.3.0"
+          }
 
       - name: sccache stats
         shell: bash
@@ -418,6 +427,17 @@ jobs:
             }
             if (-not ($entries -match '(^|/|\\)VERSION$')) {
               throw "VERSION file missing from package"
+            }
+            $versionEntry = $zipObj.Entries | Where-Object { $_.FullName -match '(^|/|\\)VERSION$' } | Select-Object -First 1
+            $reader = New-Object System.IO.StreamReader($versionEntry.Open())
+            try {
+              $packagedVersion = $reader.ReadToEnd().Trim()
+            }
+            finally {
+              $reader.Dispose()
+            }
+            if ($packagedVersion -ne $env:EDR_AGENT_VERSION) {
+              throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"

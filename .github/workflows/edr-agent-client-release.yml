@@ -276,6 +276,9 @@ jobs:
           if (-not $text.Contains($env:EDR_AGENT_VERSION)) {
             throw "FDSensor.exe does not contain release version '$env:EDR_AGENT_VERSION'"
           }
+          if ($text.Contains("0.3.0")) {
+            throw "FDSensor.exe still contains legacy agent version fallback 0.3.0"
+          }
 
       - name: sccache stats
         shell: bash

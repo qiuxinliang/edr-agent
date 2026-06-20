@@ -5,9 +5,9 @@
 .DESCRIPTION
     接收 a.b.c 格式的版本号作为唯一参数，自动扫描并更新以下文件中的版本号：
       - vcpkg.json                  (version-string)
-      - include/edr/agent_update.h (EDR_AGENT_VERSION_STRING fallback)
-      - src/transport/ingest_http.c (EDR_AGENT_VERSION_STRING fallback)
       - CMakeLists.txt              (project VERSION)
+    EDR_AGENT_VERSION_STRING 运行时版本由 CMake/CI 注入；源码 fallback 必须保持 unknown，
+    避免漏注入时伪装成真实旧版本。
     支持干跑模式（-DryRun），仅报告将会修改的内容而不实际修改文件。
 
 .PARAMETER Version
@@ -46,18 +46,6 @@ $Rules = @(
         Pattern     = '("version-string"\s*:\s*)"[^"]*"'
         Replacement = "`$1`"$Version`""
         Desc        = 'vcpkg manifest version-string'
-    },
-    @{
-        File        = 'include/edr/agent_update.h'
-        Pattern     = '(#define\s+EDR_AGENT_VERSION_STRING\s+)"[^"]*"'
-        Replacement = "`$1`"$Version`""
-        Desc        = 'EDR_AGENT_VERSION_STRING header fallback'
-    },
-    @{
-        File        = 'src/transport/ingest_http.c'
-        Pattern     = '(#define\s+EDR_AGENT_VERSION_STRING\s+)"[^"]*"'
-        Replacement = "`$1`"$Version`""
-        Desc        = 'EDR_AGENT_VERSION_STRING transport fallback'
     },
     @{
         File        = 'CMakeLists.txt'
@@ -121,6 +109,17 @@ try {
         }
         if ($CMakeText -notmatch "(?s)project\(\s*edr_agent\b.*?\bVERSION\s+$EscapedVersion\b") {
             Write-Error "CMakeLists.txt project() VERSION was not updated to $Version."
+            exit 1
+        }
+    }
+
+    foreach ($FallbackFile in @('include/edr/agent_update.h', 'src/core/agent.c', 'src/transport/ingest_http.c', 'src/transport/grpc_client_impl.cpp')) {
+        if (-not (Test-Path -LiteralPath $FallbackFile)) {
+            continue
+        }
+        $FallbackText = Get-Content -LiteralPath $FallbackFile -Raw
+        if ($FallbackText -match '#define\s+EDR_AGENT_VERSION_STRING\s+"(?!unknown")[^"]+"') {
+            Write-Error "$FallbackFile contains a concrete EDR_AGENT_VERSION_STRING fallback. Keep fallbacks as `"unknown`" and inject the real version from CMake/CI."
             exit 1
         }
     }

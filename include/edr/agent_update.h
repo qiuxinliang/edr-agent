@@ -4,7 +4,7 @@
 #include "edr/config.h"
 
 #ifndef EDR_AGENT_VERSION_STRING
-#define EDR_AGENT_VERSION_STRING "0.3.0"
+#define EDR_AGENT_VERSION_STRING "unknown"
 #endif
 
 int edr_agent_exe_path(char *out, size_t cap);
