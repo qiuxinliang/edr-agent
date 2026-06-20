@@ -265,7 +265,7 @@ jobs:
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
         run: |
-          $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe", "build\edr_agent.exe", "build\Release\edr_agent.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $exe) { throw "FDSensor.exe not found after build" }
           $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
           if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
@@ -327,15 +327,9 @@ jobs:
           $agentExe = $null
           foreach ($c in @("build\Release", "build")) {
             $preferred = Join-Path $c "FDSensor.exe"
-            $legacy = Join-Path $c "edr_agent.exe"
             if (Test-Path -LiteralPath $preferred) {
               $outDir = $c
               $agentExe = $preferred
-              break
-            }
-            if (Test-Path -LiteralPath $legacy) {
-              $outDir = $c
-              $agentExe = $legacy
               break
             }
           }

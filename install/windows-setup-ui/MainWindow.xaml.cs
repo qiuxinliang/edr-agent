@@ -596,8 +596,8 @@ public partial class MainWindow : Window
             HealthReport = File.Exists(healthPath) ? healthPath : "",
             RuntimeVerify = File.Exists(verifyPath) ? verifyPath : "",
             SetupLog = File.Exists(innoLog) ? innoLog : "",
-            EndpointId = TryReadJsonString(verifyPath, "endpoint_id"),
-            TenantId = TryReadJsonString(verifyPath, "tenant_id"),
+            EndpointId = FirstNonEmpty(TryReadJsonString(verifyPath, "endpoint_id"), TryReadJsonString(healthPath, "endpoint_id")),
+            TenantId = FirstNonEmpty(TryReadJsonString(verifyPath, "tenant_id"), TryReadJsonString(healthPath, "tenant_id")),
             PolicyUrl = TryReadJsonString(verifyPath, "runtime_policy_url"),
             PolicyVersion = TryReadJsonString(verifyPath, "policy_version"),
             P0RuleVersion = TryReadJsonString(verifyPath, "p0_rule_version"),
@@ -2094,6 +2094,18 @@ public partial class MainWindow : Window
         {
             return string.Empty;
         }
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+        return string.Empty;
     }
 
     private static bool TryReadJsonBool(string path, string property)

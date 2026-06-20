@@ -266,6 +266,53 @@ function Repair-AgentTomlAcl {
   }
 }
 
+function Repair-InstallRuntimeAcls {
+  param([string]$InstallRoot)
+  if ((Get-EnrollOs) -ne "windows") { return }
+  if (-not $InstallRoot -or -not (Test-Path -LiteralPath $InstallRoot)) { return }
+
+  $icacls = Get-Command "icacls.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $icacls) { return }
+
+  try {
+    & $icacls.Source $InstallRoot /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T /C /Q | Out-Null
+  } catch {
+    Write-Warning ("failed to grant runtime ACLs on install dir: " + $_.Exception.Message)
+  }
+
+  foreach ($sub in @("certs", "queue", "evidence", "state", "logs", "diagnostics", "upload_outbox")) {
+    $path = Join-Path $InstallRoot $sub
+    try {
+      if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+      }
+      & $icacls.Source $path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
+    } catch {
+      Write-Warning ("failed to harden runtime path ACL: " + $path + " " + $_.Exception.Message)
+    }
+  }
+
+  foreach ($sensitive in @((Join-Path $InstallRoot "agent.toml"), (Join-Path $InstallRoot "certs\*.pem"), (Join-Path $InstallRoot "certs\*.key"), (Join-Path $InstallRoot "certs\*.pfx"))) {
+    try {
+      Get-ChildItem -Path $sensitive -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+          try { & takeown.exe /F $_.FullName /A 2>$null | Out-Null } catch {}
+          try { & $icacls.Source $_.FullName /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null } catch {}
+        }
+    } catch {}
+  }
+
+  foreach ($publicPattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*", "models\*")) {
+    try {
+      Get-ChildItem -Path (Join-Path $InstallRoot $publicPattern) -Force -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object {
+          try { & $icacls.Source $_.FullName /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r "*S-1-5-32-545:RX" /C /Q | Out-Null } catch {}
+          try { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+  }
+}
+
 $av = Resolve-AgentVersion
 Write-Host "Resolved agent_version=$av"
 if ($env:EDR_MAX_EVENT_QUEUE_SIZE) {
@@ -664,6 +711,9 @@ Repair-AgentTomlAcl -Path $Output
 $existingEndpointId = Read-AgentTomlScalar -Path $Output -Key "endpoint_id"
 $existingTenantId = Read-AgentTomlScalar -Path $Output -Key "tenant_id"
 if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
+  $existingInstallRoot = Split-Path -Parent ([System.IO.Path]::GetFullPath($Output))
+  Repair-InstallRuntimeAcls -InstallRoot $existingInstallRoot
+  Repair-AgentTomlAcl -Path $Output
   if ($TrustCa) {
     Install-BootstrapCaTrust -Path $CaCertPath
   }
@@ -1628,6 +1678,8 @@ if ($dir -and -not (Test-Path $dir)) {
 # passing an Encoding object because older Windows PowerShell hosts can construct it as null.
 $outFile = [System.IO.Path]::GetFullPath($Output)
 [System.IO.File]::WriteAllText($outFile, $toml)
+Repair-AgentTomlAcl -Path $outFile
+Repair-InstallRuntimeAcls -InstallRoot $InstallDirForToml
 Repair-AgentTomlAcl -Path $outFile
 Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_id) server.address=$saddr)"
 

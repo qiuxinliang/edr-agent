@@ -89,6 +89,41 @@ function Repair-RuntimeDependencyAcls {
   }
 }
 
+function Repair-SensitiveRuntimeAcls {
+  param([string]$Dir)
+  if (-not (Test-Path -LiteralPath $Dir)) { return }
+
+  foreach ($sub in @("certs", "queue", "evidence", "state", "logs", "diagnostics", "upload_outbox")) {
+    $path = Join-Path $Dir $sub
+    try {
+      if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+      }
+      & icacls.exe $path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
+    } catch {}
+  }
+
+  foreach ($path in @((Join-Path $Dir "agent.toml"), (Join-Path $Dir "certs\*.pem"), (Join-Path $Dir "certs\*.key"), (Join-Path $Dir "certs\*.pfx"))) {
+    try {
+      Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+          try { & takeown.exe /F $_.FullName /A 2>$null | Out-Null } catch {}
+          try { & icacls.exe $_.FullName /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null } catch {}
+        }
+    } catch {}
+  }
+
+  foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*", "models\*")) {
+    try {
+      Get-ChildItem -Path (Join-Path $Dir $pattern) -Force -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object {
+          try { & icacls.exe $_.FullName /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r "*S-1-5-32-545:RX" /C /Q | Out-Null } catch {}
+          try { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+  }
+}
+
 function Quote-ForSingleQuotedPowerShell {
   param([string]$Value)
   return "'" + ($Value -replace "'", "''") + "'"
@@ -99,11 +134,15 @@ function Write-TaskLauncher {
   $launcher = Join-Path $Dir "FDSensorTaskLaunch.ps1"
   $logDir = Join-Path $Dir "logs"
   $logPath = Join-Path $logDir "startup-task.log"
+  $stdoutPath = Join-Path $logDir "startup-agent.stdout.log"
+  $stderrPath = Join-Path $logDir "startup-agent.stderr.log"
   $exeLit = Quote-ForSingleQuotedPowerShell $Exe
   $cfgLit = Quote-ForSingleQuotedPowerShell $Config
   $dirLit = Quote-ForSingleQuotedPowerShell $Dir
   $logDirLit = Quote-ForSingleQuotedPowerShell $logDir
   $logPathLit = Quote-ForSingleQuotedPowerShell $logPath
+  $stdoutPathLit = Quote-ForSingleQuotedPowerShell $stdoutPath
+  $stderrPathLit = Quote-ForSingleQuotedPowerShell $stderrPath
   $body = @"
 #Requires -Version 5.1
 `$ErrorActionPreference = "SilentlyContinue"
@@ -112,6 +151,8 @@ function Write-TaskLauncher {
 `$wd = $dirLit
 `$logDir = $logDirLit
 `$logPath = $logPathLit
+`$stdoutPath = $stdoutPathLit
+`$stderrPath = $stderrPathLit
 function Write-FDTaskLog {
   param([string]`$Message)
   try {
@@ -127,12 +168,16 @@ try {
   if (-not (Test-Path -LiteralPath `$exe)) { Write-FDTaskLog "missing_exe"; exit 2 }
   if (-not (Test-Path -LiteralPath `$cfg)) { Write-FDTaskLog "missing_config"; exit 3 }
   try { Unblock-File -LiteralPath `$exe -ErrorAction SilentlyContinue } catch {}
-  `$p = Start-Process -FilePath `$exe -ArgumentList @("--config", `$cfg) -WorkingDirectory `$wd -WindowStyle Hidden -PassThru -ErrorAction Stop
+  try { Remove-Item -LiteralPath `$stdoutPath -Force -ErrorAction SilentlyContinue } catch {}
+  try { Remove-Item -LiteralPath `$stderrPath -Force -ErrorAction SilentlyContinue } catch {}
+  `$p = Start-Process -FilePath `$exe -ArgumentList @("--config", `$cfg) -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop
   Write-FDTaskLog ("started_pid=" + `$p.Id)
   Start-Sleep -Seconds 4
   `$alive = Get-Process -Id `$p.Id -ErrorAction SilentlyContinue
   if (-not `$alive) {
-    Write-FDTaskLog "process_exited_early"
+    try { `$p.Refresh(); Write-FDTaskLog ("process_exited_early exit_code=" + `$p.ExitCode) } catch { Write-FDTaskLog "process_exited_early" }
+    try { if (Test-Path -LiteralPath `$stderrPath) { Get-Content -LiteralPath `$stderrPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stderr " + `$_) } } } catch {}
+    try { if (Test-Path -LiteralPath `$stdoutPath) { Get-Content -LiteralPath `$stdoutPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stdout " + `$_) } } } catch {}
     exit 4
   }
   Write-FDTaskLog "process_alive"
@@ -188,6 +233,7 @@ if ($HardenAcl) {
   Set-AgentTomlAcl -Path $cfg
 }
 Repair-RuntimeDependencyAcls -Dir $instDir
+Repair-SensitiveRuntimeAcls -Dir $instDir
 Set-AgentTomlAcl -Path $cfg
 Repair-ExecutableAcl -Path $exe
 

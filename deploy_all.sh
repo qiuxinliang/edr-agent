@@ -6,9 +6,9 @@ set -euo pipefail
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BACKEND_DIR="$(cd "$AGENT_DIR/../edr-backend/platform" 2>/dev/null || echo "")"
-FRONTEND_DIR="$(cd "$AGENT_DIR/../edr-frontend" 2>/dev/null || echo "")"
+AGENT_DIR="$(cd "${EDR_AGENT_DIR:-$SCRIPT_DIR}" && pwd)"
+BACKEND_DIR="${EDR_BACKEND_DIR:-$(cd "$AGENT_DIR/../edr-backend/platform" 2>/dev/null || echo "")}"
+FRONTEND_DIR="${EDR_FRONTEND_DIR:-$(cd "$AGENT_DIR/../edr-frontend" 2>/dev/null || echo "")}"
 
 TS=$(date +%Y%m%d_%H%M%S)
 echo "============================================================"
@@ -74,7 +74,12 @@ if [[ -d "$BACKEND_DIR" ]]; then
   # build.go: wire hub
   BUILD="$BACKEND_DIR/internal/server/build.go"
   if ! grep -q 'RealtimeHub: hub' "$BUILD"; then
-    sed -i '' 's/CommandHTTPOutbox: cmdHTTPOB}/CommandHTTPOutbox: cmdHTTPOB, RealtimeHub: hub}/' "$BUILD"
+    perl -0pe 's/CommandHTTPOutbox: cmdHTTPOB}/CommandHTTPOutbox: cmdHTTPOB, RealtimeHub: hub}/' "$BUILD" > "$BUILD.tmp"
+    mv "$BUILD.tmp" "$BUILD"
+    if ! grep -q 'RealtimeHub: hub' "$BUILD"; then
+      echo "  ! build.go: failed to inject RealtimeHub wiring" >&2
+      exit 1
+    fi
     echo "  + build.go: IngestHandler 注入 RealtimeHub"
   fi
 
