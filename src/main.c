@@ -10,6 +10,7 @@
 #include "edr/agent.h"
 #include "edr/ave_sdk.h"
 #include "edr/collector.h"
+#include "edr/config.h"
 #include "edr/dedup.h"
 #include "edr/event_batch.h"
 #include "edr/command.h"
@@ -422,7 +423,7 @@ static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
 
 static void print_usage(const char *argv0) {
   fprintf(stderr,
-          "Usage: %s [--config <path>] [--service] [--service-name <name>] "
+          "Usage: %s [--config <path>] [--config-test] [--service] [--service-name <name>] "
           "[--etw-uninstall-cleanup]\n",
           argv0);
   fprintf(stderr,
@@ -621,6 +622,20 @@ static int edr_agent_run_main(const char *config) {
   return e == EDR_OK ? 0 : 1;
 }
 
+static int edr_agent_config_test_main(const char *config) {
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(config ? config : "", &cfg);
+  if (e != EDR_OK) {
+    fprintf(stderr, "config test failed: %d\n", (int)e);
+    edr_config_free_heap(&cfg);
+    return 1;
+  }
+  edr_config_free_heap(&cfg);
+  fprintf(stderr, "config test ok\n");
+  return 0;
+}
+
 #ifdef _WIN32
 static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms) {
   if (!g_service_status_handle) {
@@ -666,6 +681,7 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
 int main(int argc, char **argv) {
   const char *config = NULL;
   int run_as_service = 0;
+  int config_test = 0;
 #ifdef _WIN32
   int install_mode = 0;
   int install_arg_seen = 0;
@@ -683,6 +699,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
       config = argv[++i];
+      continue;
+    }
+    if (strcmp(argv[i], "--config-test") == 0) {
+      config_test = 1;
       continue;
     }
 #ifdef _WIN32
@@ -788,6 +808,9 @@ int main(int argc, char **argv) {
   if (!config) {
     config = edr_default_windows_config_path();
   }
+  if (config_test) {
+    return edr_agent_config_test_main(config);
+  }
   if (run_as_service) {
     SERVICE_TABLE_ENTRYA table[] = {
         {(LPSTR)g_service_name, edr_service_main},
@@ -804,6 +827,10 @@ int main(int argc, char **argv) {
 #else
   (void)run_as_service;
 #endif
+
+  if (config_test) {
+    return edr_agent_config_test_main(config);
+  }
 
   return edr_agent_run_main(config);
 }

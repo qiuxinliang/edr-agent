@@ -45,6 +45,11 @@ if (-not (Test-Path -LiteralPath $binExe)) {
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
 
+$workerExe = Join-Path $BinDir "FDSecurityInstallerWorker.exe"
+if (-not (Test-Path -LiteralPath $workerExe)) {
+    Write-Warning "FDSecurityInstallerWorker.exe not found in $BinDir. The setup can still compile, but runtime stages will fall back to PowerShell."
+}
+
 $versionFile = Join-Path $BinDir "VERSION"
 $sourceVersionFile = Join-Path $agentRoot "VERSION"
 if (-not $AppVersion) {

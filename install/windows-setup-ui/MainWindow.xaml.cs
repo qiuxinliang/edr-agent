@@ -460,6 +460,11 @@ public partial class MainWindow : Window
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_summary_begin");
             var summary = ReadInstallSummary(installPath, innoLog, handoffDir);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_complete endpoint={summary.EndpointId} tenant={summary.TenantId} health={summary.HealthStatus} diagnostics={_lastDiagnosticsPath}");
+            if (summary.HealthStatus.Equals("error_runtime_not_started", StringComparison.OrdinalIgnoreCase))
+            {
+                var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
+                throw new InvalidOperationException($"Agent 运行时未成功启动{detail}");
+            }
             TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installComplete", new
             {

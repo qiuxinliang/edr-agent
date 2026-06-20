@@ -336,11 +336,17 @@ jobs:
             }
           }
           if (-not $outDir -or -not $agentExe) { throw "missing FDSensor.exe under build\Release or build" }
+          $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
           $items = New-Object System.Collections.Generic.List[string]
           if (-not $env:EDR_AGENT_VERSION) { throw "EDR_AGENT_VERSION was not resolved from the release tag" }
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
           $null = $items.Add($agentExe)
+          if (Test-Path -LiteralPath $workerExe) {
+            $null = $items.Add($workerExe)
+          } else {
+            throw "FDSecurityInstallerWorker.exe not found after build"
+          }
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @(
@@ -416,6 +422,7 @@ jobs:
               'edr_agent_zip_deploy\.ps1',
               'windows_service_install\.ps1',
               'windows_isolate_host\.ps1',
+              'FDSecurityInstallerWorker\.exe',
               'agent_windows_production\.example\.toml',
               'sensor_interest_manifest\.json'
             )) {

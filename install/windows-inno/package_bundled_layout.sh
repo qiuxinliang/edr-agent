@@ -36,6 +36,11 @@ fi
 
 # --- Binaries (Inno EDR_BIN_DIR) ---
 cp -a "$AGENT_EXE" "$OUT_DIR/FDSensor.exe"
+if [[ -f "$STAGE_DIR/FDSecurityInstallerWorker.exe" ]]; then
+  cp -a "$STAGE_DIR/FDSecurityInstallerWorker.exe" "$OUT_DIR/"
+else
+  echo "Warning: missing FDSecurityInstallerWorker.exe; installer will fall back to script stages." >&2
+fi
 shopt -s nullglob
 DLL_COUNT=0
 for f in "$STAGE_DIR"/*.dll; do

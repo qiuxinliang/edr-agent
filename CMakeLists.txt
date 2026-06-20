@@ -444,6 +444,14 @@ if(WIN32)
   endif()
 endif()
 
+if(WIN32)
+  add_executable(fd_installer_worker src/installer_worker/installer_worker_win.c)
+  set_target_properties(fd_installer_worker PROPERTIES OUTPUT_NAME "FDSecurityInstallerWorker")
+  target_compile_definitions(fd_installer_worker PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(fd_installer_worker PRIVATE advapi32 shell32 user32)
+  edr_apply_common_warnings(fd_installer_worker)
+endif()
+
 target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ave

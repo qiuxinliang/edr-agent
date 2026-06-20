@@ -71,6 +71,7 @@ Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fa
 
 [Files]
 Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
@@ -94,6 +95,7 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingD
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""; Tasks: desktopicon
 
 [UninstallRun]
+Filename: "{app}\FDSecurityInstallerWorker.exe"; Parameters: "--stage uninstall-runtime --install-dir ""{app}"" --log ""{commonappdata}\FDSecurity\setup-ui\uninstall-worker.log"""; RunOnceId: "FDSecurityNativeRuntimeRemove"; Flags: runhidden waituntilterminated; Check: InstallerWorkerPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\windows_service_install.ps1"" -Action Uninstall -InstallDir ""{app}"" -DataDir ""{app}"""; RunOnceId: "EdrServiceRemove"; Flags: runhidden waituntilterminated; Check: ServiceScriptPresentForUninstall
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\edr_windows_autorun.ps1"" -Action Remove"; RunOnceId: "EdrAutorunRemove"; Flags: runhidden waituntilterminated; Check: AutorunScriptPresentForUninstall
 
@@ -498,6 +500,25 @@ begin
   Result := '''' + V + '''';
 end;
 
+function EdrCmdQuote(const S: string): string;
+var
+  V: string;
+begin
+  V := S;
+  StringChange(V, '"', '\"');
+  Result := '"' + V + '"';
+end;
+
+function EdrInstallerWorkerPath: string;
+begin
+  Result := ExpandConstant('{app}\FDSecurityInstallerWorker.exe');
+end;
+
+function EdrInstallerWorkerExists: Boolean;
+begin
+  Result := FileExists(EdrInstallerWorkerPath);
+end;
+
 function EdrDiagnosticsFile(const FileName: string): string;
 begin
   if EdrDiagnosticsDir <> '' then
@@ -606,6 +627,11 @@ begin
   Result := EdrRunCommandStage(StageNo, StageTotal, Title, Detail, EdrPowerShellPath, Params, Critical);
 end;
 
+function EdrRunInstallerWorkerStage(StageNo, StageTotal: Integer; const Title, Detail, Params: string; Critical: Boolean): Boolean;
+begin
+  Result := EdrRunCommandStage(StageNo, StageTotal, Title, Detail, EdrInstallerWorkerPath, Params, Critical);
+end;
+
 function EdrRunNoWaitStage(StageNo, StageTotal: Integer; const Title, Detail, FileName, Params, WorkDir: string; Critical: Boolean): Boolean;
 var
   Code: Integer;
@@ -637,6 +663,76 @@ begin
   EdrSetProgress(StageNo, StageTotal, Title, Detail);
   EdrAppendStageLog('SKIP [' + Title + '] ' + Detail);
   EdrProgressPage.SetProgress(StageNo, StageTotal);
+end;
+
+function EdrWorkerBaseParams(const StageName: string): string;
+begin
+  Result := '--stage ' + StageName
+    + ' --install-dir ' + EdrCmdQuote(ExpandConstant('{app}'))
+    + ' --log ' + EdrCmdQuote(EdrDiagnosticsFile('installer-worker.log'));
+end;
+
+function EdrWorkerStopRuntimeParams: string;
+begin
+  Result := EdrWorkerBaseParams('stop-runtime');
+end;
+
+function EdrWorkerCleanCacheParams: string;
+begin
+  Result := EdrWorkerBaseParams('clean-cache')
+    + ' --report ' + EdrCmdQuote(EdrDiagnosticsFile('install_preflight_report.json'));
+  if ShouldKeepOfflineQueue then
+    Result := Result + ' --keep-offline-queue';
+  if ShouldKeepEvidenceCache then
+    Result := Result + ' --keep-evidence-cache';
+end;
+
+function EdrWorkerValidateConfigParams: string;
+begin
+  Result := EdrWorkerBaseParams('validate-config')
+    + ' --exe ' + EdrCmdQuote(ExpandConstant('{app}\{#MyAppExeName}'))
+    + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'));
+end;
+
+function EdrWorkerStartRuntimeParams: string;
+begin
+  Result := EdrWorkerBaseParams('start-runtime')
+    + ' --exe ' + EdrCmdQuote(ExpandConstant('{app}\{#MyAppExeName}'))
+    + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'));
+end;
+
+function EdrWorkerStartServiceParams: string;
+begin
+  Result := EdrWorkerBaseParams('start-service')
+    + ' --service-name ' + EdrCmdQuote('{#MyServiceName}');
+end;
+
+function EdrWorkerInstallServiceParams: string;
+begin
+  Result := EdrWorkerBaseParams('install-service')
+    + ' --exe ' + EdrCmdQuote(ExpandConstant('{app}\{#MyAppExeName}'))
+    + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'))
+    + ' --service-name ' + EdrCmdQuote('{#MyServiceName}')
+    + ' --display-name ' + EdrCmdQuote('FDSecurity Endpoint Agent');
+end;
+
+function EdrWorkerInstallAutorunParams: string;
+begin
+  Result := EdrWorkerBaseParams('install-autorun')
+    + ' --exe ' + EdrCmdQuote(ExpandConstant('{app}\{#MyAppExeName}'))
+    + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'));
+end;
+
+function EdrWorkerHardenAclParams: string;
+begin
+  Result := EdrWorkerBaseParams('harden-acl');
+end;
+
+function EdrWorkerHealthSummaryParams: string;
+begin
+  Result := EdrWorkerBaseParams('write-health-summary')
+    + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'))
+    + ' --report ' + EdrCmdQuote(EdrDiagnosticsFile('install_health_report.json'));
 end;
 
 function EdrStopRuntimePsParameters: string;
@@ -684,6 +780,8 @@ begin
     + 'if($icacls){try { & $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null } catch {}};'
     + '$raw=[System.IO.File]::ReadAllText($cfg);'
     + 'if([string]::IsNullOrWhiteSpace($raw)){throw ''agent.toml is empty''};'
+    + '$bad=0;$ln=0;foreach($line in [System.IO.File]::ReadLines($cfg)){$ln++;$t=$line.Trim();if($ln -eq 1 -and $t.Length -gt 0 -and [int][char]$t[0] -eq 65279){$t=$t.Substring(1)};if($t -eq '''' -or $t.StartsWith(''#'')){continue};if($t.StartsWith(''['') -and $t.EndsWith('']'')){continue};if(-not $t.Contains(''='')){$bad=$ln;break}};if($bad -gt 0){throw (''agent.toml syntax sanity failed at line ''+$bad)};'
+    + '$exe=Join-Path $app ''FDSensor.exe'';if(Test-Path -LiteralPath $exe){& $exe --config $cfg --config-test;if($LASTEXITCODE -ne 0){throw (''agent config-test failed exit=''+$LASTEXITCODE)}};'
     + '$sha=(Get-FileHash -Algorithm SHA256 -LiteralPath $cfg -ErrorAction SilentlyContinue).Hash;'
     + 'Write-Host (''agent.toml present size=''+(Get-Item -LiteralPath $cfg).Length+'' sha256=''+$sha);'
     + 'if($icacls){try { & $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null } catch {}}'
@@ -827,7 +925,7 @@ begin
     + 'try { if(Test-Path -LiteralPath $startupLog){Get-Content -LiteralPath $startupLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { L (''task_launcher ''+$_) }} } catch {};'
     + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
     + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
-    + 'try { $agentArgs=''--config ''+(''"''+($cfg -replace ''"'',''\"'')+''"''); $p=Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id+'' args=''+$agentArgs) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
+    + 'try { $q=[char]34;$agentArgs=''--config ''+$q+$cfg+$q; $p=Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id+'' args=''+$agentArgs) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 2;'
     + '};'
     + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
@@ -851,7 +949,7 @@ begin
     + 'try { if($icacls){& $icacls.Source $cfg /inheritance:r /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /C /Q | Out-Null} } catch {};'
     + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
     + 'Start-Sleep -Seconds 1;'
-    + '$agentArgs=''--config ''+(''"''+($cfg -replace ''"'',''\"'')+''"'');'
+    + '$q=[char]34;$agentArgs=''--config ''+$q+$cfg+$q;'
     + '$p=Start-Process -FilePath $exe'
     + ' -ArgumentList $agentArgs'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
@@ -890,10 +988,20 @@ begin
   Enrolled := EnrollParamsFileExists;
 
   EdrProgressPage.Show;
-  if not EdrRunPowerShellStage(1, Total, 'Stop old Agent runtime', 'Stopping service/process and removing stale PID files.', EdrStopRuntimePsParameters, True) then
+  if EdrInstallerWorkerExists then
+  begin
+    if not EdrRunInstallerWorkerStage(1, Total, 'Stop old Agent runtime', 'Stopping service/process and removing stale PID files.', EdrWorkerStopRuntimeParams, True) then
+      EdrAbortInstall;
+  end
+  else if not EdrRunPowerShellStage(1, Total, 'Stop old Agent runtime', 'Stopping service/process and removing stale PID files.', EdrStopRuntimePsParameters, True) then
     EdrAbortInstall;
 
-  if not EdrRunPowerShellStage(2, Total, 'Clean runtime cache', 'Cleaning queue locks and local evidence cache according to selected options.', PreflightPsParameters(''), True) then
+  if EdrInstallerWorkerExists then
+  begin
+    if not EdrRunInstallerWorkerStage(2, Total, 'Clean runtime cache', 'Cleaning queue locks and local evidence cache according to selected options.', EdrWorkerCleanCacheParams, True) then
+      EdrAbortInstall;
+  end
+  else if not EdrRunPowerShellStage(2, Total, 'Clean runtime cache', 'Cleaning queue locks and local evidence cache according to selected options.', PreflightPsParameters(''), True) then
     EdrAbortInstall;
 
   if Enrolled then
@@ -907,22 +1015,42 @@ begin
       EdrAbortInstall;
   end;
 
-  if not EdrRunPowerShellStage(4, Total, 'Validate configuration', 'Ensuring agent.toml exists and applying protected ACLs.', EdrEnsureTomlPsParameters, True) then
+  if EdrInstallerWorkerExists then
+  begin
+    if not EdrRunInstallerWorkerStage(4, Total, 'Validate configuration', 'Ensuring agent.toml exists and is parseable.', EdrWorkerValidateConfigParams, True) then
+      EdrAbortInstall;
+  end
+  else if not EdrRunPowerShellStage(4, Total, 'Validate configuration', 'Ensuring agent.toml exists and applying protected ACLs.', EdrEnsureTomlPsParameters, True) then
     EdrAbortInstall;
 
   if WizardIsTaskSelected('windowsservice') then
   begin
-    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing native Windows service for FDSecurity.', WindowsServiceInstallPsParameters(''), True) then
+    if EdrInstallerWorkerExists then
+    begin
+      if not EdrRunInstallerWorkerStage(5, Total, 'Install service/startup task', 'Installing native Windows service for FDSecurity.', EdrWorkerInstallServiceParams, True) then
+        EdrAbortInstall;
+    end
+    else if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing native Windows service for FDSecurity.', WindowsServiceInstallPsParameters(''), True) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('windowsautorun') then
   begin
-    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for FDSecurity.', AutorunInstallPsParameters(''), True) then
+    if EdrInstallerWorkerExists then
+    begin
+      if not EdrRunInstallerWorkerStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for FDSecurity.', EdrWorkerInstallAutorunParams, True) then
+        EdrAbortInstall;
+    end
+    else if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for FDSecurity.', AutorunInstallPsParameters(''), True) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('hardeninstalldir') then
   begin
-    if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Applying install directory ACL hardening.', EdrHardenAclPsParameters, True) then
+    if EdrInstallerWorkerExists then
+    begin
+      if not EdrRunInstallerWorkerStage(5, Total, 'Install service/startup task', 'Applying install directory ACL hardening.', EdrWorkerHardenAclParams, True) then
+        EdrAbortInstall;
+    end
+    else if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Applying install directory ACL hardening.', EdrHardenAclPsParameters, True) then
       EdrAbortInstall;
   end
   else
@@ -930,24 +1058,44 @@ begin
 
   if WizardIsTaskSelected('windowsservice') then
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrStartServicePsParameters, False) then
+    if EdrInstallerWorkerExists then
+    begin
+      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrWorkerStartServiceParams, False) then
+        EdrAbortInstall;
+    end
+    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrStartServicePsParameters, False) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('windowsautorun') then
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent scheduled task.', EdrStartScheduledTaskPsParameters, False) then
+    if EdrInstallerWorkerExists then
+    begin
+      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrWorkerStartRuntimeParams, False) then
+        EdrAbortInstall;
+    end
+    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent scheduled task.', EdrStartScheduledTaskPsParameters, False) then
       EdrAbortInstall;
   end
   else
   begin
-    if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrStartManualPsParameters, False) then
+    if EdrInstallerWorkerExists then
+    begin
+      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrWorkerStartRuntimeParams, False) then
+        EdrAbortInstall;
+    end
+    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrStartManualPsParameters, False) then
       EdrAbortInstall;
   end;
 
   if not EdrRunPowerShellStage(7, Total, 'Pull runtime policy', 'Verifying endpoint identity and pulling runtime policy when reachable.', EdrPolicyVerifyPsParameters, False) then
     EdrAbortInstall;
 
-  if not EdrRunPowerShellStage(8, Total, 'Write health summary', 'Writing installation health report and diagnostics bundle.', EdrHealthSummaryPsParameters, False) then
+  if EdrInstallerWorkerExists then
+  begin
+    if not EdrRunInstallerWorkerStage(8, Total, 'Write health summary', 'Writing installation health report and diagnostics bundle.', EdrWorkerHealthSummaryParams, False) then
+      EdrAbortInstall;
+  end
+  else if not EdrRunPowerShellStage(8, Total, 'Write health summary', 'Writing installation health report and diagnostics bundle.', EdrHealthSummaryPsParameters, False) then
     EdrAbortInstall;
 
   EdrCreateDiagnosticsBundle;
@@ -999,12 +1147,17 @@ begin
   end;
 end;
 
+function InstallerWorkerPresentForUninstall: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\FDSecurityInstallerWorker.exe'));
+end;
+
 function AutorunScriptPresentForUninstall: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
+  Result := (not InstallerWorkerPresentForUninstall) and FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
 end;
 
 function ServiceScriptPresentForUninstall: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
+  Result := (not InstallerWorkerPresentForUninstall) and FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
 end;
