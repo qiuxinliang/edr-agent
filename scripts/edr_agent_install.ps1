@@ -245,6 +245,86 @@ function Read-AgentTomlScalar {
   return ""
 }
 
+function Get-ExistingAgentTomlSanityIssue {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return "missing TOML"
+  }
+  try {
+    $raw = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($Path)))
+  } catch {
+    return ("unreadable TOML: " + $_.Exception.Message)
+  }
+  if ([string]::IsNullOrWhiteSpace($raw)) {
+    return "empty TOML"
+  }
+  $lines = ($raw -replace "`r`n", "`n").Split([string[]]@("`n"), [System.StringSplitOptions]::None)
+  for ($idx = 0; $idx -lt $lines.Count; $idx++) {
+    $t = $lines[$idx].Trim()
+    if ($idx -eq 0 -and $t.Length -gt 0 -and [int][char]$t[0] -eq 0xFEFF) {
+      $t = $t.Substring(1).TrimStart()
+    }
+    if ($t -eq "" -or $t.StartsWith("#")) {
+      continue
+    }
+    if ($t.StartsWith("[") -and $t.EndsWith("]")) {
+      continue
+    }
+    if (-not $t.Contains("=")) {
+      $near = ($t -replace '\s+', ' ').Trim()
+      if ($near.Length -gt 120) {
+        $near = $near.Substring(0, 120) + "..."
+      }
+      return ("line {0}: missing = near '{1}'" -f ($idx + 1), $near)
+    }
+  }
+  return ""
+}
+
+function Test-ExistingAgentTomlWithAgent {
+  param([string]$InstallRoot, [string]$ConfigPath)
+  if (-not $InstallRoot -or -not $ConfigPath) {
+    return ""
+  }
+  foreach ($exeName in @("FDSensor.exe", "edr_agent.exe")) {
+    $exe = Join-Path $InstallRoot $exeName
+    if (-not (Test-Path -LiteralPath $exe)) {
+      continue
+    }
+    try {
+      $out = (& $exe "--config" $ConfigPath "--config-test" 2>&1 | Out-String).Trim()
+      if ($LASTEXITCODE -eq 0) {
+        return ""
+      }
+      if ($out.Length -gt 240) {
+        $out = $out.Substring(0, 240) + "..."
+      }
+      return ("agent parser rejected existing TOML with {0}: {1}" -f $exeName, $out)
+    } catch {
+      return ("agent parser execution failed with {0}: {1}" -f $exeName, $_.Exception.Message)
+    }
+  }
+  return ""
+}
+
+function Backup-InvalidAgentToml {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return ""
+  }
+  try {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $dir = Split-Path -Parent $full
+    $stamp = Get-Date -Format "yyyyMMddHHmmss"
+    $backup = Join-Path $dir ("agent.toml.invalid." + $stamp)
+    Move-Item -LiteralPath $full -Destination $backup -Force
+    return $backup
+  } catch {
+    Write-Warning ("failed to backup invalid agent.toml: " + $_.Exception.Message)
+    return ""
+  }
+}
+
 function Repair-AgentTomlAcl {
   param([string]$Path)
   if ((Get-EnrollOs) -ne "windows") { return }
@@ -714,17 +794,29 @@ if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
   $existingInstallRoot = Split-Path -Parent ([System.IO.Path]::GetFullPath($Output))
   Repair-InstallRuntimeAcls -InstallRoot $existingInstallRoot
   Repair-AgentTomlAcl -Path $Output
-  if ($TrustCa) {
-    Install-BootstrapCaTrust -Path $CaCertPath
+  $existingTomlIssue = Get-ExistingAgentTomlSanityIssue -Path $Output
+  if (-not $existingTomlIssue) {
+    $existingTomlIssue = Test-ExistingAgentTomlWithAgent -InstallRoot $existingInstallRoot -ConfigPath $Output
   }
-  if ($ConfigureSensorPolicy) {
-    Enable-WindowsSensorPolicy
+  if ($existingTomlIssue) {
+    Write-Warning ("Existing agent.toml is invalid ({0}); backing it up and re-enrolling." -f $existingTomlIssue)
+    $backupPath = Backup-InvalidAgentToml -Path $Output
+    if ($backupPath) {
+      Write-Warning ("Invalid agent.toml moved to " + $backupPath)
+    }
+  } else {
+    if ($TrustCa) {
+      Install-BootstrapCaTrust -Path $CaCertPath
+    }
+    if ($ConfigureSensorPolicy) {
+      Enable-WindowsSensorPolicy
+    }
+    if ($InstallAutorun) {
+      Install-AgentAutorun
+    }
+    Write-Host "Existing agent.toml found (endpoint_id=$existingEndpointId tenant_id=$existingTenantId); skipped enroll. Use -ForceEnroll or EDR_FORCE_ENROLL=1 to re-enroll."
+    exit 0
   }
-  if ($InstallAutorun) {
-    Install-AgentAutorun
-  }
-  Write-Host "Existing agent.toml found (endpoint_id=$existingEndpointId tenant_id=$existingTenantId); skipped enroll. Use -ForceEnroll or EDR_FORCE_ENROLL=1 to re-enroll."
-  exit 0
 }
 
 $keyProviderNorm = Normalize-KeyProvider $KeyProvider
