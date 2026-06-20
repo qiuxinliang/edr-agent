@@ -170,6 +170,18 @@ static int edr_agent_config_signature_required(const EdrConfig *cfg) {
   return cfg && cfg->config_signing.signature_required;
 }
 
+static const char *edr_agent_config_signing_key_id(const EdrConfig *cfg) {
+  const char *v = getenv("EDR_AGENT_CONFIG_SIGNING_KEY_ID");
+  if (v && v[0]) {
+    return v;
+  }
+  if (cfg && cfg->config_signing.signing_key_id[0]) {
+    return cfg->config_signing.signing_key_id;
+  }
+  return "";
+}
+
+#ifdef EDR_HAVE_OPENSSL_HTTP
 static const char *edr_agent_config_signing_secret(void) {
   const char *v = getenv("EDR_AGENT_CONFIG_SIGNING_SECRET");
   if (v && v[0]) {
@@ -185,17 +197,6 @@ static const char *edr_agent_config_public_key_pem(const EdrConfig *cfg) {
   }
   if (cfg && cfg->config_signing.public_key_pem[0]) {
     return cfg->config_signing.public_key_pem;
-  }
-  return "";
-}
-
-static const char *edr_agent_config_signing_key_id(const EdrConfig *cfg) {
-  const char *v = getenv("EDR_AGENT_CONFIG_SIGNING_KEY_ID");
-  if (v && v[0]) {
-    return v;
-  }
-  if (cfg && cfg->config_signing.signing_key_id[0]) {
-    return cfg->config_signing.signing_key_id;
   }
   return "";
 }
@@ -258,6 +259,7 @@ static void b64url_encode(const unsigned char *in, size_t in_len, char *out, siz
   }
   out[o < out_cap ? o : out_cap - 1u] = '\0';
 }
+#endif
 
 static time_t edr_agent_timegm_utc(struct tm *tmv) {
 #ifdef _WIN32
@@ -392,7 +394,9 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
   long long seq;
   long long seen;
   const char *trusted_key_id;
+#ifdef EDR_HAVE_OPENSSL_HTTP
   const char *public_key_pem;
+#endif
   if (reason && reason_cap) reason[0] = '\0';
   if (!headers || !headers->signature[0] || !headers->signed_payload_b64[0] || !headers->sequence[0] || !headers->config_hash[0]) {
     if (edr_agent_config_signature_required(cfg)) {
@@ -420,8 +424,8 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
     snprintf(reason, reason_cap, "config rollback detected sequence=%lld seen=%lld", seq, seen);
     return -1;
   }
-  public_key_pem = edr_agent_config_public_key_pem(cfg);
 #ifdef EDR_HAVE_OPENSSL_HTTP
+  public_key_pem = edr_agent_config_public_key_pem(cfg);
   if (public_key_pem && public_key_pem[0]) {
     unsigned char payload[2048];
     size_t payload_len = 0u;
@@ -546,11 +550,588 @@ struct EdrAgent {
   time_t config_mtime;
   int shutdown;
   int collector_started;
+  int config_recovery_active;
+  int config_recovery_safe_mode;
+  int config_recovery_last_good_used;
+  int config_recovery_fields_extracted;
+  int config_recovery_auto_repaired;
+  char config_recovery_mode[48];
+  char config_recovery_reason[256];
+  char config_recovery_source[1024];
+  char config_recovery_recovered_path[1024];
+  char config_recovery_backup_path[1024];
   /** §19.8 周期快照：上次全量定时采集单调时钟（ns） */
   uint64_t asurf_last_post_ns;
   /** §19.6 上次轮询 refresh-request 的时间（ns） */
   uint64_t asurf_last_pending_check_ns;
 };
+
+static void edr_agent_clear_config_recovery(EdrAgent *agent) {
+  if (!agent) {
+    return;
+  }
+  agent->config_recovery_active = 0;
+  agent->config_recovery_safe_mode = 0;
+  agent->config_recovery_last_good_used = 0;
+  agent->config_recovery_fields_extracted = 0;
+  agent->config_recovery_auto_repaired = 0;
+  snprintf(agent->config_recovery_mode, sizeof(agent->config_recovery_mode), "%s", "normal");
+  agent->config_recovery_reason[0] = '\0';
+  agent->config_recovery_source[0] = '\0';
+  agent->config_recovery_recovered_path[0] = '\0';
+  agent->config_recovery_backup_path[0] = '\0';
+}
+
+static void edr_agent_copy_string(char *dst, size_t cap, const char *src) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  snprintf(dst, cap, "%s", src ? src : "");
+}
+
+static const char *edr_agent_path_sep_for(const char *path) {
+  return (path && strchr(path, '\\')) ? "\\" : "/";
+}
+
+static void edr_agent_config_dir(const char *config_path, char *out, size_t cap) {
+  const char *last1;
+  const char *last2;
+  const char *last;
+  size_t n;
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!config_path || !config_path[0]) {
+    snprintf(out, cap, "%s", ".");
+    return;
+  }
+  last1 = strrchr(config_path, '/');
+  last2 = strrchr(config_path, '\\');
+  last = last1;
+  if (last2 && (!last || last2 > last)) {
+    last = last2;
+  }
+  if (!last) {
+    snprintf(out, cap, "%s", ".");
+    return;
+  }
+  n = (size_t)(last - config_path);
+  if (n == 0u) {
+    n = 1u;
+  }
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, config_path, n);
+  out[n] = '\0';
+}
+
+static void edr_agent_join_path(const char *dir, const char *name, char *out, size_t cap) {
+  const char *sep;
+  size_t len;
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!dir || !dir[0]) {
+    snprintf(out, cap, "%s", name ? name : "");
+    return;
+  }
+  sep = edr_agent_path_sep_for(dir);
+  len = strlen(dir);
+  if (len > 0u && (dir[len - 1u] == '/' || dir[len - 1u] == '\\')) {
+    snprintf(out, cap, "%s%s", dir, name ? name : "");
+  } else {
+    snprintf(out, cap, "%s%s%s", dir, sep, name ? name : "");
+  }
+}
+
+static int edr_agent_ensure_dir(const char *path) {
+  struct stat st;
+  if (!path || !path[0]) {
+    return -1;
+  }
+  if (stat(path, &st) == 0) {
+    return 0;
+  }
+#ifdef _WIN32
+  return CreateDirectoryA(path, NULL) ? 0 : -1;
+#else
+  return mkdir(path, 0700);
+#endif
+}
+
+static void edr_agent_state_file_path(const char *config_path, const char *name, char *out, size_t cap) {
+  char dir[1024];
+  char state_dir[1024];
+  edr_agent_config_dir(config_path, dir, sizeof(dir));
+  edr_agent_join_path(dir, "state", state_dir, sizeof(state_dir));
+  (void)edr_agent_ensure_dir(state_dir);
+  edr_agent_join_path(state_dir, name, out, cap);
+}
+
+static void edr_agent_neighbor_file_path(const char *config_path, const char *suffix, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!config_path || !config_path[0]) {
+    snprintf(out, cap, "%s", suffix ? suffix : "");
+    return;
+  }
+  snprintf(out, cap, "%s%s", config_path, suffix ? suffix : "");
+}
+
+static int edr_agent_copy_file(const char *src, const char *dst) {
+  FILE *in;
+  FILE *out;
+  unsigned char buf[8192];
+  if (!src || !src[0] || !dst || !dst[0]) {
+    return -1;
+  }
+  in = fopen(src, "rb");
+  if (!in) {
+    return -1;
+  }
+  out = fopen(dst, "wb");
+  if (!out) {
+    fclose(in);
+    return -1;
+  }
+  for (;;) {
+    size_t n = fread(buf, 1u, sizeof(buf), in);
+    if (n > 0u && fwrite(buf, 1u, n, out) != n) {
+      fclose(in);
+      fclose(out);
+      return -1;
+    }
+    if (n < sizeof(buf)) {
+      if (ferror(in)) {
+        fclose(in);
+        fclose(out);
+        return -1;
+      }
+      break;
+    }
+  }
+  fclose(in);
+  fclose(out);
+  return 0;
+}
+
+static void edr_agent_toml_escape(const char *in, char *out, size_t cap) {
+  size_t o = 0u;
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!in) {
+    out[0] = '\0';
+    return;
+  }
+  for (const unsigned char *p = (const unsigned char *)in; *p && o + 1u < cap; p++) {
+    if (*p == '\\' || *p == '"') {
+      if (o + 2u >= cap) {
+        break;
+      }
+      out[o++] = '\\';
+      out[o++] = (char)*p;
+    } else if (*p == '\r' || *p == '\n') {
+      if (o + 2u >= cap) {
+        break;
+      }
+      out[o++] = '\\';
+      out[o++] = 'n';
+    } else {
+      out[o++] = (char)*p;
+    }
+  }
+  out[o] = '\0';
+}
+
+static void edr_agent_write_toml_string(FILE *fp, const char *key, const char *value) {
+  char esc[2048];
+  edr_agent_toml_escape(value, esc, sizeof(esc));
+  fprintf(fp, "%s = \"%s\"\n", key, esc);
+}
+
+static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cfg) {
+  char tmp_path[1100];
+  FILE *fp;
+  EdrConfig check;
+  EdrError ce;
+  if (!path || !path[0] || !cfg) {
+    return -1;
+  }
+  snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+  fp = fopen(tmp_path, "wb");
+  if (!fp) {
+    return -1;
+  }
+  fprintf(fp, "# Generated by FDSensor config recovery. Do not edit while Agent is running.\n");
+  fprintf(fp, "\n[server]\n");
+  edr_agent_write_toml_string(fp, "address", cfg->server.address);
+  fprintf(fp, "grpc_enabled = %s\n", cfg->server.grpc_enabled ? "true" : "false");
+  fprintf(fp, "grpc_insecure = %s\n", cfg->server.grpc_insecure ? "true" : "false");
+  edr_agent_write_toml_string(fp, "ca_cert", cfg->server.ca_cert);
+  edr_agent_write_toml_string(fp, "client_cert", cfg->server.client_cert);
+  edr_agent_write_toml_string(fp, "client_key", cfg->server.client_key);
+  edr_agent_write_toml_string(fp, "client_key_provider", cfg->server.client_key_provider);
+  fprintf(fp, "\n[agent]\n");
+  edr_agent_write_toml_string(fp, "endpoint_id", cfg->agent.endpoint_id);
+  edr_agent_write_toml_string(fp, "tenant_id", cfg->agent.tenant_id);
+  fprintf(fp, "\n[platform]\n");
+  edr_agent_write_toml_string(fp, "rest_base_url", cfg->platform.rest_base_url);
+  edr_agent_write_toml_string(fp, "relay_url", cfg->platform.relay_url);
+  edr_agent_write_toml_string(fp, "proxy_mode", cfg->platform.proxy_mode);
+  edr_agent_write_toml_string(fp, "proxy_url", cfg->platform.proxy_url);
+  edr_agent_write_toml_string(fp, "rest_bearer_token", cfg->platform.rest_bearer_token);
+  fprintf(fp, "http2_enabled = %s\n", cfg->platform.http2_enabled ? "true" : "false");
+  fprintf(fp, "control_stream_enabled = %s\n", cfg->platform.control_stream_enabled ? "true" : "false");
+  fprintf(fp, "long_poll_fallback = %s\n", cfg->platform.long_poll_fallback ? "true" : "false");
+  fprintf(fp, "report_events_v2_enabled = %s\n", cfg->platform.report_events_v2_enabled ? "true" : "false");
+  fprintf(fp, "\n[collection]\n");
+  fprintf(fp, "etw_enabled = %s\n", cfg->collection.etw_enabled ? "true" : "false");
+  fprintf(fp, "etw_powershell_provider = %s\n", cfg->collection.etw_powershell_provider ? "true" : "false");
+  fprintf(fp, "etw_amsi_provider = %s\n", cfg->collection.etw_amsi_provider ? "true" : "false");
+  fprintf(fp, "etw_security_audit_provider = %s\n", cfg->collection.etw_security_audit_provider ? "true" : "false");
+  fprintf(fp, "max_event_queue_size = %u\n", cfg->collection.max_event_queue_size);
+  fprintf(fp, "adaptive_enabled = %s\n", cfg->collection.adaptive_enabled ? "true" : "false");
+  fprintf(fp, "\n[offline]\n");
+  edr_agent_write_toml_string(fp, "queue_db_path", cfg->offline.queue_db_path);
+  edr_agent_write_toml_string(fp, "evidence_cache_path", cfg->offline.evidence_cache_path);
+  fprintf(fp, "max_queue_size_mb = %u\n", cfg->offline.max_queue_size_mb);
+  fprintf(fp, "evidence_cache_max_size_mb = %u\n", cfg->offline.evidence_cache_max_size_mb);
+  fprintf(fp, "\n[resource_limit]\n");
+  fprintf(fp, "cpu_limit_percent = %u\n", cfg->resource_limit.cpu_limit_percent);
+  fprintf(fp, "memory_limit_mb = %u\n", cfg->resource_limit.memory_limit_mb);
+  fprintf(fp, "behavior_infer_per_min = %u\n", cfg->resource_limit.behavior_infer_per_min);
+  fprintf(fp, "pmfe_scans_per_min = %u\n", cfg->resource_limit.pmfe_scans_per_min);
+  fprintf(fp, "\n[health_monitor]\n");
+  fprintf(fp, "enabled = %s\n", cfg->health_monitor.enabled ? "true" : "false");
+  edr_agent_write_toml_string(fp, "profile", cfg->health_monitor.profile);
+  fprintf(fp, "interval_s = %u\n", cfg->health_monitor.interval_s);
+  fprintf(fp, "expires_at_unix_ms = %llu\n", (unsigned long long)cfg->health_monitor.expires_at_unix_ms);
+  edr_agent_write_toml_string(fp, "request_id", cfg->health_monitor.request_id);
+  fprintf(fp, "\n[command]\n");
+  fprintf(fp, "allow_dangerous = %s\n", cfg->command.allow_dangerous ? "true" : "false");
+  fprintf(fp, "allow_rtq_readonly = %s\n", cfg->command.allow_rtq_readonly ? "true" : "false");
+  edr_agent_write_toml_string(fp, "signing_public_key_path", cfg->command.signing_public_key_path);
+  fprintf(fp, "\n[ave]\n");
+  fprintf(fp, "enabled = %s\n", cfg->ave.enabled ? "true" : "false");
+  edr_agent_write_toml_string(fp, "model_dir", cfg->ave.model_dir);
+  fprintf(fp, "static_model_enabled = %s\n", cfg->ave.static_model_enabled ? "true" : "false");
+  fprintf(fp, "behavior_monitor_enabled = %s\n", cfg->ave.behavior_monitor_enabled ? "true" : "false");
+  fprintf(fp, "\n[attack_surface]\n");
+  fprintf(fp, "enabled = %s\n", cfg->attack_surface.enabled ? "true" : "false");
+  fprintf(fp, "\n[shellcode_detector]\n");
+  fprintf(fp, "enabled = %s\n", cfg->shellcode_detector.enabled ? "true" : "false");
+  fprintf(fp, "\n[webshell_detector]\n");
+  fprintf(fp, "enabled = %s\n", cfg->webshell_detector.enabled ? "true" : "false");
+  fprintf(fp, "\n[fl]\n");
+  fprintf(fp, "enabled = %s\n", cfg->fl.enabled ? "true" : "false");
+  fclose(fp);
+
+  memset(&check, 0, sizeof(check));
+  ce = edr_config_load(tmp_path, &check);
+  edr_config_free_heap(&check);
+  if (ce != EDR_OK) {
+    (void)remove(tmp_path);
+    return -1;
+  }
+  return edr_agent_replace_file(tmp_path, path);
+}
+
+static void edr_agent_apply_config_recovery_safe_mode(EdrConfig *cfg) {
+  if (!cfg) {
+    return;
+  }
+  cfg->collection.etw_enabled = false;
+  cfg->collection.etw_dns_client_provider = false;
+  cfg->collection.etw_powershell_provider = false;
+  cfg->collection.etw_amsi_provider = false;
+  cfg->collection.etw_schannel_provider = false;
+  cfg->collection.etw_security_audit_provider = false;
+  cfg->collection.etw_wmi_provider = false;
+  cfg->collection.etw_tcpip_provider = false;
+  cfg->collection.etw_firewall_provider = false;
+  cfg->collection.ebpf_enabled = false;
+  cfg->collection.auditd_enabled = false;
+  cfg->collection.max_event_queue_size = 512u;
+  cfg->collection.adaptive_enabled = false;
+  cfg->ave.enabled = false;
+  cfg->ave.static_model_enabled = false;
+  cfg->ave.behavior_monitor_enabled = false;
+  cfg->command.allow_dangerous = false;
+  cfg->command.allow_rtq_readonly = true;
+  cfg->forensic_auto.enabled = false;
+  cfg->attack_surface.enabled = false;
+  cfg->shellcode_detector.enabled = false;
+  cfg->webshell_detector.enabled = false;
+  cfg->fl.enabled = false;
+  cfg->resource_limit.cpu_limit_percent = 1u;
+  cfg->resource_limit.memory_limit_mb = 100u;
+  cfg->resource_limit.ave_infer_per_min = 0u;
+  cfg->resource_limit.behavior_infer_per_min = 0u;
+  cfg->resource_limit.pmfe_scans_per_min = 0u;
+  cfg->resource_limit.webshell_scan_mb_per_min = 0u;
+  cfg->resource_limit.shellcode_packets_per_sec = 0u;
+  cfg->health_monitor.enabled = true;
+  snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+  cfg->health_monitor.interval_s = 60u;
+  cfg->health_monitor.expires_at_unix_ms = 0u;
+  snprintf(cfg->health_monitor.request_id, sizeof(cfg->health_monitor.request_id), "%s", "config-recovery");
+}
+
+static char *edr_agent_trim(char *s) {
+  char *e;
+  if (!s) {
+    return s;
+  }
+  while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') {
+    s++;
+  }
+  e = s + strlen(s);
+  while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) {
+    *--e = '\0';
+  }
+  return s;
+}
+
+static void edr_agent_strip_toml_value(char *raw, char *out, size_t cap) {
+  char *p;
+  size_t o = 0u;
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  p = edr_agent_trim(raw);
+  if (!p || !p[0]) {
+    return;
+  }
+  if (*p == '"') {
+    p++;
+    while (*p && o + 1u < cap) {
+      if (*p == '"' && (p == raw || p[-1] != '\\')) {
+        break;
+      }
+      if (*p == '\\' && p[1]) {
+        p++;
+      }
+      out[o++] = *p++;
+    }
+    out[o] = '\0';
+    return;
+  }
+  while (*p && *p != '#' && o + 1u < cap) {
+    out[o++] = *p++;
+  }
+  out[o] = '\0';
+  p = edr_agent_trim(out);
+  if (p != out) {
+    memmove(out, p, strlen(p) + 1u);
+  }
+}
+
+static int edr_agent_parse_bool_value(const char *v, bool *out) {
+  if (!v || !out) {
+    return 0;
+  }
+  if (strcmp(v, "true") == 0 || strcmp(v, "1") == 0 || strcmp(v, "yes") == 0) {
+    *out = true;
+    return 1;
+  }
+  if (strcmp(v, "false") == 0 || strcmp(v, "0") == 0 || strcmp(v, "no") == 0) {
+    *out = false;
+    return 1;
+  }
+  return 0;
+}
+
+static int edr_agent_extract_scalar_from_broken_toml(const char *path, EdrConfig *cfg) {
+  FILE *fp;
+  char line[4096];
+  char section[64] = "";
+  int count = 0;
+  if (!path || !path[0] || !cfg) {
+    return 0;
+  }
+  fp = fopen(path, "r");
+  if (!fp) {
+    return 0;
+  }
+  while (fgets(line, sizeof(line), fp)) {
+    char *p = edr_agent_trim(line);
+    char *eq;
+    char key[128];
+    char val[2048];
+    size_t key_len;
+    if (!p || !p[0] || *p == '#') {
+      continue;
+    }
+    if (*p == '[' && p[1] != '[') {
+      char *end = strchr(p, ']');
+      if (end) {
+        size_t n = (size_t)(end - p - 1);
+        if (n >= sizeof(section)) {
+          n = sizeof(section) - 1u;
+        }
+        memcpy(section, p + 1, n);
+        section[n] = '\0';
+      }
+      continue;
+    }
+    eq = strchr(p, '=');
+    if (!eq) {
+      continue;
+    }
+    key_len = (size_t)(eq - p);
+    while (key_len > 0u && (p[key_len - 1u] == ' ' || p[key_len - 1u] == '\t')) {
+      key_len--;
+    }
+    if (key_len == 0u || key_len >= sizeof(key)) {
+      continue;
+    }
+    memcpy(key, p, key_len);
+    key[key_len] = '\0';
+    edr_agent_strip_toml_value(eq + 1, val, sizeof(val));
+    if (!val[0]) {
+      continue;
+    }
+#define EDR_REC_STR(sec, name, dst)                         \
+    if (strcmp(section, (sec)) == 0 && strcmp(key, (name)) == 0) { \
+      edr_agent_copy_string((dst), sizeof(dst), val);       \
+      count++;                                              \
+      continue;                                             \
+    }
+    EDR_REC_STR("server", "address", cfg->server.address)
+    EDR_REC_STR("server", "ca_cert", cfg->server.ca_cert)
+    EDR_REC_STR("server", "client_cert", cfg->server.client_cert)
+    EDR_REC_STR("server", "client_key", cfg->server.client_key)
+    EDR_REC_STR("server", "client_key_provider", cfg->server.client_key_provider)
+    EDR_REC_STR("agent", "endpoint_id", cfg->agent.endpoint_id)
+    EDR_REC_STR("agent", "tenant_id", cfg->agent.tenant_id)
+    EDR_REC_STR("platform", "rest_base_url", cfg->platform.rest_base_url)
+    EDR_REC_STR("platform", "relay_url", cfg->platform.relay_url)
+    EDR_REC_STR("platform", "proxy_mode", cfg->platform.proxy_mode)
+    EDR_REC_STR("platform", "proxy_url", cfg->platform.proxy_url)
+    EDR_REC_STR("platform", "rest_bearer_token", cfg->platform.rest_bearer_token)
+    EDR_REC_STR("offline", "queue_db_path", cfg->offline.queue_db_path)
+    EDR_REC_STR("offline", "evidence_cache_path", cfg->offline.evidence_cache_path)
+    EDR_REC_STR("logging", "log_dir", cfg->logging.log_dir)
+    EDR_REC_STR("command", "signing_public_key_path", cfg->command.signing_public_key_path)
+#undef EDR_REC_STR
+    if (strcmp(section, "server") == 0 && strcmp(key, "grpc_enabled") == 0) {
+      if (edr_agent_parse_bool_value(val, &cfg->server.grpc_enabled)) count++;
+    } else if (strcmp(section, "server") == 0 && strcmp(key, "grpc_insecure") == 0) {
+      if (edr_agent_parse_bool_value(val, &cfg->server.grpc_insecure)) count++;
+    } else if (strcmp(section, "health_monitor") == 0 && strcmp(key, "enabled") == 0) {
+      if (edr_agent_parse_bool_value(val, &cfg->health_monitor.enabled)) count++;
+    } else if (strcmp(section, "health_monitor") == 0 && strcmp(key, "profile") == 0) {
+      edr_agent_copy_string(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), val);
+      count++;
+    } else if (strcmp(section, "health_monitor") == 0 && strcmp(key, "interval_s") == 0) {
+      long v = atol(val);
+      if (v >= 30 && v <= 3600) {
+        cfg->health_monitor.interval_s = (uint32_t)v;
+        count++;
+      }
+    }
+  }
+  fclose(fp);
+  return count;
+}
+
+static int edr_agent_save_last_good_config(EdrAgent *agent, const char *source_path) {
+  char lkg[1100];
+  if (!agent || !source_path || !source_path[0]) {
+    return -1;
+  }
+  edr_agent_state_file_path(source_path, "last_good_agent.toml", lkg, sizeof(lkg));
+  return edr_agent_copy_file(source_path, lkg);
+}
+
+static int edr_agent_save_last_good_snapshot(EdrAgent *agent) {
+  char lkg[1100];
+  const char *base;
+  if (!agent) {
+    return -1;
+  }
+  base = agent->config_path && agent->config_path[0] ? agent->config_path : "agent.toml";
+  edr_agent_state_file_path(base, "last_good_agent.toml", lkg, sizeof(lkg));
+  return edr_agent_write_config_snapshot(lkg, &agent->cfg);
+}
+
+static EdrError edr_agent_try_last_good_config(EdrAgent *agent, const char *load_path, const char *reason) {
+  char lkg[1100];
+  EdrError ce;
+  if (!agent || !load_path || !load_path[0]) {
+    return EDR_ERR_CONFIG_PARSE;
+  }
+  edr_agent_state_file_path(load_path, "last_good_agent.toml", lkg, sizeof(lkg));
+  ce = edr_config_load(lkg, &agent->cfg);
+  if (ce != EDR_OK) {
+    return ce;
+  }
+  agent->config_recovery_active = 1;
+  agent->config_recovery_safe_mode = 0;
+  agent->config_recovery_last_good_used = 1;
+  agent->config_recovery_auto_repaired = 0;
+  snprintf(agent->config_recovery_mode, sizeof(agent->config_recovery_mode), "%s", "last_good");
+  edr_agent_copy_string(agent->config_recovery_reason, sizeof(agent->config_recovery_reason), reason);
+  edr_agent_copy_string(agent->config_recovery_source, sizeof(agent->config_recovery_source), lkg);
+  fprintf(stderr, "[config] strict load failed; using last-known-good config: %s\n", lkg);
+  return EDR_OK;
+}
+
+static EdrError edr_agent_recover_config(EdrAgent *agent, const char *load_path, EdrError strict_error) {
+  char reason[256];
+  char recovered[1100];
+  char backup[1100];
+  int fields;
+  snprintf(reason, sizeof(reason), "strict TOML load failed: %d", (int)strict_error);
+  if (!agent) {
+    return EDR_ERR_INVALID_ARG;
+  }
+  if (edr_agent_try_last_good_config(agent, load_path, reason) == EDR_OK) {
+    return EDR_OK;
+  }
+  (void)edr_config_load(NULL, &agent->cfg);
+  edr_agent_apply_config_recovery_safe_mode(&agent->cfg);
+  fields = edr_agent_extract_scalar_from_broken_toml(load_path, &agent->cfg);
+  if (agent->cfg.health_monitor.interval_s < 30u) {
+    agent->cfg.health_monitor.interval_s = 60u;
+  }
+  agent->cfg.health_monitor.enabled = true;
+  agent->config_recovery_active = 1;
+  agent->config_recovery_safe_mode = 1;
+  agent->config_recovery_last_good_used = 0;
+  agent->config_recovery_fields_extracted = fields;
+  snprintf(agent->config_recovery_mode, sizeof(agent->config_recovery_mode), "%s",
+           fields > 0 ? "safe_extracted" : "safe_defaults");
+  edr_agent_copy_string(agent->config_recovery_reason, sizeof(agent->config_recovery_reason), reason);
+  edr_agent_copy_string(agent->config_recovery_source, sizeof(agent->config_recovery_source),
+                        load_path ? load_path : "");
+  if (load_path && load_path[0]) {
+    char invalid_suffix[80];
+    edr_agent_neighbor_file_path(load_path, ".recovered", recovered, sizeof(recovered));
+    if (edr_agent_write_config_snapshot(recovered, &agent->cfg) == 0) {
+      agent->config_recovery_auto_repaired = 1;
+      edr_agent_copy_string(agent->config_recovery_recovered_path,
+                            sizeof(agent->config_recovery_recovered_path), recovered);
+    }
+    snprintf(invalid_suffix, sizeof(invalid_suffix), ".invalid.%llu",
+             (unsigned long long)time(NULL));
+    edr_agent_neighbor_file_path(load_path, invalid_suffix, backup, sizeof(backup));
+    if (edr_agent_copy_file(load_path, backup) == 0) {
+      edr_agent_copy_string(agent->config_recovery_backup_path,
+                            sizeof(agent->config_recovery_backup_path), backup);
+    }
+  }
+  fprintf(stderr,
+          "[config] strict load failed; recovery mode=%s extracted_fields=%d recovered=%s\n",
+          agent->config_recovery_mode, fields,
+          agent->config_recovery_recovered_path[0] ? agent->config_recovery_recovered_path : "-");
+  return EDR_OK;
+}
 
 static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
   (void)user_data;
@@ -648,7 +1229,13 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
         (config_path && config_path[0]) ? config_path : NULL;
     EdrError ce = edr_config_load(load_path, &agent->cfg);
     if (ce != EDR_OK) {
-      return ce;
+      EdrError re = edr_agent_recover_config(agent, load_path, ce);
+      if (re != EDR_OK) {
+        return ce;
+      }
+    } else {
+      edr_agent_clear_config_recovery(agent);
+      (void)edr_agent_save_last_good_config(agent, load_path);
     }
     agent->config_mtime = (time_t)0;
     if (load_path) {
@@ -814,6 +1401,37 @@ static void json_escape_small(const char *in, char *out, size_t cap) {
   out[o] = '\0';
 }
 
+static void edr_agent_config_recovery_json(const EdrAgent *agent, char *out, size_t cap) {
+  char mode[80];
+  char reason[320];
+  char source[1200];
+  char recovered[1200];
+  char backup[1200];
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!agent) {
+    snprintf(out, cap, "{\"active\":false}");
+    return;
+  }
+  json_escape_small(agent->config_recovery_mode, mode, sizeof(mode));
+  json_escape_small(agent->config_recovery_reason, reason, sizeof(reason));
+  json_escape_small(agent->config_recovery_source, source, sizeof(source));
+  json_escape_small(agent->config_recovery_recovered_path, recovered, sizeof(recovered));
+  json_escape_small(agent->config_recovery_backup_path, backup, sizeof(backup));
+  snprintf(out, cap,
+           "{\"active\":%s,\"safe_mode\":%s,\"mode\":\"%s\",\"source\":\"%s\","
+           "\"reason\":\"%s\",\"last_good_used\":%s,\"fields_extracted\":%d,"
+           "\"recovered_path\":\"%s\",\"backup_path\":\"%s\",\"auto_repaired\":%s}",
+           agent->config_recovery_active ? "true" : "false",
+           agent->config_recovery_safe_mode ? "true" : "false",
+           mode[0] ? mode : "normal", source, reason,
+           agent->config_recovery_last_good_used ? "true" : "false",
+           agent->config_recovery_fields_extracted,
+           recovered, backup,
+           agent->config_recovery_auto_repaired ? "true" : "false");
+}
+
 static void edr_agent_poll_probe_json(char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
@@ -921,6 +1539,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char tv2_envelope_format[64];
   char resource_pressure_reason[96];
   char poll_probe_json[1600];
+  char config_recovery_json[1600];
   const char *hot_thread_role = "unknown";
   EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
@@ -991,6 +1610,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(tv2_rt.last_error, tv2_last_error, sizeof(tv2_last_error));
   json_escape_small(tv2_rt.envelope_format, tv2_envelope_format, sizeof(tv2_envelope_format));
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
+  edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
   if (strcmp(health_profile, "diagnostic") != 0) {
     char body_basic[12288];
     int n_basic = snprintf(
@@ -998,6 +1618,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
         "\"engine_health\":{"
         "\"reported_at_unix_ms\":%llu,"
+        "\"config_recovery\":%s,"
         "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
         "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
         "\"communication\":{\"grpc_ready\":%s,\"http_fallback\":%s,"
@@ -1070,7 +1691,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "}}",
         agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
         runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
-        (unsigned long long)wall_ms, health_profile[0] ? health_profile : "basic",
+        (unsigned long long)wall_ms, config_recovery_json,
+        health_profile[0] ? health_profile : "basic",
         agent->cfg.health_monitor.interval_s,
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
         grpc_rt.ready ? "true" : "false",
@@ -1231,6 +1853,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                     sizeof(event_filter_last_path));
   json_escape_small(event_filter_status.last_drop_cmdline, event_filter_last_cmdline,
                     sizeof(event_filter_last_cmdline));
+  edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
 
   char body[24576];
   int n = snprintf(
@@ -1238,6 +1861,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
       "\"engine_health\":{"
       "\"reported_at_unix_ms\":%llu,"
+      "\"config_recovery\":%s,"
       "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
       "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
       "\"communication\":{\"grpc_ready\":%s,\"grpc_insecure\":%s,\"http_fallback\":%s,"
@@ -1390,7 +2014,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
       runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
-      (unsigned long long)wall_ms,
+      (unsigned long long)wall_ms, config_recovery_json,
       health_profile[0] ? health_profile : "basic", agent->cfg.health_monitor.interval_s,
       (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
 	      grpc_rt.ready ? "true" : "false", grpc_rt.insecure ? "true" : "false",
@@ -1666,6 +2290,8 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
   EdrError cr =
       edr_config_reload_if_modified(agent->config_path, &agent->cfg, &agent->config_mtime, &rel);
   if (cr == EDR_OK && rel) {
+    edr_agent_clear_config_recovery(agent);
+    (void)edr_agent_save_last_good_config(agent, agent->config_path);
     edr_preprocess_apply_config(&agent->cfg);
     edr_adaptive_collection_configure(&agent->cfg);
     edr_agent_apply_event_filter_config(&agent->cfg);
@@ -1926,6 +2552,9 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   EdrError ce = edr_config_load(tmp, &remote);
   char fp[80];
   int changed = 0;
+  int was_recovering = agent->config_recovery_active;
+  char repaired_local_config[1100];
+  repaired_local_config[0] = '\0';
   edr_config_fingerprint(tmp, fp, sizeof(fp));
   if (ce != EDR_OK) {
     fprintf(stderr, "[config] remote TOML parse failed: %d\n", (int)ce);
@@ -1942,6 +2571,19 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_resource_init(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
   edr_ingest_http_set_policy_version(agent->cfg.preprocessing.rules_version);
+  if (was_recovering && agent->config_path && agent->config_path[0] &&
+      edr_agent_write_config_snapshot(agent->config_path, &agent->cfg) == 0) {
+    snprintf(repaired_local_config, sizeof(repaired_local_config), "%s", agent->config_path);
+  }
+  edr_agent_clear_config_recovery(agent);
+  if (edr_agent_save_last_good_snapshot(agent) == 0) {
+    agent->config_recovery_auto_repaired = 1;
+    snprintf(agent->config_recovery_mode, sizeof(agent->config_recovery_mode), "%s", "remote_repaired");
+    if (repaired_local_config[0]) {
+      snprintf(agent->config_recovery_recovered_path, sizeof(agent->config_recovery_recovered_path),
+               "%s", repaired_local_config);
+    }
+  }
   if (config_headers.sequence[0] || config_headers.config_hash[0]) {
     long long seq = atoll(config_headers.sequence);
     if (seq > 0) {

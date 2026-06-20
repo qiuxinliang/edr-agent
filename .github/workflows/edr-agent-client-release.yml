@@ -262,7 +262,10 @@ jobs:
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Build (Ninja + sccache)
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+        shell: pwsh
+        run: |
+          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          cmake --build build --target fd_installer_worker --parallel $env:NUMBER_OF_PROCESSORS --verbose
 
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
@@ -337,12 +340,15 @@ jobs:
           }
           if (-not $outDir -or -not $agentExe) { throw "missing FDSensor.exe under build\Release or build" }
           $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
+          if (-not (Test-Path -LiteralPath $workerExe)) {
+            $workerExe = Get-ChildItem -Path build -Recurse -Filter "FDSecurityInstallerWorker.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          }
           $items = New-Object System.Collections.Generic.List[string]
           if (-not $env:EDR_AGENT_VERSION) { throw "EDR_AGENT_VERSION was not resolved from the release tag" }
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
           $null = $items.Add($agentExe)
-          if (Test-Path -LiteralPath $workerExe) {
+          if ($workerExe -and (Test-Path -LiteralPath $workerExe)) {
             $null = $items.Add($workerExe)
           } else {
             throw "FDSecurityInstallerWorker.exe not found after build"
