@@ -141,13 +141,13 @@ function Get-WebRequestProxyOptions {
   if ($u.Scheme -ne "http" -and $u.Scheme -ne "https") {
     return $opts
   }
-  $b = [System.UriBuilder]::new($u)
+  $b = New-Object System.UriBuilder -ArgumentList $u
   if ($u.UserInfo) {
-    $parts = $u.UserInfo.Split(":", 2)
+    $parts = $u.UserInfo.Split([char[]]@(':'), 2)
     $user = [System.Uri]::UnescapeDataString($parts[0])
     $pass = if ($parts.Count -gt 1) { [System.Uri]::UnescapeDataString($parts[1]) } else { "" }
     $secure = ConvertTo-SecureString $pass -AsPlainText -Force
-    $opts["ProxyCredential"] = [System.Management.Automation.PSCredential]::new($user, $secure)
+    $opts["ProxyCredential"] = New-Object System.Management.Automation.PSCredential -ArgumentList $user, $secure
     $b.UserName = ""
     $b.Password = ""
   }
@@ -165,7 +165,7 @@ function Format-ProxySummary {
   }
   try {
     $u = [System.Uri]$Url
-    $b = [System.UriBuilder]::new($u)
+    $b = New-Object System.UriBuilder -ArgumentList $u
     $b.UserName = ""
     $b.Password = ""
     return "explicit " + $b.Uri.GetLeftPart([System.UriPartial]::Authority)
@@ -195,7 +195,8 @@ function Write-Report {
     $json | Set-Content -LiteralPath $path -Encoding UTF8
   } catch {
     Write-VerifyLog ("report Set-Content failed: " + $_.Exception.Message)
-    [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+    $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+    [System.IO.File]::WriteAllText($path, $json, $utf8NoBom)
   }
   Write-VerifyLog ("report=" + $path)
   Write-Host "postinstall_verify_report=$path"

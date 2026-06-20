@@ -692,11 +692,22 @@ end;
 
 function EdrPolicyVerifyPsParameters: string;
 begin
-  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_agent_postinstall_verify.ps1') + '"'
-    + ' -InstallDir "' + ExpandConstant('{app}') + '"'
-    + ' -ConfigPath "' + ExpandConstant('{app}\agent.toml') + '"'
-    + ' -ReportPath "' + EdrDiagnosticsFile('install_runtime_verify.json') + '"'
-    + ' -LogPath "' + EdrDiagnosticsFile('install_runtime_verify.log') + '"';
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
+    + '$out=' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.output.log')) + ';'
+    + '$script=' + EdrPsSq(ExpandConstant('{app}\edr_agent_postinstall_verify.ps1')) + ';'
+    + '$args=@('
+    + '''-InstallDir'',' + EdrPsSq(ExpandConstant('{app}')) + ','
+    + '''-ConfigPath'',' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ','
+    + '''-ReportPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ','
+    + '''-LogPath'',' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.log'))
+    + ');'
+    + '& $script @args *> $out;'
+    + '$ok=$?;'
+    + '$code=1;if($ok){$code=0};'
+    + 'if($LASTEXITCODE -ne $null){$code=$LASTEXITCODE};'
+    + 'try{Get-Content -LiteralPath $out -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }}catch{};'
+    + 'exit $code'
+    + '"';
 end;
 
 function EdrHealthSummaryPsParameters: string;
@@ -790,8 +801,11 @@ begin
     + 'FixAcl $cfg $true;'
     + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
     + 'try { L (''whoami=''+(& whoami.exe)) } catch {};'
+    + 'try { L (''dir_acl=''+((& icacls.exe $wd) -join '' | '')) } catch {};'
     + 'try { L (''exe_acl=''+((& icacls.exe $exe) -join '' | '')) } catch {};'
     + 'try { L (''cfg_acl=''+((& icacls.exe $cfg) -join '' | '')) } catch {};'
+    + 'foreach($n in @(''libcrypto-3-x64.dll'',''libssl-3-x64.dll'',''libcurl.dll'',''sqlite3.dll'',''onnxruntime.dll'',''pcre2-8.dll'')){try{$fp=Join-Path $wd $n;if(Test-Path -LiteralPath $fp){L (''dep_acl ''+$n+''=''+((& icacls.exe $fp) -join '' | ''))}}catch{}};'
+    + 'try { $task0=Get-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($task0){foreach($a in @($task0.Actions)){L (''task_action execute=''+$a.Execute+'' args=''+$a.Arguments+'' wd=''+$a.WorkingDirectory)}; L (''task_principal user=''+$task0.Principal.UserId+'' logon=''+$task0.Principal.LogonType+'' runlevel=''+$task0.Principal.RunLevel)} } catch {};'
     + 'Start-Sleep -Seconds 1;'
     + 'try { Start-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction Stop; L ''Start-ScheduledTask invoked'' } catch { L (''Start-ScheduledTask error: ''+$_.Exception.Message) };'
     + 'Start-Sleep -Seconds 3;'

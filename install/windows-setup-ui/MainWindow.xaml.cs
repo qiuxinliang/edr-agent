@@ -457,9 +457,10 @@ public partial class MainWindow : Window
             }
 
             await PostAsync("installProgress", new { stage = "收集健康回执", progress = 92, detail = "正在读取安装诊断与 Agent 启动结果" });
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_summary_begin");
             var summary = ReadInstallSummary(installPath, innoLog, handoffDir);
-            TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_complete endpoint={summary.EndpointId} tenant={summary.TenantId} health={summary.HealthStatus} diagnostics={_lastDiagnosticsPath}");
+            TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installComplete", new
             {
                 installPath,
@@ -575,10 +576,19 @@ public partial class MainWindow : Window
         var diagnosticsDir = ResolveInstallDiagnosticsDirectory(installPath, handoffDir);
         var healthPath = Path.Combine(diagnosticsDir, "install_health_report.json");
         var verifyPath = Path.Combine(diagnosticsDir, "install_runtime_verify.json");
+        var startRuntimeLog = Path.Combine(diagnosticsDir, "start-runtime.log");
+        var taskLastResult = TryReadLastLogValue(startRuntimeLog, "task_last_result=");
+        var manualFallbackPid = TryReadLastLogValue(startRuntimeLog, "manual fallback pid=");
         var healthStatus = TryReadJsonString(healthPath, "status");
         if (string.IsNullOrWhiteSpace(healthStatus))
         {
             healthStatus = TryReadJsonString(verifyPath, "status");
+        }
+        if ((string.IsNullOrWhiteSpace(healthStatus) || healthStatus.Equals("ok", StringComparison.OrdinalIgnoreCase)) &&
+            !string.IsNullOrWhiteSpace(taskLastResult) &&
+            !taskLastResult.Equals("0", StringComparison.OrdinalIgnoreCase))
+        {
+            healthStatus = string.IsNullOrWhiteSpace(manualFallbackPid) ? "warning" : "warning_manual_fallback";
         }
 
         return new InstallSummary
@@ -595,7 +605,9 @@ public partial class MainWindow : Window
             AgentVersion = TryReadJsonString(verifyPath, "agent_version"),
             HealthStatus = healthStatus,
             RuntimeMode = TryReadJsonString(verifyPath, "runtime_mode"),
-            AgentRunning = TryReadJsonBool(verifyPath, "agent_process_running")
+            AgentRunning = TryReadJsonBool(verifyPath, "agent_process_running") || !string.IsNullOrWhiteSpace(manualFallbackPid),
+            ScheduledTaskLastResult = taskLastResult,
+            ManualFallbackPid = manualFallbackPid
         };
     }
 
@@ -2101,6 +2113,31 @@ public partial class MainWindow : Window
         }
     }
 
+    private static string TryReadLastLogValue(string path, string marker)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return string.Empty;
+            }
+            foreach (var line in File.ReadLines(path).Reverse())
+            {
+                var idx = line.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                {
+                    continue;
+                }
+                return line[(idx + marker.Length)..].Trim();
+            }
+        }
+        catch
+        {
+            return string.Empty;
+        }
+        return string.Empty;
+    }
+
     private void TryDragMove()
     {
         try
@@ -2173,6 +2210,8 @@ public sealed class InstallSummary
     public string HealthStatus { get; set; } = "";
     public string RuntimeMode { get; set; } = "";
     public bool AgentRunning { get; set; }
+    public string ScheduledTaskLastResult { get; set; } = "";
+    public string ManualFallbackPid { get; set; } = "";
 }
 
 public sealed class CheckItem

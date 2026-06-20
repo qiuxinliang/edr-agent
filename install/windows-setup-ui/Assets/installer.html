@@ -429,6 +429,12 @@ function onInstallProgress(p){
 function onInstallComplete(r){
   installDone=true;lastDiagnostics=r.diagnostics||'';setProgress(100);
   const s=r.summary||{};
+  const healthRaw=String(s.healthStatus||'').toLowerCase();
+  const healthText=healthRaw==='warning_manual_fallback'
+    ? `计划任务未正常启动，已手动拉起进程${s.manualFallbackPid?' PID='+s.manualFallbackPid:''}`
+    : healthRaw==='warning'
+      ? `运行态需要复查${s.scheduledTaskLastResult?'，任务结果='+s.scheduledTaskLastResult:''}`
+      : (s.healthStatus|| (s.agentRunning?'Agent 进程已运行':'已安装，等待首次健康上报'));
   $('#sumPath').textContent=r.installPath||'-';
   $('#sumEndpoint').textContent=s.endpointId||'等待 Agent 回执';
   $('#sumTenant').textContent=s.tenantId||'-';
@@ -436,8 +442,8 @@ function onInstallComplete(r){
   $('#sumPolicy').textContent=s.policyVersion|| (s.policyUrl?'已配置 runtime policy':'等待服务端策略');
   $('#sumP0').textContent=s.p0RuleVersion?`${s.p0RuleVersion}${s.p0RuleCount?' / '+s.p0RuleCount+' 条':''}`:'-';
   $('#sumRuntimeMode').textContent=s.runtimeMode||'-';
-  $('#sumHealth').textContent=s.healthStatus|| (s.agentRunning?'Agent 进程已运行':'已安装，等待首次健康上报');
-  $('#sumHealth').classList.toggle('ok',(s.healthStatus||'').toLowerCase()==='ok'||!!s.agentRunning);
+  $('#sumHealth').textContent=healthText;
+  $('#sumHealth').classList.toggle('ok',healthRaw==='ok');
   $('#sumDiag').textContent=lastDiagnostics||'-';
   show(5);toast('安装完成','诊断包已生成，可用于排查首启问题','up');
 }
