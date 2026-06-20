@@ -33,7 +33,7 @@
   #define EDR_AGENT_PREPROCESS_TOML "..\..\..\edr-backend\platform\config\agent_preprocess_rules_v1.toml"
 #endif
 #ifndef EDR_VERSION_FILE
-  #define EDR_VERSION_FILE "{#EDR_BIN_DIR}\VERSION"
+  #define EDR_VERSION_FILE EDR_BIN_DIR + "\VERSION"
 #endif
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
