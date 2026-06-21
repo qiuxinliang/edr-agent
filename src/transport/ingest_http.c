@@ -367,6 +367,10 @@ static int build_schannel_cert_selector(char *dst, size_t cap) {
   return dst[0] != '\0';
 }
 
+static int schannel_store_mtls_configured(void) {
+  return s_client_cert_thumbprint[0] != '\0';
+}
+
 static void log_transport_capabilities_once(void) {
   if (s_transport_capability_logged) {
     return;
@@ -990,7 +994,8 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->configured = edr_ingest_http_configured();
   out->http_fallback_available = out->configured;
   out->insecure_http = s_insecure_http;
-  out->mtls_configured = (s_client_cert_file[0] && s_client_key_file[0]) ? 1 : 0;
+  out->mtls_configured = (schannel_store_mtls_configured() ||
+                          (s_client_cert_file[0] && s_client_key_file[0])) ? 1 : 0;
   out->websocket_ready = (s_ws_ready || s_stream_ready) ? 1 : 0;
   out->http2_enabled = http2_client_enabled();
   out->http2_required = http2_required();
@@ -3290,6 +3295,17 @@ static int curl_note_http_version(CURL *curl) {
 
 static int curl_h2_allowed_for_url(const char *url) {
   if (!http2_client_enabled() || !url || strncmp(url, "https://", 8u) != 0) {
+    return 0;
+  }
+  if (curl_ssl_backend_is_schannel() && schannel_store_mtls_configured() &&
+      !env_bool_default("EDR_SCHANNEL_MTLS_HTTP2", 0)) {
+    if (!s_http2_cert_problem_warned) {
+      s_http2_cert_problem_warned = 1;
+      s_http2_cert_problem_retry_after_ms = unix_ms_now() + (int64_t)h2_cert_problem_retry_cooldown_ms();
+      fprintf(stderr,
+              "[transport] Schannel store-backed mTLS uses HTTP/1.1 fallback; "
+              "set EDR_SCHANNEL_MTLS_HTTP2=1 to retry HTTP/2\n");
+    }
     return 0;
   }
   if (!http2_required() && s_http2_cert_problem_retry_after_ms > 0 &&

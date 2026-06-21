@@ -3203,6 +3203,32 @@ static int read_text_file_small(const char *path, char *out, size_t cap) {
   return n > 0u ? 0 : -1;
 }
 
+static int read_command_public_key_path(const char *path, char *out, size_t cap) {
+  if (!path || !path[0]) {
+    return -1;
+  }
+  if (read_text_file_small(path, out, cap) == 0) {
+    return 0;
+  }
+#ifdef _WIN32
+  {
+    const char *legacy = "\\EDR Agent\\";
+    const char *p = strstr(path, legacy);
+    if (p) {
+      char alt[1024];
+      size_t prefix_len = (size_t)(p - path);
+      int n = snprintf(alt, sizeof(alt), "%.*s\\FDSecurity\\%s",
+                       (int)prefix_len, path, p + strlen(legacy));
+      if (n > 0 && (size_t)n < sizeof(alt) &&
+          read_text_file_small(alt, out, cap) == 0) {
+        return 0;
+      }
+    }
+  }
+#endif
+  return -1;
+}
+
 static int command_public_key_pem(char *out, size_t cap) {
   if (!out || cap < 2u) {
     return 0;
@@ -3221,7 +3247,7 @@ static int command_public_key_pem(char *out, size_t cap) {
   if (!path || !path[0]) {
     path = getenv("EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH");
   }
-  if (path && path[0] && read_text_file_small(path, out, cap) == 0) {
+  if (path && path[0] && read_command_public_key_path(path, out, cap) == 0) {
     normalize_pem_newlines(out);
     return 1;
   }
@@ -3231,7 +3257,7 @@ static int command_public_key_pem(char *out, size_t cap) {
     return out[0] != '\0';
   }
   if (s_bound_cfg && s_bound_cfg->command.signing_public_key_path[0] &&
-      read_text_file_small(s_bound_cfg->command.signing_public_key_path, out, cap) == 0) {
+      read_command_public_key_path(s_bound_cfg->command.signing_public_key_path, out, cap) == 0) {
     normalize_pem_newlines(out);
     return 1;
   }
