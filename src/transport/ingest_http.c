@@ -145,7 +145,11 @@ static int s_http2_cert_problem_warned;
 static char s_negotiated_protocol[16];
 static int s_transport_capability_logged;
 static int s_schannel_pem_warned;
-static int s_schannel_ssl_options_logged;
+#ifdef _WIN32
+static volatile LONG s_schannel_ssl_options_logged;
+#else
+static volatile int s_schannel_ssl_options_logged;
+#endif
 static int s_alpn_log_state;
 static int64_t s_native_post_fail_log_until_ms;
 static unsigned long s_native_post_fail_log_suppressed;
@@ -270,6 +274,39 @@ static int env_bool_default(const char *name, int fallback) {
     return 0;
   }
   return fallback ? 1 : 0;
+}
+
+static long http_socket_timeout_s(void) {
+  unsigned long ms = env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul);
+  return (long)((ms + 999ul) / 1000ul);
+}
+
+static long command_poll_timeout_s(int wait_s) {
+  unsigned long wait = wait_s > 0 ? (unsigned long)wait_s : 25ul;
+  unsigned long min_s = wait + 5ul;
+  unsigned long fallback_s = wait + 10ul;
+  unsigned long v = env_ul_clamped("EDR_HTTP_COMMAND_POLL_TIMEOUT_S", fallback_s, 5ul, 120ul);
+  if (v < min_s) {
+    v = min_s;
+  }
+  if (v > 120ul) {
+    v = 120ul;
+  }
+  return (long)v;
+}
+
+static int schannel_ssl_options_log_once(void) {
+#ifdef _WIN32
+  return InterlockedCompareExchange(&s_schannel_ssl_options_logged, 1, 0) == 0;
+#elif defined(__GNUC__) || defined(__clang__)
+  return __sync_bool_compare_and_swap(&s_schannel_ssl_options_logged, 0, 1) ? 1 : 0;
+#else
+  if (s_schannel_ssl_options_logged) {
+    return 0;
+  }
+  s_schannel_ssl_options_logged = 1;
+  return 1;
+#endif
 }
 
 static int env_present(const char *name) {
@@ -3362,9 +3399,8 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
     long ssl_opts = curl_schannel_ssl_options();
     if (ssl_opts != 0L) {
       curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, ssl_opts);
-      if (!s_schannel_ssl_options_logged) {
+      if (schannel_ssl_options_log_once()) {
         const char *mode = getenv("EDR_SCHANNEL_REVOCATION_MODE");
-        s_schannel_ssl_options_logged = 1;
         fprintf(stderr, "[transport] Schannel TLS revocation mode=%s ssl_options=0x%lx\n",
                 (mode && mode[0]) ? mode : "best_effort", ssl_opts);
       }
@@ -3463,7 +3499,7 @@ static int curl_h2_allowed_for_url(const char *url) {
 
 static int curl_h2_request(const char *method, const char *url, const char *content_type,
                            const char *body, size_t body_len, char *resp_body,
-                           size_t resp_body_cap) {
+                           size_t resp_body_cap, long timeout_s) {
   CURL *curl = NULL;
   struct curl_slist *headers = NULL;
   EdrCurlBuffer rb;
@@ -3489,8 +3525,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   rb.buf = resp_body;
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
-  curl_apply_common_options(curl, url, headers,
-                            (long)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul) / 1000L);
+  curl_apply_common_options(curl, url, headers, timeout_s > 0 ? timeout_s : http_socket_timeout_s());
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &rb);
@@ -3540,7 +3575,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
 
 static int curl_h1_request(const char *method, const char *url, const char *content_type,
                            const char *body, size_t body_len, char *resp_body,
-                           size_t resp_body_cap) {
+                           size_t resp_body_cap, long timeout_s) {
   CURL *curl = NULL;
   struct curl_slist *headers = NULL;
   EdrCurlBuffer rb;
@@ -3572,7 +3607,7 @@ static int curl_h1_request(const char *method, const char *url, const char *cont
   http_version = (long)CURL_HTTP_VERSION_1_1;
 #endif
   curl_apply_common_options_ex(curl, url, headers,
-                               (long)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul) / 1000L,
+                               timeout_s > 0 ? timeout_s : http_socket_timeout_s(),
                                http_version);
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
@@ -3793,9 +3828,9 @@ static int native_post_json_legacy(const char *url, const char *body, size_t bod
   return rc;
 }
 
-static int native_request(const char *method, const char *url, const char *content_type,
-                          const char *body, size_t body_len, char *resp_body,
-                          size_t resp_body_cap) {
+static int native_request_ex(const char *method, const char *url, const char *content_type,
+                             const char *body, size_t body_len, char *resp_body,
+                             size_t resp_body_cap, long timeout_s) {
   char host[256];
   char path[1024];
   int port = 0;
@@ -3809,7 +3844,7 @@ static int native_request(const char *method, const char *url, const char *conte
   }
   if (https && http2_client_enabled()) {
 #ifdef EDR_HAVE_CURL_HTTP2
-    int h2rc = curl_h2_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+    int h2rc = curl_h2_request(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
     if (h2rc == 0) {
       return 0;
     }
@@ -3827,7 +3862,7 @@ static int native_request(const char *method, const char *url, const char *conte
   }
 #ifdef EDR_HAVE_CURL_HTTP2
   if (https && curl_schannel_store_mtls_needs_libcurl_http1(url)) {
-    return curl_h1_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+    return curl_h1_request(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
   }
 #endif
   if (!https) {
@@ -3878,14 +3913,20 @@ static int native_request(const char *method, const char *url, const char *conte
   return rc;
 }
 
-static int request_to_suffix(const char *method, const char *suffix, const char *content_type,
-                             const char *body, size_t body_len, char *resp_body,
-                             size_t resp_body_cap) {
+static int native_request(const char *method, const char *url, const char *content_type,
+                          const char *body, size_t body_len, char *resp_body,
+                          size_t resp_body_cap) {
+  return native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, 0L);
+}
+
+static int request_to_suffix_ex(const char *method, const char *suffix, const char *content_type,
+                                const char *body, size_t body_len, char *resp_body,
+                                size_t resp_body_cap, long timeout_s) {
   char url[1400];
   size_t rb = strlen(s_rest);
   int rc;
   snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
-  rc = native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+  rc = native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
   if (rc == 0) {
     route_note_success();
     return 0;
@@ -3894,12 +3935,18 @@ static int request_to_suffix(const char *method, const char *suffix, const char 
       method && strcmp(method, "GET") == 0) {
     rb = strlen(s_rest);
     snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
-    rc = native_request(method, url, content_type, body, body_len, resp_body, resp_body_cap);
+    rc = native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
     if (rc == 0) {
       route_note_success();
     }
   }
   return rc;
+}
+
+static int request_to_suffix(const char *method, const char *suffix, const char *content_type,
+                             const char *body, size_t body_len, char *resp_body,
+                             size_t resp_body_cap) {
+  return request_to_suffix_ex(method, suffix, content_type, body, body_len, resp_body, resp_body_cap, 0L);
 }
 
 static void route_apply_csv(const char *csv, const char *primary) {
@@ -6035,7 +6082,8 @@ static int edr_ingest_http_poll_once(void) {
            s_endpoint, wait_s, s_agent_ver, s_control_dict_ver, s_control_schema_ver,
            s_control_profile_id, http2_client_enabled() ? 1 : 0, s_control_zstd ? 1 : 0);
   resp[0] = '\0';
-  if (request_to_suffix("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp)) != 0) {
+  if (request_to_suffix_ex("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp),
+                           command_poll_timeout_s(wait_s)) != 0) {
     note_http_request_failure();
     note_long_poll_failure();
     return -1;
