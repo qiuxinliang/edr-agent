@@ -558,6 +558,51 @@ begin
   WizardForm.StatusLabel.Caption := Title;
 end;
 
+function EdrProductStageDetail(const Title, Status: string): string;
+begin
+  if Status = 'ok' then
+  begin
+    Result := 'Completed. Continuing setup.';
+    Exit;
+  end;
+  if Status = 'skip' then
+  begin
+    Result := 'This step is not required for the selected options.';
+    Exit;
+  end;
+  if Status = 'warn' then
+  begin
+    Result := 'Setup will continue and verify the endpoint status at the end.';
+    Exit;
+  end;
+  if Status = 'failed' then
+  begin
+    Result := 'Setup could not complete this step. Diagnostics have been collected.';
+    Exit;
+  end;
+
+  if Title = 'Stop old Agent runtime' then
+    Result := 'Preparing the endpoint components.'
+  else if Title = 'Clean runtime cache' then
+    Result := 'Preparing local runtime data.'
+  else if Title = 'Enroll and write configuration' then
+    Result := 'Registering this endpoint and writing configuration.'
+  else if Title = 'Write local configuration' then
+    Result := 'Writing local configuration.'
+  else if Title = 'Validate configuration' then
+    Result := 'Validating endpoint configuration.'
+  else if Title = 'Install service/startup task' then
+    Result := 'Registering the endpoint service.'
+  else if Title = 'Start Agent runtime' then
+    Result := 'Starting endpoint protection components.'
+  else if Title = 'Pull runtime policy' then
+    Result := 'Synchronizing endpoint policy.'
+  else if Title = 'Write health summary' then
+    Result := 'Finalizing installation summary.'
+  else
+    Result := 'Setup is applying the selected configuration.';
+end;
+
 procedure EdrCreateDiagnosticsBundle;
 var
   Code: Integer;
@@ -597,12 +642,13 @@ var
   Ok: Boolean;
 begin
   Result := True;
-  EdrSetProgress(StageNo, StageTotal, Title, Detail);
+  EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'start'));
   EdrAppendStageLog('START [' + Title + '] ' + FileName + ' ' + Params);
   Ok := Exec(FileName, Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
   if Ok and (Code = 0) then
   begin
     EdrAppendStageLog('OK [' + Title + '] exit=0');
+    EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'ok'));
     EdrProgressPage.SetProgress(StageNo, StageTotal);
     Exit;
   end;
@@ -616,11 +662,13 @@ begin
   if Critical then
   begin
     EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
+    EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'failed'));
     Result := False;
     Exit;
   end;
   EdrAppendStageLog('WARN [' + Title + '] ' + EdrFailureReason);
   EdrAppendStageLog('NONCRITICAL [' + Title + '] continuing');
+  EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'warn'));
   EdrProgressPage.SetProgress(StageNo, StageTotal);
 end;
 
@@ -640,17 +688,19 @@ var
   Ok: Boolean;
 begin
   Result := True;
-  EdrSetProgress(StageNo, StageTotal, Title, Detail);
+  EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'start'));
   EdrAppendStageLog('START_NOWAIT [' + Title + '] ' + FileName + ' ' + Params);
   Ok := Exec(FileName, Params, WorkDir, SW_HIDE, ewNoWait, Code);
   if Ok then
   begin
     EdrAppendStageLog('OK_NOWAIT [' + Title + ']');
+    EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'ok'));
     EdrProgressPage.SetProgress(StageNo, StageTotal);
     Exit;
   end;
   EdrFailureReason := Title + ' could not be started';
   EdrAppendStageLog('FAILED [' + Title + '] ' + EdrFailureReason);
+  EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'failed'));
   if Critical then
   begin
     Result := False;
@@ -662,7 +712,7 @@ end;
 
 procedure EdrSkipStage(StageNo, StageTotal: Integer; const Title, Detail: string);
 begin
-  EdrSetProgress(StageNo, StageTotal, Title, Detail);
+  EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'skip'));
   EdrAppendStageLog('SKIP [' + Title + '] ' + Detail);
   EdrProgressPage.SetProgress(StageNo, StageTotal);
 end;
@@ -813,7 +863,6 @@ begin
     + '$code=1;'
     + 'try{Add-Content -LiteralPath $out -Value ((Get-Date).ToString(''o'')+'' wrapper_exception=''+$_.Exception.Message) -Encoding UTF8}catch{};'
     + '};'
-    + 'try{Get-Content -LiteralPath $out -Tail 80 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }}catch{};'
     + 'exit $code'
     + '"';
 end;
@@ -821,9 +870,7 @@ end;
 function EdrHealthSummaryPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + 'if(Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + '){'
-    + 'Write-Host ''runtime verification report ready: ' + EdrDiagnosticsFile('install_runtime_verify.json') + ''''
-    + '}else{Write-Warning ''runtime verification report missing; install will continue and endpoint health can be checked from console''};'
+    + 'if(Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + '){exit 0};'
     + 'exit 0'
     + '"';
 end;
@@ -833,7 +880,7 @@ var
   AppToml, ExToml: string;
 begin
   Result := True;
-  EdrSetProgress(StageNo, StageTotal, 'Write local configuration', 'No enrollment token was provided; copying bundled template.');
+  EdrSetProgress(StageNo, StageTotal, 'Write local configuration', EdrProductStageDetail('Write local configuration', 'start'));
   AppToml := ExpandConstant('{app}\agent.toml');
   ExToml := ExpandConstant('{app}\agent.toml.example');
   if FileExists(AppToml) then

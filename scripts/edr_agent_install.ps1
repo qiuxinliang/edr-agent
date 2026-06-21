@@ -1202,7 +1202,7 @@ $UseNativeWindowsStore = ((Get-EnrollOs) -eq "windows" -and ($effectiveKeyProvid
 $EffectiveCaCertPath = if ($useCertPaths) { $CaCertPath } else { "" }
 $EffectiveClientCertPath = if ($useCertPaths -and -not $UseNativeWindowsStore) { $ClientCertPath } else { "" }
 $EffectiveClientKeyPath = if ($useCertPaths -and $effectiveKeyProvider -eq "pem") { $ClientKeyPath } else { "" }
-$EffectiveCertStore = if ($UseNativeWindowsStore) { "LocalMachine\\MY" } else { "" }
+$EffectiveCertStore = if ($UseNativeWindowsStore) { "LocalMachine\MY" } else { "" }
 $EffectiveCertThumbprint = ""
 
 $Http2Enabled = if ($null -ne $d.http2_enabled) { [bool]$d.http2_enabled } else { $true }
@@ -1313,7 +1313,36 @@ function Test-EndpointCertStore {
   $psPath = "Cert:\" + $store + "\" + ($Thumbprint -replace '\s+', '')
   try {
     $cert = Get-Item -LiteralPath $psPath -ErrorAction Stop
-    return @{ ok = $true; message = ("found client certificate subject={0} not_after={1:o}" -f $cert.Subject, $cert.NotAfter.ToUniversalTime()) }
+    if (-not $cert.HasPrivateKey) {
+      return @{ ok = $false; message = ("client certificate has no private key in {0}" -f $StorePath) }
+    }
+    $hasClientAuth = $false
+    foreach ($ext in $cert.Extensions) {
+      if ($ext -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]) {
+        foreach ($oid in $ext.EnhancedKeyUsages) {
+          if ($oid.Value -eq "1.3.6.1.5.5.7.3.2") {
+            $hasClientAuth = $true
+          }
+        }
+      }
+    }
+    if (-not $hasClientAuth) {
+      return @{ ok = $false; message = "client certificate missing Client Authentication EKU" }
+    }
+    $rsa = $null
+    try {
+      $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+      if (-not $rsa) {
+        return @{ ok = $false; message = "client certificate private key cannot be opened" }
+      }
+      $probe = [System.Text.Encoding]::UTF8.GetBytes("fdsecurity-install-cert-probe")
+      $null = $rsa.SignData($probe, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    } catch {
+      return @{ ok = $false; message = ("client certificate private key probe failed: " + $_.Exception.Message) }
+    } finally {
+      if ($rsa -and ($rsa -is [System.IDisposable])) { $rsa.Dispose() }
+    }
+    return @{ ok = $true; message = ("found usable client certificate subject={0} not_after={1:o}" -f $cert.Subject, $cert.NotAfter.ToUniversalTime()) }
   } catch {
     return @{ ok = $false; message = ("client certificate not found in {0}: {1}" -f $StorePath, $_) }
   }

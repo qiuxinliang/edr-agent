@@ -2444,7 +2444,22 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     agent->cfg.health_monitor = remote->health_monitor;
   }
   if (edr_agent_toml_has_section(tmp, "command")) {
+    char local_command_signing_public_key_path[sizeof(agent->cfg.command.signing_public_key_path)];
+    char local_command_signing_public_key_pem[sizeof(agent->cfg.command.signing_public_key_pem)];
+    snprintf(local_command_signing_public_key_path, sizeof(local_command_signing_public_key_path), "%s",
+             agent->cfg.command.signing_public_key_path);
+    snprintf(local_command_signing_public_key_pem, sizeof(local_command_signing_public_key_pem), "%s",
+             agent->cfg.command.signing_public_key_pem);
     agent->cfg.command = remote->command;
+    if (!agent->cfg.command.signing_public_key_path[0] && !agent->cfg.command.signing_public_key_pem[0]) {
+      snprintf(agent->cfg.command.signing_public_key_path, sizeof(agent->cfg.command.signing_public_key_path), "%s",
+               local_command_signing_public_key_path);
+      snprintf(agent->cfg.command.signing_public_key_pem, sizeof(agent->cfg.command.signing_public_key_pem), "%s",
+               local_command_signing_public_key_pem);
+      if (agent->cfg.command.signing_public_key_path[0] || agent->cfg.command.signing_public_key_pem[0]) {
+        fprintf(stderr, "[config] remote command policy omitted signing public key; preserved local command key material\n");
+      }
+    }
   }
   if (edr_agent_toml_has_section(tmp, "forensic_auto")) {
     agent->cfg.forensic_auto = remote->forensic_auto;

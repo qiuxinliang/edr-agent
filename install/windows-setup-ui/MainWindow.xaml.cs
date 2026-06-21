@@ -196,7 +196,11 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            await PostAsync("installFailed", new { reason = ex.Message, diagnostics = _lastDiagnosticsPath });
+            await PostAsync("installFailed", new
+            {
+                reason = BuildUserFacingInstallFailure(ex.Message, _lastDiagnosticsPath),
+                diagnostics = _lastDiagnosticsPath
+            });
         }
     }
 
@@ -439,7 +443,7 @@ public partial class MainWindow : Window
                     {
                         stage = stageState.Stage,
                         progress,
-                        detail = stageState.Detail
+                        detail = stageState.DisplayDetail
                     });
                 }
                 else
@@ -488,7 +492,7 @@ public partial class MainWindow : Window
             TryCreateDiagnosticsBundle(uiLogDir, handoffDir, installPath, _lastDiagnosticsPath);
             await PostAsync("installFailed", new
             {
-                reason = ex.Message,
+                reason = BuildUserFacingInstallFailure(ex.Message, _lastDiagnosticsPath),
                 diagnostics = File.Exists(_lastDiagnosticsPath) ? _lastDiagnosticsPath : uiLogDir
             });
         }
@@ -686,7 +690,7 @@ public partial class MainWindow : Window
         {
             if (line.Contains("INSTALL_WORKFLOW_OK", StringComparison.OrdinalIgnoreCase))
             {
-                return new InstallStageState("安装完成", "所有安装阶段已完成", 98);
+                return new InstallStageState("安装完成", "所有安装阶段已完成", "", 98);
             }
 
             var match = Regex.Match(line, @"\b(?<status>START|OK|WARN|FAILED|SKIP)\s+\[(?<stage>[^\]]+)\]\s*(?<detail>.*)$");
@@ -706,14 +710,14 @@ public partial class MainWindow : Window
             }
             if (status.Equals("FAILED", StringComparison.OrdinalIgnoreCase))
             {
-                return new InstallStageState("安装阶段失败：" + stage, detail, progress);
+                return new InstallStageState("安装阶段失败：" + TranslateInstallStage(stage), ProductInstallStageDetail(stage, status), detail, progress);
             }
             if (status.Equals("WARN", StringComparison.OrdinalIgnoreCase))
             {
-                return new InstallStageState("安装阶段提示：" + stage, detail, Math.Min(98, progress + 3));
+                return new InstallStageState("安装阶段提示：" + TranslateInstallStage(stage), ProductInstallStageDetail(stage, status), detail, Math.Min(98, progress + 3));
             }
 
-            return new InstallStageState(TranslateInstallStage(stage), detail, progress);
+            return new InstallStageState(TranslateInstallStage(stage), ProductInstallStageDetail(stage, status), detail, progress);
         }
 
         return null;
@@ -758,6 +762,40 @@ public partial class MainWindow : Window
             "Pull runtime policy" => "拉取运行策略",
             "Write health summary" => "写入健康摘要",
             _ => stage
+        };
+    }
+
+    private static string ProductInstallStageDetail(string stage, string status)
+    {
+        if (status.Equals("OK", StringComparison.OrdinalIgnoreCase))
+        {
+            return "已完成，正在继续下一步";
+        }
+        if (status.Equals("SKIP", StringComparison.OrdinalIgnoreCase))
+        {
+            return "此步骤无需执行，正在继续";
+        }
+        if (status.Equals("WARN", StringComparison.OrdinalIgnoreCase))
+        {
+            return "该步骤存在提示，安装将继续完成后续校验";
+        }
+        if (status.Equals("FAILED", StringComparison.OrdinalIgnoreCase))
+        {
+            return "该步骤未完成，已生成诊断包";
+        }
+
+        return stage switch
+        {
+            "Stop old Agent runtime" => "正在停止旧版本组件",
+            "Clean runtime cache" => "正在准备运行目录",
+            "Enroll and write configuration" => "正在注册终端并写入配置",
+            "Write local configuration" => "正在写入本地配置",
+            "Validate configuration" => "正在校验配置完整性",
+            "Install service/startup task" => "正在注册系统启动项",
+            "Start Agent runtime" => "正在启动终端组件",
+            "Pull runtime policy" => "正在同步运行策略",
+            "Write health summary" => "正在生成安装摘要",
+            _ => "正在执行安装步骤"
         };
     }
 
@@ -1999,52 +2037,41 @@ public partial class MainWindow : Window
         var stageState = ReadInstallStageState(installPath, handoffDir);
         if (stageState != null)
         {
-            parts.Add($"{stageState.Stage}：{stageState.Detail}");
+            parts.Add(stageState.Stage);
         }
 
         var enrollLog = ResolveInstallDiagnosticsFile(installPath, handoffDir, "enroll-output.log");
         if (File.Exists(enrollLog))
         {
             parts.Add("注册日志：" + enrollLog);
-            var enrollTail = ReadLogTail(enrollLog, 1000);
-            if (!string.IsNullOrWhiteSpace(enrollTail))
-            {
-                parts.Add("注册日志尾部：" + enrollTail);
-            }
         }
 
         if (File.Exists(innoLog))
         {
             parts.Add("Inno日志：" + innoLog);
-            var innoTail = ReadLogTail(innoLog, 1200);
-            if (!string.IsNullOrWhiteSpace(innoTail))
-            {
-                parts.Add("Inno日志尾部：" + innoTail);
-            }
         }
 
         return parts.Count == 0 ? "" : "；" + string.Join("；", parts);
     }
 
-    private static string ReadLogTail(string path, int maxChars)
+    private static string BuildUserFacingInstallFailure(string rawReason, string diagnosticsPath)
     {
-        try
+        var reason = Regex.Replace(rawReason ?? "", @"\s+", " ").Trim();
+        if (string.IsNullOrWhiteSpace(reason))
         {
-            if (!File.Exists(path))
-            {
-                return "";
-            }
-            var text = File.ReadAllText(path);
-            if (text.Length > maxChars)
-            {
-                text = text[^maxChars..];
-            }
-            return Regex.Replace(text, @"\s+", " ").Trim();
+            reason = "安装未完成";
         }
-        catch
+
+        var firstSegment = reason.Split('；', 2)[0].Trim();
+        if (firstSegment.Length > 96)
         {
-            return "";
+            firstSegment = firstSegment[..96] + "...";
         }
+
+        var suffix = string.IsNullOrWhiteSpace(diagnosticsPath)
+            ? "详细信息已写入安装诊断日志。"
+            : $"详细信息已保存到诊断包：{diagnosticsPath}";
+        return firstSegment + "。" + suffix;
     }
 
     private static CheckItem CheckSystemArchitecture()
@@ -2472,7 +2499,7 @@ public sealed class CheckItem
 
 public sealed record EndpointConfig(string ServerBase, string RestBase, string EnrollUrl, string ReadyUrl);
 
-public sealed record InstallStageState(string Stage, string Detail, int Progress);
+public sealed record InstallStageState(string Stage, string DisplayDetail, string DiagnosticDetail, int Progress);
 
 public sealed record BootstrapTrustMaterial(bool Enabled, string KeyId, string CaPem, string LeafSha256)
 {

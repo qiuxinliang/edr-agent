@@ -136,6 +136,8 @@ static unsigned long s_http2_multiplex_ok;
 static unsigned long s_http2_multiplex_fail;
 static volatile int s_http2_multiplex_active;
 static volatile int s_http2_negotiated;
+static int64_t s_http2_cert_problem_retry_after_ms;
+static int s_http2_cert_problem_warned;
 static char s_negotiated_protocol[16];
 static int s_transport_capability_logged;
 static int s_schannel_pem_warned;
@@ -319,13 +321,44 @@ static void compact_thumbprint(char *dst, size_t cap, const char *src) {
   dst[n] = '\0';
 }
 
+static void normalize_cert_store_path(char *s) {
+  char out[256];
+  size_t n = 0u;
+  int last_slash = 0;
+  const char *p;
+  if (!s || !s[0]) {
+    return;
+  }
+  for (p = s; *p && n + 1u < sizeof(out); ++p) {
+    char c = *p == '/' ? '\\' : *p;
+    if (c == '\\') {
+      if (last_slash) {
+        continue;
+      }
+      last_slash = 1;
+    } else {
+      last_slash = 0;
+    }
+    out[n++] = c;
+  }
+  while (n > 0u && out[n - 1u] == '\\') {
+    n--;
+  }
+  out[n] = '\0';
+  snprintf(s, 256, "%s", out);
+}
+
 static int build_schannel_cert_selector(char *dst, size_t cap) {
   char thumb[128];
+  char store_buf[256];
   const char *store = s_client_cert_store[0] ? s_client_cert_store : "CurrentUser\\MY";
   compact_thumbprint(thumb, sizeof(thumb), s_client_cert_thumbprint);
   if (!dst || cap == 0u || !thumb[0]) {
     return 0;
   }
+  snprintf(store_buf, sizeof(store_buf), "%s", store);
+  normalize_cert_store_path(store_buf);
+  store = store_buf;
   if (str_ends_with_ci(store, thumb)) {
     snprintf(dst, cap, "%s", store);
   } else {
@@ -858,6 +891,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   }
   if (client_cert_store && client_cert_store[0]) {
     snprintf(s_client_cert_store, sizeof(s_client_cert_store), "%s", client_cert_store);
+    normalize_cert_store_path(s_client_cert_store);
   }
   if (client_cert_thumbprint && client_cert_thumbprint[0]) {
     compact_thumbprint(s_client_cert_thumbprint, sizeof(s_client_cert_thumbprint),
@@ -2880,6 +2914,23 @@ static int h2_stream_retry_cooldown_ms(void) {
   return (int)env_ul_clamped("EDR_HTTP2_STREAM_RETRY_MS", 300000ul, 30000ul, 3600000ul);
 }
 
+static int h2_cert_problem_retry_cooldown_ms(void) {
+  return (int)env_ul_clamped("EDR_HTTP2_CERT_PROBLEM_RETRY_MS", 1800000ul, 30000ul, 3600000ul);
+}
+
+static void note_http2_cert_problem(void) {
+  int cooldown = h2_cert_problem_retry_cooldown_ms();
+  s_http2_cert_problem_retry_after_ms = unix_ms_now() + (int64_t)cooldown;
+  if (!s_http2_cert_problem_warned) {
+    s_http2_cert_problem_warned = 1;
+    fprintf(stderr,
+            "[transport] HTTP/2 Schannel client certificate selection failed; "
+            "suppressing h2 attempts for %dms and using HTTP/1.1 fallback "
+            "(check client_cert_store/client_cert_thumbprint/private key ACL)\n",
+            cooldown);
+  }
+}
+
 static void curl_multi_sync_init(void) {
 #ifdef _WIN32
   if (!s_curl_multi_mu_init) {
@@ -2945,6 +2996,9 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
   } else {
     s_http2_request_fail++;
     s_http2_multiplex_fail++;
+    if (result == CURLE_SSL_CERTPROBLEM) {
+      note_http2_cert_problem();
+    }
     fprintf(stderr,
             "[transport] HTTP/2 request failed result=%d(%s) http_status=%ld h2=%d "
             "http2_required=%d stream=%d\n",
@@ -3238,6 +3292,10 @@ static int curl_h2_allowed_for_url(const char *url) {
   if (!http2_client_enabled() || !url || strncmp(url, "https://", 8u) != 0) {
     return 0;
   }
+  if (!http2_required() && s_http2_cert_problem_retry_after_ms > 0 &&
+      unix_ms_now() < s_http2_cert_problem_retry_after_ms) {
+    return 0;
+  }
   return 1;
 }
 
@@ -3306,6 +3364,9 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
     return 0;
   }
   s_http2_request_fail++;
+  if (cc == CURLE_SSL_CERTPROBLEM) {
+    note_http2_cert_problem();
+  }
   fprintf(stderr,
           "[transport] HTTP/2 request failed method=%s result=%d(%s) http_status=%ld h2=%d "
           "http2_required=%d err=%s\n",
@@ -3362,6 +3423,9 @@ static int curl_h2_stream_loop(const char *url) {
     return 0;
   }
   s_http2_request_fail++;
+  if (cc == CURLE_SSL_CERTPROBLEM) {
+    note_http2_cert_problem();
+  }
   fprintf(stderr,
           "[ingest-stream] HTTP/2 control stream failed result=%d(%s) http_status=%ld "
           "h2=%d http2_required=%d parser_failed=%d err=%s\n",
@@ -4843,6 +4907,11 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   part = curl_mime_addpart(mime);
   curl_mime_name(part, "upload_id");
   curl_mime_data(part, upload_id, CURL_ZERO_TERMINATED);
+  if (s_endpoint[0]) {
+    part = curl_mime_addpart(mime);
+    curl_mime_name(part, "endpoint_id");
+    curl_mime_data(part, s_endpoint, CURL_ZERO_TERMINATED);
+  }
   part = curl_mime_addpart(mime);
   curl_mime_name(part, "sha256");
   curl_mime_data(part, sha256_hex ? sha256_hex : "", CURL_ZERO_TERMINATED);
@@ -4885,6 +4954,9 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
     return 0;
   }
   s_http2_request_fail++;
+  if (cc == CURLE_SSL_CERTPROBLEM) {
+    note_http2_cert_problem();
+  }
   return -1;
 }
 #endif
@@ -4991,6 +5063,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   FILE *file = NULL;
   size_t file_len = 0;
   char *uid = NULL;
+  char *eid = NULL;
   char *sha = NULL;
   char *fname = NULL;
   char content_type[160];
@@ -5060,22 +5133,25 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
 #endif
   filename = base_name_ptr(file_path);
   uid = json_escape_alloc(upload_id);
+  eid = json_escape_alloc(s_endpoint);
   sha = json_escape_alloc(sha256_hex ? sha256_hex : "");
   fname = json_escape_alloc(filename);
-  if (!uid || !sha || !fname) {
+  if (!uid || !eid || !sha || !fname) {
     fclose(file);
     free(uid);
+    free(eid);
     free(sha);
     free(fname);
     return -1;
   }
   snprintf(pre, sizeof(pre),
            "--%s\r\nContent-Disposition: form-data; name=\"upload_id\"\r\n\r\n%s\r\n"
+           "--%s\r\nContent-Disposition: form-data; name=\"endpoint_id\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"sha256\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"file_name\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
            "Content-Type: application/octet-stream\r\n\r\n",
-           boundary, uid, boundary, sha, boundary, fname, boundary, fname);
+           boundary, uid, boundary, eid, boundary, sha, boundary, fname, boundary, fname);
   snprintf(post, sizeof(post), "\r\n--%s--\r\n", boundary);
   snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
   resp[0] = '\0';
@@ -5101,6 +5177,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   }
   fclose(file);
   free(uid);
+  free(eid);
   free(sha);
   free(fname);
   return rc;
@@ -5336,6 +5413,44 @@ done:
 
 static void sleep_poll_ms(int ms);
 
+static int control_stream_reconnect_sleep_ms(int base_ms) {
+  unsigned long pct = env_ul_clamped("EDR_CONTROL_STREAM_RECONNECT_JITTER_PCT", 30ul, 0ul, 100ul);
+  unsigned long spread;
+  uint64_t h;
+  const unsigned char *p;
+  if (base_ms < 1000) {
+    base_ms = 1000;
+  }
+  spread = ((unsigned long)base_ms * pct) / 100ul;
+  if (spread == 0ul) {
+    return base_ms;
+  }
+  h = (uint64_t)unix_ms_now();
+  for (p = (const unsigned char *)s_endpoint; p && *p; ++p) {
+    h = (h * 131u) + (uint64_t)(*p);
+  }
+#ifdef _WIN32
+  h ^= (uint64_t)_getpid();
+#else
+  h ^= (uint64_t)getpid();
+#endif
+  return base_ms + (int)(h % (spread + 1ul));
+}
+
+static int control_stream_next_backoff_ms(int current_ms) {
+  int cap_ms = (int)env_ul_clamped("EDR_CONTROL_STREAM_RECONNECT_MAX_MS", 60000ul, 5000ul, 600000ul);
+  if (current_ms < 5000) {
+    current_ms = 5000;
+  }
+  if (current_ms < cap_ms) {
+    current_ms *= 2;
+    if (current_ms > cap_ms) {
+      current_ms = cap_ms;
+    }
+  }
+  return current_ms;
+}
+
 #ifdef _WIN32
 static unsigned __stdcall control_ws_thread(void *arg)
 #else
@@ -5343,6 +5458,7 @@ static void *control_ws_thread(void *arg)
 #endif
 {
   int backoff_ms = 5000;
+  int64_t connected_at_ms = 0;
   (void)arg;
   s_ws_backoff_ms = backoff_ms;
   while (s_poll_run) {
@@ -5394,13 +5510,8 @@ static void *control_ws_thread(void *arg)
                 h2_stream_retry_cooldown_ms());
       } else if (h2rc != -2) {
         s_ws_backoff_ms = backoff_ms;
-        sleep_poll_ms(backoff_ms);
-        if (backoff_ms < 60000) {
-          backoff_ms *= 2;
-          if (backoff_ms > 60000) {
-            backoff_ms = 60000;
-          }
-        }
+        sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
+        backoff_ms = control_stream_next_backoff_ms(backoff_ms);
         s_ws_backoff_ms = backoff_ms;
         continue;
       }
@@ -5410,13 +5521,8 @@ static void *control_ws_thread(void *arg)
       note_control_stream_failure();
       (void)route_note_failure("http1_stream_connect_failed");
       s_ws_backoff_ms = backoff_ms;
-      sleep_poll_ms(backoff_ms);
-      if (backoff_ms < 60000) {
-        backoff_ms *= 2;
-        if (backoff_ms > 60000) {
-          backoff_ms = 60000;
-        }
-      }
+      sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
+      backoff_ms = control_stream_next_backoff_ms(backoff_ms);
       s_ws_backoff_ms = backoff_ms;
       continue;
     }
@@ -5425,6 +5531,7 @@ static void *control_ws_thread(void *arg)
     note_http_request_success();
     note_control_stream_success();
     route_note_success();
+    connected_at_ms = unix_ms_now();
     backoff_ms = 5000;
     s_ws_backoff_ms = 0;
     fprintf(stderr, "[ingest-stream] control stream connected endpoint=%s\n", s_endpoint);
@@ -5436,10 +5543,18 @@ static void *control_ws_thread(void *arg)
     ws_close_conn(&conn);
     net_done();
     if (s_poll_run) {
+      int64_t connected_for_ms = unix_ms_now() - connected_at_ms;
+      int stable_ms = (int)env_ul_clamped("EDR_CONTROL_STREAM_STABLE_MS", 30000ul, 5000ul, 600000ul);
       fprintf(stderr,
               "[ingest-stream] control stream disconnected; HTTP long-poll fallback remains active\n");
       s_ws_backoff_ms = backoff_ms;
-      sleep_poll_ms(backoff_ms);
+      sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
+      if (connected_for_ms < (int64_t)stable_ms) {
+        backoff_ms = control_stream_next_backoff_ms(backoff_ms);
+      } else {
+        backoff_ms = 5000;
+      }
+      s_ws_backoff_ms = backoff_ms;
     }
   }
 #ifdef _WIN32
