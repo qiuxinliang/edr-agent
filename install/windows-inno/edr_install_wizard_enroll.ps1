@@ -58,10 +58,10 @@ function Format-ArgForLog {
 }
 
 function Format-ArgsForLog {
-  param([string[]]$Args)
+  param([string[]]$ArgList)
   $out = New-Object System.Collections.Generic.List[string]
   $redactNext = $false
-  foreach ($arg in $Args) {
+  foreach ($arg in $ArgList) {
     if ($redactNext) {
       $out.Add((Format-ArgForLog (Get-RedactedUrl $arg))) | Out-Null
       $redactNext = $false
@@ -109,9 +109,9 @@ function Quote-ProcessArgument {
 }
 
 function Join-ProcessArguments {
-  param([string[]]$Args)
-  if (-not $Args) { return "" }
-  return (($Args | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join " ")
+  param([string[]]$ArgList)
+  if (-not $ArgList -or $ArgList.Count -eq 0) { return "" }
+  return (($ArgList | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join " ")
 }
 
 function Invoke-CapturedProcess {
@@ -121,7 +121,9 @@ function Invoke-CapturedProcess {
   $stdoutPath = $tmpBase + ".out"
   $stderrPath = $tmpBase + ".err"
   try {
-    $p = Start-Process -FilePath $Exe -ArgumentList (Join-ProcessArguments $ArgList) `
+    $joinedArgs = Join-ProcessArguments $ArgList
+    if (-not $joinedArgs) { throw "missing process arguments for $Exe" }
+    $p = Start-Process -FilePath $Exe -ArgumentList $joinedArgs `
       -NoNewWindow -Wait -PassThru `
       -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     $stdout = if (Test-Path -LiteralPath $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }

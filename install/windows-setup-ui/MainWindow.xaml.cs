@@ -897,17 +897,18 @@ public partial class MainWindow : Window
             {
                 return false;
             }
-            if (!ShouldStageSetupUiDirectory(_baseDir))
+            var baseDir = CleanPathInput(_baseDir);
+            if (!ShouldStageSetupUiDirectory(baseDir))
             {
                 return false;
             }
-            var processPath = Environment.ProcessPath ?? "";
+            var processPath = CleanPathInput(Environment.ProcessPath ?? "");
             if (string.IsNullOrWhiteSpace(processPath) || !File.Exists(processPath))
             {
-                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_skipped reason=process_path_missing base={_baseDir}");
+                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_ui_stage_skipped reason=process_path_missing base={baseDir}");
                 return false;
             }
-            var sourceRoot = Path.GetFullPath(_baseDir);
+            var sourceRoot = Path.GetFullPath(baseDir);
             var cacheRoot = ResolveSetupUiAppCacheRoot();
             var cacheKey = ComputeShortHash(sourceRoot + "|" + GetFileCacheKey(processPath));
             var targetRoot = Path.Combine(cacheRoot, cacheKey);
@@ -1120,6 +1121,7 @@ public partial class MainWindow : Window
 
     private static string GetFileCacheKey(string path)
     {
+        path = CleanPathInput(path);
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             return path;
@@ -1829,6 +1831,7 @@ public partial class MainWindow : Window
 
     private static void AddAbsoluteCandidate(List<string> candidates, string root, params string[] parts)
     {
+        root = CleanPathInput(root);
         if (string.IsNullOrWhiteSpace(root))
         {
             return;
@@ -1919,6 +1922,7 @@ public partial class MainWindow : Window
 
     private static bool ShouldStageSetupUiDirectory(string path)
     {
+        path = CleanPathInput(path);
         if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
         {
             return false;
@@ -1974,6 +1978,11 @@ public partial class MainWindow : Window
     {
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
         return Convert.ToHexString(bytes).ToLowerInvariant()[..16];
+    }
+
+    private static string CleanPathInput(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Replace("\0", string.Empty).Trim();
     }
 
     private static void CopySetupUiRuntime(string sourceRoot, string targetRoot, string uiLog)
