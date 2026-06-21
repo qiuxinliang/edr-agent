@@ -38,6 +38,9 @@
 
 #ifdef EDR_HAVE_CURL_HTTP2
 #include <curl/curl.h>
+#if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x071900
+#define EDR_CURL_HAS_SSL_OPTIONS 1
+#endif
 #endif
 
 #ifdef EDR_HAVE_ZSTD
@@ -142,6 +145,7 @@ static int s_http2_cert_problem_warned;
 static char s_negotiated_protocol[16];
 static int s_transport_capability_logged;
 static int s_schannel_pem_warned;
+static int s_schannel_ssl_options_logged;
 static int s_alpn_log_state;
 static int64_t s_native_post_fail_log_until_ms;
 static unsigned long s_native_post_fail_log_suppressed;
@@ -410,7 +414,7 @@ static int curl_result_is_tls_cert_problem(CURLcode result) {
       ;
 }
 
-#ifdef CURLOPT_SSL_OPTIONS
+#ifdef EDR_CURL_HAS_SSL_OPTIONS
 static long curl_schannel_ssl_options(void) {
   long opts = 0L;
   const char *mode;
@@ -3354,10 +3358,16 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
     curl_easy_setopt(curl, CURLOPT_CAINFO, s_ca_file);
   }
   if (curl_ssl_backend_is_schannel()) {
-#ifdef CURLOPT_SSL_OPTIONS
+#ifdef EDR_CURL_HAS_SSL_OPTIONS
     long ssl_opts = curl_schannel_ssl_options();
     if (ssl_opts != 0L) {
       curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, ssl_opts);
+      if (!s_schannel_ssl_options_logged) {
+        const char *mode = getenv("EDR_SCHANNEL_REVOCATION_MODE");
+        s_schannel_ssl_options_logged = 1;
+        fprintf(stderr, "[transport] Schannel TLS revocation mode=%s ssl_options=0x%lx\n",
+                (mode && mode[0]) ? mode : "best_effort", ssl_opts);
+      }
     }
 #endif
     char selector[512];
