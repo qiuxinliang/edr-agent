@@ -400,6 +400,50 @@ static int curl_schannel_store_mtls_needs_libcurl_http1(const char *url) {
   }
   return !env_bool_default("EDR_SCHANNEL_MTLS_OPENSSL_FALLBACK", 0);
 }
+
+static int curl_result_is_tls_cert_problem(CURLcode result) {
+  return result == CURLE_SSL_CERTPROBLEM ||
+         result == CURLE_PEER_FAILED_VERIFICATION
+#ifdef CURLE_SSL_CACERT_BADFILE
+         || result == CURLE_SSL_CACERT_BADFILE
+#endif
+      ;
+}
+
+#ifdef CURLOPT_SSL_OPTIONS
+static long curl_schannel_ssl_options(void) {
+  long opts = 0L;
+  const char *mode;
+  if (!curl_ssl_backend_is_schannel()) {
+    return 0L;
+  }
+  mode = getenv("EDR_SCHANNEL_REVOCATION_MODE");
+  if (mode && mode[0]) {
+    if (ascii_eq_ci(mode, "strict")) {
+      return 0L;
+    }
+#ifdef CURLSSLOPT_NO_REVOKE
+    if (ascii_eq_ci(mode, "off") || ascii_eq_ci(mode, "none") ||
+        ascii_eq_ci(mode, "disabled") || ascii_eq_ci(mode, "disable")) {
+      opts |= (long)CURLSSLOPT_NO_REVOKE;
+      return opts;
+    }
+#endif
+  }
+#ifdef CURLSSLOPT_REVOKE_BEST_EFFORT
+  if (env_bool_default("EDR_SCHANNEL_REVOCATION_BEST_EFFORT",
+                       (s_ca_file[0] || schannel_store_mtls_configured()) ? 1 : 0)) {
+    opts |= (long)CURLSSLOPT_REVOKE_BEST_EFFORT;
+  }
+#elif defined(CURLSSLOPT_NO_REVOKE)
+  if (env_bool_default("EDR_SCHANNEL_REVOCATION_BEST_EFFORT",
+                       (s_ca_file[0] || schannel_store_mtls_configured()) ? 1 : 0)) {
+    opts |= (long)CURLSSLOPT_NO_REVOKE;
+  }
+#endif
+  return opts;
+}
+#endif
 #endif
 
 static void log_transport_capabilities_once(void) {
@@ -2973,15 +3017,15 @@ static void note_http2_cert_problem(void) {
     s_http2_cert_problem_warned = 1;
     if (http2_required()) {
       fprintf(stderr,
-              "[transport] HTTP/2 Schannel client certificate selection failed; "
+              "[transport] HTTP/2 TLS certificate verification failed; "
               "suppressing h2 attempts for %dms; HTTP/2 is required so communication will fail "
-              "until client_cert_store/client_cert_thumbprint/private key ACL are fixed\n",
+              "until certificate trust/revocation/client certificate settings are fixed\n",
               cooldown);
     } else {
       fprintf(stderr,
-              "[transport] HTTP/2 Schannel client certificate selection failed; "
+              "[transport] HTTP/2 TLS certificate verification failed; "
               "suppressing h2 attempts for %dms and using HTTP/1.1 fallback "
-              "(check client_cert_store/client_cert_thumbprint/private key ACL)\n",
+              "(check server CA/revocation/client certificate settings)\n",
               cooldown);
     }
   }
@@ -3067,7 +3111,7 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
     s_http2_multiplex_fail++;
     note_http2_failure_reason(job->stream_ctx ? "stream-multiplex" : "request-multiplex",
                               result, job->response_code, job->h2, NULL);
-    if (result == CURLE_SSL_CERTPROBLEM) {
+    if (curl_result_is_tls_cert_problem(result)) {
       note_http2_cert_problem();
     }
     fprintf(stderr,
@@ -3310,6 +3354,12 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
     curl_easy_setopt(curl, CURLOPT_CAINFO, s_ca_file);
   }
   if (curl_ssl_backend_is_schannel()) {
+#ifdef CURLOPT_SSL_OPTIONS
+    long ssl_opts = curl_schannel_ssl_options();
+    if (ssl_opts != 0L) {
+      curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, ssl_opts);
+    }
+#endif
     char selector[512];
     if (build_schannel_cert_selector(selector, sizeof(selector))) {
       curl_easy_setopt(curl, CURLOPT_SSLCERT, selector);
@@ -3467,7 +3517,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   }
   s_http2_request_fail++;
   note_http2_failure_reason(method ? method : "request", cc, code, h2, errbuf);
-  if (cc == CURLE_SSL_CERTPROBLEM) {
+  if (curl_result_is_tls_cert_problem(cc)) {
     note_http2_cert_problem();
   }
   fprintf(stderr,
@@ -3603,7 +3653,7 @@ static int curl_h2_stream_loop(const char *url) {
   }
   s_http2_request_fail++;
   note_http2_failure_reason("control-stream", cc, code, h2, errbuf);
-  if (cc == CURLE_SSL_CERTPROBLEM) {
+  if (curl_result_is_tls_cert_problem(cc)) {
     note_http2_cert_problem();
   }
   fprintf(stderr,
@@ -5216,7 +5266,7 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   }
   s_http2_request_fail++;
   note_http2_failure_reason("upload-file", cc, code, h2, NULL);
-  if (cc == CURLE_SSL_CERTPROBLEM) {
+  if (curl_result_is_tls_cert_problem(cc)) {
     note_http2_cert_problem();
   }
   return -1;
