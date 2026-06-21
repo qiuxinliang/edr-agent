@@ -75,6 +75,72 @@ function Format-ArgsForLog {
   return ($out -join " ")
 }
 
+function Quote-ProcessArgument {
+  param([string]$Value)
+  if ($null -eq $Value) { return '""' }
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+    return $Value
+  }
+  $out = New-Object System.Text.StringBuilder
+  [void]$out.Append('"')
+  $slashes = 0
+  foreach ($ch in $Value.ToCharArray()) {
+    if ($ch -eq '\') {
+      $slashes++
+      continue
+    }
+    if ($ch -eq '"') {
+      [void]$out.Append(('\' * (($slashes * 2) + 1)))
+      [void]$out.Append('"')
+      $slashes = 0
+      continue
+    }
+    if ($slashes -gt 0) {
+      [void]$out.Append(('\' * $slashes))
+      $slashes = 0
+    }
+    [void]$out.Append($ch)
+  }
+  if ($slashes -gt 0) {
+    [void]$out.Append(('\' * ($slashes * 2)))
+  }
+  [void]$out.Append('"')
+  return $out.ToString()
+}
+
+function Join-ProcessArguments {
+  param([string[]]$Args)
+  if (-not $Args) { return "" }
+  return (($Args | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join " ")
+}
+
+function Invoke-CapturedProcess {
+  param([string]$Exe, [string[]]$ArgList)
+  if (-not $Exe) { throw "missing executable" }
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Exe
+  $psi.Arguments = Join-ProcessArguments $ArgList
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+  try {
+    [void]$p.Start()
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    return [pscustomobject]@{
+      ExitCode = [int]$p.ExitCode
+      Stdout = [string]$stdout
+      Stderr = [string]$stderr
+    }
+  } finally {
+    $p.Dispose()
+  }
+}
+
 if (-not (Test-Path -LiteralPath $ParamsFile)) {
   Write-EnrollLog "ERROR missing params file: $ParamsFile"
   Write-Error "Missing params file: $ParamsFile"
@@ -195,14 +261,19 @@ Write-EnrollLog ("child_command={0} {1}" -f (Format-ArgForLog $psExe), (Format-A
 
 $exitCode = 0
 try {
-  & $psExe @childArgs *>&1 | ForEach-Object {
-    $line = [string]$_
-    Write-EnrollLog ("child: {0}" -f $line)
-    Write-Host $line
+  $child = Invoke-CapturedProcess -Exe $psExe -ArgList $childArgs
+  foreach ($blockName in @("stdout", "stderr")) {
+    $text = if ($blockName -eq "stdout") { $child.Stdout } else { $child.Stderr }
+    if (-not $text) { continue }
+    foreach ($line in ($text -split "`r?`n")) {
+      if (-not $line) { continue }
+      Write-EnrollLog ("child/{0}: {1}" -f $blockName, $line)
+      Write-Host $line
+    }
   }
-  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+  $exitCode = [int]$child.ExitCode
 } catch {
-  $msg = $_.Exception.Message
+  $msg = $_.Exception.ToString()
   Write-EnrollLog ("ERROR child invocation failed: {0}" -f $msg)
   Write-Error ("bundled installer script invocation failed; log={0}; error={1}" -f $EnrollLogPath, $msg)
 }

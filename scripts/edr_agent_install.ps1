@@ -311,8 +311,9 @@ function Test-ExistingAgentTomlWithAgent {
       continue
     }
     try {
-      $out = (& $exe "--config" $ConfigPath "--config-test" 2>&1 | Out-String).Trim()
-      if ($LASTEXITCODE -eq 0) {
+      $result = Invoke-CapturedProcess -Exe $exe -ArgList @("--config", $ConfigPath, "--config-test")
+      $out = (($result.Stdout, $result.Stderr | Where-Object { $_ }) -join "`n").Trim()
+      if ($result.ExitCode -eq 0) {
         return ""
       }
       if ($out.Length -gt 240) {
@@ -476,20 +477,90 @@ function Resolve-OpenSSL {
   Write-Error ("openssl not found. Native PowerShell CSR generation was unavailable, and these paths were checked: " + ($candidates -join "; "))
 }
 
+function Quote-ProcessArgument {
+  param([string]$Value)
+  if ($null -eq $Value) { return '""' }
+  if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+    return $Value
+  }
+  $out = New-Object System.Text.StringBuilder
+  [void]$out.Append('"')
+  $slashes = 0
+  foreach ($ch in $Value.ToCharArray()) {
+    if ($ch -eq '\') {
+      $slashes++
+      continue
+    }
+    if ($ch -eq '"') {
+      [void]$out.Append(('\' * (($slashes * 2) + 1)))
+      [void]$out.Append('"')
+      $slashes = 0
+      continue
+    }
+    if ($slashes -gt 0) {
+      [void]$out.Append(('\' * $slashes))
+      $slashes = 0
+    }
+    [void]$out.Append($ch)
+  }
+  if ($slashes -gt 0) {
+    [void]$out.Append(('\' * ($slashes * 2)))
+  }
+  [void]$out.Append('"')
+  return $out.ToString()
+}
+
+function Join-ProcessArguments {
+  param([string[]]$ArgList)
+  if (-not $ArgList) { return "" }
+  return (($ArgList | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join " ")
+}
+
+function Invoke-CapturedProcess {
+  param([string]$Exe, [string[]]$ArgList)
+  if (-not $Exe) {
+    throw "missing executable"
+  }
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Exe
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  $psi.Arguments = Join-ProcessArguments $ArgList
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+  try {
+    [void]$p.Start()
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    return [pscustomobject]@{
+      ExitCode = [int]$p.ExitCode
+      Stdout = [string]$stdout
+      Stderr = [string]$stderr
+    }
+  } finally {
+    $p.Dispose()
+  }
+}
+
 function Invoke-Checked {
   param([string]$Exe, [string[]]$ArgList)
-  $output = & $Exe @ArgList 2>&1
-  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
-  if ($output) {
-    $output | ForEach-Object { Write-Host ([string]$_) }
+  $result = Invoke-CapturedProcess -Exe $Exe -ArgList $ArgList
+  $combined = @()
+  if ($result.Stdout) { $combined += ($result.Stdout -split "`r?`n") }
+  if ($result.Stderr) { $combined += ($result.Stderr -split "`r?`n") }
+  foreach ($line in $combined) {
+    if ($line) { Write-Host ([string]$line) }
   }
-  if ($exitCode -ne 0) {
-    $detail = if ($output) { (($output | ForEach-Object { [string]$_ }) -join "`n").Trim() } else { "" }
+  if ($result.ExitCode -ne 0) {
+    $detail = (($combined | Where-Object { $_ }) -join "`n").Trim()
     $cmd = $Exe + " " + ($ArgList -join " ")
     if ($detail) {
-      Write-Error ("command failed exit_code={0}: {1}`n{2}" -f $exitCode, $cmd, $detail)
+      throw ("command failed exit_code={0}: {1}`n{2}" -f $result.ExitCode, $cmd, $detail)
     }
-    Write-Error ("command failed exit_code={0}: {1}" -f $exitCode, $cmd)
+    throw ("command failed exit_code={0}: {1}" -f $result.ExitCode, $cmd)
   }
 }
 
@@ -844,6 +915,7 @@ ProviderName = "$ProviderName"
 KeyContainer = "$safeKeyName"
 MachineKeySet = TRUE
 Exportable = FALSE
+KeySpec = 0
 RequestType = PKCS10
 Silent = TRUE
 
