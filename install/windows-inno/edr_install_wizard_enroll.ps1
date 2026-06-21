@@ -117,27 +117,22 @@ function Join-ProcessArguments {
 function Invoke-CapturedProcess {
   param([string]$Exe, [string[]]$ArgList)
   if (-not $Exe) { throw "missing executable" }
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $Exe
-  $psi.Arguments = Join-ProcessArguments $ArgList
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
-  $psi.CreateNoWindow = $true
-  $p = New-Object System.Diagnostics.Process
-  $p.StartInfo = $psi
+  $tmpBase = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("fdproc-" + [guid]::NewGuid().ToString("N")))
+  $stdoutPath = $tmpBase + ".out"
+  $stderrPath = $tmpBase + ".err"
   try {
-    [void]$p.Start()
-    $stdout = $p.StandardOutput.ReadToEnd()
-    $stderr = $p.StandardError.ReadToEnd()
-    $p.WaitForExit()
+    $p = Start-Process -FilePath $Exe -ArgumentList (Join-ProcessArguments $ArgList) `
+      -NoNewWindow -Wait -PassThru `
+      -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $stdout = if (Test-Path -LiteralPath $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }
+    $stderr = if (Test-Path -LiteralPath $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { "" }
     return [pscustomobject]@{
       ExitCode = [int]$p.ExitCode
       Stdout = [string]$stdout
       Stderr = [string]$stderr
     }
   } finally {
-    $p.Dispose()
+    Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
   }
 }
 
