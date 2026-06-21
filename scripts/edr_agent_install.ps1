@@ -1272,7 +1272,7 @@ $EffectiveClientKeyPath = if ($useCertPaths -and $effectiveKeyProvider -eq "pem"
 $EffectiveCertStore = if ($UseNativeWindowsStore) { "LocalMachine\MY" } else { "" }
 $EffectiveCertThumbprint = ""
 
-$Http2Enabled = if ($null -ne $d.http2_enabled) { [bool]$d.http2_enabled } else { $true }
+$Http2Enabled = if ($null -ne $d.http2_enabled) { [bool]$d.http2_enabled } else { $false }
 $Http2Require = if ($null -ne $d.http2_require) { [bool]$d.http2_require } else { $false }
 $ControlStreamEnabled = if ($null -ne $d.control_stream_enabled) { [bool]$d.control_stream_enabled } else { $true }
 $LongPollFallback = if ($null -ne $d.long_poll_fallback) { [bool]$d.long_poll_fallback } else { $true }
@@ -1281,7 +1281,7 @@ $DataPlaneEncoding = if ($d.data_plane_encoding) { [string]$d.data_plane_encodin
 $DataPlaneCompression = if ($d.data_plane_compression) { [string]$d.data_plane_compression } else { "identity" }
 $ControlDictVersion = if ($d.control_dict_version) { [string]$d.control_dict_version } else { "edr-zstd-dict-v1" }
 $ControlSchemaVersion = if ($d.control_schema_version) { [string]$d.control_schema_version } else { "edr-control-schema-v1" }
-$ControlProfileID = if ($d.control_profile_id) { [string]$d.control_profile_id } else { "default-h2-zstd" }
+$ControlProfileID = if ($d.control_profile_id) { [string]$d.control_profile_id } else { "default-http1-protobuf" }
 $ConfigSigningKeyID = if ($d.config_signing_key_id) { [string]$d.config_signing_key_id } else { "" }
 $ConfigSigningPublicKeyPEM = if ($d.config_signing_public_key_pem) { [string]$d.config_signing_public_key_pem } else { "" }
 $ConfigSignatureRequired = if ($null -ne $d.config_signature_required) { [bool]$d.config_signature_required } else { [bool]($ConfigSigningKeyID -and $ConfigSigningPublicKeyPEM) }

@@ -1531,6 +1531,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
   char http_mtls_status[128], http_key_provider[48];
   char http_negotiated_protocol[32], http_control_status[48], http_upload_status[48];
+  char http2_last_error[192];
   char http_data_encoding[48], http_data_compression[48], http_envelope_format[64];
   char http_dict_ver[96], http_schema_ver[96], http_profile_id[96];
   char http_zstd_dict_path[640];
@@ -1594,6 +1595,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.mtls_status, http_mtls_status, sizeof(http_mtls_status));
   json_escape_small(http_rt.client_key_provider, http_key_provider, sizeof(http_key_provider));
   json_escape_small(http_rt.negotiated_protocol, http_negotiated_protocol, sizeof(http_negotiated_protocol));
+  json_escape_small(http_rt.http2_last_error, http2_last_error, sizeof(http2_last_error));
   json_escape_small(http_rt.control_stream_status, http_control_status, sizeof(http_control_status));
   json_escape_small(http_rt.upload_status, http_upload_status, sizeof(http_upload_status));
   json_escape_small(http_rt.data_plane_encoding, http_data_encoding, sizeof(http_data_encoding));
@@ -1642,6 +1644,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"budget_drops\":%lu},\"slo\":{\"success_rate_pct\":%u},"
         "\"protocol\":{\"http2_enabled\":%s,\"http2_required\":%s,"
         "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
+        "\"http2_last_error\":\"%s\",\"http2_cert_error_count\":%lu,"
         "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
         "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
         "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
@@ -1725,6 +1728,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
         http_rt.http2_enabled ? "true" : "false", http_rt.http2_required ? "true" : "false",
         http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
+        http2_last_error, http_rt.http2_cert_error_count,
         http_rt.control_stream_enabled ? "true" : "false",
         http_rt.control_stream_ready ? "true" : "false", http_control_status,
         http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
@@ -1877,7 +1881,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"control_stream_heartbeat\":%lu,"
       "\"control_ack_ok\":%lu,\"control_ack_fail\":%lu,"
       "\"http2_request_ok\":%lu,\"http2_request_fail\":%lu,"
-      "\"http2_negotiated\":%lu,\"http2_fallback\":%lu},"
+      "\"http2_negotiated\":%lu,\"http2_fallback\":%lu,"
+      "\"http2_cert_error\":%lu},"
       "\"send_queue_depth\":%llu,\"send_queue_capacity\":%llu,"
       "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
       "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
@@ -1898,6 +1903,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"slo\":{\"success_rate_pct\":%u},"
       "\"protocol\":{\"http2_enabled\":%s,\"http2_required\":%s,"
       "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
+      "\"http2_last_error\":\"%s\",\"http2_cert_error_count\":%lu,"
       "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
       "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
       "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
@@ -2031,6 +2037,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      http_rt.control_ack_ok_count, http_rt.control_ack_fail_count,
 	      http_rt.http2_request_ok_count, http_rt.http2_request_fail_count,
 	      http_rt.http2_negotiated_count, http_rt.http2_fallback_count,
+	      http_rt.http2_cert_error_count,
 	      (unsigned long long)edr_transport_send_queue_depth(),
 	      (unsigned long long)edr_transport_send_queue_capacity(),
 	      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
@@ -2062,6 +2069,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
       http_rt.http2_enabled ? "true" : "false", http_rt.http2_required ? "true" : "false",
       http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
+      http2_last_error, http_rt.http2_cert_error_count,
       http_rt.control_stream_enabled ? "true" : "false",
       http_rt.control_stream_ready ? "true" : "false", http_control_status,
       http_rt.long_poll_fallback ? "true" : "false", http_upload_status,

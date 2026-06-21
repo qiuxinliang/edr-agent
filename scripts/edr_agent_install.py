@@ -79,6 +79,16 @@ def _emit_toml(
         f'rest_base_url        = "{_toml_escape(rest_base)}"',
         'rest_user_id         = ""',
         'rest_bearer_token    = ""',
+        "http2_enabled        = false",
+        "http2_require        = false",
+        "control_stream_enabled = true",
+        "long_poll_fallback   = true",
+        "report_events_v2_enabled = true",
+        'data_plane_encoding  = "protobuf"',
+        'data_plane_compression = "identity"',
+        'control_dict_version = "edr-zstd-dict-v1"',
+        'control_schema_version = "edr-control-schema-v1"',
+        'control_profile_id   = "default-http1-protobuf"',
         "",
     ]
     return "\n".join(lines)

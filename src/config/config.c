@@ -1770,7 +1770,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->config_signing.signature_required = false;
   cfg->config_signing.signing_key_id[0] = '\0';
   cfg->config_signing.public_key_pem[0] = '\0';
-  cfg->platform.http2_enabled = true;
+  cfg->platform.http2_enabled = false;
   cfg->platform.http2_require = false;
   cfg->platform.control_stream_enabled = true;
   cfg->platform.long_poll_fallback = true;
@@ -1779,7 +1779,8 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->platform.data_plane_compression, sizeof(cfg->platform.data_plane_compression), "%s", "identity");
   snprintf(cfg->platform.control_dict_version, sizeof(cfg->platform.control_dict_version), "%s", "edr-zstd-dict-v1");
   snprintf(cfg->platform.control_schema_version, sizeof(cfg->platform.control_schema_version), "%s", "edr-control-schema-v1");
-  snprintf(cfg->platform.control_profile_id, sizeof(cfg->platform.control_profile_id), "%s", "default-h2-zstd");
+  snprintf(cfg->platform.control_profile_id, sizeof(cfg->platform.control_profile_id), "%s",
+           "default-http1-protobuf");
   snprintf(cfg->platform.qos_dscp, sizeof(cfg->platform.qos_dscp), "%s", "AF21");
   snprintf(cfg->platform.telemetry_threshold, sizeof(cfg->platform.telemetry_threshold), "%s", "medium");
   cfg->platform.telemetry_sampling_pct = 100u;

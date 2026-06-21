@@ -79,7 +79,7 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
     tv2_copy(s_cfg.schema_ver, sizeof(s_cfg.schema_ver), cfg->platform.control_schema_version,
              "edr-control-schema-v1");
     tv2_copy(s_cfg.profile_id, sizeof(s_cfg.profile_id), cfg->platform.control_profile_id,
-             "default-h2-zstd");
+             "default-http1-protobuf");
     tv2_copy(s_cfg.qos_dscp, sizeof(s_cfg.qos_dscp), cfg->platform.qos_dscp, "AF21");
     tv2_copy(s_cfg.threshold, sizeof(s_cfg.threshold), cfg->platform.telemetry_threshold, "medium");
     s_cfg.zstd_requested = strcmp(s_cfg.data_plane_compression, "zstd") == 0 ? 1 : 0;
@@ -88,7 +88,7 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
     tv2_copy(s_cfg.data_plane_compression, sizeof(s_cfg.data_plane_compression), NULL, "identity");
     tv2_copy(s_cfg.dict_ver, sizeof(s_cfg.dict_ver), NULL, "edr-zstd-dict-v1");
     tv2_copy(s_cfg.schema_ver, sizeof(s_cfg.schema_ver), NULL, "edr-control-schema-v1");
-    tv2_copy(s_cfg.profile_id, sizeof(s_cfg.profile_id), NULL, "default-h2-zstd");
+    tv2_copy(s_cfg.profile_id, sizeof(s_cfg.profile_id), NULL, "default-http1-protobuf");
     tv2_copy(s_cfg.qos_dscp, sizeof(s_cfg.qos_dscp), NULL, "AF21");
     tv2_copy(s_cfg.threshold, sizeof(s_cfg.threshold), NULL, "medium");
   }
@@ -129,7 +129,7 @@ void edr_transport_v2_get_runtime(EdrTransportV2Runtime *out) {
            s_cfg.report_events_v2_enabled ? "protobuf:edr.transport.envelope.v1" : "legacy_json_b64");
   tv2_copy(out->dict_ver, sizeof(out->dict_ver), s_cfg.dict_ver, "edr-zstd-dict-v1");
   tv2_copy(out->schema_ver, sizeof(out->schema_ver), s_cfg.schema_ver, "edr-control-schema-v1");
-  tv2_copy(out->profile_id, sizeof(out->profile_id), s_cfg.profile_id, "default-h2-zstd");
+  tv2_copy(out->profile_id, sizeof(out->profile_id), s_cfg.profile_id, "default-http1-protobuf");
   tv2_copy(out->qos_dscp, sizeof(out->qos_dscp), s_cfg.qos_dscp, "AF21");
   tv2_copy(out->threshold, sizeof(out->threshold), s_cfg.threshold, "medium");
 }

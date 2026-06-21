@@ -76,6 +76,7 @@ typedef struct {
   unsigned long http2_request_fail_count;
   unsigned long http2_negotiated_count;
   unsigned long http2_fallback_count;
+  unsigned long http2_cert_error_count;
   unsigned long report_events_v2_ok_count;
   unsigned long report_events_v2_fail_count;
   unsigned long zstd_compress_ok_count;
@@ -101,6 +102,7 @@ typedef struct {
   char client_key_provider[32];
   char mtls_status[96];
   char negotiated_protocol[16];
+  char http2_last_error[160];
   char control_stream_status[32];
   char upload_status[32];
   char data_plane_encoding[32];
