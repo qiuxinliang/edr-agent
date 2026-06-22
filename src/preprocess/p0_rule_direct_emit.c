@@ -262,6 +262,35 @@ static int p0_is_edge_update_temp_baseline(const EdrBehaviorRecord *br, const ch
   return 0;
 }
 
+static int p0_is_sangfor_checknetisolation_baseline(const EdrBehaviorRecord *br, const char *detail) {
+  const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
+  if (!br) {
+    return 0;
+  }
+  if (!(p0_contains_ci(br->parent_name, "ECAgent.exe") ||
+        p0_contains_ci(br->parent_path, "\\Sangfor\\SSL\\") ||
+        p0_contains_ci(br->grandparent_name, "ECAgent.exe") ||
+        p0_contains_ci(br->detection_context, "ECAgent.exe") ||
+        p0_contains_ci(br->detection_context, "\\Sangfor\\SSL\\"))) {
+    return 0;
+  }
+  if ((p0_contains_ci(br->process_name, "CheckNetIsolation.exe") ||
+       p0_contains_ci(br->exe_path, "\\CheckNetIsolation.exe") ||
+       p0_contains_ci(cmd, "CheckNetIsolation.exe")) &&
+      p0_contains_ci(cmd, "LoopbackExempt")) {
+    return 1;
+  }
+  if ((p0_contains_ci(br->process_name, "conhost.exe") ||
+       p0_contains_ci(br->exe_path, "\\conhost.exe") ||
+       p0_contains_ci(cmd, "conhost.exe")) &&
+      (p0_contains_ci(br->parent_name, "CheckNetIsolation.exe") ||
+       p0_contains_ci(br->parent_path, "\\CheckNetIsolation.exe") ||
+       p0_contains_ci(br->detection_context, "CheckNetIsolation.exe"))) {
+    return 1;
+  }
+  return 0;
+}
+
 static int p0_should_suppress_known_false_positive(const char *rule_id, const EdrBehaviorRecord *br,
                                                    const char *detail, const char **out_reason) {
   if (out_reason) {
@@ -279,6 +308,12 @@ static int p0_should_suppress_known_false_positive(const char *rule_id, const Ed
   if (strcmp(rule_id, "R-LOLBIN-010") == 0 && p0_is_edge_update_temp_baseline(br, detail)) {
     if (out_reason) {
       *out_reason = "microsoft_edge_update_temp_baseline";
+    }
+    return 1;
+  }
+  if (strcmp(rule_id, "R-LOLBIN-010") == 0 && p0_is_sangfor_checknetisolation_baseline(br, detail)) {
+    if (out_reason) {
+      *out_reason = "sangfor_checknetisolation_baseline";
     }
     return 1;
   }
