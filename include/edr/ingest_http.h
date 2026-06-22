@@ -188,6 +188,9 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
 /** 发送 Agent 引擎运行态 JSON；body 需为完整 JSON 对象。 */
 int edr_ingest_http_post_engine_health_json(const char *body_json);
 
+/** 发送轻量在线心跳；独立于详细健康监控开关。 */
+int edr_ingest_http_post_heartbeat(void);
+
 /** 上报指令执行结果；与 gRPC ReportCommandResult 语义一致。 */
 int edr_ingest_http_post_command_result(const char *command_id,
                                         const struct EdrSoarCommandMeta *meta,

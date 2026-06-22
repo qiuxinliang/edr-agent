@@ -5014,6 +5014,42 @@ int edr_ingest_http_post_engine_health_json(const char *body_json) {
   return 0;
 }
 
+int edr_ingest_http_post_heartbeat(void) {
+  char *endpoint = NULL;
+  char *agent = NULL;
+  char *policy = NULL;
+  char body[512];
+  int n;
+  int rc;
+  if (!edr_ingest_http_configured() || !s_endpoint[0]) {
+    return -1;
+  }
+  endpoint = json_escape_alloc(s_endpoint);
+  agent = json_escape_alloc(s_agent_ver[0] ? s_agent_ver : EDR_AGENT_VERSION_STRING);
+  policy = json_escape_alloc(s_policy_version[0] ? s_policy_version : "local");
+  if (!endpoint || !agent || !policy) {
+    free(endpoint);
+    free(agent);
+    free(policy);
+    return -1;
+  }
+  n = snprintf(body, sizeof(body),
+               "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\"}",
+               endpoint, agent, policy);
+  free(endpoint);
+  free(agent);
+  free(policy);
+  if (n <= 0 || (size_t)n >= sizeof(body)) {
+    return -1;
+  }
+  rc = post_to_suffix("ingest/heartbeat", body);
+  if (rc != 0) {
+    log_native_post_failure("heartbeat", rc);
+    return -1;
+  }
+  return 0;
+}
+
 int edr_ingest_http_post_config_status(const char *tenant_id,
                                        const char *endpoint_id,
                                        const char *agent_version,

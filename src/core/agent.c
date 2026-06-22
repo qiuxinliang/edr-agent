@@ -1297,6 +1297,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
 static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns);
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
+static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns);
 
 static int edr_agent_collection_enabled(const EdrConfig *cfg) {
@@ -1324,6 +1325,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
     uint64_t last_remote_ns = 0;
     uint64_t last_p0_bundle_ns = 0;
     uint64_t last_sensor_interest_ns = 0;
+    uint64_t last_heartbeat_ns = 0;
     uint64_t last_health_ns = 0;
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
@@ -1361,6 +1363,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SENSOR_INTEREST,
                              edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ATTACK_SURFACE, edr_agent_poll_attack_surface(agent));
+        edr_agent_poll_heartbeat(&last_heartbeat_ns);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ENGINE_HEALTH,
                              edr_agent_poll_engine_health(agent, &last_health_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
@@ -1430,6 +1433,28 @@ static void edr_agent_config_recovery_json(const EdrAgent *agent, char *out, siz
            agent->config_recovery_fields_extracted,
            recovered, backup,
            agent->config_recovery_auto_repaired ? "true" : "false");
+}
+
+static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns) {
+  int interval = 60;
+  const char *iv;
+  uint64_t now;
+  if (!last_heartbeat_ns || !edr_ingest_http_configured()) {
+    return;
+  }
+  iv = getenv("EDR_AGENT_HEARTBEAT_INTERVAL_S");
+  if (iv && iv[0]) {
+    int v = atoi(iv);
+    if (v >= 30 && v <= 600) {
+      interval = v;
+    }
+  }
+  now = edr_monotonic_ns();
+  if (now - *last_heartbeat_ns < (uint64_t)interval * 1000000000ULL) {
+    return;
+  }
+  *last_heartbeat_ns = now;
+  (void)edr_ingest_http_post_heartbeat();
 }
 
 static void edr_agent_poll_probe_json(char *out, size_t cap) {
