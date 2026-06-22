@@ -77,6 +77,10 @@ typedef struct EdrConfig {
     bool low_value_file_process;
     bool low_value_file_suffix;
     bool temp_xml;
+    char low_value_process_names[1024];
+    char low_value_suffixes[1024];
+    char temp_xml_patterns[1024];
+    char agent_internal_patterns[1024];
   } event_filter;
 
   struct {

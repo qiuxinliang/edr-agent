@@ -47,6 +47,16 @@ void edr_windows_event_policy_configure(const EdrWindowsEventFilterConfig *cfg) 
     g_event_filter_cfg.temp_xml = cfg->temp_xml ? 1u : 0u;
     snprintf(g_event_filter_cfg.version, sizeof(g_event_filter_cfg.version), "%s",
              cfg->version[0] ? cfg->version : EDR_EVENT_FILTER_VERSION_DEFAULT);
+    snprintf(g_event_filter_cfg.low_value_process_names,
+             sizeof(g_event_filter_cfg.low_value_process_names), "%s",
+             cfg->low_value_process_names);
+    snprintf(g_event_filter_cfg.low_value_suffixes, sizeof(g_event_filter_cfg.low_value_suffixes),
+             "%s", cfg->low_value_suffixes);
+    snprintf(g_event_filter_cfg.temp_xml_patterns, sizeof(g_event_filter_cfg.temp_xml_patterns),
+             "%s", cfg->temp_xml_patterns);
+    snprintf(g_event_filter_cfg.agent_internal_patterns,
+             sizeof(g_event_filter_cfg.agent_internal_patterns), "%s",
+             cfg->agent_internal_patterns);
   } else {
     g_event_filter_cfg.enabled = 1u;
     g_event_filter_cfg.agent_internal_forensic = 1u;
@@ -55,6 +65,18 @@ void edr_windows_event_policy_configure(const EdrWindowsEventFilterConfig *cfg) 
     g_event_filter_cfg.temp_xml = 1u;
     snprintf(g_event_filter_cfg.version, sizeof(g_event_filter_cfg.version), "%s",
              EDR_EVENT_FILTER_VERSION_DEFAULT);
+    snprintf(g_event_filter_cfg.low_value_process_names,
+             sizeof(g_event_filter_cfg.low_value_process_names), "%s",
+             "svchost.exe, runtimebroker.exe, backgroundtaskhost.exe, "
+             "microsoftedgeupdate.exe, mousocoreworker.exe");
+    snprintf(g_event_filter_cfg.low_value_suffixes, sizeof(g_event_filter_cfg.low_value_suffixes),
+             "%s", ":wofcompresseddata, .js.map, .tmp, .etl, .blf, .regtrans-ms, .cache");
+    snprintf(g_event_filter_cfg.temp_xml_patterns, sizeof(g_event_filter_cfg.temp_xml_patterns),
+             "%s", "\\appdata\\local\\temp\\xml_file");
+    snprintf(g_event_filter_cfg.agent_internal_patterns,
+             sizeof(g_event_filter_cfg.agent_internal_patterns), "%s",
+             "\\edr_forensic\\, /edr_forensic/, cmd_forensic_, auto-forensic_, "
+             "forensic_bundle, source=agent_internal");
   }
   reset_event_filter_counters();
 }
@@ -157,6 +179,63 @@ static int any_ends(const char *s, const char *const *items, size_t count) {
   return 0;
 }
 
+static int next_list_token(const char **cursor, char *out, size_t cap) {
+  const char *p;
+  size_t n = 0u;
+  if (!cursor || !*cursor || !out || cap == 0u) {
+    return 0;
+  }
+  p = *cursor;
+  while (*p && (*p == ',' || *p == ';' || *p == '\n' || *p == '\r' ||
+                isspace((unsigned char)*p))) {
+    p++;
+  }
+  while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+    if (n + 1u < cap) {
+      out[n++] = *p;
+    }
+    p++;
+  }
+  while (n > 0u && isspace((unsigned char)out[n - 1u])) {
+    n--;
+  }
+  out[n] = '\0';
+  *cursor = p;
+  return n > 0u;
+}
+
+static int list_contains_ci(const char *hay, const char *list) {
+  const char *cursor = list;
+  char token[160];
+  if (!hay || !hay[0] || !list || !list[0]) {
+    return 0;
+  }
+  while (next_list_token(&cursor, token, sizeof(token))) {
+    if (has_ci_path(hay, token)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int list_ends_or_contains_ci(const char *hay, const char *list) {
+  const char *cursor = list;
+  char token[160];
+  if (!hay || !hay[0] || !list || !list[0]) {
+    return 0;
+  }
+  while (next_list_token(&cursor, token, sizeof(token))) {
+    if (token[0] == ':' || token[0] == '\\' || token[0] == '/') {
+      if (has_ci_path(hay, token)) {
+        return 1;
+      }
+    } else if (ends_ci_path(hay, token) || has_ci_path(hay, token)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int process_name_is(const EdrBehaviorRecord *r, const char *name) {
   return r && name && name[0] && has_ci_path(r->process_name, name);
 }
@@ -198,6 +277,12 @@ static int low_value_file_process_record(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
+  if (list_contains_ci(r->process_name, g_event_filter_cfg.low_value_process_names) ||
+      list_contains_ci(r->exe_path, g_event_filter_cfg.low_value_process_names) ||
+      list_contains_ci(r->cmdline, g_event_filter_cfg.low_value_process_names) ||
+      list_contains_ci(r->file_path, g_event_filter_cfg.low_value_process_names)) {
+    return 1;
+  }
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
     if (record_mentions_process(r, names[i])) {
       return 1;
@@ -220,6 +305,12 @@ static void mark_noisy(EdrWindowsEventPolicy *p, const char *reason, const char 
 static int agent_internal_forensic_activity(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
+  }
+  if (list_contains_ci(r->file_path, g_event_filter_cfg.agent_internal_patterns) ||
+      list_contains_ci(r->cmdline, g_event_filter_cfg.agent_internal_patterns) ||
+      list_contains_ci(r->script_snippet, g_event_filter_cfg.agent_internal_patterns) ||
+      list_contains_ci(r->detection_context, g_event_filter_cfg.agent_internal_patterns)) {
+    return 1;
   }
   return has_ci_path(r->file_path, "\\edr_forensic\\") ||
          has_ci_path(r->file_path, "/edr_forensic/") ||
@@ -465,8 +556,10 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_noisy(p, "windowsapps_language_or_sourcemap_noise", "noise_windowsapps_cache");
   }
   if (!p->high_value && g_event_filter_cfg.temp_xml &&
-      has_ci_path(path, "\\appdata\\local\\temp\\xml_file")) {
+      (has_ci_path(path, "\\appdata\\local\\temp\\xml_file") ||
+       list_contains_ci(path, g_event_filter_cfg.temp_xml_patterns))) {
     mark_noisy(p, "temp_xml_low_value_file", "noise_temp_xml");
+    return;
   }
   if (!p->high_value && g_event_filter_cfg.low_value_file_process &&
       low_value_file_process_record(r)) {
@@ -476,10 +569,12 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       (has_ci_path(path, ":wofcompresseddata") || has_ci_path(path, ".js.map") ||
        has_ci_path(path, ".tmp") || has_ci_path(path, ".etl") || has_ci_path(path, ".blf") ||
        has_ci_path(path, ".regtrans-ms") || has_ci_path(path, ".cache") ||
+       list_ends_or_contains_ci(path, g_event_filter_cfg.low_value_suffixes) ||
        (has_ci_path(path, "\\appdata\\local\\temp\\") &&
         (has_ci_path(path, ".log") || has_ci_path(path, ".dat") ||
          has_ci_path(path, ".json") || has_ci_path(path, ".xml"))))) {
     mark_noisy(p, "known_low_value_file_suffix", "noise_suffix");
+    return;
   }
 }
 

@@ -31,6 +31,10 @@ typedef struct {
   uint8_t low_value_file_suffix;
   uint8_t temp_xml;
   char version[64];
+  char low_value_process_names[1024];
+  char low_value_suffixes[1024];
+  char temp_xml_patterns[1024];
+  char agent_internal_patterns[1024];
 } EdrWindowsEventFilterConfig;
 
 typedef struct {

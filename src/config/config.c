@@ -541,6 +541,18 @@ static void load_event_filter(toml_table_t *t, EdrConfig *cfg) {
       cfg->event_filter.temp_xml = d.u.b ? true : false;
     }
   }
+  take_string(toml_string_in(t, "low_value_process_names"),
+              cfg->event_filter.low_value_process_names,
+              sizeof(cfg->event_filter.low_value_process_names));
+  take_string(toml_string_in(t, "low_value_suffixes"),
+              cfg->event_filter.low_value_suffixes,
+              sizeof(cfg->event_filter.low_value_suffixes));
+  take_string(toml_string_in(t, "temp_xml_patterns"),
+              cfg->event_filter.temp_xml_patterns,
+              sizeof(cfg->event_filter.temp_xml_patterns));
+  take_string(toml_string_in(t, "agent_internal_patterns"),
+              cfg->event_filter.agent_internal_patterns,
+              sizeof(cfg->event_filter.agent_internal_patterns));
 }
 
 static void rule_take_str(toml_table_t *rt, const char *key, char *dst, size_t cap) {
@@ -1605,6 +1617,18 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->event_filter.low_value_file_process = true;
   cfg->event_filter.low_value_file_suffix = true;
   cfg->event_filter.temp_xml = true;
+  snprintf(cfg->event_filter.low_value_process_names,
+           sizeof(cfg->event_filter.low_value_process_names), "%s",
+           "svchost.exe, runtimebroker.exe, backgroundtaskhost.exe, "
+           "microsoftedgeupdate.exe, mousocoreworker.exe");
+  snprintf(cfg->event_filter.low_value_suffixes, sizeof(cfg->event_filter.low_value_suffixes),
+           "%s", ":wofcompresseddata, .js.map, .tmp, .etl, .blf, .regtrans-ms, .cache");
+  snprintf(cfg->event_filter.temp_xml_patterns, sizeof(cfg->event_filter.temp_xml_patterns),
+           "%s", "\\appdata\\local\\temp\\xml_file");
+  snprintf(cfg->event_filter.agent_internal_patterns,
+           sizeof(cfg->event_filter.agent_internal_patterns), "%s",
+           "\\edr_forensic\\, /edr_forensic/, cmd_forensic_, auto-forensic_, "
+           "forensic_bundle, source=agent_internal");
 
   cfg->preprocessing.dedup_window_s = 30u;
   cfg->preprocessing.high_freq_threshold = 100u;

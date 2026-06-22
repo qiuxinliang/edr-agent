@@ -1190,6 +1190,14 @@ static void edr_agent_apply_event_filter_config(const EdrConfig *cfg) {
   fc.low_value_file_suffix = cfg->event_filter.low_value_file_suffix ? 1u : 0u;
   fc.temp_xml = cfg->event_filter.temp_xml ? 1u : 0u;
   snprintf(fc.version, sizeof(fc.version), "%s", cfg->event_filter.version);
+  snprintf(fc.low_value_process_names, sizeof(fc.low_value_process_names), "%s",
+           cfg->event_filter.low_value_process_names);
+  snprintf(fc.low_value_suffixes, sizeof(fc.low_value_suffixes), "%s",
+           cfg->event_filter.low_value_suffixes);
+  snprintf(fc.temp_xml_patterns, sizeof(fc.temp_xml_patterns), "%s",
+           cfg->event_filter.temp_xml_patterns);
+  snprintf(fc.agent_internal_patterns, sizeof(fc.agent_internal_patterns), "%s",
+           cfg->event_filter.agent_internal_patterns);
   edr_windows_event_policy_configure(&fc);
 }
 
