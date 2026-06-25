@@ -109,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -
 | **服务自恢复** | `sc.exe failure` 配置失败重启 |
 | **ACL** | `%ProgramFiles%\EDR Agent` 仅系统/管理员写；脚本会为服务账户授予队列、日志、取证缓存等运行时子目录写权限 |
 | **自保护** | 生产模板启用 `[self_protect] anti_debug`、`job_object_windows`、watchdog 与事件总线压力告警 |
-| **隔离 hook** | 设置 `EDR_ISOLATE_HOOK` 指向 `windows_isolate_host.ps1 -Action Enable` |
+| **主机隔离** | 默认 `enforce`：随包 `windows_isolate_host.ps1` 自动生效（Defender 默认 Block + 放行管理服务器）。agent 会用后端 IP 自动填 `EDR_ISOLATE_ALLOW_REMOTE_ADDRS` 保证管理通道存活;需自定义可设 `EDR_ISOLATE_HOOK`,`EDR_ISOLATE_MODE=stamp` 退回纯标记。脚本须随包落到 agent 同目录或其 `scripts/`(或设 `EDR_ISOLATE_SCRIPT`),服务以可写防火墙的特权账户运行 |
 | **取证上传可靠性** | 设置 `EDR_UPLOAD_FILE_RETRIES=3`；上传失败时保留本地 `bundle.tgz` 并在命令结果中返回路径 |
 
 如需以 **LOCAL SERVICE** 运行，可传 `-Account "NT AUTHORITY\LocalService"`；全量 ETW、WinDivert、取证等能力仍可能需要 LocalSystem 或额外特权。

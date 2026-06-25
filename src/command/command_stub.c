@@ -45,11 +45,16 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <sddl.h>
 #include <winevt.h>
 #else
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -68,6 +73,7 @@ unsigned long g_cmd_exec_fail;
 
 static int64_t command_now_ms(void);
 static uint64_t command_monotonic_ms(void);
+static int file_exists_c(const char *path);
 
 static EdrCommandDeliveryHealth s_delivery_health;
 static int64_t s_upload_outbox_next_retry_ms;
@@ -939,14 +945,59 @@ static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const Edr
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 5, "refuse self");
     return;
   }
-  if (kill((pid_t)pid, SIGTERM) == 0) {
+  /* SIGTERM 优雅终止 → 宽限期确认 → 仍存活则升级 SIGKILL。
+     避免进程 trap/忽略 SIGTERM 后存活、却被报成功(假成功)。 */
+  if (kill((pid_t)pid, SIGTERM) != 0) {
+    if (errno == ESRCH) {
+      s_exec_ok++;
+      audit_both(cmd_id, "kill: 进程不存在(视为已终止)");
+      soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "process already gone");
+    } else {
+      s_exec_fail++;
+      audit_both(cmd_id, "kill: kill() 失败");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, "kill() failed");
+    }
+    return;
+  }
+  int gone = 0;
+  for (int i = 0; i < 20; i++) { /* 最多 ~2s 等待优雅退出 */
+    struct timespec ts = {0, 100L * 1000L * 1000L};
+    nanosleep(&ts, NULL);
+    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+      gone = 1;
+      break;
+    }
+  }
+  if (gone) {
     s_exec_ok++;
-    audit_both(cmd_id, "kill: 已发送 SIGTERM");
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "SIGTERM sent");
-  } else {
+    audit_both(cmd_id, "kill: SIGTERM 后进程已退出");
+    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "terminated via SIGTERM");
+    return;
+  }
+  /* 仍存活 → 强制 SIGKILL。 */
+  if (kill((pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
     s_exec_fail++;
-    audit_both(cmd_id, "kill: kill() 失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, "kill() failed");
+    audit_both(cmd_id, "kill: SIGKILL 失败");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 8, "SIGKILL failed");
+    return;
+  }
+  for (int i = 0; i < 10; i++) { /* 最多 ~1s 确认 SIGKILL 生效 */
+    struct timespec ts = {0, 100L * 1000L * 1000L};
+    nanosleep(&ts, NULL);
+    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+      gone = 1;
+      break;
+    }
+  }
+  if (gone) {
+    s_exec_ok++;
+    audit_both(cmd_id, "kill: SIGTERM 无效,已用 SIGKILL 终止");
+    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "terminated via SIGKILL");
+  } else {
+    /* SIGKILL 已送达但仍在进程表(僵尸/不可中断 D 态);如实报失败,不谎报成功。 */
+    s_exec_fail++;
+    audit_both(cmd_id, "kill: SIGKILL 后进程仍存在(僵尸/不可中断)");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 9, "alive after SIGKILL");
   }
 #endif
 }
@@ -971,6 +1022,187 @@ static void isolate_stamp_path(char *path, size_t cap) {
   }
 }
 
+static void isolate_setenv(const char *k, const char *v) {
+#ifdef _WIN32
+  (void)_putenv_s(k, v ? v : "");
+#else
+  (void)setenv(k, v ? v : "", 1);
+#endif
+}
+
+/* 可执行文件所在目录。 */
+static int isolate_self_dir(char *out, size_t cap) {
+#ifdef _WIN32
+  char buf[1024];
+  DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)sizeof(buf));
+  if (n == 0 || n >= sizeof(buf)) {
+    return -1;
+  }
+  char *slash = strrchr(buf, '\\');
+  if (!slash) {
+    return -1;
+  }
+  *slash = '\0';
+  snprintf(out, cap, "%s", buf);
+  return 0;
+#else
+  char buf[1024];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1u);
+  if (n <= 0) {
+    return -1;
+  }
+  buf[n] = '\0';
+  char *slash = strrchr(buf, '/');
+  if (!slash) {
+    return -1;
+  }
+  *slash = '\0';
+  snprintf(out, cap, "%s", buf);
+  return 0;
+#endif
+}
+
+/* 解析随包隔离脚本:EDR_ISOLATE_SCRIPT > 可执行同目录 > 同目录 scripts/。 */
+static int isolate_resolve_script(char *out, size_t cap) {
+  const char *ov = getenv("EDR_ISOLATE_SCRIPT");
+  if (ov && ov[0]) {
+    snprintf(out, cap, "%s", ov);
+    return file_exists_c(out) ? 0 : -1;
+  }
+  char dir[1024];
+  if (isolate_self_dir(dir, sizeof(dir)) != 0) {
+    return -1;
+  }
+#ifdef _WIN32
+  const char *name = "windows_isolate_host.ps1";
+  snprintf(out, cap, "%s\\%s", dir, name);
+  if (file_exists_c(out)) return 0;
+  snprintf(out, cap, "%s\\scripts\\%s", dir, name);
+  if (file_exists_c(out)) return 0;
+#else
+  const char *name = "linux_isolate_host.sh";
+  snprintf(out, cap, "%s/%s", dir, name);
+  if (file_exists_c(out)) return 0;
+  snprintf(out, cap, "%s/scripts/%s", dir, name);
+  if (file_exists_c(out)) return 0;
+#endif
+  return -1;
+}
+
+/* 隔离前自动放行管理通道:若运维未显式设 EDR_ISOLATE_ALLOW_REMOTE_ADDRS,
+   则从后端 rest_base 解析 host→IP 并注入,确保隔离后 agent↔后端 仍可达
+   (否则收不到 restore 命令,主机将永久失联)。 */
+static void isolate_autofill_allowlist(void) {
+  if (getenv("EDR_ISOLATE_ALLOW_REMOTE_ADDRS")) {
+    return; /* 尊重运维显式配置 */
+  }
+  char base[512];
+  base[0] = '\0';
+  edr_ingest_http_get_rest_base(base, sizeof(base));
+  if (!base[0]) {
+    return;
+  }
+  char host[256] = {0};
+  char port[16] = {0};
+  const char *p = strstr(base, "://");
+  p = p ? p + 3 : base;
+  size_t i = 0;
+  while (*p && *p != ':' && *p != '/' && i < sizeof(host) - 1u) {
+    host[i++] = *p++;
+  }
+  host[i] = '\0';
+  if (*p == ':') {
+    p++;
+    size_t j = 0;
+    while (*p && *p != '/' && j < sizeof(port) - 1u) {
+      port[j++] = *p++;
+    }
+    port[j] = '\0';
+  }
+  if (!host[0]) {
+    return;
+  }
+  if (!port[0]) {
+    snprintf(port, sizeof(port), "%s", strncmp(base, "https", 5) == 0 ? "443" : "80");
+  }
+  char addrs[512];
+  addrs[0] = '\0';
+#ifndef _WIN32
+  struct addrinfo hints, *res = NULL, *it;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(host, NULL, &hints, &res) == 0) {
+    for (it = res; it; it = it->ai_next) {
+      char ip[INET6_ADDRSTRLEN] = {0};
+      void *sa = NULL;
+      if (it->ai_family == AF_INET) {
+        sa = &((struct sockaddr_in *)it->ai_addr)->sin_addr;
+      } else if (it->ai_family == AF_INET6) {
+        sa = &((struct sockaddr_in6 *)it->ai_addr)->sin6_addr;
+      }
+      if (sa && inet_ntop(it->ai_family, sa, ip, sizeof(ip))) {
+        if (addrs[0]) {
+          strncat(addrs, ",", sizeof(addrs) - strlen(addrs) - 1u);
+        }
+        strncat(addrs, ip, sizeof(addrs) - strlen(addrs) - 1u);
+      }
+    }
+    freeaddrinfo(res);
+  }
+#endif
+  if (!addrs[0]) {
+    /* 解析失败或 Windows:放行 host 字面量(Windows ps1 会自行将主机名解析成 IP)。 */
+    snprintf(addrs, sizeof(addrs), "%s", host);
+  }
+  isolate_setenv("EDR_ISOLATE_ALLOW_REMOTE_ADDRS", addrs);
+  if (!getenv("EDR_ISOLATE_ALLOW_REMOTE_PORTS")) {
+    char ports[32];
+    if (strcmp(port, "443") == 0) {
+      snprintf(ports, sizeof(ports), "443");
+    } else {
+      snprintf(ports, sizeof(ports), "%s,443", port);
+    }
+    isolate_setenv("EDR_ISOLATE_ALLOW_REMOTE_PORTS", ports);
+  }
+}
+
+/* 运行隔离 enforcement。返回 0=成功;-1=失败;-2=无可用 enforcement(无 hook 且无脚本)。
+   优先 EDR_ISOLATE_HOOK/EDR_RESTORE_HOOK(运维自定义);否则随包脚本(ps1/sh)。 */
+static int isolate_run(int enable, const char *cmd_id) {
+  isolate_setenv("EDR_CMD_ID", cmd_id ? cmd_id : "");
+  const char *hook;
+  if (enable) {
+    hook = getenv("EDR_ISOLATE_HOOK");
+  } else {
+    hook = getenv("EDR_RESTORE_HOOK");
+    if (!hook || !hook[0]) {
+      hook = getenv("EDR_ISOLATE_RESTORE_HOOK");
+    }
+  }
+  if (hook && hook[0]) {
+    return (system(hook) == 0) ? 0 : -1;
+  }
+  char script[1024];
+  if (isolate_resolve_script(script, sizeof(script)) != 0) {
+    return -2;
+  }
+  char cmd[1400];
+#ifdef _WIN32
+  snprintf(cmd, sizeof(cmd),
+           "powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Action %s", script,
+           enable ? "Enable" : "Remove");
+#else
+  snprintf(cmd, sizeof(cmd), "/bin/sh \"%s\" %s", script, enable ? "enable" : "remove");
+#endif
+  return (system(cmd) == 0) ? 0 : -1;
+}
+
+static int isolate_stamp_only_mode(void) {
+  const char *mode = getenv("EDR_ISOLATE_MODE");
+  return (mode && strcmp(mode, "stamp") == 0) ? 1 : 0;
+}
+
 static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
@@ -978,6 +1210,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
+  /* 写状态标记(供 isolate_status / 响应查询;非 enforcement 本身)。 */
   char path[512];
   isolate_stamp_path(path, sizeof(path));
   FILE *f = fopen(path, "w");
@@ -985,36 +1218,58 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     fprintf(f, "isolated=1\ncommand_id=%s\nupdated_unix_ms=%lld\n", cmd_id ? cmd_id : "",
             (long long)command_now_ms());
     fclose(f);
-    s_exec_ok++;
-    audit_both(cmd_id, "isolate: 已写标记文件");
-  } else {
-    s_exec_fail++;
-    audit_both(cmd_id, "isolate: 写文件失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "stamp write failed");
-    return;
   }
-  const char *hook = getenv("EDR_ISOLATE_HOOK");
-  if (hook && hook[0]) {
-#ifdef _WIN32
-    (void)_putenv_s("EDR_CMD_ID", cmd_id ? cmd_id : "");
-#else
-    (void)setenv("EDR_CMD_ID", cmd_id ? cmd_id : "", 1);
-#endif
-    int r = system(hook);
-    if (r == 0) {
-      audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 执行成功");
-    } else {
-      audit_both(cmd_id, "isolate: EDR_ISOLATE_HOOK 返回非零");
-      (void)remove(path);
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolate hook non-zero");
-      return;
+
+  if (isolate_stamp_only_mode()) {
+    /* 旧行为:仅标记(+可选 hook),用于依赖外部驱动读取标记的部署。 */
+    const char *hook = getenv("EDR_ISOLATE_HOOK");
+    if (hook && hook[0]) {
+      isolate_setenv("EDR_CMD_ID", cmd_id ? cmd_id : "");
+      if (system(hook) != 0) {
+        (void)remove(path);
+        s_exec_fail++;
+        audit_both(cmd_id, "isolate(stamp): EDR_ISOLATE_HOOK 返回非零");
+        soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolate hook non-zero");
+        return;
+      }
     }
-  }
-  {
+    s_exec_ok++;
+    audit_both(cmd_id, "isolate: stamp-only 模式(未施加网络 enforcement)");
     char pathj[700], detail[1024];
     json_escape_to(pathj, sizeof(pathj), path);
-    snprintf(detail, sizeof(detail), "{\"status\":\"isolated\",\"stamp_path\":%s,\"hook\":\"%s\"}",
-             pathj, (hook && hook[0]) ? "executed" : "not_configured");
+    snprintf(detail, sizeof(detail),
+             "{\"status\":\"isolated\",\"method\":\"stamp\",\"stamp_path\":%s}", pathj);
+    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+    return;
+  }
+
+  /* 默认:真实网络隔离。先自动放行管理通道,再施加防火墙隔离。 */
+  isolate_autofill_allowlist();
+  int rc = isolate_run(1, cmd_id);
+  if (rc != 0) {
+    (void)remove(path); /* 不谎报:enforcement 未生效则不留隔离标记 */
+    s_exec_fail++;
+    if (rc == -2) {
+      audit_both(cmd_id,
+                 "isolate: 未找到 enforcement(设 EDR_ISOLATE_HOOK 或随包 isolate 脚本;或 EDR_ISOLATE_MODE=stamp)");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "no isolation enforcement available");
+    } else {
+      audit_both(cmd_id, "isolate: 网络 enforcement 失败");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolation enforcement failed");
+    }
+    return;
+  }
+  s_exec_ok++;
+  audit_both(cmd_id, "isolate: 已施加网络隔离");
+  {
+    const char *hook = getenv("EDR_ISOLATE_HOOK");
+    const char *allow = getenv("EDR_ISOLATE_ALLOW_REMOTE_ADDRS");
+    char pathj[700], allowj[600], detail[1500];
+    json_escape_to(pathj, sizeof(pathj), path);
+    json_escape_to(allowj, sizeof(allowj), allow ? allow : "");
+    snprintf(detail, sizeof(detail),
+             "{\"status\":\"isolated\",\"method\":\"%s\",\"stamp_path\":%s,\"allow_addrs\":%s}",
+             (hook && hook[0]) ? "hook" : "builtin", pathj, allowj);
     soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
   }
 }
@@ -1028,23 +1283,28 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   }
   char path[512];
   isolate_stamp_path(path, sizeof(path));
-  const char *hook = getenv("EDR_RESTORE_HOOK");
-  if (!hook || !hook[0]) {
-    hook = getenv("EDR_ISOLATE_RESTORE_HOOK");
-  }
-  if (hook && hook[0]) {
-#ifdef _WIN32
-    (void)_putenv_s("EDR_CMD_ID", cmd_id ? cmd_id : "");
-#else
-    (void)setenv("EDR_CMD_ID", cmd_id ? cmd_id : "", 1);
-#endif
-    int r = system(hook);
-    if (r != 0) {
-      s_exec_fail++;
-      audit_both(cmd_id, "restore_host: restore hook non-zero");
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "restore hook non-zero");
-      return;
+
+  int rc = 0;
+  if (isolate_stamp_only_mode()) {
+    const char *hook = getenv("EDR_RESTORE_HOOK");
+    if (!hook || !hook[0]) {
+      hook = getenv("EDR_ISOLATE_RESTORE_HOOK");
     }
+    if (hook && hook[0]) {
+      isolate_setenv("EDR_CMD_ID", cmd_id ? cmd_id : "");
+      rc = (system(hook) == 0) ? 0 : -1;
+    }
+  } else {
+    rc = isolate_run(0, cmd_id);
+    if (rc == -2) {
+      rc = 0; /* 无 hook/脚本:无 enforcement 可撤,视作已恢复(仅清标记)。 */
+    }
+  }
+  if (rc != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "restore_host: enforcement 撤销失败");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "restore enforcement failed");
+    return;
   }
   if (remove(path) != 0 && errno != ENOENT) {
     s_exec_fail++;
@@ -1057,8 +1317,7 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   {
     char pathj[700], detail[1024];
     json_escape_to(pathj, sizeof(pathj), path);
-    snprintf(detail, sizeof(detail), "{\"status\":\"restored\",\"stamp_path\":%s,\"hook\":\"%s\"}",
-             pathj, (hook && hook[0]) ? "executed" : "not_configured");
+    snprintf(detail, sizeof(detail), "{\"status\":\"restored\",\"stamp_path\":%s}", pathj);
     audit_both(cmd_id, "restore_host: ok");
     soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
   }
@@ -1316,6 +1575,32 @@ static int move_file_cross_volume(const char *src, const char *dst) {
     return 0;
   }
   return -1;
+#endif
+}
+
+/* 隔离件加锁:防止被读回 / 再次执行(证据保全)。
+   Windows:受限 DACL(仅 Administrators+SYSTEM 全权,其余因无 ACE 隐式拒绝)+ 只读/隐藏/系统属性;
+   POSIX:chmod 0400(去执行/写位,仅属主可读,以便特权 agent 后续还原)。 */
+static void quarantine_lock(const char *p) {
+#ifdef _WIN32
+  PSECURITY_DESCRIPTOR sd = NULL;
+  if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+          "D:P(A;;FA;;;BA)(A;;FA;;;SY)", SDDL_REVISION_1, &sd, NULL)) {
+    (void)SetFileSecurityA(p, DACL_SECURITY_INFORMATION, sd);
+    LocalFree(sd);
+  }
+  (void)SetFileAttributesA(p, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+#else
+  (void)chmod(p, 0400);
+#endif
+}
+
+/* 还原前解锁:清掉只读/隐藏/系统属性,确保 move/删除可进行。 */
+static void quarantine_unlock(const char *p) {
+#ifdef _WIN32
+  (void)SetFileAttributesA(p, FILE_ATTRIBUTE_NORMAL);
+#else
+  (void)chmod(p, 0600);
 #endif
 }
 
@@ -2401,6 +2686,7 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "quarantine move failed");
     return;
   }
+  quarantine_lock(qpath); /* 加锁:去执行/限访问,防读回或再执行 */
   FILE *mf = fopen(meta, "w");
   if (mf) {
     fprintf(mf, "quarantine_id=%s\noriginal_path=%s\nquarantine_path=%s\nsha256=%s\nsize=%llu\nmtime=%lld\nreason=%s\n",
@@ -2414,7 +2700,7 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
   json_escape_to(metaj, sizeof(metaj), meta);
   snprintf(detail, sizeof(detail),
            "{\"quarantine_id\":%s,\"original_path\":%s,\"quarantine_path\":%s,"
-           "\"meta_path\":%s,\"sha256\":\"%s\",\"size\":%llu}",
+           "\"meta_path\":%s,\"sha256\":\"%s\",\"size\":%llu,\"locked\":true}",
            stemj, pathj, qpathj, metaj, sha, sz);
   s_handled++;
   s_exec_ok++;
@@ -2481,6 +2767,7 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "restore target already exists");
     return;
   }
+  quarantine_unlock(qpath); /* 解锁:清属性,确保还原 move/删除可进行 */
   if (move_file_cross_volume(qpath, restore) != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "unquarantine_file: restore failed");
@@ -3292,7 +3579,9 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "kill_process") || streq(t, "kill") ||
          streq(t, "collect_forensic") || streq(t, "forensic") ||
          streq(t, "memory_dump") || streq(t, "memdump") ||
-         streq(t, "targeted_forensic") ||
+         streq(t, "targeted_forensic") || streq(t, "forensic_targeted") ||
+         streq(t, "yara_scan") ||
+         streq(t, "deep_forensic") || streq(t, "collector") || streq(t, "collector:start") ||
          streq(t, "put_file") || streq(t, "rtr_put_file") || streq(t, "rtr_file_put") ||
          streq(t, "rtr_get_file") || streq(t, "rtr_file_get") || streq(t, "get_file") ||
          streq(t, "RTR_GET_FILE") || streq(t, "rtr_rm_file") || streq(t, "rtr_file_rm") ||
@@ -3620,8 +3909,16 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     edr_response_memory_dump(id, payload, payload_len, sm);
     return;
   }
-  if (streq(t, "targeted_forensic")) {
+  if (streq(t, "targeted_forensic") || streq(t, "forensic_targeted")) {
     edr_response_targeted_forensic(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "yara_scan")) {
+    edr_response_yara_scan(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "deep_forensic") || streq(t, "collector") || streq(t, "collector:start")) {
+    edr_response_deep_forensic(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "put_file") || streq(t, "rtr_put_file") || streq(t, "rtr_file_put")) {

@@ -13,9 +13,8 @@ extern "C" {
 void edr_response_kill(const char *cmd_id, const uint8_t *pl, size_t len,
                        const EdrSoarCommandMeta *sm);
 
-void edr_response_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm);
-void edr_response_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm);
-void edr_response_isolate_auto_from_shellcode(void);
+/* 主机隔离/恢复已统一到 command_stub.c 的 do_isolate / do_restore_host(真实 OS 网络隔离)。
+ * 旧的 stamp-only edr_response_isolate / _restore_host / _isolate_auto_from_shellcode 已删除。 */
 
 void edr_response_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len,
                                   const EdrSoarCommandMeta *sm);

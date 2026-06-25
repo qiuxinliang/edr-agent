@@ -88,6 +88,21 @@ function Enable-Isolation {
   if ($env:EDR_ISOLATE_ALLOW_REMOTE_ADDRS) {
     $addrs = $env:EDR_ISOLATE_ALLOW_REMOTE_ADDRS.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
   }
+  # New-NetFirewallRule -RemoteAddress 只接受 IP/CIDR/range,不接受主机名:
+  # 把任何非 IP 条目通过 DNS 解析成 IP(agent 在 Windows 上可能传入后端主机名)。
+  $resolved = @()
+  foreach ($a in $addrs) {
+    if ($a -match '/' -or $a -match '^\d{1,3}(\.\d{1,3}){3}$' -or $a -match ':') {
+      $resolved += $a   # 已是 IPv4 / CIDR / IPv6
+    } else {
+      try {
+        [System.Net.Dns]::GetHostAddresses($a) | ForEach-Object { $resolved += $_.IPAddressToString }
+      } catch {
+        Write-Host "warn: cannot resolve management host '$a'; skipping (set EDR_ISOLATE_ALLOW_REMOTE_ADDRS to explicit IPs)"
+      }
+    }
+  }
+  $addrs = $resolved | Select-Object -Unique
   foreach ($addr in $addrs) {
     Invoke-Step "Allow outbound management traffic to $addr ports $ports" {
       New-NetFirewallRule -DisplayName "$Prefix Allow Mgmt $addr" -Direction Outbound `

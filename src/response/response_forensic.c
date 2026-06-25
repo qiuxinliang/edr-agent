@@ -521,8 +521,16 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 5, "MiniDumpWriteDump failed");
     return;
   }
-  char result[512];
-  snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s", pid, dmpPath);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int up_rc = edr_transport_v2_upload_file(cmd_id, dmpPath, NULL, minio_key, sizeof(minio_key));
+  char result[700];
+  if (up_rc == 0) {
+    snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s minio_key=%.400s", pid, dmpPath,
+             minio_key[0] ? minio_key : "(ok)");
+  } else {
+    snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s upload=failed", pid, dmpPath);
+  }
   edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
   edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 #else
@@ -548,8 +556,17 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
     total += nr;
   }
   fclose(src); fclose(dst);
-  char result[512];
-  snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s", pid, total, dmpPath);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int up_rc = edr_transport_v2_upload_file(cmd_id, dmpPath, NULL, minio_key, sizeof(minio_key));
+  char result[700];
+  if (up_rc == 0) {
+    snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s minio_key=%.380s", pid,
+             total, dmpPath, minio_key[0] ? minio_key : "(ok)");
+  } else {
+    snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s upload=failed", pid, total,
+             dmpPath);
+  }
   edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
   edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 #endif

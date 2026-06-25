@@ -1062,6 +1062,13 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
 
 int edr_ingest_http_configured(void) { return s_rest[0] != 0 && s_endpoint[0] != 0; }
 
+void edr_ingest_http_get_rest_base(char *out, size_t cap) {
+  if (!out || cap == 0) {
+    return;
+  }
+  snprintf(out, cap, "%s", s_rest);
+}
+
 void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_required,
                                                  int control_stream_enabled,
                                                  int long_poll_fallback,

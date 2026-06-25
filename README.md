@@ -287,9 +287,12 @@ cmake --build build
 | `EDR_RTR_SHELL_MAX_TIMEOUT_SEC` | `rtr_shell` 本地最大执行秒数，默认 `60`，硬上限 `300`；payload 的 `timeout_sec` 会被钳制到该值和 SOAR deadline 剩余时间。 |
 | `EDR_RTR_SHELL_BLOCKLIST` | `rtr_shell` 追加本地 blocklist 关键字；默认已拒绝破坏性命令、控制操作符、重定向、管道与常见 PowerShell 编码执行形态。 |
 | `EDR_SOAR_REPORT_ALWAYS` | `=1` 时对**每条**指令尝试 gRPC **`ReportCommandResult`**（即使无 `soar_correlation_id`）；默认仅在下发含编排字段时上报。 |
-| `EDR_ISOLATE_HOOK` | 若设置，`isolate` 在写标记后执行 `system(hook)`（POSIX 下会 `setenv("EDR_CMD_ID", …)`）。 |
-| `EDR_RESTORE_HOOK` / `EDR_ISOLATE_RESTORE_HOOK` | 若设置，`restore_host` 在清理隔离标记前执行恢复脚本。 |
-| `EDR_SHELLCODE_AUTO_ISOLATE` | `=1` 时，若已允许高危指令且 WinDivert 分数 ≥ **`auto_isolate_threshold`**，执行与 **`isolate`** 相同的标记 + **`EDR_ISOLATE_HOOK`**（每进程最多一次）。亦可由 TOML **`[shellcode_detector] auto_isolate_execute = true`** 开启（仍须高危策略）。 |
+| `EDR_ISOLATE_MODE` | 隔离执行模式。**默认 `enforce`**：真实施加 OS 网络隔离（无 `EDR_ISOLATE_HOOK` 时自动调用随包脚本 `windows_isolate_host.ps1` / `linux_isolate_host.sh`），enforcement 失败则**报失败并不留标记**（不再谎报）。`=stamp`：旧行为，仅写隔离标记（+可选 hook），供依赖外部驱动读取标记的部署。 |
+| `EDR_ISOLATE_HOOK` | 若设置,`isolate` 用它作为**自定义 enforcement**(`system(hook)`,POSIX 下先 `setenv("EDR_CMD_ID", …)`);优先于随包脚本。返回非零=隔离失败。 |
+| `EDR_RESTORE_HOOK` / `EDR_ISOLATE_RESTORE_HOOK` | 若设置，`restore_host` 用它撤销隔离；否则 enforce 模式下自动调用随包脚本的 `Remove`/`remove`。 |
+| `EDR_ISOLATE_SCRIPT` | 覆盖随包隔离脚本路径;默认在 agent 可执行同目录或其 `scripts/` 下查找 `windows_isolate_host.ps1`（Win）/ `linux_isolate_host.sh`（Linux）。 |
+| `EDR_ISOLATE_ALLOW_REMOTE_ADDRS` / `EDR_ISOLATE_ALLOW_REMOTE_PORTS` | 隔离时放行的管理服务器 IP/CIDR 与端口（默认端口 `443,50051`）。**未设置时 agent 自动用后端 rest_base 解析出的 IP 与端口填充**,确保隔离后 agent↔后端 管理通道仍可达（否则收不到 `restore_host`，主机将永久失联）。 |
+| `EDR_SHELLCODE_AUTO_ISOLATE` | `=1` 时，若已允许高危指令且 WinDivert 分数 ≥ **`auto_isolate_threshold`**，执行与 **`isolate`** 等价的隔离（每进程最多一次）。亦可由 TOML **`[shellcode_detector] auto_isolate_execute = true`** 开启（仍须高危策略）。 |
 | `EDR_CONFIG_RELOAD_S` | 非 `0` 时每隔 N 秒检测配置文件 mtime，变更则热更 **preprocessing + resource_limit + self_protect**（见 §11.2 初版）。 |
 | `EDR_REMOTE_CONFIG_URL` | 若与 **`EDR_REMOTE_CONFIG_POLL_S`**（秒，≥1）同时设置，则周期性用 **`curl`** 下载 TOML 到临时文件并 **`edr_config_load`**，再应用 **preprocessing + resource_limit + self_protect**（**不**重连 gRPC / 不重初始化传输层，需重启进程才能对齐证书与批次参数）。URL 勿含未转义引号（Windows `cmd` 限制）。 |
 | `EDR_REMOTE_CONFIG_POLL_S` | 与上一项配合：轮询间隔秒数；未设置或 `0` 则禁用远程拉取。 |
@@ -321,7 +324,13 @@ cmake --build build
 | `EDR_ATTACK_SURFACE_ETW_LIGHT` | `=1` 且 **`etw_tcpip_wf`** 触发时，快照 **`snapshotKind=listenersOnly`**（不采集出站 `ss`/系统策略查询，缩短 ETW 洪峰路径延迟）。 |
 | `EDR_ATTACK_SURFACE_LISTENERS_ONLY` | `=1` 时，任意 **`edr_attack_surface_execute`** 均使用 **`listenersOnly`** 快照（调试用）。 |
 
-**系统级网络隔离（nft / 防火墙）**：客户端不内置 nft 规则；将运维脚本路径设为 **`EDR_ISOLATE_HOOK`**（如对某接口 `nft add rule … drop`），由 **`isolate`** 在写标记后调用；配合 **`EDR_CMD_AUDIT_PATH`** 留痕。
+**系统级网络隔离（nft / 防火墙）**：`isolate` **默认 `enforce`**，施加真实 OS 网络隔离——
+- **Windows**：随包 `scripts/windows_isolate_host.ps1`（Defender 防火墙默认 Block in/out + 放行管理服务器，原 profile 存盘供 `restore_host` 恢复）；
+- **Linux**：随包 `scripts/linux_isolate_host.sh`（nftables 优先 / iptables 回退：默认 drop + 放行 loopback、已建立连接、DNS、管理服务器）。
+
+隔离前 agent **自动放行后端管理通道**（解析 rest_base 的 host→IP 注入 `EDR_ISOLATE_ALLOW_REMOTE_ADDRS`），保证仍能收到 `restore_host`。需自定义 enforcement 时设 **`EDR_ISOLATE_HOOK`**（优先于随包脚本）。仅依赖外部驱动读取隔离标记的旧部署可设 **`EDR_ISOLATE_MODE=stamp`** 退回纯标记。enforcement 失败时 `isolate` **报失败且不留标记**（不再谎报）；全程配合 **`EDR_CMD_AUDIT_PATH`** 留痕。
+
+> 真机验证清单（无法在构建机替做）：① 在 Win/Linux 端点从前端触发 `isolate`，确认除管理通道外网络被阻断、agent 仍在线并能收 `restore_host`；② `restore_host` 后防火墙/profile 完整恢复；③ 后端按 IP 不可达时,先用 `EDR_ISOLATE_DRY_RUN=1` 预演脚本规则；④ Windows ps1 在 PowerShell 5.1+、Linux sh 需 root + nft 或 iptables。
 
 **SOAR 协议契约**：编排字段（`soar_correlation_id`、`playbook_run_id` 等）在 **`CommandEnvelope`** 中下发；执行结束后终端调用 **`ReportCommandResult`** 回传状态。详见 **`docs/SOAR_CONTRACT.md`**。**§19 攻击面** 详设 §19.4/§19.5（调度 / gRPC 示例）与当前 **REST + `curl` POST** 的差异见 **`docs/ATTACK_SURFACE_DESIGN_ALIGNMENT.md`**；gRPC **`ReportSnapshot`** 后续接入步骤见 **`docs/ATTACK_SURFACE_GRPC.md`**。
 

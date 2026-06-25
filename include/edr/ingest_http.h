@@ -29,6 +29,10 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
 
 int edr_ingest_http_configured(void);
 
+/** 拷贝当前 REST base(形如 http://host:port/api/v1)到 out;未配置时为空串。
+ *  供主机隔离逻辑解析后端 host/port,以自动放行管理通道。 */
+void edr_ingest_http_get_rest_base(char *out, size_t cap);
+
 /** 当前 native HTTP circuit 是否仍处于打开状态；到期时自动复位。 */
 int edr_ingest_http_circuit_open(void);
 

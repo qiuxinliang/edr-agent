@@ -217,9 +217,24 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing path");
     return;
   }
-  char data_b64[512 * 1024];
-  (void)edr_parse_json_string(pl, len, "data_b64", data_b64, sizeof(data_b64));
+  /* data_b64 按 payload 实际大小堆分配,消除原 512KB 栈缓冲(栈溢出风险)与 ~384KB 人为上限;
+     单条命令的文件大小上限改由传输层命令体大小决定。 */
+  char *data_b64 = (char *)malloc(len + 1u);
+  if (!data_b64) {
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "rtr_put: oom (b64 buffer)");
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "oom");
+    return;
+  }
+  data_b64[0] = '\0';
+  (void)edr_parse_json_string(pl, len, "data_b64", data_b64, len + 1u);
+  /* 可选 offset:>=0 时为顺序分块写入(大文件由后端拆成多条 put,按偏移续写);
+     缺省 -1 = 整文件单发(行为与旧版一致)。 */
+  int offset = -1;
+  (void)edr_parse_json_int(pl, len, "offset", &offset);
+
   if (!data_b64[0]) {
+    free(data_b64);
     FILE *f = fopen(path, "ab");
     if (!f) {
       edr_cmd_inc_exec_fail();
@@ -239,12 +254,14 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, co
   size_t dec_cap = (b64_len / 4 * 3) + 16;
   uint8_t *dec = (uint8_t *)malloc(dec_cap);
   if (!dec) {
+    free(data_b64);
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "rtr_put: oom");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "oom");
     return;
   }
   int dlen = response_b64_decode(data_b64, b64_len, dec, dec_cap);
+  free(data_b64);
   if (dlen <= 0) {
     free(dec);
     edr_cmd_inc_exec_fail();
@@ -262,7 +279,19 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, co
 #endif
     if (slash) { *slash = '\0'; response_mkdir_p(dir_copy); }
   }
-  FILE *f = fopen(path, "wb");
+  /* offset<=0:整文件/首块 → 截断创建;offset>0:对已有文件按偏移续写(顺序分块)。 */
+  FILE *f;
+  if (offset > 0) {
+    f = fopen(path, "r+b");
+    if (!f) {
+      f = fopen(path, "wb"); /* 容错:目标尚不存在则新建 */
+    }
+    if (f) {
+      (void)fseek(f, (long)offset, SEEK_SET);
+    }
+  } else {
+    f = fopen(path, "wb");
+  }
   if (!f) {
     free(dec);
     edr_cmd_inc_exec_fail();
@@ -275,6 +304,7 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, co
   char sha[65] = {0};
   if (written > 0) edr_sha256_hex(dec, written, sha);
   free(dec);
+  /* sha256(若给出)校验本次写入分片的内容;分块场景下不匹配即中止整次传输。 */
   char expected_sha[65] = {0};
   (void)edr_parse_json_string(pl, len, "sha256", expected_sha, sizeof(expected_sha));
   if (expected_sha[0] && sha[0] && strcmp(expected_sha, sha) != 0) {
@@ -286,8 +316,12 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len, co
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, msg);
     return;
   }
-  char action[200];
-  snprintf(action, sizeof(action), "PUT_OK %s size=%d sha256=%s", path, dlen, sha);
+  char action[220];
+  if (offset >= 0) {
+    snprintf(action, sizeof(action), "PUT_OK %s offset=%d size=%d sha256=%s", path, offset, dlen, sha);
+  } else {
+    snprintf(action, sizeof(action), "PUT_OK %s size=%d sha256=%s", path, dlen, sha);
+  }
   edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, "rtr_put: ok");
   edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, action);
