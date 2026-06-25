@@ -7,7 +7,6 @@
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/transport_v2.h"
 #include "edr/types.h"
@@ -539,8 +538,7 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
       if (s_cfg->agent.tenant_id[0]) {
         tenant = s_cfg->agent.tenant_id;
       }
-      if ((edr_transport_v2_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 ||
-           edr_grpc_client_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0) &&
+      if (edr_transport_v2_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 &&
           object_key[0]) {
         file_uploaded = 1;
       } else {

@@ -21,7 +21,6 @@
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
 #include "edr/command.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/p0_rule_ir.h"
@@ -1555,7 +1554,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char static_ver[48], behavior_ver[48], ioc_ver[48];
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
-  char grpc_err[192], http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
+  char http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
   char event_filter_ver[96];
   char event_filter_last_reason[128], event_filter_last_process[128];
   char event_filter_last_path[320], event_filter_last_cmdline[320];
@@ -1575,21 +1574,18 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char poll_probe_json[1600];
   char config_recovery_json[1600];
   const char *hot_thread_role = "unknown";
-  EdrGrpcClientRuntime grpc_rt;
   EdrIngestHttpRuntime http_rt;
   EdrTransportV2Runtime tv2_rt;
   EdrResourceSample rs;
   EdrCollectorHealth ch;
   EdrCommandDeliveryHealth cdh;
   EdrWindowsEventFilterStatus event_filter_status;
-  memset(&grpc_rt, 0, sizeof(grpc_rt));
   memset(&http_rt, 0, sizeof(http_rt));
   memset(&tv2_rt, 0, sizeof(tv2_rt));
   memset(&rs, 0, sizeof(rs));
   memset(&ch, 0, sizeof(ch));
   memset(&cdh, 0, sizeof(cdh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
-  edr_grpc_client_get_runtime(&grpc_rt);
   edr_ingest_http_get_runtime(&http_rt);
   edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
@@ -1612,7 +1608,6 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   runtime_policy_raw[0] = '\0';
   edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
   json_escape_small(runtime_policy_raw, runtime_policy_ver, sizeof(runtime_policy_ver));
-  json_escape_small(grpc_rt.last_error, grpc_err, sizeof(grpc_err));
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
   json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
   json_escape_small(http_rt.effective_base_url, http_base_url, sizeof(http_base_url));
@@ -1656,7 +1651,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"config_recovery\":%s,"
         "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
         "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
-        "\"communication\":{\"grpc_ready\":%s,\"http_fallback\":%s,"
+        "\"communication\":{\"http_fallback\":%s,"
         "\"http_ok\":%lu,\"http_fail\":%lu,"
         "\"offline_queue_pending\":%llu,"
         "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
@@ -1731,24 +1726,19 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         health_profile[0] ? health_profile : "basic",
         agent->cfg.health_monitor.interval_s,
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
-        grpc_rt.ready ? "true" : "false",
         http_rt.http_fallback_available ? "true" : "false", http_rt.ok_count, http_rt.fail_count,
         (unsigned long long)edr_storage_queue_pending_count(),
-        (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
-                                                                                  : http_rt.last_success_unix_ms),
-        (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
-                                                                                  : http_rt.last_failure_unix_ms),
-        grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+        (long long)http_rt.last_success_unix_ms,
+        (long long)http_rt.last_failure_unix_ms,
+        "", "", http_err,
         http_conn_mode[0] ? http_conn_mode : "direct", http_base_url, http_relay_url,
         http_rt.mtls_configured ? "true" : "false", http_rt.websocket_ready ? "true" : "false",
         http_mtls_status[0] ? http_mtls_status : "not_configured",
         http_key_provider[0] ? http_key_provider : "pem",
         http_proxy_mode[0] ? http_proxy_mode : "auto", http_proxy_url, http_proxy_status,
-        (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
-                                                                                  : http_rt.last_success_unix_ms),
-        (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
-                                                                                  : http_rt.last_failure_unix_ms),
-        grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+        (long long)http_rt.last_success_unix_ms,
+        (long long)http_rt.last_failure_unix_ms,
+        "", "", http_err,
         http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
         http_rt.circuit_open ? "true" : "false", (long long)http_rt.circuit_until_unix_ms,
         http_circuit_reason, (unsigned long long)edr_storage_queue_pending_count(),
@@ -1863,7 +1853,6 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(shell_rules.rollback_version, shell_rb, sizeof(shell_rb));
   json_escape_small(shell_rules.last_match_rule, shell_last_rule, sizeof(shell_last_rule));
   json_escape_small(shell_rules.last_match_source, shell_last_src, sizeof(shell_last_src));
-  json_escape_small(grpc_rt.last_error, grpc_err, sizeof(grpc_err));
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
   json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
   json_escape_small(http_rt.effective_base_url, http_base_url, sizeof(http_base_url));
@@ -1901,9 +1890,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"config_recovery\":%s,"
       "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
       "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
-      "\"communication\":{\"grpc_ready\":%s,\"grpc_insecure\":%s,\"http_fallback\":%s,"
-      "\"http_insecure\":%s,\"grpc_rpc_ok\":%lu,\"grpc_rpc_fail\":%lu,"
-      "\"grpc_consecutive_failures\":%d,\"http_ok\":%lu,\"http_fail\":%lu,"
+      "\"communication\":{\"http_fallback\":%s,"
+      "\"http_insecure\":%s,"
+      "\"http_ok\":%lu,\"http_fail\":%lu,"
       "\"counters\":{\"legacy_ok\":%lu,\"legacy_fail\":%lu,"
       "\"http_request_ok\":%lu,\"http_request_fail\":%lu,"
       "\"ws_message_ok\":%lu,\"ws_message_fail\":%lu,\"ws_pong\":%lu,"
@@ -2056,9 +2045,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)wall_ms, config_recovery_json,
       health_profile[0] ? health_profile : "basic", agent->cfg.health_monitor.interval_s,
       (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
-	      grpc_rt.ready ? "true" : "false", grpc_rt.insecure ? "true" : "false",
 	      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
-	      grpc_rt.rpc_ok, grpc_rt.rpc_fail, grpc_rt.report_fail_streak, http_rt.ok_count, http_rt.fail_count,
+	      http_rt.ok_count, http_rt.fail_count,
 	      http_rt.ok_count, http_rt.fail_count,
 	      http_rt.http_request_ok_count, http_rt.http_request_fail_count,
 	      http_rt.ws_message_ok_count, http_rt.ws_message_fail_count, http_rt.ws_pong_count,
@@ -2076,21 +2064,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
 	      edr_transport_queue_full_sampled_count(), edr_transport_queue_full_dropped_count(),
 	      (unsigned long long)edr_storage_queue_pending_count(),
-      (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
-                                                                                : http_rt.last_success_unix_ms),
-      (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
-                                                                                : http_rt.last_failure_unix_ms),
-      grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+      (long long)http_rt.last_success_unix_ms,
+      (long long)http_rt.last_failure_unix_ms,
+      "", "", http_err,
 	      http_conn_mode[0] ? http_conn_mode : "direct", http_base_url, http_relay_url,
 	      http_rt.mtls_configured ? "true" : "false", http_rt.websocket_ready ? "true" : "false",
 	      http_mtls_status[0] ? http_mtls_status : "not_configured",
 	      http_key_provider[0] ? http_key_provider : "pem",
 	      http_proxy_mode[0] ? http_proxy_mode : "auto", http_proxy_url, http_proxy_status,
-      (long long)((grpc_rt.last_success_unix_ms > http_rt.last_success_unix_ms) ? grpc_rt.last_success_unix_ms
-                                                                                : http_rt.last_success_unix_ms),
-      (long long)((grpc_rt.last_failure_unix_ms > http_rt.last_failure_unix_ms) ? grpc_rt.last_failure_unix_ms
-                                                                                : http_rt.last_failure_unix_ms),
-	      grpc_err, (grpc_err[0] && http_err[0]) ? "|" : "", http_err,
+      (long long)http_rt.last_success_unix_ms,
+      (long long)http_rt.last_failure_unix_ms,
+	      "", "", http_err,
 	      http_rt.poll_backoff_ms, http_rt.ws_backoff_ms,
 	      http_rt.circuit_open ? "true" : "false", (long long)http_rt.circuit_until_unix_ms,
 	      http_circuit_reason,

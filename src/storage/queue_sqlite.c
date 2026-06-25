@@ -1,6 +1,5 @@
 #include "edr/storage_queue.h"
 
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
@@ -313,9 +312,6 @@ static int drain_one_row(void) {
     }
     send = edr_transport_v2_report_events(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
   }
-  if (send != 0 && edr_grpc_client_ready()) {
-    send = edr_grpc_client_send_batch(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
-  }
   if (send == 0) {
     (void)delete_row_by_id(id);
     return 0;
@@ -525,7 +521,7 @@ void edr_storage_queue_poll_drain(void) {
   static uint64_t last_ns;
   uint64_t now = edr_monotonic_ns();
   uint64_t interval_ns = (uint64_t)queue_drain_interval_ms() * 1000000ULL;
-  if (!edr_grpc_client_ready() && edr_ingest_http_circuit_open()) {
+  if (edr_ingest_http_circuit_open()) {
     uint64_t circuit_interval_ns = (uint64_t)queue_circuit_backoff_ms() * 1000000ULL;
     if (now - last_ns < circuit_interval_ns) {
       return;

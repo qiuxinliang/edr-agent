@@ -34,6 +34,15 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
                                     const EdrSoarCommandMeta *sm);
 void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                 const EdrSoarCommandMeta *sm);
+
+/* 取证外移共享入口:跑外部 collector 生成产物,成功后由 agent 经 transport v2 上传(通信只走 agent)。
+ * 返回 0=成功(do_upload 时 minio_key 已填);>0=collector 非0退出;<0=启动/超时/验签失败。 */
+int edr_response_forensic_run_external(const char *cmd_id, const char *scope, const uint8_t *payload,
+                                       size_t payload_len, const char *artifact_ext, int do_upload,
+                                       char *minio_key, size_t key_cap, char *detail,
+                                       size_t detail_cap);
+/* 取证外移是否启用(EDR_FORENSIC_COLLECTOR=1)。 */
+int edr_response_forensic_external_enabled(void);
 void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
                              const EdrSoarCommandMeta *sm);
 void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,

@@ -3,7 +3,6 @@
 #include "edr/config.h"
 #include "edr/deep_collector.h"
 #include "edr/error.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/pmfe.h"
 #include "edr/sha256.h"
@@ -357,6 +356,32 @@ void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t le
     return;
   }
 
+  /* P3 统一阻塞模型:外移启用时,同步等待 collector 完成,报告真实结果并经 agent 上传产物。
+   * 命令在专用命令线程派发,阻塞不影响遥测主循环;collector 二进制执行前已做下载+SHA256 验签。 */
+  if (edr_response_forensic_external_enabled()) {
+    char minio_key[1024];
+    char dc_detail[512];
+    minio_key[0] = '\0';
+    int erc = edr_response_forensic_run_external(cmd_id, "deep_forensic", pl, len, "tar.gz", 1,
+                                                 minio_key, sizeof(minio_key), dc_detail,
+                                                 sizeof(dc_detail));
+    if (erc == 0) {
+      char result[640];
+      snprintf(result, sizeof(result), "DEEP_FORENSIC_OK(external) minio_key=%.480s",
+               minio_key[0] ? minio_key : "(local)");
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+      return;
+    }
+    edr_cmd_inc_exec_fail();
+    char fail[600];
+    snprintf(fail, sizeof(fail), "deep_forensic external failed rc=%d: %.460s", erc, dc_detail);
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+    return;
+  }
+
+  /* 外移未启用:保留原异步 launch(fire-and-forget,兼容旧行为)。 */
   EdrDeepCollectorParams params;
   (void)memset(&params, 0, sizeof(params));
   params.download_url = NULL;

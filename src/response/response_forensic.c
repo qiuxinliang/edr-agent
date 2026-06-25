@@ -3,7 +3,6 @@
 #include "edr/config.h"
 #include "edr/deep_collector.h"
 #include "edr/error.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/pmfe.h"
 #include "edr/sha256.h"
@@ -39,6 +38,96 @@
 
 /* ── Forensic Actions ── */
 
+/* 取证外移门控:默认关闭(保持 in-process 现状,不破坏)。
+ * EDR_FORENSIC_COLLECTOR=1 启用外部 collector;EDR_FORENSIC_COLLECTOR_STRICT=1 失败不回退。 */
+static int forensic_external_enabled(void) {
+  const char *e = getenv("EDR_FORENSIC_COLLECTOR");
+  return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+}
+static int forensic_external_required(void) {
+  const char *e = getenv("EDR_FORENSIC_COLLECTOR_STRICT");
+  return e && e[0] == '1';
+}
+static const char *forensic_output_dir(void) {
+  const char *o = getenv("EDR_FORENSIC_OUT");
+  if (o && o[0]) return o;
+  const EdrConfig *cfg = edr_command_get_config();
+  if (cfg && cfg->shellcode_detector.forensic_dir[0]) {
+    return cfg->shellcode_detector.forensic_dir;
+  }
+#ifdef _WIN32
+  return ".\\edr_forensic";
+#else
+  return "/tmp/edr_forensic";
+#endif
+}
+
+/* P1/P2 共享:跑外部 collector 生成产物,成功后由 agent 经 transport v2 上传(通信只走 agent)。
+ * 统一契约:把命令 payload 写成 .req 文件交给 collector;collector 读 --request、落 --out-file;agent 上传 out-file。
+ * 返回 0=成功(do_upload 时 minio_key 已填);>0=collector 非0退出;<0=启动/超时/崩溃;-100=本地准备失败。 */
+static int forensic_external_run(const char *cmd_id, const char *scope, const uint8_t *payload,
+                                 size_t payload_len, const char *artifact_ext, int do_upload,
+                                 char *minio_key, size_t key_cap, char *detail, size_t detail_cap) {
+  const char *outdir = forensic_output_dir();
+  if (response_mkdir_p(outdir) != 0) {
+    if (detail) snprintf(detail, detail_cap, "mkdir output dir failed");
+    return -100;
+  }
+  char job[96];
+  response_sanitize_job_name(cmd_id ? cmd_id : "job", job, sizeof(job));
+  long long ts = (long long)time(NULL);
+#ifdef _WIN32
+  const char sep = '\\';
+#else
+  const char sep = '/';
+#endif
+  char reqpath[900];
+  char artifact[900];
+  snprintf(reqpath, sizeof(reqpath), "%s%c%s_%s_%lld.req", outdir, sep, scope, job, ts);
+  snprintf(artifact, sizeof(artifact), "%s%c%s_%s_%lld.%s", outdir, sep, scope, job, ts,
+           artifact_ext ? artifact_ext : "bin");
+
+  FILE *rf = fopen(reqpath, "wb");
+  if (!rf) {
+    if (detail) snprintf(detail, detail_cap, "write request file failed");
+    return -100;
+  }
+  if (payload && payload_len) {
+    fwrite(payload, 1, payload_len, rf);
+  }
+  fclose(rf);
+
+  /* 注意:路径不加引号,collector 参数走空格分词(POSIX)/cmdline(Windows);取证目录约定无空格。 */
+  char extra[2048];
+  snprintf(extra, sizeof(extra), "--request=%s --out-file=%s", reqpath, artifact);
+
+  EdrCollectorRunSpec spec = {0};
+  spec.scope = scope;
+  spec.output_dir = outdir;
+  spec.extra_args = extra;
+  spec.timeout_s = 300u;
+  int rc = edr_deep_collector_run_blocking(&spec, detail, detail_cap);
+
+  (void)remove(reqpath);
+
+  if (rc == 0 && do_upload) {
+    if (minio_key && key_cap) minio_key[0] = '\0';
+    (void)edr_transport_v2_upload_file(cmd_id, artifact, NULL, minio_key, key_cap);
+  }
+  return rc;
+}
+
+/* 非静态包装:供 response_actions.c 的 deep_forensic 等复用同一外移路径(声明见 response.h)。 */
+int edr_response_forensic_run_external(const char *cmd_id, const char *scope, const uint8_t *payload,
+                                       size_t payload_len, const char *artifact_ext, int do_upload,
+                                       char *minio_key, size_t key_cap, char *detail,
+                                       size_t detail_cap) {
+  return forensic_external_run(cmd_id, scope, payload, payload_len, artifact_ext, do_upload,
+                               minio_key, key_cap, detail, detail_cap);
+}
+
+int edr_response_forensic_external_enabled(void) { return forensic_external_enabled(); }
+
 void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                     const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
@@ -47,6 +136,33 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
+
+  /* 外移:由独立 collector 生成 triage bundle,agent 经 transport v2 上传(通信只走 agent)。 */
+  if (forensic_external_enabled()) {
+    char minio_key[1024];
+    char dc_detail[512];
+    minio_key[0] = '\0';
+    int rc = forensic_external_run(cmd_id, "collect_forensic", pl, len, "tar.gz", 1, minio_key,
+                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
+    if (rc == 0) {
+      char result[640];
+      snprintf(result, sizeof(result), "forensic bundle ok(external) minio_key=%.480s",
+               minio_key[0] ? minio_key : "(local)");
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+      return;
+    }
+    if (forensic_external_required()) {
+      edr_cmd_inc_exec_fail();
+      char fail[600];
+      snprintf(fail, sizeof(fail), "collect_forensic external failed rc=%d: %.460s", rc, dc_detail);
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+      return;
+    }
+    edr_command_audit_both(cmd_id, "collect_forensic: external unavailable, fallback in-process");
+  }
+
   char base[512];
   const char *o = getenv("EDR_FORENSIC_OUT");
   if (o && o[0]) {
@@ -246,6 +362,33 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
+
+  /* 外移:collector 按 request 中的 item 清单采集打包,agent 上传(通信只走 agent)。 */
+  if (forensic_external_enabled()) {
+    char minio_key[1024];
+    char dc_detail[512];
+    minio_key[0] = '\0';
+    int rc = forensic_external_run(cmd_id, "targeted_forensic", pl, len, "tar.gz", 1, minio_key,
+                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
+    if (rc == 0) {
+      char result[640];
+      snprintf(result, sizeof(result), "TARGETED_OK(external) minio_key=%.480s",
+               minio_key[0] ? minio_key : "(local)");
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+      return;
+    }
+    if (forensic_external_required()) {
+      edr_cmd_inc_exec_fail();
+      char fail[600];
+      snprintf(fail, sizeof(fail), "targeted_forensic external failed rc=%d: %.460s", rc, dc_detail);
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+      return;
+    }
+    edr_command_audit_both(cmd_id, "targeted_forensic: external unavailable, fallback in-process");
+  }
+
   char out[4096];
   int count = 0;
   out[0] = '\0';
@@ -324,6 +467,36 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid");
     return;
   }
+
+  /* 重/危险取证外移:优先走独立 collector 进程;成功后 agent 经 transport v2 上传 .dmp(通信只走 agent)。
+   * 失败时:STRICT 模式直接报错,否则回退 in-process(稳定优先)。 */
+  if (forensic_external_enabled()) {
+    char minio_key[1024];
+    char dc_detail[512];
+    minio_key[0] = '\0';
+    int rc = forensic_external_run(cmd_id, "memory_dump", pl, len, "dmp", 1, minio_key,
+                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
+    if (rc == 0) {
+      char result[640];
+      snprintf(result, sizeof(result), "MEMDUMP_OK(external) pid=%d minio_key=%.480s", pid,
+               minio_key[0] ? minio_key : "(local)");
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+      return;
+    }
+    if (forensic_external_required()) {
+      edr_cmd_inc_exec_fail();
+      char fail[600];
+      snprintf(fail, sizeof(fail), "memory_dump external collector failed rc=%d: %.470s", rc,
+               dc_detail);
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+      return;
+    }
+    edr_command_audit_both(cmd_id, "memory_dump: external collector unavailable, fallback in-process");
+    /* 继续走下方 in-process 兜底 */
+  }
+
 #ifdef _WIN32
   HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)pid);
   if (!h) {
@@ -400,6 +573,33 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
     edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
+
+  /* 外移:collector 按 request(target_path/pid + 规则)扫描并落结果 json,agent 上传(通信只走 agent)。 */
+  if (forensic_external_enabled()) {
+    char minio_key[1024];
+    char dc_detail[512];
+    minio_key[0] = '\0';
+    int rc = forensic_external_run(cmd_id, "yara_scan", pl, len, "json", 1, minio_key,
+                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
+    if (rc == 0) {
+      char result[640];
+      snprintf(result, sizeof(result), "YARA_OK(external) minio_key=%.480s",
+               minio_key[0] ? minio_key : "(local)");
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+      return;
+    }
+    if (forensic_external_required()) {
+      edr_cmd_inc_exec_fail();
+      char fail[600];
+      snprintf(fail, sizeof(fail), "yara_scan external failed rc=%d: %.460s", rc, dc_detail);
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+      return;
+    }
+    edr_command_audit_both(cmd_id, "yara_scan: external unavailable, fallback in-process");
+  }
+
   char target_path[520];
   (void)edr_parse_json_string(pl, len, "target_path", target_path, sizeof(target_path));
   if (!target_path[0]) {

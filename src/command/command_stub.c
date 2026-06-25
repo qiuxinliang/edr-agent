@@ -12,12 +12,12 @@
 #include "edr/attack_surface_report.h"
 #include "edr/command.h"
 #include "edr/command_state.h"
+#include "edr/command_util.h"
 #include "edr/ave.h"
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_batch.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
@@ -66,9 +66,6 @@ unsigned long g_cmd_rejected;
 unsigned long g_cmd_exec_ok;
 unsigned long g_cmd_exec_fail;
 
-/** main 在 edr_agent_init 后绑定，供 ave_infer 使用 */
-static const EdrConfig *s_bound_cfg;
-
 static int64_t command_now_ms(void);
 static uint64_t command_monotonic_ms(void);
 
@@ -108,8 +105,6 @@ static void command_update_max_u32(uint32_t value, uint32_t *max_value) {
   }
 }
 
-void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
-
 static int streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
 
 static int dangerous_enabled(void) {
@@ -121,7 +116,7 @@ static int dangerous_enabled(void) {
   if (e && e[0] == '1') {
     return 1;
   }
-  if (s_bound_cfg && s_bound_cfg->command.allow_dangerous) {
+  if (edr_command_get_config() && edr_command_get_config()->command.allow_dangerous) {
     return 1;
   }
   return 0;
@@ -138,8 +133,8 @@ static int rtq_readonly_enabled(void) {
   if (dangerous_enabled()) {
     return 1;
   }
-  if (s_bound_cfg) {
-    return s_bound_cfg->command.allow_rtq_readonly ? 1 : 0;
+  if (edr_command_get_config()) {
+    return edr_command_get_config()->command.allow_rtq_readonly ? 1 : 0;
   }
   return 1;
 }
@@ -294,9 +289,6 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
   int report_pending = 0;
   if (command_should_report(cmd_id, sm)) {
     int rc = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
-    if (rc != 0) {
-      rc = edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
-    }
     report_pending = (rc != 0);
   }
   edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "", sm, rstatus,
@@ -307,20 +299,6 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
 static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
                       int exit_code, const char *detail) {
   soar_emit_ex(cmd_id, sm, st, exit_code, detail, NULL, NULL);
-}
-
-int edr_command_dangerous_enabled(void) { return dangerous_enabled(); }
-
-int edr_command_rtq_readonly_enabled(void) { return rtq_readonly_enabled(); }
-
-void edr_command_audit_both(const char *cmd_id, const char *msg) {
-  audit_both(cmd_id, msg ? msg : "");
-}
-
-void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
-                             EdrCommandExecutionStatus st, int exit_code, const char *detail) {
-  audit_both(cmd_id, detail ? detail : "");
-  soar_emit(cmd_id, sm, st, exit_code, detail);
 }
 
 static int parse_json_string_field(const uint8_t *p, size_t len, const char *key,
@@ -633,9 +611,9 @@ static int auto_recommended_rate_allow(uint32_t pid) {
   static int64_t s_hour_start_ms;
   static uint32_t s_hour_count;
   int64_t now = command_now_ms();
-  uint32_t global_cd_s = s_bound_cfg ? s_bound_cfg->forensic_auto.cooldown_s : 30u;
-  uint32_t pid_cd_s = s_bound_cfg ? s_bound_cfg->forensic_auto.per_pid_cooldown_s : 300u;
-  uint32_t max_per_hour = s_bound_cfg ? s_bound_cfg->forensic_auto.max_per_hour : 20u;
+  uint32_t global_cd_s = edr_command_get_config() ? edr_command_get_config()->forensic_auto.cooldown_s : 30u;
+  uint32_t pid_cd_s = edr_command_get_config() ? edr_command_get_config()->forensic_auto.per_pid_cooldown_s : 300u;
+  uint32_t max_per_hour = edr_command_get_config() ? edr_command_get_config()->forensic_auto.max_per_hour : 20u;
   global_cd_s = env_u32_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_COOLDOWN_S", global_cd_s, 0u, 3600u);
   pid_cd_s = env_u32_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_PER_PID_COOLDOWN_S", pid_cd_s, 0u, 86400u);
   max_per_hour = env_u32_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_MAX_PER_HOUR", max_per_hour, 0u, 10000u);
@@ -680,11 +658,11 @@ int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
   if (env_falsy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
     return 0;
   }
-  if (s_bound_cfg && !s_bound_cfg->forensic_auto.enabled &&
+  if (edr_command_get_config() && !edr_command_get_config()->forensic_auto.enabled &&
       !env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS_FORCE")) {
     return 0;
   }
-  if (!s_bound_cfg && !env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
+  if (!edr_command_get_config() && !env_truthy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
     return 0;
   }
   if (!dangerous_enabled()) {
@@ -812,7 +790,7 @@ static void do_ave_fingerprint(const char *cmd_id, const uint8_t *pl, size_t len
 }
 
 static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
-  if (!s_bound_cfg) {
+  if (!edr_command_get_config()) {
     s_exec_fail++;
     audit_both(cmd_id, "ave_infer: 未绑定配置（内部错误）");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 20, "config not bound");
@@ -883,7 +861,7 @@ static void do_self_protect_status(const char *cmd_id, const EdrSoarCommandMeta 
 static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size_t len,
                                      const EdrSoarCommandMeta *sm) {
   char addr[256];
-  if (!(s_bound_cfg && s_bound_cfg->server.grpc_enabled) &&
+  if (!(edr_command_get_config() && edr_command_get_config()->server.grpc_enabled) &&
       !env_truthy_cmd("EDR_ENABLE_LEGACY_GRPC") && !env_truthy_cmd("EDR_LEGACY_GRPC_ENABLED")) {
     s_rejected++;
     audit_both(cmd_id, "update_server_address: legacy gRPC 未启用，拒绝切换 gRPC 目标");
@@ -902,17 +880,9 @@ static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 13, "server address must be host:port");
     return;
   }
-  int rc = edr_grpc_client_reconnect_to_target(addr);
-  if (rc != 0) {
-    s_exec_fail++;
-    audit_both(cmd_id, "update_server_address: gRPC 重连失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 14, "grpc reconnect failed");
-    return;
-  }
-  s_handled++;
-  s_exec_ok++;
-  audit_both(cmd_id, "update_server_address: gRPC 目标已切换");
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "grpc target switched");
+  s_exec_fail++;
+  audit_both(cmd_id, "update_server_address: 不再支持(gRPC 已移除；请改用 platform.rest_base_url 配置切换)");
+  soar_emit(cmd_id, sm, EdrCmdExecFailed, 14, "update_server_address unsupported (grpc removed)");
 }
 
 static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -1119,7 +1089,7 @@ void edr_isolate_auto_from_shellcode_alarm(void) {
   const char *eo = getenv("EDR_SHELLCODE_AUTO_ISOLATE");
   if (eo && eo[0] == '1') {
     want = 1;
-  } else if (s_bound_cfg && s_bound_cfg->shellcode_detector.auto_isolate_execute) {
+  } else if (edr_command_get_config() && edr_command_get_config()->shellcode_detector.auto_isolate_execute) {
     want = 1;
   }
   if (!want) {
@@ -1605,8 +1575,8 @@ static int rtr_shell_token_allowed(const char *token, char *matched, size_t matc
   }
   const char *list_src = NULL;
   const char *source = "policy";
-  if (s_bound_cfg && s_bound_cfg->command.rtr_shell_allowlist[0]) {
-    list_src = s_bound_cfg->command.rtr_shell_allowlist;
+  if (edr_command_get_config() && edr_command_get_config()->command.rtr_shell_allowlist[0]) {
+    list_src = edr_command_get_config()->command.rtr_shell_allowlist;
   }
   if (!list_src || !list_src[0]) {
     list_src = getenv("EDR_RTR_SHELL_ALLOWLIST");
@@ -1712,8 +1682,8 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   int timeout_sec = parse_int_json_default(pl, len, "timeout_sec", 30);
   timeout_sec = parse_int_json_default(pl, len, "timeout_s", timeout_sec);
-  int max_timeout = s_bound_cfg && s_bound_cfg->command.rtr_shell_max_timeout_sec > 0u
-                        ? (int)s_bound_cfg->command.rtr_shell_max_timeout_sec
+  int max_timeout = edr_command_get_config() && edr_command_get_config()->command.rtr_shell_max_timeout_sec > 0u
+                        ? (int)edr_command_get_config()->command.rtr_shell_max_timeout_sec
                         : env_int_default("EDR_RTR_SHELL_MAX_TIMEOUT_SEC", 60);
   if (timeout_sec <= 0) {
     timeout_sec = 30;
@@ -1943,10 +1913,6 @@ static void do_rtr_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
   minio_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
                                                         minio_key, sizeof(minio_key));
-  if (upload_rc != 0) {
-    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "rtr_get_file", path, sha,
-                                            minio_key, sizeof(minio_key));
-  }
   char pathj[1400], keyj[1400], artifacts[3600], detail[4096];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(keyj, sizeof(keyj), minio_key);
@@ -2181,9 +2147,6 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   minio_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "eventlog", path, sha,
                                                         minio_key, sizeof(minio_key));
-  if (upload_rc != 0) {
-    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "eventlog", path, sha, minio_key, sizeof(minio_key));
-  }
   char pathj[1200], channelj[256], keyj[1200], artifacts[3200], detail[4096];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(channelj, sizeof(channelj), channel);
@@ -2350,9 +2313,6 @@ static void do_registry_query(const char *cmd_id, const uint8_t *pl, size_t len,
   minio_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "registry", path, sha,
                                                         minio_key, sizeof(minio_key));
-  if (upload_rc != 0) {
-    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "registry", path, sha, minio_key, sizeof(minio_key));
-  }
   char pathj[1200], keyj[1400], minioj[1200], artifacts[4800], detail[4800];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(keyj, sizeof(keyj), key);
@@ -2637,8 +2597,7 @@ static int flush_upload_outbox_one(const char *pending_path) {
   }
   char minio_key[1024];
   minio_key[0] = '\0';
-  if (edr_transport_v2_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0 ||
-      edr_grpc_client_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
+  if (edr_transport_v2_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
     char done[1100];
     snprintf(done, sizeof(done), "%s.done", pending_path);
     (void)rename(pending_path, done);
@@ -2826,9 +2785,9 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
     }
   }
 #endif
-  if (s_bound_cfg) {
-    fprintf(f, "endpoint_id=%s\ntenant_id=%s\n", s_bound_cfg->agent.endpoint_id[0] ? s_bound_cfg->agent.endpoint_id : "",
-            s_bound_cfg->agent.tenant_id[0] ? s_bound_cfg->agent.tenant_id : "");
+  if (edr_command_get_config()) {
+    fprintf(f, "endpoint_id=%s\ntenant_id=%s\n", edr_command_get_config()->agent.endpoint_id[0] ? edr_command_get_config()->agent.endpoint_id : "",
+            edr_command_get_config()->agent.tenant_id[0] ? edr_command_get_config()->agent.tenant_id : "");
   }
   fclose(f);
   forensic_copy_lines(dir, pl, len);
@@ -2861,10 +2820,6 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   upload_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
                                                         upload_key, sizeof(upload_key));
-  if (upload_rc != 0) {
-    upload_rc = edr_grpc_client_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
-                                            upload_key, sizeof(upload_key));
-  }
   if (upload_rc != 0) {
     write_upload_outbox(cmd_id, bundle, bundle_sha, manifest);
   }
@@ -3251,13 +3206,13 @@ static int command_public_key_pem(char *out, size_t cap) {
     normalize_pem_newlines(out);
     return 1;
   }
-  if (s_bound_cfg && s_bound_cfg->command.signing_public_key_pem[0]) {
-    snprintf(out, cap, "%s", s_bound_cfg->command.signing_public_key_pem);
+  if (edr_command_get_config() && edr_command_get_config()->command.signing_public_key_pem[0]) {
+    snprintf(out, cap, "%s", edr_command_get_config()->command.signing_public_key_pem);
     normalize_pem_newlines(out);
     return out[0] != '\0';
   }
-  if (s_bound_cfg && s_bound_cfg->command.signing_public_key_path[0] &&
-      read_command_public_key_path(s_bound_cfg->command.signing_public_key_path, out, cap) == 0) {
+  if (edr_command_get_config() && edr_command_get_config()->command.signing_public_key_path[0] &&
+      read_command_public_key_path(edr_command_get_config()->command.signing_public_key_path, out, cap) == 0) {
     normalize_pem_newlines(out);
     return 1;
   }
@@ -3336,6 +3291,9 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "restore_host") || streq(t, "host_restore") ||
          streq(t, "kill_process") || streq(t, "kill") ||
          streq(t, "collect_forensic") || streq(t, "forensic") ||
+         streq(t, "memory_dump") || streq(t, "memdump") ||
+         streq(t, "targeted_forensic") ||
+         streq(t, "put_file") || streq(t, "rtr_put_file") || streq(t, "rtr_file_put") ||
          streq(t, "rtr_get_file") || streq(t, "rtr_file_get") || streq(t, "get_file") ||
          streq(t, "RTR_GET_FILE") || streq(t, "rtr_rm_file") || streq(t, "rtr_file_rm") ||
          streq(t, "remove_file") || streq(t, "delete_file") || streq(t, "RTR_RM_FILE") ||
@@ -3501,12 +3459,6 @@ static void flush_command_result_outbox(void) {
                                                pending[i].exit_code,
                                                pending[i].detail);
     }
-    if (rc != 0 && edr_grpc_client_ready()) {
-      rc = edr_grpc_client_report_command_result(pending[i].command_id, &sm,
-                                                 pending[i].execution_status,
-                                                 pending[i].exit_code,
-                                                 pending[i].detail);
-    }
     if (rc == 0) {
       edr_command_state_mark_reported(&pending[i]);
     }
@@ -3663,6 +3615,19 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     do_forensic(id, payload, payload_len, sm);
     return;
   }
+  // 接线已实现但此前未挂载的处置：进程内存转储 / 定向取证 / 文件下推（实现见 response_forensic.c、response_file.c）。
+  if (streq(t, "memory_dump") || streq(t, "memdump")) {
+    edr_response_memory_dump(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "targeted_forensic")) {
+    edr_response_targeted_forensic(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "put_file") || streq(t, "rtr_put_file") || streq(t, "rtr_file_put")) {
+    edr_response_put_file(id, payload, payload_len, sm);
+    return;
+  }
   if (streq(t, "rtq_execute") || streq(t, "RTQ_EXECUTE")) {
     edr_response_rtq_execute(id, payload, payload_len, sm);
     return;
@@ -3758,7 +3723,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
 
   if (streq(t, "GET_ATTACK_SURFACE") || streq(t, "get_attack_surface") || streq(t, "REFRESH_ATTACK_SURFACE")) {
     char detail[256];
-    int r = edr_attack_surface_execute(id, s_bound_cfg, detail, sizeof(detail));
+    int r = edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail));
     if (r != 0) {
       s_exec_fail++;
       audit_both(id, "GET_ATTACK_SURFACE: failed");

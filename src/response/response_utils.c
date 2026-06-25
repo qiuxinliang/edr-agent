@@ -3,7 +3,6 @@
 #include "edr/config.h"
 #include "edr/deep_collector.h"
 #include "edr/error.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/pmfe.h"
 #include "edr/sha256.h"

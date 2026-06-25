@@ -50,4 +50,24 @@ void edr_deep_collector_kill(void);
 /** 判断当前是否有采集器在运行。 */
 int edr_deep_collector_is_running(void);
 
+/**
+ * 同步运行规格 — 取证生成外移用（memory_dump 等）。
+ * 通信硬约束:collector 只在本地落产物,不接收 upload-url、不做任何网络 I/O。
+ */
+typedef struct {
+  const char *collector_bin; /* 可空:空则用 EDR_FORENSIC_COLLECTOR_BIN 或平台默认 */
+  const char *scope;         /* "memory_dump" 等 */
+  const char *output_dir;    /* 本地产物目录 */
+  const char *extra_args;    /* 透传 collector,如 "--pid=1234 --full"（已做基本清洗） */
+  uint32_t timeout_s;        /* 0 表示默认 300s */
+} EdrCollectorRunSpec;
+
+/**
+ * 同步 spawn + 等待(带超时) + 返回。绝不传 upload-url(agent 独占后端通道)。
+ * 返回 0=成功(collector 退出码 0,产物已落地);<0=启动/超时/崩溃;>0=collector 非 0 退出码。
+ * out_detail 写诊断(可为 NULL)。
+ */
+int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec,
+                                    char *out_detail, size_t detail_cap);
+
 #endif

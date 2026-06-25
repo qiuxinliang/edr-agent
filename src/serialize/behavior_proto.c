@@ -7,6 +7,7 @@
 #include <pb_encode.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void copy_str(char *dst, size_t cap, const char *src) {
@@ -60,6 +61,70 @@ static int32_t edr_event_type_to_ave_event_type(EdrEventType t) {
   }
 }
 
+static int pmfe_detail_i(const char *s, const char *key) {
+  if (!s || !key || !key[0]) return 0;
+  const char *p = strstr(s, key);
+  if (!p) return 0;
+  p += strlen(key);
+  if (*p == '=') p++;
+  return (int)strtol(p, NULL, 10);
+}
+
+static float pmfe_detail_f(const char *s, const char *key) {
+  if (!s || !key || !key[0]) return 0.f;
+  const char *p = strstr(s, key);
+  if (!p) return 0.f;
+  p += strlen(key);
+  if (*p == '=') p++;
+  return strtof(p, NULL);
+}
+
+static int pmfe_has_positive_json_number(const char *json, const char *key) {
+  if (!json || !key || !key[0]) return 0;
+  char pat[64];
+  snprintf(pat, sizeof(pat), "\"%s\":", key);
+  const char *p = strstr(json, pat);
+  if (!p) return 0;
+  p += strlen(pat);
+  while (*p == ' ' || *p == '\t') p++;
+  return strtof(p, NULL) > 0.f;
+}
+
+static void fill_pmfe_cross_engine_fields(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r) {
+  if (!m || !r || r->type != EDR_EVENT_PMFE_SCAN_RESULT) return;
+  float ave = pmfe_detail_f(r->cmdline, "ave_max_score");
+  float dns_best = pmfe_detail_f(r->cmdline, "dns_best");
+  int stomp = pmfe_detail_i(r->cmdline, "stomp_suspicious");
+  int mz = pmfe_detail_i(r->cmdline, "mz_hits");
+  int elf = pmfe_detail_i(r->cmdline, "elf_hits");
+  int dns_hits = pmfe_detail_i(r->cmdline, "dns_ascii_hits") + pmfe_detail_i(r->cmdline, "dns_utf16_hits") +
+                 pmfe_detail_i(r->cmdline, "dns_wire_hits");
+  if (r->pmfe_snapshot[0]) {
+    if (pmfe_has_positive_json_number(r->pmfe_snapshot, "ave") && ave <= 0.f) {
+      const char *p = strstr(r->pmfe_snapshot, "\"ave\":");
+      ave = p ? strtof(p + 6, NULL) : ave;
+    }
+    if (pmfe_has_positive_json_number(r->pmfe_snapshot, "dns_best") && dns_best <= 0.f) {
+      const char *p = strstr(r->pmfe_snapshot, "\"dns_best\":");
+      dns_best = p ? strtof(p + 11, NULL) : dns_best;
+    }
+    stomp = stomp || pmfe_has_positive_json_number(r->pmfe_snapshot, "stomp");
+    mz = mz || pmfe_has_positive_json_number(r->pmfe_snapshot, "mz");
+    elf = elf || pmfe_has_positive_json_number(r->pmfe_snapshot, "elf");
+    dns_hits = dns_hits || pmfe_has_positive_json_number(r->pmfe_snapshot, "dns");
+  }
+  float conf = 0.f;
+  if (stomp) conf = 0.92f;
+  if (dns_hits) conf = conf > 0.63f ? conf : 0.63f;
+  if (dns_best > conf) conf = dns_best;
+  if (ave > conf) conf = ave;
+  if (conf > 1.f) conf = 1.f;
+  m->has_ave_behavior_feed = true;
+  m->ave_behavior_feed.pmfe_confidence = conf;
+  m->ave_behavior_feed.pmfe_pe_found = (mz || elf || stomp) ? true : false;
+  m->ave_behavior_feed.pmfe_dns_tunnel = (dns_hits || dns_best >= 0.30f) ? true : false;
+}
+
 static void fill_ave_behavior_feed(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r) {
   m->has_ave_behavior_feed = false;
   memset(&m->ave_behavior_feed, 0, sizeof(m->ave_behavior_feed));
@@ -93,6 +158,7 @@ static void fill_ave_behavior_feed(edr_v1_BehaviorEvent *m, const EdrBehaviorRec
     m->has_ave_behavior_feed = true;
     m->ave_behavior_feed.cert_revoked_ancestor = true;
   }
+  fill_pmfe_cross_engine_fields(m, r);
 }
 
 static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r) {

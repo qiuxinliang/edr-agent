@@ -1,6 +1,5 @@
 #include "edr/command_util.h"
 #include "edr/config.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/transport_v2.h"
 
@@ -38,10 +37,11 @@ int edr_command_dangerous_enabled(void) {
   if (e && e[0] == '0') {
     return 0;
   }
-  if (s_bound_cfg && !s_bound_cfg->command.allow_dangerous) {
-    return 0;
+  /* fail-safe 默认:未显式开启则禁止高危指令（与原 command_stub.c 语义一致）。 */
+  if (s_bound_cfg && s_bound_cfg->command.allow_dangerous) {
+    return 1;
   }
-  return 1;
+  return 0;
 }
 
 int edr_command_rtq_readonly_enabled(void) {
@@ -136,9 +136,7 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
   if (edr_ingest_http_configured()) {
     ok = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
   }
-  if (ok != 0 && edr_grpc_client_ready()) {
-    (void)edr_grpc_client_report_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
-  }
+  (void)ok;
 }
 
 void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,

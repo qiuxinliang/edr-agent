@@ -8,7 +8,6 @@
 
 #include "edr/config.h"
 #include "edr/edr_log.h"
-#include "edr/grpc_client.h"
 #include "edr/ingest_http.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_v2.h"
@@ -84,11 +83,6 @@ static int env_truthy(const char *name) {
   return v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "TRUE") == 0);
 }
 
-static int legacy_grpc_enabled(const EdrConfig *cfg) {
-  return (cfg && cfg->server.grpc_enabled) || env_truthy("EDR_ENABLE_LEGACY_GRPC") ||
-         env_truthy("EDR_LEGACY_GRPC_ENABLED");
-}
-
 static int target_is_loopback(const char *s) {
   return s && (strncmp(s, "127.0.0.1", 9) == 0 || strncmp(s, "localhost", 9) == 0 ||
                strncmp(s, "[::1]", 5) == 0 || strncmp(s, "::1", 3) == 0);
@@ -151,13 +145,7 @@ static int default_dispatch(int use_http, const char *batch_id,
     }
   }
 
-  /* 路径 2: legacy gRPC 仅在显式启用并已建链时作为 fallback */
-  if (use_http == 0 && edr_grpc_client_ready()) {
-    ok = edr_grpc_client_send_batch(batch_id, header12, header_len, payload, payload_len);
-    if (ok == 0) return 0;
-  }
-
-  /* 路径 3: 离线持久化 */
+  /* 路径 2: 离线持久化 */
   {
     const char *ps = getenv("EDR_PERSIST_STRATEGY");
     int persist_on_fail = (ps && strcmp(ps, "on_fail") == 0);
@@ -389,13 +377,6 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
     EDR_LOGE("%s", "[transport] production policy disabled non-HTTPS REST ingest; configure platform.rest_base_url=https://...\n");
   }
 
-  /* Initialize legacy gRPC only when explicitly enabled. HTTPS/TLS is the default control/data path. */
-  if (legacy_grpc_enabled(&secure_cfg)) {
-    edr_grpc_client_init(&secure_cfg);
-  } else {
-    edr_grpc_client_shutdown();
-  }
-
   /* 配置 HTTP ingest */
   edr_ingest_http_configure(
       rest_base,
@@ -484,9 +465,6 @@ void edr_transport_shutdown(void) {
 
   /* 停止命令轮询 */
   edr_ingest_http_stop_command_poll();
-
-  /* 关闭 gRPC */
-  edr_grpc_client_shutdown();
 }
 
 void edr_transport_on_behavior_wire(const uint8_t *data, size_t len) {

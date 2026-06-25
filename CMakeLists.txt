@@ -35,9 +35,6 @@ function(edr_apply_common_warnings target_name)
   endif()
 endfunction()
 
-option(EDR_WITH_GRPC "Deprecated: endpoint product builds use HTTP ingest/control only" OFF)
-option(EDR_REQUIRE_GRPC "Deprecated compatibility option; gRPC client has been removed from product builds" OFF)
-option(EDR_GRPC_REGENERATE "Deprecated compatibility option; generated gRPC stubs are no longer used" OFF)
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 set(EDR_P0_RULES_BUNDLE_VERSION
@@ -46,11 +43,6 @@ set(EDR_P0_RULES_BUNDLE_VERSION
 set(EDR_AGENT_VERSION_STRING
   "${PROJECT_VERSION}"
   CACHE STRING "Agent version string reported to the platform")
-set(EDR_GRPC_CLIENT_AVAILABLE 0)
-if(EDR_WITH_GRPC)
-  message(FATAL_ERROR "EDR_WITH_GRPC is no longer supported in endpoint product builds; use HTTP ingest/control.")
-endif()
-set(EDR_GRPC_CLIENT_AVAILABLE ${EDR_GRPC_CLIENT_AVAILABLE} CACHE INTERNAL "EDR gRPC client availability")
 message(STATUS "gRPC client removed from product build; HTTP ingest/control only")
 
 option(EDR_WITH_ONNXRUNTIME "Link ONNX Runtime C API for AVE real inference (optional)" OFF)
@@ -298,9 +290,16 @@ set(EDR_AGENT_SOURCES
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
   src/command/command_state.c
+  src/command/command_util.c
+  src/command/pe_verify.c
   src/command/rtq_exec.c
   src/command/shell_exec.c
   src/command/sha256.c
+  src/response/response_actions.c
+  src/response/response_file.c
+  src/response/response_forensic.c
+  src/response/response_utils.c
+  src/forensic/deep_collector.c
   src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
@@ -403,8 +402,6 @@ list(APPEND EDR_AGENT_SOURCES third_party/tomlc99/toml.c)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
   list(APPEND EDR_AGENT_SOURCES third_party/lz4/lz4.c)
 endif()
-
-list(APPEND EDR_AGENT_SOURCES src/transport/grpc_client_stub.c)
 
 set(EDR_AVE_CORE_SOURCES
   src/ave/ave_engine.c

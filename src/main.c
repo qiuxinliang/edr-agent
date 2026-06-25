@@ -14,7 +14,6 @@
 #include "edr/dedup.h"
 #include "edr/event_batch.h"
 #include "edr/command.h"
-#include "edr/grpc_client.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/resource.h"
 #include "edr/self_protect.h"
@@ -584,8 +583,6 @@ static int edr_agent_run_main(const char *config) {
                 edr_agent_event_bus(agent)),
             (unsigned long long)dd, (unsigned long long)rr,
             (unsigned long long)edr_storage_queue_pending_count());
-    fprintf(stderr, "[grpc] rpc_ok=%lu rpc_fail=%lu\n", edr_grpc_client_rpc_ok(),
-            edr_grpc_client_rpc_fail());
     fprintf(stderr,
             "[command] handled=%lu unknown=%lu rejected=%lu exec_ok=%lu exec_fail=%lu\n",
             edr_command_handled_count(), edr_command_unknown_count(),

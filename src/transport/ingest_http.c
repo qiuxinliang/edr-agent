@@ -2,7 +2,6 @@
 
 #include "edr/command.h"
 #include "edr/event_batch.h"
-#include "edr/grpc_client.h"
 #include "edr/transport_v2.h"
 
 #include <ctype.h>
