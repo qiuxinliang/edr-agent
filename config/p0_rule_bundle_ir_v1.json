@@ -1,10 +1,10 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-e2377a0d",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-086c1be1",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 160,
+  "rule_count": 165,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -3404,6 +3404,137 @@
           "(?i)aws\\s+s3\\s+(cp|sync|mv).*\\-\\-recursive",
           "(?i)megatools\\s+(dl|put)",
           "(?i)onedrive\\-uploader"
+        ]
+      }
+    },
+    {
+      "id": "R-CLICKFIX-001",
+      "title": "ClickFix 运行对话框粘贴执行链",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.004",
+        "T1059.001",
+        "T1218.005"
+      ],
+      "description": "explorer.exe 直接拉起 PowerShell、mshta、cmd、脚本宿主或 curl，并携带 URL、IEX、Base64、隐藏窗口、headless conhost 等 ClickFix/FileFix 典型载荷特征。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)(https?|ftp)://",
+          "(?i)frombase64string",
+          "(?i)invoke-expression",
+          "(?i)\\biex\\b",
+          "(?i)downloadstring|downloadfile|net\\.webclient|start-bitstransfer",
+          "(?i)\\-(w|windowstyle)\\s+hidden",
+          "(?i)\\-e[a-z]*\\s+['\"]?[A-Za-z0-9+/=]{16,}",
+          "(?i)conhost(\\.exe)?\\s+--headless",
+          "(?i)mshta[^\\n]{0,40}(https?://|javascript:|vbscript:)"
+        ],
+        "parent_name_in": [
+          "explorer.exe"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe",
+          "mshta.exe",
+          "cmd.exe",
+          "wscript.exe",
+          "cscript.exe",
+          "curl.exe",
+          "conhost.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-CLICKFIX-002",
+      "title": "Mshta 伪装扩展名远程载荷",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.005",
+        "T1204.004",
+        "T1105"
+      ],
+      "description": "mshta.exe 加载远程 mp4/jpg/png/gif/svg/html/htm 等伪装扩展名载荷，覆盖 ClickFix/FileFix 中常见的内容类型伪装。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)(https?|ftp)://[^\\s'\"]+\\.(mp4|jpg|jpeg|png|gif|svg|html|htm)(\\?|#|\\s|$)",
+          "(?i)mshta(\\.exe)?[^\\n]{0,80}(https?|ftp)://",
+          "(?i)mshta(\\.exe)?[^\\n]{0,80}(javascript:|vbscript:|about:<script)"
+        ],
+        "process_name_in": [
+          "mshta.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-DEFENSE-008",
+      "title": "通用 BYOVD 易受攻击驱动 / EDR-Killer",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.001",
+        "T1068",
+        "T1014"
+      ],
+      "description": "命中常见 LOLDrivers 易受攻击驱动名、公开 EDR-Killer/反 root 工具名，或通过 sc 创建内核驱动服务；用于识别勒索前置 EDR 致盲。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\b(rtcore64|dbutil_2_3|gdrv|iqvw64e|aswarpot|mhyprot2|procexp15\\d|truesight|amsdk|wamsdk|wsftprm|nseckrnl|gamedriverx64|viragt64|zam64|zamguard|kavg|atszio|winio|speedfan|asrdrv)\\.sys\\b",
+          "(?i)\\b(edrkillshifter|edrsandblast|edrsilencer|poortry|burntcigar|aukill|spyboy|terminator|gmer|backstab|hollowreaper|pchw|pchunter|hrsword)\\b",
+          "(?i)\\bsc(\\.exe)?\\s+create\\s+[^\\n]{0,200}type=\\s*kernel",
+          "(?i)\\bsc(\\.exe)?\\s+create\\s+\\S+\\s+binpath=\\s*[^\\n]{0,200}\\.sys"
+        ]
+      }
+    },
+    {
+      "id": "R-DEFENSE-009",
+      "title": "WFP 致盲与 EDR 服务直接停止",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.001",
+        "T1562.004"
+      ],
+      "description": "检测 EDRSilencer/WFP 过滤致盲迹象，以及 sc/net/taskkill 直接停止或终止常见 EDR/AV 服务与进程。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\bedrsilencer\\b",
+          "(?i)\\b(netsh|wfpdiag|pktmon)(\\.exe)?[^\\n]{0,120}\\b(wfp|filter|callout|block)\\b[^\\n]{0,120}\\b(add|delete|disable|stop)\\b",
+          "(?i)\\bsc(\\.exe)?\\s+(stop|config)\\s+(WinDefend|WdNisSvc|Sense|MsMpSvc|CSFalconService|CylanceSvc|SentinelAgent|SentinelOne|CarbonBlack|CbDefense|Sophos|SepMasterService|TaniumClient|ElasticEndpoint|osqueryd)\\b",
+          "(?i)\\b(net|net1)(\\.exe)?\\s+stop\\s+(WinDefend|WdNisSvc|Sense|MsMpSvc|CSFalconService|CylanceSvc|SentinelAgent|CarbonBlack|Sophos|SepMasterService|TaniumClient|ElasticEndpoint)\\b",
+          "(?i)\\btaskkill(\\.exe)?[^\\n]{0,120}\\b(msmpeng|senseir|sense|csfalcon|sentinelagent|cylancesvc|carbonblack|cbdefense|sophos|elastic-endpoint|elastic-agent|osqueryd)\\b"
+        ]
+      }
+    },
+    {
+      "id": "R-LOLBIN-013",
+      "title": "被滥用系统工具下载载荷",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1105",
+        "T1218",
+        "T1202"
+      ],
+      "description": "补齐 finger.exe、MpCmdRun.exe -DownloadFile、desktopimgdownldr.exe 等系统工具被滥用于下载或外带数据的行为。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\bfinger(\\.exe)?\\s+[^\\s@]+@[^\\s]+",
+          "(?i)\\bfinger(\\.exe)?[^\\n]{0,160}>",
+          "(?i)\\bmpcmdrun(\\.exe)?[^\\n]{0,160}-(DownloadFile|Download)\\b[^\\n]{0,160}(https?|ftp)://",
+          "(?i)\\bmpcmdrun(\\.exe)?[^\\n]{0,160}-(url|path)\\b",
+          "(?i)\\bdesktopimgdownldr(\\.exe)?[^\\n]{0,160}(/lockscreenurl:|/eventName:|https?://)"
+        ],
+        "process_name_in": [
+          "finger.exe",
+          "MpCmdRun.exe",
+          "desktopimgdownldr.exe"
         ]
       }
     }

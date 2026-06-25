@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r252-e2377a0d"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r252-086c1be1"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -1810,6 +1810,10 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.windivert_ports_is_custom = false;
   cfg->shellcode_detector.windivert_tcp_ports_parsed_count = 0;
 
+  cfg->net_fanout.enabled = false;
+  cfg->net_fanout.window_s = 120u;
+  cfg->net_fanout.distinct_ip_threshold = 50u;
+  cfg->net_fanout.ports[0] = '\0';
   cfg->webshell_detector.enabled = false;
   cfg->webshell_detector.discovery_interval_s = 1800u;
   cfg->webshell_detector.iis_config_path[0] = '\0';
@@ -2576,6 +2580,24 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     toml_table_t *t = toml_table_in(root, "webshell_detector");
     if (t) {
       load_webshell_detector(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "net_fanout");
+    if (t) {
+      toml_datum_t d = toml_bool_in(t, "enabled");
+      if (d.ok) {
+        cfg->net_fanout.enabled = d.u.b ? true : false;
+      }
+      d = toml_int_in(t, "window_s");
+      if (d.ok && d.u.i >= 1 && d.u.i <= 3600) {
+        cfg->net_fanout.window_s = (uint32_t)d.u.i;
+      }
+      d = toml_int_in(t, "distinct_ip_threshold");
+      if (d.ok && d.u.i >= 1 && d.u.i <= 100000) {
+        cfg->net_fanout.distinct_ip_threshold = (uint32_t)d.u.i;
+      }
+      take_string(toml_string_in(t, "ports"), cfg->net_fanout.ports, sizeof(cfg->net_fanout.ports));
     }
   }
   {

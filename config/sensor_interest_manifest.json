@@ -15,6 +15,7 @@
     "frombase64string",
     "ftp://",
     "hidden",
+    "http",
     "http://",
     "https",
     "https://",
@@ -48,16 +49,16 @@
     "wscript"
   ],
   "counts": {
-    "cmd_tokens": 46,
+    "cmd_tokens": 47,
     "file_path_contains": 28,
     "file_path_prefixes": 0,
     "process_name_prefixes": 0,
-    "process_names": 86,
+    "process_names": 87,
     "registry_path_contains": 18,
     "registry_path_prefixes": 0,
-    "remote_ports": 31
+    "remote_ports": 34
   },
-  "enabled_rules": 166,
+  "enabled_rules": 191,
   "file_path_contains": [
     "\\apache\\htdocs\\",
     "\\appdata\\local\\temp\\",
@@ -89,8 +90,8 @@
     "restore-files"
   ],
   "file_path_prefixes": [],
-  "generated_at": "2026-06-11T03:49:24.096257Z",
-  "interest_version": "sensor-interest-v1-d5e20ae77f22",
+  "generated_at": "2026-06-25T08:39:46.915274Z",
+  "interest_version": "sensor-interest-v1-24886426abf0",
   "kind": "edr_sensor_interest_manifest",
   "process_name_prefixes": [],
   "process_names": [
@@ -125,6 +126,7 @@
     "fsutil.exe",
     "iexplore.exe",
     "installutil.exe",
+    "makecab.exe",
     "mpcmdrun.exe",
     "msaccess.exe",
     "msbuild.exe",
@@ -203,6 +205,7 @@
   ],
   "registry_path_prefixes": [],
   "remote_ports": [
+    21,
     22,
     53,
     88,
@@ -213,6 +216,8 @@
     464,
     593,
     636,
+    989,
+    990,
     1080,
     1433,
     3128,
@@ -235,7 +240,7 @@
     27017,
     47001
   ],
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-e2377a0d",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-086c1be1",
   "schema_version": 1,
   "source_dynamic_rules": "dynamic_rules_v1.json"
 }

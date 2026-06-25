@@ -1365,6 +1365,26 @@ void edr_isolate_auto_from_shellcode_alarm(void) {
 #endif
 }
 
+void edr_isolate_auto_from_ransom_alarm(void) {
+#if !defined(_WIN32)
+  return;
+#else
+  /* 默认关:仅 EDR_RANSOM_AUTO_ISOLATE=1 且高危策略开启时,确诊勒索本机自隔离(每进程一次)。 */
+  const char *eo = getenv("EDR_RANSOM_AUTO_ISOLATE");
+  if (!eo || eo[0] != '1') {
+    return;
+  }
+  if (!dangerous_enabled()) {
+    return;
+  }
+  static volatile LONG s_ransom_auto_iso_once;
+  if (InterlockedCompareExchange(&s_ransom_auto_iso_once, 1, 0) != 0) {
+    return;
+  }
+  do_isolate("auto-ransom", NULL);
+#endif
+}
+
 static int forensic_copy_one_file(const char *src, const char *dst) {
 #ifdef _WIN32
   return CopyFileA(src, dst, FALSE) ? 0 : -1;

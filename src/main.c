@@ -21,6 +21,7 @@
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #include "edr/pmfe.h"
+#include "edr/net_fanout_detector.h"
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
 
@@ -562,6 +563,12 @@ static int edr_agent_run_main(const char *config) {
       fprintf(stderr, "webshell_detector init failed: %d\n", (int)we);
     }
   }
+  {
+    EdrError ne = edr_net_fanout_init(edr_agent_get_config(agent));
+    if (ne != EDR_OK) {
+      fprintf(stderr, "net_fanout init failed: %d\n", (int)ne);
+    }
+  }
 #ifdef _WIN32
   edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
 #endif
@@ -613,6 +620,7 @@ static int edr_agent_run_main(const char *config) {
   edr_pmfe_shutdown();
   edr_shellcode_detector_shutdown();
   edr_webshell_detector_shutdown();
+  edr_net_fanout_shutdown();
   edr_transport_shutdown();
   edr_local_evidence_cache_close();
   edr_storage_queue_close();

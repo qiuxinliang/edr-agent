@@ -129,7 +129,7 @@ sampling_rate_whitelist = 0.02
 #                                          # 非门控进程名保留千分比（默认30=3%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
-rules_version = "edr-dynamic-rules-v1-r252-e2377a0d"
+rules_version = "edr-dynamic-rules-v1-r252-086c1be1"
 # 若本文件未显式配置 [[preprocessing.rules]]，Agent 会尝试从与 agent.toml 同目录的
 # agent_preprocess_rules_v1.toml 自动加载第一版动态前置规则（可用 EDR_PREPROCESS_RULES_BUNDLE_PATH 覆盖路径）。
 
@@ -305,6 +305,15 @@ forensic_ring_slots      = 0
 forensic_ring_max_packet_bytes = 2048
 windivert_tcp_ports      = ""
 #   空 = 内置 SMB/RDP/WinRM/MSRPC/LDAP 等端口；非空 = 仅监听所列 TCP 端口（逗号分隔），并忽略 monitor_smb 等按类开关
+
+# 端侧网络扇出/扫描检测：同进程在窗口内对同一目的端口连接大量不同 IP=端口/主机扫描或横向探测(T1046/T1018)。
+# 用端侧真实 dst_ip/dst_port(服务端只拿到占位值,故必须端侧做)。默认关。env: EDR_NET_FANOUT_ENABLE/WINDOW_S/THRESHOLD/PORTS。
+[net_fanout]
+enabled                  = false
+window_s                 = 120
+distinct_ip_threshold    = 50
+# 扫描敏感端口(逗号分隔);留空=内置默认 445,139,3389,22,135,5985,1433,3306,23,5432
+ports                    = ""
 
 # §18 Webshell 检测引擎（Linux 当前支持 inotify 目录监控；可通过 EDR_WEBSHELL_ROOTS 指定站点根目录）
 [webshell_detector]

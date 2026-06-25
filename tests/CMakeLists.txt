@@ -561,6 +561,14 @@ target_include_directories(test_shellcode_flow_dedup PRIVATE ${CMAKE_SOURCE_DIR}
 edr_apply_common_warnings(test_shellcode_flow_dedup)
 add_test(NAME shellcode_flow_dedup COMMAND test_shellcode_flow_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+# 端侧网络扇出/扫描检测器核心逻辑
+add_executable(test_net_fanout
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_net_fanout.c
+  ${CMAKE_SOURCE_DIR}/src/detection/net_fanout_core.c)
+target_include_directories(test_net_fanout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/detection)
+edr_apply_common_warnings(test_net_fanout)
+add_test(NAME net_fanout COMMAND test_net_fanout WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 # §B1 子系统心跳逻辑
 add_executable(test_self_protect_heartbeat
   ${CMAKE_CURRENT_SOURCE_DIR}/test_self_protect_heartbeat.c

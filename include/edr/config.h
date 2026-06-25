@@ -412,6 +412,14 @@ typedef struct EdrConfig {
     uint32_t max_upload_size_mb;
   } webshell_detector;
 
+  /** 端侧网络扇出/扫描检测（TOML `[net_fanout]`）。同进程同端口窗口内连大量不同 IP=扫描。 */
+  struct {
+    bool enabled;                   /* 默认 false */
+    uint32_t window_s;              /* 默认 120 */
+    uint32_t distinct_ip_threshold; /* 默认 50 */
+    char ports[256];                /* 逗号分隔扫描敏感端口;空=内置默认 */
+  } net_fanout;
+
   /**
    * 联邦学习本地训练（FL §10）；TOML `[fl]`。
    */

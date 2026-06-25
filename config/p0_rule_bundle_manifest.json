@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-e2377a0d",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-086c1be1",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 160,
+  "rule_count": 165,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -1680,6 +1680,65 @@
         "T1567.002",
         "T1530",
         "T1048"
+      ]
+    },
+    {
+      "id": "R-CLICKFIX-001",
+      "title": "ClickFix 运行对话框粘贴执行链",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1204.004",
+        "T1059.001",
+        "T1218.005"
+      ]
+    },
+    {
+      "id": "R-CLICKFIX-002",
+      "title": "Mshta 伪装扩展名远程载荷",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1218.005",
+        "T1204.004",
+        "T1105"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-008",
+      "title": "通用 BYOVD 易受攻击驱动 / EDR-Killer",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.001",
+        "T1068",
+        "T1014"
+      ]
+    },
+    {
+      "id": "R-DEFENSE-009",
+      "title": "WFP 致盲与 EDR 服务直接停止",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1562.001",
+        "T1562.004"
+      ]
+    },
+    {
+      "id": "R-LOLBIN-013",
+      "title": "被滥用系统工具下载载荷",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1105",
+        "T1218",
+        "T1202"
       ]
     }
   ]

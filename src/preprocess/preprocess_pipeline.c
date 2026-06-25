@@ -14,6 +14,7 @@
 #include "edr/event_batch.h"
 #include "edr/event_bus.h"
 #include "edr/heartbeat.h"
+#include "edr/net_fanout_detector.h"
 #include "edr/ave_cross_engine_feed.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pid_history_pmfe.h"
@@ -291,6 +292,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
   edr_p0_rule_try_emit(&br);
+  edr_net_fanout_on_event(&br);
   {
     EdrDetectionDecision dd;
     edr_detection_decision_evaluate(&br, &dd);

@@ -1,5 +1,7 @@
 #include "edr/behavior_from_slot.h"
 
+#include "edr/command.h"
+
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -729,6 +731,11 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
                    confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
                    (suspicious ? " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3" : ""),
                    canary ? " canary_counter_bypass=1" : "");
+
+  if (confirmed) {
+    /* 确诊勒索:端侧实时自隔离(默认关,需 EDR_RANSOM_AUTO_ISOLATE=1 + 高危策略;每进程一次)。 */
+    edr_isolate_auto_from_ransom_alarm();
+  }
 
   if (is_ransom_note_like_path(r->file_path)) {
     RansomNoteBucket *nb = ransom_note_bucket_for(r->pid ? r->pid : 1u, now_ns, ransom_note_window_ns());
