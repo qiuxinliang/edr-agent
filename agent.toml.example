@@ -238,6 +238,16 @@ max_log_files        = 10
 # job_object_windows              = false
 # watchdog_log_interval_s         = 0
 # event_bus_pressure_warn_pct     = 90
+# # §B1 进程内子系统心跳：collector/preprocess/main_loop 超过该秒数未跳动则判 hang 并告警；0=关
+# subsystem_stale_timeout_s       = 0
+# # §B2 伴生 watchdog 进程互守（抗 kill）：true 时 agent 启动独立 watchdog 子进程，
+# #     任一被杀由另一方按原 config 重新拉起；干净退出写 stop stamp 阻止复活。
+# #     环境变量 EDR_SELF_PROTECT_WATCHDOG_PROCESS=1 亦可开启。
+# watchdog_process                = false
+# watchdog_heartbeat_interval_s   = 5      # agent 写/ watchdog 读心跳文件间隔（秒）
+# watchdog_stale_timeout_s        = 30     # 心跳超过该秒数视为僵死并重启
+# watchdog_max_restarts_per_min   = 5      # 重启风暴防护；超限退避
+# watchdog_heartbeat_path         = ""     # 空=从 EDR_SELF_PROTECT_PIDFILE 旁派生或用临时目录
 #
 # Windows 签名白名单（Stage0）可通过环境变量补充可信厂商关键词（逗号分隔，大小写不敏感）：
 #   EDR_AVE_TRUSTED_VENDOR_KEYWORDS="tencent,aliyun,huawei,qihoo,360,total defense,kingsoft,beijing huorong,"
@@ -263,14 +273,31 @@ alert_threshold          = 0.70
 auto_isolate_threshold   = 0.95
 auto_isolate_execute     = false
 heuristic_score_scale    = 1.0
-yara_rules_reload_interval_s = 0
+# P0 优化 #2：每条连接只深扫前 N 字节载荷（漏洞利用特征在会话起始）；超过则跳过深扫。0=不限（旧行为）。
+flow_scan_first_bytes    = 65536
+# P0 优化 #3：是否深扫 TLS 应用数据（密文）。默认 false：仅取 ClientHello(JA3/SNI)，跳过密文记录，省 CPU 且免误报。
+scan_tls_appdata         = false
+# 排除 Agent 自身到平台/中继/代理的流量(默认 true)。启动解析 [platform] rest_base_url/relay_url/proxy_url 的 IP，
+# 在 WinDivert 内核过滤器加 not 子句，避免「EDR 自抓自」。平台 IP 变更需重启重新解析。
+exclude_self_traffic     = true
+# YARA 规则目录周期性热重载间隔（秒）；0=仅启动时加载。生产建议 300。
+yara_rules_reload_interval_s = 300
 monitor_smb              = true
 monitor_rdp              = true
 monitor_winrm            = true
 monitor_msrpc            = true
 monitor_ldap             = true
+# P2 #7：捕获消费线程数(1..4)。>1 时多线程并发 recv 同一句柄、共享状态加锁；>1 时禁用 YARA 热重载(启动加载一次)。
 detector_threads         = 2
-yara_rules_dir           = ""
+# P2 #8：WinDivert 内核队列参数(0=用内置默认)。瘦终端可调小以约束非分页内存。
+# 范围:length 32..16384、size 64..32768 KiB、time 100..16000 ms。
+windivert_queue_length   = 8192
+windivert_queue_size_kb  = 8192
+windivert_queue_time_ms  = 2000
+# 已知漏洞 YARA 规则目录（命中优先于内置匹配器）。开发态相对路径；
+# 安装包由安装器写入部署机绝对路径（如 <install>/rules/shellcode）。
+# 留空则跳过 YARA，仅用内置匹配器。
+yara_rules_dir           = "src/shellcode_detector/rules"
 forensic_dir             = ""
 forensic_save_pcap       = false
 evidence_preview_bytes   = 0

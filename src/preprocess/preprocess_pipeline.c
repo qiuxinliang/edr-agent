@@ -13,6 +13,7 @@
 #include "edr/emit_rules.h"
 #include "edr/event_batch.h"
 #include "edr/event_bus.h"
+#include "edr/heartbeat.h"
 #include "edr/ave_cross_engine_feed.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pid_history_pmfe.h"
@@ -340,6 +341,7 @@ static void *preprocess_main(void *arg) {
 #endif
   (void)arg;
   for (;;) {
+    edr_health_beat(EDR_HEALTH_PREPROCESS);
     EdrEventSlot slot;
     if (edr_event_bus_try_pop(s_bus, &slot)) {
       process_one_slot(&slot);

@@ -304,6 +304,25 @@ typedef struct EdrConfig {
      * 事件总线占用 ≥ 该百分比时周期性 stderr 告警；0 表示关闭。
      */
     uint32_t event_bus_pressure_warn_pct;
+    /**
+     * §B1 进程内子系统心跳：某子系统（collector/preprocess/main_loop）距上次心跳
+     * ≥ 该秒数时判定 hang 并周期性 WARN；0=关闭（默认）。
+     */
+    uint32_t subsystem_stale_timeout_s;
+    /**
+     * §B2 伴生 watchdog 进程：为 true 时 agent 启动一个独立 watchdog 子进程互守，
+     * 任一被 kill 由另一方按原 argv/config 重新拉起。默认 false。
+     * 环境变量 EDR_SELF_PROTECT_WATCHDOG_PROCESS=1 亦可开启（优先级高于配置）。
+     */
+    bool watchdog_process;
+    /** watchdog 与 agent 写/读心跳文件的间隔（秒），默认 5。 */
+    uint32_t watchdog_heartbeat_interval_s;
+    /** agent 心跳文件超过该秒数视为僵死并由 watchdog 重启，默认 30。 */
+    uint32_t watchdog_stale_timeout_s;
+    /** 重启风暴防护：每分钟最多重启次数，默认 5；超限退避。 */
+    uint32_t watchdog_max_restarts_per_min;
+    /** 心跳文件路径；空则从 pidfile 旁派生或用默认临时路径。 */
+    char watchdog_heartbeat_path[1024];
   } self_protect;
 
   /** §17 协议层 Shellcode 检测引擎（Windows；其它平台忽略 enabled） */
@@ -321,6 +340,23 @@ typedef struct EdrConfig {
     bool auto_isolate_execute;
     /** 启发式分数乘数（0.01–3.0），用于现场压误报/提灵敏度 */
     double heuristic_score_scale;
+    /**
+     * P0 优化 #2：每条连接（4 元组）只深扫前 N 字节载荷；超过则跳过深扫（漏洞利用特征均在会话起始）。
+     * 大幅降低大文件/长连接的逐包 entropy/YARA 开销。0=不限（旧行为，逐包全扫）。默认 65536。
+     */
+    uint32_t flow_scan_first_bytes;
+    /**
+     * P0 优化 #3：是否对 TLS 应用数据（密文）做 shellcode 深扫。
+     * 默认 false：仅提取 ClientHello（JA3/SNI），跳过 CCS/alert/application_data 记录的熵/YARA 扫描，
+     * 既省 CPU 又避免高熵密文误报。设 true 恢复对 TLS 载荷的深扫。
+     */
+    bool scan_tls_appdata;
+    /**
+     * 排除 Agent 自身到平台/中继/代理的流量（默认 true）。启动时解析 `[platform]` 的
+     * rest_base_url / relay_url / proxy_url 主机 IP，在 WinDivert 过滤器内核层加 `and not (ip.*Addr==..)`，
+     * 避免「EDR 自抓自」浪费与潜在自我误报。平台 IP 变更需重启重新解析；解析失败则本次不排除。
+     */
+    bool exclude_self_traffic;
     /** YARA 规则目录周期性重新编译间隔（秒）；0=仅启动时加载 */
     uint32_t yara_rules_reload_interval_s;
     bool monitor_smb;
@@ -349,6 +385,13 @@ typedef struct EdrConfig {
     bool windivert_ports_is_custom;
     uint16_t windivert_tcp_ports_parsed[64];
     size_t windivert_tcp_ports_parsed_count;
+    /**
+     * P2 #8：WinDivert 内核队列参数（随机型可调；瘦终端可调小以约束非分页内存）。
+     * 0=用内置默认。范围按 WinDivert 规范 clamp：length 32..16384、size 64..32768 KiB、time 100..16000 ms。
+     */
+    uint32_t windivert_queue_length;
+    uint32_t windivert_queue_size_kb;
+    uint32_t windivert_queue_time_ms;
   } shellcode_detector;
 
   /** §18 Webshell 检测引擎（站点目录增量监控） */

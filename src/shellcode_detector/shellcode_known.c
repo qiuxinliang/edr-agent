@@ -238,10 +238,11 @@ static int is_rule_file_path(const char *path) {
 
 static void compiler_error_cb(int err_level, const char *file_name, int line_number, const YR_RULE *rule,
                               const char *message, void *user_data) {
-  (void)err_level;
   (void)rule;
   (void)user_data;
-  fprintf(stderr, "[shellcode_detector] yara compile error file=%s line=%d msg=%s\n",
+  /* YARA 对短/低熵 atom 会发 WARNING（不影响加载），与真正的 ERROR 区分，避免误读为失败。 */
+  const char *level = (err_level == YARA_ERROR_LEVEL_WARNING) ? "warning" : "error";
+  fprintf(stderr, "[shellcode_detector] yara compile %s file=%s line=%d msg=%s\n", level,
           file_name ? file_name : "-", line_number, message ? message : "-");
 }
 

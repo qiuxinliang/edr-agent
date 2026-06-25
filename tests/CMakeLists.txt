@@ -529,5 +529,45 @@ if(UNIX AND NOT WIN32)
 endif()
 edr_apply_common_warnings(test_shellcode)
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# §A bundled shellcode YARA 规则可加载 + 已知漏洞命中（无 YARA 时回退内置匹配器）
+add_executable(test_shellcode_yara_rules ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_yara_rules.c ${_edr_shellcode_sources_abs})
+target_include_directories(test_shellcode_yara_rules PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/windivert
+)
+target_compile_definitions(test_shellcode_yara_rules PRIVATE
+  EDR_SHELLCODE_RULES_DIR="${CMAKE_SOURCE_DIR}/src/shellcode_detector/rules")
+if(EDR_YARA_AVAILABLE)
+  target_compile_definitions(test_shellcode_yara_rules PRIVATE EDR_HAVE_YARA=1)
+  target_include_directories(test_shellcode_yara_rules PRIVATE ${YARA_INCLUDE_DIR})
+  target_link_libraries(test_shellcode_yara_rules PRIVATE ${YARA_LIB})
+endif()
+if(WIN32)
+  target_link_libraries(test_shellcode_yara_rules PRIVATE advapi32 ws2_32 iphlpapi)
+endif()
+if(UNIX AND NOT WIN32)
+  target_link_libraries(test_shellcode_yara_rules PRIVATE m)
+endif()
+edr_apply_common_warnings(test_shellcode_yara_rules)
+add_test(NAME shellcode_yara_rules COMMAND test_shellcode_yara_rules WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# P0 #2/#3 流级去重 + TLS 记录短路（纯逻辑，跨平台）
+add_executable(test_shellcode_flow_dedup
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_flow_dedup.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/flow_dedup.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/proto_parse.c)
+target_include_directories(test_shellcode_flow_dedup PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_shellcode_flow_dedup)
+add_test(NAME shellcode_flow_dedup COMMAND test_shellcode_flow_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# §B1 子系统心跳逻辑
+add_executable(test_self_protect_heartbeat
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_self_protect_heartbeat.c
+  ${CMAKE_SOURCE_DIR}/src/self_protect/heartbeat.c
+  ${CMAKE_SOURCE_DIR}/src/core/time_util.c)
+target_include_directories(test_self_protect_heartbeat PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_self_protect_heartbeat)
+add_test(NAME self_protect_heartbeat COMMAND test_self_protect_heartbeat WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)

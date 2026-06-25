@@ -35,6 +35,7 @@
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
+#include "edr/heartbeat.h"
 #include "edr/pmfe.h"
 #include "edr/types.h"
 
@@ -407,6 +408,8 @@ static void *inotify_thread_main(void *arg) {
   char buf[INOTIFY_READ_BUF] __attribute__((aligned(sizeof(struct inotify_event))));
 
   while (!s_stop) {
+    /* inotify poll 超时 1s，空闲也会跳动，不会误报“卡死” */
+    edr_health_beat(EDR_HEALTH_COLLECTOR);
     struct pollfd fds[2];
     fds[0].fd = s_ifd;
     fds[0].events = POLLIN;

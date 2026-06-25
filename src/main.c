@@ -17,6 +17,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/resource.h"
 #include "edr/self_protect.h"
+#include "edr/watchdog.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #include "edr/pmfe.h"
@@ -679,6 +680,8 @@ int main(int argc, char **argv) {
   const char *config = NULL;
   int run_as_service = 0;
   int config_test = 0;
+  int watchdog_mode = 0;
+  long watchdog_parent_pid = 0;
 #ifdef _WIN32
   int install_mode = 0;
   int install_arg_seen = 0;
@@ -774,6 +777,14 @@ int main(int argc, char **argv) {
       return 2;
     }
 #endif
+    if (strcmp(argv[i], "--watchdog") == 0) {
+      watchdog_mode = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--parent-pid") == 0 && i + 1 < argc) {
+      watchdog_parent_pid = strtol(argv[++i], NULL, 10);
+      continue;
+    }
     if (strcmp(argv[i], "--service") == 0) {
       run_as_service = 1;
       continue;
@@ -827,6 +838,11 @@ int main(int argc, char **argv) {
 
   if (config_test) {
     return edr_agent_config_test_main(config);
+  }
+
+  edr_self_protect_set_exec_context(argv[0], config ? config : "");
+  if (watchdog_mode) {
+    return edr_watchdog_run(watchdog_parent_pid, argv[0], config ? config : "");
   }
 
   return edr_agent_run_main(config);

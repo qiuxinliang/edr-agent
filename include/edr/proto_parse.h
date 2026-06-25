@@ -5,6 +5,7 @@
 #define EDR_PROTO_PARSE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef enum {
@@ -52,5 +53,17 @@ EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_
  */
 int edr_proto_parse_tls_client_hello(const uint8_t *data, uint32_t len,
                                      EdrTlsClientHelloInfo *out);
+
+/**
+ * 识别 TLS 记录头：返回内容类型（20=CCS,21=alert,22=handshake,23=application_data），非 TLS 记录返回 0。
+ * 用于 P0 优化 #3：对密文记录（CCS/alert/appdata）跳过 shellcode 深扫，避免高熵误报与无谓 CPU。
+ */
+uint8_t edr_proto_tls_record_type(const uint8_t *data, uint32_t len);
+
+/**
+ * 从 URL 抽取主机名/IP（去 scheme、userinfo、端口、路径；支持 [ipv6] 字面量）。
+ * 成功写入 host 并返回 0；无法解析返回 -1。
+ */
+int edr_url_extract_host(const char *url, char *host, size_t cap);
 
 #endif

@@ -309,3 +309,41 @@ EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_
 
   return EDR_PROTO_PARSE_UNKNOWN;
 }
+
+uint8_t edr_proto_tls_record_type(const uint8_t *data, uint32_t len) {
+  if (!data || len < 3u) {
+    return 0u;
+  }
+  uint8_t ct = data[0];
+  /* TLS/SSL3 记录：content_type ∈ {20,21,22,23}，version 主版本固定 0x03，次版本 0x00..0x04 */
+  if ((ct == 20u || ct == 21u || ct == 22u || ct == 23u) && data[1] == 0x03u && data[2] <= 0x04u) {
+    return ct;
+  }
+  return 0u;
+}
+
+int edr_url_extract_host(const char *url, char *host, size_t cap) {
+  if (!url || !url[0] || !host || cap == 0u) {
+    return -1;
+  }
+  const char *p = strstr(url, "://");
+  p = p ? p + 3 : url;
+  const char *slash = strchr(p, '/');
+  const char *at = strchr(p, '@');
+  if (at && (!slash || at < slash)) {
+    p = at + 1; /* 跳过 userinfo */
+  }
+  size_t i = 0;
+  if (*p == '[') {
+    p++;
+    while (*p && *p != ']' && i + 1u < cap) {
+      host[i++] = *p++;
+    }
+  } else {
+    while (*p && *p != ':' && *p != '/' && *p != '?' && i + 1u < cap) {
+      host[i++] = *p++;
+    }
+  }
+  host[i] = '\0';
+  return i > 0u ? 0 : -1;
+}

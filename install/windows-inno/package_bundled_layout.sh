@@ -66,6 +66,16 @@ else
   exit 1
 fi
 
+# detection rule sets (shellcode / webshell YARA + builtin fallback)
+if [[ -d "$EDR_AGENT_DIR/src/shellcode_detector/rules" ]]; then
+  mkdir -p "$OUT_DIR/rules/shellcode"
+  cp -a "$EDR_AGENT_DIR/src/shellcode_detector/rules/." "$OUT_DIR/rules/shellcode/"
+fi
+if [[ -d "$EDR_AGENT_DIR/src/webshell_detector/rules" ]]; then
+  mkdir -p "$OUT_DIR/rules/webshell"
+  cp -a "$EDR_AGENT_DIR/src/webshell_detector/rules/." "$OUT_DIR/rules/webshell/"
+fi
+
 if [[ -f "$EDR_AGENT_DIR/agent.toml.example" ]]; then
   cp -a "$EDR_AGENT_DIR/agent.toml.example" "$OUT_DIR/"
 fi

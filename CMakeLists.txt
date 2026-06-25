@@ -308,6 +308,8 @@ set(EDR_AGENT_SOURCES
   src/attack_surface/attack_surface_egress.c
   src/attack_surface/security_policy_collect.c
   src/self_protect/self_protect.c
+  src/self_protect/heartbeat.c
+  src/self_protect/watchdog.c
   src/resource/resource.c
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
@@ -368,6 +370,7 @@ set(EDR_SHELLCODE_SRCS
   src/shellcode_detector/shellcode_heuristic.c
   src/shellcode_detector/shellcode_known.c
   src/shellcode_detector/proto_parse.c
+  src/shellcode_detector/flow_dedup.c
 )
 if(WIN32)
   list(APPEND EDR_SHELLCODE_SRCS

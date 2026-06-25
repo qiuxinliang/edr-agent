@@ -7,7 +7,9 @@
 #include "edr/event_bus.h"
 #include "edr/preprocess.h"
 #include "edr/resource.h"
+#include "edr/heartbeat.h"
 #include "edr/self_protect.h"
+#include "edr/watchdog.h"
 #include "edr/sensor_interest.h"
 #include "edr/sha256.h"
 #include "edr/shell_session.h"
@@ -1356,9 +1358,13 @@ EdrError edr_agent_run(EdrAgent *agent) {
         agent->asurf_last_post_ns = t0;
         agent->asurf_last_pending_check_ns = t0;
       }
+      /* §B2 伴生 watchdog：启用时 spawn/adopt 互守进程（抗 kill）。 */
+      (void)edr_watchdog_maybe_spawn_companion(&agent->cfg);
       while (!agent->shutdown) {
         uint64_t edr_loop_started_ns = edr_agent_loop_probe_begin();
         edr_ms_sleep(200u);
+        edr_health_beat(EDR_HEALTH_MAIN_LOOP);
+        edr_watchdog_agent_tick(&agent->cfg);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RESOURCE, edr_resource_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SELF_PROTECT, edr_self_protect_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_CONFIG_RELOAD,
@@ -1377,6 +1383,8 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
         edr_agent_loop_probe_end(edr_loop_started_ns);
       }
+      /* §B2 干净退出：写 stop stamp，阻止伴生 watchdog 复活本进程。 */
+      edr_watchdog_agent_on_shutdown(&agent->cfg);
       if (agent->collector_started) {
         edr_collector_stop();
         agent->collector_started = 0;

@@ -4,6 +4,7 @@
 
 #include "edr/config.h"
 #include "edr/event_bus.h"
+#include "edr/heartbeat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@ static HANDLE s_job;
 static int s_dbg_last;
 static unsigned s_poll_tick;
 static unsigned s_pressure_warn_count;
+static unsigned s_subsystem_stale_warn_count;
 
 void edr_self_protect_set_shutdown_hook(void (*cb)(int signo)) { s_shutdown_hook = cb; }
 
@@ -217,6 +219,21 @@ void edr_self_protect_poll(void) {
                   (unsigned)s_cfg->self_protect.event_bus_pressure_warn_pct,
                   (unsigned long long)edr_event_bus_high_water_hits(s_bus),
                   (unsigned long long)edr_event_bus_dropped_total(s_bus));
+        }
+      }
+    }
+  }
+
+  if (s_cfg && s_cfg->self_protect.subsystem_stale_timeout_s > 0u) {
+    uint64_t max_age_ns = (uint64_t)s_cfg->self_protect.subsystem_stale_timeout_s * 1000000000ULL;
+    uint32_t stale = edr_health_stale_mask(max_age_ns);
+    if (stale != 0u && (s_subsystem_stale_warn_count++ % 25u) == 0u) {
+      for (unsigned i = 0; i < (unsigned)EDR_HEALTH_COMPONENT_COUNT; i++) {
+        if ((stale & (1u << i)) != 0u) {
+          fprintf(stderr, "[self_protect] subsystem hang suspected: %s idle %llus (threshold %us)\n",
+                  edr_health_component_name((EdrHealthComponent)i),
+                  (unsigned long long)(edr_health_age_ns((EdrHealthComponent)i) / 1000000000ULL),
+                  (unsigned)s_cfg->self_protect.subsystem_stale_timeout_s);
         }
       }
     }

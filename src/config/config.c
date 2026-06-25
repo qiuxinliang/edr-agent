@@ -1132,6 +1132,42 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_int_in(t, "flow_scan_first_bytes");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.flow_scan_first_bytes = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "scan_tls_appdata");
+    if (d.ok) {
+      cfg->shellcode_detector.scan_tls_appdata = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "exclude_self_traffic");
+    if (d.ok) {
+      cfg->shellcode_detector.exclude_self_traffic = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "windivert_queue_length");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.windivert_queue_length = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "windivert_queue_size_kb");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.windivert_queue_size_kb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "windivert_queue_time_ms");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.windivert_queue_time_ms = (uint32_t)d.u.i;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "monitor_smb");
     if (d.ok) {
       cfg->shellcode_detector.monitor_smb = d.u.b ? true : false;
@@ -1359,6 +1395,28 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->shellcode_detector.detector_threads > 4u) {
     cfg->shellcode_detector.detector_threads = 4u;
+  }
+  /* P2 #8：WinDivert 队列参数 clamp（0 保留为“用内置默认”，不 clamp）。 */
+  if (cfg->shellcode_detector.windivert_queue_length != 0u) {
+    if (cfg->shellcode_detector.windivert_queue_length < 32u) {
+      cfg->shellcode_detector.windivert_queue_length = 32u;
+    } else if (cfg->shellcode_detector.windivert_queue_length > 16384u) {
+      cfg->shellcode_detector.windivert_queue_length = 16384u;
+    }
+  }
+  if (cfg->shellcode_detector.windivert_queue_size_kb != 0u) {
+    if (cfg->shellcode_detector.windivert_queue_size_kb < 64u) {
+      cfg->shellcode_detector.windivert_queue_size_kb = 64u;
+    } else if (cfg->shellcode_detector.windivert_queue_size_kb > 32768u) {
+      cfg->shellcode_detector.windivert_queue_size_kb = 32768u;
+    }
+  }
+  if (cfg->shellcode_detector.windivert_queue_time_ms != 0u) {
+    if (cfg->shellcode_detector.windivert_queue_time_ms < 100u) {
+      cfg->shellcode_detector.windivert_queue_time_ms = 100u;
+    } else if (cfg->shellcode_detector.windivert_queue_time_ms > 16000u) {
+      cfg->shellcode_detector.windivert_queue_time_ms = 16000u;
+    }
   }
   if (cfg->shellcode_detector.evidence_preview_bytes > 512u) {
     cfg->shellcode_detector.evidence_preview_bytes = 512u;
@@ -1725,7 +1783,10 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.auto_isolate_threshold = 0.95;
   cfg->shellcode_detector.auto_isolate_execute = false;
   cfg->shellcode_detector.heuristic_score_scale = 1.0;
-  cfg->shellcode_detector.yara_rules_reload_interval_s = 0u;
+  cfg->shellcode_detector.flow_scan_first_bytes = 65536u;
+  cfg->shellcode_detector.scan_tls_appdata = false;
+  cfg->shellcode_detector.exclude_self_traffic = true;
+  cfg->shellcode_detector.yara_rules_reload_interval_s = 300u;
   cfg->shellcode_detector.monitor_smb = true;
   cfg->shellcode_detector.monitor_rdp = true;
   cfg->shellcode_detector.monitor_winrm = true;
@@ -1733,7 +1794,13 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.monitor_ldap = true;
   cfg->shellcode_detector.monitor_tls = true;
   cfg->shellcode_detector.detector_threads = 2u;
-  cfg->shellcode_detector.yara_rules_dir[0] = '\0';
+  cfg->shellcode_detector.windivert_queue_length = 8192u;
+  cfg->shellcode_detector.windivert_queue_size_kb = 8192u;
+  cfg->shellcode_detector.windivert_queue_time_ms = 2000u;
+  /* 默认指向 bundled 规则目录（开发态相对路径；安装器写入部署绝对路径）。
+   * YARA 缺失或目录无规则时，shellcode_known 自动回退内置匹配器。 */
+  snprintf(cfg->shellcode_detector.yara_rules_dir, sizeof(cfg->shellcode_detector.yara_rules_dir), "%s",
+           "src/shellcode_detector/rules");
   cfg->shellcode_detector.forensic_dir[0] = '\0';
   cfg->shellcode_detector.forensic_save_pcap = false;
   cfg->shellcode_detector.evidence_preview_bytes = 0u;
@@ -1833,6 +1900,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->self_protect.job_object_windows = false;
   cfg->self_protect.watchdog_log_interval_s = 0u;
   cfg->self_protect.event_bus_pressure_warn_pct = 90u;
+  cfg->self_protect.subsystem_stale_timeout_s = 0u;
+  cfg->self_protect.watchdog_process = false;
+  cfg->self_protect.watchdog_heartbeat_interval_s = 5u;
+  cfg->self_protect.watchdog_stale_timeout_s = 30u;
+  cfg->self_protect.watchdog_max_restarts_per_min = 5u;
+  cfg->self_protect.watchdog_heartbeat_path[0] = '\0';
 }
 
 static void load_command(toml_table_t *t, EdrConfig *cfg) {
@@ -2320,6 +2393,38 @@ static void load_self_protect(toml_table_t *t, EdrConfig *cfg) {
       cfg->self_protect.event_bus_pressure_warn_pct = (uint32_t)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_int_in(t, "subsystem_stale_timeout_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 86400) {
+      cfg->self_protect.subsystem_stale_timeout_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "watchdog_process");
+    if (d.ok) {
+      cfg->self_protect.watchdog_process = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "watchdog_heartbeat_interval_s");
+    if (d.ok && d.u.i >= 1 && d.u.i <= 3600) {
+      cfg->self_protect.watchdog_heartbeat_interval_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "watchdog_stale_timeout_s");
+    if (d.ok && d.u.i >= 2 && d.u.i <= 86400) {
+      cfg->self_protect.watchdog_stale_timeout_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "watchdog_max_restarts_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 1000) {
+      cfg->self_protect.watchdog_max_restarts_per_min = (uint32_t)d.u.i;
+    }
+  }
+  take_string(toml_string_in(t, "watchdog_heartbeat_path"), cfg->self_protect.watchdog_heartbeat_path,
+              sizeof(cfg->self_protect.watchdog_heartbeat_path));
 }
 
 EdrError edr_config_load(const char *path, EdrConfig *cfg) {

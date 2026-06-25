@@ -22,7 +22,7 @@ double edr_shellcode_shannon_entropy_bits(const uint8_t *data, size_t len) {
       continue;
     }
     double p = (double)count[i] * invlen;
-    h -= p * (log(p) / log(2.0));
+    h -= p * log2(p); /* P1 #6：单次 log2 替代 log(p)/log(2.0) */
   }
   return h;
 }
