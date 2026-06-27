@@ -24,6 +24,7 @@
 #include "edr/process_tree_cache.h"
 #include "edr/sha256.h"
 #include "edr/storage_queue.h"
+#include "edr/time_util.h"
 #include "edr/transport_sink.h"
 #include "edr/types.h"
 #include "edr/windows_event_policy.h"
@@ -268,6 +269,50 @@ static void log_p0_runtime_state(void) {
           (ir_source && ir_source[0]) ? ir_source : "unknown");
 }
 
+static void emit_behavior_record(const EdrBehaviorRecord *br) {
+  if (!br) {
+    return;
+  }
+  uint8_t buf[16384];
+  size_t n = 0;
+  const char *enc = getenv("EDR_BEHAVIOR_ENCODING");
+  if (!enc || enc[0] == '\0' || strcmp(enc, "protobuf") == 0) {
+#ifdef EDR_HAVE_NANOPB
+    n = edr_behavior_record_encode_protobuf(br, buf, sizeof(buf));
+#endif
+    if (n == 0) {
+      n = edr_behavior_wire_encode(br, buf, sizeof(buf));
+    }
+  } else if (enc && strcmp(enc, "protobuf_c") == 0) {
+    n = edr_behavior_record_encode_protobuf_c(br, buf, sizeof(buf));
+    if (n == 0) {
+      n = edr_behavior_wire_encode(br, buf, sizeof(buf));
+    }
+  } else {
+    n = edr_behavior_wire_encode(br, buf, sizeof(buf));
+  }
+  if (n > 0) {
+    (void)edr_event_batch_push(buf, n);
+  }
+}
+
+/* behavior_summary flush 的 emit 回调：直接复用统一编码 + 入批次路径。 */
+static void emit_summary_record(const EdrBehaviorRecord *br) {
+  emit_behavior_record(br);
+}
+
+/* 节流的行为簇摘要 flush：最多每 ~30s 扫描一次已关闭窗口的聚合槽。 */
+static void poll_summary_flush(void) {
+  static uint64_t s_last_flush_mono_ns;
+  uint64_t mono = edr_monotonic_ns();
+  if (s_last_flush_mono_ns != 0u && mono - s_last_flush_mono_ns < 30000000000ULL) {
+    return;
+  }
+  s_last_flush_mono_ns = mono;
+  int64_t now_ns = (int64_t)time(NULL) * 1000000000LL;
+  edr_local_evidence_cache_flush_summaries(now_ns, emit_summary_record);
+}
+
 static void process_one_slot(const EdrEventSlot *slot) {
   /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
@@ -283,7 +328,6 @@ static void process_one_slot(const EdrEventSlot *slot) {
     edr_pmfe_on_process_lifecycle_hint();
   }
 #endif
-  uint8_t buf[16384];
   EdrBehaviorRecord br;
   edr_behavior_from_slot(slot, &br);
   apply_agent_ids_to_record(&br);
@@ -314,26 +358,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (!edr_local_evidence_cache_is_candidate(&br)) {
     return;
   }
-  size_t n = 0;
-  const char *enc = getenv("EDR_BEHAVIOR_ENCODING");
-  if (!enc || enc[0] == '\0' || strcmp(enc, "protobuf") == 0) {
-#ifdef EDR_HAVE_NANOPB
-    n = edr_behavior_record_encode_protobuf(&br, buf, sizeof(buf));
-#endif
-    if (n == 0) {
-      n = edr_behavior_wire_encode(&br, buf, sizeof(buf));
-    }
-  } else if (enc && strcmp(enc, "protobuf_c") == 0) {
-    n = edr_behavior_record_encode_protobuf_c(&br, buf, sizeof(buf));
-    if (n == 0) {
-      n = edr_behavior_wire_encode(&br, buf, sizeof(buf));
-    }
-  } else {
-    n = edr_behavior_wire_encode(&br, buf, sizeof(buf));
-  }
-  if (n > 0) {
-    (void)edr_event_batch_push(buf, n);
-  }
+  emit_behavior_record(&br);
 }
 
 #ifdef _WIN32
@@ -350,11 +375,13 @@ static void *preprocess_main(void *arg) {
       edr_event_batch_poll_timeout();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
+      poll_summary_flush();
       continue;
     }
     edr_event_batch_poll_timeout();
     edr_storage_queue_poll_drain();
     edr_local_evidence_cache_poll_maintenance();
+    poll_summary_flush();
 #ifdef _WIN32
     if (s_stop_preprocess) {
       while (edr_event_bus_try_pop(s_bus, &slot)) {

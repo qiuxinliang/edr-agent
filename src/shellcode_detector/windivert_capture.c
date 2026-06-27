@@ -751,7 +751,8 @@ static int push_alert(double score, const char *detector_label, const char *rule
     InterlockedIncrement(&s_budget_drop_count);
     fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
   }
-  if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
+  if (s_cfg && s_cfg->shellcode_detector.auto_isolate_execute &&
+      score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
     edr_isolate_auto_from_shellcode_alarm();
   }
   return 0;

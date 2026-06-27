@@ -565,6 +565,8 @@ struct EdrAgent {
   uint64_t asurf_last_post_ns;
   /** §19.6 上次轮询 refresh-request 的时间（ns） */
   uint64_t asurf_last_pending_check_ns;
+  /** 安装/注册后补采集：endpoint_id 首次变为有效时仅执行一次。 */
+  int asurf_enrolled_posted;
 };
 
 static void edr_agent_clear_config_recovery(EdrAgent *agent) {
@@ -1351,7 +1353,12 @@ EdrError edr_agent_run(EdrAgent *agent) {
           fprintf(stderr, "[attack_surface] startup snapshot failed: %s\n", d);
         } else if (strncmp(d, "uploaded_", 9) == 0) {
           fprintf(stderr, "[attack_surface] startup %s\n", d);
+          agent->asurf_enrolled_posted = 1;
         }
+      } else if (agent->cfg.attack_surface.enabled) {
+        fprintf(stderr, "[attack_surface] startup pending: endpoint_id is not valid yet\n");
+      } else {
+        fprintf(stderr, "[attack_surface] disabled by config; startup snapshot skipped\n");
       }
       {
         uint64_t t0 = edr_monotonic_ns();
@@ -2857,6 +2864,20 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   }
 
   uint64_t now = edr_monotonic_ns();
+
+  if (!agent->asurf_enrolled_posted) {
+    char detail[256];
+    int r = edr_attack_surface_execute("agent_enrolled", cfg, detail, sizeof(detail));
+    if (r != 0) {
+      fprintf(stderr, "[attack_surface] agent_enrolled failed: %s\n", detail);
+    } else {
+      agent->asurf_enrolled_posted = 1;
+      agent->asurf_last_post_ns = now;
+      if (strncmp(detail, "uploaded_", 9) == 0) {
+        fprintf(stderr, "[attack_surface] agent_enrolled %s\n", detail);
+      }
+    }
+  }
 
   if (cfg->attack_surface.etw_refresh_triggers_snapshot) {
     uint32_t ds = cfg->attack_surface.etw_refresh_debounce_s;

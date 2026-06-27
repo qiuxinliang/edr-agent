@@ -2033,7 +2033,8 @@ watchdog_log_interval_s = 60
 event_bus_pressure_warn_pct = 80
 
 [attack_surface]
-enabled              = false
+# 默认开启：安装/注册后 Agent 会执行一次 agent_start/agent_enrolled 攻击面检测，之后支持控制台按需刷新。
+enabled              = true
 
 [detection]
 auto_profile         = true

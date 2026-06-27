@@ -147,6 +147,20 @@ rmm_rollback_version = ""
 allow_paths = ""
 script_dirs = ""
 management_tools = "anydesk,teamviewer,rustdesk,screenconnect,connectwise,splashtop,meshcentral,atera,psexec,paexec"
+# fp_feedback：服务端把告警标记 false_positive 后自动生成的条件化 suppression 规则编译成的平铺 token
+# （进程名/路径/命令行子串，逗号分隔）。Agent 映射到 EDR_DETECTION_FP_FEEDBACK，命中即降级/丢弃同类事件。
+# 通常由 runtime-policy.toml 下发，无需手填；留空表示无服务端 FP 抑制。
+fp_feedback = ""
+
+# 二期进阶：条件化 suppression（AND 语义，比 fp_feedback 平铺匹配更精确）。通常由 runtime-policy.toml
+# 下发，无需手填。仅当 process_name 命中且 contains_all 全部出现时才抑制，因此能保留同一进程其它形态
+# （如外链 / 非 localhost）的告警能力。action = downgrade（降级）| drop（丢弃）。
+# [[detection_policy.suppression]]
+# target_rule_id = "R-LOLBIN-002"
+# process_name = "rundll32.exe"
+# contains_all = ["davclnt.dll,DavSetCookie", "localhost"]
+# action = "downgrade"
+# reason = "auto_fp_R-LOLBIN-002"
 
 # 可选：见 docs/PREPROCESS_RULES.md — 在 dedup/限流 之前匹配，action = drop | emit_always
 # [[preprocessing.rules]]

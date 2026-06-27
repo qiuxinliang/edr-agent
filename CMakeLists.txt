@@ -306,6 +306,7 @@ set(EDR_AGENT_SOURCES
   src/pmfe/pid_history_pmfe.c
   src/attack_surface/attack_surface_report.c
   src/attack_surface/attack_surface_egress.c
+  src/attack_surface/attack_surface_inventory.c
   src/attack_surface/security_policy_collect.c
   src/self_protect/self_protect.c
   src/self_protect/heartbeat.c
@@ -549,7 +550,7 @@ edr_apply_common_warnings(edr_agent)
 
 if(WIN32)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
-  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi)
+  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

@@ -59,6 +59,8 @@ typedef enum {
   EDR_EVENT_PMFE_SCAN_RESULT = 66,
   /** 主机行为告警帧（protobuf `BehaviorEvent.behavior_alert`，P0/PMFE/脚本等可复用） */
   EDR_EVENT_BEHAVIOR_ONNX_ALERT = 70,
+  /** 行为簇摘要：端侧把被 coalesce 压制的同类低价值事件聚合成一条上报，替代重复明细。 */
+  EDR_EVENT_BEHAVIOR_SUMMARY = 71,
 } EdrEventType;
 
 /** 优先级：0=高 1=中 2=低（§2.3） */

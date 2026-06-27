@@ -24,6 +24,13 @@ typedef struct EdrDetectionDecision {
   uint32_t suppression_hit_count;
   char trigger_reason[192];
   char reason[256];
+  /* Event Quality Score: 可解释的上传价值评分，区别于 confidence（检测置信度）。
+   * score/suppression_score 为 0~100；selection_action ∈ {emit_alert,emit_context,local_only,drop}。 */
+  uint8_t event_quality_score;
+  uint8_t suppression_score;
+  char signal_reasons[256];
+  char noise_reasons[256];
+  char selection_action[16];
 } EdrDetectionDecision;
 
 void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision *out);

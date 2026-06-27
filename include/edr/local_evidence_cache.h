@@ -29,6 +29,7 @@ typedef struct {
   uint64_t file_coalesced;
   uint64_t registry_coalesced;
   uint64_t network_coalesced;
+  uint64_t summaries_emitted;
   uint64_t metric_file_drops;
   uint64_t metric_registry_drops;
   uint64_t metric_network_drops;
@@ -78,6 +79,14 @@ void edr_local_evidence_cache_record_command_result(
 
 /** 周期性 TTL 清理、大小水位清理和 WAL checkpoint。 */
 void edr_local_evidence_cache_poll_maintenance(void);
+
+/**
+ * Flush 已关闭窗口（早于当前分钟）且计数达到阈值（EDR_SUMMARY_MIN_COUNT，默认 5）的
+ * 普通事件聚合槽，为每个槽构造一条 EDR_EVENT_BEHAVIOR_SUMMARY 记录并通过 emit 回调上报，
+ * 用一条摘要替代被 coalesce 丢弃的重复明细。emit 由调用方提供（编码 + 入批次）。
+ */
+void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
+                                              void (*emit)(const EdrBehaviorRecord *));
 
 void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out);
 

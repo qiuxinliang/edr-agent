@@ -55,7 +55,6 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_v2.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_stub.c
-  ${CMAKE_SOURCE_DIR}/src/transport/grpc_client_stub.c
   ${CMAKE_SOURCE_DIR}/src/core/time_util.c
   ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
   ${CMAKE_CURRENT_SOURCE_DIR}/stub_agent_runtime_hooks.c
@@ -200,6 +199,15 @@ target_include_directories(test_windows_event_policy PRIVATE ${CMAKE_SOURCE_DIR}
 edr_apply_common_warnings(test_windows_event_policy)
 add_test(NAME windows_event_policy COMMAND test_windows_event_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_p0_direct_emit_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_direct_emit_suppression.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c)
+target_include_directories(test_p0_direct_emit_suppression PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)
+edr_apply_common_warnings(test_p0_direct_emit_suppression)
+add_test(NAME p0_direct_emit_suppression COMMAND test_p0_direct_emit_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_collection_admission ${CMAKE_CURRENT_SOURCE_DIR}/test_collection_admission.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/adaptive_collection.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/sensor_interest.c
@@ -217,6 +225,15 @@ add_executable(test_preprocess_dedup ${CMAKE_CURRENT_SOURCE_DIR}/test_preprocess
 target_include_directories(test_preprocess_dedup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_preprocess_dedup)
 add_test(NAME preprocess_dedup COMMAND test_preprocess_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
+  ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c)
+target_include_directories(test_local_evidence_cache_candidate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_local_evidence_cache_candidate)
+add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 set(_edr_test_ave_pipeline_sources ${_edr_test_ave_sdk_sources})
 list(REMOVE_ITEM _edr_test_ave_pipeline_sources ${CMAKE_SOURCE_DIR}/src/ave/fl_feature_provider.c)

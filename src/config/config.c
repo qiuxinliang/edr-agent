@@ -744,6 +744,84 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
   load_preprocessing_rules(t, cfg);
 }
 
+/* 把 [[detection_policy.suppression]] 数组表序列化为控制符分隔的紧凑串，供检测引擎消费。
+ * 规则间 0x1e，字段间 0x1f：target,process,action,reason,contains_all；contains_all token 间 0x1d。 */
+static void sup_append(char *out, size_t cap, size_t *len, const char *s) {
+  if (!s) {
+    return;
+  }
+  for (; *s && *len + 1u < cap; s++) {
+    /* 丢弃控制符，避免破坏分隔结构。 */
+    if ((unsigned char)*s >= 0x20u) {
+      out[(*len)++] = *s;
+    }
+  }
+  out[*len] = '\0';
+}
+
+static void load_detection_policy_suppression(toml_table_t *t, EdrConfig *cfg) {
+  cfg->detection_policy.suppression_rules[0] = '\0';
+  toml_array_t *arr = toml_array_in(t, "suppression");
+  if (!arr) {
+    return;
+  }
+  int n = toml_array_nelem(arr);
+  if (n < 0) {
+    return;
+  }
+  char *out = cfg->detection_policy.suppression_rules;
+  size_t cap = sizeof(cfg->detection_policy.suppression_rules);
+  size_t len = 0u;
+  int written = 0;
+  for (int i = 0; i < n; i++) {
+    toml_table_t *rt = toml_table_at(arr, i);
+    if (!rt) {
+      continue;
+    }
+    char target[96] = "";
+    char process[128] = "";
+    char action[32] = "";
+    char reason[96] = "";
+    take_string(toml_string_in(rt, "target_rule_id"), target, sizeof(target));
+    take_string(toml_string_in(rt, "process_name"), process, sizeof(process));
+    take_string(toml_string_in(rt, "action"), action, sizeof(action));
+    take_string(toml_string_in(rt, "reason"), reason, sizeof(reason));
+    if (!action[0]) {
+      snprintf(action, sizeof(action), "%s", "downgrade");
+    }
+    if (written && len + 1u < cap) {
+      out[len++] = '\x1e';
+    }
+    sup_append(out, cap, &len, target);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    sup_append(out, cap, &len, process);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    sup_append(out, cap, &len, action);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    sup_append(out, cap, &len, reason);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    toml_array_t *ca = toml_array_in(rt, "contains_all");
+    if (ca) {
+      int cn = toml_array_nelem(ca);
+      int first = 1;
+      for (int j = 0; j < cn; j++) {
+        toml_datum_t d = toml_string_at(ca, j);
+        if (!d.ok || !d.u.s) {
+          continue;
+        }
+        if (!first && len + 1u < cap) {
+          out[len++] = '\x1d';
+        }
+        sup_append(out, cap, &len, d.u.s);
+        first = 0;
+        free(d.u.s);
+      }
+    }
+    out[len] = '\0';
+    written = 1;
+  }
+}
+
 static void load_detection_policy(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "source"), cfg->detection_policy.source, sizeof(cfg->detection_policy.source));
   take_string(toml_string_in(t, "audit_id"), cfg->detection_policy.audit_id, sizeof(cfg->detection_policy.audit_id));
@@ -765,6 +843,9 @@ static void load_detection_policy(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->detection_policy.script_dirs));
   take_string(toml_string_in(t, "management_tools"), cfg->detection_policy.management_tools,
               sizeof(cfg->detection_policy.management_tools));
+  take_string(toml_string_in(t, "fp_feedback"), cfg->detection_policy.fp_feedback,
+              sizeof(cfg->detection_policy.fp_feedback));
+  load_detection_policy_suppression(t, cfg);
 }
 
 static void config_setenv_if_value(const char *name, const char *value) {
@@ -793,6 +874,8 @@ static void apply_detection_policy_env(const EdrConfig *cfg) {
   config_setenv_if_value("EDR_DETECTION_ALLOW_PATHS", cfg->detection_policy.allow_paths);
   config_setenv_if_value("EDR_DETECTION_SCRIPT_DIRS", cfg->detection_policy.script_dirs);
   config_setenv_if_value("EDR_DETECTION_MGMT_TOOLS", cfg->detection_policy.management_tools);
+  config_setenv_if_value("EDR_DETECTION_FP_FEEDBACK", cfg->detection_policy.fp_feedback);
+  config_setenv_if_value("EDR_DETECTION_SUPPRESSION_RULES", cfg->detection_policy.suppression_rules);
 }
 
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {

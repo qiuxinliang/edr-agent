@@ -1344,14 +1344,7 @@ void edr_isolate_auto_from_shellcode_alarm(void) {
 #if !defined(_WIN32)
   return;
 #else
-  int want = 0;
-  const char *eo = getenv("EDR_SHELLCODE_AUTO_ISOLATE");
-  if (eo && eo[0] == '1') {
-    want = 1;
-  } else if (edr_command_get_config() && edr_command_get_config()->shellcode_detector.auto_isolate_execute) {
-    want = 1;
-  }
-  if (!want) {
+  if (!edr_command_get_config() || !edr_command_get_config()->shellcode_detector.auto_isolate_execute) {
     return;
   }
   if (!dangerous_enabled()) {

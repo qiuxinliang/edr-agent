@@ -106,6 +106,10 @@ typedef struct EdrConfig {
     char allow_paths[2048];
     char script_dirs[2048];
     char management_tools[1024];
+    char fp_feedback[2048];
+    /* 二期条件化 suppression 规则的紧凑序列化串（控制符分隔），来自 [[detection_policy.suppression]]。
+     * 规则间 \x1e，字段间 \x1f（target,process,action,reason,contains_all），contains_all token 间 \x1d。 */
+    char suppression_rules[8192];
   } detection_policy;
 
   struct {

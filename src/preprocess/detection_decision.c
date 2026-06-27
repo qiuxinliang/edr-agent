@@ -553,6 +553,108 @@ static int false_positive_feedback_match(const EdrBehaviorRecord *r) {
          policy_token_match("EDR_DETECTION_FP_FEEDBACK", "EDR_DETECTION_FP_FEEDBACK_FILE", "", r->exe_hash);
 }
 
+/* 二期条件化 suppression：解析 EDR_DETECTION_SUPPRESSION_RULES（控制符分隔的紧凑串，由
+ * config.c 从 [[detection_policy.suppression]] 生成），用 AND 语义匹配：process_name 命中且
+ * contains_all 全部出现才命中。命中时输出 reason 与 action（0=downgrade,1=drop）。
+ * 相比 fp_feedback 平铺匹配，它保留同进程其它形态（如外链 / 非 localhost）的告警能力。 */
+static int record_text_has_ci(const EdrBehaviorRecord *r, const char *needle) {
+  if (!r || !needle || !needle[0]) {
+    return 0;
+  }
+  return has_ci(r->cmdline, needle) || has_ci(r->exe_path, needle) ||
+         has_ci(r->file_path, needle) || has_ci(r->script_snippet, needle) ||
+         has_ci(r->net_dst, needle) || has_ci(r->dns_query, needle) ||
+         has_ci(r->process_name, needle) || has_ci(r->reg_key_path, needle);
+}
+
+static int conditional_suppression_match(const EdrBehaviorRecord *r, char *reason_out,
+                                         size_t reason_cap, int *action_out) {
+  if (reason_out && reason_cap) {
+    reason_out[0] = '\0';
+  }
+  if (action_out) {
+    *action_out = 0;
+  }
+  if (!r) {
+    return 0;
+  }
+  const char *rules = getenv("EDR_DETECTION_SUPPRESSION_RULES");
+  if (!rules || !rules[0]) {
+    return 0;
+  }
+  const char *p = rules;
+  while (*p) {
+    /* 一条规则到下一个 0x1e。 */
+    const char *rule_end = p;
+    while (*rule_end && *rule_end != '\x1e') {
+      rule_end++;
+    }
+    /* 字段：target \x1f process \x1f action \x1f reason \x1f contains_all(\x1d 分隔) */
+    char target[96] = "", process[128] = "", action[32] = "", reason[96] = "";
+    char *fields[4] = {target, process, action, reason};
+    size_t caps[4] = {sizeof(target), sizeof(process), sizeof(action), sizeof(reason)};
+    const char *q = p;
+    int fi = 0;
+    for (; fi < 4 && q < rule_end; fi++) {
+      size_t k = 0u;
+      while (q < rule_end && *q != '\x1f' && k + 1u < caps[fi]) {
+        fields[fi][k++] = *q++;
+      }
+      fields[fi][k] = '\0';
+      while (q < rule_end && *q != '\x1f') {
+        q++;
+      }
+      if (q < rule_end && *q == '\x1f') {
+        q++;
+      }
+    }
+    /* q..rule_end 是 contains_all token（0x1d 分隔）。 */
+    int ok = 1;
+    if (process[0] && !record_text_has_ci(r, process)) {
+      ok = 0;
+    }
+    int any_contains = 0;
+    const char *c = q;
+    while (ok && c < rule_end) {
+      char tok[256];
+      size_t k = 0u;
+      while (c < rule_end && *c != '\x1d' && k + 1u < sizeof(tok)) {
+        tok[k++] = *c++;
+      }
+      tok[k] = '\0';
+      while (c < rule_end && *c != '\x1d') {
+        c++;
+      }
+      if (c < rule_end && *c == '\x1d') {
+        c++;
+      }
+      if (tok[0]) {
+        any_contains = 1;
+        if (!record_text_has_ci(r, tok)) {
+          ok = 0;
+          break;
+        }
+      }
+    }
+    (void)target;
+    /* 至少要有一个收窄条件（进程或 contains），避免空规则全匹配。 */
+    if (ok && (process[0] || any_contains)) {
+      if (reason_out && reason_cap) {
+        snprintf(reason_out, reason_cap, "%s", reason[0] ? reason : "conditional_suppression");
+      }
+      if (action_out) {
+        *action_out = (strcmp(action, "drop") == 0) ? 1 : 0;
+      }
+      return 1;
+    }
+    if (*rule_end == '\x1e') {
+      rule_end++;
+    }
+    p = rule_end;
+  }
+  return 0;
+}
+
 #define EDR_PROCESS_CONTEXT_SLOTS 256u
 #define EDR_SUPPRESSION_COUNTER_SLOTS 64u
 
@@ -790,6 +892,104 @@ static void add_reason(char *dst, size_t cap, const char *s) {
   }
 }
 
+/* Event Quality Score: 把 evaluate 累积的 reason 列表分流为 signal/noise，
+ * 并归一化出 0~100 的上传价值分与 selection_action。降分（noise）token 取自
+ * 各 suppression 分支写入 out->reason 的标签。 */
+static int reason_token_is_noise(const char *tok) {
+  static const char *kNoise[] = {
+      "false_positive_feedback_policy", "management_tool_noise",
+      "rmm_enterprise_allowlist_policy", "allowlisted_path",
+      "lolbin_without_combo_condition", "conditional_suppression",
+  };
+  for (size_t i = 0; i < sizeof(kNoise) / sizeof(kNoise[0]); i++) {
+    if (strcmp(tok, kNoise[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static uint8_t reason_token_noise_weight(const char *tok) {
+  if (strcmp(tok, "false_positive_feedback_policy") == 0) {
+    return 40u;
+  }
+  if (strcmp(tok, "rmm_enterprise_allowlist_policy") == 0 ||
+      strcmp(tok, "allowlisted_path") == 0) {
+    return 30u;
+  }
+  if (strcmp(tok, "management_tool_noise") == 0 ||
+      strcmp(tok, "lolbin_without_combo_condition") == 0) {
+    return 20u;
+  }
+  if (strcmp(tok, "conditional_suppression") == 0) {
+    return 40u;
+  }
+  return 0u;
+}
+
+static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecision *out) {
+  out->signal_reasons[0] = '\0';
+  out->noise_reasons[0] = '\0';
+  uint32_t supp = 0u;
+  const char *p = out->reason;
+  char tok[96];
+  while (*p) {
+    size_t n = 0u;
+    while (*p && *p != ',' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    tok[n] = '\0';
+    while (*p && *p != ',') {
+      p++; /* 丢弃超长 token 余部，保持 token 边界 */
+    }
+    if (*p == ',') {
+      p++;
+    }
+    if (tok[0] == '\0' || strcmp(tok, "baseline") == 0) {
+      continue;
+    }
+    if (reason_token_is_noise(tok)) {
+      add_reason(out->noise_reasons, sizeof(out->noise_reasons), tok);
+      supp += reason_token_noise_weight(tok);
+    } else {
+      add_reason(out->signal_reasons, sizeof(out->signal_reasons), tok);
+    }
+  }
+  if (supp > 100u) {
+    supp = 100u;
+  }
+  out->suppression_score = (uint8_t)supp;
+
+  long sc = (long)(out->confidence * 100.0f + 0.5f);
+  if (sc < 0) {
+    sc = 0;
+  }
+  if (sc > 100) {
+    sc = 100;
+  }
+  out->event_quality_score = (uint8_t)sc;
+
+  const char *action;
+  if (out->drop) {
+    action = "drop";
+  } else if (out->event_quality_score >= 80u) {
+    action = "emit_alert";
+  } else if (out->event_quality_score >= 50u) {
+    action = "emit_context";
+  } else if (out->event_quality_score >= 20u) {
+    action = "local_only";
+  } else {
+    action = "drop";
+  }
+  /* P0(priority==0) 强制至少告警；已 suppress 时不高于 emit_context。 */
+  if (!out->drop && r && r->priority == 0u) {
+    action = "emit_alert";
+  } else if (out->suppress && strcmp(action, "emit_alert") == 0) {
+    action = "emit_context";
+  }
+  snprintf(out->selection_action, sizeof(out->selection_action), "%s", action);
+}
+
 static uint32_t next_suppression_hit_count(const char *reason, const char *policy_version) {
   const char *r = reason ? reason : "";
   const char *p = policy_version ? policy_version : "";
@@ -906,6 +1106,36 @@ static void json_str(char *dst, size_t cap, const char *s, size_t max_chars) {
     }
   }
   json_char(dst, cap, '"');
+}
+
+/* 把逗号分隔的 reason 串序列化为 JSON 字符串数组：a,b,c -> ["a","b","c"]。 */
+static void json_reason_array(char *dst, size_t cap, const char *csv) {
+  json_char(dst, cap, '[');
+  const char *p = csv ? csv : "";
+  char tok[96];
+  int first = 1;
+  while (*p) {
+    size_t n = 0u;
+    while (*p && *p != ',' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    tok[n] = '\0';
+    while (*p && *p != ',') {
+      p++;
+    }
+    if (*p == ',') {
+      p++;
+    }
+    if (tok[0] == '\0') {
+      continue;
+    }
+    if (!first) {
+      json_char(dst, cap, ',');
+    }
+    json_str(dst, cap, tok, sizeof(tok));
+    first = 0;
+  }
+  json_char(dst, cap, ']');
 }
 
 static int detail_value(const char *text, const char *key, char *out, size_t cap) {
@@ -1084,6 +1314,15 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            ",\"rule_id\":\"agent_decision_v1\",\"confidence\":%.3f,\"suppressed\":%s,\"reason\":",
            d->confidence, d->suppress ? "true" : "false");
   json_str(r->detection_context, sizeof(r->detection_context), d->reason, 220u);
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"event_quality\":{\"score\":%u,\"suppression_score\":%u,\"selection_action\":",
+           (unsigned)d->event_quality_score, (unsigned)d->suppression_score);
+  json_str(r->detection_context, sizeof(r->detection_context), d->selection_action, 16u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"signal_reasons\":");
+  json_reason_array(r->detection_context, sizeof(r->detection_context), d->signal_reasons);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"noise_reasons\":");
+  json_reason_array(r->detection_context, sizeof(r->detection_context), d->noise_reasons);
+  json_cat(r->detection_context, sizeof(r->detection_context), "}");
   json_cat(r->detection_context, sizeof(r->detection_context),
            ",\"process\":{\"pid\":%u,\"name\":", r->pid);
   json_str(r->detection_context, sizeof(r->detection_context), r->process_name, 96u);
@@ -1486,6 +1725,26 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     add_reason(out->reason, sizeof(out->reason), "allowlisted_path");
   }
 
+  /* 二期条件化 suppression：仅在非高危信号时应用，保留同进程其它形态的告警能力。 */
+  if (!cred && !ransom && !ransom_canary && !ransom_burst && !ransom_note && !security_kill &&
+      !exfil && !inject && !persistence && !silverfox && !r->cert_revoked_ancestor &&
+      r->type != EDR_EVENT_PROTOCOL_SHELLCODE && r->type != EDR_EVENT_WEBSHELL_DETECTED &&
+      r->type != EDR_EVENT_PMFE_SCAN_RESULT) {
+    char cond_reason[96] = "";
+    int cond_action = 0;
+    if (conditional_suppression_match(r, cond_reason, sizeof(cond_reason), &cond_action)) {
+      set_suppression(out, score, cond_reason[0] ? cond_reason : "conditional_suppression",
+                      "EDR_DETECTION_FP_POLICY_VERSION");
+      if (cond_action == 1) {
+        score = 0.f;
+        out->drop = 1u;
+      } else {
+        score -= remote ? 0.20f : 0.30f;
+      }
+      add_reason(out->reason, sizeof(out->reason), "conditional_suppression");
+    }
+  }
+
   if (lolbin && !context_correlated && !remote && !script && !script_sensor && !tls_anomaly && !persistence && !silverfox && !cred && !ransom &&
       !ransom_burst && !ransom_note && !security_kill && !exfil && !inject) {
     set_suppression(out, score, "lolbin_without_combo_condition", "EDR_DETECTION_POLICY_VERSION");
@@ -1518,6 +1777,8 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (out->suppress && score < 0.25f && r->priority != 0u) {
     out->drop = 1u;
   }
+
+  compute_event_quality(r, out);
 
   {
     EdrDetectionTrigger trigger;

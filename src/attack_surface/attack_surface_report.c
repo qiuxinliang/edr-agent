@@ -2,6 +2,7 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/attack_surface_egress.h"
+#include "edr/attack_surface_inventory.h"
 #include "edr/security_policy_collect.h"
 
 #include <stdio.h>
@@ -69,6 +70,24 @@ static void json_escape_str(FILE *f, const char *s) {
     }
   }
   fputc('"', f);
+}
+
+static void copy_text_file_to_stream(FILE *out, const char *path) {
+  FILE *in = fopen(path, "rb");
+  if (!in) {
+    return;
+  }
+  char buf[4096];
+  for (;;) {
+    size_t n = fread(buf, 1u, sizeof(buf), in);
+    if (n > 0u) {
+      (void)fwrite(buf, 1u, n, out);
+    }
+    if (n < sizeof(buf)) {
+      break;
+    }
+  }
+  fclose(in);
 }
 
 #ifdef __linux__
@@ -691,6 +710,16 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     asurf_gather_policy_and_egress(cfg, &sp, Eg, EDR_ASURF_EGRESS_OUT_MAX, &nEg, &suspEg, &egTrunc);
   }
 
+  EdrAsurfInventorySummary inv;
+  memset(&inv, 0, sizeof(inv));
+  char inv_path[1100];
+  snprintf(inv_path, sizeof(inv_path), "%s.inv", path);
+  FILE *invf = fopen(inv_path, "wb");
+  if (invf) {
+    edr_asurf_inventory_write_json(invf, listeners_only, &inv);
+    fclose(invf);
+  }
+
   int pub = 0;
   int webInst = 0;
   for (int i = 0; i < nE; i++) {
@@ -717,8 +746,14 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   fprintf(f, ",\"stale\":false,\"ttlSeconds\":%d,", ttl);
 
   fprintf(f, "\"summary\":{\"listenerCount\":%d,\"publicListenerCount\":%d,\"webInstanceCount\":%d,"
-          "\"suspiciousEgressCount\":%d},",
-          nE, pub, webInst, suspEg);
+          "\"suspiciousEgressCount\":%d,"
+          "\"serviceCount\":%d,\"autoStartServiceCount\":%d,\"scheduledTaskCount\":%d,"
+          "\"enabledScheduledTaskCount\":%d,\"startupItemCount\":%d,\"privilegedAccountCount\":%d,"
+          "\"adminGroupMemberCount\":%d,\"shareCount\":%d,\"riskyShareCount\":%d,"
+          "\"persistenceFindingCount\":%d},",
+          nE, pub, webInst, suspEg, inv.service_count, inv.auto_start_service_count, inv.scheduled_task_count,
+          inv.enabled_scheduled_task_count, inv.startup_item_count, inv.privileged_account_count,
+          inv.admin_group_member_count, inv.share_count, inv.risky_share_count, inv.persistence_finding_count);
 
   fprintf(f, "\"listeners\":{\"items\":[");
   for (int i = 0; i < nE; i++) {
@@ -845,6 +880,14 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     }
   }
   fprintf(f, "],");
+  if (invf) {
+    copy_text_file_to_stream(f, inv_path);
+    (void)remove(inv_path);
+    fprintf(f, ",");
+  } else {
+    edr_asurf_inventory_write_json(f, listeners_only, &inv);
+    fprintf(f, ",");
+  }
 
   fprintf(f, "\"policy\":{},\"firewall\":{");
   fprintf(f, "\"enabled\":");

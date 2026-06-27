@@ -92,6 +92,13 @@ typedef struct {
   char endpoint_id[48];
   char prefix[160];
   uint64_t count;
+  /* behavior_summary 上报所需的聚合上下文。 */
+  int64_t first_seen_ns;
+  int64_t last_seen_ns;
+  uint32_t event_type;
+  char tenant_id[64];
+  char process_name[256];
+  char suppression_reason[96];
 } OrdinaryAggregateSlot;
 
 static ProcSlot s_proc[EDR_EVIDENCE_PROC_SLOTS];
@@ -683,6 +690,16 @@ static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_
         strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
         strncmp(s->prefix, prefix, sizeof(s->prefix)) == 0) {
       s->count++;
+      if (ts > s->last_seen_ns) {
+        s->last_seen_ns = ts;
+      }
+      if (s->process_name[0] == '\0' && r->process_name[0]) {
+        copy_s(s->process_name, sizeof(s->process_name), r->process_name);
+      }
+      if (s->suppression_reason[0] == '\0' && r->detection_context[0]) {
+        extract_json_string_field(r->detection_context, "\"reason\":\"", s->suppression_reason,
+                                  sizeof(s->suppression_reason));
+      }
       s_status.ordinary_coalesced++;
       if (kind == 1u) {
         s_status.file_coalesced++;
@@ -701,13 +718,86 @@ static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_
   slot->pid = r ? r->pid : 0u;
   slot->kind = kind;
   slot->count = 1u;
+  slot->first_seen_ns = ts;
+  slot->last_seen_ns = ts;
+  slot->event_type = r ? (uint32_t)r->type : 0u;
   copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r ? r->endpoint_id : "");
+  copy_s(slot->tenant_id, sizeof(slot->tenant_id), r ? r->tenant_id : "");
+  copy_s(slot->process_name, sizeof(slot->process_name), r ? r->process_name : "");
   copy_s(slot->prefix, sizeof(slot->prefix), prefix);
+  if (r && r->detection_context[0]) {
+    extract_json_string_field(r->detection_context, "\"reason\":\"", slot->suppression_reason,
+                              sizeof(slot->suppression_reason));
+  }
   return 0;
 }
 
 static int evidence_cache_pressure_active(void) {
   return edr_resource_preprocess_throttle_active() ? 1 : 0;
+}
+
+static unsigned summary_flush_min_count(void) {
+  const char *v = getenv("EDR_SUMMARY_MIN_COUNT");
+  if (v && v[0]) {
+    long n = strtol(v, NULL, 10);
+    if (n >= 1 && n <= 100000) {
+      return (unsigned)n;
+    }
+  }
+  return 5u;
+}
+
+void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
+                                              void (*emit)(const EdrBehaviorRecord *)) {
+  if (!emit) {
+    return;
+  }
+  int64_t cur_minute = (now_ns / 1000000000LL) / 60LL;
+  unsigned threshold = summary_flush_min_count();
+  for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
+    OrdinaryAggregateSlot *s = &s_ordinary_agg[i];
+    if (!s->used) {
+      continue;
+    }
+    /* 仅 flush 已关闭的窗口（早于当前分钟），避免截断仍在累积的聚合。 */
+    if (s->minute_unix >= cur_minute) {
+      continue;
+    }
+    if (s->count < (uint64_t)threshold) {
+      /* 计数不足以成一条摘要：直接释放槽位，明细此前已被 coalesce 丢弃。 */
+      memset(s, 0, sizeof(*s));
+      continue;
+    }
+    char prefix_esc[200];
+    char reason_esc[160];
+    char proc_esc[280];
+    json_escape(prefix_esc, sizeof(prefix_esc), s->prefix);
+    json_escape(reason_esc, sizeof(reason_esc), s->suppression_reason);
+    json_escape(proc_esc, sizeof(proc_esc), s->process_name);
+
+    EdrBehaviorRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.type = EDR_EVENT_BEHAVIOR_SUMMARY;
+    rec.priority = 2u; /* 低优先级，不进告警链路 */
+    rec.pid = s->pid;
+    rec.event_time_ns = s->last_seen_ns > 0 ? s->last_seen_ns : now_ns;
+    copy_s(rec.endpoint_id, sizeof(rec.endpoint_id), s->endpoint_id);
+    copy_s(rec.tenant_id, sizeof(rec.tenant_id), s->tenant_id);
+    copy_s(rec.process_name, sizeof(rec.process_name), s->process_name);
+    snprintf(rec.cmdline, sizeof(rec.cmdline),
+             "behavior_summary kind=%u count=%llu key=%s", (unsigned)s->kind,
+             (unsigned long long)s->count, s->prefix);
+    snprintf(rec.detection_context, sizeof(rec.detection_context),
+             "{\"type\":\"behavior_summary\",\"kind\":%u,\"event_type\":%u,\"pid\":%u,"
+             "\"count\":%llu,\"first_seen_ns\":%lld,\"last_seen_ns\":%lld,"
+             "\"process_name\":\"%s\",\"aggregate_key\":\"%s\",\"suppression_reason\":\"%s\"}",
+             (unsigned)s->kind, (unsigned)s->event_type, (unsigned)s->pid,
+             (unsigned long long)s->count, (long long)s->first_seen_ns,
+             (long long)s->last_seen_ns, proc_esc, prefix_esc, reason_esc);
+    emit(&rec);
+    s_status.summaries_emitted++;
+    memset(s, 0, sizeof(*s));
+  }
 }
 
 static int candidate_dedupe_should_skip(const EdrBehaviorRecord *r, int64_t ts) {
@@ -1520,20 +1610,118 @@ static int evidence_is_high_risk_port(uint32_t port) {
   return 0;
 }
 
+static int evidence_has_priority_or_high_confidence_context(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  return evidence_contains_ci(r->detection_context, "\"severity\":\"P0\"") ||
+         evidence_contains_ci(r->detection_context, "\"severity\":\"P1\"") ||
+         evidence_contains_ci(r->detection_context, "\"priority\":\"P0\"") ||
+         evidence_contains_ci(r->detection_context, "\"priority\":\"P1\"") ||
+         evidence_contains_ci(r->detection_context, "\"confidence\":0.8") ||
+         evidence_contains_ci(r->detection_context, "\"confidence\":0.9") ||
+         evidence_contains_ci(r->detection_context, "\"confidence\":1");
+}
+
+static int evidence_is_file_event(EdrEventType t) {
+  return t == EDR_EVENT_FILE_READ || t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE ||
+         t == EDR_EVENT_FILE_DELETE || t == EDR_EVENT_FILE_RENAME ||
+         t == EDR_EVENT_FILE_PERMISSION_CHANGE;
+}
+
+static int evidence_file_path_usable(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+    if (path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
+      return 1;
+    }
+  }
+  if ((path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1]) ||
+      evidence_contains_ci(path, "\\device\\") || evidence_contains_ci(path, "\\??\\") ||
+      evidence_contains_ci(path, "\\global??\\")) {
+    return 1;
+  }
+  return strchr(path, '\\') != NULL || strchr(path, '/') != NULL;
+}
+
+static int evidence_file_event_has_weak_fields(const EdrBehaviorRecord *r) {
+  if (!r || !evidence_is_file_event(r->type)) {
+    return 0;
+  }
+  int no_process_identity = !r->process_name[0] && !r->exe_path[0] && !r->cmdline[0];
+  if (no_process_identity) {
+    return 1;
+  }
+  if (r->pid == 0u && no_process_identity) {
+    return 1;
+  }
+  if (!evidence_file_path_usable(r->file_path)) {
+    return 1;
+  }
+  return 0;
+}
+
+static int evidence_process_or_path_contains(const EdrBehaviorRecord *r, const char *needle) {
+  if (!r || !needle || !needle[0]) {
+    return 0;
+  }
+  return evidence_contains_ci(r->process_name, needle) || evidence_contains_ci(r->exe_path, needle) ||
+         evidence_contains_ci(r->cmdline, needle) || evidence_contains_ci(r->parent_name, needle) ||
+         evidence_contains_ci(r->parent_path, needle) || evidence_contains_ci(r->detection_context, needle);
+}
+
+static int evidence_checknetisolation_standard_path(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  if (r->exe_path[0]) {
+    return evidence_contains_ci(r->exe_path, "\\Windows\\System32\\CheckNetIsolation.exe") ||
+           evidence_contains_ci(r->exe_path, "\\Windows\\SysWOW64\\CheckNetIsolation.exe") ||
+           evidence_contains_ci(r->exe_path, "/Windows/System32/CheckNetIsolation.exe") ||
+           evidence_contains_ci(r->exe_path, "/Windows/SysWOW64/CheckNetIsolation.exe");
+  }
+  return evidence_contains_ci(r->cmdline, "\\Windows\\System32\\CheckNetIsolation.exe") ||
+         evidence_contains_ci(r->cmdline, "\\Windows\\SysWOW64\\CheckNetIsolation.exe") ||
+         evidence_contains_ci(r->cmdline, "/Windows/System32/CheckNetIsolation.exe") ||
+         evidence_contains_ci(r->cmdline, "/Windows/SysWOW64/CheckNetIsolation.exe");
+}
+
+static int evidence_is_checknetisolation_standard_noise(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  if (r->type != EDR_EVENT_NET_CONNECT && r->type != EDR_EVENT_NET_LISTEN &&
+      r->type != EDR_EVENT_NET_DNS_QUERY && r->type != EDR_EVENT_PROCESS_CREATE) {
+    return 0;
+  }
+  if (!evidence_process_or_path_contains(r, "CheckNetIsolation.exe")) {
+    return 0;
+  }
+  if (!evidence_checknetisolation_standard_path(r)) {
+    return 0;
+  }
+  if (evidence_text_has_high_signal(r) || evidence_is_high_risk_port(r->net_dport)) {
+    return 0;
+  }
+  return 1;
+}
+
 static int evidence_should_store_record(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  if (evidence_contains_ci(r->detection_context, "\"severity\":\"P0\"") ||
-      evidence_contains_ci(r->detection_context, "\"severity\":\"P1\"") ||
-      evidence_contains_ci(r->detection_context, "\"priority\":\"P0\"") ||
-      evidence_contains_ci(r->detection_context, "\"priority\":\"P1\"") ||
-      evidence_contains_ci(r->detection_context, "\"confidence\":0.8") ||
-      evidence_contains_ci(r->detection_context, "\"confidence\":0.9") ||
-      evidence_contains_ci(r->detection_context, "\"confidence\":1")) {
+  if (evidence_has_priority_or_high_confidence_context(r)) {
     return 1;
   }
   if (evidence_is_low_value_file_noise(r)) {
+    return 0;
+  }
+  if (evidence_is_checknetisolation_standard_noise(r)) {
+    return 0;
+  }
+  if (evidence_file_event_has_weak_fields(r) && !evidence_text_has_high_signal(r)) {
     return 0;
   }
   switch (r->type) {

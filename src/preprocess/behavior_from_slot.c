@@ -846,6 +846,41 @@ static unsigned long parse_ulong_auto(const char *val) {
   return strtoul(val, NULL, 0);
 }
 
+static int ipv4_decimal_to_dotted_le(const char *val, char *out, size_t cap) {
+  if (!val || !val[0] || !out || cap == 0u) {
+    return 0;
+  }
+  for (const unsigned char *p = (const unsigned char *)val; *p; p++) {
+    if (!isdigit(*p)) {
+      return 0;
+    }
+  }
+  char *end = NULL;
+  unsigned long n = strtoul(val, &end, 10);
+  if (!end || *end != '\0' || n == 0ul || n > 0xfffffffful) {
+    return 0;
+  }
+  unsigned int b0 = (unsigned int)(n & 0xfful);
+  unsigned int b1 = (unsigned int)((n >> 8) & 0xfful);
+  unsigned int b2 = (unsigned int)((n >> 16) & 0xfful);
+  unsigned int b3 = (unsigned int)((n >> 24) & 0xfful);
+  int w = snprintf(out, cap, "%u.%u.%u.%u", b0, b1, b2, b3);
+  return w > 0 && (size_t)w < cap;
+}
+
+static void normalize_ip_field_copy(char *out, size_t cap, const char *val) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!val) {
+    out[0] = '\0';
+    return;
+  }
+  if (!ipv4_decimal_to_dotted_le(val, out, cap)) {
+    snprintf(out, cap, "%s", val);
+  }
+}
+
 static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   if (!key || !val) {
     return;
@@ -914,8 +949,13 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     append_sensor_kv(f, "signature_status", val);
   } else if (strcmp(key, "qname") == 0) {
     snprintf(f->qname, sizeof(f->qname), "%s", val);
-  } else if (strcmp(key, "ip") == 0 && !f->dst[0]) {
-    snprintf(f->dst, sizeof(f->dst), "%s", val);
+  } else if ((strcmp(key, "ip") == 0 || strcmp(key, "dest_ip") == 0 ||
+              strcmp(key, "dst_ip") == 0 || strcmp(key, "remote_ip") == 0 ||
+              strcmp(key, "remote_addr") == 0) && !f->dst[0]) {
+    normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
+  } else if ((strcmp(key, "source_ip") == 0 || strcmp(key, "src_ip") == 0 ||
+              strcmp(key, "local_ip") == 0 || strcmp(key, "local_addr") == 0) && !f->src[0]) {
+    normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "script") == 0) {
     snprintf(f->script, sizeof(f->script), "%s", val);
   } else if (strcmp(key, "amsi_content") == 0 || strcmp(key, "script_content") == 0 ||
@@ -962,9 +1002,9 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
              strcmp(key, "token_features") == 0) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "dst") == 0) {
-    snprintf(f->dst, sizeof(f->dst), "%s", val);
+    normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
   } else if (strcmp(key, "src") == 0) {
-    snprintf(f->src, sizeof(f->src), "%s", val);
+    normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "dpt") == 0) {
     f->dport = strtoul(val, NULL, 10);
     f->has_dport = 1;
@@ -972,9 +1012,9 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->sport = strtoul(val, NULL, 10);
     f->has_sport = 1;
   } else if (strcmp(key, "laddr") == 0) {
-    snprintf(f->src, sizeof(f->src), "%s", val);
+    normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "raddr") == 0) {
-    snprintf(f->dst, sizeof(f->dst), "%s", val);
+    normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
   } else if (strcmp(key, "lport") == 0) {
     f->sport = strtoul(val, NULL, 10);
     f->has_sport = 1;

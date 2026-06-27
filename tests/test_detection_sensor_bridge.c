@@ -15,6 +15,8 @@ static void test_setenv(const char *k, const char *v) { setenv(k, v, 1); }
 static void test_unsetenv(const char *k) { unsetenv(k); }
 #endif
 
+void edr_isolate_auto_from_ransom_alarm(void) {}
+
 static void fill_slot(EdrEventSlot *slot, EdrEventType type, const char *text) {
   memset(slot, 0, sizeof(*slot));
   slot->type = type;
@@ -420,6 +422,36 @@ static void test_sensor_alias_bridge(void) {
   assert(strstr(r.detection_context, "\"webshell_semantic\":true") != NULL);
 }
 
+static void test_integer_ip_fields_are_normalized(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_NET_CONNECT,
+            "ETW1\n"
+            "prov=net\n"
+            "pid=6001\n"
+            "img=C:\\Windows\\System32\\CheckNetIsolation.exe\n"
+            "dest_ip=16777343\n"
+            "dpt=80\n"
+            "src_ip=16777343\n"
+            "spt=50123\n");
+  eval_slot(&slot, &r, &d);
+  assert(strcmp(r.net_dst, "127.0.0.1") == 0);
+  assert(strcmp(r.net_src, "127.0.0.1") == 0);
+  assert(r.net_dport == 80u);
+  assert(r.net_sport == 50123u);
+
+  fill_slot(&slot, EDR_EVENT_NET_CONNECT,
+            "ETW1\n"
+            "prov=net\n"
+            "pid=6002\n"
+            "img=C:\\Windows\\System32\\svchost.exe\n"
+            "dst=203.0.113.44\n"
+            "dpt=443\n");
+  eval_slot(&slot, &r, &d);
+  assert(strcmp(r.net_dst, "203.0.113.44") == 0);
+}
+
 static void test_registry_persistence_alias_bridge(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
@@ -460,6 +492,7 @@ int main(void) {
   test_ransom_signer_path_allowlist_suppresses_counter();
   test_webshell_semantic_bridge_keeps_yara_evidence();
   test_sensor_alias_bridge();
+  test_integer_ip_fields_are_normalized();
   test_registry_persistence_alias_bridge();
   puts("detection_sensor_bridge ok");
   return 0;

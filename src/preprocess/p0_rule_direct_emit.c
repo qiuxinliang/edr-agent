@@ -291,6 +291,147 @@ static int p0_is_sangfor_checknetisolation_baseline(const EdrBehaviorRecord *br,
   return 0;
 }
 
+static int p0_record_contains_ci(const EdrBehaviorRecord *br, const char *detail, const char *needle) {
+  if (!br || !needle || !needle[0]) {
+    return 0;
+  }
+  return p0_contains_ci(detail, needle) ||
+         p0_contains_ci(br->cmdline, needle) ||
+         p0_contains_ci(br->exe_path, needle) ||
+         p0_contains_ci(br->file_path, needle) ||
+         p0_contains_ci(br->parent_path, needle) ||
+         p0_contains_ci(br->script_snippet, needle) ||
+         p0_contains_ci(br->detection_context, needle) ||
+         p0_contains_ci(br->current_directory, needle) ||
+         p0_contains_ci(br->scheduled_task_path, needle) ||
+         p0_contains_ci(br->network_aux_path, needle) ||
+         p0_contains_ci(br->dns_query, needle) ||
+         p0_contains_ci(br->net_dst, needle) ||
+         p0_contains_ci(br->process_name, needle) ||
+         p0_contains_ci(br->parent_name, needle) ||
+         p0_contains_ci(br->grandparent_name, needle);
+}
+
+static int p0_record_has_fdsecurity_root(const EdrBehaviorRecord *br, const char *detail) {
+  return p0_record_contains_ci(br, detail, "\\Program Files\\FDSecurity\\") ||
+         p0_record_contains_ci(br, detail, "/Program Files/FDSecurity/") ||
+         p0_record_contains_ci(br, detail, "\\ProgramData\\FDSecurity\\") ||
+         p0_record_contains_ci(br, detail, "/ProgramData/FDSecurity/");
+}
+
+static int p0_is_fdsecurity_self_installer_baseline(const EdrBehaviorRecord *br, const char *detail) {
+  if (!br || !p0_record_has_fdsecurity_root(br, detail)) {
+    return 0;
+  }
+  if (p0_record_contains_ci(br, detail, "FDSensorTaskLaunch.ps1")) {
+    return 1;
+  }
+  if ((p0_record_contains_ci(br, detail, "setup-ui\\install-diagnostics.zip") ||
+       p0_record_contains_ci(br, detail, "setup-ui/install-diagnostics.zip")) &&
+      p0_record_contains_ci(br, detail, "install-diagnostics.zip")) {
+    return 1;
+  }
+  return 0;
+}
+
+static char p0_fold_path_ci_char(char c) {
+  if (c == '\\') {
+    c = '/';
+  }
+  if (c >= 'A' && c <= 'Z') {
+    c = (char)(c - 'A' + 'a');
+  }
+  return c;
+}
+
+static int p0_loopback_host_delim(char c) {
+  return c == '\0' || c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+         c == ':' || c == '/' || c == '\\' || c == '@' || c == '"' || c == '\'';
+}
+
+static int p0_has_ci_token_with_loopback_delim(const char *s, const char *token) {
+  size_t nt;
+  if (!s || !s[0] || !token || !token[0]) {
+    return 0;
+  }
+  nt = strlen(token);
+  for (const char *p = s; *p; p++) {
+    size_t i = 0u;
+    while (i < nt && p[i]) {
+      if (p0_fold_path_ci_char(p[i]) != p0_fold_path_ci_char(token[i])) {
+        break;
+      }
+      i++;
+    }
+    if (i == nt && p0_loopback_host_delim(p[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int p0_text_has_loopback_target(const char *s) {
+  if (!s || !s[0]) {
+    return 0;
+  }
+  return p0_has_ci_token_with_loopback_delim(s, "http://localhost") ||
+         p0_has_ci_token_with_loopback_delim(s, "https://localhost") ||
+         p0_has_ci_token_with_loopback_delim(s, "//localhost") ||
+         p0_has_ci_token_with_loopback_delim(s, "\\\\localhost") ||
+         p0_has_ci_token_with_loopback_delim(s, " localhost") ||
+         p0_has_ci_token_with_loopback_delim(s, "http://127.0.0.1") ||
+         p0_has_ci_token_with_loopback_delim(s, "https://127.0.0.1") ||
+         p0_has_ci_token_with_loopback_delim(s, "//127.0.0.1") ||
+         p0_has_ci_token_with_loopback_delim(s, "\\\\127.0.0.1") ||
+         p0_has_ci_token_with_loopback_delim(s, " 127.0.0.1");
+}
+
+static int p0_is_rundll32_davclnt_loopback_baseline(const EdrBehaviorRecord *br, const char *detail) {
+  const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
+  if (!br) {
+    return 0;
+  }
+  if (!(p0_contains_ci(br->process_name, "rundll32.exe") ||
+        p0_contains_ci(br->exe_path, "\\rundll32.exe") ||
+        p0_contains_ci(cmd, "rundll32.exe"))) {
+    return 0;
+  }
+  if (!p0_contains_ci(cmd, "davclnt.dll") || !p0_contains_ci(cmd, "DavSetCookie")) {
+    return 0;
+  }
+  return p0_text_has_loopback_target(cmd) || p0_text_has_loopback_target(br->dns_query) ||
+         p0_text_has_loopback_target(br->net_dst) || p0_text_has_loopback_target(br->network_aux_path) ||
+         p0_text_has_loopback_target(br->script_snippet);
+}
+
+static int p0_searchprotocolhost_path_is_system32(const EdrBehaviorRecord *br, const char *detail) {
+  const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
+  if (!br) {
+    return 0;
+  }
+  if (br->exe_path[0]) {
+    return p0_contains_ci(br->exe_path, "\\Windows\\System32\\SearchProtocolHost.exe");
+  }
+  return p0_contains_ci(cmd, "\\Windows\\System32\\SearchProtocolHost.exe") ||
+         p0_contains_ci(cmd, "/Windows/System32/SearchProtocolHost.exe");
+}
+
+static int p0_is_searchprotocolhost_indexing_baseline(const EdrBehaviorRecord *br, const char *detail) {
+  const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
+  if (!br || !cmd || !cmd[0]) {
+    return 0;
+  }
+  if (!(p0_contains_ci(br->process_name, "SearchProtocolHost.exe") ||
+        p0_contains_ci(br->exe_path, "\\SearchProtocolHost.exe") ||
+        p0_contains_ci(cmd, "SearchProtocolHost.exe"))) {
+    return 0;
+  }
+  if (!p0_searchprotocolhost_path_is_system32(br, detail)) {
+    return 0;
+  }
+  return p0_contains_ci(cmd, "Global\\UsGthrFltPipe");
+}
+
 static int p0_should_suppress_known_false_positive(const char *rule_id, const EdrBehaviorRecord *br,
                                                    const char *detail, const char **out_reason) {
   if (out_reason) {
@@ -317,6 +458,24 @@ static int p0_should_suppress_known_false_positive(const char *rule_id, const Ed
     }
     return 1;
   }
+  if (p0_is_fdsecurity_self_installer_baseline(br, detail)) {
+    if (out_reason) {
+      *out_reason = "fdsecurity_self_installer_baseline";
+    }
+    return 1;
+  }
+  if (p0_is_rundll32_davclnt_loopback_baseline(br, detail)) {
+    if (out_reason) {
+      *out_reason = "rundll32_davclnt_loopback_baseline";
+    }
+    return 1;
+  }
+  if (p0_is_searchprotocolhost_indexing_baseline(br, detail)) {
+    if (out_reason) {
+      *out_reason = "searchprotocolhost_indexing_baseline";
+    }
+    return 1;
+  }
   if (p0_is_known_smoke_command(br, detail)) {
     if (out_reason) {
       *out_reason = "known_smoke_test";
@@ -325,6 +484,15 @@ static int p0_should_suppress_known_false_positive(const char *rule_id, const Ed
   }
   return 0;
 }
+
+#ifdef EDR_P0_DIRECT_EMIT_TESTING
+int edr_p0_test_should_suppress_known_false_positive(const char *rule_id,
+                                                     const EdrBehaviorRecord *br,
+                                                     const char *detail,
+                                                     const char **out_reason) {
+  return p0_should_suppress_known_false_positive(rule_id, br, detail, out_reason);
+}
+#endif
 
 static int p0_ends_with_ci(const char *s, const char *suffix) {
   size_t ns;
@@ -1079,30 +1247,54 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       return;
     }
     if (edr_p0_rule_matches3("R-EXEC-001", pn, cmd, par, ch)) {
-      if (p0_debug_enabled()) {
-        p0_debug_event("R-EXEC-001", br, pn, detail);
-      }
-      if (emit_for_rule(br, "R-EXEC-001", 3, "PowerShell 编码命令执行", "T1059.001")) {
-        edr_adaptive_collection_raise(3, "R-EXEC-001", br->pid, br->ppid,
-                                      (pn && pn[0]) ? pn : br->process_name);
+      const char *reason = "";
+      if (p0_should_suppress_known_false_positive("R-EXEC-001", br, detail, &reason)) {
+        if (p0_debug_enabled()) {
+          fprintf(stderr, "[P0 DEBUG] suppress known false positive: rule=R-EXEC-001 pid=%u reason=%s\n",
+                  br->pid, reason && reason[0] ? reason : "unknown");
+        }
+      } else {
+        if (p0_debug_enabled()) {
+          p0_debug_event("R-EXEC-001", br, pn, detail);
+        }
+        if (emit_for_rule(br, "R-EXEC-001", 3, "PowerShell 编码命令执行", "T1059.001")) {
+          edr_adaptive_collection_raise(3, "R-EXEC-001", br->pid, br->ppid,
+                                        (pn && pn[0]) ? pn : br->process_name);
+        }
       }
     }
     if (edr_p0_rule_matches3("R-CRED-001", pn, cmd, par, ch)) {
-      if (p0_debug_enabled()) {
-        p0_debug_event("R-CRED-001", br, pn, detail);
-      }
-      if (emit_for_rule(br, "R-CRED-001", 3, "导出 SAM/SYSTEM/SECURITY", "T1003.002")) {
-        edr_adaptive_collection_raise(3, "R-CRED-001", br->pid, br->ppid,
-                                      (pn && pn[0]) ? pn : br->process_name);
+      const char *reason = "";
+      if (p0_should_suppress_known_false_positive("R-CRED-001", br, detail, &reason)) {
+        if (p0_debug_enabled()) {
+          fprintf(stderr, "[P0 DEBUG] suppress known false positive: rule=R-CRED-001 pid=%u reason=%s\n",
+                  br->pid, reason && reason[0] ? reason : "unknown");
+        }
+      } else {
+        if (p0_debug_enabled()) {
+          p0_debug_event("R-CRED-001", br, pn, detail);
+        }
+        if (emit_for_rule(br, "R-CRED-001", 3, "导出 SAM/SYSTEM/SECURITY", "T1003.002")) {
+          edr_adaptive_collection_raise(3, "R-CRED-001", br->pid, br->ppid,
+                                        (pn && pn[0]) ? pn : br->process_name);
+        }
       }
     }
     if (edr_p0_rule_matches3("R-FILELESS-001", pn, cmd, par, ch)) {
-      if (p0_debug_enabled()) {
-        p0_debug_event("R-FILELESS-001", br, pn, detail);
-      }
-      if (emit_for_rule(br, "R-FILELESS-001", 3, "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027")) {
-        edr_adaptive_collection_raise(3, "R-FILELESS-001", br->pid, br->ppid,
-                                      (pn && pn[0]) ? pn : br->process_name);
+      const char *reason = "";
+      if (p0_should_suppress_known_false_positive("R-FILELESS-001", br, detail, &reason)) {
+        if (p0_debug_enabled()) {
+          fprintf(stderr, "[P0 DEBUG] suppress known false positive: rule=R-FILELESS-001 pid=%u reason=%s\n",
+                  br->pid, reason && reason[0] ? reason : "unknown");
+        }
+      } else {
+        if (p0_debug_enabled()) {
+          p0_debug_event("R-FILELESS-001", br, pn, detail);
+        }
+        if (emit_for_rule(br, "R-FILELESS-001", 3, "PowerShell 反射/IEX 无文件执行特征", "T1059.001,T1027")) {
+          edr_adaptive_collection_raise(3, "R-FILELESS-001", br->pid, br->ppid,
+                                        (pn && pn[0]) ? pn : br->process_name);
+        }
       }
     }
   }
