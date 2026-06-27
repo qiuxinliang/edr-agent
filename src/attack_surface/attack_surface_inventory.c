@@ -9,8 +9,10 @@
 #include <string.h>
 
 #ifdef _WIN32
-#include <lm.h>
+/* windows.h 必须先于 lm.h / winsvc.h：后者依赖 DWORD/LPBYTE 等 Windows 类型，
+ * 否则 MSVC 报 C2061/C2065 未声明类型（MinGW/Clang 头文件较宽松不暴露）。 */
 #include <windows.h>
+#include <lm.h>
 #include <winsvc.h>
 #else
 #include <dirent.h>
