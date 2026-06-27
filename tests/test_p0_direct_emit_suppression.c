@@ -264,6 +264,25 @@ static void test_searchprotocolhost_without_pipe_is_not_suppressed(void) {
   assert(!suppressed("R-LOLBIN-010", &r, r.cmdline, NULL));
 }
 
+static void test_searchprotocolhost_no_cmdline_system32_is_suppressed(void) {
+  /* behavior_70 缺字段场景：无命令行但 System32 标准路径 + 进程名 → 按正常索引降级。 */
+  EdrBehaviorRecord r;
+  init_record(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "SearchProtocolHost.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path), "C:\\Windows\\System32\\SearchProtocolHost.exe");
+  /* cmdline 留空 */
+  assert(suppressed("R-LOLBIN-010", &r, "", "searchprotocolhost_indexing_baseline"));
+}
+
+static void test_searchprotocolhost_no_cmdline_user_path_not_suppressed(void) {
+  /* 无命令行但伪装到用户目录：仍不豁免，保留检测能力。 */
+  EdrBehaviorRecord r;
+  init_record(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "SearchProtocolHost.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path), "C:\\Users\\Public\\SearchProtocolHost.exe");
+  assert(!suppressed("R-LOLBIN-010", &r, "", NULL));
+}
+
 int main(void) {
   test_fdsecurity_sensor_task_is_suppressed();
   test_fdsecurity_setup_diagnostics_is_suppressed();
@@ -277,6 +296,8 @@ int main(void) {
   test_searchprotocolhost_indexing_is_suppressed();
   test_searchprotocolhost_user_path_is_not_suppressed();
   test_searchprotocolhost_without_pipe_is_not_suppressed();
+  test_searchprotocolhost_no_cmdline_system32_is_suppressed();
+  test_searchprotocolhost_no_cmdline_user_path_not_suppressed();
   puts("test_p0_direct_emit_suppression: ok");
   return 0;
 }

@@ -418,18 +418,25 @@ static int p0_searchprotocolhost_path_is_system32(const EdrBehaviorRecord *br, c
 
 static int p0_is_searchprotocolhost_indexing_baseline(const EdrBehaviorRecord *br, const char *detail) {
   const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
-  if (!br || !cmd || !cmd[0]) {
+  if (!br) {
     return 0;
   }
   if (!(p0_contains_ci(br->process_name, "SearchProtocolHost.exe") ||
         p0_contains_ci(br->exe_path, "\\SearchProtocolHost.exe") ||
-        p0_contains_ci(cmd, "SearchProtocolHost.exe"))) {
+        (cmd && p0_contains_ci(cmd, "SearchProtocolHost.exe")))) {
     return 0;
   }
+  /* 必须是 System32 真实路径——伪装到其它目录的同名进程不在此豁免。 */
   if (!p0_searchprotocolhost_path_is_system32(br, detail)) {
     return 0;
   }
-  return p0_contains_ci(cmd, "Global\\UsGthrFltPipe");
+  if (cmd && cmd[0]) {
+    /* 有命令行：要求正常索引管线 token；其它命令行形态保留检测能力（不豁免）。 */
+    return p0_contains_ci(cmd, "Global\\UsGthrFltPipe");
+  }
+  /* 无命令行（告警缺字段，behavior_70 常见）：System32 标准路径 + 进程名即按正常索引降级。
+   * 伪装路径已被上面的 System32 检查排除，真实 System32\SearchProtocolHost 无命令行即索引宿主。 */
+  return p0_contains_ci(br->exe_path, "\\Windows\\System32\\SearchProtocolHost.exe");
 }
 
 static int p0_should_suppress_known_false_positive(const char *rule_id, const EdrBehaviorRecord *br,

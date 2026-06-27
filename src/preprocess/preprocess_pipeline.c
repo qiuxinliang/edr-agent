@@ -344,6 +344,13 @@ static void process_one_slot(const EdrEventSlot *slot) {
       edr_local_evidence_cache_record_behavior(&br);
       return;
     }
+    /* EQS enforcement：低上传价值（local_only）不投递平台，仅进本地证据缓存
+     * （普通事件在缓存内 coalesce → 由 behavior_summary 周期性以一条摘要替代逐条）。
+     * 仅 emit_context / emit_alert 继续走候选与上传路径。drop 已在上面拦下。 */
+    if (dd.selection_action[0] != '\0' && strcmp(dd.selection_action, "local_only") == 0) {
+      edr_local_evidence_cache_record_behavior(&br);
+      return;
+    }
   }
   if (!edr_preprocess_should_emit(&br)) {
     return;
