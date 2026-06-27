@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r218-9ae52519"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r252-086c1be1"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -317,12 +317,76 @@ static void take_string(toml_datum_t d, char *dst, size_t cap) {
   }
 }
 
+static void take_string_array_csv(toml_array_t *arr, char *dst, size_t cap) {
+  if (!arr || !dst || cap == 0u) {
+    return;
+  }
+  dst[0] = '\0';
+  int n = toml_array_nelem(arr);
+  size_t used = 0u;
+  for (int i = 0; i < n; i++) {
+    toml_datum_t d = toml_string_at(arr, i);
+    if (!d.ok || !d.u.s) {
+      continue;
+    }
+    const char *s = d.u.s;
+    while (*s && isspace((unsigned char)*s)) {
+      s++;
+    }
+    size_t len = strlen(s);
+    while (len > 0u && isspace((unsigned char)s[len - 1u])) {
+      len--;
+    }
+    if (len > 0u) {
+      if (used > 0u && used + 1u < cap) {
+        dst[used++] = ',';
+        dst[used] = '\0';
+      }
+      size_t room = cap - used - 1u;
+      size_t copy = len < room ? len : room;
+      if (copy > 0u) {
+        memcpy(dst + used, s, copy);
+        used += copy;
+        dst[used] = '\0';
+      }
+    }
+    free(d.u.s);
+    if (used + 1u >= cap) {
+      break;
+    }
+  }
+}
+
 static void load_server(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "address"), cfg->server.address, sizeof(cfg->server.address));
+  {
+    toml_datum_t d = toml_bool_in(t, "grpc_enabled");
+    if (d.ok) {
+      cfg->server.grpc_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "grpc_insecure");
+    if (d.ok) {
+      cfg->server.grpc_insecure = d.u.b ? true : false;
+    }
+  }
   take_string(toml_string_in(t, "ca_cert"), cfg->server.ca_cert, sizeof(cfg->server.ca_cert));
   take_string(toml_string_in(t, "client_cert"), cfg->server.client_cert,
               sizeof(cfg->server.client_cert));
   take_string(toml_string_in(t, "client_key"), cfg->server.client_key, sizeof(cfg->server.client_key));
+  take_string(toml_string_in(t, "client_key_provider"), cfg->server.client_key_provider,
+              sizeof(cfg->server.client_key_provider));
+  take_string(toml_string_in(t, "client_cert_store"), cfg->server.client_cert_store,
+              sizeof(cfg->server.client_cert_store));
+  take_string(toml_string_in(t, "client_cert_thumbprint"), cfg->server.client_cert_thumbprint,
+              sizeof(cfg->server.client_cert_thumbprint));
+  take_string(toml_string_in(t, "pkcs11_module"), cfg->server.pkcs11_module,
+              sizeof(cfg->server.pkcs11_module));
+  take_string(toml_string_in(t, "pkcs11_key_uri"), cfg->server.pkcs11_key_uri,
+              sizeof(cfg->server.pkcs11_key_uri));
+  take_string(toml_string_in(t, "tpm_key_uri"), cfg->server.tpm_key_uri,
+              sizeof(cfg->server.tpm_key_uri));
   {
     toml_datum_t d = toml_int_in(t, "connect_timeout_s");
     if (d.ok) {
@@ -351,6 +415,42 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "etw_dns_client_provider");
+    if (d.ok) {
+      cfg->collection.etw_dns_client_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_powershell_provider");
+    if (d.ok) {
+      cfg->collection.etw_powershell_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_amsi_provider");
+    if (d.ok) {
+      cfg->collection.etw_amsi_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_schannel_provider");
+    if (d.ok) {
+      cfg->collection.etw_schannel_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_security_audit_provider");
+    if (d.ok) {
+      cfg->collection.etw_security_audit_provider = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "etw_wmi_provider");
+    if (d.ok) {
+      cfg->collection.etw_wmi_provider = d.u.b ? true : false;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "etw_tcpip_provider");
     if (d.ok) {
       cfg->collection.etw_tcpip_provider = d.u.b ? true : false;
@@ -369,6 +469,14 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "auditd_enabled");
+    if (d.ok) {
+      cfg->collection.auditd_enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "auditd_log_path"), cfg->collection.auditd_log_path,
+              sizeof(cfg->collection.auditd_log_path));
+  {
     toml_datum_t d = toml_int_in(t, "poll_interval_s");
     if (d.ok) {
       cfg->collection.poll_interval_s = (int)d.u.i;
@@ -380,6 +488,71 @@ static void load_collection(toml_table_t *t, EdrConfig *cfg) {
       cfg->collection.max_event_queue_size = (uint32_t)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_bool_in(t, "adaptive_enabled");
+    if (d.ok) {
+      cfg->collection.adaptive_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "adaptive_boost_seconds");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->collection.adaptive_boost_seconds = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "adaptive_min_severity");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->collection.adaptive_min_severity = (uint32_t)d.u.i;
+    }
+  }
+}
+
+static void load_event_filter(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->event_filter.enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "version"), cfg->event_filter.version,
+              sizeof(cfg->event_filter.version));
+  {
+    toml_datum_t d = toml_bool_in(t, "agent_internal_forensic");
+    if (d.ok) {
+      cfg->event_filter.agent_internal_forensic = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "low_value_file_process");
+    if (d.ok) {
+      cfg->event_filter.low_value_file_process = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "low_value_file_suffix");
+    if (d.ok) {
+      cfg->event_filter.low_value_file_suffix = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "temp_xml");
+    if (d.ok) {
+      cfg->event_filter.temp_xml = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "low_value_process_names"),
+              cfg->event_filter.low_value_process_names,
+              sizeof(cfg->event_filter.low_value_process_names));
+  take_string(toml_string_in(t, "low_value_suffixes"),
+              cfg->event_filter.low_value_suffixes,
+              sizeof(cfg->event_filter.low_value_suffixes));
+  take_string(toml_string_in(t, "temp_xml_patterns"),
+              cfg->event_filter.temp_xml_patterns,
+              sizeof(cfg->event_filter.temp_xml_patterns));
+  take_string(toml_string_in(t, "agent_internal_patterns"),
+              cfg->event_filter.agent_internal_patterns,
+              sizeof(cfg->event_filter.agent_internal_patterns));
 }
 
 static void rule_take_str(toml_table_t *rt, const char *key, char *dst, size_t cap) {
@@ -571,7 +744,147 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
   load_preprocessing_rules(t, cfg);
 }
 
+/* 把 [[detection_policy.suppression]] 数组表序列化为控制符分隔的紧凑串，供检测引擎消费。
+ * 规则间 0x1e，字段间 0x1f：target,process,action,reason,contains_all；contains_all token 间 0x1d。 */
+static void sup_append(char *out, size_t cap, size_t *len, const char *s) {
+  if (!s) {
+    return;
+  }
+  for (; *s && *len + 1u < cap; s++) {
+    /* 丢弃控制符，避免破坏分隔结构。 */
+    if ((unsigned char)*s >= 0x20u) {
+      out[(*len)++] = *s;
+    }
+  }
+  out[*len] = '\0';
+}
+
+static void load_detection_policy_suppression(toml_table_t *t, EdrConfig *cfg) {
+  cfg->detection_policy.suppression_rules[0] = '\0';
+  toml_array_t *arr = toml_array_in(t, "suppression");
+  if (!arr) {
+    return;
+  }
+  int n = toml_array_nelem(arr);
+  if (n < 0) {
+    return;
+  }
+  char *out = cfg->detection_policy.suppression_rules;
+  size_t cap = sizeof(cfg->detection_policy.suppression_rules);
+  size_t len = 0u;
+  int written = 0;
+  for (int i = 0; i < n; i++) {
+    toml_table_t *rt = toml_table_at(arr, i);
+    if (!rt) {
+      continue;
+    }
+    char target[96] = "";
+    char process[128] = "";
+    char action[32] = "";
+    char reason[96] = "";
+    take_string(toml_string_in(rt, "target_rule_id"), target, sizeof(target));
+    take_string(toml_string_in(rt, "process_name"), process, sizeof(process));
+    take_string(toml_string_in(rt, "action"), action, sizeof(action));
+    take_string(toml_string_in(rt, "reason"), reason, sizeof(reason));
+    if (!action[0]) {
+      snprintf(action, sizeof(action), "%s", "downgrade");
+    }
+    if (written && len + 1u < cap) {
+      out[len++] = '\x1e';
+    }
+    sup_append(out, cap, &len, target);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    sup_append(out, cap, &len, process);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    sup_append(out, cap, &len, action);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    sup_append(out, cap, &len, reason);
+    if (len + 1u < cap) out[len++] = '\x1f';
+    toml_array_t *ca = toml_array_in(rt, "contains_all");
+    if (ca) {
+      int cn = toml_array_nelem(ca);
+      int first = 1;
+      for (int j = 0; j < cn; j++) {
+        toml_datum_t d = toml_string_at(ca, j);
+        if (!d.ok || !d.u.s) {
+          continue;
+        }
+        if (!first && len + 1u < cap) {
+          out[len++] = '\x1d';
+        }
+        sup_append(out, cap, &len, d.u.s);
+        first = 0;
+        free(d.u.s);
+      }
+    }
+    out[len] = '\0';
+    written = 1;
+  }
+}
+
+static void load_detection_policy(toml_table_t *t, EdrConfig *cfg) {
+  take_string(toml_string_in(t, "source"), cfg->detection_policy.source, sizeof(cfg->detection_policy.source));
+  take_string(toml_string_in(t, "audit_id"), cfg->detection_policy.audit_id, sizeof(cfg->detection_policy.audit_id));
+  take_string(toml_string_in(t, "policy_version"), cfg->detection_policy.policy_version,
+              sizeof(cfg->detection_policy.policy_version));
+  take_string(toml_string_in(t, "rollback_version"), cfg->detection_policy.rollback_version,
+              sizeof(cfg->detection_policy.rollback_version));
+  take_string(toml_string_in(t, "fp_policy_version"), cfg->detection_policy.fp_policy_version,
+              sizeof(cfg->detection_policy.fp_policy_version));
+  take_string(toml_string_in(t, "fp_rollback_version"), cfg->detection_policy.fp_rollback_version,
+              sizeof(cfg->detection_policy.fp_rollback_version));
+  take_string(toml_string_in(t, "rmm_policy_version"), cfg->detection_policy.rmm_policy_version,
+              sizeof(cfg->detection_policy.rmm_policy_version));
+  take_string(toml_string_in(t, "rmm_rollback_version"), cfg->detection_policy.rmm_rollback_version,
+              sizeof(cfg->detection_policy.rmm_rollback_version));
+  take_string(toml_string_in(t, "allow_paths"), cfg->detection_policy.allow_paths,
+              sizeof(cfg->detection_policy.allow_paths));
+  take_string(toml_string_in(t, "script_dirs"), cfg->detection_policy.script_dirs,
+              sizeof(cfg->detection_policy.script_dirs));
+  take_string(toml_string_in(t, "management_tools"), cfg->detection_policy.management_tools,
+              sizeof(cfg->detection_policy.management_tools));
+  take_string(toml_string_in(t, "fp_feedback"), cfg->detection_policy.fp_feedback,
+              sizeof(cfg->detection_policy.fp_feedback));
+  load_detection_policy_suppression(t, cfg);
+}
+
+static void config_setenv_if_value(const char *name, const char *value) {
+  if (!name || !name[0] || !value || !value[0]) {
+    return;
+  }
+#ifdef _WIN32
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, 1);
+#endif
+}
+
+static void apply_detection_policy_env(const EdrConfig *cfg) {
+  if (!cfg) {
+    return;
+  }
+  config_setenv_if_value("EDR_DETECTION_POLICY_SOURCE", cfg->detection_policy.source);
+  config_setenv_if_value("EDR_DETECTION_POLICY_AUDIT_ID", cfg->detection_policy.audit_id);
+  config_setenv_if_value("EDR_DETECTION_POLICY_VERSION", cfg->detection_policy.policy_version);
+  config_setenv_if_value("EDR_DETECTION_ROLLBACK_VERSION", cfg->detection_policy.rollback_version);
+  config_setenv_if_value("EDR_DETECTION_FP_POLICY_VERSION", cfg->detection_policy.fp_policy_version);
+  config_setenv_if_value("EDR_DETECTION_FP_ROLLBACK_VERSION", cfg->detection_policy.fp_rollback_version);
+  config_setenv_if_value("EDR_DETECTION_RMM_POLICY_VERSION", cfg->detection_policy.rmm_policy_version);
+  config_setenv_if_value("EDR_DETECTION_RMM_ROLLBACK_VERSION", cfg->detection_policy.rmm_rollback_version);
+  config_setenv_if_value("EDR_DETECTION_ALLOW_PATHS", cfg->detection_policy.allow_paths);
+  config_setenv_if_value("EDR_DETECTION_SCRIPT_DIRS", cfg->detection_policy.script_dirs);
+  config_setenv_if_value("EDR_DETECTION_MGMT_TOOLS", cfg->detection_policy.management_tools);
+  config_setenv_if_value("EDR_DETECTION_FP_FEEDBACK", cfg->detection_policy.fp_feedback);
+  config_setenv_if_value("EDR_DETECTION_SUPPRESSION_RULES", cfg->detection_policy.suppression_rules);
+}
+
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->ave.enabled = d.u.b ? true : false;
+    }
+  }
   take_string(toml_string_in(t, "model_dir"), cfg->ave.model_dir, sizeof(cfg->ave.model_dir));
   {
     toml_datum_t d = toml_int_in(t, "scan_threads");
@@ -601,6 +914,12 @@ static void load_ave(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_bool_in(t, "ioc_precheck_enabled");
     if (d.ok) {
       cfg->ave.ioc_precheck_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "static_model_enabled");
+    if (d.ok) {
+      cfg->ave.static_model_enabled = d.u.b ? true : false;
     }
   }
   take_string(toml_string_in(t, "behavior_policy_db_path"), cfg->ave.behavior_policy_db_path,
@@ -673,6 +992,8 @@ static void load_upload(toml_table_t *t, EdrConfig *cfg) {
 static void load_offline(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "queue_db_path"), cfg->offline.queue_db_path,
               sizeof(cfg->offline.queue_db_path));
+  take_string(toml_string_in(t, "evidence_cache_path"), cfg->offline.evidence_cache_path,
+              sizeof(cfg->offline.evidence_cache_path));
   {
     toml_datum_t d = toml_int_in(t, "max_queue_size_mb");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
@@ -683,6 +1004,18 @@ static void load_offline(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "retention_hours");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->offline.retention_hours = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "evidence_cache_max_size_mb");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->offline.evidence_cache_max_size_mb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "evidence_cache_retention_hours");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->offline.evidence_cache_retention_hours = (uint32_t)d.u.i;
     }
   }
 }
@@ -706,6 +1039,67 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
       cfg->resource_limit.emergency_cpu_limit = (uint32_t)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_int_in(t, "ave_infer_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.ave_infer_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "behavior_infer_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.behavior_infer_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "pmfe_scans_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.pmfe_scans_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "webshell_scan_mb_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.webshell_scan_mb_per_min = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "shellcode_packets_per_sec");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->resource_limit.shellcode_packets_per_sec = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "low_priority_keep_percent_under_pressure");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 100) {
+      cfg->resource_limit.low_priority_keep_percent_under_pressure = (uint32_t)d.u.i;
+    }
+  }
+}
+
+static void load_health_monitor(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->health_monitor.enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "profile"), cfg->health_monitor.profile,
+              sizeof(cfg->health_monitor.profile));
+  {
+    toml_datum_t d = toml_int_in(t, "interval_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->health_monitor.interval_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "expires_at_unix_ms");
+    if (d.ok && d.u.i >= 0) {
+      cfg->health_monitor.expires_at_unix_ms = (uint64_t)d.u.i;
+    }
+  }
+  take_string(toml_string_in(t, "request_id"), cfg->health_monitor.request_id,
+              sizeof(cfg->health_monitor.request_id));
 }
 
 static void load_logging(toml_table_t *t, EdrConfig *cfg) {
@@ -821,6 +1215,42 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_int_in(t, "flow_scan_first_bytes");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.flow_scan_first_bytes = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "scan_tls_appdata");
+    if (d.ok) {
+      cfg->shellcode_detector.scan_tls_appdata = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "exclude_self_traffic");
+    if (d.ok) {
+      cfg->shellcode_detector.exclude_self_traffic = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "windivert_queue_length");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.windivert_queue_length = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "windivert_queue_size_kb");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.windivert_queue_size_kb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "windivert_queue_time_ms");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.windivert_queue_time_ms = (uint32_t)d.u.i;
+    }
+  }
+  {
     toml_datum_t d = toml_bool_in(t, "monitor_smb");
     if (d.ok) {
       cfg->shellcode_detector.monitor_smb = d.u.b ? true : false;
@@ -848,6 +1278,12 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_bool_in(t, "monitor_ldap");
     if (d.ok) {
       cfg->shellcode_detector.monitor_ldap = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "monitor_tls");
+    if (d.ok) {
+      cfg->shellcode_detector.monitor_tls = d.u.b ? true : false;
     }
   }
   {
@@ -898,7 +1334,7 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     if (cfg->shellcode_detector.windivert_tcp_ports_parsed_count > 0) {
       cfg->shellcode_detector.windivert_ports_is_custom = true;
     } else {
-      fprintf(stderr, "[config] shellcode_detector.windivert_tcp_ports 无有效端口，使用内置 WinDivert 端口表\n");
+      fprintf(stderr, "[config] shellcode_detector.windivert_tcp_ports has no valid port; using built-in WinDivert port table\n");
     }
   }
 }
@@ -984,7 +1420,7 @@ static void load_webshell_detector(toml_table_t *t, EdrConfig *cfg) {
 
 static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->collection.max_event_queue_size < 256u) {
-    cfg->collection.max_event_queue_size = 4096u;
+    cfg->collection.max_event_queue_size = 256u;
   }
   if (cfg->collection.max_event_queue_size > 65536u) {
     cfg->collection.max_event_queue_size = 65536u;
@@ -1003,6 +1439,12 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->upload.batch_max_events > 50000u) {
     cfg->upload.batch_max_events = 50000u;
+  }
+  if (cfg->platform.telemetry_sampling_pct < 1u) {
+    cfg->platform.telemetry_sampling_pct = 1u;
+  }
+  if (cfg->platform.telemetry_sampling_pct > 100u) {
+    cfg->platform.telemetry_sampling_pct = 100u;
   }
   if (cfg->shellcode_detector.alert_threshold < 0.0) {
     cfg->shellcode_detector.alert_threshold = 0.0;
@@ -1036,6 +1478,28 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->shellcode_detector.detector_threads > 4u) {
     cfg->shellcode_detector.detector_threads = 4u;
+  }
+  /* P2 #8：WinDivert 队列参数 clamp（0 保留为“用内置默认”，不 clamp）。 */
+  if (cfg->shellcode_detector.windivert_queue_length != 0u) {
+    if (cfg->shellcode_detector.windivert_queue_length < 32u) {
+      cfg->shellcode_detector.windivert_queue_length = 32u;
+    } else if (cfg->shellcode_detector.windivert_queue_length > 16384u) {
+      cfg->shellcode_detector.windivert_queue_length = 16384u;
+    }
+  }
+  if (cfg->shellcode_detector.windivert_queue_size_kb != 0u) {
+    if (cfg->shellcode_detector.windivert_queue_size_kb < 64u) {
+      cfg->shellcode_detector.windivert_queue_size_kb = 64u;
+    } else if (cfg->shellcode_detector.windivert_queue_size_kb > 32768u) {
+      cfg->shellcode_detector.windivert_queue_size_kb = 32768u;
+    }
+  }
+  if (cfg->shellcode_detector.windivert_queue_time_ms != 0u) {
+    if (cfg->shellcode_detector.windivert_queue_time_ms < 100u) {
+      cfg->shellcode_detector.windivert_queue_time_ms = 100u;
+    } else if (cfg->shellcode_detector.windivert_queue_time_ms > 16000u) {
+      cfg->shellcode_detector.windivert_queue_time_ms = 16000u;
+    }
   }
   if (cfg->shellcode_detector.evidence_preview_bytes > 512u) {
     cfg->shellcode_detector.evidence_preview_bytes = 512u;
@@ -1217,6 +1681,23 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->ave.static_infer_cache_ttl_s > 864000u) {
     cfg->ave.static_infer_cache_ttl_s = 864000u;
   }
+  if (cfg->health_monitor.profile[0] == '\0') {
+    snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+  } else {
+    for (size_t i = 0; i < sizeof(cfg->health_monitor.profile) && cfg->health_monitor.profile[i]; i++) {
+      cfg->health_monitor.profile[i] = (char)tolower((unsigned char)cfg->health_monitor.profile[i]);
+    }
+    if (strcmp(cfg->health_monitor.profile, "basic") != 0 &&
+        strcmp(cfg->health_monitor.profile, "diagnostic") != 0) {
+      snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+    }
+  }
+  if (cfg->health_monitor.interval_s < 30u) {
+    cfg->health_monitor.interval_s = 30u;
+  }
+  if (cfg->health_monitor.interval_s > 3600u) {
+    cfg->health_monitor.interval_s = 3600u;
+  }
   {
     const char *e = getenv("EDR_AVE_CERT_REVOCATION");
     if (e && e[0] == '1') {
@@ -1242,7 +1723,10 @@ void edr_config_free_heap(EdrConfig *cfg) {
 
 void edr_config_apply_defaults(EdrConfig *cfg) {
   memset(cfg, 0, sizeof(*cfg));
-  snprintf(cfg->server.address, sizeof(cfg->server.address), "%s", "127.0.0.1:50051");
+  cfg->server.address[0] = '\0';
+  cfg->server.grpc_enabled = false;
+  cfg->server.grpc_insecure = false;
+  snprintf(cfg->server.client_key_provider, sizeof(cfg->server.client_key_provider), "%s", "pem");
   cfg->server.connect_timeout_s = 10;
   cfg->server.keepalive_interval_s = 30;
 
@@ -1250,11 +1734,42 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->agent.tenant_id, sizeof(cfg->agent.tenant_id), "%s", "tenant_default");
 
   cfg->collection.etw_enabled = true;
+  cfg->collection.etw_dns_client_provider = true;
+  cfg->collection.etw_powershell_provider = true;
+  cfg->collection.etw_amsi_provider = true;
+  cfg->collection.etw_schannel_provider = true;
+  cfg->collection.etw_security_audit_provider = true;
+  cfg->collection.etw_wmi_provider = true;
   cfg->collection.etw_tcpip_provider = true;
   cfg->collection.etw_firewall_provider = true;
   cfg->collection.ebpf_enabled = true;
+  cfg->collection.auditd_enabled = false;
+  snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;
-  cfg->collection.max_event_queue_size = 4096u;
+  cfg->collection.max_event_queue_size = 1024u;
+  cfg->collection.adaptive_enabled = true;
+  cfg->collection.adaptive_boost_seconds = 180u;
+  cfg->collection.adaptive_min_severity = 3u;
+
+  cfg->event_filter.enabled = true;
+  snprintf(cfg->event_filter.version, sizeof(cfg->event_filter.version), "%s",
+           "agent-event-filter-v1");
+  cfg->event_filter.agent_internal_forensic = true;
+  cfg->event_filter.low_value_file_process = true;
+  cfg->event_filter.low_value_file_suffix = true;
+  cfg->event_filter.temp_xml = true;
+  snprintf(cfg->event_filter.low_value_process_names,
+           sizeof(cfg->event_filter.low_value_process_names), "%s",
+           "svchost.exe, runtimebroker.exe, backgroundtaskhost.exe, "
+           "microsoftedgeupdate.exe, mousocoreworker.exe");
+  snprintf(cfg->event_filter.low_value_suffixes, sizeof(cfg->event_filter.low_value_suffixes),
+           "%s", ":wofcompresseddata, .js.map, .tmp, .etl, .blf, .regtrans-ms, .cache");
+  snprintf(cfg->event_filter.temp_xml_patterns, sizeof(cfg->event_filter.temp_xml_patterns),
+           "%s", "\\appdata\\local\\temp\\xml_file");
+  snprintf(cfg->event_filter.agent_internal_patterns,
+           sizeof(cfg->event_filter.agent_internal_patterns), "%s",
+           "\\edr_forensic\\, /edr_forensic/, cmd_forensic_, auto-forensic_, "
+           "forensic_bundle, source=agent_internal");
 
   cfg->preprocessing.dedup_window_s = 30u;
   cfg->preprocessing.high_freq_threshold = 100u;
@@ -1262,13 +1777,17 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->preprocessing.rules_version, sizeof(cfg->preprocessing.rules_version), "%s",
            EDR_PREPROCESS_RULES_VERSION_DEFAULT);
   apply_builtin_preprocess_rules(cfg);
+  snprintf(cfg->detection_policy.source, sizeof(cfg->detection_policy.source), "%s", "local_default");
+  snprintf(cfg->detection_policy.policy_version, sizeof(cfg->detection_policy.policy_version), "%s", "local-default");
 
 #ifdef _WIN32
   /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
-  snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "C:\\ProgramData\\EDR\\models");
+  snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s",
+           "C:\\Program Files\\FDSecurity\\models");
 #else
   snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
 #endif
+  cfg->ave.enabled = true;
   cfg->ave.scan_threads = 2;
   cfg->ave.max_file_size_mb = 256;
   snprintf(cfg->ave.sensitivity, sizeof(cfg->ave.sensitivity), "%s", "MEDIUM");
@@ -1281,8 +1800,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->ave.file_whitelist_db_path[0] = '\0';
   cfg->ave.ioc_db_path[0] = '\0';
   cfg->ave.ioc_precheck_enabled = true;
+  cfg->ave.static_model_enabled = true;
   cfg->ave.behavior_policy_db_path[0] = '\0';
-  cfg->ave.behavior_monitor_enabled = true;
+  cfg->ave.behavior_monitor_enabled = false;
   cfg->ave.cert_revocation_check = false;
   cfg->ave.l4_realtime_behavior_link = false;
   cfg->ave.l4_realtime_anomaly_threshold = 0.65f;
@@ -1294,17 +1814,48 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->upload.batch_timeout_s = 5;
   cfg->upload.max_upload_mbps = 1u;
 
+#ifdef _WIN32
+  snprintf(cfg->offline.queue_db_path, sizeof(cfg->offline.queue_db_path), "%s",
+           "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db");
+#else
   snprintf(cfg->offline.queue_db_path, sizeof(cfg->offline.queue_db_path), "%s",
            "edr_queue.db");
+#endif
   cfg->offline.max_queue_size_mb = 512u;
   cfg->offline.retention_hours = 72u;
+#ifdef _WIN32
+  snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
+           "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db");
+#else
+  snprintf(cfg->offline.evidence_cache_path, sizeof(cfg->offline.evidence_cache_path), "%s",
+           "local_evidence_cache.db");
+#endif
+  cfg->offline.evidence_cache_max_size_mb = 128u;
+  cfg->offline.evidence_cache_retention_hours = 24u;
 
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
   cfg->resource_limit.emergency_cpu_limit = 5u;
+  cfg->resource_limit.ave_infer_per_min = 120u;
+  cfg->resource_limit.behavior_infer_per_min = 30u;
+  cfg->resource_limit.pmfe_scans_per_min = 3u;
+  cfg->resource_limit.webshell_scan_mb_per_min = 64u;
+  cfg->resource_limit.shellcode_packets_per_sec = 2000u;
+  cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
+
+  cfg->health_monitor.enabled = false;
+  snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
+  cfg->health_monitor.interval_s = 60u;
+  cfg->health_monitor.expires_at_unix_ms = 0u;
+  cfg->health_monitor.request_id[0] = '\0';
 
   snprintf(cfg->logging.level, sizeof(cfg->logging.level), "%s", "info");
+#ifdef _WIN32
+  snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s",
+           "C:\\Program Files\\FDSecurity\\logs");
+#else
   snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s", "/var/log/edr");
+#endif
   cfg->logging.max_log_size_mb = 100u;
   cfg->logging.max_log_files = 10u;
 
@@ -1315,14 +1866,24 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.auto_isolate_threshold = 0.95;
   cfg->shellcode_detector.auto_isolate_execute = false;
   cfg->shellcode_detector.heuristic_score_scale = 1.0;
-  cfg->shellcode_detector.yara_rules_reload_interval_s = 0u;
+  cfg->shellcode_detector.flow_scan_first_bytes = 65536u;
+  cfg->shellcode_detector.scan_tls_appdata = false;
+  cfg->shellcode_detector.exclude_self_traffic = true;
+  cfg->shellcode_detector.yara_rules_reload_interval_s = 300u;
   cfg->shellcode_detector.monitor_smb = true;
   cfg->shellcode_detector.monitor_rdp = true;
   cfg->shellcode_detector.monitor_winrm = true;
   cfg->shellcode_detector.monitor_msrpc = true;
   cfg->shellcode_detector.monitor_ldap = true;
+  cfg->shellcode_detector.monitor_tls = true;
   cfg->shellcode_detector.detector_threads = 2u;
-  cfg->shellcode_detector.yara_rules_dir[0] = '\0';
+  cfg->shellcode_detector.windivert_queue_length = 8192u;
+  cfg->shellcode_detector.windivert_queue_size_kb = 8192u;
+  cfg->shellcode_detector.windivert_queue_time_ms = 2000u;
+  /* 默认指向 bundled 规则目录（开发态相对路径；安装器写入部署绝对路径）。
+   * YARA 缺失或目录无规则时，shellcode_known 自动回退内置匹配器。 */
+  snprintf(cfg->shellcode_detector.yara_rules_dir, sizeof(cfg->shellcode_detector.yara_rules_dir), "%s",
+           "src/shellcode_detector/rules");
   cfg->shellcode_detector.forensic_dir[0] = '\0';
   cfg->shellcode_detector.forensic_save_pcap = false;
   cfg->shellcode_detector.evidence_preview_bytes = 0u;
@@ -1332,6 +1893,10 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.windivert_ports_is_custom = false;
   cfg->shellcode_detector.windivert_tcp_ports_parsed_count = 0;
 
+  cfg->net_fanout.enabled = false;
+  cfg->net_fanout.window_s = 120u;
+  cfg->net_fanout.distinct_ip_threshold = 50u;
+  cfg->net_fanout.ports[0] = '\0';
   cfg->webshell_detector.enabled = false;
   cfg->webshell_detector.discovery_interval_s = 1800u;
   cfg->webshell_detector.iis_config_path[0] = '\0';
@@ -1367,8 +1932,38 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->fl.frozen_layer_count_behavior = 0;
 
   cfg->command.allow_dangerous = false;
+  cfg->command.allow_rtq_readonly = true;
+  cfg->command.rtr_shell_allowlist[0] = '\0';
+  cfg->command.rtr_shell_max_timeout_sec = 60u;
+  cfg->command.signing_public_key_path[0] = '\0';
+  cfg->command.signing_public_key_pem[0] = '\0';
+  cfg->forensic_auto.enabled = false;
+  cfg->forensic_auto.cooldown_s = 30u;
+  cfg->forensic_auto.per_pid_cooldown_s = 300u;
+  cfg->forensic_auto.max_per_hour = 20u;
+  cfg->forensic_auto.trigger_on_p0 = true;
+  cfg->forensic_auto.collect_process_tree = true;
 
   snprintf(cfg->platform.rest_user_id, sizeof(cfg->platform.rest_user_id), "%s", "edr-agent");
+  cfg->config_signing.signature_required = false;
+  cfg->config_signing.signing_key_id[0] = '\0';
+  cfg->config_signing.public_key_pem[0] = '\0';
+  cfg->platform.http2_enabled = false;
+  cfg->platform.http2_require = false;
+  cfg->platform.control_stream_enabled = true;
+  cfg->platform.long_poll_fallback = true;
+  cfg->platform.report_events_v2_enabled = true;
+  snprintf(cfg->platform.data_plane_encoding, sizeof(cfg->platform.data_plane_encoding), "%s", "protobuf");
+  snprintf(cfg->platform.data_plane_compression, sizeof(cfg->platform.data_plane_compression), "%s", "identity");
+  snprintf(cfg->platform.control_dict_version, sizeof(cfg->platform.control_dict_version), "%s", "edr-zstd-dict-v1");
+  snprintf(cfg->platform.control_schema_version, sizeof(cfg->platform.control_schema_version), "%s", "edr-control-schema-v1");
+  snprintf(cfg->platform.control_profile_id, sizeof(cfg->platform.control_profile_id), "%s",
+           "default-http1-protobuf");
+  snprintf(cfg->platform.qos_dscp, sizeof(cfg->platform.qos_dscp), "%s", "AF21");
+  snprintf(cfg->platform.telemetry_threshold, sizeof(cfg->platform.telemetry_threshold), "%s", "medium");
+  cfg->platform.telemetry_sampling_pct = 100u;
+  cfg->platform.backpressure_enabled = true;
+  snprintf(cfg->platform.proxy_mode, sizeof(cfg->platform.proxy_mode), "%s", "auto");
 
   cfg->attack_surface.enabled = false;
   cfg->attack_surface.port_interval_s = 300u;
@@ -1392,12 +1987,84 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->self_protect.job_object_windows = false;
   cfg->self_protect.watchdog_log_interval_s = 0u;
   cfg->self_protect.event_bus_pressure_warn_pct = 90u;
+  cfg->self_protect.subsystem_stale_timeout_s = 0u;
+  cfg->self_protect.watchdog_process = false;
+  cfg->self_protect.watchdog_heartbeat_interval_s = 5u;
+  cfg->self_protect.watchdog_stale_timeout_s = 30u;
+  cfg->self_protect.watchdog_max_restarts_per_min = 5u;
+  cfg->self_protect.watchdog_heartbeat_path[0] = '\0';
 }
 
 static void load_command(toml_table_t *t, EdrConfig *cfg) {
   toml_datum_t d = toml_bool_in(t, "allow_dangerous");
   if (d.ok) {
     cfg->command.allow_dangerous = d.u.b ? true : false;
+  }
+  d = toml_bool_in(t, "allow_rtq_readonly");
+  if (d.ok) {
+    cfg->command.allow_rtq_readonly = d.u.b ? true : false;
+  }
+  take_string(toml_string_in(t, "rtr_shell_allowlist"), cfg->command.rtr_shell_allowlist,
+              sizeof(cfg->command.rtr_shell_allowlist));
+  take_string(toml_string_in(t, "signing_public_key_path"), cfg->command.signing_public_key_path,
+              sizeof(cfg->command.signing_public_key_path));
+  take_string(toml_string_in(t, "signing_public_key_pem"), cfg->command.signing_public_key_pem,
+              sizeof(cfg->command.signing_public_key_pem));
+  {
+    toml_datum_t mt = toml_int_in(t, "rtr_shell_max_timeout_sec");
+    if (mt.ok && mt.u.i >= 1 && mt.u.i <= 300) {
+      cfg->command.rtr_shell_max_timeout_sec = (uint32_t)mt.u.i;
+    }
+  }
+  toml_table_t *rt = toml_table_in(t, "rtr_shell");
+  if (rt) {
+    take_string(toml_string_in(rt, "allowlist"), cfg->command.rtr_shell_allowlist,
+                sizeof(cfg->command.rtr_shell_allowlist));
+    take_string_array_csv(toml_array_in(rt, "allowlist"), cfg->command.rtr_shell_allowlist,
+                          sizeof(cfg->command.rtr_shell_allowlist));
+    toml_datum_t mt = toml_int_in(rt, "max_timeout_sec");
+    if (mt.ok && mt.u.i >= 1 && mt.u.i <= 300) {
+      cfg->command.rtr_shell_max_timeout_sec = (uint32_t)mt.u.i;
+    }
+  }
+}
+
+static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
+  {
+    toml_datum_t d = toml_bool_in(t, "enabled");
+    if (d.ok) {
+      cfg->forensic_auto.enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "cooldown_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 3600) {
+      cfg->forensic_auto.cooldown_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "per_pid_cooldown_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 86400) {
+      cfg->forensic_auto.per_pid_cooldown_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "max_per_hour");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 10000) {
+      cfg->forensic_auto.max_per_hour = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "trigger_on_p0");
+    if (d.ok) {
+      cfg->forensic_auto.trigger_on_p0 = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "collect_process_tree");
+    if (d.ok) {
+      cfg->forensic_auto.collect_process_tree = d.u.b ? true : false;
+    }
   }
 }
 
@@ -1408,6 +2075,93 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.rest_user_id));
   take_string(toml_string_in(t, "rest_bearer_token"), cfg->platform.rest_bearer_token,
               sizeof(cfg->platform.rest_bearer_token));
+  {
+    toml_datum_t d = toml_bool_in(t, "http2_enabled");
+    if (d.ok) {
+      cfg->platform.http2_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "http2_require");
+    if (d.ok) {
+      cfg->platform.http2_require = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_stream_enabled");
+    if (d.ok) {
+      cfg->platform.control_stream_enabled = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "long_poll_fallback");
+    if (d.ok) {
+      cfg->platform.long_poll_fallback = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "report_events_v2_enabled");
+    if (d.ok) {
+      cfg->platform.report_events_v2_enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "data_plane_encoding"), cfg->platform.data_plane_encoding,
+              sizeof(cfg->platform.data_plane_encoding));
+  take_string(toml_string_in(t, "data_plane_compression"), cfg->platform.data_plane_compression,
+              sizeof(cfg->platform.data_plane_compression));
+  take_string(toml_string_in(t, "control_dict_version"), cfg->platform.control_dict_version,
+              sizeof(cfg->platform.control_dict_version));
+  take_string(toml_string_in(t, "control_schema_version"), cfg->platform.control_schema_version,
+              sizeof(cfg->platform.control_schema_version));
+  take_string(toml_string_in(t, "control_profile_id"), cfg->platform.control_profile_id,
+              sizeof(cfg->platform.control_profile_id));
+  take_string(toml_string_in(t, "qos_dscp"), cfg->platform.qos_dscp,
+              sizeof(cfg->platform.qos_dscp));
+  take_string(toml_string_in(t, "telemetry_threshold"), cfg->platform.telemetry_threshold,
+              sizeof(cfg->platform.telemetry_threshold));
+  {
+    toml_datum_t d = toml_int_in(t, "telemetry_sampling_pct");
+    if (d.ok) {
+      cfg->platform.telemetry_sampling_pct = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "backpressure_enabled");
+    if (d.ok) {
+      cfg->platform.backpressure_enabled = d.u.b ? true : false;
+    }
+  }
+  take_string(toml_string_in(t, "proxy_mode"), cfg->platform.proxy_mode,
+              sizeof(cfg->platform.proxy_mode));
+  take_string(toml_string_in(t, "proxy_url"), cfg->platform.proxy_url,
+              sizeof(cfg->platform.proxy_url));
+  take_string(toml_string_in(t, "relay_url"), cfg->platform.relay_url,
+              sizeof(cfg->platform.relay_url));
+}
+
+static void load_config_signing(toml_table_t *t, EdrConfig *cfg) {
+  toml_datum_t d = toml_bool_in(t, "signature_required");
+  if (d.ok) {
+    cfg->config_signing.signature_required = d.u.b ? true : false;
+  }
+  take_string(toml_string_in(t, "signing_key_id"), cfg->config_signing.signing_key_id,
+              sizeof(cfg->config_signing.signing_key_id));
+  take_string(toml_string_in(t, "public_key_pem"), cfg->config_signing.public_key_pem,
+              sizeof(cfg->config_signing.public_key_pem));
+  if (cfg->config_signing.public_key_pem[0]) {
+    char expanded[sizeof(cfg->config_signing.public_key_pem)];
+    size_t o = 0u;
+    for (size_t i = 0u; cfg->config_signing.public_key_pem[i] && o + 1u < sizeof(expanded); i++) {
+      if (cfg->config_signing.public_key_pem[i] == '\\' && cfg->config_signing.public_key_pem[i + 1u] == 'n') {
+        expanded[o++] = '\n';
+        i++;
+      } else {
+        expanded[o++] = cfg->config_signing.public_key_pem[i];
+      }
+    }
+    expanded[o] = '\0';
+    snprintf(cfg->config_signing.public_key_pem, sizeof(cfg->config_signing.public_key_pem), "%s", expanded);
+  }
 }
 
 /** 解析 `[fl] coordinator_secp256r1_pubkey_hex` → SEC1 点（33 或 65 字节） */
@@ -1726,6 +2480,38 @@ static void load_self_protect(toml_table_t *t, EdrConfig *cfg) {
       cfg->self_protect.event_bus_pressure_warn_pct = (uint32_t)d.u.i;
     }
   }
+  {
+    toml_datum_t d = toml_int_in(t, "subsystem_stale_timeout_s");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 86400) {
+      cfg->self_protect.subsystem_stale_timeout_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "watchdog_process");
+    if (d.ok) {
+      cfg->self_protect.watchdog_process = d.u.b ? true : false;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "watchdog_heartbeat_interval_s");
+    if (d.ok && d.u.i >= 1 && d.u.i <= 3600) {
+      cfg->self_protect.watchdog_heartbeat_interval_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "watchdog_stale_timeout_s");
+    if (d.ok && d.u.i >= 2 && d.u.i <= 86400) {
+      cfg->self_protect.watchdog_stale_timeout_s = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "watchdog_max_restarts_per_min");
+    if (d.ok && d.u.i >= 0 && d.u.i <= 1000) {
+      cfg->self_protect.watchdog_max_restarts_per_min = (uint32_t)d.u.i;
+    }
+  }
+  take_string(toml_string_in(t, "watchdog_heartbeat_path"), cfg->self_protect.watchdog_heartbeat_path,
+              sizeof(cfg->self_protect.watchdog_heartbeat_path));
 }
 
 EdrError edr_config_load(const char *path, EdrConfig *cfg) {
@@ -1735,6 +2521,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
   edr_config_free_heap(cfg);
   edr_config_apply_defaults(cfg);
   if (!path || !path[0]) {
+    apply_detection_policy_env(cfg);
 #ifdef _WIN32
     edr_win_listen_apply_config(cfg);
 #endif
@@ -1777,9 +2564,21 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
+    toml_table_t *t = toml_table_in(root, "event_filter");
+    if (t) {
+      load_event_filter(t, cfg);
+    }
+  }
+  {
     toml_table_t *t = toml_table_in(root, "preprocessing");
     if (t) {
       load_preprocessing(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "detection_policy");
+    if (t) {
+      load_detection_policy(t, cfg);
     }
   }
   {
@@ -1807,6 +2606,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
+    toml_table_t *t = toml_table_in(root, "health_monitor");
+    if (t) {
+      load_health_monitor(t, cfg);
+    }
+  }
+  {
     toml_table_t *t = toml_table_in(root, "logging");
     if (t) {
       load_logging(t, cfg);
@@ -1825,9 +2630,21 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
+    toml_table_t *t = toml_table_in(root, "forensic_auto");
+    if (t) {
+      load_forensic_auto(t, cfg);
+    }
+  }
+  {
     toml_table_t *t = toml_table_in(root, "platform");
     if (t) {
       load_platform(t, cfg);
+    }
+  }
+  {
+    toml_table_t *t = toml_table_in(root, "config_signing");
+    if (t) {
+      load_config_signing(t, cfg);
     }
   }
   {
@@ -1849,6 +2666,24 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
+    toml_table_t *t = toml_table_in(root, "net_fanout");
+    if (t) {
+      toml_datum_t d = toml_bool_in(t, "enabled");
+      if (d.ok) {
+        cfg->net_fanout.enabled = d.u.b ? true : false;
+      }
+      d = toml_int_in(t, "window_s");
+      if (d.ok && d.u.i >= 1 && d.u.i <= 3600) {
+        cfg->net_fanout.window_s = (uint32_t)d.u.i;
+      }
+      d = toml_int_in(t, "distinct_ip_threshold");
+      if (d.ok && d.u.i >= 1 && d.u.i <= 100000) {
+        cfg->net_fanout.distinct_ip_threshold = (uint32_t)d.u.i;
+      }
+      take_string(toml_string_in(t, "ports"), cfg->net_fanout.ports, sizeof(cfg->net_fanout.ports));
+    }
+  }
+  {
     toml_table_t *t = toml_table_in(root, "fl");
     if (t) {
       load_fl(t, cfg);
@@ -1857,6 +2692,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 
   toml_free(root);
   edr_config_clamp(cfg);
+  apply_detection_policy_env(cfg);
 #ifdef _WIN32
   edr_win_listen_apply_config(cfg);
 #endif

@@ -24,6 +24,8 @@ typedef enum {
   EDR_EVENT_PROCESS_INJECT = 3,
   EDR_EVENT_DLL_LOAD = 4,
   EDR_EVENT_THREAD_CREATE_REMOTE = 5,
+  /** 文件读（与 `file_read` 动态规则对齐；采集路径可按需映射） */
+  EDR_EVENT_FILE_READ = 6,
   EDR_EVENT_FILE_CREATE = 10,
   EDR_EVENT_FILE_WRITE = 11,
   EDR_EVENT_FILE_DELETE = 12,
@@ -53,10 +55,12 @@ typedef enum {
   EDR_EVENT_WEBSHELL_DETECTED = 64,
   /** §19.10 Microsoft-Windows-Windows Firewall With Advanced Security（规则增删改等） */
   EDR_EVENT_FIREWALL_RULE_CHANGE = 65,
-  /** §21 PMFE 内存扫描结论（经预处理 → 行为批次 → gRPC，与 ETW 路径一致） */
+  /** §21 PMFE 内存扫描结论（经预处理 → 统一 HTTP 行为批次，与 ETW 路径一致） */
   EDR_EVENT_PMFE_SCAN_RESULT = 66,
-  /** behavior.onnx 告警帧（`BehaviorEvent.behavior_alert`，§12.4） */
+  /** 主机行为告警帧（protobuf `BehaviorEvent.behavior_alert`，P0/PMFE/脚本等可复用） */
   EDR_EVENT_BEHAVIOR_ONNX_ALERT = 70,
+  /** 行为簇摘要：端侧把被 coalesce 压制的同类低价值事件聚合成一条上报，替代重复明细。 */
+  EDR_EVENT_BEHAVIOR_SUMMARY = 71,
 } EdrEventType;
 
 /** 优先级：0=高 1=中 2=低（§2.3） */
