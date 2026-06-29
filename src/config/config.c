@@ -1937,6 +1937,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->command.rtr_shell_max_timeout_sec = 60u;
   cfg->command.signing_public_key_path[0] = '\0';
   cfg->command.signing_public_key_pem[0] = '\0';
+  cfg->command.forensic_yara_rules_dir[0] = '\0';
   cfg->forensic_auto.enabled = false;
   cfg->forensic_auto.cooldown_s = 30u;
   cfg->forensic_auto.per_pid_cooldown_s = 300u;
@@ -2010,6 +2011,8 @@ static void load_command(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->command.signing_public_key_path));
   take_string(toml_string_in(t, "signing_public_key_pem"), cfg->command.signing_public_key_pem,
               sizeof(cfg->command.signing_public_key_pem));
+  take_string(toml_string_in(t, "forensic_yara_rules_dir"), cfg->command.forensic_yara_rules_dir,
+              sizeof(cfg->command.forensic_yara_rules_dir));
   {
     toml_datum_t mt = toml_int_in(t, "rtr_shell_max_timeout_sec");
     if (mt.ok && mt.u.i >= 1 && mt.u.i <= 300) {

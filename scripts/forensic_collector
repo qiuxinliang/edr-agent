@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
+# [DEPRECATED — 参考实现，勿用于生产]
+# 本脚本为早期 macOS-only 参考实现，且参数契约不匹配 agent（用 `--scope $2` 空格式，
+# 而 agent 传 `--scope=value`），也不产出 `--out-file` 打包，端到端无法跑通。
+# 正式实现见编译型二进制：tools/forensic_collector/main.c（CMake target forensic_collector）。
+# 详见 docs/FORENSIC_COLLECTOR_SPEC.md「落地状态(v1.0.0 baseline)」。
+# ============================================================================
 # EDR Deep Forensic Collector (macOS/POSIX)
 # 对标 CrowdStrike Falcon Forensics Collector
 # ============================================================================

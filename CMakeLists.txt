@@ -82,6 +82,7 @@ if(EDR_WITH_FL_TRAINER OR EDR_WITH_FL_KAFKA OR EDR_WITH_LIBTORCH)
 endif()
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
+option(EDR_WITH_FORENSIC_COLLECTOR "Build the standalone forensic_collector binary" ON)
 
 set(EDR_PCRE2_AVAILABLE 0)
 set(EDR_PCRE2_TARGET "")
@@ -453,6 +454,16 @@ if(WIN32)
   target_compile_definitions(fd_installer_worker PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
   target_link_libraries(fd_installer_worker PRIVATE advapi32 shell32 user32)
   edr_apply_common_warnings(fd_installer_worker)
+endif()
+
+# 独立取证采集器：被 agent 的 deep_collector fork/CreateProcess 调用，仅 libc + 系统命令，无第三方依赖。
+if(EDR_WITH_FORENSIC_COLLECTOR)
+  add_executable(forensic_collector tools/forensic_collector/main.c)
+  set_target_properties(forensic_collector PROPERTIES OUTPUT_NAME "forensic_collector")
+  if(MSVC)
+    target_compile_definitions(forensic_collector PRIVATE _CRT_SECURE_NO_WARNINGS)
+  endif()
+  edr_apply_common_warnings(forensic_collector)
 endif()
 
 target_include_directories(edr_agent PRIVATE

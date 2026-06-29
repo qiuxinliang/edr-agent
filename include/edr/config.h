@@ -218,6 +218,8 @@ typedef struct EdrConfig {
     uint32_t rtr_shell_max_timeout_sec;
     char signing_public_key_path[1024];
     char signing_public_key_pem[2048];
+    /** 取证 YARA 扫描规则目录（yara_scan 命令使用）。空=用 EDR_YARA_RULES_DIR 或默认 rules/forensic。 */
+    char forensic_yara_rules_dir[1024];
   } command;
 
   /** 告警推荐取证自动派发。该开关独立于 [command].allow_dangerous，避免开启响应权限后自动风暴。 */

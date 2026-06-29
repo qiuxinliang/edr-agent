@@ -36,6 +36,206 @@
 
 #include "edr/response_utils.h"
 
+/* ── 取证 YARA 真引擎（libyara，构建启用 EDR_WITH_YARA 时可用） ──
+ * 复用 shellcode_known.c 的成熟模式：懒加载 + 目录编译 + scan 回调收集命中规则名。
+ * 规则目录优先级：EDR_YARA_RULES_DIR > [command].forensic_yara_rules_dir > 默认 rules/forensic。
+ * 不可用（未链接 libyara / 无规则 / 加载失败）时由调用方回退内置子串匹配。 */
+#ifdef EDR_HAVE_YARA
+#include <yara.h>
+#if !defined(_WIN32)
+#include <dirent.h>
+#endif
+
+#define EDR_FY_RULE_NAME_MAX 128
+#define EDR_FY_MAX_HITS 8
+
+typedef struct {
+  char rules[EDR_FY_MAX_HITS][EDR_FY_RULE_NAME_MAX];
+  int count;
+} ForensicYaraResult;
+
+static YR_RULES *s_fy_rules;
+static int s_fy_initialized;
+static int s_fy_loaded;
+
+static int fy_is_rule_file(const char *name) {
+  const char *dot = name ? strrchr(name, '.') : NULL;
+  if (!dot) {
+    return 0;
+  }
+  return (strcmp(dot, ".yar") == 0 || strcmp(dot, ".yara") == 0) ? 1 : 0;
+}
+
+static void fy_compiler_error_cb(int level, const char *fn, int line, const YR_RULE *rule,
+                                 const char *msg, void *ud) {
+  (void)rule;
+  (void)ud;
+  const char *lv = (level == YARA_ERROR_LEVEL_WARNING) ? "warning" : "error";
+  fprintf(stderr, "[forensic-yara] compile %s file=%s line=%d msg=%s\n", lv, fn ? fn : "-", line,
+          msg ? msg : "-");
+}
+
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static int fy_scan_cb(YR_SCAN_CONTEXT *ctx, int message, void *message_data, void *user_data) {
+  (void)ctx;
+#else
+static int fy_scan_cb(int message, void *message_data, void *user_data) {
+#endif
+  ForensicYaraResult *res = (ForensicYaraResult *)user_data;
+  if (!res) {
+    return CALLBACK_CONTINUE;
+  }
+  if (message == CALLBACK_MSG_RULE_MATCHING) {
+    const YR_RULE *rule = (const YR_RULE *)message_data;
+    if (rule && rule->identifier && res->count < EDR_FY_MAX_HITS) {
+      snprintf(res->rules[res->count], EDR_FY_RULE_NAME_MAX, "%s", rule->identifier);
+      res->count++;
+    }
+  }
+  return CALLBACK_CONTINUE;
+}
+
+static int fy_add_file(YR_COMPILER *c, const char *path) {
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    return 0;
+  }
+  int nerr = yr_compiler_add_file(c, fp, NULL, path);
+  fclose(fp);
+  return nerr > 0 ? 0 : 1;
+}
+
+#if defined(_WIN32)
+static int fy_add_dir(YR_COMPILER *c, const char *dir) {
+  char pattern[1024];
+  snprintf(pattern, sizeof(pattern), "%s\\*.*", dir);
+  WIN32_FIND_DATAA ffd;
+  HANDLE h = FindFirstFileA(pattern, &ffd);
+  if (h == INVALID_HANDLE_VALUE) {
+    return 0;
+  }
+  int loaded = 0;
+  do {
+    if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+      continue;
+    }
+    if (!fy_is_rule_file(ffd.cFileName)) {
+      continue;
+    }
+    char full[1024];
+    snprintf(full, sizeof(full), "%s\\%s", dir, ffd.cFileName);
+    loaded += fy_add_file(c, full);
+  } while (FindNextFileA(h, &ffd));
+  FindClose(h);
+  return loaded;
+}
+#else
+static int fy_add_dir(YR_COMPILER *c, const char *dir) {
+  DIR *d = opendir(dir);
+  if (!d) {
+    return 0;
+  }
+  int loaded = 0;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] == '.') {
+      continue;
+    }
+    if (!fy_is_rule_file(ent->d_name)) {
+      continue;
+    }
+    char full[1024];
+    snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
+    loaded += fy_add_file(c, full);
+  }
+  closedir(d);
+  return loaded;
+}
+#endif
+
+static const char *fy_rules_dir(void) {
+  const char *e = getenv("EDR_YARA_RULES_DIR");
+  if (e && e[0]) {
+    return e;
+  }
+  const EdrConfig *cfg = edr_command_get_config();
+  if (cfg && cfg->command.forensic_yara_rules_dir[0]) {
+    return cfg->command.forensic_yara_rules_dir;
+  }
+  return "rules/forensic";
+}
+
+/* 懒加载并编译规则。返回 1=规则可用，0=不可用（调用方回退子串匹配）。 */
+static int fy_ensure_rules(void) {
+  if (s_fy_loaded && s_fy_rules) {
+    return 1;
+  }
+  if (!s_fy_initialized) {
+    if (yr_initialize() != ERROR_SUCCESS) {
+      return 0;
+    }
+    s_fy_initialized = 1;
+  }
+  YR_COMPILER *c = NULL;
+  if (yr_compiler_create(&c) != ERROR_SUCCESS || !c) {
+    return 0;
+  }
+  yr_compiler_set_callback(c, fy_compiler_error_cb, NULL);
+  int loaded = fy_add_dir(c, fy_rules_dir());
+  if (loaded <= 0) {
+    yr_compiler_destroy(c);
+    return 0;
+  }
+  YR_RULES *rules = NULL;
+  if (yr_compiler_get_rules(c, &rules) != ERROR_SUCCESS || !rules) {
+    yr_compiler_destroy(c);
+    return 0;
+  }
+  yr_compiler_destroy(c);
+  if (s_fy_rules) {
+    yr_rules_destroy(s_fy_rules);
+  }
+  s_fy_rules = rules;
+  s_fy_loaded = 1;
+  return 1;
+}
+
+/* 用真引擎扫描文件（拿不到文件时回退内存缓冲）。
+ * 返回 1=已用真引擎并将结果写入 out；0=引擎不可用，需回退子串匹配。 */
+static int fy_scan(const char *target_path, const uint8_t *buf, size_t len, char *out, size_t cap) {
+  if (!fy_ensure_rules()) {
+    return 0;
+  }
+  ForensicYaraResult res;
+  memset(&res, 0, sizeof(res));
+  int rc = ERROR_INTERNAL_FATAL_ERROR;
+  if (target_path && target_path[0]) {
+    rc = yr_rules_scan_file(s_fy_rules, target_path, 0, fy_scan_cb, &res, 0);
+  }
+  if (rc != ERROR_SUCCESS && buf && len > 0u) {
+    rc = yr_rules_scan_mem(s_fy_rules, buf, len, 0, fy_scan_cb, &res, 0);
+  }
+  if (rc != ERROR_SUCCESS) {
+    return 0;
+  }
+  if (res.count > 0) {
+    char rl[640];
+    rl[0] = '\0';
+    for (int i = 0; i < res.count; i++) {
+      if (rl[0]) {
+        strncat(rl, ",", sizeof(rl) - strlen(rl) - 1);
+      }
+      strncat(rl, res.rules[i], sizeof(rl) - strlen(rl) - 1);
+    }
+    snprintf(out, cap, "YARA_HIT path=%s engine=yara count=%d rules=[%s]",
+             target_path ? target_path : "(mem)", res.count, rl);
+  } else {
+    snprintf(out, cap, "YARA_CLEAN path=%s engine=yara", target_path ? target_path : "(mem)");
+  }
+  return 1;
+}
+#endif /* EDR_HAVE_YARA */
+
 /* ── Forensic Actions ── */
 
 /* 取证外移门控:默认关闭(保持 in-process 现状,不破坏)。
@@ -647,6 +847,18 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   fclose(f);
 
   char result[1024];
+#ifdef EDR_HAVE_YARA
+  /* 真引擎优先：libyara 编译 rules 目录并扫描；不可用（无规则/加载失败）则回退下方子串匹配。 */
+  if (fy_scan(target_path, buf, (size_t)fsz, result, sizeof(result))) {
+    free(buf);
+    edr_cmd_inc_handled();
+    edr_cmd_inc_exec_ok();
+    edr_command_audit_both(cmd_id, "yara_scan: ok (engine=yara)");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    return;
+  }
+#endif
+  /* 降级：内置子串匹配（无 libyara 或无规则时）。结果标 engine=builtin 以便区分。 */
   int matches = 0;
   const char *patterns[] = {
     "MZ", "PE\0\0", "This program cannot be run",
@@ -669,11 +881,11 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   free(buf);
 
   if (matches > 0) {
-    snprintf(result, sizeof(result), "YARA_HIT path=%s matches=%d patterns=[%s]", target_path, matches, hitBuf);
+    snprintf(result, sizeof(result), "YARA_HIT path=%s engine=builtin matches=%d patterns=[%s]", target_path, matches, hitBuf);
   } else {
-    snprintf(result, sizeof(result), "YARA_CLEAN path=%s", target_path);
+    snprintf(result, sizeof(result), "YARA_CLEAN path=%s engine=builtin", target_path);
   }
   edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
-  edr_command_audit_both(cmd_id, "yara_scan: ok");
+  edr_command_audit_both(cmd_id, "yara_scan: ok (engine=builtin)");
   edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
 }
