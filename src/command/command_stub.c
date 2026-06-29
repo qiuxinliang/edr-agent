@@ -48,6 +48,10 @@
 #include <sddl.h>
 #include <tlhelp32.h>
 #include <winevt.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <mscat.h>
+#pragma comment(lib, "wintrust.lib")
 #else
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -3273,6 +3277,87 @@ static void do_rtr_list_connections(const char *cmd_id, const uint8_t *pl, size_
 
 /* 主机显微镜：枚举指定进程已加载的模块（Win: Toolhelp 模块快照；Linux: /proc/pid/maps 可执行映射）。
  * 镜像 do_registry_query：落 JSON 产物 + SHA-256 + 上传 + soar_emit_ex 带 artifacts。只读巡检，沿用 dangerous 门控。 */
+#ifdef _WIN32
+/* 真 Authenticode 验签：先验内嵌签名，再查系统目录（catalog，多数 OS DLL 无内嵌签名）。
+ * 返回 1=已签名且受信任，0=确定未签名/不受信任，-1=无法判定（默认保守，前端按"未知"处理，绝不误报未签名）。
+ * 兼容 SHA256（Win8+ CryptCATAdminAcquireContext2）与 SHA1 旧 catalog。禁用网络吊销检查以加速。 */
+static int win_file_signed(const char *path) {
+  if (!path || !path[0]) {
+    return -1;
+  }
+  wchar_t wpath[1024];
+  if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024) == 0) {
+    return -1;
+  }
+  /* 1) 内嵌签名 */
+  WINTRUST_FILE_INFO fi;
+  memset(&fi, 0, sizeof(fi));
+  fi.cbStruct = sizeof(fi);
+  fi.pcwszFilePath = wpath;
+  GUID gv = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+  WINTRUST_DATA wd;
+  memset(&wd, 0, sizeof(wd));
+  wd.cbStruct = sizeof(wd);
+  wd.dwUIChoice = WTD_UI_NONE;
+  wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+  wd.dwUnionChoice = WTD_CHOICE_FILE;
+  wd.pFile = &fi;
+  wd.dwStateAction = WTD_STATEACTION_VERIFY;
+  wd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+  LONG st = WinVerifyTrust(NULL, &gv, &wd);
+  wd.dwStateAction = WTD_STATEACTION_CLOSE;
+  WinVerifyTrust(NULL, &gv, &wd);
+  if (st == 0) {
+    return 1; /* ERROR_SUCCESS：内嵌签名受信任 */
+  }
+  int embedded_nosig = ((unsigned long)st == 0x800B0100UL); /* TRUST_E_NOSIGNATURE */
+  /* 2) 系统 catalog 验签 */
+  HANDLE hf = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (hf == INVALID_HANDLE_VALUE) {
+    return -1;
+  }
+  HCATADMIN hca = NULL;
+  BYTE *hash = NULL;
+  DWORD hlen = 0;
+  int hashed = 0;
+  if (CryptCATAdminAcquireContext2(&hca, NULL, L"SHA256", NULL, 0)) {
+    CryptCATAdminCalcHashFromFileHandle2(hca, hf, &hlen, NULL, 0);
+    if (hlen > 0 && (hash = (BYTE *)malloc(hlen)) != NULL &&
+        CryptCATAdminCalcHashFromFileHandle2(hca, hf, &hlen, hash, 0)) {
+      hashed = 1;
+    }
+  }
+  if (!hashed) {
+    if (hca) { CryptCATAdminReleaseContext(hca, 0); hca = NULL; }
+    free(hash); hash = NULL; hlen = 0;
+    if (CryptCATAdminAcquireContext(&hca, NULL, 0)) {
+      CryptCATAdminCalcHashFromFileHandle(hf, &hlen, NULL, 0);
+      if (hlen > 0 && (hash = (BYTE *)malloc(hlen)) != NULL &&
+          CryptCATAdminCalcHashFromFileHandle(hf, &hlen, hash, 0)) {
+        hashed = 1;
+      }
+    }
+  }
+  int result = -1;
+  if (hashed && hca) {
+    HCATINFO hci = CryptCATAdminEnumCatalogFromHash(hca, hash, hlen, 0, NULL);
+    if (hci) {
+      result = 1; /* 命中系统 catalog → OS 受信任 */
+      CryptCATAdminReleaseCatalogContext(hca, hci, 0);
+    } else {
+      result = embedded_nosig ? 0 : -1; /* 仅在内嵌确为无签名且不在 catalog 时判未签名 */
+    }
+  }
+  free(hash);
+  if (hca) {
+    CryptCATAdminReleaseContext(hca, 0);
+  }
+  CloseHandle(hf);
+  return result;
+}
+#endif
+
 static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
@@ -3331,11 +3416,16 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
         if (count >= max_modules) {
           break;
         }
-        char nmj[600], pthj2[1100], obj[1900];
+        char nmj[600], pthj2[1100], obj[1960];
         json_escape_to(nmj, sizeof(nmj), me.szModule);
         json_escape_to(pthj2, sizeof(pthj2), me.szExePath);
-        snprintf(obj, sizeof(obj), "{\"name\":%s,\"path\":%s,\"base\":\"0x%llx\",\"size\":%lu}",
-                 nmj, pthj2, (unsigned long long)(size_t)me.modBaseAddr, (unsigned long)me.modBaseSize);
+        int sg = win_file_signed(me.szExePath); /* 1=signed 0=unsigned -1=unknown */
+        char sgf[24];
+        if (sg == 1) snprintf(sgf, sizeof(sgf), ",\"signed\":true");
+        else if (sg == 0) snprintf(sgf, sizeof(sgf), ",\"signed\":false");
+        else sgf[0] = '\0';
+        snprintf(obj, sizeof(obj), "{\"name\":%s,\"path\":%s,\"base\":\"0x%llx\",\"size\":%lu%s}",
+                 nmj, pthj2, (unsigned long long)(size_t)me.modBaseAddr, (unsigned long)me.modBaseSize, sgf);
         EDR_MOD_EMIT(obj);
       } while (Module32Next(snap, &me));
     }
@@ -3545,6 +3635,167 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
            "{\"count\":%d,\"inline_count\":%d,\"processes\":[%s],"
            "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
            count, inline_count, inline_procs, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  s_handled++;
+  if (upload_rc == 0) {
+    s_exec_ok++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+  } else {
+    s_exec_fail++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  }
+}
+
+/* 主机显微镜·持久化全景（类 Autoruns）：枚举常见自启动位置 → 扁平 {type,name,command,location} 行。
+ * Win：Run/RunOnce 注册表 + 计划任务 + 启动项；Linux：cron + systemd + rc.local + autostart。
+ * 只读巡检，沿用 dangerous 门控；镜像 do_list_modules 的产物+内联+上传结构。 */
+static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
+                             const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject list_autoruns: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  int max_rows = parse_int_json_default(pl, len, "max_rows", 500);
+  if (max_rows <= 0 || max_rows > 2000) {
+    max_rows = 500;
+  }
+  char path[900];
+  command_artifact_path(cmd_id, "autoruns", "json", path, sizeof(path));
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create autoruns artifact");
+    return;
+  }
+  fputs("{\"autoruns\":[\n", f);
+  int count = 0;
+  char inl[24000];
+  size_t io = 0;
+  int inl_n = 0;
+  inl[0] = '\0';
+#define EDR_AR_EMIT(obj)                                                               \
+  do {                                                                                 \
+    if (count) fputs(",\n", f);                                                        \
+    fputs((obj), f);                                                                   \
+    size_t _ol = strlen(obj);                                                          \
+    if (io + _ol + 2u < sizeof(inl)) {                                                 \
+      if (inl_n) { inl[io++] = ','; }                                                  \
+      memcpy(inl + io, (obj), _ol);                                                    \
+      io += _ol;                                                                       \
+      inl[io] = '\0';                                                                  \
+      inl_n++;                                                                         \
+    }                                                                                  \
+    count++;                                                                           \
+  } while (0)
+#ifdef _WIN32
+  {
+    static const struct { HKEY root; const char *sub; const char *label; } RUN_KEYS[] = {
+      { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\...\\Run" },
+      { HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKLM\\...\\RunOnce" },
+      { HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKCU\\...\\Run" },
+      { HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKCU\\...\\RunOnce" },
+      { HKEY_LOCAL_MACHINE, "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Wow6432\\Run" },
+    };
+    for (size_t ki = 0; ki < sizeof(RUN_KEYS) / sizeof(RUN_KEYS[0]) && count < max_rows; ki++) {
+      HKEY hk;
+      if (RegOpenKeyExA(RUN_KEYS[ki].root, RUN_KEYS[ki].sub, 0, KEY_READ, &hk) != ERROR_SUCCESS) {
+        continue;
+      }
+      for (DWORD idx = 0; count < max_rows; idx++) {
+        char name[512];
+        BYTE data[4096];
+        DWORD ns = sizeof(name), ds = sizeof(data), type = 0;
+        LONG lr = RegEnumValueA(hk, idx, name, &ns, NULL, &type, data, &ds);
+        if (lr != ERROR_SUCCESS) {
+          break;
+        }
+        if (type != REG_SZ && type != REG_EXPAND_SZ) {
+          continue;
+        }
+        char cmd[4096];
+        DWORD cl = ds < (DWORD)(sizeof(cmd) - 1) ? ds : (DWORD)(sizeof(cmd) - 1);
+        memcpy(cmd, data, cl);
+        cmd[cl] = '\0'; /* REG_SZ data 末尾含 NUL；此处再兜底终止 */
+        char nmj[700], cmj[4200], locj[200], obj[5400];
+        json_escape_to(nmj, sizeof(nmj), name);
+        json_escape_to(cmj, sizeof(cmj), cmd);
+        json_escape_to(locj, sizeof(locj), RUN_KEYS[ki].label);
+        snprintf(obj, sizeof(obj), "{\"type\":\"run_key\",\"name\":%s,\"command\":%s,\"location\":%s}", nmj, cmj, locj);
+        EDR_AR_EMIT(obj);
+      }
+      RegCloseKey(hk);
+    }
+    /* 计划任务 + 启动项（best-effort，经 popen）。 */
+    static const struct { const char *cmd; const char *type; const char *loc; } WIN_CMDS[] = {
+      { "schtasks /query /fo csv /nh 2>nul", "scheduled_task", "schtasks" },
+      { "wmic startup get Caption,Command /format:csv 2>nul", "startup_item", "wmic_startup" },
+    };
+    for (size_t ci = 0; ci < sizeof(WIN_CMDS) / sizeof(WIN_CMDS[0]) && count < max_rows; ci++) {
+      FILE *p = _popen(WIN_CMDS[ci].cmd, "r");
+      if (!p) { continue; }
+      char line[2048];
+      while (fgets(line, sizeof(line), p) && count < max_rows) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!line[0]) { continue; }
+        char lj[2200], tj[64], loj[64], obj[2500];
+        json_escape_to(lj, sizeof(lj), line);
+        json_escape_to(tj, sizeof(tj), WIN_CMDS[ci].type);
+        json_escape_to(loj, sizeof(loj), WIN_CMDS[ci].loc);
+        snprintf(obj, sizeof(obj), "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}", tj, lj, lj, loj);
+        EDR_AR_EMIT(obj);
+      }
+      _pclose(p);
+    }
+  }
+#else
+  {
+    static const struct { const char *cmd; const char *type; const char *loc; } NIX_CMDS[] = {
+      { "crontab -l 2>/dev/null", "cron", "user_crontab" },
+      { "ls -1 /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly 2>/dev/null", "cron_system", "/etc/cron.*" },
+      { "systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | head -300", "systemd", "systemd_enabled" },
+      { "cat /etc/rc.local 2>/dev/null", "rc_local", "/etc/rc.local" },
+      { "ls -1 ~/.config/autostart /etc/xdg/autostart 2>/dev/null", "autostart", "autostart" },
+    };
+    for (size_t ci = 0; ci < sizeof(NIX_CMDS) / sizeof(NIX_CMDS[0]) && count < max_rows; ci++) {
+      FILE *p = popen(NIX_CMDS[ci].cmd, "r");
+      if (!p) { continue; }
+      char line[2048];
+      while (fgets(line, sizeof(line), p) && count < max_rows) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!line[0] || line[0] == '#') { continue; }
+        char lj[2200], tj[64], loj[64], obj[2500];
+        json_escape_to(lj, sizeof(lj), line);
+        json_escape_to(tj, sizeof(tj), NIX_CMDS[ci].type);
+        json_escape_to(loj, sizeof(loj), NIX_CMDS[ci].loc);
+        snprintf(obj, sizeof(obj), "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}", tj, lj, lj, loj);
+        EDR_AR_EMIT(obj);
+      }
+      pclose(p);
+    }
+  }
+#endif
+#undef EDR_AR_EMIT
+  fprintf(f, "\n],\"total\":%d}\n", count);
+  fclose(f);
+  char sha[65];
+  sha[0] = '\0';
+  (void)file_sha256_hex(path, sha);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "autoruns", path, sha,
+                                               minio_key, sizeof(minio_key));
+  char pathj[1200], minioj[1200], artifacts[3200], detail[26000];
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(minioj, sizeof(minioj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"autoruns\",\"path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  snprintf(detail, sizeof(detail),
+           "{\"count\":%d,\"inline_count\":%d,\"autoruns\":[%s],"
+           "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
+           count, inl_n, inl, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
   s_handled++;
   if (upload_rc == 0) {
     s_exec_ok++;
@@ -3905,6 +4156,7 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY") ||
          streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES") ||
          streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT") ||
+         streq(t, "list_autoruns") || streq(t, "autoruns") || streq(t, "RTR_AUTORUNS") ||
          is_rtr_shell_command_type(t);
 }
 
@@ -4258,6 +4510,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT")) {
     do_host_process_tree(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "list_autoruns") || streq(t, "autoruns") || streq(t, "RTR_AUTORUNS")) {
+    do_list_autoruns(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "rtr_file_stat") || streq(t, "file_stat") || streq(t, "RTR_FILE_STAT")) {
