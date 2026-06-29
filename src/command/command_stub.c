@@ -46,6 +46,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <sddl.h>
+#include <tlhelp32.h>
 #include <winevt.h>
 #else
 #include <arpa/inet.h>
@@ -54,6 +55,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -2378,12 +2380,22 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
 }
 #else
 static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) {
-  (void)channel;
   if (max_events <= 0) {
     max_events = 100;
   }
-  char cmd[160];
-  snprintf(cmd, sizeof(cmd), "journalctl --output=json -n %d 2>/dev/null", max_events);
+  /* 把 Windows 风格 channel 映射到 journalctl 过滤，未识别时回退全量。 */
+  const char *filt = "";
+  if (channel && channel[0]) {
+    if (strcasecmp(channel, "Security") == 0) {
+      filt = " SYSLOG_FACILITY=10 SYSLOG_FACILITY=4"; /* authpriv / auth */
+    } else if (strcasecmp(channel, "System") == 0) {
+      filt = " -k"; /* 内核日志 */
+    } else if (strcasecmp(channel, "Application") == 0) {
+      filt = " SYSLOG_FACILITY=1 SYSLOG_FACILITY=3"; /* user / daemon */
+    }
+  }
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), "journalctl --output=json -n %d%s 2>/dev/null", max_events, filt);
   FILE *p = popen(cmd, "r");
   if (!p) {
     return -1;
@@ -3259,6 +3271,130 @@ static void do_rtr_list_connections(const char *cmd_id, const uint8_t *pl, size_
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
+/* 主机显微镜：枚举指定进程已加载的模块（Win: Toolhelp 模块快照；Linux: /proc/pid/maps 可执行映射）。
+ * 镜像 do_registry_query：落 JSON 产物 + SHA-256 + 上传 + soar_emit_ex 带 artifacts。只读巡检，沿用 dangerous 门控。 */
+static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
+                            const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject list_modules: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  long pid = -1;
+  if (parse_pid_json(pl, len, &pid) != 0 || pid <= 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid payload");
+    return;
+  }
+  int max_modules = parse_int_json_default(pl, len, "max_modules", 200);
+  if (max_modules <= 0 || max_modules > 1000) {
+    max_modules = 200;
+  }
+  char path[900];
+  command_artifact_path(cmd_id, "modules", "json", path, sizeof(path));
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create modules artifact");
+    return;
+  }
+  fprintf(f, "{\"pid\":%ld,\"modules\":[\n", pid);
+  int count = 0;
+#ifdef _WIN32
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, (DWORD)pid);
+  if (snap != INVALID_HANDLE_VALUE) {
+    MODULEENTRY32 me;
+    me.dwSize = sizeof(me);
+    if (Module32First(snap, &me)) {
+      do {
+        if (count >= max_modules) {
+          break;
+        }
+        if (count) {
+          fputs(",\n", f);
+        }
+        fputs("{\"name\":\"", f);
+        fprint_json_escaped(f, me.szModule);
+        fputs("\",\"path\":\"", f);
+        fprint_json_escaped(f, me.szExePath);
+        fprintf(f, "\",\"base\":\"0x%llx\",\"size\":%lu}",
+                (unsigned long long)(size_t)me.modBaseAddr, (unsigned long)me.modBaseSize);
+        count++;
+      } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+  }
+#else
+  char maps[64];
+  snprintf(maps, sizeof(maps), "/proc/%ld/maps", pid);
+  FILE *mp = fopen(maps, "r");
+  if (mp) {
+    char line[4096];
+    char prevpath[512];
+    prevpath[0] = '\0';
+    while (fgets(line, sizeof(line), mp) && count < max_modules) {
+      unsigned long long a0 = 0, a1 = 0;
+      char perms[8] = {0};
+      char pathbuf[512] = {0};
+      /* maps 行格式：addr_start-addr_end perms offset dev inode pathname */
+      if (sscanf(line, "%llx-%llx %7s %*s %*s %*s %511[^\n]", &a0, &a1, perms, pathbuf) >= 3) {
+        char *pp = pathbuf;
+        while (*pp == ' ' || *pp == '\t') {
+          pp++;
+        }
+        if (pp[0] != '/') {
+          continue; /* 仅文件映射的模块 */
+        }
+        if (!strchr(perms, 'x')) {
+          continue; /* 仅可执行映射 */
+        }
+        if (strcmp(pp, prevpath) == 0) {
+          continue; /* 相邻段去重（同一映像多段连续出现） */
+        }
+        snprintf(prevpath, sizeof(prevpath), "%s", pp);
+        if (count) {
+          fputs(",\n", f);
+        }
+        fputs("{\"path\":\"", f);
+        fprint_json_escaped(f, pp);
+        fprintf(f, "\",\"base\":\"0x%llx\",\"perms\":\"%s\"}", a0, perms);
+        count++;
+      }
+    }
+    fclose(mp);
+  }
+#endif
+  fprintf(f, "\n],\"total\":%d}\n", count);
+  fclose(f);
+  char sha[65];
+  sha[0] = '\0';
+  (void)file_sha256_hex(path, sha);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "modules", path, sha,
+                                               minio_key, sizeof(minio_key));
+  char pathj[1200], minioj[1200], artifacts[3200], detail[4096];
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(minioj, sizeof(minioj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"modules\",\"path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  snprintf(detail, sizeof(detail),
+           "{\"pid\":%ld,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}",
+           pid, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  s_handled++;
+  if (upload_rc == 0) {
+    s_exec_ok++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+  } else {
+    s_exec_fail++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  }
+}
+
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
@@ -3607,6 +3743,7 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN") ||
          streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG") ||
          streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY") ||
+         streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES") ||
          is_rtr_shell_command_type(t);
 }
 
@@ -3952,6 +4089,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "rtr_list_connections") || streq(t, "RTR_LIST_CONNECTIONS")) {
     do_rtr_list_connections(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES")) {
+    do_list_modules(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "rtr_file_stat") || streq(t, "file_stat") || streq(t, "RTR_FILE_STAT")) {
