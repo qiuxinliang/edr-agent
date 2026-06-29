@@ -236,6 +236,14 @@ if ($Action -eq "Remove") {
     } catch {}
   }
   Reset-InstallDirAcl -Dir $instDir
+  foreach ($n in @(
+      "EDR_FORENSIC_COLLECTOR",
+      "EDR_FORENSIC_COLLECTOR_BIN",
+      "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
+      "EDR_VELOCIRAPTOR_BIN",
+      "EDR_FORENSIC_COLLECTOR_AUTOFETCH")) {
+    try { [Environment]::SetEnvironmentVariable($n, $null, "Machine") } catch {}
+  }
   exit 0
 }
 
@@ -263,6 +271,19 @@ if ($HardenAcl) {
 Repair-RuntimeDependencyAcls -Dir $instDir
 Repair-SensitiveRuntimeAcls -Dir $instDir
 Set-AgentTomlAcl -Path $cfg
+
+# --- 取证采集器启用(非 bundled / autorun 安装链) ---
+# 与 windows_service_install.ps1 对齐:启用外置采集 + 本地 bin 路径 + 按需下载。
+# manifest 地址由 agent 启动时从 agent.toml 的 rest_base_url 自动推导,无需在此设置。
+try {
+  [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR", "1", "Machine")
+  [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BIN", (Join-Path $instDir "collector\forensic_collector.exe"), "Machine")
+  [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", (Join-Path $instDir "collector\forensic_collector_builtin.exe"), "Machine")
+  [Environment]::SetEnvironmentVariable("EDR_VELOCIRAPTOR_BIN", (Join-Path $instDir "collector\velociraptor.exe"), "Machine")
+  [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_AUTOFETCH", "1", "Machine")
+} catch {
+  Write-Warning "设置取证采集器环境变量失败(非致命): $_"
+}
 Repair-ExecutableAcl -Path $exe
 
 $launcher = Write-TaskLauncher -Exe $exe -Config $cfg -Dir $instDir

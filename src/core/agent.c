@@ -1225,6 +1225,52 @@ void edr_agent_destroy(EdrAgent *agent) {
   free(agent);
 }
 
+/* 取证采集器按需下载:若未显式配置 manifest 地址,则从平台 REST base 自动推导,
+ * 使 velo 按需下载在 bundled/非 bundled/手动部署下都自动生效(无需安装器塞 env)。
+ * rest_base_url 形如 http://host:port/api/v1 →
+ *   <base>/agent/forensic-collector/manifest?kind=velociraptor&os=<os>&arch=<arch>
+ * os/arch 取编译期常量(agent 二进制架构即宿主架构)。已显式设置 env 时不覆盖。 */
+static void edr_agent_derive_forensic_manifest_env(const EdrConfig *cfg) {
+  if (getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL")) {
+    return;
+  }
+  if (!cfg) {
+    return;
+  }
+  const char *base = cfg->platform.rest_base_url;
+  if (!base || !base[0]) {
+    return;
+  }
+#if defined(_WIN32)
+  const char *os_str = "windows";
+#elif defined(__APPLE__)
+  const char *os_str = "darwin";
+#else
+  const char *os_str = "linux";
+#endif
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM)
+  const char *arch_str = "arm64";
+#else
+  const char *arch_str = "amd64";
+#endif
+  char trimmed[512];
+  snprintf(trimmed, sizeof(trimmed), "%s", base);
+  size_t n = strlen(trimmed);
+  while (n > 0 && trimmed[n - 1] == '/') {
+    trimmed[--n] = '\0';
+  }
+  char url[768];
+  snprintf(url, sizeof(url),
+           "%s/agent/forensic-collector/manifest?kind=velociraptor&os=%s&arch=%s",
+           trimmed, os_str, arch_str);
+#if defined(_WIN32)
+  _putenv_s("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url);
+#else
+  setenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, 0);
+#endif
+  fprintf(stderr, "[forensic] manifest auto-derived: %s\n", url);
+}
+
 EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   if (!agent) {
     return EDR_ERR_INVALID_ARG;
@@ -1262,6 +1308,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
     }
   }
   edr_self_protect_init();
+  edr_agent_derive_forensic_manifest_env(&agent->cfg);
   edr_adaptive_collection_configure(&agent->cfg);
   edr_agent_apply_event_filter_config(&agent->cfg);
   edr_resource_init(&agent->cfg);

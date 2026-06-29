@@ -46,10 +46,86 @@ static int dc_download(const char *url, const char *dest) {
   return system(cmd) == 0 ? 0 : -1;
 }
 
+/* 从小型 manifest JSON 中提取字符串字段 "key":"value"(value 不含转义)。成功返回 0。
+ * manifest 由本平台服务端产出且体量小,沿用 forensic_collector main.c 的手写扫描风格,不引 cJSON。 */
+static int dc_json_str(const char *json, const char *key, char *out, size_t cap) {
+  if (!json || !key || !out || cap == 0) return -1;
+  out[0] = '\0';
+  char needle[64];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *p = strstr(json, needle);
+  if (!p) return -1;
+  p += strlen(needle);
+  while (*p == ' ' || *p == ':' || *p == '\t') p++;
+  if (*p != '"') return -1; /* 仅取字符串值 */
+  p++;
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < cap) {
+    out[i++] = *p++;
+  }
+  out[i] = '\0';
+  return out[0] ? 0 : -1;
+}
+
+/* manifest 是否标记 enabled:true(粗匹配,容忍空格)。 */
+static int dc_json_enabled(const char *json) {
+  if (!json) return 0;
+  const char *p = strstr(json, "\"enabled\"");
+  if (!p) return 0;
+  p += 9;
+  while (*p == ' ' || *p == ':' || *p == '\t') p++;
+  return strncmp(p, "true", 4) == 0 ? 1 : 0;
+}
+
+/* 从平台固定地址拉取 manifest,解析出下载 url 与 sha256,下载到 dest。
+ * 成功返回 0 并把期望 sha256 写入 out_sha(65);失败返回非 0。
+ * manifest_url 由 EDR_FORENSIC_COLLECTOR_MANIFEST_URL 提供(installer 写入)。 */
+static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
+                                     char out_sha[65], char *detail, size_t detail_cap) {
+  if (!manifest_url || !manifest_url[0]) return -1;
+  char mf_path[1100];
+  snprintf(mf_path, sizeof(mf_path), "%s.mf.json", dest);
+  if (dc_download(manifest_url, mf_path) != 0) {
+    if (detail) snprintf(detail, detail_cap, "manifest fetch failed");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  FILE *f = fopen(mf_path, "rb");
+  if (!f) {
+    if (detail) snprintf(detail, detail_cap, "manifest read failed");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  char buf[4096];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  remove(mf_path);
+  buf[n] = '\0';
+
+  if (!dc_json_enabled(buf)) {
+    if (detail) snprintf(detail, detail_cap, "manifest disabled (no active collector)");
+    return EDR_DC_ERR_DISABLED;
+  }
+  char url[1024];
+  if (dc_json_str(buf, "url", url, sizeof(url)) != 0) {
+    if (detail) snprintf(detail, detail_cap, "manifest missing url");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  out_sha[0] = '\0';
+  (void)dc_json_str(buf, "sha256", out_sha, 65); /* 缺 sha 则后续按 env 或无 pin 处理 */
+  if (dc_download(url, dest) != 0) {
+    if (detail) snprintf(detail, detail_cap, "collector download failed (manifest url)");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  return EDR_DC_OK;
+}
+
 /* 解析 collector 路径并(可选)下载+验签。返回 0 可执行;EDR_DC_ERR_DOWNLOAD/SIGNATURE 失败。
  * 来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
- * 若文件缺失且 EDR_FORENSIC_COLLECTOR_URL 配置 → 下载;
- * 若 EDR_FORENSIC_COLLECTOR_SHA256 配置 → 执行前校验,失败拒绝执行。 */
+ * 文件缺失时的拉取优先级:
+ *   1) EDR_FORENSIC_COLLECTOR_URL(静态直链,向后兼容,最高优先);
+ *   2) 否则若 autofetch 开启(EDR_FORENSIC_COLLECTOR_AUTOFETCH != "0")且配置了
+ *      EDR_FORENSIC_COLLECTOR_MANIFEST_URL → 经平台固定地址 manifest 拉取(返回 sha256)。
+ * 验签优先级:EDR_FORENSIC_COLLECTOR_SHA256(env pin) > manifest sha256;
+ *   两者皆有则任一不匹配即拒绝执行。 */
 static int dc_resolve_verify(const char *spec_bin, const char *platform_default, char *out_path,
                              size_t cap, char *detail, size_t detail_cap) {
   const char *bin = (spec_bin && spec_bin[0]) ? spec_bin : NULL;
@@ -60,6 +136,9 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
   if (!bin) bin = platform_default;
   snprintf(out_path, cap, "%s", bin ? bin : "");
 
+  char manifest_sha[65];
+  manifest_sha[0] = '\0';
+
   if (!dc_file_exists(out_path)) {
     const char *url = getenv("EDR_FORENSIC_COLLECTOR_URL");
     if (url && url[0]) {
@@ -67,9 +146,20 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
         if (detail) snprintf(detail, detail_cap, "collector download failed");
         return EDR_DC_ERR_DOWNLOAD;
       }
+    } else {
+      const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
+      int autofetch = !(af && af[0] == '0'); /* 默认开,显式 "0" 关闭 */
+      const char *mf = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL");
+      if (autofetch && mf && mf[0]) {
+        int rc = dc_autofetch_via_manifest(mf, out_path, manifest_sha, detail, detail_cap);
+        if (rc != EDR_DC_OK) return rc;
+      }
     }
   }
   const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
+  if ((!want || !want[0]) && manifest_sha[0]) {
+    want = manifest_sha; /* env 未 pin 时用 manifest 的 sha256(纵深防御:下载后本地再校验) */
+  }
   if (want && want[0]) {
     char got[65];
     if (dc_sha256_file(out_path, got) != 0) {

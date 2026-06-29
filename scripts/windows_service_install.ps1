@@ -18,6 +18,7 @@ param(
   [string]$InstallDir = "C:\Program Files\FDSecurity",
   [string]$DataDir = "C:\Program Files\FDSecurity",
   [string]$Account = "LocalSystem",
+  [string]$PlatformBaseUrl = "",
   [switch]$SkipPreflight,
   [switch]$KeepOfflineQueue,
   [switch]$KeepEvidenceCache,
@@ -184,11 +185,18 @@ function Install-AgentService {
   Set-MachineEnv "EDR_UPLOAD_FILE_RETRY_BACKOFF_MS" "750"
   Set-MachineEnv "EDR_FORENSIC_OUT" (Join-Path $DataDir "forensic")
   # 启用外置取证采集器(forensic_collector.exe → Velociraptor;不可用时 agent 回退 C builtin,
-  # 再回退 in-process)。不设 STRICT(保留兜底),不设 URL(避免下载执行风险)。
+  # 再回退 in-process)。不设 STRICT(保留兜底)。
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR" "1"
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BIN" (Join-Path $InstallDir "collector\forensic_collector.exe")
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN" (Join-Path $InstallDir "collector\forensic_collector_builtin.exe")
   Set-MachineEnv "EDR_VELOCIRAPTOR_BIN" (Join-Path $InstallDir "collector\velociraptor.exe")
+  # 按需下载:本地缺 velo 时,agent 经平台「固定地址」manifest 拉取 + SHA256 校验 + 执行。
+  # 默认开启;manifest 地址由 -PlatformBaseUrl 推导(留空则不自动下载,仅用安装包内置/手动部署的 velo)。
+  Set-MachineEnv "EDR_FORENSIC_COLLECTOR_AUTOFETCH" "1"
+  if ($PlatformBaseUrl) {
+    $base = $PlatformBaseUrl.TrimEnd('/')
+    Set-MachineEnv "EDR_FORENSIC_COLLECTOR_MANIFEST_URL" "$base/api/v1/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=amd64"
+  }
   Set-MachineEnv "EDR_CMD_AUDIT_PATH" (Join-Path $DataDir "logs\command_audit.log")
   Set-MachineEnv "EDR_SELF_PROTECT_PIDFILE" (Join-Path $DataDir "FDSensor.pid")
   Set-MachineEnv "EDR_ISOLATE_STAMP_PATH" (Join-Path $DataDir "isolation\isolated.stamp")
@@ -249,6 +257,8 @@ function Uninstall-AgentService {
       "EDR_FORENSIC_COLLECTOR_BIN",
       "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
       "EDR_VELOCIRAPTOR_BIN",
+      "EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+      "EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
       "EDR_CMD_AUDIT_PATH",
       "EDR_SELF_PROTECT_PIDFILE",
       "EDR_ISOLATE_STAMP_PATH",

@@ -10,9 +10,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# 目标架构(amd64|arm64):决定 STAGE 默认目录、Go 适配器/velo 取哪一份、输出 zip 名。
+ARCH="${EDR_BUNDLE_ARCH:-amd64}"
+case "$ARCH" in
+  amd64|arm64) ;;
+  *) echo "Error: EDR_BUNDLE_ARCH must be amd64 or arm64 (got: $ARCH)" >&2; exit 1 ;;
+esac
 STAGE_DIR="${EDR_BIN_DIR:-"$REPO_ROOT/edr-agent-win_2-2"}"
 EDR_AGENT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUT_NAME="${EDR_BUNDLE_ZIP_NAME:-EDRAgent-bundled-payload-win-amd64}"
+OUT_NAME="${EDR_BUNDLE_ZIP_NAME:-EDRAgent-bundled-payload-win-${ARCH}}"
 OUT_DIR="$SCRIPT_DIR/Output/${OUT_NAME}"
 ZIP_PATH="$SCRIPT_DIR/Output/${OUT_NAME}.zip"
 STRICT="${EDR_BUNDLE_STRICT:-0}"
@@ -122,36 +128,44 @@ if [[ -f "$SCRIPT_DIR/bundle_extra/BUNDLE_README.txt" ]]; then
 fi
 
 # --- 取证采集器 collector/ (装到 {app}\collector\ = C:\Program Files\FDSecurity\collector\) ---
-# 来源:
-#   forensic_collector.exe          ← Go 适配器:forensic-collector/build.sh windows (dist/win-amd64/)
-#   velociraptor.exe + LICENSE/SOURCE ← fetch_velociraptor.sh (collector_stage/)
+# 按架构(ARCH=amd64|arm64)取件:
+#   forensic_collector.exe          ← Go 适配器:forensic-collector/build.sh (dist/win-<ARCH>/)
 #   forensic_collector_builtin.exe  ← CMake target(C baseline);从 STAGE_DIR 取(发布 CI 同 FDSensor 一起 stage)
-# 任一缺失仅 Warning(非 strict):agent 在该层不可用时自动回退下一层,最终 in-process 兜底。
+#   velociraptor.exe + LICENSE/SOURCE ← fetch_velociraptor.sh (collector_stage/<ARCH>/)
+# velo 体积大:**默认不内置**(平台自托管 + agent 按需下载是主路径);
+# 仅 EDR_BUNDLE_VELO=1 时才内置(离线/无平台连通场景)。adapter+builtin 始终内置(小)。
+# 任一缺失仅 Warning(非 strict):agent 三层兜底(velo→builtin→in-process)。
+BUNDLE_VELO="${EDR_BUNDLE_VELO:-0}"
 COLLECTOR_OUT="$OUT_DIR/collector"
 mkdir -p "$COLLECTOR_OUT"
-GO_FC="${EDR_FORENSIC_COLLECTOR_BIN:-$EDR_AGENT_DIR/../forensic-collector/dist/win-amd64/forensic_collector.exe}"
-VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}"
+GO_FC="${EDR_FORENSIC_COLLECTOR_BIN:-$EDR_AGENT_DIR/../forensic-collector/dist/win-${ARCH}/forensic_collector.exe}"
+VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}/${ARCH}"
 if [[ -f "$GO_FC" ]]; then
   cp -a "$GO_FC" "$COLLECTOR_OUT/forensic_collector.exe"
 else
-  echo "Warning: missing Go forensic_collector.exe ($GO_FC); run forensic-collector/build.sh windows. Agent will fall back to builtin/in-process." >&2
+  echo "Warning: [$ARCH] missing Go forensic_collector.exe ($GO_FC); run forensic-collector/build.sh ${ARCH}. Agent falls back to builtin/in-process." >&2
 fi
 if [[ -f "$STAGE_DIR/forensic_collector_builtin.exe" ]]; then
   cp -a "$STAGE_DIR/forensic_collector_builtin.exe" "$COLLECTOR_OUT/"
 else
-  echo "Warning: missing forensic_collector_builtin.exe in STAGE_DIR; C-baseline fallback will be unavailable." >&2
+  echo "Warning: [$ARCH] missing forensic_collector_builtin.exe in STAGE_DIR; C-baseline fallback unavailable." >&2
 fi
-if [[ -f "$VELO_STAGE/velociraptor.exe" ]]; then
-  cp -a "$VELO_STAGE/velociraptor.exe" "$COLLECTOR_OUT/"
-  # AGPL 合规件必须随 velociraptor.exe 一起分发;有 velo 无许可即视为打包错误。
-  if [[ -f "$VELO_STAGE/velociraptor.LICENSE.txt" && -f "$VELO_STAGE/velociraptor.SOURCE.txt" ]]; then
-    cp -a "$VELO_STAGE/velociraptor.LICENSE.txt" "$VELO_STAGE/velociraptor.SOURCE.txt" "$COLLECTOR_OUT/"
+if [[ "$BUNDLE_VELO" == "1" ]]; then
+  if [[ -f "$VELO_STAGE/velociraptor.exe" ]]; then
+    cp -a "$VELO_STAGE/velociraptor.exe" "$COLLECTOR_OUT/"
+    # AGPL 合规件必须随 velociraptor.exe 一起分发;有 velo 无许可即视为打包错误。
+    if [[ -f "$VELO_STAGE/velociraptor.LICENSE.txt" && -f "$VELO_STAGE/velociraptor.SOURCE.txt" ]]; then
+      cp -a "$VELO_STAGE/velociraptor.LICENSE.txt" "$VELO_STAGE/velociraptor.SOURCE.txt" "$COLLECTOR_OUT/"
+    else
+      echo "Error: [$ARCH] EDR_BUNDLE_VELO=1 but AGPL LICENSE/SOURCE missing in $VELO_STAGE (run fetch_velociraptor.sh)" >&2
+      exit 1
+    fi
   else
-    echo "Error: velociraptor.exe present but AGPL LICENSE/SOURCE missing in $VELO_STAGE (run fetch_velociraptor.sh)" >&2
+    echo "Error: [$ARCH] EDR_BUNDLE_VELO=1 but velociraptor.exe missing ($VELO_STAGE/velociraptor.exe); run fetch_velociraptor.sh EDR_VELO_ARCHES=$ARCH" >&2
     exit 1
   fi
 else
-  echo "Warning: missing velociraptor.exe ($VELO_STAGE/velociraptor.exe); run fetch_velociraptor.sh. Velo-tier forensics disabled; agent uses builtin/in-process." >&2
+  echo "Info: [$ARCH] velociraptor 未内置(默认按需下载);如需内置离线包设 EDR_BUNDLE_VELO=1。" >&2
 fi
 # collector 目录若为空则移除,避免空目录入包
 rmdir "$COLLECTOR_OUT" 2>/dev/null || true

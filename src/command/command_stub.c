@@ -13,6 +13,7 @@
 #include "edr/command.h"
 #include "edr/command_state.h"
 #include "edr/command_util.h"
+#include "edr/deep_collector.h"
 #include "edr/ave.h"
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
@@ -3637,6 +3638,94 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 }
 
+/* 主机显微镜·Velociraptor 富数据（V1：进程）。调外部采集器 query 模式跑 VQL → JSONL 行 →
+ * 适配器写 out-file 为 {source,artifact,rows:[...],total}；本命令读回并内联回流（前端 extractRecords 取 rows）。
+ * 只读、沿用 dangerous 门控；不自动回退（前端有"数据源"手动开关）。 */
+static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject velo_query: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  long pid = -1;
+  (void)parse_pid_json(pl, len, &pid); /* 可选 */
+  int limit = parse_int_json_default(pl, len, "limit", 150);
+  if (limit <= 0 || limit > 1000) {
+    limit = 150;
+  }
+  char scope[64];
+  if (parse_json_string_field(pl, len, "scope", scope, sizeof(scope)) != 0 || !scope[0]) {
+    snprintf(scope, sizeof(scope), "%s", "inspect_process");
+  }
+  /* 白名单 inspect scope，避免任意 scope/VQL 透传（V1.x: 进程/模块/网络）。 */
+  if (strcmp(scope, "inspect_process") != 0 && strcmp(scope, "inspect_modules") != 0 &&
+      strcmp(scope, "inspect_netstat") != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "unsupported velo scope (allow: inspect_process/modules/netstat)");
+    return;
+  }
+  char reqpath[900], rowspath[900];
+  command_artifact_path(cmd_id, "veloreq", "json", reqpath, sizeof(reqpath));
+  command_artifact_path(cmd_id, "velorows", "json", rowspath, sizeof(rowspath));
+  {
+    FILE *rf = fopen(reqpath, "w");
+    if (!rf) {
+      s_exec_fail++;
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create velo request file");
+      return;
+    }
+    fprintf(rf, "{\"scope\":\"%s\",\"pid\":%ld,\"limit\":%d}", scope, pid, limit);
+    fclose(rf);
+  }
+  char extra[2048];
+  snprintf(extra, sizeof(extra), "--mode=query --request=%s --out-file=%s --limit=%d", reqpath, rowspath, limit);
+  EdrCollectorRunSpec spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.scope = scope;
+  spec.output_dir = ".";
+  spec.extra_args = extra;
+  spec.timeout_s = 60u;
+  char dc_detail[512];
+  dc_detail[0] = '\0';
+  int rc = edr_deep_collector_run_blocking(&spec, dc_detail, sizeof(dc_detail));
+  (void)remove(reqpath);
+  if (rc == 5) {
+    s_exec_fail++;
+    audit_both(cmd_id, "velo_query: velociraptor 采集器未部署");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "velociraptor 采集器未部署（设 EDR_FORENSIC_COLLECTOR_BIN 或随包 velociraptor）");
+    return;
+  }
+  if (rc != 0 && rc != 2) {
+    s_exec_fail++;
+    char fail[640];
+    snprintf(fail, sizeof(fail), "velo_query failed rc=%d: %.560s", rc, dc_detail);
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+    return;
+  }
+  /* 读回适配器产出的 {source,artifact,rows:[...],total}，内联回流（前端 extractRecords 取 rows）。 */
+  char rows[30000];
+  size_t rn = 0;
+  {
+    FILE *rf = fopen(rowspath, "rb");
+    if (rf) {
+      rn = fread(rows, 1, sizeof(rows) - 1u, rf);
+      fclose(rf);
+    }
+    rows[rn] = '\0';
+  }
+  (void)remove(rowspath);
+  if (rn == 0u || rows[0] != '{') {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or invalid query output");
+    return;
+  }
+  s_handled++;
+  s_exec_ok++;
+  audit_both(cmd_id, "velo_query: ok");
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, rows, "ok", "[]");
+}
+
 /* 主机显微镜·持久化全景（类 Autoruns）：枚举常见自启动位置 → 扁平 {type,name,command,location} 行。
  * Win：Run/RunOnce 注册表 + 计划任务 + 启动项；Linux：cron + systemd + rc.local + autostart。
  * 只读巡检，沿用 dangerous 门控；镜像 do_list_modules 的产物+内联+上传结构。 */
@@ -4145,6 +4234,7 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES") ||
          streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT") ||
          streq(t, "list_autoruns") || streq(t, "autoruns") || streq(t, "RTR_AUTORUNS") ||
+         streq(t, "velo_query") || streq(t, "RTR_VELO_QUERY") ||
          is_rtr_shell_command_type(t);
 }
 
@@ -4502,6 +4592,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "list_autoruns") || streq(t, "autoruns") || streq(t, "RTR_AUTORUNS")) {
     do_list_autoruns(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "velo_query") || streq(t, "RTR_VELO_QUERY")) {
+    do_velo_query(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "rtr_file_stat") || streq(t, "file_stat") || streq(t, "RTR_FILE_STAT")) {
