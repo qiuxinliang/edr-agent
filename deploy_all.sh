@@ -28,11 +28,16 @@ cd "$AGENT_DIR/build"
 cmake .. -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -2
 make -j$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4) 2>&1 | tail -3
 
-# 部署采集器
-cp "$AGENT_DIR/scripts/forensic_collector" ./forensic_collector
-chmod +x ./forensic_collector
-echo "  + Agent 编译完成"
-echo "  + forensic_collector 已部署到 build/"
+# 取证采集器(已不再部署废弃的 scripts/forensic_collector bash stub)。
+#   - 主(Velociraptor 适配器): cd ../forensic-collector && ./build.sh host   产出 forensic_collector[.exe]
+#   - 兜底(C baseline):         CMake target 已随上面 make 构建为 build/forensic_collector_builtin
+#   - Windows 生产部署:         由 install/windows-inno 安装包装到 C:\Program Files\FDSecurity\collector\
+# dev 本机如需 velo 主路径,把 ../forensic-collector 构建产物放到 PATH 或设 EDR_FORENSIC_COLLECTOR_BIN。
+if [[ -x ./forensic_collector_builtin ]]; then
+  echo "  + Agent 编译完成 (含 C 兜底采集器 forensic_collector_builtin)"
+else
+  echo "  + Agent 编译完成"
+fi
 
 # ============================================================================
 # Part B: Backend (WS Relay)

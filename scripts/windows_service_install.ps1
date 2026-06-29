@@ -183,6 +183,12 @@ function Install-AgentService {
   Set-MachineEnv "EDR_UPLOAD_FILE_RETRIES" "3"
   Set-MachineEnv "EDR_UPLOAD_FILE_RETRY_BACKOFF_MS" "750"
   Set-MachineEnv "EDR_FORENSIC_OUT" (Join-Path $DataDir "forensic")
+  # 启用外置取证采集器(forensic_collector.exe → Velociraptor;不可用时 agent 回退 C builtin,
+  # 再回退 in-process)。不设 STRICT(保留兜底),不设 URL(避免下载执行风险)。
+  Set-MachineEnv "EDR_FORENSIC_COLLECTOR" "1"
+  Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BIN" (Join-Path $InstallDir "collector\forensic_collector.exe")
+  Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN" (Join-Path $InstallDir "collector\forensic_collector_builtin.exe")
+  Set-MachineEnv "EDR_VELOCIRAPTOR_BIN" (Join-Path $InstallDir "collector\velociraptor.exe")
   Set-MachineEnv "EDR_CMD_AUDIT_PATH" (Join-Path $DataDir "logs\command_audit.log")
   Set-MachineEnv "EDR_SELF_PROTECT_PIDFILE" (Join-Path $DataDir "FDSensor.pid")
   Set-MachineEnv "EDR_ISOLATE_STAMP_PATH" (Join-Path $DataDir "isolation\isolated.stamp")
@@ -239,6 +245,10 @@ function Uninstall-AgentService {
       "EDR_UPLOAD_FILE_RETRIES",
       "EDR_UPLOAD_FILE_RETRY_BACKOFF_MS",
       "EDR_FORENSIC_OUT",
+      "EDR_FORENSIC_COLLECTOR",
+      "EDR_FORENSIC_COLLECTOR_BIN",
+      "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
+      "EDR_VELOCIRAPTOR_BIN",
       "EDR_CMD_AUDIT_PATH",
       "EDR_SELF_PROTECT_PIDFILE",
       "EDR_ISOLATE_STAMP_PATH",

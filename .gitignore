@@ -11,6 +11,9 @@ install/windows-setup-ui/bin/
 install/windows-setup-ui/obj/
 install/windows-setup-ui/Output/
 
+# 取证采集器打包暂存(velociraptor.exe 等大体积/第三方件,由 fetch_velociraptor.sh 生成,不入库)。
+install/windows-inno/collector_stage/
+
 # Generated dependencies / virtualenvs / temporary workspaces.
 /.onnx_gen_deps/
 .venv*/

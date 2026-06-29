@@ -78,6 +78,15 @@ max_per_hour         = 20
 trigger_on_p0        = true
 collect_process_tree = true
 
+# 外置取证采集器(深度取证)——经环境变量配置,由 windows_service_install.ps1 在安装时写入机器级 env。
+# agent 走 getenv 读取,此处仅为部署说明(改这些值请改服务 env,不是改本 toml):
+#   EDR_FORENSIC_COLLECTOR=1                 启用外置采集(否则仅 in-process 兜底)
+#   EDR_FORENSIC_COLLECTOR_BIN=...\collector\forensic_collector.exe          主:Go 适配器→Velociraptor
+#   EDR_FORENSIC_COLLECTOR_BUILTIN_BIN=...\collector\forensic_collector_builtin.exe  兜底:C baseline(系统命令级)
+#   EDR_VELOCIRAPTOR_BIN=...\collector\velociraptor.exe                      官方 v0.77.1(未修改,AGPL 外部调用)
+#   EDR_FORENSIC_COLLECTOR_STRICT=1          (可选)外置失败不回退 in-process,默认不设
+# 采集层级:velo(主) → builtin(velo 不可用) → in-process(都不可用);产物经 agent transport v2 上传。
+
 [upload]
 batch_max_events     = 200
 batch_max_size_mb    = 2

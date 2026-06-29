@@ -66,6 +66,11 @@ typedef struct {
  * 同步 spawn + 等待(带超时) + 返回。绝不传 upload-url(agent 独占后端通道)。
  * 返回 0=成功(collector 退出码 0,产物已落地);<0=启动/超时/崩溃;>0=collector 非 0 退出码。
  * out_detail 写诊断(可为 NULL)。
+ *
+ * collector 退出码约定(与 Go 适配器 forensic-collector/main.go 对齐,供调用方做兜底判断):
+ *   0=成功; 2=带 warning 完成; 3=velociraptor 非0退出; 4=超时;
+ *   5=找不到 velociraptor(调用方据此回退 C baseline forensic_collector_builtin);
+ *   6=参数/请求错误; 7=适配器内部错误(打包等)。
  */
 int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec,
                                     char *out_detail, size_t detail_cap);

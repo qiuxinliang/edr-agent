@@ -306,13 +306,45 @@ static int forensic_external_run(const char *cmd_id, const char *scope, const ui
   spec.output_dir = outdir;
   spec.extra_args = extra;
   spec.timeout_s = 300u;
+
+  /* 第一级:Go 适配器(默认路径 forensic_collector[.exe])→ 调官方 Velociraptor。 */
   int rc = edr_deep_collector_run_blocking(&spec, detail, detail_cap);
+  const char *tier = "velo";
+
+  /* 第二级兜底:velo 不可用(rc==5,collector exitNoVelo)或启动/超时/崩溃(rc<0),
+   * 且非 STRICT 时,改调 C baseline(forensic_collector_builtin)。仍失败则由调用方回退 in-process。 */
+  if ((rc == 5 || rc < 0) && !forensic_external_required()) {
+    const char *bbin = getenv("EDR_FORENSIC_COLLECTOR_BUILTIN_BIN");
+    if (!bbin || !bbin[0]) {
+#ifdef _WIN32
+      bbin = "C:\\Program Files\\FDSecurity\\collector\\forensic_collector_builtin.exe";
+#else
+      bbin = "forensic_collector_builtin";
+#endif
+    }
+    spec.collector_bin = bbin;
+    char bdetail[512];
+    bdetail[0] = '\0';
+    int rc2 = edr_deep_collector_run_blocking(&spec, bdetail, sizeof(bdetail));
+    /* 采纳 builtin 结果(它就是兜底):成功直接用;失败也覆盖 rc,让调用方据此回退 in-process。 */
+    rc = rc2;
+    tier = "builtin";
+    if (detail && detail_cap) snprintf(detail, detail_cap, "%s", bdetail);
+  }
 
   (void)remove(reqpath);
 
   if (rc == 0 && do_upload) {
     if (minio_key && key_cap) minio_key[0] = '\0';
     (void)edr_transport_v2_upload_file(cmd_id, artifact, NULL, minio_key, key_cap);
+  }
+
+  /* 在 detail 末尾标注实际采集层级,便于审计/前端展示(velo|builtin)。 */
+  if (detail && detail_cap) {
+    size_t l = strlen(detail);
+    if (l + 12 < detail_cap) {
+      snprintf(detail + l, detail_cap - l, " [tier=%s]", tier);
+    }
   }
   return rc;
 }

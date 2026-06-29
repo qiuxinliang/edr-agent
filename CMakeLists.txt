@@ -456,10 +456,13 @@ if(WIN32)
   edr_apply_common_warnings(fd_installer_worker)
 endif()
 
-# 独立取证采集器：被 agent 的 deep_collector fork/CreateProcess 调用，仅 libc + 系统命令，无第三方依赖。
+# C baseline 取证采集器(系统命令级,仅 libc,无第三方依赖)。
+# 命名裁决:Go 适配器(forensic-collector/, 封装 Velociraptor)输出规范名 forensic_collector(.exe)为主;
+# 本 C target 输出 forensic_collector_builtin(.exe)作兜底,由 agent 在 velo 不可用时回退调用。
+# 二者部署到同一目录 C:\Program Files\FDSecurity\collector\,靠文件名区分。
 if(EDR_WITH_FORENSIC_COLLECTOR)
   add_executable(forensic_collector tools/forensic_collector/main.c)
-  set_target_properties(forensic_collector PROPERTIES OUTPUT_NAME "forensic_collector")
+  set_target_properties(forensic_collector PROPERTIES OUTPUT_NAME "forensic_collector_builtin")
   if(MSVC)
     target_compile_definitions(forensic_collector PRIVATE _CRT_SECURE_NO_WARNINGS)
   endif()

@@ -121,6 +121,41 @@ if [[ -f "$SCRIPT_DIR/bundle_extra/BUNDLE_README.txt" ]]; then
   cp -a "$SCRIPT_DIR/bundle_extra/BUNDLE_README.txt" "$OUT_DIR/BUNDLE_README.txt"
 fi
 
+# --- 取证采集器 collector/ (装到 {app}\collector\ = C:\Program Files\FDSecurity\collector\) ---
+# 来源:
+#   forensic_collector.exe          ← Go 适配器:forensic-collector/build.sh windows (dist/win-amd64/)
+#   velociraptor.exe + LICENSE/SOURCE ← fetch_velociraptor.sh (collector_stage/)
+#   forensic_collector_builtin.exe  ← CMake target(C baseline);从 STAGE_DIR 取(发布 CI 同 FDSensor 一起 stage)
+# 任一缺失仅 Warning(非 strict):agent 在该层不可用时自动回退下一层,最终 in-process 兜底。
+COLLECTOR_OUT="$OUT_DIR/collector"
+mkdir -p "$COLLECTOR_OUT"
+GO_FC="${EDR_FORENSIC_COLLECTOR_BIN:-$EDR_AGENT_DIR/../forensic-collector/dist/win-amd64/forensic_collector.exe}"
+VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}"
+if [[ -f "$GO_FC" ]]; then
+  cp -a "$GO_FC" "$COLLECTOR_OUT/forensic_collector.exe"
+else
+  echo "Warning: missing Go forensic_collector.exe ($GO_FC); run forensic-collector/build.sh windows. Agent will fall back to builtin/in-process." >&2
+fi
+if [[ -f "$STAGE_DIR/forensic_collector_builtin.exe" ]]; then
+  cp -a "$STAGE_DIR/forensic_collector_builtin.exe" "$COLLECTOR_OUT/"
+else
+  echo "Warning: missing forensic_collector_builtin.exe in STAGE_DIR; C-baseline fallback will be unavailable." >&2
+fi
+if [[ -f "$VELO_STAGE/velociraptor.exe" ]]; then
+  cp -a "$VELO_STAGE/velociraptor.exe" "$COLLECTOR_OUT/"
+  # AGPL 合规件必须随 velociraptor.exe 一起分发;有 velo 无许可即视为打包错误。
+  if [[ -f "$VELO_STAGE/velociraptor.LICENSE.txt" && -f "$VELO_STAGE/velociraptor.SOURCE.txt" ]]; then
+    cp -a "$VELO_STAGE/velociraptor.LICENSE.txt" "$VELO_STAGE/velociraptor.SOURCE.txt" "$COLLECTOR_OUT/"
+  else
+    echo "Error: velociraptor.exe present but AGPL LICENSE/SOURCE missing in $VELO_STAGE (run fetch_velociraptor.sh)" >&2
+    exit 1
+  fi
+else
+  echo "Warning: missing velociraptor.exe ($VELO_STAGE/velociraptor.exe); run fetch_velociraptor.sh. Velo-tier forensics disabled; agent uses builtin/in-process." >&2
+fi
+# collector 目录若为空则移除,避免空目录入包
+rmdir "$COLLECTOR_OUT" 2>/dev/null || true
+
 # --- Full-stack checks (ONNX + rules) ---
 ONNX_LIST=0
 STATIC_CAND=0

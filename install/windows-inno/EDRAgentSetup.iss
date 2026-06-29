@@ -65,6 +65,10 @@ Source: "..\..\scripts\windows_service_install.ps1"; DestDir: "{app}"; Flags: ig
 Source: "..\..\scripts\windows_isolate_host.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
+; 取证采集器(发布 CI 在 ISCC 前 stage 到 build\Release\collector\):
+;   forensic_collector.exe(Go/主) + forensic_collector_builtin.exe(C 兜底) + velociraptor.exe(官方 v0.77.1)
+;   + velociraptor.LICENSE.txt / velociraptor.SOURCE.txt(AGPL 合规)。缺失不致命→agent 回退 in-process。
+Source: "..\..\build\Release\collector\*"; DestDir: "{app}\collector"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""

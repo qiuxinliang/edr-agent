@@ -277,10 +277,10 @@ static void json_escape_to(char *dst, size_t cap, const char *s) {
 static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
                          int exit_code, const char *detail, const char *response_status,
                          const char *artifacts) {
-  char detail_json[16384];
+  char detail_json[40000];
   char taskj[300];
   char statusj[96];
-  char raw[12000];
+  char raw[32000];
   char err[1600];
   const char *rstatus = response_status && response_status[0] ? response_status : response_status_label(st);
   int retryable = (st == EdrCmdExecFailed && exit_code != 1 && exit_code != 2 && exit_code != 7) ? 1 : 0;
@@ -3411,6 +3411,150 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
   }
 }
 
+/* 主机显微镜主干：全机进程快照（Win Toolhelp / Linux /proc），输出扁平 {pid,ppid,name} 列表。
+ * 只读巡检，沿用 dangerous 门控；镜像 do_list_modules 的产物+内联+上传结构。前端据此构进程树。
+ * 为尽量内联完整列表，Tier 1 省略 image（≈ name），命令行/用户经 rtr_process_tree 下钻。 */
+static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t len,
+                                 const EdrSoarCommandMeta *sm) {
+  if (!dangerous_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id, "reject host_process_tree: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    return;
+  }
+  int max_procs = parse_int_json_default(pl, len, "max_procs", 2000);
+  if (max_procs <= 0 || max_procs > 5000) {
+    max_procs = 2000;
+  }
+  char path[900];
+  command_artifact_path(cmd_id, "proctree", "json", path, sizeof(path));
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "cannot create proctree artifact");
+    return;
+  }
+  fputs("{\"processes\":[\n", f);
+  int count = 0;
+  char inline_procs[28000];
+  size_t io = 0;
+  int inline_count = 0;
+  inline_procs[0] = '\0';
+#define EDR_PROC_EMIT(obj)                                                             \
+  do {                                                                                 \
+    if (count) fputs(",\n", f);                                                        \
+    fputs((obj), f);                                                                   \
+    size_t _ol = strlen(obj);                                                          \
+    if (io + _ol + 2u < sizeof(inline_procs)) {                                        \
+      if (inline_count) { inline_procs[io++] = ','; }                                  \
+      memcpy(inline_procs + io, (obj), _ol);                                           \
+      io += _ol;                                                                       \
+      inline_procs[io] = '\0';                                                         \
+      inline_count++;                                                                  \
+    }                                                                                  \
+    count++;                                                                           \
+  } while (0)
+#ifdef _WIN32
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap != INVALID_HANDLE_VALUE) {
+    PROCESSENTRY32W pe;
+    pe.dwSize = (DWORD)sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+      do {
+        if (count >= max_procs) {
+          break;
+        }
+        char name[520];
+        WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, name, (int)sizeof(name), NULL, NULL);
+        char nmj[600], obj[800];
+        json_escape_to(nmj, sizeof(nmj), name);
+        snprintf(obj, sizeof(obj), "{\"pid\":%lu,\"ppid\":%lu,\"name\":%s}",
+                 (unsigned long)pe.th32ProcessID, (unsigned long)pe.th32ParentProcessID, nmj);
+        EDR_PROC_EMIT(obj);
+      } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+  }
+#else
+  DIR *pd = opendir("/proc");
+  if (pd) {
+    struct dirent *ent;
+    while ((ent = readdir(pd)) != NULL && count < max_procs) {
+      const char *nm = ent->d_name;
+      int isnum = nm[0] != '\0';
+      for (const char *q = nm; *q; q++) {
+        if (*q < '0' || *q > '9') { isnum = 0; break; }
+      }
+      if (!isnum) {
+        continue;
+      }
+      long pid = strtol(nm, NULL, 10);
+      long ppid = 0;
+      char comm[256];
+      comm[0] = '\0';
+      char statp[80];
+      snprintf(statp, sizeof(statp), "/proc/%s/stat", nm);
+      FILE *sf = fopen(statp, "r");
+      if (sf) {
+        char line[4096];
+        if (fgets(line, sizeof(line), sf)) {
+          char *lp = strchr(line, '(');
+          char *rp = lp ? strrchr(line, ')') : NULL;
+          if (lp && rp && rp > lp) {
+            size_t cl = (size_t)(rp - lp - 1);
+            if (cl >= sizeof(comm)) {
+              cl = sizeof(comm) - 1;
+            }
+            memcpy(comm, lp + 1, cl);
+            comm[cl] = '\0';
+            char stc;
+            long pp = 0;
+            if (sscanf(rp + 1, " %c %ld", &stc, &pp) >= 2) {
+              ppid = pp;
+            }
+          }
+        }
+        fclose(sf);
+      }
+      char nmj[600], obj[800];
+      json_escape_to(nmj, sizeof(nmj), comm[0] ? comm : nm);
+      snprintf(obj, sizeof(obj), "{\"pid\":%ld,\"ppid\":%ld,\"name\":%s}", pid, ppid, nmj);
+      EDR_PROC_EMIT(obj);
+    }
+    closedir(pd);
+  }
+#endif
+#undef EDR_PROC_EMIT
+  fprintf(f, "\n],\"total\":%d}\n", count);
+  fclose(f);
+  char sha[65];
+  sha[0] = '\0';
+  (void)file_sha256_hex(path, sha);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "proctree", path, sha,
+                                               minio_key, sizeof(minio_key));
+  char pathj[1200], minioj[1200], artifacts[3200], detail[30000];
+  json_escape_to(pathj, sizeof(pathj), path);
+  json_escape_to(minioj, sizeof(minioj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"process_tree\",\"path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  snprintf(detail, sizeof(detail),
+           "{\"count\":%d,\"inline_count\":%d,\"processes\":[%s],"
+           "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
+           count, inline_count, inline_procs, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  s_handled++;
+  if (upload_rc == 0) {
+    s_exec_ok++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
+  } else {
+    s_exec_fail++;
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  }
+}
+
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
@@ -3760,6 +3904,7 @@ static int is_dangerous_command_type(const char *t) {
          streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG") ||
          streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY") ||
          streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES") ||
+         streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT") ||
          is_rtr_shell_command_type(t);
 }
 
@@ -4109,6 +4254,10 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   }
   if (streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES")) {
     do_list_modules(id, payload, payload_len, sm);
+    return;
+  }
+  if (streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT")) {
+    do_host_process_tree(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "rtr_file_stat") || streq(t, "file_stat") || streq(t, "RTR_FILE_STAT")) {

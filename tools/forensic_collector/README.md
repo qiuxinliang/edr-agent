@@ -1,17 +1,21 @@
-# forensic_collector
+# forensic_collector_builtin（C baseline 兜底采集器）
 
 独立的取证采集器二进制，由 agent 的 `src/forensic/deep_collector.c` 通过 fork/CreateProcess 调起。
 **仅本地采集 + 打包，绝不联网**；上传由 agent 的 transport v2 通道负责。
 
+> **命名裁决（重要）**：本 C target 的输出名为 **`forensic_collector_builtin`**（系统命令级，**兜底**用）。
+> 生产**主**采集器是 `forensic-collector/`（Go 适配器，封装官方 Velociraptor v0.77.1），输出规范名 `forensic_collector(.exe)`。
+> agent 采集层级：`velo(主) → builtin(本程序) → in-process`。详见 `docs/FORENSIC_INDEX.md`。
+
 ## 构建
 
 ```bash
-# 随 agent 构建（默认开启）
+# 随 agent 构建（默认开启）→ 产出 forensic_collector_builtin(.exe)
 cmake -B build -DEDR_WITH_FORENSIC_COLLECTOR=ON
 cmake --build build --target forensic_collector
 
 # 或单文件直接编译（无第三方依赖）
-cc -O2 -o forensic_collector tools/forensic_collector/main.c
+cc -O2 -o forensic_collector_builtin tools/forensic_collector/main.c
 ```
 
 ## CLI 契约（与 deep_collector.c 对齐）

@@ -8,7 +8,9 @@ set -euo pipefail
 
 BIN="${BIN:-}"
 if [[ -z "$BIN" ]]; then
-  for cand in ./forensic_collector build/forensic_collector ./build/forensic_collector; do
+  # C baseline 输出名为 forensic_collector_builtin(CMake OUTPUT_NAME);兼容旧名 forensic_collector。
+  for cand in ./forensic_collector_builtin build/forensic_collector_builtin ./build/forensic_collector_builtin \
+              ./forensic_collector build/forensic_collector ./build/forensic_collector; do
     [[ -x "$cand" ]] && BIN="$cand" && break
   done
 fi
