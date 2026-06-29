@@ -3492,13 +3492,9 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
            "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
            pid, count, inline_count, inline_mods, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
   s_handled++;
-  if (upload_rc == 0) {
-    s_exec_ok++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
-  } else {
-    s_exec_fail++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
-  }
+  s_exec_ok++;
+  /* 数据已内联回流，采集即成功；上传失败只降级为 upload_status=failed（详情/产物已标注），不再判任务失败。 */
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 }
 
 /* 主机显微镜主干：全机进程快照（Win Toolhelp / Linux /proc），输出扁平 {pid,ppid,name} 列表。
@@ -3636,13 +3632,9 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
            "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
            count, inline_count, inline_procs, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
   s_handled++;
-  if (upload_rc == 0) {
-    s_exec_ok++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
-  } else {
-    s_exec_fail++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
-  }
+  s_exec_ok++;
+  /* 数据已内联回流，采集即成功；上传失败只降级为 upload_status=failed，不再判任务失败。 */
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 }
 
 /* 主机显微镜·持久化全景（类 Autoruns）：枚举常见自启动位置 → 扁平 {type,name,command,location} 行。
@@ -3797,13 +3789,9 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
            "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
            count, inl_n, inl, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
   s_handled++;
-  if (upload_rc == 0) {
-    s_exec_ok++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
-  } else {
-    s_exec_fail++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
-  }
+  s_exec_ok++;
+  /* 数据已内联回流，采集即成功；上传失败只降级为 upload_status=failed，不再判任务失败。 */
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 }
 
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
