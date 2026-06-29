@@ -3301,6 +3301,26 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   fprintf(f, "{\"pid\":%ld,\"modules\":[\n", pid);
   int count = 0;
+  /* 同步累积前若干条模块的内联 JSON，随结果回流（主机显微镜内联表格直接展示，无需下载产物）。 */
+  char inline_mods[9000];
+  size_t io = 0;
+  int inline_count = 0;
+  inline_mods[0] = '\0';
+  /* 把一条已构造好的模块对象 obj 写入文件，并在容量允许时追加到内联缓冲。 */
+#define EDR_MOD_EMIT(obj)                                                              \
+  do {                                                                                 \
+    if (count) fputs(",\n", f);                                                        \
+    fputs((obj), f);                                                                   \
+    size_t _ol = strlen(obj);                                                          \
+    if (io + _ol + 2u < sizeof(inline_mods)) {                                         \
+      if (inline_count) { inline_mods[io++] = ','; }                                   \
+      memcpy(inline_mods + io, (obj), _ol);                                            \
+      io += _ol;                                                                       \
+      inline_mods[io] = '\0';                                                          \
+      inline_count++;                                                                  \
+    }                                                                                  \
+    count++;                                                                           \
+  } while (0)
 #ifdef _WIN32
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, (DWORD)pid);
   if (snap != INVALID_HANDLE_VALUE) {
@@ -3311,16 +3331,12 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
         if (count >= max_modules) {
           break;
         }
-        if (count) {
-          fputs(",\n", f);
-        }
-        fputs("{\"name\":\"", f);
-        fprint_json_escaped(f, me.szModule);
-        fputs("\",\"path\":\"", f);
-        fprint_json_escaped(f, me.szExePath);
-        fprintf(f, "\",\"base\":\"0x%llx\",\"size\":%lu}",
-                (unsigned long long)(size_t)me.modBaseAddr, (unsigned long)me.modBaseSize);
-        count++;
+        char nmj[600], pthj2[1100], obj[1900];
+        json_escape_to(nmj, sizeof(nmj), me.szModule);
+        json_escape_to(pthj2, sizeof(pthj2), me.szExePath);
+        snprintf(obj, sizeof(obj), "{\"name\":%s,\"path\":%s,\"base\":\"0x%llx\",\"size\":%lu}",
+                 nmj, pthj2, (unsigned long long)(size_t)me.modBaseAddr, (unsigned long)me.modBaseSize);
+        EDR_MOD_EMIT(obj);
       } while (Module32Next(snap, &me));
     }
     CloseHandle(snap);
@@ -3353,18 +3369,17 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
           continue; /* 相邻段去重（同一映像多段连续出现） */
         }
         snprintf(prevpath, sizeof(prevpath), "%s", pp);
-        if (count) {
-          fputs(",\n", f);
-        }
-        fputs("{\"path\":\"", f);
-        fprint_json_escaped(f, pp);
-        fprintf(f, "\",\"base\":\"0x%llx\",\"perms\":\"%s\"}", a0, perms);
-        count++;
+        char pthj2[1100], prmj[64], obj[1300];
+        json_escape_to(pthj2, sizeof(pthj2), pp);
+        json_escape_to(prmj, sizeof(prmj), perms);
+        snprintf(obj, sizeof(obj), "{\"path\":%s,\"base\":\"0x%llx\",\"perms\":%s}", pthj2, a0, prmj);
+        EDR_MOD_EMIT(obj);
       }
     }
     fclose(mp);
   }
 #endif
+#undef EDR_MOD_EMIT
   fprintf(f, "\n],\"total\":%d}\n", count);
   fclose(f);
   char sha[65];
@@ -3374,17 +3389,18 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
   minio_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "modules", path, sha,
                                                minio_key, sizeof(minio_key));
-  char pathj[1200], minioj[1200], artifacts[3200], detail[4096];
+  char pathj[1200], minioj[1200], artifacts[3200], detail[11000];
   json_escape_to(pathj, sizeof(pathj), path);
   json_escape_to(minioj, sizeof(minioj), minio_key);
   snprintf(artifacts, sizeof(artifacts),
            "[{\"type\":\"modules\",\"path\":%s,\"sha256\":\"%s\","
            "\"upload_status\":\"%s\",\"minio_key\":%s}]",
            pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  /* detail 内联前 inline_count 条模块（剩余在产物文件中），主机显微镜据此渲染表格。 */
   snprintf(detail, sizeof(detail),
-           "{\"pid\":%ld,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
-           "\"upload_status\":\"%s\",\"minio_key\":%s}",
-           pid, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+           "{\"pid\":%ld,\"count\":%d,\"inline_count\":%d,\"modules\":[%s],"
+           "\"artifact_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}",
+           pid, count, inline_count, inline_mods, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
   s_handled++;
   if (upload_rc == 0) {
     s_exec_ok++;
