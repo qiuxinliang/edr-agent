@@ -1,0 +1,135 @@
+# Windows production profile.
+# Copy to C:\Program Files\FDSecurity\agent.toml, then enroll/replace server and agent values.
+
+[server]
+address              = ""
+grpc_insecure        = false
+ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
+client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
+# P2 hardware/non-exportable key metadata. Runtime gRPC currently consumes PEM
+# client_key; cng/tpm/pkcs11 entries are written by installers for Schannel or
+# hardware-key transport adapters.
+client_key_provider  = "pem" # pem | cng | tpm | pkcs11
+client_cert_store    = ""
+client_cert_thumbprint = ""
+pkcs11_module        = ""
+pkcs11_key_uri       = ""
+tpm_key_uri          = ""
+connect_timeout_s    = 10
+keepalive_interval_s = 30
+
+[agent]
+endpoint_id          = "auto"
+tenant_id            = "tenant_default"
+
+[platform]
+rest_base_url        = "https://edr.example.com/api/v1"
+proxy_mode           = "auto"
+proxy_url            = ""
+relay_url            = ""
+http2_enabled        = false
+http2_require        = false
+control_stream_enabled = true
+long_poll_fallback   = true
+report_events_v2_enabled = true
+data_plane_encoding  = "protobuf"
+data_plane_compression = "identity"
+control_dict_version = "edr-zstd-dict-v1"
+control_schema_version = "edr-control-schema-v1"
+control_profile_id   = "default-http1-protobuf"
+
+[collection]
+etw_enabled          = true
+ebpf_enabled         = false
+poll_interval_s      = 1
+max_event_queue_size = 8192
+adaptive_enabled = true
+adaptive_boost_seconds = 180
+adaptive_min_severity = 3
+# High-volume providers stay off by default for first install. Enable them
+# only after confirming event bus pressure is stable on the target host.
+etw_dns_client_provider = false
+etw_powershell_provider = true
+etw_security_audit_provider = true
+etw_wmi_provider = false
+etw_tcpip_provider = false
+etw_firewall_provider = false
+
+[preprocessing]
+dedup_window_s       = 60
+high_freq_threshold  = 40
+sampling_rate_whitelist = 0.03
+rules_version        = "edr-dynamic-rules-v1"
+
+[ave]
+model_dir            = "C:\\Program Files\\FDSecurity\\models"
+scan_threads         = 1
+max_file_size_mb     = 256
+sensitivity          = "MEDIUM"
+static_model_enabled = true
+behavior_monitor_enabled = false
+
+[forensic_auto]
+enabled              = false
+cooldown_s           = 30
+per_pid_cooldown_s   = 300
+max_per_hour         = 20
+trigger_on_p0        = true
+collect_process_tree = true
+
+# 外置取证采集器(深度取证)——经环境变量配置,由 windows_service_install.ps1 在安装时写入机器级 env。
+# agent 走 getenv 读取,此处仅为部署说明(改这些值请改服务 env,不是改本 toml):
+#   EDR_FORENSIC_COLLECTOR=1                 启用外置采集(否则仅 in-process 兜底)
+#   EDR_FORENSIC_COLLECTOR_BIN=...\collector\forensic_collector.exe          主:Go 适配器→Velociraptor
+#   EDR_FORENSIC_COLLECTOR_BUILTIN_BIN=...\collector\forensic_collector_builtin.exe  兜底:C baseline(系统命令级)
+#   EDR_VELOCIRAPTOR_BIN=...\collector\velociraptor.exe                      官方 v0.77.1(未修改,AGPL 外部调用)
+#   EDR_FORENSIC_COLLECTOR_STRICT=1          (可选)外置失败不回退 in-process,默认不设
+# 采集层级:velo(主) → builtin(velo 不可用) → in-process(都不可用);产物经 agent transport v2 上传。
+
+[upload]
+batch_max_events     = 200
+batch_max_size_mb    = 2
+batch_timeout_s      = 2
+max_upload_mbps      = 4
+
+[offline]
+queue_db_path        = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db"
+max_queue_size_mb    = 512
+retention_hours      = 72
+evidence_cache_path  = "C:\\Program Files\\FDSecurity\\evidence\\evidence_cache.db"
+evidence_cache_max_size_mb = 512
+evidence_cache_retention_hours = 72
+
+[resource_limit]
+cpu_limit_percent    = 10
+memory_limit_mb      = 512
+emergency_cpu_limit  = 25
+behavior_infer_per_min = 30
+
+[logging]
+level                = "info"
+log_dir              = "C:\\Program Files\\FDSecurity\\logs"
+max_log_size_mb      = 50
+max_log_files        = 5
+
+[command]
+allow_dangerous      = false
+allow_rtq_readonly   = true
+signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
+
+[self_protect]
+anti_debug           = true
+job_object_windows   = true
+watchdog_log_interval_s = 60
+event_bus_pressure_warn_pct = 80
+
+[attack_surface]
+enabled              = false
+tick_interval_s      = 300
+
+[shellcode_detector]
+enabled              = false
+
+[webshell_detector]
+enabled              = false
