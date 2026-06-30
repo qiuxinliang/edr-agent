@@ -42,6 +42,24 @@ int edr_response_forensic_run_external(const char *cmd_id, const char *scope, co
                                        size_t detail_cap);
 /* 取证外移是否启用(EDR_FORENSIC_COLLECTOR=1)。 */
 int edr_response_forensic_external_enabled(void);
+
+/* ── 取证异步生命周期(velo 采集硬取消支持)──
+ * 受理:由 5 个 forensic 处理器在外移启用时调用,非阻塞 spawn + 登记单槽任务。
+ *   返回 0=已受理(完成由 poll 上报终态); 1=busy(已有采集在跑); <0=spawn/解析/下载失败(调用方据此决定 in-process 回退)。 */
+int edr_response_forensic_async_accept(const char *cmd_id, const char *command_type,
+                                       const EdrSoarCommandMeta *sm, const char *scope,
+                                       const uint8_t *payload, size_t payload_len,
+                                       const char *artifact_ext, int do_upload,
+                                       char *detail, size_t detail_cap);
+/* agent 主循环周期调用:收割已完成采集(velo→builtin 两段、上传、唯一终态上报)。 */
+void edr_response_forensic_async_poll(void);
+/* 取消正在运行的采集:target_cmd_id 为空=取消当前。返回 1=已请求取消;0=无匹配运行中任务。 */
+int edr_response_forensic_async_cancel(const char *target_cmd_id);
+/* agent 关闭时调用:kill 在跑的 velo 并补报"已取消"。 */
+void edr_response_forensic_async_abort_shutdown(void);
+/* 是否有采集在运行(busy 查询)。 */
+int edr_response_forensic_async_active(void);
+
 void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
                              const EdrSoarCommandMeta *sm);
 void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,

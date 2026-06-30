@@ -3018,6 +3018,37 @@ static void flush_upload_outbox(void) {
   s_delivery_health.upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
 }
 
+/* 取证 velo 仅人工下发 gate:命令需带 initiated_by="operator"(或 payload {"initiated_by":"operator"}/{"manual":true})。
+ * env EDR_FORENSIC_OPERATOR_ONLY="0" 可关闭(默认开)。返回 1=放行,0=拒绝。 */
+static int forensic_operator_gate(const EdrSoarCommandMeta *sm, const uint8_t *pl, size_t len) {
+  const char *e = getenv("EDR_FORENSIC_OPERATOR_ONLY");
+  if (e && e[0] == '0') {
+    return 1; /* 显式关闭 gate */
+  }
+  if (sm && sm->initiated_by[0]) {
+    if (strcasecmp(sm->initiated_by, "operator") == 0 || strcasecmp(sm->initiated_by, "manual") == 0) {
+      return 1;
+    }
+  }
+  /* payload 兜底:{"initiated_by":"operator"} 或 {"manual":true} */
+  char ib[32];
+  ib[0] = '\0';
+  if (parse_json_string_field(pl, len, "initiated_by", ib, sizeof(ib)) == 0 &&
+      (strcasecmp(ib, "operator") == 0 || strcasecmp(ib, "manual") == 0)) {
+    return 1;
+  }
+  if (pl && len) {
+    char tmp[256];
+    size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+    memcpy(tmp, pl, n);
+    tmp[n] = '\0';
+    if (strstr(tmp, "\"manual\":true") || strstr(tmp, "\"manual\": true")) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
@@ -3650,20 +3681,31 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
   }
   long pid = -1;
   (void)parse_pid_json(pl, len, &pid); /* 可选 */
-  int limit = parse_int_json_default(pl, len, "limit", 150);
-  if (limit <= 0 || limit > 1000) {
-    limit = 150;
+  /* 大结果走产物下载通道，limit 上限提到 5000（与适配器一致）；默认 1000 以含较全集。 */
+  int limit = parse_int_json_default(pl, len, "limit", 1000);
+  if (limit <= 0 || limit > 5000) {
+    limit = 1000;
   }
   char scope[64];
   if (parse_json_string_field(pl, len, "scope", scope, sizeof(scope)) != 0 || !scope[0]) {
     snprintf(scope, sizeof(scope), "%s", "inspect_process");
   }
-  /* 白名单 inspect scope，避免任意 scope/VQL 透传（V1.x: 进程/模块/网络）。 */
-  if (strcmp(scope, "inspect_process") != 0 && strcmp(scope, "inspect_modules") != 0 &&
-      strcmp(scope, "inspect_netstat") != 0) {
-    s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "unsupported velo scope (allow: inspect_process/modules/netstat)");
-    return;
+  /* 闸：仅放行 inspect_* 前缀 + 字符集/长度护栏（[a-z0-9_]，≤48）。具体 scope 由适配器注册表精确校验。
+   * scope 串不进 VQL（仅查表 + 拼 action），无注入面。 */
+  {
+    size_t sl = strlen(scope);
+    int ok = (strncmp(scope, "inspect_", 8) == 0) && sl > 8u && sl <= 48u;
+    for (size_t i = 0; ok && i < sl; i++) {
+      char ch = scope[i];
+      if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) {
+        ok = 0;
+      }
+    }
+    if (!ok) {
+      s_exec_fail++;
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid velo scope (allow: inspect_<name>)");
+      return;
+    }
   }
   char reqpath[900], rowspath[900];
   command_artifact_path(cmd_id, "veloreq", "json", reqpath, sizeof(reqpath));
@@ -3686,6 +3728,7 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
   spec.output_dir = ".";
   spec.extra_args = extra;
   spec.timeout_s = 60u;
+  spec.needs_velociraptor = 1; /* velo_query 走 velo 适配器,运行前确保 velo 就绪 */
   char dc_detail[512];
   dc_detail[0] = '\0';
   int rc = edr_deep_collector_run_blocking(&spec, dc_detail, sizeof(dc_detail));
@@ -3703,27 +3746,85 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, fail);
     return;
   }
-  /* 读回适配器产出的 {source,artifact,rows:[...],total}，内联回流（前端 extractRecords 取 rows）。 */
-  char rows[30000];
-  size_t rn = 0;
-  {
-    FILE *rf = fopen(rowspath, "rb");
-    if (rf) {
-      rn = fread(rows, 1, sizeof(rows) - 1u, rf);
-      fclose(rf);
-    }
-    rows[rn] = '\0';
-  }
-  (void)remove(rowspath);
-  if (rn == 0u || rows[0] != '{') {
+  /* 读回适配器产出的 {source,artifact,rows:[...],total}。
+   * 大产物上传对象存储 → 前端经 /rtr/velo/:task/rows 取回全量；小产物直接内联回流（前端 extractRecords 取 rows）。
+   * 镜像 do_list_modules 的 sha+上传+artifacts+内联 结构（截断不再判失败，改走下载通道）。 */
+  unsigned long long fsz = 0ull;
+  long long fmt_unused = 0;
+  if (file_size_mtime(rowspath, &fsz, &fmt_unused) != 0 || fsz == 0ull) {
+    (void)remove(rowspath);
     s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or invalid query output");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or missing query output");
     return;
   }
-  s_handled++;
-  s_exec_ok++;
-  audit_both(cmd_id, "velo_query: ok");
-  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, rows, "ok", "[]");
+  char sha[65];
+  sha[0] = '\0';
+  (void)file_sha256_hex(rowspath, sha);
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "velo_rows", rowspath, sha,
+                                               minio_key, sizeof(minio_key));
+  char pathj[1200], minioj[1200], artifacts[3200];
+  json_escape_to(pathj, sizeof(pathj), rowspath);
+  json_escape_to(minioj, sizeof(minioj), minio_key);
+  snprintf(artifacts, sizeof(artifacts),
+           "[{\"type\":\"velo_rows\",\"path\":%s,\"sha256\":\"%s\","
+           "\"upload_status\":\"%s\",\"minio_key\":%s}]",
+           pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  /* 内联上限：env EDR_VELO_INLINE_CAP 可调，默认 20000（≈ soar raw 上限）。 */
+  unsigned long long inline_cap = 20000ull;
+  {
+    const char *cs = getenv("EDR_VELO_INLINE_CAP");
+    if (cs && cs[0]) {
+      long long v = atoll(cs);
+      if (v > 0) {
+        inline_cap = (unsigned long long)v;
+      }
+    }
+  }
+  if (fsz <= inline_cap) {
+    /* 小产物：文件内容（{source,artifact,rows,total}）直接内联回流。 */
+    char *detail = (char *)malloc((size_t)fsz + 1u);
+    if (detail) {
+      FILE *rf = fopen(rowspath, "rb");
+      size_t rn = 0;
+      if (rf) {
+        rn = fread(detail, 1, (size_t)fsz, rf);
+        fclose(rf);
+      }
+      detail[rn] = '\0';
+      (void)remove(rowspath);
+      if (rn == 0u || detail[0] != '{') {
+        free(detail);
+        s_exec_fail++;
+        soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or invalid query output");
+        return;
+      }
+      s_handled++;
+      s_exec_ok++;
+      audit_both(cmd_id, "velo_query: ok (inline)");
+      soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail,
+                   upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
+      free(detail);
+      return;
+    }
+    /* malloc 失败 → 退回下载通道。 */
+  }
+  (void)remove(rowspath);
+  /* 大产物（或内联缓冲分配失败）：空内联 + 下载标记，前端经下载通道取全量。 */
+  {
+    char detail[2600];
+    int can_dl = (upload_rc == 0 && minio_key[0]) ? 1 : 0;
+    snprintf(detail, sizeof(detail),
+             "{\"source\":\"velociraptor\",\"truncated\":true,\"download\":%s,"
+             "\"total\":-1,\"rows\":[],\"minio_key\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\"}",
+             can_dl ? "true" : "false", minioj, sha, upload_rc == 0 ? "ok" : "failed");
+    s_handled++;
+    s_exec_ok++;
+    audit_both(cmd_id, can_dl ? "velo_query: ok (download)" : "velo_query: large result, upload failed");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail,
+                 upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
+  }
 }
 
 /* 主机显微镜·持久化全景（类 Autoruns）：枚举常见自启动位置 → 扁平 {type,name,command,location} 行。
@@ -4542,23 +4643,60 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
   if (streq(t, "collect_forensic") || streq(t, "forensic")) {
+    if (!forensic_operator_gate(sm, payload, payload_len)) {
+      edr_command_audit_both(id, "reject forensic: operator-only(人工下发) gate");
+      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
+      return;
+    }
     do_forensic(id, payload, payload_len, sm);
     return;
   }
   // 接线已实现但此前未挂载的处置：进程内存转储 / 定向取证 / 文件下推（实现见 response_forensic.c、response_file.c）。
   if (streq(t, "memory_dump") || streq(t, "memdump")) {
+    if (!forensic_operator_gate(sm, payload, payload_len)) {
+      edr_command_audit_both(id, "reject memory_dump: operator-only(人工下发) gate");
+      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
+      return;
+    }
     edr_response_memory_dump(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "targeted_forensic") || streq(t, "forensic_targeted")) {
+    if (!forensic_operator_gate(sm, payload, payload_len)) {
+      edr_command_audit_both(id, "reject targeted_forensic: operator-only(人工下发) gate");
+      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
+      return;
+    }
     edr_response_targeted_forensic(id, payload, payload_len, sm);
     return;
   }
   if (streq(t, "yara_scan")) {
+    if (!forensic_operator_gate(sm, payload, payload_len)) {
+      edr_command_audit_both(id, "reject yara_scan: operator-only(人工下发) gate");
+      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
+      return;
+    }
     edr_response_yara_scan(id, payload, payload_len, sm);
     return;
   }
+  if (streq(t, "forensic_cancel") || streq(t, "cancel_forensic") || streq(t, "collector:stop")) {
+    /* 运行中硬取消:可选 payload {"target_cmd_id":"..."};缺省取消当前。实际 kill 由主循环 poll 统一执行。 */
+    char target[96];
+    target[0] = '\0';
+    (void)parse_json_string_field(payload, payload_len, "target_cmd_id", target, sizeof(target));
+    int hit = edr_response_forensic_async_cancel(target[0] ? target : NULL);
+    edr_cmd_inc_handled();
+    edr_cmd_inc_exec_ok();
+    edr_command_emit_always(id, sm, EdrCmdExecOk, 0,
+                            hit ? "forensic cancel requested" : "no running forensic to cancel");
+    return;
+  }
   if (streq(t, "deep_forensic") || streq(t, "collector") || streq(t, "collector:start")) {
+    if (!forensic_operator_gate(sm, payload, payload_len)) {
+      edr_command_audit_both(id, "reject deep_forensic: operator-only(人工下发) gate");
+      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
+      return;
+    }
     edr_response_deep_forensic(id, payload, payload_len, sm);
     return;
   }

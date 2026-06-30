@@ -118,14 +118,22 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
   return EDR_DC_OK;
 }
 
-/* 解析 collector 路径并(可选)下载+验签。返回 0 可执行;EDR_DC_ERR_DOWNLOAD/SIGNATURE 失败。
- * 来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
- * 文件缺失时的拉取优先级:
- *   1) EDR_FORENSIC_COLLECTOR_URL(静态直链,向后兼容,最高优先);
- *   2) 否则若 autofetch 开启(EDR_FORENSIC_COLLECTOR_AUTOFETCH != "0")且配置了
- *      EDR_FORENSIC_COLLECTOR_MANIFEST_URL → 经平台固定地址 manifest 拉取(返回 sha256)。
- * 验签优先级:EDR_FORENSIC_COLLECTOR_SHA256(env pin) > manifest sha256;
- *   两者皆有则任一不匹配即拒绝执行。 */
+/* 64 位 hex 不区分大小写相等。 */
+static int dc_hex64_ieq(const char *a, const char *b) {
+  for (int i = 0; i < 64; i++) {
+    char x = a[i], y = b[i];
+    if (x >= 'A' && x <= 'F') x = (char)(x - 'A' + 'a');
+    if (y >= 'A' && y <= 'F') y = (char)(y - 'A' + 'a');
+    if (x != y || x == '\0') return 0;
+  }
+  return 1;
+}
+
+/* 解析适配器(forensic_collector)路径并校验。返回 0 可执行;否则 <0。
+ * 路径来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
+ * 适配器为小体积件,随安装包内置:缺失即返回 EDR_DC_ERR_DOWNLOAD(调用方回退 builtin),
+ *   **不**经 velo manifest 误下载(velo 由 dc_ensure_velociraptor 拉到独立槽位)。
+ * 验签:EDR_FORENSIC_COLLECTOR_SHA256(env pin)配置时校验,不匹配拒绝执行。 */
 static int dc_resolve_verify(const char *spec_bin, const char *platform_default, char *out_path,
                              size_t cap, char *detail, size_t detail_cap) {
   const char *bin = (spec_bin && spec_bin[0]) ? spec_bin : NULL;
@@ -136,46 +144,64 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
   if (!bin) bin = platform_default;
   snprintf(out_path, cap, "%s", bin ? bin : "");
 
-  char manifest_sha[65];
-  manifest_sha[0] = '\0';
-
   if (!dc_file_exists(out_path)) {
-    const char *url = getenv("EDR_FORENSIC_COLLECTOR_URL");
-    if (url && url[0]) {
-      if (dc_download(url, out_path) != 0) {
-        if (detail) snprintf(detail, detail_cap, "collector download failed");
-        return EDR_DC_ERR_DOWNLOAD;
-      }
-    } else {
-      const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
-      int autofetch = !(af && af[0] == '0'); /* 默认开,显式 "0" 关闭 */
-      const char *mf = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL");
-      if (autofetch && mf && mf[0]) {
-        int rc = dc_autofetch_via_manifest(mf, out_path, manifest_sha, detail, detail_cap);
-        if (rc != EDR_DC_OK) return rc;
-      }
+    if (detail) {
+      snprintf(detail, detail_cap, "collector adapter missing: %.400s (应随安装包内置)", out_path);
     }
+    return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
   }
   const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
-  if ((!want || !want[0]) && manifest_sha[0]) {
-    want = manifest_sha; /* env 未 pin 时用 manifest 的 sha256(纵深防御:下载后本地再校验) */
-  }
   if (want && want[0]) {
     char got[65];
     if (dc_sha256_file(out_path, got) != 0) {
       if (detail) snprintf(detail, detail_cap, "collector sha256 read failed");
       return EDR_DC_ERR_SIGNATURE;
     }
-    /* 不区分大小写比较 */
-    int mismatch = 0;
-    for (int i = 0; i < 64; i++) {
-      char a = got[i], b = want[i];
-      if (a >= 'A' && a <= 'F') a = (char)(a - 'A' + 'a');
-      if (b >= 'A' && b <= 'F') b = (char)(b - 'A' + 'a');
-      if (a != b) { mismatch = 1; break; }
-    }
-    if (mismatch) {
+    if (!dc_hex64_ieq(got, want)) {
       if (detail) snprintf(detail, detail_cap, "collector sha256 mismatch (got %.16s...)", got);
+      return EDR_DC_ERR_SIGNATURE;
+    }
+  }
+  return EDR_DC_OK;
+}
+
+/* 确保 velociraptor 就绪到**它自己的槽位**(EDR_VELOCIRAPTOR_BIN,适配器经此定位 velo)。
+ * 缺失且 autofetch 开启时,经平台 manifest 固定地址(EDR_FORENSIC_COLLECTOR_MANIFEST_URL,
+ * kind=velociraptor)下载到该路径 + SHA256 校验(EDR_VELOCIRAPTOR_SHA256 > manifest sha)。
+ * best-effort:返回非 0 时调用方不应中止(适配器找不到 velo 会 exit 5 → 由上层回退 builtin)。 */
+static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
+  char path[1024];
+  const char *velo = getenv("EDR_VELOCIRAPTOR_BIN");
+  if (velo && velo[0]) {
+    snprintf(path, sizeof(path), "%s", velo);
+  } else {
+#ifdef _WIN32
+    snprintf(path, sizeof(path), "%s", "C:\\Program Files\\FDSecurity\\collector\\velociraptor.exe");
+#else
+    snprintf(path, sizeof(path), "%s", "velociraptor");
+#endif
+  }
+  if (dc_file_exists(path)) return EDR_DC_OK; /* 已就绪 */
+
+  const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
+  int autofetch = !(af && af[0] == '0');
+  const char *mf = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL"); /* kind=velociraptor */
+  if (!autofetch || !mf || !mf[0]) {
+    if (detail) snprintf(detail, detail_cap, "velociraptor missing; autofetch/manifest unavailable");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  char manifest_sha[65];
+  manifest_sha[0] = '\0';
+  int rc = dc_autofetch_via_manifest(mf, path, manifest_sha, detail, detail_cap);
+  if (rc != EDR_DC_OK) return rc;
+
+  const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
+  if ((!want || !want[0]) && manifest_sha[0]) want = manifest_sha;
+  if (want && want[0]) {
+    char got[65];
+    if (dc_sha256_file(path, got) != 0 || !dc_hex64_ieq(got, want)) {
+      if (detail) snprintf(detail, detail_cap, "velociraptor sha256 mismatch/read fail");
+      (void)remove(path); /* 删坏件,避免下次复用损坏 velo */
       return EDR_DC_ERR_SIGNATURE;
     }
   }
@@ -328,6 +354,12 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
                              "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe",
                              binpath, sizeof(binpath), out_detail, detail_cap);
   if (vr != EDR_DC_OK) return vr;
+  if (spec->needs_velociraptor) {
+    char vd[256]; vd[0] = '\0';
+    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+      fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
+    }
+  }
   const char *bin = binpath;
   uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
 
@@ -385,6 +417,76 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   if (job) CloseHandle(job);
   if (out_detail) snprintf(out_detail, detail_cap, "collector exit=%lu", (unsigned long)ec);
   return (int)ec; /* 0=成功;>0=collector 非0退出码 */
+}
+
+/* 异步 spawn(Windows):同 run_blocking 的解析/Job/CreateProcess,但不等待——登记到单例后立即返回。 */
+int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, size_t detail_cap) {
+  if (out_detail && detail_cap) out_detail[0] = '\0';
+  if (!spec || !spec->scope || !spec->scope[0]) return EDR_DC_ERR_DISABLED;
+
+  /* 单槽:已有采集在跑则忙。 */
+  if (g_collector_process) {
+    DWORD ec = 0;
+    if (GetExitCodeProcess(g_collector_process, &ec) && ec == STILL_ACTIVE) {
+      if (out_detail) snprintf(out_detail, detail_cap, "collector busy");
+      return EDR_DC_ERR_SPAWN;
+    }
+    CloseHandle(g_collector_process);
+    g_collector_process = NULL;
+  }
+  if (g_collector_job) { CloseHandle(g_collector_job); g_collector_job = NULL; }
+  g_running = 0;
+  g_detail[0] = '\0';
+
+  char binpath[1024];
+  int vr = dc_resolve_verify(spec->collector_bin,
+                             "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe",
+                             binpath, sizeof(binpath), out_detail, detail_cap);
+  if (vr != EDR_DC_OK) return vr;
+  if (spec->needs_velociraptor) {
+    char vd[256]; vd[0] = '\0';
+    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+      fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
+    }
+  }
+  uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
+
+  char cmdline[2048];
+  snprintf(cmdline, sizeof(cmdline),
+           "\"%s\" --scope=\"%s\" --output-dir=\"%s\" --timeout=%u %s", binpath, spec->scope,
+           spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
+
+  HANDLE job = CreateJobObject(NULL, NULL);
+  if (job) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
+    jeli.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu = {0};
+    cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+    cpu.CpuRate = 1000; /* 10% */
+    SetInformationJobObject(job, JobObjectCpuRateControlInformation, &cpu, sizeof(cpu));
+  }
+  STARTUPINFO si = {sizeof(si)};
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION pi = {0};
+  BOOL cr = CreateProcess(binpath, cmdline, NULL, NULL, FALSE,
+                          CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+  if (!cr) {
+    if (out_detail) snprintf(out_detail, detail_cap, "CreateProcess failed: %lu",
+                             (unsigned long)GetLastError());
+    if (job) CloseHandle(job);
+    return EDR_DC_ERR_SPAWN;
+  }
+  if (job) AssignProcessToJobObject(job, pi.hProcess);
+  SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS);
+  ResumeThread(pi.hThread);
+  CloseHandle(pi.hThread);
+  g_collector_process = pi.hProcess;
+  g_collector_job = job;
+  g_running = 1;
+  return EDR_DC_OK;
 }
 
 #else /* POSIX */
@@ -506,6 +608,12 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(), binpath, sizeof(binpath),
                              out_detail, detail_cap);
   if (vr != EDR_DC_OK) return vr;
+  if (spec->needs_velociraptor) {
+    char vd[256]; vd[0] = '\0';
+    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+      fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
+    }
+  }
   const char *bin = binpath;
   uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
 
@@ -563,6 +671,67 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     usleep(step_ms * 1000u);
     waited_ms += step_ms;
   }
+}
+
+/* 异步 spawn(POSIX):同 run_blocking 的解析/fork/execv,但不等待——登记到单例后立即返回。 */
+int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, size_t detail_cap) {
+  if (out_detail && detail_cap) out_detail[0] = '\0';
+  if (!spec || !spec->scope || !spec->scope[0]) return EDR_DC_ERR_DISABLED;
+
+  /* 单槽:已有采集在跑则忙。 */
+  if (g_collector_pid && g_running) {
+    int st = 0;
+    pid_t w = waitpid(g_collector_pid, &st, WNOHANG);
+    if (w == 0) {
+      if (out_detail) snprintf(out_detail, detail_cap, "collector busy");
+      return EDR_DC_ERR_SPAWN;
+    }
+    g_collector_pid = 0;
+  }
+  g_running = 0;
+  g_detail[0] = '\0';
+
+  char binpath[1024];
+  int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(), binpath, sizeof(binpath),
+                             out_detail, detail_cap);
+  if (vr != EDR_DC_OK) return vr;
+  if (spec->needs_velociraptor) {
+    char vd[256]; vd[0] = '\0';
+    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+      fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
+    }
+  }
+  uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    if (out_detail) snprintf(out_detail, detail_cap, "fork failed");
+    return EDR_DC_ERR_SPAWN;
+  }
+  if (pid == 0) {
+    char scope_buf[80], out_buf[1024], to_buf[40], extra[256];
+    snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
+    snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
+    snprintf(to_buf, sizeof(to_buf), "--timeout=%u", to);
+    extra[0] = '\0';
+    if (spec->extra_args) snprintf(extra, sizeof(extra), "%s", spec->extra_args);
+    char *argv[32];
+    int ai = 0;
+    argv[ai++] = (char *)binpath;
+    argv[ai++] = scope_buf;
+    argv[ai++] = out_buf;
+    argv[ai++] = to_buf;
+    char *save = NULL;
+    char *tok = strtok_r(extra, " ", &save);
+    while (tok && ai < 31) { argv[ai++] = tok; tok = strtok_r(NULL, " ", &save); }
+    argv[ai] = NULL;
+    execv(binpath, argv);
+    _exit(127);
+  }
+  g_collector_pid = pid;
+  g_running = 1;
+  snprintf(g_detail, sizeof(g_detail), "collector pid=%d started(async)", (int)pid);
+  return EDR_DC_OK;
 }
 
 #endif

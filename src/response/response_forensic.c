@@ -306,6 +306,7 @@ static int forensic_external_run(const char *cmd_id, const char *scope, const ui
   spec.output_dir = outdir;
   spec.extra_args = extra;
   spec.timeout_s = 300u;
+  spec.needs_velociraptor = 1; /* 第一级走 velo 适配器,运行前确保 velo 就绪到其槽位 */
 
   /* 第一级:Go 适配器(默认路径 forensic_collector[.exe])→ 调官方 Velociraptor。 */
   int rc = edr_deep_collector_run_blocking(&spec, detail, detail_cap);
@@ -323,6 +324,7 @@ static int forensic_external_run(const char *cmd_id, const char *scope, const ui
 #endif
     }
     spec.collector_bin = bbin;
+    spec.needs_velociraptor = 0; /* builtin 兜底不依赖 velo,勿在其前拉取 */
     char bdetail[512];
     bdetail[0] = '\0';
     int rc2 = edr_deep_collector_run_blocking(&spec, bdetail, sizeof(bdetail));
@@ -360,6 +362,236 @@ int edr_response_forensic_run_external(const char *cmd_id, const char *scope, co
 
 int edr_response_forensic_external_enabled(void) { return forensic_external_enabled(); }
 
+/* ════════════════════════ 取证异步生命周期(单槽 + 锁) ════════════════════════
+ * 受理在命令线程、收割在主循环线程、取消在命令线程、关闭在主循环线程 → 跨线程共享 g_fx,加锁。
+ * 单槽:同一时刻只允许一个 velo 采集(底层 deep_collector 本就是单例)。
+ * 上报用 edr_command_emit_always(cmd_id+sm 自含,不依赖全局 command_type) → 可在 poll 线程安全调用。 */
+#ifdef _WIN32
+static CRITICAL_SECTION g_fx_lock;
+static int g_fx_lock_init = 0;
+static void fx_lock_ensure(void) { if (!g_fx_lock_init) { InitializeCriticalSection(&g_fx_lock); g_fx_lock_init = 1; } }
+static void fx_lock(void) { fx_lock_ensure(); EnterCriticalSection(&g_fx_lock); }
+static void fx_unlock(void) { LeaveCriticalSection(&g_fx_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_fx_lock = PTHREAD_MUTEX_INITIALIZER;
+static void fx_lock(void) { pthread_mutex_lock(&g_fx_lock); }
+static void fx_unlock(void) { pthread_mutex_unlock(&g_fx_lock); }
+#endif
+
+typedef struct {
+  int active;
+  int phase;            /* 0=velo, 1=builtin */
+  int do_upload;
+  int strict;
+  int cancel_requested;
+  char cmd_id[96];
+  EdrSoarCommandMeta sm; /* 值拷贝,供 poll 线程上报 */
+  char scope[64];
+  char reqpath[900];
+  char artifact[900];
+  char outdir[512];
+  char extra[2048];
+} ForensicAsyncJob;
+static ForensicAsyncJob g_fx; /* 受 g_fx_lock 保护 */
+
+/* 构造 .req + extra_args,spawn velo(phase=0)。调用方持锁。返回 EDR_DC_OK/busy/err。 */
+static int fx_spawn_locked(const char *scope, const uint8_t *payload, size_t payload_len,
+                           const char *artifact_ext, char *detail, size_t detail_cap) {
+  const char *outdir = forensic_output_dir();
+  if (response_mkdir_p(outdir) != 0) {
+    if (detail) snprintf(detail, detail_cap, "mkdir output dir failed");
+    return -100;
+  }
+  char job[96];
+  response_sanitize_job_name(g_fx.cmd_id[0] ? g_fx.cmd_id : "job", job, sizeof(job));
+  long long ts = (long long)time(NULL);
+#ifdef _WIN32
+  const char sep = '\\';
+#else
+  const char sep = '/';
+#endif
+  snprintf(g_fx.outdir, sizeof(g_fx.outdir), "%s", outdir);
+  snprintf(g_fx.reqpath, sizeof(g_fx.reqpath), "%s%c%s_%s_%lld.req", outdir, sep, scope, job, ts);
+  snprintf(g_fx.artifact, sizeof(g_fx.artifact), "%s%c%s_%s_%lld.%s", outdir, sep, scope, job, ts,
+           artifact_ext ? artifact_ext : "bin");
+  FILE *rf = fopen(g_fx.reqpath, "wb");
+  if (!rf) { if (detail) snprintf(detail, detail_cap, "write request file failed"); return -100; }
+  if (payload && payload_len) fwrite(payload, 1, payload_len, rf);
+  fclose(rf);
+  snprintf(g_fx.extra, sizeof(g_fx.extra), "--request=%s --out-file=%s", g_fx.reqpath, g_fx.artifact);
+
+  EdrCollectorRunSpec spec = {0};
+  spec.scope = scope;
+  spec.output_dir = g_fx.outdir;
+  spec.extra_args = g_fx.extra;
+  spec.timeout_s = 300u;
+  spec.needs_velociraptor = (g_fx.phase == 0) ? 1 : 0; /* 仅 velo 层运行前确保 velo 就绪 */
+  if (g_fx.phase == 1) {
+    const char *bbin = getenv("EDR_FORENSIC_COLLECTOR_BUILTIN_BIN");
+    if (!bbin || !bbin[0]) {
+#ifdef _WIN32
+      bbin = "C:\\Program Files\\FDSecurity\\collector\\forensic_collector_builtin.exe";
+#else
+      bbin = "forensic_collector_builtin";
+#endif
+    }
+    spec.collector_bin = bbin;
+  }
+  return edr_deep_collector_spawn(&spec, detail, detail_cap);
+}
+
+int edr_response_forensic_async_accept(const char *cmd_id, const char *command_type,
+                                       const EdrSoarCommandMeta *sm, const char *scope,
+                                       const uint8_t *payload, size_t payload_len,
+                                       const char *artifact_ext, int do_upload,
+                                       char *detail, size_t detail_cap) {
+  (void)command_type;
+  fx_lock();
+  if (g_fx.active) { fx_unlock(); if (detail) snprintf(detail, detail_cap, "collector busy"); return 1; }
+  (void)memset(&g_fx, 0, sizeof(g_fx));
+  snprintf(g_fx.cmd_id, sizeof(g_fx.cmd_id), "%s", cmd_id ? cmd_id : "");
+  if (sm) g_fx.sm = *sm;
+  snprintf(g_fx.scope, sizeof(g_fx.scope), "%s", scope ? scope : "standard");
+  g_fx.do_upload = do_upload;
+  g_fx.strict = forensic_external_required();
+  g_fx.phase = 0; /* velo */
+  snprintf(g_fx.artifact, sizeof(g_fx.artifact), "%s", ""); /* 由 fx_spawn_locked 填 */
+  char art_ext[16];
+  snprintf(art_ext, sizeof(art_ext), "%s", artifact_ext ? artifact_ext : "bin");
+  /* spawn(含首次 manifest 下载,持锁;首跑较慢,后续即时) */
+  int rc = fx_spawn_locked(g_fx.scope, payload, payload_len, art_ext, detail, detail_cap);
+  if (rc != EDR_DC_OK) { (void)memset(&g_fx, 0, sizeof(g_fx)); fx_unlock(); return rc < 0 ? rc : -3; }
+  /* 复用 artifact_ext 供 phase2 同名约定:重存 ext 到 scope 后缀不需要;artifact 路径已定 */
+  g_fx.active = 1;
+  fx_unlock();
+  return 0;
+}
+
+/* 终态上报(poll 线程):成功/失败/已取消。do_upload 时先上传。 */
+static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm, int do_upload,
+                               const char *artifact, int rc, const char *tier, int cancelled) {
+  char minio_key[1024];
+  minio_key[0] = '\0';
+  if (cancelled) {
+    edr_cmd_inc_exec_fail();
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 130, "forensic cancelled by operator");
+    return;
+  }
+  if (rc == 0) {
+    if (do_upload) (void)edr_transport_v2_upload_file(cmd_id, artifact, NULL, minio_key, sizeof(minio_key));
+    char result[700];
+    snprintf(result, sizeof(result), "forensic ok(external,%s) minio_key=%.480s",
+             tier, minio_key[0] ? minio_key : "(local)");
+    edr_cmd_inc_handled();
+    edr_cmd_inc_exec_ok();
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+  } else {
+    edr_cmd_inc_exec_fail();
+    char fail[600];
+    snprintf(fail, sizeof(fail), "forensic external failed(%s) rc=%d", tier, rc);
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+  }
+}
+
+void edr_response_forensic_async_poll(void) {
+  fx_lock();
+  if (!g_fx.active) { fx_unlock(); return; }
+
+  /* 取消优先:kill 由 poll 线程统一执行,避免与 spawn 跨线程争用句柄。 */
+  if (g_fx.cancel_requested) {
+    edr_deep_collector_kill();
+    char cmd_id[96]; EdrSoarCommandMeta sm; char req[900];
+    snprintf(cmd_id, sizeof(cmd_id), "%s", g_fx.cmd_id); sm = g_fx.sm;
+    snprintf(req, sizeof(req), "%s", g_fx.reqpath);
+    (void)memset(&g_fx, 0, sizeof(g_fx));
+    fx_unlock();
+    (void)remove(req);
+    fx_report_terminal(cmd_id, &sm, 0, "", 0, "cancelled", 1);
+    return;
+  }
+
+  int exit_code = 0;
+  char pd[256]; pd[0] = '\0';
+  int pr = edr_deep_collector_poll(&exit_code, pd, sizeof(pd));
+  if (pr > 0) { fx_unlock(); return; } /* 仍在跑 */
+
+  /* 已结束(pr==0,exit_code 有效)或 poll 内部错误(pr<0) */
+  int rc = (pr < 0) ? pr : exit_code;
+  const char *tier = (g_fx.phase == 1) ? "builtin" : "velo";
+
+  /* velo 段:无 velo(5)/启动崩溃(<0) 且非 strict → 切 builtin 第二段(单槽串行)。 */
+  if (g_fx.phase == 0 && (rc == 5 || rc < 0) && !g_fx.strict) {
+    g_fx.phase = 1;
+    char bd[256]; bd[0] = '\0';
+    /* 复用同一 req/artifact 路径(artifact_ext 已含在 artifact 名里);仅换 collector_bin。 */
+    EdrCollectorRunSpec spec = {0};
+    spec.scope = g_fx.scope;
+    spec.output_dir = g_fx.outdir;
+    spec.extra_args = g_fx.extra;
+    spec.timeout_s = 300u;
+    const char *bbin = getenv("EDR_FORENSIC_COLLECTOR_BUILTIN_BIN");
+    if (!bbin || !bbin[0]) {
+#ifdef _WIN32
+      bbin = "C:\\Program Files\\FDSecurity\\collector\\forensic_collector_builtin.exe";
+#else
+      bbin = "forensic_collector_builtin";
+#endif
+    }
+    spec.collector_bin = bbin;
+    int sr = edr_deep_collector_spawn(&spec, bd, sizeof(bd));
+    if (sr == EDR_DC_OK) { fx_unlock(); return; } /* builtin 已起,下轮 poll 收割 */
+    rc = sr; tier = "builtin"; /* builtin 也起不来 → 失败终态 */
+  }
+
+  /* 终态:快照后出锁上报+上传 */
+  char cmd_id[96]; EdrSoarCommandMeta sm; char artifact[900]; char req[900];
+  int do_upload = g_fx.do_upload;
+  snprintf(cmd_id, sizeof(cmd_id), "%s", g_fx.cmd_id); sm = g_fx.sm;
+  snprintf(artifact, sizeof(artifact), "%s", g_fx.artifact);
+  snprintf(req, sizeof(req), "%s", g_fx.reqpath);
+  const char *tier_final = tier;
+  (void)memset(&g_fx, 0, sizeof(g_fx));
+  fx_unlock();
+  (void)remove(req);
+  fx_report_terminal(cmd_id, &sm, do_upload, artifact, rc, tier_final, 0);
+}
+
+int edr_response_forensic_async_cancel(const char *target_cmd_id) {
+  int hit = 0;
+  fx_lock();
+  if (g_fx.active) {
+    if (!target_cmd_id || !target_cmd_id[0] || strcmp(target_cmd_id, g_fx.cmd_id) == 0) {
+      g_fx.cancel_requested = 1; /* 实际 kill 由 poll 统一执行 */
+      hit = 1;
+    }
+  }
+  fx_unlock();
+  return hit;
+}
+
+void edr_response_forensic_async_abort_shutdown(void) {
+  fx_lock();
+  if (!g_fx.active) { fx_unlock(); return; }
+  edr_deep_collector_kill();
+  char cmd_id[96]; EdrSoarCommandMeta sm; char req[900];
+  snprintf(cmd_id, sizeof(cmd_id), "%s", g_fx.cmd_id); sm = g_fx.sm;
+  snprintf(req, sizeof(req), "%s", g_fx.reqpath);
+  (void)memset(&g_fx, 0, sizeof(g_fx));
+  fx_unlock();
+  (void)remove(req);
+  fx_report_terminal(cmd_id, &sm, 0, "", 0, "shutdown", 1);
+}
+
+int edr_response_forensic_async_active(void) {
+  int a;
+  fx_lock();
+  a = g_fx.active;
+  fx_unlock();
+  return a;
+}
+
+
 void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                     const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
@@ -369,26 +601,25 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     return;
   }
 
-  /* 外移:由独立 collector 生成 triage bundle,agent 经 transport v2 上传(通信只走 agent)。 */
+  /* 外移:由独立 collector 异步生成 triage bundle,完成由主循环 poll 上传+上报。 */
   if (forensic_external_enabled()) {
-    char minio_key[1024];
     char dc_detail[512];
-    minio_key[0] = '\0';
-    int rc = forensic_external_run(cmd_id, "collect_forensic", pl, len, "tar.gz", 1, minio_key,
-                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
-    if (rc == 0) {
-      char result[640];
-      snprintf(result, sizeof(result), "forensic bundle ok(external) minio_key=%.480s",
-               minio_key[0] ? minio_key : "(local)");
-      edr_cmd_inc_handled();
-      edr_cmd_inc_exec_ok();
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    dc_detail[0] = '\0';
+    int ar = edr_response_forensic_async_accept(cmd_id, "collect_forensic", sm, "collect_forensic",
+                                                pl, len, "tar.gz", 1, dc_detail, sizeof(dc_detail));
+    if (ar == 0) {
+      edr_command_audit_both(cmd_id, "collect_forensic: accepted(async velo); poll 上报终态");
+      return;
+    }
+    if (ar == 1) {
+      edr_cmd_inc_exec_fail();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
       return;
     }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
       char fail[600];
-      snprintf(fail, sizeof(fail), "collect_forensic external failed rc=%d: %.460s", rc, dc_detail);
+      snprintf(fail, sizeof(fail), "collect_forensic external failed rc=%d: %.460s", ar, dc_detail);
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
       return;
     }
@@ -595,26 +826,22 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
     return;
   }
 
-  /* 外移:collector 按 request 中的 item 清单采集打包,agent 上传(通信只走 agent)。 */
+  /* 外移:collector 按 request 中的 item 清单异步采集打包,完成由主循环 poll 上传+上报。 */
   if (forensic_external_enabled()) {
-    char minio_key[1024];
     char dc_detail[512];
-    minio_key[0] = '\0';
-    int rc = forensic_external_run(cmd_id, "targeted_forensic", pl, len, "tar.gz", 1, minio_key,
-                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
-    if (rc == 0) {
-      char result[640];
-      snprintf(result, sizeof(result), "TARGETED_OK(external) minio_key=%.480s",
-               minio_key[0] ? minio_key : "(local)");
-      edr_cmd_inc_handled();
-      edr_cmd_inc_exec_ok();
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    dc_detail[0] = '\0';
+    int ar = edr_response_forensic_async_accept(cmd_id, "targeted_forensic", sm, "targeted_forensic",
+                                                pl, len, "tar.gz", 1, dc_detail, sizeof(dc_detail));
+    if (ar == 0) { edr_command_audit_both(cmd_id, "targeted_forensic: accepted(async)"); return; }
+    if (ar == 1) {
+      edr_cmd_inc_exec_fail();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
       return;
     }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
       char fail[600];
-      snprintf(fail, sizeof(fail), "targeted_forensic external failed rc=%d: %.460s", rc, dc_detail);
+      snprintf(fail, sizeof(fail), "targeted_forensic external failed rc=%d: %.460s", ar, dc_detail);
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
       return;
     }
@@ -703,25 +930,20 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   /* 重/危险取证外移:优先走独立 collector 进程;成功后 agent 经 transport v2 上传 .dmp(通信只走 agent)。
    * 失败时:STRICT 模式直接报错,否则回退 in-process(稳定优先)。 */
   if (forensic_external_enabled()) {
-    char minio_key[1024];
     char dc_detail[512];
-    minio_key[0] = '\0';
-    int rc = forensic_external_run(cmd_id, "memory_dump", pl, len, "dmp", 1, minio_key,
-                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
-    if (rc == 0) {
-      char result[640];
-      snprintf(result, sizeof(result), "MEMDUMP_OK(external) pid=%d minio_key=%.480s", pid,
-               minio_key[0] ? minio_key : "(local)");
-      edr_cmd_inc_handled();
-      edr_cmd_inc_exec_ok();
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    dc_detail[0] = '\0';
+    int ar = edr_response_forensic_async_accept(cmd_id, "memory_dump", sm, "memory_dump",
+                                                pl, len, "dmp", 1, dc_detail, sizeof(dc_detail));
+    if (ar == 0) { edr_command_audit_both(cmd_id, "memory_dump: accepted(async)"); return; }
+    if (ar == 1) {
+      edr_cmd_inc_exec_fail();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
       return;
     }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
       char fail[600];
-      snprintf(fail, sizeof(fail), "memory_dump external collector failed rc=%d: %.470s", rc,
-               dc_detail);
+      snprintf(fail, sizeof(fail), "memory_dump external collector failed rc=%d: %.470s", ar, dc_detail);
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
       return;
     }
@@ -823,26 +1045,22 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
     return;
   }
 
-  /* 外移:collector 按 request(target_path/pid + 规则)扫描并落结果 json,agent 上传(通信只走 agent)。 */
+  /* 外移:collector 按 request(target_path/pid + 规则)异步扫描,完成由主循环 poll 上传+上报。 */
   if (forensic_external_enabled()) {
-    char minio_key[1024];
     char dc_detail[512];
-    minio_key[0] = '\0';
-    int rc = forensic_external_run(cmd_id, "yara_scan", pl, len, "json", 1, minio_key,
-                                   sizeof(minio_key), dc_detail, sizeof(dc_detail));
-    if (rc == 0) {
-      char result[640];
-      snprintf(result, sizeof(result), "YARA_OK(external) minio_key=%.480s",
-               minio_key[0] ? minio_key : "(local)");
-      edr_cmd_inc_handled();
-      edr_cmd_inc_exec_ok();
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    dc_detail[0] = '\0';
+    int ar = edr_response_forensic_async_accept(cmd_id, "yara_scan", sm, "yara_scan",
+                                                pl, len, "json", 1, dc_detail, sizeof(dc_detail));
+    if (ar == 0) { edr_command_audit_both(cmd_id, "yara_scan: accepted(async)"); return; }
+    if (ar == 1) {
+      edr_cmd_inc_exec_fail();
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
       return;
     }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
       char fail[600];
-      snprintf(fail, sizeof(fail), "yara_scan external failed rc=%d: %.460s", rc, dc_detail);
+      snprintf(fail, sizeof(fail), "yara_scan external failed rc=%d: %.460s", ar, dc_detail);
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
       return;
     }

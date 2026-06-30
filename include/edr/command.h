@@ -39,6 +39,8 @@ typedef struct EdrSoarCommandMeta {
   char idempotency_key[512];
   int64_t issued_at_unix_ms;
   uint32_t deadline_ms;
+  /* 命令发起来源(取证 velo 仅允许 "operator" 人工下发;空/其它=自动化,被 gate 拒绝)。 */
+  char initiated_by[32];
 } EdrSoarCommandMeta;
 
 /** 与 ingest.proto CommandExecutionStatus 枚举值一致 */

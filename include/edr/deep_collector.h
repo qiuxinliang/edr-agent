@@ -60,6 +60,7 @@ typedef struct {
   const char *output_dir;    /* 本地产物目录 */
   const char *extra_args;    /* 透传 collector,如 "--pid=1234 --full"（已做基本清洗） */
   uint32_t timeout_s;        /* 0 表示默认 300s */
+  int needs_velociraptor;    /* 1=velo 层(运行前确保 velociraptor 就绪到其槽位);0=builtin/其它,不拉 velo */
 } EdrCollectorRunSpec;
 
 /**
@@ -74,5 +75,15 @@ typedef struct {
  */
 int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec,
                                     char *out_detail, size_t detail_cap);
+
+/**
+ * 异步 spawn(非阻塞)——用同一 EdrCollectorRunSpec 契约(.req/--out-file 由调用方拼进 extra_args),
+ * 复用 dc_resolve_verify(平台固定地址下载 + SHA256 校验),spawn 后立即返回,进程登记到单例。
+ * 之后由 agent 主循环周期调 edr_deep_collector_poll() 收割,edr_deep_collector_kill() 取消。
+ * 返回 EDR_DC_OK 已受理并在后台运行;EDR_DC_ERR_SPAWN 已有采集在跑(busy)或 spawn 失败;
+ *      其它<0 为路径解析/下载/校验失败(out_detail 写诊断)。
+ * 单槽:同一时刻只允许一个采集;busy 时调用方应返回"忙"。
+ */
+int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, size_t detail_cap);
 
 #endif

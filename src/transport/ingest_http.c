@@ -5632,6 +5632,8 @@ static int poll_dispatch_one(const char *obj) {
   (void)json_get_string(obj, "playbook_run_id", sm.playbook_run_id, sizeof(sm.playbook_run_id));
   (void)json_get_string(obj, "playbook_step_id", sm.playbook_step_id, sizeof(sm.playbook_step_id));
   (void)json_get_string(obj, "idempotency_key", sm.idempotency_key, sizeof(sm.idempotency_key));
+  /* 命令发起来源:取证 velo 仅允许 operator 人工下发(见 command_stub forensic gate)。 */
+  (void)json_get_string(obj, "initiated_by", sm.initiated_by, sizeof(sm.initiated_by));
   if (json_get_int64(obj, "issued_at_unix_ms", &v) == 0) {
     sm.issued_at_unix_ms = v;
   }

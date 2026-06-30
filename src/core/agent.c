@@ -5,6 +5,7 @@
 #include "edr/behavior_alert_emit.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
+#include "edr/response.h"
 #include "edr/preprocess.h"
 #include "edr/resource.h"
 #include "edr/heartbeat.h"
@@ -1435,9 +1436,14 @@ EdrError edr_agent_run(EdrAgent *agent) {
                              edr_agent_poll_engine_health(agent, &last_health_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
+        /* 取证异步生命周期收割:velo 完成→velo→builtin 两段/上传/唯一终态上报;取消由此统一 kill。
+         * 空闲时仅一次加锁+标志检查,开销可忽略,故每轮直调不另设节流。 */
+        edr_response_forensic_async_poll();
         edr_agent_loop_probe_end(edr_loop_started_ns);
       }
       /* §B2 干净退出：写 stop stamp，阻止伴生 watchdog 复活本进程。 */
+      /* 取证异步:agent 退出前 kill 在跑的 velo(POSIX fork 子进程不随父退出消失)并补报。 */
+      edr_response_forensic_async_abort_shutdown();
       edr_watchdog_agent_on_shutdown(&agent->cfg);
       if (agent->collector_started) {
         edr_collector_stop();
