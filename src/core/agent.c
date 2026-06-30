@@ -1233,12 +1233,21 @@ void edr_agent_destroy(EdrAgent *agent) {
  * os/arch 取编译期常量(agent 二进制架构即宿主架构)。已显式设置 env 时不覆盖。 */
 static void edr_agent_derive_forensic_manifest_env(const EdrConfig *cfg) {
   /* velo 与 适配器 各自独立推导：任一已显式设置则跳过该项，不互相短路。 */
+  if (!cfg) {
+    return;
+  }
+  /* 取证下载(dc_download 裸 curl)需信任平台 CA——把 agent 配置里的 ca_cert 导出供其 --cacert 使用，
+   * 否则私有 CA(如 mkcert)下 manifest/二进制拉取会 TLS 校验失败。已显式设置则不覆盖。 */
+  if (getenv("EDR_FORENSIC_CA_CERT") == NULL && cfg->server.ca_cert[0]) {
+#if defined(_WIN32)
+    _putenv_s("EDR_FORENSIC_CA_CERT", cfg->server.ca_cert);
+#else
+    setenv("EDR_FORENSIC_CA_CERT", cfg->server.ca_cert, 0);
+#endif
+  }
   int need_velo = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL") == NULL;
   int need_adapter = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL") == NULL;
   if (!need_velo && !need_adapter) {
-    return;
-  }
-  if (!cfg) {
     return;
   }
   const char *base = cfg->platform.rest_base_url;

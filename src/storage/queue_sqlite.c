@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #endif
 #else
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -330,30 +331,81 @@ static int exec_simple(sqlite3 *db, const char *sql) {
   return SQLITE_OK;
 }
 
+/* 锁等待上限(ms):重装/重启时旧实例可能在数秒内才释放锁;有界重试避免新实例瞬时秒退。
+ * EDR_QUEUE_LOCK_WAIT_MS 可调(默认 3000,范围 0~30000);真被占用则等满后再放弃。 */
+static long queue_lock_wait_ms(void) {
+  const char *e = getenv("EDR_QUEUE_LOCK_WAIT_MS");
+  long v = e && e[0] ? strtol(e, NULL, 10) : 3000L;
+  if (v < 0) v = 0;
+  if (v > 30000) v = 30000;
+  return v;
+}
+
 static int queue_lock_acquire(const char *path) {
   if (!path || !path[0]) {
     return -1;
   }
   snprintf(s_lock_path, sizeof(s_lock_path), "%s.lock", path);
+  const long wait_ms = queue_lock_wait_ms();
 #if defined(_WIN32)
-  s_lock_handle = CreateFileA(s_lock_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-  if (s_lock_handle == INVALID_HANDLE_VALUE) {
-    fprintf(stderr, "[queue] cannot acquire queue file lock: %s\n", s_lock_path);
-    return -1;
+  /* 独占打开(share=0):持有者进程退出时 OS 自动释放句柄,故真陈旧锁不阻塞;
+   * 仅在另一活实例持有(SHARING_VIOLATION)时按上限重试;ACL 拒绝(ACCESS_DENIED)直接报权限,重试无益。 */
+  const DWORD step = 250;
+  long waited = 0;
+  for (;;) {
+    s_lock_handle = CreateFileA(s_lock_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    if (s_lock_handle != INVALID_HANDLE_VALUE) {
+      return 0;
+    }
+    DWORD err = GetLastError();
+    if (err == ERROR_ACCESS_DENIED) {
+      fprintf(stderr,
+              "[queue] lock open denied (ACL/权限不足,Agent 须以 SYSTEM 经计划任务运行;勿手动前台跑): %s\n",
+              s_lock_path);
+      return -1;
+    }
+    if (waited >= wait_ms) {
+      fprintf(stderr,
+              "[queue] cannot acquire queue file lock after %ldms (另一实例持有): %s\n",
+              wait_ms, s_lock_path);
+      return -1;
+    }
+    Sleep(step);
+    waited += (long)step;
   }
-  return 0;
 #else
   s_lock_fd = open(s_lock_path, O_CREAT | O_RDWR, 0600);
-  if (s_lock_fd < 0 || flock(s_lock_fd, LOCK_EX | LOCK_NB) != 0) {
-    if (s_lock_fd >= 0) {
-      close(s_lock_fd);
-      s_lock_fd = -1;
+  if (s_lock_fd < 0) {
+    if (errno == EACCES || errno == EPERM) {
+      fprintf(stderr, "[queue] lock open denied (权限不足,须以服务身份运行): %s\n", s_lock_path);
+    } else {
+      fprintf(stderr, "[queue] cannot open queue lock file (errno=%d): %s\n", errno, s_lock_path);
     }
-    fprintf(stderr, "[queue] cannot acquire queue file lock: %s\n", s_lock_path);
     return -1;
   }
-  return 0;
+  const long step_us = 250000; /* 250ms */
+  long waited = 0;
+  for (;;) {
+    if (flock(s_lock_fd, LOCK_EX | LOCK_NB) == 0) {
+      return 0;
+    }
+    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+      fprintf(stderr, "[queue] flock failed (errno=%d): %s\n", errno, s_lock_path);
+      close(s_lock_fd);
+      s_lock_fd = -1;
+      return -1;
+    }
+    if (waited >= wait_ms) {
+      close(s_lock_fd);
+      s_lock_fd = -1;
+      fprintf(stderr, "[queue] cannot acquire queue file lock after %ldms (另一实例持有): %s\n",
+              wait_ms, s_lock_path);
+      return -1;
+    }
+    usleep(step_us);
+    waited += 250;
+  }
 #endif
 }
 

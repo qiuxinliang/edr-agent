@@ -48,9 +48,12 @@ static int dc_file_exists(const char *path) {
 static int dc_url_ok(const char *url) {
   if (!url || !url[0]) return 0;
   if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) return 0;
+  /* 注:dc_download 在 Win 走 CreateProcessA(无 cmd.exe)、*nix 走 execlp(argv),URL 不经 shell 解释，
+   * 故查询串里的 '&' 是合法的(manifest URL 形如 ?kind=...&os=...&arch=...);只需拦真正会破坏
+   * 引号包裹/参数切分的字符:引号、空格、反引号、控制字符、重定向符。 */
   for (const unsigned char *p = (const unsigned char *)url; *p; p++) {
-    if (*p < 0x20 || *p == '"' || *p == '\'' || *p == '`' || *p == ';' ||
-        *p == '|' || *p == '&' || *p == '$' || *p == '\\' || *p == ' ' || *p == '<' || *p == '>') {
+    if (*p < 0x20 || *p == '"' || *p == '\'' || *p == '`' ||
+        *p == '\\' || *p == ' ' || *p == '<' || *p == '>') {
       return 0;
     }
   }
@@ -68,13 +71,35 @@ static int dc_path_ok(const char *p) {
 
 /* 经 curl 下载 url 到 dest(本地)。成功返回 0。**不经 shell**(消除命令注入):
  * POSIX 用 fork+execlp 直传 argv;Windows 用 CreateProcess 直起 curl.exe(不经 cmd.exe)。 */
+/* TLS 信任:平台多为私有 CA(企业自签/mkcert),裸 curl 默认只认系统信任库 → 校验失败。
+ * 取 agent 配置导出的 EDR_FORENSIC_CA_CERT 作 --cacert;EDR_FORENSIC_COLLECTOR_INSECURE_TLS=1 时 -k(逃生口)。
+ * ca 路径来源可信(agent 自身配置),仅做基本字符护栏避免破坏引号/参数切分。 */
+static int dc_tls_ca_ok(const char *p) {
+  if (!p || !p[0]) return 0;
+  for (const unsigned char *c = (const unsigned char *)p; *c; c++) {
+    if (*c < 0x20 || *c == '"' || *c == '`' || *c == '<' || *c == '>') return 0;
+  }
+  return 1;
+}
+
 static int dc_download(const char *url, const char *dest) {
   if (!dc_url_ok(url) || !dc_path_ok(dest)) return -1;
+  const char *ca = getenv("EDR_FORENSIC_CA_CERT");
+  const char *insec = getenv("EDR_FORENSIC_COLLECTOR_INSECURE_TLS");
+  int use_insecure = insec && insec[0] == '1';
+  int use_ca = !use_insecure && dc_tls_ca_ok(ca);
 #ifdef _WIN32
-  char cmd[2600];
+  char cmd[4096];
+  char tlsopt[1200];
+  tlsopt[0] = '\0';
+  if (use_insecure) {
+    snprintf(tlsopt, sizeof(tlsopt), " -k");
+  } else if (use_ca) {
+    snprintf(tlsopt, sizeof(tlsopt), " --cacert \"%s\"", ca);
+  }
   /* 直起 curl.exe(lpApplicationName=NULL → 按 PATH 解析首 token);不走 cmd.exe,故无 shell 解释。
-   * url 已禁引号/空格,dest 已禁引号 → 引号包裹安全。 */
-  snprintf(cmd, sizeof(cmd), "curl.exe -fsSL \"%s\" -o \"%s\"", url, dest);
+   * url/dest/ca 已过字符护栏,引号包裹安全。 */
+  snprintf(cmd, sizeof(cmd), "curl.exe -fsSL%s \"%s\" -o \"%s\"", tlsopt, url, dest);
   STARTUPINFOA si = { sizeof(si) };
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
@@ -92,8 +117,23 @@ static int dc_download(const char *url, const char *dest) {
   pid_t pid = fork();
   if (pid < 0) return -1;
   if (pid == 0) {
-    /* 子进程:argv 直传,curl 永不经 shell 解释 url/dest;`--` 阻断选项注入。 */
-    execlp("curl", "curl", "-fsSL", "--", url, "-o", dest, (char *)NULL);
+    /* 子进程:argv 直传,curl 永不经 shell 解释;`--` 阻断选项注入。 */
+    const char *argv[12];
+    int n = 0;
+    argv[n++] = "curl";
+    argv[n++] = "-fsSL";
+    if (use_insecure) {
+      argv[n++] = "-k";
+    } else if (use_ca) {
+      argv[n++] = "--cacert";
+      argv[n++] = ca;
+    }
+    argv[n++] = "--";
+    argv[n++] = url;
+    argv[n++] = "-o";
+    argv[n++] = dest;
+    argv[n] = NULL;
+    execvp("curl", (char *const *)argv);
     _exit(127);
   }
   int st = 0;
