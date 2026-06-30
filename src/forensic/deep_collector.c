@@ -6,6 +6,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 平台头(供下方共享段的 dc_download 直起 curl 用;平台分支后会重复 include,有头文件 guard 无碍)。 */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 /* P3:下载 + SHA256 验签的平台无关辅助(放在平台分支之前,两端共用)。 */
 
 /* 计算文件 SHA256(十六进制,小写)。成功返回 0。大文件分块读。 */
@@ -34,16 +43,62 @@ static int dc_file_exists(const char *path) {
   return 0;
 }
 
-/* 经 curl 下载 url 到 dest(本地)。成功返回 0。仅在 collector 缺失且配置了 URL 时使用。 */
+/* url 基本合法性:必须 http(s):// 开头,且不含控制字符/引号/shell 元字符(纵深防御)。 */
+static int dc_url_ok(const char *url) {
+  if (!url || !url[0]) return 0;
+  if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) return 0;
+  for (const unsigned char *p = (const unsigned char *)url; *p; p++) {
+    if (*p < 0x20 || *p == '"' || *p == '\'' || *p == '`' || *p == ';' ||
+        *p == '|' || *p == '&' || *p == '$' || *p == '\\' || *p == ' ' || *p == '<' || *p == '>') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* dest 路径不得含引号/控制字符(Windows 命令行引号安全;路径可含空格故只禁引号与控制符)。 */
+static int dc_path_ok(const char *p) {
+  if (!p || !p[0]) return 0;
+  for (const unsigned char *c = (const unsigned char *)p; *c; c++) {
+    if (*c < 0x20 || *c == '"') return 0;
+  }
+  return 1;
+}
+
+/* 经 curl 下载 url 到 dest(本地)。成功返回 0。**不经 shell**(消除命令注入):
+ * POSIX 用 fork+execlp 直传 argv;Windows 用 CreateProcess 直起 curl.exe(不经 cmd.exe)。 */
 static int dc_download(const char *url, const char *dest) {
-  if (!url || !url[0] || !dest || !dest[0]) return -1;
-  char cmd[2600];
+  if (!dc_url_ok(url) || !dc_path_ok(dest)) return -1;
 #ifdef _WIN32
-  snprintf(cmd, sizeof(cmd), "curl -fsSL \"%s\" -o \"%s\" 1>nul 2>nul", url, dest);
+  char cmd[2600];
+  /* 直起 curl.exe(lpApplicationName=NULL → 按 PATH 解析首 token);不走 cmd.exe,故无 shell 解释。
+   * url 已禁引号/空格,dest 已禁引号 → 引号包裹安全。 */
+  snprintf(cmd, sizeof(cmd), "curl.exe -fsSL \"%s\" -o \"%s\"", url, dest);
+  STARTUPINFOA si = { sizeof(si) };
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION pi = {0};
+  if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    return -1;
+  }
+  WaitForSingleObject(pi.hProcess, 600000); /* 10min 上限 */
+  DWORD ec = 1;
+  GetExitCodeProcess(pi.hProcess, &ec);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return ec == 0 ? 0 : -1;
 #else
-  snprintf(cmd, sizeof(cmd), "curl -fsSL '%s' -o '%s' 2>/dev/null", url, dest);
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    /* 子进程:argv 直传,curl 永不经 shell 解释 url/dest;`--` 阻断选项注入。 */
+    execlp("curl", "curl", "-fsSL", "--", url, "-o", dest, (char *)NULL);
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) != pid) return -1;
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
 #endif
-  return system(cmd) == 0 ? 0 : -1;
 }
 
 /* 从小型 manifest JSON 中提取字符串字段 "key":"value"(value 不含转义)。成功返回 0。

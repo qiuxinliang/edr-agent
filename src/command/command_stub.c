@@ -3035,21 +3035,13 @@ static int forensic_operator_gate(const EdrSoarCommandMeta *sm, const uint8_t *p
       return 1;
     }
   }
-  /* payload 兜底:{"initiated_by":"operator"} 或 {"manual":true} */
+  /* payload 兜底:结构化解析 {"initiated_by":"operator"/"manual"}(后端对人工命令注入此字段)。
+   * 不再用松散 strstr 子串匹配,避免被其它字段值伪造绕过。 */
   char ib[32];
   ib[0] = '\0';
   if (parse_json_string_field(pl, len, "initiated_by", ib, sizeof(ib)) == 0 &&
       (strcasecmp(ib, "operator") == 0 || strcasecmp(ib, "manual") == 0)) {
     return 1;
-  }
-  if (pl && len) {
-    char tmp[256];
-    size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
-    memcpy(tmp, pl, n);
-    tmp[n] = '\0';
-    if (strstr(tmp, "\"manual\":true") || strstr(tmp, "\"manual\": true")) {
-      return 1;
-    }
   }
   return 0;
 }
@@ -4648,11 +4640,8 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
   if (streq(t, "collect_forensic") || streq(t, "forensic")) {
-    if (!forensic_operator_gate(sm, payload, payload_len)) {
-      edr_command_audit_both(id, "reject forensic: operator-only(人工下发) gate");
-      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
-      return;
-    }
+    /* collect_forensic = in-process 打包(不调 velo),不受 operator-only gate 约束:
+     * gate 只针对真正执行 velociraptor 的命令(velo_query / memory_dump / targeted / yara)。 */
     do_forensic(id, payload, payload_len, sm);
     return;
   }
@@ -4738,6 +4727,11 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     return;
   }
   if (streq(t, "velo_query") || streq(t, "RTR_VELO_QUERY")) {
+    if (!forensic_operator_gate(sm, payload, payload_len)) {
+      edr_command_audit_both(id, "reject velo_query: operator-only(人工下发) gate");
+      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "velo_query requires operator-initiated dispatch");
+      return;
+    }
     do_velo_query(id, payload, payload_len, sm);
     return;
   }
