@@ -1,5 +1,6 @@
 #include "edr/deep_collector.h"
 
+#include "edr/ingest_http.h"
 #include "edr/sha256.h"
 
 #include <stdio.h>
@@ -44,6 +45,19 @@ static int dc_file_exists(const char *path) {
   return 0;
 }
 
+/* 文件大小(字节);不存在/不可读返回 -1。可移植(fseek/ftell),无平台分支。 */
+static long dc_file_size(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  long sz = ftell(f);
+  fclose(f);
+  return sz;
+}
+
+/* 非空文件视为"就绪"。下载失败/中断常留 0 字节坏件,若仅用 dc_file_exists 会被当成已装而永不自愈。 */
+static int dc_file_nonempty(const char *path) { return dc_file_size(path) > 0; }
+
 /* url 基本合法性:必须 http(s):// 开头,且不含控制字符/引号/shell 元字符(纵深防御)。 */
 static int dc_url_ok(const char *url) {
   if (!url || !url[0]) return 0;
@@ -84,6 +98,18 @@ static int dc_tls_ca_ok(const char *p) {
 
 static int dc_download(const char *url, const char *dest) {
   if (!dc_url_ok(url) || !dc_path_ok(dest)) return -1;
+  /* 首选 Agent 自带的 OpenSSL HTTP 客户端:认 ca.pem(私有 CA 无碍)、带鉴权头、无 Schannel 吊销/
+   * curl.exe PATH 依赖。256MiB 上限覆盖 velo(~80MB),客户端流式写文件内存安全。
+   * 仅当它失败(如下载源在不同主机/未配置)时回退到 curl。EDR_FORENSIC_DOWNLOAD_NO_INPROC=1 可禁用此首选。 */
+  {
+    const char *noinproc = getenv("EDR_FORENSIC_DOWNLOAD_NO_INPROC");
+    if (!(noinproc && noinproc[0] == '1')) {
+      if (edr_ingest_http_get_url_to_file(url, dest, 256u * 1024u * 1024u) == 0 && dc_file_nonempty(dest)) {
+        return 0;
+      }
+      (void)remove(dest); /* 客户端可能留半截/0 字节,清掉再让 curl 兜底重试 */
+    }
+  }
   const char *ca = getenv("EDR_FORENSIC_CA_CERT");
   const char *insec = getenv("EDR_FORENSIC_COLLECTOR_INSECURE_TLS");
   int use_insecure = insec && insec[0] == '1';
@@ -98,8 +124,10 @@ static int dc_download(const char *url, const char *dest) {
     snprintf(tlsopt, sizeof(tlsopt), " --cacert \"%s\"", ca);
   }
   /* 直起 curl.exe(lpApplicationName=NULL → 按 PATH 解析首 token);不走 cmd.exe,故无 shell 解释。
-   * url/dest/ca 已过字符护栏,引号包裹安全。 */
-  snprintf(cmd, sizeof(cmd), "curl.exe -fsSL%s \"%s\" -o \"%s\"", tlsopt, url, dest);
+   * url/dest/ca 已过字符护栏,引号包裹安全。
+   * --ssl-no-revoke:Windows 自带 curl 用 Schannel 后端,对私有 CA(mkcert/企业自签,无 CRL/OCSP)会因
+   * "revocation status unknown" 拒绝(curl: (60));跳过吊销检查(仍校验证书链),这是私有 CA 的标准做法。 */
+  snprintf(cmd, sizeof(cmd), "curl.exe -fsSL --ssl-no-revoke%s \"%s\" -o \"%s\"", tlsopt, url, dest);
   STARTUPINFOA si = { sizeof(si) };
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
@@ -182,6 +210,7 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
   char mf_path[1100];
   snprintf(mf_path, sizeof(mf_path), "%s.mf.json", dest);
   if (dc_download(manifest_url, mf_path) != 0) {
+    (void)remove(mf_path); /* 失败可能留 0 字节坏件,清掉避免下次误读 */
     if (detail) snprintf(detail, detail_cap, "manifest fetch failed");
     return EDR_DC_ERR_DOWNLOAD;
   }
@@ -208,7 +237,13 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
   out_sha[0] = '\0';
   (void)dc_json_str(buf, "sha256", out_sha, 65); /* 缺 sha 则后续按 env 或无 pin 处理 */
   if (dc_download(url, dest) != 0) {
+    (void)remove(dest); /* 失败/中断常留 0 字节坏件,清掉以便下次重新拉取(否则被当成已装) */
     if (detail) snprintf(detail, detail_cap, "collector download failed (manifest url)");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  if (!dc_file_nonempty(dest)) {
+    (void)remove(dest); /* 成功但 0 字节(代理/截断) → 视为失败,删坏件 */
+    if (detail) snprintf(detail, detail_cap, "downloaded artifact is empty");
     return EDR_DC_ERR_DOWNLOAD;
   }
   return EDR_DC_OK;
@@ -249,7 +284,7 @@ static void dc_make_parent_dir(const char *path) {
  * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
 static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
   if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
-  if (dc_file_exists(dest)) return EDR_DC_OK;
+  if (dc_file_nonempty(dest)) return EDR_DC_OK;
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
   const char *mf = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL"); /* kind=forensic_collector */
@@ -293,12 +328,12 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
   if (!bin) bin = platform_default;
   snprintf(out_path, cap, "%s", bin ? bin : "");
 
-  if (!dc_file_exists(out_path)) {
-    /* 适配器缺失 → 经平台 manifest(kind=forensic_collector)按需自动下发到该路径,再复检。 */
+  if (!dc_file_nonempty(out_path)) {
+    /* 适配器缺失/0 字节坏件 → 经平台 manifest(kind=forensic_collector)按需自动下发到该路径,再复检。 */
     char ad[256];
     ad[0] = '\0';
     (void)dc_ensure_adapter(out_path, ad, sizeof(ad));
-    if (!dc_file_exists(out_path)) {
+    if (!dc_file_nonempty(out_path)) {
       if (detail) {
         snprintf(detail, detail_cap, "collector adapter missing: %.300s (%s)", out_path,
                  ad[0] ? ad : "平台未激活适配器制品或终端无法访问固定地址");
@@ -337,7 +372,7 @@ static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
     snprintf(path, sizeof(path), "%s", "velociraptor");
 #endif
   }
-  if (dc_file_exists(path)) return EDR_DC_OK; /* 已就绪 */
+  if (dc_file_nonempty(path)) return EDR_DC_OK; /* 已就绪(非空) */
 
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
@@ -780,7 +815,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   }
   if (pid == 0) {
     /* child:组装 argv(不含 --upload-url),透传 extra_args(空格分词) */
-    char scope_buf[80], out_buf[1024], to_buf[40], extra[256];
+    char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
     snprintf(to_buf, sizeof(to_buf), "--timeout=%u", to);
@@ -865,7 +900,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     return EDR_DC_ERR_SPAWN;
   }
   if (pid == 0) {
-    char scope_buf[80], out_buf[1024], to_buf[40], extra[256];
+    char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
     snprintf(to_buf, sizeof(to_buf), "--timeout=%u", to);

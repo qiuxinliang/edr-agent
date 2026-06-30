@@ -4134,8 +4134,10 @@ int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
   if (cap < 4096u) {
     cap = 4096u;
   }
-  if (cap > 4u * 1024u * 1024u) {
-    cap = 4u * 1024u * 1024u;
+  /* 上限 256MiB：取证采集器(velociraptor ~80MB)经此通道下载;响应是流式写文件(逐块受 max_bytes 约束),
+   * 内存不随文件增长。小请求(配置/规则/manifest)按各自传入的 max_bytes 生效,本上限只抬高天花板。 */
+  if (cap > 256u * 1024u * 1024u) {
+    cap = 256u * 1024u * 1024u;
   }
   f = fopen(file_path, "wb");
 	if (!f) {
