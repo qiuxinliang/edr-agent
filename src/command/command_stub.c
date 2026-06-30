@@ -37,6 +37,11 @@
 #include <string.h>
 #include <time.h>
 
+/* MSVC 无 POSIX strcasecmp:映射到 _stricmp(POSIX 编译时此宏不生效)。 */
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
+
 #if defined(EDR_HAVE_OPENSSL_HTTP) || defined(EDR_HAVE_OPENSSL_FL)
 #define EDR_HAVE_COMMAND_SIGNATURE_OPENSSL 1
 #include <openssl/bio.h>
