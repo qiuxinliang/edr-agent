@@ -11,6 +11,7 @@
 #include <windows.h>
 #else
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -184,6 +185,59 @@ static int dc_hex64_ieq(const char *a, const char *b) {
   return 1;
 }
 
+/* 尽力创建 path 的父目录(单层即可:安装目录通常已在,仅 collector 子目录可能缺)。 */
+static void dc_make_parent_dir(const char *path) {
+  char dir[1024];
+  snprintf(dir, sizeof(dir), "%s", path ? path : "");
+  size_t n = strlen(dir);
+  while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') {
+    dir[--n] = '\0';
+  }
+  if (n == 0) return;
+  dir[--n] = '\0'; /* 去掉尾部分隔符 */
+  if (!dir[0]) return;
+#ifdef _WIN32
+  (void)CreateDirectoryA(dir, NULL); /* 已存在/父级缺失均忽略,best-effort */
+#else
+  (void)mkdir(dir, 0755);
+#endif
+}
+
+/* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
+ * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
+ * (EDR_FORENSIC_COLLECTOR_SHA256 env pin > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
+ * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
+static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
+  if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
+  if (dc_file_exists(dest)) return EDR_DC_OK;
+  const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
+  int autofetch = !(af && af[0] == '0');
+  const char *mf = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL"); /* kind=forensic_collector */
+  if (!autofetch || !mf || !mf[0]) {
+    if (detail) snprintf(detail, detail_cap, "adapter missing; autofetch/manifest unavailable");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  dc_make_parent_dir(dest);
+  char manifest_sha[65];
+  manifest_sha[0] = '\0';
+  int rc = dc_autofetch_via_manifest(mf, dest, manifest_sha, detail, detail_cap);
+  if (rc != EDR_DC_OK) return rc;
+  const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
+  if ((!want || !want[0]) && manifest_sha[0]) want = manifest_sha;
+  if (want && want[0]) {
+    char got[65];
+    if (dc_sha256_file(dest, got) != 0 || !dc_hex64_ieq(got, want)) {
+      if (detail) snprintf(detail, detail_cap, "adapter sha256 mismatch/read fail");
+      (void)remove(dest); /* 删坏件,避免下次复用 */
+      return EDR_DC_ERR_SIGNATURE;
+    }
+  }
+#ifndef _WIN32
+  (void)chmod(dest, 0755); /* 下载件需可执行位 */
+#endif
+  return EDR_DC_OK;
+}
+
 /* 解析适配器(forensic_collector)路径并校验。返回 0 可执行;否则 <0。
  * 路径来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
  * 适配器为小体积件,随安装包内置:缺失即返回 EDR_DC_ERR_DOWNLOAD(调用方回退 builtin),
@@ -200,10 +254,17 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
   snprintf(out_path, cap, "%s", bin ? bin : "");
 
   if (!dc_file_exists(out_path)) {
-    if (detail) {
-      snprintf(detail, detail_cap, "collector adapter missing: %.400s (应随安装包内置)", out_path);
+    /* 适配器缺失 → 经平台 manifest(kind=forensic_collector)按需自动下发到该路径,再复检。 */
+    char ad[256];
+    ad[0] = '\0';
+    (void)dc_ensure_adapter(out_path, ad, sizeof(ad));
+    if (!dc_file_exists(out_path)) {
+      if (detail) {
+        snprintf(detail, detail_cap, "collector adapter missing: %.300s (%s)", out_path,
+                 ad[0] ? ad : "平台未激活适配器制品或终端无法访问固定地址");
+      }
+      return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
     }
-    return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
   }
   const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
   if (want && want[0]) {

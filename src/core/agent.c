@@ -1232,7 +1232,10 @@ void edr_agent_destroy(EdrAgent *agent) {
  *   <base>/agent/forensic-collector/manifest?kind=velociraptor&os=<os>&arch=<arch>
  * os/arch 取编译期常量(agent 二进制架构即宿主架构)。已显式设置 env 时不覆盖。 */
 static void edr_agent_derive_forensic_manifest_env(const EdrConfig *cfg) {
-  if (getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL")) {
+  /* velo 与 适配器 各自独立推导：任一已显式设置则跳过该项，不互相短路。 */
+  int need_velo = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL") == NULL;
+  int need_adapter = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL") == NULL;
+  if (!need_velo && !need_adapter) {
     return;
   }
   if (!cfg) {
@@ -1261,15 +1264,28 @@ static void edr_agent_derive_forensic_manifest_env(const EdrConfig *cfg) {
     trimmed[--n] = '\0';
   }
   char url[768];
-  snprintf(url, sizeof(url),
-           "%s/agent/forensic-collector/manifest?kind=velociraptor&os=%s&arch=%s",
-           trimmed, os_str, arch_str);
+  if (need_velo) {
+    snprintf(url, sizeof(url),
+             "%s/agent/forensic-collector/manifest?kind=velociraptor&os=%s&arch=%s",
+             trimmed, os_str, arch_str);
 #if defined(_WIN32)
-  _putenv_s("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url);
+    _putenv_s("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url);
 #else
-  setenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, 0);
+    setenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, 0);
 #endif
-  fprintf(stderr, "[forensic] manifest auto-derived: %s\n", url);
+    fprintf(stderr, "[forensic] velo manifest auto-derived: %s\n", url);
+  }
+  if (need_adapter) {
+    snprintf(url, sizeof(url),
+             "%s/agent/forensic-collector/manifest?kind=forensic_collector&os=%s&arch=%s",
+             trimmed, os_str, arch_str);
+#if defined(_WIN32)
+    _putenv_s("EDR_FORENSIC_ADAPTER_MANIFEST_URL", url);
+#else
+    setenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL", url, 0);
+#endif
+    fprintf(stderr, "[forensic] adapter manifest auto-derived: %s\n", url);
+  }
 }
 
 EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
