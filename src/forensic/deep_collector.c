@@ -170,8 +170,9 @@ static int dc_download(const char *url, const char *dest) {
 #endif
 }
 
-/* 从小型 manifest JSON 中提取字符串字段 "key":"value"(value 不含转义)。成功返回 0。
- * manifest 由本平台服务端产出且体量小,沿用 forensic_collector main.c 的手写扫描风格,不引 cJSON。 */
+/* 从小型 manifest JSON 中提取字符串字段 "key":"value"，并做标准 JSON 反转义。成功返回 0。
+ * 关键:Go 的 json 编码默认把 URL 里的 '&' 转义成 &(还有 </>),
+ * 若按字面照抄会得到含反斜杠的坏 URL(下载失败)。这里解码 \"、\\、\/、\n\t\r\b\f 及 \uXXXX(ASCII 直出/UTF-8)。 */
 static int dc_json_str(const char *json, const char *key, char *out, size_t cap) {
   if (!json || !key || !out || cap == 0) return -1;
   out[0] = '\0';
@@ -185,7 +186,52 @@ static int dc_json_str(const char *json, const char *key, char *out, size_t cap)
   p++;
   size_t i = 0;
   while (*p && *p != '"' && i + 1 < cap) {
-    out[i++] = *p++;
+    if (*p != '\\') {
+      out[i++] = *p++;
+      continue;
+    }
+    /* 转义序列 */
+    p++;
+    char e = *p;
+    if (e == '\0') break;
+    switch (e) {
+      case '"': out[i++] = '"'; p++; break;
+      case '\\': out[i++] = '\\'; p++; break;
+      case '/': out[i++] = '/'; p++; break;
+      case 'n': out[i++] = '\n'; p++; break;
+      case 't': out[i++] = '\t'; p++; break;
+      case 'r': out[i++] = '\r'; p++; break;
+      case 'b': out[i++] = '\b'; p++; break;
+      case 'f': out[i++] = '\f'; p++; break;
+      case 'u': {
+        p++; /* 跳过 'u' */
+        int v = 0, ok = 1;
+        for (int k = 0; k < 4; k++) {
+          char h = p[k];
+          int d;
+          if (h >= '0' && h <= '9') d = h - '0';
+          else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+          else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+          else { ok = 0; break; }
+          v = v * 16 + d;
+        }
+        if (!ok) { out[i++] = 'u'; break; } /* 非法 \u,退化保留 */
+        p += 4;
+        if (v < 0x80) {
+          out[i++] = (char)v;
+        } else if (v < 0x800) {
+          if (i + 2 < cap) { out[i++] = (char)(0xC0 | (v >> 6)); out[i++] = (char)(0x80 | (v & 0x3F)); }
+        } else {
+          if (i + 3 < cap) {
+            out[i++] = (char)(0xE0 | (v >> 12));
+            out[i++] = (char)(0x80 | ((v >> 6) & 0x3F));
+            out[i++] = (char)(0x80 | (v & 0x3F));
+          }
+        }
+        break;
+      }
+      default: out[i++] = e; p++; break;
+    }
   }
   out[i] = '\0';
   return out[0] ? 0 : -1;
