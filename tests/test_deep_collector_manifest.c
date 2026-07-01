@@ -198,11 +198,90 @@ static void test_stderr_tail_appended(void) {
   rmdir(dir);
 }
 
+static void test_maybe_refresh_replaces_on_sha_change(void) {
+  char dir[512];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
+  char dest[512];
+  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  expect_true(write_file_bytes(dest, "old-adapter-body") == 0, "write existing old adapter");
+
+  /* manifest 广告一个新 sha(= new-adapter-body 的 sha),artifact 下载返回新体。 */
+  char newsha[65];
+  expect_true(edr_sha256_hex((const unsigned char *)"new-adapter-body", 16, newsha) == 0, "hash new body");
+  static char mbody[256];
+  snprintf(mbody, sizeof(mbody), "{\"enabled\":true,\"url\":\"https://plat.invalid/artifact\",\"sha256\":\"%s\"}", newsha);
+  g_manifest_body = mbody;
+  g_artifact_body = "new-adapter-body";
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_VERSION_CHECK_SEC", "1");
+#else
+  setenv("EDR_FORENSIC_VERSION_CHECK_SEC", "1", 1);
+#endif
+
+  time_t last = 0;
+  char detail[256];
+  int rc = dc_maybe_refresh(dest, "https://plat.invalid/manifest", NULL, &last, detail, sizeof(detail));
+  expect_true(rc == EDR_DC_OK, "refresh with changed sha should succeed");
+  char got[64];
+  expect_true(read_file_text(dest, got, sizeof(got)) == 0, "dest readable after refresh");
+  expect_true(strcmp(got, "new-adapter-body") == 0, "stale adapter replaced with new body");
+
+  /* 第二次:同一 last_check 且间隔未到 → 不再拉取(限流),文件不变。 */
+  g_artifact_body = "SHOULD-NOT-BE-USED";
+  int rc2 = dc_maybe_refresh(dest, "https://plat.invalid/manifest", NULL, &last, detail, sizeof(detail));
+  expect_true(rc2 == EDR_DC_OK, "second refresh within interval is a no-op");
+  expect_true(read_file_text(dest, got, sizeof(got)) == 0, "dest still readable");
+  expect_true(strcmp(got, "new-adapter-body") == 0, "rate-limited: file unchanged on second call");
+
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_VERSION_CHECK_SEC", "");
+#else
+  unsetenv("EDR_FORENSIC_VERSION_CHECK_SEC");
+#endif
+  remove(dest);
+  rmdir(dir);
+}
+
+static void test_maybe_refresh_keeps_current_when_sha_matches(void) {
+  char dir[512];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
+  char dest[512];
+  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  expect_true(write_file_bytes(dest, "current-body") == 0, "write current adapter");
+  char cursha[65];
+  expect_true(edr_sha256_hex((const unsigned char *)"current-body", 12, cursha) == 0, "hash current");
+  static char mbody[256];
+  snprintf(mbody, sizeof(mbody), "{\"enabled\":true,\"url\":\"https://plat.invalid/artifact\",\"sha256\":\"%s\"}", cursha);
+  g_manifest_body = mbody;
+  g_artifact_body = "SHOULD-NOT-DOWNLOAD";
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_VERSION_CHECK_SEC", "1");
+#else
+  setenv("EDR_FORENSIC_VERSION_CHECK_SEC", "1", 1);
+#endif
+  time_t last = 0;
+  char detail[256];
+  int rc = dc_maybe_refresh(dest, "https://plat.invalid/manifest", NULL, &last, detail, sizeof(detail));
+  expect_true(rc == EDR_DC_OK, "matching sha → no-op OK");
+  char got[64];
+  read_file_text(dest, got, sizeof(got));
+  expect_true(strcmp(got, "current-body") == 0, "matching sha keeps current body (no re-download)");
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_VERSION_CHECK_SEC", "");
+#else
+  unsetenv("EDR_FORENSIC_VERSION_CHECK_SEC");
+#endif
+  remove(dest);
+  rmdir(dir);
+}
+
 int main(void) {
   test_json_url_unescape();
   test_artifact_failure_keeps_existing_dest();
   test_success_installs_part_atomically();
   test_artifact_download_fallback_uses_manifest_origin();
   test_stderr_tail_appended();
+  test_maybe_refresh_replaces_on_sha_change();
+  test_maybe_refresh_keeps_current_when_sha_matches();
   return g_failures == 0 ? 0 : 1;
 }
