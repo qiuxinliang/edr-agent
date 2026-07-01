@@ -83,6 +83,53 @@ static int dc_path_ok(const char *p) {
   return 1;
 }
 
+static char g_dc_download_detail[192];
+
+static void dc_set_download_detail(const char *fmt, const char *a, unsigned long b) {
+  if (!fmt) {
+    g_dc_download_detail[0] = '\0';
+    return;
+  }
+  if (a) {
+    snprintf(g_dc_download_detail, sizeof(g_dc_download_detail), fmt, a, b);
+  } else {
+    snprintf(g_dc_download_detail, sizeof(g_dc_download_detail), fmt, b);
+  }
+}
+
+static const char *dc_last_download_detail(void) {
+  return g_dc_download_detail[0] ? g_dc_download_detail : "download failed";
+}
+
+static void dc_note_native_http_failure(void) {
+  EdrIngestHttpRuntime rt;
+  memset(&rt, 0, sizeof(rt));
+  edr_ingest_http_get_runtime(&rt);
+  if (rt.last_error[0]) {
+    dc_set_download_detail("native http: %s", rt.last_error, 0);
+  }
+}
+
+/* manifest 已经从可达平台地址取到；若 manifest 内 url 指向不可达 PublicBaseURL，
+ * 用 manifest 同源的 download 固定地址兜底，避免配置漂移让 Agent 卡在 .part。 */
+static int dc_manifest_sibling_download_url(const char *manifest_url, char *out, size_t cap) {
+  static const char marker[] = "/agent/forensic-collector/manifest";
+  if (!manifest_url || !out || cap == 0u) return -1;
+  out[0] = '\0';
+  const char *q = strchr(manifest_url, '?');
+  const char *m = strstr(manifest_url, marker);
+  if (!m || (q && m > q)) return -1;
+  size_t prefix_len = (size_t)(m - manifest_url);
+  const char *query = q ? q : "";
+  int n = snprintf(out, cap, "%.*s/agent/forensic-collector/download%s",
+                   (int)prefix_len, manifest_url, query);
+  return (n > 0 && (size_t)n < cap && dc_url_ok(out)) ? 0 : -1;
+}
+
+static int dc_same_cstr(const char *a, const char *b) {
+  return a && b && strcmp(a, b) == 0;
+}
+
 /* 经 curl 下载 url 到 dest(本地)。成功返回 0。**不经 shell**(消除命令注入):
  * POSIX 用 fork+execlp 直传 argv;Windows 用 CreateProcess 直起 curl.exe(不经 cmd.exe)。 */
 /* TLS 信任:平台多为私有 CA(企业自签/mkcert),裸 curl 默认只认系统信任库 → 校验失败。
@@ -97,7 +144,11 @@ static int dc_tls_ca_ok(const char *p) {
 }
 
 static int dc_download(const char *url, const char *dest) {
-  if (!dc_url_ok(url) || !dc_path_ok(dest)) return -1;
+  g_dc_download_detail[0] = '\0';
+  if (!dc_url_ok(url) || !dc_path_ok(dest)) {
+    dc_set_download_detail("invalid url or destination", NULL, 0);
+    return -1;
+  }
   /* 首选 Agent 自带的 OpenSSL HTTP 客户端:认 ca.pem(私有 CA 无碍)、带鉴权头、无 Schannel 吊销/
    * curl.exe PATH 依赖。256MiB 上限覆盖 velo(~80MB),客户端流式写文件内存安全。
    * 仅当它失败(如下载源在不同主机/未配置)时回退到 curl。EDR_FORENSIC_DOWNLOAD_NO_INPROC=1 可禁用此首选。 */
@@ -107,7 +158,17 @@ static int dc_download(const char *url, const char *dest) {
       if (edr_ingest_http_get_url_to_file(url, dest, 256u * 1024u * 1024u) == 0 && dc_file_nonempty(dest)) {
         return 0;
       }
+      dc_note_native_http_failure();
       (void)remove(dest); /* 客户端可能留半截/0 字节,清掉再让 curl 兜底重试 */
+    }
+  }
+  {
+    const char *nocurl = getenv("EDR_FORENSIC_DOWNLOAD_NO_CURL");
+    if (nocurl && nocurl[0] == '1') {
+      if (!g_dc_download_detail[0]) {
+        dc_set_download_detail("curl fallback disabled", NULL, 0);
+      }
+      return -1;
     }
   }
   const char *ca = getenv("EDR_FORENSIC_CA_CERT");
@@ -133,17 +194,43 @@ static int dc_download(const char *url, const char *dest) {
   si.wShowWindow = SW_HIDE;
   PROCESS_INFORMATION pi = {0};
   if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    dc_set_download_detail("curl spawn failed", NULL, 0);
     return -1;
   }
-  WaitForSingleObject(pi.hProcess, 600000); /* 10min 上限 */
+  DWORD wait = WaitForSingleObject(pi.hProcess, 600000); /* 10min 上限 */
+  if (wait == WAIT_TIMEOUT) {
+    TerminateProcess(pi.hProcess, 124);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    dc_set_download_detail("curl timeout", NULL, 0);
+    return -1;
+  }
+  if (wait != WAIT_OBJECT_0) {
+    TerminateProcess(pi.hProcess, 125);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    dc_set_download_detail("curl wait failed", NULL, 0);
+    return -1;
+  }
   DWORD ec = 1;
   GetExitCodeProcess(pi.hProcess, &ec);
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
+  if (ec != 0) {
+    char prev[sizeof(g_dc_download_detail)];
+    snprintf(prev, sizeof(prev), "%s", g_dc_download_detail);
+    dc_set_download_detail(prev[0] ? "%s; curl exit=%lu" : "curl exit=%lu",
+                           prev[0] ? prev : NULL, (unsigned long)ec);
+  }
   return ec == 0 ? 0 : -1;
 #else
   pid_t pid = fork();
-  if (pid < 0) return -1;
+  if (pid < 0) {
+    dc_set_download_detail("curl fork failed", NULL, 0);
+    return -1;
+  }
   if (pid == 0) {
     /* 子进程:argv 直传,curl 永不经 shell 解释;`--` 阻断选项注入。 */
     const char *argv[12];
@@ -165,10 +252,26 @@ static int dc_download(const char *url, const char *dest) {
     _exit(127);
   }
   int st = 0;
-  if (waitpid(pid, &st, 0) != pid) return -1;
-  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+  if (waitpid(pid, &st, 0) != pid) {
+    dc_set_download_detail("curl wait failed", NULL, 0);
+    return -1;
+  }
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    return 0;
+  }
+  if (WIFEXITED(st)) {
+    char prev[sizeof(g_dc_download_detail)];
+    snprintf(prev, sizeof(prev), "%s", g_dc_download_detail);
+    dc_set_download_detail(prev[0] ? "%s; curl exit=%lu" : "curl exit=%lu",
+                           prev[0] ? prev : NULL, (unsigned long)WEXITSTATUS(st));
+  } else if (WIFSIGNALED(st)) {
+    dc_set_download_detail("curl signal=%lu", NULL, (unsigned long)WTERMSIG(st));
+  }
+  return -1;
 #endif
 }
+
+static int dc_hex64_ieq(const char *a, const char *b);
 
 /* 从小型 manifest JSON 中提取字符串字段 "key":"value"，并做标准 JSON 反转义。成功返回 0。
  * 关键:Go 的 json 编码默认把 URL 里的 '&' 转义成 &(还有 </>),
@@ -247,14 +350,28 @@ static int dc_json_enabled(const char *json) {
   return strncmp(p, "true", 4) == 0 ? 1 : 0;
 }
 
-/* 从平台固定地址拉取 manifest,解析出下载 url 与 sha256,下载到 dest。
- * 成功返回 0 并把期望 sha256 写入 out_sha(65);失败返回非 0。
- * manifest_url 由 EDR_FORENSIC_COLLECTOR_MANIFEST_URL 提供(installer 写入)。 */
+static int dc_replace_file(const char *tmp, const char *dest) {
+  if (!tmp || !tmp[0] || !dest || !dest[0]) return -1;
+#ifdef _WIN32
+  return MoveFileExA(tmp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) ? 0 : -1;
+#else
+  return rename(tmp, dest) == 0 ? 0 : -1;
+#endif
+}
+
+/* 从平台固定地址拉取 manifest,解析出下载 url 与 sha256,下载到 dest.part,验签后原子替换 dest。
+ * 失败只清理 .part/manifest,不删除已有可用 dest,避免瞬时网络/平台错误破坏本地好件。
+ * pin_sha 非空时优先生效;否则使用 manifest sha256。 */
 static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
-                                     char out_sha[65], char *detail, size_t detail_cap) {
-  if (!manifest_url || !manifest_url[0]) return -1;
+                                     const char *pin_sha, char *detail, size_t detail_cap) {
+  if (!manifest_url || !manifest_url[0] || !dest || !dest[0]) return -1;
   char mf_path[1100];
-  snprintf(mf_path, sizeof(mf_path), "%s.mf.json", dest);
+  char part_path[1100];
+  if (snprintf(mf_path, sizeof(mf_path), "%s.mf.json", dest) >= (int)sizeof(mf_path) ||
+      snprintf(part_path, sizeof(part_path), "%s.part", dest) >= (int)sizeof(part_path)) {
+    if (detail) snprintf(detail, detail_cap, "collector path too long");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
   if (dc_download(manifest_url, mf_path) != 0) {
     (void)remove(mf_path); /* 失败可能留 0 字节坏件,清掉避免下次误读 */
     if (detail) snprintf(detail, detail_cap, "manifest fetch failed");
@@ -262,6 +379,7 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
   }
   FILE *f = fopen(mf_path, "rb");
   if (!f) {
+    (void)remove(mf_path);
     if (detail) snprintf(detail, detail_cap, "manifest read failed");
     return EDR_DC_ERR_DOWNLOAD;
   }
@@ -280,16 +398,49 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
     if (detail) snprintf(detail, detail_cap, "manifest missing url");
     return EDR_DC_ERR_DOWNLOAD;
   }
-  out_sha[0] = '\0';
-  (void)dc_json_str(buf, "sha256", out_sha, 65); /* 缺 sha 则后续按 env 或无 pin 处理 */
-  if (dc_download(url, dest) != 0) {
-    (void)remove(dest); /* 失败/中断常留 0 字节坏件,清掉以便下次重新拉取(否则被当成已装) */
-    if (detail) snprintf(detail, detail_cap, "collector download failed (manifest url)");
+  char manifest_sha[65];
+  manifest_sha[0] = '\0';
+  (void)dc_json_str(buf, "sha256", manifest_sha, sizeof(manifest_sha));
+  const char *want = (pin_sha && pin_sha[0]) ? pin_sha : (manifest_sha[0] ? manifest_sha : NULL);
+
+  (void)remove(part_path); /* 只清旧临时件,不碰已有最终 exe */
+  if (dc_download(url, part_path) != 0) {
+    char primary[192];
+    char fallback_url[1024];
+    snprintf(primary, sizeof(primary), "%s", dc_last_download_detail());
+    (void)remove(part_path);
+    if (dc_manifest_sibling_download_url(manifest_url, fallback_url, sizeof(fallback_url)) == 0 &&
+        !dc_same_cstr(fallback_url, url)) {
+      if (dc_download(fallback_url, part_path) != 0) {
+        const char *fb = dc_last_download_detail();
+        (void)remove(part_path);
+        if (detail) {
+          snprintf(detail, detail_cap, "artifact download failed (primary: %.90s; fallback: %.90s)",
+                   primary, fb);
+        }
+        return EDR_DC_ERR_DOWNLOAD;
+      }
+    } else {
+      if (detail) snprintf(detail, detail_cap, "artifact download failed (%.160s)", primary);
+      return EDR_DC_ERR_DOWNLOAD;
+    }
+  }
+  if (!dc_file_nonempty(part_path)) {
+    (void)remove(part_path); /* 成功但 0 字节(代理/截断) → 视为失败,不替换最终件 */
+    if (detail) snprintf(detail, detail_cap, "downloaded artifact is empty");
     return EDR_DC_ERR_DOWNLOAD;
   }
-  if (!dc_file_nonempty(dest)) {
-    (void)remove(dest); /* 成功但 0 字节(代理/截断) → 视为失败,删坏件 */
-    if (detail) snprintf(detail, detail_cap, "downloaded artifact is empty");
+  if (want && want[0]) {
+    char got[65];
+    if (dc_sha256_file(part_path, got) != 0 || !dc_hex64_ieq(got, want)) {
+      (void)remove(part_path);
+      if (detail) snprintf(detail, detail_cap, "artifact sha256 mismatch/read fail");
+      return EDR_DC_ERR_SIGNATURE;
+    }
+  }
+  if (dc_replace_file(part_path, dest) != 0) {
+    (void)remove(part_path);
+    if (detail) snprintf(detail, detail_cap, "artifact install failed");
     return EDR_DC_ERR_DOWNLOAD;
   }
   return EDR_DC_OK;
@@ -324,9 +475,53 @@ static void dc_make_parent_dir(const char *path) {
 #endif
 }
 
+/* 读取 adapter stderr 临时文件的尾部若干可打印字符,清洗换行/引号后拼进 detail。
+ * collector 退出非 0 时,velociraptor 的真实报错(如字段/VQL 错误)只在 adapter stderr;
+ * 不回捞就只剩 "collector exit=N",无法定位。best-effort:失败静默。 */
+static void dc_append_stderr_tail(const char *err_path, char *out_detail, size_t detail_cap) {
+  if (!err_path || !out_detail || detail_cap == 0) return;
+  long sz = dc_file_size(err_path);
+  if (sz <= 0) return;
+  /* 只取尾部最多 240 字节,避免撑爆 detail。 */
+  long want = sz > 240 ? 240 : sz;
+  FILE *f = fopen(err_path, "rb");
+  if (!f) return;
+  if (fseek(f, sz - want, SEEK_SET) != 0) { fclose(f); return; }
+  char buf[256];
+  size_t rd = fread(buf, 1, (size_t)want, f);
+  fclose(f);
+  if (rd == 0) return;
+  buf[rd] = '\0';
+  /* 清洗:控制字符/引号/反斜杠 → 空格,压缩连续空白,便于塞进 JSON 回执文本。 */
+  char clean[256];
+  size_t ci = 0;
+  int prev_space = 0;
+  for (size_t i = 0; i < rd && ci + 1 < sizeof(clean); i++) {
+    unsigned char c = (unsigned char)buf[i];
+    if (c < 0x20 || c == '"' || c == '\\') c = ' ';
+    if (c == ' ') {
+      if (prev_space) continue;
+      prev_space = 1;
+    } else {
+      prev_space = 0;
+    }
+    clean[ci++] = (char)c;
+  }
+  clean[ci] = '\0';
+  /* 去掉首尾空格 */
+  char *s = clean;
+  while (*s == ' ') s++;
+  size_t sl = strlen(s);
+  while (sl > 0 && s[sl - 1] == ' ') s[--sl] = '\0';
+  if (!s[0]) return;
+  size_t cur = strlen(out_detail);
+  if (cur + 3 >= detail_cap) return;
+  snprintf(out_detail + cur, detail_cap - cur, " | %s", s);
+}
+
 /* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
  * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
- * (EDR_FORENSIC_COLLECTOR_SHA256 env pin > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
+ * (EDR_FORENSIC_ADAPTER_SHA256 > legacy EDR_FORENSIC_COLLECTOR_SHA256 > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
  * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
 static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
   if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
@@ -339,20 +534,10 @@ static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) 
     return EDR_DC_ERR_DOWNLOAD;
   }
   dc_make_parent_dir(dest);
-  char manifest_sha[65];
-  manifest_sha[0] = '\0';
-  int rc = dc_autofetch_via_manifest(mf, dest, manifest_sha, detail, detail_cap);
+  const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
+  if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
+  int rc = dc_autofetch_via_manifest(mf, dest, want, detail, detail_cap);
   if (rc != EDR_DC_OK) return rc;
-  const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
-  if ((!want || !want[0]) && manifest_sha[0]) want = manifest_sha;
-  if (want && want[0]) {
-    char got[65];
-    if (dc_sha256_file(dest, got) != 0 || !dc_hex64_ieq(got, want)) {
-      if (detail) snprintf(detail, detail_cap, "adapter sha256 mismatch/read fail");
-      (void)remove(dest); /* 删坏件,避免下次复用 */
-      return EDR_DC_ERR_SIGNATURE;
-    }
-  }
 #ifndef _WIN32
   (void)chmod(dest, 0755); /* 下载件需可执行位 */
 #endif
@@ -363,7 +548,7 @@ static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) 
  * 路径来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
  * 适配器为小体积件,随安装包内置:缺失即返回 EDR_DC_ERR_DOWNLOAD(调用方回退 builtin),
  *   **不**经 velo manifest 误下载(velo 由 dc_ensure_velociraptor 拉到独立槽位)。
- * 验签:EDR_FORENSIC_COLLECTOR_SHA256(env pin)配置时校验,不匹配拒绝执行。 */
+ * 验签:EDR_FORENSIC_ADAPTER_SHA256 或 legacy EDR_FORENSIC_COLLECTOR_SHA256(env pin)配置时校验,不匹配拒绝执行。 */
 static int dc_resolve_verify(const char *spec_bin, const char *platform_default, char *out_path,
                              size_t cap, char *detail, size_t detail_cap) {
   const char *bin = (spec_bin && spec_bin[0]) ? spec_bin : NULL;
@@ -387,7 +572,8 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
       return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
     }
   }
-  const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
+  const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
+  if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
   if (want && want[0]) {
     char got[65];
     if (dc_sha256_file(out_path, got) != 0) {
@@ -427,21 +613,10 @@ static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
     if (detail) snprintf(detail, detail_cap, "velociraptor missing; autofetch/manifest unavailable");
     return EDR_DC_ERR_DOWNLOAD;
   }
-  char manifest_sha[65];
-  manifest_sha[0] = '\0';
-  int rc = dc_autofetch_via_manifest(mf, path, manifest_sha, detail, detail_cap);
-  if (rc != EDR_DC_OK) return rc;
-
+  dc_make_parent_dir(path);
   const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
-  if ((!want || !want[0]) && manifest_sha[0]) want = manifest_sha;
-  if (want && want[0]) {
-    char got[65];
-    if (dc_sha256_file(path, got) != 0 || !dc_hex64_ieq(got, want)) {
-      if (detail) snprintf(detail, detail_cap, "velociraptor sha256 mismatch/read fail");
-      (void)remove(path); /* 删坏件,避免下次复用损坏 velo */
-      return EDR_DC_ERR_SIGNATURE;
-    }
-  }
+  int rc = dc_autofetch_via_manifest(mf, path, want, detail, detail_cap);
+  if (rc != EDR_DC_OK) return rc;
   return EDR_DC_OK;
 }
 
@@ -621,13 +796,31 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   STARTUPINFO si = {sizeof(si)};
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
+  /* 把 adapter stdout/stderr 重定向到临时文件,便于退出非 0 时回捞真实报错(velo 字段/VQL 错)。
+   * 用 CREATE_NO_WINDOW(而非 CREATE_NEW_CONSOLE),使 STARTF_USESTDHANDLES 生效。 */
+  char errpath[1100];
+  snprintf(errpath, sizeof(errpath), "%s\\fc_stderr_%lu.log",
+           spec->output_dir ? spec->output_dir : ".", (unsigned long)GetCurrentProcessId());
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+  HANDLE herr = CreateFileA(errpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  BOOL inherit = FALSE;
+  DWORD flags = CREATE_NEW_CONSOLE | CREATE_SUSPENDED;
+  if (herr != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = herr;
+    si.hStdError = herr;
+    si.hStdInput = NULL;
+    inherit = TRUE;
+    flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+  }
   PROCESS_INFORMATION pi = {0};
-  BOOL cr = CreateProcess(bin, cmdline, NULL, NULL, FALSE,
-                          CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+  BOOL cr = CreateProcess(bin, cmdline, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi);
   if (!cr) {
     if (out_detail) {
       snprintf(out_detail, detail_cap, "CreateProcess failed: %lu", (unsigned long)GetLastError());
     }
+    if (herr != INVALID_HANDLE_VALUE) { CloseHandle(herr); (void)remove(errpath); }
     if (job) CloseHandle(job);
     return EDR_DC_ERR_SPAWN;
   }
@@ -645,6 +838,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     }
     if (out_detail) snprintf(out_detail, detail_cap, "collector timeout after %us", to);
     CloseHandle(pi.hProcess);
+    if (herr != INVALID_HANDLE_VALUE) { CloseHandle(herr); (void)remove(errpath); }
     if (job) CloseHandle(job);
     return EDR_DC_ERR_TIMEOUT;
   }
@@ -652,7 +846,14 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   GetExitCodeProcess(pi.hProcess, &ec);
   CloseHandle(pi.hProcess);
   if (job) CloseHandle(job);
-  if (out_detail) snprintf(out_detail, detail_cap, "collector exit=%lu", (unsigned long)ec);
+  if (herr != INVALID_HANDLE_VALUE) CloseHandle(herr);
+  if (out_detail) {
+    snprintf(out_detail, detail_cap, "collector exit=%lu", (unsigned long)ec);
+    if (ec != 0 && herr != INVALID_HANDLE_VALUE) {
+      dc_append_stderr_tail(errpath, out_detail, detail_cap);
+    }
+  }
+  if (herr != INVALID_HANDLE_VALUE) (void)remove(errpath);
   return (int)ec; /* 0=成功;>0=collector 非0退出码 */
 }
 
@@ -728,6 +929,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
 
 #else /* POSIX */
 
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -854,6 +1056,11 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   const char *bin = binpath;
   uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
 
+  /* adapter stdout/stderr → 临时文件,退出非 0 时回捞真实报错(velo 字段/VQL 错)。 */
+  char errpath[1100];
+  snprintf(errpath, sizeof(errpath), "%s/fc_stderr_%d.log",
+           spec->output_dir ? spec->output_dir : ".", (int)getpid());
+
   pid_t pid = fork();
   if (pid < 0) {
     if (out_detail) snprintf(out_detail, detail_cap, "fork failed");
@@ -861,6 +1068,12 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   }
   if (pid == 0) {
     /* child:组装 argv(不含 --upload-url),透传 extra_args(空格分词) */
+    int efd = open(errpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (efd >= 0) {
+      dup2(efd, 1);
+      dup2(efd, 2);
+      if (efd > 2) close(efd);
+    }
     char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
@@ -892,17 +1105,23 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     pid_t w = waitpid(pid, &st, WNOHANG);
     if (w == pid) {
       int ec = WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1);
-      if (out_detail) snprintf(out_detail, detail_cap, "collector exit=%d", ec);
+      if (out_detail) {
+        snprintf(out_detail, detail_cap, "collector exit=%d", ec);
+        if (ec != 0) dc_append_stderr_tail(errpath, out_detail, detail_cap);
+      }
+      (void)remove(errpath);
       return ec; /* 0=成功;>0=collector 失败/被信号 */
     }
     if (w < 0) {
       if (out_detail) snprintf(out_detail, detail_cap, "waitpid error");
+      (void)remove(errpath);
       return EDR_DC_ERR_CRASH;
     }
     if (waited_ms >= to * 1000u) {
       kill(pid, SIGKILL);
       waitpid(pid, NULL, 0);
       if (out_detail) snprintf(out_detail, detail_cap, "collector timeout after %us", to);
+      (void)remove(errpath);
       return EDR_DC_ERR_TIMEOUT;
     }
     usleep(step_ms * 1000u);
