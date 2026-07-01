@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* 平台头(供下方共享段的 dc_download 直起 curl 用;平台分支后会重复 include,有头文件 guard 无碍)。 */
 #ifdef _WIN32
@@ -519,23 +520,68 @@ static void dc_append_stderr_tail(const char *err_path, char *out_detail, size_t
   snprintf(out_detail + cur, detail_cap - cur, " | %s", s);
 }
 
+/* 版本感知刷新:本地件已存在时,按间隔拉 manifest 比对 sha256,不一致则原子替换(dest.part → dest)。
+ * 平台激活新版后无需人工删旧件即可自动滚更。间隔由 EDR_FORENSIC_VERSION_CHECK_SEC 控制
+ * (默认 600s;<=0 禁用,回到“仅缺失时重拉”的旧行为)。*last_check 为每槽位静态计时,限流 manifest 拉取。
+ * 保守:manifest 不可达 / 平台停用 / sha 缺失 / 本地读不了 → 返回 EDR_DC_OK 保留现有件,绝不因瞬时问题破坏在用件。 */
+static int dc_maybe_refresh(const char *dest, const char *manifest_url, const char *pin_sha,
+                            time_t *last_check, char *detail, size_t detail_cap) {
+  if (!dest || !dest[0] || !manifest_url || !manifest_url[0] || !last_check) return EDR_DC_OK;
+  const char *iv = getenv("EDR_FORENSIC_VERSION_CHECK_SEC");
+  long interval = 600;
+  if (iv && iv[0]) interval = atol(iv);
+  if (interval <= 0) return EDR_DC_OK; /* 版本检查禁用 */
+  time_t now = time(NULL);
+  if (*last_check != 0 && (now - *last_check) < interval) return EDR_DC_OK; /* 限流:未到检查间隔 */
+  *last_check = now;
+
+  char mfpath[1120];
+  if (snprintf(mfpath, sizeof(mfpath), "%s.vermf.json", dest) >= (int)sizeof(mfpath)) return EDR_DC_OK;
+  if (dc_download(manifest_url, mfpath) != 0) { (void)remove(mfpath); return EDR_DC_OK; }
+  FILE *f = fopen(mfpath, "rb");
+  if (!f) { (void)remove(mfpath); return EDR_DC_OK; }
+  char buf[4096];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  remove(mfpath);
+  buf[n] = '\0';
+  if (!dc_json_enabled(buf)) return EDR_DC_OK; /* 平台停用了 active 制品 → 保守保留本地件 */
+  char mfsha[65];
+  mfsha[0] = '\0';
+  (void)dc_json_str(buf, "sha256", mfsha, sizeof(mfsha));
+  const char *want = (pin_sha && pin_sha[0]) ? pin_sha : (mfsha[0] ? mfsha : NULL);
+  if (!want) return EDR_DC_OK; /* 无 sha 可比 */
+  char got[65];
+  if (dc_sha256_file(dest, got) != 0) return EDR_DC_OK; /* 本地读不了 → 不乱动 */
+  if (dc_hex64_ieq(got, want)) return EDR_DC_OK; /* 已是最新 */
+  /* 版本/内容变更 → 原子替换(dc_autofetch_via_manifest 重新拉 manifest+artifact,.part 替换,失败不碰旧件)。 */
+  return dc_autofetch_via_manifest(manifest_url, dest, pin_sha, detail, detail_cap);
+}
+
 /* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
  * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
  * (EDR_FORENSIC_ADAPTER_SHA256 > legacy EDR_FORENSIC_COLLECTOR_SHA256 > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
  * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
 static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
   if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
-  if (dc_file_nonempty(dest)) return EDR_DC_OK;
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
   const char *mf = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL"); /* kind=forensic_collector */
+  const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
+  if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
+  if (dc_file_nonempty(dest)) {
+    /* 已存在:按间隔比对平台 active sha,变更则原子替换(平台激活新版自动滚更);失败/不可判则保留旧件。 */
+    if (autofetch && mf && mf[0]) {
+      static time_t s_adapter_last_check = 0;
+      (void)dc_maybe_refresh(dest, mf, want, &s_adapter_last_check, detail, detail_cap);
+    }
+    return EDR_DC_OK;
+  }
   if (!autofetch || !mf || !mf[0]) {
     if (detail) snprintf(detail, detail_cap, "adapter missing; autofetch/manifest unavailable");
     return EDR_DC_ERR_DOWNLOAD;
   }
   dc_make_parent_dir(dest);
-  const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
-  if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
   int rc = dc_autofetch_via_manifest(mf, dest, want, detail, detail_cap);
   if (rc != EDR_DC_OK) return rc;
 #ifndef _WIN32
@@ -571,6 +617,11 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
       }
       return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
     }
+  } else {
+    /* 已存在:给版本感知刷新一次机会(按间隔比对平台 active sha,变更则原子替换)。 */
+    char ad[256];
+    ad[0] = '\0';
+    (void)dc_ensure_adapter(out_path, ad, sizeof(ad));
   }
   const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
   if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
@@ -604,17 +655,24 @@ static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
     snprintf(path, sizeof(path), "%s", "velociraptor");
 #endif
   }
-  if (dc_file_nonempty(path)) return EDR_DC_OK; /* 已就绪(非空) */
-
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
   const char *mf = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL"); /* kind=velociraptor */
+  const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
+  if (dc_file_nonempty(path)) {
+    /* 已就绪:按间隔比对平台 active sha,变更则原子替换(平台升级 velo 版本自动滚更);失败/不可判则保留旧件。 */
+    if (autofetch && mf && mf[0]) {
+      static time_t s_velo_last_check = 0;
+      (void)dc_maybe_refresh(path, mf, want, &s_velo_last_check, detail, detail_cap);
+    }
+    return EDR_DC_OK;
+  }
+
   if (!autofetch || !mf || !mf[0]) {
     if (detail) snprintf(detail, detail_cap, "velociraptor missing; autofetch/manifest unavailable");
     return EDR_DC_ERR_DOWNLOAD;
   }
   dc_make_parent_dir(path);
-  const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
   int rc = dc_autofetch_via_manifest(mf, path, want, detail, detail_cap);
   if (rc != EDR_DC_OK) return rc;
   return EDR_DC_OK;
