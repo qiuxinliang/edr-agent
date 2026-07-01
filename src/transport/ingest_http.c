@@ -2499,6 +2499,22 @@ static void copy_header_value(const char *headers, const char *name, char *out, 
   out[n] = '\0';
 }
 
+static void copy_status_line(const char *headers, char *out, size_t cap) {
+  size_t n = 0u;
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!headers) {
+    return;
+  }
+  while (headers[n] && headers[n] != '\r' && headers[n] != '\n' && n + 1u < cap) {
+    out[n] = headers[n];
+    n++;
+  }
+  out[n] = '\0';
+}
+
 static void parse_agent_config_headers(const char *headers, EdrAgentConfigHeaders *out) {
   if (!out) {
     return;
@@ -2625,7 +2641,20 @@ static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *b
       if (status_ok) {
         parse_agent_config_headers(buf, out_agent_config);
       }
-      if (!status_ok || content_len < 0 || headers_chunked(buf)) {
+      if (!status_ok) {
+        char line[96];
+        char msg[140];
+        copy_status_line(buf, line, sizeof(line));
+        snprintf(msg, sizeof(msg), "http get status: %s", line[0] ? line : "non-2xx");
+        runtime_failure(msg);
+        return -1;
+      }
+      if (headers_chunked(buf)) {
+        runtime_failure("http get chunked response unsupported");
+        return -1;
+      }
+      if (content_len < 0) {
+        runtime_failure("http get missing content-length");
         return -1;
       }
       if ((unsigned long)content_len > (unsigned long)max_bytes) {

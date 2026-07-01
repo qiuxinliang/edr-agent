@@ -83,6 +83,53 @@ static int dc_path_ok(const char *p) {
   return 1;
 }
 
+static char g_dc_download_detail[192];
+
+static void dc_set_download_detail(const char *fmt, const char *a, unsigned long b) {
+  if (!fmt) {
+    g_dc_download_detail[0] = '\0';
+    return;
+  }
+  if (a) {
+    snprintf(g_dc_download_detail, sizeof(g_dc_download_detail), fmt, a, b);
+  } else {
+    snprintf(g_dc_download_detail, sizeof(g_dc_download_detail), fmt, b);
+  }
+}
+
+static const char *dc_last_download_detail(void) {
+  return g_dc_download_detail[0] ? g_dc_download_detail : "download failed";
+}
+
+static void dc_note_native_http_failure(void) {
+  EdrIngestHttpRuntime rt;
+  memset(&rt, 0, sizeof(rt));
+  edr_ingest_http_get_runtime(&rt);
+  if (rt.last_error[0]) {
+    dc_set_download_detail("native http: %s", rt.last_error, 0);
+  }
+}
+
+/* manifest 已经从可达平台地址取到；若 manifest 内 url 指向不可达 PublicBaseURL，
+ * 用 manifest 同源的 download 固定地址兜底，避免配置漂移让 Agent 卡在 .part。 */
+static int dc_manifest_sibling_download_url(const char *manifest_url, char *out, size_t cap) {
+  static const char marker[] = "/agent/forensic-collector/manifest";
+  if (!manifest_url || !out || cap == 0u) return -1;
+  out[0] = '\0';
+  const char *q = strchr(manifest_url, '?');
+  const char *m = strstr(manifest_url, marker);
+  if (!m || (q && m > q)) return -1;
+  size_t prefix_len = (size_t)(m - manifest_url);
+  const char *query = q ? q : "";
+  int n = snprintf(out, cap, "%.*s/agent/forensic-collector/download%s",
+                   (int)prefix_len, manifest_url, query);
+  return (n > 0 && (size_t)n < cap && dc_url_ok(out)) ? 0 : -1;
+}
+
+static int dc_same_cstr(const char *a, const char *b) {
+  return a && b && strcmp(a, b) == 0;
+}
+
 /* 经 curl 下载 url 到 dest(本地)。成功返回 0。**不经 shell**(消除命令注入):
  * POSIX 用 fork+execlp 直传 argv;Windows 用 CreateProcess 直起 curl.exe(不经 cmd.exe)。 */
 /* TLS 信任:平台多为私有 CA(企业自签/mkcert),裸 curl 默认只认系统信任库 → 校验失败。
@@ -97,7 +144,11 @@ static int dc_tls_ca_ok(const char *p) {
 }
 
 static int dc_download(const char *url, const char *dest) {
-  if (!dc_url_ok(url) || !dc_path_ok(dest)) return -1;
+  g_dc_download_detail[0] = '\0';
+  if (!dc_url_ok(url) || !dc_path_ok(dest)) {
+    dc_set_download_detail("invalid url or destination", NULL, 0);
+    return -1;
+  }
   /* 首选 Agent 自带的 OpenSSL HTTP 客户端:认 ca.pem(私有 CA 无碍)、带鉴权头、无 Schannel 吊销/
    * curl.exe PATH 依赖。256MiB 上限覆盖 velo(~80MB),客户端流式写文件内存安全。
    * 仅当它失败(如下载源在不同主机/未配置)时回退到 curl。EDR_FORENSIC_DOWNLOAD_NO_INPROC=1 可禁用此首选。 */
@@ -107,7 +158,17 @@ static int dc_download(const char *url, const char *dest) {
       if (edr_ingest_http_get_url_to_file(url, dest, 256u * 1024u * 1024u) == 0 && dc_file_nonempty(dest)) {
         return 0;
       }
+      dc_note_native_http_failure();
       (void)remove(dest); /* 客户端可能留半截/0 字节,清掉再让 curl 兜底重试 */
+    }
+  }
+  {
+    const char *nocurl = getenv("EDR_FORENSIC_DOWNLOAD_NO_CURL");
+    if (nocurl && nocurl[0] == '1') {
+      if (!g_dc_download_detail[0]) {
+        dc_set_download_detail("curl fallback disabled", NULL, 0);
+      }
+      return -1;
     }
   }
   const char *ca = getenv("EDR_FORENSIC_CA_CERT");
@@ -133,17 +194,43 @@ static int dc_download(const char *url, const char *dest) {
   si.wShowWindow = SW_HIDE;
   PROCESS_INFORMATION pi = {0};
   if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    dc_set_download_detail("curl spawn failed", NULL, 0);
     return -1;
   }
-  WaitForSingleObject(pi.hProcess, 600000); /* 10min 上限 */
+  DWORD wait = WaitForSingleObject(pi.hProcess, 600000); /* 10min 上限 */
+  if (wait == WAIT_TIMEOUT) {
+    TerminateProcess(pi.hProcess, 124);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    dc_set_download_detail("curl timeout", NULL, 0);
+    return -1;
+  }
+  if (wait != WAIT_OBJECT_0) {
+    TerminateProcess(pi.hProcess, 125);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    dc_set_download_detail("curl wait failed", NULL, 0);
+    return -1;
+  }
   DWORD ec = 1;
   GetExitCodeProcess(pi.hProcess, &ec);
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
+  if (ec != 0) {
+    char prev[sizeof(g_dc_download_detail)];
+    snprintf(prev, sizeof(prev), "%s", g_dc_download_detail);
+    dc_set_download_detail(prev[0] ? "%s; curl exit=%lu" : "curl exit=%lu",
+                           prev[0] ? prev : NULL, (unsigned long)ec);
+  }
   return ec == 0 ? 0 : -1;
 #else
   pid_t pid = fork();
-  if (pid < 0) return -1;
+  if (pid < 0) {
+    dc_set_download_detail("curl fork failed", NULL, 0);
+    return -1;
+  }
   if (pid == 0) {
     /* 子进程:argv 直传,curl 永不经 shell 解释;`--` 阻断选项注入。 */
     const char *argv[12];
@@ -165,8 +252,22 @@ static int dc_download(const char *url, const char *dest) {
     _exit(127);
   }
   int st = 0;
-  if (waitpid(pid, &st, 0) != pid) return -1;
-  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+  if (waitpid(pid, &st, 0) != pid) {
+    dc_set_download_detail("curl wait failed", NULL, 0);
+    return -1;
+  }
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    return 0;
+  }
+  if (WIFEXITED(st)) {
+    char prev[sizeof(g_dc_download_detail)];
+    snprintf(prev, sizeof(prev), "%s", g_dc_download_detail);
+    dc_set_download_detail(prev[0] ? "%s; curl exit=%lu" : "curl exit=%lu",
+                           prev[0] ? prev : NULL, (unsigned long)WEXITSTATUS(st));
+  } else if (WIFSIGNALED(st)) {
+    dc_set_download_detail("curl signal=%lu", NULL, (unsigned long)WTERMSIG(st));
+  }
+  return -1;
 #endif
 }
 
@@ -304,9 +405,25 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
 
   (void)remove(part_path); /* 只清旧临时件,不碰已有最终 exe */
   if (dc_download(url, part_path) != 0) {
+    char primary[192];
+    char fallback_url[1024];
+    snprintf(primary, sizeof(primary), "%s", dc_last_download_detail());
     (void)remove(part_path);
-    if (detail) snprintf(detail, detail_cap, "artifact download failed");
-    return EDR_DC_ERR_DOWNLOAD;
+    if (dc_manifest_sibling_download_url(manifest_url, fallback_url, sizeof(fallback_url)) == 0 &&
+        !dc_same_cstr(fallback_url, url)) {
+      if (dc_download(fallback_url, part_path) != 0) {
+        const char *fb = dc_last_download_detail();
+        (void)remove(part_path);
+        if (detail) {
+          snprintf(detail, detail_cap, "artifact download failed (primary: %.90s; fallback: %.90s)",
+                   primary, fb);
+        }
+        return EDR_DC_ERR_DOWNLOAD;
+      }
+    } else {
+      if (detail) snprintf(detail, detail_cap, "artifact download failed (%.160s)", primary);
+      return EDR_DC_ERR_DOWNLOAD;
+    }
   }
   if (!dc_file_nonempty(part_path)) {
     (void)remove(part_path); /* 成功但 0 字节(代理/截断) → 视为失败,不替换最终件 */

@@ -13,6 +13,8 @@
 static int g_failures;
 static const char *g_manifest_body;
 static const char *g_artifact_body;
+static const char *g_fail_download_substr;
+static char g_runtime_last_error[160];
 
 static void expect_true(int cond, const char *msg) {
   if (!cond) {
@@ -52,10 +54,15 @@ static int make_temp_dir(char *out, size_t cap) {
 
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
   (void)max_bytes;
+  g_runtime_last_error[0] = '\0';
+  if (g_fail_download_substr && strstr(url, g_fail_download_substr)) {
+    snprintf(g_runtime_last_error, sizeof(g_runtime_last_error), "simulated download failure");
+    return -1;
+  }
   if (strstr(url, "/manifest")) {
     return write_file_bytes(file_path, g_manifest_body ? g_manifest_body : "");
   }
-  if (strstr(url, "/artifact")) {
+  if (strstr(url, "/artifact") || strstr(url, "/download")) {
     return write_file_bytes(file_path, g_artifact_body ? g_artifact_body : "");
   }
   return -1;
@@ -65,6 +72,12 @@ int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
                                          size_t max_bytes, EdrAgentConfigHeaders *headers) {
   (void)headers;
   return edr_ingest_http_get_url_to_file(url, file_path, max_bytes);
+}
+
+void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->last_error, sizeof(out->last_error), "%s", g_runtime_last_error);
 }
 
 #include "../src/forensic/deep_collector.c"
@@ -130,9 +143,47 @@ static void test_success_installs_part_atomically(void) {
   rmdir(dir);
 }
 
+static void test_artifact_download_fallback_uses_manifest_origin(void) {
+  char dir[512];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
+  char dest[512];
+  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://public.invalid/api/v1/agent/forensic-collector/download?kind=adapter\\u0026os=windows\\u0026arch=amd64\",\"sha256\":\"\"}";
+  g_artifact_body = "fallback-good";
+  g_fail_download_substr = "public.invalid";
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_DOWNLOAD_NO_CURL", "1");
+#else
+  setenv("EDR_FORENSIC_DOWNLOAD_NO_CURL", "1", 1);
+#endif
+
+  char detail[256];
+  int rc = dc_autofetch_via_manifest(
+      "https://reachable.local/api/v1/agent/forensic-collector/manifest?kind=forensic_collector&os=windows&arch=amd64",
+      dest, NULL, detail, sizeof(detail));
+  expect_true(rc == EDR_DC_OK, "artifact fallback should install successfully");
+  char got[64];
+  expect_true(read_file_text(dest, got, sizeof(got)) == 0, "fallback dest should be readable");
+  expect_true(strcmp(got, "fallback-good") == 0, "fallback should use manifest-origin download URL");
+  char part[512];
+  snprintf(part, sizeof(part), "%s.part", dest);
+  expect_true(!dc_file_exists(part), "fallback install should not leave .part");
+
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_DOWNLOAD_NO_CURL", "");
+#else
+  unsetenv("EDR_FORENSIC_DOWNLOAD_NO_CURL");
+#endif
+  g_fail_download_substr = NULL;
+  remove(dest);
+  rmdir(dir);
+}
+
 int main(void) {
   test_json_url_unescape();
   test_artifact_failure_keeps_existing_dest();
   test_success_installs_part_atomically();
+  test_artifact_download_fallback_uses_manifest_origin();
   return g_failures == 0 ? 0 : 1;
 }
