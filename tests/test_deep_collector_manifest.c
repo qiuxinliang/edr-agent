@@ -180,10 +180,29 @@ static void test_artifact_download_fallback_uses_manifest_origin(void) {
   rmdir(dir);
 }
 
+static void test_stderr_tail_appended(void) {
+  char dir[512];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
+  char errp[600];
+  snprintf(errp, sizeof(errp), "%s/fc_stderr.log", dir);
+  expect_true(write_file_bytes(errp,
+      "[ERROR] While resolving Consumer.Name Symbol Consumer not found\nvelociraptor.exe: error: query\n") == 0,
+      "write stderr log");
+  char detail[256];
+  snprintf(detail, sizeof(detail), "collector exit=3");
+  dc_append_stderr_tail(errp, detail, sizeof(detail));
+  expect_true(strstr(detail, "collector exit=3") != NULL, "detail keeps base");
+  expect_true(strstr(detail, "Symbol Consumer not found") != NULL, "detail gains velo error tail");
+  expect_true(strchr(detail, '"') == NULL, "tail must be quote-free for JSON safety");
+  remove(errp);
+  rmdir(dir);
+}
+
 int main(void) {
   test_json_url_unescape();
   test_artifact_failure_keeps_existing_dest();
   test_success_installs_part_atomically();
   test_artifact_download_fallback_uses_manifest_origin();
+  test_stderr_tail_appended();
   return g_failures == 0 ? 0 : 1;
 }

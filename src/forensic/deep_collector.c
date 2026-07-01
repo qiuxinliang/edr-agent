@@ -475,6 +475,50 @@ static void dc_make_parent_dir(const char *path) {
 #endif
 }
 
+/* 读取 adapter stderr 临时文件的尾部若干可打印字符,清洗换行/引号后拼进 detail。
+ * collector 退出非 0 时,velociraptor 的真实报错(如字段/VQL 错误)只在 adapter stderr;
+ * 不回捞就只剩 "collector exit=N",无法定位。best-effort:失败静默。 */
+static void dc_append_stderr_tail(const char *err_path, char *out_detail, size_t detail_cap) {
+  if (!err_path || !out_detail || detail_cap == 0) return;
+  long sz = dc_file_size(err_path);
+  if (sz <= 0) return;
+  /* 只取尾部最多 240 字节,避免撑爆 detail。 */
+  long want = sz > 240 ? 240 : sz;
+  FILE *f = fopen(err_path, "rb");
+  if (!f) return;
+  if (fseek(f, sz - want, SEEK_SET) != 0) { fclose(f); return; }
+  char buf[256];
+  size_t rd = fread(buf, 1, (size_t)want, f);
+  fclose(f);
+  if (rd == 0) return;
+  buf[rd] = '\0';
+  /* 清洗:控制字符/引号/反斜杠 → 空格,压缩连续空白,便于塞进 JSON 回执文本。 */
+  char clean[256];
+  size_t ci = 0;
+  int prev_space = 0;
+  for (size_t i = 0; i < rd && ci + 1 < sizeof(clean); i++) {
+    unsigned char c = (unsigned char)buf[i];
+    if (c < 0x20 || c == '"' || c == '\\') c = ' ';
+    if (c == ' ') {
+      if (prev_space) continue;
+      prev_space = 1;
+    } else {
+      prev_space = 0;
+    }
+    clean[ci++] = (char)c;
+  }
+  clean[ci] = '\0';
+  /* 去掉首尾空格 */
+  char *s = clean;
+  while (*s == ' ') s++;
+  size_t sl = strlen(s);
+  while (sl > 0 && s[sl - 1] == ' ') s[--sl] = '\0';
+  if (!s[0]) return;
+  size_t cur = strlen(out_detail);
+  if (cur + 3 >= detail_cap) return;
+  snprintf(out_detail + cur, detail_cap - cur, " | %s", s);
+}
+
 /* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
  * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
  * (EDR_FORENSIC_ADAPTER_SHA256 > legacy EDR_FORENSIC_COLLECTOR_SHA256 > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
@@ -752,13 +796,31 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   STARTUPINFO si = {sizeof(si)};
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
+  /* 把 adapter stdout/stderr 重定向到临时文件,便于退出非 0 时回捞真实报错(velo 字段/VQL 错)。
+   * 用 CREATE_NO_WINDOW(而非 CREATE_NEW_CONSOLE),使 STARTF_USESTDHANDLES 生效。 */
+  char errpath[1100];
+  snprintf(errpath, sizeof(errpath), "%s\\fc_stderr_%lu.log",
+           spec->output_dir ? spec->output_dir : ".", (unsigned long)GetCurrentProcessId());
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+  HANDLE herr = CreateFileA(errpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  BOOL inherit = FALSE;
+  DWORD flags = CREATE_NEW_CONSOLE | CREATE_SUSPENDED;
+  if (herr != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = herr;
+    si.hStdError = herr;
+    si.hStdInput = NULL;
+    inherit = TRUE;
+    flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+  }
   PROCESS_INFORMATION pi = {0};
-  BOOL cr = CreateProcess(bin, cmdline, NULL, NULL, FALSE,
-                          CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+  BOOL cr = CreateProcess(bin, cmdline, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi);
   if (!cr) {
     if (out_detail) {
       snprintf(out_detail, detail_cap, "CreateProcess failed: %lu", (unsigned long)GetLastError());
     }
+    if (herr != INVALID_HANDLE_VALUE) { CloseHandle(herr); (void)remove(errpath); }
     if (job) CloseHandle(job);
     return EDR_DC_ERR_SPAWN;
   }
@@ -776,6 +838,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     }
     if (out_detail) snprintf(out_detail, detail_cap, "collector timeout after %us", to);
     CloseHandle(pi.hProcess);
+    if (herr != INVALID_HANDLE_VALUE) { CloseHandle(herr); (void)remove(errpath); }
     if (job) CloseHandle(job);
     return EDR_DC_ERR_TIMEOUT;
   }
@@ -783,7 +846,14 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   GetExitCodeProcess(pi.hProcess, &ec);
   CloseHandle(pi.hProcess);
   if (job) CloseHandle(job);
-  if (out_detail) snprintf(out_detail, detail_cap, "collector exit=%lu", (unsigned long)ec);
+  if (herr != INVALID_HANDLE_VALUE) CloseHandle(herr);
+  if (out_detail) {
+    snprintf(out_detail, detail_cap, "collector exit=%lu", (unsigned long)ec);
+    if (ec != 0 && herr != INVALID_HANDLE_VALUE) {
+      dc_append_stderr_tail(errpath, out_detail, detail_cap);
+    }
+  }
+  if (herr != INVALID_HANDLE_VALUE) (void)remove(errpath);
   return (int)ec; /* 0=成功;>0=collector 非0退出码 */
 }
 
@@ -859,6 +929,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
 
 #else /* POSIX */
 
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -985,6 +1056,11 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   const char *bin = binpath;
   uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
 
+  /* adapter stdout/stderr → 临时文件,退出非 0 时回捞真实报错(velo 字段/VQL 错)。 */
+  char errpath[1100];
+  snprintf(errpath, sizeof(errpath), "%s/fc_stderr_%d.log",
+           spec->output_dir ? spec->output_dir : ".", (int)getpid());
+
   pid_t pid = fork();
   if (pid < 0) {
     if (out_detail) snprintf(out_detail, detail_cap, "fork failed");
@@ -992,6 +1068,12 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   }
   if (pid == 0) {
     /* child:组装 argv(不含 --upload-url),透传 extra_args(空格分词) */
+    int efd = open(errpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (efd >= 0) {
+      dup2(efd, 1);
+      dup2(efd, 2);
+      if (efd > 2) close(efd);
+    }
     char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
@@ -1023,17 +1105,23 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     pid_t w = waitpid(pid, &st, WNOHANG);
     if (w == pid) {
       int ec = WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1);
-      if (out_detail) snprintf(out_detail, detail_cap, "collector exit=%d", ec);
+      if (out_detail) {
+        snprintf(out_detail, detail_cap, "collector exit=%d", ec);
+        if (ec != 0) dc_append_stderr_tail(errpath, out_detail, detail_cap);
+      }
+      (void)remove(errpath);
       return ec; /* 0=成功;>0=collector 失败/被信号 */
     }
     if (w < 0) {
       if (out_detail) snprintf(out_detail, detail_cap, "waitpid error");
+      (void)remove(errpath);
       return EDR_DC_ERR_CRASH;
     }
     if (waited_ms >= to * 1000u) {
       kill(pid, SIGKILL);
       waitpid(pid, NULL, 0);
       if (out_detail) snprintf(out_detail, detail_cap, "collector timeout after %us", to);
+      (void)remove(errpath);
       return EDR_DC_ERR_TIMEOUT;
     }
     usleep(step_ms * 1000u);

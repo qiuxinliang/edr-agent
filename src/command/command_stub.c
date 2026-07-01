@@ -2474,18 +2474,34 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   snprintf(artifacts, sizeof(artifacts),
            "[{\"type\":\"eventlog\",\"path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\",\"minio_key\":%s}]",
            pathj, sha, upload_rc == 0 ? "ok" : "failed", keyj);
-  snprintf(detail, sizeof(detail),
-           "{\"channel\":%s,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
-           "\"upload_status\":\"%s\",\"minio_key\":%s}",
-           channelj, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", keyj);
-  s_handled++;
-  if (upload_rc == 0) {
-    s_exec_ok++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
-  } else {
-    s_exec_fail++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  /* 内联回流:事件只在产物里,上传失败时不内联会"成功却无数据"。读回产物({channel,events,total},
+   * 受 max_events 约束)直接作 detail;上传失败仅降级 ok_upload_failed,不判任务失败。 */
+  detail[0] = '\0';
+  {
+    unsigned long long fsz = 0ull;
+    long long fmt_unused = 0;
+    if (file_size_mtime(path, &fsz, &fmt_unused) == 0 && fsz > 0ull && fsz < sizeof(detail)) {
+      FILE *rf = fopen(path, "rb");
+      if (rf) {
+        size_t rn = fread(detail, 1, sizeof(detail) - 1, rf);
+        fclose(rf);
+        detail[rn] = '\0';
+        if (rn == 0u || detail[0] != '{') {
+          detail[0] = '\0';
+        }
+      }
+    }
   }
+  if (!detail[0]) {
+    snprintf(detail, sizeof(detail),
+             "{\"channel\":%s,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
+             "\"upload_status\":\"%s\",\"minio_key\":%s}",
+             channelj, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", keyj);
+  }
+  s_handled++;
+  s_exec_ok++;
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail,
+               upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 }
 
 #ifdef _WIN32
@@ -2641,18 +2657,36 @@ static void do_registry_query(const char *cmd_id, const uint8_t *pl, size_t len,
            "[{\"type\":\"registry\",\"path\":%s,\"registry_key\":%s,\"sha256\":\"%s\","
            "\"upload_status\":\"%s\",\"minio_key\":%s}]",
            pathj, keyj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
-  snprintf(detail, sizeof(detail),
-           "{\"key\":%s,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
-           "\"upload_status\":\"%s\",\"minio_key\":%s}",
-           keyj, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
-  s_handled++;
-  if (upload_rc == 0) {
-    s_exec_ok++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
-  } else {
-    s_exec_fail++;
-    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 6, detail, "partial_success", artifacts);
+  /* 内联回流:注册表值只在产物文件里,上传失败时若不内联,前端会"成功却无数据"。
+   * 读回产物({key,values,total},受 max_values 约束体积可控)直接作 detail,
+   * 前端 extractRecords 取 values;上传失败仅降级 ok_upload_failed,不再判任务失败。 */
+  detail[0] = '\0';
+  {
+    unsigned long long fsz = 0ull;
+    long long fmt_unused = 0;
+    if (file_size_mtime(path, &fsz, &fmt_unused) == 0 && fsz > 0ull && fsz < sizeof(detail)) {
+      FILE *rf = fopen(path, "rb");
+      if (rf) {
+        size_t rn = fread(detail, 1, sizeof(detail) - 1, rf);
+        fclose(rf);
+        detail[rn] = '\0';
+        if (rn == 0u || detail[0] != '{') {
+          detail[0] = '\0';
+        }
+      }
+    }
   }
+  if (!detail[0]) {
+    /* 产物过大或读回失败:退化为摘要 detail(仅 count),数据仍在产物中。 */
+    snprintf(detail, sizeof(detail),
+             "{\"key\":%s,\"count\":%d,\"artifact_path\":%s,\"sha256\":\"%s\","
+             "\"upload_status\":\"%s\",\"minio_key\":%s}",
+             keyj, count, pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
+  }
+  s_handled++;
+  s_exec_ok++;
+  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail,
+               upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 #endif
 }
 
