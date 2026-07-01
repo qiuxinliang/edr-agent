@@ -1,0 +1,138 @@
+#include "edr/ingest_http.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+static int g_failures;
+static const char *g_manifest_body;
+static const char *g_artifact_body;
+
+static void expect_true(int cond, const char *msg) {
+  if (!cond) {
+    fprintf(stderr, "FAIL: %s\n", msg);
+    g_failures++;
+  }
+}
+
+static int write_file_bytes(const char *path, const char *data) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return -1;
+  if (data && data[0]) {
+    size_t n = strlen(data);
+    if (fwrite(data, 1, n, f) != n) {
+      fclose(f);
+      return -1;
+    }
+  }
+  fclose(f);
+  return 0;
+}
+
+static int make_temp_dir(char *out, size_t cap) {
+#ifdef _WIN32
+  const char *base = getenv("TEMP");
+  if (!base || !base[0]) base = ".";
+  if (snprintf(out, cap, "%s\\edr_dc_test_XXXXXX", base) >= (int)cap) return -1;
+  if (_mktemp_s(out, cap) != 0) return -1;
+  return _mkdir(out);
+#else
+  const char *base = getenv("TMPDIR");
+  if (!base || !base[0]) base = "/tmp";
+  if (snprintf(out, cap, "%s/edr_dc_test_XXXXXX", base) >= (int)cap) return -1;
+  return mkdtemp(out) ? 0 : -1;
+#endif
+}
+
+int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
+  (void)max_bytes;
+  if (strstr(url, "/manifest")) {
+    return write_file_bytes(file_path, g_manifest_body ? g_manifest_body : "");
+  }
+  if (strstr(url, "/artifact")) {
+    return write_file_bytes(file_path, g_artifact_body ? g_artifact_body : "");
+  }
+  return -1;
+}
+
+int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
+                                         size_t max_bytes, EdrAgentConfigHeaders *headers) {
+  (void)headers;
+  return edr_ingest_http_get_url_to_file(url, file_path, max_bytes);
+}
+
+#include "../src/forensic/deep_collector.c"
+
+static int read_file_text(const char *path, char *out, size_t cap) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  size_t n = fread(out, 1, cap - 1, f);
+  fclose(f);
+  out[n] = '\0';
+  return 0;
+}
+
+static void test_json_url_unescape(void) {
+  char out[256];
+  int rc = dc_json_str("{\"url\":\"https://plat/api/download?kind=adapter\\u0026os=windows\\u0026arch=amd64\"}",
+                       "url", out, sizeof(out));
+  expect_true(rc == 0, "json url should parse");
+  expect_true(strcmp(out, "https://plat/api/download?kind=adapter&os=windows&arch=amd64") == 0,
+              "json url should unescape unicode ampersands");
+}
+
+static void test_artifact_failure_keeps_existing_dest(void) {
+  char dir[512];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
+  char dest[512];
+  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  expect_true(write_file_bytes(dest, "existing-good") == 0, "write existing dest");
+
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/artifact bad\",\"sha256\":\"\"}";
+  g_artifact_body = "new-bad";
+  char detail[256];
+  int rc = dc_autofetch_via_manifest("https://platform.invalid/manifest", dest, NULL, detail, sizeof(detail));
+  expect_true(rc == EDR_DC_ERR_DOWNLOAD, "invalid artifact url should fail download");
+  expect_true(strstr(detail, "artifact download failed") != NULL, "detail should name artifact stage");
+  char got[64];
+  expect_true(read_file_text(dest, got, sizeof(got)) == 0, "existing dest should remain readable");
+  expect_true(strcmp(got, "existing-good") == 0, "failed artifact download must not delete existing dest");
+  char part[512];
+  snprintf(part, sizeof(part), "%s.part", dest);
+  expect_true(!dc_file_exists(part), "failed artifact download should not leave .part");
+  remove(dest);
+  rmdir(dir);
+}
+
+static void test_success_installs_part_atomically(void) {
+  char dir[512];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
+  char dest[512];
+  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/artifact\",\"sha256\":\"\"}";
+  g_artifact_body = "new-good";
+  char detail[256];
+  int rc = dc_autofetch_via_manifest("https://platform.invalid/manifest", dest, NULL, detail, sizeof(detail));
+  expect_true(rc == EDR_DC_OK, "artifact download should install successfully");
+  char got[64];
+  expect_true(read_file_text(dest, got, sizeof(got)) == 0, "installed dest should be readable");
+  expect_true(strcmp(got, "new-good") == 0, "installed dest should contain artifact body");
+  char part[512];
+  snprintf(part, sizeof(part), "%s.part", dest);
+  expect_true(!dc_file_exists(part), "successful install should not leave .part");
+  remove(dest);
+  rmdir(dir);
+}
+
+int main(void) {
+  test_json_url_unescape();
+  test_artifact_failure_keeps_existing_dest();
+  test_success_installs_part_atomically();
+  return g_failures == 0 ? 0 : 1;
+}

@@ -170,6 +170,8 @@ static int dc_download(const char *url, const char *dest) {
 #endif
 }
 
+static int dc_hex64_ieq(const char *a, const char *b);
+
 /* 从小型 manifest JSON 中提取字符串字段 "key":"value"，并做标准 JSON 反转义。成功返回 0。
  * 关键:Go 的 json 编码默认把 URL 里的 '&' 转义成 &(还有 </>),
  * 若按字面照抄会得到含反斜杠的坏 URL(下载失败)。这里解码 \"、\\、\/、\n\t\r\b\f 及 \uXXXX(ASCII 直出/UTF-8)。 */
@@ -247,14 +249,28 @@ static int dc_json_enabled(const char *json) {
   return strncmp(p, "true", 4) == 0 ? 1 : 0;
 }
 
-/* 从平台固定地址拉取 manifest,解析出下载 url 与 sha256,下载到 dest。
- * 成功返回 0 并把期望 sha256 写入 out_sha(65);失败返回非 0。
- * manifest_url 由 EDR_FORENSIC_COLLECTOR_MANIFEST_URL 提供(installer 写入)。 */
+static int dc_replace_file(const char *tmp, const char *dest) {
+  if (!tmp || !tmp[0] || !dest || !dest[0]) return -1;
+#ifdef _WIN32
+  return MoveFileExA(tmp, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) ? 0 : -1;
+#else
+  return rename(tmp, dest) == 0 ? 0 : -1;
+#endif
+}
+
+/* 从平台固定地址拉取 manifest,解析出下载 url 与 sha256,下载到 dest.part,验签后原子替换 dest。
+ * 失败只清理 .part/manifest,不删除已有可用 dest,避免瞬时网络/平台错误破坏本地好件。
+ * pin_sha 非空时优先生效;否则使用 manifest sha256。 */
 static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
-                                     char out_sha[65], char *detail, size_t detail_cap) {
-  if (!manifest_url || !manifest_url[0]) return -1;
+                                     const char *pin_sha, char *detail, size_t detail_cap) {
+  if (!manifest_url || !manifest_url[0] || !dest || !dest[0]) return -1;
   char mf_path[1100];
-  snprintf(mf_path, sizeof(mf_path), "%s.mf.json", dest);
+  char part_path[1100];
+  if (snprintf(mf_path, sizeof(mf_path), "%s.mf.json", dest) >= (int)sizeof(mf_path) ||
+      snprintf(part_path, sizeof(part_path), "%s.part", dest) >= (int)sizeof(part_path)) {
+    if (detail) snprintf(detail, detail_cap, "collector path too long");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
   if (dc_download(manifest_url, mf_path) != 0) {
     (void)remove(mf_path); /* 失败可能留 0 字节坏件,清掉避免下次误读 */
     if (detail) snprintf(detail, detail_cap, "manifest fetch failed");
@@ -262,6 +278,7 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
   }
   FILE *f = fopen(mf_path, "rb");
   if (!f) {
+    (void)remove(mf_path);
     if (detail) snprintf(detail, detail_cap, "manifest read failed");
     return EDR_DC_ERR_DOWNLOAD;
   }
@@ -280,16 +297,33 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
     if (detail) snprintf(detail, detail_cap, "manifest missing url");
     return EDR_DC_ERR_DOWNLOAD;
   }
-  out_sha[0] = '\0';
-  (void)dc_json_str(buf, "sha256", out_sha, 65); /* 缺 sha 则后续按 env 或无 pin 处理 */
-  if (dc_download(url, dest) != 0) {
-    (void)remove(dest); /* 失败/中断常留 0 字节坏件,清掉以便下次重新拉取(否则被当成已装) */
-    if (detail) snprintf(detail, detail_cap, "collector download failed (manifest url)");
+  char manifest_sha[65];
+  manifest_sha[0] = '\0';
+  (void)dc_json_str(buf, "sha256", manifest_sha, sizeof(manifest_sha));
+  const char *want = (pin_sha && pin_sha[0]) ? pin_sha : (manifest_sha[0] ? manifest_sha : NULL);
+
+  (void)remove(part_path); /* 只清旧临时件,不碰已有最终 exe */
+  if (dc_download(url, part_path) != 0) {
+    (void)remove(part_path);
+    if (detail) snprintf(detail, detail_cap, "artifact download failed");
     return EDR_DC_ERR_DOWNLOAD;
   }
-  if (!dc_file_nonempty(dest)) {
-    (void)remove(dest); /* 成功但 0 字节(代理/截断) → 视为失败,删坏件 */
+  if (!dc_file_nonempty(part_path)) {
+    (void)remove(part_path); /* 成功但 0 字节(代理/截断) → 视为失败,不替换最终件 */
     if (detail) snprintf(detail, detail_cap, "downloaded artifact is empty");
+    return EDR_DC_ERR_DOWNLOAD;
+  }
+  if (want && want[0]) {
+    char got[65];
+    if (dc_sha256_file(part_path, got) != 0 || !dc_hex64_ieq(got, want)) {
+      (void)remove(part_path);
+      if (detail) snprintf(detail, detail_cap, "artifact sha256 mismatch/read fail");
+      return EDR_DC_ERR_SIGNATURE;
+    }
+  }
+  if (dc_replace_file(part_path, dest) != 0) {
+    (void)remove(part_path);
+    if (detail) snprintf(detail, detail_cap, "artifact install failed");
     return EDR_DC_ERR_DOWNLOAD;
   }
   return EDR_DC_OK;
@@ -326,7 +360,7 @@ static void dc_make_parent_dir(const char *path) {
 
 /* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
  * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
- * (EDR_FORENSIC_COLLECTOR_SHA256 env pin > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
+ * (EDR_FORENSIC_ADAPTER_SHA256 > legacy EDR_FORENSIC_COLLECTOR_SHA256 > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
  * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
 static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
   if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
@@ -339,20 +373,10 @@ static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) 
     return EDR_DC_ERR_DOWNLOAD;
   }
   dc_make_parent_dir(dest);
-  char manifest_sha[65];
-  manifest_sha[0] = '\0';
-  int rc = dc_autofetch_via_manifest(mf, dest, manifest_sha, detail, detail_cap);
+  const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
+  if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
+  int rc = dc_autofetch_via_manifest(mf, dest, want, detail, detail_cap);
   if (rc != EDR_DC_OK) return rc;
-  const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
-  if ((!want || !want[0]) && manifest_sha[0]) want = manifest_sha;
-  if (want && want[0]) {
-    char got[65];
-    if (dc_sha256_file(dest, got) != 0 || !dc_hex64_ieq(got, want)) {
-      if (detail) snprintf(detail, detail_cap, "adapter sha256 mismatch/read fail");
-      (void)remove(dest); /* 删坏件,避免下次复用 */
-      return EDR_DC_ERR_SIGNATURE;
-    }
-  }
 #ifndef _WIN32
   (void)chmod(dest, 0755); /* 下载件需可执行位 */
 #endif
@@ -363,7 +387,7 @@ static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) 
  * 路径来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
  * 适配器为小体积件,随安装包内置:缺失即返回 EDR_DC_ERR_DOWNLOAD(调用方回退 builtin),
  *   **不**经 velo manifest 误下载(velo 由 dc_ensure_velociraptor 拉到独立槽位)。
- * 验签:EDR_FORENSIC_COLLECTOR_SHA256(env pin)配置时校验,不匹配拒绝执行。 */
+ * 验签:EDR_FORENSIC_ADAPTER_SHA256 或 legacy EDR_FORENSIC_COLLECTOR_SHA256(env pin)配置时校验,不匹配拒绝执行。 */
 static int dc_resolve_verify(const char *spec_bin, const char *platform_default, char *out_path,
                              size_t cap, char *detail, size_t detail_cap) {
   const char *bin = (spec_bin && spec_bin[0]) ? spec_bin : NULL;
@@ -387,7 +411,8 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
       return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
     }
   }
-  const char *want = getenv("EDR_FORENSIC_COLLECTOR_SHA256");
+  const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
+  if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
   if (want && want[0]) {
     char got[65];
     if (dc_sha256_file(out_path, got) != 0) {
@@ -427,21 +452,10 @@ static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
     if (detail) snprintf(detail, detail_cap, "velociraptor missing; autofetch/manifest unavailable");
     return EDR_DC_ERR_DOWNLOAD;
   }
-  char manifest_sha[65];
-  manifest_sha[0] = '\0';
-  int rc = dc_autofetch_via_manifest(mf, path, manifest_sha, detail, detail_cap);
-  if (rc != EDR_DC_OK) return rc;
-
+  dc_make_parent_dir(path);
   const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
-  if ((!want || !want[0]) && manifest_sha[0]) want = manifest_sha;
-  if (want && want[0]) {
-    char got[65];
-    if (dc_sha256_file(path, got) != 0 || !dc_hex64_ieq(got, want)) {
-      if (detail) snprintf(detail, detail_cap, "velociraptor sha256 mismatch/read fail");
-      (void)remove(path); /* 删坏件,避免下次复用损坏 velo */
-      return EDR_DC_ERR_SIGNATURE;
-    }
-  }
+  int rc = dc_autofetch_via_manifest(mf, path, want, detail, detail_cap);
+  if (rc != EDR_DC_OK) return rc;
   return EDR_DC_OK;
 }
 

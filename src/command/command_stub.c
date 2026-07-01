@@ -3248,6 +3248,12 @@ static void do_rtr_process_tree(const char *cmd_id, const uint8_t *pl, size_t le
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid payload");
     return;
   }
+  if (pid <= 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_process_tree: pid required");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "pid is required");
+    return;
+  }
   char endpoint_id[64];
   if (parse_json_string_field(pl, len, "endpoint_id", endpoint_id, sizeof(endpoint_id)) != 0) {
     endpoint_id[0] = '\0';

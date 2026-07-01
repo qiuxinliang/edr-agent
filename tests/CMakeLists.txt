@@ -235,6 +235,12 @@ target_include_directories(test_local_evidence_cache_candidate PRIVATE ${CMAKE_S
 edr_apply_common_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_deep_collector_manifest ${CMAKE_CURRENT_SOURCE_DIR}/test_deep_collector_manifest.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+target_include_directories(test_deep_collector_manifest PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_deep_collector_manifest)
+add_test(NAME deep_collector_manifest COMMAND test_deep_collector_manifest WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 set(_edr_test_ave_pipeline_sources ${_edr_test_ave_sdk_sources})
 list(REMOVE_ITEM _edr_test_ave_pipeline_sources ${CMAKE_SOURCE_DIR}/src/ave/fl_feature_provider.c)
 add_executable(test_ave_pipeline ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_pipeline.c
