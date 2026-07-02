@@ -67,8 +67,8 @@ Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 ; 取证采集器(发布 CI 在 ISCC 前 stage 到 build\Release\collector\):
 ;   forensic_collector.exe(Go/主) + forensic_collector_builtin.exe(C 兜底)。
-;   非 bundled 安装包**不内置 velociraptor.exe**(体积大):由 agent 经平台「固定地址」按需下载,
-;   manifest 地址在 agent 启动时从 agent.toml 的 rest_base_url 自动推导;若 stage 目录恰好放了 velo 也会一并带上。
+;   非 bundled 安装包**不内置 velociraptor.exe**(体积大):autorun 根据 agent.toml 的
+;   rest_base_url 写入 adapter/velociraptor 两个 manifest 地址,由 agent 按需下载/刷新。
 ;   缺失不致命→agent 三层兜底(velo→builtin→in-process)。
 Source: "..\..\build\Release\collector\*"; DestDir: "{app}\collector"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 

@@ -60,6 +60,22 @@ function Set-AgentTomlAcl {
   & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
 }
 
+function Read-AgentTomlString {
+  param([string]$Path, [string]$Key)
+  if (-not (Test-Path -LiteralPath $Path)) { return "" }
+  try {
+    foreach ($line in Get-Content -LiteralPath $Path -ErrorAction Stop) {
+      if ($line -match ("^\s*" + [regex]::Escape($Key) + "\s*=\s*`"([^`"]*)`"")) {
+        return [string]$Matches[1]
+      }
+      if ($line -match ("^\s*" + [regex]::Escape($Key) + "\s*=\s*'([^']*)'")) {
+        return [string]$Matches[1]
+      }
+    }
+  } catch {}
+  return ""
+}
+
 function Repair-ExecutableAcl {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -241,7 +257,9 @@ if ($Action -eq "Remove") {
       "EDR_FORENSIC_COLLECTOR_BIN",
       "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
       "EDR_VELOCIRAPTOR_BIN",
-      "EDR_FORENSIC_COLLECTOR_AUTOFETCH")) {
+      "EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+      "EDR_FORENSIC_ADAPTER_MANIFEST_URL",
+      "EDR_FORENSIC_COLLECTOR_MANIFEST_URL")) {
     try { [Environment]::SetEnvironmentVariable($n, $null, "Machine") } catch {}
   }
   exit 0
@@ -274,13 +292,18 @@ Set-AgentTomlAcl -Path $cfg
 
 # --- 取证采集器启用(非 bundled / autorun 安装链) ---
 # 与 windows_service_install.ps1 对齐:启用外置采集 + 本地 bin 路径 + 按需下载。
-# manifest 地址由 agent 启动时从 agent.toml 的 rest_base_url 自动推导,无需在此设置。
+# manifest 地址从 agent.toml 的 rest_base_url 推导,分别刷新 adapter 与 Velociraptor。
 try {
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR", "1", "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BIN", (Join-Path $instDir "collector\forensic_collector.exe"), "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", (Join-Path $instDir "collector\forensic_collector_builtin.exe"), "Machine")
   [Environment]::SetEnvironmentVariable("EDR_VELOCIRAPTOR_BIN", (Join-Path $instDir "collector\velociraptor.exe"), "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_AUTOFETCH", "1", "Machine")
+  $restBase = (Read-AgentTomlString -Path $cfg -Key "rest_base_url").TrimEnd("/")
+  if ($restBase) {
+    [Environment]::SetEnvironmentVariable("EDR_FORENSIC_ADAPTER_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", "Machine")
+    [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=amd64", "Machine")
+  }
 } catch {
   Write-Warning "设置取证采集器环境变量失败(非致命): $_"
 }
