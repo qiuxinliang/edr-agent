@@ -18,6 +18,7 @@
 #include "edr/ave_cross_engine_feed.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pid_history_pmfe.h"
+#include "edr/correlation_engine.h"
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
@@ -336,6 +337,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
   edr_p0_rule_try_emit(&br);
+  edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   {
     EdrDetectionDecision dd;
@@ -382,12 +384,14 @@ static void *preprocess_main(void *arg) {
       edr_event_batch_poll_timeout();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
+      edr_correlation_poll_maintenance(0); /* 内部节流；同预处理线程，满足契约 */
       poll_summary_flush();
       continue;
     }
     edr_event_batch_poll_timeout();
     edr_storage_queue_poll_drain();
     edr_local_evidence_cache_poll_maintenance();
+    edr_correlation_poll_maintenance(0); /* 空闲期兜底排空注入 + 定期清扫 */
     poll_summary_flush();
 #ifdef _WIN32
     if (s_stop_preprocess) {

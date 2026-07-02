@@ -239,6 +239,9 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
       L"CommandLine", L"Commandline", L"ProcessCommandLine", L"Command", L"ScriptBlockText",
       L"Content", L"Buffer",
   };
+  static const PCWSTR dns_qname_try[] = {
+      L"QueryName", L"Name", L"HostName",
+  };
 
   (void)edr_prop_first_utf8(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]),
                             out_event->process_name, sizeof(out_event->process_name));
@@ -270,8 +273,15 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
     if (edr_prop_first_utf8(rec, port_try, sizeof(port_try) / sizeof(port_try[0]), tmp, sizeof(tmp))) {
       out_event->remote_port = edr_parse_u32_ascii(tmp);
     }
-    (void)edr_prop_first_utf8(rec, cmd_try, sizeof(cmd_try) / sizeof(cmd_try[0]),
-                              out_event->path, sizeof(out_event->path));
+    /* DNS 查询：优先把查询名填入 path，供关联引擎按查询名做隧道检测；取不到再回退 cmd_try。 */
+    if (type == EDR_EVENT_NET_DNS_QUERY) {
+      (void)edr_prop_first_utf8(rec, dns_qname_try, sizeof(dns_qname_try) / sizeof(dns_qname_try[0]),
+                                out_event->path, sizeof(out_event->path));
+    }
+    if (!out_event->path[0]) {
+      (void)edr_prop_first_utf8(rec, cmd_try, sizeof(cmd_try) / sizeof(cmd_try[0]),
+                                out_event->path, sizeof(out_event->path));
+    }
   } else if (type == EDR_EVENT_PROCESS_CREATE || type == EDR_EVENT_SCRIPT_POWERSHELL ||
              type == EDR_EVENT_SCRIPT_WMI) {
     (void)edr_prop_first_utf8(rec, cmd_try, sizeof(cmd_try) / sizeof(cmd_try[0]),

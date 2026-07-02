@@ -3,6 +3,7 @@
 #include "edr/adaptive_collection.h"
 #include "edr/ave_sdk.h"
 #include "edr/behavior_alert_emit.h"
+#include "edr/correlation_engine.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
 #include "edr/response.h"
@@ -1137,9 +1138,40 @@ static EdrError edr_agent_recover_config(EdrAgent *agent, const char *load_path,
   return EDR_OK;
 }
 
+/* AVE 行为裁决中判定为“进程注入类”的 behavior_flags 掩码（纯注入技法，不含
+ * DNS 隧道 / LSASS dump / NTDS 等凭证/外泄类，避免误把非注入信号回灌注入序列）。 */
+#define EDR_AVE_BEH_INJECTION_MASK                                                   \
+  (AVE_BEH_INJECT_LSASS | AVE_BEH_ALLOC_EXEC_REMOTE | AVE_BEH_CREATE_REMOTE_THREAD | \
+   AVE_BEH_MODULE_STOMP | AVE_BEH_HOLLOW_PROCESS | AVE_BEH_REFLECTIVE_LOAD)
+
 static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
   (void)user_data;
   edr_behavior_alert_emit_to_batch(alert);
+  /* Windows 注入回灌：Windows 上注入由 AVE 引擎内部多事件推理得出裁决，不以离散
+   * PROCESS_INJECT 记录流经 process_one_slot。此处仅在注入类裁决（低频、高置信）时：
+   *   1) 对该 pid 提升自适应采集 —— 使其后续 net/file/reg 事件被采集门放行，
+   *      注入后外联（R-CORR-INJECT-C2-001）等跨引擎关联方能拿到第二步事件；
+   *   2) 把注入信号回灌关联引擎（经无锁 pending 环，实际入表在预处理线程）。
+   * 非注入裁决零额外开销（仅一次位与判断）；不新增采集、无新线程、不碰 ETW 热路径。 */
+  if (alert && (alert->behavior_flags & EDR_AVE_BEH_INJECTION_MASK) != 0u && alert->pid != 0u) {
+    /* 独立开关：EDR_CORRELATION_INJECT_FEEDBACK=0 可单独关掉注入回灌（含提采集），
+     * 不影响其余关联规则。用于在评估 AVE 注入判定误报率期间灰度/回滚。默认开。 */
+    const char *fb = getenv("EDR_CORRELATION_INJECT_FEEDBACK");
+    if (!(fb && (fb[0] == '0' || fb[0] == 'n' || fb[0] == 'N' || fb[0] == 'f' || fb[0] == 'F'))) {
+      /* 从 behavior_flags 派生具体注入子技法（优先级：更明确的技法在前），随回灌上报，
+       * 供后端/图计算精确归因（如注入后外联的证据链标注 "inject:hollowing"）。 */
+      const uint32_t bf = alert->behavior_flags;
+      const char *tech = (bf & AVE_BEH_HOLLOW_PROCESS)      ? "hollowing"
+                         : (bf & AVE_BEH_REFLECTIVE_LOAD)   ? "reflective"
+                         : (bf & AVE_BEH_INJECT_LSASS)      ? "lsass"
+                         : (bf & AVE_BEH_CREATE_REMOTE_THREAD) ? "remote_thread"
+                         : (bf & AVE_BEH_ALLOC_EXEC_REMOTE) ? "alloc_exec"
+                         : (bf & AVE_BEH_MODULE_STOMP)      ? "module_stomp"
+                                                            : "generic";
+      edr_adaptive_collection_raise(4, "R-CORR-INJECT", alert->pid, 0u, alert->process_name);
+      edr_correlation_note_injection(alert->pid, alert->process_name, alert->timestamp_ns, tech);
+    }
+  }
 }
 
 static void edr_agent_register_ave_behavior_callbacks(EdrAgent *agent) {
@@ -1648,6 +1680,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
+  char corr_health_json[600];
   char event_filter_ver[96];
   char event_filter_last_reason[128], event_filter_last_process[128];
   char event_filter_last_path[320], event_filter_last_cmdline[320];
@@ -1922,6 +1955,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
+  /* 关联引擎状态（含注入回灌/发射限流指标）随健康周期上报，供后端看板评估误报/数据量。
+   * 拼成 `,"correlation":{...}` 片段挂到 body 末尾（evidence_cache 之后）；关闭时留空，
+   * 既不改 body 结构也不产生悬挂逗号。同时打一行 stderr 便于本地/验证脚本读取。 */
+  corr_health_json[0] = '\0';
+  if (edr_correlation_enabled()) {
+    char corr_json[512];
+    if (edr_correlation_status_json(corr_json, sizeof(corr_json)) > 0) {
+      fprintf(stderr, "[correlation] %s\n", corr_json);
+      (void)snprintf(corr_health_json, sizeof(corr_health_json), ",\"correlation\":%s", corr_json);
+    }
+  }
   EdrShellcodeRulesStatus shell_rules;
   memset(&shell_rules, 0, sizeof(shell_rules));
   edr_shellcode_known_get_status(&shell_rules);
@@ -2131,7 +2175,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"last_error\":\"%s\",\"last_degrade_reason\":\"%s\"},"
       "\"webshell\":{\"enabled\":%s,\"mode\":\"web_roots_only\",\"watch_count\":%u,"
       "\"max_file_size_mb\":%u,\"scan_threads\":%u,\"last_degrade_reason\":\"%s\"},"
-      "%s"
+      "%s%s"
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
       runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
@@ -2363,7 +2407,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       shell_error[0] ? "rules_error" : "",
       agent->cfg.webshell_detector.enabled ? "true" : "false", agent->cfg.webshell_detector.max_watch_dirs,
       agent->cfg.webshell_detector.max_file_size_mb, agent->cfg.webshell_detector.scan_threads,
-      "", evidence_json);
+      "", evidence_json, corr_health_json);
   if (n > 0 && (size_t)n < sizeof(body)) {
     (void)edr_ingest_http_post_engine_health_json(body);
   }

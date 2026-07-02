@@ -1,6 +1,7 @@
 #include "edr/sensor_interest.h"
 
 #include "edr/adaptive_collection.h"
+#include "edr/correlation_engine.h"
 
 #include "cJSON.h"
 
@@ -813,6 +814,9 @@ int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
   if (!event) {
     return 0;
   }
+  /* 集成点 A：在采集丢弃决策之前观测“全火喉”，供阈值/频率关联计数。
+   * 个体事件的准入判定不受影响；总开关默认关时为 no-op。 */
+  edr_correlation_observe_interest(event);
   edr_sensor_interest_lazy_init();
   if (!s_si.enabled || edr_si_env_bool("EDR_COLLECTOR_ADMIT_ALL", 0)) {
     edr_si_inc64(&s_si.checked);
