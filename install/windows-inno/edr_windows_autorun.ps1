@@ -298,6 +298,7 @@ try {
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BIN", (Join-Path $instDir "collector\forensic_collector.exe"), "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", (Join-Path $instDir "collector\forensic_collector_builtin.exe"), "Machine")
   [Environment]::SetEnvironmentVariable("EDR_VELOCIRAPTOR_BIN", (Join-Path $instDir "collector\velociraptor.exe"), "Machine")
+  [Environment]::SetEnvironmentVariable("EDR_FORENSIC_VERSION_CHECK_SEC", "60", "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_AUTOFETCH", "1", "Machine")
   $restBase = (Read-AgentTomlString -Path $cfg -Key "rest_base_url").TrimEnd("/")
   if ($restBase) {

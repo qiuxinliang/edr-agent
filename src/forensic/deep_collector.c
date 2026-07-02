@@ -522,13 +522,13 @@ static void dc_append_stderr_tail(const char *err_path, char *out_detail, size_t
 
 /* 版本感知刷新:本地件已存在时,按间隔拉 manifest 比对 sha256,不一致则原子替换(dest.part → dest)。
  * 平台激活新版后无需人工删旧件即可自动滚更。间隔由 EDR_FORENSIC_VERSION_CHECK_SEC 控制
- * (默认 600s;<=0 禁用,回到“仅缺失时重拉”的旧行为)。*last_check 为每槽位静态计时,限流 manifest 拉取。
+ * (默认 60s;<=0 禁用,回到“仅缺失时重拉”的旧行为)。*last_check 为每槽位静态计时,限流 manifest 拉取。
  * 保守:manifest 不可达 / 平台停用 / sha 缺失 / 本地读不了 → 返回 EDR_DC_OK 保留现有件,绝不因瞬时问题破坏在用件。 */
 static int dc_maybe_refresh(const char *dest, const char *manifest_url, const char *pin_sha,
                             time_t *last_check, char *detail, size_t detail_cap) {
   if (!dest || !dest[0] || !manifest_url || !manifest_url[0] || !last_check) return EDR_DC_OK;
   const char *iv = getenv("EDR_FORENSIC_VERSION_CHECK_SEC");
-  long interval = 600;
+  long interval = 60;
   if (iv && iv[0]) interval = atol(iv);
   if (interval <= 0) return EDR_DC_OK; /* 版本检查禁用 */
   time_t now = time(NULL);

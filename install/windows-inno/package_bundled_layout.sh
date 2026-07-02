@@ -140,6 +140,14 @@ COLLECTOR_OUT="$OUT_DIR/collector"
 mkdir -p "$COLLECTOR_OUT"
 GO_FC="${EDR_FORENSIC_COLLECTOR_BIN:-$EDR_AGENT_DIR/../forensic-collector/dist/win-${ARCH}/forensic_collector.exe}"
 VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}/${ARCH}"
+if [[ "${EDR_SKIP_FORENSIC_COLLECTOR_BUILD:-0}" != "1" && -d "$EDR_AGENT_DIR/../forensic-collector" ]]; then
+  if command -v go >/dev/null 2>&1; then
+    echo "==> [$ARCH] rebuilding Go forensic_collector.exe from current source"
+    ( cd "$EDR_AGENT_DIR/../forensic-collector" && EDR_FC_OUT="$EDR_AGENT_DIR/../forensic-collector/dist/win-${ARCH}" ./build.sh "$ARCH" )
+  else
+    echo "Warning: [$ARCH] go not found; using existing forensic_collector.exe if present." >&2
+  fi
+fi
 if [[ -f "$GO_FC" ]]; then
   cp -a "$GO_FC" "$COLLECTOR_OUT/forensic_collector.exe"
 else

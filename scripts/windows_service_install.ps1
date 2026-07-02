@@ -190,6 +190,7 @@ function Install-AgentService {
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BIN" (Join-Path $InstallDir "collector\forensic_collector.exe")
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN" (Join-Path $InstallDir "collector\forensic_collector_builtin.exe")
   Set-MachineEnv "EDR_VELOCIRAPTOR_BIN" (Join-Path $InstallDir "collector\velociraptor.exe")
+  Set-MachineEnv "EDR_FORENSIC_VERSION_CHECK_SEC" "60"
   # 按需下载:agent 经平台「固定地址」manifest 分别刷新 Go adapter 与 Velociraptor。
   # 默认开启;manifest 地址由 -PlatformBaseUrl 推导(留空则仅用安装包内置/手动部署件)。
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_AUTOFETCH" "1"

@@ -13,7 +13,9 @@
 param(
     [string] $Inno = "",
     [string] $BinDir = "",
-    [string] $AppVersion = ""
+    [string] $AppVersion = "",
+    [string] $CollectorArch = "",
+    [switch] $SkipForensicCollectorBuild
 )
 if (-not $Inno) {
     $pf86 = [Environment]::GetFolderPath("ProgramFilesX86")
@@ -45,6 +47,72 @@ if (-not (Test-Path -LiteralPath $binExe)) {
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
 
+function Resolve-CollectorArch {
+    param([string] $Raw)
+    $v = ""
+    if ($Raw) { $v = $Raw.Trim().ToLowerInvariant() }
+    if (-not $v -and $env:EDR_BUNDLE_ARCH) { $v = $env:EDR_BUNDLE_ARCH.Trim().ToLowerInvariant() }
+    if (-not $v) { $v = "amd64" }
+    switch ($v) {
+        "x64" { return "amd64" }
+        "x86_64" { return "amd64" }
+        "amd64" { return "amd64" }
+        "aarch64" { return "arm64" }
+        "arm64" { return "arm64" }
+        default { throw "Unsupported CollectorArch '$Raw' (allow: amd64|arm64)" }
+    }
+}
+
+function Build-AndStageForensicCollector {
+    param(
+        [string] $RepoRoot,
+        [string] $BinDir,
+        [string] $Arch,
+        [switch] $Skip
+    )
+    if ($Skip) {
+        Write-Warning "SkipForensicCollectorBuild set; installer will use existing BinDir\collector content."
+        return
+    }
+    $fcRoot = Join-Path $RepoRoot "forensic-collector"
+    if (-not (Test-Path -LiteralPath $fcRoot)) {
+        Write-Warning "forensic-collector source not found: $fcRoot. Installer will use existing BinDir\collector content."
+        return
+    }
+    $go = Get-Command go -ErrorAction SilentlyContinue
+    if (-not $go) {
+        Write-Warning "go executable not found. Cannot rebuild forensic_collector.exe; installer will use existing BinDir\collector content."
+        return
+    }
+    $distDir = Join-Path $fcRoot ("dist\win-" + $Arch)
+    $outExe = Join-Path $distDir "forensic_collector.exe"
+    New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+    Push-Location $fcRoot
+    $oldGoos = $env:GOOS
+    $oldGoarch = $env:GOARCH
+    $oldCgo = $env:CGO_ENABLED
+    try {
+        $env:GOOS = "windows"
+        $env:GOARCH = $Arch
+        $env:CGO_ENABLED = "0"
+        & $go.Source build -trimpath -ldflags "-s -w" -o $outExe .
+        if ($LASTEXITCODE -ne 0) {
+            throw "go build forensic_collector.exe failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        $env:GOOS = $oldGoos
+        $env:GOARCH = $oldGoarch
+        $env:CGO_ENABLED = $oldCgo
+        Pop-Location
+    }
+    $collectorDir = Join-Path $BinDir "collector"
+    New-Item -ItemType Directory -Force -Path $collectorDir | Out-Null
+    $dest = Join-Path $collectorDir "forensic_collector.exe"
+    Copy-Item -LiteralPath $outExe -Destination $dest -Force
+    $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $dest).Hash.ToLowerInvariant()
+    Write-Host "Staged forensic_collector.exe: arch=$Arch sha256=$sha path=$dest"
+}
+
 $workerExe = Join-Path $BinDir "FDSecurityInstallerWorker.exe"
 if (-not (Test-Path -LiteralPath $workerExe)) {
     Write-Warning "FDSecurityInstallerWorker.exe not found in $BinDir. The setup can still compile, but runtime stages will fall back to PowerShell."
@@ -68,6 +136,9 @@ if (-not $AppVersion) {
 }
 [System.IO.File]::WriteAllText($versionFile, $AppVersion + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
 Write-Host "Staged VERSION: $AppVersion"
+
+$resolvedCollectorArch = Resolve-CollectorArch $CollectorArch
+Build-AndStageForensicCollector -RepoRoot $repoRoot -BinDir $BinDir -Arch $resolvedCollectorArch -Skip:$SkipForensicCollectorBuild
 
 $modelsDir = Join-Path $agentRoot "models"
 if (Test-Path -LiteralPath $modelsDir) {
