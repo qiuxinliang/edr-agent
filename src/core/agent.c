@@ -1143,33 +1143,53 @@ static EdrError edr_agent_recover_config(EdrAgent *agent, const char *load_path,
 #define EDR_AVE_BEH_INJECTION_MASK                                                   \
   (AVE_BEH_INJECT_LSASS | AVE_BEH_ALLOC_EXEC_REMOTE | AVE_BEH_CREATE_REMOTE_THREAD | \
    AVE_BEH_MODULE_STOMP | AVE_BEH_HOLLOW_PROCESS | AVE_BEH_REFLECTIVE_LOAD)
+/* 凭证转储类裁决（纯转储，非注入）：LSASS 内存转储 / NTDS / SAM。INJECT_LSASS 归注入掩码。 */
+#define EDR_AVE_BEH_CREDACCESS_MASK (AVE_BEH_LSASS_DUMP | AVE_BEH_NTDS_ACCESS | AVE_BEH_SAM_DUMP)
 
 static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
   (void)user_data;
   edr_behavior_alert_emit_to_batch(alert);
-  /* Windows 注入回灌：Windows 上注入由 AVE 引擎内部多事件推理得出裁决，不以离散
-   * PROCESS_INJECT 记录流经 process_one_slot。此处仅在注入类裁决（低频、高置信）时：
-   *   1) 对该 pid 提升自适应采集 —— 使其后续 net/file/reg 事件被采集门放行，
-   *      注入后外联（R-CORR-INJECT-C2-001）等跨引擎关联方能拿到第二步事件；
-   *   2) 把注入信号回灌关联引擎（经无锁 pending 环，实际入表在预处理线程）。
-   * 非注入裁决零额外开销（仅一次位与判断）；不新增采集、无新线程、不碰 ETW 热路径。 */
-  if (alert && (alert->behavior_flags & EDR_AVE_BEH_INJECTION_MASK) != 0u && alert->pid != 0u) {
-    /* 独立开关：EDR_CORRELATION_INJECT_FEEDBACK=0 可单独关掉注入回灌（含提采集），
-     * 不影响其余关联规则。用于在评估 AVE 注入判定误报率期间灰度/回滚。默认开。 */
-    const char *fb = getenv("EDR_CORRELATION_INJECT_FEEDBACK");
-    if (!(fb && (fb[0] == '0' || fb[0] == 'n' || fb[0] == 'N' || fb[0] == 'f' || fb[0] == 'F'))) {
-      /* 从 behavior_flags 派生具体注入子技法（优先级：更明确的技法在前），随回灌上报，
-       * 供后端/图计算精确归因（如注入后外联的证据链标注 "inject:hollowing"）。 */
-      const uint32_t bf = alert->behavior_flags;
-      const char *tech = (bf & AVE_BEH_HOLLOW_PROCESS)      ? "hollowing"
-                         : (bf & AVE_BEH_REFLECTIVE_LOAD)   ? "reflective"
-                         : (bf & AVE_BEH_INJECT_LSASS)      ? "lsass"
+  /* AVE 裁决回灌：Windows 上注入/凭证转储由 AVE 引擎内部多事件推理得出裁决，不以离散
+   * 事件流经 process_one_slot。此处仅在这两类高价值裁决（低频、高置信）时：
+   *   1) 对该 pid 提升自适应采集 —— 使其后续 net/file 事件被采集门放行，跨引擎关联
+   *      （注入后外联 / 凭证转储后外联）方能拿到第二步事件；
+   *   2) 把信号回灌关联引擎（经无锁 pending 环，实际入表在预处理线程）。
+   * 非命中裁决零额外开销（两次位与判断）；不新增采集、无新线程、不碰 ETW 热路径。 */
+  {
+    const uint32_t bf = alert ? alert->behavior_flags : 0u;
+    const char *fb;
+    if (!alert || alert->pid == 0u) {
+      return;
+    }
+    if ((bf & (EDR_AVE_BEH_INJECTION_MASK | EDR_AVE_BEH_CREDACCESS_MASK)) == 0u) {
+      return; /* 非注入/凭证裁决，无需回灌 */
+    }
+    /* 独立开关：EDR_CORRELATION_INJECT_FEEDBACK=0 单独关掉 AVE 回灌（含提采集），
+     * 不影响其余关联规则。用于评估 AVE 判定误报率期间灰度/回滚。默认开。 */
+    fb = getenv("EDR_CORRELATION_INJECT_FEEDBACK");
+    if (fb && (fb[0] == '0' || fb[0] == 'n' || fb[0] == 'N' || fb[0] == 'f' || fb[0] == 'F')) {
+      return;
+    }
+    if (bf & EDR_AVE_BEH_INJECTION_MASK) {
+      const char *tech = (bf & AVE_BEH_HOLLOW_PROCESS)         ? "hollowing"
+                         : (bf & AVE_BEH_REFLECTIVE_LOAD)      ? "reflective"
+                         : (bf & AVE_BEH_INJECT_LSASS)         ? "lsass"
                          : (bf & AVE_BEH_CREATE_REMOTE_THREAD) ? "remote_thread"
-                         : (bf & AVE_BEH_ALLOC_EXEC_REMOTE) ? "alloc_exec"
-                         : (bf & AVE_BEH_MODULE_STOMP)      ? "module_stomp"
-                                                            : "generic";
+                         : (bf & AVE_BEH_ALLOC_EXEC_REMOTE)    ? "alloc_exec"
+                         : (bf & AVE_BEH_MODULE_STOMP)         ? "module_stomp"
+                                                               : "generic";
       edr_adaptive_collection_raise(4, "R-CORR-INJECT", alert->pid, 0u, alert->process_name);
       edr_correlation_note_injection(alert->pid, alert->process_name, alert->timestamp_ns, tech);
+    }
+    if (bf & EDR_AVE_BEH_CREDACCESS_MASK) {
+      /* 凭证转储 → 合成凭证访问信号，接入 R-CORR-CRED-EXFIL-001（凭证访问后外联）。
+       * 覆盖 LSASS 内存转储这一头号手法（无落地文件，file_read 规则抓不到）。 */
+      const char *ctech = (bf & AVE_BEH_LSASS_DUMP)    ? "lsass_dump"
+                          : (bf & AVE_BEH_NTDS_ACCESS) ? "ntds"
+                          : (bf & AVE_BEH_SAM_DUMP)    ? "sam_dump"
+                                                       : "cred_access";
+      edr_adaptive_collection_raise(4, "R-CORR-CRED", alert->pid, 0u, alert->process_name);
+      edr_correlation_note_cred_access(alert->pid, alert->process_name, alert->timestamp_ns, ctech);
     }
   }
 }

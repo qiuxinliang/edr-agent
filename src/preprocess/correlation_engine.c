@@ -128,12 +128,19 @@ static CorrStateSlot s_sequence[CORR_SEQUENCE_SLOTS];
  */
 #define CORR_INJECT_PENDING_SLOTS 32u
 
+/* AVE 裁决回灌信号类别：决定 drain 时合成哪种事件喂序列表。 */
+typedef enum {
+  CORR_SIG_INJECT = 0,      /* 进程注入 → 合成 PROCESS_INJECT */
+  CORR_SIG_CRED_ACCESS = 1, /* 凭证转储(LSASS/SAM/NTDS) → 合成带凭证标记的 FILE_READ */
+} CorrSignalKind;
+
 typedef struct {
   volatile uint32_t ready; /* 0=空/写入中，1=可读 */
   uint32_t pid;
+  uint32_t kind;           /* CorrSignalKind */
   int64_t event_time_ns;
   char process_name[EDR_BR_STR_SHORT];
-  char technique[32]; /* 注入子技法（AVE behavior_flags 派生），空=通用 */
+  char technique[32]; /* 子技法（AVE behavior_flags 派生），空=通用 */
 } CorrInjectPending;
 
 static CorrInjectPending s_inject_pending[CORR_INJECT_PENDING_SLOTS];
@@ -337,9 +344,11 @@ static void corr_load_builtin_rules(void) {
     r->n_steps = 2;
   }
 
-  /* R-CORR-CRED-EXFIL-001：凭证读取→外联合流（同进程，允许乱序）。
-   * 步：读取凭证库/敏感文件(file_read) + 外部网络连接(net_connect)。
-   * 单事件均不足以定性，合流才升级；证据链供云端/图计算续接。 */
+  /* R-CORR-CRED-EXFIL-001：凭证访问→外联合流（同进程，允许乱序）。
+   * 步：凭证访问(file_read + require_cred_path) + 外部网络连接(net_connect + require_external)。
+   * 凭证访问来源有二：(a) 真实读取凭证库/Hive 文件；(b) AVE 凭证转储裁决经
+   * edr_correlation_note_cred_access 回灌的合成记录（file_path="avecred:*"，覆盖 LSASS
+   * 内存转储等无落地文件的头号手法）。单事件均不足以定性，合流才升级。 */
   r = corr_rule_new("R-CORR-CRED-EXFIL-001", "凭证访问后外联（合流）", 4,
                     "T1003,T1041", CORR_KIND_SEQUENCE, CORR_KEY_PID,
                     (int64_t)corr_env_u32("EDR_CORR_CREDEXFIL_WINDOW_MS", 60000));
@@ -1047,6 +1056,8 @@ static int corr_path_is_credential(const char *path) {
       "\\microsoft\\protect\\", "\\.aws\\credentials", "\\.azure\\", "\\.ssh\\id_",
       "\\.ssh\\known_hosts", "\\.gnupg\\", "\\credentials\\", "\\.docker\\config.json",
       "\\.kube\\config",
+      /* AVE 凭证转储裁决回灌的合成标记（LSASS 内存转储无落地文件，用此标记接入）。 */
+      "avecred:",
   };
   if (!path || !path[0]) {
     return 0;
@@ -1240,26 +1251,32 @@ static void corr_run_sequences(const EdrBehaviorRecord *br, int64_t now_ns,
   }
 }
 
-/* 排空注入 pending 环：把 AVE 线程投递的注入信号合成最小 PROCESS_INJECT 记录并入序列表。
+/* 排空 AVE 裁决 pending 环：按信号类别合成最小记录并入序列表。
  * 仅由预处理线程调用，保持“序列表单一写者”不变式。 */
 static void corr_drain_injections(int64_t now_ns) {
   for (uint32_t i = 0; i < CORR_INJECT_PENDING_SLOTS; i++) {
     CorrInjectPending *p = &s_inject_pending[i];
     EdrBehaviorRecord br;
+    char detail[CORR_EV_FIELD];
+    const char *tech;
     if (p->ready == 0u) {
       continue;
     }
-    char detail[CORR_EV_FIELD];
+    tech = p->technique[0] ? p->technique : p->process_name;
     memset(&br, 0, sizeof(br));
-    br.type = EDR_EVENT_PROCESS_INJECT;
     br.pid = p->pid;
     br.event_time_ns = p->event_time_ns > 0 ? p->event_time_ns : now_ns;
     snprintf(br.process_name, sizeof(br.process_name), "%s", p->process_name);
-    /* 证据 detail 携带子技法，供上报/图边精确归因（如 "inject:hollowing"）。 */
-    if (p->technique[0]) {
-      snprintf(detail, sizeof(detail), "inject:%s", p->technique);
+    if (p->kind == CORR_SIG_CRED_ACCESS) {
+      /* 凭证转储裁决 → 合成带凭证标记的 FILE_READ，命中 CRED-EXFIL 的 require_cred_path。
+       * LSASS 内存转储无落地文件，用合成标记路径接入现有凭证外泄检测。 */
+      br.type = EDR_EVENT_FILE_READ;
+      snprintf(br.file_path, sizeof(br.file_path), "avecred:%s", tech);
+      snprintf(detail, sizeof(detail), "credaccess:%s", tech);
     } else {
-      snprintf(detail, sizeof(detail), "inject:%.80s", p->process_name);
+      /* 注入裁决 → 合成 PROCESS_INJECT，证据 detail 携带子技法供图边归因。 */
+      br.type = EDR_EVENT_PROCESS_INJECT;
+      snprintf(detail, sizeof(detail), "inject:%s", tech);
     }
     p->ready = 0u; /* 先清可读位再处理，避免重复消费 */
     corr_run_sequences(&br, br.event_time_ns, detail);
@@ -1282,8 +1299,9 @@ void edr_correlation_evaluate(const EdrBehaviorRecord *br) {
   corr_run_sequences(br, now_ns, NULL);
 }
 
-void edr_correlation_note_injection(uint32_t pid, const char *process_name, int64_t event_time_ns,
-                                    const char *technique) {
+/* AVE 裁决回灌的共用写入器：原子领取 pending 槽并发布。由 AVE 裁决线程调用。 */
+static void corr_note_ave_signal(CorrSignalKind kind, uint32_t pid, const char *process_name,
+                                 int64_t event_time_ns, const char *technique) {
   long seq;
   CorrInjectPending *p;
   if (!edr_correlation_enabled() || pid == 0u) {
@@ -1298,6 +1316,7 @@ void edr_correlation_note_injection(uint32_t pid, const char *process_name, int6
   }
   p->ready = 0u; /* 写入期间标记不可读 */
   p->pid = pid;
+  p->kind = (uint32_t)kind;
   p->event_time_ns = event_time_ns;
   if (process_name && process_name[0]) {
     snprintf(p->process_name, sizeof(p->process_name), "%s", process_name);
@@ -1315,6 +1334,16 @@ void edr_correlation_note_injection(uint32_t pid, const char *process_name, int6
   __sync_synchronize();
 #endif
   p->ready = 1u; /* 发布：字段就绪后再置可读 */
+}
+
+void edr_correlation_note_injection(uint32_t pid, const char *process_name, int64_t event_time_ns,
+                                    const char *technique) {
+  corr_note_ave_signal(CORR_SIG_INJECT, pid, process_name, event_time_ns, technique);
+}
+
+void edr_correlation_note_cred_access(uint32_t pid, const char *process_name, int64_t event_time_ns,
+                                      const char *technique) {
+  corr_note_ave_signal(CORR_SIG_CRED_ACCESS, pid, process_name, event_time_ns, technique);
 }
 
 /* ------------------------------------------------------------ 维护/状态 */

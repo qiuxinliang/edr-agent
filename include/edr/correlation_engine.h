@@ -63,6 +63,16 @@ void edr_correlation_evaluate(const EdrBehaviorRecord *br);
 void edr_correlation_note_injection(uint32_t pid, const char *process_name,
                                     int64_t event_time_ns, const char *technique);
 
+/**
+ * 集成点 B''（凭证转储回灌）：AVE 行为裁决判定为凭证转储类（LSASS/SAM/NTDS 等）时调用。
+ * 与 note_injection 同一机制（AVE 裁决线程写 pending 环，预处理线程排空），但合成一条带
+ * 凭证标记路径的 FILE_READ 记录，直接被 R-CORR-CRED-EXFIL-001 覆盖 —— 使“LSASS 内存转储
+ * → 外联”这一头号手法（无落地文件、file_read 规则抓不到）纳入关联检测面。
+ * technique：凭证子技法（"lsass_dump"/"sam_dump"/"ntds"/"inject_lsass"），随证据链上报。
+ */
+void edr_correlation_note_cred_access(uint32_t pid, const char *process_name,
+                                      int64_t event_time_ns, const char *technique);
+
 /** 周期维护：过期窗口回收、注入 pending 排空。搭 local_evidence_cache ~60s 周期调用。
  * 契约：本函数写序列状态表，必须与 edr_correlation_evaluate 同在预处理线程调用。 */
 void edr_correlation_poll_maintenance(int64_t now_ns);
