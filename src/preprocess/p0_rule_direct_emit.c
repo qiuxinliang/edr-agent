@@ -27,7 +27,7 @@
 #endif
 
 #ifndef EDR_P0_RULES_BUNDLE_VERSION
-#define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r252-086c1be1"
+#define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r252-a459baa5"
 #endif
 
 /* 同一 (rule_id, endpoint_id, pid, event_time_ns) 在窗口内不重复上送。
@@ -334,6 +334,23 @@ static int p0_is_fdsecurity_self_installer_baseline(const EdrBehaviorRecord *br,
   return 0;
 }
 
+static int p0_is_local_fixed_disk_desktop_ini_baseline(const EdrBehaviorRecord *br, const char *detail) {
+  if (!br || !p0_record_contains_ci(br, detail, "desktop.ini")) {
+    return 0;
+  }
+  if (!(p0_record_contains_ci(br, detail, "\\Device\\HarddiskVolume") ||
+        p0_record_contains_ci(br, detail, "C:\\") ||
+        p0_record_contains_ci(br, detail, "C:/"))) {
+    return 0;
+  }
+  return p0_record_contains_ci(br, detail, "\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\desktop.ini") ||
+         p0_record_contains_ci(br, detail, "\\Windows\\System32\\Tasks\\") ||
+         p0_record_contains_ci(br, detail, "\\WindowsApps\\") ||
+         p0_record_contains_ci(br, detail, "\\D3DSCache\\") ||
+         p0_record_contains_ci(br, detail, "\\Windows\\System32\\config\\systemprofile\\AppData\\Local\\") ||
+         p0_record_contains_ci(br, detail, "\\desktop.ini");
+}
+
 static char p0_fold_path_ci_char(char c) {
   if (c == '\\') {
     c = '/';
@@ -468,6 +485,13 @@ static int p0_should_suppress_known_false_positive(const char *rule_id, const Ed
   if (p0_is_fdsecurity_self_installer_baseline(br, detail)) {
     if (out_reason) {
       *out_reason = "fdsecurity_self_installer_baseline";
+    }
+    return 1;
+  }
+  if (strcmp(rule_id, "R-MITRE-WIN-T1091") == 0 &&
+      p0_is_local_fixed_disk_desktop_ini_baseline(br, detail)) {
+    if (out_reason) {
+      *out_reason = "local_fixed_disk_desktop_ini";
     }
     return 1;
   }

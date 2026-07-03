@@ -90,8 +90,8 @@
     "restore-files"
   ],
   "file_path_prefixes": [],
-  "generated_at": "2026-06-25T08:39:46.915274Z",
-  "interest_version": "sensor-interest-v1-24886426abf0",
+  "generated_at": "2026-07-03T15:32:58.597608Z",
+  "interest_version": "sensor-interest-v1-e706cef77977",
   "kind": "edr_sensor_interest_manifest",
   "process_name_prefixes": [],
   "process_names": [
@@ -240,7 +240,7 @@
     27017,
     47001
   ],
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-086c1be1",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-a459baa5",
   "schema_version": 1,
   "source_dynamic_rules": "dynamic_rules_v1.json"
 }

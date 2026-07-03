@@ -208,6 +208,19 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
              r->parent_path);
     copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level),
              r->integrity_level);
+    /* 取证增强字段：端侧已采集，补齐上报（服务端 pbwire 按字段号 4-10 接住落库）。 */
+    copy_str(m->detail.process.parent_cmdline, sizeof(m->detail.process.parent_cmdline),
+             r->parent_cmdline);
+    copy_str(m->detail.process.current_directory, sizeof(m->detail.process.current_directory),
+             r->current_directory);
+    copy_str(m->detail.process.process_creation_time, sizeof(m->detail.process.process_creation_time),
+             r->process_creation_time);
+    m->detail.process.token_elevation = r->token_elevation;
+    m->detail.process.grandparent_pid = r->grandparent_pid;
+    copy_str(m->detail.process.grandparent_name, sizeof(m->detail.process.grandparent_name),
+             r->grandparent_name);
+    copy_str(m->detail.process.grandparent_path, sizeof(m->detail.process.grandparent_path),
+             r->grandparent_path);
     return;
   }
 }

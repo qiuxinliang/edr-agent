@@ -121,6 +121,15 @@ message ProcessDetail {
   string parent_name = 1;
   string parent_path = 2;
   string integrity_level = 3;
+  // 取证增强字段（与 EdrBehaviorRecord / 平台 alerts_analysis_snapshot 必需字段对齐）：
+  // 端侧已采集，补齐上报供服务端进程链/研判使用。
+  string parent_cmdline = 4;
+  string current_directory = 5;
+  string process_creation_time = 6;
+  uint32 token_elevation = 7;
+  uint32 grandparent_pid = 8;
+  string grandparent_name = 9;
+  string grandparent_path = 10;
 }
 
 message FileDetail {

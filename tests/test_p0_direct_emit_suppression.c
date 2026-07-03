@@ -234,6 +234,23 @@ static void test_rundll32_davclnt_127_prefix_is_not_suppressed(void) {
   assert(!suppressed("R-LOLBIN-002", &r, r.cmdline, NULL));
 }
 
+static void test_t1091_local_fixed_desktop_ini_is_suppressed(void) {
+  EdrBehaviorRecord r;
+  init_record(&r);
+  r.type = EDR_EVENT_FILE_WRITE;
+  snprintf(r.file_path, sizeof(r.file_path),
+           "\\Device\\HarddiskVolume3\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\desktop.ini");
+  assert(suppressed("R-MITRE-WIN-T1091", &r, r.file_path, "local_fixed_disk_desktop_ini"));
+}
+
+static void test_t1091_autorun_inf_is_not_suppressed(void) {
+  EdrBehaviorRecord r;
+  init_record(&r);
+  r.type = EDR_EVENT_FILE_WRITE;
+  snprintf(r.file_path, sizeof(r.file_path), "E:\\autorun.inf");
+  assert(!suppressed("R-MITRE-WIN-T1091", &r, r.file_path, NULL));
+}
+
 static void test_searchprotocolhost_indexing_is_suppressed(void) {
   EdrBehaviorRecord r;
   init_record(&r);
@@ -293,6 +310,8 @@ int main(void) {
   test_rundll32_davclnt_remote_ip_is_not_suppressed();
   test_rundll32_davclnt_localhost_suffix_is_not_suppressed();
   test_rundll32_davclnt_127_prefix_is_not_suppressed();
+  test_t1091_local_fixed_desktop_ini_is_suppressed();
+  test_t1091_autorun_inf_is_not_suppressed();
   test_searchprotocolhost_indexing_is_suppressed();
   test_searchprotocolhost_user_path_is_not_suppressed();
   test_searchprotocolhost_without_pipe_is_not_suppressed();

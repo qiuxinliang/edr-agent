@@ -38,7 +38,7 @@ endfunction()
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
 set(EDR_P0_RULES_BUNDLE_VERSION
-  "edr-dynamic-rules-v1-r252-086c1be1"
+  "edr-dynamic-rules-v1-r252-a459baa5"
   CACHE STRING "P0/dynamic rule bundle version")
 set(EDR_AGENT_VERSION_STRING
   "${PROJECT_VERSION}"

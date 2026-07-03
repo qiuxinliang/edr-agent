@@ -79,6 +79,15 @@ typedef struct _edr_v1_ProcessDetail {
     char parent_name[256];
     char parent_path[512];
     char integrity_level[64];
+    /* 取证增强字段（与 EdrBehaviorRecord / 平台 alerts_analysis_snapshot 必需字段对齐）：
+ 端侧已采集，补齐上报供服务端进程链/研判使用。 */
+    char parent_cmdline[1024];
+    char current_directory[1024];
+    char process_creation_time[64];
+    uint32_t token_elevation;
+    uint32_t grandparent_pid;
+    char grandparent_name[256];
+    char grandparent_path[512];
 } edr_v1_ProcessDetail;
 
 typedef struct _edr_v1_FileDetail {
@@ -165,7 +174,7 @@ extern "C" {
 #define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", ""}
 #define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default}
-#define edr_v1_ProcessDetail_init_default        {"", "", ""}
+#define edr_v1_ProcessDetail_init_default        {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_default           {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
 #define edr_v1_NetworkDetail_init_default        {"", 0, "", 0, "", ""}
@@ -174,7 +183,7 @@ extern "C" {
 #define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", ""}
 #define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero}
-#define edr_v1_ProcessDetail_init_zero           {"", "", ""}
+#define edr_v1_ProcessDetail_init_zero           {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
 #define edr_v1_NetworkDetail_init_zero           {"", 0, "", 0, "", ""}
@@ -225,6 +234,13 @@ extern "C" {
 #define edr_v1_ProcessDetail_parent_name_tag     1
 #define edr_v1_ProcessDetail_parent_path_tag     2
 #define edr_v1_ProcessDetail_integrity_level_tag 3
+#define edr_v1_ProcessDetail_parent_cmdline_tag  4
+#define edr_v1_ProcessDetail_current_directory_tag 5
+#define edr_v1_ProcessDetail_process_creation_time_tag 6
+#define edr_v1_ProcessDetail_token_elevation_tag 7
+#define edr_v1_ProcessDetail_grandparent_pid_tag 8
+#define edr_v1_ProcessDetail_grandparent_name_tag 9
+#define edr_v1_ProcessDetail_grandparent_path_tag 10
 #define edr_v1_FileDetail_operation_tag          1
 #define edr_v1_FileDetail_target_path_tag        2
 #define edr_v1_FileDetail_file_size_tag          3
@@ -356,7 +372,14 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  ave_behavior_feed,  41)
 #define edr_v1_ProcessDetail_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   parent_name,       1) \
 X(a, STATIC,   SINGULAR, STRING,   parent_path,       2) \
-X(a, STATIC,   SINGULAR, STRING,   integrity_level,   3)
+X(a, STATIC,   SINGULAR, STRING,   integrity_level,   3) \
+X(a, STATIC,   SINGULAR, STRING,   parent_cmdline,    4) \
+X(a, STATIC,   SINGULAR, STRING,   current_directory,   5) \
+X(a, STATIC,   SINGULAR, STRING,   process_creation_time,   6) \
+X(a, STATIC,   SINGULAR, UINT32,   token_elevation,   7) \
+X(a, STATIC,   SINGULAR, UINT32,   grandparent_pid,   8) \
+X(a, STATIC,   SINGULAR, STRING,   grandparent_name,   9) \
+X(a, STATIC,   SINGULAR, STRING,   grandparent_path,  10)
 #define edr_v1_ProcessDetail_CALLBACK NULL
 #define edr_v1_ProcessDetail_DEFAULT NULL
 
@@ -425,7 +448,7 @@ extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   1072
 #define edr_v1_NetworkDetail_size                1185
-#define edr_v1_ProcessDetail_size                837
+#define edr_v1_ProcessDetail_size                3738
 #define edr_v1_RegistryDetail_size               9767
 #define edr_v1_ScriptDetail_size                 1026
 

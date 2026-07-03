@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-086c1be1",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r252-a459baa5",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 165,
@@ -2219,11 +2219,10 @@
       "mitre_ttps": [
         "T1091"
       ],
-      "description": "针对 ATT&CK 父技术「T1091」（Replication Through Removable Media）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
+      "description": "针对 ATT&CK 父技术「T1091」（Replication Through Removable Media）的可疑行为检测；仅保留 autorun.inf 等移动介质传播强线索，避免将本地固定磁盘 desktop.ini 误归类为可移动介质传播。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "file_path_regex_any": [
-          "(?i)\\\\autorun\\.inf$",
-          "(?i)\\\\desktop\\.ini$"
+          "(?i)\\\\autorun\\.inf$"
         ]
       }
     },
