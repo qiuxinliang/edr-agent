@@ -1,0 +1,139 @@
+# Compact Windows Agent config. Replace endpoint values after enroll.
+
+[server]
+address              = ""
+grpc_insecure        = false
+ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
+client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
+client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
+client_key_provider  = "pem"
+client_cert_store    = ""
+client_cert_thumbprint = ""
+pkcs11_module        = ""
+pkcs11_key_uri       = ""
+tpm_key_uri          = ""
+connect_timeout_s    = 10
+keepalive_interval_s = 30
+
+[agent]
+endpoint_id          = "REPLACE_WITH_ENROLLED_ENDPOINT_ID"
+tenant_id            = "demo-tenant"
+
+[platform]
+rest_base_url        = "https://192.168.3.56:8080/api/v1"
+proxy_mode           = "auto"
+proxy_url            = ""
+relay_url            = ""
+http2_enabled        = false
+http2_require        = false
+control_stream_enabled = true
+long_poll_fallback   = true
+report_events_v2_enabled = true
+data_plane_encoding  = "protobuf"
+data_plane_compression = "identity"
+control_dict_version = "edr-zstd-dict-v1"
+control_schema_version = "edr-control-schema-v1"
+control_profile_id   = "default-http1-protobuf"
+
+[collection]
+etw_enabled          = true
+ebpf_enabled         = false
+poll_interval_s      = 1
+max_event_queue_size = 32768
+adaptive_enabled = true
+adaptive_boost_seconds = 180
+adaptive_min_severity = 3
+etw_dns_client_provider = false
+etw_powershell_provider = true
+etw_security_audit_provider = true
+etw_wmi_provider = false
+etw_tcpip_provider = false
+etw_firewall_provider = false
+
+[preprocessing]
+dedup_window_s       = 60
+high_freq_threshold  = 40
+sampling_rate_whitelist = 0.03
+rules_version        = "edr-dynamic-rules-v1"
+
+[ave]
+model_dir            = "C:\\Program Files\\FDSecurity\\models"
+scan_threads         = 1
+max_file_size_mb     = 256
+sensitivity          = "MEDIUM"
+static_model_enabled = true
+behavior_monitor_enabled = false
+
+[forensic_auto]
+enabled              = false
+cooldown_s           = 30
+trigger_on_p0        = true
+collect_process_tree = true
+
+[upload]
+batch_max_events     = 200
+batch_max_size_mb    = 2
+batch_timeout_s      = 2
+max_upload_mbps      = 4
+
+[offline]
+queue_db_path        = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db"
+max_queue_size_mb    = 512
+retention_hours      = 72
+evidence_cache_path  = "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db"
+evidence_cache_max_size_mb = 512
+evidence_cache_retention_hours = 72
+
+[resource_limit]
+cpu_limit_percent    = 10
+memory_limit_mb      = 512
+emergency_cpu_limit  = 25
+behavior_infer_per_min = 30
+
+[logging]
+level                = "info"
+log_dir              = "C:\\Program Files\\FDSecurity\\logs"
+max_log_size_mb      = 50
+max_log_files        = 5
+
+[command]
+allow_dangerous      = false
+allow_rtq_readonly   = true
+signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
+
+[self_protect]
+anti_debug           = true
+job_object_windows   = true
+watchdog_log_interval_s = 60
+event_bus_pressure_warn_pct = 80
+
+[attack_surface]
+enabled              = false
+
+[detection]
+auto_profile         = true
+shellcode_mode       = 0
+webshell_mode        = 0
+pmfe_mode            = 2
+
+[pmfe]
+idle_scan_enabled    = false
+idle_scan_interval_min = 15
+idle_scan_max_procs  = 8
+idle_cpu_threshold   = 15.0
+idle_skip_on_battery = true
+
+[shellcode_detector]
+enabled              = false
+
+[webshell_detector]
+enabled              = false
+
+[remote]
+rules_url            = "https://192.168.3.56:8080/api/v1/agent/rules.toml"
+p0_bundle_url        = "https://192.168.3.56:8080/api/v1/agent/p0-bundle.enc"
+sensor_interest_url  = "https://192.168.3.56:8080/api/v1/agent/sensor-interest.json"
+poll_interval_s      = 1800
+version_url          = "https://192.168.3.56:8080/api/v1/agent/version/latest"
+download_url         = "https://192.168.3.56:8080/api/v1/agent/download/latest"
+auto_update          = false

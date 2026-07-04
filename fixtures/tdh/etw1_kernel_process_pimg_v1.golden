@@ -1,0 +1,9 @@
+ETW1
+prov=kproc
+pid=1234
+eid=1
+op=0
+ppid=5678
+img=C:\Windows\System32\cmd.exe
+pimg=C:\Windows\System32\explorer.exe
+cmd=whoami

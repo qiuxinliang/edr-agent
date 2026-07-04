@@ -1,0 +1,3 @@
+# Export outputs (qa_smoke_stats_export.ps1 / .cmd) — keep directory, ignore files
+*
+!.gitignore

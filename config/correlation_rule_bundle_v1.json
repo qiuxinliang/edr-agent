@@ -1,0 +1,113 @@
+{
+  "version": "edr-corr-rules-v1-r2",
+  "note": "端侧关联引擎规则包。event_type 为 EdrEventType 数值（见 include/edr/types.h）：process_create=1 process_inject=3 thread_create_remote=5 file_read=6 file_write=11 net_connect=20 net_dns_query=22。key: pid|ppid|host。th_dim: none|port|path。step.flags: require_external|require_cred_path。",
+  "rules": [
+    {
+      "id": "R-CORR-SCAN-001",
+      "title": "端口扫描（高频异构连接）",
+      "severity": 3,
+      "mitre": "T1046",
+      "kind": "threshold",
+      "key": "pid",
+      "window_ms": 10000,
+      "th_event_type": 20,
+      "th_dim": "port",
+      "th_distinct": true,
+      "th_threshold": 30,
+      "enabled": true
+    },
+    {
+      "id": "R-CORR-RANSOM-001",
+      "title": "疑似勒索批量加密（高频异构文件改写）",
+      "severity": 4,
+      "mitre": "T1486",
+      "kind": "threshold",
+      "key": "pid",
+      "window_ms": 10000,
+      "th_event_type": 11,
+      "th_dim": "path",
+      "th_distinct": true,
+      "th_threshold": 40,
+      "th_skip_safe_proc": true,
+      "enabled": true
+    },
+    {
+      "id": "R-CORR-DNSTUNNEL-001",
+      "title": "DNS 隧道（高频异构长标签查询）",
+      "severity": 3,
+      "mitre": "T1071.004",
+      "kind": "threshold",
+      "key": "pid",
+      "window_ms": 30000,
+      "th_event_type": 22,
+      "th_dim": "path",
+      "th_distinct": true,
+      "th_threshold": 40,
+      "th_dns_long_label": true,
+      "enabled": true,
+      "note": "采集侧已把 DNS 查询名填入 interest.path（etw_tdh NET_* 分支）；th_dns_long_label 仅统计长标签/超长查询（隧道特征），正常浏览域名不计入。阈值 40 与标签长度阈值 EDR_CORR_DNS_LABEL_LEN(默认30) 可调。"
+    },
+    {
+      "id": "R-CORR-DISCOVERY-001",
+      "title": "发现命令爆发（短窗口大量侦察子进程）",
+      "severity": 2,
+      "mitre": "T1082,T1033,T1057",
+      "kind": "threshold",
+      "key": "ppid",
+      "window_ms": 20000,
+      "th_event_type": 1,
+      "th_dim": "path",
+      "th_distinct": true,
+      "th_threshold": 12,
+      "th_skip_safe_proc": true,
+      "enabled": true,
+      "note": "同一父进程短窗口内派生大量不同子进程镜像；th_skip_safe_proc 跳过编译器/构建/备份类子进程降误报。阈值 12 偏保守，可按环境下调。"
+    },
+    {
+      "id": "R-CORR-INJECT-001",
+      "title": "远程线程注入序列",
+      "severity": 4,
+      "mitre": "T1055",
+      "kind": "sequence",
+      "key": "pid",
+      "window_ms": 5000,
+      "ordered": true,
+      "steps": [
+        { "event_type": 3 },
+        { "event_type": 3 },
+        { "event_type": 5 }
+      ],
+      "enabled": true
+    },
+    {
+      "id": "R-CORR-INJECT-C2-001",
+      "title": "注入后外联（疑似 C2 植入）",
+      "severity": 4,
+      "mitre": "T1055,T1071",
+      "kind": "sequence",
+      "key": "pid",
+      "window_ms": 120000,
+      "ordered": false,
+      "steps": [
+        { "event_type": 3 },
+        { "event_type": 20, "flags": ["require_external"] }
+      ],
+      "enabled": true
+    },
+    {
+      "id": "R-CORR-CRED-EXFIL-001",
+      "title": "凭证访问后外联（合流）",
+      "severity": 4,
+      "mitre": "T1003,T1041",
+      "kind": "sequence",
+      "key": "pid",
+      "window_ms": 60000,
+      "ordered": false,
+      "steps": [
+        { "event_type": 6, "flags": ["require_cred_path"] },
+        { "event_type": 20, "flags": ["require_external"] }
+      ],
+      "enabled": true
+    }
+  ]
+}

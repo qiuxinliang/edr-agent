@@ -1,0 +1,14 @@
+FDSecurity End User License Agreement
+
+This software is provided for authorized enterprise endpoint security use only.
+By installing this agent, you confirm that you are authorized to deploy it on
+the target endpoint and to collect security telemetry required for detection,
+investigation, remote query, and response workflows.
+
+The agent may collect endpoint security metadata such as process, network,
+registry, file, policy, health, and forensic task information. Collection scope
+is controlled by the tenant policy delivered from the EDR management platform.
+
+Do not install this software on systems where you do not have permission to
+monitor endpoint activity. Remove the software if the endpoint is no longer
+managed by the organization.

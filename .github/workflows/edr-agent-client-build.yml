@@ -1,0 +1,468 @@
+# 独立 edr-agent 仓库：仅构建 Windows 客户端产物（exe + 运行时 DLL zip），不创建 GitHub Release。
+# 正式发版请推 win_* tag 触发 edr-agent-client-release.yml。
+# 首步 `./scripts/verify_ave_behavior_chain_invariants.sh`（与 monorepo 同锚点，**无**编译）。
+
+name: edr-agent client build (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_features:
+        description: "Build with static ONNX Runtime + YARA (release-like, no gRPC/FL)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edr-agent-client-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+  VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  windows-build:
+    name: Build Windows (FDSensor.exe, fast by default)
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+    steps:
+      - uses: actions/checkout@v6
+      - name: AVE / behavior chain invariants (no vcpkg, bash)
+        shell: bash
+        run: |
+          chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
+          ./scripts/verify_ave_behavior_chain_invariants.sh
+
+      - name: Resolve agent version
+        shell: pwsh
+        run: |
+          $ref = '${{ github.ref_name }}'
+          if ($ref -match '_(\d+\.\d+\.\d+)$') {
+            $ver = $Matches[1]
+          } elseif ($ref -match '^(\d+\.\d+\.\d+)$') {
+            $ver = $Matches[1]
+          } else {
+            $cmake = [System.IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE "CMakeLists.txt"))
+            if ($cmake -match '(?s)project\(\s*edr_agent\b.*?\bVERSION\s+(\d+\.\d+\.\d+)') {
+              $ver = $Matches[1]
+            } else {
+              $ver = "0.1.0"
+            }
+            Write-Warning "Cannot extract semver from ref '$ref'; using project default $ver"
+          }
+          "EDR_AGENT_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+          [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $ver)
+          Write-Host "Agent version: $ver"
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - name: Install build tools
+        shell: pwsh
+        run: choco install ninja innosetup -y --no-progress
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Prepare vcpkg cache directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
+
+      - name: Prepare P0 rule bundle
+        shell: pwsh
+        run: |
+          python -m pip install -q cryptography
+          python .\scripts\prepare_p0_release_bundle.py
+
+      - name: Cache vcpkg (installed + downloads + binary cache)
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+            vcpkg_installed
+          key: vcpkg-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          restore-keys: |
+            vcpkg-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+
+      - name: Cache ONNX Runtime
+        if: ${{ inputs.full_features }}
+        uses: actions/cache@v5
+        with:
+          path: onnxrt-win
+          key: onnxrt-x64-win-1.17.3-${{ runner.os }}
+
+      - name: Cache CMake build directory (incremental)
+        uses: actions/cache@v5
+        with:
+          path: build
+          key: build-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
+          restore-keys: |
+            build-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
+
+      - name: Restore vcpkg from pre-built packages (if cache miss)
+        if: ${{ inputs.full_features }}
+        shell: pwsh
+        run: |
+          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          if (Test-Path $installed_marker) {
+            Write-Host "[pre-build-packages] vcpkg cache hit, skip download"
+            "VCPKG_SOURCE=cache" | Out-File -FilePath $env:GITHUB_ENV -Append
+            return
+          }
+          $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
+          $release_tag = "prebuild-x64-windows-$hash"
+          $archive = "vcpkg-installed-x64-windows.7z"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$release_tag/$archive"
+          Write-Host "[pre-build-packages] Cache miss, trying pre-built: $url"
+          try {
+            $progressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
+            Write-Host "[pre-build-packages] Download OK, extracting..."
+            7z x $archive -o"$env:GITHUB_WORKSPACE" -y
+            if ($LASTEXITCODE -ne 0) { throw "7z extract failed" }
+            Remove-Item $archive -Force
+            if (Test-Path $installed_marker) {
+              Write-Host "[pre-build-packages] Pre-built packages restored from $release_tag"
+              "VCPKG_SOURCE=prebuilt:$release_tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+            } else {
+              throw "Extracted but marker not found"
+            }
+          } catch {
+            Write-Host "[pre-build-packages] Download/extract failed: $_"
+            Write-Host "[pre-build-packages] Falling back to source build"
+            "VCPKG_SOURCE=source" | Out-File -FilePath $env:GITHUB_ENV -Append
+            if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
+          }
+
+      - name: "[Timing] Build start"
+        shell: pwsh
+        run: |
+          $start = Get-Date
+          "BUILD_TIMING_START=$($start.ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Build started at $($start.ToString('HH:mm:ss'))"
+
+      - name: sccache pre-check
+        shell: bash
+        run: |
+          echo "=== sccache version ==="
+          sccache --version || echo "(not found)"
+          echo "=== sccache stats (pre-build) ==="
+          sccache --show-stats || echo "(stats not available)"
+
+      - name: Clone and bootstrap vcpkg
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          }
+          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: vcpkg install (manifest)
+        working-directory: ${{ github.workspace }}
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
+          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          if (Test-Path $installed_marker) {
+            Write-Host "[vcpkg] Packages already installed (from $env:VCPKG_SOURCE), verifying..."
+          }
+          $vroot = (Join-Path $env:GITHUB_WORKSPACE "vcpkg")
+          $env:VCPKG_ROOT = $vroot
+          $env:Path = $vroot + ";" + $env:Path
+          $tc = Join-Path $vroot "vcpkg.exe"
+          if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            Write-Host "[vcpkg] full detection build: sqlite + yara + static ONNX support (no grpc/fl)"
+            & $tc install --x-feature=sqlite --x-feature=yara
+          } else {
+            Write-Host "[vcpkg] fast build: manifest defaults only (no grpc/onnx/yara)"
+            & $tc install
+          }
+          "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: ONNX Runtime (CPU, Windows x64)
+        if: ${{ inputs.full_features }}
+        working-directory: ${{ github.workspace }}
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
+          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
+          if (Test-Path (Join-Path $root "include\onnxruntime_c_api.h")) {
+            Write-Host "[skip] ONNX Runtime 1.17.3 already cached at $root"
+          } else {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $zip = Join-Path $dest "ort.zip"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $progressPreference = 'SilentlyContinue'
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add('User-Agent', 'edr-agent-ci')
+            for ($i = 0; $i -lt 5; $i++) {
+              try {
+                $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip", $zip)
+                Write-Host "ORT download OK"
+                break
+              } catch {
+                Write-Host "ORT download attempt $($i+1)/5 failed: $_"
+                if ($i -ge 4) { throw "ORT download exhausted retries: $_" }
+                Start-Sleep -Seconds 15
+              }
+            }
+            Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+            if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
+          }
+          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure (Ninja, Release, sccache)
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        shell: pwsh
+        run: |
+          $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
+          if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+              -DEDR_WITH_GRPC=OFF `
+              -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+              -DEDR_WITH_P0_RULES_OPENSSL=ON `
+              -DEDR_REQUIRE_SQLITE=ON `
+              -DEDR_WITH_ONNXRUNTIME=ON `
+              -DEDR_WITH_FL_TRAINER=OFF `
+              -DEDR_WITH_FL_KAFKA=OFF `
+              "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
+              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              -DEDR_BUILD_TESTS=OFF
+          } else {
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+              -DEDR_WITH_GRPC=OFF `
+              -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+              -DEDR_WITH_P0_RULES_OPENSSL=ON `
+              -DEDR_REQUIRE_SQLITE=ON `
+              -DEDR_WITH_ONNXRUNTIME=OFF `
+              -DEDR_WITH_FL_TRAINER=OFF `
+              -DEDR_WITH_FL_KAFKA=OFF `
+              -DEDR_WITH_YARA=OFF `
+              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              -DEDR_BUILD_TESTS=OFF
+          }
+          if (-not $?) { throw "cmake configure failed" }
+
+      - name: Build (Ninja + sccache)
+        shell: pwsh
+        run: |
+          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          cmake --build build --target fd_installer_worker --parallel $env:NUMBER_OF_PROCESSORS --verbose
+
+      - name: Verify HTTPS REST and SQLite compiled in
+        shell: pwsh
+        run: |
+          $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $exe) { throw "FDSensor.exe not found after build" }
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
+          if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
+          if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
+          if (-not $env:EDR_AGENT_VERSION) {
+            throw "EDR_AGENT_VERSION was not resolved"
+          }
+          if (-not $text.Contains($env:EDR_AGENT_VERSION)) {
+            throw "FDSensor.exe does not contain agent version '$env:EDR_AGENT_VERSION'"
+          }
+          if ($text.Contains("0.3.0")) {
+            throw "FDSensor.exe still contains legacy agent version fallback 0.3.0"
+          }
+
+      - name: sccache stats
+        shell: bash
+        run: |
+          echo "=== sccache compilation cache stats ==="
+          sccache --show-stats || echo "(sccache stats unavailable)"
+
+      - name: Stage ORT + vcpkg runtime DLLs
+        shell: pwsh
+        run: |
+          $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
+          if ('${{ inputs.full_features }}' -eq 'true') {
+            ./scripts/stage_ort_dlls_build_release.ps1
+          }
+          ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      - name: "[Timing] Build summary"
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:BUILD_TIMING_START) {
+            $start = [DateTime]::Parse($env:BUILD_TIMING_START)
+            $elapsed = (Get-Date) - $start
+            Write-Host "========================================"
+            Write-Host "Total elapsed build time: $($elapsed.TotalMinutes.ToString('F1')) minutes ($($elapsed.TotalSeconds)s)"
+            Write-Host "vcpkg source : $env:VCPKG_SOURCE"
+            $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+            if (Test-Path $installed_marker) {
+              $size = [math]::Round(((Get-ChildItem -Path "vcpkg_installed" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
+              Write-Host "vcpkg installed size: ${size} MB"
+            }
+            Write-Host "========================================"
+          }
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Package (setup exe + runtime zip)
+        shell: pwsh
+        run: |
+          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          $outDir = $null
+          $agentExe = $null
+          foreach ($c in @("build\Release", "build")) {
+            $preferred = Join-Path $c "FDSensor.exe"
+            if (Test-Path -LiteralPath $preferred) {
+              $outDir = $c
+              $agentExe = $preferred
+              break
+            }
+          }
+          if (-not $outDir -or -not $agentExe) { throw "missing FDSensor.exe under build\Release or build" }
+          $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
+          if (-not (Test-Path -LiteralPath $workerExe)) {
+            $workerExe = Get-ChildItem -Path build -Recurse -Filter "FDSecurityInstallerWorker.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+          }
+          $items = New-Object System.Collections.Generic.List[string]
+          if (-not (Test-Path "VERSION")) {
+            [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
+          }
+          [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
+          $null = $items.Add($agentExe)
+          if ($workerExe -and (Test-Path -LiteralPath $workerExe)) {
+            $null = $items.Add($workerExe)
+          } else {
+            throw "FDSecurityInstallerWorker.exe not found after build"
+          }
+          $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
+          Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          foreach ($p in @(
+            "scripts\edr_agent_install.ps1",
+            "scripts\edr_agent_preflight.ps1",
+            "scripts\edr_agent_zip_deploy.ps1",
+            "scripts\windows_service_install.ps1",
+            "scripts\windows_isolate_host.ps1",
+            "config\agent_windows_production.example.toml",
+            "config\p0_rule_bundle_ir_v1.json.enc",
+            "config\sensor_interest_manifest.json"
+          )) {
+            if (Test-Path $p) { $null = $items.Add($p) }
+          }
+          if (-not (Test-Path "config\p0_rule_bundle_ir_v1.json.enc")) {
+            throw "missing encrypted P0 rule bundle: config\p0_rule_bundle_ir_v1.json.enc"
+          }
+
+          $innoOut = "install\windows-inno\Output"
+          Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
+          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
+          $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
+          if (-not (Test-Path -LiteralPath $setupSrc)) {
+            $setupSrc = Join-Path $innoOut "EDRAgentSetup-bundled.exe"
+          }
+          if (-not (Test-Path -LiteralPath $setupSrc)) { throw "missing bundled setup exe: $setupSrc" }
+          $setupDest = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup.exe"
+          Copy-Item -LiteralPath $setupSrc -Destination $setupDest -Force
+          $null = $items.Add($setupDest)
+
+          $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -OutputZip $setupUiZip
+          if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
+          if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
+          Write-Host "Setup UI package is uploaded as a separate artifact and is not nested into the runtime zip."
+
+          Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
+          if (-not (Test-Path -LiteralPath $zip)) { throw "package was not created: $zip" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipObj = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $entries = $zipObj.Entries.FullName
+            if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
+              throw "plaintext P0 rule bundle must not be packaged"
+            }
+            if ($entries -match '(^|/|\\)p0_rule_bundle_manifest\.json$') {
+              throw "plaintext P0 rule manifest must not be packaged"
+            }
+            if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
+              throw "encrypted P0 rule bundle missing from package"
+            }
+            if (-not ($entries -match '(^|/|\\)VERSION$')) {
+              throw "VERSION file missing from package"
+            }
+            $versionEntry = $zipObj.Entries | Where-Object { $_.FullName -match '(^|/|\\)VERSION$' } | Select-Object -First 1
+            $reader = New-Object System.IO.StreamReader($versionEntry.Open())
+            try {
+              $packagedVersion = $reader.ReadToEnd().Trim()
+            }
+            finally {
+              $reader.Dispose()
+            }
+            if ($packagedVersion -ne $env:EDR_AGENT_VERSION) {
+              throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
+            }
+            if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
+              throw "edr_agent_setup.exe missing from package"
+            }
+            foreach ($required in @(
+              'edr_agent_install\.ps1',
+              'edr_agent_preflight\.ps1',
+              'edr_agent_zip_deploy\.ps1',
+              'windows_service_install\.ps1',
+              'windows_isolate_host\.ps1',
+              'FDSecurityInstallerWorker\.exe',
+              'agent_windows_production\.example\.toml',
+              'sensor_interest_manifest\.json'
+            )) {
+              if (-not ($entries -match "(^|/|\\)${required}$")) {
+                throw "required package entry missing: $required"
+              }
+            }
+          }
+          finally {
+            $zipObj.Dispose()
+          }
+
+      - name: Move artifact to workspace
+        shell: pwsh
+        run: |
+          $src = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
+          Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-exe.zip") -Force
+          if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
+          if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edr-agent-windows-${{ github.ref_name }}
+          path: |
+            edr-agent-win-exe.zip
+            edr_agent_setup.exe
+            edr_agent_setup_ui.zip
+          retention-days: 14
+          if-no-files-found: error
