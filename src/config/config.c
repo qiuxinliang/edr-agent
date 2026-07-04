@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r252-a459baa5"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r253-b91d8e18"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",

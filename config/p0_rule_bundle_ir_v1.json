@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 1,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-a459baa5",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r253-b91d8e18",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 165,
@@ -34,8 +34,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1564.003",
-        "T1059.001"
+        "T1059.001",
+        "T1564.003"
       ],
       "description": "PowerShell 使用隐藏窗口并禁用 profile",
       "condition": {
@@ -56,8 +56,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.002",
-        "T1059"
+        "T1059",
+        "T1204.002"
       ],
       "description": "Office 父进程拉起 cmd/powershell/wscript/cscript/mshta/rundll32/regsvr32",
       "condition": {
@@ -88,8 +88,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.001",
-        "T1059"
+        "T1059",
+        "T1204.001"
       ],
       "description": "浏览器父进程启动命令解释器/脚本解释器",
       "condition": {
@@ -569,8 +569,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1505.003",
-        "T1059"
+        "T1059",
+        "T1505.003"
       ],
       "description": "Web 服务/应用容器进程拉起 shell、脚本解释器或常见 LOLBin，是 WebShell 后门执行链的核心行为信号",
       "condition": {
@@ -630,8 +630,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1562.001",
-        "T1486"
+        "T1486",
+        "T1562.001"
       ],
       "description": "检测通过 taskkill/tskill/wmic/PowerShell 终止安全产品进程。Agent 侧会在短窗口内聚合多个安全产品目标，并与勒索文件爆发、恢复破坏等信号组合后升为 P0。",
       "condition": {
@@ -670,8 +670,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1218.007",
-        "T1105"
+        "T1105",
+        "T1218.007"
       ],
       "description": "msiexec 使用 http(s) 远程 MSI 或静默安装参数",
       "condition": {
@@ -799,8 +799,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1569.002",
-        "T1021.002"
+        "T1021.002",
+        "T1569.002"
       ],
       "description": "psexec 风格远程执行命令参数或 ADMIN$ 路径痕迹",
       "condition": {
@@ -818,8 +818,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1197",
-        "T1105"
+        "T1105",
+        "T1197"
       ],
       "description": "bitsadmin 创建/添加下载任务并指向 URL",
       "condition": {
@@ -971,9 +971,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1082",
         "T1033",
-        "T1057"
+        "T1057",
+        "T1082"
       ],
       "description": "whoami/systeminfo/tasklist/hostname/ipconfig 高频发现命令",
       "condition": {
@@ -1043,8 +1043,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1218.004",
-        "T1127.001"
+        "T1127.001",
+        "T1218.004"
       ],
       "description": "InstallUtil/RegAsm/MSBuild 命令行含 URL 或典型辅助安装参数",
       "condition": {
@@ -1089,8 +1089,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1202",
-        "T1059"
+        "T1059",
+        "T1202"
       ],
       "description": "forfiles /c 调用 cmd 或 PowerShell",
       "condition": {
@@ -1302,8 +1302,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1560.001",
-        "T1074"
+        "T1074",
+        "T1560.001"
       ],
       "description": "rar/7z/winrar 对 Users/Documents/Desktop 等路径打包，或 PowerShell Compress-Archive",
       "condition": {
@@ -1329,8 +1329,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1048",
-        "T1041"
+        "T1041",
+        "T1048"
       ],
       "description": "curl/wget/scp/sftp 将本地文件推送到远程；常与 C2/备用协议外传重叠",
       "condition": {
@@ -2219,7 +2219,7 @@
       "mitre_ttps": [
         "T1091"
       ],
-      "description": "针对 ATT&CK 父技术「T1091」（Replication Through Removable Media）的可疑行为检测；仅保留 autorun.inf 等移动介质传播强线索，避免将本地固定磁盘 desktop.ini 误归类为可移动介质传播。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
+      "description": "仅保留 autorun.inf 等移动介质传播强线索，避免将本地固定磁盘 desktop.ini 误归类为可移动介质传播。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\autorun\\.inf$"
@@ -2678,8 +2678,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1219",
-        "T1204.002"
+        "T1204.002",
+        "T1219"
       ],
       "description": "Office/脚本宿主/命令解释器作为父进程启动远程管理工具",
       "condition": {
@@ -2722,9 +2722,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1059",
         "T1219",
-        "T1574.001",
-        "T1059"
+        "T1574.001"
       ],
       "description": "RMM 工具加载非签名或非标准路径的 DLL，或启动异常子进程(如 cmd/ps)",
       "condition": {
@@ -2774,8 +2774,8 @@
       "enabled": true,
       "mitre_ttps": [
         "T1036.005",
-        "T1574.002",
-        "T1204.002"
+        "T1204.002",
+        "T1574.002"
       ],
       "description": "银狐/Winos 攻击链中 Setup64.exe 与 C:\\ProgramData\\Golden 目录相关的载荷启动、DLL 侧载或安装阶段。",
       "condition": {
@@ -2793,8 +2793,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1548.002",
-        "T1218"
+        "T1218",
+        "T1548.002"
       ],
       "description": "computerdefaults.exe 携带 DebugObject/AppInfo 或银狐落地路径上下文，覆盖银狐/Winos 链条中观察到的 UAC 绕过阶段。",
       "condition": {
@@ -2835,9 +2835,9 @@
       "event_type": "registry_set",
       "enabled": true,
       "mitre_ttps": [
+        "T1027",
         "T1112",
-        "T1547.001",
-        "T1027"
+        "T1547.001"
       ],
       "description": "银狐/Winos 将模块或启动项写入注册表时常见的 Run/RunOnce、Golden、Winos/ValleyRAT 关键词与落地路径组合。",
       "condition": {
@@ -2862,9 +2862,9 @@
       "event_type": "file_write",
       "enabled": true,
       "mitre_ttps": [
+        "T1068",
         "T1105",
-        "T1574.002",
-        "T1068"
+        "T1574.002"
       ],
       "description": "银狐/Winos 攻击链关键落地文件写入：Public\\501 下载器/Setup64、ProgramData\\Golden 目录、Zemana/WatchDog BYOVD 驱动文件。",
       "condition": {
@@ -2934,9 +2934,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1027",
         "T1036.003",
-        "T1059",
-        "T1027"
+        "T1059"
       ],
       "description": "非powershell.exe/cscript.exe名称的进程执行了典型脚本/下载/远程调用参数；攻击者将脚本宿主重命名以绕过进程名监控",
       "condition": {
@@ -2976,9 +2976,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1055",
         "T1055.001",
-        "T1055.002",
-        "T1055"
+        "T1055.002"
       ],
       "description": "VirtualAllocEx+WriteProcessMemory+CreateRemoteThread 经典DLL/Shellcode注入三联调用",
       "condition": {
@@ -3002,8 +3002,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1562.006",
         "T1562.001",
+        "T1562.006",
         "T1562.010"
       ],
       "description": "通过修补 EtwEventWrite/NtTraceEvent/AmsiScanBuffer 绕过EDR遥测和脚本扫描；无文件攻防对抗的关键一步",
@@ -3050,8 +3050,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1112",
         "T1059.001",
+        "T1112",
         "T1547"
       ],
       "description": "检测从HKCU/HKLM注册表读取超长值(>1KB)并传给Invoke-Expression/IEX/cscript等解释器执行的链式攻击(如SUBTLE#PAWS)。攻击者将恶意脚本分片存入注册表，用Get-ItemProperty读取后直接执行。",
@@ -3104,9 +3104,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.002",
         "T1059.001",
         "T1059.005",
+        "T1204.002",
         "T1566.001"
       ],
       "description": "检测Office应用(WinWord/Excel/PowerPoint)启动cmd/powershell/wscript/mshta，且命令行包含递归下载/反射注入/内存执行特征。典型的Office宏无文件攻击链。",
@@ -3142,9 +3142,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1546.003",
         "T1059.005",
-        "T1059.007"
+        "T1059.007",
+        "T1546.003"
       ],
       "description": "检测WMI通过ActiveScriptEventConsumer注册VBScript/JScript持久化(无文件方式)——攻击者通过WMI事件订阅使恶意脚本在系统事件触发时自动执行(如SUBTLE#PAWS)。",
       "condition": {
@@ -3167,8 +3167,8 @@
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
-        "T1550.004",
         "T1539",
+        "T1550.004",
         "T1555.003"
       ],
       "description": "检测浏览器Cookie/Session数据被复制或读取后用于横向认证绕过(如从Chrome/Edge/Firefox读取Login Data/Cookies，配合sharpchromium/rubeus等工具进行基于Web/Cloud的横向移动)。",
@@ -3192,8 +3192,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1090",
         "T1021.004",
+        "T1090",
         "T1572"
       ],
       "description": "检测通过SSH建立本地/远程端口转发隧道实现代理横向移动(ssh -L/-R/-D)，或通过plink/chisel等工具建立隧道。",
@@ -3215,9 +3215,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1003",
         "T1021.003",
-        "T1175",
-        "T1003"
+        "T1175"
       ],
       "description": "检测通过DCOM远程激活Office/WMI/ShellWindows等AppID进行横向代码执行——MITRE T1021.003最活跃的横向移动技术之一",
       "condition": {
@@ -3261,8 +3261,8 @@
       "event_type": "file_write",
       "enabled": true,
       "mitre_ttps": [
-        "T1560.001",
-        "T1074.001"
+        "T1074.001",
+        "T1560.001"
       ],
       "description": "检测常见压缩工具或PowerShell在用户目录、下载目录、临时目录或ProgramData中生成归档文件，覆盖勒索/外传前的数据打包阶段。",
       "condition": {
@@ -3288,8 +3288,8 @@
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
-        "T1552.001",
         "T1530",
+        "T1552.001",
         "T1567.002"
       ],
       "description": "检测读取云CLI凭据、配置和PowerShell历史记录，覆盖云凭据窃取、命令历史敏感信息泄露和后续云侧横向移动入口。",
@@ -3334,9 +3334,9 @@
       "event_type": "network_connect",
       "enabled": true,
       "mitre_ttps": [
-        "T1046",
+        "T1018",
         "T1021",
-        "T1018"
+        "T1046"
       ],
       "description": "检测命令行工具、扫描工具或脚本解释器连接数据库/缓存/搜索服务端口，覆盖内网资源发现、凭据复用和横向移动前探测。",
       "condition": {
@@ -3390,9 +3390,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1567.002",
+        "T1048",
         "T1530",
-        "T1048"
+        "T1567.002"
       ],
       "description": "检测rclone/azcopy/gsutil/aws s3 cp/sync等云存储同步工具在非系统目录下执行大量数据传输——常为数据外传或勒索前数据收集。",
       "condition": {
@@ -3413,8 +3413,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.004",
         "T1059.001",
+        "T1204.004",
         "T1218.005"
       ],
       "description": "explorer.exe 直接拉起 PowerShell、mshta、cmd、脚本宿主或 curl，并携带 URL、IEX、Base64、隐藏窗口、headless conhost 等 ClickFix/FileFix 典型载荷特征。",
@@ -3452,9 +3452,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1218.005",
+        "T1105",
         "T1204.004",
-        "T1105"
+        "T1218.005"
       ],
       "description": "mshta.exe 加载远程 mp4/jpg/png/gif/svg/html/htm 等伪装扩展名载荷，覆盖 ClickFix/FileFix 中常见的内容类型伪装。",
       "condition": {
@@ -3475,9 +3475,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1562.001",
+        "T1014",
         "T1068",
-        "T1014"
+        "T1562.001"
       ],
       "description": "命中常见 LOLDrivers 易受攻击驱动名、公开 EDR-Killer/反 root 工具名，或通过 sc 创建内核驱动服务；用于识别勒索前置 EDR 致盲。",
       "condition": {
@@ -3518,8 +3518,8 @@
       "enabled": true,
       "mitre_ttps": [
         "T1105",
-        "T1218",
-        "T1202"
+        "T1202",
+        "T1218"
       ],
       "description": "补齐 finger.exe、MpCmdRun.exe -DownloadFile、desktopimgdownldr.exe 等系统工具被滥用于下载或外带数据的行为。",
       "condition": {

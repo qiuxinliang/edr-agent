@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r252-a459baa5",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r253-b91d8e18",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 165,
   "rules": [
@@ -21,8 +21,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1564.003",
-        "T1059.001"
+        "T1059.001",
+        "T1564.003"
       ]
     },
     {
@@ -32,8 +32,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.002",
-        "T1059"
+        "T1059",
+        "T1204.002"
       ]
     },
     {
@@ -43,8 +43,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.001",
-        "T1059"
+        "T1059",
+        "T1204.001"
       ]
     },
     {
@@ -284,8 +284,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1505.003",
-        "T1059"
+        "T1059",
+        "T1505.003"
       ]
     },
     {
@@ -305,8 +305,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1562.001",
-        "T1486"
+        "T1486",
+        "T1562.001"
       ]
     },
     {
@@ -326,8 +326,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1218.007",
-        "T1105"
+        "T1105",
+        "T1218.007"
       ]
     },
     {
@@ -387,8 +387,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1569.002",
-        "T1021.002"
+        "T1021.002",
+        "T1569.002"
       ]
     },
     {
@@ -398,8 +398,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1197",
-        "T1105"
+        "T1105",
+        "T1197"
       ]
     },
     {
@@ -470,9 +470,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1082",
         "T1033",
-        "T1057"
+        "T1057",
+        "T1082"
       ]
     },
     {
@@ -504,8 +504,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1218.004",
-        "T1127.001"
+        "T1127.001",
+        "T1218.004"
       ]
     },
     {
@@ -526,8 +526,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1202",
-        "T1059"
+        "T1059",
+        "T1202"
       ]
     },
     {
@@ -628,8 +628,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1560.001",
-        "T1074"
+        "T1074",
+        "T1560.001"
       ]
     },
     {
@@ -639,8 +639,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1048",
-        "T1041"
+        "T1041",
+        "T1048"
       ]
     },
     {
@@ -1336,8 +1336,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1219",
-        "T1204.002"
+        "T1204.002",
+        "T1219"
       ]
     },
     {
@@ -1358,9 +1358,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1059",
         "T1219",
-        "T1574.001",
-        "T1059"
+        "T1574.001"
       ]
     },
     {
@@ -1383,8 +1383,8 @@
       "enabled": true,
       "mitre_ttps": [
         "T1036.005",
-        "T1574.002",
-        "T1204.002"
+        "T1204.002",
+        "T1574.002"
       ]
     },
     {
@@ -1394,8 +1394,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1548.002",
-        "T1218"
+        "T1218",
+        "T1548.002"
       ]
     },
     {
@@ -1417,9 +1417,9 @@
       "event_type": "registry_set",
       "enabled": true,
       "mitre_ttps": [
+        "T1027",
         "T1112",
-        "T1547.001",
-        "T1027"
+        "T1547.001"
       ]
     },
     {
@@ -1429,9 +1429,9 @@
       "event_type": "file_write",
       "enabled": true,
       "mitre_ttps": [
+        "T1068",
         "T1105",
-        "T1574.002",
-        "T1068"
+        "T1574.002"
       ]
     },
     {
@@ -1465,9 +1465,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1027",
         "T1036.003",
-        "T1059",
-        "T1027"
+        "T1059"
       ]
     },
     {
@@ -1488,9 +1488,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1055",
         "T1055.001",
-        "T1055.002",
-        "T1055"
+        "T1055.002"
       ]
     },
     {
@@ -1500,8 +1500,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1562.006",
         "T1562.001",
+        "T1562.006",
         "T1562.010"
       ]
     },
@@ -1523,8 +1523,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1112",
         "T1059.001",
+        "T1112",
         "T1547"
       ]
     },
@@ -1547,9 +1547,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.002",
         "T1059.001",
         "T1059.005",
+        "T1204.002",
         "T1566.001"
       ]
     },
@@ -1560,9 +1560,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1546.003",
         "T1059.005",
-        "T1059.007"
+        "T1059.007",
+        "T1546.003"
       ]
     },
     {
@@ -1572,8 +1572,8 @@
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
-        "T1550.004",
         "T1539",
+        "T1550.004",
         "T1555.003"
       ]
     },
@@ -1584,8 +1584,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1090",
         "T1021.004",
+        "T1090",
         "T1572"
       ]
     },
@@ -1596,9 +1596,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1003",
         "T1021.003",
-        "T1175",
-        "T1003"
+        "T1175"
       ]
     },
     {
@@ -1619,8 +1619,8 @@
       "event_type": "file_write",
       "enabled": true,
       "mitre_ttps": [
-        "T1560.001",
-        "T1074.001"
+        "T1074.001",
+        "T1560.001"
       ]
     },
     {
@@ -1630,8 +1630,8 @@
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
-        "T1552.001",
         "T1530",
+        "T1552.001",
         "T1567.002"
       ]
     },
@@ -1653,9 +1653,9 @@
       "event_type": "network_connect",
       "enabled": true,
       "mitre_ttps": [
-        "T1046",
+        "T1018",
         "T1021",
-        "T1018"
+        "T1046"
       ]
     },
     {
@@ -1677,9 +1677,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1567.002",
+        "T1048",
         "T1530",
-        "T1048"
+        "T1567.002"
       ]
     },
     {
@@ -1689,8 +1689,8 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1204.004",
         "T1059.001",
+        "T1204.004",
         "T1218.005"
       ]
     },
@@ -1701,9 +1701,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1218.005",
+        "T1105",
         "T1204.004",
-        "T1105"
+        "T1218.005"
       ]
     },
     {
@@ -1713,9 +1713,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
-        "T1562.001",
+        "T1014",
         "T1068",
-        "T1014"
+        "T1562.001"
       ]
     },
     {
@@ -1737,8 +1737,8 @@
       "enabled": true,
       "mitre_ttps": [
         "T1105",
-        "T1218",
-        "T1202"
+        "T1202",
+        "T1218"
       ]
     }
   ]
