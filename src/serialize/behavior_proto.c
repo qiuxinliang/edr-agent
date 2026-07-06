@@ -158,6 +158,19 @@ static void fill_ave_behavior_feed(edr_v1_BehaviorEvent *m, const EdrBehaviorRec
     m->has_ave_behavior_feed = true;
     m->ave_behavior_feed.cert_revoked_ancestor = true;
   }
+  if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
+    float score = pmfe_detail_f(r->script_snippet, "score");
+    if (score > 0.f) {
+      m->has_ave_behavior_feed = true;
+      m->ave_behavior_feed.shellcode_score = score;
+    }
+  } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
+    float score = pmfe_detail_f(r->script_snippet, "score");
+    if (score > 0.f) {
+      m->has_ave_behavior_feed = true;
+      m->ave_behavior_feed.webshell_score = score;
+    }
+  }
   fill_pmfe_cross_engine_fields(m, r);
 }
 

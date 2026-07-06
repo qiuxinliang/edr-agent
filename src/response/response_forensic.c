@@ -980,8 +980,8 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   int up_rc = edr_transport_v2_upload_file(cmd_id, dmpPath, NULL, minio_key, sizeof(minio_key));
   char result[700];
   if (up_rc == 0) {
-    snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s minio_key=%.400s", pid, dmpPath,
-             minio_key[0] ? minio_key : "(ok)");
+    snprintf(result, sizeof(result), "{\"schema\":\"evidence_artifact_v1\",\"engine\":\"pmfe\",\"action\":\"memory_dump\",\"status\":\"success\",\"artifact\":{\"type\":\"memory_dump\",\"object_key\":\"%.400s\",\"local_path\":\"%s\"},\"legacy\":\"MEMDUMP_OK pid=%d file=%s minio_key=%.400s\"}",
+             minio_key[0] ? minio_key : "", dmpPath, pid, dmpPath, minio_key[0] ? minio_key : "(ok)");
   } else {
     snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d file=%s upload=failed", pid, dmpPath);
   }
@@ -1015,8 +1015,8 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
   int up_rc = edr_transport_v2_upload_file(cmd_id, dmpPath, NULL, minio_key, sizeof(minio_key));
   char result[700];
   if (up_rc == 0) {
-    snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s minio_key=%.380s", pid,
-             total, dmpPath, minio_key[0] ? minio_key : "(ok)");
+    snprintf(result, sizeof(result), "{\"schema\":\"evidence_artifact_v1\",\"engine\":\"pmfe\",\"action\":\"memory_dump\",\"status\":\"success\",\"artifact\":{\"type\":\"memory_dump\",\"object_key\":\"%.380s\",\"local_path\":\"%s\",\"size_bytes\":%zu},\"legacy\":\"MEMDUMP_OK pid=%d size=%zu file=%s minio_key=%.380s\"}",
+             minio_key[0] ? minio_key : "", dmpPath, total, pid, total, dmpPath, minio_key[0] ? minio_key : "(ok)");
   } else {
     snprintf(result, sizeof(result), "MEMDUMP_OK pid=%d size=%zu file=%s upload=failed", pid, total,
              dmpPath);

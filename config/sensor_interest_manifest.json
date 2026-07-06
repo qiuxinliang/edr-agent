@@ -89,8 +89,8 @@
     "restore-files"
   ],
   "file_path_prefixes": [],
-  "generated_at": "2026-07-04T05:46:01.928459Z",
-  "interest_version": "sensor-interest-v1-39f54e14bf3a",
+  "generated_at": "2026-07-05T17:36:07.337033Z",
+  "interest_version": "sensor-interest-v1-0d2aa70cb312",
   "kind": "edr_sensor_interest_manifest",
   "process_name_prefixes": [],
   "process_names": [

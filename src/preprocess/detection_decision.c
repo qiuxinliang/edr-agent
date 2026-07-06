@@ -1242,6 +1242,44 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char evidence_proto[48];
   char evidence_mitre[32];
   char evidence_forensic[32];
+  char evidence_pcap_status[32];
+  char evidence_pcap_object_key[512];
+  char evidence_payload_sha256[96];
+  char evidence_preview_hex[192];
+  char evidence_stem[192];
+  char evidence_frames[32];
+  char attrib_schema[64];
+  char attrib_cve[64];
+  char attrib_family[96];
+  char attrib_product[96];
+  char attrib_vector[48];
+  char attrib_confidence[24];
+  char attrib_source[32];
+  char attrib_basis[160];
+  char evidence_service[128];
+  char evidence_action[64];
+  char evidence_url[256];
+  char evidence_alert_id[96];
+  char evidence_file_fp[96];
+  char evidence_file_uploaded[24];
+  char evidence_object_key[512];
+  char evidence_local_path[512];
+  char evidence_ast_score[32];
+  char evidence_token_score[32];
+  char pmfe_stomp[32];
+  char pmfe_mz[32];
+  char pmfe_elf[32];
+  char pmfe_dns_ascii[32];
+  char pmfe_dns_utf16[32];
+  char pmfe_dns_wire[32];
+  char pmfe_dns_best[32];
+  char pmfe_dns_sample[128];
+  char pmfe_dns_owner[128];
+  char pmfe_ave[32];
+  char pmfe_entropy[32];
+  char pmfe_regions[32];
+  char pmfe_private_exec[32];
+  char pmfe_module_consistency[64];
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_canary = has_ransom_canary_indicator(r);
@@ -1282,6 +1320,50 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char signature_status_buf[96];
   char ransomware_kind_buf[64];
   char ransomware_severity_buf[16];
+  evidence_detector[0] = '\0';
+  evidence_rule[0] = '\0';
+  evidence_score[0] = '\0';
+  evidence_proto[0] = '\0';
+  evidence_mitre[0] = '\0';
+  evidence_forensic[0] = '\0';
+  evidence_pcap_status[0] = '\0';
+  evidence_pcap_object_key[0] = '\0';
+  evidence_payload_sha256[0] = '\0';
+  evidence_preview_hex[0] = '\0';
+  evidence_stem[0] = '\0';
+  evidence_frames[0] = '\0';
+  attrib_schema[0] = '\0';
+  attrib_cve[0] = '\0';
+  attrib_family[0] = '\0';
+  attrib_product[0] = '\0';
+  attrib_vector[0] = '\0';
+  attrib_confidence[0] = '\0';
+  attrib_source[0] = '\0';
+  attrib_basis[0] = '\0';
+  evidence_service[0] = '\0';
+  evidence_action[0] = '\0';
+  evidence_url[0] = '\0';
+  evidence_alert_id[0] = '\0';
+  evidence_file_fp[0] = '\0';
+  evidence_file_uploaded[0] = '\0';
+  evidence_object_key[0] = '\0';
+  evidence_local_path[0] = '\0';
+  evidence_ast_score[0] = '\0';
+  evidence_token_score[0] = '\0';
+  pmfe_stomp[0] = '\0';
+  pmfe_mz[0] = '\0';
+  pmfe_elf[0] = '\0';
+  pmfe_dns_ascii[0] = '\0';
+  pmfe_dns_utf16[0] = '\0';
+  pmfe_dns_wire[0] = '\0';
+  pmfe_dns_best[0] = '\0';
+  pmfe_dns_sample[0] = '\0';
+  pmfe_dns_owner[0] = '\0';
+  pmfe_ave[0] = '\0';
+  pmfe_entropy[0] = '\0';
+  pmfe_regions[0] = '\0';
+  pmfe_private_exec[0] = '\0';
+  pmfe_module_consistency[0] = '\0';
   detail_value(r->script_snippet, "ransom_note_count", note_count_buf, sizeof(note_count_buf));
   detail_value(r->script_snippet, "file_rate", file_rate_buf, sizeof(file_rate_buf));
   detail_value(r->script_snippet, "ext_burst", ext_burst_buf, sizeof(ext_burst_buf));
@@ -1307,6 +1389,44 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->script_snippet, "proto", evidence_proto, sizeof(evidence_proto));
   detail_value(r->script_snippet, "mitre", evidence_mitre, sizeof(evidence_mitre));
   detail_value(r->script_snippet, "forensic", evidence_forensic, sizeof(evidence_forensic));
+  detail_value(r->script_snippet, "stem", evidence_stem, sizeof(evidence_stem));
+  detail_value(r->script_snippet, "frames", evidence_frames, sizeof(evidence_frames));
+  detail_value(r->script_snippet, "pcap_status", evidence_pcap_status, sizeof(evidence_pcap_status));
+  detail_value(r->script_snippet, "pcap_object_key", evidence_pcap_object_key, sizeof(evidence_pcap_object_key));
+  detail_value(r->script_snippet, "payload_sha256", evidence_payload_sha256, sizeof(evidence_payload_sha256));
+  detail_value(r->script_snippet, "preview_hex", evidence_preview_hex, sizeof(evidence_preview_hex));
+  detail_value(r->script_snippet, "attrib_schema", attrib_schema, sizeof(attrib_schema));
+  detail_value(r->script_snippet, "attrib_cve", attrib_cve, sizeof(attrib_cve));
+  detail_value(r->script_snippet, "attrib_family", attrib_family, sizeof(attrib_family));
+  detail_value(r->script_snippet, "attrib_product", attrib_product, sizeof(attrib_product));
+  detail_value(r->script_snippet, "attrib_vector", attrib_vector, sizeof(attrib_vector));
+  detail_value(r->script_snippet, "attrib_confidence", attrib_confidence, sizeof(attrib_confidence));
+  detail_value(r->script_snippet, "attrib_source", attrib_source, sizeof(attrib_source));
+  detail_value(r->script_snippet, "attrib_basis", attrib_basis, sizeof(attrib_basis));
+  detail_value(r->script_snippet, "service", evidence_service, sizeof(evidence_service));
+  detail_value(r->script_snippet, "action", evidence_action, sizeof(evidence_action));
+  detail_value(r->script_snippet, "url", evidence_url, sizeof(evidence_url));
+  detail_value(r->script_snippet, "alert_id", evidence_alert_id, sizeof(evidence_alert_id));
+  detail_value(r->script_snippet, "file_fp", evidence_file_fp, sizeof(evidence_file_fp));
+  detail_value(r->script_snippet, "file_uploaded", evidence_file_uploaded, sizeof(evidence_file_uploaded));
+  detail_value(r->script_snippet, "object_key", evidence_object_key, sizeof(evidence_object_key));
+  detail_value(r->script_snippet, "local_path", evidence_local_path, sizeof(evidence_local_path));
+  detail_value(r->script_snippet, "ast_score", evidence_ast_score, sizeof(evidence_ast_score));
+  detail_value(r->script_snippet, "token_score", evidence_token_score, sizeof(evidence_token_score));
+  detail_value(r->cmdline, "stomp_suspicious", pmfe_stomp, sizeof(pmfe_stomp));
+  detail_value(r->cmdline, "mz_hits", pmfe_mz, sizeof(pmfe_mz));
+  detail_value(r->cmdline, "elf_hits", pmfe_elf, sizeof(pmfe_elf));
+  detail_value(r->cmdline, "dns_ascii_hits", pmfe_dns_ascii, sizeof(pmfe_dns_ascii));
+  detail_value(r->cmdline, "dns_utf16_hits", pmfe_dns_utf16, sizeof(pmfe_dns_utf16));
+  detail_value(r->cmdline, "dns_wire_hits", pmfe_dns_wire, sizeof(pmfe_dns_wire));
+  detail_value(r->cmdline, "dns_best", pmfe_dns_best, sizeof(pmfe_dns_best));
+  detail_value(r->cmdline, "dns_sample", pmfe_dns_sample, sizeof(pmfe_dns_sample));
+  detail_value(r->cmdline, "dns_owner", pmfe_dns_owner, sizeof(pmfe_dns_owner));
+  detail_value(r->cmdline, "ave_max_score", pmfe_ave, sizeof(pmfe_ave));
+  detail_value(r->cmdline, "ent_max", pmfe_entropy, sizeof(pmfe_entropy));
+  detail_value(r->cmdline, "regions", pmfe_regions, sizeof(pmfe_regions));
+  detail_value(r->cmdline, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
+  detail_value(r->cmdline, "module_path_consistency", pmfe_module_consistency, sizeof(pmfe_module_consistency));
   json_cat(r->detection_context, sizeof(r->detection_context),
            "{\"engine\":");
   json_str(r->detection_context, sizeof(r->detection_context), engine_name(r), 48u);
@@ -1479,8 +1599,99 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            (t && t->targeted_files) ? "true" : "false",
            (t && t->ioc_lookup) ? "true" : "false");
   json_str(r->detection_context, sizeof(r->detection_context), t ? t->reason : "", 180u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
-           "},\"engine_evidence\":{\"pmfe_snapshot\":");
+  json_cat(r->detection_context, sizeof(r->detection_context), "},\"engine_evidence\":{");
+  if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"shellcode_result_v1\",\"flow\":{\"src\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->net_src, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"spt\":%u,\"dst\":", r->net_sport);
+    json_str(r->detection_context, sizeof(r->detection_context), r->net_dst, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"dpt\":%u,\"proto\":", r->net_dport);
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_proto[0] ? evidence_proto : r->net_proto, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"owner\":{\"pid\":%u},\"detection\":{\"detector\":", r->pid);
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":%.6f,\"mitre\":", evidence_score[0] ? strtod(evidence_score, NULL) : 0.0);
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_mitre[0] ? evidence_mitre : "T1210", 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"payload\":{\"sha256\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash, 80u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"preview_hex\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_preview_hex, 160u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"pcap\":{\"stem\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_stem, 180u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"object_key\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pcap_object_key, 240u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"status\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pcap_status[0] ? evidence_pcap_status : "disabled", 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"kind\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_forensic, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"frames\":%ld},\"response\":{\"status\":\"unknown\"},", evidence_frames[0] ? strtol(evidence_frames, NULL, 10) : 0L);
+    if (attrib_cve[0] || attrib_family[0] || attrib_vector[0]) {
+      json_cat(r->detection_context, sizeof(r->detection_context), "\"vulnerability_attribution\":{\"schema\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_schema[0] ? attrib_schema : "shellcode_vulnerability_attribution_v1", 64u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"candidate_cve\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_cve, 64u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"family\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_family, 96u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"product\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_product, 96u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"vector\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_vector, 48u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"confidence\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_confidence[0] ? attrib_confidence : "candidate", 24u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"source\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_source, 32u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"evidence_basis\":");
+      json_reason_array(r->detection_context, sizeof(r->detection_context), attrib_basis[0] ? attrib_basis : "known_rule_name,protocol_region,safe_signature_metadata");
+      json_cat(r->detection_context, sizeof(r->detection_context), "},");
+    }
+  } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"webshell_result_v1\",\"file\":{\"path\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->file_path, 220u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"sha256\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->exe_hash[0] ? r->exe_hash : evidence_file_fp, 80u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"sample\":{\"uploaded\":%s,\"object_key\":", (evidence_file_uploaded[0] && strcmp(evidence_file_uploaded, "0") != 0) ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_object_key, 240u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"local_path\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_local_path, 240u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"http\":{\"service\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_service, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"url\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_url[0] ? evidence_url : r->dns_query, 180u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"use\":{\"observed\":false},\"detection\":{\"detector\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":%.6f,\"ast_score\":%.6f,\"token_score\":%.6f},\"response\":{\"quarantine_status\":\"unknown\"},",
+             evidence_score[0] ? strtod(evidence_score, NULL) : 0.0,
+             evidence_ast_score[0] ? strtod(evidence_ast_score, NULL) : 0.0,
+             evidence_token_score[0] ? strtod(evidence_token_score, NULL) : 0.0);
+  } else if (r->type == EDR_EVENT_PMFE_SCAN_RESULT || r->pmfe_snapshot[0]) {
+    long dns_hits = (pmfe_dns_ascii[0] ? strtol(pmfe_dns_ascii, NULL, 10) : 0L) +
+                    (pmfe_dns_utf16[0] ? strtol(pmfe_dns_utf16, NULL, 10) : 0L) +
+                    (pmfe_dns_wire[0] ? strtol(pmfe_dns_wire, NULL, 10) : 0L);
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"pmfe_result_v1\",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"module_consistency\":",
+             pmfe_stomp[0] ? strtol(pmfe_stomp, NULL, 10) : 0L,
+             pmfe_mz[0] ? strtol(pmfe_mz, NULL, 10) : 0L,
+             pmfe_elf[0] ? strtol(pmfe_elf, NULL, 10) : 0L,
+             dns_hits,
+             pmfe_dns_best[0] ? strtod(pmfe_dns_best, NULL) : 0.0,
+             pmfe_ave[0] ? strtod(pmfe_ave, NULL) : 0.0,
+             pmfe_entropy[0] ? strtod(pmfe_entropy, NULL) : 0.0,
+             pmfe_regions[0] ? strtol(pmfe_regions, NULL, 10) : 0L,
+             pmfe_private_exec[0] ? strtol(pmfe_private_exec, NULL, 10) : 0L);
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_module_consistency, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"samples\":{\"dns_sample\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_dns_sample, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"dns_owner\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_dns_owner, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"evidence\":{\"pmfe_snapshot\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->pmfe_snapshot, 360u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},");
+  } else {
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"generic_engine_evidence_v1\",");
+  }
+  json_cat(r->detection_context, sizeof(r->detection_context), "\"pmfe_snapshot\":");
   json_str(r->detection_context, sizeof(r->detection_context), r->pmfe_snapshot, 360u);
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"detector\":");
   json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);

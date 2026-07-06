@@ -2182,6 +2182,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"pid_history_used\":%u,\"pid_history_capacity\":%u,"
       "\"pid_history_static_bytes\":%llu,"
       "\"last_degrade_reason\":\"%s\"},"
+      "\"detection_readiness\":{\"behavior_monitor_enabled\":%s,"
+      "\"behavior_monitor_running\":%s,\"ioc_precheck_enabled\":%s,"
+      "\"ioc_db_configured\":%s,\"ioc_rules_version\":\"%s\","
+      "\"pmfe_budget_configured\":%s,\"shellcode_configured\":%s,"
+      "\"webshell_configured\":%s},"
       "\"pmfe\":{\"enabled\":true,\"mode\":\"alert_single_process\",\"queue_depth\":%lu,"
       "\"submitted\":%lu,\"completed\":%lu,\"dropped\":%lu,"
       "\"last_degrade_reason\":\"%s\"},"
@@ -2404,6 +2409,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)(ave_ok ? avst.behavior_pid_history_static_bytes : 0u),
       (ave_ok && avst.behavior_queue_capacity > 0u &&
        avst.behavior_event_queue_size >= (int)avst.behavior_queue_capacity) ? "queue_full" : "",
+      agent->cfg.ave.behavior_monitor_enabled ? "true" : "false",
+      (ave_ok && avst.behavior_monitor_running) ? "true" : "false",
+      agent->cfg.ave.ioc_precheck_enabled ? "true" : "false",
+      agent->cfg.ave.ioc_db_path[0] ? "true" : "false",
+      ioc_ver,
+      agent->cfg.resource_limit.pmfe_scans_per_min > 0u ? "true" : "false",
+      agent->cfg.shellcode_detector.enabled ? "true" : "false",
+      agent->cfg.webshell_detector.enabled ? "true" : "false",
       pmfe_q, pmfe_sub, pmfe_done, pmfe_drop,
       pmfe_drop ? "queue_drop" : "",
       agent->cfg.shellcode_detector.enabled ? "true" : "false",

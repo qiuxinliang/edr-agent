@@ -120,6 +120,53 @@ static void json_escape_copy(const char *src, char *dst, size_t cap) {
   dst[j] = '\0';
 }
 
+
+static void ave_fill_related_iocs_json(AVEBehaviorAlert *al, const char *remote_ip, const char *remote_domain,
+                                       const char *file_sha256, uint8_t ioc_ip_hit, uint8_t ioc_domain_hit,
+                                       uint8_t ioc_sha256_hit) {
+  if (!al) {
+    return;
+  }
+  al->related_iocs_json[0] = '\0';
+  char ip[64], domain[300], sha[80];
+  json_escape_copy(remote_ip, ip, sizeof(ip));
+  json_escape_copy(remote_domain, domain, sizeof(domain));
+  json_escape_copy(file_sha256, sha, sizeof(sha));
+  int first = 1;
+  size_t off = 0u;
+  int n = snprintf(al->related_iocs_json, sizeof(al->related_iocs_json), "[");
+  if (n < 0) {
+    al->related_iocs_json[0] = '\0';
+    return;
+  }
+  off = (size_t)n;
+#define APPEND_IOC(kind, value)                                                                  \
+  do {                                                                                            \
+    if ((value)[0] && off + 64u < sizeof(al->related_iocs_json)) {                                 \
+      n = snprintf(al->related_iocs_json + off, sizeof(al->related_iocs_json) - off,               \
+                   "%s{\"type\":\"%s\",\"value\":\"%s\",\"source\":\"endpoint_ioc\"}", \
+                   first ? "" : ",", (kind), (value));                                            \
+      if (n > 0) {                                                                                 \
+        off += (size_t)n;                                                                          \
+        first = 0;                                                                                 \
+      }                                                                                            \
+    }                                                                                              \
+  } while (0)
+  if (ioc_ip_hit) APPEND_IOC("ip", ip);
+  if (ioc_domain_hit) APPEND_IOC("domain", domain);
+  if (ioc_sha256_hit) APPEND_IOC("sha256", sha);
+#undef APPEND_IOC
+  if (first) {
+    al->related_iocs_json[0] = '\0';
+    return;
+  }
+  if (off + 2u < sizeof(al->related_iocs_json)) {
+    snprintf(al->related_iocs_json + off, sizeof(al->related_iocs_json) - off, "]");
+  } else {
+    al->related_iocs_json[0] = '\0';
+  }
+}
+
 static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_type, uint32_t parent_pid,
                                        const char *target_path, const char *file_sha256, const char *remote_ip,
                                        const char *remote_domain, uint16_t remote_port, float shellcode_score,
@@ -1249,6 +1296,10 @@ behavior_infer_done:
                                  ev_ransom_counter_score, ev_script_block_present, ev_amsi_content_present,
                                  ev_ja3_anomaly, ev_sni_anomaly, ev_cert_anomaly, ev_suspicious_extension_burst,
                                  ev_shadow_copy_delete);
+    }
+    if (!al.related_iocs_json[0]) {
+      ave_fill_related_iocs_json(&al, ev_tgt_ip, ev_tgt_domain, ev_file_sha, ev_ioc_ip_hit, ev_ioc_domain_hit,
+                                 ev_ioc_sha256_hit);
     }
     edr_behavior_alert_emit_to_batch(&al);
     cb(&al, ud);

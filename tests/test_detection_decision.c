@@ -91,6 +91,8 @@ static void test_shellcode_recommends_minidump_and_pmfe(void) {
   assert(!d.trigger_single_process_minidump);
   assert(strstr(r.detection_context, "\"engine\":\"shellcode\"") != NULL);
   assert(strstr(r.detection_context, "\"engine_evidence\"") != NULL);
+  assert(strstr(r.detection_context, "\"schema\":\"shellcode_result_v1\"") != NULL);
+  assert(strstr(r.detection_context, "\"flow\"") != NULL);
   assert(strstr(r.detection_context, "\"detector\":\"yara\"") != NULL);
   assert(strstr(r.detection_context, "\"rule\":\"EternalBlue\"") != NULL);
   assert(strstr(r.detection_context, "\"proto\":\"smb2\"") != NULL);
@@ -109,6 +111,7 @@ static void test_webshell_triggers_targeted_pmfe(void) {
   assert(!d.drop);
   assert(d.trigger_pmfe_scan);
   assert(strstr(r.detection_context, "\"engine\":\"webshell\"") != NULL);
+  assert(strstr(r.detection_context, "\"schema\":\"webshell_result_v1\"") != NULL);
   assert(strstr(r.detection_context, "\"webshell_files\"") != NULL);
   assert(strstr(r.detection_context, "\"targeted_files\":true") != NULL);
   assert(strstr(r.detection_context, "\"rule\":\"PHP_Webshell_Eval\"") != NULL);
@@ -126,6 +129,7 @@ static void test_pmfe_result_keeps_memory_evidence(void) {
   assert(!d.drop);
   assert(!d.trigger_pmfe_scan);
   assert(strstr(r.detection_context, "\"engine\":\"pmfe\"") != NULL);
+  assert(strstr(r.detection_context, "\"schema\":\"pmfe_result_v1\"") != NULL);
   assert(strstr(r.detection_context, "\"pmfe_snapshot\"") != NULL);
   assert(strstr(r.detection_context, "\"detector\":\"pmfe\"") != NULL);
   assert(strstr(r.detection_context, "pmfe_result_feedback") != NULL);

@@ -766,11 +766,31 @@ typedef struct {
   char mitre[24];
   char forensic_kind[16];
   char pcap_stem[180];
+  char pcap_status[24];
+  char pcap_object_key[512];
+  char preview_hex[256];
+  char webshell_service[128];
+  char webshell_action[64];
+  char webshell_alert_id[96];
+  char webshell_file_fp[80];
+  char webshell_file_uploaded[16];
+  char webshell_object_key[512];
+  char webshell_local_path[1024];
+  char webshell_ast_score[32];
+  char webshell_token_score[32];
   char ring_trigger_slot[24];
   char ring_oldest_ns[28];
   char ring_newest_ns[28];
   char ring_span_ns[28];
   char shellcode_json[512];
+  char attrib_schema[64];
+  char attrib_cve[64];
+  char attrib_family[96];
+  char attrib_product[96];
+  char attrib_vector[48];
+  char attrib_confidence[24];
+  char attrib_source[32];
+  char attrib_basis[160];
   char sensor_detail[2048];
   char fw_id[96];
   char fw_rule[256];
@@ -846,6 +866,30 @@ static unsigned long parse_ulong_auto(const char *val) {
   return strtoul(val, NULL, 0);
 }
 
+static int detail_token_value(const char *text, const char *key, char *out, size_t cap) {
+  if (!text || !key || !out || cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  size_t kl = strlen(key);
+  for (const char *p = text; *p; p++) {
+    if ((p == text || p[-1] == ' ' || p[-1] == '\n' || p[-1] == '|') && strncmp(p, key, kl) == 0 && p[kl] == '=') {
+      const char *v = p + kl + 1u;
+      size_t n = 0u;
+      while (v[n] && v[n] != ' ' && v[n] != '\n' && v[n] != '\r' && v[n] != '|') {
+        n++;
+      }
+      if (n >= cap) {
+        n = cap - 1u;
+      }
+      memcpy(out, v, n);
+      out[n] = '\0';
+      return out[0] != '\0';
+    }
+  }
+  return 0;
+}
+
 static int ipv4_decimal_to_dotted_le(const char *val, char *out, size_t cap) {
   if (!val || !val[0] || !out || cap == 0u) {
     return 0;
@@ -879,6 +923,32 @@ static void normalize_ip_field_copy(char *out, size_t cap, const char *val) {
   if (!ipv4_decimal_to_dotted_le(val, out, cap)) {
     snprintf(out, cap, "%s", val);
   }
+}
+
+static void append_snippet_kv(char *dst, size_t cap, const char *key, const char *val) {
+  if (!dst || cap == 0u || !key || !key[0] || !val || !val[0]) {
+    return;
+  }
+  if (strcmp(val, "-") == 0) {
+    return;
+  }
+  size_t l = strlen(dst);
+  if (l + 4u >= cap) {
+    return;
+  }
+  int n = snprintf(dst + l, cap - l, "%s%s=", l > 0u ? " " : "", key);
+  if (n <= 0 || (size_t)n >= cap - l) {
+    return;
+  }
+  l += (size_t)n;
+  for (const char *p = val; *p && l + 1u < cap; p++) {
+    char c = *p;
+    if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+      c = '_';
+    }
+    dst[l++] = c;
+  }
+  dst[l] = '\0';
 }
 
 static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
@@ -958,6 +1028,15 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "script") == 0) {
     snprintf(f->script, sizeof(f->script), "%s", val);
+    detail_token_value(val, "service", f->webshell_service, sizeof(f->webshell_service));
+    detail_token_value(val, "action", f->webshell_action, sizeof(f->webshell_action));
+    detail_token_value(val, "alert_id", f->webshell_alert_id, sizeof(f->webshell_alert_id));
+    detail_token_value(val, "file_fp", f->webshell_file_fp, sizeof(f->webshell_file_fp));
+    detail_token_value(val, "file_uploaded", f->webshell_file_uploaded, sizeof(f->webshell_file_uploaded));
+    detail_token_value(val, "object_key", f->webshell_object_key, sizeof(f->webshell_object_key));
+    detail_token_value(val, "local_path", f->webshell_local_path, sizeof(f->webshell_local_path));
+    detail_token_value(val, "ast_score", f->webshell_ast_score, sizeof(f->webshell_ast_score));
+    detail_token_value(val, "token_score", f->webshell_token_score, sizeof(f->webshell_token_score));
   } else if (strcmp(key, "amsi_content") == 0 || strcmp(key, "script_content") == 0 ||
              strcmp(key, "script_text") == 0) {
     if (!f->script[0]) {
@@ -1000,6 +1079,11 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
              strcmp(key, "ast") == 0 || strcmp(key, "token") == 0 ||
              strcmp(key, "features") == 0 || strcmp(key, "ast_tokens") == 0 ||
              strcmp(key, "token_features") == 0) {
+    if (strcmp(key, "ast_score") == 0 || strcmp(key, "ast") == 0) {
+      snprintf(f->webshell_ast_score, sizeof(f->webshell_ast_score), "%s", val);
+    } else if (strcmp(key, "token_score") == 0 || strcmp(key, "token") == 0) {
+      snprintf(f->webshell_token_score, sizeof(f->webshell_token_score), "%s", val);
+    }
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "dst") == 0) {
     normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
@@ -1047,6 +1131,26 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->forensic_kind, sizeof(f->forensic_kind), "%s", val);
   } else if (strcmp(key, "pcap_stem") == 0) {
     snprintf(f->pcap_stem, sizeof(f->pcap_stem), "%s", val);
+  } else if (strcmp(key, "pcap_status") == 0) {
+    snprintf(f->pcap_status, sizeof(f->pcap_status), "%s", val);
+  } else if (strcmp(key, "pcap_object_key") == 0) {
+    snprintf(f->pcap_object_key, sizeof(f->pcap_object_key), "%s", val);
+  } else if (strcmp(key, "preview_hex") == 0) {
+    snprintf(f->preview_hex, sizeof(f->preview_hex), "%s", val);
+  } else if (strcmp(key, "service") == 0) {
+    snprintf(f->webshell_service, sizeof(f->webshell_service), "%s", val);
+  } else if (strcmp(key, "action") == 0) {
+    snprintf(f->webshell_action, sizeof(f->webshell_action), "%s", val);
+  } else if (strcmp(key, "alert_id") == 0) {
+    snprintf(f->webshell_alert_id, sizeof(f->webshell_alert_id), "%s", val);
+  } else if (strcmp(key, "file_fp") == 0) {
+    snprintf(f->webshell_file_fp, sizeof(f->webshell_file_fp), "%s", val);
+  } else if (strcmp(key, "file_uploaded") == 0) {
+    snprintf(f->webshell_file_uploaded, sizeof(f->webshell_file_uploaded), "%s", val);
+  } else if (strcmp(key, "object_key") == 0) {
+    snprintf(f->webshell_object_key, sizeof(f->webshell_object_key), "%s", val);
+  } else if (strcmp(key, "local_path") == 0) {
+    snprintf(f->webshell_local_path, sizeof(f->webshell_local_path), "%s", val);
   } else if (strcmp(key, "forensic_frames") == 0) {
     f->forensic_frames = strtoul(val, NULL, 10);
     f->has_forensic_frames = 1;
@@ -1062,6 +1166,22 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "ring_span_ns") == 0) {
     snprintf(f->ring_span_ns, sizeof(f->ring_span_ns), "%s", val);
     f->has_ring_meta = 1;
+  } else if (strcmp(key, "attrib_schema") == 0) {
+    snprintf(f->attrib_schema, sizeof(f->attrib_schema), "%s", val);
+  } else if (strcmp(key, "attrib_cve") == 0) {
+    snprintf(f->attrib_cve, sizeof(f->attrib_cve), "%s", val);
+  } else if (strcmp(key, "attrib_family") == 0) {
+    snprintf(f->attrib_family, sizeof(f->attrib_family), "%s", val);
+  } else if (strcmp(key, "attrib_product") == 0) {
+    snprintf(f->attrib_product, sizeof(f->attrib_product), "%s", val);
+  } else if (strcmp(key, "attrib_vector") == 0) {
+    snprintf(f->attrib_vector, sizeof(f->attrib_vector), "%s", val);
+  } else if (strcmp(key, "attrib_confidence") == 0) {
+    snprintf(f->attrib_confidence, sizeof(f->attrib_confidence), "%s", val);
+  } else if (strcmp(key, "attrib_source") == 0) {
+    snprintf(f->attrib_source, sizeof(f->attrib_source), "%s", val);
+  } else if (strcmp(key, "attrib_basis") == 0) {
+    snprintf(f->attrib_basis, sizeof(f->attrib_basis), "%s", val);
   } else if (strcmp(key, "shellcode_json") == 0) {
     snprintf(f->shellcode_json, sizeof(f->shellcode_json), "%s", val);
   } else if (strcmp(key, "regkey") == 0 || strcmp(key, "registry_key") == 0 ||
@@ -1293,7 +1413,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       snprintf(r->reg_op, sizeof(r->reg_op), "delete_key");
     }
     if (ef.score[0] || ef.proto[0] || ef.detector[0] || ef.rule[0] || ef.mitre[0] || ef.forensic_kind[0] ||
-        ef.pcap_stem[0] || ef.has_forensic_frames || ef.has_ring_meta || ef.shellcode_json[0]) {
+        ef.pcap_stem[0] || ef.pcap_status[0] || ef.pcap_object_key[0] || ef.preview_hex[0] ||
+        ef.has_forensic_frames || ef.has_ring_meta || ef.shellcode_json[0]) {
       if (ef.has_forensic_frames) {
         snprintf(r->script_snippet, sizeof(r->script_snippet),
                  "detector=%s rule=%s score=%s proto=%s mitre=%s forensic=%s stem=%s frames=%lu",
@@ -1307,6 +1428,18 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                  ef.proto[0] ? ef.proto : "-", ef.mitre[0] ? ef.mitre : "-", ef.forensic_kind[0] ? ef.forensic_kind : "-",
                  ef.pcap_stem[0] ? ef.pcap_stem : "-");
       }
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "pcap_status", ef.pcap_status);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "pcap_object_key", ef.pcap_object_key);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "payload_sha256", ef.sha256);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "preview_hex", ef.preview_hex);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_schema", ef.attrib_schema);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_cve", ef.attrib_cve);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_family", ef.attrib_family);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_product", ef.attrib_product);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_vector", ef.attrib_vector);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_confidence", ef.attrib_confidence);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_source", ef.attrib_source);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_basis", ef.attrib_basis);
       if (ef.has_ring_meta) {
         size_t L = strlen(r->script_snippet);
         snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, " ring_slot=%s span_ns=%s",
@@ -1317,6 +1450,16 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, " | %s", ef.shellcode_json);
       }
     }
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "service", ef.webshell_service);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "action", ef.webshell_action);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "url", ef.url);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "alert_id", ef.webshell_alert_id);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "file_fp", ef.webshell_file_fp);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "file_uploaded", ef.webshell_file_uploaded);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "object_key", ef.webshell_object_key);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "local_path", ef.webshell_local_path);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "ast_score", ef.webshell_ast_score);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "token_score", ef.webshell_token_score);
     if (ef.sensor_detail[0]) {
       size_t L = strlen(r->script_snippet);
       snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, "%s%s",

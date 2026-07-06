@@ -74,6 +74,7 @@ static void note_match(const char *source, const char *rule) {
 #ifdef EDR_HAVE_YARA
 typedef struct {
   char first_rule[EDR_RULE_NAME_MAX];
+  EdrShellcodeExploitAttribution attribution;
   int matched;
 } YaraScanResult;
 
@@ -124,6 +125,66 @@ static void set_rule_name(char *out, size_t cap, const char *name) {
     return;
   }
   snprintf(out, cap, "%s", name ? name : "");
+}
+
+static void clear_attribution(EdrShellcodeExploitAttribution *out) {
+  if (out) {
+    memset(out, 0, sizeof(*out));
+  }
+}
+
+static void copy_attr_token(char *dst, size_t cap, const char *src) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  dst[0] = '\0';
+  if (!src) {
+    return;
+  }
+  size_t n = 0u;
+  for (const unsigned char *p = (const unsigned char *)src; *p && n + 1u < cap; p++) {
+    unsigned char c = *p;
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '_' || c == '-' || c == '.' || c == ',') {
+      dst[n++] = (char)c;
+    } else if (c == ' ' || c == '\t' || c == '/' || c == ':') {
+      dst[n++] = '_';
+    }
+  }
+  dst[n] = '\0';
+}
+
+static void set_attr(EdrShellcodeExploitAttribution *out, const char *cve, const char *family,
+                     const char *product, const char *vector, const char *source) {
+  if (!out) {
+    return;
+  }
+  copy_attr_token(out->candidate_cve, sizeof(out->candidate_cve), cve ? cve : "");
+  copy_attr_token(out->family, sizeof(out->family), family ? family : "");
+  copy_attr_token(out->product, sizeof(out->product), product ? product : "");
+  copy_attr_token(out->vector, sizeof(out->vector), vector ? vector : "");
+  copy_attr_token(out->confidence, sizeof(out->confidence), "candidate");
+  copy_attr_token(out->source, sizeof(out->source), source ? source : "builtin_rule_table");
+  snprintf(out->evidence_basis, sizeof(out->evidence_basis), "%s", "known_rule_name,protocol_region,safe_signature_metadata");
+}
+
+static void fill_builtin_attribution(const char *rule, EdrShellcodeExploitAttribution *out) {
+  if (!out || !rule || !rule[0]) {
+    return;
+  }
+  if (strcmp(rule, "EternalBlue_MS17_010") == 0) {
+    set_attr(out, "CVE-2017-0144", rule, "Microsoft_Windows_SMBv1", "network_smb", "builtin_rule_table");
+  } else if (strcmp(rule, "DoublePulsar_MS17_010_Ping") == 0) {
+    set_attr(out, "", rule, "Microsoft_Windows_SMBv1", "network_smb", "builtin_rule_table");
+  } else if (strcmp(rule, "SMBGhost_CVE_2020_0796") == 0) {
+    set_attr(out, "CVE-2020-0796", rule, "Microsoft_Windows_SMBv3", "network_smb", "builtin_rule_table");
+  } else if (strcmp(rule, "BlueKeep_CVE_2019_0708") == 0) {
+    set_attr(out, "CVE-2019-0708", rule, "Microsoft_RDP", "network_rdp", "builtin_rule_table");
+  } else if (strcmp(rule, "PrintNightmare_CVE_2021_34527") == 0) {
+    set_attr(out, "CVE-2021-34527", rule, "Windows_Print_Spooler_RPC", "network_msrpc", "builtin_rule_table");
+  } else if (strcmp(rule, "ReflectiveLoader_HTTP_Stager") == 0) {
+    set_attr(out, "", rule, "generic_http_loader", "network_http", "builtin_rule_table");
+  }
 }
 
 static int match_smb1_eternalblue(const uint8_t *data, uint32_t len) {
@@ -246,6 +307,45 @@ static void compiler_error_cb(int err_level, const char *file_name, int line_num
           file_name ? file_name : "-", line_number, message ? message : "-");
 }
 
+static void copy_yara_meta_value(char *dst, size_t cap, const YR_META *meta) {
+  if (!dst || cap == 0u || !meta) {
+    return;
+  }
+  if (meta->type == META_TYPE_STRING) {
+    copy_attr_token(dst, cap, meta->string ? meta->string : "");
+  } else if (meta->type == META_TYPE_INTEGER) {
+    snprintf(dst, cap, "%lld", (long long)meta->integer);
+  }
+}
+
+static void fill_yara_attribution_from_metadata(const YR_RULE *rule, YaraScanResult *res) {
+  if (!rule || !res) {
+    return;
+  }
+  YR_META *meta = NULL;
+  yr_rule_metas_foreach(rule, meta) {
+    const char *id = meta && meta->identifier ? meta->identifier : "";
+    if (strcmp(id, "cve") == 0 || strcmp(id, "cves") == 0 || strcmp(id, "cve_candidates") == 0) {
+      copy_yara_meta_value(res->attribution.candidate_cve, sizeof(res->attribution.candidate_cve), meta);
+    } else if (strcmp(id, "family") == 0 || strcmp(id, "exploit_family") == 0) {
+      copy_yara_meta_value(res->attribution.family, sizeof(res->attribution.family), meta);
+    } else if (strcmp(id, "product") == 0 || strcmp(id, "affected_product") == 0 || strcmp(id, "vulnerable_product") == 0) {
+      copy_yara_meta_value(res->attribution.product, sizeof(res->attribution.product), meta);
+    } else if (strcmp(id, "vector") == 0 || strcmp(id, "exploit_vector") == 0) {
+      copy_yara_meta_value(res->attribution.vector, sizeof(res->attribution.vector), meta);
+    } else if (strcmp(id, "confidence") == 0) {
+      copy_yara_meta_value(res->attribution.confidence, sizeof(res->attribution.confidence), meta);
+    }
+  }
+  if (res->attribution.candidate_cve[0] || res->attribution.family[0] || res->attribution.vector[0]) {
+    if (!res->attribution.confidence[0]) {
+      copy_attr_token(res->attribution.confidence, sizeof(res->attribution.confidence), "candidate");
+    }
+    copy_attr_token(res->attribution.source, sizeof(res->attribution.source), "yara_rule_metadata");
+    copy_attr_token(res->attribution.evidence_basis, sizeof(res->attribution.evidence_basis), "known_rule_name,protocol_region,safe_signature_metadata");
+  }
+}
+
 #if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
 static int scan_cb(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
   (void)context;
@@ -260,6 +360,13 @@ static int scan_cb(int message, void *message_data, void *user_data) {
     const YR_RULE *rule = (const YR_RULE *)message_data;
     if (rule && !res->matched) {
       set_rule_name(res->first_rule, sizeof(res->first_rule), rule->identifier);
+      fill_yara_attribution_from_metadata(rule, res);
+      if (!res->attribution.family[0]) {
+        fill_builtin_attribution(res->first_rule, &res->attribution);
+        if (res->attribution.family[0]) {
+          copy_attr_token(res->attribution.source, sizeof(res->attribution.source), "yara_rule_name_mapping");
+        }
+      }
       res->matched = 1;
     }
     return CALLBACK_ABORT;
@@ -466,12 +573,14 @@ void edr_shellcode_known_shutdown(void) {
 #endif
 }
 
-int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProtoKind kind, char *rule_name_out,
-                                      size_t rule_name_cap) {
+int edr_shellcode_match_known_exploit_ex(const uint8_t *data, uint32_t len, EdrProtoKind kind, char *rule_name_out,
+                                         size_t rule_name_cap, EdrShellcodeExploitAttribution *attrib_out) {
   if (!data || len == 0u || !rule_name_out || rule_name_cap == 0u) {
+    clear_attribution(attrib_out);
     return 0;
   }
   rule_name_out[0] = '\0';
+  clear_attribution(attrib_out);
 
 #ifdef EDR_HAVE_YARA
   if (s_yara_rules) {
@@ -479,6 +588,10 @@ int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProt
     memset(&res, 0, sizeof(res));
     if (yr_rules_scan_mem(s_yara_rules, data, len, 0, scan_cb, &res, 0) == ERROR_SUCCESS && res.matched) {
       set_rule_name(rule_name_out, rule_name_cap, res.first_rule);
+      fill_builtin_attribution(res.first_rule, attrib_out);
+      if (attrib_out && attrib_out->family[0]) {
+        snprintf(attrib_out->source, sizeof(attrib_out->source), "%s", "yara_rule_metadata");
+      }
       note_match("yara", res.first_rule);
       return 1;
     }
@@ -487,33 +600,44 @@ int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProt
 
   if (kind == EDR_PROTO_KIND_SMB1 && match_smb1_eternalblue(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "EternalBlue_MS17_010");
+    fill_builtin_attribution(rule_name_out, attrib_out);
     note_match("builtin", rule_name_out);
     return 1;
   }
   if (kind == EDR_PROTO_KIND_SMB1 && match_ms17_010_doublepulsar_ping(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "DoublePulsar_MS17_010_Ping");
+    fill_builtin_attribution(rule_name_out, attrib_out);
     note_match("builtin", rule_name_out);
     return 1;
   }
   if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_SMB2) && match_smb3_smbghost(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "SMBGhost_CVE_2020_0796");
+    fill_builtin_attribution(rule_name_out, attrib_out);
     note_match("builtin", rule_name_out);
     return 1;
   }
   if (kind == EDR_PROTO_KIND_RDP && match_rdp_bluekeep(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "BlueKeep_CVE_2019_0708");
+    fill_builtin_attribution(rule_name_out, attrib_out);
     note_match("builtin", rule_name_out);
     return 1;
   }
   if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_SMB2) && match_msrpc_printnightmare(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "PrintNightmare_CVE_2021_34527");
+    fill_builtin_attribution(rule_name_out, attrib_out);
     note_match("builtin", rule_name_out);
     return 1;
   }
   if ((kind == EDR_PROTO_KIND_UNKNOWN || kind == EDR_PROTO_KIND_HTTP) && match_http_reflective_loader_stager(data, len)) {
     set_rule_name(rule_name_out, rule_name_cap, "ReflectiveLoader_HTTP_Stager");
+    fill_builtin_attribution(rule_name_out, attrib_out);
     note_match("builtin", rule_name_out);
     return 1;
   }
   return 0;
+}
+
+int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProtoKind kind, char *rule_name_out,
+                                      size_t rule_name_cap) {
+  return edr_shellcode_match_known_exploit_ex(data, len, kind, rule_name_out, rule_name_cap, NULL);
 }

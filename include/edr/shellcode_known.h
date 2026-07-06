@@ -25,6 +25,16 @@ typedef struct EdrShellcodeRulesStatus {
   char last_match_source[32];
 } EdrShellcodeRulesStatus;
 
+typedef struct EdrShellcodeExploitAttribution {
+  char candidate_cve[64];
+  char family[96];
+  char product[96];
+  char vector[48];
+  char confidence[24];
+  char source[32];
+  char evidence_basis[160];
+} EdrShellcodeExploitAttribution;
+
 /**
  * 初始化已知漏洞规则库。rules_dir 为空时仅使用内置匹配器。
  * 返回 0 表示可继续（包括降级到内置匹配器），负值表示内部错误。
@@ -51,6 +61,10 @@ void edr_shellcode_known_get_status(EdrShellcodeRulesStatus *out);
  *  - 1: 命中，rule_name_out 写入规则名
  *  - 0: 未命中
  */
+int edr_shellcode_match_known_exploit_ex(const uint8_t *data, uint32_t len, EdrProtoKind kind,
+                                         char *rule_name_out, size_t rule_name_cap,
+                                         EdrShellcodeExploitAttribution *attrib_out);
+
 int edr_shellcode_match_known_exploit(const uint8_t *data, uint32_t len, EdrProtoKind kind,
                                       char *rule_name_out, size_t rule_name_cap);
 

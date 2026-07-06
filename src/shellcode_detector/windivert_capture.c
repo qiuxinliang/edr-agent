@@ -24,6 +24,7 @@
 #include "edr/resource.h"
 #include "edr/shellcode_known.h"
 #include "edr/shellcode_detector.h"
+#include "edr/transport_v2.h"
 #include "edr/types.h"
 
 #include "windivert_abi.h"
@@ -600,6 +601,7 @@ static const char *kind_name(EdrProtoKind k) {
 }
 
 static int push_alert(double score, const char *detector_label, const char *rule_name, const char *proto_label,
+                      const EdrShellcodeExploitAttribution *attrib,
                       uint16_t dpt, uint16_t spt, const char *src, const char *dst, const uint8_t *evidence,
                       uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6,
                       uint32_t owner_pid) {
@@ -610,38 +612,51 @@ static int push_alert(double score, const char *detector_label, const char *rule
   }
   int wrote_pcap_ok = 0;
   char forensic_stem[192];
+  char forensic_path[1200];
+  char pcap_object_key[512];
+  const char *pcap_status = "disabled";
   forensic_stem[0] = '\0';
+  forensic_path[0] = '\0';
+  pcap_object_key[0] = '\0';
   unsigned forensic_frames = 0u;
   const char *forensic_kind = "";
 
   if (s_cfg && s_cfg->shellcode_detector.forensic_save_pcap && s_cfg->shellcode_detector.forensic_dir[0]) {
     mkdir_p_win(s_cfg->shellcode_detector.forensic_dir);
-    char pcap_path[1200];
+    pcap_status = "local_only";
     unsigned long long tsn = (unsigned long long)edr_win_now_ns();
     unsigned long pid = (unsigned long)GetCurrentProcessId();
     wd_lock(); /* P2 #7：环形缓冲读取（write_ring_pcap）与计数读须与捕获线程的 ring 写互斥 */
     if (s_ring_mem && s_cfg->shellcode_detector.forensic_ring_slots > 0u && s_ring_count > 0u) {
-      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_ring_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir,
+      snprintf(forensic_path, sizeof(forensic_path), "%s\\shellcode_ring_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir,
                tsn, pid);
-      if (write_ring_pcap(pcap_path) == 0) {
+      if (write_ring_pcap(forensic_path) == 0) {
         wrote_pcap_ok = 1;
         forensic_kind = "ring";
         forensic_frames = s_ring_count;
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_ring_%llu_%lu", tsn, pid);
-        fprintf(stderr, "[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", pcap_path,
+        fprintf(stderr, "[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", forensic_path,
                 (unsigned)s_ring_count);
       }
     } else if (ip_packet && ip_len > 0u) {
-      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
+      snprintf(forensic_path, sizeof(forensic_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
                pid);
-      if (write_single_pcap(pcap_path, ip_packet, ip_len, is_v6) == 0) {
+      if (write_single_pcap(forensic_path, ip_packet, ip_len, is_v6) == 0) {
         wrote_pcap_ok = 1;
         forensic_kind = "single";
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_%llu_%lu", tsn, pid);
-        fprintf(stderr, "[shellcode_detector] wrote pcap %s\n", pcap_path);
+        fprintf(stderr, "[shellcode_detector] wrote pcap %s\n", forensic_path);
       }
     }
     wd_unlock();
+    if (wrote_pcap_ok && forensic_path[0]) {
+      if (edr_transport_v2_upload_file(forensic_stem[0] ? forensic_stem : "shellcode_pcap", forensic_path, "",
+                                       pcap_object_key, sizeof(pcap_object_key)) == 0 && pcap_object_key[0]) {
+        pcap_status = "uploaded";
+      } else {
+        pcap_status = "upload_failed";
+      }
+    }
   }
 
   EdrEventSlot slot;
@@ -665,11 +680,35 @@ static int push_alert(double score, const char *detector_label, const char *rule
     return -1;
   }
   size_t off = (size_t)base;
+  {
+    int ps = snprintf(wx + off, sizeof(wx) - off, "pcap_status=%s\n", pcap_status ? pcap_status : "disabled");
+    if (ps > 0 && (size_t)ps < sizeof(wx) - off) {
+      off += (size_t)ps;
+    }
+  }
+  if (attrib && (attrib->candidate_cve[0] || attrib->family[0] || attrib->vector[0])) {
+    int am = snprintf(wx + off, sizeof(wx) - off,
+                      "attrib_schema=shellcode_vulnerability_attribution_v1\nattrib_cve=%s\nattrib_family=%s\n"
+                      "attrib_product=%s\nattrib_vector=%s\nattrib_confidence=%s\nattrib_source=%s\nattrib_basis=%s\n",
+                      attrib->candidate_cve, attrib->family, attrib->product, attrib->vector,
+                      attrib->confidence[0] ? attrib->confidence : "candidate",
+                      attrib->source[0] ? attrib->source : "builtin_rule_table",
+                      attrib->evidence_basis[0] ? attrib->evidence_basis : "known_rule_name,protocol_region,safe_signature_metadata");
+    if (am > 0 && (size_t)am < sizeof(wx) - off) {
+      off += (size_t)am;
+    }
+  }
   if (wrote_pcap_ok && forensic_kind[0]) {
     int fm = snprintf(wx + off, sizeof(wx) - off,
                       "mitre=T1210\nforensic_kind=%s\npcap_stem=%s\n", forensic_kind, forensic_stem[0] ? forensic_stem : "-");
     if (fm > 0 && (size_t)fm < sizeof(wx) - off) {
       off += (size_t)fm;
+    }
+    if (pcap_object_key[0]) {
+      fm = snprintf(wx + off, sizeof(wx) - off, "pcap_object_key=%s\n", pcap_object_key);
+      if (fm > 0 && (size_t)fm < sizeof(wx) - off) {
+        off += (size_t)fm;
+      }
     }
     if (strcmp(forensic_kind, "ring") == 0 && forensic_frames > 0u) {
       fm = snprintf(wx + off, sizeof(wx) - off, "forensic_frames=%u\n", forensic_frames);
@@ -734,10 +773,25 @@ static int push_alert(double score, const char *detector_label, const char *rule
       }
     }
     const char *det = detector_label ? detector_label : "heuristic";
-    int jn = snprintf(wx + off, sizeof(wx) - off,
-                      "shellcode_json={\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
-                      "\"rule\":\"%s\"}\n",
-                      score, (unsigned)dpt, (unsigned)spt, eproto, det, erule);
+    int jn;
+    if (attrib && (attrib->candidate_cve[0] || attrib->family[0] || attrib->vector[0])) {
+      jn = snprintf(wx + off, sizeof(wx) - off,
+                    "shellcode_json={\"schema\":\"shellcode_result_v1\",\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
+                    "\"rule\":\"%s\",\"pcap\":{\"object_key\":\"%s\",\"status\":\"%s\"},\"attrib\":{\"schema\":\"shellcode_vulnerability_attribution_v1\","
+                    "\"candidate_cve\":\"%s\",\"family\":\"%s\",\"product\":\"%s\",\"vector\":\"%s\","
+                    "\"confidence\":\"%s\",\"source\":\"%s\",\"evidence_basis\":[\"known_rule_name\",\"protocol_region\",\"safe_signature_metadata\"]}}\n",
+                    score, (unsigned)dpt, (unsigned)spt, eproto, det, erule,
+                    pcap_object_key[0] ? pcap_object_key : "", pcap_object_key[0] ? "uploaded" : "missing",
+                    attrib->candidate_cve, attrib->family, attrib->product, attrib->vector,
+                    attrib->confidence[0] ? attrib->confidence : "candidate",
+                    attrib->source[0] ? attrib->source : "builtin_rule_table");
+    } else {
+      jn = snprintf(wx + off, sizeof(wx) - off,
+                    "shellcode_json={\"schema\":\"shellcode_result_v1\",\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
+                    "\"rule\":\"%s\",\"pcap\":{\"object_key\":\"%s\",\"status\":\"%s\"}}\n",
+                    score, (unsigned)dpt, (unsigned)spt, eproto, det, erule,
+                    pcap_object_key[0] ? pcap_object_key : "", pcap_object_key[0] ? "uploaded" : "missing");
+    }
     if (jn > 0 && (size_t)jn < sizeof(wx) - off) {
       off += (size_t)jn;
     }
@@ -825,9 +879,11 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
     snprintf(proto_l, sizeof(proto_l), "%s", kind_name(reg.kind));
   }
   char rule_name[96];
+  EdrShellcodeExploitAttribution attrib;
   EdrProtoKind k = (pr == EDR_PROTO_PARSE_OK) ? reg.kind : EDR_PROTO_KIND_UNKNOWN;
-  if (edr_shellcode_match_known_exploit(scan, slen, k, rule_name, sizeof(rule_name))) {
-    (void)push_alert(1.0, "yara", rule_name, proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+  if (edr_shellcode_match_known_exploit_ex(scan, slen, k, rule_name, sizeof(rule_name), &attrib)) {
+    (void)push_alert(1.0, attrib.source[0] ? attrib.source : "known", rule_name, proto_l, &attrib,
+                     dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
                      lazy_owner_pid(is_v6_pkt, v4_src, v4_dst, spt, dpt));
     return;
   }
@@ -839,7 +895,7 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   if (sc < s_cfg->shellcode_detector.alert_threshold) {
     return;
   }
-  (void)push_alert(sc, "heuristic", "-", proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+  (void)push_alert(sc, "heuristic", "-", proto_l, NULL, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
                    lazy_owner_pid(is_v6_pkt, v4_src, v4_dst, spt, dpt));
 }
 
