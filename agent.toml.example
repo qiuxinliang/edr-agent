@@ -52,6 +52,10 @@ tenant_id            = "tenant_default"
 # proxy_mode         = "auto" # auto | off | explicit
 # proxy_url          = ""     # http://proxy.corp:8080
 # relay_url          = ""     # https://relay.corp:443/api/v1
+# [platform.request_signing]
+# enabled = false              # enroll 返回 request_signing_enabled 后置 true；旧平台/旧 Agent 保持 false
+# key_id = ""                  # enroll 响应 request_signing_key_id
+# secret = ""                  # enroll 响应 request_signing_secret；生产安装器应限制本文件 ACL
 
 # §19.8 攻击面 TOML（与《EDR_端点详细设计》§19.8 对齐；**成功 POST 最小间隔** = min(port,service,policy,full)；ETW/按需刷新/周期共享；enabled 默认 false）。
 # 快照 JSON 的 collectedAt 为 **UTC**（...Z），与「本地时区显示」需自行换算。

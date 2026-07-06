@@ -370,7 +370,10 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
   } else if (secure_cfg.server.grpc_insecure) {
     EDR_LOGE("%s", "[transport] insecure gRPC allowed for loopback/dev only\n");
   }
-  const char *rest_base = secure_cfg.platform.rest_base_url;
+  const char *rest_base_env = getenv("EDR_PLATFORM_REST_BASE");
+  const char *rest_bearer_env = getenv("EDR_PLATFORM_BEARER");
+  const char *rest_base = (rest_base_env && rest_base_env[0]) ? rest_base_env : secure_cfg.platform.rest_base_url;
+  const char *rest_bearer = (rest_bearer_env && rest_bearer_env[0]) ? rest_bearer_env : cfg->platform.rest_bearer_token;
   const int allow_rest_insecure = allow_insecure_env || url_is_loopback_http(rest_base);
   if (rest_base && strncmp(rest_base, "http://", 7) == 0 && !allow_rest_insecure) {
     rest_base = "";
@@ -382,7 +385,7 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       rest_base,
       cfg->agent.tenant_id,
       cfg->platform.rest_user_id,
-      cfg->platform.rest_bearer_token,
+      rest_bearer,
       cfg->agent.endpoint_id,
       NULL /* agent_version */,
       cfg->server.ca_cert,
@@ -394,6 +397,14 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.proxy_mode,
       cfg->platform.proxy_url,
       cfg->platform.relay_url);
+  {
+    EdrRequestSigningConfig reqsig;
+    memset(&reqsig, 0, sizeof(reqsig));
+    reqsig.enabled = cfg->platform.request_signing.enabled ? 1 : 0;
+    snprintf(reqsig.key_id, sizeof(reqsig.key_id), "%s", cfg->platform.request_signing.key_id);
+    snprintf(reqsig.secret, sizeof(reqsig.secret), "%s", cfg->platform.request_signing.secret);
+    edr_ingest_http_configure_request_signing(&reqsig);
+  }
   edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version);
   edr_ingest_http_configure_transport_options(
       cfg->platform.http2_enabled ? 1 : 0,

@@ -85,6 +85,7 @@ static char s_control_qos_dscp[32];
 static char s_control_threshold[32];
 static char s_data_plane_encoding[32] = "protobuf";
 static char s_data_plane_compression[32] = "identity";
+static EdrRequestSigningConfig s_request_signing;
 static unsigned s_control_sampling_pct;
 static int s_control_backpressure_enabled;
 static int s_http2_enabled_cfg = 0;
@@ -202,6 +203,9 @@ static pthread_mutex_t s_ws_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int edr_ingest_http_refresh_route_profile(int force);
 static void http_conn_close_locked(void);
+static int append_signature_headers(char *req, size_t cap, size_t used,
+                                    const char *method, const char *path,
+                                    const char *body, size_t body_len);
 #ifdef EDR_HAVE_CURL_HTTP2
 static int curl_h2_multiplex_enabled(void);
 #endif
@@ -924,6 +928,15 @@ static void route_note_success(void) {
   s_route_failures = 0;
 }
 
+void edr_ingest_http_configure_request_signing(const EdrRequestSigningConfig *cfg) {
+  memset(&s_request_signing, 0, sizeof(s_request_signing));
+  if (cfg) {
+    s_request_signing.enabled = cfg->enabled ? 1 : 0;
+    snprintf(s_request_signing.key_id, sizeof(s_request_signing.key_id), "%s", cfg->key_id);
+    snprintf(s_request_signing.secret, sizeof(s_request_signing.secret), "%s", cfg->secret);
+  }
+}
+
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
                                 const char *ca_file, const char *client_cert_file,
@@ -959,6 +972,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   memset(s_control_profile_id, 0, sizeof(s_control_profile_id));
   memset(s_control_qos_dscp, 0, sizeof(s_control_qos_dscp));
   memset(s_control_threshold, 0, sizeof(s_control_threshold));
+  memset(&s_request_signing, 0, sizeof(s_request_signing));
   snprintf(s_data_plane_encoding, sizeof(s_data_plane_encoding), "%s",
            env_str_default("EDR_DATA_PLANE_ENCODING", "protobuf"));
   snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s",
@@ -1091,9 +1105,13 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
   log_transport_capabilities_once();
 }
 
-void edr_ingest_http_apply_transport_flags(int http2_required, int control_stream_enabled,
+void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required,
+                                           int control_stream_enabled,
                                            int long_poll_fallback,
                                            int report_events_v2_enabled) {
+  if (http2_enabled >= 0) {
+    s_http2_enabled_cfg = http2_enabled ? 1 : 0;
+  }
   if (http2_required >= 0) {
     s_http2_required_cfg = http2_required ? 1 : 0;
   }
@@ -2349,6 +2367,32 @@ static int tcp_connect_http_route(const char *host, int port, int https, EdrSock
   return 0;
 }
 
+static int append_signature_headers(char *req, size_t cap, size_t used,
+                                    const char *method, const char *path,
+                                    const char *body, size_t body_len) {
+  char sig_headers[1024];
+  int n;
+  if (used >= cap) {
+    return -1;
+  }
+  if (body_len > 0u && !body) {
+    return (int)used;
+  }
+  if (edr_reqsig_build_headers(&s_request_signing, method, path, s_endpoint,
+                                (const uint8_t *)(body ? body : ""), body ? body_len : 0u,
+                                unix_ms_now(), sig_headers, sizeof(sig_headers)) != 0) {
+    return -1;
+  }
+  if (!sig_headers[0]) {
+    return (int)used;
+  }
+  n = snprintf(req + used, cap - used, "%s", sig_headers);
+  if (n <= 0 || (size_t)n >= cap - used) {
+    return -1;
+  }
+  return (int)(used + (size_t)n);
+}
+
 static int append_common_headers(char *req, size_t cap, size_t used) {
   int n;
   if (used >= cap) {
@@ -2377,7 +2421,8 @@ static int append_common_headers(char *req, size_t cap, size_t used) {
 }
 
 static int append_request_headers(char *req, size_t cap, const char *method, const char *path,
-                                  const char *host, const char *content_type, size_t body_len) {
+                                  const char *host, const char *content_type,
+                                  const char *body, size_t body_len) {
   int n;
   size_t used;
   n = snprintf(req, cap, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, path, host);
@@ -2400,6 +2445,11 @@ static int append_request_headers(char *req, size_t cap, const char *method, con
     used += (size_t)n;
   }
   n = append_common_headers(req, cap, used);
+  if (n <= 0) {
+    return -1;
+  }
+  used = (size_t)n;
+  n = append_signature_headers(req, cap, used, method, path, body, body_len);
   if (n <= 0) {
     return -1;
   }
@@ -3371,6 +3421,47 @@ static size_t curl_stream_write_cb(char *ptr, size_t size, size_t nmemb, void *u
   return n;
 }
 
+static struct curl_slist *curl_append_signature_headers(struct curl_slist *headers,
+                                                        const char *method, const char *url,
+                                                        const char *body, size_t body_len) {
+  char host[256];
+  char path[1024];
+  int port = 0;
+  int https = 0;
+  char signed_headers[1024];
+  char line[256];
+  const char *p;
+  if (!s_request_signing.enabled || !url || parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
+    return headers;
+  }
+  (void)host;
+  (void)port;
+  (void)https;
+  if (edr_reqsig_build_headers(&s_request_signing, method, path, s_endpoint,
+                                (const uint8_t *)(body ? body : ""), body ? body_len : 0u,
+                                unix_ms_now(), signed_headers, sizeof(signed_headers)) != 0) {
+    return headers;
+  }
+  p = signed_headers;
+  while (*p) {
+    const char *e = strstr(p, "\r\n");
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    if (len > 0u) {
+      if (len >= sizeof(line)) {
+        len = sizeof(line) - 1u;
+      }
+      memcpy(line, p, len);
+      line[len] = '\0';
+      headers = curl_slist_append(headers, line);
+    }
+    if (!e) {
+      break;
+    }
+    p = e + 2;
+  }
+  return headers;
+}
+
 static struct curl_slist *curl_common_headers(const char *content_type) {
   char h[1024];
   struct curl_slist *headers = NULL;
@@ -3560,6 +3651,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   rb.buf = resp_body;
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
+  headers = curl_append_signature_headers(headers, method, url, body, body_len);
   curl_apply_common_options(curl, url, headers, timeout_s > 0 ? timeout_s : http_socket_timeout_s());
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
@@ -3638,6 +3730,7 @@ static int curl_h1_request(const char *method, const char *url, const char *cont
   rb.buf = resp_body;
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
+  headers = curl_append_signature_headers(headers, method, url, body, body_len);
 #ifdef CURL_HTTP_VERSION_1_1
   http_version = (long)CURL_HTTP_VERSION_1_1;
 #endif
@@ -3705,6 +3798,7 @@ static int curl_h2_stream_loop(const char *url) {
   }
   errbuf[0] = '\0';
   headers = curl_common_headers(NULL);
+  headers = curl_append_signature_headers(headers, "GET", url, NULL, 0u);
   headers = curl_slist_append(headers, "Accept: application/x-ndjson");
   headers = curl_slist_append(headers, "Cache-Control: no-cache");
   curl_apply_common_options(curl, url, headers, 0L);
@@ -3766,6 +3860,7 @@ static int curl_h1_stream_loop(const char *url) {
   }
   errbuf[0] = '\0';
   headers = curl_common_headers(NULL);
+  headers = curl_append_signature_headers(headers, "GET", url, NULL, 0u);
   headers = curl_slist_append(headers, "Accept: application/x-ndjson");
   headers = curl_slist_append(headers, "Cache-Control: no-cache");
 #ifdef CURL_HTTP_VERSION_1_1
@@ -3917,7 +4012,7 @@ static int native_request_ex(const char *method, const char *url, const char *co
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), method, path, host, content_type, body_len);
+  rn = append_request_headers(req, sizeof(req), method, path, host, content_type, body, body_len);
   if (rn <= 0) {
     runtime_failure("http request build failed");
     return -1;
@@ -3982,6 +4077,39 @@ static int request_to_suffix(const char *method, const char *suffix, const char 
                              const char *body, size_t body_len, char *resp_body,
                              size_t resp_body_cap) {
   return request_to_suffix_ex(method, suffix, content_type, body, body_len, resp_body, resp_body_cap, 0L);
+}
+
+int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
+                                     char *resp_body, size_t resp_body_cap) {
+  if (!edr_ingest_http_configured() || !suffix || !suffix[0] || !body_json) {
+    return -1;
+  }
+  int rc = request_to_suffix("POST", suffix, "application/json", body_json, strlen(body_json), resp_body, resp_body_cap);
+  if (rc == 0) {
+    note_http_request_success();
+    return 0;
+  }
+  note_http_request_failure();
+  if (!s_last_error[0]) {
+    runtime_failure("json suffix post failed");
+  }
+  return -1;
+}
+
+int edr_ingest_http_get_suffix(const char *suffix, char *resp_body, size_t resp_body_cap) {
+  if (!edr_ingest_http_configured() || !suffix || !suffix[0]) {
+    return -1;
+  }
+  int rc = request_to_suffix("GET", suffix, NULL, NULL, 0u, resp_body, resp_body_cap);
+  if (rc == 0) {
+    note_http_request_success();
+    return 0;
+  }
+  note_http_request_failure();
+  if (!s_last_error[0]) {
+    runtime_failure("suffix get failed");
+  }
+  return -1;
 }
 
 static void route_apply_csv(const char *csv, const char *primary) {
@@ -4112,7 +4240,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), "GET", path, host, NULL, 0u);
+  rn = append_request_headers(req, sizeof(req), "GET", path, host, NULL, NULL, 0u);
   if (rn <= 0) {
     runtime_failure("http request build failed");
     net_done();
@@ -4695,6 +4823,12 @@ static int stream_connect_once(EdrWsConn *out) {
     return -1;
   }
   rn = append_common_headers(req, sizeof(req), (size_t)rn);
+  if (rn <= 0) {
+    ws_close_conn(out);
+    net_done();
+    return -1;
+  }
+  rn = append_signature_headers(req, sizeof(req), (size_t)rn, "GET", path, NULL, 0u);
   if (rn <= 0) {
     ws_close_conn(out);
     net_done();
@@ -5460,7 +5594,7 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), "POST", path, host, content_type, body_len);
+  rn = append_request_headers(req, sizeof(req), "POST", path, host, content_type, NULL, body_len);
   if (rn <= 0) {
     runtime_failure("http upload request build failed");
     return -1;
@@ -6149,6 +6283,11 @@ static int edr_ingest_http_poll_once(void) {
     if (v >= 1 && v <= 30) {
       wait_s = v;
     }
+  }
+  if (s_control_stream_enabled_cfg && !s_long_poll_fallback_cfg) {
+    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s",
+             s_control_stream_status[0] ? s_control_stream_status : "long_poll_disabled");
+    return -1;
   }
   (void)edr_ingest_http_control_hello_once();
   (void)edr_ingest_http_refresh_route_profile(0);

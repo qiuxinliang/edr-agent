@@ -286,6 +286,7 @@ set(EDR_AGENT_SOURCES
   third_party/nanopb/pb_decode.c
   src/transport/event_batch.c
   src/transport/ingest_http.c
+  src/transport/request_signing.c
   src/transport/transport_v2.c
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c

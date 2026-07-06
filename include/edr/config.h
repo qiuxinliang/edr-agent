@@ -261,6 +261,11 @@ typedef struct EdrConfig {
     char proxy_url[512];
     /** 本地 Relay/Gateway 地址；配置后 Agent 优先连接 relay_url，再由 Relay 转发到 Server。 */
     char relay_url[512];
+    struct {
+      bool enabled;
+      char key_id[128];
+      char secret[256];
+    } request_signing;
   } platform;
 
   /**

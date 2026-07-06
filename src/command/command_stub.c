@@ -474,6 +474,7 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   long flush_s = 0;
   long sampling_pct = 100;
   int h2 = -1;
+  int h2_enabled = -1;
   int h2_required = -1;
   int zstd = -1;
   int control_stream_enabled = -1;
@@ -490,6 +491,8 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   (void)parse_json_int_field(pl, len, "flush_interval_s", &flush_s);
   (void)parse_json_int_field(pl, len, "sampling_pct", &sampling_pct);
   (void)parse_json_bool_field(pl, len, "h2", &h2);
+  h2_enabled = h2;
+  (void)parse_json_bool_field(pl, len, "http2_enabled", &h2_enabled);
   (void)parse_json_bool_field(pl, len, "h2_required", &h2_required);
   (void)parse_json_bool_field(pl, len, "zstd", &zstd);
   (void)parse_json_bool_field(pl, len, "control_stream_enabled", &control_stream_enabled);
@@ -520,8 +523,8 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   edr_ingest_http_apply_telemetry_profile(dict_ver, schema_ver, profile_id, h2, zstd,
                                           qos_dscp, (unsigned)sampling_pct, threshold,
                                           backpressure);
-  edr_ingest_http_apply_transport_flags(h2_required, control_stream_enabled, long_poll_fallback,
-                                        report_events_v2_enabled);
+  edr_ingest_http_apply_transport_flags(h2_enabled, h2_required, control_stream_enabled,
+                                        long_poll_fallback, report_events_v2_enabled);
 
   char detail[512];
   snprintf(detail, sizeof(detail),

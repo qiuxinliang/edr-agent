@@ -1,5 +1,18 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_signing.c
+  ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+target_include_directories(test_request_signing PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_request_signing)
+add_test(NAME request_signing COMMAND test_request_signing WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_attack_surface_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_contract.c)
+edr_apply_common_warnings(test_attack_surface_contract)
+add_test(NAME attack_surface_command_ingest_contract COMMAND test_attack_surface_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(attack_surface_command_ingest_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 function(edr_absolutize_sources output_var)
   set(_edr_abs_sources)
   foreach(_edr_source ${ARGN})
@@ -53,6 +66,7 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
+  ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_v2.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_stub.c
   ${CMAKE_SOURCE_DIR}/src/core/time_util.c

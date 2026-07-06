@@ -1965,6 +1965,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->platform.telemetry_sampling_pct = 100u;
   cfg->platform.backpressure_enabled = true;
   snprintf(cfg->platform.proxy_mode, sizeof(cfg->platform.proxy_mode), "%s", "auto");
+  cfg->platform.request_signing.enabled = false;
+  cfg->platform.request_signing.key_id[0] = '\0';
+  cfg->platform.request_signing.secret[0] = '\0';
 
   cfg->attack_surface.enabled = false;
   cfg->attack_surface.port_interval_s = 300u;
@@ -2140,6 +2143,19 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.proxy_url));
   take_string(toml_string_in(t, "relay_url"), cfg->platform.relay_url,
               sizeof(cfg->platform.relay_url));
+  {
+    toml_table_t *rs = toml_table_in(t, "request_signing");
+    if (rs) {
+      toml_datum_t d = toml_bool_in(rs, "enabled");
+      if (d.ok) {
+        cfg->platform.request_signing.enabled = d.u.b ? true : false;
+      }
+      take_string(toml_string_in(rs, "key_id"), cfg->platform.request_signing.key_id,
+                  sizeof(cfg->platform.request_signing.key_id));
+      take_string(toml_string_in(rs, "secret"), cfg->platform.request_signing.secret,
+                  sizeof(cfg->platform.request_signing.secret));
+    }
+  }
 }
 
 static void load_config_signing(toml_table_t *t, EdrConfig *cfg) {

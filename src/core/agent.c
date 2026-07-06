@@ -2666,6 +2666,46 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
              remote->platform.proxy_url);
     snprintf(agent->cfg.platform.relay_url, sizeof(agent->cfg.platform.relay_url), "%s",
              remote->platform.relay_url);
+    agent->cfg.platform.http2_enabled = remote->platform.http2_enabled;
+    agent->cfg.platform.http2_require = remote->platform.http2_require;
+    agent->cfg.platform.control_stream_enabled = remote->platform.control_stream_enabled;
+    agent->cfg.platform.long_poll_fallback = remote->platform.long_poll_fallback;
+    agent->cfg.platform.report_events_v2_enabled = remote->platform.report_events_v2_enabled;
+    snprintf(agent->cfg.platform.data_plane_encoding, sizeof(agent->cfg.platform.data_plane_encoding), "%s",
+             remote->platform.data_plane_encoding);
+    snprintf(agent->cfg.platform.data_plane_compression, sizeof(agent->cfg.platform.data_plane_compression), "%s",
+             remote->platform.data_plane_compression);
+    snprintf(agent->cfg.platform.control_dict_version, sizeof(agent->cfg.platform.control_dict_version), "%s",
+             remote->platform.control_dict_version);
+    snprintf(agent->cfg.platform.control_schema_version, sizeof(agent->cfg.platform.control_schema_version), "%s",
+             remote->platform.control_schema_version);
+    snprintf(agent->cfg.platform.control_profile_id, sizeof(agent->cfg.platform.control_profile_id), "%s",
+             remote->platform.control_profile_id);
+    snprintf(agent->cfg.platform.qos_dscp, sizeof(agent->cfg.platform.qos_dscp), "%s",
+             remote->platform.qos_dscp);
+    snprintf(agent->cfg.platform.telemetry_threshold, sizeof(agent->cfg.platform.telemetry_threshold), "%s",
+             remote->platform.telemetry_threshold);
+    agent->cfg.platform.telemetry_sampling_pct = remote->platform.telemetry_sampling_pct;
+    agent->cfg.platform.backpressure_enabled = remote->platform.backpressure_enabled;
+    edr_ingest_http_configure_transport_options(
+        agent->cfg.platform.http2_enabled ? 1 : 0,
+        agent->cfg.platform.http2_require ? 1 : 0,
+        agent->cfg.platform.control_stream_enabled ? 1 : 0,
+        agent->cfg.platform.long_poll_fallback ? 1 : 0,
+        agent->cfg.platform.report_events_v2_enabled ? 1 : 0,
+        agent->cfg.platform.data_plane_encoding,
+        agent->cfg.platform.data_plane_compression);
+    edr_ingest_http_apply_telemetry_profile(
+        agent->cfg.platform.control_dict_version,
+        agent->cfg.platform.control_schema_version,
+        agent->cfg.platform.control_profile_id,
+        agent->cfg.platform.http2_enabled ? 1 : 0,
+        strcmp(agent->cfg.platform.data_plane_compression, "zstd") == 0 ? 1 : 0,
+        agent->cfg.platform.qos_dscp,
+        agent->cfg.platform.telemetry_sampling_pct,
+        agent->cfg.platform.telemetry_threshold,
+        agent->cfg.platform.backpressure_enabled ? 1 : 0);
+    edr_transport_v2_init_from_config(&agent->cfg);
   }
   if (edr_agent_toml_has_section(tmp, "ave")) {
     agent->cfg.ave.behavior_monitor_enabled = false;

@@ -1,9 +1,10 @@
-/* §19 攻击面：GET_ATTACK_SURFACE — 轻量采集 + POST 平台（需 curl 与 [platform] 或 EDR_PLATFORM_REST_BASE） */
+/* §19 攻击面：GET_ATTACK_SURFACE — 轻量采集 + 复用内置 HTTP 传输栈 POST 平台 */
 
 #include "edr/attack_surface_report.h"
 #include "edr/attack_surface_egress.h"
 #include "edr/attack_surface_inventory.h"
 #include "edr/security_policy_collect.h"
+#include "edr/ingest_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,10 +27,7 @@
 #endif
 
 #ifdef _WIN32
-/**
- * curl 配置里若用双引号包住路径，反斜杠会被当作转义（如 \\Users\\testPC 中 \\t → TAB），
- * 导致 data-binary / output 指向错误文件 → curl_exit_26。与 ingest_http.c 一致改为正斜杠。
- */
+/** Windows 临时路径统一转为正斜杠，避免后续文件读取/日志中的反斜杠转义歧义。 */
 static void win_path_fwd_slashes(char *p) {
   if (!p) {
     return;
@@ -341,27 +339,6 @@ static int collect_listeners_platform(AsListener *out, int max_out, int *truncat
   return collect_listeners_none(out, max_out, truncated);
 }
 #endif
-
-static void strip_trailing_slash(char *s) {
-  size_t n = strlen(s);
-  while (n > 0 && (s[n - 1] == '/' || s[n - 1] == '\\')) {
-    s[--n] = 0;
-  }
-}
-
-static void resolve_rest_base(const EdrConfig *cfg, char *out, size_t cap) {
-  const char *e = getenv("EDR_PLATFORM_REST_BASE");
-  if (e && e[0]) {
-    snprintf(out, cap, "%s", e);
-  } else if (cfg && cfg->platform.relay_url[0]) {
-    snprintf(out, cap, "%s", cfg->platform.relay_url);
-  } else if (cfg && cfg->platform.rest_base_url[0]) {
-    snprintf(out, cap, "%s", cfg->platform.rest_base_url);
-  } else {
-    out[0] = 0;
-  }
-  strip_trailing_slash(out);
-}
 
 uint32_t edr_attack_surface_effective_periodic_interval_s(const EdrConfig *cfg) {
   if (!cfg) {
@@ -946,151 +923,57 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   return 0;
 }
 
-static int run_curl_upload(const char *cfg_path, const char *bearer, char *errbuf, size_t errlen) {
-  if (!cfg_path || !cfg_path[0]) {
-    snprintf(errbuf, errlen, "%s", "curl_cfg_empty");
-    return -1;
+static char *read_text_file_alloc(const char *path, size_t max_bytes, size_t *out_len) {
+  if (out_len) {
+    *out_len = 0u;
   }
-#ifdef _WIN32
-  char cfg_slash[768];
-  snprintf(cfg_slash, sizeof(cfg_slash), "%s", cfg_path);
-  win_path_fwd_slashes(cfg_slash);
-  if (bearer && bearer[0]) {
-    char auth[1024];
-    if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
-      snprintf(errbuf, errlen, "%s", "curl_auth_header_too_long");
-      return -1;
-    }
-    const char *argv[] = {"curl", "-fsS", "--config", cfg_slash, "-H", auth, NULL};
-    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
-    if (rc != 0) {
-      snprintf(errbuf, errlen, "curl_exit_%d", (int)rc);
-      return -1;
-    }
-  } else {
-    const char *argv[] = {"curl", "-fsS", "--config", cfg_slash, NULL};
-    intptr_t rc = _spawnvp(_P_WAIT, "curl", argv);
-    if (rc != 0) {
-      snprintf(errbuf, errlen, "curl_exit_%d", (int)rc);
-      return -1;
-    }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return NULL;
   }
-#else
-  pid_t pid = fork();
-  if (pid < 0) {
-    snprintf(errbuf, errlen, "%s", "fork_failed");
-    return -1;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
   }
-  if (pid == 0) {
-    if (bearer && bearer[0]) {
-      char auth[1024];
-      if ((size_t)snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer) >= sizeof(auth)) {
-        _exit(127);
-      }
-      execlp("curl", "curl", "-fsS", "--config", cfg_path, "-H", auth, (char *)NULL);
-    } else {
-      execlp("curl", "curl", "-fsS", "--config", cfg_path, (char *)NULL);
-    }
-    _exit(127);
+  long sz = ftell(f);
+  if (sz < 0 || (size_t)sz > max_bytes) {
+    fclose(f);
+    return NULL;
   }
-  int st = 0;
-  if (waitpid(pid, &st, 0) < 0) {
-    snprintf(errbuf, errlen, "%s", "waitpid_failed");
-    return -1;
+  rewind(f);
+  char *buf = (char *)malloc((size_t)sz + 1u);
+  if (!buf) {
+    fclose(f);
+    return NULL;
   }
-  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-    snprintf(errbuf, errlen, "curl_exit_%d", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-    return -1;
+  size_t n = fread(buf, 1u, (size_t)sz, f);
+  fclose(f);
+  buf[n] = 0;
+  if (out_len) {
+    *out_len = n;
   }
-#endif
-  snprintf(errbuf, errlen, "%s", "http_ok");
-  return 0;
+  return buf;
 }
 
-static int response_json_refresh_pending(const char *path) {
-  FILE *rf = fopen(path, "rb");
-  if (!rf) {
+static int response_json_refresh_pending_buf(const char *buf) {
+  if (!buf) {
     return 0;
   }
-  char buf[16384];
-  size_t n = fread(buf, 1, sizeof(buf) - 1u, rf);
-  fclose(rf);
-  buf[n] = 0;
-  return (strstr(buf, "\"refreshPending\":true") != NULL || strstr(buf, "\"refreshPending\": true") != NULL) ? 1
-                                                                                                              : 0;
+  return (strstr(buf, "\"refreshPending\":true") != NULL || strstr(buf, "\"refreshPending\": true") != NULL) ? 1 : 0;
 }
 
 int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
   if (!cfg || !cfg->agent.endpoint_id[0] || strcmp(cfg->agent.endpoint_id, "auto") == 0) {
     return 0;
   }
-  char base[512];
-  resolve_rest_base(cfg, base, sizeof(base));
-  if (!base[0]) {
-    return 0;
-  }
-
-  char outpath[512];
-#ifdef _WIN32
-  {
-    char td[MAX_PATH];
-    DWORD nn = GetTempPathA(sizeof(td), td);
-    if (nn == 0 || nn >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    win_path_fwd_slashes(td);
-    snprintf(outpath, sizeof(outpath), "%sedr_asurf_pend_%d.json", td, EDR_GETPID());
-    win_path_fwd_slashes(outpath);
-  }
-#else
-  snprintf(outpath, sizeof(outpath), "/tmp/edr_asurf_pend_%d.json", EDR_GETPID());
-#endif
-
-  char cfgpath[512];
-#ifdef _WIN32
-  {
-    char td[MAX_PATH];
-    DWORD nn = GetTempPathA(sizeof(td), td);
-    if (nn == 0 || nn >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    win_path_fwd_slashes(td);
-    snprintf(cfgpath, sizeof(cfgpath), "%sedr_asurf_pend_curl_%d.cfg", td, EDR_GETPID());
-    win_path_fwd_slashes(cfgpath);
-  }
-#else
-  snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_asurf_pend_curl_%d.cfg", EDR_GETPID());
-#endif
-
-  FILE *cf = fopen(cfgpath, "wb");
-  if (!cf) {
+  char suffix[512];
+  snprintf(suffix, sizeof(suffix), "endpoints/%s/attack-surface/refresh-request", cfg->agent.endpoint_id);
+  char resp[16384];
+  resp[0] = 0;
+  if (edr_ingest_http_get_suffix(suffix, resp, sizeof(resp)) != 0) {
     return -1;
   }
-  fprintf(cf, "url = \"%s/endpoints/%s/attack-surface/refresh-request\"\n", base, cfg->agent.endpoint_id);
-  fprintf(cf, "output = \"%s\"\n", outpath);
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "tenant_default");
-  fprintf(cf, "header = \"X-User-ID: %s\"\n",
-          cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent");
-  fprintf(cf, "header = \"X-Permission-Set: endpoint:attack_surface_report\"\n");
-  const char *bearer = NULL;
-  if (getenv("EDR_PLATFORM_BEARER") && getenv("EDR_PLATFORM_BEARER")[0]) {
-    bearer = getenv("EDR_PLATFORM_BEARER");
-  } else if (cfg->platform.rest_bearer_token[0]) {
-    bearer = cfg->platform.rest_bearer_token;
-  }
-  fprintf(cf, "silent\n");
-  fclose(cf);
-
-  char errbuf[128];
-  if (run_curl_upload(cfgpath, bearer, errbuf, sizeof(errbuf)) != 0) {
-    (void)remove(outpath);
-    (void)remove(cfgpath);
-    return -1;
-  }
-  int hit = response_json_refresh_pending(outpath);
-  (void)remove(outpath);
-  (void)remove(cfgpath);
-  return hit;
+  return response_json_refresh_pending_buf(resp);
 }
 
 int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, char *detail, size_t detail_cap) {
@@ -1129,71 +1012,24 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     return 3;
   }
 
-  char base[512];
-  resolve_rest_base(cfg, base, sizeof(base));
-  if (!base[0]) {
-    (void)remove(jsonpath);
-    snprintf(detail, detail_cap, "skip_no_rest_base_listeners_%d", nL);
-    return 0;
-  }
-
-  const char *tenant = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "tenant_default";
-  const char *user = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
-  const char *bearer = NULL;
-  if (getenv("EDR_PLATFORM_BEARER") && getenv("EDR_PLATFORM_BEARER")[0]) {
-    bearer = getenv("EDR_PLATFORM_BEARER");
-  } else if (cfg->platform.rest_bearer_token[0]) {
-    bearer = cfg->platform.rest_bearer_token;
-  }
-
-  char cfgpath[512];
-#ifdef _WIN32
-  {
-    char td[MAX_PATH];
-    DWORD n = GetTempPathA(sizeof(td), td);
-    if (n == 0 || n >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    win_path_fwd_slashes(td);
-    snprintf(cfgpath, sizeof(cfgpath), "%sedr_asurf_curl_%d.cfg", td, EDR_GETPID());
-    win_path_fwd_slashes(cfgpath);
-  }
-#else
-  snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_asurf_curl_%d.cfg", EDR_GETPID());
-#endif
-
-  FILE *cf = fopen(cfgpath, "wb");
-  if (!cf) {
-    (void)remove(jsonpath);
-    snprintf(detail, detail_cap, "curl_cfg_open_failed");
-    return 3;
-  }
-  fprintf(cf, "url = \"%s/endpoints/%s/attack-surface\"\n", base, cfg->agent.endpoint_id);
-  fprintf(cf, "request = \"POST\"\n");
-  fprintf(cf, "header = \"Content-Type: application/json\"\n");
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", tenant);
-  fprintf(cf, "header = \"X-User-ID: %s\"\n", user);
-  fprintf(cf, "header = \"X-Permission-Set: endpoint:attack_surface_report\"\n");
-  /* 默认 curl 把响应体打 stdout，与 Agent stderr 交错且缺换行；丢弃即可（仅需 HTTP 状态）。 */
-#ifdef _WIN32
-  fprintf(cf, "output = \"NUL\"\n");
-#else
-  fprintf(cf, "output = \"/dev/null\"\n");
-#endif
-  /* 正斜杠 jsonpath 可避免 curl 配置双引号内 \\ 被误解析（与 ingest_http 一致）。 */
-  fprintf(cf, "data-binary = @%s\n", jsonpath);
-  fprintf(cf, "silent\n");
-  fclose(cf);
-
-  char errbuf[128];
-  int ur = run_curl_upload(cfgpath, bearer, errbuf, sizeof(errbuf));
+  size_t body_len = 0u;
+  char *body = read_text_file_alloc(jsonpath, 4u * 1024u * 1024u, &body_len);
   (void)remove(jsonpath);
-  (void)remove(cfgpath);
-  if (ur != 0) {
-    snprintf(detail, detail_cap, "%s", errbuf);
+  if (!body || body_len == 0u) {
+    free(body);
+    snprintf(detail, detail_cap, "read_json_failed");
     return 3;
   }
-  snprintf(detail, detail_cap, "uploaded_%s", errbuf);
+
+  char suffix[512];
+  snprintf(suffix, sizeof(suffix), "endpoints/%s/attack-surface", cfg->agent.endpoint_id);
+  int ur = edr_ingest_http_post_json_suffix(suffix, body, NULL, 0u);
+  free(body);
+  if (ur != 0) {
+    snprintf(detail, detail_cap, "http_post_failed");
+    return 3;
+  }
+  snprintf(detail, detail_cap, "uploaded_http_ok");
   return 0;
 }
 

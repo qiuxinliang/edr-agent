@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "edr/request_signing.h"
+
 struct EdrSoarCommandMeta;
 
 /** 在 edr_transport_init_from_config 中调用；rest_base 形如 http://127.0.0.1:8080/api/v1 */
@@ -26,6 +28,7 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
                                                  int report_events_v2_enabled,
                                                  const char *data_plane_encoding,
                                                  const char *data_plane_compression);
+void edr_ingest_http_configure_request_signing(const EdrRequestSigningConfig *cfg);
 
 int edr_ingest_http_configured(void);
 
@@ -142,7 +145,8 @@ void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *s
                                              const char *profile_id, int h2, int zstd,
                                              const char *qos_dscp, unsigned sampling_pct,
                                              const char *threshold, int backpressure_enabled);
-void edr_ingest_http_apply_transport_flags(int http2_required, int control_stream_enabled,
+void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required,
+                                           int control_stream_enabled,
                                            int long_poll_fallback,
                                            int report_events_v2_enabled);
 
@@ -191,6 +195,13 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
 
 /** 发送 Agent 引擎运行态 JSON；body 需为完整 JSON 对象。 */
 int edr_ingest_http_post_engine_health_json(const char *body_json);
+
+/** 复用当前 REST/mTLS/proxy 栈向 API suffix 发送 JSON；suffix 不带前导 /。 */
+int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
+                                     char *resp_body, size_t resp_body_cap);
+
+/** 复用当前 REST/mTLS/proxy 栈读取 API suffix；suffix 不带前导 /。 */
+int edr_ingest_http_get_suffix(const char *suffix, char *resp_body, size_t resp_body_cap);
 
 /** 发送轻量在线心跳；独立于详细健康监控开关。 */
 int edr_ingest_http_post_heartbeat(void);
