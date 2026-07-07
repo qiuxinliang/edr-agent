@@ -75,7 +75,7 @@ function Assert-AuthenticodeSignature([string] $Path) {
     }
     $sig = Get-AuthenticodeSignature -LiteralPath $Path
     if ($sig.Status -ne 'Valid') {
-        throw "Authenticode signature verification failed for $Path: $($sig.Status) $($sig.StatusMessage)"
+        throw "Authenticode signature verification failed for ${Path}: $($sig.Status) $($sig.StatusMessage)"
     }
 }
 
