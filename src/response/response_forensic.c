@@ -26,6 +26,7 @@
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -37,14 +38,11 @@
 #include "edr/response_utils.h"
 
 /* ── 取证 YARA 真引擎（libyara，构建启用 EDR_WITH_YARA 时可用） ──
- * 复用 shellcode_known.c 的成熟模式：懒加载 + 目录编译 + scan 回调收集命中规则名。
- * 规则目录优先级：EDR_YARA_RULES_DIR > [command].forensic_yara_rules_dir > 默认 rules/forensic。
- * 不可用（未链接 libyara / 无规则 / 加载失败）时由调用方回退内置子串匹配。 */
+ * Phase 1 仅使用命令 payload 中的内联规则，scan 回调收集命中规则名。
+ * 不可用（未链接 libyara / 规则编译失败 / 扫描失败）时默认失败；仅在显式开启
+ * EDR_YARA_ALLOW_BUILTIN_FALLBACK=1 时降级到内置子串启发式并在结果中标记 degraded。 */
 #ifdef EDR_HAVE_YARA
 #include <yara.h>
-#if !defined(_WIN32)
-#include <dirent.h>
-#endif
 
 #define EDR_FY_RULE_NAME_MAX 128
 #define EDR_FY_MAX_HITS 8
@@ -54,25 +52,23 @@ typedef struct {
   int count;
 } ForensicYaraResult;
 
-static YR_RULES *s_fy_rules;
 static int s_fy_initialized;
-static int s_fy_loaded;
 
-static int fy_is_rule_file(const char *name) {
-  const char *dot = name ? strrchr(name, '.') : NULL;
-  if (!dot) {
-    return 0;
-  }
-  return (strcmp(dot, ".yar") == 0 || strcmp(dot, ".yara") == 0) ? 1 : 0;
-}
+typedef struct {
+  char msg[256];
+} ForensicYaraCompileState;
 
 static void fy_compiler_error_cb(int level, const char *fn, int line, const YR_RULE *rule,
                                  const char *msg, void *ud) {
   (void)rule;
-  (void)ud;
   const char *lv = (level == YARA_ERROR_LEVEL_WARNING) ? "warning" : "error";
   fprintf(stderr, "[forensic-yara] compile %s file=%s line=%d msg=%s\n", lv, fn ? fn : "-", line,
           msg ? msg : "-");
+  ForensicYaraCompileState *st = (ForensicYaraCompileState *)ud;
+  if (st && level != YARA_ERROR_LEVEL_WARNING && st->msg[0] == '\0') {
+    snprintf(st->msg, sizeof(st->msg), "compile error file=%s line=%d msg=%s", fn ? fn : "-", line,
+             msg ? msg : "-");
+  }
 }
 
 #if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
@@ -95,145 +91,72 @@ static int fy_scan_cb(int message, void *message_data, void *user_data) {
   return CALLBACK_CONTINUE;
 }
 
-static int fy_add_file(YR_COMPILER *c, const char *path) {
-  FILE *fp = fopen(path, "rb");
-  if (!fp) {
+static int fy_scan_rules(YR_RULES *rules, const char *target_path, const uint8_t *buf, size_t len,
+                         ForensicYaraResult *res, char *err, size_t err_cap) {
+  if (!rules || !res) {
+    if (err && err_cap) snprintf(err, err_cap, "libyara rules unavailable");
     return 0;
   }
-  int nerr = yr_compiler_add_file(c, fp, NULL, path);
-  fclose(fp);
-  return nerr > 0 ? 0 : 1;
-}
-
-#if defined(_WIN32)
-static int fy_add_dir(YR_COMPILER *c, const char *dir) {
-  char pattern[1024];
-  snprintf(pattern, sizeof(pattern), "%s\\*.*", dir);
-  WIN32_FIND_DATAA ffd;
-  HANDLE h = FindFirstFileA(pattern, &ffd);
-  if (h == INVALID_HANDLE_VALUE) {
+  memset(res, 0, sizeof(*res));
+  int rc = ERROR_INTERNAL_FATAL_ERROR;
+  if (target_path && target_path[0]) {
+    rc = yr_rules_scan_file(rules, target_path, 0, fy_scan_cb, res, 0);
+  }
+  if (rc != ERROR_SUCCESS && buf && len > 0u) {
+    rc = yr_rules_scan_mem(rules, buf, len, 0, fy_scan_cb, res, 0);
+  }
+  if (rc != ERROR_SUCCESS) {
+    if (err && err_cap) snprintf(err, err_cap, "libyara scan failed rc=%d", rc);
     return 0;
   }
-  int loaded = 0;
-  do {
-    if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-      continue;
-    }
-    if (!fy_is_rule_file(ffd.cFileName)) {
-      continue;
-    }
-    char full[1024];
-    snprintf(full, sizeof(full), "%s\\%s", dir, ffd.cFileName);
-    loaded += fy_add_file(c, full);
-  } while (FindNextFileA(h, &ffd));
-  FindClose(h);
-  return loaded;
-}
-#else
-static int fy_add_dir(YR_COMPILER *c, const char *dir) {
-  DIR *d = opendir(dir);
-  if (!d) {
-    return 0;
-  }
-  int loaded = 0;
-  struct dirent *ent;
-  while ((ent = readdir(d)) != NULL) {
-    if (ent->d_name[0] == '.') {
-      continue;
-    }
-    if (!fy_is_rule_file(ent->d_name)) {
-      continue;
-    }
-    char full[1024];
-    snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
-    loaded += fy_add_file(c, full);
-  }
-  closedir(d);
-  return loaded;
-}
-#endif
-
-static const char *fy_rules_dir(void) {
-  const char *e = getenv("EDR_YARA_RULES_DIR");
-  if (e && e[0]) {
-    return e;
-  }
-  const EdrConfig *cfg = edr_command_get_config();
-  if (cfg && cfg->command.forensic_yara_rules_dir[0]) {
-    return cfg->command.forensic_yara_rules_dir;
-  }
-  return "rules/forensic";
+  return 1;
 }
 
-/* 懒加载并编译规则。返回 1=规则可用，0=不可用（调用方回退子串匹配）。 */
-static int fy_ensure_rules(void) {
-  if (s_fy_loaded && s_fy_rules) {
-    return 1;
+static YR_RULES *fy_compile_inline_rules(const char *rules_text, char *err, size_t err_cap) {
+  if (!rules_text || !rules_text[0]) {
+    if (err && err_cap) snprintf(err, err_cap, "inline YARA rules required");
+    return NULL;
   }
   if (!s_fy_initialized) {
     if (yr_initialize() != ERROR_SUCCESS) {
-      return 0;
+      if (err && err_cap) snprintf(err, err_cap, "libyara initialize failed");
+      return NULL;
     }
     s_fy_initialized = 1;
   }
   YR_COMPILER *c = NULL;
   if (yr_compiler_create(&c) != ERROR_SUCCESS || !c) {
-    return 0;
+    if (err && err_cap) snprintf(err, err_cap, "libyara compiler create failed");
+    return NULL;
   }
-  yr_compiler_set_callback(c, fy_compiler_error_cb, NULL);
-  int loaded = fy_add_dir(c, fy_rules_dir());
-  if (loaded <= 0) {
+  ForensicYaraCompileState cstate;
+  memset(&cstate, 0, sizeof(cstate));
+  yr_compiler_set_callback(c, fy_compiler_error_cb, &cstate);
+  int nerr = yr_compiler_add_string(c, rules_text, "inline");
+  if (nerr > 0) {
+    if (err && err_cap) snprintf(err, err_cap, "%s", cstate.msg[0] ? cstate.msg : "inline YARA rule compile failed");
     yr_compiler_destroy(c);
-    return 0;
+    return NULL;
   }
   YR_RULES *rules = NULL;
   if (yr_compiler_get_rules(c, &rules) != ERROR_SUCCESS || !rules) {
+    if (err && err_cap) snprintf(err, err_cap, "inline YARA rule finalize failed");
     yr_compiler_destroy(c);
-    return 0;
+    return NULL;
   }
   yr_compiler_destroy(c);
-  if (s_fy_rules) {
-    yr_rules_destroy(s_fy_rules);
-  }
-  s_fy_rules = rules;
-  s_fy_loaded = 1;
-  return 1;
+  return rules;
 }
 
-/* 用真引擎扫描文件（拿不到文件时回退内存缓冲）。
- * 返回 1=已用真引擎并将结果写入 out；0=引擎不可用，需回退子串匹配。 */
-static int fy_scan(const char *target_path, const uint8_t *buf, size_t len, char *out, size_t cap) {
-  if (!fy_ensure_rules()) {
-    return 0;
-  }
-  ForensicYaraResult res;
-  memset(&res, 0, sizeof(res));
-  int rc = ERROR_INTERNAL_FATAL_ERROR;
-  if (target_path && target_path[0]) {
-    rc = yr_rules_scan_file(s_fy_rules, target_path, 0, fy_scan_cb, &res, 0);
-  }
-  if (rc != ERROR_SUCCESS && buf && len > 0u) {
-    rc = yr_rules_scan_mem(s_fy_rules, buf, len, 0, fy_scan_cb, &res, 0);
-  }
-  if (rc != ERROR_SUCCESS) {
-    return 0;
-  }
-  if (res.count > 0) {
-    char rl[640];
-    rl[0] = '\0';
-    for (int i = 0; i < res.count; i++) {
-      if (rl[0]) {
-        strncat(rl, ",", sizeof(rl) - strlen(rl) - 1);
-      }
-      strncat(rl, res.rules[i], sizeof(rl) - strlen(rl) - 1);
-    }
-    snprintf(out, cap, "YARA_HIT path=%s engine=yara count=%d rules=[%s]",
-             target_path ? target_path : "(mem)", res.count, rl);
-  } else {
-    snprintf(out, cap, "YARA_CLEAN path=%s engine=yara", target_path ? target_path : "(mem)");
-  }
-  return 1;
+static int fy_scan_inline_rules(const char *rules_text, const char *target_path, const uint8_t *buf, size_t len,
+                                ForensicYaraResult *res, char *err, size_t err_cap) {
+  YR_RULES *rules = fy_compile_inline_rules(rules_text, err, err_cap);
+  if (!rules) return 0;
+  int ok = fy_scan_rules(rules, target_path, buf, len, res, err, err_cap);
+  yr_rules_destroy(rules);
+  return ok;
 }
+
 #endif /* EDR_HAVE_YARA */
 
 /* ── Forensic Actions ── */
@@ -1026,6 +949,106 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
 #endif
 }
 
+static void response_json_escape(const char *in, char *out, size_t cap) {
+  if (!out || cap == 0) return;
+  size_t oi = 0;
+  out[0] = '\0';
+  if (!in) return;
+  for (const unsigned char *p = (const unsigned char *)in; *p && oi + 1 < cap; p++) {
+    if (*p == '"' || *p == '\\') {
+      if (oi + 2 >= cap) break;
+      out[oi++] = '\\';
+      out[oi++] = (char)*p;
+    } else if (*p == '\n') {
+      if (oi + 2 >= cap) break;
+      out[oi++] = '\\';
+      out[oi++] = 'n';
+    } else if (*p == '\r') {
+      if (oi + 2 >= cap) break;
+      out[oi++] = '\\';
+      out[oi++] = 'r';
+    } else if (*p == '\t') {
+      if (oi + 2 >= cap) break;
+      out[oi++] = '\\';
+      out[oi++] = 't';
+    } else if (*p < 0x20) {
+      continue;
+    } else {
+      out[oi++] = (char)*p;
+    }
+  }
+  out[oi] = '\0';
+}
+
+static void yara_emit_json_result(const char *cmd_id, const EdrSoarCommandMeta *sm,
+                                  EdrCommandExecutionStatus exec_status, int exit_code,
+                                  const char *target_path, const char *engine, const char *status,
+                                  int matched, long bytes_scanned, int files_scanned,
+                                  int files_matched, int files_skipped, const char *rules_csv,
+                                  const char *warning) {
+  char path_esc[1100], engine_esc[96], status_esc[96], rules_esc[800], warning_esc[600];
+  response_json_escape(target_path ? target_path : "", path_esc, sizeof(path_esc));
+  response_json_escape(engine ? engine : "", engine_esc, sizeof(engine_esc));
+  response_json_escape(status ? status : "", status_esc, sizeof(status_esc));
+  response_json_escape(rules_csv ? rules_csv : "", rules_esc, sizeof(rules_esc));
+  response_json_escape(warning ? warning : "", warning_esc, sizeof(warning_esc));
+
+  char matches[1200];
+  if (matched) {
+    snprintf(matches, sizeof(matches), "[{\"path\":\"%s\",\"rules\":[", path_esc);
+    const char *p = rules_esc;
+    int first = 1;
+    while (p && *p) {
+      char rule_esc[180];
+      size_t ri = 0;
+      while (*p && *p != ',' && ri + 1 < sizeof(rule_esc)) {
+        rule_esc[ri++] = *p++;
+      }
+      rule_esc[ri] = '\0';
+      if (*p == ',') p++;
+      if (!rule_esc[0]) continue;
+      strncat(matches, first ? "\"" : ",\"", sizeof(matches) - strlen(matches) - 1);
+      strncat(matches, rule_esc, sizeof(matches) - strlen(matches) - 1);
+      strncat(matches, "\"", sizeof(matches) - strlen(matches) - 1);
+      first = 0;
+    }
+    strncat(matches, "]}]", sizeof(matches) - strlen(matches) - 1);
+  } else {
+    snprintf(matches, sizeof(matches), "[]");
+  }
+
+  char warnings[700];
+  if (warning_esc[0]) {
+    snprintf(warnings, sizeof(warnings), "[\"%s\"]", warning_esc);
+  } else {
+    snprintf(warnings, sizeof(warnings), "[]");
+  }
+
+  char detail[4096];
+  snprintf(detail, sizeof(detail),
+           "{\"schema\":\"edr.yara_scan.result.v1\",\"target_type\":\"file\",\"target_path\":\"%s\",\"engine\":\"%s\",\"status\":\"%s\",\"matched\":%s,\"files_scanned\":%d,\"files_matched\":%d,\"files_skipped\":%d,\"bytes_scanned\":%ld,\"matches\":%s,\"warnings\":%s}",
+           path_esc, engine_esc, status_esc, matched ? "true" : "false", files_scanned,
+           files_matched, files_skipped, bytes_scanned, matches, warnings);
+  edr_command_emit_always(cmd_id, sm, exec_status, exit_code, detail);
+}
+
+static int yara_allow_builtin_fallback(void) {
+  const char *e = getenv("EDR_YARA_ALLOW_BUILTIN_FALLBACK");
+  return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+}
+
+static int response_json_bool(const uint8_t *p, size_t len, const char *key) {
+  char needle[80];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *s = (const char *)p;
+  const char *end = s + len;
+  const char *pos = strstr(s, needle);
+  if (!pos || pos >= end) return 0;
+  pos += strlen(needle);
+  while (pos < end && (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r' || *pos == ':')) pos++;
+  return pos + 4 <= end && strncmp(pos, "true", 4) == 0;
+}
+
 static void *response_memmem(const void *haystack, size_t haystack_len,
                              const void *needle, size_t needle_len) {
   if (!needle_len) return (void *)haystack;
@@ -1036,6 +1059,126 @@ static void *response_memmem(const void *haystack, size_t haystack_len,
   }
   return NULL;
 }
+
+#ifdef EDR_HAVE_YARA
+typedef struct {
+  YR_RULES *rules;
+  int max_files;
+  int max_depth;
+  long max_bytes;
+  int recursive;
+  int scanned;
+  int matched_files;
+  int skipped;
+  int matches_returned;
+  int matches_truncated;
+  long bytes_scanned;
+  const char *payload;
+  size_t payload_len;
+  char matches_json[4096];
+  char warnings[512];
+} YaraDirCtx;
+
+static void yd_append_warning(YaraDirCtx *ctx, const char *msg) {
+  if (!ctx || !msg || !msg[0]) return;
+  if (ctx->warnings[0]) strncat(ctx->warnings, "; ", sizeof(ctx->warnings) - strlen(ctx->warnings) - 1);
+  strncat(ctx->warnings, msg, sizeof(ctx->warnings) - strlen(ctx->warnings) - 1);
+}
+
+static int yd_is_excluded(YaraDirCtx *ctx, const char *path) {
+  if (!ctx || !ctx->payload || !path || !path[0]) return 0;
+  return response_memmem(ctx->payload, ctx->payload_len, path, strlen(path)) != NULL;
+}
+
+static int yd_scan_file(YaraDirCtx *ctx, const char *path) {
+  if (!ctx || !path || !path[0] || ctx->scanned >= ctx->max_files) return 0;
+  if (yd_is_excluded(ctx, path)) { ctx->skipped++; return 0; }
+  FILE *f = fopen(path, "rb");
+  if (!f) { ctx->skipped++; return 0; }
+  fseek(f, 0, SEEK_END);
+  long fsz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (fsz <= 0 || fsz > ctx->max_bytes) { fclose(f); ctx->skipped++; return 0; }
+  uint8_t *buf = (uint8_t *)malloc((size_t)fsz);
+  if (!buf) { fclose(f); ctx->skipped++; return 0; }
+  size_t nr = fread(buf, 1, (size_t)fsz, f);
+  fclose(f);
+  if (nr != (size_t)fsz) { free(buf); ctx->skipped++; return 0; }
+  ForensicYaraResult res;
+  char err[128]; err[0] = '\0';
+  ctx->scanned++;
+  ctx->bytes_scanned += fsz;
+  int ok = fy_scan_rules(ctx->rules, path, buf, (size_t)fsz, &res, err, sizeof(err));
+  free(buf);
+  if (!ok) { ctx->skipped++; yd_append_warning(ctx, err[0] ? err : "scan failed"); return 0; }
+  if (res.count <= 0) return 1;
+  ctx->matched_files++;
+  if (ctx->matches_returned >= 100) { ctx->matches_truncated = 1; return 1; }
+  char path_esc[1100]; response_json_escape(path, path_esc, sizeof(path_esc));
+  if (ctx->matches_json[0]) strncat(ctx->matches_json, ",", sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+  strncat(ctx->matches_json, "{\"path\":\"", sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+  strncat(ctx->matches_json, path_esc, sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+  strncat(ctx->matches_json, "\",\"rules\":[", sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+  for (int i = 0; i < res.count; i++) {
+    char rule_esc[180]; response_json_escape(res.rules[i], rule_esc, sizeof(rule_esc));
+    strncat(ctx->matches_json, i == 0 ? "\"" : ",\"", sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+    strncat(ctx->matches_json, rule_esc, sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+    strncat(ctx->matches_json, "\"", sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+  }
+  strncat(ctx->matches_json, "]}", sizeof(ctx->matches_json) - strlen(ctx->matches_json) - 1);
+  ctx->matches_returned++;
+  return 1;
+}
+
+static void yara_emit_dir_result(const char *cmd_id, const EdrSoarCommandMeta *sm, const char *target, YaraDirCtx *ctx) {
+  char target_esc[1100], warn_esc[700];
+  response_json_escape(target ? target : "", target_esc, sizeof(target_esc));
+  response_json_escape(ctx && ctx->warnings[0] ? ctx->warnings : "", warn_esc, sizeof(warn_esc));
+  char warnings[900];
+  snprintf(warnings, sizeof(warnings), "%s%s%s", warn_esc[0] ? "[\"" : "[]", warn_esc[0] ? warn_esc : "", warn_esc[0] ? "\"]" : "");
+  char detail[8192];
+  snprintf(detail, sizeof(detail),
+           "{\"schema\":\"edr.yara_scan.result.v1\",\"target_type\":\"directory\",\"target_path\":\"%s\",\"engine\":\"libyara\",\"status\":\"completed\",\"matched\":%s,\"files_scanned\":%d,\"files_matched\":%d,\"files_skipped\":%d,\"bytes_scanned\":%ld,\"matches\":[%s],\"matches_returned\":%d,\"matches_truncated\":%s,\"warnings\":%s}",
+           target_esc, ctx->matched_files > 0 ? "true" : "false", ctx->scanned, ctx->matched_files, ctx->skipped,
+           ctx->bytes_scanned, ctx->matches_json, ctx->matches_returned, ctx->matches_truncated ? "true" : "false", warnings);
+  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, detail);
+}
+
+#ifdef _WIN32
+static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
+  if (!ctx || !dir || ctx->scanned >= ctx->max_files || depth > ctx->max_depth) return;
+  char pat[1100]; snprintf(pat, sizeof(pat), "%s\\*", dir);
+  WIN32_FIND_DATAA ffd; HANDLE h = FindFirstFileA(pat, &ffd);
+  if (h == INVALID_HANDLE_VALUE) { ctx->skipped++; return; }
+  do {
+    if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
+    char full[1200]; snprintf(full, sizeof(full), "%s\\%s", dir, ffd.cFileName);
+    if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) { if (ctx->recursive) yd_walk(ctx, full, depth + 1); }
+    else yd_scan_file(ctx, full);
+    if (ctx->scanned >= ctx->max_files) break;
+  } while (FindNextFileA(h, &ffd));
+  FindClose(h);
+}
+#else
+static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
+  if (!ctx || !dir || ctx->scanned >= ctx->max_files || depth > ctx->max_depth) return;
+  DIR *d = opendir(dir);
+  if (!d) { ctx->skipped++; return; }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+    char full[1200]; snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
+    struct stat st;
+    if (lstat(full, &st) != 0) { ctx->skipped++; continue; }
+    if (S_ISDIR(st.st_mode)) { if (ctx->recursive) yd_walk(ctx, full, depth + 1); }
+    else if (S_ISREG(st.st_mode)) yd_scan_file(ctx, full);
+    else ctx->skipped++;
+    if (ctx->scanned >= ctx->max_files) break;
+  }
+  closedir(d);
+}
+#endif
+#endif
 
 void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!edr_command_dangerous_enabled()) {
@@ -1068,19 +1211,87 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   }
 
   char target_path[520];
+  char target_type[32];
+  char rules_text[262144];
+  int max_files = 0, max_depth = 0, max_file_mb = 0;
   (void)edr_parse_json_string(pl, len, "target_path", target_path, sizeof(target_path));
+  (void)edr_parse_json_string(pl, len, "target_type", target_type, sizeof(target_type));
+  (void)edr_parse_json_string(pl, len, "rules", rules_text, sizeof(rules_text));
+  (void)edr_parse_json_int(pl, len, "max_files", &max_files);
+  (void)edr_parse_json_int(pl, len, "max_depth", &max_depth);
+  (void)edr_parse_json_int(pl, len, "max_file_mb", &max_file_mb);
+  int recursive = response_json_bool(pl, len, "recursive");
+  if (!target_type[0]) snprintf(target_type, sizeof(target_type), "file");
   if (!target_path[0]) {
     edr_cmd_inc_exec_fail();
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "missing target_path");
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 2, "", "unavailable", "failed", 0, 0, 0, 0, 0,
+                          NULL, "missing target_path");
     return;
   }
+  if (!rules_text[0]) {
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 2, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "inline YARA rules required");
+    return;
+  }
+  if (strcmp(target_type, "directory") == 0) {
+#ifdef EDR_HAVE_YARA
+    if (max_files <= 0 || max_files > 10000) max_files = 1000;
+    if (max_depth <= 0 || max_depth > 32) max_depth = 8;
+    if (max_file_mb <= 0 || max_file_mb > 256) max_file_mb = 50;
+    char yerr[256]; yerr[0] = '\0';
+    YR_RULES *rules = fy_compile_inline_rules(rules_text, yerr, sizeof(yerr));
+    if (!rules) {
+      edr_cmd_inc_exec_fail();
+      yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 6, target_path, "libyara", "failed", 0, 0, 0, 0,
+                            0, NULL, yerr[0] ? yerr : "inline YARA rule compile failed");
+      return;
+    }
+    YaraDirCtx yd;
+    memset(&yd, 0, sizeof(yd));
+    yd.rules = rules;
+    yd.max_files = max_files;
+    yd.max_depth = max_depth;
+    yd.max_bytes = (long)max_file_mb * 1024L * 1024L;
+    yd.recursive = recursive;
+    yd.payload = (const char *)pl;
+    yd.payload_len = len;
+    yd_walk(&yd, target_path, 0);
+    yr_rules_destroy(rules);
+    edr_cmd_inc_handled();
+    edr_cmd_inc_exec_ok();
+    edr_command_audit_both(cmd_id, "yara_scan: ok (directory engine=libyara inline)");
+    yara_emit_dir_result(cmd_id, sm, target_path, &yd);
+    return;
+#else
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 6, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "directory YARA scan requires libyara; rebuild with EDR_WITH_YARA and libyara");
+    return;
+#endif
+  }
+#ifdef _WIN32
+  DWORD attrs = GetFileAttributesA(target_path);
+  if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 3, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "target_path is a directory; current YARA scan supports single files only");
+    return;
+  }
+#else
+  struct stat st;
+  if (stat(target_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 3, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "target_path is a directory; current YARA scan supports single files only");
+    return;
+  }
+#endif
   FILE *f = fopen(target_path, "rb");
   if (!f) {
-    f = fopen(target_path, "r");
-  }
-  if (!f) {
     edr_cmd_inc_exec_fail();
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "file not found");
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 3, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "file not found");
     return;
   }
   fseek(f, 0, SEEK_END);
@@ -1088,27 +1299,67 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   fseek(f, 0, SEEK_SET);
   if (fsz <= 0 || fsz > 50 * 1024 * 1024) {
     fclose(f);
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 4, "file too large (>50MB)");
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 4, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 1, NULL, "file empty or too large (>50MB)");
     return;
   }
   uint8_t *buf = (uint8_t *)malloc((size_t)fsz);
-  if (!buf) { fclose(f); edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 5, "oom"); return; }
-  fread(buf, 1, (size_t)fsz, f);
+  if (!buf) {
+    fclose(f);
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 5, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "out of memory");
+    return;
+  }
+  size_t nr = fread(buf, 1, (size_t)fsz, f);
   fclose(f);
+  if (nr != (size_t)fsz) {
+    free(buf);
+    edr_cmd_inc_exec_fail();
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 5, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 1, NULL, "file read failed");
+    return;
+  }
 
-  char result[1024];
 #ifdef EDR_HAVE_YARA
-  /* 真引擎优先：libyara 编译 rules 目录并扫描；不可用（无规则/加载失败）则回退下方子串匹配。 */
-  if (fy_scan(target_path, buf, (size_t)fsz, result, sizeof(result))) {
+  ForensicYaraResult yres;
+  char yerr[256];
+  yerr[0] = '\0';
+  if (fy_scan_inline_rules(rules_text, target_path, buf, (size_t)fsz, &yres, yerr, sizeof(yerr))) {
+    char rules_csv[700];
+    rules_csv[0] = '\0';
+    for (int i = 0; i < yres.count; i++) {
+      if (rules_csv[0]) strncat(rules_csv, ",", sizeof(rules_csv) - strlen(rules_csv) - 1);
+      strncat(rules_csv, yres.rules[i], sizeof(rules_csv) - strlen(rules_csv) - 1);
+    }
     free(buf);
     edr_cmd_inc_handled();
     edr_cmd_inc_exec_ok();
-    edr_command_audit_both(cmd_id, "yara_scan: ok (engine=yara)");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    edr_command_audit_both(cmd_id, "yara_scan: ok (engine=libyara inline)");
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecOk, 0, target_path, "libyara", "completed", yres.count > 0,
+                          fsz, 1, yres.count > 0 ? 1 : 0, 0, rules_csv, NULL);
+    return;
+  }
+  if (!yara_allow_builtin_fallback()) {
+    free(buf);
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "yara_scan: failed (libyara inline rules)");
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 6, target_path, "libyara", "failed", 0, 0, 0, 0,
+                          0, NULL, yerr[0] ? yerr : "libyara scan failed");
+    return;
+  }
+#else
+  if (!yara_allow_builtin_fallback()) {
+    free(buf);
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "yara_scan: failed (libyara unavailable)");
+    yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 6, target_path, "unavailable", "failed", 0, 0, 0,
+                          0, 0, NULL, "libyara unavailable; rebuild with EDR_WITH_YARA and libyara");
     return;
   }
 #endif
-  /* 降级：内置子串匹配（无 libyara 或无规则时）。结果标 engine=builtin 以便区分。 */
+
   int matches = 0;
   const char *patterns[] = {
     "MZ", "PE\0\0", "This program cannot be run",
@@ -1130,12 +1381,10 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   }
   free(buf);
 
-  if (matches > 0) {
-    snprintf(result, sizeof(result), "YARA_HIT path=%s engine=builtin matches=%d patterns=[%s]", target_path, matches, hitBuf);
-  } else {
-    snprintf(result, sizeof(result), "YARA_CLEAN path=%s engine=builtin", target_path);
-  }
-  edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
-  edr_command_audit_both(cmd_id, "yara_scan: ok (engine=builtin)");
-  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+  edr_cmd_inc_handled();
+  edr_cmd_inc_exec_ok();
+  edr_command_audit_both(cmd_id, "yara_scan: degraded (engine=builtin_substring_heuristic)");
+  yara_emit_json_result(cmd_id, sm, EdrCmdExecOk, 0, target_path, "builtin_substring_heuristic", "degraded",
+                        matches > 0, fsz, 1, matches > 0 ? 1 : 0, 0, hitBuf,
+                        "YARA engine unavailable or rule compilation failed; used built-in substring heuristic, not YARA");
 }
