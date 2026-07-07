@@ -1772,6 +1772,14 @@ function Merge-EnrollIntoAgentTomlExample {
       $merged += ('public_key_pem = "{0}"' -f (Escape-Toml (Format-TomlInlinePem $ConfigSigningPublicKeyPEM))) + "`n"
     }
   }
+  if ($merged -notmatch '(?m)^\s*\[health_monitor\]\s*$') {
+    $merged += "`n[health_monitor]`n"
+    $merged += "enabled              = true`n"
+    $merged += "profile              = \"basic\"`n"
+    $merged += "interval_s           = 60`n"
+    $merged += "expires_at_unix_ms   = 0`n"
+    $merged += "request_id           = \"bootstrap-runtime\"`n"
+  }
   return $merged
 }
 
@@ -1989,6 +1997,13 @@ enabled              = false
 cooldown_s           = 30
 trigger_on_p0        = true
 collect_process_tree = true
+
+[health_monitor]
+enabled              = true
+profile              = "basic"
+interval_s           = 60
+expires_at_unix_ms   = 0
+request_id           = "bootstrap-runtime"
 
 [upload]
 batch_max_events     = 200

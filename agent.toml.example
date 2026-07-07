@@ -404,14 +404,14 @@ trigger_on_mitre = ["T1059", "T1547", "T1543", "T1003"]
 
 # =========================
 # [health_monitor] Agent 健康监测
-# 默认关闭；通常由终端管理详情页按主机临时开启，并带 TTL 自动停止。
+# 默认开启基础健康上报；终端管理详情页可按主机调整 profile/TTL。
 # =========================
 [health_monitor]
-enabled = false
+enabled = true
 profile = "basic"
 interval_s = 60
 expires_at_unix_ms = 0
-request_id = ""
+request_id = "agent-bootstrap"
 
 # =========================
 # [shell] 远程 Shell 会话配置

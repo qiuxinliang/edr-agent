@@ -1559,7 +1559,37 @@ public partial class MainWindow : Window
         return string.Join(",", pins);
     }
 
-    private static string WriteEnrollParamsFile(
+    private bool? ReadPreconfigBool(string key)
+    {
+        if (!_preconfig.TryGetValue(key, out var value) || value == null)
+        {
+            return null;
+        }
+        if (value is JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.True) return true;
+            if (element.ValueKind == JsonValueKind.False) return false;
+            if (element.ValueKind == JsonValueKind.String && bool.TryParse(element.GetString(), out var parsed)) return parsed;
+            return null;
+        }
+        if (value is bool b) return b;
+        return bool.TryParse(value.ToString(), out var parsedValue) ? parsedValue : null;
+    }
+
+    private string ReadPreconfigString(string key)
+    {
+        if (!_preconfig.TryGetValue(key, out var value) || value == null)
+        {
+            return "";
+        }
+        if (value is JsonElement element)
+        {
+            return element.ValueKind == JsonValueKind.String ? element.GetString() ?? "" : element.ToString();
+        }
+        return value.ToString() ?? "";
+    }
+
+    private string WriteEnrollParamsFile(
         InstallRequest request,
         EndpointConfig endpoint,
         string effectiveProxyUrl,
@@ -1591,6 +1621,14 @@ public partial class MainWindow : Window
             ["keep_offline_queue"] = ShouldKeepOfflineQueue(request, normalizedMode),
             ["keep_evidence_cache"] = ShouldKeepEvidenceCache(request, normalizedMode),
             ["strict_health_check"] = request.StrictHealthCheck,
+            ["http2_enabled"] = request.Http2Enabled ?? ReadPreconfigBool("http2Enabled"),
+            ["http2_require"] = request.Http2Require ?? ReadPreconfigBool("http2Require"),
+            ["control_stream_enabled"] = request.ControlStreamEnabled ?? ReadPreconfigBool("controlStreamEnabled"),
+            ["long_poll_fallback"] = request.LongPollFallback ?? ReadPreconfigBool("longPollFallback"),
+            ["report_events_v2_enabled"] = request.ReportEventsV2Enabled ?? ReadPreconfigBool("reportEventsV2Enabled"),
+            ["data_plane_encoding"] = FirstNonEmpty(request.DataPlaneEncoding, ReadPreconfigString("dataPlaneEncoding")),
+            ["data_plane_compression"] = FirstNonEmpty(request.DataPlaneCompression, ReadPreconfigString("dataPlaneCompression")),
+            ["control_profile_id"] = FirstNonEmpty(request.ControlProfileId, ReadPreconfigString("controlProfileId")),
             ["health_report"] = Path.Combine(uiLogDir, "agent-diagnostics", "install_health_report.json")
         };
 
@@ -2474,6 +2512,14 @@ public sealed class InstallRequest
     public bool KeepEvidenceCache { get; set; }
     public bool StrictHealthCheck { get; set; }
     public bool AutoOpenEndpoint { get; set; }
+    public bool? Http2Enabled { get; set; }
+    public bool? Http2Require { get; set; }
+    public bool? ControlStreamEnabled { get; set; }
+    public bool? LongPollFallback { get; set; }
+    public bool? ReportEventsV2Enabled { get; set; }
+    public string DataPlaneEncoding { get; set; } = "";
+    public string DataPlaneCompression { get; set; } = "";
+    public string ControlProfileId { get; set; } = "";
 }
 
 public sealed class InstallSummary

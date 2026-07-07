@@ -78,6 +78,13 @@ max_per_hour         = 20
 trigger_on_p0        = true
 collect_process_tree = true
 
+[health_monitor]
+enabled              = true
+profile              = "basic"
+interval_s           = 60
+expires_at_unix_ms   = 0
+request_id           = "bootstrap-runtime"
+
 # 外置取证采集器(深度取证)——经环境变量配置,由 windows_service_install.ps1 在安装时写入机器级 env。
 # agent 走 getenv 读取,此处仅为部署说明(改这些值请改服务 env,不是改本 toml):
 #   EDR_FORENSIC_COLLECTOR=1                 启用外置采集(否则仅 in-process 兜底)
