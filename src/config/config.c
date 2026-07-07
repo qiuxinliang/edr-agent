@@ -1843,7 +1843,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.shellcode_packets_per_sec = 2000u;
   cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
 
-  cfg->health_monitor.enabled = false;
+  cfg->health_monitor.enabled = true;
   snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
   cfg->health_monitor.interval_s = 60u;
   cfg->health_monitor.expires_at_unix_ms = 0u;

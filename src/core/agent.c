@@ -1434,7 +1434,7 @@ static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_n
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns);
-static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns);
+static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns, int force);
 
 static int edr_agent_collection_enabled(const EdrConfig *cfg) {
   if (!cfg) {
@@ -1510,7 +1510,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ATTACK_SURFACE, edr_agent_poll_attack_surface(agent));
         edr_agent_poll_heartbeat(&last_heartbeat_ns);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ENGINE_HEALTH,
-                             edr_agent_poll_engine_health(agent, &last_health_ns));
+                             edr_agent_poll_engine_health(agent, &last_health_ns, last_health_ns == 0u));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
         /* 取证异步生命周期收割:velo 完成→velo→builtin 两段/上传/唯一终态上报;取消由此统一 kill。
@@ -1659,7 +1659,7 @@ static void edr_agent_poll_probe_json(char *out, size_t cap) {
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_COMMAND_DELIVERY].calls);
 }
 
-static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns) {
+static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns, int force) {
   if (!agent || !last_health_ns || !edr_ingest_http_configured()) {
     return;
   }
@@ -1683,7 +1683,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
     }
   }
   uint64_t now = edr_monotonic_ns();
-  if (now - *last_health_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!force && now - *last_health_ns < (uint64_t)interval * 1000000000ULL) {
     return;
   }
   *last_health_ns = now;
@@ -1965,7 +1965,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)ch.ordinary_network_dropped,
         (unsigned long long)ch.metadata_dropped);
     if (n_basic > 0 && (size_t)n_basic < sizeof(body_basic)) {
-      (void)edr_ingest_http_post_engine_health_json(body_basic);
+      int health_rc = edr_ingest_http_post_engine_health_json(body_basic);
+      fprintf(stderr, "[engine-health] post %s profile=basic http2_enabled=%d negotiated=%s protocol=%s\n",
+              health_rc == 0 ? "ok" : "failed", http_rt.http2_enabled ? 1 : 0,
+              http_rt.http2_negotiated ? "true" : "false",
+              http_negotiated_protocol[0] ? http_negotiated_protocol : "unknown");
+    } else {
+      fprintf(stderr, "[engine-health] skipped: payload too large or formatting failed profile=basic\n");
     }
     return;
   }
@@ -2442,7 +2448,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.webshell_detector.max_file_size_mb, agent->cfg.webshell_detector.scan_threads,
       "", evidence_json, corr_health_json);
   if (n > 0 && (size_t)n < sizeof(body)) {
-    (void)edr_ingest_http_post_engine_health_json(body);
+    int health_rc = edr_ingest_http_post_engine_health_json(body);
+    fprintf(stderr, "[engine-health] post %s profile=diagnostic http2_enabled=%d negotiated=%s protocol=%s\n",
+            health_rc == 0 ? "ok" : "failed", http_rt.http2_enabled ? 1 : 0,
+            http_rt.http2_negotiated ? "true" : "false",
+            http_negotiated_protocol[0] ? http_negotiated_protocol : "unknown");
+  } else {
+    fprintf(stderr, "[engine-health] skipped: payload too large or formatting failed profile=diagnostic\n");
   }
 }
 
