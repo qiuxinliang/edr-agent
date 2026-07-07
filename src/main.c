@@ -24,6 +24,7 @@
 #include "edr/net_fanout_detector.h"
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
+#include "edr/preprocess.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -580,7 +581,9 @@ static int edr_agent_run_main(const char *config) {
             "[preprocess] wire_events=%lu wire_bytes=%zu batches=%lu "
             "batch_bytes=%zu batch_lz4=%lu batch_timeout_flushes=%llu "
             "bus_hw80=%llu bus_dropped=%llu dedup_drops=%llu rate_drops=%llu "
-            "queue_pending=%llu\n",
+            "sampling_pct=%u sampling_kept=%llu sampling_dropped=%llu "
+            "queue_pending=%llu queue_full=%lu queue_full_persisted=%lu "
+            "queue_full_sampled=%lu queue_full_dropped=%lu\n",
             edr_transport_wire_events_count(), edr_transport_wire_bytes_count(),
             edr_transport_batch_count(), edr_transport_batch_bytes_count(),
             edr_transport_batch_lz4_count(),
@@ -590,7 +593,12 @@ static int edr_agent_run_main(const char *config) {
             (unsigned long long)edr_event_bus_dropped_total(
                 edr_agent_event_bus(agent)),
             (unsigned long long)dd, (unsigned long long)rr,
-            (unsigned long long)edr_storage_queue_pending_count());
+            edr_preprocess_sampling_pct(),
+            (unsigned long long)edr_preprocess_sampling_kept_count(),
+            (unsigned long long)edr_preprocess_sampling_dropped_count(),
+            (unsigned long long)edr_storage_queue_pending_count(),
+            edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
+            edr_transport_queue_full_sampled_count(), edr_transport_queue_full_dropped_count());
     fprintf(stderr,
             "[command] handled=%lu unknown=%lu rejected=%lu exec_ok=%lu exec_fail=%lu\n",
             edr_command_handled_count(), edr_command_unknown_count(),

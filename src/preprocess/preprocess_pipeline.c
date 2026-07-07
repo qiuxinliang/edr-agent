@@ -56,6 +56,9 @@ static volatile int s_stop_preprocess;
 static int s_preprocess_active;
 
 static EdrEventBus *s_bus;
+static unsigned s_telemetry_sampling_pct = 100u;
+static uint64_t s_sampling_dropped;
+static uint64_t s_sampling_kept;
 
 /** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 gRPC endpoint_id 一致） */
 static char s_cfg_endpoint_id[128];
@@ -95,6 +98,94 @@ static void apply_agent_ids_to_record(EdrBehaviorRecord *br) {
     copy_trunc(br->endpoint_id, sizeof(br->endpoint_id), s_cfg_endpoint_id);
   }
 }
+
+static void sync_sampling_from_cfg(const EdrConfig *cfg) {
+  unsigned pct = 100u;
+  if (cfg) {
+    pct = cfg->platform.telemetry_sampling_pct;
+  }
+  if (pct > 100u) {
+    pct = 100u;
+  }
+  s_telemetry_sampling_pct = pct;
+}
+
+static uint32_t sampling_hash_bytes(uint32_t h, const void *data, size_t len) {
+  const unsigned char *p = (const unsigned char *)data;
+  for (size_t i = 0; i < len; i++) {
+    h ^= (uint32_t)p[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+static uint32_t sampling_hash_cstr(uint32_t h, const char *s) {
+  return s && s[0] ? sampling_hash_bytes(h, s, strlen(s)) : h;
+}
+
+static uint32_t edr_preprocess_sampling_hash_record(const EdrBehaviorRecord *br) {
+  uint32_t h = 2166136261u;
+  if (!br) {
+    return h;
+  }
+  h = sampling_hash_bytes(h, &br->type, sizeof(br->type));
+  h = sampling_hash_bytes(h, &br->pid, sizeof(br->pid));
+  h = sampling_hash_bytes(h, &br->event_time_ns, sizeof(br->event_time_ns));
+  h = sampling_hash_cstr(h, br->endpoint_id);
+  h = sampling_hash_cstr(h, br->process_name);
+  h = sampling_hash_cstr(h, br->cmdline);
+  h = sampling_hash_cstr(h, br->exe_path);
+  h = sampling_hash_cstr(h, br->file_path);
+  h = sampling_hash_cstr(h, br->dns_query);
+  h = sampling_hash_cstr(h, br->net_dst);
+  h = sampling_hash_bytes(h, &br->net_dport, sizeof(br->net_dport));
+  return h;
+}
+
+static int edr_preprocess_sampling_exempt(const EdrBehaviorRecord *br) {
+  if (!br) {
+    return 0;
+  }
+  if (br->priority == 0u) {
+    return 1;
+  }
+  switch (br->type) {
+  case EDR_EVENT_PROCESS_INJECT:
+  case EDR_EVENT_THREAD_CREATE_REMOTE:
+  case EDR_EVENT_PROTOCOL_SHELLCODE:
+  case EDR_EVENT_WEBSHELL_DETECTED:
+  case EDR_EVENT_PMFE_SCAN_RESULT:
+  case EDR_EVENT_BEHAVIOR_ONNX_ALERT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int edr_preprocess_sampling_allow(const EdrBehaviorRecord *br) {
+  unsigned pct = s_telemetry_sampling_pct;
+  if (!br) {
+    return 0;
+  }
+  if (pct >= 100u || edr_preprocess_sampling_exempt(br)) {
+    s_sampling_kept++;
+    return 1;
+  }
+  if (pct == 0u) {
+    s_sampling_dropped++;
+    return 0;
+  }
+  if ((edr_preprocess_sampling_hash_record(br) % 100u) < pct) {
+    s_sampling_kept++;
+    return 1;
+  }
+  s_sampling_dropped++;
+  return 0;
+}
+
+uint64_t edr_preprocess_sampling_dropped_count(void) { return s_sampling_dropped; }
+uint64_t edr_preprocess_sampling_kept_count(void) { return s_sampling_kept; }
+uint32_t edr_preprocess_sampling_pct(void) { return s_telemetry_sampling_pct; }
 
 static int p0_direct_emit_enabled(void) {
   const char *v = getenv("EDR_P0_DIRECT_EMIT");
@@ -367,6 +458,9 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (!edr_local_evidence_cache_is_candidate(&br)) {
     return;
   }
+  if (!edr_preprocess_sampling_allow(&br)) {
+    return;
+  }
   emit_behavior_record(&br);
 }
 
@@ -448,6 +542,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   edr_dedup_configure(cfg->preprocessing.dedup_window_s,
                       cfg->preprocessing.high_freq_threshold);
   edr_emit_rules_configure(cfg);
+  sync_sampling_from_cfg(cfg);
   log_p0_runtime_state();
   edr_dedup_init();
   edr_pt_cache_init();
@@ -480,6 +575,7 @@ void edr_preprocess_apply_config(const EdrConfig *cfg) {
   }
   edr_dedup_configure(cfg->preprocessing.dedup_window_s, cfg->preprocessing.high_freq_threshold);
   edr_emit_rules_configure(cfg);
+  sync_sampling_from_cfg(cfg);
   sync_agent_ids_from_cfg(cfg);
 }
 

@@ -164,6 +164,21 @@ static long audit_long_field(const char *line, const char *key, long defv) {
   return end != p ? v : defv;
 }
 
+static int env_truthy(const char *key) {
+  const char *v = getenv(key);
+  return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
+static void audit_copy_optional(const char *line, const char *key, const char *out_key,
+                                char *buf, size_t cap) {
+  char val[PATH_MAX];
+  copy_between_quotes(line, key, val, sizeof(val));
+  if (val[0]) {
+    size_t used = strlen(buf);
+    (void)snprintf(buf + used, used < cap ? cap - used : 0u, "%s=%s\n", out_key, val);
+  }
+}
+
 static const LinuxAuditSyscallMap *audit_lookup_syscall(const char *line) {
   char name[64];
   copy_between_quotes(line, "syscall=", name, sizeof(name));
@@ -197,21 +212,45 @@ static const char *lookup_dir(int wd) {
   return "";
 }
 
-static EdrEventType map_inotify_mask(uint32_t mask) {
+static uint32_t edr_linux_inotify_default_mask(void) {
+  uint32_t mask = IN_CREATE | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO |
+                  IN_DELETE | IN_DELETE_SELF | IN_ATTRIB;
+  const char *v = getenv("EDR_INOTIFY_INCLUDE_MODIFY");
+  if (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) {
+    mask |= IN_MODIFY;
+  }
+  if ((v = getenv("EDR_INOTIFY_VERBOSE_ACCESS")) != NULL &&
+      (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) {
+    mask |= IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE;
+  }
+  return mask;
+}
+
+static int edr_linux_map_inotify_mask(uint32_t mask, EdrEventType *out_type) {
+  if (!out_type) {
+    return 0;
+  }
   if ((mask & (IN_DELETE | IN_DELETE_SELF)) != 0u) {
-    return EDR_EVENT_FILE_DELETE;
+    *out_type = EDR_EVENT_FILE_DELETE;
+    return 1;
   }
   if ((mask & IN_CREATE) != 0u) {
-    return EDR_EVENT_FILE_CREATE;
+    *out_type = EDR_EVENT_FILE_CREATE;
+    return 1;
   }
   if ((mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0u) {
-    return EDR_EVENT_FILE_RENAME;
+    *out_type = EDR_EVENT_FILE_RENAME;
+    return 1;
   }
-  if ((mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB)) != 0u) {
-    return EDR_EVENT_FILE_WRITE;
+  if ((mask & IN_ATTRIB) != 0u) {
+    *out_type = EDR_EVENT_FILE_PERMISSION_CHANGE;
+    return 1;
   }
-  /* IN_OPEN / IN_ACCESS 等仍上报为写侧活动，便于观测 */
-  return EDR_EVENT_FILE_WRITE;
+  if ((mask & (IN_CLOSE_WRITE | IN_MODIFY)) != 0u) {
+    *out_type = EDR_EVENT_FILE_WRITE;
+    return 1;
+  }
+  return 0;
 }
 
 static int build_etw1_payload(uint8_t *out, size_t cap, const char *fullpath) {
@@ -230,7 +269,9 @@ static void push_inotify_event(uint32_t mask, const char *fullpath) {
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = edr_realtime_ns();
-  slot.type = map_inotify_mask(mask);
+  if (!edr_linux_map_inotify_mask(mask, &slot.type)) {
+    return;
+  }
   slot.consumed = false;
   slot.priority = 1;
   int plen = build_etw1_payload(slot.data, EDR_MAX_EVENT_PAYLOAD, fullpath);
@@ -251,10 +292,13 @@ static void push_audit_event(const char *line) {
   if (!m) {
     return;
   }
-  char comm[128], exe[PATH_MAX], auid[64];
+  char comm[128], exe[PATH_MAX], auid[64], uid[64], gid[64], ses[64];
   copy_between_quotes(line, "comm=", comm, sizeof(comm));
   copy_between_quotes(line, "exe=", exe, sizeof(exe));
   copy_between_quotes(line, "auid=", auid, sizeof(auid));
+  copy_between_quotes(line, "uid=", uid, sizeof(uid));
+  copy_between_quotes(line, "gid=", gid, sizeof(gid));
+  copy_between_quotes(line, "ses=", ses, sizeof(ses));
   long pid = audit_long_field(line, "pid=", 0);
   long ppid = audit_long_field(line, "ppid=", 0);
   EdrEventSlot slot;
@@ -264,12 +308,24 @@ static void push_audit_event(const char *line) {
   slot.priority = 0;
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=auditd\nsensor=auditd\nsyscall=%s\npid=%ld\nppid=%ld\nimg=%s\nprocess=%s\nauid=%s\nraw=%.900s\n",
-                   m->name, pid, ppid, exe[0] ? exe : "-", comm[0] ? comm : "-", auid[0] ? auid : "-", line);
+                   "ETW1\nprov=auditd\nsensor=auditd\nsyscall=%s\npid=%ld\nppid=%ld\nimg=%s\nprocess=%s\nauid=%s\nuid=%s\ngid=%s\nsession=%s\n",
+                   m->name, pid, ppid, exe[0] ? exe : "-", comm[0] ? comm : "-", auid[0] ? auid : "-",
+                   uid[0] ? uid : "-", gid[0] ? gid : "-", ses[0] ? ses : "-");
   if (n <= 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return;
   }
-  slot.size = (uint32_t)n;
+  audit_copy_optional(line, "cwd=", "cwd", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "name=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "addr=", "dst", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "family=", "family", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "success=", "success", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "exit=", "exit", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  if (env_truthy("EDR_LINUX_INCLUDE_RAW_AUDIT")) {
+    size_t used = strlen((char *)slot.data);
+    (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
+                   "raw=%.900s\n", line);
+  }
+  slot.size = (uint32_t)strlen((char *)slot.data);
   s_health.auditd_events++;
   s_health.security_audit_visible = 1;
   if (m->event_type == EDR_EVENT_PROCESS_CREATE) {
@@ -319,12 +375,24 @@ static void push_ebpf_trace_event(const char *line) {
   slot.timestamp_ns = edr_realtime_ns();
   slot.type = type;
   slot.priority = 0;
+  long pid = audit_long_field(line, "pid=", 0);
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=ebpf\nsensor=ebpf\nsyscall=%s\npid=0\nraw=%.1100s\n", op, line);
+                   "ETW1\nprov=ebpf\nsensor=ebpf\nsyscall=%s\npid=%ld\n", op, pid);
   if (n <= 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return;
   }
-  slot.size = (uint32_t)n;
+  audit_copy_optional(line, "comm=", "process", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "exe=", "img", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "file=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "path=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "dst=", "dst", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "dport=", "dport", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  if (env_truthy("EDR_LINUX_INCLUDE_RAW_EBPF")) {
+    size_t used = strlen((char *)slot.data);
+    (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
+                   "raw=%.1100s\n", line);
+  }
+  slot.size = (uint32_t)strlen((char *)slot.data);
   s_health.ebpf_events++;
   if (!edr_event_bus_try_push(s_bus, &slot)) {
     s_health.collector_dropped++;
@@ -378,7 +446,7 @@ static int add_watches(int ifd) {
       fprintf(stderr, "[collector_linux] skipping non-directory or inaccessible path: %s\n", tok);
       continue;
     }
-    uint32_t mask = IN_ALL_EVENTS;
+    uint32_t mask = edr_linux_inotify_default_mask();
     int wd = inotify_add_watch(ifd, tok, mask);
     if (wd < 0) {
       fprintf(stderr, "[collector_linux] inotify_add_watch failed %s: %s\n", tok, strerror(errno));

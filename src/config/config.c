@@ -1734,15 +1734,15 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->agent.tenant_id, sizeof(cfg->agent.tenant_id), "%s", "tenant_default");
 
   cfg->collection.etw_enabled = true;
-  cfg->collection.etw_dns_client_provider = true;
+  cfg->collection.etw_dns_client_provider = false;
   cfg->collection.etw_powershell_provider = true;
   cfg->collection.etw_amsi_provider = true;
-  cfg->collection.etw_schannel_provider = true;
+  cfg->collection.etw_schannel_provider = false;
   cfg->collection.etw_security_audit_provider = true;
   cfg->collection.etw_wmi_provider = true;
-  cfg->collection.etw_tcpip_provider = true;
-  cfg->collection.etw_firewall_provider = true;
-  cfg->collection.ebpf_enabled = true;
+  cfg->collection.etw_tcpip_provider = false;
+  cfg->collection.etw_firewall_provider = false;
+  cfg->collection.ebpf_enabled = false;
   cfg->collection.auditd_enabled = false;
   snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;

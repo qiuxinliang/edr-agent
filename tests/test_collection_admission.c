@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 
+void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
+  (void)ev;
+}
+
 #if defined(_WIN32)
 #include <stdlib.h>
 static void set_env_value(const char *name, const char *value) {
