@@ -804,6 +804,23 @@ static void corr_build_subject_json(const CorrRule *rule, const CorrStateSlot *s
   }
 }
 
+static float corr_alert_score(const CorrRule *rule, const CorrStateSlot *s) {
+  if (!rule) {
+    return 0.7f;
+  }
+  if (strcmp(rule->id, "R-CORR-RANSOM-001") == 0) {
+    uint32_t threshold = rule->th_threshold ? rule->th_threshold : 40u;
+    if (s && s->n_distinct >= threshold * 3u) {
+      return 0.90f;
+    }
+    if (s && s->n_distinct >= threshold * 2u) {
+      return 0.84f;
+    }
+    return 0.76f;
+  }
+  return rule->severity >= 4 ? 0.9f : (rule->severity == 3 ? 0.8f : 0.7f);
+}
+
 static void corr_emit(const CorrRule *rule, CorrStateSlot *s, uint32_t pid,
                       const char *process_name) {
   AVEBehaviorAlert a;
@@ -823,7 +840,7 @@ static void corr_emit(const CorrRule *rule, CorrStateSlot *s, uint32_t pid,
   if (process_name && process_name[0]) {
     snprintf(a.process_name, sizeof(a.process_name), "%s", process_name);
   }
-  a.anomaly_score = rule->severity >= 4 ? 0.9f : (rule->severity == 3 ? 0.8f : 0.7f);
+  a.anomaly_score = corr_alert_score(rule, s);
   a.needs_l2_review = false;
   a.skip_ai_analysis = false;
   a.timestamp_ns = s->last_seen_ns;

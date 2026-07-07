@@ -248,14 +248,41 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
            policy_esc, forensics);
 }
 
+static int bp_str_eq_ci(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
 static int bp_path_has_ransom_ext(const char *path) {
   if (!path || !path[0]) {
     return 0;
   }
   const char *exts[] = {".locked", ".lockbit", ".encrypted", ".crypt", ".crypted", ".conti", ".ryuk",
                         ".blackcat", ".akira", ".8base", ".mallox", ".medusa", NULL};
+  const char *base = path;
+  const char *dot = NULL;
+  for (const char *p = path; *p; ++p) {
+    if (*p == '\\' || *p == '/') {
+      base = p + 1;
+      dot = NULL;
+    } else if (*p == '.') {
+      dot = p;
+    }
+  }
+  if (!dot || dot == base || dot[1] == '\0') {
+    return 0;
+  }
   for (const char **p = exts; *p; ++p) {
-    if (bp_str_has_ci(path, *p)) {
+    if (bp_str_eq_ci(dot, *p)) {
       return 1;
     }
   }
@@ -271,10 +298,10 @@ static float bp_ransom_counter_score(const EdrPidHistory *sl, const AVEBehaviorE
     if (sl->file_write_count >= 200u) s += 0.40f;
     else if (sl->file_write_count >= 80u) s += 0.25f;
     else if (sl->file_write_count >= 30u) s += 0.12f;
-    if (bp_path_has_ransom_ext(e->target_path)) s += 0.35f;
+    if (bp_path_has_ransom_ext(e->target_path)) s += 0.18f;
   }
   if ((e->behavior_flags & AVE_BEH_SHADOW_COPY_DELETE) || e->shadow_copy_delete) {
-    s += 0.35f;
+    s += 0.25f;
   }
   if (s > 1.f) s = 1.f;
   return s;

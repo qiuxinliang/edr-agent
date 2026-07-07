@@ -265,9 +265,18 @@ static int has_credential_dump_indicator(const EdrBehaviorRecord *r) {
 static int has_ransom_recovery_tamper_indicator(const EdrBehaviorRecord *r) {
   const char *s = r->cmdline[0] ? r->cmdline : r->script_snippet;
   const char *n = r->process_name[0] ? r->process_name : base_name(r->exe_path);
-  return has_ci(n, "vssadmin.exe") || has_ci(n, "wbadmin.exe") || has_ci(n, "bcdedit.exe") ||
-         has_ci(n, "wevtutil.exe") || has_ci(s, "delete shadows") || has_ci(s, "shadowcopy delete") ||
-         has_ci(s, "recoveryenabled no") || has_ci(s, "delete catalog") || has_ci(s, "clear-log");
+  int vss_delete = has_ci(n, "vssadmin.exe") && has_ci(s, "delete") && has_ci(s, "shadows");
+  int wmic_shadow_delete = has_ci(s, "wmic") && has_ci(s, "shadowcopy") && has_ci(s, "delete");
+  int wbadmin_delete = has_ci(n, "wbadmin.exe") && has_ci(s, "delete") &&
+                       (has_ci(s, "catalog") || has_ci(s, "backup") || has_ci(s, "systemstatebackup"));
+  int bcdedit_recovery = has_ci(n, "bcdedit.exe") &&
+                         ((has_ci(s, "recoveryenabled") && has_ci(s, " no")) ||
+                          (has_ci(s, "bootstatuspolicy") && has_ci(s, "ignoreallfailures")));
+  int wevtutil_clear = has_ci(n, "wevtutil.exe") &&
+                       (has_ci(s, " cl ") || has_ci(s, " clear-log") || has_ci(s, "clearlog"));
+  return vss_delete || wmic_shadow_delete || wbadmin_delete || bcdedit_recovery || wevtutil_clear ||
+         has_ci(s, "shadowcopy delete") || has_ci(s, "delete shadows") || has_ci(s, "recoveryenabled no") ||
+         has_ci(s, "delete catalog") || has_ci(s, "clear-log");
 }
 
 static int has_ransom_note_indicator(const EdrBehaviorRecord *r) {
@@ -512,11 +521,22 @@ static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
     entropy_delta = detail_number(s, "file_entropy_delta", -1.0);
   }
   int recovery = has_ransom_recovery_tamper_indicator(r);
-  return has_ci(s, "ransom_counter=1") || has_ci(s, "mass_rename=1") || has_ci(s, "extension_burst=1") ||
-         has_ci(s, "rename_burst=1") || has_ci(s, "shadow_delete=1") ||
-         has_ci(s, "shadowcopy_delete=1") || file_rate >= 80.0 || ext_burst >= 20.0 ||
-         dir_burst >= 4.0 || entropy_delta >= 1.5 || (ext_changed && high_content_entropy) ||
-         (recovery && (file_rate >= 20.0 || ext_burst >= 8.0 || dir_burst >= 2.0));
+  int mass = has_ci(s, "mass_rename=1") || has_ci(s, "rename_burst=1") || file_rate >= 120.0 ||
+             (file_rate >= 80.0 && (ext_burst >= 8.0 || dir_burst >= 2.0));
+  int extension = has_ci(s, "extension_burst=1") || ext_burst >= 20.0 || ext_changed;
+  int entropy = high_content_entropy || entropy_delta >= 1.5;
+  int spread = dir_burst >= 4.0;
+  int counter = has_ci(s, "ransom_counter=1");
+  int shadow = has_ci(s, "shadow_delete=1") || has_ci(s, "shadowcopy_delete=1") || recovery;
+  if (ext_changed && high_content_entropy) {
+    return 1;
+  }
+  if (recovery && (file_rate >= 20.0 || ext_burst >= 8.0 || dir_burst >= 2.0)) {
+    return 1;
+  }
+  return (mass && (extension || entropy || spread || shadow || counter)) ||
+         (extension && entropy && (spread || file_rate >= 20.0 || counter)) ||
+         (shadow && (mass || extension || entropy || spread || counter));
 }
 
 static int has_webshell_semantic_indicator(const EdrBehaviorRecord *r) {

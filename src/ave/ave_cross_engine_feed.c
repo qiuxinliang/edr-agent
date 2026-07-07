@@ -73,11 +73,42 @@ static float script_score_from_record(const EdrBehaviorRecord *br) {
   return s > 1.f ? 1.f : s;
 }
 
+static int ace_str_eq_ci(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
 static int path_has_ransom_ext(const char *path) {
   const char *exts[] = {".locked", ".lockbit", ".encrypted", ".crypt", ".crypted", ".conti", ".ryuk",
                         ".blackcat", ".akira", ".8base", ".mallox", ".medusa", NULL};
-  for (const char **p = exts; path && *p; ++p) {
-    if (ace_str_has_ci(path, *p)) {
+  const char *base;
+  const char *dot = NULL;
+  if (!path || !path[0]) {
+    return 0;
+  }
+  base = path;
+  for (const char *p = path; *p; ++p) {
+    if (*p == '\\' || *p == '/') {
+      base = p + 1;
+      dot = NULL;
+    } else if (*p == '.') {
+      dot = p;
+    }
+  }
+  if (!dot || dot == base || dot[1] == '\0') {
+    return 0;
+  }
+  for (const char **p = exts; *p; ++p) {
+    if (ace_str_eq_ci(dot, *p)) {
       return 1;
     }
   }
@@ -277,9 +308,8 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   }
   float script_score = script_score_from_record(br);
   int ransom_ext = path_has_ransom_ext(br->file_path);
-  int shadow_delete = ace_str_has_ci(br->cmdline, "vssadmin delete shadows") ||
-                      ace_str_has_ci(br->cmdline, "wmic shadowcopy delete") ||
-                      ace_str_has_ci(br->cmdline, "delete shadows");
+  int shadow_delete = (ace_str_has_ci(br->cmdline, "vssadmin") && ace_str_has_ci(br->cmdline, "delete") && ace_str_has_ci(br->cmdline, "shadows")) ||
+                      (ace_str_has_ci(br->cmdline, "wmic") && ace_str_has_ci(br->cmdline, "shadowcopy") && ace_str_has_ci(br->cmdline, "delete"));
   int cert_anom = br->cert_revoked_ancestor ? 1 : 0;
   AVEEventType avt;
   if (!ave_event_type_from_record(br->type, &avt)) {
@@ -304,7 +334,8 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   ev.amsi_content_present = ace_str_has_ci(br->script_snippet, "amsi") || ace_str_has_ci(br->powershell_script_block, "amsi");
   ev.suspicious_extension_burst = ransom_ext ? 1u : 0u;
   ev.shadow_copy_delete = shadow_delete ? 1u : 0u;
-  ev.ransom_counter_score = (float)((ransom_ext ? 0.45 : 0.0) + (shadow_delete ? 0.45 : 0.0));
+  ev.ransom_counter_score = (float)((ransom_ext ? 0.18 : 0.0) + (shadow_delete ? 0.25 : 0.0));
+  if (ransom_ext && shadow_delete) ev.ransom_counter_score += 0.20f;
   if (ev.ransom_counter_score > 1.f) ev.ransom_counter_score = 1.f;
   ev.timestamp_ns = br->event_time_ns;
   if (br->priority <= 255u) {

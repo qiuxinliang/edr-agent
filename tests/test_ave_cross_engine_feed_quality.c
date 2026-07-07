@@ -78,6 +78,24 @@ static void test_accepts_enriched_file_signal(void) {
   assert(g_last_event.event_type == AVE_EVT_FILE_WRITE);
   assert(strstr(g_last_event.target_path, "note.locked") != NULL);
   assert(g_last_event.suspicious_extension_burst == 1u);
+  assert(g_last_event.ransom_counter_score > 0.17f && g_last_event.ransom_counter_score < 0.19f);
+}
+
+static void test_ransom_ext_requires_final_extension(void) {
+  EdrBehaviorRecord r;
+  edr_behavior_record_init(&r);
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.pid = 5002u;
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "backup.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path), "%s", "C:\\Tools\\backup.exe");
+  snprintf(r.file_path, sizeof(r.file_path), "%s", "C:\\Users\\test\\Documents\\encrypted_notes.txt");
+  snprintf(r.file_op, sizeof(r.file_op), "%s", "write");
+
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1);
+  assert(g_last_event.suspicious_extension_burst == 0u);
+  assert(g_last_event.ransom_counter_score == 0.f);
 }
 
 int main(void) {
@@ -85,6 +103,7 @@ int main(void) {
   test_accepts_enriched_process_create();
   test_rejects_file_without_process_identity();
   test_accepts_enriched_file_signal();
+  test_ransom_ext_requires_final_extension();
   puts("ave_cross_engine_feed_quality ok");
   return 0;
 }
