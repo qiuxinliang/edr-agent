@@ -12,6 +12,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -1048,6 +1050,7 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
     _exit(127);
   }
 
+  (void)setpgid(pid, pid);
   g_collector_pid = pid;
   g_running = 1;
   snprintf(g_detail, sizeof(g_detail), "collector pid=%d started", (int)pid);
@@ -1082,9 +1085,23 @@ int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
   return 0;
 }
 
+static void dc_child_prepare_limits(void) {
+  (void)setpgid(0, 0);
+#ifdef PRIO_PROCESS
+  (void)setpriority(PRIO_PROCESS, 0, 10);
+#endif
+}
+
+static void dc_kill_process_group(pid_t pid) {
+  if (pid <= 0) return;
+  if (kill(-pid, SIGKILL) != 0) {
+    (void)kill(pid, SIGKILL);
+  }
+}
+
 void edr_deep_collector_kill(void) {
   if (g_collector_pid && g_running) {
-    kill(g_collector_pid, SIGKILL);
+    dc_kill_process_group(g_collector_pid);
     waitpid(g_collector_pid, NULL, 0);
   }
   g_collector_pid = 0;
@@ -1125,6 +1142,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     return EDR_DC_ERR_SPAWN;
   }
   if (pid == 0) {
+    dc_child_prepare_limits();
     /* child:组装 argv(不含 --upload-url),透传 extra_args(空格分词) */
     int efd = open(errpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (efd >= 0) {
@@ -1155,6 +1173,8 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     _exit(127);
   }
 
+  (void)setpgid(pid, pid);
+
   /* parent:带超时等待 */
   uint32_t waited_ms = 0;
   const uint32_t step_ms = 100;
@@ -1176,7 +1196,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
       return EDR_DC_ERR_CRASH;
     }
     if (waited_ms >= to * 1000u) {
-      kill(pid, SIGKILL);
+      dc_kill_process_group(pid);
       waitpid(pid, NULL, 0);
       if (out_detail) snprintf(out_detail, detail_cap, "collector timeout after %us", to);
       (void)remove(errpath);
@@ -1223,6 +1243,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     return EDR_DC_ERR_SPAWN;
   }
   if (pid == 0) {
+    dc_child_prepare_limits();
     char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
@@ -1242,6 +1263,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     execv(binpath, argv);
     _exit(127);
   }
+  (void)setpgid(pid, pid);
   g_collector_pid = pid;
   g_running = 1;
   snprintf(g_detail, sizeof(g_detail), "collector pid=%d started(async)", (int)pid);
