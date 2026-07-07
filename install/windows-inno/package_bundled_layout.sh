@@ -49,19 +49,33 @@ else
 fi
 shopt -s nullglob
 DLL_COUNT=0
+BUNDLE_ONNX_RUNTIME="${EDR_BUNDLE_ONNX_RUNTIME:-0}"
+DLL_DENY_REGEX="${EDR_BUNDLE_DLL_DENY_REGEX:-(^|/)(onnxruntime.*|.*\\.(pdb|ilk|exp|lib|xml))$}"
 for f in "$STAGE_DIR"/*.dll; do
+  name="$(basename "$f")"
+  if [[ "$BUNDLE_ONNX_RUNTIME" != "1" && "$name" =~ ^onnxruntime.*\.dll$ ]]; then
+    echo "Info: skip large optional ONNX Runtime DLL from standard package: $name (set EDR_BUNDLE_ONNX_RUNTIME=1 to include)." >&2
+    continue
+  fi
+  if [[ "$name" =~ $DLL_DENY_REGEX ]]; then
+    echo "Info: skip denied runtime file: $name" >&2
+    continue
+  fi
   cp -a "$f" "$OUT_DIR/"
   DLL_COUNT=$((DLL_COUNT + 1))
 done
 shopt -u nullglob
 if [[ "$DLL_COUNT" -lt 1 ]]; then
-  echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start." >&2
+  echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start if FDSensor.exe is dynamically linked." >&2
 fi
 
-# models: recursive (onnx, pca_*.npy, etc.)
+# models: whitelist production-ready compact model artifacts only.
 if [[ -d "$EDR_AGENT_DIR/models" ]]; then
-  cp -a "$EDR_AGENT_DIR/models/." "$OUT_DIR/models/"
-  find "$OUT_DIR/models" -type f -name 'behavior.onnx' -delete 2>/dev/null || true
+  shopt -s nullglob
+  for f in "$EDR_AGENT_DIR/models"/README* "$EDR_AGENT_DIR/models"/pca_*.npy "$EDR_AGENT_DIR/models"/static.onnx "$EDR_AGENT_DIR/models"/static_quant*.onnx; do
+    [[ -f "$f" ]] && cp -a "$f" "$OUT_DIR/models/"
+  done
+  shopt -u nullglob
 fi
 
 PREP_TOML="$REPO_ROOT/edr-backend/platform/config/agent_preprocess_rules_v1.toml"

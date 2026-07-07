@@ -76,6 +76,7 @@ public partial class MainWindow : Window
         _setupPath = ResolveSetupPath();
         AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_resolved path={_setupPath} exists={File.Exists(_setupPath)} elevated={IsElevated()} arch={DescribeArchitectureForHeader()}");
         _preconfig = LoadPreconfig();
+        CleanupStaleEnrollParams(ResolveSetupUiLogDirectory(), uiLog);
         AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] preconfig_loaded keys={_preconfig.Count}");
         await Dispatcher.Yield(DispatcherPriority.Background);
         try
@@ -1745,6 +1746,7 @@ public partial class MainWindow : Window
         var path = Path.Combine(uiLogDir, "enroll-params-" + Guid.NewGuid().ToString("N") + ".json");
         var json = JsonSerializer.Serialize(data, new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = false });
         File.WriteAllText(path, json, new UTF8Encoding(false));
+        ProtectSensitiveFile(path);
         return path;
     }
 
@@ -1935,6 +1937,72 @@ public partial class MainWindow : Window
         using var identity = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(identity);
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static void CleanupStaleEnrollParams(string rootDir, string uiLog)
+    {
+        try
+        {
+            if (!Directory.Exists(rootDir))
+            {
+                return;
+            }
+            foreach (var file in Directory.GetFiles(rootDir, "enroll-params-*.json", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    File.Delete(file);
+                    AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] stale_enroll_params_deleted path={file}");
+                }
+                catch (Exception ex)
+                {
+                    AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] stale_enroll_params_delete_failed path={file} error={ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] stale_enroll_params_cleanup_failed error={ex.Message}");
+        }
+    }
+
+    private static void ProtectSensitiveFile(string path)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "icacls.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            psi.ArgumentList.Add(path);
+            psi.ArgumentList.Add("/inheritance:r");
+            psi.ArgumentList.Add("/grant:r");
+            psi.ArgumentList.Add("*S-1-5-18:F");
+            psi.ArgumentList.Add("/grant:r");
+            psi.ArgumentList.Add("*S-1-5-32-544:F");
+            var currentUserSid = WindowsIdentity.GetCurrent().User?.Value ?? "";
+            if (!string.IsNullOrWhiteSpace(currentUserSid))
+            {
+                psi.ArgumentList.Add("/grant:r");
+                psi.ArgumentList.Add("*" + currentUserSid + ":F");
+            }
+            psi.ArgumentList.Add("/C");
+            psi.ArgumentList.Add("/Q");
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(5000);
+        }
+        catch
+        {
+            // Best-effort protection; the elevated setup deletes the params file after handoff.
+        }
     }
 
     private static string ResolveSetupUiLogDirectory()

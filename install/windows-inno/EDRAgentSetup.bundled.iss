@@ -72,9 +72,9 @@ Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fa
 [Files]
 Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Excludes: "behavior.onnx,static_fp32.onnx,*.training.*,*.tmp"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "{#EDR_AGENT_PREPROCESS_TOML}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion

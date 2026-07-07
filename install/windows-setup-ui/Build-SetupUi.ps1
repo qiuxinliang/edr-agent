@@ -21,7 +21,9 @@ param(
     [string] $PreconfigJson = "",
     [string] $BootstrapTrustPublicKeyPem = "",
     [ValidateSet("", "self-contained", "compact", "framework-dependent")]
-    [string] $RuntimeMode = ""
+    [string] $RuntimeMode = "",
+    [ValidateSet("", "win-x64", "win-arm64")]
+    [string] $RuntimeIdentifier = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +53,32 @@ function Get-FileSha256Hex([string] $Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Resolve-SignToolPath {
+    $signtool = [string]$env:EDR_SIGNTOOL_PATH
+    if (-not $signtool) {
+        $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+        if ($cmd) {
+            $signtool = $cmd.Source
+        }
+    }
+    return $signtool
+}
+
+function Assert-AuthenticodeSignature([string] $Path) {
+    $signtool = Resolve-SignToolPath
+    if ($signtool) {
+        & $signtool verify /pa /all $Path
+        if ($LASTEXITCODE -ne 0) {
+            throw "signtool verify failed for $Path"
+        }
+        return
+    }
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($sig.Status -ne 'Valid') {
+        throw "Authenticode signature verification failed for $Path: $($sig.Status) $($sig.StatusMessage)"
+    }
+}
+
 function Invoke-SignIfConfigured([string] $Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Cannot sign missing file: $Path"
@@ -63,6 +91,7 @@ function Invoke-SignIfConfigured([string] $Path) {
         if ($LASTEXITCODE -ne 0) {
             throw "custom signing command failed for $Path"
         }
+        Assert-AuthenticodeSignature $Path
         return $true
     }
 
@@ -70,13 +99,7 @@ function Invoke-SignIfConfigured([string] $Path) {
     if (-not $certB64) {
         return $false
     }
-    $signtool = [string]$env:EDR_SIGNTOOL_PATH
-    if (-not $signtool) {
-        $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
-        if ($cmd) {
-            $signtool = $cmd.Source
-        }
-    }
+    $signtool = Resolve-SignToolPath
     if (-not $signtool) {
         throw "EDR_WINDOWS_SIGNING_CERT_BASE64 is set but signtool.exe was not found"
     }
@@ -95,6 +118,7 @@ function Invoke-SignIfConfigured([string] $Path) {
         if ($LASTEXITCODE -ne 0) {
             throw "signtool failed for $Path"
         }
+        Assert-AuthenticodeSignature $Path
         return $true
     }
     finally {
@@ -164,16 +188,20 @@ function Write-SetupUiSizeReport([string] $PublishDir, [string] $OutputZipPath) 
 }
 
 $targetFramework = "net8.0-windows10.0.17763.0"
-$runtime = "win-x64"
+$runtime = if ($RuntimeIdentifier) { $RuntimeIdentifier } elseif ($env:EDR_SETUP_UI_RUNTIME_IDENTIFIER) { [string]$env:EDR_SETUP_UI_RUNTIME_IDENTIFIER } else { "win-x64" }
+if ($runtime -notin @("win-x64", "win-arm64")) {
+    throw "Invalid RuntimeIdentifier: $runtime"
+}
+$platformDir = if ($runtime -eq "win-arm64") { "arm64" } else { "x64" }
 $publishDirCandidates = @(
     (Join-Path $scriptDir "bin\$Configuration\$targetFramework\$runtime\publish"),
-    (Join-Path $scriptDir "bin\x64\$Configuration\$targetFramework\$runtime\publish")
+    (Join-Path $scriptDir "bin\$platformDir\$Configuration\$targetFramework\$runtime\publish")
 )
 foreach ($candidate in $publishDirCandidates) {
     Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$resolvedRuntimeMode = if ($RuntimeMode) { $RuntimeMode } elseif ($env:EDR_SETUP_UI_RUNTIME_MODE) { [string]$env:EDR_SETUP_UI_RUNTIME_MODE } else { "self-contained" }
+$resolvedRuntimeMode = if ($RuntimeMode) { $RuntimeMode } elseif ($env:EDR_SETUP_UI_RUNTIME_MODE) { [string]$env:EDR_SETUP_UI_RUNTIME_MODE } else { "compact" }
 if ($resolvedRuntimeMode -notin @("self-contained", "compact", "framework-dependent")) {
     throw "Invalid RuntimeMode: $resolvedRuntimeMode"
 }
@@ -185,7 +213,7 @@ Write-Host "Setup UI runtime mode: $resolvedRuntimeMode (self-contained=$selfCon
 $publishArgs = @(
     $project,
     "-c", $Configuration,
-    "-r", "win-x64",
+    "-r", $runtime,
     "--self-contained", $selfContained,
     "-p:Version=$AppVersion",
     "-p:PublishSingleFile=false",
@@ -261,6 +289,7 @@ $manifest = @{
     name = "FDSecurity Setup UI"
     version = $AppVersion
     runtime_mode = $resolvedRuntimeMode
+    runtime_identifier = $runtime
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"
     setup_exe_sha256 = Get-FileSha256Hex $bundledSetupExe
@@ -277,7 +306,7 @@ $manifest = @{
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $publishDir "setup-ui-manifest.json") -Encoding UTF8
 
 if (-not $OutputZip) {
-    $OutputZip = Join-Path $scriptDir "Output\FDSecuritySetupUI-win-x64.zip"
+    $OutputZip = Join-Path $scriptDir ("Output\FDSecuritySetupUI-{0}-{1}.zip" -f $runtime, $resolvedRuntimeMode)
 }
 $outParent = Split-Path -Parent $OutputZip
 if ($outParent) {

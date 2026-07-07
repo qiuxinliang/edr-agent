@@ -60,6 +60,16 @@ function Set-AgentTomlAcl {
   & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
 }
 
+function Get-FDWindowsArch {
+  $raw = if ($env:EDR_BUNDLE_ARCH) { $env:EDR_BUNDLE_ARCH } elseif ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  $v = if ($raw) { $raw.Trim().ToLowerInvariant() } else { "" }
+  switch ($v) {
+    "arm64" { return "arm64" }
+    "aarch64" { return "arm64" }
+    default { return "amd64" }
+  }
+}
+
 function Read-AgentTomlString {
   param([string]$Path, [string]$Key)
   if (-not (Test-Path -LiteralPath $Path)) { return "" }
@@ -302,8 +312,9 @@ try {
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_AUTOFETCH", "1", "Machine")
   $restBase = (Read-AgentTomlString -Path $cfg -Key "rest_base_url").TrimEnd("/")
   if ($restBase) {
-    [Environment]::SetEnvironmentVariable("EDR_FORENSIC_ADAPTER_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", "Machine")
-    [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=amd64", "Machine")
+    $arch = Get-FDWindowsArch
+    [Environment]::SetEnvironmentVariable("EDR_FORENSIC_ADAPTER_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=$arch", "Machine")
+    [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=$arch", "Machine")
   }
 } catch {
   Write-Warning "设置取证采集器环境变量失败(非致命): $_"
