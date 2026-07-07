@@ -70,7 +70,10 @@ Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 ;   非 bundled 安装包**不内置 velociraptor.exe**(体积大):autorun 根据 agent.toml 的
 ;   rest_base_url 写入 adapter/velociraptor 两个 manifest 地址,由 agent 按需下载/刷新。
 ;   缺失不致命→agent 三层兜底(velo→builtin→in-process)。
-Source: "..\..\build\Release\collector\*"; DestDir: "{app}\collector"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\build\Release\collector\forensic_collector.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\build\Release\collector\forensic_collector_builtin.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\build\Release\collector\*.LICENSE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\build\Release\collector\*.SOURCE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""

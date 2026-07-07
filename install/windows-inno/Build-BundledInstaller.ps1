@@ -15,7 +15,8 @@ param(
     [string] $BinDir = "",
     [string] $AppVersion = "",
     [string] $CollectorArch = "",
-    [switch] $SkipForensicCollectorBuild
+    [switch] $SkipForensicCollectorBuild,
+    [switch] $AllowPowerShellFallback
 )
 if (-not $Inno) {
     $pf86 = [Environment]::GetFolderPath("ProgramFilesX86")
@@ -115,7 +116,12 @@ function Build-AndStageForensicCollector {
 
 $workerExe = Join-Path $BinDir "FDSecurityInstallerWorker.exe"
 if (-not (Test-Path -LiteralPath $workerExe)) {
-    Write-Warning "FDSecurityInstallerWorker.exe not found in $BinDir. The setup can still compile, but runtime stages will fall back to PowerShell."
+    $message = "FDSecurityInstallerWorker.exe not found in $BinDir. Release installers require the native worker; pass -AllowPowerShellFallback only for development/lab builds."
+    if ($AllowPowerShellFallback) {
+        Write-Warning $message
+    } else {
+        throw $message
+    }
 }
 
 $versionFile = Join-Path $BinDir "VERSION"

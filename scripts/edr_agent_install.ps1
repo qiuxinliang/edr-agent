@@ -1775,10 +1775,10 @@ function Merge-EnrollIntoAgentTomlExample {
   if ($merged -notmatch '(?m)^\s*\[health_monitor\]\s*$') {
     $merged += "`n[health_monitor]`n"
     $merged += "enabled              = true`n"
-    $merged += "profile              = \"basic\"`n"
+    $merged += 'profile              = "basic"' + "`n"
     $merged += "interval_s           = 60`n"
     $merged += "expires_at_unix_ms   = 0`n"
-    $merged += "request_id           = \"bootstrap-runtime\"`n"
+    $merged += 'request_id           = "bootstrap-runtime"' + "`n"
   }
   return $merged
 }

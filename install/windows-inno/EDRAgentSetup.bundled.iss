@@ -89,11 +89,13 @@ Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "bundle_extra\README_OPTIONAL_DBS.txt"; DestDir: "{app}\data"; DestName: "README_OPTIONAL_DBS.txt"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "bundle_extra\BUNDLE_README.txt"; DestDir: "{app}"; DestName: "BUNDLE_README.txt"; Flags: ignoreversion skipifsourcedoesntexist
-; 取证采集器:forensic_collector.exe(Go 适配器/主) + forensic_collector_builtin.exe(C 兜底) +
-; velociraptor.exe(官方 v0.77.1,未修改,外部调用) + AGPL 许可/源指引。装到 {app}\collector\
-; = C:\Program Files\FDSecurity\collector\,与 agent 默认查找路径及服务 env 对齐。
+; 取证采集器白名单: standard 包只允许小型 adapter/builtin 与许可说明进入安装包。
+; velociraptor.exe 体积大，必须由 offline/full 构建显式写入 staging 后用独立 Inno 定义追加，standard 包不递归打包 collector\*。
 ; 缺失不致命(skipifsourcedoesntexist):无 collector 时 agent 自动回退 in-process 取证。
-Source: "{#EDR_BIN_DIR}\collector\*"; DestDir: "{app}\collector"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\collector\forensic_collector.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\collector\forensic_collector_builtin.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\collector\*.LICENSE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\collector\*.SOURCE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""

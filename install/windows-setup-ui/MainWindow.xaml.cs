@@ -1,6 +1,7 @@
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
@@ -25,6 +26,9 @@ public partial class MainWindow : Window
     private const int WmNcLButtonDown = 0x00A1;
     private const int HtCaption = 2;
     private const int ProbeTimeoutSeconds = 15;
+    private const int WebView2InitTimeoutSeconds = 30;
+    private const int InstallProcessTimeoutMinutes = 15;
+    private const int InstallNoProgressTimeoutMinutes = 3;
     private const int CheckProgressPauseMs = 70;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _baseDir = AppContext.BaseDirectory;
@@ -81,10 +85,10 @@ public partial class MainWindow : Window
             EnsureWebView2WpfDependencies();
             _browser = new WebView2();
             BrowserHost.Children.Add(_browser);
-            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_env_begin");
-            var env = await CreateWebViewEnvironmentAsync();
-            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ensure_begin");
-            await Browser.EnsureCoreWebView2Async(env);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_env_begin timeout_s={WebView2InitTimeoutSeconds}");
+            var env = await WithTimeout(CreateWebViewEnvironmentAsync(), TimeSpan.FromSeconds(WebView2InitTimeoutSeconds), "WebView2 环境初始化超时");
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ensure_begin timeout_s={WebView2InitTimeoutSeconds}");
+            await WithTimeout(Browser.EnsureCoreWebView2Async(env), TimeSpan.FromSeconds(WebView2InitTimeoutSeconds), "WebView2 Runtime 初始化超时");
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ready version={Browser.CoreWebView2?.Environment.BrowserVersionString ?? ""}");
         }
         catch (Exception ex)
@@ -210,6 +214,26 @@ public partial class MainWindow : Window
     }
 
     private WebView2 Browser => _browser ?? throw new InvalidOperationException("WebView2 is not initialized");
+
+    private static async Task<T> WithTimeout<T>(Task<T> task, TimeSpan timeout, string message)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(timeout));
+        if (completed != task)
+        {
+            throw new TimeoutException(message);
+        }
+        return await task;
+    }
+
+    private static async Task WithTimeout(Task task, TimeSpan timeout, string message)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(timeout));
+        if (completed != task)
+        {
+            throw new TimeoutException(message);
+        }
+        await task;
+    }
 
     private static async Task<CoreWebView2Environment> CreateWebViewEnvironmentAsync()
     {
@@ -431,11 +455,34 @@ public partial class MainWindow : Window
             await PostAsync("installProgress", new { stage = "执行安装器", progress = 22, detail = "正在停止旧进程、清理运行缓存并写入配置" });
 
             var progress = 22;
+            var installStartedAt = DateTimeOffset.Now;
+            var lastProgressAt = installStartedAt;
+            var lastProgressKey = string.Empty;
             while (!proc.HasExited)
             {
                 await Task.Delay(1200);
                 progress = Math.Min(86, progress + 4);
                 var stageState = ReadInstallStageState(installPath, handoffDir);
+                var progressKey = stageState != null
+                    ? $"stage:{stageState.Stage}:{stageState.DisplayDetail}:{stageState.DiagnosticDetail}"
+                    : $"state:{DescribeCurrentInstallState(installPath, innoLog, handoffDir)}:{GetInstallProgressStamp(installPath, innoLog, handoffDir)}";
+                if (!string.Equals(progressKey, lastProgressKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    lastProgressKey = progressKey;
+                    lastProgressAt = DateTimeOffset.Now;
+                }
+                var elapsed = DateTimeOffset.Now - installStartedAt;
+                var idle = DateTimeOffset.Now - lastProgressAt;
+                if (elapsed > TimeSpan.FromMinutes(InstallProcessTimeoutMinutes) || idle > TimeSpan.FromMinutes(InstallNoProgressTimeoutMinutes))
+                {
+                    var reason = elapsed > TimeSpan.FromMinutes(InstallProcessTimeoutMinutes)
+                        ? $"安装器运行超过 {InstallProcessTimeoutMinutes} 分钟"
+                        : $"安装阶段超过 {InstallNoProgressTimeoutMinutes} 分钟无进展";
+                    AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_timeout reason={reason} pid={proc.Id} elapsed_s={elapsed.TotalSeconds:F0} idle_s={idle.TotalSeconds:F0}");
+                    TryTerminateInstallProcess(proc, uiLog);
+                    var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
+                    throw new TimeoutException($"{reason}{detail}");
+                }
                 if (stageState != null)
                 {
                     progress = Math.Max(progress, stageState.Progress);
@@ -666,6 +713,68 @@ public partial class MainWindow : Window
             return "安装器正在复制文件并执行部署阶段";
         }
         return "等待安装器返回状态";
+    }
+
+    private static string GetInstallProgressStamp(string installPath, string innoLog, string handoffDir)
+    {
+        var candidates = new[]
+        {
+            innoLog,
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "install-stage.log"),
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "enroll-output.log"),
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "install_health_report.json"),
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "install_runtime_verify.json"),
+            Path.Combine(installPath, "agent.toml")
+        };
+        var latest = 0L;
+        foreach (var path in candidates)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    latest = Math.Max(latest, File.GetLastWriteTimeUtc(path).Ticks);
+                }
+            }
+            catch
+            {
+                // Best-effort progress signal only.
+            }
+        }
+        return latest.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static void TryTerminateInstallProcess(Process proc, string uiLog)
+    {
+        try
+        {
+            if (!proc.HasExited)
+            {
+                proc.Kill(entireProcessTree: true);
+                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_killed pid={proc.Id}");
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_kill_failed pid={proc.Id} error={ex.Message}");
+        }
+    }
+
+    private static bool AllowUnsafeSetupIntegritySkip()
+    {
+        var raw = Environment.GetEnvironmentVariable("FDSECURITY_SETUP_UI_ALLOW_UNSIGNED_SETUP") ?? "";
+        return raw.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+               raw.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+               raw.Equals("yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static CheckItem SetupIntegrityFailure(string message)
+    {
+        if (AllowUnsafeSetupIntegritySkip())
+        {
+            return CheckItem.Warn("完整性校验", message + "；已通过开发模式环境变量允许继续");
+        }
+        return CheckItem.Fail("完整性校验", message);
     }
 
     private static InstallStageState? ReadInstallStageState(string installPath, string handoffDir)
@@ -1019,7 +1128,7 @@ public partial class MainWindow : Window
         var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
         if (!File.Exists(manifest))
         {
-            return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，跳过安装器哈希校验"));
+            return CacheSetupIntegrity(SetupIntegrityFailure("缺少 setup-ui-manifest.json，无法校验安装器哈希"));
         }
         try
         {
@@ -1037,7 +1146,7 @@ public partial class MainWindow : Window
             expected = expected.Trim().ToLowerInvariant();
             if (expected == "")
             {
-                return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，跳过安装器哈希校验"));
+                return CacheSetupIntegrity(SetupIntegrityFailure("manifest 未记录 setup_exe_sha256，无法校验安装器哈希"));
             }
             if (!File.Exists(_setupPath))
             {
@@ -1050,7 +1159,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message));
+            return CacheSetupIntegrity(SetupIntegrityFailure("读取 manifest 失败：" + ex.Message));
         }
     }
 
@@ -1063,7 +1172,7 @@ public partial class MainWindow : Window
         var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
         if (!File.Exists(manifest))
         {
-            return CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，安装开始时跳过哈希校验");
+            return SetupIntegrityFailure("缺少 setup-ui-manifest.json，安装开始前无法校验哈希");
         }
         if (!File.Exists(_setupPath))
         {
@@ -1077,11 +1186,11 @@ public partial class MainWindow : Window
                               (root.TryGetProperty("setupExeSha256", out var camel) && !string.IsNullOrWhiteSpace(camel.GetString()));
             return hasExpected
                 ? CheckItem.Ok("完整性校验", "安装开始前执行 SHA256 校验")
-                : CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，安装开始时跳过哈希校验");
+                : SetupIntegrityFailure("manifest 未记录 setup_exe_sha256，安装开始前无法校验哈希");
         }
         catch (Exception ex)
         {
-            return CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message);
+            return SetupIntegrityFailure("读取 manifest 失败：" + ex.Message);
         }
     }
 

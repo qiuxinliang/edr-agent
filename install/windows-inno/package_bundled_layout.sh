@@ -140,6 +140,10 @@ COLLECTOR_OUT="$OUT_DIR/collector"
 mkdir -p "$COLLECTOR_OUT"
 GO_FC="${EDR_FORENSIC_COLLECTOR_BIN:-$EDR_AGENT_DIR/../forensic-collector/dist/win-${ARCH}/forensic_collector.exe}"
 VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}/${ARCH}"
+if [[ "$BUNDLE_VELO" != "1" && -f "$STAGE_DIR/collector/velociraptor.exe" ]]; then
+  echo "Error: standard installer staging contains collector/velociraptor.exe. Remove it or build an explicit offline package with EDR_BUNDLE_VELO=1." >&2
+  exit 1
+fi
 if [[ "${EDR_SKIP_FORENSIC_COLLECTOR_BUILD:-0}" != "1" && -d "$EDR_AGENT_DIR/../forensic-collector" ]]; then
   if command -v go >/dev/null 2>&1; then
     echo "==> [$ARCH] rebuilding Go forensic_collector.exe from current source"
