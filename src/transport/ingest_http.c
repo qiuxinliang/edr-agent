@@ -4092,19 +4092,31 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
                                 const char *body, size_t body_len, char *resp_body,
                                 size_t resp_body_cap, long timeout_s) {
   char url[1400];
+  char fail_resp[512];
+  char *out_body = resp_body;
+  size_t out_cap = resp_body_cap;
   size_t rb = strlen(s_rest);
   int rc;
+  if (!out_body || out_cap == 0u) {
+    fail_resp[0] = '\0';
+    out_body = fail_resp;
+    out_cap = sizeof(fail_resp);
+  }
   snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
-  rc = native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
+  rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
   if (rc == 0) {
     route_note_success();
     return 0;
   }
+  fprintf(stderr, "[ingest-http] request failed method=%s suffix=%s rc=%d err=%s resp=%.240s\n",
+          method ? method : "-", suffix ? suffix : "-", rc, s_last_error[0] ? s_last_error : "-",
+          out_body && out_body[0] ? out_body : "-");
   if (route_note_failure(s_last_error[0] ? s_last_error : "request_failed") &&
       method && strcmp(method, "GET") == 0) {
     rb = strlen(s_rest);
+    if (out_body && out_cap > 0u) out_body[0] = '\0';
     snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
-    rc = native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
+    rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
     if (rc == 0) {
       route_note_success();
     }

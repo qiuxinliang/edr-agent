@@ -4637,6 +4637,14 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   (void)retry_count;
   if (dup_rc == 1) {
     char detail[2600];
+    if (streq(t, "shell_open")) {
+      snprintf(detail, sizeof(detail),
+               "duplicate shell_open suppressed; live shell session was not reopened (previous_status=%s previous_exit=%d)",
+               dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code);
+      audit_both(id, "duplicate shell_open suppressed by local idempotency state");
+      soar_emit_ex(id, sm, EdrCmdExecFailed, 17, detail, "failed", NULL);
+      return;
+    }
     snprintf(detail, sizeof(detail), "duplicate command suppressed previous_status=%s previous_exit=%d previous_detail=%s",
              dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code,
              dup.detail[0] ? dup.detail : "");
