@@ -14,6 +14,7 @@ void edr_preprocess_stop(void);
 
 /** 运行中更新预处理参数（当前：去重/限流）；不涉及批次缓冲重建。 */
 void edr_preprocess_apply_config(const EdrConfig *cfg);
+void edr_preprocess_apply_sampling_pct(uint32_t pct);
 
 /** 拷贝当前缓存的 agent endpoint_id / tenant_id（供行为告警批次编码与 §12.4 对齐）。 */
 void edr_preprocess_copy_agent_ids(char *endpoint_id, size_t endpoint_cap, char *tenant_id, size_t tenant_cap);

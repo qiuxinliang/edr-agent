@@ -2,6 +2,7 @@
 
 #include "edr/command.h"
 #include "edr/event_batch.h"
+#include "edr/preprocess.h"
 #include "edr/transport_v2.h"
 
 #include <ctype.h>
@@ -11,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (void)pct; }
+#endif
 
 #ifdef _WIN32
 #include <io.h>
@@ -87,6 +92,7 @@ static char s_data_plane_encoding[32] = "protobuf";
 static char s_data_plane_compression[32] = "identity";
 static EdrRequestSigningConfig s_request_signing;
 static unsigned s_control_sampling_pct;
+static unsigned s_effective_sampling_pct;
 static int s_control_backpressure_enabled;
 static int s_http2_enabled_cfg = 0;
 static int s_http2_required_cfg;
@@ -203,6 +209,7 @@ static pthread_mutex_t s_ws_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int edr_ingest_http_refresh_route_profile(int force);
 static void http_conn_close_locked(void);
+static void apply_effective_preprocess_sampling(void);
 static int append_signature_headers(char *req, size_t cap, size_t used,
                                     const char *method, const char *path,
                                     const char *body, size_t body_len);
@@ -553,6 +560,30 @@ static unsigned long tls_handshake_limit_per_minute(void) {
 
 static void comm_open_circuit(const char *reason);
 
+static unsigned backpressure_sampling_cap_pct(void) {
+  return (unsigned)env_ul_clamped("EDR_BACKPRESSURE_SAMPLING_CAP", 25ul, 1ul, 100ul);
+}
+
+static void apply_effective_preprocess_sampling(void) {
+  unsigned requested = s_control_sampling_pct;
+  unsigned effective = requested;
+  if (requested > 100u) {
+    requested = 100u;
+  }
+  if (requested == 0u) {
+    requested = 1u;
+  }
+  effective = requested;
+  if (s_control_backpressure_enabled && s_circuit_open) {
+    unsigned cap = backpressure_sampling_cap_pct();
+    if (effective > cap) {
+      effective = cap;
+    }
+  }
+  s_effective_sampling_pct = effective;
+  edr_preprocess_apply_sampling_pct(effective);
+}
+
 static void budget_refresh_window(void) {
   int64_t minute = unix_ms_now() / 60000LL;
   if (minute != s_budget_window_minute) {
@@ -618,6 +649,7 @@ static void comm_open_circuit(const char *reason) {
   s_circuit_open = 1;
   s_circuit_until_ms = unix_ms_now() + (int64_t)sec * 1000LL;
   snprintf(s_circuit_reason, sizeof(s_circuit_reason), "%s", reason ? reason : "transport failures");
+  apply_effective_preprocess_sampling();
 }
 
 int edr_ingest_http_circuit_open(void) {
@@ -631,6 +663,7 @@ int edr_ingest_http_circuit_open(void) {
     s_circuit_until_ms = 0;
     s_circuit_reason[0] = '\0';
     s_consecutive_failures = 0;
+    apply_effective_preprocess_sampling();
     return 0;
   }
   return 1;
@@ -655,6 +688,7 @@ static void runtime_success(void) {
   s_circuit_open = 0;
   s_circuit_until_ms = 0;
   s_circuit_reason[0] = '\0';
+  apply_effective_preprocess_sampling();
 }
 
 static void runtime_failure(const char *msg) {
@@ -1063,7 +1097,9 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   snprintf(s_control_threshold, sizeof(s_control_threshold), "%s",
            env_str_default("EDR_TELEMETRY_PROFILE_THRESHOLD", "medium"));
   s_control_sampling_pct = (unsigned)env_ul_clamped("EDR_TELEMETRY_PROFILE_SAMPLING_PCT", 100ul, 1ul, 100ul);
+  s_effective_sampling_pct = s_control_sampling_pct;
   s_control_backpressure_enabled = env_bool_default("EDR_BACKPRESSURE_PUSH_PROFILE_THROTTLE", 1);
+  apply_effective_preprocess_sampling();
   s_control_zstd = env_bool_default("EDR_CONTROL_CAP_ZSTD", 0);
   s_http2_enabled_cfg = env_bool_default("EDR_DATA_PLANE_HTTP2", 0);
   s_http2_required_cfg = env_bool_default("EDR_HTTP2_REQUIRE", 0);
@@ -1146,6 +1182,7 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->long_poll_fallback = s_long_poll_fallback_cfg;
   out->report_events_v2_enabled = s_report_events_v2_enabled_cfg;
   out->zstd_requested = strcmp(s_data_plane_compression, "zstd") == 0 || s_control_zstd;
+  out->backpressure_enabled = s_control_backpressure_enabled;
 #ifdef EDR_HAVE_ZSTD
   out->zstd_available = 1;
 #else
@@ -1239,6 +1276,7 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   snprintf(out->telemetry_threshold, sizeof(out->telemetry_threshold), "%s",
            s_control_threshold[0] ? s_control_threshold : "medium");
   out->telemetry_sampling_pct = s_control_sampling_pct;
+  out->effective_sampling_pct = s_effective_sampling_pct;
   out->zstd_raw_bytes = s_zstd_raw_bytes;
   out->zstd_wire_bytes = s_zstd_wire_bytes;
   out->zstd_dict_bytes = s_zstd_dict_bytes;
@@ -1307,6 +1345,7 @@ void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *s
   s_control_hello_last_ms = unix_ms_now();
   edr_transport_v2_apply_profile(dict_ver, schema_ver, profile_id, h2, zstd, qos_dscp,
                                  s_control_sampling_pct, threshold, backpressure_enabled);
+  apply_effective_preprocess_sampling();
 }
 
 static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -4868,6 +4907,7 @@ static void stream_process_line(const char *line) {
     (void)json_get_string(line, "threshold", s_control_threshold, sizeof(s_control_threshold));
     (void)json_get_bool(line, "h2", &s_control_h2);
     (void)json_get_bool(line, "zstd", &s_control_zstd);
+    (void)json_get_bool(line, "backpressure_enabled", &s_control_backpressure_enabled);
     if (json_get_int64(line, "batch_events", &batch_events) == 0 ||
         json_get_int64(line, "flush_interval_s", &flush_s) == 0) {
       if (batch_events < 0) batch_events = 0;
@@ -4890,10 +4930,10 @@ static void stream_process_line(const char *line) {
       fprintf(stderr, "[ingest-stream] control stream verified endpoint=%s\n", s_endpoint);
     }
     s_control_hello_ok = 1;
-    edr_transport_v2_apply_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
-                                   s_control_h2, s_control_zstd, s_control_qos_dscp,
-                                   s_control_sampling_pct, s_control_threshold,
-                                   s_control_backpressure_enabled);
+    edr_ingest_http_apply_telemetry_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+                                            s_control_h2, s_control_zstd, s_control_qos_dscp,
+                                            s_control_sampling_pct, s_control_threshold,
+                                            s_control_backpressure_enabled);
     edr_transport_v2_on_control("server_hello");
   } else if (strstr(line, "\"type\":\"heartbeat\"")) {
     note_control_stream_heartbeat();
@@ -5965,6 +6005,7 @@ static int edr_ingest_http_control_hello_once(void) {
   (void)json_get_string(resp, "threshold", s_control_threshold, sizeof(s_control_threshold));
   (void)json_get_bool(resp, "h2", &s_control_h2);
   (void)json_get_bool(resp, "zstd", &s_control_zstd);
+  (void)json_get_bool(resp, "backpressure_enabled", &s_control_backpressure_enabled);
   {
     int64_t batch_events = 0;
     int64_t flush_s = 0;
@@ -5982,10 +6023,10 @@ static int edr_ingest_http_control_hello_once(void) {
       s_control_sampling_pct = (unsigned)sampling_pct;
     }
   }
-  edr_transport_v2_apply_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
-                                 s_control_h2, s_control_zstd, s_control_qos_dscp,
-                                 s_control_sampling_pct, s_control_threshold,
-                                 s_control_backpressure_enabled);
+  edr_ingest_http_apply_telemetry_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+                                          s_control_h2, s_control_zstd, s_control_qos_dscp,
+                                          s_control_sampling_pct, s_control_threshold,
+                                          s_control_backpressure_enabled);
   s_control_hello_ok = 1;
   rc = 0;
 done:

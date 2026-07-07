@@ -53,6 +53,7 @@ typedef struct {
   int long_poll_fallback;
   int report_events_v2_enabled;
   int zstd_requested;
+  int backpressure_enabled;
   int zstd_available;
   int zstd_dict_loaded;
   int http2_multiplex_enabled;
@@ -122,6 +123,7 @@ typedef struct {
   char qos_dscp[32];
   char telemetry_threshold[32];
   unsigned int telemetry_sampling_pct;
+  unsigned int effective_sampling_pct;
   uint64_t zstd_raw_bytes;
   uint64_t zstd_wire_bytes;
   uint64_t zstd_dict_bytes;

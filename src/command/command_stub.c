@@ -22,6 +22,7 @@
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
+#include "edr/preprocess.h"
 #include "edr/response.h"
 #include "edr/resource.h"
 #include "edr/transport_v2.h"
@@ -487,7 +488,9 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   (void)parse_json_string_field(pl, len, "profile_id", profile_id, sizeof(profile_id));
   (void)parse_json_string_field(pl, len, "qos_dscp", qos_dscp, sizeof(qos_dscp));
   (void)parse_json_string_field(pl, len, "threshold", threshold, sizeof(threshold));
-  (void)parse_json_int_field(pl, len, "batch_max_events", &batch_events);
+  if (parse_json_int_field(pl, len, "batch_events", &batch_events) != 0) {
+    (void)parse_json_int_field(pl, len, "batch_max_events", &batch_events);
+  }
   (void)parse_json_int_field(pl, len, "flush_interval_s", &flush_s);
   (void)parse_json_int_field(pl, len, "sampling_pct", &sampling_pct);
   (void)parse_json_bool_field(pl, len, "h2", &h2);

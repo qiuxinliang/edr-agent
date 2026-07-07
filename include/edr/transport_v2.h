@@ -42,6 +42,7 @@ typedef struct {
   int long_poll_fallback;
   int report_events_v2_enabled;
   int zstd_requested;
+  int backpressure_enabled;
   unsigned telemetry_sampling_pct;
   char data_plane_encoding[32];
   char data_plane_compression[32];
@@ -61,6 +62,7 @@ typedef struct {
   int long_poll_fallback;
   int report_events_v2_enabled;
   int zstd_requested;
+  int backpressure_enabled;
   unsigned telemetry_sampling_pct;
   unsigned long opened_streams;
   unsigned long send_ok;

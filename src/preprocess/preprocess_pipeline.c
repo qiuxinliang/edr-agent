@@ -183,6 +183,13 @@ static int edr_preprocess_sampling_allow(const EdrBehaviorRecord *br) {
   return 0;
 }
 
+void edr_preprocess_apply_sampling_pct(uint32_t pct) {
+  if (pct > 100u) {
+    pct = 100u;
+  }
+  s_telemetry_sampling_pct = pct;
+}
+
 uint64_t edr_preprocess_sampling_dropped_count(void) { return s_sampling_dropped; }
 uint64_t edr_preprocess_sampling_kept_count(void) { return s_sampling_kept; }
 uint32_t edr_preprocess_sampling_pct(void) { return s_telemetry_sampling_pct; }

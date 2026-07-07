@@ -2699,6 +2699,7 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
              remote->platform.telemetry_threshold);
     agent->cfg.platform.telemetry_sampling_pct = remote->platform.telemetry_sampling_pct;
     agent->cfg.platform.backpressure_enabled = remote->platform.backpressure_enabled;
+    edr_transport_v2_init_from_config(&agent->cfg);
     edr_ingest_http_configure_transport_options(
         agent->cfg.platform.http2_enabled ? 1 : 0,
         agent->cfg.platform.http2_require ? 1 : 0,
@@ -2717,7 +2718,6 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
         agent->cfg.platform.telemetry_sampling_pct,
         agent->cfg.platform.telemetry_threshold,
         agent->cfg.platform.backpressure_enabled ? 1 : 0);
-    edr_transport_v2_init_from_config(&agent->cfg);
   }
   if (edr_agent_toml_has_section(tmp, "ave")) {
     agent->cfg.ave.behavior_monitor_enabled = false;

@@ -62,6 +62,7 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
   s_cfg.control_stream_enabled = 1;
   s_cfg.long_poll_fallback = 1;
   s_cfg.report_events_v2_enabled = 1;
+  s_cfg.backpressure_enabled = 1;
   s_cfg.telemetry_sampling_pct = 100u;
   if (cfg) {
     s_cfg.h2_enabled = cfg->platform.http2_enabled ? 1 : 0;
@@ -69,6 +70,7 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
     s_cfg.control_stream_enabled = cfg->platform.control_stream_enabled ? 1 : 0;
     s_cfg.long_poll_fallback = cfg->platform.long_poll_fallback ? 1 : 0;
     s_cfg.report_events_v2_enabled = cfg->platform.report_events_v2_enabled ? 1 : 0;
+    s_cfg.backpressure_enabled = cfg->platform.backpressure_enabled ? 1 : 0;
     s_cfg.telemetry_sampling_pct = cfg->platform.telemetry_sampling_pct;
     tv2_copy(s_cfg.data_plane_encoding, sizeof(s_cfg.data_plane_encoding),
              cfg->platform.data_plane_encoding, "protobuf");
@@ -120,6 +122,7 @@ void edr_transport_v2_get_runtime(EdrTransportV2Runtime *out) {
   out->long_poll_fallback = s_cfg.long_poll_fallback;
   out->report_events_v2_enabled = s_cfg.report_events_v2_enabled;
   out->zstd_requested = s_cfg.zstd_requested;
+  out->backpressure_enabled = s_cfg.backpressure_enabled;
   out->telemetry_sampling_pct = s_cfg.telemetry_sampling_pct;
   tv2_copy(out->data_plane_encoding, sizeof(out->data_plane_encoding),
            s_cfg.data_plane_encoding, "protobuf");
@@ -138,7 +141,9 @@ void edr_transport_v2_apply_profile(const char *dict_ver, const char *schema_ver
                                     const char *profile_id, int h2, int zstd,
                                     const char *qos_dscp, unsigned sampling_pct,
                                     const char *threshold, int backpressure_enabled) {
-  (void)backpressure_enabled;
+  if (backpressure_enabled >= 0) {
+    s_cfg.backpressure_enabled = backpressure_enabled ? 1 : 0;
+  }
   if (dict_ver && dict_ver[0]) {
     tv2_copy(s_cfg.dict_ver, sizeof(s_cfg.dict_ver), dict_ver, NULL);
   }
