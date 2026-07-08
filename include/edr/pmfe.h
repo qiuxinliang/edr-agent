@@ -1,5 +1,5 @@
 /**
- * §21 PMFE — 进程内存取证引擎（调度 + 扫描线程 + VAD/maps 粗筛；Windows 含 §6 DNS ASCII 分块；扫描命中经事件总线→行为批次→gRPC）
+ * §21 PMFE — 进程内存取证引擎（调度 + 扫描线程 + VAD/maps 粗筛；Windows 含 §6 DNS ASCII 分块；扫描命中经事件总线→行为批次→HTTP ingest）
  *
  * **与行为管线（P2 T9）职责边界**：PMFE **工作线程**只产出扫描详情、调用 **`edr_pid_history_pmfe_ingest_scan_detail`**、
  * 并由 **`pmfe_try_emit_scan_result`** 推 **ETW1 槽**；**不写 `AVE_FeedEvent`**。预处理线程在 **`edr_behavior_from_slot`**
@@ -37,7 +37,7 @@ struct EdrConfig;
 struct EdrEventBus;
 
 /**
- * 绑定事件总线，使 PMFE 扫描完成后可将 **ETW1 形态** 事件送入预处理线程（与 ETW/Webshell 同源：`edr_event_batch_push` → gRPC）。
+ * 绑定事件总线，使 PMFE 扫描完成后可将 **ETW1 形态** 事件送入预处理线程（与 ETW/Webshell 同源：`edr_event_batch_push` → HTTP ingest）。
  * 须在 `edr_pmfe_init` 之前调用（通常传入 `edr_agent_event_bus(agent)`）。
  */
 void edr_pmfe_set_event_bus(struct EdrEventBus *bus);

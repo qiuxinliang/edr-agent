@@ -1,5 +1,5 @@
 /**
- * §6.2 EventBatch 本地聚合：长度前缀帧拼接，达阈值刷写；载荷前加 BAT1 头便于与 gRPC 对接。
+ * §6.2 EventBatch 本地聚合：长度前缀帧拼接，达阈值刷写；载荷前加 BAT1 头便于与 HTTP ingest 对接。
  */
 #ifndef EDR_EVENT_BATCH_H
 #define EDR_EVENT_BATCH_H

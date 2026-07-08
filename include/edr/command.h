@@ -1,7 +1,7 @@
 /**
  * §8 响应指令 — HTTPS control stream / long-poll 收到 CommandEnvelope 后转入此入口（隔离/杀进程/取证/PMFE/AVE/自保护状态等）。
  * 高危操作需 **`EDR_CMD_ENABLED=1`** / **`EDR_CMD_DANGEROUS=1`** 或配置 **`[command] allow_dangerous`**。
- * SOAR：编排字段见 `EdrSoarCommandMeta`；执行结果优先经 HTTPS ingest 回传，legacy gRPC 仅显式启用时 fallback。
+ * SOAR：编排字段见 `EdrSoarCommandMeta`；执行结果经 HTTPS ingest 回传。
  */
 #ifndef EDR_COMMAND_H
 #define EDR_COMMAND_H
@@ -31,7 +31,7 @@ void edr_isolate_auto_from_shellcode_alarm(void);
 /** 确诊勒索(ENCRYPTION_CONFIRMED)时本机自隔离;默认关,需 EDR_RANSOM_AUTO_ISOLATE=1 + 高危策略,每进程一次。 */
 void edr_isolate_auto_from_ransom_alarm(void);
 
-/** 与 ingest.proto CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由 gRPC 层写入） */
+/** 与 CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由控制面写入） */
 typedef struct EdrSoarCommandMeta {
   char soar_correlation_id[128];
   char playbook_run_id[96];
@@ -53,12 +53,30 @@ typedef enum EdrCommandExecutionStatus {
 } EdrCommandExecutionStatus;
 
 /**
- * 处理服务端下发的指令（来自 HTTPS control stream / long-poll；legacy gRPC Subscribe 仅兼容期使用）。
+ * 处理服务端下发的指令（来自 HTTPS control stream / long-poll）。
  * command_id / command_type 为 UTF-8 字符串；payload 可为空。
  * soar_meta 为 NULL 表示无非编排扩展（旧服务端或纯本地指令）。
  */
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta);
+
+/**
+ * 两阶段控制面入口：先验签/验 deadline/持久化 command_state + 本地执行 inbox。
+ * 返回 1 表示应继续执行；返回 0 表示已拒绝、已压制重复或已回放最终结果；
+ * 返回 -1 表示尚未可靠接收，HTTPS 控制面不得 ack。
+ */
+int edr_command_receive_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
+                                 size_t payload_len, const EdrSoarCommandMeta *soar_meta);
+
+/** 执行已经通过 edr_command_receive_envelope 持久化接收的命令。 */
+void edr_command_execute_received_envelope(const char *command_id, const char *command_type,
+                                           const uint8_t *payload, size_t payload_len,
+                                           const EdrSoarCommandMeta *soar_meta);
+
+/** 执行已持久化的命令，并在最终结果写入后删除本地执行 inbox。 */
+void edr_command_execute_persisted_envelope(const char *command_id, const char *command_type,
+                                            const uint8_t *payload, size_t payload_len,
+                                            const EdrSoarCommandMeta *soar_meta);
 
 /** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
 void edr_command_poll_reliable_delivery(void);

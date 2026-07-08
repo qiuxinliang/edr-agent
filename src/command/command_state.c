@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <io.h>
 #else
+#include <dirent.h>
 #include <sys/file.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -34,8 +35,23 @@ static EdrCommandStateFileInfo s_collect_cache_info;
 static int s_collect_cache_pending_zero;
 static int64_t s_last_compact_check_ms;
 
+static long state_env_long_clamped(const char *name, long defv, long minv, long maxv);
+static void state_ensure_dir(const char *path);
+
 static int64_t state_now_ms(void) {
   return (int64_t)time(NULL) * 1000LL;
+}
+
+static int64_t command_running_ttl_ms(const EdrSoarCommandMeta *meta) {
+  long def_s = 10L * 60L;
+  if (meta && meta->deadline_ms > 0u) {
+    long deadline_s = (long)((meta->deadline_ms + 999u) / 1000u);
+    if (deadline_s > def_s) {
+      def_s = deadline_s;
+    }
+  }
+  long ttl_s = state_env_long_clamped("EDR_COMMAND_RUNNING_DUP_TTL_S", def_s, 30L, 24L * 60L * 60L);
+  return (int64_t)ttl_s * 1000LL;
 }
 
 static void state_ensure_parent_dir(const char *path);
@@ -214,6 +230,33 @@ static void state_ensure_parent_dir(const char *path) {
   (void)state_mkdir_one(tmp);
 }
 
+static void state_ensure_dir(const char *path) {
+  char tmp[1024];
+  if (!path || !path[0] || strlen(path) >= sizeof(tmp)) {
+    return;
+  }
+  snprintf(tmp, sizeof(tmp), "%s", path);
+  size_t len = strlen(tmp);
+  while (len > 1u && (tmp[len - 1u] == '/' || tmp[len - 1u] == '\\')) {
+    tmp[--len] = '\0';
+  }
+  for (char *p = tmp + 1; *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      char saved = *p;
+      *p = '\0';
+#ifdef _WIN32
+      if (!(strlen(tmp) == 2u && tmp[1] == ':')) {
+        (void)state_mkdir_one(tmp);
+      }
+#else
+      (void)state_mkdir_one(tmp);
+#endif
+      *p = saved;
+    }
+  }
+  (void)state_mkdir_one(tmp);
+}
+
 static void json_escape_to(char *dst, size_t cap, const char *s) {
   if (!dst || cap == 0u) {
     return;
@@ -285,6 +328,130 @@ static int parse_json_int_field_line(const char *line, const char *key, int defv
   return (int)strtol(p, NULL, 10);
 }
 
+static int64_t parse_json_int64_field_line(const char *line, const char *key, int64_t defv) {
+  if (!line || !key) {
+    return defv;
+  }
+  char pat[96];
+  snprintf(pat, sizeof(pat), "\"%s\":", key);
+  const char *p = strstr(line, pat);
+  if (!p) {
+    return defv;
+  }
+  p += strlen(pat);
+  while (*p && isspace((unsigned char)*p)) {
+    p++;
+  }
+  return strtoll(p, NULL, 10);
+}
+
+static char *parse_json_string_field_alloc(const char *line, const char *key) {
+  if (!line || !key) {
+    return NULL;
+  }
+  char pat[96];
+  snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+  const char *p = strstr(line, pat);
+  if (!p) {
+    return NULL;
+  }
+  p += strlen(pat);
+  char *out = (char *)malloc(strlen(p) + 1u);
+  if (!out) {
+    return NULL;
+  }
+  size_t o = 0;
+  while (*p) {
+    if (*p == '"' && (p == line || p[-1] != '\\')) {
+      break;
+    }
+    if (*p == '\\' && p[1]) {
+      p++;
+    }
+    out[o++] = *p++;
+  }
+  out[o] = '\0';
+  return out;
+}
+
+static int state_flush_file(FILE *f) {
+  if (!f) {
+    return -1;
+  }
+  if (fflush(f) != 0) {
+    return -1;
+  }
+#ifdef _WIN32
+  return _commit(_fileno(f));
+#else
+  return fsync(fileno(f));
+#endif
+}
+
+static char *hex_encode_alloc(const uint8_t *data, size_t len) {
+  static const char h[] = "0123456789abcdef";
+  if (len > ((size_t)-1 - 1u) / 2u) {
+    return NULL;
+  }
+  char *out = (char *)malloc(len * 2u + 1u);
+  if (!out) {
+    return NULL;
+  }
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = data ? data[i] : 0u;
+    out[i * 2u] = h[(c >> 4) & 0x0f];
+    out[i * 2u + 1u] = h[c & 0x0f];
+  }
+  out[len * 2u] = '\0';
+  return out;
+}
+
+static int hex_value(int c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+static int hex_decode_alloc(const char *hex, uint8_t **out, size_t *out_len) {
+  if (out) {
+    *out = NULL;
+  }
+  if (out_len) {
+    *out_len = 0u;
+  }
+  if (!hex || !out || !out_len) {
+    return -1;
+  }
+  size_t n = strlen(hex);
+  if ((n % 2u) != 0u) {
+    return -1;
+  }
+  size_t len = n / 2u;
+  uint8_t *buf = len ? (uint8_t *)malloc(len) : NULL;
+  if (len && !buf) {
+    return -1;
+  }
+  for (size_t i = 0; i < len; i++) {
+    int hi = hex_value((unsigned char)hex[i * 2u]);
+    int lo = hex_value((unsigned char)hex[i * 2u + 1u]);
+    if (hi < 0 || lo < 0) {
+      free(buf);
+      return -1;
+    }
+    buf[i] = (uint8_t)((hi << 4) | lo);
+  }
+  *out = buf;
+  *out_len = len;
+  return 0;
+}
+
 static int line_matches_key(const char *line, const char *key, const char *value) {
   if (!line || !key || !value || !value[0]) {
     return 0;
@@ -337,6 +504,326 @@ static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) 
   out->retry_count = parse_json_int_field_line(line, "retry_count", 0);
   out->final_record = parse_json_int_field_line(line, "final", 0);
   out->report_pending = parse_json_int_field_line(line, "report_pending", 0);
+  {
+    const char *p = strstr(line, "\"updated_unix_ms\"");
+    if (p) {
+      p = strchr(p, ':');
+      if (p) {
+        out->updated_unix_ms = strtoll(p + 1, NULL, 10);
+      }
+    }
+  }
+}
+
+static void command_inbox_default_dir(char *out, size_t cap) {
+  const char *p = getenv("EDR_COMMAND_INBOX_DIR");
+  if (p && p[0]) {
+    snprintf(out, cap, "%s", p);
+    return;
+  }
+#ifdef _WIN32
+  snprintf(out, cap, "%s", "C:\\Program Files\\FDSecurity\\state\\command_inbox");
+#else
+  snprintf(out, cap, "%s", "/tmp/edr_command_inbox");
+#endif
+}
+
+static void command_inbox_safe_name(const char *command_id, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  size_t o = 0;
+  const char *id = command_id && command_id[0] ? command_id : "missing_command_id";
+  for (; *id && o + 1u < cap; id++) {
+    unsigned char c = (unsigned char)*id;
+    if (isalnum(c) || c == '_' || c == '-' || c == '.') {
+      out[o++] = (char)c;
+    } else {
+      out[o++] = '_';
+    }
+  }
+  out[o] = '\0';
+}
+
+static int command_inbox_record_path(const char *command_id, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return -1;
+  }
+  char dir[1024];
+  char safe[128];
+  command_inbox_default_dir(dir, sizeof(dir));
+  command_inbox_safe_name(command_id, safe, sizeof(safe));
+  char sep = '/';
+#ifdef _WIN32
+  sep = '\\';
+#endif
+  size_t len = strlen(dir);
+  if (len > 0u && (dir[len - 1u] == '/' || dir[len - 1u] == '\\')) {
+    snprintf(out, cap, "%s%s.json", dir, safe);
+  } else {
+    snprintf(out, cap, "%s%c%s.json", dir, sep, safe);
+  }
+  return out[0] ? 0 : -1;
+}
+
+static int command_state_has_final(const char *command_id, const EdrSoarCommandMeta *meta) {
+  char path[1024];
+  state_default_path(path, sizeof(path));
+  FILE *lock = state_lock_acquire();
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    state_lock_release(lock);
+    return 0;
+  }
+  char idem_key[128];
+  state_idempotency_key(meta, idem_key, sizeof(idem_key));
+  int found = 0;
+  char line[8192];
+  while (fgets(line, sizeof(line), f)) {
+    if (!strstr(line, "\"final\":1")) {
+      continue;
+    }
+    int match = 0;
+    if (idem_key[0]) {
+      match = line_matches_key(line, "idempotency_key", idem_key);
+    } else if (command_id && command_id[0]) {
+      match = line_matches_key(line, "command_id", command_id);
+    }
+    if (match) {
+      found = 1;
+      break;
+    }
+  }
+  fclose(f);
+  state_lock_release(lock);
+  return found;
+}
+
+static int command_inbox_delete_path(const char *path) {
+  if (!path || !path[0]) {
+    return -1;
+  }
+#ifdef _WIN32
+  return DeleteFileA(path) ? 0 : -1;
+#else
+  return remove(path);
+#endif
+}
+
+int edr_command_state_store_inbox(const char *command_id, const char *command_type,
+                                  const uint8_t *payload, size_t payload_len,
+                                  const EdrSoarCommandMeta *meta) {
+  if (!command_id || !command_id[0] || (payload_len > 0u && !payload)) {
+    return -1;
+  }
+  char dir[1024];
+  char path[1200];
+  char tmp[1300];
+  command_inbox_default_dir(dir, sizeof(dir));
+  if (command_inbox_record_path(command_id, path, sizeof(path)) != 0) {
+    return -1;
+  }
+  char *hex = hex_encode_alloc(payload, payload_len);
+  if (!hex) {
+    return -1;
+  }
+  FILE *lock = state_lock_acquire();
+  if (!lock) {
+    free(hex);
+    return -1;
+  }
+  state_ensure_dir(dir);
+  snprintf(tmp, sizeof(tmp), "%s.tmp.%lld", path, (long long)state_now_ms());
+  FILE *f = fopen(tmp, "wb");
+  if (!f) {
+    state_lock_release(lock);
+    free(hex);
+    return -1;
+  }
+  EdrSoarCommandMeta empty;
+  memset(&empty, 0, sizeof(empty));
+  const EdrSoarCommandMeta *sm = meta ? meta : &empty;
+  char cid[300], ctype[180], scid[300], run[240], step[240], idem[1100], by[100];
+  json_escape_to(cid, sizeof(cid), command_id);
+  json_escape_to(ctype, sizeof(ctype), command_type ? command_type : "");
+  json_escape_to(scid, sizeof(scid), sm->soar_correlation_id);
+  json_escape_to(run, sizeof(run), sm->playbook_run_id);
+  json_escape_to(step, sizeof(step), sm->playbook_step_id);
+  json_escape_to(idem, sizeof(idem), sm->idempotency_key);
+  json_escape_to(by, sizeof(by), sm->initiated_by);
+  fprintf(f,
+          "{\"record\":\"command_inbox\",\"command_id\":%s,\"command_type\":%s,"
+          "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
+          "\"idempotency_key\":%s,\"issued_at_unix_ms\":%lld,\"deadline_ms\":%u,"
+          "\"initiated_by\":%s,\"received_unix_ms\":%lld,\"payload_hex\":\"",
+          cid, ctype, scid, run, step, idem, (long long)sm->issued_at_unix_ms,
+          (unsigned)sm->deadline_ms, by, (long long)state_now_ms());
+  fputs(hex, f);
+  fputs("\"}\n", f);
+  int ok = state_flush_file(f) == 0;
+  if (fclose(f) != 0) {
+    ok = 0;
+  }
+  if (!ok || state_replace_file(tmp, path) != 0) {
+    (void)command_inbox_delete_path(tmp);
+    state_lock_release(lock);
+    free(hex);
+    return -1;
+  }
+  state_lock_release(lock);
+  free(hex);
+  return 0;
+}
+
+static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out) {
+  if (!path || !out) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  struct stat st;
+  if (stat(path, &st) != 0 || st.st_size < 0) {
+    return -1;
+  }
+  long max_bytes = state_env_long_clamped("EDR_COMMAND_INBOX_MAX_BYTES",
+                                          16L * 1024L * 1024L,
+                                          1024L, 256L * 1024L * 1024L);
+  if (st.st_size > max_bytes) {
+    return -1;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return -1;
+  }
+  size_t n = (size_t)st.st_size;
+  char *buf = (char *)malloc(n + 1u);
+  if (!buf) {
+    fclose(f);
+    return -1;
+  }
+  size_t got = fread(buf, 1, n, f);
+  fclose(f);
+  buf[got] = '\0';
+  if (got == 0u) {
+    free(buf);
+    return -1;
+  }
+  parse_json_string_field_line(buf, "command_id", out->command_id, sizeof(out->command_id));
+  parse_json_string_field_line(buf, "command_type", out->command_type, sizeof(out->command_type));
+  parse_json_string_field_line(buf, "soar_correlation_id", out->meta.soar_correlation_id,
+                               sizeof(out->meta.soar_correlation_id));
+  parse_json_string_field_line(buf, "playbook_run_id", out->meta.playbook_run_id,
+                               sizeof(out->meta.playbook_run_id));
+  parse_json_string_field_line(buf, "playbook_step_id", out->meta.playbook_step_id,
+                               sizeof(out->meta.playbook_step_id));
+  parse_json_string_field_line(buf, "idempotency_key", out->meta.idempotency_key,
+                               sizeof(out->meta.idempotency_key));
+  parse_json_string_field_line(buf, "initiated_by", out->meta.initiated_by,
+                               sizeof(out->meta.initiated_by));
+  out->meta.issued_at_unix_ms = parse_json_int64_field_line(buf, "issued_at_unix_ms", 0);
+  int64_t deadline_ms = parse_json_int64_field_line(buf, "deadline_ms", 0);
+  if (deadline_ms > 0 && deadline_ms <= 0xffffffffLL) {
+    out->meta.deadline_ms = (uint32_t)deadline_ms;
+  }
+  out->received_unix_ms = parse_json_int64_field_line(buf, "received_unix_ms", 0);
+  char *payload_hex = parse_json_string_field_alloc(buf, "payload_hex");
+  free(buf);
+  if (!out->command_id[0] || !payload_hex) {
+    free(payload_hex);
+    return -1;
+  }
+  int rc = hex_decode_alloc(payload_hex, &out->payload, &out->payload_len);
+  free(payload_hex);
+  if (rc != 0) {
+    edr_command_state_free_inbox_record(out);
+    return -1;
+  }
+  return 0;
+}
+
+static int command_inbox_name_is_record(const char *name) {
+  if (!name || name[0] == '.') {
+    return 0;
+  }
+  size_t n = strlen(name);
+  return n > 5u && strcmp(name + n - 5u, ".json") == 0;
+}
+
+int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return 0;
+  }
+  char dir[1024];
+  command_inbox_default_dir(dir, sizeof(dir));
+  size_t count = 0;
+#ifdef _WIN32
+  char pattern[1100];
+  snprintf(pattern, sizeof(pattern), "%s\\*.json", dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    return 0;
+  }
+  do {
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+      continue;
+    }
+    char path[1200];
+    snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+#else
+  DIR *d = opendir(dir);
+  if (!d) {
+    return 0;
+  }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (!command_inbox_name_is_record(ent->d_name)) {
+      continue;
+    }
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+#endif
+    EdrCommandInboxRecord rec;
+    if (command_inbox_read_file(path, &rec) != 0) {
+      continue;
+    }
+    if (command_state_has_final(rec.command_id, &rec.meta)) {
+      edr_command_state_free_inbox_record(&rec);
+      (void)command_inbox_delete_path(path);
+      continue;
+    }
+    out[count++] = rec;
+    if (count >= cap) {
+      break;
+    }
+#ifdef _WIN32
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  }
+  closedir(d);
+#endif
+  return (int)count;
+}
+
+void edr_command_state_delete_inbox(const char *command_id) {
+  if (!command_id || !command_id[0]) {
+    return;
+  }
+  char path[1200];
+  if (command_inbox_record_path(command_id, path, sizeof(path)) != 0) {
+    return;
+  }
+  FILE *lock = state_lock_acquire();
+  (void)command_inbox_delete_path(path);
+  state_lock_release(lock);
+}
+
+void edr_command_state_free_inbox_record(EdrCommandInboxRecord *record) {
+  if (!record) {
+    return;
+  }
+  free(record->payload);
+  memset(record, 0, sizeof(*record));
 }
 
 static void append_state_line(const char *line) {
@@ -402,8 +889,13 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
   FILE *f = fopen(path, "r");
   int retry = 0;
   int duplicate = 0;
+  int running_duplicate = 0;
   EdrCommandStateRecord last_final;
+  EdrCommandStateRecord last_running;
   memset(&last_final, 0, sizeof(last_final));
+  memset(&last_running, 0, sizeof(last_running));
+  int64_t now_ms = state_now_ms();
+  int64_t running_ttl_ms = command_running_ttl_ms(meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
   if (f) {
@@ -422,6 +914,13 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
       if (strstr(line, "\"final\":1")) {
         duplicate = 1;
         fill_record_from_line(line, &last_final);
+      } else {
+        EdrCommandStateRecord running;
+        fill_record_from_line(line, &running);
+        if (running.updated_unix_ms > 0 && now_ms - running.updated_unix_ms < running_ttl_ms) {
+          running_duplicate = 1;
+          last_running = running;
+        }
       }
     }
     fclose(f);
@@ -433,7 +932,15 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
     if (out_duplicate) {
       *out_duplicate = last_final;
     }
+    state_lock_release(lock);
     return 1;
+  }
+  if (running_duplicate) {
+    if (out_duplicate) {
+      *out_duplicate = last_running;
+    }
+    state_lock_release(lock);
+    return EDR_COMMAND_STATE_BEGIN_DUP_RUNNING;
   }
 
   char cid[300], ctype[180], idem[300], line[1200];

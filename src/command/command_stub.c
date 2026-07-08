@@ -1,4 +1,4 @@
-/* §8 响应指令执行器 — Subscribe 分发；高危操作需 EDR_CMD_ENABLED=1；AVE 见 ave_* */
+/* §8 响应指令执行器 — HTTPS control 分发；高危操作需 EDR_CMD_ENABLED=1；AVE 见 ave_* */
 
 #ifdef _MSC_VER
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -885,13 +885,6 @@ static void do_self_protect_status(const char *cmd_id, const EdrSoarCommandMeta 
 static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size_t len,
                                      const EdrSoarCommandMeta *sm) {
   char addr[256];
-  if (!(edr_command_get_config() && edr_command_get_config()->server.grpc_enabled) &&
-      !env_truthy_cmd("EDR_ENABLE_LEGACY_GRPC") && !env_truthy_cmd("EDR_LEGACY_GRPC_ENABLED")) {
-    s_rejected++;
-    audit_both(cmd_id, "update_server_address: legacy gRPC 未启用，拒绝切换 gRPC 目标");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 15, "legacy grpc disabled");
-    return;
-  }
   if (parse_server_address_json(pl, len, addr, sizeof(addr)) != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "update_server_address: payload 需 JSON {\"server_address\":\"host:port\"}");
@@ -905,8 +898,8 @@ static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size
     return;
   }
   s_exec_fail++;
-  audit_both(cmd_id, "update_server_address: 不再支持(gRPC 已移除；请改用 platform.rest_base_url 配置切换)");
-  soar_emit(cmd_id, sm, EdrCmdExecFailed, 14, "update_server_address unsupported (grpc removed)");
+  audit_both(cmd_id, "update_server_address: 不再支持 server.address 切换；请通过远程配置更新 platform.rest_base_url");
+  soar_emit(cmd_id, sm, EdrCmdExecFailed, 14, "update_server_address unsupported; use platform.rest_base_url");
 }
 
 static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -3230,8 +3223,8 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   }
   s_handled++;
   audit_both(cmd_id, upload_rc == 0
-                         ? "forensic: manifest + bundle.tgz + grpc upload ok"
-                         : "forensic: manifest + bundle.tgz ok; grpc upload failed, queued outbox");
+                         ? "forensic: manifest + bundle.tgz + artifact upload ok"
+                         : "forensic: manifest + bundle.tgz ok; artifact upload failed, queued outbox");
   {
     char manifestj[1200], bundlej[1200], keyj[1200], artifacts[4200], detail[4800];
     json_escape_to(manifestj, sizeof(manifestj), manifest);
@@ -3863,10 +3856,14 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
              "\"total\":-1,\"rows\":[],\"minio_key\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\"}",
              can_dl ? "true" : "false", minioj, sha, upload_rc == 0 ? "ok" : "failed");
     s_handled++;
-    s_exec_ok++;
+    if (can_dl) {
+      s_exec_ok++;
+    } else {
+      s_exec_fail++;
+    }
     audit_both(cmd_id, can_dl ? "velo_query: ok (download)" : "velo_query: large result, upload failed");
-    soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail,
-                 upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
+    soar_emit_ex(cmd_id, sm, can_dl ? EdrCmdExecOk : EdrCmdExecFailed, can_dl ? 0 : 9, detail,
+                 upload_rc == 0 ? "ok" : "upload_failed", artifacts);
   }
 }
 
@@ -4511,6 +4508,82 @@ static int command_deadline_expired(const EdrSoarCommandMeta *sm, char *reason, 
   return 1;
 }
 
+enum { COMMAND_ACTIVE_INBOX_MAX = 32 };
+static char s_active_inbox_commands[COMMAND_ACTIVE_INBOX_MAX][128];
+
+static int command_inbox_is_active(const char *command_id) {
+  if (!command_id || !command_id[0]) {
+    return 0;
+  }
+  for (size_t i = 0; i < COMMAND_ACTIVE_INBOX_MAX; i++) {
+    if (s_active_inbox_commands[i][0] &&
+        strcmp(s_active_inbox_commands[i], command_id) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int command_inbox_mark_active(const char *command_id) {
+  if (!command_id || !command_id[0]) {
+    return 1;
+  }
+  if (command_inbox_is_active(command_id)) {
+    return 0;
+  }
+  for (size_t i = 0; i < COMMAND_ACTIVE_INBOX_MAX; i++) {
+    if (!s_active_inbox_commands[i][0]) {
+      snprintf(s_active_inbox_commands[i], sizeof(s_active_inbox_commands[i]), "%s", command_id);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void command_inbox_unmark_active(const char *command_id) {
+  if (!command_id || !command_id[0]) {
+    return;
+  }
+  for (size_t i = 0; i < COMMAND_ACTIVE_INBOX_MAX; i++) {
+    if (strcmp(s_active_inbox_commands[i], command_id) == 0) {
+      s_active_inbox_commands[i][0] = '\0';
+      return;
+    }
+  }
+}
+
+static void replay_persisted_command_inbox(void) {
+  static int s_replaying_inbox;
+  if (s_replaying_inbox) {
+    return;
+  }
+  s_replaying_inbox = 1;
+  EdrCommandInboxRecord inbox[8];
+  int n = edr_command_state_collect_inbox(inbox, sizeof(inbox) / sizeof(inbox[0]));
+  for (int i = 0; i < n; i++) {
+    if (command_inbox_is_active(inbox[i].command_id)) {
+      edr_command_state_free_inbox_record(&inbox[i]);
+      continue;
+    }
+    char reason[180];
+    reason[0] = '\0';
+    if (command_deadline_expired(&inbox[i].meta, reason, sizeof(reason))) {
+      audit_both(inbox[i].command_id, reason);
+      soar_emit_ex(inbox[i].command_id, &inbox[i].meta, EdrCmdExecFailed, 16,
+                   reason, "timeout", NULL);
+      edr_command_state_delete_inbox(inbox[i].command_id);
+      edr_command_state_free_inbox_record(&inbox[i]);
+      continue;
+    }
+    audit_both(inbox[i].command_id, "replaying persisted command inbox");
+    edr_command_execute_persisted_envelope(inbox[i].command_id, inbox[i].command_type,
+                                           inbox[i].payload, inbox[i].payload_len,
+                                           &inbox[i].meta);
+    edr_command_state_free_inbox_record(&inbox[i]);
+  }
+  s_replaying_inbox = 0;
+}
+
 static void flush_command_result_outbox(void) {
   EdrCommandStateRecord pending[16];
   int n = edr_command_state_collect_pending(pending, sizeof(pending) / sizeof(pending[0]));
@@ -4557,6 +4630,9 @@ void edr_command_poll_reliable_delivery(void) {
   flush_upload_outbox();
   s_delivery_health.last_upload_ms = command_elapsed_ms_u32(step_start);
   command_update_max_u32(s_delivery_health.last_upload_ms, &s_delivery_health.max_upload_ms);
+  if (!pressure) {
+    replay_persisted_command_inbox();
+  }
   s_delivery_health.last_result_ms = 0u;
   if (!pressure || s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
     step_start = command_monotonic_ms();
@@ -4602,8 +4678,8 @@ void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health) {
   out_health->upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
 }
 
-void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
-                             size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
+int edr_command_receive_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
+                                 size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
   EdrSoarCommandMeta empty;
   memset(&empty, 0, sizeof(empty));
   const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
@@ -4617,7 +4693,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     s_rejected++;
     audit_both(id, sig_reason[0] ? sig_reason : "command signature rejected");
     soar_emit(id, sm, EdrCmdExecRejected, 15, sig_reason[0] ? sig_reason : "command signature rejected");
-    return;
+    return 0;
   }
 
   char deadline_reason[180];
@@ -4626,16 +4702,25 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     s_rejected++;
     audit_both(id, deadline_reason);
     soar_emit_ex(id, sm, EdrCmdExecFailed, 16, deadline_reason, "timeout", NULL);
-    return;
+    return 0;
   }
 
   edr_command_poll_reliable_delivery();
+
+  if (edr_command_state_store_inbox(id, t, payload, payload_len, sm) != 0) {
+    s_exec_fail++;
+    audit_both(id, "command inbox persist failed; command not acked");
+    soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
+                 "command inbox persist failed before received ack", "failed", NULL);
+    return -1;
+  }
 
   int retry_count = 0;
   EdrCommandStateRecord dup;
   int dup_rc = edr_command_state_begin(id, t, sm, &retry_count, &dup);
   (void)retry_count;
-  if (dup_rc == 1) {
+  if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_FINAL) {
+    edr_command_state_delete_inbox(id);
     char detail[2600];
     if (streq(t, "shell_open")) {
       snprintf(detail, sizeof(detail),
@@ -4643,7 +4728,7 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
                dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code);
       audit_both(id, "duplicate shell_open suppressed by local idempotency state");
       soar_emit_ex(id, sm, EdrCmdExecFailed, 17, detail, "failed", NULL);
-      return;
+      return 0;
     }
     snprintf(detail, sizeof(detail), "duplicate command suppressed previous_status=%s previous_exit=%d previous_detail=%s",
              dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code,
@@ -4651,8 +4736,28 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
     audit_both(id, "duplicate command suppressed by local idempotency state");
     soar_emit_ex(id, sm, (EdrCommandExecutionStatus)(dup.execution_status ? dup.execution_status : EdrCmdExecOk),
                  dup.exit_code, detail, dup.response_status[0] ? dup.response_status : "ok", NULL);
-    return;
+    return 0;
   }
+  if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_RUNNING) {
+    char detail[320];
+    snprintf(detail, sizeof(detail), "duplicate command already running; command_id=%s type=%s retry=%d",
+             dup.command_id[0] ? dup.command_id : id, dup.command_type[0] ? dup.command_type : t,
+             retry_count);
+    audit_both(id, detail);
+    return 0;
+  }
+  return 1;
+}
+
+void edr_command_execute_received_envelope(const char *command_id, const char *command_type,
+                                           const uint8_t *payload, size_t payload_len,
+                                           const EdrSoarCommandMeta *soar_meta) {
+  EdrSoarCommandMeta empty;
+  memset(&empty, 0, sizeof(empty));
+  const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
+  const char *t = command_type ? command_type : "";
+  const char *id = command_id ? command_id : "";
+  s_active_command_type = t;
 
   if (streq(t, "noop") || streq(t, "ping")) {
     fprintf(stderr, "[command] ok id=%s type=%s\n", id, t);
@@ -4885,6 +4990,28 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   fprintf(stderr, "[command] unknown type id=%s type=%s\n", id, t);
   s_unknown++;
   soar_emit(id, sm, EdrCmdExecUnknownType, 1, "unknown command_type");
+}
+
+void edr_command_execute_persisted_envelope(const char *command_id, const char *command_type,
+                                            const uint8_t *payload, size_t payload_len,
+                                            const EdrSoarCommandMeta *soar_meta) {
+  const char *id = command_id ? command_id : "";
+  if (!command_inbox_mark_active(id)) {
+    audit_both(id, "persisted command already executing");
+    return;
+  }
+  edr_command_execute_received_envelope(command_id, command_type, payload, payload_len, soar_meta);
+  edr_command_state_delete_inbox(id);
+  command_inbox_unmark_active(id);
+}
+
+void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
+                             size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
+  int receive_rc = edr_command_receive_envelope(command_id, command_type, payload, payload_len, soar_meta);
+  if (receive_rc <= 0) {
+    return;
+  }
+  edr_command_execute_persisted_envelope(command_id, command_type, payload, payload_len, soar_meta);
 }
 
 unsigned long edr_command_handled_count(void) { return s_handled; }

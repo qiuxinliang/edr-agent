@@ -60,7 +60,7 @@ static unsigned s_telemetry_sampling_pct = 100u;
 static uint64_t s_sampling_dropped;
 static uint64_t s_sampling_kept;
 
-/** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 gRPC endpoint_id 一致） */
+/** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 endpoint_id 一致） */
 static char s_cfg_endpoint_id[128];
 static char s_cfg_tenant_id[128];
 

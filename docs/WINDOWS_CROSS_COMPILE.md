@@ -87,7 +87,7 @@ EDR_MINGW_DOCKER_IMAGE=ubuntu:24.04 ./scripts/build_windows_mingw_docker.sh
 
 ## 产物位置
 
-成功后在仓库内 **`edr-agent/build-mingw/`** 下出现 **`edr_agent.exe`**（或构建日志中的等价目标）。该二进制为 **MinGW ABI**，与 MSVC 产物不同，仅作交叉编译验证。
+成功后在仓库内 **`edr-agent/build-mingw/`** 下出现 **`FDSensor.exe`** / **`edr_agent.exe`**（以构建日志为准）。该二进制为 **MinGW ABI**，与 MSVC 产物不同；若作为 Windows 客户端产物使用，必须同时带上 MinGW 动态 triplet 的运行时 DLL（包括 YARA）。
 
 ## 终端编译注意要点
 
@@ -105,22 +105,33 @@ EDR_MINGW_DOCKER_IMAGE=ubuntu:24.04 ./scripts/build_windows_mingw_docker.sh
 - 需要 curl/nghttp2 等 Windows 目标依赖时，设置 **`EDR_MINGW_DEPS_PREFIX`** 指向 vcpkg `installed/<triplet>`。
 
 ```bash
-EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-static \
+EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-dynamic \
 ./scripts/build_windows_mingw.sh
 ```
+
+Windows 客户端包要求真实 libyara 扫描能力；MinGW 路径也会强制：
+
+- **`EDR_WITH_YARA=ON`**、**`EDR_REQUIRE_YARA=ON`**、**`VCPKG_MANIFEST_FEATURES=yara`**。
+- **`EDR_MINGW_DEPS_PREFIX`** 必须指向 vcpkg 的 **MinGW 动态 triplet**（推荐 **`x64-mingw-dynamic`**），且包含：
+  - **`include/yara.h`** 或 **`include/yara/yara.h`**；
+  - **`share/unofficial-libyara/unofficial-libyara-config.cmake`**；
+  - **`bin/*yara*.dll`** / **`bin/libyara*.dll`**。
+- 不要把 **`EDR_MINGW_DEPS_PREFIX`** 指向 MSVC **`x64-windows`** 安装树；ABI 不匹配，且不会作为 MinGW 客户端包的有效运行时来源。
 
 旧变量 **`EDR_MINGW_GRPC_PREFIX`** 仅作为兼容别名保留，建议新脚本和文档统一使用 **`EDR_MINGW_DEPS_PREFIX`**。
 
 ### 3. MinGW 侧目标依赖（vcpkg 等）
 
-**让 CMake 找到 Windows 目标的包**（常见为 **vcpkg** 的 `x64-mingw-static` 安装树）：
+**让 CMake 找到 Windows 目标的包**（发布/客户端包推荐 **vcpkg** 的 `x64-mingw-dynamic` 安装树）：
 
-- **CONFIG 路径（vcpkg 典型布局）**：`<prefix>/share/curl/CURLConfig.cmake`、`<prefix>/share/openssl/OpenSSLConfig.cmake`、`<prefix>/share/sqlite3/SQLite3Config.cmake` 等（部分发行版也可能在 `lib/cmake/...`，以实际树为准）。
+- **CONFIG 路径（vcpkg 典型布局）**：`<prefix>/share/curl/CURLConfig.cmake`、`<prefix>/share/openssl/OpenSSLConfig.cmake`、`<prefix>/share/sqlite3/SQLite3Config.cmake`、`<prefix>/share/unofficial-libyara/unofficial-libyara-config.cmake` 等（部分发行版也可能在 `lib/cmake/...`，以实际树为准）。
 - 构建时传入前缀，例如：
 
 ```bash
-EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-static \
+EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-dynamic \
 ./scripts/build_windows_mingw.sh
 ```
 
-**vcpkg 根目录路径：** 含**空格**的路径曾导致部分 port（如 OpenSSL）配置失败；可将 **`vcpkg`** 目录同步到无空格路径（例如 **`/tmp/vcpkg-mingw-deps`**）再执行 **`install`**。**edr-agent** 源码可仍在原路径。
+MSVC Windows 发布构建使用 **`x64-windows`**，MinGW 交叉构建使用 **`x64-mingw-dynamic`** 这类 MinGW 动态 triplet；两者不要混用。Windows 上 **`EDR_REQUIRE_YARA=ON`** 只接受 vcpkg config package 暴露的 **`unofficial::libyara::libyara`** target，缺少 vcpkg `yara` feature 或缺少 YARA runtime DLL 时，configure / staging / packaging 会直接失败。
+
+**vcpkg 根目录路径：** 含**空格**的路径曾导致部分 port（如 OpenSSL）配置失败；可将 **`vcpkg`** 目录同步到无空格路径（例如 **`/tmp/vcpkg-mingw-deps`**）再执行 **`install --x-feature=yara`**。**edr-agent** 源码可仍在原路径。

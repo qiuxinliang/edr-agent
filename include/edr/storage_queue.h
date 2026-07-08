@@ -30,7 +30,7 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
 uint64_t edr_storage_queue_pending_count(void);
 
 /**
- * 从 SQLite 取 pending 批次，经 gRPC 补传（与 flush 时 ReportEvents 载荷一致）。
+ * 从 SQLite 取 pending 批次，经 HTTP ingest 补传（与 flush 时 ReportEvents 载荷一致）。
  * 在预处理循环中周期性调用；内部节流，失败行保留并增加 retry_count。
  */
 void edr_storage_queue_poll_drain(void);

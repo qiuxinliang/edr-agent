@@ -1638,7 +1638,7 @@ static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_m
 }
 
 /**
- * 经 `edr_event_bus_try_push` → 预处理 → `EdrBehaviorRecord` → `edr_event_batch_push` → gRPC（与 ETW 同源）。
+ * 经 `edr_event_bus_try_push` → 预处理 → `EdrBehaviorRecord` → `edr_event_batch_push` → HTTP ingest（与 ETW 同源）。
  * `EDR_PMFE_EMIT_ALERTS=0` 关闭；`EDR_PMFE_EMIT_MZ=1` 时在无 stomp/dns/ave 信号下仍上报「仅 MZ 命中」类结果。
  * Linux：`elf_hits=` 仅由 `EDR_PMFE_EMIT_ELF=1` 控制上报，与 `EDR_PMFE_EMIT_MZ` 无关。
  */

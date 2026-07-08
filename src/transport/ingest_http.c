@@ -137,6 +137,8 @@ static unsigned long s_control_stream_fail;
 static unsigned long s_control_stream_heartbeat;
 static unsigned long s_control_ack_ok;
 static unsigned long s_control_ack_fail;
+static int64_t s_last_command_ack_ms;
+static char s_last_command_ack_id[160];
 static unsigned long s_http2_request_ok;
 static unsigned long s_http2_request_fail;
 static unsigned long s_http2_negotiated_count;
@@ -758,8 +760,10 @@ static void note_control_stream_heartbeat(void) {
   s_control_stream_heartbeat++;
 }
 
-static void note_control_ack_success(void) {
+static void note_control_ack_success(const char *command_id) {
   s_control_ack_ok++;
+  s_last_command_ack_ms = unix_ms_now();
+  snprintf(s_last_command_ack_id, sizeof(s_last_command_ack_id), "%s", command_id ? command_id : "");
 }
 
 static void note_control_ack_failure(void) {
@@ -1217,6 +1221,8 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->control_stream_heartbeat_count = s_control_stream_heartbeat;
   out->control_ack_ok_count = s_control_ack_ok;
   out->control_ack_fail_count = s_control_ack_fail;
+  out->last_command_ack_unix_ms = s_last_command_ack_ms;
+  snprintf(out->last_command_ack_id, sizeof(out->last_command_ack_id), "%s", s_last_command_ack_id);
   out->http2_request_ok_count = s_http2_request_ok;
   out->http2_request_fail_count = s_http2_request_fail;
   out->http2_negotiated_count = s_http2_negotiated_count;
@@ -5446,13 +5452,13 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
     return -1;
   }
   snprintf(body, body_cap,
-           "{\"endpoint_id\":\"%s\",\"command_id\":\"%s\",\"status\":\"processed\","
+           "{\"endpoint_id\":\"%s\",\"command_id\":\"%s\",\"status\":\"received\","
            "\"transport\":\"%s\",\"last_seq\":%lld}",
            s_endpoint, cmd, tr, (long long)last_seq);
   rc = request_to_suffix("POST", "ingest/control/ack", "application/json", body, strlen(body), NULL, 0u);
   if (rc == 0) {
     note_http_request_success();
-    note_control_ack_success();
+    note_control_ack_success(command_id);
     edr_transport_v2_ack(command_id, 1);
   } else {
     note_http_request_failure();
@@ -5613,6 +5619,7 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
                                             const char *pre, size_t pre_len,
                                             FILE *file, size_t file_len,
                                             const char *post, size_t post_len,
+                                            const char *sig_body, size_t sig_body_len,
                                             char *resp_body, size_t resp_body_cap) {
   char url[1400];
   char host[256];
@@ -5646,7 +5653,8 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), "POST", path, host, content_type, NULL, body_len);
+  rn = append_request_headers(req, sizeof(req), "POST", path, host, content_type,
+                              sig_body, sig_body ? sig_body_len : body_len);
   if (rn <= 0) {
     runtime_failure("http upload request build failed");
     return -1;
@@ -5698,6 +5706,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   char resp[4096];
   char pre[2048];
   char post[96];
+  char *sig_body = NULL;
   int rc;
   long sz;
   long max_mb;
@@ -5735,7 +5744,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     return -1;
   }
 #ifdef EDR_HAVE_CURL_HTTP2
-  if (http2_client_enabled()) {
+  if (http2_client_enabled() && !s_request_signing.enabled) {
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_h2");
     resp[0] = '\0';
     rc = curl_h2_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
@@ -5763,7 +5772,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     }
   }
 #endif
-  if (http2_required()) {
+  if (http2_required() && !s_request_signing.enabled) {
     fclose(file);
     runtime_failure("HTTP/2 required but h2 upload transport unavailable");
     return -1;
@@ -5791,11 +5800,49 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
            boundary, uid, boundary, eid, boundary, sha, boundary, fname, boundary, fname);
   snprintf(post, sizeof(post), "\r\n--%s--\r\n", boundary);
   snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+  {
+    size_t pre_len = strlen(pre);
+    size_t post_len = strlen(post);
+    size_t body_len = pre_len + file_len + post_len;
+    sig_body = (char *)malloc(body_len ? body_len : 1u);
+    if (!sig_body) {
+      fclose(file);
+      free(uid);
+      free(eid);
+      free(sha);
+      free(fname);
+      return -1;
+    }
+    memcpy(sig_body, pre, pre_len);
+    if (fread(sig_body + pre_len, 1u, file_len, file) != file_len) {
+      free(sig_body);
+      fclose(file);
+      free(uid);
+      free(eid);
+      free(sha);
+      free(fname);
+      runtime_failure("http upload file read failed");
+      return -1;
+    }
+    memcpy(sig_body + pre_len + file_len, post, post_len);
+    if (fseek(file, 0, SEEK_SET) != 0) {
+      free(sig_body);
+      fclose(file);
+      free(uid);
+      free(eid);
+      free(sha);
+      free(fname);
+      runtime_failure("http upload file seek failed");
+      return -1;
+    }
+  }
   resp[0] = '\0';
   snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_http");
   rc = request_to_suffix_multipart_file("ingest/upload-file", content_type,
                                         pre, strlen(pre), file, file_len,
-                                        post, strlen(post), resp, sizeof(resp));
+                                        post, strlen(post), sig_body,
+                                        strlen(pre) + file_len + strlen(post),
+                                        resp, sizeof(resp));
   if (rc == 0) {
     note_http_request_success();
     note_upload_success();
@@ -5813,6 +5860,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed");
   }
   fclose(file);
+  free(sig_body);
   free(uid);
   free(eid);
   free(sha);
@@ -5863,8 +5911,16 @@ static int poll_dispatch_one(const char *obj) {
   if (json_get_int64(obj, "deadline_ms", &v) == 0 && v > 0 && v <= 0xffffffffLL) {
     sm.deadline_ms = (uint32_t)v;
   }
-  edr_command_on_envelope(command_id, command_type, payload, payload_len, &sm);
+  int should_execute = edr_command_receive_envelope(command_id, command_type, payload, payload_len, &sm);
+  if (should_execute < 0) {
+    free(payload_b64);
+    free(payload);
+    return -1;
+  }
   (void)edr_ingest_http_post_control_ack(command_id, transport, seq);
+  if (should_execute > 0) {
+    edr_command_execute_persisted_envelope(command_id, command_type, payload, payload_len, &sm);
+  }
   free(payload_b64);
   free(payload);
   return 0;

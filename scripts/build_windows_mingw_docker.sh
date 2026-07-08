@@ -11,7 +11,7 @@
 #   EDR_MINGW_DOCKER_IMAGE   默认 ubuntu:22.04（可改为 ubuntu:24.04 等）
 #   EDR_MINGW_DOCKER_EXTRA   附加 docker run 参数，例如 '--network host'（部分网络环境 apt 更稳）
 #   http_proxy / https_proxy  传入容器（若宿主机已设，会自动 -e 传入）
-#   EDR_MINGW_DEPS_PREFIX     Windows 目标依赖前缀，需含 curl+nghttp2（vcpkg installed/<triplet>）
+#   EDR_MINGW_DEPS_PREFIX     Windows 目标依赖前缀，需指向 vcpkg MinGW 动态 triplet（如 x64-mingw-dynamic），且含 curl+nghttp2+unofficial-libyara+YARA DLL
 #   EDR_MINGW_GRPC_PREFIX     兼容旧变量名，等同于 EDR_MINGW_DEPS_PREFIX
 # 终端编译注意：宿主机侧 build-mingw/ 与容器内产物宜保留以便后查，勿习惯性全删（见 docs/WINDOWS_CROSS_COMPILE.md「终端编译注意要点」）。
 set -euo pipefail
@@ -76,13 +76,36 @@ for attempt in 1 2 3 4 5; do
 done
 apt-get install -y -qq --no-install-recommends \
   mingw-w64 cmake ninja-build ca-certificates
-if [[ -z "${EDR_MINGW_DEPS_PREFIX:-}" || ! -f "${EDR_MINGW_DEPS_PREFIX}/include/curl/curl.h" ]]; then
+if [[ -z "${EDR_MINGW_DEPS_PREFIX:-}" ]]; then
+  echo "ERROR: EDR_MINGW_DEPS_PREFIX is required for Windows MinGW package builds."
+  echo "Set it to a vcpkg MinGW dynamic triplet prefix, e.g. installed/x64-mingw-dynamic; do not use MSVC x64-windows."
+  exit 2
+fi
+if [[ ! -f "${EDR_MINGW_DEPS_PREFIX}/include/curl/curl.h" ]]; then
   echo "ERROR: EDR_WITH_HTTP2_CURL=ON requires a Windows-target dependency prefix with curl/nghttp2."
   echo "Set EDR_MINGW_DEPS_PREFIX to vcpkg installed/<triplet> containing include/curl/curl.h and libcurl."
   exit 2
 fi
+if [[ ! -f "${EDR_MINGW_DEPS_PREFIX}/include/yara.h" && ! -f "${EDR_MINGW_DEPS_PREFIX}/include/yara/yara.h" ]]; then
+  echo "ERROR: EDR_REQUIRE_YARA=ON requires YARA headers under ${EDR_MINGW_DEPS_PREFIX}/include."
+  echo "Install the vcpkg yara feature for a MinGW dynamic triplet such as x64-mingw-dynamic."
+  exit 2
+fi
+if [[ ! -f "${EDR_MINGW_DEPS_PREFIX}/share/unofficial-libyara/unofficial-libyara-config.cmake" ]]; then
+  echo "ERROR: vcpkg unofficial-libyara config package missing under ${EDR_MINGW_DEPS_PREFIX}/share/unofficial-libyara."
+  echo "Windows MinGW YARA builds must use vcpkg libyara, not a manual YARA_ROOT fallback."
+  exit 2
+fi
+shopt -s nullglob
+yara_dlls=("${EDR_MINGW_DEPS_PREFIX}"/bin/*yara*.dll "${EDR_MINGW_DEPS_PREFIX}"/bin/*YARA*.dll "${EDR_MINGW_DEPS_PREFIX}"/bin/libyara*.dll "${EDR_MINGW_DEPS_PREFIX}"/bin/libYARA*.dll)
+shopt -u nullglob
+if [[ ${#yara_dlls[@]} -lt 1 ]]; then
+  echo "ERROR: YARA runtime DLL missing under ${EDR_MINGW_DEPS_PREFIX}/bin."
+  echo "Use a dynamic MinGW vcpkg triplet such as x64-mingw-dynamic; static/MSVC prefixes are not valid for this package path."
+  exit 2
+fi
 rm -rf build-mingw
-cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -S .
+cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -DEDR_WITH_YARA=ON -DEDR_REQUIRE_YARA=ON -DVCPKG_MANIFEST_FEATURES=yara -S .
 cmake --build build-mingw --target edr_agent -j4
 '
 

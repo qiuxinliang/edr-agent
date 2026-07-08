@@ -23,6 +23,16 @@ OUT_DIR="$SCRIPT_DIR/Output/${OUT_NAME}"
 ZIP_PATH="$SCRIPT_DIR/Output/${OUT_NAME}.zip"
 STRICT="${EDR_BUNDLE_STRICT:-0}"
 
+require_yara_runtime_dlls_in_dir() {
+  local dir="$1"
+  local context="$2"
+  if ! find "$dir" -maxdepth 1 -type f -iname '*yara*.dll' | grep -q .; then
+    echo "Error: YARA runtime DLL missing from ${context}: $dir" >&2
+    echo "Windows endpoint bundles require vcpkg libyara runtime DLLs staged next to FDSensor.exe." >&2
+    exit 1
+  fi
+}
+
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/models" "$OUT_DIR/data"
 
@@ -39,6 +49,7 @@ else
   echo "Error: missing: $STAGE_DIR/FDSensor.exe" >&2
   exit 1
 fi
+require_yara_runtime_dlls_in_dir "$STAGE_DIR" "STAGE_DIR"
 
 # --- Binaries (Inno EDR_BIN_DIR) ---
 cp -a "$AGENT_EXE" "$OUT_DIR/FDSensor.exe"
@@ -68,6 +79,7 @@ shopt -u nullglob
 if [[ "$DLL_COUNT" -lt 1 ]]; then
   echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start if FDSensor.exe is dynamically linked." >&2
 fi
+require_yara_runtime_dlls_in_dir "$OUT_DIR" "bundled payload output"
 
 # models: whitelist production-ready compact model artifacts only.
 if [[ -d "$EDR_AGENT_DIR/models" ]]; then
@@ -236,11 +248,19 @@ find "$OUT_DIR" -name '.DS_Store' -delete 2>/dev/null || true
   echo
   ( cd "$OUT_DIR" && find . -type f | sort )
 } > "$OUT_DIR/MANIFEST.txt"
+if ! grep -Ei '(^|/)(lib)?yara.*\.dll$' "$OUT_DIR/MANIFEST.txt" >/dev/null; then
+  echo "Error: MANIFEST.txt does not include a YARA runtime DLL" >&2
+  exit 1
+fi
 
 mkdir -p "$SCRIPT_DIR/Output"
 ( cd "$SCRIPT_DIR/Output" && rm -f "${OUT_NAME}.zip" && zip -r -q "${OUT_NAME}.zip" "$OUT_NAME" )
 if unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bundle_manifest\.json)$' >/dev/null; then
   echo "Error: plaintext P0 rules were found in $ZIP_PATH" >&2
+  exit 1
+fi
+if ! unzip -Z1 "$ZIP_PATH" | grep -Ei '(^|/)(lib)?yara.*\.dll$' >/dev/null; then
+  echo "Error: YARA runtime DLL missing from $ZIP_PATH" >&2
   exit 1
 fi
 echo "OK: $ZIP_PATH"

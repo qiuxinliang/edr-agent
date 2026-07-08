@@ -1,6 +1,5 @@
 /**
  * HTTPS/TLS ingest 主路径：ReportEvents / command result / artifact upload / control stream。
- * legacy gRPC 仅在显式启用时作为 fallback。
  */
 #ifndef EDR_INGEST_HTTP_H
 #define EDR_INGEST_HTTP_H
@@ -80,6 +79,8 @@ typedef struct {
   unsigned long control_stream_heartbeat_count;
   unsigned long control_ack_ok_count;
   unsigned long control_ack_fail_count;
+  int64_t last_command_ack_unix_ms;
+  char last_command_ack_id[160];
   unsigned long http2_request_ok_count;
   unsigned long http2_request_fail_count;
   unsigned long http2_negotiated_count;
@@ -208,14 +209,14 @@ int edr_ingest_http_get_suffix(const char *suffix, char *resp_body, size_t resp_
 /** 发送轻量在线心跳；独立于详细健康监控开关。 */
 int edr_ingest_http_post_heartbeat(void);
 
-/** 上报指令执行结果；与 gRPC ReportCommandResult 语义一致。 */
+/** 上报指令执行结果；与服务端 command result manifest 语义一致。 */
 int edr_ingest_http_post_command_result(const char *command_id,
                                         const struct EdrSoarCommandMeta *meta,
                                         int execution_status,
                                         int exit_code,
                                         const char *detail_utf8);
 
-/** 上传指令/取证产物；与 gRPC UploadFile 落点一致。 */
+/** 上传指令/取证产物；大结果落 object storage，command result 只保留 manifest。 */
 int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,
                                           const char *sha256_hex, char *out_minio_key,
                                           size_t out_minio_key_cap);

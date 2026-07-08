@@ -2,7 +2,6 @@
 
 [server]
 address              = ""
-grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
 client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"

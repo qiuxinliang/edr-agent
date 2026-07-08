@@ -1575,12 +1575,10 @@ function Merge-EnrollIntoAgentTomlExample {
       continue
     }
     if ($line -match '^\s*grpc_enabled\s*=') {
-      $out.Add('grpc_enabled         = false')
       $i++
       continue
     }
     if ($line -match '^\s*grpc_insecure\s*=') {
-      $out.Add('grpc_insecure        = false')
       $i++
       continue
     }
@@ -1929,8 +1927,6 @@ $tomlMinimal = @"
 
 [server]
 address              = "$(Escape-Toml $saddr)"
-grpc_enabled         = false
-grpc_insecure        = false
 ca_cert              = "$(Escape-Toml $EffectiveCaCertPath)"
 client_cert          = "$(Escape-Toml $EffectiveClientCertPath)"
 client_key           = "$(Escape-Toml $EffectiveClientKeyPath)"

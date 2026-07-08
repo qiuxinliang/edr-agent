@@ -1,5 +1,11 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c)
+target_include_directories(test_command_inbox PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_command_inbox)
+add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_signing.c
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c)

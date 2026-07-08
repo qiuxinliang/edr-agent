@@ -11,16 +11,16 @@
 struct EdrConfig;
 struct EdrTransportCtx;
 
-/** 可注入 dispatch 回调：由 transport 内部在工作线程调用，将批次实际发往 gRPC/HTTP。 */
+/** 可注入 dispatch 回调：由 transport 内部在工作线程调用，将批次实际发往 HTTP ingest。 */
 typedef int (*EdrTransportDispatchFn)(int use_http, const char *batch_id,
                                       const uint8_t *header12, size_t header_len,
                                       const uint8_t *payload, size_t payload_len,
                                       void *userdata);
 
-/** 从配置登记上报目标；默认使用 HTTPS/TLS，legacy gRPC 仅显式启用时读取 server.address。 */
+/** 从配置登记上报目标；默认使用 HTTPS/TLS ingest 与 HTTPS 控制面。 */
 void edr_transport_init_from_config(const struct EdrConfig *cfg);
 
-/** 与 init 配对：停止 Subscribe 线程并释放 gRPC 资源 */
+/** 与 init 配对：停止控制面轮询/流和工作线程资源。 */
 void edr_transport_shutdown(void);
 
 #define EDR_TRANSPORT_BATCH_MAGIC_RAW 0x31544142u  /* "BAT1" */
@@ -32,7 +32,7 @@ void edr_transport_on_event_batch(const char *batch_id, const uint8_t *header12,
                                   const uint8_t *payload, size_t payload_len);
 
 /**
- * 分流上报：use_http=0 → gRPC ReportEvents；use_http=1 → HTTP POST .../ingest/report-events。
+ * 分流上报：use_http 保留历史优先级语义；实际发送统一走 HTTP POST .../ingest/report-events。
  * 统计与失败落盘策略与 edr_transport_on_event_batch 一致。
  */
 void edr_transport_send_ingest_batch(int use_http, const char *batch_id, const uint8_t *header12,

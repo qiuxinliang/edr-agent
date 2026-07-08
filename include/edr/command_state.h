@@ -28,6 +28,21 @@ typedef struct EdrCommandStateRecord {
   char detail[2048];
 } EdrCommandStateRecord;
 
+typedef struct EdrCommandInboxRecord {
+  char command_id[128];
+  char command_type[64];
+  EdrSoarCommandMeta meta;
+  uint8_t *payload;
+  size_t payload_len;
+  int64_t received_unix_ms;
+} EdrCommandInboxRecord;
+
+enum {
+  EDR_COMMAND_STATE_BEGIN_READY = 0,
+  EDR_COMMAND_STATE_BEGIN_DUP_FINAL = 1,
+  EDR_COMMAND_STATE_BEGIN_DUP_RUNNING = 2,
+};
+
 int edr_command_state_begin(const char *command_id, const char *command_type,
                             const EdrSoarCommandMeta *meta, int *out_retry_count,
                             EdrCommandStateRecord *out_duplicate);
@@ -36,6 +51,13 @@ void edr_command_state_finish(const char *command_id, const char *command_type,
                               const EdrSoarCommandMeta *meta, const char *response_status,
                               int execution_status, int exit_code, const char *detail,
                               const char *artifacts, int report_pending);
+
+int edr_command_state_store_inbox(const char *command_id, const char *command_type,
+                                  const uint8_t *payload, size_t payload_len,
+                                  const EdrSoarCommandMeta *meta);
+int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap);
+void edr_command_state_delete_inbox(const char *command_id);
+void edr_command_state_free_inbox_record(EdrCommandInboxRecord *record);
 
 int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap);
 void edr_command_state_mark_reported(const EdrCommandStateRecord *record);

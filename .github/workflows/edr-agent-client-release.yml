@@ -276,6 +276,17 @@ jobs:
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 
+      - name: Verify YARA compile definition generated
+        shell: pwsh
+        run: |
+          $generated = @("build\build.ninja", "build\CMakeFiles\edr_agent.dir\flags.make") | Where-Object { Test-Path -LiteralPath $_ }
+          if (-not $generated) { throw "No generated build metadata found under build; cannot verify EDR_HAVE_YARA=1" }
+          $hasYara = $false
+          foreach ($p in $generated) {
+            if (Select-String -Path $p -SimpleMatch "EDR_HAVE_YARA=1" -Quiet) { $hasYara = $true; break }
+          }
+          if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
+
       - name: Build (Ninja + sccache)
         shell: pwsh
         run: |
@@ -315,6 +326,10 @@ jobs:
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
           ./scripts/stage_ort_dlls_build_release.ps1
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+
+          $stagedYara = @(Get-ChildItem -Path "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
+          if (-not $stagedYara -or $stagedYara.Count -lt 1) { throw "YARA runtime DLL missing from build\Release after staging" }
+          Write-Host "Verified staged YARA runtime DLL(s): $($stagedYara.Name -join ', ')"
 
       - name: Test
         shell: bash
@@ -439,6 +454,10 @@ jobs:
             }
             if ($packagedVersion -ne $env:EDR_AGENT_VERSION) {
               throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
+            }
+
+            if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
+              throw "YARA runtime DLL missing from package"
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"

@@ -30,6 +30,15 @@ if (-not (Test-Path -LiteralPath $iss)) {
     throw "Missing $iss"
 }
 
+function Assert-YaraRuntimeDlls {
+    param([string] $Dir)
+    $dlls = @(Get-ChildItem -Path $Dir -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
+    if (-not $dlls -or $dlls.Count -lt 1) {
+        throw "YARA runtime DLL missing from $Dir. Stage vcpkg libyara DLLs next to FDSensor.exe before building the bundled installer."
+    }
+    Write-Host "Verified YARA runtime DLL(s): $($dlls.Name -join ', ')"
+}
+
 if (-not $BinDir) {
     $monorepoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
     $BinDir = Join-Path $monorepoRoot "edr-agent-win_2-2"
@@ -44,6 +53,7 @@ if (-not (Test-Path -LiteralPath $binExe)) {
         throw "FDSensor.exe not found: $binExe. Pass -BinDir to your staging folder."
     }
 }
+Assert-YaraRuntimeDlls -Dir $BinDir
 
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path

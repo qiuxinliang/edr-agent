@@ -16,7 +16,7 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg);
 /** 清空 static ONNX 推理 LRU（`AVE_SyncFromEdrConfig` / `AVE_ApplyHotfix` / `AVE_UpdateModel` 成功重载后调用） */
 void edr_ave_infer_cache_clear(void);
 
-/** 最近一次 init 时模型目录扫描结果（供 gRPC ave_status 指令） */
+/** 最近一次 init 时模型目录扫描结果（供 ave_status 指令） */
 void edr_ave_get_scan_counts(int *out_model_files, int *out_non_dir_files, int *out_ready_flag);
 
 /** 读取文件 SHA256 指纹；缓冲区小于 65 字节时写入偶数字节 hex 前缀（cap≥17）。返回 0 成功，-1 失败。 */

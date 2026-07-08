@@ -1,5 +1,5 @@
 /**
- * 传输层 — 批次入队、工作线程、gRPC/HTTP 调度、指标计数。
+ * 传输层 — 批次入队、工作线程、HTTP ingest/control 调度、指标计数。
  *
  * EdrTransportCtx 将 15 个 file-scope 全局变量收敛为单一结构体；
  * dispatch 函数指针通过 edr_transport_inject_dispatch 可注入（测试/QUIC/MQTT）。
@@ -38,7 +38,6 @@ typedef struct EdrSendJob {
 
 typedef struct EdrTransportCtx {
   /* --- 调度层 --- */
-  char target[256];
   EdrTransportDispatchFn dispatch;
   void *dispatch_ud;
 
@@ -81,11 +80,6 @@ static EdrTransportCtx g_ctx;
 static int env_truthy(const char *name) {
   const char *v = getenv(name);
   return v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "TRUE") == 0);
-}
-
-static int target_is_loopback(const char *s) {
-  return s && (strncmp(s, "127.0.0.1", 9) == 0 || strncmp(s, "localhost", 9) == 0 ||
-               strncmp(s, "[::1]", 5) == 0 || strncmp(s, "::1", 3) == 0);
 }
 
 static int url_is_loopback_http(const char *s) {
@@ -137,12 +131,8 @@ static int default_dispatch(int use_http, const char *batch_id,
 
   /* 路径 1: HTTPS/TLS ingest 默认主路径 */
   if (edr_ingest_http_configured()) {
-    const char *e = getenv("EDR_EVENT_GRPC_FALLBACK_HTTP");
-    int allow_fallback = (!e || e[0] == '\0' || strcmp(e, "0") != 0);
-    if (use_http == 1 || allow_fallback) {
-      ok = edr_transport_v2_report_events(batch_id, header12, header_len, payload, payload_len);
-      if (ok == 0) return 0;
-    }
+    ok = edr_transport_v2_report_events(batch_id, header12, header_len, payload, payload_len);
+    if (ok == 0) return 0;
   }
 
   /* 路径 2: 离线持久化 */
@@ -328,9 +318,6 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
 
   EdrTransportCtx *c = &g_ctx;
 
-  /* gRPC 目标 */
-  snprintf(c->target, sizeof(c->target), "%s", cfg->server.address);
-
   /* dispatch 默认为内置实现 */
   c->dispatch = NULL;  /* NULL → 使用 default_dispatch */
   c->dispatch_ud = NULL;
@@ -360,19 +347,11 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
   c->q_started = 0;
   c->q_run = 0;
 
-  EdrConfig secure_cfg = *cfg;
   const int allow_insecure_env =
       env_truthy("EDR_ALLOW_INSECURE_TRANSPORT") || env_truthy("EDR_DEV_ALLOW_INSECURE_TRANSPORT");
-  const int allow_grpc_insecure = allow_insecure_env || target_is_loopback(cfg->server.address);
-  if (secure_cfg.server.grpc_insecure && !allow_grpc_insecure) {
-    secure_cfg.server.grpc_insecure = false;
-    EDR_LOGE("%s", "[transport] production policy forced grpc_insecure=false; configure mTLS certs or set EDR_ALLOW_INSECURE_TRANSPORT=1 only for lab\n");
-  } else if (secure_cfg.server.grpc_insecure) {
-    EDR_LOGE("%s", "[transport] insecure gRPC allowed for loopback/dev only\n");
-  }
   const char *rest_base_env = getenv("EDR_PLATFORM_REST_BASE");
   const char *rest_bearer_env = getenv("EDR_PLATFORM_BEARER");
-  const char *rest_base = (rest_base_env && rest_base_env[0]) ? rest_base_env : secure_cfg.platform.rest_base_url;
+  const char *rest_base = (rest_base_env && rest_base_env[0]) ? rest_base_env : cfg->platform.rest_base_url;
   const char *rest_bearer = (rest_bearer_env && rest_bearer_env[0]) ? rest_bearer_env : cfg->platform.rest_bearer_token;
   const int allow_rest_insecure = allow_insecure_env || url_is_loopback_http(rest_base);
   if (rest_base && strncmp(rest_base, "http://", 7) == 0 && !allow_rest_insecure) {

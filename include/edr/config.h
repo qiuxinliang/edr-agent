@@ -19,10 +19,12 @@
 #define EDR_FL_FROZEN_NAME_MAX 64
 
 typedef struct EdrConfig {
-  struct {
-    char address[256];
-    bool grpc_enabled;
-    bool grpc_insecure;
+	  struct {
+	    char address[256];
+	    /** Legacy config compatibility only; current transport uses platform.rest_base_url. */
+	    bool grpc_enabled;
+	    /** Legacy config compatibility only; current transport ignores this flag. */
+	    bool grpc_insecure;
     char ca_cert[1024];
     char client_cert[1024];
     char client_key[1024];

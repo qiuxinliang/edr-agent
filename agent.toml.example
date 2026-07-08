@@ -9,11 +9,8 @@
 # ETW/采集 profile 与 P0 字段矩阵底线（WP-8）：见 docs/WP8_ETW_COLLECTION_PROFILE.md、config/profiles/wp8_compliance_baseline.env.example
 
 [server]
-# Legacy EventIngest gRPC 兼容地址。默认留空；只有旧平台迁移期才填写 host:port 并设置 grpc_enabled=true。
+# 保留为证书和历史 server_addr 兼容字段；当前通信主路径使用 [platform].rest_base_url。
 address              = ""
-grpc_enabled         = false
-# Plaintext legacy gRPC; 仅旧链路联调使用，生产保持 false。
-grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
 client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"

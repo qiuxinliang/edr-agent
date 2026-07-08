@@ -2,9 +2,8 @@
 # 前置：reset_local_edr_db.sh 已灌入 demo-tenant / ep-1~ep-3
 
 [server]
-# Legacy EventIngest gRPC 默认关闭；如需旧链路兼容，填写 127.0.0.1:50051 并设置 grpc_enabled=true。
+# 当前通信主路径使用 [platform].rest_base_url 的 HTTP/HTTPS ingest 与控制面。
 address              = ""
-grpc_enabled         = false
 ca_cert              = ""
 client_cert          = ""
 client_key           = ""

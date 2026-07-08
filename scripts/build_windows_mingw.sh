@@ -37,7 +37,40 @@ mingw_gcc_path() {
   fi
 }
 
+require_mingw_vcpkg_yara_deps() {
+  if [[ -z "$DEPS_PREFIX" ]]; then
+    echo "ERROR: Windows MinGW package builds require EDR_MINGW_DEPS_PREFIX." >&2
+    echo "Set EDR_MINGW_DEPS_PREFIX to a vcpkg MinGW dynamic triplet prefix, e.g. installed/x64-mingw-dynamic." >&2
+    echo "Do not point it at an MSVC x64-windows prefix." >&2
+    exit 2
+  fi
+  if [[ ! -f "$DEPS_PREFIX/include/curl/curl.h" ]]; then
+    echo "ERROR: EDR_WITH_HTTP2_CURL=ON requires $DEPS_PREFIX/include/curl/curl.h." >&2
+    echo "Set EDR_MINGW_DEPS_PREFIX to vcpkg installed/<triplet> containing curl/nghttp2 for MinGW." >&2
+    exit 2
+  fi
+  if [[ ! -f "$DEPS_PREFIX/include/yara.h" && ! -f "$DEPS_PREFIX/include/yara/yara.h" ]]; then
+    echo "ERROR: EDR_REQUIRE_YARA=ON requires YARA headers under $DEPS_PREFIX/include." >&2
+    echo "Install the vcpkg yara feature for a MinGW dynamic triplet such as x64-mingw-dynamic." >&2
+    exit 2
+  fi
+  if [[ ! -f "$DEPS_PREFIX/share/unofficial-libyara/unofficial-libyara-config.cmake" ]]; then
+    echo "ERROR: vcpkg unofficial-libyara config package missing under $DEPS_PREFIX/share/unofficial-libyara." >&2
+    echo "Windows MinGW YARA builds must use vcpkg libyara, not a manual YARA_ROOT fallback." >&2
+    exit 2
+  fi
+  shopt -s nullglob
+  local yara_dlls=("$DEPS_PREFIX"/bin/*yara*.dll "$DEPS_PREFIX"/bin/*YARA*.dll "$DEPS_PREFIX"/bin/libyara*.dll "$DEPS_PREFIX"/bin/libYARA*.dll)
+  shopt -u nullglob
+  if [[ ${#yara_dlls[@]} -lt 1 ]]; then
+    echo "ERROR: YARA runtime DLL missing under $DEPS_PREFIX/bin." >&2
+    echo "Use a dynamic MinGW vcpkg triplet such as x64-mingw-dynamic; static/MSVC prefixes are not valid for this package path." >&2
+    exit 2
+  fi
+}
+
 build_local() {
+  require_mingw_vcpkg_yara_deps
   cmake_args=(
     -B "$OUTDIR"
     -G Ninja
@@ -47,12 +80,13 @@ build_local() {
     -DEDR_WITH_FL_KAFKA=OFF
     -DEDR_WITH_HTTP2_CURL=ON
     -DEDR_REQUIRE_CURL_HTTP2=ON
+    -DEDR_WITH_YARA=ON
+    -DEDR_REQUIRE_YARA=ON
+    -DVCPKG_MANIFEST_FEATURES=yara
     -S "$ROOT"
   )
-  if [[ -n "$DEPS_PREFIX" ]]; then
-    export EDR_MINGW_DEPS_PREFIX="$DEPS_PREFIX"
-    cmake_args+=("-DCMAKE_PREFIX_PATH=$DEPS_PREFIX")
-  fi
+  export EDR_MINGW_DEPS_PREFIX="$DEPS_PREFIX"
+  cmake_args+=("-DCMAKE_PREFIX_PATH=$DEPS_PREFIX")
   cmake "${cmake_args[@]}"
   cmake --build "$OUTDIR" --target edr_agent -j"${NPROC:-4}"
   echo "OK: $OUTDIR/FDSensor.exe (MinGW)"
@@ -95,6 +129,7 @@ echo "  可选："
 echo "    ./scripts/build_windows_mingw_docker.sh   # Colima/Podman/Docker 任一可用即可，不经 Homebrew ghcr"
 echo "    文档: docs/WINDOWS_CROSS_COMPILE.md"
 echo "    export MINGW_PREFIX=/path/to/mingw-root   # 须含 bin/x86_64-w64-mingw32-gcc，再运行 $0"
+echo "    export EDR_MINGW_DEPS_PREFIX=/path/to/vcpkg/installed/x64-mingw-dynamic  # 须含 curl + unofficial-libyara + YARA DLL"
 echo "    或: sudo port install mingw-w64          # MacPorts"
 echo "  Docker Desktop 异常时：brew install colima docker && colima start 后重试；或 Podman Machine。"
 echo "  Homebrew ghcr 超时：勿依赖 brew bottle；用容器路径或 MINGW_PREFIX / MacPorts。"

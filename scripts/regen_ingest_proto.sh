@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# 由 proto/edr/v1/ingest.proto 生成 C++ gRPC 桩到 src/grpc_gen/edr/v1/
-# 须与最终链接的 libprotobuf 主版本一致；macOS 建议用 Homebrew 的 protoc/grpc_cpp_plugin。
+# Archived EventIngest gRPC codegen. Product builds use HTTP ingest/control.
+# Set EDR_ALLOW_LEGACY_INGEST_GRPC_CODEGEN=1 only for archived research.
 set -euo pipefail
+if [[ "${EDR_ALLOW_LEGACY_INGEST_GRPC_CODEGEN:-0}" != "1" ]]; then
+  echo "EventIngest gRPC codegen is archived. Product path uses HTTP ingest/control." >&2
+  echo "Set EDR_ALLOW_LEGACY_INGEST_GRPC_CODEGEN=1 only for archived research." >&2
+  exit 2
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 OUT="src/grpc_gen"

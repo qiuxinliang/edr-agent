@@ -1,7 +1,5 @@
 [server]
 address              = ""
-grpc_enabled         = false
-grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\EDR Agent\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\EDR Agent\\certs\\client.pem"
 client_key           = "C:\\Program Files\\EDR Agent\\certs\\client-key.pem"
