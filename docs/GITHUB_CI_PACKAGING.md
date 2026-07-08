@@ -7,20 +7,22 @@ repository root. The workflows under `.github/workflows` therefore use `cmake
 ## Why package builds disable gRPC
 
 The Windows installer job builds the production installer and should be fast and
-repeatable. It explicitly disables optional heavy dependencies:
+repeatable. It explicitly disables legacy/heavy optional components while keeping
+the endpoint detection stack intact:
 
 - `EDR_WITH_GRPC=OFF`
-- `EDR_WITH_YARA=OFF`
-- `EDR_WITH_ONNXRUNTIME=OFF`
+- `EDR_WITH_YARA=ON`
+- `EDR_REQUIRE_YARA=ON`
+- `VCPKG_MANIFEST_FEATURES=yara`
 - `EDR_WITH_FL_TRAINER=OFF`
 
-This keeps the package job on the native HTTPS/REST transport and builtin
-fallback detectors. gRPC is still supported, but it is validated in the separate
-`gRPC Smoke` workflow on Ubuntu using packaged system dependencies. That
-workflow sets `EDR_REQUIRE_GRPC=ON`, so it fails if CMake cannot find the real
-`gRPC::grpc++` target. Avoid using Windows vcpkg gRPC in the installer workflow
-because building gRPC and its dependency graph from source can take hours on
-GitHub-hosted runners.
+This keeps the package job on the native HTTPS/REST transport while requiring
+real libyara-backed scanning. The package must include both the vcpkg YARA
+runtime/static package artifacts and the rule directories: `rules/forensic`,
+`rules/shellcode`, and `rules/webshell`. gRPC is no longer part of the standard
+Windows endpoint package path; avoid adding Windows vcpkg gRPC to the installer
+workflow because building gRPC and its dependency graph from source can take
+hours on GitHub-hosted runners.
 
 ## CMake project declaration
 

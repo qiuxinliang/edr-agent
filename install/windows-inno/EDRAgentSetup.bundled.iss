@@ -80,6 +80,9 @@ Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.exa
 Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion
 Source: "..\..\config\p0_rule_bundle_ir_v1.json.enc"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\config\sensor_interest_manifest.json"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\rules\forensic\*"; DestDir: "{app}\rules\forensic"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\src\shellcode_detector\rules\*"; DestDir: "{app}\rules\shellcode"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "..\..\src\webshell_detector\rules\*"; DestDir: "{app}\rules\webshell"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\edr_agent_preflight.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\scripts\edr_agent_postinstall_verify.ps1"; DestDir: "{app}"; Flags: ignoreversion

@@ -38,6 +38,24 @@ static void test_detection_policy_fp_feedback_maps_to_env(void) {
   assert(ver != NULL && strcmp(ver, "fp-pol-test-v9") == 0);
 }
 
+static void test_command_forensic_yara_rules_dir(void) {
+  const char *fn = "edr_test_cfg_yara_dir.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[command]\n"
+          "forensic_yara_rules_dir = \"rules/forensic\"\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(strcmp(cfg.command.forensic_yara_rules_dir, "rules/forensic") == 0);
+}
+
 static void test_detection_policy_conditional_suppression(void) {
   const char *fn = "edr_test_cfg_supp.toml";
   FILE *f = fopen(fn, "wb");
@@ -89,6 +107,7 @@ int main(void) {
   }
   test_detection_policy_fp_feedback_maps_to_env();
   test_detection_policy_conditional_suppression();
+  test_command_forensic_yara_rules_dir();
   puts("config_fp ok");
   return 0;
 }

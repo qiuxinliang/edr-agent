@@ -603,6 +603,24 @@ endif()
 edr_apply_common_warnings(test_shellcode_yara_rules)
 add_test(NAME shellcode_yara_rules COMMAND test_shellcode_yara_rules WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_yara_rule_catalog_compile ${CMAKE_CURRENT_SOURCE_DIR}/test_yara_rule_catalog_compile.c)
+target_include_directories(test_yara_rule_catalog_compile PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_yara_rule_catalog_compile PRIVATE
+  EDR_FORENSIC_RULES_DIR="${CMAKE_SOURCE_DIR}/rules/forensic"
+  EDR_SHELLCODE_RULES_DIR="${CMAKE_SOURCE_DIR}/src/shellcode_detector/rules"
+  EDR_WEBSHELL_RULES_DIR="${CMAKE_SOURCE_DIR}/src/webshell_detector/rules")
+if(EDR_YARA_AVAILABLE)
+  target_compile_definitions(test_yara_rule_catalog_compile PRIVATE EDR_HAVE_YARA=1)
+  if(EDR_YARA_TARGET)
+    target_link_libraries(test_yara_rule_catalog_compile PRIVATE ${EDR_YARA_TARGET})
+  else()
+    target_include_directories(test_yara_rule_catalog_compile PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(test_yara_rule_catalog_compile PRIVATE ${YARA_LIB})
+  endif()
+endif()
+edr_apply_common_warnings(test_yara_rule_catalog_compile)
+add_test(NAME yara_rule_catalog_compile COMMAND test_yara_rule_catalog_compile WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 # P0 #2/#3 流级去重 + TLS 记录短路（纯逻辑，跨平台）
 add_executable(test_shellcode_flow_dedup
   ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_flow_dedup.c

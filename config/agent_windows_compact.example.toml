@@ -99,6 +99,7 @@ max_log_files        = 5
 allow_dangerous      = false
 allow_rtq_readonly   = true
 signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
+forensic_yara_rules_dir = "C:\\Program Files\\FDSecurity\\rules\\forensic"
 
 [self_protect]
 anti_debug           = true

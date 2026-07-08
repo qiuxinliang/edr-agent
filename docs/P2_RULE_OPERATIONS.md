@@ -15,6 +15,21 @@ This pass keeps the existing engines and adds operational controls around them.
 
 The Agent `engine_health.shellcode` payload now includes `rule_version`, `rules_source`, `rules_loaded`, `last_reload_unix_s` and `last_error`.
 
+## Forensic YARA Rules
+
+`yara_scan` supports two rule sources:
+
+1. inline `rules` in the command payload, used first for operator-supplied or catalog-expanded rules;
+2. local forensic rules when inline rules are omitted.
+
+Local forensic rule source priority is:
+
+- `[command].forensic_yara_rules_dir`
+- `EDR_YARA_RULES_DIR`
+- fallback `rules/forensic`
+
+The packaged Windows layout installs the local forensic rule set under `rules\\forensic`; shellcode and webshell rule sets are installed under `rules\\shellcode` and `rules\\webshell`. Runtime DLLs and rule directories are separate assets: the DLL makes the libyara engine available, while the rule directories provide signatures. Rule compile failures fail the scan explicitly; the degraded substring fallback is used only when `EDR_YARA_ALLOW_BUILTIN_FALLBACK=1` is set.
+
 ## WebShell AST / Token Rules
 
 `src/webshell_detector/webshell_semantic.c` is a shared lightweight semantic layer used by Linux and Windows detectors. It scores:

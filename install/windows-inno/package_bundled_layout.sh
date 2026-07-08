@@ -98,7 +98,11 @@ else
   exit 1
 fi
 
-# detection rule sets (shellcode / webshell YARA + builtin fallback)
+# detection rule sets (forensic / shellcode / webshell YARA + builtin fallback)
+if [[ -d "$EDR_AGENT_DIR/rules/forensic" ]]; then
+  mkdir -p "$OUT_DIR/rules/forensic"
+  cp -a "$EDR_AGENT_DIR/rules/forensic/." "$OUT_DIR/rules/forensic/"
+fi
 if [[ -d "$EDR_AGENT_DIR/src/shellcode_detector/rules" ]]; then
   mkdir -p "$OUT_DIR/rules/shellcode"
   cp -a "$EDR_AGENT_DIR/src/shellcode_detector/rules/." "$OUT_DIR/rules/shellcode/"
@@ -106,6 +110,20 @@ fi
 if [[ -d "$EDR_AGENT_DIR/src/webshell_detector/rules" ]]; then
   mkdir -p "$OUT_DIR/rules/webshell"
   cp -a "$EDR_AGENT_DIR/src/webshell_detector/rules/." "$OUT_DIR/rules/webshell/"
+fi
+for required_rule in \
+  "rules/forensic/VERSION" \
+  "rules/forensic/credential_theft.yar" \
+  "rules/forensic/lateral_movement.yar" \
+  "rules/forensic/privilege_escalation.yar"; do
+  if [[ ! -f "$OUT_DIR/$required_rule" ]]; then
+    echo "Error: missing bundled forensic YARA rule asset: $required_rule" >&2
+    exit 1
+  fi
+done
+if ! find "$OUT_DIR/rules/forensic" -maxdepth 1 -type f \( -name '*.yar' -o -name '*.yara' \) | grep -q .; then
+  echo "Error: rules/forensic has no .yar/.yara files" >&2
+  exit 1
 fi
 
 if [[ -f "$EDR_AGENT_DIR/agent.toml.example" ]]; then
@@ -252,6 +270,10 @@ if ! grep -Ei '(^|/)(lib)?yara.*\.dll$' "$OUT_DIR/MANIFEST.txt" >/dev/null; then
   echo "Error: MANIFEST.txt does not include a YARA runtime DLL" >&2
   exit 1
 fi
+if ! grep -E '^\./rules/forensic/.+\.yar(a)?$' "$OUT_DIR/MANIFEST.txt" >/dev/null; then
+  echo "Error: MANIFEST.txt does not include forensic YARA rules" >&2
+  exit 1
+fi
 
 mkdir -p "$SCRIPT_DIR/Output"
 ( cd "$SCRIPT_DIR/Output" && rm -f "${OUT_NAME}.zip" && zip -r -q "${OUT_NAME}.zip" "$OUT_NAME" )
@@ -261,6 +283,10 @@ if unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bun
 fi
 if ! unzip -Z1 "$ZIP_PATH" | grep -Ei '(^|/)(lib)?yara.*\.dll$' >/dev/null; then
   echo "Error: YARA runtime DLL missing from $ZIP_PATH" >&2
+  exit 1
+fi
+if ! unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)rules/forensic/.+\.yar(a)?$' >/dev/null; then
+  echo "Error: forensic YARA rules missing from $ZIP_PATH" >&2
   exit 1
 fi
 echo "OK: $ZIP_PATH"

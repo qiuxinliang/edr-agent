@@ -2,7 +2,7 @@
   "kind": "edr_p0_rule_bundle_manifest",
   "rules_bundle_version": "edr-dynamic-rules-v1-r253-b91d8e18",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 165,
+  "rule_count": 173,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -1739,6 +1739,96 @@
         "T1105",
         "T1202",
         "T1218"
+      ]
+    },
+    {
+      "id": "R-WS-LINUX-EXEC-001",
+      "title": "Linux Web 服务进程启动 shell",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059",
+        "T1505.003"
+      ]
+    },
+    {
+      "id": "R-WS-LINUX-TOOL-001",
+      "title": "Linux WebShell 下载/反连工具执行",
+      "severity": 4,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059",
+        "T1105",
+        "T1505.003"
+      ]
+    },
+    {
+      "id": "R-WS-LINUX-WEBROOT-WRITE-001",
+      "title": "Linux Web 根目录写入 WebShell 入口",
+      "severity": 3,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1105",
+        "T1505.003"
+      ]
+    },
+    {
+      "id": "R-CRED-009",
+      "title": "LSASS Dump 工具变体与内存转储参数",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1003.001"
+      ]
+    },
+    {
+      "id": "R-CRED-010",
+      "title": "DPAPI/Vault/浏览器会话凭据收集痕迹",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1555",
+        "T1555.003",
+        "T1003"
+      ]
+    },
+    {
+      "id": "R-LMOVE-016",
+      "title": "Impacket/远程执行工具横向移动痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1021.002",
+        "T1047",
+        "T1053.005",
+        "T1569.002"
+      ]
+    },
+    {
+      "id": "R-UAC-004",
+      "title": "扩展 UAC 绕过 LOLBIN 与注册表劫持痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1548.002"
+      ]
+    },
+    {
+      "id": "R-TOKEN-002",
+      "title": "Potato/PrintSpoofer/SeImpersonate 提权工具痕迹",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1068",
+        "T1134.001"
       ]
     }
   ]

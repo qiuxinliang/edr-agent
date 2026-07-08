@@ -20,11 +20,20 @@ if (-not (Test-Path -LiteralPath $bin)) {
   exit 1
 }
 $yaraRuntimeDlls = @(Get-ChildItem -Path $bin -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
+$yaraPackageArtifacts = @(
+  (Join-Path $V "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+  (Join-Path $V "lib\yara.lib"),
+  (Join-Path $V "lib\libyara.lib")
+) | Where-Object { Test-Path -LiteralPath $_ }
 if (-not $yaraRuntimeDlls -or $yaraRuntimeDlls.Count -lt 1) {
-  Write-Error "YARA runtime DLL missing from vcpkg bin: $bin. Install vcpkg manifest feature 'yara' for x64-windows before staging."
-  exit 1
+  if (-not $yaraPackageArtifacts -or $yaraPackageArtifacts.Count -lt 1) {
+    Write-Error "YARA package artifacts missing from vcpkg root: $V. Install vcpkg manifest feature 'yara' for x64-windows before staging."
+    exit 1
+  }
+  Write-Warning "No YARA runtime DLL found under $bin; vcpkg libyara appears to be linked statically for this triplet. Continuing after verifying package artifacts: $($yaraPackageArtifacts -join ', ')"
+} else {
+  Write-Host "Found YARA runtime DLL(s) in vcpkg bin: $($yaraRuntimeDlls.Name -join ', ')"
 }
-Write-Host "Found YARA runtime DLL(s) in vcpkg bin: $($yaraRuntimeDlls.Name -join ', ')"
 if (-not (Test-Path -LiteralPath $releaseExe)) {
   if (Test-Path -LiteralPath $singleConfigExe) {
     New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
@@ -51,7 +60,11 @@ Get-ChildItem -Path $bin -Filter "*.dll" -File -ErrorAction SilentlyContinue | F
 Write-Host "Staged $n vcpkg DLL(s) from $bin into $releaseDir"
 $stagedYaraRuntimeDlls = @(Get-ChildItem -Path $releaseDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
 if (-not $stagedYaraRuntimeDlls -or $stagedYaraRuntimeDlls.Count -lt 1) {
-  Write-Error "YARA runtime DLL was not staged into $releaseDir"
-  exit 1
+  if ($yaraRuntimeDlls -and $yaraRuntimeDlls.Count -ge 1) {
+    Write-Error "YARA runtime DLL was not staged into $releaseDir"
+    exit 1
+  }
+  Write-Warning "No YARA runtime DLL staged because vcpkg libyara is static for this triplet."
+} else {
+  Write-Host "Verified staged YARA runtime DLL(s): $($stagedYaraRuntimeDlls.Name -join ', ')"
 }
-Write-Host "Verified staged YARA runtime DLL(s): $($stagedYaraRuntimeDlls.Name -join ', ')"
