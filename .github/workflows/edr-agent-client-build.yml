@@ -186,8 +186,8 @@ jobs:
             Write-Host "[vcpkg] full detection build: sqlite + yara + static ONNX support (no grpc/fl)"
             & $tc install --x-feature=sqlite --x-feature=yara
           } else {
-            Write-Host "[vcpkg] fast build: manifest defaults only (no grpc/onnx/yara)"
-            & $tc install
+            Write-Host "[vcpkg] fast build: manifest defaults + sqlite + yara (no grpc/onnx)"
+            & $tc install --x-feature=sqlite --x-feature=yara
           }
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -245,6 +245,8 @@ jobs:
               -DEDR_WITH_FL_KAFKA=OFF `
               "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
               "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              -DEDR_WITH_YARA=ON `
+              -DEDR_REQUIRE_YARA=ON `
               -DEDR_BUILD_TESTS=OFF
           } else {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
@@ -259,8 +261,9 @@ jobs:
               -DEDR_WITH_ONNXRUNTIME=OFF `
               -DEDR_WITH_FL_TRAINER=OFF `
               -DEDR_WITH_FL_KAFKA=OFF `
-              -DEDR_WITH_YARA=OFF `
               "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              -DEDR_WITH_YARA=ON `
+              -DEDR_REQUIRE_YARA=ON `
               -DEDR_BUILD_TESTS=OFF
           }
           if (-not $?) { throw "cmake configure failed" }
@@ -287,6 +290,9 @@ jobs:
           }
           if ($text.Contains("0.3.0")) {
             throw "FDSensor.exe still contains legacy agent version fallback 0.3.0"
+          }
+          if ($text.Contains("This Agent build does not include libyara-backed YARA support")) {
+            throw "FDSensor.exe was built without libyara-backed YARA support"
           }
 
       - name: sccache stats

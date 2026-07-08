@@ -1266,7 +1266,7 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
 #else
     edr_cmd_inc_exec_fail();
     yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 6, target_path, "unavailable", "failed", 0, 0, 0,
-                          0, 0, NULL, "directory YARA scan requires libyara; rebuild with EDR_WITH_YARA and libyara");
+                          0, 0, NULL, "This Agent build does not include libyara-backed YARA support; upgrade to a YARA-enabled Agent build or route the request through the collector");
     return;
 #endif
   }
@@ -1355,7 +1355,7 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "yara_scan: failed (libyara unavailable)");
     yara_emit_json_result(cmd_id, sm, EdrCmdExecFailed, 6, target_path, "unavailable", "failed", 0, 0, 0,
-                          0, 0, NULL, "libyara unavailable; rebuild with EDR_WITH_YARA and libyara");
+                          0, 0, NULL, "This Agent build does not include libyara-backed YARA support; upgrade to a YARA-enabled Agent build or enable the collector/fallback path for this request");
     return;
   }
 #endif

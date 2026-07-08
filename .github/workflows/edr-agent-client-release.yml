@@ -108,9 +108,9 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-release-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: vcpkg-x64-win-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-release-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+            vcpkg-x64-win-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
 
       - name: Cache ONNX Runtime
         uses: actions/cache@v5
@@ -200,8 +200,8 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          Write-Host "[vcpkg] release fast path: curl + sqlite only (no grpc/protobuf/yara)"
-          & $tc install --x-feature=sqlite
+          Write-Host "[vcpkg] release path: curl + sqlite + yara (no grpc/protobuf)"
+          & $tc install --x-feature=sqlite --x-feature=yara
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: ONNX Runtime (CPU, Windows x64)
@@ -254,7 +254,8 @@ jobs:
             -DEDR_WITH_ONNXRUNTIME=ON `
             -DEDR_WITH_FL_TRAINER=OFF `
             -DEDR_WITH_FL_KAFKA=OFF `
-            -DEDR_WITH_YARA=OFF `
+            -DEDR_WITH_YARA=ON `
+            -DEDR_REQUIRE_YARA=ON `
             -DEDR_ENABLE_IPO=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
@@ -283,6 +284,9 @@ jobs:
           }
           if ($text.Contains("0.3.0")) {
             throw "FDSensor.exe still contains legacy agent version fallback 0.3.0"
+          }
+          if ($text.Contains("This Agent build does not include libyara-backed YARA support")) {
+            throw "FDSensor.exe was built without libyara-backed YARA support"
           }
 
       - name: sccache stats
