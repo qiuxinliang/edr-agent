@@ -1181,12 +1181,9 @@ static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
 #endif
 
 void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
-  if (!edr_command_dangerous_enabled()) {
-    edr_cmd_inc_rejected();
-    edr_command_audit_both(cmd_id, "reject yara_scan: policy");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
-    return;
-  }
+  /* yara_scan is a read-only scan. command_stub.c already applies the operator-only
+   * gate before dispatching here, so do not require the global dangerous-command
+   * switch that is reserved for destructive response actions. */
 
   /* 外移:collector 按 request(target_path/pid + 规则)异步扫描,完成由主循环 poll 上传+上报。 */
   if (forensic_external_enabled()) {
