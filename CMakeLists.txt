@@ -234,24 +234,37 @@ message(STATUS "P0 encrypted rule bundle OpenSSL support: ${EDR_WITH_P0_RULES_OP
 set(EDR_LIBTORCH_AVAILABLE 0)
 set(EDR_YARA_AVAILABLE 0)
 if(EDR_WITH_YARA)
-  find_path(YARA_INCLUDE_DIR NAMES yara.h
-    PATHS
-      ENV YARA_ROOT
-      "$ENV{YARA_ROOT}/include"
-      /opt/homebrew/include
-      /usr/local/include
-      "C:/yara/include")
-  find_library(YARA_LIB NAMES yara libyara
-    PATHS
-      ENV YARA_ROOT
-      "$ENV{YARA_ROOT}/lib"
-      /opt/homebrew/lib
-      /usr/local/lib
-      "C:/yara/lib")
+  set(_EDR_YARA_HINTS)
+  if(DEFINED ENV{YARA_ROOT})
+    list(APPEND _EDR_YARA_HINTS "$ENV{YARA_ROOT}")
+  endif()
+  if(DEFINED ENV{VCPKG_INSTALLED_X64})
+    list(APPEND _EDR_YARA_HINTS "$ENV{VCPKG_INSTALLED_X64}")
+  endif()
+  if(DEFINED VCPKG_INSTALLED_DIR)
+    list(APPEND _EDR_YARA_HINTS "${VCPKG_INSTALLED_DIR}")
+    if(DEFINED VCPKG_TARGET_TRIPLET)
+      list(APPEND _EDR_YARA_HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+    endif()
+  endif()
+  if(DEFINED ENV{VCPKG_ROOT} AND DEFINED VCPKG_TARGET_TRIPLET)
+    list(APPEND _EDR_YARA_HINTS "$ENV{VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}")
+  endif()
+  list(APPEND _EDR_YARA_HINTS /opt/homebrew /usr/local "C:/yara")
+
+  find_path(YARA_INCLUDE_DIR
+    NAMES yara.h yara/yara.h
+    HINTS ${_EDR_YARA_HINTS}
+    PATH_SUFFIXES include)
+  find_library(YARA_LIB
+    NAMES yara libyara yara64 libyara64
+    HINTS ${_EDR_YARA_HINTS}
+    PATH_SUFFIXES lib lib64)
   if(YARA_INCLUDE_DIR AND YARA_LIB)
     set(EDR_YARA_AVAILABLE 1)
+    message(STATUS "libyara support: include=${YARA_INCLUDE_DIR} lib=${YARA_LIB}")
   elseif(EDR_REQUIRE_YARA)
-    message(FATAL_ERROR "EDR_REQUIRE_YARA=ON but libyara was not found; install vcpkg yara feature or set YARA_ROOT")
+    message(FATAL_ERROR "EDR_REQUIRE_YARA=ON but libyara was not found; install vcpkg yara feature or set YARA_ROOT (include=${YARA_INCLUDE_DIR}, lib=${YARA_LIB})")
   else()
     message(STATUS "libyara not found, fallback to builtin known-exploit matcher")
   endif()
