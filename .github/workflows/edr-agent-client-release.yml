@@ -202,6 +202,18 @@ jobs:
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[vcpkg] release path: curl + sqlite + yara (no grpc/protobuf)"
           & $tc install --x-feature=sqlite --x-feature=yara
+          $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
+          Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
+          foreach ($p in @(
+            (Join-Path $vcpkgX64 "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+            (Join-Path $vcpkgX64 "include\yara.h"),
+            (Join-Path $vcpkgX64 "include\yara\yara.h"),
+            (Join-Path $vcpkgX64 "lib\yara.lib"),
+            (Join-Path $vcpkgX64 "lib\libyara.lib")
+          )) {
+            if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
+          }
+
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: ONNX Runtime (CPU, Windows x64)
@@ -244,6 +256,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
+            "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
@@ -258,7 +273,6 @@ jobs:
             -DEDR_REQUIRE_YARA=ON `
             -DEDR_ENABLE_IPO=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-            "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 

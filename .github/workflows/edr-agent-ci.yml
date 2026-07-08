@@ -57,6 +57,18 @@ jobs:
           $v = Join-Path $vroot "vcpkg.exe"
           Push-Location $env:GITHUB_WORKSPACE
           & $v install --x-feature=yara
+          $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
+          Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
+          foreach ($p in @(
+            (Join-Path $vcpkgX64 "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+            (Join-Path $vcpkgX64 "include\yara.h"),
+            (Join-Path $vcpkgX64 "include\yara\yara.h"),
+            (Join-Path $vcpkgX64 "lib\yara.lib"),
+            (Join-Path $vcpkgX64 "lib\libyara.lib")
+          )) {
+            if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
+          }
+
           Pop-Location
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
@@ -74,6 +86,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $tcf)) { throw "vcpkg toolchain: $tcf" }
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+            "-DVCPKG_MANIFEST_FEATURES=yara" `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `

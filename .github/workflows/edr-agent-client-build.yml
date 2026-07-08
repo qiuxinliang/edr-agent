@@ -185,6 +185,18 @@ jobs:
           if ('${{ inputs.full_features }}' -eq 'true') {
             Write-Host "[vcpkg] full detection build: sqlite + yara + static ONNX support (no grpc/fl)"
             & $tc install --x-feature=sqlite --x-feature=yara
+            $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
+            Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
+            foreach ($p in @(
+              (Join-Path $vcpkgX64 "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+              (Join-Path $vcpkgX64 "include\yara.h"),
+              (Join-Path $vcpkgX64 "include\yara\yara.h"),
+              (Join-Path $vcpkgX64 "lib\yara.lib"),
+              (Join-Path $vcpkgX64 "lib\libyara.lib")
+            )) {
+              if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
+            }
+
           } else {
             Write-Host "[vcpkg] fast build: manifest defaults + sqlite + yara (no grpc/onnx)"
             & $tc install --x-feature=sqlite --x-feature=yara
@@ -233,6 +245,8 @@ jobs:
           if ('${{ inputs.full_features }}' -eq 'true') {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
               -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+              "-DVCPKG_MANIFEST_FEATURES=yara" `
               "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
@@ -244,13 +258,15 @@ jobs:
               -DEDR_WITH_FL_TRAINER=OFF `
               -DEDR_WITH_FL_KAFKA=OFF `
               "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
               -DEDR_WITH_YARA=ON `
               -DEDR_REQUIRE_YARA=ON `
               -DEDR_BUILD_TESTS=OFF
           } else {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
               -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+              "-DVCPKG_MANIFEST_FEATURES=yara" `
               "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
@@ -261,7 +277,7 @@ jobs:
               -DEDR_WITH_ONNXRUNTIME=OFF `
               -DEDR_WITH_FL_TRAINER=OFF `
               -DEDR_WITH_FL_KAFKA=OFF `
-              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
               -DEDR_WITH_YARA=ON `
               -DEDR_REQUIRE_YARA=ON `
               -DEDR_BUILD_TESTS=OFF
