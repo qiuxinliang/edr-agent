@@ -285,34 +285,103 @@ static void json_escape_to(char *dst, size_t cap, const char *s) {
   dst[o < cap ? o : cap - 1u] = '\0';
 }
 
+static char *json_escape_alloc_cmd(const char *s) {
+  if (!s) {
+    s = "";
+  }
+  size_t len = strlen(s);
+  if (len > (((size_t)-1) - 3u) / 6u) {
+    return NULL;
+  }
+  size_t cap = len * 6u + 3u;
+  char *out = (char *)malloc(cap);
+  if (!out) {
+    return NULL;
+  }
+  size_t o = 0;
+  out[o++] = '"';
+  for (; *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') {
+      out[o++] = '\\';
+      out[o++] = (char)c;
+    } else if (c == '\n') {
+      out[o++] = '\\';
+      out[o++] = 'n';
+    } else if (c == '\r') {
+      out[o++] = '\\';
+      out[o++] = 'r';
+    } else if (c == '\t') {
+      out[o++] = '\\';
+      out[o++] = 't';
+    } else if (c < 0x20u) {
+      o += (size_t)snprintf(out + o, cap - o, "\\u%04x", (unsigned)c);
+    } else {
+      out[o++] = (char)c;
+    }
+  }
+  out[o++] = '"';
+  out[o] = '\0';
+  return out;
+}
+
 static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
                          int exit_code, const char *detail, const char *response_status,
                          const char *artifacts) {
-  char detail_json[40000];
   char taskj[300];
   char statusj[96];
-  char raw[32000];
-  char err[1600];
+  char *detail_json = NULL;
+  char *raw = NULL;
+  char *err = NULL;
   const char *rstatus = response_status && response_status[0] ? response_status : response_status_label(st);
+  const char *artifact_json = artifacts && artifacts[0] ? artifacts : "[]";
+  const char *err_text = st == EdrCmdExecOk ? "" : (detail ? detail : response_status_label(st));
   int retryable = (st == EdrCmdExecFailed && exit_code != 1 && exit_code != 2 && exit_code != 7) ? 1 : 0;
   json_escape_to(taskj, sizeof(taskj), cmd_id ? cmd_id : "");
   json_escape_to(statusj, sizeof(statusj), rstatus);
-  json_escape_to(raw, sizeof(raw), detail ? detail : "");
-  json_escape_to(err, sizeof(err), st == EdrCmdExecOk ? "" : (detail ? detail : response_status_label(st)));
-  snprintf(detail_json, sizeof(detail_json),
-           "{\"task_id\":%s,\"status\":%s,\"exit_code\":%d,"
-           "\"evidence_refs\":[],\"upload_refs\":[],\"artifacts\":%s,\"error\":%s,"
-           "\"retryable\":%s,\"raw_detail\":%s}",
-           taskj, statusj, exit_code, artifacts && artifacts[0] ? artifacts : "[]", err,
-           retryable ? "true" : "false", raw);
+  raw = json_escape_alloc_cmd(detail ? detail : "");
+  err = json_escape_alloc_cmd(err_text);
+  if (raw && err) {
+    size_t need = strlen(taskj) + strlen(statusj) + strlen(artifact_json) +
+                  strlen(err) + strlen(raw) + 256u;
+    detail_json = (char *)malloc(need);
+    if (detail_json) {
+      snprintf(detail_json, need,
+               "{\"task_id\":%s,\"status\":%s,\"exit_code\":%d,"
+               "\"evidence_refs\":[],\"upload_refs\":[],\"artifacts\":%s,\"error\":%s,"
+               "\"retryable\":%s,\"raw_detail\":%s}",
+               taskj, statusj, exit_code, artifact_json, err,
+               retryable ? "true" : "false", raw);
+    }
+  }
+  if (!detail_json) {
+    char fallback[4096];
+    char small_raw[1800];
+    char small_err[1200];
+    json_escape_to(small_raw, sizeof(small_raw), detail ? detail : "");
+    json_escape_to(small_err, sizeof(small_err), err_text);
+    snprintf(fallback, sizeof(fallback),
+             "{\"task_id\":%s,\"status\":%s,\"exit_code\":%d,"
+             "\"evidence_refs\":[],\"upload_refs\":[],\"artifacts\":%s,\"error\":%s,"
+             "\"retryable\":%s,\"raw_detail\":%s}",
+             taskj, statusj, exit_code, artifact_json, small_err,
+             retryable ? "true" : "false", small_raw);
+    detail_json = (char *)malloc(strlen(fallback) + 1u);
+    if (detail_json) {
+      strcpy(detail_json, fallback);
+    }
+  }
   int report_pending = 0;
-  if (command_should_report(cmd_id, sm)) {
+  if (detail_json && command_should_report(cmd_id, sm)) {
     int rc = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
     report_pending = (rc != 0);
   }
   edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "", sm, rstatus,
                            (int)st, exit_code, detail ? detail : "", artifacts ? artifacts : "",
                            report_pending);
+  free(raw);
+  free(err);
+  free(detail_json);
 }
 
 static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
@@ -3807,8 +3876,9 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
            "[{\"type\":\"velo_rows\",\"path\":%s,\"sha256\":\"%s\","
            "\"upload_status\":\"%s\",\"minio_key\":%s}]",
            pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
-  /* 内联上限：env EDR_VELO_INLINE_CAP 可调，默认 20000（≈ soar raw 上限）。 */
-  unsigned long long inline_cap = 20000ull;
+  /* 内联上限：env EDR_VELO_INLINE_CAP 可调，默认 256KiB。
+   * 进程表常因长命令行超过旧 20KB 阈值；能内联时不让对象存储临时故障影响表格回显。 */
+  unsigned long long inline_cap = 256ull * 1024ull;
   {
     const char *cs = getenv("EDR_VELO_INLINE_CAP");
     if (cs && cs[0]) {
@@ -3816,6 +3886,9 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
       if (v > 0) {
         inline_cap = (unsigned long long)v;
       }
+    }
+    if (inline_cap > 1024ull * 1024ull) {
+      inline_cap = 1024ull * 1024ull;
     }
   }
   if (fsz <= inline_cap) {
