@@ -40,6 +40,9 @@ typedef struct {
 static RansomCounterBucket g_ransom_buckets[RANSOM_COUNTER_BUCKETS];
 static RansomNoteBucket g_ransom_note_buckets[RANSOM_NOTE_BUCKETS];
 
+static int ransom_policy_token_match(const char *env_inline, const char *env_file, const char *fallback,
+                                     const char *value);
+
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = ++g_event_seq;
   snprintf(out, cap, "e-%llx-%llx", (unsigned long long)(uint64_t)time_ns,
@@ -137,10 +140,18 @@ static int known_low_value_ransom_counter_process(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  const char *s = r->process_name[0] ? r->process_name : r->exe_path;
-  return has_ci_ascii(s, "taskmgr.exe") || has_ci_ascii(s, "usoclient.exe") ||
-         has_ci_ascii(s, "taskhostw.exe") || has_ci_ascii(s, "ecagent.exe") ||
-         has_ci_ascii(s, "checknetisolation.exe") || has_ci_ascii(s, "conhost.exe");
+  char subject[8192];
+  snprintf(subject, sizeof(subject), "%s %s %s",
+           r->process_name, r->exe_path, r->cmdline);
+  const char *fallback =
+      "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
+      "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
+  if (ransom_policy_token_match("EDR_RANSOM_LOW_VALUE_PROCESSES",
+                                "EDR_RANSOM_LOW_VALUE_PROCESSES_FILE", fallback, subject)) {
+    return 1;
+  }
+  return ransom_policy_token_match("EDR_RANSOM_BULK_SAFE_PROCESSES",
+                                   "EDR_RANSOM_BULK_SAFE_PROCESSES_FILE", "", subject);
 }
 
 static char fold_ascii(char c) {
@@ -394,6 +405,20 @@ static int file_content_entropy_sample(const char *path, double *out_entropy, si
     *out_entropy = entropy;
   }
   return 1;
+}
+
+static int should_sample_ransom_content_entropy(const RansomCounterBucket *b, int ext_changed, int canary) {
+  if (canary) {
+    return 1;
+  }
+  if (env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", 0, 0, 1)) {
+    return 1;
+  }
+  if (ext_changed && env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_ON_EXT_CHANGE", 1, 0, 1)) {
+    return 1;
+  }
+  int min_events = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_MIN_EVENTS", 6, 1, 200);
+  return b && (int)b->file_events >= min_events;
 }
 
 static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int64_t now_ns, int64_t window_ns) {
@@ -681,12 +706,13 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   double path_entropy = path_entropy_score(r->file_path);
   double content_entropy = 0.0;
   size_t content_sample = 0u;
-  int content_ok = file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
-  double entropy = content_ok ? content_entropy : path_entropy;
   double prev = b->entropy_avg;
   b->file_events++;
   (void)ext_seen_or_add(b, ext);
   (void)dir_seen_or_add(b, dir);
+  int content_deferred = !should_sample_ransom_content_entropy(b, ext_changed, canary);
+  int content_ok = content_deferred ? 0 : file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
+  double entropy = content_ok ? content_entropy : path_entropy;
   if (b->file_events == 1u || prev <= 0.0) {
     b->entropy_avg = entropy;
   } else {
@@ -724,9 +750,10 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
                   (suspicious && ext_changed && content_high && b->file_events >= 20u);
   append_record_kv(r,
                    "file_rate=%.0f ext_burst=%u dir_burst=%u entropy_delta=%.2f high_entropy_ratio=%.2f "
-                   "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d%s%s%s",
+                   "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d%s%s%s%s",
                    file_rate, (unsigned)b->ext_count, (unsigned)b->dir_count, entropy_delta,
                    high_entropy_ratio, path_entropy, content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
+                   content_deferred ? " content_entropy_deferred=1" : "",
                    (suspicious || confirmed) ? " ransom_counter=1" : "",
                    confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
                    (suspicious ? " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3" : ""),

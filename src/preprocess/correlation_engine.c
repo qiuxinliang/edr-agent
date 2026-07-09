@@ -36,7 +36,7 @@
 #define CORR_EV_FIELD 96u            /* 证据关键字段截断长度 */
 #define CORR_MAX_STEPS 6u            /* 序列规则最大步数 */
 #define CORR_EMIT_MIN_INTERVAL_MS 3000u /* 同一 (rule,key) 最小发射间隔（内建去抖） */
-#define CORR_DEFAULT_MAX_EMITS_PER_MIN 120u /* 引擎级全局发射上限（agent 单端点即端点级上限） */
+#define CORR_DEFAULT_MAX_EMITS_PER_MIN 32u /* 引擎级全局发射上限（agent 单端点即端点级上限） */
 
 typedef enum {
   CORR_KIND_THRESHOLD = 1, /* 窗口内某维度计数/去重达阈值 */
@@ -733,6 +733,25 @@ static void corr_evidence_push(CorrStateSlot *s, uint32_t type, uint32_t pid,
   }
 }
 
+static void corr_slot_reset_window(CorrStateSlot *s, int64_t now_ns) {
+  uint64_t key_hash;
+  uint16_t rule_idx;
+  int64_t last_emit_ms;
+  if (!s) {
+    return;
+  }
+  key_hash = s->key_hash;
+  rule_idx = s->rule_idx;
+  last_emit_ms = s->last_emit_ms;
+  memset(s, 0, sizeof(*s));
+  s->used = 1;
+  s->key_hash = key_hash;
+  s->rule_idx = rule_idx;
+  s->first_seen_ns = now_ns;
+  s->last_seen_ns = now_ns;
+  s->last_emit_ms = last_emit_ms;
+}
+
 /* ------------------------------------------------------------ 发射通道 */
 
 /* 内建去抖：同一 (rule,key) 槽在 CORR_EMIT_MIN_INTERVAL_MS 内只发一次。 */
@@ -785,19 +804,98 @@ static int corr_global_emit_allow(int64_t now_ms) {
   return 1;
 }
 
+static void corr_json_escape(const char *in, char *out, size_t cap, size_t max_chars) {
+  size_t o = 0;
+  size_t used_chars = 0;
+  if (!out || cap == 0) {
+    return;
+  }
+  out[0] = '\0';
+  if (!in) {
+    return;
+  }
+  for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+    unsigned char c = *p;
+    if (max_chars > 0 && used_chars >= max_chars) {
+      break;
+    }
+    used_chars++;
+    if (c == '"' || c == '\\') {
+      if (o + 2 >= cap) break;
+      out[o++] = '\\';
+      out[o++] = (char)c;
+      continue;
+    }
+    switch (c) {
+    case '\b':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'b';
+      break;
+    case '\f':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'f';
+      break;
+    case '\n':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'n';
+      break;
+    case '\r':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'r';
+      break;
+    case '\t':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 't';
+      break;
+    default:
+      if (c < 0x20u) {
+        if (o + 6 >= cap) goto done;
+        snprintf(out + o, cap - o, "\\u%04x", (unsigned)c);
+        o += 6;
+      } else {
+        if (o + 1 >= cap) goto done;
+        out[o++] = (char)c;
+      }
+      break;
+    }
+  }
+done:
+  out[o < cap ? o : cap - 1] = '\0';
+}
+
 /* 构造证据链 JSON 到 user_subject_json（≤4KiB）。 */
 static void corr_build_subject_json(const CorrRule *rule, const CorrStateSlot *s,
                                     char *out, size_t cap) {
-  int n = snprintf(out, cap,
-                   "{\"subject_type\":\"edr_correlation\",\"rule_id\":\"%s\","
-                   "\"rules_bundle_version\":\"%s\",\"display_title\":\"%s\","
-                   "\"window_ms\":%lld,\"count\":%u,\"evidence_chain\":[",
-                   rule->id, s_bundle_version, rule->title,
-                   (long long)rule->window_ms, s->count);
+  char rule_id[96];
+  char bundle[192];
+  char title[384];
+  uint32_t count;
+  uint32_t distinct;
+  int n;
+  if (!out || cap == 0 || !rule || !s) {
+    return;
+  }
+  corr_json_escape(rule->id, rule_id, sizeof(rule_id), 0);
+  corr_json_escape(s_bundle_version, bundle, sizeof(bundle), 0);
+  corr_json_escape(rule->title, title, sizeof(title), 0);
+  distinct = s->n_distinct;
+  count = distinct > 0 ? distinct : s->count;
+  n = snprintf(out, cap,
+               "{\"subject_type\":\"edr_correlation\",\"rule_id\":\"%s\","
+               "\"rules_bundle_version\":\"%s\",\"display_title\":\"%s\","
+               "\"window_ms\":%lld,\"count\":%u,\"distinct\":%u,\"evidence_chain\":[",
+               rule_id, bundle, title, (long long)rule->window_ms, count, distinct);
   for (uint8_t i = 0; i < s->ev_count && n > 0 && (size_t)n < cap; i++) {
+    char detail[256];
+    corr_json_escape(s->ev[i].key_field, detail, sizeof(detail), 80);
     n += snprintf(out + n, cap - (size_t)n,
-                  "%s{\"type\":%u,\"pid\":%u,\"detail\":\"%.80s\"}",
-                  i ? "," : "", s->ev[i].type, s->ev[i].pid, s->ev[i].key_field);
+                  "%s{\"type\":%u,\"pid\":%u,\"detail\":\"%s\"}",
+                  i ? "," : "", s->ev[i].type, s->ev[i].pid, detail);
   }
   if (n > 0 && (size_t)n < cap) {
     snprintf(out + n, cap - (size_t)n, "]}");
@@ -891,6 +989,7 @@ static uint32_t corr_dimension_fp(const CorrRule *rule, const EdrSensorInterestE
 
 static int corr_proc_is_bulk_file_safe(const char *process_name); /* 定义见下 */
 static int corr_dns_is_tunnel_like(const char *qname);             /* 定义见下 */
+static int corr_ransom_interest_ok(const EdrSensorInterestEvent *ev); /* 定义见下 */
 
 void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
   int64_t now_ns;
@@ -919,6 +1018,9 @@ void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
     if (rule->th_skip_safe_proc && corr_proc_is_bulk_file_safe(ev->process_name)) {
       continue;
     }
+    if (strcmp(rule->id, "R-CORR-RANSOM-001") == 0 && !corr_ransom_interest_ok(ev)) {
+      continue;
+    }
     /* DNS 隧道：仅统计具备隧道特征（长标签/超长）的查询，正常域名不计入。 */
     if (rule->th_dns_long_label && !corr_dns_is_tunnel_like(ev->path)) {
       continue;
@@ -943,6 +1045,7 @@ void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
     }
     if (hit >= rule->th_threshold) {
       corr_emit(rule, slot, ev->pid, ev->process_name);
+      corr_slot_reset_window(slot, now_ns);
     }
   }
 }
@@ -1059,6 +1162,85 @@ static int corr_path_contains_ci(const char *hay, const char *needle) {
     }
   }
   return 0;
+}
+
+static int corr_path_ends_ci(const char *s, const char *suffix) {
+  size_t sl, nl;
+  if (!s || !suffix || !suffix[0]) {
+    return 0;
+  }
+  sl = strlen(s);
+  nl = strlen(suffix);
+  if (nl > sl) {
+    return 0;
+  }
+  return corr_path_contains_ci(s + sl - nl, suffix);
+}
+
+static int corr_path_has_path_shape(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  for (const char *p = path; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x20u) {
+      return 0;
+    }
+    if (*p == '\\' || *p == '/' || *p == ':') {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int corr_path_is_low_value_file_write(const char *path) {
+  static const char *const low_dirs[] = {
+      "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\microsoft\\edge\\user data\\",
+      "\\appdata\\local\\google\\chrome\\user data\\", "\\appdata\\local\\packages\\",
+      "\\appdata\\local\\microsoft\\windows\\inetcache\\", "\\windows\\softwaredistribution\\",
+      "\\windows\\system32\\winevt\\logs\\", "\\programdata\\microsoft\\windows defender\\",
+      "\\programdata\\fdsecurity\\setup-ui\\", "\\programdata\\fdsecurity\\collector\\",
+      "\\onedrive\\logs\\", "\\cache\\",
+  };
+  static const char *const low_exts[] = {
+      ".tmp", ".temp", ".log", ".etl", ".evtx", ".cache", ".lock",
+  };
+  if (!path || !path[0]) {
+    return 1;
+  }
+  for (size_t i = 0; i < sizeof(low_dirs) / sizeof(low_dirs[0]); i++) {
+    if (corr_path_contains_ci(path, low_dirs[i])) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < sizeof(low_exts) / sizeof(low_exts[0]); i++) {
+    if (corr_path_ends_ci(path, low_exts[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int corr_ransom_interest_ok(const EdrSensorInterestEvent *ev) {
+  if (!ev || ev->type != EDR_EVENT_FILE_WRITE) {
+    return 0;
+  }
+  if (ev->pid == 0u || ev->pid == 4u) {
+    return 0;
+  }
+  if (!ev->process_name[0] || strncmp(ev->process_name, "pid:", 4) == 0) {
+    return 0;
+  }
+  if (corr_proc_is_bulk_file_safe(ev->process_name)) {
+    return 0;
+  }
+  if (!corr_path_has_path_shape(ev->path)) {
+    return 0;
+  }
+  if (corr_path_is_low_value_file_write(ev->path)) {
+    return 0;
+  }
+  return 1;
 }
 
 /* 路径是否为凭证类存储（用于 CORR_STEP_REQUIRE_CRED_PATH）。

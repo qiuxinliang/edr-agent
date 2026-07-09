@@ -32,6 +32,7 @@ static int has_ci(const char *hay, const char *needle) {
 
 static int detail_value(const char *text, const char *key, char *out, size_t cap);
 static double detail_number(const char *text, const char *key, double fallback);
+static int policy_token_match(const char *env_inline, const char *env_file, const char *fallback, const char *value);
 
 static const char *base_name(const char *path) {
   const char *b = path && path[0] ? path : "";
@@ -66,10 +67,18 @@ static int decision_low_value_ransom_process(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  const char *s = r->process_name[0] ? r->process_name : r->exe_path;
-  return has_ci(s, "taskmgr.exe") || has_ci(s, "usoclient.exe") ||
-         has_ci(s, "taskhostw.exe") || has_ci(s, "ecagent.exe") ||
-         has_ci(s, "checknetisolation.exe") || has_ci(s, "conhost.exe");
+  char subject[8192];
+  snprintf(subject, sizeof(subject), "%s %s %s",
+           r->process_name, r->exe_path, r->cmdline);
+  const char *fallback =
+      "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
+      "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
+  if (policy_token_match("EDR_RANSOM_LOW_VALUE_PROCESSES",
+                         "EDR_RANSOM_LOW_VALUE_PROCESSES_FILE", fallback, subject)) {
+    return 1;
+  }
+  return policy_token_match("EDR_RANSOM_BULK_SAFE_PROCESSES",
+                            "EDR_RANSOM_BULK_SAFE_PROCESSES_FILE", "", subject);
 }
 
 static int decision_suppress_ransom_file_signal(const EdrBehaviorRecord *r) {
