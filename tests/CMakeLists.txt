@@ -1,5 +1,11 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+add_executable(test_shell_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_policy.c
+  ${CMAKE_SOURCE_DIR}/src/command/shell_exec.c)
+target_include_directories(test_shell_policy PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_shell_policy)
+add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c)
 target_include_directories(test_command_inbox PRIVATE ${CMAKE_SOURCE_DIR}/include)

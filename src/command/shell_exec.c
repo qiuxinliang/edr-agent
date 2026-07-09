@@ -41,6 +41,45 @@ static const char *g_shell_block_default[] = {
 static const char **g_shell_allow = NULL;
 static const char **g_shell_block = NULL;
 
+static int json_hex_value(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static int append_utf8_codepoint(uint32_t cp, char *out, size_t out_size, size_t *idx) {
+  if (!out || !idx || out_size == 0) return 0;
+  if (cp <= 0x7Fu) {
+    if (*idx + 1 >= out_size) return 0;
+    out[(*idx)++] = (char)cp;
+    return 1;
+  }
+  if (cp <= 0x7FFu) {
+    if (*idx + 2 >= out_size) return 0;
+    out[(*idx)++] = (char)(0xC0u | ((cp >> 6) & 0x1Fu));
+    out[(*idx)++] = (char)(0x80u | (cp & 0x3Fu));
+    return 1;
+  }
+  if (cp >= 0xD800u && cp <= 0xDFFFu) {
+    cp = 0xFFFDu;
+  }
+  if (cp <= 0xFFFFu) {
+    if (*idx + 3 >= out_size) return 0;
+    out[(*idx)++] = (char)(0xE0u | ((cp >> 12) & 0x0Fu));
+    out[(*idx)++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+    out[(*idx)++] = (char)(0x80u | (cp & 0x3Fu));
+    return 1;
+  }
+  if (cp > 0x10FFFFu) cp = 0xFFFDu;
+  if (*idx + 4 >= out_size) return 0;
+  out[(*idx)++] = (char)(0xF0u | ((cp >> 18) & 0x07u));
+  out[(*idx)++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+  out[(*idx)++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+  out[(*idx)++] = (char)(0x80u | (cp & 0x3Fu));
+  return 1;
+}
+
 void edr_shell_load_policy(const char **allow, const char **block) {
   g_shell_allow = allow;
   g_shell_block = block;
@@ -271,6 +310,21 @@ int edr_parse_json_string(const uint8_t *payload, size_t len,
       if (*pos == 'n') out[i++] = '\n';
       else if (*pos == 'r') out[i++] = '\r';
       else if (*pos == 't') out[i++] = '\t';
+      else if (*pos == 'b') out[i++] = '\b';
+      else if (*pos == 'f') out[i++] = '\f';
+      else if (*pos == 'u' && pos + 4 < end) {
+        int h0 = json_hex_value(pos[1]);
+        int h1 = json_hex_value(pos[2]);
+        int h2 = json_hex_value(pos[3]);
+        int h3 = json_hex_value(pos[4]);
+        if (h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0) {
+          uint32_t cp = (uint32_t)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+          (void)append_utf8_codepoint(cp, out, out_size, &i);
+          pos += 4;
+        } else {
+          out[i++] = *pos;
+        }
+      }
       else out[i++] = *pos;
     } else {
       out[i++] = *pos;
