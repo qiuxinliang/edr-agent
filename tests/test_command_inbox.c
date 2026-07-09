@@ -10,6 +10,7 @@
 #define TEST_PID _getpid()
 static void test_setenv(const char *name, const char *value) { _putenv_s(name, value); }
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #define TEST_PID getpid()
 static void test_setenv(const char *name, const char *value) { setenv(name, value, 1); }
@@ -35,10 +36,12 @@ static void require_true(int ok, const char *msg) {
 }
 
 int main(void) {
+  char state_dir[512];
   char state_path[512];
   char inbox_dir[512];
   long long suffix = ((long long)time(NULL) * 100000LL) + (long long)TEST_PID;
-  snprintf(state_path, sizeof(state_path), "./test_command_state_%lld.jsonl", suffix);
+  snprintf(state_dir, sizeof(state_dir), "./test_command_state_%lld", suffix);
+  snprintf(state_path, sizeof(state_path), "%s/command_state.jsonl", state_dir);
   snprintf(inbox_dir, sizeof(inbox_dir), "./test_command_inbox_%lld", suffix);
   test_setenv("EDR_COMMAND_STATE_DB", state_path);
   test_setenv("EDR_COMMAND_INBOX_DIR", inbox_dir);
@@ -79,6 +82,39 @@ int main(void) {
                            "done", NULL, 0);
   n = edr_command_state_collect_inbox(records, 4);
   require_true(n == 0, "final command is not replayed from inbox");
+
+  EdrSoarCommandMeta replay_meta = meta;
+  snprintf(replay_meta.idempotency_key, sizeof(replay_meta.idempotency_key), "%s", "idem-replay|sigv1|placeholder");
+  require_true(edr_command_state_store_inbox("cmd-inbox-replay", "echo",
+                                            payload, sizeof(payload) - 1u, &replay_meta) == 0,
+               "store replay inbox");
+  int retries = 0;
+  EdrCommandStateRecord dup;
+  require_true(edr_command_state_begin("cmd-inbox-replay", "echo", &replay_meta, &retries, &dup) ==
+                   EDR_COMMAND_STATE_BEGIN_READY,
+               "begin replay command");
+  require_true(edr_command_state_replay_begin("cmd-inbox-replay", "echo", &replay_meta, &retries, &dup) ==
+                   EDR_COMMAND_STATE_BEGIN_DUP_RUNNING,
+               "same boot replay is deferred while running");
+  edr_command_state_finish("cmd-inbox-replay", "echo", &replay_meta, "ok", 1, 0,
+                           "done", NULL, 0);
+  require_true(edr_command_state_replay_begin("cmd-inbox-replay", "echo", &replay_meta, &retries, &dup) ==
+                   EDR_COMMAND_STATE_BEGIN_DUP_FINAL,
+               "final replay is suppressed");
+  edr_command_state_delete_inbox("cmd-inbox-replay");
+
+#ifndef _WIN32
+  char bad_inbox_dir[512];
+  snprintf(bad_inbox_dir, sizeof(bad_inbox_dir), "./test_command_inbox_bad_%lld", suffix);
+  require_true(mkdir(bad_inbox_dir, 0777) == 0, "create insecure inbox dir");
+  require_true(chmod(bad_inbox_dir, 0777) == 0, "chmod insecure inbox dir");
+  test_setenv("EDR_COMMAND_INBOX_DIR", bad_inbox_dir);
+  require_true(edr_command_state_store_inbox("cmd-inbox-bad", "echo",
+                                            payload, sizeof(payload) - 1u, &replay_meta) != 0,
+               "reject group/world writable inbox dir");
+  (void)chmod(bad_inbox_dir, 0700);
+  (void)rmdir(bad_inbox_dir);
+#endif
 
   printf("ok\n");
   return 0;

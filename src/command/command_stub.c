@@ -4638,6 +4638,19 @@ static void replay_persisted_command_inbox(void) {
       edr_command_state_free_inbox_record(&inbox[i]);
       continue;
     }
+    s_active_command_type = inbox[i].command_type;
+    char sig_reason[160];
+    sig_reason[0] = '\0';
+    if (!command_signature_verify(inbox[i].command_id, inbox[i].command_type,
+                                  inbox[i].payload, inbox[i].payload_len,
+                                  &inbox[i].meta, sig_reason, sizeof(sig_reason))) {
+      audit_both(inbox[i].command_id, sig_reason[0] ? sig_reason : "persisted command signature rejected");
+      soar_emit(inbox[i].command_id, &inbox[i].meta, EdrCmdExecRejected, 15,
+                sig_reason[0] ? sig_reason : "persisted command signature rejected");
+      edr_command_state_delete_inbox(inbox[i].command_id);
+      edr_command_state_free_inbox_record(&inbox[i]);
+      continue;
+    }
     char reason[180];
     reason[0] = '\0';
     if (command_deadline_expired(&inbox[i].meta, reason, sizeof(reason))) {
@@ -4645,6 +4658,31 @@ static void replay_persisted_command_inbox(void) {
       soar_emit_ex(inbox[i].command_id, &inbox[i].meta, EdrCmdExecFailed, 16,
                    reason, "timeout", NULL);
       edr_command_state_delete_inbox(inbox[i].command_id);
+      edr_command_state_free_inbox_record(&inbox[i]);
+      continue;
+    }
+    int retry_count = 0;
+    EdrCommandStateRecord dup;
+    int begin_rc = edr_command_state_replay_begin(inbox[i].command_id, inbox[i].command_type,
+                                                  &inbox[i].meta, &retry_count, &dup);
+    if (begin_rc == EDR_COMMAND_STATE_BEGIN_DUP_FINAL) {
+      audit_both(inbox[i].command_id, "persisted command replay suppressed by final idempotency state");
+      edr_command_state_delete_inbox(inbox[i].command_id);
+      edr_command_state_free_inbox_record(&inbox[i]);
+      continue;
+    }
+    if (begin_rc == EDR_COMMAND_STATE_BEGIN_DUP_RUNNING) {
+      char detail[320];
+      snprintf(detail, sizeof(detail), "persisted command replay deferred; command already running id=%s type=%s retry=%d",
+               dup.command_id[0] ? dup.command_id : inbox[i].command_id,
+               dup.command_type[0] ? dup.command_type : inbox[i].command_type,
+               retry_count);
+      audit_both(inbox[i].command_id, detail);
+      edr_command_state_free_inbox_record(&inbox[i]);
+      continue;
+    }
+    if (begin_rc != EDR_COMMAND_STATE_BEGIN_READY) {
+      audit_both(inbox[i].command_id, "persisted command replay begin failed");
       edr_command_state_free_inbox_record(&inbox[i]);
       continue;
     }

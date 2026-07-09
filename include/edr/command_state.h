@@ -21,6 +21,8 @@ typedef struct EdrCommandStateRecord {
   int final_record;
   int report_pending;
   int64_t updated_unix_ms;
+  char agent_boot_id[64];
+  int process_id;
   char soar_correlation_id[128];
   char playbook_run_id[128];
   char playbook_step_id[128];
@@ -46,6 +48,10 @@ enum {
 int edr_command_state_begin(const char *command_id, const char *command_type,
                             const EdrSoarCommandMeta *meta, int *out_retry_count,
                             EdrCommandStateRecord *out_duplicate);
+
+int edr_command_state_replay_begin(const char *command_id, const char *command_type,
+                                   const EdrSoarCommandMeta *meta, int *out_retry_count,
+                                   EdrCommandStateRecord *out_duplicate);
 
 void edr_command_state_finish(const char *command_id, const char *command_type,
                               const EdrSoarCommandMeta *meta, const char *response_status,
