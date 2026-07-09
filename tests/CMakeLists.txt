@@ -258,6 +258,14 @@ add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/t
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c)
 target_include_directories(test_local_evidence_cache_candidate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(SQLite3_FOUND)
+  if(TARGET SQLite3::SQLite3)
+    target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite3::SQLite3)
+  else()
+    target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite::SQLite3)
+  endif()
+  target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_SQLITE=1)
+endif()
 edr_apply_common_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 

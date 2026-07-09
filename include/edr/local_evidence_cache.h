@@ -95,10 +95,24 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap);
 
 /**
  * RTQ/RTR 轻量查询：payload_json 支持 event_type/type、pid、endpoint_id、
- * process_name_contains、cmdline_contains、file_path_contains、remote_ip、
- * registry_key_contains、limit、time_window_s。优先返回内存 ring，SQLite 可用时补历史。
+ * process_name_contains、cmdline_contains、file_path/file_path_contains、
+ * file_sha256、file_ext、remote_ip、registry_key_contains、limit、time_window_s。
+ * 优先返回内存 ring，SQLite 可用时补历史。file_sha256 只查缓存，不触发文件系统扫描。
  */
 int edr_local_evidence_cache_query_json(const char *payload_json, char *out, size_t cap);
+
+/**
+ * RTQ file hash cache lookup. Returns a JSON array of file rows from local
+ * evidence cache; it never scans the filesystem. file_path_contains/file_ext are
+ * optional narrowing filters. returned/scanned may be NULL.
+ */
+int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
+                                                  const char *file_path_contains,
+                                                  const char *file_ext,
+                                                  uint32_t limit,
+                                                  char *out, size_t cap,
+                                                  uint32_t *returned,
+                                                  uint32_t *scanned);
 
 /** 用进程缓存返回 pid 的父进程和直接子进程，供 RTR 进程树查看。 */
 int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,

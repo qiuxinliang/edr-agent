@@ -143,6 +143,63 @@ static void test_behavior_summary_below_threshold_no_emit(void) {
   assert(g_summary_count == 0);
 }
 
+static void test_file_sha256_query_uses_file_evidence_cache(void) {
+#if defined(EDR_HAVE_SQLITE)
+  const char *db = "rtq_file_hash_cache_test.sqlite";
+  const char *hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const char *miss = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  (void)remove(db);
+  (void)remove("rtq_file_hash_cache_test.sqlite-wal");
+  (void)remove("rtq_file_hash_cache_test.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  EdrBehaviorRecord r;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  r.pid = 5151u;
+  r.priority = 3u;
+  snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-hash-1");
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\Users\\Public\\dropper.exe");
+  snprintf(r.exe_hash, sizeof(r.exe_hash), "%s", hash);
+  snprintf(r.detection_context, sizeof(r.detection_context), "{\"priority\":\"P1\"}");
+  edr_local_evidence_cache_record_behavior(&r);
+
+  char rows[4096];
+  uint32_t returned = 0;
+  uint32_t scanned = 0;
+  assert(edr_local_evidence_cache_query_file_hash_json(hash, "", ".exe", 10u, rows,
+                                                       sizeof(rows), &returned, &scanned) == 0);
+  assert(returned == 1u);
+  assert(scanned >= 1u);
+  assert(strstr(rows, "\"source\":\"file_evidence\"") != NULL);
+  assert(strstr(rows, "\"cache_hit\":true") != NULL);
+  assert(strstr(rows, "dropper.exe") != NULL);
+  assert(strstr(rows, hash) != NULL);
+
+  returned = 99u;
+  scanned = 99u;
+  assert(edr_local_evidence_cache_query_file_hash_json(miss, "", ".exe", 10u, rows,
+                                                       sizeof(rows), &returned, &scanned) == 0);
+  assert(returned == 0u);
+  assert(strcmp(rows, "[]") == 0);
+
+  char qout[8192];
+  char payload[256];
+  snprintf(payload, sizeof(payload), "{\"file_sha256\":\"%s\",\"file_ext\":\".exe\"}", hash);
+  assert(edr_local_evidence_cache_query_json(payload, qout, sizeof(qout)) == 0);
+  assert(strstr(qout, "\"rows_returned\":1") != NULL);
+  assert(strstr(qout, "\"source\":\"file_evidence\"") != NULL);
+
+  snprintf(payload, sizeof(payload), "{\"file_sha256\":\"%s\",\"file_ext\":\".dll\"}", hash);
+  assert(edr_local_evidence_cache_query_json(payload, qout, sizeof(qout)) == 0);
+  assert(strstr(qout, "\"rows_returned\":0") != NULL);
+
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("rtq_file_hash_cache_test.sqlite-wal");
+  (void)remove("rtq_file_hash_cache_test.sqlite-shm");
+#endif
+}
+
 int main(void) {
   test_checknetisolation_standard_low_risk_is_not_candidate();
   test_checknetisolation_high_risk_port_is_candidate();
@@ -153,6 +210,7 @@ int main(void) {
   test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise();
   test_behavior_summary_flush_coalesced_events();
   test_behavior_summary_below_threshold_no_emit();
+  test_file_sha256_query_uses_file_evidence_cache();
   puts("test_local_evidence_cache_candidate: ok");
   return 0;
 }

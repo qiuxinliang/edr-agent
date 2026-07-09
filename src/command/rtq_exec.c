@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "wevtapi.lib")
 #endif
 #else
 #include <dirent.h>
@@ -24,6 +26,7 @@
 #endif
 
 #include "edr/command_util.h"
+#include "edr/local_evidence_cache.h"
 #include "edr/response.h"
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
@@ -216,7 +219,35 @@ static void append_json_kv_str(char *buf, int cap, int *offset, const char *key,
     *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\"");
 }
 
+static int append_json_array_items_to_result(char *buf, int cap, int *offset, int *total,
+                                             const char *array_json, uint32_t returned) {
+    if (!buf || !offset || !total || !array_json || returned == 0 || *offset >= cap - 1024) return 0;
+    const char *b = strchr(array_json, '[');
+    const char *e = strrchr(array_json, ']');
+    if (!b || !e || e <= b + 1) return 0;
+    b++;
+    while (b < e && isspace((unsigned char)*b)) b++;
+    while (e > b && isspace((unsigned char)e[-1])) e--;
+    if (e <= b) return 0;
+    size_t n = (size_t)(e - b);
+    if (n >= (size_t)(cap - *offset - 128)) return 0;
+    if (*total > 0) *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",");
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "%.*s", (int)n, b);
+    *total += (int)returned;
+    return (int)returned;
+}
+
 static int str_contains_icase(const char *haystack, const char *needle);
+
+static int str_eq_icase(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
 
 static int file_has_ext(const char *path, const char *ext) {
     if (!ext || !ext[0]) return 1;
@@ -242,7 +273,7 @@ static int hash_file_if_needed(const char *path, const char *expected, char out6
     if (got != (size_t)sz) { free(buf); return 0; }
     edr_sha256_hex(buf, (size_t)sz, out65);
     free(buf);
-    return str_contains_icase(out65, expected);
+    return str_eq_icase(out65, expected);
 }
 
 #ifdef _WIN32
@@ -759,7 +790,14 @@ static void scan_win_files_limited(rtq_filter *f, const char *root, int depth, i
 static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
     int scanned = 0;
     int before = *total;
-    if (f->file_path[0]) {
+    if (f->file_sha256[0]) {
+        if (f->file_path[0]) {
+            DWORD attr = GetFileAttributesA(f->file_path);
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                scan_win_files_limited(f, f->file_path, 0, &scanned, buf, cap, offset, total);
+            }
+        }
+    } else if (f->file_path[0]) {
         scan_win_files_limited(f, f->file_path, RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
     } else if (f->file_ext[0]) {
         scan_win_files_limited(f, "C:\\Windows\\Temp", RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
@@ -813,6 +851,116 @@ static int match_registry(rtq_filter *f, char *buf, int cap, int *offset, int *t
     return count;
 }
 
+static int wide_to_utf8_str(LPCWSTR src, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    if (!src || !src[0]) return 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, src, -1, out, (int)cap, NULL, NULL);
+    if (n <= 0) {
+        out[0] = '\0';
+        return 0;
+    }
+    out[cap - 1] = '\0';
+    return 1;
+}
+
+static int evt_variant_u64(const EVT_VARIANT *v, unsigned long long *out) {
+    if (!v || !out) return 0;
+    switch (v->Type & EVT_VARIANT_TYPE_MASK) {
+    case EvtVarTypeByte:
+        *out = (unsigned long long)v->ByteVal;
+        return 1;
+    case EvtVarTypeUInt16:
+        *out = (unsigned long long)v->UInt16Val;
+        return 1;
+    case EvtVarTypeUInt32:
+    case EvtVarTypeHexInt32:
+        *out = (unsigned long long)v->UInt32Val;
+        return 1;
+    case EvtVarTypeUInt64:
+    case EvtVarTypeHexInt64:
+        *out = (unsigned long long)v->UInt64Val;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void append_eventlog_u64(EVT_VARIANT *values, DWORD count, EVT_SYSTEM_PROPERTY_ID id,
+                                const char *key, char *buf, int cap, int *offset) {
+    if (!values || id >= count || !key) return;
+    unsigned long long v = 0;
+    if (!evt_variant_u64(&values[id], &v)) return;
+    *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"%s\":%llu", key, v);
+}
+
+static void append_eventlog_wstr(EVT_VARIANT *values, DWORD count, EVT_SYSTEM_PROPERTY_ID id,
+                                 const char *key, char *buf, int cap, int *offset) {
+    if (!values || id >= count || !key) return;
+    if ((values[id].Type & EVT_VARIANT_TYPE_MASK) != EvtVarTypeString || !values[id].StringVal) return;
+    char tmp[512];
+    if (wide_to_utf8_str(values[id].StringVal, tmp, sizeof(tmp))) {
+        append_json_kv_str(buf, cap, offset, key, tmp);
+    }
+}
+
+static void append_eventlog_time(EVT_VARIANT *values, DWORD count, char *buf, int cap, int *offset) {
+    if (!values || EvtSystemTimeCreated >= count) return;
+    if ((values[EvtSystemTimeCreated].Type & EVT_VARIANT_TYPE_MASK) != EvtVarTypeFileTime) return;
+    ULONGLONG ftv = values[EvtSystemTimeCreated].FileTimeVal;
+    FILETIME ft;
+    ft.dwLowDateTime = (DWORD)(ftv & 0xffffffffULL);
+    ft.dwHighDateTime = (DWORD)(ftv >> 32);
+    SYSTEMTIME st;
+    if (!FileTimeToSystemTime(&ft, &st)) return;
+    char ts[64];
+    snprintf(ts, sizeof(ts), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+             (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+             (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
+             (unsigned)st.wMilliseconds);
+    append_json_kv_str(buf, cap, offset, "timestamp", ts);
+}
+
+static void append_eventlog_xml(EVT_HANDLE event, char *buf, int cap, int *offset) {
+    DWORD used = 0, prop_count = 0;
+    if (EvtRender(NULL, event, EvtRenderEventXml, 0, NULL, &used, &prop_count)) return;
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || used == 0) return;
+    wchar_t *xml = (wchar_t *)malloc(used);
+    if (!xml) return;
+    if (EvtRender(NULL, event, EvtRenderEventXml, used, xml, &used, &prop_count)) {
+        char xml_utf8[4096];
+        if (wide_to_utf8_str(xml, xml_utf8, sizeof(xml_utf8))) {
+            append_json_kv_str(buf, cap, offset, "xml", xml_utf8);
+            if (used > sizeof(xml_utf8)) {
+                *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"xml_truncated\":true");
+            }
+        }
+    }
+    free(xml);
+}
+
+static void append_eventlog_evidence(EVT_HANDLE render_ctx, EVT_HANDLE event,
+                                     char *buf, int cap, int *offset) {
+    if (!render_ctx || !event || *offset >= cap - 2048) return;
+    DWORD used = 0, prop_count = 0;
+    if (EvtRender(render_ctx, event, EvtRenderEventValues, 0, NULL, &used, &prop_count)) return;
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || used == 0) return;
+    EVT_VARIANT *values = (EVT_VARIANT *)malloc(used);
+    if (!values) return;
+    if (EvtRender(render_ctx, event, EvtRenderEventValues, used, values, &used, &prop_count)) {
+        append_eventlog_wstr(values, prop_count, EvtSystemProviderName, "provider", buf, cap, offset);
+        append_eventlog_u64(values, prop_count, EvtSystemEventID, "event_id", buf, cap, offset);
+        append_eventlog_u64(values, prop_count, EvtSystemEventRecordId, "record_id", buf, cap, offset);
+        append_eventlog_u64(values, prop_count, EvtSystemLevel, "level", buf, cap, offset);
+        append_eventlog_u64(values, prop_count, EvtSystemProcessID, "process_id", buf, cap, offset);
+        append_eventlog_u64(values, prop_count, EvtSystemThreadID, "thread_id", buf, cap, offset);
+        append_eventlog_wstr(values, prop_count, EvtSystemComputer, "computer", buf, cap, offset);
+        append_eventlog_time(values, prop_count, buf, cap, offset);
+    }
+    free(values);
+    if (*offset < cap - 8192) append_eventlog_xml(event, buf, cap, offset);
+}
+
 static int match_eventlog(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
     wchar_t channel[128];
     wchar_t query[512];
@@ -820,6 +968,7 @@ static int match_eventlog(rtq_filter *f, char *buf, int cap, int *offset, int *t
     MultiByteToWideChar(CP_UTF8, 0, f->eventlog_query[0] ? f->eventlog_query : "*", -1, query, 512);
     EVT_HANDLE h = EvtQuery(NULL, channel, query, EvtQueryChannelPath | EvtQueryReverseDirection);
     if (!h) return 0;
+    EVT_HANDLE render_ctx = EvtCreateRenderContext(0, NULL, EvtRenderContextSystem);
     int count = 0;
     EVT_HANDLE events[16];
     DWORD returned = 0;
@@ -830,12 +979,14 @@ static int match_eventlog(rtq_filter *f, char *buf, int cap, int *offset, int *t
             *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "{\"type\":\"eventlog\"");
             append_json_kv_str(buf, cap, offset, "channel", f->eventlog_channel[0] ? f->eventlog_channel : "System");
             append_json_kv_str(buf, cap, offset, "query", f->eventlog_query[0] ? f->eventlog_query : "*");
+            append_eventlog_evidence(render_ctx, events[i], buf, cap, offset);
             *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "}");
             (*total)++;
             count++;
             EvtClose(events[i]);
         }
     }
+    if (render_ctx) EvtClose(render_ctx);
     EvtClose(h);
     return count;
 }
@@ -1041,7 +1192,14 @@ static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *to
 static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
     int scanned = 0;
     int before = *total;
-    if (f->file_path[0]) {
+    if (f->file_sha256[0]) {
+        if (f->file_path[0]) {
+            struct stat st;
+            if (stat(f->file_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                scan_files_limited(f, f->file_path, 0, &scanned, buf, cap, offset, total);
+            }
+        }
+    } else if (f->file_path[0]) {
         scan_files_limited(f, f->file_path, RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
     } else if (f->file_ext[0]) {
         scan_files_limited(f, "/tmp", RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset, total);
@@ -1050,6 +1208,39 @@ static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *tota
     return *total - before;
 }
 #endif
+
+static int match_file_hash_cache(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    if (!f || !f->file_sha256[0]) return 0;
+    size_t rows_cap = RTQ_MAX_RESULT_STR / 2u;
+    char *rows = (char *)malloc(rows_cap);
+    if (!rows) return 0;
+    uint32_t returned = 0;
+    uint32_t scanned = 0;
+    if (edr_local_evidence_cache_query_file_hash_json(f->file_sha256, f->file_path,
+                                                      f->file_ext, RTQ_MAX_RESULTS,
+                                                      rows, rows_cap,
+                                                      &returned, &scanned) != 0) {
+        free(rows);
+        return 0;
+    }
+    (void)scanned;
+    int appended = append_json_array_items_to_result(buf, cap, offset, total, rows, returned);
+    free(rows);
+    return appended;
+}
+
+static int match_files_cache_first(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
+    if (!f) return 0;
+    int before = *total;
+    int cache_hits = 0;
+    if (f->file_sha256[0]) {
+        cache_hits = match_file_hash_cache(f, buf, cap, offset, total);
+    }
+    if (!f->file_sha256[0] || (cache_hits == 0 && f->file_path[0])) {
+        (void)match_files(f, buf, cap, offset, total);
+    }
+    return *total - before;
+}
 
 void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                                size_t len, const EdrSoarCommandMeta *sm) {
@@ -1094,7 +1285,7 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
         (void)match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
     if (has_file) {
-        (void)match_files(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+        (void)match_files_cache_first(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
     if (has_registry) {
         (void)match_registry(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
@@ -1110,7 +1301,7 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
         (void)match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
     if (has_file) {
-        (void)match_files(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+        (void)match_files_cache_first(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
     }
 #endif
     (void)has_file;
