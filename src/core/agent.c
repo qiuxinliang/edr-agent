@@ -66,6 +66,7 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #endif
 
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
+#define EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED 0x02
 
 typedef enum {
   EDR_AGENT_POLL_RESOURCE = 0,
@@ -1427,7 +1428,8 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
 }
 
 static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_ns);
-static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns);
+static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns,
+                                         uint64_t *last_health_ns);
 static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns);
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
@@ -1500,7 +1502,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_CONFIG_RELOAD,
                              edr_agent_poll_config_reload(agent, &last_reload_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_REMOTE_CONFIG,
-                             edr_agent_poll_remote_config(agent, &last_remote_ns));
+                             edr_agent_poll_remote_config(agent, &last_remote_ns, &last_health_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_P0_BUNDLE,
                              edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SENSOR_INTEREST,
@@ -2608,6 +2610,80 @@ static void edr_agent_restart_collector(EdrAgent *agent) {
   }
 }
 
+static int edr_health_monitor_policy_changed(const EdrConfig *current, const EdrConfig *remote) {
+  if (!current || !remote) {
+    return 0;
+  }
+  return current->health_monitor.enabled != remote->health_monitor.enabled ||
+         current->health_monitor.interval_s != remote->health_monitor.interval_s ||
+         current->health_monitor.expires_at_unix_ms != remote->health_monitor.expires_at_unix_ms ||
+         strcmp(current->health_monitor.profile, remote->health_monitor.profile) != 0 ||
+         strcmp(current->health_monitor.request_id, remote->health_monitor.request_id) != 0;
+}
+
+static int edr_attack_surface_policy_changed(const EdrConfig *current, const EdrConfig *remote) {
+  if (!current || !remote) {
+    return 0;
+  }
+  return current->attack_surface.enabled != remote->attack_surface.enabled ||
+         current->attack_surface.port_interval_s != remote->attack_surface.port_interval_s ||
+         current->attack_surface.conn_interval_s != remote->attack_surface.conn_interval_s ||
+         current->attack_surface.service_interval_s != remote->attack_surface.service_interval_s ||
+         current->attack_surface.policy_interval_s != remote->attack_surface.policy_interval_s ||
+         current->attack_surface.full_snapshot_interval_s != remote->attack_surface.full_snapshot_interval_s ||
+         current->attack_surface.outbound_top_n != remote->attack_surface.outbound_top_n ||
+         current->attack_surface.egress_top_n != remote->attack_surface.egress_top_n ||
+         current->attack_surface.outbound_exclude_loopback != remote->attack_surface.outbound_exclude_loopback ||
+         current->attack_surface.firewall_rule_detail_max != remote->attack_surface.firewall_rule_detail_max ||
+         current->attack_surface.etw_refresh_triggers_snapshot != remote->attack_surface.etw_refresh_triggers_snapshot ||
+         current->attack_surface.etw_refresh_debounce_s != remote->attack_surface.etw_refresh_debounce_s ||
+         current->attack_surface.win_listen_cache_ttl_ms != remote->attack_surface.win_listen_cache_ttl_ms ||
+         current->attack_surface.high_risk_immediate_ports_count != remote->attack_surface.high_risk_immediate_ports_count ||
+         strcmp(current->attack_surface.geoip_db_path, remote->attack_surface.geoip_db_path) != 0 ||
+         (current->attack_surface.high_risk_immediate_ports_count > 0u &&
+          remote->attack_surface.high_risk_immediate_ports_count > 0u &&
+          current->attack_surface.high_risk_immediate_ports &&
+          remote->attack_surface.high_risk_immediate_ports &&
+          memcmp(current->attack_surface.high_risk_immediate_ports,
+                 remote->attack_surface.high_risk_immediate_ports,
+                 current->attack_surface.high_risk_immediate_ports_count * sizeof(uint16_t)) != 0);
+}
+
+static void edr_agent_apply_attack_surface_policy(EdrConfig *cfg, const EdrConfig *remote) {
+  uint16_t *ports = NULL;
+  size_t ports_count = 0u;
+  if (!cfg || !remote) {
+    return;
+  }
+  if (remote->attack_surface.high_risk_immediate_ports &&
+      remote->attack_surface.high_risk_immediate_ports_count > 0u) {
+    size_t n = remote->attack_surface.high_risk_immediate_ports_count;
+    ports = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (ports) {
+      memcpy(ports, remote->attack_surface.high_risk_immediate_ports, n * sizeof(uint16_t));
+      ports_count = n;
+    }
+  }
+  free(cfg->attack_surface.high_risk_immediate_ports);
+  cfg->attack_surface.high_risk_immediate_ports = ports;
+  cfg->attack_surface.high_risk_immediate_ports_count = ports_count;
+  cfg->attack_surface.enabled = remote->attack_surface.enabled;
+  cfg->attack_surface.port_interval_s = remote->attack_surface.port_interval_s;
+  cfg->attack_surface.conn_interval_s = remote->attack_surface.conn_interval_s;
+  cfg->attack_surface.service_interval_s = remote->attack_surface.service_interval_s;
+  cfg->attack_surface.policy_interval_s = remote->attack_surface.policy_interval_s;
+  cfg->attack_surface.full_snapshot_interval_s = remote->attack_surface.full_snapshot_interval_s;
+  cfg->attack_surface.outbound_top_n = remote->attack_surface.outbound_top_n;
+  cfg->attack_surface.egress_top_n = remote->attack_surface.egress_top_n;
+  cfg->attack_surface.outbound_exclude_loopback = remote->attack_surface.outbound_exclude_loopback;
+  snprintf(cfg->attack_surface.geoip_db_path, sizeof(cfg->attack_surface.geoip_db_path), "%s",
+           remote->attack_surface.geoip_db_path);
+  cfg->attack_surface.firewall_rule_detail_max = remote->attack_surface.firewall_rule_detail_max;
+  cfg->attack_surface.etw_refresh_triggers_snapshot = remote->attack_surface.etw_refresh_triggers_snapshot;
+  cfg->attack_surface.etw_refresh_debounce_s = remote->attack_surface.etw_refresh_debounce_s;
+  cfg->attack_surface.win_listen_cache_ttl_ms = remote->attack_surface.win_listen_cache_ttl_ms;
+}
+
 static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remote, const char *tmp) {
   int changed = 0;
   if (!agent || !remote || !tmp || !tmp[0]) {
@@ -2650,6 +2726,9 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     agent->cfg.resource_limit = remote->resource_limit;
   }
   if (edr_agent_toml_has_section(tmp, "health_monitor")) {
+    if (edr_health_monitor_policy_changed(&agent->cfg, remote)) {
+      changed |= EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED;
+    }
     agent->cfg.health_monitor = remote->health_monitor;
   }
   if (edr_agent_toml_has_section(tmp, "command")) {
@@ -2729,7 +2808,11 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     snprintf(agent->cfg.ave.sensitivity, sizeof(agent->cfg.ave.sensitivity), "%s", remote->ave.sensitivity);
   }
   if (edr_agent_toml_has_section(tmp, "attack_surface")) {
-    agent->cfg.attack_surface.enabled = remote->attack_surface.enabled;
+    if (edr_attack_surface_policy_changed(&agent->cfg, remote)) {
+      agent->asurf_last_post_ns = 0u;
+      agent->asurf_last_pending_check_ns = 0u;
+    }
+    edr_agent_apply_attack_surface_policy(&agent->cfg, remote);
   }
   if (edr_agent_toml_has_section(tmp, "self_protect")) {
     agent->cfg.self_protect.event_bus_pressure_warn_pct = remote->self_protect.event_bus_pressure_warn_pct;
@@ -2737,12 +2820,13 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   return changed;
 }
 
-static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns) {
+static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns,
+                                         uint64_t *last_health_ns) {
   const char *url = getenv("EDR_REMOTE_CONFIG_URL");
   const char *auto_pull = getenv("EDR_REMOTE_CONFIG_AUTO_PULL");
   const char *ps = getenv("EDR_REMOTE_CONFIG_POLL_S");
   char derived[768];
-  int interval = 1800;
+  int interval = 60;
   if (!agent) {
     return;
   }
@@ -2835,6 +2919,11 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_resource_init(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
   edr_ingest_http_set_policy_version(agent->cfg.preprocessing.rules_version);
+  if ((changed & EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED) != 0 &&
+      agent->cfg.health_monitor.enabled && last_health_ns) {
+    *last_health_ns = 0u;
+    edr_agent_poll_engine_health(agent, last_health_ns, 1);
+  }
   if (was_recovering && agent->config_path && agent->config_path[0] &&
       edr_agent_write_config_snapshot(agent->config_path, &agent->cfg) == 0) {
     snprintf(repaired_local_config, sizeof(repaired_local_config), "%s", agent->config_path);
