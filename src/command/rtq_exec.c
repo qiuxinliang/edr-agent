@@ -1114,6 +1114,7 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
         *offset += snprintf(buf + *offset, (size_t)(cap - *offset),
             "{\"type\":\"process\",\"pid\":%d,\"ppid\":%d,\"name\":\"", loc_pid, loc_ppid);
         append_json_escaped(buf, cap, offset, loc_comm);
+        *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\"");
         append_json_kv_str(buf, cap, offset, "user", loc_user);
         append_json_kv_str(buf, cap, offset, "cmdline", rest);
         if (path[0]) append_json_kv_str(buf, cap, offset, "path", path);
@@ -1378,7 +1379,7 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     if (!edr_command_rtq_readonly_enabled()) {
         g_cmd_rejected++;
         edr_command_audit_both(cmd_id, "reject rtq_execute: readonly RTQ disabled");
-        edr_command_emit_always(cmd_id, sm, EdrCmdExecRejected, 1, "readonly RTQ disabled");
+        edr_command_emit_always_typed(cmd_id, "rtq_execute", sm, EdrCmdExecRejected, 1, "readonly RTQ disabled");
         return;
     }
 
@@ -1386,14 +1387,14 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     if (parse_rtq_filter(pl, len, &filter) != 0) {
         g_cmd_exec_fail++;
         edr_command_audit_both(cmd_id, "rtq_execute: no filter conditions");
-        edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "no filter conditions");
+        edr_command_emit_always_typed(cmd_id, "rtq_execute", sm, EdrCmdExecFailed, 2, "no filter conditions");
         return;
     }
 
     char *result = (char *)malloc(RTQ_MAX_RESULT_STR);
     if (!result) {
         g_cmd_exec_fail++;
-        edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 3, "oom");
+        edr_command_emit_always_typed(cmd_id, "rtq_execute", sm, EdrCmdExecFailed, 3, "oom");
         return;
     }
 
@@ -1455,6 +1456,6 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
 
     g_cmd_handled++; g_cmd_exec_ok++;
     edr_command_audit_both(cmd_id, "rtq_execute: ok");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    edr_command_emit_always_typed(cmd_id, "rtq_execute", sm, EdrCmdExecOk, 0, result);
     free(result);
 }

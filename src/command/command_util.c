@@ -1,4 +1,5 @@
 #include "edr/command_util.h"
+#include "edr/command_state.h"
 #include "edr/config.h"
 #include "edr/ingest_http.h"
 #include "edr/transport_v2.h"
@@ -139,19 +140,42 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
   (void)ok;
 }
 
+static const char *command_response_status_label(EdrCommandExecutionStatus st) {
+  switch (st) {
+    case EdrCmdExecOk:
+      return "ok";
+    case EdrCmdExecRejected:
+      return "denied";
+    case EdrCmdExecFailed:
+      return "failed";
+    case EdrCmdExecUnknownType:
+      return "unknown_type";
+    default:
+      return "unknown";
+  }
+}
+
+void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
+                                   const EdrSoarCommandMeta *sm,
+                                   EdrCommandExecutionStatus st, int exit_code, const char *detail) {
+  edr_command_audit_both(cmd_id, detail);
+  int report_pending = 0;
+  if (edr_ingest_http_configured()) {
+    const EdrSoarCommandMeta *report_meta = edr_command_soar_want_report(sm) ? sm : NULL;
+    fprintf(stderr, "[cmd_emit_always] HTTP reporting id=%s st=%d\n", cmd_id ? cmd_id : "", (int)st);
+    int rc = edr_transport_v2_command_result(cmd_id, report_meta, (int)st, exit_code, detail ? detail : "");
+    fprintf(stderr, "[cmd_emit_always] HTTP report rc=%d\n", rc);
+    report_pending = (rc != 0);
+  } else {
+    fprintf(stderr, "[cmd_emit_always] HTTP NOT configured id=%s\n", cmd_id ? cmd_id : "");
+  }
+  edr_command_state_finish(cmd_id, command_type ? command_type : "", sm, command_response_status_label(st), (int)st, exit_code,
+                           detail ? detail : "", "", report_pending);
+}
+
 void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
                              EdrCommandExecutionStatus st, int exit_code, const char *detail) {
-  edr_command_audit_both(cmd_id, detail);
-  edr_command_soar_emit(cmd_id, sm, st, exit_code, detail);
-  if (!edr_command_soar_want_report(sm)) {
-    if (edr_ingest_http_configured()) {
-      fprintf(stderr, "[cmd_emit_always] HTTP reporting id=%s st=%d\n", cmd_id ? cmd_id : "", (int)st);
-      int rc = edr_transport_v2_command_result(cmd_id, NULL, (int)st, exit_code, detail ? detail : "");
-      fprintf(stderr, "[cmd_emit_always] HTTP report rc=%d\n", rc);
-    } else {
-      fprintf(stderr, "[cmd_emit_always] HTTP NOT configured id=%s\n", cmd_id ? cmd_id : "");
-    }
-  }
+  edr_command_emit_always_typed(cmd_id, "", sm, st, exit_code, detail);
 }
 
 int edr_command_parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {

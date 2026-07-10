@@ -23,6 +23,9 @@ void edr_command_audit_both(const char *cmd_id, const char *msg);
 int edr_command_soar_want_report(const EdrSoarCommandMeta *m);
 void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
                            EdrCommandExecutionStatus st, int exit_code, const char *detail);
+void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
+                                   const EdrSoarCommandMeta *sm,
+                                   EdrCommandExecutionStatus st, int exit_code, const char *detail);
 void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
                              EdrCommandExecutionStatus st, int exit_code, const char *detail);
 
