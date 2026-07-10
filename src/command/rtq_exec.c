@@ -36,6 +36,14 @@
 #define RTQ_FILE_HASH_MAX  (64 * 1024 * 1024)
 #define RTQ_FILE_SCAN_MAX  2000
 #define RTQ_FILE_SCAN_DEPTH 3
+#define RTQ_SAMPLER_TIMEOUT_SEC 3
+#define RTQ_SAMPLER_OUTPUT_MAX (64 * 1024)
+
+typedef struct rtq_errors {
+    char json[4096];
+    int offset;
+    int count;
+} rtq_errors;
 
 typedef struct rtq_filter {
     int has_process;
@@ -217,6 +225,58 @@ static void append_json_kv_str(char *buf, int cap, int *offset, const char *key,
     *offset += snprintf(buf + *offset, (size_t)(cap - *offset), ",\"%s\":\"", key);
     append_json_escaped(buf, cap, offset, value ? value : "");
     *offset += snprintf(buf + *offset, (size_t)(cap - *offset), "\"");
+}
+
+static void rtq_error_init(rtq_errors *errs) {
+    if (!errs) return;
+    errs->json[0] = '\0';
+    errs->offset = 0;
+    errs->count = 0;
+}
+
+static void rtq_error_append(rtq_errors *errs, const char *source, const char *code,
+                             const char *message) {
+    if (!errs || errs->offset >= (int)sizeof(errs->json) - 256) return;
+    if (errs->count > 0) {
+        errs->offset += snprintf(errs->json + errs->offset,
+                                 sizeof(errs->json) - (size_t)errs->offset, ",");
+    }
+    errs->offset += snprintf(errs->json + errs->offset,
+                             sizeof(errs->json) - (size_t)errs->offset,
+                             "{\"source\":\"");
+    append_json_escaped(errs->json, (int)sizeof(errs->json), &errs->offset, source ? source : "rtq");
+    errs->offset += snprintf(errs->json + errs->offset,
+                             sizeof(errs->json) - (size_t)errs->offset,
+                             "\",\"code\":\"");
+    append_json_escaped(errs->json, (int)sizeof(errs->json), &errs->offset, code ? code : "collector_failed");
+    errs->offset += snprintf(errs->json + errs->offset,
+                             sizeof(errs->json) - (size_t)errs->offset,
+                             "\",\"message\":\"");
+    append_json_escaped(errs->json, (int)sizeof(errs->json), &errs->offset, message ? message : "RTQ collector failed");
+    errs->offset += snprintf(errs->json + errs->offset,
+                             sizeof(errs->json) - (size_t)errs->offset, "\"}");
+    errs->count++;
+}
+
+static void trim_sampler_output(char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = '\0';
+    }
+    char *p = s;
+    while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1u);
+}
+
+static void sampler_error_message(char *out, size_t cap, const char *cmd, int exit_code,
+                                  const char *output) {
+    if (!out || cap == 0) return;
+    char detail[512];
+    snprintf(detail, sizeof(detail), "%s", output && output[0] ? output : "no stderr/stdout");
+    trim_sampler_output(detail);
+    snprintf(out, cap, "sampler command failed: %s exit_code=%d detail=%s",
+             cmd ? cmd : "", exit_code, detail[0] ? detail : "empty output");
 }
 
 static int append_json_array_items_to_result(char *buf, int cap, int *offset, int *total,
@@ -1000,17 +1060,41 @@ static void read_proc_exe_path(int pid, char *out, size_t out_cap) {
     if (n > 0) out[n] = '\0';
 }
 
-static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
-    FILE *p = popen("ps -eo pid,ppid,user,comm,args 2>/dev/null", "r");
-    if (!p) return 0;
+static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *total,
+                           rtq_errors *errs) {
+    const char *cmd = "ps -eo pid,ppid,user,comm,args";
+    char *output = (char *)malloc(RTQ_SAMPLER_OUTPUT_MAX);
+    if (!output) {
+        rtq_error_append(errs, "process", "oom", "process sampler output allocation failed");
+        return -1;
+    }
+    int exit_code = 0;
+    if (edr_shell_exec(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code) != 0 ||
+        exit_code != 0) {
+        char msg[768];
+        sampler_error_message(msg, sizeof(msg), cmd, exit_code, output);
+        rtq_error_append(errs, "process", exit_code == 124 ? "sampler_timeout" : "sampler_failed", msg);
+        free(output);
+        return -1;
+    }
+
+#if !defined(__linux__)
+    if (f->process_path[0]) {
+        rtq_error_append(errs, "process", "process_path_unsupported",
+                         "process_path requires /proc/<pid>/exe and is unavailable on this platform");
+    }
+#endif
 
     int count = 0;
-    char line[4096];
-    while (fgets(line, sizeof(line), p) && *total < RTQ_MAX_RESULTS) {
+    char *save = NULL;
+    char *line = strtok_r(output, "\n", &save);
+    while (line && *total < RTQ_MAX_RESULTS) {
+        char *cur = line;
+        line = strtok_r(NULL, "\n", &save);
         int loc_pid = 0, loc_ppid = 0;
         char loc_user[64] = {0}, loc_comm[256] = {0};
         char rest[2560] = {0};
-        (void)sscanf(line, "%d %d %63s %255s %2559[^\n]",
+        (void)sscanf(cur, "%d %d %63s %255s %2559[^\n]",
             &loc_pid, &loc_ppid, loc_user, loc_comm, rest);
         if (loc_pid <= 0) continue;
 
@@ -1037,7 +1121,7 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
         (*total)++;
         count++;
     }
-    pclose(p);
+    free(output);
     return count;
 }
 
@@ -1142,36 +1226,70 @@ static int append_network_result(rtq_filter *f, const char *proto, const char *s
     return 1;
 }
 
-static int scan_ss_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
-    FILE *p = popen("ss -tunapH 2>/dev/null", "r");
-    if (!p) return 0;
+static int scan_ss_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
+                           int *sampler_ok, char *err_msg, size_t err_cap) {
+    const char *cmd = "ss -tunapH";
+    if (sampler_ok) *sampler_ok = 0;
+    char *output = (char *)malloc(RTQ_SAMPLER_OUTPUT_MAX);
+    if (!output) {
+        if (err_msg && err_cap > 0) snprintf(err_msg, err_cap, "network sampler output allocation failed");
+        return 0;
+    }
+    int exit_code = 0;
+    if (edr_shell_exec(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code) != 0 ||
+        exit_code != 0) {
+        if (err_msg && err_cap > 0) sampler_error_message(err_msg, err_cap, cmd, exit_code, output);
+        free(output);
+        return 0;
+    }
+    if (sampler_ok) *sampler_ok = 1;
 
     int count = 0;
-    char line[2048];
-    while (fgets(line, sizeof(line), p) && *total < RTQ_MAX_RESULTS) {
+    char *save = NULL;
+    char *line = strtok_r(output, "\n", &save);
+    while (line && *total < RTQ_MAX_RESULTS) {
+        char *cur = line;
+        line = strtok_r(NULL, "\n", &save);
         char proto[16] = {0}, state[32] = {0}, recvq[32] = {0}, sendq[32] = {0};
         char local_addr[256] = {0}, remote_addr[256] = {0}, tail[1024] = {0};
-        int n = sscanf(line, "%15s %31s %31s %31s %255s %255s %1023[^\n]",
+        int n = sscanf(cur, "%15s %31s %31s %31s %255s %255s %1023[^\n]",
                        proto, state, recvq, sendq, local_addr, remote_addr, tail);
         if (n < 6) continue;
         if (append_network_result(f, proto, state, local_addr, remote_addr, tail, buf, cap, offset, total)) {
             count++;
         }
     }
-    pclose(p);
+    free(output);
     return count;
 }
 
-static int scan_netstat_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
-    FILE *p = popen("netstat -an 2>/dev/null", "r");
-    if (!p) return 0;
+static int scan_netstat_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
+                                int *sampler_ok, char *err_msg, size_t err_cap) {
+    const char *cmd = "netstat -an";
+    if (sampler_ok) *sampler_ok = 0;
+    char *output = (char *)malloc(RTQ_SAMPLER_OUTPUT_MAX);
+    if (!output) {
+        if (err_msg && err_cap > 0) snprintf(err_msg, err_cap, "network sampler output allocation failed");
+        return 0;
+    }
+    int exit_code = 0;
+    if (edr_shell_exec(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code) != 0 ||
+        exit_code != 0) {
+        if (err_msg && err_cap > 0) sampler_error_message(err_msg, err_cap, cmd, exit_code, output);
+        free(output);
+        return 0;
+    }
+    if (sampler_ok) *sampler_ok = 1;
 
     int count = 0;
-    char line[2048];
-    while (fgets(line, sizeof(line), p) && *total < RTQ_MAX_RESULTS) {
+    char *save = NULL;
+    char *line = strtok_r(output, "\n", &save);
+    while (line && *total < RTQ_MAX_RESULTS) {
+        char *cur = line;
+        line = strtok_r(NULL, "\n", &save);
         char proto[16] = {0}, recvq[32] = {0}, sendq[32] = {0};
         char local_addr[256] = {0}, remote_addr[256] = {0}, state[32] = {0}, tail[1024] = {0};
-        int n = sscanf(line, "%15s %31s %31s %255s %255s %31s %1023[^\n]",
+        int n = sscanf(cur, "%15s %31s %31s %255s %255s %31s %1023[^\n]",
                        proto, recvq, sendq, local_addr, remote_addr, state, tail);
         if (n < 5 || (!str_contains_icase(proto, "tcp") && !str_contains_icase(proto, "udp"))) continue;
         if (n < 6) snprintf(state, sizeof(state), "%s", "");
@@ -1179,13 +1297,26 @@ static int scan_netstat_network(rtq_filter *f, char *buf, int cap, int *offset, 
             count++;
         }
     }
-    pclose(p);
+    free(output);
     return count;
 }
 
-static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *total) {
-    int count = scan_ss_network(f, buf, cap, offset, total);
-    if (count == 0) count += scan_netstat_network(f, buf, cap, offset, total);
+static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
+                         rtq_errors *errs) {
+    int ss_ok = 0;
+    int netstat_ok = 0;
+    char ss_err[768] = {0};
+    char netstat_err[768] = {0};
+    int count = scan_ss_network(f, buf, cap, offset, total, &ss_ok, ss_err, sizeof(ss_err));
+    if (ss_ok) return count;
+    count = scan_netstat_network(f, buf, cap, offset, total, &netstat_ok, netstat_err, sizeof(netstat_err));
+    if (!netstat_ok) {
+        char msg[1600];
+        snprintf(msg, sizeof(msg), "all network samplers failed; ss=%s; netstat=%s",
+                 ss_err[0] ? ss_err : "not attempted/empty error",
+                 netstat_err[0] ? netstat_err : "not attempted/empty error");
+        rtq_error_append(errs, "network", "sampler_failed", msg);
+    }
     return count;
 }
 
@@ -1273,6 +1404,8 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     int has_file = filter.has_file;
     int has_registry = filter.has_registry;
     int has_eventlog = filter.has_eventlog;
+    rtq_errors errors;
+    rtq_error_init(&errors);
 
     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
         "{\"results\":[\n");
@@ -1295,10 +1428,10 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     }
 #else
     if (has_proc) {
-        (void)match_processes(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+        (void)match_processes(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total, &errors);
     }
     if (has_net) {
-        (void)match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
+        (void)match_network(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total, &errors);
     }
     if (has_file) {
         (void)match_files_cache_first(&filter, result, RTQ_MAX_RESULT_STR, &offset, &total);
@@ -1309,7 +1442,16 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     (void)has_eventlog;
 
     offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
-        "\n],\"total\":%d,\"error\":null}", total);
+        "\n],\"total\":%d,\"error\":", total);
+    if (errors.count > 0) {
+        offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\"");
+        append_json_escaped(result, RTQ_MAX_RESULT_STR, &offset, "one or more RTQ collectors failed");
+        offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
+                           "\",\"errors\":[%s]}", errors.json);
+    } else {
+        offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
+                           "null,\"errors\":[]}");
+    }
 
     g_cmd_handled++; g_cmd_exec_ok++;
     edr_command_audit_both(cmd_id, "rtq_execute: ok");

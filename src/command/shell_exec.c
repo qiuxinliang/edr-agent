@@ -218,6 +218,7 @@ int edr_shell_exec(const char *command, int timeout_sec,
   pid_t pid = fork();
   if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
   if (pid == 0) {
+    (void)setpgid(0, 0);
     dup2(pipefd[1], STDOUT_FILENO);
     dup2(pipefd[1], STDERR_FILENO);
     close(pipefd[0]);
@@ -225,6 +226,7 @@ int edr_shell_exec(const char *command, int timeout_sec,
     execl("/bin/sh", "sh", "-c", command, (char *)NULL);
     _exit(127);
   }
+  (void)setpgid(pid, pid);
   close(pipefd[1]);
   time_t start = time(NULL);
   size_t total = 0;
@@ -261,7 +263,9 @@ int edr_shell_exec(const char *command, int timeout_sec,
     usleep(100000);
   }
   if (!completed) {
-    kill(pid, SIGKILL);
+    if (kill(-pid, SIGKILL) != 0) {
+      (void)kill(pid, SIGKILL);
+    }
     waitpid(pid, NULL, 0);
     if (exit_code) *exit_code = 124;
     for (;;) {
