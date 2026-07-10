@@ -111,6 +111,10 @@ int edr_transport_v2_command_result(const char *command_id,
                                     const struct EdrSoarCommandMeta *meta,
                                     int execution_status, int exit_code,
                                     const char *detail_utf8);
+int edr_transport_v2_command_result_typed(const char *command_id, const char *command_type,
+                                          const struct EdrSoarCommandMeta *meta,
+                                          int execution_status, int exit_code,
+                                          const char *detail_utf8);
 int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
                                  const char *sha256_hex, char *out_minio_key,
                                  size_t out_minio_key_cap);

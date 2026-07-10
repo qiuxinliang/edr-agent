@@ -1198,6 +1198,67 @@ function Get-ExceptionChainText {
   return ($items -join " | ")
 }
 
+function ConvertTo-EnrollDiagnosticValue {
+  param(
+    [object]$Value,
+    [int]$MaxLength = 800
+  )
+  $s = ([string]$Value).Trim()
+  if (-not $s) {
+    return ""
+  }
+  $s = $s -replace "[`r`n`t]+", " "
+  if ($s.Length -gt $MaxLength) {
+    return ($s.Substring(0, $MaxLength) + "...")
+  }
+  return $s
+}
+
+function Get-EnrollErrorResponseDiagnostics {
+  param([object]$Response)
+  $items = New-Object System.Collections.Generic.List[string]
+  if (-not $Response) {
+    return $items
+  }
+  try {
+    $stream = $Response.GetResponseStream()
+    if (-not $stream) {
+      return $items
+    }
+    $reader = New-Object System.IO.StreamReader -ArgumentList @($stream, [System.Text.Encoding]::UTF8)
+    try {
+      $rawBody = $reader.ReadToEnd()
+    } finally {
+      $reader.Dispose()
+    }
+    $body = ConvertTo-EnrollDiagnosticValue $rawBody 2000
+    if (-not $body) {
+      return $items
+    }
+    $parsed = $null
+    try {
+      $parsed = $rawBody | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+      $parsed = $null
+    }
+    if ($parsed) {
+      if ($parsed.code) {
+        $items.Add(("api_code={0}" -f (ConvertTo-EnrollDiagnosticValue $parsed.code 200))) | Out-Null
+      }
+      if ($parsed.message) {
+        $items.Add(("api_message={0}" -f (ConvertTo-EnrollDiagnosticValue $parsed.message 800))) | Out-Null
+      }
+      if ($parsed.request_id) {
+        $items.Add(("api_request_id={0}" -f (ConvertTo-EnrollDiagnosticValue $parsed.request_id 200))) | Out-Null
+      }
+    }
+    $items.Add(("api_body={0}" -f $body)) | Out-Null
+  } catch {
+    $items.Add(("api_body_read_error={0}" -f (ConvertTo-EnrollDiagnosticValue $_.Exception.Message 400))) | Out-Null
+  }
+  return $items
+}
+
 function Get-EnrollFailureHint {
   param([object]$Exception)
   $text = (Get-ExceptionChainText $Exception).ToLowerInvariant()
@@ -1233,6 +1294,11 @@ function Format-EnrollFailure {
     $parts.Add(("web_status={0}" -f $ex.Status)) | Out-Null
     if ($ex.Response -is [System.Net.HttpWebResponse]) {
       $parts.Add(("http_status={0}" -f [int]$ex.Response.StatusCode)) | Out-Null
+      foreach ($detail in (Get-EnrollErrorResponseDiagnostics $ex.Response)) {
+        if ($detail) {
+          $parts.Add($detail) | Out-Null
+        }
+      }
     }
   }
   $parts.Add(("error_chain={0}" -f (Get-ExceptionChainText $ex))) | Out-Null

@@ -16,8 +16,14 @@ unsigned long g_cmd_exec_ok;
 unsigned long g_cmd_exec_fail;
 
 static const EdrConfig *s_bound_cfg;
+static char s_active_command_type[64];
+static const char *command_response_status_label(EdrCommandExecutionStatus st);
 
 void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
+
+void edr_command_set_active_type(const char *command_type) {
+  snprintf(s_active_command_type, sizeof(s_active_command_type), "%s", command_type ? command_type : "");
+}
 
 const struct EdrConfig *edr_command_get_config(void) { return s_bound_cfg; }
 
@@ -130,14 +136,16 @@ int edr_command_soar_want_report(const EdrSoarCommandMeta *m) {
 
 void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
                            EdrCommandExecutionStatus st, int exit_code, const char *detail) {
-  if (!edr_command_soar_want_report(sm)) {
-    return;
-  }
+  int should_report = edr_command_soar_want_report(sm);
   int ok = -1;
-  if (edr_ingest_http_configured()) {
-    ok = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail ? detail : "");
+  if (should_report && edr_ingest_http_configured()) {
+    ok = edr_transport_v2_command_result_typed(cmd_id, s_active_command_type, sm, (int)st, exit_code,
+                                               detail ? detail : "");
   }
   (void)ok;
+  edr_command_state_finish(cmd_id, s_active_command_type, sm, command_response_status_label(st), (int)st, exit_code,
+                           detail ? detail : "", "", should_report && ok != 0);
+  edr_command_state_delete_inbox(cmd_id);
 }
 
 static const char *command_response_status_label(EdrCommandExecutionStatus st) {
@@ -163,7 +171,8 @@ void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
   if (edr_ingest_http_configured()) {
     const EdrSoarCommandMeta *report_meta = edr_command_soar_want_report(sm) ? sm : NULL;
     fprintf(stderr, "[cmd_emit_always] HTTP reporting id=%s st=%d\n", cmd_id ? cmd_id : "", (int)st);
-    int rc = edr_transport_v2_command_result(cmd_id, report_meta, (int)st, exit_code, detail ? detail : "");
+    int rc = edr_transport_v2_command_result_typed(cmd_id, command_type ? command_type : "", report_meta,
+                                                   (int)st, exit_code, detail ? detail : "");
     fprintf(stderr, "[cmd_emit_always] HTTP report rc=%d\n", rc);
     report_pending = (rc != 0);
   } else {
@@ -171,11 +180,12 @@ void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
   }
   edr_command_state_finish(cmd_id, command_type ? command_type : "", sm, command_response_status_label(st), (int)st, exit_code,
                            detail ? detail : "", "", report_pending);
+  edr_command_state_delete_inbox(cmd_id);
 }
 
 void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
                              EdrCommandExecutionStatus st, int exit_code, const char *detail) {
-  edr_command_emit_always_typed(cmd_id, "", sm, st, exit_code, detail);
+  edr_command_emit_always_typed(cmd_id, s_active_command_type, sm, st, exit_code, detail);
 }
 
 int edr_command_parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {

@@ -215,6 +215,12 @@ int edr_ingest_http_post_command_result(const char *command_id,
                                         int execution_status,
                                         int exit_code,
                                         const char *detail_utf8);
+int edr_ingest_http_post_command_result_typed(const char *command_id,
+                                              const char *command_type,
+                                              const struct EdrSoarCommandMeta *meta,
+                                              int execution_status,
+                                              int exit_code,
+                                              const char *detail_utf8);
 
 /** 上传指令/取证产物；大结果落 object storage，command result 只保留 manifest。 */
 int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,

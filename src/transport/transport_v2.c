@@ -234,22 +234,30 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
   return rc;
 }
 
-int edr_transport_v2_command_result(const char *command_id,
-                                    const struct EdrSoarCommandMeta *meta,
-                                    int execution_status, int exit_code,
-                                    const char *detail_utf8) {
+int edr_transport_v2_command_result_typed(const char *command_id, const char *command_type,
+                                          const struct EdrSoarCommandMeta *meta,
+                                          int execution_status, int exit_code,
+                                          const char *detail_utf8) {
   int stream_id = edr_transport_v2_open_stream(EDR_TV2_CHANNEL_COMMAND_RESULT,
                                                EDR_TV2_OP_COMMAND_RESULT);
   int rc;
   if (edr_transport_v2_send(stream_id, command_id, command_id ? strlen(command_id) : 0u) != 0) {
     return -1;
   }
-  rc = edr_ingest_http_post_command_result(command_id, meta, execution_status, exit_code, detail_utf8);
+  rc = edr_ingest_http_post_command_result_typed(command_id, command_type, meta, execution_status, exit_code,
+                                                 detail_utf8);
   if (rc != 0) {
     s_rt.send_fail++;
     tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "command_result failed");
   }
   return rc;
+}
+
+int edr_transport_v2_command_result(const char *command_id,
+                                    const struct EdrSoarCommandMeta *meta,
+                                    int execution_status, int exit_code,
+                                    const char *detail_utf8) {
+  return edr_transport_v2_command_result_typed(command_id, "", meta, execution_status, exit_code, detail_utf8);
 }
 
 int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,

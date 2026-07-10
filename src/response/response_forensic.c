@@ -440,6 +440,7 @@ typedef struct {
   int strict;
   int cancel_requested;
   char cmd_id[96];
+  char command_type[64];
   EdrSoarCommandMeta sm; /* 值拷贝,供 poll 线程上报 */
   char scope[64];
   char reqpath[900];
@@ -500,11 +501,11 @@ int edr_response_forensic_async_accept(const char *cmd_id, const char *command_t
                                        const uint8_t *payload, size_t payload_len,
                                        const char *artifact_ext, int do_upload,
                                        char *detail, size_t detail_cap) {
-  (void)command_type;
   fx_lock();
   if (g_fx.active) { fx_unlock(); if (detail) snprintf(detail, detail_cap, "collector busy"); return 1; }
   (void)memset(&g_fx, 0, sizeof(g_fx));
   snprintf(g_fx.cmd_id, sizeof(g_fx.cmd_id), "%s", cmd_id ? cmd_id : "");
+  snprintf(g_fx.command_type, sizeof(g_fx.command_type), "%s", command_type ? command_type : "collect_forensic");
   if (sm) g_fx.sm = *sm;
   snprintf(g_fx.scope, sizeof(g_fx.scope), "%s", scope ? scope : "standard");
   g_fx.do_upload = do_upload;
@@ -524,12 +525,13 @@ int edr_response_forensic_async_accept(const char *cmd_id, const char *command_t
 
 /* 终态上报(poll 线程):成功/失败/已取消。do_upload 时先上传。 */
 static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm, int do_upload,
-                               const char *artifact, int rc, const char *tier, int cancelled) {
+                               const char *command_type, const char *artifact, int rc, const char *tier,
+                               int cancelled) {
   char minio_key[1024];
   minio_key[0] = '\0';
   if (cancelled) {
     edr_cmd_inc_exec_fail();
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 130, "forensic cancelled by operator");
+    edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecFailed, 130, "forensic cancelled by operator");
     return;
   }
   if (rc == 0) {
@@ -539,12 +541,12 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
              tier, minio_key[0] ? minio_key : "(local)");
     edr_cmd_inc_handled();
     edr_cmd_inc_exec_ok();
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
+    edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecOk, 0, result);
   } else {
     edr_cmd_inc_exec_fail();
     char fail[600];
     snprintf(fail, sizeof(fail), "forensic external failed(%s) rc=%d", tier, rc);
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+    edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecFailed, 6, fail);
   }
 }
 
@@ -555,13 +557,14 @@ void edr_response_forensic_async_poll(void) {
   /* 取消优先:kill 由 poll 线程统一执行,避免与 spawn 跨线程争用句柄。 */
   if (g_fx.cancel_requested) {
     edr_deep_collector_kill();
-    char cmd_id[96]; EdrSoarCommandMeta sm; char req[900];
+    char cmd_id[96]; char command_type[64]; EdrSoarCommandMeta sm; char req[900];
     snprintf(cmd_id, sizeof(cmd_id), "%s", g_fx.cmd_id); sm = g_fx.sm;
+    snprintf(command_type, sizeof(command_type), "%s", g_fx.command_type);
     snprintf(req, sizeof(req), "%s", g_fx.reqpath);
     (void)memset(&g_fx, 0, sizeof(g_fx));
     fx_unlock();
     (void)remove(req);
-    fx_report_terminal(cmd_id, &sm, 0, "", 0, "cancelled", 1);
+    fx_report_terminal(cmd_id, &sm, 0, command_type, "", 0, "cancelled", 1);
     return;
   }
 
@@ -599,16 +602,17 @@ void edr_response_forensic_async_poll(void) {
   }
 
   /* 终态:快照后出锁上报+上传 */
-  char cmd_id[96]; EdrSoarCommandMeta sm; char artifact[900]; char req[900];
+  char cmd_id[96]; char command_type[64]; EdrSoarCommandMeta sm; char artifact[900]; char req[900];
   int do_upload = g_fx.do_upload;
   snprintf(cmd_id, sizeof(cmd_id), "%s", g_fx.cmd_id); sm = g_fx.sm;
+  snprintf(command_type, sizeof(command_type), "%s", g_fx.command_type);
   snprintf(artifact, sizeof(artifact), "%s", g_fx.artifact);
   snprintf(req, sizeof(req), "%s", g_fx.reqpath);
   const char *tier_final = tier;
   (void)memset(&g_fx, 0, sizeof(g_fx));
   fx_unlock();
   (void)remove(req);
-  fx_report_terminal(cmd_id, &sm, do_upload, artifact, rc, tier_final, 0);
+  fx_report_terminal(cmd_id, &sm, do_upload, command_type, artifact, rc, tier_final, 0);
 }
 
 int edr_response_forensic_async_cancel(const char *target_cmd_id) {
@@ -628,13 +632,14 @@ void edr_response_forensic_async_abort_shutdown(void) {
   fx_lock();
   if (!g_fx.active) { fx_unlock(); return; }
   edr_deep_collector_kill();
-  char cmd_id[96]; EdrSoarCommandMeta sm; char req[900];
+  char cmd_id[96]; char command_type[64]; EdrSoarCommandMeta sm; char req[900];
   snprintf(cmd_id, sizeof(cmd_id), "%s", g_fx.cmd_id); sm = g_fx.sm;
+  snprintf(command_type, sizeof(command_type), "%s", g_fx.command_type);
   snprintf(req, sizeof(req), "%s", g_fx.reqpath);
   (void)memset(&g_fx, 0, sizeof(g_fx));
   fx_unlock();
   (void)remove(req);
-  fx_report_terminal(cmd_id, &sm, 0, "", 0, "shutdown", 1);
+  fx_report_terminal(cmd_id, &sm, 0, command_type, "", 0, "shutdown", 1);
 }
 
 int edr_response_forensic_async_active(void) {
@@ -804,16 +809,21 @@ void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid json");
     return;
   }
-  if (edr_pmfe_submit_server_scan(cmd_id, (uint32_t)pid) != 0) {
+  EdrPmfeCommandContext context;
+  memset(&context, 0, sizeof(context));
+  if (sm) {
+    snprintf(context.soar_correlation_id, sizeof(context.soar_correlation_id), "%s", sm->soar_correlation_id);
+    snprintf(context.playbook_run_id, sizeof(context.playbook_run_id), "%s", sm->playbook_run_id);
+    snprintf(context.playbook_step_id, sizeof(context.playbook_step_id), "%s", sm->playbook_step_id);
+  }
+  if (edr_pmfe_submit_server_scan_ex(cmd_id, (uint32_t)pid, &context) != 0) {
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "pmfe_scan: queue failed (PMFE not running or queue full)");
     edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "pmfe queue full or not running");
     return;
   }
   edr_cmd_inc_handled();
-  edr_cmd_inc_exec_ok();
-  edr_command_audit_both(cmd_id, "pmfe_scan: queued (async coarse scan)");
-  edr_command_soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued");
+  edr_command_audit_both(cmd_id, "pmfe_scan: accepted (terminal result pending)");
 }
 
 void edr_response_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -904,6 +914,7 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
 
   char out[4096];
   int count = 0;
+  int copy_failures = 0;
   out[0] = '\0';
 
   const char *p = (const char *)pl;
@@ -931,8 +942,11 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
           if (!fbname) fbname = fpath; else fbname++;
           char dest[800];
           snprintf(dest, sizeof(dest), "files/%s", fbname);
-          response_forensic_copy_one_file(fpath, dest);
-          count++;
+          if (response_forensic_copy_one_file(fpath, dest) == 0) {
+            count++;
+          } else {
+            copy_failures++;
+          }
         }
       }
       p = pathPos ? pathPos : typePos + 4;
@@ -946,9 +960,10 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
         while (rkPos < end && *rkPos != '"' && ri < sizeof(rkey)-1) rkey[ri++] = *rkPos++;
         rkey[ri] = '\0';
         if (rkey[0]) {
-          char dest[800];
-          snprintf(dest, sizeof(dest), "registry/%s.reg", rkey); (void)dest;
-          count++;
+          /* The local fallback has no registry reader. Do not count a
+           * parsed target as evidence, otherwise the command reports
+           * success with an empty artifact. */
+          (void)rkey;
         }
       }
       p = rkPos ? rkPos : typePos + 8;
@@ -959,7 +974,19 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
     if (!next) break;
     p = next;
   }
-  snprintf(out, sizeof(out), "TARGETED_OK items=%d", count);
+  if (count == 0) {
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "targeted_forensic: no evidence collected");
+    if (copy_failures > 0) {
+      char fail[256];
+      snprintf(fail, sizeof(fail), "targeted_forensic collected no evidence; file_copy_failures=%d", copy_failures);
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 8, fail);
+    } else {
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 8, "targeted_forensic collected no evidence");
+    }
+    return;
+  }
+  snprintf(out, sizeof(out), "TARGETED_OK items=%d file_copy_failures=%d", count, copy_failures);
   edr_cmd_inc_handled(); edr_cmd_inc_exec_ok();
   edr_command_audit_both(cmd_id, "targeted_forensic: ok");
   edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, out);

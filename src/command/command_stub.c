@@ -71,6 +71,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <pthread.h>
 #endif
 
 static unsigned long s_handled;
@@ -83,6 +84,43 @@ unsigned long g_cmd_handled;
 unsigned long g_cmd_rejected;
 unsigned long g_cmd_exec_ok;
 unsigned long g_cmd_exec_fail;
+
+/* PMFE workers must not perform transport I/O. Keep terminal results until
+ * the normal command poll loop can persist and emit them. */
+#define PMFE_COMPLETION_CAP 32
+typedef struct {
+  int used;
+  char command_id[96];
+  uint32_t pid;
+  int scan_status;
+  char detail[1200];
+  EdrPmfeCommandContext context;
+} PmfeCompletion;
+static PmfeCompletion s_pmfe_completions[PMFE_COMPLETION_CAP];
+#ifdef _WIN32
+static CRITICAL_SECTION s_pmfe_completion_lock;
+static volatile LONG s_pmfe_completion_lock_ready;
+static void pmfe_completion_lock_init(void) {
+  LONG state = InterlockedCompareExchange(&s_pmfe_completion_lock_ready, 1, 0);
+  if (state == 0) {
+    InitializeCriticalSection(&s_pmfe_completion_lock);
+    InterlockedExchange(&s_pmfe_completion_lock_ready, 2);
+  } else {
+    while (InterlockedCompareExchange(&s_pmfe_completion_lock_ready, 0, 0) == 1) {
+      Sleep(0);
+    }
+  }
+}
+static void pmfe_completion_lock(void) {
+  pmfe_completion_lock_init();
+  EnterCriticalSection(&s_pmfe_completion_lock);
+}
+static void pmfe_completion_unlock(void) { LeaveCriticalSection(&s_pmfe_completion_lock); }
+#else
+static pthread_mutex_t s_pmfe_completion_lock = PTHREAD_MUTEX_INITIALIZER;
+static void pmfe_completion_lock(void) { pthread_mutex_lock(&s_pmfe_completion_lock); }
+static void pmfe_completion_unlock(void) { pthread_mutex_unlock(&s_pmfe_completion_lock); }
+#endif
 
 static int64_t command_now_ms(void);
 static uint64_t command_monotonic_ms(void);
@@ -373,12 +411,17 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
   }
   int report_pending = 0;
   if (detail_json && command_should_report(cmd_id, sm)) {
-    int rc = edr_transport_v2_command_result(cmd_id, sm, (int)st, exit_code, detail_json);
+    int rc = edr_transport_v2_command_result_typed(cmd_id, s_active_command_type ? s_active_command_type : "",
+                                                   sm, (int)st, exit_code, detail_json);
     report_pending = (rc != 0);
   }
   edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "", sm, rstatus,
                            (int)st, exit_code, detail ? detail : "", artifacts ? artifacts : "",
                            report_pending);
+  /* The inbox is the crash-recovery record. Delete it only after a terminal
+   * result is durably recorded; async forensic commands therefore remain
+   * replayable while their collector is running. */
+  edr_command_state_delete_inbox(cmd_id);
   free(raw);
   free(err);
   free(detail_json);
@@ -1278,6 +1321,54 @@ static int isolate_run(int enable, const char *cmd_id) {
   return (system(cmd) == 0) ? 0 : -1;
 }
 
+/* Status is a second signal from the enforcement backend, not a restatement
+ * of the agent stamp. Built-in scripts are required to report an active rule
+ * set; custom hooks may provide EDR_ISOLATE_STATUS_HOOK for the same check. */
+static int isolate_run_status(char *evidence, size_t evidence_cap) {
+  if (evidence && evidence_cap > 0u) {
+    evidence[0] = '\0';
+  }
+  const char *status_hook = getenv("EDR_ISOLATE_STATUS_HOOK");
+  if (status_hook && status_hook[0]) {
+    return system(status_hook) == 0 ? 0 : -1;
+  }
+  char script[1024];
+  if (isolate_resolve_script(script, sizeof(script)) != 0) {
+    return -2;
+  }
+  char stamp[512];
+  isolate_stamp_path(stamp, sizeof(stamp));
+  char outpath[700];
+  snprintf(outpath, sizeof(outpath), "%s.status", stamp);
+  char cmd[1500];
+#ifdef _WIN32
+  snprintf(cmd, sizeof(cmd), "powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Action Status > \"%s\" 2>&1",
+           script, outpath);
+#else
+  snprintf(cmd, sizeof(cmd), "/bin/sh \"%s\" status > \"%s\" 2>&1", script, outpath);
+#endif
+  int rc = system(cmd) == 0 ? 0 : -1;
+  if (evidence && evidence_cap > 1u) {
+    FILE *f = fopen(outpath, "rb");
+    if (f) {
+      size_t n = fread(evidence, 1, evidence_cap - 1u, f);
+      evidence[n] = '\0';
+      fclose(f);
+    }
+  }
+  (void)remove(outpath);
+  return rc;
+}
+
+static int isolate_status_reports_active(const char *evidence) {
+  if (!evidence || !evidence[0]) {
+    return 0;
+  }
+  return strstr(evidence, "State file:") != NULL || strstr(evidence, "Isolation enabled") != NULL ||
+         strstr(evidence, "table inet edr_isolate") != NULL || strstr(evidence, "DefaultInboundAction : Block") != NULL ||
+         strstr(evidence, "-P INPUT DROP") != NULL || strstr(evidence, "-P OUTPUT DROP") != NULL;
+}
+
 static int isolate_stamp_only_mode(void) {
   const char *mode = getenv("EDR_ISOLATE_MODE");
   return (mode && strcmp(mode, "stamp") == 0) ? 1 : 0;
@@ -1293,11 +1384,18 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   /* 写状态标记(供 isolate_status / 响应查询;非 enforcement 本身)。 */
   char path[512];
   isolate_stamp_path(path, sizeof(path));
+  int stamp_written = 0;
   FILE *f = fopen(path, "w");
   if (f) {
     fprintf(f, "isolated=1\ncommand_id=%s\nupdated_unix_ms=%lld\n", cmd_id ? cmd_id : "",
             (long long)command_now_ms());
-    fclose(f);
+    stamp_written = fclose(f) == 0 ? 1 : 0;
+  }
+  if (!stamp_written) {
+    s_exec_fail++;
+    audit_both(cmd_id, "isolate: cannot persist isolation state stamp");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "cannot persist isolation state");
+    return;
   }
 
   if (isolate_stamp_only_mode()) {
@@ -1339,6 +1437,25 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     }
     return;
   }
+  int verified = 0;
+  const char *verification = "enforcement_status";
+  char status_evidence[2048];
+  status_evidence[0] = '\0';
+  const char *isolate_hook = getenv("EDR_ISOLATE_HOOK");
+  if (isolate_hook && isolate_hook[0]) {
+    verified = 1; /* Custom hook's zero exit is its enforcement contract. */
+    verification = "hook_return_code";
+  } else if (isolate_run_status(status_evidence, sizeof(status_evidence)) == 0 &&
+             isolate_status_reports_active(status_evidence)) {
+    verified = 1;
+  }
+  if (!verified) {
+    (void)remove(path);
+    s_exec_fail++;
+    audit_both(cmd_id, "isolate: enforcement completed but status verification failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation enforcement status not verified");
+    return;
+  }
   s_exec_ok++;
   audit_both(cmd_id, "isolate: 已施加网络隔离");
   {
@@ -1348,8 +1465,9 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     json_escape_to(pathj, sizeof(pathj), path);
     json_escape_to(allowj, sizeof(allowj), allow ? allow : "");
     snprintf(detail, sizeof(detail),
-             "{\"status\":\"isolated\",\"method\":\"%s\",\"stamp_path\":%s,\"allow_addrs\":%s}",
-             (hook && hook[0]) ? "hook" : "builtin", pathj, allowj);
+             "{\"status\":\"isolated\",\"method\":\"%s\",\"verification\":\"%s\","
+             "\"stamp_path\":%s,\"allow_addrs\":%s}",
+             (hook && hook[0]) ? "hook" : "builtin", verification, pathj, allowj);
     soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
   }
 }
@@ -1376,9 +1494,6 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     }
   } else {
     rc = isolate_run(0, cmd_id);
-    if (rc == -2) {
-      rc = 0; /* 无 hook/脚本:无 enforcement 可撤,视作已恢复(仅清标记)。 */
-    }
   }
   if (rc != 0) {
     s_exec_fail++;
@@ -1412,9 +1527,29 @@ static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) 
     exists = 1;
     fclose(f);
   }
-  char pathj[700], detail[1024];
+  int verified = 0;
+  const char *verification = "not_isolated";
+  char evidence[2048];
+  evidence[0] = '\0';
+  if (exists && isolate_stamp_only_mode()) {
+    verification = "stamp_only";
+  } else if (exists) {
+    int rc = isolate_run_status(evidence, sizeof(evidence));
+    const char *status_hook = getenv("EDR_ISOLATE_STATUS_HOOK");
+    if (rc == 0 && ((status_hook && status_hook[0]) || isolate_status_reports_active(evidence))) {
+      verified = 1;
+      verification = "enforcement_status";
+    } else {
+      verification = rc == -2 ? "enforcement_unavailable" : "enforcement_not_active";
+    }
+  }
+  char pathj[700], detail[2600];
   json_escape_to(pathj, sizeof(pathj), path);
-  snprintf(detail, sizeof(detail), "{\"isolated\":%s,\"stamp_path\":%s}", exists ? "true" : "false", pathj);
+  snprintf(detail, sizeof(detail),
+           "{\"isolated\":%s,\"stamp_present\":%s,\"enforcement_verified\":%s,"
+           "\"verification\":\"%s\",\"stamp_path\":%s}",
+           (exists && (isolate_stamp_only_mode() || verified)) ? "true" : "false",
+           exists ? "true" : "false", verified ? "true" : "false", verification, pathj);
   s_handled++;
   s_exec_ok++;
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
@@ -1655,6 +1790,26 @@ static void quarantine_base_dir(char *out, size_t cap) {
 #else
   snprintf(out, cap, "%s", "/tmp/edr_quarantine");
 #endif
+}
+
+static int quarantine_path_allowed(const char *base, const char *path) {
+  if (!base || !base[0] || !path || !path[0]) {
+    return 0;
+  }
+  size_t n = strlen(base);
+  while (n > 0u && (base[n - 1u] == '/' || base[n - 1u] == '\\')) {
+    n--;
+  }
+#ifdef _WIN32
+  if (_strnicmp(base, path, n) != 0) {
+    return 0;
+  }
+#else
+  if (strncmp(base, path, n) != 0) {
+    return 0;
+  }
+#endif
+  return path[n] == '/' || path[n] == '\\';
 }
 
 static int move_file_cross_volume(const char *src, const char *dst) {
@@ -2409,6 +2564,100 @@ static void fprint_json_escaped(FILE *f, const char *s) {
 
 #ifdef _WIN32
 #define EDR_EVENTLOG_XML_MAX (256u * 1024u)
+
+static void eventlog_xml_text(const char *xml, const char *tag, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!xml || !tag) {
+    return;
+  }
+  char open[64];
+  snprintf(open, sizeof(open), "<%s", tag);
+  const char *p = strstr(xml, open);
+  if (!p) {
+    return;
+  }
+  p = strchr(p, '>');
+  if (!p) {
+    return;
+  }
+  p++;
+  char close[72];
+  snprintf(close, sizeof(close), "</%s>", tag);
+  const char *end = strstr(p, close);
+  if (!end || end <= p) {
+    return;
+  }
+  size_t n = (size_t)(end - p);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, p, n);
+  out[n] = '\0';
+}
+
+static void eventlog_xml_attr(const char *xml, const char *element, const char *attr,
+                              char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  char open[96];
+  snprintf(open, sizeof(open), "<%s", element ? element : "");
+  const char *p = strstr(xml ? xml : "", open);
+  if (!p) {
+    return;
+  }
+  const char *close = strchr(p, '>');
+  const char *a = strstr(p, attr ? attr : "");
+  if (!a || (close && a > close)) {
+    return;
+  }
+  a = strchr(a, '=');
+  if (!a || !a[1]) {
+    return;
+  }
+  char quote = a[1] == '\'' || a[1] == '"' ? a[1] : 0;
+  const char *start = quote ? a + 2 : a + 1;
+  const char *end = quote ? strchr(start, quote) : strpbrk(start, " \t\r\n>");
+  if (!end || end <= start) {
+    return;
+  }
+  size_t n = (size_t)(end - start);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, start, n);
+  out[n] = '\0';
+}
+
+static void eventlog_write_windows_record(FILE *f, const char *xml) {
+  char event_id[64], provider[256], record_id[64], level[64], timestamp[128], message[4096];
+  eventlog_xml_text(xml, "EventID", event_id, sizeof(event_id));
+  eventlog_xml_attr(xml, "Provider", "Name", provider, sizeof(provider));
+  eventlog_xml_text(xml, "EventRecordID", record_id, sizeof(record_id));
+  eventlog_xml_text(xml, "Level", level, sizeof(level));
+  eventlog_xml_attr(xml, "TimeCreated", "SystemTime", timestamp, sizeof(timestamp));
+  eventlog_xml_text(xml, "Message", message, sizeof(message));
+  fputs("{\"schema\":\"edr.eventlog.v1\",\"event_id\":\"", f);
+  fprint_json_escaped(f, event_id);
+  fputs("\",\"provider\":\"", f);
+  fprint_json_escaped(f, provider);
+  fputs("\",\"record_id\":\"", f);
+  fprint_json_escaped(f, record_id);
+  fputs("\",\"level\":\"", f);
+  fprint_json_escaped(f, level);
+  fputs("\",\"timestamp\":\"", f);
+  fprint_json_escaped(f, timestamp);
+  fputs("\",\"message\":\"", f);
+  fprint_json_escaped(f, message);
+  fputs("\",\"event_xml\":\"", f);
+  fprint_json_escaped(f, xml);
+  fputs("\"}", f);
+}
+
 static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) {
   wchar_t wchannel[256];
   if (!channel || !channel[0]) {
@@ -2440,9 +2689,7 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
                 fputs(",\n", f);
               }
               first = 0;
-              fputc('"', f);
-              fprint_json_escaped(f, utf8);
-              fputc('"', f);
+              eventlog_write_windows_record(f, utf8);
               total++;
               free(utf8);
             }
@@ -2490,7 +2737,10 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
     fputs(line, f);
     count++;
   }
-  (void)pclose(p);
+  int status = pclose(p);
+  if (status != 0 && count == 0) {
+    return -1;
+  }
   return count;
 }
 #endif
@@ -2524,7 +2774,12 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   fputs("\",\"events\":[\n", f);
   int count = eventlog_query_to_file(channel, max_events, f);
   if (count < 0) {
-    count = 0;
+    fclose(f);
+    (void)remove(path);
+    s_exec_fail++;
+    audit_both(cmd_id, "eventlog_view: query backend unavailable or query failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "eventlog query backend unavailable or query failed");
+    return;
   }
   fprintf(f, "\n],\"total\":%d}\n", count);
   fclose(f);
@@ -2825,10 +3080,24 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
   }
   quarantine_lock(qpath); /* 加锁:去执行/限访问,防读回或再执行 */
   FILE *mf = fopen(meta, "w");
-  if (mf) {
-    fprintf(mf, "quarantine_id=%s\noriginal_path=%s\nquarantine_path=%s\nsha256=%s\nsize=%llu\nmtime=%lld\nreason=%s\n",
-            stem, path, qpath, sha, sz, mt, reason);
-    fclose(mf);
+  if (!mf) {
+    quarantine_unlock(qpath);
+    (void)move_file_cross_volume(qpath, path);
+    s_exec_fail++;
+    audit_both(cmd_id, "quarantine_file: metadata create failed, rollback complete");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "quarantine metadata create failed");
+    return;
+  }
+  int meta_rc = fprintf(mf, "quarantine_id=%s\noriginal_path=%s\nquarantine_path=%s\nsha256=%s\nsize=%llu\nmtime=%lld\nreason=%s\n",
+                        stem, path, qpath, sha, sz, mt, reason);
+  if (meta_rc < 0 || fclose(mf) != 0) {
+    quarantine_unlock(qpath);
+    (void)remove(meta);
+    (void)move_file_cross_volume(qpath, path);
+    s_exec_fail++;
+    audit_both(cmd_id, "quarantine_file: metadata write failed, rollback complete");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "quarantine metadata write failed");
+    return;
   }
   char stemj[700], pathj[1400], qpathj[1600], metaj[1600], detail[5600];
   json_escape_to(stemj, sizeof(stemj), stem);
@@ -2875,29 +3144,58 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     return;
   }
   char qid[256];
-  if (parse_json_string_field(pl, len, "quarantine_id", qid, sizeof(qid)) != 0 &&
-      parse_json_string_field(pl, len, "id", qid, sizeof(qid)) != 0) {
+  char base[700], meta[1200];
+  quarantine_base_dir(base, sizeof(base));
+  char direct_qpath[1400], direct_restore[1400];
+  int has_direct_paths = parse_json_string_field(pl, len, "quarantine_path", direct_qpath,
+                                                   sizeof(direct_qpath)) == 0 &&
+                         (parse_json_string_field(pl, len, "dest", direct_restore,
+                                                   sizeof(direct_restore)) == 0 ||
+                          parse_json_string_field(pl, len, "restore_path", direct_restore,
+                                                   sizeof(direct_restore)) == 0);
+  if (has_direct_paths && (!direct_qpath[0] || !direct_restore[0] ||
+                           strlen(direct_qpath) >= 1024u ||
+                           strlen(direct_restore) >= 1024u)) {
+    has_direct_paths = 0;
+  }
+  if (has_direct_paths) {
+    if (!quarantine_path_allowed(base, direct_qpath) || !file_exists_c(direct_qpath)) {
+      s_exec_fail++;
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine_path is outside quarantine directory or missing");
+      return;
+    }
+    snprintf(qid, sizeof(qid), "%s", path_basename_c(direct_qpath));
+    char *dot = strrchr(qid, '.');
+    if (dot && strcmp(dot, ".bin") == 0) {
+      *dot = '\0';
+    }
+  } else if (parse_json_string_field(pl, len, "quarantine_id", qid, sizeof(qid)) != 0 &&
+             parse_json_string_field(pl, len, "id", qid, sizeof(qid)) != 0) {
     s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing quarantine_id");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing quarantine_id or quarantine_path/dest");
     return;
   }
   sanitize_component(qid);
-  char base[700], meta[1200];
-  quarantine_base_dir(base, sizeof(base));
 #ifdef _WIN32
   snprintf(meta, sizeof(meta), "%s\\%s.meta", base, qid);
 #else
   snprintf(meta, sizeof(meta), "%s/%s.meta", base, qid);
 #endif
   char qpath[1024], original[1024], restore[1024];
-  if (read_meta_value(meta, "quarantine_path", qpath, sizeof(qpath)) != 0 ||
-      read_meta_value(meta, "original_path", original, sizeof(original)) != 0) {
-    s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine metadata not found");
-    return;
-  }
-  if (parse_json_string_field(pl, len, "restore_path", restore, sizeof(restore)) != 0) {
-    snprintf(restore, sizeof(restore), "%s", original);
+  if (has_direct_paths) {
+    snprintf(qpath, sizeof(qpath), "%s", direct_qpath);
+    snprintf(restore, sizeof(restore), "%s", direct_restore);
+    snprintf(original, sizeof(original), "%s", direct_restore);
+  } else {
+    if (read_meta_value(meta, "quarantine_path", qpath, sizeof(qpath)) != 0 ||
+        read_meta_value(meta, "original_path", original, sizeof(original)) != 0) {
+      s_exec_fail++;
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine metadata not found");
+      return;
+    }
+    if (parse_json_string_field(pl, len, "restore_path", restore, sizeof(restore)) != 0) {
+      snprintf(restore, sizeof(restore), "%s", original);
+    }
   }
   if (file_exists_c(restore)) {
     s_exec_fail++;
@@ -4111,16 +4409,21 @@ static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid json");
     return;
   }
-  if (edr_pmfe_submit_server_scan(cmd_id, (uint32_t)pid) != 0) {
+  EdrPmfeCommandContext context;
+  memset(&context, 0, sizeof(context));
+  if (sm) {
+    snprintf(context.soar_correlation_id, sizeof(context.soar_correlation_id), "%s", sm->soar_correlation_id);
+    snprintf(context.playbook_run_id, sizeof(context.playbook_run_id), "%s", sm->playbook_run_id);
+    snprintf(context.playbook_step_id, sizeof(context.playbook_step_id), "%s", sm->playbook_step_id);
+  }
+  if (edr_pmfe_submit_server_scan_ex(cmd_id, (uint32_t)pid, &context) != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "pmfe_scan: queue failed (PMFE not running or queue full)");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "pmfe queue full or not running");
     return;
   }
   s_handled++;
-  s_exec_ok++;
-  audit_both(cmd_id, "pmfe_scan: queued (async coarse scan)");
-  soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, "pmfe_scan queued", "queued", NULL);
+  audit_both(cmd_id, "pmfe_scan: accepted (terminal result pending)");
 }
 
 static void hex_from_bytes(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -4639,6 +4942,7 @@ static void replay_persisted_command_inbox(void) {
       continue;
     }
     s_active_command_type = inbox[i].command_type;
+    edr_command_set_active_type(s_active_command_type);
     char sig_reason[160];
     sig_reason[0] = '\0';
     if (!command_signature_verify(inbox[i].command_id, inbox[i].command_type,
@@ -4712,10 +5016,9 @@ static void flush_command_result_outbox(void) {
     }
     int rc = -1;
     if (edr_ingest_http_configured()) {
-      rc = edr_transport_v2_command_result(pending[i].command_id, &sm,
-                                               pending[i].execution_status,
-                                               pending[i].exit_code,
-                                               pending[i].detail);
+      rc = edr_transport_v2_command_result_typed(pending[i].command_id, pending[i].command_type, &sm,
+                                                 pending[i].execution_status, pending[i].exit_code,
+                                                 pending[i].detail);
     }
     if (rc == 0) {
       edr_command_state_mark_reported(&pending[i]);
@@ -4723,8 +5026,76 @@ static void flush_command_result_outbox(void) {
   }
 }
 
+void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int scan_status,
+                                       const char *detail,
+                                       const struct EdrPmfeCommandContext *context) {
+  if (!command_id || !command_id[0]) {
+    return;
+  }
+  pmfe_completion_lock();
+  for (size_t i = 0; i < PMFE_COMPLETION_CAP; i++) {
+    if (s_pmfe_completions[i].used) {
+      continue;
+    }
+    PmfeCompletion *slot = &s_pmfe_completions[i];
+    memset(slot, 0, sizeof(*slot));
+    slot->used = 1;
+    snprintf(slot->command_id, sizeof(slot->command_id), "%s", command_id);
+    slot->pid = pid;
+    slot->scan_status = scan_status;
+    snprintf(slot->detail, sizeof(slot->detail), "%s", detail ? detail : "pmfe scan completed without detail");
+    if (context) {
+      slot->context = *context;
+    }
+    pmfe_completion_unlock();
+    return;
+  }
+  pmfe_completion_unlock();
+  edr_command_audit_both(command_id, "pmfe completion queue full; terminal result remains in command inbox");
+}
+
+static void drain_pmfe_completions(void) {
+  for (;;) {
+    PmfeCompletion completion;
+    int found = 0;
+    pmfe_completion_lock();
+    for (size_t i = 0; i < PMFE_COMPLETION_CAP; i++) {
+      if (!s_pmfe_completions[i].used) {
+        continue;
+      }
+      completion = s_pmfe_completions[i];
+      memset(&s_pmfe_completions[i], 0, sizeof(s_pmfe_completions[i]));
+      found = 1;
+      break;
+    }
+    pmfe_completion_unlock();
+    if (!found) {
+      return;
+    }
+    EdrSoarCommandMeta sm;
+    memset(&sm, 0, sizeof(sm));
+    snprintf(sm.soar_correlation_id, sizeof(sm.soar_correlation_id), "%s",
+             completion.context.soar_correlation_id);
+    snprintf(sm.playbook_run_id, sizeof(sm.playbook_run_id), "%s",
+             completion.context.playbook_run_id);
+    snprintf(sm.playbook_step_id, sizeof(sm.playbook_step_id), "%s",
+             completion.context.playbook_step_id);
+    char result[1500];
+    snprintf(result, sizeof(result), "pmfe_scan %s pid=%u detail=%s",
+             completion.scan_status == 0 ? "completed" : "failed", completion.pid, completion.detail);
+    if (completion.scan_status == 0) {
+      s_exec_ok++;
+      edr_command_emit_always_typed(completion.command_id, "pmfe_scan", &sm, EdrCmdExecOk, 0, result);
+    } else {
+      s_exec_fail++;
+      edr_command_emit_always_typed(completion.command_id, "pmfe_scan", &sm, EdrCmdExecFailed, 8, result);
+    }
+  }
+}
+
 void edr_command_poll_reliable_delivery(void) {
   static int64_t last_poll_ms;
+  drain_pmfe_completions();
   int64_t now = command_now_ms();
   int pressure = edr_resource_preprocess_throttle_active() ? 1 : 0;
   uint32_t poll_ms = command_u32_env_clamped(
@@ -4797,6 +5168,7 @@ int edr_command_receive_envelope(const char *command_id, const char *command_typ
   const char *t = command_type ? command_type : "";
   const char *id = command_id ? command_id : "";
   s_active_command_type = t;
+  edr_command_set_active_type(t);
 
   char sig_reason[160];
   sig_reason[0] = 0;
@@ -4869,6 +5241,7 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
   const char *t = command_type ? command_type : "";
   const char *id = command_id ? command_id : "";
   s_active_command_type = t;
+  edr_command_set_active_type(t);
 
   if (streq(t, "noop") || streq(t, "ping")) {
     fprintf(stderr, "[command] ok id=%s type=%s\n", id, t);
@@ -4909,12 +5282,17 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
     do_kill(id, payload, payload_len, sm);
     return;
   }
-  if (streq(t, "collect_forensic") || streq(t, "forensic")) {
-    /* collect_forensic = in-process 打包(不调 velo),不受 operator-only gate 约束:
-     * gate 只针对真正执行 velociraptor 的命令(velo_query / memory_dump / targeted / yara)。 */
-    do_forensic(id, payload, payload_len, sm);
-    return;
-  }
+	if (streq(t, "collect_forensic")) {
+	  /* SOAR forensic action uses the collector-aware response path. It may
+	   * fall back to the local bundle only when collector policy allows it. */
+	  edr_response_collect_forensic(id, payload, payload_len, sm);
+	 return;
+	}
+	if (streq(t, "forensic")) {
+	  /* Legacy forensic remains the explicit lightweight local bundle path. */
+	  do_forensic(id, payload, payload_len, sm);
+	  return;
+	}
   // 接线已实现但此前未挂载的处置：进程内存转储 / 定向取证 / 文件下推（实现见 response_forensic.c、response_file.c）。
   if (streq(t, "memory_dump") || streq(t, "memdump")) {
     if (!forensic_operator_gate(sm, payload, payload_len)) {
@@ -5112,7 +5490,6 @@ void edr_command_execute_persisted_envelope(const char *command_id, const char *
     return;
   }
   edr_command_execute_received_envelope(command_id, command_type, payload, payload_len, soar_meta);
-  edr_command_state_delete_inbox(id);
   command_inbox_unmark_active(id);
 }
 

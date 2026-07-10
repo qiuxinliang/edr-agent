@@ -5074,9 +5074,11 @@ static int ws_send_agent_message(EdrWsConn *c, const char *command_type) {
   return ws_send_text_conn(c, env);
 }
 
-static int ws_send_command_result(const char *command_id, const struct EdrSoarCommandMeta *meta,
+static int ws_send_command_result(const char *command_id, const char *command_type,
+                                  const struct EdrSoarCommandMeta *meta,
                                   int execution_status, int exit_code, const char *detail_utf8) {
   char *cmd = NULL;
+  char *ctype = NULL;
   char *detail = NULL;
   char *soar = NULL;
   char *run = NULL;
@@ -5092,25 +5094,26 @@ static int ws_send_command_result(const char *command_id, const struct EdrSoarCo
     return -1;
   }
   cmd = json_escape_alloc(command_id);
+  ctype = json_escape_alloc(command_type ? command_type : "");
   detail = json_escape_alloc(detail_utf8 ? detail_utf8 : "");
   soar = json_escape_alloc(meta ? meta->soar_correlation_id : "");
   run = json_escape_alloc(meta ? meta->playbook_run_id : "");
   step = json_escape_alloc(meta ? meta->playbook_step_id : "");
-  if (!cmd || !detail || !soar || !run || !step) {
+  if (!cmd || !ctype || !detail || !soar || !run || !step) {
     goto done;
   }
-  payload_cap = strlen(cmd) + strlen(detail) + strlen(soar) + strlen(run) + strlen(step) +
+  payload_cap = strlen(cmd) + strlen(ctype) + strlen(detail) + strlen(soar) + strlen(run) + strlen(step) +
                 strlen(s_agent_ver) + 512u;
   payload = (char *)malloc(payload_cap);
   if (!payload) {
     goto done;
   }
   snprintf(payload, payload_cap,
-           "{\"command_id\":\"%s\",\"status\":%d,\"exit_code\":%d,"
+           "{\"command_id\":\"%s\",\"command_type\":%s,\"status\":%d,\"exit_code\":%d,"
            "\"detail_utf8\":\"%s\",\"agent_version\":\"%s\","
            "\"soar_correlation_id\":\"%s\",\"playbook_run_id\":\"%s\","
            "\"playbook_step_id\":\"%s\",\"finished_unix_ms\":%lld}",
-           cmd, execution_status, exit_code, detail, s_agent_ver, soar, run, step,
+           cmd, ctype, execution_status, exit_code, detail, s_agent_ver, soar, run, step,
            (long long)unix_ms_now());
   b64_cap = (strlen(payload) / 3u + 2u) * 4u + 16u;
   payload_b64 = (char *)malloc(b64_cap);
@@ -5131,6 +5134,7 @@ static int ws_send_command_result(const char *command_id, const struct EdrSoarCo
   rc = ws_send_text_active(env);
 done:
   free(cmd);
+  free(ctype);
   free(detail);
   free(soar);
   free(run);
@@ -5348,13 +5352,13 @@ int edr_ingest_http_post_config_status(const char *tenant_id,
   return 0;
 }
 
-int edr_ingest_http_post_command_result(const char *command_id,
-                                        const struct EdrSoarCommandMeta *meta,
-                                        int execution_status,
-                                        int exit_code,
-                                        const char *detail_utf8) {
+int edr_ingest_http_post_command_result_typed(const char *command_id, const char *command_type,
+                                              const struct EdrSoarCommandMeta *meta,
+                                              int execution_status, int exit_code,
+                                              const char *detail_utf8) {
   char *detail = NULL;
   char *cmd = NULL;
+  char *ctype = NULL;
   char *soar = NULL;
   char *run = NULL;
   char *step = NULL;
@@ -5366,7 +5370,7 @@ int edr_ingest_http_post_command_result(const char *command_id,
     return -1;
   }
   ws_was_ready = s_ws_ready ? 1 : 0;
-  if (ws_send_command_result(command_id, meta, execution_status, exit_code, detail_utf8) == 0) {
+  if (ws_send_command_result(command_id, command_type, meta, execution_status, exit_code, detail_utf8) == 0) {
     note_ws_message_success();
     note_command_result_success();
     return 0;
@@ -5375,23 +5379,26 @@ int edr_ingest_http_post_command_result(const char *command_id,
     s_ws_message_fail++;
   }
   cmd = json_escape_alloc(command_id);
+  ctype = json_escape_alloc(command_type ? command_type : "");
   detail = json_escape_alloc(detail_utf8 ? detail_utf8 : "");
   soar = json_escape_alloc(meta ? meta->soar_correlation_id : "");
   run = json_escape_alloc(meta ? meta->playbook_run_id : "");
   step = json_escape_alloc(meta ? meta->playbook_step_id : "");
-  if (!cmd || !detail || !soar || !run || !step) {
+  if (!cmd || !ctype || !detail || !soar || !run || !step) {
     free(cmd);
+    free(ctype);
     free(detail);
     free(soar);
     free(run);
     free(step);
     return -1;
   }
-  body_cap = strlen(cmd) + strlen(detail) + strlen(soar) + strlen(run) + strlen(step) +
+  body_cap = strlen(cmd) + strlen(ctype) + strlen(detail) + strlen(soar) + strlen(run) + strlen(step) +
              strlen(s_endpoint) + strlen(s_agent_ver) + 512u;
   body = (char *)malloc(body_cap);
   if (!body) {
     free(cmd);
+    free(ctype);
     free(detail);
     free(soar);
     free(run);
@@ -5400,11 +5407,11 @@ int edr_ingest_http_post_command_result(const char *command_id,
   }
   snprintf(body, body_cap,
            "{\"endpoint_id\":\"%s\",\"result\":{"
-           "\"command_id\":\"%s\",\"endpoint_id\":\"%s\",\"agent_version\":\"%s\","
+           "\"command_id\":\"%s\",\"command_type\":%s,\"endpoint_id\":\"%s\",\"agent_version\":\"%s\","
            "\"status\":\"%d\",\"exit_code\":\"%d\",\"detail_utf8\":\"%s\","
            "\"finished_unix_ms\":\"%lld\",\"soar_correlation_id\":\"%s\","
            "\"playbook_run_id\":\"%s\",\"playbook_step_id\":\"%s\"}}",
-           s_endpoint, cmd, s_endpoint, s_agent_ver, execution_status, exit_code, detail,
+           s_endpoint, cmd, ctype, s_endpoint, s_agent_ver, execution_status, exit_code, detail,
            (long long)unix_ms_now(), soar, run, step);
   rc = request_to_suffix("POST", "ingest/report-command-result", "application/json",
                          body, strlen(body), NULL, 0u);
@@ -5420,12 +5427,21 @@ int edr_ingest_http_post_command_result(const char *command_id,
     note_command_result_failure();
   }
   free(cmd);
+  free(ctype);
   free(detail);
   free(soar);
   free(run);
   free(step);
   free(body);
   return rc;
+}
+
+int edr_ingest_http_post_command_result(const char *command_id,
+                                        const struct EdrSoarCommandMeta *meta,
+                                        int execution_status, int exit_code,
+                                        const char *detail_utf8) {
+  return edr_ingest_http_post_command_result_typed(command_id, "", meta, execution_status, exit_code,
+                                                   detail_utf8);
 }
 
 static int edr_ingest_http_post_control_ack(const char *command_id, const char *transport, int64_t last_seq) {

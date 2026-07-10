@@ -36,11 +36,24 @@ typedef enum {
 struct EdrConfig;
 struct EdrEventBus;
 
+/* Context retained from a server-triggered scan until the worker reaches a
+ * terminal result. */
+typedef struct EdrPmfeCommandContext {
+  char soar_correlation_id[128];
+  char playbook_run_id[96];
+  char playbook_step_id[96];
+} EdrPmfeCommandContext;
+
+typedef void (*EdrPmfeServerScanResultCallback)(const char *command_id, uint32_t pid,
+                                                int scan_status, const char *detail,
+                                                const EdrPmfeCommandContext *context);
+
 /**
  * 绑定事件总线，使 PMFE 扫描完成后可将 **ETW1 形态** 事件送入预处理线程（与 ETW/Webshell 同源：`edr_event_batch_push` → HTTP ingest）。
  * 须在 `edr_pmfe_init` 之前调用（通常传入 `edr_agent_event_bus(agent)`）。
  */
 void edr_pmfe_set_event_bus(struct EdrEventBus *bus);
+void edr_pmfe_set_server_scan_result_callback(EdrPmfeServerScanResultCallback callback);
 
 /** 供可选 `AVE_ScanFile` 候选落盘路径使用；在 `edr_pmfe_init` 之前调用一次即可。 */
 void edr_pmfe_bind_config(const struct EdrConfig *cfg);
@@ -79,6 +92,10 @@ int edr_pmfe_is_running(void);
  * @return 0 已入队；-1 未初始化、已 shutdown、队列满或 pid 无效
  */
 int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid);
+
+/** Same as edr_pmfe_submit_server_scan, retaining the SOAR context. */
+int edr_pmfe_submit_server_scan_ex(const char *command_id, uint32_t pid,
+                                   const EdrPmfeCommandContext *context);
 
 /**
  * ETW / 预处理路径触发的 PMFE 入队（`etw:<reason>`），带 **同 PID 冷却**（`EDR_PMFE_ETW_COOLDOWN_MS`，默认 30000）。

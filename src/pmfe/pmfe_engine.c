@@ -42,6 +42,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 
 #include "edr/pmfe_idle_scanner.h"
 static const EdrConfig *s_pmfe_cfg;
+static EdrPmfeServerScanResultCallback s_server_scan_result_callback;
 
 void edr_pmfe_bind_config(const EdrConfig *cfg) {
   s_pmfe_cfg = cfg;
@@ -69,6 +70,7 @@ const EdrConfig *edr_pmfe_current_config(void) {
 typedef struct {
   uint32_t pid;
   char cmd_id[64];
+  EdrPmfeCommandContext command_context;
   uint8_t priority;
   uint8_t band;
   uint8_t force_deep;
@@ -1539,6 +1541,10 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
 
 void edr_pmfe_set_event_bus(EdrEventBus *bus) { s_pmfe_bus = bus; }
 
+void edr_pmfe_set_server_scan_result_callback(EdrPmfeServerScanResultCallback callback) {
+  s_server_scan_result_callback = callback;
+}
+
 static unsigned pmfe_detail_u(const char *d, const char *key) {
   const char *p = strstr(d, key);
   if (!p) {
@@ -1795,6 +1801,9 @@ static void pmfe_worker_body(void) {
     audit_pmfe_line(task.cmd_id[0] ? task.cmd_id : "-", detail);
     edr_pid_history_pmfe_ingest_scan_detail(task.pid, detail);
     pmfe_try_emit_scan_result(&task, detail);
+    if (task.cmd_id[0] && s_server_scan_result_callback) {
+      s_server_scan_result_callback(task.cmd_id, task.pid, sr, detail, &task.command_context);
+    }
 
 #ifdef _WIN32
     InterlockedIncrement(&s_stat_completed);
@@ -2266,7 +2275,8 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
   return 0;
 }
 
-int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
+int edr_pmfe_submit_server_scan_ex(const char *command_id, uint32_t pid,
+                                   const EdrPmfeCommandContext *context) {
   if (pid == 0u) {
     return -1;
   }
@@ -2289,11 +2299,18 @@ int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
   if (command_id && command_id[0]) {
     snprintf(t.cmd_id, sizeof(t.cmd_id), "%s", command_id);
   }
+  if (context) {
+    t.command_context = *context;
+  }
   t.priority = (uint8_t)pr;
   t.band = (uint8_t)EDR_PMFE_BAND_P0;
   t.force_deep = 1u;
   pmfe_task_fill_scope(&t);
   return pmfe_enqueue_task(&t);
+}
+
+int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
+  return edr_pmfe_submit_server_scan_ex(command_id, pid, NULL);
 }
 
 int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTriggerBand band, uint64_t vad_hint_va) {

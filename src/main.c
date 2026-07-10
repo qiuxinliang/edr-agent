@@ -544,6 +544,7 @@ static int edr_agent_run_main(const char *config) {
   edr_command_bind_config(edr_agent_get_config(agent));
   edr_pmfe_bind_config(edr_agent_get_config(agent));
   edr_pmfe_set_event_bus(edr_agent_event_bus(agent));
+  edr_pmfe_set_server_scan_result_callback(edr_command_on_pmfe_scan_complete);
   {
     EdrError pe = edr_pmfe_init();
     if (pe != EDR_OK) {

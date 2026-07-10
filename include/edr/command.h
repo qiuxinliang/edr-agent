@@ -16,11 +16,13 @@ extern "C" {
 #endif
 
 struct EdrConfig;
+struct EdrPmfeCommandContext;
 
 /**
  * 绑定当前进程配置（main 在 edr_agent_init 成功后调用），供 AVE 等指令使用 `EdrConfig`。
  */
 void edr_command_bind_config(const struct EdrConfig *cfg);
+void edr_command_set_active_type(const char *command_type);
 
 /**
  * WinDivert shellcode 告警分数 ≥ `auto_isolate_threshold` 时，在显式启用（`EDR_SHELLCODE_AUTO_ISOLATE=1`
@@ -80,6 +82,11 @@ void edr_command_execute_persisted_envelope(const char *command_id, const char *
 
 /** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
 void edr_command_poll_reliable_delivery(void);
+
+/** PMFE worker completion is queued and drained by the command poll loop. */
+void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int scan_status,
+                                       const char *detail,
+                                       const struct EdrPmfeCommandContext *context);
 
 typedef struct EdrCommandDeliveryHealth {
   uint64_t poll_count;
