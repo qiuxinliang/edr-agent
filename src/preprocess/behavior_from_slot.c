@@ -40,8 +40,7 @@ typedef struct {
 static RansomCounterBucket g_ransom_buckets[RANSOM_COUNTER_BUCKETS];
 static RansomNoteBucket g_ransom_note_buckets[RANSOM_NOTE_BUCKETS];
 
-static int ransom_policy_token_match(const char *env_inline, const char *env_file, const char *fallback,
-                                     const char *value);
+static int detail_token_value(const char *text, const char *key, char *out, size_t cap);
 
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = ++g_event_seq;
@@ -136,24 +135,6 @@ static int file_path_usable_for_ransom(const char *path) {
   return ascii > 0u;
 }
 
-static int known_low_value_ransom_counter_process(const EdrBehaviorRecord *r) {
-  if (!r) {
-    return 0;
-  }
-  char subject[8192];
-  snprintf(subject, sizeof(subject), "%s %s %s",
-           r->process_name, r->exe_path, r->cmdline);
-  const char *fallback =
-      "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
-      "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
-  if (ransom_policy_token_match("EDR_RANSOM_LOW_VALUE_PROCESSES",
-                                "EDR_RANSOM_LOW_VALUE_PROCESSES_FILE", fallback, subject)) {
-    return 1;
-  }
-  return ransom_policy_token_match("EDR_RANSOM_BULK_SAFE_PROCESSES",
-                                   "EDR_RANSOM_BULK_SAFE_PROCESSES_FILE", "", subject);
-}
-
 static char fold_ascii(char c) {
   if (c == '/') {
     c = '\\';
@@ -182,7 +163,21 @@ static int has_ci_ascii(const char *hay, const char *needle) {
   return 0;
 }
 
-static int token_list_has_ci_ascii(const char *list, const char *value) {
+static int ransom_ci_equal(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (fold_ascii(*a) != fold_ascii(*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int token_list_has_exact_ci_ascii(const char *list, const char *value) {
   if (!list || !list[0] || !value || !value[0]) {
     return 0;
   }
@@ -191,7 +186,7 @@ static int token_list_has_ci_ascii(const char *list, const char *value) {
     while (*p == ',' || *p == ';' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ' ') {
       p++;
     }
-    char tok[256];
+    char tok[512];
     size_t n = 0u;
     while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
       tok[n++] = *p++;
@@ -203,39 +198,80 @@ static int token_list_has_ci_ascii(const char *list, const char *value) {
       n--;
     }
     tok[n] = '\0';
-    if (tok[0] && has_ci_ascii(value, tok)) {
+    if (tok[0] && ransom_ci_equal(tok, value)) {
       return 1;
     }
   }
   return 0;
 }
 
-static int file_token_list_has_ci_ascii(const char *path, const char *value) {
-  if (!path || !path[0] || !value || !value[0]) {
-    return 0;
-  }
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    return 0;
-  }
-  char buf[4096];
-  size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
-  fclose(f);
-  buf[n] = '\0';
-  return token_list_has_ci_ascii(buf, value);
-}
-
-static int ransom_policy_token_match(const char *env_inline, const char *env_file, const char *fallback,
-                                     const char *value) {
+static int policy_exact_value_match(const char *env_inline, const char *env_file, const char *value) {
   const char *list = getenv(env_inline);
-  if (list && list[0] && token_list_has_ci_ascii(list, value)) {
+  if (list && list[0] && token_list_has_exact_ci_ascii(list, value)) {
     return 1;
   }
   const char *file = getenv(env_file);
-  if (file && file[0] && file_token_list_has_ci_ascii(file, value)) {
+  if (file && file[0]) {
+    FILE *f = fopen(file, "rb");
+    if (f) {
+      char buf[8192];
+      size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+      fclose(f);
+      buf[n] = '\0';
+      if (token_list_has_exact_ci_ascii(buf, value)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int ransom_process_identity_match(const char *list, const EdrBehaviorRecord *r) {
+  if (!list || !list[0] || !r) {
+    return 0;
+  }
+  char first_cmd[EDR_BR_STR_LONG];
+  first_cmd_token(r->cmdline, first_cmd, sizeof(first_cmd));
+  const char *ids[] = {r->process_name, r->exe_path, basename_c(r->process_name), basename_c(r->exe_path),
+                       basename_c(first_cmd), r->exe_hash};
+  for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+    if (ids[i][0] && token_list_has_exact_ci_ascii(list, ids[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ransom_process_policy_match(const char *env_inline, const char *env_file, const char *fallback,
+                                       const EdrBehaviorRecord *r) {
+  const char *list = getenv(env_inline);
+  if (ransom_process_identity_match(list, r)) {
     return 1;
   }
-  return fallback && fallback[0] && token_list_has_ci_ascii(fallback, value);
+  const char *file = getenv(env_file);
+  if (file && file[0]) {
+    FILE *f = fopen(file, "rb");
+    if (f) {
+      char buf[8192];
+      size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+      fclose(f);
+      buf[n] = '\0';
+      if (ransom_process_identity_match(buf, r)) {
+        return 1;
+      }
+    }
+  }
+  return ransom_process_identity_match(fallback, r);
+}
+
+static int known_low_value_ransom_counter_process(const EdrBehaviorRecord *r) {
+  const char *fallback =
+      "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
+      "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
+  return ransom_process_policy_match("EDR_RANSOM_LOW_VALUE_PROCESSES",
+                                    "EDR_RANSOM_LOW_VALUE_PROCESSES_FILE", fallback, r) ||
+         ransom_process_policy_match("EDR_RANSOM_BULK_SAFE_PROCESSES",
+                                    "EDR_RANSOM_BULK_SAFE_PROCESSES_FILE", "", r);
 }
 
 static int env_int_clamped(const char *name, int fallback, int lo, int hi) {
@@ -570,11 +606,9 @@ static int is_ransom_canary_path(const char *path) {
   if (!path || !path[0]) {
     return 0;
   }
-  const char *fallback =
-      "~$canary,edr_canary,.edr-canary,edr-canary,canary.doc,canary.docx,canary.xlsx,canary.txt,"
-      "~edr_canary,~$edr_canary";
-  return ransom_policy_token_match("EDR_RANSOM_CANARY_TOKENS", "EDR_RANSOM_CANARY_TOKENS_FILE",
-                                   fallback, path);
+  /* Canary 必须由每台设备下发唯一完整路径；未配置时关闭确定性判定。 */
+  return policy_exact_value_match("EDR_RANSOM_CANARY_PATH", "EDR_RANSOM_CANARY_PATH_FILE", path) ||
+         policy_exact_value_match("EDR_RANSOM_CANARY_TOKENS", "EDR_RANSOM_CANARY_TOKENS_FILE", path);
 }
 
 static int ransom_signature_trusted(const EdrBehaviorRecord *r) {
@@ -588,18 +622,18 @@ static int ransom_signer_allowlisted(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  char subject[12288];
-  snprintf(subject, sizeof(subject), "%s %s %s %s %s",
-           r->process_name, r->exe_path, r->cmdline, r->file_path, r->script_snippet);
-  int signer_ok = ransom_policy_token_match("EDR_RANSOM_SIGNER_ALLOWLIST",
-                                             "EDR_RANSOM_SIGNER_ALLOWLIST_FILE", "", subject);
+  char signer[512];
+  if (!detail_token_value(r->script_snippet, "signer", signer, sizeof(signer))) {
+    return 0;
+  }
+  int signer_ok = policy_exact_value_match("EDR_RANSOM_SIGNER_ALLOWLIST",
+                                           "EDR_RANSOM_SIGNER_ALLOWLIST_FILE", signer);
   if (!signer_ok) {
     return 0;
   }
-  char path_subject[8192];
-  snprintf(path_subject, sizeof(path_subject), "%s %s %s", r->exe_path, r->cmdline, r->process_name);
-  int path_ok = ransom_policy_token_match("EDR_RANSOM_SIGNED_PATH_ALLOWLIST",
-                                           "EDR_RANSOM_SIGNED_PATH_ALLOWLIST_FILE", "", path_subject);
+  const char *path = r->exe_path[0] ? r->exe_path : r->process_name;
+  int path_ok = policy_exact_value_match("EDR_RANSOM_SIGNED_PATH_ALLOWLIST",
+                                         "EDR_RANSOM_SIGNED_PATH_ALLOWLIST_FILE", path);
   if (!path_ok) {
     return 0;
   }
@@ -611,14 +645,7 @@ static int ransom_signer_allowlisted(const EdrBehaviorRecord *r) {
 }
 
 static int ransom_counter_allowlisted(const EdrBehaviorRecord *r) {
-  if (!r) {
-    return 0;
-  }
-  char subject[8192];
-  snprintf(subject, sizeof(subject), "%s %s %s %s",
-           r->process_name, r->exe_path, r->cmdline, r->file_path);
-  return ransom_policy_token_match("EDR_RANSOM_COUNTER_ALLOWLIST", "EDR_RANSOM_COUNTER_ALLOWLIST_FILE",
-                                   "", subject) ||
+  return ransom_process_policy_match("EDR_RANSOM_COUNTER_ALLOWLIST", "EDR_RANSOM_COUNTER_ALLOWLIST_FILE", "", r) ||
          ransom_signer_allowlisted(r);
 }
 
@@ -760,8 +787,8 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
                    canary ? " canary_counter_bypass=1" : "");
 
   if (confirmed) {
-    /* 确诊勒索:端侧实时自隔离(默认关,需 EDR_RANSOM_AUTO_ISOLATE=1 + 高危策略;每进程一次)。 */
-    edr_isolate_auto_from_ransom_alarm();
+    /* 确诊勒索:端侧处置(默认关,需显式启用自动隔离策略)。 */
+    edr_isolate_auto_from_ransom_alarm(r->pid);
   }
 
   if (is_ransom_note_like_path(r->file_path)) {

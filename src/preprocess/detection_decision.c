@@ -33,6 +33,7 @@ static int has_ci(const char *hay, const char *needle) {
 static int detail_value(const char *text, const char *key, char *out, size_t cap);
 static double detail_number(const char *text, const char *key, double fallback);
 static int policy_token_match(const char *env_inline, const char *env_file, const char *fallback, const char *value);
+static int token_list_has_exact_ci(const char *list, const char *value);
 
 static const char *base_name(const char *path) {
   const char *b = path && path[0] ? path : "";
@@ -67,18 +68,58 @@ static int decision_low_value_ransom_process(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  char subject[8192];
-  snprintf(subject, sizeof(subject), "%s %s %s",
-           r->process_name, r->exe_path, r->cmdline);
   const char *fallback =
       "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
       "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
-  if (policy_token_match("EDR_RANSOM_LOW_VALUE_PROCESSES",
-                         "EDR_RANSOM_LOW_VALUE_PROCESSES_FILE", fallback, subject)) {
-    return 1;
+  char first_cmd[EDR_BR_STR_LONG];
+  first_cmd[0] = '\0';
+  const char *cmd = r->cmdline;
+  while (*cmd == ' ' || *cmd == '\t') {
+    cmd++;
   }
-  return policy_token_match("EDR_RANSOM_BULK_SAFE_PROCESSES",
-                            "EDR_RANSOM_BULK_SAFE_PROCESSES_FILE", "", subject);
+  if (*cmd == '"' || *cmd == '\'') {
+    char quote = *cmd++;
+    size_t n = 0u;
+    while (*cmd && *cmd != quote && n + 1u < sizeof(first_cmd)) {
+      first_cmd[n++] = *cmd++;
+    }
+    first_cmd[n] = '\0';
+  } else {
+    size_t n = 0u;
+    while (*cmd && *cmd != ' ' && *cmd != '\t' && n + 1u < sizeof(first_cmd)) {
+      first_cmd[n++] = *cmd++;
+    }
+    first_cmd[n] = '\0';
+  }
+  const char *ids[] = {base_name(r->process_name), base_name(r->exe_path), base_name(first_cmd)};
+  const char *lists[] = {getenv("EDR_RANSOM_LOW_VALUE_PROCESSES"),
+                         getenv("EDR_RANSOM_LOW_VALUE_PROCESSES_FILE"), fallback,
+                         getenv("EDR_RANSOM_BULK_SAFE_PROCESSES"),
+                         getenv("EDR_RANSOM_BULK_SAFE_PROCESSES_FILE")};
+  for (size_t i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+    const char *list = lists[i];
+    if (!list || !list[0]) {
+      continue;
+    }
+    char buf[8192];
+    const char *src = list;
+    if (i == 1u || i == 4u) {
+      FILE *f = fopen(list, "rb");
+      if (!f) {
+        continue;
+      }
+      size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+      fclose(f);
+      buf[n] = '\0';
+      src = buf;
+    }
+    for (size_t j = 0; j < sizeof(ids) / sizeof(ids[0]); j++) {
+      if (ids[j][0] && token_list_has_exact_ci(src, ids[j])) {
+        return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 static int decision_suppress_ransom_file_signal(const EdrBehaviorRecord *r) {
@@ -109,6 +150,40 @@ static int token_list_has_ci(const char *list, const char *value) {
       tok[--n] = '\0';
     }
     if (tok[0] && has_ci(value, tok)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int token_list_has_exact_ci(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    char tok[512];
+    size_t n = 0u;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t')) {
+      n--;
+    }
+    tok[n] = '\0';
+    int same = tok[0] && strlen(tok) == strlen(value);
+    for (size_t i = 0; same && tok[i]; i++) {
+      if (tolower((unsigned char)tok[i]) != tolower((unsigned char)value[i])) {
+        same = 0;
+      }
+    }
+    if (same) {
       return 1;
     }
   }
@@ -314,10 +389,10 @@ static int has_ransom_canary_indicator(const EdrBehaviorRecord *r) {
     return 0;
   }
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
-  const char *path = r->file_path[0] ? r->file_path : r->exe_path;
-  return has_ci(s, "ransom_canary=1") || has_ci(s, "DETERMINISTIC_ENCRYPTION") ||
-         has_ci(path, "~$canary") || has_ci(path, "edr_canary") || has_ci(path, ".edr-canary") ||
-         has_ci(path, "edr-canary");
+  /* Deterministic Canary 只接受 behavior_from_slot 生成的受信标记；
+   * 不再根据普通文件路径中的 canary 字符串升级为 P0。 */
+  return has_ci(s, "ransom_canary=1") || has_ci(s, "canary_counter_bypass=1") ||
+         has_ci(s, "ransomware_kind=DETERMINISTIC_ENCRYPTION");
 }
 
 static int has_ransom_counter_allowlist_indicator(const EdrBehaviorRecord *r) {
@@ -1765,6 +1840,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_canary = has_ransom_canary_indicator(r);
   int ransom_burst = has_ransom_burst_indicator(r);
+  int ransom_counter_allowlisted = has_ransom_counter_allowlist_indicator(r);
   int ransom_note = has_ransom_note_indicator(r);
   int ransom_note_burst = has_ransom_note_burst_indicator(r);
   int security_kill = has_security_product_kill_indicator(r);
@@ -2014,7 +2090,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (out->reason[0] == '\0') {
     snprintf(out->reason, sizeof(out->reason), "%s", "baseline");
   }
-  if (out->suppress && score < 0.25f && r->priority != 0u) {
+  if (out->suppress && score < 0.25f && r->priority != 0u && !ransom_counter_allowlisted) {
     out->drop = 1u;
   }
 

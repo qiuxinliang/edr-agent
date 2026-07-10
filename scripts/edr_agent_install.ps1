@@ -1260,8 +1260,29 @@ function Get-EnrollErrorResponseDiagnostics {
 }
 
 function Get-EnrollFailureHint {
-  param([object]$Exception)
-  $text = (Get-ExceptionChainText $Exception).ToLowerInvariant()
+  param(
+    [object]$Exception,
+    [string]$ApiDiagnostics = ""
+  )
+  $text = ((Get-ExceptionChainText $Exception) + " " + $ApiDiagnostics).ToLowerInvariant()
+  if ($text -match "token_expired|token expired|has expired|已过期|过期") {
+    return "Enrollment token has expired; generate a new enrollment token in the platform and rerun the installer with the new token."
+  }
+  if ($text -match "token_exhausted|activation limit|limit reached|no longer activatable|激活次数|耗尽") {
+    return "Enrollment token activation limit has been reached; generate a new token or increase the token activation limit, then rerun the installer."
+  }
+  if ($text -match "invalid_token|unknown or revoked|not active|missing token|无效|吊销|撤销") {
+    return "Enrollment token is invalid, revoked, missing, or not active; copy the current plaintext token from the platform and rerun the installer."
+  }
+  if ($text -match "os_not_allowed|os_type|does not allow this platform|platform|操作系统") {
+    return "Enrollment token does not allow this operating system; create or select a token whose osType matches this endpoint."
+  }
+  if ($text -match "quota_exceeded|endpoint quota|quota exceeded|配额") {
+    return "Endpoint quota has been reached; free endpoint quota or expand the tenant license before enrolling this endpoint."
+  }
+  if ($text -match "license_blocked|license expired|license suspended|expired/suspended|过期许可|许可") {
+    return "Tenant license blocks enrollment; renew or reactivate the tenant license before enrolling new endpoints."
+  }
   if ($text -match "trust|certificate|ssl|tls|认证|证书") {
     return "TLS/certificate validation failed; provide a signed bootstrap manifest with tls_ca_pem or tls_leaf_sha256, enable TrustCa for a local CA, or use InsecureTls only for lab testing."
   }
@@ -1290,19 +1311,21 @@ function Format-EnrollFailure {
   $parts.Add(("insecure_tls={0}" -f ($env:EDR_INSECURE_TLS -eq "1"))) | Out-Null
   $parts.Add(("bootstrap_ca={0}" -f [bool]$BootstrapCaCertPath)) | Out-Null
   $parts.Add(("bootstrap_leaf_pin={0}" -f [bool]$BootstrapTlsLeafSha256)) | Out-Null
+  $apiDetails = New-Object System.Collections.Generic.List[string]
   if ($ex -is [System.Net.WebException]) {
     $parts.Add(("web_status={0}" -f $ex.Status)) | Out-Null
     if ($ex.Response -is [System.Net.HttpWebResponse]) {
       $parts.Add(("http_status={0}" -f [int]$ex.Response.StatusCode)) | Out-Null
       foreach ($detail in (Get-EnrollErrorResponseDiagnostics $ex.Response)) {
         if ($detail) {
+          $apiDetails.Add($detail) | Out-Null
           $parts.Add($detail) | Out-Null
         }
       }
     }
   }
   $parts.Add(("error_chain={0}" -f (Get-ExceptionChainText $ex))) | Out-Null
-  $parts.Add(("hint={0}" -f (Get-EnrollFailureHint $ex))) | Out-Null
+  $parts.Add(("hint={0}" -f (Get-EnrollFailureHint -Exception $ex -ApiDiagnostics ($apiDetails -join " ")))) | Out-Null
   return ($parts -join "; ")
 }
 

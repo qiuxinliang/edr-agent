@@ -2278,9 +2278,114 @@ public partial class MainWindow : Window
         return parts.Count == 0 ? "" : "；" + string.Join("；", parts);
     }
 
+    private static string BuildEnrollFailureSummary(string rawReason)
+    {
+        var pathMatch = Regex.Match(rawReason ?? "", @"注册日志：([^；]+)", RegexOptions.IgnoreCase);
+        if (!pathMatch.Success)
+        {
+            return "";
+        }
+        var enrollLog = pathMatch.Groups[1].Value.Trim();
+        if (string.IsNullOrWhiteSpace(enrollLog) || !File.Exists(enrollLog))
+        {
+            return "";
+        }
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(enrollLog);
+        }
+        catch
+        {
+            return "";
+        }
+        if (text.Length > 30000)
+        {
+            text = text[^30000..];
+        }
+        var flat = Regex.Replace(text, @"\s+", " ").Trim();
+        var code = ExtractEnrollDiagnosticField(flat, "api_code");
+        var message = ExtractEnrollDiagnosticField(flat, "api_message");
+        var hint = ExtractEnrollDiagnosticField(flat, "hint");
+        var combined = string.Join(" ", new[] { code, message, hint, flat }.Where(v => !string.IsNullOrWhiteSpace(v)));
+
+        if (EnrollTextContains(combined, "token_expired") ||
+            EnrollTextContains(combined, "token expired") ||
+            EnrollTextContains(combined, "has expired") ||
+            combined.Contains("令牌已过期", StringComparison.OrdinalIgnoreCase))
+        {
+            return "注册令牌已过期，请在平台重新生成 enroll token 后重新安装";
+        }
+        if (EnrollTextContains(combined, "token_exhausted") ||
+            EnrollTextContains(combined, "activation limit") ||
+            EnrollTextContains(combined, "limit reached") ||
+            combined.Contains("激活次数", StringComparison.OrdinalIgnoreCase))
+        {
+            return "注册令牌激活次数已用尽，请生成新的 enroll token 或提高激活上限后重新安装";
+        }
+        if (EnrollTextContains(combined, "invalid_token") ||
+            EnrollTextContains(combined, "unknown or revoked") ||
+            EnrollTextContains(combined, "not active") ||
+            EnrollTextContains(combined, "missing token"))
+        {
+            return "注册令牌无效、已吊销或未激活，请复制平台当前有效的明文 enroll token 后重新安装";
+        }
+        if (EnrollTextContains(combined, "os_not_allowed") ||
+            EnrollTextContains(combined, "os_type") ||
+            EnrollTextContains(combined, "does not allow this platform"))
+        {
+            return "注册令牌不适用于当前操作系统，请选择匹配该终端系统类型的 enroll token";
+        }
+        if (EnrollTextContains(combined, "quota_exceeded") ||
+            EnrollTextContains(combined, "endpoint quota"))
+        {
+            return "租户终端配额已满，请释放配额或扩容后重新安装";
+        }
+        if (EnrollTextContains(combined, "license_blocked") ||
+            EnrollTextContains(combined, "license expired") ||
+            EnrollTextContains(combined, "license suspended"))
+        {
+            return "租户 License 阻止注册，请续期或恢复 License 后重新安装";
+        }
+        if (!string.IsNullOrWhiteSpace(hint))
+        {
+            return "注册失败：" + TrimForUserFacingSummary(hint, 120);
+        }
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            return "注册失败：" + TrimForUserFacingSummary(message, 120);
+        }
+        return "";
+    }
+
+    private static string ExtractEnrollDiagnosticField(string text, string field)
+    {
+        var match = Regex.Match(text ?? "", @"(?:^|[;\s])" + Regex.Escape(field) + @"=([^;]+)", RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[1].Value.Trim() : "";
+    }
+
+    private static bool EnrollTextContains(string text, string value)
+    {
+        return (text ?? "").IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string TrimForUserFacingSummary(string value, int maxLength)
+    {
+        var s = Regex.Replace(value ?? "", @"\s+", " ").Trim();
+        if (s.Length > maxLength)
+        {
+            s = s[..maxLength] + "...";
+        }
+        return s;
+    }
+
     private static string BuildUserFacingInstallFailure(string rawReason, string diagnosticsPath)
     {
-        var reason = Regex.Replace(rawReason ?? "", @"\s+", " ").Trim();
+        var enrollSummary = BuildEnrollFailureSummary(rawReason);
+        var reason = string.IsNullOrWhiteSpace(enrollSummary)
+            ? Regex.Replace(rawReason ?? "", @"\s+", " ").Trim()
+            : enrollSummary;
         if (string.IsNullOrWhiteSpace(reason))
         {
             reason = "安装未完成";

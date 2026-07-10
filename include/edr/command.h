@@ -30,8 +30,11 @@ void edr_command_set_active_type(const char *command_type);
  * 同一进程至多成功一次。仅 Windows 端实现。
  */
 void edr_isolate_auto_from_shellcode_alarm(void);
-/** 确诊勒索(ENCRYPTION_CONFIRMED)时本机自隔离;默认关,需 EDR_RANSOM_AUTO_ISOLATE=1 + 高危策略,每进程一次。 */
-void edr_isolate_auto_from_ransom_alarm(void);
+/**
+ * 确诊勒索时执行端侧处置：可选终止归属进程并执行主机隔离。
+ * 默认关闭，需 EDR_RANSOM_AUTO_ISOLATE=1 + 高危策略；终止进程另需 EDR_RANSOM_AUTO_TERMINATE=1。
+ */
+void edr_isolate_auto_from_ransom_alarm(uint32_t pid);
 
 /** 与 CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由控制面写入） */
 typedef struct EdrSoarCommandMeta {

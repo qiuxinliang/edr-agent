@@ -1374,12 +1374,12 @@ static int isolate_stamp_only_mode(void) {
   return (mode && strcmp(mode, "stamp") == 0) ? 1 : 0;
 }
 
-static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
+static int do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
     audit_both(cmd_id, "reject isolate: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
-    return;
+    return -1;
   }
   /* 写状态标记(供 isolate_status / 响应查询;非 enforcement 本身)。 */
   char path[512];
@@ -1395,7 +1395,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     s_exec_fail++;
     audit_both(cmd_id, "isolate: cannot persist isolation state stamp");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "cannot persist isolation state");
-    return;
+    return -2;
   }
 
   if (isolate_stamp_only_mode()) {
@@ -1408,7 +1408,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
         s_exec_fail++;
         audit_both(cmd_id, "isolate(stamp): EDR_ISOLATE_HOOK 返回非零");
         soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolate hook non-zero");
-        return;
+        return -3;
       }
     }
     s_exec_ok++;
@@ -1418,7 +1418,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     snprintf(detail, sizeof(detail),
              "{\"status\":\"isolated\",\"method\":\"stamp\",\"stamp_path\":%s}", pathj);
     soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
-    return;
+    return 0;
   }
 
   /* 默认:真实网络隔离。先自动放行管理通道,再施加防火墙隔离。 */
@@ -1435,7 +1435,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
       audit_both(cmd_id, "isolate: 网络 enforcement 失败");
       soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolation enforcement failed");
     }
-    return;
+    return rc == -2 ? -4 : -3;
   }
   int verified = 0;
   const char *verification = "enforcement_status";
@@ -1454,7 +1454,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     s_exec_fail++;
     audit_both(cmd_id, "isolate: enforcement completed but status verification failed");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation enforcement status not verified");
-    return;
+    return -5;
   }
   s_exec_ok++;
   audit_both(cmd_id, "isolate: 已施加网络隔离");
@@ -1470,6 +1470,7 @@ static void do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
              (hook && hook[0]) ? "hook" : "builtin", verification, pathj, allowj);
     soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
   }
+  return 0;
 }
 
 static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
@@ -1555,6 +1556,129 @@ static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) 
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
+/* 自动勒索处置只允许结束事件归属的进程，并在 OS 层确认进程确实退出，避免把
+ * “信号已发送”误报成“加密进程已停止”。手工 kill 仍走 do_kill 的完整命令路径。 */
+static int ransom_terminate_pid_checked(uint32_t pid, char *detail, size_t detail_cap) {
+  if (detail && detail_cap > 0u) {
+    detail[0] = '\0';
+  }
+  if (pid <= 4u) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "protected pid=%u", (unsigned)pid);
+    }
+    return -1;
+  }
+  if (!kill_pid_allowed((long)pid)) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "pid=%u blocked by EDR_CMD_KILL_ALLOWLIST", (unsigned)pid);
+    }
+    return -2;
+  }
+#ifdef _WIN32
+  if ((DWORD)pid == GetCurrentProcessId()) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "refuse agent pid=%u", (unsigned)pid);
+    }
+    return -1;
+  }
+  HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
+  if (!h) {
+    if (GetLastError() == ERROR_INVALID_PARAMETER) {
+      if (detail && detail_cap > 0u) {
+        snprintf(detail, detail_cap, "process pid=%u already gone", (unsigned)pid);
+      }
+      return 0;
+    }
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "OpenProcess failed pid=%u error=%lu", (unsigned)pid,
+               (unsigned long)GetLastError());
+    }
+    return -3;
+  }
+  if (!TerminateProcess(h, 1)) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "TerminateProcess failed pid=%u error=%lu", (unsigned)pid,
+               (unsigned long)GetLastError());
+    }
+    CloseHandle(h);
+    return -3;
+  }
+  DWORD wait_rc = WaitForSingleObject(h, 1000u);
+  CloseHandle(h);
+  if (wait_rc != WAIT_OBJECT_0) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "pid=%u still running after TerminateProcess", (unsigned)pid);
+    }
+    return -4;
+  }
+  if (detail && detail_cap > 0u) {
+    snprintf(detail, detail_cap, "pid=%u terminated", (unsigned)pid);
+  }
+  return 0;
+#else
+  if ((pid_t)pid == getpid()) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "refuse agent pid=%u", (unsigned)pid);
+    }
+    return -1;
+  }
+  if (kill((pid_t)pid, SIGTERM) != 0) {
+    if (errno == ESRCH) {
+      if (detail && detail_cap > 0u) {
+        snprintf(detail, detail_cap, "process pid=%u already gone", (unsigned)pid);
+      }
+      return 0;
+    }
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "SIGTERM failed pid=%u errno=%d", (unsigned)pid, errno);
+    }
+    return -3;
+  }
+  for (int i = 0; i < 5; i++) {
+    struct timespec ts = {0, 50L * 1000L * 1000L};
+    nanosleep(&ts, NULL);
+    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+      if (detail && detail_cap > 0u) {
+        snprintf(detail, detail_cap, "pid=%u terminated via SIGTERM", (unsigned)pid);
+      }
+      return 0;
+    }
+  }
+  if (kill((pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
+    if (detail && detail_cap > 0u) {
+      snprintf(detail, detail_cap, "SIGKILL failed pid=%u errno=%d", (unsigned)pid, errno);
+    }
+    return -4;
+  }
+  for (int i = 0; i < 10; i++) {
+    struct timespec ts = {0, 50L * 1000L * 1000L};
+    nanosleep(&ts, NULL);
+    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+      if (detail && detail_cap > 0u) {
+        snprintf(detail, detail_cap, "pid=%u terminated via SIGKILL", (unsigned)pid);
+      }
+      return 0;
+    }
+  }
+  if (detail && detail_cap > 0u) {
+    snprintf(detail, detail_cap, "pid=%u remains visible after SIGKILL", (unsigned)pid);
+  }
+  return -5;
+#endif
+}
+
+static void ransom_auto_meta(uint32_t pid, EdrSoarCommandMeta *sm) {
+  if (!sm) {
+    return;
+  }
+  memset(sm, 0, sizeof(*sm));
+  snprintf(sm->soar_correlation_id, sizeof(sm->soar_correlation_id), "ransom-auto-%u", (unsigned)pid);
+  snprintf(sm->playbook_run_id, sizeof(sm->playbook_run_id), "ransom-auto");
+  snprintf(sm->idempotency_key, sizeof(sm->idempotency_key), "ransom-auto-%u", (unsigned)pid);
+  snprintf(sm->initiated_by, sizeof(sm->initiated_by), "automatic");
+  sm->issued_at_unix_ms = command_now_ms();
+}
+
 void edr_isolate_auto_from_shellcode_alarm(void) {
 #if !defined(_WIN32)
   return;
@@ -1573,11 +1697,8 @@ void edr_isolate_auto_from_shellcode_alarm(void) {
 #endif
 }
 
-void edr_isolate_auto_from_ransom_alarm(void) {
-#if !defined(_WIN32)
-  return;
-#else
-  /* 默认关:仅 EDR_RANSOM_AUTO_ISOLATE=1 且高危策略开启时,确诊勒索本机自隔离(每进程一次)。 */
+void edr_isolate_auto_from_ransom_alarm(uint32_t pid) {
+  /* 默认关:显式启用后才执行自动终止/隔离，且仍受高危策略保护。 */
   const char *eo = getenv("EDR_RANSOM_AUTO_ISOLATE");
   if (!eo || eo[0] != '1') {
     return;
@@ -1585,12 +1706,59 @@ void edr_isolate_auto_from_ransom_alarm(void) {
   if (!dangerous_enabled()) {
     return;
   }
-  static volatile LONG s_ransom_auto_iso_once;
-  if (InterlockedCompareExchange(&s_ransom_auto_iso_once, 1, 0) != 0) {
+  EdrSoarCommandMeta sm;
+  ransom_auto_meta(pid, &sm);
+
+  const char *to = getenv("EDR_RANSOM_AUTO_TERMINATE");
+  if (to && to[0] == '1' && pid > 0u) {
+    static uint32_t s_ransom_auto_terminated_pid;
+    if (s_ransom_auto_terminated_pid != pid) {
+      EdrSoarCommandMeta terminate_sm = sm;
+      snprintf(terminate_sm.idempotency_key, sizeof(terminate_sm.idempotency_key),
+               "ransom-auto-%u-terminate", (unsigned)pid);
+      char detail[256];
+      int rc = ransom_terminate_pid_checked(pid, detail, sizeof(detail));
+      s_ransom_auto_terminated_pid = rc == 0 ? pid : 0u;
+      char cmd_id[96];
+      snprintf(cmd_id, sizeof(cmd_id), "cmd_auto_ransom_%u_terminate", (unsigned)pid);
+      if (rc == 0) {
+        audit_both(cmd_id, detail);
+        soar_emit(cmd_id, &terminate_sm, EdrCmdExecOk, 0, detail);
+      } else if (rc == -2 || rc == -1) {
+        audit_both(cmd_id, detail);
+        soar_emit(cmd_id, &terminate_sm, EdrCmdExecRejected, rc == -2 ? 7 : 5, detail);
+      } else {
+        audit_both(cmd_id, detail);
+        soar_emit(cmd_id, &terminate_sm, EdrCmdExecFailed, -rc, detail);
+      }
+    }
+  }
+
+  static int s_ransom_auto_iso_success;
+  static uint32_t s_ransom_auto_iso_attempts;
+  static int64_t s_ransom_auto_iso_last_attempt_ms;
+  if (s_ransom_auto_iso_success) {
     return;
   }
-  do_isolate("auto-ransom", NULL);
-#endif
+  uint32_t max_attempts = command_u32_env_clamped("EDR_RANSOM_AUTO_ISOLATE_MAX_ATTEMPTS", 3u, 1u, 10u);
+  uint32_t retry_s = command_u32_env_clamped("EDR_RANSOM_AUTO_ISOLATE_RETRY_S", 5u, 1u, 300u);
+  int64_t now_ms = command_now_ms();
+  if (s_ransom_auto_iso_attempts >= max_attempts ||
+      (s_ransom_auto_iso_last_attempt_ms > 0 &&
+       now_ms - s_ransom_auto_iso_last_attempt_ms < (int64_t)retry_s * 1000LL)) {
+    return;
+  }
+  s_ransom_auto_iso_attempts++;
+  s_ransom_auto_iso_last_attempt_ms = now_ms;
+  char cmd_id[96];
+  snprintf(cmd_id, sizeof(cmd_id), "cmd_auto_ransom_%u_isolate_%u", (unsigned)pid,
+           (unsigned)s_ransom_auto_iso_attempts);
+  EdrSoarCommandMeta isolate_sm = sm;
+  snprintf(isolate_sm.idempotency_key, sizeof(isolate_sm.idempotency_key),
+           "ransom-auto-%u-isolate-%u", (unsigned)pid, (unsigned)s_ransom_auto_iso_attempts);
+  if (do_isolate(cmd_id, &isolate_sm) == 0) {
+    s_ransom_auto_iso_success = 1;
+  }
 }
 
 static int forensic_copy_one_file(const char *src, const char *dst) {

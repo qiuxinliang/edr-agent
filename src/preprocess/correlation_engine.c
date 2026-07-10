@@ -1283,12 +1283,53 @@ static const char *corr_basename(const char *s) {
   return last;
 }
 
+static int corr_token_list_exact_ci(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    char tok[256];
+    size_t n = 0u;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t')) {
+      n--;
+    }
+    tok[n] = '\0';
+    if (tok[0] && strlen(tok) == strlen(value)) {
+      int same = 1;
+      for (size_t i = 0; tok[i]; i++) {
+        char a = tok[i];
+        char b = value[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) {
+          same = 0;
+          break;
+        }
+      }
+      if (same) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* 进程是否属于“会合法地批量改写大量文件”的白名单（备份/索引/压缩/编译/同步）。
  * 用于 RANSOM 阈值规则的降误报；EDR_CORR_RANSOM_ALLOW 逗号分隔可追加。 */
 static int corr_proc_is_bulk_file_safe(const char *process_name) {
   static const char *const safe[] = {
       "wbadmin.exe", "vssadmin.exe", "diskshadow.exe", "robocopy.exe", "xcopy.exe",
-      "backup.exe", "veeam.agent.exe", "acronis", "msmpeng.exe", "searchindexer.exe",
+      "backup.exe", "veeam.agent.exe", "acronis.exe", "msmpeng.exe", "searchindexer.exe",
       "searchprotocolhost.exe", "searchfilterhost.exe", "7z.exe", "7za.exe", "winrar.exe",
       "rar.exe", "zip.exe", "tar.exe", "compress.exe", "onedrive.exe", "dropbox.exe",
       "googledrivefs.exe", "msbuild.exe", "cl.exe", "link.exe", "gcc.exe", "clang.exe",
@@ -1302,13 +1343,12 @@ static int corr_proc_is_bulk_file_safe(const char *process_name) {
   }
   base = corr_basename(process_name);
   for (size_t i = 0; i < sizeof(safe) / sizeof(safe[0]); i++) {
-    /* 包含匹配：兼容 "acronis" 等前缀家族与带路径的进程名。 */
-    if (corr_path_contains_ci(base, safe[i])) {
+    if (corr_token_list_exact_ci(safe[i], base)) {
       return 1;
     }
   }
   env = getenv("EDR_CORR_RANSOM_ALLOW");
-  if (env && env[0] && corr_path_contains_ci(env, base)) {
+  if (env && env[0] && corr_token_list_exact_ci(env, base)) {
     return 1;
   }
   return 0;
