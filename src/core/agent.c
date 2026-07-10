@@ -1147,6 +1147,7 @@ static EdrError edr_agent_recover_config(EdrAgent *agent, const char *load_path,
 
 static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, void *user_data) {
   (void)user_data;
+  /* The Agent callback is the single transport owner for AVE verdicts. */
   edr_behavior_alert_emit_to_batch(alert);
   /* AVE 裁决回灌：Windows 上注入/凭证转储由 AVE 引擎内部多事件推理得出裁决，不以离散
    * 事件流经 process_one_slot。此处仅在这两类高价值裁决（低频、高置信）时：

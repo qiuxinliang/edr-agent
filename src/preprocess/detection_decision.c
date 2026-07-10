@@ -1659,6 +1659,7 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            "\"signer_allowlisted\":%s,\"tree_root_pid\":%u,"
            "\"note_count\":%ld,\"note_min_files\":%d,"
            "\"note_window_s\":%d,\"candidate_score\":%d,\"p0_score\":%d,"
+           "\"state_transition\":%s,\"periodic_summary\":%s,"
            "\"direct_emit_single_note\":false,\"attribution_key\":\"tree:%u\"},",
            entropy_delta_buf[0] ? strtod(entropy_delta_buf, NULL) : 0.0,
            high_entropy_ratio_buf[0] ? strtod(high_entropy_ratio_buf, NULL) : 0.0,
@@ -1669,7 +1670,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            (unsigned)tree_root_pid,
            note_count_buf[0] ? strtol(note_count_buf, NULL, 10) : 0L,
            ransom_note_policy_min_files(), ransom_note_policy_window_s(),
-           chain_candidate_score, chain_p0_score, (unsigned)tree_root_pid);
+           chain_candidate_score, chain_p0_score,
+           has_ci(r->script_snippet, "ransom_counter_transition=1") ? "true" : "false",
+           has_ci(r->script_snippet, "ransom_counter_summary=1") ? "true" : "false",
+           (unsigned)tree_root_pid);
   if (d->suppress) {
     float before = d->confidence_before_suppression > 0.0f ? d->confidence_before_suppression : d->confidence;
     json_cat(r->detection_context, sizeof(r->detection_context),

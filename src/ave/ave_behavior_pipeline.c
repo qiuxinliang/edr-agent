@@ -4,7 +4,6 @@
 
 #include "ave_behavior_pipeline.h"
 
-#include "edr/behavior_alert_emit.h"
 #include "edr/ave_behavior_features.h"
 #include "edr/ave_behavior_gates.h"
 #include "edr/ingest_http.h"
@@ -1328,7 +1327,6 @@ behavior_infer_done:
       ave_fill_related_iocs_json(&al, ev_tgt_ip, ev_tgt_domain, ev_file_sha, ev_ioc_ip_hit, ev_ioc_domain_hit,
                                  ev_ioc_sha256_hit);
     }
-    edr_behavior_alert_emit_to_batch(&al);
     cb(&al, ud);
   }
 }

@@ -27,6 +27,9 @@ typedef struct {
   char dirs[RANSOM_COUNTER_DIRS][128];
   uint8_t ext_count;
   uint8_t dir_count;
+  uint8_t emitted_level;
+  int64_t last_signal_ns;
+  uint32_t coalesced_events;
   double entropy_avg;
 } RansomCounterBucket;
 
@@ -457,6 +460,10 @@ static int should_sample_ransom_content_entropy(const RansomCounterBucket *b, in
   return b && (int)b->file_events >= min_events;
 }
 
+static int64_t ransom_counter_summary_interval_ns(void) {
+  return (int64_t)env_int_clamped("EDR_RANSOM_COUNTER_SUMMARY_S", 30, 5, 600) * 1000000000LL;
+}
+
 static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int64_t now_ns, int64_t window_ns) {
   RansomCounterBucket *empty = NULL;
   RansomCounterBucket *oldest = &g_ransom_buckets[0];
@@ -766,7 +773,7 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   int suspicious = (enough_volume && file_rate >= 120.0) ||
                    (b->file_events >= 12u && b->ext_count >= 8u) ||
                    (b->file_events >= 8u && entropy_delta >= 1.5) ||
-                   (b->file_events >= 6u && ext_changed && content_high) ||
+                   (ext_changed && content_high) ||
                    ((int)b->file_events >= warn_files &&
                     ((int)b->dir_count >= warn_dirs || b->ext_count >= 8u));
   double high_entropy_ratio = b->file_events > 0u ? (double)b->high_entropy_events / (double)b->file_events : 0.0;
@@ -775,18 +782,37 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
                    ((int)b->dir_count >= confirm_dirs || b->ext_count >= 12u || high_entropy_ratio >= 0.70)) ||
                   (suspicious && file_rate >= 300.0 && b->ext_count >= 12u) ||
                   (suspicious && ext_changed && content_high && b->file_events >= 20u);
-  append_record_kv(r,
-                   "file_rate=%.0f ext_burst=%u dir_burst=%u entropy_delta=%.2f high_entropy_ratio=%.2f "
-                   "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d%s%s%s%s",
-                   file_rate, (unsigned)b->ext_count, (unsigned)b->dir_count, entropy_delta,
-                   high_entropy_ratio, path_entropy, content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
-                   content_deferred ? " content_entropy_deferred=1" : "",
-                   (suspicious || confirmed) ? " ransom_counter=1" : "",
-                   confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
-                   (suspicious ? " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3" : ""),
-                   canary ? " canary_counter_bypass=1" : "");
+  uint8_t level = confirmed ? 2u : (suspicious ? 1u : 0u);
+  int state_changed = level > 0u && level != b->emitted_level;
+  int periodic_summary = level > 0u && !state_changed && b->last_signal_ns > 0 &&
+                         now_ns >= b->last_signal_ns &&
+                         now_ns - b->last_signal_ns >= ransom_counter_summary_interval_ns();
+  int emit_signal = state_changed || periodic_summary;
+  if (emit_signal) {
+    uint32_t coalesced = b->coalesced_events;
+    b->emitted_level = level;
+    b->last_signal_ns = now_ns;
+    b->coalesced_events = 0u;
+    append_record_kv(r,
+                     "file_rate=%.0f ext_burst=%u dir_burst=%u entropy_delta=%.2f high_entropy_ratio=%.2f "
+                     "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d "
+                     "ransom_counter=1 ransom_counter_level=%u coalesced_events=%u%s%s%s%s",
+                     file_rate, (unsigned)b->ext_count, (unsigned)b->dir_count, entropy_delta,
+                     high_entropy_ratio, path_entropy, content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
+                     (unsigned)level, (unsigned)coalesced,
+                     content_deferred ? " content_entropy_deferred=1" : "",
+                     state_changed ? " ransom_counter_transition=1" : "",
+                     periodic_summary ? " ransom_counter_summary=1" : "",
+                     confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
+                     " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3");
+    if (canary) {
+      append_record_kv(r, "canary_counter_bypass=1");
+    }
+  } else if (level > 0u && b->coalesced_events < UINT32_MAX) {
+    b->coalesced_events++;
+  }
 
-  if (confirmed) {
+  if (confirmed && state_changed) {
     /* 确诊勒索:端侧处置(默认关,需显式启用自动隔离策略)。 */
     edr_isolate_auto_from_ransom_alarm(r->pid);
   }

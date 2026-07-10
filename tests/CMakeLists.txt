@@ -186,7 +186,8 @@ add_executable(test_detection_sensor_bridge ${CMAKE_CURRENT_SOURCE_DIR}/test_det
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c)
 target_include_directories(test_detection_sensor_bridge PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_sensor_bridge)
 if(NOT MSVC)

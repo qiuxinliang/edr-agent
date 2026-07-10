@@ -1,5 +1,6 @@
 #include "edr/behavior_from_slot.h"
 #include "edr/detection_decision.h"
+#include "edr/windows_event_policy.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -154,7 +155,10 @@ static void test_ransom_counter_bridge(void) {
 static void test_ransom_sliding_window_counter(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
+  EdrBehaviorRecord signal_record;
   EdrDetectionDecision d;
+  int signal_count = 0;
+  memset(&signal_record, 0, sizeof(signal_record));
 
   for (int i = 0; i < 85; i++) {
     char payload[768];
@@ -168,15 +172,65 @@ static void test_ransom_sliding_window_counter(void) {
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338500000000000LL + (int64_t)i * 10000000LL;
     edr_behavior_from_slot(&slot, &r);
+    if (strstr(r.script_snippet, "ransom_counter=1") != NULL) {
+      signal_record = r;
+      signal_count++;
+    }
   }
 
-  edr_detection_decision_evaluate(&r, &d);
+  assert(signal_count >= 1);
+  assert(signal_count <= 2);
+  edr_detection_decision_evaluate(&signal_record, &d);
   assert(!d.drop);
-  assert(strstr(r.script_snippet, "file_rate=") != NULL);
-  assert(strstr(r.script_snippet, "ext_burst=") != NULL);
-  assert(strstr(r.script_snippet, "ransom_counter=1") != NULL);
+  assert(strstr(signal_record.script_snippet, "file_rate=") != NULL);
+  assert(strstr(signal_record.script_snippet, "ext_burst=") != NULL);
+  assert(strstr(signal_record.script_snippet, "ransom_counter_transition=1") != NULL);
   assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
-  assert(strstr(r.detection_context, "\"ransom_behavior\":true") != NULL);
+  assert(strstr(signal_record.detection_context, "\"ransom_behavior\":true") != NULL);
+  assert(strstr(signal_record.detection_context, "\"state_transition\":true") != NULL);
+}
+
+static void test_ransom_alert_volume_is_bounded(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  int signal_count = 0;
+  int transition_count = 0;
+  int summary_count = 0;
+
+  test_setenv("EDR_RANSOM_COUNTER_WINDOW_S", "600");
+  test_setenv("EDR_RANSOM_COUNTER_SUMMARY_S", "30");
+  for (int i = 0; i < 1000; i++) {
+    char payload[768];
+    snprintf(payload, sizeof(payload),
+             "ETW1\n"
+             "prov=kfile\n"
+             "pid=5098\n"
+             "img=C:\\Users\\alice\\AppData\\Roaming\\sync_update.exe\n"
+             "file=C:\\Users\\alice\\Documents\\bulk\\d%02d\\doc%04d.e%02d\n",
+             i % 16, i, i % 20);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns = 1779338900000000000LL + (int64_t)i * 100000000LL;
+    edr_behavior_from_slot(&slot, &r);
+    edr_windows_event_policy_apply(&r);
+    if (strstr(r.script_snippet, "ransom_counter=1") == NULL) {
+      continue;
+    }
+    signal_count++;
+    transition_count += strstr(r.script_snippet, "ransom_counter_transition=1") != NULL;
+    summary_count += strstr(r.script_snippet, "ransom_counter_summary=1") != NULL;
+    assert(r.priority == 0u);
+    edr_detection_decision_evaluate(&r, &d);
+    assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
+  }
+  test_unsetenv("EDR_RANSOM_COUNTER_WINDOW_S");
+  test_unsetenv("EDR_RANSOM_COUNTER_SUMMARY_S");
+
+  assert(signal_count >= 3);
+  assert(signal_count <= 5);
+  assert(transition_count >= 1);
+  assert(transition_count <= 2);
+  assert(summary_count <= 3);
 }
 
 static void test_invalid_file_path_does_not_raise_ransom_counter(void) {
@@ -520,6 +574,7 @@ int main(void) {
   test_schannel_cert_error_bridge();
   test_ransom_counter_bridge();
   test_ransom_sliding_window_counter();
+  test_ransom_alert_volume_is_bounded();
   test_invalid_file_path_does_not_raise_ransom_counter();
   test_low_value_process_does_not_raise_ransom_counter();
   test_ransom_note_burst_counter();
