@@ -100,6 +100,7 @@ typedef struct {
   uint32_t pid;
   int scan_status;
   char detail[1200];
+  EdrPmfeScanResult result;
   EdrPmfeCommandContext context;
 } PmfeCompletion;
 static PmfeCompletion s_pmfe_completions[PMFE_COMPLETION_CAP];
@@ -4624,34 +4625,7 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
 }
 
 static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
-  if (!dangerous_enabled()) {
-    s_rejected++;
-    audit_both(cmd_id, "reject pmfe_scan: enable EDR_CMD_ENABLED=1 or TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
-    return;
-  }
-  long pid = -1;
-  if (parse_pid_json(pl, len, &pid) != 0) {
-    s_exec_fail++;
-    audit_both(cmd_id, "pmfe_scan: payload missing valid pid (JSON requires \"pid\")");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid json");
-    return;
-  }
-  EdrPmfeCommandContext context;
-  memset(&context, 0, sizeof(context));
-  if (sm) {
-    snprintf(context.soar_correlation_id, sizeof(context.soar_correlation_id), "%s", sm->soar_correlation_id);
-    snprintf(context.playbook_run_id, sizeof(context.playbook_run_id), "%s", sm->playbook_run_id);
-    snprintf(context.playbook_step_id, sizeof(context.playbook_step_id), "%s", sm->playbook_step_id);
-  }
-  if (edr_pmfe_submit_server_scan_ex(cmd_id, (uint32_t)pid, &context) != 0) {
-    s_exec_fail++;
-    audit_both(cmd_id, "pmfe_scan: queue failed (PMFE not running or queue full)");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "pmfe queue full or not running");
-    return;
-  }
-  s_handled++;
-  audit_both(cmd_id, "pmfe_scan: accepted (terminal result pending)");
+  edr_response_pmfe_scan(cmd_id, pl, len, sm);
 }
 
 static void hex_from_bytes(const uint8_t *in, size_t len, char *out, size_t cap) {
@@ -5233,6 +5207,7 @@ static void flush_command_result_outbox(void) {
 
 void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int scan_status,
                                        const char *detail,
+                                       const EdrPmfeScanResult *result,
                                        const struct EdrPmfeCommandContext *context) {
   if (!command_id || !command_id[0]) {
     return;
@@ -5249,6 +5224,9 @@ void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int
     slot->pid = pid;
     slot->scan_status = scan_status;
     snprintf(slot->detail, sizeof(slot->detail), "%s", detail ? detail : "pmfe scan completed without detail");
+    if (result) {
+      slot->result = *result;
+    }
     if (context) {
       slot->context = *context;
     }
@@ -5257,6 +5235,252 @@ void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int
   }
   pmfe_completion_unlock();
   edr_command_audit_both(command_id, "pmfe completion queue full; terminal result remains in command inbox");
+}
+
+static cJSON *pmfe_region_json(const char *command_id, EdrPmfeRegionResult *r,
+                              cJSON *artifacts, int *upload_failed) {
+  cJSON *item = cJSON_CreateObject();
+  if (!item || !r) return item;
+  char base[32];
+  char allocation_base[32];
+  snprintf(base, sizeof(base), "0x%llx", (unsigned long long)r->base);
+  snprintf(allocation_base, sizeof(allocation_base), "0x%llx",
+           (unsigned long long)r->allocation_base);
+  cJSON_AddStringToObject(item, "base", base);
+  cJSON_AddStringToObject(item, "allocation_base", allocation_base);
+  cJSON_AddNumberToObject(item, "size_bytes", (double)r->size_bytes);
+  cJSON_AddNumberToObject(item, "bytes_sampled", (double)r->bytes_sampled);
+  cJSON_AddStringToObject(item, "protection", r->protection_name);
+  cJSON_AddStringToObject(item, "allocation_protection",
+                          r->allocation_protection_name);
+  cJSON_AddStringToObject(item, "kind", r->kind);
+  if (r->mapped_path[0]) {
+    cJSON_AddStringToObject(item, "mapped_path", r->mapped_path);
+  }
+  cJSON_AddNumberToObject(item, "score", r->score);
+  cJSON_AddNumberToObject(item, "entropy", r->entropy);
+  cJSON_AddStringToObject(item, "reason", r->reason);
+  cJSON_AddStringToObject(item, "sha256", r->sha256);
+  cJSON_AddBoolToObject(item, "read_ok", r->read_ok ? 1 : 0);
+  if (r->pe_arch[0]) {
+    cJSON *pe = cJSON_AddObjectToObject(item, "pe");
+    cJSON_AddStringToObject(pe, "arch", r->pe_arch);
+    cJSON_AddNumberToObject(pe, "sections", r->pe_sections);
+    cJSON_AddNumberToObject(pe, "timestamp", r->pe_timestamp);
+    cJSON_AddNumberToObject(pe, "entrypoint_rva", r->pe_entrypoint_rva);
+    if (r->entrypoint_preview_hex[0]) {
+      cJSON_AddStringToObject(pe, "entrypoint_preview_hex",
+                              r->entrypoint_preview_hex);
+    }
+  }
+  cJSON *thread_starts = cJSON_AddArrayToObject(item, "thread_starts");
+  for (uint8_t i = 0; i < r->thread_start_count &&
+                          i < EDR_PMFE_MAX_THREAD_STARTS; i++) {
+    cJSON *thread_start = cJSON_CreateObject();
+    char start_address[32];
+    snprintf(start_address, sizeof(start_address), "0x%llx",
+             (unsigned long long)r->thread_starts[i].start_address);
+    cJSON_AddNumberToObject(thread_start, "tid", r->thread_starts[i].tid);
+    cJSON_AddStringToObject(thread_start, "start_address", start_address);
+    cJSON_AddItemToArray(thread_starts, thread_start);
+  }
+  cJSON *yara = cJSON_AddArrayToObject(item, "yara_hits");
+  for (uint8_t i = 0; i < r->yara_hit_count && i < EDR_PMFE_MAX_YARA_HITS; i++) {
+    cJSON_AddItemToArray(yara, cJSON_CreateString(r->yara_hits[i]));
+  }
+  if (r->artifact_path[0]) {
+    char object_key[1024];
+    object_key[0] = '\0';
+    int upload_rc = edr_transport_v2_upload_file(command_id, r->artifact_path,
+                                                   r->sha256, object_key,
+                                                   sizeof(object_key));
+    if (upload_rc != 0 && upload_failed) *upload_failed = 1;
+    cJSON *evidence = cJSON_AddObjectToObject(item, "evidence");
+    cJSON_AddStringToObject(evidence, "local_path", r->artifact_path);
+    cJSON_AddStringToObject(evidence, "object_key", object_key);
+    cJSON_AddStringToObject(evidence, "sha256", r->sha256);
+    cJSON_AddStringToObject(evidence, "upload_status", upload_rc == 0 ? "ok" : "failed");
+    if (artifacts) {
+      cJSON *artifact = cJSON_CreateObject();
+      cJSON_AddStringToObject(artifact, "type", "pmfe_region");
+      cJSON_AddStringToObject(artifact, "path", r->artifact_path);
+      cJSON_AddStringToObject(artifact, "sha256", r->sha256);
+      cJSON_AddStringToObject(artifact, "object_key", object_key);
+      cJSON_AddStringToObject(artifact, "upload_status", upload_rc == 0 ? "ok" : "failed");
+      cJSON_AddItemToArray(artifacts, artifact);
+    }
+    if (upload_rc == 0) {
+      (void)remove(r->artifact_path);
+      r->artifact_path[0] = '\0';
+    }
+  }
+  if (r->reconstruction_status[0]) {
+    cJSON *reconstruction = cJSON_AddObjectToObject(item, "reconstruction");
+    cJSON_AddStringToObject(reconstruction, "status", r->reconstruction_status);
+    cJSON_AddStringToObject(reconstruction, "sha256", r->reconstructed_sha256);
+    if (r->reconstructed_path[0]) {
+      char object_key[1024];
+      object_key[0] = '\0';
+      int upload_rc = edr_transport_v2_upload_file(
+          command_id, r->reconstructed_path, r->reconstructed_sha256,
+          object_key, sizeof(object_key));
+      if (upload_rc != 0 && upload_failed) *upload_failed = 1;
+      cJSON_AddStringToObject(reconstruction, "local_path", r->reconstructed_path);
+      cJSON_AddStringToObject(reconstruction, "object_key", object_key);
+      cJSON_AddStringToObject(reconstruction, "upload_status",
+                              upload_rc == 0 ? "ok" : "failed");
+      if (artifacts) {
+        cJSON *artifact = cJSON_CreateObject();
+        cJSON_AddStringToObject(artifact, "type", "pmfe_reconstructed_pe");
+        cJSON_AddStringToObject(artifact, "path", r->reconstructed_path);
+        cJSON_AddStringToObject(artifact, "sha256", r->reconstructed_sha256);
+        cJSON_AddStringToObject(artifact, "object_key", object_key);
+        cJSON_AddStringToObject(artifact, "upload_status",
+                                upload_rc == 0 ? "ok" : "failed");
+        cJSON_AddItemToArray(artifacts, artifact);
+      }
+      if (upload_rc == 0) {
+        (void)remove(r->reconstructed_path);
+        r->reconstructed_path[0] = '\0';
+      }
+    }
+  }
+  return item;
+}
+
+static void pmfe_mark_upload_partial(PmfeCompletion *completion, cJSON *root) {
+  if (!completion || !root) return;
+  snprintf(completion->result.status, sizeof(completion->result.status), "%s", "partial");
+  cJSON_DeleteItemFromObjectCaseSensitive(root, "status");
+  cJSON_AddStringToObject(root, "status", "partial");
+  if (!cJSON_GetObjectItemCaseSensitive(root, "artifact_upload_failed")) {
+    cJSON_AddBoolToObject(root, "artifact_upload_failed", 1);
+    cJSON *warnings = cJSON_GetObjectItemCaseSensitive(root, "warnings");
+    if (!cJSON_IsArray(warnings)) warnings = cJSON_AddArrayToObject(root, "warnings");
+    cJSON_AddItemToArray(warnings, cJSON_CreateString("one or more PMFE evidence artifacts failed to upload"));
+  }
+}
+
+static char *pmfe_completion_result_json(PmfeCompletion *completion) {
+  if (!completion) return NULL;
+  EdrPmfeScanResult *r = &completion->result;
+  cJSON *root = cJSON_CreateObject();
+  if (!root) return NULL;
+  cJSON_AddStringToObject(root, "schema", EDR_PMFE_RESULT_SCHEMA);
+  cJSON_AddStringToObject(root, "status", r->status[0] ? r->status :
+                         (completion->scan_status == 0 ? "completed_clean" : "failed"));
+  cJSON_AddStringToObject(root, "verdict", r->verdict[0] ? r->verdict : "inconclusive");
+  cJSON_AddStringToObject(root, "task_id", completion->command_id);
+  cJSON *target = cJSON_AddObjectToObject(root, "target");
+  cJSON_AddNumberToObject(target, "pid", completion->pid);
+  cJSON_AddStringToObject(target, "path", r->image_path);
+  cJSON *scan = cJSON_AddObjectToObject(root, "scan");
+  cJSON_AddNumberToObject(scan, "started_unix_ms", (double)r->started_unix_ms);
+  cJSON_AddNumberToObject(scan, "finished_unix_ms", (double)r->finished_unix_ms);
+  cJSON_AddNumberToObject(scan, "duration_ms", (double)r->duration_ms);
+  cJSON_AddNumberToObject(scan, "regions_total", r->regions_total);
+  cJSON_AddNumberToObject(scan, "regions_read", r->regions_read);
+  cJSON_AddNumberToObject(scan, "read_failures", r->read_failures);
+  cJSON_AddNumberToObject(scan, "threads_total", r->threads_total);
+  cJSON_AddNumberToObject(scan, "thread_start_matches", r->thread_start_matches);
+  cJSON_AddNumberToObject(scan, "thread_query_failures", r->thread_query_failures);
+  cJSON_AddNumberToObject(scan, "bytes_sampled", (double)r->bytes_sampled);
+  cJSON_AddBoolToObject(scan, "truncated", r->truncated ? 1 : 0);
+  cJSON *signals = cJSON_AddObjectToObject(root, "signals");
+  cJSON_AddNumberToObject(signals, "stomp_suspicious", r->stomp_suspicious);
+  cJSON_AddNumberToObject(signals, "mz_hits", r->mz_hits);
+  cJSON_AddNumberToObject(signals, "dns_hits", r->dns_hits);
+  cJSON_AddNumberToObject(signals, "dns_best", r->dns_best);
+  cJSON_AddStringToObject(signals, "dns_sample", r->dns_sample);
+  cJSON_AddStringToObject(signals, "dns_owner", r->dns_owner);
+  cJSON_AddNumberToObject(signals, "ave_max_score", r->ave_max_score);
+  cJSON_AddNumberToObject(signals, "entropy_max", r->entropy_max);
+  cJSON_AddNumberToObject(signals, "regions_scanned", r->regions_total);
+  cJSON_AddNumberToObject(signals, "private_exec", r->private_exec);
+  cJSON_AddStringToObject(signals, "module_consistency", r->module_consistency);
+  cJSON *correlation = cJSON_AddObjectToObject(root, "correlation");
+  cJSON *cross_process_write = cJSON_AddObjectToObject(
+      correlation, "cross_process_write");
+  cJSON_AddStringToObject(cross_process_write, "status",
+                          r->cross_process_write_status[0]
+                              ? r->cross_process_write_status
+                              : "not_observed");
+  cJSON_AddStringToObject(
+      cross_process_write, "explanation",
+      "No source-to-target memory write telemetry was available for this scan");
+  cJSON *injection = cJSON_AddObjectToObject(correlation, "injection_signal");
+  cJSON_AddBoolToObject(injection, "observed", r->injection_observed ? 1 : 0);
+  if (r->injection_observed) {
+    char event_time_ns[32];
+    snprintf(event_time_ns, sizeof(event_time_ns), "%lld",
+             (long long)r->injection_event_time_ns);
+    cJSON_AddStringToObject(injection, "event_time_ns", event_time_ns);
+    cJSON_AddNumberToObject(injection, "age_ms", (double)r->injection_age_ms);
+    cJSON_AddStringToObject(injection, "technique", r->injection_technique);
+    cJSON_AddStringToObject(injection, "source", r->injection_source);
+    cJSON_AddStringToObject(
+        injection, "scope",
+        "process_level_correlation_not_region_writer_attribution");
+  }
+  cJSON *artifacts = cJSON_AddArrayToObject(root, "artifacts");
+  cJSON *regions = cJSON_AddArrayToObject(root, "regions");
+  int upload_failed = 0;
+  for (uint8_t i = 0; i < r->region_count && i < EDR_PMFE_MAX_REGIONS; i++) {
+    cJSON_AddItemToArray(regions, pmfe_region_json(completion->command_id, &r->regions[i], artifacts,
+                                                   &upload_failed));
+  }
+  if (upload_failed) pmfe_mark_upload_partial(completion, root);
+  if (r->warning[0]) {
+    cJSON *warnings = cJSON_AddArrayToObject(root, "warnings");
+    cJSON_AddItemToArray(warnings, cJSON_CreateString(r->warning));
+  }
+  cJSON_AddStringToObject(root, "raw_detail", completion->detail);
+
+  char result_path[1024];
+  command_artifact_path(completion->command_id, "pmfe_result", "json",
+                        result_path, sizeof(result_path));
+  char *file_json = cJSON_PrintUnformatted(root);
+  if (file_json) {
+    FILE *fp = fopen(result_path, "wb");
+    if (fp && fwrite(file_json, 1, strlen(file_json), fp) == strlen(file_json)) {
+      fclose(fp);
+      char sha[65];
+      char object_key[1024];
+      sha[0] = '\0';
+      object_key[0] = '\0';
+      int hash_rc = file_sha256_hex(result_path, sha);
+      int upload_rc = hash_rc == 0
+                          ? edr_transport_v2_upload_file(completion->command_id, result_path, sha,
+                                                         object_key, sizeof(object_key))
+                          : -1;
+      if (upload_rc != 0) upload_failed = 1;
+      cJSON *evidence = cJSON_AddObjectToObject(root, "evidence");
+      cJSON_AddStringToObject(evidence, "object_key", object_key);
+      cJSON_AddStringToObject(evidence, "sha256", sha);
+      cJSON_AddStringToObject(evidence, "content_type", "application/json");
+      cJSON_AddStringToObject(evidence, "upload_status", upload_rc == 0 ? "ok" : "failed");
+      cJSON *artifact = cJSON_CreateObject();
+      cJSON_AddStringToObject(artifact, "type", "pmfe_result");
+      cJSON_AddStringToObject(artifact, "path", result_path);
+      cJSON_AddStringToObject(artifact, "sha256", sha);
+      cJSON_AddStringToObject(artifact, "object_key", object_key);
+      cJSON_AddStringToObject(artifact, "upload_status", upload_rc == 0 ? "ok" : "failed");
+      cJSON_AddItemToArray(artifacts, artifact);
+      if (upload_rc == 0) (void)remove(result_path);
+    } else if (fp) {
+      fclose(fp);
+      upload_failed = 1;
+    } else {
+      upload_failed = 1;
+    }
+    cJSON_free(file_json);
+  } else {
+    upload_failed = 1;
+  }
+  if (upload_failed) pmfe_mark_upload_partial(completion, root);
+  char *out = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  return out;
 }
 
 static void drain_pmfe_completions(void) {
@@ -5285,16 +5509,28 @@ static void drain_pmfe_completions(void) {
              completion.context.playbook_run_id);
     snprintf(sm.playbook_step_id, sizeof(sm.playbook_step_id), "%s",
              completion.context.playbook_step_id);
-    char result[1500];
-    snprintf(result, sizeof(result), "pmfe_scan %s pid=%u detail=%s",
-             completion.scan_status == 0 ? "completed" : "failed", completion.pid, completion.detail);
+    char *result = pmfe_completion_result_json(&completion);
+    if (!result) {
+      result = (char *)malloc(1600u);
+      if (result) {
+        snprintf(result, 1600u, "pmfe_scan %s pid=%u detail=%s",
+                 completion.scan_status == 0 ? "completed" : "failed",
+                 completion.pid, completion.detail);
+      }
+    }
     if (completion.scan_status == 0) {
       s_exec_ok++;
-      edr_command_emit_always_typed(completion.command_id, "pmfe_scan", &sm, EdrCmdExecOk, 0, result);
+      edr_command_emit_always_typed_status(
+          completion.command_id, "pmfe_scan", &sm, EdrCmdExecOk, 0,
+          result ? result : completion.detail,
+          strcmp(completion.result.status, "partial") == 0 ? "partial_success" : "ok");
     } else {
       s_exec_fail++;
-      edr_command_emit_always_typed(completion.command_id, "pmfe_scan", &sm, EdrCmdExecFailed, 8, result);
+      edr_command_emit_always_typed(completion.command_id, "pmfe_scan", &sm,
+                                    EdrCmdExecFailed, 8,
+                                    result ? result : completion.detail);
     }
+    cJSON_free(result);
   }
 }
 

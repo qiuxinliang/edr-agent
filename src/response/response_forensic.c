@@ -30,6 +30,7 @@
 #else
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -103,6 +104,19 @@ typedef struct {
 } ForensicYaraResult;
 
 static int s_fy_initialized;
+#ifdef _WIN32
+static INIT_ONCE s_fy_init_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK fy_initialize_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  s_fy_initialized = yr_initialize() == ERROR_SUCCESS ? 1 : -1;
+  return TRUE;
+}
+#else
+static pthread_once_t s_fy_init_once = PTHREAD_ONCE_INIT;
+static void fy_initialize_once(void) {
+  s_fy_initialized = yr_initialize() == ERROR_SUCCESS ? 1 : -1;
+}
+#endif
 
 typedef struct {
   char msg[256];
@@ -172,12 +186,15 @@ static int fy_scan_rules(YR_RULES *rules, const char *cmd_id, const char *target
 }
 
 static int fy_ensure_initialized(char *err, size_t err_cap) {
-  if (s_fy_initialized) return 1;
-  if (yr_initialize() != ERROR_SUCCESS) {
+#ifdef _WIN32
+  (void)InitOnceExecuteOnce(&s_fy_init_once, fy_initialize_once, NULL, NULL);
+#else
+  (void)pthread_once(&s_fy_init_once, fy_initialize_once);
+#endif
+  if (s_fy_initialized != 1) {
     if (err && err_cap) snprintf(err, err_cap, "libyara initialize failed");
     return 0;
   }
-  s_fy_initialized = 1;
   return 1;
 }
 
@@ -347,6 +364,90 @@ static YR_RULES *fy_compile_effective_rules(const char *rules_text, char *source
 }
 
 #endif /* EDR_HAVE_YARA */
+
+struct EdrForensicYaraSession {
+#ifdef EDR_HAVE_YARA
+  YR_RULES *rules;
+#else
+  int unavailable;
+#endif
+};
+
+EdrForensicYaraSession *edr_response_yara_session_open(char *error, size_t error_cap) {
+  if (error && error_cap) error[0] = '\0';
+#ifdef EDR_HAVE_YARA
+  char source[1100];
+  char compile_error[256];
+  int files_loaded = 0;
+  source[0] = '\0';
+  compile_error[0] = '\0';
+  YR_RULES *rules = fy_compile_effective_rules(NULL, source, sizeof(source),
+                                                &files_loaded, compile_error,
+                                                sizeof(compile_error));
+  if (!rules) {
+    if (error && error_cap) snprintf(error, error_cap, "%s", compile_error);
+    return NULL;
+  }
+  EdrForensicYaraSession *session = (EdrForensicYaraSession *)calloc(1u, sizeof(*session));
+  if (!session) {
+    yr_rules_destroy(rules);
+    if (error && error_cap) snprintf(error, error_cap, "%s", "YARA session allocation failed");
+    return NULL;
+  }
+  session->rules = rules;
+  return session;
+#else
+  if (error && error_cap) snprintf(error, error_cap, "%s", "libyara unavailable in this build");
+  return NULL;
+#endif
+}
+
+int edr_response_yara_session_scan(EdrForensicYaraSession *session, const char *cmd_id,
+                                   const uint8_t *buf, size_t len, char (*hits)[128],
+                                   size_t hit_cap, size_t *hit_count,
+                                   char *error, size_t error_cap) {
+  if (hit_count) *hit_count = 0u;
+  if (error && error_cap) error[0] = '\0';
+  if (!session || !buf || len == 0u || !hits || hit_cap == 0u || !hit_count) return -1;
+#ifdef EDR_HAVE_YARA
+  ForensicYaraResult result;
+  char scan_error[256];
+  scan_error[0] = '\0';
+  int ok = fy_scan_rules(session->rules, cmd_id, NULL, buf, len, &result,
+                         scan_error, sizeof(scan_error));
+  if (!ok) {
+    if (error && error_cap) snprintf(error, error_cap, "%s", scan_error);
+    return -1;
+  }
+  size_t count = (size_t)result.count < hit_cap ? (size_t)result.count : hit_cap;
+  for (size_t i = 0; i < count; i++) snprintf(hits[i], 128u, "%s", result.rules[i]);
+  *hit_count = count;
+  return 0;
+#else
+  (void)cmd_id;
+  if (error && error_cap) snprintf(error, error_cap, "%s", "libyara unavailable in this build");
+  return 1;
+#endif
+}
+
+void edr_response_yara_session_close(EdrForensicYaraSession *session) {
+  if (!session) return;
+#ifdef EDR_HAVE_YARA
+  if (session->rules) yr_rules_destroy(session->rules);
+#endif
+  free(session);
+}
+
+int edr_response_yara_scan_memory(const char *cmd_id, const uint8_t *buf, size_t len,
+                                  char (*hits)[128], size_t hit_cap, size_t *hit_count,
+                                  char *error, size_t error_cap) {
+  EdrForensicYaraSession *session = edr_response_yara_session_open(error, error_cap);
+  if (!session) return 1;
+  int rc = edr_response_yara_session_scan(session, cmd_id, buf, len, hits, hit_cap,
+                                          hit_count, error, error_cap);
+  edr_response_yara_session_close(session);
+  return rc;
+}
 
 /* ── Forensic Actions ── */
 
@@ -894,6 +995,33 @@ void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
   }
   EdrPmfeCommandContext context;
   memset(&context, 0, sizeof(context));
+  char region_base[64];
+  int region_size = 0;
+  int extract_region = 0;
+  int run_yara = 1;
+  region_base[0] = '\0';
+  (void)edr_parse_json_string(pl, len, "region_base", region_base, sizeof(region_base));
+  (void)edr_parse_json_int(pl, len, "region_size", &region_size);
+  (void)edr_parse_json_bool(pl, len, "extract_region", &extract_region);
+  (void)edr_parse_json_bool(pl, len, "run_yara", &run_yara);
+  if (region_base[0]) {
+    char *end = NULL;
+    unsigned long long base = strtoull(region_base, &end, 0);
+    if (!end || end == region_base || *end != '\0') {
+      edr_cmd_inc_exec_fail();
+      edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid region_base");
+      return;
+    }
+    context.requested_region_base = (uint64_t)base;
+    context.extract_region = 1u;
+  } else if (extract_region) {
+    edr_cmd_inc_exec_fail();
+    edr_command_soar_emit(cmd_id, sm, EdrCmdExecFailed, 2,
+                          "extract_region requires region_base");
+    return;
+  }
+  if (region_size > 0) context.requested_region_size = (uint64_t)region_size;
+  context.yara_mode = run_yara ? 1u : 2u;
   if (sm) {
     snprintf(context.soar_correlation_id, sizeof(context.soar_correlation_id), "%s", sm->soar_correlation_id);
     snprintf(context.playbook_run_id, sizeof(context.playbook_run_id), "%s", sm->playbook_run_id);

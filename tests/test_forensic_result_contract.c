@@ -46,6 +46,12 @@ int main(void) {
       "yara_scan", EdrCmdExecOk, 0, existing, out, sizeof(out));
   require_true(result == existing, "existing unified result is not double wrapped");
 
+  const char *pmfe_v1 =
+      "{\"schema\":\"pmfe_result_v1\",\"status\":\"completed_clean\"}";
+  result = edr_command_normalize_forensic_result(
+      "pmfe_scan", EdrCmdExecOk, 0, pmfe_v1, out, sizeof(out));
+  require_true(result == pmfe_v1, "structured PMFE result is not double wrapped");
+
   const char *plain = "pong";
   result = edr_command_normalize_forensic_result(
       "noop", EdrCmdExecOk, 0, plain, out, sizeof(out));

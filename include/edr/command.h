@@ -17,6 +17,7 @@ extern "C" {
 
 struct EdrConfig;
 struct EdrPmfeCommandContext;
+struct EdrPmfeScanResult;
 
 /**
  * 绑定当前进程配置（main 在 edr_agent_init 成功后调用），供 AVE 等指令使用 `EdrConfig`。
@@ -98,6 +99,7 @@ void edr_command_poll_reliable_delivery(void);
 /** PMFE worker completion is queued and drained by the command poll loop. */
 void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int scan_status,
                                        const char *detail,
+                                       const struct EdrPmfeScanResult *result,
                                        const struct EdrPmfeCommandContext *context);
 
 typedef struct EdrCommandDeliveryHealth {

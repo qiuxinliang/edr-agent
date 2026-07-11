@@ -1613,6 +1613,9 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"features\":{"
       "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"pmfe\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
+      "\"result_schema\":\"pmfe_result_v1\",\"region_metadata\":%s,\"region_dump\":%s,\"yara_memory\":%s,"
+      "\"vad_allocation_metadata\":%s,\"thread_start_snapshot\":%s,\"pe_reconstruction\":%s},"
       "\"onnxruntime\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"sqlite\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"http2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
@@ -1639,6 +1642,11 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       endpoint_policy_capability,
       pcre2_build ? "true" : "false", pcre2_build ? "true" : "false", pcre2_build ? "healthy" : "unavailable",
       yara_build ? "true" : "false", yara_build ? "true" : "false", yara_build ? "healthy" : "unavailable",
+      inventory_native ? "true" : "false", edr_pmfe_is_running() ? "true" : "false",
+      edr_pmfe_is_running() ? "healthy" : "disabled", windows_native ? "true" : "false",
+      windows_native ? "true" : "false", yara_build ? "true" : "false",
+      windows_native ? "true" : "false", windows_native ? "true" : "false",
+      windows_native ? "true" : "false",
       ort_build ? "true" : "false", ort_policy ? "true" : "false", ort_runtime,
       sqlite_build ? "true" : "false", sqlite_policy ? "true" : "false", sqlite_build && sqlite_policy ? "healthy" : (sqlite_build ? "disabled" : "unavailable"),
       http2_build ? "true" : "false", http_rt && http_rt->http2_enabled ? "true" : "false", http2_runtime,
@@ -3140,6 +3148,57 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   return changed;
 }
 
+static uint64_t s_remote_config_failure_report_ns = 0u;
+static char s_remote_config_failure_reason[192];
+
+static void edr_agent_report_remote_config_failure(EdrAgent *agent,
+                                                   const EdrAgentConfigHeaders *headers,
+                                                   const char *reason,
+                                                   uint64_t now) {
+  EdrIngestHttpRuntime runtime;
+  char detail[192];
+  const char *failure = reason && reason[0] ? reason : "remote_config_failed";
+  const uint64_t repeat_ns = 15ULL * 60ULL * 1000000000ULL;
+  if (!agent) {
+    return;
+  }
+  memset(&runtime, 0, sizeof(runtime));
+  edr_ingest_http_get_runtime(&runtime);
+  if (runtime.last_error[0] && strcmp(failure, "remote_config_download_failed") == 0) {
+    snprintf(detail, sizeof(detail), "%.64s: %.116s", failure, runtime.last_error);
+    failure = detail;
+  }
+  if (strcmp(s_remote_config_failure_reason, failure) == 0 &&
+      s_remote_config_failure_report_ns != 0u &&
+      now - s_remote_config_failure_report_ns < repeat_ns) {
+    return;
+  }
+  if (edr_ingest_http_post_config_status(
+          agent->cfg.agent.tenant_id,
+          agent->cfg.agent.endpoint_id,
+          EDR_AGENT_VERSION_STRING,
+          agent->cfg.preprocessing.rules_version,
+          headers ? headers->config_hash : "",
+          headers ? headers->sequence : "",
+          headers ? headers->nonce : "",
+          headers ? headers->signature : "",
+          headers ? headers->signing_key_id : "",
+          0,
+          failure,
+          "",
+          headers ? headers->config_hash : "",
+          "failed",
+          0) == 0) {
+    s_remote_config_failure_report_ns = now;
+    snprintf(s_remote_config_failure_reason, sizeof(s_remote_config_failure_reason), "%s", failure);
+  }
+}
+
+static void edr_agent_clear_remote_config_failure(void) {
+  s_remote_config_failure_report_ns = 0u;
+  s_remote_config_failure_reason[0] = '\0';
+}
+
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns,
                                          uint64_t *last_health_ns) {
   const char *url = getenv("EDR_REMOTE_CONFIG_URL");
@@ -3189,27 +3248,14 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   EdrAgentConfigHeaders config_headers;
   memset(&config_headers, 0, sizeof(config_headers));
   if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "remote TOML", &config_headers) != 0) {
+    edr_agent_report_remote_config_failure(agent, NULL, "remote_config_download_failed", now);
     return;
   }
   {
     char verify_reason[192];
     if (edr_agent_verify_config_headers(&agent->cfg, agent->cfg.offline.queue_db_path, tmp, &config_headers, verify_reason, sizeof(verify_reason)) != 0) {
       fprintf(stderr, "[config] remote TOML signature rejected: %s\n", verify_reason);
-      (void)edr_ingest_http_post_config_status(agent->cfg.agent.tenant_id,
-                                               agent->cfg.agent.endpoint_id,
-                                               EDR_AGENT_VERSION_STRING,
-                                               config_headers.sequence[0] ? agent->cfg.preprocessing.rules_version : "local",
-                                               config_headers.config_hash,
-                                               config_headers.sequence,
-                                               config_headers.nonce,
-                                               config_headers.signature,
-                                               config_headers.signing_key_id,
-                                               0,
-                                               verify_reason,
-                                               agent->cfg.preprocessing.rules_version,
-                                               config_headers.config_hash,
-                                               "failed",
-                                               0);
+      edr_agent_report_remote_config_failure(agent, &config_headers, verify_reason, now);
       (void)remove(tmp);
       return;
     }
@@ -3225,7 +3271,10 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   repaired_local_config[0] = '\0';
   edr_config_fingerprint(tmp, fp, sizeof(fp));
   if (ce != EDR_OK) {
+    char parse_reason[96];
     fprintf(stderr, "[config] remote TOML parse failed: %d\n", (int)ce);
+    snprintf(parse_reason, sizeof(parse_reason), "remote_config_parse_failed:%d", (int)ce);
+    edr_agent_report_remote_config_failure(agent, &config_headers, parse_reason, now);
     (void)remove(tmp);
     return;
   }
@@ -3293,6 +3342,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
             config_headers.rollout_id[0] ? config_headers.rollout_id : "-",
             config_headers.rollout_bucket[0] ? config_headers.rollout_bucket : "-");
   }
+  edr_agent_clear_remote_config_failure();
   {
     const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
     if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&

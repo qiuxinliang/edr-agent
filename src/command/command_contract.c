@@ -63,8 +63,12 @@ static const CommandFieldRule k_telemetry_rules[] = {
     RULE("backpressure_enabled", FIELD_BOOL, 0, 0, 0, 0, 0),
 };
 
-static const CommandFieldRule k_pid_rules[] = {
+static const CommandFieldRule k_pmfe_rules[] = {
     RULE("pid", FIELD_NUMBER, 1, 1, 4294967295.0, 0, 0),
+    RULE("region_base", FIELD_STRING, 0, 0, 0, 32, 0),
+    RULE("region_size", FIELD_NUMBER, 0, 1, 1048576, 0, 0),
+    RULE("extract_region", FIELD_BOOL, 0, 0, 0, 0, 0),
+    RULE("run_yara", FIELD_BOOL, 0, 0, 0, 0, 0),
 };
 
 static const CommandFieldRule k_memory_rules[] = {
@@ -302,7 +306,7 @@ static void command_rules(EdrCommandKind kind, const CommandFieldRule **rules,
       *rules = k_telemetry_rules; *count = COUNT_OF(k_telemetry_rules); break;
     case EDR_COMMAND_KIND_KILL_PROCESS:
     case EDR_COMMAND_KIND_PMFE_SCAN:
-      *rules = k_pid_rules; *count = COUNT_OF(k_pid_rules); break;
+      *rules = k_pmfe_rules; *count = COUNT_OF(k_pmfe_rules); break;
     case EDR_COMMAND_KIND_MEMORY_DUMP:
       *rules = k_memory_rules; *count = COUNT_OF(k_memory_rules); break;
     case EDR_COMMAND_KIND_FILE_STAT:

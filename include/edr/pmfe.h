@@ -42,10 +42,97 @@ typedef struct EdrPmfeCommandContext {
   char soar_correlation_id[128];
   char playbook_run_id[96];
   char playbook_step_id[96];
+  uint64_t requested_region_base;
+  uint64_t requested_region_size;
+  uint8_t extract_region;
+  uint8_t yara_mode; /* 0=default, 1=enabled, 2=disabled */
 } EdrPmfeCommandContext;
+
+#define EDR_PMFE_RESULT_SCHEMA "pmfe_result_v1"
+#define EDR_PMFE_MAX_REGIONS 8
+#define EDR_PMFE_MAX_YARA_HITS 4
+#define EDR_PMFE_MAX_THREAD_STARTS 8
+
+typedef struct EdrPmfeThreadStart {
+  uint32_t tid;
+  uint64_t start_address;
+} EdrPmfeThreadStart;
+
+typedef struct EdrPmfeRegionResult {
+  uint64_t base;
+  uint64_t allocation_base;
+  uint64_t size_bytes;
+  uint64_t bytes_sampled;
+  uint32_t protection;
+  uint32_t memory_type;
+  float score;
+  float entropy;
+  uint8_t read_ok;
+  uint8_t mz_found;
+  uint8_t yara_hit_count;
+  uint8_t thread_start_count;
+  char protection_name[48];
+  char allocation_protection_name[48];
+  char kind[32];
+  char mapped_path[1024];
+  char reason[160];
+  char sha256[65];
+  char artifact_path[1024];
+  char pe_arch[16];
+  uint16_t pe_sections;
+  uint32_t pe_timestamp;
+  uint32_t pe_entrypoint_rva;
+  char entrypoint_preview_hex[129];
+  char reconstructed_path[1024];
+  char reconstructed_sha256[65];
+  char reconstruction_status[32];
+  EdrPmfeThreadStart thread_starts[EDR_PMFE_MAX_THREAD_STARTS];
+  char yara_hits[EDR_PMFE_MAX_YARA_HITS][128];
+} EdrPmfeRegionResult;
+
+/** Structured server-scan result. Region artifacts are written by the PMFE
+ * worker but uploaded only by the normal command loop. */
+typedef struct EdrPmfeScanResult {
+  char schema[24];
+  char status[32];
+  char verdict[32];
+  uint32_t pid;
+  char image_path[1024];
+  uint64_t started_unix_ms;
+  uint64_t finished_unix_ms;
+  uint64_t duration_ms;
+  uint64_t bytes_sampled;
+  uint32_t regions_total;
+  uint32_t regions_read;
+  uint32_t read_failures;
+  uint32_t threads_total;
+  uint32_t thread_start_matches;
+  uint32_t thread_query_failures;
+  uint32_t private_exec;
+  uint32_t stomp_suspicious;
+  uint32_t mz_hits;
+  uint32_t dns_hits;
+  float entropy_max;
+  float ave_max_score;
+  float dns_best;
+  char dns_sample[200];
+  char dns_owner[200];
+  char module_consistency[24];
+  uint8_t injection_observed;
+  int64_t injection_event_time_ns;
+  int64_t injection_age_ms;
+  char injection_technique[32];
+  char injection_source[32];
+  char cross_process_write_status[32];
+  uint8_t truncated;
+  uint8_t region_count;
+  char warning[256];
+  EdrPmfeRegionResult regions[EDR_PMFE_MAX_REGIONS];
+} EdrPmfeScanResult;
 
 typedef void (*EdrPmfeServerScanResultCallback)(const char *command_id, uint32_t pid,
                                                 int scan_status, const char *detail,
+                                                const EdrPmfeScanResult *result,
                                                 const EdrPmfeCommandContext *context);
 
 /**

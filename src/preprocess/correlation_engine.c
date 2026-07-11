@@ -146,6 +146,18 @@ typedef struct {
 static CorrInjectPending s_inject_pending[CORR_INJECT_PENDING_SLOTS];
 static volatile long s_inject_write_seq; /* 单调递增，取模定位槽 */
 
+#define CORR_INJECT_HISTORY_SLOTS 128u
+typedef struct {
+  volatile uint32_t ready;
+  uint64_t sequence;
+  uint32_t pid;
+  int64_t event_time_ns;
+  char process_name[256];
+  char technique[32];
+} CorrInjectHistory;
+static CorrInjectHistory s_inject_history[CORR_INJECT_HISTORY_SLOTS];
+static volatile long s_inject_history_seq;
+
 /* ------------------------------------------------------------ 运行态/指标 */
 
 static volatile long s_inited;
@@ -1578,6 +1590,56 @@ static void corr_note_ave_signal(CorrSignalKind kind, uint32_t pid, const char *
 void edr_correlation_note_injection(uint32_t pid, const char *process_name, int64_t event_time_ns,
                                     const char *technique) {
   corr_note_ave_signal(CORR_SIG_INJECT, pid, process_name, event_time_ns, technique);
+  if (pid != 0u) {
+    long sequence = corr_fetch_inc_long(&s_inject_history_seq);
+    CorrInjectHistory *slot = &s_inject_history[(uint32_t)sequence % CORR_INJECT_HISTORY_SLOTS];
+    slot->ready = 0u;
+    slot->sequence = (uint64_t)(unsigned long)sequence;
+    slot->pid = pid;
+    slot->event_time_ns = event_time_ns;
+    snprintf(slot->process_name, sizeof(slot->process_name), "%s",
+             process_name ? process_name : "");
+    snprintf(slot->technique, sizeof(slot->technique), "%s",
+             technique ? technique : "");
+#if defined(_WIN32)
+    MemoryBarrier();
+#elif defined(__GNUC__) || defined(__clang__)
+    __sync_synchronize();
+#endif
+    slot->ready = 1u;
+  }
+}
+
+int edr_correlation_latest_injection(uint32_t pid,
+                                     EdrCorrelationInjectionObservation *out) {
+  if (!out || pid == 0u) return 0;
+  memset(out, 0, sizeof(*out));
+  uint64_t best_sequence = 0u;
+  int found = 0;
+  for (uint32_t i = 0; i < CORR_INJECT_HISTORY_SLOTS; i++) {
+    CorrInjectHistory *slot = &s_inject_history[i];
+    if (slot->ready == 0u || slot->pid != pid) continue;
+    uint64_t sequence = slot->sequence;
+    EdrCorrelationInjectionObservation candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.pid = slot->pid;
+    candidate.event_time_ns = slot->event_time_ns;
+    snprintf(candidate.process_name, sizeof(candidate.process_name), "%s", slot->process_name);
+    snprintf(candidate.technique, sizeof(candidate.technique), "%s", slot->technique);
+    snprintf(candidate.source, sizeof(candidate.source), "%s", "ave_behavior");
+#if defined(_WIN32)
+    MemoryBarrier();
+#elif defined(__GNUC__) || defined(__clang__)
+    __sync_synchronize();
+#endif
+    if (slot->ready == 0u || slot->sequence != sequence || slot->pid != pid) continue;
+    if (!found || sequence >= best_sequence) {
+      *out = candidate;
+      best_sequence = sequence;
+      found = 1;
+    }
+  }
+  return found;
 }
 
 void edr_correlation_note_cred_access(uint32_t pid, const char *process_name, int64_t event_time_ns,

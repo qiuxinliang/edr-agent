@@ -87,6 +87,10 @@ int main(void) {
                "reject string pid");
   require_true(!validate("kill_process", "{\"pid\":42.5}", reason, sizeof(reason)),
                "reject fractional pid");
+  require_true(validate("pmfe_scan", "{\"pid\":42,\"region_base\":\"0x7ff60000\",\"region_size\":65536,\"extract_region\":true,\"run_yara\":true}", reason, sizeof(reason)),
+               "accept targeted PMFE region extraction contract");
+  require_true(!validate("pmfe_scan", "{\"pid\":42,\"region_size\":2097152}", reason, sizeof(reason)),
+               "reject oversized PMFE region sample");
   require_true(validate("file_stat", "{\"path\":\"/tmp/a\"}", reason, sizeof(reason)),
                "valid path contract");
   require_true(!validate("file_stat", "{\"path\":\"/tmp/a\",\"typo\":1}", reason, sizeof(reason)),

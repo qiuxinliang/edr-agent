@@ -52,6 +52,18 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm);
 void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
+/** Scan an in-memory PMFE region with the effective forensic YARA rule set.
+ * Returns 0 on a completed scan, 1 when YARA is unavailable, and <0 on error. */
+int edr_response_yara_scan_memory(const char *cmd_id, const uint8_t *buf, size_t len,
+                                  char (*hits)[128], size_t hit_cap, size_t *hit_count,
+                                  char *error, size_t error_cap);
+typedef struct EdrForensicYaraSession EdrForensicYaraSession;
+EdrForensicYaraSession *edr_response_yara_session_open(char *error, size_t error_cap);
+int edr_response_yara_session_scan(EdrForensicYaraSession *session, const char *cmd_id,
+                                   const uint8_t *buf, size_t len, char (*hits)[128],
+                                   size_t hit_cap, size_t *hit_count,
+                                   char *error, size_t error_cap);
+void edr_response_yara_session_close(EdrForensicYaraSession *session);
 void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
 

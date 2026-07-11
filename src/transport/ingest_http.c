@@ -5397,7 +5397,7 @@ int edr_ingest_http_post_config_status(const char *tenant_id,
   sig = json_escape_alloc(config_signature ? config_signature : "");
   key_id = json_escape_alloc(signing_key_id ? signing_key_id : "");
   reject = json_escape_alloc(reject_reason ? reject_reason : "");
-  desired_ver = json_escape_alloc(desired_version && desired_version[0] ? desired_version : (policy_version ? policy_version : ""));
+  desired_ver = json_escape_alloc(desired_version && desired_version[0] ? desired_version : "");
   desired_h = json_escape_alloc(desired_hash && desired_hash[0] ? desired_hash : (config_hash ? config_hash : ""));
   status = json_escape_alloc(apply_status && apply_status[0] ? apply_status : "reported");
   if (!tenant || !endpoint || !agent || !policy || !hash || !nonce || !sig || !key_id || !reject || !desired_ver || !desired_h || !status) {

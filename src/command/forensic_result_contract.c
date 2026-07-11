@@ -40,7 +40,8 @@ const char *edr_command_normalize_forensic_result(const char *command_type,
                                                   const char *detail,
                                                   char *out, size_t out_cap) {
   if (!command_type_is_forensic(command_type) ||
-      (detail && strstr(detail, "edr.forensic.result.v1"))) {
+      (detail && (strstr(detail, "edr.forensic.result.v1") ||
+                  strstr(detail, "pmfe_result_v1")))) {
     return detail ? detail : "";
   }
   if (!out || out_cap == 0u) return detail ? detail : "";
