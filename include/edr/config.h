@@ -114,6 +114,33 @@ typedef struct EdrConfig {
     char suppression_rules[8192];
   } detection_policy;
 
+  /** Product-level sensor modes from remote `[detection]` policy. */
+  struct {
+    bool auto_profile;
+    int shellcode_mode; /* -1 adaptive, 0 off, 1 on */
+    int webshell_mode;  /* -1 adaptive, 0 off, 1 on */
+    int pmfe_mode;      /* -1 adaptive alert, 0 off, 1 reserved idle, 2 alert-triggered */
+  } detection;
+
+  /** Endpoint policy schema v2. Modes: 0 off, 1 observe, 2 alert, 3 block. */
+  struct {
+    int credential_mode;
+    int lateral_mode;
+    int privilege_mode;
+    int evasion_mode;
+    int persistence_mode;
+    int script_mode;
+    int webshell_mode;
+    int exfil_mode;
+    int impact_mode;
+    bool ransomware_behavior;
+    bool ransomware_mass_write;
+    bool ransomware_vss;
+    bool ransomware_spread;
+    bool ransomware_honey;
+    bool ransomware_forensic;
+  } policy_v2;
+
   struct {
     bool enabled;
     char model_dir[1024];
@@ -277,6 +304,15 @@ typedef struct EdrConfig {
    */
   struct {
     bool enabled;
+    bool listeners_enabled;
+    bool public_service_enabled;
+    bool local_admins_enabled;
+    bool services_enabled;
+    bool shares_enabled;
+    bool browser_enabled;
+    bool software_enabled;
+    bool defender_enabled;
+    bool egress_enabled;
     uint32_t port_interval_s;
     uint32_t conn_interval_s;
     uint32_t service_interval_s;

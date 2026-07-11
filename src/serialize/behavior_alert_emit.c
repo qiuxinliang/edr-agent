@@ -4,6 +4,7 @@
 #include "edr/behavior_proto.h"
 #include "edr/event_batch.h"
 #include "edr/preprocess.h"
+#include "edr/policy_v2.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,9 @@ static void emit_volume_summary(uint64_t suppressed_count, uint64_t timestamp_ns
 
 void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
   if (!a) {
+    return;
+  }
+  if (!edr_policy_v2_alert_allowed(a->triggered_tactics, a->user_subject_json)) {
     return;
   }
 #ifdef EDR_HAVE_NANOPB

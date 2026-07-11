@@ -316,6 +316,8 @@ set(EDR_AGENT_SOURCES
   src/preprocess/windows_event_policy.c
   src/preprocess/correlation_engine.c
   src/preprocess/preprocess_pipeline.c
+  src/detection/detection_profile.c
+  src/detection/policy_v2.c
   src/forensic/process_tree_cache.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c

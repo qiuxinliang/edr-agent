@@ -1,6 +1,7 @@
 #include "edr/ave_cross_engine_feed.h"
 
 #include "edr/ave_sdk.h"
+#include "edr/policy_v2.h"
 #include "edr/types.h"
 
 #include <stdio.h>
@@ -307,9 +308,10 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
     return;
   }
   float script_score = script_score_from_record(br);
-  int ransom_ext = path_has_ransom_ext(br->file_path);
-  int shadow_delete = (ace_str_has_ci(br->cmdline, "vssadmin") && ace_str_has_ci(br->cmdline, "delete") && ace_str_has_ci(br->cmdline, "shadows")) ||
-                      (ace_str_has_ci(br->cmdline, "wmic") && ace_str_has_ci(br->cmdline, "shadowcopy") && ace_str_has_ci(br->cmdline, "delete"));
+  int ransom_ext = edr_policy_v2_ransomware_enabled("mass_write") && path_has_ransom_ext(br->file_path);
+  int shadow_delete = edr_policy_v2_ransomware_enabled("vss") &&
+                      ((ace_str_has_ci(br->cmdline, "vssadmin") && ace_str_has_ci(br->cmdline, "delete") && ace_str_has_ci(br->cmdline, "shadows")) ||
+                      (ace_str_has_ci(br->cmdline, "wmic") && ace_str_has_ci(br->cmdline, "shadowcopy") && ace_str_has_ci(br->cmdline, "delete")));
   int cert_anom = br->cert_revoked_ancestor ? 1 : 0;
   AVEEventType avt;
   if (!ave_event_type_from_record(br->type, &avt)) {

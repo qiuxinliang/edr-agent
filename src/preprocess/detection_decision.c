@@ -1,5 +1,6 @@
 #include "edr/detection_decision.h"
 #include "edr/detection_profile.h"
+#include "edr/policy_v2.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -586,7 +587,7 @@ static int has_high_content_entropy_indicator(const EdrBehaviorRecord *r) {
 
 static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
-  if (has_ransom_canary_indicator(r)) {
+  if (edr_policy_v2_ransomware_enabled("honey") && has_ransom_canary_indicator(r)) {
     return 1;
   }
   if (decision_suppress_ransom_file_signal(r)) {
@@ -605,13 +606,16 @@ static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
     entropy_delta = detail_number(s, "file_entropy_delta", -1.0);
   }
   int recovery = has_ransom_recovery_tamper_indicator(r);
-  int mass = has_ci(s, "mass_rename=1") || has_ci(s, "rename_burst=1") || file_rate >= 120.0 ||
-             (file_rate >= 80.0 && (ext_burst >= 8.0 || dir_burst >= 2.0));
-  int extension = has_ci(s, "extension_burst=1") || ext_burst >= 20.0 || ext_changed;
-  int entropy = high_content_entropy || entropy_delta >= 1.5;
-  int spread = dir_burst >= 4.0;
-  int counter = has_ci(s, "ransom_counter=1");
-  int shadow = has_ci(s, "shadow_delete=1") || has_ci(s, "shadowcopy_delete=1") || recovery;
+  int behavior_enabled = edr_policy_v2_ransomware_enabled("behavior");
+  int mass_write_enabled = edr_policy_v2_ransomware_enabled("mass_write");
+  int mass = mass_write_enabled && (has_ci(s, "mass_rename=1") || has_ci(s, "rename_burst=1") || file_rate >= 120.0 ||
+             (file_rate >= 80.0 && (ext_burst >= 8.0 || dir_burst >= 2.0)));
+  int extension = (behavior_enabled || mass_write_enabled) && (has_ci(s, "extension_burst=1") || ext_burst >= 20.0 || ext_changed);
+  int entropy = behavior_enabled && (high_content_entropy || entropy_delta >= 1.5);
+  int spread = edr_policy_v2_ransomware_enabled("spread") && dir_burst >= 4.0;
+  int counter = mass_write_enabled && has_ci(s, "ransom_counter=1");
+  int shadow = edr_policy_v2_ransomware_enabled("vss") &&
+               (has_ci(s, "shadow_delete=1") || has_ci(s, "shadowcopy_delete=1") || recovery);
   if (ext_changed && high_content_entropy) {
     return 1;
   }

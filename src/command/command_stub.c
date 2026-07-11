@@ -27,6 +27,7 @@
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
+#include "edr/policy_v2.h"
 #include "edr/preprocess.h"
 #include "edr/response.h"
 #include "edr/resource.h"
@@ -666,6 +667,10 @@ static int auto_pmfe_recommended_enabled(void) {
 
 int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
   if (!r || !r->detection_context[0] || !ctx_has(r, "\"recommended_forensics\"")) {
+    return 0;
+  }
+  if ((ctx_has(r, "ransom") || ctx_has(r, "T1486") || ctx_has(r, "T1490")) &&
+      !edr_policy_v2_ransomware_enabled("forensic")) {
     return 0;
   }
   if (env_falsy_cmd("EDR_AUTO_RECOMMENDED_FORENSICS")) {
@@ -1577,7 +1582,7 @@ void edr_isolate_auto_from_shellcode_alarm(void) {
 void edr_isolate_auto_from_ransom_alarm(uint32_t pid) {
   /* 默认关:显式启用后才执行自动终止/隔离，且仍受高危策略保护。 */
   const char *eo = getenv("EDR_RANSOM_AUTO_ISOLATE");
-  if (!eo || eo[0] != '1') {
+  if ((!eo || eo[0] != '1') && edr_policy_v2_mode_for_category("impact") != EDR_POLICY_MODE_BLOCK) {
     return;
   }
   if (!dangerous_enabled()) {

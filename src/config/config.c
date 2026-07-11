@@ -848,6 +848,58 @@ static void load_detection_policy(toml_table_t *t, EdrConfig *cfg) {
   load_detection_policy_suppression(t, cfg);
 }
 
+static void load_detection(toml_table_t *t, EdrConfig *cfg) {
+  toml_datum_t b = toml_bool_in(t, "auto_profile");
+  if (b.ok) cfg->detection.auto_profile = b.u.b != 0;
+  toml_datum_t shellcode = toml_int_in(t, "shellcode_mode");
+  if (shellcode.ok && shellcode.u.i >= -1 && shellcode.u.i <= 1) {
+    cfg->detection.shellcode_mode = (int)shellcode.u.i;
+  }
+  toml_datum_t webshell = toml_int_in(t, "webshell_mode");
+  if (webshell.ok && webshell.u.i >= -1 && webshell.u.i <= 1) {
+    cfg->detection.webshell_mode = (int)webshell.u.i;
+  }
+  toml_datum_t pmfe = toml_int_in(t, "pmfe_mode");
+  if (pmfe.ok && pmfe.u.i >= -1 && pmfe.u.i <= 2) {
+    cfg->detection.pmfe_mode = (int)pmfe.u.i;
+  }
+}
+
+static int policy_mode_value(toml_table_t *t, const char *key, int fallback) {
+  toml_datum_t d = toml_string_in(t, key);
+  int mode = fallback;
+  if (!d.ok || !d.u.s) return fallback;
+  if (strcmp(d.u.s, "off") == 0) mode = 0;
+  else if (strcmp(d.u.s, "observe") == 0) mode = 1;
+  else if (strcmp(d.u.s, "alert") == 0) mode = 2;
+  else if (strcmp(d.u.s, "block") == 0) mode = 3;
+  free(d.u.s);
+  return mode;
+}
+
+static void policy_bool_value(toml_table_t *t, const char *key, bool *out) {
+  toml_datum_t d = toml_bool_in(t, key);
+  if (d.ok && out) *out = d.u.b != 0;
+}
+
+static void load_policy_v2(toml_table_t *t, EdrConfig *cfg) {
+  cfg->policy_v2.credential_mode = policy_mode_value(t, "credential_mode", cfg->policy_v2.credential_mode);
+  cfg->policy_v2.lateral_mode = policy_mode_value(t, "lateral_mode", cfg->policy_v2.lateral_mode);
+  cfg->policy_v2.privilege_mode = policy_mode_value(t, "privilege_mode", cfg->policy_v2.privilege_mode);
+  cfg->policy_v2.evasion_mode = policy_mode_value(t, "evasion_mode", cfg->policy_v2.evasion_mode);
+  cfg->policy_v2.persistence_mode = policy_mode_value(t, "persistence_mode", cfg->policy_v2.persistence_mode);
+  cfg->policy_v2.script_mode = policy_mode_value(t, "script_mode", cfg->policy_v2.script_mode);
+  cfg->policy_v2.webshell_mode = policy_mode_value(t, "webshell_mode", cfg->policy_v2.webshell_mode);
+  cfg->policy_v2.exfil_mode = policy_mode_value(t, "exfil_mode", cfg->policy_v2.exfil_mode);
+  cfg->policy_v2.impact_mode = policy_mode_value(t, "impact_mode", cfg->policy_v2.impact_mode);
+  policy_bool_value(t, "ransomware_behavior", &cfg->policy_v2.ransomware_behavior);
+  policy_bool_value(t, "ransomware_mass_write", &cfg->policy_v2.ransomware_mass_write);
+  policy_bool_value(t, "ransomware_vss", &cfg->policy_v2.ransomware_vss);
+  policy_bool_value(t, "ransomware_spread", &cfg->policy_v2.ransomware_spread);
+  policy_bool_value(t, "ransomware_honey", &cfg->policy_v2.ransomware_honey);
+  policy_bool_value(t, "ransomware_forensic", &cfg->policy_v2.ransomware_forensic);
+}
+
 static void config_setenv_if_value(const char *name, const char *value) {
   if (!name || !name[0] || !value || !value[0]) {
     return;
@@ -1779,6 +1831,25 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   apply_builtin_preprocess_rules(cfg);
   snprintf(cfg->detection_policy.source, sizeof(cfg->detection_policy.source), "%s", "local_default");
   snprintf(cfg->detection_policy.policy_version, sizeof(cfg->detection_policy.policy_version), "%s", "local-default");
+  cfg->detection.auto_profile = true;
+  cfg->detection.shellcode_mode = 0;
+  cfg->detection.webshell_mode = 0;
+  cfg->detection.pmfe_mode = 0;
+  cfg->policy_v2.credential_mode = 2;
+  cfg->policy_v2.lateral_mode = 2;
+  cfg->policy_v2.privilege_mode = 2;
+  cfg->policy_v2.evasion_mode = 2;
+  cfg->policy_v2.persistence_mode = 2;
+  cfg->policy_v2.script_mode = 2;
+  cfg->policy_v2.webshell_mode = 2;
+  cfg->policy_v2.exfil_mode = 2;
+  cfg->policy_v2.impact_mode = 2;
+  cfg->policy_v2.ransomware_behavior = true;
+  cfg->policy_v2.ransomware_mass_write = true;
+  cfg->policy_v2.ransomware_vss = true;
+  cfg->policy_v2.ransomware_spread = true;
+  cfg->policy_v2.ransomware_honey = true;
+  cfg->policy_v2.ransomware_forensic = true;
 
 #ifdef _WIN32
   /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
@@ -1970,6 +2041,15 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->platform.request_signing.secret[0] = '\0';
 
   cfg->attack_surface.enabled = false;
+  cfg->attack_surface.listeners_enabled = true;
+  cfg->attack_surface.public_service_enabled = true;
+  cfg->attack_surface.local_admins_enabled = true;
+  cfg->attack_surface.services_enabled = true;
+  cfg->attack_surface.shares_enabled = true;
+  cfg->attack_surface.browser_enabled = false;
+  cfg->attack_surface.software_enabled = true;
+  cfg->attack_surface.defender_enabled = true;
+  cfg->attack_surface.egress_enabled = true;
   cfg->attack_surface.port_interval_s = 300u;
   cfg->attack_surface.conn_interval_s = 300u;
   cfg->attack_surface.service_interval_s = 600u;
@@ -2360,6 +2440,15 @@ static void load_attack_surface(toml_table_t *t, EdrConfig *cfg) {
       cfg->attack_surface.enabled = d.u.b ? true : false;
     }
   }
+  policy_bool_value(t, "listeners_enabled", &cfg->attack_surface.listeners_enabled);
+  policy_bool_value(t, "public_service_enabled", &cfg->attack_surface.public_service_enabled);
+  policy_bool_value(t, "local_admins_enabled", &cfg->attack_surface.local_admins_enabled);
+  policy_bool_value(t, "services_enabled", &cfg->attack_surface.services_enabled);
+  policy_bool_value(t, "shares_enabled", &cfg->attack_surface.shares_enabled);
+  policy_bool_value(t, "browser_enabled", &cfg->attack_surface.browser_enabled);
+  policy_bool_value(t, "software_enabled", &cfg->attack_surface.software_enabled);
+  policy_bool_value(t, "defender_enabled", &cfg->attack_surface.defender_enabled);
+  policy_bool_value(t, "egress_enabled", &cfg->attack_surface.egress_enabled);
   {
     toml_datum_t d = toml_int_in(t, "port_interval_s");
     if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
@@ -2595,6 +2684,18 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
+		toml_table_t *t = toml_table_in(root, "detection");
+		if (t) {
+			load_detection(t, cfg);
+		}
+	}
+	{
+		toml_table_t *t = toml_table_in(root, "policy_v2");
+		if (t) {
+			load_policy_v2(t, cfg);
+		}
+	}
+	{
     toml_table_t *t = toml_table_in(root, "detection_policy");
     if (t) {
       load_detection_policy(t, cfg);

@@ -7,6 +7,7 @@
 #include "edr/correlation_engine.h"
 #include "edr/config.h"
 #include "edr/deep_collector.h"
+#include "edr/detection_mode.h"
 #include "edr/event_bus.h"
 #include "edr/response.h"
 #include "edr/preprocess.h"
@@ -17,6 +18,7 @@
 #include "edr/sensor_interest.h"
 #include "edr/sha256.h"
 #include "edr/shell_session.h"
+#include "edr/shellcode_detector.h"
 #include "edr/shellcode_known.h"
 #include "edr/time_util.h"
 
@@ -31,11 +33,13 @@
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/p0_rule_ir.h"
+#include "edr/policy_v2.h"
 #include "edr/pmfe.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #include "edr/transport_v2.h"
 #include "edr/windows_event_policy.h"
+#include "edr/webshell_detector.h"
 #ifdef _WIN32
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
@@ -70,6 +74,7 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
 #define EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED 0x02
+#define EDR_REMOTE_POLICY_DETECTION_CHANGED 0x04
 
 typedef enum {
   EDR_AGENT_POLL_RESOURCE = 0,
@@ -802,6 +807,30 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "etw_security_audit_provider = %s\n", cfg->collection.etw_security_audit_provider ? "true" : "false");
   fprintf(fp, "max_event_queue_size = %u\n", cfg->collection.max_event_queue_size);
   fprintf(fp, "adaptive_enabled = %s\n", cfg->collection.adaptive_enabled ? "true" : "false");
+  fprintf(fp, "\n[detection]\n");
+  fprintf(fp, "auto_profile = %s\n", cfg->detection.auto_profile ? "true" : "false");
+  fprintf(fp, "shellcode_mode = %d\n", cfg->detection.shellcode_mode);
+  fprintf(fp, "webshell_mode = %d\n", cfg->detection.webshell_mode);
+  fprintf(fp, "pmfe_mode = %d\n", cfg->detection.pmfe_mode);
+  fprintf(fp, "\n[policy_v2]\n");
+  static const char *policy_modes[] = {"off", "observe", "alert", "block"};
+#define EDR_WRITE_POLICY_MODE(name, value) fprintf(fp, name " = \"%s\"\n", policy_modes[(value) >= 0 && (value) <= 3 ? (value) : 2])
+  EDR_WRITE_POLICY_MODE("credential_mode", cfg->policy_v2.credential_mode);
+  EDR_WRITE_POLICY_MODE("lateral_mode", cfg->policy_v2.lateral_mode);
+  EDR_WRITE_POLICY_MODE("privilege_mode", cfg->policy_v2.privilege_mode);
+  EDR_WRITE_POLICY_MODE("evasion_mode", cfg->policy_v2.evasion_mode);
+  EDR_WRITE_POLICY_MODE("persistence_mode", cfg->policy_v2.persistence_mode);
+  EDR_WRITE_POLICY_MODE("script_mode", cfg->policy_v2.script_mode);
+  EDR_WRITE_POLICY_MODE("webshell_mode", cfg->policy_v2.webshell_mode);
+  EDR_WRITE_POLICY_MODE("exfil_mode", cfg->policy_v2.exfil_mode);
+  EDR_WRITE_POLICY_MODE("impact_mode", cfg->policy_v2.impact_mode);
+#undef EDR_WRITE_POLICY_MODE
+  fprintf(fp, "ransomware_behavior = %s\n", cfg->policy_v2.ransomware_behavior ? "true" : "false");
+  fprintf(fp, "ransomware_mass_write = %s\n", cfg->policy_v2.ransomware_mass_write ? "true" : "false");
+  fprintf(fp, "ransomware_vss = %s\n", cfg->policy_v2.ransomware_vss ? "true" : "false");
+  fprintf(fp, "ransomware_spread = %s\n", cfg->policy_v2.ransomware_spread ? "true" : "false");
+  fprintf(fp, "ransomware_honey = %s\n", cfg->policy_v2.ransomware_honey ? "true" : "false");
+  fprintf(fp, "ransomware_forensic = %s\n", cfg->policy_v2.ransomware_forensic ? "true" : "false");
   fprintf(fp, "\n[offline]\n");
   edr_agent_write_toml_string(fp, "queue_db_path", cfg->offline.queue_db_path);
   edr_agent_write_toml_string(fp, "evidence_cache_path", cfg->offline.evidence_cache_path);
@@ -822,6 +851,13 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "allow_dangerous = %s\n", cfg->command.allow_dangerous ? "true" : "false");
   fprintf(fp, "allow_rtq_readonly = %s\n", cfg->command.allow_rtq_readonly ? "true" : "false");
   edr_agent_write_toml_string(fp, "signing_public_key_path", cfg->command.signing_public_key_path);
+  fprintf(fp, "\n[forensic_auto]\n");
+  fprintf(fp, "enabled = %s\n", cfg->forensic_auto.enabled ? "true" : "false");
+  fprintf(fp, "trigger_on_p0 = %s\n", cfg->forensic_auto.trigger_on_p0 ? "true" : "false");
+  fprintf(fp, "cooldown_s = %u\n", cfg->forensic_auto.cooldown_s);
+  fprintf(fp, "per_pid_cooldown_s = %u\n", cfg->forensic_auto.per_pid_cooldown_s);
+  fprintf(fp, "max_per_hour = %u\n", cfg->forensic_auto.max_per_hour);
+  fprintf(fp, "collect_process_tree = %s\n", cfg->forensic_auto.collect_process_tree ? "true" : "false");
   fprintf(fp, "\n[ave]\n");
   fprintf(fp, "enabled = %s\n", cfg->ave.enabled ? "true" : "false");
   edr_agent_write_toml_string(fp, "model_dir", cfg->ave.model_dir);
@@ -829,6 +865,15 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "behavior_monitor_enabled = %s\n", cfg->ave.behavior_monitor_enabled ? "true" : "false");
   fprintf(fp, "\n[attack_surface]\n");
   fprintf(fp, "enabled = %s\n", cfg->attack_surface.enabled ? "true" : "false");
+  fprintf(fp, "listeners_enabled = %s\n", cfg->attack_surface.listeners_enabled ? "true" : "false");
+  fprintf(fp, "public_service_enabled = %s\n", cfg->attack_surface.public_service_enabled ? "true" : "false");
+  fprintf(fp, "local_admins_enabled = %s\n", cfg->attack_surface.local_admins_enabled ? "true" : "false");
+  fprintf(fp, "services_enabled = %s\n", cfg->attack_surface.services_enabled ? "true" : "false");
+  fprintf(fp, "shares_enabled = %s\n", cfg->attack_surface.shares_enabled ? "true" : "false");
+  fprintf(fp, "browser_enabled = %s\n", cfg->attack_surface.browser_enabled ? "true" : "false");
+  fprintf(fp, "software_enabled = %s\n", cfg->attack_surface.software_enabled ? "true" : "false");
+  fprintf(fp, "defender_enabled = %s\n", cfg->attack_surface.defender_enabled ? "true" : "false");
+  fprintf(fp, "egress_enabled = %s\n", cfg->attack_surface.egress_enabled ? "true" : "false");
   fprintf(fp, "\n[shellcode_detector]\n");
   fprintf(fp, "enabled = %s\n", cfg->shellcode_detector.enabled ? "true" : "false");
   fprintf(fp, "\n[webshell_detector]\n");
@@ -1388,6 +1433,8 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       }
     }
   }
+  edr_detection_apply_profile(&agent->cfg);
+  edr_policy_v2_configure(&agent->cfg);
   edr_self_protect_init();
   edr_agent_derive_forensic_manifest_env(&agent->cfg);
   edr_adaptive_collection_configure(&agent->cfg);
@@ -1492,6 +1539,11 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
 #else
   const int windows_native = 0;
 #endif
+#if defined(_WIN32) || defined(__linux__)
+  const int inventory_native = 1;
+#else
+  const int inventory_native = 0;
+#endif
   int rtq_policy = agent && (agent->cfg.command.allow_rtq_readonly ||
                               agent->cfg.command.allow_dangerous);
   int dangerous_policy = agent && agent->cfg.command.allow_dangerous;
@@ -1525,13 +1577,39 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *velo_runtime = !velo_policy ? "disabled"
                              : edr_deep_collector_is_running() ? "healthy" : "idle";
   EdrAlertGovernorStats alert_stats;
+  char endpoint_policy_capability[2048];
   memset(&alert_stats, 0, sizeof(alert_stats));
   edr_alert_governor_get_stats(&alert_stats);
+  snprintf(endpoint_policy_capability, sizeof(endpoint_policy_capability),
+           "\"endpoint_policy\":{\"schema\":\"edr.endpoint.policy.v2\","
+           "\"category_modes\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":true,\"runtime_status\":\"healthy\"},"
+           "\"impact_block\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+           "\"ransomware_controls\":{\"behavior\":%s,\"mass_write\":%s,\"vss\":%s,\"spread\":%s,\"honey\":%s,\"forensic\":%s},"
+           "\"attack_surface_collectors\":{\"listeners\":%s,\"public_service\":%s,\"local_admins\":%s,\"services\":%s,\"shares\":%s,\"browser\":%s,\"software\":%s,\"defender\":%s,\"egress\":%s}},",
+           windows_native ? "true" : "false",
+           agent && agent->cfg.policy_v2.impact_mode == EDR_POLICY_MODE_BLOCK ? "true" : "false",
+           windows_native ? "healthy" : "unavailable",
+           agent && agent->cfg.policy_v2.ransomware_behavior ? "true" : "false",
+           agent && agent->cfg.policy_v2.ransomware_mass_write ? "true" : "false",
+           windows_native && agent && agent->cfg.policy_v2.ransomware_vss ? "true" : "false",
+           agent && agent->cfg.policy_v2.ransomware_spread ? "true" : "false",
+           agent && agent->cfg.policy_v2.ransomware_honey ? "true" : "false",
+           agent && agent->cfg.policy_v2.ransomware_forensic ? "true" : "false",
+           agent && agent->cfg.attack_surface.listeners_enabled ? "true" : "false",
+           agent && agent->cfg.attack_surface.public_service_enabled ? "true" : "false",
+           inventory_native && agent && agent->cfg.attack_surface.local_admins_enabled ? "true" : "false",
+           inventory_native && agent && agent->cfg.attack_surface.services_enabled ? "true" : "false",
+           inventory_native && agent && agent->cfg.attack_surface.shares_enabled ? "true" : "false",
+           windows_native && agent && agent->cfg.attack_surface.browser_enabled ? "true" : "false",
+           windows_native && agent && agent->cfg.attack_surface.software_enabled ? "true" : "false",
+           windows_native && agent && agent->cfg.attack_surface.defender_enabled ? "true" : "false",
+           agent && agent->cfg.attack_surface.egress_enabled ? "true" : "false");
   snprintf(
       out, out_cap,
       "{\"schema\":\"edr.agent.capabilities.v1\",\"platform\":\"%s\","
       "\"telemetry\":{\"alert_governor\":{\"admitted\":%llu,\"suppressed\":%llu,"
       "\"summaries\":%llu,\"critical_bypassed\":%llu}},"
+      "%s"
       "\"features\":{"
       "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
@@ -1558,6 +1636,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       (unsigned long long)alert_stats.suppressed,
       (unsigned long long)alert_stats.summaries,
       (unsigned long long)alert_stats.critical_bypassed,
+      endpoint_policy_capability,
       pcre2_build ? "true" : "false", pcre2_build ? "true" : "false", pcre2_build ? "healthy" : "unavailable",
       yara_build ? "true" : "false", yara_build ? "true" : "false", yara_build ? "healthy" : "unavailable",
       ort_build ? "true" : "false", ort_policy ? "true" : "false", ort_runtime,
@@ -2841,6 +2920,15 @@ static int edr_attack_surface_policy_changed(const EdrConfig *current, const Edr
     return 0;
   }
   return current->attack_surface.enabled != remote->attack_surface.enabled ||
+         current->attack_surface.listeners_enabled != remote->attack_surface.listeners_enabled ||
+         current->attack_surface.public_service_enabled != remote->attack_surface.public_service_enabled ||
+         current->attack_surface.local_admins_enabled != remote->attack_surface.local_admins_enabled ||
+         current->attack_surface.services_enabled != remote->attack_surface.services_enabled ||
+         current->attack_surface.shares_enabled != remote->attack_surface.shares_enabled ||
+         current->attack_surface.browser_enabled != remote->attack_surface.browser_enabled ||
+         current->attack_surface.software_enabled != remote->attack_surface.software_enabled ||
+         current->attack_surface.defender_enabled != remote->attack_surface.defender_enabled ||
+         current->attack_surface.egress_enabled != remote->attack_surface.egress_enabled ||
          current->attack_surface.port_interval_s != remote->attack_surface.port_interval_s ||
          current->attack_surface.conn_interval_s != remote->attack_surface.conn_interval_s ||
          current->attack_surface.service_interval_s != remote->attack_surface.service_interval_s ||
@@ -2883,6 +2971,15 @@ static void edr_agent_apply_attack_surface_policy(EdrConfig *cfg, const EdrConfi
   cfg->attack_surface.high_risk_immediate_ports = ports;
   cfg->attack_surface.high_risk_immediate_ports_count = ports_count;
   cfg->attack_surface.enabled = remote->attack_surface.enabled;
+  cfg->attack_surface.listeners_enabled = remote->attack_surface.listeners_enabled;
+  cfg->attack_surface.public_service_enabled = remote->attack_surface.public_service_enabled;
+  cfg->attack_surface.local_admins_enabled = remote->attack_surface.local_admins_enabled;
+  cfg->attack_surface.services_enabled = remote->attack_surface.services_enabled;
+  cfg->attack_surface.shares_enabled = remote->attack_surface.shares_enabled;
+  cfg->attack_surface.browser_enabled = remote->attack_surface.browser_enabled;
+  cfg->attack_surface.software_enabled = remote->attack_surface.software_enabled;
+  cfg->attack_surface.defender_enabled = remote->attack_surface.defender_enabled;
+  cfg->attack_surface.egress_enabled = remote->attack_surface.egress_enabled;
   cfg->attack_surface.port_interval_s = remote->attack_surface.port_interval_s;
   cfg->attack_surface.conn_interval_s = remote->attack_surface.conn_interval_s;
   cfg->attack_surface.service_interval_s = remote->attack_surface.service_interval_s;
@@ -2933,6 +3030,14 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   if (edr_agent_toml_has_section(tmp, "event_filter")) {
     agent->cfg.event_filter = remote->event_filter;
     edr_agent_apply_event_filter_config(&agent->cfg);
+  }
+  if (edr_agent_toml_has_section(tmp, "detection")) {
+    if (edr_detection_apply_remote_modes(&agent->cfg, remote)) {
+      changed |= EDR_REMOTE_POLICY_DETECTION_CHANGED;
+    }
+  }
+  if (edr_agent_toml_has_section(tmp, "policy_v2")) {
+    (void)edr_policy_v2_apply_remote(&agent->cfg, remote);
   }
   if (edr_agent_toml_has_section(tmp, "upload")) {
     agent->cfg.upload = remote->upload;
@@ -3130,6 +3235,16 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   if ((changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0) {
     edr_agent_restart_collector(agent);
   }
+  if ((changed & EDR_REMOTE_POLICY_DETECTION_CHANGED) != 0) {
+    edr_shellcode_detector_shutdown();
+    if (edr_shellcode_detector_init(&agent->cfg, agent->event_bus) != EDR_OK) {
+      fprintf(stderr, "[config] shellcode detector hot reload failed\n");
+    }
+    edr_webshell_detector_shutdown();
+    if (edr_webshell_detector_init(&agent->cfg, agent->event_bus) != EDR_OK) {
+      fprintf(stderr, "[config] webshell detector hot reload failed\n");
+    }
+  }
   edr_preprocess_apply_config(&agent->cfg);
   edr_resource_init(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
@@ -3171,7 +3286,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
                                              agent->cfg.preprocessing.rules_version,
                                              config_headers.config_hash,
                                              "applied",
-                                             (changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0);
+                                             0);
     fprintf(stderr, "[config] signed remote policy applied sequence=%s hash=%s rollout=%s/%s\n",
             config_headers.sequence[0] ? config_headers.sequence : "0",
             config_headers.config_hash[0] ? config_headers.config_hash : "-",

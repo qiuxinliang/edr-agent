@@ -1,6 +1,7 @@
 #include "edr/behavior_from_slot.h"
 
 #include "edr/command.h"
+#include "edr/policy_v2.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -702,7 +703,12 @@ static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
 }
 
 static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
+  int mass_write_enabled = edr_policy_v2_ransomware_enabled("mass_write");
+  int honey_enabled = edr_policy_v2_ransomware_enabled("honey");
   if (!r || !is_file_activity_event(r->type) || !r->file_path[0]) {
+    return;
+  }
+  if (!mass_write_enabled && !honey_enabled) {
     return;
   }
   if (!file_path_usable_for_ransom(r->file_path)) {
@@ -728,9 +734,12 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   dirname_c(r->file_path, dir, sizeof(dir));
   extension_c(r->file_path, ext, sizeof(ext));
   int ext_changed = has_ci_ascii(r->script_snippet, "ext_changed=1");
-  int canary = is_ransom_canary_path(r->file_path);
+  int canary = honey_enabled && is_ransom_canary_path(r->file_path);
   if (canary) {
     append_record_kv(r, "ransom_canary=1 ransomware_kind=DETERMINISTIC_ENCRYPTION ransomware_severity=4");
+  }
+  if (!mass_write_enabled && !canary) {
+    return;
   }
   if (!canary && ransom_counter_allowlisted(r)) {
     append_record_kv(r, "ransom_counter_allowlisted=1%s", ransom_signer_allowlisted(r) ? " ransom_signer_allowlisted=1" : "");

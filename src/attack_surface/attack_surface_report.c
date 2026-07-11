@@ -685,6 +685,8 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     egTrunc = 0;
   } else {
     asurf_gather_policy_and_egress(cfg, &sp, Eg, EDR_ASURF_EGRESS_OUT_MAX, &nEg, &suspEg, &egTrunc);
+    if (!cfg->attack_surface.egress_enabled) { nEg = 0; suspEg = 0; egTrunc = 0; }
+    if (!cfg->attack_surface.defender_enabled) memset(&sp, 0, sizeof(sp));
   }
 
   EdrAsurfInventorySummary inv;
@@ -693,14 +695,14 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   snprintf(inv_path, sizeof(inv_path), "%s.inv", path);
   FILE *invf = fopen(inv_path, "wb");
   if (invf) {
-    edr_asurf_inventory_write_json(invf, listeners_only, &inv);
+    edr_asurf_inventory_write_json(invf, cfg, listeners_only, &inv);
     fclose(invf);
   }
 
   int pub = 0;
   int webInst = 0;
   for (int i = 0; i < nE; i++) {
-    if (strcmp(E[i].scope, "public") == 0) {
+    if (cfg->attack_surface.public_service_enabled && strcmp(E[i].scope, "public") == 0) {
       pub++;
     }
     if (web_listener_heuristic(&E[i])) {
@@ -727,10 +729,11 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
           "\"serviceCount\":%d,\"autoStartServiceCount\":%d,\"scheduledTaskCount\":%d,"
           "\"enabledScheduledTaskCount\":%d,\"startupItemCount\":%d,\"privilegedAccountCount\":%d,"
           "\"adminGroupMemberCount\":%d,\"shareCount\":%d,\"riskyShareCount\":%d,"
-          "\"persistenceFindingCount\":%d},",
+          "\"persistenceFindingCount\":%d,\"browserExtensionCount\":%d,\"installedSoftwareCount\":%d},",
           nE, pub, webInst, suspEg, inv.service_count, inv.auto_start_service_count, inv.scheduled_task_count,
           inv.enabled_scheduled_task_count, inv.startup_item_count, inv.privileged_account_count,
-          inv.admin_group_member_count, inv.share_count, inv.risky_share_count, inv.persistence_finding_count);
+          inv.admin_group_member_count, inv.share_count, inv.risky_share_count, inv.persistence_finding_count,
+          inv.browser_extension_count, inv.installed_software_count);
 
   fprintf(f, "\"listeners\":{\"items\":[");
   for (int i = 0; i < nE; i++) {
@@ -862,7 +865,7 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     (void)remove(inv_path);
     fprintf(f, ",");
   } else {
-    edr_asurf_inventory_write_json(f, listeners_only, &inv);
+    edr_asurf_inventory_write_json(f, cfg, listeners_only, &inv);
     fprintf(f, ",");
   }
 
@@ -988,7 +991,8 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
 
   AsListener L[EDR_ASURF_LISTENERS_MAX];
   int truncated = 0;
-  int nL = collect_listeners_platform(L, EDR_ASURF_LISTENERS_MAX, &truncated);
+  int nL = (cfg->attack_surface.listeners_enabled || cfg->attack_surface.public_service_enabled)
+             ? collect_listeners_platform(L, EDR_ASURF_LISTENERS_MAX, &truncated) : 0;
   int listeners_only = asurf_listeners_only_mode(command_id);
 
   char jsonpath[512];

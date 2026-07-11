@@ -58,6 +58,18 @@ add_test(NAME attack_surface_command_ingest_contract COMMAND test_attack_surface
 set_tests_properties(attack_surface_command_ingest_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_attack_surface_inventory_policy
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_inventory_policy.c
+  ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_inventory.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_attack_surface_inventory_policy PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(WIN32)
+  target_link_libraries(test_attack_surface_inventory_policy PRIVATE netapi32 advapi32)
+endif()
+edr_apply_common_warnings(test_attack_surface_inventory_policy)
+add_test(NAME attack_surface_inventory_policy COMMAND test_attack_surface_inventory_policy)
+
 add_executable(test_control_stream_lease_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_control_stream_lease_contract.c)
 edr_apply_common_warnings(test_control_stream_lease_contract)
 add_test(NAME control_stream_lease_contract COMMAND test_control_stream_lease_contract
@@ -112,6 +124,7 @@ set(_edr_test_ave_sdk_sources
 set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
   ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
@@ -206,17 +219,28 @@ target_link_libraries(test_ave_suppression PRIVATE edr_ave_test_common)
 
 add_executable(test_detection_decision ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_detection_decision PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_decision)
 add_test(NAME detection_decision_combo COMMAND test_detection_decision WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_detection_regression ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_regression.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_detection_regression PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_regression)
 add_test(NAME detection_regression_scenarios COMMAND test_detection_regression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_detection_profile_trigger
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_profile_trigger.c
+  ${CMAKE_SOURCE_DIR}/src/detection/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/detection_trigger.c)
+target_include_directories(test_detection_profile_trigger PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_detection_profile_trigger)
+add_test(NAME detection_profile_and_trigger_modes COMMAND test_detection_profile_trigger
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_webshell_semantic ${CMAKE_CURRENT_SOURCE_DIR}/test_webshell_semantic.c ${CMAKE_SOURCE_DIR}/src/webshell_detector/webshell_semantic.c)
 target_include_directories(test_webshell_semantic PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -228,6 +252,7 @@ add_executable(test_detection_sensor_bridge ${CMAKE_CURRENT_SOURCE_DIR}/test_det
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c)
 target_include_directories(test_detection_sensor_bridge PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_sensor_bridge)
@@ -337,7 +362,8 @@ add_executable(test_ave_cross_engine_feed_quality
   ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_cross_engine_feed_quality.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_feed.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c)
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_ave_cross_engine_feed_quality PRIVATE ${CMAKE_SOURCE_DIR}/include)
 if(NOT WIN32)
   target_link_libraries(test_ave_cross_engine_parse PRIVATE m)
@@ -707,7 +733,8 @@ add_test(NAME self_protect_heartbeat COMMAND test_self_protect_heartbeat WORKING
 add_executable(test_alert_governor_cardinality
   ${CMAKE_CURRENT_SOURCE_DIR}/test_alert_governor_cardinality.c
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
-  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c)
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_alert_governor_cardinality PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(test_alert_governor_cardinality PRIVATE EDR_HAVE_NANOPB=1)
 if(UNIX AND NOT WIN32)
@@ -716,6 +743,13 @@ endif()
 edr_apply_common_warnings(test_alert_governor_cardinality)
 add_test(NAME alert_cardinality_release_gate COMMAND test_alert_governor_cardinality WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(alert_cardinality_release_gate PROPERTIES LABELS "release-gate")
+
+add_executable(test_policy_v2
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_policy_v2.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
+target_include_directories(test_policy_v2 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_policy_v2)
+add_test(NAME endpoint_policy_v2_modes COMMAND test_policy_v2 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_forensic_result_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_result_contract.c

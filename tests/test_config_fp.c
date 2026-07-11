@@ -56,6 +56,65 @@ static void test_command_forensic_yara_rules_dir(void) {
   assert(strcmp(cfg.command.forensic_yara_rules_dir, "rules/forensic") == 0);
 }
 
+static void test_remote_detection_modes_parse(void) {
+  const char *fn = "edr_test_cfg_detection.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[detection]\n"
+          "auto_profile = false\n"
+          "shellcode_mode = 1\n"
+          "webshell_mode = -1\n"
+          "pmfe_mode = 2\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(!cfg.detection.auto_profile);
+  assert(cfg.detection.shellcode_mode == 1);
+  assert(cfg.detection.webshell_mode == -1);
+  assert(cfg.detection.pmfe_mode == 2);
+}
+
+static void test_policy_v2_and_attack_surface_parse(void) {
+  const char *fn = "edr_test_cfg_policy_v2.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[policy_v2]\n"
+          "credential_mode = \"observe\"\n"
+          "impact_mode = \"block\"\n"
+          "ransomware_honey = false\n"
+          "ransomware_forensic = false\n\n"
+          "[attack_surface]\n"
+          "listeners_enabled = false\n"
+          "public_service_enabled = true\n"
+          "browser_enabled = true\n"
+          "software_enabled = true\n"
+          "egress_enabled = false\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(cfg.policy_v2.credential_mode == 1);
+  assert(cfg.policy_v2.impact_mode == 3);
+  assert(!cfg.policy_v2.ransomware_honey);
+  assert(!cfg.policy_v2.ransomware_forensic);
+  assert(!cfg.attack_surface.listeners_enabled);
+  assert(cfg.attack_surface.public_service_enabled);
+  assert(cfg.attack_surface.browser_enabled);
+  assert(cfg.attack_surface.software_enabled);
+  assert(!cfg.attack_surface.egress_enabled);
+}
+
 static void test_detection_policy_conditional_suppression(void) {
   const char *fn = "edr_test_cfg_supp.toml";
   FILE *f = fopen(fn, "wb");
@@ -108,6 +167,8 @@ int main(void) {
   test_detection_policy_fp_feedback_maps_to_env();
   test_detection_policy_conditional_suppression();
   test_command_forensic_yara_rules_dir();
+  test_remote_detection_modes_parse();
+  test_policy_v2_and_attack_surface_parse();
   puts("config_fp ok");
   return 0;
 }

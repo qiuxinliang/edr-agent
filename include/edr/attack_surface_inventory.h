@@ -2,6 +2,7 @@
 #define EDR_ATTACK_SURFACE_INVENTORY_H
 
 #include <stdio.h>
+#include "edr/config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,12 +19,15 @@ typedef struct {
   int share_count;
   int risky_share_count;
   int persistence_finding_count;
+  int browser_extension_count;
+  int installed_software_count;
 } EdrAsurfInventorySummary;
 
 /* P2 attack-surface inventory dimensions. Emits JSON object members:
- * services, scheduledTasks, startupItems, localAccounts, localGroups, shares.
+ * services, scheduledTasks, startupItems, localAccounts, localGroups, shares,
+ * browserExtensions and installedSoftware.
  * listeners_only keeps the schema present but avoids expensive persistence/account scans. */
-void edr_asurf_inventory_write_json(FILE *f, int listeners_only, EdrAsurfInventorySummary *summary);
+void edr_asurf_inventory_write_json(FILE *f, const EdrConfig *cfg, int listeners_only, EdrAsurfInventorySummary *summary);
 
 #ifdef __cplusplus
 }
