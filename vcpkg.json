@@ -11,7 +11,8 @@
     },
     "openssl",
     "pcre2",
-    "sqlite3"
+    "sqlite3",
+    "zstd"
   ],
   "features": {
     "sqlite": {

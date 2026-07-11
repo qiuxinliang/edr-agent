@@ -1,6 +1,9 @@
 #include "edr/ingest_http.h"
 
 #include "edr/command.h"
+#include "edr/command_executor.h"
+#include "edr/command_state.h"
+#include "edr/command_util.h"
 #include "edr/event_batch.h"
 #include "edr/preprocess.h"
 #include "edr/transport_v2.h"
@@ -13,6 +16,9 @@
 #include <string.h>
 #include <time.h>
 
+static int json_get_bool(const char *obj, const char *key, int *out);
+static void control_ack_refresh_pending_runtime(void);
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (void)pct; }
 #endif
@@ -20,10 +26,10 @@ __attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (vo
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
-#include <winreg.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winreg.h>
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -135,10 +141,20 @@ static unsigned long s_long_poll_fail;
 static unsigned long s_control_stream_ok;
 static unsigned long s_control_stream_fail;
 static unsigned long s_control_stream_heartbeat;
+static unsigned long s_control_stream_lease_expired;
+static volatile int64_t s_control_stream_last_activity_ms;
 static unsigned long s_control_ack_ok;
 static unsigned long s_control_ack_fail;
+static unsigned long s_control_ack_retry_attempt;
+static unsigned long s_control_ack_retry_ok;
+static unsigned long s_control_ack_retry_fail;
+static unsigned long s_control_ack_outbox_persist_fail;
+static unsigned long s_control_ack_pending;
 static int64_t s_last_command_ack_ms;
+static int64_t s_last_command_ack_failure_ms;
+static int64_t s_next_control_ack_retry_ms;
 static char s_last_command_ack_id[160];
+static char s_last_command_ack_failure_id[160];
 static unsigned long s_http2_request_ok;
 static unsigned long s_http2_request_fail;
 static unsigned long s_http2_negotiated_count;
@@ -760,14 +776,50 @@ static void note_control_stream_heartbeat(void) {
   s_control_stream_heartbeat++;
 }
 
+static int64_t control_stream_lease_ms(void) {
+  return (int64_t)env_ul_clamped("EDR_CONTROL_STREAM_LEASE_MS", 90000ul, 10000ul, 3600000ul);
+}
+
+static void note_control_stream_activity(void) {
+  s_control_stream_last_activity_ms = unix_ms_now();
+  if (s_stream_verified && !s_stream_ready) {
+    s_stream_ready = 1;
+    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connected");
+    fprintf(stderr, "[ingest-stream] control stream lease restored endpoint=%s\n", s_endpoint);
+  }
+}
+
+static int control_stream_ready_lease_valid(void) {
+  if (!s_stream_ready) {
+    return 0;
+  }
+  int64_t now = unix_ms_now();
+  int64_t last = s_control_stream_last_activity_ms;
+  int64_t lease_ms = control_stream_lease_ms();
+  if (last > 0 && now >= last && now - last <= lease_ms) {
+    return 1;
+  }
+  s_stream_ready = 0;
+  s_control_stream_lease_expired++;
+  snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "lease_expired");
+  fprintf(stderr,
+          "[ingest-stream] control stream lease expired endpoint=%s last_activity=%lld lease_ms=%lld; "
+          "long-poll fallback may resume\n",
+          s_endpoint, (long long)last, (long long)lease_ms);
+  return 0;
+}
+
 static void note_control_ack_success(const char *command_id) {
   s_control_ack_ok++;
   s_last_command_ack_ms = unix_ms_now();
   snprintf(s_last_command_ack_id, sizeof(s_last_command_ack_id), "%s", command_id ? command_id : "");
 }
 
-static void note_control_ack_failure(void) {
+static void note_control_ack_failure(const char *command_id) {
   s_control_ack_fail++;
+  s_last_command_ack_failure_ms = unix_ms_now();
+  snprintf(s_last_command_ack_failure_id, sizeof(s_last_command_ack_failure_id), "%s",
+           command_id ? command_id : "");
 }
 
 static void log_native_post_failure(const char *label, int rc) {
@@ -1171,18 +1223,22 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   if (!out) {
     return;
   }
+  int stream_lease_valid = control_stream_ready_lease_valid();
+  int64_t stream_last_activity_ms = s_control_stream_last_activity_ms;
+  control_ack_refresh_pending_runtime();
   memset(out, 0, sizeof(*out));
   out->configured = edr_ingest_http_configured();
   out->http_fallback_available = out->configured;
   out->insecure_http = s_insecure_http;
   out->mtls_configured = (schannel_store_mtls_configured() ||
                           (s_client_cert_file[0] && s_client_key_file[0])) ? 1 : 0;
-  out->websocket_ready = (s_ws_ready || s_stream_ready) ? 1 : 0;
+  out->websocket_ready = (s_ws_ready || stream_lease_valid) ? 1 : 0;
   out->http2_enabled = http2_client_enabled();
   out->http2_required = http2_required();
   out->http2_negotiated = s_http2_negotiated ? 1 : 0;
   out->control_stream_enabled = s_control_stream_enabled_cfg;
-  out->control_stream_ready = s_stream_ready ? 1 : 0;
+  out->control_stream_ready = stream_lease_valid;
+  out->control_stream_lease_valid = stream_lease_valid;
   out->long_poll_fallback = s_long_poll_fallback_cfg;
   out->report_events_v2_enabled = s_report_events_v2_enabled_cfg;
   out->zstd_requested = strcmp(s_data_plane_compression, "zstd") == 0 || s_control_zstd;
@@ -1219,10 +1275,23 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->control_stream_ok_count = s_control_stream_ok;
   out->control_stream_fail_count = s_control_stream_fail;
   out->control_stream_heartbeat_count = s_control_stream_heartbeat;
+  out->control_stream_lease_expired_count = s_control_stream_lease_expired;
+  out->control_stream_last_activity_unix_ms = stream_last_activity_ms;
+  out->control_stream_lease_deadline_unix_ms =
+      stream_last_activity_ms > 0 ? stream_last_activity_ms + control_stream_lease_ms() : 0;
   out->control_ack_ok_count = s_control_ack_ok;
   out->control_ack_fail_count = s_control_ack_fail;
+  out->control_ack_retry_attempt_count = s_control_ack_retry_attempt;
+  out->control_ack_retry_ok_count = s_control_ack_retry_ok;
+  out->control_ack_retry_fail_count = s_control_ack_retry_fail;
+  out->control_ack_outbox_persist_fail_count = s_control_ack_outbox_persist_fail;
+  out->control_ack_pending_count = s_control_ack_pending;
   out->last_command_ack_unix_ms = s_last_command_ack_ms;
+  out->last_command_ack_failure_unix_ms = s_last_command_ack_failure_ms;
+  out->next_control_ack_retry_unix_ms = s_next_control_ack_retry_ms;
   snprintf(out->last_command_ack_id, sizeof(out->last_command_ack_id), "%s", s_last_command_ack_id);
+  snprintf(out->last_command_ack_failure_id, sizeof(out->last_command_ack_failure_id), "%s",
+           s_last_command_ack_failure_id);
   out->http2_request_ok_count = s_http2_request_ok;
   out->http2_request_fail_count = s_http2_request_fail;
   out->http2_negotiated_count = s_http2_negotiated_count;
@@ -4913,7 +4982,9 @@ static void stream_process_line(const char *line) {
   }
   if (strstr(line, "\"type\":\"command_envelope\"") || strstr(line, "\"command_id\"")) {
     edr_transport_v2_on_control("command_envelope");
-    (void)poll_dispatch_one(line);
+    if (poll_dispatch_one(line) == 0) {
+      note_control_stream_activity();
+    }
   } else if (strstr(line, "\"type\":\"server_hello\"")) {
     int64_t batch_events = 0;
     int64_t flush_s = 0;
@@ -4947,6 +5018,7 @@ static void stream_process_line(const char *line) {
       route_note_success();
       fprintf(stderr, "[ingest-stream] control stream verified endpoint=%s\n", s_endpoint);
     }
+    note_control_stream_activity();
     s_control_hello_ok = 1;
     edr_ingest_http_apply_telemetry_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
                                             s_control_h2, s_control_zstd, s_control_qos_dscp,
@@ -4955,6 +5027,7 @@ static void stream_process_line(const char *line) {
     edr_transport_v2_on_control("server_hello");
   } else if (strstr(line, "\"type\":\"heartbeat\"")) {
     note_control_stream_heartbeat();
+    note_control_stream_activity();
     edr_transport_v2_on_control("heartbeat");
   }
 }
@@ -5444,10 +5517,63 @@ int edr_ingest_http_post_command_result(const char *command_id,
                                                    detail_utf8);
 }
 
+static uint32_t control_ack_retry_delay_ms(uint32_t attempts) {
+  uint64_t delay = env_ul_clamped("EDR_CONTROL_ACK_RETRY_BASE_MS", 5000ul, 1000ul, 60000ul);
+  uint64_t cap = env_ul_clamped("EDR_CONTROL_ACK_RETRY_MAX_MS", 300000ul, 5000ul, 3600000ul);
+  for (uint32_t i = 1u; i < attempts && delay < cap; i++) {
+    delay *= 2u;
+    if (delay > cap) {
+      delay = cap;
+    }
+  }
+  return (uint32_t)delay;
+}
+
+static void control_ack_refresh_pending_runtime(void) {
+  EdrControlAckRecord records[64];
+  memset(records, 0, sizeof(records));
+  int n = edr_command_state_collect_pending_acks(records, sizeof(records) / sizeof(records[0]));
+  s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
+  s_next_control_ack_retry_ms = 0;
+  for (int i = 0; i < n; i++) {
+    if (s_next_control_ack_retry_ms == 0 ||
+        records[i].next_retry_unix_ms < s_next_control_ack_retry_ms) {
+      s_next_control_ack_retry_ms = records[i].next_retry_unix_ms;
+    }
+  }
+}
+
+static void control_ack_schedule_retry(const char *command_id, const char *transport, int64_t last_seq,
+                                       uint32_t attempts, int64_t first_failure_unix_ms) {
+  int64_t now = unix_ms_now();
+  EdrControlAckRecord record;
+  memset(&record, 0, sizeof(record));
+  snprintf(record.command_id, sizeof(record.command_id), "%s", command_id ? command_id : "");
+  snprintf(record.transport, sizeof(record.transport), "%s",
+           (transport && transport[0]) ? transport : "https_control");
+  record.last_seq = last_seq;
+  record.attempts = attempts ? attempts : 1u;
+  record.first_failure_unix_ms = first_failure_unix_ms > 0 ? first_failure_unix_ms : now;
+  record.last_failure_unix_ms = now;
+  record.next_retry_unix_ms = now + (int64_t)control_ack_retry_delay_ms(record.attempts);
+  if (edr_command_state_upsert_pending_ack(&record) == 0) {
+    control_ack_refresh_pending_runtime();
+    char audit[256];
+    snprintf(audit, sizeof(audit),
+             "control ACK failed; queued durable retry attempt=%u next_retry_unix_ms=%lld",
+             (unsigned)record.attempts, (long long)record.next_retry_unix_ms);
+    edr_command_audit_both(record.command_id, audit);
+    return;
+  }
+  s_control_ack_outbox_persist_fail++;
+  edr_command_audit_both(command_id, "control ACK failed and durable ACK retry record could not be persisted");
+}
+
 static int edr_ingest_http_post_control_ack(const char *command_id, const char *transport, int64_t last_seq) {
   char *cmd = NULL;
   char *tr = NULL;
   char *body = NULL;
+  char response[512];
   size_t body_cap;
   int rc;
   if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
@@ -5471,14 +5597,25 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
            "{\"endpoint_id\":\"%s\",\"command_id\":\"%s\",\"status\":\"received\","
            "\"transport\":\"%s\",\"last_seq\":%lld}",
            s_endpoint, cmd, tr, (long long)last_seq);
-  rc = request_to_suffix("POST", "ingest/control/ack", "application/json", body, strlen(body), NULL, 0u);
+  response[0] = '\0';
+  rc = request_to_suffix("POST", "ingest/control/ack", "application/json", body, strlen(body),
+                         response, sizeof(response));
+  if (rc == 0) {
+    int acked = 0;
+    if (json_get_bool(response, "acked", &acked) != 0 || !acked) {
+      rc = -1;
+      runtime_failure("control ack response was not accepted");
+    }
+  }
   if (rc == 0) {
     note_http_request_success();
     note_control_ack_success(command_id);
     edr_transport_v2_ack(command_id, 1);
+    edr_command_state_delete_pending_ack(command_id);
+    control_ack_refresh_pending_runtime();
   } else {
     note_http_request_failure();
-    note_control_ack_failure();
+    note_control_ack_failure(command_id);
     edr_transport_v2_ack(command_id, 0);
     if (!s_last_error[0]) {
       runtime_failure("control ack http post failed");
@@ -5488,6 +5625,44 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
   free(tr);
   free(body);
   return rc;
+}
+
+void edr_ingest_http_retry_pending_control_acks(void) {
+  EdrControlAckRecord records[16];
+  memset(records, 0, sizeof(records));
+  int n = edr_command_state_collect_pending_acks(records, sizeof(records) / sizeof(records[0]));
+  s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
+  s_next_control_ack_retry_ms = 0;
+  if (n <= 0 || !edr_ingest_http_configured()) {
+    return;
+  }
+  int64_t now = unix_ms_now();
+  unsigned long max_attempts = env_ul_clamped("EDR_CONTROL_ACK_RETRY_PER_CYCLE", 4ul, 1ul, 16ul);
+  unsigned long attempted = 0ul;
+  for (int i = 0; i < n; i++) {
+    if (records[i].next_retry_unix_ms > now) {
+      if (s_next_control_ack_retry_ms == 0 ||
+          records[i].next_retry_unix_ms < s_next_control_ack_retry_ms) {
+        s_next_control_ack_retry_ms = records[i].next_retry_unix_ms;
+      }
+      continue;
+    }
+    if (attempted >= max_attempts) {
+      break;
+    }
+    attempted++;
+    s_control_ack_retry_attempt++;
+    if (edr_ingest_http_post_control_ack(records[i].command_id, records[i].transport,
+                                         records[i].last_seq) == 0) {
+      s_control_ack_retry_ok++;
+      edr_command_audit_both(records[i].command_id, "control ACK retry accepted by server");
+      continue;
+    }
+    s_control_ack_retry_fail++;
+    control_ack_schedule_retry(records[i].command_id, records[i].transport, records[i].last_seq,
+                               records[i].attempts + 1u, records[i].first_failure_unix_ms);
+  }
+  control_ack_refresh_pending_runtime();
 }
 
 static const char *base_name_ptr(const char *path) {
@@ -5922,7 +6097,8 @@ static int poll_dispatch_one(const char *obj) {
     seq = sm.issued_at_unix_ms;
   }
   if (json_get_string(obj, "transport", transport, sizeof(transport)) != 0 || !transport[0]) {
-    snprintf(transport, sizeof(transport), "%s", s_stream_ready ? "https_control_stream" : "https_long_poll");
+    snprintf(transport, sizeof(transport), "%s",
+             control_stream_ready_lease_valid() ? "https_control_stream" : "https_long_poll");
   }
   if (json_get_int64(obj, "deadline_ms", &v) == 0 && v > 0 && v <= 0xffffffffLL) {
     sm.deadline_ms = (uint32_t)v;
@@ -5933,9 +6109,11 @@ static int poll_dispatch_one(const char *obj) {
     free(payload);
     return -1;
   }
-  (void)edr_ingest_http_post_control_ack(command_id, transport, seq);
+  if (edr_ingest_http_post_control_ack(command_id, transport, seq) != 0) {
+    control_ack_schedule_retry(command_id, transport, seq, 1u, 0);
+  }
   if (should_execute > 0) {
-    edr_command_execute_persisted_envelope(command_id, command_type, payload, payload_len, &sm);
+    edr_command_executor_wake();
   }
   free(payload_b64);
   free(payload);
@@ -6250,7 +6428,7 @@ static void *control_ws_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
-    if (s_stream_ready || s_ws_ready) {
+    if (control_stream_ready_lease_valid() || s_ws_ready) {
       sleep_poll_ms(5000);
       continue;
     }
@@ -6476,7 +6654,7 @@ static void *command_poll_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
-    if (s_stream_ready || s_ws_ready) {
+    if (control_stream_ready_lease_valid() || s_ws_ready) {
       s_poll_backoff_ms = 0;
       sleep_poll_ms(5000);
       continue;

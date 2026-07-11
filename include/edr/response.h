@@ -10,22 +10,10 @@
 extern "C" {
 #endif
 
-void edr_response_kill(const char *cmd_id, const uint8_t *pl, size_t len,
-                       const EdrSoarCommandMeta *sm);
-
 /* 主机隔离/恢复已统一到 command_stub.c 的 do_isolate / do_restore_host(真实 OS 网络隔离)。
  * 旧的 stamp-only edr_response_isolate / _restore_host / _isolate_auto_from_shellcode 已删除。 */
-
-void edr_response_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                                  const EdrSoarCommandMeta *sm);
-void edr_response_restore_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                               const EdrSoarCommandMeta *sm);
-void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                           const EdrSoarCommandMeta *sm);
 void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len,
                            const EdrSoarCommandMeta *sm);
-void edr_response_remove_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                              const EdrSoarCommandMeta *sm);
 
 void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                    const EdrSoarCommandMeta *sm);
@@ -60,14 +48,6 @@ void edr_response_forensic_async_abort_shutdown(void);
 /* 是否有采集在运行(busy 查询)。 */
 int edr_response_forensic_async_active(void);
 
-void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
-                             const EdrSoarCommandMeta *sm);
-void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
-                              const EdrSoarCommandMeta *sm);
-void edr_response_shell_close(const char *cmd_id, const uint8_t *pl, size_t len,
-                              const EdrSoarCommandMeta *sm);
-void edr_shell_stream_output_cb(const char *sid, const char *data, size_t len,
-                                int exit_code, bool closed, void *user);
 void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm);
 void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len,
@@ -84,8 +64,6 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
 void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm);
-void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t len,
-                                  const EdrSoarCommandMeta *sm);
 
 #ifdef __cplusplus
 }

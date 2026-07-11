@@ -18,9 +18,10 @@
 #include <time.h>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
+#include <sddl.h>
 #else
 #include <dirent.h>
 #include <sys/file.h>
@@ -32,6 +33,9 @@ typedef struct EdrCommandStateFileInfo {
   long size;
   long mtime;
 } EdrCommandStateFileInfo;
+
+static EdrCommandStateQuarantineStats s_quarantine_stats;
+static unsigned long s_quarantine_serial;
 
 static EdrCommandStateFileInfo s_collect_cache_info;
 static int s_collect_cache_pending_zero;
@@ -63,6 +67,38 @@ static int64_t command_running_ttl_ms(const EdrSoarCommandMeta *meta) {
 
 #ifdef _WIN32
 static void state_ensure_parent_dir(const char *path);
+
+static int state_windows_validate_existing(const char *path, int want_dir) {
+  if (!path || !path[0]) {
+    return -1;
+  }
+  DWORD attributes = GetFileAttributesA(path);
+  if (attributes == INVALID_FILE_ATTRIBUTES ||
+      (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u) {
+    return -1;
+  }
+  if ((((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0u) ? 1 : 0) != want_dir) {
+    return -1;
+  }
+  return 0;
+}
+
+static int state_windows_secure_existing(const char *path, int want_dir) {
+  if (state_windows_validate_existing(path, want_dir) != 0) {
+    return -1;
+  }
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+          "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)", SDDL_REVISION_1,
+          &descriptor, NULL)) {
+    return -1;
+  }
+  BOOL ok = SetFileSecurityA(path,
+                             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                             descriptor);
+  LocalFree(descriptor);
+  return ok ? 0 : -1;
+}
 #endif
 
 static long state_env_long_clamped(const char *name, long defv, long minv, long maxv) {
@@ -279,25 +315,58 @@ static FILE *state_open_new_secure(const char *path) {
 }
 #else
 static FILE *state_open_read_secure(const char *path, struct stat *out_st) {
-  if (out_st) {
-    memset(out_st, 0, sizeof(*out_st));
+  if (state_windows_secure_existing(path, 0) != 0) {
+    return NULL;
   }
-  return fopen(path, "rb");
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return NULL;
+  }
+  if (out_st && fstat(_fileno(f), out_st) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  return f;
 }
 
 static FILE *state_open_append_secure(const char *path) {
   state_ensure_parent_dir(path);
-  return fopen(path, "ab");
+  FILE *f = fopen(path, "ab");
+  if (!f || state_windows_secure_existing(path, 0) != 0) {
+    if (f) {
+      fclose(f);
+    }
+    return NULL;
+  }
+  return f;
 }
 
 static FILE *state_open_lock_secure(const char *path) {
   state_ensure_parent_dir(path);
-  return fopen(path, "a+b");
+  FILE *f = fopen(path, "a+b");
+  if (!f || state_windows_secure_existing(path, 0) != 0) {
+    if (f) {
+      fclose(f);
+    }
+    return NULL;
+  }
+  return f;
 }
 
 static FILE *state_open_new_secure(const char *path) {
   state_ensure_parent_dir(path);
-  return fopen(path, "wb");
+  if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+    return NULL;
+  }
+  FILE *f = fopen(path, "wb");
+  if (!f || state_windows_secure_existing(path, 0) != 0) {
+    if (f) {
+      fclose(f);
+    }
+    (void)DeleteFileA(path);
+    return NULL;
+  }
+  return f;
 }
 #endif
 
@@ -324,7 +393,7 @@ static int state_replace_file(const char *tmp_path, const char *dst_path) {
   }
 #ifdef _WIN32
   if (MoveFileExA(tmp_path, dst_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    return 0;
+    return state_windows_secure_existing(dst_path, 0);
   }
   (void)DeleteFileA(tmp_path);
   return -1;
@@ -423,7 +492,7 @@ static int state_mkdir_one(const char *path) {
   }
 #ifdef _WIN32
   if (CreateDirectoryA(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
-    return 0;
+    return state_windows_validate_existing(path, 1);
   }
 #else
   if (mkdir(path, 0700) == 0) {
@@ -523,9 +592,11 @@ static int state_prepare_parent_dir(const char *path) {
   }
   if (strcmp(dir, ".") != 0 && strcmp(dir, "/") != 0) {
     state_ensure_dir(dir);
+  } else {
+    return 0;
   }
 #ifdef _WIN32
-  return 0;
+  return state_windows_secure_existing(dir, 1);
 #else
   return state_dir_private_existing(dir);
 #endif
@@ -537,7 +608,7 @@ static int state_prepare_dir(const char *path) {
   }
   state_ensure_dir(path);
 #ifdef _WIN32
-  return 0;
+  return state_windows_secure_existing(path, 1);
 #else
   return state_dir_private_existing(path);
 #endif
@@ -865,10 +936,58 @@ static int command_inbox_record_path(const char *command_id, char *out, size_t c
   return out[0] ? 0 : -1;
 }
 
+static void control_ack_default_dir(char *out, size_t cap) {
+  const char *p = getenv("EDR_COMMAND_ACK_DIR");
+  if (p && p[0]) {
+    snprintf(out, cap, "%s", p);
+    return;
+  }
+  const char *dir = getenv("EDR_COMMAND_STATE_DIR");
+  if (dir && dir[0]) {
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\command_ack", dir);
+#else
+    snprintf(out, cap, "%s/command_ack", dir);
+#endif
+    return;
+  }
+#ifdef _WIN32
+  snprintf(out, cap, "%s", "C:\\Program Files\\FDSecurity\\state\\command_ack");
+#elif defined(__APPLE__)
+  snprintf(out, cap, "%s", "/Library/Application Support/FDSecurity/state/command_ack");
+#else
+  snprintf(out, cap, "%s", "/var/lib/fdsecurity/edr/state/command_ack");
+#endif
+}
+
+static int control_ack_record_path(const char *command_id, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return -1;
+  }
+  char dir[1024];
+  char safe[128];
+  control_ack_default_dir(dir, sizeof(dir));
+  command_inbox_safe_name(command_id, safe, sizeof(safe));
+  char sep = '/';
+#ifdef _WIN32
+  sep = '\\';
+#endif
+  size_t len = strlen(dir);
+  if (len > 0u && (dir[len - 1u] == '/' || dir[len - 1u] == '\\')) {
+    snprintf(out, cap, "%s%s.json", dir, safe);
+  } else {
+    snprintf(out, cap, "%s%c%s.json", dir, sep, safe);
+  }
+  return out[0] ? 0 : -1;
+}
+
 static int command_state_has_final(const char *command_id, const EdrSoarCommandMeta *meta) {
   char path[1024];
   state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return 0;
+  }
   FILE *f = state_open_read_secure(path, NULL);
   if (!f) {
     state_lock_release(lock);
@@ -907,6 +1026,282 @@ static int command_inbox_delete_path(const char *path) {
 #else
   return remove(path);
 #endif
+}
+
+static void state_quarantine_audit(const char *kind, const char *path, const char *reason, int moved) {
+  fprintf(stderr, "[command][quarantine] kind=%s moved=%d path=%s reason=%s\n",
+          kind ? kind : "unknown", moved, path ? path : "", reason ? reason : "unknown");
+  const char *audit_path = getenv("EDR_CMD_AUDIT_PATH");
+  if (!audit_path || !audit_path[0]) {
+    return;
+  }
+  FILE *f = fopen(audit_path, "a");
+  if (!f) {
+    return;
+  }
+  fprintf(f, "%lld command_state_quarantine kind=%s moved=%d path=%s reason=%s\n",
+          (long long)state_now_ms(), kind ? kind : "unknown", moved,
+          path ? path : "", reason ? reason : "unknown");
+  fclose(f);
+}
+
+static void state_quarantine_note(const char *kind, const char *reason, int moved) {
+  s_quarantine_stats.last_quarantine_unix_ms = state_now_ms();
+  snprintf(s_quarantine_stats.last_record_kind, sizeof(s_quarantine_stats.last_record_kind), "%s",
+           kind ? kind : "unknown");
+  snprintf(s_quarantine_stats.last_reason, sizeof(s_quarantine_stats.last_reason), "%s",
+           reason ? reason : "unknown");
+  if (!moved) {
+    s_quarantine_stats.move_failure_count++;
+  } else if (kind && strcmp(kind, "control_ack") == 0) {
+    s_quarantine_stats.ack_record_count++;
+  } else {
+    s_quarantine_stats.inbox_record_count++;
+  }
+}
+
+static int state_move_to_quarantine(const char *dir, const char *path, const char *kind,
+                                    const char *reason) {
+  if (!dir || !dir[0] || !path || !path[0]) {
+    return -1;
+  }
+  char qdir[1200];
+  char base[256];
+  char safe[256];
+  char dst[1500];
+  const char *name = strrchr(path, '/');
+  const char *win_name = strrchr(path, '\\');
+  if (!name || (win_name && win_name > name)) {
+    name = win_name;
+  }
+  name = name ? name + 1 : path;
+  snprintf(base, sizeof(base), "%s", name);
+  command_inbox_safe_name(base, safe, sizeof(safe));
+#ifdef _WIN32
+  snprintf(qdir, sizeof(qdir), "%s\\quarantine", dir);
+#else
+  snprintf(qdir, sizeof(qdir), "%s/quarantine", dir);
+#endif
+  if (state_prepare_dir(qdir) != 0) {
+    state_quarantine_note(kind, reason, 0);
+    state_quarantine_audit(kind, path, reason, 0);
+    return -1;
+  }
+  unsigned long serial = ++s_quarantine_serial;
+#ifdef _WIN32
+  snprintf(dst, sizeof(dst), "%s\\%s.bad.%lld.%lu.json", qdir, safe,
+           (long long)state_now_ms(), serial);
+  int moved = MoveFileExA(path, dst, MOVEFILE_WRITE_THROUGH) ? 1 : 0;
+#else
+  snprintf(dst, sizeof(dst), "%s/%s.bad.%lld.%lu.json", qdir, safe,
+           (long long)state_now_ms(), serial);
+  int moved = rename(path, dst) == 0 ? 1 : 0;
+#endif
+  state_quarantine_note(kind, reason, moved);
+  state_quarantine_audit(kind, path, reason, moved);
+  return moved ? 0 : -1;
+}
+
+void edr_command_state_get_quarantine_stats(EdrCommandStateQuarantineStats *out_stats) {
+  if (out_stats) {
+    *out_stats = s_quarantine_stats;
+  }
+}
+
+static int control_ack_read_file(const char *path, EdrControlAckRecord *out) {
+  if (!path || !out) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  struct stat st;
+  FILE *f = state_open_read_secure(path, &st);
+  if (!f || st.st_size < 0) {
+    if (f) {
+      fclose(f);
+    }
+    return -1;
+  }
+  long max_bytes = state_env_long_clamped("EDR_COMMAND_ACK_MAX_BYTES", 32L * 1024L,
+                                          512L, 1024L * 1024L);
+  if (st.st_size > max_bytes) {
+    fclose(f);
+    return 1;
+  }
+  size_t n = (size_t)st.st_size;
+  char *buf = (char *)malloc(n + 1u);
+  if (!buf) {
+    fclose(f);
+    return -1;
+  }
+  size_t got = fread(buf, 1, n, f);
+  fclose(f);
+  buf[got] = '\0';
+  if (got != n) {
+    free(buf);
+    return 1;
+  }
+  char record[32];
+  parse_json_string_field_line(buf, "record", record, sizeof(record));
+  parse_json_string_field_line(buf, "command_id", out->command_id, sizeof(out->command_id));
+  parse_json_string_field_line(buf, "transport", out->transport, sizeof(out->transport));
+  out->last_seq = parse_json_int64_field_line(buf, "last_seq", 0);
+  int64_t attempts = parse_json_int64_field_line(buf, "attempts", 0);
+  out->first_failure_unix_ms = parse_json_int64_field_line(buf, "first_failure_unix_ms", 0);
+  out->last_failure_unix_ms = parse_json_int64_field_line(buf, "last_failure_unix_ms", 0);
+  out->next_retry_unix_ms = parse_json_int64_field_line(buf, "next_retry_unix_ms", 0);
+  free(buf);
+  if (strcmp(record, "control_ack") != 0 || !out->command_id[0] || !out->transport[0] || attempts < 1 ||
+      attempts > 10000000LL || out->next_retry_unix_ms <= 0) {
+    return 1;
+  }
+  out->attempts = (uint32_t)attempts;
+  return 0;
+}
+
+static int control_ack_name_is_record(const char *name) {
+  if (!name || name[0] == '.') {
+    return 0;
+  }
+  size_t n = strlen(name);
+  return n > 5u && strcmp(name + n - 5u, ".json") == 0;
+}
+
+int edr_command_state_upsert_pending_ack(const EdrControlAckRecord *record) {
+  if (!record || !record->command_id[0]) {
+    return -1;
+  }
+  char dir[1024];
+  char path[1200];
+  char tmp[1300];
+  control_ack_default_dir(dir, sizeof(dir));
+  if (control_ack_record_path(record->command_id, path, sizeof(path)) != 0) {
+    return -1;
+  }
+  FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return -1;
+  }
+  if (state_prepare_dir(dir) != 0) {
+    state_lock_release(lock);
+    return -1;
+  }
+  snprintf(tmp, sizeof(tmp), "%s.tmp.%lld", path, (long long)state_now_ms());
+  FILE *f = state_open_new_secure(tmp);
+  if (!f) {
+    state_lock_release(lock);
+    return -1;
+  }
+  char cid[300], transport[220];
+  json_escape_to(cid, sizeof(cid), record->command_id);
+  json_escape_to(transport, sizeof(transport), record->transport[0] ? record->transport : "https_control");
+  uint32_t attempts = record->attempts ? record->attempts : 1u;
+  int64_t now = state_now_ms();
+  int64_t first_failure = record->first_failure_unix_ms > 0 ? record->first_failure_unix_ms : now;
+  int64_t last_failure = record->last_failure_unix_ms > 0 ? record->last_failure_unix_ms : now;
+  int64_t next_retry = record->next_retry_unix_ms > 0 ? record->next_retry_unix_ms : now;
+  fprintf(f,
+          "{\"record\":\"control_ack\",\"command_id\":%s,\"transport\":%s,"
+          "\"last_seq\":%lld,\"attempts\":%u,\"first_failure_unix_ms\":%lld,"
+          "\"last_failure_unix_ms\":%lld,\"next_retry_unix_ms\":%lld}\n",
+          cid, transport, (long long)record->last_seq, (unsigned)attempts,
+          (long long)first_failure, (long long)last_failure, (long long)next_retry);
+  int ok = state_flush_file(f) == 0;
+  if (fclose(f) != 0) {
+    ok = 0;
+  }
+  if (!ok || state_replace_file(tmp, path) != 0) {
+    (void)command_inbox_delete_path(tmp);
+    state_lock_release(lock);
+    return -1;
+  }
+  state_lock_release(lock);
+  return 0;
+}
+
+int edr_command_state_collect_pending_acks(EdrControlAckRecord *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return 0;
+  }
+  char dir[1024];
+  control_ack_default_dir(dir, sizeof(dir));
+  if (state_prepare_dir(dir) != 0) {
+    return 0;
+  }
+  size_t count = 0u;
+#ifdef _WIN32
+  char pattern[1100];
+  snprintf(pattern, sizeof(pattern), "%s\\*.json", dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    return 0;
+  }
+  do {
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        !control_ack_name_is_record(fd.cFileName)) {
+      continue;
+    }
+    char path[1200];
+    snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+#else
+  DIR *d = opendir(dir);
+  if (!d) {
+    return 0;
+  }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (!control_ack_name_is_record(ent->d_name)) {
+      continue;
+    }
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+#endif
+    EdrControlAckRecord rec;
+    int read_rc = control_ack_read_file(path, &rec);
+    if (read_rc != 0) {
+      if (read_rc > 0) {
+        /* A concurrent ACK upsert can atomically replace this path. Re-read
+         * under the writer lock before moving it, so a valid replacement is
+         * never quarantined based on an earlier malformed snapshot. */
+        FILE *lock = state_lock_acquire();
+        if (lock) {
+          EdrControlAckRecord confirm;
+          if (control_ack_read_file(path, &confirm) > 0) {
+            (void)state_move_to_quarantine(dir, path, "control_ack", "malformed_control_ack_record");
+          }
+          state_lock_release(lock);
+        }
+      }
+      continue;
+    }
+    out[count++] = rec;
+    if (count >= cap) {
+      break;
+    }
+#ifdef _WIN32
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  }
+  closedir(d);
+#endif
+  return (int)count;
+}
+
+void edr_command_state_delete_pending_ack(const char *command_id) {
+  if (!command_id || !command_id[0]) {
+    return;
+  }
+  char path[1200];
+  if (control_ack_record_path(command_id, path, sizeof(path)) != 0) {
+    return;
+  }
+  FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return;
+  }
+  (void)command_inbox_delete_path(path);
+  state_lock_release(lock);
 }
 
 int edr_command_state_store_inbox(const char *command_id, const char *command_type,
@@ -996,7 +1391,7 @@ static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out)
                                           1024L, 256L * 1024L * 1024L);
   if (st.st_size > max_bytes) {
     fclose(f);
-    return -1;
+    return 1;
   }
   size_t n = (size_t)st.st_size;
   char *buf = (char *)malloc(n + 1u);
@@ -1007,10 +1402,12 @@ static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out)
   size_t got = fread(buf, 1, n, f);
   fclose(f);
   buf[got] = '\0';
-  if (got == 0u) {
+  if (got != n) {
     free(buf);
-    return -1;
+    return 1;
   }
+  char record[32];
+  parse_json_string_field_line(buf, "record", record, sizeof(record));
   parse_json_string_field_line(buf, "command_id", out->command_id, sizeof(out->command_id));
   parse_json_string_field_line(buf, "command_type", out->command_type, sizeof(out->command_type));
   parse_json_string_field_line(buf, "soar_correlation_id", out->meta.soar_correlation_id,
@@ -1031,15 +1428,15 @@ static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out)
   out->received_unix_ms = parse_json_int64_field_line(buf, "received_unix_ms", 0);
   char *payload_hex = parse_json_string_field_alloc(buf, "payload_hex");
   free(buf);
-  if (!out->command_id[0] || !payload_hex) {
+  if (strcmp(record, "command_inbox") != 0 || !out->command_id[0] || !out->command_type[0] || !payload_hex) {
     free(payload_hex);
-    return -1;
+    return 1;
   }
   int rc = hex_decode_alloc(payload_hex, &out->payload, &out->payload_len);
   free(payload_hex);
   if (rc != 0) {
     edr_command_state_free_inbox_record(out);
-    return -1;
+    return 1;
   }
   return 0;
 }
@@ -1052,7 +1449,46 @@ static int command_inbox_name_is_record(const char *name) {
   return n > 5u && strcmp(name + n - 5u, ".json") == 0;
 }
 
-int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap) {
+size_t edr_command_state_count_inbox(void) {
+  char dir[1024];
+  command_inbox_default_dir(dir, sizeof(dir));
+  if (state_prepare_dir(dir) != 0) {
+    return 0u;
+  }
+  size_t count = 0u;
+#ifdef _WIN32
+  char pattern[1100];
+  snprintf(pattern, sizeof(pattern), "%s\\*.json", dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    return 0u;
+  }
+  do {
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u &&
+        command_inbox_name_is_record(fd.cFileName)) {
+      count++;
+    }
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  DIR *d = opendir(dir);
+  if (!d) {
+    return 0u;
+  }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (command_inbox_name_is_record(ent->d_name)) {
+      count++;
+    }
+  }
+  closedir(d);
+#endif
+  return count;
+}
+
+int edr_command_state_collect_inbox_filtered(EdrCommandInboxRecord *out, size_t cap,
+                                             EdrCommandInboxFilter filter, void *user) {
   if (!out || cap == 0u) {
     return 0;
   }
@@ -1071,7 +1507,8 @@ int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap) {
     return 0;
   }
   do {
-    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        !command_inbox_name_is_record(fd.cFileName)) {
       continue;
     }
     char path[1200];
@@ -1090,12 +1527,32 @@ int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap) {
     snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
 #endif
     EdrCommandInboxRecord rec;
-    if (command_inbox_read_file(path, &rec) != 0) {
+    int read_rc = command_inbox_read_file(path, &rec);
+    if (read_rc != 0) {
+      if (read_rc > 0) {
+        /* See ACK collection above: only quarantine the same malformed
+         * snapshot while command writers are excluded. */
+        FILE *lock = state_lock_acquire();
+        if (lock) {
+          EdrCommandInboxRecord confirm;
+          int confirm_rc = command_inbox_read_file(path, &confirm);
+          if (confirm_rc > 0) {
+            (void)state_move_to_quarantine(dir, path, "command_inbox", "malformed_command_inbox_record");
+          } else if (confirm_rc == 0) {
+            edr_command_state_free_inbox_record(&confirm);
+          }
+          state_lock_release(lock);
+        }
+      }
       continue;
     }
     if (command_state_has_final(rec.command_id, &rec.meta)) {
       edr_command_state_free_inbox_record(&rec);
       (void)command_inbox_delete_path(path);
+      continue;
+    }
+    if (filter && !filter(rec.command_type, user)) {
+      edr_command_state_free_inbox_record(&rec);
       continue;
     }
     out[count++] = rec;
@@ -1112,6 +1569,10 @@ int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap) {
   return (int)count;
 }
 
+int edr_command_state_collect_inbox(EdrCommandInboxRecord *out, size_t cap) {
+  return edr_command_state_collect_inbox_filtered(out, cap, NULL, NULL);
+}
+
 void edr_command_state_delete_inbox(const char *command_id) {
   if (!command_id || !command_id[0]) {
     return;
@@ -1121,6 +1582,9 @@ void edr_command_state_delete_inbox(const char *command_id) {
     return;
   }
   FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return;
+  }
   (void)command_inbox_delete_path(path);
   state_lock_release(lock);
 }
@@ -1133,28 +1597,37 @@ void edr_command_state_free_inbox_record(EdrCommandInboxRecord *record) {
   memset(record, 0, sizeof(*record));
 }
 
-static void append_state_line(const char *line) {
+static int append_state_line(const char *line) {
   char path[1024];
   state_default_path(path, sizeof(path));
   FILE *f = state_open_append_secure(path);
   if (!f) {
-    return;
+    return -1;
   }
-  fputs(line, f);
-  fputc('\n', f);
-  fclose(f);
+  int ok = fputs(line, f) >= 0 && fputc('\n', f) != EOF && state_flush_file(f) == 0;
+  if (fclose(f) != 0) {
+    ok = 0;
+  }
+  return ok ? 0 : -1;
 }
 
-static void append_state_line_locked(const char *line) {
+static int append_state_line_locked(const char *line) {
   FILE *lock = state_lock_acquire();
-  append_state_line(line);
+  if (!lock) {
+    return -1;
+  }
+  int rc = append_state_line(line);
   state_lock_release(lock);
+  return rc;
 }
 
 static int count_prior_attempts(const char *command_id, const EdrSoarCommandMeta *meta) {
   char path[1024];
   state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return 0;
+  }
   FILE *f = state_open_read_secure(path, NULL);
   if (!f) {
     state_lock_release(lock);
@@ -1192,6 +1665,9 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
   char path[1024];
   state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return EDR_COMMAND_STATE_BEGIN_ERROR;
+  }
   FILE *f = state_open_read_secure(path, NULL);
   int retry = 0;
   int duplicate = 0;
@@ -1265,18 +1741,20 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
 #endif
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":0,\"command_id\":%s,\"command_type\":%s,"
-           "\"idempotency_key\":%s,\"response_status\":\"started\",\"execution_status\":0,"
+           "\"idempotency_key\":%s,\"response_status\":\"queued\",\"execution_status\":0,"
            "\"exit_code\":0,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
            "\"agent_boot_id\":%s,\"process_id\":%d}",
            cid, ctype, idem, retry, (long long)state_now_ms(), boot, pid);
-  append_state_line(line);
+  int append_rc = append_state_line(line);
   state_lock_release(lock);
-  return 0;
+  return append_rc == 0 ? EDR_COMMAND_STATE_BEGIN_READY : EDR_COMMAND_STATE_BEGIN_ERROR;
 }
 
-int edr_command_state_replay_begin(const char *command_id, const char *command_type,
-                                   const EdrSoarCommandMeta *meta, int *out_retry_count,
-                                   EdrCommandStateRecord *out_duplicate) {
+int edr_command_state_replay_begin_policy(const char *command_id, const char *command_type,
+                                          const EdrSoarCommandMeta *meta,
+                                          int allow_replay_after_start,
+                                          int *out_retry_count,
+                                          EdrCommandStateRecord *out_duplicate) {
   if (out_retry_count) {
     *out_retry_count = 0;
   }
@@ -1286,14 +1764,20 @@ int edr_command_state_replay_begin(const char *command_id, const char *command_t
   char path[1024];
   state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return EDR_COMMAND_STATE_BEGIN_ERROR;
+  }
   FILE *f = state_open_read_secure(path, NULL);
   int retry = 0;
   int duplicate = 0;
   int running_duplicate = 0;
+  int queued_record = 0;
   EdrCommandStateRecord last_final;
   EdrCommandStateRecord last_running;
+  EdrCommandStateRecord last_nonfinal;
   memset(&last_final, 0, sizeof(last_final));
   memset(&last_running, 0, sizeof(last_running));
+  memset(&last_nonfinal, 0, sizeof(last_nonfinal));
   int64_t now_ms = state_now_ms();
   int64_t running_ttl_ms = command_running_ttl_ms(meta);
   char idem_key[128];
@@ -1319,11 +1803,7 @@ int edr_command_state_replay_begin(const char *command_id, const char *command_t
       } else {
         EdrCommandStateRecord running;
         fill_record_from_line(line, &running);
-        if (running.updated_unix_ms > 0 && now_ms - running.updated_unix_ms < running_ttl_ms &&
-            running.agent_boot_id[0] && strcmp(running.agent_boot_id, current_boot) == 0) {
-          running_duplicate = 1;
-          last_running = running;
-        }
+        last_nonfinal = running;
       }
     }
     fclose(f);
@@ -1337,6 +1817,28 @@ int edr_command_state_replay_begin(const char *command_id, const char *command_t
     }
     state_lock_release(lock);
     return EDR_COMMAND_STATE_BEGIN_DUP_FINAL;
+  }
+  queued_record = strcmp(last_nonfinal.response_status, "queued") == 0;
+  if (strcmp(last_nonfinal.response_status, "cancelling") == 0) {
+    if (out_duplicate) {
+      *out_duplicate = last_nonfinal;
+    }
+    state_lock_release(lock);
+    return EDR_COMMAND_STATE_BEGIN_REPLAY_BLOCKED;
+  }
+  if (!allow_replay_after_start && last_nonfinal.command_id[0] && !queued_record) {
+    if (out_duplicate) {
+      *out_duplicate = last_nonfinal;
+    }
+    state_lock_release(lock);
+    return EDR_COMMAND_STATE_BEGIN_REPLAY_BLOCKED;
+  }
+  if (!queued_record && last_nonfinal.command_id[0] &&
+      last_nonfinal.updated_unix_ms > 0 &&
+      now_ms - last_nonfinal.updated_unix_ms < running_ttl_ms &&
+      last_nonfinal.agent_boot_id[0] && strcmp(last_nonfinal.agent_boot_id, current_boot) == 0) {
+    running_duplicate = 1;
+    last_running = last_nonfinal;
   }
   if (running_duplicate) {
     if (out_duplicate) {
@@ -1358,19 +1860,27 @@ int edr_command_state_replay_begin(const char *command_id, const char *command_t
 #endif
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":0,\"command_id\":%s,\"command_type\":%s,"
-           "\"idempotency_key\":%s,\"response_status\":\"replaying\",\"execution_status\":0,"
+           "\"idempotency_key\":%s,\"response_status\":\"%s\",\"execution_status\":0,"
            "\"exit_code\":0,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
            "\"agent_boot_id\":%s,\"process_id\":%d}",
-           cid, ctype, idem, retry, (long long)state_now_ms(), boot, pid);
-  append_state_line(line);
+           cid, ctype, idem, queued_record ? "running" : "replaying", retry,
+           (long long)state_now_ms(), boot, pid);
+  int append_rc = append_state_line(line);
   state_lock_release(lock);
-  return EDR_COMMAND_STATE_BEGIN_READY;
+  return append_rc == 0 ? EDR_COMMAND_STATE_BEGIN_READY : EDR_COMMAND_STATE_BEGIN_ERROR;
 }
 
-void edr_command_state_finish(const char *command_id, const char *command_type,
-                              const EdrSoarCommandMeta *meta, const char *response_status,
-                              int execution_status, int exit_code, const char *detail,
-                              const char *artifacts, int report_pending) {
+int edr_command_state_replay_begin(const char *command_id, const char *command_type,
+                                   const EdrSoarCommandMeta *meta, int *out_retry_count,
+                                   EdrCommandStateRecord *out_duplicate) {
+  return edr_command_state_replay_begin_policy(command_id, command_type, meta, 1,
+                                               out_retry_count, out_duplicate);
+}
+
+int edr_command_state_finish(const char *command_id, const char *command_type,
+                             const EdrSoarCommandMeta *meta, const char *response_status,
+                             int execution_status, int exit_code, const char *detail,
+                             const char *artifacts, int report_pending) {
   int retry = count_prior_attempts(command_id, meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
@@ -1402,11 +1912,77 @@ void edr_command_state_finish(const char *command_id, const char *command_type,
            "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
-  append_state_line_locked(line);
+  if (append_state_line_locked(line) != 0) {
+    return -1;
+  }
   edr_local_evidence_cache_record_command_result(
       command_id, command_type, response_status ? response_status : "failed",
       execution_status, exit_code, detail, artifacts);
   edr_command_state_compact_if_needed();
+  return 0;
+}
+
+int edr_command_state_request_cancel(const char *command_id,
+                                     EdrCommandStateRecord *out_target) {
+  if (out_target) {
+    memset(out_target, 0, sizeof(*out_target));
+  }
+  if (!command_id || !command_id[0]) {
+    return EDR_COMMAND_STATE_CANCEL_NOT_FOUND;
+  }
+  char path[1024];
+  state_default_path(path, sizeof(path));
+  FILE *lock = state_lock_acquire();
+  if (!lock) {
+    return EDR_COMMAND_STATE_CANCEL_ERROR;
+  }
+  FILE *f = state_open_read_secure(path, NULL);
+  EdrCommandStateRecord latest;
+  memset(&latest, 0, sizeof(latest));
+  if (f) {
+    char line_buf[8192];
+    while (fgets(line_buf, sizeof(line_buf), f)) {
+      if (line_matches_key(line_buf, "command_id", command_id)) {
+        fill_record_from_line(line_buf, &latest);
+      }
+    }
+    fclose(f);
+  }
+  if (!latest.command_id[0]) {
+    state_lock_release(lock);
+    return EDR_COMMAND_STATE_CANCEL_NOT_FOUND;
+  }
+  if (out_target) {
+    *out_target = latest;
+  }
+  if (latest.final_record) {
+    state_lock_release(lock);
+    return EDR_COMMAND_STATE_CANCEL_ALREADY_FINAL;
+  }
+
+  char cid[300], ctype[180], idem[1100], boot[100], line[1800];
+  json_escape_to(cid, sizeof(cid), latest.command_id);
+  json_escape_to(ctype, sizeof(ctype), latest.command_type);
+  json_escape_to(idem, sizeof(idem), latest.idempotency_key);
+  {
+    char boot_raw[64];
+    state_boot_id(boot_raw, sizeof(boot_raw));
+    json_escape_to(boot, sizeof(boot), boot_raw);
+  }
+#ifdef _WIN32
+  int pid = _getpid();
+#else
+  int pid = (int)getpid();
+#endif
+  snprintf(line, sizeof(line),
+           "{\"record\":\"command_state\",\"final\":0,\"command_id\":%s,\"command_type\":%s,"
+           "\"idempotency_key\":%s,\"response_status\":\"cancelling\",\"execution_status\":0,"
+           "\"exit_code\":0,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
+           "\"agent_boot_id\":%s,\"process_id\":%d}",
+           cid, ctype, idem, latest.retry_count, (long long)state_now_ms(), boot, pid);
+  int rc = append_state_line(line);
+  state_lock_release(lock);
+  return rc == 0 ? EDR_COMMAND_STATE_CANCEL_REQUESTED : EDR_COMMAND_STATE_CANCEL_ERROR;
 }
 
 int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {

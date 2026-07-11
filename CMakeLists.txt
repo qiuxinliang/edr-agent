@@ -319,6 +319,7 @@ set(EDR_AGENT_SOURCES
   src/forensic/process_tree_cache.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c
+  src/serialize/alert_governor.c
   src/serialize/behavior_alert_emit.c
   src/serialize/behavior_proto_c.c
   src/proto/edr/v1/event.pb.c
@@ -333,6 +334,11 @@ set(EDR_AGENT_SOURCES
   src/storage/queue_sqlite.c
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
+  src/command/forensic_result_contract.c
+  src/command/command_cancel.c
+  src/command/command_contract.c
+  src/command/command_executor.c
+  src/command/command_registry.c
   src/command/command_state.c
   src/command/command_util.c
   src/command/pe_verify.c
@@ -611,7 +617,7 @@ edr_apply_common_warnings(edr_agent)
 
 if(WIN32)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
-  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32)
+  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32 dbghelp)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

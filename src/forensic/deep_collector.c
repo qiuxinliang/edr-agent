@@ -889,7 +889,23 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   ResumeThread(pi.hThread);
   CloseHandle(pi.hThread);
 
-  DWORD wr = WaitForSingleObject(pi.hProcess, to * 1000u);
+  DWORD wr = WAIT_TIMEOUT;
+  uint64_t waited_ms = 0u;
+  while (waited_ms < (uint64_t)to * 1000u) {
+    wr = WaitForSingleObject(pi.hProcess, 100u);
+    if (wr != WAIT_TIMEOUT) break;
+    waited_ms += 100u;
+    if (spec->cancel_requested && spec->cancel_requested(spec->cancel_user)) {
+      if (job) TerminateJobObject(job, 130u);
+      else TerminateProcess(pi.hProcess, 130u);
+      (void)WaitForSingleObject(pi.hProcess, 5000u);
+      if (out_detail) snprintf(out_detail, detail_cap, "collector cancelled by operator");
+      CloseHandle(pi.hProcess);
+      if (herr != INVALID_HANDLE_VALUE) { CloseHandle(herr); (void)remove(errpath); }
+      if (job) CloseHandle(job);
+      return EDR_DC_ERR_CANCELLED;
+    }
+  }
   if (wr == WAIT_TIMEOUT) {
     if (job) {
       TerminateJobObject(job, 1);
@@ -1201,6 +1217,13 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
       if (out_detail) snprintf(out_detail, detail_cap, "collector timeout after %us", to);
       (void)remove(errpath);
       return EDR_DC_ERR_TIMEOUT;
+    }
+    if (spec->cancel_requested && spec->cancel_requested(spec->cancel_user)) {
+      dc_kill_process_group(pid);
+      waitpid(pid, NULL, 0);
+      if (out_detail) snprintf(out_detail, detail_cap, "collector cancelled by operator");
+      (void)remove(errpath);
+      return EDR_DC_ERR_CANCELLED;
     }
     usleep(step_ms * 1000u);
     waited_ms += step_ms;

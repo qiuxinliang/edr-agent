@@ -1,10 +1,12 @@
 #include "edr/agent.h"
 
 #include "edr/adaptive_collection.h"
+#include "edr/alert_governor.h"
 #include "edr/ave_sdk.h"
 #include "edr/behavior_alert_emit.h"
 #include "edr/correlation_engine.h"
 #include "edr/config.h"
+#include "edr/deep_collector.h"
 #include "edr/event_bus.h"
 #include "edr/response.h"
 #include "edr/preprocess.h"
@@ -25,6 +27,7 @@
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
 #include "edr/command.h"
+#include "edr/command_executor.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/p0_rule_ir.h"
@@ -1437,6 +1440,147 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns, int force);
 
+static void edr_agent_capability_manifest_json(const EdrAgent *agent,
+                                               const EdrIngestHttpRuntime *http_rt,
+                                               const AVEStatus *avst, int ave_ok,
+                                               char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) return;
+#ifdef _WIN32
+  const char *platform = "windows";
+#elif defined(__APPLE__)
+  const char *platform = "darwin";
+#else
+  const char *platform = "linux";
+#endif
+#ifdef EDR_HAVE_PCRE2
+  const int pcre2_build = 1;
+#else
+  const int pcre2_build = 0;
+#endif
+#ifdef EDR_HAVE_YARA
+  const int yara_build = 1;
+#else
+  const int yara_build = 0;
+#endif
+#ifdef EDR_HAVE_ONNXRUNTIME
+  const int ort_build = 1;
+#else
+  const int ort_build = 0;
+#endif
+#ifdef EDR_HAVE_SQLITE
+  const int sqlite_build = 1;
+#else
+  const int sqlite_build = 0;
+#endif
+#ifdef EDR_HAVE_CURL_HTTP2
+  const int http2_build = 1;
+#else
+  const int http2_build = 0;
+#endif
+#ifdef EDR_HAVE_ZSTD
+  const int zstd_build = 1;
+#else
+  const int zstd_build = 0;
+#endif
+#if defined(EDR_HAVE_OPENSSL_HTTP) || defined(EDR_HAVE_OPENSSL_FL)
+  const int signing_build = 1;
+#else
+  const int signing_build = 0;
+#endif
+#ifdef _WIN32
+  const int windows_native = 1;
+#else
+  const int windows_native = 0;
+#endif
+  int rtq_policy = agent && (agent->cfg.command.allow_rtq_readonly ||
+                              agent->cfg.command.allow_dangerous);
+  int dangerous_policy = agent && agent->cfg.command.allow_dangerous;
+  int ort_policy = agent && agent->cfg.ave.enabled && agent->cfg.ave.static_model_enabled;
+  int sqlite_policy = agent && agent->cfg.offline.queue_db_path[0];
+  int velo_policy = edr_response_forensic_external_enabled();
+  int yara_command_build = yara_build || velo_policy;
+  int memory_command_build = windows_native || velo_policy;
+  const char *allow_unsigned = getenv("EDR_COMMAND_ALLOW_UNSIGNED");
+  int signing_policy = !(allow_unsigned && allow_unsigned[0] == '1');
+  int signing_key_configured = agent &&
+      (agent->cfg.command.signing_public_key_pem[0] ||
+       agent->cfg.command.signing_public_key_path[0]);
+  if (!signing_key_configured) {
+    const char *legacy_key = getenv("EDR_COMMAND_SIGNING_KEY");
+    signing_key_configured = legacy_key && legacy_key[0];
+  }
+  const char *signing_runtime = !signing_build ? "unavailable"
+                                : !signing_policy ? "disabled"
+                                : signing_key_configured ? "healthy" : "degraded";
+  const char *ort_runtime = !ort_build ? "unavailable"
+                            : !ort_policy ? "disabled"
+                            : (ave_ok && avst && avst->initialized && avst->static_model_version[0])
+                                  ? "healthy" : "degraded";
+  const char *http2_runtime = !http2_build ? "unavailable"
+                              : !(http_rt && http_rt->http2_enabled) ? "disabled"
+                              : http_rt->http2_negotiated ? "healthy" : "degraded";
+  const char *zstd_runtime = !zstd_build ? "unavailable"
+                             : !(http_rt && http_rt->zstd_requested) ? "idle"
+                             : http_rt->zstd_available ? "healthy" : "degraded";
+  const char *velo_runtime = !velo_policy ? "disabled"
+                             : edr_deep_collector_is_running() ? "healthy" : "idle";
+  EdrAlertGovernorStats alert_stats;
+  memset(&alert_stats, 0, sizeof(alert_stats));
+  edr_alert_governor_get_stats(&alert_stats);
+  snprintf(
+      out, out_cap,
+      "{\"schema\":\"edr.agent.capabilities.v1\",\"platform\":\"%s\","
+      "\"telemetry\":{\"alert_governor\":{\"admitted\":%llu,\"suppressed\":%llu,"
+      "\"summaries\":%llu,\"critical_bypassed\":%llu}},"
+      "\"features\":{"
+      "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"onnxruntime\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"sqlite\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"http2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"zstd\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"velociraptor\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"command_signing\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}},"
+      "\"commands\":{"
+      "\"rtq_execute\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"yara_scan\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"memory_dump\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"targeted_forensic\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"targeted_forensic_file\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"targeted_forensic_process\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"targeted_forensic_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"targeted_forensic_memory\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
+      platform,
+      (unsigned long long)alert_stats.admitted,
+      (unsigned long long)alert_stats.suppressed,
+      (unsigned long long)alert_stats.summaries,
+      (unsigned long long)alert_stats.critical_bypassed,
+      pcre2_build ? "true" : "false", pcre2_build ? "true" : "false", pcre2_build ? "healthy" : "unavailable",
+      yara_build ? "true" : "false", yara_build ? "true" : "false", yara_build ? "healthy" : "unavailable",
+      ort_build ? "true" : "false", ort_policy ? "true" : "false", ort_runtime,
+      sqlite_build ? "true" : "false", sqlite_policy ? "true" : "false", sqlite_build && sqlite_policy ? "healthy" : (sqlite_build ? "disabled" : "unavailable"),
+      http2_build ? "true" : "false", http_rt && http_rt->http2_enabled ? "true" : "false", http2_runtime,
+      zstd_build ? "true" : "false", http_rt && http_rt->zstd_requested ? "true" : "false", zstd_runtime,
+      velo_policy ? "true" : "false", velo_runtime,
+      signing_build ? "true" : "false", signing_policy ? "true" : "false", signing_runtime,
+      rtq_policy ? "true" : "false",
+      windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
+      windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
+      yara_command_build ? "true" : "false", yara_command_build ? "true" : "false",
+      yara_build ? "healthy" : (velo_policy ? "idle" : "unavailable"),
+      memory_command_build ? "true" : "false", dangerous_policy ? "true" : "false",
+      windows_native ? "healthy" : (velo_policy ? "idle" : "unavailable"),
+      dangerous_policy ? "true" : "false",
+      dangerous_policy ? "true" : "false",
+      velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
+      velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
+      velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
+      velo_policy ? "true" : "false", velo_runtime);
+}
+
 static int edr_agent_collection_enabled(const EdrConfig *cfg) {
   if (!cfg) {
     return 0;
@@ -1514,6 +1658,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
                              edr_agent_poll_engine_health(agent, &last_health_ns, last_health_ns == 0u));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
+        edr_behavior_alert_emit_periodic_summary();
         /* 取证异步生命周期收割:velo 完成→velo→builtin 两段/上传/唯一终态上报;取消由此统一 kill。
          * 空闲时仅一次加锁+标志检查,开销可忽略,故每轮直调不另设节流。 */
         edr_response_forensic_async_poll();
@@ -1710,35 +1855,44 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char http_proxy_url[640], http_proxy_status[128], http_circuit_reason[160];
   char http_mtls_status[128], http_key_provider[48];
   char http_negotiated_protocol[32], http_control_status[48], http_upload_status[48];
-  char http_last_command_ack_id[192];
+  char http_last_command_ack_id[192], http_last_command_ack_failure_id[192];
   char http2_last_error[192];
   char http_data_encoding[48], http_data_compression[48], http_envelope_format[64];
   char http_dict_ver[96], http_schema_ver[96], http_profile_id[96];
   char http_zstd_dict_path[640];
   char http_qos_dscp[48], http_threshold[48];
+  char command_quarantine_kind[48], command_quarantine_reason[128];
   char tv2_active_channel[48], tv2_last_operation[48], tv2_last_error[192];
   char tv2_envelope_format[64];
   char resource_pressure_reason[96];
   char poll_probe_json[1600];
   char config_recovery_json[1600];
+  char capability_manifest_json[8192];
   const char *hot_thread_role = "unknown";
   EdrIngestHttpRuntime http_rt;
   EdrTransportV2Runtime tv2_rt;
   EdrResourceSample rs;
   EdrCollectorHealth ch;
   EdrCommandDeliveryHealth cdh;
+  EdrCommandExecutorHealth ceh;
   EdrWindowsEventFilterStatus event_filter_status;
   memset(&http_rt, 0, sizeof(http_rt));
   memset(&tv2_rt, 0, sizeof(tv2_rt));
   memset(&rs, 0, sizeof(rs));
   memset(&ch, 0, sizeof(ch));
   memset(&cdh, 0, sizeof(cdh));
+  memset(&ceh, 0, sizeof(ceh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
   edr_ingest_http_get_runtime(&http_rt);
   edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
   edr_command_get_delivery_health(&cdh);
+  edr_command_executor_get_health(&ceh);
+  ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
+  edr_agent_capability_manifest_json(agent, &http_rt, &avst, ave_ok,
+                                     capability_manifest_json,
+                                     sizeof(capability_manifest_json));
 #ifdef _WIN32
   if (rs.hot_thread_id != 0u && ch.collector_thread_id != 0u &&
       rs.hot_thread_id == ch.collector_thread_id) {
@@ -1775,6 +1929,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.control_stream_status, http_control_status, sizeof(http_control_status));
   json_escape_small(http_rt.upload_status, http_upload_status, sizeof(http_upload_status));
   json_escape_small(http_rt.last_command_ack_id, http_last_command_ack_id, sizeof(http_last_command_ack_id));
+  json_escape_small(http_rt.last_command_ack_failure_id, http_last_command_ack_failure_id,
+                    sizeof(http_last_command_ack_failure_id));
   json_escape_small(http_rt.data_plane_encoding, http_data_encoding, sizeof(http_data_encoding));
   json_escape_small(http_rt.data_plane_compression, http_data_compression, sizeof(http_data_compression));
   json_escape_small(http_rt.envelope_format, http_envelope_format, sizeof(http_envelope_format));
@@ -1784,6 +1940,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(http_rt.zstd_dict_path, http_zstd_dict_path, sizeof(http_zstd_dict_path));
   json_escape_small(http_rt.qos_dscp, http_qos_dscp, sizeof(http_qos_dscp));
   json_escape_small(http_rt.telemetry_threshold, http_threshold, sizeof(http_threshold));
+  json_escape_small(cdh.last_quarantine_kind, command_quarantine_kind,
+                    sizeof(command_quarantine_kind));
+  json_escape_small(cdh.last_quarantine_reason, command_quarantine_reason,
+                    sizeof(command_quarantine_reason));
   json_escape_small(tv2_rt.active_channel, tv2_active_channel, sizeof(tv2_active_channel));
   json_escape_small(tv2_rt.last_operation, tv2_last_operation, sizeof(tv2_last_operation));
   json_escape_small(tv2_rt.last_error, tv2_last_error, sizeof(tv2_last_error));
@@ -1791,17 +1951,22 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
   edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
   if (strcmp(health_profile, "diagnostic") != 0) {
-    char body_basic[12288];
+    char body_basic[24576];
     int n_basic = snprintf(
         body_basic, sizeof(body_basic),
         "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
         "\"engine_health\":{"
         "\"reported_at_unix_ms\":%llu,"
+        "\"capability_manifest\":%s,"
         "\"config_recovery\":%s,"
         "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
         "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
         "\"communication\":{\"http_fallback\":%s,"
         "\"http_ok\":%lu,\"http_fail\":%lu,"
+        "\"control_ack\":{\"ok\":%lu,\"fail\":%lu,\"pending\":%lu,"
+        "\"retry_attempt\":%lu,\"retry_ok\":%lu,\"retry_fail\":%lu,"
+        "\"outbox_persist_fail\":%lu,\"last_failure_unix_ms\":%lld,"
+        "\"last_failure_id\":\"%s\",\"next_retry_unix_ms\":%lld},"
         "\"offline_queue_pending\":%llu,"
         "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
         "\"last_failure_reason\":\"%s%s%s\","
@@ -1823,6 +1988,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
         "\"http2_last_error\":\"%s\",\"http2_cert_error_count\":%lu,"
         "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
+        "\"control_stream_lease_valid\":%s,\"control_stream_last_activity_unix_ms\":%lld,"
+        "\"control_stream_lease_deadline_unix_ms\":%lld,\"control_stream_lease_expired\":%lu,"
         "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
         "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
         "\"report_events_v2_ok\":%lu,\"report_events_v2_fail\":%lu,"
@@ -1871,11 +2038,16 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "}}",
         agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
         runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
-        (unsigned long long)wall_ms, config_recovery_json,
+        (unsigned long long)wall_ms, capability_manifest_json, config_recovery_json,
         health_profile[0] ? health_profile : "basic",
         agent->cfg.health_monitor.interval_s,
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
         http_rt.http_fallback_available ? "true" : "false", http_rt.ok_count, http_rt.fail_count,
+        http_rt.control_ack_ok_count, http_rt.control_ack_fail_count, http_rt.control_ack_pending_count,
+        http_rt.control_ack_retry_attempt_count, http_rt.control_ack_retry_ok_count,
+        http_rt.control_ack_retry_fail_count, http_rt.control_ack_outbox_persist_fail_count,
+        (long long)http_rt.last_command_ack_failure_unix_ms, http_last_command_ack_failure_id,
+        (long long)http_rt.next_control_ack_retry_unix_ms,
         (unsigned long long)edr_storage_queue_pending_count(),
         (long long)http_rt.last_success_unix_ms,
         (long long)http_rt.last_failure_unix_ms,
@@ -1902,8 +2074,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
         http2_last_error, http_rt.http2_cert_error_count,
         http_rt.control_stream_enabled ? "true" : "false",
-        http_rt.control_stream_ready ? "true" : "false", http_control_status,
-        http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
+        http_rt.control_stream_ready ? "true" : "false",
+        http_rt.control_stream_lease_valid ? "true" : "false",
+        (long long)http_rt.control_stream_last_activity_unix_ms,
+        (long long)http_rt.control_stream_lease_deadline_unix_ms,
+        http_rt.control_stream_lease_expired_count,
+        http_control_status, http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
         http_rt.report_events_v2_enabled ? "true" : "false",
         http_rt.report_events_v2_ok_count, http_rt.report_events_v2_fail_count,
         http_data_encoding, http_data_compression, http_envelope_format,
@@ -1981,7 +2157,6 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 
   edr_pmfe_get_stats(&pmfe_sub, &pmfe_done, &pmfe_drop);
   pmfe_q = edr_pmfe_queue_depth();
-  ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
   /* 关联引擎状态（含注入回灌/发射限流指标）随健康周期上报，供后端看板评估误报/数据量。
@@ -2047,12 +2222,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                     sizeof(event_filter_last_cmdline));
   edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
 
-  char body[24576];
+  char body[49152];
   int n = snprintf(
       body, sizeof(body),
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
       "\"engine_health\":{"
       "\"reported_at_unix_ms\":%llu,"
+      "\"capability_manifest\":%s,"
       "\"config_recovery\":%s,"
       "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
       "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
@@ -2067,8 +2243,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"long_poll_ok\":%lu,\"long_poll_fail\":%lu,"
 	      "\"control_stream_ok\":%lu,\"control_stream_fail\":%lu,"
 	      "\"control_stream_heartbeat\":%lu,"
-	      "\"control_ack_ok\":%lu,\"control_ack_fail\":%lu,"
-	      "\"last_command_ack_unix_ms\":%lld,\"last_command_ack_id\":\"%s\","
+      "\"control_ack_ok\":%lu,\"control_ack_fail\":%lu,"
+      "\"control_ack_retry_attempt\":%lu,\"control_ack_retry_ok\":%lu,"
+      "\"control_ack_retry_fail\":%lu,\"control_ack_outbox_persist_fail\":%lu,"
+      "\"control_ack_pending\":%lu,"
+      "\"last_command_ack_unix_ms\":%lld,\"last_command_ack_id\":\"%s\","
+      "\"last_command_ack_failure_unix_ms\":%lld,\"last_command_ack_failure_id\":\"%s\","
+      "\"next_control_ack_retry_unix_ms\":%lld,"
 	      "\"http2_request_ok\":%lu,\"http2_request_fail\":%lu,"
       "\"http2_negotiated\":%lu,\"http2_fallback\":%lu,"
       "\"http2_cert_error\":%lu},"
@@ -2094,6 +2275,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
       "\"http2_last_error\":\"%s\",\"http2_cert_error_count\":%lu,"
       "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
+      "\"control_stream_lease_valid\":%s,\"control_stream_last_activity_unix_ms\":%lld,"
+      "\"control_stream_lease_deadline_unix_ms\":%lld,\"control_stream_lease_expired\":%lu,"
       "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
       "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
       "\"report_events_v2_ok\":%lu,\"report_events_v2_fail\":%lu,"
@@ -2127,7 +2310,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"upload_pending_seen\":%u,\"upload_attempted\":%u,"
       "\"upload_succeeded\":%u,\"upload_failed\":%u,"
       "\"upload_skipped_backoff\":%u,\"upload_fail_streak\":%u,"
-      "\"upload_next_retry_unix_ms\":%lld},"
+      "\"upload_next_retry_unix_ms\":%lld,"
+      "\"quarantine\":{\"inbox_records\":%llu,\"ack_records\":%llu,"
+      "\"move_failures\":%llu,\"last_unix_ms\":%lld,\"last_kind\":\"%s\","
+      "\"last_reason\":\"%s\"},"
+      "\"executor\":{\"started\":%s,\"accepting\":%s,\"active\":%s,"
+      "\"workers\":%u,\"pending\":%u,\"reserved\":%u,\"capacity\":%u,\"critical_reserve\":%u,"
+      "\"wake_count\":%llu,\"executed_count\":%llu,\"replay_errors\":%llu,"
+      "\"queue_rejected\":%llu,\"critical_executed\":%llu,"
+      "\"interactive_executed\":%llu,\"bulk_executed\":%llu}},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
@@ -2214,7 +2405,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
       runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
-      (unsigned long long)wall_ms, config_recovery_json,
+      (unsigned long long)wall_ms, capability_manifest_json, config_recovery_json,
       health_profile[0] ? health_profile : "basic", agent->cfg.health_monitor.interval_s,
       (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
 	      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
@@ -2226,9 +2417,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      http_rt.upload_ok_count, http_rt.upload_fail_count,
 	      http_rt.long_poll_ok_count, http_rt.long_poll_fail_count,
 	      http_rt.control_stream_ok_count, http_rt.control_stream_fail_count,
-	      http_rt.control_stream_heartbeat_count,
-	      http_rt.control_ack_ok_count, http_rt.control_ack_fail_count,
-	      (long long)http_rt.last_command_ack_unix_ms, http_last_command_ack_id,
+      http_rt.control_stream_heartbeat_count,
+      http_rt.control_ack_ok_count, http_rt.control_ack_fail_count,
+      http_rt.control_ack_retry_attempt_count, http_rt.control_ack_retry_ok_count,
+      http_rt.control_ack_retry_fail_count, http_rt.control_ack_outbox_persist_fail_count,
+      http_rt.control_ack_pending_count,
+      (long long)http_rt.last_command_ack_unix_ms, http_last_command_ack_id,
+      (long long)http_rt.last_command_ack_failure_unix_ms, http_last_command_ack_failure_id,
+      (long long)http_rt.next_control_ack_retry_unix_ms,
 	      http_rt.http2_request_ok_count, http_rt.http2_request_fail_count,
 	      http_rt.http2_negotiated_count, http_rt.http2_fallback_count,
 	      http_rt.http2_cert_error_count,
@@ -2261,8 +2457,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
       http2_last_error, http_rt.http2_cert_error_count,
       http_rt.control_stream_enabled ? "true" : "false",
-      http_rt.control_stream_ready ? "true" : "false", http_control_status,
-      http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
+      http_rt.control_stream_ready ? "true" : "false",
+      http_rt.control_stream_lease_valid ? "true" : "false",
+      (long long)http_rt.control_stream_last_activity_unix_ms,
+      (long long)http_rt.control_stream_lease_deadline_unix_ms,
+      http_rt.control_stream_lease_expired_count,
+      http_control_status, http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
       http_rt.report_events_v2_enabled ? "true" : "false",
       http_rt.report_events_v2_ok_count, http_rt.report_events_v2_fail_count,
       http_data_encoding, http_data_compression, http_envelope_format,
@@ -2304,6 +2504,20 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       cdh.upload_succeeded, cdh.upload_failed,
       cdh.upload_skipped_backoff, cdh.upload_fail_streak,
       (long long)cdh.upload_next_retry_unix_ms,
+      (unsigned long long)cdh.inbox_quarantined,
+      (unsigned long long)cdh.ack_quarantined,
+      (unsigned long long)cdh.quarantine_move_failed,
+      (long long)cdh.last_quarantine_unix_ms,
+      command_quarantine_kind, command_quarantine_reason,
+      ceh.started ? "true" : "false", ceh.accepting ? "true" : "false",
+      ceh.active ? "true" : "false", ceh.worker_count, ceh.pending_count,
+      ceh.admission_reservations, ceh.queue_capacity, ceh.queue_critical_reserve,
+      (unsigned long long)ceh.wake_count, (unsigned long long)ceh.executed_count,
+      (unsigned long long)ceh.replay_error_count,
+      (unsigned long long)ceh.queue_rejected_count,
+      (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_CRITICAL],
+      (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_INTERACTIVE],
+      (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_BULK],
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       agent->cfg.resource_limit.ave_infer_per_min,
       agent->cfg.resource_limit.behavior_infer_per_min,

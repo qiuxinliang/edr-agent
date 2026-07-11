@@ -7,5 +7,6 @@
 #include "ave_sdk.h"
 
 void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a);
+void edr_behavior_alert_emit_periodic_summary(void);
 
 #endif

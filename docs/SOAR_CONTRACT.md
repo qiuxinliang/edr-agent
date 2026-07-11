@@ -23,6 +23,13 @@
 
 **C 侧结构体**：`EdrSoarCommandMeta`（`include/edr/command.h`）与上表一一对应（定长缓冲，由 gRPC 层截断写入）。
 
+### 1.1 控制面可靠性与恢复语义
+
+- Agent 在验签、过期检查与本地 `command_state` / inbox 持久化成功后，才发送控制面接收 ACK。ACK 请求失败会写入私有 ACK outbox 并由主循环重试；ACK 的送达状态不影响已经可靠接收或已开始执行的命令。
+- HTTP 控制流的 `ready` 是活动租约，不是一次性连接标志。`server_hello`、控制流 heartbeat 或成功解析的 `command_envelope` 刷新活动时间；默认租约为 `90000ms`，可通过 `EDR_CONTROL_STREAM_LEASE_MS` 在 `10000ms` 至 `3600000ms` 内调整。租约过期后，Agent 将控制流标记为 `lease_expired`，并允许已启用的 HTTPS long-poll 立即恢复取命令，即使底层流线程仍在等待 I/O。
+- 引擎心跳的 `communication.enterprise.protocol` 提供 `control_stream_lease_valid`、最后活动时间、租约截止时间和过期计数。诊断画像还在 `command_delivery.quarantine` 输出损坏持久化记录的隔离数量与最近原因。
+- inbox 与 ACK 目录中被完整读取后确认格式非法、字段缺失或超出大小限制的 `.json` 记录，会原子移动到同目录受权限保护的 `quarantine/`，并写入本地审计。打开失败、权限/安全校验失败、读取失败或内存不足不会删除或隔离原记录，以避免把暂时性故障误判为数据损坏。
+
 ### AVE 指令 payload（UTF-8 JSON）
 
 | command_type | payload | 说明 |

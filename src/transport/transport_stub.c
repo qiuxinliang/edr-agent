@@ -426,6 +426,9 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
 void edr_transport_shutdown(void) {
   EdrTransportCtx *c = &g_ctx;
 
+  /* Stop accepting control commands before tearing down result transport. */
+  edr_ingest_http_stop_command_poll();
+
   /* 停止工作线程 */
   c->q_run = 0;
   if (c->q_started) {
@@ -452,9 +455,6 @@ void edr_transport_shutdown(void) {
   }
   c->q_tail = NULL;
   c->q_len = 0;
-
-  /* 停止命令轮询 */
-  edr_ingest_http_stop_command_poll();
 }
 
 void edr_transport_on_behavior_wire(const uint8_t *data, size_t len) {

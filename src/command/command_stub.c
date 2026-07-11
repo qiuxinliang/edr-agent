@@ -11,6 +11,10 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/command.h"
+#include "edr/command_cancel.h"
+#include "edr/command_contract.h"
+#include "edr/command_executor.h"
+#include "edr/command_registry.h"
 #include "edr/command_state.h"
 #include "edr/command_util.h"
 #include "edr/deep_collector.h"
@@ -19,6 +23,7 @@
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_batch.h"
+#include "edr/forensic_result_contract.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pmfe.h"
@@ -30,6 +35,7 @@
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
 #include "edr/shell_session.h"
+#include "cJSON.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -79,12 +85,11 @@ static unsigned long s_unknown;
 static unsigned long s_rejected;
 static unsigned long s_exec_ok;
 static unsigned long s_exec_fail;
-static const char *s_active_command_type;
-unsigned long g_cmd_handled;
-unsigned long g_cmd_rejected;
-unsigned long g_cmd_exec_ok;
-unsigned long g_cmd_exec_fail;
-
+#ifdef _MSC_VER
+static __declspec(thread) const char *s_active_command_type;
+#else
+static _Thread_local const char *s_active_command_type;
+#endif
 /* PMFE workers must not perform transport I/O. Keep terminal results until
  * the normal command poll loop can persist and emit them. */
 #define PMFE_COMPLETION_CAP 32
@@ -366,6 +371,20 @@ static char *json_escape_alloc_cmd(const char *s) {
 static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
                          int exit_code, const char *detail, const char *response_status,
                          const char *artifacts) {
+  char cancel_detail[1536];
+  if (cmd_id && edr_command_cancel_requested(cmd_id) && exit_code != 130 &&
+      (!response_status || strcmp(response_status, "cancelled") != 0)) {
+    snprintf(cancel_detail, sizeof(cancel_detail),
+             "cancellation requested while action was running; backend returned status=%s exit=%d detail=%.1200s",
+             response_status_label(st), exit_code, detail ? detail : "");
+    st = EdrCmdExecFailed;
+    exit_code = 130;
+    detail = cancel_detail;
+    response_status = "cancelled";
+  }
+  char forensic_detail[8192];
+  detail = edr_command_normalize_forensic_result(s_active_command_type, st, exit_code, detail,
+                                                 forensic_detail, sizeof(forensic_detail));
   char taskj[300];
   char statusj[96];
   char *detail_json = NULL;
@@ -415,13 +434,18 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
                                                    sm, (int)st, exit_code, detail_json);
     report_pending = (rc != 0);
   }
-  edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "", sm, rstatus,
-                           (int)st, exit_code, detail ? detail : "", artifacts ? artifacts : "",
-                           report_pending);
+  int state_rc = edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "",
+                                          sm, rstatus, (int)st, exit_code,
+                                          detail ? detail : "", artifacts ? artifacts : "",
+                                          report_pending);
   /* The inbox is the crash-recovery record. Delete it only after a terminal
    * result is durably recorded; async forensic commands therefore remain
    * replayable while their collector is running. */
-  edr_command_state_delete_inbox(cmd_id);
+  if (state_rc == 0) {
+    edr_command_state_delete_inbox(cmd_id);
+  } else {
+    audit_both(cmd_id, "terminal command state persist failed; durable inbox retained");
+  }
   free(raw);
   free(err);
   free(detail_json);
@@ -434,145 +458,28 @@ static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrComma
 
 static int parse_json_string_field(const uint8_t *p, size_t len, const char *key,
                                    char *out, size_t outcap) {
-  if (!p || len == 0u || !key || !out || outcap < 2u) {
-    return -1;
-  }
-  char tmp[8192];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\"", key);
-  char *keyp = strstr(tmp, pat);
-  if (!keyp) {
-    return -1;
-  }
-  char *colon = strchr(keyp + strlen(pat), ':');
-  if (!colon) {
-    return -1;
-  }
-  char *q = strchr(colon + 1, '"');
-  if (!q) {
-    return -1;
-  }
-  q++;
-  size_t o = 0;
-  while (*q && *q != '"' && o + 1u < outcap) {
-    if (*q == '\\' && q[1]) {
-      q++;
-      if (*q == 'n' || *q == 'r' || *q == 't') {
-        out[o++] = ' ';
-      } else {
-        out[o++] = *q;
-      }
-      q++;
-      continue;
-    }
-    out[o++] = *q++;
-  }
-  out[o] = 0;
-  return out[0] ? 0 : -1;
+  return edr_parse_json_string(p, len, key, out, outcap) ? 0 : -1;
 }
 
 static int parse_json_int_field(const uint8_t *p, size_t len, const char *key, long *out) {
-  if (!p || len == 0u || !key || !out) {
+  int value = 0;
+  if (!out || !edr_parse_json_int(p, len, key, &value)) {
     return -1;
   }
-  char tmp[8192];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\"", key);
-  char *keyp = strstr(tmp, pat);
-  if (!keyp) {
-    return -1;
-  }
-  char *colon = strchr(keyp + strlen(pat), ':');
-  if (!colon) {
-    return -1;
-  }
-  char *start = colon + 1;
-  while (*start && (isspace((unsigned char)*start) || *start == '"' || *start == '\'')) {
-    start++;
-  }
-  char *end = NULL;
-  long v = strtol(start, &end, 10);
-  if (!end || end == start) {
-    return -1;
-  }
-  *out = v;
+  *out = (long)value;
   return 0;
 }
 
 static int parse_json_bool_field(const uint8_t *p, size_t len, const char *key, int *out) {
-  if (!p || len == 0u || !key || !out) {
-    return -1;
-  }
-  char tmp[8192];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\"", key);
-  char *keyp = strstr(tmp, pat);
-  if (!keyp) {
-    return -1;
-  }
-  char *colon = strchr(keyp + strlen(pat), ':');
-  if (!colon) {
-    return -1;
-  }
-  char *start = colon + 1;
-  while (*start && isspace((unsigned char)*start)) {
-    start++;
-  }
-  if (strncmp(start, "true", 4u) == 0 || strncmp(start, "\"true\"", 6u) == 0 ||
-      strncmp(start, "1", 1u) == 0 || strncmp(start, "\"1\"", 3u) == 0) {
-    *out = 1;
-    return 0;
-  }
-  if (strncmp(start, "false", 5u) == 0 || strncmp(start, "\"false\"", 7u) == 0 ||
-      strncmp(start, "0", 1u) == 0 || strncmp(start, "\"0\"", 3u) == 0) {
-    *out = 0;
-    return 0;
-  }
-  return -1;
+  return edr_parse_json_bool(p, len, key, out) ? 0 : -1;
 }
 
 static int parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
-  *out_pid = -1;
-  if (!p || len == 0u) {
+  int pid = -1;
+  if (!out_pid || !edr_parse_json_int(p, len, "pid", &pid) || pid <= 0) {
     return -1;
   }
-  char tmp[4096];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char *q = strstr(tmp, "\"pid\"");
-  if (!q) {
-    q = strstr(tmp, "pid");
-  }
-  if (!q) {
-    return -1;
-  }
-  char *colon = strchr(q, ':');
-  char *start = colon ? colon + 1 : q;
-  while (*start && (isspace((unsigned char)*start) || *start == '"' || *start == '\'')) {
-    start++;
-  }
-  *out_pid = strtol(start, NULL, 10);
-  if (*out_pid <= 0 || *out_pid > 0x7fffffffL) {
-    return -1;
-  }
+  *out_pid = (long)pid;
   return 0;
 }
 
@@ -662,41 +569,11 @@ static int parse_path_json(const uint8_t *p, size_t len, char *out, size_t outca
 }
 
 static int parse_server_address_json(const uint8_t *p, size_t len, char *out, size_t outcap) {
-  if (!p || len == 0u || !out || outcap < 8u) {
-    return -1;
-  }
-  char tmp[2048];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  const char *keys[] = {"\"server_address\"", "\"server_addr\"", "\"address\""};
+  const char *keys[] = {"server_address", "server_addr", "address"};
   for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-    char *k = strstr(tmp, keys[i]);
-    if (!k) {
-      continue;
+    if (edr_parse_json_string(p, len, keys[i], out, outcap) && out[0]) {
+      return 0;
     }
-    char *colon = strchr(k, ':');
-    if (!colon) {
-      continue;
-    }
-    char *q = strchr(colon + 1, '"');
-    if (!q) {
-      continue;
-    }
-    q++;
-    char *end = strchr(q, '"');
-    if (!end) {
-      continue;
-    }
-    size_t n = (size_t)(end - q);
-    if (n == 0u || n >= outcap) {
-      return -1;
-    }
-    memcpy(out, q, n);
-    out[n] = 0;
-    return 0;
   }
   return -1;
 }
@@ -819,7 +696,7 @@ int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
     char payload[96];
     snprintf(id, sizeof(id), "auto-pmfe-%s", r->event_id[0] ? r->event_id : "event");
     snprintf(payload, sizeof(payload), "{\"pid\":%u,\"reason\":\"recommended_forensics\"}", (unsigned)r->pid);
-    edr_command_on_envelope(id, "pmfe_scan", (const uint8_t *)payload, strlen(payload), &sm);
+    edr_command_on_internal_envelope(id, "pmfe_scan", (const uint8_t *)payload, strlen(payload), &sm);
     dispatched++;
   }
 
@@ -857,7 +734,7 @@ int edr_command_dispatch_recommended_forensics(const EdrBehaviorRecord *r) {
              ctx_has(r, "targeted_files") || ctx_has(r, "webshell_files") ? "targeted_files," : "",
              ctx_has(r, "ioc_lookup") ? "ioc_lookup," : "",
              ctx_has(r, "single_process_minidump") ? "single_process_minidump_if_needed" : "");
-    edr_command_on_envelope(id, "forensic", (const uint8_t *)payload, strlen(payload), &sm);
+    edr_command_on_internal_envelope(id, "forensic", (const uint8_t *)payload, strlen(payload), &sm);
     dispatched++;
   }
   return dispatched;
@@ -2048,30 +1925,8 @@ static void do_file_stat(const char *cmd_id, const uint8_t *pl, size_t len, cons
 }
 
 static int parse_int_json_default(const uint8_t *p, size_t len, const char *key, int defv) {
-  if (!p || len == 0u || !key) {
-    return defv;
-  }
-  char tmp[4096];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\"", key);
-  char *k = strstr(tmp, pat);
-  if (!k) {
-    return defv;
-  }
-  char *colon = strchr(k + strlen(pat), ':');
-  if (!colon) {
-    return defv;
-  }
-  char *v = colon + 1;
-  while (*v && isspace((unsigned char)*v)) {
-    v++;
-  }
-  return (int)strtol(v, NULL, 10);
+  int value = defv;
+  return edr_parse_json_int(p, len, key, &value) ? value : defv;
 }
 
 static int ascii_case_equal(const char *a, const char *b) {
@@ -2339,6 +2194,10 @@ static void rtr_shell_output_to_utf8(char *s, size_t cap) {
 }
 #endif
 
+static int rtr_shell_cancel_check(void *user) {
+  return edr_command_cancel_requested((const char *)user);
+}
+
 static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
                          const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
@@ -2412,7 +2271,8 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
 
   char out[8192];
   int exit_code = 0;
-  int rc = edr_shell_exec(command, timeout_sec, out, sizeof(out), &exit_code);
+  int rc = edr_shell_exec_cancellable(command, timeout_sec, out, sizeof(out), &exit_code,
+                                      rtr_shell_cancel_check, (void *)cmd_id);
 #ifdef _WIN32
   rtr_shell_output_to_utf8(out, sizeof(out));
 #endif
@@ -2436,6 +2296,12 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
     s_exec_fail++;
     audit_both(cmd_id, "rtr_shell: timeout");
     soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 124, detail, "timeout", NULL);
+    return;
+  }
+  if (exit_code == 130 || edr_command_cancel_requested(cmd_id)) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_shell: cancelled");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 130, detail, "cancelled", NULL);
     return;
   }
   if (exit_code != 0) {
@@ -2494,9 +2360,11 @@ static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
 #else
   snprintf(shell_type, sizeof(shell_type), "%s", "/bin/sh");
 #endif
-  if (pl && len > 0u && len < sizeof(shell_type) - 1u && pl[0] != '{') {
-    memcpy(shell_type, pl, len);
-    shell_type[len] = '\0';
+  char requested_shell[128];
+  requested_shell[0] = '\0';
+  if (parse_json_string_field(pl, len, "shell_type", requested_shell,
+                              sizeof(requested_shell)) == 0 && requested_shell[0]) {
+    snprintf(shell_type, sizeof(shell_type), "%s", requested_shell);
   }
   ensure_shell_session_initialized();
   int rc = edr_shell_session_open(cmd_id, shell_type);
@@ -2826,7 +2694,8 @@ static void eventlog_write_windows_record(FILE *f, const char *xml) {
   fputs("\"}", f);
 }
 
-static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) {
+static int eventlog_query_to_file(const char *channel, int max_events, FILE *f,
+                                  const char *cmd_id) {
   wchar_t wchannel[256];
   if (!channel || !channel[0]) {
     channel = "Security";
@@ -2840,8 +2709,26 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
   DWORD returned = 0;
   int total = 0;
   int first = 1;
-  while (total < max_events && EvtNext(hq, 16, events, 1000, 0, &returned)) {
-    for (DWORD i = 0; i < returned && total < max_events; i++) {
+  while (total < max_events) {
+    if (edr_command_cancel_requested(cmd_id)) {
+      EvtClose(hq);
+      return -2;
+    }
+    if (!EvtNext(hq, 16, events, 1000, 0, &returned)) {
+      break;
+    }
+    for (DWORD i = 0; i < returned; i++) {
+      if (edr_command_cancel_requested(cmd_id)) {
+        for (DWORD j = i; j < returned; j++) {
+          EvtClose(events[j]);
+        }
+        EvtClose(hq);
+        return -2;
+      }
+      if (total >= max_events) {
+        EvtClose(events[i]);
+        continue;
+      }
       DWORD used = 0;
       DWORD props = 0;
       (void)EvtRender(NULL, events[i], EvtRenderEventXml, 0, NULL, &used, &props);
@@ -2872,7 +2759,8 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
   return total;
 }
 #else
-static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) {
+static int eventlog_query_to_file(const char *channel, int max_events, FILE *f,
+                                  const char *cmd_id) {
   if (max_events <= 0) {
     max_events = 100;
   }
@@ -2889,24 +2777,51 @@ static int eventlog_query_to_file(const char *channel, int max_events, FILE *f) 
   }
   char cmd[256];
   snprintf(cmd, sizeof(cmd), "journalctl --output=json -n %d%s 2>/dev/null", max_events, filt);
-  FILE *p = popen(cmd, "r");
-  if (!p) {
+  size_t output_cap = (size_t)max_events * 8192u + 1u;
+  if (output_cap > 8u * 1024u * 1024u) {
+    output_cap = 8u * 1024u * 1024u;
+  }
+  char *output = (char *)calloc(1u, output_cap);
+  int exit_code = 0;
+  if (!output) {
     return -1;
   }
-  char line[8192];
+  if (edr_shell_exec_cancellable(cmd, 30, output, output_cap, &exit_code,
+                                 rtr_shell_cancel_check, (void *)cmd_id) != 0) {
+    free(output);
+    return -1;
+  }
+  if (exit_code == 130 || edr_command_cancel_requested(cmd_id)) {
+    free(output);
+    return -2;
+  }
   int first = 1;
   int count = 0;
-  while (fgets(line, sizeof(line), p) && count < max_events) {
-    line[strcspn(line, "\r\n")] = '\0';
+  char *line = output;
+  while (*line && count < max_events) {
+    char *next = strpbrk(line, "\r\n");
+    if (next) {
+      *next = '\0';
+      char *after = next + 1;
+      while (*after == '\r' || *after == '\n') after++;
+      next = after;
+    }
+    if (!line[0]) {
+      if (!next) break;
+      line = next;
+      continue;
+    }
     if (!first) {
       fputs(",\n", f);
     }
     first = 0;
     fputs(line, f);
     count++;
+    if (!next) break;
+    line = next;
   }
-  int status = pclose(p);
-  if (status != 0 && count == 0) {
+  free(output);
+  if (exit_code != 0 && count == 0) {
     return -1;
   }
   return count;
@@ -2940,7 +2855,15 @@ static void do_eventlog_view(const char *cmd_id, const uint8_t *pl, size_t len,
   fputs("{\"channel\":\"", f);
   fprint_json_escaped(f, channel);
   fputs("\",\"events\":[\n", f);
-  int count = eventlog_query_to_file(channel, max_events, f);
+  int count = eventlog_query_to_file(channel, max_events, f, cmd_id);
+  if (count == -2 || edr_command_cancel_requested(cmd_id)) {
+    fclose(f);
+    (void)remove(path);
+    audit_both(cmd_id, "eventlog_view: cancelled during collection");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 130, "event log collection cancelled",
+                 "cancelled", NULL);
+    return;
+  }
   if (count < 0) {
     fclose(f);
     (void)remove(path);
@@ -3852,7 +3775,16 @@ static void do_rtr_list_connections(const char *cmd_id, const uint8_t *pl, size_
   } else {
     snprintf(payload, sizeof(payload), "{\"event_type\":\"network\",\"limit\":50,\"time_window_s\":600}");
   }
-  if (!strstr(payload, "\"event_type\"") && !strstr(payload, "\"type\"")) {
+  char requested_type[64] = "";
+  int has_event_type = edr_parse_json_string((const uint8_t *)payload, strlen(payload),
+                                             "event_type", requested_type,
+                                             sizeof(requested_type));
+  if (!has_event_type) {
+    has_event_type = edr_parse_json_string((const uint8_t *)payload, strlen(payload),
+                                           "type", requested_type,
+                                           sizeof(requested_type));
+  }
+  if (!has_event_type) {
     char wrapped[4096];
     const char *body = payload;
     while (*body && isspace((unsigned char)*body)) {
@@ -3989,6 +3921,7 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   fprintf(f, "{\"pid\":%ld,\"modules\":[\n", pid);
   int count = 0;
+  int cancelled = 0;
   /* 同步累积前若干条模块的内联 JSON，随结果回流（主机显微镜内联表格直接展示，无需下载产物）。 */
   char inline_mods[9000];
   size_t io = 0;
@@ -4016,6 +3949,10 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
     me.dwSize = sizeof(me);
     if (Module32First(snap, &me)) {
       do {
+        if (edr_command_cancel_requested(cmd_id)) {
+          cancelled = 1;
+          break;
+        }
         if (count >= max_modules) {
           break;
         }
@@ -4043,6 +3980,10 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
     char prevpath[512];
     prevpath[0] = '\0';
     while (fgets(line, sizeof(line), mp) && count < max_modules) {
+      if (edr_command_cancel_requested(cmd_id)) {
+        cancelled = 1;
+        break;
+      }
       unsigned long long a0 = 0, a1 = 0;
       char perms[8] = {0};
       char pathbuf[512] = {0};
@@ -4073,6 +4014,15 @@ static void do_list_modules(const char *cmd_id, const uint8_t *pl, size_t len,
   }
 #endif
 #undef EDR_MOD_EMIT
+  if (cancelled || edr_command_cancel_requested(cmd_id)) {
+    fclose(f);
+    (void)remove(path);
+    s_exec_fail++;
+    audit_both(cmd_id, "list_modules: cancelled during enumeration");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 130, "module enumeration cancelled",
+                 "cancelled", NULL);
+    return;
+  }
   fprintf(f, "\n],\"total\":%d}\n", count);
   fclose(f);
   char sha[65];
@@ -4125,6 +4075,7 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
   }
   fputs("{\"processes\":[\n", f);
   int count = 0;
+  int cancelled = 0;
   char inline_procs[28000];
   size_t io = 0;
   int inline_count = 0;
@@ -4150,6 +4101,10 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
     pe.dwSize = (DWORD)sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
       do {
+        if (edr_command_cancel_requested(cmd_id)) {
+          cancelled = 1;
+          break;
+        }
         if (count >= max_procs) {
           break;
         }
@@ -4169,6 +4124,10 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
   if (pd) {
     struct dirent *ent;
     while ((ent = readdir(pd)) != NULL && count < max_procs) {
+      if (edr_command_cancel_requested(cmd_id)) {
+        cancelled = 1;
+        break;
+      }
       const char *nm = ent->d_name;
       int isnum = nm[0] != '\0';
       for (const char *q = nm; *q; q++) {
@@ -4214,6 +4173,15 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
   }
 #endif
 #undef EDR_PROC_EMIT
+  if (cancelled || edr_command_cancel_requested(cmd_id)) {
+    fclose(f);
+    (void)remove(path);
+    s_exec_fail++;
+    audit_both(cmd_id, "host_process_tree: cancelled during enumeration");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 130, "process snapshot cancelled",
+                 "cancelled", NULL);
+    return;
+  }
   fprintf(f, "\n],\"total\":%d}\n", count);
   fclose(f);
   char sha[65];
@@ -4300,6 +4268,8 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
   spec.extra_args = extra;
   spec.timeout_s = 60u;
   spec.needs_velociraptor = 1; /* velo_query 走 velo 适配器,运行前确保 velo 就绪 */
+  spec.cancel_requested = rtr_shell_cancel_check;
+  spec.cancel_user = (void *)cmd_id;
   char dc_detail[512];
   dc_detail[0] = '\0';
   int rc = edr_deep_collector_run_blocking(&spec, dc_detail, sizeof(dc_detail));
@@ -4375,11 +4345,40 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
         soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or invalid query output");
         return;
       }
+      cJSON *root = cJSON_Parse(detail);
+      if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        free(detail);
+        s_exec_fail++;
+        soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: invalid JSON query output");
+        return;
+      }
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "schema");
+      cJSON_AddStringToObject(root, "schema", "edr.forensic.result.v1");
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "status");
+      cJSON_AddStringToObject(root, "status", upload_rc == 0 ? "success" : "partial_success");
+      if (!cJSON_GetObjectItemCaseSensitive(root, "source"))
+        cJSON_AddStringToObject(root, "source", "velociraptor");
+      if (!cJSON_GetObjectItemCaseSensitive(root, "artifact"))
+        cJSON_AddStringToObject(root, "artifact", rowspath);
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "sha256");
+      cJSON_AddStringToObject(root, "sha256", sha);
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "object_key");
+      cJSON_AddStringToObject(root, "object_key", minio_key);
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "truncated");
+      cJSON_AddBoolToObject(root, "truncated", 0);
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "upload_status");
+      cJSON_AddStringToObject(root, "upload_status", upload_rc == 0 ? "ok" : "failed");
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "error");
+      cJSON_AddStringToObject(root, "error", upload_rc == 0 ? "" : "artifact upload failed; inline rows retained");
+      char *contract_detail = cJSON_PrintUnformatted(root);
+      cJSON_Delete(root);
       s_handled++;
       s_exec_ok++;
       audit_both(cmd_id, "velo_query: ok (inline)");
-      soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail,
+      soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, contract_detail ? contract_detail : detail,
                    upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
+      if (contract_detail) cJSON_free(contract_detail);
       free(detail);
       return;
     }
@@ -4391,9 +4390,14 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     char detail[2600];
     int can_dl = (upload_rc == 0 && minio_key[0]) ? 1 : 0;
     snprintf(detail, sizeof(detail),
-             "{\"source\":\"velociraptor\",\"truncated\":true,\"download\":%s,"
-             "\"total\":-1,\"rows\":[],\"minio_key\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\"}",
-             can_dl ? "true" : "false", minioj, sha, upload_rc == 0 ? "ok" : "failed");
+             "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"%s\","
+             "\"source\":\"velociraptor\",\"artifact\":%s,\"sha256\":\"%s\","
+             "\"object_key\":%s,\"truncated\":true,\"upload_status\":\"%s\","
+             "\"error\":\"%s\",\"download\":%s,\"total\":-1,\"rows\":[]}",
+             can_dl ? "success" : "failed", pathj, sha, minioj,
+             upload_rc == 0 ? "ok" : "failed",
+             can_dl ? "" : "large result upload failed; no retrievable rows",
+             can_dl ? "true" : "false");
     s_handled++;
     if (can_dl) {
       s_exec_ok++;
@@ -4431,6 +4435,7 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   fputs("{\"autoruns\":[\n", f);
   int count = 0;
+  int cancelled = 0;
   char inl[24000];
   size_t io = 0;
   int inl_n = 0;
@@ -4459,11 +4464,13 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
       { HKEY_LOCAL_MACHINE, "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Wow6432\\Run" },
     };
     for (size_t ki = 0; ki < sizeof(RUN_KEYS) / sizeof(RUN_KEYS[0]) && count < max_rows; ki++) {
+      if (edr_command_cancel_requested(cmd_id)) { cancelled = 1; break; }
       HKEY hk;
       if (RegOpenKeyExA(RUN_KEYS[ki].root, RUN_KEYS[ki].sub, 0, KEY_READ, &hk) != ERROR_SUCCESS) {
         continue;
       }
       for (DWORD idx = 0; count < max_rows; idx++) {
+        if (edr_command_cancel_requested(cmd_id)) { cancelled = 1; break; }
         char name[512];
         BYTE data[4096];
         DWORD ns = sizeof(name), ds = sizeof(data), type = 0;
@@ -4486,27 +4493,47 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
         EDR_AR_EMIT(obj);
       }
       RegCloseKey(hk);
+      if (cancelled) break;
     }
-    /* 计划任务 + 启动项（best-effort，经 popen）。 */
+    /* 计划任务 + 启动项：通过可取消执行器采样，避免 popen/fgets 无输出时卡住。 */
     static const struct { const char *cmd; const char *type; const char *loc; } WIN_CMDS[] = {
       { "schtasks /query /fo csv /nh 2>nul", "scheduled_task", "schtasks" },
       { "wmic startup get Caption,Command /format:csv 2>nul", "startup_item", "wmic_startup" },
     };
-    for (size_t ci = 0; ci < sizeof(WIN_CMDS) / sizeof(WIN_CMDS[0]) && count < max_rows; ci++) {
-      FILE *p = _popen(WIN_CMDS[ci].cmd, "r");
-      if (!p) { continue; }
-      char line[2048];
-      while (fgets(line, sizeof(line), p) && count < max_rows) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!line[0]) { continue; }
+    for (size_t ci = 0; !cancelled && ci < sizeof(WIN_CMDS) / sizeof(WIN_CMDS[0]) && count < max_rows; ci++) {
+      char *output = (char *)calloc(1u, 65536u);
+      int exit_code = 0;
+      if (!output) { continue; }
+      if (edr_shell_exec_cancellable(WIN_CMDS[ci].cmd, 15, output, 65536u, &exit_code,
+                                     rtr_shell_cancel_check, (void *)cmd_id) != 0) {
+        free(output);
+        continue;
+      }
+      if (exit_code == 130 || edr_command_cancel_requested(cmd_id)) {
+        cancelled = 1;
+        free(output);
+        break;
+      }
+      char *line = output;
+      while (*line && count < max_rows) {
+        char *next = strpbrk(line, "\r\n");
+        if (next) {
+          *next = '\0';
+          char *after = next + 1;
+          while (*after == '\r' || *after == '\n') after++;
+          next = after;
+        }
+        if (!line[0]) { line = next ? next : line + strlen(line); continue; }
         char lj[2200], tj[64], loj[64], obj[2500];
         json_escape_to(lj, sizeof(lj), line);
         json_escape_to(tj, sizeof(tj), WIN_CMDS[ci].type);
         json_escape_to(loj, sizeof(loj), WIN_CMDS[ci].loc);
         snprintf(obj, sizeof(obj), "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}", tj, lj, lj, loj);
         EDR_AR_EMIT(obj);
+        if (!next) break;
+        line = next;
       }
-      _pclose(p);
+      free(output);
     }
   }
 #else
@@ -4518,25 +4545,53 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
       { "cat /etc/rc.local 2>/dev/null", "rc_local", "/etc/rc.local" },
       { "ls -1 ~/.config/autostart /etc/xdg/autostart 2>/dev/null", "autostart", "autostart" },
     };
-    for (size_t ci = 0; ci < sizeof(NIX_CMDS) / sizeof(NIX_CMDS[0]) && count < max_rows; ci++) {
-      FILE *p = popen(NIX_CMDS[ci].cmd, "r");
-      if (!p) { continue; }
-      char line[2048];
-      while (fgets(line, sizeof(line), p) && count < max_rows) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (!line[0] || line[0] == '#') { continue; }
+    for (size_t ci = 0; !cancelled && ci < sizeof(NIX_CMDS) / sizeof(NIX_CMDS[0]) && count < max_rows; ci++) {
+      char *output = (char *)calloc(1u, 65536u);
+      int exit_code = 0;
+      if (!output) { continue; }
+      if (edr_shell_exec_cancellable(NIX_CMDS[ci].cmd, 15, output, 65536u, &exit_code,
+                                     rtr_shell_cancel_check, (void *)cmd_id) != 0) {
+        free(output);
+        continue;
+      }
+      if (exit_code == 130 || edr_command_cancel_requested(cmd_id)) {
+        cancelled = 1;
+        free(output);
+        break;
+      }
+      char *line = output;
+      while (*line && count < max_rows) {
+        char *next = strpbrk(line, "\r\n");
+        if (next) {
+          *next = '\0';
+          char *after = next + 1;
+          while (*after == '\r' || *after == '\n') after++;
+          next = after;
+        }
+        if (!line[0] || line[0] == '#') { line = next ? next : line + strlen(line); continue; }
         char lj[2200], tj[64], loj[64], obj[2500];
         json_escape_to(lj, sizeof(lj), line);
         json_escape_to(tj, sizeof(tj), NIX_CMDS[ci].type);
         json_escape_to(loj, sizeof(loj), NIX_CMDS[ci].loc);
         snprintf(obj, sizeof(obj), "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}", tj, lj, lj, loj);
         EDR_AR_EMIT(obj);
+        if (!next) break;
+        line = next;
       }
-      pclose(p);
+      free(output);
     }
   }
 #endif
 #undef EDR_AR_EMIT
+  if (cancelled || edr_command_cancel_requested(cmd_id)) {
+    fclose(f);
+    (void)remove(path);
+    s_exec_fail++;
+    audit_both(cmd_id, "list_autoruns: cancelled during enumeration");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 130, "autoruns collection cancelled",
+                 "cancelled", NULL);
+    return;
+  }
   fprintf(f, "\n],\"total\":%d}\n", count);
   fclose(f);
   char sha[65];
@@ -4885,61 +4940,23 @@ static void command_signature_idempotency_value(const char *idempotency_key, cha
   out[n] = '\0';
 }
 
-static int is_internal_auto_command(const char *cmd_id) {
-  return cmd_id && (strncmp(cmd_id, "auto-", 5) == 0 || strcmp(cmd_id, "auto-shellcode") == 0);
-}
-
-static int is_rtr_shell_command_type(const char *t) {
-  return streq(t, "rtr_shell") || streq(t, "RTR_SHELL") ||
-         streq(t, "remote_shell") || streq(t, "shell_exec") ||
-         streq(t, "shell_open") || streq(t, "shell_input") || streq(t, "shell_close");
-}
-
-static int is_dangerous_command_type(const char *t) {
-  return streq(t, "isolate_host") || streq(t, "isolate") ||
-         streq(t, "restore_host") || streq(t, "host_restore") ||
-         streq(t, "kill_process") || streq(t, "kill") ||
-         streq(t, "collect_forensic") || streq(t, "forensic") ||
-         streq(t, "memory_dump") || streq(t, "memdump") ||
-         streq(t, "targeted_forensic") || streq(t, "forensic_targeted") ||
-         streq(t, "yara_scan") ||
-         streq(t, "deep_forensic") || streq(t, "collector") || streq(t, "collector:start") ||
-         streq(t, "put_file") || streq(t, "rtr_put_file") || streq(t, "rtr_file_put") ||
-         streq(t, "rtr_get_file") || streq(t, "rtr_file_get") || streq(t, "get_file") ||
-         streq(t, "RTR_GET_FILE") || streq(t, "rtr_rm_file") || streq(t, "rtr_file_rm") ||
-         streq(t, "remove_file") || streq(t, "delete_file") || streq(t, "RTR_RM_FILE") ||
-         streq(t, "quarantine_file") || streq(t, "file_quarantine") ||
-         streq(t, "rtr_quarantine_file") || streq(t, "RTR_QUARANTINE_FILE") ||
-         streq(t, "unquarantine_file") || streq(t, "restore_file") ||
-         streq(t, "file_unquarantine") || streq(t, "rtr_unquarantine_file") ||
-         streq(t, "RTR_UNQUARANTINE_FILE") ||
-         streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN") ||
-         streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG") ||
-         streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY") ||
-         streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES") ||
-         streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT") ||
-         streq(t, "list_autoruns") || streq(t, "autoruns") || streq(t, "RTR_AUTORUNS") ||
-         streq(t, "velo_query") || streq(t, "RTR_VELO_QUERY") ||
-         is_rtr_shell_command_type(t);
-}
-
 static int command_signature_verify(const char *cmd_id, const char *cmd_type, const uint8_t *payload,
                                     size_t payload_len, const EdrSoarCommandMeta *sm,
-                                    char *reason, size_t reason_cap) {
-  const char *require = getenv("EDR_COMMAND_REQUIRE_SIGNATURE");
-  int required = require && require[0] == '1';
-  int force_shell_signature = is_rtr_shell_command_type(cmd_type);
-  const char *allow_unsigned = getenv("EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS");
-  if (force_shell_signature) {
-    required = 1;
-  }
-  if (!required && is_dangerous_command_type(cmd_type) && !is_internal_auto_command(cmd_id) &&
-      !(allow_unsigned && allow_unsigned[0] == '1')) {
-    required = 1;
-  }
-  if (force_shell_signature && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
-    snprintf(reason, reason_cap, "rtr_shell requires issued_at_unix_ms and deadline_ms");
+                                    int internal_trusted, char *reason, size_t reason_cap) {
+  int required = internal_trusted ? 0 :
+      edr_command_contract_signature_required(cmd_id, cmd_type);
+  if (required && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
+    snprintf(reason, reason_cap, "signed external command requires issued_at_unix_ms and deadline_ms");
     return 0;
+  }
+  if (required) {
+    int64_t now_ms = command_now_ms();
+    uint32_t max_future_skew_ms = command_u32_env_clamped(
+        "EDR_COMMAND_MAX_FUTURE_SKEW_MS", 300000u, 1000u, 3600000u);
+    if (sm->issued_at_unix_ms > now_ms + (int64_t)max_future_skew_ms) {
+      snprintf(reason, reason_cap, "command issued_at_unix_ms is too far in the future");
+      return 0;
+    }
   }
 
   char idem[512];
@@ -5052,76 +5069,38 @@ static int command_deadline_expired(const EdrSoarCommandMeta *sm, char *reason, 
   return 1;
 }
 
-enum { COMMAND_ACTIVE_INBOX_MAX = 32 };
-static char s_active_inbox_commands[COMMAND_ACTIVE_INBOX_MAX][128];
-
-static int command_inbox_is_active(const char *command_id) {
-  if (!command_id || !command_id[0]) {
-    return 0;
-  }
-  for (size_t i = 0; i < COMMAND_ACTIVE_INBOX_MAX; i++) {
-    if (s_active_inbox_commands[i][0] &&
-        strcmp(s_active_inbox_commands[i], command_id) == 0) {
-      return 1;
-    }
-  }
-  return 0;
+static int command_lane_filter(const char *command_type, void *user) {
+  int lane = user ? *(const int *)user : -1;
+  return lane < 0 || (int)edr_command_registry_execution_lane(command_type) == lane;
 }
 
-static int command_inbox_mark_active(const char *command_id) {
-  if (!command_id || !command_id[0]) {
-    return 1;
-  }
-  if (command_inbox_is_active(command_id)) {
-    return 0;
-  }
-  for (size_t i = 0; i < COMMAND_ACTIVE_INBOX_MAX; i++) {
-    if (!s_active_inbox_commands[i][0]) {
-      snprintf(s_active_inbox_commands[i], sizeof(s_active_inbox_commands[i]), "%s", command_id);
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static void command_inbox_unmark_active(const char *command_id) {
-  if (!command_id || !command_id[0]) {
-    return;
-  }
-  for (size_t i = 0; i < COMMAND_ACTIVE_INBOX_MAX; i++) {
-    if (strcmp(s_active_inbox_commands[i], command_id) == 0) {
-      s_active_inbox_commands[i][0] = '\0';
-      return;
-    }
-  }
-}
-
-static void replay_persisted_command_inbox(void) {
-  static int s_replaying_inbox;
-  if (s_replaying_inbox) {
-    return;
-  }
-  s_replaying_inbox = 1;
-  EdrCommandInboxRecord inbox[8];
-  int n = edr_command_state_collect_inbox(inbox, sizeof(inbox) / sizeof(inbox[0]));
+int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
+  EdrCommandInboxRecord inbox[16];
+  memset(inbox, 0, sizeof(inbox));
+  int n = edr_command_state_collect_inbox_filtered(
+      inbox, sizeof(inbox) / sizeof(inbox[0]), command_lane_filter, &lane);
+  int work_done = 0;
+  int saw_error = 0;
   for (int i = 0; i < n; i++) {
-    if (command_inbox_is_active(inbox[i].command_id)) {
-      edr_command_state_free_inbox_record(&inbox[i]);
+    if (!edr_command_cancel_begin(inbox[i].command_id)) {
       continue;
     }
     s_active_command_type = inbox[i].command_type;
     edr_command_set_active_type(s_active_command_type);
     char sig_reason[160];
     sig_reason[0] = '\0';
+    int internal_trusted = strncmp(inbox[i].command_id, "auto-", 5u) == 0 &&
+                           strcmp(inbox[i].meta.initiated_by, "agent_auto") == 0;
     if (!command_signature_verify(inbox[i].command_id, inbox[i].command_type,
                                   inbox[i].payload, inbox[i].payload_len,
-                                  &inbox[i].meta, sig_reason, sizeof(sig_reason))) {
+                                  &inbox[i].meta, internal_trusted,
+                                  sig_reason, sizeof(sig_reason))) {
       audit_both(inbox[i].command_id, sig_reason[0] ? sig_reason : "persisted command signature rejected");
       soar_emit(inbox[i].command_id, &inbox[i].meta, EdrCmdExecRejected, 15,
                 sig_reason[0] ? sig_reason : "persisted command signature rejected");
-      edr_command_state_delete_inbox(inbox[i].command_id);
-      edr_command_state_free_inbox_record(&inbox[i]);
-      continue;
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
     }
     char reason[180];
     reason[0] = '\0';
@@ -5129,42 +5108,95 @@ static void replay_persisted_command_inbox(void) {
       audit_both(inbox[i].command_id, reason);
       soar_emit_ex(inbox[i].command_id, &inbox[i].meta, EdrCmdExecFailed, 16,
                    reason, "timeout", NULL);
-      edr_command_state_delete_inbox(inbox[i].command_id);
-      edr_command_state_free_inbox_record(&inbox[i]);
-      continue;
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
     }
     int retry_count = 0;
     EdrCommandStateRecord dup;
-    int begin_rc = edr_command_state_replay_begin(inbox[i].command_id, inbox[i].command_type,
-                                                  &inbox[i].meta, &retry_count, &dup);
+    int allow_replay = edr_command_registry_replay_policy(inbox[i].command_type) ==
+                       EDR_COMMAND_REPLAY_IDEMPOTENT;
+    int begin_rc = edr_command_state_replay_begin_policy(
+        inbox[i].command_id, inbox[i].command_type, &inbox[i].meta, allow_replay,
+        &retry_count, &dup);
     if (begin_rc == EDR_COMMAND_STATE_BEGIN_DUP_FINAL) {
       audit_both(inbox[i].command_id, "persisted command replay suppressed by final idempotency state");
       edr_command_state_delete_inbox(inbox[i].command_id);
-      edr_command_state_free_inbox_record(&inbox[i]);
-      continue;
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
     }
     if (begin_rc == EDR_COMMAND_STATE_BEGIN_DUP_RUNNING) {
+      if (edr_command_cancel_requested(inbox[i].command_id)) {
+        edr_command_emit_always_typed_status(
+            inbox[i].command_id, inbox[i].command_type, &inbox[i].meta,
+            EdrCmdExecFailed, 130, "command cancelled before action started", "cancelled");
+        edr_command_cancel_end(inbox[i].command_id);
+        work_done = 1;
+        break;
+      }
       char detail[320];
       snprintf(detail, sizeof(detail), "persisted command replay deferred; command already running id=%s type=%s retry=%d",
                dup.command_id[0] ? dup.command_id : inbox[i].command_id,
                dup.command_type[0] ? dup.command_type : inbox[i].command_type,
                retry_count);
       audit_both(inbox[i].command_id, detail);
-      edr_command_state_free_inbox_record(&inbox[i]);
+      edr_command_cancel_end(inbox[i].command_id);
       continue;
+    }
+    if (begin_rc == EDR_COMMAND_STATE_BEGIN_REPLAY_BLOCKED) {
+      int was_cancelling = strcmp(dup.response_status, "cancelling") == 0;
+      audit_both(inbox[i].command_id, was_cancelling
+                                            ? "persisted cancelled command suppressed on replay"
+                                            : "persisted command replay blocked by command replay policy");
+      soar_emit_ex(inbox[i].command_id, &inbox[i].meta, EdrCmdExecFailed,
+                   was_cancelling ? 130 : 17,
+                   was_cancelling ? "command cancellation recovered after restart"
+                                  : "command was interrupted and is not safe to replay",
+                   was_cancelling ? "cancelled" : "failed", NULL);
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
     }
     if (begin_rc != EDR_COMMAND_STATE_BEGIN_READY) {
       audit_both(inbox[i].command_id, "persisted command replay begin failed");
-      edr_command_state_free_inbox_record(&inbox[i]);
+      edr_command_cancel_end(inbox[i].command_id);
+      saw_error = 1;
       continue;
     }
     audit_both(inbox[i].command_id, "replaying persisted command inbox");
+    if (edr_command_cancel_requested(inbox[i].command_id)) {
+      edr_command_emit_always_typed_status(
+          inbox[i].command_id, inbox[i].command_type, &inbox[i].meta,
+          EdrCmdExecFailed, 130, "command cancelled before action started", "cancelled");
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
+    }
     edr_command_execute_persisted_envelope(inbox[i].command_id, inbox[i].command_type,
                                            inbox[i].payload, inbox[i].payload_len,
                                            &inbox[i].meta);
+    edr_command_cancel_end(inbox[i].command_id);
+    work_done = 1;
+    break;
+  }
+  for (int i = 0; i < n; i++) {
     edr_command_state_free_inbox_record(&inbox[i]);
   }
-  s_replaying_inbox = 0;
+  if (work_done) {
+    return 1;
+  }
+  return saw_error ? -1 : 0;
+}
+
+int edr_command_replay_persisted_inbox_once(void) {
+  for (int lane = 0; lane < EDR_COMMAND_LANE_COUNT; lane++) {
+    int rc = edr_command_replay_persisted_inbox_once_for_lane(lane);
+    if (rc != 0) {
+      return rc;
+    }
+  }
+  return 0;
 }
 
 static void flush_command_result_outbox(void) {
@@ -5276,12 +5308,13 @@ void edr_command_poll_reliable_delivery(void) {
   uint64_t total_start = command_monotonic_ms();
   s_delivery_health.poll_count++;
   s_delivery_health.last_poll_unix_ms = now;
+  edr_ingest_http_retry_pending_control_acks();
   uint64_t step_start = command_monotonic_ms();
   flush_upload_outbox();
   s_delivery_health.last_upload_ms = command_elapsed_ms_u32(step_start);
   command_update_max_u32(s_delivery_health.last_upload_ms, &s_delivery_health.max_upload_ms);
   if (!pressure) {
-    replay_persisted_command_inbox();
+    edr_command_executor_wake();
   }
   s_delivery_health.last_result_ms = 0u;
   if (!pressure || s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
@@ -5326,10 +5359,23 @@ void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health) {
   *out_health = s_delivery_health;
   out_health->upload_fail_streak = s_upload_outbox_fail_streak;
   out_health->upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
+  EdrCommandStateQuarantineStats quarantine;
+  memset(&quarantine, 0, sizeof(quarantine));
+  edr_command_state_get_quarantine_stats(&quarantine);
+  out_health->inbox_quarantined = quarantine.inbox_record_count;
+  out_health->ack_quarantined = quarantine.ack_record_count;
+  out_health->quarantine_move_failed = quarantine.move_failure_count;
+  out_health->last_quarantine_unix_ms = quarantine.last_quarantine_unix_ms;
+  snprintf(out_health->last_quarantine_kind, sizeof(out_health->last_quarantine_kind), "%s",
+           quarantine.last_record_kind);
+  snprintf(out_health->last_quarantine_reason, sizeof(out_health->last_quarantine_reason), "%s",
+           quarantine.last_reason);
 }
 
-int edr_command_receive_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
-                                 size_t payload_len, const EdrSoarCommandMeta *soar_meta) {
+static int command_receive_envelope_impl(const char *command_id, const char *command_type,
+                                         const uint8_t *payload, size_t payload_len,
+                                         const EdrSoarCommandMeta *soar_meta,
+                                         int internal_trusted) {
   EdrSoarCommandMeta empty;
   memset(&empty, 0, sizeof(empty));
   const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
@@ -5340,12 +5386,22 @@ int edr_command_receive_envelope(const char *command_id, const char *command_typ
 
   char sig_reason[160];
   sig_reason[0] = 0;
-  if (!command_signature_verify(id, t, payload, payload_len, sm, sig_reason, sizeof(sig_reason))) {
+  if (!command_signature_verify(id, t, payload, payload_len, sm, internal_trusted,
+                                sig_reason, sizeof(sig_reason))) {
     s_rejected++;
     audit_both(id, sig_reason[0] ? sig_reason : "command signature rejected");
     soar_emit(id, sm, EdrCmdExecRejected, 15, sig_reason[0] ? sig_reason : "command signature rejected");
     return 0;
   }
+
+  EdrSoarCommandMeta normalized_meta = *sm;
+  if (normalized_meta.issued_at_unix_ms <= 0) {
+    normalized_meta.issued_at_unix_ms = command_now_ms();
+  }
+  if (normalized_meta.deadline_ms == 0u) {
+    normalized_meta.deadline_ms = edr_command_registry_default_timeout_s(t) * 1000u;
+  }
+  sm = &normalized_meta;
 
   char deadline_reason[180];
   deadline_reason[0] = '\0';
@@ -5356,9 +5412,27 @@ int edr_command_receive_envelope(const char *command_id, const char *command_typ
     return 0;
   }
 
-  edr_command_poll_reliable_delivery();
+  char contract_reason[192];
+  contract_reason[0] = '\0';
+  if (!edr_command_contract_validate(t, payload, payload_len,
+                                     contract_reason, sizeof(contract_reason))) {
+    const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(t);
+    s_rejected++;
+    audit_both(id, contract_reason[0] ? contract_reason : "command payload contract rejected");
+    soar_emit(id, sm, descriptor ? EdrCmdExecRejected : EdrCmdExecUnknownType,
+              descriptor ? 19 : 1,
+              contract_reason[0] ? contract_reason : "command payload contract rejected");
+    return 0;
+  }
 
-  if (edr_command_state_store_inbox(id, t, payload, payload_len, sm) != 0) {
+  if (!edr_command_executor_admit(t)) {
+    audit_both(id, "command durable queue full; receipt deferred");
+    return -1;
+  }
+
+  int inbox_store_rc = edr_command_state_store_inbox(id, t, payload, payload_len, sm);
+  edr_command_executor_release_admission();
+  if (inbox_store_rc != 0) {
     s_exec_fail++;
     audit_both(id, "command inbox persist failed; command not acked");
     soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
@@ -5397,7 +5471,19 @@ int edr_command_receive_envelope(const char *command_id, const char *command_typ
     audit_both(id, detail);
     return 0;
   }
+  if (dup_rc != EDR_COMMAND_STATE_BEGIN_READY) {
+    s_exec_fail++;
+    audit_both(id, "command queued-state persist failed; command not acked");
+    return -1;
+  }
   return 1;
+}
+
+int edr_command_receive_envelope(const char *command_id, const char *command_type,
+                                 const uint8_t *payload, size_t payload_len,
+                                 const EdrSoarCommandMeta *soar_meta) {
+  return command_receive_envelope_impl(command_id, command_type, payload, payload_len,
+                                       soar_meta, 0);
 }
 
 void edr_command_execute_received_envelope(const char *command_id, const char *command_type,
@@ -5406,259 +5492,244 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
   EdrSoarCommandMeta empty;
   memset(&empty, 0, sizeof(empty));
   const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
-  const char *t = command_type ? command_type : "";
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  const char *t = descriptor ? descriptor->canonical_type : "";
   const char *id = command_id ? command_id : "";
   s_active_command_type = t;
   edr_command_set_active_type(t);
 
-  if (streq(t, "noop") || streq(t, "ping")) {
-    fprintf(stderr, "[command] ok id=%s type=%s\n", id, t);
-    s_handled++;
-    soar_emit(id, sm, EdrCmdExecOk, 0, t);
+  if (!descriptor) {
+    fprintf(stderr, "[command] unknown type id=%s type=%s\n", id,
+            command_type ? command_type : "");
+    s_unknown++;
+    soar_emit(id, sm, EdrCmdExecUnknownType, 1, "unknown command_type");
     return;
   }
 
-  if (streq(t, "echo")) {
-    fprintf(stderr, "[command] echo id=%s len=%zu\n", id, payload_len);
-    if (payload && payload_len > 0u && payload_len < 4096u) {
-      fwrite(payload, 1, payload_len, stderr);
-      fputc('\n', stderr);
-    }
-    s_handled++;
-    soar_emit(id, sm, EdrCmdExecOk, 0, "echo");
-    return;
-  }
-
-  if (streq(t, "telemetry_profile_update") || streq(t, "runtime_profile_update")) {
-    do_telemetry_profile_update(id, payload, payload_len, sm);
-    return;
-  }
-
-  if (streq(t, "isolate_host") || streq(t, "isolate")) {
-    do_isolate(id, sm);
-    return;
-  }
-  if (streq(t, "restore_host") || streq(t, "host_restore")) {
-    do_restore_host(id, sm);
-    return;
-  }
-  if (streq(t, "isolate_status") || streq(t, "host_isolation_status")) {
-    do_isolate_status(id, sm);
-    return;
-  }
-  if (streq(t, "kill_process") || streq(t, "kill")) {
-    do_kill(id, payload, payload_len, sm);
-    return;
-  }
-	if (streq(t, "collect_forensic")) {
-	  /* SOAR forensic action uses the collector-aware response path. It may
-	   * fall back to the local bundle only when collector policy allows it. */
-	  edr_response_collect_forensic(id, payload, payload_len, sm);
-	 return;
-	}
-	if (streq(t, "forensic")) {
-	  /* Legacy forensic remains the explicit lightweight local bundle path. */
-	  do_forensic(id, payload, payload_len, sm);
-	  return;
-	}
-  // 接线已实现但此前未挂载的处置：进程内存转储 / 定向取证 / 文件下推（实现见 response_forensic.c、response_file.c）。
-  if (streq(t, "memory_dump") || streq(t, "memdump")) {
-    if (!forensic_operator_gate(sm, payload, payload_len)) {
-      edr_command_audit_both(id, "reject memory_dump: operator-only(人工下发) gate");
-      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
-      return;
-    }
-    edr_response_memory_dump(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "targeted_forensic") || streq(t, "forensic_targeted")) {
-    if (!forensic_operator_gate(sm, payload, payload_len)) {
-      edr_command_audit_both(id, "reject targeted_forensic: operator-only(人工下发) gate");
-      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
-      return;
-    }
-    edr_response_targeted_forensic(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "yara_scan")) {
-    if (!forensic_operator_gate(sm, payload, payload_len)) {
-      edr_command_audit_both(id, "reject yara_scan: operator-only(人工下发) gate");
-      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
-      return;
-    }
-    edr_response_yara_scan(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "forensic_cancel") || streq(t, "cancel_forensic") || streq(t, "collector:stop")) {
-    /* 运行中硬取消:可选 payload {"target_cmd_id":"..."};缺省取消当前。实际 kill 由主循环 poll 统一执行。 */
-    char target[96];
-    target[0] = '\0';
-    (void)parse_json_string_field(payload, payload_len, "target_cmd_id", target, sizeof(target));
-    int hit = edr_response_forensic_async_cancel(target[0] ? target : NULL);
-    edr_cmd_inc_handled();
-    edr_cmd_inc_exec_ok();
-    edr_command_emit_always(id, sm, EdrCmdExecOk, 0,
-                            hit ? "forensic cancel requested" : "no running forensic to cancel");
-    return;
-  }
-  if (streq(t, "deep_forensic") || streq(t, "collector") || streq(t, "collector:start")) {
-    if (!forensic_operator_gate(sm, payload, payload_len)) {
-      edr_command_audit_both(id, "reject deep_forensic: operator-only(人工下发) gate");
-      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "forensic requires operator-initiated dispatch");
-      return;
-    }
-    edr_response_deep_forensic(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "put_file") || streq(t, "rtr_put_file") || streq(t, "rtr_file_put")) {
-    edr_response_put_file(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtq_execute") || streq(t, "RTQ_EXECUTE")) {
-    edr_response_rtq_execute(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtq_query") || streq(t, "RTQ_QUERY")) {
-    do_rtq_query(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtr_process_tree") || streq(t, "RTR_PROCESS_TREE")) {
-    do_rtr_process_tree(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtr_list_connections") || streq(t, "RTR_LIST_CONNECTIONS")) {
-    do_rtr_list_connections(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "list_modules") || streq(t, "rtr_list_modules") || streq(t, "RTR_LIST_MODULES")) {
-    do_list_modules(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "host_process_tree") || streq(t, "process_snapshot") || streq(t, "RTR_PROCESS_SNAPSHOT")) {
-    do_host_process_tree(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "list_autoruns") || streq(t, "autoruns") || streq(t, "RTR_AUTORUNS")) {
-    do_list_autoruns(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "velo_query") || streq(t, "RTR_VELO_QUERY")) {
-    if (!forensic_operator_gate(sm, payload, payload_len)) {
-      edr_command_audit_both(id, "reject velo_query: operator-only(人工下发) gate");
-      edr_command_emit_always(id, sm, EdrCmdExecRejected, 8, "velo_query requires operator-initiated dispatch");
-      return;
-    }
-    do_velo_query(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtr_file_stat") || streq(t, "file_stat") || streq(t, "RTR_FILE_STAT")) {
-    do_file_stat(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtr_get_file") || streq(t, "rtr_file_get") || streq(t, "get_file") ||
-      streq(t, "RTR_GET_FILE")) {
-    do_rtr_get_file(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "rtr_rm_file") || streq(t, "rtr_file_rm") || streq(t, "remove_file") ||
-      streq(t, "delete_file") || streq(t, "RTR_RM_FILE")) {
-    do_rtr_rm_file(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "eventlog_view") || streq(t, "rtr_eventlog") || streq(t, "RTR_EVENTLOG")) {
-    do_eventlog_view(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "reg_query") || streq(t, "registry_query") || streq(t, "RTR_REG_QUERY")) {
-    do_registry_query(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "quarantine_file") || streq(t, "file_quarantine") ||
-      streq(t, "rtr_quarantine_file") || streq(t, "RTR_QUARANTINE_FILE")) {
-    do_quarantine_file(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "unquarantine_file") || streq(t, "restore_file") ||
-      streq(t, "file_unquarantine") || streq(t, "rtr_unquarantine_file") ||
-      streq(t, "RTR_UNQUARANTINE_FILE")) {
-    do_unquarantine_file(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "pmfe_scan") || streq(t, "CMD_PMFE_SCAN")) {
-    do_pmfe_scan(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "shell_open")) {
-    do_shell_open(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "shell_input")) {
-    do_shell_input(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "shell_close")) {
-    do_shell_close(id, payload, payload_len, sm);
-    return;
-  }
-  if (is_rtr_shell_command_type(t)) {
-    do_rtr_shell(id, payload, payload_len, sm);
-    return;
-  }
-
-  if (streq(t, "ave_status") || streq(t, "ave_model_status")) {
-    do_ave_status(id, sm);
-    return;
-  }
-  if (streq(t, "ave_fingerprint") || streq(t, "ave_fp")) {
-    do_ave_fingerprint(id, payload, payload_len, sm);
-    return;
-  }
-  if (streq(t, "ave_infer")) {
-    do_ave_infer(id, payload, payload_len, sm);
-    return;
-  }
-
-  if (streq(t, "self_protect_status") || streq(t, "agent_health") || streq(t, "health_status")) {
-    do_self_protect_status(id, sm);
-    return;
-  }
-
-  if (streq(t, "update_server_address") || streq(t, "set_server_address")) {
-    do_update_server_address(id, payload, payload_len, sm);
-    return;
-  }
-
-  if (streq(t, "GET_ATTACK_SURFACE") || streq(t, "get_attack_surface") || streq(t, "REFRESH_ATTACK_SURFACE")) {
-    char detail[256];
-    int r = edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail));
-    if (r != 0) {
-      s_exec_fail++;
-      audit_both(id, "GET_ATTACK_SURFACE: failed");
-      soar_emit(id, sm, EdrCmdExecFailed, r, detail[0] ? detail : "attack_surface_failed");
-    } else {
+  switch (descriptor->kind) {
+    case EDR_COMMAND_KIND_NOOP:
+      fprintf(stderr, "[command] ok id=%s type=%s\n", id, t);
       s_handled++;
-      s_exec_ok++;
-      audit_both(id, "GET_ATTACK_SURFACE: ok");
-      soar_emit(id, sm, EdrCmdExecOk, 0, detail[0] ? detail : "attack_surface_ok");
-    }
-    return;
-  }
+      soar_emit(id, sm, EdrCmdExecOk, 0, t);
+      return;
+    case EDR_COMMAND_KIND_ECHO:
+      fprintf(stderr, "[command] echo id=%s len=%zu\n", id, payload_len);
+      if (payload && payload_len > 0u && payload_len < 4096u) {
+        fwrite(payload, 1, payload_len, stderr);
+        fputc('\n', stderr);
+      }
+      s_handled++;
+      soar_emit(id, sm, EdrCmdExecOk, 0, "echo");
+      return;
+    case EDR_COMMAND_KIND_TELEMETRY_PROFILE_UPDATE:
+      do_telemetry_profile_update(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_ISOLATE_HOST:
+      do_isolate(id, sm);
+      return;
+    case EDR_COMMAND_KIND_RESTORE_HOST:
+      do_restore_host(id, sm);
+      return;
+    case EDR_COMMAND_KIND_ISOLATE_STATUS:
+      do_isolate_status(id, sm);
+      return;
+    case EDR_COMMAND_KIND_KILL_PROCESS:
+      do_kill(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_COLLECT_FORENSIC:
+      edr_response_collect_forensic(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_FORENSIC:
+      do_forensic(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_MEMORY_DUMP:
+      if (!forensic_operator_gate(sm, payload, payload_len)) {
+        edr_command_audit_both(id, "reject memory_dump: operator-only(人工下发) gate");
+        edr_command_emit_always(id, sm, EdrCmdExecRejected, 8,
+                                "forensic requires operator-initiated dispatch");
+        return;
+      }
+      edr_response_memory_dump(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_TARGETED_FORENSIC:
+      if (!forensic_operator_gate(sm, payload, payload_len)) {
+        edr_command_audit_both(id, "reject targeted_forensic: operator-only(人工下发) gate");
+        edr_command_emit_always(id, sm, EdrCmdExecRejected, 8,
+                                "forensic requires operator-initiated dispatch");
+        return;
+      }
+      edr_response_targeted_forensic(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_YARA_SCAN:
+      if (!forensic_operator_gate(sm, payload, payload_len)) {
+        edr_command_audit_both(id, "reject yara_scan: operator-only(人工下发) gate");
+        edr_command_emit_always(id, sm, EdrCmdExecRejected, 8,
+                                "forensic requires operator-initiated dispatch");
+        return;
+      }
+      edr_response_yara_scan(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_FORENSIC_CANCEL: {
+      char target[96];
+      target[0] = '\0';
+      (void)parse_json_string_field(payload, payload_len, "target_cmd_id", target, sizeof(target));
+      EdrCommandStateRecord target_state;
+      memset(&target_state, 0, sizeof(target_state));
+      int state_rc = target[0]
+                         ? edr_command_state_request_cancel(target, &target_state)
+                         : EDR_COMMAND_STATE_CANCEL_NOT_FOUND;
+      int active_hit = target[0] ? edr_command_cancel_request(target) : 0;
+      int forensic_hit = edr_response_forensic_async_cancel(target[0] ? target : NULL);
 
-  fprintf(stderr, "[command] unknown type id=%s type=%s\n", id, t);
-  s_unknown++;
-  soar_emit(id, sm, EdrCmdExecUnknownType, 1, "unknown command_type");
+      if (state_rc == EDR_COMMAND_STATE_CANCEL_REQUESTED &&
+          strcmp(target_state.response_status, "queued") == 0 && !active_hit && !forensic_hit) {
+        EdrSoarCommandMeta target_meta;
+        memset(&target_meta, 0, sizeof(target_meta));
+        snprintf(target_meta.idempotency_key, sizeof(target_meta.idempotency_key), "%s",
+                 target_state.idempotency_key);
+        snprintf(target_meta.soar_correlation_id, sizeof(target_meta.soar_correlation_id), "%s",
+                 target_state.soar_correlation_id);
+        snprintf(target_meta.playbook_run_id, sizeof(target_meta.playbook_run_id), "%s",
+                 target_state.playbook_run_id);
+        snprintf(target_meta.playbook_step_id, sizeof(target_meta.playbook_step_id), "%s",
+                 target_state.playbook_step_id);
+        edr_command_emit_always_typed_status(
+            target, target_state.command_type, &target_meta, EdrCmdExecFailed, 130,
+            "command cancelled before execution", "cancelled");
+      }
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+      char detail[384];
+      snprintf(detail, sizeof(detail),
+               "cancel target=%s state=%d active=%d forensic=%d mode=%d",
+               target[0] ? target : "current_forensic", state_rc, active_hit, forensic_hit,
+               target_state.command_type[0]
+                   ? (int)edr_command_registry_cancel_mode(target_state.command_type)
+                   : (int)EDR_COMMAND_CANCEL_HARD);
+      edr_command_emit_always(id, sm, EdrCmdExecOk, 0, detail);
+      return;
+    }
+    case EDR_COMMAND_KIND_DEEP_FORENSIC:
+      if (!forensic_operator_gate(sm, payload, payload_len)) {
+        edr_command_audit_both(id, "reject deep_forensic: operator-only(人工下发) gate");
+        edr_command_emit_always(id, sm, EdrCmdExecRejected, 8,
+                                "forensic requires operator-initiated dispatch");
+        return;
+      }
+      edr_response_deep_forensic(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_PUT_FILE:
+      edr_response_put_file(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_RTQ_EXECUTE:
+      edr_response_rtq_execute(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_RTQ_QUERY:
+      do_rtq_query(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_PROCESS_TREE:
+      do_rtr_process_tree(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_LIST_CONNECTIONS:
+      do_rtr_list_connections(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_LIST_MODULES:
+      do_list_modules(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_PROCESS_SNAPSHOT:
+      do_host_process_tree(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_LIST_AUTORUNS:
+      do_list_autoruns(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_VELO_QUERY:
+      if (!forensic_operator_gate(sm, payload, payload_len)) {
+        edr_command_audit_both(id, "reject velo_query: operator-only(人工下发) gate");
+        edr_command_emit_always(id, sm, EdrCmdExecRejected, 8,
+                                "velo_query requires operator-initiated dispatch");
+        return;
+      }
+      do_velo_query(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_FILE_STAT:
+      do_file_stat(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_GET_FILE:
+      do_rtr_get_file(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_REMOVE_FILE:
+      do_rtr_rm_file(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_EVENTLOG_VIEW:
+      do_eventlog_view(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_REGISTRY_QUERY:
+      do_registry_query(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_QUARANTINE_FILE:
+      do_quarantine_file(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_RESTORE_FILE:
+      do_unquarantine_file(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_PMFE_SCAN:
+      do_pmfe_scan(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_SHELL_OPEN:
+      do_shell_open(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_SHELL_INPUT:
+      do_shell_input(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_SHELL_CLOSE:
+      do_shell_close(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_RTR_SHELL:
+      do_rtr_shell(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_AVE_STATUS:
+      do_ave_status(id, sm);
+      return;
+    case EDR_COMMAND_KIND_AVE_FINGERPRINT:
+      do_ave_fingerprint(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_AVE_INFER:
+      do_ave_infer(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_SELF_PROTECT_STATUS:
+      do_self_protect_status(id, sm);
+      return;
+    case EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS:
+      do_update_server_address(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_ATTACK_SURFACE: {
+      char detail[256];
+      int r = edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail));
+      if (r != 0) {
+        s_exec_fail++;
+        audit_both(id, "GET_ATTACK_SURFACE: failed");
+        soar_emit(id, sm, EdrCmdExecFailed, r, detail[0] ? detail : "attack_surface_failed");
+      } else {
+        s_handled++;
+        s_exec_ok++;
+        audit_both(id, "GET_ATTACK_SURFACE: ok");
+        soar_emit(id, sm, EdrCmdExecOk, 0, detail[0] ? detail : "attack_surface_ok");
+      }
+      return;
+    }
+    case EDR_COMMAND_KIND_UNKNOWN:
+    default:
+      fprintf(stderr, "[command] registry dispatch missing id=%s type=%s\n", id, t);
+      s_unknown++;
+      soar_emit(id, sm, EdrCmdExecUnknownType, 1, "command registry dispatch missing");
+      return;
+  }
 }
 
 void edr_command_execute_persisted_envelope(const char *command_id, const char *command_type,
                                             const uint8_t *payload, size_t payload_len,
                                             const EdrSoarCommandMeta *soar_meta) {
-  const char *id = command_id ? command_id : "";
-  if (!command_inbox_mark_active(id)) {
-    audit_both(id, "persisted command already executing");
-    return;
-  }
   edr_command_execute_received_envelope(command_id, command_type, payload, payload_len, soar_meta);
-  command_inbox_unmark_active(id);
 }
 
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
@@ -5667,7 +5738,27 @@ void edr_command_on_envelope(const char *command_id, const char *command_type, c
   if (receive_rc <= 0) {
     return;
   }
-  edr_command_execute_persisted_envelope(command_id, command_type, payload, payload_len, soar_meta);
+  edr_command_executor_wake();
+}
+
+void edr_command_on_internal_envelope(const char *command_id, const char *command_type,
+                                      const uint8_t *payload, size_t payload_len,
+                                      const EdrSoarCommandMeta *soar_meta) {
+  if (!command_id || strncmp(command_id, "auto-", 5u) != 0) {
+    audit_both(command_id, "trusted internal command rejected: command_id must use auto- prefix");
+    return;
+  }
+  EdrSoarCommandMeta internal_meta;
+  memset(&internal_meta, 0, sizeof(internal_meta));
+  if (soar_meta) {
+    internal_meta = *soar_meta;
+  }
+  snprintf(internal_meta.initiated_by, sizeof(internal_meta.initiated_by), "%s", "agent_auto");
+  int receive_rc = command_receive_envelope_impl(command_id, command_type, payload, payload_len,
+                                                  &internal_meta, 1);
+  if (receive_rc > 0) {
+    edr_command_executor_wake();
+  }
 }
 
 unsigned long edr_command_handled_count(void) { return s_handled; }

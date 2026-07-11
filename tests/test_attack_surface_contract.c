@@ -50,26 +50,41 @@ int main(void) {
   if (!root || !root[0]) root = ".";
 
   char command_path[1024];
+  char registry_path[1024];
   char report_path[1024];
   snprintf(command_path, sizeof(command_path), "%s/src/command/command_stub.c", root);
+  snprintf(registry_path, sizeof(registry_path), "%s/src/command/command_registry.c", root);
   snprintf(report_path, sizeof(report_path), "%s/src/attack_surface/attack_surface_report.c", root);
 
   char *command = read_file(command_path);
+  char *registry = read_file(registry_path);
   char *report = read_file(report_path);
-  if (!command || !report) {
-    fprintf(stderr, "failed to read command/report sources\n");
+  if (!command || !registry || !report) {
+    fprintf(stderr, "failed to read command/registry/report sources\n");
     free(command);
+    free(registry);
     free(report);
     return 1;
   }
 
   char *branch = slice_between(
       command,
-      "if (streq(t, \"GET_ATTACK_SURFACE\") || streq(t, \"get_attack_surface\") || streq(t, \"REFRESH_ATTACK_SURFACE\"))",
-      "fprintf(stderr, \"[command] unknown type");
+      "case EDR_COMMAND_KIND_ATTACK_SURFACE:",
+      "case EDR_COMMAND_KIND_UNKNOWN:");
   if (!branch) {
     fprintf(stderr, "attack surface command branch not found\n");
     free(command);
+    free(registry);
+    free(report);
+    return 1;
+  }
+  if (!contains(registry, "COMMAND(\"GET_ATTACK_SURFACE\"") ||
+      !contains(registry, "COMMAND(\"get_attack_surface\"") ||
+      !contains(registry, "COMMAND(\"REFRESH_ATTACK_SURFACE\"")) {
+    fprintf(stderr, "attack surface aliases missing from command registry\n");
+    free(branch);
+    free(command);
+    free(registry);
     free(report);
     return 1;
   }
@@ -78,6 +93,7 @@ int main(void) {
     fprintf(stderr, "manual attack surface command no longer calls edr_attack_surface_execute directly\n");
     free(branch);
     free(command);
+    free(registry);
     free(report);
     return 1;
   }
@@ -85,6 +101,7 @@ int main(void) {
     fprintf(stderr, "manual REFRESH_ATTACK_SURFACE must not be gated by attack_surface.enabled\n");
     free(branch);
     free(command);
+    free(registry);
     free(report);
     return 1;
   }
@@ -92,6 +109,7 @@ int main(void) {
     fprintf(stderr, "manual REFRESH_ATTACK_SURFACE must not depend on legacy refresh-request polling\n");
     free(branch);
     free(command);
+    free(registry);
     free(report);
     return 1;
   }
@@ -100,6 +118,7 @@ int main(void) {
     fprintf(stderr, "attack surface upload must use internal ingest HTTP helper\n");
     free(branch);
     free(command);
+    free(registry);
     free(report);
     return 1;
   }
@@ -107,12 +126,14 @@ int main(void) {
     fprintf(stderr, "attack surface upload must not shell out to external curl\n");
     free(branch);
     free(command);
+    free(registry);
     free(report);
     return 1;
   }
 
   free(branch);
   free(command);
+  free(registry);
   free(report);
   return 0;
 }

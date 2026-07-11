@@ -310,17 +310,29 @@ static int is_rule_file(const char *name) {
   return (_stricmp(dot, ".yar") == 0 || _stricmp(dot, ".yara") == 0) ? 1 : 0;
 }
 
-static int yara_compile_cb(int level, const char *file_name, int line_number, const YR_RULE *rule, const char *msg,
-                           void *user_data) {
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static void yara_compile_cb(int level, const char *file_name, int line_number, const YR_RULE *rule,
+                            const char *msg, void *user_data) {
+#else
+static int yara_compile_cb(int level, const char *file_name, int line_number, const YR_RULE *rule,
+                           const char *msg, void *user_data) {
+#endif
   (void)level;
   (void)rule;
   (void)user_data;
   EDR_LOGE("[webshell_detector] yara compile error file=%s line=%d msg=%s\n", file_name ? file_name : "-", line_number,
           msg ? msg : "-");
+#if !defined(YR_VERSION_HEX) || YR_VERSION_HEX < 0x040500
   return 0;
+#endif
 }
 
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static int yara_scan_cb(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
+  (void)context;
+#else
 static int yara_scan_cb(int message, void *message_data, void *user_data) {
+#endif
   WebshellRuleMatch *m = (WebshellRuleMatch *)user_data;
   if (message == CALLBACK_MSG_RULE_MATCHING && m && !m->matched) {
     const YR_RULE *r = (const YR_RULE *)message_data;

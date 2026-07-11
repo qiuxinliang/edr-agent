@@ -263,11 +263,12 @@ static void wstr_to_utf8(const wchar_t *w, char *out, size_t cap) {
 }
 
 static void emit_windows_accounts_groups(FILE *f, EdrAsurfInventorySummary *s) {
-  DWORD level = 1, pref = MAX_PREFERRED_LENGTH, entries = 0, total = 0, resume = 0;
+  DWORD level = 1, pref = MAX_PREFERRED_LENGTH, entries = 0, total = 0, user_resume = 0;
   LPUSER_INFO_1 users = NULL;
   int emitted = 0, trunc = 0;
   fprintf(f, "\"localAccounts\":{\"items\":[");
-  if (NetUserEnum(NULL, level, FILTER_NORMAL_ACCOUNT, (LPBYTE *)&users, pref, &entries, &total, &resume) == NERR_Success && users) {
+  if (NetUserEnum(NULL, level, FILTER_NORMAL_ACCOUNT, (LPBYTE *)&users, pref, &entries, &total,
+                  &user_resume) == NERR_Success && users) {
     for (DWORD i = 0; i < entries; i++) {
       char name[256];
       int disabled = (users[i].usri1_flags & UF_ACCOUNTDISABLE) != 0;
@@ -287,10 +288,12 @@ static void emit_windows_accounts_groups(FILE *f, EdrAsurfInventorySummary *s) {
   fprintf(f, "],\"truncated\":%s},", trunc ? "true" : "false");
 
   LOCALGROUP_INFO_0 *groups = NULL;
-  entries = total = resume = 0;
+  DWORD_PTR group_resume = 0;
+  entries = total = 0;
   emitted = 0; trunc = 0;
   fprintf(f, "\"localGroups\":{\"items\":[");
-  if (NetLocalGroupEnum(NULL, 0, (LPBYTE *)&groups, pref, &entries, &total, &resume) == NERR_Success && groups) {
+  if (NetLocalGroupEnum(NULL, 0, (LPBYTE *)&groups, pref, &entries, &total,
+                        &group_resume) == NERR_Success && groups) {
     for (DWORD i = 0; i < entries; i++) {
       char name[256];
       int priv;

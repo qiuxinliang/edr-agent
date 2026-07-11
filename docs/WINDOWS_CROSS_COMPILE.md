@@ -87,7 +87,9 @@ EDR_MINGW_DOCKER_IMAGE=ubuntu:24.04 ./scripts/build_windows_mingw_docker.sh
 
 ## 产物位置
 
-成功后在仓库内 **`edr-agent/build-mingw/`** 下出现 **`FDSensor.exe`** / **`edr_agent.exe`**（以构建日志为准）。该二进制为 **MinGW ABI**，与 MSVC 产物不同；若作为 Windows 客户端产物使用，必须同时带上 MinGW 动态 triplet 的运行时 DLL（包括 YARA）。
+成功后在仓库内 **`edr-agent/build-mingw/`** 下出现 **`FDSensor.exe`** / **`edr_agent.exe`**（以构建日志为准）。该二进制为 **MinGW ABI**，与 MSVC 产物不同。构建脚本会递归检查 PE import table，将 vcpkg 和 MinGW 工具链的非系统运行时 DLL 复制到可执行文件同目录；任何非系统 DLL 无法解析时构建直接失败，禁止只发布孤立 EXE。
+
+运行时闭包由 **`scripts/stage_mingw_runtime_dlls.sh`** 负责，会继续检查已复制 DLL 的下一层依赖（例如 curl 引入的 nghttp2/zlib），而不是只处理 `FDSensor.exe` 的直接依赖。
 
 ## 终端编译注意要点
 
@@ -115,6 +117,7 @@ Windows 客户端包要求真实 libyara 扫描能力；MinGW 路径也会强制
 - **`EDR_MINGW_DEPS_PREFIX`** 必须指向 vcpkg 的 **MinGW 动态 triplet**（推荐 **`x64-mingw-dynamic`**），且包含：
   - **`include/yara.h`** 或 **`include/yara/yara.h`**；
   - **`share/unofficial-libyara/unofficial-libyara-config.cmake`**；
+  - YARA 运行库 DLL，或 vcpkg 当前 YARA port 生成的静态 archive（如 `lib/liblibyara.a`）。
   - **`bin/*yara*.dll`** / **`bin/libyara*.dll`**。
 - 不要把 **`EDR_MINGW_DEPS_PREFIX`** 指向 MSVC **`x64-windows`** 安装树；ABI 不匹配，且不会作为 MinGW 客户端包的有效运行时来源。
 

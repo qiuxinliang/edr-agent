@@ -16,6 +16,7 @@ typedef enum {
   EDR_DC_ERR_TIMEOUT = -4,
   EDR_DC_ERR_CRASH = -5,
   EDR_DC_ERR_DISABLED = -6,
+  EDR_DC_ERR_CANCELLED = -7,
 } EdrDeepCollectorError;
 
 typedef struct {
@@ -61,6 +62,8 @@ typedef struct {
   const char *extra_args;    /* 透传 collector,如 "--pid=1234 --full"（已做基本清洗） */
   uint32_t timeout_s;        /* 0 表示默认 300s */
   int needs_velociraptor;    /* 1=velo 层(运行前确保 velociraptor 就绪到其槽位);0=builtin/其它,不拉 velo */
+  int (*cancel_requested)(void *user); /* blocking 模式每 100ms 检查；非零时终止整个子进程树 */
+  void *cancel_user;
 } EdrCollectorRunSpec;
 
 /**

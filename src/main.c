@@ -14,6 +14,8 @@
 #include "edr/dedup.h"
 #include "edr/event_batch.h"
 #include "edr/command.h"
+#include "edr/command_executor.h"
+#include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/resource.h"
 #include "edr/self_protect.h"
@@ -542,6 +544,9 @@ static int edr_agent_run_main(const char *config) {
     }
   }
   edr_command_bind_config(edr_agent_get_config(agent));
+  if (edr_command_executor_start() != 0) {
+    fprintf(stderr, "[command] durable executor start failed; inbox will be retained for retry\n");
+  }
   edr_pmfe_bind_config(edr_agent_get_config(agent));
   edr_pmfe_set_event_bus(edr_agent_event_bus(agent));
   edr_pmfe_set_server_scan_result_callback(edr_command_on_pmfe_scan_complete);
@@ -626,6 +631,8 @@ static int edr_agent_run_main(const char *config) {
       }
     }
   }
+  edr_ingest_http_stop_command_poll();
+  edr_command_executor_shutdown();
   edr_pmfe_shutdown();
   edr_shellcode_detector_shutdown();
   edr_webshell_detector_shutdown();

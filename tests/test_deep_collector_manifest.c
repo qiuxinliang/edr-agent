@@ -275,6 +275,41 @@ static void test_maybe_refresh_keeps_current_when_sha_matches(void) {
   rmdir(dir);
 }
 
+#ifndef _WIN32
+static int cancel_immediately(void *user) {
+  int *calls = (int *)user;
+  (*calls)++;
+  return 1;
+}
+
+static void test_blocking_collector_cancels_process_group(void) {
+  char dir[512];
+  char script[600];
+  char detail[256];
+  int cancel_calls = 0;
+  EdrCollectorRunSpec spec;
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create cancellation temp dir");
+  snprintf(script, sizeof(script), "%s/slow-collector.sh", dir);
+  expect_true(write_file_bytes(script, "#!/bin/sh\nsleep 30\n") == 0,
+              "write slow collector script");
+  expect_true(chmod(script, 0700) == 0, "make slow collector executable");
+  memset(&spec, 0, sizeof(spec));
+  spec.collector_bin = script;
+  spec.scope = "cancel-test";
+  spec.output_dir = dir;
+  spec.timeout_s = 10;
+  spec.cancel_requested = cancel_immediately;
+  spec.cancel_user = &cancel_calls;
+  expect_true(edr_deep_collector_run_blocking(&spec, detail, sizeof(detail)) ==
+                  EDR_DC_ERR_CANCELLED,
+              "blocking collector returns cancelled status");
+  expect_true(cancel_calls > 0, "blocking collector invokes cancellation callback");
+  expect_true(strstr(detail, "cancelled") != NULL, "blocking collector reports cancellation");
+  remove(script);
+  rmdir(dir);
+}
+#endif
+
 int main(void) {
   test_json_url_unescape();
   test_artifact_failure_keeps_existing_dest();
@@ -283,5 +318,8 @@ int main(void) {
   test_stderr_tail_appended();
   test_maybe_refresh_replaces_on_sha_change();
   test_maybe_refresh_keeps_current_when_sha_matches();
+#ifndef _WIN32
+  test_blocking_collector_cancels_process_group();
+#endif
   return g_failures == 0 ? 0 : 1;
 }

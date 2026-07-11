@@ -49,6 +49,7 @@ typedef struct {
   int http2_negotiated;
   int control_stream_enabled;
   int control_stream_ready;
+  int control_stream_lease_valid;
   int long_poll_fallback;
   int report_events_v2_enabled;
   int zstd_requested;
@@ -77,10 +78,21 @@ typedef struct {
   unsigned long control_stream_ok_count;
   unsigned long control_stream_fail_count;
   unsigned long control_stream_heartbeat_count;
+  unsigned long control_stream_lease_expired_count;
+  int64_t control_stream_last_activity_unix_ms;
+  int64_t control_stream_lease_deadline_unix_ms;
   unsigned long control_ack_ok_count;
   unsigned long control_ack_fail_count;
+  unsigned long control_ack_retry_attempt_count;
+  unsigned long control_ack_retry_ok_count;
+  unsigned long control_ack_retry_fail_count;
+  unsigned long control_ack_outbox_persist_fail_count;
+  unsigned long control_ack_pending_count;
   int64_t last_command_ack_unix_ms;
+  int64_t last_command_ack_failure_unix_ms;
+  int64_t next_control_ack_retry_unix_ms;
   char last_command_ack_id[160];
+  char last_command_ack_failure_id[160];
   unsigned long http2_request_ok_count;
   unsigned long http2_request_fail_count;
   unsigned long http2_negotiated_count;
@@ -138,6 +150,10 @@ typedef struct {
 } EdrIngestHttpRuntime;
 
 void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out);
+
+/* Retries persisted receipt ACKs. Command execution is intentionally
+ * independent from this transport bookkeeping retry. */
+void edr_ingest_http_retry_pending_control_acks(void);
 
 /** 缓存/读取当前策略版本，供行为告警补齐 policy_version 字段。 */
 void edr_ingest_http_set_policy_version(const char *policy_version);

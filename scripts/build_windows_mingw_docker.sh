@@ -11,7 +11,7 @@
 #   EDR_MINGW_DOCKER_IMAGE   默认 ubuntu:22.04（可改为 ubuntu:24.04 等）
 #   EDR_MINGW_DOCKER_EXTRA   附加 docker run 参数，例如 '--network host'（部分网络环境 apt 更稳）
 #   http_proxy / https_proxy  传入容器（若宿主机已设，会自动 -e 传入）
-#   EDR_MINGW_DEPS_PREFIX     Windows 目标依赖前缀，需指向 vcpkg MinGW 动态 triplet（如 x64-mingw-dynamic），且含 curl+nghttp2+unofficial-libyara+YARA DLL
+#   EDR_MINGW_DEPS_PREFIX     Windows 目标依赖前缀，需指向 vcpkg MinGW 动态 triplet（如 x64-mingw-dynamic），且含 curl+nghttp2+unofficial-libyara config+YARA DLL/静态库
 #   EDR_MINGW_GRPC_PREFIX     兼容旧变量名，等同于 EDR_MINGW_DEPS_PREFIX
 # 终端编译注意：宿主机侧 build-mingw/ 与容器内产物宜保留以便后查，勿习惯性全删（见 docs/WINDOWS_CROSS_COMPILE.md「终端编译注意要点」）。
 set -euo pipefail
@@ -22,6 +22,11 @@ OUTDIR="build-mingw"
 IMAGE="${EDR_MINGW_DOCKER_IMAGE:-ubuntu:22.04}"
 EXTRA="${EDR_MINGW_DOCKER_EXTRA:-}"
 DEPS_PREFIX="${EDR_MINGW_DEPS_PREFIX:-${EDR_MINGW_GRPC_PREFIX:-}}"
+
+if [[ -z "$DEPS_PREFIX" || ! -d "$DEPS_PREFIX" ]]; then
+  echo "ERROR: EDR_MINGW_DEPS_PREFIX must reference an existing vcpkg MinGW dependency prefix." >&2
+  exit 2
+fi
 
 ENGINE="${EDR_CONTAINER:-}"
 if [[ -z "$ENGINE" ]]; then
@@ -62,11 +67,13 @@ fi
   -e "EDR_MINGW_DEPS_PREFIX=${DEPS_PREFIX}" \
   ${EXTRA} \
   -v "$ROOT:/work" \
+  -v "$DEPS_PREFIX:$DEPS_PREFIX:ro" \
   -w /work \
   "$IMAGE" \
   bash -ec '
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+export PKG_CONFIG_LIBDIR="${EDR_MINGW_DEPS_PREFIX}/lib/pkgconfig"
 for attempt in 1 2 3 4 5; do
   if apt-get update -qq; then
     break
@@ -98,15 +105,17 @@ if [[ ! -f "${EDR_MINGW_DEPS_PREFIX}/share/unofficial-libyara/unofficial-libyara
 fi
 shopt -s nullglob
 yara_dlls=("${EDR_MINGW_DEPS_PREFIX}"/bin/*yara*.dll "${EDR_MINGW_DEPS_PREFIX}"/bin/*YARA*.dll "${EDR_MINGW_DEPS_PREFIX}"/bin/libyara*.dll "${EDR_MINGW_DEPS_PREFIX}"/bin/libYARA*.dll)
+yara_static=("${EDR_MINGW_DEPS_PREFIX}"/lib/libyara*.a "${EDR_MINGW_DEPS_PREFIX}"/lib/libYARA*.a "${EDR_MINGW_DEPS_PREFIX}"/lib/liblibyara*.a)
 shopt -u nullglob
-if [[ ${#yara_dlls[@]} -lt 1 ]]; then
-  echo "ERROR: YARA runtime DLL missing under ${EDR_MINGW_DEPS_PREFIX}/bin."
-  echo "Use a dynamic MinGW vcpkg triplet such as x64-mingw-dynamic; static/MSVC prefixes are not valid for this package path."
+if [[ ${#yara_dlls[@]} -lt 1 && ${#yara_static[@]} -lt 1 ]]; then
+  echo "ERROR: vcpkg YARA library missing (expected runtime DLL or static archive)."
+  echo "Install the vcpkg yara feature for x64-mingw-dynamic; manual YARA_ROOT fallback is not accepted."
   exit 2
 fi
 rm -rf build-mingw
-cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -DEDR_WITH_YARA=ON -DEDR_REQUIRE_YARA=ON -DVCPKG_MANIFEST_FEATURES=yara -S .
+cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DOPENSSL_ROOT_DIR="${EDR_MINGW_DEPS_PREFIX}" -DOPENSSL_USE_STATIC_LIBS=OFF -DOPENSSL_SSL_LIBRARY="${EDR_MINGW_DEPS_PREFIX}/lib/libssl.dll.a" -DOPENSSL_CRYPTO_LIBRARY="${EDR_MINGW_DEPS_PREFIX}/lib/libcrypto.dll.a" -DSSL_EAY="${EDR_MINGW_DEPS_PREFIX}/lib/libssl.dll.a" -DLIB_EAY="${EDR_MINGW_DEPS_PREFIX}/lib/libcrypto.dll.a" -DPCRE2_DIR="${EDR_MINGW_DEPS_PREFIX}/share/pcre2" -Dzstd_DIR="${EDR_MINGW_DEPS_PREFIX}/share/zstd" -DEDR_WITH_GRPC=OFF -DEDR_WITH_FL_TRAINER=OFF -DEDR_WITH_FL_KAFKA=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -DEDR_WITH_YARA=ON -DEDR_REQUIRE_YARA=ON -DVCPKG_MANIFEST_FEATURES=yara -S .
 cmake --build build-mingw --target edr_agent -j4
+bash scripts/stage_mingw_runtime_dlls.sh build-mingw/FDSensor.exe "${EDR_MINGW_DEPS_PREFIX}" x86_64-w64-mingw32-gcc x86_64-w64-mingw32-objdump
 '
 
 echo "OK: ${ROOT}/${OUTDIR}/ 下生成 Windows 目标（见 FDSensor.exe 或构建日志）"

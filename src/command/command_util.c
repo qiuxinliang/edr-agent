@@ -1,7 +1,10 @@
 #include "edr/command_util.h"
+#include "edr/command_cancel.h"
 #include "edr/command_state.h"
 #include "edr/config.h"
+#include "edr/forensic_result_contract.h"
 #include "edr/ingest_http.h"
+#include "edr/shell_exec.h"
 #include "edr/transport_v2.h"
 
 #include <ctype.h>
@@ -16,8 +19,34 @@ unsigned long g_cmd_exec_ok;
 unsigned long g_cmd_exec_fail;
 
 static const EdrConfig *s_bound_cfg;
-static char s_active_command_type[64];
+#ifdef _MSC_VER
+static __declspec(thread) char s_active_command_type[64];
+#else
+static _Thread_local char s_active_command_type[64];
+#endif
 static const char *command_response_status_label(EdrCommandExecutionStatus st);
+
+static void command_apply_cancel_override(const char *cmd_id,
+                                          EdrCommandExecutionStatus *st,
+                                          int *exit_code, const char **detail,
+                                          const char **response_status,
+                                          char *cancel_detail,
+                                          size_t cancel_detail_cap) {
+  if (!cmd_id || !st || !exit_code || !detail || !response_status ||
+      !cancel_detail || cancel_detail_cap == 0u ||
+      !edr_command_cancel_requested(cmd_id) || *exit_code == 130 ||
+      (*response_status && strcmp(*response_status, "cancelled") == 0)) {
+    return;
+  }
+  snprintf(cancel_detail, cancel_detail_cap,
+           "cancellation requested while action was running; backend returned status=%s exit=%d detail=%.1200s",
+           command_response_status_label(*st), *exit_code,
+           *detail ? *detail : "");
+  *st = EdrCmdExecFailed;
+  *exit_code = 130;
+  *detail = cancel_detail;
+  *response_status = "cancelled";
+}
 
 void edr_command_bind_config(const struct EdrConfig *cfg) { s_bound_cfg = cfg; }
 
@@ -136,6 +165,11 @@ int edr_command_soar_want_report(const EdrSoarCommandMeta *m) {
 
 void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
                            EdrCommandExecutionStatus st, int exit_code, const char *detail) {
+  char cancel_detail[1536];
+  const char *response_status = NULL;
+  command_apply_cancel_override(cmd_id, &st, &exit_code, &detail,
+                                &response_status, cancel_detail,
+                                sizeof(cancel_detail));
   int should_report = edr_command_soar_want_report(sm);
   int ok = -1;
   if (should_report && edr_ingest_http_configured()) {
@@ -143,9 +177,12 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
                                                detail ? detail : "");
   }
   (void)ok;
-  edr_command_state_finish(cmd_id, s_active_command_type, sm, command_response_status_label(st), (int)st, exit_code,
-                           detail ? detail : "", "", should_report && ok != 0);
-  edr_command_state_delete_inbox(cmd_id);
+  if (edr_command_state_finish(cmd_id, s_active_command_type, sm,
+                               response_status ? response_status : command_response_status_label(st),
+                               (int)st, exit_code, detail ? detail : "", "",
+                               should_report && ok != 0) == 0) {
+    edr_command_state_delete_inbox(cmd_id);
+  }
 }
 
 static const char *command_response_status_label(EdrCommandExecutionStatus st) {
@@ -163,9 +200,17 @@ static const char *command_response_status_label(EdrCommandExecutionStatus st) {
   }
 }
 
-void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
-                                   const EdrSoarCommandMeta *sm,
-                                   EdrCommandExecutionStatus st, int exit_code, const char *detail) {
+void edr_command_emit_always_typed_status(const char *cmd_id, const char *command_type,
+                                          const EdrSoarCommandMeta *sm,
+                                          EdrCommandExecutionStatus st, int exit_code,
+                                          const char *detail, const char *response_status) {
+  char cancel_detail[1536];
+  command_apply_cancel_override(cmd_id, &st, &exit_code, &detail,
+                                &response_status, cancel_detail,
+                                sizeof(cancel_detail));
+  char forensic_detail[8192];
+  detail = edr_command_normalize_forensic_result(command_type, st, exit_code, detail,
+                                                 forensic_detail, sizeof(forensic_detail));
   edr_command_audit_both(cmd_id, detail);
   int report_pending = 0;
   if (edr_ingest_http_configured()) {
@@ -178,9 +223,21 @@ void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
   } else {
     fprintf(stderr, "[cmd_emit_always] HTTP NOT configured id=%s\n", cmd_id ? cmd_id : "");
   }
-  edr_command_state_finish(cmd_id, command_type ? command_type : "", sm, command_response_status_label(st), (int)st, exit_code,
-                           detail ? detail : "", "", report_pending);
-  edr_command_state_delete_inbox(cmd_id);
+  if (edr_command_state_finish(cmd_id, command_type ? command_type : "", sm,
+                               response_status && response_status[0]
+                                   ? response_status
+                                   : command_response_status_label(st),
+                               (int)st, exit_code,
+                               detail ? detail : "", "", report_pending) == 0) {
+    edr_command_state_delete_inbox(cmd_id);
+  }
+}
+
+void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,
+                                   const EdrSoarCommandMeta *sm,
+                                   EdrCommandExecutionStatus st, int exit_code, const char *detail) {
+  edr_command_emit_always_typed_status(cmd_id, command_type, sm, st, exit_code,
+                                       detail, NULL);
 }
 
 void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
@@ -189,107 +246,24 @@ void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
 }
 
 int edr_command_parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
-  *out_pid = -1;
-  if (!p || len == 0u) {
+  int pid = -1;
+  if (!out_pid || !edr_parse_json_int(p, len, "pid", &pid) || pid <= 0) {
     return -1;
   }
-  char tmp[4096];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char *q = strstr(tmp, "\"pid\"");
-  if (!q) {
-    q = strstr(tmp, "pid");
-  }
-  if (!q) {
-    return -1;
-  }
-  char *colon = strchr(q, ':');
-  char *start = colon ? colon + 1 : q;
-  while (*start && (isspace((unsigned char)*start) || *start == '"' || *start == '\'')) {
-    start++;
-  }
-  *out_pid = strtol(start, NULL, 10);
-  if (*out_pid <= 0 || *out_pid > 0x7fffffffL) {
-    return -1;
-  }
+  *out_pid = (long)pid;
   return 0;
 }
 
 int edr_command_parse_path_json(const uint8_t *p, size_t len, char *out, size_t outcap) {
-  if (!p || len == 0u || !out || outcap < 4u) {
-    return -1;
-  }
-  char tmp[8192];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  char *path_key = strstr(tmp, "\"path\"");
-  if (!path_key) {
-    return -1;
-  }
-  char *colon = strchr(path_key, ':');
-  if (!colon) {
-    return -1;
-  }
-  char *q = strchr(colon + 1, '"');
-  if (!q) {
-    return -1;
-  }
-  q++;
-  char *end = strchr(q, '"');
-  if (!end) {
-    return -1;
-  }
-  size_t n = (size_t)(end - q);
-  if (n == 0u || n >= outcap) {
-    return -1;
-  }
-  memcpy(out, q, n);
-  out[n] = 0;
-  return 0;
+  return edr_parse_json_string(p, len, "path", out, outcap) && out[0] ? 0 : -1;
 }
 
 int edr_command_parse_server_address_json(const uint8_t *p, size_t len, char *out, size_t outcap) {
-  if (!p || len == 0u || !out || outcap < 8u) {
-    return -1;
-  }
-  char tmp[2048];
-  if (len >= sizeof(tmp)) {
-    len = sizeof(tmp) - 1u;
-  }
-  memcpy(tmp, p, len);
-  tmp[len] = 0;
-  const char *keys[] = {"\"server_address\"", "\"server_addr\"", "\"address\""};
+  const char *keys[] = {"server_address", "server_addr", "address"};
   for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-    char *k = strstr(tmp, keys[i]);
-    if (!k) {
-      continue;
+    if (edr_parse_json_string(p, len, keys[i], out, outcap) && out[0]) {
+      return 0;
     }
-    char *colon = strchr(k, ':');
-    if (!colon) {
-      continue;
-    }
-    char *q = strchr(colon + 1, '"');
-    if (!q) {
-      continue;
-    }
-    q++;
-    char *end = strchr(q, '"');
-    if (!end) {
-      continue;
-    }
-    size_t n = (size_t)(end - q);
-    if (n == 0u || n >= outcap) {
-      return -1;
-    }
-    memcpy(out, q, n);
-    out[n] = 0;
-    return 0;
   }
   return -1;
 }

@@ -65,6 +65,11 @@ typedef enum EdrCommandExecutionStatus {
 void edr_command_on_envelope(const char *command_id, const char *command_type, const uint8_t *payload,
                              size_t payload_len, const EdrSoarCommandMeta *soar_meta);
 
+/** Trusted in-process automation entry. Never call this with transport-originated data. */
+void edr_command_on_internal_envelope(const char *command_id, const char *command_type,
+                                      const uint8_t *payload, size_t payload_len,
+                                      const EdrSoarCommandMeta *soar_meta);
+
 /**
  * 两阶段控制面入口：先验签/验 deadline/持久化 command_state + 本地执行 inbox。
  * 返回 1 表示应继续执行；返回 0 表示已拒绝、已压制重复或已回放最终结果；
@@ -82,6 +87,10 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
 void edr_command_execute_persisted_envelope(const char *command_id, const char *command_type,
                                             const uint8_t *payload, size_t payload_len,
                                             const EdrSoarCommandMeta *soar_meta);
+
+/** Claim and execute at most one durable inbox record. Used only by the command executor. */
+int edr_command_replay_persisted_inbox_once(void);
+int edr_command_replay_persisted_inbox_once_for_lane(int lane);
 
 /** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
 void edr_command_poll_reliable_delivery(void);
@@ -109,6 +118,12 @@ typedef struct EdrCommandDeliveryHealth {
   uint32_t upload_skipped_backoff;
   uint32_t upload_fail_streak;
   int64_t upload_next_retry_unix_ms;
+  uint64_t inbox_quarantined;
+  uint64_t ack_quarantined;
+  uint64_t quarantine_move_failed;
+  int64_t last_quarantine_unix_ms;
+  char last_quarantine_kind[32];
+  char last_quarantine_reason[96];
 } EdrCommandDeliveryHealth;
 
 void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health);

@@ -1,8 +1,11 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 add_executable(test_shell_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_policy.c
-  ${CMAKE_SOURCE_DIR}/src/command/shell_exec.c)
-target_include_directories(test_shell_policy PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  ${CMAKE_SOURCE_DIR}/src/command/shell_exec.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_shell_policy PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_common_warnings(test_shell_policy)
 add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -11,6 +14,36 @@ add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox
 target_include_directories(test_command_inbox PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_command_inbox)
 add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+if(WIN32)
+  target_link_libraries(test_command_inbox PRIVATE advapi32)
+endif()
+
+add_executable(test_command_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_contract PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_command_contract)
+add_test(NAME command_registry_and_payload_contract COMMAND test_command_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_executor.c)
+target_include_directories(test_command_executor PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_command_executor PRIVATE Threads::Threads)
+edr_apply_common_warnings(test_command_executor)
+add_test(NAME command_executor_thread_isolation COMMAND test_command_executor
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_cancel ${CMAKE_CURRENT_SOURCE_DIR}/test_command_cancel.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c)
+target_include_directories(test_command_cancel PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_command_cancel PRIVATE Threads::Threads)
+edr_apply_common_warnings(test_command_cancel)
+add_test(NAME command_cancellation_registry COMMAND test_command_cancel
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_signing.c
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
@@ -23,6 +56,13 @@ add_executable(test_attack_surface_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_att
 edr_apply_common_warnings(test_attack_surface_contract)
 add_test(NAME attack_surface_command_ingest_contract COMMAND test_attack_surface_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(attack_surface_command_ingest_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_control_stream_lease_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_control_stream_lease_contract.c)
+edr_apply_common_warnings(test_control_stream_lease_contract)
+add_test(NAME control_stream_lease_contract COMMAND test_control_stream_lease_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(control_stream_lease_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
 function(edr_absolutize_sources output_var)
@@ -70,6 +110,7 @@ set(_edr_test_ave_sdk_sources
 )
 # 与 `edr_agent` 一致：`ave_behavior_pipeline` → `edr_behavior_alert_emit_to_batch` 的依赖链
 set(_edr_test_behavior_emit_sources
+  ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
   ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
@@ -661,5 +702,27 @@ add_executable(test_self_protect_heartbeat
 target_include_directories(test_self_protect_heartbeat PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_self_protect_heartbeat)
 add_test(NAME self_protect_heartbeat COMMAND test_self_protect_heartbeat WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Release blocker: ordinary behavior-alert output must stay within the endpoint/rule SLO.
+add_executable(test_alert_governor_cardinality
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_alert_governor_cardinality.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c)
+target_include_directories(test_alert_governor_cardinality PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_alert_governor_cardinality PRIVATE EDR_HAVE_NANOPB=1)
+if(UNIX AND NOT WIN32)
+  target_link_libraries(test_alert_governor_cardinality PRIVATE Threads::Threads)
+endif()
+edr_apply_common_warnings(test_alert_governor_cardinality)
+add_test(NAME alert_cardinality_release_gate COMMAND test_alert_governor_cardinality WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(alert_cardinality_release_gate PROPERTIES LABELS "release-gate")
+
+add_executable(test_forensic_result_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_result_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c)
+target_include_directories(test_forensic_result_contract PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_forensic_result_contract)
+add_test(NAME forensic_result_contract COMMAND test_forensic_result_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
