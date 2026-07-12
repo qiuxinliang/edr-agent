@@ -666,6 +666,7 @@ if(UNIX AND NOT WIN32)
 endif()
 edr_apply_common_warnings(test_shellcode)
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_modules PROPERTIES LABELS "shellcode")
 
 # §A bundled shellcode YARA 规则可加载 + 已知漏洞命中（无 YARA 时回退内置匹配器）
 add_executable(test_shellcode_yara_rules ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_yara_rules.c ${_edr_shellcode_sources_abs})
@@ -692,6 +693,7 @@ if(UNIX AND NOT WIN32)
 endif()
 edr_apply_common_warnings(test_shellcode_yara_rules)
 add_test(NAME shellcode_yara_rules COMMAND test_shellcode_yara_rules WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_yara_rules PROPERTIES LABELS "shellcode")
 
 add_executable(test_yara_rule_catalog_compile ${CMAKE_CURRENT_SOURCE_DIR}/test_yara_rule_catalog_compile.c)
 target_include_directories(test_yara_rule_catalog_compile PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -719,6 +721,42 @@ add_executable(test_shellcode_flow_dedup
 target_include_directories(test_shellcode_flow_dedup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_shellcode_flow_dedup)
 add_test(NAME shellcode_flow_dedup COMMAND test_shellcode_flow_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_flow_dedup PROPERTIES LABELS "shellcode")
+
+add_executable(test_shellcode_tcp_reassembly
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_tcp_reassembly.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/tcp_reassembly.c)
+target_include_directories(test_shellcode_tcp_reassembly PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_shellcode_tcp_reassembly)
+add_test(NAME shellcode_tcp_reassembly COMMAND test_shellcode_tcp_reassembly
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_tcp_reassembly PROPERTIES LABELS "shellcode")
+
+add_executable(test_shellcode_server_benchmark
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_server_benchmark.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/tcp_reassembly.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/proto_parse.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/shellcode_entropy.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/shellcode_heuristic.c)
+target_include_directories(test_shellcode_server_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_shellcode_server_benchmark)
+if(UNIX AND NOT WIN32)
+  target_link_libraries(test_shellcode_server_benchmark PRIVATE m)
+endif()
+add_test(NAME shellcode_server_benchmark COMMAND test_shellcode_server_benchmark
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_server_benchmark PROPERTIES
+  LABELS "shellcode;performance;release-gate"
+  TIMEOUT 30)
+
+add_executable(test_shellcode_runtime_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_runtime_contract.c)
+edr_apply_common_warnings(test_shellcode_runtime_contract)
+add_test(NAME shellcode_runtime_truth_contract COMMAND test_shellcode_runtime_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_runtime_truth_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+  LABELS "shellcode")
 
 # 端侧网络扇出/扫描检测器核心逻辑
 add_executable(test_net_fanout
@@ -765,6 +803,13 @@ add_executable(test_forensic_result_contract
 target_include_directories(test_forensic_result_contract PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_forensic_result_contract)
 add_test(NAME forensic_result_contract COMMAND test_forensic_result_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_event_batch_max_age
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_event_batch_max_age.c
+  ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c)
+target_include_directories(test_event_batch_max_age PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_event_batch_max_age)
+add_test(NAME event_batch_max_age COMMAND test_event_batch_max_age WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)

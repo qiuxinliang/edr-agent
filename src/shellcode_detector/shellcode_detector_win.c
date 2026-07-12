@@ -14,6 +14,7 @@ extern EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *b
 extern void edr_windivert_capture_stop(void);
 extern uint64_t edr_windivert_capture_budget_drop_count(void);
 extern uint64_t edr_windivert_capture_rate_drop_count(void);
+extern void edr_windivert_capture_get_runtime(EdrShellcodeDetectorRuntime *out);
 
 static int s_active;
 
@@ -52,4 +53,8 @@ uint64_t edr_shellcode_detector_budget_drop_count(void) {
 
 uint64_t edr_shellcode_detector_rate_drop_count(void) {
   return edr_windivert_capture_rate_drop_count();
+}
+
+void edr_shellcode_detector_get_runtime(EdrShellcodeDetectorRuntime *out) {
+  edr_windivert_capture_get_runtime(out);
 }

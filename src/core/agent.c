@@ -876,6 +876,14 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "egress_enabled = %s\n", cfg->attack_surface.egress_enabled ? "true" : "false");
   fprintf(fp, "\n[shellcode_detector]\n");
   fprintf(fp, "enabled = %s\n", cfg->shellcode_detector.enabled ? "true" : "false");
+  fprintf(fp, "pmfe_followup_enabled = %s\n", cfg->shellcode_detector.pmfe_followup_enabled ? "true" : "false");
+  fprintf(fp, "pmfe_heuristic_threshold = %.2f\n", cfg->shellcode_detector.pmfe_heuristic_threshold);
+  fprintf(fp, "flow_scan_first_bytes = %u\n", cfg->shellcode_detector.flow_scan_first_bytes);
+  fprintf(fp, "reassembly_max_flows = %u\n", cfg->shellcode_detector.reassembly_max_flows);
+  fprintf(fp, "reassembly_memory_limit_kb = %u\n", cfg->shellcode_detector.reassembly_memory_limit_kb);
+  fprintf(fp, "reassembly_idle_timeout_s = %u\n", cfg->shellcode_detector.reassembly_idle_timeout_s);
+  fprintf(fp, "detector_threads = %u\n", cfg->shellcode_detector.detector_threads);
+  fprintf(fp, "scan_queue_capacity = %u\n", cfg->shellcode_detector.scan_queue_capacity);
   fprintf(fp, "\n[webshell_detector]\n");
   fprintf(fp, "enabled = %s\n", cfg->webshell_detector.enabled ? "true" : "false");
   fprintf(fp, "\n[fl]\n");
@@ -1577,9 +1585,12 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *velo_runtime = !velo_policy ? "disabled"
                              : edr_deep_collector_is_running() ? "healthy" : "idle";
   EdrAlertGovernorStats alert_stats;
+  EdrShellcodeDetectorRuntime shellcode_rt;
   char endpoint_policy_capability[2048];
   memset(&alert_stats, 0, sizeof(alert_stats));
+  memset(&shellcode_rt, 0, sizeof(shellcode_rt));
   edr_alert_governor_get_stats(&alert_stats);
+  edr_shellcode_detector_get_runtime(&shellcode_rt);
   snprintf(endpoint_policy_capability, sizeof(endpoint_policy_capability),
            "\"endpoint_policy\":{\"schema\":\"edr.endpoint.policy.v2\","
            "\"category_modes\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":true,\"runtime_status\":\"healthy\"},"
@@ -1613,6 +1624,10 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"features\":{"
       "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"shellcode_network\":{\"code_supported\":%s,\"build_supported\":%s,\"policy_enabled\":%s,"
+      "\"runtime_status\":\"%s\",\"provider\":\"windivert\",\"dll_loaded\":%s,"
+      "\"driver_open\":%s,\"capture_threads\":%u,\"scan_workers\":%u,"
+      "\"scan_queue_capacity\":%u,\"win32_error\":%u,\"detail\":\"%s\"},"
       "\"pmfe\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
       "\"result_schema\":\"pmfe_result_v1\",\"region_metadata\":%s,\"region_dump\":%s,\"yara_memory\":%s,"
       "\"vad_allocation_metadata\":%s,\"thread_start_snapshot\":%s,\"pe_reconstruction\":%s},"
@@ -1642,6 +1657,13 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       endpoint_policy_capability,
       pcre2_build ? "true" : "false", pcre2_build ? "true" : "false", pcre2_build ? "healthy" : "unavailable",
       yara_build ? "true" : "false", yara_build ? "true" : "false", yara_build ? "healthy" : "unavailable",
+      shellcode_rt.code_supported ? "true" : "false", shellcode_rt.build_supported ? "true" : "false",
+      shellcode_rt.policy_enabled ? "true" : "false",
+      shellcode_rt.runtime_status[0] ? shellcode_rt.runtime_status : "unavailable",
+      shellcode_rt.dll_loaded ? "true" : "false", shellcode_rt.driver_open ? "true" : "false",
+      shellcode_rt.capture_threads, shellcode_rt.scan_workers, shellcode_rt.scan_queue_capacity,
+      shellcode_rt.win32_error,
+      shellcode_rt.detail[0] ? shellcode_rt.detail : "unknown",
       inventory_native ? "true" : "false", edr_pmfe_is_running() ? "true" : "false",
       edr_pmfe_is_running() ? "healthy" : "disabled", windows_native ? "true" : "false",
       windows_native ? "true" : "false", yara_build ? "true" : "false",
@@ -2258,13 +2280,18 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
     }
   }
   EdrShellcodeRulesStatus shell_rules;
+  EdrShellcodeDetectorRuntime shell_runtime;
   memset(&shell_rules, 0, sizeof(shell_rules));
+  memset(&shell_runtime, 0, sizeof(shell_runtime));
   edr_shellcode_known_get_status(&shell_rules);
+  edr_shellcode_detector_get_runtime(&shell_runtime);
   char shell_source[48], shell_version[128], shell_error[192], shell_rb[128], shell_last_rule[128], shell_last_src[48];
+  char shell_runtime_detail[192];
   char audit_err[192], ebpf_err[192];
   json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
   json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
+  json_escape_small(shell_runtime.detail, shell_runtime_detail, sizeof(shell_runtime_detail));
   runtime_policy_raw[0] = '\0';
   edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
   json_escape_small(runtime_policy_raw, runtime_policy_ver, sizeof(runtime_policy_ver));
@@ -2478,7 +2505,15 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"pmfe\":{\"enabled\":true,\"mode\":\"alert_single_process\",\"queue_depth\":%lu,"
       "\"submitted\":%lu,\"completed\":%lu,\"dropped\":%lu,"
       "\"last_degrade_reason\":\"%s\"},"
-      "\"shellcode\":{\"enabled\":%s,\"mode\":\"%s\",\"watch_count\":%zu,"
+      "\"shellcode\":{\"configured\":%s,\"enabled\":%s,\"runtime_status\":\"%s\","
+      "\"provider\":\"windivert\",\"dll_loaded\":%s,\"driver_open\":%s,"
+      "\"capture_threads\":%u,\"scan_workers\":%u,\"scan_queue_depth\":%u,"
+      "\"scan_queue_capacity\":%u,\"win32_error\":%u,\"packets_received\":%llu,"
+      "\"receive_errors\":%llu,\"scan_queue_dropped\":%llu,\"scan_jobs_processed\":%llu,"
+      "\"runtime_detail\":\"%s\","
+      "\"reassembly\":{\"active_streams\":%u,\"memory_bytes\":%llu,\"out_of_order\":%llu,"
+      "\"evicted\":%llu,\"memory_drops\":%llu},"
+      "\"mode\":\"%s\",\"watch_count\":%zu,"
       "\"threads\":%u,\"max_payload_inspect\":%u,\"rule_version\":\"%s\","
       "\"rules_source\":\"%s\",\"rules_loaded\":%u,\"last_reload_unix_s\":%llu,"
       "\"gray_percent\":%u,\"rollback_available\":%s,\"rollback_active\":%s,"
@@ -2732,6 +2767,21 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       pmfe_q, pmfe_sub, pmfe_done, pmfe_drop,
       pmfe_drop ? "queue_drop" : "",
       agent->cfg.shellcode_detector.enabled ? "true" : "false",
+      edr_shellcode_detector_active() ? "true" : "false",
+      shell_runtime.runtime_status[0] ? shell_runtime.runtime_status : "unavailable",
+      shell_runtime.dll_loaded ? "true" : "false", shell_runtime.driver_open ? "true" : "false",
+      shell_runtime.capture_threads, shell_runtime.scan_workers, shell_runtime.scan_queue_depth,
+      shell_runtime.scan_queue_capacity, shell_runtime.win32_error,
+      (unsigned long long)shell_runtime.packets_received,
+      (unsigned long long)shell_runtime.receive_errors,
+      (unsigned long long)shell_runtime.scan_queue_dropped,
+      (unsigned long long)shell_runtime.scan_jobs_processed,
+      shell_runtime_detail[0] ? shell_runtime_detail : "unknown",
+      shell_runtime.reassembly_active_streams,
+      (unsigned long long)shell_runtime.reassembly_memory_bytes,
+      (unsigned long long)shell_runtime.reassembly_out_of_order,
+      (unsigned long long)shell_runtime.reassembly_evicted,
+      (unsigned long long)shell_runtime.reassembly_memory_drops,
       agent->cfg.shellcode_detector.windivert_ports_is_custom ? "custom_ports" : "lateral_movement_ports",
       agent->cfg.shellcode_detector.windivert_ports_is_custom
           ? agent->cfg.shellcode_detector.windivert_tcp_ports_parsed_count

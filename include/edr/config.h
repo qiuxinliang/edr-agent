@@ -389,11 +389,18 @@ typedef struct EdrConfig {
     bool auto_isolate_execute;
     /** 启发式分数乘数（0.01–3.0），用于现场压误报/提灵敏度 */
     double heuristic_score_scale;
+    /** 网络命中后的定向PMFE确认；启发式仅在达到独立高阈值时触发。 */
+    bool pmfe_followup_enabled;
+    double pmfe_heuristic_threshold;
     /**
      * P0 优化 #2：每条连接（4 元组）只深扫前 N 字节载荷；超过则跳过深扫（漏洞利用特征均在会话起始）。
      * 大幅降低大文件/长连接的逐包 entropy/YARA 开销。0=不限（旧行为，逐包全扫）。默认 65536。
      */
     uint32_t flow_scan_first_bytes;
+    /** TCP方向流重组上限。总内存耗尽时优先淘汰最久未活动的流。 */
+    uint32_t reassembly_max_flows;
+    uint32_t reassembly_memory_limit_kb;
+    uint32_t reassembly_idle_timeout_s;
     /**
      * P0 优化 #3：是否对 TLS 应用数据（密文）做 shellcode 深扫。
      * 默认 false：仅提取 ClientHello（JA3/SNI），跳过 CCS/alert/application_data 记录的熵/YARA 扫描，
@@ -415,6 +422,8 @@ typedef struct EdrConfig {
     bool monitor_ldap;
     bool monitor_tls;
     uint32_t detector_threads;
+    /** 捕获线程到检测worker的有界队列容量。 */
+    uint32_t scan_queue_capacity;
     char yara_rules_dir[1024];
     char forensic_dir[1024];
     /** 告警时写 PCAP（需 forensic_dir 非空；无环形时单包 raw LINKTYPE 228/229） */

@@ -130,6 +130,13 @@ int edr_collector_get_filter_stats(EdrCollectorFilterStats *out_stats);
 int edr_collector_get_health(EdrCollectorHealth *out_health);
 
 /**
+ * Register an RTR policy canary root before it executes. Windows uses this
+ * short-lived PID grant to let explicitly marked canary descendants traverse
+ * the real sensor pipeline without disabling general Agent self-noise filtering.
+ */
+void edr_collector_register_policy_canary_process(uint32_t pid, const char *command);
+
+/**
  * 启动采集：Windows 为 ETW 会话（Kernel-Process / File / Network 等）；Linux（M1）为 inotify 目录监视；其它 POSIX 为 stub。
  * 使用 `cfg->collection.etw_enabled`；Windows 另读 `etw_*_provider` 系列（见 `config.h` 与 §19.10，含 A4.3 四项可选 Provider）。
  * `cfg` 为空视为未启用采集。失败返回 EDR_ERR_ETW_*（常见原因：权限不足、会话名冲突）。

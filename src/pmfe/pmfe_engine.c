@@ -2071,7 +2071,8 @@ static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_m
  * `EDR_PMFE_EMIT_ALERTS=0` 关闭；`EDR_PMFE_EMIT_MZ=1` 时在无 stomp/dns/ave 信号下仍上报「仅 MZ 命中」类结果。
  * Linux：`elf_hits=` 仅由 `EDR_PMFE_EMIT_ELF=1` 控制上报，与 `EDR_PMFE_EMIT_MZ` 无关。
  */
-static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detail) {
+static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detail,
+                                      const EdrPmfeScanResult *scan_result) {
   if (!task || !detail || !detail[0]) {
     return;
   }
@@ -2082,10 +2083,11 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   if (!s_pmfe_bus) {
     return;
   }
-  if (strstr(detail, "open_process=failed")) {
+  int shellcode_followup = strncmp(task->cmd_id, "etw:shellcode:", 14u) == 0;
+  if (!shellcode_followup && strstr(detail, "open_process=failed")) {
     return;
   }
-  if (strstr(detail, "maps_open_failed")) {
+  if (!shellcode_followup && strstr(detail, "maps_open_failed")) {
     return;
   }
   unsigned stomp = pmfe_detail_u(detail, "stomp_suspicious=");
@@ -2098,7 +2100,7 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   char dns_sample[256];
   pmfe_detail_copy_token(detail, "dns_sample=", dns_sample, sizeof(dns_sample));
 
-  int want = 0;
+  int want = shellcode_followup;
   if (stomp > 0u) {
     want = 1;
   }
@@ -2153,7 +2155,11 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   if (ave_max > score) {
     score = ave_max;
   }
-  if (score < 0.35f) {
+  int clean_followup = shellcode_followup && scan_result && strcmp(scan_result->verdict, "clean") == 0;
+  if (clean_followup) {
+    score = 0.05f;
+  }
+  if (!clean_followup && score < 0.35f) {
     score = 0.35f;
   }
   if (score > 1.f) {
@@ -2169,10 +2175,17 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   slot.attack_surface_hint = 0u;
 
   const char *cid = task->cmd_id[0] ? task->cmd_id : "-";
+  const char *source_alert_id = shellcode_followup ? task->cmd_id + 14u : "";
+  const char *status = scan_result && scan_result->status[0] ? scan_result->status : "unknown";
+  const char *verdict = scan_result && scan_result->verdict[0] ? scan_result->verdict : "inconclusive";
+  int suspicious = strcmp(verdict, "suspicious") == 0;
   int n = snprintf((char *)slot.data, sizeof(slot.data),
-                   "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=T1055\n"
+                   "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nfollowup_only=%u\nsource_alert_id=%.63s\n"
+                   "pmfe_status=%s\npmfe_verdict=%s\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=%s\n"
                    "detector=pmfe\n",
-                   task->pid, cid, img[0] ? img : "-", cmdline_buf, dns_sample[0] ? dns_sample : "-", score);
+                   task->pid, cid, (unsigned)shellcode_followup, source_alert_id, status, verdict,
+                   img[0] ? img : "-", cmdline_buf, dns_sample[0] ? dns_sample : "-", score,
+                   suspicious ? "T1055" : "-");
   if (n < 0 || (size_t)n >= sizeof(slot.data)) {
     return;
   }
@@ -2326,7 +2339,7 @@ static void pmfe_worker_body(void) {
     EDR_LOGV("[pmfe] scan_done %s\n", detail);
     audit_pmfe_line(task.cmd_id[0] ? task.cmd_id : "-", detail);
     edr_pid_history_pmfe_ingest_scan_detail(task.pid, detail);
-    pmfe_try_emit_scan_result(&task, detail);
+    pmfe_try_emit_scan_result(&task, detail, &scan_result);
     if (task.server_requested && task.cmd_id[0] && s_server_scan_result_callback) {
       s_server_scan_result_callback(task.cmd_id, task.pid, sr, detail, &scan_result,
                                     &task.command_context);

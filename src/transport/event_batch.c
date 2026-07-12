@@ -54,6 +54,9 @@ static void batch_note_write(void) {
     s_deadline_ns = 0;
     return;
   }
+  if (s_deadline_ns != 0u) {
+    return;
+  }
   uint64_t now = edr_monotonic_ns();
   s_deadline_ns = now + (uint64_t)s_flush_timeout_s * 1000000000ULL;
 }
@@ -278,14 +281,15 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
 }
 
 void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s) {
-  if (flush_timeout_s < 0) {
-    flush_timeout_s = 0;
-  }
   if (flush_timeout_s > 300) {
     flush_timeout_s = 300;
   }
-  s_max_frames = max_frames_per_batch;
-  s_flush_timeout_s = flush_timeout_s;
+  if (max_frames_per_batch > 0u) {
+    s_max_frames = max_frames_per_batch;
+  }
+  if (flush_timeout_s > 0) {
+    s_flush_timeout_s = flush_timeout_s;
+  }
   if (s_used > 0u) {
     batch_note_write();
   }

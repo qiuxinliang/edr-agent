@@ -426,6 +426,7 @@ set(EDR_SHELLCODE_SRCS
   src/shellcode_detector/shellcode_known.c
   src/shellcode_detector/proto_parse.c
   src/shellcode_detector/flow_dedup.c
+  src/shellcode_detector/tcp_reassembly.c
 )
 if(WIN32)
   list(APPEND EDR_SHELLCODE_SRCS

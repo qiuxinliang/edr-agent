@@ -567,6 +567,32 @@ static void test_registry_persistence_alias_bridge(void) {
   assert(strstr(r.detection_context, "persistence_changes") != NULL);
 }
 
+static void test_pmfe_followup_bridge_preserves_link_without_false_mitre(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_PMFE_SCAN_RESULT,
+            "ETW1\n"
+            "prov=pmfe\n"
+            "pid=864\n"
+            "cmd_id=etw:shellcode:sc-bridge-1\n"
+            "followup_only=1\n"
+            "source_alert_id=sc-bridge-1\n"
+            "pmfe_status=completed_clean\n"
+            "pmfe_verdict=clean\n"
+            "score=0.05\n"
+            "mitre=-\n"
+            "detector=pmfe\n");
+  eval_slot(&slot, &r, &d);
+  assert(r.pid == 864u);
+  assert(strstr(r.script_snippet, "source_alert_id=sc-bridge-1") != NULL);
+  assert(strstr(r.script_snippet, "pmfe_status=completed_clean") != NULL);
+  assert(r.mitre_ttp_count == 0);
+  assert(d.suppress);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-bridge-1\"") != NULL);
+}
+
 int main(void) {
   test_scriptblock_sensor_bridge();
   test_amsi_sensor_bridge();
@@ -588,6 +614,7 @@ int main(void) {
   test_sensor_alias_bridge();
   test_integer_ip_fields_are_normalized();
   test_registry_persistence_alias_bridge();
+  test_pmfe_followup_bridge_preserves_link_without_false_mitre();
   puts("detection_sensor_bridge ok");
   return 0;
 }

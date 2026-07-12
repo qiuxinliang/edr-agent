@@ -1095,6 +1095,12 @@ static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecisi
   } else if (out->suppress && strcmp(action, "emit_alert") == 0) {
     action = "emit_context";
   }
+  /* PMFE 跟进结果必须回传以关闭/更新源告警；非可疑结果只发上下文，不产生新告警。 */
+  if (r && r->type == EDR_EVENT_PMFE_SCAN_RESULT &&
+      strstr(r->script_snippet, "followup_only=1") != NULL &&
+      strstr(r->script_snippet, "pmfe_verdict=suspicious") == NULL) {
+    action = "emit_context";
+  }
   snprintf(out->selection_action, sizeof(out->selection_action), "%s", action);
 }
 
@@ -1374,6 +1380,9 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char evidence_local_path[512];
   char evidence_ast_score[32];
   char evidence_token_score[32];
+  char evidence_pmfe_recommended[16];
+  char evidence_pmfe_trigger[48];
+  char evidence_pmfe_status[32];
   char pmfe_stomp[32];
   char pmfe_mz[32];
   char pmfe_elf[32];
@@ -1388,6 +1397,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char pmfe_regions[32];
   char pmfe_private_exec[32];
   char pmfe_module_consistency[64];
+  char pmfe_source_alert_id[64];
+  char pmfe_status[32];
+  char pmfe_verdict[32];
+  char pmfe_followup[8];
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_canary = has_ransom_canary_indicator(r);
@@ -1458,6 +1471,9 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   evidence_local_path[0] = '\0';
   evidence_ast_score[0] = '\0';
   evidence_token_score[0] = '\0';
+  evidence_pmfe_recommended[0] = '\0';
+  evidence_pmfe_trigger[0] = '\0';
+  evidence_pmfe_status[0] = '\0';
   pmfe_stomp[0] = '\0';
   pmfe_mz[0] = '\0';
   pmfe_elf[0] = '\0';
@@ -1472,6 +1488,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   pmfe_regions[0] = '\0';
   pmfe_private_exec[0] = '\0';
   pmfe_module_consistency[0] = '\0';
+  pmfe_source_alert_id[0] = '\0';
+  pmfe_status[0] = '\0';
+  pmfe_verdict[0] = '\0';
+  pmfe_followup[0] = '\0';
   detail_value(r->script_snippet, "ransom_note_count", note_count_buf, sizeof(note_count_buf));
   detail_value(r->script_snippet, "file_rate", file_rate_buf, sizeof(file_rate_buf));
   detail_value(r->script_snippet, "ext_burst", ext_burst_buf, sizeof(ext_burst_buf));
@@ -1521,6 +1541,9 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->script_snippet, "local_path", evidence_local_path, sizeof(evidence_local_path));
   detail_value(r->script_snippet, "ast_score", evidence_ast_score, sizeof(evidence_ast_score));
   detail_value(r->script_snippet, "token_score", evidence_token_score, sizeof(evidence_token_score));
+  detail_value(r->script_snippet, "pmfe_recommended", evidence_pmfe_recommended, sizeof(evidence_pmfe_recommended));
+  detail_value(r->script_snippet, "pmfe_trigger", evidence_pmfe_trigger, sizeof(evidence_pmfe_trigger));
+  detail_value(r->script_snippet, "pmfe_status", evidence_pmfe_status, sizeof(evidence_pmfe_status));
   detail_value(r->cmdline, "stomp_suspicious", pmfe_stomp, sizeof(pmfe_stomp));
   detail_value(r->cmdline, "mz_hits", pmfe_mz, sizeof(pmfe_mz));
   detail_value(r->cmdline, "elf_hits", pmfe_elf, sizeof(pmfe_elf));
@@ -1535,6 +1558,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->cmdline, "regions", pmfe_regions, sizeof(pmfe_regions));
   detail_value(r->cmdline, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
   detail_value(r->cmdline, "module_path_consistency", pmfe_module_consistency, sizeof(pmfe_module_consistency));
+  detail_value(r->script_snippet, "source_alert_id", pmfe_source_alert_id, sizeof(pmfe_source_alert_id));
+  detail_value(r->script_snippet, "pmfe_status", pmfe_status, sizeof(pmfe_status));
+  detail_value(r->script_snippet, "pmfe_verdict", pmfe_verdict, sizeof(pmfe_verdict));
+  detail_value(r->script_snippet, "followup_only", pmfe_followup, sizeof(pmfe_followup));
   json_cat(r->detection_context, sizeof(r->detection_context),
            "{\"engine\":");
   json_str(r->detection_context, sizeof(r->detection_context), engine_name(r), 48u);
@@ -1713,7 +1740,9 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   json_str(r->detection_context, sizeof(r->detection_context), t ? t->reason : "", 180u);
   json_cat(r->detection_context, sizeof(r->detection_context), "},\"engine_evidence\":{");
   if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
-    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"shellcode_result_v1\",\"flow\":{\"src\":");
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"shellcode_result_v1\",\"alert_id\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_alert_id, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"flow\":{\"src\":");
     json_str(r->detection_context, sizeof(r->detection_context), r->net_src, 64u);
     json_cat(r->detection_context, sizeof(r->detection_context), ",\"spt\":%u,\"dst\":", r->net_sport);
     json_str(r->detection_context, sizeof(r->detection_context), r->net_dst, 64u);
@@ -1729,6 +1758,11 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
     json_str(r->detection_context, sizeof(r->detection_context), evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash, 80u);
     json_cat(r->detection_context, sizeof(r->detection_context), ",\"preview_hex\":");
     json_str(r->detection_context, sizeof(r->detection_context), evidence_preview_hex, 160u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"pmfe_followup\":{\"recommended\":%s,\"trigger\":",
+             evidence_pmfe_recommended[0] && strcmp(evidence_pmfe_recommended, "0") != 0 ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pmfe_trigger, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"status\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pmfe_status, 32u);
     json_cat(r->detection_context, sizeof(r->detection_context), "},\"pcap\":{\"stem\":");
     json_str(r->detection_context, sizeof(r->detection_context), evidence_stem, 180u);
     json_cat(r->detection_context, sizeof(r->detection_context), ",\"object_key\":");
@@ -1782,7 +1816,14 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
     long dns_hits = (pmfe_dns_ascii[0] ? strtol(pmfe_dns_ascii, NULL, 10) : 0L) +
                     (pmfe_dns_utf16[0] ? strtol(pmfe_dns_utf16, NULL, 10) : 0L) +
                     (pmfe_dns_wire[0] ? strtol(pmfe_dns_wire, NULL, 10) : 0L);
-    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"pmfe_result_v1\",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"module_consistency\":",
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"pmfe_result_v1\",\"source_alert_id\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_source_alert_id, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"followup_only\":%s,\"status\":",
+             pmfe_followup[0] && strcmp(pmfe_followup, "0") != 0 ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_status, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"verdict\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_verdict, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"module_consistency\":",
              pmfe_stomp[0] ? strtol(pmfe_stomp, NULL, 10) : 0L,
              pmfe_mz[0] ? strtol(pmfe_mz, NULL, 10) : 0L,
              pmfe_elf[0] ? strtol(pmfe_elf, NULL, 10) : 0L,
@@ -1873,6 +1914,13 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     memset(&ransom_chain, 0, sizeof(ransom_chain));
   }
 
+  int pmfe_followup = r->type == EDR_EVENT_PMFE_SCAN_RESULT &&
+                      strstr(r->script_snippet, "followup_only=1") != NULL;
+  int pmfe_clean_followup = pmfe_followup &&
+                            strstr(r->script_snippet, "pmfe_verdict=clean") != NULL;
+  int pmfe_inconclusive_followup = pmfe_followup &&
+                                   strstr(r->script_snippet, "pmfe_verdict=suspicious") == NULL &&
+                                   !pmfe_clean_followup;
   float score = 0.20f;
   if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
     score = 0.88f;
@@ -1881,8 +1929,18 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     score = 0.82f;
     add_reason(out->reason, sizeof(out->reason), "webshell_signal");
   } else if (r->type == EDR_EVENT_PMFE_SCAN_RESULT) {
-    score = 0.72f;
-    add_reason(out->reason, sizeof(out->reason), "pmfe_memory_evidence");
+    if (pmfe_clean_followup) {
+      score = 0.05f;
+      add_reason(out->reason, sizeof(out->reason), "pmfe_followup_clean");
+      set_suppression(out, score, "pmfe_followup_clean", "EDR_DETECTION_POLICY_VERSION");
+    } else if (pmfe_inconclusive_followup) {
+      score = 0.15f;
+      add_reason(out->reason, sizeof(out->reason), "pmfe_followup_inconclusive");
+      set_suppression(out, score, "pmfe_followup_inconclusive", "EDR_DETECTION_POLICY_VERSION");
+    } else {
+      score = 0.72f;
+      add_reason(out->reason, sizeof(out->reason), "pmfe_memory_evidence");
+    }
   } else if (inject) {
     score = 0.74f;
     add_reason(out->reason, sizeof(out->reason), "process_injection_signal");
@@ -2098,7 +2156,8 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (out->reason[0] == '\0') {
     snprintf(out->reason, sizeof(out->reason), "%s", "baseline");
   }
-  if (out->suppress && score < 0.25f && r->priority != 0u && !ransom_counter_allowlisted) {
+  if (out->suppress && score < 0.25f && r->priority != 0u && !ransom_counter_allowlisted &&
+      !pmfe_followup) {
     out->drop = 1u;
   }
 

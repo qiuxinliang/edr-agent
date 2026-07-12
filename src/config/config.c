@@ -1261,6 +1261,14 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "pmfe_followup_enabled");
+    if (d.ok) cfg->shellcode_detector.pmfe_followup_enabled = d.u.b ? true : false;
+  }
+  {
+    toml_datum_t d = toml_double_in(t, "pmfe_heuristic_threshold");
+    if (d.ok) cfg->shellcode_detector.pmfe_heuristic_threshold = d.u.d;
+  }
+  {
     toml_datum_t d = toml_int_in(t, "yara_rules_reload_interval_s");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.yara_rules_reload_interval_s = (uint32_t)d.u.i;
@@ -1270,6 +1278,24 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "flow_scan_first_bytes");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.flow_scan_first_bytes = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "reassembly_max_flows");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.reassembly_max_flows = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "reassembly_memory_limit_kb");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.reassembly_memory_limit_kb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "reassembly_idle_timeout_s");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.reassembly_idle_timeout_s = (uint32_t)d.u.i;
     }
   }
   {
@@ -1288,6 +1314,12 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "windivert_queue_length");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.windivert_queue_length = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "scan_queue_capacity");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.scan_queue_capacity = (uint32_t)d.u.i;
     }
   }
   {
@@ -1516,6 +1548,11 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->shellcode_detector.heuristic_score_scale > 3.0) {
     cfg->shellcode_detector.heuristic_score_scale = 3.0;
   }
+  if (cfg->shellcode_detector.pmfe_heuristic_threshold < 0.70) {
+    cfg->shellcode_detector.pmfe_heuristic_threshold = 0.70;
+  } else if (cfg->shellcode_detector.pmfe_heuristic_threshold > 1.0) {
+    cfg->shellcode_detector.pmfe_heuristic_threshold = 1.0;
+  }
   if (cfg->shellcode_detector.yara_rules_reload_interval_s > 86400u) {
     cfg->shellcode_detector.yara_rules_reload_interval_s = 86400u;
   }
@@ -1530,6 +1567,26 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->shellcode_detector.detector_threads > 4u) {
     cfg->shellcode_detector.detector_threads = 4u;
+  }
+  if (cfg->shellcode_detector.reassembly_max_flows < 64u) {
+    cfg->shellcode_detector.reassembly_max_flows = 64u;
+  } else if (cfg->shellcode_detector.reassembly_max_flows > 16384u) {
+    cfg->shellcode_detector.reassembly_max_flows = 16384u;
+  }
+  if (cfg->shellcode_detector.reassembly_memory_limit_kb < 1024u) {
+    cfg->shellcode_detector.reassembly_memory_limit_kb = 1024u;
+  } else if (cfg->shellcode_detector.reassembly_memory_limit_kb > 262144u) {
+    cfg->shellcode_detector.reassembly_memory_limit_kb = 262144u;
+  }
+  if (cfg->shellcode_detector.reassembly_idle_timeout_s < 5u) {
+    cfg->shellcode_detector.reassembly_idle_timeout_s = 5u;
+  } else if (cfg->shellcode_detector.reassembly_idle_timeout_s > 600u) {
+    cfg->shellcode_detector.reassembly_idle_timeout_s = 600u;
+  }
+  if (cfg->shellcode_detector.scan_queue_capacity < 32u) {
+    cfg->shellcode_detector.scan_queue_capacity = 32u;
+  } else if (cfg->shellcode_detector.scan_queue_capacity > 4096u) {
+    cfg->shellcode_detector.scan_queue_capacity = 4096u;
   }
   /* P2 #8：WinDivert 队列参数 clamp（0 保留为“用内置默认”，不 clamp）。 */
   if (cfg->shellcode_detector.windivert_queue_length != 0u) {
@@ -1937,7 +1994,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.auto_isolate_threshold = 0.95;
   cfg->shellcode_detector.auto_isolate_execute = false;
   cfg->shellcode_detector.heuristic_score_scale = 1.0;
+  cfg->shellcode_detector.pmfe_followup_enabled = true;
+  cfg->shellcode_detector.pmfe_heuristic_threshold = 0.90;
   cfg->shellcode_detector.flow_scan_first_bytes = 65536u;
+  cfg->shellcode_detector.reassembly_max_flows = 512u;
+  cfg->shellcode_detector.reassembly_memory_limit_kb = 16384u;
+  cfg->shellcode_detector.reassembly_idle_timeout_s = 30u;
   cfg->shellcode_detector.scan_tls_appdata = false;
   cfg->shellcode_detector.exclude_self_traffic = true;
   cfg->shellcode_detector.yara_rules_reload_interval_s = 300u;
@@ -1948,6 +2010,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.monitor_ldap = true;
   cfg->shellcode_detector.monitor_tls = true;
   cfg->shellcode_detector.detector_threads = 2u;
+  cfg->shellcode_detector.scan_queue_capacity = 256u;
   cfg->shellcode_detector.windivert_queue_length = 8192u;
   cfg->shellcode_detector.windivert_queue_size_kb = 8192u;
   cfg->shellcode_detector.windivert_queue_time_ms = 2000u;

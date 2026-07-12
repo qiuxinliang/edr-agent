@@ -51,6 +51,7 @@ static const EdrConfig *s_collector_cfg;
 
 #define EDR_COLLECTOR_PID_CACHE 512u
 #define EDR_AGENT_SELF_PID_CACHE 128u
+#define EDR_POLICY_CANARY_PID_CACHE 32u
 
 typedef struct {
   uint32_t pid;
@@ -65,6 +66,9 @@ static uint32_t s_pid_cache_next;
 static uint32_t s_agent_self_pid_cache[EDR_AGENT_SELF_PID_CACHE];
 static uint64_t s_agent_self_seen_ns[EDR_AGENT_SELF_PID_CACHE];
 static uint32_t s_agent_self_pid_next;
+static uint32_t s_policy_canary_pid_cache[EDR_POLICY_CANARY_PID_CACHE];
+static uint64_t s_policy_canary_seen_ns[EDR_POLICY_CANARY_PID_CACHE];
+static uint32_t s_policy_canary_pid_next;
 static char s_agent_exe_path[MAX_PATH];
 static uint64_t s_agent_self_minute_unix;
 static uint64_t s_agent_self_minute_count;
@@ -564,6 +568,56 @@ static int edr_agent_self_process_name(const char *s) {
          edr_contains_ci_path(s, "edr_agent_install.ps1");
 }
 
+static int edr_policy_canary_marker(const char *s) {
+  return s && s[0] && edr_contains_ci_path(s, "EDR_POLICY_CANARY_");
+}
+
+static uint64_t edr_policy_canary_ttl_ns(void) {
+  return edr_env_u64_clamped("EDR_POLICY_CANARY_TTL_S", 120ULL, 30ULL, 600ULL) *
+         1000000000ULL;
+}
+
+static void edr_policy_canary_mark_pid(uint32_t pid, uint64_t now_ns) {
+  if (pid == 0u) {
+    return;
+  }
+  for (uint32_t i = 0; i < EDR_POLICY_CANARY_PID_CACHE; i++) {
+    if (s_policy_canary_pid_cache[i] == pid) {
+      s_policy_canary_seen_ns[i] = now_ns;
+      return;
+    }
+  }
+  uint32_t idx = s_policy_canary_pid_next++ % EDR_POLICY_CANARY_PID_CACHE;
+  s_policy_canary_pid_cache[idx] = pid;
+  s_policy_canary_seen_ns[idx] = now_ns;
+}
+
+static int edr_policy_canary_pid_seen(uint32_t pid, uint64_t now_ns) {
+  const uint64_t ttl_ns = edr_policy_canary_ttl_ns();
+  if (pid == 0u) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < EDR_POLICY_CANARY_PID_CACHE; i++) {
+    if (s_policy_canary_pid_cache[i] != pid) {
+      continue;
+    }
+    if (now_ns >= s_policy_canary_seen_ns[i] && now_ns - s_policy_canary_seen_ns[i] <= ttl_ns) {
+      return 1;
+    }
+    s_policy_canary_pid_cache[i] = 0u;
+    s_policy_canary_seen_ns[i] = 0u;
+    return 0;
+  }
+  return 0;
+}
+
+void edr_collector_register_policy_canary_process(uint32_t pid, const char *command) {
+  if (pid == 0u || !edr_policy_canary_marker(command)) {
+    return;
+  }
+  edr_policy_canary_mark_pid(pid, edr_unix_ns());
+}
+
 static uint32_t edr_parse_pid_text(const char *s) {
   if (!s || !s[0]) {
     return 0u;
@@ -576,6 +630,15 @@ static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
     return 0;
   }
   uint64_t now = edr_unix_ns();
+  if (edr_policy_canary_marker(ev->path) || edr_policy_canary_marker(ev->registry_path)) {
+    edr_policy_canary_mark_pid(ev->pid, now);
+    return 0;
+  }
+  if (edr_policy_canary_pid_seen(ev->pid, now) ||
+      edr_policy_canary_pid_seen(ev->parent_pid, now)) {
+    edr_policy_canary_mark_pid(ev->pid, now);
+    return 0;
+  }
   if (ev->pid == s_agent_pid || ev->parent_pid == s_agent_pid ||
       edr_agent_self_pid_seen(ev->pid, now) || edr_agent_self_pid_seen(ev->parent_pid, now)) {
     edr_agent_self_mark_pid(ev->pid, now);
@@ -598,6 +661,14 @@ static int edr_agent_self_suppress_security_event(const char *img, const char *c
   uint64_t now = edr_unix_ns();
   uint32_t pid = edr_parse_pid_text(epid);
   uint32_t parent_pid = edr_parse_pid_text(ppid);
+  if (edr_policy_canary_marker(cmd)) {
+    edr_policy_canary_mark_pid(pid, now);
+    return 0;
+  }
+  if (edr_policy_canary_pid_seen(pid, now) || edr_policy_canary_pid_seen(parent_pid, now)) {
+    edr_policy_canary_mark_pid(pid, now);
+    return 0;
+  }
   if (pid == s_agent_pid || parent_pid == s_agent_pid ||
       edr_agent_self_pid_seen(pid, now) || edr_agent_self_pid_seen(parent_pid, now)) {
     edr_agent_self_mark_pid(pid, now);
@@ -617,6 +688,14 @@ static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
     return 0;
   }
   uint64_t now = br->event_time_ns > 0 ? (uint64_t)br->event_time_ns : edr_unix_ns();
+  if (edr_policy_canary_marker(br->cmdline)) {
+    edr_policy_canary_mark_pid(br->pid, now);
+    return 0;
+  }
+  if (edr_policy_canary_pid_seen(br->pid, now) || edr_policy_canary_pid_seen(br->ppid, now)) {
+    edr_policy_canary_mark_pid(br->pid, now);
+    return 0;
+  }
   if (br->pid == s_agent_pid || br->ppid == s_agent_pid ||
       edr_agent_self_pid_seen(br->pid, now) || edr_agent_self_pid_seen(br->ppid, now)) {
     edr_agent_self_mark_pid(br->pid, now);
@@ -1240,11 +1319,6 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (!s_bus || !event_record) {
     return;
   }
-  if (!edr_collector_keep_agent_self_events() &&
-      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid) {
-    edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_DIRECT_PID);
-    return;
-  }
   if (edr_agent_self_fuse_should_drop_provider(event_record)) {
     s_agent_self_fuse_suppressed++;
     s_health.agent_self_fuse_provider_suppressed++;
@@ -1255,6 +1329,12 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   const char *tag;
   if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
     s_health.collector_dropped++;
+    return;
+  }
+  if (!edr_collector_keep_agent_self_events() &&
+      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
+      ty != EDR_EVENT_PROCESS_CREATE) {
+    edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_DIRECT_PID);
     return;
   }
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
@@ -1453,6 +1533,9 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   memset(s_agent_self_pid_cache, 0, sizeof(s_agent_self_pid_cache));
   memset(s_agent_self_seen_ns, 0, sizeof(s_agent_self_seen_ns));
   s_agent_self_pid_next = 0u;
+  memset(s_policy_canary_pid_cache, 0, sizeof(s_policy_canary_pid_cache));
+  memset(s_policy_canary_seen_ns, 0, sizeof(s_policy_canary_seen_ns));
+  s_policy_canary_pid_next = 0u;
   s_agent_self_minute_unix = 0u;
   s_agent_self_minute_count = 0u;
   s_agent_self_fuse_until_ns = 0u;

@@ -293,8 +293,14 @@ alert_threshold          = 0.70
 auto_isolate_threshold   = 0.95
 auto_isolate_execute     = false
 heuristic_score_scale    = 1.0
+pmfe_followup_enabled    = true
+pmfe_heuristic_threshold = 0.90
 # P0 优化 #2：每条连接只深扫前 N 字节载荷（漏洞利用特征在会话起始）；超过则跳过深扫。0=不限（旧行为）。
 flow_scan_first_bytes    = 65536
+# 方向感知TCP重组：总内存达到上限时淘汰最久未活动的流。
+reassembly_max_flows     = 512
+reassembly_memory_limit_kb = 16384
+reassembly_idle_timeout_s = 30
 # P0 优化 #3：是否深扫 TLS 应用数据（密文）。默认 false：仅取 ClientHello(JA3/SNI)，跳过密文记录，省 CPU 且免误报。
 scan_tls_appdata         = false
 # 排除 Agent 自身到平台/中继/代理的流量(默认 true)。启动解析 [platform] rest_base_url/relay_url/proxy_url 的 IP，
@@ -307,8 +313,9 @@ monitor_rdp              = true
 monitor_winrm            = true
 monitor_msrpc            = true
 monitor_ldap             = true
-# P2 #7：捕获消费线程数(1..4)。>1 时多线程并发 recv 同一句柄、共享状态加锁；>1 时禁用 YARA 热重载(启动加载一次)。
+# 异步检测 worker 数(1..4)。捕获固定使用单线程；worker 消费有界队列，YARA 匹配与热重载由锁保护。
 detector_threads         = 2
+scan_queue_capacity      = 256
 # P2 #8：WinDivert 内核队列参数(0=用内置默认)。瘦终端可调小以约束非分页内存。
 # 范围:length 32..16384、size 64..32768 KiB、time 100..16000 ms。
 windivert_queue_length   = 8192

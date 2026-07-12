@@ -1,4 +1,5 @@
 #include "edr/shell_exec.h"
+#include "edr/collector.h"
 #include "cJSON.h"
 #include <ctype.h>
 #include <errno.h>
@@ -114,8 +115,18 @@ int edr_shell_exec_cancellable(const char *command, int timeout_sec,
   char cmdline[3072];
   snprintf(cmdline, sizeof(cmdline), "cmd.exe /c \"%s\"", command);
   PROCESS_INFORMATION pi = { 0 };
-  if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+  if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                      NULL, NULL, &si, &pi)) {
     CloseHandle(hWrite); CloseHandle(hRead);
+    return -1;
+  }
+  edr_collector_register_policy_canary_process((uint32_t)pi.dwProcessId, command);
+  if (ResumeThread(pi.hThread) == (DWORD)-1) {
+    TerminateProcess(pi.hProcess, 125);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hWrite);
+    CloseHandle(hRead);
     return -1;
   }
   CloseHandle(hWrite);

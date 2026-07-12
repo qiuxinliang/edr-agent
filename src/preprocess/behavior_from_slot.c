@@ -1082,6 +1082,12 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "cmd") == 0) {
     snprintf(f->cmd, sizeof(f->cmd), "%s", val);
     f->has_cmd = 1;
+  } else if (strcmp(key, "cmd_id") == 0 || strcmp(key, "alert_id") == 0 ||
+             strcmp(key, "pmfe_recommended") == 0 || strcmp(key, "pmfe_trigger") == 0 ||
+             strcmp(key, "followup_only") == 0 ||
+             strcmp(key, "source_alert_id") == 0 || strcmp(key, "pmfe_status") == 0 ||
+             strcmp(key, "pmfe_verdict") == 0) {
+    append_sensor_kv(f, key, val);
   } else if (strcmp(key, "path") == 0 && !f->file[0]) {
     snprintf(f->file, sizeof(f->file), "%s", val);
   } else if (strcmp(key, "old_file") == 0 || strcmp(key, "old_path") == 0 ||
@@ -1349,7 +1355,9 @@ static void apply_mitre_hints(EdrBehaviorRecord *r) {
     snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1562.004");
     r->mitre_ttp_count++;
   }
-  if (r->type == EDR_EVENT_PMFE_SCAN_RESULT && r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
+  if (r->type == EDR_EVENT_PMFE_SCAN_RESULT &&
+      strstr(r->script_snippet, "pmfe_verdict=suspicious") != NULL &&
+      r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
     snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1055");
     r->mitre_ttp_count++;
   }

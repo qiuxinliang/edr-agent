@@ -135,6 +135,66 @@ static void test_pmfe_result_keeps_memory_evidence(void) {
   assert(strstr(r.detection_context, "pmfe_result_feedback") != NULL);
 }
 
+static void test_pmfe_clean_shellcode_followup_closes_without_alert(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=pmfe followup_only=1 source_alert_id=sc-123 "
+           "pmfe_status=completed_clean pmfe_verdict=clean score=0.05 mitre=-");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "regions=7 private_exec=0 stomp_suspicious=0 mz_hits=0 ave_max_score=0");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(!d.drop);
+  assert(d.confidence < 0.25f);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(strstr(d.reason, "pmfe_followup_clean") != NULL);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-123\"") != NULL);
+  assert(strstr(r.detection_context, "\"followup_only\":true") != NULL);
+  assert(strstr(r.detection_context, "\"status\":\"completed_clean\"") != NULL);
+  assert(strstr(r.detection_context, "\"verdict\":\"clean\"") != NULL);
+}
+
+static void test_pmfe_failed_shellcode_followup_reports_context(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=pmfe followup_only=1 source_alert_id=sc-789 "
+           "pmfe_status=failed pmfe_verdict=inconclusive score=0.35 mitre=-");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(!d.drop);
+  assert(d.confidence < 0.25f);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(strstr(d.reason, "pmfe_followup_inconclusive") != NULL);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-789\"") != NULL);
+  assert(strstr(r.detection_context, "\"status\":\"failed\"") != NULL);
+  assert(strstr(r.detection_context, "\"verdict\":\"inconclusive\"") != NULL);
+}
+
+static void test_pmfe_suspicious_shellcode_followup_keeps_alert(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=pmfe followup_only=1 source_alert_id=sc-456 "
+           "pmfe_status=completed_suspicious pmfe_verdict=suspicious score=0.94 mitre=T1055");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "regions=9 private_exec=1 stomp_suspicious=1 mz_hits=1 ave_max_score=0.94");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.suppress);
+  assert(!d.drop);
+  assert(d.confidence >= 0.70f);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-456\"") != NULL);
+  assert(strstr(r.detection_context, "\"status\":\"completed_suspicious\"") != NULL);
+  assert(strstr(r.detection_context, "\"verdict\":\"suspicious\"") != NULL);
+}
+
 static void test_rmm_enterprise_allowlist_policy_suppresses_remote_noise(void) {
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
@@ -459,6 +519,9 @@ int main(void) {
   test_shellcode_recommends_minidump_and_pmfe();
   test_webshell_triggers_targeted_pmfe();
   test_pmfe_result_keeps_memory_evidence();
+  test_pmfe_clean_shellcode_followup_closes_without_alert();
+  test_pmfe_failed_shellcode_followup_reports_context();
+  test_pmfe_suspicious_shellcode_followup_keeps_alert();
   test_rmm_enterprise_allowlist_policy_suppresses_remote_noise();
   test_process_context_window_correlates_remote_script();
   test_process_tree_context_correlates_parent_child();

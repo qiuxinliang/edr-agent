@@ -18,6 +18,11 @@ void edr_collector_stop(void) {}
 
 void edr_collector_stop_orphan_etw_session(void) {}
 
+void edr_collector_register_policy_canary_process(uint32_t pid, const char *command) {
+  (void)pid;
+  (void)command;
+}
+
 int edr_collector_get_health(EdrCollectorHealth *out_health) {
   EdrAdaptiveCollectionStatus adaptive;
   if (!out_health) {

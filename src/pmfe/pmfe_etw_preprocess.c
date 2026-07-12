@@ -14,8 +14,6 @@
 
 #ifdef _WIN32
 #include <stdio.h>
-#include <winsock2.h>
-#include <iphlpapi.h>
 #include <windows.h>
 
 /** 在 ETW1 文本中查找 `key=value` 行（key 不含 '='） */
@@ -63,41 +61,6 @@ static int etw1_line_value(const uint8_t *data, uint32_t len, const char *key, c
   return -1;
 }
 
-static uint32_t pmfe_tcp_owner_for_local_port_v4(uint16_t port_host_order) {
-  DWORD size = 0;
-  if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER ||
-      size == 0) {
-    return 0u;
-  }
-  MIB_TCPTABLE_OWNER_PID *tab = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
-  if (!tab) {
-    return 0u;
-  }
-  if (GetExtendedTcpTable(tab, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
-    free(tab);
-    return 0u;
-  }
-  uint32_t listen_pid = 0u;
-  uint32_t estab_pid = 0u;
-  for (DWORD i = 0; i < tab->dwNumEntries; i++) {
-    MIB_TCPROW_OWNER_PID *r = &tab->table[i];
-    uint16_t lp = (uint16_t)ntohs((u_short)r->dwLocalPort);
-    if (lp != port_host_order) {
-      continue;
-    }
-    /* 与 attack_surface_report / attack_surface_egress 一致：LISTEN=2、ESTABLISHED=5 */
-    if ((int)r->dwState == 2) {
-      listen_pid = r->dwOwningPid;
-    } else if ((int)r->dwState == 5) {
-      estab_pid = r->dwOwningPid;
-    }
-  }
-  free(tab);
-  if (listen_pid != 0u) {
-    return listen_pid;
-  }
-  return estab_pid;
-}
 #endif
 
 #if defined(__linux__) || defined(_WIN32)
@@ -175,7 +138,13 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
   }
 
   char score_s[40];
-  char dpt_s[24];
+  char recommended_s[16];
+  char alert_id[64];
+  char trigger[48];
+  if (etw1_line_value(slot->data, slot->size, "pmfe_recommended", recommended_s,
+                      sizeof(recommended_s)) != 0 || strcmp(recommended_s, "1") != 0) {
+    return;
+  }
   if (etw1_line_value(slot->data, slot->size, "score", score_s, sizeof(score_s)) != 0) {
     return;
   }
@@ -190,12 +159,6 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
   }
 
   uint32_t target = br->pid;
-  if (target == 0u && etw1_line_value(slot->data, slot->size, "dpt", dpt_s, sizeof(dpt_s)) == 0) {
-    unsigned long dpt = strtoul(dpt_s, NULL, 10);
-    if (dpt > 0ul && dpt <= 65535ul) {
-      target = pmfe_tcp_owner_for_local_port_v4((uint16_t)dpt);
-    }
-  }
 
   DWORD self = GetCurrentProcessId();
   if (target == 0u || target == (uint32_t)self) {
@@ -210,10 +173,17 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
     hint_va = strtoull(va_s, NULL, 0);
   }
 
-  EdrPmfeTriggerBand band = (slot->priority == 0u) ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  alert_id[0] = '\0';
+  trigger[0] = '\0';
+  (void)etw1_line_value(slot->data, slot->size, "alert_id", alert_id, sizeof(alert_id));
+  (void)etw1_line_value(slot->data, slot->size, "pmfe_trigger", trigger, sizeof(trigger));
+  EdrPmfeTriggerBand band = strcmp(trigger, "known_exploit") == 0 ? EDR_PMFE_BAND_P0 : EDR_PMFE_BAND_P1;
+  char reason[64];
+  snprintf(reason, sizeof(reason), "shellcode:%.46s", alert_id[0] ? alert_id : "unlinked");
 
-  if (edr_pmfe_submit_etw_scan_ex("shellcode", target, band, hint_va) == 0) {
-    fprintf(stderr, "[pmfe][etw] auto_queued shellcode score=%.4f target_pid=%u band=%u hint=0x%llx\n", score,
+  if (edr_pmfe_submit_etw_scan_ex(reason, target, band, hint_va) == 0) {
+    fprintf(stderr, "[pmfe][etw] auto_queued shellcode alert_id=%s trigger=%s score=%.4f target_pid=%u band=%u hint=0x%llx\n",
+            alert_id[0] ? alert_id : "unlinked", trigger[0] ? trigger : "unknown", score,
             (unsigned)target, (unsigned)band, (unsigned long long)hint_va);
   }
 #else
