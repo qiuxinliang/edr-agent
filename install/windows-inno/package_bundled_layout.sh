@@ -70,6 +70,13 @@ else
   echo "Error: missing: $STAGE_DIR/FDSensor.exe" >&2
   exit 1
 fi
+if command -v file >/dev/null 2>&1; then
+  PE_DESC="$(file -b "$AGENT_EXE")"
+  case "$ARCH" in
+    amd64) [[ "$PE_DESC" == *"x86-64"* ]] || { echo "Error: target amd64 but Agent PE is: $PE_DESC" >&2; exit 1; } ;;
+    arm64) [[ "$PE_DESC" == *"Aarch64"* || "$PE_DESC" == *"ARM64"* ]] || { echo "Error: target arm64 but Agent PE is: $PE_DESC" >&2; exit 1; } ;;
+  esac
+fi
 require_yara_runtime_dlls_in_dir "$STAGE_DIR" "STAGE_DIR"
 
 # --- Binaries (Inno EDR_BIN_DIR) ---
@@ -101,12 +108,18 @@ if [[ "$DLL_COUNT" -lt 1 ]]; then
   echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start if FDSensor.exe is dynamically linked." >&2
 fi
 require_yara_runtime_dlls_in_dir "$OUT_DIR" "bundled payload output"
-require_windivert_runtime
-cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert.dll" "$OUT_DIR/WinDivert.dll"
-cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert64.sys" "$OUT_DIR/WinDivert64.sys"
-mkdir -p "$OUT_DIR/licenses"
-cp -a "$EDR_AGENT_DIR/third_party/windivert/LICENSE" "$OUT_DIR/licenses/WinDivert-LICENSE.txt"
-cp -a "$EDR_AGENT_DIR/third_party/windivert/SOURCE.json" "$OUT_DIR/licenses/WinDivert-SOURCE.json"
+mkdir -p "$OUT_DIR/licenses" "$OUT_DIR/capabilities"
+if [[ "$ARCH" == "amd64" ]]; then
+  require_windivert_runtime
+  cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert.dll" "$OUT_DIR/WinDivert.dll"
+  cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert64.sys" "$OUT_DIR/WinDivert64.sys"
+  cp -a "$EDR_AGENT_DIR/third_party/windivert/LICENSE" "$OUT_DIR/licenses/WinDivert-LICENSE.txt"
+  cp -a "$EDR_AGENT_DIR/third_party/windivert/SOURCE.json" "$OUT_DIR/licenses/WinDivert-SOURCE.json"
+  printf '%s\n' '{"target_arch":"amd64","windivert":true,"network_packet_capture":true}' > "$OUT_DIR/capabilities/package.json"
+else
+  printf '%s\n' '{"target_arch":"arm64","windivert":false,"network_packet_capture":false,"reason":"WinDivert 2.2.2 has no ARM64 kernel driver; Windows Firewall host isolation remains available"}' > "$OUT_DIR/capabilities/package.json"
+fi
+printf '%s\n' "$ARCH" > "$OUT_DIR/ARCH"
 
 # models: whitelist production-ready compact model artifacts only.
 if [[ -d "$EDR_AGENT_DIR/models" ]]; then

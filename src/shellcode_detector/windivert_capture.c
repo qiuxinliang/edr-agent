@@ -1394,7 +1394,11 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
   InterlockedExchange(&s_scan_jobs_processed, 0);
   InterlockedExchange(&s_alert_seq, 0);
   s_runtime.code_supported = 1;
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  s_runtime.build_supported = 0;
+#else
   s_runtime.build_supported = 1;
+#endif
   s_runtime.policy_enabled = cfg && cfg->shellcode_detector.enabled ? 1 : 0;
   s_cfg = cfg;
   s_bus = bus;
@@ -1403,6 +1407,11 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     runtime_set(EDR_SHELLCODE_RUNTIME_DISABLED, "disabled", "policy_disabled", ERROR_SUCCESS);
     return EDR_OK;
   }
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "unavailable",
+              "arm64_windivert_driver_unavailable", ERROR_NOT_SUPPORTED);
+  return EDR_ERR_WINDIVERT_OPEN;
+#endif
   runtime_set(EDR_SHELLCODE_RUNTIME_STARTING, "starting", "loading_windivert", ERROR_SUCCESS);
   (void)edr_shellcode_known_init(cfg->shellcode_detector.yara_rules_dir);
   if (load_windivert() != 0) {

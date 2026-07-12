@@ -1507,6 +1507,13 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
 #else
   const char *platform = "linux";
 #endif
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  const char *architecture = "arm64";
+#elif defined(_M_X64) || defined(_AMD64_) || defined(__x86_64__)
+  const char *architecture = "amd64";
+#else
+  const char *architecture = "unknown";
+#endif
 #ifdef EDR_HAVE_PCRE2
   const int pcre2_build = 1;
 #else
@@ -1617,7 +1624,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
            agent && agent->cfg.attack_surface.egress_enabled ? "true" : "false");
   snprintf(
       out, out_cap,
-      "{\"schema\":\"edr.agent.capabilities.v1\",\"platform\":\"%s\","
+      "{\"schema\":\"edr.agent.capabilities.v1\",\"platform\":\"%s\",\"architecture\":\"%s\","
       "\"telemetry\":{\"alert_governor\":{\"admitted\":%llu,\"suppressed\":%llu,"
       "\"summaries\":%llu,\"critical_bypassed\":%llu}},"
       "%s"
@@ -1649,7 +1656,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"targeted_forensic_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"targeted_forensic_memory\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
-      platform,
+      platform, architecture,
       (unsigned long long)alert_stats.admitted,
       (unsigned long long)alert_stats.suppressed,
       (unsigned long long)alert_stats.summaries,

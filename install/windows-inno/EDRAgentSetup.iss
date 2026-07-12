@@ -21,7 +21,15 @@
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
-#define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
+#ifndef EDR_TARGET_ARCH
+  #define EDR_TARGET_ARCH "amd64"
+#endif
+#ifdef EDR_TARGET_ARM64
+  #define EDR_SETUP_ARCH "arm64"
+#else
+  #define EDR_SETUP_ARCH "x64os"
+  #define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
+#endif
 #define EDR_WINDIVERT_LICENSE "..\..\third_party\windivert\LICENSE"
 #define EDR_WINDIVERT_SOURCE "..\..\third_party\windivert\SOURCE.json"
 
@@ -33,8 +41,8 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed={#EDR_SETUP_ARCH}
+ArchitecturesInstallIn64BitMode={#EDR_SETUP_ARCH}
 OutputDir=Output
 OutputBaseFilename=FDSecuritySetup
 Compression=lzma2
@@ -54,8 +62,10 @@ Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin 
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
 ; 与 FDSensor.exe 同目录：ONNX + vcpkg 运行时 DLL（发布 CI 在 ISCC 前 stage 到 build\Release\）
 Source: "..\..\build\Release\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
+#ifndef EDR_TARGET_ARM64
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 Source: "{#EDR_WINDIVERT_LICENSE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
 Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-SOURCE.json"; Flags: ignoreversion
 ; models\：与 config.c 中「exe 同目录\models」及 agent.toml.example [ave] 约定一致；占位文件便于空目录随包安装

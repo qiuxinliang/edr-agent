@@ -35,7 +35,15 @@
 #ifndef EDR_VERSION_FILE
   #define EDR_VERSION_FILE EDR_BIN_DIR + "\VERSION"
 #endif
-#define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
+#ifndef EDR_TARGET_ARCH
+  #define EDR_TARGET_ARCH "amd64"
+#endif
+#ifdef EDR_TARGET_ARM64
+  #define EDR_SETUP_ARCH "arm64"
+#else
+  #define EDR_SETUP_ARCH "x64os"
+  #define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
+#endif
 #define EDR_WINDIVERT_LICENSE "..\..\third_party\windivert\LICENSE"
 #define EDR_WINDIVERT_SOURCE "..\..\third_party\windivert\SOURCE.json"
 #ifndef MyAppVersion
@@ -51,8 +59,8 @@ DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=bundle_extra\EULA.txt
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed={#EDR_SETUP_ARCH}
+ArchitecturesInstallIn64BitMode={#EDR_SETUP_ARCH}
 OutputDir=Output
 OutputBaseFilename=FDSecuritySetup-bundled
 Compression=lzma2
@@ -76,11 +84,15 @@ Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fa
 Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
+#ifndef EDR_TARGET_ARM64
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 Source: "{#EDR_WINDIVERT_LICENSE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
 Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-SOURCE.json"; Flags: ignoreversion
 Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_BIN_DIR}\ARCH"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_BIN_DIR}\package-capabilities.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Excludes: "behavior.onnx,static_fp32.onnx,*.training.*,*.tmp"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "{#EDR_AGENT_PREPROCESS_TOML}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist

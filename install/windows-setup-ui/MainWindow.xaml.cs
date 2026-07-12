@@ -2403,23 +2403,58 @@ public partial class MainWindow : Window
         return firstSegment + "。" + suffix;
     }
 
-    private static CheckItem CheckSystemArchitecture()
+    private CheckItem CheckSystemArchitecture()
     {
         var os = RuntimeInformation.OSArchitecture;
         var process = RuntimeInformation.ProcessArchitecture;
-        if (os == Architecture.X64 && process == Architecture.X64)
+        var target = ReadSetupTargetArchitecture();
+        if (target == "arm64")
         {
-            return CheckItem.Ok("系统架构", "x64 / AMD64");
+            return os == Architecture.Arm64
+                ? CheckItem.Ok("系统架构", $"ARM64 原生包 / 进程 {process}")
+                : CheckItem.Fail("系统架构", $"当前安装包要求 ARM64 Windows，检测到 OS={os}；请下载 Windows x64 安装包");
         }
-        if (os == Architecture.Arm64 && process == Architecture.X64)
+        if (target == "amd64")
         {
-            return CheckItem.Warn("系统架构", "ARM64 Windows，当前通过 x64 仿真运行；虚拟机/兼容场景可继续安装");
+            return os == Architecture.X64
+                ? CheckItem.Ok("系统架构", "x64 / AMD64 原生包")
+                : CheckItem.Fail("系统架构", $"当前安装包包含 x64 内核组件，不能安装到 OS={os}；请下载 Windows ARM64 安装包");
         }
-        if (os == Architecture.Arm64)
+        return CheckItem.Fail("系统架构", $"安装包未声明有效 target_arch（{target}），拒绝继续安装");
+    }
+
+    private string ReadSetupTargetArchitecture()
+    {
+        var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
+        if (!File.Exists(manifest))
         {
-            return CheckItem.Warn("系统架构", $"ARM64 Windows / 进程 {process}；安装包为 x64，将尝试兼容安装");
+            return "unknown";
         }
-        return CheckItem.Fail("系统架构", $"当前为 OS={os}, Process={process}，此安装包要求 x64 或 ARM64+x64 仿真");
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+            var root = doc.RootElement;
+            var target = root.TryGetProperty("target_arch", out var archNode)
+                ? (archNode.GetString() ?? "").Trim().ToLowerInvariant()
+                : "";
+            if (target is "x64" or "x86_64") target = "amd64";
+            if (target is "aarch64") target = "arm64";
+            if (target is "amd64" or "arm64") return target;
+
+            var runtime = root.TryGetProperty("runtime_identifier", out var runtimeNode)
+                ? (runtimeNode.GetString() ?? "").Trim().ToLowerInvariant()
+                : "";
+            return runtime switch
+            {
+                "win-x64" => "amd64",
+                "win-arm64" => "arm64",
+                _ => "unknown"
+            };
+        }
+        catch
+        {
+            return "unknown";
+        }
     }
 
     private static string DescribeArchitectureForHeader()

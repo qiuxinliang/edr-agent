@@ -14,6 +14,8 @@ param(
     [string] $Inno = "",
     [string] $BinDir = "",
     [string] $AppVersion = "",
+    [ValidateSet("amd64", "arm64")]
+    [string] $TargetArch = "amd64",
     [string] $CollectorArch = "",
     [switch] $SkipForensicCollectorBuild,
     [switch] $AllowPowerShellFallback
@@ -84,7 +86,14 @@ Assert-YaraRuntimeDlls -Dir $BinDir
 
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
-Assert-WinDivertRuntime -AgentRoot $agentRoot
+$archCheck = Join-Path $agentRoot "scripts\Assert-WindowsPeArchitecture.ps1"
+if (-not (Test-Path -LiteralPath $archCheck)) { throw "Missing architecture verifier: $archCheck" }
+& $archCheck -Path $binExe -Architecture $TargetArch
+if ($TargetArch -eq "amd64") {
+    Assert-WinDivertRuntime -AgentRoot $agentRoot
+} else {
+    Write-Host "ARM64 package: WinDivert x64 DLL/driver intentionally excluded."
+}
 
 function Resolve-CollectorArch {
     param([string] $Raw)
@@ -161,6 +170,9 @@ if (-not (Test-Path -LiteralPath $workerExe)) {
         throw $message
     }
 }
+if (Test-Path -LiteralPath $workerExe) {
+    & $archCheck -Path $workerExe -Architecture $TargetArch
+}
 
 $versionFile = Join-Path $BinDir "VERSION"
 $sourceVersionFile = Join-Path $agentRoot "VERSION"
@@ -180,8 +192,21 @@ if (-not $AppVersion) {
 }
 [System.IO.File]::WriteAllText($versionFile, $AppVersion + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
 Write-Host "Staged VERSION: $AppVersion"
+$archFile = Join-Path $BinDir "ARCH"
+[System.IO.File]::WriteAllText($archFile, $TargetArch + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
+$packageCapabilities = @{
+    target_arch = $TargetArch
+    windivert = ($TargetArch -eq "amd64")
+    network_packet_capture = ($TargetArch -eq "amd64")
+    windows_firewall_isolation = $true
+} | ConvertTo-Json -Compress
+[System.IO.File]::WriteAllText((Join-Path $BinDir "package-capabilities.json"), $packageCapabilities, [System.Text.Encoding]::UTF8)
 
-$resolvedCollectorArch = Resolve-CollectorArch $CollectorArch
+$collectorArchInput = if ($CollectorArch) { $CollectorArch } else { $TargetArch }
+$resolvedCollectorArch = Resolve-CollectorArch $collectorArchInput
+if ($resolvedCollectorArch -ne $TargetArch) {
+    throw "CollectorArch '$resolvedCollectorArch' must match TargetArch '$TargetArch'"
+}
 Build-AndStageForensicCollector -RepoRoot $repoRoot -BinDir $BinDir -Arch $resolvedCollectorArch -Skip:$SkipForensicCollectorBuild
 
 $modelsDir = Join-Path $agentRoot "models"
@@ -203,16 +228,20 @@ if (-not (Test-Path -LiteralPath $Inno)) {
 
 # ISCC: paths with spaces need /DNAME="C:\a b"
 if ($BinDir -match "\s") { $binDef = '/DEDR_BIN_DIR="' + $BinDir + '"' } else { $binDef = "/DEDR_BIN_DIR=$BinDir" }
-& $Inno $binDef "/DMyAppVersion=$AppVersion" $iss
+$archDefs = @("/DEDR_TARGET_ARCH=$TargetArch")
+if ($TargetArch -eq "arm64") { $archDefs += "/DEDR_TARGET_ARM64=1" }
+& $Inno $binDef "/DMyAppVersion=$AppVersion" @archDefs $iss
 if ($LASTEXITCODE -ne 0) {
     throw "ISCC failed with exit $LASTEXITCODE"
 }
 $outDir = Join-Path $scriptDir "Output"
 $out = Join-Path $outDir "FDSecuritySetup-bundled.exe"
 if (Test-Path -LiteralPath $out) {
+    [System.IO.File]::WriteAllText($out + ".arch", $TargetArch + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
     Write-Host "OK: $out"
     $legacyOut = Join-Path $outDir "EDRAgentSetup-bundled.exe"
     Copy-Item -LiteralPath $out -Destination $legacyOut -Force
+    Copy-Item -LiteralPath ($out + ".arch") -Destination ($legacyOut + ".arch") -Force
     Write-Host "OK: legacy compatibility alias: $legacyOut"
 } else {
     Write-Warning "ISCC reported success but $out not found; check ISCC log."

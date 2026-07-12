@@ -23,7 +23,10 @@ param(
     [ValidateSet("", "self-contained", "compact", "framework-dependent")]
     [string] $RuntimeMode = "",
     [ValidateSet("", "win-x64", "win-arm64")]
-    [string] $RuntimeIdentifier = ""
+    [string] $RuntimeIdentifier = "",
+    [ValidateSet("", "amd64", "arm64")]
+    [string] $SetupTargetArch = "",
+    [switch] $AllowMissingSetupArchMetadata
 )
 
 $ErrorActionPreference = "Stop"
@@ -193,6 +196,22 @@ if ($runtime -notin @("win-x64", "win-arm64")) {
     throw "Invalid RuntimeIdentifier: $runtime"
 }
 $platformDir = if ($runtime -eq "win-arm64") { "arm64" } else { "x64" }
+$targetArch = if ($runtime -eq "win-arm64") { "arm64" } else { "amd64" }
+$setupArchSidecar = $SetupExe + ".arch"
+if (-not $SetupTargetArch -and (Test-Path -LiteralPath $setupArchSidecar)) {
+    $SetupTargetArch = ([System.IO.File]::ReadAllText($setupArchSidecar)).Trim().ToLowerInvariant()
+}
+if (-not $SetupTargetArch) {
+    if ($AllowMissingSetupArchMetadata) {
+        $SetupTargetArch = $targetArch
+        Write-Warning "Setup architecture sidecar is missing; trusting requested UI target because AllowMissingSetupArchMetadata was set."
+    } else {
+        throw "Missing setup architecture metadata: $setupArchSidecar. Rebuild Inno installer or pass -SetupTargetArch explicitly."
+    }
+}
+if ($SetupTargetArch -ne $targetArch) {
+    throw "Setup/UI architecture mismatch: setup=$SetupTargetArch ui=$targetArch"
+}
 $publishDirCandidates = @(
     (Join-Path $scriptDir "bin\$Configuration\$targetFramework\$runtime\publish"),
     (Join-Path $scriptDir "bin\$platformDir\$Configuration\$targetFramework\$runtime\publish")
@@ -256,6 +275,9 @@ foreach ($requiredPublishFile in $requiredPublishFiles) {
 Copy-Item -LiteralPath $SetupExe -Destination (Join-Path $publishDir "FDSecuritySetup.exe") -Force
 $uiExe = Join-Path $publishDir "FDSecuritySetupUI.exe"
 $bundledSetupExe = Join-Path $publishDir "FDSecuritySetup.exe"
+$archVerifier = Join-Path (Resolve-Path (Join-Path $scriptDir "..\..")).Path "scripts\Assert-WindowsPeArchitecture.ps1"
+if (-not (Test-Path -LiteralPath $archVerifier)) { throw "Missing architecture verifier: $archVerifier" }
+& $archVerifier -Path $uiExe -Architecture $targetArch
 $uiSigned = Invoke-SignIfConfigured $uiExe
 $setupSigned = Invoke-SignIfConfigured $bundledSetupExe
 
@@ -290,6 +312,13 @@ $manifest = @{
     version = $AppVersion
     runtime_mode = $resolvedRuntimeMode
     runtime_identifier = $runtime
+    target_arch = $targetArch
+    setup_target_arch = $SetupTargetArch
+    capabilities = @{
+        windivert = ($targetArch -eq "amd64")
+        network_packet_capture = ($targetArch -eq "amd64")
+        windows_firewall_isolation = $true
+    }
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"
     setup_exe_sha256 = Get-FileSha256Hex $bundledSetupExe

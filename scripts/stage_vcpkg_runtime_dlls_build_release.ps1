@@ -1,10 +1,10 @@
-# 将 vcpkg x64-windows 的 bin\*.dll 复制到 build\Release\，与 FDSensor.exe 同目录分发。
+# 将当前目标架构 vcpkg triplet 的 bin\*.dll 复制到 build\Release\。
 # 在 edr-agent 根目录、Release 已生成 FDSensor.exe 后执行。
-# 由 CI 在构建后调用；VCPKG_INSTALLED_X64 为 .../vcpkg_installed/x64-windows
+# 由 CI 在构建后调用；优先使用 VCPKG_INSTALLED_ROOT，兼容旧的 VCPKG_INSTALLED_X64。
 $ErrorActionPreference = "Stop"
-$V = $env:VCPKG_INSTALLED_X64
+$V = if ($env:VCPKG_INSTALLED_ROOT) { $env:VCPKG_INSTALLED_ROOT } else { $env:VCPKG_INSTALLED_X64 }
 if (-not $V) {
-  Write-Error "Set VCPKG_INSTALLED_X64 to vcpkg_installed\x64-windows (e.g. under edr-agent)"
+  Write-Error "Set VCPKG_INSTALLED_ROOT to the target vcpkg triplet directory (x64-windows or arm64-windows)"
   exit 1
 }
 $bin = Join-Path $V "bin"
@@ -27,7 +27,7 @@ $yaraPackageArtifacts = @(
 ) | Where-Object { Test-Path -LiteralPath $_ }
 if (-not $yaraRuntimeDlls -or $yaraRuntimeDlls.Count -lt 1) {
   if (-not $yaraPackageArtifacts -or $yaraPackageArtifacts.Count -lt 1) {
-    Write-Error "YARA package artifacts missing from vcpkg root: $V. Install vcpkg manifest feature 'yara' for x64-windows before staging."
+    Write-Error "YARA package artifacts missing from vcpkg root: $V. Install vcpkg manifest feature 'yara' for the target triplet before staging."
     exit 1
   }
   Write-Warning "No YARA runtime DLL found under $bin; vcpkg libyara appears to be linked statically for this triplet. Continuing after verifying package artifacts: $($yaraPackageArtifacts -join ', ')"
