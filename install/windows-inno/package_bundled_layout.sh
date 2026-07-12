@@ -115,9 +115,9 @@ if [[ "$ARCH" == "amd64" ]]; then
   cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert64.sys" "$OUT_DIR/WinDivert64.sys"
   cp -a "$EDR_AGENT_DIR/third_party/windivert/LICENSE" "$OUT_DIR/licenses/WinDivert-LICENSE.txt"
   cp -a "$EDR_AGENT_DIR/third_party/windivert/SOURCE.json" "$OUT_DIR/licenses/WinDivert-SOURCE.json"
-  printf '%s\n' '{"target_arch":"amd64","windivert":true,"network_packet_capture":true}' > "$OUT_DIR/capabilities/package.json"
+  printf '%s\n' '{"target_arch":"amd64","windivert":true,"network_packet_capture":true,"arm64_emulation_supported":true,"arm64_emulation_network_packet_capture":false,"windows_firewall_isolation":true}' > "$OUT_DIR/capabilities/package.json"
 else
-  printf '%s\n' '{"target_arch":"arm64","windivert":false,"network_packet_capture":false,"reason":"WinDivert 2.2.2 has no ARM64 kernel driver; Windows Firewall host isolation remains available"}' > "$OUT_DIR/capabilities/package.json"
+  printf '%s\n' '{"target_arch":"arm64","windivert":false,"network_packet_capture":false,"arm64_emulation_supported":false,"arm64_emulation_network_packet_capture":false,"windows_firewall_isolation":true,"reason":"WinDivert 2.2.2 has no ARM64 kernel driver; Windows Firewall host isolation remains available"}' > "$OUT_DIR/capabilities/package.json"
 fi
 printf '%s\n' "$ARCH" > "$OUT_DIR/ARCH"
 

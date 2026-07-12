@@ -198,6 +198,8 @@ $packageCapabilities = @{
     target_arch = $TargetArch
     windivert = ($TargetArch -eq "amd64")
     network_packet_capture = ($TargetArch -eq "amd64")
+    arm64_emulation_supported = ($TargetArch -eq "amd64")
+    arm64_emulation_network_packet_capture = $false
     windows_firewall_isolation = $true
 } | ConvertTo-Json -Compress
 [System.IO.File]::WriteAllText((Join-Path $BinDir "package-capabilities.json"), $packageCapabilities, [System.Text.Encoding]::UTF8)

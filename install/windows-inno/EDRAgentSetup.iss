@@ -27,7 +27,7 @@
 #ifdef EDR_TARGET_ARM64
   #define EDR_SETUP_ARCH "arm64"
 #else
-  #define EDR_SETUP_ARCH "x64os"
+  #define EDR_SETUP_ARCH "x64compatible"
   #define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
 #endif
 #define EDR_WINDIVERT_LICENSE "..\..\third_party\windivert\LICENSE"
@@ -63,8 +63,8 @@ Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
 ; 与 FDSensor.exe 同目录：ONNX + vcpkg 运行时 DLL（发布 CI 在 ISCC 前 stage 到 build\Release\）
 Source: "..\..\build\Release\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 #ifndef EDR_TARGET_ARM64
-Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
+Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
 #endif
 Source: "{#EDR_WINDIVERT_LICENSE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
 Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-SOURCE.json"; Flags: ignoreversion

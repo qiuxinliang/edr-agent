@@ -1495,6 +1495,27 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent);
 static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns, int force);
 
+static const char *edr_agent_native_architecture(const char *process_architecture,
+                                                 int *emulated) {
+  if (emulated) *emulated = 0;
+#ifdef _WIN32
+  typedef BOOL(WINAPI *PFN_IsWow64Process2)(HANDLE, USHORT *, USHORT *);
+  HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+  PFN_IsWow64Process2 query = kernel
+      ? (PFN_IsWow64Process2)GetProcAddress(kernel, "IsWow64Process2")
+      : NULL;
+  USHORT process_machine = 0;
+  USHORT native_machine = 0;
+  if (query && query(GetCurrentProcess(), &process_machine, &native_machine)) {
+    if (emulated) *emulated = process_machine != IMAGE_FILE_MACHINE_UNKNOWN;
+    if (native_machine == IMAGE_FILE_MACHINE_ARM64) return "arm64";
+    if (native_machine == IMAGE_FILE_MACHINE_AMD64) return "amd64";
+    if (native_machine == IMAGE_FILE_MACHINE_I386) return "386";
+  }
+#endif
+  return process_architecture;
+}
+
 static void edr_agent_capability_manifest_json(const EdrAgent *agent,
                                                const EdrIngestHttpRuntime *http_rt,
                                                const AVEStatus *avst, int ave_ok,
@@ -1514,6 +1535,9 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
 #else
   const char *architecture = "unknown";
 #endif
+  int architecture_emulated = 0;
+  const char *native_architecture =
+      edr_agent_native_architecture(architecture, &architecture_emulated);
 #ifdef EDR_HAVE_PCRE2
   const int pcre2_build = 1;
 #else
@@ -1625,6 +1649,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
   snprintf(
       out, out_cap,
       "{\"schema\":\"edr.agent.capabilities.v1\",\"platform\":\"%s\",\"architecture\":\"%s\","
+      "\"native_architecture\":\"%s\",\"emulated\":%s,"
       "\"telemetry\":{\"alert_governor\":{\"admitted\":%llu,\"suppressed\":%llu,"
       "\"summaries\":%llu,\"critical_bypassed\":%llu}},"
       "%s"
@@ -1656,7 +1681,8 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"targeted_forensic_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"targeted_forensic_memory\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
-      platform, architecture,
+      platform, architecture, native_architecture,
+      architecture_emulated ? "true" : "false",
       (unsigned long long)alert_stats.admitted,
       (unsigned long long)alert_stats.suppressed,
       (unsigned long long)alert_stats.summaries,

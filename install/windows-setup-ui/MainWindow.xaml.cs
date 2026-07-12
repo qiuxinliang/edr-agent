@@ -2416,11 +2416,40 @@ public partial class MainWindow : Window
         }
         if (target == "amd64")
         {
-            return os == Architecture.X64
-                ? CheckItem.Ok("系统架构", "x64 / AMD64 原生包")
-                : CheckItem.Fail("系统架构", $"当前安装包包含 x64 内核组件，不能安装到 OS={os}；请下载 Windows ARM64 安装包");
+            if (os == Architecture.X64)
+            {
+                return CheckItem.Ok("系统架构", "x64 / AMD64 原生包");
+            }
+            if (os == Architecture.Arm64 && ReadSetupBooleanCapability("arm64_emulation_supported"))
+            {
+                return CheckItem.Warn(
+                    "系统架构",
+                    $"ARM64 兼容模式 / x64 仿真进程 {process}；安装时将跳过 x64 WinDivert 驱动，网络协议包采集不可用，建议后续替换为原生 ARM64 包");
+            }
+            return CheckItem.Fail("系统架构", $"当前 x64 安装包未声明 ARM64 仿真兼容能力，不能安装到 OS={os}；请下载 Windows ARM64 安装包");
         }
         return CheckItem.Fail("系统架构", $"安装包未声明有效 target_arch（{target}），拒绝继续安装");
+    }
+
+    private bool ReadSetupBooleanCapability(string name)
+    {
+        var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
+        if (!File.Exists(manifest))
+        {
+            return false;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+            return doc.RootElement.TryGetProperty("capabilities", out var capabilities) &&
+                   capabilities.ValueKind == JsonValueKind.Object &&
+                   capabilities.TryGetProperty(name, out var value) &&
+                   value.ValueKind == JsonValueKind.True;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private string ReadSetupTargetArchitecture()

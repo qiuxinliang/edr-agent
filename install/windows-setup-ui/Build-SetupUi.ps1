@@ -317,6 +317,8 @@ $manifest = @{
     capabilities = @{
         windivert = ($targetArch -eq "amd64")
         network_packet_capture = ($targetArch -eq "amd64")
+        arm64_emulation_supported = ($targetArch -eq "amd64")
+        arm64_emulation_network_packet_capture = $false
         windows_firewall_isolation = $true
     }
     setup_exe = "FDSecuritySetup.exe"

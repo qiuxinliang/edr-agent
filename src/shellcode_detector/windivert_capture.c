@@ -38,6 +38,9 @@
 #ifndef CALG_SHA_256
 #define CALG_SHA_256 0x0000800c
 #endif
+#ifndef IMAGE_FILE_MACHINE_ARM64
+#define IMAGE_FILE_MACHINE_ARM64 0xAA64
+#endif
 
 /** libpcap LINKTYPE (per tcpdump.org linktypes) */
 #define EDR_PCAP_LT_IPV4 228u
@@ -175,6 +178,24 @@ static void runtime_set(EdrShellcodeRuntimeState state, const char *status, cons
   s_runtime.win32_error = (uint32_t)win32_error;
   snprintf(s_runtime.runtime_status, sizeof(s_runtime.runtime_status), "%s", status ? status : "degraded");
   snprintf(s_runtime.detail, sizeof(s_runtime.detail), "%s", detail ? detail : "unknown");
+}
+
+static int native_windows_is_arm64(void) {
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  return 1;
+#else
+  typedef BOOL(WINAPI *PFN_IsWow64Process2)(HANDLE, USHORT *, USHORT *);
+  HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+  PFN_IsWow64Process2 query = kernel
+      ? (PFN_IsWow64Process2)GetProcAddress(kernel, "IsWow64Process2")
+      : NULL;
+  USHORT process_machine = 0;
+  USHORT native_machine = 0;
+  if (!query || !query(GetCurrentProcess(), &process_machine, &native_machine)) {
+    return 0;
+  }
+  return native_machine == IMAGE_FILE_MACHINE_ARM64;
+#endif
 }
 
 static void ipv4_ntoa(uint32_t addr_le, char *out, size_t cap) {
@@ -1387,6 +1408,7 @@ static void scan_workers_stop(void) {
 }
 
 EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
+  const int arm64_os = native_windows_is_arm64();
   memset(&s_runtime, 0, sizeof(s_runtime));
   InterlockedExchange(&s_packets_received, 0);
   InterlockedExchange(&s_receive_errors, 0);
@@ -1397,7 +1419,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
 #if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
   s_runtime.build_supported = 0;
 #else
-  s_runtime.build_supported = 1;
+  s_runtime.build_supported = arm64_os ? 0 : 1;
 #endif
   s_runtime.policy_enabled = cfg && cfg->shellcode_detector.enabled ? 1 : 0;
   s_cfg = cfg;
@@ -1412,6 +1434,11 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
               "arm64_windivert_driver_unavailable", ERROR_NOT_SUPPORTED);
   return EDR_ERR_WINDIVERT_OPEN;
 #endif
+  if (arm64_os) {
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "unavailable",
+                "arm64_x64_emulation_windivert_unavailable", ERROR_NOT_SUPPORTED);
+    return EDR_ERR_WINDIVERT_OPEN;
+  }
   runtime_set(EDR_SHELLCODE_RUNTIME_STARTING, "starting", "loading_windivert", ERROR_SUCCESS);
   (void)edr_shellcode_known_init(cfg->shellcode_detector.yara_rules_dir);
   if (load_windivert() != 0) {
