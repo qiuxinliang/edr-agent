@@ -32,6 +32,8 @@ int main(void) {
   char *pmfe_preprocess = NULL;
   char *pmfe_engine = NULL;
   char *decision = NULL;
+  char *bundled_iss = NULL;
+  char *bundle_script = NULL;
   snprintf(path, sizeof(path), "%s/src/shellcode_detector/windivert_capture.c", root);
   if (read_all(path, &capture) != 0) return 2;
   snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
@@ -46,6 +48,14 @@ int main(void) {
   if (read_all(path, &decision) != 0) {
     free(capture); free(agent); free(pmfe_preprocess); free(pmfe_engine); return 2;
   }
+  snprintf(path, sizeof(path), "%s/install/windows-inno/EDRAgentSetup.bundled.iss", root);
+  if (read_all(path, &bundled_iss) != 0) {
+    free(capture); free(agent); free(pmfe_preprocess); free(pmfe_engine); free(decision); return 2;
+  }
+  snprintf(path, sizeof(path), "%s/scripts/stage_windivert_runtime.ps1", root);
+  if (read_all(path, &bundle_script) != 0) {
+    free(capture); free(agent); free(pmfe_preprocess); free(pmfe_engine); free(decision); free(bundled_iss); return 2;
+  }
 
   int failed = 0;
   failed |= require_text(capture, "WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY");
@@ -56,6 +66,8 @@ int main(void) {
   failed |= require_text(capture, "scan_queue_push");
   failed |= require_text(capture, "edr_tcp_reassembly_submit");
   failed |= require_text(capture, "scan_queue_capacity");
+  failed |= require_text(capture, "GetModuleFileNameW");
+  failed |= require_text(capture, "windivert_source");
   failed |= require_text(agent, "\\\"shellcode_network\\\"");
   failed |= require_text(agent, "\\\"driver_open\\\"");
   failed |= require_text(agent, "\\\"runtime_detail\\\"");
@@ -65,10 +77,16 @@ int main(void) {
   failed |= require_text(pmfe_engine, "completed_clean");
   failed |= require_text(decision, "pmfe_followup_inconclusive");
   failed |= require_text(decision, "action = \"emit_context\"");
+  failed |= require_text(bundled_iss, "WinDivert64.sys");
+  failed |= require_text(bundled_iss, "EDR_WINDIVERT_RUNTIME_DIR");
+  failed |= require_text(bundle_script, "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2");
+  failed |= require_text(bundle_script, "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2");
   free(capture);
   free(agent);
   free(pmfe_preprocess);
   free(pmfe_engine);
   free(decision);
+  free(bundled_iss);
+  free(bundle_script);
   return failed ? 1 : 0;
 }

@@ -40,6 +40,32 @@ function Assert-YaraRuntimeDlls {
     Write-Host "Verified YARA runtime DLL(s): $($dlls.Name -join ', ')"
 }
 
+function Assert-WinDivertRuntime {
+    param([string] $AgentRoot)
+    $runtimeDir = Join-Path $AgentRoot "third_party\windivert\runtime\amd64"
+    $expected = @{
+        "WinDivert.dll" = "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2"
+        "WinDivert64.sys" = "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2"
+    }
+    foreach ($name in $expected.Keys) {
+        $path = Join-Path $runtimeDir $name
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "Missing pinned WinDivert runtime: $path"
+        }
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+        if ($actual -ne $expected[$name]) {
+            throw "WinDivert hash mismatch for $name. expected=$($expected[$name]) actual=$actual"
+        }
+    }
+    foreach ($path in @(
+        (Join-Path $AgentRoot "third_party\windivert\LICENSE"),
+        (Join-Path $AgentRoot "third_party\windivert\SOURCE.json")
+    )) {
+        if (-not (Test-Path -LiteralPath $path)) { throw "Missing WinDivert legal/provenance asset: $path" }
+    }
+    Write-Host "Verified pinned WinDivert 2.2.2 x64 runtime."
+}
+
 if (-not $BinDir) {
     $monorepoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
     $BinDir = Join-Path $monorepoRoot "edr-agent-win_2-2"
@@ -58,6 +84,7 @@ Assert-YaraRuntimeDlls -Dir $BinDir
 
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
+Assert-WinDivertRuntime -AgentRoot $agentRoot
 
 function Resolve-CollectorArch {
     param([string] $Raw)

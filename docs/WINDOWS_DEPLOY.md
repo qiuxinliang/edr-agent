@@ -24,7 +24,7 @@
 - **注意**：**完整 ETW 实时会话**、**WinDivert 驱动加载**、**对部分进程执行 forensic** 等能力，在真实环境中常需要 **管理员** 或 **附加特权**（如 **SeDebugPrivilege**、加载驱动权限）。**LOCAL SERVICE 能否满足全量采集**取决于：
   - 是否以 **用户态交互会话** 运行（通常服务无桌面）；
   - 组策略是否限制 **内核 ETW**、**防火墙/WFAS Provider**；
-  - WinDivert 是否已以 **管理员** 预先安装驱动。
+  - 首次开启 Shellcode 检测时，是否以 **管理员** 身份运行，以便随包 WinDivert 安装签名驱动。
 
 **研发结论（草案）**：生产环境常见两种模式——**(A)** 服务账户 + 收窄功能集（仅上报、无 WinDivert）；**(B)** **LocalSystem / 管理员服务** + 全功能。选型需 **安全与产品** 联合签字，本文不强制单一方案。
 
@@ -38,7 +38,7 @@
 |--------|------|
 | **管理员** | 首次安装 WinDivert **驱动**、调整部分 ETW Provider 时常需提升权限 |
 | **ETW** | `edr_collector_start` 失败时 stderr 含 ETW 相关错误；可选 Provider 跳过策略见 README「ETW 增强」 |
-| **WinDivert** | Shellcode 模块依赖 **已安装的 WinDivert.sys**；进程内会 **`log_windivert_service_hint`**（`windivert_capture.c`）探测服务是否存在 |
+| **WinDivert** | x64 安装包自带官方签名 `WinDivert.dll` / `WinDivert64.sys`；首次 `WinDivertOpen()` 由提升权限的 Agent 按需安装驱动，健康状态必须显示 `windivert_source=appdir`、`driver_open=true` |
 | **网络** | gRPC **`server.address`** 可达；证书与 mTLS 与平台一致 |
 | **磁盘** | 离线队列路径、取证输出 **`EDR_FORENSIC_OUT`** 可写 |
 
@@ -125,7 +125,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -
 | **Run at startup (scheduled task as SYSTEM, survives reboot)**（默认勾选） | 注册名称为 **`EdrAgent`** 的计划任务：触发器 **系统启动**、主体 **`NT AUTHORITY\SYSTEM`**、无单次执行时限、失败可重试；安装结束时 **立即 Start-ScheduledTask** 一次。 |
 | **Restrict install folder…**（默认不勾选） | 对 **`%ProgramFiles%\EDR Agent`** 执行 **`icacls`**：去掉继承；**`SYSTEM`** / **`Administrators`** 完全控制；**`Users`**（SID `S-1-5-32-545`）**读取+执行**，以便非管理员仍能运行 **`edr_agent.exe`** 并读取 **`agent.toml`**（不可写目录内文件，降低随意篡改）。若曾用旧脚本加固导致「拒绝访问」，请用**管理员**命令行执行卸载或手动 **`icacls "<安装目录>" /inheritance:e /T`** 恢复继承后重装。 |
 
-**卸载**：使用「程序和功能」中的 **EDR Agent** 项（即 Inno 生成的 **`unins000.exe`**）。卸载阶段会先执行 **`edr_windows_autorun.ps1 -Action Remove`**：停止并注销计划任务、结束 **`edr_agent`** 进程、在删除文件前运行 **`edr_agent.exe --etw-uninstall-cleanup`** 按名 **`ControlTrace` STOP** 本程序使用的 ETW 实时会话（避免异常退出后会话名 **`EDR_Agent_RT_001`** 仍占用）；再对安装目录 **`icacls /inheritance:e`** 恢复继承，最后删除文件。**说明**：未单独安装的 **WinDivert** 驱动等不由本卸载移除；若曾启用 shellcode 模块且自行安装过驱动，需按该组件文档单独卸载。
+**卸载**：使用「程序和功能」中的 **EDR Agent** 项（即 Inno 生成的 **`unins000.exe`**）。卸载阶段会先执行 **`edr_windows_autorun.ps1 -Action Remove`**：停止并注销计划任务、结束 **`edr_agent`** 进程、在删除文件前运行 **`edr_agent.exe --etw-uninstall-cleanup`** 按名 **`ControlTrace` STOP** 本程序使用的 ETW 实时会话（避免异常退出后会话名 **`EDR_Agent_RT_001`** 仍占用）；再对安装目录 **`icacls /inheritance:e`** 恢复继承，最后删除文件。随包的 WinDivert 文件也会删除；若没有其他进程使用该驱动，WinDivert 会在后续重启时自动卸载。安装器不会强制删除共享的 `WinDivert` 服务，避免影响同机其他软件。
 
 若需 **Windows 服务**形态，优先使用上文 §4；与计划任务二选一，避免同一主机启动两个 Agent 实例。
 

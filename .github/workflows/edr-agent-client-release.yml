@@ -326,6 +326,7 @@ jobs:
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
           ./scripts/stage_ort_dlls_build_release.ps1
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+          ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
 
           $stagedYara = @(Get-ChildItem -Path "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
           if (-not $stagedYara -or $stagedYara.Count -lt 1) {
@@ -394,6 +395,11 @@ jobs:
           }
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
+            $asset = Join-Path $outDir $p
+            if (-not (Test-Path -LiteralPath $asset)) { throw "missing staged WinDivert asset: $asset" }
+            $null = $items.Add($asset)
+          }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
             "scripts\edr_agent_preflight.ps1",
@@ -472,6 +478,9 @@ jobs:
               'windows_service_install\.ps1',
               'windows_isolate_host\.ps1',
               'FDSecurityInstallerWorker\.exe',
+              'WinDivert\.dll',
+              'WinDivert64\.sys',
+              'WinDivert-LICENSE\.txt',
               'agent_windows_production\.example\.toml',
               'sensor_interest_manifest\.json'
             )) {

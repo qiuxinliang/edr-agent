@@ -124,7 +124,7 @@ cmake --build build
 
 - 配置节 **`[shellcode_detector]`**（见 `agent.toml.example`），默认 **`enabled = false`**，不改变既有部署行为。
 - 已编译：**熵 / 启发式 / SMB2·SMB1·RDP·明文 HTTP 载荷区定位**（`proto_parse.c`；HTTPS/TLS 仍按原始字节启发式），单测 `test_shellcode`。
-- **WinDivert 闭环（初版）**：`windivert_capture.c` 从 **`%SystemRoot%\System32\WinDivert.dll`** **动态加载**（无需链接 `WinDivert.lib`），`SNIFF | RECV_ONLY` 捕获 TCP 端口集合；**`windivert_tcp_ports`** 为空时使用内置端口（SMB/RDP/WinRM/MSRPC/LDAP 等）；**非空**时为逗号分隔列表（如 `80,443,8443`），据此生成过滤器，且 **`monitor_smb` 等按类开关不再生效**（仅按列表匹配）。TCP 载荷经协议区段提取与启发式打分，**≥ `alert_threshold`** 时投递 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（ETW1，`prov=windivert`），预处理映射 **T1210**。
+- **WinDivert 闭环（x64）**：安装包随 **`FDSensor.exe`** 放置官方签名的 `WinDivert.dll` 与 `WinDivert64.sys`，`windivert_capture.c` 优先从该目录动态加载（兼容回退 `%SystemRoot%\System32`，无需链接 `WinDivert.lib`）。首次提升权限调用 `WinDivertOpen()` 时驱动按需安装。模块以 `SNIFF | RECV_ONLY` 捕获 TCP 端口集合；**`windivert_tcp_ports`** 为空时使用内置端口（SMB/RDP/WinRM/MSRPC/LDAP 等）；**非空**时为逗号分隔列表（如 `80,443,8443`），据此生成过滤器，且 **`monitor_smb` 等按类开关不再生效**（仅按列表匹配）。TCP 载荷经协议区段提取与启发式打分，**≥ `alert_threshold`** 时投递 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（ETW1，`prov=windivert`），预处理映射 **T1210**。
 - **已实现（Phase 2）**：优先使用 **libyara** 扫描已知漏洞规则（`yara_rules_dir` 指向规则目录，加载 `.yar/.yara`）；命中时以 `detector=yara` 和 `rule=<规则名>` 上报。若未安装 libyara 或目录未加载到规则，自动降级为内置匹配器（规则名保持一致：`EternalBlue_MS17_010` / `BlueKeep_CVE_2019_0708` / `PrintNightmare_CVE_2021_34527`）。默认规则文件见 `src/shellcode_detector/rules/known_exploits.yar`。
 - **P0（持续迭代）**：IPv6 五元组；**`windivert_tcp_ports`**；**单包或环形 PCAP**（`shellcode_ring_*.pcap`，EN10MB）；**SHA256 + 可选 preview_hex**；环形告警附 **`ring_*_ns` / `ring_trigger_slot`** 与 **`shellcode_json`** 行；**`heuristic_score_scale`** 调启发式灵敏度；**`yara_rules_reload_interval_s`** 热重载规则（libyara）；**`auto_isolate_threshold`** 仍为高优先级标记；**可选端上隔离**：`EDR_SHELLCODE_AUTO_ISOLATE=1` 或 **`auto_isolate_execute`** + 高危策略，与 **`isolate`** 同路径（每进程最多一次）。WinDivert 过滤器在**启动时**固定。**pcapng / 纯服务端编排隔离**等见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`**。
 
@@ -141,11 +141,11 @@ cmake --build build
 
 | 用途 | 路径 |
 |------|------|
-| 用户态 DLL（部署） | **`%SystemRoot%\System32\WinDivert.dll`**（例如 `C:\Windows\System32\WinDivert.dll`） |
-| 内核驱动（安装后） | 通常在 **`%SystemRoot%\System32\drivers\`** 下，名称形如 `WinDivert*.sys`（以实际安装为准） |
+| 用户态 DLL（部署） | **`<Agent 安装目录>\WinDivert.dll`**；仅兼容旧终端时回退 `%SystemRoot%\System32\WinDivert.dll` |
+| 内核驱动（安装包） | **`<Agent 安装目录>\WinDivert64.sys`**；官方 DLL 首次 `WinDivertOpen()` 时按需安装 |
 | 开发编译 | **`windivert.h` / `WinDivert.lib`** 仍来自官方 SDK 解压目录；CMake 可用 **`WINDIVERT_ROOT`** 指向该目录；**不要**指望 System32 里带有头文件与导入库 |
 
-运行期若从固定路径加载 DLL，可使用上述 System32 路径；需管理员权限与已正确安装的 WinDivert 服务/驱动。
+标准 x64 安装包已携带官方签名运行时与 LGPL/GPL 许可证；首次启用 Shellcode 检测的 Agent 必须具有管理员权限。ARM64 暂不提供该能力，因为官方 WinDivert 2.2.2 发布包没有 ARM64 驱动。
 
 ---
 

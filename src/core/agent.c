@@ -1625,7 +1625,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"shellcode_network\":{\"code_supported\":%s,\"build_supported\":%s,\"policy_enabled\":%s,"
-      "\"runtime_status\":\"%s\",\"provider\":\"windivert\",\"dll_loaded\":%s,"
+      "\"runtime_status\":\"%s\",\"provider\":\"windivert\",\"windivert_source\":\"%s\",\"dll_loaded\":%s,"
       "\"driver_open\":%s,\"capture_threads\":%u,\"scan_workers\":%u,"
       "\"scan_queue_capacity\":%u,\"win32_error\":%u,\"detail\":\"%s\"},"
       "\"pmfe\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
@@ -1660,6 +1660,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       shellcode_rt.code_supported ? "true" : "false", shellcode_rt.build_supported ? "true" : "false",
       shellcode_rt.policy_enabled ? "true" : "false",
       shellcode_rt.runtime_status[0] ? shellcode_rt.runtime_status : "unavailable",
+      shellcode_rt.windivert_source[0] ? shellcode_rt.windivert_source : "none",
       shellcode_rt.dll_loaded ? "true" : "false", shellcode_rt.driver_open ? "true" : "false",
       shellcode_rt.capture_threads, shellcode_rt.scan_workers, shellcode_rt.scan_queue_capacity,
       shellcode_rt.win32_error,
@@ -2286,12 +2287,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_shellcode_known_get_status(&shell_rules);
   edr_shellcode_detector_get_runtime(&shell_runtime);
   char shell_source[48], shell_version[128], shell_error[192], shell_rb[128], shell_last_rule[128], shell_last_src[48];
-  char shell_runtime_detail[192];
+  char shell_runtime_detail[192], shell_runtime_source[32];
   char audit_err[192], ebpf_err[192];
   json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
   json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
   json_escape_small(shell_runtime.detail, shell_runtime_detail, sizeof(shell_runtime_detail));
+  json_escape_small(shell_runtime.windivert_source, shell_runtime_source, sizeof(shell_runtime_source));
   runtime_policy_raw[0] = '\0';
   edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
   json_escape_small(runtime_policy_raw, runtime_policy_ver, sizeof(runtime_policy_ver));
@@ -2506,7 +2508,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"submitted\":%lu,\"completed\":%lu,\"dropped\":%lu,"
       "\"last_degrade_reason\":\"%s\"},"
       "\"shellcode\":{\"configured\":%s,\"enabled\":%s,\"runtime_status\":\"%s\","
-      "\"provider\":\"windivert\",\"dll_loaded\":%s,\"driver_open\":%s,"
+      "\"provider\":\"windivert\",\"windivert_source\":\"%s\",\"dll_loaded\":%s,\"driver_open\":%s,"
       "\"capture_threads\":%u,\"scan_workers\":%u,\"scan_queue_depth\":%u,"
       "\"scan_queue_capacity\":%u,\"win32_error\":%u,\"packets_received\":%llu,"
       "\"receive_errors\":%llu,\"scan_queue_dropped\":%llu,\"scan_jobs_processed\":%llu,"
@@ -2769,6 +2771,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.shellcode_detector.enabled ? "true" : "false",
       edr_shellcode_detector_active() ? "true" : "false",
       shell_runtime.runtime_status[0] ? shell_runtime.runtime_status : "unavailable",
+      shell_runtime_source[0] ? shell_runtime_source : "none",
       shell_runtime.dll_loaded ? "true" : "false", shell_runtime.driver_open ? "true" : "false",
       shell_runtime.capture_threads, shell_runtime.scan_workers, shell_runtime.scan_queue_depth,
       shell_runtime.scan_queue_capacity, shell_runtime.win32_error,

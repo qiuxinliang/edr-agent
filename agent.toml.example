@@ -283,8 +283,8 @@ max_log_files        = 10
 [command]
 forensic_yara_rules_dir = "rules/forensic"
 
-# §17 协议层 Shellcode 检测（Windows；需管理员 + WinDivert 驱动）。默认关闭。
-# 部署约定：WinDivert.dll 位于 %SystemRoot%\System32（驱动一般在 System32\drivers）；详见 README §17。
+# §17 协议层 Shellcode 检测（Windows x64；需管理员）。默认关闭。
+# 官方签名 WinDivert.dll/WinDivert64.sys 随安装包置于 Agent 目录，首次启用时由 WinDivert 按需安装驱动；旧版 System32 部署仅作兼容回退。
 [shellcode_detector]
 enabled                  = false
 windivert_priority       = -1000

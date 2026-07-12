@@ -21,6 +21,9 @@
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
+#define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
+#define EDR_WINDIVERT_LICENSE "..\..\third_party\windivert\LICENSE"
+#define EDR_WINDIVERT_SOURCE "..\..\third_party\windivert\SOURCE.json"
 
 [Setup]
 AppId={{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}
@@ -30,8 +33,8 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64
+ArchitecturesInstallIn64BitMode=x64
 OutputDir=Output
 OutputBaseFilename=FDSecuritySetup
 Compression=lzma2
@@ -50,7 +53,11 @@ Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin 
 [Files]
 Source: "{#EDR_AGENT_EXE}"; DestDir: "{app}"; Flags: ignoreversion
 ; 与 FDSensor.exe 同目录：ONNX + vcpkg 运行时 DLL（发布 CI 在 ISCC 前 stage 到 build\Release\）
-Source: "..\..\build\Release\*.dll"; DestDir: "{app}"; Excludes: "onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\build\Release\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_WINDIVERT_LICENSE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
+Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-SOURCE.json"; Flags: ignoreversion
 ; models\：与 config.c 中「exe 同目录\models」及 agent.toml.example [ave] 约定一致；占位文件便于空目录随包安装
 Source: "..\..\models\*"; DestDir: "{app}\models"; Excludes: "behavior.onnx,static_fp32.onnx,*.training.*,*.tmp"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; 第一版动态前置规则包（由 edr-backend/platform/config/generate_agent_preprocess_rules.py 生成）

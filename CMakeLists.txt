@@ -419,7 +419,7 @@ else()
   list(APPEND EDR_AGENT_SOURCES src/collector/collector_stub.c)
 endif()
 
-# §17 Shellcode：头文件/WinDivert.lib 来自官方 SDK，通过 WINDIVERT_ROOT 传入；运行部署约定见 README（DLL 在 %SystemRoot%\System32）。
+# §17 Shellcode：运行时 WinDivert DLL/驱动由 x64 安装包随 Agent 目录交付；开发构建可用官方 SDK。
 set(EDR_SHELLCODE_SRCS
   src/shellcode_detector/shellcode_entropy.c
   src/shellcode_detector/shellcode_heuristic.c

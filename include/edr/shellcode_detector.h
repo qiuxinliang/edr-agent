@@ -42,6 +42,7 @@ typedef struct {
   uint64_t reassembly_evicted;
   uint64_t reassembly_memory_drops;
   char runtime_status[16];
+  char windivert_source[16];
   char detail[128];
 } EdrShellcodeDetectorRuntime;
 

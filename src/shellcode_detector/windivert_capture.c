@@ -1,5 +1,5 @@
 /**
- * §17 WinDivert：从 %SystemRoot%\System32\WinDivert.dll 动态加载，SNIFF+RECV_ONLY，
+ * §17 WinDivert：优先从 Agent 安装目录加载，兼容回退 %SystemRoot%\System32，SNIFF+RECV_ONLY，
  * TCP payload → proto_parse + 启发式，达阈值则写入事件总线（ETW1 载荷）。
  */
 #if !defined(_WIN32)
@@ -47,7 +47,7 @@
 /** 环形槽：ts_ns(8) + stored_len(4) + is_v6(4) + payload[max] */
 #define EDR_RING_SLOT_HDR 16u
 
-static const char kWdDllPath[] = "%SystemRoot%\\System32\\WinDivert.dll";
+static const wchar_t kWdDllName[] = L"WinDivert.dll";
 
 static const char kWdFilter[] =
     "tcp and ("
@@ -1216,20 +1216,63 @@ static DWORD WINAPI wd_thread_main(void *arg) {
   return 0;
 }
 
-static int load_windivert(void) {
-  wchar_t wpath[512];
-  if (ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\WinDivert.dll", wpath,
-                                (DWORD)(sizeof(wpath) / sizeof(wpath[0]))) == 0u) {
-    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_path_expand_failed", GetLastError());
+static int windivert_appdir_path(wchar_t *out, DWORD out_cap) {
+  if (!out || out_cap == 0u) {
     return -1;
   }
-  s_wd_dll = LoadLibraryW(wpath);
-  if (!s_wd_dll) {
-    DWORD err = GetLastError();
-    fprintf(stderr, "[shellcode_detector] LoadLibrary WinDivert.dll failed err=%lu (path=%ls)\n", err,
-            wpath);
-    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_dll_load_failed", err);
+  DWORD n = GetModuleFileNameW(NULL, out, out_cap);
+  if (n == 0u || n >= out_cap) {
     return -1;
+  }
+  wchar_t *slash = wcsrchr(out, L'\\');
+  if (!slash) {
+    return -1;
+  }
+  size_t dir_len = (size_t)(slash - out) + 1u;
+  size_t name_len = wcslen(kWdDllName);
+  if (dir_len + name_len + 1u > out_cap) {
+    return -1;
+  }
+  memcpy(slash + 1, kWdDllName, (name_len + 1u) * sizeof(wchar_t));
+  return 0;
+}
+
+static int load_windivert(void) {
+  wchar_t wpath[512];
+  DWORD err = ERROR_SUCCESS;
+  int appdir_present = 0;
+  if (windivert_appdir_path(wpath, (DWORD)(sizeof(wpath) / sizeof(wpath[0]))) == 0) {
+    appdir_present = GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES;
+    if (appdir_present) {
+      s_wd_dll = LoadLibraryW(wpath);
+      if (!s_wd_dll) {
+        err = GetLastError();
+        fprintf(stderr, "[shellcode_detector] LoadLibrary bundled WinDivert failed err=%lu (path=%ls)\n", err,
+                wpath);
+        runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_appdir_load_failed", err);
+        return -1;
+      }
+      snprintf(s_runtime.windivert_source, sizeof(s_runtime.windivert_source), "%s", "appdir");
+    }
+  }
+  if (!s_wd_dll) {
+    UINT n = GetSystemDirectoryW(wpath, (UINT)(sizeof(wpath) / sizeof(wpath[0])));
+    if (n == 0u || n >= sizeof(wpath) / sizeof(wpath[0]) ||
+        (size_t)n + 1u + wcslen(kWdDllName) + 1u > sizeof(wpath) / sizeof(wpath[0])) {
+      runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_system_path_failed", GetLastError());
+      return -1;
+    }
+    wpath[n++] = L'\\';
+    memcpy(wpath + n, kWdDllName, (wcslen(kWdDllName) + 1u) * sizeof(wchar_t));
+    s_wd_dll = LoadLibraryW(wpath);
+    if (!s_wd_dll) {
+      err = GetLastError();
+      fprintf(stderr, "[shellcode_detector] LoadLibrary WinDivert failed err=%lu (appdir_present=%d path=%ls)\n",
+              err, appdir_present, wpath);
+      runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_dll_load_failed", err);
+      return -1;
+    }
+    snprintf(s_runtime.windivert_source, sizeof(s_runtime.windivert_source), "%s", "system32");
   }
   s_runtime.dll_loaded = 1;
 #define LOAD(sym, dst, T)                                                                         \
@@ -1249,7 +1292,6 @@ static int load_windivert(void) {
   LOAD(WinDivertSetParam, s_setparam, PFN_WinDivertSetParam);
   LOAD(WinDivertHelperParsePacket, s_parse, PFN_WinDivertHelperParsePacket);
 #undef LOAD
-  (void)kWdDllPath;
   return 0;
 }
 

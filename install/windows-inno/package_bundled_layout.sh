@@ -33,6 +33,27 @@ require_yara_runtime_dlls_in_dir() {
   fi
 }
 
+require_windivert_runtime() {
+  local runtime_dir="$EDR_AGENT_DIR/third_party/windivert/runtime/amd64"
+  local dll="$runtime_dir/WinDivert.dll"
+  local sys="$runtime_dir/WinDivert64.sys"
+  local license="$EDR_AGENT_DIR/third_party/windivert/LICENSE"
+  local source="$EDR_AGENT_DIR/third_party/windivert/SOURCE.json"
+  [[ -f "$dll" && -f "$sys" && -f "$license" && -f "$source" ]] || {
+    echo "Error: pinned WinDivert runtime/legal assets are missing" >&2
+    exit 1
+  }
+  local dll_hash sys_hash
+  dll_hash="$(shasum -a 256 "$dll" | awk '{print $1}')"
+  sys_hash="$(shasum -a 256 "$sys" | awk '{print $1}')"
+  [[ "$dll_hash" == "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2" ]] || {
+    echo "Error: WinDivert.dll SHA-256 mismatch" >&2; exit 1;
+  }
+  [[ "$sys_hash" == "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2" ]] || {
+    echo "Error: WinDivert64.sys SHA-256 mismatch" >&2; exit 1;
+  }
+}
+
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/models" "$OUT_DIR/data"
 
@@ -80,6 +101,12 @@ if [[ "$DLL_COUNT" -lt 1 ]]; then
   echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start if FDSensor.exe is dynamically linked." >&2
 fi
 require_yara_runtime_dlls_in_dir "$OUT_DIR" "bundled payload output"
+require_windivert_runtime
+cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert.dll" "$OUT_DIR/WinDivert.dll"
+cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert64.sys" "$OUT_DIR/WinDivert64.sys"
+mkdir -p "$OUT_DIR/licenses"
+cp -a "$EDR_AGENT_DIR/third_party/windivert/LICENSE" "$OUT_DIR/licenses/WinDivert-LICENSE.txt"
+cp -a "$EDR_AGENT_DIR/third_party/windivert/SOURCE.json" "$OUT_DIR/licenses/WinDivert-SOURCE.json"
 
 # models: whitelist production-ready compact model artifacts only.
 if [[ -d "$EDR_AGENT_DIR/models" ]]; then
@@ -274,6 +301,12 @@ if ! grep -E '^\./rules/forensic/.+\.yar(a)?$' "$OUT_DIR/MANIFEST.txt" >/dev/nul
   echo "Error: MANIFEST.txt does not include forensic YARA rules" >&2
   exit 1
 fi
+for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.txt" "licenses/WinDivert-SOURCE.json"; do
+  if ! grep -Fqx "./$required" "$OUT_DIR/MANIFEST.txt"; then
+    echo "Error: MANIFEST.txt does not include $required" >&2
+    exit 1
+  fi
+done
 
 mkdir -p "$SCRIPT_DIR/Output"
 ( cd "$SCRIPT_DIR/Output" && rm -f "${OUT_NAME}.zip" && zip -r -q "${OUT_NAME}.zip" "$OUT_NAME" )
@@ -289,6 +322,12 @@ if ! unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)rules/forensic/.+\.yar(a)?$' >/dev/nu
   echo "Error: forensic YARA rules missing from $ZIP_PATH" >&2
   exit 1
 fi
+for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.txt" "licenses/WinDivert-SOURCE.json"; do
+  if ! unzip -Z1 "$ZIP_PATH" | grep -Fq "/$required"; then
+    echo "Error: $required missing from $ZIP_PATH" >&2
+    exit 1
+  fi
+done
 echo "OK: $ZIP_PATH"
 echo "Read BUNDLE_README inside the zip for full terminal feature coverage and out-of-band items."
 echo "Optional: EDR_BUNDLE_STRICT=1 to require a static .onnx before zipping."

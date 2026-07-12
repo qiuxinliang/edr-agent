@@ -138,6 +138,7 @@ enabled              = false
 tick_interval_s      = 300
 
 [shellcode_detector]
+# WinDivert x64 runtime is bundled beside FDSensor.exe; enabling it requires an elevated Agent process on first use.
 enabled              = false
 flow_scan_first_bytes = 65536
 reassembly_max_flows = 512
