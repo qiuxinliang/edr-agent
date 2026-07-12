@@ -158,6 +158,47 @@ static int edr_prop_first_utf8(PEVENT_RECORD rec, const PCWSTR *names, size_t n,
   return 0;
 }
 
+static int edr_legacy_registry_key_utf8(PEVENT_RECORD rec, char *out, size_t out_cap) {
+  size_t pointer_bytes;
+  size_t key_offset;
+  size_t wchar_count;
+  const WCHAR *key_name;
+  int n;
+  if (!rec || !out || out_cap < 2u ||
+      memcmp(&rec->EventHeader.ProviderId, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) != 0 ||
+      !rec->UserData) {
+    return 0;
+  }
+  out[0] = '\0';
+  pointer_bytes = (rec->EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) ? 4u : 8u;
+  /* Registry_TypeGroup1: InitialTime(8), Status(4), Index(4), KeyHandle(pointer), KeyName(WCHAR[]). */
+  key_offset = 16u + pointer_bytes;
+  if ((size_t)rec->UserDataLength < key_offset + sizeof(WCHAR)) {
+    return 0;
+  }
+  key_name = (const WCHAR *)((const BYTE *)rec->UserData + key_offset);
+  wchar_count = ((size_t)rec->UserDataLength - key_offset) / sizeof(WCHAR);
+  size_t len = 0u;
+  while (len < wchar_count && key_name[len] != L'\0') {
+    len++;
+  }
+  if (len == 0u || len == wchar_count || len > 32767u) {
+    return 0;
+  }
+  n = WideCharToMultiByte(CP_UTF8, 0, key_name, (int)len, out,
+                          (int)out_cap - 1, NULL, NULL);
+  if (n <= 0) {
+    out[0] = '\0';
+    return 0;
+  }
+  out[n] = '\0';
+  if (!utf8_looks_text(out)) {
+    out[0] = '\0';
+    return 0;
+  }
+  return 1;
+}
+
 static uint32_t edr_parse_u32_ascii(const char *s) {
   uint32_t v = 0;
   if (!s) {
@@ -263,9 +304,13 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
     (void)edr_prop_first_utf8(rec, file_try, sizeof(file_try) / sizeof(file_try[0]),
                               out_event->path, sizeof(out_event->path));
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
-             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0) {
-    (void)edr_prop_first_utf8(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]),
-                              out_event->registry_path, sizeof(out_event->registry_path));
+             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
+             memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) {
+    if (!edr_prop_first_utf8(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]),
+                             out_event->registry_path, sizeof(out_event->registry_path))) {
+      (void)edr_legacy_registry_key_utf8(rec, out_event->registry_path,
+                                         sizeof(out_event->registry_path));
+    }
     if (!out_event->path[0]) {
       snprintf(out_event->path, sizeof(out_event->path), "%s", out_event->registry_path);
     }
@@ -455,9 +500,14 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     edr_try_append_all(rec, net_try, sizeof(net_try) / sizeof(net_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
-             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0) {
+             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
+             memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
+    if (memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0 &&
+        edr_legacy_registry_key_utf8(rec, line, sizeof(line))) {
+      append_utf8((char *)out, out_cap, &off, "regkey=%s\n", line);
+    }
   } else if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, dns_try, sizeof(dns_try) / sizeof(dns_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);

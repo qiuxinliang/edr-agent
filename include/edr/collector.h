@@ -61,6 +61,10 @@ typedef struct {
     uint64_t auditd_events;
     uint64_t ebpf_events;
     uint32_t collector_thread_id;
+    uint64_t registry_provider_events;
+    uint64_t registry_provider_unmapped;
+    uint64_t registry_payload_missing;
+    uint64_t registry_events_admitted;
     uint64_t collector_dropped;
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;

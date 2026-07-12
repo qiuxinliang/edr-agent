@@ -2457,6 +2457,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
       "\"collector_thread_id\":%u,"
+      "\"registry_provider\":{\"events\":%llu,\"unmapped\":%llu,"
+      "\"payload_missing\":%llu,\"admitted\":%llu},"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
       "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
@@ -2670,6 +2672,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.auditd_events,
       ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
       (unsigned long long)ch.ebpf_events, ch.collector_thread_id,
+      (unsigned long long)ch.registry_provider_events,
+      (unsigned long long)ch.registry_provider_unmapped,
+      (unsigned long long)ch.registry_payload_missing,
+      (unsigned long long)ch.registry_events_admitted,
       (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
       ch.agent_self_fuse_active ? "true" : "false",

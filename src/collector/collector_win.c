@@ -43,11 +43,11 @@ static WCHAR g_registry_session_name[] = L"EDR_Agent_KReg_001";
 static EdrEventBus *s_bus;
 static DWORD s_agent_pid;
 static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
-static TRACEHANDLE s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
 static DWORD s_consumer_thread_id;
-static HANDLE s_registry_consumer_thread;
-static DWORD s_registry_consumer_thread_id;
+static HANDLE s_registry_watch_thread;
+static HANDLE s_registry_watch_stop_event;
+static DWORD s_registry_watch_thread_id;
 static EVT_HANDLE s_security_sub;
 static volatile LONG s_started;
 static EdrCollectorHealth s_health;
@@ -166,21 +166,26 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
     (void)ev_id;
     return 0;
   }
-  if (memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0) {
+  if (memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) {
+    s_health.registry_provider_events++;
     *out_tag = "kreg";
-    /* Legacy Registry MOF events expose the operation in Opcode. */
-    if (op == 10u) {
+    /* System/legacy registry providers normally expose the operation in Opcode;
+     * some builds preserve it in EventDescriptor.Id instead. */
+    unsigned operation = op != 0u ? (unsigned)op : (unsigned)ev_id;
+    if (operation == 1u || operation == 10u) {
       *out_type = EDR_EVENT_REG_CREATE_KEY;
       return 1;
     }
-    if (op == 12u || op == 15u) {
+    if (operation == 3u || operation == 7u || operation == 12u || operation == 15u) {
       *out_type = EDR_EVENT_REG_DELETE_KEY;
       return 1;
     }
-    if (op == 14u) {
+    if (operation == 6u || operation == 14u) {
       *out_type = EDR_EVENT_REG_SET_VALUE;
       return 1;
     }
+    s_health.registry_provider_unmapped++;
     return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
@@ -743,6 +748,7 @@ static int edr_agent_self_fuse_should_drop_provider(PEVENT_RECORD event_record) 
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
@@ -961,6 +967,164 @@ static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag)
   }
   if (!edr_event_bus_try_push(s_bus, slot)) {
     s_health.queue_dropped++;
+    return 0;
+  }
+  return 1;
+}
+
+#define EDR_REGISTRY_WATCH_MAX 32u
+
+typedef struct {
+  HKEY key;
+  HANDLE event;
+  char path[1024];
+} EdrRegistryWatch;
+
+static int edr_registry_watch_add(EdrRegistryWatch *watches, DWORD *count,
+                                  HKEY root, const char *subkey,
+                                  const char *display_path, REGSAM view) {
+  HKEY key = NULL;
+  HANDLE event = NULL;
+  if (!watches || !count || *count >= EDR_REGISTRY_WATCH_MAX ||
+      !subkey || !display_path) {
+    return 0;
+  }
+  if (RegOpenKeyExA(root, subkey, 0, KEY_NOTIFY | view, &key) != ERROR_SUCCESS) {
+    return 0;
+  }
+  event = CreateEventW(NULL, FALSE, FALSE, NULL);
+  if (!event || RegNotifyChangeKeyValue(key, FALSE,
+                                        REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                                        event, TRUE) != ERROR_SUCCESS) {
+    if (event) CloseHandle(event);
+    RegCloseKey(key);
+    return 0;
+  }
+  watches[*count].key = key;
+  watches[*count].event = event;
+  snprintf(watches[*count].path, sizeof(watches[*count].path), "%s", display_path);
+  (*count)++;
+  return 1;
+}
+
+static void edr_registry_watch_emit(const char *path) {
+  EdrSensorInterestEvent interest;
+  EdrEventSlot slot;
+  int n;
+  if (!path || !path[0] || !s_bus) {
+    return;
+  }
+  s_health.registry_provider_events++;
+  memset(&interest, 0, sizeof(interest));
+  interest.type = EDR_EVENT_REG_SET_VALUE;
+  snprintf(interest.provider, sizeof(interest.provider), "%s", "regnotify");
+  snprintf(interest.path, sizeof(interest.path), "%s", path);
+  snprintf(interest.registry_path, sizeof(interest.registry_path), "%s", path);
+  if (!edr_sensor_interest_should_admit(&interest)) {
+    s_health.collector_dropped++;
+    return;
+  }
+
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_unix_ns();
+  slot.type = EDR_EVENT_REG_SET_VALUE;
+  slot.priority = 0u;
+  n = snprintf((char *)slot.data, sizeof(slot.data),
+               "ETW1\nprov=regnotify\npid=0\nregkey=%s\nregop=change_notify\n", path);
+  if (n <= 0 || (size_t)n >= sizeof(slot.data)) {
+    s_health.registry_payload_missing++;
+    return;
+  }
+  slot.size = (uint32_t)n + 1u;
+  if (edr_push_slot_after_policy(&slot, "regnotify")) {
+    s_health.registry_events_admitted++;
+  }
+}
+
+static DWORD WINAPI edr_registry_watch_thread_main(void *arg) {
+  EdrRegistryWatch watches[EDR_REGISTRY_WATCH_MAX];
+  HANDLE wait_handles[EDR_REGISTRY_WATCH_MAX + 1u];
+  DWORD count = 0u;
+  DWORD wait_count;
+  (void)arg;
+  memset(watches, 0, sizeof(watches));
+  memset(wait_handles, 0, sizeof(wait_handles));
+
+  (void)edr_registry_watch_add(watches, &count, HKEY_LOCAL_MACHINE,
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", KEY_WOW64_64KEY);
+  (void)edr_registry_watch_add(watches, &count, HKEY_LOCAL_MACHINE,
+      "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", KEY_WOW64_64KEY);
+  (void)edr_registry_watch_add(watches, &count, HKEY_LOCAL_MACHINE,
+      "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", KEY_WOW64_64KEY);
+  (void)edr_registry_watch_add(watches, &count, HKEY_LOCAL_MACHINE,
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run",
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run", KEY_WOW64_64KEY);
+
+  HKEY users = NULL;
+  if (RegOpenKeyExA(HKEY_USERS, "", 0, KEY_ENUMERATE_SUB_KEYS, &users) == ERROR_SUCCESS) {
+    for (DWORD i = 0u; count + 2u < EDR_REGISTRY_WATCH_MAX; ++i) {
+      char sid[256];
+      DWORD sid_len = (DWORD)sizeof(sid);
+      if (RegEnumKeyExA(users, i, sid, &sid_len, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+        break;
+      }
+      if (strncmp(sid, "S-1-5-", 6u) != 0 || strstr(sid, "_Classes") != NULL) {
+        continue;
+      }
+      char subkey[768];
+      char display[1024];
+      snprintf(subkey, sizeof(subkey), "%s\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", sid);
+      snprintf(display, sizeof(display), "HKU\\%s\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", sid);
+      (void)edr_registry_watch_add(watches, &count, HKEY_USERS, subkey, display, 0);
+      snprintf(subkey, sizeof(subkey), "%s\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", sid);
+      snprintf(display, sizeof(display), "HKU\\%s\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", sid);
+      (void)edr_registry_watch_add(watches, &count, HKEY_USERS, subkey, display, 0);
+    }
+    RegCloseKey(users);
+  }
+
+  wait_handles[0] = s_registry_watch_stop_event;
+  for (DWORD i = 0u; i < count; ++i) {
+    wait_handles[i + 1u] = watches[i].event;
+  }
+  wait_count = count + 1u;
+  while (s_registry_watch_stop_event && wait_count > 1u) {
+    DWORD wr = WaitForMultipleObjects(wait_count, wait_handles, FALSE, INFINITE);
+    if (wr == WAIT_OBJECT_0) {
+      break;
+    }
+    if (wr >= WAIT_OBJECT_0 + 1u && wr < WAIT_OBJECT_0 + wait_count) {
+      DWORD idx = wr - WAIT_OBJECT_0 - 1u;
+      edr_registry_watch_emit(watches[idx].path);
+      if (RegNotifyChangeKeyValue(watches[idx].key, FALSE,
+                                  REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                                  watches[idx].event, TRUE) != ERROR_SUCCESS) {
+        break;
+      }
+      continue;
+    }
+    break;
+  }
+  for (DWORD i = 0u; i < count; ++i) {
+    if (watches[i].event) CloseHandle(watches[i].event);
+    if (watches[i].key) RegCloseKey(watches[i].key);
+  }
+  return 0u;
+}
+
+static int edr_start_registry_watch(void) {
+  s_registry_watch_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!s_registry_watch_stop_event) {
+    return 0;
+  }
+  s_registry_watch_thread = CreateThread(NULL, 0, edr_registry_watch_thread_main,
+                                          NULL, 0, &s_registry_watch_thread_id);
+  if (!s_registry_watch_thread) {
+    CloseHandle(s_registry_watch_stop_event);
+    s_registry_watch_stop_event = NULL;
     return 0;
   }
   return 1;
@@ -1365,6 +1529,10 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   {
     EdrSensorInterestEvent interest_event;
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
+      if ((ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE ||
+           ty == EDR_EVENT_REG_DELETE_KEY) && !interest_event.registry_path[0]) {
+        s_health.registry_payload_missing++;
+      }
       if (edr_agent_self_suppress_interest(&interest_event)) {
         edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_INTEREST);
         return;
@@ -1420,6 +1588,9 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
 
   if (!edr_event_bus_try_push(s_bus, &slot)) {
     s_health.queue_dropped++;
+  } else if (ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE ||
+             ty == EDR_EVENT_REG_DELETE_KEY) {
+    s_health.registry_events_admitted++;
   }
 }
 
@@ -1441,26 +1612,6 @@ static DWORD WINAPI edr_etw_consumer_thread(void *arg) {
 
   CloseTrace(th);
   return 0;
-}
-
-static DWORD WINAPI edr_registry_consumer_thread(void *arg) {
-  (void)arg;
-  EVENT_TRACE_LOGFILEW logfile;
-  TRACEHANDLE th;
-  memset(&logfile, 0, sizeof(logfile));
-  logfile.LoggerName = g_registry_session_name;
-  logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
-                             PROCESS_TRACE_MODE_EVENT_RECORD;
-  logfile.EventRecordCallback = edr_event_record_callback;
-  th = OpenTraceW(&logfile);
-  if (th == INVALID_PROCESSTRACE_HANDLE) {
-    fprintf(stderr, "[collector_win] OpenTraceW failed session=EDR_Agent_KReg_001 err=%lu\n",
-            (unsigned long)GetLastError());
-    return 1u;
-  }
-  (void)ProcessTrace(&th, 1, NULL, NULL);
-  CloseTrace(th);
-  return 0u;
 }
 
 static void edr_stop_named_trace_session(const WCHAR *session_name) {
@@ -1491,40 +1642,6 @@ static void edr_stop_named_trace_session(const WCHAR *session_name) {
 void edr_collector_stop_orphan_etw_session(void) {
   edr_stop_named_trace_session(g_session_name);
   edr_stop_named_trace_session(g_registry_session_name);
-}
-
-static ULONG edr_start_registry_kernel_session(void) {
-  ULONG name_bytes = (ULONG)((wcslen(g_registry_session_name) + 1u) * sizeof(WCHAR));
-  ULONG buffer_size = (ULONG)sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
-  EVENT_TRACE_PROPERTIES *prop =
-      (EVENT_TRACE_PROPERTIES *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, buffer_size);
-  ULONG status;
-  if (!prop) {
-    return ERROR_OUTOFMEMORY;
-  }
-  prop->Wnode.BufferSize = buffer_size;
-  prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-  prop->Wnode.ClientContext = 1u;
-  prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-  memcpy((BYTE *)prop + prop->LoggerNameOffset, g_registry_session_name, name_bytes);
-  prop->BufferSize = 32u;
-  prop->MinimumBuffers = 8u;
-  prop->MaximumBuffers = 32u;
-  prop->FlushTimer = 1u;
-  prop->EnableFlags = EVENT_TRACE_FLAG_REGISTRY;
-  prop->LogFileMode = EVENT_TRACE_REAL_TIME_MODE |
-                      EVENT_TRACE_SYSTEM_LOGGER_MODE |
-                      EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
-  status = StartTraceW(&s_registry_session_handle, g_registry_session_name, prop);
-  if (status == ERROR_ALREADY_EXISTS) {
-    edr_stop_named_trace_session(g_registry_session_name);
-    status = StartTraceW(&s_registry_session_handle, g_registry_session_name, prop);
-  }
-  HeapFree(GetProcessHeap(), 0, prop);
-  if (status != ERROR_SUCCESS) {
-    s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
-  }
-  return status;
 }
 
 static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
@@ -1681,24 +1798,11 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     return EDR_ERR_ETW_PROVIDER_ENABLE;
   }
 
-  status = edr_start_registry_kernel_session();
-  if (status != ERROR_SUCCESS) {
-    fprintf(stderr,
-            "[collector_win] kernel registry session unavailable status=%lu; "
-            "manifest provider remains enabled\n",
-            (unsigned long)status);
-  } else {
-    s_registry_consumer_thread = CreateThread(NULL, 0, edr_registry_consumer_thread,
-                                               NULL, 0, &s_registry_consumer_thread_id);
-    if (!s_registry_consumer_thread) {
-      EVENT_TRACE_PROPERTIES stop = {0};
-      stop.Wnode.BufferSize = sizeof(stop);
-      ControlTraceW(s_registry_session_handle, g_registry_session_name, &stop,
-                    EVENT_TRACE_CONTROL_STOP);
-      s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
-      fprintf(stderr, "[collector_win] kernel registry consumer thread create failed err=%lu\n",
-              (unsigned long)GetLastError());
-    }
+  /* Remove a stale full-kernel registry session from older Agent builds. */
+  edr_stop_named_trace_session(g_registry_session_name);
+  if (!edr_start_registry_watch()) {
+    fprintf(stderr, "[collector_win] high-value registry watch unavailable err=%lu\n",
+            (unsigned long)GetLastError());
   }
 
   edr_start_security_eventlog_subscription();
@@ -1710,15 +1814,17 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     stop.Wnode.BufferSize = sizeof(stop);
     ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
-    if (s_registry_session_handle != INVALID_PROCESSTRACE_HANDLE) {
-      ControlTraceW(s_registry_session_handle, g_registry_session_name, &stop,
-                    EVENT_TRACE_CONTROL_STOP);
-      s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
+    if (s_registry_watch_stop_event) {
+      SetEvent(s_registry_watch_stop_event);
     }
-    if (s_registry_consumer_thread) {
-      WaitForSingleObject(s_registry_consumer_thread, 30000);
-      CloseHandle(s_registry_consumer_thread);
-      s_registry_consumer_thread = NULL;
+    if (s_registry_watch_thread) {
+      WaitForSingleObject(s_registry_watch_thread, 30000);
+      CloseHandle(s_registry_watch_thread);
+      s_registry_watch_thread = NULL;
+    }
+    if (s_registry_watch_stop_event) {
+      CloseHandle(s_registry_watch_stop_event);
+      s_registry_watch_stop_event = NULL;
     }
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_INTERNAL;
@@ -1739,12 +1845,8 @@ void edr_collector_stop(void) {
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
   }
 
-  if (s_registry_session_handle != INVALID_PROCESSTRACE_HANDLE) {
-    EVENT_TRACE_PROPERTIES stop = {0};
-    stop.Wnode.BufferSize = sizeof(stop);
-    ControlTraceW(s_registry_session_handle, g_registry_session_name, &stop,
-                  EVENT_TRACE_CONTROL_STOP);
-    s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
+  if (s_registry_watch_stop_event) {
+    SetEvent(s_registry_watch_stop_event);
   }
 
   if (s_security_sub) {
@@ -1758,15 +1860,19 @@ void edr_collector_stop(void) {
     s_consumer_thread = NULL;
   }
 
-  if (s_registry_consumer_thread) {
-    WaitForSingleObject(s_registry_consumer_thread, 30000);
-    CloseHandle(s_registry_consumer_thread);
-    s_registry_consumer_thread = NULL;
+  if (s_registry_watch_thread) {
+    WaitForSingleObject(s_registry_watch_thread, 30000);
+    CloseHandle(s_registry_watch_thread);
+    s_registry_watch_thread = NULL;
+  }
+  if (s_registry_watch_stop_event) {
+    CloseHandle(s_registry_watch_stop_event);
+    s_registry_watch_stop_event = NULL;
   }
 
   s_agent_self_fuse_provider_degraded = 0;
   s_consumer_thread_id = 0u;
-  s_registry_consumer_thread_id = 0u;
+  s_registry_watch_thread_id = 0u;
   s_bus = NULL;
   s_collector_cfg = NULL;
 }
