@@ -429,7 +429,7 @@ jobs:
 
           $innoOut = "install\windows-inno\Output"
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
-          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION
+          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch amd64
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
           $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
           if (-not (Test-Path -LiteralPath $setupSrc)) {
@@ -438,10 +438,13 @@ jobs:
           if (-not (Test-Path -LiteralPath $setupSrc)) { throw "missing bundled setup exe: $setupSrc" }
           $setupDest = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup.exe"
           Copy-Item -LiteralPath $setupSrc -Destination $setupDest -Force
+          $setupArchSrc = $setupSrc + ".arch"
+          if (-not (Test-Path -LiteralPath $setupArchSrc)) { throw "missing setup architecture metadata: $setupArchSrc" }
+          Copy-Item -LiteralPath $setupArchSrc -Destination ($setupDest + ".arch") -Force
           $null = $items.Add($setupDest)
 
           $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -OutputZip $setupUiZip
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Write-Host "Setup UI package is uploaded as a separate artifact and is not nested into the runtime zip."
