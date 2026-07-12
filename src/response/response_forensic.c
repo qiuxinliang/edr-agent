@@ -451,11 +451,18 @@ int edr_response_yara_scan_memory(const char *cmd_id, const uint8_t *buf, size_t
 
 /* ── Forensic Actions ── */
 
-/* 取证外移门控:默认关闭(保持 in-process 现状,不破坏)。
- * EDR_FORENSIC_COLLECTOR=1 启用外部 collector;EDR_FORENSIC_COLLECTOR_STRICT=1 失败不回退。 */
+/* Windows 产品包默认启用外移取证；manifest 由 Agent 从 REST base 自动推导，
+ * collector/velo 缺失时仍会回退 builtin/in-process。显式 EDR_FORENSIC_COLLECTOR=0 可关闭。 */
 static int forensic_external_enabled(void) {
   const char *e = getenv("EDR_FORENSIC_COLLECTOR");
-  return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+  if (e && e[0]) {
+    return e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y';
+  }
+#ifdef _WIN32
+  return 1;
+#else
+  return 0;
+#endif
 }
 static int forensic_external_required(void) {
   const char *e = getenv("EDR_FORENSIC_COLLECTOR_STRICT");

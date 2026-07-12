@@ -26,6 +26,12 @@
 /** 总开关：EDR_CORRELATION_ENABLE=1/true/yes/on 才启用；默认关（no-op）。 */
 int edr_correlation_enabled(void);
 
+/** Apply product policy without requiring process-level environment changes. */
+void edr_correlation_configure(int enabled, int inject_feedback_enabled);
+
+/** Whether AVE injection/credential verdicts may be fed into correlation. */
+int edr_correlation_inject_feedback_enabled(void);
+
 /** 懒加载规则包与状态表；幂等，可重复调用。 */
 void edr_correlation_lazy_init(void);
 

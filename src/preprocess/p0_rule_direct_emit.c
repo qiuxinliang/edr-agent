@@ -29,7 +29,7 @@
 #endif
 
 #ifndef EDR_P0_RULES_BUNDLE_VERSION
-#define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r253-b91d8e18"
+#define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r264-4287f2da"
 #endif
 
 /* 同一 (rule_id, endpoint_id, pid, event_time_ns) 在窗口内不重复上送。

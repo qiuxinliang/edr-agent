@@ -222,6 +222,20 @@ try {
   try { Unblock-File -LiteralPath `$exe -ErrorAction SilentlyContinue } catch {}
   try { Remove-Item -LiteralPath `$stdoutPath -Force -ErrorAction SilentlyContinue } catch {}
   try { Remove-Item -LiteralPath `$stderrPath -Force -ErrorAction SilentlyContinue } catch {}
+  foreach (`$envName in @(
+      "EDR_FORENSIC_COLLECTOR",
+      "EDR_FORENSIC_COLLECTOR_BIN",
+      "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
+      "EDR_VELOCIRAPTOR_BIN",
+      "EDR_FORENSIC_VERSION_CHECK_SEC",
+      "EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+      "EDR_FORENSIC_ADAPTER_MANIFEST_URL",
+      "EDR_FORENSIC_COLLECTOR_MANIFEST_URL")) {
+    `$machineValue = [Environment]::GetEnvironmentVariable(`$envName, "Machine")
+    if (-not [string]::IsNullOrWhiteSpace(`$machineValue)) {
+      [Environment]::SetEnvironmentVariable(`$envName, `$machineValue, "Process")
+    }
+  }
   `$agentArgs = "--config " + (Quote-FDNativeArg `$cfg)
   Write-FDTaskLog ("args=`$agentArgs")
   `$p = Start-Process -FilePath `$exe -ArgumentList `$agentArgs -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop

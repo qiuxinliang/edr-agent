@@ -5688,9 +5688,9 @@ static long upload_max_mb(void) {
 }
 
 #ifdef EDR_HAVE_CURL_HTTP2
-static int curl_h2_upload_multipart_file(const char *upload_id, const char *file_path,
-                                         const char *sha256_hex, char *resp_body,
-                                         size_t resp_body_cap) {
+static int curl_upload_multipart_file(const char *upload_id, const char *file_path,
+                                      const char *sha256_hex, char *resp_body,
+                                      size_t resp_body_cap) {
   char url[1400];
   size_t rb;
   CURL *curl = NULL;
@@ -5701,6 +5701,7 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   long code = 0;
   CURLcode cc;
   int h2;
+  int force_mtls_http1 = 0;
   const char *filename;
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0] ||
       !http2_client_enabled() || strncmp(s_rest, "https://", 8u) != 0 || !curl_global_ready()) {
@@ -5722,6 +5723,7 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   rb = strlen(s_rest);
   snprintf(url, sizeof(url), "%s%singest/upload-file",
            s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/");
+  force_mtls_http1 = !http2_required() && curl_schannel_store_mtls_needs_libcurl_http1(url);
   filename = base_name_ptr(file_path);
   mime = curl_mime_init(curl);
   if (!mime) {
@@ -5752,12 +5754,26 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
     return -2;
   }
   headers = curl_common_headers(NULL);
-  curl_apply_common_options(curl, url, headers,
-                            (long)env_ul_clamped("EDR_HTTP_UPLOAD_TIMEOUT_S", 600ul, 30ul, 86400ul));
+  curl_apply_common_options_ex(
+      curl, url, headers,
+      (long)env_ul_clamped("EDR_HTTP_UPLOAD_TIMEOUT_S", 600ul, 30ul, 86400ul),
+#ifdef CURL_HTTP_VERSION_1_1
+      force_mtls_http1 ? (long)CURL_HTTP_VERSION_1_1 : 0L
+#else
+      0L
+#endif
+  );
+  if (force_mtls_http1) {
+    /* A TLS connection created without a client certificate cannot be upgraded to
+     * store-backed mTLS. Keep uploads out of the shared HTTP/2 pool so Schannel
+     * selects the configured certificate on a fresh handshake. */
+    curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+    curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+  }
   curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
-  {
+  if (!force_mtls_http1) {
     int mrc = curl_h2_multi_perform(curl, NULL);
     if (mrc != -2) {
       curl_slist_free_all(headers);
@@ -5773,12 +5789,18 @@ static int curl_h2_upload_multipart_file(const char *upload_id, const char *file
   curl_mime_free(mime);
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 &&
-      (h2 || !http2_required())) {
-    s_http2_request_ok++;
+      (force_mtls_http1 || h2 || !http2_required())) {
+    if (h2) {
+      s_http2_request_ok++;
+    } else {
+      s_http2_fallback_count++;
+      snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
+    }
     return 0;
   }
   s_http2_request_fail++;
-  note_http2_failure_reason("upload-file", cc, code, h2, NULL);
+  note_http2_failure_reason(force_mtls_http1 ? "upload-file-mtls-h1" : "upload-file",
+                            cc, code, h2, resp_body);
   if (curl_result_is_tls_cert_problem(cc)) {
     note_http2_cert_problem();
   }
@@ -5936,9 +5958,10 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   }
 #ifdef EDR_HAVE_CURL_HTTP2
   if (http2_client_enabled() && !s_request_signing.enabled) {
+    int store_mtls_curl = curl_ssl_backend_is_schannel() && schannel_store_mtls_configured();
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_h2");
     resp[0] = '\0';
-    rc = curl_h2_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
+    rc = curl_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
     if (rc == 0) {
       note_http_request_success();
       note_upload_success();
@@ -5950,9 +5973,11 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       return 0;
     }
     if (rc != -2) {
-      if (http2_required()) {
+      if (http2_required() || store_mtls_curl) {
         fclose(file);
-        runtime_failure("HTTP/2 required but h2 upload failed");
+        runtime_failure(store_mtls_curl
+                            ? "Schannel store-backed mTLS upload failed"
+                            : "HTTP/2 required but h2 upload failed");
         return -1;
       }
       if (fseek(file, 0, SEEK_SET) != 0) {

@@ -178,6 +178,8 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
                  detail_u(detail, "dns_wire_hits=");
   int mz = detail_i(detail, "mz_hits=");
   int elf = detail_i(detail, "elf_hits=");
+  unsigned private_exec = detail_u(detail, "private_exec=");
+  unsigned read_failures = detail_u(detail, "vm_read_failures=");
   float ave = detail_f(detail, "ave_max_score=");
   float dns_best = detail_f(detail, "dns_best=");
   char sample[140];
@@ -217,9 +219,10 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
     s_slots[idx].last_ns = now;
     (void)snprintf(
         s_slots[idx].json, sizeof(s_slots[idx].json),
-        "{\"stomp\":%u,\"dns\":%u,\"mz\":%d,\"elf\":%d,\"ave\":%.4f,\"dns_best\":%.4f,\"sample\":\"%.120s\","
+        "{\"stomp\":%u,\"dns\":%u,\"mz\":%d,\"elf\":%d,\"private_exec\":%u,\"read_failures\":%u,"
+        "\"ave\":%.4f,\"dns_best\":%.4f,\"sample\":\"%.120s\","
         "\"owner\":\"%.120s\"}",
-        stomp, dns, mz, elf, (double)ave, (double)dns_best, esample, eowner);
+        stomp, dns, mz, elf, private_exec, read_failures, (double)ave, (double)dns_best, esample, eowner);
   }
   unlock();
 }

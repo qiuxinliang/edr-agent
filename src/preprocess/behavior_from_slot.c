@@ -1086,7 +1086,10 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
              strcmp(key, "pmfe_recommended") == 0 || strcmp(key, "pmfe_trigger") == 0 ||
              strcmp(key, "followup_only") == 0 ||
              strcmp(key, "source_alert_id") == 0 || strcmp(key, "pmfe_status") == 0 ||
-             strcmp(key, "pmfe_verdict") == 0) {
+             strcmp(key, "pmfe_verdict") == 0 || strcmp(key, "private_exec") == 0 ||
+             strcmp(key, "mz_hits") == 0 || strcmp(key, "stomp_suspicious") == 0 ||
+             strcmp(key, "thread_start_matches") == 0 || strcmp(key, "read_failures") == 0 ||
+             strcmp(key, "injection_observed") == 0) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "path") == 0 && !f->file[0]) {
     snprintf(f->file, sizeof(f->file), "%s", val);

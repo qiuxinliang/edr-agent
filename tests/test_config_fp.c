@@ -80,6 +80,27 @@ static void test_remote_detection_modes_parse(void) {
   assert(cfg.detection.pmfe_mode == 2);
 }
 
+static void test_correlation_policy_parse(void) {
+  const char *fn = "edr_test_cfg_correlation.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[correlation]\n"
+          "enabled = true\n"
+          "inject_feedback_enabled = false\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(cfg.correlation.configured);
+  assert(cfg.correlation.enabled);
+  assert(!cfg.correlation.inject_feedback_enabled);
+}
+
 static void test_policy_v2_and_attack_surface_parse(void) {
   const char *fn = "edr_test_cfg_policy_v2.toml";
   FILE *f = fopen(fn, "wb");
@@ -168,6 +189,7 @@ int main(void) {
   test_detection_policy_conditional_suppression();
   test_command_forensic_yara_rules_dir();
   test_remote_detection_modes_parse();
+  test_correlation_policy_parse();
   test_policy_v2_and_attack_surface_parse();
   puts("config_fp ok");
   return 0;

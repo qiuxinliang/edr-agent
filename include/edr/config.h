@@ -122,6 +122,13 @@ typedef struct EdrConfig {
     int pmfe_mode;      /* -1 adaptive alert, 0 off, 1 reserved idle, 2 alert-triggered */
   } detection;
 
+  /** Low-latency endpoint correlation. `configured` preserves legacy env-only deployments. */
+  struct {
+    bool configured;
+    bool enabled;
+    bool inject_feedback_enabled;
+  } correlation;
+
   /** Endpoint policy schema v2. Modes: 0 off, 1 observe, 2 alert, 3 block. */
   struct {
     int credential_mode;

@@ -593,6 +593,36 @@ static void test_pmfe_followup_bridge_preserves_link_without_false_mitre(void) {
   assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-bridge-1\"") != NULL);
 }
 
+static void test_pmfe_structured_signals_reach_detection_context(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_PMFE_SCAN_RESULT,
+            "ETW1\n"
+            "prov=pmfe\n"
+            "pid=865\n"
+            "pmfe_status=completed_suspicious\n"
+            "pmfe_verdict=suspicious\n"
+            "private_exec=2\n"
+            "mz_hits=1\n"
+            "stomp_suspicious=1\n"
+            "thread_start_matches=1\n"
+            "read_failures=3\n"
+            "injection_observed=1\n"
+            "score=0.94\n"
+            "mitre=T1055\n"
+            "detector=pmfe\n");
+  eval_slot(&slot, &r, &d);
+  assert(!d.drop);
+  assert(strstr(r.script_snippet, "private_exec=2") != NULL);
+  assert(strstr(r.detection_context, "\"private_exec\":2") != NULL);
+  assert(strstr(r.detection_context, "\"mz_hits\":1") != NULL);
+  assert(strstr(r.detection_context, "\"stomp_suspicious\":1") != NULL);
+  assert(strstr(r.detection_context, "\"thread_start_matches\":1") != NULL);
+  assert(strstr(r.detection_context, "\"read_failures\":3") != NULL);
+  assert(strstr(r.detection_context, "\"injection_observed\":true") != NULL);
+}
+
 int main(void) {
   test_scriptblock_sensor_bridge();
   test_amsi_sensor_bridge();
@@ -615,6 +645,7 @@ int main(void) {
   test_integer_ip_fields_are_normalized();
   test_registry_persistence_alias_bridge();
   test_pmfe_followup_bridge_preserves_link_without_false_mitre();
+  test_pmfe_structured_signals_reach_detection_context();
   puts("detection_sensor_bridge ok");
   return 0;
 }

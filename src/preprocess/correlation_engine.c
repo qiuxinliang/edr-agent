@@ -161,7 +161,9 @@ static volatile long s_inject_history_seq;
 /* ------------------------------------------------------------ 运行态/指标 */
 
 static volatile long s_inited;
-static int s_enabled_cache = -1;
+static volatile long s_enabled_cache = -1;
+static volatile long s_enabled_override = -1;
+static volatile long s_inject_feedback_override = -1;
 static int s_loaded;
 static char s_bundle_version[128] = "edr-corr-rules-v1-builtin";
 
@@ -192,6 +194,26 @@ static long corr_fetch_inc_long(volatile long *p) {
   long old = *p;
   *p = old + 1;
   return old;
+#endif
+}
+
+static long corr_load_long(volatile long *p) {
+#if defined(_WIN32)
+  return (long)InterlockedCompareExchange(p, 0, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  return __sync_add_and_fetch(p, 0);
+#else
+  return *p;
+#endif
+}
+
+static void corr_store_long(volatile long *p, long value) {
+#if defined(_WIN32)
+  (void)InterlockedExchange(p, value);
+#elif defined(__GNUC__) || defined(__clang__)
+  (void)__sync_lock_test_and_set(p, value);
+#else
+  *p = value;
 #endif
 }
 
@@ -248,10 +270,29 @@ static int corr_env_bool(const char *name, int fallback) {
 }
 
 int edr_correlation_enabled(void) {
-  if (s_enabled_cache < 0) {
-    s_enabled_cache = corr_env_bool("EDR_CORRELATION_ENABLE", 0);
+  long enabled_override = corr_load_long(&s_enabled_override);
+  if (enabled_override >= 0) {
+    return enabled_override != 0;
   }
-  return s_enabled_cache;
+  long enabled_cache = corr_load_long(&s_enabled_cache);
+  if (enabled_cache < 0) {
+    enabled_cache = corr_env_bool("EDR_CORRELATION_ENABLE", 0);
+    corr_store_long(&s_enabled_cache, enabled_cache);
+  }
+  return enabled_cache != 0;
+}
+
+void edr_correlation_configure(int enabled, int inject_feedback_enabled) {
+  corr_store_long(&s_enabled_override, enabled ? 1 : 0);
+  corr_store_long(&s_inject_feedback_override, inject_feedback_enabled ? 1 : 0);
+}
+
+int edr_correlation_inject_feedback_enabled(void) {
+  long feedback_override = corr_load_long(&s_inject_feedback_override);
+  if (feedback_override >= 0) {
+    return feedback_override != 0;
+  }
+  return corr_env_bool("EDR_CORRELATION_INJECT_FEEDBACK", 1);
 }
 
 /* ------------------------------------------------------------ 规则加载 */
@@ -657,7 +698,7 @@ void edr_correlation_lazy_init(void) {
 }
 
 void edr_correlation_reload(void) {
-  s_enabled_cache = -1;
+  corr_store_long(&s_enabled_cache, -1);
 #if defined(_WIN32)
   InterlockedExchange(&s_inited, 1);
 #elif defined(__GNUC__) || defined(__clang__)

@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r253-b91d8e18"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r264-4287f2da"
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -862,6 +862,18 @@ static void load_detection(toml_table_t *t, EdrConfig *cfg) {
   toml_datum_t pmfe = toml_int_in(t, "pmfe_mode");
   if (pmfe.ok && pmfe.u.i >= -1 && pmfe.u.i <= 2) {
     cfg->detection.pmfe_mode = (int)pmfe.u.i;
+  }
+}
+
+static void load_correlation(toml_table_t *t, EdrConfig *cfg) {
+  cfg->correlation.configured = true;
+  toml_datum_t enabled = toml_bool_in(t, "enabled");
+  if (enabled.ok) {
+    cfg->correlation.enabled = enabled.u.b != 0;
+  }
+  toml_datum_t feedback = toml_bool_in(t, "inject_feedback_enabled");
+  if (feedback.ok) {
+    cfg->correlation.inject_feedback_enabled = feedback.u.b != 0;
   }
 }
 
@@ -1892,6 +1904,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->detection.shellcode_mode = 0;
   cfg->detection.webshell_mode = 0;
   cfg->detection.pmfe_mode = 0;
+  cfg->correlation.configured = false;
+  cfg->correlation.enabled = false;
+  cfg->correlation.inject_feedback_enabled = true;
   cfg->policy_v2.credential_mode = 2;
   cfg->policy_v2.lateral_mode = 2;
   cfg->policy_v2.privilege_mode = 2;
@@ -2756,6 +2771,12 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
 		toml_table_t *t = toml_table_in(root, "policy_v2");
 		if (t) {
 			load_policy_v2(t, cfg);
+		}
+	}
+	{
+		toml_table_t *t = toml_table_in(root, "correlation");
+		if (t) {
+			load_correlation(t, cfg);
 		}
 	}
 	{

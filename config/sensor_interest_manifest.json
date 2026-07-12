@@ -79,7 +79,7 @@
     "registry_path_prefixes": 0,
     "remote_ports": 31
   },
-  "enabled_rules": 174,
+  "enabled_rules": 178,
   "file_path_contains": [
     "\\apache\\htdocs\\",
     "\\appdata\\local\\temp\\",
@@ -122,8 +122,8 @@
     "restore-files"
   ],
   "file_path_prefixes": [],
-  "generated_at": "2026-07-08T16:04:18.224748Z",
-  "interest_version": "sensor-interest-v1-c7eaf55db837",
+  "generated_at": "2026-07-12T14:57:20.306998Z",
+  "interest_version": "sensor-interest-v1-d8cf23d7faaf",
   "kind": "edr_sensor_interest_manifest",
   "process_name_prefixes": [],
   "process_names": [
@@ -285,7 +285,7 @@
     27017,
     47001
   ],
-  "rules_bundle_version": "edr-dynamic-rules-v1-r253-b91d8e18",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r264-4287f2da",
   "schema_version": 1,
   "source_dynamic_rules": "dynamic_rules_v1.json"
 }

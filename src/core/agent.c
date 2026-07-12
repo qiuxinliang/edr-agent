@@ -812,6 +812,12 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "shellcode_mode = %d\n", cfg->detection.shellcode_mode);
   fprintf(fp, "webshell_mode = %d\n", cfg->detection.webshell_mode);
   fprintf(fp, "pmfe_mode = %d\n", cfg->detection.pmfe_mode);
+  if (cfg->correlation.configured) {
+    fprintf(fp, "\n[correlation]\n");
+    fprintf(fp, "enabled = %s\n", cfg->correlation.enabled ? "true" : "false");
+    fprintf(fp, "inject_feedback_enabled = %s\n",
+            cfg->correlation.inject_feedback_enabled ? "true" : "false");
+  }
   fprintf(fp, "\n[policy_v2]\n");
   static const char *policy_modes[] = {"off", "observe", "alert", "block"};
 #define EDR_WRITE_POLICY_MODE(name, value) fprintf(fp, name " = \"%s\"\n", policy_modes[(value) >= 0 && (value) <= 3 ? (value) : 2])
@@ -1213,7 +1219,6 @@ static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, 
    * 非命中裁决零额外开销（两次位与判断）；不新增采集、无新线程、不碰 ETW 热路径。 */
   {
     const uint32_t bf = alert ? alert->behavior_flags : 0u;
-    const char *fb;
     if (!alert || alert->pid == 0u) {
       return;
     }
@@ -1222,8 +1227,7 @@ static void AVE_CALL edr_agent_on_behavior_alert(const AVEBehaviorAlert *alert, 
     }
     /* 独立开关：EDR_CORRELATION_INJECT_FEEDBACK=0 单独关掉 AVE 回灌（含提采集），
      * 不影响其余关联规则。用于评估 AVE 判定误报率期间灰度/回滚。默认开。 */
-    fb = getenv("EDR_CORRELATION_INJECT_FEEDBACK");
-    if (fb && (fb[0] == '0' || fb[0] == 'n' || fb[0] == 'N' || fb[0] == 'f' || fb[0] == 'F')) {
+    if (!edr_correlation_inject_feedback_enabled()) {
       return;
     }
     if (bf & EDR_AVE_BEH_INJECTION_MASK) {
@@ -1443,6 +1447,10 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   }
   edr_detection_apply_profile(&agent->cfg);
   edr_policy_v2_configure(&agent->cfg);
+  if (agent->cfg.correlation.configured) {
+    edr_correlation_configure(agent->cfg.correlation.enabled ? 1 : 0,
+                              agent->cfg.correlation.inject_feedback_enabled ? 1 : 0);
+  }
   edr_self_protect_init();
   edr_agent_derive_forensic_manifest_env(&agent->cfg);
   edr_adaptive_collection_configure(&agent->cfg);
@@ -1585,7 +1593,11 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
 #endif
   int rtq_policy = agent && (agent->cfg.command.allow_rtq_readonly ||
                               agent->cfg.command.allow_dangerous);
-  int dangerous_policy = agent && agent->cfg.command.allow_dangerous;
+  const char *command_enabled_env = getenv("EDR_CMD_ENABLED");
+  const char *command_dangerous_env = getenv("EDR_CMD_DANGEROUS");
+  int dangerous_policy = (agent && agent->cfg.command.allow_dangerous) ||
+                         (command_enabled_env && command_enabled_env[0] == '1') ||
+                         (command_dangerous_env && command_dangerous_env[0] == '1');
   int ort_policy = agent && agent->cfg.ave.enabled && agent->cfg.ave.static_model_enabled;
   int sqlite_policy = agent && agent->cfg.offline.queue_db_path[0];
   int velo_policy = edr_response_forensic_external_enabled();
@@ -1615,6 +1627,8 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
                              : http_rt->zstd_available ? "healthy" : "degraded";
   const char *velo_runtime = !velo_policy ? "disabled"
                              : edr_deep_collector_is_running() ? "healthy" : "idle";
+  const char *velo_query_runtime = !dangerous_policy ? "disabled"
+                                   : edr_deep_collector_is_running() ? "healthy" : "idle";
   EdrAlertGovernorStats alert_stats;
   EdrShellcodeDetectorRuntime shellcode_rt;
   char endpoint_policy_capability[2048];
@@ -1721,7 +1735,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
-      velo_policy ? "true" : "false", velo_runtime);
+      dangerous_policy ? "true" : "false", velo_query_runtime);
 }
 
 static int edr_agent_collection_enabled(const EdrConfig *cfg) {
@@ -1952,14 +1966,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   if (!agent || !last_health_ns || !edr_ingest_http_configured()) {
     return;
   }
-  if (!agent->cfg.health_monitor.enabled) {
-    return;
-  }
   uint64_t wall_ms = (uint64_t)time(NULL) * 1000ULL;
-  if (agent->cfg.health_monitor.expires_at_unix_ms > 0u &&
-      wall_ms >= agent->cfg.health_monitor.expires_at_unix_ms) {
-    return;
-  }
+  /* Diagnostic monitoring is leased; the capability/communication baseline is not. */
+  const int monitor_lease_active = agent->cfg.health_monitor.enabled &&
+      (agent->cfg.health_monitor.expires_at_unix_ms == 0u ||
+       wall_ms < agent->cfg.health_monitor.expires_at_unix_ms);
   int interval = (int)agent->cfg.health_monitor.interval_s;
   if (interval < 30 || interval > 3600) {
     interval = 60;
@@ -2049,6 +2060,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 #endif
   json_escape_small(agent->cfg.health_monitor.profile, health_profile, sizeof(health_profile));
   json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
+  if (!monitor_lease_active) {
+    snprintf(health_profile, sizeof(health_profile), "%s", "basic");
+  }
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
   runtime_policy_raw[0] = '\0';
   edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
@@ -3138,6 +3152,11 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   }
   if (edr_agent_toml_has_section(tmp, "policy_v2")) {
     (void)edr_policy_v2_apply_remote(&agent->cfg, remote);
+  }
+  if (edr_agent_toml_has_section(tmp, "correlation")) {
+    agent->cfg.correlation = remote->correlation;
+    edr_correlation_configure(agent->cfg.correlation.enabled ? 1 : 0,
+                              agent->cfg.correlation.inject_feedback_enabled ? 1 : 0);
   }
   if (edr_agent_toml_has_section(tmp, "upload")) {
     agent->cfg.upload = remote->upload;

@@ -77,6 +77,13 @@ add_test(NAME control_stream_lease_contract COMMAND test_control_stream_lease_co
 set_tests_properties(control_stream_lease_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_mtls_upload_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_upload_contract.c)
+edr_apply_common_warnings(test_mtls_upload_contract)
+add_test(NAME mtls_upload_transport_contract COMMAND test_mtls_upload_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(mtls_upload_transport_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 add_executable(test_remote_config_status_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_config_status_contract.c)
 edr_apply_common_warnings(test_remote_config_status_contract)
