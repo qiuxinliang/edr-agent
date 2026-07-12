@@ -109,6 +109,8 @@ typedef struct EdrPmfeScanResult {
   uint32_t thread_start_matches;
   uint32_t thread_query_failures;
   uint32_t private_exec;
+  uint32_t memfd_exec;
+  uint32_t deleted_exec;
   uint32_t stomp_suspicious;
   uint32_t mz_hits;
   uint32_t dns_hits;

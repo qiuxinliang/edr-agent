@@ -45,7 +45,7 @@ if [[ -n "${HTTPS_PROXY:-}" ]]; then PROXY_ARGS+=(-e "HTTPS_PROXY=${HTTPS_PROXY}
 
 # shellcheck disable=SC2086
 "$ENGINE" run --rm \
-  "${PROXY_ARGS[@]}" \
+  ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
   -e "EDR_RUN_CTEST=${EDR_RUN_CTEST:-0}" \
   ${EXTRA} \
   -v "$ROOT:/work" \

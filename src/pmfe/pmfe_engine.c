@@ -1803,6 +1803,8 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
   unsigned regions = 0u;
   unsigned private_exec = 0u;
   unsigned file_exec_maps = 0u;
+  unsigned memfd_exec = 0u;
+  unsigned deleted_exec = 0u;
   unsigned vm_read_failures = 0u;
   PmfeLinuxMapCand pool[PMFE_LINUX_MAP_POOL];
   int np = 0;
@@ -1821,7 +1823,15 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
     }
     if (strlen(perms) >= 4u && perms[2] == 'x' && perms[3] == 'p') {
       private_exec++;
-      if (strchr(mpathline, '/') != NULL) {
+      int is_memfd = edr_pmfe_linux_path_is_memfd(mpathline);
+      int is_deleted = edr_pmfe_linux_path_is_deleted(mpathline);
+      if (is_memfd) {
+        memfd_exec++;
+      }
+      if (is_deleted) {
+        deleted_exec++;
+      }
+      if (strchr(mpathline, '/') != NULL && !is_memfd && !is_deleted) {
         file_exec_maps++;
       }
     }
@@ -1925,10 +1935,10 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
 
   snprintf(detail, detail_cap,
            "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
-           "file_exec_maps=%u first_stomp=%.200s thread_start=unknown executable_private_page=%u "
+           "memfd_exec=%u deleted_exec=%u file_exec_maps=%u first_stomp=%.200s thread_start=unknown executable_private_page=%u "
            "private_page_origin=%s cross_process_write=unknown module_path_consistency=%s module_signature=unknown | %s",
            pid_u, (unsigned)task->priority, (unsigned)task->band, baseline_mods_u, stomp, disk_ok, regions,
-           private_exec, file_exec_maps, stomp_disp, private_exec ? 1u : 0u,
+           private_exec, memfd_exec, deleted_exec, file_exec_maps, stomp_disp, private_exec ? 1u : 0u,
            private_exec > file_exec_maps ? "anonymous_or_memfd" : "file_backed",
            stomp ? "mismatch" : "ok", extra);
   return 0;
@@ -1953,6 +1963,8 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
     result->regions_read = pmfe_detail_u(detail, "maps_peek=");
     result->read_failures = pmfe_detail_u(detail, "vm_read_failures=");
     result->private_exec = pmfe_detail_u(detail, "private_exec=");
+    result->memfd_exec = pmfe_detail_u(detail, "memfd_exec=");
+    result->deleted_exec = pmfe_detail_u(detail, "deleted_exec=");
     result->stomp_suspicious = pmfe_detail_u(detail, "stomp_suspicious=");
     result->mz_hits = pmfe_detail_u(detail, "elf_hits=");
   }
@@ -2060,11 +2072,13 @@ static void pmfe_query_target_image(uint32_t pid, char *out, size_t cap) {
 }
 
 static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_max,
-                                  unsigned private_exec, unsigned mz_hits,
+                                  unsigned private_exec, unsigned mz_hits, unsigned memfd_exec,
+                                  unsigned deleted_exec,
                                   unsigned thread_start_matches, int injection_observed) {
   if (stomp > 0u || dns_hits > 0u || ave_max >= 0.65f ||
       (private_exec > 0u && mz_hits > 0u) ||
-      (thread_start_matches > 0u && private_exec > 0u) || injection_observed) {
+      (thread_start_matches > 0u && private_exec > 0u) || memfd_exec > 0u || deleted_exec > 0u ||
+      injection_observed) {
     return 0u;
   }
   return 1u;
@@ -2102,6 +2116,8 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   float ave_max = pmfe_detail_f(detail, "ave_max_score=");
   float dns_best = pmfe_detail_f(detail, "dns_best=");
   unsigned private_exec = scan_result ? scan_result->private_exec : pmfe_detail_u(detail, "private_exec=");
+  unsigned memfd_exec = scan_result ? scan_result->memfd_exec : pmfe_detail_u(detail, "memfd_exec=");
+  unsigned deleted_exec = scan_result ? scan_result->deleted_exec : pmfe_detail_u(detail, "deleted_exec=");
   unsigned mz_hits = scan_result ? scan_result->mz_hits : (unsigned)(mz > 0 ? mz : (elf > 0 ? elf : 0));
   unsigned thread_start_matches = scan_result ? scan_result->thread_start_matches : 0u;
   unsigned read_failures = scan_result ? scan_result->read_failures : pmfe_detail_u(detail, "vm_read_failures=");
@@ -2121,6 +2137,9 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   }
   if ((private_exec > 0u && mz_hits > 0u) ||
       (thread_start_matches > 0u && private_exec > 0u) || injection_observed) {
+    want = 1;
+  }
+  if (memfd_exec > 0u || deleted_exec > 0u) {
     want = 1;
   }
   const char *mz_env = getenv("EDR_PMFE_EMIT_MZ");
@@ -2177,6 +2196,12 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   if (injection_observed && score < 0.94f) {
     score = 0.94f;
   }
+  if (memfd_exec > 0u && score < 0.92f) {
+    score = 0.92f;
+  }
+  if (deleted_exec > 0u && score < 0.88f) {
+    score = 0.88f;
+  }
   int clean_followup = shellcode_followup && scan_result && strcmp(scan_result->verdict, "clean") == 0;
   if (clean_followup) {
     score = 0.05f;
@@ -2192,7 +2217,7 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = pmfe_wall_time_ns();
   slot.type = EDR_EVENT_PMFE_SCAN_RESULT;
-  slot.priority = pmfe_emit_priority(stomp, dns_hits, ave_max, private_exec, mz_hits,
+  slot.priority = pmfe_emit_priority(stomp, dns_hits, ave_max, private_exec, mz_hits, memfd_exec, deleted_exec,
                                      thread_start_matches, injection_observed);
   slot.consumed = false;
   slot.attack_surface_hint = 0u;
@@ -2204,12 +2229,12 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   int suspicious = strcmp(verdict, "suspicious") == 0;
   int n = snprintf((char *)slot.data, sizeof(slot.data),
                    "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nfollowup_only=%u\nsource_alert_id=%.63s\n"
-                   "pmfe_status=%s\npmfe_verdict=%s\nprivate_exec=%u\nmz_hits=%u\n"
+                   "pmfe_status=%s\npmfe_verdict=%s\nprivate_exec=%u\nmemfd_exec=%u\ndeleted_exec=%u\nmz_hits=%u\n"
                    "stomp_suspicious=%u\nthread_start_matches=%u\nread_failures=%u\n"
                    "injection_observed=%u\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=%s\n"
                    "detector=pmfe\n",
                    task->pid, cid, (unsigned)shellcode_followup, source_alert_id, status, verdict,
-                   private_exec, mz_hits, stomp, thread_start_matches, read_failures,
+                   private_exec, memfd_exec, deleted_exec, mz_hits, stomp, thread_start_matches, read_failures,
                    (unsigned)injection_observed, img[0] ? img : "-", cmdline_buf,
                    dns_sample[0] ? dns_sample : "-", score,
                    suspicious ? "T1055" : "-");
@@ -2343,6 +2368,7 @@ static void pmfe_worker_body(void) {
       snprintf(scan_result.status, sizeof(scan_result.status), "%s", "partial");
       int suspicious = scan_result.stomp_suspicious > 0u || scan_result.mz_hits > 0u ||
                        scan_result.private_exec > 0u || scan_result.dns_hits > 0u ||
+                       scan_result.memfd_exec > 0u || scan_result.deleted_exec > 0u ||
                        scan_result.ave_max_score >= 0.5f ||
                        scan_result.thread_start_matches > 0u ||
                        scan_result.injection_observed;
@@ -2354,6 +2380,7 @@ static void pmfe_worker_body(void) {
                warning_len ? "; " : "", scan_result.read_failures);
     } else if (scan_result.stomp_suspicious > 0u || scan_result.mz_hits > 0u ||
                scan_result.private_exec > 0u || scan_result.dns_hits > 0u ||
+               scan_result.memfd_exec > 0u || scan_result.deleted_exec > 0u ||
                scan_result.ave_max_score >= 0.5f ||
                scan_result.thread_start_matches > 0u ||
                scan_result.injection_observed) {

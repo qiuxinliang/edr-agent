@@ -87,10 +87,16 @@ static unsigned long s_rejected;
 static unsigned long s_exec_ok;
 static unsigned long s_exec_fail;
 #ifdef _MSC_VER
-static __declspec(thread) const char *s_active_command_type;
+static __declspec(thread) char s_active_command_type[96];
 #else
-static _Thread_local const char *s_active_command_type;
+static _Thread_local char s_active_command_type[96];
 #endif
+
+static void command_set_active_type_owned(const char *command_type) {
+  snprintf(s_active_command_type, sizeof(s_active_command_type), "%s",
+           command_type ? command_type : "");
+  edr_command_set_active_type(s_active_command_type);
+}
 /* PMFE workers must not perform transport I/O. Keep terminal results until
  * the normal command poll loop can persist and emit them. */
 #define PMFE_COMPLETION_CAP 32
@@ -432,11 +438,11 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
   }
   int report_pending = 0;
   if (detail_json && command_should_report(cmd_id, sm)) {
-    int rc = edr_transport_v2_command_result_typed(cmd_id, s_active_command_type ? s_active_command_type : "",
+    int rc = edr_transport_v2_command_result_typed(cmd_id, s_active_command_type,
                                                    sm, (int)st, exit_code, detail_json);
     report_pending = (rc != 0);
   }
-  int state_rc = edr_command_state_finish(cmd_id, s_active_command_type ? s_active_command_type : "",
+  int state_rc = edr_command_state_finish(cmd_id, s_active_command_type,
                                           sm, rstatus, (int)st, exit_code,
                                           detail ? detail : "", artifacts ? artifacts : "",
                                           report_pending);
@@ -5064,8 +5070,7 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
     if (!edr_command_cancel_begin(inbox[i].command_id)) {
       continue;
     }
-    s_active_command_type = inbox[i].command_type;
-    edr_command_set_active_type(s_active_command_type);
+    command_set_active_type_owned(inbox[i].command_type);
     char sig_reason[160];
     sig_reason[0] = '\0';
     int internal_trusted = strncmp(inbox[i].command_id, "auto-", 5u) == 0 &&
@@ -5397,6 +5402,8 @@ static char *pmfe_completion_result_json(PmfeCompletion *completion) {
   cJSON_AddNumberToObject(signals, "entropy_max", r->entropy_max);
   cJSON_AddNumberToObject(signals, "regions_scanned", r->regions_total);
   cJSON_AddNumberToObject(signals, "private_exec", r->private_exec);
+  cJSON_AddNumberToObject(signals, "memfd_exec", r->memfd_exec);
+  cJSON_AddNumberToObject(signals, "deleted_exec", r->deleted_exec);
   cJSON_AddStringToObject(signals, "module_consistency", r->module_consistency);
   cJSON *correlation = cJSON_AddObjectToObject(root, "correlation");
   cJSON *cross_process_write = cJSON_AddObjectToObject(
@@ -5622,8 +5629,7 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
   const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
   const char *t = command_type ? command_type : "";
   const char *id = command_id ? command_id : "";
-  s_active_command_type = t;
-  edr_command_set_active_type(t);
+  command_set_active_type_owned(t);
 
   char sig_reason[160];
   sig_reason[0] = 0;
@@ -5736,8 +5742,7 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
   const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
   const char *t = descriptor ? descriptor->canonical_type : "";
   const char *id = command_id ? command_id : "";
-  s_active_command_type = t;
-  edr_command_set_active_type(t);
+  command_set_active_type_owned(t);
 
   if (!descriptor) {
     fprintf(stderr, "[command] unknown type id=%s type=%s\n", id,

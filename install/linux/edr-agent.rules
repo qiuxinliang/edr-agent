@@ -1,0 +1,12 @@
+## FDSecurity EDR Linux high-value audit rules.
+## Install as /etc/audit/rules.d/edr-agent.rules and load with augenrules --load.
+-a always,exit -F arch=b64 -S execve,execveat -k edr_exec
+-a always,exit -F arch=b64 -S connect -k edr_net
+-a always,exit -F arch=b64 -S ptrace -k edr_ptrace
+-a always,exit -F arch=b64 -S process_vm_writev -k edr_memwrite
+-a always,exit -F arch=b64 -S process_vm_readv -k edr_memread
+-a always,exit -F arch=b64 -S memfd_create -k edr_memfd
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k edr_kernel_module
+-w /etc/cron.d/ -p wa -k edr_persistence
+-w /etc/systemd/system/ -p wa -k edr_persistence
+-w /tmp/ -p wa -k edr_tmp_exec

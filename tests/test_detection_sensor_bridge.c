@@ -604,6 +604,8 @@ static void test_pmfe_structured_signals_reach_detection_context(void) {
             "pmfe_status=completed_suspicious\n"
             "pmfe_verdict=suspicious\n"
             "private_exec=2\n"
+            "memfd_exec=1\n"
+            "deleted_exec=1\n"
             "mz_hits=1\n"
             "stomp_suspicious=1\n"
             "thread_start_matches=1\n"
@@ -616,6 +618,8 @@ static void test_pmfe_structured_signals_reach_detection_context(void) {
   assert(!d.drop);
   assert(strstr(r.script_snippet, "private_exec=2") != NULL);
   assert(strstr(r.detection_context, "\"private_exec\":2") != NULL);
+  assert(strstr(r.detection_context, "\"memfd_exec\":1") != NULL);
+  assert(strstr(r.detection_context, "\"deleted_exec\":1") != NULL);
   assert(strstr(r.detection_context, "\"mz_hits\":1") != NULL);
   assert(strstr(r.detection_context, "\"stomp_suspicious\":1") != NULL);
   assert(strstr(r.detection_context, "\"thread_start_matches\":1") != NULL);

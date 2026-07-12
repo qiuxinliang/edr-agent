@@ -1396,6 +1396,8 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char pmfe_entropy[32];
   char pmfe_regions[32];
   char pmfe_private_exec[32];
+  char pmfe_memfd_exec[32];
+  char pmfe_deleted_exec[32];
   char pmfe_thread_start_matches[32];
   char pmfe_read_failures[32];
   char pmfe_injection_observed[8];
@@ -1490,6 +1492,8 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   pmfe_entropy[0] = '\0';
   pmfe_regions[0] = '\0';
   pmfe_private_exec[0] = '\0';
+  pmfe_memfd_exec[0] = '\0';
+  pmfe_deleted_exec[0] = '\0';
   pmfe_thread_start_matches[0] = '\0';
   pmfe_read_failures[0] = '\0';
   pmfe_injection_observed[0] = '\0';
@@ -1566,6 +1570,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->cmdline, "regions", pmfe_regions, sizeof(pmfe_regions));
   detail_value(r->script_snippet, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
   if (!pmfe_private_exec[0]) detail_value(r->cmdline, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
+  detail_value(r->script_snippet, "memfd_exec", pmfe_memfd_exec, sizeof(pmfe_memfd_exec));
+  if (!pmfe_memfd_exec[0]) detail_value(r->cmdline, "memfd_exec", pmfe_memfd_exec, sizeof(pmfe_memfd_exec));
+  detail_value(r->script_snippet, "deleted_exec", pmfe_deleted_exec, sizeof(pmfe_deleted_exec));
+  if (!pmfe_deleted_exec[0]) detail_value(r->cmdline, "deleted_exec", pmfe_deleted_exec, sizeof(pmfe_deleted_exec));
   detail_value(r->script_snippet, "thread_start_matches", pmfe_thread_start_matches,
                sizeof(pmfe_thread_start_matches));
   detail_value(r->script_snippet, "read_failures", pmfe_read_failures, sizeof(pmfe_read_failures));
@@ -1837,7 +1845,7 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
     json_str(r->detection_context, sizeof(r->detection_context), pmfe_status, 32u);
     json_cat(r->detection_context, sizeof(r->detection_context), ",\"verdict\":");
     json_str(r->detection_context, sizeof(r->detection_context), pmfe_verdict, 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"thread_start_matches\":%ld,\"read_failures\":%ld,\"injection_observed\":%s,\"module_consistency\":",
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"memfd_exec\":%ld,\"deleted_exec\":%ld,\"thread_start_matches\":%ld,\"read_failures\":%ld,\"injection_observed\":%s,\"module_consistency\":",
              pmfe_stomp[0] ? strtol(pmfe_stomp, NULL, 10) : 0L,
              pmfe_mz[0] ? strtol(pmfe_mz, NULL, 10) : 0L,
              pmfe_elf[0] ? strtol(pmfe_elf, NULL, 10) : 0L,
@@ -1847,6 +1855,8 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
              pmfe_entropy[0] ? strtod(pmfe_entropy, NULL) : 0.0,
              pmfe_regions[0] ? strtol(pmfe_regions, NULL, 10) : 0L,
              pmfe_private_exec[0] ? strtol(pmfe_private_exec, NULL, 10) : 0L,
+             pmfe_memfd_exec[0] ? strtol(pmfe_memfd_exec, NULL, 10) : 0L,
+             pmfe_deleted_exec[0] ? strtol(pmfe_deleted_exec, NULL, 10) : 0L,
              pmfe_thread_start_matches[0] ? strtol(pmfe_thread_start_matches, NULL, 10) : 0L,
              pmfe_read_failures[0] ? strtol(pmfe_read_failures, NULL, 10) : 0L,
              pmfe_injection_observed[0] && strcmp(pmfe_injection_observed, "0") != 0 ? "true" : "false");

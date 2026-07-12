@@ -1,0 +1,32 @@
+# Linux strong-detection policy overlay. Bootstrap identity/TLS paths remain in the local agent.toml.
+[collection]
+etw_enabled = true
+ebpf_enabled = true
+auditd_enabled = true
+auditd_log_path = "/var/log/audit/audit.log"
+adaptive_enabled = true
+adaptive_boost_seconds = 180
+adaptive_min_severity = 3
+max_event_queue_size = 32768
+
+[detection]
+auto_profile = false
+shellcode_mode = 0
+webshell_mode = -1
+pmfe_mode = 2
+
+[correlation]
+enabled = true
+inject_feedback_enabled = true
+
+[resource_limit]
+cpu_limit_percent = 12
+memory_limit_mb = 512
+emergency_cpu_limit = 40
+behavior_infer_per_min = 20
+pmfe_scans_per_min = 4
+
+# Runtime environment used by the Linux service:
+# EDR_LINUX_PROC_CONNECTOR=1
+# EDR_PMFE_LINUX_ANON_EXEC_ONLY=1
+# EDR_LINUX_EBPF_TRACE_PIPE_PATH=/run/edr-agent/ebpf-events.pipe

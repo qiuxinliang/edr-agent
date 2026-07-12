@@ -1,0 +1,36 @@
+tracepoint:syscalls:sys_enter_execve
+{
+  printf("edr syscall=execve pid=%d comm=%s exe=%s\n", pid, comm, str(args->filename));
+}
+
+tracepoint:syscalls:sys_enter_connect
+{
+  printf("edr syscall=connect pid=%d comm=%s\n", pid, comm);
+}
+
+tracepoint:syscalls:sys_enter_ptrace
+{
+  printf("edr syscall=ptrace pid=%d comm=%s target_pid=%d\n", pid, comm, args->pid);
+}
+
+tracepoint:syscalls:sys_enter_process_vm_writev
+{
+  printf("edr syscall=process_vm_writev pid=%d comm=%s target_pid=%d\n", pid, comm, args->pid);
+}
+
+tracepoint:syscalls:sys_enter_process_vm_readv
+{
+  printf("edr syscall=process_vm_readv pid=%d comm=%s target_pid=%d\n", pid, comm, args->pid);
+}
+
+tracepoint:syscalls:sys_enter_memfd_create
+{
+  printf("edr syscall=memfd_create pid=%d comm=%s name=%s\n", pid, comm, str(args->uname));
+}
+
+tracepoint:syscalls:sys_enter_init_module,
+tracepoint:syscalls:sys_enter_finit_module,
+tracepoint:syscalls:sys_enter_delete_module
+{
+  printf("edr syscall=module_load pid=%d comm=%s\n", pid, comm);
+}

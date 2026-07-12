@@ -74,30 +74,34 @@ static EdrCollectorHealth s_health;
 typedef struct {
   const char *name;
   int x86_64_nr;
+  int aarch64_nr;
   EdrEventType event_type;
 } LinuxAuditSyscallMap;
 
 static const LinuxAuditSyscallMap kAuditSyscalls[] = {
-    {"execve", 59, EDR_EVENT_PROCESS_CREATE},
-    {"connect", 42, EDR_EVENT_NET_CONNECT},
-    {"openat", 257, EDR_EVENT_FILE_READ},
-    {"rename", 82, EDR_EVENT_FILE_RENAME},
-    {"renameat", 264, EDR_EVENT_FILE_RENAME},
-    {"renameat2", 316, EDR_EVENT_FILE_RENAME},
-    {"unlink", 87, EDR_EVENT_FILE_DELETE},
-    {"unlinkat", 263, EDR_EVENT_FILE_DELETE},
-    {"chmod", 90, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"fchmod", 91, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"fchmodat", 268, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"chown", 92, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"fchown", 93, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"lchown", 94, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"fchownat", 260, EDR_EVENT_FILE_PERMISSION_CHANGE},
-    {"setuid", 105, EDR_EVENT_AUTH_PRIVILEGE_ESC},
-    {"ptrace", 101, EDR_EVENT_PROCESS_INJECT},
-    {"init_module", 175, EDR_EVENT_DRIVER_LOAD},
-    {"finit_module", 313, EDR_EVENT_DRIVER_LOAD},
-    {"delete_module", 176, EDR_EVENT_DRIVER_LOAD},
+    {"execve", 59, 221, EDR_EVENT_PROCESS_CREATE},
+    {"connect", 42, 203, EDR_EVENT_NET_CONNECT},
+    {"openat", 257, 56, EDR_EVENT_FILE_READ},
+    {"rename", 82, -1, EDR_EVENT_FILE_RENAME},
+    {"renameat", 264, 38, EDR_EVENT_FILE_RENAME},
+    {"renameat2", 316, 276, EDR_EVENT_FILE_RENAME},
+    {"unlink", 87, -1, EDR_EVENT_FILE_DELETE},
+    {"unlinkat", 263, 35, EDR_EVENT_FILE_DELETE},
+    {"chmod", 90, -1, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchmod", 91, 52, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchmodat", 268, 53, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"chown", 92, -1, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchown", 93, 55, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"lchown", 94, -1, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchownat", 260, 54, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"setuid", 105, 146, EDR_EVENT_AUTH_PRIVILEGE_ESC},
+    {"ptrace", 101, 117, EDR_EVENT_PROCESS_INJECT},
+    {"process_vm_readv", 310, 270, EDR_EVENT_PROCESS_INJECT},
+    {"process_vm_writev", 311, 271, EDR_EVENT_PROCESS_INJECT},
+    {"memfd_create", 319, 279, EDR_EVENT_PROCESS_INJECT},
+    {"init_module", 175, 105, EDR_EVENT_DRIVER_LOAD},
+    {"finit_module", 313, 273, EDR_EVENT_DRIVER_LOAD},
+    {"delete_module", 176, 106, EDR_EVENT_DRIVER_LOAD},
 };
 
 static uint64_t edr_realtime_ns(void) {
@@ -164,6 +168,17 @@ static long audit_long_field(const char *line, const char *key, long defv) {
   return end != p ? v : defv;
 }
 
+static unsigned long audit_hex_field(const char *line, const char *key, unsigned long defv) {
+  const char *p = strstr(line, key);
+  if (!p) {
+    return defv;
+  }
+  p += strlen(key);
+  char *end = NULL;
+  unsigned long value = strtoul(p, &end, 16);
+  return end != p ? value : defv;
+}
+
 static int env_truthy(const char *key) {
   const char *v = getenv(key);
   return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
@@ -195,8 +210,10 @@ static const LinuxAuditSyscallMap *audit_lookup_syscall(const char *line) {
   if (end == name) {
     return NULL;
   }
+  int aarch64 = strstr(line, "arch=c00000b7") != NULL;
   for (size_t i = 0; i < sizeof(kAuditSyscalls) / sizeof(kAuditSyscalls[0]); i++) {
-    if (nr == kAuditSyscalls[i].x86_64_nr) {
+    int expected = aarch64 ? kAuditSyscalls[i].aarch64_nr : kAuditSyscalls[i].x86_64_nr;
+    if (expected >= 0 && nr == expected) {
       return &kAuditSyscalls[i];
     }
   }
@@ -301,6 +318,12 @@ static void push_audit_event(const char *line) {
   copy_between_quotes(line, "ses=", ses, sizeof(ses));
   long pid = audit_long_field(line, "pid=", 0);
   long ppid = audit_long_field(line, "ppid=", 0);
+  unsigned long target_pid = 0;
+  if (strcmp(m->name, "ptrace") == 0) {
+    target_pid = audit_hex_field(line, "a1=", 0);
+  } else if (strcmp(m->name, "process_vm_readv") == 0 || strcmp(m->name, "process_vm_writev") == 0) {
+    target_pid = audit_hex_field(line, "a0=", 0);
+  }
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = edr_realtime_ns();
@@ -320,6 +343,11 @@ static void push_audit_event(const char *line) {
   audit_copy_optional(line, "family=", "family", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
   audit_copy_optional(line, "success=", "success", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
   audit_copy_optional(line, "exit=", "exit", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  if (target_pid > 0) {
+    size_t used = strlen((char *)slot.data);
+    (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
+                   "target_pid=%lu\n", target_pid);
+  }
   if (env_truthy("EDR_LINUX_INCLUDE_RAW_AUDIT")) {
     size_t used = strlen((char *)slot.data);
     (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
@@ -364,6 +392,15 @@ static void push_ebpf_trace_event(const char *line) {
   } else if (strstr(line, "ptrace")) {
     type = EDR_EVENT_PROCESS_INJECT;
     op = "ptrace";
+  } else if (strstr(line, "process_vm_writev")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "process_vm_writev";
+  } else if (strstr(line, "process_vm_readv")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "process_vm_readv";
+  } else if (strstr(line, "memfd_create")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "memfd_create";
   } else if (strstr(line, "module")) {
     type = EDR_EVENT_DRIVER_LOAD;
     op = "module_load";
@@ -387,6 +424,8 @@ static void push_ebpf_trace_event(const char *line) {
   audit_copy_optional(line, "path=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
   audit_copy_optional(line, "dst=", "dst", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
   audit_copy_optional(line, "dport=", "dport", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "target_pid=", "target_pid", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "name=", "memfd_name", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
   if (env_truthy("EDR_LINUX_INCLUDE_RAW_EBPF")) {
     size_t used = strlen((char *)slot.data);
     (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
@@ -548,6 +587,11 @@ static void *ebpf_trace_thread_main(void *arg) {
     if (feof(s_ebpf_fp)) {
       clearerr(s_ebpf_fp);
       usleep(250000);
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+      clearerr(s_ebpf_fp);
+      usleep(100000);
       continue;
     }
     snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "read_failed:%s", strerror(errno));
@@ -746,15 +790,23 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_ebpf_thread_valid = 0;
   s_ebpf_fp = NULL;
   const char *ebpf_trace = getenv("EDR_LINUX_EBPF_TRACE_PIPE");
-  if (cfg->collection.ebpf_enabled && ebpf_trace && ebpf_trace[0] == '1') {
+  int ebpf_trace_on = cfg->collection.ebpf_enabled && !(ebpf_trace && ebpf_trace[0] == '0');
+  if (ebpf_trace_on) {
     const char *tp = getenv("EDR_LINUX_EBPF_TRACE_PIPE_PATH");
     if (!tp || !tp[0]) {
-      tp = "/sys/kernel/debug/tracing/trace_pipe";
+      tp = "/run/edr-agent/ebpf-events.pipe";
     }
-    s_ebpf_fp = fopen(tp, "r");
-    if (!s_ebpf_fp) {
+    int trace_fd = open(tp, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (trace_fd < 0) {
       snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "trace_pipe_open_failed:%s", strerror(errno));
     } else {
+      s_ebpf_fp = fdopen(trace_fd, "r");
+      if (!s_ebpf_fp) {
+        close(trace_fd);
+        snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "trace_pipe_fdopen_failed:%s", strerror(errno));
+      }
+    }
+    if (s_ebpf_fp) {
       s_health.ebpf_loaded = 1;
       snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "%s", "");
       if (pthread_create(&s_ebpf_thread, NULL, ebpf_trace_thread_main, NULL) != 0) {
