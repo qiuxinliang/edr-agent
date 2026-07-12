@@ -96,6 +96,11 @@ int edr_policy_v2_mode_for_category(const char *category) {
   return id == CAT_UNKNOWN ? EDR_POLICY_MODE_ALERT : s_modes[id];
 }
 
+int edr_policy_v2_mode_for_alert(const char *triggered_tactics, const char *subject_json) {
+  int category = category_from_alert(triggered_tactics, subject_json);
+  return category == CAT_UNKNOWN ? EDR_POLICY_MODE_ALERT : s_modes[category];
+}
+
 int edr_policy_v2_ransomware_enabled(const char *control) {
   if (!control) return 0;
   if (strcmp(control, "behavior") == 0) return s_ransomware_behavior;

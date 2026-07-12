@@ -68,6 +68,8 @@ int main(void) {
   failed |= require_text(capture, "scan_queue_capacity");
   failed |= require_text(capture, "GetModuleFileNameW");
   failed |= require_text(capture, "windivert_source");
+  failed |= require_text(capture, "shellcode_pcap__%s__%s");
+  failed |= require_text(capture, "sha256_hex_file(forensic_path, pcap_sha256)");
   failed |= require_text(agent, "\\\"shellcode_network\\\"");
   failed |= require_text(agent, "\\\"driver_open\\\"");
   failed |= require_text(agent, "\\\"runtime_detail\\\"");

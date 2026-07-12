@@ -6,6 +6,8 @@
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_match.h"
 #include "edr/p0_rule_ir.h"
+#include "edr/policy_enforcement.h"
+#include "edr/policy_v2.h"
 
 #include "edr/adaptive_collection.h"
 #include "edr/ave_sdk.h"
@@ -930,6 +932,7 @@ static void p0_json_escape_or_empty(const char *in, char *out, size_t out_cap, s
 
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
                         const char *mitre_comma) {
+  EdrPolicyEnforcementResult enforcement;
   static int s_debug_enabled = -1;
   if (s_debug_enabled < 0) {
     s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
@@ -966,6 +969,11 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
       }
     }
   }
+
+  if (edr_policy_v2_mode_for_alert(mitre_comma, rule_id) < EDR_POLICY_MODE_ALERT) {
+    return 0;
+  }
+  edr_policy_enforce_alert(br, mitre_comma, rule_id, &enforcement);
 
   if (!p0_global_rate_ok()) {
     if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: global rate limit\n");
@@ -1021,6 +1029,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char esc_psb[1024];
     char esc_clo[256];
     char esc_ect[96];
+    char esc_enforcement_action[96];
+    char esc_enforcement_message[320];
     char parent_name_buf[sizeof(br->parent_name)];
     char parent_path_buf[sizeof(br->parent_path)];
 
@@ -1067,6 +1077,10 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
                             96);
     p0_json_escape_or_empty(br->encoded_command_type[0] ? br->encoded_command_type : "", esc_ect, sizeof(esc_ect),
                             64);
+    p0_json_escape_or_empty(enforcement.action, esc_enforcement_action,
+                            sizeof(esc_enforcement_action), 64);
+    p0_json_escape_or_empty(enforcement.message, esc_enforcement_message,
+                            sizeof(esc_enforcement_message), 160);
 
     int n = snprintf(
         a.user_subject_json, sizeof(a.user_subject_json),
@@ -1105,6 +1119,14 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           "\"powershell_script_block\":\"%s\","
           "\"command_line_origin\":\"%s\","
           "\"encoded_command_type\":\"%s\""
+        "},"
+        "\"enforcement\":{"
+          "\"requested\":%s,"
+          "\"attempted\":%s,"
+          "\"succeeded\":%s,"
+          "\"action\":\"%s\","
+          "\"error_code\":%u,"
+          "\"message\":\"%s\""
         "}"
         "}",
         esc_rule_id,
@@ -1138,7 +1160,13 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
         esc_child,
         esc_psb,
         esc_clo,
-        esc_ect);
+        esc_ect,
+        enforcement.requested ? "true" : "false",
+        enforcement.attempted ? "true" : "false",
+        enforcement.succeeded ? "true" : "false",
+        esc_enforcement_action,
+        enforcement.error_code,
+        esc_enforcement_message);
     if (n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
       a.user_subject_json[0] = 0;
       fprintf(stderr, "[P0] emit_for_rule: user_subject_json overflow (need=%d cap=%zu rule=%s pid=%u)\n",

@@ -262,7 +262,8 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     (void)edr_prop_first_utf8(rec, file_try, sizeof(file_try) / sizeof(file_try[0]),
                               out_event->path, sizeof(out_event->path));
-  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
+  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
+             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0) {
     (void)edr_prop_first_utf8(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]),
                               out_event->registry_path, sizeof(out_event->registry_path));
     if (!out_event->path[0]) {
@@ -453,7 +454,8 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, net_try, sizeof(net_try) / sizeof(net_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
-  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
+  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
+             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {

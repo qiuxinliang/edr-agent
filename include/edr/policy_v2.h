@@ -18,6 +18,7 @@ void edr_policy_v2_configure(const EdrConfig *cfg);
 int edr_policy_v2_apply_remote(EdrConfig *current, const EdrConfig *remote);
 int edr_policy_v2_alert_allowed(const char *triggered_tactics, const char *subject_json);
 int edr_policy_v2_mode_for_category(const char *category);
+int edr_policy_v2_mode_for_alert(const char *triggered_tactics, const char *subject_json);
 int edr_policy_v2_ransomware_enabled(const char *control);
 
 #ifdef __cplusplus

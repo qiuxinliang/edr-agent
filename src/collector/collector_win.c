@@ -38,12 +38,16 @@
 #include <wchar.h>
 
 static WCHAR g_session_name[] = L"EDR_Agent_RT_001";
+static WCHAR g_registry_session_name[] = L"EDR_Agent_KReg_001";
 
 static EdrEventBus *s_bus;
 static DWORD s_agent_pid;
 static TRACEHANDLE s_session_handle = INVALID_PROCESSTRACE_HANDLE;
+static TRACEHANDLE s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
 static HANDLE s_consumer_thread;
 static DWORD s_consumer_thread_id;
+static HANDLE s_registry_consumer_thread;
+static DWORD s_registry_consumer_thread_id;
 static EVT_HANDLE s_security_sub;
 static volatile LONG s_started;
 static EdrCollectorHealth s_health;
@@ -160,6 +164,23 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
       return 1;
     }
     (void)ev_id;
+    return 0;
+  }
+  if (memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0) {
+    *out_tag = "kreg";
+    /* Legacy Registry MOF events expose the operation in Opcode. */
+    if (op == 10u) {
+      *out_type = EDR_EVENT_REG_CREATE_KEY;
+      return 1;
+    }
+    if (op == 12u || op == 15u) {
+      *out_type = EDR_EVENT_REG_DELETE_KEY;
+      return 1;
+    }
+    if (op == 14u) {
+      *out_type = EDR_EVENT_REG_SET_VALUE;
+      return 1;
+    }
     return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) {
@@ -721,6 +742,7 @@ static int edr_agent_self_fuse_should_drop_provider(PEVENT_RECORD event_record) 
   UCHAR op = event_record->EventHeader.EventDescriptor.Opcode;
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0 ||
       memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
@@ -1421,23 +1443,88 @@ static DWORD WINAPI edr_etw_consumer_thread(void *arg) {
   return 0;
 }
 
-void edr_collector_stop_orphan_etw_session(void) {
-  ULONG name_bytes = (ULONG)((wcslen(g_session_name) + 1u) * sizeof(WCHAR));
-  ULONG buffer_size = (ULONG)sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
-  EVENT_TRACE_PROPERTIES *prop =
+static DWORD WINAPI edr_registry_consumer_thread(void *arg) {
+  (void)arg;
+  EVENT_TRACE_LOGFILEW logfile;
+  TRACEHANDLE th;
+  memset(&logfile, 0, sizeof(logfile));
+  logfile.LoggerName = g_registry_session_name;
+  logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                             PROCESS_TRACE_MODE_EVENT_RECORD;
+  logfile.EventRecordCallback = edr_event_record_callback;
+  th = OpenTraceW(&logfile);
+  if (th == INVALID_PROCESSTRACE_HANDLE) {
+    fprintf(stderr, "[collector_win] OpenTraceW failed session=EDR_Agent_KReg_001 err=%lu\n",
+            (unsigned long)GetLastError());
+    return 1u;
+  }
+  (void)ProcessTrace(&th, 1, NULL, NULL);
+  CloseTrace(th);
+  return 0u;
+}
+
+static void edr_stop_named_trace_session(const WCHAR *session_name) {
+  ULONG name_bytes;
+  ULONG buffer_size;
+  EVENT_TRACE_PROPERTIES *prop;
+  ULONG status;
+  if (!session_name || !session_name[0]) {
+    return;
+  }
+  name_bytes = (ULONG)((wcslen(session_name) + 1u) * sizeof(WCHAR));
+  buffer_size = (ULONG)sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
+  prop =
       (EVENT_TRACE_PROPERTIES *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, buffer_size);
   if (!prop) {
     return;
   }
   prop->Wnode.BufferSize = buffer_size;
   prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-  memcpy((BYTE *)prop + prop->LoggerNameOffset, g_session_name, name_bytes);
-  ULONG status = ControlTraceW((TRACEHANDLE)0, g_session_name, prop, EVENT_TRACE_CONTROL_STOP);
+  memcpy((BYTE *)prop + prop->LoggerNameOffset, session_name, name_bytes);
+  status = ControlTraceW((TRACEHANDLE)0, session_name, prop, EVENT_TRACE_CONTROL_STOP);
   if (status != ERROR_SUCCESS && status != ERROR_WMI_INSTANCE_NOT_FOUND) {
-    fprintf(stderr, "[collector_win] orphan ETW cleanup failed session=EDR_Agent_RT_001 status=%lu\n",
-            (unsigned long)status);
+    fprintf(stderr, "[collector_win] orphan ETW cleanup failed status=%lu\n", (unsigned long)status);
   }
   HeapFree(GetProcessHeap(), 0, prop);
+}
+
+void edr_collector_stop_orphan_etw_session(void) {
+  edr_stop_named_trace_session(g_session_name);
+  edr_stop_named_trace_session(g_registry_session_name);
+}
+
+static ULONG edr_start_registry_kernel_session(void) {
+  ULONG name_bytes = (ULONG)((wcslen(g_registry_session_name) + 1u) * sizeof(WCHAR));
+  ULONG buffer_size = (ULONG)sizeof(EVENT_TRACE_PROPERTIES) + name_bytes;
+  EVENT_TRACE_PROPERTIES *prop =
+      (EVENT_TRACE_PROPERTIES *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, buffer_size);
+  ULONG status;
+  if (!prop) {
+    return ERROR_OUTOFMEMORY;
+  }
+  prop->Wnode.BufferSize = buffer_size;
+  prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+  prop->Wnode.ClientContext = 1u;
+  prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+  memcpy((BYTE *)prop + prop->LoggerNameOffset, g_registry_session_name, name_bytes);
+  prop->BufferSize = 32u;
+  prop->MinimumBuffers = 8u;
+  prop->MaximumBuffers = 32u;
+  prop->FlushTimer = 1u;
+  prop->EnableFlags = EVENT_TRACE_FLAG_REGISTRY;
+  prop->LogFileMode = EVENT_TRACE_REAL_TIME_MODE |
+                      EVENT_TRACE_SYSTEM_LOGGER_MODE |
+                      EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
+  status = StartTraceW(&s_registry_session_handle, g_registry_session_name, prop);
+  if (status == ERROR_ALREADY_EXISTS) {
+    edr_stop_named_trace_session(g_registry_session_name);
+    status = StartTraceW(&s_registry_session_handle, g_registry_session_name, prop);
+  }
+  HeapFree(GetProcessHeap(), 0, prop);
+  if (status != ERROR_SUCCESS) {
+    s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
+  }
+  return status;
 }
 
 static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
@@ -1594,6 +1681,26 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     return EDR_ERR_ETW_PROVIDER_ENABLE;
   }
 
+  status = edr_start_registry_kernel_session();
+  if (status != ERROR_SUCCESS) {
+    fprintf(stderr,
+            "[collector_win] kernel registry session unavailable status=%lu; "
+            "manifest provider remains enabled\n",
+            (unsigned long)status);
+  } else {
+    s_registry_consumer_thread = CreateThread(NULL, 0, edr_registry_consumer_thread,
+                                               NULL, 0, &s_registry_consumer_thread_id);
+    if (!s_registry_consumer_thread) {
+      EVENT_TRACE_PROPERTIES stop = {0};
+      stop.Wnode.BufferSize = sizeof(stop);
+      ControlTraceW(s_registry_session_handle, g_registry_session_name, &stop,
+                    EVENT_TRACE_CONTROL_STOP);
+      s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
+      fprintf(stderr, "[collector_win] kernel registry consumer thread create failed err=%lu\n",
+              (unsigned long)GetLastError());
+    }
+  }
+
   edr_start_security_eventlog_subscription();
 
   s_consumer_thread =
@@ -1603,6 +1710,16 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     stop.Wnode.BufferSize = sizeof(stop);
     ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
+    if (s_registry_session_handle != INVALID_PROCESSTRACE_HANDLE) {
+      ControlTraceW(s_registry_session_handle, g_registry_session_name, &stop,
+                    EVENT_TRACE_CONTROL_STOP);
+      s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (s_registry_consumer_thread) {
+      WaitForSingleObject(s_registry_consumer_thread, 30000);
+      CloseHandle(s_registry_consumer_thread);
+      s_registry_consumer_thread = NULL;
+    }
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_INTERNAL;
   }
@@ -1622,6 +1739,14 @@ void edr_collector_stop(void) {
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
   }
 
+  if (s_registry_session_handle != INVALID_PROCESSTRACE_HANDLE) {
+    EVENT_TRACE_PROPERTIES stop = {0};
+    stop.Wnode.BufferSize = sizeof(stop);
+    ControlTraceW(s_registry_session_handle, g_registry_session_name, &stop,
+                  EVENT_TRACE_CONTROL_STOP);
+    s_registry_session_handle = INVALID_PROCESSTRACE_HANDLE;
+  }
+
   if (s_security_sub) {
     EvtClose(s_security_sub);
     s_security_sub = NULL;
@@ -1633,8 +1758,15 @@ void edr_collector_stop(void) {
     s_consumer_thread = NULL;
   }
 
+  if (s_registry_consumer_thread) {
+    WaitForSingleObject(s_registry_consumer_thread, 30000);
+    CloseHandle(s_registry_consumer_thread);
+    s_registry_consumer_thread = NULL;
+  }
+
   s_agent_self_fuse_provider_degraded = 0;
   s_consumer_thread_id = 0u;
+  s_registry_consumer_thread_id = 0u;
   s_bus = NULL;
   s_collector_cfg = NULL;
 }

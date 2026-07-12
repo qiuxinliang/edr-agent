@@ -303,7 +303,9 @@ add_test(NAME windows_event_policy COMMAND test_windows_event_policy WORKING_DIR
 add_executable(test_p0_direct_emit_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_direct_emit_suppression.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_enforcement.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_p0_direct_emit_suppression PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)
 edr_apply_common_warnings(test_p0_direct_emit_suppression)

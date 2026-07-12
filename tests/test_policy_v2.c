@@ -23,6 +23,9 @@ int main(void) {
   assert(!edr_policy_v2_alert_allowed("T1003", "{}"));
   assert(!edr_policy_v2_alert_allowed("T1021", "{}"));
   assert(edr_policy_v2_alert_allowed("T1059.001", "{}"));
+  assert(edr_policy_v2_mode_for_alert("T1059.001", "{}") == EDR_POLICY_MODE_ALERT);
+  assert(edr_policy_v2_mode_for_alert("T1505.003", "{}") == EDR_POLICY_MODE_BLOCK);
+  assert(edr_policy_v2_mode_for_alert("", "{\"rule_id\":\"unknown\"}") == EDR_POLICY_MODE_ALERT);
   assert(edr_policy_v2_alert_allowed("T1505.003", "{\"rule_id\":\"webshell\"}"));
   assert(edr_policy_v2_alert_allowed("", "{\"rule_id\":\"unknown\"}"));
   assert(edr_policy_v2_ransomware_enabled("mass_write"));

@@ -230,6 +230,52 @@ static int sha256_hex_buf(const uint8_t *data, size_t len, char out65[65]) {
   return 0;
 }
 
+static int sha256_hex_file(const char *path, char out65[65]) {
+  HCRYPTPROV hProv = 0;
+  HCRYPTHASH hHash = 0;
+  FILE *file = NULL;
+  uint8_t buffer[8192];
+  BYTE digest[32];
+  DWORD digest_len = sizeof(digest);
+  static const char hex[] = "0123456789abcdef";
+  size_t n;
+  if (!path || !path[0] || !out65) {
+    return -1;
+  }
+  out65[0] = '\0';
+  file = fopen(path, "rb");
+  if (!file || !CryptAcquireContextA(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) ||
+      !CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+    if (hHash) CryptDestroyHash(hHash);
+    if (hProv) CryptReleaseContext(hProv, 0);
+    if (file) fclose(file);
+    return -1;
+  }
+  while ((n = fread(buffer, 1u, sizeof(buffer), file)) > 0u) {
+    if (!CryptHashData(hHash, buffer, (DWORD)n, 0)) {
+      CryptDestroyHash(hHash);
+      CryptReleaseContext(hProv, 0);
+      fclose(file);
+      return -1;
+    }
+  }
+  if (ferror(file) || !CryptGetHashParam(hHash, HP_HASHVAL, digest, &digest_len, 0) || digest_len != sizeof(digest)) {
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    fclose(file);
+    return -1;
+  }
+  for (size_t i = 0; i < sizeof(digest); i++) {
+    out65[i * 2u] = hex[digest[i] >> 4u];
+    out65[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out65[64] = '\0';
+  CryptDestroyHash(hHash);
+  CryptReleaseContext(hProv, 0);
+  fclose(file);
+  return 0;
+}
+
 static void mkdir_p_win(const char *dir) {
   if (!dir || !dir[0]) {
     return;
@@ -859,7 +905,19 @@ static int push_alert(double score, const char *detector_label, const char *rule
   }
   /* 告警先入总线；大文件上传在检测worker尾部执行，不阻塞WinDivert捕获路径。 */
   if (wrote_pcap_ok && forensic_path[0]) {
-    if (edr_transport_v2_upload_file(forensic_stem[0] ? forensic_stem : "shellcode_pcap", forensic_path, "",
+    /*
+     * The alert is generated before the asynchronous upload completes. Carry
+     * its immutable source ID in the upload ID so the server can persist a
+     * durable evidence record even when the alert and upload arrive out of
+     * order. This is deliberately not a command ID.
+     */
+    char pcap_upload_id[320];
+    char pcap_sha256[65];
+    snprintf(pcap_upload_id, sizeof(pcap_upload_id), "shellcode_pcap__%s__%s", alert_id,
+             forensic_stem[0] ? forensic_stem : "pcap");
+    pcap_sha256[0] = '\0';
+    (void)sha256_hex_file(forensic_path, pcap_sha256);
+    if (edr_transport_v2_upload_file(pcap_upload_id, forensic_path, pcap_sha256,
                                      pcap_object_key, sizeof(pcap_object_key)) != 0 || !pcap_object_key[0]) {
       fprintf(stderr, "[shellcode_detector] pcap upload failed artifact_ref=%s\n",
               forensic_stem[0] ? forensic_stem : "shellcode_pcap");
