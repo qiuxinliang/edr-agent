@@ -300,6 +300,37 @@ function Get-ExistingAgentTomlMtlsIssue {
   return ""
 }
 
+function Get-ExistingAgentTomlRequestSigningIssue {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return "missing TOML"
+  }
+  try {
+    $raw = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($Path)))
+  } catch {
+    return ("unreadable TOML: " + $_.Exception.Message)
+  }
+  $sectionMatch = [regex]::Match(
+    $raw,
+    '(?ms)^\s*\[platform\.request_signing\]\s*$\s*(?<body>.*?)(?=^\s*\[|\z)'
+  )
+  if (-not $sectionMatch.Success) {
+    return "missing [platform.request_signing] enrollment credentials"
+  }
+  $section = $sectionMatch.Groups['body'].Value
+  if ($section -match '(?m)^\s*enabled\s*=\s*false\s*(?:#.*)?$') {
+    return ""
+  }
+  if ($section -notmatch '(?m)^\s*enabled\s*=\s*true\s*(?:#.*)?$') {
+    return "platform request signing state is missing"
+  }
+  if ($section -notmatch '(?m)^\s*key_id\s*=\s*"[^\"]+"\s*(?:#.*)?$' -or
+      $section -notmatch '(?m)^\s*secret\s*=\s*"[^\"]+"\s*(?:#.*)?$') {
+    return "platform request signing credentials are incomplete"
+  }
+  return ""
+}
+
 function Test-ExistingAgentTomlWithAgent {
   param([string]$InstallRoot, [string]$ConfigPath)
   if (-not $InstallRoot -or -not $ConfigPath) {
@@ -1016,6 +1047,9 @@ if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
   if (-not $existingTomlIssue) {
     $existingTomlIssue = Get-ExistingAgentTomlMtlsIssue -Path $Output
   }
+  if (-not $existingTomlIssue -and $env:EDR_ALLOW_LEGACY_UNSIGNED_CONFIG -ne "1") {
+    $existingTomlIssue = Get-ExistingAgentTomlRequestSigningIssue -Path $Output
+  }
   if ($existingTomlIssue) {
     Write-Warning ("Existing agent.toml is invalid ({0}); backing it up and re-enrolling." -f $existingTomlIssue)
     $backupPath = Backup-InvalidAgentToml -Path $Output
@@ -1375,6 +1409,14 @@ $ConfigSigningKeyID = if ($d.config_signing_key_id) { [string]$d.config_signing_
 $ConfigSigningPublicKeyPEM = if ($d.config_signing_public_key_pem) { [string]$d.config_signing_public_key_pem } else { "" }
 $ConfigSignatureRequired = if ($null -ne $d.config_signature_required) { [bool]$d.config_signature_required } else { [bool]($ConfigSigningKeyID -and $ConfigSigningPublicKeyPEM) }
 $CommandSigningPublicKeyPEM = if ($d.command_signing_public_key_pem) { [string]$d.command_signing_public_key_pem } else { "" }
+$RequestSigningEnabled = if ($null -ne $d.request_signing_enabled) { [bool]$d.request_signing_enabled } else { $false }
+$RequestSigningRequired = if ($null -ne $d.request_signing_required) { [bool]$d.request_signing_required } else { $false }
+$RequestSigningKeyID = if ($d.request_signing_key_id) { [string]$d.request_signing_key_id } else { "" }
+$RequestSigningSecret = if ($d.request_signing_secret) { [string]$d.request_signing_secret } else { "" }
+if (($RequestSigningEnabled -or $RequestSigningRequired) -and
+    (-not $RequestSigningKeyID -or -not $RequestSigningSecret)) {
+  Write-Error "enroll response enabled request signing but did not include key_id and secret"
+}
 $RulesURL = if ($d.rules_url) { [string]$d.rules_url } else { "$agentApiBase/agent/rules.toml" }
 $P0BundleURL = if ($d.p0_bundle_url) { [string]$d.p0_bundle_url } else { "$agentApiBase/agent/p0-bundle.enc" }
 $SensorInterestURL = if ($d.sensor_interest_url) { [string]$d.sensor_interest_url } else { "$agentApiBase/agent/sensor-interest.json" }
@@ -1635,6 +1677,9 @@ function Merge-EnrollIntoAgentTomlExample {
     [AllowEmptyString()][string]$ConfigSigningKeyID,
     [AllowEmptyString()][string]$ConfigSigningPublicKeyPEM,
     [Parameter(Mandatory = $true)][bool]$ConfigSignatureRequired,
+    [Parameter(Mandatory = $true)][bool]$RequestSigningEnabled,
+    [AllowEmptyString()][string]$RequestSigningKeyID,
+    [AllowEmptyString()][string]$RequestSigningSecret,
     [AllowEmptyString()][string]$CertStore,
     [AllowEmptyString()][string]$CertThumbprint,
     [AllowEmptyString()][string]$Pkcs11ModulePath,
@@ -1859,6 +1904,12 @@ function Merge-EnrollIntoAgentTomlExample {
       $merged += ('public_key_pem = "{0}"' -f (Escape-Toml (Format-TomlInlinePem $ConfigSigningPublicKeyPEM))) + "`n"
     }
   }
+  if ($merged -notmatch '(?m)^\s*\[platform\.request_signing\]\s*$') {
+    $merged += "`n[platform.request_signing]`n"
+    $merged += ('enabled = {0}' -f (Format-TomlBool $RequestSigningEnabled)) + "`n"
+    $merged += ('key_id = "{0}"' -f (Escape-Toml $RequestSigningKeyID)) + "`n"
+    $merged += ('secret = "{0}"' -f (Escape-Toml $RequestSigningSecret)) + "`n"
+  }
   if ($merged -notmatch '(?m)^\s*\[health_monitor\]\s*$') {
     $merged += "`n[health_monitor]`n"
     $merged += "enabled              = true`n"
@@ -2048,6 +2099,11 @@ proxy_mode           = "$(Escape-Toml $ProxyMode)"
 proxy_url            = "$(Escape-Toml $ProxyUrl)"
 relay_url            = "$(Escape-Toml $RelayUrl)"
 
+[platform.request_signing]
+enabled              = $(Format-TomlBool $RequestSigningEnabled)
+key_id               = "$(Escape-Toml $RequestSigningKeyID)"
+secret               = "$(Escape-Toml $RequestSigningSecret)"
+
 [collection]
 etw_enabled          = true
 ebpf_enabled         = false
@@ -2202,6 +2258,8 @@ if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $ex
       -RuntimePolicyURL $RuntimePolicyURL -VersionURL $VersionURL -DownloadURL $DownloadURL `
       -ConfigSigningKeyID $ConfigSigningKeyID -ConfigSigningPublicKeyPEM $ConfigSigningPublicKeyPEM `
       -ConfigSignatureRequired $ConfigSignatureRequired `
+      -RequestSigningEnabled $RequestSigningEnabled -RequestSigningKeyID $RequestSigningKeyID `
+      -RequestSigningSecret $RequestSigningSecret `
       -CertStore $EffectiveCertStore -CertThumbprint $EffectiveCertThumbprint `
       -Pkcs11ModulePath $Pkcs11Module -Pkcs11Uri $Pkcs11KeyUri -TpmUri $TpmKeyUri
     $tomlSource = "template:$examplePath"

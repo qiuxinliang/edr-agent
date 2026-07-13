@@ -5898,11 +5898,14 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   file = fopen(file_path, "rb");
   if (!file) {
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_open");
+    note_upload_failure();
     runtime_failure("http upload file read failed");
     return -1;
   }
   if (fseek(file, 0, SEEK_END) != 0) {
     fclose(file);
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+    note_upload_failure();
     runtime_failure("http upload file seek failed");
     return -1;
   }
@@ -5911,6 +5914,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   if (sz < 0 || (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
     fclose(file);
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_too_large");
+    note_upload_failure();
     runtime_failure("http upload file too large");
     return -1;
   }
@@ -5918,6 +5922,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   if (fseek(file, 0, SEEK_SET) != 0) {
     fclose(file);
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+    note_upload_failure();
     runtime_failure("http upload file seek failed");
     return -1;
   }
@@ -5940,6 +5945,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     if (rc != -2) {
       if (http2_required() || store_mtls_curl) {
         fclose(file);
+        snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_h2");
+        note_upload_failure();
         runtime_failure(store_mtls_curl
                             ? "Schannel store-backed mTLS upload failed"
                             : "HTTP/2 required but h2 upload failed");
@@ -5947,6 +5954,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       }
       if (fseek(file, 0, SEEK_SET) != 0) {
         fclose(file);
+        snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+        note_upload_failure();
         runtime_failure("http upload file seek failed");
         return -1;
       }
@@ -5955,6 +5964,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
 #endif
   if (http2_required() && !s_request_signing.enabled) {
     fclose(file);
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_h2_required");
+    note_upload_failure();
     runtime_failure("HTTP/2 required but h2 upload transport unavailable");
     return -1;
   }
@@ -5965,6 +5976,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   fname = json_escape_alloc(filename);
   if (!uid || !eid || !sha || !fname) {
     fclose(file);
+    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_build");
+    note_upload_failure();
     free(uid);
     free(eid);
     free(sha);
@@ -5988,6 +6001,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     sig_body = (char *)malloc(body_len ? body_len : 1u);
     if (!sig_body) {
       fclose(file);
+      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_build");
+      note_upload_failure();
       free(uid);
       free(eid);
       free(sha);
@@ -6002,6 +6017,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       free(eid);
       free(sha);
       free(fname);
+      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_read");
+      note_upload_failure();
       runtime_failure("http upload file read failed");
       return -1;
     }
@@ -6013,6 +6030,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       free(eid);
       free(sha);
       free(fname);
+      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+      note_upload_failure();
       runtime_failure("http upload file seek failed");
       return -1;
     }

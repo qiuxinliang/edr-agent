@@ -46,6 +46,12 @@ int main(void) {
       "yara_scan", EdrCmdExecOk, 0, existing, out, sizeof(out));
   require_true(result == existing, "existing unified result is not double wrapped");
 
+  const char *yara_v1 =
+      "{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"success\",\"matched\":false}";
+  result = edr_command_normalize_forensic_result(
+      "yara_scan", EdrCmdExecOk, 0, yara_v1, out, sizeof(out));
+  require_true(result == yara_v1, "dedicated YARA result is not double wrapped");
+
   const char *pmfe_v1 =
       "{\"schema\":\"pmfe_result_v1\",\"status\":\"completed_clean\"}";
   result = edr_command_normalize_forensic_result(

@@ -1601,7 +1601,24 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   int ort_policy = agent && agent->cfg.ave.enabled && agent->cfg.ave.static_model_enabled;
   int sqlite_policy = agent && agent->cfg.offline.queue_db_path[0];
   int velo_policy = edr_response_forensic_external_enabled();
+  int yara_external_policy = edr_response_yara_external_enabled();
+  int artifact_upload_configured = agent && http_rt && http_rt->configured && http_rt->mtls_configured &&
+      agent->cfg.platform.request_signing.enabled &&
+      agent->cfg.platform.request_signing.key_id[0] &&
+      agent->cfg.platform.request_signing.secret[0];
+  int artifact_upload_failed = http_rt &&
+      (strncmp(http_rt->upload_status, "failed", 6u) == 0 ||
+       strstr(http_rt->http2_last_error, "upload-file") != NULL);
+  const char *artifact_upload_runtime = !(http_rt && http_rt->configured && http_rt->mtls_configured)
+                                            ? "unavailable"
+                                        : !artifact_upload_configured ? "degraded"
+                                        : artifact_upload_failed ? "degraded"
+                                        : http_rt->upload_ok_count > 0u ? "healthy" : "idle";
   int yara_command_build = yara_build || velo_policy;
+  int yara_command_policy = yara_external_policy ? (velo_policy && artifact_upload_configured) : yara_build;
+  const char *yara_command_runtime = !yara_command_build ? "unavailable"
+                                     : !yara_command_policy ? "degraded"
+                                     : yara_external_policy ? artifact_upload_runtime : "healthy";
   int memory_command_build = windows_native || velo_policy;
   const char *allow_unsigned = getenv("EDR_COMMAND_ALLOW_UNSIGNED");
   int signing_policy = !(allow_unsigned && allow_unsigned[0] == '1');
@@ -1632,10 +1649,18 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   EdrAlertGovernorStats alert_stats;
   EdrShellcodeDetectorRuntime shellcode_rt;
   char endpoint_policy_capability[2048];
+  char artifact_upload_capability[512];
   memset(&alert_stats, 0, sizeof(alert_stats));
   memset(&shellcode_rt, 0, sizeof(shellcode_rt));
   edr_alert_governor_get_stats(&alert_stats);
   edr_shellcode_detector_get_runtime(&shellcode_rt);
+  snprintf(artifact_upload_capability, sizeof(artifact_upload_capability),
+           "\"artifact_upload\":{\"code_supported\":true,\"build_supported\":true,"
+           "\"policy_enabled\":%s,\"runtime_status\":\"%s\","
+           "\"request_signing_configured\":%s,\"upload_status\":\"%s\"},",
+           artifact_upload_configured ? "true" : "false", artifact_upload_runtime,
+           artifact_upload_configured ? "true" : "false",
+           http_rt && http_rt->upload_status[0] ? http_rt->upload_status : "unknown");
   snprintf(endpoint_policy_capability, sizeof(endpoint_policy_capability),
            "\"endpoint_policy\":{\"schema\":\"edr.endpoint.policy.v2\","
            "\"category_modes\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":true,\"runtime_status\":\"healthy\"},"
@@ -1682,12 +1707,13 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"http2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"zstd\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"velociraptor\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "%s"
       "\"command_signing\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}},"
       "\"commands\":{"
       "\"rtq_execute\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
       "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
-      "\"yara_scan\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"yara_scan\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"artifact_upload_required\":%s},"
       "\"memory_dump\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"targeted_forensic\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
       "\"targeted_forensic_file\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
@@ -1722,12 +1748,13 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       http2_build ? "true" : "false", http_rt && http_rt->http2_enabled ? "true" : "false", http2_runtime,
       zstd_build ? "true" : "false", http_rt && http_rt->zstd_requested ? "true" : "false", zstd_runtime,
       velo_policy ? "true" : "false", velo_runtime,
+      artifact_upload_capability,
       signing_build ? "true" : "false", signing_policy ? "true" : "false", signing_runtime,
       rtq_policy ? "true" : "false",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
-      yara_command_build ? "true" : "false", yara_command_build ? "true" : "false",
-      yara_build ? "healthy" : (velo_policy ? "idle" : "unavailable"),
+      yara_command_build ? "true" : "false", yara_command_policy ? "true" : "false",
+      yara_command_runtime, yara_external_policy ? "true" : "false",
       memory_command_build ? "true" : "false", dangerous_policy ? "true" : "false",
       windows_native ? "healthy" : (velo_policy ? "idle" : "unavailable"),
       dangerous_policy ? "true" : "false",

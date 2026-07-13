@@ -30,6 +30,7 @@ int edr_response_forensic_run_external(const char *cmd_id, const char *scope, co
                                        size_t detail_cap);
 /* 取证外移是否启用(EDR_FORENSIC_COLLECTOR=1)。 */
 int edr_response_forensic_external_enabled(void);
+int edr_response_yara_external_enabled(void);
 
 /* ── 取证异步生命周期(velo 采集硬取消支持)──
  * 受理:由 5 个 forensic 处理器在外移启用时调用,非阻塞 spawn + 登记单槽任务。

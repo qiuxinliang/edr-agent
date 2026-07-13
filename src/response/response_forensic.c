@@ -85,6 +85,29 @@ static void forensic_result_json(char *out, size_t out_cap, const char *status,
            upload_status ? upload_status : "not_requested", error_esc);
 }
 
+static void yara_artifact_result_json(char *out, size_t out_cap, const char *status,
+                                      const char *source, const char *artifact, const char *sha256,
+                                      const char *object_key, const char *upload_status,
+                                      const char *error, int partial) {
+  char source_esc[96], artifact_esc[1200], key_esc[1200], error_esc[600];
+  response_json_escape(source ? source : "", source_esc, sizeof(source_esc));
+  response_json_escape(artifact ? artifact : "", artifact_esc, sizeof(artifact_esc));
+  response_json_escape(object_key ? object_key : "", key_esc, sizeof(key_esc));
+  response_json_escape(error ? error : "", error_esc, sizeof(error_esc));
+  snprintf(out, out_cap,
+           "{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"%s\","
+           "\"source\":\"%s\",\"engine\":\"%s\",\"scan_status\":\"artifact_only\","
+           "\"artifact\":\"%s\",\"sha256\":\"%s\",\"object_key\":\"%s\","
+           "\"upload_status\":\"%s\",\"truncated\":false,\"error\":\"%s\","
+           "\"warnings\":[\"%s\"]}",
+           status ? status : "failed", source_esc, source_esc, artifact_esc,
+           sha256 ? sha256 : "", key_esc,
+           upload_status ? upload_status : "not_requested", error_esc,
+           error_esc[0] ? error_esc :
+           partial ? "collector completed with warnings; inspect the uploaded artifact for full results" :
+                     "external collector returned an evidence artifact; inline match status is unavailable");
+}
+
 /* ── 取证 YARA 真引擎（libyara，构建启用 EDR_WITH_YARA 时可用） ──
  * 规则来源优先级:命令 payload 内联 rules > [command].forensic_yara_rules_dir >
  * EDR_YARA_RULES_DIR > rules/forensic。scan 回调收集命中规则名。
@@ -464,6 +487,19 @@ static int forensic_external_enabled(void) {
   return 0;
 #endif
 }
+
+static int yara_external_enabled(void) {
+  const char *mode = getenv("EDR_YARA_EXECUTION");
+  if (mode && mode[0]) {
+    if (strcmp(mode, "external") == 0 || strcmp(mode, "collector") == 0) return 1;
+    if (strcmp(mode, "local") == 0 || strcmp(mode, "libyara") == 0) return 0;
+  }
+#ifdef EDR_HAVE_YARA
+  return 0;
+#else
+  return forensic_external_enabled();
+#endif
+}
 static int forensic_external_required(void) {
   const char *e = getenv("EDR_FORENSIC_COLLECTOR_STRICT");
   return e && e[0] == '1';
@@ -587,6 +623,7 @@ int edr_response_forensic_run_external(const char *cmd_id, const char *scope, co
 }
 
 int edr_response_forensic_external_enabled(void) { return forensic_external_enabled(); }
+int edr_response_yara_external_enabled(void) { return yara_external_enabled(); }
 
 /* ════════════════════════ 取证异步生命周期(单槽 + 锁) ════════════════════════
  * 受理在命令线程、收割在主循环线程、取消在命令线程、关闭在主循环线程 → 跨线程共享 g_fx,加锁。
@@ -703,14 +740,19 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
   minio_key[0] = '\0';
   if (cancelled) {
     char result[1200];
-    forensic_result_json(result, sizeof(result), "cancelled", "external_collector", "", "", "",
-                         0, "not_requested", "forensic cancelled by operator");
+    if (command_type && strcmp(command_type, "yara_scan") == 0) {
+      yara_artifact_result_json(result, sizeof(result), "cancelled", "external_collector", "", "", "",
+                                "not_requested", "YARA scan cancelled by operator", 0);
+    } else {
+      forensic_result_json(result, sizeof(result), "cancelled", "external_collector", "", "", "",
+                           0, "not_requested", "forensic cancelled by operator");
+    }
     edr_cmd_inc_exec_fail();
     edr_command_emit_always_typed_status(cmd_id, command_type, sm, EdrCmdExecFailed, 130,
                                          result, "cancelled");
     return;
   }
-  if (rc == 0) {
+  if (rc == 0 || rc == 2) {
     int upload_rc = 0;
     char sha[65];
     char result[2600];
@@ -719,14 +761,27 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
     (void)response_file_sha256(artifact, sha);
     if (do_upload) upload_rc = edr_transport_v2_upload_file(cmd_id, artifact, sha, minio_key, sizeof(minio_key));
     if (do_upload && (upload_rc != 0 || !minio_key[0])) {
-      forensic_result_json(result, sizeof(result), "failed", source, artifact, sha, minio_key, 0,
-                           "failed", "artifact collected but upload failed; no durable remote result");
+      if (command_type && strcmp(command_type, "yara_scan") == 0) {
+        yara_artifact_result_json(result, sizeof(result), "failed", source, artifact, sha, minio_key,
+                                  "failed", "artifact collected but upload failed; no durable remote result",
+                                  rc == 2);
+      } else {
+        forensic_result_json(result, sizeof(result), "failed", source, artifact, sha, minio_key, 0,
+                             "failed", "artifact collected but upload failed; no durable remote result");
+      }
       edr_cmd_inc_exec_fail();
       edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecFailed, 9, result);
       return;
     }
-    forensic_result_json(result, sizeof(result), "success", source, artifact, sha, minio_key, 0,
-                         do_upload ? "ok" : "not_requested", "");
+    if (command_type && strcmp(command_type, "yara_scan") == 0) {
+      yara_artifact_result_json(result, sizeof(result), rc == 2 ? "partial_success" : "success",
+                                source, artifact, sha, minio_key,
+                                do_upload ? "ok" : "not_requested", "", rc == 2);
+    } else {
+      forensic_result_json(result, sizeof(result), rc == 2 ? "partial_success" : "success",
+                           source, artifact, sha, minio_key, 0,
+                           do_upload ? "ok" : "not_requested", "");
+    }
     edr_cmd_inc_handled();
     edr_cmd_inc_exec_ok();
     edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecOk, 0, result);
@@ -734,9 +789,15 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
     edr_cmd_inc_exec_fail();
     char fail[1200], error[300];
     snprintf(error, sizeof(error), "forensic external failed(%s) rc=%d", tier ? tier : "unknown", rc);
-    forensic_result_json(fail, sizeof(fail), "failed",
-                         tier && strcmp(tier, "velo") == 0 ? "velociraptor" : "builtin",
-                         artifact, "", "", 0, "not_requested", error);
+    if (command_type && strcmp(command_type, "yara_scan") == 0) {
+      yara_artifact_result_json(fail, sizeof(fail), "failed",
+                                tier && strcmp(tier, "velo") == 0 ? "velociraptor" : "builtin",
+                                artifact, "", "", "not_requested", error, 0);
+    } else {
+      forensic_result_json(fail, sizeof(fail), "failed",
+                           tier && strcmp(tier, "velo") == 0 ? "velociraptor" : "builtin",
+                           artifact, "", "", 0, "not_requested", error);
+    }
     edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecFailed, 6, fail);
   }
 }
@@ -1453,7 +1514,7 @@ static void yara_emit_json_result(const char *cmd_id, const EdrSoarCommandMeta *
                                            ? "partial_success" : "success")
                                     : "failed";
   snprintf(detail, sizeof(detail),
-           "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"%s\",\"source\":\"%s\","
+           "{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"%s\",\"source\":\"%s\","
            "\"artifact\":\"%s\",\"sha256\":\"\",\"object_key\":\"\",\"truncated\":false,"
            "\"upload_status\":\"not_requested\",\"error\":\"%s\",\"scan_status\":\"%s\","
            "\"target_type\":\"file\",\"target_path\":\"%s\",\"engine\":\"%s\","
@@ -1493,18 +1554,21 @@ typedef struct {
   int max_depth;
   long max_bytes;
   int recursive;
+  int visited;
   int scanned;
   int matched_files;
   int skipped;
   int matches_returned;
   int matches_truncated;
   long bytes_scanned;
-  const char *payload;
-  size_t payload_len;
+  int exclude_count;
+  char exclude_paths[64][1024];
   char matches_json[4096];
   char warnings[512];
   const char *command_id;
   int cancelled;
+  int max_files_reached;
+  int max_depth_reached;
 } YaraDirCtx;
 
 static void yd_append_warning(YaraDirCtx *ctx, const char *msg) {
@@ -1513,13 +1577,66 @@ static void yd_append_warning(YaraDirCtx *ctx, const char *msg) {
   strncat(ctx->warnings, msg, sizeof(ctx->warnings) - strlen(ctx->warnings) - 1);
 }
 
+static void yd_normalize_path(const char *input, char *out, size_t cap) {
+  size_t used = 0;
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  if (!input) return;
+  for (const unsigned char *p = (const unsigned char *)input; *p && used + 1u < cap; p++) {
+    unsigned char ch = *p == '\\' ? '/' : *p;
+#ifdef _WIN32
+    ch = (unsigned char)tolower(ch);
+#endif
+    if (ch == '/' && used > 0u && out[used - 1u] == '/') continue;
+    out[used++] = (char)ch;
+  }
+  while (used > 1u && out[used - 1u] == '/') used--;
+  out[used] = '\0';
+}
+
+static void yd_load_excludes(YaraDirCtx *ctx, const uint8_t *payload, size_t payload_len) {
+  if (!ctx || !payload || payload_len == 0u) return;
+  cJSON *root = cJSON_ParseWithLength((const char *)payload, payload_len);
+  if (!root) {
+    yd_append_warning(ctx, "exclude_paths could not be parsed");
+    return;
+  }
+  cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "exclude_paths");
+  if (cJSON_IsArray(items)) {
+    int count = cJSON_GetArraySize(items);
+    for (int i = 0; i < count && ctx->exclude_count < 64; i++) {
+      cJSON *item = cJSON_GetArrayItem(items, i);
+      if (!cJSON_IsString(item) || !item->valuestring || !item->valuestring[0]) continue;
+      yd_normalize_path(item->valuestring, ctx->exclude_paths[ctx->exclude_count],
+                        sizeof(ctx->exclude_paths[ctx->exclude_count]));
+      if (ctx->exclude_paths[ctx->exclude_count][0]) ctx->exclude_count++;
+    }
+    if (count > 64) yd_append_warning(ctx, "exclude_paths truncated to 64 entries");
+  }
+  cJSON_Delete(root);
+}
+
 static int yd_is_excluded(YaraDirCtx *ctx, const char *path) {
-  if (!ctx || !ctx->payload || !path || !path[0]) return 0;
-  return response_memmem(ctx->payload, ctx->payload_len, path, strlen(path)) != NULL;
+  if (!ctx || !path || !path[0] || ctx->exclude_count <= 0) return 0;
+  char normalized[1200];
+  yd_normalize_path(path, normalized, sizeof(normalized));
+  for (int i = 0; i < ctx->exclude_count; i++) {
+    const char *excluded = ctx->exclude_paths[i];
+    size_t excluded_len = strlen(excluded);
+    if (strcmp(normalized, excluded) == 0 ||
+        (strncmp(normalized, excluded, excluded_len) == 0 && normalized[excluded_len] == '/')) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static int yd_scan_file(YaraDirCtx *ctx, const char *path) {
-  if (!ctx || !path || !path[0] || ctx->scanned >= ctx->max_files) return 0;
+  if (!ctx || !path || !path[0] || ctx->visited >= ctx->max_files) {
+    if (ctx && ctx->visited >= ctx->max_files) ctx->max_files_reached = 1;
+    return 0;
+  }
+  ctx->visited++;
   if (edr_command_cancel_requested(ctx->command_id)) { ctx->cancelled = 1; return 0; }
   if (yd_is_excluded(ctx, path)) { ctx->skipped++; return 0; }
   FILE *f = fopen(path, "rb");
@@ -1568,7 +1685,7 @@ static void yara_emit_dir_result(const char *cmd_id, const EdrSoarCommandMeta *s
   snprintf(warnings, sizeof(warnings), "%s%s%s", warn_esc[0] ? "[\"" : "[]", warn_esc[0] ? warn_esc : "", warn_esc[0] ? "\"]" : "");
   char detail[8192];
   snprintf(detail, sizeof(detail),
-           "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"success\",\"source\":\"libyara\","
+           "{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"success\",\"source\":\"libyara\","
            "\"artifact\":\"%s\",\"sha256\":\"\",\"object_key\":\"\","
            "\"truncated\":%s,\"upload_status\":\"not_requested\",\"error\":\"\","
            "\"scan_status\":\"completed\",\"target_type\":\"directory\",\"target_path\":\"%s\","
@@ -1583,7 +1700,7 @@ static void yara_emit_dir_result(const char *cmd_id, const EdrSoarCommandMeta *s
 
 #ifdef _WIN32
 static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
-  if (!ctx || !dir || ctx->scanned >= ctx->max_files || depth > ctx->max_depth) return;
+  if (!ctx || !dir || ctx->visited >= ctx->max_files || depth > ctx->max_depth) return;
   if (edr_command_cancel_requested(ctx->command_id)) { ctx->cancelled = 1; return; }
   char pat[1100]; snprintf(pat, sizeof(pat), "%s\\*", dir);
   WIN32_FIND_DATAA ffd; HANDLE h = FindFirstFileA(pat, &ffd);
@@ -1591,16 +1708,19 @@ static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
   do {
     if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
     char full[1200]; snprintf(full, sizeof(full), "%s\\%s", dir, ffd.cFileName);
-    if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) { if (ctx->recursive) yd_walk(ctx, full, depth + 1); }
+    if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+      if (ctx->recursive && depth < ctx->max_depth) yd_walk(ctx, full, depth + 1);
+      else if (ctx->recursive) ctx->max_depth_reached = 1;
+    }
     else yd_scan_file(ctx, full);
     if (ctx->cancelled) break;
-    if (ctx->scanned >= ctx->max_files) break;
+    if (ctx->visited >= ctx->max_files) { ctx->max_files_reached = 1; break; }
   } while (FindNextFileA(h, &ffd));
   FindClose(h);
 }
 #else
 static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
-  if (!ctx || !dir || ctx->scanned >= ctx->max_files || depth > ctx->max_depth) return;
+  if (!ctx || !dir || ctx->visited >= ctx->max_files || depth > ctx->max_depth) return;
   if (edr_command_cancel_requested(ctx->command_id)) { ctx->cancelled = 1; return; }
   DIR *d = opendir(dir);
   if (!d) { ctx->skipped++; return; }
@@ -1610,11 +1730,14 @@ static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
     char full[1200]; snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
     struct stat st;
     if (lstat(full, &st) != 0) { ctx->skipped++; continue; }
-    if (S_ISDIR(st.st_mode)) { if (ctx->recursive) yd_walk(ctx, full, depth + 1); }
+    if (S_ISDIR(st.st_mode)) {
+      if (ctx->recursive && depth < ctx->max_depth) yd_walk(ctx, full, depth + 1);
+      else if (ctx->recursive) ctx->max_depth_reached = 1;
+    }
     else if (S_ISREG(st.st_mode)) yd_scan_file(ctx, full);
     else ctx->skipped++;
     if (ctx->cancelled) break;
-    if (ctx->scanned >= ctx->max_files) break;
+    if (ctx->visited >= ctx->max_files) { ctx->max_files_reached = 1; break; }
   }
   closedir(d);
 }
@@ -1627,11 +1750,11 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
    * switch that is reserved for destructive response actions. */
 
   /* 外移:collector 按 request(target_path/pid + 规则)异步扫描,完成由主循环 poll 上传+上报。 */
-  if (forensic_external_enabled()) {
+  if (yara_external_enabled()) {
     char dc_detail[512];
     dc_detail[0] = '\0';
     int ar = edr_response_forensic_async_accept(cmd_id, "yara_scan", sm, "yara_scan",
-                                                pl, len, "json", 1, dc_detail, sizeof(dc_detail));
+                                                pl, len, "tar.gz", 1, dc_detail, sizeof(dc_detail));
     if (ar == 0) { edr_command_audit_both(cmd_id, "yara_scan: accepted(async)"); return; }
     if (ar == 1) {
       edr_cmd_inc_exec_fail();
@@ -1690,10 +1813,11 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
     yd.max_depth = max_depth;
     yd.max_bytes = (long)max_file_mb * 1024L * 1024L;
     yd.recursive = recursive;
-    yd.payload = (const char *)pl;
-    yd.payload_len = len;
+    yd_load_excludes(&yd, pl, len);
     yd.command_id = cmd_id;
     yd_walk(&yd, target_path, 0);
+    if (yd.max_files_reached) yd_append_warning(&yd, "max_files limit reached");
+    if (yd.max_depth_reached) yd_append_warning(&yd, "max_depth limit reached");
     yr_rules_destroy(rules);
     if (yd.cancelled || edr_command_cancel_requested(cmd_id)) {
       edr_cmd_inc_exec_fail();
