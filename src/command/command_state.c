@@ -1892,8 +1892,7 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
            "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
-           report_pending ? 1u : 0u,
-           report_pending ? (long long)state_now_ms() : 0LL,
+           0u, 0LL,
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
   if (append_state_line_locked(line) != 0) {
     return -1;

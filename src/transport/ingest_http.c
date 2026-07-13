@@ -9,6 +9,7 @@
 #include "edr/command_util.h"
 #include "edr/event_batch.h"
 #include "edr/preprocess.h"
+#include "edr/sha256.h"
 #include "edr/transport_v2.h"
 
 #include <ctype.h>
@@ -141,6 +142,8 @@ static unsigned long s_upload_ok;
 static unsigned long s_upload_fail;
 static unsigned long s_long_poll_ok;
 static unsigned long s_long_poll_fail;
+static volatile int64_t s_long_poll_last_success_ms;
+static volatile int64_t s_long_poll_last_failure_ms;
 static unsigned long s_control_stream_ok;
 static unsigned long s_control_stream_fail;
 static unsigned long s_control_stream_heartbeat;
@@ -263,7 +266,7 @@ typedef struct EdrHttpConn {
   int64_t last_used_ms;
 } EdrHttpConn;
 
-static EdrHttpConn s_http_conn;
+static EdrHttpConn s_http_conn = {.fd = EDR_SOCKET_INVALID};
 #ifdef _WIN32
 static CRITICAL_SECTION s_http_mu;
 static int s_http_mu_init;
@@ -763,10 +766,12 @@ static void note_upload_failure(void) {
 
 static void note_long_poll_success(void) {
   s_long_poll_ok++;
+  s_long_poll_last_success_ms = unix_ms_now();
 }
 
 static void note_long_poll_failure(void) {
   s_long_poll_fail++;
+  s_long_poll_last_failure_ms = unix_ms_now();
 }
 
 static void note_control_stream_success(void) {
@@ -1245,6 +1250,16 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->control_stream_ready = stream_lease_valid;
   out->control_stream_lease_valid = stream_lease_valid;
   out->long_poll_fallback = s_long_poll_fallback_cfg;
+  out->long_poll_last_success_unix_ms = s_long_poll_last_success_ms;
+  out->long_poll_last_failure_unix_ms = s_long_poll_last_failure_ms;
+  {
+    int64_t now_ms = unix_ms_now();
+    int64_t freshness_ms = (int64_t)(s_poll_backoff_ms > 60000 ? s_poll_backoff_ms : 60000) * 2;
+    out->long_poll_ready = s_long_poll_fallback_cfg &&
+                           s_long_poll_last_success_ms > 0 &&
+                           s_long_poll_last_success_ms >= s_long_poll_last_failure_ms &&
+                           now_ms - s_long_poll_last_success_ms <= freshness_ms;
+  }
   out->report_events_v2_enabled = s_report_events_v2_enabled_cfg;
   out->zstd_requested = strcmp(s_data_plane_compression, "zstd") == 0 || s_control_zstd;
   out->backpressure_enabled = s_control_backpressure_enabled;
@@ -2581,6 +2596,40 @@ static int append_request_headers(char *req, size_t cap, const char *method, con
   return (int)(used + (size_t)n);
 }
 
+static int append_request_headers_hash(char *req, size_t cap, const char *method,
+                                       const char *path, const char *host,
+                                       const char *content_type, size_t body_len,
+                                       const char *content_sha256_hex) {
+  char sig_headers[1024];
+  int n = snprintf(req, cap, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, path, host);
+  if (n <= 0 || (size_t)n >= cap) return -1;
+  size_t used = (size_t)n;
+  if (content_type && content_type[0]) {
+    n = snprintf(req + used, cap - used, "Content-Type: %s\r\n", content_type);
+    if (n <= 0 || (size_t)n >= cap - used) return -1;
+    used += (size_t)n;
+  }
+  n = snprintf(req + used, cap - used, "Content-Length: %zu\r\n", body_len);
+  if (n <= 0 || (size_t)n >= cap - used) return -1;
+  used += (size_t)n;
+  n = append_common_headers(req, cap, used);
+  if (n <= 0) return -1;
+  used = (size_t)n;
+  if (edr_reqsig_build_headers_from_hash(&s_request_signing, method, path, s_endpoint,
+                                         content_sha256_hex, unix_ms_now(),
+                                         sig_headers, sizeof(sig_headers)) != 0) {
+    return -1;
+  }
+  if (sig_headers[0]) {
+    n = snprintf(req + used, cap - used, "%s", sig_headers);
+    if (n <= 0 || (size_t)n >= cap - used) return -1;
+    used += (size_t)n;
+  }
+  n = snprintf(req + used, cap - used, "Connection: close\r\n\r\n");
+  if (n <= 0 || (size_t)n >= cap - used) return -1;
+  return (int)(used + (size_t)n);
+}
+
 static int ascii_starts_ci(const char *s, const char *prefix) {
   if (!s || !prefix) return 0;
   while (*prefix) {
@@ -2948,26 +2997,28 @@ static int http_conn_write_all(EdrHttpConn *c, const char *p, size_t n) {
   return write_all_plain(c->fd, p, n);
 }
 
-static void http_conn_close_locked(void) {
-  if (!s_http_conn.active) {
-    return;
-  }
+static void http_conn_close(EdrHttpConn *conn) {
+  if (!conn) return;
 #ifdef EDR_HAVE_OPENSSL_HTTP
-  if (s_http_conn.ssl) {
-    SSL_shutdown(s_http_conn.ssl);
-    SSL_free(s_http_conn.ssl);
-    s_http_conn.ssl = NULL;
+  if (conn->ssl) {
+    SSL_shutdown(conn->ssl);
+    SSL_free(conn->ssl);
+    conn->ssl = NULL;
   }
-  if (s_http_conn.ctx) {
-    SSL_CTX_free(s_http_conn.ctx);
-    s_http_conn.ctx = NULL;
+  if (conn->ctx) {
+    SSL_CTX_free(conn->ctx);
+    conn->ctx = NULL;
   }
 #endif
-  if (s_http_conn.fd != EDR_SOCKET_INVALID) {
-    close_fd(s_http_conn.fd);
+  if (conn->fd != EDR_SOCKET_INVALID) {
+    close_fd(conn->fd);
   }
-  memset(&s_http_conn, 0, sizeof(s_http_conn));
-  s_http_conn.fd = EDR_SOCKET_INVALID;
+  memset(conn, 0, sizeof(*conn));
+  conn->fd = EDR_SOCKET_INVALID;
+}
+
+static void http_conn_close_locked(void) {
+  http_conn_close(&s_http_conn);
 }
 
 static int http_conn_matches_locked(const char *host, int port, int https) {
@@ -2986,46 +3037,43 @@ static int http_conn_matches_locked(const char *host, int port, int https) {
          strcmp(s_http_conn.host, host ? host : "") == 0;
 }
 
-static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https) {
-  if (http_conn_matches_locked(host, port, https)) {
-    return &s_http_conn;
-  }
-  http_conn_close_locked();
-  memset(&s_http_conn, 0, sizeof(s_http_conn));
-  s_http_conn.fd = EDR_SOCKET_INVALID;
+static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int https) {
+  if (!conn) return -1;
+  memset(conn, 0, sizeof(*conn));
+  conn->fd = EDR_SOCKET_INVALID;
   if (https && !comm_tls_handshake_budget_try()) {
-    return NULL;
+    return -1;
   }
-  if (tcp_connect_http_route(host, port, https, &s_http_conn.fd) != 0) {
+  if (tcp_connect_http_route(host, port, https, &conn->fd) != 0) {
     runtime_failure(https ? "https tcp connect failed" : "http connect failed");
-    return NULL;
+    return -1;
   }
-  socket_set_timeout_ms(s_http_conn.fd, (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
-  snprintf(s_http_conn.host, sizeof(s_http_conn.host), "%s", host ? host : "");
-  s_http_conn.port = port;
-  s_http_conn.https = https;
+  socket_set_timeout_ms(conn->fd, (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
+  snprintf(conn->host, sizeof(conn->host), "%s", host ? host : "");
+  conn->port = port;
+  conn->https = https;
 #ifdef EDR_HAVE_OPENSSL_HTTP
   if (https) {
     char active_cafile[1024];
-    s_http_conn.ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
-    if (!s_http_conn.ctx) {
-      http_conn_close_locked();
-      return NULL;
+    conn->ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
+    if (!conn->ctx) {
+      http_conn_close(conn);
+      return -1;
     }
-    s_http_conn.ssl = SSL_new(s_http_conn.ctx);
-    if (!s_http_conn.ssl) {
+    conn->ssl = SSL_new(conn->ctx);
+    if (!conn->ssl) {
       runtime_failure_openssl("https ssl new failed");
-      http_conn_close_locked();
-      return NULL;
+      http_conn_close(conn);
+      return -1;
     }
 #ifdef _WIN32
-    SSL_set_fd(s_http_conn.ssl, (int)s_http_conn.fd);
+    SSL_set_fd(conn->ssl, (int)conn->fd);
 #else
-    SSL_set_fd(s_http_conn.ssl, s_http_conn.fd);
+    SSL_set_fd(conn->ssl, conn->fd);
 #endif
-    (void)SSL_set_tlsext_host_name(s_http_conn.ssl, host);
-    if (SSL_connect(s_http_conn.ssl) != 1) {
-      long verify = SSL_get_verify_result(s_http_conn.ssl);
+    (void)SSL_set_tlsext_host_name(conn->ssl, host);
+    if (SSL_connect(conn->ssl) != 1) {
+      long verify = SSL_get_verify_result(conn->ssl);
       if (verify != X509_V_OK) {
         char msg[160];
         snprintf(msg, sizeof(msg), "https tls verify failed: %s ca=%s",
@@ -3035,19 +3083,30 @@ static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https) 
       } else {
         runtime_failure_openssl("https tls connect failed");
       }
-      http_conn_close_locked();
-      return NULL;
+      http_conn_close(conn);
+      return -1;
     }
   }
 #else
   if (https) {
     runtime_failure("https requested but OpenSSL disabled");
-    http_conn_close_locked();
-    return NULL;
+    http_conn_close(conn);
+    return -1;
   }
 #endif
-  s_http_conn.active = 1;
-  s_http_conn.last_used_ms = unix_ms_now();
+  conn->active = 1;
+  conn->last_used_ms = unix_ms_now();
+  return 0;
+}
+
+static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https) {
+  if (http_conn_matches_locked(host, port, https)) {
+    return &s_http_conn;
+  }
+  http_conn_close_locked();
+  if (http_conn_open_new(&s_http_conn, host, port, https) != 0) {
+    return NULL;
+  }
   return &s_http_conn;
 }
 
@@ -5436,6 +5495,22 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
   rc = request_to_suffix("POST", "ingest/report-command-result", "application/json",
                          body, strlen(body), response, sizeof(response));
   if (rc == 0) {
+    cJSON *ack = response[0] ? cJSON_Parse(response) : NULL;
+    const cJSON *accepted = ack ? cJSON_GetObjectItemCaseSensitive(ack, "accepted") : NULL;
+    const cJSON *complete = ack ? cJSON_GetObjectItemCaseSensitive(ack, "complete") : NULL;
+    int application_acked = cJSON_IsTrue(accepted) && (!complete || cJSON_IsTrue(complete));
+    if (ack) {
+      cJSON_Delete(ack);
+    }
+    if (!application_acked) {
+      rc = -1;
+      snprintf(s_last_command_result_error, sizeof(s_last_command_result_error), "%s",
+               "command result response missing accepted complete application ack");
+      s_last_command_result_retryable = 1;
+      runtime_failure("command result application ack missing");
+    }
+  }
+  if (rc == 0) {
     s_last_command_result_error[0] = '\0';
     s_last_command_result_retryable = 1;
     note_http_request_success();
@@ -5793,11 +5868,38 @@ static int http_conn_write_file(EdrHttpConn *conn, FILE *f, size_t file_len) {
   return 0;
 }
 
+static int multipart_body_sha256(FILE *file, const char *pre, size_t pre_len,
+                                 const char *post, size_t post_len, char out65[65]) {
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  uint8_t chunk[65536];
+  static const char hex[] = "0123456789abcdef";
+  if (!file || !pre || !post || !out65 || fseek(file, 0, SEEK_SET) != 0) return -1;
+  edr_sha256_init(&ctx);
+  edr_sha256_update(&ctx, (const uint8_t *)pre, pre_len);
+  for (;;) {
+    size_t n = fread(chunk, 1u, sizeof(chunk), file);
+    if (n > 0u) edr_sha256_update(&ctx, chunk, n);
+    if (n < sizeof(chunk)) {
+      if (ferror(file)) return -1;
+      break;
+    }
+  }
+  edr_sha256_update(&ctx, (const uint8_t *)post, post_len);
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0u; i < sizeof(digest); i++) {
+    out65[i * 2u] = hex[(digest[i] >> 4u) & 0x0fu];
+    out65[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out65[64] = '\0';
+  return fseek(file, 0, SEEK_SET) == 0 ? 0 : -1;
+}
+
 static int request_to_suffix_multipart_file(const char *suffix, const char *content_type,
                                             const char *pre, size_t pre_len,
                                             FILE *file, size_t file_len,
                                             const char *post, size_t post_len,
-                                            const char *sig_body, size_t sig_body_len,
+                                            const char *content_sha256_hex,
                                             char *resp_body, size_t resp_body_cap) {
   char url[1400];
   char host[256];
@@ -5831,38 +5933,35 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), "POST", path, host, content_type,
-                              sig_body, sig_body ? sig_body_len : body_len);
+  rn = append_request_headers_hash(req, sizeof(req), "POST", path, host, content_type,
+                                   body_len, content_sha256_hex);
   if (rn <= 0) {
     runtime_failure("http upload request build failed");
     return -1;
   }
-  http_lock();
   for (int attempt = 0; attempt < 2; attempt++) {
     int reusable = 0;
-    EdrHttpConn *conn;
+    EdrHttpConn local_conn;
+    memset(&local_conn, 0, sizeof(local_conn));
+    local_conn.fd = EDR_SOCKET_INVALID;
     if (fseek(file, 0, SEEK_SET) != 0) {
       break;
     }
-    conn = http_conn_get_locked(host, port, https);
-    if (!conn) {
+    if (http_conn_open_new(&local_conn, host, port, https) != 0) {
       break;
     }
-    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
-        http_conn_write_all(conn, pre, pre_len) == 0 &&
-        http_conn_write_file(conn, file, file_len) == 0 &&
-        http_conn_write_all(conn, post, post_len) == 0 &&
-        read_http_response_from_recv(http_socket_recv_adapter, conn, resp_body, resp_body_cap, &reusable) == 0) {
+    if (http_conn_write_all(&local_conn, req, (size_t)rn) == 0 &&
+        http_conn_write_all(&local_conn, pre, pre_len) == 0 &&
+        http_conn_write_file(&local_conn, file, file_len) == 0 &&
+        http_conn_write_all(&local_conn, post, post_len) == 0 &&
+        read_http_response_from_recv(http_socket_recv_adapter, &local_conn,
+                                     resp_body, resp_body_cap, &reusable) == 0) {
       rc = 0;
-      conn->last_used_ms = unix_ms_now();
-      if (!reusable || !http_keepalive_enabled()) {
-        http_conn_close_locked();
-      }
+      http_conn_close(&local_conn);
       break;
     }
-    http_conn_close_locked();
+    http_conn_close(&local_conn);
   }
-  http_unlock();
   if (rc != 0 && !s_last_error[0]) {
     runtime_failure(https ? "https upload failed" : "http upload failed");
   }
@@ -5884,7 +5983,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   char resp[4096];
   char pre[2048];
   char post[96];
-  char *sig_body = NULL;
+  char multipart_sha256[65];
   int rc;
   long sz;
   long max_mb;
@@ -5997,21 +6096,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   {
     size_t pre_len = strlen(pre);
     size_t post_len = strlen(post);
-    size_t body_len = pre_len + file_len + post_len;
-    sig_body = (char *)malloc(body_len ? body_len : 1u);
-    if (!sig_body) {
-      fclose(file);
-      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_build");
-      note_upload_failure();
-      free(uid);
-      free(eid);
-      free(sha);
-      free(fname);
-      return -1;
-    }
-    memcpy(sig_body, pre, pre_len);
-    if (fread(sig_body + pre_len, 1u, file_len, file) != file_len) {
-      free(sig_body);
+    if (multipart_body_sha256(file, pre, pre_len, post, post_len, multipart_sha256) != 0) {
       fclose(file);
       free(uid);
       free(eid);
@@ -6019,20 +6104,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       free(fname);
       snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_read");
       note_upload_failure();
-      runtime_failure("http upload file read failed");
-      return -1;
-    }
-    memcpy(sig_body + pre_len + file_len, post, post_len);
-    if (fseek(file, 0, SEEK_SET) != 0) {
-      free(sig_body);
-      fclose(file);
-      free(uid);
-      free(eid);
-      free(sha);
-      free(fname);
-      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
-      note_upload_failure();
-      runtime_failure("http upload file seek failed");
+      runtime_failure("http upload file hash failed");
       return -1;
     }
   }
@@ -6040,8 +6112,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_http");
   rc = request_to_suffix_multipart_file("ingest/upload-file", content_type,
                                         pre, strlen(pre), file, file_len,
-                                        post, strlen(post), sig_body,
-                                        strlen(pre) + file_len + strlen(post),
+                                        post, strlen(post), multipart_sha256,
                                         resp, sizeof(resp));
   if (rc == 0) {
     note_http_request_success();
@@ -6060,7 +6131,6 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed");
   }
   fclose(file);
-  free(sig_body);
   free(uid);
   free(eid);
   free(sha);

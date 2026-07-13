@@ -436,15 +436,11 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
       strcpy(detail_json, fallback);
     }
   }
-  int report_pending = 0;
-  if (detail_json && command_should_report(cmd_id, sm)) {
-    int rc = edr_transport_v2_command_result_typed(cmd_id, s_active_command_type,
-                                                   sm, (int)st, exit_code, detail_json);
-    report_pending = (rc != 0);
-  }
+  int report_pending = detail_json && command_should_report(cmd_id, sm);
   int state_rc = edr_command_state_finish(cmd_id, s_active_command_type,
                                           sm, rstatus, (int)st, exit_code,
-                                          detail ? detail : "", artifacts ? artifacts : "",
+                                          detail_json ? detail_json : (detail ? detail : ""),
+                                          artifacts ? artifacts : "",
                                           report_pending);
   /* The inbox is the crash-recovery record. Delete it only after a terminal
    * result is durably recorded; async forensic commands therefore remain
@@ -3406,23 +3402,115 @@ static void write_upload_outbox(const char *cmd_id, const char *bundle, const ch
   fclose(f);
 }
 
+static void upload_meta_value(char *value) {
+  if (!value) return;
+  for (; *value; value++) {
+    if (*value == '\r' || *value == '\n') *value = ' ';
+  }
+}
+
+int edr_command_queue_forensic_upload(const char *command_id, const char *command_type,
+                                      const EdrSoarCommandMeta *soar_meta,
+                                      const char *artifact_path, const char *sha256,
+                                      const char *source, int partial) {
+  if (!command_id || !command_id[0] || !artifact_path || !artifact_path[0] ||
+      !file_exists_c(artifact_path)) {
+    return -1;
+  }
+  char dir[700];
+  upload_outbox_dir(dir, sizeof(dir));
+  if (mkdir_p_quiet(dir) != 0) return -1;
+  char safe[180];
+  snprintf(safe, sizeof(safe), "%s", command_id);
+  sanitize_component(safe);
+  int64_t now_ms = command_now_ms();
+  char path[900], tmp[920];
+#ifdef _WIN32
+  snprintf(path, sizeof(path), "%s\\upload_%s_%lld.pending", dir, safe, (long long)now_ms);
+#else
+  snprintf(path, sizeof(path), "%s/upload_%s_%lld.pending", dir, safe, (long long)now_ms);
+#endif
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  FILE *f = fopen(tmp, "w");
+  if (!f) return -1;
+  char type[80], src[80], idem[520], soar[140], run[108], step[108];
+  snprintf(type, sizeof(type), "%s", command_type ? command_type : "collect_forensic");
+  snprintf(src, sizeof(src), "%s", source ? source : "builtin");
+  snprintf(idem, sizeof(idem), "%s", soar_meta ? soar_meta->idempotency_key : "");
+  snprintf(soar, sizeof(soar), "%s", soar_meta ? soar_meta->soar_correlation_id : "");
+  snprintf(run, sizeof(run), "%s", soar_meta ? soar_meta->playbook_run_id : "");
+  snprintf(step, sizeof(step), "%s", soar_meta ? soar_meta->playbook_step_id : "");
+  upload_meta_value(type); upload_meta_value(src); upload_meta_value(idem);
+  upload_meta_value(soar); upload_meta_value(run); upload_meta_value(step);
+  fprintf(f,
+          "kind=forensic_terminal\ncommand_id=%s\ncommand_type=%s\nbundle_path=%s\n"
+          "sha256=%s\nsource=%s\npartial=%d\nidempotency_key=%s\n"
+          "soar_correlation_id=%s\nplaybook_run_id=%s\nplaybook_step_id=%s\n"
+          "created_unix_ms=%lld\n",
+          command_id, type, artifact_path, sha256 ? sha256 : "", src, partial ? 1 : 0,
+          idem, soar, run, step, (long long)now_ms);
+  if (fclose(f) != 0 || rename(tmp, path) != 0) {
+    (void)remove(tmp);
+    return -1;
+  }
+  edr_command_executor_wake();
+  return 0;
+}
+
 static int read_kv_file_value(const char *path, const char *key, char *out, size_t cap) {
   return read_meta_value(path, key, out, cap);
 }
 
 static int flush_upload_outbox_one(const char *pending_path) {
-  char cmd_id[128], bundle[1024], sha[65];
+  char cmd_id[128], bundle[1024], sha[65], kind[48];
+  kind[0] = '\0';
+  (void)read_kv_file_value(pending_path, "kind", kind, sizeof(kind));
   if (read_kv_file_value(pending_path, "command_id", cmd_id, sizeof(cmd_id)) != 0 ||
       read_kv_file_value(pending_path, "bundle_path", bundle, sizeof(bundle)) != 0 ||
       read_kv_file_value(pending_path, "sha256", sha, sizeof(sha)) != 0) {
     return 0;
   }
   if (!file_exists_c(bundle)) {
+    if (strcmp(kind, "forensic_terminal") == 0) {
+      char command_type[80], source[80], partial_raw[16];
+      EdrSoarCommandMeta sm;
+      memset(&sm, 0, sizeof(sm));
+      command_type[0] = source[0] = partial_raw[0] = '\0';
+      (void)read_kv_file_value(pending_path, "command_type", command_type, sizeof(command_type));
+      (void)read_kv_file_value(pending_path, "source", source, sizeof(source));
+      (void)read_kv_file_value(pending_path, "partial", partial_raw, sizeof(partial_raw));
+      (void)read_kv_file_value(pending_path, "idempotency_key", sm.idempotency_key, sizeof(sm.idempotency_key));
+      (void)read_kv_file_value(pending_path, "soar_correlation_id", sm.soar_correlation_id, sizeof(sm.soar_correlation_id));
+      (void)read_kv_file_value(pending_path, "playbook_run_id", sm.playbook_run_id, sizeof(sm.playbook_run_id));
+      (void)read_kv_file_value(pending_path, "playbook_step_id", sm.playbook_step_id, sizeof(sm.playbook_step_id));
+      edr_response_forensic_complete_queued_upload(cmd_id, command_type, &sm, bundle, sha, "",
+                                                   source, atoi(partial_raw), 0,
+                                                   "artifact missing before upload retry");
+      char failed[1100];
+      snprintf(failed, sizeof(failed), "%s.failed", pending_path);
+      (void)rename(pending_path, failed);
+      return 1;
+    }
     return 0;
   }
   char minio_key[1024];
   minio_key[0] = '\0';
   if (edr_transport_v2_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
+    if (strcmp(kind, "forensic_terminal") == 0) {
+      char command_type[80], source[80], partial_raw[16];
+      EdrSoarCommandMeta sm;
+      memset(&sm, 0, sizeof(sm));
+      command_type[0] = source[0] = partial_raw[0] = '\0';
+      (void)read_kv_file_value(pending_path, "command_type", command_type, sizeof(command_type));
+      (void)read_kv_file_value(pending_path, "source", source, sizeof(source));
+      (void)read_kv_file_value(pending_path, "partial", partial_raw, sizeof(partial_raw));
+      (void)read_kv_file_value(pending_path, "idempotency_key", sm.idempotency_key, sizeof(sm.idempotency_key));
+      (void)read_kv_file_value(pending_path, "soar_correlation_id", sm.soar_correlation_id, sizeof(sm.soar_correlation_id));
+      (void)read_kv_file_value(pending_path, "playbook_run_id", sm.playbook_run_id, sizeof(sm.playbook_run_id));
+      (void)read_kv_file_value(pending_path, "playbook_step_id", sm.playbook_step_id, sizeof(sm.playbook_step_id));
+      edr_response_forensic_complete_queued_upload(cmd_id, command_type, &sm, bundle, sha, minio_key,
+                                                   source, atoi(partial_raw), 1, "");
+    }
     char done[1100];
     snprintf(done, sizeof(done), "%s.done", pending_path);
     (void)rename(pending_path, done);
@@ -5221,14 +5309,9 @@ static void record_command_result_delivery_failure(const EdrCommandStateRecord *
     audit_both(record->command_id, "command result permanently rejected; retained in local dead-letter state");
     return;
   }
-  uint32_t max_attempts = command_u32_env_clamped("EDR_COMMAND_RESULT_RETRY_MAX_ATTEMPTS", 12u, 1u, 1000u);
-  if (record->report_attempts >= max_attempts) {
-    char exhausted[256];
-    snprintf(exhausted, sizeof(exhausted), "retry budget exhausted after %u attempts: %.160s",
-             (unsigned)record->report_attempts, error);
-    edr_command_state_mark_report_rejected(record, exhausted);
-    audit_both(record->command_id, "command result retry budget exhausted; retained in local dead-letter state");
-    return;
+  uint32_t alert_attempts = command_u32_env_clamped("EDR_COMMAND_RESULT_RETRY_ALERT_ATTEMPTS", 12u, 1u, 1000u);
+  if (record->report_attempts == alert_attempts) {
+    audit_both(record->command_id, "command result retry threshold reached; durable retry remains active");
   }
   int64_t next_retry = command_now_ms() + (int64_t)command_result_retry_delay_ms(record);
   if (edr_command_state_mark_report_retry(record, error, next_retry) != 0) {
@@ -5596,14 +5679,12 @@ static void drain_pmfe_completions(void) {
   }
 }
 
-void edr_command_poll_reliable_delivery(void) {
+static void command_delivery_run_once(void) {
   static int64_t last_poll_ms;
   drain_pmfe_completions();
   int64_t now = command_now_ms();
   int pressure = edr_resource_preprocess_throttle_active() ? 1 : 0;
-  uint32_t poll_ms = command_u32_env_clamped(
-      pressure ? "EDR_COMMAND_DELIVERY_PRESSURE_POLL_MS" : "EDR_COMMAND_DELIVERY_POLL_MS",
-      pressure ? 30000u : 5000u, 1000u, 600000u);
+  uint32_t poll_ms = command_u32_env_clamped("EDR_COMMAND_DELIVERY_POLL_MS", 5000u, 1000u, 600000u);
   if (last_poll_ms > 0 && now - last_poll_ms < (int64_t)poll_ms) {
     return;
   }
@@ -5616,18 +5697,16 @@ void edr_command_poll_reliable_delivery(void) {
   flush_upload_outbox();
   s_delivery_health.last_upload_ms = command_elapsed_ms_u32(step_start);
   command_update_max_u32(s_delivery_health.last_upload_ms, &s_delivery_health.max_upload_ms);
-  if (!pressure) {
-    edr_command_executor_wake();
-  }
+  edr_command_executor_wake();
   s_delivery_health.last_result_ms = 0u;
-  if (!pressure || s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
+  if (s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
     step_start = command_monotonic_ms();
     flush_command_result_outbox();
     s_delivery_health.last_result_ms = command_elapsed_ms_u32(step_start);
     command_update_max_u32(s_delivery_health.last_result_ms, &s_delivery_health.max_result_ms);
     if (pressure) {
       uint32_t next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_PRESSURE_INTERVAL_MS",
-                                                 60000u, 5000u, 600000u);
+                                                 5000u, 1000u, 60000u);
       if (s_delivery_health.last_result_ms >=
           command_u32_env_clamped("EDR_COMMAND_DELIVERY_SLOW_MS", 750u, 100u, 60000u)) {
         next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_SLOW_BACKOFF_MS",
@@ -5653,6 +5732,85 @@ void edr_command_poll_reliable_delivery(void) {
   }
   s_delivery_health.last_total_ms = command_elapsed_ms_u32(total_start);
   command_update_max_u32(s_delivery_health.last_total_ms, &s_delivery_health.max_total_ms);
+}
+
+#ifdef _WIN32
+static HANDLE s_delivery_thread;
+static volatile LONG s_delivery_thread_started;
+static volatile LONG s_delivery_thread_stop;
+
+static DWORD WINAPI command_delivery_thread_main(LPVOID unused) {
+  (void)unused;
+  while (InterlockedCompareExchange(&s_delivery_thread_stop, 0, 0) == 0) {
+    command_delivery_run_once();
+    Sleep(1000u);
+  }
+  return 0;
+}
+
+static void command_delivery_thread_start(void) {
+  if (InterlockedCompareExchange(&s_delivery_thread_started, 1, 0) != 0) return;
+  InterlockedExchange(&s_delivery_thread_stop, 0);
+  s_delivery_thread = CreateThread(NULL, 0u, command_delivery_thread_main, NULL, 0u, NULL);
+  if (!s_delivery_thread) InterlockedExchange(&s_delivery_thread_started, 0);
+}
+#else
+static pthread_t s_delivery_thread;
+static pthread_mutex_t s_delivery_thread_mu = PTHREAD_MUTEX_INITIALIZER;
+static int s_delivery_thread_started;
+static int s_delivery_thread_stop;
+
+static void *command_delivery_thread_main(void *unused) {
+  (void)unused;
+  for (;;) {
+    pthread_mutex_lock(&s_delivery_thread_mu);
+    int stop = s_delivery_thread_stop;
+    pthread_mutex_unlock(&s_delivery_thread_mu);
+    if (stop) break;
+    command_delivery_run_once();
+    usleep(1000000u);
+  }
+  return NULL;
+}
+
+static void command_delivery_thread_start(void) {
+  pthread_mutex_lock(&s_delivery_thread_mu);
+  if (s_delivery_thread_started) {
+    pthread_mutex_unlock(&s_delivery_thread_mu);
+    return;
+  }
+  s_delivery_thread_stop = 0;
+  if (pthread_create(&s_delivery_thread, NULL, command_delivery_thread_main, NULL) == 0) {
+    s_delivery_thread_started = 1;
+  }
+  pthread_mutex_unlock(&s_delivery_thread_mu);
+}
+#endif
+
+void edr_command_poll_reliable_delivery(void) {
+  command_delivery_thread_start();
+}
+
+void edr_command_delivery_shutdown(void) {
+#ifdef _WIN32
+  if (InterlockedCompareExchange(&s_delivery_thread_started, 0, 0) == 0) return;
+  InterlockedExchange(&s_delivery_thread_stop, 1);
+  if (s_delivery_thread) {
+    (void)WaitForSingleObject(s_delivery_thread, 10000u);
+    CloseHandle(s_delivery_thread);
+    s_delivery_thread = NULL;
+  }
+  InterlockedExchange(&s_delivery_thread_started, 0);
+#else
+  pthread_mutex_lock(&s_delivery_thread_mu);
+  int started = s_delivery_thread_started;
+  s_delivery_thread_stop = 1;
+  pthread_mutex_unlock(&s_delivery_thread_mu);
+  if (started) (void)pthread_join(s_delivery_thread, NULL);
+  pthread_mutex_lock(&s_delivery_thread_mu);
+  s_delivery_thread_started = 0;
+  pthread_mutex_unlock(&s_delivery_thread_mu);
+#endif
 }
 
 void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health) {

@@ -95,6 +95,14 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane);
 
 /** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
 void edr_command_poll_reliable_delivery(void);
+void edr_command_delivery_shutdown(void);
+
+/** Persist a collected forensic artifact for retryable upload. A successful
+ * retry emits the command's single terminal result. */
+int edr_command_queue_forensic_upload(const char *command_id, const char *command_type,
+                                      const EdrSoarCommandMeta *soar_meta,
+                                      const char *artifact_path, const char *sha256,
+                                      const char *source, int partial);
 
 /** PMFE worker completion is queued and drained by the command poll loop. */
 void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int scan_status,

@@ -632,6 +632,7 @@ static int edr_agent_run_main(const char *config) {
     }
   }
   edr_ingest_http_stop_command_poll();
+  edr_command_delivery_shutdown();
   edr_command_executor_shutdown();
   edr_pmfe_shutdown();
   edr_shellcode_detector_shutdown();

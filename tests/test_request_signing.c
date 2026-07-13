@@ -17,7 +17,9 @@ int main(void) {
   char headers[1024];
   EdrRequestSigningConfig cfg;
 
-  if (edr_reqsig_canonical("get", "/api/v1/ingest/poll-commands?endpoint_id=ep-1",
+  const char *poll_path =
+      "/api/v1/ingest/poll-commands?endpoint_id=ep-1&limit=8&wait_s=5&agent_version=3.2.228&dict_ver=edr-zstd-dict-v1&schema_ver=edr-control-schema-v1&profile_id=default-h2-zstd&h2=1&zstd=1";
+  if (edr_reqsig_canonical("get", poll_path,
                            "1700000000000", "00112233445566778899aabbccddeeff",
                            EDR_REQSIG_EMPTY_BODY_SHA256, "ep-1",
                            canonical, sizeof(canonical)) != 0) {
@@ -25,7 +27,7 @@ int main(void) {
     return 1;
   }
   if (expect_str("canonical", canonical,
-                 "REQSIG-V1\nGET\n/api/v1/ingest/poll-commands?endpoint_id=ep-1\n1700000000000\n00112233445566778899aabbccddeeff\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nep-1")) {
+                 "REQSIG-V1\nGET\n/api/v1/ingest/poll-commands?endpoint_id=ep-1&limit=8&wait_s=5&agent_version=3.2.228&dict_ver=edr-zstd-dict-v1&schema_ver=edr-control-schema-v1&profile_id=default-h2-zstd&h2=1&zstd=1\n1700000000000\n00112233445566778899aabbccddeeff\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nep-1")) {
     return 1;
   }
 
@@ -43,7 +45,7 @@ int main(void) {
   cfg.enabled = 1;
   snprintf(cfg.key_id, sizeof(cfg.key_id), "%s", "reqsig_test");
   snprintf(cfg.secret, sizeof(cfg.secret), "%s", "a2V5");
-  if (edr_reqsig_build_headers(&cfg, "GET", "/api/v1/ingest/poll-commands?endpoint_id=ep-1",
+  if (edr_reqsig_build_headers(&cfg, "GET", poll_path,
                                "ep-1", NULL, 0u, 1700000000000LL,
                                headers, sizeof(headers)) != 0) {
     fprintf(stderr, "header build failed\n");
@@ -55,6 +57,15 @@ int main(void) {
       !strstr(headers, "X-EDR-Content-SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\n") ||
       !strstr(headers, "X-EDR-Signature: ")) {
     fprintf(stderr, "missing expected request signing headers:\n%s\n", headers);
+    return 1;
+  }
+  memset(headers, 0, sizeof(headers));
+  if (edr_reqsig_build_headers_from_hash(&cfg, "GET", poll_path, "ep-1",
+                                         EDR_REQSIG_EMPTY_BODY_SHA256,
+                                         1700000000000LL, headers, sizeof(headers)) != 0 ||
+      !strstr(headers, "X-EDR-Content-SHA256: " EDR_REQSIG_EMPTY_BODY_SHA256 "\r\n") ||
+      !strstr(headers, "X-EDR-Signature: ")) {
+    fprintf(stderr, "pre-hashed header build failed:\n%s\n", headers);
     return 1;
   }
   return 0;

@@ -29,5 +29,11 @@ int edr_reqsig_build_headers(const EdrRequestSigningConfig *cfg,
                              const uint8_t *body, size_t body_len,
                              int64_t timestamp_ms,
                              char *out, size_t out_cap);
+int edr_reqsig_build_headers_from_hash(const EdrRequestSigningConfig *cfg,
+                                       const char *method, const char *path_with_query,
+                                       const char *endpoint_id,
+                                       const char *content_sha256_hex,
+                                       int64_t timestamp_ms,
+                                       char *out, size_t out_cap);
 
 #endif

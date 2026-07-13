@@ -1848,9 +1848,6 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
         edr_behavior_alert_emit_periodic_summary();
-        /* 取证异步生命周期收割:velo 完成→velo→builtin 两段/上传/唯一终态上报;取消由此统一 kill。
-         * 空闲时仅一次加锁+标志检查,开销可忽略,故每轮直调不另设节流。 */
-        edr_response_forensic_async_poll();
         edr_agent_loop_probe_end(edr_loop_started_ns);
       }
       /* §B2 干净退出：写 stop stamp，阻止伴生 watchdog 复活本进程。 */
@@ -2184,6 +2181,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"control_stream_lease_valid\":%s,\"control_stream_last_activity_unix_ms\":%lld,"
         "\"control_stream_lease_deadline_unix_ms\":%lld,\"control_stream_lease_expired\":%lu,"
         "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
+        "\"long_poll_ready\":%s,\"long_poll_last_success_unix_ms\":%lld,"
+        "\"long_poll_last_failure_unix_ms\":%lld,"
         "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
         "\"report_events_v2_ok\":%lu,\"report_events_v2_fail\":%lu,"
         "\"data_plane_encoding\":\"%s\",\"data_plane_compression\":\"%s\","
@@ -2204,6 +2203,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
         "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
         "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
+        "\"command_delivery\":{\"executor\":{\"started\":%s,\"accepting\":%s,"
+        "\"active\":%s,\"workers\":%u,\"pending\":%u,\"reserved\":%u,"
+        "\"capacity\":%u,\"critical_reserve\":%u,\"queue_rejected\":%llu}},"
         "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
         "\"behavior_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,"
         "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
@@ -2272,7 +2274,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (long long)http_rt.control_stream_last_activity_unix_ms,
         (long long)http_rt.control_stream_lease_deadline_unix_ms,
         http_rt.control_stream_lease_expired_count,
-        http_control_status, http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
+        http_control_status, http_rt.long_poll_fallback ? "true" : "false",
+        http_rt.long_poll_ready ? "true" : "false",
+        (long long)http_rt.long_poll_last_success_unix_ms,
+        (long long)http_rt.long_poll_last_failure_unix_ms, http_upload_status,
         http_rt.report_events_v2_enabled ? "true" : "false",
         http_rt.report_events_v2_ok_count, http_rt.report_events_v2_fail_count,
         http_data_encoding, http_data_compression, http_envelope_format,
@@ -2302,6 +2307,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)s_agent_loop_interval_max_ms,
         (unsigned long long)s_agent_loop_elapsed_last_us,
         (unsigned long long)s_agent_loop_elapsed_max_us,
+        ceh.started ? "true" : "false", ceh.accepting ? "true" : "false",
+        ceh.active ? "true" : "false", ceh.worker_count, ceh.pending_count,
+        ceh.admission_reservations, ceh.queue_capacity, ceh.queue_critical_reserve,
+        (unsigned long long)ceh.queue_rejected_count,
         agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
         agent->cfg.resource_limit.behavior_infer_per_min,
         agent->cfg.resource_limit.pmfe_scans_per_min,
@@ -2493,6 +2502,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"control_stream_lease_valid\":%s,\"control_stream_last_activity_unix_ms\":%lld,"
       "\"control_stream_lease_deadline_unix_ms\":%lld,\"control_stream_lease_expired\":%lu,"
       "\"control_stream_status\":\"%s\",\"long_poll_fallback\":%s,"
+      "\"long_poll_ready\":%s,\"long_poll_last_success_unix_ms\":%lld,"
+      "\"long_poll_last_failure_unix_ms\":%lld,"
       "\"upload_status\":\"%s\",\"report_events_v2_enabled\":%s,"
       "\"report_events_v2_ok\":%lu,\"report_events_v2_fail\":%lu,"
       "\"data_plane_encoding\":\"%s\",\"data_plane_compression\":\"%s\","
@@ -2687,7 +2698,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (long long)http_rt.control_stream_last_activity_unix_ms,
       (long long)http_rt.control_stream_lease_deadline_unix_ms,
       http_rt.control_stream_lease_expired_count,
-      http_control_status, http_rt.long_poll_fallback ? "true" : "false", http_upload_status,
+	      http_control_status, http_rt.long_poll_fallback ? "true" : "false",
+      http_rt.long_poll_ready ? "true" : "false",
+      (long long)http_rt.long_poll_last_success_unix_ms,
+      (long long)http_rt.long_poll_last_failure_unix_ms, http_upload_status,
       http_rt.report_events_v2_enabled ? "true" : "false",
       http_rt.report_events_v2_ok_count, http_rt.report_events_v2_fail_count,
       http_data_encoding, http_data_compression, http_envelope_format,
@@ -3686,11 +3700,21 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
   (void)remove(tmp);
 }
 
+static void edr_agent_queue_attack_surface(const char *reason, uint64_t now_ns) {
+  char command_id[96];
+  char payload[192];
+  snprintf(command_id, sizeof(command_id), "auto-asurf-%llu",
+           (unsigned long long)(now_ns / 1000000ULL));
+  snprintf(payload, sizeof(payload), "{\"reason\":\"%s\"}", reason ? reason : "periodic");
+  edr_command_on_internal_envelope(command_id, "GET_ATTACK_SURFACE",
+                                   (const uint8_t *)payload, strlen(payload), NULL);
+}
+
 /**
- * §19.8 周期快照：仅当 `[attack_surface].enabled=true` 时，按
- * `edr_attack_surface_effective_periodic_interval_s`（`min(port, service, policy, full)`，钳 60～604800s）
- * 调用 `edr_attack_surface_execute`（与 HTTPS 控制面指令路径共用实现）。
- * 按需刷新：按 `conn_interval_s`（钳 15～120s）轮询 GET .../attack-surface/refresh-request。
+ * Attack-surface collection can enumerate services, software and network state,
+ * so the main loop only schedules a durable internal bulk command. Manual
+ * refreshes arrive through the normal command outbox; legacy refresh polling is
+ * intentionally not performed here because it could block liveness reporting.
  */
 static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   if (!agent || agent->shutdown) {
@@ -3707,17 +3731,9 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
   uint64_t now = edr_monotonic_ns();
 
   if (!agent->asurf_enrolled_posted) {
-    char detail[256];
-    int r = edr_attack_surface_execute("agent_enrolled", cfg, detail, sizeof(detail));
-    if (r != 0) {
-      fprintf(stderr, "[attack_surface] agent_enrolled failed: %s\n", detail);
-    } else {
-      agent->asurf_enrolled_posted = 1;
-      agent->asurf_last_post_ns = now;
-      if (strncmp(detail, "uploaded_", 9) == 0) {
-        fprintf(stderr, "[attack_surface] agent_enrolled %s\n", detail);
-      }
-    }
+    edr_agent_queue_attack_surface("agent_enrolled", now);
+    agent->asurf_enrolled_posted = 1;
+    agent->asurf_last_post_ns = now;
   }
 
   if (cfg->attack_surface.etw_refresh_triggers_snapshot) {
@@ -3730,35 +3746,7 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
     }
     uint64_t debounce_ns = (uint64_t)ds * 1000000000ULL;
     if (edr_attack_surface_take_etw_flush(now, debounce_ns)) {
-      char detail[256];
-      int r = edr_attack_surface_execute("etw_tcpip_wf", cfg, detail, sizeof(detail));
-      if (r != 0) {
-        fprintf(stderr, "[attack_surface] etw_tcpip_wf failed: %s\n", detail);
-      } else if (strncmp(detail, "uploaded_", 9) == 0) {
-        fprintf(stderr, "[attack_surface] etw_tcpip_wf %s\n", detail);
-      }
-    }
-  }
-
-  uint32_t pend_iv = cfg->attack_surface.conn_interval_s;
-  if (pend_iv < 15u) {
-    pend_iv = 15u;
-  }
-  if (pend_iv > 120u) {
-    pend_iv = 120u;
-  }
-  const uint64_t pend_iv_ns = (uint64_t)pend_iv * 1000000000ULL;
-  if (now - agent->asurf_last_pending_check_ns >= pend_iv_ns) {
-    agent->asurf_last_pending_check_ns = now;
-    int pr = edr_attack_surface_refresh_pending(cfg);
-    if (pr == 1) {
-      char detail[256];
-      int r = edr_attack_surface_execute("refresh_request", cfg, detail, sizeof(detail));
-      if (r != 0) {
-        fprintf(stderr, "[attack_surface] refresh_request failed: %s\n", detail);
-      } else if (strncmp(detail, "uploaded_", 9) == 0) {
-        fprintf(stderr, "[attack_surface] refresh_request %s\n", detail);
-      }
+      edr_agent_queue_attack_surface("etw_tcpip_wf", now);
     }
   }
 
@@ -3769,14 +3757,5 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
     return;
   }
   agent->asurf_last_post_ns = now;
-
-  char detail[256];
-  int r = edr_attack_surface_execute("periodic_attack_surface", cfg, detail, sizeof(detail));
-  if (r != 0) {
-    fprintf(stderr, "[attack_surface] periodic failed: %s\n", detail);
-    return;
-  }
-  if (strncmp(detail, "uploaded_", 9) == 0) {
-    fprintf(stderr, "[attack_surface] periodic %s\n", detail);
-  }
+  edr_agent_queue_attack_surface("periodic_attack_surface", now);
 }

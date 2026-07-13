@@ -205,21 +205,31 @@ int edr_reqsig_build_headers(const EdrRequestSigningConfig *cfg,
                              int64_t timestamp_ms,
                              char *out, size_t out_cap) {
   char body_hash[65];
+  if (edr_reqsig_body_sha256_hex(body, body_len, body_hash) != 0) {
+    return -1;
+  }
+  return edr_reqsig_build_headers_from_hash(cfg, method, path_with_query, endpoint_id,
+                                            body_hash, timestamp_ms, out, out_cap);
+}
+
+int edr_reqsig_build_headers_from_hash(const EdrRequestSigningConfig *cfg,
+                                       const char *method, const char *path_with_query,
+                                       const char *endpoint_id,
+                                       const char *content_sha256_hex,
+                                       int64_t timestamp_ms,
+                                       char *out, size_t out_cap) {
   char timestamp[32];
   char nonce[33];
   char canonical[2048];
   uint8_t secret[128];
   size_t secret_len = 0u;
   char sig[65];
-  if (!out || out_cap == 0u) {
+  if (!out || out_cap == 0u || !content_sha256_hex || strlen(content_sha256_hex) != 64u) {
     return -1;
   }
   out[0] = '\0';
   if (!cfg || !cfg->enabled || !cfg->key_id[0] || !cfg->secret[0] || !endpoint_id || !endpoint_id[0]) {
     return 0;
-  }
-  if (edr_reqsig_body_sha256_hex(body, body_len, body_hash) != 0) {
-    return -1;
   }
   snprintf(timestamp, sizeof(timestamp), "%lld", (long long)timestamp_ms);
   if (edr_reqsig_random_nonce_hex(nonce) != 0) {
@@ -228,7 +238,7 @@ int edr_reqsig_build_headers(const EdrRequestSigningConfig *cfg,
   if (edr_reqsig_secret_decode(cfg->secret, secret, sizeof(secret), &secret_len) != 0) {
     return -1;
   }
-  if (edr_reqsig_canonical(method, path_with_query, timestamp, nonce, body_hash, endpoint_id,
+  if (edr_reqsig_canonical(method, path_with_query, timestamp, nonce, content_sha256_hex, endpoint_id,
                            canonical, sizeof(canonical)) != 0) {
     return -1;
   }
@@ -242,7 +252,7 @@ int edr_reqsig_build_headers(const EdrRequestSigningConfig *cfg,
                "X-EDR-Nonce: %s\r\n"
                "X-EDR-Content-SHA256: %s\r\n"
                "X-EDR-Signature: %s\r\n",
-               EDR_REQSIG_VERSION, cfg->key_id, timestamp, nonce, body_hash, sig) >= (int)out_cap) {
+               EDR_REQSIG_VERSION, cfg->key_id, timestamp, nonce, content_sha256_hex, sig) >= (int)out_cap) {
     out[0] = '\0';
     return -1;
   }

@@ -165,8 +165,10 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_v2.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_stub.c
@@ -181,6 +183,7 @@ target_include_directories(edr_ave_test_common INTERFACE
   ${CMAKE_SOURCE_DIR}/src/ave
   ${CMAKE_SOURCE_DIR}/third_party/tomlc99
   ${CMAKE_SOURCE_DIR}/third_party/nanopb
+  ${CMAKE_SOURCE_DIR}/third_party/cjson
   ${CMAKE_SOURCE_DIR}/src/proto
 )
 target_compile_definitions(edr_ave_test_common INTERFACE EDR_HAVE_NANOPB=1)

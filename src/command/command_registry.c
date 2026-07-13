@@ -258,6 +258,7 @@ EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_
     case EDR_COMMAND_KIND_LIST_AUTORUNS:
     case EDR_COMMAND_KIND_EVENTLOG_VIEW:
     case EDR_COMMAND_KIND_VELO_QUERY:
+    case EDR_COMMAND_KIND_ATTACK_SURFACE:
       return EDR_COMMAND_LANE_BULK;
     default:
       return EDR_COMMAND_LANE_INTERACTIVE;
@@ -300,6 +301,7 @@ EdrCommandReplayPolicy edr_command_registry_replay_policy(const char *command_ty
     case EDR_COMMAND_KIND_SHELL_OPEN:
     case EDR_COMMAND_KIND_SHELL_INPUT:
     case EDR_COMMAND_KIND_SHELL_CLOSE:
+    case EDR_COMMAND_KIND_RTR_SHELL:
       return EDR_COMMAND_REPLAY_FINAL_ONLY;
     default:
       return EDR_COMMAND_REPLAY_IDEMPOTENT;

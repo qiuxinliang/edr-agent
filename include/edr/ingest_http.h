@@ -57,6 +57,9 @@ typedef struct {
   int control_stream_ready;
   int control_stream_lease_valid;
   int long_poll_fallback;
+  int long_poll_ready;
+  int64_t long_poll_last_success_unix_ms;
+  int64_t long_poll_last_failure_unix_ms;
   int report_events_v2_enabled;
   int zstd_requested;
   int backpressure_enabled;

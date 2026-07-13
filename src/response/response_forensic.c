@@ -659,6 +659,39 @@ typedef struct {
 } ForensicAsyncJob;
 static ForensicAsyncJob g_fx; /* 受 g_fx_lock 保护 */
 
+#ifdef _WIN32
+static DWORD WINAPI fx_monitor_thread(LPVOID unused) {
+  (void)unused;
+  while (edr_response_forensic_async_active()) {
+    edr_response_forensic_async_poll();
+    Sleep(100u);
+  }
+  return 0;
+}
+#else
+static void *fx_monitor_thread(void *unused) {
+  (void)unused;
+  while (edr_response_forensic_async_active()) {
+    edr_response_forensic_async_poll();
+    usleep(100000u);
+  }
+  return NULL;
+}
+#endif
+
+static int fx_start_monitor(void) {
+#ifdef _WIN32
+  HANDLE thread = CreateThread(NULL, 0u, fx_monitor_thread, NULL, 0u, NULL);
+  if (!thread) return -1;
+  CloseHandle(thread);
+#else
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, fx_monitor_thread, NULL) != 0) return -1;
+  (void)pthread_detach(thread);
+#endif
+  return 0;
+}
+
 /* 构造 .req + extra_args,spawn velo(phase=0)。调用方持锁。返回 EDR_DC_OK/busy/err。 */
 static int fx_spawn_locked(const char *scope, const uint8_t *payload, size_t payload_len,
                            const char *artifact_ext, char *detail, size_t detail_cap) {
@@ -729,6 +762,14 @@ int edr_response_forensic_async_accept(const char *cmd_id, const char *command_t
   /* 复用 artifact_ext 供 phase2 同名约定:重存 ext 到 scope 后缀不需要;artifact 路径已定 */
   g_fx.active = 1;
   fx_unlock();
+  if (fx_start_monitor() != 0) {
+    fx_lock();
+    edr_deep_collector_kill();
+    (void)memset(&g_fx, 0, sizeof(g_fx));
+    fx_unlock();
+    if (detail) snprintf(detail, detail_cap, "collector monitor thread start failed");
+    return -4;
+  }
   return 0;
 }
 
@@ -761,6 +802,11 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
     (void)response_file_sha256(artifact, sha);
     if (do_upload) upload_rc = edr_transport_v2_upload_file(cmd_id, artifact, sha, minio_key, sizeof(minio_key));
     if (do_upload && (upload_rc != 0 || !minio_key[0])) {
+      if (edr_command_queue_forensic_upload(cmd_id, command_type, sm, artifact, sha,
+                                            source, rc == 2) == 0) {
+        edr_command_audit_both(cmd_id, "forensic artifact upload deferred to durable retry queue");
+        return;
+      }
       if (command_type && strcmp(command_type, "yara_scan") == 0) {
         yara_artifact_result_json(result, sizeof(result), "failed", source, artifact, sha, minio_key,
                                   "failed", "artifact collected but upload failed; no durable remote result",
@@ -800,6 +846,40 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
     }
     edr_command_emit_always_typed(cmd_id, command_type, sm, EdrCmdExecFailed, 6, fail);
   }
+}
+
+void edr_response_forensic_complete_queued_upload(
+    const char *command_id, const char *command_type, const EdrSoarCommandMeta *soar_meta,
+    const char *artifact_path, const char *sha256, const char *object_key,
+    const char *source, int partial, int upload_ok, const char *upload_error) {
+  char result[2600];
+  const char *type = command_type && command_type[0] ? command_type : "collect_forensic";
+  const char *actual_source = source && source[0] ? source : "builtin";
+  if (upload_ok && object_key && object_key[0]) {
+    if (strcmp(type, "yara_scan") == 0) {
+      yara_artifact_result_json(result, sizeof(result), partial ? "partial_success" : "success",
+                                actual_source, artifact_path, sha256, object_key, "ok", "", partial);
+    } else {
+      forensic_result_json(result, sizeof(result), partial ? "partial_success" : "success",
+                           actual_source, artifact_path, sha256, object_key, 0, "ok", "");
+    }
+    edr_cmd_inc_handled();
+    edr_cmd_inc_exec_ok();
+    edr_command_emit_always_typed(command_id, type, soar_meta, EdrCmdExecOk, 0, result);
+    return;
+  }
+  const char *error = upload_error && upload_error[0]
+                          ? upload_error
+                          : "artifact upload retry failed without a durable object key";
+  if (strcmp(type, "yara_scan") == 0) {
+    yara_artifact_result_json(result, sizeof(result), "failed", actual_source, artifact_path,
+                              sha256, "", "failed", error, partial);
+  } else {
+    forensic_result_json(result, sizeof(result), "failed", actual_source, artifact_path,
+                         sha256, "", 0, "failed", error);
+  }
+  edr_cmd_inc_exec_fail();
+  edr_command_emit_always_typed(command_id, type, soar_meta, EdrCmdExecFailed, 9, result);
 }
 
 void edr_response_forensic_async_poll(void) {
