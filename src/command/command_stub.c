@@ -5183,6 +5183,59 @@ int edr_command_replay_persisted_inbox_once(void) {
   return 0;
 }
 
+static uint32_t command_result_retry_delay_ms(const EdrCommandStateRecord *record) {
+  uint64_t delay = command_u32_env_clamped("EDR_COMMAND_RESULT_RETRY_BASE_MS", 5000u, 1000u, 60000u);
+  uint64_t cap = command_u32_env_clamped("EDR_COMMAND_RESULT_RETRY_MAX_MS", 300000u, 5000u, 3600000u);
+  uint32_t attempts = record && record->report_attempts ? record->report_attempts : 1u;
+  for (uint32_t i = 1u; i < attempts && delay < cap; i++) {
+    delay *= 2u;
+    if (delay > cap) {
+      delay = cap;
+    }
+  }
+  /* Deterministic bounded jitter avoids endpoints retrying the same result in
+   * lockstep while preserving a reproducible delay for a persisted record. */
+  uint32_t hash = 2166136261u;
+  if (record) {
+    for (const unsigned char *p = (const unsigned char *)record->command_id; p && *p; p++) {
+      hash = (hash ^ *p) * 16777619u;
+    }
+  }
+  uint64_t jitter = delay / 10u;
+  if (jitter > 0u) {
+    delay += hash % (jitter + 1u);
+  }
+  return (uint32_t)(delay > cap ? cap : delay);
+}
+
+static void record_command_result_delivery_failure(const EdrCommandStateRecord *record, int rc) {
+  char error[192];
+  int retryable = 1;
+  error[0] = '\0';
+  edr_ingest_http_get_last_command_result_delivery_error(error, sizeof(error), &retryable);
+  if (!error[0]) {
+    snprintf(error, sizeof(error), "%s", "command result delivery failed");
+  }
+  if (rc == EDR_INGEST_COMMAND_RESULT_REJECTED || !retryable) {
+    edr_command_state_mark_report_rejected(record, error);
+    audit_both(record->command_id, "command result permanently rejected; retained in local dead-letter state");
+    return;
+  }
+  uint32_t max_attempts = command_u32_env_clamped("EDR_COMMAND_RESULT_RETRY_MAX_ATTEMPTS", 12u, 1u, 1000u);
+  if (record->report_attempts >= max_attempts) {
+    char exhausted[256];
+    snprintf(exhausted, sizeof(exhausted), "retry budget exhausted after %u attempts: %.160s",
+             (unsigned)record->report_attempts, error);
+    edr_command_state_mark_report_rejected(record, exhausted);
+    audit_both(record->command_id, "command result retry budget exhausted; retained in local dead-letter state");
+    return;
+  }
+  int64_t next_retry = command_now_ms() + (int64_t)command_result_retry_delay_ms(record);
+  if (edr_command_state_mark_report_retry(record, error, next_retry) != 0) {
+    audit_both(record->command_id, "command result delivery failed and retry state could not be persisted");
+  }
+}
+
 static void flush_command_result_outbox(void) {
   EdrCommandStateRecord pending[16];
   int n = edr_command_state_collect_pending(pending, sizeof(pending) / sizeof(pending[0]));
@@ -5206,6 +5259,8 @@ static void flush_command_result_outbox(void) {
     }
     if (rc == 0) {
       edr_command_state_mark_reported(&pending[i]);
+    } else {
+      record_command_result_delivery_failure(&pending[i], rc);
     }
   }
 }

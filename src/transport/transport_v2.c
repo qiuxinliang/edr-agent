@@ -247,8 +247,13 @@ int edr_transport_v2_command_result_typed(const char *command_id, const char *co
   rc = edr_ingest_http_post_command_result_typed(command_id, command_type, meta, execution_status, exit_code,
                                                  detail_utf8);
   if (rc != 0) {
+    char error[160];
+    error[0] = '\0';
+    edr_ingest_http_get_last_command_result_delivery_error(error, sizeof(error), NULL);
     s_rt.send_fail++;
-    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "command_result failed");
+    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), error, "command_result failed");
+  } else {
+    s_rt.last_error[0] = '\0';
   }
   return rc;
 }

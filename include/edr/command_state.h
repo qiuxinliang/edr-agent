@@ -20,6 +20,10 @@ typedef struct EdrCommandStateRecord {
   int retry_count;
   int final_record;
   int report_pending;
+  uint32_t report_attempts;
+  int64_t report_last_failure_unix_ms;
+  int64_t report_next_retry_unix_ms;
+  char report_last_error[128];
   int64_t updated_unix_ms;
   char agent_boot_id[64];
   int process_id;
@@ -114,7 +118,14 @@ void edr_command_state_delete_pending_ack(const char *command_id);
 void edr_command_state_get_quarantine_stats(EdrCommandStateQuarantineStats *out_stats);
 
 int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap);
+int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
+                                        const char *error,
+                                        int64_t next_retry_unix_ms);
 void edr_command_state_mark_reported(const EdrCommandStateRecord *record);
+/* A permanent HTTP/API rejection is retained locally for audit but no longer
+ * retried, preventing a malformed terminal result from amplifying traffic. */
+void edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
+                                            const char *error);
 void edr_command_state_compact_if_needed(void);
 
 #ifdef __cplusplus

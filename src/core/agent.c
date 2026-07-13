@@ -1524,11 +1524,11 @@ static const char *edr_agent_native_architecture(const char *process_architectur
   return process_architecture;
 }
 
-static void edr_agent_capability_manifest_json(const EdrAgent *agent,
-                                               const EdrIngestHttpRuntime *http_rt,
-                                               const AVEStatus *avst, int ave_ok,
-                                               char *out, size_t out_cap) {
-  if (!out || out_cap == 0u) return;
+static int edr_agent_capability_manifest_json(const EdrAgent *agent,
+                                              const EdrIngestHttpRuntime *http_rt,
+                                              const AVEStatus *avst, int ave_ok,
+                                              char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) return -1;
 #ifdef _WIN32
   const char *platform = "windows";
 #elif defined(__APPLE__)
@@ -1660,7 +1660,7 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
            windows_native && agent && agent->cfg.attack_surface.software_enabled ? "true" : "false",
            windows_native && agent && agent->cfg.attack_surface.defender_enabled ? "true" : "false",
            agent && agent->cfg.attack_surface.egress_enabled ? "true" : "false");
-  snprintf(
+  int written = snprintf(
       out, out_cap,
       "{\"schema\":\"edr.agent.capabilities.v1\",\"platform\":\"%s\",\"architecture\":\"%s\","
       "\"native_architecture\":\"%s\",\"emulated\":%s,"
@@ -1736,6 +1736,11 @@ static void edr_agent_capability_manifest_json(const EdrAgent *agent,
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       dangerous_policy ? "true" : "false", velo_query_runtime);
+  if (written < 0 || (size_t)written >= out_cap) {
+    out[0] = '\0';
+    return -1;
+  }
+  return 0;
 }
 
 static int edr_agent_collection_enabled(const EdrConfig *cfg) {
@@ -2021,7 +2026,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char resource_pressure_reason[96];
   char poll_probe_json[1600];
   char config_recovery_json[1600];
-  char capability_manifest_json[8192];
+  char capability_manifest_json[16384];
   const char *hot_thread_role = "unknown";
   EdrIngestHttpRuntime http_rt;
   EdrTransportV2Runtime tv2_rt;
@@ -2044,9 +2049,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_command_get_delivery_health(&cdh);
   edr_command_executor_get_health(&ceh);
   ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
-  edr_agent_capability_manifest_json(agent, &http_rt, &avst, ave_ok,
-                                     capability_manifest_json,
-                                     sizeof(capability_manifest_json));
+  int capability_manifest_ok = edr_agent_capability_manifest_json(
+      agent, &http_rt, &avst, ave_ok, capability_manifest_json,
+      sizeof(capability_manifest_json));
+  if (capability_manifest_ok != 0) {
+    snprintf(capability_manifest_json, sizeof(capability_manifest_json),
+             "{\"schema\":\"edr.agent.capabilities.v1\",\"truncated\":true,\"commands\":{}}");
+  }
 #ifdef _WIN32
   if (rs.hot_thread_id != 0u && ch.collector_thread_id != 0u &&
       rs.hot_thread_id == ch.collector_thread_id) {
@@ -2108,7 +2117,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
   edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
   if (strcmp(health_profile, "diagnostic") != 0) {
-    char body_basic[24576];
+    char body_basic[49152];
     int n_basic = snprintf(
         body_basic, sizeof(body_basic),
         "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
@@ -2307,7 +2316,23 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
               http_rt.http2_negotiated ? "true" : "false",
               http_negotiated_protocol[0] ? http_negotiated_protocol : "unknown");
     } else {
-      fprintf(stderr, "[engine-health] skipped: payload too large or formatting failed profile=basic\n");
+      char capability_only[18432];
+      int n_capability_only = snprintf(
+          capability_only, sizeof(capability_only),
+          "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
+          "\"engine_health\":{\"reported_at_unix_ms\":%llu,\"capability_manifest\":%s,"
+          "\"monitor\":{\"enabled\":true,\"profile\":\"basic\",\"interval_s\":%u},"
+          "\"health_status\":\"degraded\",\"health_error\":\"basic health payload too large\"}}",
+          agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
+          runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
+          (unsigned long long)wall_ms, capability_manifest_json,
+          agent->cfg.health_monitor.interval_s);
+      if (n_capability_only > 0 && (size_t)n_capability_only < sizeof(capability_only)) {
+        (void)edr_ingest_http_post_engine_health_json(capability_only);
+        fprintf(stderr, "[engine-health] posted capability-only fallback profile=basic\n");
+      } else {
+        fprintf(stderr, "[engine-health] capability fallback formatting failed profile=basic\n");
+      }
     }
     return;
   }

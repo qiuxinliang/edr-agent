@@ -1,6 +1,8 @@
 #include "edr/command_state.h"
 #include "edr/local_evidence_cache.h"
 
+#include "cJSON.h"
+
 #ifdef _MSC_VER
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -648,86 +650,63 @@ static void parse_json_string_field_line(const char *line, const char *key, char
   if (!line || !key) {
     return;
   }
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\":\"", key);
-  const char *p = strstr(line, pat);
-  if (!p) {
+  cJSON *root = cJSON_Parse(line);
+  if (!root) {
     return;
   }
-  p += strlen(pat);
-  size_t o = 0;
-  while (*p && o + 1u < cap) {
-    if (*p == '"' && (p == line || p[-1] != '\\')) {
-      break;
-    }
-    if (*p == '\\' && p[1]) {
-      p++;
-    }
-    out[o++] = *p++;
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
+  if (cJSON_IsString(value) && value->valuestring) {
+    snprintf(out, cap, "%s", value->valuestring);
   }
-  out[o] = '\0';
+  cJSON_Delete(root);
 }
 
 static int parse_json_int_field_line(const char *line, const char *key, int defv) {
   if (!line || !key) {
     return defv;
   }
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\":", key);
-  const char *p = strstr(line, pat);
-  if (!p) {
+  cJSON *root = cJSON_Parse(line);
+  if (!root) {
     return defv;
   }
-  p += strlen(pat);
-  while (*p && isspace((unsigned char)*p)) {
-    p++;
-  }
-  return (int)strtol(p, NULL, 10);
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
+  int out = cJSON_IsNumber(value) ? value->valueint : defv;
+  cJSON_Delete(root);
+  return out;
 }
 
 static int64_t parse_json_int64_field_line(const char *line, const char *key, int64_t defv) {
   if (!line || !key) {
     return defv;
   }
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\":", key);
-  const char *p = strstr(line, pat);
-  if (!p) {
+  cJSON *root = cJSON_Parse(line);
+  if (!root) {
     return defv;
   }
-  p += strlen(pat);
-  while (*p && isspace((unsigned char)*p)) {
-    p++;
-  }
-  return strtoll(p, NULL, 10);
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
+  int64_t out = cJSON_IsNumber(value) ? (int64_t)value->valuedouble : defv;
+  cJSON_Delete(root);
+  return out;
 }
 
 static char *parse_json_string_field_alloc(const char *line, const char *key) {
   if (!line || !key) {
     return NULL;
   }
-  char pat[96];
-  snprintf(pat, sizeof(pat), "\"%s\":\"", key);
-  const char *p = strstr(line, pat);
-  if (!p) {
+  cJSON *root = cJSON_Parse(line);
+  if (!root) {
     return NULL;
   }
-  p += strlen(pat);
-  char *out = (char *)malloc(strlen(p) + 1u);
-  if (!out) {
-    return NULL;
-  }
-  size_t o = 0;
-  while (*p) {
-    if (*p == '"' && (p == line || p[-1] != '\\')) {
-      break;
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
+  char *out = NULL;
+  if (cJSON_IsString(value) && value->valuestring) {
+    size_t n = strlen(value->valuestring);
+    out = (char *)malloc(n + 1u);
+    if (out) {
+      memcpy(out, value->valuestring, n + 1u);
     }
-    if (*p == '\\' && p[1]) {
-      p++;
-    }
-    out[o++] = *p++;
   }
-  out[o] = '\0';
+  cJSON_Delete(root);
   return out;
 }
 
@@ -857,21 +836,20 @@ static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) 
   parse_json_string_field_line(line, "artifacts", out->artifacts, sizeof(out->artifacts));
   parse_json_string_field_line(line, "detail", out->detail, sizeof(out->detail));
   parse_json_string_field_line(line, "agent_boot_id", out->agent_boot_id, sizeof(out->agent_boot_id));
+  parse_json_string_field_line(line, "report_last_error", out->report_last_error,
+                               sizeof(out->report_last_error));
   out->execution_status = parse_json_int_field_line(line, "execution_status", 0);
   out->exit_code = parse_json_int_field_line(line, "exit_code", 0);
   out->retry_count = parse_json_int_field_line(line, "retry_count", 0);
   out->final_record = parse_json_int_field_line(line, "final", 0);
   out->report_pending = parse_json_int_field_line(line, "report_pending", 0);
+  out->report_attempts = (uint32_t)parse_json_int_field_line(line, "report_attempts", 0);
   out->process_id = parse_json_int_field_line(line, "process_id", 0);
-  {
-    const char *p = strstr(line, "\"updated_unix_ms\"");
-    if (p) {
-      p = strchr(p, ':');
-      if (p) {
-        out->updated_unix_ms = strtoll(p + 1, NULL, 10);
-      }
-    }
-  }
+  out->updated_unix_ms = parse_json_int64_field_line(line, "updated_unix_ms", 0);
+  out->report_last_failure_unix_ms =
+      parse_json_int64_field_line(line, "report_last_failure_unix_ms", 0);
+  out->report_next_retry_unix_ms =
+      parse_json_int64_field_line(line, "report_next_retry_unix_ms", 0);
 }
 
 static void command_inbox_default_dir(char *out, size_t cap) {
@@ -1884,7 +1862,7 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
   int retry = count_prior_attempts(command_id, meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
-  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], line[12288];
+  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], line[12544];
   json_escape_to(cid, sizeof(cid), command_id ? command_id : "");
   json_escape_to(ctype, sizeof(ctype), command_type ? command_type : "");
   json_escape_to(idem, sizeof(idem), idem_key);
@@ -1907,10 +1885,15 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
-           "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":%d,\"updated_unix_ms\":%lld,"
+           "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":%d,"
+           "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
+           "\"report_next_retry_unix_ms\":0,\"report_last_error\":\"\","
+           "\"updated_unix_ms\":%lld,"
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
            "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
+           report_pending ? 1u : 0u,
+           report_pending ? (long long)state_now_ms() : 0LL,
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
   if (append_state_line_locked(line) != 0) {
     return -1;
@@ -2018,11 +2001,8 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
   char line[8192];
   while (fgets(line, sizeof(line), f)) {
     EdrCommandStateRecord rec;
-    if (!strstr(line, "\"final\":1")) {
-      continue;
-    }
     fill_record_from_line(line, &rec);
-    if (!rec.command_id[0]) {
+    if (!rec.final_record || !rec.command_id[0]) {
       continue;
     }
     size_t idx = latest_n;
@@ -2043,13 +2023,20 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
   fclose(f);
   state_lock_release(lock);
   size_t n = 0;
+  int pending_exists = 0;
+  int64_t now_ms = state_now_ms();
   for (size_t i = 0; i < latest_n && n < cap; i++) {
-    if (latest[i].report_pending && latest[i].command_id[0] && latest[i].detail[0]) {
+    if (!latest[i].report_pending || !latest[i].command_id[0]) {
+      continue;
+    }
+    pending_exists = 1;
+    if (latest[i].report_next_retry_unix_ms <= 0 ||
+        latest[i].report_next_retry_unix_ms <= now_ms) {
       out[n++] = latest[i];
     }
   }
   free(latest);
-  if (n == 0u) {
+  if (n == 0u && !pending_exists) {
     s_collect_cache_info = info;
     s_collect_cache_pending_zero = 1;
   } else {
@@ -2058,11 +2045,66 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
   return (int)n;
 }
 
+int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
+                                        const char *error,
+                                        int64_t next_retry_unix_ms) {
+  if (!record || !record->command_id[0]) {
+    return -1;
+  }
+  char cid[300], ctype[180], idem[1100], st[96], det[4200], art[2200];
+  char scid[300], run[300], step[300], boot[100], report_error[300], line[13500];
+  json_escape_to(cid, sizeof(cid), record->command_id);
+  json_escape_to(ctype, sizeof(ctype), record->command_type);
+  json_escape_to(idem, sizeof(idem), record->idempotency_key);
+  json_escape_to(st, sizeof(st), record->response_status[0] ? record->response_status : "failed");
+  json_escape_to(scid, sizeof(scid), record->soar_correlation_id);
+  json_escape_to(run, sizeof(run), record->playbook_run_id);
+  json_escape_to(step, sizeof(step), record->playbook_step_id);
+  json_escape_to(det, sizeof(det), record->detail);
+  json_escape_to(art, sizeof(art), record->artifacts);
+  json_escape_to(report_error, sizeof(report_error), error ? error : "result delivery failed");
+  if (record->agent_boot_id[0]) {
+    json_escape_to(boot, sizeof(boot), record->agent_boot_id);
+  } else {
+    char boot_raw[64];
+    state_boot_id(boot_raw, sizeof(boot_raw));
+    json_escape_to(boot, sizeof(boot), boot_raw);
+  }
+#ifdef _WIN32
+  int pid = record->process_id ? record->process_id : _getpid();
+#else
+  int pid = record->process_id ? record->process_id : (int)getpid();
+#endif
+  int64_t now_ms = state_now_ms();
+  uint32_t attempts = record->report_attempts < UINT32_MAX
+                          ? record->report_attempts + 1u
+                          : UINT32_MAX;
+  snprintf(line, sizeof(line),
+           "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
+           "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
+           "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":1,"
+           "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
+           "\"report_next_retry_unix_ms\":%lld,\"report_last_error\":%s,"
+           "\"updated_unix_ms\":%lld,\"soar_correlation_id\":%s,"
+           "\"playbook_run_id\":%s,\"playbook_step_id\":%s,\"agent_boot_id\":%s,"
+           "\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
+           cid, ctype, idem, st, record->execution_status, record->exit_code,
+           record->retry_count, attempts, (long long)now_ms,
+           (long long)next_retry_unix_ms, report_error, (long long)now_ms,
+           scid, run, step, boot, pid, art, det);
+  if (append_state_line_locked(line) != 0) {
+    return -1;
+  }
+  s_collect_cache_pending_zero = 0;
+  edr_command_state_compact_if_needed();
+  return 0;
+}
+
 void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
   if (!record || !record->command_id[0]) {
     return;
   }
-  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], line[12288];
+  char cid[300], ctype[180], idem[1100], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], report_error[300], line[13000];
   json_escape_to(cid, sizeof(cid), record->command_id);
   json_escape_to(ctype, sizeof(ctype), record->command_type);
   json_escape_to(idem, sizeof(idem), record->idempotency_key);
@@ -2072,6 +2114,7 @@ void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
   json_escape_to(step, sizeof(step), record->playbook_step_id);
   json_escape_to(det, sizeof(det), record->detail);
   json_escape_to(art, sizeof(art), record->artifacts);
+  json_escape_to(report_error, sizeof(report_error), record->report_last_error);
   if (record->agent_boot_id[0]) {
     json_escape_to(boot, sizeof(boot), record->agent_boot_id);
   } else {
@@ -2087,14 +2130,32 @@ void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
-           "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
+           "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":0,"
+           "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
+           "\"report_next_retry_unix_ms\":0,\"report_last_error\":%s,"
+           "\"updated_unix_ms\":%lld,"
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
            "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
-           cid, ctype, idem, st, record->execution_status, record->exit_code, record->retry_count,
+           cid, ctype, idem, st, record->execution_status, record->exit_code,
+           record->retry_count, record->report_attempts,
+           (long long)record->report_last_failure_unix_ms,
+           record->report_last_error[0] ? report_error : "\"\"",
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
   append_state_line_locked(line);
   s_collect_cache_pending_zero = 0;
   edr_command_state_compact_if_needed();
+}
+
+void edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
+                                            const char *error) {
+  if (!record || !record->command_id[0]) {
+    return;
+  }
+  EdrCommandStateRecord rejected = *record;
+  snprintf(rejected.report_last_error, sizeof(rejected.report_last_error), "%s",
+           error && error[0] ? error : "command result rejected by platform");
+  rejected.report_last_failure_unix_ms = state_now_ms();
+  edr_command_state_mark_reported(&rejected);
 }
 
 void edr_command_state_compact_if_needed(void) {

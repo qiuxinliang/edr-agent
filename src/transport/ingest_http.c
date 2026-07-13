@@ -2,6 +2,9 @@
 
 #include "edr/command.h"
 #include "edr/command_executor.h"
+#include "edr/command_result_json.h"
+
+#include "cJSON.h"
 #include "edr/command_state.h"
 #include "edr/command_util.h"
 #include "edr/event_batch.h"
@@ -180,6 +183,8 @@ static unsigned long s_native_post_fail_log_suppressed;
 static int64_t s_last_success_ms;
 static int64_t s_last_failure_ms;
 static char s_last_error[160];
+static char s_last_command_result_error[160];
+static int s_last_command_result_retryable = 1;
 static char s_http2_last_error[160];
 static int s_insecure_http;
 static volatile int s_circuit_open;
@@ -5147,77 +5152,6 @@ static int ws_send_agent_message(EdrWsConn *c, const char *command_type) {
   return ws_send_text_conn(c, env);
 }
 
-static int ws_send_command_result(const char *command_id, const char *command_type,
-                                  const struct EdrSoarCommandMeta *meta,
-                                  int execution_status, int exit_code, const char *detail_utf8) {
-  char *cmd = NULL;
-  char *ctype = NULL;
-  char *detail = NULL;
-  char *soar = NULL;
-  char *run = NULL;
-  char *step = NULL;
-  char *payload = NULL;
-  char *payload_b64 = NULL;
-  char *env = NULL;
-  size_t payload_cap;
-  size_t b64_cap;
-  size_t env_cap;
-  int rc = -1;
-  if (!s_ws_ready || !command_id || !command_id[0]) {
-    return -1;
-  }
-  cmd = json_escape_alloc(command_id);
-  ctype = json_escape_alloc(command_type ? command_type : "");
-  detail = json_escape_alloc(detail_utf8 ? detail_utf8 : "");
-  soar = json_escape_alloc(meta ? meta->soar_correlation_id : "");
-  run = json_escape_alloc(meta ? meta->playbook_run_id : "");
-  step = json_escape_alloc(meta ? meta->playbook_step_id : "");
-  if (!cmd || !ctype || !detail || !soar || !run || !step) {
-    goto done;
-  }
-  payload_cap = strlen(cmd) + strlen(ctype) + strlen(detail) + strlen(soar) + strlen(run) + strlen(step) +
-                strlen(s_agent_ver) + 512u;
-  payload = (char *)malloc(payload_cap);
-  if (!payload) {
-    goto done;
-  }
-  snprintf(payload, payload_cap,
-           "{\"command_id\":\"%s\",\"command_type\":%s,\"status\":%d,\"exit_code\":%d,"
-           "\"detail_utf8\":\"%s\",\"agent_version\":\"%s\","
-           "\"soar_correlation_id\":\"%s\",\"playbook_run_id\":\"%s\","
-           "\"playbook_step_id\":\"%s\",\"finished_unix_ms\":%lld}",
-           cmd, ctype, execution_status, exit_code, detail, s_agent_ver, soar, run, step,
-           (long long)unix_ms_now());
-  b64_cap = (strlen(payload) / 3u + 2u) * 4u + 16u;
-  payload_b64 = (char *)malloc(b64_cap);
-  if (!payload_b64 || b64_encode((const uint8_t *)payload, strlen(payload), payload_b64, b64_cap) < 0) {
-    goto done;
-  }
-  env_cap = strlen(cmd) + strlen(payload_b64) + strlen(soar) + strlen(run) + strlen(step) + 512u;
-  env = (char *)malloc(env_cap);
-  if (!env) {
-    goto done;
-  }
-  snprintf(env, env_cap,
-           "{\"command_id\":\"%s\",\"command_type\":\"command_result\","
-           "\"issued_at_unix_ms\":%lld,\"payload_b64\":\"%s\","
-           "\"soar_correlation_id\":\"%s\",\"playbook_run_id\":\"%s\","
-           "\"playbook_step_id\":\"%s\"}",
-           cmd, (long long)unix_ms_now(), payload_b64, soar, run, step);
-  rc = ws_send_text_active(env);
-done:
-  free(cmd);
-  free(ctype);
-  free(detail);
-  free(soar);
-  free(run);
-  free(step);
-  free(payload);
-  free(payload_b64);
-  free(env);
-  return rc;
-}
-
 static int post_to_suffix(const char *suffix, const char *body) {
   char url[1024];
   size_t rb = strlen(s_rest);
@@ -5425,70 +5359,85 @@ int edr_ingest_http_post_config_status(const char *tenant_id,
   return 0;
 }
 
+static long command_result_http_status_from_error(const char *error) {
+  if (!error || !error[0]) {
+    return 0;
+  }
+  const char *status = strstr(error, "HTTP/1.1 ");
+  if (status) {
+    return strtol(status + strlen("HTTP/1.1 "), NULL, 10);
+  }
+  status = strstr(error, "status=");
+  return status ? strtol(status + strlen("status="), NULL, 10) : 0;
+}
+
+static void command_result_note_delivery_failure(const char *response) {
+  long status = command_result_http_status_from_error(s_last_error);
+  char code[64] = "";
+  char message[96] = "";
+  cJSON *root = response && response[0] ? cJSON_Parse(response) : NULL;
+  if (root) {
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, "code");
+    if (cJSON_IsString(value) && value->valuestring) {
+      snprintf(code, sizeof(code), "%s", value->valuestring);
+    }
+    value = cJSON_GetObjectItemCaseSensitive(root, "message");
+    if (cJSON_IsString(value) && value->valuestring) {
+      snprintf(message, sizeof(message), "%.80s", value->valuestring);
+    }
+    cJSON_Delete(root);
+  }
+  s_last_command_result_retryable =
+      !(status >= 400 && status < 500 && status != 408 && status != 429);
+  if (status > 0 || code[0] || message[0]) {
+    snprintf(s_last_command_result_error, sizeof(s_last_command_result_error),
+             "HTTP %ld %s%s%s", status,
+             code[0] ? code : "REQUEST_FAILED",
+             message[0] ? ": " : "", message);
+  } else {
+    snprintf(s_last_command_result_error, sizeof(s_last_command_result_error), "%s",
+             s_last_error[0] ? s_last_error : "command result transport failure");
+  }
+}
+
+void edr_ingest_http_get_last_command_result_delivery_error(char *out, size_t cap,
+                                                            int *retryable) {
+  if (out && cap > 0u) {
+    snprintf(out, cap, "%s", s_last_command_result_error);
+  }
+  if (retryable) {
+    *retryable = s_last_command_result_retryable;
+  }
+}
+
 int edr_ingest_http_post_command_result_typed(const char *command_id, const char *command_type,
                                               const struct EdrSoarCommandMeta *meta,
                                               int execution_status, int exit_code,
                                               const char *detail_utf8) {
-  char *detail = NULL;
-  char *cmd = NULL;
-  char *ctype = NULL;
-  char *soar = NULL;
-  char *run = NULL;
-  char *step = NULL;
   char *body = NULL;
-  size_t body_cap;
+  char response[512];
   int rc;
-  int ws_was_ready;
   if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
     return -1;
   }
-  ws_was_ready = s_ws_ready ? 1 : 0;
-  if (ws_send_command_result(command_id, command_type, meta, execution_status, exit_code, detail_utf8) == 0) {
-    note_ws_message_success();
-    note_command_result_success();
-    return 0;
-  }
-  if (ws_was_ready) {
-    s_ws_message_fail++;
-  }
-  cmd = json_escape_alloc(command_id);
-  ctype = json_escape_alloc(command_type ? command_type : "");
-  detail = json_escape_alloc(detail_utf8 ? detail_utf8 : "");
-  soar = json_escape_alloc(meta ? meta->soar_correlation_id : "");
-  run = json_escape_alloc(meta ? meta->playbook_run_id : "");
-  step = json_escape_alloc(meta ? meta->playbook_step_id : "");
-  if (!cmd || !ctype || !detail || !soar || !run || !step) {
-    free(cmd);
-    free(ctype);
-    free(detail);
-    free(soar);
-    free(run);
-    free(step);
-    return -1;
-  }
-  body_cap = strlen(cmd) + strlen(ctype) + strlen(detail) + strlen(soar) + strlen(run) + strlen(step) +
-             strlen(s_endpoint) + strlen(s_agent_ver) + 512u;
-  body = (char *)malloc(body_cap);
+  /* HTTP 2xx is the authoritative application ACK: the server returns it only
+   * after the terminal result has been durably stored. The WebSocket result
+   * path remains disabled until it has an equivalent result_ack protocol. */
+  body = edr_command_result_http_json(
+      s_endpoint, s_agent_ver, command_id, command_type, execution_status,
+      exit_code, detail_utf8, unix_ms_now(),
+      meta ? meta->soar_correlation_id : "",
+      meta ? meta->playbook_run_id : "",
+      meta ? meta->playbook_step_id : "");
   if (!body) {
-    free(cmd);
-    free(ctype);
-    free(detail);
-    free(soar);
-    free(run);
-    free(step);
     return -1;
   }
-  snprintf(body, body_cap,
-           "{\"endpoint_id\":\"%s\",\"result\":{"
-           "\"command_id\":\"%s\",\"command_type\":%s,\"endpoint_id\":\"%s\",\"agent_version\":\"%s\","
-           "\"status\":\"%d\",\"exit_code\":\"%d\",\"detail_utf8\":\"%s\","
-           "\"finished_unix_ms\":\"%lld\",\"soar_correlation_id\":\"%s\","
-           "\"playbook_run_id\":\"%s\",\"playbook_step_id\":\"%s\"}}",
-           s_endpoint, cmd, ctype, s_endpoint, s_agent_ver, execution_status, exit_code, detail,
-           (long long)unix_ms_now(), soar, run, step);
+  response[0] = '\0';
   rc = request_to_suffix("POST", "ingest/report-command-result", "application/json",
-                         body, strlen(body), NULL, 0u);
+                         body, strlen(body), response, sizeof(response));
   if (rc == 0) {
+    s_last_command_result_error[0] = '\0';
+    s_last_command_result_retryable = 1;
     note_http_request_success();
     note_command_result_success();
   } else if (!s_last_error[0]) {
@@ -5499,14 +5448,14 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
     note_http_request_failure();
     note_command_result_failure();
   }
-  free(cmd);
-  free(ctype);
-  free(detail);
-  free(soar);
-  free(run);
-  free(step);
-  free(body);
-  return rc;
+  edr_command_result_json_free(body);
+  if (rc != 0) {
+    command_result_note_delivery_failure(response);
+    return s_last_command_result_retryable
+               ? EDR_INGEST_COMMAND_RESULT_RETRYABLE_FAILURE
+               : EDR_INGEST_COMMAND_RESULT_REJECTED;
+  }
+  return EDR_INGEST_COMMAND_RESULT_OK;
 }
 
 int edr_ingest_http_post_command_result(const char *command_id,
@@ -5569,9 +5518,13 @@ static void control_ack_schedule_retry(const char *command_id, const char *trans
   edr_command_audit_both(command_id, "control ACK failed and durable ACK retry record could not be persisted");
 }
 
-static int edr_ingest_http_post_control_ack(const char *command_id, const char *transport, int64_t last_seq) {
+static int edr_ingest_http_post_control_ack_with_status(const char *command_id, const char *transport,
+                                                        int64_t last_seq, const char *status,
+                                                        const char *reason) {
   char *cmd = NULL;
   char *tr = NULL;
+  char *st = NULL;
+  char *why = NULL;
   char *body = NULL;
   char response[512];
   size_t body_cap;
@@ -5581,22 +5534,28 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
   }
   cmd = json_escape_alloc(command_id);
   tr = json_escape_alloc((transport && transport[0]) ? transport : "https_control");
-  if (!cmd || !tr) {
+  st = json_escape_alloc((status && status[0]) ? status : "received");
+  why = json_escape_alloc(reason ? reason : "");
+  if (!cmd || !tr || !st || !why) {
     free(cmd);
     free(tr);
+    free(st);
+    free(why);
     return -1;
   }
-  body_cap = strlen(s_endpoint) + strlen(cmd) + strlen(tr) + 256u;
+  body_cap = strlen(s_endpoint) + strlen(cmd) + strlen(tr) + strlen(st) + strlen(why) + 288u;
   body = (char *)malloc(body_cap);
   if (!body) {
     free(cmd);
     free(tr);
+    free(st);
+    free(why);
     return -1;
   }
   snprintf(body, body_cap,
-           "{\"endpoint_id\":\"%s\",\"command_id\":\"%s\",\"status\":\"received\","
-           "\"transport\":\"%s\",\"last_seq\":%lld}",
-           s_endpoint, cmd, tr, (long long)last_seq);
+           "{\"endpoint_id\":\"%s\",\"command_id\":\"%s\",\"status\":\"%s\","
+           "\"reason\":\"%s\",\"transport\":\"%s\",\"last_seq\":%lld}",
+           s_endpoint, cmd, st, why, tr, (long long)last_seq);
   response[0] = '\0';
   rc = request_to_suffix("POST", "ingest/control/ack", "application/json", body, strlen(body),
                          response, sizeof(response));
@@ -5623,8 +5582,14 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
   }
   free(cmd);
   free(tr);
+  free(st);
+  free(why);
   free(body);
   return rc;
+}
+
+static int edr_ingest_http_post_control_ack(const char *command_id, const char *transport, int64_t last_seq) {
+  return edr_ingest_http_post_control_ack_with_status(command_id, transport, last_seq, "received", NULL);
 }
 
 void edr_ingest_http_retry_pending_control_acks(void) {
@@ -6130,6 +6095,9 @@ static int poll_dispatch_one(const char *obj) {
   }
   int should_execute = edr_command_receive_envelope(command_id, command_type, payload, payload_len, &sm);
   if (should_execute < 0) {
+    (void)edr_ingest_http_post_control_ack_with_status(
+        command_id, transport, seq, "rejected", "agent could not durably receive command");
+    edr_command_audit_both(command_id, "command receipt rejected to platform after local durable receive failure");
     free(payload_b64);
     free(payload);
     return -1;

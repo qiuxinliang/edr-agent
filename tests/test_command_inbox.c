@@ -190,6 +190,32 @@ int main(void) {
   n = edr_command_state_collect_pending_acks(pending, 4);
   require_true(n == 0, "delete pending ACK after server receipt");
 
+  EdrSoarCommandMeta result_meta = meta;
+  snprintf(result_meta.idempotency_key, sizeof(result_meta.idempotency_key), "%s",
+           "idem-json-state|sigv1|placeholder");
+  const char *escaped_detail = "path=C:\\temp\\tail\\\"quoted\"";
+  require_true(edr_command_state_finish("cmd-json-state", "velo_query", &result_meta,
+                                        "failed", 3, 42, escaped_detail, NULL, 1) == 0,
+               "persist escaped command result detail");
+  EdrCommandStateRecord result_pending[4];
+  n = edr_command_state_collect_pending(result_pending, 4);
+  require_true(n >= 1, "collect pending escaped command result");
+  int found_escaped = 0;
+  for (int i = 0; i < n; i++) {
+    if (strcmp(result_pending[i].command_id, "cmd-json-state") == 0) {
+      found_escaped = 1;
+      require_true(strcmp(result_pending[i].detail, escaped_detail) == 0,
+                   "escaped detail survives durable JSON round trip");
+      edr_command_state_mark_report_rejected(&result_pending[i], "HTTP 400 INVALID_ARGUMENT");
+    }
+  }
+  require_true(found_escaped, "escaped command result present in pending outbox");
+  n = edr_command_state_collect_pending(result_pending, 4);
+  for (int i = 0; i < n; i++) {
+    require_true(strcmp(result_pending[i].command_id, "cmd-json-state") != 0,
+                 "permanently rejected result is removed from retry outbox");
+  }
+
   char corrupt_inbox_path[1024];
   snprintf(corrupt_inbox_path, sizeof(corrupt_inbox_path), "%s/corrupt-inbox.json", inbox_dir);
   write_corrupt_record(corrupt_inbox_path);

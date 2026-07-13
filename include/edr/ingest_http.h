@@ -11,6 +11,12 @@
 
 struct EdrSoarCommandMeta;
 
+enum {
+  EDR_INGEST_COMMAND_RESULT_OK = 0,
+  EDR_INGEST_COMMAND_RESULT_RETRYABLE_FAILURE = -1,
+  EDR_INGEST_COMMAND_RESULT_REJECTED = 1,
+};
+
 /** 在 edr_transport_init_from_config 中调用；rest_base 形如 http://127.0.0.1:8080/api/v1 */
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
                                 const char *bearer, const char *endpoint_id, const char *agent_version,
@@ -237,6 +243,10 @@ int edr_ingest_http_post_command_result_typed(const char *command_id,
                                               int execution_status,
                                               int exit_code,
                                               const char *detail_utf8);
+/* Copies the last command-result delivery error. `retryable` is false only
+ * after a definitive 4xx rejection from the platform. */
+void edr_ingest_http_get_last_command_result_delivery_error(char *out, size_t cap,
+                                                            int *retryable);
 
 /** 上传指令/取证产物；大结果落 object storage，command result 只保留 manifest。 */
 int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,

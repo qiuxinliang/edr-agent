@@ -10,8 +10,11 @@ edr_apply_common_warnings(test_shell_policy)
 add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox.c
-  ${CMAKE_SOURCE_DIR}/src/command/command_state.c)
-target_include_directories(test_command_inbox PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_inbox PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_common_warnings(test_command_inbox)
 add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -51,6 +54,16 @@ add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_sig
 target_include_directories(test_request_signing PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_request_signing)
 add_test(NAME request_signing COMMAND test_request_signing WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_result_json ${CMAKE_CURRENT_SOURCE_DIR}/test_command_result_json.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_result_json PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_command_result_json)
+add_test(NAME command_result_json_contract COMMAND test_command_result_json
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_attack_surface_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_contract.c)
 edr_apply_common_warnings(test_attack_surface_contract)
