@@ -33,6 +33,8 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
                                                  int report_events_v2_enabled,
                                                  const char *data_plane_encoding,
                                                  const char *data_plane_compression);
+void edr_ingest_http_configure_control_transport_options(int http2_enabled, int http2_required,
+                                                         int http1_fallback);
 void edr_ingest_http_configure_request_signing(const EdrRequestSigningConfig *cfg);
 
 int edr_ingest_http_configured(void);
@@ -53,6 +55,9 @@ typedef struct {
   int http2_enabled;
   int http2_required;
   int http2_negotiated;
+  int control_http2_enabled;
+  int control_http2_required;
+  int control_http1_fallback;
   int control_stream_enabled;
   int control_stream_ready;
   int control_stream_lease_valid;
@@ -181,6 +186,8 @@ void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required
                                            int control_stream_enabled,
                                            int long_poll_fallback,
                                            int report_events_v2_enabled);
+void edr_ingest_http_apply_control_transport_flags(int http2_enabled, int http2_required,
+                                                   int http1_fallback);
 
 typedef struct {
   char config_hash[65];

@@ -66,6 +66,14 @@ int main(void) {
       contains(source, "out->control_stream_lease_valid = stream_lease_valid") &&
       contains(source, "out->control_stream_lease_expired_count = s_control_stream_lease_expired") &&
       contains(source, "CURLOPT_XFERINFOFUNCTION, curl_transfer_progress") &&
+      contains(source, "curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &version)") &&
+      !contains(source, "#ifdef CURLINFO_HTTP_VERSION") &&
+      !contains(source, "#ifdef CURL_HTTP_VERSION_2_0") &&
+      contains(source, "json_get_string(line, \"protocol\", protocol") &&
+      contains(source, "note_negotiated_protocol_name(protocol, 1)") &&
+      contains(source, "server_drain") &&
+      contains(source, "control_http2_client_enabled()") &&
+      contains(source, "control_http1_fallback_enabled()") &&
       contains(source, "void edr_ingest_http_cancel_inflight(void)") &&
       contains(source, "edr_ingest_http_cancel_inflight();") &&
       count_occurrences(source, "note_control_stream_activity();") >= 3u;

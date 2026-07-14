@@ -12,6 +12,8 @@
 #define EDR_SS_MAX_SESSIONS 10u
 #define EDR_SS_ID_LEN 48u
 #define EDR_SS_BUF_KB 64u
+/* Keep each durable stream result within EdrCommandStateRecord.detail. */
+#define EDR_SS_STREAM_CHUNK_BYTES 2048u
 
 typedef void (*edr_ss_write_fn)(const char *session_id,
                                 const char *data, size_t len,

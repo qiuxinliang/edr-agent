@@ -255,6 +255,31 @@ int main(void) {
                  "permanently rejected result is removed from retry outbox");
   }
 
+  char long_detail[12000];
+  size_t long_detail_len = sizeof(long_detail) - 1u;
+  for (size_t i = 0; i < long_detail_len; i++) {
+    static const char pattern[] = "RTR C:\\Program Files\\FDSecurity\\ \"output\" | ";
+    long_detail[i] = pattern[i % (sizeof(pattern) - 1u)];
+  }
+  long_detail[long_detail_len] = '\0';
+  require_true(edr_command_state_finish("cmd-rtr-long-state", "shell_open", &result_meta,
+                                        "ok", 1, 0, long_detail, NULL, 1) == 0,
+               "persist long RTR command result detail");
+  n = edr_command_state_collect_pending(result_pending, 4);
+  int found_long = 0;
+  for (int i = 0; i < n; i++) {
+    if (strcmp(result_pending[i].command_id, "cmd-rtr-long-state") == 0) {
+      found_long = 1;
+      require_true(strlen(result_pending[i].detail) == long_detail_len,
+                   "long RTR detail length survives durable JSON round trip");
+      require_true(strcmp(result_pending[i].detail, long_detail) == 0,
+                   "long RTR detail content survives durable JSON round trip");
+      require_true(edr_command_state_mark_reported(&result_pending[i]) == 0,
+                   "mark long RTR result reported");
+    }
+  }
+  require_true(found_long, "long RTR command result present in pending outbox");
+
   EdrCommandStateRecord persistence_probe;
   memset(&persistence_probe, 0, sizeof(persistence_probe));
   snprintf(persistence_probe.command_id, sizeof(persistence_probe.command_id), "%s",

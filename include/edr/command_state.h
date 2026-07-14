@@ -10,6 +10,8 @@
 extern "C" {
 #endif
 
+#define EDR_COMMAND_STATE_DETAIL_CAP 16384u
+
 typedef struct EdrCommandStateRecord {
   char command_id[128];
   char command_type[64];
@@ -31,7 +33,7 @@ typedef struct EdrCommandStateRecord {
   char playbook_run_id[128];
   char playbook_step_id[128];
   char artifacts[1024];
-  char detail[2048];
+  char detail[EDR_COMMAND_STATE_DETAIL_CAP];
 } EdrCommandStateRecord;
 
 typedef struct EdrCommandInboxRecord {

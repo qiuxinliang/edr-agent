@@ -2100,6 +2100,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->config_signing.public_key_pem[0] = '\0';
   cfg->platform.http2_enabled = false;
   cfg->platform.http2_require = false;
+  cfg->platform.control_http2_enabled = false;
+  cfg->platform.control_http2_require = false;
+  cfg->platform.control_http1_fallback = true;
   cfg->platform.control_stream_enabled = true;
   cfg->platform.long_poll_fallback = true;
   cfg->platform.report_events_v2_enabled = true;
@@ -2233,6 +2236,9 @@ static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
 }
 
 static void load_platform(toml_table_t *t, EdrConfig *cfg) {
+  int control_http2_enabled_set = 0;
+  int control_http2_require_set = 0;
+  int control_http1_fallback_set = 0;
   take_string(toml_string_in(t, "rest_base_url"), cfg->platform.rest_base_url,
               sizeof(cfg->platform.rest_base_url));
   take_string(toml_string_in(t, "rest_user_id"), cfg->platform.rest_user_id,
@@ -2250,6 +2256,40 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
     if (d.ok) {
       cfg->platform.http2_require = d.u.b ? true : false;
     }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_http2_enabled");
+    if (d.ok) {
+      cfg->platform.control_http2_enabled = d.u.b ? true : false;
+      control_http2_enabled_set = 1;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_http2_require");
+    if (d.ok) {
+      cfg->platform.control_http2_require = d.u.b ? true : false;
+      control_http2_require_set = 1;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_http1_fallback");
+    if (d.ok) {
+      cfg->platform.control_http1_fallback = d.u.b ? true : false;
+      control_http1_fallback_set = 1;
+    }
+  }
+  if (!control_http2_enabled_set) {
+    cfg->platform.control_http2_enabled = cfg->platform.http2_enabled;
+  }
+  if (!control_http2_require_set) {
+    cfg->platform.control_http2_require = cfg->platform.http2_require;
+  }
+  if (!control_http1_fallback_set) {
+    cfg->platform.control_http1_fallback = !cfg->platform.control_http2_require;
+  }
+  if (cfg->platform.control_http2_require) {
+    cfg->platform.control_http2_enabled = true;
+    cfg->platform.control_http1_fallback = false;
   }
   {
     toml_datum_t d = toml_bool_in(t, "control_stream_enabled");

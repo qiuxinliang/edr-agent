@@ -19,6 +19,9 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#define EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP (EDR_COMMAND_STATE_DETAIL_CAP * 2u + 2u)
+#define EDR_COMMAND_STATE_LINE_CAP (EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP + 16384u)
+
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
@@ -985,7 +988,7 @@ static int command_state_has_final(const char *command_id, const EdrSoarCommandM
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
   int found = 0;
-  char line[8192];
+  char line[EDR_COMMAND_STATE_LINE_CAP];
   while (fgets(line, sizeof(line), f)) {
     if (!strstr(line, "\"final\":1")) {
       continue;
@@ -1685,7 +1688,7 @@ static int count_prior_attempts(const char *command_id, const EdrSoarCommandMeta
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
   int retry = 0;
-  char line[8192];
+  char line[EDR_COMMAND_STATE_LINE_CAP];
   while (fgets(line, sizeof(line), f)) {
     int match = 0;
     if (idem_key[0]) {
@@ -1730,7 +1733,7 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
   if (f) {
-    char line[8192];
+    char line[EDR_COMMAND_STATE_LINE_CAP];
     while (fgets(line, sizeof(line), f)) {
       int match = 0;
       if (idem_key[0]) {
@@ -1834,7 +1837,7 @@ int edr_command_state_replay_begin_policy(const char *command_id, const char *co
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
   state_boot_id(current_boot, sizeof(current_boot));
   if (f) {
-    char line[8192];
+    char line[EDR_COMMAND_STATE_LINE_CAP];
     while (fgets(line, sizeof(line), f)) {
       int match = 0;
       if (idem_key[0]) {
@@ -1933,7 +1936,7 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
   int retry = count_prior_attempts(command_id, meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
-  char cid[300], ctype[180], idem[300], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], line[12544];
+  char cid[300], ctype[180], idem[300], st[96], det[EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP], art[2200], scid[300], run[300], step[300], boot[100], line[EDR_COMMAND_STATE_LINE_CAP];
   json_escape_to(cid, sizeof(cid), command_id ? command_id : "");
   json_escape_to(ctype, sizeof(ctype), command_type ? command_type : "");
   json_escape_to(idem, sizeof(idem), idem_key);
@@ -2068,7 +2071,7 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
     return 0;
   }
   size_t latest_n = 0;
-  char line[8192];
+  char line[EDR_COMMAND_STATE_LINE_CAP];
   while (fgets(line, sizeof(line), f)) {
     EdrCommandStateRecord rec;
     fill_record_from_line(line, &rec);
@@ -2121,8 +2124,8 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
   if (!record || !record->command_id[0]) {
     return -1;
   }
-  char cid[300], ctype[180], idem[1100], st[96], det[4200], art[2200];
-  char scid[300], run[300], step[300], boot[100], report_error[300], line[13500];
+  char cid[300], ctype[180], idem[1100], st[96], det[EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP], art[2200];
+  char scid[300], run[300], step[300], boot[100], report_error[300], line[EDR_COMMAND_STATE_LINE_CAP];
   json_escape_to(cid, sizeof(cid), record->command_id);
   json_escape_to(ctype, sizeof(ctype), record->command_type);
   json_escape_to(idem, sizeof(idem), record->idempotency_key);
@@ -2174,7 +2177,7 @@ int edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
   if (!record || !record->command_id[0]) {
     return -1;
   }
-  char cid[300], ctype[180], idem[1100], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], report_error[300], line[13000];
+  char cid[300], ctype[180], idem[1100], st[96], det[EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP], art[2200], scid[300], run[300], step[300], boot[100], report_error[300], line[EDR_COMMAND_STATE_LINE_CAP];
   json_escape_to(cid, sizeof(cid), record->command_id);
   json_escape_to(ctype, sizeof(ctype), record->command_type);
   json_escape_to(idem, sizeof(idem), record->idempotency_key);

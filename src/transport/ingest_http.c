@@ -106,6 +106,9 @@ static unsigned s_effective_sampling_pct;
 static int s_control_backpressure_enabled;
 static int s_http2_enabled_cfg = 0;
 static int s_http2_required_cfg;
+static int s_control_http2_enabled_cfg;
+static int s_control_http2_required_cfg;
+static int s_control_http1_fallback_cfg = 1;
 static int s_control_stream_enabled_cfg = 1;
 static int s_long_poll_fallback_cfg = 1;
 static int s_report_events_v2_enabled_cfg = 1;
@@ -448,6 +451,20 @@ static int env_present(const char *name) {
   return (e && e[0]) ? 1 : 0;
 }
 
+static int curl_runtime_supports_http2(void) {
+#ifdef EDR_HAVE_CURL_HTTP2
+  curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+#ifdef CURL_VERSION_HTTP2
+  return info && (((long)info->features & (long)CURL_VERSION_HTTP2) != 0L);
+#else
+  (void)info;
+  return 0;
+#endif
+#else
+  return 0;
+#endif
+}
+
 static const char *env_str_default(const char *name, const char *fallback) {
   const char *e = getenv(name);
   return (e && e[0]) ? e : fallback;
@@ -467,7 +484,7 @@ static int http2_client_enabled(void) {
   if (env_bool_default("EDR_HTTP2_REQUIRE", 0)) {
     enabled = 1;
   }
-  return enabled;
+  return enabled && curl_runtime_supports_http2();
 #else
   return 0;
 #endif
@@ -478,6 +495,57 @@ static int http2_required(void) {
   int required = s_http2_required_cfg || env_bool_default("EDR_HTTP2_REQUIRE", 0);
   runtime_state_unlock();
   return required;
+}
+
+static int control_http2_client_enabled(void) {
+#ifdef EDR_HAVE_CURL_HTTP2
+  runtime_state_lock();
+  int enabled = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
+  runtime_state_unlock();
+  if (env_present("EDR_CONTROL_HTTP2_ENABLED")) {
+    enabled = env_bool_default("EDR_CONTROL_HTTP2_ENABLED", enabled);
+  }
+  if (env_bool_default("EDR_CONTROL_HTTP2_REQUIRE", 0)) {
+    enabled = 1;
+  }
+  return enabled && curl_runtime_supports_http2();
+#else
+  return 0;
+#endif
+}
+
+static int control_http2_required(void) {
+  runtime_state_lock();
+  int required = s_control_http2_required_cfg || env_bool_default("EDR_CONTROL_HTTP2_REQUIRE", 0);
+  runtime_state_unlock();
+  return required;
+}
+
+static int control_http1_fallback_enabled(void) {
+  runtime_state_lock();
+  int enabled = s_control_http1_fallback_cfg;
+  runtime_state_unlock();
+  if (env_present("EDR_CONTROL_HTTP1_FALLBACK")) {
+    enabled = env_bool_default("EDR_CONTROL_HTTP1_FALLBACK", enabled);
+  }
+  return control_http2_required() ? 0 : enabled;
+}
+
+static int url_uses_control_http2_policy(const char *url) {
+  if (!url) {
+    return 0;
+  }
+  return strstr(url, "/ingest/control/") != NULL ||
+         strstr(url, "/ingest/poll-commands") != NULL ||
+         strstr(url, "/ingest/report-command-result") != NULL;
+}
+
+static int http2_enabled_for_url(const char *url) {
+  return url_uses_control_http2_policy(url) ? control_http2_client_enabled() : http2_client_enabled();
+}
+
+static int http2_required_for_url(const char *url) {
+  return url_uses_control_http2_policy(url) ? control_http2_required() : http2_required();
 }
 
 static int curl_ssl_backend_is_schannel(void) {
@@ -583,11 +651,8 @@ static int curl_schannel_store_mtls_needs_libcurl_http1(const char *url) {
 
 static int curl_result_is_tls_cert_problem(CURLcode result) {
   return result == CURLE_SSL_CERTPROBLEM ||
-         result == CURLE_PEER_FAILED_VERIFICATION
-#ifdef CURLE_SSL_CACERT_BADFILE
-         || result == CURLE_SSL_CACERT_BADFILE
-#endif
-      ;
+         result == CURLE_PEER_FAILED_VERIFICATION ||
+         result == CURLE_SSL_CACERT_BADFILE;
 }
 
 #ifdef EDR_CURL_HAS_SSL_OPTIONS
@@ -641,13 +706,18 @@ static void log_transport_capabilities_once(void) {
 #endif
     fprintf(stderr,
             "[transport] EDR_HAVE_CURL_HTTP2=1 libcurl=%s ssl=%s features_http2=%d "
-            "http2_enabled=%d http2_required=%d control_stream_enabled=%d long_poll_fallback=%d "
+            "http2_enabled=%d http2_required=%d control_http2_enabled=%d "
+            "control_http2_required=%d control_http1_fallback=%d "
+            "control_stream_enabled=%d long_poll_fallback=%d "
             "data_encoding=%s data_compression=%s mtls_status=%s cert_store=%s thumbprint=%s\n",
             info && info->version ? info->version : "unknown",
             info && info->ssl_version ? info->ssl_version : "unknown",
             feature_http2,
             http2_client_enabled(),
             http2_required(),
+            control_http2_client_enabled(),
+            control_http2_required(),
+            control_http1_fallback_enabled(),
             s_control_stream_enabled_cfg,
             s_long_poll_fallback_cfg,
             s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf",
@@ -1388,7 +1458,11 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   s_control_zstd = env_bool_default("EDR_CONTROL_CAP_ZSTD", 0);
   s_http2_enabled_cfg = env_bool_default("EDR_DATA_PLANE_HTTP2", 0);
   s_http2_required_cfg = env_bool_default("EDR_HTTP2_REQUIRE", 0);
-  s_control_h2 = http2_client_enabled();
+  s_control_http2_enabled_cfg = env_bool_default("EDR_CONTROL_HTTP2_ENABLED", s_http2_enabled_cfg);
+  s_control_http2_required_cfg = env_bool_default("EDR_CONTROL_HTTP2_REQUIRE", s_http2_required_cfg);
+  s_control_http1_fallback_cfg = env_bool_default("EDR_CONTROL_HTTP1_FALLBACK",
+                                                  s_control_http2_required_cfg ? 0 : 1);
+  s_control_h2 = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
   s_control_stream_enabled_cfg = env_bool_default("EDR_HTTP_CONTROL_STREAM", 1);
   s_long_poll_fallback_cfg = env_bool_default("EDR_CONTROL_LONG_POLL_FALLBACK", 1);
   s_report_events_v2_enabled_cfg = env_bool_default("EDR_REPORT_EVENTS_V2", 1);
@@ -1422,7 +1496,7 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
   s_control_stream_enabled_cfg = control_stream_enabled ? 1 : 0;
   s_long_poll_fallback_cfg = long_poll_fallback ? 1 : 0;
   s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
-  s_control_h2 = http2_client_enabled();
+  s_control_h2 = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
   if (data_plane_encoding && data_plane_encoding[0]) {
     snprintf(s_data_plane_encoding, sizeof(s_data_plane_encoding), "%s", data_plane_encoding);
   }
@@ -1430,7 +1504,17 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
     snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s", data_plane_compression);
   }
   s_control_zstd = strcmp(s_data_plane_compression, "zstd") == 0 ? 1 : s_control_zstd;
+  runtime_state_unlock();
   log_transport_capabilities_once();
+}
+
+void edr_ingest_http_configure_control_transport_options(int http2_enabled, int http2_required,
+                                                         int http1_fallback) {
+  runtime_state_lock();
+  s_control_http2_enabled_cfg = (http2_enabled || http2_required) ? 1 : 0;
+  s_control_http2_required_cfg = http2_required ? 1 : 0;
+  s_control_http1_fallback_cfg = http2_required ? 0 : (http1_fallback ? 1 : 0);
+  s_control_h2 = s_control_http2_enabled_cfg;
   runtime_state_unlock();
 }
 
@@ -1454,7 +1538,27 @@ void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required
   if (report_events_v2_enabled >= 0) {
     s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
   }
-  s_control_h2 = http2_client_enabled();
+  s_control_h2 = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_apply_control_transport_flags(int http2_enabled, int http2_required,
+                                                   int http1_fallback) {
+  runtime_state_lock();
+  if (http2_enabled >= 0) {
+    s_control_http2_enabled_cfg = http2_enabled ? 1 : 0;
+  }
+  if (http2_required >= 0) {
+    s_control_http2_required_cfg = http2_required ? 1 : 0;
+  }
+  if (http1_fallback >= 0) {
+    s_control_http1_fallback_cfg = http1_fallback ? 1 : 0;
+  }
+  if (s_control_http2_required_cfg) {
+    s_control_http2_enabled_cfg = 1;
+    s_control_http1_fallback_cfg = 0;
+  }
+  s_control_h2 = s_control_http2_enabled_cfg;
   runtime_state_unlock();
 }
 
@@ -1463,6 +1567,11 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
     return;
   }
   int stream_lease_valid = control_stream_ready_lease_valid();
+  int data_http2_enabled = http2_client_enabled();
+  int data_http2_required = http2_required();
+  int control_h2_enabled = control_http2_client_enabled();
+  int control_h2_required = control_http2_required();
+  int control_h1_fallback = control_http1_fallback_enabled();
   control_ack_refresh_pending_runtime();
   runtime_state_lock();
   int64_t stream_last_activity_ms = s_control_stream_last_activity_ms;
@@ -1473,9 +1582,12 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->mtls_configured = (schannel_store_mtls_configured() ||
                           (s_client_cert_file[0] && s_client_key_file[0])) ? 1 : 0;
   out->websocket_ready = (s_ws_ready || stream_lease_valid) ? 1 : 0;
-  out->http2_enabled = http2_client_enabled();
-  out->http2_required = http2_required();
+  out->http2_enabled = data_http2_enabled;
+  out->http2_required = data_http2_required;
   out->http2_negotiated = s_http2_negotiated ? 1 : 0;
+  out->control_http2_enabled = control_h2_enabled;
+  out->control_http2_required = control_h2_required;
+  out->control_http1_fallback = control_h1_fallback;
   out->control_stream_enabled = s_control_stream_enabled_cfg;
   out->control_stream_ready = stream_lease_valid;
   out->control_stream_lease_valid = stream_lease_valid;
@@ -3614,7 +3726,7 @@ static int h2_cert_problem_retry_cooldown_ms(void) {
   return (int)env_ul_clamped("EDR_HTTP2_CERT_PROBLEM_RETRY_MS", 1800000ul, 30000ul, 3600000ul);
 }
 
-static void note_http2_cert_problem(void) {
+static void note_http2_cert_problem(int required) {
   int cooldown = h2_cert_problem_retry_cooldown_ms();
   int should_warn = 0;
   runtime_state_lock();
@@ -3626,7 +3738,7 @@ static void note_http2_cert_problem(void) {
   }
   runtime_state_unlock();
   if (should_warn) {
-    if (http2_required()) {
+    if (required) {
       fprintf(stderr,
               "[transport] HTTP/2 TLS certificate verification failed; "
               "suppressing h2 attempts for %dms; HTTP/2 is required so communication will fail "
@@ -3702,6 +3814,8 @@ static void curl_multi_wait_cv(void) {
 
 static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode result) {
   int ok = 0;
+  int required = 0;
+  char *effective_url = NULL;
   if (!job) {
     return;
   }
@@ -3712,9 +3826,11 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
   job->h2 = job->easy ? curl_note_http_version(job->easy) : 0;
   if (job->easy) {
     (void)curl_easy_getinfo(job->easy, CURLINFO_RESPONSE_CODE, &job->response_code);
+    (void)curl_easy_getinfo(job->easy, CURLINFO_EFFECTIVE_URL, &effective_url);
+    required = http2_required_for_url(effective_url);
   }
   ok = result == CURLE_OK && job->response_code >= 200 && job->response_code < 300 &&
-       (!job->stream_ctx || !job->stream_ctx->failed) && (job->h2 || !http2_required());
+       (!job->stream_ctx || !job->stream_ctx->failed) && (job->h2 || !required);
   job->status = ok ? 0 : -1;
   runtime_state_lock();
   if (ok) {
@@ -3729,13 +3845,13 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
     note_http2_failure_reason(job->stream_ctx ? "stream-multiplex" : "request-multiplex",
                               result, job->response_code, job->h2, NULL);
     if (curl_result_is_tls_cert_problem(result)) {
-      note_http2_cert_problem();
+      note_http2_cert_problem(required);
     }
     fprintf(stderr,
             "[transport] HTTP/2 request failed result=%d(%s) http_status=%ld h2=%d "
             "http2_required=%d stream=%d\n",
             (int)result, curl_easy_strerror(result), job->response_code, job->h2,
-            http2_required(), job->stream_ctx ? 1 : 0);
+            required, job->stream_ctx ? 1 : 0);
   }
   curl_multi_lock();
   if (s_curl_multi_active_count > 0u) {
@@ -3829,15 +3945,11 @@ static int curl_multi_worker_start(void) {
     curl_multi_unlock();
     return 0;
   }
-#ifdef CURLMOPT_PIPELINING
-#ifdef CURLPIPE_MULTIPLEX
+#if LIBCURL_VERSION_NUM >= 0x072b00
   curl_multi_setopt(s_curl_multi, CURLMOPT_PIPELINING, (long)CURLPIPE_MULTIPLEX);
 #endif
-#endif
-#ifdef CURLMOPT_MAX_HOST_CONNECTIONS
+#if LIBCURL_VERSION_NUM >= 0x071e00
   curl_multi_setopt(s_curl_multi, CURLMOPT_MAX_HOST_CONNECTIONS, 1L);
-#endif
-#ifdef CURLMOPT_MAX_TOTAL_CONNECTIONS
   curl_multi_setopt(s_curl_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 1L);
 #endif
 #ifdef _WIN32
@@ -3987,24 +4099,24 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
   if (http_version > 0) {
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, http_version);
   } else {
-    if (http2_required()) {
-#ifdef CURL_HTTP_VERSION_2_0
+    if (http2_required_for_url(url)) {
+#if LIBCURL_VERSION_NUM >= 0x073100
+      curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
+#else
       curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_0);
-#elif defined(CURL_HTTP_VERSION_2TLS)
-      curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
 #endif
     } else {
-#ifdef CURL_HTTP_VERSION_2TLS
+#if LIBCURL_VERSION_NUM >= 0x072f00
       curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
 #else
       curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_0);
 #endif
     }
   }
-#ifdef CURLOPT_SSL_ENABLE_ALPN
+#if LIBCURL_VERSION_NUM >= 0x072400
   curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
 #endif
-#ifdef CURLOPT_PIPEWAIT
+#if LIBCURL_VERSION_NUM >= 0x072b00
   curl_easy_setopt(curl, CURLOPT_PIPEWAIT, 1L);
 #endif
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -4073,69 +4185,68 @@ static void curl_apply_common_options(CURL *curl, const char *url, struct curl_s
   curl_apply_common_options_ex(curl, url, headers, timeout_s, 0L);
 }
 
+static int note_negotiated_protocol_name(const char *value, int authoritative) {
+  int h2 = value && (ascii_eq_ci(value, "h2") || ascii_contains_ci(value, "http/2"));
+  int log_protocol = 0;
+  unsigned long fallback_count = 0;
+  char stream_status[sizeof(s_control_stream_status)];
+  char endpoint[sizeof(s_endpoint)];
+  runtime_state_lock();
+  if (h2) {
+    s_http2_negotiated = 1;
+    s_http2_negotiated_count++;
+    s_http2_last_error[0] = '\0';
+    snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "h2");
+    if (s_alpn_log_state != 1) {
+      s_alpn_log_state = 1;
+      log_protocol = 1;
+    }
+  } else {
+    s_http2_fallback_count++;
+    fallback_count = s_http2_fallback_count;
+    if (authoritative || !s_negotiated_protocol[0]) {
+      s_http2_negotiated = 0;
+      snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
+    }
+    if (s_alpn_log_state != 2) {
+      s_alpn_log_state = 2;
+      log_protocol = 1;
+    }
+  }
+  snprintf(stream_status, sizeof(stream_status), "%s",
+           s_control_stream_status[0] ? s_control_stream_status : "idle");
+  snprintf(endpoint, sizeof(endpoint), "%s", s_endpoint[0] ? s_endpoint : "-");
+  runtime_state_unlock();
+  if (log_protocol) {
+    if (h2) {
+      fprintf(stderr, "[transport] ALPN negotiated h2 control_stream_status=%s endpoint=%s\n",
+              stream_status, endpoint);
+    } else {
+      fprintf(stderr,
+              "[transport] ALPN did not negotiate h2; negotiated_protocol=http/1.1 "
+              "http2_required=%d control_stream_status=%s fallback_count=%lu\n",
+              control_http2_required(), stream_status, fallback_count);
+    }
+  }
+  return h2;
+}
+
 static int curl_note_http_version(CURL *curl) {
-#ifdef CURLINFO_HTTP_VERSION
+#if LIBCURL_VERSION_NUM >= 0x073200
   long version = 0;
   if (curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &version) == CURLE_OK) {
-#ifdef CURL_HTTP_VERSION_2_0
     if (version == CURL_HTTP_VERSION_2_0) {
-      int log_h2 = 0;
-      char stream_status[sizeof(s_control_stream_status)];
-      char endpoint[sizeof(s_endpoint)];
-      runtime_state_lock();
-      s_http2_negotiated = 1;
-      s_http2_negotiated_count++;
-      s_http2_last_error[0] = '\0';
-      snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "h2");
-      if (s_alpn_log_state != 1) {
-        s_alpn_log_state = 1;
-        log_h2 = 1;
-      }
-      snprintf(stream_status, sizeof(stream_status), "%s",
-               s_control_stream_status[0] ? s_control_stream_status : "idle");
-      snprintf(endpoint, sizeof(endpoint), "%s", s_endpoint[0] ? s_endpoint : "-");
-      runtime_state_unlock();
-      if (log_h2) {
-        fprintf(stderr, "[transport] ALPN negotiated h2 control_stream_status=%s endpoint=%s\n",
-                stream_status, endpoint);
-      }
-      return 1;
+      return note_negotiated_protocol_name("h2", 0);
     }
-#endif
   }
 #else
   (void)curl;
 #endif
-  int log_fallback = 0;
-  unsigned long fallback_count;
-  char protocol[sizeof(s_negotiated_protocol)];
-  char stream_status[sizeof(s_control_stream_status)];
-  runtime_state_lock();
-  s_http2_fallback_count++;
-  if (!s_negotiated_protocol[0]) {
-    snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
-  }
-  if (s_alpn_log_state != 2) {
-    s_alpn_log_state = 2;
-    log_fallback = 1;
-  }
-  fallback_count = s_http2_fallback_count;
-  snprintf(protocol, sizeof(protocol), "%s",
-           s_negotiated_protocol[0] ? s_negotiated_protocol : "http/1.1");
-  snprintf(stream_status, sizeof(stream_status), "%s",
-           s_control_stream_status[0] ? s_control_stream_status : "idle");
-  runtime_state_unlock();
-  if (log_fallback) {
-    fprintf(stderr,
-            "[transport] ALPN did not negotiate h2; negotiated_protocol=%s "
-            "http2_required=%d control_stream_status=%s fallback_count=%lu\n",
-            protocol, http2_required(), stream_status, fallback_count);
-  }
-  return 0;
+  return note_negotiated_protocol_name("http/1.1", 0);
 }
 
 static int curl_h2_allowed_for_url(const char *url) {
-  if (!http2_client_enabled() || !url || strncmp(url, "https://", 8u) != 0) {
+  if (!http2_enabled_for_url(url) || !url || strncmp(url, "https://", 8u) != 0) {
     return 0;
   }
   if (curl_ssl_backend_is_schannel() && schannel_store_mtls_configured() &&
@@ -4150,7 +4261,7 @@ static int curl_h2_allowed_for_url(const char *url) {
     }
     return 0;
   }
-  if (!http2_required() && s_http2_cert_problem_retry_after_ms > 0 &&
+  if (!http2_required_for_url(url) && s_http2_cert_problem_retry_after_ms > 0 &&
       unix_ms_now() < s_http2_cert_problem_retry_after_ms) {
     return 0;
   }
@@ -4217,7 +4328,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 &&
-      (h2 || !http2_required())) {
+      (h2 || !http2_required_for_url(url))) {
     runtime_state_lock();
     s_http2_request_ok++;
     runtime_state_unlock();
@@ -4228,13 +4339,13 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   runtime_state_unlock();
   note_http2_failure_reason(method ? method : "request", cc, code, h2, errbuf);
   if (curl_result_is_tls_cert_problem(cc)) {
-    note_http2_cert_problem();
+    note_http2_cert_problem(http2_required_for_url(url));
   }
   fprintf(stderr,
           "[transport] HTTP/2 request failed method=%s result=%d(%s) http_status=%ld h2=%d "
           "http2_required=%d err=%s\n",
           method ? method : "-", (int)cc, curl_easy_strerror(cc), code, h2,
-          http2_required(), errbuf[0] ? errbuf : "-");
+          http2_required_for_url(url), errbuf[0] ? errbuf : "-");
   return -1;
 }
 
@@ -4269,9 +4380,7 @@ static int curl_h1_request(const char *method, const char *url, const char *cont
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
   headers = curl_append_signature_headers(headers, method, url, body, body_len);
-#ifdef CURL_HTTP_VERSION_1_1
   http_version = (long)CURL_HTTP_VERSION_1_1;
-#endif
   curl_apply_common_options_ex(curl, url, headers,
                                timeout_s > 0 ? timeout_s : http_socket_timeout_s(),
                                http_version);
@@ -4359,7 +4468,7 @@ static int curl_h2_stream_loop(const char *url) {
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 && !ctx.failed &&
-      (h2 || !http2_required())) {
+      (h2 || !control_http2_required())) {
     runtime_state_lock();
     s_http2_request_ok++;
     runtime_state_unlock();
@@ -4370,12 +4479,12 @@ static int curl_h2_stream_loop(const char *url) {
   runtime_state_unlock();
   note_http2_failure_reason("control-stream", cc, code, h2, errbuf);
   if (curl_result_is_tls_cert_problem(cc)) {
-    note_http2_cert_problem();
+    note_http2_cert_problem(control_http2_required());
   }
   fprintf(stderr,
           "[ingest-stream] HTTP/2 control stream failed result=%d(%s) http_status=%ld "
           "h2=%d http2_required=%d parser_failed=%d err=%s\n",
-          (int)cc, curl_easy_strerror(cc), code, h2, http2_required(), ctx.failed,
+          (int)cc, curl_easy_strerror(cc), code, h2, control_http2_required(), ctx.failed,
           errbuf[0] ? errbuf : "-");
   return -1;
 }
@@ -4405,9 +4514,7 @@ static int curl_h1_stream_loop(const char *url) {
   headers = curl_append_signature_headers(headers, "GET", url, NULL, 0u);
   headers = curl_slist_append(headers, "Accept: application/x-ndjson");
   headers = curl_slist_append(headers, "Cache-Control: no-cache");
-#ifdef CURL_HTTP_VERSION_1_1
   http_version = (long)CURL_HTTP_VERSION_1_1;
-#endif
   curl_apply_common_options_ex(curl, url, headers, 0L, http_version);
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_stream_write_cb);
@@ -4514,22 +4621,26 @@ static int native_request_ex(const char *method, const char *url, const char *co
     runtime_failure("invalid ingest url");
     return -1;
   }
-  if (https && http2_client_enabled()) {
+  if (https && http2_enabled_for_url(url)) {
 #ifdef EDR_HAVE_CURL_HTTP2
     int h2rc = curl_h2_request(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
     if (h2rc == 0) {
       return 0;
     }
     if (h2rc != -2) {
-      if (http2_required()) {
+      if (http2_required_for_url(url)) {
         runtime_failure("HTTP/2 required but h2 request failed");
         return -1;
       }
     }
 #endif
   }
-  if (https && http2_required()) {
+  if (https && http2_required_for_url(url)) {
     runtime_failure("HTTP/2 required but h2 transport unavailable");
+    return -1;
+  }
+  if (https && url_uses_control_http2_policy(url) && !control_http1_fallback_enabled()) {
+    runtime_failure("control HTTP/1.1 fallback disabled and h2 transport unavailable");
     return -1;
   }
 #ifdef EDR_HAVE_CURL_HTTP2
@@ -5218,7 +5329,7 @@ static int ws_connect_once(EdrWsConn *out) {
   int port = 0;
   int https = 0;
   int rn;
-  int h2_cap = http2_client_enabled();
+  int h2_cap = control_http2_client_enabled();
   if (!out || !edr_ingest_http_configured()) {
     return -1;
   }
@@ -5324,11 +5435,12 @@ static int ws_connect_once(EdrWsConn *out) {
 
 static void build_control_stream_url(char *url, size_t cap) {
   char suffix[1200];
+  int h2_cap;
   if (!url || cap == 0u) {
     return;
   }
+  h2_cap = control_http2_client_enabled();
   runtime_state_lock();
-  int h2_cap = http2_client_enabled();
   snprintf(suffix, sizeof(suffix),
            "ingest/control/stream?endpoint_id=%s&agent_version=%s&policy_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
            s_endpoint,
@@ -5455,6 +5567,7 @@ static void stream_process_line(const char *line) {
     char profile_id[sizeof(s_control_profile_id)];
     char qos_dscp[sizeof(s_control_qos_dscp)];
     char threshold[sizeof(s_control_threshold)];
+    char protocol[32];
     int h2;
     int zstd;
     int backpressure;
@@ -5465,6 +5578,7 @@ static void stream_process_line(const char *line) {
     snprintf(profile_id, sizeof(profile_id), "%s", s_control_profile_id);
     snprintf(qos_dscp, sizeof(qos_dscp), "%s", s_control_qos_dscp);
     snprintf(threshold, sizeof(threshold), "%s", s_control_threshold);
+    protocol[0] = '\0';
     h2 = s_control_h2;
     zstd = s_control_zstd;
     backpressure = s_control_backpressure_enabled;
@@ -5475,6 +5589,7 @@ static void stream_process_line(const char *line) {
     (void)json_get_string(line, "profile_id", profile_id, sizeof(profile_id));
     (void)json_get_string(line, "qos_dscp", qos_dscp, sizeof(qos_dscp));
     (void)json_get_string(line, "threshold", threshold, sizeof(threshold));
+    (void)json_get_string(line, "protocol", protocol, sizeof(protocol));
     (void)json_get_bool(line, "h2", &h2);
     (void)json_get_bool(line, "zstd", &zstd);
     (void)json_get_bool(line, "backpressure_enabled", &backpressure);
@@ -5498,6 +5613,13 @@ static void stream_process_line(const char *line) {
       newly_verified = 1;
     }
     runtime_state_unlock();
+#ifdef EDR_HAVE_CURL_HTTP2
+    if (protocol[0]) {
+      (void)note_negotiated_protocol_name(protocol, 1);
+    } else if (h2) {
+      (void)note_negotiated_protocol_name("h2", 1);
+    }
+#endif
     if (newly_verified) {
       note_http_request_success();
       note_control_stream_success();
@@ -5510,6 +5632,11 @@ static void stream_process_line(const char *line) {
                                             (unsigned)sampling_pct, threshold,
                                             backpressure);
     edr_transport_v2_on_control("server_hello");
+  } else if (strstr(line, "\"type\":\"server_drain\"")) {
+    runtime_stream_state_set(0, 0);
+    runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "draining");
+    note_control_stream_activity();
+    edr_transport_v2_on_control("server_drain");
   } else if (strstr(line, "\"type\":\"heartbeat\"")) {
     note_control_stream_heartbeat();
     note_control_stream_activity();
@@ -6244,11 +6371,7 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
   curl_apply_common_options_ex(
       curl, url, headers,
       (long)env_ul_clamped("EDR_HTTP_UPLOAD_TIMEOUT_S", 600ul, 30ul, 86400ul),
-#ifdef CURL_HTTP_VERSION_1_1
       force_mtls_http1 ? (long)CURL_HTTP_VERSION_1_1 : 0L
-#else
-      0L
-#endif
   );
   if (force_mtls_http1) {
     /* A TLS connection created without a client certificate cannot be upgraded to
@@ -6293,7 +6416,7 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
   note_http2_failure_reason(force_mtls_http1 ? "upload-file-mtls-h1" : "upload-file",
                             cc, code, h2, resp_body);
   if (curl_result_is_tls_cert_problem(cc)) {
-    note_http2_cert_problem();
+    note_http2_cert_problem(http2_required());
   }
   return -1;
 }
@@ -6750,7 +6873,7 @@ static int edr_ingest_http_control_hello_once(void) {
   char threshold_raw[sizeof(s_control_threshold)];
   size_t body_cap;
   int rc = -1;
-  int h2_cap = http2_client_enabled();
+  int h2_cap = control_http2_client_enabled();
   int h2_profile;
   int zstd_profile;
   int backpressure_profile;
@@ -6910,7 +7033,7 @@ static int control_stream_try_schannel_http1(int *backoff_ms, const char *fallba
   char stream_url[1400];
   int h1rc;
   int64_t connected_at_ms;
-  if (!backoff_ms) {
+  if (!backoff_ms || !control_http1_fallback_enabled()) {
     return 0;
   }
   build_control_stream_url(stream_url, sizeof(stream_url));
@@ -6996,14 +7119,15 @@ static void *control_ws_thread(void *arg)
     (void)edr_ingest_http_control_hello_once();
 #ifdef EDR_HAVE_CURL_HTTP2
     if (env_present("EDR_SCHANNEL_MTLS_HTTP2") &&
-        !env_bool_default("EDR_SCHANNEL_MTLS_HTTP2", 1)) {
+        !env_bool_default("EDR_SCHANNEL_MTLS_HTTP2", 1) &&
+        control_http1_fallback_enabled()) {
       if (control_stream_try_schannel_http1(&backoff_ms, NULL)) {
         continue;
       }
     }
 #endif
 #ifdef EDR_HAVE_CURL_HTTP2
-    if (http2_client_enabled() && unix_ms_now() >= s_h2_stream_retry_after_ms) {
+    if (control_http2_client_enabled() && unix_ms_now() >= s_h2_stream_retry_after_ms) {
       char stream_url[1400];
       int h2rc;
       build_control_stream_url(stream_url, sizeof(stream_url));
@@ -7042,7 +7166,7 @@ static void *control_ws_thread(void *arg)
       runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "h2_failed");
       (void)route_note_failure("h2_stream_failed");
       s_h2_stream_retry_after_ms = unix_ms_now() + (int64_t)h2_stream_retry_cooldown_ms();
-      if (http2_required()) {
+      if (control_http2_required()) {
         runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
         backoff_ms = control_stream_next_backoff_ms(backoff_ms);
@@ -7050,12 +7174,14 @@ static void *control_ws_thread(void *arg)
         continue;
       }
       if (curl_schannel_store_mtls_needs_libcurl_http1(stream_url) &&
+          control_http1_fallback_enabled() &&
           env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
         if (control_stream_try_schannel_http1(&backoff_ms, "HTTP/2 control stream unavailable")) {
           continue;
         }
       }
-      if (h2rc != -2 && env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
+      if (h2rc != -2 && control_http1_fallback_enabled() &&
+          env_bool_default("EDR_HTTP2_STREAM_FALLBACK_HTTP1", 1)) {
         fprintf(stderr,
                 "[ingest-stream] HTTP/2 control stream unavailable; falling back to HTTP/1.1 stream "
                 "(h2 retry cooldown=%dms)\n",
@@ -7069,7 +7195,7 @@ static void *control_ws_thread(void *arg)
       }
     }
 #endif
-    if (http2_required()) {
+    if (control_http2_required()) {
       runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "h2_unavailable");
       note_control_stream_failure();
       runtime_int_set(&s_ws_backoff_ms, backoff_ms);
@@ -7079,12 +7205,22 @@ static void *control_ws_thread(void *arg)
       continue;
     }
 #ifdef EDR_HAVE_CURL_HTTP2
-    if (!http2_client_enabled()) {
+    if (!control_http2_client_enabled() && control_http1_fallback_enabled()) {
       if (control_stream_try_schannel_http1(&backoff_ms, NULL)) {
         continue;
       }
     }
 #endif
+    if (!control_http1_fallback_enabled()) {
+      runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status),
+                         "h2_unavailable_no_http1_fallback");
+      note_control_stream_failure();
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
+      sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
+      backoff_ms = control_stream_next_backoff_ms(backoff_ms);
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
+      continue;
+    }
     if (stream_connect_once(&conn) != 0) {
       note_control_stream_failure();
       (void)route_note_failure("http1_stream_connect_failed");
@@ -7156,7 +7292,7 @@ static int edr_ingest_http_poll_once(void) {
   snprintf(suffix, sizeof(suffix),
            "ingest/poll-commands?endpoint_id=%s&limit=8&wait_s=%d&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
            s_endpoint, wait_s, s_agent_ver, s_control_dict_ver, s_control_schema_ver,
-           s_control_profile_id, http2_client_enabled() ? 1 : 0, s_control_zstd ? 1 : 0);
+           s_control_profile_id, control_http2_client_enabled() ? 1 : 0, s_control_zstd ? 1 : 0);
   resp[0] = '\0';
   if (request_to_suffix_ex("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp),
                            command_poll_timeout_s(wait_s)) != 0) {

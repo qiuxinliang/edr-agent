@@ -199,6 +199,7 @@ void edr_shell_session_poll(void) {
 
     if (avail > 0) {
       uint32_t cap = g_max_output_kb * 1024;
+      if (cap > EDR_SS_STREAM_CHUNK_BYTES) cap = EDR_SS_STREAM_CHUNK_BYTES;
       if (avail > cap) avail = cap;
       char *buf = (char *)malloc(avail + 1);
       if (buf) {
@@ -389,6 +390,7 @@ void edr_shell_session_poll(void) {
     if (!s->active) continue;
 
     uint32_t cap = g_max_output_kb * 1024;
+    if (cap > EDR_SS_STREAM_CHUNK_BYTES) cap = EDR_SS_STREAM_CHUNK_BYTES;
     char *buf = (char *)malloc(cap);
     if (!buf) continue;
 

@@ -140,6 +140,46 @@ static void test_policy_v2_and_attack_surface_parse(void) {
   assert(!cfg.attack_surface.egress_enabled);
 }
 
+static void test_control_http2_policy_parse_and_legacy_fallback(void) {
+  const char *legacy_fn = "edr_test_cfg_http2_legacy.toml";
+  FILE *f = fopen(legacy_fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[platform]\n"
+          "http2_enabled = true\n"
+          "http2_require = false\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(legacy_fn, &cfg);
+  (void)remove(legacy_fn);
+  assert(e == EDR_OK);
+  assert(cfg.platform.control_http2_enabled);
+  assert(!cfg.platform.control_http2_require);
+  assert(cfg.platform.control_http1_fallback);
+
+  const char *strict_fn = "edr_test_cfg_http2_strict.toml";
+  f = fopen(strict_fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[platform]\n"
+          "http2_enabled = false\n"
+          "control_http2_enabled = false\n"
+          "control_http2_require = true\n"
+          "control_http1_fallback = true\n");
+  fclose(f);
+  memset(&cfg, 0, sizeof(cfg));
+  e = edr_config_load(strict_fn, &cfg);
+  (void)remove(strict_fn);
+  assert(e == EDR_OK);
+  assert(cfg.platform.control_http2_enabled);
+  assert(cfg.platform.control_http2_require);
+  assert(!cfg.platform.control_http1_fallback);
+}
+
 static void test_detection_policy_conditional_suppression(void) {
   const char *fn = "edr_test_cfg_supp.toml";
   FILE *f = fopen(fn, "wb");
@@ -195,6 +235,7 @@ int main(void) {
   test_remote_detection_modes_parse();
   test_correlation_policy_parse();
   test_policy_v2_and_attack_surface_parse();
+  test_control_http2_policy_parse_and_legacy_fallback();
   puts("config_fp ok");
   return 0;
 }

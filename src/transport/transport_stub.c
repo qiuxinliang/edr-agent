@@ -393,6 +393,10 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.report_events_v2_enabled ? 1 : 0,
       cfg->platform.data_plane_encoding,
       cfg->platform.data_plane_compression);
+  edr_ingest_http_configure_control_transport_options(
+      cfg->platform.control_http2_enabled ? 1 : 0,
+      cfg->platform.control_http2_require ? 1 : 0,
+      cfg->platform.control_http1_fallback ? 1 : 0);
   edr_transport_v2_init_from_config(cfg);
 
   /* 启动命令轮询 */

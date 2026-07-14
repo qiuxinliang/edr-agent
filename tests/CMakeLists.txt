@@ -21,6 +21,16 @@ if(WIN32)
   target_link_libraries(test_command_inbox PRIVATE advapi32)
 endif()
 
+if(NOT WIN32)
+  add_executable(test_shell_session_stream
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_session_stream.c
+    ${CMAKE_SOURCE_DIR}/src/shell/shell_session.c)
+  target_include_directories(test_shell_session_stream PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  edr_apply_common_warnings(test_shell_session_stream)
+  add_test(NAME shell_session_stream_completeness COMMAND test_shell_session_stream
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
+
 add_executable(test_command_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_command_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_registry.c

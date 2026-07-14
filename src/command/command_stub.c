@@ -585,6 +585,9 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   int h2 = -1;
   int h2_enabled = -1;
   int h2_required = -1;
+  int control_h2_enabled = -1;
+  int control_h2_required = -1;
+  int control_h1_fallback = -1;
   int zstd = -1;
   int control_stream_enabled = -1;
   int long_poll_fallback = -1;
@@ -605,6 +608,9 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
   h2_enabled = h2;
   (void)parse_json_bool_field(pl, len, "http2_enabled", &h2_enabled);
   (void)parse_json_bool_field(pl, len, "h2_required", &h2_required);
+  (void)parse_json_bool_field(pl, len, "control_http2_enabled", &control_h2_enabled);
+  (void)parse_json_bool_field(pl, len, "control_http2_require", &control_h2_required);
+  (void)parse_json_bool_field(pl, len, "control_http1_fallback", &control_h1_fallback);
   (void)parse_json_bool_field(pl, len, "zstd", &zstd);
   (void)parse_json_bool_field(pl, len, "control_stream_enabled", &control_stream_enabled);
   (void)parse_json_bool_field(pl, len, "long_poll_fallback", &long_poll_fallback);
@@ -636,6 +642,17 @@ static void do_telemetry_profile_update(const char *cmd_id, const uint8_t *pl, s
                                           backpressure);
   edr_ingest_http_apply_transport_flags(h2_enabled, h2_required, control_stream_enabled,
                                         long_poll_fallback, report_events_v2_enabled);
+  if (control_h2_enabled < 0) {
+    control_h2_enabled = h2_enabled;
+  }
+  if (control_h2_required < 0) {
+    control_h2_required = h2_required;
+  }
+  if (control_h1_fallback < 0 && control_h2_required >= 0) {
+    control_h1_fallback = control_h2_required ? 0 : 1;
+  }
+  edr_ingest_http_apply_control_transport_flags(control_h2_enabled, control_h2_required,
+                                                control_h1_fallback);
 
   char detail[512];
   snprintf(detail, sizeof(detail),

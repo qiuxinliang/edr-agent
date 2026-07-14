@@ -797,6 +797,10 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   edr_agent_write_toml_string(fp, "proxy_url", cfg->platform.proxy_url);
   edr_agent_write_toml_string(fp, "rest_bearer_token", cfg->platform.rest_bearer_token);
   fprintf(fp, "http2_enabled = %s\n", cfg->platform.http2_enabled ? "true" : "false");
+  fprintf(fp, "http2_require = %s\n", cfg->platform.http2_require ? "true" : "false");
+  fprintf(fp, "control_http2_enabled = %s\n", cfg->platform.control_http2_enabled ? "true" : "false");
+  fprintf(fp, "control_http2_require = %s\n", cfg->platform.control_http2_require ? "true" : "false");
+  fprintf(fp, "control_http1_fallback = %s\n", cfg->platform.control_http1_fallback ? "true" : "false");
   fprintf(fp, "control_stream_enabled = %s\n", cfg->platform.control_stream_enabled ? "true" : "false");
   fprintf(fp, "long_poll_fallback = %s\n", cfg->platform.long_poll_fallback ? "true" : "false");
   fprintf(fp, "report_events_v2_enabled = %s\n", cfg->platform.report_events_v2_enabled ? "true" : "false");
@@ -2175,6 +2179,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"tls_handshakes_this_minute\":%lu,\"tls_handshake_limit_per_minute\":%lu,"
         "\"budget_drops\":%lu},\"slo\":{\"success_rate_pct\":%u},"
         "\"protocol\":{\"http2_enabled\":%s,\"http2_required\":%s,"
+        "\"control_http2_enabled\":%s,\"control_http2_required\":%s,"
+        "\"control_http1_fallback\":%s,"
         "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
         "\"http2_last_error\":\"%s\",\"http2_cert_error_count\":%lu,"
         "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
@@ -2271,6 +2277,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
         http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
         http_rt.http2_enabled ? "true" : "false", http_rt.http2_required ? "true" : "false",
+        http_rt.control_http2_enabled ? "true" : "false",
+        http_rt.control_http2_required ? "true" : "false",
+        http_rt.control_http1_fallback ? "true" : "false",
         http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
         http2_last_error, http_rt.http2_cert_error_count,
         http_rt.control_stream_enabled ? "true" : "false",
@@ -2511,6 +2520,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"budget_drops\":%lu},"
       "\"slo\":{\"success_rate_pct\":%u},"
       "\"protocol\":{\"http2_enabled\":%s,\"http2_required\":%s,"
+      "\"control_http2_enabled\":%s,\"control_http2_required\":%s,"
+      "\"control_http1_fallback\":%s,"
       "\"http2_negotiated\":%s,\"negotiated_protocol\":\"%s\","
       "\"http2_last_error\":\"%s\",\"http2_cert_error_count\":%lu,"
       "\"control_stream_enabled\":%s,\"control_stream_ready\":%s,"
@@ -2709,6 +2720,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      http_rt.tls_handshakes_this_minute, http_rt.tls_handshake_limit_per_minute,
       http_rt.budget_drop_count, http_rt.slo_success_rate_pct,
       http_rt.http2_enabled ? "true" : "false", http_rt.http2_required ? "true" : "false",
+      http_rt.control_http2_enabled ? "true" : "false",
+      http_rt.control_http2_required ? "true" : "false",
+      http_rt.control_http1_fallback ? "true" : "false",
       http_rt.http2_negotiated ? "true" : "false", http_negotiated_protocol,
       http2_last_error, http_rt.http2_cert_error_count,
       http_rt.control_stream_enabled ? "true" : "false",
@@ -3291,6 +3305,9 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
              remote->platform.relay_url);
     agent->cfg.platform.http2_enabled = remote->platform.http2_enabled;
     agent->cfg.platform.http2_require = remote->platform.http2_require;
+    agent->cfg.platform.control_http2_enabled = remote->platform.control_http2_enabled;
+    agent->cfg.platform.control_http2_require = remote->platform.control_http2_require;
+    agent->cfg.platform.control_http1_fallback = remote->platform.control_http1_fallback;
     agent->cfg.platform.control_stream_enabled = remote->platform.control_stream_enabled;
     agent->cfg.platform.long_poll_fallback = remote->platform.long_poll_fallback;
     agent->cfg.platform.report_events_v2_enabled = remote->platform.report_events_v2_enabled;
@@ -3319,6 +3336,10 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
         agent->cfg.platform.report_events_v2_enabled ? 1 : 0,
         agent->cfg.platform.data_plane_encoding,
         agent->cfg.platform.data_plane_compression);
+    edr_ingest_http_configure_control_transport_options(
+        agent->cfg.platform.control_http2_enabled ? 1 : 0,
+        agent->cfg.platform.control_http2_require ? 1 : 0,
+        agent->cfg.platform.control_http1_fallback ? 1 : 0);
     edr_ingest_http_apply_telemetry_profile(
         agent->cfg.platform.control_dict_version,
         agent->cfg.platform.control_schema_version,

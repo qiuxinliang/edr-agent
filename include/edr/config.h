@@ -279,6 +279,10 @@ typedef struct EdrConfig {
     /** HTTPS/TLS transport v2: HTTP/2 is the default, HTTP/1.1 remains an explicit fallback unless required. */
     bool http2_enabled;
     bool http2_require;
+    /** Control-plane policy is independent from bulk telemetry HTTP/2. */
+    bool control_http2_enabled;
+    bool control_http2_require;
+    bool control_http1_fallback;
     bool control_stream_enabled;
     bool long_poll_fallback;
     bool report_events_v2_enabled;
