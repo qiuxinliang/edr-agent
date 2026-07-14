@@ -397,6 +397,23 @@ function Repair-AgentTomlAcl {
   }
 }
 
+function Remove-StaleEnrollmentArtifact {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+  try {
+    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    return
+  } catch {
+    if ((Get-EnrollOs) -ne "windows") { throw }
+  }
+
+  try { & takeown.exe /F $Path /A 2>$null | Out-Null } catch {}
+  try {
+    & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+  } catch {}
+  Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+}
+
 function Repair-InstallRuntimeAcls {
   param([string]$InstallRoot)
   if ((Get-EnrollOs) -ne "windows") { return }
@@ -924,9 +941,7 @@ function Ensure-CngAgentCSR {
   Write-Host "Using CNG key container: $safeKeyName"
   $infPath = [System.IO.Path]::ChangeExtension($CsrPath, ".inf")
   foreach ($stalePath in @($CsrPath, $infPath)) {
-    if ($stalePath -and (Test-Path -LiteralPath $stalePath)) {
-      Remove-Item -LiteralPath $stalePath -Force -ErrorAction SilentlyContinue
-    }
+    Remove-StaleEnrollmentArtifact -Path $stalePath
   }
   $inf = @"
 [Version]
@@ -1397,6 +1412,9 @@ $EffectiveCertThumbprint = ""
 
 $Http2Enabled = if ($null -ne $d.http2_enabled) { [bool]$d.http2_enabled } else { $false }
 $Http2Require = if ($null -ne $d.http2_require) { [bool]$d.http2_require } else { $false }
+$ControlHttp2Enabled = if ($null -ne $d.control_http2_enabled) { [bool]$d.control_http2_enabled } else { $Http2Enabled }
+$ControlHttp2Require = if ($null -ne $d.control_http2_require) { [bool]$d.control_http2_require } else { $false }
+$ControlHttp1Fallback = if ($null -ne $d.control_http1_fallback) { [bool]$d.control_http1_fallback } else { $true }
 $ControlStreamEnabled = if ($null -ne $d.control_stream_enabled) { [bool]$d.control_stream_enabled } else { $true }
 $LongPollFallback = if ($null -ne $d.long_poll_fallback) { [bool]$d.long_poll_fallback } else { $true }
 $ReportEventsV2Enabled = if ($null -ne $d.report_events_v2_enabled) { [bool]$d.report_events_v2_enabled } else { $true }
@@ -1805,6 +1823,9 @@ function Merge-EnrollIntoAgentTomlExample {
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
       $out.Add(('http2_enabled        = {0}' -f (Format-TomlBool $Http2Enabled)))
       $out.Add(('http2_require        = {0}' -f (Format-TomlBool $Http2Require)))
+      $out.Add(('control_http2_enabled = {0}' -f (Format-TomlBool $ControlHttp2Enabled)))
+      $out.Add(('control_http2_require = {0}' -f (Format-TomlBool $ControlHttp2Require)))
+      $out.Add(('control_http1_fallback = {0}' -f (Format-TomlBool $ControlHttp1Fallback)))
       $out.Add(('control_stream_enabled = {0}' -f (Format-TomlBool $ControlStreamEnabled)))
       $out.Add(('long_poll_fallback   = {0}' -f (Format-TomlBool $LongPollFallback)))
       $out.Add(('report_events_v2_enabled = {0}' -f (Format-TomlBool $ReportEventsV2Enabled)))
@@ -1817,7 +1838,7 @@ function Merge-EnrollIntoAgentTomlExample {
       $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
       $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
       $i++
-      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(http2_enabled|http2_require|control_stream_enabled|long_poll_fallback|report_events_v2_enabled|data_plane_encoding|data_plane_compression|control_dict_version|control_schema_version|control_profile_id|proxy_mode|proxy_url|relay_url)\s*=')) {
+      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(http2_enabled|http2_require|control_http2_enabled|control_http2_require|control_http1_fallback|control_stream_enabled|long_poll_fallback|report_events_v2_enabled|data_plane_encoding|data_plane_compression|control_dict_version|control_schema_version|control_profile_id|proxy_mode|proxy_url|relay_url)\s*=')) {
         $i++
       }
       continue
@@ -1857,6 +1878,9 @@ function Merge-EnrollIntoAgentTomlExample {
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
       $out.Add(('http2_enabled        = {0}' -f (Format-TomlBool $Http2Enabled)))
       $out.Add(('http2_require        = {0}' -f (Format-TomlBool $Http2Require)))
+      $out.Add(('control_http2_enabled = {0}' -f (Format-TomlBool $ControlHttp2Enabled)))
+      $out.Add(('control_http2_require = {0}' -f (Format-TomlBool $ControlHttp2Require)))
+      $out.Add(('control_http1_fallback = {0}' -f (Format-TomlBool $ControlHttp1Fallback)))
       $out.Add(('control_stream_enabled = {0}' -f (Format-TomlBool $ControlStreamEnabled)))
       $out.Add(('long_poll_fallback   = {0}' -f (Format-TomlBool $LongPollFallback)))
       $out.Add(('report_events_v2_enabled = {0}' -f (Format-TomlBool $ReportEventsV2Enabled)))
@@ -2087,6 +2111,9 @@ tenant_id            = "$(Escape-Toml $d.tenant_id)"
 rest_base_url        = "$(Escape-Toml $rest)"
 http2_enabled        = $(Format-TomlBool $Http2Enabled)
 http2_require        = $(Format-TomlBool $Http2Require)
+control_http2_enabled = $(Format-TomlBool $ControlHttp2Enabled)
+control_http2_require = $(Format-TomlBool $ControlHttp2Require)
+control_http1_fallback = $(Format-TomlBool $ControlHttp1Fallback)
 control_stream_enabled = $(Format-TomlBool $ControlStreamEnabled)
 long_poll_fallback   = $(Format-TomlBool $LongPollFallback)
 report_events_v2_enabled = $(Format-TomlBool $ReportEventsV2Enabled)
