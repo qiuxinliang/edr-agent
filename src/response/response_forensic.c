@@ -321,19 +321,84 @@ static int fy_add_rules_from_dir(YR_COMPILER *c, const char *dir, int *loaded, c
 }
 #endif
 
-static const char *fy_effective_rules_dir(char *buf, size_t cap) {
+static const char *fy_effective_rules_dir(char *buf, size_t cap, const char **source_out) {
   const EdrConfig *cfg = edr_command_get_config();
   if (cfg && cfg->command.forensic_yara_rules_dir[0]) {
     snprintf(buf, cap, "%s", cfg->command.forensic_yara_rules_dir);
+    if (source_out) *source_out = "config";
     return buf;
   }
   const char *env = getenv("EDR_YARA_RULES_DIR");
   if (env && env[0]) {
     snprintf(buf, cap, "%s", env);
+    if (source_out) *source_out = "environment";
     return buf;
   }
+  {
+    char executable[1024];
+    executable[0] = '\0';
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, executable, (DWORD)sizeof(executable));
+    if (n == 0 || n >= sizeof(executable)) executable[0] = '\0';
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", executable, sizeof(executable) - 1u);
+    if (n > 0) executable[n] = '\0';
+    else executable[0] = '\0';
+#endif
+    if (executable[0]) {
+      char *slash = strrchr(executable, '/');
+#ifdef _WIN32
+      char *backslash = strrchr(executable, '\\');
+      if (!slash || (backslash && backslash > slash)) slash = backslash;
+#endif
+      if (slash) {
+        *slash = '\0';
+#ifdef _WIN32
+        snprintf(buf, cap, "%s\\rules\\forensic", executable);
+#else
+        snprintf(buf, cap, "%s/rules/forensic", executable);
+#endif
+        if (source_out) *source_out = "executable";
+        return buf;
+      }
+    }
+  }
   snprintf(buf, cap, "%s", "rules/forensic");
+  if (source_out) *source_out = "cwd";
   return buf;
+}
+
+static YR_RULES *fy_compile_rules_dir(const char *rules_dir, int *files_loaded,
+                                      char *err, size_t err_cap);
+
+int edr_response_yara_runtime_status(char *rules_dir, size_t rules_dir_cap,
+                                     size_t *rules_count, char *source,
+                                     size_t source_cap, char *error,
+                                     size_t error_cap) {
+  if (rules_dir && rules_dir_cap) rules_dir[0] = '\0';
+  if (rules_count) *rules_count = 0u;
+  if (source && source_cap) source[0] = '\0';
+  if (error && error_cap) error[0] = '\0';
+  char dir[1024];
+  const char *path_source = "unknown";
+  const char *path = fy_effective_rules_dir(dir, sizeof(dir), &path_source);
+  if (rules_dir && rules_dir_cap) snprintf(rules_dir, rules_dir_cap, "%s", path);
+  if (source && source_cap) snprintf(source, source_cap, "%s", path_source);
+  int loaded = 0;
+  char compile_error[256];
+  compile_error[0] = '\0';
+  YR_RULES *compiled = fy_compile_rules_dir(path, &loaded, compile_error,
+                                            sizeof(compile_error));
+  if (!compiled) {
+    if (error && error_cap) {
+      snprintf(error, error_cap, "%s",
+               compile_error[0] ? compile_error : "YARA rules runtime preflight failed");
+    }
+    return 0;
+  }
+  yr_rules_destroy(compiled);
+  if (rules_count) *rules_count = loaded > 0 ? (size_t)loaded : 0u;
+  return 1;
 }
 
 static YR_RULES *fy_compile_rules_dir(const char *rules_dir, int *files_loaded, char *err, size_t err_cap) {
@@ -381,12 +446,25 @@ static YR_RULES *fy_compile_effective_rules(const char *rules_text, char *source
     return fy_compile_inline_rules(rules_text, err, err_cap);
   }
   char dir[1024];
-  const char *rules_dir = fy_effective_rules_dir(dir, sizeof(dir));
+  const char *rules_dir = fy_effective_rules_dir(dir, sizeof(dir), NULL);
   if (source && source_cap) snprintf(source, source_cap, "rules_dir:%s", rules_dir);
   return fy_compile_rules_dir(rules_dir, files_loaded, err, err_cap);
 }
 
 #endif /* EDR_HAVE_YARA */
+
+#ifndef EDR_HAVE_YARA
+int edr_response_yara_runtime_status(char *rules_dir, size_t rules_dir_cap,
+                                     size_t *rules_count, char *source,
+                                     size_t source_cap, char *error,
+                                     size_t error_cap) {
+  if (rules_dir && rules_dir_cap) rules_dir[0] = '\0';
+  if (rules_count) *rules_count = 0u;
+  if (source && source_cap) snprintf(source, source_cap, "%s", "build");
+  if (error && error_cap) snprintf(error, error_cap, "%s", "libyara unavailable in this build");
+  return 0;
+}
+#endif
 
 struct EdrForensicYaraSession {
 #ifdef EDR_HAVE_YARA

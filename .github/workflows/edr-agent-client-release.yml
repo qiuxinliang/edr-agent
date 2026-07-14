@@ -291,7 +291,13 @@ jobs:
         shell: pwsh
         run: |
           cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "FDSensor build failed with exit code $LASTEXITCODE"
+          }
           cmake --build build --target fd_installer_worker --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "FDSecurityInstallerWorker build failed with exit code $LASTEXITCODE"
+          }
 
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh

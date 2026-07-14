@@ -5,6 +5,7 @@
 #include "edr/attack_surface_inventory.h"
 #include "edr/security_policy_collect.h"
 #include "edr/ingest_http.h"
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -650,19 +651,58 @@ static void asurf_gather_policy_and_egress(const EdrConfig *cfg, EdrSecurityPoli
 #endif
 }
 
-static int asurf_listeners_only_mode(const char *command_id) {
+static int asurf_listeners_only_mode(const char *command_id, const uint8_t *payload,
+                                     size_t payload_len) {
   const char *lo = getenv("EDR_ATTACK_SURFACE_LISTENERS_ONLY");
   if (lo && lo[0] == '1') {
     return 1;
   }
-  if (command_id && strcmp(command_id, "etw_tcpip_wf") == 0) {
-    const char *el = getenv("EDR_ATTACK_SURFACE_ETW_LIGHT");
-    if (el && el[0] == '1') {
-      return 1;
+  int etw_trigger = command_id && strcmp(command_id, "etw_tcpip_wf") == 0;
+  if (payload && payload_len > 0u && payload_len <= 4096u) {
+    cJSON *root = cJSON_ParseWithLength((const char *)payload, payload_len);
+    if (root) {
+      cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+      cJSON *light = cJSON_GetObjectItemCaseSensitive(root, "listeners_only");
+      if (cJSON_IsString(reason) && reason->valuestring &&
+          strcmp(reason->valuestring, "etw_tcpip_wf") == 0) etw_trigger = 1;
+      if (cJSON_IsTrue(light)) etw_trigger = 1;
+      cJSON_Delete(root);
     }
+  }
+  if (etw_trigger) {
+    const char *el = getenv("EDR_ATTACK_SURFACE_ETW_LIGHT");
+    if (!el || el[0] != '0') return 1;
   }
   return 0;
 }
+
+static uint64_t asurf_monotonic_ms(void) {
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0u;
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+#ifdef _WIN32
+static volatile LONG s_asurf_execute_running;
+static int asurf_execute_try_lock(void) {
+  return InterlockedCompareExchange(&s_asurf_execute_running, 1, 0) == 0;
+}
+static void asurf_execute_unlock(void) { InterlockedExchange(&s_asurf_execute_running, 0); }
+#else
+static volatile unsigned s_asurf_execute_running;
+static int asurf_execute_try_lock(void) {
+  unsigned expected = 0u;
+  return __atomic_compare_exchange_n(&s_asurf_execute_running, &expected, 1u, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+static void asurf_execute_unlock(void) {
+  __atomic_store_n(&s_asurf_execute_running, 0u, __ATOMIC_RELEASE);
+}
+#endif
 
 static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsListener *L, int nL,
                                int truncated_ss, int listeners_only) {
@@ -994,7 +1034,9 @@ int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
   return response_json_refresh_pending_buf(resp);
 }
 
-int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, char *detail, size_t detail_cap) {
+static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t *payload,
+                                           size_t payload_len, const EdrConfig *cfg,
+                                           char *detail, size_t detail_cap) {
   if (!detail || detail_cap == 0) {
     return 3;
   }
@@ -1004,6 +1046,7 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     return 2;
   }
 
+  uint64_t started_ms = asurf_monotonic_ms();
   AsListener L[EDR_ASURF_LISTENERS_MAX];
   int truncated = 0;
   int nL = (cfg->attack_surface.listeners_enabled || cfg->attack_surface.public_service_enabled)
@@ -1012,7 +1055,8 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     snprintf(detail, detail_cap, "listener_collection_failed");
     return 3;
   }
-  int listeners_only = asurf_listeners_only_mode(command_id);
+  uint64_t listeners_done_ms = asurf_monotonic_ms();
+  int listeners_only = asurf_listeners_only_mode(command_id, payload, payload_len);
 
   char jsonpath[512];
   snprintf(jsonpath, sizeof(jsonpath), "/tmp/edr_asurf_%d_%lld.json", EDR_GETPID(),
@@ -1043,6 +1087,7 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     snprintf(detail, detail_cap, "read_json_failed");
     return 3;
   }
+  uint64_t snapshot_done_ms = asurf_monotonic_ms();
 
   char suffix[512];
   snprintf(suffix, sizeof(suffix), "endpoints/%s/attack-surface", cfg->agent.endpoint_id);
@@ -1052,8 +1097,29 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     snprintf(detail, detail_cap, "http_post_failed");
     return 3;
   }
-  snprintf(detail, detail_cap, "uploaded_http_ok");
+  uint64_t uploaded_ms = asurf_monotonic_ms();
+  snprintf(detail, detail_cap,
+           "uploaded_http_ok mode=%s listeners_ms=%llu snapshot_ms=%llu upload_ms=%llu total_ms=%llu",
+           listeners_only ? "listeners_only" : "full",
+           (unsigned long long)(listeners_done_ms - started_ms),
+           (unsigned long long)(snapshot_done_ms - listeners_done_ms),
+           (unsigned long long)(uploaded_ms - snapshot_done_ms),
+           (unsigned long long)(uploaded_ms - started_ms));
   return 0;
+}
+
+int edr_attack_surface_execute(const char *command_id, const uint8_t *payload,
+                               size_t payload_len, const EdrConfig *cfg,
+                               char *detail, size_t detail_cap) {
+  if (!detail || detail_cap == 0u) return 3;
+  if (!asurf_execute_try_lock()) {
+    snprintf(detail, detail_cap, "%s", "coalesced_inflight");
+    return 0;
+  }
+  int rc = edr_attack_surface_execute_impl(command_id, payload, payload_len,
+                                           cfg, detail, detail_cap);
+  asurf_execute_unlock();
+  return rc;
 }
 
 /* §19.10 ETW → 攻击面增量：预处理线程 signal，主线程 take + execute（去抖） */

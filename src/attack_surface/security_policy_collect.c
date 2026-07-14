@@ -128,70 +128,9 @@ static int parse_netsh_fw_policy(const char *line, char *inb, size_t in_cap, cha
   return 0;
 }
 
-static int run_command_capture_first_line(const char *cmdline, char *line, size_t cap) {
-  if (!cmdline || !cmdline[0] || !line || cap < 2u) {
-    return -1;
-  }
-  line[0] = 0;
-  SECURITY_ATTRIBUTES sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.nLength = sizeof(sa);
-  sa.bInheritHandle = TRUE;
-  HANDLE rd = NULL, wr = NULL;
-  if (!CreatePipe(&rd, &wr, &sa, 0)) {
-    return -1;
-  }
-  (void)SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-  STARTUPINFOA si;
-  PROCESS_INFORMATION pi;
-  memset(&si, 0, sizeof(si));
-  memset(&pi, 0, sizeof(pi));
-  si.cb = sizeof(si);
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-  si.hStdOutput = wr;
-  si.hStdError = wr;
-  char cmd[2048];
-  snprintf(cmd, sizeof(cmd), "%s", cmdline);
-  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-  CloseHandle(wr);
-  if (!ok) {
-    CloseHandle(rd);
-    return -1;
-  }
-  DWORD got = 0;
-  size_t off = 0u;
-  char tmp[128];
-  while (ReadFile(rd, tmp, sizeof(tmp), &got, NULL) && got > 0) {
-    for (DWORD i = 0; i < got; i++) {
-      if (off + 1u >= cap) {
-        break;
-      }
-      line[off++] = tmp[i];
-      if (tmp[i] == '\n') {
-        goto done_read;
-      }
-    }
-    if (off + 1u >= cap) {
-      break;
-    }
-  }
-done_read:
-  line[off] = 0;
-  CloseHandle(rd);
-  (void)WaitForSingleObject(pi.hProcess, 15000);
-  CloseHandle(pi.hThread);
-  CloseHandle(pi.hProcess);
-  if (off == 0u) {
-    return -1;
-  }
-  return 0;
-}
-
-static int run_command_capture_all(const char *cmdline, char *out, size_t cap) {
-  if (!cmdline || !cmdline[0] || !out || cap < 2u) {
-    return -1;
-  }
+static int run_command_capture_timeout(const char *cmdline, char *out, size_t cap,
+                                       int first_line_only, DWORD timeout_ms) {
+  if (!cmdline || !cmdline[0] || !out || cap < 2u || timeout_ms == 0u) return -1;
   out[0] = 0;
   SECURITY_ATTRIBUTES sa;
   memset(&sa, 0, sizeof(sa));
@@ -211,94 +150,177 @@ static int run_command_capture_all(const char *cmdline, char *out, size_t cap) {
   si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
   si.hStdOutput = wr;
   si.hStdError = wr;
-  char cmd[2048];
+  char cmd[8192];
   snprintf(cmd, sizeof(cmd), "%s", cmdline);
-  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  HANDLE job = CreateJobObjectA(NULL, NULL);
+  if (job) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                 &limits, sizeof(limits))) {
+      CloseHandle(job);
+      job = NULL;
+    }
+  }
+  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+                           CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                           NULL, NULL, &si, &pi);
   CloseHandle(wr);
   if (!ok) {
     CloseHandle(rd);
+    if (job) CloseHandle(job);
     return -1;
   }
-  DWORD got = 0;
+  if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+    CloseHandle(job);
+    job = NULL;
+  }
+  ResumeThread(pi.hThread);
+
+  ULONGLONG started = GetTickCount64();
   size_t off = 0u;
-  char tmp[256];
-  while (ReadFile(rd, tmp, sizeof(tmp), &got, NULL) && got > 0) {
-    if (off + (size_t)got >= cap) {
-      got = (DWORD)(cap - off - 1u);
+  int capture_done = 0;
+  int timed_out = 0;
+  for (;;) {
+    DWORD available = 0u;
+    BOOL peek_ok = PeekNamedPipe(rd, NULL, 0, NULL, &available, NULL);
+    if (peek_ok && available > 0u) {
+      char tmp[512];
+      DWORD want = available < sizeof(tmp) ? available : (DWORD)sizeof(tmp);
+      DWORD got = 0u;
+      if (ReadFile(rd, tmp, want, &got, NULL) && got > 0u) {
+        for (DWORD i = 0; i < got; i++) {
+          if (!capture_done && off + 1u < cap) out[off++] = tmp[i];
+          if (first_line_only && tmp[i] == '\n') capture_done = 1;
+          if (off + 1u >= cap) capture_done = 1;
+        }
+      }
+      continue;
     }
-    if (got == 0) {
+    DWORD wait = WaitForSingleObject(pi.hProcess, 0u);
+    if (wait == WAIT_OBJECT_0) {
+      if (!peek_ok || available == 0u) break;
+    } else if (wait == WAIT_FAILED) {
       break;
     }
-    memcpy(out + off, tmp, (size_t)got);
-    off += (size_t)got;
-    if (off + 1u >= cap) {
+    if (GetTickCount64() - started >= timeout_ms) {
+      timed_out = 1;
+      if (job) TerminateJobObject(job, 124u);
+      else TerminateProcess(pi.hProcess, 124u);
+      (void)WaitForSingleObject(pi.hProcess, 5000u);
       break;
     }
+    Sleep(10u);
   }
   out[off] = 0;
+  DWORD exit_code = 1u;
+  (void)GetExitCodeProcess(pi.hProcess, &exit_code);
   CloseHandle(rd);
-  (void)WaitForSingleObject(pi.hProcess, 15000);
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
-  return (off > 0u) ? 0 : -1;
+  if (job) CloseHandle(job);
+  if (timed_out) return -2;
+  return off > 0u && exit_code == 0u ? 0 : -1;
 }
 
-static int ps_count_rules(const char *filter_expr) {
-  char cmd[1800];
-  snprintf(cmd, sizeof(cmd),
-           "powershell.exe -NoProfile -NoLogo -Command "
-           "\"(Get-NetFirewallRule | Where-Object { %s } | Measure-Object).Count\"",
-           filter_expr);
-  char line[64];
-  if (run_command_capture_first_line(cmd, line, sizeof(line)) != 0) {
-    return -1;
-  }
-  trim_crlf(line);
-  return (int)strtol(line, NULL, 10);
+static int run_command_capture_all(const char *cmdline, char *out, size_t cap) {
+  return run_command_capture_timeout(cmdline, out, cap, 0, 15000u);
 }
 
-/** 与 §19.2.4 `highRiskAllowPorts` 对齐：入站 Allow 且 LocalPort 在配置或默认高危列表中 */
-static void collect_win_high_risk_allow_ports(const EdrConfig *cfg, EdrSecurityPolicySnap *o) {
-  if (!cfg || !o) {
-    return;
+static int configured_high_risk_port(const EdrConfig *cfg, int port) {
+  static const uint16_t fallback[] = {23, 445, 3389, 6379, 27017, 1433, 3306};
+  const uint16_t *ports = fallback;
+  size_t count = sizeof(fallback) / sizeof(fallback[0]);
+  if (cfg && cfg->attack_surface.high_risk_immediate_ports &&
+      cfg->attack_surface.high_risk_immediate_ports_count > 0u) {
+    ports = cfg->attack_surface.high_risk_immediate_ports;
+    count = cfg->attack_surface.high_risk_immediate_ports_count;
   }
-  o->sp_hr_allow_ports_count = 0;
-  static const uint16_t fb[] = {23, 445, 3389, 6379, 27017, 1433, 3306};
-  const uint16_t *plist = fb;
-  size_t pn = sizeof(fb) / sizeof(fb[0]);
-  if (cfg->attack_surface.high_risk_immediate_ports &&
-      cfg->attack_surface.high_risk_immediate_ports_count > 0) {
-    plist = cfg->attack_surface.high_risk_immediate_ports;
-    pn = cfg->attack_surface.high_risk_immediate_ports_count;
+  for (size_t i = 0; i < count; i++) {
+    if ((int)ports[i] == port) return 1;
   }
-  for (size_t k = 0; k < pn && o->sp_hr_allow_ports_count < 16; k++) {
-    int port = (int)plist[k];
-    if (port < 1 || port > 65535) {
-      continue;
-    }
-    char cmd[2200];
-    int nw = snprintf(
-        cmd, sizeof(cmd),
-        "powershell.exe -NoProfile -NoLogo -Command "
-        "\"if ((Get-NetFirewallRule | Where-Object { $_.Enabled -eq $true -and $_.Direction -eq "
-        "'Inbound' -and $_.Action -eq 'Allow' } | ForEach-Object { Get-NetFirewallPortFilter "
-        "-AssociatedNetFirewallRule $_ -ErrorAction SilentlyContinue } | Where-Object { $_.LocalPort "
-        "-eq %d }).Count -gt 0) { '1' } else { '0' }\"",
-        port);
-    if (nw <= 0 || (size_t)nw >= sizeof(cmd)) {
-      continue;
-    }
-    char line[8];
-    if (run_command_capture_first_line(cmd, line, sizeof(line)) != 0) {
-      continue;
-    }
+  return 0;
+}
+
+static void collect_win_firewall_rule_summary(const EdrConfig *cfg,
+                                              EdrSecurityPolicySnap *o) {
+  static const uint16_t fallback[] = {23, 445, 3389, 6379, 27017, 1433, 3306};
+  const uint16_t *ports = fallback;
+  size_t port_count = sizeof(fallback) / sizeof(fallback[0]);
+  if (cfg && cfg->attack_surface.high_risk_immediate_ports &&
+      cfg->attack_surface.high_risk_immediate_ports_count > 0u) {
+    ports = cfg->attack_surface.high_risk_immediate_ports;
+    port_count = cfg->attack_surface.high_risk_immediate_ports_count;
+  }
+  if (port_count > 16u) port_count = 16u;
+  char port_list[192];
+  size_t used = 0u;
+  port_list[0] = '\0';
+  for (size_t i = 0; i < port_count; i++) {
+    int n = snprintf(port_list + used, sizeof(port_list) - used, "%s%u",
+                     used ? "," : "", (unsigned)ports[i]);
+    if (n <= 0 || (size_t)n >= sizeof(port_list) - used) break;
+    used += (size_t)n;
+  }
+
+  char cmd[8192];
+  snprintf(
+      cmd, sizeof(cmd),
+      "powershell.exe -NoProfile -NoLogo -NonInteractive -Command \""
+      "$ErrorActionPreference='Stop';$wanted=@(%s);"
+      "$all=@(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop);"
+      "$enabled=@($all|Where-Object {$_.Enabled -eq $true});"
+      "$ia=@($enabled|Where-Object {$_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow'});"
+      "$ib=@($enabled|Where-Object {$_.Direction -eq 'Inbound' -and $_.Action -eq 'Block'});"
+      "$oa=@($enabled|Where-Object {$_.Direction -eq 'Outbound' -and $_.Action -eq 'Allow'});"
+      "$ob=@($enabled|Where-Object {$_.Direction -eq 'Outbound' -and $_.Action -eq 'Block'});"
+      "$hp=@($ia|ForEach-Object {Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_ "
+      "-ErrorAction SilentlyContinue}|"
+      "ForEach-Object {$_.LocalPort}|Where-Object {$_ -match '^[0-9]+$' -and "
+      "$wanted -contains [int]$_}|Sort-Object -Unique);"
+      "Write-Output ('IA='+$ia.Count);Write-Output ('IB='+$ib.Count);"
+      "Write-Output ('OA='+$oa.Count);Write-Output ('OB='+$ob.Count);"
+      "Write-Output ('HP='+($hp -join ','));"
+      "try {if (Confirm-SecureBootUEFI) {Write-Output 'SB=1'} "
+      "else {Write-Output 'SB=0'}} catch {Write-Output 'SB=x'}\"",
+      port_list);
+  char output[4096];
+  if (run_command_capture_timeout(cmd, output, sizeof(output), 0, 25000u) != 0) return;
+  int ia = -1, ib = -1, oa = -1, ob = -1;
+  char *context = NULL;
+  for (char *line = strtok_s(output, "\r\n", &context); line;
+       line = strtok_s(NULL, "\r\n", &context)) {
     trim_crlf(line);
-    if (line[0] != '1') {
+    if (sscanf(line, "IA=%d", &ia) == 1) continue;
+    if (sscanf(line, "IB=%d", &ib) == 1) continue;
+    if (sscanf(line, "OA=%d", &oa) == 1) continue;
+    if (sscanf(line, "OB=%d", &ob) == 1) continue;
+    if (strncmp(line, "SB=", 3u) == 0 && (line[3] == '0' || line[3] == '1')) {
+      o->os_secure_boot_known = 1;
+      o->os_secure_boot = line[3] == '1';
       continue;
     }
-    snprintf(o->sp_hr_allow_ports[o->sp_hr_allow_ports_count], sizeof(o->sp_hr_allow_ports[0]),
-             "%d/tcp", port);
-    o->sp_hr_allow_ports_count++;
+    if (strncmp(line, "HP=", 3u) == 0) {
+      char *port_context = NULL;
+      for (char *item = strtok_s(line + 3, ",", &port_context); item;
+           item = strtok_s(NULL, ",", &port_context)) {
+        int port = (int)strtol(item, NULL, 10);
+        if (!configured_high_risk_port(cfg, port) ||
+            o->sp_hr_allow_ports_count >= 16) continue;
+        snprintf(o->sp_hr_allow_ports[o->sp_hr_allow_ports_count],
+                 sizeof(o->sp_hr_allow_ports[0]), "%d/tcp", port);
+        o->sp_hr_allow_ports_count++;
+      }
+    }
+  }
+  if (ia >= 0) { o->sp_in_allow_known = 1; o->sp_in_allow = (uint32_t)ia; }
+  if (ib >= 0) { o->sp_in_block_known = 1; o->sp_in_block = (uint32_t)ib; }
+  if (oa >= 0) { o->sp_out_allow_known = 1; o->sp_out_allow = (uint32_t)oa; }
+  if (ob >= 0) { o->sp_out_block_known = 1; o->sp_out_block = (uint32_t)ob; }
+  if (ia >= 0 && ib >= 0 && oa >= 0 && ob >= 0) {
+    o->top_rule_count_known = 1;
+    o->top_rule_count = ia + ib + oa + ob;
   }
 }
 
@@ -315,6 +337,7 @@ static void collect_win_firewall(const EdrConfig *cfg, EdrSecurityPolicySnap *o)
 
   char dump[16384];
   if (run_command_capture_all("netsh advfirewall show allprofiles", dump, sizeof(dump)) != 0) {
+    collect_win_firewall_rule_summary(cfg, o);
     return;
   }
   char *save = NULL;
@@ -386,25 +409,7 @@ static void collect_win_firewall(const EdrConfig *cfg, EdrSecurityPolicySnap *o)
     }
   }
 
-  int ia = ps_count_rules("$_.Enabled -eq $true -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow'");
-  int ib = ps_count_rules("$_.Enabled -eq $true -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block'");
-  int oa = ps_count_rules("$_.Enabled -eq $true -and $_.Direction -eq 'Outbound' -and $_.Action -eq 'Allow'");
-  int ob = ps_count_rules("$_.Enabled -eq $true -and $_.Direction -eq 'Outbound' -and $_.Action -eq 'Block'");
-  if (ia >= 0 && ib >= 0 && oa >= 0 && ob >= 0) {
-    o->sp_in_allow_known = o->sp_in_block_known = o->sp_out_allow_known = o->sp_out_block_known = 1;
-    o->sp_in_allow = (uint32_t)ia;
-    o->sp_in_block = (uint32_t)ib;
-    o->sp_out_allow = (uint32_t)oa;
-    o->sp_out_block = (uint32_t)ob;
-    int sum = ia + ib + oa + ob;
-    if (sum >= 0) {
-      o->top_rule_count_known = 1;
-      o->top_rule_count = sum;
-    }
-  }
-  if (cfg) {
-    collect_win_high_risk_allow_ports(cfg, o);
-  }
+  collect_win_firewall_rule_summary(cfg, o);
 }
 
 static void collect_win_os(EdrSecurityPolicySnap *o) {
@@ -433,20 +438,7 @@ static void collect_win_os(EdrSecurityPolicySnap *o) {
     o->os_rdp_nla_known = 1;
     o->os_rdp_nla = (int)(v != 0);
   }
-  /* DEP：策略注册表项在不同 SKU 上不一致，P1 不填 */
-  {
-    char line[16];
-    if (run_command_capture_first_line(
-            "powershell.exe -NoProfile -NoLogo -Command \"try { if (Confirm-SecureBootUEFI) { '1' } "
-            "else { '0' } } catch { 'x' }\"",
-            line, sizeof(line)) == 0) {
-      trim_crlf(line);
-      if (line[0] == '1' || line[0] == '0') {
-        o->os_secure_boot_known = 1;
-        o->os_secure_boot = line[0] == '1' ? 1 : 0;
-      }
-    }
-  }
+  /* Secure Boot 与防火墙规则在同一个受控 PowerShell 进程中采集。 */
   char bn[32] = "";
   char dv[64] = "";
   DWORD bnv = 0;

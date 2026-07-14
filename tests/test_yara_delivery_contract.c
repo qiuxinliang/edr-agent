@@ -30,6 +30,12 @@ static int require_contains(const char *text, const char *needle, const char *me
   return 0;
 }
 
+static int require_absent(const char *text, const char *needle, const char *message) {
+  if (!contains(text, needle)) return 1;
+  fprintf(stderr, "FAIL: %s (unexpected %s)\n", message, needle);
+  return 0;
+}
+
 int main(void) {
   const char *root = getenv("EDR_SOURCE_DIR");
   if (!root || !root[0]) root = ".";
@@ -80,7 +86,35 @@ int main(void) {
   ok &= require_contains(response, "no eligible readable files completed YARA scanning", "zero-scan failure must be explicit");
   ok &= require_contains(response, "pl, len, \"tar.gz\", 1", "external YARA artifact type must match collector output");
   ok &= require_contains(response, "if (rc == 0 || rc == 2)", "collector partial exit must be a terminal success state");
+  ok &= require_contains(response, "GetModuleFileNameA(NULL, executable",
+                         "Windows YARA must resolve rules relative to the installed executable");
+  ok &= require_contains(response, "readlink(\"/proc/self/exe\"",
+                         "POSIX YARA must resolve rules relative to the installed executable");
+  ok &= require_contains(response, "edr_response_yara_runtime_status",
+                         "YARA must expose a runtime rules preflight for capability reporting");
+  ok &= require_contains(response, "fy_compile_rules_dir(path, &loaded",
+                         "YARA readiness must compile, not merely count, the installed rules");
+  ok &= require_contains(response, "yr_rules_destroy(compiled)",
+                         "YARA readiness preflight must release compiled rules");
   free(response);
+
+  snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
+  char *agent = read_file(path);
+  if (!agent) {
+    fprintf(stderr, "FAIL: cannot read Agent core source\n");
+    return 1;
+  }
+  ok &= require_contains(agent, "edr_agent_apply_remote_command_policy",
+                         "remote command policy must merge only explicit fields");
+  ok &= require_contains(agent, "edr_agent_toml_section_has_key",
+                         "remote command policy merge must preserve omitted local settings");
+  ok &= require_absent(agent, "agent->cfg.command = remote->command;",
+                       "remote policy must not replace the complete command configuration");
+  ok &= require_contains(agent, "yara_rules_ready",
+                         "capability manifest must distinguish compiled YARA from ready rules");
+  ok &= require_contains(agent, "edr_deep_collector_schedule_runtime_refresh();",
+                         "collector manifest refresh must be scheduled outside query execution");
+  free(agent);
 
   snprintf(path, sizeof(path), "%s/src/command/command_stub.c", root);
   char *commands = read_file(path);
@@ -92,7 +126,70 @@ int main(void) {
   ok &= require_contains(commands, "query output is missing the required rows array", "Velo output must require rows");
   ok &= require_contains(commands, "collector returned an error", "Velo must preserve collector failures");
   ok &= require_contains(commands, "provider_status", "Velo must preserve provider status provenance");
+  ok &= require_contains(commands, "spec.cpu_limit_percent = 40u;",
+                         "Velo query must run under the approved 40 percent CPU quota");
+  ok &= require_contains(commands, "cJSON_AddNumberToObject(result, \"cpu_limit_percent\", spec.cpu_limit_percent)",
+                         "Velo result contracts must expose the applied CPU quota");
+  ok &= require_contains(commands, "cJSON_AddItemToObject(result, \"timings_ms\", timings)",
+                         "Velo large-result contract must include phase timings without fixed-buffer JSON");
   free(commands);
+
+  snprintf(path, sizeof(path), "%s/src/forensic/deep_collector.c", root);
+  char *collector = read_file(path);
+  if (!collector) {
+    fprintf(stderr, "FAIL: cannot read deep collector source\n");
+    return 1;
+  }
+  ok &= require_contains(collector, "spec->cpu_limit_percent ? spec->cpu_limit_percent : 10u",
+                         "collector Job Object must apply per-command CPU quotas");
+  ok &= require_contains(collector, "collector CPU quota setup failed percent=%u",
+                         "an explicit Velo CPU quota must fail closed when Windows rejects the hard cap");
+  ok &= require_contains(collector, "collector CPU quota assignment failed percent=%u",
+                         "an explicit Velo CPU quota must fail closed when the process cannot join the Job Object");
+  ok &= require_contains(collector, "edr_deep_collector_schedule_runtime_refresh",
+                         "existing collector binaries must refresh asynchronously");
+  ok &= require_contains(collector, "dc_prepare_velociraptor",
+                         "Velo preparation must reuse a ready binary without blocking on version checks");
+  free(collector);
+
+  snprintf(path, sizeof(path), "%s/src/attack_surface/security_policy_collect.c", root);
+  char *security = read_file(path);
+  if (!security) {
+    fprintf(stderr, "FAIL: cannot read Windows security policy collector source\n");
+    return 1;
+  }
+  ok &= require_contains(security, "PeekNamedPipe", "Windows subprocess output must be polled without blocking");
+  ok &= require_contains(security, "TerminateJobObject(job, 124u)",
+                         "Windows subprocess timeout must terminate the complete process tree");
+  ok &= require_contains(security, "$all=@(Get-NetFirewallRule -PolicyStore ActiveStore",
+                         "Windows firewall rules must be enumerated once per snapshot");
+  ok &= require_absent(security, "static int ps_count_rules(",
+                       "legacy repeated firewall PowerShell queries must stay removed");
+  free(security);
+
+  snprintf(path, sizeof(path), "%s/install/windows-inno/Build-BundledInstaller.ps1", root);
+  char *build_installer = read_file(path);
+  if (!build_installer) {
+    fprintf(stderr, "FAIL: cannot read bundled installer build script\n");
+    return 1;
+  }
+  ok &= require_contains(build_installer, "$requiredForensicRules = @(",
+                         "Windows release build must gate on the complete forensic rule set");
+  ok &= require_contains(build_installer, "Missing required forensic YARA rule asset",
+                         "missing YARA assets must fail the release build");
+  free(build_installer);
+
+  snprintf(path, sizeof(path), "%s/install/windows-inno/EDRAgentSetup.bundled.iss", root);
+  char *inno = read_file(path);
+  if (!inno) {
+    fprintf(stderr, "FAIL: cannot read bundled Inno setup source\n");
+    return 1;
+  }
+  ok &= require_contains(inno, "Source: \"..\\..\\rules\\forensic\\*\"; DestDir: \"{app}\\rules\\forensic\"; Flags: ignoreversion recursesubdirs createallsubdirs",
+                         "bundled installer must always package forensic YARA rules");
+  ok &= require_absent(inno, "rules\\forensic\\*\"; DestDir: \"{app}\\rules\\forensic\"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist",
+                       "bundled installer must not silently omit forensic YARA rules");
+  free(inno);
 
   snprintf(path, sizeof(path), "%s/src/transport/ingest_http.c", root);
   char *transport = read_file(path);

@@ -395,7 +395,12 @@ else()
 endif()
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_win.c)
-  list(APPEND EDR_AGENT_SOURCES resources/FDSensor.rc)
+  # MSVC already creates and embeds an executable manifest. Feeding it another
+  # RT_MANIFEST resource can collide with that generated resource at link time.
+  # Non-MSVC Windows toolchains still need the resource compiler input.
+  if(NOT MSVC)
+    list(APPEND EDR_AGENT_SOURCES resources/FDSensor.rc)
+  endif()
 else()
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_stub.c)
 endif()
@@ -493,6 +498,13 @@ endif()
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
 if(WIN32)
   set_target_properties(edr_agent PROPERTIES OUTPUT_NAME "FDSensor")
+  if(MSVC)
+    # Merge the application settings into MSVC's generated manifest instead of
+    # embedding a second resource with the same executable manifest ID.
+    target_link_options(edr_agent PRIVATE
+      "/MANIFEST:EMBED"
+      "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/resources/FDSensor.manifest")
+  endif()
   if(EDR_CREATE_LEGACY_AGENT_ALIAS)
     add_custom_command(TARGET edr_agent POST_BUILD
       COMMAND "${CMAKE_COMMAND}" -E copy_if_different

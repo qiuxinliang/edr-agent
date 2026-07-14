@@ -95,8 +95,9 @@ int main(void) {
     return 1;
   }
 
-  if (!contains(branch, "edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail))")) {
-    fprintf(stderr, "manual attack surface command no longer calls edr_attack_surface_execute directly\n");
+  if (!contains(branch, "edr_attack_surface_execute(id, payload, payload_len,") ||
+      !contains(branch, "edr_command_get_config(), detail, sizeof(detail)")) {
+    fprintf(stderr, "manual attack surface command must pass its trigger payload to the collector\n");
     free(branch);
     free(command);
     free(registry);
@@ -135,6 +136,20 @@ int main(void) {
   if (!contains(report, "WEXITSTATUS(child_status) != 0") ||
       !contains(report, "listener_collection_failed")) {
     fprintf(stderr, "listener collector failures must not become fresh empty snapshots\n");
+    free(branch);
+    free(command);
+    free(registry);
+    free(report);
+    free(agent);
+    return 1;
+  }
+  if (!contains(report, "cJSON_GetObjectItemCaseSensitive(root, \"reason\")") ||
+      !contains(report, "strcmp(reason->valuestring, \"etw_tcpip_wf\") == 0") ||
+      !contains(report, "coalesced_inflight") ||
+      !contains(report, "listeners_ms=%llu") ||
+      !contains(report, "snapshot_ms=%llu") ||
+      !contains(report, "upload_ms=%llu")) {
+    fprintf(stderr, "attack surface triggers must support ETW light mode, coalescing and phase timings\n");
     free(branch);
     free(command);
     free(registry);

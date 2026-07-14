@@ -1457,6 +1457,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
   }
   edr_self_protect_init();
   edr_agent_derive_forensic_manifest_env(&agent->cfg);
+  edr_deep_collector_schedule_runtime_refresh();
   edr_adaptive_collection_configure(&agent->cfg);
   edr_agent_apply_event_filter_config(&agent->cfg);
   edr_resource_init(&agent->cfg);
@@ -1560,6 +1561,17 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
 #else
   const int yara_build = 0;
 #endif
+  size_t yara_rules_count = 0u;
+  char yara_rules_source[32];
+  char yara_rules_error[192];
+  yara_rules_source[0] = '\0';
+  yara_rules_error[0] = '\0';
+  int yara_rules_ready = yara_build &&
+      edr_response_yara_runtime_status(NULL, 0u, &yara_rules_count,
+                                       yara_rules_source, sizeof(yara_rules_source),
+                                       yara_rules_error, sizeof(yara_rules_error));
+  const char *yara_runtime = !yara_build ? "unavailable"
+                               : yara_rules_ready ? "healthy" : "degraded";
 #ifdef EDR_HAVE_ONNXRUNTIME
   const int ort_build = 1;
 #else
@@ -1619,7 +1631,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                         : artifact_upload_failed ? "degraded"
                                         : http_rt->upload_ok_count > 0u ? "healthy" : "idle";
   int yara_command_build = yara_build || velo_policy;
-  int yara_command_policy = yara_external_policy ? (velo_policy && artifact_upload_configured) : yara_build;
+  int yara_command_policy = yara_external_policy ? (velo_policy && artifact_upload_configured)
+                                                  : (yara_build && yara_rules_ready);
   const char *yara_command_runtime = !yara_command_build ? "unavailable"
                                      : !yara_command_policy ? "degraded"
                                      : yara_external_policy ? artifact_upload_runtime : "healthy";
@@ -1698,7 +1711,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "%s"
       "\"features\":{"
       "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
-      "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,"
+      "\"runtime_status\":\"%s\",\"rules_ready\":%s,\"rules_count\":%u,\"rules_source\":\"%s\"},"
       "\"shellcode_network\":{\"code_supported\":%s,\"build_supported\":%s,\"policy_enabled\":%s,"
       "\"runtime_status\":\"%s\",\"provider\":\"windivert\",\"windivert_source\":\"%s\",\"dll_loaded\":%s,"
       "\"driver_open\":%s,\"capture_threads\":%u,\"scan_workers\":%u,"
@@ -1733,7 +1747,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       (unsigned long long)alert_stats.critical_bypassed,
       endpoint_policy_capability,
       pcre2_build ? "true" : "false", pcre2_build ? "true" : "false", pcre2_build ? "healthy" : "unavailable",
-      yara_build ? "true" : "false", yara_build ? "true" : "false", yara_build ? "healthy" : "unavailable",
+      yara_build ? "true" : "false", yara_build ? "true" : "false", yara_runtime,
+      yara_rules_ready ? "true" : "false", (unsigned)yara_rules_count,
+      yara_rules_source[0] ? yara_rules_source : "unavailable",
       shellcode_rt.code_supported ? "true" : "false", shellcode_rt.build_supported ? "true" : "false",
       shellcode_rt.policy_enabled ? "true" : "false",
       shellcode_rt.runtime_status[0] ? shellcode_rt.runtime_status : "unavailable",
@@ -3085,6 +3101,75 @@ static int edr_agent_toml_has_section(const char *path, const char *section) {
   return 0;
 }
 
+static int edr_agent_toml_section_has_key(const char *path, const char *section,
+                                          const char *key) {
+  FILE *fp;
+  char line[512];
+  char section_header[96];
+  int in_section = 0;
+  if (!path || !path[0] || !section || !section[0] || !key || !key[0]) {
+    return 0;
+  }
+  snprintf(section_header, sizeof(section_header), "[%s]", section);
+  fp = fopen(path, "r");
+  if (!fp) {
+    return 0;
+  }
+  while (fgets(line, sizeof(line), fp)) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+    if (*p == '[') {
+      char *end = strchr(p, ']');
+      if (!end || p[1] == '[') {
+        in_section = 0;
+        continue;
+      }
+      end[1] = '\0';
+      in_section = strcmp(p, section_header) == 0;
+      continue;
+    }
+    if (in_section) {
+      char *eq = strchr(p, '=');
+      if (!eq) continue;
+      char *end = eq;
+      while (end > p && (end[-1] == ' ' || end[-1] == '\t')) end--;
+      if ((size_t)(end - p) == strlen(key) && strncmp(p, key, (size_t)(end - p)) == 0) {
+        fclose(fp);
+        return 1;
+      }
+    }
+  }
+  fclose(fp);
+  return 0;
+}
+
+static void edr_agent_apply_remote_command_policy(EdrConfig *cfg, const EdrConfig *remote,
+                                                   const char *toml_path) {
+  if (!cfg || !remote || !toml_path) return;
+#define EDR_REMOTE_COMMAND_BOOL(field)                                                        \
+  do {                                                                                         \
+    if (edr_agent_toml_section_has_key(toml_path, "command", #field))                         \
+      cfg->command.field = remote->command.field;                                               \
+  } while (0)
+#define EDR_REMOTE_COMMAND_U32(field) EDR_REMOTE_COMMAND_BOOL(field)
+#define EDR_REMOTE_COMMAND_STRING(field)                                                       \
+  do {                                                                                         \
+    if (edr_agent_toml_section_has_key(toml_path, "command", #field))                         \
+      snprintf(cfg->command.field, sizeof(cfg->command.field), "%s", remote->command.field);  \
+  } while (0)
+  EDR_REMOTE_COMMAND_BOOL(allow_dangerous);
+  EDR_REMOTE_COMMAND_BOOL(allow_rtq_readonly);
+  EDR_REMOTE_COMMAND_STRING(rtr_shell_allowlist);
+  EDR_REMOTE_COMMAND_U32(rtr_shell_max_timeout_sec);
+  EDR_REMOTE_COMMAND_STRING(signing_public_key_path);
+  EDR_REMOTE_COMMAND_STRING(signing_public_key_pem);
+  EDR_REMOTE_COMMAND_STRING(forensic_yara_rules_dir);
+#undef EDR_REMOTE_COMMAND_STRING
+#undef EDR_REMOTE_COMMAND_U32
+#undef EDR_REMOTE_COMMAND_BOOL
+}
+
 static int edr_collection_policy_changed(const EdrConfig *current, const EdrConfig *remote) {
   if (!current || !remote) {
     return 0;
@@ -3276,22 +3361,7 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     agent->cfg.health_monitor = remote->health_monitor;
   }
   if (edr_agent_toml_has_section(tmp, "command")) {
-    char local_command_signing_public_key_path[sizeof(agent->cfg.command.signing_public_key_path)];
-    char local_command_signing_public_key_pem[sizeof(agent->cfg.command.signing_public_key_pem)];
-    snprintf(local_command_signing_public_key_path, sizeof(local_command_signing_public_key_path), "%s",
-             agent->cfg.command.signing_public_key_path);
-    snprintf(local_command_signing_public_key_pem, sizeof(local_command_signing_public_key_pem), "%s",
-             agent->cfg.command.signing_public_key_pem);
-    agent->cfg.command = remote->command;
-    if (!agent->cfg.command.signing_public_key_path[0] && !agent->cfg.command.signing_public_key_pem[0]) {
-      snprintf(agent->cfg.command.signing_public_key_path, sizeof(agent->cfg.command.signing_public_key_path), "%s",
-               local_command_signing_public_key_path);
-      snprintf(agent->cfg.command.signing_public_key_pem, sizeof(agent->cfg.command.signing_public_key_pem), "%s",
-               local_command_signing_public_key_pem);
-      if (agent->cfg.command.signing_public_key_path[0] || agent->cfg.command.signing_public_key_pem[0]) {
-        fprintf(stderr, "[config] remote command policy omitted signing public key; preserved local command key material\n");
-      }
-    }
+    edr_agent_apply_remote_command_policy(&agent->cfg, remote, tmp);
   }
   if (edr_agent_toml_has_section(tmp, "forensic_auto")) {
     agent->cfg.forensic_auto = remote->forensic_auto;

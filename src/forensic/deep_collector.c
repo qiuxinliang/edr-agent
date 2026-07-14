@@ -12,6 +12,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -560,11 +561,23 @@ static int dc_maybe_refresh(const char *dest, const char *manifest_url, const ch
   return dc_autofetch_via_manifest(manifest_url, dest, pin_sha, detail, detail_cap);
 }
 
+#ifdef _WIN32
+static SRWLOCK s_dc_runtime_refresh_lock = SRWLOCK_INIT;
+static volatile LONG s_dc_runtime_refresh_running;
+static void dc_runtime_refresh_lock(void) { AcquireSRWLockExclusive(&s_dc_runtime_refresh_lock); }
+static void dc_runtime_refresh_unlock(void) { ReleaseSRWLockExclusive(&s_dc_runtime_refresh_lock); }
+#else
+static pthread_mutex_t s_dc_runtime_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile unsigned s_dc_runtime_refresh_running;
+static void dc_runtime_refresh_lock(void) { (void)pthread_mutex_lock(&s_dc_runtime_refresh_lock); }
+static void dc_runtime_refresh_unlock(void) { (void)pthread_mutex_unlock(&s_dc_runtime_refresh_lock); }
+#endif
+
 /* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
  * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
  * (EDR_FORENSIC_ADAPTER_SHA256 > legacy EDR_FORENSIC_COLLECTOR_SHA256 > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
  * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
-static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
+static int dc_ensure_adapter_unlocked(const char *dest, char *detail, size_t detail_cap) {
   if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
@@ -590,6 +603,13 @@ static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) 
   (void)chmod(dest, 0755); /* 下载件需可执行位 */
 #endif
   return EDR_DC_OK;
+}
+
+static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) {
+  dc_runtime_refresh_lock();
+  int rc = dc_ensure_adapter_unlocked(dest, detail, detail_cap);
+  dc_runtime_refresh_unlock();
+  return rc;
 }
 
 /* 解析适配器(forensic_collector)路径并校验。返回 0 可执行;否则 <0。
@@ -620,10 +640,8 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
       return EDR_DC_ERR_DOWNLOAD; /* 调用方据此回退 builtin */
     }
   } else {
-    /* 已存在:给版本感知刷新一次机会(按间隔比对平台 active sha,变更则原子替换)。 */
-    char ad[256];
-    ad[0] = '\0';
-    (void)dc_ensure_adapter(out_path, ad, sizeof(ad));
+    /* 已存在时版本检查交给后台，不在 RTQ/RTR/取证命令热路径持有 HTTP 锁。 */
+    edr_deep_collector_schedule_runtime_refresh();
   }
   const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
   if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
@@ -645,7 +663,7 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
  * 缺失且 autofetch 开启时,经平台 manifest 固定地址(EDR_FORENSIC_COLLECTOR_MANIFEST_URL,
  * kind=velociraptor)下载到该路径 + SHA256 校验(EDR_VELOCIRAPTOR_SHA256 > manifest sha)。
  * best-effort:返回非 0 时调用方不应中止(适配器找不到 velo 会 exit 5 → 由上层回退 builtin)。 */
-static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
+static int dc_ensure_velociraptor_unlocked(int refresh_existing, char *detail, size_t detail_cap) {
   char path[1024];
   const char *velo = getenv("EDR_VELOCIRAPTOR_BIN");
   if (velo && velo[0]) {
@@ -663,7 +681,7 @@ static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
   const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
   if (dc_file_nonempty(path)) {
     /* 已就绪:按间隔比对平台 active sha,变更则原子替换(平台升级 velo 版本自动滚更);失败/不可判则保留旧件。 */
-    if (autofetch && mf && mf[0]) {
+    if (refresh_existing && autofetch && mf && mf[0]) {
       static time_t s_velo_last_check = 0;
       (void)dc_maybe_refresh(path, mf, want, &s_velo_last_check, detail, detail_cap);
     }
@@ -678,6 +696,100 @@ static int dc_ensure_velociraptor(char *detail, size_t detail_cap) {
   int rc = dc_autofetch_via_manifest(mf, path, want, detail, detail_cap);
   if (rc != EDR_DC_OK) return rc;
   return EDR_DC_OK;
+}
+
+static int dc_ensure_velociraptor(int refresh_existing, char *detail, size_t detail_cap) {
+  dc_runtime_refresh_lock();
+  int rc = dc_ensure_velociraptor_unlocked(refresh_existing, detail, detail_cap);
+  dc_runtime_refresh_unlock();
+  return rc;
+}
+
+static int dc_velociraptor_ready(void) {
+  const char *velo = getenv("EDR_VELOCIRAPTOR_BIN");
+  if (velo && velo[0]) return dc_file_nonempty(velo);
+#ifdef _WIN32
+  return dc_file_nonempty("C:\\Program Files\\FDSecurity\\collector\\velociraptor.exe");
+#else
+  return dc_file_nonempty("velociraptor");
+#endif
+}
+
+static int dc_prepare_velociraptor(char *detail, size_t detail_cap) {
+  if (dc_velociraptor_ready()) {
+    edr_deep_collector_schedule_runtime_refresh();
+    return EDR_DC_OK;
+  }
+  return dc_ensure_velociraptor(0, detail, detail_cap);
+}
+
+static void dc_default_adapter_path(char *path, size_t cap) {
+  const char *configured = getenv("EDR_FORENSIC_COLLECTOR_BIN");
+  if (configured && configured[0]) {
+    snprintf(path, cap, "%s", configured);
+    return;
+  }
+#ifdef _WIN32
+  snprintf(path, cap, "%s", "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe");
+#else
+  snprintf(path, cap, "%s", "forensic_collector");
+#endif
+}
+
+static void dc_runtime_refresh_worker_body(void) {
+  char detail[256];
+  char adapter[1024];
+  detail[0] = '\0';
+  dc_default_adapter_path(adapter, sizeof(adapter));
+  int adapter_rc = dc_ensure_adapter(adapter, detail, sizeof(detail));
+  if (adapter_rc != EDR_DC_OK) {
+    fprintf(stderr, "[forensic] adapter background refresh: %s\n",
+            detail[0] ? detail : "unavailable");
+  }
+  detail[0] = '\0';
+  int velo_rc = dc_ensure_velociraptor(1, detail, sizeof(detail));
+  if (velo_rc != EDR_DC_OK) {
+    fprintf(stderr, "[forensic] velociraptor background refresh: %s\n",
+            detail[0] ? detail : "unavailable");
+  }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI dc_runtime_refresh_worker(LPVOID unused) {
+  (void)unused;
+  dc_runtime_refresh_worker_body();
+  InterlockedExchange(&s_dc_runtime_refresh_running, 0);
+  return 0u;
+}
+#else
+static void *dc_runtime_refresh_worker(void *unused) {
+  (void)unused;
+  dc_runtime_refresh_worker_body();
+  __atomic_store_n(&s_dc_runtime_refresh_running, 0u, __ATOMIC_RELEASE);
+  return NULL;
+}
+#endif
+
+void edr_deep_collector_schedule_runtime_refresh(void) {
+#ifdef _WIN32
+  if (InterlockedCompareExchange(&s_dc_runtime_refresh_running, 1, 0) != 0) return;
+  HANDLE thread = CreateThread(NULL, 0, dc_runtime_refresh_worker, NULL, 0, NULL);
+  if (!thread) {
+    InterlockedExchange(&s_dc_runtime_refresh_running, 0);
+    return;
+  }
+  CloseHandle(thread);
+#else
+  unsigned expected = 0u;
+  if (!__atomic_compare_exchange_n(&s_dc_runtime_refresh_running, &expected, 1u, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, dc_runtime_refresh_worker, NULL) != 0) {
+    __atomic_store_n(&s_dc_runtime_refresh_running, 0u, __ATOMIC_RELEASE);
+    return;
+  }
+  (void)pthread_detach(thread);
+#endif
 }
 
 #ifdef _WIN32
@@ -828,7 +940,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
     char vd[256]; vd[0] = '\0';
-    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+    if (dc_prepare_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
       fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
     }
   }
@@ -842,15 +954,36 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
            spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
 
   HANDLE job = CreateJobObject(NULL, NULL);
+  if (!job && spec->cpu_limit_percent) {
+    if (out_detail) {
+      snprintf(out_detail, detail_cap, "collector CPU quota job creation failed: %lu",
+               (unsigned long)GetLastError());
+    }
+    return EDR_DC_ERR_SPAWN;
+  }
   if (job) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
     jeli.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    BOOL limits_ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                             &jeli, sizeof(jeli));
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu = {0};
     cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-    cpu.CpuRate = 1000; /* 10% */
-    SetInformationJobObject(job, JobObjectCpuRateControlInformation, &cpu, sizeof(cpu));
+    uint32_t cpu_percent = spec->cpu_limit_percent ? spec->cpu_limit_percent : 10u;
+    if (cpu_percent > 100u) cpu_percent = 100u;
+    cpu.CpuRate = cpu_percent * 100u;
+    BOOL cpu_ok = SetInformationJobObject(job, JobObjectCpuRateControlInformation,
+                                         &cpu, sizeof(cpu));
+    if (spec->cpu_limit_percent && (!limits_ok || !cpu_ok)) {
+      DWORD error = GetLastError();
+      CloseHandle(job);
+      if (out_detail) {
+        snprintf(out_detail, detail_cap,
+                 "collector CPU quota setup failed percent=%u win32=%lu",
+                 cpu_percent, (unsigned long)error);
+      }
+      return EDR_DC_ERR_SPAWN;
+    }
   }
 
   STARTUPINFO si = {sizeof(si)};
@@ -884,7 +1017,21 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     if (job) CloseHandle(job);
     return EDR_DC_ERR_SPAWN;
   }
-  if (job) AssignProcessToJobObject(job, pi.hProcess);
+  if (job && !AssignProcessToJobObject(job, pi.hProcess) && spec->cpu_limit_percent) {
+    DWORD error = GetLastError();
+    TerminateProcess(pi.hProcess, 1u);
+    (void)WaitForSingleObject(pi.hProcess, 5000u);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (herr != INVALID_HANDLE_VALUE) { CloseHandle(herr); (void)remove(errpath); }
+    CloseHandle(job);
+    if (out_detail) {
+      snprintf(out_detail, detail_cap,
+               "collector CPU quota assignment failed percent=%u win32=%lu",
+               spec->cpu_limit_percent, (unsigned long)error);
+    }
+    return EDR_DC_ERR_SPAWN;
+  }
   SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS);
   ResumeThread(pi.hThread);
   CloseHandle(pi.hThread);
@@ -959,7 +1106,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
     char vd[256]; vd[0] = '\0';
-    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+    if (dc_prepare_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
       fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
     }
   }
@@ -971,15 +1118,36 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
            spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
 
   HANDLE job = CreateJobObject(NULL, NULL);
+  if (!job && spec->cpu_limit_percent) {
+    if (out_detail) {
+      snprintf(out_detail, detail_cap, "collector CPU quota job creation failed: %lu",
+               (unsigned long)GetLastError());
+    }
+    return EDR_DC_ERR_SPAWN;
+  }
   if (job) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
     jeli.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    BOOL limits_ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                             &jeli, sizeof(jeli));
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu = {0};
     cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-    cpu.CpuRate = 1000; /* 10% */
-    SetInformationJobObject(job, JobObjectCpuRateControlInformation, &cpu, sizeof(cpu));
+    uint32_t cpu_percent = spec->cpu_limit_percent ? spec->cpu_limit_percent : 10u;
+    if (cpu_percent > 100u) cpu_percent = 100u;
+    cpu.CpuRate = cpu_percent * 100u;
+    BOOL cpu_ok = SetInformationJobObject(job, JobObjectCpuRateControlInformation,
+                                         &cpu, sizeof(cpu));
+    if (spec->cpu_limit_percent && (!limits_ok || !cpu_ok)) {
+      DWORD error = GetLastError();
+      CloseHandle(job);
+      if (out_detail) {
+        snprintf(out_detail, detail_cap,
+                 "collector CPU quota setup failed percent=%u win32=%lu",
+                 cpu_percent, (unsigned long)error);
+      }
+      return EDR_DC_ERR_SPAWN;
+    }
   }
   STARTUPINFO si = {sizeof(si)};
   si.dwFlags = STARTF_USESHOWWINDOW;
@@ -993,7 +1161,20 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     if (job) CloseHandle(job);
     return EDR_DC_ERR_SPAWN;
   }
-  if (job) AssignProcessToJobObject(job, pi.hProcess);
+  if (job && !AssignProcessToJobObject(job, pi.hProcess) && spec->cpu_limit_percent) {
+    DWORD error = GetLastError();
+    TerminateProcess(pi.hProcess, 1u);
+    (void)WaitForSingleObject(pi.hProcess, 5000u);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(job);
+    if (out_detail) {
+      snprintf(out_detail, detail_cap,
+               "collector CPU quota assignment failed percent=%u win32=%lu",
+               spec->cpu_limit_percent, (unsigned long)error);
+    }
+    return EDR_DC_ERR_SPAWN;
+  }
   SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS);
   ResumeThread(pi.hThread);
   CloseHandle(pi.hThread);
@@ -1140,7 +1321,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
     char vd[256]; vd[0] = '\0';
-    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+    if (dc_prepare_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
       fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
     }
   }
@@ -1254,7 +1435,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
     char vd[256]; vd[0] = '\0';
-    if (dc_ensure_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
+    if (dc_prepare_velociraptor(vd, sizeof(vd)) != EDR_DC_OK) {
       fprintf(stderr, "[forensic] velociraptor ensure: %s\n", vd[0] ? vd : "unavailable");
     }
   }

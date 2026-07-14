@@ -4625,6 +4625,7 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
+  uint64_t total_started_ms = command_monotonic_ms();
   long pid = -1;
   (void)parse_pid_json(pl, len, &pid); /* 可选 */
   /* 大结果走产物下载通道，limit 上限提到 5000（与适配器一致）；默认 1000 以含较全集。 */
@@ -4674,12 +4675,15 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
   spec.output_dir = ".";
   spec.extra_args = extra;
   spec.timeout_s = 60u;
+  spec.cpu_limit_percent = 40u;
   spec.needs_velociraptor = 1; /* velo_query 走 velo 适配器,运行前确保 velo 就绪 */
   spec.cancel_requested = rtr_shell_cancel_check;
   spec.cancel_user = (void *)cmd_id;
   char dc_detail[512];
   dc_detail[0] = '\0';
+  uint64_t collector_started_ms = command_monotonic_ms();
   int rc = edr_deep_collector_run_blocking(&spec, dc_detail, sizeof(dc_detail));
+  uint64_t collector_finished_ms = command_monotonic_ms();
   (void)remove(reqpath);
   if (rc == 5) {
     s_exec_fail++;
@@ -4755,8 +4759,10 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
   }
   char minio_key[1024];
   minio_key[0] = '\0';
+  uint64_t upload_started_ms = command_monotonic_ms();
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "velo_rows", rowspath, sha,
                                                minio_key, sizeof(minio_key));
+  uint64_t upload_finished_ms = command_monotonic_ms();
   char pathj[1200], minioj[1200], artifacts[3200];
   json_escape_to(pathj, sizeof(pathj), rowspath);
   json_escape_to(minioj, sizeof(minioj), minio_key);
@@ -4826,6 +4832,23 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
       cJSON_AddStringToObject(root, "upload_status", upload_rc == 0 ? "ok" : "failed");
       cJSON_DeleteItemFromObjectCaseSensitive(root, "error");
       cJSON_AddStringToObject(root, "error", combined_error);
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "cpu_limit_percent");
+      cJSON_AddNumberToObject(root, "cpu_limit_percent", spec.cpu_limit_percent);
+      cJSON *timings = cJSON_CreateObject();
+      if (timings) {
+        cJSON_AddNumberToObject(timings, "prepare_ms",
+                                (double)(collector_started_ms - total_started_ms));
+        cJSON_AddNumberToObject(timings, "collector_ms",
+                                (double)(collector_finished_ms - collector_started_ms));
+        cJSON_AddNumberToObject(timings, "process_ms",
+                                (double)(upload_started_ms - collector_finished_ms));
+        cJSON_AddNumberToObject(timings, "upload_ms",
+                                (double)(upload_finished_ms - upload_started_ms));
+        cJSON_AddNumberToObject(timings, "total_ms",
+                                (double)(command_monotonic_ms() - total_started_ms));
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "timings_ms");
+        cJSON_AddItemToObject(root, "timings_ms", timings);
+      }
       char *contract_detail = cJSON_PrintUnformatted(root);
       cJSON_Delete(root);
       s_handled++;
@@ -4842,30 +4865,55 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
   (void)remove(rowspath);
   /* 大产物（或内联缓冲分配失败）：空内联 + 下载标记，前端经下载通道取全量。 */
   {
-    char detail[2600];
     int can_dl = (upload_rc == 0 && minio_key[0]) ? 1 : 0;
     const char *large_status = can_dl ? (provider_partial ? "partial_success" : "success") : "failed";
     const char *large_error = can_dl
                                   ? (provider_error[0] ? provider_error
                                                        : (provider_partial ? "collector returned a partial result" : ""))
                                   : "large result upload failed; no retrievable rows";
-    char large_errorj[1200];
-    json_escape_to(large_errorj, sizeof(large_errorj), large_error);
-    char artifact_value[1200];
-    if (manifest_artifact[0]) {
-      json_escape_to(artifact_value, sizeof(artifact_value), manifest_artifact);
+    cJSON *result = cJSON_CreateObject();
+    cJSON *timings = result ? cJSON_CreateObject() : NULL;
+    cJSON *rows = result ? cJSON_CreateArray() : NULL;
+    if (!result || !timings || !rows) {
+      cJSON_Delete(rows);
+      cJSON_Delete(timings);
+      cJSON_Delete(result);
+      rows = NULL;
+      timings = NULL;
+      result = NULL;
     } else {
-      snprintf(artifact_value, sizeof(artifact_value), "%s", pathj);
+      cJSON_AddStringToObject(result, "schema", "edr.forensic.result.v1");
+      cJSON_AddStringToObject(result, "status", large_status);
+      cJSON_AddStringToObject(result, "source", "velociraptor");
+      cJSON_AddStringToObject(result, "artifact",
+                             manifest_artifact[0] ? manifest_artifact : rowspath);
+      cJSON_AddStringToObject(result, "sha256", sha);
+      cJSON_AddStringToObject(result, "object_key", minio_key);
+      cJSON_AddBoolToObject(result, "truncated", 1);
+      cJSON_AddStringToObject(result, "upload_status", upload_rc == 0 ? "ok" : "failed");
+      cJSON_AddStringToObject(result, "error", large_error);
+      cJSON_AddNumberToObject(result, "cpu_limit_percent", spec.cpu_limit_percent);
+      cJSON_AddBoolToObject(result, "download", can_dl);
+      cJSON_AddNumberToObject(result, "total", manifest_total);
+      cJSON_AddItemToObject(result, "rows", rows);
+      rows = NULL;
+      cJSON_AddNumberToObject(timings, "prepare_ms",
+                              (double)(collector_started_ms - total_started_ms));
+      cJSON_AddNumberToObject(timings, "collector_ms",
+                              (double)(collector_finished_ms - collector_started_ms));
+      cJSON_AddNumberToObject(timings, "process_ms",
+                              (double)(upload_started_ms - collector_finished_ms));
+      cJSON_AddNumberToObject(timings, "upload_ms",
+                              (double)(upload_finished_ms - upload_started_ms));
+      cJSON_AddNumberToObject(timings, "total_ms",
+                              (double)(command_monotonic_ms() - total_started_ms));
+      cJSON_AddItemToObject(result, "timings_ms", timings);
+      timings = NULL;
     }
-    snprintf(detail, sizeof(detail),
-             "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"%s\","
-             "\"source\":\"velociraptor\",\"artifact\":%s,\"sha256\":\"%s\","
-             "\"object_key\":%s,\"truncated\":true,\"upload_status\":\"%s\","
-             "\"error\":%s,\"download\":%s,\"total\":%d,\"rows\":[]}",
-             large_status, artifact_value, sha, minioj,
-             upload_rc == 0 ? "ok" : "failed",
-             large_errorj,
-             can_dl ? "true" : "false", manifest_total);
+    char *detail = result ? cJSON_PrintUnformatted(result) : NULL;
+    cJSON_Delete(rows);
+    cJSON_Delete(timings);
+    cJSON_Delete(result);
     s_handled++;
     if (can_dl) {
       s_exec_ok++;
@@ -4874,8 +4922,10 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     }
     audit_both(cmd_id, can_dl ? (provider_partial ? "velo_query: partial (download)" : "velo_query: ok (download)")
                               : "velo_query: large result, upload failed");
-    soar_emit_ex(cmd_id, sm, can_dl ? EdrCmdExecOk : EdrCmdExecFailed, can_dl ? 0 : 9, detail,
+    soar_emit_ex(cmd_id, sm, can_dl ? EdrCmdExecOk : EdrCmdExecFailed, can_dl ? 0 : 9,
+                 detail ? detail : "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"failed\",\"source\":\"velociraptor\",\"error\":\"result serialization failed\"}",
                  can_dl && provider_partial ? "ok_partial" : (upload_rc == 0 ? "ok" : "upload_failed"), artifacts);
+    if (detail) cJSON_free(detail);
   }
 }
 
@@ -6639,8 +6689,9 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
       do_update_server_address(id, payload, payload_len, sm);
       return;
     case EDR_COMMAND_KIND_ATTACK_SURFACE: {
-      char detail[256];
-      int r = edr_attack_surface_execute(id, edr_command_get_config(), detail, sizeof(detail));
+      char detail[384];
+      int r = edr_attack_surface_execute(id, payload, payload_len,
+                                         edr_command_get_config(), detail, sizeof(detail));
       if (r != 0) {
         s_exec_fail++;
         audit_both(id, "GET_ATTACK_SURFACE: failed");

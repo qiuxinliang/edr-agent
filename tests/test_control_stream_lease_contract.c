@@ -84,6 +84,7 @@ int main(void) {
       contains(source, "CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS") &&
       !contains(source, "CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE") &&
       contains(cmake, "resources/FDSensor.rc") &&
+      contains(cmake, "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/resources/FDSensor.manifest") &&
       contains(manifest, "{4f476546-937d-4f00-9c1b-e235127d47f6}") &&
       contains(manifest, "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}") &&
       contains(source, "json_get_string(line, \"protocol\", protocol") &&

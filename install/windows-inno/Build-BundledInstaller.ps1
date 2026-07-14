@@ -86,6 +86,29 @@ Assert-YaraRuntimeDlls -Dir $BinDir
 
 $agentRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
+$forensicRulesDir = Join-Path $agentRoot "rules\forensic"
+$requiredForensicRules = @(
+    "VERSION",
+    "credential_theft.yar",
+    "injection.yar",
+    "lateral_movement.yar",
+    "packers.yar",
+    "privilege_escalation.yar",
+    "suspicious.yar"
+)
+foreach ($rule in $requiredForensicRules) {
+    $rulePath = Join-Path $forensicRulesDir $rule
+    if (-not (Test-Path -LiteralPath $rulePath -PathType Leaf)) {
+        throw "Missing required forensic YARA rule asset: $rulePath"
+    }
+}
+$forensicRuleFiles = @(Get-ChildItem -LiteralPath $forensicRulesDir -File -ErrorAction Stop | Where-Object {
+    $_.Extension -eq ".yar" -or $_.Extension -eq ".yara"
+})
+if ($forensicRuleFiles.Count -lt 1) {
+    throw "Forensic YARA rules directory has no .yar/.yara files: $forensicRulesDir"
+}
+Write-Host "Verified forensic YARA rules: $($forensicRuleFiles.Count) file(s)."
 $archCheck = Join-Path $agentRoot "scripts\Assert-WindowsPeArchitecture.ps1"
 if (-not (Test-Path -LiteralPath $archCheck)) { throw "Missing architecture verifier: $archCheck" }
 & $archCheck -Path $binExe -Architecture $TargetArch

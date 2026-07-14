@@ -4,6 +4,7 @@
 #ifndef EDR_ATTACK_SURFACE_REPORT_H
 #define EDR_ATTACK_SURFACE_REPORT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "edr/config.h"
@@ -23,7 +24,9 @@ uint32_t edr_attack_surface_effective_periodic_interval_s(const EdrConfig *cfg);
  * 执行采集并通过内置 HTTP 传输栈上报。detail 为 SOAR/审计短句（如 "uploaded_http_ok"）。
  * @return 0 成功；非 0 为失败码（可映射 CommandExecutionResult）。
  */
-int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, char *detail, size_t detail_cap);
+int edr_attack_surface_execute(const char *command_id, const uint8_t *payload,
+                               size_t payload_len, const EdrConfig *cfg,
+                               char *detail, size_t detail_cap);
 
 /**
  * 查询管控是否排队了按需刷新（GET .../attack-surface/refresh-request）。
