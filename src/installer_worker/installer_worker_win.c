@@ -206,9 +206,38 @@ static int run_process_wait(const wchar_t *exe_path, const wchar_t *args, const 
   si.cb = sizeof(si);
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
-  BOOL ok = CreateProcessW(exe_path, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, work_dir, &si, &pi);
+
+  SECURITY_ATTRIBUTES sa;
+  ZeroMemory(&sa, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  HANDLE child_log = INVALID_HANDLE_VALUE;
+  HANDLE child_stdin = INVALID_HANDLE_VALUE;
+  if (log_path && log_path[0]) {
+    child_log = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    child_stdin = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (child_log != INVALID_HANDLE_VALUE && child_stdin != INVALID_HANDLE_VALUE) {
+      si.dwFlags |= STARTF_USESTDHANDLES;
+      si.hStdInput = child_stdin;
+      si.hStdOutput = child_log;
+      si.hStdError = child_log;
+    } else {
+      if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
+      if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
+      child_log = INVALID_HANDLE_VALUE;
+      child_stdin = INVALID_HANDLE_VALUE;
+    }
+  }
+
+  BOOL inherit_handles = child_log != INVALID_HANDLE_VALUE;
+  BOOL ok = CreateProcessW(exe_path, cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW, NULL, work_dir, &si, &pi);
   if (!ok) {
-    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_failed gle=%lu exe=%ls", GetLastError(), exe_path);
+    DWORD create_error = GetLastError();
+    if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
+    if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
+    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_failed gle=%lu exe=%ls", create_error, exe_path);
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
     append_log_utf8(log_path, line);
     return 9001;
@@ -221,6 +250,8 @@ static int run_process_wait(const wchar_t *exe_path, const wchar_t *args, const 
   } else {
     GetExitCodeProcess(pi.hProcess, &exit_code);
   }
+  if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
+  if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
   _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_exit code=%lu", exit_code);
   line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
   append_log_utf8(log_path, line);

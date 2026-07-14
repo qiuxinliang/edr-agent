@@ -2020,7 +2020,7 @@ function Get-AgentTomlSanityIssue([string]$TomlText) {
 
 function Redact-AgentTomlLine([string]$Line) {
   if ($null -eq $Line) { return "" }
-  if ($Line -match '(?i)^(\s*(endpoint_id|tenant_id|client_key|client_cert|client_cert_thumbprint|rest_bearer_token|signing_public_key_path|signing_public_key_pem|public_key_pem)\s*=\s*).*$') {
+  if ($Line -match '(?i)^(\s*(endpoint_id|tenant_id|client_key|client_cert|client_cert_thumbprint|rest_bearer_token|secret|signing_public_key_path|signing_public_key_pem|public_key_pem)\s*=\s*).*$') {
     return ($Matches[1] + '"<redacted>"')
   }
   return $Line
@@ -2330,6 +2330,24 @@ if ($dir -and -not (Test-Path $dir)) {
 $outFile = [System.IO.Path]::GetFullPath($Output)
 $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
 [System.IO.File]::WriteAllText($outFile, $toml, $utf8NoBom)
+$generatedTomlIssue = Test-ExistingAgentTomlWithAgent -InstallRoot $InstallDirForToml -ConfigPath $outFile
+if ($generatedTomlIssue) {
+  Write-AgentTomlSanityDiagnostic -TomlText $toml -Issue ("source={0}; {1}" -f $tomlSource, $generatedTomlIssue) -OutputPath $Output -ReportPath $HealthReportPath
+  if ($tomlSource -like "template:*") {
+    Write-Warning ("Agent rejected template-generated agent.toml ({0}); falling back to minimal TOML." -f $generatedTomlIssue)
+    $toml = $tomlMinimal
+    $tomlSource = "minimal-parser-fallback"
+    if (-not $KeepTemplateComments) {
+      $toml = Optimize-GeneratedToml $toml
+    }
+    [System.IO.File]::WriteAllText($outFile, $toml, $utf8NoBom)
+    $generatedTomlIssue = Test-ExistingAgentTomlWithAgent -InstallRoot $InstallDirForToml -ConfigPath $outFile
+  }
+}
+if ($generatedTomlIssue) {
+  Write-AgentTomlSanityDiagnostic -TomlText $toml -Issue ("source={0}; {1}" -f $tomlSource, $generatedTomlIssue) -OutputPath $Output -ReportPath $HealthReportPath
+  Write-Error ("Generated agent.toml failed Agent parser validation ({0}); source={1}" -f $generatedTomlIssue, $tomlSource)
+}
 Repair-AgentTomlAcl -Path $outFile
 Repair-InstallRuntimeAcls -InstallRoot $InstallDirForToml
 Repair-AgentTomlAcl -Path $outFile

@@ -47,7 +47,24 @@ int main(void) {
   ok &= require_contains(installer, "$d.request_signing_secret", "installer must read request-signing secret");
   ok &= require_contains(installer, "[platform.request_signing]", "installer must write request-signing TOML section");
   ok &= require_contains(installer, "Get-ExistingAgentTomlRequestSigningIssue", "upgrade must repair legacy unsigned config");
+  ok &= require_contains(installer, "minimal-parser-fallback", "installer must recover from template parser failures");
+  ok &= require_contains(installer, "Generated agent.toml failed Agent parser validation",
+                         "installer must fail before handoff when minimal TOML is rejected");
+  ok &= require_contains(installer, "rest_bearer_token|secret|signing_public_key_path",
+                         "installer diagnostics must redact request-signing secrets");
   free(installer);
+
+  snprintf(path, sizeof(path), "%s/src/installer_worker/installer_worker_win.c", root);
+  char *installer_worker = read_file(path);
+  if (!installer_worker) {
+    fprintf(stderr, "FAIL: cannot read native installer worker source\n");
+    return 1;
+  }
+  ok &= require_contains(installer_worker, "STARTF_USESTDHANDLES",
+                         "native installer worker must capture child process diagnostics");
+  ok &= require_contains(installer_worker, "si.hStdError = child_log",
+                         "native installer worker must preserve Agent parser stderr");
+  free(installer_worker);
 
   snprintf(path, sizeof(path), "%s/src/response/response_forensic.c", root);
   char *response = read_file(path);
