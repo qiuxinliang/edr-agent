@@ -57,6 +57,11 @@ int main(void) {
     return 1;
   }
 
+  snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
+  char *cmake = read_file(path);
+  snprintf(path, sizeof(path), "%s/resources/FDSensor.manifest", root);
+  char *manifest = read_file(path);
+
   int ok =
       contains(source, "static int64_t control_stream_lease_ms(void)") &&
       contains(source, "static int control_stream_ready_lease_valid(void)") &&
@@ -69,6 +74,18 @@ int main(void) {
       contains(source, "curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &version)") &&
       !contains(source, "#ifdef CURLINFO_HTTP_VERSION") &&
       !contains(source, "#ifdef CURL_HTTP_VERSION_2_0") &&
+      contains(source, "(!job->stream_ctx || !job->stream_ctx->failed) && job->h2") &&
+      contains(source, "code >= 200 && code < 300 && h2") &&
+      contains(source, "code < 300 && !ctx.failed && h2") &&
+      !contains(source, "(h2 || !control_http2_required())") &&
+      contains(source, "static size_t curl_stream_header_cb") &&
+      contains(source, "ctx.require_h2 = 1") &&
+      contains(source, "CURLOPT_HEADERFUNCTION, curl_stream_header_cb") &&
+      contains(source, "CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS") &&
+      !contains(source, "CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE") &&
+      contains(cmake, "resources/FDSensor.rc") &&
+      contains(manifest, "{4f476546-937d-4f00-9c1b-e235127d47f6}") &&
+      contains(manifest, "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}") &&
       contains(source, "json_get_string(line, \"protocol\", protocol") &&
       contains(source, "note_negotiated_protocol_name(protocol, 1)") &&
       contains(source, "server_drain") &&
@@ -78,6 +95,8 @@ int main(void) {
       contains(source, "edr_ingest_http_cancel_inflight();") &&
       count_occurrences(source, "note_control_stream_activity();") >= 3u;
   free(source);
+  free(cmake);
+  free(manifest);
   if (!ok) {
     fprintf(stderr, "control stream lease/fallback contract missing\n");
     return 1;

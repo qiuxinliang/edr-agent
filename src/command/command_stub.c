@@ -4385,6 +4385,7 @@ typedef struct EdrVeloValidatedOutput {
   char *raw;
   cJSON *root;
   int partial;
+  int rows_manifest;
   char provider_status[32];
   char provider_error[512];
 } EdrVeloValidatedOutput;
@@ -4428,11 +4429,23 @@ static int velo_load_validated_output(const char *path, unsigned long long file_
     velo_validated_output_free(out);
     return 0;
   }
-  cJSON *rows = cJSON_GetObjectItemCaseSensitive(out->root, "rows");
-  if (!cJSON_IsArray(rows)) {
-    if (error && error_cap) snprintf(error, error_cap, "query output is missing the required rows array");
-    velo_validated_output_free(out);
-    return 0;
+  cJSON *schema = cJSON_GetObjectItemCaseSensitive(out->root, "schema");
+  if (cJSON_IsString(schema) && schema->valuestring &&
+      strcmp(schema->valuestring, "edr.velo_rows.manifest.v1") == 0) {
+    cJSON *chunks = cJSON_GetObjectItemCaseSensitive(out->root, "chunks");
+    if (!cJSON_IsArray(chunks)) {
+      if (error && error_cap) snprintf(error, error_cap, "velo rows manifest is missing the required chunks array");
+      velo_validated_output_free(out);
+      return 0;
+    }
+    out->rows_manifest = 1;
+  } else {
+    cJSON *rows = cJSON_GetObjectItemCaseSensitive(out->root, "rows");
+    if (!cJSON_IsArray(rows)) {
+      if (error && error_cap) snprintf(error, error_cap, "query output is missing the required rows array");
+      velo_validated_output_free(out);
+      return 0;
+    }
   }
   cJSON *provider_error = cJSON_GetObjectItemCaseSensitive(out->root, "error");
   if (provider_error && !cJSON_IsNull(provider_error) && !cJSON_IsString(provider_error)) {
@@ -4481,6 +4494,125 @@ static int velo_load_validated_output(const char *path, unsigned long long file_
     return 0;
   }
   return 1;
+}
+
+static void path_dirname_to(const char *path, char *out, size_t cap) {
+  if (!out || cap == 0u) return;
+  snprintf(out, cap, "%s", ".");
+  if (!path || !path[0]) return;
+  size_t n = strlen(path);
+  if (n >= cap) n = cap - 1u;
+  memcpy(out, path, n);
+  out[n] = '\0';
+  char *last = NULL;
+  for (char *p = out; *p; p++) {
+    if (*p == '/' || *p == '\\') last = p;
+  }
+  if (!last) {
+    snprintf(out, cap, "%s", ".");
+  } else if (last == out) {
+    last[1] = '\0';
+  } else {
+    *last = '\0';
+  }
+}
+
+static int relative_chunk_path_safe(const char *rel) {
+  if (!rel || !rel[0]) return 0;
+  if (rel[0] == '/' || rel[0] == '\\' || strchr(rel, ':')) return 0;
+  const char *p = rel;
+  while (*p) {
+    while (*p == '/' || *p == '\\') p++;
+    const char *start = p;
+    while (*p && *p != '/' && *p != '\\') p++;
+    size_t len = (size_t)(p - start);
+    if (len == 2u && start[0] == '.' && start[1] == '.') return 0;
+  }
+  return 1;
+}
+
+static int join_relative_path(const char *dir, const char *rel, char *out, size_t cap) {
+  if (!out || cap == 0u || !relative_chunk_path_safe(rel)) return -1;
+  int n = snprintf(out, cap, "%s/%s", (dir && dir[0]) ? dir : ".", rel);
+  return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+static int velo_write_manifest_file(const char *path, cJSON *root, char *error, size_t error_cap) {
+  char *body = cJSON_PrintUnformatted(root);
+  if (!body) {
+    if (error && error_cap) snprintf(error, error_cap, "manifest serialization failed");
+    return -1;
+  }
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    if (error && error_cap) snprintf(error, error_cap, "manifest rewrite failed");
+    cJSON_free(body);
+    return -1;
+  }
+  size_t len = strlen(body);
+  size_t n = fwrite(body, 1, len, f);
+  int close_rc = fclose(f);
+  cJSON_free(body);
+  if (n != len || close_rc != 0) {
+    if (error && error_cap) snprintf(error, error_cap, "manifest rewrite incomplete");
+    return -1;
+  }
+  return 0;
+}
+
+static int velo_upload_manifest_chunks(const char *cmd_id, const char *manifest_path, cJSON *root,
+                                       char *error, size_t error_cap) {
+  cJSON *chunks = cJSON_GetObjectItemCaseSensitive(root, "chunks");
+  if (!cJSON_IsArray(chunks)) {
+    if (error && error_cap) snprintf(error, error_cap, "manifest chunks missing");
+    return -1;
+  }
+  char dir[900];
+  path_dirname_to(manifest_path, dir, sizeof(dir));
+  cJSON *chunk = NULL;
+  cJSON_ArrayForEach(chunk, chunks) {
+    if (!cJSON_IsObject(chunk)) continue;
+    cJSON *storage = cJSON_GetObjectItemCaseSensitive(chunk, "storage_key");
+    cJSON *object_key = cJSON_GetObjectItemCaseSensitive(chunk, "object_key");
+    cJSON *minio_key = cJSON_GetObjectItemCaseSensitive(chunk, "minio_key");
+    if ((cJSON_IsString(storage) && storage->valuestring && storage->valuestring[0]) ||
+        (cJSON_IsString(object_key) && object_key->valuestring && object_key->valuestring[0]) ||
+        (cJSON_IsString(minio_key) && minio_key->valuestring && minio_key->valuestring[0])) {
+      continue;
+    }
+    cJSON *path = cJSON_GetObjectItemCaseSensitive(chunk, "path");
+    if (!cJSON_IsString(path) || !path->valuestring || !path->valuestring[0]) {
+      if (error && error_cap) snprintf(error, error_cap, "manifest chunk path missing");
+      return -1;
+    }
+    char chunk_path[1200];
+    if (join_relative_path(dir, path->valuestring, chunk_path, sizeof(chunk_path)) != 0 || !file_exists_c(chunk_path)) {
+      if (error && error_cap) snprintf(error, error_cap, "manifest chunk not found: %.200s", path->valuestring);
+      return -1;
+    }
+    char sha[65];
+    sha[0] = '\0';
+    if (file_sha256_hex(chunk_path, sha) != 0 || !sha[0]) {
+      if (error && error_cap) snprintf(error, error_cap, "manifest chunk hash failed: %.200s", path->valuestring);
+      return -1;
+    }
+    char key[1024];
+    key[0] = '\0';
+    if (edr_transport_v2_upload_file(cmd_id ? cmd_id : "velo_rows", chunk_path, sha, key, sizeof(key)) != 0 || !key[0]) {
+      if (error && error_cap) snprintf(error, error_cap, "manifest chunk upload failed: %.200s", path->valuestring);
+      return -1;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(chunk, "sha256");
+    cJSON_AddStringToObject(chunk, "sha256", sha);
+    cJSON_DeleteItemFromObjectCaseSensitive(chunk, "storage_key");
+    cJSON_AddStringToObject(chunk, "storage_key", key);
+    cJSON_DeleteItemFromObjectCaseSensitive(chunk, "object_key");
+    cJSON_AddStringToObject(chunk, "object_key", key);
+    cJSON_DeleteItemFromObjectCaseSensitive(chunk, "minio_key");
+    cJSON_AddStringToObject(chunk, "minio_key", key);
+    (void)remove(chunk_path);
+  }
+  return velo_write_manifest_file(manifest_path, root, error, error_cap);
 }
 
 /* 主机显微镜·Velociraptor 富数据（V1：进程）。调外部采集器 query 模式跑 VQL → JSONL 行 →
@@ -4587,13 +4719,40 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     return;
   }
   int provider_partial = validated.partial;
+  int rows_manifest = validated.rows_manifest;
   char provider_status[sizeof(validated.provider_status)];
   char provider_error[sizeof(validated.provider_error)];
   snprintf(provider_status, sizeof(provider_status), "%s", validated.provider_status);
   snprintf(provider_error, sizeof(provider_error), "%s", validated.provider_error);
+  if (rows_manifest) {
+    if (velo_upload_manifest_chunks(cmd_id, rowspath, validated.root, validation_error, sizeof(validation_error)) != 0) {
+      velo_validated_output_free(&validated);
+      (void)remove(rowspath);
+      s_exec_fail++;
+      char fail[760];
+      snprintf(fail, sizeof(fail), "velo_query: upload manifest chunks failed: %.640s",
+               validation_error[0] ? validation_error : "unknown error");
+      audit_both(cmd_id, fail);
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 8, fail);
+      return;
+    }
+    free(validated.raw);
+    validated.raw = NULL;
+  }
   char sha[65];
   sha[0] = '\0';
   (void)file_sha256_hex(rowspath, sha);
+  int manifest_total = -1;
+  char manifest_artifact[256];
+  manifest_artifact[0] = '\0';
+  if (rows_manifest && validated.root) {
+    cJSON *total_item = cJSON_GetObjectItemCaseSensitive(validated.root, "total");
+    if (cJSON_IsNumber(total_item)) manifest_total = total_item->valueint;
+    cJSON *artifact_item = cJSON_GetObjectItemCaseSensitive(validated.root, "artifact");
+    if (cJSON_IsString(artifact_item) && artifact_item->valuestring) {
+      snprintf(manifest_artifact, sizeof(manifest_artifact), "%s", artifact_item->valuestring);
+    }
+  }
   char minio_key[1024];
   minio_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "velo_rows", rowspath, sha,
@@ -4605,9 +4764,14 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
            "[{\"type\":\"velo_rows\",\"path\":%s,\"sha256\":\"%s\","
            "\"upload_status\":\"%s\",\"minio_key\":%s}]",
            pathj, sha, upload_rc == 0 ? "ok" : "failed", minioj);
-  /* 内联上限：env EDR_VELO_INLINE_CAP 可调，默认 256KiB。
-   * 进程表常因长命令行超过旧 20KB 阈值；能内联时不让对象存储临时故障影响表格回显。 */
-  unsigned long long inline_cap = 256ull * 1024ull;
+  /* raw_detail is JSON-escaped again inside the command-result envelope. Keep
+   * inline rows below the durable command-state cap; larger results use the
+   * already-uploaded velo_rows artifact instead of becoming invalid JSON. */
+  const unsigned long long state_safe_inline_cap =
+      EDR_COMMAND_STATE_DETAIL_CAP > 8192u
+          ? (unsigned long long)(EDR_COMMAND_STATE_DETAIL_CAP - 8192u) / 2ull
+          : 1024ull;
+  unsigned long long inline_cap = state_safe_inline_cap;
   {
     const char *cs = getenv("EDR_VELO_INLINE_CAP");
     if (cs && cs[0]) {
@@ -4616,11 +4780,11 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
         inline_cap = (unsigned long long)v;
       }
     }
-    if (inline_cap > 1024ull * 1024ull) {
-      inline_cap = 1024ull * 1024ull;
+    if (inline_cap > state_safe_inline_cap) {
+      inline_cap = state_safe_inline_cap;
     }
   }
-  if (fsz <= inline_cap) {
+  if (!rows_manifest && fsz <= inline_cap) {
     /* 小产物：已验证的文件内容直接内联回流。 */
     char *detail = validated.raw;
     cJSON *root = validated.root;
@@ -4687,15 +4851,21 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
                                   : "large result upload failed; no retrievable rows";
     char large_errorj[1200];
     json_escape_to(large_errorj, sizeof(large_errorj), large_error);
+    char artifact_value[1200];
+    if (manifest_artifact[0]) {
+      json_escape_to(artifact_value, sizeof(artifact_value), manifest_artifact);
+    } else {
+      snprintf(artifact_value, sizeof(artifact_value), "%s", pathj);
+    }
     snprintf(detail, sizeof(detail),
              "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"%s\","
              "\"source\":\"velociraptor\",\"artifact\":%s,\"sha256\":\"%s\","
              "\"object_key\":%s,\"truncated\":true,\"upload_status\":\"%s\","
-             "\"error\":%s,\"download\":%s,\"total\":-1,\"rows\":[]}",
-             large_status, pathj, sha, minioj,
+             "\"error\":%s,\"download\":%s,\"total\":%d,\"rows\":[]}",
+             large_status, artifact_value, sha, minioj,
              upload_rc == 0 ? "ok" : "failed",
              large_errorj,
-             can_dl ? "true" : "false");
+             can_dl ? "true" : "false", manifest_total);
     s_handled++;
     if (can_dl) {
       s_exec_ok++;
@@ -5892,6 +6062,9 @@ static void command_delivery_run_once(void) {
   int64_t now = command_now_ms();
   int pressure = edr_resource_preprocess_throttle_active() ? 1 : 0;
   uint32_t poll_ms = command_u32_env_clamped("EDR_COMMAND_DELIVERY_POLL_MS", 5000u, 1000u, 600000u);
+  if (edr_shell_session_active_count() > 0u && poll_ms > 200u) {
+    poll_ms = 200u;
+  }
   if (last_poll_ms > 0 && now - last_poll_ms < (int64_t)poll_ms) {
     return;
   }

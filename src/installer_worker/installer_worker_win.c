@@ -264,7 +264,34 @@ static void delete_file_if_exists(const wchar_t *path, const wchar_t *log_path) 
   if (!path || !path[0]) return;
   DWORD attr = GetFileAttributesW(path);
   if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
-  if (!DeleteFileW(path)) {
+  if (DeleteFileW(path)) return;
+
+  DWORD first_error = GetLastError();
+  if (first_error == ERROR_ACCESS_DENIED) {
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileW(path)) {
+      append_log_utf8(log_path, L"delete_recovered_after_attribute_reset");
+      return;
+    }
+
+    wchar_t takeown[MAX_PATH * 2], icacls[MAX_PATH * 2], qpath[MAX_PATH * 4], args[MAX_PATH * 6];
+    system_exe_path(takeown, sizeof(takeown) / sizeof(takeown[0]), L"takeown.exe");
+    system_exe_path(icacls, sizeof(icacls) / sizeof(icacls[0]), L"icacls.exe");
+    quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), path);
+    _snwprintf(args, sizeof(args) / sizeof(args[0]), L"/F %ls /A", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    (void)run_process_wait(takeown, args, NULL, log_path, 30000);
+    _snwprintf(args, sizeof(args) / sizeof(args[0]),
+               L"%ls /inheritance:r /grant:r \"*S-1-5-18:F\" /grant:r \"*S-1-5-32-544:F\" /C /Q", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    (void)run_process_wait(icacls, args, NULL, log_path, 30000);
+    if (DeleteFileW(path)) {
+      append_log_utf8(log_path, L"delete_recovered_after_acl_reset");
+      return;
+    }
+  }
+
+  {
     wchar_t line[2048];
     _snwprintf(line, sizeof(line) / sizeof(line[0]), L"delete_failed path=%ls gle=%lu", path, GetLastError());
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;

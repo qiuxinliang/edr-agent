@@ -1,11 +1,11 @@
 #Requires -Version 5.1
 <#
-  安装 / 卸载 FDSecurity 的「开机常驻」与可选安装目录 ACL 加固。
-  - Install：注册计划任务（SYSTEM、开机触发、无执行时限）；默认立即启动一次，传 -NoStart 时只注册不启动。
-  - Remove：停止任务、结束 FDSensor 进程、按名停止可能残留的 ETW 实时会话、重置 ACL、注销任务（供 Inno UninstallRun 调用）。
+  Installs or removes the FDSecurity startup task and optional install-directory ACL hardening.
+  - Install: registers an unlimited SYSTEM startup task and starts it unless -NoStart is set.
+  - Remove: stops the task and Agent, cleans residual ETW sessions, resets ACLs, and unregisters the task.
 
-  说明：FDSensor 为控制台程序，未实现 SCM ServiceMain；以「计划任务 + SYSTEM」实现重启后仍在。
-  管理员仍可强制删除文件；加固仅提高普通用户随意改删的成本。正式卸载应使用「程序和功能」中的卸载项（unins000.exe）。
+  FDSensor is a console process, so persistence uses a SYSTEM scheduled task instead of SCM ServiceMain.
+  ACL hardening limits ordinary users; administrators must use unins000.exe for normal removal.
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -24,6 +24,22 @@ function Stop-AgentProcess {
   Stop-Process -Name "FDSensor" -Force -ErrorAction SilentlyContinue
   Stop-Process -Name "edr_agent" -Force -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 400
+}
+
+function Remove-StaleQueueLock {
+  param([string]$Dir)
+  $path = Join-Path $Dir "queue\edr_queue.db.lock"
+  if (-not (Test-Path -LiteralPath $path)) { return }
+  try {
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    return
+  } catch {}
+
+  try { & takeown.exe /F $path /A 2>$null | Out-Null } catch {}
+  try {
+    & icacls.exe $path /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+  } catch {}
+  Remove-Item -LiteralPath $path -Force -ErrorAction Stop
 }
 
 function Remove-ScheduledTaskIfPresent {
@@ -305,6 +321,7 @@ if (-not (Test-Path -LiteralPath $cfg)) {
 
 Remove-ScheduledTaskIfPresent
 Stop-AgentProcess
+Remove-StaleQueueLock -Dir $instDir
 
 if ($HardenAcl) {
   Set-InstallDirAclHarden -Dir $instDir
@@ -314,9 +331,8 @@ Repair-RuntimeDependencyAcls -Dir $instDir
 Repair-SensitiveRuntimeAcls -Dir $instDir
 Set-AgentTomlAcl -Path $cfg
 
-# --- 取证采集器启用(非 bundled / autorun 安装链) ---
-# 与 windows_service_install.ps1 对齐:启用外置采集 + 本地 bin 路径 + 按需下载。
-# manifest 地址从 agent.toml 的 rest_base_url 推导,分别刷新 adapter 与 Velociraptor。
+# Keep autorun forensic collector settings aligned with the Windows service installer.
+# Derive adapter and Velociraptor manifest URLs from rest_base_url.
 try {
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR", "1", "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BIN", (Join-Path $instDir "collector\forensic_collector.exe"), "Machine")
@@ -331,7 +347,7 @@ try {
     [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", "$restBase/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=$arch", "Machine")
   }
 } catch {
-  Write-Warning "设置取证采集器环境变量失败(非致命): $_"
+  Write-Warning "Failed to configure forensic collector environment variables (non-fatal): $_"
 }
 Repair-ExecutableAcl -Path $exe
 

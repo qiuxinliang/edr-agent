@@ -3668,6 +3668,8 @@ typedef struct {
   char line[262144];
   size_t line_len;
   int failed;
+  int require_h2;
+  int protocol_checked;
 } EdrCurlStreamCtx;
 
 typedef struct EdrCurlMultiJob {
@@ -3829,8 +3831,10 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
     (void)curl_easy_getinfo(job->easy, CURLINFO_EFFECTIVE_URL, &effective_url);
     required = http2_required_for_url(effective_url);
   }
+  /* This worker is the HTTP/2 attempt. A successful HTTP/1.1 response must
+   * return to the caller as a downgrade so fallback and health stay honest. */
   ok = result == CURLE_OK && job->response_code >= 200 && job->response_code < 300 &&
-       (!job->stream_ctx || !job->stream_ctx->failed) && (job->h2 || !required);
+       (!job->stream_ctx || !job->stream_ctx->failed) && job->h2;
   job->status = ok ? 0 : -1;
   runtime_state_lock();
   if (ok) {
@@ -4030,6 +4034,37 @@ static size_t curl_stream_write_cb(char *ptr, size_t size, size_t nmemb, void *u
   return n;
 }
 
+static int curl_header_contains(const char *buf, size_t len, const char *needle, size_t needle_len) {
+  if (!buf || !needle || needle_len == 0u || len < needle_len) {
+    return 0;
+  }
+  for (size_t i = 0u; i + needle_len <= len; i++) {
+    if (memcmp(buf + i, needle, needle_len) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static size_t curl_stream_header_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+  size_t n = size * nmemb;
+  EdrCurlStreamCtx *ctx = (EdrCurlStreamCtx *)userdata;
+  if (!ctx || !ptr || n == 0u || !ctx->require_h2 || ctx->protocol_checked) {
+    return n;
+  }
+  if (n >= 5u && memcmp(ptr, "HTTP/", 5u) == 0) {
+    if (curl_header_contains(ptr, n, "Connection established", 22u)) {
+      return n;
+    }
+    ctx->protocol_checked = 1;
+    if (n < 6u || ptr[5] != '2') {
+      ctx->failed = 1;
+      return 0u;
+    }
+  }
+  return n;
+}
+
 static struct curl_slist *curl_append_signature_headers(struct curl_slist *headers,
                                                         const char *method, const char *url,
                                                         const char *body, size_t body_len) {
@@ -4100,8 +4135,11 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, http_version);
   } else {
     if (http2_required_for_url(url)) {
-#if LIBCURL_VERSION_NUM >= 0x073100
-      curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
+#if LIBCURL_VERSION_NUM >= 0x072f00
+      /* HTTPS must negotiate h2 with ALPN. PRIOR_KNOWLEDGE can make a TLS
+       * peer's HTTP/1.1 response look like a broken h2 SETTINGS frame. The
+       * h2-only callers verify CURLINFO_HTTP_VERSION and reject downgrades. */
+      curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
 #else
       curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2_0);
 #endif
@@ -4327,8 +4365,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
-  if (cc == CURLE_OK && code >= 200 && code < 300 &&
-      (h2 || !http2_required_for_url(url))) {
+  if (cc == CURLE_OK && code >= 200 && code < 300 && h2) {
     runtime_state_lock();
     s_http2_request_ok++;
     runtime_state_unlock();
@@ -4439,6 +4476,7 @@ static int curl_h2_stream_loop(const char *url) {
     return -1;
   }
   memset(&ctx, 0, sizeof(ctx));
+  ctx.require_h2 = 1;
   curl = curl_easy_init();
   if (!curl) {
     return -2;
@@ -4452,6 +4490,8 @@ static int curl_h2_stream_loop(const char *url) {
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_stream_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+  curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_stream_header_cb);
+  curl_easy_setopt(curl, CURLOPT_HEADERDATA, &ctx);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, (long)env_ul_clamped("EDR_HTTP2_STREAM_LOW_SPEED_S", 120ul, 30ul, 3600ul));
   {
@@ -4467,8 +4507,7 @@ static int curl_h2_stream_loop(const char *url) {
   (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
-  if (cc == CURLE_OK && code >= 200 && code < 300 && !ctx.failed &&
-      (h2 || !control_http2_required())) {
+  if (cc == CURLE_OK && code >= 200 && code < 300 && !ctx.failed && h2) {
     runtime_state_lock();
     s_http2_request_ok++;
     runtime_state_unlock();
