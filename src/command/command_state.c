@@ -26,6 +26,7 @@
 #include <sddl.h>
 #else
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -38,6 +39,16 @@ typedef struct EdrCommandStateFileInfo {
 
 static EdrCommandStateQuarantineStats s_quarantine_stats;
 static unsigned long s_quarantine_serial;
+
+#ifdef _WIN32
+static SRWLOCK s_quarantine_lock = SRWLOCK_INIT;
+static void quarantine_lock(void) { AcquireSRWLockExclusive(&s_quarantine_lock); }
+static void quarantine_unlock(void) { ReleaseSRWLockExclusive(&s_quarantine_lock); }
+#else
+static pthread_mutex_t s_quarantine_lock = PTHREAD_MUTEX_INITIALIZER;
+static void quarantine_lock(void) { pthread_mutex_lock(&s_quarantine_lock); }
+static void quarantine_unlock(void) { pthread_mutex_unlock(&s_quarantine_lock); }
+#endif
 
 static EdrCommandStateFileInfo s_collect_cache_info;
 static int s_collect_cache_pending_zero;
@@ -1024,6 +1035,7 @@ static void state_quarantine_audit(const char *kind, const char *path, const cha
 }
 
 static void state_quarantine_note(const char *kind, const char *reason, int moved) {
+  quarantine_lock();
   s_quarantine_stats.last_quarantine_unix_ms = state_now_ms();
   snprintf(s_quarantine_stats.last_record_kind, sizeof(s_quarantine_stats.last_record_kind), "%s",
            kind ? kind : "unknown");
@@ -1036,6 +1048,7 @@ static void state_quarantine_note(const char *kind, const char *reason, int move
   } else {
     s_quarantine_stats.inbox_record_count++;
   }
+  quarantine_unlock();
 }
 
 static int state_move_to_quarantine(const char *dir, const char *path, const char *kind,
@@ -1065,7 +1078,9 @@ static int state_move_to_quarantine(const char *dir, const char *path, const cha
     state_quarantine_audit(kind, path, reason, 0);
     return -1;
   }
+  quarantine_lock();
   unsigned long serial = ++s_quarantine_serial;
+  quarantine_unlock();
 #ifdef _WIN32
   snprintf(dst, sizeof(dst), "%s\\%s.bad.%lld.%lu.json", qdir, safe,
            (long long)state_now_ms(), serial);
@@ -1082,7 +1097,9 @@ static int state_move_to_quarantine(const char *dir, const char *path, const cha
 
 void edr_command_state_get_quarantine_stats(EdrCommandStateQuarantineStats *out_stats) {
   if (out_stats) {
+    quarantine_lock();
     *out_stats = s_quarantine_stats;
+    quarantine_unlock();
   }
 }
 
@@ -1427,6 +1444,58 @@ static int command_inbox_name_is_record(const char *name) {
   return n > 5u && strcmp(name + n - 5u, ".json") == 0;
 }
 
+static int64_t command_inbox_deadline_at_ms(const EdrCommandInboxRecord *record) {
+  if (!record || record->meta.deadline_ms == 0u) {
+    return INT64_MAX;
+  }
+  int64_t base = record->meta.issued_at_unix_ms > 0
+                     ? record->meta.issued_at_unix_ms
+                     : record->received_unix_ms;
+  if (base <= 0 || base > INT64_MAX - (int64_t)record->meta.deadline_ms) {
+    return INT64_MAX;
+  }
+  return base + (int64_t)record->meta.deadline_ms;
+}
+
+static int command_inbox_priority_compare(const void *left, const void *right) {
+  const EdrCommandInboxRecord *a = (const EdrCommandInboxRecord *)left;
+  const EdrCommandInboxRecord *b = (const EdrCommandInboxRecord *)right;
+  int64_t a_deadline = command_inbox_deadline_at_ms(a);
+  int64_t b_deadline = command_inbox_deadline_at_ms(b);
+  if (a_deadline != b_deadline) {
+    return a_deadline < b_deadline ? -1 : 1;
+  }
+  if (a->received_unix_ms != b->received_unix_ms) {
+    return a->received_unix_ms < b->received_unix_ms ? -1 : 1;
+  }
+  if (a->meta.issued_at_unix_ms != b->meta.issued_at_unix_ms) {
+    return a->meta.issued_at_unix_ms < b->meta.issued_at_unix_ms ? -1 : 1;
+  }
+  return strcmp(a->command_id, b->command_id);
+}
+
+static void command_inbox_keep_priority(EdrCommandInboxRecord *out, size_t *count,
+                                        size_t cap, EdrCommandInboxRecord *candidate) {
+  if (*count < cap) {
+    out[(*count)++] = *candidate;
+    memset(candidate, 0, sizeof(*candidate));
+    return;
+  }
+  size_t worst = 0u;
+  for (size_t i = 1u; i < *count; i++) {
+    if (command_inbox_priority_compare(&out[i], &out[worst]) > 0) {
+      worst = i;
+    }
+  }
+  if (command_inbox_priority_compare(candidate, &out[worst]) < 0) {
+    edr_command_state_free_inbox_record(&out[worst]);
+    out[worst] = *candidate;
+    memset(candidate, 0, sizeof(*candidate));
+    return;
+  }
+  edr_command_state_free_inbox_record(candidate);
+}
+
 size_t edr_command_state_count_inbox(void) {
   char dir[1024];
   command_inbox_default_dir(dir, sizeof(dir));
@@ -1533,10 +1602,9 @@ int edr_command_state_collect_inbox_filtered(EdrCommandInboxRecord *out, size_t 
       edr_command_state_free_inbox_record(&rec);
       continue;
     }
-    out[count++] = rec;
-    if (count >= cap) {
-      break;
-    }
+    /* Directory enumeration order is not a scheduler. Keep the most urgent
+     * records across the whole inbox, even when pending depth exceeds cap. */
+    command_inbox_keep_priority(out, &count, cap, &rec);
 #ifdef _WIN32
   } while (FindNextFileA(h, &fd));
   FindClose(h);
@@ -1544,6 +1612,9 @@ int edr_command_state_collect_inbox_filtered(EdrCommandInboxRecord *out, size_t 
   }
   closedir(d);
 #endif
+  if (count > 1u) {
+    qsort(out, count, sizeof(out[0]), command_inbox_priority_compare);
+  }
   return (int)count;
 }
 
@@ -2099,9 +2170,9 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
   return 0;
 }
 
-void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
+int edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
   if (!record || !record->command_id[0]) {
-    return;
+    return -1;
   }
   char cid[300], ctype[180], idem[1100], st[96], det[4200], art[2200], scid[300], run[300], step[300], boot[100], report_error[300], line[13000];
   json_escape_to(cid, sizeof(cid), record->command_id);
@@ -2140,21 +2211,24 @@ void edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
            (long long)record->report_last_failure_unix_ms,
            record->report_last_error[0] ? report_error : "\"\"",
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
-  append_state_line_locked(line);
+  if (append_state_line_locked(line) != 0) {
+    return -1;
+  }
   s_collect_cache_pending_zero = 0;
   edr_command_state_compact_if_needed();
+  return 0;
 }
 
-void edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
-                                            const char *error) {
+int edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
+                                           const char *error) {
   if (!record || !record->command_id[0]) {
-    return;
+    return -1;
   }
   EdrCommandStateRecord rejected = *record;
   snprintf(rejected.report_last_error, sizeof(rejected.report_last_error), "%s",
            error && error[0] ? error : "command result rejected by platform");
   rejected.report_last_failure_unix_ms = state_now_ms();
-  edr_command_state_mark_reported(&rejected);
+  return edr_command_state_mark_reported(&rejected);
 }
 
 void edr_command_state_compact_if_needed(void) {

@@ -80,6 +80,10 @@ typedef struct {
   unsigned long ws_pong_count;
   unsigned long command_result_ok_count;
   unsigned long command_result_fail_count;
+  int64_t command_result_last_success_unix_ms;
+  int64_t command_result_last_failure_unix_ms;
+  int command_result_last_error_retryable;
+  char command_result_last_error[160];
   unsigned long upload_ok_count;
   unsigned long upload_fail_count;
   unsigned long long_poll_ok_count;
@@ -258,6 +262,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
 
 /** HTTPS h2 control stream 优先；stream 不可用时由 long-poll 接管命令面。 */
 void edr_ingest_http_start_command_poll(void);
+void edr_ingest_http_cancel_inflight(void);
 void edr_ingest_http_stop_command_poll(void);
+int edr_ingest_http_stop_command_poll_timeout(uint32_t timeout_ms);
 
 #endif

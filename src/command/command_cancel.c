@@ -23,6 +23,7 @@ typedef struct EdrActiveCommand {
 } EdrActiveCommand;
 
 static EdrActiveCommand s_active[EDR_COMMAND_ACTIVE_MAX];
+static int s_cancel_all_requested;
 
 static int active_index(const char *command_id) {
   if (!command_id || !command_id[0]) {
@@ -48,7 +49,7 @@ int edr_command_cancel_begin(const char *command_id) {
   for (int i = 0; i < EDR_COMMAND_ACTIVE_MAX; i++) {
     if (!s_active[i].command_id[0]) {
       snprintf(s_active[i].command_id, sizeof(s_active[i].command_id), "%s", command_id);
-      s_active[i].cancel_requested = 0;
+      s_active[i].cancel_requested = s_cancel_all_requested;
       cancel_unlock();
       return 1;
     }
@@ -74,6 +75,26 @@ int edr_command_cancel_request(const char *command_id) {
   }
   cancel_unlock();
   return index >= 0;
+}
+
+int edr_command_cancel_request_all(void) {
+  int requested = 0;
+  cancel_lock();
+  s_cancel_all_requested = 1;
+  for (int i = 0; i < EDR_COMMAND_ACTIVE_MAX; i++) {
+    if (s_active[i].command_id[0]) {
+      s_active[i].cancel_requested = 1;
+      requested++;
+    }
+  }
+  cancel_unlock();
+  return requested;
+}
+
+void edr_command_cancel_reset_all(void) {
+  cancel_lock();
+  s_cancel_all_requested = 0;
+  cancel_unlock();
 }
 
 int edr_command_cancel_requested(const char *command_id) {

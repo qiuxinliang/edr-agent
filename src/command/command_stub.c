@@ -135,6 +135,31 @@ static void pmfe_completion_lock(void) { pthread_mutex_lock(&s_pmfe_completion_l
 static void pmfe_completion_unlock(void) { pthread_mutex_unlock(&s_pmfe_completion_lock); }
 #endif
 
+#ifdef _WIN32
+static CRITICAL_SECTION s_delivery_health_lock;
+static volatile LONG s_delivery_health_lock_ready;
+static void delivery_health_lock_init(void) {
+  LONG state = InterlockedCompareExchange(&s_delivery_health_lock_ready, 1, 0);
+  if (state == 0) {
+    InitializeCriticalSection(&s_delivery_health_lock);
+    InterlockedExchange(&s_delivery_health_lock_ready, 2);
+  } else {
+    while (InterlockedCompareExchange(&s_delivery_health_lock_ready, 0, 0) == 1) {
+      Sleep(0);
+    }
+  }
+}
+static void delivery_health_lock(void) {
+  delivery_health_lock_init();
+  EnterCriticalSection(&s_delivery_health_lock);
+}
+static void delivery_health_unlock(void) { LeaveCriticalSection(&s_delivery_health_lock); }
+#else
+static pthread_mutex_t s_delivery_health_lock = PTHREAD_MUTEX_INITIALIZER;
+static void delivery_health_lock(void) { pthread_mutex_lock(&s_delivery_health_lock); }
+static void delivery_health_unlock(void) { pthread_mutex_unlock(&s_delivery_health_lock); }
+#endif
+
 static int64_t command_now_ms(void);
 static uint64_t command_monotonic_ms(void);
 static int file_exists_c(const char *path);
@@ -173,6 +198,54 @@ static void command_update_max_u32(uint32_t value, uint32_t *max_value) {
   if (max_value && value > *max_value) {
     *max_value = value;
   }
+}
+
+static int delivery_health_upload_backoff_active(int64_t now_ms) {
+  int active;
+  delivery_health_lock();
+  active = s_upload_outbox_next_retry_ms > now_ms;
+  if (active) {
+    s_delivery_health.upload_skipped_backoff++;
+  }
+  delivery_health_unlock();
+  return active;
+}
+
+static void delivery_health_upload_attempted(void) {
+  delivery_health_lock();
+  s_delivery_health.upload_attempted++;
+  delivery_health_unlock();
+}
+
+static void delivery_health_upload_result(int rc, int64_t now_ms) {
+  delivery_health_lock();
+  if (rc > 0) {
+    s_delivery_health.upload_succeeded++;
+    s_upload_outbox_fail_streak = 0u;
+    s_upload_outbox_next_retry_ms = 0;
+  } else if (rc < 0) {
+    s_delivery_health.upload_failed++;
+    s_upload_outbox_fail_streak++;
+    uint32_t base_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_RETRY_BACKOFF_S",
+                                               60u, 10u, 3600u);
+    uint32_t cap_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_BACKOFF_S",
+                                              900u, base_s, 86400u);
+    uint32_t mult = s_upload_outbox_fail_streak > 5u ? 5u : s_upload_outbox_fail_streak;
+    uint64_t backoff_s = (uint64_t)base_s * (uint64_t)(mult ? mult : 1u);
+    if (backoff_s > cap_s) {
+      backoff_s = cap_s;
+    }
+    s_upload_outbox_next_retry_ms = now_ms + (int64_t)backoff_s * 1000LL;
+  }
+  delivery_health_unlock();
+}
+
+static void delivery_health_upload_pending(uint32_t pending_seen) {
+  delivery_health_lock();
+  s_delivery_health.upload_pending_seen = pending_seen;
+  s_delivery_health.upload_fail_streak = s_upload_outbox_fail_streak;
+  s_delivery_health.upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
+  delivery_health_unlock();
 }
 
 static int streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
@@ -396,6 +469,7 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
   char taskj[300];
   char statusj[96];
   char *detail_json = NULL;
+  const char *persist_detail = NULL;
   char *raw = NULL;
   char *err = NULL;
   const char *rstatus = response_status && response_status[0] ? response_status : response_status_label(st);
@@ -427,19 +501,30 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
     json_escape_to(small_err, sizeof(small_err), err_text);
     snprintf(fallback, sizeof(fallback),
              "{\"task_id\":%s,\"status\":%s,\"exit_code\":%d,"
-             "\"evidence_refs\":[],\"upload_refs\":[],\"artifacts\":%s,\"error\":%s,"
+             "\"evidence_refs\":[],\"upload_refs\":[],\"artifacts\":[],\"error\":%s,"
              "\"retryable\":%s,\"raw_detail\":%s}",
-             taskj, statusj, exit_code, artifact_json, small_err,
+             taskj, statusj, exit_code, small_err,
              retryable ? "true" : "false", small_raw);
-    detail_json = (char *)malloc(strlen(fallback) + 1u);
-    if (detail_json) {
-      strcpy(detail_json, fallback);
+    persist_detail = fallback;
+    int report_pending = command_should_report(cmd_id, sm);
+    int state_rc = edr_command_state_finish(cmd_id, s_active_command_type,
+                                            sm, rstatus, (int)st, exit_code,
+                                            persist_detail, artifacts ? artifacts : "",
+                                            report_pending);
+    if (state_rc == 0) {
+      edr_command_state_delete_inbox(cmd_id);
+    } else {
+      audit_both(cmd_id, "terminal command state persist failed; durable inbox retained");
     }
+    free(raw);
+    free(err);
+    return;
   }
-  int report_pending = detail_json && command_should_report(cmd_id, sm);
+  persist_detail = detail_json;
+  int report_pending = command_should_report(cmd_id, sm);
   int state_rc = edr_command_state_finish(cmd_id, s_active_command_type,
                                           sm, rstatus, (int)st, exit_code,
-                                          detail_json ? detail_json : (detail ? detail : ""),
+                                          persist_detail,
                                           artifacts ? artifacts : "",
                                           report_pending);
   /* The inbox is the crash-recovery record. Delete it only after a terminal
@@ -3523,8 +3608,7 @@ static void flush_upload_outbox(void) {
   char dir[700];
   upload_outbox_dir(dir, sizeof(dir));
   int64_t now_ms = command_now_ms();
-  if (s_upload_outbox_next_retry_ms > now_ms) {
-    s_delivery_health.upload_skipped_backoff++;
+  if (delivery_health_upload_backoff_active(now_ms)) {
     return;
   }
   uint32_t max_per_poll = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_PER_POLL", 1u, 1u, 64u);
@@ -3547,23 +3631,10 @@ static void flush_upload_outbox(void) {
         continue;
       }
       attempted_this_poll++;
-      s_delivery_health.upload_attempted++;
+      delivery_health_upload_attempted();
       int rc = flush_upload_outbox_one(path);
-      if (rc > 0) {
-        s_delivery_health.upload_succeeded++;
-        s_upload_outbox_fail_streak = 0u;
-        s_upload_outbox_next_retry_ms = 0;
-      } else if (rc < 0) {
-        s_delivery_health.upload_failed++;
-        s_upload_outbox_fail_streak++;
-        uint32_t base_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_RETRY_BACKOFF_S", 60u, 10u, 3600u);
-        uint32_t cap_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_BACKOFF_S", 900u, base_s, 86400u);
-        uint32_t mult = s_upload_outbox_fail_streak > 5u ? 5u : s_upload_outbox_fail_streak;
-        uint64_t backoff_s = (uint64_t)base_s * (uint64_t)(mult ? mult : 1u);
-        if (backoff_s > cap_s) {
-          backoff_s = cap_s;
-        }
-        s_upload_outbox_next_retry_ms = now_ms + (int64_t)backoff_s * 1000LL;
+      delivery_health_upload_result(rc, now_ms);
+      if (rc < 0) {
         break;
       }
     }
@@ -3586,32 +3657,17 @@ static void flush_upload_outbox(void) {
         continue;
       }
       attempted_this_poll++;
-      s_delivery_health.upload_attempted++;
+      delivery_health_upload_attempted();
       int rc = flush_upload_outbox_one(path);
-      if (rc > 0) {
-        s_delivery_health.upload_succeeded++;
-        s_upload_outbox_fail_streak = 0u;
-        s_upload_outbox_next_retry_ms = 0;
-      } else if (rc < 0) {
-        s_delivery_health.upload_failed++;
-        s_upload_outbox_fail_streak++;
-        uint32_t base_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_RETRY_BACKOFF_S", 60u, 10u, 3600u);
-        uint32_t cap_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_BACKOFF_S", 900u, base_s, 86400u);
-        uint32_t mult = s_upload_outbox_fail_streak > 5u ? 5u : s_upload_outbox_fail_streak;
-        uint64_t backoff_s = (uint64_t)base_s * (uint64_t)(mult ? mult : 1u);
-        if (backoff_s > cap_s) {
-          backoff_s = cap_s;
-        }
-        s_upload_outbox_next_retry_ms = now_ms + (int64_t)backoff_s * 1000LL;
+      delivery_health_upload_result(rc, now_ms);
+      if (rc < 0) {
         break;
       }
     }
   }
   closedir(d);
 #endif
-  s_delivery_health.upload_pending_seen = seen_this_poll;
-  s_delivery_health.upload_fail_streak = s_upload_outbox_fail_streak;
-  s_delivery_health.upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
+  delivery_health_upload_pending(seen_this_poll);
 }
 
 /* 取证 velo 仅人工下发 gate:命令需带 initiated_by="operator"(或 payload {"initiated_by":"operator"}/{"manual":true})。
@@ -4308,6 +4364,108 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
 }
 
+typedef struct EdrVeloValidatedOutput {
+  char *raw;
+  cJSON *root;
+  int partial;
+  char provider_status[32];
+  char provider_error[512];
+} EdrVeloValidatedOutput;
+
+static void velo_validated_output_free(EdrVeloValidatedOutput *out) {
+  if (!out) return;
+  cJSON_Delete(out->root);
+  free(out->raw);
+  memset(out, 0, sizeof(*out));
+}
+
+static int velo_load_validated_output(const char *path, unsigned long long file_size,
+                                      EdrVeloValidatedOutput *out, char *error,
+                                      size_t error_cap) {
+  const unsigned long long max_contract_bytes = 64ull * 1024ull * 1024ull;
+  if (!out || !path || !path[0]) return 0;
+  memset(out, 0, sizeof(*out));
+  if (file_size == 0ull || file_size > max_contract_bytes) {
+    if (error && error_cap) {
+      snprintf(error, error_cap, "query output size is outside the validated 1..64MiB contract");
+    }
+    return 0;
+  }
+  out->raw = (char *)malloc((size_t)file_size + 1u);
+  if (!out->raw) {
+    if (error && error_cap) snprintf(error, error_cap, "out of memory validating query output");
+    return 0;
+  }
+  FILE *f = fopen(path, "rb");
+  size_t read_bytes = f ? fread(out->raw, 1, (size_t)file_size, f) : 0u;
+  if (f) fclose(f);
+  out->raw[read_bytes] = '\0';
+  if (read_bytes != (size_t)file_size) {
+    if (error && error_cap) snprintf(error, error_cap, "query output could not be read completely");
+    velo_validated_output_free(out);
+    return 0;
+  }
+  out->root = cJSON_Parse(out->raw);
+  if (!out->root || !cJSON_IsObject(out->root)) {
+    if (error && error_cap) snprintf(error, error_cap, "query output is not a JSON object");
+    velo_validated_output_free(out);
+    return 0;
+  }
+  cJSON *rows = cJSON_GetObjectItemCaseSensitive(out->root, "rows");
+  if (!cJSON_IsArray(rows)) {
+    if (error && error_cap) snprintf(error, error_cap, "query output is missing the required rows array");
+    velo_validated_output_free(out);
+    return 0;
+  }
+  cJSON *provider_error = cJSON_GetObjectItemCaseSensitive(out->root, "error");
+  if (provider_error && !cJSON_IsNull(provider_error) && !cJSON_IsString(provider_error)) {
+    if (error && error_cap) snprintf(error, error_cap, "query output error must be a string");
+    velo_validated_output_free(out);
+    return 0;
+  }
+  if (cJSON_IsString(provider_error) && provider_error->valuestring && provider_error->valuestring[0]) {
+    snprintf(out->provider_error, sizeof(out->provider_error), "%s", provider_error->valuestring);
+  }
+  cJSON *status = cJSON_GetObjectItemCaseSensitive(out->root, "status");
+  if (status && !cJSON_IsString(status)) {
+    if (error && error_cap) snprintf(error, error_cap, "query output status must be a string");
+    velo_validated_output_free(out);
+    return 0;
+  }
+  if (cJSON_IsString(status) && status->valuestring) {
+    snprintf(out->provider_status, sizeof(out->provider_status), "%s", status->valuestring);
+    if (strcasecmp(status->valuestring, "failed") == 0 ||
+        strcasecmp(status->valuestring, "error") == 0 ||
+        strcasecmp(status->valuestring, "rejected") == 0 ||
+        strcasecmp(status->valuestring, "cancelled") == 0 ||
+        strcasecmp(status->valuestring, "canceled") == 0) {
+      if (error && error_cap) {
+        snprintf(error, error_cap, "collector reported status %.80s%s%.400s", status->valuestring,
+                 out->provider_error[0] ? ": " : "", out->provider_error);
+      }
+      velo_validated_output_free(out);
+      return 0;
+    }
+    if (strcasecmp(status->valuestring, "partial") == 0 ||
+        strcasecmp(status->valuestring, "partial_success") == 0 ||
+        strcasecmp(status->valuestring, "degraded") == 0) {
+      out->partial = 1;
+    } else if (status->valuestring[0] && strcasecmp(status->valuestring, "ok") != 0 &&
+               strcasecmp(status->valuestring, "success") != 0 &&
+               strcasecmp(status->valuestring, "completed") != 0) {
+      if (error && error_cap) snprintf(error, error_cap, "collector returned unsupported status %.80s", status->valuestring);
+      velo_validated_output_free(out);
+      return 0;
+    }
+  }
+  if (out->provider_error[0] && !out->partial) {
+    if (error && error_cap) snprintf(error, error_cap, "collector returned an error: %.400s", out->provider_error);
+    velo_validated_output_free(out);
+    return 0;
+  }
+  return 1;
+}
+
 /* 主机显微镜·Velociraptor 富数据（V1：进程）。调外部采集器 query 模式跑 VQL → JSONL 行 →
  * 适配器写 out-file 为 {source,artifact,rows:[...],total}；本命令读回并内联回流（前端 extractRecords 取 rows）。
  * 只读、沿用 dangerous 门控；不自动回退（前端有"数据源"手动开关）。 */
@@ -4398,6 +4556,24 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or missing query output");
     return;
   }
+  EdrVeloValidatedOutput validated;
+  char validation_error[640];
+  validation_error[0] = '\0';
+  if (!velo_load_validated_output(rowspath, fsz, &validated, validation_error, sizeof(validation_error))) {
+    (void)remove(rowspath);
+    s_exec_fail++;
+    char fail[760];
+    snprintf(fail, sizeof(fail), "velo_query: invalid collector result: %.640s",
+             validation_error[0] ? validation_error : "unknown contract violation");
+    audit_both(cmd_id, fail);
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, fail);
+    return;
+  }
+  int provider_partial = validated.partial;
+  char provider_status[sizeof(validated.provider_status)];
+  char provider_error[sizeof(validated.provider_error)];
+  snprintf(provider_status, sizeof(provider_status), "%s", validated.provider_status);
+  snprintf(provider_error, sizeof(provider_error), "%s", validated.provider_error);
   char sha[65];
   sha[0] = '\0';
   (void)file_sha256_hex(rowspath, sha);
@@ -4428,35 +4604,33 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     }
   }
   if (fsz <= inline_cap) {
-    /* 小产物：文件内容（{source,artifact,rows,total}）直接内联回流。 */
-    char *detail = (char *)malloc((size_t)fsz + 1u);
-    if (detail) {
-      FILE *rf = fopen(rowspath, "rb");
-      size_t rn = 0;
-      if (rf) {
-        rn = fread(detail, 1, (size_t)fsz, rf);
-        fclose(rf);
+    /* 小产物：已验证的文件内容直接内联回流。 */
+    char *detail = validated.raw;
+    cJSON *root = validated.root;
+    validated.raw = NULL;
+    validated.root = NULL;
+    (void)remove(rowspath);
+    if (root && detail) {
+      char combined_error[760];
+      combined_error[0] = '\0';
+      if (provider_error[0]) {
+        snprintf(combined_error, sizeof(combined_error), "%s", provider_error);
+      } else if (provider_partial) {
+        snprintf(combined_error, sizeof(combined_error), "%s", "collector returned a partial result");
       }
-      detail[rn] = '\0';
-      (void)remove(rowspath);
-      if (rn == 0u || detail[0] != '{') {
-        free(detail);
-        s_exec_fail++;
-        soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: empty or invalid query output");
-        return;
+      if (upload_rc != 0) {
+        size_t used = strlen(combined_error);
+        snprintf(combined_error + used, sizeof(combined_error) - used, "%sartifact upload failed; inline rows retained",
+                 used ? "; " : "");
       }
-      cJSON *root = cJSON_Parse(detail);
-      if (!root || !cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        free(detail);
-        s_exec_fail++;
-        soar_emit(cmd_id, sm, EdrCmdExecFailed, 7, "velo_query: invalid JSON query output");
-        return;
+      if (provider_status[0]) {
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "provider_status");
+        cJSON_AddStringToObject(root, "provider_status", provider_status);
       }
       cJSON_DeleteItemFromObjectCaseSensitive(root, "schema");
       cJSON_AddStringToObject(root, "schema", "edr.forensic.result.v1");
       cJSON_DeleteItemFromObjectCaseSensitive(root, "status");
-      cJSON_AddStringToObject(root, "status", upload_rc == 0 ? "success" : "partial_success");
+      cJSON_AddStringToObject(root, "status", (provider_partial || upload_rc != 0) ? "partial_success" : "success");
       if (!cJSON_GetObjectItemCaseSensitive(root, "source"))
         cJSON_AddStringToObject(root, "source", "velociraptor");
       if (!cJSON_GetObjectItemCaseSensitive(root, "artifact"))
@@ -4470,33 +4644,40 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
       cJSON_DeleteItemFromObjectCaseSensitive(root, "upload_status");
       cJSON_AddStringToObject(root, "upload_status", upload_rc == 0 ? "ok" : "failed");
       cJSON_DeleteItemFromObjectCaseSensitive(root, "error");
-      cJSON_AddStringToObject(root, "error", upload_rc == 0 ? "" : "artifact upload failed; inline rows retained");
+      cJSON_AddStringToObject(root, "error", combined_error);
       char *contract_detail = cJSON_PrintUnformatted(root);
       cJSON_Delete(root);
       s_handled++;
       s_exec_ok++;
-      audit_both(cmd_id, "velo_query: ok (inline)");
+      audit_both(cmd_id, provider_partial ? "velo_query: partial (inline)" : "velo_query: ok (inline)");
       soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, contract_detail ? contract_detail : detail,
-                   upload_rc == 0 ? "ok" : "ok_upload_failed", artifacts);
+                   provider_partial ? "ok_partial" : (upload_rc == 0 ? "ok" : "ok_upload_failed"), artifacts);
       if (contract_detail) cJSON_free(contract_detail);
       free(detail);
       return;
     }
-    /* malloc 失败 → 退回下载通道。 */
   }
+  velo_validated_output_free(&validated);
   (void)remove(rowspath);
   /* 大产物（或内联缓冲分配失败）：空内联 + 下载标记，前端经下载通道取全量。 */
   {
     char detail[2600];
     int can_dl = (upload_rc == 0 && minio_key[0]) ? 1 : 0;
+    const char *large_status = can_dl ? (provider_partial ? "partial_success" : "success") : "failed";
+    const char *large_error = can_dl
+                                  ? (provider_error[0] ? provider_error
+                                                       : (provider_partial ? "collector returned a partial result" : ""))
+                                  : "large result upload failed; no retrievable rows";
+    char large_errorj[1200];
+    json_escape_to(large_errorj, sizeof(large_errorj), large_error);
     snprintf(detail, sizeof(detail),
              "{\"schema\":\"edr.forensic.result.v1\",\"status\":\"%s\","
              "\"source\":\"velociraptor\",\"artifact\":%s,\"sha256\":\"%s\","
              "\"object_key\":%s,\"truncated\":true,\"upload_status\":\"%s\","
-             "\"error\":\"%s\",\"download\":%s,\"total\":-1,\"rows\":[]}",
-             can_dl ? "success" : "failed", pathj, sha, minioj,
+             "\"error\":%s,\"download\":%s,\"total\":-1,\"rows\":[]}",
+             large_status, pathj, sha, minioj,
              upload_rc == 0 ? "ok" : "failed",
-             can_dl ? "" : "large result upload failed; no retrievable rows",
+             large_errorj,
              can_dl ? "true" : "false");
     s_handled++;
     if (can_dl) {
@@ -4504,9 +4685,10 @@ static void do_velo_query(const char *cmd_id, const uint8_t *pl, size_t len, con
     } else {
       s_exec_fail++;
     }
-    audit_both(cmd_id, can_dl ? "velo_query: ok (download)" : "velo_query: large result, upload failed");
+    audit_both(cmd_id, can_dl ? (provider_partial ? "velo_query: partial (download)" : "velo_query: ok (download)")
+                              : "velo_query: large result, upload failed");
     soar_emit_ex(cmd_id, sm, can_dl ? EdrCmdExecOk : EdrCmdExecFailed, can_dl ? 0 : 9, detail,
-                 upload_rc == 0 ? "ok" : "upload_failed", artifacts);
+                 can_dl && provider_partial ? "ok_partial" : (upload_rc == 0 ? "ok" : "upload_failed"), artifacts);
   }
 }
 
@@ -5305,8 +5487,13 @@ static void record_command_result_delivery_failure(const EdrCommandStateRecord *
     snprintf(error, sizeof(error), "%s", "command result delivery failed");
   }
   if (rc == EDR_INGEST_COMMAND_RESULT_REJECTED || !retryable) {
-    edr_command_state_mark_report_rejected(record, error);
-    audit_both(record->command_id, "command result permanently rejected; retained in local dead-letter state");
+    if (edr_command_state_mark_report_rejected(record, error) != 0) {
+      audit_both(record->command_id,
+                 "command result rejection received but terminal state persistence failed; pending result retained");
+    } else {
+      audit_both(record->command_id,
+                 "command result permanently rejected; retained in local dead-letter state");
+    }
     return;
   }
   uint32_t alert_attempts = command_u32_env_clamped("EDR_COMMAND_RESULT_RETRY_ALERT_ATTEMPTS", 12u, 1u, 1000u);
@@ -5341,7 +5528,10 @@ static void flush_command_result_outbox(void) {
                                                  pending[i].detail);
     }
     if (rc == 0) {
-      edr_command_state_mark_reported(&pending[i]);
+      if (edr_command_state_mark_reported(&pending[i]) != 0) {
+        audit_both(pending[i].command_id,
+                   "command result accepted but reported-state persistence failed; idempotent delivery remains pending");
+      }
     } else {
       record_command_result_delivery_failure(&pending[i], rc);
     }
@@ -5690,24 +5880,28 @@ static void command_delivery_run_once(void) {
   }
   last_poll_ms = now;
   uint64_t total_start = command_monotonic_ms();
+  delivery_health_lock();
   s_delivery_health.poll_count++;
   s_delivery_health.last_poll_unix_ms = now;
+  delivery_health_unlock();
   edr_ingest_http_retry_pending_control_acks();
   uint64_t step_start = command_monotonic_ms();
   flush_upload_outbox();
-  s_delivery_health.last_upload_ms = command_elapsed_ms_u32(step_start);
-  command_update_max_u32(s_delivery_health.last_upload_ms, &s_delivery_health.max_upload_ms);
+  uint32_t upload_ms = command_elapsed_ms_u32(step_start);
+  delivery_health_lock();
+  s_delivery_health.last_upload_ms = upload_ms;
+  command_update_max_u32(upload_ms, &s_delivery_health.max_upload_ms);
+  delivery_health_unlock();
   edr_command_executor_wake();
-  s_delivery_health.last_result_ms = 0u;
+  uint32_t result_ms = 0u;
   if (s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
     step_start = command_monotonic_ms();
     flush_command_result_outbox();
-    s_delivery_health.last_result_ms = command_elapsed_ms_u32(step_start);
-    command_update_max_u32(s_delivery_health.last_result_ms, &s_delivery_health.max_result_ms);
+    result_ms = command_elapsed_ms_u32(step_start);
     if (pressure) {
       uint32_t next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_PRESSURE_INTERVAL_MS",
                                                  5000u, 1000u, 60000u);
-      if (s_delivery_health.last_result_ms >=
+      if (result_ms >=
           command_u32_env_clamped("EDR_COMMAND_DELIVERY_SLOW_MS", 750u, 100u, 60000u)) {
         next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_SLOW_BACKOFF_MS",
                                           300000u, next_ms, 1800000u);
@@ -5717,27 +5911,43 @@ static void command_delivery_run_once(void) {
       s_result_outbox_next_flush_ms = 0;
     }
   }
-  s_delivery_health.last_compact_ms = 0u;
+  delivery_health_lock();
+  s_delivery_health.last_result_ms = result_ms;
+  command_update_max_u32(result_ms, &s_delivery_health.max_result_ms);
+  delivery_health_unlock();
+  uint32_t compact_ms = 0u;
   if (!pressure && (s_compact_next_allowed_ms <= 0 || now >= s_compact_next_allowed_ms)) {
     step_start = command_monotonic_ms();
     edr_command_state_compact_if_needed();
-    s_delivery_health.last_compact_ms = command_elapsed_ms_u32(step_start);
-    command_update_max_u32(s_delivery_health.last_compact_ms, &s_delivery_health.max_compact_ms);
-    if (s_delivery_health.last_compact_ms >=
+    compact_ms = command_elapsed_ms_u32(step_start);
+    if (compact_ms >=
         command_u32_env_clamped("EDR_COMMAND_DELIVERY_SLOW_MS", 750u, 100u, 60000u)) {
       uint32_t next_ms = command_u32_env_clamped("EDR_COMMAND_COMPACT_SLOW_BACKOFF_MS",
                                                 600000u, 60000u, 3600000u);
       s_compact_next_allowed_ms = now + (int64_t)next_ms;
     }
   }
-  s_delivery_health.last_total_ms = command_elapsed_ms_u32(total_start);
-  command_update_max_u32(s_delivery_health.last_total_ms, &s_delivery_health.max_total_ms);
+  uint32_t total_ms = command_elapsed_ms_u32(total_start);
+  delivery_health_lock();
+  s_delivery_health.last_compact_ms = compact_ms;
+  command_update_max_u32(compact_ms, &s_delivery_health.max_compact_ms);
+  s_delivery_health.last_total_ms = total_ms;
+  command_update_max_u32(total_ms, &s_delivery_health.max_total_ms);
+  delivery_health_unlock();
 }
+
+enum {
+  COMMAND_DELIVERY_STOPPED = 0,
+  COMMAND_DELIVERY_RUNNING = 1,
+  COMMAND_DELIVERY_STOPPING = 2
+};
 
 #ifdef _WIN32
 static HANDLE s_delivery_thread;
-static volatile LONG s_delivery_thread_started;
+static SRWLOCK s_delivery_thread_mu = SRWLOCK_INIT;
+static LONG s_delivery_thread_state;
 static volatile LONG s_delivery_thread_stop;
+static volatile LONG s_delivery_thread_exited;
 
 static DWORD WINAPI command_delivery_thread_main(LPVOID unused) {
   (void)unused;
@@ -5745,20 +5955,31 @@ static DWORD WINAPI command_delivery_thread_main(LPVOID unused) {
     command_delivery_run_once();
     Sleep(1000u);
   }
+  InterlockedExchange(&s_delivery_thread_exited, 1);
   return 0;
 }
 
 static void command_delivery_thread_start(void) {
-  if (InterlockedCompareExchange(&s_delivery_thread_started, 1, 0) != 0) return;
+  AcquireSRWLockExclusive(&s_delivery_thread_mu);
+  if (s_delivery_thread_state != COMMAND_DELIVERY_STOPPED) {
+    ReleaseSRWLockExclusive(&s_delivery_thread_mu);
+    return;
+  }
   InterlockedExchange(&s_delivery_thread_stop, 0);
-  s_delivery_thread = CreateThread(NULL, 0u, command_delivery_thread_main, NULL, 0u, NULL);
-  if (!s_delivery_thread) InterlockedExchange(&s_delivery_thread_started, 0);
+  InterlockedExchange(&s_delivery_thread_exited, 0);
+  HANDLE thread = CreateThread(NULL, 0u, command_delivery_thread_main, NULL, 0u, NULL);
+  if (thread) {
+    s_delivery_thread = thread;
+    s_delivery_thread_state = COMMAND_DELIVERY_RUNNING;
+  }
+  ReleaseSRWLockExclusive(&s_delivery_thread_mu);
 }
 #else
 static pthread_t s_delivery_thread;
 static pthread_mutex_t s_delivery_thread_mu = PTHREAD_MUTEX_INITIALIZER;
-static int s_delivery_thread_started;
+static int s_delivery_thread_state;
 static int s_delivery_thread_stop;
+static int s_delivery_thread_exited;
 
 static void *command_delivery_thread_main(void *unused) {
   (void)unused;
@@ -5770,18 +5991,22 @@ static void *command_delivery_thread_main(void *unused) {
     command_delivery_run_once();
     usleep(1000000u);
   }
+  pthread_mutex_lock(&s_delivery_thread_mu);
+  s_delivery_thread_exited = 1;
+  pthread_mutex_unlock(&s_delivery_thread_mu);
   return NULL;
 }
 
 static void command_delivery_thread_start(void) {
   pthread_mutex_lock(&s_delivery_thread_mu);
-  if (s_delivery_thread_started) {
+  if (s_delivery_thread_state != COMMAND_DELIVERY_STOPPED) {
     pthread_mutex_unlock(&s_delivery_thread_mu);
     return;
   }
   s_delivery_thread_stop = 0;
+  s_delivery_thread_exited = 0;
   if (pthread_create(&s_delivery_thread, NULL, command_delivery_thread_main, NULL) == 0) {
-    s_delivery_thread_started = 1;
+    s_delivery_thread_state = COMMAND_DELIVERY_RUNNING;
   }
   pthread_mutex_unlock(&s_delivery_thread_mu);
 }
@@ -5791,35 +6016,86 @@ void edr_command_poll_reliable_delivery(void) {
   command_delivery_thread_start();
 }
 
-void edr_command_delivery_shutdown(void) {
+int edr_command_delivery_shutdown_timeout(uint32_t timeout_ms) {
+  edr_ingest_http_cancel_inflight();
 #ifdef _WIN32
-  if (InterlockedCompareExchange(&s_delivery_thread_started, 0, 0) == 0) return;
-  InterlockedExchange(&s_delivery_thread_stop, 1);
-  if (s_delivery_thread) {
-    (void)WaitForSingleObject(s_delivery_thread, 10000u);
-    CloseHandle(s_delivery_thread);
-    s_delivery_thread = NULL;
+  AcquireSRWLockExclusive(&s_delivery_thread_mu);
+  if (s_delivery_thread_state == COMMAND_DELIVERY_STOPPED) {
+    ReleaseSRWLockExclusive(&s_delivery_thread_mu);
+    return 1;
   }
-  InterlockedExchange(&s_delivery_thread_started, 0);
+  if (s_delivery_thread_state == COMMAND_DELIVERY_RUNNING) {
+    s_delivery_thread_state = COMMAND_DELIVERY_STOPPING;
+  }
+  InterlockedExchange(&s_delivery_thread_stop, 1);
+  HANDLE thread = s_delivery_thread;
+  ReleaseSRWLockExclusive(&s_delivery_thread_mu);
+  DWORD wait_rc = thread ? WaitForSingleObject(thread, (DWORD)timeout_ms) : WAIT_OBJECT_0;
+  AcquireSRWLockExclusive(&s_delivery_thread_mu);
+  if (wait_rc == WAIT_OBJECT_0) {
+    if (thread) CloseHandle(thread);
+    s_delivery_thread = NULL;
+    s_delivery_thread_state = COMMAND_DELIVERY_STOPPED;
+  }
+  ReleaseSRWLockExclusive(&s_delivery_thread_mu);
+  if (wait_rc != WAIT_OBJECT_0) {
+    audit_both("command_delivery", "delivery thread did not stop after transport cancellation");
+    return 0;
+  }
+  return 1;
 #else
   pthread_mutex_lock(&s_delivery_thread_mu);
-  int started = s_delivery_thread_started;
+  if (s_delivery_thread_state == COMMAND_DELIVERY_STOPPED) {
+    pthread_mutex_unlock(&s_delivery_thread_mu);
+    return 1;
+  }
+  if (s_delivery_thread_state == COMMAND_DELIVERY_RUNNING) {
+    s_delivery_thread_state = COMMAND_DELIVERY_STOPPING;
+  }
   s_delivery_thread_stop = 1;
+  pthread_t thread = s_delivery_thread;
   pthread_mutex_unlock(&s_delivery_thread_mu);
-  if (started) (void)pthread_join(s_delivery_thread, NULL);
+
+  uint32_t waited_ms = 0u;
+  for (;;) {
+    pthread_mutex_lock(&s_delivery_thread_mu);
+    int exited = s_delivery_thread_exited;
+    pthread_mutex_unlock(&s_delivery_thread_mu);
+    if (exited) break;
+    if (waited_ms >= timeout_ms) {
+      audit_both("command_delivery", "delivery thread did not stop after transport cancellation");
+      return 0;
+    }
+    uint32_t step_ms = timeout_ms - waited_ms;
+    if (step_ms > 10u) step_ms = 10u;
+    usleep((useconds_t)step_ms * 1000u);
+    waited_ms += step_ms;
+  }
+  int join_rc = pthread_join(thread, NULL);
   pthread_mutex_lock(&s_delivery_thread_mu);
-  s_delivery_thread_started = 0;
+  s_delivery_thread_state = join_rc == 0 ? COMMAND_DELIVERY_STOPPED : COMMAND_DELIVERY_RUNNING;
   pthread_mutex_unlock(&s_delivery_thread_mu);
+  if (join_rc != 0) {
+    audit_both("command_delivery", "delivery thread join failed after transport cancellation");
+    return 0;
+  }
+  return 1;
 #endif
+}
+
+void edr_command_delivery_shutdown(void) {
+  (void)edr_command_delivery_shutdown_timeout(10000u);
 }
 
 void edr_command_get_delivery_health(EdrCommandDeliveryHealth *out_health) {
   if (!out_health) {
     return;
   }
+  delivery_health_lock();
   *out_health = s_delivery_health;
   out_health->upload_fail_streak = s_upload_outbox_fail_streak;
   out_health->upload_next_retry_unix_ms = s_upload_outbox_next_retry_ms;
+  delivery_health_unlock();
   EdrCommandStateQuarantineStats quarantine;
   memset(&quarantine, 0, sizeof(quarantine));
   edr_command_state_get_quarantine_stats(&quarantine);
@@ -6056,8 +6332,6 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
             target, target_state.command_type, &target_meta, EdrCmdExecFailed, 130,
             "command cancelled before execution", "cancelled");
       }
-      edr_cmd_inc_handled();
-      edr_cmd_inc_exec_ok();
       char detail[384];
       snprintf(detail, sizeof(detail),
                "cancel target=%s state=%d active=%d forensic=%d mode=%d",
@@ -6065,7 +6339,20 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
                target_state.command_type[0]
                    ? (int)edr_command_registry_cancel_mode(target_state.command_type)
                    : (int)EDR_COMMAND_CANCEL_HARD);
-      edr_command_emit_always(id, sm, EdrCmdExecOk, 0, detail);
+      if (state_rc == EDR_COMMAND_STATE_CANCEL_ERROR) {
+        edr_cmd_inc_exec_fail();
+        edr_command_emit_always(id, sm, EdrCmdExecFailed, 5,
+                                "cancel request could not be durably recorded");
+      } else if (state_rc == EDR_COMMAND_STATE_CANCEL_REQUESTED || active_hit || forensic_hit) {
+        edr_cmd_inc_handled();
+        edr_cmd_inc_exec_ok();
+        edr_command_emit_always(id, sm, EdrCmdExecOk, 0, detail);
+      } else {
+        edr_cmd_inc_exec_fail();
+        edr_command_emit_always(id, sm, EdrCmdExecFailed, 4,
+                                target[0] ? "cancel target not found or already final"
+                                          : "no active forensic task to cancel");
+      }
       return;
     }
     case EDR_COMMAND_KIND_DEEP_FORENSIC:

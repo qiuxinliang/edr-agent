@@ -69,7 +69,8 @@ typedef enum EdrCommandExecutionLane {
   EDR_COMMAND_LANE_CRITICAL = 0,
   EDR_COMMAND_LANE_INTERACTIVE = 1,
   EDR_COMMAND_LANE_BULK = 2,
-  EDR_COMMAND_LANE_COUNT = 3,
+  EDR_COMMAND_LANE_SCAN = 3,
+  EDR_COMMAND_LANE_COUNT = 4,
 } EdrCommandExecutionLane;
 
 typedef enum EdrCommandCancelMode {

@@ -23,21 +23,37 @@ static volatile int s_bulk_work;
 static volatile int s_bulk_started;
 static volatile int s_bulk_release;
 static volatile int s_bulk_done;
+static volatile int s_bulk_fast_work;
+static volatile int s_bulk_fast_done;
 static volatile int s_critical_work;
 static volatile int s_critical_done;
+static volatile int s_scan_work;
+static volatile int s_scan_done;
 static volatile size_t s_pending_count;
 
+static int claim_once(volatile int *flag) {
+#ifdef _WIN32
+  return InterlockedCompareExchange((volatile LONG *)flag, 1, 0) == 0;
+#else
+  return __sync_bool_compare_and_swap(flag, 0, 1);
+#endif
+}
+
 int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
-  if (lane == EDR_COMMAND_LANE_BULK && s_bulk_work && !s_bulk_started) {
-    s_bulk_started = 1;
+  if (lane == EDR_COMMAND_LANE_BULK && s_bulk_work && claim_once(&s_bulk_started)) {
     while (!s_bulk_release) {
       sleep_ms(5u);
     }
     s_bulk_done = 1;
     return 1;
   }
-  if (lane == EDR_COMMAND_LANE_CRITICAL && s_critical_work && !s_critical_done) {
-    s_critical_done = 1;
+  if (lane == EDR_COMMAND_LANE_BULK && s_bulk_fast_work && claim_once(&s_bulk_fast_done)) {
+    return 1;
+  }
+  if (lane == EDR_COMMAND_LANE_CRITICAL && s_critical_work && claim_once(&s_critical_done)) {
+    return 1;
+  }
+  if (lane == EDR_COMMAND_LANE_SCAN && s_scan_work && claim_once(&s_scan_done)) {
     return 1;
   }
   return 0;
@@ -51,6 +67,9 @@ EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_
   }
   if (command_type && strcmp(command_type, "deep_forensic") == 0) {
     return EDR_COMMAND_LANE_BULK;
+  }
+  if (command_type && strcmp(command_type, "yara_scan") == 0) {
+    return EDR_COMMAND_LANE_SCAN;
   }
   return EDR_COMMAND_LANE_INTERACTIVE;
 }
@@ -72,7 +91,8 @@ static void wait_until(volatile int *value, const char *message) {
 int main(void) {
   test_setenv("EDR_COMMAND_CRITICAL_WORKERS", "1");
   test_setenv("EDR_COMMAND_INTERACTIVE_WORKERS", "1");
-  test_setenv("EDR_COMMAND_BULK_WORKERS", "1");
+  test_setenv("EDR_COMMAND_BULK_WORKERS", "2");
+  test_setenv("EDR_COMMAND_SCAN_WORKERS", "1");
   test_setenv("EDR_COMMAND_QUEUE_CAPACITY", "8");
   test_setenv("EDR_COMMAND_QUEUE_CRITICAL_RESERVE", "2");
   require_true(edr_command_executor_start() == 0, "start command executor");
@@ -81,10 +101,20 @@ int main(void) {
   edr_command_executor_wake();
   wait_until(&s_bulk_started, "bulk worker starts long task");
 
+  s_bulk_fast_work = 1;
+  edr_command_executor_wake();
+  wait_until(&s_bulk_fast_done, "second bulk worker completes independent collection");
+  require_true(!s_bulk_done, "bounded bulk concurrency avoids single-worker head-of-line blocking");
+
   s_critical_work = 1;
   edr_command_executor_wake();
   wait_until(&s_critical_done, "critical command bypasses blocked bulk worker");
   require_true(!s_bulk_done, "critical command finishes while bulk task remains blocked");
+
+  s_scan_work = 1;
+  edr_command_executor_wake();
+  wait_until(&s_scan_done, "YARA scan lane bypasses blocked bulk worker");
+  require_true(!s_bulk_done, "scan command finishes while bulk task remains blocked");
 
   s_pending_count = 7u;
   require_true(edr_command_executor_admit("deep_forensic"),
@@ -103,21 +133,31 @@ int main(void) {
   require_true(!edr_command_executor_admit("isolate_host"),
                "critical lane is bounded after reserve is consumed");
 
+  require_true(!edr_command_executor_shutdown_timeout(20u),
+               "shutdown returns within its bound while a worker is uncooperative");
+
   s_bulk_release = 1;
   wait_until(&s_bulk_done, "bulk task completes after release");
   EdrCommandExecutorHealth health;
   edr_command_executor_get_health(&health);
-  require_true(health.started && health.worker_count == 3u,
+  require_true(health.started && health.worker_count == 5u,
                "executor exposes bounded worker count");
+  require_true(health.lane_worker_count[EDR_COMMAND_LANE_CRITICAL] == 1u &&
+                   health.lane_worker_count[EDR_COMMAND_LANE_INTERACTIVE] == 1u &&
+                   health.lane_worker_count[EDR_COMMAND_LANE_BULK] == 2u &&
+                   health.lane_worker_count[EDR_COMMAND_LANE_SCAN] == 1u,
+               "executor reports configured workers for every lane");
   require_true(health.admission_reservations == 0u,
                "admission reservations are released after persistence window");
   require_true(health.lane_executed[EDR_COMMAND_LANE_CRITICAL] > 0u &&
-                   health.lane_executed[EDR_COMMAND_LANE_BULK] > 0u,
+                   health.lane_executed[EDR_COMMAND_LANE_BULK] > 0u &&
+                   health.lane_executed[EDR_COMMAND_LANE_SCAN] > 0u,
                "executor reports per-lane completion counters");
   require_true(health.queue_rejected_count >= 2u,
                "executor reports durable queue rejections");
 
-  edr_command_executor_shutdown();
+  require_true(edr_command_executor_shutdown_timeout(1000u),
+               "shutdown completes after the worker exits");
   printf("ok\n");
   return 0;
 }

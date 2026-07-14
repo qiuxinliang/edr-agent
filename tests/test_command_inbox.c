@@ -106,6 +106,41 @@ int main(void) {
   n = edr_command_state_collect_inbox(records, 4);
   require_true(n == 0, "delete inbox record");
 
+  char backlog_ids[20][64];
+  for (int i = 0; i < 18; i++) {
+    EdrSoarCommandMeta queued_meta = meta;
+    queued_meta.deadline_ms = 60u * 60u * 1000u;
+    snprintf(backlog_ids[i], sizeof(backlog_ids[i]), "cmd-backlog-%02d", i);
+    snprintf(queued_meta.idempotency_key, sizeof(queued_meta.idempotency_key),
+             "idem-backlog-%02d|sigv1|placeholder", i);
+    require_true(edr_command_state_store_inbox(backlog_ids[i], "velo_query",
+                                               payload, sizeof(payload) - 1u,
+                                               &queued_meta) == 0,
+                 "store bulk backlog record");
+  }
+  for (int i = 18; i < 20; i++) {
+    EdrSoarCommandMeta urgent_meta = meta;
+    urgent_meta.deadline_ms = (uint32_t)(i - 17) * 1000u;
+    snprintf(backlog_ids[i], sizeof(backlog_ids[i]), "zz-urgent-%d", i - 17);
+    snprintf(urgent_meta.idempotency_key, sizeof(urgent_meta.idempotency_key),
+             "idem-urgent-%d|sigv1|placeholder", i - 17);
+    require_true(edr_command_state_store_inbox(backlog_ids[i], "velo_query",
+                                               payload, sizeof(payload) - 1u,
+                                               &urgent_meta) == 0,
+                 "store deadline-sensitive backlog record");
+  }
+  n = edr_command_state_collect_inbox_filtered(records, 2, only_velo, NULL);
+  require_true(n == 2, "bounded inbox collection returns requested top-k");
+  require_true(strcmp(records[0].command_id, "zz-urgent-1") == 0 &&
+                   strcmp(records[1].command_id, "zz-urgent-2") == 0,
+               "deadline ordering scans the full backlog instead of filesystem prefix order");
+  for (int i = 0; i < n; i++) {
+    edr_command_state_free_inbox_record(&records[i]);
+  }
+  for (int i = 0; i < 20; i++) {
+    edr_command_state_delete_inbox(backlog_ids[i]);
+  }
+
   require_true(edr_command_state_store_inbox("cmd-inbox-final", "echo",
                                             payload, sizeof(payload) - 1u, &meta) == 0,
                "store final inbox");
@@ -206,7 +241,11 @@ int main(void) {
       found_escaped = 1;
       require_true(strcmp(result_pending[i].detail, escaped_detail) == 0,
                    "escaped detail survives durable JSON round trip");
-      edr_command_state_mark_report_rejected(&result_pending[i], "HTTP 400 INVALID_ARGUMENT");
+      if (edr_command_state_mark_report_rejected(&result_pending[i],
+                                                 "HTTP 400 INVALID_ARGUMENT") != 0) {
+        fprintf(stderr, "failed to persist rejected result state\n");
+        return 1;
+      }
     }
   }
   require_true(found_escaped, "escaped command result present in pending outbox");
@@ -215,6 +254,18 @@ int main(void) {
     require_true(strcmp(result_pending[i].command_id, "cmd-json-state") != 0,
                  "permanently rejected result is removed from retry outbox");
   }
+
+  EdrCommandStateRecord persistence_probe;
+  memset(&persistence_probe, 0, sizeof(persistence_probe));
+  snprintf(persistence_probe.command_id, sizeof(persistence_probe.command_id), "%s",
+           "cmd-report-persistence-probe");
+  snprintf(persistence_probe.command_type, sizeof(persistence_probe.command_type), "%s", "echo");
+  /* An existing directory is never a valid append target, while a missing
+   * parent is created intentionally by the production state writer. */
+  test_setenv("EDR_COMMAND_STATE_DB", state_dir);
+  require_true(edr_command_state_mark_reported(&persistence_probe) != 0,
+               "reported state fails closed when durable append fails");
+  test_setenv("EDR_COMMAND_STATE_DB", state_path);
 
   char corrupt_inbox_path[1024];
   snprintf(corrupt_inbox_path, sizeof(corrupt_inbox_path), "%s/corrupt-inbox.json", inbox_dir);

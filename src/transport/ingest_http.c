@@ -138,6 +138,8 @@ static unsigned long s_ws_message_fail;
 static unsigned long s_ws_pong;
 static unsigned long s_command_result_ok;
 static unsigned long s_command_result_fail;
+static int64_t s_command_result_last_success_ms;
+static int64_t s_command_result_last_failure_ms;
 static unsigned long s_upload_ok;
 static unsigned long s_upload_fail;
 static unsigned long s_long_poll_ok;
@@ -202,11 +204,19 @@ static unsigned long s_budget_tls_handshakes;
 static volatile int s_poll_backoff_ms;
 static volatile int s_ws_backoff_ms;
 static volatile int s_poll_run;
+#ifdef _WIN32
+static volatile LONG s_transfer_shutdown;
+#else
+static volatile int s_transfer_shutdown;
+#endif
 static int s_poll_started;
+static int s_poll_thread_created;
 static volatile int s_ws_ready;
 static volatile int s_stream_ready;
 static volatile int s_stream_verified;
 static int s_ws_started;
+static volatile int s_poll_thread_exited = 1;
+static volatile int s_ws_thread_exited = 1;
 static volatile int s_control_hello_ok;
 static int64_t s_control_hello_last_ms;
 static int64_t s_h2_stream_retry_after_ms;
@@ -270,9 +280,97 @@ static EdrHttpConn s_http_conn = {.fd = EDR_SOCKET_INVALID};
 #ifdef _WIN32
 static CRITICAL_SECTION s_http_mu;
 static int s_http_mu_init;
+static CRITICAL_SECTION s_runtime_mu;
+static volatile LONG s_runtime_mu_state;
 #else
 static pthread_mutex_t s_http_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_runtime_mu;
+static pthread_once_t s_runtime_mu_once = PTHREAD_ONCE_INIT;
+
+static void runtime_state_init(void) {
+  pthread_mutexattr_t attr;
+  (void)pthread_mutexattr_init(&attr);
+  (void)pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  (void)pthread_mutex_init(&s_runtime_mu, &attr);
+  (void)pthread_mutexattr_destroy(&attr);
+}
 #endif
+
+static void runtime_state_lock(void) {
+#ifdef _WIN32
+  LONG state = InterlockedCompareExchange(&s_runtime_mu_state, 1, 0);
+  if (state == 0) {
+    InitializeCriticalSection(&s_runtime_mu);
+    InterlockedExchange(&s_runtime_mu_state, 2);
+  } else {
+    while (InterlockedCompareExchange(&s_runtime_mu_state, 0, 0) == 1) {
+      Sleep(0);
+    }
+  }
+  EnterCriticalSection(&s_runtime_mu);
+#else
+  (void)pthread_once(&s_runtime_mu_once, runtime_state_init);
+  pthread_mutex_lock(&s_runtime_mu);
+#endif
+}
+
+static void runtime_state_unlock(void) {
+#ifdef _WIN32
+  LeaveCriticalSection(&s_runtime_mu);
+#else
+  pthread_mutex_unlock(&s_runtime_mu);
+#endif
+}
+
+static void runtime_string_set(char *dst, size_t cap, const char *value) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  runtime_state_lock();
+  snprintf(dst, cap, "%s", value ? value : "");
+  runtime_state_unlock();
+}
+
+static int runtime_string_empty(const char *src) {
+  int empty;
+  runtime_state_lock();
+  empty = !src || src[0] == '\0';
+  runtime_state_unlock();
+  return empty;
+}
+
+static void runtime_string_copy(char *dst, size_t cap, const char *src) {
+  if (!dst || cap == 0u) {
+    return;
+  }
+  runtime_state_lock();
+  snprintf(dst, cap, "%s", src ? src : "");
+  runtime_state_unlock();
+}
+
+static void runtime_int_set(volatile int *dst, int value) {
+  if (!dst) {
+    return;
+  }
+  runtime_state_lock();
+  *dst = value;
+  runtime_state_unlock();
+}
+
+static int runtime_int_get(const volatile int *src) {
+  int value;
+  runtime_state_lock();
+  value = src ? *src : 0;
+  runtime_state_unlock();
+  return value;
+}
+
+static void runtime_stream_state_set(int verified, int ready) {
+  runtime_state_lock();
+  s_stream_verified = verified ? 1 : 0;
+  s_stream_ready = ready ? 1 : 0;
+  runtime_state_unlock();
+}
 
 static int64_t unix_ms_now(void) {
   return (int64_t)time(NULL) * 1000LL;
@@ -357,7 +455,9 @@ static const char *env_str_default(const char *name, const char *fallback) {
 
 static int http2_client_enabled(void) {
 #ifdef EDR_HAVE_CURL_HTTP2
+  runtime_state_lock();
   int enabled = (s_http2_enabled_cfg || s_http2_required_cfg) ? 1 : 0;
+  runtime_state_unlock();
   if (env_present("EDR_DATA_PLANE_HTTP2")) {
     enabled = env_bool_default("EDR_DATA_PLANE_HTTP2", enabled);
   }
@@ -374,7 +474,10 @@ static int http2_client_enabled(void) {
 }
 
 static int http2_required(void) {
-  return s_http2_required_cfg || env_bool_default("EDR_HTTP2_REQUIRE", 0);
+  runtime_state_lock();
+  int required = s_http2_required_cfg || env_bool_default("EDR_HTTP2_REQUIRE", 0);
+  runtime_state_unlock();
+  return required;
 }
 
 static int curl_ssl_backend_is_schannel(void) {
@@ -591,8 +694,9 @@ static unsigned backpressure_sampling_cap_pct(void) {
 }
 
 static void apply_effective_preprocess_sampling(void) {
+  unsigned effective;
+  runtime_state_lock();
   unsigned requested = s_control_sampling_pct;
-  unsigned effective = requested;
   if (requested > 100u) {
     requested = 100u;
   }
@@ -607,10 +711,11 @@ static void apply_effective_preprocess_sampling(void) {
     }
   }
   s_effective_sampling_pct = effective;
+  runtime_state_unlock();
   edr_preprocess_apply_sampling_pct(effective);
 }
 
-static void budget_refresh_window(void) {
+static void budget_refresh_window_locked(void) {
   int64_t minute = unix_ms_now() / 60000LL;
   if (minute != s_budget_window_minute) {
     s_budget_window_minute = minute;
@@ -624,7 +729,9 @@ static int comm_budget_try(size_t bytes, int tls_handshake) {
   unsigned long req_lim;
   uint64_t byte_lim;
   unsigned long tls_lim;
-  budget_refresh_window();
+  int exceeded = 0;
+  runtime_state_lock();
+  budget_refresh_window_locked();
   req_lim = request_limit_per_minute();
   byte_lim = byte_limit_per_minute();
   tls_lim = tls_handshake_limit_per_minute();
@@ -634,29 +741,41 @@ static int comm_budget_try(size_t bytes, int tls_handshake) {
     s_budget_drop_count++;
     snprintf(s_last_error, sizeof(s_last_error), "%s", "communication budget exceeded");
     s_last_failure_ms = unix_ms_now();
-    comm_open_circuit(s_last_error);
-    return 0;
+    exceeded = 1;
+  } else {
+    s_budget_requests++;
+    s_budget_bytes += (uint64_t)bytes;
+    if (tls_handshake) {
+      s_budget_tls_handshakes++;
+    }
   }
-  s_budget_requests++;
-  s_budget_bytes += (uint64_t)bytes;
-  if (tls_handshake) {
-    s_budget_tls_handshakes++;
+  runtime_state_unlock();
+  if (exceeded) {
+    comm_open_circuit("communication budget exceeded");
+    return 0;
   }
   return 1;
 }
 
 static int comm_tls_handshake_budget_try(void) {
   unsigned long tls_lim;
-  budget_refresh_window();
+  int exceeded = 0;
+  runtime_state_lock();
+  budget_refresh_window_locked();
   tls_lim = tls_handshake_limit_per_minute();
   if (s_budget_tls_handshakes + 1ul > tls_lim) {
     s_budget_drop_count++;
     snprintf(s_last_error, sizeof(s_last_error), "%s", "tls handshake budget exceeded");
     s_last_failure_ms = unix_ms_now();
-    comm_open_circuit(s_last_error);
+    exceeded = 1;
+  } else {
+    s_budget_tls_handshakes++;
+  }
+  runtime_state_unlock();
+  if (exceeded) {
+    comm_open_circuit("tls handshake budget exceeded");
     return 0;
   }
-  s_budget_tls_handshakes++;
   return 1;
 }
 
@@ -672,15 +791,20 @@ static int failure_should_open_circuit(const char *msg) {
 
 static void comm_open_circuit(const char *reason) {
   int sec = (int)env_ul_clamped("EDR_HTTP_CIRCUIT_OPEN_S", 60ul, 10ul, 3600ul);
+  runtime_state_lock();
   s_circuit_open = 1;
   s_circuit_until_ms = unix_ms_now() + (int64_t)sec * 1000LL;
   snprintf(s_circuit_reason, sizeof(s_circuit_reason), "%s", reason ? reason : "transport failures");
+  runtime_state_unlock();
   apply_effective_preprocess_sampling();
 }
 
 int edr_ingest_http_circuit_open(void) {
   int64_t now;
+  int closed = 0;
+  runtime_state_lock();
   if (!s_circuit_open) {
+    runtime_state_unlock();
     return 0;
   }
   now = unix_ms_now();
@@ -689,10 +813,14 @@ int edr_ingest_http_circuit_open(void) {
     s_circuit_until_ms = 0;
     s_circuit_reason[0] = '\0';
     s_consecutive_failures = 0;
-    apply_effective_preprocess_sampling();
-    return 0;
+    closed = 1;
   }
-  return 1;
+  int open = s_circuit_open ? 1 : 0;
+  runtime_state_unlock();
+  if (closed) {
+    apply_effective_preprocess_sampling();
+  }
+  return open;
 }
 
 static int comm_circuit_allows(void) {
@@ -701,12 +829,15 @@ static int comm_circuit_allows(void) {
     return 1;
   }
   now = unix_ms_now();
+  runtime_state_lock();
   snprintf(s_last_error, sizeof(s_last_error), "circuit open: %s", s_circuit_reason);
   s_last_failure_ms = now;
+  runtime_state_unlock();
   return 0;
 }
 
 static void runtime_success(void) {
+  runtime_state_lock();
   s_http_ok++;
   s_last_success_ms = unix_ms_now();
   s_last_error[0] = '\0';
@@ -714,76 +845,111 @@ static void runtime_success(void) {
   s_circuit_open = 0;
   s_circuit_until_ms = 0;
   s_circuit_reason[0] = '\0';
+  runtime_state_unlock();
   apply_effective_preprocess_sampling();
 }
 
 static void runtime_failure(const char *msg) {
   unsigned threshold;
+  int open_circuit = 0;
+  runtime_state_lock();
   s_http_fail++;
   s_last_failure_ms = unix_ms_now();
   snprintf(s_last_error, sizeof(s_last_error), "%s", msg ? msg : "");
   s_consecutive_failures++;
   threshold = (unsigned)env_ul_clamped("EDR_HTTP_CIRCUIT_FAILURES", 3ul, 1ul, 100ul);
   if (!s_circuit_open && s_consecutive_failures >= threshold && failure_should_open_circuit(msg)) {
+    open_circuit = 1;
+  }
+  runtime_state_unlock();
+  if (open_circuit) {
     comm_open_circuit(msg);
   }
 }
 
 static void note_http_request_success(void) {
+  runtime_state_lock();
   s_http_request_ok++;
+  runtime_state_unlock();
   runtime_success();
 }
 
 static void note_http_request_failure(void) {
+  runtime_state_lock();
   s_http_request_fail++;
+  runtime_state_unlock();
 }
 
 static void note_ws_message_success(void) {
+  runtime_state_lock();
   s_ws_message_ok++;
+  runtime_state_unlock();
   runtime_success();
 }
 
 static void note_ws_message_failure(const char *msg) {
+  runtime_state_lock();
   s_ws_message_fail++;
+  runtime_state_unlock();
   runtime_failure(msg);
 }
 
 static void note_command_result_success(void) {
+  runtime_state_lock();
   s_command_result_ok++;
+  s_command_result_last_success_ms = unix_ms_now();
+  runtime_state_unlock();
 }
 
 static void note_command_result_failure(void) {
+  runtime_state_lock();
   s_command_result_fail++;
+  s_command_result_last_failure_ms = unix_ms_now();
+  runtime_state_unlock();
 }
 
 static void note_upload_success(void) {
+  runtime_state_lock();
   s_upload_ok++;
+  runtime_state_unlock();
 }
 
 static void note_upload_failure(void) {
+  runtime_state_lock();
   s_upload_fail++;
+  runtime_state_unlock();
 }
 
 static void note_long_poll_success(void) {
+  runtime_state_lock();
   s_long_poll_ok++;
   s_long_poll_last_success_ms = unix_ms_now();
+  runtime_state_unlock();
 }
 
 static void note_long_poll_failure(void) {
+  runtime_state_lock();
   s_long_poll_fail++;
   s_long_poll_last_failure_ms = unix_ms_now();
+  runtime_state_unlock();
 }
 
 static void note_control_stream_success(void) {
+  runtime_state_lock();
   s_control_stream_ok++;
+  runtime_state_unlock();
 }
 
 static void note_control_stream_failure(void) {
+  runtime_state_lock();
   s_control_stream_fail++;
+  runtime_state_unlock();
 }
 
 static void note_control_stream_heartbeat(void) {
+  runtime_state_lock();
   s_control_stream_heartbeat++;
+  runtime_state_unlock();
 }
 
 static int64_t control_stream_lease_ms(void) {
@@ -791,27 +957,37 @@ static int64_t control_stream_lease_ms(void) {
 }
 
 static void note_control_stream_activity(void) {
+  int restored = 0;
+  runtime_state_lock();
   s_control_stream_last_activity_ms = unix_ms_now();
   if (s_stream_verified && !s_stream_ready) {
     s_stream_ready = 1;
     snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connected");
+    restored = 1;
+  }
+  runtime_state_unlock();
+  if (restored) {
     fprintf(stderr, "[ingest-stream] control stream lease restored endpoint=%s\n", s_endpoint);
   }
 }
 
 static int control_stream_ready_lease_valid(void) {
+  runtime_state_lock();
   if (!s_stream_ready) {
+    runtime_state_unlock();
     return 0;
   }
   int64_t now = unix_ms_now();
   int64_t last = s_control_stream_last_activity_ms;
   int64_t lease_ms = control_stream_lease_ms();
   if (last > 0 && now >= last && now - last <= lease_ms) {
+    runtime_state_unlock();
     return 1;
   }
   s_stream_ready = 0;
   s_control_stream_lease_expired++;
   snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "lease_expired");
+  runtime_state_unlock();
   fprintf(stderr,
           "[ingest-stream] control stream lease expired endpoint=%s last_activity=%lld lease_ms=%lld; "
           "long-poll fallback may resume\n",
@@ -820,35 +996,46 @@ static int control_stream_ready_lease_valid(void) {
 }
 
 static void note_control_ack_success(const char *command_id) {
+  runtime_state_lock();
   s_control_ack_ok++;
   s_last_command_ack_ms = unix_ms_now();
   snprintf(s_last_command_ack_id, sizeof(s_last_command_ack_id), "%s", command_id ? command_id : "");
+  runtime_state_unlock();
 }
 
 static void note_control_ack_failure(const char *command_id) {
+  runtime_state_lock();
   s_control_ack_fail++;
   s_last_command_ack_failure_ms = unix_ms_now();
   snprintf(s_last_command_ack_failure_id, sizeof(s_last_command_ack_failure_id), "%s",
            command_id ? command_id : "");
+  runtime_state_unlock();
 }
 
 static void log_native_post_failure(const char *label, int rc) {
   int64_t now = unix_ms_now();
+  char rest[sizeof(s_rest)];
+  char error[sizeof(s_last_error)];
+  runtime_state_lock();
   if (s_native_post_fail_log_until_ms > now) {
     s_native_post_fail_log_suppressed++;
+    runtime_state_unlock();
     return;
   }
   unsigned long suppressed = s_native_post_fail_log_suppressed;
   s_native_post_fail_log_suppressed = 0;
   s_native_post_fail_log_until_ms =
       now + (int64_t)env_ul_clamped("EDR_HTTP_FAILURE_LOG_INTERVAL_MS", 60000ul, 1000ul, 600000ul);
+  snprintf(rest, sizeof(rest), "%s", s_rest);
+  snprintf(error, sizeof(error), "%s", s_last_error);
+  runtime_state_unlock();
   if (suppressed > 0ul) {
     fprintf(stderr, "[ingest-http] %s native post failed rc=%d (rest=%s err=%s suppressed=%lu)\n",
-            label ? label : "request", rc, s_rest, s_last_error, suppressed);
+            label ? label : "request", rc, rest, error, suppressed);
     return;
   }
   fprintf(stderr, "[ingest-http] %s native post failed rc=%d (rest=%s err=%s)\n",
-          label ? label : "request", rc, s_rest, s_last_error);
+          label ? label : "request", rc, rest, error);
 }
 
 static void ws_mu_init_once(void) {
@@ -941,6 +1128,7 @@ static void copy_base_url(char *dst, size_t cap, const char *url) {
 }
 
 static void route_seed_initial(const char *base) {
+  runtime_state_lock();
   memset(s_route_bases, 0, sizeof(s_route_bases));
   s_route_count = 0;
   s_route_active = 0;
@@ -952,36 +1140,47 @@ static void route_seed_initial(const char *base) {
     copy_base_url(s_route_bases[0], sizeof(s_route_bases[0]), base);
     s_route_count = s_route_bases[0][0] ? 1 : 0;
   }
+  runtime_state_unlock();
 }
 
 static int route_base_exists(const char *base) {
   int i;
+  runtime_state_lock();
   if (!base || !base[0]) {
+    runtime_state_unlock();
     return 1;
   }
   for (i = 0; i < s_route_count; i++) {
     if (strcmp(s_route_bases[i], base) == 0) {
+      runtime_state_unlock();
       return 1;
     }
   }
+  runtime_state_unlock();
   return 0;
 }
 
 static void route_add_base(const char *base) {
   char normalized[512];
+  runtime_state_lock();
   if (s_route_count >= (int)(sizeof(s_route_bases) / sizeof(s_route_bases[0]))) {
+    runtime_state_unlock();
     return;
   }
   copy_base_url(normalized, sizeof(normalized), base);
   if (!normalized[0] || route_base_exists(normalized)) {
+    runtime_state_unlock();
     return;
   }
   snprintf(s_route_bases[s_route_count], sizeof(s_route_bases[s_route_count]), "%s", normalized);
   s_route_count++;
+  runtime_state_unlock();
 }
 
 static void route_apply_active(void) {
+  runtime_state_lock();
   if (s_route_count <= 0) {
+    runtime_state_unlock();
     return;
   }
   if (s_route_active < 0 || s_route_active >= s_route_count) {
@@ -990,16 +1189,23 @@ static void route_apply_active(void) {
   if (s_route_bases[s_route_active][0]) {
     copy_base_url(s_rest, sizeof(s_rest), s_route_bases[s_route_active]);
   }
+  runtime_state_unlock();
 }
 
 static int route_failover_next(const char *reason) {
   int64_t now;
+  int route_active;
+  int route_count;
+  char rest[sizeof(s_rest)];
+  runtime_state_lock();
   if (s_route_count <= 1) {
+    runtime_state_unlock();
     return 0;
   }
   now = unix_ms_now();
   if (s_route_last_failover_ms > 0 &&
       now - s_route_last_failover_ms < s_route_failover_cooldown_ms) {
+    runtime_state_unlock();
     return 0;
   }
   s_route_active = (s_route_active + 1) % s_route_count;
@@ -1008,33 +1214,45 @@ static int route_failover_next(const char *reason) {
   s_route_last_failover_ms = now;
   s_route_failover_count++;
   s_control_hello_ok = 0;
+  route_active = s_route_active;
+  route_count = s_route_count;
+  snprintf(rest, sizeof(rest), "%s", s_rest);
+  runtime_state_unlock();
   http_lock();
   http_conn_close_locked();
   http_unlock();
   fprintf(stderr, "[route] switched active region route=%d/%d base=%s reason=%s\n",
-          s_route_active + 1, s_route_count, s_rest, reason ? reason : "failover");
+          route_active + 1, route_count, rest, reason ? reason : "failover");
   return 1;
 }
 
 static int route_note_failure(const char *reason) {
+  int should_failover;
+  runtime_state_lock();
   s_route_failures++;
-  if (s_route_failures >= s_route_failover_after) {
+  should_failover = s_route_failures >= s_route_failover_after;
+  runtime_state_unlock();
+  if (should_failover) {
     return route_failover_next(reason);
   }
   return 0;
 }
 
 static void route_note_success(void) {
+  runtime_state_lock();
   s_route_failures = 0;
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_configure_request_signing(const EdrRequestSigningConfig *cfg) {
+  runtime_state_lock();
   memset(&s_request_signing, 0, sizeof(s_request_signing));
   if (cfg) {
     s_request_signing.enabled = cfg->enabled ? 1 : 0;
     snprintf(s_request_signing.key_id, sizeof(s_request_signing.key_id), "%s", cfg->key_id);
     snprintf(s_request_signing.secret, sizeof(s_request_signing.secret), "%s", cfg->secret);
   }
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
@@ -1048,6 +1266,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   const char *relay_effective = getenv("EDR_RELAY_URL");
   const char *proxy_mode_effective = getenv("EDR_PROXY_MODE");
   const char *proxy_url_effective = getenv("EDR_PROXY_URL");
+  runtime_state_lock();
   memset(s_rest, 0, sizeof(s_rest));
   memset(s_tenant, 0, sizeof(s_tenant));
   memset(s_user, 0, sizeof(s_user));
@@ -1174,15 +1393,21 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   s_long_poll_fallback_cfg = env_bool_default("EDR_CONTROL_LONG_POLL_FALLBACK", 1);
   s_report_events_v2_enabled_cfg = env_bool_default("EDR_REPORT_EVENTS_V2", 1);
   s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
+  runtime_state_unlock();
 }
 
-int edr_ingest_http_configured(void) { return s_rest[0] != 0 && s_endpoint[0] != 0; }
+int edr_ingest_http_configured(void) {
+  runtime_state_lock();
+  int configured = s_rest[0] != 0 && s_endpoint[0] != 0;
+  runtime_state_unlock();
+  return configured;
+}
 
 void edr_ingest_http_get_rest_base(char *out, size_t cap) {
   if (!out || cap == 0) {
     return;
   }
-  snprintf(out, cap, "%s", s_rest);
+  runtime_string_copy(out, cap, s_rest);
 }
 
 void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_required,
@@ -1191,6 +1416,7 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
                                                  int report_events_v2_enabled,
                                                  const char *data_plane_encoding,
                                                  const char *data_plane_compression) {
+  runtime_state_lock();
   s_http2_enabled_cfg = http2_enabled ? 1 : 0;
   s_http2_required_cfg = http2_required ? 1 : 0;
   s_control_stream_enabled_cfg = control_stream_enabled ? 1 : 0;
@@ -1205,12 +1431,14 @@ void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_re
   }
   s_control_zstd = strcmp(s_data_plane_compression, "zstd") == 0 ? 1 : s_control_zstd;
   log_transport_capabilities_once();
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required,
                                            int control_stream_enabled,
                                            int long_poll_fallback,
                                            int report_events_v2_enabled) {
+  runtime_state_lock();
   if (http2_enabled >= 0) {
     s_http2_enabled_cfg = http2_enabled ? 1 : 0;
   }
@@ -1227,6 +1455,7 @@ void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required
     s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
   }
   s_control_h2 = http2_client_enabled();
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
@@ -1234,8 +1463,9 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
     return;
   }
   int stream_lease_valid = control_stream_ready_lease_valid();
-  int64_t stream_last_activity_ms = s_control_stream_last_activity_ms;
   control_ack_refresh_pending_runtime();
+  runtime_state_lock();
+  int64_t stream_last_activity_ms = s_control_stream_last_activity_ms;
   memset(out, 0, sizeof(*out));
   out->configured = edr_ingest_http_configured();
   out->http_fallback_available = out->configured;
@@ -1288,6 +1518,11 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->ws_pong_count = s_ws_pong;
   out->command_result_ok_count = s_command_result_ok;
   out->command_result_fail_count = s_command_result_fail;
+  out->command_result_last_success_unix_ms = s_command_result_last_success_ms;
+  out->command_result_last_failure_unix_ms = s_command_result_last_failure_ms;
+  out->command_result_last_error_retryable = s_last_command_result_retryable;
+  snprintf(out->command_result_last_error, sizeof(out->command_result_last_error), "%s",
+           s_last_command_result_error);
   out->upload_ok_count = s_upload_ok;
   out->upload_fail_count = s_upload_fail;
   out->long_poll_ok_count = s_long_poll_ok;
@@ -1375,7 +1610,7 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->zstd_raw_bytes = s_zstd_raw_bytes;
   out->zstd_wire_bytes = s_zstd_wire_bytes;
   out->zstd_dict_bytes = s_zstd_dict_bytes;
-  budget_refresh_window();
+  budget_refresh_window_locked();
   out->requests_this_minute = s_budget_requests;
   out->request_limit_per_minute = request_limit_per_minute();
   out->bytes_this_minute = s_budget_bytes;
@@ -1386,26 +1621,33 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
     unsigned long total = s_http_ok + s_http_fail;
     out->slo_success_rate_pct = total ? (unsigned int)((s_http_ok * 100ul) / total) : 100u;
   }
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_set_policy_version(const char *policy_version) {
+  runtime_state_lock();
   memset(s_policy_version, 0, sizeof(s_policy_version));
   if (policy_version && policy_version[0]) {
     snprintf(s_policy_version, sizeof(s_policy_version), "%s", policy_version);
   }
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_copy_policy_version(char *out, size_t out_cap) {
   if (!out || out_cap == 0u) {
     return;
   }
+  runtime_state_lock();
   snprintf(out, out_cap, "%s", s_policy_version[0] ? s_policy_version : "local");
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *schema_ver,
                                              const char *profile_id, int h2, int zstd,
                                              const char *qos_dscp, unsigned sampling_pct,
                                              const char *threshold, int backpressure_enabled) {
+  unsigned applied_sampling;
+  runtime_state_lock();
   if (dict_ver && dict_ver[0]) {
     snprintf(s_control_dict_ver, sizeof(s_control_dict_ver), "%s", dict_ver);
   }
@@ -1438,8 +1680,10 @@ void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *s
   }
   s_control_hello_ok = 1;
   s_control_hello_last_ms = unix_ms_now();
+  applied_sampling = s_control_sampling_pct;
+  runtime_state_unlock();
   edr_transport_v2_apply_profile(dict_ver, schema_ver, profile_id, h2, zstd, qos_dscp,
-                                 s_control_sampling_pct, threshold, backpressure_enabled);
+                                 applied_sampling, threshold, backpressure_enabled);
   apply_effective_preprocess_sampling();
 }
 
@@ -1616,12 +1860,16 @@ static int ci_equals(const char *a, const char *b) {
 }
 
 static int report_events_v2_should_use(void) {
+  runtime_state_lock();
   if (!s_report_events_v2_enabled_cfg) {
+    runtime_state_unlock();
     return 0;
   }
   if (ci_equals(s_data_plane_encoding, "json")) {
+    runtime_state_unlock();
     return 0;
   }
+  runtime_state_unlock();
   return 1;
 }
 
@@ -1670,7 +1918,9 @@ static int zstd_read_dict_file(const char *path, uint8_t **out, size_t *out_len)
 
 static void zstd_load_dict_once(void) {
   const char *path;
+  runtime_state_lock();
   if (s_zstd_dict_load_attempted) {
+    runtime_state_unlock();
     return;
   }
   s_zstd_dict_load_attempted = 1;
@@ -1679,6 +1929,7 @@ static void zstd_load_dict_once(void) {
     path = getenv("EDR_CONTROL_DICT_PATH");
   }
   if (!path || !path[0]) {
+    runtime_state_unlock();
     return;
   }
   snprintf(s_zstd_dict_path, sizeof(s_zstd_dict_path), "%s", path);
@@ -1686,11 +1937,15 @@ static void zstd_load_dict_once(void) {
     s_zstd_dict_loaded = 1;
     s_zstd_dict_bytes = (uint64_t)s_zstd_dict_len;
   }
+  runtime_state_unlock();
 }
 #endif
 
 static int zstd_requested_for_data_plane(void) {
-  return ci_equals(s_data_plane_compression, "zstd") || s_control_zstd;
+  runtime_state_lock();
+  int requested = ci_equals(s_data_plane_compression, "zstd") || s_control_zstd;
+  runtime_state_unlock();
+  return requested;
 }
 
 static int maybe_zstd_compress_payload(const uint8_t *raw, size_t raw_len,
@@ -1716,13 +1971,17 @@ static int maybe_zstd_compress_payload(const uint8_t *raw, size_t raw_len,
     bound = ZSTD_compressBound(raw_len);
     dst = (uint8_t *)malloc(bound);
     if (!dst) {
+      runtime_state_lock();
       s_zstd_compress_fail++;
+      runtime_state_unlock();
       return 0;
     }
     cctx = ZSTD_createCCtx();
     if (!cctx) {
       free(dst);
+      runtime_state_lock();
       s_zstd_compress_fail++;
+      runtime_state_unlock();
       return 0;
     }
     if (s_zstd_dict && s_zstd_dict_len > 0u) {
@@ -1734,19 +1993,25 @@ static int maybe_zstd_compress_payload(const uint8_t *raw, size_t raw_len,
     ZSTD_freeCCtx(cctx);
     if (ZSTD_isError(n)) {
       free(dst);
+      runtime_state_lock();
       s_zstd_compress_fail++;
+      runtime_state_unlock();
       return 0;
     }
     *out = dst;
     *out_len = n;
     *codec = "zstd";
+    runtime_state_lock();
     s_zstd_compress_ok++;
     s_zstd_raw_bytes += (uint64_t)raw_len;
     s_zstd_wire_bytes += (uint64_t)n;
+    runtime_state_unlock();
     return 0;
   }
 #else
+  runtime_state_lock();
   s_zstd_compress_fail++;
+  runtime_state_unlock();
   return 0;
 #endif
 }
@@ -2059,12 +2324,14 @@ static int ascii_contains_ci(const char *s, const char *needle) {
 }
 
 static void set_proxy_status(const char *status, const char *active_url) {
+  runtime_state_lock();
   snprintf(s_proxy_status, sizeof(s_proxy_status), "%s", status ? status : "");
   if (active_url && active_url[0]) {
     snprintf(s_proxy_url_active, sizeof(s_proxy_url_active), "%s", active_url);
   } else {
     s_proxy_url_active[0] = '\0';
   }
+  runtime_state_unlock();
 }
 
 static int host_suffix_match_ci(const char *host, const char *suffix) {
@@ -3245,6 +3512,40 @@ static int native_post_json(const char *url, const char *body, size_t body_len) 
 }
 
 #ifdef EDR_HAVE_CURL_HTTP2
+static int curl_transfer_cancelled(void) {
+#ifdef _WIN32
+  return InterlockedCompareExchange(&s_transfer_shutdown, 0, 0) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+  return __atomic_load_n(&s_transfer_shutdown, __ATOMIC_ACQUIRE) != 0;
+#else
+  return s_transfer_shutdown != 0;
+#endif
+}
+
+#if LIBCURL_VERSION_NUM >= 0x072000
+static int curl_transfer_progress(void *unused, curl_off_t download_total,
+                                  curl_off_t download_now, curl_off_t upload_total,
+                                  curl_off_t upload_now) {
+  (void)unused;
+  (void)download_total;
+  (void)download_now;
+  (void)upload_total;
+  (void)upload_now;
+  return curl_transfer_cancelled();
+}
+#else
+static int curl_transfer_progress(void *unused, double download_total,
+                                  double download_now, double upload_total,
+                                  double upload_now) {
+  (void)unused;
+  (void)download_total;
+  (void)download_now;
+  (void)upload_total;
+  (void)upload_now;
+  return curl_transfer_cancelled();
+}
+#endif
+
 typedef struct {
   char *buf;
   size_t cap;
@@ -3315,10 +3616,16 @@ static int h2_cert_problem_retry_cooldown_ms(void) {
 
 static void note_http2_cert_problem(void) {
   int cooldown = h2_cert_problem_retry_cooldown_ms();
+  int should_warn = 0;
+  runtime_state_lock();
   s_http2_cert_error_count++;
   s_http2_cert_problem_retry_after_ms = unix_ms_now() + (int64_t)cooldown;
   if (!s_http2_cert_problem_warned) {
     s_http2_cert_problem_warned = 1;
+    should_warn = 1;
+  }
+  runtime_state_unlock();
+  if (should_warn) {
     if (http2_required()) {
       fprintf(stderr,
               "[transport] HTTP/2 TLS certificate verification failed; "
@@ -3337,6 +3644,7 @@ static void note_http2_cert_problem(void) {
 
 static void note_http2_failure_reason(const char *op, CURLcode result, long http_status,
                                       int h2, const char *err) {
+  runtime_state_lock();
   s_last_failure_ms = unix_ms_now();
   snprintf(s_http2_last_error, sizeof(s_http2_last_error),
            "http2 %s failed: curl=%d(%s) status=%ld negotiated_h2=%d err=%s",
@@ -3346,6 +3654,7 @@ static void note_http2_failure_reason(const char *op, CURLcode result, long http
            http_status,
            h2 ? 1 : 0,
            err && err[0] ? err : "-");
+  runtime_state_unlock();
 }
 
 static void curl_multi_sync_init(void) {
@@ -3407,12 +3716,16 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
   ok = result == CURLE_OK && job->response_code >= 200 && job->response_code < 300 &&
        (!job->stream_ctx || !job->stream_ctx->failed) && (job->h2 || !http2_required());
   job->status = ok ? 0 : -1;
+  runtime_state_lock();
   if (ok) {
     s_http2_request_ok++;
     s_http2_multiplex_ok++;
   } else {
     s_http2_request_fail++;
     s_http2_multiplex_fail++;
+  }
+  runtime_state_unlock();
+  if (!ok) {
     note_http2_failure_reason(job->stream_ctx ? "stream-multiplex" : "request-multiplex",
                               result, job->response_code, job->h2, NULL);
     if (curl_result_is_tls_cert_problem(result)) {
@@ -3428,7 +3741,9 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
   if (s_curl_multi_active_count > 0u) {
     s_curl_multi_active_count--;
   }
+  runtime_state_lock();
   s_http2_multiplex_active = s_curl_multi_active_count > 0u ? 1 : 0;
+  runtime_state_unlock();
   job->done = 1;
   curl_multi_signal();
   curl_multi_unlock();
@@ -3446,7 +3761,9 @@ static void *curl_multi_worker_main(void *arg)
     EdrCurlMultiJob *pending;
     curl_multi_lock();
     while (!s_curl_multi_pending_head && s_curl_multi_active_count == 0u) {
+      runtime_state_lock();
       s_http2_multiplex_active = 0;
+      runtime_state_unlock();
       curl_multi_wait_cv();
     }
     pending = s_curl_multi_pending_head;
@@ -3460,7 +3777,9 @@ static void *curl_multi_worker_main(void *arg)
       if (curl_multi_add_handle(s_curl_multi, pending->easy) == CURLM_OK) {
         curl_multi_lock();
         s_curl_multi_active_count++;
+        runtime_state_lock();
         s_http2_multiplex_active = 1;
+        runtime_state_unlock();
         curl_multi_unlock();
       } else {
         curl_multi_complete_job(NULL, pending, CURLE_FAILED_INIT);
@@ -3692,6 +4011,14 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
   curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+#if LIBCURL_VERSION_NUM >= 0x072000
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_transfer_progress);
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, NULL);
+#else
+  curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, curl_transfer_progress);
+  curl_easy_setopt(curl, CURLOPT_PROGRESSDATA, NULL);
+#endif
   if (timeout_s > 0) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
   }
@@ -3713,13 +4040,21 @@ static void curl_apply_common_options_ex(CURL *curl, const char *url, struct cur
     char selector[512];
     if (build_schannel_cert_selector(selector, sizeof(selector))) {
       curl_easy_setopt(curl, CURLOPT_SSLCERT, selector);
-    } else if (s_client_cert_file[0] && s_client_key_file[0] && !s_schannel_pem_warned) {
-      s_schannel_pem_warned = 1;
-      snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "schannel_needs_store_cert");
-      fprintf(stderr,
-              "[transport] Schannel libcurl cannot use PEM client_cert/client_key reliably; "
-              "import client cert with private key into Windows cert store and set "
-              "client_cert_thumbprint/client_cert_store, or use OpenSSL libcurl\n");
+    } else if (s_client_cert_file[0] && s_client_key_file[0]) {
+      int warn = 0;
+      runtime_state_lock();
+      if (!s_schannel_pem_warned) {
+        s_schannel_pem_warned = 1;
+        snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "schannel_needs_store_cert");
+        warn = 1;
+      }
+      runtime_state_unlock();
+      if (warn) {
+        fprintf(stderr,
+                "[transport] Schannel libcurl cannot use PEM client_cert/client_key reliably; "
+                "import client cert with private key into Windows cert store and set "
+                "client_cert_thumbprint/client_cert_store, or use OpenSSL libcurl\n");
+      }
     }
   } else if (s_client_cert_file[0] && s_client_key_file[0]) {
     curl_easy_setopt(curl, CURLOPT_SSLCERT, s_client_cert_file);
@@ -3744,15 +4079,25 @@ static int curl_note_http_version(CURL *curl) {
   if (curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &version) == CURLE_OK) {
 #ifdef CURL_HTTP_VERSION_2_0
     if (version == CURL_HTTP_VERSION_2_0) {
+      int log_h2 = 0;
+      char stream_status[sizeof(s_control_stream_status)];
+      char endpoint[sizeof(s_endpoint)];
+      runtime_state_lock();
       s_http2_negotiated = 1;
       s_http2_negotiated_count++;
       s_http2_last_error[0] = '\0';
       snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "h2");
       if (s_alpn_log_state != 1) {
         s_alpn_log_state = 1;
+        log_h2 = 1;
+      }
+      snprintf(stream_status, sizeof(stream_status), "%s",
+               s_control_stream_status[0] ? s_control_stream_status : "idle");
+      snprintf(endpoint, sizeof(endpoint), "%s", s_endpoint[0] ? s_endpoint : "-");
+      runtime_state_unlock();
+      if (log_h2) {
         fprintf(stderr, "[transport] ALPN negotiated h2 control_stream_status=%s endpoint=%s\n",
-                s_control_stream_status[0] ? s_control_stream_status : "idle",
-                s_endpoint[0] ? s_endpoint : "-");
+                stream_status, endpoint);
       }
       return 1;
     }
@@ -3761,19 +4106,30 @@ static int curl_note_http_version(CURL *curl) {
 #else
   (void)curl;
 #endif
+  int log_fallback = 0;
+  unsigned long fallback_count;
+  char protocol[sizeof(s_negotiated_protocol)];
+  char stream_status[sizeof(s_control_stream_status)];
+  runtime_state_lock();
   s_http2_fallback_count++;
   if (!s_negotiated_protocol[0]) {
     snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
   }
   if (s_alpn_log_state != 2) {
     s_alpn_log_state = 2;
+    log_fallback = 1;
+  }
+  fallback_count = s_http2_fallback_count;
+  snprintf(protocol, sizeof(protocol), "%s",
+           s_negotiated_protocol[0] ? s_negotiated_protocol : "http/1.1");
+  snprintf(stream_status, sizeof(stream_status), "%s",
+           s_control_stream_status[0] ? s_control_stream_status : "idle");
+  runtime_state_unlock();
+  if (log_fallback) {
     fprintf(stderr,
             "[transport] ALPN did not negotiate h2; negotiated_protocol=%s "
             "http2_required=%d control_stream_status=%s fallback_count=%lu\n",
-            s_negotiated_protocol[0] ? s_negotiated_protocol : "http/1.1",
-            http2_required(),
-            s_control_stream_status[0] ? s_control_stream_status : "idle",
-            s_http2_fallback_count);
+            protocol, http2_required(), stream_status, fallback_count);
   }
   return 0;
 }
@@ -3862,10 +4218,14 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 &&
       (h2 || !http2_required())) {
+    runtime_state_lock();
     s_http2_request_ok++;
+    runtime_state_unlock();
     return 0;
   }
+  runtime_state_lock();
   s_http2_request_fail++;
+  runtime_state_unlock();
   note_http2_failure_reason(method ? method : "request", cc, code, h2, errbuf);
   if (curl_result_is_tls_cert_problem(cc)) {
     note_http2_cert_problem();
@@ -4000,10 +4360,14 @@ static int curl_h2_stream_loop(const char *url) {
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 && !ctx.failed &&
       (h2 || !http2_required())) {
+    runtime_state_lock();
     s_http2_request_ok++;
+    runtime_state_unlock();
     return 0;
   }
+  runtime_state_lock();
   s_http2_request_fail++;
+  runtime_state_unlock();
   note_http2_failure_reason("control-stream", cc, code, h2, errbuf);
   if (curl_result_is_tls_cert_problem(cc)) {
     note_http2_cert_problem();
@@ -4215,7 +4579,7 @@ static int native_request_ex(const char *method, const char *url, const char *co
     http_conn_close_locked();
   }
   http_unlock();
-  if (rc != 0 && !s_last_error[0]) {
+  if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https request failed" : "http request failed");
   }
   return rc;
@@ -4227,6 +4591,14 @@ static int native_request(const char *method, const char *url, const char *conte
   return native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, 0L);
 }
 
+static void build_suffix_url(char *url, size_t cap, const char *suffix) {
+  char rest[sizeof(s_rest)];
+  runtime_string_copy(rest, sizeof(rest), s_rest);
+  size_t rb = strlen(rest);
+  snprintf(url, cap, "%s%s%s", rest, (rb > 0u && rest[rb - 1u] == '/') ? "" : "/",
+           suffix ? suffix : "");
+}
+
 static int request_to_suffix_ex(const char *method, const char *suffix, const char *content_type,
                                 const char *body, size_t body_len, char *resp_body,
                                 size_t resp_body_cap, long timeout_s) {
@@ -4234,27 +4606,27 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
   char fail_resp[512];
   char *out_body = resp_body;
   size_t out_cap = resp_body_cap;
-  size_t rb = strlen(s_rest);
   int rc;
   if (!out_body || out_cap == 0u) {
     fail_resp[0] = '\0';
     out_body = fail_resp;
     out_cap = sizeof(fail_resp);
   }
-  snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+  build_suffix_url(url, sizeof(url), suffix);
   rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
   if (rc == 0) {
     route_note_success();
     return 0;
   }
+  char last_error[sizeof(s_last_error)];
+  runtime_string_copy(last_error, sizeof(last_error), s_last_error);
   fprintf(stderr, "[ingest-http] request failed method=%s suffix=%s rc=%d err=%s resp=%.240s\n",
-          method ? method : "-", suffix ? suffix : "-", rc, s_last_error[0] ? s_last_error : "-",
+          method ? method : "-", suffix ? suffix : "-", rc, last_error[0] ? last_error : "-",
           out_body && out_body[0] ? out_body : "-");
-  if (route_note_failure(s_last_error[0] ? s_last_error : "request_failed") &&
+  if (route_note_failure(last_error[0] ? last_error : "request_failed") &&
       method && strcmp(method, "GET") == 0) {
-    rb = strlen(s_rest);
     if (out_body && out_cap > 0u) out_body[0] = '\0';
-    snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+    build_suffix_url(url, sizeof(url), suffix);
     rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
     if (rc == 0) {
       route_note_success();
@@ -4280,7 +4652,7 @@ int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
     return 0;
   }
   note_http_request_failure();
-  if (!s_last_error[0]) {
+  if (runtime_string_empty(s_last_error)) {
     runtime_failure("json suffix post failed");
   }
   return -1;
@@ -4296,7 +4668,7 @@ int edr_ingest_http_get_suffix(const char *suffix, char *resp_body, size_t resp_
     return 0;
   }
   note_http_request_failure();
-  if (!s_last_error[0]) {
+  if (runtime_string_empty(s_last_error)) {
     runtime_failure("suffix get failed");
   }
   return -1;
@@ -4305,12 +4677,14 @@ int edr_ingest_http_get_suffix(const char *suffix, char *resp_body, size_t resp_
 static void route_apply_csv(const char *csv, const char *primary) {
   char buf[4096];
   char current[512];
-  int old_active = s_route_active;
+  int old_active;
   char *start;
   char *p;
   if (!csv || !csv[0]) {
     return;
   }
+  runtime_state_lock();
+  old_active = s_route_active;
   snprintf(current, sizeof(current), "%s", s_rest);
   memset(s_route_bases, 0, sizeof(s_route_bases));
   s_route_count = 0;
@@ -4352,6 +4726,7 @@ static void route_apply_csv(const char *csv, const char *primary) {
   if (old_active != s_route_active) {
     route_apply_active();
   }
+  runtime_state_unlock();
 }
 
 static int edr_ingest_http_refresh_route_profile(int force) {
@@ -4363,15 +4738,22 @@ static int edr_ingest_http_refresh_route_profile(int force) {
   int64_t v = 0;
   int64_t now = unix_ms_now();
   int64_t interval_ms = (int64_t)env_ul_clamped("EDR_ROUTE_PROFILE_REFRESH_MS", 300000ul, 30000ul, 3600000ul);
-  if (!edr_ingest_http_configured() || s_relay_url[0]) {
+  if (!edr_ingest_http_configured()) {
+    return -1;
+  }
+  runtime_state_lock();
+  if (s_relay_url[0]) {
+    runtime_state_unlock();
     return -1;
   }
   if (!force && s_route_profile_last_ms > 0 && now - s_route_profile_last_ms < interval_ms) {
+    runtime_state_unlock();
     return 0;
   }
   s_route_profile_last_ms = now;
   snprintf(suffix, sizeof(suffix), "agent/comms-route-profile?endpoint_id=%s&tenant_id=%s",
            s_endpoint, s_tenant);
+  runtime_state_unlock();
   resp[0] = '\0';
   if (request_to_suffix("GET", suffix, NULL, NULL, 0u, resp, sizeof(resp)) != 0) {
     return -1;
@@ -4382,6 +4764,7 @@ static int edr_ingest_http_refresh_route_profile(int force) {
   (void)json_get_string(resp, "base_urls_csv", csv, sizeof(csv));
   (void)json_get_string(resp, "primary_base_url", primary, sizeof(primary));
   (void)json_get_string(resp, "profile_version", version, sizeof(version));
+  runtime_state_lock();
   if (json_get_int64(resp, "failover_after_failures", &v) == 0 && v >= 1 && v <= 10) {
     s_route_failover_after = (int)v;
   }
@@ -4393,10 +4776,19 @@ static int edr_ingest_http_refresh_route_profile(int force) {
     if (version[0]) {
       snprintf(s_route_profile_version, sizeof(s_route_profile_version), "%s", version);
     }
+    char applied_version[sizeof(s_route_profile_version)];
+    char active_base[sizeof(s_rest)];
+    int route_count = s_route_count;
+    int route_active = s_route_active;
+    snprintf(applied_version, sizeof(applied_version), "%s",
+             s_route_profile_version[0] ? s_route_profile_version : "unknown");
+    snprintf(active_base, sizeof(active_base), "%s", s_rest);
+    runtime_state_unlock();
     fprintf(stderr, "[route] profile applied version=%s routes=%d active=%d base=%s\n",
-            s_route_profile_version[0] ? s_route_profile_version : "unknown",
-            s_route_count, s_route_active + 1, s_rest);
+            applied_version, route_count, route_active + 1, active_base);
+    return 0;
   }
+  runtime_state_unlock();
   return 0;
 }
 
@@ -4463,7 +4855,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   }
   http_unlock();
   net_done();
-  if (rc != 0 && !s_last_error[0]) {
+  if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https get failed" : "http get failed");
   }
   return rc;
@@ -4573,7 +4965,7 @@ static int ws_recv_some(EdrWsConn *c, char *buf, int cap) {
 
 static int ws_read_exact(EdrWsConn *c, uint8_t *buf, size_t len) {
   size_t off = 0;
-  while (off < len && s_poll_run) {
+  while (off < len && runtime_int_get(&s_poll_run)) {
     int n = ws_recv_some(c, (char *)buf + off, (int)(len - off));
     if (n == -2) {
       if (off == 0u) {
@@ -4595,7 +4987,7 @@ static int ws_write_all(EdrWsConn *c, const uint8_t *buf, size_t len) {
   if (!c || !buf) {
     return -1;
   }
-  while (off < len && s_poll_run) {
+  while (off < len && runtime_int_get(&s_poll_run)) {
 #ifdef EDR_HAVE_OPENSSL_HTTP
     if (c->ssl) {
       int n = SSL_write(c->ssl, buf + off, (int)(len - off));
@@ -4724,10 +5116,10 @@ static int ws_send_text_conn(EdrWsConn *c, const char *text) {
 static int ws_send_text_active(const char *text) {
   int rc = -1;
   ws_lock();
-  if (s_ws_ready && s_ws_conn) {
+  if (runtime_int_get(&s_ws_ready) && s_ws_conn) {
     rc = ws_send_text_conn(s_ws_conn, text);
     if (rc != 0) {
-      s_ws_ready = 0;
+      runtime_int_set(&s_ws_ready, 0);
     }
   }
   ws_unlock();
@@ -4822,22 +5214,24 @@ static int ws_connect_once(EdrWsConn *out) {
   char req[4096];
   uint8_t nonce[16];
   char key[64];
+  char suffix[1200];
   int port = 0;
   int https = 0;
   int rn;
   int h2_cap = http2_client_enabled();
-  size_t rb;
   if (!out || !edr_ingest_http_configured()) {
     return -1;
   }
   memset(out, 0, sizeof(*out));
   out->fd = EDR_SOCKET_INVALID;
-  rb = strlen(s_rest);
-  snprintf(url, sizeof(url),
-           "%s%singest/control/ws?endpoint_id=%s&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
-           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", s_endpoint,
+  runtime_state_lock();
+  snprintf(suffix, sizeof(suffix),
+           "ingest/control/ws?endpoint_id=%s&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
+           s_endpoint,
            s_agent_ver, s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
            h2_cap ? 1 : 0, s_control_zstd ? 1 : 0);
+  runtime_state_unlock();
+  build_suffix_url(url, sizeof(url), suffix);
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     return -1;
   }
@@ -4929,17 +5323,20 @@ static int ws_connect_once(EdrWsConn *out) {
 }
 
 static void build_control_stream_url(char *url, size_t cap) {
-  size_t rb = strlen(s_rest);
-  int h2_cap = http2_client_enabled();
+  char suffix[1200];
   if (!url || cap == 0u) {
     return;
   }
-  snprintf(url, cap,
-           "%s%singest/control/stream?endpoint_id=%s&agent_version=%s&policy_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
-           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", s_endpoint,
+  runtime_state_lock();
+  int h2_cap = http2_client_enabled();
+  snprintf(suffix, sizeof(suffix),
+           "ingest/control/stream?endpoint_id=%s&agent_version=%s&policy_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
+           s_endpoint,
            s_agent_ver, s_policy_version[0] ? s_policy_version : "local",
            s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
            h2_cap ? 1 : 0, s_control_zstd ? 1 : 0);
+  runtime_state_unlock();
+  build_suffix_url(url, cap, suffix);
 }
 
 static int stream_connect_once(EdrWsConn *out) {
@@ -5053,16 +5450,37 @@ static void stream_process_line(const char *line) {
     int64_t batch_events = 0;
     int64_t flush_s = 0;
     int64_t sampling_pct = 0;
-    (void)json_get_string(line, "dict_ver", s_control_dict_ver, sizeof(s_control_dict_ver));
-    (void)json_get_string(line, "schema_ver", s_control_schema_ver, sizeof(s_control_schema_ver));
-    (void)json_get_string(line, "profile_id", s_control_profile_id, sizeof(s_control_profile_id));
-    (void)json_get_string(line, "qos_dscp", s_control_qos_dscp, sizeof(s_control_qos_dscp));
-    (void)json_get_string(line, "threshold", s_control_threshold, sizeof(s_control_threshold));
-    (void)json_get_bool(line, "h2", &s_control_h2);
-    (void)json_get_bool(line, "zstd", &s_control_zstd);
-    (void)json_get_bool(line, "backpressure_enabled", &s_control_backpressure_enabled);
-    if (json_get_int64(line, "batch_events", &batch_events) == 0 ||
-        json_get_int64(line, "flush_interval_s", &flush_s) == 0) {
+    char dict_ver[sizeof(s_control_dict_ver)];
+    char schema_ver[sizeof(s_control_schema_ver)];
+    char profile_id[sizeof(s_control_profile_id)];
+    char qos_dscp[sizeof(s_control_qos_dscp)];
+    char threshold[sizeof(s_control_threshold)];
+    int h2;
+    int zstd;
+    int backpressure;
+    int newly_verified = 0;
+    runtime_state_lock();
+    snprintf(dict_ver, sizeof(dict_ver), "%s", s_control_dict_ver);
+    snprintf(schema_ver, sizeof(schema_ver), "%s", s_control_schema_ver);
+    snprintf(profile_id, sizeof(profile_id), "%s", s_control_profile_id);
+    snprintf(qos_dscp, sizeof(qos_dscp), "%s", s_control_qos_dscp);
+    snprintf(threshold, sizeof(threshold), "%s", s_control_threshold);
+    h2 = s_control_h2;
+    zstd = s_control_zstd;
+    backpressure = s_control_backpressure_enabled;
+    sampling_pct = (int64_t)s_control_sampling_pct;
+    runtime_state_unlock();
+    (void)json_get_string(line, "dict_ver", dict_ver, sizeof(dict_ver));
+    (void)json_get_string(line, "schema_ver", schema_ver, sizeof(schema_ver));
+    (void)json_get_string(line, "profile_id", profile_id, sizeof(profile_id));
+    (void)json_get_string(line, "qos_dscp", qos_dscp, sizeof(qos_dscp));
+    (void)json_get_string(line, "threshold", threshold, sizeof(threshold));
+    (void)json_get_bool(line, "h2", &h2);
+    (void)json_get_bool(line, "zstd", &zstd);
+    (void)json_get_bool(line, "backpressure_enabled", &backpressure);
+    int have_batch = json_get_int64(line, "batch_events", &batch_events) == 0;
+    int have_flush = json_get_int64(line, "flush_interval_s", &flush_s) == 0;
+    if (have_batch || have_flush) {
       if (batch_events < 0) batch_events = 0;
       if (batch_events > 50000) batch_events = 50000;
       if (flush_s < 0) flush_s = 0;
@@ -5071,23 +5489,26 @@ static void stream_process_line(const char *line) {
     }
     if (json_get_int64(line, "sampling_pct", &sampling_pct) == 0 && sampling_pct > 0) {
       if (sampling_pct > 100) sampling_pct = 100;
-      s_control_sampling_pct = (unsigned)sampling_pct;
     }
+    runtime_state_lock();
     if (!s_stream_verified) {
       s_stream_verified = 1;
       s_stream_ready = 1;
       snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connected");
+      newly_verified = 1;
+    }
+    runtime_state_unlock();
+    if (newly_verified) {
       note_http_request_success();
       note_control_stream_success();
       route_note_success();
       fprintf(stderr, "[ingest-stream] control stream verified endpoint=%s\n", s_endpoint);
     }
     note_control_stream_activity();
-    s_control_hello_ok = 1;
-    edr_ingest_http_apply_telemetry_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
-                                            s_control_h2, s_control_zstd, s_control_qos_dscp,
-                                            s_control_sampling_pct, s_control_threshold,
-                                            s_control_backpressure_enabled);
+    edr_ingest_http_apply_telemetry_profile(dict_ver, schema_ver, profile_id,
+                                            h2, zstd, qos_dscp,
+                                            (unsigned)sampling_pct, threshold,
+                                            backpressure);
     edr_transport_v2_on_control("server_hello");
   } else if (strstr(line, "\"type\":\"heartbeat\"")) {
     note_control_stream_heartbeat();
@@ -5140,7 +5561,7 @@ static int stream_read_loop(EdrWsConn *conn) {
     }
     n = ws_recv_some(conn, buf + used, (int)(sizeof(buf) - 1u - used));
     if (n == -2) {
-      if (!s_poll_run) {
+      if (!runtime_int_get(&s_poll_run)) {
         return -1;
       }
       continue;
@@ -5168,7 +5589,7 @@ static int stream_read_loop(EdrWsConn *conn) {
       break;
     }
   }
-  while (s_poll_run) {
+  while (runtime_int_get(&s_poll_run)) {
     int n = ws_recv_some(conn, buf, (int)(sizeof(buf) - 1u));
     if (n == -2) {
       continue;
@@ -5213,12 +5634,11 @@ static int ws_send_agent_message(EdrWsConn *c, const char *command_type) {
 
 static int post_to_suffix(const char *suffix, const char *body) {
   char url[1024];
-  size_t rb = strlen(s_rest);
-  snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+  build_suffix_url(url, sizeof(url), suffix);
   int rc = native_post_json(url, body, strlen(body));
   if (rc == 0) {
     note_http_request_success();
-  } else if (!s_last_error[0]) {
+  } else if (runtime_string_empty(s_last_error)) {
     note_http_request_failure();
     runtime_failure("native post failed");
   } else {
@@ -5243,18 +5663,24 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
                                (const char *)env, env_len, NULL, 0u);
       free(env);
       if (v2rc == 0) {
+        runtime_state_lock();
         s_report_events_v2_ok++;
+        runtime_state_unlock();
         note_http_request_success();
         return 0;
       }
+      runtime_state_lock();
       s_report_events_v2_fail++;
+      runtime_state_unlock();
       note_http_request_failure();
       if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 0)) {
         log_native_post_failure("report-events-v2", v2rc);
         return -1;
       }
     } else {
+      runtime_state_lock();
       s_report_events_v2_fail++;
+      runtime_state_unlock();
       if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 0)) {
         runtime_failure("report-events-v2 envelope build failed");
         return -1;
@@ -5431,7 +5857,9 @@ static long command_result_http_status_from_error(const char *error) {
 }
 
 static void command_result_note_delivery_failure(const char *response) {
-  long status = command_result_http_status_from_error(s_last_error);
+  char transport_error[sizeof(s_last_error)];
+  runtime_string_copy(transport_error, sizeof(transport_error), s_last_error);
+  long status = command_result_http_status_from_error(transport_error);
   char code[64] = "";
   char message[96] = "";
   cJSON *root = response && response[0] ? cJSON_Parse(response) : NULL;
@@ -5446,6 +5874,7 @@ static void command_result_note_delivery_failure(const char *response) {
     }
     cJSON_Delete(root);
   }
+  runtime_state_lock();
   s_last_command_result_retryable =
       !(status >= 400 && status < 500 && status != 408 && status != 429);
   if (status > 0 || code[0] || message[0]) {
@@ -5455,18 +5884,21 @@ static void command_result_note_delivery_failure(const char *response) {
              message[0] ? ": " : "", message);
   } else {
     snprintf(s_last_command_result_error, sizeof(s_last_command_result_error), "%s",
-             s_last_error[0] ? s_last_error : "command result transport failure");
+             transport_error[0] ? transport_error : "command result transport failure");
   }
+  runtime_state_unlock();
 }
 
 void edr_ingest_http_get_last_command_result_delivery_error(char *out, size_t cap,
                                                             int *retryable) {
+  runtime_state_lock();
   if (out && cap > 0u) {
     snprintf(out, cap, "%s", s_last_command_result_error);
   }
   if (retryable) {
     *retryable = s_last_command_result_retryable;
   }
+  runtime_state_unlock();
 }
 
 int edr_ingest_http_post_command_result_typed(const char *command_id, const char *command_type,
@@ -5476,6 +5908,7 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
   char *body = NULL;
   char response[512];
   int rc;
+  int application_ack_missing = 0;
   if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
     return -1;
   }
@@ -5495,27 +5928,25 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
   rc = request_to_suffix("POST", "ingest/report-command-result", "application/json",
                          body, strlen(body), response, sizeof(response));
   if (rc == 0) {
-    cJSON *ack = response[0] ? cJSON_Parse(response) : NULL;
-    const cJSON *accepted = ack ? cJSON_GetObjectItemCaseSensitive(ack, "accepted") : NULL;
-    const cJSON *complete = ack ? cJSON_GetObjectItemCaseSensitive(ack, "complete") : NULL;
-    int application_acked = cJSON_IsTrue(accepted) && (!complete || cJSON_IsTrue(complete));
-    if (ack) {
-      cJSON_Delete(ack);
-    }
-    if (!application_acked) {
+    if (!edr_command_result_http_response_acked(response)) {
       rc = -1;
+      application_ack_missing = 1;
+      runtime_state_lock();
       snprintf(s_last_command_result_error, sizeof(s_last_command_result_error), "%s",
                "command result response missing accepted complete application ack");
       s_last_command_result_retryable = 1;
+      runtime_state_unlock();
       runtime_failure("command result application ack missing");
     }
   }
   if (rc == 0) {
+    runtime_state_lock();
     s_last_command_result_error[0] = '\0';
-    s_last_command_result_retryable = 1;
+    s_last_command_result_retryable = 0;
+    runtime_state_unlock();
     note_http_request_success();
     note_command_result_success();
-  } else if (!s_last_error[0]) {
+  } else if (runtime_string_empty(s_last_error)) {
     note_http_request_failure();
     note_command_result_failure();
     runtime_failure("command result http post failed");
@@ -5525,8 +5956,13 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
   }
   edr_command_result_json_free(body);
   if (rc != 0) {
-    command_result_note_delivery_failure(response);
-    return s_last_command_result_retryable
+    if (!application_ack_missing) {
+      command_result_note_delivery_failure(response);
+    }
+    runtime_state_lock();
+    int retryable = s_last_command_result_retryable;
+    runtime_state_unlock();
+    return retryable
                ? EDR_INGEST_COMMAND_RESULT_RETRYABLE_FAILURE
                : EDR_INGEST_COMMAND_RESULT_REJECTED;
   }
@@ -5557,14 +5993,16 @@ static void control_ack_refresh_pending_runtime(void) {
   EdrControlAckRecord records[64];
   memset(records, 0, sizeof(records));
   int n = edr_command_state_collect_pending_acks(records, sizeof(records) / sizeof(records[0]));
-  s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
-  s_next_control_ack_retry_ms = 0;
+  int64_t next_retry_ms = 0;
   for (int i = 0; i < n; i++) {
-    if (s_next_control_ack_retry_ms == 0 ||
-        records[i].next_retry_unix_ms < s_next_control_ack_retry_ms) {
-      s_next_control_ack_retry_ms = records[i].next_retry_unix_ms;
+    if (next_retry_ms == 0 || records[i].next_retry_unix_ms < next_retry_ms) {
+      next_retry_ms = records[i].next_retry_unix_ms;
     }
   }
+  runtime_state_lock();
+  s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
+  s_next_control_ack_retry_ms = next_retry_ms;
+  runtime_state_unlock();
 }
 
 static void control_ack_schedule_retry(const char *command_id, const char *transport, int64_t last_seq,
@@ -5589,7 +6027,9 @@ static void control_ack_schedule_retry(const char *command_id, const char *trans
     edr_command_audit_both(record.command_id, audit);
     return;
   }
+  runtime_state_lock();
   s_control_ack_outbox_persist_fail++;
+  runtime_state_unlock();
   edr_command_audit_both(command_id, "control ACK failed and durable ACK retry record could not be persisted");
 }
 
@@ -5651,7 +6091,7 @@ static int edr_ingest_http_post_control_ack_with_status(const char *command_id, 
     note_http_request_failure();
     note_control_ack_failure(command_id);
     edr_transport_v2_ack(command_id, 0);
-    if (!s_last_error[0]) {
+    if (runtime_string_empty(s_last_error)) {
       runtime_failure("control ack http post failed");
     }
   }
@@ -5671,8 +6111,10 @@ void edr_ingest_http_retry_pending_control_acks(void) {
   EdrControlAckRecord records[16];
   memset(records, 0, sizeof(records));
   int n = edr_command_state_collect_pending_acks(records, sizeof(records) / sizeof(records[0]));
+  runtime_state_lock();
   s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
   s_next_control_ack_retry_ms = 0;
+  runtime_state_unlock();
   if (n <= 0 || !edr_ingest_http_configured()) {
     return;
   }
@@ -5681,24 +6123,32 @@ void edr_ingest_http_retry_pending_control_acks(void) {
   unsigned long attempted = 0ul;
   for (int i = 0; i < n; i++) {
     if (records[i].next_retry_unix_ms > now) {
+      runtime_state_lock();
       if (s_next_control_ack_retry_ms == 0 ||
           records[i].next_retry_unix_ms < s_next_control_ack_retry_ms) {
         s_next_control_ack_retry_ms = records[i].next_retry_unix_ms;
       }
+      runtime_state_unlock();
       continue;
     }
     if (attempted >= max_attempts) {
       break;
     }
     attempted++;
+    runtime_state_lock();
     s_control_ack_retry_attempt++;
+    runtime_state_unlock();
     if (edr_ingest_http_post_control_ack(records[i].command_id, records[i].transport,
                                          records[i].last_seq) == 0) {
+      runtime_state_lock();
       s_control_ack_retry_ok++;
+      runtime_state_unlock();
       edr_command_audit_both(records[i].command_id, "control ACK retry accepted by server");
       continue;
     }
+    runtime_state_lock();
     s_control_ack_retry_fail++;
+    runtime_state_unlock();
     control_ack_schedule_retry(records[i].command_id, records[i].transport, records[i].last_seq,
                                records[i].attempts + 1u, records[i].first_failure_unix_ms);
   }
@@ -5732,7 +6182,6 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
                                       const char *sha256_hex, char *resp_body,
                                       size_t resp_body_cap) {
   char url[1400];
-  size_t rb;
   CURL *curl = NULL;
   curl_mime *mime = NULL;
   curl_mimepart *part = NULL;
@@ -5743,8 +6192,9 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
   int h2;
   int force_mtls_http1 = 0;
   const char *filename;
+  build_suffix_url(url, sizeof(url), "ingest/upload-file");
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0] ||
-      !http2_client_enabled() || strncmp(s_rest, "https://", 8u) != 0 || !curl_global_ready()) {
+      !http2_client_enabled() || strncmp(url, "https://", 8u) != 0 || !curl_global_ready()) {
     return -2;
   }
   if (!comm_circuit_allows() || !comm_budget_try(4096u, 1)) {
@@ -5760,9 +6210,6 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
   memset(&out, 0, sizeof(out));
   out.buf = resp_body;
   out.cap = resp_body_cap;
-  rb = strlen(s_rest);
-  snprintf(url, sizeof(url), "%s%singest/upload-file",
-           s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/");
   force_mtls_http1 = !http2_required() && curl_schannel_store_mtls_needs_libcurl_http1(url);
   filename = base_name_ptr(file_path);
   mime = curl_mime_init(curl);
@@ -5830,15 +6277,19 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
   curl_easy_cleanup(curl);
   if (cc == CURLE_OK && code >= 200 && code < 300 &&
       (force_mtls_http1 || h2 || !http2_required())) {
+    runtime_state_lock();
     if (h2) {
       s_http2_request_ok++;
     } else {
       s_http2_fallback_count++;
       snprintf(s_negotiated_protocol, sizeof(s_negotiated_protocol), "%s", "http/1.1");
     }
+    runtime_state_unlock();
     return 0;
   }
+  runtime_state_lock();
   s_http2_request_fail++;
+  runtime_state_unlock();
   note_http2_failure_reason(force_mtls_http1 ? "upload-file-mtls-h1" : "upload-file",
                             cc, code, h2, resp_body);
   if (curl_result_is_tls_cert_problem(cc)) {
@@ -5909,9 +6360,8 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
   int rc = -1;
   char req[8192];
   int rn;
-  size_t rb = strlen(s_rest);
   size_t body_len = pre_len + file_len + post_len;
-  snprintf(url, sizeof(url), "%s%s%s", s_rest, (rb > 0u && s_rest[rb - 1u] == '/') ? "" : "/", suffix);
+  build_suffix_url(url, sizeof(url), suffix);
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid upload url");
     return -1;
@@ -5962,7 +6412,7 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     }
     http_conn_close(&local_conn);
   }
-  if (rc != 0 && !s_last_error[0]) {
+  if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https upload failed" : "http upload failed");
   }
   return rc;
@@ -5993,17 +6443,17 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0]) {
     return -1;
   }
-  snprintf(s_upload_status, sizeof(s_upload_status), "%s", "opening");
+  runtime_string_set(s_upload_status, sizeof(s_upload_status), "opening");
   file = fopen(file_path, "rb");
   if (!file) {
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_open");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_open");
     note_upload_failure();
     runtime_failure("http upload file read failed");
     return -1;
   }
   if (fseek(file, 0, SEEK_END) != 0) {
     fclose(file);
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_seek");
     note_upload_failure();
     runtime_failure("http upload file seek failed");
     return -1;
@@ -6012,7 +6462,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   max_mb = upload_max_mb();
   if (sz < 0 || (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
     fclose(file);
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_too_large");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_too_large");
     note_upload_failure();
     runtime_failure("http upload file too large");
     return -1;
@@ -6020,7 +6470,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   file_len = (size_t)sz;
   if (fseek(file, 0, SEEK_SET) != 0) {
     fclose(file);
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_seek");
     note_upload_failure();
     runtime_failure("http upload file seek failed");
     return -1;
@@ -6028,13 +6478,13 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
 #ifdef EDR_HAVE_CURL_HTTP2
   if (http2_client_enabled() && !s_request_signing.enabled) {
     int store_mtls_curl = curl_ssl_backend_is_schannel() && schannel_store_mtls_configured();
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_h2");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "uploading_h2");
     resp[0] = '\0';
     rc = curl_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
     if (rc == 0) {
       note_http_request_success();
       note_upload_success();
-      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "ok_h2");
+      runtime_string_set(s_upload_status, sizeof(s_upload_status), "ok_h2");
       if (out_minio_key && out_minio_key_cap > 0u) {
         (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
       }
@@ -6044,7 +6494,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     if (rc != -2) {
       if (http2_required() || store_mtls_curl) {
         fclose(file);
-        snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_h2");
+        runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_h2");
         note_upload_failure();
         runtime_failure(store_mtls_curl
                             ? "Schannel store-backed mTLS upload failed"
@@ -6053,7 +6503,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       }
       if (fseek(file, 0, SEEK_SET) != 0) {
         fclose(file);
-        snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_seek");
+        runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_seek");
         note_upload_failure();
         runtime_failure("http upload file seek failed");
         return -1;
@@ -6063,7 +6513,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
 #endif
   if (http2_required() && !s_request_signing.enabled) {
     fclose(file);
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_h2_required");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_h2_required");
     note_upload_failure();
     runtime_failure("HTTP/2 required but h2 upload transport unavailable");
     return -1;
@@ -6075,7 +6525,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   fname = json_escape_alloc(filename);
   if (!uid || !eid || !sha || !fname) {
     fclose(file);
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_build");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_build");
     note_upload_failure();
     free(uid);
     free(eid);
@@ -6102,14 +6552,14 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
       free(eid);
       free(sha);
       free(fname);
-      snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed_read");
+      runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_read");
       note_upload_failure();
       runtime_failure("http upload file hash failed");
       return -1;
     }
   }
   resp[0] = '\0';
-  snprintf(s_upload_status, sizeof(s_upload_status), "%s", "uploading_http");
+  runtime_string_set(s_upload_status, sizeof(s_upload_status), "uploading_http");
   rc = request_to_suffix_multipart_file("ingest/upload-file", content_type,
                                         pre, strlen(pre), file, file_len,
                                         post, strlen(post), multipart_sha256,
@@ -6117,18 +6567,18 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   if (rc == 0) {
     note_http_request_success();
     note_upload_success();
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "ok_http");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "ok_http");
     if (out_minio_key && out_minio_key_cap > 0u) {
       (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
     }
-  } else if (!s_last_error[0]) {
+  } else if (runtime_string_empty(s_last_error)) {
     note_http_request_failure();
     note_upload_failure();
     runtime_failure("http upload failed");
   } else {
     note_http_request_failure();
     note_upload_failure();
-    snprintf(s_upload_status, sizeof(s_upload_status), "%s", "failed");
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed");
   }
   fclose(file);
   free(uid);
@@ -6290,27 +6740,57 @@ static int edr_ingest_http_control_hello_once(void) {
   char *schema = NULL;
   char *profile = NULL;
   char *body = NULL;
+  char endpoint_raw[sizeof(s_endpoint)];
+  char agent_raw[sizeof(s_agent_ver)];
+  char policy_raw[sizeof(s_policy_version)];
+  char dict_raw[sizeof(s_control_dict_ver)];
+  char schema_raw[sizeof(s_control_schema_ver)];
+  char profile_raw[sizeof(s_control_profile_id)];
+  char qos_raw[sizeof(s_control_qos_dscp)];
+  char threshold_raw[sizeof(s_control_threshold)];
   size_t body_cap;
   int rc = -1;
   int h2_cap = http2_client_enabled();
+  int h2_profile;
+  int zstd_profile;
+  int backpressure_profile;
+  unsigned sampling_profile;
   int64_t now = unix_ms_now();
   int retry_ms = (int)env_ul_clamped("EDR_CONTROL_HELLO_RETRY_MS", 30000ul, 5000ul, 300000ul);
   if (!edr_ingest_http_configured()) {
     return -1;
   }
-  if (s_control_hello_ok) {
+  if (runtime_int_get(&s_control_hello_ok)) {
     return 0;
   }
+  runtime_state_lock();
   if (s_control_hello_last_ms > 0 && now - s_control_hello_last_ms < (int64_t)retry_ms) {
+    runtime_state_unlock();
     return -1;
   }
   s_control_hello_last_ms = now;
-  endpoint = json_escape_alloc(s_endpoint);
-  agent = json_escape_alloc(s_agent_ver);
-  policy = json_escape_alloc(s_policy_version[0] ? s_policy_version : "local");
-  dict = json_escape_alloc(s_control_dict_ver[0] ? s_control_dict_ver : "edr-zstd-dict-v1");
-  schema = json_escape_alloc(s_control_schema_ver[0] ? s_control_schema_ver : "edr-control-schema-v1");
-  profile = json_escape_alloc(s_control_profile_id[0] ? s_control_profile_id : "default-http1-protobuf");
+  snprintf(endpoint_raw, sizeof(endpoint_raw), "%s", s_endpoint);
+  snprintf(agent_raw, sizeof(agent_raw), "%s", s_agent_ver);
+  snprintf(policy_raw, sizeof(policy_raw), "%s", s_policy_version[0] ? s_policy_version : "local");
+  snprintf(dict_raw, sizeof(dict_raw), "%s",
+           s_control_dict_ver[0] ? s_control_dict_ver : "edr-zstd-dict-v1");
+  snprintf(schema_raw, sizeof(schema_raw), "%s",
+           s_control_schema_ver[0] ? s_control_schema_ver : "edr-control-schema-v1");
+  snprintf(profile_raw, sizeof(profile_raw), "%s",
+           s_control_profile_id[0] ? s_control_profile_id : "default-http1-protobuf");
+  snprintf(qos_raw, sizeof(qos_raw), "%s", s_control_qos_dscp);
+  snprintf(threshold_raw, sizeof(threshold_raw), "%s", s_control_threshold);
+  h2_profile = s_control_h2;
+  zstd_profile = s_control_zstd;
+  backpressure_profile = s_control_backpressure_enabled;
+  sampling_profile = s_control_sampling_pct;
+  runtime_state_unlock();
+  endpoint = json_escape_alloc(endpoint_raw);
+  agent = json_escape_alloc(agent_raw);
+  policy = json_escape_alloc(policy_raw);
+  dict = json_escape_alloc(dict_raw);
+  schema = json_escape_alloc(schema_raw);
+  profile = json_escape_alloc(profile_raw);
   if (!endpoint || !agent || !policy || !dict || !schema || !profile) {
     goto done;
   }
@@ -6329,10 +6809,10 @@ static int edr_ingest_http_control_hello_once(void) {
            "\"supported_schema\":[\"%s\"],\"supported_dicts\":[\"%s\"],\"profiles\":[\"%s\"]}",
            endpoint, agent, policy,
            h2_cap ? "true" : "false",
-           s_control_zstd ? "true" : "false",
+           zstd_profile ? "true" : "false",
            dict, schema, profile,
            h2_cap ? "true" : "false",
-           s_control_zstd ? "true" : "false",
+           zstd_profile ? "true" : "false",
            dict, schema, profile,
            schema, dict, profile);
   resp[0] = '\0';
@@ -6342,20 +6822,21 @@ static int edr_ingest_http_control_hello_once(void) {
     goto done;
   }
   note_http_request_success();
-  (void)json_get_string(resp, "dict_ver", s_control_dict_ver, sizeof(s_control_dict_ver));
-  (void)json_get_string(resp, "schema_ver", s_control_schema_ver, sizeof(s_control_schema_ver));
-  (void)json_get_string(resp, "profile_id", s_control_profile_id, sizeof(s_control_profile_id));
-  (void)json_get_string(resp, "qos_dscp", s_control_qos_dscp, sizeof(s_control_qos_dscp));
-  (void)json_get_string(resp, "threshold", s_control_threshold, sizeof(s_control_threshold));
-  (void)json_get_bool(resp, "h2", &s_control_h2);
-  (void)json_get_bool(resp, "zstd", &s_control_zstd);
-  (void)json_get_bool(resp, "backpressure_enabled", &s_control_backpressure_enabled);
+  (void)json_get_string(resp, "dict_ver", dict_raw, sizeof(dict_raw));
+  (void)json_get_string(resp, "schema_ver", schema_raw, sizeof(schema_raw));
+  (void)json_get_string(resp, "profile_id", profile_raw, sizeof(profile_raw));
+  (void)json_get_string(resp, "qos_dscp", qos_raw, sizeof(qos_raw));
+  (void)json_get_string(resp, "threshold", threshold_raw, sizeof(threshold_raw));
+  (void)json_get_bool(resp, "h2", &h2_profile);
+  (void)json_get_bool(resp, "zstd", &zstd_profile);
+  (void)json_get_bool(resp, "backpressure_enabled", &backpressure_profile);
   {
     int64_t batch_events = 0;
     int64_t flush_s = 0;
-    int64_t sampling_pct = 0;
-    if (json_get_int64(resp, "batch_events", &batch_events) == 0 ||
-        json_get_int64(resp, "flush_interval_s", &flush_s) == 0) {
+    int64_t sampling_pct = (int64_t)sampling_profile;
+    int have_batch = json_get_int64(resp, "batch_events", &batch_events) == 0;
+    int have_flush = json_get_int64(resp, "flush_interval_s", &flush_s) == 0;
+    if (have_batch || have_flush) {
       if (batch_events < 0) batch_events = 0;
       if (batch_events > 50000) batch_events = 50000;
       if (flush_s < 0) flush_s = 0;
@@ -6364,14 +6845,14 @@ static int edr_ingest_http_control_hello_once(void) {
     }
     if (json_get_int64(resp, "sampling_pct", &sampling_pct) == 0 && sampling_pct > 0) {
       if (sampling_pct > 100) sampling_pct = 100;
-      s_control_sampling_pct = (unsigned)sampling_pct;
+      sampling_profile = (unsigned)sampling_pct;
     }
   }
-  edr_ingest_http_apply_telemetry_profile(s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
-                                          s_control_h2, s_control_zstd, s_control_qos_dscp,
-                                          s_control_sampling_pct, s_control_threshold,
-                                          s_control_backpressure_enabled);
-  s_control_hello_ok = 1;
+  edr_ingest_http_apply_telemetry_profile(dict_raw, schema_raw, profile_raw,
+                                          h2_profile, zstd_profile, qos_raw,
+                                          sampling_profile, threshold_raw,
+                                          backpressure_profile);
+  runtime_int_set(&s_control_hello_ok, 1);
   rc = 0;
 done:
   free(endpoint);
@@ -6436,11 +6917,10 @@ static int control_stream_try_schannel_http1(int *backoff_ms, const char *fallba
   if (!curl_schannel_store_mtls_needs_libcurl_http1(stream_url)) {
     return 0;
   }
-  s_stream_verified = 0;
-  s_stream_ready = 0;
-  snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connecting_http1");
+  runtime_stream_state_set(0, 0);
+  runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "connecting_http1");
   *backoff_ms = 5000;
-  s_ws_backoff_ms = 0;
+  runtime_int_set(&s_ws_backoff_ms, 0);
   if (fallback_reason && fallback_reason[0]) {
     fprintf(stderr,
             "[ingest-stream] %s; falling back to HTTP/1.1 stream via Schannel "
@@ -6455,36 +6935,34 @@ static int control_stream_try_schannel_http1(int *backoff_ms, const char *fallba
   if (h1rc == 0) {
     int64_t connected_for_ms = unix_ms_now() - connected_at_ms;
     int stable_ms = (int)env_ul_clamped("EDR_CONTROL_STREAM_STABLE_MS", 30000ul, 5000ul, 600000ul);
-    int verified = s_stream_verified ? 1 : 0;
-    s_stream_ready = 0;
-    s_stream_verified = 0;
-    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "disconnected");
+    int verified = runtime_int_get(&s_stream_verified);
+    runtime_stream_state_set(0, 0);
+    runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "disconnected");
     if (!verified) {
       note_control_stream_failure();
       (void)route_note_failure("http1_schannel_stream_no_server_hello");
     }
     fprintf(stderr,
             "[ingest-stream] HTTP/1.1 control stream disconnected; HTTP long-poll fallback remains %s\n",
-            s_long_poll_fallback_cfg ? "active" : "disabled");
-    s_ws_backoff_ms = *backoff_ms;
+            runtime_int_get(&s_long_poll_fallback_cfg) ? "active" : "disabled");
+    runtime_int_set(&s_ws_backoff_ms, *backoff_ms);
     sleep_poll_ms(control_stream_reconnect_sleep_ms(*backoff_ms));
     if (verified && connected_for_ms >= (int64_t)stable_ms) {
       *backoff_ms = 5000;
     } else {
       *backoff_ms = control_stream_next_backoff_ms(*backoff_ms);
     }
-    s_ws_backoff_ms = *backoff_ms;
+    runtime_int_set(&s_ws_backoff_ms, *backoff_ms);
     return 1;
   }
-  s_stream_ready = 0;
-  s_stream_verified = 0;
+  runtime_stream_state_set(0, 0);
   note_control_stream_failure();
-  snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "http1_failed");
+  runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "http1_failed");
   (void)route_note_failure("http1_schannel_stream_failed");
-  s_ws_backoff_ms = *backoff_ms;
+  runtime_int_set(&s_ws_backoff_ms, *backoff_ms);
   sleep_poll_ms(control_stream_reconnect_sleep_ms(*backoff_ms));
   *backoff_ms = control_stream_next_backoff_ms(*backoff_ms);
-  s_ws_backoff_ms = *backoff_ms;
+  runtime_int_set(&s_ws_backoff_ms, *backoff_ms);
   return 1;
 }
 #endif
@@ -6498,19 +6976,19 @@ static void *control_ws_thread(void *arg)
   int backoff_ms = 5000;
   int64_t connected_at_ms = 0;
   (void)arg;
-  s_ws_backoff_ms = backoff_ms;
-  while (s_poll_run) {
+  runtime_int_set(&s_ws_backoff_ms, backoff_ms);
+  while (runtime_int_get(&s_poll_run)) {
     EdrWsConn conn;
     if (!edr_ingest_http_configured()) {
       sleep_poll_ms(5000);
       continue;
     }
-    if (!s_control_stream_enabled_cfg) {
-      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "disabled");
+    if (!runtime_int_get(&s_control_stream_enabled_cfg)) {
+      runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "disabled");
       sleep_poll_ms(5000);
       continue;
     }
-    if (control_stream_ready_lease_valid() || s_ws_ready) {
+    if (control_stream_ready_lease_valid() || runtime_int_get(&s_ws_ready)) {
       sleep_poll_ms(5000);
       continue;
     }
@@ -6529,49 +7007,46 @@ static void *control_ws_thread(void *arg)
       char stream_url[1400];
       int h2rc;
       build_control_stream_url(stream_url, sizeof(stream_url));
-      s_stream_verified = 0;
-      s_stream_ready = 0;
-      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connecting_h2");
+      runtime_stream_state_set(0, 0);
+      runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "connecting_h2");
       backoff_ms = 5000;
-      s_ws_backoff_ms = 0;
+      runtime_int_set(&s_ws_backoff_ms, 0);
       fprintf(stderr, "[ingest-stream] HTTP/2 control stream connecting endpoint=%s\n", s_endpoint);
       connected_at_ms = unix_ms_now();
       h2rc = curl_h2_stream_loop(stream_url);
       if (h2rc == 0) {
         int64_t connected_for_ms = unix_ms_now() - connected_at_ms;
         int stable_ms = (int)env_ul_clamped("EDR_CONTROL_STREAM_STABLE_MS", 30000ul, 5000ul, 600000ul);
-        int verified = s_stream_verified ? 1 : 0;
-        s_stream_ready = 0;
-        s_stream_verified = 0;
-        snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "disconnected");
+        int verified = runtime_int_get(&s_stream_verified);
+        runtime_stream_state_set(0, 0);
+        runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "disconnected");
         if (!verified) {
           note_control_stream_failure();
           (void)route_note_failure("h2_stream_no_server_hello");
         }
         fprintf(stderr,
                 "[ingest-stream] HTTP/2 control stream disconnected; HTTP long-poll fallback remains %s\n",
-                s_long_poll_fallback_cfg ? "active" : "disabled");
-        s_ws_backoff_ms = backoff_ms;
+                runtime_int_get(&s_long_poll_fallback_cfg) ? "active" : "disabled");
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
         if (verified && connected_for_ms >= (int64_t)stable_ms) {
           backoff_ms = 5000;
         } else {
           backoff_ms = control_stream_next_backoff_ms(backoff_ms);
         }
-        s_ws_backoff_ms = backoff_ms;
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         continue;
       }
-      s_stream_ready = 0;
-      s_stream_verified = 0;
+      runtime_stream_state_set(0, 0);
       note_control_stream_failure();
-      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "h2_failed");
+      runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "h2_failed");
       (void)route_note_failure("h2_stream_failed");
       s_h2_stream_retry_after_ms = unix_ms_now() + (int64_t)h2_stream_retry_cooldown_ms();
       if (http2_required()) {
-        s_ws_backoff_ms = backoff_ms;
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
         backoff_ms = control_stream_next_backoff_ms(backoff_ms);
-        s_ws_backoff_ms = backoff_ms;
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         continue;
       }
       if (curl_schannel_store_mtls_needs_libcurl_http1(stream_url) &&
@@ -6586,21 +7061,21 @@ static void *control_ws_thread(void *arg)
                 "(h2 retry cooldown=%dms)\n",
                 h2_stream_retry_cooldown_ms());
       } else if (h2rc != -2) {
-        s_ws_backoff_ms = backoff_ms;
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
         backoff_ms = control_stream_next_backoff_ms(backoff_ms);
-        s_ws_backoff_ms = backoff_ms;
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
         continue;
       }
     }
 #endif
     if (http2_required()) {
-      snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "h2_unavailable");
+      runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "h2_unavailable");
       note_control_stream_failure();
-      s_ws_backoff_ms = backoff_ms;
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
       sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
       backoff_ms = control_stream_next_backoff_ms(backoff_ms);
-      s_ws_backoff_ms = backoff_ms;
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
       continue;
     }
 #ifdef EDR_HAVE_CURL_HTTP2
@@ -6613,43 +7088,42 @@ static void *control_ws_thread(void *arg)
     if (stream_connect_once(&conn) != 0) {
       note_control_stream_failure();
       (void)route_note_failure("http1_stream_connect_failed");
-      s_ws_backoff_ms = backoff_ms;
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
       sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
       backoff_ms = control_stream_next_backoff_ms(backoff_ms);
-      s_ws_backoff_ms = backoff_ms;
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
       continue;
     }
-    s_stream_verified = 0;
-    s_stream_ready = 0;
-    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "connected_pending_hello");
+    runtime_stream_state_set(0, 0);
+    runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "connected_pending_hello");
     connected_at_ms = unix_ms_now();
     backoff_ms = 5000;
-    s_ws_backoff_ms = 0;
+    runtime_int_set(&s_ws_backoff_ms, 0);
     fprintf(stderr, "[ingest-stream] control stream connected endpoint=%s\n", s_endpoint);
     if (stream_read_loop(&conn) != 0) {
       note_control_stream_failure();
     }
-    s_stream_ready = 0;
-    s_stream_verified = 0;
-    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s", "disconnected");
+    runtime_stream_state_set(0, 0);
+    runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "disconnected");
     ws_close_conn(&conn);
     net_done();
-    if (s_poll_run) {
+    if (runtime_int_get(&s_poll_run)) {
       int64_t connected_for_ms = unix_ms_now() - connected_at_ms;
       int stable_ms = (int)env_ul_clamped("EDR_CONTROL_STREAM_STABLE_MS", 30000ul, 5000ul, 600000ul);
       fprintf(stderr,
               "[ingest-stream] control stream disconnected; HTTP long-poll fallback remains %s\n",
-              s_long_poll_fallback_cfg ? "active" : "disabled");
-      s_ws_backoff_ms = backoff_ms;
+              runtime_int_get(&s_long_poll_fallback_cfg) ? "active" : "disabled");
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
       sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
       if (connected_for_ms < (int64_t)stable_ms) {
         backoff_ms = control_stream_next_backoff_ms(backoff_ms);
       } else {
         backoff_ms = 5000;
       }
-      s_ws_backoff_ms = backoff_ms;
+      runtime_int_set(&s_ws_backoff_ms, backoff_ms);
     }
   }
+  runtime_int_set(&s_ws_thread_exited, 1);
 #ifdef _WIN32
   return 0;
 #else
@@ -6669,9 +7143,12 @@ static int edr_ingest_http_poll_once(void) {
       wait_s = v;
     }
   }
-  if (s_control_stream_enabled_cfg && !s_long_poll_fallback_cfg) {
-    snprintf(s_control_stream_status, sizeof(s_control_stream_status), "%s",
-             s_control_stream_status[0] ? s_control_stream_status : "long_poll_disabled");
+  if (runtime_int_get(&s_control_stream_enabled_cfg) &&
+      !runtime_int_get(&s_long_poll_fallback_cfg)) {
+    if (runtime_string_empty(s_control_stream_status)) {
+      runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status),
+                         "long_poll_disabled");
+    }
     return -1;
   }
   (void)edr_ingest_http_control_hello_once();
@@ -6698,7 +7175,7 @@ static void sleep_poll_ms(int ms) {
   if (ms < step) {
     step = ms;
   }
-  while (s_poll_run && ms > 0) {
+  while (runtime_int_get(&s_poll_run) && ms > 0) {
 #ifdef _WIN32
     Sleep((DWORD)step);
 #else
@@ -6729,22 +7206,22 @@ static void *command_poll_thread(void *arg)
 {
   int backoff_ms = 5000;
   (void)arg;
-  s_poll_backoff_ms = backoff_ms;
-  while (s_poll_run) {
+  runtime_int_set(&s_poll_backoff_ms, backoff_ms);
+  while (runtime_int_get(&s_poll_run)) {
     int rc;
     if (!edr_ingest_http_configured()) {
       sleep_poll_ms(5000);
       continue;
     }
-    if (control_stream_ready_lease_valid() || s_ws_ready) {
-      s_poll_backoff_ms = 0;
+    if (control_stream_ready_lease_valid() || runtime_int_get(&s_ws_ready)) {
+      runtime_int_set(&s_poll_backoff_ms, 0);
       sleep_poll_ms(5000);
       continue;
     }
     rc = edr_ingest_http_poll_once();
     if (rc >= 0) {
       backoff_ms = 5000;
-      s_poll_backoff_ms = 0;
+      runtime_int_set(&s_poll_backoff_ms, 0);
       if (rc == 0) {
         sleep_poll_ms((int)poll_jitter_ms());
       }
@@ -6757,8 +7234,9 @@ static void *command_poll_thread(void *arg)
         backoff_ms = 300000;
       }
     }
-    s_poll_backoff_ms = backoff_ms;
+    runtime_int_set(&s_poll_backoff_ms, backoff_ms);
   }
+  runtime_int_set(&s_poll_thread_exited, 1);
 #ifdef _WIN32
   return 0;
 #else
@@ -6775,20 +7253,34 @@ void edr_ingest_http_start_command_poll(void) {
   if (s_poll_started || !edr_ingest_http_configured()) {
     return;
   }
-  s_poll_run = 1;
+#ifdef _WIN32
+  InterlockedExchange(&s_transfer_shutdown, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  __atomic_store_n(&s_transfer_shutdown, 0, __ATOMIC_RELEASE);
+#else
+  s_transfer_shutdown = 0;
+#endif
+  runtime_int_set(&s_poll_run, 1);
+  runtime_int_set(&s_poll_thread_exited, 0);
+  runtime_int_set(&s_ws_thread_exited, 1);
+  s_poll_thread_created = 0;
   ws_mu_init_once();
-  if (s_control_stream_enabled_cfg && (!streamoff || strcmp(streamoff, "0") != 0)) {
+  if (runtime_int_get(&s_control_stream_enabled_cfg) &&
+      (!streamoff || strcmp(streamoff, "0") != 0)) {
+    runtime_int_set(&s_ws_thread_exited, 0);
 #ifdef _WIN32
     s_ws_thread = (HANDLE)_beginthreadex(NULL, 0, control_ws_thread, NULL, 0, NULL);
     if (s_ws_thread) {
       s_ws_started = 1;
     } else {
+      runtime_int_set(&s_ws_thread_exited, 1);
       runtime_failure("control stream thread create failed");
     }
 #else
     if (pthread_create(&s_ws_thread, NULL, control_ws_thread, NULL) == 0) {
       s_ws_started = 1;
     } else {
+      runtime_int_set(&s_ws_thread_exited, 1);
       runtime_failure("control stream thread create failed");
     }
 #endif
@@ -6796,51 +7288,114 @@ void edr_ingest_http_start_command_poll(void) {
 #ifdef _WIN32
   s_poll_thread = (HANDLE)_beginthreadex(NULL, 0, command_poll_thread, NULL, 0, NULL);
   if (!s_poll_thread) {
-    s_poll_run = 0;
+    runtime_int_set(&s_poll_run, 0);
+    runtime_int_set(&s_poll_thread_exited, 1);
+    s_poll_started = s_ws_started ? 1 : 0;
     runtime_failure("http command poll thread create failed");
     return;
   }
+  s_poll_thread_created = 1;
 #else
   if (pthread_create(&s_poll_thread, NULL, command_poll_thread, NULL) != 0) {
-    s_poll_run = 0;
+    runtime_int_set(&s_poll_run, 0);
+    runtime_int_set(&s_poll_thread_exited, 1);
+    s_poll_started = s_ws_started ? 1 : 0;
     runtime_failure("http command poll thread create failed");
     return;
   }
+  s_poll_thread_created = 1;
 #endif
   s_poll_started = 1;
 }
 
-void edr_ingest_http_stop_command_poll(void) {
-  if (!s_poll_started) {
-    return;
+void edr_ingest_http_cancel_inflight(void) {
+#ifdef _WIN32
+  InterlockedExchange(&s_transfer_shutdown, 1);
+#elif defined(__GNUC__) || defined(__clang__)
+  __atomic_store_n(&s_transfer_shutdown, 1, __ATOMIC_RELEASE);
+#else
+  s_transfer_shutdown = 1;
+#endif
+}
+
+static uint64_t ingest_stop_monotonic_ms(void) {
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+  return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+
+static uint32_t ingest_stop_remaining_ms(uint64_t started_ms, uint32_t timeout_ms) {
+  uint64_t now = ingest_stop_monotonic_ms();
+  uint64_t elapsed = now >= started_ms ? now - started_ms : 0u;
+  return elapsed >= timeout_ms ? 0u : timeout_ms - (uint32_t)elapsed;
+}
+
+int edr_ingest_http_stop_command_poll_timeout(uint32_t timeout_ms) {
+  edr_ingest_http_cancel_inflight();
+  if (!s_poll_started && !s_poll_thread_created && !s_ws_started) {
+    return 1;
   }
-  s_poll_run = 0;
-  s_stream_ready = 0;
+  uint64_t started_ms = ingest_stop_monotonic_ms();
+  runtime_int_set(&s_poll_run, 0);
+  runtime_stream_state_set(0, 0);
   ws_lock();
-  if (s_ws_conn) {
-    if (s_ws_conn->fd != EDR_SOCKET_INVALID) {
-      close_fd(s_ws_conn->fd);
-      s_ws_conn->fd = EDR_SOCKET_INVALID;
-    }
+  if (s_ws_conn && s_ws_conn->fd != EDR_SOCKET_INVALID) {
+    close_fd(s_ws_conn->fd);
+    s_ws_conn->fd = EDR_SOCKET_INVALID;
   }
-  s_ws_ready = 0;
+  runtime_int_set(&s_ws_ready, 0);
   ws_unlock();
 #ifdef _WIN32
-  WaitForSingleObject(s_poll_thread, 3000);
-  CloseHandle(s_poll_thread);
-  s_poll_thread = NULL;
+  if (s_poll_thread_created && s_poll_thread) {
+    DWORD poll_wait = WaitForSingleObject(
+        s_poll_thread, (DWORD)ingest_stop_remaining_ms(started_ms, timeout_ms));
+    if (poll_wait != WAIT_OBJECT_0) {
+      fprintf(stderr, "[transport] command poll thread did not stop after cancellation\n");
+      return 0;
+    }
+    CloseHandle(s_poll_thread);
+    s_poll_thread = NULL;
+    s_poll_thread_created = 0;
+  }
   if (s_ws_started) {
-    WaitForSingleObject(s_ws_thread, 3000);
+    DWORD ws_wait = WaitForSingleObject(
+        s_ws_thread, (DWORD)ingest_stop_remaining_ms(started_ms, timeout_ms));
+    if (ws_wait != WAIT_OBJECT_0) {
+      fprintf(stderr, "[transport] websocket thread did not stop after cancellation\n");
+      return 0;
+    }
     CloseHandle(s_ws_thread);
     s_ws_thread = NULL;
     s_ws_started = 0;
   }
 #else
-  pthread_join(s_poll_thread, NULL);
+  for (;;) {
+    int poll_exited = !s_poll_thread_created || runtime_int_get(&s_poll_thread_exited);
+    int ws_exited = !s_ws_started || runtime_int_get(&s_ws_thread_exited);
+    if (poll_exited && ws_exited) break;
+    if (ingest_stop_remaining_ms(started_ms, timeout_ms) == 0u) {
+      fprintf(stderr, "[transport] command transport threads did not stop after cancellation\n");
+      return 0;
+    }
+    usleep(10000u);
+  }
+  if (s_poll_thread_created) {
+    if (pthread_join(s_poll_thread, NULL) != 0) return 0;
+    s_poll_thread_created = 0;
+  }
   if (s_ws_started) {
-    pthread_join(s_ws_thread, NULL);
+    if (pthread_join(s_ws_thread, NULL) != 0) return 0;
     s_ws_started = 0;
   }
 #endif
   s_poll_started = 0;
+  return 1;
+}
+
+void edr_ingest_http_stop_command_poll(void) {
+  (void)edr_ingest_http_stop_command_poll_timeout(10000u);
 }

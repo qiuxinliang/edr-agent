@@ -44,6 +44,7 @@ typedef struct rtq_errors {
     char json[4096];
     int offset;
     int count;
+    int warning_count;
 } rtq_errors;
 
 typedef struct rtq_filter {
@@ -252,6 +253,7 @@ static void rtq_error_init(rtq_errors *errs) {
     errs->json[0] = '\0';
     errs->offset = 0;
     errs->count = 0;
+    errs->warning_count = 0;
 }
 
 static void rtq_error_append(rtq_errors *errs, const char *source, const char *code,
@@ -273,10 +275,13 @@ static void rtq_error_append(rtq_errors *errs, const char *source, const char *c
                              sizeof(errs->json) - (size_t)errs->offset,
                              "\",\"message\":\"");
     append_json_escaped(errs->json, (int)sizeof(errs->json), &errs->offset, message ? message : "RTQ collector failed");
+    int warning = code && strcmp(code, "partial_access") == 0;
     errs->offset += snprintf(errs->json + errs->offset,
                              sizeof(errs->json) - (size_t)errs->offset,
-                             "\",\"retryable\":%s}", retryable ? "true" : "false");
+                             "\",\"retryable\":%s,\"severity\":\"%s\"}",
+                             retryable ? "true" : "false", warning ? "warning" : "error");
     errs->count++;
+    if (warning) errs->warning_count++;
 }
 
 static void trim_sampler_output(char *s) {
@@ -560,6 +565,39 @@ static void query_file_signature_status(const char *path, char *status, size_t c
     else snprintf(status, cap, "untrusted");
 }
 
+#define RTQ_PROCESS_FILE_METADATA_CACHE_MAX 64
+typedef struct rtq_process_file_metadata {
+    char path[520];
+    char sha256[65];
+    char signature[32];
+} rtq_process_file_metadata;
+
+static void query_process_file_metadata_cached(
+    const char *path, rtq_process_file_metadata *cache, int *cache_count,
+    char sha256[65], char signature[32]) {
+    if (!sha256 || !signature) return;
+    sha256[0] = '\0';
+    signature[0] = '\0';
+    if (!path || !path[0] || !cache || !cache_count) return;
+    for (int i = 0; i < *cache_count; i++) {
+        if (_stricmp(cache[i].path, path) == 0) {
+            snprintf(sha256, 65, "%s", cache[i].sha256);
+            snprintf(signature, 32, "%s", cache[i].signature);
+            return;
+        }
+    }
+
+    (void)hash_file_sha256_limited(path, sha256);
+    query_file_signature_status(path, signature, 32);
+    if (*cache_count >= RTQ_PROCESS_FILE_METADATA_CACHE_MAX) return;
+    rtq_process_file_metadata *entry = &cache[*cache_count];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+    snprintf(entry->sha256, sizeof(entry->sha256), "%s", sha256);
+    snprintf(entry->signature, sizeof(entry->signature), "%s", signature);
+    (*cache_count)++;
+}
+
 typedef LONG (WINAPI *RtqNtQueryInformationProcessFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 typedef struct rtq_unicode_string {
     USHORT length;
@@ -711,6 +749,9 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
     int cmdline_sampled = 0;
     int cmdline_access_denied = 0;
     int cmdline_failed = 0;
+    rtq_process_file_metadata file_metadata_cache[RTQ_PROCESS_FILE_METADATA_CACHE_MAX];
+    int file_metadata_cache_count = 0;
+    memset(file_metadata_cache, 0, sizeof(file_metadata_cache));
     if (Process32FirstW(h, &pe)) {
         do {
             if (rtq_cancelled(f)) break;
@@ -760,8 +801,9 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
                 }
                 query_process_integrity_level(pe.th32ProcessID, integrity, sizeof(integrity));
                 if (path[0]) {
-                    (void)hash_file_sha256_limited(path, exe_sha256);
-                    query_file_signature_status(path, signature, sizeof(signature));
+                    query_process_file_metadata_cached(path, file_metadata_cache,
+                                                       &file_metadata_cache_count,
+                                                       exe_sha256, signature);
                 }
                 if (pe.th32ParentProcessID > 0) {
                     query_process_path(pe.th32ParentProcessID, parent_path, sizeof(parent_path));
@@ -1690,14 +1732,16 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
         total, cache_status, filter.file_cache_attempted ? "true" : "false",
         filter.file_cache_hits, filter.file_cache_candidates,
         filter.file_path_scanned ? "true" : "false");
-    if (errors.count > 0) {
+    if (errors.count > errors.warning_count || (errors.count > 0 && total == 0)) {
         offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset), "\"");
         append_json_escaped(result, RTQ_MAX_RESULT_STR, &offset, "one or more RTQ collectors failed");
         offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
-                           "\",\"errors\":[%s]}", errors.json);
+                           "\",\"errors\":[%s],\"warning_count\":%d}",
+                           errors.json, errors.warning_count);
     } else {
         offset += snprintf(result + offset, (size_t)(RTQ_MAX_RESULT_STR - offset),
-                           "null,\"errors\":[]}");
+                           "null,\"errors\":[%s],\"warning_count\":%d}",
+                           errors.json, errors.warning_count);
     }
 
     g_cmd_handled++; g_cmd_exec_ok++;

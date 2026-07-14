@@ -47,6 +47,10 @@ int main(void) {
                "isolation is routed to critical execution lane");
   require_true(edr_command_registry_execution_lane("deep_forensic") == EDR_COMMAND_LANE_BULK,
                "deep forensic is routed to bulk execution lane");
+  require_true(edr_command_registry_execution_lane("yara_scan") == EDR_COMMAND_LANE_SCAN,
+               "YARA is isolated from long-running bulk collectors");
+  require_true(edr_command_registry_execution_lane("pmfe_scan") == EDR_COMMAND_LANE_SCAN,
+               "PMFE scanning shares the bounded scan lane");
   require_true(edr_command_registry_cancel_mode("rtr_shell") == EDR_COMMAND_CANCEL_HARD,
                "RTR shell declares hard cancellation");
   require_true(edr_command_registry_cancel_mode("rtq_execute") == EDR_COMMAND_CANCEL_COOPERATIVE,
@@ -122,6 +126,12 @@ int main(void) {
                "reject malformed RTQ SHA256");
   require_true(validate("velo_query", "{\"scope\":\"inspect_process\",\"pid\":42,\"limit\":100,\"backend\":\"local_collector\",\"provider_requested\":\"auto\",\"fallback_reason\":\"\",\"initiated_by\":\"operator\"}", reason, sizeof(reason)),
                "current backend velo payload satisfies strict contract");
+  require_true(validate("REFRESH_ATTACK_SURFACE", "{\"reason\":\"manual attack surface refresh\"}",
+                        reason, sizeof(reason)),
+               "current backend attack surface refresh payload satisfies strict contract");
+  require_true(!validate("REFRESH_ATTACK_SURFACE", "{\"reason\":\"manual\",\"requested_at\":\"now\"}",
+                         reason, sizeof(reason)),
+               "reject the retired attack surface requested_at field");
   require_true(validate("forensic_deep", "{\"scope\":2,\"initiated_by\":\"operator\"}", reason, sizeof(reason)),
                "current deep-forensic payload satisfies strict contract");
   require_true(validate("forensic_targeted", "{\"scope\":\"targeted\",\"reason\":\"triage\",\"timeout_ms\":60000,\"items\":[{\"type\":\"file\",\"path\":\"C:\\\\Temp\\\\a.bin\"}],\"initiated_by\":\"operator\"}", reason, sizeof(reason)),

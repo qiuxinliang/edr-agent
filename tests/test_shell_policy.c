@@ -2,6 +2,11 @@
 #include <string.h>
 #include "edr/shell_exec.h"
 
+void edr_collector_register_policy_canary_process(uint32_t pid, const char *command) {
+  (void)pid;
+  (void)command;
+}
+
 static const char *custom_allow[] = {
   "whoami", "hostname", "ls", "cat", "find", "grep",
   "tasklist", "ps", "netstat", "curl", "wget",

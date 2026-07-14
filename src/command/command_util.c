@@ -170,7 +170,8 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
   command_apply_cancel_override(cmd_id, &st, &exit_code, &detail,
                                 &response_status, cancel_detail,
                                 sizeof(cancel_detail));
-  int should_report = edr_command_soar_want_report(sm);
+  int should_report = edr_command_soar_want_report(sm) ||
+                      (cmd_id && strncmp(cmd_id, "cmd_", 4u) == 0);
   if (edr_command_state_finish(cmd_id, s_active_command_type, sm,
                                response_status ? response_status : command_response_status_label(st),
                                (int)st, exit_code, detail ? detail : "", "",

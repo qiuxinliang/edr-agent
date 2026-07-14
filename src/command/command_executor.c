@@ -1,6 +1,7 @@
 #include "edr/command_executor.h"
 
 #include "edr/command.h"
+#include "edr/command_cancel.h"
 #include "edr/command_state.h"
 
 #include <stdint.h>
@@ -15,7 +16,7 @@
 #include <time.h>
 #endif
 
-enum { EDR_COMMAND_EXECUTOR_MAX_WORKERS = 8 };
+enum { EDR_COMMAND_EXECUTOR_MAX_WORKERS = 10 };
 
 typedef struct EdrCommandWorker {
   EdrCommandExecutionLane lane;
@@ -30,6 +31,7 @@ typedef struct EdrCommandExecutor {
   int started;
   int accepting;
   uint32_t active_workers;
+  uint32_t live_workers;
   uint32_t worker_count;
   uint32_t queue_capacity;
   uint32_t queue_critical_reserve;
@@ -38,6 +40,7 @@ typedef struct EdrCommandExecutor {
   uint64_t executed_count;
   uint64_t replay_error_count;
   uint64_t queue_rejected_count;
+  uint32_t lane_worker_count[EDR_COMMAND_LANE_COUNT];
   uint64_t lane_executed[EDR_COMMAND_LANE_COUNT];
   EdrCommandWorker workers[EDR_COMMAND_EXECUTOR_MAX_WORKERS];
 #ifdef _WIN32
@@ -89,6 +92,17 @@ static void executor_wait(void) {
 static void executor_signal_all(void) { pthread_cond_broadcast(&s_executor.wake); }
 #endif
 
+static void executor_sleep_ms(uint32_t milliseconds) {
+#ifdef _WIN32
+  Sleep((DWORD)milliseconds);
+#else
+  struct timespec delay;
+  delay.tv_sec = (time_t)(milliseconds / 1000u);
+  delay.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
+  nanosleep(&delay, NULL);
+#endif
+}
+
 #ifdef _WIN32
 static unsigned __stdcall executor_main(void *arg)
 #else
@@ -122,6 +136,12 @@ static void *executor_main(void *arg)
     }
     executor_unlock();
   }
+  executor_lock();
+  if (s_executor.live_workers > 0u) {
+    s_executor.live_workers--;
+  }
+  executor_signal_all();
+  executor_unlock();
 #ifdef _WIN32
   return 0u;
 #else
@@ -136,17 +156,21 @@ static int executor_add_worker(EdrCommandExecutionLane lane) {
   EdrCommandWorker *worker = &s_executor.workers[s_executor.worker_count];
   memset(worker, 0, sizeof(*worker));
   worker->lane = lane;
+  s_executor.live_workers++;
 #ifdef _WIN32
   worker->thread = (HANDLE)_beginthreadex(NULL, 0, executor_main, worker, 0, NULL);
   if (!worker->thread) {
+    s_executor.live_workers--;
     return -1;
   }
 #else
   if (pthread_create(&worker->thread, NULL, executor_main, worker) != 0) {
+    s_executor.live_workers--;
     return -1;
   }
 #endif
   s_executor.worker_count++;
+  s_executor.lane_worker_count[lane]++;
   return 0;
 }
 
@@ -155,6 +179,7 @@ int edr_command_executor_start(void) {
     return 0;
   }
   memset(&s_executor, 0, sizeof(s_executor));
+  edr_command_cancel_reset_all();
 #ifdef _WIN32
   InitializeCriticalSection(&s_executor.lock);
   InitializeConditionVariable(&s_executor.wake);
@@ -174,7 +199,8 @@ int edr_command_executor_start(void) {
 
   uint32_t critical_workers = executor_env_u32("EDR_COMMAND_CRITICAL_WORKERS", 1u, 1u, 2u);
   uint32_t interactive_workers = executor_env_u32("EDR_COMMAND_INTERACTIVE_WORKERS", 2u, 1u, 4u);
-  uint32_t bulk_workers = executor_env_u32("EDR_COMMAND_BULK_WORKERS", 1u, 1u, 2u);
+  uint32_t bulk_workers = executor_env_u32("EDR_COMMAND_BULK_WORKERS", 2u, 1u, 2u);
+  uint32_t scan_workers = executor_env_u32("EDR_COMMAND_SCAN_WORKERS", 1u, 1u, 2u);
   for (uint32_t i = 0; i < critical_workers; i++) {
     if (executor_add_worker(EDR_COMMAND_LANE_CRITICAL) != 0) goto fail;
   }
@@ -183,6 +209,9 @@ int edr_command_executor_start(void) {
   }
   for (uint32_t i = 0; i < bulk_workers; i++) {
     if (executor_add_worker(EDR_COMMAND_LANE_BULK) != 0) goto fail;
+  }
+  for (uint32_t i = 0; i < scan_workers; i++) {
+    if (executor_add_worker(EDR_COMMAND_LANE_SCAN) != 0) goto fail;
   }
   s_executor.started = 1;
   return 0;
@@ -254,14 +283,32 @@ void edr_command_executor_release_admission(void) {
   executor_unlock();
 }
 
-void edr_command_executor_shutdown(void) {
+int edr_command_executor_shutdown_timeout(uint32_t timeout_ms) {
   if (!s_executor.started) {
-    return;
+    return 1;
   }
   executor_lock();
   s_executor.accepting = 0;
   executor_signal_all();
   executor_unlock();
+  (void)edr_command_cancel_request_all();
+
+  uint32_t waited_ms = 0u;
+  for (;;) {
+    executor_lock();
+    uint32_t live_workers = s_executor.live_workers;
+    executor_unlock();
+    if (live_workers == 0u) {
+      break;
+    }
+    if (waited_ms >= timeout_ms) {
+      return 0;
+    }
+    uint32_t step_ms = timeout_ms - waited_ms;
+    if (step_ms > 10u) step_ms = 10u;
+    executor_sleep_ms(step_ms);
+    waited_ms += step_ms;
+  }
   for (uint32_t i = 0; i < s_executor.worker_count; i++) {
 #ifdef _WIN32
     (void)WaitForSingleObject(s_executor.workers[i].thread, INFINITE);
@@ -277,6 +324,11 @@ void edr_command_executor_shutdown(void) {
   pthread_mutex_destroy(&s_executor.lock);
 #endif
   memset(&s_executor, 0, sizeof(s_executor));
+  return 1;
+}
+
+void edr_command_executor_shutdown(void) {
+  (void)edr_command_executor_shutdown_timeout(30000u);
 }
 
 void edr_command_executor_get_health(EdrCommandExecutorHealth *out_health) {
@@ -292,6 +344,7 @@ void edr_command_executor_get_health(EdrCommandExecutorHealth *out_health) {
   out_health->accepting = s_executor.accepting;
   out_health->active = s_executor.active_workers > 0u;
   out_health->worker_count = s_executor.worker_count;
+  out_health->live_worker_count = s_executor.live_workers;
   out_health->queue_capacity = s_executor.queue_capacity;
   out_health->queue_critical_reserve = s_executor.queue_critical_reserve;
   out_health->admission_reservations = s_executor.admission_reservations;
@@ -300,6 +353,7 @@ void edr_command_executor_get_health(EdrCommandExecutorHealth *out_health) {
   out_health->replay_error_count = s_executor.replay_error_count;
   out_health->queue_rejected_count = s_executor.queue_rejected_count;
   for (int lane = 0; lane < EDR_COMMAND_LANE_COUNT; lane++) {
+    out_health->lane_worker_count[lane] = s_executor.lane_worker_count[lane];
     out_health->lane_executed[lane] = s_executor.lane_executed[lane];
   }
   executor_unlock();

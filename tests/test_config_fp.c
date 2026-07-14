@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+void edr_win_listen_apply_config(const EdrConfig *cfg) { (void)cfg; }
+#endif
+
 static void test_detection_policy_fp_feedback_maps_to_env(void) {
   const char *fn = "edr_test_cfg_detpol.toml";
   FILE *f = fopen(fn, "wb");

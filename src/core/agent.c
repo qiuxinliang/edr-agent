@@ -1777,6 +1777,8 @@ static int edr_agent_collection_enabled(const EdrConfig *cfg) {
   return cfg->collection.etw_enabled || cfg->collection.ebpf_enabled || cfg->collection.auditd_enabled;
 }
 
+static void edr_agent_queue_attack_surface(const char *reason, uint64_t now_ns);
+
 EdrError edr_agent_run(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
     return EDR_ERR_INVALID_ARG;
@@ -1806,14 +1808,10 @@ EdrError edr_agent_run(EdrAgent *agent) {
       }
       if (agent->cfg.attack_surface.enabled && agent->cfg.agent.endpoint_id[0] &&
           strcmp(agent->cfg.agent.endpoint_id, "auto") != 0) {
-        char d[256];
-        int sr = edr_attack_surface_execute("agent_start", &agent->cfg, d, sizeof(d));
-        if (sr != 0) {
-          fprintf(stderr, "[attack_surface] startup snapshot failed: %s\n", d);
-        } else if (strncmp(d, "uploaded_", 9) == 0) {
-          fprintf(stderr, "[attack_surface] startup %s\n", d);
-          agent->asurf_enrolled_posted = 1;
-        }
+        uint64_t now_ns = edr_monotonic_ns();
+        edr_agent_queue_attack_surface("agent_start", now_ns);
+        agent->asurf_enrolled_posted = 1;
+        fprintf(stderr, "[attack_surface] startup snapshot queued\n");
       } else if (agent->cfg.attack_surface.enabled) {
         fprintf(stderr, "[attack_surface] startup pending: endpoint_id is not valid yet\n");
       } else {
@@ -2028,7 +2026,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char static_ver[48], behavior_ver[48], ioc_ver[48];
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
-  char http_err[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
+  char http_err[192], command_result_error[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
   char corr_health_json[600];
   char event_filter_ver[96];
   char event_filter_last_reason[128], event_filter_last_process[128];
@@ -2101,6 +2099,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_ingest_http_copy_policy_version(runtime_policy_raw, sizeof(runtime_policy_raw));
   json_escape_small(runtime_policy_raw, runtime_policy_ver, sizeof(runtime_policy_ver));
   json_escape_small(http_rt.last_error, http_err, sizeof(http_err));
+  json_escape_small(http_rt.command_result_last_error, command_result_error,
+                    sizeof(command_result_error));
   json_escape_small(http_rt.connection_mode, http_conn_mode, sizeof(http_conn_mode));
   json_escape_small(http_rt.effective_base_url, http_base_url, sizeof(http_base_url));
   char http_route_profile[128];
@@ -2194,6 +2194,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"dict_bytes\":%llu,\"compress_ok\":%lu,\"compress_fail\":%lu},"
         "\"http2_multiplex\":{\"enabled\":%s,\"active\":%s,"
         "\"ok\":%lu,\"fail\":%lu},"
+        "\"command_result_delivery\":{\"ok\":%lu,\"fail\":%lu,"
+        "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
+        "\"retryable\":%s,\"last_error\":\"%s\"},"
         "\"transport_v2\":{\"enabled\":%s,\"opened_streams\":%lu,"
         "\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
         "\"resume_count\":%lu,\"control_frames\":%lu,"
@@ -2204,8 +2207,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
         "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
         "\"command_delivery\":{\"executor\":{\"started\":%s,\"accepting\":%s,"
-        "\"active\":%s,\"workers\":%u,\"pending\":%u,\"reserved\":%u,"
-        "\"capacity\":%u,\"critical_reserve\":%u,\"queue_rejected\":%llu}},"
+        "\"active\":%s,\"workers\":%u,\"live_workers\":%u,\"pending\":%u,\"reserved\":%u,"
+        "\"capacity\":%u,\"critical_reserve\":%u,"
+        "\"lane_workers\":{\"critical\":%u,\"interactive\":%u,\"bulk\":%u,\"scan\":%u},"
+        "\"queue_rejected\":%llu}},"
         "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
         "\"behavior_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,"
         "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
@@ -2292,6 +2297,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         http_rt.http2_multiplex_enabled ? "true" : "false",
         http_rt.http2_multiplex_active ? "true" : "false",
         http_rt.http2_multiplex_ok_count, http_rt.http2_multiplex_fail_count,
+        http_rt.command_result_ok_count, http_rt.command_result_fail_count,
+        (long long)http_rt.command_result_last_success_unix_ms,
+        (long long)http_rt.command_result_last_failure_unix_ms,
+        http_rt.command_result_last_error_retryable ? "true" : "false",
+        command_result_error,
         tv2_rt.enabled ? "true" : "false", tv2_rt.opened_streams,
         tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
         tv2_rt.resume_count, tv2_rt.control_frames,
@@ -2308,8 +2318,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)s_agent_loop_elapsed_last_us,
         (unsigned long long)s_agent_loop_elapsed_max_us,
         ceh.started ? "true" : "false", ceh.accepting ? "true" : "false",
-        ceh.active ? "true" : "false", ceh.worker_count, ceh.pending_count,
+        ceh.active ? "true" : "false", ceh.worker_count, ceh.live_worker_count,
+        ceh.pending_count,
         ceh.admission_reservations, ceh.queue_capacity, ceh.queue_critical_reserve,
+        ceh.lane_worker_count[EDR_COMMAND_LANE_CRITICAL],
+        ceh.lane_worker_count[EDR_COMMAND_LANE_INTERACTIVE],
+        ceh.lane_worker_count[EDR_COMMAND_LANE_BULK],
+        ceh.lane_worker_count[EDR_COMMAND_LANE_SCAN],
         (unsigned long long)ceh.queue_rejected_count,
         agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
         agent->cfg.resource_limit.behavior_infer_per_min,
@@ -2515,6 +2530,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"dict_bytes\":%llu,\"compress_ok\":%lu,\"compress_fail\":%lu},"
       "\"http2_multiplex\":{\"enabled\":%s,\"active\":%s,"
       "\"ok\":%lu,\"fail\":%lu},"
+      "\"command_result_delivery\":{\"ok\":%lu,\"fail\":%lu,"
+      "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
+      "\"retryable\":%s,\"last_error\":\"%s\"},"
       "\"transport_v2\":{\"enabled\":%s,\"opened_streams\":%lu,"
       "\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
       "\"resume_count\":%lu,\"control_frames\":%lu,"
@@ -2541,10 +2559,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"move_failures\":%llu,\"last_unix_ms\":%lld,\"last_kind\":\"%s\","
       "\"last_reason\":\"%s\"},"
       "\"executor\":{\"started\":%s,\"accepting\":%s,\"active\":%s,"
-      "\"workers\":%u,\"pending\":%u,\"reserved\":%u,\"capacity\":%u,\"critical_reserve\":%u,"
+      "\"workers\":%u,\"live_workers\":%u,\"pending\":%u,\"reserved\":%u,\"capacity\":%u,\"critical_reserve\":%u,"
+      "\"lane_workers\":{\"critical\":%u,\"interactive\":%u,\"bulk\":%u,\"scan\":%u},"
       "\"wake_count\":%llu,\"executed_count\":%llu,\"replay_errors\":%llu,"
       "\"queue_rejected\":%llu,\"critical_executed\":%llu,"
-      "\"interactive_executed\":%llu,\"bulk_executed\":%llu}},"
+      "\"interactive_executed\":%llu,\"bulk_executed\":%llu,\"scan_executed\":%llu}},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
       "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
@@ -2716,6 +2735,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       http_rt.http2_multiplex_enabled ? "true" : "false",
       http_rt.http2_multiplex_active ? "true" : "false",
       http_rt.http2_multiplex_ok_count, http_rt.http2_multiplex_fail_count,
+      http_rt.command_result_ok_count, http_rt.command_result_fail_count,
+      (long long)http_rt.command_result_last_success_unix_ms,
+      (long long)http_rt.command_result_last_failure_unix_ms,
+      http_rt.command_result_last_error_retryable ? "true" : "false",
+      command_result_error,
       tv2_rt.enabled ? "true" : "false", tv2_rt.opened_streams,
       tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
       tv2_rt.resume_count, tv2_rt.control_frames,
@@ -2749,14 +2773,20 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (long long)cdh.last_quarantine_unix_ms,
       command_quarantine_kind, command_quarantine_reason,
       ceh.started ? "true" : "false", ceh.accepting ? "true" : "false",
-      ceh.active ? "true" : "false", ceh.worker_count, ceh.pending_count,
+      ceh.active ? "true" : "false", ceh.worker_count, ceh.live_worker_count,
+      ceh.pending_count,
       ceh.admission_reservations, ceh.queue_capacity, ceh.queue_critical_reserve,
+      ceh.lane_worker_count[EDR_COMMAND_LANE_CRITICAL],
+      ceh.lane_worker_count[EDR_COMMAND_LANE_INTERACTIVE],
+      ceh.lane_worker_count[EDR_COMMAND_LANE_BULK],
+      ceh.lane_worker_count[EDR_COMMAND_LANE_SCAN],
       (unsigned long long)ceh.wake_count, (unsigned long long)ceh.executed_count,
       (unsigned long long)ceh.replay_error_count,
       (unsigned long long)ceh.queue_rejected_count,
       (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_CRITICAL],
       (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_INTERACTIVE],
       (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_BULK],
+      (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_SCAN],
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       agent->cfg.resource_limit.ave_infer_per_min,
       agent->cfg.resource_limit.behavior_infer_per_min,
@@ -2987,13 +3017,8 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
       const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
       if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&
           agent->cfg.agent.endpoint_id[0] && strcmp(agent->cfg.agent.endpoint_id, "auto") != 0) {
-        char d[256];
-        int sr = edr_attack_surface_execute("config_reload", &agent->cfg, d, sizeof(d));
-        if (sr != 0) {
-          fprintf(stderr, "[attack_surface] config_reload POST failed: %s\n", d);
-        } else if (strncmp(d, "uploaded_", 9) == 0) {
-          fprintf(stderr, "[attack_surface] config_reload %s\n", d);
-        }
+        edr_agent_queue_attack_surface("config_reload", now);
+        fprintf(stderr, "[attack_surface] config_reload snapshot queued\n");
       }
     }
     {
@@ -3524,13 +3549,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
     if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&
         agent->cfg.agent.endpoint_id[0] && strcmp(agent->cfg.agent.endpoint_id, "auto") != 0) {
-      char d[256];
-      int sr = edr_attack_surface_execute("config_reload", &agent->cfg, d, sizeof(d));
-      if (sr != 0) {
-        fprintf(stderr, "[attack_surface] remote config_reload POST failed: %s\n", d);
-      } else if (strncmp(d, "uploaded_", 9) == 0) {
-        fprintf(stderr, "[attack_surface] remote config_reload %s\n", d);
-      }
+      edr_agent_queue_attack_surface("remote_config_reload", now);
+      fprintf(stderr, "[attack_surface] remote config_reload snapshot queued\n");
     }
   }
   {

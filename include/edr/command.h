@@ -96,6 +96,7 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane);
 /** 周期性刷可靠投递 outbox：取证上传补发、命令执行结果补报、状态库压缩。 */
 void edr_command_poll_reliable_delivery(void);
 void edr_command_delivery_shutdown(void);
+int edr_command_delivery_shutdown_timeout(uint32_t timeout_ms);
 
 /** Persist a collected forensic artifact for retryable upload. A successful
  * retry emits the command's single terminal result. */

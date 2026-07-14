@@ -58,9 +58,24 @@ int main(void) {
   ok &= require_contains(response, "static int yara_external_enabled(void)", "YARA must have an execution-path policy");
   ok &= require_contains(response, "#ifdef EDR_HAVE_YARA\n  return 0;", "libyara builds must default to the local path");
   ok &= require_contains(response, "edr.yara_scan.result.v1", "YARA must emit its dedicated result schema");
+  ok &= require_contains(response, "root_open_failed", "directory YARA must distinguish an inaccessible root");
+  ok &= require_contains(response, "yd.scan_completed == 0", "directory YARA must reject zero completed scans");
+  ok &= require_contains(response, "no eligible readable files completed YARA scanning", "zero-scan failure must be explicit");
   ok &= require_contains(response, "pl, len, \"tar.gz\", 1", "external YARA artifact type must match collector output");
   ok &= require_contains(response, "if (rc == 0 || rc == 2)", "collector partial exit must be a terminal success state");
   free(response);
+
+  snprintf(path, sizeof(path), "%s/src/command/command_stub.c", root);
+  char *commands = read_file(path);
+  if (!commands) {
+    fprintf(stderr, "FAIL: cannot read command handler source\n");
+    return 1;
+  }
+  ok &= require_contains(commands, "velo_load_validated_output", "Velo output must be validated before success");
+  ok &= require_contains(commands, "query output is missing the required rows array", "Velo output must require rows");
+  ok &= require_contains(commands, "collector returned an error", "Velo must preserve collector failures");
+  ok &= require_contains(commands, "provider_status", "Velo must preserve provider status provenance");
+  free(commands);
 
   snprintf(path, sizeof(path), "%s/src/transport/ingest_http.c", root);
   char *transport = read_file(path);

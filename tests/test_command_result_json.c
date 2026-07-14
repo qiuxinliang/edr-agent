@@ -34,11 +34,53 @@ static void verify_type(const char *command_type) {
   edr_command_result_json_free(json);
 }
 
+static void verify_http_ack_contract(void) {
+  require_true(edr_command_result_http_response_acked(
+                   "{\"code\":\"OK\",\"data\":{\"accepted\":true,\"complete\":true},"
+                   "\"message\":\"success\"}"),
+               "current backend success envelope is accepted");
+  require_true(edr_command_result_http_response_acked(
+                   "{\"accepted\":true,\"complete\":true}"),
+               "legacy top-level success envelope is accepted");
+  require_true(edr_command_result_http_response_acked(
+                   "{\"accepted\":true,\"complete\":true,\"data\":{\"message\":\"success\"}}"),
+               "legacy ACK survives an unrelated standard data envelope");
+  require_true(!edr_command_result_http_response_acked(
+                   "{\"accepted\":true,\"complete\":true,"
+                   "\"data\":{\"accepted\":false,\"complete\":true}}"),
+               "explicit nested ACK remains authoritative");
+  require_true(!edr_command_result_http_response_acked(
+                   "{\"accepted\":true,\"complete\":true,\"data\":{\"complete\":false}}"),
+               "nested incomplete state cannot be masked by a root ACK");
+  require_true(edr_command_result_http_response_acked("{\"accepted\":true}"),
+               "complete may be omitted after accepted");
+  require_true(!edr_command_result_http_response_acked(
+                   "{\"code\":\"OK\",\"data\":{\"accepted\":true,\"complete\":false}}"),
+               "explicit incomplete response is rejected");
+  require_true(edr_command_result_http_chunk_response_acked(
+                   "{\"code\":\"OK\",\"data\":{\"accepted\":true,\"complete\":false}}"),
+               "chunk sender accepts an explicit incomplete acknowledgement");
+  require_true(edr_command_result_http_chunk_response_acked(
+                   "{\"code\":\"OK\",\"data\":{\"accepted\":true,\"complete\":true}}"),
+               "chunk sender accepts an already complete acknowledgement");
+  require_true(!edr_command_result_http_chunk_response_acked(
+                   "{\"code\":\"OK\",\"data\":{\"accepted\":false,\"complete\":false}}"),
+               "chunk sender rejects a negative acknowledgement");
+  require_true(!edr_command_result_http_response_acked(
+                   "{\"code\":\"OK\",\"message\":\"success\"}"),
+               "transport success without application ack is rejected");
+  require_true(!edr_command_result_http_response_acked("not-json"),
+               "malformed response is rejected");
+  require_true(!edr_command_result_http_response_acked(NULL),
+               "missing response is rejected");
+}
+
 int main(void) {
   verify_type("rtq_execute");
   verify_type("rtr_shell");
   verify_type("velo_query");
   verify_type("targeted_forensic");
+  verify_http_ack_contract();
   printf("ok\n");
   return 0;
 }

@@ -3,8 +3,22 @@
 #include "edr/config.h"
 #include "edr/ingest_http.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static SRWLOCK s_tv2_lock = SRWLOCK_INIT;
+static void tv2_lock(void) { AcquireSRWLockExclusive(&s_tv2_lock); }
+static void tv2_unlock(void) { ReleaseSRWLockExclusive(&s_tv2_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_tv2_lock = PTHREAD_MUTEX_INITIALIZER;
+static void tv2_lock(void) { (void)pthread_mutex_lock(&s_tv2_lock); }
+static void tv2_unlock(void) { (void)pthread_mutex_unlock(&s_tv2_lock); }
+#endif
 
 static EdrTransportV2Config s_cfg;
 static EdrTransportV2Runtime s_rt;
@@ -41,7 +55,7 @@ static const char *operation_name(EdrTransportV2Operation op) {
   }
 }
 
-static void note_channel(EdrTransportV2Channel channel) {
+static void note_channel_locked(EdrTransportV2Channel channel) {
   switch (channel) {
     case EDR_TV2_CHANNEL_CONTROL: s_rt.channel_control++; break;
     case EDR_TV2_CHANNEL_HIGH_SEV_TELEMETRY: s_rt.channel_high_sev++; break;
@@ -54,8 +68,10 @@ static void note_channel(EdrTransportV2Channel channel) {
 }
 
 void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
+  tv2_lock();
   memset(&s_cfg, 0, sizeof(s_cfg));
   memset(&s_rt, 0, sizeof(s_rt));
+  s_next_stream_id = 1;
   s_cfg.enabled = 1;
   s_cfg.h2_enabled = 1;
   s_cfg.h2_required = 0;
@@ -100,12 +116,14 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
   if (s_cfg.telemetry_sampling_pct > 100u) {
     s_cfg.telemetry_sampling_pct = 100u;
   }
-  edr_transport_v2_get_runtime(&s_rt);
+  tv2_unlock();
 }
 
 void edr_transport_v2_get_config(EdrTransportV2Config *out) {
   if (out) {
+    tv2_lock();
     *out = s_cfg;
+    tv2_unlock();
   }
 }
 
@@ -113,6 +131,7 @@ void edr_transport_v2_get_runtime(EdrTransportV2Runtime *out) {
   if (!out) {
     return;
   }
+  tv2_lock();
   *out = s_rt;
   out->configured = 1;
   out->enabled = s_cfg.enabled;
@@ -135,12 +154,14 @@ void edr_transport_v2_get_runtime(EdrTransportV2Runtime *out) {
   tv2_copy(out->profile_id, sizeof(out->profile_id), s_cfg.profile_id, "default-http1-protobuf");
   tv2_copy(out->qos_dscp, sizeof(out->qos_dscp), s_cfg.qos_dscp, "AF21");
   tv2_copy(out->threshold, sizeof(out->threshold), s_cfg.threshold, "medium");
+  tv2_unlock();
 }
 
 void edr_transport_v2_apply_profile(const char *dict_ver, const char *schema_ver,
                                     const char *profile_id, int h2, int zstd,
                                     const char *qos_dscp, unsigned sampling_pct,
                                     const char *threshold, int backpressure_enabled) {
+  tv2_lock();
   if (backpressure_enabled >= 0) {
     s_cfg.backpressure_enabled = backpressure_enabled ? 1 : 0;
   }
@@ -170,51 +191,63 @@ void edr_transport_v2_apply_profile(const char *dict_ver, const char *schema_ver
   if (sampling_pct > 0u) {
     s_cfg.telemetry_sampling_pct = sampling_pct > 100u ? 100u : sampling_pct;
   }
+  tv2_unlock();
 }
 
 int edr_transport_v2_open_stream(EdrTransportV2Channel channel, EdrTransportV2Operation op) {
-  int stream_id = s_next_stream_id++;
-  if (s_next_stream_id <= 0) {
+  tv2_lock();
+  if (s_next_stream_id <= 0 || s_next_stream_id == INT_MAX) {
     s_next_stream_id = 1;
   }
+  int stream_id = s_next_stream_id++;
   s_rt.opened_streams++;
-  note_channel(channel);
+  note_channel_locked(channel);
   tv2_copy(s_rt.active_channel, sizeof(s_rt.active_channel), channel_name(channel), NULL);
   tv2_copy(s_rt.last_operation, sizeof(s_rt.last_operation), operation_name(op), NULL);
+  tv2_unlock();
   return stream_id;
 }
 
 int edr_transport_v2_send(int stream_id, const void *data, size_t len) {
   (void)data;
+  tv2_lock();
   if (stream_id <= 0 || len == 0u) {
     s_rt.send_fail++;
     tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "invalid transport v2 send");
+    tv2_unlock();
     return -1;
   }
   s_rt.send_ok++;
   s_rt.last_error[0] = '\0';
+  tv2_unlock();
   return 0;
 }
 
 void edr_transport_v2_on_control(const char *frame_type) {
+  tv2_lock();
   s_rt.control_frames++;
   tv2_copy(s_rt.active_channel, sizeof(s_rt.active_channel), NULL, "control");
   tv2_copy(s_rt.last_operation, sizeof(s_rt.last_operation), frame_type, "control_frame");
+  tv2_unlock();
 }
 
 void edr_transport_v2_ack(const char *command_id, int ok) {
   (void)command_id;
+  tv2_lock();
   if (ok) {
     s_rt.ack_ok++;
   } else {
     s_rt.ack_fail++;
   }
+  tv2_unlock();
 }
 
 void edr_transport_v2_resume(const char *cursor) {
   (void)cursor;
+  tv2_lock();
   s_rt.resume_count++;
   tv2_copy(s_rt.last_operation, sizeof(s_rt.last_operation), NULL, "resume");
+  tv2_unlock();
 }
 
 int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12,
@@ -228,8 +261,10 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
   }
   rc = edr_ingest_http_post_report_events(batch_id, header12, header_len, payload, payload_len);
   if (rc != 0) {
+    tv2_lock();
     s_rt.send_fail++;
     tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "report_events failed");
+    tv2_unlock();
   }
   return rc;
 }
@@ -250,10 +285,14 @@ int edr_transport_v2_command_result_typed(const char *command_id, const char *co
     char error[160];
     error[0] = '\0';
     edr_ingest_http_get_last_command_result_delivery_error(error, sizeof(error), NULL);
+    tv2_lock();
     s_rt.send_fail++;
     tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), error, "command_result failed");
+    tv2_unlock();
   } else {
+    tv2_lock();
     s_rt.last_error[0] = '\0';
+    tv2_unlock();
   }
   return rc;
 }
@@ -276,8 +315,10 @@ int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
   rc = edr_ingest_http_upload_file_multipart(upload_id, file_path, sha256_hex,
                                              out_minio_key, out_minio_key_cap);
   if (rc != 0) {
+    tv2_lock();
     s_rt.send_fail++;
     tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "upload_file failed");
+    tv2_unlock();
   }
   return rc;
 }

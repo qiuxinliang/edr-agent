@@ -631,9 +631,18 @@ static int edr_agent_run_main(const char *config) {
       }
     }
   }
-  edr_ingest_http_stop_command_poll();
-  edr_command_delivery_shutdown();
-  edr_command_executor_shutdown();
+  if (!edr_ingest_http_stop_command_poll_timeout(10000u)) {
+    fprintf(stderr, "[shutdown] command transport threads are still active; preserving dependencies for process exit\n");
+    return 1;
+  }
+  if (!edr_command_delivery_shutdown_timeout(10000u)) {
+    fprintf(stderr, "[shutdown] result delivery thread is still active; preserving dependencies for process exit\n");
+    return 1;
+  }
+  if (!edr_command_executor_shutdown_timeout(30000u)) {
+    fprintf(stderr, "[shutdown] command workers did not stop after cancellation; preserving dependencies for process exit\n");
+    return 1;
+  }
   edr_pmfe_shutdown();
   edr_shellcode_detector_shutdown();
   edr_webshell_detector_shutdown();

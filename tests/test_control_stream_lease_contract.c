@@ -61,10 +61,13 @@ int main(void) {
       contains(source, "static int64_t control_stream_lease_ms(void)") &&
       contains(source, "static int control_stream_ready_lease_valid(void)") &&
       contains(source, "s_control_stream_status, sizeof(s_control_stream_status), \"%s\", \"lease_expired\"") &&
-      contains(source, "if (control_stream_ready_lease_valid() || s_ws_ready)") &&
+      contains(source, "if (control_stream_ready_lease_valid() || runtime_int_get(&s_ws_ready))") &&
       contains(source, "control_stream_ready_lease_valid() ? \"https_control_stream\" : \"https_long_poll\"") &&
       contains(source, "out->control_stream_lease_valid = stream_lease_valid") &&
       contains(source, "out->control_stream_lease_expired_count = s_control_stream_lease_expired") &&
+      contains(source, "CURLOPT_XFERINFOFUNCTION, curl_transfer_progress") &&
+      contains(source, "void edr_ingest_http_cancel_inflight(void)") &&
+      contains(source, "edr_ingest_http_cancel_inflight();") &&
       count_occurrences(source, "note_control_stream_activity();") >= 3u;
   free(source);
   if (!ok) {

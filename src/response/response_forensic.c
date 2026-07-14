@@ -1636,6 +1636,8 @@ typedef struct {
   int recursive;
   int visited;
   int scanned;
+  int scan_completed;
+  int scan_errors;
   int matched_files;
   int skipped;
   int matches_returned;
@@ -1647,6 +1649,7 @@ typedef struct {
   char warnings[512];
   const char *command_id;
   int cancelled;
+  int root_open_failed;
   int max_files_reached;
   int max_depth_reached;
 } YaraDirCtx;
@@ -1737,7 +1740,13 @@ static int yd_scan_file(YaraDirCtx *ctx, const char *path) {
   int ok = fy_scan_rules(ctx->rules, ctx->command_id, path, buf, (size_t)fsz, &res, err, sizeof(err));
   if (res.cancelled) ctx->cancelled = 1;
   free(buf);
-  if (!ok) { ctx->skipped++; yd_append_warning(ctx, err[0] ? err : "scan failed"); return 0; }
+  if (!ok) {
+    ctx->scan_errors++;
+    ctx->skipped++;
+    yd_append_warning(ctx, err[0] ? err : "scan failed");
+    return 0;
+  }
+  ctx->scan_completed++;
   if (res.count <= 0) return 1;
   ctx->matched_files++;
   if (ctx->matches_returned >= 100) { ctx->matches_truncated = 1; return 1; }
@@ -1757,25 +1766,34 @@ static int yd_scan_file(YaraDirCtx *ctx, const char *path) {
   return 1;
 }
 
-static void yara_emit_dir_result(const char *cmd_id, const EdrSoarCommandMeta *sm, const char *target, YaraDirCtx *ctx) {
-  char target_esc[1100], warn_esc[700];
+static void yara_emit_dir_result(const char *cmd_id, const EdrSoarCommandMeta *sm, const char *target,
+                                 YaraDirCtx *ctx, EdrCommandExecutionStatus exec_status,
+                                 int exit_code, const char *error) {
+  char target_esc[1100], warn_esc[700], error_esc[700];
   response_json_escape(target ? target : "", target_esc, sizeof(target_esc));
   response_json_escape(ctx && ctx->warnings[0] ? ctx->warnings : "", warn_esc, sizeof(warn_esc));
+  response_json_escape(error ? error : "", error_esc, sizeof(error_esc));
   char warnings[900];
   snprintf(warnings, sizeof(warnings), "%s%s%s", warn_esc[0] ? "[\"" : "[]", warn_esc[0] ? warn_esc : "", warn_esc[0] ? "\"]" : "");
   char detail[8192];
+  const char *contract_status = exec_status == EdrCmdExecOk
+                                    ? (ctx->scan_errors > 0 ? "partial_success" : "success")
+                                    : "failed";
+  const char *scan_status = exec_status == EdrCmdExecOk ? "completed" : "failed";
   snprintf(detail, sizeof(detail),
-           "{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"success\",\"source\":\"libyara\","
+           "{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"%s\",\"source\":\"libyara\","
            "\"artifact\":\"%s\",\"sha256\":\"\",\"object_key\":\"\","
-           "\"truncated\":%s,\"upload_status\":\"not_requested\",\"error\":\"\","
-           "\"scan_status\":\"completed\",\"target_type\":\"directory\",\"target_path\":\"%s\","
+           "\"truncated\":%s,\"upload_status\":\"not_requested\",\"error\":\"%s\","
+           "\"scan_status\":\"%s\",\"target_type\":\"directory\",\"target_path\":\"%s\","
            "\"engine\":\"libyara\",\"matched\":%s,\"files_scanned\":%d,\"files_matched\":%d,"
+           "\"files_completed\":%d,\"scan_errors\":%d,"
            "\"files_skipped\":%d,\"bytes_scanned\":%ld,\"matches\":[%s],"
            "\"matches_returned\":%d,\"matches_truncated\":%s,\"warnings\":%s}",
-           target_esc, ctx->matches_truncated ? "true" : "false", target_esc,
-           ctx->matched_files > 0 ? "true" : "false", ctx->scanned, ctx->matched_files, ctx->skipped,
+           contract_status, target_esc, ctx->matches_truncated ? "true" : "false", error_esc,
+           scan_status, target_esc, ctx->matched_files > 0 ? "true" : "false", ctx->scanned,
+           ctx->matched_files, ctx->scan_completed, ctx->scan_errors, ctx->skipped,
            ctx->bytes_scanned, ctx->matches_json, ctx->matches_returned, ctx->matches_truncated ? "true" : "false", warnings);
-  edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, detail);
+  edr_command_emit_always(cmd_id, sm, exec_status, exit_code, detail);
 }
 
 #ifdef _WIN32
@@ -1784,7 +1802,11 @@ static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
   if (edr_command_cancel_requested(ctx->command_id)) { ctx->cancelled = 1; return; }
   char pat[1100]; snprintf(pat, sizeof(pat), "%s\\*", dir);
   WIN32_FIND_DATAA ffd; HANDLE h = FindFirstFileA(pat, &ffd);
-  if (h == INVALID_HANDLE_VALUE) { ctx->skipped++; return; }
+  if (h == INVALID_HANDLE_VALUE) {
+    if (depth == 0) ctx->root_open_failed = 1;
+    ctx->skipped++;
+    return;
+  }
   do {
     if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0) continue;
     char full[1200]; snprintf(full, sizeof(full), "%s\\%s", dir, ffd.cFileName);
@@ -1803,7 +1825,11 @@ static void yd_walk(YaraDirCtx *ctx, const char *dir, int depth) {
   if (!ctx || !dir || ctx->visited >= ctx->max_files || depth > ctx->max_depth) return;
   if (edr_command_cancel_requested(ctx->command_id)) { ctx->cancelled = 1; return; }
   DIR *d = opendir(dir);
-  if (!d) { ctx->skipped++; return; }
+  if (!d) {
+    if (depth == 0) ctx->root_open_failed = 1;
+    ctx->skipped++;
+    return;
+  }
   struct dirent *ent;
   while ((ent = readdir(d)) != NULL) {
     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
@@ -1905,13 +1931,22 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
                                            "YARA directory scan cancelled", "cancelled");
       return;
     }
+    if (yd.root_open_failed || yd.scan_completed == 0) {
+      const char *reason = yd.root_open_failed
+                               ? "target directory is missing or unreadable"
+                               : "no eligible readable files completed YARA scanning";
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, reason);
+      yara_emit_dir_result(cmd_id, sm, target_path, &yd, EdrCmdExecFailed, 3, reason);
+      return;
+    }
     edr_cmd_inc_handled();
     edr_cmd_inc_exec_ok();
     char audit[1400];
     snprintf(audit, sizeof(audit), "yara_scan: ok (directory engine=libyara source=%s files_loaded=%d)",
              rules_source[0] ? rules_source : "unknown", rules_files_loaded);
     edr_command_audit_both(cmd_id, audit);
-    yara_emit_dir_result(cmd_id, sm, target_path, &yd);
+    yara_emit_dir_result(cmd_id, sm, target_path, &yd, EdrCmdExecOk, 0, NULL);
     return;
 #else
     edr_cmd_inc_exec_fail();

@@ -42,4 +42,57 @@ char *edr_command_result_http_json(const char *endpoint_id,
   return json;
 }
 
+enum command_result_ack_state {
+  COMMAND_RESULT_ACK_INVALID = 0,
+  COMMAND_RESULT_ACK_PARTIAL = 1,
+  COMMAND_RESULT_ACK_COMPLETE = 2
+};
+
+static enum command_result_ack_state command_result_http_ack_state(const char *json) {
+  cJSON *root;
+  const cJSON *payload;
+  const cJSON *data;
+  const cJSON *accepted;
+  const cJSON *complete;
+  enum command_result_ack_state state;
+
+  if (!json || !json[0]) {
+    return COMMAND_RESULT_ACK_INVALID;
+  }
+  root = cJSON_Parse(json);
+  if (!cJSON_IsObject(root)) {
+    cJSON_Delete(root);
+    return COMMAND_RESULT_ACK_INVALID;
+  }
+
+  payload = root;
+  data = cJSON_GetObjectItemCaseSensitive(root, "data");
+  if (cJSON_IsObject(data)) {
+    const cJSON *nested_accepted = cJSON_GetObjectItemCaseSensitive(data, "accepted");
+    const cJSON *nested_complete = cJSON_GetObjectItemCaseSensitive(data, "complete");
+    /* During rolling upgrades a standard data envelope may coexist with the
+     * legacy root-level ACK. Nested ACK fields are authoritative when present. */
+    if (nested_accepted || nested_complete) {
+      payload = data;
+    }
+  }
+  accepted = cJSON_GetObjectItemCaseSensitive(payload, "accepted");
+  complete = cJSON_GetObjectItemCaseSensitive(payload, "complete");
+  state = COMMAND_RESULT_ACK_INVALID;
+  if (cJSON_IsTrue(accepted)) {
+    state = cJSON_IsFalse(complete) ? COMMAND_RESULT_ACK_PARTIAL
+                                    : COMMAND_RESULT_ACK_COMPLETE;
+  }
+  cJSON_Delete(root);
+  return state;
+}
+
+int edr_command_result_http_response_acked(const char *json) {
+  return command_result_http_ack_state(json) == COMMAND_RESULT_ACK_COMPLETE;
+}
+
+int edr_command_result_http_chunk_response_acked(const char *json) {
+  return command_result_http_ack_state(json) != COMMAND_RESULT_ACK_INVALID;
+}
+
 void edr_command_result_json_free(char *json) { cJSON_free(json); }

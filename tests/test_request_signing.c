@@ -16,6 +16,20 @@ int main(void) {
   char mac[65];
   char headers[1024];
   EdrRequestSigningConfig cfg;
+  char nonces[64][33];
+
+  for (size_t i = 0u; i < sizeof(nonces) / sizeof(nonces[0]); i++) {
+    if (edr_reqsig_random_nonce_hex(nonces[i]) != 0 || strlen(nonces[i]) != 32u) {
+      fprintf(stderr, "secure nonce generation failed at %zu\n", i);
+      return 1;
+    }
+    for (size_t j = 0u; j < i; j++) {
+      if (strcmp(nonces[i], nonces[j]) == 0) {
+        fprintf(stderr, "duplicate request nonce at %zu/%zu\n", j, i);
+        return 1;
+      }
+    }
+  }
 
   const char *poll_path =
       "/api/v1/ingest/poll-commands?endpoint_id=ep-1&limit=8&wait_s=5&agent_version=3.2.228&dict_ver=edr-zstd-dict-v1&schema_ver=edr-control-schema-v1&profile_id=default-h2-zstd&h2=1&zstd=1";

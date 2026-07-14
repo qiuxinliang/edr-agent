@@ -52,18 +52,22 @@ int main(void) {
   char command_path[1024];
   char registry_path[1024];
   char report_path[1024];
+  char agent_path[1024];
   snprintf(command_path, sizeof(command_path), "%s/src/command/command_stub.c", root);
   snprintf(registry_path, sizeof(registry_path), "%s/src/command/command_registry.c", root);
   snprintf(report_path, sizeof(report_path), "%s/src/attack_surface/attack_surface_report.c", root);
+  snprintf(agent_path, sizeof(agent_path), "%s/src/core/agent.c", root);
 
   char *command = read_file(command_path);
   char *registry = read_file(registry_path);
   char *report = read_file(report_path);
-  if (!command || !registry || !report) {
-    fprintf(stderr, "failed to read command/registry/report sources\n");
+  char *agent = read_file(agent_path);
+  if (!command || !registry || !report || !agent) {
+    fprintf(stderr, "failed to read command/registry/report/agent sources\n");
     free(command);
     free(registry);
     free(report);
+    free(agent);
     return 1;
   }
 
@@ -76,6 +80,7 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
     return 1;
   }
   if (!contains(registry, "COMMAND(\"GET_ATTACK_SURFACE\"") ||
@@ -86,6 +91,7 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
     return 1;
   }
 
@@ -95,6 +101,7 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
     return 1;
   }
   if (contains(branch, "attack_surface.enabled")) {
@@ -103,6 +110,7 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
     return 1;
   }
   if (contains(branch, "edr_attack_surface_refresh_pending")) {
@@ -111,6 +119,7 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
     return 1;
   }
 
@@ -120,6 +129,17 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
+    return 1;
+  }
+  if (!contains(report, "WEXITSTATUS(child_status) != 0") ||
+      !contains(report, "listener_collection_failed")) {
+    fprintf(stderr, "listener collector failures must not become fresh empty snapshots\n");
+    free(branch);
+    free(command);
+    free(registry);
+    free(report);
+    free(agent);
     return 1;
   }
   if (contains(report, "execlp(\"curl\"") || contains(report, "system(\"curl") || contains(report, "popen(\"curl")) {
@@ -128,6 +148,31 @@ int main(void) {
     free(command);
     free(registry);
     free(report);
+    free(agent);
+    return 1;
+  }
+  if (!contains(report, "int have_policy = pthread_create") ||
+      !contains(report, "if (have_policy)") ||
+      !contains(report, "pthread_join(tpol, NULL)") ||
+      !contains(report, "WaitForSingleObject(tp, INFINITE)")) {
+    fprintf(stderr, "partial attack-surface thread creation must join every started worker\n");
+    free(branch);
+    free(command);
+    free(registry);
+    free(report);
+    free(agent);
+    return 1;
+  }
+  if (contains(agent, "edr_attack_surface_execute(") ||
+      !contains(agent, "edr_agent_queue_attack_surface(\"agent_start\"") ||
+      !contains(agent, "edr_agent_queue_attack_surface(\"config_reload\"") ||
+      !contains(agent, "edr_agent_queue_attack_surface(\"remote_config_reload\"")) {
+    fprintf(stderr, "agent main/config loops must queue attack-surface collection\n");
+    free(branch);
+    free(command);
+    free(registry);
+    free(report);
+    free(agent);
     return 1;
   }
 
@@ -135,5 +180,6 @@ int main(void) {
   free(command);
   free(registry);
   free(report);
+  free(agent);
   return 0;
 }

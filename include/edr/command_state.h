@@ -121,11 +121,11 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap);
 int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
                                         const char *error,
                                         int64_t next_retry_unix_ms);
-void edr_command_state_mark_reported(const EdrCommandStateRecord *record);
+int edr_command_state_mark_reported(const EdrCommandStateRecord *record);
 /* A permanent HTTP/API rejection is retained locally for audit but no longer
  * retried, preventing a malformed terminal result from amplifying traffic. */
-void edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
-                                            const char *error);
+int edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
+                                           const char *error);
 void edr_command_state_compact_if_needed(void);
 
 #ifdef __cplusplus

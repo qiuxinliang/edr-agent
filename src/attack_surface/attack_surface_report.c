@@ -232,7 +232,7 @@ static int collect_listeners_linux(AsListener *out, int max_out, int *truncated)
   pid_t child = -1;
   FILE *pf = open_ss_ltnp_reader(&child);
   if (!pf) {
-    return 0;
+    return -1;
   }
   char line[2048];
   int n = 0;
@@ -288,10 +288,15 @@ static int collect_listeners_linux(AsListener *out, int max_out, int *truncated)
     snprintf(L->id, sizeof(L->id), "l-%d", n);
     n++;
   }
-  (void)fclose(pf);
+  int close_rc = fclose(pf);
   if (child > 0) {
-    (void)waitpid(child, NULL, 0);
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) < 0 || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
+      return -1;
+    }
   }
+  if (close_rc != 0) return -1;
   return n;
 }
 #elif defined(_WIN32)
@@ -606,32 +611,42 @@ static void asurf_gather_policy_and_egress(const EdrConfig *cfg, EdrSecurityPoli
 #ifdef _WIN32
   HANDLE tp = CreateThread(NULL, 0, asurf_thread_policy, &ctx, 0, NULL);
   HANDLE te = CreateThread(NULL, 0, asurf_thread_egress, &ctx, 0, NULL);
-  if (!tp || !te) {
-    if (tp) {
-      CloseHandle(tp);
-    }
-    if (te) {
-      CloseHandle(te);
-    }
+  if (tp && te) {
+    HANDLE arr[2] = {tp, te};
+    (void)WaitForMultipleObjects(2, arr, TRUE, INFINITE);
+  } else if (tp) {
+    edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
+    (void)WaitForSingleObject(tp, INFINITE);
+  } else if (te) {
+    edr_security_policy_snap_collect(cfg, sp);
+    (void)WaitForSingleObject(te, INFINITE);
+  } else {
     edr_security_policy_snap_collect(cfg, sp);
     edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
-    return;
   }
-  HANDLE arr[2] = {tp, te};
-  WaitForMultipleObjects(2, arr, TRUE, INFINITE);
-  CloseHandle(tp);
-  CloseHandle(te);
+  if (tp) {
+    CloseHandle(tp);
+  }
+  if (te) {
+    CloseHandle(te);
+  }
 #else
   pthread_t tpol = 0;
   pthread_t tegr = 0;
-  if (pthread_create(&tpol, NULL, asurf_thread_policy, &ctx) != 0 ||
-      pthread_create(&tegr, NULL, asurf_thread_egress, &ctx) != 0) {
+  int have_policy = pthread_create(&tpol, NULL, asurf_thread_policy, &ctx) == 0;
+  int have_egress = pthread_create(&tegr, NULL, asurf_thread_egress, &ctx) == 0;
+  if (!have_policy) {
     edr_security_policy_snap_collect(cfg, sp);
-    edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
-    return;
   }
-  (void)pthread_join(tpol, NULL);
-  (void)pthread_join(tegr, NULL);
+  if (!have_egress) {
+    edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
+  }
+  if (have_policy) {
+    (void)pthread_join(tpol, NULL);
+  }
+  if (have_egress) {
+    (void)pthread_join(tegr, NULL);
+  }
 #endif
 }
 
@@ -993,6 +1008,10 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
   int truncated = 0;
   int nL = (cfg->attack_surface.listeners_enabled || cfg->attack_surface.public_service_enabled)
              ? collect_listeners_platform(L, EDR_ASURF_LISTENERS_MAX, &truncated) : 0;
+  if (nL < 0) {
+    snprintf(detail, detail_cap, "listener_collection_failed");
+    return 3;
+  }
   int listeners_only = asurf_listeners_only_mode(command_id);
 
   char jsonpath[512];

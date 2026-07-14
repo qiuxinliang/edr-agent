@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -182,11 +181,11 @@ static int random_bytes(uint8_t *out, size_t len) {
     if (got == len) return 0;
   }
 #endif
-  srand((unsigned)time(NULL));
-  for (size_t i = 0u; i < len; i++) {
-    out[i] = (uint8_t)(rand() & 0xffu);
-  }
-  return 0;
+  /* A request nonce is part of the replay boundary. If the operating-system
+   * CSPRNG is unavailable, fail the request instead of emitting predictable
+   * or duplicate nonces. */
+  memset(out, 0, len);
+  return -1;
 }
 
 int edr_reqsig_random_nonce_hex(char out33[33]) {

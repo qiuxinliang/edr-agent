@@ -33,11 +33,21 @@ add_test(NAME command_registry_and_payload_contract COMMAND test_command_contrac
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
-  ${CMAKE_SOURCE_DIR}/src/command/command_executor.c)
+  ${CMAKE_SOURCE_DIR}/src/command/command_executor.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c)
 target_include_directories(test_command_executor PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_command_executor PRIVATE Threads::Threads)
 edr_apply_common_warnings(test_command_executor)
 add_test(NAME command_executor_thread_isolation COMMAND test_command_executor
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_active_type_tls
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_command_active_type_tls.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_util.c)
+target_include_directories(test_command_active_type_tls PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_command_active_type_tls PRIVATE Threads::Threads)
+edr_apply_common_warnings(test_command_active_type_tls)
+add_test(NAME command_active_type_thread_isolation COMMAND test_command_active_type_tls
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_command_cancel ${CMAKE_CURRENT_SOURCE_DIR}/test_command_cancel.c
@@ -394,6 +404,15 @@ else()
   target_sources(test_ave_pipeline PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
 endif()
 
+if(WIN32)
+  foreach(_edr_ave_windows_test
+      test_ave_sdk test_ave_fl_abi test_ave_e2e_full test_ave_hotfix_smoke test_ave_pipeline)
+    target_sources(${_edr_ave_windows_test} PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_win_util.c)
+    target_link_libraries(${_edr_ave_windows_test} PRIVATE iphlpapi ws2_32)
+  endforeach()
+endif()
+
 add_executable(test_ave_behavior_features_m3a ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_behavior_features_m3a.c ${CMAKE_SOURCE_DIR}/src/ave/ave_behavior_features.c)
 target_include_directories(test_ave_behavior_features_m3a PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_executable(test_ave_cross_engine_parse ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_cross_engine_parse.c ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c)
@@ -681,6 +700,9 @@ target_include_directories(test_shellcode PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/windivert
 )
+if(WIN32)
+  target_sources(test_shellcode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stub_shellcode_runtime_hooks.c)
+endif()
 if(EDR_YARA_AVAILABLE)
   target_compile_definitions(test_shellcode PRIVATE EDR_HAVE_YARA=1)
   if(EDR_YARA_TARGET)
@@ -706,6 +728,9 @@ target_include_directories(test_shellcode_yara_rules PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/windivert
 )
+if(WIN32)
+  target_sources(test_shellcode_yara_rules PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stub_shellcode_runtime_hooks.c)
+endif()
 target_compile_definitions(test_shellcode_yara_rules PRIVATE
   EDR_SHELLCODE_RULES_DIR="${CMAKE_SOURCE_DIR}/src/shellcode_detector/rules")
 if(EDR_YARA_AVAILABLE)

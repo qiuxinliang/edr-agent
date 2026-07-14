@@ -252,7 +252,6 @@ EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_
     case EDR_COMMAND_KIND_FORENSIC:
     case EDR_COMMAND_KIND_MEMORY_DUMP:
     case EDR_COMMAND_KIND_TARGETED_FORENSIC:
-    case EDR_COMMAND_KIND_YARA_SCAN:
     case EDR_COMMAND_KIND_DEEP_FORENSIC:
     case EDR_COMMAND_KIND_PROCESS_SNAPSHOT:
     case EDR_COMMAND_KIND_LIST_AUTORUNS:
@@ -260,6 +259,9 @@ EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_
     case EDR_COMMAND_KIND_VELO_QUERY:
     case EDR_COMMAND_KIND_ATTACK_SURFACE:
       return EDR_COMMAND_LANE_BULK;
+    case EDR_COMMAND_KIND_YARA_SCAN:
+    case EDR_COMMAND_KIND_PMFE_SCAN:
+      return EDR_COMMAND_LANE_SCAN;
     default:
       return EDR_COMMAND_LANE_INTERACTIVE;
   }
