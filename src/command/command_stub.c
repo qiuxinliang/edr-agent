@@ -2425,25 +2425,44 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
 }
 
-static void shell_stream_output_cb(const char *sid, const char *data, size_t len,
+static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *data, size_t len,
                                    int exit_code, bool closed, void *user) {
   (void)user;
-  char detail[4096];
+  if (!sid || !sid[0]) {
+    return;
+  }
+  char cmd_id[160];
+  snprintf(cmd_id, sizeof(cmd_id), "%s.s%06llu", sid, (unsigned long long)seq);
+
+  char sessionj[300], streamj[40], dataj[EDR_COMMAND_STATE_DETAIL_CAP], detail[EDR_COMMAND_STATE_DETAIL_CAP];
+  json_escape_to(sessionj, sizeof(sessionj), sid);
+  json_escape_to(streamj, sizeof(streamj), "stdout");
   if (closed && !data) {
-    snprintf(detail, sizeof(detail), "shell session %s closed, exit=%d", sid ? sid : "", exit_code);
+    json_escape_to(dataj, sizeof(dataj), "");
   } else if (data && len > 0u) {
-    size_t cp = len < sizeof(detail) - 1u ? len : sizeof(detail) - 1u;
-    memcpy(detail, data, cp);
-    detail[cp] = '\0';
+    size_t cp = len < EDR_SS_STREAM_CHUNK_BYTES ? len : EDR_SS_STREAM_CHUNK_BYTES;
+    char raw[EDR_SS_STREAM_CHUNK_BYTES + 1u];
+    memcpy(raw, data, cp);
+    raw[cp] = '\0';
+    json_escape_to(dataj, sizeof(dataj), raw);
   } else {
     return;
   }
+  snprintf(detail, sizeof(detail),
+           "{\"schema\":\"edr.shell.stream.v1\",\"session_id\":%s,\"seq\":%llu,"
+           "\"stream\":%s,\"data\":%s,\"exit_code\":%d,\"closed\":%s}",
+           sessionj, (unsigned long long)seq, streamj, dataj, exit_code,
+           closed ? "true" : "false");
+
   EdrSoarCommandMeta dummy;
   memset(&dummy, 0, sizeof(dummy));
-  if (sid) {
-    snprintf(dummy.soar_correlation_id, sizeof(dummy.soar_correlation_id), "%s", sid);
+  snprintf(dummy.soar_correlation_id, sizeof(dummy.soar_correlation_id), "%s", sid);
+  if (edr_command_state_finish(cmd_id, "shell_stream", &dummy, closed ? "closed" : "ok",
+                               (int)EdrCmdExecOk, exit_code, detail, "", 1) == 0) {
+    edr_command_state_delete_inbox(cmd_id);
+  } else {
+    audit_both(cmd_id, "shell_stream state persist failed");
   }
-  soar_emit(sid ? sid : "shell_session", &dummy, EdrCmdExecOk, exit_code, detail);
 }
 
 static void ensure_shell_session_initialized(void) {

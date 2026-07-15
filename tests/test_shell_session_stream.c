@@ -9,9 +9,10 @@ static char s_output[32768];
 static size_t s_output_len;
 static size_t s_max_chunk;
 
-static void capture_output(const char *session_id, const char *data, size_t len,
+static void capture_output(const char *session_id, uint64_t seq, const char *data, size_t len,
                            int exit_code, bool closed, void *user) {
   (void)session_id;
+  (void)seq;
   (void)exit_code;
   (void)closed;
   (void)user;

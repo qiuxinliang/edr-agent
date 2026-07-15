@@ -16,6 +16,7 @@
 #define EDR_SS_STREAM_CHUNK_BYTES 2048u
 
 typedef void (*edr_ss_write_fn)(const char *session_id,
+                                uint64_t seq,
                                 const char *data, size_t len,
                                 int exit_code, bool closed,
                                 void *user);
