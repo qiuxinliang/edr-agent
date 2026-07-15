@@ -52,7 +52,7 @@ button{background:none;border:0;cursor:pointer}
 	.fin,.fsel{width:100%;background:var(--bg3);border:1px solid var(--ln2);outline:none;padding:9px 12px}.fin:focus,.fsel:focus{border-color:var(--pri)}.fin::placeholder{color:var(--tx3)}
 	.testc{margin-left:auto;border:1px solid rgba(54,197,224,.35);color:var(--info);padding:3px 12px}.testc:hover{background:var(--info-d)}
 	.subpanel{grid-column:1 / -1;border:1px solid var(--ln2);background:rgba(20,27,41,.58);padding:12px 14px;margin-bottom:2px}.subpanel .form{gap:12px}.hide{display:none!important}.secret{-webkit-text-security:disc}
-	.toggles{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}.tgl{display:flex;align-items:center;gap:11px;cursor:pointer;user-select:none}.sw{width:34px;height:18px;border-radius:10px;background:var(--bg4);position:relative;flex-shrink:0}.sw i{position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:var(--tx3);transition:.18s}.tgl.on .sw{background:var(--pri-d)}.tgl.on .sw i{left:18px;background:var(--pri)}.tl{font-size:10.5px;color:var(--tx)}.td{font-size:9px;color:var(--tx3)}
+	.toggles{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}.tgl{display:flex;align-items:center;gap:11px;cursor:pointer;user-select:none}.tgl[data-locked=true]{cursor:not-allowed;opacity:.55}.sw{width:34px;height:18px;border-radius:10px;background:var(--bg4);position:relative;flex-shrink:0}.sw i{position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:var(--tx3);transition:.18s}.tgl.on .sw{background:var(--pri-d)}.tgl.on .sw i{left:18px;background:var(--pri)}.tl{font-size:10.5px;color:var(--tx)}.td{font-size:9px;color:var(--tx3)}
 .advtop{display:flex;align-items:center;gap:12px;margin-bottom:14px}.advbtn{margin-left:auto;border:1px solid var(--ln3);color:var(--info);padding:7px 14px}.advbtn:hover{background:var(--info-d)}
 .shade{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:30}.drawer{position:fixed;right:0;top:0;bottom:0;width:390px;background:var(--bg2);border-left:1px solid var(--ln3);z-index:31;padding:20px;box-shadow:-20px 0 50px rgba(0,0,0,.36);overflow:auto;animation:in .16s ease}.dh{display:flex;align-items:center;gap:10px;margin-bottom:14px}.dh .ph{font-size:15px}.xbtn{margin-left:auto;border:1px solid var(--ln2);color:var(--tx2);padding:4px 10px}.xbtn:hover{color:var(--crit);border-color:rgba(255,82,119,.35)}
 .checklist{margin-top:2px}.chk{display:flex;align-items:center;gap:13px;padding:11px 2px;border-bottom:1px solid var(--ln)}.chk:last-child{border-bottom:0}.ci{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1px solid var(--ln3);color:var(--tx3);flex-shrink:0}.chk.run .ci{border:2px solid var(--ln2);border-top-color:var(--info);animation:spin .8s linear infinite}.chk.ok .ci{background:var(--up);border-color:var(--up);color:#04130d}.chk.warn .ci{background:var(--warn);border-color:var(--warn);color:#160b02}.chk.fail .ci{background:var(--crit);border-color:var(--crit);color:#fff}.ck{width:116px;font-weight:800;color:var(--tx)}.cv{font-size:10px;color:var(--tx3)}.chk.warn .cv{color:var(--warn)}.chk.fail .cv{color:var(--crit)}
@@ -323,7 +323,7 @@ $('#btnNext').onclick=()=>{
   show(cur+1);
 };
 $('#accept').onclick=function(){accepted=!accepted;this.classList.toggle('on',accepted);renderFooter();};
-$$('.tgl').forEach(t=>t.onclick=()=>t.classList.toggle('on'));
+$$('.tgl').forEach(t=>t.onclick=()=>{if(t.dataset.locked==='true')return;t.classList.toggle('on')});
 $('#proxyMode').onchange=syncProxyPanel;
 $('#installMode').onchange=syncInstallMode;
 $('#openAdvanced').onclick=()=>setAdvanced(true);
@@ -350,6 +350,7 @@ function setInputValue(id,value){
 function applyPreconfig(c){
   nativePreconfig=c||{};
   if(!nativePreconfig.preconfigured)return;
+  const hasBootstrap=!!(nativePreconfig.bootstrapManifestUrl||nativePreconfig.bootstrapManifestPath||nativePreconfig.bootstrapManifest||nativePreconfig.bootstrapManifestJson);
   setInputValue('#apiBase',nativePreconfig.apiBase||nativePreconfig.restBaseUrl);
   setInputValue('#token',nativePreconfig.enrollToken||nativePreconfig.token);
   setInputValue('#installPath',nativePreconfig.installPath);
@@ -366,11 +367,13 @@ function applyPreconfig(c){
   setToggle('#strictHealthCheck',!!nativePreconfig.strictHealthCheck);
   setToggle('#keepOfflineQueue',nativePreconfig.keepOfflineQueue!==false);
   setToggle('#keepEvidenceCache',nativePreconfig.keepEvidenceCache!==false);
-  setToggle('#insecureTls',!!nativePreconfig.insecureTls);
+  setToggle('#insecureTls',hasBootstrap?false:!!nativePreconfig.insecureTls);
+  $('#insecureTls').dataset.locked=hasBootstrap?'true':'false';
+  if(hasBootstrap)$('#insecureTls').title='签名 Bootstrap 已启用私有 CA 校验，禁止跳过证书验证';
   syncProxyPanel();
   const note=$('#preconfigNote');
   note.classList.add('on');
-  const boot=(nativePreconfig.bootstrapManifestUrl||nativePreconfig.bootstrapManifestPath||nativePreconfig.bootstrapManifest||nativePreconfig.bootstrapManifestJson)?' · Bootstrap manifest':'';
+  const boot=hasBootstrap?' · Bootstrap manifest':'';
   note.textContent=`预配置已加载${boot} · 租户 ${nativePreconfig.tenantId||'-'} · 构建 ${nativePreconfig.buildId||'-'} · 安装完成后自动打开终端详情`;
 }
 function runChecks(){

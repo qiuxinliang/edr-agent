@@ -1832,7 +1832,9 @@ public partial class MainWindow : Window
 
     private static void ConfigureTlsValidation(HttpClientHandler handler, InstallRequest request, BootstrapTrustMaterial bootstrap)
     {
-        if (request.InsecureTls)
+        // A signed Bootstrap Manifest is a fail-closed trust contract. Never let
+        // the lab-only "insecure" switch override its private-CA verification.
+        if (request.InsecureTls && !bootstrap.Enabled)
         {
             handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
             return;
@@ -1848,6 +1850,11 @@ public partial class MainWindow : Window
             if (errors == SslPolicyErrors.None)
             {
                 return true;
+            }
+            if ((errors & (SslPolicyErrors.RemoteCertificateNameMismatch |
+                           SslPolicyErrors.RemoteCertificateNotAvailable)) != 0)
+            {
+                return false;
             }
             return ValidateBootstrapServerCertificate(certificate, bootstrap);
         };
