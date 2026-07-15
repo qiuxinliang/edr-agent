@@ -24,6 +24,7 @@ tenant_id            = "tenant_default"
 
 [platform]
 rest_base_url        = "https://edr.example.com/api/v1"
+rest_bearer_token    = "" # installer-populated Agent bearer; do not use a platform admin JWT
 proxy_mode           = "auto"
 proxy_url            = ""
 relay_url            = ""

@@ -1,6 +1,6 @@
 # Agent 独立安装器（注册 + 写 agent.toml）
 
-平台在租户下签发 **Enrollment Token** 后，终端上只需能访问 **`POST /api/v1/enroll`**（无需登录 JWT），即可领取 **`endpoint_id`、`tenant_id`、`server_addr`**（gRPC 接入），并生成本地 **`agent.toml`**。
+平台在租户下签发 **Enrollment Token** 后，终端上只需能访问 **`POST /api/v1/enroll`**（无需登录 JWT），即可领取 **`endpoint_id`、`tenant_id`、`server_addr`**（历史/gRPC 兼容字段）以及生产 REST 所需的 **Agent 专用 Bearer**，并生成本地 **`agent.toml`**。该 Bearer 是租户 + endpoint 绑定的最小权限 Agent 凭据，不应替换为平台管理员 JWT。
 
 **与「管理端生成安装包 / 限时下载链接」的关系**（能力对照、24h 语义、目标架构）见 **`edr-backend/docs/INSTALLER_AND_DOWNLOAD_DESIGN.md`**。
 **端到端发布主流程**（Agent 二进制、预生成安装包、租户下载的分工）见 **`edr-backend/docs/AGENT_TERMINAL_RELEASE_FLOW.md`**。
@@ -94,9 +94,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\edr_agent_zip_deploy.ps1 `
 
 - **`[server].address`**：平台返回的 **`server_addr`**（`host:port`），供 gRPC EventIngest。
 - **`[agent].endpoint_id` / `tenant_id`**：注册结果。
-- **`[platform].rest_base_url`**：`{EDR_API_BASE}/api/v1`，供攻击面等 REST（需本机有 `curl` 时与现有逻辑一致）。
+- **`[platform].rest_base_url`**：`{EDR_API_BASE}/api/v1`，供 Agent REST 上报、控制与策略拉取。
+- **`[platform].rest_bearer_token`**：后端 enroll 返回的 Agent 专用 Bearer（`platform_bearer_token` / `agent_access_token`）。安装器会自动写入；旧后端未返回时保持空值以兼容实验环境。生产不要把 `platform_ops_full`、`admin` 等平台用户 JWT 写入 Agent 配置。
 
-**PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：注册成功后默认写入紧凑配置，包含 **`[server]`、`[agent]`、`[platform]`、`[collection]`、`[ave]`、`[offline]`** 等运行必需段落，并只保留一行英文说明，避免中文编码、模板注释和异常换行污染现场配置。如确需旧版“合并完整模板”行为，可传 **`-UseTemplateToml`** 或设置 **`EDR_USE_TEMPLATE_TOML=1`**；调试模板注释可同时传 **`-KeepTemplateComments`**。
+**PowerShell（`edr_agent_install.ps1`，含 Windows 安装向导调用的版本）**：注册成功后默认写入紧凑配置，包含 **`[server]`、`[agent]`、`[platform]`、`[collection]`、`[ave]`、`[offline]`** 等运行必需段落，并只保留一行英文说明，避免中文编码、模板注释和异常换行污染现场配置。如确需旧版“合并完整模板”行为，可传 **`-UseTemplateToml`** 或设置 **`EDR_USE_TEMPLATE_TOML=1`**；调试模板注释可同时传 **`-KeepTemplateComments`**。`--dry-run` / `-DryRun` 输出会隐藏 Bearer 明文。
 
 **mTLS**：enroll 使用端侧 CSR 签发唯一客户端证书，脚本只保存服务端返回的 `ca.pem` / `client.pem`，不会从服务端接收私钥。默认 PEM 私钥路径为 **`C:\Program Files\EDR Agent\certs\client-key.pem`**；高级模式可用 `EDR_KEY_PROVIDER=cng|tpm|pkcs11` 生成硬件/不可导出 CSR，但当前 gRPC C++ 运行时仍需要 PEM `client_key` 才能启用 RTR 实时通道。
 

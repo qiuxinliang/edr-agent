@@ -31,7 +31,7 @@ tenant_id            = "tenant_default"
 # [platform]
 # rest_base_url      = "https://edr.example.com/api/v1"
 # rest_user_id       = "edr-agent"
-# rest_bearer_token  = ""
+# rest_bearer_token  = "" # 安装器会从 enroll 响应写入 Agent 专用 bearer；不要填平台管理员 JWT
 # http2_enabled      = false # 商业默认 HTTPS/1.1；HTTP/2 仅在灰度策略中开启
 # http2_require      = false # 保持 false；仅特定网络验证达标后才考虑强制 h2
 # control_http2_enabled = false # 控制面独立开关；未配置时兼容继承 http2_enabled

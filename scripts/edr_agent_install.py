@@ -28,6 +28,7 @@ import ssl
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict
@@ -37,11 +38,74 @@ def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _sanitize_bearer_token(value: Any) -> str:
+    token = str(value or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        return ""
+    if len(token) > 480:
+        print("enroll response bearer token exceeds Agent configuration limit", file=sys.stderr)
+        sys.exit(1)
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in token):
+        print("enroll response bearer token contains whitespace or control characters", file=sys.stderr)
+        sys.exit(1)
+    return token
+
+
+def _bearer_from_enroll(data: Dict[str, Any]) -> str:
+    for key in ("platform_bearer_token", "agent_access_token", "access_token", "rest_bearer_token", "bearer_token"):
+        token = _sanitize_bearer_token(data.get(key))
+        if token:
+            return token
+    return ""
+
+
+def _redact_enroll_payload(raw: str) -> str:
+    for key in ("platform_bearer_token", "agent_access_token", "access_token", "rest_bearer_token", "bearer_token"):
+        raw = raw.replace(f'"{key}":', f'"{key}":')
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return raw
+
+    def redact(value: Any) -> None:
+        if isinstance(value, dict):
+            for k, v in list(value.items()):
+                if k in {"platform_bearer_token", "agent_access_token", "access_token", "rest_bearer_token", "bearer_token"}:
+                    value[k] = "<redacted>"
+                else:
+                    redact(v)
+        elif isinstance(value, list):
+            for item in value:
+                redact(item)
+
+    redact(obj)
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _normalize_api_base(raw: str) -> tuple[str, str, str]:
+    value = (raw or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        print(f"EDR_API_BASE must be an absolute http(s) URL: {raw}", file=sys.stderr)
+        sys.exit(2)
+    path = parsed.path.rstrip("/")
+    lower = path.lower()
+    if lower.endswith("/api/v1/enroll"):
+        path = path[: -len("/api/v1/enroll")]
+    elif lower.endswith("/api/v1"):
+        path = path[: -len("/api/v1")]
+    server_base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", "")).rstrip("/")
+    return server_base, server_base + "/api/v1", server_base + "/api/v1/enroll"
+
+
 def _emit_toml(
     server_addr: str,
     endpoint_id: str,
     tenant_id: str,
     rest_base: str,
+    rest_bearer_token: str,
     ca_cert_path: str,
     client_cert_path: str,
     client_key_path: str,
@@ -77,7 +141,7 @@ def _emit_toml(
         "[platform]",
         f'rest_base_url        = "{_toml_escape(rest_base)}"',
         'rest_user_id         = ""',
-        'rest_bearer_token    = ""',
+        f'rest_bearer_token    = "{_toml_escape(rest_bearer_token)}"',
         "http2_enabled        = false",
         "http2_require        = false",
         "control_stream_enabled = true",
@@ -159,8 +223,7 @@ def _hostname() -> str:
 
 
 def enroll(api_base: str, token: str, agent_version: str, csr_pem: str) -> Dict[str, Any]:
-    api_base = api_base.rstrip("/")
-    url = api_base + "/api/v1/enroll"
+    _, normalized_rest_base, url = _normalize_api_base(api_base)
     body = {
         "token": token,
         "hostname": _hostname(),
@@ -186,23 +249,23 @@ def enroll(api_base: str, token: str, agent_version: str, csr_pem: str) -> Dict[
             status = int(resp.status)
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        print(f"enroll HTTP {e.code}: {err_body}", file=sys.stderr)
+        print(f"enroll HTTP {e.code}: {_redact_enroll_payload(err_body)}", file=sys.stderr)
         sys.exit(1)
 
     if status != 201:
-        print(f"enroll unexpected status {status}: {raw}", file=sys.stderr)
+        print(f"enroll unexpected status {status}: {_redact_enroll_payload(raw)}", file=sys.stderr)
         sys.exit(1)
 
     env = json.loads(raw)
     if env.get("code") and env.get("code") != "OK":
-        print(f"enroll error: {env.get('message', raw)}", file=sys.stderr)
+        print(f"enroll error: {env.get('message', _redact_enroll_payload(raw))}", file=sys.stderr)
         sys.exit(1)
     data_obj = env.get("data") or {}
     ep = (data_obj.get("endpoint_id") or "").strip()
     tid = (data_obj.get("tenant_id") or "").strip()
     saddr = (data_obj.get("server_addr") or "").strip()
     if not ep or not tid or not saddr:
-        print(f"enroll missing fields: {raw}", file=sys.stderr)
+        print(f"enroll missing fields: {_redact_enroll_payload(raw)}", file=sys.stderr)
         sys.exit(1)
     override = os.environ.get("EDR_OVERRIDE_SERVER_ADDR", "").strip()
     if override:
@@ -211,7 +274,8 @@ def enroll(api_base: str, token: str, agent_version: str, csr_pem: str) -> Dict[
         "endpoint_id": ep,
         "tenant_id": tid,
         "server_addr": saddr,
-        "rest_base": api_base + "/api/v1",
+        "rest_base": (data_obj.get("rest_base_url") or normalized_rest_base).strip().rstrip("/"),
+        "rest_bearer_token": _bearer_from_enroll(data_obj),
         "ca_cert": data_obj.get("ca_cert") or "",
         "client_cert": data_obj.get("client_cert") or "",
     }
@@ -414,6 +478,7 @@ def main() -> None:
         out["endpoint_id"],
         out["tenant_id"],
         out["rest_base"],
+        out.get("rest_bearer_token", ""),
         ca_path if use_cert_paths else "",
         cert_path if use_cert_paths else "",
         effective_key_path,
@@ -426,7 +491,8 @@ def main() -> None:
         str(Path(args.output).expanduser().resolve().parent),
     )
     if args.dry_run:
-        print(text)
+        import re
+        print(re.sub(r'(?m)^(\s*rest_bearer_token\s*=\s*")[^"]*(")', r'\1<redacted>\2', text))
         return
     if out["ca_cert"] or out["client_cert"]:
         if not (out["ca_cert"] and out["client_cert"]):

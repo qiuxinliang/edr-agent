@@ -1456,6 +1456,28 @@ function Format-TomlInlinePem([string]$Value) {
   return (($Value -replace "`r`n", "`n") -replace "`r", "`n") -replace "`n", "\n"
 }
 
+function Get-EnrollBearerToken([object]$Data) {
+  if (-not $Data) { return "" }
+  foreach ($name in @("platform_bearer_token", "agent_access_token", "access_token", "rest_bearer_token", "bearer_token")) {
+    $prop = $Data.PSObject.Properties[$name]
+    if (-not $prop -or $null -eq $prop.Value) { continue }
+    $v = ([string]$prop.Value).Trim()
+    if (-not $v) { continue }
+    $v = [regex]::Replace($v, '(?i)^Bearer\s+', '').Trim()
+    if (-not $v) { continue }
+    if ($v.Length -gt 480) {
+      Write-Error "enroll response bearer token exceeds Agent configuration limit"
+    }
+    if ([regex]::IsMatch($v, '[\x00-\x20\x7f]')) {
+      Write-Error "enroll response bearer token contains whitespace or control characters"
+    }
+    return $v
+  }
+  return ""
+}
+
+$RestBearerToken = Get-EnrollBearerToken $d
+
 $InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\FDSecurity" } else { "." }
 $TomlModelDir = Join-Path $InstallDirForToml "models"
 $TomlQueueDbPath = Join-Path $InstallDirForToml "queue\edr_queue.db"
@@ -1669,6 +1691,7 @@ function Merge-EnrollIntoAgentTomlExample {
     [Parameter(Mandatory = $true)][string]$EndpointId,
     [Parameter(Mandatory = $true)][string]$TenantId,
     [Parameter(Mandatory = $true)][string]$RestBaseUrl,
+    [AllowEmptyString()][string]$RestBearerToken,
     [AllowEmptyString()][string]$CaPath,
     [AllowEmptyString()][string]$CertPath,
     [AllowEmptyString()][string]$KeyPath,
@@ -1821,6 +1844,7 @@ function Merge-EnrollIntoAgentTomlExample {
     }
     if ($line -match '^\s*rest_base_url\s*=') {
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
+      $out.Add(('rest_bearer_token    = "{0}"' -f (Escape-Toml $RestBearerToken)))
       $out.Add(('http2_enabled        = {0}' -f (Format-TomlBool $Http2Enabled)))
       $out.Add(('http2_require        = {0}' -f (Format-TomlBool $Http2Require)))
       $out.Add(('control_http2_enabled = {0}' -f (Format-TomlBool $ControlHttp2Enabled)))
@@ -1838,7 +1862,7 @@ function Merge-EnrollIntoAgentTomlExample {
       $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
       $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
       $i++
-      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(http2_enabled|http2_require|control_http2_enabled|control_http2_require|control_http1_fallback|control_stream_enabled|long_poll_fallback|report_events_v2_enabled|data_plane_encoding|data_plane_compression|control_dict_version|control_schema_version|control_profile_id|proxy_mode|proxy_url|relay_url)\s*=')) {
+      while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*(rest_bearer_token|http2_enabled|http2_require|control_http2_enabled|control_http2_require|control_http1_fallback|control_stream_enabled|long_poll_fallback|report_events_v2_enabled|data_plane_encoding|data_plane_compression|control_dict_version|control_schema_version|control_profile_id|proxy_mode|proxy_url|relay_url)\s*=')) {
         $i++
       }
       continue
@@ -1876,6 +1900,7 @@ function Merge-EnrollIntoAgentTomlExample {
     if ($line -match '^\s*#\s*\[platform\]\s*$') {
       $out.Add('[platform]')
       $out.Add(('rest_base_url        = "{0}"' -f (Escape-Toml $RestBaseUrl)))
+      $out.Add(('rest_bearer_token    = "{0}"' -f (Escape-Toml $RestBearerToken)))
       $out.Add(('http2_enabled        = {0}' -f (Format-TomlBool $Http2Enabled)))
       $out.Add(('http2_require        = {0}' -f (Format-TomlBool $Http2Require)))
       $out.Add(('control_http2_enabled = {0}' -f (Format-TomlBool $ControlHttp2Enabled)))
@@ -1892,7 +1917,6 @@ function Merge-EnrollIntoAgentTomlExample {
       $out.Add(('proxy_mode           = "{0}"' -f (Escape-Toml $ProxyMode)))
       $out.Add(('proxy_url            = "{0}"' -f (Escape-Toml $ProxyUrl)))
       $out.Add(('relay_url            = "{0}"' -f (Escape-Toml $RelayUrl)))
-      # 省略 rest_user_id / rest_bearer_token：Agent 默认 X-User-ID=edr-agent；Bearer 用环境变量或后续手写。
       $i++
       while ($i -lt $lines.Count -and ($lines[$i] -match '^\s*#\s*(rest_(base_url|user_id|bearer_token)|proxy_mode|proxy_url|relay_url)')) {
         $i++
@@ -2109,6 +2133,7 @@ tenant_id            = "$(Escape-Toml $d.tenant_id)"
 
 [platform]
 rest_base_url        = "$(Escape-Toml $rest)"
+rest_bearer_token    = "$(Escape-Toml $RestBearerToken)"
 http2_enabled        = $(Format-TomlBool $Http2Enabled)
 http2_require        = $(Format-TomlBool $Http2Require)
 control_http2_enabled = $(Format-TomlBool $ControlHttp2Enabled)
@@ -2273,7 +2298,7 @@ $tomlSource = "minimal"
 if ($UseTemplateToml -and -not $MinimalTomlOnly -and (Test-Path -LiteralPath $examplePath)) {
   try {
     $toml = Merge-EnrollIntoAgentTomlExample -ExamplePath $examplePath -InstallDir $InstallDirForToml -ServerAddr $saddr `
-      -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest `
+      -EndpointId $d.endpoint_id -TenantId $d.tenant_id -RestBaseUrl $rest -RestBearerToken $RestBearerToken `
       -CaPath $EffectiveCaCertPath -CertPath $EffectiveClientCertPath -KeyPath $EffectiveClientKeyPath `
       -KeyProvider $effectiveKeyProvider -ProxyMode $ProxyMode -ProxyUrl $ProxyUrl -RelayUrl $RelayUrl `
       -Http2Enabled $Http2Enabled -Http2Require $Http2Require `
@@ -2319,7 +2344,8 @@ if ($tomlIssue) {
 }
 
 if ($DryRun) {
-  Write-Output $toml
+  $displayToml = [regex]::Replace($toml, '(?m)^(\s*rest_bearer_token\s*=\s*")[^"]*(")', '$1<redacted>$2')
+  Write-Output $displayToml
   exit 0
 }
 

@@ -1312,6 +1312,7 @@ public partial class MainWindow : Window
     private static EndpointConfig NormalizeEndpointInput(string? raw)
     {
         const string apiSuffix = "/api/v1";
+        const string enrollSuffix = "/api/v1/enroll";
         var input = (raw ?? "").Trim().TrimEnd('/');
         if (string.IsNullOrWhiteSpace(input))
         {
@@ -1325,6 +1326,12 @@ public partial class MainWindow : Window
 
         var builder = new UriBuilder(uri) { Query = "", Fragment = "" };
         var path = builder.Path.TrimEnd('/');
+        if (path.Equals(enrollSuffix, StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(enrollSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            path = path.Substring(0, path.Length - enrollSuffix.Length);
+            builder.Path = path;
+        }
         if (path.Equals(apiSuffix, StringComparison.OrdinalIgnoreCase) ||
             path.EndsWith(apiSuffix, StringComparison.OrdinalIgnoreCase))
         {
