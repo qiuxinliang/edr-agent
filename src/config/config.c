@@ -20,6 +20,282 @@
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
 #define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r268-57605ae1"
 
+/*
+ * Some older Windows bootstrap packages wrote paths such as
+ * C:\\Program Files\\FDSecurity\\certs\\ca.pem directly inside a TOML
+ * basic string.  TOML requires those backslashes to be escaped, so tomlc99
+ * correctly rejects the file.  The client keeps this narrowly-scoped
+ * compatibility path for legacy packages: only invalid escapes inside basic
+ * strings are treated as literal backslashes; valid TOML escapes retain their
+ * standard meaning.
+ */
+static int edr_toml_hex_digit(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+static int edr_toml_valid_escape(const char *p, size_t remaining, size_t *width) {
+  size_t i;
+  size_t digits;
+  if (!p || remaining < 2u || !width || p[0] != '\\') {
+    return 0;
+  }
+  switch (p[1]) {
+    case 'b':
+    case 't':
+    case 'n':
+    case 'f':
+    case 'r':
+    case '"':
+    case '\\':
+      *width = 2u;
+      return 1;
+    case 'u':
+      digits = 4u;
+      break;
+    case 'U':
+      digits = 8u;
+      break;
+    default:
+      return 0;
+  }
+  if (remaining < 2u + digits) {
+    return 0;
+  }
+  for (i = 0u; i < digits; i++) {
+    if (!edr_toml_hex_digit(p[2u + i])) {
+      return 0;
+    }
+  }
+  *width = 2u + digits;
+  return 1;
+}
+
+static char *edr_toml_repair_legacy_windows_escapes(const char *input, size_t input_len,
+                                                     size_t *output_len, int *changed) {
+  enum {
+    EDR_TOML_OUTSIDE,
+    EDR_TOML_BASIC,
+    EDR_TOML_LITERAL,
+    EDR_TOML_BASIC_MULTI,
+    EDR_TOML_LITERAL_MULTI,
+    EDR_TOML_COMMENT
+  } state = EDR_TOML_OUTSIDE;
+  size_t i = 0u;
+  size_t o = 0u;
+  char *out;
+
+  if (!input || !output_len || !changed || input_len > (SIZE_MAX - 1u) / 2u) {
+    return NULL;
+  }
+  out = (char *)malloc(input_len * 2u + 1u);
+  if (!out) {
+    return NULL;
+  }
+  *changed = 0;
+  while (i < input_len) {
+    const char c = input[i];
+    if (state == EDR_TOML_COMMENT) {
+      out[o++] = c;
+      i++;
+      if (c == '\n') {
+        state = EDR_TOML_OUTSIDE;
+      }
+      continue;
+    }
+    if (state == EDR_TOML_BASIC || state == EDR_TOML_BASIC_MULTI) {
+      if (c == '\\') {
+        size_t width = 0u;
+        if (edr_toml_valid_escape(input + i, input_len - i, &width)) {
+          memcpy(out + o, input + i, width);
+          o += width;
+          i += width;
+        } else {
+          out[o++] = '\\';
+          out[o++] = '\\';
+          i++;
+          *changed = 1;
+        }
+        continue;
+      }
+      if (state == EDR_TOML_BASIC_MULTI && i + 2u < input_len &&
+          input[i] == '"' && input[i + 1u] == '"' && input[i + 2u] == '"') {
+        memcpy(out + o, input + i, 3u);
+        o += 3u;
+        i += 3u;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      if (state == EDR_TOML_BASIC && c == '"') {
+        out[o++] = c;
+        i++;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      out[o++] = c;
+      i++;
+      continue;
+    }
+    if (state == EDR_TOML_LITERAL || state == EDR_TOML_LITERAL_MULTI) {
+      if (state == EDR_TOML_LITERAL_MULTI && i + 2u < input_len &&
+          input[i] == '\'' && input[i + 1u] == '\'' && input[i + 2u] == '\'') {
+        memcpy(out + o, input + i, 3u);
+        o += 3u;
+        i += 3u;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      if (state == EDR_TOML_LITERAL && c == '\'') {
+        out[o++] = c;
+        i++;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      out[o++] = c;
+      i++;
+      continue;
+    }
+
+    if (c == '#') {
+      out[o++] = c;
+      i++;
+      state = EDR_TOML_COMMENT;
+    } else if (c == '"' && i + 2u < input_len && input[i + 1u] == '"' &&
+               input[i + 2u] == '"') {
+      memcpy(out + o, input + i, 3u);
+      o += 3u;
+      i += 3u;
+      state = EDR_TOML_BASIC_MULTI;
+    } else if (c == '"') {
+      out[o++] = c;
+      i++;
+      state = EDR_TOML_BASIC;
+    } else if (c == '\'' && i + 2u < input_len && input[i + 1u] == '\'' &&
+               input[i + 2u] == '\'') {
+      memcpy(out + o, input + i, 3u);
+      o += 3u;
+      i += 3u;
+      state = EDR_TOML_LITERAL_MULTI;
+    } else if (c == '\'') {
+      out[o++] = c;
+      i++;
+      state = EDR_TOML_LITERAL;
+    } else {
+      out[o++] = c;
+      i++;
+    }
+  }
+  out[o] = '\0';
+  *output_len = o;
+  return out;
+}
+
+static char *edr_config_read_text(const char *path, size_t *length) {
+  FILE *fp;
+  char *buf;
+  size_t used = 0u;
+  size_t cap = 4096u;
+
+  if (!path || !path[0] || !length) {
+    return NULL;
+  }
+  fp = fopen(path, "rb");
+  if (!fp) {
+    return NULL;
+  }
+  buf = (char *)malloc(cap);
+  if (!buf) {
+    fclose(fp);
+    return NULL;
+  }
+  for (;;) {
+    size_t n = fread(buf + used, 1u, cap - used - 1u, fp);
+    used += n;
+    if (ferror(fp)) {
+      free(buf);
+      fclose(fp);
+      return NULL;
+    }
+    if (n == 0u) {
+      break;
+    }
+    if (used + 1u == cap) {
+      size_t next_cap = cap > SIZE_MAX / 2u ? 0u : cap * 2u;
+      char *next;
+      if (next_cap == 0u) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+      }
+      next = (char *)realloc(buf, next_cap);
+      if (!next) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+      }
+      buf = next;
+      cap = next_cap;
+    }
+  }
+  fclose(fp);
+  buf[used] = '\0';
+  *length = used;
+  return buf;
+}
+
+static toml_table_t *edr_config_parse_file_compat(const char *path, char *errbuf,
+                                                   int errbufsz) {
+  char *raw;
+  char *strict;
+  char *repaired;
+  size_t length = 0u;
+  size_t repaired_length = 0u;
+  int changed = 0;
+  const char *strict_input;
+  const char *repaired_input;
+  toml_table_t *root;
+
+  raw = edr_config_read_text(path, &length);
+  if (!raw) {
+    return NULL;
+  }
+  strict = (char *)malloc(length + 1u);
+  if (!strict) {
+    free(raw);
+    return NULL;
+  }
+  memcpy(strict, raw, length + 1u);
+  strict_input = (length >= 3u && (unsigned char)strict[0] == 0xEFu &&
+                  (unsigned char)strict[1] == 0xBBu && (unsigned char)strict[2] == 0xBFu)
+                     ? strict + 3
+                     : strict;
+  root = toml_parse((char *)strict_input, errbuf, errbufsz);
+  free(strict);
+  if (root) {
+    free(raw);
+    return root;
+  }
+
+  repaired = edr_toml_repair_legacy_windows_escapes(raw, length, &repaired_length, &changed);
+  free(raw);
+  if (!repaired || !changed) {
+    free(repaired);
+    return NULL;
+  }
+  repaired_input = (repaired_length >= 3u && (unsigned char)repaired[0] == 0xEFu &&
+                    (unsigned char)repaired[1] == 0xBBu &&
+                    (unsigned char)repaired[2] == 0xBFu)
+                       ? repaired + 3
+                       : repaired;
+  root = toml_parse((char *)repaired_input, errbuf, errbufsz);
+  if (root) {
+    fprintf(stderr,
+            "[config] accepted legacy TOML backslash escapes; regenerate the installer package\n");
+  }
+  free(repaired);
+  return root;
+}
+
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
      .cmdline_contains = "EncodedCommand",
@@ -2754,15 +3030,9 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     return EDR_OK;
   }
 
-  FILE *fp = fopen(path, "r");
-  if (!fp) {
-    return EDR_ERR_CONFIG_PARSE;
-  }
-
   char errbuf[512];
   memset(errbuf, 0, sizeof(errbuf));
-  toml_table_t *root = toml_parse_file(fp, errbuf, (int)sizeof(errbuf));
-  fclose(fp);
+  toml_table_t *root = edr_config_parse_file_compat(path, errbuf, (int)sizeof(errbuf));
 
   if (!root) {
     if (errbuf[0]) {

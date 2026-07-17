@@ -180,6 +180,31 @@ static void test_control_http2_policy_parse_and_legacy_fallback(void) {
   assert(!cfg.platform.control_http1_fallback);
 }
 
+static void test_legacy_windows_path_escape_compatibility(void) {
+  const char *fn = "edr_test_cfg_legacy_windows_paths.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  /* Deliberately emit single backslashes, as older headless packages did. */
+  fprintf(f,
+          "[server]\n"
+          "ca_cert = \"C:\\Program Files\\FDSecurity\\certs\\ca.pem\"\n"
+          "client_cert = \"C:\\Program Files\\FDSecurity\\certs\\client.pem\"\n"
+          "\n[agent]\nendpoint_id = \"legacy\"\n"
+          "\n[platform]\nrest_base_url = \"https://edr.example.test/api/v1\"\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(strcmp(cfg.server.ca_cert, "C:\\Program Files\\FDSecurity\\certs\\ca.pem") == 0);
+  assert(strcmp(cfg.server.client_cert, "C:\\Program Files\\FDSecurity\\certs\\client.pem") == 0);
+  assert(strcmp(cfg.agent.endpoint_id, "legacy") == 0);
+  assert(strcmp(cfg.platform.rest_base_url, "https://edr.example.test/api/v1") == 0);
+  edr_config_free_heap(&cfg);
+}
+
 static void test_detection_policy_conditional_suppression(void) {
   const char *fn = "edr_test_cfg_supp.toml";
   FILE *f = fopen(fn, "wb");
@@ -236,6 +261,7 @@ int main(void) {
   test_correlation_policy_parse();
   test_policy_v2_and_attack_surface_parse();
   test_control_http2_policy_parse_and_legacy_fallback();
+  test_legacy_windows_path_escape_compatibility();
   puts("config_fp ok");
   return 0;
 }
