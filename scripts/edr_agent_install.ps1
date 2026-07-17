@@ -90,6 +90,25 @@ if ((Get-EnrollOs) -eq "windows" -and $InstallDir) {
   if (-not $env:EDR_CLIENT_CSR) { $ClientCsrPath = Join-Path $InstallDir "certs\client.csr.pem" }
 }
 
+# Headless packages may carry a signed Bootstrap CA under certs/. Discover it
+# automatically so scripted installs get the same TLS trust as Setup UI.
+if (-not $BootstrapCaCertPath) {
+  $bootstrapCaCandidates = New-Object System.Collections.Generic.List[string]
+  if ($PSScriptRoot) {
+    $bootstrapCaCandidates.Add((Join-Path $PSScriptRoot "certs\bootstrap-ca.pem")) | Out-Null
+    $packageRoot = Split-Path -Parent $PSScriptRoot
+    if ($packageRoot) {
+      $bootstrapCaCandidates.Add((Join-Path $packageRoot "certs\bootstrap-ca.pem")) | Out-Null
+    }
+  }
+  foreach ($candidate in $bootstrapCaCandidates) {
+    if (Test-Path -LiteralPath $candidate) {
+      $BootstrapCaCertPath = [System.IO.Path]::GetFullPath($candidate)
+      break
+    }
+  }
+}
+
 $api = $ApiBase
 $tok = $EnrollToken
 if (-not $api -or -not $tok) {
