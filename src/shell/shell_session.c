@@ -25,6 +25,10 @@ static uint32_t g_max_output_kb;
 static edr_ss_write_fn g_write_fn;
 static void *g_write_user;
 static bool g_initialized;
+static SRWLOCK g_sessions_lock = SRWLOCK_INIT;
+
+static void sessions_lock(void) { AcquireSRWLockExclusive(&g_sessions_lock); }
+static void sessions_unlock(void) { ReleaseSRWLockExclusive(&g_sessions_lock); }
 
 static ShellSession *find_free_slot(void) {
   for (uint32_t i = 0; i < g_max_sessions; i++) {
@@ -54,6 +58,11 @@ static void close_session_handles(ShellSession *s) {
 void edr_shell_session_init(uint32_t max_sessions, uint32_t timeout_s,
                             uint32_t max_output_kb,
                             edr_ss_write_fn write_fn, void *write_user) {
+  sessions_lock();
+  if (g_initialized) {
+    sessions_unlock();
+    return;
+  }
   if (max_sessions > EDR_SS_MAX_SESSIONS) max_sessions = EDR_SS_MAX_SESSIONS;
   g_max_sessions = max_sessions;
   g_timeout_s = timeout_s;
@@ -62,9 +71,11 @@ void edr_shell_session_init(uint32_t max_sessions, uint32_t timeout_s,
   g_write_user = write_user;
   (void)memset(g_sessions, 0, sizeof(g_sessions));
   g_initialized = true;
+  sessions_unlock();
 }
 
 void edr_shell_session_shutdown(void) {
+  sessions_lock();
   for (uint32_t i = 0; i < g_max_sessions; i++) {
     if (g_sessions[i].active) {
       if (g_sessions[i].process) {
@@ -75,13 +86,21 @@ void edr_shell_session_shutdown(void) {
   }
   (void)memset(g_sessions, 0, sizeof(g_sessions));
   g_initialized = false;
+  sessions_unlock();
 }
 
 int edr_shell_session_open(const char *session_id, const char *shell) {
-  if (!g_initialized || !session_id || !shell) return -1;
+  sessions_lock();
+  if (!g_initialized || !session_id || !shell) {
+    sessions_unlock();
+    return -1;
+  }
 
   ShellSession *s = find_free_slot();
-  if (!s) return -1;
+  if (!s) {
+    sessions_unlock();
+    return -1;
+  }
 
   HANDLE stdin_r = NULL, stdin_w = NULL;
   HANDLE stdout_r = NULL, stdout_w = NULL;
@@ -93,6 +112,7 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
     if (stdin_w)  CloseHandle(stdin_w);
     if (stdout_r) CloseHandle(stdout_r);
     if (stdout_w) CloseHandle(stdout_w);
+    sessions_unlock();
     return -1;
   }
   SetHandleInformation(stdin_w, HANDLE_FLAG_INHERIT, 0);
@@ -103,6 +123,7 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   if (!wshell) {
     CloseHandle(stdin_r);  CloseHandle(stdin_w);
     CloseHandle(stdout_r); CloseHandle(stdout_w);
+    sessions_unlock();
     return -1;
   }
   MultiByteToWideChar(CP_UTF8, 0, shell, -1, wshell, (int)shell_wlen);
@@ -134,6 +155,7 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
     CloseHandle(stdin_w);
     CloseHandle(stdout_r);
     if (job) CloseHandle(job);
+    sessions_unlock();
     return -1;
   }
 
@@ -153,33 +175,52 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   s->start_ms = GetTickCount64();
   s->next_seq = 1u;
   s->active = true;
+  sessions_unlock();
   return 0;
 }
 
 int edr_shell_session_input(const char *session_id,
                             const char *data, size_t len) {
-  if (!g_initialized || !session_id || !data || len == 0) return -1;
+  sessions_lock();
+  if (!g_initialized || !session_id || !data || len == 0) {
+    sessions_unlock();
+    return -1;
+  }
   ShellSession *s = find_by_id(session_id);
-  if (!s) return -1;
+  if (!s) {
+    sessions_unlock();
+    return -1;
+  }
 
   DWORD written = 0;
   if (!WriteFile(s->stdin_w, data, (DWORD)len, &written, NULL)) {
+    sessions_unlock();
     return -1;
   }
+  sessions_unlock();
   return 0;
 }
 
 void edr_shell_session_close(const char *session_id) {
+  sessions_lock();
   ShellSession *s = find_by_id(session_id);
-  if (!s) return;
+  if (!s) {
+    sessions_unlock();
+    return;
+  }
 
   if (s->process) TerminateProcess(s->process, 0);
   close_session_handles(s);
   (void)memset(s, 0, sizeof(*s));
+  sessions_unlock();
 }
 
 void edr_shell_session_poll(void) {
-  if (!g_initialized) return;
+  sessions_lock();
+  if (!g_initialized) {
+    sessions_unlock();
+    return;
+  }
 
   uint64_t now = GetTickCount64();
 
@@ -235,13 +276,16 @@ void edr_shell_session_poll(void) {
       (void)memset(s, 0, sizeof(*s));
     }
   }
+  sessions_unlock();
 }
 
 uint32_t edr_shell_session_active_count(void) {
+  sessions_lock();
   uint32_t c = 0;
   for (uint32_t i = 0; i < g_max_sessions; i++) {
     if (g_sessions[i].active) c++;
   }
+  sessions_unlock();
   return c;
 }
 
@@ -250,6 +294,7 @@ uint32_t edr_shell_session_active_count(void) {
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <time.h>
 
@@ -270,6 +315,10 @@ static uint32_t g_max_output_kb;
 static edr_ss_write_fn g_write_fn;
 static void *g_write_user;
 static bool g_initialized;
+static pthread_mutex_t g_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void sessions_lock(void) { (void)pthread_mutex_lock(&g_sessions_lock); }
+static void sessions_unlock(void) { (void)pthread_mutex_unlock(&g_sessions_lock); }
 
 static ShellSession *find_free_slot(void) {
   for (uint32_t i = 0; i < g_max_sessions; i++) {
@@ -298,6 +347,11 @@ static uint64_t ms_now(void) {
 void edr_shell_session_init(uint32_t max_sessions, uint32_t timeout_s,
                             uint32_t max_output_kb,
                             edr_ss_write_fn write_fn, void *write_user) {
+  sessions_lock();
+  if (g_initialized) {
+    sessions_unlock();
+    return;
+  }
   if (max_sessions > EDR_SS_MAX_SESSIONS) max_sessions = EDR_SS_MAX_SESSIONS;
   g_max_sessions = max_sessions;
   g_timeout_s = timeout_s;
@@ -306,9 +360,11 @@ void edr_shell_session_init(uint32_t max_sessions, uint32_t timeout_s,
   g_write_user = write_user;
   (void)memset(g_sessions, 0, sizeof(g_sessions));
   g_initialized = true;
+  sessions_unlock();
 }
 
 void edr_shell_session_shutdown(void) {
+  sessions_lock();
   for (uint32_t i = 0; i < g_max_sessions; i++) {
     if (g_sessions[i].active) {
       kill(g_sessions[i].child_pid, SIGKILL);
@@ -319,16 +375,25 @@ void edr_shell_session_shutdown(void) {
   }
   (void)memset(g_sessions, 0, sizeof(g_sessions));
   g_initialized = false;
+  sessions_unlock();
 }
 
 int edr_shell_session_open(const char *session_id, const char *shell) {
-  if (!g_initialized || !session_id || !shell) return -1;
+  sessions_lock();
+  if (!g_initialized || !session_id || !shell) {
+    sessions_unlock();
+    return -1;
+  }
 
   ShellSession *s = find_free_slot();
-  if (!s) return -1;
+  if (!s) {
+    sessions_unlock();
+    return -1;
+  }
 
   int stdin_pipe[2], stdout_pipe[2];
   if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0) {
+    sessions_unlock();
     return -1;
   }
 
@@ -336,6 +401,7 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   if (pid < 0) {
     close(stdin_pipe[0]); close(stdin_pipe[1]);
     close(stdout_pipe[0]); close(stdout_pipe[1]);
+    sessions_unlock();
     return -1;
   }
 
@@ -362,30 +428,48 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   s->start_ms = ms_now();
   s->next_seq = 1u;
   s->active = true;
+  sessions_unlock();
   return 0;
 }
 
 int edr_shell_session_input(const char *session_id,
                             const char *data, size_t len) {
-  if (!g_initialized || !session_id || !data || len == 0) return -1;
+  sessions_lock();
+  if (!g_initialized || !session_id || !data || len == 0) {
+    sessions_unlock();
+    return -1;
+  }
   ShellSession *s = find_by_id(session_id);
-  if (!s || s->stdin_fd < 0) return -1;
+  if (!s || s->stdin_fd < 0) {
+    sessions_unlock();
+    return -1;
+  }
   (void)!write(s->stdin_fd, data, len);
+  sessions_unlock();
   return 0;
 }
 
 void edr_shell_session_close(const char *session_id) {
+  sessions_lock();
   ShellSession *s = find_by_id(session_id);
-  if (!s) return;
+  if (!s) {
+    sessions_unlock();
+    return;
+  }
   kill(s->child_pid, SIGKILL);
   waitpid(s->child_pid, NULL, WNOHANG);
   if (s->stdin_fd >= 0)  { close(s->stdin_fd);  s->stdin_fd = -1; }
   if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
   (void)memset(s, 0, sizeof(*s));
+  sessions_unlock();
 }
 
 void edr_shell_session_poll(void) {
-  if (!g_initialized) return;
+  sessions_lock();
+  if (!g_initialized) {
+    sessions_unlock();
+    return;
+  }
 
   uint64_t now = ms_now();
 
@@ -434,13 +518,16 @@ void edr_shell_session_poll(void) {
     }
     free(buf);
   }
+  sessions_unlock();
 }
 
 uint32_t edr_shell_session_active_count(void) {
+  sessions_lock();
   uint32_t c = 0;
   for (uint32_t i = 0; i < g_max_sessions; i++) {
     if (g_sessions[i].active) c++;
   }
+  sessions_unlock();
   return c;
 }
 

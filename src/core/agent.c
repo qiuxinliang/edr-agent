@@ -160,6 +160,7 @@ static void edr_agent_loop_probe_end(uint64_t started_ns) {
 static int edr_agent_download_text_file(const char *url, const char *tmp, size_t max_bytes,
                                         const char *label, EdrAgentConfigHeaders *headers) {
   int rc;
+  EdrIngestHttpRuntime runtime;
   if (!url || !url[0] || !tmp || !tmp[0]) {
     return -1;
   }
@@ -169,8 +170,12 @@ static int edr_agent_download_text_file(const char *url, const char *tmp, size_t
   if (rc == 0) {
     return 0;
   }
-  fprintf(stderr, "[config] %s pull failed via native HTTPS client\n",
-          label && label[0] ? label : "remote config");
+  memset(&runtime, 0, sizeof(runtime));
+  edr_ingest_http_get_runtime(&runtime);
+  fprintf(stderr, "[config] %s pull failed via native HTTPS client%s%s\n",
+          label && label[0] ? label : "remote config",
+          runtime.last_error[0] ? ": " : "",
+          runtime.last_error[0] ? runtime.last_error : "");
   return -1;
 }
 
