@@ -66,6 +66,10 @@ int main(void) {
                          "queue lock access denial must not be reported as another instance");
   ok &= require_contains(queue, "err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION",
                          "only Windows lock-contention errors may enter the lock wait path");
+  ok &= require_contains(queue, "sqlite open failed rc=%d extended_rc=%d system_errno=%d",
+                         "SQLite queue open failures must retain native diagnostic details");
+  ok &= require_contains(queue, "sqlite3_close(s_db);",
+                         "failed SQLite queue opens must close the diagnostic handle");
   free(queue);
 
   char *main_source = read_source(root, "src/main.c");
@@ -106,7 +110,23 @@ int main(void) {
                          "scheduled Agent must be restarted after abnormal exit");
   ok &= require_contains(autorun, "-WorkingDirectory $instDir",
                          "scheduled task must use the installation directory");
+  ok &= require_contains(autorun, "Repair-RuntimeFileAcls -Path $path",
+                         "scheduled-task installation must repair explicit ACLs on existing runtime files");
   free(autorun);
+
+  char *installer_ps = read_source(root, "scripts/edr_agent_install.ps1");
+  if (!installer_ps) return 1;
+  ok &= require_contains(installer_ps, "Repair-RuntimeFileAcls -Path $path",
+                         "headless enrollment must repair explicit ACLs on existing queue DB sidecars");
+  ok &= require_contains(installer_ps, "if ($sub -eq \"queue\") { throw }",
+                         "headless enrollment must fail when queue ACL repair fails");
+  free(installer_ps);
+
+  char *preflight = read_source(root, "scripts/edr_agent_preflight.ps1");
+  if (!preflight) return 1;
+  ok &= require_contains(preflight, "repaired ACL and removed $Label",
+                         "preflight must retry cleanup after repairing empty file ACLs");
+  free(preflight);
 
   char *inno = read_source(root, "install/windows-inno/EDRAgentSetup.bundled.iss");
   if (!inno) return 1;

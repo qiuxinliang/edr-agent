@@ -133,6 +133,18 @@ function Repair-UninstallerAcls {
   }
 }
 
+function Repair-RuntimeFileAcls {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  foreach ($item in @(Get-ChildItem -LiteralPath $Path -File -Force -Recurse -ErrorAction SilentlyContinue)) {
+    try { & takeown.exe /F $item.FullName /A 2>$null | Out-Null } catch {}
+    & icacls.exe $item.FullName /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "file ACL repair failed with exit code $LASTEXITCODE path=$($item.FullName)"
+    }
+  }
+}
+
 function Repair-RuntimeDependencyAcls {
   param([string]$Dir)
   if (-not (Test-Path -LiteralPath $Dir)) { return }
@@ -167,6 +179,7 @@ function Repair-SensitiveRuntimeAcls {
       if ($sub -eq "queue" -and $aclExit -ne 0) {
         throw "queue ACL repair failed with exit code $aclExit"
       }
+      Repair-RuntimeFileAcls -Path $path
     } catch {
       if ($sub -eq "queue") { throw }
     }

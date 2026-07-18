@@ -458,6 +458,15 @@ EdrError edr_storage_queue_open(const char *path) {
 
   int rc = sqlite3_open(s_path, &s_db);
   if (rc != SQLITE_OK || !s_db) {
+    int extended_rc = s_db ? sqlite3_extended_errcode(s_db) : rc;
+    int system_errno = s_db ? sqlite3_system_errno(s_db) : 0;
+    const char *message = s_db ? sqlite3_errmsg(s_db) : "sqlite handle unavailable";
+    fprintf(stderr,
+            "[queue] sqlite open failed rc=%d extended_rc=%d system_errno=%d message=%s path=%s\n",
+            rc, extended_rc, system_errno, message ? message : "unknown", s_path);
+    if (s_db) {
+      sqlite3_close(s_db);
+    }
     s_db = NULL;
     queue_lock_release();
     return EDR_ERR_SQLITE_OPEN;

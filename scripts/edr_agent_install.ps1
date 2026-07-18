@@ -433,6 +433,20 @@ function Remove-StaleEnrollmentArtifact {
   Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
 }
 
+function Repair-RuntimeFileAcls {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+  $icacls = Get-Command "icacls.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $icacls) { throw "icacls.exe not found" }
+  foreach ($item in @(Get-ChildItem -LiteralPath $Path -File -Force -Recurse -ErrorAction SilentlyContinue)) {
+    try { & takeown.exe /F $item.FullName /A 2>$null | Out-Null } catch {}
+    & $icacls.Source $item.FullName /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "file ACL repair failed with exit code $LASTEXITCODE path=$($item.FullName)"
+    }
+  }
+}
+
 function Repair-InstallRuntimeAcls {
   param([string]$InstallRoot)
   if ((Get-EnrollOs) -ne "windows") { return }
@@ -453,9 +467,15 @@ function Repair-InstallRuntimeAcls {
       if (-not (Test-Path -LiteralPath $path)) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
       }
+      try { & takeown.exe /F $path /A /R /D Y 2>$null | Out-Null } catch {}
       & $icacls.Source $path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "directory ACL repair failed with exit code $LASTEXITCODE path=$path"
+      }
+      Repair-RuntimeFileAcls -Path $path
     } catch {
       Write-Warning ("failed to harden runtime path ACL: " + $path + " " + $_.Exception.Message)
+      if ($sub -eq "queue") { throw }
     }
   }
 
