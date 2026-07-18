@@ -782,6 +782,11 @@ begin
     + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'));
 end;
 
+function EdrWorkerStartAutorunParams: string;
+begin
+  Result := EdrWorkerBaseParams('start-autorun');
+end;
+
 function EdrWorkerStartServiceParams: string;
 begin
   Result := EdrWorkerBaseParams('start-service')
@@ -1005,13 +1010,9 @@ begin
     + 'Start-Sleep -Seconds 5;'
     + 'try { if(Test-Path -LiteralPath $startupLog){Get-Content -LiteralPath $startupLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { L (''task_launcher ''+$_) }} } catch {};'
     + '$p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue;'
-    + 'if(-not $p -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $cfg)){'
-    + 'try { $q=[char]34;$agentArgs=''--config ''+$q+$cfg+$q; $p=Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd -WindowStyle Hidden -PassThru -ErrorAction Stop; L (''manual fallback pid=''+$p.Id+'' args=''+$agentArgs) } catch { L (''manual fallback error: ''+$_.Exception.Message) };'
-    + 'Start-Sleep -Seconds 2;'
-    + '};'
     + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
     + 'try { $task=Get-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($task){L (''task_state=''+$task.State)}; $info=Get-ScheduledTaskInfo -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($info){L (''task_last_result=''+$info.LastTaskResult)} } catch {};'
-    + 'if(-not (Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue)){L ''runtime_not_started''};'
+    + 'if(-not $p){L ''runtime_not_started'';exit 1};'
     + 'exit 0'
     + '"';
 end;
@@ -1153,10 +1154,10 @@ begin
   begin
     if EdrInstallerWorkerExists then
     begin
-      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrWorkerStartRuntimeParams, False) then
+      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting and verifying the FDSecurityAgent scheduled task.', EdrWorkerStartAutorunParams, True) then
         EdrAbortInstall;
     end
-    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent scheduled task.', EdrStartScheduledTaskPsParameters, False) then
+    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent scheduled task.', EdrStartScheduledTaskPsParameters, True) then
       EdrAbortInstall;
   end
   else

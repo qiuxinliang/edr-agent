@@ -473,16 +473,11 @@ static int edr_agent_run_main(const char *config) {
 #ifdef _WIN32
     edr_ensure_parent_dirs_win(qpath);
 #endif
+    const char *queue_error_path = (qpath && qpath[0]) ? qpath : "edr_queue.db";
     EdrError sq = edr_storage_queue_open(qpath);
-    if (sq == EDR_ERR_QUEUE_LOCKED) {
-      fprintf(stderr,
-              "[queue] another agent instance appears to be running; exiting before collector start\n");
-      edr_agent_destroy(agent);
-      return 1;
-    }
-    if (sq != EDR_OK && qpath && qpath[0]) {
+    if (sq != EDR_OK) {
 #ifdef _WIN32
-      if (!edr_path_is_absolute_win(qpath)) {
+      if (sq != EDR_ERR_QUEUE_LOCKED && !edr_path_is_absolute_win(queue_error_path)) {
         char fallback[MAX_PATH * 4];
         snprintf(fallback, sizeof(fallback), "%s",
                  "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db");
@@ -490,18 +485,25 @@ static int edr_agent_run_main(const char *config) {
         sq = edr_storage_queue_open(fallback);
         if (sq == EDR_OK) {
           fprintf(stderr, "[queue] using install-dir path (%s)\n", fallback);
-        } else if (sq == EDR_ERR_QUEUE_LOCKED) {
-          fprintf(stderr,
-                  "[queue] another agent instance appears to be running; exiting before collector start\n");
-          edr_agent_destroy(agent);
-          return 1;
         } else {
-          fprintf(stderr, "[queue] open failed (%s): %d\n", qpath, (int)sq);
+          queue_error_path = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db";
         }
-      } else
+      }
 #endif
-      {
-        fprintf(stderr, "[queue] open failed (%s): %d\n", qpath, (int)sq);
+      if (sq != EDR_OK) {
+        if (sq == EDR_ERR_QUEUE_LOCKED) {
+          fprintf(stderr,
+                  "[queue] another agent instance holds the queue lock; exiting before collector start (%s)\n",
+                  queue_error_path);
+        } else if (sq == EDR_ERR_QUEUE_PERMISSION) {
+          fprintf(stderr,
+                  "[queue] queue ACL denies the Agent runtime identity; repair the queue directory ACL and restart (%s)\n",
+                  queue_error_path);
+        } else {
+          fprintf(stderr, "[queue] fatal open failure (%s): %d\n", queue_error_path, (int)sq);
+        }
+        edr_agent_destroy(agent);
+        return 1;
       }
     }
   }

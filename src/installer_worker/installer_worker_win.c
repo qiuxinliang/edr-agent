@@ -99,6 +99,18 @@ static void system_exe_path(wchar_t *out, size_t cap, const wchar_t *name) {
   out[cap - 1] = 0;
 }
 
+static void windows_powershell_path(wchar_t *out, size_t cap) {
+  if (!out || cap == 0) return;
+  wchar_t windows_dir[MAX_PATH];
+  UINT n = GetWindowsDirectoryW(windows_dir, (UINT)(sizeof(windows_dir) / sizeof(windows_dir[0])));
+  if (n == 0 || n >= (sizeof(windows_dir) / sizeof(windows_dir[0]))) {
+    _snwprintf(out, cap, L"powershell.exe");
+  } else {
+    _snwprintf(out, cap, L"%ls\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", windows_dir);
+  }
+  out[cap - 1] = 0;
+}
+
 static void quote_arg(wchar_t *out, size_t cap, const wchar_t *value) {
   if (!out || cap == 0) return;
   size_t pos = 0;
@@ -463,6 +475,10 @@ static int process_running_by_name(const wchar_t *image_name) {
 
 static int stage_stop_runtime(const wchar_t *install_dir, const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=stop-runtime begin");
+  wchar_t schtasks[MAX_PATH * 2];
+  system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
+  (void)run_process_wait(schtasks, L"/End /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
+  (void)run_process_wait(schtasks, L"/End /TN \"EdrAgent\"", install_dir, log_path, 30000);
   stop_service_by_name(DEFAULT_SERVICE_NAME, log_path);
   stop_service_by_name(L"EdrAgent", log_path);
   stop_process_by_name(L"FDSensor.exe", log_path);
@@ -552,6 +568,12 @@ static int run_icacls(const wchar_t *args, const wchar_t *install_dir, const wch
   return run_process_wait(exe, args, install_dir, log_path, 30000);
 }
 
+static int run_takeown(const wchar_t *args, const wchar_t *install_dir, const wchar_t *log_path) {
+  wchar_t exe[MAX_PATH * 2];
+  system_exe_path(exe, sizeof(exe) / sizeof(exe[0]), L"takeown.exe");
+  return run_process_wait(exe, args, install_dir, log_path, 30000);
+}
+
 static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=harden-acl begin");
   ensure_runtime_dirs(install_dir, log_path);
@@ -562,18 +584,32 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
              L"%ls /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /grant:r \"*S-1-5-32-545:(OI)(CI)RX\" /C /Q",
              qdir);
   args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-  run_icacls(args, install_dir, log_path);
+  (void)run_icacls(args, install_dir, log_path);
 
   const wchar_t *sensitive_dirs[] = {L"certs", L"queue", L"evidence", L"state", L"logs", L"diagnostics",
                                      L"upload_outbox", L"forensic", L"isolation", NULL};
   for (int i = 0; sensitive_dirs[i]; ++i) {
     join_path(path, sizeof(path) / sizeof(path[0]), install_dir, sensitive_dirs[i]);
     quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), path);
+    _snwprintf(args, sizeof(args) / sizeof(args[0]), L"/F %ls /A /R /D Y", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    (void)run_takeown(args, install_dir, log_path);
     _snwprintf(args, sizeof(args) / sizeof(args[0]),
                L"%ls /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /T /C /Q",
                qpath);
     args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-    run_icacls(args, install_dir, log_path);
+    int acl_rc = run_icacls(args, install_dir, log_path);
+    if (_wcsicmp(sensitive_dirs[i], L"queue") == 0 && acl_rc != 0) {
+      append_log_utf8(log_path, L"queue_acl_repair_failed");
+      return 52;
+    }
+  }
+
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"queue\\edr_queue.db.lock");
+  delete_file_if_exists(path, log_path);
+  if (file_exists(path)) {
+    append_log_utf8(log_path, L"stale_queue_lock_remove_failed");
+    return 53;
   }
 
   const struct {
@@ -741,7 +777,8 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
     return 31;
   }
   ensure_runtime_dirs(install_dir, log_path);
-  stage_harden_acl(install_dir, log_path);
+  int acl_rc = stage_harden_acl(install_dir, log_path);
+  if (acl_rc != 0) return acl_rc;
   set_runtime_env(install_dir, log_path);
   delete_service_by_name(L"EdrAgent", log_path);
 
@@ -812,28 +849,53 @@ static int stage_install_autorun(const wchar_t *install_dir, const wchar_t *exe_
     return 41;
   }
   ensure_runtime_dirs(install_dir, log_path);
-  stage_harden_acl(install_dir, log_path);
+  int acl_rc = stage_harden_acl(install_dir, log_path);
+  if (acl_rc != 0) return acl_rc;
   set_runtime_env(install_dir, log_path);
 
-  wchar_t schtasks[MAX_PATH * 2], qtn[256], qtr[4096], qexe[MAX_PATH * 2], qcfg[MAX_PATH * 2], task_run[4096];
-  system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
-  run_process_wait(schtasks, L"/Delete /F /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
-  run_process_wait(schtasks, L"/Delete /F /TN \"EdrAgent\"", install_dir, log_path, 30000);
-  quote_arg(qtn, sizeof(qtn) / sizeof(qtn[0]), L"FDSecurityAgent");
-  quote_arg(qexe, sizeof(qexe) / sizeof(qexe[0]), exe_path);
-  quote_arg(qcfg, sizeof(qcfg) / sizeof(qcfg[0]), config_path);
-  _snwprintf(task_run, sizeof(task_run) / sizeof(task_run[0]), L"%ls --config %ls", qexe, qcfg);
-  task_run[(sizeof(task_run) / sizeof(task_run[0])) - 1] = 0;
-  quote_arg(qtr, sizeof(qtr) / sizeof(qtr[0]), task_run);
-
-  wchar_t args[8192];
+  wchar_t script[MAX_PATH * 2], powershell[MAX_PATH * 2], qscript[MAX_PATH * 4], args[8192];
+  join_path(script, sizeof(script) / sizeof(script[0]), install_dir, L"edr_windows_autorun.ps1");
+  if (!file_exists(script)) {
+    log_msg(log_path, L"autorun_script_missing path=", script);
+    return 42;
+  }
+  windows_powershell_path(powershell, sizeof(powershell) / sizeof(powershell[0]));
+  quote_arg(qscript, sizeof(qscript) / sizeof(qscript[0]), script);
   _snwprintf(args, sizeof(args) / sizeof(args[0]),
-             L"/Create /F /TN %ls /SC ONSTART /RU SYSTEM /RL HIGHEST /TR %ls", qtn, qtr);
+             L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File %ls -Action Install -NoStart -HardenAcl",
+             qscript);
   args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-  int rc = run_process_wait(schtasks, args, install_dir, log_path, 30000);
-  if (rc != 0) return 42;
+  int rc = run_process_wait(powershell, args, install_dir, log_path, 120000);
+  if (rc != 0) return 43;
   append_log_utf8(log_path, L"stage=install-autorun ok");
   return 0;
+}
+
+static int stage_start_autorun(const wchar_t *install_dir, const wchar_t *log_path) {
+  append_log_utf8(log_path, L"stage=start-autorun begin");
+  if (process_running_by_name(L"FDSensor.exe")) {
+    append_log_utf8(log_path, L"stage=start-autorun ok already_running=1");
+    return 0;
+  }
+
+  wchar_t schtasks[MAX_PATH * 2];
+  system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
+  int rc = run_process_wait(schtasks, L"/Run /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
+  if (rc != 0) {
+    append_log_utf8(log_path, L"scheduled_task_start_failed");
+    return 44;
+  }
+
+  for (int i = 0; i < 60; ++i) {
+    Sleep(250);
+    if (process_running_by_name(L"FDSensor.exe")) {
+      append_log_utf8(log_path, L"stage=start-autorun ok process_running=1");
+      return 0;
+    }
+  }
+  (void)run_process_wait(schtasks, L"/Query /TN \"FDSecurityAgent\" /V /FO LIST", install_dir, log_path, 30000);
+  append_log_utf8(log_path, L"scheduled_task_started_without_agent_process");
+  return 45;
 }
 
 static int stage_start_runtime(const wchar_t *install_dir, const wchar_t *exe_path, const wchar_t *config_path,
@@ -1022,7 +1084,7 @@ static int stage_write_health_summary(const wchar_t *install_dir, const wchar_t 
 
 static void usage(void) {
   fwprintf(stderr,
-           L"FDSecurityInstallerWorker --stage <stop-runtime|clean-cache|validate-config|harden-acl|install-service|install-autorun|start-runtime|start-service|uninstall-runtime|write-health-summary> "
+           L"FDSecurityInstallerWorker --stage <stop-runtime|clean-cache|validate-config|harden-acl|install-service|install-autorun|start-autorun|start-runtime|start-service|uninstall-runtime|write-health-summary> "
            L"[--install-dir <dir>] [--config <path>] [--exe <path>] [--log <path>] [--report <path>]\n");
 }
 
@@ -1066,6 +1128,8 @@ int main(void) {
     rc = stage_install_service(install_dir, exe_path, config_path, svc, display, log_path);
   } else if (_wcsicmp(stage, L"install-autorun") == 0) {
     rc = stage_install_autorun(install_dir, exe_path, config_path, log_path);
+  } else if (_wcsicmp(stage, L"start-autorun") == 0) {
+    rc = stage_start_autorun(install_dir, log_path);
   } else if (_wcsicmp(stage, L"start-runtime") == 0) {
     rc = stage_start_runtime(install_dir, exe_path, config_path, log_path);
   } else if (_wcsicmp(stage, L"start-service") == 0) {

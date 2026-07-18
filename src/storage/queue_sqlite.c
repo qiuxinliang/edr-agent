@@ -341,9 +341,9 @@ static long queue_lock_wait_ms(void) {
   return v;
 }
 
-static int queue_lock_acquire(const char *path) {
+static EdrError queue_lock_acquire(const char *path) {
   if (!path || !path[0]) {
-    return -1;
+    return EDR_ERR_INVALID_ARG;
   }
   snprintf(s_lock_path, sizeof(s_lock_path), "%s.lock", path);
   const long wait_ms = queue_lock_wait_ms();
@@ -356,20 +356,25 @@ static int queue_lock_acquire(const char *path) {
     s_lock_handle = CreateFileA(s_lock_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
                                 FILE_ATTRIBUTE_NORMAL, NULL);
     if (s_lock_handle != INVALID_HANDLE_VALUE) {
-      return 0;
+      return EDR_OK;
     }
     DWORD err = GetLastError();
     if (err == ERROR_ACCESS_DENIED) {
       fprintf(stderr,
               "[queue] lock open denied (ACL/权限不足,Agent 须以 SYSTEM 经计划任务运行;勿手动前台跑): %s\n",
               s_lock_path);
-      return -1;
+      return EDR_ERR_QUEUE_PERMISSION;
+    }
+    if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION) {
+      fprintf(stderr, "[queue] cannot open queue lock file (winerr=%lu): %s\n",
+              (unsigned long)err, s_lock_path);
+      return EDR_ERR_SQLITE_OPEN;
     }
     if (waited >= wait_ms) {
       fprintf(stderr,
               "[queue] cannot acquire queue file lock after %ldms (另一实例持有): %s\n",
               wait_ms, s_lock_path);
-      return -1;
+      return EDR_ERR_QUEUE_LOCKED;
     }
     Sleep(step);
     waited += (long)step;
@@ -379,29 +384,30 @@ static int queue_lock_acquire(const char *path) {
   if (s_lock_fd < 0) {
     if (errno == EACCES || errno == EPERM) {
       fprintf(stderr, "[queue] lock open denied (权限不足,须以服务身份运行): %s\n", s_lock_path);
+      return EDR_ERR_QUEUE_PERMISSION;
     } else {
       fprintf(stderr, "[queue] cannot open queue lock file (errno=%d): %s\n", errno, s_lock_path);
+      return EDR_ERR_SQLITE_OPEN;
     }
-    return -1;
   }
   const long step_us = 250000; /* 250ms */
   long waited = 0;
   for (;;) {
     if (flock(s_lock_fd, LOCK_EX | LOCK_NB) == 0) {
-      return 0;
+      return EDR_OK;
     }
     if (errno != EWOULDBLOCK && errno != EAGAIN) {
       fprintf(stderr, "[queue] flock failed (errno=%d): %s\n", errno, s_lock_path);
       close(s_lock_fd);
       s_lock_fd = -1;
-      return -1;
+      return EDR_ERR_SQLITE_OPEN;
     }
     if (waited >= wait_ms) {
       close(s_lock_fd);
       s_lock_fd = -1;
       fprintf(stderr, "[queue] cannot acquire queue file lock after %ldms (另一实例持有): %s\n",
               wait_ms, s_lock_path);
-      return -1;
+      return EDR_ERR_QUEUE_LOCKED;
     }
     usleep(step_us);
     waited += 250;
@@ -445,8 +451,9 @@ EdrError edr_storage_queue_open(const char *path) {
     snprintf(s_path, sizeof(s_path), "%s", "edr_queue.db");
   }
 
-  if (queue_lock_acquire(s_path) != 0) {
-    return EDR_ERR_QUEUE_LOCKED;
+  EdrError lock_error = queue_lock_acquire(s_path);
+  if (lock_error != EDR_OK) {
+    return lock_error;
   }
 
   int rc = sqlite3_open(s_path, &s_db);

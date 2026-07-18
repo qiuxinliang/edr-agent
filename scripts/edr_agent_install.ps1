@@ -721,6 +721,33 @@ function Install-AgentAutorun {
   Write-Host "Installed FDSecurityAgent startup task"
 }
 
+function Install-HeadlessUninstaller {
+  param([string]$InstallRoot)
+  if ((Get-EnrollOs) -ne "windows" -or -not $InstallRoot) { return }
+
+  $sourceCandidates = New-Object System.Collections.Generic.List[string]
+  if ($PSScriptRoot) {
+    $sourceCandidates.Add((Join-Path $PSScriptRoot "uninstall.ps1")) | Out-Null
+    $packageRoot = Split-Path -Parent $PSScriptRoot
+    if ($packageRoot) {
+      $sourceCandidates.Add((Join-Path $packageRoot "uninstall.ps1")) | Out-Null
+    }
+  }
+  $source = $sourceCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+  if (-not $source) {
+    Write-Warning "Headless uninstaller was not found next to the installer script"
+    return
+  }
+
+  $destination = Join-Path ([System.IO.Path]::GetFullPath($InstallRoot)) "uninstall.ps1"
+  $sourceFull = [System.IO.Path]::GetFullPath($source)
+  if ($sourceFull -ne [System.IO.Path]::GetFullPath($destination)) {
+    Copy-Item -LiteralPath $sourceFull -Destination $destination -Force
+  }
+  try { Unblock-File -LiteralPath $destination -ErrorAction SilentlyContinue } catch {}
+  Write-Host "Installed headless uninstall entry: $destination"
+}
+
 function Normalize-KeyProvider([string]$Provider) {
   $p = if ($Provider) { $Provider.Trim().ToLowerInvariant() } else { "" }
   if (-not $p) {
@@ -1100,6 +1127,7 @@ if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
     if ($InstallAutorun) {
       Install-AgentAutorun
     }
+    Install-HeadlessUninstaller -InstallRoot $existingInstallRoot
     Write-Host "Existing agent.toml found (endpoint_id=$existingEndpointId tenant_id=$existingTenantId); skipped enroll. Use -ForceEnroll or EDR_FORCE_ENROLL=1 to re-enroll."
     exit 0
   }
@@ -2422,6 +2450,7 @@ if ($generatedTomlIssue) {
 }
 Repair-AgentTomlAcl -Path $outFile
 Repair-InstallRuntimeAcls -InstallRoot $InstallDirForToml
+Install-HeadlessUninstaller -InstallRoot $InstallDirForToml
 Repair-AgentTomlAcl -Path $outFile
 Write-Host "Wrote $outFile (endpoint_id=$($d.endpoint_id) tenant_id=$($d.tenant_id) server.address=$saddr)"
 

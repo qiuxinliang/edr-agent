@@ -124,6 +124,14 @@ add_test(NAME yara_delivery_contract COMMAND test_yara_delivery_contract
 set_tests_properties(yara_delivery_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_windows_headless_runtime_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_headless_runtime_contract.c)
+edr_apply_common_warnings(test_windows_headless_runtime_contract)
+add_test(NAME windows_headless_runtime_contract COMMAND test_windows_headless_runtime_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(windows_headless_runtime_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 add_executable(test_remote_config_status_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_config_status_contract.c)
 edr_apply_common_warnings(test_remote_config_status_contract)

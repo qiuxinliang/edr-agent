@@ -4,7 +4,7 @@
   - Install: registers an unlimited SYSTEM startup task and starts it unless -NoStart is set.
   - Remove: stops the task and Agent, cleans residual ETW sessions, resets ACLs, and unregisters the task.
 
-  FDSensor is a console process, so persistence uses a SYSTEM scheduled task instead of SCM ServiceMain.
+  This script configures the scheduled-task runtime mode; the native-service mode is installed separately.
   ACL hardening limits ordinary users; administrators must use unins000.exe for normal removal.
 #>
 param(
@@ -161,8 +161,15 @@ function Repair-SensitiveRuntimeAcls {
       if (-not (Test-Path -LiteralPath $path)) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
       }
+      try { & takeown.exe /F $path /A /R /D Y 2>$null | Out-Null } catch {}
       & icacls.exe $path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
-    } catch {}
+      $aclExit = $LASTEXITCODE
+      if ($sub -eq "queue" -and $aclExit -ne 0) {
+        throw "queue ACL repair failed with exit code $aclExit"
+      }
+    } catch {
+      if ($sub -eq "queue") { throw }
+    }
   }
 
   foreach ($path in @((Join-Path $Dir "agent.toml"), (Join-Path $Dir "certs\*.pem"), (Join-Path $Dir "certs\*.key"), (Join-Path $Dir "certs\*.pfx"))) {
@@ -265,7 +272,18 @@ try {
     exit 4
   }
   Write-FDTaskLog "process_alive"
-  exit 0
+  try {
+    `$p.WaitForExit()
+    `$p.Refresh()
+    `$exitCode = [int]`$p.ExitCode
+    Write-FDTaskLog ("process_exit exit_code=" + `$exitCode)
+    try { if (Test-Path -LiteralPath `$stderrPath) { Get-Content -LiteralPath `$stderrPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stderr " + `$_) } } } catch {}
+    try { if (Test-Path -LiteralPath `$stdoutPath) { Get-Content -LiteralPath `$stdoutPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stdout " + `$_) } } } catch {}
+    exit `$exitCode
+  } catch {
+    Write-FDTaskLog ("process_wait_error=" + `$_.Exception.Message)
+    exit 5
+  }
 } catch {
   Write-FDTaskLog ("launcher_error=" + `$_.Exception.Message)
   exit 1
@@ -360,8 +378,9 @@ $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $l
 $sta = New-ScheduledTaskAction -Execute $psExe -Argument $argLine -WorkingDirectory $instDir
 $trg = New-ScheduledTaskTrigger -AtStartup
 $prc = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-  -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+  -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
+  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
 Register-ScheduledTask -TaskName $TaskName -Action $sta -Trigger $trg -Principal $prc -Settings $set -Force | Out-Null
 if (-not $NoStart) {
