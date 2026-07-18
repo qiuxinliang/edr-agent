@@ -361,6 +361,8 @@ static int stop_service_by_name(const wchar_t *service_name, const wchar_t *log_
   return 1;
 }
 
+static int process_running_by_name(const wchar_t *image_name);
+
 static int start_service_by_name(const wchar_t *service_name, const wchar_t *log_path) {
   SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
   if (!scm) return 2;
@@ -369,7 +371,18 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
     CloseServiceHandle(scm);
     return 3;
   }
-  StartServiceW(svc, 0, NULL);
+  BOOL start_ok = StartServiceW(svc, 0, NULL);
+  DWORD start_error = start_ok ? ERROR_SUCCESS : GetLastError();
+  if (!start_ok && start_error != ERROR_SERVICE_ALREADY_RUNNING) {
+    wchar_t line[512];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"start_service_failed name=%ls gle=%lu", service_name,
+               start_error);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return 4;
+  }
   SERVICE_STATUS_PROCESS ssp;
   DWORD bytes = 0;
   int ok = 0;
@@ -381,14 +394,25 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
       break;
     }
   }
+  int process_ok = 0;
+  if (ok) {
+    for (int i = 0; i < 40; ++i) {
+      if (process_running_by_name(L"FDSensor.exe")) {
+        process_ok = 1;
+        break;
+      }
+      Sleep(250);
+    }
+  }
   wchar_t line[512];
-  _snwprintf(line, sizeof(line) / sizeof(line[0]), L"start_service name=%ls ok=%d gle=%lu", service_name, ok,
-             GetLastError());
+  _snwprintf(line, sizeof(line) / sizeof(line[0]),
+             L"start_service name=%ls service_running=%d process_running=%d start_gle=%lu", service_name, ok,
+             process_ok, start_error);
   line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
   append_log_utf8(log_path, line);
   CloseServiceHandle(svc);
   CloseServiceHandle(scm);
-  return ok ? 0 : 4;
+  return (ok && process_ok) ? 0 : 5;
 }
 
 static int service_running_by_name(const wchar_t *service_name) {
@@ -798,8 +822,17 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
 
   SC_HANDLE svc = OpenServiceW(scm, service_name, SERVICE_ALL_ACCESS);
   if (svc) {
-    ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin_path, NULL,
-                         NULL, NULL, NULL, NULL, display_name);
+    if (!ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin_path,
+                              NULL, NULL, NULL, NULL, NULL, display_name)) {
+      DWORD gle = GetLastError();
+      wchar_t line[512];
+      _snwprintf(line, sizeof(line) / sizeof(line[0]), L"change_service_config_failed gle=%lu", gle);
+      line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+      append_log_utf8(log_path, line);
+      CloseServiceHandle(svc);
+      CloseServiceHandle(scm);
+      return 34;
+    }
     append_log_utf8(log_path, L"service_existing_reconfigured");
   } else {
     svc = CreateServiceW(scm, service_name, display_name, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
@@ -818,7 +851,9 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
 
   SERVICE_DESCRIPTIONW desc;
   desc.lpDescription = L"FDSecurity endpoint sensor";
-  ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+  if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc)) {
+    append_log_utf8(log_path, L"service_description_config_warning");
+  }
   SC_ACTION actions[2];
   actions[0].Type = SC_ACTION_RESTART;
   actions[0].Delay = 60000;
@@ -829,7 +864,16 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
   failure.dwResetPeriod = 86400;
   failure.cActions = 2;
   failure.lpsaActions = actions;
-  ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+  if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure)) {
+    DWORD gle = GetLastError();
+    wchar_t line[512];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"service_failure_actions_config_failed gle=%lu", gle);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return 35;
+  }
 
   CloseServiceHandle(svc);
   CloseServiceHandle(scm);

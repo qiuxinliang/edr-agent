@@ -9,6 +9,13 @@
 ;   示例：... /VERYSILENT /API=https://host:8080 /TOK=your-token
 ;   /MERGETASKS=enrollinsecure 与 /TLS=1 同类效果
 
+; 该脚本仅保留给实验室兼容验证。生产安装包必须使用
+; Build-BundledInstaller.ps1 + EDRAgentSetup.bundled.iss，以确保携带原生 worker
+; 并对 ACL、服务/计划任务启动及 Agent 进程存活执行强校验。
+#ifndef EDR_ALLOW_LEGACY_INSTALLER
+  #error Legacy installer disabled. Use Build-BundledInstaller.ps1, or define EDR_ALLOW_LEGACY_INSTALLER=1 for lab-only compatibility testing.
+#endif
+
 #define MyAppName "FDSecurity"
 #define MyAppPublisher "FDSecurity"
 #define MyAppExeName "FDSensor.exe"

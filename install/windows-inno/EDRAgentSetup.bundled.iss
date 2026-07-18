@@ -82,7 +82,11 @@ Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fa
 
 [Files]
 Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+#ifdef EDR_ALLOW_POWERSHELL_FALLBACK
 Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+#else
+Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 #ifndef EDR_TARGET_ARM64
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
@@ -962,15 +966,17 @@ end;
 function EdrStartServicePsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + '$ErrorActionPreference=''SilentlyContinue'';'
+    + '$ErrorActionPreference=''Stop'';'
     + '$log=' + EdrPsSq(EdrDiagnosticsFile('start-runtime.log')) + ';'
     + 'try { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue } catch {};'
     + 'function L($m){try{Add-Content -LiteralPath $log -Value ((Get-Date).ToString(''o'')+'' ''+$m) -Encoding UTF8}catch{}};'
     + 'Start-Sleep -Seconds 1;'
-    + 'try { Start-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue; L ''Start-Service invoked'' } catch { L (''Start-Service error: ''+$_.Exception.Message) };'
-    + 'Start-Sleep -Seconds 3;'
-    + 'Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {} };'
-    + 'try { $svc=Get-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($svc){L (''service_status=''+$svc.Status)} } catch {};'
+    + 'try { Start-Service -Name ''{#MyServiceName}'' -ErrorAction Stop; L ''Start-Service invoked'' } catch { L (''Start-Service error: ''+$_.Exception.Message); exit 2 };'
+    + '$deadline=(Get-Date).AddSeconds(15);$svc=$null;$p=$null;'
+    + 'do { Start-Sleep -Milliseconds 500; $svc=Get-Service -Name ''{#MyServiceName}'' -ErrorAction SilentlyContinue; $p=Get-Process -Name ''FDSensor'' -ErrorAction SilentlyContinue } while((Get-Date) -lt $deadline -and (($null -eq $svc) -or $svc.Status -ne ''Running'' -or (-not $p)));'
+    + 'if($svc){L (''service_status=''+$svc.Status)}else{L ''service_status=missing''};'
+    + '$p | ForEach-Object { try { $_.PriorityClass = ''BelowNormal'' } catch {}; L (''process_pid=''+$_.Id) };'
+    + 'if(($null -eq $svc) -or $svc.Status -ne ''Running'' -or (-not $p)){L ''runtime_not_started'';exit 3};'
     + 'exit 0'
     + '"';
 end;
@@ -1020,7 +1026,10 @@ end;
 function EdrStartManualPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + '$ErrorActionPreference=''SilentlyContinue'';'
+    + '$ErrorActionPreference=''Stop'';'
+    + '$log=' + EdrPsSq(EdrDiagnosticsFile('start-runtime.log')) + ';'
+    + 'try { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue } catch {};'
+    + 'function L($m){try{Add-Content -LiteralPath $log -Value ((Get-Date).ToString(''o'')+'' ''+$m) -Encoding UTF8}catch{}};'
     + '$exe=' + EdrPsSq(ExpandConstant('{app}\{#MyAppExeName}')) + ';'
     + '$cfg=' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ';'
     + '$takeown=Get-Command ''takeown.exe'' -ErrorAction SilentlyContinue;'
@@ -1032,11 +1041,15 @@ begin
     + 'try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch {};'
     + 'Start-Sleep -Seconds 1;'
     + '$q=[char]34;$agentArgs=''--config ''+$q+$cfg+$q;'
-    + '$p=Start-Process -FilePath $exe'
+    + 'try{$p=Start-Process -FilePath $exe'
     + ' -ArgumentList $agentArgs'
     + ' -WorkingDirectory ' + EdrPsSq(ExpandConstant('{app}'))
-    + ' -WindowStyle Hidden -PassThru -ErrorAction Stop;'
+    + ' -WindowStyle Hidden -PassThru -ErrorAction Stop}catch{L (''Start-Process error: ''+$_.Exception.Message);exit 2};'
     + 'try { $p.PriorityClass = ''BelowNormal'' } catch {};'
+    + 'Start-Sleep -Seconds 4;try{$p.Refresh()}catch{};'
+    + 'if($p.HasExited){L (''process_exited_early exit_code=''+$p.ExitCode);exit 3};'
+    + '$live=Get-Process -Id $p.Id -ErrorAction SilentlyContinue;if(-not $live){L ''runtime_not_started'';exit 4};'
+    + 'L (''process_pid=''+$p.Id);'
     + 'exit 0'
     + '"';
 end;
@@ -1127,7 +1140,7 @@ begin
     else if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Installing SYSTEM startup task for FDSecurity.', AutorunInstallPsParameters(''), True) then
       EdrAbortInstall;
   end
-  else if WizardIsTaskSelected('hardeninstalldir') then
+  else
   begin
     if EdrInstallerWorkerExists then
     begin
@@ -1136,18 +1149,16 @@ begin
     end
     else if not EdrRunPowerShellStage(5, Total, 'Install service/startup task', 'Applying install directory ACL hardening.', EdrHardenAclPsParameters, True) then
       EdrAbortInstall;
-  end
-  else
-    EdrSkipStage(5, Total, 'Install service/startup task', 'Startup task disabled by installer option.');
+  end;
 
   if WizardIsTaskSelected('windowsservice') then
   begin
     if EdrInstallerWorkerExists then
     begin
-      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrWorkerStartServiceParams, False) then
+      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrWorkerStartServiceParams, True) then
         EdrAbortInstall;
     end
-    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrStartServicePsParameters, False) then
+    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSecurityAgent Windows service.', EdrStartServicePsParameters, True) then
       EdrAbortInstall;
   end
   else if WizardIsTaskSelected('windowsautorun') then
@@ -1164,10 +1175,10 @@ begin
   begin
     if EdrInstallerWorkerExists then
     begin
-      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrWorkerStartRuntimeParams, False) then
+      if not EdrRunInstallerWorkerStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrWorkerStartRuntimeParams, True) then
         EdrAbortInstall;
     end
-    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrStartManualPsParameters, False) then
+    else if not EdrRunPowerShellStage(6, Total, 'Start Agent runtime', 'Starting FDSensor.exe with generated agent.toml.', EdrStartManualPsParameters, True) then
       EdrAbortInstall;
   end;
 

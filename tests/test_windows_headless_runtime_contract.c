@@ -84,6 +84,12 @@ int main(void) {
                          "native worker must start and verify the scheduled task");
   ok &= require_contains(worker, "scheduled_task_started_without_agent_process",
                          "scheduled-task startup must fail when no Agent process appears");
+  ok &= require_contains(worker, "service_running=%d process_running=%d",
+                         "service startup must verify both SCM state and the Agent process");
+  ok &= require_contains(worker, "change_service_config_failed",
+                         "service reconfiguration failures must stop installation");
+  ok &= require_contains(worker, "service_failure_actions_config_failed",
+                         "service recovery policy failures must stop installation");
   ok &= require_contains(worker, "takeown.exe",
                          "ACL repair must recover ownership before applying queue permissions");
   ok &= require_absent(worker, "L\"/Create /F /TN %ls /SC ONSTART",
@@ -108,7 +114,53 @@ int main(void) {
                          "headless setup must fail if the scheduled task cannot start the Agent");
   ok &= require_contains(inno, "EdrWorkerBaseParams('start-autorun')",
                          "headless setup must start the registered task instead of a detached process");
+  ok &= require_contains(inno, "EdrWorkerStartServiceParams, True",
+                         "GUI service mode must fail setup when the service cannot start");
+  ok &= require_contains(inno, "EdrStartServicePsParameters, True",
+                         "GUI service fallback must remain a critical install stage");
+  ok &= require_contains(inno, "EdrWorkerStartRuntimeParams, True",
+                         "GUI manual mode must fail setup when the Agent exits early");
+  ok &= require_contains(inno, "EdrStartManualPsParameters, True",
+                         "GUI manual fallback must remain a critical install stage");
+  ok &= require_contains(inno, "service_status=missing",
+                         "PowerShell service fallback must verify the service state");
+  ok &= require_contains(inno, "process_exited_early exit_code=",
+                         "PowerShell manual fallback must reject an early Agent exit");
+  ok &= require_contains(inno, "#ifdef EDR_ALLOW_POWERSHELL_FALLBACK",
+                         "worker-less bundled installers must require an explicit lab-only build flag");
   free(inno);
+
+  char *setup_ui = read_source(root, "install/windows-setup-ui/MainWindow.xaml.cs");
+  if (!setup_ui) return 1;
+  ok &= require_contains(setup_ui, "await fallbackSetup.WaitForExitAsync();",
+                         "WebView2 fallback must wait for the traditional installer");
+  ok &= require_contains(setup_ui, "if (fallbackSetup.ExitCode != 0)",
+                         "WebView2 fallback must surface a failed installer exit code");
+  ok &= require_contains(setup_ui, "if (!summary.AgentRunning ||",
+                         "GUI completion must require a live Agent process");
+  ok &= require_contains(setup_ui, "Process.GetProcessesByName(\"FDSensor\")",
+                         "GUI health collection must verify live process state directly");
+  free(setup_ui);
+
+  char *build_ps = read_source(root, "install/windows-inno/Build-BundledInstaller.ps1");
+  if (!build_ps) return 1;
+  ok &= require_contains(build_ps, "/DEDR_ALLOW_POWERSHELL_FALLBACK=1",
+                         "lab-only PowerShell fallback must be explicit in the Inno build contract");
+  free(build_ps);
+
+  char *build_cmd = read_source(root, "install/windows-inno/build_bundled.cmd");
+  if (!build_cmd) return 1;
+  ok &= require_contains(build_cmd, "Build-BundledInstaller.ps1",
+                         "batch build entrypoint must use the worker-enforcing build script");
+  ok &= require_absent(build_cmd, "EDRAgentSetup.bundled.iss\"",
+                       "batch build entrypoint must not invoke ISCC directly");
+  free(build_cmd);
+
+  char *legacy_inno = read_source(root, "install/windows-inno/EDRAgentSetup.iss");
+  if (!legacy_inno) return 1;
+  ok &= require_contains(legacy_inno, "#ifndef EDR_ALLOW_LEGACY_INSTALLER",
+                         "legacy GUI installer must be disabled unless a lab-only flag is explicit");
+  free(legacy_inno);
 
   return ok ? 0 : 1;
 }

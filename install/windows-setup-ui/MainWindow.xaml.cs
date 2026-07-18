@@ -109,7 +109,30 @@ public partial class MainWindow : Window
             {
                 if (File.Exists(_setupPath))
                 {
-                    Process.Start(new ProcessStartInfo { FileName = _setupPath, UseShellExecute = true });
+                    try
+                    {
+                        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] fallback_setup_start path={_setupPath}");
+                        using var fallbackSetup = StartSetup(_setupPath, string.Empty);
+                        await fallbackSetup.WaitForExitAsync();
+                        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] fallback_setup_exit code={fallbackSetup.ExitCode}");
+                        if (fallbackSetup.ExitCode != 0)
+                        {
+                            MessageBox.Show(
+                                $"传统安装器执行失败，退出代码：{fallbackSetup.ExitCode}\n\n诊断日志：{uiLog}",
+                                "FDSecurity 安装失败",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Error);
+                        }
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] fallback_setup_failed {fallbackEx}");
+                        MessageBox.Show(
+                            $"无法完成传统安装器：{fallbackEx.Message}\n\n诊断日志：{uiLog}",
+                            "FDSecurity 安装失败",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Error);
+                    }
                 }
                 else
                 {
@@ -519,7 +542,8 @@ public partial class MainWindow : Window
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_summary_begin");
             var summary = ReadInstallSummary(installPath, innoLog, handoffDir);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_complete endpoint={summary.EndpointId} tenant={summary.TenantId} health={summary.HealthStatus} diagnostics={_lastDiagnosticsPath}");
-            if (summary.HealthStatus.Equals("error_runtime_not_started", StringComparison.OrdinalIgnoreCase))
+            if (!summary.AgentRunning ||
+                summary.HealthStatus.Equals("error_runtime_not_started", StringComparison.OrdinalIgnoreCase))
             {
                 var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
                 throw new InvalidOperationException($"Agent 运行时未成功启动{detail}");
@@ -650,8 +674,9 @@ public partial class MainWindow : Window
             !latestLogProcessAlive &&
             string.IsNullOrWhiteSpace(processPid);
         var verifyStatus = TryReadJsonString(verifyPath, "status");
-        var verifyAgentRunning = TryReadJsonBool(verifyPath, "agent_process_running");
-        var agentRunning = verifyAgentRunning || latestLogProcessAlive || !string.IsNullOrWhiteSpace(processPid);
+        // A report or log entry can be stale. Installation succeeds only when the
+        // current machine actually has a live FDSensor process at handoff time.
+        var agentRunning = IsAgentProcessRunning();
         var healthStatus = TryReadJsonString(healthPath, "status");
         if (!string.IsNullOrWhiteSpace(verifyStatus))
         {
@@ -692,6 +717,27 @@ public partial class MainWindow : Window
             ScheduledTaskLastResult = taskLastResult,
             ManualFallbackPid = manualFallbackPid
         };
+    }
+
+    private static bool IsAgentProcessRunning()
+    {
+        Process[] processes = Array.Empty<Process>();
+        try
+        {
+            processes = Process.GetProcessesByName("FDSensor");
+            return processes.Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
     }
 
     private string DescribeCurrentInstallState(string installPath, string innoLog, string handoffDir)

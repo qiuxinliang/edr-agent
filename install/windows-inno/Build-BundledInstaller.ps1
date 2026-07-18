@@ -255,7 +255,11 @@ if (-not (Test-Path -LiteralPath $Inno)) {
 if ($BinDir -match "\s") { $binDef = '/DEDR_BIN_DIR="' + $BinDir + '"' } else { $binDef = "/DEDR_BIN_DIR=$BinDir" }
 $archDefs = @("/DEDR_TARGET_ARCH=$TargetArch")
 if ($TargetArch -eq "arm64") { $archDefs += "/DEDR_TARGET_ARM64=1" }
-& $Inno $binDef "/DMyAppVersion=$AppVersion" @archDefs $iss
+$fallbackDefs = @()
+if ($AllowPowerShellFallback) {
+    $fallbackDefs += "/DEDR_ALLOW_POWERSHELL_FALLBACK=1"
+}
+& $Inno $binDef "/DMyAppVersion=$AppVersion" @archDefs @fallbackDefs $iss
 if ($LASTEXITCODE -ne 0) {
     throw "ISCC failed with exit $LASTEXITCODE"
 }
