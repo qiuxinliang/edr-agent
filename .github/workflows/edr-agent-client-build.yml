@@ -511,10 +511,12 @@ jobs:
                 throw "required forensic YARA rule missing from headless package: $rule"
               }
             }
-            if (-not ($entries -match '(^|/|\\)VERSION$')) {
-              throw "VERSION file missing from package"
+            # rules/forensic/VERSION is the rule-bundle version, not the Agent version.
+            $rootVersionEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'VERSION' })
+            if ($rootVersionEntries.Count -ne 1) {
+              throw "package root must contain exactly one VERSION file; found $($rootVersionEntries.Count)"
             }
-            $versionEntry = $zipObj.Entries | Where-Object { $_.FullName -match '(^|/|\\)VERSION$' } | Select-Object -First 1
+            $versionEntry = $rootVersionEntries[0]
             $reader = New-Object System.IO.StreamReader($versionEntry.Open())
             try {
               $packagedVersion = $reader.ReadToEnd().Trim()
