@@ -574,5 +574,5 @@ jobs:
             edr-agent-win-exe.zip
             edr_agent_setup.exe
             edr_agent_setup_ui.zip
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: error
