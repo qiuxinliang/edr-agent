@@ -130,6 +130,50 @@ static int dc_manifest_sibling_download_url(const char *manifest_url, char *out,
   return (n > 0 && (size_t)n < cap && dc_url_ok(out)) ? 0 : -1;
 }
 
+static const char *dc_current_os_token(void) {
+#if defined(_WIN32)
+  return "windows";
+#elif defined(__APPLE__)
+  return "darwin";
+#else
+  return "linux";
+#endif
+}
+
+static const char *dc_current_arch_token(void) {
+#if defined(_M_ARM64) || defined(__aarch64__) || defined(_M_ARM)
+  return "arm64";
+#else
+  return "amd64";
+#endif
+}
+
+/* 取证下载地址运行时兜底:优先使用显式 env;未配置/空字符串时,从当前 REST base 自动推导。
+ * 这层放在 deep_collector 内,覆盖测试工具、手动调用或旧安装包未执行 agent.c 启动推导的场景。 */
+static const char *dc_effective_manifest_url(const char *env_name, const char *kind,
+                                             char *derived, size_t derived_cap) {
+  const char *mf = getenv(env_name);
+  if (mf && mf[0]) return mf;
+  if (!derived || derived_cap == 0u || !kind || !kind[0]) return NULL;
+  derived[0] = '\0';
+  char base[768];
+  base[0] = '\0';
+  edr_ingest_http_get_rest_base(base, sizeof(base));
+  size_t n = strlen(base);
+  while (n > 0 && base[n - 1] == '/') {
+    base[--n] = '\0';
+  }
+  if (!base[0]) return NULL;
+  int rc = snprintf(derived, derived_cap,
+                    "%s/agent/forensic-collector/manifest?kind=%s&os=%s&arch=%s",
+                    base, kind, dc_current_os_token(), dc_current_arch_token());
+  if (rc <= 0 || (size_t)rc >= derived_cap || !dc_url_ok(derived)) {
+    derived[0] = '\0';
+    return NULL;
+  }
+  return derived;
+}
+
 static int dc_same_cstr(const char *a, const char *b) {
   return a && b && strcmp(a, b) == 0;
 }
@@ -461,7 +505,39 @@ static int dc_hex64_ieq(const char *a, const char *b) {
   return 1;
 }
 
-/* 尽力创建 path 的父目录(单层即可:安装目录通常已在,仅 collector 子目录可能缺)。 */
+static void dc_make_dir_recursive(const char *dir) {
+  if (!dir || !dir[0]) return;
+  char tmp[1024];
+  snprintf(tmp, sizeof(tmp), "%s", dir);
+  size_t len = strlen(tmp);
+  while (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
+    tmp[--len] = '\0';
+  }
+  if (!tmp[0]) return;
+  for (size_t i = 1; tmp[i]; i++) {
+    if (tmp[i] != '/' && tmp[i] != '\\') continue;
+#ifdef _WIN32
+    if (i == 2 && tmp[1] == ':') continue; /* C:\ */
+#endif
+    char saved = tmp[i];
+    tmp[i] = '\0';
+    if (tmp[0]) {
+#ifdef _WIN32
+      (void)CreateDirectoryA(tmp, NULL);
+#else
+      (void)mkdir(tmp, 0755);
+#endif
+    }
+    tmp[i] = saved;
+  }
+#ifdef _WIN32
+  (void)CreateDirectoryA(tmp, NULL);
+#else
+  (void)mkdir(tmp, 0755);
+#endif
+}
+
+/* 尽力创建 path 的父目录(支持多层,覆盖 macOS ~/.edr/collector 等首次下载场景)。 */
 static void dc_make_parent_dir(const char *path) {
   char dir[1024];
   snprintf(dir, sizeof(dir), "%s", path ? path : "");
@@ -472,11 +548,7 @@ static void dc_make_parent_dir(const char *path) {
   if (n == 0) return;
   dir[--n] = '\0'; /* 去掉尾部分隔符 */
   if (!dir[0]) return;
-#ifdef _WIN32
-  (void)CreateDirectoryA(dir, NULL); /* 已存在/父级缺失均忽略,best-effort */
-#else
-  (void)mkdir(dir, 0755);
-#endif
+  dc_make_dir_recursive(dir);
 }
 
 /* 读取 adapter stderr 临时文件的尾部若干可打印字符,清洗换行/引号后拼进 detail。
@@ -574,14 +646,16 @@ static void dc_runtime_refresh_unlock(void) { (void)pthread_mutex_unlock(&s_dc_r
 #endif
 
 /* 确保适配器(forensic_collector)就绪到 dest:缺失且 autofetch 开启时,
- * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=forensic_collector)下载 + SHA256 校验
+ * 经平台 manifest 固定地址(EDR_FORENSIC_ADAPTER_MANIFEST_URL, kind=adapter)下载 + SHA256 校验
  * (EDR_FORENSIC_ADAPTER_SHA256 > legacy EDR_FORENSIC_COLLECTOR_SHA256 > manifest sha)。best-effort:失败返回非 0,调用方据此回退 builtin。
- * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=forensic_collector)。 */
+ * 与 dc_ensure_velociraptor 同构,但目标是适配器自身(小体积),走独立 manifest(kind=adapter)。 */
 static int dc_ensure_adapter_unlocked(const char *dest, char *detail, size_t detail_cap) {
   if (!dest || !dest[0]) return EDR_DC_ERR_DOWNLOAD;
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
-  const char *mf = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL"); /* kind=forensic_collector */
+  char mfbuf[1024];
+  const char *mf = dc_effective_manifest_url("EDR_FORENSIC_ADAPTER_MANIFEST_URL",
+                                             "adapter", mfbuf, sizeof(mfbuf));
   const char *want = getenv("EDR_FORENSIC_ADAPTER_SHA256");
   if (!want || !want[0]) want = getenv("EDR_FORENSIC_COLLECTOR_SHA256"); /* legacy adapter pin */
   if (dc_file_nonempty(dest)) {
@@ -593,7 +667,10 @@ static int dc_ensure_adapter_unlocked(const char *dest, char *detail, size_t det
     return EDR_DC_OK;
   }
   if (!autofetch || !mf || !mf[0]) {
-    if (detail) snprintf(detail, detail_cap, "adapter missing; autofetch/manifest unavailable");
+    if (detail) {
+      snprintf(detail, detail_cap,
+               "adapter missing; autofetch/manifest unavailable (no env or rest_base_url)");
+    }
     return EDR_DC_ERR_DOWNLOAD;
   }
   dc_make_parent_dir(dest);
@@ -612,6 +689,33 @@ static int dc_ensure_adapter(const char *dest, char *detail, size_t detail_cap) 
   return rc;
 }
 
+#ifndef _WIN32
+static const char *dc_posix_collector_dir(void) {
+  const char *configured = getenv("EDR_FORENSIC_COLLECTOR_DIR");
+  if (configured && configured[0]) return configured;
+#ifdef __APPLE__
+  const char *home = getenv("HOME");
+  static char mac_dir[1024];
+  snprintf(mac_dir, sizeof(mac_dir), "%s/.edr/collector", home && home[0] ? home : "/tmp");
+  return mac_dir;
+#else
+  return "/usr/local/lib/edr-agent/collector";
+#endif
+}
+
+static const char *dc_posix_default_collector_path(void) {
+  static char path[1024];
+  snprintf(path, sizeof(path), "%s/forensic_collector", dc_posix_collector_dir());
+  return path;
+}
+
+static const char *dc_posix_default_velociraptor_path(void) {
+  static char path[1024];
+  snprintf(path, sizeof(path), "%s/velociraptor", dc_posix_collector_dir());
+  return path;
+}
+#endif
+
 /* 解析适配器(forensic_collector)路径并校验。返回 0 可执行;否则 <0。
  * 路径来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
  * 适配器为小体积件,随安装包内置:缺失即返回 EDR_DC_ERR_DOWNLOAD(调用方回退 builtin),
@@ -628,7 +732,7 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
   snprintf(out_path, cap, "%s", bin ? bin : "");
 
   if (!dc_file_nonempty(out_path)) {
-    /* 适配器缺失/0 字节坏件 → 经平台 manifest(kind=forensic_collector)按需自动下发到该路径,再复检。 */
+    /* 适配器缺失/0 字节坏件 → 经平台 manifest(kind=adapter)按需自动下发到该路径,再复检。 */
     char ad[256];
     ad[0] = '\0';
     (void)dc_ensure_adapter(out_path, ad, sizeof(ad));
@@ -672,12 +776,14 @@ static int dc_ensure_velociraptor_unlocked(int refresh_existing, char *detail, s
 #ifdef _WIN32
     snprintf(path, sizeof(path), "%s", "C:\\Program Files\\FDSecurity\\collector\\velociraptor.exe");
 #else
-    snprintf(path, sizeof(path), "%s", "velociraptor");
+    snprintf(path, sizeof(path), "%s", dc_posix_default_velociraptor_path());
 #endif
   }
   const char *af = getenv("EDR_FORENSIC_COLLECTOR_AUTOFETCH");
   int autofetch = !(af && af[0] == '0');
-  const char *mf = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL"); /* kind=velociraptor */
+  char mfbuf[1024];
+  const char *mf = dc_effective_manifest_url("EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
+                                             "velociraptor", mfbuf, sizeof(mfbuf));
   const char *want = getenv("EDR_VELOCIRAPTOR_SHA256");
   if (dc_file_nonempty(path)) {
     /* 已就绪:按间隔比对平台 active sha,变更则原子替换(平台升级 velo 版本自动滚更);失败/不可判则保留旧件。 */
@@ -689,7 +795,10 @@ static int dc_ensure_velociraptor_unlocked(int refresh_existing, char *detail, s
   }
 
   if (!autofetch || !mf || !mf[0]) {
-    if (detail) snprintf(detail, detail_cap, "velociraptor missing; autofetch/manifest unavailable");
+    if (detail) {
+      snprintf(detail, detail_cap,
+               "velociraptor missing; autofetch/manifest unavailable (no env or rest_base_url)");
+    }
     return EDR_DC_ERR_DOWNLOAD;
   }
   dc_make_parent_dir(path);
@@ -711,7 +820,7 @@ static int dc_velociraptor_ready(void) {
 #ifdef _WIN32
   return dc_file_nonempty("C:\\Program Files\\FDSecurity\\collector\\velociraptor.exe");
 #else
-  return dc_file_nonempty("velociraptor");
+  return dc_file_nonempty(dc_posix_default_velociraptor_path());
 #endif
 }
 
@@ -732,7 +841,7 @@ static void dc_default_adapter_path(char *path, size_t cap) {
 #ifdef _WIN32
   snprintf(path, cap, "%s", "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe");
 #else
-  snprintf(path, cap, "%s", "forensic_collector");
+  snprintf(path, cap, "%s", dc_posix_default_collector_path());
 #endif
 }
 
@@ -1198,14 +1307,10 @@ static int g_running = 0;
 static char g_detail[512];
 
 static const char *find_collector_bin(void) {
+  const char *configured = getenv("EDR_FORENSIC_COLLECTOR_BIN");
+  if (configured && configured[0]) return configured;
   if (access("./forensic_collector", X_OK) == 0) return "./forensic_collector";
-#ifdef __APPLE__
-  const char *home = getenv("HOME");
-  static char path[1024];
-  snprintf(path, sizeof(path), "%s/.edr/collector/forensic_collector", home ? home : "/tmp");
-  if (access(path, X_OK) == 0) return path;
-#endif
-  return "forensic_collector";
+  return dc_posix_default_collector_path();
 }
 
 int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {

@@ -1359,15 +1359,18 @@ static void edr_agent_derive_forensic_manifest_env(const EdrConfig *cfg) {
   }
   /* 取证下载(dc_download 裸 curl)需信任平台 CA——把 agent 配置里的 ca_cert 导出供其 --cacert 使用，
    * 否则私有 CA(如 mkcert)下 manifest/二进制拉取会 TLS 校验失败。已显式设置则不覆盖。 */
-  if (getenv("EDR_FORENSIC_CA_CERT") == NULL && cfg->server.ca_cert[0]) {
+  const char *ca_env = getenv("EDR_FORENSIC_CA_CERT");
+  if (!(ca_env && ca_env[0]) && cfg->server.ca_cert[0]) {
 #if defined(_WIN32)
     _putenv_s("EDR_FORENSIC_CA_CERT", cfg->server.ca_cert);
 #else
-    setenv("EDR_FORENSIC_CA_CERT", cfg->server.ca_cert, 0);
+    setenv("EDR_FORENSIC_CA_CERT", cfg->server.ca_cert, 1);
 #endif
   }
-  int need_velo = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL") == NULL;
-  int need_adapter = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL") == NULL;
+  const char *velo_env = getenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL");
+  const char *adapter_env = getenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL");
+  int need_velo = !(velo_env && velo_env[0]);
+  int need_adapter = !(adapter_env && adapter_env[0]);
   if (!need_velo && !need_adapter) {
     return;
   }
@@ -1401,18 +1404,18 @@ static void edr_agent_derive_forensic_manifest_env(const EdrConfig *cfg) {
 #if defined(_WIN32)
     _putenv_s("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url);
 #else
-    setenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, 0);
+    setenv("EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, 1);
 #endif
     fprintf(stderr, "[forensic] velo manifest auto-derived: %s\n", url);
   }
   if (need_adapter) {
     snprintf(url, sizeof(url),
-             "%s/agent/forensic-collector/manifest?kind=forensic_collector&os=%s&arch=%s",
+             "%s/agent/forensic-collector/manifest?kind=adapter&os=%s&arch=%s",
              trimmed, os_str, arch_str);
 #if defined(_WIN32)
     _putenv_s("EDR_FORENSIC_ADAPTER_MANIFEST_URL", url);
 #else
-    setenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL", url, 0);
+    setenv("EDR_FORENSIC_ADAPTER_MANIFEST_URL", url, 1);
 #endif
     fprintf(stderr, "[forensic] adapter manifest auto-derived: %s\n", url);
   }

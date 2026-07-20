@@ -86,6 +86,12 @@ if [[ -f "$STAGE_DIR/FDSecurityInstallerWorker.exe" ]]; then
 else
   echo "Warning: missing FDSecurityInstallerWorker.exe; installer will fall back to script stages." >&2
 fi
+if [[ -f "$STAGE_DIR/uninstall.exe" ]]; then
+  cp -a "$STAGE_DIR/uninstall.exe" "$OUT_DIR/"
+else
+  echo "Error: missing headless uninstaller: $STAGE_DIR/uninstall.exe" >&2
+  exit 1
+fi
 shopt -s nullglob
 DLL_COUNT=0
 BUNDLE_ONNX_RUNTIME="${EDR_BUNDLE_ONNX_RUNTIME:-0}"
@@ -171,6 +177,12 @@ if [[ -f "$EDR_AGENT_DIR/agent.toml.example" ]]; then
 fi
 if [[ -f "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" ]]; then
   cp -a "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" "$OUT_DIR/"
+fi
+if [[ -f "$EDR_AGENT_DIR/scripts/edr_agent_uninstall.ps1" ]]; then
+  cp -a "$EDR_AGENT_DIR/scripts/edr_agent_uninstall.ps1" "$OUT_DIR/uninstall.ps1"
+else
+  echo "Error: missing headless uninstall script: $EDR_AGENT_DIR/scripts/edr_agent_uninstall.ps1" >&2
+  exit 1
 fi
 for n in "edr_agent_preflight.ps1" "windows_service_install.ps1" "windows_isolate_host.ps1"; do
   if [[ -f "$EDR_AGENT_DIR/scripts/$n" ]]; then

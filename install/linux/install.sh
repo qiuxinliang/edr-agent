@@ -8,6 +8,7 @@ EXAMPLE="${ROOT}/agent.toml.example"
 INSTALL_BIN="/usr/local/bin/edr_agent"
 ETC_DIR="/etc/edr-agent"
 LIB_DIR="/usr/local/lib/edr-agent"
+COLLECTOR_DIR="${LIB_DIR}/collector"
 STRONG_PROFILE="${ROOT}/linux_detection_strong.toml"
 if [[ ! -f "$STRONG_PROFILE" && -f "${ROOT}/../../config/profiles/linux_detection_strong.toml" ]]; then
   STRONG_PROFILE="${ROOT}/../../config/profiles/linux_detection_strong.toml"
@@ -39,9 +40,15 @@ else
 fi
 
 install -m 0755 -d "$LIB_DIR"
+install -m 0755 -d "$COLLECTOR_DIR"
 for asset in edr-ebpf-trace.sh edr-linux.bt; do
   if [[ -f "${ROOT}/${asset}" ]]; then
     install -m 0755 "${ROOT}/${asset}" "${LIB_DIR}/${asset}"
+  fi
+done
+for asset in forensic_collector forensic_collector_builtin velociraptor; do
+  if [[ -f "${ROOT}/collector/${asset}" ]]; then
+    install -m 0755 "${ROOT}/collector/${asset}" "${COLLECTOR_DIR}/${asset}"
   fi
 done
 if [[ -f "${ROOT}/edr-linux.bt" ]]; then

@@ -127,6 +127,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -
 
 **卸载**：使用「程序和功能」中的 **EDR Agent** 项（即 Inno 生成的 **`unins000.exe`**）。卸载阶段会先执行 **`edr_windows_autorun.ps1 -Action Remove`**：停止并注销计划任务、结束 **`edr_agent`** 进程、在删除文件前运行 **`edr_agent.exe --etw-uninstall-cleanup`** 按名 **`ControlTrace` STOP** 本程序使用的 ETW 实时会话（避免异常退出后会话名 **`EDR_Agent_RT_001`** 仍占用）；再对安装目录 **`icacls /inheritance:e`** 恢复继承，最后删除文件。随包的 WinDivert 文件也会删除；若没有其他进程使用该驱动，WinDivert 会在后续重启时自动卸载。安装器不会强制删除共享的 `WinDivert` 服务，避免影响同机其他软件。
 
+## 4.2 Headless `uninstall.exe`：完整卸载（已实现）
+
+Windows headless 安装完成后会在 `%ProgramFiles%\FDSecurity` 写入原生 **`uninstall.exe`**，并注册到 Windows“应用和功能”。双击会请求管理员权限并执行完整卸载：停止并删除 Agent 服务/计划任务、结束进程、清理 ETW、删除客户端证书和 Agent 专用机器环境变量，再删除配置、队列、证据、日志与程序目录。
+
+- 交互卸载：`"C:\Program Files\FDSecurity\uninstall.exe"`
+- 静默卸载：`"C:\Program Files\FDSecurity\uninstall.exe" /S`
+- 仅注销运行时并保留配置、运行数据和程序文件：`"C:\Program Files\FDSecurity\uninstall.exe" /KEEPDATA`
+
+`uninstall.ps1` 作为维护和故障恢复入口继续保留；正常卸载应优先使用 `uninstall.exe`。
+
 若需 **Windows 服务**形态，优先使用上文 §4；与计划任务二选一，避免同一主机启动两个 Agent 实例。
 
 **静默 + 命令行注册**：支持 **`/EDR_API_BASE=`** / **`/EDR_ENROLL_TOKEN=`**（或短写法 **`/API=`** / **`/TOK=`**），可选 **`/EDR_INSECURE_TLS=1`** 或 **`/TLS=1`**；须成对或均省略；与 Inno **`/VERYSILENT`** 等组合使用。完整说明与命令行敏感提示见 **[AGENT_INSTALLER.md](AGENT_INSTALLER.md)**「Release 一键安装」Windows 小节。

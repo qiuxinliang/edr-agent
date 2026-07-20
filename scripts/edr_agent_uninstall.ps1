@@ -8,17 +8,19 @@
   does not create unins000.exe automatically. This script is copied into the
   install directory by edr_agent_install.ps1 and provides the equivalent
   elevated cleanup entry point for services, scheduled tasks, certificates,
-  machine environment variables and optional runtime data.
+  machine environment variables, runtime data and program files.
 
   The default action removes runtime registration and identity material but
-  preserves queue/evidence/log data. Add -RemoveData when that data should be
-  removed as well. Program files are intentionally left in place so the
-  operation remains recoverable and can be audited by the deployment tool.
+  preserves queue/evidence/log data. uninstall.exe invokes this script with
+  -RemoveData and -RemoveProgramFiles for a complete uninstall. Administrators
+  may run the script directly without those switches for recoverable cleanup.
 #>
 [CmdletBinding()]
 param(
   [string]$InstallDir = "",
-  [switch]$RemoveData
+  [switch]$RemoveData,
+  [switch]$RemoveProgramFiles,
+  [int]$ParentProcessId = 0
 )
 
 $ErrorActionPreference = "Continue"
@@ -138,6 +140,56 @@ function Remove-MachineEnvironment {
   }
 }
 
+function Remove-HeadlessUninstallRegistration {
+  $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FDSecurityAgentHeadless"
+  try {
+    Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
+  } catch {
+    Write-Warning ("Failed to remove uninstall registry entry: " + $_.Exception.Message)
+  }
+}
+
+function Grant-InstallDirectoryRemovalRights {
+  if (-not (Test-Path -LiteralPath $InstallDir)) { return }
+  try {
+    & icacls.exe $InstallDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
+  } catch {
+    Write-Warning ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
+  }
+}
+
+function Start-DeferredProgramFilesRemoval {
+  if (-not $RemoveProgramFiles) { return }
+  Grant-InstallDirectoryRemovalRights
+
+  $quotedDir = $InstallDir.Replace("'", "''")
+  $cleanup = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+`$parentId = $ParentProcessId
+if (`$parentId -gt 0) {
+  `$parent = Get-Process -Id `$parentId -ErrorAction SilentlyContinue
+  if (`$parent) { `$null = `$parent.WaitForExit(30000) }
+}
+Start-Sleep -Milliseconds 750
+`$target = '$quotedDir'
+for (`$attempt = 0; `$attempt -lt 20 -and (Test-Path -LiteralPath `$target); `$attempt++) {
+  Remove-Item -LiteralPath `$target -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath `$target) { Start-Sleep -Milliseconds 500 }
+}
+"@
+  try {
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanup))
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    Start-Process -FilePath $powershell -WorkingDirectory $env:SystemRoot -WindowStyle Hidden -ArgumentList @(
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded
+    ) | Out-Null
+    Write-Host "Scheduled program directory removal: $InstallDir"
+  } catch {
+    Write-Warning ("Failed to schedule program directory removal: " + $_.Exception.Message)
+    exit 1
+  }
+}
+
 function Remove-AgentData {
   foreach ($relative in @(
       "agent.toml",
@@ -168,9 +220,15 @@ Stop-AgentProcesses
 Invoke-AgentEtwUninstallCleanup
 Remove-AgentClientCertificate
 Remove-MachineEnvironment
+Remove-HeadlessUninstallRegistration
 if ($RemoveData) {
   Remove-AgentData
 } else {
   Write-Host "Runtime data preserved. Use -RemoveData to remove config, certificates, queue, evidence and logs."
 }
-Write-Host "FDSecurity runtime unregistered successfully. Program files remain in place for audit/recovery."
+if ($RemoveProgramFiles) {
+  Start-DeferredProgramFilesRemoval
+  Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal."
+} else {
+  Write-Host "FDSecurity runtime unregistered successfully. Program files remain in place for audit/recovery."
+}

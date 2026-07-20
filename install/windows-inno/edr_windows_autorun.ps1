@@ -120,7 +120,9 @@ function Repair-UninstallerAcls {
 
   $entries = @(
     @{ Name = "unins000.exe"; Grant = "*S-1-5-32-545:RX" },
-    @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" }
+    @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" },
+    @{ Name = "uninstall.exe"; Grant = "*S-1-5-32-545:RX" },
+    @{ Name = "uninstall.ps1"; Grant = "*S-1-5-32-545:R" }
   )
   foreach ($entry in $entries) {
     $path = Join-Path $Dir $entry.Name

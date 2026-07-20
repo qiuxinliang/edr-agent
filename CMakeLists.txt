@@ -521,6 +521,12 @@ if(WIN32)
   target_compile_definitions(fd_installer_worker PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
   target_link_libraries(fd_installer_worker PRIVATE advapi32 shell32 user32)
   edr_apply_common_warnings(fd_installer_worker)
+
+  add_executable(fd_headless_uninstaller WIN32 src/installer_worker/headless_uninstaller_win.c)
+  set_target_properties(fd_headless_uninstaller PROPERTIES OUTPUT_NAME "uninstall")
+  target_compile_definitions(fd_headless_uninstaller PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(fd_headless_uninstaller PRIVATE shell32 user32)
+  edr_apply_common_warnings(fd_headless_uninstaller)
 endif()
 
 # C baseline 取证采集器(系统命令级,仅 libc,无第三方依赖)。

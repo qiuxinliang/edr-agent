@@ -501,7 +501,9 @@ function Repair-InstallRuntimeAcls {
 
   foreach ($uninstaller in @(
     @{ Name = "unins000.exe"; Grant = "*S-1-5-32-545:RX" },
-    @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" }
+    @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" },
+    @{ Name = "uninstall.exe"; Grant = "*S-1-5-32-545:RX" },
+    @{ Name = "uninstall.ps1"; Grant = "*S-1-5-32-545:R" }
   )) {
     $path = Join-Path $InstallRoot $uninstaller.Name
     try {
@@ -745,27 +747,64 @@ function Install-HeadlessUninstaller {
   param([string]$InstallRoot)
   if ((Get-EnrollOs) -ne "windows" -or -not $InstallRoot) { return }
 
-  $sourceCandidates = New-Object System.Collections.Generic.List[string]
+  $packageDirs = New-Object System.Collections.Generic.List[string]
   if ($PSScriptRoot) {
-    $sourceCandidates.Add((Join-Path $PSScriptRoot "uninstall.ps1")) | Out-Null
+    $packageDirs.Add($PSScriptRoot) | Out-Null
     $packageRoot = Split-Path -Parent $PSScriptRoot
     if ($packageRoot) {
-      $sourceCandidates.Add((Join-Path $packageRoot "uninstall.ps1")) | Out-Null
+      $packageDirs.Add($packageRoot) | Out-Null
     }
   }
-  $source = $sourceCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-  if (-not $source) {
-    Write-Warning "Headless uninstaller was not found next to the installer script"
+  $scriptSource = $packageDirs | ForEach-Object { Join-Path $_ "uninstall.ps1" } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+  $exeSource = $packageDirs | ForEach-Object { Join-Path $_ "uninstall.exe" } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+  if (-not $scriptSource) {
+    Write-Warning "Headless uninstall.ps1 was not found next to the installer script"
     return
   }
 
-  $destination = Join-Path ([System.IO.Path]::GetFullPath($InstallRoot)) "uninstall.ps1"
-  $sourceFull = [System.IO.Path]::GetFullPath($source)
-  if ($sourceFull -ne [System.IO.Path]::GetFullPath($destination)) {
-    Copy-Item -LiteralPath $sourceFull -Destination $destination -Force
+  $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot)
+  $scriptDestination = Join-Path $installRootFull "uninstall.ps1"
+  if ([System.IO.Path]::GetFullPath($scriptSource) -ne [System.IO.Path]::GetFullPath($scriptDestination)) {
+    Copy-Item -LiteralPath $scriptSource -Destination $scriptDestination -Force
   }
-  try { Unblock-File -LiteralPath $destination -ErrorAction SilentlyContinue } catch {}
-  Write-Host "Installed headless uninstall entry: $destination"
+  try { Unblock-File -LiteralPath $scriptDestination -ErrorAction SilentlyContinue } catch {}
+
+  if (-not $exeSource) {
+    Write-Warning "Headless uninstall.exe was not found; PowerShell uninstall remains available"
+    return
+  }
+  $exeDestination = Join-Path $installRootFull "uninstall.exe"
+  if ([System.IO.Path]::GetFullPath($exeSource) -ne [System.IO.Path]::GetFullPath($exeDestination)) {
+    Copy-Item -LiteralPath $exeSource -Destination $exeDestination -Force
+  }
+  try { Unblock-File -LiteralPath $exeDestination -ErrorAction SilentlyContinue } catch {}
+
+  try {
+    $uninstallKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FDSecurityAgentHeadless"
+    $version = ""
+    foreach ($versionFile in @((Join-Path $installRootFull "VERSION"), (Join-Path $PSScriptRoot "VERSION"))) {
+      if ($versionFile -and (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+        $version = (Get-Content -LiteralPath $versionFile -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($version) { break }
+      }
+    }
+    if (-not $version) { $version = "unknown" }
+    New-Item -Path $uninstallKey -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "DisplayName" -Value "FDSecurity Endpoint Agent" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "DisplayVersion" -Value $version -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "Publisher" -Value "FDSecurity" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "InstallLocation" -Value $installRootFull -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "DisplayIcon" -Value $exeDestination -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "UninstallString" -Value ('"' + $exeDestination + '"') -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "QuietUninstallString" -Value ('"' + $exeDestination + '" /S') -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "NoModify" -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name "NoRepair" -Value 1 -PropertyType DWord -Force | Out-Null
+  } catch {
+    Write-Warning ("Failed to register headless uninstaller: " + $_.Exception.Message)
+  }
+  Write-Host "Installed headless uninstall entry: $exeDestination"
 }
 
 function Normalize-KeyProvider([string]$Provider) {

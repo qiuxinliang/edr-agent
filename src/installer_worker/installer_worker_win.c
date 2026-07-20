@@ -186,6 +186,39 @@ static int read_toml_scalar(const wchar_t *path, const char *key, wchar_t *out, 
   return 0;
 }
 
+static void trim_wide_trailing_slashes(wchar_t *s) {
+  if (!s) return;
+  size_t n = wcslen(s);
+  while (n > 0 && (s[n - 1] == L'/' || s[n - 1] == L'\\')) {
+    s[--n] = 0;
+  }
+}
+
+static const wchar_t *collector_arch_token(void) {
+#if defined(_M_ARM64) || defined(__aarch64__)
+  return L"arm64";
+#else
+  return L"amd64";
+#endif
+}
+
+static int build_forensic_manifest_url(wchar_t *out, size_t cap, const wchar_t *rest_base,
+                                       const wchar_t *kind) {
+  if (!out || cap == 0) return 0;
+  out[0] = 0;
+  if (!rest_base || !rest_base[0] || !kind || !kind[0]) return 0;
+  wchar_t base[1024];
+  _snwprintf(base, sizeof(base) / sizeof(base[0]), L"%ls", rest_base);
+  base[(sizeof(base) / sizeof(base[0])) - 1] = 0;
+  trim_wide_trailing_slashes(base);
+  if (!base[0]) return 0;
+  int n = _snwprintf(out, cap,
+                     L"%ls/agent/forensic-collector/manifest?kind=%ls&os=windows&arch=%ls",
+                     base, kind, collector_arch_token());
+  out[cap - 1] = 0;
+  return n > 0 && (size_t)n < cap;
+}
+
 static void sanitize_thumbprint(const wchar_t *in, wchar_t *out, size_t cap) {
   if (!out || cap == 0) return;
   size_t pos = 0;
@@ -578,7 +611,7 @@ static void broadcast_env_changed(void) {
 
 static void ensure_runtime_dirs(const wchar_t *install_dir, const wchar_t *log_path) {
   const wchar_t *dirs[] = {L"certs", L"queue", L"evidence", L"state", L"logs", L"diagnostics",
-                           L"upload_outbox", L"forensic", L"isolation", NULL};
+                           L"upload_outbox", L"forensic", L"collector", L"isolation", NULL};
   wchar_t path[MAX_PATH * 2];
   for (int i = 0; dirs[i]; ++i) {
     join_path(path, sizeof(path) / sizeof(path[0]), install_dir, dirs[i]);
@@ -611,7 +644,7 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
   (void)run_icacls(args, install_dir, log_path);
 
   const wchar_t *sensitive_dirs[] = {L"certs", L"queue", L"evidence", L"state", L"logs", L"diagnostics",
-                                     L"upload_outbox", L"forensic", L"isolation", NULL};
+                                     L"upload_outbox", L"forensic", L"collector", L"isolation", NULL};
   for (int i = 0; sensitive_dirs[i]; ++i) {
     join_path(path, sizeof(path) / sizeof(path[0]), install_dir, sensitive_dirs[i]);
     quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), path);
@@ -669,12 +702,34 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
   return 0;
 }
 
-static void set_runtime_env(const wchar_t *install_dir, const wchar_t *log_path) {
-  wchar_t path[MAX_PATH * 2];
+static void set_runtime_env(const wchar_t *install_dir, const wchar_t *config_path, const wchar_t *log_path) {
+  wchar_t path[MAX_PATH * 2], rest_base[1024], url[1400];
   set_machine_env(L"EDR_UPLOAD_FILE_RETRIES", L"3", log_path);
   set_machine_env(L"EDR_UPLOAD_FILE_RETRY_BACKOFF_MS", L"750", log_path);
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"forensic");
   set_machine_env(L"EDR_FORENSIC_OUT", path, log_path);
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR", L"1", log_path);
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\forensic_collector.exe");
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR_BIN", path, log_path);
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\forensic_collector_builtin.exe");
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", path, log_path);
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\velociraptor.exe");
+  set_machine_env(L"EDR_VELOCIRAPTOR_BIN", path, log_path);
+  set_machine_env(L"EDR_FORENSIC_VERSION_CHECK_SEC", L"60", log_path);
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR_AUTOFETCH", L"1", log_path);
+  rest_base[0] = 0;
+  if (read_toml_scalar(config_path, "rest_base_url", rest_base, sizeof(rest_base) / sizeof(rest_base[0]))) {
+    trim_wide_trailing_slashes(rest_base);
+    if (build_forensic_manifest_url(url, sizeof(url) / sizeof(url[0]), rest_base, L"adapter")) {
+      set_machine_env(L"EDR_FORENSIC_ADAPTER_MANIFEST_URL", url, log_path);
+    }
+    if (build_forensic_manifest_url(url, sizeof(url) / sizeof(url[0]), rest_base, L"velociraptor")) {
+      set_machine_env(L"EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, log_path);
+    }
+    append_log_utf8(log_path, L"forensic_manifest_env_configured");
+  } else {
+    append_log_utf8(log_path, L"forensic_manifest_env_skipped rest_base_url_missing");
+  }
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"logs\\command_audit.log");
   set_machine_env(L"EDR_CMD_AUDIT_PATH", path, log_path);
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"FDSensor.pid");
@@ -686,6 +741,10 @@ static void set_runtime_env(const wchar_t *install_dir, const wchar_t *log_path)
 
 static void clear_runtime_env(const wchar_t *log_path) {
   const wchar_t *names[] = {L"EDR_UPLOAD_FILE_RETRIES", L"EDR_UPLOAD_FILE_RETRY_BACKOFF_MS", L"EDR_FORENSIC_OUT",
+                            L"EDR_FORENSIC_COLLECTOR", L"EDR_FORENSIC_COLLECTOR_BIN",
+                            L"EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", L"EDR_VELOCIRAPTOR_BIN",
+                            L"EDR_FORENSIC_VERSION_CHECK_SEC", L"EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+                            L"EDR_FORENSIC_ADAPTER_MANIFEST_URL", L"EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
                             L"EDR_CMD_AUDIT_PATH", L"EDR_SELF_PROTECT_PIDFILE", L"EDR_ISOLATE_STAMP_PATH",
                             L"EDR_GRPC_REQUIRE_MTLS", L"EDR_ISOLATE_HOOK", L"EDR_CMD_ENABLED", NULL};
   for (int i = 0; names[i]; ++i) set_machine_env(names[i], L"", log_path);
@@ -803,7 +862,7 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
   ensure_runtime_dirs(install_dir, log_path);
   int acl_rc = stage_harden_acl(install_dir, log_path);
   if (acl_rc != 0) return acl_rc;
-  set_runtime_env(install_dir, log_path);
+  set_runtime_env(install_dir, config_path, log_path);
   delete_service_by_name(L"EdrAgent", log_path);
 
   wchar_t qexe[MAX_PATH * 2], qcfg[MAX_PATH * 2], qsvc[256], bin_path[4096];
@@ -895,7 +954,7 @@ static int stage_install_autorun(const wchar_t *install_dir, const wchar_t *exe_
   ensure_runtime_dirs(install_dir, log_path);
   int acl_rc = stage_harden_acl(install_dir, log_path);
   if (acl_rc != 0) return acl_rc;
-  set_runtime_env(install_dir, log_path);
+  set_runtime_env(install_dir, config_path, log_path);
 
   wchar_t script[MAX_PATH * 2], powershell[MAX_PATH * 2], qscript[MAX_PATH * 4], args[8192];
   join_path(script, sizeof(script) / sizeof(script[0]), install_dir, L"edr_windows_autorun.ps1");

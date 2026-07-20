@@ -306,6 +306,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "FDSecurityInstallerWorker build failed with exit code $LASTEXITCODE"
           }
+          cmake --build build --target fd_headless_uninstaller --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "headless uninstall.exe build failed with exit code $LASTEXITCODE"
+          }
 
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
@@ -410,6 +414,16 @@ jobs:
           } else {
             throw "FDSecurityInstallerWorker.exe not found after build"
           }
+          $uninstallerExe = Join-Path $outDir "uninstall.exe"
+          if (-not (Test-Path -LiteralPath $uninstallerExe)) {
+            $foundUninstaller = Get-ChildItem -Path build -Recurse -Filter "uninstall.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            if ($foundUninstaller) { Copy-Item -LiteralPath $foundUninstaller -Destination $uninstallerExe -Force }
+          }
+          if (-not (Test-Path -LiteralPath $uninstallerExe)) { throw "headless uninstall.exe not found after build" }
+          $null = $items.Add($uninstallerExe)
+          $uninstallScript = Join-Path $outDir "uninstall.ps1"
+          Copy-Item -LiteralPath "scripts\edr_agent_uninstall.ps1" -Destination $uninstallScript -Force
+          $null = $items.Add($uninstallScript)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
@@ -432,6 +446,22 @@ jobs:
           if (-not (Test-Path "config\p0_rule_bundle_ir_v1.json.enc")) {
             throw "missing encrypted P0 rule bundle: config\p0_rule_bundle_ir_v1.json.enc"
           }
+          $forensicRulesDir = "rules\forensic"
+          $requiredForensicRules = @(
+            "credential_theft.yar",
+            "injection.yar",
+            "lateral_movement.yar",
+            "packers.yar",
+            "privilege_escalation.yar",
+            "suspicious.yar"
+          )
+          foreach ($rule in $requiredForensicRules) {
+            $rulePath = Join-Path $forensicRulesDir $rule
+            if (-not (Test-Path -LiteralPath $rulePath -PathType Leaf)) {
+              throw "missing forensic YARA rule for headless package: $rulePath"
+            }
+          }
+          $null = $items.Add((Resolve-Path -LiteralPath "rules").Path)
 
           $innoOut = "install\windows-inno\Output"
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
@@ -470,6 +500,17 @@ jobs:
             if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
               throw "encrypted P0 rule bundle missing from package"
             }
+            $forensicEntries = @($entries | Where-Object { $_ -match '(?i)^rules[/\\]forensic[/\\][^/\\]+\.yar(a)?$' })
+            if ($forensicEntries.Count -lt 1) {
+              throw "rules/forensic/*.yar missing from headless package"
+            }
+            $normalizedForensicEntries = @($forensicEntries | ForEach-Object { $_.Replace('\', '/').ToLowerInvariant() })
+            foreach ($rule in $requiredForensicRules) {
+              $expectedRuleEntry = "rules/forensic/$($rule.ToLowerInvariant())"
+              if ($normalizedForensicEntries -notcontains $expectedRuleEntry) {
+                throw "required forensic YARA rule missing from headless package: $rule"
+              }
+            }
             if (-not ($entries -match '(^|/|\\)VERSION$')) {
               throw "VERSION file missing from package"
             }
@@ -498,6 +539,8 @@ jobs:
               'windows_service_install\.ps1',
               'windows_isolate_host\.ps1',
               'FDSecurityInstallerWorker\.exe',
+              'uninstall\.exe',
+              'uninstall\.ps1',
               'WinDivert\.dll',
               'WinDivert64\.sys',
               'WinDivert-LICENSE\.txt',
