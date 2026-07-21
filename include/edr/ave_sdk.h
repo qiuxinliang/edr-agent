@@ -29,8 +29,8 @@ extern "C" {
 #endif
 
 #define AVE_SDK_VERSION_MAJOR 2
-#define AVE_SDK_VERSION_MINOR 6
-#define AVE_SDK_VERSION_PATCH 5
+#define AVE_SDK_VERSION_MINOR 7
+#define AVE_SDK_VERSION_PATCH 0
 
 #define AVE_OK 0
 #define AVE_ERR_NOT_INITIALIZED (-1)
@@ -216,6 +216,9 @@ typedef struct AVEBehaviorAlert {
   char related_iocs_json[4090];
   /** 跨端并案主键，与 `alerts.user_subject_json` 同构；无则全零 */
   char user_subject_json[4090];
+  /** 追加 ABI 字段：进程快照；旧调用方结构前缀和既有成员偏移保持不变。 */
+  uint32_t ppid;
+  char cmdline[1024];
 } AVEBehaviorAlert;
 
 typedef struct AVEBehaviorEvent {
@@ -260,6 +263,10 @@ typedef struct AVEBehaviorEvent {
    *（PidHistory 粘性 / `merge_static_scan`）**独立**；编码时二者 **OR** 进入 `feat[56]`，便于预处理或证书子系统直写本字段而不依赖槽位粘性。
    */
   uint8_t cert_revoked_ancestor;
+  /** 追加 ABI 字段：当前事件对应进程的身份快照；target_path 仍表示事件目标。 */
+  char process_name[256];
+  char process_path[512];
+  char cmdline[1024];
 } AVEBehaviorEvent;
 
 typedef void(AVE_CALL *AVEThreatCallback)(const AVEScanResult *result, void *user_data);

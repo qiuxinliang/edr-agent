@@ -307,7 +307,9 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
   msg.type = (int32_t)EDR_EVENT_BEHAVIOR_ONNX_ALERT;
   msg.event_time_ns = a->timestamp_ns;
   msg.pid = a->pid;
+  msg.ppid = a->ppid;
   copy_str(msg.process_name, sizeof(msg.process_name), a->process_name[0] ? a->process_name : "");
+  copy_str(msg.cmdline, sizeof(msg.cmdline), a->cmdline[0] ? a->cmdline : "");
   copy_str(msg.exe_path, sizeof(msg.exe_path), a->process_path[0] ? a->process_path : "");
   msg.priority = 0u;
 
@@ -331,6 +333,9 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
            a->related_iocs_json[0] ? a->related_iocs_json : "");
   copy_str(msg.behavior_alert.user_subject_json, sizeof(msg.behavior_alert.user_subject_json),
            a->user_subject_json[0] ? a->user_subject_json : "");
+  msg.behavior_alert.ppid = a->ppid;
+  copy_str(msg.behavior_alert.cmdline, sizeof(msg.behavior_alert.cmdline),
+           a->cmdline[0] ? a->cmdline : "");
 
   pb_ostream_t stream = pb_ostream_from_buffer(out, out_cap);
   if (!pb_encode(&stream, edr_v1_BehaviorEvent_fields, &msg)) {

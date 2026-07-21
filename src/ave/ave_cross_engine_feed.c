@@ -340,6 +340,9 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   if (ransom_ext && shadow_delete) ev.ransom_counter_score += 0.20f;
   if (ev.ransom_counter_score > 1.f) ev.ransom_counter_score = 1.f;
   ev.timestamp_ns = br->event_time_ns;
+  snprintf(ev.process_name, sizeof(ev.process_name), "%s", br->process_name);
+  snprintf(ev.process_path, sizeof(ev.process_path), "%s", br->exe_path);
+  snprintf(ev.cmdline, sizeof(ev.cmdline), "%s", br->cmdline);
   if (br->priority <= 255u) {
     ev.severity_hint = (uint8_t)br->priority;
   }

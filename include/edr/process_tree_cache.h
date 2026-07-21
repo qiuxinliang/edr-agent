@@ -1,6 +1,6 @@
 /**
- * 进程树缓存 — 预处理线程内 LRU 哈希表（PID→父链），供 P0 事件上下文富化。
- * 4096 条目，~1.5MB 常驻，仅在预处理线程访问（无需锁）。
+ * 进程树缓存 — 线程安全 LRU 哈希表（PID→父链），供 P0 富化和告警发送快照。
+ * 4096 条目，~1.5MB 常驻。跨线程调用必须使用复制型 API，禁止持有内部条目指针。
  */
 #ifndef EDR_PROCESS_TREE_CACHE_H
 #define EDR_PROCESS_TREE_CACHE_H
@@ -35,8 +35,11 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
                      const char *exe_path, const char *parent_name,
                      uint64_t start_time_ns);
 
-/** 根据 PID 查找条目；未命中返回 NULL。仅预处理线程调用。 */
+/** 根据 PID 查找内部条目；仅可在缓存实现内部持锁调用。 */
 const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid);
+
+/** 线程安全复制快照；命中返回 0，未命中/未初始化返回 -1。 */
+int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out);
 
 /** 移除条目（进程退出时调用）。返回 0 成功，-1 未找到。 */
 int edr_pt_cache_remove(uint32_t pid);

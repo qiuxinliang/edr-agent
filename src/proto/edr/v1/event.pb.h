@@ -73,6 +73,9 @@ typedef struct _edr_v1_BehaviorAlert {
     char related_iocs_json[4090];
     /* 跨端并案主键真源：与平台 `alerts.user_subject_json` 一致，如 {"subject_type":"ad_sid","value":"S-1-5-21-..."}。 */
     char user_subject_json[4090];
+    /* 进程快照冗余：同时写入 BehaviorEvent.ppid/cmdline，兼容只解析外层事件的旧平台。 */
+    uint32_t ppid;
+    char cmdline[1024];
 } edr_v1_BehaviorAlert;
 
 typedef struct _edr_v1_ProcessDetail {
@@ -172,7 +175,7 @@ extern "C" {
 
 /* Initializer values for message structs */
 #define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
-#define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", ""}
+#define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, ""}
 #define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default}
 #define edr_v1_ProcessDetail_init_default        {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_default           {"", "", 0, 0}
@@ -181,7 +184,7 @@ extern "C" {
 #define edr_v1_DnsDetail_init_default            {""}
 #define edr_v1_ScriptDetail_init_default         {""}
 #define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
-#define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", ""}
+#define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, ""}
 #define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero}
 #define edr_v1_ProcessDetail_init_zero           {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
@@ -231,6 +234,8 @@ extern "C" {
 #define edr_v1_BehaviorAlert_process_path_tag    9
 #define edr_v1_BehaviorAlert_related_iocs_json_tag 10
 #define edr_v1_BehaviorAlert_user_subject_json_tag 11
+#define edr_v1_BehaviorAlert_ppid_tag            12
+#define edr_v1_BehaviorAlert_cmdline_tag         13
 #define edr_v1_ProcessDetail_parent_name_tag     1
 #define edr_v1_ProcessDetail_parent_path_tag     2
 #define edr_v1_ProcessDetail_integrity_level_tag 3
@@ -328,7 +333,9 @@ X(a, STATIC,   SINGULAR, UINT32,   pid,               7) \
 X(a, STATIC,   SINGULAR, STRING,   process_name,      8) \
 X(a, STATIC,   SINGULAR, STRING,   process_path,      9) \
 X(a, STATIC,   SINGULAR, STRING,   related_iocs_json,  10) \
-X(a, STATIC,   SINGULAR, STRING,   user_subject_json,  11)
+X(a, STATIC,   SINGULAR, STRING,   user_subject_json,  11) \
+X(a, STATIC,   SINGULAR, UINT32,   ppid,             12) \
+X(a, STATIC,   SINGULAR, STRING,   cmdline,          13)
 #define edr_v1_BehaviorAlert_CALLBACK NULL
 #define edr_v1_BehaviorAlert_DEFAULT NULL
 
@@ -443,8 +450,8 @@ extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
 /* Maximum encoded size of messages (where known) */
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         1792
-#define edr_v1_BehaviorAlert_size                10078
-#define edr_v1_BehaviorEvent_size                28742
+#define edr_v1_BehaviorAlert_size                11110
+#define edr_v1_BehaviorEvent_size                29774
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   1072
 #define edr_v1_NetworkDetail_size                1185

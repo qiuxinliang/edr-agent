@@ -5,6 +5,7 @@
 #include "edr/event_batch.h"
 #include "edr/preprocess.h"
 #include "edr/policy_v2.h"
+#include "edr/process_tree_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,31 @@ static void warn_encoding_once(void) {
 }
 
 #ifdef EDR_HAVE_NANOPB
+static int process_name_is_placeholder(const char *name) {
+  if (!name || !name[0]) return 1;
+  if (strncmp(name, "pid:", 4) != 0) return 0;
+  const char *p = name + 4;
+  if (!*p) return 0;
+  while (*p >= '0' && *p <= '9') p++;
+  return *p == '\0';
+}
+
+static void enrich_alert_process_snapshot(AVEBehaviorAlert *alert) {
+  if (!alert || alert->pid == 0u) return;
+  ProcessTreeEntry snapshot;
+  if (edr_pt_cache_snapshot(alert->pid, &snapshot) != 0) return;
+  if (process_name_is_placeholder(alert->process_name) && snapshot.process_name[0]) {
+    snprintf(alert->process_name, sizeof(alert->process_name), "%s", snapshot.process_name);
+  }
+  if (!alert->process_path[0] && snapshot.exe_path[0]) {
+    snprintf(alert->process_path, sizeof(alert->process_path), "%s", snapshot.exe_path);
+  }
+  if (alert->ppid == 0u) alert->ppid = snapshot.ppid;
+  if (!alert->cmdline[0] && snapshot.cmdline[0]) {
+    snprintf(alert->cmdline, sizeof(alert->cmdline), "%s", snapshot.cmdline);
+  }
+}
+
 static void emit_raw(const AVEBehaviorAlert *a, const char *ep, const char *te) {
   uint8_t buf[65536];
   size_t n = edr_behavior_alert_encode_protobuf(a, ep, te, buf, sizeof(buf));
@@ -79,7 +105,9 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
     emit_volume_summary(decision.summary_suppressed, a->timestamp_ns, ep, te);
   }
   if (decision.allow_original) {
-    emit_raw(a, ep, te);
+    AVEBehaviorAlert enriched = *a;
+    enrich_alert_process_snapshot(&enriched);
+    emit_raw(&enriched, ep, te);
     static int s_debug_enabled = -1;
     if (s_debug_enabled < 0) {
       s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;

@@ -187,6 +187,7 @@ set(_edr_test_ave_sdk_sources
 set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
   ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
@@ -386,6 +387,15 @@ add_executable(test_preprocess_dedup ${CMAKE_CURRENT_SOURCE_DIR}/test_preprocess
 target_include_directories(test_preprocess_dedup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_preprocess_dedup)
 add_test(NAME preprocess_dedup COMMAND test_preprocess_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_process_tree_cache ${CMAKE_CURRENT_SOURCE_DIR}/test_process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c)
+target_include_directories(test_process_tree_cache PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(UNIX)
+  target_link_libraries(test_process_tree_cache PRIVATE Threads::Threads)
+endif()
+edr_apply_common_warnings(test_process_tree_cache)
+add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
@@ -855,6 +865,7 @@ add_executable(test_alert_governor_cardinality
   ${CMAKE_CURRENT_SOURCE_DIR}/test_alert_governor_cardinality.c
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_alert_governor_cardinality PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(test_alert_governor_cardinality PRIVATE EDR_HAVE_NANOPB=1)

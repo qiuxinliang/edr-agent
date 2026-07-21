@@ -10,6 +10,9 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#else
+#include <pthread.h>
+#include <strings.h>
 #endif
 
 #define PT_HT_CAPACITY 4096u
@@ -22,6 +25,16 @@ typedef struct {
 static PTHashSlot g_pt_table[PT_HT_CAPACITY];
 static uint64_t g_pt_oldest_ns;
 static bool g_pt_initialized;
+
+#ifdef _WIN32
+static SRWLOCK g_pt_lock = SRWLOCK_INIT;
+static void pt_lock(void) { AcquireSRWLockExclusive(&g_pt_lock); }
+static void pt_unlock(void) { ReleaseSRWLockExclusive(&g_pt_lock); }
+#else
+static pthread_mutex_t g_pt_lock = PTHREAD_MUTEX_INITIALIZER;
+static void pt_lock(void) { (void)pthread_mutex_lock(&g_pt_lock); }
+static void pt_unlock(void) { (void)pthread_mutex_unlock(&g_pt_lock); }
+#endif
 
 #ifdef _WIN32
 static const char *g_key_proc_names[] = {
@@ -58,98 +71,125 @@ static void pt_evict_lru(void) {
 }
 
 void edr_pt_cache_init(void) {
+  pt_lock();
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
   g_pt_oldest_ns = 0;
   g_pt_initialized = true;
+  pt_unlock();
 }
 
 void edr_pt_cache_shutdown(void) {
+  pt_lock();
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
   g_pt_oldest_ns = 0;
   g_pt_initialized = false;
+  pt_unlock();
+}
+
+static const ProcessTreeEntry *pt_get_locked(uint32_t pid) {
+  if (!g_pt_initialized) return NULL;
+  size_t idx = pt_hash(pid);
+  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+    size_t probe = (idx + i) % PT_HT_CAPACITY;
+    if (g_pt_table[probe].occupied && g_pt_table[probe].entry.pid == pid) {
+      return &g_pt_table[probe].entry;
+    }
+  }
+  return NULL;
+}
+
+static int pt_put_locked(uint32_t pid, uint32_t ppid,
+                         const char *process_name, const char *cmdline,
+                         const char *exe_path, const char *parent_name,
+                         uint64_t start_time_ns) {
+  if (!g_pt_initialized) return -1;
+  size_t idx = pt_hash(pid);
+  size_t target = PT_HT_CAPACITY;
+  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+    size_t probe = (idx + i) % PT_HT_CAPACITY;
+    if (g_pt_table[probe].occupied && g_pt_table[probe].entry.pid == pid) {
+      target = probe;
+      break;
+    }
+    if (!g_pt_table[probe].occupied && target == PT_HT_CAPACITY) {
+      target = probe;
+    }
+  }
+  if (target == PT_HT_CAPACITY) {
+    pt_evict_lru();
+    return pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name, start_time_ns);
+  }
+  ProcessTreeEntry *e = &g_pt_table[target].entry;
+  e->pid = pid;
+  e->ppid = ppid;
+  e->start_time_ns = start_time_ns;
+  e->last_seen_ns = start_time_ns;
+  snprintf(e->process_name, sizeof(e->process_name), "%s", process_name ? process_name : "");
+  snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline ? cmdline : "");
+  snprintf(e->exe_path, sizeof(e->exe_path), "%s", exe_path ? exe_path : "");
+  snprintf(e->parent_name, sizeof(e->parent_name), "%s", parent_name ? parent_name : "");
+  g_pt_table[target].occupied = true;
+  if (start_time_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
+    g_pt_oldest_ns = start_time_ns;
+  }
+  return 0;
 }
 
 int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
                      const char *process_name, const char *cmdline,
                      const char *exe_path, const char *parent_name,
                      uint64_t start_time_ns) {
-  if (!g_pt_initialized) return -1;
-
-  size_t idx = pt_hash(pid);
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    size_t probe = (idx + i) % PT_HT_CAPACITY;
-    if (!g_pt_table[probe].occupied || g_pt_table[probe].entry.pid == pid) {
-      ProcessTreeEntry *e = &g_pt_table[probe].entry;
-      e->pid = pid;
-      e->ppid = ppid;
-      e->start_time_ns = start_time_ns;
-      e->last_seen_ns = start_time_ns;
-      if (process_name) {
-        strncpy(e->process_name, process_name, EDR_PTC_STR_SHORT - 1);
-        e->process_name[EDR_PTC_STR_SHORT - 1] = '\0';
-      } else {
-        e->process_name[0] = '\0';
-      }
-      if (cmdline) {
-        strncpy(e->cmdline, cmdline, EDR_PTC_STR_LONG - 1);
-        e->cmdline[EDR_PTC_STR_LONG - 1] = '\0';
-      } else {
-        e->cmdline[0] = '\0';
-      }
-      if (exe_path) {
-        strncpy(e->exe_path, exe_path, EDR_PTC_STR_PATH - 1);
-        e->exe_path[EDR_PTC_STR_PATH - 1] = '\0';
-      } else {
-        e->exe_path[0] = '\0';
-      }
-      if (parent_name) {
-        strncpy(e->parent_name, parent_name, EDR_PTC_STR_SHORT - 1);
-        e->parent_name[EDR_PTC_STR_SHORT - 1] = '\0';
-      } else {
-        e->parent_name[0] = '\0';
-      }
-      g_pt_table[probe].occupied = true;
-      if (start_time_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
-        g_pt_oldest_ns = start_time_ns;
-      }
-      return 0;
-    }
-  }
-  pt_evict_lru();
-  return edr_pt_cache_put(pid, ppid, process_name, cmdline,
-                          exe_path, parent_name, start_time_ns);
+  pt_lock();
+  int rc = pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name, start_time_ns);
+  pt_unlock();
+  return rc;
 }
 
 const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid) {
-  if (!g_pt_initialized) return NULL;
-  size_t idx = pt_hash(pid);
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    size_t probe = (idx + i) % PT_HT_CAPACITY;
-    if (!g_pt_table[probe].occupied) return NULL;
-    if (g_pt_table[probe].entry.pid == pid) return &g_pt_table[probe].entry;
+#ifdef _MSC_VER
+  static __declspec(thread) ProcessTreeEntry snapshot;
+#else
+  static __thread ProcessTreeEntry snapshot;
+#endif
+  return edr_pt_cache_snapshot(pid, &snapshot) == 0 ? &snapshot : NULL;
+}
+
+int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out) {
+  if (!out) return -1;
+  pt_lock();
+  const ProcessTreeEntry *entry = pt_get_locked(pid);
+  if (entry) {
+    memcpy(out, entry, sizeof(*out));
+  } else {
+    memset(out, 0, sizeof(*out));
   }
-  return NULL;
+  pt_unlock();
+  return entry ? 0 : -1;
 }
 
 int edr_pt_cache_remove(uint32_t pid) {
-  if (!g_pt_initialized) return -1;
-  size_t idx = pt_hash(pid);
-  for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
-    size_t probe = (idx + i) % PT_HT_CAPACITY;
-    if (!g_pt_table[probe].occupied) return -1;
-    if (g_pt_table[probe].entry.pid == pid) {
-      g_pt_table[probe].occupied = false;
-      return 0;
+  int rc = -1;
+  pt_lock();
+  if (g_pt_initialized) {
+    size_t idx = pt_hash(pid);
+    for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
+      size_t probe = (idx + i) % PT_HT_CAPACITY;
+      if (g_pt_table[probe].occupied && g_pt_table[probe].entry.pid == pid) {
+        g_pt_table[probe].occupied = false;
+        rc = 0;
+        break;
+      }
     }
   }
-  return -1;
+  pt_unlock();
+  return rc;
 }
 
-uint32_t edr_pt_cache_chain_depth(uint32_t pid) {
+static uint32_t pt_chain_depth_locked(uint32_t pid) {
   uint32_t depth = 0;
   uint32_t cur = pid;
   for (int hop = 0; hop < 32; hop++) {
-    const ProcessTreeEntry *e = edr_pt_cache_get(cur);
+    const ProcessTreeEntry *e = pt_get_locked(cur);
     if (!e || e->ppid == 0 || e->ppid == cur) {
       depth++;
       break;
@@ -157,6 +197,13 @@ uint32_t edr_pt_cache_chain_depth(uint32_t pid) {
     depth++;
     cur = e->ppid;
   }
+  return depth;
+}
+
+uint32_t edr_pt_cache_chain_depth(uint32_t pid) {
+  pt_lock();
+  uint32_t depth = pt_chain_depth_locked(pid);
+  pt_unlock();
   return depth;
 }
 
@@ -172,41 +219,44 @@ void edr_pt_cache_fill_record(uint32_t pid,
   if (parent_cmdline)  parent_cmdline[0] = '\0';
   if (out_chain_depth) *out_chain_depth = 0;
 
-  const ProcessTreeEntry *self = edr_pt_cache_get(pid);
-  if (!self) return;
-
-  if (self->ppid == 0 || self->ppid == pid) {
-    if (out_chain_depth) *out_chain_depth = 1;
+  pt_lock();
+  const ProcessTreeEntry *self = pt_get_locked(pid);
+  if (!self) {
+    pt_unlock();
     return;
   }
 
-  const ProcessTreeEntry *parent = edr_pt_cache_get(self->ppid);
-  if (parent && parent_cmdline && parent->cmdline[0]) {
+  if (self->ppid == 0 || self->ppid == pid) {
+    if (out_chain_depth) *out_chain_depth = 1;
+    pt_unlock();
+    return;
+  }
+
+  const ProcessTreeEntry *parent = pt_get_locked(self->ppid);
+  if (parent && parent_cmdline && parent->cmdline[0] && pc_cap > 0) {
     strncpy(parent_cmdline, parent->cmdline, pc_cap - 1);
     parent_cmdline[pc_cap - 1] = '\0';
   }
   if (!parent || parent->ppid == 0 || parent->ppid == self->ppid) {
     if (out_chain_depth) *out_chain_depth = parent ? 2 : 1;
+    pt_unlock();
     return;
   }
 
-  const ProcessTreeEntry *grandparent = edr_pt_cache_get(parent->ppid);
+  const ProcessTreeEntry *grandparent = pt_get_locked(parent->ppid);
   if (grandparent) {
-    if (out_grandparent_pid) {
-      *out_grandparent_pid = grandparent->pid;
-    }
-    if (grandparent_name) {
+    if (out_grandparent_pid) *out_grandparent_pid = grandparent->pid;
+    if (grandparent_name && gn_cap > 0) {
       strncpy(grandparent_name, grandparent->process_name, gn_cap - 1);
       grandparent_name[gn_cap - 1] = '\0';
     }
-    if (grandparent_path) {
+    if (grandparent_path && gp_cap > 0) {
       strncpy(grandparent_path, grandparent->exe_path, gp_cap - 1);
       grandparent_path[gp_cap - 1] = '\0';
     }
   }
-  if (out_chain_depth) {
-    *out_chain_depth = edr_pt_cache_chain_depth(pid);
-  }
+  if (out_chain_depth) *out_chain_depth = pt_chain_depth_locked(pid);
+  pt_unlock();
 }
 
 #ifdef _WIN32
@@ -291,14 +341,18 @@ int edr_pt_cache_warmup(void) {
     } while (Process32NextW(snap, &pe));
   }
   CloseHandle(snap);
+  pt_lock();
   edr_pt_cache_refresh_key_procs();
+  EdrKeyProcSlot key_snapshot[EDR_KEY_PROC_MAX];
+  memcpy(key_snapshot, g_key_procs, sizeof(key_snapshot));
+  pt_unlock();
   fprintf(stderr, "[pt_cache] warmup complete: cached=%d key_procs=%zu\n",
           count, (size_t)EDR_KEY_PROC_MAX);
   for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
-    if (g_key_procs[k].valid) {
+    if (key_snapshot[k].valid) {
       fprintf(stderr, "[pt_cache]   key[%d] %s pid=%u ppid=%u\n",
-              k, g_key_procs[k].name, (unsigned)g_key_procs[k].pid,
-              (unsigned)g_key_procs[k].ppid);
+              k, key_snapshot[k].name, (unsigned)key_snapshot[k].pid,
+              (unsigned)key_snapshot[k].ppid);
     }
   }
   return count;
@@ -307,21 +361,27 @@ int edr_pt_cache_warmup(void) {
 void edr_pt_cache_get_key_procs(EdrKeyProcSlot *out, int max) {
   if (!out || max <= 0) return;
   int n = max < EDR_KEY_PROC_MAX ? max : EDR_KEY_PROC_MAX;
+  pt_lock();
   for (int i = 0; i < n; i++) {
     memcpy(&out[i], &g_key_procs[i], sizeof(EdrKeyProcSlot));
   }
+  pt_unlock();
 }
 
 int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
   if (!name || !out_pid) return -1;
+  int rc = -1;
+  pt_lock();
   for (int k = 0; k < EDR_KEY_PROC_MAX; k++) {
     if (!g_key_procs[k].valid) continue;
     if (strcmp(g_key_procs[k].name, name) == 0) {
       *out_pid = g_key_procs[k].pid;
-      return 0;
+      rc = 0;
+      break;
     }
   }
-  return -1;
+  pt_unlock();
+  return rc;
 }
 #else
 int edr_pt_cache_warmup(void) { return 0; }

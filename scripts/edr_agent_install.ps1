@@ -1251,6 +1251,8 @@ function Read-PemCertificates([string]$Path) {
   return $certs
 }
 
+$script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $false
+
 function Enable-BootstrapTlsValidation([string]$CaPath, [string]$LeafSha256) {
   $pins = @(Get-NormalizedSha256List $LeafSha256)
   $certs = Read-PemCertificates $CaPath
@@ -1266,6 +1268,7 @@ function Enable-BootstrapTlsValidation([string]$CaPath, [string]$LeafSha256) {
   $script:EDR_BOOTSTRAP_TLS_LEAF_SHA256 = @($pins)
   $script:EDR_BOOTSTRAP_TLS_CA_CERTS = @($certs)
   $script:EDR_BOOTSTRAP_TLS_CA_THUMBPRINTS = @($thumbprints)
+  $script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $true
   [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
     param($sender, $certificate, $chain, $sslPolicyErrors)
     try {
@@ -1311,6 +1314,7 @@ if ($TrustCa) {
 }
 
 if ($env:EDR_INSECURE_TLS -eq "1") {
+  $script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $false
   if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
     Add-Type @"
 using System.Net;
@@ -2461,8 +2465,19 @@ if ($d.ca_cert -or $d.client_cert) {
   }
   Write-PemNoBom -Path $CaCertPath -Text $d.ca_cert
   Write-PemNoBom -Path $ClientCertPath -Text $d.client_cert
-  if ($TrustCa) {
+  # certreq validates the issued chain against LocalMachine\Root. The enrollment
+  # CA may be trusted automatically only when its response arrived over bootstrap-verified HTTPS.
+  $enrollmentTransportAuthenticated = $false
+  try {
+    $enrollmentUri = [System.Uri]$uri
+    $enrollmentTransportAuthenticated = ($script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED -and $enrollmentUri.Scheme -eq "https" -and $env:EDR_INSECURE_TLS -ne "1")
+  } catch {
+  }
+  $shouldInstallEnrollmentCaTrust = [bool]$TrustCa -or ($UseNativeWindowsStore -and $enrollmentTransportAuthenticated)
+  if ($shouldInstallEnrollmentCaTrust) {
     Install-BootstrapCaTrust -Path $CaCertPath
+  } elseif ($UseNativeWindowsStore) {
+    throw "Windows certificate-store acceptance requires a trusted issuing CA; use verified HTTPS bootstrap or set -TrustCa explicitly"
   }
   Accept-CngIssuedCertificate -CertPath $ClientCertPath -Provider $effectiveKeyProvider
   if ($UseNativeWindowsStore) {

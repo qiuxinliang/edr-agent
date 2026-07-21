@@ -167,7 +167,7 @@ static void ave_fill_related_iocs_json(AVEBehaviorAlert *al, const char *remote_
 }
 
 static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_type, uint32_t parent_pid,
-                                       const char *target_path, const char *file_sha256, const char *remote_ip,
+                                       const char *cmdline, const char *target_path, const char *file_sha256, const char *remote_ip,
                                        const char *remote_domain, uint16_t remote_port, float shellcode_score,
                                        float webshell_score, float pmfe_confidence, float pmfe_dns_tunnel,
                                        uint8_t pmfe_pe_found, uint8_t ioc_ip_hit, uint8_t ioc_domain_hit,
@@ -195,10 +195,11 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
     forensics = "[\"timeline_window\",\"targeted_files\",\"process_tree\"]";
   }
 
-  char proc_name[256], proc_path[512], target_path_esc[512], file_sha_esc[80], remote_ip_esc[64], remote_domain_esc[300];
+  char proc_name[256], proc_path[512], cmdline_esc[1024], target_path_esc[512], file_sha_esc[80], remote_ip_esc[64], remote_domain_esc[300];
   char policy_ver[64], policy_esc[96];
   json_escape_copy(al->process_name, proc_name, sizeof(proc_name));
   json_escape_copy(al->process_path, proc_path, sizeof(proc_path));
+  json_escape_copy(cmdline, cmdline_esc, sizeof(cmdline_esc));
   json_escape_copy(target_path, target_path_esc, sizeof(target_path_esc));
   json_escape_copy(file_sha256, file_sha_esc, sizeof(file_sha_esc));
   json_escape_copy(remote_ip, remote_ip_esc, sizeof(remote_ip_esc));
@@ -227,7 +228,7 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
   snprintf(al->user_subject_json, sizeof(al->user_subject_json),
            "{\"subject_type\":\"detection_context\",\"detection_context\":{\"engine\":\"%s\","
            "\"rule_id\":\"%s\",\"confidence\":%.3f,\"process\":{\"pid\":%u,\"name\":\"%s\","
-           "\"path\":\"%s\",\"parent_pid\":%u}%s%s%s,"
+           "\"path\":\"%s\",\"parent_pid\":%u,\"cmdline\":\"%s\"}%s%s%s,"
            "\"engine_signals\":{\"shellcode_score\":%.3f,\"webshell_score\":%.3f,"
            "\"pmfe_confidence\":%.3f,\"pmfe_dns_tunnel\":%.3f,\"pmfe_pe_found\":%s,"
            "\"script_content_score\":%.3f,\"tls_anomaly_score\":%.3f,\"ransom_counter_score\":%.3f,"
@@ -237,7 +238,7 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
            "\"suppression\":{\"applied\":false,\"policy_version\":\"%s\"},"
            "\"recommended_forensics\":%s}}",
            engine, rule_id, (double)al->anomaly_score, (unsigned)al->pid, proc_name, proc_path,
-           (unsigned)parent_pid, file, network, policy, (double)shellcode_score, (double)webshell_score,
+           (unsigned)parent_pid, cmdline_esc, file, network, policy, (double)shellcode_score, (double)webshell_score,
            (double)pmfe_confidence, (double)pmfe_dns_tunnel, pmfe_pe_found ? "true" : "false",
            (double)script_content_score, (double)tls_anomaly_score, (double)ransom_counter_score,
            script_block_present ? "true" : "false", amsi_content_present ? "true" : "false",
@@ -973,13 +974,15 @@ static void ph_reset_lifecycle_for_pid_reuse(EdrPidHistory *sl, const AVEBehavio
       sl->parent_chain_depth = 1u;
     }
   }
-  if (e->target_path[0]) {
-    snprintf(sl->process_path, sizeof(sl->process_path), "%s", e->target_path);
-    const char *base = e->target_path;
-    for (const char *p = e->target_path; *p; p++) {
-      if (*p == '/' || *p == '\\') {
-        base = p + 1;
-      }
+  if (e->process_path[0]) {
+    snprintf(sl->process_path, sizeof(sl->process_path), "%s", e->process_path);
+  }
+  if (e->process_name[0]) {
+    snprintf(sl->process_name, sizeof(sl->process_name), "%s", e->process_name);
+  } else if (e->process_path[0]) {
+    const char *base = e->process_path;
+    for (const char *p = e->process_path; *p; p++) {
+      if (*p == '/' || *p == '\\') base = p + 1;
     }
     snprintf(sl->process_name, sizeof(sl->process_name), "%s", base);
   } else {
@@ -1020,18 +1023,26 @@ static void process_one_event(const AVEBehaviorEvent *e) {
         sl->parent_chain_depth = 1u;
       }
     }
-    if (e->target_path[0]) {
-      snprintf(sl->process_path, sizeof(sl->process_path), "%s", e->target_path);
-      const char *base = e->target_path;
-      for (const char *p = e->target_path; *p; p++) {
-        if (*p == '/' || *p == '\\') {
-          base = p + 1;
-        }
+    if (e->process_path[0]) {
+      snprintf(sl->process_path, sizeof(sl->process_path), "%s", e->process_path);
+    }
+    if (e->process_name[0]) {
+      snprintf(sl->process_name, sizeof(sl->process_name), "%s", e->process_name);
+    } else if (e->process_path[0]) {
+      const char *base = e->process_path;
+      for (const char *p = e->process_path; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
       }
       snprintf(sl->process_name, sizeof(sl->process_name), "%s", base);
     } else {
       snprintf(sl->process_name, sizeof(sl->process_name), "pid:%u", e->pid);
     }
+  }
+  if (e->process_name[0] && strncmp(e->process_name, "pid:", 4) != 0) {
+    snprintf(sl->process_name, sizeof(sl->process_name), "%s", e->process_name);
+  }
+  if (e->process_path[0]) {
+    snprintf(sl->process_path, sizeof(sl->process_path), "%s", e->process_path);
   }
   sl->ppid = e->ppid;
   sl->events_since_last_inference++;
@@ -1245,6 +1256,10 @@ behavior_infer_done:
   memcpy(sl_proc_name, sl->process_name, sizeof(sl_proc_name));
   char ev_tgt_path[1024];
   snprintf(ev_tgt_path, sizeof(ev_tgt_path), "%s", e->target_path);
+  char ev_proc_path[512];
+  snprintf(ev_proc_path, sizeof(ev_proc_path), "%s", e->process_path);
+  char ev_cmdline[1024];
+  snprintf(ev_cmdline, sizeof(ev_cmdline), "%s", e->cmdline);
   char ev_file_sha[80];
   snprintf(ev_file_sha, sizeof(ev_file_sha), "%s", e->file_sha256_hex);
   char ev_tgt_ip[64];
@@ -1277,6 +1292,8 @@ behavior_infer_done:
     AVEBehaviorAlert al;
     memset(&al, 0, sizeof(al));
     al.pid = pid_copy;
+    al.ppid = ppid_copy;
+    snprintf(al.cmdline, sizeof(al.cmdline), "%s", ev_cmdline);
     al.anomaly_score = an_copy;
     memcpy(al.tactic_probs, tactic_copy, sizeof(al.tactic_probs));
     if (!onnx_ready) {
@@ -1301,7 +1318,9 @@ behavior_infer_done:
     } else {
       snprintf(al.process_name, sizeof(al.process_name), "pid:%u", (unsigned)pid_copy);
     }
-    if (ev_tgt_path[0]) {
+    if (ev_proc_path[0]) {
+      snprintf(al.process_path, sizeof(al.process_path), "%s", ev_proc_path);
+    } else if (ev_tgt_path[0] && evt_copy == AVE_EVT_PROCESS_CREATE) {
       snprintf(al.process_path, sizeof(al.process_path), "%s", ev_tgt_path);
     }
     /* 可选：与平台 alerts.user_subject_json 对齐的 JSON 真源（调试用/专线注入；生产建议由策略填 AVEBehaviorAlert） */
@@ -1315,7 +1334,7 @@ behavior_infer_done:
       }
     }
     if (!al.user_subject_json[0]) {
-      ave_fill_detection_context(&al, evt_copy, ppid_copy, ev_tgt_path, ev_file_sha, ev_tgt_ip, ev_tgt_domain,
+      ave_fill_detection_context(&al, evt_copy, ppid_copy, ev_cmdline, ev_tgt_path, ev_file_sha, ev_tgt_ip, ev_tgt_domain,
                                  ev_tgt_port, ev_shellcode_score, ev_webshell_score, ev_pmfe_confidence,
                                  ev_pmfe_dns_tunnel, ev_pmfe_pe_found, ev_ioc_ip_hit, ev_ioc_domain_hit,
                                  ev_ioc_sha256_hit, ev_script_content_score, ev_tls_anomaly_score,

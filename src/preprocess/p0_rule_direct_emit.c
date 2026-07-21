@@ -994,9 +994,11 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   AVEBehaviorAlert a;
   memset(&a, 0, sizeof(a));
   a.pid = br->pid;
+  a.ppid = br->ppid;
   a.timestamp_ns = br->event_time_ns;
   snprintf(a.process_name, sizeof(a.process_name), "%s", pn && pn[0] ? pn : "");
   snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path);
+  snprintf(a.cmdline, sizeof(a.cmdline), "%s", br->cmdline);
   a.anomaly_score = p0_anomaly_for_severity(severity);
   snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", mitre_comma ? mitre_comma : "");
   a.skip_ai_analysis = false;
