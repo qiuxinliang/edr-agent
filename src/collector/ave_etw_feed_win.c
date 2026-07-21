@@ -91,7 +91,7 @@ static DWORD WINAPI edr_ave_async_thread(void *arg) {
     s_ave_head = (s_ave_head + 1u) % EDR_AVE_ASYNC_CAP;
     s_ave_count--;
     LeaveCriticalSection(&s_ave_cs);
-    AVE_FeedEvent(&ev);
+    (void)AVE_FeedEventEx(&ev, sizeof(ev));
   }
   /* not reached */
   /* return 0; */
@@ -151,7 +151,6 @@ void edr_ave_etw_feed_from_event(PEVENT_RECORD rec, EdrEventType ty, uint64_t ts
     return;
   }
   if (ty == EDR_EVENT_PROCESS_TERMINATE) {
-    AVE_NotifyProcessExit((uint32_t)rec->EventHeader.ProcessId);
     return;
   }
   if (!direct || !(direct[0] == '1' && direct[1] == '\0')) {
@@ -225,5 +224,5 @@ void edr_ave_etw_feed_from_event(PEVENT_RECORD rec, EdrEventType ty, uint64_t ts
       return;
     }
   }
-  AVE_FeedEvent(&ev);
+  (void)AVE_FeedEventEx(&ev, sizeof(ev));
 }

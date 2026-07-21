@@ -400,5 +400,5 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
     break;
   }
 
-  AVE_FeedEvent(&ev);
+  (void)AVE_FeedEventEx(&ev, sizeof(ev));
 }

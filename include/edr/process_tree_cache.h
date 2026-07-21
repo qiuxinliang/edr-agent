@@ -11,12 +11,14 @@
 #define EDR_PTC_STR_SHORT 64u
 #define EDR_PTC_STR_LONG  256u
 #define EDR_PTC_STR_PATH  512u
+#define EDR_PTC_EXIT_GRACE_NS (30ULL * 1000000000ULL)
 
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
   uint64_t start_time_ns;
   uint64_t last_seen_ns;
+  uint64_t exit_time_ns;
   char process_name[EDR_PTC_STR_SHORT];
   char cmdline[EDR_PTC_STR_LONG];
   char exe_path[EDR_PTC_STR_PATH];
@@ -41,7 +43,16 @@ const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid);
 /** 线程安全复制快照；命中返回 0，未命中/未初始化返回 -1。 */
 int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out);
 
-/** 移除条目（进程退出时调用）。返回 0 成功，-1 未找到。 */
+/**
+ * 按源事件时间复制快照。命中返回 0；未命中返回 -1；事件不属于当前 PID
+ * generation 或已超出退出宽限时返回 -2。
+ */
+int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out);
+
+/** 标记进程退出，保留短暂迟到告警宽限。返回 0 成功，-1 未找到。 */
+int edr_pt_cache_mark_exit(uint32_t pid, uint64_t exit_time_ns);
+
+/** 移除条目。返回 0 成功，-1 未找到。 */
 int edr_pt_cache_remove(uint32_t pid);
 
 /** 获取自 PID 向上的进程链深度。返回跳数（含自身）。 */
@@ -54,6 +65,20 @@ void edr_pt_cache_fill_record(uint32_t pid,
                               uint32_t *out_grandparent_pid,
                               char *parent_cmdline,    size_t pc_cap,
                               uint32_t *out_chain_depth);
+
+typedef struct {
+  uint64_t puts;
+  uint64_t updates;
+  uint64_t put_time_rejects;
+  uint64_t snapshot_hits;
+  uint64_t snapshot_misses;
+  uint64_t snapshot_time_rejects;
+  uint64_t exits_marked;
+  uint64_t evictions;
+  uint32_t entries;
+} EdrProcessTreeCacheMetrics;
+
+void edr_pt_cache_get_metrics(EdrProcessTreeCacheMetrics *out);
 
 #define EDR_KEY_PROC_MAX 12
 

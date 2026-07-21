@@ -9,10 +9,12 @@
 static int g_feed_count;
 static AVEBehaviorEvent g_last_event;
 
-AVE_EXPORT void AVE_CALL AVE_FeedEvent(const AVEBehaviorEvent *event) {
+AVE_EXPORT int AVE_CALL AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size) {
   assert(event != NULL);
+  assert(event_size == sizeof(*event));
   g_last_event = *event;
   g_feed_count++;
+  return AVE_OK;
 }
 
 static void reset_capture(void) {

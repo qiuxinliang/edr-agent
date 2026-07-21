@@ -367,6 +367,11 @@ AVE_EXPORT int AVE_CALL AVE_ScanMemory(const uint8_t *buffer, size_t size, const
 AVE_EXPORT int AVE_CALL AVE_CancelScan(int64_t scan_id);
 
 AVE_EXPORT void AVE_CALL AVE_FeedEvent(const AVEBehaviorEvent *event);
+/**
+ * Size-aware behavior feed for SDK 2.7+ callers. Pass sizeof(AVEBehaviorEvent).
+ * The legacy AVE_FeedEvent entry point interprets its input using the SDK 2.6 layout.
+ */
+AVE_EXPORT int AVE_CALL AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size);
 AVE_EXPORT int AVE_CALL AVE_GetProcessAnomalyScore(uint32_t pid, float *score_out);
 AVE_EXPORT int AVE_CALL AVE_GetProcessBehaviorFlags(uint32_t pid, AVEBehaviorFlags *flags_out);
 AVE_EXPORT void AVE_CALL AVE_NotifyProcessExit(uint32_t pid);

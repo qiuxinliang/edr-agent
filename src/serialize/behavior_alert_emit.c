@@ -43,7 +43,8 @@ static int process_name_is_placeholder(const char *name) {
 static void enrich_alert_process_snapshot(AVEBehaviorAlert *alert) {
   if (!alert || alert->pid == 0u) return;
   ProcessTreeEntry snapshot;
-  if (edr_pt_cache_snapshot(alert->pid, &snapshot) != 0) return;
+  uint64_t event_time_ns = alert->timestamp_ns > 0 ? (uint64_t)alert->timestamp_ns : 0u;
+  if (edr_pt_cache_snapshot_at(alert->pid, event_time_ns, &snapshot) != 0) return;
   if (process_name_is_placeholder(alert->process_name) && snapshot.process_name[0]) {
     snprintf(alert->process_name, sizeof(alert->process_name), "%s", snapshot.process_name);
   }

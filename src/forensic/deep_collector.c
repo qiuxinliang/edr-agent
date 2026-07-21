@@ -421,8 +421,12 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
     return EDR_DC_ERR_DOWNLOAD;
   }
   if (dc_download(manifest_url, mf_path) != 0) {
+    const char *download_detail = dc_last_download_detail();
     (void)remove(mf_path); /* 失败可能留 0 字节坏件,清掉避免下次误读 */
-    if (detail) snprintf(detail, detail_cap, "manifest fetch failed");
+    if (detail) {
+      snprintf(detail, detail_cap, "manifest fetch failed (%.180s)",
+               download_detail ? download_detail : "unknown");
+    }
     return EDR_DC_ERR_DOWNLOAD;
   }
   FILE *f = fopen(mf_path, "rb");

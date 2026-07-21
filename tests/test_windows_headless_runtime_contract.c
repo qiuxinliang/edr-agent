@@ -122,6 +122,30 @@ int main(void) {
                          "headless enrollment must fail when queue ACL repair fails");
   free(installer_ps);
 
+  char *uninstall_ps = read_source(root, "scripts/edr_agent_uninstall.ps1");
+  if (!uninstall_ps) return 1;
+  ok &= require_contains(uninstall_ps, "takeown.exe /F $InstallDir /A /R /D Y",
+                         "uninstall cleanup must recover ownership recursively");
+  ok &= require_contains(uninstall_ps, "/reset /T /C /Q",
+                         "uninstall cleanup must remove stale deny and inheritance ACL state");
+  ok &= require_contains(uninstall_ps, "[IO.FileAttributes]::Normal",
+                         "uninstall cleanup must clear restrictive file attributes before deletion");
+  free(uninstall_ps);
+
+  char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");
+  if (!headless_uninstaller) return 1;
+  ok &= require_contains(headless_uninstaller, "MessageBoxW(",
+                         "headless uninstall prompts must use the Unicode Windows API");
+  ok &= require_absent(headless_uninstaller, "MessageBoxA(",
+                       "headless uninstall prompts must never use the ANSI Windows API");
+  free(headless_uninstaller);
+
+  char *cmake = read_source(root, "CMakeLists.txt");
+  if (!cmake) return 1;
+  ok &= require_contains(cmake, "target_compile_options(fd_headless_uninstaller PRIVATE /utf-8)",
+                         "MSVC must decode the UTF-8 Chinese uninstall prompt source explicitly");
+  free(cmake);
+
   char *preflight = read_source(root, "scripts/edr_agent_preflight.ps1");
   if (!preflight) return 1;
   ok &= require_contains(preflight, "repaired ACL and removed $Label",

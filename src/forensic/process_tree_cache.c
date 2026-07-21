@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -25,6 +26,7 @@ typedef struct {
 static PTHashSlot g_pt_table[PT_HT_CAPACITY];
 static uint64_t g_pt_oldest_ns;
 static bool g_pt_initialized;
+static EdrProcessTreeCacheMetrics g_pt_metrics;
 
 #ifdef _WIN32
 static SRWLOCK g_pt_lock = SRWLOCK_INIT;
@@ -50,6 +52,19 @@ static size_t pt_hash(uint32_t pid) {
   return ((size_t)pid * 2654435761u) % PT_HT_CAPACITY;
 }
 
+static uint64_t pt_wall_ns(void) {
+#ifdef _WIN32
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  uint64_t ticks = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  return ticks > 116444736000000000ULL ? (ticks - 116444736000000000ULL) * 100ULL : 0ULL;
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0ULL;
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
 static void pt_evict_lru(void) {
   uint64_t oldest = UINT64_MAX;
   size_t oldest_i = 0;
@@ -61,6 +76,8 @@ static void pt_evict_lru(void) {
   }
   if (oldest != UINT64_MAX) {
     g_pt_table[oldest_i].occupied = false;
+    if (g_pt_metrics.entries > 0u) g_pt_metrics.entries--;
+    g_pt_metrics.evictions++;
     g_pt_oldest_ns = 0;
     for (size_t i = 0; i < PT_HT_CAPACITY; i++) {
       if (g_pt_table[i].occupied && g_pt_table[i].entry.last_seen_ns > g_pt_oldest_ns) {
@@ -73,6 +90,7 @@ static void pt_evict_lru(void) {
 void edr_pt_cache_init(void) {
   pt_lock();
   (void)memset(g_pt_table, 0, sizeof(g_pt_table));
+  (void)memset(&g_pt_metrics, 0, sizeof(g_pt_metrics));
   g_pt_oldest_ns = 0;
   g_pt_initialized = true;
   pt_unlock();
@@ -119,11 +137,24 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
     pt_evict_lru();
     return pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name, start_time_ns);
   }
+  bool was_occupied = g_pt_table[target].occupied;
   ProcessTreeEntry *e = &g_pt_table[target].entry;
+  if (was_occupied && start_time_ns != 0u && e->start_time_ns != 0u &&
+      start_time_ns < e->start_time_ns) {
+    g_pt_metrics.put_time_rejects++;
+    return -2;
+  }
+  if (was_occupied) {
+    g_pt_metrics.updates++;
+  } else {
+    g_pt_metrics.puts++;
+    g_pt_metrics.entries++;
+  }
   e->pid = pid;
   e->ppid = ppid;
   e->start_time_ns = start_time_ns;
   e->last_seen_ns = start_time_ns;
+  e->exit_time_ns = 0u;
   snprintf(e->process_name, sizeof(e->process_name), "%s", process_name ? process_name : "");
   snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline ? cmdline : "");
   snprintf(e->exe_path, sizeof(e->exe_path), "%s", exe_path ? exe_path : "");
@@ -154,17 +185,64 @@ const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid) {
   return edr_pt_cache_snapshot(pid, &snapshot) == 0 ? &snapshot : NULL;
 }
 
+static int pt_snapshot_locked(uint32_t pid, uint64_t event_time_ns,
+                              bool validate_time, ProcessTreeEntry *out) {
+  const ProcessTreeEntry *entry = pt_get_locked(pid);
+  if (!entry) {
+    memset(out, 0, sizeof(*out));
+    g_pt_metrics.snapshot_misses++;
+    return -1;
+  }
+  if (validate_time) {
+    uint64_t now_ns = pt_wall_ns();
+    bool before_generation = event_time_ns != 0u && entry->start_time_ns != 0u &&
+                             event_time_ns < entry->start_time_ns;
+    bool after_exit = entry->exit_time_ns != 0u &&
+                      (event_time_ns == 0u || event_time_ns > entry->exit_time_ns);
+    bool exit_grace_expired = entry->exit_time_ns != 0u && now_ns != 0u &&
+                              now_ns > entry->exit_time_ns + EDR_PTC_EXIT_GRACE_NS;
+    if (before_generation || after_exit || exit_grace_expired) {
+      memset(out, 0, sizeof(*out));
+      g_pt_metrics.snapshot_time_rejects++;
+      return -2;
+    }
+  }
+  memcpy(out, entry, sizeof(*out));
+  g_pt_metrics.snapshot_hits++;
+  return 0;
+}
+
 int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out) {
   if (!out) return -1;
   pt_lock();
-  const ProcessTreeEntry *entry = pt_get_locked(pid);
+  int rc = pt_snapshot_locked(pid, 0u, false, out);
+  pt_unlock();
+  return rc;
+}
+
+int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out) {
+  if (!out) return -1;
+  pt_lock();
+  int rc = pt_snapshot_locked(pid, event_time_ns, true, out);
+  pt_unlock();
+  return rc;
+}
+
+int edr_pt_cache_mark_exit(uint32_t pid, uint64_t exit_time_ns) {
+  int rc = -1;
+  pt_lock();
+  ProcessTreeEntry *entry = (ProcessTreeEntry *)(void *)pt_get_locked(pid);
   if (entry) {
-    memcpy(out, entry, sizeof(*out));
-  } else {
-    memset(out, 0, sizeof(*out));
+    if (exit_time_ns == 0u) exit_time_ns = pt_wall_ns();
+    if (entry->start_time_ns == 0u || exit_time_ns >= entry->start_time_ns) {
+      entry->exit_time_ns = exit_time_ns;
+      entry->last_seen_ns = exit_time_ns;
+      g_pt_metrics.exits_marked++;
+      rc = 0;
+    }
   }
   pt_unlock();
-  return entry ? 0 : -1;
+  return rc;
 }
 
 int edr_pt_cache_remove(uint32_t pid) {
@@ -176,6 +254,7 @@ int edr_pt_cache_remove(uint32_t pid) {
       size_t probe = (idx + i) % PT_HT_CAPACITY;
       if (g_pt_table[probe].occupied && g_pt_table[probe].entry.pid == pid) {
         g_pt_table[probe].occupied = false;
+        if (g_pt_metrics.entries > 0u) g_pt_metrics.entries--;
         rc = 0;
         break;
       }
@@ -313,12 +392,7 @@ static int edr_pt_cache_put_raw(uint32_t pid, uint32_t ppid,
     WideCharToMultiByte(CP_UTF8, 0, exe_path_w, -1, path_buf,
                         (int)sizeof(path_buf) - 1, NULL, NULL);
   }
-  uint64_t now = 0;
-  {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    now = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-  }
+  uint64_t now = pt_wall_ns();
   return edr_pt_cache_put(pid, ppid, name_buf[0] ? name_buf : NULL,
                           NULL, path_buf[0] ? path_buf : NULL, NULL, now);
 }
@@ -396,6 +470,13 @@ int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
 #endif
 
 /* stub: PPID 推断预案未实现 */
+void edr_pt_cache_get_metrics(EdrProcessTreeCacheMetrics *out) {
+  if (!out) return;
+  pt_lock();
+  *out = g_pt_metrics;
+  pt_unlock();
+}
+
 int edr_pt_cache_infer_parent(uint32_t pid, uint64_t event_time_ns,
                               uint32_t *out_ppid, char *out_parent_name,
                               size_t name_cap) {

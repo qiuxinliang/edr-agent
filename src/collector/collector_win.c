@@ -25,7 +25,9 @@
 #include "edr/event_bus.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
+#include "edr/process_tree_cache.h"
 #include "edr/sensor_interest.h"
+#include "edr/ave_sdk.h"
 #include "edr/types.h"
 #include "edr/windows_event_policy.h"
 
@@ -1235,6 +1237,7 @@ static void edr_collector_pid_cache_enrich(EdrBehaviorRecord *br) {
     if (slot->pid != br->pid) {
       continue;
     }
+    s_health.process_identity_cache_hits++;
     if (!br->process_name[0] && slot->process_name[0]) {
       edr_copy_trunc(br->process_name, sizeof(br->process_name), slot->process_name);
     }
@@ -1246,6 +1249,7 @@ static void edr_collector_pid_cache_enrich(EdrBehaviorRecord *br) {
     }
     return;
   }
+  s_health.process_identity_cache_misses++;
 }
 
 static int edr_is_p0_network_port(uint32_t port) {
@@ -1378,7 +1382,9 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     return 1;
   }
   edr_behavior_from_slot(slot, &br);
-  edr_collector_pid_cache_enrich(&br);
+  if (slot->type != EDR_EVENT_PROCESS_CREATE) {
+    edr_collector_pid_cache_enrich(&br);
+  }
   if ((slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) &&
       br.exe_path[0] && !br.network_aux_path[0]) {
     edr_copy_trunc(br.network_aux_path, sizeof(br.network_aux_path), br.exe_path);
@@ -1449,6 +1455,9 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
     if (!edr_collector_valid_process_create_record(&br)) {
       s_health.invalid_process_dropped++;
+      if (br.pid != 0u && !br.process_name[0] && !br.exe_path[0] && !br.cmdline[0]) {
+        s_health.process_create_missing_identity++;
+      }
       return 0;
     }
     return (br.process_name[0] || br.cmdline[0]) ? 1 : 0;
@@ -1529,6 +1538,11 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   {
     EdrSensorInterestEvent interest_event;
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
+      if (ty == EDR_EVENT_PROCESS_TERMINATE && interest_event.pid != 0u) {
+        uint64_t exit_time_ns = edr_unix_ns();
+        (void)edr_pt_cache_mark_exit(interest_event.pid, exit_time_ns);
+        AVE_NotifyProcessExit(interest_event.pid);
+      }
       if ((ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE ||
            ty == EDR_EVENT_REG_DELETE_KEY) && !interest_event.registry_path[0]) {
         s_health.registry_payload_missing++;

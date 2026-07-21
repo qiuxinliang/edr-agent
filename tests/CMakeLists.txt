@@ -91,6 +91,14 @@ add_test(NAME attack_surface_command_ingest_contract COMMAND test_attack_surface
 set_tests_properties(attack_surface_command_ingest_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_process_identity_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_process_identity_contract.c)
+edr_apply_common_warnings(test_process_identity_contract)
+add_test(NAME process_identity_lifecycle_contract COMMAND test_process_identity_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(process_identity_lifecycle_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 add_executable(test_attack_surface_inventory_policy
   ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_inventory_policy.c
   ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_inventory.c

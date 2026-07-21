@@ -152,9 +152,23 @@ function Remove-HeadlessUninstallRegistration {
 function Grant-InstallDirectoryRemovalRights {
   if (-not (Test-Path -LiteralPath $InstallDir)) { return }
   try {
+    & takeown.exe /F $InstallDir /A /R /D Y | Out-Null
+  } catch {
+    Write-Warning ("Failed to take ownership of install directory: " + $_.Exception.Message)
+  }
+  try {
+    & icacls.exe $InstallDir /inheritance:e /T /C /Q | Out-Null
+    & icacls.exe $InstallDir /reset /T /C /Q | Out-Null
+  } catch {
+    Write-Warning ("Failed to reset install directory ACL: " + $_.Exception.Message)
+  }
+  try {
     & icacls.exe $InstallDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
   } catch {
     Write-Warning ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
+  }
+  Get-ChildItem -LiteralPath $InstallDir -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+    try { $_.Attributes = [IO.FileAttributes]::Normal } catch {}
   }
 }
 
@@ -172,6 +186,15 @@ if (`$parentId -gt 0) {
 }
 Start-Sleep -Milliseconds 750
 `$target = '$quotedDir'
+try { & takeown.exe /F `$target /A /R /D Y | Out-Null } catch {}
+try {
+  & icacls.exe `$target /inheritance:e /T /C /Q | Out-Null
+  & icacls.exe `$target /reset /T /C /Q | Out-Null
+  & icacls.exe `$target /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
+} catch {}
+Get-ChildItem -LiteralPath `$target -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+  try { `$_.Attributes = [IO.FileAttributes]::Normal } catch {}
+}
 for (`$attempt = 0; `$attempt -lt 20 -and (Test-Path -LiteralPath `$target); `$attempt++) {
   Remove-Item -LiteralPath `$target -Recurse -Force -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath `$target) { Start-Sleep -Milliseconds 500 }
@@ -221,6 +244,9 @@ Invoke-AgentEtwUninstallCleanup
 Remove-AgentClientCertificate
 Remove-MachineEnvironment
 Remove-HeadlessUninstallRegistration
+if ($RemoveData -or $RemoveProgramFiles) {
+  Grant-InstallDirectoryRemovalRights
+}
 if ($RemoveData) {
   Remove-AgentData
 } else {

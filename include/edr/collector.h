@@ -84,6 +84,9 @@ typedef struct {
     uint64_t lifecycle_dropped;
     uint64_t auth_dropped;
     uint64_t invalid_process_dropped;
+    uint64_t process_create_missing_identity;
+    uint64_t process_identity_cache_hits;
+    uint64_t process_identity_cache_misses;
     uint64_t ordinary_file_dropped;
     uint64_t ordinary_registry_dropped;
     uint64_t ordinary_network_dropped;

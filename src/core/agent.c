@@ -32,6 +32,8 @@
 #include "edr/command_executor.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/enrich_parent_info.h"
+#include "edr/process_tree_cache.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/policy_v2.h"
 #include "edr/pmfe.h"
@@ -1827,6 +1829,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
     uint64_t last_sensor_interest_ns = 0;
     uint64_t last_heartbeat_ns = 0;
     uint64_t last_health_ns = 0;
+    uint64_t last_forensic_refresh_ns = 0;
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
       if (e != EDR_OK) {
@@ -1871,6 +1874,26 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_agent_poll_heartbeat(&last_heartbeat_ns);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ENGINE_HEALTH,
                              edr_agent_poll_engine_health(agent, &last_health_ns, last_health_ns == 0u));
+        /* The init-time collector prefetch may run before HTTP transport is
+         * configured. Retry after transport becomes ready and keep retrying at
+         * a bounded interval so transient TLS/API startup failures do not leave
+         * adapter/Velociraptor absent for the lifetime of the service. */
+        if (edr_ingest_http_configured()) {
+          uint64_t refresh_now_ns = edr_monotonic_ns();
+          uint64_t refresh_interval_ns = 60ULL * 1000000000ULL;
+          const char *refresh_interval = getenv("EDR_FORENSIC_PREFETCH_RETRY_SEC");
+          if (refresh_interval && refresh_interval[0]) {
+            long seconds = atol(refresh_interval);
+            if (seconds >= 30 && seconds <= 3600) {
+              refresh_interval_ns = (uint64_t)seconds * 1000000000ULL;
+            }
+          }
+          if (last_forensic_refresh_ns == 0u ||
+              refresh_now_ns - last_forensic_refresh_ns >= refresh_interval_ns) {
+            last_forensic_refresh_ns = refresh_now_ns;
+            edr_deep_collector_schedule_runtime_refresh();
+          }
+        }
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SHELL_SESSION, edr_shell_session_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_COMMAND_DELIVERY, edr_command_poll_reliable_delivery());
         edr_behavior_alert_emit_periodic_summary();
@@ -2082,6 +2105,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   EdrTransportV2Runtime tv2_rt;
   EdrResourceSample rs;
   EdrCollectorHealth ch;
+  EdrParentEnrichmentMetrics parent_metrics;
+  EdrProcessTreeCacheMetrics process_cache_metrics;
   EdrCommandDeliveryHealth cdh;
   EdrCommandExecutorHealth ceh;
   EdrWindowsEventFilterStatus event_filter_status;
@@ -2089,6 +2114,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&tv2_rt, 0, sizeof(tv2_rt));
   memset(&rs, 0, sizeof(rs));
   memset(&ch, 0, sizeof(ch));
+  memset(&parent_metrics, 0, sizeof(parent_metrics));
+  memset(&process_cache_metrics, 0, sizeof(process_cache_metrics));
   memset(&cdh, 0, sizeof(cdh));
   memset(&ceh, 0, sizeof(ceh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
@@ -2096,6 +2123,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
+  edr_parent_enrichment_get_metrics(&parent_metrics);
+  edr_pt_cache_get_metrics(&process_cache_metrics);
   edr_command_get_delivery_health(&cdh);
   edr_command_executor_get_health(&ceh);
   ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
@@ -2257,6 +2286,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"powershell_visible\":%s,\"amsi_visible\":%s,"
         "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
         "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+        "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
+        "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
+        "\"snapshot_rejects\":%llu},"
         "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
         "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
         "\"current_minute_count\":%llu,\"threshold_per_min\":%llu,"
@@ -2377,6 +2409,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         ch.collector_thread_id,
         (unsigned long long)ch.collector_dropped,
         (unsigned long long)ch.queue_dropped,
+        (unsigned long long)ch.process_create_missing_identity,
+        (unsigned long long)ch.process_identity_cache_hits,
+        (unsigned long long)ch.process_identity_cache_misses,
+        (unsigned long long)process_cache_metrics.snapshot_hits,
+        (unsigned long long)process_cache_metrics.snapshot_misses,
+        (unsigned long long)process_cache_metrics.snapshot_time_rejects,
         ch.agent_self_fuse_active ? "true" : "false",
         ch.agent_self_fuse_provider_degraded ? "true" : "false",
         (unsigned long long)ch.agent_self_fuse_until_unix_ms,
@@ -2624,6 +2662,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"registry_provider\":{\"events\":%llu,\"unmapped\":%llu,"
       "\"payload_missing\":%llu,\"admitted\":%llu},"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+      "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
+      "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
+      "\"snapshot_rejects\":%llu,\"cache_entries\":%u,\"cache_puts\":%llu,"
+      "\"cache_updates\":%llu,\"cache_put_rejects\":%llu,\"cache_exits\":%llu,\"cache_evictions\":%llu,"
+      "\"parent_attempts\":%llu,\"parent_succeeded\":%llu,\"parent_access_denied\":%llu,"
+      "\"parent_exited\":%llu,\"parent_other_failed\":%llu},"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
       "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
       "\"current_minute_count\":%llu,\"threshold_per_min\":%llu,"
@@ -2859,6 +2903,23 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.registry_events_admitted,
       (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
+      (unsigned long long)ch.process_create_missing_identity,
+      (unsigned long long)ch.process_identity_cache_hits,
+      (unsigned long long)ch.process_identity_cache_misses,
+      (unsigned long long)process_cache_metrics.snapshot_hits,
+      (unsigned long long)process_cache_metrics.snapshot_misses,
+      (unsigned long long)process_cache_metrics.snapshot_time_rejects,
+      process_cache_metrics.entries,
+      (unsigned long long)process_cache_metrics.puts,
+      (unsigned long long)process_cache_metrics.updates,
+      (unsigned long long)process_cache_metrics.put_time_rejects,
+      (unsigned long long)process_cache_metrics.exits_marked,
+      (unsigned long long)process_cache_metrics.evictions,
+      (unsigned long long)parent_metrics.attempts,
+      (unsigned long long)parent_metrics.succeeded,
+      (unsigned long long)parent_metrics.access_denied,
+      (unsigned long long)parent_metrics.process_exited,
+      (unsigned long long)parent_metrics.other_failed,
       ch.agent_self_fuse_active ? "true" : "false",
       ch.agent_self_fuse_provider_degraded ? "true" : "false",
       (unsigned long long)ch.agent_self_fuse_until_unix_ms,

@@ -930,22 +930,87 @@ int AVE_CancelScan(int64_t scan_id) {
   return AVE_ERR_NOT_IMPL;
 }
 
-void AVE_FeedEvent(const AVEBehaviorEvent *event) {
+typedef struct AVEBehaviorEventV26 {
+  uint32_t pid;
+  uint32_t ppid;
+  AVEEventType event_type;
+  uint8_t severity_hint;
+  int64_t timestamp_ns;
+  char target_path[512];
+  char target_ip[46];
+  char target_domain[256];
+  uint16_t target_port;
+  float ave_confidence;
+  float shellcode_score;
+  float webshell_score;
+  float pmfe_confidence;
+  float pmfe_dns_tunnel;
+  uint8_t pmfe_pe_found;
+  char file_sha256_hex[65];
+  uint8_t ioc_ip_hit;
+  uint8_t ioc_domain_hit;
+  uint8_t ioc_sha256_hit;
+  AVEBehaviorFlags behavior_flags;
+  uint8_t target_has_motw;
+  uint8_t cert_revoked_ancestor;
+} AVEBehaviorEventV26;
+
+static int ave_feed_event_current(const AVEBehaviorEvent *event) {
   if (!g_initialized) {
-    return;
+    return AVE_ERR_NOT_INITIALIZED;
   }
   if (!event) {
-    return;
+    return AVE_ERR_INVALID_PARAM;
   }
   AVEBehaviorEvent ev = *event;
   const EdrConfig *pcfg = active_edr_config();
   if (pcfg && !pcfg->ave.behavior_monitor_enabled) {
-    return;
+    return AVE_OK;
   }
   if (pcfg) {
     edr_ave_behavior_event_apply_ioc(pcfg, &ev);
   }
   edr_ave_bp_feed(&ev);
+  return AVE_OK;
+}
+
+void AVE_FeedEvent(const AVEBehaviorEvent *event) {
+  if (!event) {
+    return;
+  }
+  const AVEBehaviorEventV26 *legacy = (const AVEBehaviorEventV26 *)(const void *)event;
+  AVEBehaviorEvent current;
+  memset(&current, 0, sizeof(current));
+  current.pid = legacy->pid;
+  current.ppid = legacy->ppid;
+  current.event_type = legacy->event_type;
+  current.severity_hint = legacy->severity_hint;
+  current.timestamp_ns = legacy->timestamp_ns;
+  memcpy(current.target_path, legacy->target_path, sizeof(legacy->target_path));
+  memcpy(current.target_ip, legacy->target_ip, sizeof(legacy->target_ip));
+  memcpy(current.target_domain, legacy->target_domain, sizeof(legacy->target_domain));
+  current.target_port = legacy->target_port;
+  current.ave_confidence = legacy->ave_confidence;
+  current.shellcode_score = legacy->shellcode_score;
+  current.webshell_score = legacy->webshell_score;
+  current.pmfe_confidence = legacy->pmfe_confidence;
+  current.pmfe_dns_tunnel = legacy->pmfe_dns_tunnel;
+  current.pmfe_pe_found = legacy->pmfe_pe_found;
+  memcpy(current.file_sha256_hex, legacy->file_sha256_hex, sizeof(legacy->file_sha256_hex));
+  current.ioc_ip_hit = legacy->ioc_ip_hit;
+  current.ioc_domain_hit = legacy->ioc_domain_hit;
+  current.ioc_sha256_hit = legacy->ioc_sha256_hit;
+  current.behavior_flags = legacy->behavior_flags;
+  current.target_has_motw = legacy->target_has_motw;
+  current.cert_revoked_ancestor = legacy->cert_revoked_ancestor;
+  (void)ave_feed_event_current(&current);
+}
+
+int AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size) {
+  if (event_size != sizeof(AVEBehaviorEvent)) {
+    return AVE_ERR_INVALID_PARAM;
+  }
+  return ave_feed_event_current(event);
 }
 
 int AVE_GetProcessAnomalyScore(uint32_t pid, float *score_out) {
