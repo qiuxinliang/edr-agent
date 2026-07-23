@@ -2357,13 +2357,15 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
                                                   uint32_t limit,
                                                   char *out, size_t cap,
                                                   uint32_t *returned,
-                                                  uint32_t *scanned) {
+                                                  uint32_t *scanned,
+                                                  int *truncated) {
   if (!out || cap == 0u) {
     return -1;
   }
   out[0] = '\0';
   uint32_t ret = 0;
   uint32_t scan = 0;
+  int partial = 0;
   uint32_t lim = limit;
   if (lim == 0u || lim > 500u) {
     lim = 50u;
@@ -2400,11 +2402,18 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
           json_escape(epj, sizeof(epj), ep);
           json_escape(pathj, sizeof(pathj), path);
           json_escape(shaj, sizeof(shaj), sha);
+          size_t row_start = off;
           appendf(out, cap, &off,
                   "%s{\"type\":\"file\",\"source\":\"file_evidence\",\"cache_hit\":true,"
                   "\"endpoint_id\":%s,\"path\":%s,\"sha256\":%s,\"pid\":%u,"
                   "\"last_seen_ns\":%lld}",
                   first ? "" : ",", epj, pathj, shaj, pid, (long long)last_seen);
+          if (off >= cap - 1u) {
+            off = row_start;
+            out[off] = '\0';
+            partial = 1;
+            break;
+          }
           first = 0;
           ret++;
         }
@@ -2420,6 +2429,9 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
   }
   if (scanned) {
     *scanned = scan;
+  }
+  if (truncated) {
+    *truncated = partial;
   }
   return 0;
 }
@@ -2493,14 +2505,22 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
     char *rows = (char *)malloc(rows_cap);
     uint32_t cache_returned = 0;
     uint32_t cache_scanned = 0;
+    int cache_truncated = 0;
     if (rows &&
         edr_local_evidence_cache_query_file_hash_json(f.file_sha256, f.file_path_contains,
                                                       f.file_ext, f.limit - returned,
                                                       rows, rows_cap,
-                                                      &cache_returned, &cache_scanned) == 0) {
+                                                      &cache_returned, &cache_scanned,
+                                                      &cache_truncated) == 0) {
       append_json_array_items(out, cap, &off, &first, rows);
       returned += cache_returned;
       scanned += cache_scanned;
+      if (cache_truncated) {
+        char *partial_flag = strstr(out, "\"partial\":false");
+        if (partial_flag) {
+          memcpy(partial_flag + 10, "true ", 5u);
+        }
+      }
     }
     free(rows);
   }

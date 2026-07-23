@@ -1607,6 +1607,48 @@ function Write-PemNoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text)
 }
 
+function Get-Ed25519PublicKeyDer([string]$PemText) {
+  if ([string]::IsNullOrWhiteSpace($PemText)) {
+    throw "enroll response did not include an Ed25519 command signing public key"
+  }
+  $match = [regex]::Match(
+    $PemText.Trim(),
+    '(?s)^-----BEGIN PUBLIC KEY-----\s*(?<body>[A-Za-z0-9+/=\s]+?)\s*-----END PUBLIC KEY-----$'
+  )
+  if (-not $match.Success) {
+    throw "enroll response command signing public key is not a valid PUBLIC KEY PEM"
+  }
+  try {
+    [byte[]]$der = [Convert]::FromBase64String(($match.Groups["body"].Value -replace '\s', ''))
+  } catch {
+    throw "enroll response command signing public key has invalid base64"
+  }
+
+  # RFC 8410 Ed25519 SubjectPublicKeyInfo prefix followed by the 32-byte key.
+  [byte[]]$prefix = @(0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00)
+  if ($der.Length -ne 44) {
+    throw "enroll response command signing public key is not an Ed25519 SubjectPublicKeyInfo"
+  }
+  for ($i = 0; $i -lt $prefix.Length; $i++) {
+    if ($der[$i] -ne $prefix[$i]) {
+      throw "enroll response command signing public key algorithm is not Ed25519"
+    }
+  }
+  return ,$der
+}
+
+function Get-ByteArraySha256Hex([byte[]]$Value) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($sha.ComputeHash($Value))).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+[byte[]]$CommandSigningPublicKeyDer = Get-Ed25519PublicKeyDer $CommandSigningPublicKeyPEM
+$CommandSigningPublicKeySha256 = Get-ByteArraySha256Hex $CommandSigningPublicKeyDer
+
 function Get-PemCertificateThumbprint([string]$PemText) {
   if (-not $PemText) { return "" }
   $m = [regex]::Match($PemText, '-----BEGIN CERTIFICATE-----\s*(?<b64>.*?)\s*-----END CERTIFICATE-----', 'Singleline')
@@ -2493,8 +2535,14 @@ if ($d.client_key) {
 if (-not $d.ca_cert -and $bootstrapCaAvailable) {
   Write-PemNoBom -Path $CaCertPath -Text ([System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($BootstrapCaCertPath))))
 }
-if ($CommandSigningPublicKeyPEM) {
-  Write-PemNoBom -Path $TomlSigningPublicKeyPath -Text $CommandSigningPublicKeyPEM
+Write-PemNoBom -Path $TomlSigningPublicKeyPath -Text $CommandSigningPublicKeyPEM
+$writtenCommandSigningPublicKeyPEM = [System.IO.File]::ReadAllText(
+  [System.IO.Path]::GetFullPath($TomlSigningPublicKeyPath)
+)
+[byte[]]$WrittenCommandSigningPublicKeyDer = Get-Ed25519PublicKeyDer $writtenCommandSigningPublicKeyPEM
+$WrittenCommandSigningPublicKeySha256 = Get-ByteArraySha256Hex $WrittenCommandSigningPublicKeyDer
+if ($WrittenCommandSigningPublicKeySha256 -ne $CommandSigningPublicKeySha256) {
+  throw "command signing public key integrity check failed after writing $TomlSigningPublicKeyPath"
 }
 
 $dir = Split-Path -Parent $Output

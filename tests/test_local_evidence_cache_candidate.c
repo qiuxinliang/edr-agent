@@ -166,8 +166,11 @@ static void test_file_sha256_query_uses_file_evidence_cache(void) {
   char rows[4096];
   uint32_t returned = 0;
   uint32_t scanned = 0;
+  int truncated = 0;
   assert(edr_local_evidence_cache_query_file_hash_json(hash, "", ".exe", 10u, rows,
-                                                       sizeof(rows), &returned, &scanned) == 0);
+                                                        sizeof(rows), &returned, &scanned,
+                                                        &truncated) == 0);
+  assert(truncated == 0);
   assert(returned == 1u);
   assert(scanned >= 1u);
   assert(strstr(rows, "\"source\":\"file_evidence\"") != NULL);
@@ -175,10 +178,23 @@ static void test_file_sha256_query_uses_file_evidence_cache(void) {
   assert(strstr(rows, "dropper.exe") != NULL);
   assert(strstr(rows, hash) != NULL);
 
+  char tiny_rows[96];
+  returned = 99u;
+  scanned = 0u;
+  truncated = 0;
+  assert(edr_local_evidence_cache_query_file_hash_json(hash, "", ".exe", 10u, tiny_rows,
+                                                        sizeof(tiny_rows), &returned, &scanned,
+                                                        &truncated) == 0);
+  assert(truncated == 1);
+  assert(returned == 0u);
+  assert(strcmp(tiny_rows, "[]") == 0);
+
   returned = 99u;
   scanned = 99u;
+  truncated = 0;
   assert(edr_local_evidence_cache_query_file_hash_json(miss, "", ".exe", 10u, rows,
-                                                       sizeof(rows), &returned, &scanned) == 0);
+                                                        sizeof(rows), &returned, &scanned,
+                                                        &truncated) == 0);
   assert(returned == 0u);
   assert(strcmp(rows, "[]") == 0);
 

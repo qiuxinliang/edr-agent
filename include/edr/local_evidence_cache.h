@@ -112,7 +112,8 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
                                                   uint32_t limit,
                                                   char *out, size_t cap,
                                                   uint32_t *returned,
-                                                  uint32_t *scanned);
+                                                  uint32_t *scanned,
+                                                  int *truncated);
 
 /** 用进程缓存返回 pid 的父进程和直接子进程，供 RTR 进程树查看。 */
 int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,

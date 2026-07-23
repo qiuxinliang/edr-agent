@@ -112,6 +112,21 @@ int main(void) {
                "reject duplicate JSON fields");
   require_true(validate("rtq_execute", "{\"process_name\":\"powershell.exe\"}", reason, sizeof(reason)),
                "valid strict RTQ contract");
+  char rtq_max_path[520];
+  memset(rtq_max_path, 'a', sizeof(rtq_max_path) - 1u);
+  rtq_max_path[sizeof(rtq_max_path) - 1u] = '\0';
+  char rtq_path_payload[600];
+  snprintf(rtq_path_payload, sizeof(rtq_path_payload),
+           "{\"file_path\":\"%s\"}", rtq_max_path);
+  require_true(validate("rtq_execute", rtq_path_payload, reason, sizeof(reason)),
+               "accept RTQ file path at Agent buffer contract");
+  char rtq_overlong_path[521];
+  memset(rtq_overlong_path, 'b', sizeof(rtq_overlong_path) - 1u);
+  rtq_overlong_path[sizeof(rtq_overlong_path) - 1u] = '\0';
+  snprintf(rtq_path_payload, sizeof(rtq_path_payload),
+           "{\"file_path\":\"%s\"}", rtq_overlong_path);
+  require_true(!validate("rtq_execute", rtq_path_payload, reason, sizeof(reason)),
+               "reject RTQ file path beyond Agent buffer contract");
   require_true(!validate("rtq_execute", "{\"network_remote_port\":70000}", reason, sizeof(reason)),
                "reject out-of-range RTQ port");
   require_true(validate("rtq_execute",

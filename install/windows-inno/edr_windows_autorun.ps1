@@ -238,6 +238,7 @@ function Write-TaskLauncher {
 `$logPath = $logPathLit
 `$stdoutPath = $stdoutPathLit
 `$stderrPath = $stderrPathLit
+`$jobHandle = [IntPtr]::Zero
 function Quote-FDNativeArg {
   param([string]`$Value)
   if (`$null -eq `$Value) { return '""' }
@@ -255,6 +256,112 @@ function Write-FDTaskLog {
 Write-FDTaskLog "launcher_start user=`$([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
 Write-FDTaskLog "exe=`$exe cfg=`$cfg wd=`$wd"
 try {
+  if (-not ("FDSecurity.TaskJob" -as [type])) {
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace FDSecurity {
+  public static class TaskJob {
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const int JobObjectExtendedLimitInformation = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+      public long PerProcessUserTimeLimit;
+      public long PerJobUserTimeLimit;
+      public uint LimitFlags;
+      public UIntPtr MinimumWorkingSetSize;
+      public UIntPtr MaximumWorkingSetSize;
+      public uint ActiveProcessLimit;
+      public UIntPtr Affinity;
+      public uint PriorityClass;
+      public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+      public ulong ReadOperationCount;
+      public ulong WriteOperationCount;
+      public ulong OtherOperationCount;
+      public ulong ReadTransferCount;
+      public ulong WriteTransferCount;
+      public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+      public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+      public IO_COUNTERS IoInfo;
+      public UIntPtr ProcessMemoryLimit;
+      public UIntPtr JobMemoryLimit;
+      public UIntPtr PeakProcessMemoryUsed;
+      public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr securityAttributes, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+      IntPtr job,
+      int infoClass,
+      IntPtr info,
+      uint infoLength);
+
+    [DllImport("kernel32.dll", EntryPoint = "AssignProcessToJobObject", SetLastError = true)]
+    private static extern bool AssignProcessToJobObjectNative(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static IntPtr CreateKillOnCloseJob() {
+      IntPtr job = CreateJobObject(IntPtr.Zero, null);
+      if (job == IntPtr.Zero) {
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject failed");
+      }
+      var limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+      limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+      int length = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+      IntPtr buffer = Marshal.AllocHGlobal(length);
+      try {
+        Marshal.StructureToPtr(limits, buffer, false);
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)length)) {
+          int error = Marshal.GetLastWin32Error();
+          CloseHandle(job);
+          throw new Win32Exception(error, "SetInformationJobObject failed");
+        }
+      } finally {
+        Marshal.FreeHGlobal(buffer);
+      }
+      return job;
+    }
+
+    public static void AssignProcess(IntPtr job, IntPtr process) {
+      if (!AssignProcessToJobObjectNative(job, process)) {
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
+      }
+    }
+
+    public static void Close(IntPtr job) {
+      if (job != IntPtr.Zero) {
+        CloseHandle(job);
+      }
+    }
+  }
+}
+'@
+  }
+  `$jobHandle = [FDSecurity.TaskJob]::CreateKillOnCloseJob()
+  try {
+    [FDSecurity.TaskJob]::AssignProcess(`$jobHandle, [Diagnostics.Process]::GetCurrentProcess().Handle)
+  } catch {
+    [FDSecurity.TaskJob]::Close(`$jobHandle)
+    `$jobHandle = [IntPtr]::Zero
+    throw
+  }
+  Write-FDTaskLog "launcher_job_assigned kill_on_close=1"
   if (-not (Test-Path -LiteralPath `$exe)) { Write-FDTaskLog "missing_exe"; exit 2 }
   if (-not (Test-Path -LiteralPath `$cfg)) { Write-FDTaskLog "missing_config"; exit 3 }
   try { Unblock-File -LiteralPath `$exe -ErrorAction SilentlyContinue } catch {}
@@ -277,7 +384,7 @@ try {
   `$agentArgs = "--config " + (Quote-FDNativeArg `$cfg)
   Write-FDTaskLog ("args=`$agentArgs")
   `$p = Start-Process -FilePath `$exe -ArgumentList `$agentArgs -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop
-  Write-FDTaskLog ("started_pid=" + `$p.Id)
+  Write-FDTaskLog ("started_pid=" + `$p.Id + " inherited_kill_on_close_job=1")
   Start-Sleep -Seconds 4
   `$alive = Get-Process -Id `$p.Id -ErrorAction SilentlyContinue
   if (-not `$alive) {
