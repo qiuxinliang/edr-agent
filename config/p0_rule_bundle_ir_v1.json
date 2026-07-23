@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 2,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r268-57605ae1",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r276-89b04a96",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 173,
