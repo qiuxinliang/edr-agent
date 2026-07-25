@@ -50,12 +50,15 @@ static void compile_cb(int level, const char *fn, int line, const YR_RULE *rule,
 static int add_file(YR_COMPILER *c, const char *path) {
   if (!is_yara_file(path)) return 0;
   FILE *f = fopen(path, "rb");
-  assert(f != NULL);
+  if (!f) {
+    fprintf(stderr, "open failed: %s\n", path);
+    abort();
+  }
   int nerr = yr_compiler_add_file(c, f, NULL, path);
   fclose(f);
   if (nerr > 0) {
     fprintf(stderr, "compile failed: %s\n", path);
-    assert(nerr == 0);
+    abort();
   }
   return 1;
 }
@@ -112,9 +115,18 @@ static int scan_cb(int message, void *message_data, void *user_data) {
 }
 
 static void compile_all_and_scan_samples(void) {
-  assert(yr_initialize() == ERROR_SUCCESS);
+  int rc = yr_initialize();
+  if (rc != ERROR_SUCCESS) {
+    fprintf(stderr, "yr_initialize failed: %d\n", rc);
+    abort();
+  }
   YR_COMPILER *c = NULL;
-  assert(yr_compiler_create(&c) == ERROR_SUCCESS && c != NULL);
+  rc = yr_compiler_create(&c);
+  if (rc != ERROR_SUCCESS || !c) {
+    fprintf(stderr, "yr_compiler_create failed: %d\n", rc);
+    yr_finalize();
+    abort();
+  }
   CompileState st;
   memset(&st, 0, sizeof(st));
   yr_compiler_set_callback(c, compile_cb, &st);
@@ -122,12 +134,19 @@ static void compile_all_and_scan_samples(void) {
   loaded += add_dir(c, EDR_FORENSIC_RULES_DIR);
   loaded += add_dir(c, EDR_SHELLCODE_RULES_DIR);
   loaded += add_dir(c, EDR_WEBSHELL_RULES_DIR);
-  assert(loaded >= 3);
+  if (loaded < 3) {
+    fprintf(stderr, "insufficient YARA rule files loaded: %d\n", loaded);
+    yr_compiler_destroy(c);
+    yr_finalize();
+    abort();
+  }
   YR_RULES *rules = NULL;
-  int rc = yr_compiler_get_rules(c, &rules);
+  rc = yr_compiler_get_rules(c, &rules);
   if (rc != ERROR_SUCCESS || !rules) {
     fprintf(stderr, "finalize failed: %s\n", st.first_error);
-    assert(rc == ERROR_SUCCESS && rules != NULL);
+    yr_compiler_destroy(c);
+    yr_finalize();
+    abort();
   }
   yr_compiler_destroy(c);
 
@@ -139,9 +158,15 @@ static void compile_all_and_scan_samples(void) {
   };
   for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
     MatchCtx mc = { samples[i].rule, 0 };
-    assert(yr_rules_scan_mem(rules, (const uint8_t *)samples[i].text, strlen(samples[i].text), 0, scan_cb, &mc, 0) == ERROR_SUCCESS);
-    if (!mc.matched) fprintf(stderr, "sample did not match rule: %s\n", samples[i].rule);
-    assert(mc.matched == 1);
+    rc = yr_rules_scan_mem(rules, (const uint8_t *)samples[i].text,
+                           strlen(samples[i].text), 0, scan_cb, &mc, 0);
+    if (rc != ERROR_SUCCESS || !mc.matched) {
+      fprintf(stderr, "sample scan failed: rule=%s rc=%d matched=%d\n",
+              samples[i].rule, rc, mc.matched);
+      yr_rules_destroy(rules);
+      yr_finalize();
+      abort();
+    }
   }
   yr_rules_destroy(rules);
   yr_finalize();
