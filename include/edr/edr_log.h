@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-/** 非 0：打印详细诊断（ONNX 加载、传输/gRPC 横幅、上报面成功、WinDivert 包级日志等）。 */
+/** 非 0：打印详细诊断（ONNX 加载、HTTP 传输横幅、上报面成功、WinDivert 包级日志等）。 */
 int edr_log_verbose(void);
 
 /**

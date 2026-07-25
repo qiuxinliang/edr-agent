@@ -1523,7 +1523,12 @@ toml_table_t *toml_parse_file(FILE *fp, char *errbuf, int errbufsz) {
   buf[off] = 0;
 
   /* parse it, cleanup and finish */
-  toml_table_t *ret = toml_parse(buf, errbuf, errbufsz);
+  char *parse_buf = buf;
+  if (off >= 3 && (unsigned char)buf[0] == 0xEF &&
+      (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) {
+    parse_buf = buf + 3;
+  }
+  toml_table_t *ret = toml_parse(parse_buf, errbuf, errbufsz);
   xfree(buf);
   return ret;
 }

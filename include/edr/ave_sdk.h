@@ -29,8 +29,8 @@ extern "C" {
 #endif
 
 #define AVE_SDK_VERSION_MAJOR 2
-#define AVE_SDK_VERSION_MINOR 6
-#define AVE_SDK_VERSION_PATCH 5
+#define AVE_SDK_VERSION_MINOR 7
+#define AVE_SDK_VERSION_PATCH 0
 
 #define AVE_OK 0
 #define AVE_ERR_NOT_INITIALIZED (-1)
@@ -55,7 +55,7 @@ extern "C" {
 #define AVE_ERR_NOT_IMPL (-101)
 /** `AVE_ExportModelWeights`：输出缓冲区不足；`*size` 回写所需最小字节数（C0+ 实现） */
 #define AVE_ERR_BUFFER_TOO_SMALL (-102)
-/** `AVE_ExportFeatureVector`：该 SHA256 在 FL 特征缓存中不存在（C1+ 对接 fl_samples / 缓存） */
+/** Legacy compatibility: feature cache miss; endpoint FL training is no longer part of product builds. */
 #define AVE_ERR_FL_SAMPLE_NOT_FOUND (-103)
 
 typedef enum EDRVerdict {
@@ -135,6 +135,7 @@ typedef struct AVEConfig {
   const char *behavior_policy_db_path;
   const char *cert_whitelist_db_path;
   const char *yara_rules_dir;
+  /** Legacy compatibility only; endpoint product builds ignore local FL sample DBs. */
   const char *fl_samples_db_path;
 
   int max_concurrent_scans;
@@ -157,6 +158,7 @@ typedef struct AVEConfig {
   float cert_min_confidence_floor;
 
   bool behavior_monitor_enabled;
+  /** Legacy compatibility only; learning/evaluation is handled server-side. */
   bool federated_learning_enabled;
   bool yara_scan_enabled;
   bool cert_whitelist_enabled;
@@ -210,6 +212,13 @@ typedef struct AVEBehaviorAlert {
   bool skip_ai_analysis;
   bool needs_l2_review;
   int64_t timestamp_ns;
+  /** 与 `alerts.related_iocs_json` 对齐的 JSON 文本；无则全零（与 nanopb max 4KiB-1 对齐） */
+  char related_iocs_json[4090];
+  /** 跨端并案主键，与 `alerts.user_subject_json` 同构；无则全零 */
+  char user_subject_json[4090];
+  /** 追加 ABI 字段：进程快照；旧调用方结构前缀和既有成员偏移保持不变。 */
+  uint32_t ppid;
+  char cmdline[1024];
 } AVEBehaviorAlert;
 
 typedef struct AVEBehaviorEvent {
@@ -228,7 +237,18 @@ typedef struct AVEBehaviorEvent {
   float webshell_score;
   float pmfe_confidence;
   float pmfe_dns_tunnel;
+  /** P1：轻量传感器富化信号，0=无/未知，>0 进入 behavior detection_context 与行为特征侧证据。 */
+  float script_content_score;
+  float tls_anomaly_score;
+  float ransom_counter_score;
   uint8_t pmfe_pe_found;
+  uint8_t script_block_present;
+  uint8_t amsi_content_present;
+  uint8_t ja3_anomaly;
+  uint8_t sni_anomaly;
+  uint8_t cert_anomaly;
+  uint8_t suspicious_extension_burst;
+  uint8_t shadow_copy_delete;
   /** 可选：预处理/缓存已算出的文件 SHA256（64 hex + `\\0`），供 `ioc_file_hash` 匹配 */
   char file_sha256_hex[65];
   /** §5.5 E 组 48–50：TIP/IOC 库在本事件上的命中（0/1）；由 `AVE_FillBehaviorEventIocHits` 或上游填写 */
@@ -243,6 +263,10 @@ typedef struct AVEBehaviorEvent {
    *（PidHistory 粘性 / `merge_static_scan`）**独立**；编码时二者 **OR** 进入 `feat[56]`，便于预处理或证书子系统直写本字段而不依赖槽位粘性。
    */
   uint8_t cert_revoked_ancestor;
+  /** 追加 ABI 字段：当前事件对应进程的身份快照；target_path 仍表示事件目标。 */
+  char process_name[256];
+  char process_path[512];
+  char cmdline[1024];
 } AVEBehaviorEvent;
 
 typedef void(AVE_CALL *AVEThreatCallback)(const AVEScanResult *result, void *user_data);
@@ -282,8 +306,10 @@ typedef struct AVEStatus {
   uint64_t behavior_feed_total;
   /** MPMC **`ave_mpmc_try_push`** 成功次数 */
   uint64_t behavior_queue_enqueued;
-  /** 队列满时 **同步降级** `process_one_event` 次数（背压指标） */
+  /** 保留兼容字段；P0 资源控制后不再队列满同步处理，正常应为 0。 */
   uint64_t behavior_queue_full_sync_fallback;
+  /** MPMC 队列满时丢弃行为输入的次数；用于判断 AVE 是否被高噪声拖住。 */
+  uint64_t behavior_queue_full_dropped;
   /** 未起监控线程或队列未建时，**直接同步**处理次数 */
   uint64_t behavior_feed_sync_bypass;
   /** 消费线程从 MPMC **成功 pop** 次数（与 enqueued+当前深度大致守恒） */
@@ -291,8 +317,19 @@ typedef struct AVEStatus {
   /** **`edr_onnx_behavior_infer`** 成功 / 非 **EDR_OK** 次数 */
   uint64_t behavior_infer_ok;
   uint64_t behavior_infer_fail;
+  uint64_t behavior_infer_budget_dropped;
+  uint64_t behavior_pressure_feed_dropped;
+  uint64_t behavior_pressure_infer_dropped;
+  uint32_t behavior_infer_budget_per_min;
+  uint32_t behavior_infer_effective_budget_per_min;
+  uint32_t behavior_infer_latency_last_ms;
+  uint32_t behavior_infer_latency_p95_ms;
+  uint32_t behavior_pressure_active;
   /** 行为 MPMC 容量（当前实现为 **4096**） */
   uint32_t behavior_queue_capacity;
+  uint32_t behavior_pid_history_used;
+  uint32_t behavior_pid_history_capacity;
+  uint64_t behavior_pid_history_static_bytes;
 } AVEStatus;
 
 AVE_EXPORT int AVE_CALL AVE_Init(const AVEConfig *config);
@@ -330,31 +367,36 @@ AVE_EXPORT int AVE_CALL AVE_ScanMemory(const uint8_t *buffer, size_t size, const
 AVE_EXPORT int AVE_CALL AVE_CancelScan(int64_t scan_id);
 
 AVE_EXPORT void AVE_CALL AVE_FeedEvent(const AVEBehaviorEvent *event);
+/**
+ * Size-aware behavior feed for SDK 2.7+ callers. Pass sizeof(AVEBehaviorEvent).
+ * The legacy AVE_FeedEvent entry point interprets its input using the SDK 2.6 layout.
+ */
+AVE_EXPORT int AVE_CALL AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size);
 AVE_EXPORT int AVE_CALL AVE_GetProcessAnomalyScore(uint32_t pid, float *score_out);
 AVE_EXPORT int AVE_CALL AVE_GetProcessBehaviorFlags(uint32_t pid, AVEBehaviorFlags *flags_out);
 AVE_EXPORT void AVE_CALL AVE_NotifyProcessExit(uint32_t pid);
 
 AVE_EXPORT int AVE_CALL AVE_ReportFalsePositive(const char *sha256, const char *file_path);
 AVE_EXPORT int AVE_CALL AVE_ReportTruePositive(const char *sha256);
+/** Legacy compatibility no-op: product builds return 0/0 samples. */
 AVE_EXPORT int AVE_CALL AVE_GetFLSampleCount(int *confirmed_malware_count, int *confirmed_clean_count);
 
 /**
- * 联邦学习：按 SHA256 导出 static 模型用 **512 维 float** 特征（见《10_联邦学习FL组件详细设计》§2.9）。
- * 若已注册 `edr_fl_register_feature_lookup` 且命中样本则写库中向量；未注册或未命中时写全零并保持 `AVE_OK`（C0 兼容）。
- * 显式未命中（回调返回「未找到」）时返回 `AVE_ERR_FL_SAMPLE_NOT_FOUND`。
+ * Legacy compatibility: export a deterministic zero 512-float vector.
+ * Endpoint product builds do not read local FL sample stores.
  */
 AVE_EXPORT int AVE_CALL AVE_ExportFeatureVector(const char *sha256, float *out_512d);
 
-/** static 联邦特征默认维度（与 static ONNX 嵌入一致） */
+/** Legacy feature vector dimension kept for SDK ABI compatibility. */
 #define AVE_FL_FEATURE_DIM_STATIC 512u
-/** behavior：与《11_behavior.onnx详细设计》§6.1 **CLS Token** 表征维 **256** 一致（联邦导出默认） */
+/** Legacy behavior feature dimension kept for SDK ABI compatibility. */
 #define AVE_FL_FEATURE_DIM_BEHAVIOR_DEFAULT 256u
-/** 行为序列长度（`features` 张量 `seq_len`，与 §6.1 输入 shape `(1,128,64)` 一致；非 FL 向量维数） */
+/** Behavior feature sequence length retained for compatibility and server-side analysis. */
 #define AVE_FL_BEHAVIOR_SEQ_LEN 128u
 #define AVE_FL_FEATURE_DIM_MAX 4096u
 
 /**
- * C7：按目标与维度导出特征；`target` 使用 `EDR_FL_TARGET_*`（见 `fl_feature_provider.h`）。
+ * Legacy compatibility: writes a zero vector for the requested dimension.
  */
 AVE_EXPORT int AVE_CALL AVE_ExportFeatureVectorEx(const char *sha256, float *out, size_t dim, int target);
 
@@ -365,8 +407,8 @@ AVE_EXPORT int AVE_CALL AVE_ExportFeatureVectorEx(const char *sha256, float *out
 AVE_EXPORT int AVE_CALL AVE_ExportModelWeights(const char *target, void *buf, size_t *size);
 
 /**
- * 《11》§9.4：**张量级**导出可联邦训练的 **FP32** 初始值（从 **behavior.onnx** 解析 initializer，排除战术头相关张量）。
- * 与 **`AVE_ExportModelWeights("behavior",…)`**（整文件字节）**并存**；平台按任务选择其一。
+ * Legacy compatibility: endpoint product builds return `AVE_ERR_NOT_IMPL`.
+ * Historical builds used this for behavior.onnx trainable tensor export.
  * `out == NULL`：`*out_nelem` ← 所需 float 元素数；`manifest_json` 若非空则写入 JSON 切片说明（`cap` 含 NUL）。
  * `out != NULL`：`*out_nelem` 入参为缓冲可容元素数，成功时回写实际写入数。
  */

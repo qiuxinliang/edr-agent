@@ -27,6 +27,8 @@
 #define AS_INV_ACCOUNTS_MAX 128
 #define AS_INV_GROUPS_MAX 64
 #define AS_INV_SHARES_MAX 64
+#define AS_INV_BROWSER_MAX 128
+#define AS_INV_SOFTWARE_MAX 256
 
 #if defined(__GNUC__) || defined(__clang__)
 #define AS_INV_UNUSED __attribute__((unused))
@@ -263,11 +265,12 @@ static void wstr_to_utf8(const wchar_t *w, char *out, size_t cap) {
 }
 
 static void emit_windows_accounts_groups(FILE *f, EdrAsurfInventorySummary *s) {
-  DWORD level = 1, pref = MAX_PREFERRED_LENGTH, entries = 0, total = 0, resume = 0;
+  DWORD level = 1, pref = MAX_PREFERRED_LENGTH, entries = 0, total = 0, user_resume = 0;
   LPUSER_INFO_1 users = NULL;
   int emitted = 0, trunc = 0;
   fprintf(f, "\"localAccounts\":{\"items\":[");
-  if (NetUserEnum(NULL, level, FILTER_NORMAL_ACCOUNT, (LPBYTE *)&users, pref, &entries, &total, &resume) == NERR_Success && users) {
+  if (NetUserEnum(NULL, level, FILTER_NORMAL_ACCOUNT, (LPBYTE *)&users, pref, &entries, &total,
+                  &user_resume) == NERR_Success && users) {
     for (DWORD i = 0; i < entries; i++) {
       char name[256];
       int disabled = (users[i].usri1_flags & UF_ACCOUNTDISABLE) != 0;
@@ -287,10 +290,12 @@ static void emit_windows_accounts_groups(FILE *f, EdrAsurfInventorySummary *s) {
   fprintf(f, "],\"truncated\":%s},", trunc ? "true" : "false");
 
   LOCALGROUP_INFO_0 *groups = NULL;
-  entries = total = resume = 0;
+  DWORD_PTR group_resume = 0;
+  entries = total = 0;
   emitted = 0; trunc = 0;
   fprintf(f, "\"localGroups\":{\"items\":[");
-  if (NetLocalGroupEnum(NULL, 0, (LPBYTE *)&groups, pref, &entries, &total, &resume) == NERR_Success && groups) {
+  if (NetLocalGroupEnum(NULL, 0, (LPBYTE *)&groups, pref, &entries, &total,
+                        &group_resume) == NERR_Success && groups) {
     for (DWORD i = 0; i < entries; i++) {
       char name[256];
       int priv;
@@ -335,7 +340,100 @@ static void emit_windows_shares(FILE *f, EdrAsurfInventorySummary *s) {
     NetApiBufferFree(shares);
   }
   s->share_count = emitted;
-  fprintf(f, "],\"truncated\":%s}", trunc ? "true" : "false");
+  fprintf(f, "],\"truncated\":%s},", trunc ? "true" : "false");
+}
+
+static void emit_windows_browser_extensions(FILE *f, EdrAsurfInventorySummary *s) {
+  const char *local = getenv("LOCALAPPDATA");
+  const char *browsers[][2] = {{"chrome", "Google\\Chrome\\User Data"}, {"edge", "Microsoft\\Edge\\User Data"}};
+  int emitted = 0, truncated = 0;
+  fprintf(f, "\"browserExtensions\":{\"items\":[");
+  if (local && local[0]) {
+    for (size_t bi = 0; bi < sizeof(browsers) / sizeof(browsers[0]) && !truncated; ++bi) {
+      char profiles[MAX_PATH], pattern[MAX_PATH];
+      WIN32_FIND_DATAA profile_fd;
+      snprintf(profiles, sizeof(profiles), "%s\\%s", local, browsers[bi][1]);
+      snprintf(pattern, sizeof(pattern), "%s\\*", profiles);
+      HANDLE profiles_h = FindFirstFileA(pattern, &profile_fd);
+      if (profiles_h == INVALID_HANDLE_VALUE) continue;
+      do {
+        if (!(profile_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || profile_fd.cFileName[0] == '.') continue;
+        char ext_root[MAX_PATH], ext_pattern[MAX_PATH];
+        WIN32_FIND_DATAA ext_fd;
+        snprintf(ext_root, sizeof(ext_root), "%s\\%s\\Extensions", profiles, profile_fd.cFileName);
+        snprintf(ext_pattern, sizeof(ext_pattern), "%s\\*", ext_root);
+        HANDLE ext_h = FindFirstFileA(ext_pattern, &ext_fd);
+        if (ext_h == INVALID_HANDLE_VALUE) continue;
+        do {
+          if (!(ext_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || ext_fd.cFileName[0] == '.') continue;
+          if (emitted >= AS_INV_BROWSER_MAX) { truncated = 1; break; }
+          if (emitted) fputc(',', f);
+          char path[MAX_PATH];
+          snprintf(path, sizeof(path), "%s\\%s", ext_root, ext_fd.cFileName);
+          fprintf(f, "{\"id\":"); inv_json_escape(f, ext_fd.cFileName);
+          fprintf(f, ",\"browser\":"); inv_json_escape(f, browsers[bi][0]);
+          fprintf(f, ",\"profile\":"); inv_json_escape(f, profile_fd.cFileName);
+          fprintf(f, ",\"path\":"); inv_json_escape(f, path);
+          fprintf(f, ",\"enabled\":true}");
+          emitted++;
+        } while (FindNextFileA(ext_h, &ext_fd));
+        FindClose(ext_h);
+      } while (FindNextFileA(profiles_h, &profile_fd) && !truncated);
+      FindClose(profiles_h);
+    }
+  }
+  s->browser_extension_count = emitted;
+  fprintf(f, "],\"truncated\":%s},", truncated ? "true" : "false");
+}
+
+static int win_reg_string(HKEY key, const char *name, char *out, size_t cap) {
+  DWORD type = 0, bytes = (DWORD)cap;
+  if (!out || cap == 0u) return 0;
+  out[0] = 0;
+  if (RegQueryValueExA(key, name, NULL, &type, (LPBYTE)out, &bytes) != ERROR_SUCCESS ||
+      (type != REG_SZ && type != REG_EXPAND_SZ)) return 0;
+  out[cap - 1u] = 0;
+  return out[0] != 0;
+}
+
+static void emit_windows_software_key(FILE *f, HKEY root, const char *path, REGSAM view,
+                                      int *emitted, int *truncated) {
+  HKEY uninstall = NULL;
+  if (RegOpenKeyExA(root, path, 0, KEY_READ | view, &uninstall) != ERROR_SUCCESS) return;
+  for (DWORD index = 0; !*truncated; ++index) {
+    char key_name[256];
+    DWORD key_len = sizeof(key_name);
+    if (RegEnumKeyExA(uninstall, index, key_name, &key_len, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+    HKEY app = NULL;
+    if (RegOpenKeyExA(uninstall, key_name, 0, KEY_READ | view, &app) != ERROR_SUCCESS) continue;
+    char name[512], version[256], publisher[256], location[768];
+    if (!win_reg_string(app, "DisplayName", name, sizeof(name))) { RegCloseKey(app); continue; }
+    (void)win_reg_string(app, "DisplayVersion", version, sizeof(version));
+    (void)win_reg_string(app, "Publisher", publisher, sizeof(publisher));
+    (void)win_reg_string(app, "InstallLocation", location, sizeof(location));
+    if (*emitted >= AS_INV_SOFTWARE_MAX) { *truncated = 1; RegCloseKey(app); break; }
+    if (*emitted) fputc(',', f);
+    fprintf(f, "{\"id\":"); inv_json_escape(f, key_name);
+    fprintf(f, ",\"name\":"); inv_json_escape(f, name);
+    fprintf(f, ",\"version\":"); inv_json_escape(f, version);
+    fprintf(f, ",\"publisher\":"); inv_json_escape(f, publisher);
+    fprintf(f, ",\"installLocation\":"); inv_json_escape(f, location);
+    fprintf(f, "}");
+    (*emitted)++;
+    RegCloseKey(app);
+  }
+  RegCloseKey(uninstall);
+}
+
+static void emit_windows_installed_software(FILE *f, EdrAsurfInventorySummary *s) {
+  const char *path = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+  int emitted = 0, truncated = 0;
+  fprintf(f, "\"installedSoftware\":{\"items\":[");
+  emit_windows_software_key(f, HKEY_LOCAL_MACHINE, path, KEY_WOW64_64KEY, &emitted, &truncated);
+  emit_windows_software_key(f, HKEY_LOCAL_MACHINE, path, KEY_WOW64_32KEY, &emitted, &truncated);
+  emit_windows_software_key(f, HKEY_CURRENT_USER, path, 0, &emitted, &truncated);
+  s->installed_software_count = emitted;
+  fprintf(f, "],\"truncated\":%s}", truncated ? "true" : "false");
 }
 
 #else
@@ -526,11 +624,11 @@ static void emit_linux_shares(FILE *f, EdrAsurfInventorySummary *s) {
     emitted++;
   }
   s->share_count = emitted;
-  fprintf(f, "],\"truncated\":false}");
+  fprintf(f, "],\"truncated\":false},");
 }
 #endif
 
-void edr_asurf_inventory_write_json(FILE *f, int listeners_only, EdrAsurfInventorySummary *summary) {
+void edr_asurf_inventory_write_json(FILE *f, const EdrConfig *cfg, int listeners_only, EdrAsurfInventorySummary *summary) {
   EdrAsurfInventorySummary zero;
   if (!summary) summary = &zero;
   memset(summary, 0, sizeof(*summary));
@@ -540,20 +638,30 @@ void edr_asurf_inventory_write_json(FILE *f, int listeners_only, EdrAsurfInvento
     fprintf(f, "\"startupItems\":{\"items\":[],\"truncated\":false},");
     fprintf(f, "\"localAccounts\":{\"items\":[],\"truncated\":false},");
     fprintf(f, "\"localGroups\":{\"items\":[],\"truncated\":false},");
-    fprintf(f, "\"shares\":{\"items\":[],\"truncated\":false}");
+    fprintf(f, "\"shares\":{\"items\":[],\"truncated\":false},");
+    fprintf(f, "\"browserExtensions\":{\"items\":[],\"truncated\":false},");
+    fprintf(f, "\"installedSoftware\":{\"items\":[],\"truncated\":false}");
     return;
   }
 #ifdef _WIN32
-  emit_windows_services(f, summary);
-  emit_windows_tasks(f, summary);
-  emit_windows_startup(f, summary);
-  emit_windows_accounts_groups(f, summary);
-  emit_windows_shares(f, summary);
+  if (!cfg || cfg->attack_surface.services_enabled) { emit_windows_services(f, summary); emit_windows_tasks(f, summary); emit_windows_startup(f, summary); }
+  else fprintf(f, "\"services\":{\"items\":[],\"truncated\":false},\"scheduledTasks\":{\"items\":[],\"truncated\":false},\"startupItems\":{\"items\":[],\"truncated\":false},");
+  if (!cfg || cfg->attack_surface.local_admins_enabled) emit_windows_accounts_groups(f, summary);
+  else fprintf(f, "\"localAccounts\":{\"items\":[],\"truncated\":false},\"localGroups\":{\"items\":[],\"truncated\":false},");
+  if (!cfg || cfg->attack_surface.shares_enabled) emit_windows_shares(f, summary);
+  else fprintf(f, "\"shares\":{\"items\":[],\"truncated\":false},");
+  if (!cfg || cfg->attack_surface.browser_enabled) emit_windows_browser_extensions(f, summary);
+  else fprintf(f, "\"browserExtensions\":{\"items\":[],\"truncated\":false},");
+  if (!cfg || cfg->attack_surface.software_enabled) emit_windows_installed_software(f, summary);
+  else fprintf(f, "\"installedSoftware\":{\"items\":[],\"truncated\":false}");
 #else
-  emit_linux_services(f, summary);
-  emit_linux_cron_tasks(f, summary);
-  emit_linux_startup(f, summary);
-  emit_linux_accounts_groups(f, summary);
-  emit_linux_shares(f, summary);
+  if (!cfg || cfg->attack_surface.services_enabled) { emit_linux_services(f, summary); emit_linux_cron_tasks(f, summary); emit_linux_startup(f, summary); }
+  else fprintf(f, "\"services\":{\"items\":[],\"truncated\":false},\"scheduledTasks\":{\"items\":[],\"truncated\":false},\"startupItems\":{\"items\":[],\"truncated\":false},");
+  if (!cfg || cfg->attack_surface.local_admins_enabled) emit_linux_accounts_groups(f, summary);
+  else fprintf(f, "\"localAccounts\":{\"items\":[],\"truncated\":false},\"localGroups\":{\"items\":[],\"truncated\":false},");
+  if (!cfg || cfg->attack_surface.shares_enabled) emit_linux_shares(f, summary);
+  else fprintf(f, "\"shares\":{\"items\":[],\"truncated\":false},");
+  fprintf(f, "\"browserExtensions\":{\"items\":[],\"truncated\":false},");
+  fprintf(f, "\"installedSoftware\":{\"items\":[],\"truncated\":false}");
 #endif
 }

@@ -99,6 +99,18 @@ static void system_exe_path(wchar_t *out, size_t cap, const wchar_t *name) {
   out[cap - 1] = 0;
 }
 
+static void windows_powershell_path(wchar_t *out, size_t cap) {
+  if (!out || cap == 0) return;
+  wchar_t windows_dir[MAX_PATH];
+  UINT n = GetWindowsDirectoryW(windows_dir, (UINT)(sizeof(windows_dir) / sizeof(windows_dir[0])));
+  if (n == 0 || n >= (sizeof(windows_dir) / sizeof(windows_dir[0]))) {
+    _snwprintf(out, cap, L"powershell.exe");
+  } else {
+    _snwprintf(out, cap, L"%ls\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", windows_dir);
+  }
+  out[cap - 1] = 0;
+}
+
 static void quote_arg(wchar_t *out, size_t cap, const wchar_t *value) {
   if (!out || cap == 0) return;
   size_t pos = 0;
@@ -174,6 +186,39 @@ static int read_toml_scalar(const wchar_t *path, const char *key, wchar_t *out, 
   return 0;
 }
 
+static void trim_wide_trailing_slashes(wchar_t *s) {
+  if (!s) return;
+  size_t n = wcslen(s);
+  while (n > 0 && (s[n - 1] == L'/' || s[n - 1] == L'\\')) {
+    s[--n] = 0;
+  }
+}
+
+static const wchar_t *collector_arch_token(void) {
+#if defined(_M_ARM64) || defined(__aarch64__)
+  return L"arm64";
+#else
+  return L"amd64";
+#endif
+}
+
+static int build_forensic_manifest_url(wchar_t *out, size_t cap, const wchar_t *rest_base,
+                                       const wchar_t *kind) {
+  if (!out || cap == 0) return 0;
+  out[0] = 0;
+  if (!rest_base || !rest_base[0] || !kind || !kind[0]) return 0;
+  wchar_t base[1024];
+  _snwprintf(base, sizeof(base) / sizeof(base[0]), L"%ls", rest_base);
+  base[(sizeof(base) / sizeof(base[0])) - 1] = 0;
+  trim_wide_trailing_slashes(base);
+  if (!base[0]) return 0;
+  int n = _snwprintf(out, cap,
+                     L"%ls/agent/forensic-collector/manifest?kind=%ls&os=windows&arch=%ls",
+                     base, kind, collector_arch_token());
+  out[cap - 1] = 0;
+  return n > 0 && (size_t)n < cap;
+}
+
 static void sanitize_thumbprint(const wchar_t *in, wchar_t *out, size_t cap) {
   if (!out || cap == 0) return;
   size_t pos = 0;
@@ -206,9 +251,38 @@ static int run_process_wait(const wchar_t *exe_path, const wchar_t *args, const 
   si.cb = sizeof(si);
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
-  BOOL ok = CreateProcessW(exe_path, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, work_dir, &si, &pi);
+
+  SECURITY_ATTRIBUTES sa;
+  ZeroMemory(&sa, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  HANDLE child_log = INVALID_HANDLE_VALUE;
+  HANDLE child_stdin = INVALID_HANDLE_VALUE;
+  if (log_path && log_path[0]) {
+    child_log = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    child_stdin = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (child_log != INVALID_HANDLE_VALUE && child_stdin != INVALID_HANDLE_VALUE) {
+      si.dwFlags |= STARTF_USESTDHANDLES;
+      si.hStdInput = child_stdin;
+      si.hStdOutput = child_log;
+      si.hStdError = child_log;
+    } else {
+      if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
+      if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
+      child_log = INVALID_HANDLE_VALUE;
+      child_stdin = INVALID_HANDLE_VALUE;
+    }
+  }
+
+  BOOL inherit_handles = child_log != INVALID_HANDLE_VALUE;
+  BOOL ok = CreateProcessW(exe_path, cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW, NULL, work_dir, &si, &pi);
   if (!ok) {
-    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_failed gle=%lu exe=%ls", GetLastError(), exe_path);
+    DWORD create_error = GetLastError();
+    if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
+    if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
+    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_failed gle=%lu exe=%ls", create_error, exe_path);
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
     append_log_utf8(log_path, line);
     return 9001;
@@ -221,6 +295,8 @@ static int run_process_wait(const wchar_t *exe_path, const wchar_t *args, const 
   } else {
     GetExitCodeProcess(pi.hProcess, &exit_code);
   }
+  if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
+  if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
   _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_exit code=%lu", exit_code);
   line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
   append_log_utf8(log_path, line);
@@ -233,7 +309,34 @@ static void delete_file_if_exists(const wchar_t *path, const wchar_t *log_path) 
   if (!path || !path[0]) return;
   DWORD attr = GetFileAttributesW(path);
   if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
-  if (!DeleteFileW(path)) {
+  if (DeleteFileW(path)) return;
+
+  DWORD first_error = GetLastError();
+  if (first_error == ERROR_ACCESS_DENIED) {
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileW(path)) {
+      append_log_utf8(log_path, L"delete_recovered_after_attribute_reset");
+      return;
+    }
+
+    wchar_t takeown[MAX_PATH * 2], icacls[MAX_PATH * 2], qpath[MAX_PATH * 4], args[MAX_PATH * 6];
+    system_exe_path(takeown, sizeof(takeown) / sizeof(takeown[0]), L"takeown.exe");
+    system_exe_path(icacls, sizeof(icacls) / sizeof(icacls[0]), L"icacls.exe");
+    quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), path);
+    _snwprintf(args, sizeof(args) / sizeof(args[0]), L"/F %ls /A", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    (void)run_process_wait(takeown, args, NULL, log_path, 30000);
+    _snwprintf(args, sizeof(args) / sizeof(args[0]),
+               L"%ls /inheritance:r /grant:r \"*S-1-5-18:F\" /grant:r \"*S-1-5-32-544:F\" /C /Q", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    (void)run_process_wait(icacls, args, NULL, log_path, 30000);
+    if (DeleteFileW(path)) {
+      append_log_utf8(log_path, L"delete_recovered_after_acl_reset");
+      return;
+    }
+  }
+
+  {
     wchar_t line[2048];
     _snwprintf(line, sizeof(line) / sizeof(line[0]), L"delete_failed path=%ls gle=%lu", path, GetLastError());
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
@@ -291,6 +394,8 @@ static int stop_service_by_name(const wchar_t *service_name, const wchar_t *log_
   return 1;
 }
 
+static int process_running_by_name(const wchar_t *image_name);
+
 static int start_service_by_name(const wchar_t *service_name, const wchar_t *log_path) {
   SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
   if (!scm) return 2;
@@ -299,7 +404,18 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
     CloseServiceHandle(scm);
     return 3;
   }
-  StartServiceW(svc, 0, NULL);
+  BOOL start_ok = StartServiceW(svc, 0, NULL);
+  DWORD start_error = start_ok ? ERROR_SUCCESS : GetLastError();
+  if (!start_ok && start_error != ERROR_SERVICE_ALREADY_RUNNING) {
+    wchar_t line[512];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"start_service_failed name=%ls gle=%lu", service_name,
+               start_error);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return 4;
+  }
   SERVICE_STATUS_PROCESS ssp;
   DWORD bytes = 0;
   int ok = 0;
@@ -311,14 +427,25 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
       break;
     }
   }
+  int process_ok = 0;
+  if (ok) {
+    for (int i = 0; i < 40; ++i) {
+      if (process_running_by_name(L"FDSensor.exe")) {
+        process_ok = 1;
+        break;
+      }
+      Sleep(250);
+    }
+  }
   wchar_t line[512];
-  _snwprintf(line, sizeof(line) / sizeof(line[0]), L"start_service name=%ls ok=%d gle=%lu", service_name, ok,
-             GetLastError());
+  _snwprintf(line, sizeof(line) / sizeof(line[0]),
+             L"start_service name=%ls service_running=%d process_running=%d start_gle=%lu", service_name, ok,
+             process_ok, start_error);
   line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
   append_log_utf8(log_path, line);
   CloseServiceHandle(svc);
   CloseServiceHandle(scm);
-  return ok ? 0 : 4;
+  return (ok && process_ok) ? 0 : 5;
 }
 
 static int service_running_by_name(const wchar_t *service_name) {
@@ -405,6 +532,10 @@ static int process_running_by_name(const wchar_t *image_name) {
 
 static int stage_stop_runtime(const wchar_t *install_dir, const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=stop-runtime begin");
+  wchar_t schtasks[MAX_PATH * 2];
+  system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
+  (void)run_process_wait(schtasks, L"/End /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
+  (void)run_process_wait(schtasks, L"/End /TN \"EdrAgent\"", install_dir, log_path, 30000);
   stop_service_by_name(DEFAULT_SERVICE_NAME, log_path);
   stop_service_by_name(L"EdrAgent", log_path);
   stop_process_by_name(L"FDSensor.exe", log_path);
@@ -480,7 +611,7 @@ static void broadcast_env_changed(void) {
 
 static void ensure_runtime_dirs(const wchar_t *install_dir, const wchar_t *log_path) {
   const wchar_t *dirs[] = {L"certs", L"queue", L"evidence", L"state", L"logs", L"diagnostics",
-                           L"upload_outbox", L"forensic", L"isolation", NULL};
+                           L"upload_outbox", L"forensic", L"collector", L"isolation", NULL};
   wchar_t path[MAX_PATH * 2];
   for (int i = 0; dirs[i]; ++i) {
     join_path(path, sizeof(path) / sizeof(path[0]), install_dir, dirs[i]);
@@ -494,6 +625,12 @@ static int run_icacls(const wchar_t *args, const wchar_t *install_dir, const wch
   return run_process_wait(exe, args, install_dir, log_path, 30000);
 }
 
+static int run_takeown(const wchar_t *args, const wchar_t *install_dir, const wchar_t *log_path) {
+  wchar_t exe[MAX_PATH * 2];
+  system_exe_path(exe, sizeof(exe) / sizeof(exe[0]), L"takeown.exe");
+  return run_process_wait(exe, args, install_dir, log_path, 30000);
+}
+
 static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=harden-acl begin");
   ensure_runtime_dirs(install_dir, log_path);
@@ -504,18 +641,32 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
              L"%ls /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /grant:r \"*S-1-5-32-545:(OI)(CI)RX\" /C /Q",
              qdir);
   args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-  run_icacls(args, install_dir, log_path);
+  (void)run_icacls(args, install_dir, log_path);
 
   const wchar_t *sensitive_dirs[] = {L"certs", L"queue", L"evidence", L"state", L"logs", L"diagnostics",
-                                     L"upload_outbox", L"forensic", L"isolation", NULL};
+                                     L"upload_outbox", L"forensic", L"collector", L"isolation", NULL};
   for (int i = 0; sensitive_dirs[i]; ++i) {
     join_path(path, sizeof(path) / sizeof(path[0]), install_dir, sensitive_dirs[i]);
     quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), path);
+    _snwprintf(args, sizeof(args) / sizeof(args[0]), L"/F %ls /A /R /D Y", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    (void)run_takeown(args, install_dir, log_path);
     _snwprintf(args, sizeof(args) / sizeof(args[0]),
                L"%ls /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /T /C /Q",
                qpath);
     args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-    run_icacls(args, install_dir, log_path);
+    int acl_rc = run_icacls(args, install_dir, log_path);
+    if (_wcsicmp(sensitive_dirs[i], L"queue") == 0 && acl_rc != 0) {
+      append_log_utf8(log_path, L"queue_acl_repair_failed");
+      return 52;
+    }
+  }
+
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"queue\\edr_queue.db.lock");
+  delete_file_if_exists(path, log_path);
+  if (file_exists(path)) {
+    append_log_utf8(log_path, L"stale_queue_lock_remove_failed");
+    return 53;
   }
 
   const struct {
@@ -551,12 +702,34 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
   return 0;
 }
 
-static void set_runtime_env(const wchar_t *install_dir, const wchar_t *log_path) {
-  wchar_t path[MAX_PATH * 2];
+static void set_runtime_env(const wchar_t *install_dir, const wchar_t *config_path, const wchar_t *log_path) {
+  wchar_t path[MAX_PATH * 2], rest_base[1024], url[1400];
   set_machine_env(L"EDR_UPLOAD_FILE_RETRIES", L"3", log_path);
   set_machine_env(L"EDR_UPLOAD_FILE_RETRY_BACKOFF_MS", L"750", log_path);
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"forensic");
   set_machine_env(L"EDR_FORENSIC_OUT", path, log_path);
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR", L"1", log_path);
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\forensic_collector.exe");
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR_BIN", path, log_path);
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\forensic_collector_builtin.exe");
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", path, log_path);
+  join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\velociraptor.exe");
+  set_machine_env(L"EDR_VELOCIRAPTOR_BIN", path, log_path);
+  set_machine_env(L"EDR_FORENSIC_VERSION_CHECK_SEC", L"60", log_path);
+  set_machine_env(L"EDR_FORENSIC_COLLECTOR_AUTOFETCH", L"1", log_path);
+  rest_base[0] = 0;
+  if (read_toml_scalar(config_path, "rest_base_url", rest_base, sizeof(rest_base) / sizeof(rest_base[0]))) {
+    trim_wide_trailing_slashes(rest_base);
+    if (build_forensic_manifest_url(url, sizeof(url) / sizeof(url[0]), rest_base, L"adapter")) {
+      set_machine_env(L"EDR_FORENSIC_ADAPTER_MANIFEST_URL", url, log_path);
+    }
+    if (build_forensic_manifest_url(url, sizeof(url) / sizeof(url[0]), rest_base, L"velociraptor")) {
+      set_machine_env(L"EDR_FORENSIC_COLLECTOR_MANIFEST_URL", url, log_path);
+    }
+    append_log_utf8(log_path, L"forensic_manifest_env_configured");
+  } else {
+    append_log_utf8(log_path, L"forensic_manifest_env_skipped rest_base_url_missing");
+  }
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"logs\\command_audit.log");
   set_machine_env(L"EDR_CMD_AUDIT_PATH", path, log_path);
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"FDSensor.pid");
@@ -568,6 +741,10 @@ static void set_runtime_env(const wchar_t *install_dir, const wchar_t *log_path)
 
 static void clear_runtime_env(const wchar_t *log_path) {
   const wchar_t *names[] = {L"EDR_UPLOAD_FILE_RETRIES", L"EDR_UPLOAD_FILE_RETRY_BACKOFF_MS", L"EDR_FORENSIC_OUT",
+                            L"EDR_FORENSIC_COLLECTOR", L"EDR_FORENSIC_COLLECTOR_BIN",
+                            L"EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", L"EDR_VELOCIRAPTOR_BIN",
+                            L"EDR_FORENSIC_VERSION_CHECK_SEC", L"EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+                            L"EDR_FORENSIC_ADAPTER_MANIFEST_URL", L"EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
                             L"EDR_CMD_AUDIT_PATH", L"EDR_SELF_PROTECT_PIDFILE", L"EDR_ISOLATE_STAMP_PATH",
                             L"EDR_GRPC_REQUIRE_MTLS", L"EDR_ISOLATE_HOOK", L"EDR_CMD_ENABLED", NULL};
   for (int i = 0; names[i]; ++i) set_machine_env(names[i], L"", log_path);
@@ -683,8 +860,9 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
     return 31;
   }
   ensure_runtime_dirs(install_dir, log_path);
-  stage_harden_acl(install_dir, log_path);
-  set_runtime_env(install_dir, log_path);
+  int acl_rc = stage_harden_acl(install_dir, log_path);
+  if (acl_rc != 0) return acl_rc;
+  set_runtime_env(install_dir, config_path, log_path);
   delete_service_by_name(L"EdrAgent", log_path);
 
   wchar_t qexe[MAX_PATH * 2], qcfg[MAX_PATH * 2], qsvc[256], bin_path[4096];
@@ -703,8 +881,17 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
 
   SC_HANDLE svc = OpenServiceW(scm, service_name, SERVICE_ALL_ACCESS);
   if (svc) {
-    ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin_path, NULL,
-                         NULL, NULL, NULL, NULL, display_name);
+    if (!ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin_path,
+                              NULL, NULL, NULL, NULL, NULL, display_name)) {
+      DWORD gle = GetLastError();
+      wchar_t line[512];
+      _snwprintf(line, sizeof(line) / sizeof(line[0]), L"change_service_config_failed gle=%lu", gle);
+      line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+      append_log_utf8(log_path, line);
+      CloseServiceHandle(svc);
+      CloseServiceHandle(scm);
+      return 34;
+    }
     append_log_utf8(log_path, L"service_existing_reconfigured");
   } else {
     svc = CreateServiceW(scm, service_name, display_name, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
@@ -723,7 +910,9 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
 
   SERVICE_DESCRIPTIONW desc;
   desc.lpDescription = L"FDSecurity endpoint sensor";
-  ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+  if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc)) {
+    append_log_utf8(log_path, L"service_description_config_warning");
+  }
   SC_ACTION actions[2];
   actions[0].Type = SC_ACTION_RESTART;
   actions[0].Delay = 60000;
@@ -734,7 +923,16 @@ static int stage_install_service(const wchar_t *install_dir, const wchar_t *exe_
   failure.dwResetPeriod = 86400;
   failure.cActions = 2;
   failure.lpsaActions = actions;
-  ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+  if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure)) {
+    DWORD gle = GetLastError();
+    wchar_t line[512];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]), L"service_failure_actions_config_failed gle=%lu", gle);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return 35;
+  }
 
   CloseServiceHandle(svc);
   CloseServiceHandle(scm);
@@ -754,28 +952,53 @@ static int stage_install_autorun(const wchar_t *install_dir, const wchar_t *exe_
     return 41;
   }
   ensure_runtime_dirs(install_dir, log_path);
-  stage_harden_acl(install_dir, log_path);
-  set_runtime_env(install_dir, log_path);
+  int acl_rc = stage_harden_acl(install_dir, log_path);
+  if (acl_rc != 0) return acl_rc;
+  set_runtime_env(install_dir, config_path, log_path);
 
-  wchar_t schtasks[MAX_PATH * 2], qtn[256], qtr[4096], qexe[MAX_PATH * 2], qcfg[MAX_PATH * 2], task_run[4096];
-  system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
-  run_process_wait(schtasks, L"/Delete /F /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
-  run_process_wait(schtasks, L"/Delete /F /TN \"EdrAgent\"", install_dir, log_path, 30000);
-  quote_arg(qtn, sizeof(qtn) / sizeof(qtn[0]), L"FDSecurityAgent");
-  quote_arg(qexe, sizeof(qexe) / sizeof(qexe[0]), exe_path);
-  quote_arg(qcfg, sizeof(qcfg) / sizeof(qcfg[0]), config_path);
-  _snwprintf(task_run, sizeof(task_run) / sizeof(task_run[0]), L"%ls --config %ls", qexe, qcfg);
-  task_run[(sizeof(task_run) / sizeof(task_run[0])) - 1] = 0;
-  quote_arg(qtr, sizeof(qtr) / sizeof(qtr[0]), task_run);
-
-  wchar_t args[8192];
+  wchar_t script[MAX_PATH * 2], powershell[MAX_PATH * 2], qscript[MAX_PATH * 4], args[8192];
+  join_path(script, sizeof(script) / sizeof(script[0]), install_dir, L"edr_windows_autorun.ps1");
+  if (!file_exists(script)) {
+    log_msg(log_path, L"autorun_script_missing path=", script);
+    return 42;
+  }
+  windows_powershell_path(powershell, sizeof(powershell) / sizeof(powershell[0]));
+  quote_arg(qscript, sizeof(qscript) / sizeof(qscript[0]), script);
   _snwprintf(args, sizeof(args) / sizeof(args[0]),
-             L"/Create /F /TN %ls /SC ONSTART /RU SYSTEM /RL HIGHEST /TR %ls", qtn, qtr);
+             L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File %ls -Action Install -NoStart -HardenAcl",
+             qscript);
   args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-  int rc = run_process_wait(schtasks, args, install_dir, log_path, 30000);
-  if (rc != 0) return 42;
+  int rc = run_process_wait(powershell, args, install_dir, log_path, 120000);
+  if (rc != 0) return 43;
   append_log_utf8(log_path, L"stage=install-autorun ok");
   return 0;
+}
+
+static int stage_start_autorun(const wchar_t *install_dir, const wchar_t *log_path) {
+  append_log_utf8(log_path, L"stage=start-autorun begin");
+  if (process_running_by_name(L"FDSensor.exe")) {
+    append_log_utf8(log_path, L"stage=start-autorun ok already_running=1");
+    return 0;
+  }
+
+  wchar_t schtasks[MAX_PATH * 2];
+  system_exe_path(schtasks, sizeof(schtasks) / sizeof(schtasks[0]), L"schtasks.exe");
+  int rc = run_process_wait(schtasks, L"/Run /TN \"FDSecurityAgent\"", install_dir, log_path, 30000);
+  if (rc != 0) {
+    append_log_utf8(log_path, L"scheduled_task_start_failed");
+    return 44;
+  }
+
+  for (int i = 0; i < 60; ++i) {
+    Sleep(250);
+    if (process_running_by_name(L"FDSensor.exe")) {
+      append_log_utf8(log_path, L"stage=start-autorun ok process_running=1");
+      return 0;
+    }
+  }
+  (void)run_process_wait(schtasks, L"/Query /TN \"FDSecurityAgent\" /V /FO LIST", install_dir, log_path, 30000);
+  append_log_utf8(log_path, L"scheduled_task_started_without_agent_process");
+  return 45;
 }
 
 static int stage_start_runtime(const wchar_t *install_dir, const wchar_t *exe_path, const wchar_t *config_path,
@@ -964,7 +1187,7 @@ static int stage_write_health_summary(const wchar_t *install_dir, const wchar_t 
 
 static void usage(void) {
   fwprintf(stderr,
-           L"FDSecurityInstallerWorker --stage <stop-runtime|clean-cache|validate-config|harden-acl|install-service|install-autorun|start-runtime|start-service|uninstall-runtime|write-health-summary> "
+           L"FDSecurityInstallerWorker --stage <stop-runtime|clean-cache|validate-config|harden-acl|install-service|install-autorun|start-autorun|start-runtime|start-service|uninstall-runtime|write-health-summary> "
            L"[--install-dir <dir>] [--config <path>] [--exe <path>] [--log <path>] [--report <path>]\n");
 }
 
@@ -1008,6 +1231,8 @@ int main(void) {
     rc = stage_install_service(install_dir, exe_path, config_path, svc, display, log_path);
   } else if (_wcsicmp(stage, L"install-autorun") == 0) {
     rc = stage_install_autorun(install_dir, exe_path, config_path, log_path);
+  } else if (_wcsicmp(stage, L"start-autorun") == 0) {
+    rc = stage_start_autorun(install_dir, log_path);
   } else if (_wcsicmp(stage, L"start-runtime") == 0) {
     rc = stage_start_runtime(install_dir, exe_path, config_path, log_path);
   } else if (_wcsicmp(stage, L"start-service") == 0) {

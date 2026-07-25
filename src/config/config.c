@@ -18,7 +18,283 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r252-086c1be1"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r276-89b04a96"
+
+/*
+ * Some older Windows bootstrap packages wrote paths such as
+ * C:\\Program Files\\FDSecurity\\certs\\ca.pem directly inside a TOML
+ * basic string.  TOML requires those backslashes to be escaped, so tomlc99
+ * correctly rejects the file.  The client keeps this narrowly-scoped
+ * compatibility path for legacy packages: only invalid escapes inside basic
+ * strings are treated as literal backslashes; valid TOML escapes retain their
+ * standard meaning.
+ */
+static int edr_toml_hex_digit(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F');
+}
+
+static int edr_toml_valid_escape(const char *p, size_t remaining, size_t *width) {
+  size_t i;
+  size_t digits;
+  if (!p || remaining < 2u || !width || p[0] != '\\') {
+    return 0;
+  }
+  switch (p[1]) {
+    case 'b':
+    case 't':
+    case 'n':
+    case 'f':
+    case 'r':
+    case '"':
+    case '\\':
+      *width = 2u;
+      return 1;
+    case 'u':
+      digits = 4u;
+      break;
+    case 'U':
+      digits = 8u;
+      break;
+    default:
+      return 0;
+  }
+  if (remaining < 2u + digits) {
+    return 0;
+  }
+  for (i = 0u; i < digits; i++) {
+    if (!edr_toml_hex_digit(p[2u + i])) {
+      return 0;
+    }
+  }
+  *width = 2u + digits;
+  return 1;
+}
+
+static char *edr_toml_repair_legacy_windows_escapes(const char *input, size_t input_len,
+                                                     size_t *output_len, int *changed) {
+  enum {
+    EDR_TOML_OUTSIDE,
+    EDR_TOML_BASIC,
+    EDR_TOML_LITERAL,
+    EDR_TOML_BASIC_MULTI,
+    EDR_TOML_LITERAL_MULTI,
+    EDR_TOML_COMMENT
+  } state = EDR_TOML_OUTSIDE;
+  size_t i = 0u;
+  size_t o = 0u;
+  char *out;
+
+  if (!input || !output_len || !changed || input_len > (SIZE_MAX - 1u) / 2u) {
+    return NULL;
+  }
+  out = (char *)malloc(input_len * 2u + 1u);
+  if (!out) {
+    return NULL;
+  }
+  *changed = 0;
+  while (i < input_len) {
+    const char c = input[i];
+    if (state == EDR_TOML_COMMENT) {
+      out[o++] = c;
+      i++;
+      if (c == '\n') {
+        state = EDR_TOML_OUTSIDE;
+      }
+      continue;
+    }
+    if (state == EDR_TOML_BASIC || state == EDR_TOML_BASIC_MULTI) {
+      if (c == '\\') {
+        size_t width = 0u;
+        if (edr_toml_valid_escape(input + i, input_len - i, &width)) {
+          memcpy(out + o, input + i, width);
+          o += width;
+          i += width;
+        } else {
+          out[o++] = '\\';
+          out[o++] = '\\';
+          i++;
+          *changed = 1;
+        }
+        continue;
+      }
+      if (state == EDR_TOML_BASIC_MULTI && i + 2u < input_len &&
+          input[i] == '"' && input[i + 1u] == '"' && input[i + 2u] == '"') {
+        memcpy(out + o, input + i, 3u);
+        o += 3u;
+        i += 3u;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      if (state == EDR_TOML_BASIC && c == '"') {
+        out[o++] = c;
+        i++;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      out[o++] = c;
+      i++;
+      continue;
+    }
+    if (state == EDR_TOML_LITERAL || state == EDR_TOML_LITERAL_MULTI) {
+      if (state == EDR_TOML_LITERAL_MULTI && i + 2u < input_len &&
+          input[i] == '\'' && input[i + 1u] == '\'' && input[i + 2u] == '\'') {
+        memcpy(out + o, input + i, 3u);
+        o += 3u;
+        i += 3u;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      if (state == EDR_TOML_LITERAL && c == '\'') {
+        out[o++] = c;
+        i++;
+        state = EDR_TOML_OUTSIDE;
+        continue;
+      }
+      out[o++] = c;
+      i++;
+      continue;
+    }
+
+    if (c == '#') {
+      out[o++] = c;
+      i++;
+      state = EDR_TOML_COMMENT;
+    } else if (c == '"' && i + 2u < input_len && input[i + 1u] == '"' &&
+               input[i + 2u] == '"') {
+      memcpy(out + o, input + i, 3u);
+      o += 3u;
+      i += 3u;
+      state = EDR_TOML_BASIC_MULTI;
+    } else if (c == '"') {
+      out[o++] = c;
+      i++;
+      state = EDR_TOML_BASIC;
+    } else if (c == '\'' && i + 2u < input_len && input[i + 1u] == '\'' &&
+               input[i + 2u] == '\'') {
+      memcpy(out + o, input + i, 3u);
+      o += 3u;
+      i += 3u;
+      state = EDR_TOML_LITERAL_MULTI;
+    } else if (c == '\'') {
+      out[o++] = c;
+      i++;
+      state = EDR_TOML_LITERAL;
+    } else {
+      out[o++] = c;
+      i++;
+    }
+  }
+  out[o] = '\0';
+  *output_len = o;
+  return out;
+}
+
+static char *edr_config_read_text(const char *path, size_t *length) {
+  FILE *fp;
+  char *buf;
+  size_t used = 0u;
+  size_t cap = 4096u;
+
+  if (!path || !path[0] || !length) {
+    return NULL;
+  }
+  fp = fopen(path, "rb");
+  if (!fp) {
+    return NULL;
+  }
+  buf = (char *)malloc(cap);
+  if (!buf) {
+    fclose(fp);
+    return NULL;
+  }
+  for (;;) {
+    size_t n = fread(buf + used, 1u, cap - used - 1u, fp);
+    used += n;
+    if (ferror(fp)) {
+      free(buf);
+      fclose(fp);
+      return NULL;
+    }
+    if (n == 0u) {
+      break;
+    }
+    if (used + 1u == cap) {
+      size_t next_cap = cap > SIZE_MAX / 2u ? 0u : cap * 2u;
+      char *next;
+      if (next_cap == 0u) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+      }
+      next = (char *)realloc(buf, next_cap);
+      if (!next) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+      }
+      buf = next;
+      cap = next_cap;
+    }
+  }
+  fclose(fp);
+  buf[used] = '\0';
+  *length = used;
+  return buf;
+}
+
+static toml_table_t *edr_config_parse_file_compat(const char *path, char *errbuf,
+                                                   int errbufsz) {
+  char *raw;
+  char *strict;
+  char *repaired;
+  size_t length = 0u;
+  size_t repaired_length = 0u;
+  int changed = 0;
+  const char *strict_input;
+  const char *repaired_input;
+  toml_table_t *root;
+
+  raw = edr_config_read_text(path, &length);
+  if (!raw) {
+    return NULL;
+  }
+  strict = (char *)malloc(length + 1u);
+  if (!strict) {
+    free(raw);
+    return NULL;
+  }
+  memcpy(strict, raw, length + 1u);
+  strict_input = (length >= 3u && (unsigned char)strict[0] == 0xEFu &&
+                  (unsigned char)strict[1] == 0xBBu && (unsigned char)strict[2] == 0xBFu)
+                     ? strict + 3
+                     : strict;
+  root = toml_parse((char *)strict_input, errbuf, errbufsz);
+  free(strict);
+  if (root) {
+    free(raw);
+    return root;
+  }
+
+  repaired = edr_toml_repair_legacy_windows_escapes(raw, length, &repaired_length, &changed);
+  free(raw);
+  if (!repaired || !changed) {
+    free(repaired);
+    return NULL;
+  }
+  repaired_input = (repaired_length >= 3u && (unsigned char)repaired[0] == 0xEFu &&
+                    (unsigned char)repaired[1] == 0xBBu &&
+                    (unsigned char)repaired[2] == 0xBFu)
+                       ? repaired + 3
+                       : repaired;
+  root = toml_parse((char *)repaired_input, errbuf, errbufsz);
+  if (root) {
+    fprintf(stderr,
+            "[config] accepted legacy TOML backslash escapes; regenerate the installer package\n");
+  }
+  free(repaired);
+  return root;
+}
 
 static const EdrEmitRule kBuiltinPreprocessRules[] = {
     {.name = "r-exec-001_1",
@@ -848,6 +1124,70 @@ static void load_detection_policy(toml_table_t *t, EdrConfig *cfg) {
   load_detection_policy_suppression(t, cfg);
 }
 
+static void load_detection(toml_table_t *t, EdrConfig *cfg) {
+  toml_datum_t b = toml_bool_in(t, "auto_profile");
+  if (b.ok) cfg->detection.auto_profile = b.u.b != 0;
+  toml_datum_t shellcode = toml_int_in(t, "shellcode_mode");
+  if (shellcode.ok && shellcode.u.i >= -1 && shellcode.u.i <= 1) {
+    cfg->detection.shellcode_mode = (int)shellcode.u.i;
+  }
+  toml_datum_t webshell = toml_int_in(t, "webshell_mode");
+  if (webshell.ok && webshell.u.i >= -1 && webshell.u.i <= 1) {
+    cfg->detection.webshell_mode = (int)webshell.u.i;
+  }
+  toml_datum_t pmfe = toml_int_in(t, "pmfe_mode");
+  if (pmfe.ok && pmfe.u.i >= -1 && pmfe.u.i <= 2) {
+    cfg->detection.pmfe_mode = (int)pmfe.u.i;
+  }
+}
+
+static void load_correlation(toml_table_t *t, EdrConfig *cfg) {
+  cfg->correlation.configured = true;
+  toml_datum_t enabled = toml_bool_in(t, "enabled");
+  if (enabled.ok) {
+    cfg->correlation.enabled = enabled.u.b != 0;
+  }
+  toml_datum_t feedback = toml_bool_in(t, "inject_feedback_enabled");
+  if (feedback.ok) {
+    cfg->correlation.inject_feedback_enabled = feedback.u.b != 0;
+  }
+}
+
+static int policy_mode_value(toml_table_t *t, const char *key, int fallback) {
+  toml_datum_t d = toml_string_in(t, key);
+  int mode = fallback;
+  if (!d.ok || !d.u.s) return fallback;
+  if (strcmp(d.u.s, "off") == 0) mode = 0;
+  else if (strcmp(d.u.s, "observe") == 0) mode = 1;
+  else if (strcmp(d.u.s, "alert") == 0) mode = 2;
+  else if (strcmp(d.u.s, "block") == 0) mode = 3;
+  free(d.u.s);
+  return mode;
+}
+
+static void policy_bool_value(toml_table_t *t, const char *key, bool *out) {
+  toml_datum_t d = toml_bool_in(t, key);
+  if (d.ok && out) *out = d.u.b != 0;
+}
+
+static void load_policy_v2(toml_table_t *t, EdrConfig *cfg) {
+  cfg->policy_v2.credential_mode = policy_mode_value(t, "credential_mode", cfg->policy_v2.credential_mode);
+  cfg->policy_v2.lateral_mode = policy_mode_value(t, "lateral_mode", cfg->policy_v2.lateral_mode);
+  cfg->policy_v2.privilege_mode = policy_mode_value(t, "privilege_mode", cfg->policy_v2.privilege_mode);
+  cfg->policy_v2.evasion_mode = policy_mode_value(t, "evasion_mode", cfg->policy_v2.evasion_mode);
+  cfg->policy_v2.persistence_mode = policy_mode_value(t, "persistence_mode", cfg->policy_v2.persistence_mode);
+  cfg->policy_v2.script_mode = policy_mode_value(t, "script_mode", cfg->policy_v2.script_mode);
+  cfg->policy_v2.webshell_mode = policy_mode_value(t, "webshell_mode", cfg->policy_v2.webshell_mode);
+  cfg->policy_v2.exfil_mode = policy_mode_value(t, "exfil_mode", cfg->policy_v2.exfil_mode);
+  cfg->policy_v2.impact_mode = policy_mode_value(t, "impact_mode", cfg->policy_v2.impact_mode);
+  policy_bool_value(t, "ransomware_behavior", &cfg->policy_v2.ransomware_behavior);
+  policy_bool_value(t, "ransomware_mass_write", &cfg->policy_v2.ransomware_mass_write);
+  policy_bool_value(t, "ransomware_vss", &cfg->policy_v2.ransomware_vss);
+  policy_bool_value(t, "ransomware_spread", &cfg->policy_v2.ransomware_spread);
+  policy_bool_value(t, "ransomware_honey", &cfg->policy_v2.ransomware_honey);
+  policy_bool_value(t, "ransomware_forensic", &cfg->policy_v2.ransomware_forensic);
+}
+
 static void config_setenv_if_value(const char *name, const char *value) {
   if (!name || !name[0] || !value || !value[0]) {
     return;
@@ -1209,6 +1549,14 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     }
   }
   {
+    toml_datum_t d = toml_bool_in(t, "pmfe_followup_enabled");
+    if (d.ok) cfg->shellcode_detector.pmfe_followup_enabled = d.u.b ? true : false;
+  }
+  {
+    toml_datum_t d = toml_double_in(t, "pmfe_heuristic_threshold");
+    if (d.ok) cfg->shellcode_detector.pmfe_heuristic_threshold = d.u.d;
+  }
+  {
     toml_datum_t d = toml_int_in(t, "yara_rules_reload_interval_s");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.yara_rules_reload_interval_s = (uint32_t)d.u.i;
@@ -1218,6 +1566,24 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "flow_scan_first_bytes");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.flow_scan_first_bytes = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "reassembly_max_flows");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.reassembly_max_flows = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "reassembly_memory_limit_kb");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.reassembly_memory_limit_kb = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "reassembly_idle_timeout_s");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.reassembly_idle_timeout_s = (uint32_t)d.u.i;
     }
   }
   {
@@ -1236,6 +1602,12 @@ static void load_shellcode_detector(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "windivert_queue_length");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->shellcode_detector.windivert_queue_length = (uint32_t)d.u.i;
+    }
+  }
+  {
+    toml_datum_t d = toml_int_in(t, "scan_queue_capacity");
+    if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
+      cfg->shellcode_detector.scan_queue_capacity = (uint32_t)d.u.i;
     }
   }
   {
@@ -1464,6 +1836,11 @@ static void edr_config_clamp(EdrConfig *cfg) {
   if (cfg->shellcode_detector.heuristic_score_scale > 3.0) {
     cfg->shellcode_detector.heuristic_score_scale = 3.0;
   }
+  if (cfg->shellcode_detector.pmfe_heuristic_threshold < 0.70) {
+    cfg->shellcode_detector.pmfe_heuristic_threshold = 0.70;
+  } else if (cfg->shellcode_detector.pmfe_heuristic_threshold > 1.0) {
+    cfg->shellcode_detector.pmfe_heuristic_threshold = 1.0;
+  }
   if (cfg->shellcode_detector.yara_rules_reload_interval_s > 86400u) {
     cfg->shellcode_detector.yara_rules_reload_interval_s = 86400u;
   }
@@ -1478,6 +1855,26 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->shellcode_detector.detector_threads > 4u) {
     cfg->shellcode_detector.detector_threads = 4u;
+  }
+  if (cfg->shellcode_detector.reassembly_max_flows < 64u) {
+    cfg->shellcode_detector.reassembly_max_flows = 64u;
+  } else if (cfg->shellcode_detector.reassembly_max_flows > 16384u) {
+    cfg->shellcode_detector.reassembly_max_flows = 16384u;
+  }
+  if (cfg->shellcode_detector.reassembly_memory_limit_kb < 1024u) {
+    cfg->shellcode_detector.reassembly_memory_limit_kb = 1024u;
+  } else if (cfg->shellcode_detector.reassembly_memory_limit_kb > 262144u) {
+    cfg->shellcode_detector.reassembly_memory_limit_kb = 262144u;
+  }
+  if (cfg->shellcode_detector.reassembly_idle_timeout_s < 5u) {
+    cfg->shellcode_detector.reassembly_idle_timeout_s = 5u;
+  } else if (cfg->shellcode_detector.reassembly_idle_timeout_s > 600u) {
+    cfg->shellcode_detector.reassembly_idle_timeout_s = 600u;
+  }
+  if (cfg->shellcode_detector.scan_queue_capacity < 32u) {
+    cfg->shellcode_detector.scan_queue_capacity = 32u;
+  } else if (cfg->shellcode_detector.scan_queue_capacity > 4096u) {
+    cfg->shellcode_detector.scan_queue_capacity = 4096u;
   }
   /* P2 #8：WinDivert 队列参数 clamp（0 保留为“用内置默认”，不 clamp）。 */
   if (cfg->shellcode_detector.windivert_queue_length != 0u) {
@@ -1734,15 +2131,15 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   snprintf(cfg->agent.tenant_id, sizeof(cfg->agent.tenant_id), "%s", "tenant_default");
 
   cfg->collection.etw_enabled = true;
-  cfg->collection.etw_dns_client_provider = true;
+  cfg->collection.etw_dns_client_provider = false;
   cfg->collection.etw_powershell_provider = true;
   cfg->collection.etw_amsi_provider = true;
-  cfg->collection.etw_schannel_provider = true;
+  cfg->collection.etw_schannel_provider = false;
   cfg->collection.etw_security_audit_provider = true;
   cfg->collection.etw_wmi_provider = true;
-  cfg->collection.etw_tcpip_provider = true;
-  cfg->collection.etw_firewall_provider = true;
-  cfg->collection.ebpf_enabled = true;
+  cfg->collection.etw_tcpip_provider = false;
+  cfg->collection.etw_firewall_provider = false;
+  cfg->collection.ebpf_enabled = false;
   cfg->collection.auditd_enabled = false;
   snprintf(cfg->collection.auditd_log_path, sizeof(cfg->collection.auditd_log_path), "%s", "/var/log/audit/audit.log");
   cfg->collection.poll_interval_s = 1;
@@ -1779,6 +2176,28 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   apply_builtin_preprocess_rules(cfg);
   snprintf(cfg->detection_policy.source, sizeof(cfg->detection_policy.source), "%s", "local_default");
   snprintf(cfg->detection_policy.policy_version, sizeof(cfg->detection_policy.policy_version), "%s", "local-default");
+  cfg->detection.auto_profile = true;
+  cfg->detection.shellcode_mode = 0;
+  cfg->detection.webshell_mode = 0;
+  cfg->detection.pmfe_mode = 0;
+  cfg->correlation.configured = false;
+  cfg->correlation.enabled = false;
+  cfg->correlation.inject_feedback_enabled = true;
+  cfg->policy_v2.credential_mode = 2;
+  cfg->policy_v2.lateral_mode = 2;
+  cfg->policy_v2.privilege_mode = 2;
+  cfg->policy_v2.evasion_mode = 2;
+  cfg->policy_v2.persistence_mode = 2;
+  cfg->policy_v2.script_mode = 2;
+  cfg->policy_v2.webshell_mode = 2;
+  cfg->policy_v2.exfil_mode = 2;
+  cfg->policy_v2.impact_mode = 2;
+  cfg->policy_v2.ransomware_behavior = true;
+  cfg->policy_v2.ransomware_mass_write = true;
+  cfg->policy_v2.ransomware_vss = true;
+  cfg->policy_v2.ransomware_spread = true;
+  cfg->policy_v2.ransomware_honey = true;
+  cfg->policy_v2.ransomware_forensic = true;
 
 #ifdef _WIN32
   /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
@@ -1843,7 +2262,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.shellcode_packets_per_sec = 2000u;
   cfg->resource_limit.low_priority_keep_percent_under_pressure = 5u;
 
-  cfg->health_monitor.enabled = false;
+  cfg->health_monitor.enabled = true;
   snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
   cfg->health_monitor.interval_s = 60u;
   cfg->health_monitor.expires_at_unix_ms = 0u;
@@ -1866,7 +2285,12 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.auto_isolate_threshold = 0.95;
   cfg->shellcode_detector.auto_isolate_execute = false;
   cfg->shellcode_detector.heuristic_score_scale = 1.0;
+  cfg->shellcode_detector.pmfe_followup_enabled = true;
+  cfg->shellcode_detector.pmfe_heuristic_threshold = 0.90;
   cfg->shellcode_detector.flow_scan_first_bytes = 65536u;
+  cfg->shellcode_detector.reassembly_max_flows = 512u;
+  cfg->shellcode_detector.reassembly_memory_limit_kb = 16384u;
+  cfg->shellcode_detector.reassembly_idle_timeout_s = 30u;
   cfg->shellcode_detector.scan_tls_appdata = false;
   cfg->shellcode_detector.exclude_self_traffic = true;
   cfg->shellcode_detector.yara_rules_reload_interval_s = 300u;
@@ -1877,6 +2301,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->shellcode_detector.monitor_ldap = true;
   cfg->shellcode_detector.monitor_tls = true;
   cfg->shellcode_detector.detector_threads = 2u;
+  cfg->shellcode_detector.scan_queue_capacity = 256u;
   cfg->shellcode_detector.windivert_queue_length = 8192u;
   cfg->shellcode_detector.windivert_queue_size_kb = 8192u;
   cfg->shellcode_detector.windivert_queue_time_ms = 2000u;
@@ -1937,6 +2362,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->command.rtr_shell_max_timeout_sec = 60u;
   cfg->command.signing_public_key_path[0] = '\0';
   cfg->command.signing_public_key_pem[0] = '\0';
+  cfg->command.forensic_yara_rules_dir[0] = '\0';
   cfg->forensic_auto.enabled = false;
   cfg->forensic_auto.cooldown_s = 30u;
   cfg->forensic_auto.per_pid_cooldown_s = 300u;
@@ -1950,6 +2376,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->config_signing.public_key_pem[0] = '\0';
   cfg->platform.http2_enabled = false;
   cfg->platform.http2_require = false;
+  cfg->platform.control_http2_enabled = false;
+  cfg->platform.control_http2_require = false;
+  cfg->platform.control_http1_fallback = true;
   cfg->platform.control_stream_enabled = true;
   cfg->platform.long_poll_fallback = true;
   cfg->platform.report_events_v2_enabled = true;
@@ -1964,8 +2393,20 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->platform.telemetry_sampling_pct = 100u;
   cfg->platform.backpressure_enabled = true;
   snprintf(cfg->platform.proxy_mode, sizeof(cfg->platform.proxy_mode), "%s", "auto");
+  cfg->platform.request_signing.enabled = false;
+  cfg->platform.request_signing.key_id[0] = '\0';
+  cfg->platform.request_signing.secret[0] = '\0';
 
   cfg->attack_surface.enabled = false;
+  cfg->attack_surface.listeners_enabled = true;
+  cfg->attack_surface.public_service_enabled = true;
+  cfg->attack_surface.local_admins_enabled = true;
+  cfg->attack_surface.services_enabled = true;
+  cfg->attack_surface.shares_enabled = true;
+  cfg->attack_surface.browser_enabled = false;
+  cfg->attack_surface.software_enabled = true;
+  cfg->attack_surface.defender_enabled = true;
+  cfg->attack_surface.egress_enabled = true;
   cfg->attack_surface.port_interval_s = 300u;
   cfg->attack_surface.conn_interval_s = 300u;
   cfg->attack_surface.service_interval_s = 600u;
@@ -2010,6 +2451,8 @@ static void load_command(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->command.signing_public_key_path));
   take_string(toml_string_in(t, "signing_public_key_pem"), cfg->command.signing_public_key_pem,
               sizeof(cfg->command.signing_public_key_pem));
+  take_string(toml_string_in(t, "forensic_yara_rules_dir"), cfg->command.forensic_yara_rules_dir,
+              sizeof(cfg->command.forensic_yara_rules_dir));
   {
     toml_datum_t mt = toml_int_in(t, "rtr_shell_max_timeout_sec");
     if (mt.ok && mt.u.i >= 1 && mt.u.i <= 300) {
@@ -2069,6 +2512,9 @@ static void load_forensic_auto(toml_table_t *t, EdrConfig *cfg) {
 }
 
 static void load_platform(toml_table_t *t, EdrConfig *cfg) {
+  int control_http2_enabled_set = 0;
+  int control_http2_require_set = 0;
+  int control_http1_fallback_set = 0;
   take_string(toml_string_in(t, "rest_base_url"), cfg->platform.rest_base_url,
               sizeof(cfg->platform.rest_base_url));
   take_string(toml_string_in(t, "rest_user_id"), cfg->platform.rest_user_id,
@@ -2086,6 +2532,40 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
     if (d.ok) {
       cfg->platform.http2_require = d.u.b ? true : false;
     }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_http2_enabled");
+    if (d.ok) {
+      cfg->platform.control_http2_enabled = d.u.b ? true : false;
+      control_http2_enabled_set = 1;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_http2_require");
+    if (d.ok) {
+      cfg->platform.control_http2_require = d.u.b ? true : false;
+      control_http2_require_set = 1;
+    }
+  }
+  {
+    toml_datum_t d = toml_bool_in(t, "control_http1_fallback");
+    if (d.ok) {
+      cfg->platform.control_http1_fallback = d.u.b ? true : false;
+      control_http1_fallback_set = 1;
+    }
+  }
+  if (!control_http2_enabled_set) {
+    cfg->platform.control_http2_enabled = cfg->platform.http2_enabled;
+  }
+  if (!control_http2_require_set) {
+    cfg->platform.control_http2_require = cfg->platform.http2_require;
+  }
+  if (!control_http1_fallback_set) {
+    cfg->platform.control_http1_fallback = !cfg->platform.control_http2_require;
+  }
+  if (cfg->platform.control_http2_require) {
+    cfg->platform.control_http2_enabled = true;
+    cfg->platform.control_http1_fallback = false;
   }
   {
     toml_datum_t d = toml_bool_in(t, "control_stream_enabled");
@@ -2137,6 +2617,19 @@ static void load_platform(toml_table_t *t, EdrConfig *cfg) {
               sizeof(cfg->platform.proxy_url));
   take_string(toml_string_in(t, "relay_url"), cfg->platform.relay_url,
               sizeof(cfg->platform.relay_url));
+  {
+    toml_table_t *rs = toml_table_in(t, "request_signing");
+    if (rs) {
+      toml_datum_t d = toml_bool_in(rs, "enabled");
+      if (d.ok) {
+        cfg->platform.request_signing.enabled = d.u.b ? true : false;
+      }
+      take_string(toml_string_in(rs, "key_id"), cfg->platform.request_signing.key_id,
+                  sizeof(cfg->platform.request_signing.key_id));
+      take_string(toml_string_in(rs, "secret"), cfg->platform.request_signing.secret,
+                  sizeof(cfg->platform.request_signing.secret));
+    }
+  }
 }
 
 static void load_config_signing(toml_table_t *t, EdrConfig *cfg) {
@@ -2341,6 +2834,15 @@ static void load_attack_surface(toml_table_t *t, EdrConfig *cfg) {
       cfg->attack_surface.enabled = d.u.b ? true : false;
     }
   }
+  policy_bool_value(t, "listeners_enabled", &cfg->attack_surface.listeners_enabled);
+  policy_bool_value(t, "public_service_enabled", &cfg->attack_surface.public_service_enabled);
+  policy_bool_value(t, "local_admins_enabled", &cfg->attack_surface.local_admins_enabled);
+  policy_bool_value(t, "services_enabled", &cfg->attack_surface.services_enabled);
+  policy_bool_value(t, "shares_enabled", &cfg->attack_surface.shares_enabled);
+  policy_bool_value(t, "browser_enabled", &cfg->attack_surface.browser_enabled);
+  policy_bool_value(t, "software_enabled", &cfg->attack_surface.software_enabled);
+  policy_bool_value(t, "defender_enabled", &cfg->attack_surface.defender_enabled);
+  policy_bool_value(t, "egress_enabled", &cfg->attack_surface.egress_enabled);
   {
     toml_datum_t d = toml_int_in(t, "port_interval_s");
     if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
@@ -2528,15 +3030,9 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     return EDR_OK;
   }
 
-  FILE *fp = fopen(path, "r");
-  if (!fp) {
-    return EDR_ERR_CONFIG_PARSE;
-  }
-
   char errbuf[512];
   memset(errbuf, 0, sizeof(errbuf));
-  toml_table_t *root = toml_parse_file(fp, errbuf, (int)sizeof(errbuf));
-  fclose(fp);
+  toml_table_t *root = edr_config_parse_file_compat(path, errbuf, (int)sizeof(errbuf));
 
   if (!root) {
     if (errbuf[0]) {
@@ -2576,6 +3072,24 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
     }
   }
   {
+		toml_table_t *t = toml_table_in(root, "detection");
+		if (t) {
+			load_detection(t, cfg);
+		}
+	}
+	{
+		toml_table_t *t = toml_table_in(root, "policy_v2");
+		if (t) {
+			load_policy_v2(t, cfg);
+		}
+	}
+	{
+		toml_table_t *t = toml_table_in(root, "correlation");
+		if (t) {
+			load_correlation(t, cfg);
+		}
+	}
+	{
     toml_table_t *t = toml_table_in(root, "detection_policy");
     if (t) {
       load_detection_policy(t, cfg);

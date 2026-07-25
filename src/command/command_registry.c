@@ -1,0 +1,337 @@
+#include "edr/command_registry.h"
+
+#include <string.h>
+
+typedef struct EdrCommandAlias {
+  const char *alias;
+  EdrCommandDescriptor descriptor;
+} EdrCommandAlias;
+
+#define COMMAND(alias_value, kind_value, canonical_value, flag_value, schema_value) \
+  { alias_value, { kind_value, canonical_value, flag_value, schema_value } }
+
+static const EdrCommandAlias k_commands[] = {
+    COMMAND("noop", EDR_COMMAND_KIND_NOOP, "noop", 0, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("ping", EDR_COMMAND_KIND_NOOP, "noop", 0, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("echo", EDR_COMMAND_KIND_ECHO, "echo", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("telemetry_profile_update", EDR_COMMAND_KIND_TELEMETRY_PROFILE_UPDATE,
+            "telemetry_profile_update", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("runtime_profile_update", EDR_COMMAND_KIND_TELEMETRY_PROFILE_UPDATE,
+            "telemetry_profile_update", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("isolate_host", EDR_COMMAND_KIND_ISOLATE_HOST, "isolate_host",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("isolate", EDR_COMMAND_KIND_ISOLATE_HOST, "isolate_host",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("restore_host", EDR_COMMAND_KIND_RESTORE_HOST, "restore_host",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("host_restore", EDR_COMMAND_KIND_RESTORE_HOST, "restore_host",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("isolate_status", EDR_COMMAND_KIND_ISOLATE_STATUS, "isolate_status", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("host_isolation_status", EDR_COMMAND_KIND_ISOLATE_STATUS, "isolate_status", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("kill_process", EDR_COMMAND_KIND_KILL_PROCESS, "kill_process",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("kill", EDR_COMMAND_KIND_KILL_PROCESS, "kill_process",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("collect_forensic", EDR_COMMAND_KIND_COLLECT_FORENSIC, "collect_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("forensic", EDR_COMMAND_KIND_FORENSIC, "forensic", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("forensic_deep", EDR_COMMAND_KIND_DEEP_FORENSIC, "deep_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("memory_dump", EDR_COMMAND_KIND_MEMORY_DUMP, "memory_dump",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("memdump", EDR_COMMAND_KIND_MEMORY_DUMP, "memory_dump",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("targeted_forensic", EDR_COMMAND_KIND_TARGETED_FORENSIC, "targeted_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("forensic_targeted", EDR_COMMAND_KIND_TARGETED_FORENSIC, "targeted_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("yara_scan", EDR_COMMAND_KIND_YARA_SCAN, "yara_scan",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("forensic_cancel", EDR_COMMAND_KIND_FORENSIC_CANCEL, "forensic_cancel",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("cancel_forensic", EDR_COMMAND_KIND_FORENSIC_CANCEL, "forensic_cancel",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("collector:stop", EDR_COMMAND_KIND_FORENSIC_CANCEL, "forensic_cancel",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("cancel_command", EDR_COMMAND_KIND_FORENSIC_CANCEL, "forensic_cancel",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("command_cancel", EDR_COMMAND_KIND_FORENSIC_CANCEL, "forensic_cancel",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("deep_forensic", EDR_COMMAND_KIND_DEEP_FORENSIC, "deep_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("collector", EDR_COMMAND_KIND_DEEP_FORENSIC, "deep_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("collector:start", EDR_COMMAND_KIND_DEEP_FORENSIC, "deep_forensic",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("put_file", EDR_COMMAND_KIND_PUT_FILE, "put_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_put_file", EDR_COMMAND_KIND_PUT_FILE, "put_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_file_put", EDR_COMMAND_KIND_PUT_FILE, "put_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_put", EDR_COMMAND_KIND_PUT_FILE, "put_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("file_put", EDR_COMMAND_KIND_PUT_FILE, "put_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtq_execute", EDR_COMMAND_KIND_RTQ_EXECUTE, "rtq_execute", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("RTQ_EXECUTE", EDR_COMMAND_KIND_RTQ_EXECUTE, "rtq_execute", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtq_query", EDR_COMMAND_KIND_RTQ_QUERY, "rtq_query", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("RTQ_QUERY", EDR_COMMAND_KIND_RTQ_QUERY, "rtq_query", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_process_tree", EDR_COMMAND_KIND_PROCESS_TREE, "rtr_process_tree", 0,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("RTR_PROCESS_TREE", EDR_COMMAND_KIND_PROCESS_TREE, "rtr_process_tree", 0,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_list_connections", EDR_COMMAND_KIND_LIST_CONNECTIONS, "rtr_list_connections", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("RTR_LIST_CONNECTIONS", EDR_COMMAND_KIND_LIST_CONNECTIONS, "rtr_list_connections", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("list_modules", EDR_COMMAND_KIND_LIST_MODULES, "list_modules", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("rtr_list_modules", EDR_COMMAND_KIND_LIST_MODULES, "list_modules", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("RTR_LIST_MODULES", EDR_COMMAND_KIND_LIST_MODULES, "list_modules", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("host_process_tree", EDR_COMMAND_KIND_PROCESS_SNAPSHOT, "host_process_tree",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("process_snapshot", EDR_COMMAND_KIND_PROCESS_SNAPSHOT, "host_process_tree",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("RTR_PROCESS_SNAPSHOT", EDR_COMMAND_KIND_PROCESS_SNAPSHOT, "host_process_tree",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("list_autoruns", EDR_COMMAND_KIND_LIST_AUTORUNS, "list_autoruns", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("autoruns", EDR_COMMAND_KIND_LIST_AUTORUNS, "list_autoruns", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("RTR_AUTORUNS", EDR_COMMAND_KIND_LIST_AUTORUNS, "list_autoruns", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("velo_query", EDR_COMMAND_KIND_VELO_QUERY, "velo_query",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("RTR_VELO_QUERY", EDR_COMMAND_KIND_VELO_QUERY, "velo_query",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_file_stat", EDR_COMMAND_KIND_FILE_STAT, "rtr_file_stat", 0, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("file_stat", EDR_COMMAND_KIND_FILE_STAT, "rtr_file_stat", 0, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("RTR_FILE_STAT", EDR_COMMAND_KIND_FILE_STAT, "rtr_file_stat", 0, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_get_file", EDR_COMMAND_KIND_GET_FILE, "rtr_get_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_file_get", EDR_COMMAND_KIND_GET_FILE, "rtr_get_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("get_file", EDR_COMMAND_KIND_GET_FILE, "rtr_get_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("RTR_GET_FILE", EDR_COMMAND_KIND_GET_FILE, "rtr_get_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_get", EDR_COMMAND_KIND_GET_FILE, "rtr_get_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("file_get", EDR_COMMAND_KIND_GET_FILE, "rtr_get_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_rm_file", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_file_rm", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("remove_file", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("delete_file", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("RTR_RM_FILE", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_rm", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("file_rm", EDR_COMMAND_KIND_REMOVE_FILE, "rtr_rm_file", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("eventlog_view", EDR_COMMAND_KIND_EVENTLOG_VIEW, "eventlog_view", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("rtr_eventlog", EDR_COMMAND_KIND_EVENTLOG_VIEW, "eventlog_view", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("RTR_EVENTLOG", EDR_COMMAND_KIND_EVENTLOG_VIEW, "eventlog_view", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND("reg_query", EDR_COMMAND_KIND_REGISTRY_QUERY, "reg_query", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_REGISTRY_KEY),
+    COMMAND("registry_query", EDR_COMMAND_KIND_REGISTRY_QUERY, "reg_query", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_REGISTRY_KEY),
+    COMMAND("RTR_REG_QUERY", EDR_COMMAND_KIND_REGISTRY_QUERY, "reg_query", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_REGISTRY_KEY),
+    COMMAND("quarantine_file", EDR_COMMAND_KIND_QUARANTINE_FILE, "quarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("file_quarantine", EDR_COMMAND_KIND_QUARANTINE_FILE, "quarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("rtr_quarantine_file", EDR_COMMAND_KIND_QUARANTINE_FILE, "quarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("RTR_QUARANTINE_FILE", EDR_COMMAND_KIND_QUARANTINE_FILE, "quarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("unquarantine_file", EDR_COMMAND_KIND_RESTORE_FILE, "unquarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_RESTORE_FILE),
+    COMMAND("restore_file", EDR_COMMAND_KIND_RESTORE_FILE, "unquarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_RESTORE_FILE),
+    COMMAND("file_unquarantine", EDR_COMMAND_KIND_RESTORE_FILE, "unquarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_RESTORE_FILE),
+    COMMAND("rtr_unquarantine_file", EDR_COMMAND_KIND_RESTORE_FILE, "unquarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_RESTORE_FILE),
+    COMMAND("RTR_UNQUARANTINE_FILE", EDR_COMMAND_KIND_RESTORE_FILE, "unquarantine_file",
+            EDR_COMMAND_FLAG_DANGEROUS, EDR_COMMAND_PAYLOAD_RESTORE_FILE),
+    COMMAND("pmfe_scan", EDR_COMMAND_KIND_PMFE_SCAN, "pmfe_scan", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("CMD_PMFE_SCAN", EDR_COMMAND_KIND_PMFE_SCAN, "pmfe_scan", EDR_COMMAND_FLAG_DANGEROUS,
+            EDR_COMMAND_PAYLOAD_PID),
+    COMMAND("shell_open", EDR_COMMAND_KIND_SHELL_OPEN, "shell_open",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("shell_input", EDR_COMMAND_KIND_SHELL_INPUT, "shell_input",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_SHELL_INPUT),
+    COMMAND("shell_close", EDR_COMMAND_KIND_SHELL_CLOSE, "shell_close",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_SHELL_CLOSE),
+    COMMAND("rtr_shell", EDR_COMMAND_KIND_RTR_SHELL, "rtr_shell",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_RTR_SHELL),
+    COMMAND("RTR_SHELL", EDR_COMMAND_KIND_RTR_SHELL, "rtr_shell",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_RTR_SHELL),
+    COMMAND("remote_shell", EDR_COMMAND_KIND_RTR_SHELL, "rtr_shell",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_RTR_SHELL),
+    COMMAND("shell_exec", EDR_COMMAND_KIND_RTR_SHELL, "rtr_shell",
+            EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_SHELL, EDR_COMMAND_PAYLOAD_RTR_SHELL),
+    COMMAND("ave_status", EDR_COMMAND_KIND_AVE_STATUS, "ave_status", 0, EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("ave_model_status", EDR_COMMAND_KIND_AVE_STATUS, "ave_status", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("ave_fingerprint", EDR_COMMAND_KIND_AVE_FINGERPRINT, "ave_fingerprint", 0,
+            EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("ave_fp", EDR_COMMAND_KIND_AVE_FINGERPRINT, "ave_fingerprint", 0, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("ave_infer", EDR_COMMAND_KIND_AVE_INFER, "ave_infer", 0, EDR_COMMAND_PAYLOAD_PATH),
+    COMMAND("self_protect_status", EDR_COMMAND_KIND_SELF_PROTECT_STATUS, "self_protect_status", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("agent_health", EDR_COMMAND_KIND_SELF_PROTECT_STATUS, "self_protect_status", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("health_status", EDR_COMMAND_KIND_SELF_PROTECT_STATUS, "self_protect_status", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("update_server_address", EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS, "update_server_address", 0,
+            EDR_COMMAND_PAYLOAD_UPDATE_SERVER),
+    COMMAND("set_server_address", EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS, "update_server_address", 0,
+            EDR_COMMAND_PAYLOAD_UPDATE_SERVER),
+    COMMAND("GET_ATTACK_SURFACE", EDR_COMMAND_KIND_ATTACK_SURFACE, "GET_ATTACK_SURFACE", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("get_attack_surface", EDR_COMMAND_KIND_ATTACK_SURFACE, "GET_ATTACK_SURFACE", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+    COMMAND("REFRESH_ATTACK_SURFACE", EDR_COMMAND_KIND_ATTACK_SURFACE, "GET_ATTACK_SURFACE", 0,
+            EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT),
+};
+
+const EdrCommandDescriptor *edr_command_registry_lookup(const char *command_type) {
+  if (!command_type || !command_type[0]) {
+    return NULL;
+  }
+  for (size_t i = 0; i < sizeof(k_commands) / sizeof(k_commands[0]); i++) {
+    if (strcmp(k_commands[i].alias, command_type) == 0) {
+      return &k_commands[i].descriptor;
+    }
+  }
+  return NULL;
+}
+
+int edr_command_registry_is_dangerous(const char *command_type) {
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  return descriptor && (descriptor->flags & EDR_COMMAND_FLAG_DANGEROUS) != 0u;
+}
+
+int edr_command_registry_is_shell(const char *command_type) {
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  return descriptor && (descriptor->flags & EDR_COMMAND_FLAG_SHELL) != 0u;
+}
+
+EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_type) {
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  if (!descriptor) {
+    return EDR_COMMAND_LANE_INTERACTIVE;
+  }
+  switch (descriptor->kind) {
+    case EDR_COMMAND_KIND_ISOLATE_HOST:
+    case EDR_COMMAND_KIND_RESTORE_HOST:
+    case EDR_COMMAND_KIND_KILL_PROCESS:
+    case EDR_COMMAND_KIND_FORENSIC_CANCEL:
+    case EDR_COMMAND_KIND_REMOVE_FILE:
+    case EDR_COMMAND_KIND_QUARANTINE_FILE:
+    case EDR_COMMAND_KIND_RESTORE_FILE:
+      return EDR_COMMAND_LANE_CRITICAL;
+    case EDR_COMMAND_KIND_COLLECT_FORENSIC:
+    case EDR_COMMAND_KIND_FORENSIC:
+    case EDR_COMMAND_KIND_MEMORY_DUMP:
+    case EDR_COMMAND_KIND_TARGETED_FORENSIC:
+    case EDR_COMMAND_KIND_DEEP_FORENSIC:
+    case EDR_COMMAND_KIND_PROCESS_SNAPSHOT:
+    case EDR_COMMAND_KIND_LIST_AUTORUNS:
+    case EDR_COMMAND_KIND_EVENTLOG_VIEW:
+    case EDR_COMMAND_KIND_VELO_QUERY:
+    case EDR_COMMAND_KIND_ATTACK_SURFACE:
+      return EDR_COMMAND_LANE_BULK;
+    case EDR_COMMAND_KIND_YARA_SCAN:
+    case EDR_COMMAND_KIND_PMFE_SCAN:
+      return EDR_COMMAND_LANE_SCAN;
+    default:
+      return EDR_COMMAND_LANE_INTERACTIVE;
+  }
+}
+
+EdrCommandCancelMode edr_command_registry_cancel_mode(const char *command_type) {
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  if (!descriptor) {
+    return EDR_COMMAND_CANCEL_NONE;
+  }
+  switch (descriptor->kind) {
+    case EDR_COMMAND_KIND_RTR_SHELL:
+      return EDR_COMMAND_CANCEL_HARD;
+    case EDR_COMMAND_KIND_COLLECT_FORENSIC:
+    case EDR_COMMAND_KIND_MEMORY_DUMP:
+    case EDR_COMMAND_KIND_TARGETED_FORENSIC:
+    case EDR_COMMAND_KIND_YARA_SCAN:
+    case EDR_COMMAND_KIND_DEEP_FORENSIC:
+    case EDR_COMMAND_KIND_VELO_QUERY:
+    case EDR_COMMAND_KIND_FORENSIC:
+    case EDR_COMMAND_KIND_RTQ_EXECUTE:
+    case EDR_COMMAND_KIND_RTQ_QUERY:
+    case EDR_COMMAND_KIND_PROCESS_SNAPSHOT:
+    case EDR_COMMAND_KIND_LIST_MODULES:
+    case EDR_COMMAND_KIND_LIST_AUTORUNS:
+    case EDR_COMMAND_KIND_EVENTLOG_VIEW:
+      return EDR_COMMAND_CANCEL_COOPERATIVE;
+    default:
+      return EDR_COMMAND_CANCEL_NONE;
+  }
+}
+
+EdrCommandReplayPolicy edr_command_registry_replay_policy(const char *command_type) {
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  if (!descriptor) {
+    return EDR_COMMAND_REPLAY_FINAL_ONLY;
+  }
+  switch (descriptor->kind) {
+    case EDR_COMMAND_KIND_SHELL_OPEN:
+    case EDR_COMMAND_KIND_SHELL_INPUT:
+    case EDR_COMMAND_KIND_SHELL_CLOSE:
+    case EDR_COMMAND_KIND_RTR_SHELL:
+      return EDR_COMMAND_REPLAY_FINAL_ONLY;
+    default:
+      return EDR_COMMAND_REPLAY_IDEMPOTENT;
+  }
+}
+
+uint32_t edr_command_registry_default_timeout_s(const char *command_type) {
+  const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(command_type);
+  if (!descriptor) {
+    return 30u;
+  }
+  switch (descriptor->kind) {
+    case EDR_COMMAND_KIND_ISOLATE_HOST:
+    case EDR_COMMAND_KIND_RESTORE_HOST:
+    case EDR_COMMAND_KIND_KILL_PROCESS:
+    case EDR_COMMAND_KIND_FORENSIC_CANCEL:
+      return 30u;
+    case EDR_COMMAND_KIND_RTR_SHELL:
+      return 60u;
+    case EDR_COMMAND_KIND_COLLECT_FORENSIC:
+    case EDR_COMMAND_KIND_FORENSIC:
+    case EDR_COMMAND_KIND_MEMORY_DUMP:
+    case EDR_COMMAND_KIND_TARGETED_FORENSIC:
+    case EDR_COMMAND_KIND_YARA_SCAN:
+    case EDR_COMMAND_KIND_DEEP_FORENSIC:
+    case EDR_COMMAND_KIND_VELO_QUERY:
+      return 900u;
+    default:
+      return 120u;
+  }
+}

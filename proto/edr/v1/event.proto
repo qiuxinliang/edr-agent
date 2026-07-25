@@ -72,6 +72,13 @@ message BehaviorAlert {
   uint32 pid = 7;
   string process_name = 8;
   string process_path = 9; // 对应 BehaviorEvent.exe_path
+  // 与 `alerts.related_iocs_json` 对齐的 JSON 文本；单帧长度受 Agent nanopb 静态缓冲上界约 4KiB（与 event.options 对账）。
+  string related_iocs_json = 10;
+  // 跨端并案主键真源：与平台 `alerts.user_subject_json` 一致，如 {"subject_type":"ad_sid","value":"S-1-5-21-..."}。
+  string user_subject_json = 11;
+  // 进程快照冗余：同时写入 BehaviorEvent.ppid/cmdline，兼容只解析外层事件的旧平台。
+  uint32 ppid = 12;
+  string cmdline = 13;
 }
 
 // BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。
@@ -89,6 +96,8 @@ message BehaviorEvent {
   string exe_path = 11;
   string username = 12;
   uint32 session_id = 13;
+  // 自根进程向上的父链跳数（与平台 dynamic_rules `process_chain_depth_gt` 对齐；0 表示未计算/未携带）
+  uint32 process_chain_depth = 14;
 
   oneof detail {
     ProcessDetail process = 20;
@@ -115,6 +124,15 @@ message ProcessDetail {
   string parent_name = 1;
   string parent_path = 2;
   string integrity_level = 3;
+  // 取证增强字段（与 EdrBehaviorRecord / 平台 alerts_analysis_snapshot 必需字段对齐）：
+  // 端侧已采集，补齐上报供服务端进程链/研判使用。
+  string parent_cmdline = 4;
+  string current_directory = 5;
+  string process_creation_time = 6;
+  uint32 token_elevation = 7;
+  uint32 grandparent_pid = 8;
+  string grandparent_name = 9;
+  string grandparent_path = 10;
 }
 
 message FileDetail {
@@ -141,6 +159,8 @@ message NetworkDetail {
   string dst_ip = 3;
   uint32 dst_port = 4;
   string protocol = 5;
+  // 与 EdrBehaviorRecord.network_aux_path / 平台 `network_aux_path` 一致（如进程映像路径，供规则侧与 ingest 对拍）
+  string network_aux_path = 6;
 }
 
 message DnsDetail {

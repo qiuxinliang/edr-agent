@@ -1,10 +1,50 @@
 #include "edr/behavior_from_slot.h"
 
+#include "edr/command.h"
+#include "edr/policy_v2.h"
+
+#include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 static uint64_t g_event_seq;
+
+#define RANSOM_COUNTER_BUCKETS 128u
+#define RANSOM_COUNTER_EXTS 24u
+#define RANSOM_COUNTER_DIRS 16u
+#define RANSOM_NOTE_BUCKETS 128u
+#define RANSOM_NOTE_FILES 16u
+
+typedef struct {
+  uint32_t pid;
+  char dir[256];
+  int64_t window_start_ns;
+  uint32_t file_events;
+  uint32_t high_entropy_events;
+  char exts[RANSOM_COUNTER_EXTS][16];
+  char dirs[RANSOM_COUNTER_DIRS][128];
+  uint8_t ext_count;
+  uint8_t dir_count;
+  uint8_t emitted_level;
+  int64_t last_signal_ns;
+  uint32_t coalesced_events;
+  double entropy_avg;
+} RansomCounterBucket;
+
+typedef struct {
+  uint32_t pid;
+  int64_t window_start_ns;
+  uint32_t note_count;
+  char files[RANSOM_NOTE_FILES][96];
+} RansomNoteBucket;
+
+static RansomCounterBucket g_ransom_buckets[RANSOM_COUNTER_BUCKETS];
+static RansomNoteBucket g_ransom_note_buckets[RANSOM_NOTE_BUCKETS];
+
+static int detail_token_value(const char *text, const char *key, char *out, size_t cap);
 
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = ++g_event_seq;
@@ -25,13 +65,787 @@ static const char *basename_c(const char *path) {
   return p;
 }
 
+static void first_cmd_token(const char *cmd, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!cmd || !cmd[0]) {
+    return;
+  }
+  while (*cmd == ' ' || *cmd == '\t') {
+    cmd++;
+  }
+  char quote = 0;
+  if (*cmd == '"' || *cmd == '\'') {
+    quote = *cmd++;
+  }
+  size_t n = 0;
+  while (*cmd && n + 1u < cap) {
+    if (quote) {
+      if (*cmd == quote) {
+        break;
+      }
+    } else if (*cmd == ' ' || *cmd == '\t') {
+      break;
+    }
+    out[n++] = *cmd++;
+  }
+  out[n] = '\0';
+}
+
+static int is_file_activity_event(EdrEventType t) {
+  return t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_WRITE || t == EDR_EVENT_FILE_RENAME ||
+         t == EDR_EVENT_FILE_DELETE;
+}
+
+static int has_ci_ascii(const char *hay, const char *needle);
+
+static int file_path_has_root_or_separator(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  if ((isalpha((unsigned char)path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) ||
+      (path[0] == '\\' && path[1] == '\\') || (path[0] == '/' && path[1]) ||
+      has_ci_ascii(path, "\\device\\") || has_ci_ascii(path, "\\??\\") ||
+      has_ci_ascii(path, "\\global??\\")) {
+    return 1;
+  }
+  return strchr(path, '\\') != NULL || strchr(path, '/') != NULL;
+}
+
+static int file_path_usable_for_ransom(const char *path) {
+  if (!path || !path[0] || !file_path_has_root_or_separator(path)) {
+    return 0;
+  }
+  const char *base = basename_c(path);
+  if (!base || strlen(base) < 3u) {
+    return 0;
+  }
+  size_t printable = 0u;
+  size_t ascii = 0u;
+  size_t len = 0u;
+  for (const unsigned char *p = (const unsigned char *)path; *p && len < 512u; p++, len++) {
+    if ((*p >= 0x20u && *p < 0x7fu) || *p >= 0x80u) {
+      printable++;
+    }
+    if (*p < 0x80u) {
+      ascii++;
+    }
+  }
+  if (len == 0u || printable * 100u < len * 90u) {
+    return 0;
+  }
+  return ascii > 0u;
+}
+
+static char fold_ascii(char c) {
+  if (c == '/') {
+    c = '\\';
+  }
+  return (char)tolower((unsigned char)c);
+}
+
+static int has_ci_ascii(const char *hay, const char *needle) {
+  if (!needle || !needle[0]) {
+    return 1;
+  }
+  if (!hay || !hay[0]) {
+    return 0;
+  }
+  for (; *hay; hay++) {
+    const char *a = hay;
+    const char *b = needle;
+    while (*a && *b && fold_ascii(*a) == fold_ascii(*b)) {
+      a++;
+      b++;
+    }
+    if (!*b) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ransom_ci_equal(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (fold_ascii(*a) != fold_ascii(*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int token_list_has_exact_ci_ascii(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ' ') {
+      p++;
+    }
+    char tok[512];
+    size_t n = 0u;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t')) {
+      n--;
+    }
+    tok[n] = '\0';
+    if (tok[0] && ransom_ci_equal(tok, value)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int policy_exact_value_match(const char *env_inline, const char *env_file, const char *value) {
+  const char *list = getenv(env_inline);
+  if (list && list[0] && token_list_has_exact_ci_ascii(list, value)) {
+    return 1;
+  }
+  const char *file = getenv(env_file);
+  if (file && file[0]) {
+    FILE *f = fopen(file, "rb");
+    if (f) {
+      char buf[8192];
+      size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+      fclose(f);
+      buf[n] = '\0';
+      if (token_list_has_exact_ci_ascii(buf, value)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int ransom_process_identity_match(const char *list, const EdrBehaviorRecord *r) {
+  if (!list || !list[0] || !r) {
+    return 0;
+  }
+  char first_cmd[EDR_BR_STR_LONG];
+  first_cmd_token(r->cmdline, first_cmd, sizeof(first_cmd));
+  const char *ids[] = {r->process_name, r->exe_path, basename_c(r->process_name), basename_c(r->exe_path),
+                       basename_c(first_cmd), r->exe_hash};
+  for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+    if (ids[i][0] && token_list_has_exact_ci_ascii(list, ids[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ransom_process_policy_match(const char *env_inline, const char *env_file, const char *fallback,
+                                       const EdrBehaviorRecord *r) {
+  const char *list = getenv(env_inline);
+  if (ransom_process_identity_match(list, r)) {
+    return 1;
+  }
+  const char *file = getenv(env_file);
+  if (file && file[0]) {
+    FILE *f = fopen(file, "rb");
+    if (f) {
+      char buf[8192];
+      size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+      fclose(f);
+      buf[n] = '\0';
+      if (ransom_process_identity_match(buf, r)) {
+        return 1;
+      }
+    }
+  }
+  return ransom_process_identity_match(fallback, r);
+}
+
+static int known_low_value_ransom_counter_process(const EdrBehaviorRecord *r) {
+  const char *fallback =
+      "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
+      "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
+  return ransom_process_policy_match("EDR_RANSOM_LOW_VALUE_PROCESSES",
+                                    "EDR_RANSOM_LOW_VALUE_PROCESSES_FILE", fallback, r) ||
+         ransom_process_policy_match("EDR_RANSOM_BULK_SAFE_PROCESSES",
+                                    "EDR_RANSOM_BULK_SAFE_PROCESSES_FILE", "", r);
+}
+
+static int env_int_clamped(const char *name, int fallback, int lo, int hi) {
+  const char *v = getenv(name);
+  long n = v && v[0] ? strtol(v, NULL, 10) : (long)fallback;
+  if (n < (long)lo) {
+    n = (long)lo;
+  }
+  if (n > (long)hi) {
+    n = (long)hi;
+  }
+  return (int)n;
+}
+
+static int ends_ci_ascii(const char *s, const char *suffix) {
+  size_t a;
+  size_t b;
+  if (!s || !suffix) {
+    return 0;
+  }
+  a = strlen(s);
+  b = strlen(suffix);
+  if (b == 0u || a < b) {
+    return 0;
+  }
+  return has_ci_ascii(s + (a - b), suffix);
+}
+
+static uint32_t parse_token_elevation_type(const char *s) {
+  if (!s || !s[0]) {
+    return 0u;
+  }
+  if (strcmp(s, "%%1936") == 0) {
+    return 1u; /* TokenElevationTypeDefault */
+  }
+  if (strcmp(s, "%%1937") == 0) {
+    return 2u; /* TokenElevationTypeFull */
+  }
+  if (strcmp(s, "%%1938") == 0) {
+    return 3u; /* TokenElevationTypeLimited */
+  }
+  if (has_ci_ascii(s, "default")) {
+    return 1u;
+  }
+  if (has_ci_ascii(s, "full") || has_ci_ascii(s, "elevated")) {
+    return 2u;
+  }
+  if (has_ci_ascii(s, "limited") || has_ci_ascii(s, "filtered")) {
+    return 3u;
+  }
+  return (uint32_t)strtoul(s, NULL, 0);
+}
+
+static void dirname_c(const char *path, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!path || !path[0]) {
+    return;
+  }
+  const char *last = NULL;
+  for (const char *p = path; *p; p++) {
+    if (*p == '\\' || *p == '/') {
+      last = p;
+    }
+  }
+  if (!last) {
+    snprintf(out, cap, "%s", ".");
+    return;
+  }
+  size_t n = (size_t)(last - path);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, path, n);
+  out[n] = '\0';
+}
+
+static void extension_c(const char *path, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  const char *b = basename_c(path);
+  const char *dot = strrchr(b, '.');
+  if (!dot || !dot[1]) {
+    snprintf(out, cap, "%s", "<none>");
+    return;
+  }
+  snprintf(out, cap, "%s", dot + 1);
+}
+
+static double path_entropy_score(const char *path) {
+  const char *b = basename_c(path);
+  if (!b || !b[0]) {
+    return 0.0;
+  }
+  unsigned char seen[256];
+  memset(seen, 0, sizeof(seen));
+  size_t len = 0u;
+  size_t uniq = 0u;
+  for (const unsigned char *p = (const unsigned char *)b; *p && len < 160u; p++, len++) {
+    if (!seen[*p]) {
+      seen[*p] = 1u;
+      uniq++;
+    }
+  }
+  if (len == 0u) {
+    return 0.0;
+  }
+  return ((double)uniq / (double)len) * 8.0;
+}
+
+static int file_content_entropy_sample(const char *path, double *out_entropy, size_t *out_bytes) {
+  if (out_entropy) {
+    *out_entropy = 0.0;
+  }
+  if (out_bytes) {
+    *out_bytes = 0u;
+  }
+  if (!path || !path[0]) {
+    return 0;
+  }
+  int cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
+  if (cap <= 0) {
+    return 0;
+  }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return 0;
+  }
+  unsigned long counts[256];
+  memset(counts, 0, sizeof(counts));
+  unsigned char buf[4096];
+  size_t total = 0u;
+  while (total < (size_t)cap) {
+    size_t want = sizeof(buf);
+    if ((size_t)cap - total < want) {
+      want = (size_t)cap - total;
+    }
+    size_t n = fread(buf, 1u, want, f);
+    if (n == 0u) {
+      break;
+    }
+    for (size_t i = 0; i < n; i++) {
+      counts[buf[i]]++;
+    }
+    total += n;
+  }
+  fclose(f);
+  if (out_bytes) {
+    *out_bytes = total;
+  }
+  if (total == 0u) {
+    return 0;
+  }
+  double entropy = 0.0;
+  for (size_t i = 0; i < 256u; i++) {
+    if (counts[i] == 0ul) {
+      continue;
+    }
+    double p = (double)counts[i] / (double)total;
+    entropy -= p * (log(p) / log(2.0));
+  }
+  if (out_entropy) {
+    *out_entropy = entropy;
+  }
+  return 1;
+}
+
+static int should_sample_ransom_content_entropy(const RansomCounterBucket *b, int ext_changed, int canary) {
+  if (canary) {
+    return 1;
+  }
+  if (env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", 0, 0, 1)) {
+    return 1;
+  }
+  if (ext_changed && env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_ON_EXT_CHANGE", 1, 0, 1)) {
+    return 1;
+  }
+  int min_events = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_MIN_EVENTS", 6, 1, 200);
+  return b && (int)b->file_events >= min_events;
+}
+
+static int64_t ransom_counter_summary_interval_ns(void) {
+  return (int64_t)env_int_clamped("EDR_RANSOM_COUNTER_SUMMARY_S", 30, 5, 600) * 1000000000LL;
+}
+
+static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int64_t now_ns, int64_t window_ns) {
+  RansomCounterBucket *empty = NULL;
+  RansomCounterBucket *oldest = &g_ransom_buckets[0];
+  uint32_t key_pid = pid ? pid : 1u;
+  for (size_t i = 0; i < RANSOM_COUNTER_BUCKETS; i++) {
+    RansomCounterBucket *b = &g_ransom_buckets[i];
+    if (b->pid == key_pid) {
+      if (b->window_start_ns <= 0 || now_ns - b->window_start_ns > window_ns) {
+        memset(b, 0, sizeof(*b));
+        b->pid = key_pid;
+        snprintf(b->dir, sizeof(b->dir), "%s", dir);
+        b->window_start_ns = now_ns;
+      }
+      return b;
+    }
+    if (b->pid == 0u && !empty) {
+      empty = b;
+    }
+    if (b->window_start_ns < oldest->window_start_ns) {
+      oldest = b;
+    }
+  }
+  RansomCounterBucket *b = empty ? empty : oldest;
+  memset(b, 0, sizeof(*b));
+  b->pid = key_pid;
+  snprintf(b->dir, sizeof(b->dir), "%s", dir);
+  b->window_start_ns = now_ns;
+  return b;
+}
+
+static int ext_seen_or_add(RansomCounterBucket *b, const char *ext) {
+  if (!b || !ext || !ext[0]) {
+    return 0;
+  }
+  for (uint8_t i = 0; i < b->ext_count; i++) {
+    if (strcmp(b->exts[i], ext) == 0) {
+      return 1;
+    }
+  }
+  if (b->ext_count < RANSOM_COUNTER_EXTS) {
+    snprintf(b->exts[b->ext_count], sizeof(b->exts[b->ext_count]), "%s", ext);
+    b->ext_count++;
+  }
+  return 0;
+}
+
+static int dir_seen_or_add(RansomCounterBucket *b, const char *dir) {
+  if (!b || !dir || !dir[0]) {
+    return 0;
+  }
+  char compact[128];
+  size_t n = 0u;
+  while (*dir && n + 1u < sizeof(compact)) {
+    char c = fold_ascii(*dir++);
+    compact[n++] = c;
+  }
+  compact[n] = '\0';
+  for (uint8_t i = 0; i < b->dir_count; i++) {
+    if (strcmp(b->dirs[i], compact) == 0) {
+      return 1;
+    }
+  }
+  if (b->dir_count < RANSOM_COUNTER_DIRS) {
+    snprintf(b->dirs[b->dir_count], sizeof(b->dirs[b->dir_count]), "%s", compact);
+    b->dir_count++;
+  }
+  return 0;
+}
+
+static int note_file_seen_or_add(RansomNoteBucket *b, const char *path) {
+  if (!b || !path || !path[0]) {
+    return 0;
+  }
+  const char *base = basename_c(path);
+  if (!base || !base[0]) {
+    base = path;
+  }
+  char compact[96];
+  size_t n = 0u;
+  while (*base && n + 1u < sizeof(compact)) {
+    char c = fold_ascii(*base++);
+    if (c == ' ' || c == '\t' || c == '_' || c == '-') {
+      c = '_';
+    }
+    compact[n++] = c;
+  }
+  compact[n] = '\0';
+  for (uint32_t i = 0; i < b->note_count && i < RANSOM_NOTE_FILES; i++) {
+    if (strcmp(b->files[i], compact) == 0) {
+      return 1;
+    }
+  }
+  if (b->note_count < RANSOM_NOTE_FILES) {
+    snprintf(b->files[b->note_count], sizeof(b->files[b->note_count]), "%s", compact);
+  }
+  b->note_count++;
+  return 0;
+}
+
+static int ransom_note_threshold(void) {
+  const char *env = getenv("EDR_RANSOM_NOTE_MIN_FILES");
+  long n = env && env[0] ? strtol(env, NULL, 10) : 2L;
+  if (n < 2L) {
+    n = 2L;
+  }
+  if (n > 10L) {
+    n = 10L;
+  }
+  return (int)n;
+}
+
+static int64_t ransom_note_window_ns(void) {
+  const char *env = getenv("EDR_RANSOM_NOTE_WINDOW_S");
+  long sec = env && env[0] ? strtol(env, NULL, 10) : 300L;
+  if (sec <= 0L) {
+    sec = 300L;
+  }
+  if (sec > 3600L) {
+    sec = 3600L;
+  }
+  return (int64_t)sec * 1000000000LL;
+}
+
+static int is_ransom_note_like_path(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  const char *base = basename_c(path);
+  int ext = ends_ci_ascii(base, ".txt") || ends_ci_ascii(base, ".hta") ||
+            ends_ci_ascii(base, ".htm") || ends_ci_ascii(base, ".html");
+  if (!ext) {
+    return 0;
+  }
+  return has_ci_ascii(base, "readme") || has_ci_ascii(base, "read_me") ||
+         has_ci_ascii(base, "read___me") || has_ci_ascii(base, "decrypt") ||
+         has_ci_ascii(base, "encrypted") || has_ci_ascii(base, "recover") ||
+         has_ci_ascii(base, "restore") || has_ci_ascii(base, "restore-files") ||
+         has_ci_ascii(base, "restore_files") || has_ci_ascii(base, "get_your_files_back") ||
+         has_ci_ascii(base, "help_instruction") || has_ci_ascii(base, "help_to_save_files") ||
+         has_ci_ascii(base, "how_to_back") || has_ci_ascii(base, "how_to_restore") ||
+         has_ci_ascii(base, "howtobackyourfiles") || has_ci_ascii(base, "howtorestoreyourfiles") ||
+         has_ci_ascii(base, "return_files") || has_ci_ascii(base, "your_files_back") ||
+         has_ci_ascii(base, "use_to_repair") || has_ci_ascii(base, "ransom");
+}
+
+static int is_ransom_canary_path(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  /* Canary 必须由每台设备下发唯一完整路径；未配置时关闭确定性判定。 */
+  return policy_exact_value_match("EDR_RANSOM_CANARY_PATH", "EDR_RANSOM_CANARY_PATH_FILE", path) ||
+         policy_exact_value_match("EDR_RANSOM_CANARY_TOKENS", "EDR_RANSOM_CANARY_TOKENS_FILE", path);
+}
+
+static int ransom_signature_trusted(const EdrBehaviorRecord *r) {
+  const char *s = r ? r->script_snippet : "";
+  return has_ci_ascii(s, "signature_status=trusted") || has_ci_ascii(s, "signature_status=valid") ||
+         has_ci_ascii(s, "signature_status=verified") || has_ci_ascii(s, "signature_status=ok") ||
+         has_ci_ascii(s, "signed=1") || has_ci_ascii(s, "signed=true");
+}
+
+static int ransom_signer_allowlisted(const EdrBehaviorRecord *r) {
+  if (!r) {
+    return 0;
+  }
+  char signer[512];
+  if (!detail_token_value(r->script_snippet, "signer", signer, sizeof(signer))) {
+    return 0;
+  }
+  int signer_ok = policy_exact_value_match("EDR_RANSOM_SIGNER_ALLOWLIST",
+                                           "EDR_RANSOM_SIGNER_ALLOWLIST_FILE", signer);
+  if (!signer_ok) {
+    return 0;
+  }
+  const char *path = r->exe_path[0] ? r->exe_path : r->process_name;
+  int path_ok = policy_exact_value_match("EDR_RANSOM_SIGNED_PATH_ALLOWLIST",
+                                         "EDR_RANSOM_SIGNED_PATH_ALLOWLIST_FILE", path);
+  if (!path_ok) {
+    return 0;
+  }
+  const char *require = getenv("EDR_RANSOM_REQUIRE_TRUSTED_SIGNATURE");
+  if (require && require[0] && strcmp(require, "0") != 0 && !ransom_signature_trusted(r)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int ransom_counter_allowlisted(const EdrBehaviorRecord *r) {
+  return ransom_process_policy_match("EDR_RANSOM_COUNTER_ALLOWLIST", "EDR_RANSOM_COUNTER_ALLOWLIST_FILE", "", r) ||
+         ransom_signer_allowlisted(r);
+}
+
+static RansomNoteBucket *ransom_note_bucket_for(uint32_t pid, int64_t now_ns, int64_t window_ns) {
+  RansomNoteBucket *empty = NULL;
+  RansomNoteBucket *oldest = &g_ransom_note_buckets[0];
+  for (size_t i = 0; i < RANSOM_NOTE_BUCKETS; i++) {
+    RansomNoteBucket *b = &g_ransom_note_buckets[i];
+    if (b->pid == pid) {
+      if (b->window_start_ns <= 0 || now_ns - b->window_start_ns > window_ns) {
+        memset(b, 0, sizeof(*b));
+        b->pid = pid;
+        b->window_start_ns = now_ns;
+      }
+      return b;
+    }
+    if (b->pid == 0u && !empty) {
+      empty = b;
+    }
+    if (b->window_start_ns < oldest->window_start_ns) {
+      oldest = b;
+    }
+  }
+  RansomNoteBucket *b = empty ? empty : oldest;
+  memset(b, 0, sizeof(*b));
+  b->pid = pid ? pid : 1u;
+  b->window_start_ns = now_ns;
+  return b;
+}
+
+static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
+  if (!r || !fmt) {
+    return;
+  }
+  size_t l = strlen(r->script_snippet);
+  if (l + 2u >= sizeof(r->script_snippet)) {
+    return;
+  }
+  if (l > 0u) {
+    r->script_snippet[l++] = ' ';
+    r->script_snippet[l] = '\0';
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  (void)vsnprintf(r->script_snippet + l, sizeof(r->script_snippet) - l, fmt, ap);
+  va_end(ap);
+}
+
+static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
+  int mass_write_enabled = edr_policy_v2_ransomware_enabled("mass_write");
+  int honey_enabled = edr_policy_v2_ransomware_enabled("honey");
+  if (!r || !is_file_activity_event(r->type) || !r->file_path[0]) {
+    return;
+  }
+  if (!mass_write_enabled && !honey_enabled) {
+    return;
+  }
+  if (!file_path_usable_for_ransom(r->file_path)) {
+    append_record_kv(r, "invalid_file_path=1 ransom_counter_suppressed=1");
+    return;
+  }
+  if (known_low_value_ransom_counter_process(r)) {
+    append_record_kv(r, "ransom_counter_suppressed=1 low_value_ransom_process=1");
+    return;
+  }
+  const char *env = getenv("EDR_RANSOM_COUNTER_WINDOW_S");
+  long window_s = env && env[0] ? strtol(env, NULL, 10) : 60L;
+  if (window_s <= 0L) {
+    window_s = 60L;
+  }
+  if (window_s > 600L) {
+    window_s = 600L;
+  }
+  int64_t now_ns = r->event_time_ns > 0 ? r->event_time_ns : 1;
+  int64_t window_ns = (int64_t)window_s * 1000000000LL;
+  char dir[256];
+  char ext[16];
+  dirname_c(r->file_path, dir, sizeof(dir));
+  extension_c(r->file_path, ext, sizeof(ext));
+  int ext_changed = has_ci_ascii(r->script_snippet, "ext_changed=1");
+  int canary = honey_enabled && is_ransom_canary_path(r->file_path);
+  if (canary) {
+    append_record_kv(r, "ransom_canary=1 ransomware_kind=DETERMINISTIC_ENCRYPTION ransomware_severity=4");
+  }
+  if (!mass_write_enabled && !canary) {
+    return;
+  }
+  if (!canary && ransom_counter_allowlisted(r)) {
+    append_record_kv(r, "ransom_counter_allowlisted=1%s", ransom_signer_allowlisted(r) ? " ransom_signer_allowlisted=1" : "");
+    return;
+  }
+  RansomCounterBucket *b = ransom_bucket_for(r->pid ? r->pid : 1u, dir, now_ns, window_ns);
+  double path_entropy = path_entropy_score(r->file_path);
+  double content_entropy = 0.0;
+  size_t content_sample = 0u;
+  double prev = b->entropy_avg;
+  b->file_events++;
+  (void)ext_seen_or_add(b, ext);
+  (void)dir_seen_or_add(b, dir);
+  int content_deferred = !should_sample_ransom_content_entropy(b, ext_changed, canary);
+  int content_ok = content_deferred ? 0 : file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
+  double entropy = content_ok ? content_entropy : path_entropy;
+  if (b->file_events == 1u || prev <= 0.0) {
+    b->entropy_avg = entropy;
+  } else {
+    b->entropy_avg = (prev * 0.85) + (entropy * 0.15);
+  }
+  double elapsed_s = (double)(now_ns - b->window_start_ns) / 1000000000.0;
+  if (elapsed_s < 1.0) {
+    elapsed_s = 1.0;
+  }
+  double file_rate = ((double)b->file_events * 60.0) / elapsed_s;
+  double entropy_delta = entropy - prev;
+  if (entropy_delta < 0.0) {
+    entropy_delta = 0.0;
+  }
+  int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
+  if (content_high || entropy >= 4.0 || entropy_delta >= 1.5) {
+    b->high_entropy_events++;
+  }
+  int warn_files = env_int_clamped("EDR_RANSOM_RATE_WARN_FILES", 60, 8, 500);
+  int confirm_files = env_int_clamped("EDR_RANSOM_RATE_CONFIRM_FILES", 200, 20, 2000);
+  int warn_dirs = env_int_clamped("EDR_RANSOM_RATE_WARN_DIRS", 4, 1, 32);
+  int confirm_dirs = env_int_clamped("EDR_RANSOM_RATE_CONFIRM_DIRS", 8, 1, 64);
+  int enough_volume = b->file_events >= 20u;
+  int suspicious = (enough_volume && file_rate >= 120.0) ||
+                   (b->file_events >= 12u && b->ext_count >= 8u) ||
+                   (b->file_events >= 8u && entropy_delta >= 1.5) ||
+                   (ext_changed && content_high) ||
+                   ((int)b->file_events >= warn_files &&
+                    ((int)b->dir_count >= warn_dirs || b->ext_count >= 8u));
+  double high_entropy_ratio = b->file_events > 0u ? (double)b->high_entropy_events / (double)b->file_events : 0.0;
+  int confirmed = canary ||
+                  ((int)b->file_events >= confirm_files &&
+                   ((int)b->dir_count >= confirm_dirs || b->ext_count >= 12u || high_entropy_ratio >= 0.70)) ||
+                  (suspicious && file_rate >= 300.0 && b->ext_count >= 12u) ||
+                  (suspicious && ext_changed && content_high && b->file_events >= 20u);
+  uint8_t level = confirmed ? 2u : (suspicious ? 1u : 0u);
+  int state_changed = level > 0u && level != b->emitted_level;
+  int periodic_summary = level > 0u && !state_changed && b->last_signal_ns > 0 &&
+                         now_ns >= b->last_signal_ns &&
+                         now_ns - b->last_signal_ns >= ransom_counter_summary_interval_ns();
+  int emit_signal = state_changed || periodic_summary;
+  if (emit_signal) {
+    uint32_t coalesced = b->coalesced_events;
+    b->emitted_level = level;
+    b->last_signal_ns = now_ns;
+    b->coalesced_events = 0u;
+    append_record_kv(r,
+                     "file_rate=%.0f ext_burst=%u dir_burst=%u entropy_delta=%.2f high_entropy_ratio=%.2f "
+                     "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d "
+                     "ransom_counter=1 ransom_counter_level=%u coalesced_events=%u%s%s%s%s",
+                     file_rate, (unsigned)b->ext_count, (unsigned)b->dir_count, entropy_delta,
+                     high_entropy_ratio, path_entropy, content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
+                     (unsigned)level, (unsigned)coalesced,
+                     content_deferred ? " content_entropy_deferred=1" : "",
+                     state_changed ? " ransom_counter_transition=1" : "",
+                     periodic_summary ? " ransom_counter_summary=1" : "",
+                     confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
+                     " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3");
+    if (canary) {
+      append_record_kv(r, "canary_counter_bypass=1");
+    }
+  } else if (level > 0u && b->coalesced_events < UINT32_MAX) {
+    b->coalesced_events++;
+  }
+
+  if (confirmed && state_changed) {
+    /* 确诊勒索:端侧处置(默认关,需显式启用自动隔离策略)。 */
+    edr_isolate_auto_from_ransom_alarm(r->pid);
+  }
+
+  if (is_ransom_note_like_path(r->file_path)) {
+    RansomNoteBucket *nb = ransom_note_bucket_for(r->pid ? r->pid : 1u, now_ns, ransom_note_window_ns());
+    (void)note_file_seen_or_add(nb, r->file_path);
+    append_record_kv(r, "ransom_note_count=%u%s", nb->note_count,
+                     nb->note_count >= (uint32_t)ransom_note_threshold() ? " ransom_note_burst=1" : "");
+  }
+}
+
 typedef struct {
   char prov[48];
   char img[EDR_BR_STR_LONG];
   char cmd[EDR_BR_STR_LONG];
   char file[EDR_BR_STR_LONG];
+  char old_file[EDR_BR_STR_LONG];
+  char signer[512];
+  char signature_status[96];
   char qname[EDR_BR_STR_MID];
   char script[EDR_BR_STR_LONG];
+  char url[EDR_BR_STR_MID];
+  char sha256[80];
   char dst[64];
   char src[64];
   char score[32];
@@ -41,11 +855,32 @@ typedef struct {
   char mitre[24];
   char forensic_kind[16];
   char pcap_stem[180];
+  char pcap_status[24];
+  char pcap_object_key[512];
+  char preview_hex[256];
+  char webshell_service[128];
+  char webshell_action[64];
+  char webshell_alert_id[96];
+  char webshell_file_fp[80];
+  char webshell_file_uploaded[16];
+  char webshell_object_key[512];
+  char webshell_local_path[1024];
+  char webshell_ast_score[32];
+  char webshell_token_score[32];
   char ring_trigger_slot[24];
   char ring_oldest_ns[28];
   char ring_newest_ns[28];
   char ring_span_ns[28];
   char shellcode_json[512];
+  char attrib_schema[64];
+  char attrib_cve[64];
+  char attrib_family[96];
+  char attrib_product[96];
+  char attrib_vector[48];
+  char attrib_confidence[24];
+  char attrib_source[32];
+  char attrib_basis[160];
+  char sensor_detail[2048];
   char fw_id[96];
   char fw_rule[256];
   char fw_mod[512];
@@ -53,6 +888,14 @@ typedef struct {
   char regname[512];
   char regdata[8192];
   char regop[64];
+  char user[256];
+  char domain[256];
+  char parent_img[EDR_BR_STR_LONG];
+  char parent_cmdline[EDR_BR_STR_LONG];
+  char cwd[EDR_BR_STR_LONG];
+  char integrity[64];
+  char token_elevation[64];
+  char process_creation_time[96];
   int has_fw;
   unsigned long forensic_frames;
   int has_forensic_frames;
@@ -68,9 +911,134 @@ typedef struct {
   int has_cmd;
   int has_dport;
   int has_sport;
+  int has_parent_img;
+  int has_parent_cmdline;
+  int has_cwd;
+  int has_integrity;
+  int has_token_elevation;
+  int has_process_creation_time;
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
+
+static void append_sensor_kv(Etw1Fields *f, const char *key, const char *val) {
+  if (!f || !key || !key[0] || !val || !val[0]) {
+    return;
+  }
+  size_t l = strlen(f->sensor_detail);
+  if (l + 4u >= sizeof(f->sensor_detail)) {
+    return;
+  }
+  if (l > 0u) {
+    f->sensor_detail[l++] = ' ';
+    f->sensor_detail[l] = '\0';
+  }
+  int n = snprintf(f->sensor_detail + l, sizeof(f->sensor_detail) - l, "%s=", key);
+  if (n <= 0 || (size_t)n >= sizeof(f->sensor_detail) - l) {
+    return;
+  }
+  l += (size_t)n;
+  while (*val && l + 1u < sizeof(f->sensor_detail)) {
+    char c = *val++;
+    if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+      c = '_';
+    }
+    f->sensor_detail[l++] = c;
+  }
+  f->sensor_detail[l] = '\0';
+}
+
+static unsigned long parse_ulong_auto(const char *val) {
+  if (!val) {
+    return 0ul;
+  }
+  return strtoul(val, NULL, 0);
+}
+
+static int detail_token_value(const char *text, const char *key, char *out, size_t cap) {
+  if (!text || !key || !out || cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  size_t kl = strlen(key);
+  for (const char *p = text; *p; p++) {
+    if ((p == text || p[-1] == ' ' || p[-1] == '\n' || p[-1] == '|') && strncmp(p, key, kl) == 0 && p[kl] == '=') {
+      const char *v = p + kl + 1u;
+      size_t n = 0u;
+      while (v[n] && v[n] != ' ' && v[n] != '\n' && v[n] != '\r' && v[n] != '|') {
+        n++;
+      }
+      if (n >= cap) {
+        n = cap - 1u;
+      }
+      memcpy(out, v, n);
+      out[n] = '\0';
+      return out[0] != '\0';
+    }
+  }
+  return 0;
+}
+
+static int ipv4_decimal_to_dotted_le(const char *val, char *out, size_t cap) {
+  if (!val || !val[0] || !out || cap == 0u) {
+    return 0;
+  }
+  for (const unsigned char *p = (const unsigned char *)val; *p; p++) {
+    if (!isdigit(*p)) {
+      return 0;
+    }
+  }
+  char *end = NULL;
+  unsigned long n = strtoul(val, &end, 10);
+  if (!end || *end != '\0' || n == 0ul || n > 0xfffffffful) {
+    return 0;
+  }
+  unsigned int b0 = (unsigned int)(n & 0xfful);
+  unsigned int b1 = (unsigned int)((n >> 8) & 0xfful);
+  unsigned int b2 = (unsigned int)((n >> 16) & 0xfful);
+  unsigned int b3 = (unsigned int)((n >> 24) & 0xfful);
+  int w = snprintf(out, cap, "%u.%u.%u.%u", b0, b1, b2, b3);
+  return w > 0 && (size_t)w < cap;
+}
+
+static void normalize_ip_field_copy(char *out, size_t cap, const char *val) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!val) {
+    out[0] = '\0';
+    return;
+  }
+  if (!ipv4_decimal_to_dotted_le(val, out, cap)) {
+    snprintf(out, cap, "%s", val);
+  }
+}
+
+static void append_snippet_kv(char *dst, size_t cap, const char *key, const char *val) {
+  if (!dst || cap == 0u || !key || !key[0] || !val || !val[0]) {
+    return;
+  }
+  if (strcmp(val, "-") == 0) {
+    return;
+  }
+  size_t l = strlen(dst);
+  if (l + 4u >= cap) {
+    return;
+  }
+  int n = snprintf(dst + l, cap - l, "%s%s=", l > 0u ? " " : "", key);
+  if (n <= 0 || (size_t)n >= cap - l) {
+    return;
+  }
+  l += (size_t)n;
+  for (const char *p = val; *p && l + 1u < cap; p++) {
+    char c = *p;
+    if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
+      c = '_';
+    }
+    dst[l++] = c;
+  }
+  dst[l] = '\0';
+}
 
 static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   if (!key || !val) {
@@ -79,32 +1047,149 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   if (strcmp(key, "prov") == 0) {
     snprintf(f->prov, sizeof(f->prov), "%s", val);
   } else if (strcmp(key, "pid") == 0) {
-    f->pid = strtoul(val, NULL, 10);
+    f->pid = parse_ulong_auto(val);
   } else if (strcmp(key, "epid") == 0) {
-    f->epid = strtoul(val, NULL, 10);
+    f->epid = parse_ulong_auto(val);
   } else if (strcmp(key, "hint_pid") == 0) {
-    f->epid = strtoul(val, NULL, 10);
+    f->epid = parse_ulong_auto(val);
   } else if (strcmp(key, "ppid") == 0) {
-    f->ppid = strtoul(val, NULL, 10);
+    f->ppid = parse_ulong_auto(val);
+  } else if (strcmp(key, "user") == 0 || strcmp(key, "username") == 0) {
+    snprintf(f->user, sizeof(f->user), "%s", val);
+  } else if (strcmp(key, "user_domain") == 0 || strcmp(key, "subject_domain") == 0) {
+    snprintf(f->domain, sizeof(f->domain), "%s", val);
+  } else if (strcmp(key, "parent_img") == 0 || strcmp(key, "parent_path") == 0) {
+    snprintf(f->parent_img, sizeof(f->parent_img), "%s", val);
+    f->has_parent_img = 1;
+  } else if (strcmp(key, "parent_cmdline") == 0 || strcmp(key, "parent_cmd") == 0) {
+    snprintf(f->parent_cmdline, sizeof(f->parent_cmdline), "%s", val);
+    f->has_parent_cmdline = 1;
+  } else if (strcmp(key, "current_directory") == 0 || strcmp(key, "cwd") == 0) {
+    snprintf(f->cwd, sizeof(f->cwd), "%s", val);
+    f->has_cwd = 1;
+  } else if (strcmp(key, "integrity") == 0 || strcmp(key, "mandatory_label") == 0) {
+    snprintf(f->integrity, sizeof(f->integrity), "%s", val);
+    f->has_integrity = 1;
+  } else if (strcmp(key, "token_elevation") == 0 || strcmp(key, "token_elevation_type") == 0) {
+    snprintf(f->token_elevation, sizeof(f->token_elevation), "%s", val);
+    f->has_token_elevation = 1;
+  } else if (strcmp(key, "process_creation_time") == 0 || strcmp(key, "create_time") == 0) {
+    snprintf(f->process_creation_time, sizeof(f->process_creation_time), "%s", val);
+    f->has_process_creation_time = 1;
   } else if (strcmp(key, "img") == 0) {
     snprintf(f->img, sizeof(f->img), "%s", val);
     f->has_img = 1;
   } else if (strcmp(key, "cmd") == 0) {
     snprintf(f->cmd, sizeof(f->cmd), "%s", val);
     f->has_cmd = 1;
+  } else if (strcmp(key, "cmd_id") == 0 || strcmp(key, "alert_id") == 0 ||
+             strcmp(key, "pmfe_recommended") == 0 || strcmp(key, "pmfe_trigger") == 0 ||
+             strcmp(key, "followup_only") == 0 ||
+             strcmp(key, "source_alert_id") == 0 || strcmp(key, "pmfe_status") == 0 ||
+             strcmp(key, "pmfe_verdict") == 0 || strcmp(key, "private_exec") == 0 ||
+             strcmp(key, "mz_hits") == 0 || strcmp(key, "stomp_suspicious") == 0 ||
+             strcmp(key, "thread_start_matches") == 0 || strcmp(key, "read_failures") == 0 ||
+             strcmp(key, "injection_observed") == 0 || strcmp(key, "syscall") == 0 ||
+             strcmp(key, "memfd_exec") == 0 || strcmp(key, "deleted_exec") == 0 ||
+             strcmp(key, "target_pid") == 0 || strcmp(key, "memfd_name") == 0 ||
+             strcmp(key, "sensor") == 0) {
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "path") == 0 && !f->file[0]) {
+    snprintf(f->file, sizeof(f->file), "%s", val);
+  } else if (strcmp(key, "old_file") == 0 || strcmp(key, "old_path") == 0 ||
+             strcmp(key, "source_file") == 0 || strcmp(key, "source_path") == 0 ||
+             strcmp(key, "previous_file") == 0 || strcmp(key, "previous_path") == 0 ||
+             strcmp(key, "rename_from") == 0) {
+    snprintf(f->old_file, sizeof(f->old_file), "%s", val);
+  } else if (strcmp(key, "new_file") == 0 || strcmp(key, "new_path") == 0 ||
+             strcmp(key, "target_file") == 0 || strcmp(key, "target_path") == 0 ||
+             strcmp(key, "rename_to") == 0) {
+    snprintf(f->file, sizeof(f->file), "%s", val);
   } else if (strcmp(key, "cert_revoked_ancestor") == 0 || strcmp(key, "cert_ra") == 0) {
     f->cert_revoked_ancestor = (strtoul(val, NULL, 10) != 0u) ? 1u : 0u;
     f->has_cert_revoked_ancestor = 1;
   } else if (strcmp(key, "file") == 0) {
     snprintf(f->file, sizeof(f->file), "%s", val);
+  } else if (strcmp(key, "signer") == 0 || strcmp(key, "publisher") == 0 ||
+             strcmp(key, "signature_publisher") == 0 || strcmp(key, "cert_subject") == 0) {
+    snprintf(f->signer, sizeof(f->signer), "%s", val);
+    append_sensor_kv(f, "signer", val);
+  } else if (strcmp(key, "signature_status") == 0 || strcmp(key, "signature_trust") == 0 ||
+             strcmp(key, "signed") == 0 || strcmp(key, "verified") == 0) {
+    snprintf(f->signature_status, sizeof(f->signature_status), "%s", val);
+    append_sensor_kv(f, "signature_status", val);
   } else if (strcmp(key, "qname") == 0) {
     snprintf(f->qname, sizeof(f->qname), "%s", val);
+  } else if ((strcmp(key, "ip") == 0 || strcmp(key, "dest_ip") == 0 ||
+              strcmp(key, "dst_ip") == 0 || strcmp(key, "remote_ip") == 0 ||
+              strcmp(key, "remote_addr") == 0) && !f->dst[0]) {
+    normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
+  } else if ((strcmp(key, "source_ip") == 0 || strcmp(key, "src_ip") == 0 ||
+              strcmp(key, "local_ip") == 0 || strcmp(key, "local_addr") == 0) && !f->src[0]) {
+    normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "script") == 0) {
     snprintf(f->script, sizeof(f->script), "%s", val);
+    detail_token_value(val, "service", f->webshell_service, sizeof(f->webshell_service));
+    detail_token_value(val, "action", f->webshell_action, sizeof(f->webshell_action));
+    detail_token_value(val, "alert_id", f->webshell_alert_id, sizeof(f->webshell_alert_id));
+    detail_token_value(val, "file_fp", f->webshell_file_fp, sizeof(f->webshell_file_fp));
+    detail_token_value(val, "file_uploaded", f->webshell_file_uploaded, sizeof(f->webshell_file_uploaded));
+    detail_token_value(val, "object_key", f->webshell_object_key, sizeof(f->webshell_object_key));
+    detail_token_value(val, "local_path", f->webshell_local_path, sizeof(f->webshell_local_path));
+    detail_token_value(val, "ast_score", f->webshell_ast_score, sizeof(f->webshell_ast_score));
+    detail_token_value(val, "token_score", f->webshell_token_score, sizeof(f->webshell_token_score));
+  } else if (strcmp(key, "amsi_content") == 0 || strcmp(key, "script_content") == 0 ||
+             strcmp(key, "script_text") == 0) {
+    if (!f->script[0]) {
+      snprintf(f->script, sizeof(f->script), "%s", val);
+    }
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "app_name") == 0) {
+    if (!f->has_img && val[0]) {
+      snprintf(f->img, sizeof(f->img), "%s", val);
+      f->has_img = 1;
+    }
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "url") == 0 || strcmp(key, "remote_url") == 0 || strcmp(key, "domain") == 0) {
+    snprintf(f->url, sizeof(f->url), "%s", val);
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "sha256") == 0 || strcmp(key, "file_sha256") == 0 || strcmp(key, "file_hash") == 0) {
+    snprintf(f->sha256, sizeof(f->sha256), "%s", val);
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "sensor") == 0 || strcmp(key, "provider") == 0 || strcmp(key, "scriptblock_id") == 0 ||
+             strcmp(key, "amsi_result") == 0 || strcmp(key, "script_hash") == 0 ||
+             strcmp(key, "module") == 0 ||
+             strcmp(key, "ja3") == 0 || strcmp(key, "ja3_hash") == 0 ||
+             strcmp(key, "ja3_fingerprint") == 0 || strcmp(key, "ja3_rare") == 0 ||
+             strcmp(key, "ja3_unknown") == 0 || strcmp(key, "sni") == 0 ||
+             strcmp(key, "tls_sni") == 0 || strcmp(key, "sni_suspicious") == 0 ||
+             strcmp(key, "sni_mismatch") == 0 || strcmp(key, "cert_self_signed") == 0 ||
+             strcmp(key, "cert_expired") == 0 || strcmp(key, "cert_mismatch") == 0 ||
+             strcmp(key, "cert_revoked") == 0 || strcmp(key, "cert_chain_anomaly") == 0 ||
+             strcmp(key, "cert_untrusted") == 0 || strcmp(key, "cert_subject") == 0 ||
+             strcmp(key, "cert_issuer") == 0 || strcmp(key, "cert_hash") == 0 ||
+             strcmp(key, "tls_error") == 0 || strcmp(key, "tls_alert") == 0 ||
+             strcmp(key, "amsi_session") == 0 || strcmp(key, "amsi_size") == 0 ||
+             strcmp(key, "file_rate") == 0 || strcmp(key, "ext_burst") == 0 ||
+             strcmp(key, "entropy_delta") == 0 || strcmp(key, "file_entropy_delta") == 0 ||
+             strcmp(key, "ransom_counter") == 0 ||
+             strcmp(key, "mass_rename") == 0 || strcmp(key, "extension_burst") == 0 ||
+             strcmp(key, "rename_burst") == 0 || strcmp(key, "shadow_delete") == 0 ||
+             strcmp(key, "shadowcopy_delete") == 0 || strcmp(key, "ast_score") == 0 ||
+             strcmp(key, "token_score") == 0 || strcmp(key, "semantic_score") == 0 ||
+             strcmp(key, "ast") == 0 || strcmp(key, "token") == 0 ||
+             strcmp(key, "features") == 0 || strcmp(key, "ast_tokens") == 0 ||
+             strcmp(key, "token_features") == 0) {
+    if (strcmp(key, "ast_score") == 0 || strcmp(key, "ast") == 0) {
+      snprintf(f->webshell_ast_score, sizeof(f->webshell_ast_score), "%s", val);
+    } else if (strcmp(key, "token_score") == 0 || strcmp(key, "token") == 0) {
+      snprintf(f->webshell_token_score, sizeof(f->webshell_token_score), "%s", val);
+    }
+    append_sensor_kv(f, key, val);
   } else if (strcmp(key, "dst") == 0) {
-    snprintf(f->dst, sizeof(f->dst), "%s", val);
+    normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
   } else if (strcmp(key, "src") == 0) {
-    snprintf(f->src, sizeof(f->src), "%s", val);
+    normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "dpt") == 0) {
     f->dport = strtoul(val, NULL, 10);
     f->has_dport = 1;
@@ -112,9 +1197,9 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->sport = strtoul(val, NULL, 10);
     f->has_sport = 1;
   } else if (strcmp(key, "laddr") == 0) {
-    snprintf(f->src, sizeof(f->src), "%s", val);
+    normalize_ip_field_copy(f->src, sizeof(f->src), val);
   } else if (strcmp(key, "raddr") == 0) {
-    snprintf(f->dst, sizeof(f->dst), "%s", val);
+    normalize_ip_field_copy(f->dst, sizeof(f->dst), val);
   } else if (strcmp(key, "lport") == 0) {
     f->sport = strtoul(val, NULL, 10);
     f->has_sport = 1;
@@ -147,6 +1232,26 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->forensic_kind, sizeof(f->forensic_kind), "%s", val);
   } else if (strcmp(key, "pcap_stem") == 0) {
     snprintf(f->pcap_stem, sizeof(f->pcap_stem), "%s", val);
+  } else if (strcmp(key, "pcap_status") == 0) {
+    snprintf(f->pcap_status, sizeof(f->pcap_status), "%s", val);
+  } else if (strcmp(key, "pcap_object_key") == 0) {
+    snprintf(f->pcap_object_key, sizeof(f->pcap_object_key), "%s", val);
+  } else if (strcmp(key, "preview_hex") == 0) {
+    snprintf(f->preview_hex, sizeof(f->preview_hex), "%s", val);
+  } else if (strcmp(key, "service") == 0) {
+    snprintf(f->webshell_service, sizeof(f->webshell_service), "%s", val);
+  } else if (strcmp(key, "action") == 0) {
+    snprintf(f->webshell_action, sizeof(f->webshell_action), "%s", val);
+  } else if (strcmp(key, "alert_id") == 0) {
+    snprintf(f->webshell_alert_id, sizeof(f->webshell_alert_id), "%s", val);
+  } else if (strcmp(key, "file_fp") == 0) {
+    snprintf(f->webshell_file_fp, sizeof(f->webshell_file_fp), "%s", val);
+  } else if (strcmp(key, "file_uploaded") == 0) {
+    snprintf(f->webshell_file_uploaded, sizeof(f->webshell_file_uploaded), "%s", val);
+  } else if (strcmp(key, "object_key") == 0) {
+    snprintf(f->webshell_object_key, sizeof(f->webshell_object_key), "%s", val);
+  } else if (strcmp(key, "local_path") == 0) {
+    snprintf(f->webshell_local_path, sizeof(f->webshell_local_path), "%s", val);
   } else if (strcmp(key, "forensic_frames") == 0) {
     f->forensic_frames = strtoul(val, NULL, 10);
     f->has_forensic_frames = 1;
@@ -162,17 +1267,37 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "ring_span_ns") == 0) {
     snprintf(f->ring_span_ns, sizeof(f->ring_span_ns), "%s", val);
     f->has_ring_meta = 1;
+  } else if (strcmp(key, "attrib_schema") == 0) {
+    snprintf(f->attrib_schema, sizeof(f->attrib_schema), "%s", val);
+  } else if (strcmp(key, "attrib_cve") == 0) {
+    snprintf(f->attrib_cve, sizeof(f->attrib_cve), "%s", val);
+  } else if (strcmp(key, "attrib_family") == 0) {
+    snprintf(f->attrib_family, sizeof(f->attrib_family), "%s", val);
+  } else if (strcmp(key, "attrib_product") == 0) {
+    snprintf(f->attrib_product, sizeof(f->attrib_product), "%s", val);
+  } else if (strcmp(key, "attrib_vector") == 0) {
+    snprintf(f->attrib_vector, sizeof(f->attrib_vector), "%s", val);
+  } else if (strcmp(key, "attrib_confidence") == 0) {
+    snprintf(f->attrib_confidence, sizeof(f->attrib_confidence), "%s", val);
+  } else if (strcmp(key, "attrib_source") == 0) {
+    snprintf(f->attrib_source, sizeof(f->attrib_source), "%s", val);
+  } else if (strcmp(key, "attrib_basis") == 0) {
+    snprintf(f->attrib_basis, sizeof(f->attrib_basis), "%s", val);
   } else if (strcmp(key, "shellcode_json") == 0) {
     snprintf(f->shellcode_json, sizeof(f->shellcode_json), "%s", val);
-  } else if (strcmp(key, "regkey") == 0) {
+  } else if (strcmp(key, "regkey") == 0 || strcmp(key, "registry_key") == 0 ||
+             strcmp(key, "registry_path") == 0 || strcmp(key, "target_object") == 0) {
     snprintf(f->regkey, sizeof(f->regkey), "%s", val);
-  } else if (strcmp(key, "regpath") == 0 && !f->regkey[0]) {
+  } else if ((strcmp(key, "regpath") == 0 || strcmp(key, "key_path") == 0) && !f->regkey[0]) {
     snprintf(f->regkey, sizeof(f->regkey), "%s", val);
-  } else if (strcmp(key, "regname") == 0) {
+  } else if (strcmp(key, "regname") == 0 || strcmp(key, "registry_value") == 0 ||
+             strcmp(key, "value_name") == 0) {
     snprintf(f->regname, sizeof(f->regname), "%s", val);
-  } else if (strcmp(key, "regdata") == 0) {
+  } else if (strcmp(key, "regdata") == 0 || strcmp(key, "registry_data") == 0 ||
+             strcmp(key, "value_data") == 0 || strcmp(key, "details") == 0) {
     snprintf(f->regdata, sizeof(f->regdata), "%s", val);
-  } else if (strcmp(key, "regop") == 0) {
+  } else if (strcmp(key, "regop") == 0 || strcmp(key, "registry_op") == 0 ||
+             strcmp(key, "operation") == 0) {
     snprintf(f->regop, sizeof(f->regop), "%s", val);
   }
 }
@@ -236,8 +1361,17 @@ static void apply_mitre_hints(EdrBehaviorRecord *r) {
     snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1562.004");
     r->mitre_ttp_count++;
   }
-  if (r->type == EDR_EVENT_PMFE_SCAN_RESULT && r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
+  if (r->type == EDR_EVENT_PMFE_SCAN_RESULT &&
+      strstr(r->script_snippet, "pmfe_verdict=suspicious") != NULL &&
+      r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
     snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1055");
+    r->mitre_ttp_count++;
+  }
+  if ((r->type == EDR_EVENT_REG_CREATE_KEY || r->type == EDR_EVENT_REG_SET_VALUE ||
+       r->type == EDR_EVENT_SERVICE_CREATE || r->type == EDR_EVENT_SCHEDULED_TASK_CREATE ||
+       r->type == EDR_EVENT_DRIVER_LOAD) &&
+      r->mitre_ttp_count < (int)EDR_BR_MAX_MITRE) {
+    snprintf(r->mitre_ttps[r->mitre_ttp_count], sizeof(r->mitre_ttps[0]), "%s", "T1547.001");
     r->mitre_ttp_count++;
   }
   const char *hay = r->cmdline[0] ? r->cmdline : r->script_snippet;
@@ -276,13 +1410,64 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
     if (ef.has_cmd) {
       snprintf(r->cmdline, sizeof(r->cmdline), "%s", ef.cmd);
+      if (!r->exe_path[0]) {
+        char first[EDR_BR_STR_LONG];
+        first_cmd_token(ef.cmd, first, sizeof(first));
+        if (first[0]) {
+          snprintf(r->exe_path, sizeof(r->exe_path), "%s", first);
+          snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(first));
+        }
+      }
+    }
+    if (ef.user[0]) {
+      if (ef.domain[0]) {
+        snprintf(r->username, sizeof(r->username), "%s\\%s", ef.domain, ef.user);
+      } else {
+        snprintf(r->username, sizeof(r->username), "%s", ef.user);
+      }
+    }
+    if (ef.domain[0]) {
+      snprintf(r->domain, sizeof(r->domain), "%s", ef.domain);
+    }
+    if (ef.has_parent_img) {
+      snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.parent_img);
+      snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.parent_img));
+    }
+    if (ef.has_parent_cmdline) {
+      snprintf(r->parent_cmdline, sizeof(r->parent_cmdline), "%s", ef.parent_cmdline);
+    }
+    if (ef.has_cwd) {
+      snprintf(r->current_directory, sizeof(r->current_directory), "%s", ef.cwd);
+    }
+    if (ef.has_integrity) {
+      snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integrity);
+    }
+    if (ef.has_token_elevation) {
+      r->token_elevation = parse_token_elevation_type(ef.token_elevation);
+    }
+    if (ef.has_process_creation_time) {
+      snprintf(r->process_creation_time, sizeof(r->process_creation_time), "%s", ef.process_creation_time);
     }
     if (ef.file[0]) {
       snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
       snprintf(r->file_op, sizeof(r->file_op), "event");
     }
+    if (ef.old_file[0]) {
+      char old_ext[16];
+      char new_ext[16];
+      extension_c(ef.old_file, old_ext, sizeof(old_ext));
+      extension_c(r->file_path[0] ? r->file_path : ef.file, new_ext, sizeof(new_ext));
+      append_record_kv(r, "old_ext=%s new_ext=%s ext_changed=%d",
+                       old_ext, new_ext, strcmp(old_ext, new_ext) != 0 ? 1 : 0);
+    }
     if (ef.qname[0]) {
       snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.qname);
+    }
+    if (ef.url[0] && !r->dns_query[0]) {
+      snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.url);
+    }
+    if (ef.sha256[0]) {
+      snprintf(r->exe_hash, sizeof(r->exe_hash), "%s", ef.sha256);
     }
     if (ef.script[0]) {
       snprintf(r->script_snippet, sizeof(r->script_snippet), "%s", ef.script);
@@ -331,7 +1516,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       snprintf(r->reg_op, sizeof(r->reg_op), "delete_key");
     }
     if (ef.score[0] || ef.proto[0] || ef.detector[0] || ef.rule[0] || ef.mitre[0] || ef.forensic_kind[0] ||
-        ef.pcap_stem[0] || ef.has_forensic_frames || ef.has_ring_meta || ef.shellcode_json[0]) {
+        ef.pcap_stem[0] || ef.pcap_status[0] || ef.pcap_object_key[0] || ef.preview_hex[0] ||
+        ef.has_forensic_frames || ef.has_ring_meta || ef.shellcode_json[0]) {
       if (ef.has_forensic_frames) {
         snprintf(r->script_snippet, sizeof(r->script_snippet),
                  "detector=%s rule=%s score=%s proto=%s mitre=%s forensic=%s stem=%s frames=%lu",
@@ -345,6 +1531,18 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                  ef.proto[0] ? ef.proto : "-", ef.mitre[0] ? ef.mitre : "-", ef.forensic_kind[0] ? ef.forensic_kind : "-",
                  ef.pcap_stem[0] ? ef.pcap_stem : "-");
       }
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "pcap_status", ef.pcap_status);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "pcap_object_key", ef.pcap_object_key);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "payload_sha256", ef.sha256);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "preview_hex", ef.preview_hex);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_schema", ef.attrib_schema);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_cve", ef.attrib_cve);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_family", ef.attrib_family);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_product", ef.attrib_product);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_vector", ef.attrib_vector);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_confidence", ef.attrib_confidence);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_source", ef.attrib_source);
+      append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "attrib_basis", ef.attrib_basis);
       if (ef.has_ring_meta) {
         size_t L = strlen(r->script_snippet);
         snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, " ring_slot=%s span_ns=%s",
@@ -355,6 +1553,21 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, " | %s", ef.shellcode_json);
       }
     }
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "service", ef.webshell_service);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "action", ef.webshell_action);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "url", ef.url);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "alert_id", ef.webshell_alert_id);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "file_fp", ef.webshell_file_fp);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "file_uploaded", ef.webshell_file_uploaded);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "object_key", ef.webshell_object_key);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "local_path", ef.webshell_local_path);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "ast_score", ef.webshell_ast_score);
+    append_snippet_kv(r->script_snippet, sizeof(r->script_snippet), "token_score", ef.webshell_token_score);
+    if (ef.sensor_detail[0]) {
+      size_t L = strlen(r->script_snippet);
+      snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, "%s%s",
+               L > 0u ? " " : "", ef.sensor_detail);
+    }
   } else if (slot->size > 0) {
     size_t n = slot->size;
     if (n >= sizeof(r->cmdline)) {
@@ -364,5 +1577,6 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     r->cmdline[n] = '\0';
   }
 
+  enrich_ransom_file_counters(r);
   apply_mitre_hints(r);
 }

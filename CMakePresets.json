@@ -9,11 +9,11 @@
     },
     {
       "name": "w-vcpkg-ninja-dev",
-      "displayName": "Win vcpkg+Ninja 快编（无 gRPC/HTTPS REST/无 ORT/无 YARA/无 FL）",
+      "displayName": "Win vcpkg+Ninja 快编（no-gRPC/HTTPS REST/YARA；无 ORT/无 FL）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置。产品主线固定 no-gRPC/no-FL。",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置；先 vcpkg install --x-feature=yara。产品主线固定 no-gRPC/no-FL，Windows 构建强制 YARA。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -23,18 +23,20 @@
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
         "EDR_WITH_ONNXRUNTIME": "OFF",
-        "EDR_WITH_YARA": "OFF",
+        "VCPKG_MANIFEST_FEATURES": "yara",
+        "EDR_WITH_YARA": "ON",
+        "EDR_REQUIRE_YARA": "ON",
         "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },
     {
       "name": "w-vcpkg-ninja-nogrpc",
-      "displayName": "Win vcpkg+Ninja 无 gRPC（HTTPS REST；先 vcpkg install）",
+      "displayName": "Win vcpkg+Ninja 无 gRPC（HTTPS REST + YARA；先 vcpkg install --x-feature=yara）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "不编 gRPC；须 vcpkg 的 curl+openssl+sqlite，使 HTTPS REST ingest/engine-health 与本地状态库可用。设 VCPKG_ROOT 后 cmake --preset。",
+      "description": "不编 gRPC；须 vcpkg 的 curl+openssl+sqlite+yara，使 HTTPS REST、本地状态库与 libyara 扫描可用。设 VCPKG_ROOT 并先 vcpkg install --x-feature=yara 后 cmake --preset。" ,
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -44,7 +46,9 @@
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
         "EDR_WITH_ONNXRUNTIME": "OFF",
-        "EDR_WITH_YARA": "OFF",
+        "VCPKG_MANIFEST_FEATURES": "yara",
+        "EDR_WITH_YARA": "ON",
+        "EDR_REQUIRE_YARA": "ON",
         "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
@@ -65,7 +69,9 @@
         "EDR_REQUIRE_SQLITE": "ON",
         "EDR_WITH_ONNXRUNTIME": "ON",
         "ONNXRUNTIME_ROOT": "$env{ONNXRUNTIME_ROOT}",
+        "VCPKG_MANIFEST_FEATURES": "yara",
         "EDR_WITH_YARA": "ON",
+        "EDR_REQUIRE_YARA": "ON",
         "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_WITH_FL_KAFKA": "OFF",
         "EDR_BUILD_TESTS": "OFF"

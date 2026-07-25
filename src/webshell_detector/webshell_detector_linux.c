@@ -7,9 +7,11 @@
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
-#include "edr/grpc_client.h"
+#include "edr/ingest_http.h"
+#include "edr/transport_v2.h"
 #include "edr/types.h"
 #include "edr/webshell_forensic.h"
+#include "edr/webshell_semantic.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -50,6 +52,8 @@ typedef struct {
 typedef struct {
   char rule_name[128];
   float confidence;
+  float ast_score;
+  float token_score;
   int matched;
 } WebshellRuleMatch;
 
@@ -65,6 +69,9 @@ static WebRoot s_roots[WEBSHELL_MAX_ROOTS];
 static size_t s_root_count;
 static WatchEntry s_watches[WEBSHELL_MAX_WATCHES];
 static size_t s_watch_count;
+static uint64_t s_budget_window_ns;
+static uint64_t s_budget_bytes;
+static uint64_t s_budget_drops;
 
 #ifdef EDR_HAVE_YARA
 static YR_RULES *s_yara_rules;
@@ -88,6 +95,25 @@ static uint64_t now_ns(void) {
 }
 
 static void ms_sleep(unsigned ms) { usleep(ms * 1000u); }
+
+static int webshell_scan_budget_allow(uint64_t bytes) {
+  if (!s_cfg || s_cfg->resource_limit.webshell_scan_mb_per_min == 0u) {
+    return 1;
+  }
+  uint64_t now = now_ns();
+  if (s_budget_window_ns == 0u || now < s_budget_window_ns ||
+      now - s_budget_window_ns >= 60000000000ULL) {
+    s_budget_window_ns = now;
+    s_budget_bytes = 0u;
+  }
+  uint64_t cap = (uint64_t)s_cfg->resource_limit.webshell_scan_mb_per_min * 1024ULL * 1024ULL;
+  if (bytes > cap || s_budget_bytes + bytes > cap) {
+    s_budget_drops++;
+    return 0;
+  }
+  s_budget_bytes += bytes;
+  return 1;
+}
 
 static int starts_with_ci(const char *s, const char *prefix) {
   size_t n = strlen(prefix);
@@ -124,6 +150,9 @@ static int pre_filter(const char *full_path) {
   }
   uint64_t max_bytes = (uint64_t)s_cfg->webshell_detector.max_file_size_mb * 1024ULL * 1024ULL;
   if ((uint64_t)st.st_size == 0u || (uint64_t)st.st_size > max_bytes) {
+    return 0;
+  }
+  if (!webshell_scan_budget_allow((uint64_t)st.st_size)) {
     return 0;
   }
   off_t size1 = st.st_size;
@@ -317,17 +346,29 @@ static int is_rule_file(const char *name) {
   return strcmp(dot, ".yar") == 0 || strcmp(dot, ".yara") == 0;
 }
 
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static void yara_compile_cb(int err_level, const char *file_name, int line_number, const YR_RULE *rule,
+                            const char *message, void *user_data) {
+#else
 static int yara_compile_cb(int err_level, const char *file_name, int line_number, const YR_RULE *rule,
                            const char *message, void *user_data) {
+#endif
   (void)err_level;
   (void)rule;
   (void)user_data;
   fprintf(stderr, "[webshell_detector] yara compile error file=%s line=%d msg=%s\n", file_name ? file_name : "-",
           line_number, message ? message : "-");
+#if !defined(YR_VERSION_HEX) || YR_VERSION_HEX < 0x040500
   return 0;
+#endif
 }
 
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static int yara_scan_cb(YR_SCAN_CONTEXT *context, int msg, void *msg_data, void *user_data) {
+  (void)context;
+#else
 static int yara_scan_cb(int msg, void *msg_data, void *user_data) {
+#endif
   WebshellRuleMatch *m = (WebshellRuleMatch *)user_data;
   if (msg == CALLBACK_MSG_RULE_MATCHING && m && !m->matched) {
     const YR_RULE *r = (const YR_RULE *)msg_data;
@@ -413,6 +454,17 @@ static int load_yara(const char *dir) {
 static int fallback_match_text(const char *text, WebshellRuleMatch *out) {
   if (!text || !out) {
     return 0;
+  }
+  {
+    EdrWebshellSemanticResult sem;
+    if (edr_webshell_semantic_match_text(text, &sem)) {
+      snprintf(out->rule_name, sizeof(out->rule_name), "%s", sem.rule_name);
+      out->confidence = sem.confidence;
+      out->ast_score = sem.ast_score;
+      out->token_score = sem.token_score;
+      out->matched = 1;
+      return 1;
+    }
   }
   if ((strcasestr(text, "eval(") && strcasestr(text, "$_POST")) || strcasestr(text, "eval(base64_decode($_POST")) {
     snprintf(out->rule_name, sizeof(out->rule_name), "%s", "PHP_Webshell_OneLiners");
@@ -506,7 +558,7 @@ static int push_alert_event(const char *path, const char *action, const WebRoot 
       if (s_cfg->agent.tenant_id[0]) {
         tenant = s_cfg->agent.tenant_id;
       }
-      if (edr_grpc_client_upload_file(alert_id, path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 &&
+      if (edr_transport_v2_upload_file(alert_id, path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 &&
           object_key[0]) {
         file_uploaded = 1;
       } else {
@@ -525,10 +577,13 @@ static int push_alert_event(const char *path, const char *action, const WebRoot 
   slot.priority = (m->confidence >= s_cfg->webshell_detector.l2_review_threshold) ? 0 : 1;
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=webshell\ndetector=yara\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
-                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s\n",
-                   m->rule_name, m->confidence, path, root->service_name, action ? action : "-", url, alert_id,
-                   fp[0] ? fp : "-", file_uploaded, object_key[0] ? object_key : "-", staged_path[0] ? staged_path : "-");
+                   "ETW1\nprov=webshell\ndetector=%s\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
+                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s ast_score=%.3f "
+                   "token_score=%.3f\n",
+                   strncmp(m->rule_name, "WebShell_AST_Token_", 19u) == 0 ? "semantic" : "yara", m->rule_name,
+                   m->confidence, path, root->service_name, action ? action : "-", url, alert_id, fp[0] ? fp : "-",
+                   file_uploaded, object_key[0] ? object_key : "-", staged_path[0] ? staged_path : "-", m->ast_score,
+                   m->token_score);
   if (n < 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return -1;
   }
@@ -780,3 +835,9 @@ void edr_webshell_detector_shutdown(void) {
   unload_yara();
 #endif
 }
+
+unsigned int edr_webshell_detector_watch_count(void) {
+  return (unsigned int)s_watch_count;
+}
+
+uint64_t edr_webshell_detector_budget_drop_count(void) { return s_budget_drops; }

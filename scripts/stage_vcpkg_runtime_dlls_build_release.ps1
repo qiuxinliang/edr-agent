@@ -1,10 +1,10 @@
-# 将 vcpkg x64-windows 的 bin\*.dll 复制到 build\Release\，与 FDSensor.exe 同目录分发。
+# 将当前目标架构 vcpkg triplet 的 bin\*.dll 复制到 build\Release\。
 # 在 edr-agent 根目录、Release 已生成 FDSensor.exe 后执行。
-# 由 CI 在构建后调用；VCPKG_INSTALLED_X64 为 .../vcpkg_installed/x64-windows
+# 由 CI 在构建后调用；优先使用 VCPKG_INSTALLED_ROOT，兼容旧的 VCPKG_INSTALLED_X64。
 $ErrorActionPreference = "Stop"
-$V = $env:VCPKG_INSTALLED_X64
+$V = if ($env:VCPKG_INSTALLED_ROOT) { $env:VCPKG_INSTALLED_ROOT } else { $env:VCPKG_INSTALLED_X64 }
 if (-not $V) {
-  Write-Error "Set VCPKG_INSTALLED_X64 to vcpkg_installed\x64-windows (e.g. under edr-agent)"
+  Write-Error "Set VCPKG_INSTALLED_ROOT to the target vcpkg triplet directory (x64-windows or arm64-windows)"
   exit 1
 }
 $bin = Join-Path $V "bin"
@@ -18,6 +18,21 @@ $legacySingleConfigExe = Join-Path $singleConfigDir "edr_agent.exe"
 if (-not (Test-Path -LiteralPath $bin)) {
   Write-Error "No bin: $bin"
   exit 1
+}
+$yaraRuntimeDlls = @(Get-ChildItem -Path $bin -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
+$yaraPackageArtifacts = @(
+  (Join-Path $V "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+  (Join-Path $V "lib\yara.lib"),
+  (Join-Path $V "lib\libyara.lib")
+) | Where-Object { Test-Path -LiteralPath $_ }
+if (-not $yaraRuntimeDlls -or $yaraRuntimeDlls.Count -lt 1) {
+  if (-not $yaraPackageArtifacts -or $yaraPackageArtifacts.Count -lt 1) {
+    Write-Error "YARA package artifacts missing from vcpkg root: $V. Install vcpkg manifest feature 'yara' for the target triplet before staging."
+    exit 1
+  }
+  Write-Warning "No YARA runtime DLL found under $bin; vcpkg libyara appears to be linked statically for this triplet. Continuing after verifying package artifacts: $($yaraPackageArtifacts -join ', ')"
+} else {
+  Write-Host "Found YARA runtime DLL(s) in vcpkg bin: $($yaraRuntimeDlls.Name -join ', ')"
 }
 if (-not (Test-Path -LiteralPath $releaseExe)) {
   if (Test-Path -LiteralPath $singleConfigExe) {
@@ -43,3 +58,13 @@ Get-ChildItem -Path $bin -Filter "*.dll" -File -ErrorAction SilentlyContinue | F
   $n++
 }
 Write-Host "Staged $n vcpkg DLL(s) from $bin into $releaseDir"
+$stagedYaraRuntimeDlls = @(Get-ChildItem -Path $releaseDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
+if (-not $stagedYaraRuntimeDlls -or $stagedYaraRuntimeDlls.Count -lt 1) {
+  if ($yaraRuntimeDlls -and $yaraRuntimeDlls.Count -ge 1) {
+    Write-Error "YARA runtime DLL was not staged into $releaseDir"
+    exit 1
+  }
+  Write-Warning "No YARA runtime DLL staged because vcpkg libyara is static for this triplet."
+} else {
+  Write-Host "Verified staged YARA runtime DLL(s): $($stagedYaraRuntimeDlls.Name -join ', ')"
+}

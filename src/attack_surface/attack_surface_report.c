@@ -1,10 +1,12 @@
-/* §19 攻击面：GET_ATTACK_SURFACE — 轻量采集 + POST 平台（需 curl 与 [platform] 或 EDR_PLATFORM_REST_BASE） */
+/* §19 攻击面：GET_ATTACK_SURFACE — 轻量采集 + 复用内置 HTTP 传输栈 POST 平台 */
 
 #include "edr/attack_surface_report.h"
 #include "edr/attack_surface_egress.h"
+#include "edr/attack_surface_inventory.h"
 #include "edr/security_policy_collect.h"
+#include "edr/ingest_http.h"
+#include "cJSON.h"
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,13 +16,29 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <process.h>
 #include "edr/attack_surface_win_util.h"
 #include "edr/listen_table_win.h"
-#define EDR_GETPID (int)GetCurrentProcessId
+#define EDR_GETPID() ((int)GetCurrentProcessId())
 #else
 #include <pthread.h>
+#include <sys/wait.h>
 #include <unistd.h>
-#define EDR_GETPID (int)getpid
+#define EDR_GETPID() ((int)getpid())
+#endif
+
+#ifdef _WIN32
+/** Windows 临时路径统一转为正斜杠，避免后续文件读取/日志中的反斜杠转义歧义。 */
+static void win_path_fwd_slashes(char *p) {
+  if (!p) {
+    return;
+  }
+  for (; *p; ++p) {
+    if (*p == '\\') {
+      *p = '/';
+    }
+  }
+}
 #endif
 
 /** 与 `[attack_surface]` 对齐：单次 ss 解析与快照序列化上限 */
@@ -51,6 +69,24 @@ static void json_escape_str(FILE *f, const char *s) {
     }
   }
   fputc('"', f);
+}
+
+static void copy_text_file_to_stream(FILE *out, const char *path) {
+  FILE *in = fopen(path, "rb");
+  if (!in) {
+    return;
+  }
+  char buf[4096];
+  for (;;) {
+    size_t n = fread(buf, 1u, sizeof(buf), in);
+    if (n > 0u) {
+      (void)fwrite(buf, 1u, n, out);
+    }
+    if (n < sizeof(buf)) {
+      break;
+    }
+  }
+  fclose(in);
 }
 
 #ifdef __linux__
@@ -140,6 +176,40 @@ static int parse_pid_users(const char *proc, int *pid_out) {
   return sscanf(p + 4, "%d", pid_out) == 1 ? 0 : -1;
 }
 
+static FILE *open_ss_ltnp_reader(pid_t *child_out) {
+  if (child_out) {
+    *child_out = -1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    return NULL;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return NULL;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    (void)dup2(pfd[1], STDOUT_FILENO);
+    close(pfd[1]);
+    execlp("ss", "ss", "-ltnp", (char *)NULL);
+    _exit(127);
+  }
+  close(pfd[1]);
+  FILE *pf = fdopen(pfd[0], "r");
+  if (!pf) {
+    close(pfd[0]);
+    (void)waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  if (child_out) {
+    *child_out = pid;
+  }
+  return pf;
+}
+
 static void proc_name_from_users(const char *proc, char *name, size_t cap) {
   name[0] = 0;
   const char *q = strstr(proc, "((\"");
@@ -160,9 +230,10 @@ static void proc_name_from_users(const char *proc, char *name, size_t cap) {
 }
 
 static int collect_listeners_linux(AsListener *out, int max_out, int *truncated) {
-  FILE *pf = popen("ss -ltnp 2>/dev/null", "r");
+  pid_t child = -1;
+  FILE *pf = open_ss_ltnp_reader(&child);
   if (!pf) {
-    return 0;
+    return -1;
   }
   char line[2048];
   int n = 0;
@@ -218,7 +289,15 @@ static int collect_listeners_linux(AsListener *out, int max_out, int *truncated)
     snprintf(L->id, sizeof(L->id), "l-%d", n);
     n++;
   }
-  (void)pclose(pf);
+  int close_rc = fclose(pf);
+  if (child > 0) {
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) < 0 || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
+      return -1;
+    }
+  }
+  if (close_rc != 0) return -1;
   return n;
 }
 #elif defined(_WIN32)
@@ -267,28 +346,9 @@ static int collect_listeners_platform(AsListener *out, int max_out, int *truncat
 }
 #endif
 
-static void strip_trailing_slash(char *s) {
-  size_t n = strlen(s);
-  while (n > 0 && (s[n - 1] == '/' || s[n - 1] == '\\')) {
-    s[--n] = 0;
-  }
-}
-
-static void resolve_rest_base(const EdrConfig *cfg, char *out, size_t cap) {
-  const char *e = getenv("EDR_PLATFORM_REST_BASE");
-  if (e && e[0]) {
-    snprintf(out, cap, "%s", e);
-  } else if (cfg && cfg->platform.rest_base_url[0]) {
-    snprintf(out, cap, "%s", cfg->platform.rest_base_url);
-  } else {
-    out[0] = 0;
-  }
-  strip_trailing_slash(out);
-}
-
 uint32_t edr_attack_surface_effective_periodic_interval_s(const EdrConfig *cfg) {
   if (!cfg) {
-    return 1800u;
+    return 7200u;
   }
   uint32_t m = cfg->attack_surface.port_interval_s;
   if (cfg->attack_surface.service_interval_s < m) {
@@ -540,58 +600,109 @@ static void *asurf_thread_egress(void *arg) {
 static void asurf_gather_policy_and_egress(const EdrConfig *cfg, EdrSecurityPolicySnap *sp,
                                            EdrAsurfEgressRow *eg, int eg_max, int *n_eg, int *susp,
                                            int *eg_trunc) {
-  AsurfGatherParallel ctx = {.cfg = cfg,
-                             .sp = sp,
-                             .eg = eg,
-                             .eg_max = eg_max,
-                             .n_eg = n_eg,
-                             .susp = susp,
-                             .eg_trunc = eg_trunc};
+  AsurfGatherParallel ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.cfg = cfg;
+  ctx.sp = sp;
+  ctx.eg = eg;
+  ctx.eg_max = eg_max;
+  ctx.n_eg = n_eg;
+  ctx.susp = susp;
+  ctx.eg_trunc = eg_trunc;
 #ifdef _WIN32
   HANDLE tp = CreateThread(NULL, 0, asurf_thread_policy, &ctx, 0, NULL);
   HANDLE te = CreateThread(NULL, 0, asurf_thread_egress, &ctx, 0, NULL);
-  if (!tp || !te) {
-    if (tp) {
-      CloseHandle(tp);
-    }
-    if (te) {
-      CloseHandle(te);
-    }
+  if (tp && te) {
+    HANDLE arr[2] = {tp, te};
+    (void)WaitForMultipleObjects(2, arr, TRUE, INFINITE);
+  } else if (tp) {
+    edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
+    (void)WaitForSingleObject(tp, INFINITE);
+  } else if (te) {
+    edr_security_policy_snap_collect(cfg, sp);
+    (void)WaitForSingleObject(te, INFINITE);
+  } else {
     edr_security_policy_snap_collect(cfg, sp);
     edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
-    return;
   }
-  HANDLE arr[2] = {tp, te};
-  WaitForMultipleObjects(2, arr, TRUE, INFINITE);
-  CloseHandle(tp);
-  CloseHandle(te);
+  if (tp) {
+    CloseHandle(tp);
+  }
+  if (te) {
+    CloseHandle(te);
+  }
 #else
   pthread_t tpol = 0;
   pthread_t tegr = 0;
-  if (pthread_create(&tpol, NULL, asurf_thread_policy, &ctx) != 0 ||
-      pthread_create(&tegr, NULL, asurf_thread_egress, &ctx) != 0) {
+  int have_policy = pthread_create(&tpol, NULL, asurf_thread_policy, &ctx) == 0;
+  int have_egress = pthread_create(&tegr, NULL, asurf_thread_egress, &ctx) == 0;
+  if (!have_policy) {
     edr_security_policy_snap_collect(cfg, sp);
-    edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
-    return;
   }
-  (void)pthread_join(tpol, NULL);
-  (void)pthread_join(tegr, NULL);
+  if (!have_egress) {
+    edr_asurf_collect_egress(cfg, eg, eg_max, n_eg, susp, eg_trunc);
+  }
+  if (have_policy) {
+    (void)pthread_join(tpol, NULL);
+  }
+  if (have_egress) {
+    (void)pthread_join(tegr, NULL);
+  }
 #endif
 }
 
-static int asurf_listeners_only_mode(const char *command_id) {
+static int asurf_listeners_only_mode(const char *command_id, const uint8_t *payload,
+                                     size_t payload_len) {
   const char *lo = getenv("EDR_ATTACK_SURFACE_LISTENERS_ONLY");
   if (lo && lo[0] == '1') {
     return 1;
   }
-  if (command_id && strcmp(command_id, "etw_tcpip_wf") == 0) {
-    const char *el = getenv("EDR_ATTACK_SURFACE_ETW_LIGHT");
-    if (el && el[0] == '1') {
-      return 1;
+  int etw_trigger = command_id && strcmp(command_id, "etw_tcpip_wf") == 0;
+  if (payload && payload_len > 0u && payload_len <= 4096u) {
+    cJSON *root = cJSON_ParseWithLength((const char *)payload, payload_len);
+    if (root) {
+      cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+      cJSON *light = cJSON_GetObjectItemCaseSensitive(root, "listeners_only");
+      if (cJSON_IsString(reason) && reason->valuestring &&
+          strcmp(reason->valuestring, "etw_tcpip_wf") == 0) etw_trigger = 1;
+      if (cJSON_IsTrue(light)) etw_trigger = 1;
+      cJSON_Delete(root);
     }
+  }
+  if (etw_trigger) {
+    const char *el = getenv("EDR_ATTACK_SURFACE_ETW_LIGHT");
+    if (!el || el[0] != '0') return 1;
   }
   return 0;
 }
+
+static uint64_t asurf_monotonic_ms(void) {
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0u;
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+#ifdef _WIN32
+static volatile LONG s_asurf_execute_running;
+static int asurf_execute_try_lock(void) {
+  return InterlockedCompareExchange(&s_asurf_execute_running, 1, 0) == 0;
+}
+static void asurf_execute_unlock(void) { InterlockedExchange(&s_asurf_execute_running, 0); }
+#else
+static volatile unsigned s_asurf_execute_running;
+static int asurf_execute_try_lock(void) {
+  unsigned expected = 0u;
+  return __atomic_compare_exchange_n(&s_asurf_execute_running, &expected, 1u, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+static void asurf_execute_unlock(void) {
+  __atomic_store_n(&s_asurf_execute_running, 0u, __ATOMIC_RELEASE);
+}
+#endif
 
 static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsListener *L, int nL,
                                int truncated_ss, int listeners_only) {
@@ -599,6 +710,7 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   if (!f) {
     return -1;
   }
+  /* collectedAt: UTC (trailing Z). Compare with local OS clock by converting local -> UTC. */
   time_t now = time(NULL);
 #ifdef _WIN32
   struct tm tmb;
@@ -628,12 +740,24 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     egTrunc = 0;
   } else {
     asurf_gather_policy_and_egress(cfg, &sp, Eg, EDR_ASURF_EGRESS_OUT_MAX, &nEg, &suspEg, &egTrunc);
+    if (!cfg->attack_surface.egress_enabled) { nEg = 0; suspEg = 0; egTrunc = 0; }
+    if (!cfg->attack_surface.defender_enabled) memset(&sp, 0, sizeof(sp));
+  }
+
+  EdrAsurfInventorySummary inv;
+  memset(&inv, 0, sizeof(inv));
+  char inv_path[1100];
+  snprintf(inv_path, sizeof(inv_path), "%s.inv", path);
+  FILE *invf = fopen(inv_path, "wb");
+  if (invf) {
+    edr_asurf_inventory_write_json(invf, cfg, listeners_only, &inv);
+    fclose(invf);
   }
 
   int pub = 0;
   int webInst = 0;
   for (int i = 0; i < nE; i++) {
-    if (strcmp(E[i].scope, "public") == 0) {
+    if (cfg->attack_surface.public_service_enabled && strcmp(E[i].scope, "public") == 0) {
       pub++;
     }
     if (web_listener_heuristic(&E[i])) {
@@ -656,8 +780,15 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   fprintf(f, ",\"stale\":false,\"ttlSeconds\":%d,", ttl);
 
   fprintf(f, "\"summary\":{\"listenerCount\":%d,\"publicListenerCount\":%d,\"webInstanceCount\":%d,"
-          "\"suspiciousEgressCount\":%d},",
-          nE, pub, webInst, suspEg);
+          "\"suspiciousEgressCount\":%d,"
+          "\"serviceCount\":%d,\"autoStartServiceCount\":%d,\"scheduledTaskCount\":%d,"
+          "\"enabledScheduledTaskCount\":%d,\"startupItemCount\":%d,\"privilegedAccountCount\":%d,"
+          "\"adminGroupMemberCount\":%d,\"shareCount\":%d,\"riskyShareCount\":%d,"
+          "\"persistenceFindingCount\":%d,\"browserExtensionCount\":%d,\"installedSoftwareCount\":%d},",
+          nE, pub, webInst, suspEg, inv.service_count, inv.auto_start_service_count, inv.scheduled_task_count,
+          inv.enabled_scheduled_task_count, inv.startup_item_count, inv.privileged_account_count,
+          inv.admin_group_member_count, inv.share_count, inv.risky_share_count, inv.persistence_finding_count,
+          inv.browser_extension_count, inv.installed_software_count);
 
   fprintf(f, "\"listeners\":{\"items\":[");
   for (int i = 0; i < nE; i++) {
@@ -784,6 +915,14 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     }
   }
   fprintf(f, "],");
+  if (invf) {
+    copy_text_file_to_stream(f, inv_path);
+    (void)remove(inv_path);
+    fprintf(f, ",");
+  } else {
+    edr_asurf_inventory_write_json(f, cfg, listeners_only, &inv);
+    fprintf(f, ",");
+  }
 
   fprintf(f, "\"policy\":{},\"firewall\":{");
   fprintf(f, "\"enabled\":");
@@ -812,7 +951,7 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   }
   {
     char note_fw[160];
-    snprintf(note_fw, sizeof(note_fw), "firewall_rule_detail_max(配置上限)=%u",
+    snprintf(note_fw, sizeof(note_fw), "firewall_rule_detail_max(config_limit)=%u",
              cfg->attack_surface.firewall_rule_detail_max);
     fprintf(f, ",");
     json_escape_str(f, note_fw);
@@ -826,9 +965,9 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
     if (gp && gp[0]) {
       char note_geo[768];
       if (geoip_db_readable(cfg)) {
-        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 可读: %s", gp);
+        snprintf(note_geo, sizeof(note_geo), "geoip_db_path readable: %.680s", gp);
       } else {
-        snprintf(note_geo, sizeof(note_geo), "geoip_db_path 未就绪(跳过): %s", gp);
+        snprintf(note_geo, sizeof(note_geo), "geoip_db_path not ready (skipped): %.680s", gp);
       }
       fprintf(f, ",");
       json_escape_str(f, note_geo);
@@ -842,109 +981,62 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   return 0;
 }
 
-static int run_curl_upload(const char *cfg_path, char *errbuf, size_t errlen) {
-#ifdef _WIN32
-  char cmd[700];
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config \"%s\"", cfg_path);
-#else
-  char cmd[700];
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config '%s'", cfg_path);
-#endif
-  int rc = system(cmd);
-  if (rc != 0) {
-    snprintf(errbuf, errlen, "curl_exit_%d", rc);
-    return -1;
+static char *read_text_file_alloc(const char *path, size_t max_bytes, size_t *out_len) {
+  if (out_len) {
+    *out_len = 0u;
   }
-  snprintf(errbuf, errlen, "http_ok");
-  return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    return NULL;
+  }
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  long sz = ftell(f);
+  if (sz < 0 || (size_t)sz > max_bytes) {
+    fclose(f);
+    return NULL;
+  }
+  rewind(f);
+  char *buf = (char *)malloc((size_t)sz + 1u);
+  if (!buf) {
+    fclose(f);
+    return NULL;
+  }
+  size_t n = fread(buf, 1u, (size_t)sz, f);
+  fclose(f);
+  buf[n] = 0;
+  if (out_len) {
+    *out_len = n;
+  }
+  return buf;
 }
 
-static int response_json_refresh_pending(const char *path) {
-  FILE *rf = fopen(path, "rb");
-  if (!rf) {
+static int response_json_refresh_pending_buf(const char *buf) {
+  if (!buf) {
     return 0;
   }
-  char buf[16384];
-  size_t n = fread(buf, 1, sizeof(buf) - 1u, rf);
-  fclose(rf);
-  buf[n] = 0;
-  return (strstr(buf, "\"refreshPending\":true") != NULL || strstr(buf, "\"refreshPending\": true") != NULL) ? 1
-                                                                                                              : 0;
+  return (strstr(buf, "\"refreshPending\":true") != NULL || strstr(buf, "\"refreshPending\": true") != NULL) ? 1 : 0;
 }
 
 int edr_attack_surface_refresh_pending(const EdrConfig *cfg) {
   if (!cfg || !cfg->agent.endpoint_id[0] || strcmp(cfg->agent.endpoint_id, "auto") == 0) {
     return 0;
   }
-  char base[512];
-  resolve_rest_base(cfg, base, sizeof(base));
-  if (!base[0]) {
-    return 0;
-  }
-
-  char outpath[512];
-#ifdef _WIN32
-  {
-    char td[MAX_PATH];
-    DWORD nn = GetTempPathA(sizeof(td), td);
-    if (nn == 0 || nn >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    snprintf(outpath, sizeof(outpath), "%sedr_asurf_pend_%d.json", td, EDR_GETPID());
-  }
-#else
-  snprintf(outpath, sizeof(outpath), "/tmp/edr_asurf_pend_%d.json", EDR_GETPID());
-#endif
-
-  char cfgpath[512];
-#ifdef _WIN32
-  {
-    char td[MAX_PATH];
-    DWORD nn = GetTempPathA(sizeof(td), td);
-    if (nn == 0 || nn >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    snprintf(cfgpath, sizeof(cfgpath), "%sedr_asurf_pend_curl_%d.cfg", td, EDR_GETPID());
-  }
-#else
-  snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_asurf_pend_curl_%d.cfg", EDR_GETPID());
-#endif
-
-  FILE *cf = fopen(cfgpath, "wb");
-  if (!cf) {
+  char suffix[512];
+  snprintf(suffix, sizeof(suffix), "endpoints/%s/attack-surface/refresh-request", cfg->agent.endpoint_id);
+  char resp[16384];
+  resp[0] = 0;
+  if (edr_ingest_http_get_suffix(suffix, resp, sizeof(resp)) != 0) {
     return -1;
   }
-  fprintf(cf, "url = \"%s/endpoints/%s/attack-surface/refresh-request\"\n", base, cfg->agent.endpoint_id);
-  fprintf(cf, "output = \"%s\"\n", outpath);
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "tenant_default");
-  fprintf(cf, "header = \"X-User-ID: %s\"\n",
-          cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent");
-  fprintf(cf, "header = \"X-Permission-Set: endpoint:attack_surface_report\"\n");
-  const char *bearer = NULL;
-  if (getenv("EDR_PLATFORM_BEARER") && getenv("EDR_PLATFORM_BEARER")[0]) {
-    bearer = getenv("EDR_PLATFORM_BEARER");
-  } else if (cfg->platform.rest_bearer_token[0]) {
-    bearer = cfg->platform.rest_bearer_token;
-  }
-  if (bearer && bearer[0]) {
-    fprintf(cf, "header = \"Authorization: Bearer %s\"\n", bearer);
-  }
-  fprintf(cf, "silent\n");
-  fclose(cf);
-
-  char errbuf[128];
-  if (run_curl_upload(cfgpath, errbuf, sizeof(errbuf)) != 0) {
-    (void)remove(outpath);
-    (void)remove(cfgpath);
-    return -1;
-  }
-  int hit = response_json_refresh_pending(outpath);
-  (void)remove(outpath);
-  (void)remove(cfgpath);
-  return hit;
+  return response_json_refresh_pending_buf(resp);
 }
 
-int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, char *detail, size_t detail_cap) {
+static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t *payload,
+                                           size_t payload_len, const EdrConfig *cfg,
+                                           char *detail, size_t detail_cap) {
   if (!detail || detail_cap == 0) {
     return 3;
   }
@@ -954,10 +1046,17 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     return 2;
   }
 
+  uint64_t started_ms = asurf_monotonic_ms();
   AsListener L[EDR_ASURF_LISTENERS_MAX];
   int truncated = 0;
-  int nL = collect_listeners_platform(L, EDR_ASURF_LISTENERS_MAX, &truncated);
-  int listeners_only = asurf_listeners_only_mode(command_id);
+  int nL = (cfg->attack_surface.listeners_enabled || cfg->attack_surface.public_service_enabled)
+             ? collect_listeners_platform(L, EDR_ASURF_LISTENERS_MAX, &truncated) : 0;
+  if (nL < 0) {
+    snprintf(detail, detail_cap, "listener_collection_failed");
+    return 3;
+  }
+  uint64_t listeners_done_ms = asurf_monotonic_ms();
+  int listeners_only = asurf_listeners_only_mode(command_id, payload, payload_len);
 
   char jsonpath[512];
   snprintf(jsonpath, sizeof(jsonpath), "/tmp/edr_asurf_%d_%lld.json", EDR_GETPID(),
@@ -969,8 +1068,10 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     if (n == 0 || n >= sizeof(td)) {
       snprintf(td, sizeof(td), ".\\");
     }
+    win_path_fwd_slashes(td);
     snprintf(jsonpath, sizeof(jsonpath), "%sedr_asurf_%d_%lld.json", td, EDR_GETPID(),
              (long long)time(NULL) * 1000LL);
+    win_path_fwd_slashes(jsonpath);
   }
 #endif
   if (write_snapshot_json(jsonpath, cfg, L, nL, truncated, listeners_only) != 0) {
@@ -978,85 +1079,82 @@ int edr_attack_surface_execute(const char *command_id, const EdrConfig *cfg, cha
     return 3;
   }
 
-  char base[512];
-  resolve_rest_base(cfg, base, sizeof(base));
-  if (!base[0]) {
-    (void)remove(jsonpath);
-    snprintf(detail, detail_cap, "skip_no_rest_base_listeners_%d", nL);
-    return 0;
-  }
-
-  const char *tenant = cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "tenant_default";
-  const char *user = cfg->platform.rest_user_id[0] ? cfg->platform.rest_user_id : "edr-agent";
-  const char *bearer = NULL;
-  if (getenv("EDR_PLATFORM_BEARER") && getenv("EDR_PLATFORM_BEARER")[0]) {
-    bearer = getenv("EDR_PLATFORM_BEARER");
-  } else if (cfg->platform.rest_bearer_token[0]) {
-    bearer = cfg->platform.rest_bearer_token;
-  }
-
-  char cfgpath[512];
-#ifdef _WIN32
-  {
-    char td[MAX_PATH];
-    DWORD n = GetTempPathA(sizeof(td), td);
-    if (n == 0 || n >= sizeof(td)) {
-      snprintf(td, sizeof(td), ".\\");
-    }
-    snprintf(cfgpath, sizeof(cfgpath), "%sedr_asurf_curl_%d.cfg", td, EDR_GETPID());
-  }
-#else
-  snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_asurf_curl_%d.cfg", EDR_GETPID());
-#endif
-
-  FILE *cf = fopen(cfgpath, "wb");
-  if (!cf) {
-    (void)remove(jsonpath);
-    snprintf(detail, detail_cap, "curl_cfg_open_failed");
-    return 3;
-  }
-  fprintf(cf, "url = \"%s/endpoints/%s/attack-surface\"\n", base, cfg->agent.endpoint_id);
-  fprintf(cf, "request = \"POST\"\n");
-  fprintf(cf, "header = \"Content-Type: application/json\"\n");
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", tenant);
-  fprintf(cf, "header = \"X-User-ID: %s\"\n", user);
-  fprintf(cf, "header = \"X-Permission-Set: endpoint:attack_surface_report\"\n");
-  if (bearer && bearer[0]) {
-    fprintf(cf, "header = \"Authorization: Bearer %s\"\n", bearer);
-  }
-  fprintf(cf, "data-binary = \"@%s\"\n", jsonpath);
-  fprintf(cf, "silent\n");
-  fclose(cf);
-
-  char errbuf[128];
-  int ur = run_curl_upload(cfgpath, errbuf, sizeof(errbuf));
+  size_t body_len = 0u;
+  char *body = read_text_file_alloc(jsonpath, 4u * 1024u * 1024u, &body_len);
   (void)remove(jsonpath);
-  (void)remove(cfgpath);
-  if (ur != 0) {
-    snprintf(detail, detail_cap, "%s", errbuf);
+  if (!body || body_len == 0u) {
+    free(body);
+    snprintf(detail, detail_cap, "read_json_failed");
     return 3;
   }
-  snprintf(detail, detail_cap, "uploaded_%s", errbuf);
+  uint64_t snapshot_done_ms = asurf_monotonic_ms();
+
+  char suffix[512];
+  snprintf(suffix, sizeof(suffix), "endpoints/%s/attack-surface", cfg->agent.endpoint_id);
+  int ur = edr_ingest_http_post_json_suffix(suffix, body, NULL, 0u);
+  free(body);
+  if (ur != 0) {
+    snprintf(detail, detail_cap, "http_post_failed");
+    return 3;
+  }
+  uint64_t uploaded_ms = asurf_monotonic_ms();
+  snprintf(detail, detail_cap,
+           "uploaded_http_ok mode=%s listeners_ms=%llu snapshot_ms=%llu upload_ms=%llu total_ms=%llu",
+           listeners_only ? "listeners_only" : "full",
+           (unsigned long long)(listeners_done_ms - started_ms),
+           (unsigned long long)(snapshot_done_ms - listeners_done_ms),
+           (unsigned long long)(uploaded_ms - snapshot_done_ms),
+           (unsigned long long)(uploaded_ms - started_ms));
   return 0;
 }
 
+int edr_attack_surface_execute(const char *command_id, const uint8_t *payload,
+                               size_t payload_len, const EdrConfig *cfg,
+                               char *detail, size_t detail_cap) {
+  if (!detail || detail_cap == 0u) return 3;
+  if (!asurf_execute_try_lock()) {
+    snprintf(detail, detail_cap, "%s", "coalesced_inflight");
+    return 0;
+  }
+  int rc = edr_attack_surface_execute_impl(command_id, payload, payload_len,
+                                           cfg, detail, detail_cap);
+  asurf_execute_unlock();
+  return rc;
+}
+
 /* §19.10 ETW → 攻击面增量：预处理线程 signal，主线程 take + execute（去抖） */
-static atomic_uint_fast32_t s_asurf_etw_pending;
+#ifdef _WIN32
+static volatile LONG s_asurf_etw_pending;
+#else
+static volatile unsigned s_asurf_etw_pending;
+#endif
 static uint64_t s_asurf_etw_last_flush_ns;
 
 void edr_attack_surface_etw_signal(void) {
-  atomic_store_explicit(&s_asurf_etw_pending, (uint_fast32_t)1, memory_order_release);
+#ifdef _WIN32
+  InterlockedExchange(&s_asurf_etw_pending, 1);
+#else
+  __atomic_store_n(&s_asurf_etw_pending, 1u, __ATOMIC_RELEASE);
+#endif
 }
 
 int edr_attack_surface_take_etw_flush(uint64_t now_monotonic_ns, uint64_t debounce_ns) {
-  if (atomic_load_explicit(&s_asurf_etw_pending, memory_order_acquire) == (uint_fast32_t)0) {
+#ifdef _WIN32
+  if (InterlockedCompareExchange(&s_asurf_etw_pending, 0, 0) == 0) {
+#else
+  if (__atomic_load_n(&s_asurf_etw_pending, __ATOMIC_ACQUIRE) == 0u) {
+#endif
     return 0;
   }
   if (s_asurf_etw_last_flush_ns != 0u &&
       (now_monotonic_ns - s_asurf_etw_last_flush_ns) < debounce_ns) {
     return 0;
   }
-  atomic_store_explicit(&s_asurf_etw_pending, (uint_fast32_t)0, memory_order_release);
+#ifdef _WIN32
+  InterlockedExchange(&s_asurf_etw_pending, 0);
+#else
+  __atomic_store_n(&s_asurf_etw_pending, 0u, __ATOMIC_RELEASE);
+#endif
   s_asurf_etw_last_flush_ns = now_monotonic_ns;
   return 1;
 }

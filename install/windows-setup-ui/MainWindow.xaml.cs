@@ -1,6 +1,7 @@
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
@@ -25,6 +26,9 @@ public partial class MainWindow : Window
     private const int WmNcLButtonDown = 0x00A1;
     private const int HtCaption = 2;
     private const int ProbeTimeoutSeconds = 15;
+    private const int WebView2InitTimeoutSeconds = 30;
+    private const int InstallProcessTimeoutMinutes = 15;
+    private const int InstallNoProgressTimeoutMinutes = 3;
     private const int CheckProgressPauseMs = 70;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _baseDir = AppContext.BaseDirectory;
@@ -72,6 +76,7 @@ public partial class MainWindow : Window
         _setupPath = ResolveSetupPath();
         AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_resolved path={_setupPath} exists={File.Exists(_setupPath)} elevated={IsElevated()} arch={DescribeArchitectureForHeader()}");
         _preconfig = LoadPreconfig();
+        CleanupStaleEnrollParams(ResolveSetupUiLogDirectory(), uiLog);
         AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] preconfig_loaded keys={_preconfig.Count}");
         await Dispatcher.Yield(DispatcherPriority.Background);
         try
@@ -81,10 +86,10 @@ public partial class MainWindow : Window
             EnsureWebView2WpfDependencies();
             _browser = new WebView2();
             BrowserHost.Children.Add(_browser);
-            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_env_begin");
-            var env = await CreateWebViewEnvironmentAsync();
-            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ensure_begin");
-            await Browser.EnsureCoreWebView2Async(env);
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_env_begin timeout_s={WebView2InitTimeoutSeconds}");
+            var env = await WithTimeout(CreateWebViewEnvironmentAsync(), TimeSpan.FromSeconds(WebView2InitTimeoutSeconds), "WebView2 环境初始化超时");
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ensure_begin timeout_s={WebView2InitTimeoutSeconds}");
+            await WithTimeout(Browser.EnsureCoreWebView2Async(env), TimeSpan.FromSeconds(WebView2InitTimeoutSeconds), "WebView2 Runtime 初始化超时");
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] webview2_ready version={Browser.CoreWebView2?.Environment.BrowserVersionString ?? ""}");
         }
         catch (Exception ex)
@@ -104,7 +109,30 @@ public partial class MainWindow : Window
             {
                 if (File.Exists(_setupPath))
                 {
-                    Process.Start(new ProcessStartInfo { FileName = _setupPath, UseShellExecute = true });
+                    try
+                    {
+                        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] fallback_setup_start path={_setupPath}");
+                        using var fallbackSetup = StartSetup(_setupPath, string.Empty);
+                        await fallbackSetup.WaitForExitAsync();
+                        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] fallback_setup_exit code={fallbackSetup.ExitCode}");
+                        if (fallbackSetup.ExitCode != 0)
+                        {
+                            MessageBox.Show(
+                                $"传统安装器执行失败，退出代码：{fallbackSetup.ExitCode}\n\n诊断日志：{uiLog}",
+                                "FDSecurity 安装失败",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Error);
+                        }
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] fallback_setup_failed {fallbackEx}");
+                        MessageBox.Show(
+                            $"无法完成传统安装器：{fallbackEx.Message}\n\n诊断日志：{uiLog}",
+                            "FDSecurity 安装失败",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Error);
+                    }
                 }
                 else
                 {
@@ -210,6 +238,26 @@ public partial class MainWindow : Window
     }
 
     private WebView2 Browser => _browser ?? throw new InvalidOperationException("WebView2 is not initialized");
+
+    private static async Task<T> WithTimeout<T>(Task<T> task, TimeSpan timeout, string message)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(timeout));
+        if (completed != task)
+        {
+            throw new TimeoutException(message);
+        }
+        return await task;
+    }
+
+    private static async Task WithTimeout(Task task, TimeSpan timeout, string message)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(timeout));
+        if (completed != task)
+        {
+            throw new TimeoutException(message);
+        }
+        await task;
+    }
 
     private static async Task<CoreWebView2Environment> CreateWebViewEnvironmentAsync()
     {
@@ -431,11 +479,34 @@ public partial class MainWindow : Window
             await PostAsync("installProgress", new { stage = "执行安装器", progress = 22, detail = "正在停止旧进程、清理运行缓存并写入配置" });
 
             var progress = 22;
+            var installStartedAt = DateTimeOffset.Now;
+            var lastProgressAt = installStartedAt;
+            var lastProgressKey = string.Empty;
             while (!proc.HasExited)
             {
                 await Task.Delay(1200);
                 progress = Math.Min(86, progress + 4);
                 var stageState = ReadInstallStageState(installPath, handoffDir);
+                var progressKey = stageState != null
+                    ? $"stage:{stageState.Stage}:{stageState.DisplayDetail}:{stageState.DiagnosticDetail}"
+                    : $"state:{DescribeCurrentInstallState(installPath, innoLog, handoffDir)}:{GetInstallProgressStamp(installPath, innoLog, handoffDir)}";
+                if (!string.Equals(progressKey, lastProgressKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    lastProgressKey = progressKey;
+                    lastProgressAt = DateTimeOffset.Now;
+                }
+                var elapsed = DateTimeOffset.Now - installStartedAt;
+                var idle = DateTimeOffset.Now - lastProgressAt;
+                if (elapsed > TimeSpan.FromMinutes(InstallProcessTimeoutMinutes) || idle > TimeSpan.FromMinutes(InstallNoProgressTimeoutMinutes))
+                {
+                    var reason = elapsed > TimeSpan.FromMinutes(InstallProcessTimeoutMinutes)
+                        ? $"安装器运行超过 {InstallProcessTimeoutMinutes} 分钟"
+                        : $"安装阶段超过 {InstallNoProgressTimeoutMinutes} 分钟无进展";
+                    AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_timeout reason={reason} pid={proc.Id} elapsed_s={elapsed.TotalSeconds:F0} idle_s={idle.TotalSeconds:F0}");
+                    TryTerminateInstallProcess(proc, uiLog);
+                    var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
+                    throw new TimeoutException($"{reason}{detail}");
+                }
                 if (stageState != null)
                 {
                     progress = Math.Max(progress, stageState.Progress);
@@ -471,7 +542,8 @@ public partial class MainWindow : Window
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_summary_begin");
             var summary = ReadInstallSummary(installPath, innoLog, handoffDir);
             AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] install_complete endpoint={summary.EndpointId} tenant={summary.TenantId} health={summary.HealthStatus} diagnostics={_lastDiagnosticsPath}");
-            if (summary.HealthStatus.Equals("error_runtime_not_started", StringComparison.OrdinalIgnoreCase))
+            if (!summary.AgentRunning ||
+                summary.HealthStatus.Equals("error_runtime_not_started", StringComparison.OrdinalIgnoreCase))
             {
                 var detail = BuildInstallFailureDetail(installPath, innoLog, handoffDir);
                 throw new InvalidOperationException($"Agent 运行时未成功启动{detail}");
@@ -602,8 +674,9 @@ public partial class MainWindow : Window
             !latestLogProcessAlive &&
             string.IsNullOrWhiteSpace(processPid);
         var verifyStatus = TryReadJsonString(verifyPath, "status");
-        var verifyAgentRunning = TryReadJsonBool(verifyPath, "agent_process_running");
-        var agentRunning = verifyAgentRunning || latestLogProcessAlive || !string.IsNullOrWhiteSpace(processPid);
+        // A report or log entry can be stale. Installation succeeds only when the
+        // current machine actually has a live FDSensor process at handoff time.
+        var agentRunning = IsAgentProcessRunning();
         var healthStatus = TryReadJsonString(healthPath, "status");
         if (!string.IsNullOrWhiteSpace(verifyStatus))
         {
@@ -646,6 +719,27 @@ public partial class MainWindow : Window
         };
     }
 
+    private static bool IsAgentProcessRunning()
+    {
+        Process[] processes = Array.Empty<Process>();
+        try
+        {
+            processes = Process.GetProcessesByName("FDSensor");
+            return processes.Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
     private string DescribeCurrentInstallState(string installPath, string innoLog, string handoffDir)
     {
         var diagnosticsDir = ResolveInstallDiagnosticsDirectory(installPath, handoffDir);
@@ -666,6 +760,68 @@ public partial class MainWindow : Window
             return "安装器正在复制文件并执行部署阶段";
         }
         return "等待安装器返回状态";
+    }
+
+    private static string GetInstallProgressStamp(string installPath, string innoLog, string handoffDir)
+    {
+        var candidates = new[]
+        {
+            innoLog,
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "install-stage.log"),
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "enroll-output.log"),
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "install_health_report.json"),
+            ResolveInstallDiagnosticsFile(installPath, handoffDir, "install_runtime_verify.json"),
+            Path.Combine(installPath, "agent.toml")
+        };
+        var latest = 0L;
+        foreach (var path in candidates)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    latest = Math.Max(latest, File.GetLastWriteTimeUtc(path).Ticks);
+                }
+            }
+            catch
+            {
+                // Best-effort progress signal only.
+            }
+        }
+        return latest.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static void TryTerminateInstallProcess(Process proc, string uiLog)
+    {
+        try
+        {
+            if (!proc.HasExited)
+            {
+                proc.Kill(entireProcessTree: true);
+                AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_killed pid={proc.Id}");
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] setup_process_kill_failed pid={proc.Id} error={ex.Message}");
+        }
+    }
+
+    private static bool AllowUnsafeSetupIntegritySkip()
+    {
+        var raw = Environment.GetEnvironmentVariable("FDSECURITY_SETUP_UI_ALLOW_UNSIGNED_SETUP") ?? "";
+        return raw.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+               raw.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+               raw.Equals("yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static CheckItem SetupIntegrityFailure(string message)
+    {
+        if (AllowUnsafeSetupIntegritySkip())
+        {
+            return CheckItem.Warn("完整性校验", message + "；已通过开发模式环境变量允许继续");
+        }
+        return CheckItem.Fail("完整性校验", message);
     }
 
     private static InstallStageState? ReadInstallStageState(string installPath, string handoffDir)
@@ -1019,7 +1175,7 @@ public partial class MainWindow : Window
         var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
         if (!File.Exists(manifest))
         {
-            return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，跳过安装器哈希校验"));
+            return CacheSetupIntegrity(SetupIntegrityFailure("缺少 setup-ui-manifest.json，无法校验安装器哈希"));
         }
         try
         {
@@ -1037,7 +1193,7 @@ public partial class MainWindow : Window
             expected = expected.Trim().ToLowerInvariant();
             if (expected == "")
             {
-                return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，跳过安装器哈希校验"));
+                return CacheSetupIntegrity(SetupIntegrityFailure("manifest 未记录 setup_exe_sha256，无法校验安装器哈希"));
             }
             if (!File.Exists(_setupPath))
             {
@@ -1050,7 +1206,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            return CacheSetupIntegrity(CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message));
+            return CacheSetupIntegrity(SetupIntegrityFailure("读取 manifest 失败：" + ex.Message));
         }
     }
 
@@ -1063,7 +1219,7 @@ public partial class MainWindow : Window
         var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
         if (!File.Exists(manifest))
         {
-            return CheckItem.Warn("完整性校验", "缺少 setup-ui-manifest.json，安装开始时跳过哈希校验");
+            return SetupIntegrityFailure("缺少 setup-ui-manifest.json，安装开始前无法校验哈希");
         }
         if (!File.Exists(_setupPath))
         {
@@ -1077,11 +1233,11 @@ public partial class MainWindow : Window
                               (root.TryGetProperty("setupExeSha256", out var camel) && !string.IsNullOrWhiteSpace(camel.GetString()));
             return hasExpected
                 ? CheckItem.Ok("完整性校验", "安装开始前执行 SHA256 校验")
-                : CheckItem.Warn("完整性校验", "manifest 未记录 setup_exe_sha256，安装开始时跳过哈希校验");
+                : SetupIntegrityFailure("manifest 未记录 setup_exe_sha256，安装开始前无法校验哈希");
         }
         catch (Exception ex)
         {
-            return CheckItem.Warn("完整性校验", "读取 manifest 失败：" + ex.Message);
+            return SetupIntegrityFailure("读取 manifest 失败：" + ex.Message);
         }
     }
 
@@ -1202,6 +1358,7 @@ public partial class MainWindow : Window
     private static EndpointConfig NormalizeEndpointInput(string? raw)
     {
         const string apiSuffix = "/api/v1";
+        const string enrollSuffix = "/api/v1/enroll";
         var input = (raw ?? "").Trim().TrimEnd('/');
         if (string.IsNullOrWhiteSpace(input))
         {
@@ -1215,6 +1372,12 @@ public partial class MainWindow : Window
 
         var builder = new UriBuilder(uri) { Query = "", Fragment = "" };
         var path = builder.Path.TrimEnd('/');
+        if (path.Equals(enrollSuffix, StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(enrollSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            path = path.Substring(0, path.Length - enrollSuffix.Length);
+            builder.Path = path;
+        }
         if (path.Equals(apiSuffix, StringComparison.OrdinalIgnoreCase) ||
             path.EndsWith(apiSuffix, StringComparison.OrdinalIgnoreCase))
         {
@@ -1559,7 +1722,37 @@ public partial class MainWindow : Window
         return string.Join(",", pins);
     }
 
-    private static string WriteEnrollParamsFile(
+    private bool? ReadPreconfigBool(string key)
+    {
+        if (!_preconfig.TryGetValue(key, out var value) || value == null)
+        {
+            return null;
+        }
+        if (value is JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.True) return true;
+            if (element.ValueKind == JsonValueKind.False) return false;
+            if (element.ValueKind == JsonValueKind.String && bool.TryParse(element.GetString(), out var parsed)) return parsed;
+            return null;
+        }
+        if (value is bool b) return b;
+        return bool.TryParse(value.ToString(), out var parsedValue) ? parsedValue : null;
+    }
+
+    private string ReadPreconfigString(string key)
+    {
+        if (!_preconfig.TryGetValue(key, out var value) || value == null)
+        {
+            return "";
+        }
+        if (value is JsonElement element)
+        {
+            return element.ValueKind == JsonValueKind.String ? element.GetString() ?? "" : element.ToString();
+        }
+        return value.ToString() ?? "";
+    }
+
+    private string WriteEnrollParamsFile(
         InstallRequest request,
         EndpointConfig endpoint,
         string effectiveProxyUrl,
@@ -1591,6 +1784,14 @@ public partial class MainWindow : Window
             ["keep_offline_queue"] = ShouldKeepOfflineQueue(request, normalizedMode),
             ["keep_evidence_cache"] = ShouldKeepEvidenceCache(request, normalizedMode),
             ["strict_health_check"] = request.StrictHealthCheck,
+            ["http2_enabled"] = request.Http2Enabled ?? ReadPreconfigBool("http2Enabled"),
+            ["http2_require"] = request.Http2Require ?? ReadPreconfigBool("http2Require"),
+            ["control_stream_enabled"] = request.ControlStreamEnabled ?? ReadPreconfigBool("controlStreamEnabled"),
+            ["long_poll_fallback"] = request.LongPollFallback ?? ReadPreconfigBool("longPollFallback"),
+            ["report_events_v2_enabled"] = request.ReportEventsV2Enabled ?? ReadPreconfigBool("reportEventsV2Enabled"),
+            ["data_plane_encoding"] = FirstNonEmpty(request.DataPlaneEncoding, ReadPreconfigString("dataPlaneEncoding")),
+            ["data_plane_compression"] = FirstNonEmpty(request.DataPlaneCompression, ReadPreconfigString("dataPlaneCompression")),
+            ["control_profile_id"] = FirstNonEmpty(request.ControlProfileId, ReadPreconfigString("controlProfileId")),
             ["health_report"] = Path.Combine(uiLogDir, "agent-diagnostics", "install_health_report.json")
         };
 
@@ -1598,6 +1799,7 @@ public partial class MainWindow : Window
         var path = Path.Combine(uiLogDir, "enroll-params-" + Guid.NewGuid().ToString("N") + ".json");
         var json = JsonSerializer.Serialize(data, new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = false });
         File.WriteAllText(path, json, new UTF8Encoding(false));
+        ProtectSensitiveFile(path);
         return path;
     }
 
@@ -1676,7 +1878,9 @@ public partial class MainWindow : Window
 
     private static void ConfigureTlsValidation(HttpClientHandler handler, InstallRequest request, BootstrapTrustMaterial bootstrap)
     {
-        if (request.InsecureTls)
+        // A signed Bootstrap Manifest is a fail-closed trust contract. Never let
+        // the lab-only "insecure" switch override its private-CA verification.
+        if (request.InsecureTls && !bootstrap.Enabled)
         {
             handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
             return;
@@ -1692,6 +1896,11 @@ public partial class MainWindow : Window
             if (errors == SslPolicyErrors.None)
             {
                 return true;
+            }
+            if ((errors & (SslPolicyErrors.RemoteCertificateNameMismatch |
+                           SslPolicyErrors.RemoteCertificateNotAvailable)) != 0)
+            {
+                return false;
             }
             return ValidateBootstrapServerCertificate(certificate, bootstrap);
         };
@@ -1788,6 +1997,72 @@ public partial class MainWindow : Window
         using var identity = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(identity);
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static void CleanupStaleEnrollParams(string rootDir, string uiLog)
+    {
+        try
+        {
+            if (!Directory.Exists(rootDir))
+            {
+                return;
+            }
+            foreach (var file in Directory.GetFiles(rootDir, "enroll-params-*.json", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    File.Delete(file);
+                    AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] stale_enroll_params_deleted path={file}");
+                }
+                catch (Exception ex)
+                {
+                    AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] stale_enroll_params_delete_failed path={file} error={ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLine(uiLog, $"[{DateTimeOffset.Now:o}] stale_enroll_params_cleanup_failed error={ex.Message}");
+        }
+    }
+
+    private static void ProtectSensitiveFile(string path)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "icacls.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            psi.ArgumentList.Add(path);
+            psi.ArgumentList.Add("/inheritance:r");
+            psi.ArgumentList.Add("/grant:r");
+            psi.ArgumentList.Add("*S-1-5-18:F");
+            psi.ArgumentList.Add("/grant:r");
+            psi.ArgumentList.Add("*S-1-5-32-544:F");
+            var currentUserSid = WindowsIdentity.GetCurrent().User?.Value ?? "";
+            if (!string.IsNullOrWhiteSpace(currentUserSid))
+            {
+                psi.ArgumentList.Add("/grant:r");
+                psi.ArgumentList.Add("*" + currentUserSid + ":F");
+            }
+            psi.ArgumentList.Add("/C");
+            psi.ArgumentList.Add("/Q");
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(5000);
+        }
+        catch
+        {
+            // Best-effort protection; the elevated setup deletes the params file after handoff.
+        }
     }
 
     private static string ResolveSetupUiLogDirectory()
@@ -2063,9 +2338,114 @@ public partial class MainWindow : Window
         return parts.Count == 0 ? "" : "；" + string.Join("；", parts);
     }
 
+    private static string BuildEnrollFailureSummary(string rawReason)
+    {
+        var pathMatch = Regex.Match(rawReason ?? "", @"注册日志：([^；]+)", RegexOptions.IgnoreCase);
+        if (!pathMatch.Success)
+        {
+            return "";
+        }
+        var enrollLog = pathMatch.Groups[1].Value.Trim();
+        if (string.IsNullOrWhiteSpace(enrollLog) || !File.Exists(enrollLog))
+        {
+            return "";
+        }
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(enrollLog);
+        }
+        catch
+        {
+            return "";
+        }
+        if (text.Length > 30000)
+        {
+            text = text[^30000..];
+        }
+        var flat = Regex.Replace(text, @"\s+", " ").Trim();
+        var code = ExtractEnrollDiagnosticField(flat, "api_code");
+        var message = ExtractEnrollDiagnosticField(flat, "api_message");
+        var hint = ExtractEnrollDiagnosticField(flat, "hint");
+        var combined = string.Join(" ", new[] { code, message, hint, flat }.Where(v => !string.IsNullOrWhiteSpace(v)));
+
+        if (EnrollTextContains(combined, "token_expired") ||
+            EnrollTextContains(combined, "token expired") ||
+            EnrollTextContains(combined, "has expired") ||
+            combined.Contains("令牌已过期", StringComparison.OrdinalIgnoreCase))
+        {
+            return "注册令牌已过期，请在平台重新生成 enroll token 后重新安装";
+        }
+        if (EnrollTextContains(combined, "token_exhausted") ||
+            EnrollTextContains(combined, "activation limit") ||
+            EnrollTextContains(combined, "limit reached") ||
+            combined.Contains("激活次数", StringComparison.OrdinalIgnoreCase))
+        {
+            return "注册令牌激活次数已用尽，请生成新的 enroll token 或提高激活上限后重新安装";
+        }
+        if (EnrollTextContains(combined, "invalid_token") ||
+            EnrollTextContains(combined, "unknown or revoked") ||
+            EnrollTextContains(combined, "not active") ||
+            EnrollTextContains(combined, "missing token"))
+        {
+            return "注册令牌无效、已吊销或未激活，请复制平台当前有效的明文 enroll token 后重新安装";
+        }
+        if (EnrollTextContains(combined, "os_not_allowed") ||
+            EnrollTextContains(combined, "os_type") ||
+            EnrollTextContains(combined, "does not allow this platform"))
+        {
+            return "注册令牌不适用于当前操作系统，请选择匹配该终端系统类型的 enroll token";
+        }
+        if (EnrollTextContains(combined, "quota_exceeded") ||
+            EnrollTextContains(combined, "endpoint quota"))
+        {
+            return "租户终端配额已满，请释放配额或扩容后重新安装";
+        }
+        if (EnrollTextContains(combined, "license_blocked") ||
+            EnrollTextContains(combined, "license expired") ||
+            EnrollTextContains(combined, "license suspended"))
+        {
+            return "租户 License 阻止注册，请续期或恢复 License 后重新安装";
+        }
+        if (!string.IsNullOrWhiteSpace(hint))
+        {
+            return "注册失败：" + TrimForUserFacingSummary(hint, 120);
+        }
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            return "注册失败：" + TrimForUserFacingSummary(message, 120);
+        }
+        return "";
+    }
+
+    private static string ExtractEnrollDiagnosticField(string text, string field)
+    {
+        var match = Regex.Match(text ?? "", @"(?:^|[;\s])" + Regex.Escape(field) + @"=([^;]+)", RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[1].Value.Trim() : "";
+    }
+
+    private static bool EnrollTextContains(string text, string value)
+    {
+        return (text ?? "").IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string TrimForUserFacingSummary(string value, int maxLength)
+    {
+        var s = Regex.Replace(value ?? "", @"\s+", " ").Trim();
+        if (s.Length > maxLength)
+        {
+            s = s[..maxLength] + "...";
+        }
+        return s;
+    }
+
     private static string BuildUserFacingInstallFailure(string rawReason, string diagnosticsPath)
     {
-        var reason = Regex.Replace(rawReason ?? "", @"\s+", " ").Trim();
+        var enrollSummary = BuildEnrollFailureSummary(rawReason);
+        var reason = string.IsNullOrWhiteSpace(enrollSummary)
+            ? Regex.Replace(rawReason ?? "", @"\s+", " ").Trim()
+            : enrollSummary;
         if (string.IsNullOrWhiteSpace(reason))
         {
             reason = "安装未完成";
@@ -2083,23 +2463,87 @@ public partial class MainWindow : Window
         return firstSegment + "。" + suffix;
     }
 
-    private static CheckItem CheckSystemArchitecture()
+    private CheckItem CheckSystemArchitecture()
     {
         var os = RuntimeInformation.OSArchitecture;
         var process = RuntimeInformation.ProcessArchitecture;
-        if (os == Architecture.X64 && process == Architecture.X64)
+        var target = ReadSetupTargetArchitecture();
+        if (target == "arm64")
         {
-            return CheckItem.Ok("系统架构", "x64 / AMD64");
+            return os == Architecture.Arm64
+                ? CheckItem.Ok("系统架构", $"ARM64 原生包 / 进程 {process}")
+                : CheckItem.Fail("系统架构", $"当前安装包要求 ARM64 Windows，检测到 OS={os}；请下载 Windows x64 安装包");
         }
-        if (os == Architecture.Arm64 && process == Architecture.X64)
+        if (target == "amd64")
         {
-            return CheckItem.Warn("系统架构", "ARM64 Windows，当前通过 x64 仿真运行；虚拟机/兼容场景可继续安装");
+            if (os == Architecture.X64)
+            {
+                return CheckItem.Ok("系统架构", "x64 / AMD64 原生包");
+            }
+            if (os == Architecture.Arm64 && ReadSetupBooleanCapability("arm64_emulation_supported"))
+            {
+                return CheckItem.Warn(
+                    "系统架构",
+                    $"ARM64 兼容模式 / x64 仿真进程 {process}；安装时将跳过 x64 WinDivert 驱动，网络协议包采集不可用，建议后续替换为原生 ARM64 包");
+            }
+            return CheckItem.Fail("系统架构", $"当前 x64 安装包未声明 ARM64 仿真兼容能力，不能安装到 OS={os}；请下载 Windows ARM64 安装包");
         }
-        if (os == Architecture.Arm64)
+        return CheckItem.Fail("系统架构", $"安装包未声明有效 target_arch（{target}），拒绝继续安装");
+    }
+
+    private bool ReadSetupBooleanCapability(string name)
+    {
+        var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
+        if (!File.Exists(manifest))
         {
-            return CheckItem.Warn("系统架构", $"ARM64 Windows / 进程 {process}；安装包为 x64，将尝试兼容安装");
+            return false;
         }
-        return CheckItem.Fail("系统架构", $"当前为 OS={os}, Process={process}，此安装包要求 x64 或 ARM64+x64 仿真");
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+            return doc.RootElement.TryGetProperty("capabilities", out var capabilities) &&
+                   capabilities.ValueKind == JsonValueKind.Object &&
+                   capabilities.TryGetProperty(name, out var value) &&
+                   value.ValueKind == JsonValueKind.True;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private string ReadSetupTargetArchitecture()
+    {
+        var manifest = Path.Combine(_baseDir, "setup-ui-manifest.json");
+        if (!File.Exists(manifest))
+        {
+            return "unknown";
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+            var root = doc.RootElement;
+            var target = root.TryGetProperty("target_arch", out var archNode)
+                ? (archNode.GetString() ?? "").Trim().ToLowerInvariant()
+                : "";
+            if (target is "x64" or "x86_64") target = "amd64";
+            if (target is "aarch64") target = "arm64";
+            if (target is "amd64" or "arm64") return target;
+
+            var runtime = root.TryGetProperty("runtime_identifier", out var runtimeNode)
+                ? (runtimeNode.GetString() ?? "").Trim().ToLowerInvariant()
+                : "";
+            return runtime switch
+            {
+                "win-x64" => "amd64",
+                "win-arm64" => "arm64",
+                _ => "unknown"
+            };
+        }
+        catch
+        {
+            return "unknown";
+        }
     }
 
     private static string DescribeArchitectureForHeader()
@@ -2474,6 +2918,14 @@ public sealed class InstallRequest
     public bool KeepEvidenceCache { get; set; }
     public bool StrictHealthCheck { get; set; }
     public bool AutoOpenEndpoint { get; set; }
+    public bool? Http2Enabled { get; set; }
+    public bool? Http2Require { get; set; }
+    public bool? ControlStreamEnabled { get; set; }
+    public bool? LongPollFallback { get; set; }
+    public bool? ReportEventsV2Enabled { get; set; }
+    public string DataPlaneEncoding { get; set; } = "";
+    public string DataPlaneCompression { get; set; } = "";
+    public string ControlProfileId { get; set; } = "";
 }
 
 public sealed class InstallSummary

@@ -4,8 +4,6 @@
 
 #include "edr/ave_sdk.h"
 
-#include "edr/fl_feature_provider.h"
-
 #include "edr/ave.h"
 #include "edr/config.h"
 #include "edr/sha256.h"
@@ -135,6 +133,9 @@ typedef struct {
 
 static AveInferCacheEntry s_infer_cache[EDR_AVE_INFER_CACHE_CAP];
 static size_t s_infer_cache_n;
+static int64_t s_infer_budget_window_ms;
+static uint32_t s_infer_budget_count;
+static uint64_t s_infer_budget_drops;
 
 void edr_ave_infer_cache_clear(void) {
   s_infer_cache_n = 0;
@@ -229,6 +230,24 @@ static void infer_cache_put(const char *sha256, const EdrAveInferResult *infer, 
   s_infer_cache[0].infer = *infer;
   s_infer_cache[0].inserted_ms = mono_ms();
   s_infer_cache_n++;
+}
+
+static int ave_infer_budget_allow(const EdrConfig *pcfg) {
+  if (!pcfg || pcfg->resource_limit.ave_infer_per_min == 0u) {
+    return 1;
+  }
+  int64_t now = mono_ms();
+  if (s_infer_budget_window_ms == 0 || now < s_infer_budget_window_ms ||
+      now - s_infer_budget_window_ms >= 60000) {
+    s_infer_budget_window_ms = now;
+    s_infer_budget_count = 0u;
+  }
+  if (s_infer_budget_count >= pcfg->resource_limit.ave_infer_per_min) {
+    s_infer_budget_drops++;
+    return 0;
+  }
+  s_infer_budget_count++;
+  return 1;
 }
 
 static int hash_file_sha256(const char *path, char out65[65]) {
@@ -383,6 +402,62 @@ static void fill_file_hash_whitelist(AVEScanResult *out) {
   out->skip_ai_analysis = true;
 }
 
+static const char *verdict_name(EDRVerdict v) {
+  switch (v) {
+    case VERDICT_CLEAN:
+      return "clean";
+    case VERDICT_SUSPICIOUS:
+      return "suspicious";
+    case VERDICT_MALWARE:
+      return "malware";
+    case VERDICT_IOC_CONFIRMED:
+      return "ioc_confirmed";
+    case VERDICT_WHITELISTED:
+      return "whitelisted";
+    default:
+      return "unknown";
+  }
+}
+
+static void apply_tenant_noise_policy(const EdrConfig *pcfg, AVEScanResult *out) {
+  if (!pcfg || !out) {
+    return;
+  }
+  if (out->final_verdict == VERDICT_IOC_CONFIRMED || out->final_verdict == VERDICT_WHITELISTED) {
+    return;
+  }
+  char model_version[64];
+  const char *override = getenv("EDR_AVE_POLICY_MODEL_VERSION");
+  if (override && override[0]) {
+    snprintf(model_version, sizeof(model_version), "%s", override);
+  } else {
+    edr_onnx_static_model_version(model_version, sizeof(model_version));
+  }
+  EdrAveTenantNoiseDecision dec;
+  if (!edr_ave_tenant_noise_lookup(pcfg, pcfg->agent.tenant_id, model_version, out->rule_name,
+                                   out->final_confidence, &dec)) {
+    return;
+  }
+  const char *shadow = verdict_name(out->final_verdict);
+  if (dec.suppress) {
+    out->final_verdict = VERDICT_WHITELISTED;
+    out->final_confidence = dec.adjusted_confidence;
+    out->skip_ai_analysis = true;
+    snprintf(out->verification_layer, sizeof(out->verification_layer), "TENANT_POLICY");
+    snprintf(out->rule_name, sizeof(out->rule_name), "tenant_noise_suppressed:%s", dec.policy_version);
+  } else if (dec.needs_review) {
+    out->needs_l2_review = true;
+    out->final_confidence = dec.adjusted_confidence;
+    snprintf(out->verification_layer, sizeof(out->verification_layer), "TENANT_REVIEW");
+  } else if (!dec.observe_only) {
+    out->final_confidence = dec.adjusted_confidence;
+  }
+  if (dec.gray_percent > 0u || dec.observe_only) {
+    (void)edr_ave_gray_eval_record(pcfg, pcfg->agent.tenant_id, model_version, dec.policy_version, out->rule_name,
+                                   out->raw_confidence, out->final_confidence, dec.action, shadow);
+  }
+}
+
 int AVE_Init(const AVEConfig *config) {
   if (g_initialized) {
     return AVE_ERR_ALREADY_INIT;
@@ -452,6 +527,7 @@ int AVE_Init(const AVEConfig *config) {
   ensure_scan_mutex();
 
   edr_ave_bp_init();
+  edr_ave_bp_configure_resource_limits(&g_cfg);
   g_initialized = 1;
   return AVE_OK;
 }
@@ -475,9 +551,19 @@ int AVE_InitFromEdrConfig(const EdrConfig *cfg) {
     return edr_err_to_ave(e);
   }
 
+  {
+    const char *vkw = getenv("EDR_AVE_TRUSTED_VENDOR_KEYWORDS");
+    if (vkw && vkw[0]) {
+      fprintf(stderr, "[ave/config] EDR_AVE_TRUSTED_VENDOR_KEYWORDS=%s\n", vkw);
+    } else {
+      fprintf(stderr, "%s", "[ave/config] EDR_AVE_TRUSTED_VENDOR_KEYWORDS=<builtin_only>\n");
+    }
+  }
+
   ensure_scan_mutex();
 
   edr_ave_bp_init();
+  edr_ave_bp_configure_resource_limits(cfg);
   g_initialized = 1;
   return AVE_OK;
 }
@@ -490,6 +576,7 @@ int AVE_SyncFromEdrConfig(const EdrConfig *cfg) {
     return AVE_ERR_INVALID_PARAM;
   }
   EdrError e = edr_ave_reload_models(cfg);
+  edr_ave_bp_configure_resource_limits(cfg);
   if (e == EDR_OK) {
     edr_ave_infer_cache_clear();
   }
@@ -579,12 +666,62 @@ int AVE_GetStatus(AVEStatus *status_out) {
   return AVE_OK;
 }
 
-/** B3b：将 static 扫描结论写入行为槽（§5.5 维 44–45），供 behavior.onnx 特征使用 */
+/** 将 static 扫描结论写入行为槽，供主机行为上下文与服务端关联分析使用。 */
 static void ave_bp_merge_static_if_subject(uint32_t subject_pid, const AVEScanResult *r) {
   if (subject_pid == 0u || !r) {
     return;
   }
   edr_ave_bp_merge_static_scan(subject_pid, r->final_confidence, (int)r->final_verdict);
+}
+
+static int env_skip_ext_enabled(void) {
+  const char *e = getenv("EDR_AVE_SKIP_BY_EXT");
+  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
+    return 0;
+  }
+  return 1;  // 默认启用
+}
+
+static const char *safe_file_ext(const char *path) {
+  if (!path) return NULL;
+  const char *base = strrchr(path, '/');
+  if (!base) base = strrchr(path, '\\');
+  if (!base) base = path;
+  else base++;
+  const char *dot = strrchr(base, '.');
+  if (!dot || dot == base) return NULL;
+  return dot + 1;
+}
+
+static int is_known_safe_ext(const char *ext) {
+  static const char *safe_exts[] = {
+    "jpg", "jpeg", "png", "gif", "bmp", "ico", "webp", "svg",  // 图片
+    "mp3", "wav", "ogg", "flac", "aac", "m4a",               // 音频
+    "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm",         // 视频
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz",             // 压缩包
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",        // 文档
+    "txt", "rtf", "csv", "json", "xml", "html", "htm",        // 文本
+    "css", "js", "ts", "jsx", "tsx",                           // Web
+    "ttf", "otf", "woff", "woff2",                            // 字体
+  };
+  if (!ext) return 0;
+  for (size_t i = 0; i < sizeof(safe_exts) / sizeof(safe_exts[0]); i++) {
+#ifdef _WIN32
+    if (_stricmp(ext, safe_exts[i]) == 0) return 1;
+#else
+    if (strcasecmp(ext, safe_exts[i]) == 0) return 1;
+#endif
+  }
+  return 0;
+}
+
+static int64_t get_file_size_fast(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  fseek(f, 0, SEEK_END);
+  int64_t sz = (int64_t)ftell(f);
+  fclose(f);
+  return sz;
 }
 
 static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVEScanResult *result_out) {
@@ -597,6 +734,22 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
 
   memset(result_out, 0, sizeof(*result_out));
   snprintf(result_out->scanned_path, sizeof(result_out->scanned_path), "%s", file_path);
+
+  if (env_skip_ext_enabled()) {
+    const char *ext = safe_file_ext(file_path);
+    if (ext && is_known_safe_ext(ext)) {
+      result_out->final_verdict = VERDICT_WHITELISTED;
+      result_out->final_confidence = 0.01f;
+      result_out->scan_duration_ms = 0;
+      snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "ext_filter");
+      return AVE_OK;
+    }
+  }
+
+  int64_t fsize = get_file_size_fast(file_path);
+  if (fsize < 0) {
+    return AVE_ERR_INTERNAL;
+  }
 
   FILE *probe = fopen(file_path, "rb");
   if (!probe) {
@@ -618,6 +771,23 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
   const EdrConfig *pcfg = active_edr_config();
   if (!pcfg) {
     return AVE_ERR_INTERNAL;
+  }
+  if (fsize == 0) {
+    int ioc_sev_empty = 3;
+    if (edr_ave_ioc_file_hit(pcfg, result_out->sha256, &ioc_sev_empty)) {
+      if (pcfg->ave.ioc_precheck_enabled) {
+        fill_ioc_file_hash(result_out, ioc_sev_empty);
+      } else {
+        edr_ave_overlay_ioc_post_ai(result_out, ioc_sev_empty);
+      }
+    } else {
+      result_out->final_verdict = VERDICT_WHITELISTED;
+      result_out->final_confidence = 0.0f;
+      snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "empty_file");
+    }
+    result_out->scan_duration_ms = 0;
+    ave_bp_merge_static_if_subject(subject_pid, result_out);
+    return AVE_OK;
   }
 
   int skip_onnx = 0;
@@ -662,6 +832,8 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     uint32_t cttl = infer_cache_ttl_effective(pcfg);
     if (!skip_cache && cmax > 0u && infer_cache_get(result_out->sha256, &infer, cttl)) {
       ie = EDR_OK;
+    } else if (!ave_infer_budget_allow(pcfg)) {
+      ie = EDR_ERR_AVE_SCAN_TIMEOUT;
     } else {
       ie = edr_ave_infer_file(pcfg, file_path, &infer);
       if (ie == EDR_OK && !skip_cache && cmax > 0u) {
@@ -707,6 +879,7 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
         }
       }
     }
+    apply_tenant_noise_policy(pcfg, result_out);
     ave_bp_merge_static_if_subject(subject_pid, result_out);
     return AVE_OK;
   }
@@ -718,6 +891,12 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     return AVE_ERR_NOT_IMPL;
   }
 
+  if (ie == EDR_ERR_AVE_SCAN_TIMEOUT) {
+    result_out->raw_ai_verdict = VERDICT_TIMEOUT;
+    result_out->final_verdict = VERDICT_TIMEOUT;
+    snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "%s",
+             "infer_budget_throttle");
+  }
   return edr_err_to_ave(ie);
 }
 
@@ -751,19 +930,87 @@ int AVE_CancelScan(int64_t scan_id) {
   return AVE_ERR_NOT_IMPL;
 }
 
-void AVE_FeedEvent(const AVEBehaviorEvent *event) {
+typedef struct AVEBehaviorEventV26 {
+  uint32_t pid;
+  uint32_t ppid;
+  AVEEventType event_type;
+  uint8_t severity_hint;
+  int64_t timestamp_ns;
+  char target_path[512];
+  char target_ip[46];
+  char target_domain[256];
+  uint16_t target_port;
+  float ave_confidence;
+  float shellcode_score;
+  float webshell_score;
+  float pmfe_confidence;
+  float pmfe_dns_tunnel;
+  uint8_t pmfe_pe_found;
+  char file_sha256_hex[65];
+  uint8_t ioc_ip_hit;
+  uint8_t ioc_domain_hit;
+  uint8_t ioc_sha256_hit;
+  AVEBehaviorFlags behavior_flags;
+  uint8_t target_has_motw;
+  uint8_t cert_revoked_ancestor;
+} AVEBehaviorEventV26;
+
+static int ave_feed_event_current(const AVEBehaviorEvent *event) {
   if (!g_initialized) {
-    return;
+    return AVE_ERR_NOT_INITIALIZED;
   }
   if (!event) {
-    return;
+    return AVE_ERR_INVALID_PARAM;
   }
   AVEBehaviorEvent ev = *event;
   const EdrConfig *pcfg = active_edr_config();
+  if (pcfg && !pcfg->ave.behavior_monitor_enabled) {
+    return AVE_OK;
+  }
   if (pcfg) {
     edr_ave_behavior_event_apply_ioc(pcfg, &ev);
   }
   edr_ave_bp_feed(&ev);
+  return AVE_OK;
+}
+
+void AVE_FeedEvent(const AVEBehaviorEvent *event) {
+  if (!event) {
+    return;
+  }
+  const AVEBehaviorEventV26 *legacy = (const AVEBehaviorEventV26 *)(const void *)event;
+  AVEBehaviorEvent current;
+  memset(&current, 0, sizeof(current));
+  current.pid = legacy->pid;
+  current.ppid = legacy->ppid;
+  current.event_type = legacy->event_type;
+  current.severity_hint = legacy->severity_hint;
+  current.timestamp_ns = legacy->timestamp_ns;
+  memcpy(current.target_path, legacy->target_path, sizeof(legacy->target_path));
+  memcpy(current.target_ip, legacy->target_ip, sizeof(legacy->target_ip));
+  memcpy(current.target_domain, legacy->target_domain, sizeof(legacy->target_domain));
+  current.target_port = legacy->target_port;
+  current.ave_confidence = legacy->ave_confidence;
+  current.shellcode_score = legacy->shellcode_score;
+  current.webshell_score = legacy->webshell_score;
+  current.pmfe_confidence = legacy->pmfe_confidence;
+  current.pmfe_dns_tunnel = legacy->pmfe_dns_tunnel;
+  current.pmfe_pe_found = legacy->pmfe_pe_found;
+  memcpy(current.file_sha256_hex, legacy->file_sha256_hex, sizeof(legacy->file_sha256_hex));
+  current.ioc_ip_hit = legacy->ioc_ip_hit;
+  current.ioc_domain_hit = legacy->ioc_domain_hit;
+  current.ioc_sha256_hit = legacy->ioc_sha256_hit;
+  current.behavior_flags = legacy->behavior_flags;
+  current.target_has_motw = legacy->target_has_motw;
+  current.cert_revoked_ancestor = legacy->cert_revoked_ancestor;
+  (void)ave_feed_event_current(&current);
+}
+
+int AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size) {
+  if (event_size != sizeof(AVEBehaviorEvent)) {
+    return AVE_ERR_INVALID_PARAM;
+  }
+  return ave_feed_event_current(event);
 }
 
 int AVE_GetProcessAnomalyScore(uint32_t pid, float *score_out) {
@@ -934,7 +1181,7 @@ int AVE_IsWhitelisted(const char *sha256) {
   return edr_ave_file_hash_whitelist_hit(pcfg, sha256) ? 1 : 0;
 }
 
-/** 64 位十六进制 + '\0'（联邦 FL 样本 SHA256） */
+/** 64 位十六进制 + '\0'。 */
 static int is_sha256_hex64(const char *s) {
   if (!s) {
     return 0;
@@ -965,16 +1212,8 @@ int AVE_ExportFeatureVector(const char *sha256, float *out_512d) {
   if (!is_sha256_hex64(sha256)) {
     return AVE_ERR_INVALID_PARAM;
   }
-  {
-    int r = edr_fl_feature_lookup_dispatch(sha256, out_512d, 512u, EDR_FL_TARGET_STATIC);
-    if (r == 0) {
-      return AVE_OK;
-    }
-    if (r == 1) {
-      return AVE_ERR_FL_SAMPLE_NOT_FOUND;
-    }
-  }
-  /* 无注册或内部错误：C0 兼容全零 */
+  /* Endpoint FL training was removed from product builds. Keep this SDK
+   * compatibility API deterministic by returning a zero feature vector. */
   for (int i = 0; i < 512; i++) {
     out_512d[i] = 0.0f;
   }
@@ -993,15 +1232,7 @@ int AVE_ExportFeatureVectorEx(const char *sha256, float *out, size_t dim, int ta
   if (!is_sha256_hex64(sha256)) {
     return AVE_ERR_INVALID_PARAM;
   }
-  {
-    int r = edr_fl_feature_lookup_dispatch(sha256, out, dim, target);
-    if (r == 0) {
-      return AVE_OK;
-    }
-    if (r == 1) {
-      return AVE_ERR_FL_SAMPLE_NOT_FOUND;
-    }
-  }
+  (void)target;
   for (i = 0; i < dim; i++) {
     out[i] = 0.0f;
   }
@@ -1034,7 +1265,7 @@ int AVE_ExportModelWeights(const char *target, void *buf, size_t *size) {
     }
     return AVE_OK;
   }
-  /* behavior：导出磁盘 behavior.onnx 整文件字节（联邦 / P3 T10·T11），与 ORT 加载源一致；≠ 实施计划 §0「B3c」（M3b+§7/§8） */
+  /* Legacy behavior model export: product builds normally return AVE_ERR_NOT_IMPL. */
   int r = edr_onnx_behavior_export_weights(buf, size);
   if (r == -1) {
     return AVE_ERR_INVALID_PARAM;
@@ -1087,11 +1318,11 @@ int AVE_ImportModelWeights(const char *target, const void *buf, size_t size) {
   if (strcmp(target, "static") != 0 && strcmp(target, "behavior") != 0) {
     return AVE_ERR_INVALID_PARAM;
   }
-  /* FL3 梯度封装（协调方解密）；勿当作 ONNX 权重导入。 */
+  /* Historical FL3 gradient envelopes are not ONNX model weights. */
   if (buf && size >= 4u && memcmp(buf, "FL3", 3) == 0 && ((const uint8_t *)buf)[3] == 2u) {
     return AVE_ERR_NOT_SUPPORTED;
   }
-  /* C6：开发占位——`FLSTUB1` / `FL2` 前缀视为校验通过（非生产权重加载）。梯度 **FL3**（`fl_crypto_seal_gradient`）由协调方持有私钥解密，端上 `fl_crypto_open_gradient` 对 FL3 返回 `-5`，不用于本接口。 */
+  /* Legacy development markers are accepted for compatibility only. */
   if (buf && size >= 7u && memcmp(buf, "FLSTUB1", 7) == 0) {
     return AVE_OK;
   }

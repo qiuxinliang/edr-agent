@@ -1,5 +1,6 @@
 #include "edr/detection_decision.h"
 #include "edr/detection_profile.h"
+#include "edr/policy_v2.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -32,6 +33,8 @@ static int has_ci(const char *hay, const char *needle) {
 
 static int detail_value(const char *text, const char *key, char *out, size_t cap);
 static double detail_number(const char *text, const char *key, double fallback);
+static int policy_token_match(const char *env_inline, const char *env_file, const char *fallback, const char *value);
+static int token_list_has_exact_ci(const char *list, const char *value);
 
 static const char *base_name(const char *path) {
   const char *b = path && path[0] ? path : "";
@@ -66,10 +69,58 @@ static int decision_low_value_ransom_process(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
-  const char *s = r->process_name[0] ? r->process_name : r->exe_path;
-  return has_ci(s, "taskmgr.exe") || has_ci(s, "usoclient.exe") ||
-         has_ci(s, "taskhostw.exe") || has_ci(s, "ecagent.exe") ||
-         has_ci(s, "checknetisolation.exe") || has_ci(s, "conhost.exe");
+  const char *fallback =
+      "taskmgr.exe,usoclient.exe,taskhostw.exe,ecagent.exe,checknetisolation.exe,conhost.exe,"
+      "searchindexer.exe,searchprotocolhost.exe,searchfilterhost.exe";
+  char first_cmd[EDR_BR_STR_LONG];
+  first_cmd[0] = '\0';
+  const char *cmd = r->cmdline;
+  while (*cmd == ' ' || *cmd == '\t') {
+    cmd++;
+  }
+  if (*cmd == '"' || *cmd == '\'') {
+    char quote = *cmd++;
+    size_t n = 0u;
+    while (*cmd && *cmd != quote && n + 1u < sizeof(first_cmd)) {
+      first_cmd[n++] = *cmd++;
+    }
+    first_cmd[n] = '\0';
+  } else {
+    size_t n = 0u;
+    while (*cmd && *cmd != ' ' && *cmd != '\t' && n + 1u < sizeof(first_cmd)) {
+      first_cmd[n++] = *cmd++;
+    }
+    first_cmd[n] = '\0';
+  }
+  const char *ids[] = {base_name(r->process_name), base_name(r->exe_path), base_name(first_cmd)};
+  const char *lists[] = {getenv("EDR_RANSOM_LOW_VALUE_PROCESSES"),
+                         getenv("EDR_RANSOM_LOW_VALUE_PROCESSES_FILE"), fallback,
+                         getenv("EDR_RANSOM_BULK_SAFE_PROCESSES"),
+                         getenv("EDR_RANSOM_BULK_SAFE_PROCESSES_FILE")};
+  for (size_t i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+    const char *list = lists[i];
+    if (!list || !list[0]) {
+      continue;
+    }
+    char buf[8192];
+    const char *src = list;
+    if (i == 1u || i == 4u) {
+      FILE *f = fopen(list, "rb");
+      if (!f) {
+        continue;
+      }
+      size_t n = fread(buf, 1u, sizeof(buf) - 1u, f);
+      fclose(f);
+      buf[n] = '\0';
+      src = buf;
+    }
+    for (size_t j = 0; j < sizeof(ids) / sizeof(ids[0]); j++) {
+      if (ids[j][0] && token_list_has_exact_ci(src, ids[j])) {
+        return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 static int decision_suppress_ransom_file_signal(const EdrBehaviorRecord *r) {
@@ -100,6 +151,40 @@ static int token_list_has_ci(const char *list, const char *value) {
       tok[--n] = '\0';
     }
     if (tok[0] && has_ci(value, tok)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int token_list_has_exact_ci(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    char tok[512];
+    size_t n = 0u;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t')) {
+      n--;
+    }
+    tok[n] = '\0';
+    int same = tok[0] && strlen(tok) == strlen(value);
+    for (size_t i = 0; same && tok[i]; i++) {
+      if (tolower((unsigned char)tok[i]) != tolower((unsigned char)value[i])) {
+        same = 0;
+      }
+    }
+    if (same) {
       return 1;
     }
   }
@@ -265,9 +350,18 @@ static int has_credential_dump_indicator(const EdrBehaviorRecord *r) {
 static int has_ransom_recovery_tamper_indicator(const EdrBehaviorRecord *r) {
   const char *s = r->cmdline[0] ? r->cmdline : r->script_snippet;
   const char *n = r->process_name[0] ? r->process_name : base_name(r->exe_path);
-  return has_ci(n, "vssadmin.exe") || has_ci(n, "wbadmin.exe") || has_ci(n, "bcdedit.exe") ||
-         has_ci(n, "wevtutil.exe") || has_ci(s, "delete shadows") || has_ci(s, "shadowcopy delete") ||
-         has_ci(s, "recoveryenabled no") || has_ci(s, "delete catalog") || has_ci(s, "clear-log");
+  int vss_delete = has_ci(n, "vssadmin.exe") && has_ci(s, "delete") && has_ci(s, "shadows");
+  int wmic_shadow_delete = has_ci(s, "wmic") && has_ci(s, "shadowcopy") && has_ci(s, "delete");
+  int wbadmin_delete = has_ci(n, "wbadmin.exe") && has_ci(s, "delete") &&
+                       (has_ci(s, "catalog") || has_ci(s, "backup") || has_ci(s, "systemstatebackup"));
+  int bcdedit_recovery = has_ci(n, "bcdedit.exe") &&
+                         ((has_ci(s, "recoveryenabled") && has_ci(s, " no")) ||
+                          (has_ci(s, "bootstatuspolicy") && has_ci(s, "ignoreallfailures")));
+  int wevtutil_clear = has_ci(n, "wevtutil.exe") &&
+                       (has_ci(s, " cl ") || has_ci(s, " clear-log") || has_ci(s, "clearlog"));
+  return vss_delete || wmic_shadow_delete || wbadmin_delete || bcdedit_recovery || wevtutil_clear ||
+         has_ci(s, "shadowcopy delete") || has_ci(s, "delete shadows") || has_ci(s, "recoveryenabled no") ||
+         has_ci(s, "delete catalog") || has_ci(s, "clear-log");
 }
 
 static int has_ransom_note_indicator(const EdrBehaviorRecord *r) {
@@ -296,10 +390,10 @@ static int has_ransom_canary_indicator(const EdrBehaviorRecord *r) {
     return 0;
   }
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
-  const char *path = r->file_path[0] ? r->file_path : r->exe_path;
-  return has_ci(s, "ransom_canary=1") || has_ci(s, "DETERMINISTIC_ENCRYPTION") ||
-         has_ci(path, "~$canary") || has_ci(path, "edr_canary") || has_ci(path, ".edr-canary") ||
-         has_ci(path, "edr-canary");
+  /* Deterministic Canary 只接受 behavior_from_slot 生成的受信标记；
+   * 不再根据普通文件路径中的 canary 字符串升级为 P0。 */
+  return has_ci(s, "ransom_canary=1") || has_ci(s, "canary_counter_bypass=1") ||
+         has_ci(s, "ransomware_kind=DETERMINISTIC_ENCRYPTION");
 }
 
 static int has_ransom_counter_allowlist_indicator(const EdrBehaviorRecord *r) {
@@ -493,7 +587,7 @@ static int has_high_content_entropy_indicator(const EdrBehaviorRecord *r) {
 
 static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
-  if (has_ransom_canary_indicator(r)) {
+  if (edr_policy_v2_ransomware_enabled("honey") && has_ransom_canary_indicator(r)) {
     return 1;
   }
   if (decision_suppress_ransom_file_signal(r)) {
@@ -512,11 +606,25 @@ static int has_ransom_burst_indicator(const EdrBehaviorRecord *r) {
     entropy_delta = detail_number(s, "file_entropy_delta", -1.0);
   }
   int recovery = has_ransom_recovery_tamper_indicator(r);
-  return has_ci(s, "ransom_counter=1") || has_ci(s, "mass_rename=1") || has_ci(s, "extension_burst=1") ||
-         has_ci(s, "rename_burst=1") || has_ci(s, "shadow_delete=1") ||
-         has_ci(s, "shadowcopy_delete=1") || file_rate >= 80.0 || ext_burst >= 20.0 ||
-         dir_burst >= 4.0 || entropy_delta >= 1.5 || (ext_changed && high_content_entropy) ||
-         (recovery && (file_rate >= 20.0 || ext_burst >= 8.0 || dir_burst >= 2.0));
+  int behavior_enabled = edr_policy_v2_ransomware_enabled("behavior");
+  int mass_write_enabled = edr_policy_v2_ransomware_enabled("mass_write");
+  int mass = mass_write_enabled && (has_ci(s, "mass_rename=1") || has_ci(s, "rename_burst=1") || file_rate >= 120.0 ||
+             (file_rate >= 80.0 && (ext_burst >= 8.0 || dir_burst >= 2.0)));
+  int extension = (behavior_enabled || mass_write_enabled) && (has_ci(s, "extension_burst=1") || ext_burst >= 20.0 || ext_changed);
+  int entropy = behavior_enabled && (high_content_entropy || entropy_delta >= 1.5);
+  int spread = edr_policy_v2_ransomware_enabled("spread") && dir_burst >= 4.0;
+  int counter = mass_write_enabled && has_ci(s, "ransom_counter=1");
+  int shadow = edr_policy_v2_ransomware_enabled("vss") &&
+               (has_ci(s, "shadow_delete=1") || has_ci(s, "shadowcopy_delete=1") || recovery);
+  if (ext_changed && high_content_entropy) {
+    return 1;
+  }
+  if (recovery && (file_rate >= 20.0 || ext_burst >= 8.0 || dir_burst >= 2.0)) {
+    return 1;
+  }
+  return (mass && (extension || entropy || spread || shadow || counter)) ||
+         (extension && entropy && (spread || file_rate >= 20.0 || counter)) ||
+         (shadow && (mass || extension || entropy || spread || counter));
 }
 
 static int has_webshell_semantic_indicator(const EdrBehaviorRecord *r) {
@@ -987,6 +1095,12 @@ static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecisi
   } else if (out->suppress && strcmp(action, "emit_alert") == 0) {
     action = "emit_context";
   }
+  /* PMFE 跟进结果必须回传以关闭/更新源告警；非可疑结果只发上下文，不产生新告警。 */
+  if (r && r->type == EDR_EVENT_PMFE_SCAN_RESULT &&
+      strstr(r->script_snippet, "followup_only=1") != NULL &&
+      strstr(r->script_snippet, "pmfe_verdict=suspicious") == NULL) {
+    action = "emit_context";
+  }
   snprintf(out->selection_action, sizeof(out->selection_action), "%s", action);
 }
 
@@ -1242,6 +1356,56 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char evidence_proto[48];
   char evidence_mitre[32];
   char evidence_forensic[32];
+  char evidence_pcap_status[32];
+  char evidence_pcap_object_key[512];
+  char evidence_payload_sha256[96];
+  char evidence_preview_hex[192];
+  char evidence_stem[192];
+  char evidence_frames[32];
+  char attrib_schema[64];
+  char attrib_cve[64];
+  char attrib_family[96];
+  char attrib_product[96];
+  char attrib_vector[48];
+  char attrib_confidence[24];
+  char attrib_source[32];
+  char attrib_basis[160];
+  char evidence_service[128];
+  char evidence_action[64];
+  char evidence_url[256];
+  char evidence_alert_id[96];
+  char evidence_file_fp[96];
+  char evidence_file_uploaded[24];
+  char evidence_object_key[512];
+  char evidence_local_path[512];
+  char evidence_ast_score[32];
+  char evidence_token_score[32];
+  char evidence_pmfe_recommended[16];
+  char evidence_pmfe_trigger[48];
+  char evidence_pmfe_status[32];
+  char pmfe_stomp[32];
+  char pmfe_mz[32];
+  char pmfe_elf[32];
+  char pmfe_dns_ascii[32];
+  char pmfe_dns_utf16[32];
+  char pmfe_dns_wire[32];
+  char pmfe_dns_best[32];
+  char pmfe_dns_sample[128];
+  char pmfe_dns_owner[128];
+  char pmfe_ave[32];
+  char pmfe_entropy[32];
+  char pmfe_regions[32];
+  char pmfe_private_exec[32];
+  char pmfe_memfd_exec[32];
+  char pmfe_deleted_exec[32];
+  char pmfe_thread_start_matches[32];
+  char pmfe_read_failures[32];
+  char pmfe_injection_observed[8];
+  char pmfe_module_consistency[64];
+  char pmfe_source_alert_id[64];
+  char pmfe_status[32];
+  char pmfe_verdict[32];
+  char pmfe_followup[8];
   int script_sensor = has_script_sensor_indicator(r);
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_canary = has_ransom_canary_indicator(r);
@@ -1282,6 +1446,62 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char signature_status_buf[96];
   char ransomware_kind_buf[64];
   char ransomware_severity_buf[16];
+  evidence_detector[0] = '\0';
+  evidence_rule[0] = '\0';
+  evidence_score[0] = '\0';
+  evidence_proto[0] = '\0';
+  evidence_mitre[0] = '\0';
+  evidence_forensic[0] = '\0';
+  evidence_pcap_status[0] = '\0';
+  evidence_pcap_object_key[0] = '\0';
+  evidence_payload_sha256[0] = '\0';
+  evidence_preview_hex[0] = '\0';
+  evidence_stem[0] = '\0';
+  evidence_frames[0] = '\0';
+  attrib_schema[0] = '\0';
+  attrib_cve[0] = '\0';
+  attrib_family[0] = '\0';
+  attrib_product[0] = '\0';
+  attrib_vector[0] = '\0';
+  attrib_confidence[0] = '\0';
+  attrib_source[0] = '\0';
+  attrib_basis[0] = '\0';
+  evidence_service[0] = '\0';
+  evidence_action[0] = '\0';
+  evidence_url[0] = '\0';
+  evidence_alert_id[0] = '\0';
+  evidence_file_fp[0] = '\0';
+  evidence_file_uploaded[0] = '\0';
+  evidence_object_key[0] = '\0';
+  evidence_local_path[0] = '\0';
+  evidence_ast_score[0] = '\0';
+  evidence_token_score[0] = '\0';
+  evidence_pmfe_recommended[0] = '\0';
+  evidence_pmfe_trigger[0] = '\0';
+  evidence_pmfe_status[0] = '\0';
+  pmfe_stomp[0] = '\0';
+  pmfe_mz[0] = '\0';
+  pmfe_elf[0] = '\0';
+  pmfe_dns_ascii[0] = '\0';
+  pmfe_dns_utf16[0] = '\0';
+  pmfe_dns_wire[0] = '\0';
+  pmfe_dns_best[0] = '\0';
+  pmfe_dns_sample[0] = '\0';
+  pmfe_dns_owner[0] = '\0';
+  pmfe_ave[0] = '\0';
+  pmfe_entropy[0] = '\0';
+  pmfe_regions[0] = '\0';
+  pmfe_private_exec[0] = '\0';
+  pmfe_memfd_exec[0] = '\0';
+  pmfe_deleted_exec[0] = '\0';
+  pmfe_thread_start_matches[0] = '\0';
+  pmfe_read_failures[0] = '\0';
+  pmfe_injection_observed[0] = '\0';
+  pmfe_module_consistency[0] = '\0';
+  pmfe_source_alert_id[0] = '\0';
+  pmfe_status[0] = '\0';
+  pmfe_verdict[0] = '\0';
+  pmfe_followup[0] = '\0';
   detail_value(r->script_snippet, "ransom_note_count", note_count_buf, sizeof(note_count_buf));
   detail_value(r->script_snippet, "file_rate", file_rate_buf, sizeof(file_rate_buf));
   detail_value(r->script_snippet, "ext_burst", ext_burst_buf, sizeof(ext_burst_buf));
@@ -1307,6 +1527,63 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->script_snippet, "proto", evidence_proto, sizeof(evidence_proto));
   detail_value(r->script_snippet, "mitre", evidence_mitre, sizeof(evidence_mitre));
   detail_value(r->script_snippet, "forensic", evidence_forensic, sizeof(evidence_forensic));
+  detail_value(r->script_snippet, "stem", evidence_stem, sizeof(evidence_stem));
+  detail_value(r->script_snippet, "frames", evidence_frames, sizeof(evidence_frames));
+  detail_value(r->script_snippet, "pcap_status", evidence_pcap_status, sizeof(evidence_pcap_status));
+  detail_value(r->script_snippet, "pcap_object_key", evidence_pcap_object_key, sizeof(evidence_pcap_object_key));
+  detail_value(r->script_snippet, "payload_sha256", evidence_payload_sha256, sizeof(evidence_payload_sha256));
+  detail_value(r->script_snippet, "preview_hex", evidence_preview_hex, sizeof(evidence_preview_hex));
+  detail_value(r->script_snippet, "attrib_schema", attrib_schema, sizeof(attrib_schema));
+  detail_value(r->script_snippet, "attrib_cve", attrib_cve, sizeof(attrib_cve));
+  detail_value(r->script_snippet, "attrib_family", attrib_family, sizeof(attrib_family));
+  detail_value(r->script_snippet, "attrib_product", attrib_product, sizeof(attrib_product));
+  detail_value(r->script_snippet, "attrib_vector", attrib_vector, sizeof(attrib_vector));
+  detail_value(r->script_snippet, "attrib_confidence", attrib_confidence, sizeof(attrib_confidence));
+  detail_value(r->script_snippet, "attrib_source", attrib_source, sizeof(attrib_source));
+  detail_value(r->script_snippet, "attrib_basis", attrib_basis, sizeof(attrib_basis));
+  detail_value(r->script_snippet, "service", evidence_service, sizeof(evidence_service));
+  detail_value(r->script_snippet, "action", evidence_action, sizeof(evidence_action));
+  detail_value(r->script_snippet, "url", evidence_url, sizeof(evidence_url));
+  detail_value(r->script_snippet, "alert_id", evidence_alert_id, sizeof(evidence_alert_id));
+  detail_value(r->script_snippet, "file_fp", evidence_file_fp, sizeof(evidence_file_fp));
+  detail_value(r->script_snippet, "file_uploaded", evidence_file_uploaded, sizeof(evidence_file_uploaded));
+  detail_value(r->script_snippet, "object_key", evidence_object_key, sizeof(evidence_object_key));
+  detail_value(r->script_snippet, "local_path", evidence_local_path, sizeof(evidence_local_path));
+  detail_value(r->script_snippet, "ast_score", evidence_ast_score, sizeof(evidence_ast_score));
+  detail_value(r->script_snippet, "token_score", evidence_token_score, sizeof(evidence_token_score));
+  detail_value(r->script_snippet, "pmfe_recommended", evidence_pmfe_recommended, sizeof(evidence_pmfe_recommended));
+  detail_value(r->script_snippet, "pmfe_trigger", evidence_pmfe_trigger, sizeof(evidence_pmfe_trigger));
+  detail_value(r->script_snippet, "pmfe_status", evidence_pmfe_status, sizeof(evidence_pmfe_status));
+  detail_value(r->script_snippet, "stomp_suspicious", pmfe_stomp, sizeof(pmfe_stomp));
+  detail_value(r->script_snippet, "mz_hits", pmfe_mz, sizeof(pmfe_mz));
+  if (!pmfe_stomp[0]) detail_value(r->cmdline, "stomp_suspicious", pmfe_stomp, sizeof(pmfe_stomp));
+  if (!pmfe_mz[0]) detail_value(r->cmdline, "mz_hits", pmfe_mz, sizeof(pmfe_mz));
+  detail_value(r->cmdline, "elf_hits", pmfe_elf, sizeof(pmfe_elf));
+  detail_value(r->cmdline, "dns_ascii_hits", pmfe_dns_ascii, sizeof(pmfe_dns_ascii));
+  detail_value(r->cmdline, "dns_utf16_hits", pmfe_dns_utf16, sizeof(pmfe_dns_utf16));
+  detail_value(r->cmdline, "dns_wire_hits", pmfe_dns_wire, sizeof(pmfe_dns_wire));
+  detail_value(r->cmdline, "dns_best", pmfe_dns_best, sizeof(pmfe_dns_best));
+  detail_value(r->cmdline, "dns_sample", pmfe_dns_sample, sizeof(pmfe_dns_sample));
+  detail_value(r->cmdline, "dns_owner", pmfe_dns_owner, sizeof(pmfe_dns_owner));
+  detail_value(r->cmdline, "ave_max_score", pmfe_ave, sizeof(pmfe_ave));
+  detail_value(r->cmdline, "ent_max", pmfe_entropy, sizeof(pmfe_entropy));
+  detail_value(r->cmdline, "regions", pmfe_regions, sizeof(pmfe_regions));
+  detail_value(r->script_snippet, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
+  if (!pmfe_private_exec[0]) detail_value(r->cmdline, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
+  detail_value(r->script_snippet, "memfd_exec", pmfe_memfd_exec, sizeof(pmfe_memfd_exec));
+  if (!pmfe_memfd_exec[0]) detail_value(r->cmdline, "memfd_exec", pmfe_memfd_exec, sizeof(pmfe_memfd_exec));
+  detail_value(r->script_snippet, "deleted_exec", pmfe_deleted_exec, sizeof(pmfe_deleted_exec));
+  if (!pmfe_deleted_exec[0]) detail_value(r->cmdline, "deleted_exec", pmfe_deleted_exec, sizeof(pmfe_deleted_exec));
+  detail_value(r->script_snippet, "thread_start_matches", pmfe_thread_start_matches,
+               sizeof(pmfe_thread_start_matches));
+  detail_value(r->script_snippet, "read_failures", pmfe_read_failures, sizeof(pmfe_read_failures));
+  detail_value(r->script_snippet, "injection_observed", pmfe_injection_observed,
+               sizeof(pmfe_injection_observed));
+  detail_value(r->cmdline, "module_path_consistency", pmfe_module_consistency, sizeof(pmfe_module_consistency));
+  detail_value(r->script_snippet, "source_alert_id", pmfe_source_alert_id, sizeof(pmfe_source_alert_id));
+  detail_value(r->script_snippet, "pmfe_status", pmfe_status, sizeof(pmfe_status));
+  detail_value(r->script_snippet, "pmfe_verdict", pmfe_verdict, sizeof(pmfe_verdict));
+  detail_value(r->script_snippet, "followup_only", pmfe_followup, sizeof(pmfe_followup));
   json_cat(r->detection_context, sizeof(r->detection_context),
            "{\"engine\":");
   json_str(r->detection_context, sizeof(r->detection_context), engine_name(r), 48u);
@@ -1435,6 +1712,7 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            "\"signer_allowlisted\":%s,\"tree_root_pid\":%u,"
            "\"note_count\":%ld,\"note_min_files\":%d,"
            "\"note_window_s\":%d,\"candidate_score\":%d,\"p0_score\":%d,"
+           "\"state_transition\":%s,\"periodic_summary\":%s,"
            "\"direct_emit_single_note\":false,\"attribution_key\":\"tree:%u\"},",
            entropy_delta_buf[0] ? strtod(entropy_delta_buf, NULL) : 0.0,
            high_entropy_ratio_buf[0] ? strtod(high_entropy_ratio_buf, NULL) : 0.0,
@@ -1445,7 +1723,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            (unsigned)tree_root_pid,
            note_count_buf[0] ? strtol(note_count_buf, NULL, 10) : 0L,
            ransom_note_policy_min_files(), ransom_note_policy_window_s(),
-           chain_candidate_score, chain_p0_score, (unsigned)tree_root_pid);
+           chain_candidate_score, chain_p0_score,
+           has_ci(r->script_snippet, "ransom_counter_transition=1") ? "true" : "false",
+           has_ci(r->script_snippet, "ransom_counter_summary=1") ? "true" : "false",
+           (unsigned)tree_root_pid);
   if (d->suppress) {
     float before = d->confidence_before_suppression > 0.0f ? d->confidence_before_suppression : d->confidence;
     json_cat(r->detection_context, sizeof(r->detection_context),
@@ -1479,8 +1760,118 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            (t && t->targeted_files) ? "true" : "false",
            (t && t->ioc_lookup) ? "true" : "false");
   json_str(r->detection_context, sizeof(r->detection_context), t ? t->reason : "", 180u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
-           "},\"engine_evidence\":{\"pmfe_snapshot\":");
+  json_cat(r->detection_context, sizeof(r->detection_context), "},\"engine_evidence\":{");
+  if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"shellcode_result_v1\",\"alert_id\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_alert_id, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"flow\":{\"src\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->net_src, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"spt\":%u,\"dst\":", r->net_sport);
+    json_str(r->detection_context, sizeof(r->detection_context), r->net_dst, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"dpt\":%u,\"proto\":", r->net_dport);
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_proto[0] ? evidence_proto : r->net_proto, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"owner\":{\"pid\":%u},\"detection\":{\"detector\":", r->pid);
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":%.6f,\"mitre\":", evidence_score[0] ? strtod(evidence_score, NULL) : 0.0);
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_mitre[0] ? evidence_mitre : "T1210", 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"payload\":{\"sha256\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash, 80u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"preview_hex\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_preview_hex, 160u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"pmfe_followup\":{\"recommended\":%s,\"trigger\":",
+             evidence_pmfe_recommended[0] && strcmp(evidence_pmfe_recommended, "0") != 0 ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pmfe_trigger, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"status\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pmfe_status, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"pcap\":{\"stem\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_stem, 180u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"object_key\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pcap_object_key, 240u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"status\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_pcap_status[0] ? evidence_pcap_status : "disabled", 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"kind\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_forensic, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"frames\":%ld},\"response\":{\"status\":\"unknown\"},", evidence_frames[0] ? strtol(evidence_frames, NULL, 10) : 0L);
+    if (attrib_cve[0] || attrib_family[0] || attrib_vector[0]) {
+      json_cat(r->detection_context, sizeof(r->detection_context), "\"vulnerability_attribution\":{\"schema\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_schema[0] ? attrib_schema : "shellcode_vulnerability_attribution_v1", 64u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"candidate_cve\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_cve, 64u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"family\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_family, 96u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"product\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_product, 96u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"vector\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_vector, 48u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"confidence\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_confidence[0] ? attrib_confidence : "candidate", 24u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"source\":");
+      json_str(r->detection_context, sizeof(r->detection_context), attrib_source, 32u);
+      json_cat(r->detection_context, sizeof(r->detection_context), ",\"evidence_basis\":");
+      json_reason_array(r->detection_context, sizeof(r->detection_context), attrib_basis[0] ? attrib_basis : "known_rule_name,protocol_region,safe_signature_metadata");
+      json_cat(r->detection_context, sizeof(r->detection_context), "},");
+    }
+  } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"webshell_result_v1\",\"file\":{\"path\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->file_path, 220u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"sha256\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->exe_hash[0] ? r->exe_hash : evidence_file_fp, 80u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"sample\":{\"uploaded\":%s,\"object_key\":", (evidence_file_uploaded[0] && strcmp(evidence_file_uploaded, "0") != 0) ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_object_key, 240u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"local_path\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_local_path, 240u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"http\":{\"service\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_service, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"url\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_url[0] ? evidence_url : r->dns_query, 180u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"use\":{\"observed\":false},\"detection\":{\"detector\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
+    json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":%.6f,\"ast_score\":%.6f,\"token_score\":%.6f},\"response\":{\"quarantine_status\":\"unknown\"},",
+             evidence_score[0] ? strtod(evidence_score, NULL) : 0.0,
+             evidence_ast_score[0] ? strtod(evidence_ast_score, NULL) : 0.0,
+             evidence_token_score[0] ? strtod(evidence_token_score, NULL) : 0.0);
+  } else if (r->type == EDR_EVENT_PMFE_SCAN_RESULT || r->pmfe_snapshot[0]) {
+    long dns_hits = (pmfe_dns_ascii[0] ? strtol(pmfe_dns_ascii, NULL, 10) : 0L) +
+                    (pmfe_dns_utf16[0] ? strtol(pmfe_dns_utf16, NULL, 10) : 0L) +
+                    (pmfe_dns_wire[0] ? strtol(pmfe_dns_wire, NULL, 10) : 0L);
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"pmfe_result_v1\",\"source_alert_id\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_source_alert_id, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"followup_only\":%s,\"status\":",
+             pmfe_followup[0] && strcmp(pmfe_followup, "0") != 0 ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_status, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"verdict\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_verdict, 32u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"memfd_exec\":%ld,\"deleted_exec\":%ld,\"thread_start_matches\":%ld,\"read_failures\":%ld,\"injection_observed\":%s,\"module_consistency\":",
+             pmfe_stomp[0] ? strtol(pmfe_stomp, NULL, 10) : 0L,
+             pmfe_mz[0] ? strtol(pmfe_mz, NULL, 10) : 0L,
+             pmfe_elf[0] ? strtol(pmfe_elf, NULL, 10) : 0L,
+             dns_hits,
+             pmfe_dns_best[0] ? strtod(pmfe_dns_best, NULL) : 0.0,
+             pmfe_ave[0] ? strtod(pmfe_ave, NULL) : 0.0,
+             pmfe_entropy[0] ? strtod(pmfe_entropy, NULL) : 0.0,
+             pmfe_regions[0] ? strtol(pmfe_regions, NULL, 10) : 0L,
+             pmfe_private_exec[0] ? strtol(pmfe_private_exec, NULL, 10) : 0L,
+             pmfe_memfd_exec[0] ? strtol(pmfe_memfd_exec, NULL, 10) : 0L,
+             pmfe_deleted_exec[0] ? strtol(pmfe_deleted_exec, NULL, 10) : 0L,
+             pmfe_thread_start_matches[0] ? strtol(pmfe_thread_start_matches, NULL, 10) : 0L,
+             pmfe_read_failures[0] ? strtol(pmfe_read_failures, NULL, 10) : 0L,
+             pmfe_injection_observed[0] && strcmp(pmfe_injection_observed, "0") != 0 ? "true" : "false");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_module_consistency, 64u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"samples\":{\"dns_sample\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_dns_sample, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), ",\"dns_owner\":");
+    json_str(r->detection_context, sizeof(r->detection_context), pmfe_dns_owner, 96u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},\"evidence\":{\"pmfe_snapshot\":");
+    json_str(r->detection_context, sizeof(r->detection_context), r->pmfe_snapshot, 360u);
+    json_cat(r->detection_context, sizeof(r->detection_context), "},");
+  } else {
+    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"generic_engine_evidence_v1\",");
+  }
+  json_cat(r->detection_context, sizeof(r->detection_context), "\"pmfe_snapshot\":");
   json_str(r->detection_context, sizeof(r->detection_context), r->pmfe_snapshot, 360u);
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"detector\":");
   json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
@@ -1525,6 +1916,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int tls_anomaly = has_tls_anomaly_indicator(r);
   int ransom_canary = has_ransom_canary_indicator(r);
   int ransom_burst = has_ransom_burst_indicator(r);
+  int ransom_counter_allowlisted = has_ransom_counter_allowlist_indicator(r);
   int ransom_note = has_ransom_note_indicator(r);
   int ransom_note_burst = has_ransom_note_burst_indicator(r);
   int security_kill = has_security_product_kill_indicator(r);
@@ -1549,6 +1941,13 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     memset(&ransom_chain, 0, sizeof(ransom_chain));
   }
 
+  int pmfe_followup = r->type == EDR_EVENT_PMFE_SCAN_RESULT &&
+                      strstr(r->script_snippet, "followup_only=1") != NULL;
+  int pmfe_clean_followup = pmfe_followup &&
+                            strstr(r->script_snippet, "pmfe_verdict=clean") != NULL;
+  int pmfe_inconclusive_followup = pmfe_followup &&
+                                   strstr(r->script_snippet, "pmfe_verdict=suspicious") == NULL &&
+                                   !pmfe_clean_followup;
   float score = 0.20f;
   if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
     score = 0.88f;
@@ -1557,8 +1956,18 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     score = 0.82f;
     add_reason(out->reason, sizeof(out->reason), "webshell_signal");
   } else if (r->type == EDR_EVENT_PMFE_SCAN_RESULT) {
-    score = 0.72f;
-    add_reason(out->reason, sizeof(out->reason), "pmfe_memory_evidence");
+    if (pmfe_clean_followup) {
+      score = 0.05f;
+      add_reason(out->reason, sizeof(out->reason), "pmfe_followup_clean");
+      set_suppression(out, score, "pmfe_followup_clean", "EDR_DETECTION_POLICY_VERSION");
+    } else if (pmfe_inconclusive_followup) {
+      score = 0.15f;
+      add_reason(out->reason, sizeof(out->reason), "pmfe_followup_inconclusive");
+      set_suppression(out, score, "pmfe_followup_inconclusive", "EDR_DETECTION_POLICY_VERSION");
+    } else {
+      score = 0.72f;
+      add_reason(out->reason, sizeof(out->reason), "pmfe_memory_evidence");
+    }
   } else if (inject) {
     score = 0.74f;
     add_reason(out->reason, sizeof(out->reason), "process_injection_signal");
@@ -1774,7 +2183,8 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   if (out->reason[0] == '\0') {
     snprintf(out->reason, sizeof(out->reason), "%s", "baseline");
   }
-  if (out->suppress && score < 0.25f && r->priority != 0u) {
+  if (out->suppress && score < 0.25f && r->priority != 0u && !ransom_counter_allowlisted &&
+      !pmfe_followup) {
     out->drop = 1u;
   }
 

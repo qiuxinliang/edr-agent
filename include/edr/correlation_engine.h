@@ -26,6 +26,12 @@
 /** 总开关：EDR_CORRELATION_ENABLE=1/true/yes/on 才启用；默认关（no-op）。 */
 int edr_correlation_enabled(void);
 
+/** Apply product policy without requiring process-level environment changes. */
+void edr_correlation_configure(int enabled, int inject_feedback_enabled);
+
+/** Whether AVE injection/credential verdicts may be fed into correlation. */
+int edr_correlation_inject_feedback_enabled(void);
+
 /** 懒加载规则包与状态表；幂等，可重复调用。 */
 void edr_correlation_lazy_init(void);
 
@@ -62,6 +68,20 @@ void edr_correlation_evaluate(const EdrBehaviorRecord *br);
  */
 void edr_correlation_note_injection(uint32_t pid, const char *process_name,
                                     int64_t event_time_ns, const char *technique);
+
+typedef struct EdrCorrelationInjectionObservation {
+  uint32_t pid;
+  int64_t event_time_ns;
+  char process_name[256];
+  char technique[32];
+  char source[32];
+} EdrCorrelationInjectionObservation;
+
+/** Return the latest AVE-confirmed injection observation for pid. This is a
+ * process-level correlation signal; it does not imply that pid wrote a
+ * particular VAD unless source/target telemetry is available. */
+int edr_correlation_latest_injection(uint32_t pid,
+                                     EdrCorrelationInjectionObservation *out);
 
 /**
  * 集成点 B''（凭证转储回灌）：AVE 行为裁决判定为凭证转储类（LSASS/SAM/NTDS 等）时调用。

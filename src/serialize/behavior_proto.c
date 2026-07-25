@@ -7,6 +7,7 @@
 #include <pb_encode.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void copy_str(char *dst, size_t cap, const char *src) {
@@ -60,6 +61,70 @@ static int32_t edr_event_type_to_ave_event_type(EdrEventType t) {
   }
 }
 
+static int pmfe_detail_i(const char *s, const char *key) {
+  if (!s || !key || !key[0]) return 0;
+  const char *p = strstr(s, key);
+  if (!p) return 0;
+  p += strlen(key);
+  if (*p == '=') p++;
+  return (int)strtol(p, NULL, 10);
+}
+
+static float pmfe_detail_f(const char *s, const char *key) {
+  if (!s || !key || !key[0]) return 0.f;
+  const char *p = strstr(s, key);
+  if (!p) return 0.f;
+  p += strlen(key);
+  if (*p == '=') p++;
+  return strtof(p, NULL);
+}
+
+static int pmfe_has_positive_json_number(const char *json, const char *key) {
+  if (!json || !key || !key[0]) return 0;
+  char pat[64];
+  snprintf(pat, sizeof(pat), "\"%s\":", key);
+  const char *p = strstr(json, pat);
+  if (!p) return 0;
+  p += strlen(pat);
+  while (*p == ' ' || *p == '\t') p++;
+  return strtof(p, NULL) > 0.f;
+}
+
+static void fill_pmfe_cross_engine_fields(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r) {
+  if (!m || !r || r->type != EDR_EVENT_PMFE_SCAN_RESULT) return;
+  float ave = pmfe_detail_f(r->cmdline, "ave_max_score");
+  float dns_best = pmfe_detail_f(r->cmdline, "dns_best");
+  int stomp = pmfe_detail_i(r->cmdline, "stomp_suspicious");
+  int mz = pmfe_detail_i(r->cmdline, "mz_hits");
+  int elf = pmfe_detail_i(r->cmdline, "elf_hits");
+  int dns_hits = pmfe_detail_i(r->cmdline, "dns_ascii_hits") + pmfe_detail_i(r->cmdline, "dns_utf16_hits") +
+                 pmfe_detail_i(r->cmdline, "dns_wire_hits");
+  if (r->pmfe_snapshot[0]) {
+    if (pmfe_has_positive_json_number(r->pmfe_snapshot, "ave") && ave <= 0.f) {
+      const char *p = strstr(r->pmfe_snapshot, "\"ave\":");
+      ave = p ? strtof(p + 6, NULL) : ave;
+    }
+    if (pmfe_has_positive_json_number(r->pmfe_snapshot, "dns_best") && dns_best <= 0.f) {
+      const char *p = strstr(r->pmfe_snapshot, "\"dns_best\":");
+      dns_best = p ? strtof(p + 11, NULL) : dns_best;
+    }
+    stomp = stomp || pmfe_has_positive_json_number(r->pmfe_snapshot, "stomp");
+    mz = mz || pmfe_has_positive_json_number(r->pmfe_snapshot, "mz");
+    elf = elf || pmfe_has_positive_json_number(r->pmfe_snapshot, "elf");
+    dns_hits = dns_hits || pmfe_has_positive_json_number(r->pmfe_snapshot, "dns");
+  }
+  float conf = 0.f;
+  if (stomp) conf = 0.92f;
+  if (dns_hits) conf = conf > 0.63f ? conf : 0.63f;
+  if (dns_best > conf) conf = dns_best;
+  if (ave > conf) conf = ave;
+  if (conf > 1.f) conf = 1.f;
+  m->has_ave_behavior_feed = true;
+  m->ave_behavior_feed.pmfe_confidence = conf;
+  m->ave_behavior_feed.pmfe_pe_found = (mz || elf || stomp) ? true : false;
+  m->ave_behavior_feed.pmfe_dns_tunnel = (dns_hits || dns_best >= 0.30f) ? true : false;
+}
+
 static void fill_ave_behavior_feed(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r) {
   m->has_ave_behavior_feed = false;
   memset(&m->ave_behavior_feed, 0, sizeof(m->ave_behavior_feed));
@@ -93,6 +158,20 @@ static void fill_ave_behavior_feed(edr_v1_BehaviorEvent *m, const EdrBehaviorRec
     m->has_ave_behavior_feed = true;
     m->ave_behavior_feed.cert_revoked_ancestor = true;
   }
+  if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
+    float score = pmfe_detail_f(r->script_snippet, "score");
+    if (score > 0.f) {
+      m->has_ave_behavior_feed = true;
+      m->ave_behavior_feed.shellcode_score = score;
+    }
+  } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
+    float score = pmfe_detail_f(r->script_snippet, "score");
+    if (score > 0.f) {
+      m->has_ave_behavior_feed = true;
+      m->ave_behavior_feed.webshell_score = score;
+    }
+  }
+  fill_pmfe_cross_engine_fields(m, r);
 }
 
 static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r) {
@@ -140,7 +219,21 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
              r->parent_name);
     copy_str(m->detail.process.parent_path, sizeof(m->detail.process.parent_path),
              r->parent_path);
-    copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level), "");
+    copy_str(m->detail.process.integrity_level, sizeof(m->detail.process.integrity_level),
+             r->integrity_level);
+    /* 取证增强字段：端侧已采集，补齐上报（服务端 pbwire 按字段号 4-10 接住落库）。 */
+    copy_str(m->detail.process.parent_cmdline, sizeof(m->detail.process.parent_cmdline),
+             r->parent_cmdline);
+    copy_str(m->detail.process.current_directory, sizeof(m->detail.process.current_directory),
+             r->current_directory);
+    copy_str(m->detail.process.process_creation_time, sizeof(m->detail.process.process_creation_time),
+             r->process_creation_time);
+    m->detail.process.token_elevation = r->token_elevation;
+    m->detail.process.grandparent_pid = r->grandparent_pid;
+    copy_str(m->detail.process.grandparent_name, sizeof(m->detail.process.grandparent_name),
+             r->grandparent_name);
+    copy_str(m->detail.process.grandparent_path, sizeof(m->detail.process.grandparent_path),
+             r->grandparent_path);
     return;
   }
 }
@@ -167,7 +260,9 @@ size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *
   copy_str(msg.exe_path, sizeof(msg.exe_path), r->exe_path);
   copy_str(msg.username, sizeof(msg.username), r->username);
   msg.session_id = r->session_id;
-  if (r->pmfe_snapshot[0]) {
+  if (r->detection_context[0]) {
+    copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), r->detection_context);
+  } else if (r->pmfe_snapshot[0]) {
     copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), r->pmfe_snapshot);
   } else {
     copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), "");
@@ -212,7 +307,9 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
   msg.type = (int32_t)EDR_EVENT_BEHAVIOR_ONNX_ALERT;
   msg.event_time_ns = a->timestamp_ns;
   msg.pid = a->pid;
+  msg.ppid = a->ppid;
   copy_str(msg.process_name, sizeof(msg.process_name), a->process_name[0] ? a->process_name : "");
+  copy_str(msg.cmdline, sizeof(msg.cmdline), a->cmdline[0] ? a->cmdline : "");
   copy_str(msg.exe_path, sizeof(msg.exe_path), a->process_path[0] ? a->process_path : "");
   msg.priority = 0u;
 
@@ -232,6 +329,13 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
            a->process_name[0] ? a->process_name : "");
   copy_str(msg.behavior_alert.process_path, sizeof(msg.behavior_alert.process_path),
            a->process_path[0] ? a->process_path : "");
+  copy_str(msg.behavior_alert.related_iocs_json, sizeof(msg.behavior_alert.related_iocs_json),
+           a->related_iocs_json[0] ? a->related_iocs_json : "");
+  copy_str(msg.behavior_alert.user_subject_json, sizeof(msg.behavior_alert.user_subject_json),
+           a->user_subject_json[0] ? a->user_subject_json : "");
+  msg.behavior_alert.ppid = a->ppid;
+  copy_str(msg.behavior_alert.cmdline, sizeof(msg.behavior_alert.cmdline),
+           a->cmdline[0] ? a->cmdline : "");
 
   pb_ostream_t stream = pb_ostream_from_buffer(out, out_cap);
   if (!pb_encode(&stream, edr_v1_BehaviorEvent_fields, &msg)) {

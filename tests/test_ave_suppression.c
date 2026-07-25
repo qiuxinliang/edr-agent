@@ -92,6 +92,47 @@ static int init_db_l4_only(const char *path) {
   return 0;
 }
 
+static int init_db_tenant_noise(const char *path) {
+  sqlite3 *db = NULL;
+  if (sqlite3_open(path, &db) != SQLITE_OK) {
+    return -1;
+  }
+  const char *sql =
+      "CREATE TABLE IF NOT EXISTS ave_tenant_noise_policy ("
+      "tenant_id TEXT NOT NULL, model_version TEXT NOT NULL, rule_name TEXT NOT NULL,"
+      "min_confidence REAL DEFAULT 0, max_confidence REAL DEFAULT 1, action TEXT NOT NULL,"
+      "score_delta REAL DEFAULT 0, policy_version TEXT, gray_percent INTEGER DEFAULT 0,"
+      "is_active INTEGER DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);"
+      "INSERT INTO ave_tenant_noise_policy (tenant_id,model_version,rule_name,min_confidence,max_confidence,"
+      "action,score_delta,policy_version,gray_percent,is_active) VALUES "
+      "('tenant-a','ave-bhv-v3','rmm_remote_admin',0.4,0.95,'suppress',-0.55,'tenant-noise-v7',15,1),"
+      "('*','ave-bhv-v3','powershell_download',0.6,1.0,'review',-0.10,'global-noise-v2',5,1);";
+  char *err = NULL;
+  if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+    sqlite3_free(err);
+    sqlite3_close(db);
+    return -1;
+  }
+  sqlite3_close(db);
+  return 0;
+}
+
+static int count_gray_eval_rows(const char *path) {
+  sqlite3 *db = NULL;
+  if (sqlite3_open(path, &db) != SQLITE_OK) {
+    return -1;
+  }
+  sqlite3_stmt *st = NULL;
+  int n = -1;
+  if (sqlite3_prepare_v2(db, "SELECT COUNT(1) FROM ave_model_gray_eval", -1, &st, NULL) == SQLITE_OK &&
+      sqlite3_step(st) == SQLITE_ROW) {
+    n = sqlite3_column_int(st, 0);
+  }
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return n;
+}
+
 int main(void) {
   char dbpath[512];
   if (make_temp_path(dbpath, sizeof(dbpath)) != 0) {
@@ -156,8 +197,51 @@ int main(void) {
     return 1;
   }
 
+  char db3[512];
+  if (make_temp_path(db3, sizeof(db3)) != 0) {
+    remove(dbpath);
+    remove(db2);
+    return 1;
+  }
+  if (init_db_tenant_noise(db3) != 0) {
+    remove(dbpath);
+    remove(db2);
+    remove(db3);
+    return 1;
+  }
+  snprintf(cfg.ave.behavior_policy_db_path, sizeof(cfg.ave.behavior_policy_db_path), "%s", db3);
+  EdrAveTenantNoiseDecision dec;
+  if (!edr_ave_tenant_noise_lookup(&cfg, "tenant-a", "ave-bhv-v3", "rmm_remote_admin", 0.80f, &dec) ||
+      !dec.suppress || dec.gray_percent != 15u || strcmp(dec.policy_version, "tenant-noise-v7") != 0 ||
+      dec.adjusted_confidence > 0.26f) {
+    fprintf(stderr, "tenant noise suppress mismatch action=%s policy=%s adj=%.3f gray=%u\n", dec.action,
+            dec.policy_version, dec.adjusted_confidence, dec.gray_percent);
+    remove(dbpath);
+    remove(db2);
+    remove(db3);
+    return 1;
+  }
+  if (!edr_ave_tenant_noise_lookup(&cfg, "tenant-b", "ave-bhv-v3", "powershell_download", 0.82f, &dec) ||
+      !dec.needs_review || strcmp(dec.policy_version, "global-noise-v2") != 0) {
+    fprintf(stderr, "global noise review mismatch\n");
+    remove(dbpath);
+    remove(db2);
+    remove(db3);
+    return 1;
+  }
+  if (edr_ave_gray_eval_record(&cfg, "tenant-a", "ave-bhv-v3-canary", dec.policy_version, "powershell_download",
+                               0.82f, dec.adjusted_confidence, dec.action, "would_alert") != 0 ||
+      count_gray_eval_rows(db3) != 1) {
+    fprintf(stderr, "gray eval record mismatch\n");
+    remove(dbpath);
+    remove(db2);
+    remove(db3);
+    return 1;
+  }
+
   remove(dbpath);
   remove(db2);
+  remove(db3);
   printf("test_ave_suppression: ok\n");
   return 0;
 }

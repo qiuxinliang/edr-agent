@@ -15,8 +15,11 @@ const char *edr_pmfe_linux_skip_ws(const char *p);
 int edr_pmfe_linux_parse_maps_line(const char *line, uint64_t *lo, uint64_t *hi, char perms[5], char *path,
                                    size_t path_cap);
 
+int edr_pmfe_linux_path_is_memfd(const char *path);
+int edr_pmfe_linux_path_is_deleted(const char *path);
+
 /**
- * 私有可执行映射候选打分。anon_exec_only!=0 时仅匿名/[vdso] 等路径（无 '/' 或以 '[' 开头）参与。
+ * 私有可执行映射候选打分。anon_exec_only!=0 时仅匿名/[vdso]/memfd/deleted 映射参与。
  */
 float edr_pmfe_linux_map_candidate_score(const char *perms, uint64_t lo, uint64_t hi, const char *path,
                                          int anon_exec_only);

@@ -2,6 +2,8 @@
 
 目标：在**本机**用 **ONNX Runtime** 加载 **`[ave].model_dir`** 下模型，跑通 **`edr_ave_infer_file`** / **`test_ave_infer`**，并与 **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`** 的租户、endpoint 约定一致（若还要连平台）。
 
+**与「行为全链 / ingest」Runbook 的分工**：本页解决 **ORT 能加载**、`static.onnx` / **`behavior.onnx`** 就绪、**`edr_onnx_runtime_ready` / `edr_onnx_behavior_ready`** 为真时**在测试里**能跑通推理与 **`test_ave_e2e_full`** 等；**不**单独保证**生产路径**上一定出现**可解码**的 **行为批次** —— 那依赖 **预处理 → 跨引擎喂入 → 行为队列 → 非空 `on_behavior_alert` → `edr_behavior_alert_emit_to_batch` → `EDR_BEHAVIOR_ENCODING`**，见 **[WP-9 行为全链](WP9_BEHAVIOR_AVE.md)** 与 P0/静态 的**边界**（**WP-5**）。**CI 锚点**（无模型）：`edr-agent/scripts/verify_ave_behavior_chain_invariants.sh`。
+
 ---
 
 ## 1. 依赖
@@ -82,7 +84,8 @@ export EDR_AVE_INFER_DRY_RUN=0
 
 - **平台 HTTP + 种子库**：按 **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`** 启动 **edr-api**，**`tenant_id` / `endpoint_id`** 与 **`agent.integration.toml`** 对齐。
 - **gRPC**：Agent **`[server].address`** 指向 ingest；开发可用 **`EDR_GRPC_INSECURE=1`**（仅调试）。**`ave_infer`** 等指令经 **Subscribe** 下发时，需进程已 **`AVE_InitFromEdrConfig`**（**`edr_agent`** 主程序路径已初始化）。
-- **行为 ONNX**：真机 E2E 见 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**；实现计划见 **`docs/BEHAVIOR_ONNX_IMPLEMENTATION_PLAN.md`**。
+- **行为 ONNX**：真机 E2E 见 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**；实现计划见 **`docs/BEHAVIOR_ONNX_IMPLEMENTATION_PLAN.md`**。  
+- **全链可运营**（回调、跨引擎喂入、**`EDR_BEHAVIOR_ENCODING`**、与 P0 不混谈）：**[`docs/WP9_BEHAVIOR_AVE.md`](WP9_BEHAVIOR_AVE.md)**。
 
 ---
 

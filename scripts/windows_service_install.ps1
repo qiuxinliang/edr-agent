@@ -167,6 +167,16 @@ function Invoke-AgentPreflight {
   }
 }
 
+function Get-FDWindowsArch {
+  $raw = if ($env:EDR_BUNDLE_ARCH) { $env:EDR_BUNDLE_ARCH } elseif ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  $v = if ($raw) { $raw.Trim().ToLowerInvariant() } else { "" }
+  switch ($v) {
+    "arm64" { return "arm64" }
+    "aarch64" { return "arm64" }
+    default { return "amd64" }
+  }
+}
+
 function Install-AgentService {
   Assert-Admin
   if (-not (Test-Path -LiteralPath $ExePath)) {
@@ -190,12 +200,15 @@ function Install-AgentService {
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BIN" (Join-Path $InstallDir "collector\forensic_collector.exe")
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN" (Join-Path $InstallDir "collector\forensic_collector_builtin.exe")
   Set-MachineEnv "EDR_VELOCIRAPTOR_BIN" (Join-Path $InstallDir "collector\velociraptor.exe")
-  # 按需下载:本地缺 velo 时,agent 经平台「固定地址」manifest 拉取 + SHA256 校验 + 执行。
-  # 默认开启;manifest 地址由 -PlatformBaseUrl 推导(留空则不自动下载,仅用安装包内置/手动部署的 velo)。
+  Set-MachineEnv "EDR_FORENSIC_VERSION_CHECK_SEC" "60"
+  # 按需下载:agent 经平台「固定地址」manifest 分别刷新 Go adapter 与 Velociraptor。
+  # 默认开启;manifest 地址由 -PlatformBaseUrl 推导(留空则仅用安装包内置/手动部署件)。
   Set-MachineEnv "EDR_FORENSIC_COLLECTOR_AUTOFETCH" "1"
   if ($PlatformBaseUrl) {
     $base = $PlatformBaseUrl.TrimEnd('/')
-    Set-MachineEnv "EDR_FORENSIC_COLLECTOR_MANIFEST_URL" "$base/api/v1/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=amd64"
+    $arch = Get-FDWindowsArch
+    Set-MachineEnv "EDR_FORENSIC_ADAPTER_MANIFEST_URL" "$base/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=$arch"
+    Set-MachineEnv "EDR_FORENSIC_COLLECTOR_MANIFEST_URL" "$base/api/v1/agent/forensic-collector/manifest?kind=velociraptor&os=windows&arch=$arch"
   }
   Set-MachineEnv "EDR_CMD_AUDIT_PATH" (Join-Path $DataDir "logs\command_audit.log")
   Set-MachineEnv "EDR_SELF_PROTECT_PIDFILE" (Join-Path $DataDir "FDSensor.pid")
@@ -258,6 +271,7 @@ function Uninstall-AgentService {
       "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
       "EDR_VELOCIRAPTOR_BIN",
       "EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+      "EDR_FORENSIC_ADAPTER_MANIFEST_URL",
       "EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
       "EDR_CMD_AUDIT_PATH",
       "EDR_SELF_PROTECT_PIDFILE",

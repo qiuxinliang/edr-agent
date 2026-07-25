@@ -1,35 +1,52 @@
 cmake_minimum_required(VERSION 3.16)
-project(edr_agent C CXX)
+project(edr_agent
+  VERSION 0.1.0
+  DESCRIPTION "EDR endpoint agent"
+  LANGUAGES C CXX
+)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(EDR_WITH_GRPC "Build with gRPC++ EventIngest client (mTLS)" ON)
-option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
-list(APPEND CMAKE_PREFIX_PATH
-  /usr/local/opt/grpc
-  /opt/homebrew/opt/grpc
-  /usr/local
-  /opt/homebrew
-)
-set(EDR_GRPC_CLIENT_AVAILABLE 0)
-if(EDR_WITH_GRPC)
-  # 只通过 gRPC CONFIG 拉取 protobuf，避免与独立 Protobuf 包重复定义目标
-  find_package(gRPC CONFIG QUIET)
-  if(TARGET gRPC::grpc++)
-    set(EDR_GRPC_CLIENT_AVAILABLE 1)
+if(MSVC)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+  if(WIN32)
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _edr_system_processor_lc)
+    if(_edr_system_processor_lc MATCHES "arm64|aarch64")
+      set(_edr_msvc_win_arch_define _ARM64_=1)
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+      set(_edr_msvc_win_arch_define _AMD64_=1)
+    else()
+      set(_edr_msvc_win_arch_define _X86_=1)
+    endif()
+    add_compile_definitions(${_edr_msvc_win_arch_define})
+    message(STATUS "MSVC Windows SDK target architecture macro: ${_edr_msvc_win_arch_define}")
   endif()
 endif()
-set(EDR_GRPC_CLIENT_AVAILABLE ${EDR_GRPC_CLIENT_AVAILABLE} CACHE INTERNAL "EDR gRPC client availability")
-if(NOT EDR_GRPC_CLIENT_AVAILABLE)
-  message(STATUS "gRPC client disabled (install grpc/protobuf or set EDR_WITH_GRPC=OFF)")
-else()
-  message(STATUS "gRPC client enabled (real EventIngest transport)")
-endif()
+
+function(edr_apply_common_warnings target_name)
+  if(MSVC)
+    target_compile_options(${target_name} PRIVATE /W4 /WX-)
+  else()
+    target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+endfunction()
+
+option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
+option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
+set(EDR_P0_RULES_BUNDLE_VERSION
+  "edr-dynamic-rules-v1-r276-89b04a96"
+  CACHE STRING "P0/dynamic rule bundle version")
+set(EDR_AGENT_VERSION_STRING
+  "${PROJECT_VERSION}"
+  CACHE STRING "Agent version string reported to the platform")
+message(STATUS "gRPC client removed from product build; HTTP ingest/control only")
 
 option(EDR_WITH_ONNXRUNTIME "Link ONNX Runtime C API for AVE real inference (optional)" OFF)
+option(EDR_WITH_AVE_BEHAVIOR_ONNX "Deprecated: run behavior.onnx on endpoint instead of server-side evaluation" OFF)
 set(EDR_ONNXRUNTIME_AVAILABLE 0)
 if(EDR_WITH_ONNXRUNTIME)
   find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_c_api.h
@@ -55,60 +72,257 @@ if(EDR_WITH_ONNXRUNTIME)
 endif()
 
 option(EDR_BUILD_AVE_SHARED_LIB "Build standalone edr_ave_shared (AVE DLL/so for embedding)" OFF)
-option(EDR_WITH_FL_TRAINER "Build federated learning local trainer threads (stub)" OFF)
-option(EDR_WITH_FL_KAFKA "FL: consume round announces via librdkafka (requires EDR_WITH_FL_TRAINER)" OFF)
-set(TORCH_ROOT "" CACHE PATH "LibTorch 根目录（含 share/cmake/Torch），见 pytorch.org/cppdocs/installing.html")
-option(EDR_WITH_LIBTORCH "FL local_train 使用 LibTorch（需 TORCH_ROOT / CMAKE_PREFIX_PATH）" OFF)
-option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
-
-find_package(OpenSSL QUIET)
-set(EDR_LIBTORCH_AVAILABLE 0)
-if(EDR_WITH_LIBTORCH)
-  list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}" "$ENV{TORCH_ROOT}")
-  find_package(Torch QUIET)
-  if(Torch_FOUND)
-    set(EDR_LIBTORCH_AVAILABLE 1)
-    message(STATUS "LibTorch found for FL local_train")
-  else()
-    message(STATUS "LibTorch not found (set TORCH_ROOT or CMAKE_PREFIX_PATH to libtorch)")
-  endif()
+option(EDR_WITH_FL_TRAINER "Deprecated: federated learning trainer is removed from endpoint product builds" OFF)
+option(EDR_WITH_FL_KAFKA "Deprecated: federated learning Kafka consumer is removed from endpoint product builds" OFF)
+option(EDR_CREATE_LEGACY_AGENT_ALIAS "Create legacy edr_agent.exe alias next to FDSensor.exe on Windows" OFF)
+set(TORCH_ROOT "" CACHE PATH "Deprecated: LibTorch was used only by the removed endpoint FL trainer")
+option(EDR_WITH_LIBTORCH "Deprecated: LibTorch local FL training is removed from endpoint product builds" OFF)
+if(EDR_WITH_FL_TRAINER OR EDR_WITH_FL_KAFKA OR EDR_WITH_LIBTORCH)
+  message(FATAL_ERROR "Endpoint FL training has been removed from product builds; keep model learning server-side.")
 endif()
-set(EDR_YARA_AVAILABLE 0)
-if(EDR_WITH_YARA)
-  find_path(YARA_INCLUDE_DIR NAMES yara.h
+option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
+option(EDR_REQUIRE_YARA "Fail configure when libyara is unavailable" OFF)
+option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
+option(EDR_WITH_FORENSIC_COLLECTOR "Build the standalone forensic_collector binary" ON)
+if(EDR_REQUIRE_YARA AND NOT EDR_WITH_YARA)
+  message(FATAL_ERROR "EDR_REQUIRE_YARA=ON requires EDR_WITH_YARA=ON")
+endif()
+
+set(EDR_PCRE2_AVAILABLE 0)
+set(EDR_PCRE2_TARGET "")
+find_package(PCRE2 CONFIG QUIET)
+if(TARGET PCRE2::8BIT)
+  set(EDR_PCRE2_AVAILABLE 1)
+  set(EDR_PCRE2_TARGET PCRE2::8BIT)
+elseif(TARGET PCRE2::pcre2-8)
+  set(EDR_PCRE2_AVAILABLE 1)
+  set(EDR_PCRE2_TARGET PCRE2::pcre2-8)
+else()
+  find_path(EDR_PCRE2_INCLUDE_DIR NAMES pcre2.h
     PATHS
-      ENV YARA_ROOT
-      "$ENV{YARA_ROOT}/include"
+      ENV PCRE2_ROOT
+      "$ENV{PCRE2_ROOT}/include"
       /opt/homebrew/include
       /usr/local/include
-      "C:/yara/include")
-  find_library(YARA_LIB NAMES yara libyara
+      "C:/vcpkg/installed/x64-windows/include")
+  find_library(EDR_PCRE2_LIBRARY NAMES pcre2-8 pcre2-8-static
     PATHS
-      ENV YARA_ROOT
-      "$ENV{YARA_ROOT}/lib"
+      ENV PCRE2_ROOT
+      "$ENV{PCRE2_ROOT}/lib"
       /opt/homebrew/lib
       /usr/local/lib
-      "C:/yara/lib")
-  if(YARA_INCLUDE_DIR AND YARA_LIB)
-    set(EDR_YARA_AVAILABLE 1)
+      "C:/vcpkg/installed/x64-windows/lib")
+  if(EDR_PCRE2_INCLUDE_DIR AND EDR_PCRE2_LIBRARY)
+    set(EDR_PCRE2_AVAILABLE 1)
+  endif()
+endif()
+message(STATUS "P0 IR rule engine PCRE2 support: ${EDR_PCRE2_AVAILABLE}")
+
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT ON)
+else()
+  set(_EDR_INGEST_HTTPS_OPENSSL_DEFAULT OFF)
+endif()
+find_package(CURL QUIET)
+if(CURL_FOUND)
+  set(_EDR_HTTP2_CURL_DEFAULT ON)
+else()
+  set(_EDR_HTTP2_CURL_DEFAULT OFF)
+endif()
+set(EDR_ZSTD_AVAILABLE 0)
+set(EDR_ZSTD_TARGET "")
+find_package(zstd CONFIG QUIET)
+if(TARGET zstd::libzstd_shared)
+  set(EDR_ZSTD_AVAILABLE 1)
+  set(EDR_ZSTD_TARGET zstd::libzstd_shared)
+elseif(TARGET zstd::libzstd_static)
+  set(EDR_ZSTD_AVAILABLE 1)
+  set(EDR_ZSTD_TARGET zstd::libzstd_static)
+elseif(TARGET zstd::zstd)
+  set(EDR_ZSTD_AVAILABLE 1)
+  set(EDR_ZSTD_TARGET zstd::zstd)
+else()
+  find_path(EDR_ZSTD_INCLUDE_DIR NAMES zstd.h
+    PATHS
+      ENV ZSTD_ROOT
+      "$ENV{ZSTD_ROOT}/include"
+      /opt/homebrew/include
+      /usr/local/include
+      "C:/vcpkg/installed/x64-windows/include")
+  find_library(EDR_ZSTD_LIBRARY NAMES zstd libzstd
+    PATHS
+      ENV ZSTD_ROOT
+      "$ENV{ZSTD_ROOT}/lib"
+      /opt/homebrew/lib
+      /usr/local/lib
+      "C:/vcpkg/installed/x64-windows/lib")
+  if(EDR_ZSTD_INCLUDE_DIR AND EDR_ZSTD_LIBRARY)
+    set(EDR_ZSTD_AVAILABLE 1)
+  endif()
+endif()
+if(EDR_ZSTD_AVAILABLE)
+  set(_EDR_ZSTD_DEFAULT ON)
+else()
+  set(_EDR_ZSTD_DEFAULT OFF)
+endif()
+# no-gRPC Windows production builds still use REST ingest/health over HTTPS.
+# Default to ON whenever OpenSSL is available; smoke builds without OpenSSL stay
+# fast, while release/CI presets explicitly require this option and fail if the
+# dependency is missing.
+option(EDR_WITH_INGEST_HTTPS_OPENSSL
+  "Enable native HTTPS fallback in ingest_http.c through OpenSSL C headers"
+  ${_EDR_INGEST_HTTPS_OPENSSL_DEFAULT})
+if(WIN32)
+  set(_EDR_REQUIRE_HTTPS_REST_DEFAULT ON)
+else()
+  set(_EDR_REQUIRE_HTTPS_REST_DEFAULT OFF)
+endif()
+option(EDR_REQUIRE_HTTPS_REST
+  "Fail configure when no-gRPC Agent builds cannot use native HTTPS REST ingest"
+  ${_EDR_REQUIRE_HTTPS_REST_DEFAULT})
+if(EDR_WITH_INGEST_HTTPS_OPENSSL AND NOT OpenSSL_FOUND)
+  message(FATAL_ERROR "EDR_WITH_INGEST_HTTPS_OPENSSL=ON but OpenSSL was not found")
+endif()
+if(EDR_REQUIRE_HTTPS_REST AND NOT EDR_WITH_INGEST_HTTPS_OPENSSL)
+  message(FATAL_ERROR "EDR_REQUIRE_HTTPS_REST=ON requires EDR_WITH_INGEST_HTTPS_OPENSSL=ON")
+endif()
+message(STATUS "HTTP HTTPS ingest OpenSSL support: ${EDR_WITH_INGEST_HTTPS_OPENSSL}")
+option(EDR_WITH_HTTP2_CURL
+  "Enable real HTTP/2 ingest/control client through libcurl ALPN/nghttp2 when available"
+  ${_EDR_HTTP2_CURL_DEFAULT})
+if(EDR_WITH_HTTP2_CURL AND NOT CURL_FOUND)
+  message(FATAL_ERROR "EDR_WITH_HTTP2_CURL=ON but libcurl was not found")
+endif()
+option(EDR_REQUIRE_CURL_HTTP2
+  "Fail configure when EDR_WITH_HTTP2_CURL=ON but curl headers do not expose HTTP/2 support"
+  OFF)
+if(EDR_WITH_HTTP2_CURL)
+  include(CheckCSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${CURL_INCLUDE_DIRS})
+  if(TARGET CURL::libcurl)
+    set(CMAKE_REQUIRED_LIBRARIES CURL::libcurl)
   else()
-    message(STATUS "libyara not found, fallback to builtin known-exploit matcher")
+    set(CMAKE_REQUIRED_LIBRARIES ${CURL_LIBRARIES})
+  endif()
+  check_c_source_compiles("
+    #include <curl/curl.h>
+    #ifndef CURL_VERSION_HTTP2
+    #error CURL_VERSION_HTTP2 missing
+    #endif
+    int main(void) { return 0; }
+  " EDR_CURL_HEADERS_EXPOSE_HTTP2)
+  if(EDR_REQUIRE_CURL_HTTP2 AND NOT EDR_CURL_HEADERS_EXPOSE_HTTP2)
+    message(FATAL_ERROR "EDR_REQUIRE_CURL_HTTP2=ON but curl headers do not expose CURL_VERSION_HTTP2; install libcurl built with nghttp2")
+  endif()
+endif()
+message(STATUS "HTTP/2 ingest libcurl support: ${EDR_WITH_HTTP2_CURL}")
+option(EDR_WITH_ZSTD
+  "Enable zstd compression for HTTPS transport v2 report-events envelopes"
+  ${_EDR_ZSTD_DEFAULT})
+if(EDR_WITH_ZSTD AND NOT EDR_ZSTD_AVAILABLE)
+  message(FATAL_ERROR "EDR_WITH_ZSTD=ON but libzstd was not found")
+endif()
+message(STATUS "HTTPS transport zstd support: ${EDR_WITH_ZSTD}")
+option(EDR_WITH_P0_RULES_OPENSSL
+  "Enable AES-GCM decrypt support for encrypted P0 rule bundles"
+  ${_EDR_INGEST_HTTPS_OPENSSL_DEFAULT})
+if(EDR_WITH_P0_RULES_OPENSSL AND NOT OpenSSL_FOUND)
+  message(FATAL_ERROR "EDR_WITH_P0_RULES_OPENSSL=ON but OpenSSL was not found")
+endif()
+message(STATUS "P0 encrypted rule bundle OpenSSL support: ${EDR_WITH_P0_RULES_OPENSSL}")
+set(EDR_LIBTORCH_AVAILABLE 0)
+set(EDR_YARA_AVAILABLE 0)
+set(EDR_YARA_TARGET "")
+if(EDR_WITH_YARA)
+  if(WIN32 AND EDR_REQUIRE_YARA)
+    set(_EDR_VCPKG_FEATURES "${VCPKG_MANIFEST_FEATURES}")
+    if(NOT _EDR_VCPKG_FEATURES MATCHES "(^|[;,])yara($|[;,])")
+      message(FATAL_ERROR "Windows EDR_REQUIRE_YARA=ON requires vcpkg manifest feature 'yara'. Configure with -DVCPKG_MANIFEST_FEATURES=yara and install via vcpkg --x-feature=yara.")
+    endif()
+    find_package(unofficial-libyara CONFIG REQUIRED)
+    if(NOT TARGET unofficial::libyara::libyara)
+      message(FATAL_ERROR "Windows EDR_REQUIRE_YARA=ON requires vcpkg target unofficial::libyara::libyara; manual YARA_ROOT fallback is not accepted for release/package builds.")
+    endif()
+    set(EDR_YARA_AVAILABLE 1)
+    set(EDR_YARA_TARGET unofficial::libyara::libyara)
+    message(STATUS "libyara support: vcpkg target=${EDR_YARA_TARGET}")
+  else()
+    find_package(unofficial-libyara CONFIG QUIET)
+    if(TARGET unofficial::libyara::libyara)
+      set(EDR_YARA_AVAILABLE 1)
+      set(EDR_YARA_TARGET unofficial::libyara::libyara)
+      message(STATUS "libyara support: target=${EDR_YARA_TARGET}")
+    else()
+      set(_EDR_YARA_HINTS)
+      if(DEFINED ENV{YARA_ROOT})
+        list(APPEND _EDR_YARA_HINTS "$ENV{YARA_ROOT}")
+      endif()
+      if(DEFINED ENV{VCPKG_INSTALLED_X64})
+        list(APPEND _EDR_YARA_HINTS "$ENV{VCPKG_INSTALLED_X64}")
+      endif()
+      if(DEFINED VCPKG_INSTALLED_DIR)
+        list(APPEND _EDR_YARA_HINTS "${VCPKG_INSTALLED_DIR}")
+        if(DEFINED VCPKG_TARGET_TRIPLET)
+          list(APPEND _EDR_YARA_HINTS "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+        endif()
+      endif()
+      if(DEFINED ENV{VCPKG_ROOT} AND DEFINED VCPKG_TARGET_TRIPLET)
+        list(APPEND _EDR_YARA_HINTS "$ENV{VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}")
+      endif()
+      list(APPEND _EDR_YARA_HINTS /opt/homebrew /usr/local "C:/yara")
+
+      find_path(YARA_INCLUDE_DIR
+        NAMES yara.h yara/yara.h
+        HINTS ${_EDR_YARA_HINTS}
+        PATH_SUFFIXES include)
+      find_library(YARA_LIB
+        NAMES yara libyara yara64 libyara64
+        HINTS ${_EDR_YARA_HINTS}
+        PATH_SUFFIXES lib lib64)
+      if(YARA_INCLUDE_DIR AND YARA_LIB)
+        set(EDR_YARA_AVAILABLE 1)
+        message(STATUS "libyara support: include=${YARA_INCLUDE_DIR} lib=${YARA_LIB}")
+      elseif(EDR_REQUIRE_YARA)
+        message(FATAL_ERROR "EDR_REQUIRE_YARA=ON but libyara was not found; install vcpkg yara feature or set YARA_ROOT (include=${YARA_INCLUDE_DIR}, lib=${YARA_LIB})")
+      else()
+        message(STATUS "libyara not found, fallback to builtin known-exploit matcher")
+      endif()
+    endif()
   endif()
 endif()
 
 set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
+  src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c
   src/config/config.c
   src/preprocess/behavior_record.c
   src/preprocess/behavior_from_slot.c
+  src/preprocess/adaptive_collection.c
   src/preprocess/dedup.c
+  src/preprocess/detection_decision.c
+  src/preprocess/detection_profile.c
+  src/preprocess/enrich_parent_info.c
   src/preprocess/emit_rules.c
+  src/preprocess/encrypt_p0_rules.c
+  src/preprocess/p0_rule_direct_emit.c
+  src/preprocess/p0_rule_match.c
+  src/preprocess/process_chain_depth.c
+  src/preprocess/preprocess_env.c
+  src/preprocess/sensor_interest.c
+  src/preprocess/windows_event_policy.c
+  src/preprocess/correlation_engine.c
   src/preprocess/preprocess_pipeline.c
+  src/detection/detection_profile.c
+  src/detection/policy_enforcement.c
+  src/detection/policy_v2.c
+  src/forensic/process_tree_cache.c
   src/serialize/behavior_wire.c
   src/serialize/behavior_proto.c
+  src/serialize/alert_governor.c
   src/serialize/behavior_alert_emit.c
   src/serialize/behavior_proto_c.c
   src/proto/edr/v1/event.pb.c
@@ -116,22 +330,46 @@ set(EDR_AGENT_SOURCES
   third_party/nanopb/pb_encode.c
   third_party/nanopb/pb_decode.c
   src/transport/event_batch.c
+  src/transport/command_result_json.c
   src/transport/ingest_http.c
+  src/transport/request_signing.c
+  src/transport/transport_v2.c
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c
+  src/storage/local_evidence_cache.c
   src/command/command_stub.c
+  src/command/forensic_result_contract.c
+  src/command/command_cancel.c
+  src/command/command_contract.c
+  src/command/command_executor.c
+  src/command/command_registry.c
+  src/command/command_state.c
+  src/command/command_util.c
+  src/command/pe_verify.c
+  src/command/rtq_exec.c
+  src/command/shell_exec.c
   src/command/sha256.c
+  src/response/response_actions.c
+  src/response/response_file.c
+  src/response/response_forensic.c
+  src/response/response_utils.c
+  src/forensic/deep_collector.c
+  src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
   src/attack_surface/attack_surface_report.c
   src/attack_surface/attack_surface_egress.c
+  src/attack_surface/attack_surface_inventory.c
   src/attack_surface/security_policy_collect.c
   src/self_protect/self_protect.c
+  src/self_protect/heartbeat.c
+  src/self_protect/watchdog.c
+  src/detection/net_fanout_core.c
+  src/detection/net_fanout_detector.c
   src/resource/resource.c
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c
   src/ave/ave_sdk.c
   src/ave/ave_suppression.c
   src/ave/ave_rules_meta.c
@@ -143,10 +381,26 @@ set(EDR_AGENT_SOURCES
   src/ave/ave_hotfix.c
   src/ave/ave_db_update.c
   src/ave/ave_static_features.c
-  src/ave/fl_feature_provider.c
+  third_party/cjson/cJSON.c
 )
+if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  list(APPEND EDR_AGENT_SOURCES src/ave/edr_onnx_behavior_fl_tensor_export.c)
+endif()
+if(EDR_PCRE2_AVAILABLE)
+  list(APPEND EDR_AGENT_SOURCES
+    src/preprocess/p0_rule_ir.c
+  )
+else()
+  list(APPEND EDR_AGENT_SOURCES src/preprocess/p0_rule_ir_stub.c)
+endif()
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_win.c)
+  # MSVC already creates and embeds an executable manifest. Feeding it another
+  # RT_MANIFEST resource can collide with that generated resource at link time.
+  # Non-MSVC Windows toolchains still need the resource compiler input.
+  if(NOT MSVC)
+    list(APPEND EDR_AGENT_SOURCES resources/FDSensor.rc)
+  endif()
 else()
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_stub.c)
 endif()
@@ -173,12 +427,14 @@ else()
   list(APPEND EDR_AGENT_SOURCES src/collector/collector_stub.c)
 endif()
 
-# §17 Shellcode：头文件/WinDivert.lib 来自官方 SDK，通过 WINDIVERT_ROOT 传入；运行部署约定见 README（DLL 在 %SystemRoot%\System32）。
+# §17 Shellcode：运行时 WinDivert DLL/驱动由 x64 安装包随 Agent 目录交付；开发构建可用官方 SDK。
 set(EDR_SHELLCODE_SRCS
   src/shellcode_detector/shellcode_entropy.c
   src/shellcode_detector/shellcode_heuristic.c
   src/shellcode_detector/shellcode_known.c
   src/shellcode_detector/proto_parse.c
+  src/shellcode_detector/flow_dedup.c
+  src/shellcode_detector/tcp_reassembly.c
 )
 if(WIN32)
   list(APPEND EDR_SHELLCODE_SRCS
@@ -191,7 +447,10 @@ endif()
 list(APPEND EDR_AGENT_SOURCES ${EDR_SHELLCODE_SRCS})
 
 set(EDR_WEBSHELL_SRCS)
-list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_forensic.c)
+list(APPEND EDR_WEBSHELL_SRCS
+  src/webshell_detector/webshell_forensic.c
+  src/webshell_detector/webshell_semantic.c
+)
 if(WIN32)
   list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_detector_win.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -200,69 +459,7 @@ else()
   list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_detector_none.c)
 endif()
 list(APPEND EDR_AGENT_SOURCES ${EDR_WEBSHELL_SRCS})
-
 set(EDR_FL_KAFKA_AVAILABLE 0)
-if(EDR_WITH_FL_KAFKA AND NOT EDR_WITH_FL_TRAINER)
-  message(FATAL_ERROR "EDR_WITH_FL_KAFKA requires EDR_WITH_FL_TRAINER=ON")
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_WITH_FL_KAFKA)
-  find_package(PkgConfig QUIET)
-  if(PkgConfig_FOUND)
-    pkg_check_modules(RDKAFKA QUIET IMPORTED_TARGET rdkafka)
-  endif()
-  if(RDKAFKA_FOUND AND TARGET PkgConfig::RDKAFKA)
-    set(EDR_FL_KAFKA_AVAILABLE 1)
-  else()
-    find_path(RDKAFKA_INCLUDE_DIR NAMES librdkafka/rdkafka.h
-      PATHS
-        /opt/homebrew/include
-        /usr/local/include
-        "$ENV{HOMEBREW_PREFIX}/include"
-        "C:/vcpkg/installed/x64-windows/include")
-    find_library(RDKAFKA_LIBRARY NAMES rdkafka
-      PATHS
-        /opt/homebrew/lib
-        /usr/local/lib
-        "$ENV{HOMEBREW_PREFIX}/lib"
-        "C:/vcpkg/installed/x64-windows/lib")
-    if(RDKAFKA_INCLUDE_DIR AND RDKAFKA_LIBRARY)
-      set(EDR_FL_KAFKA_AVAILABLE 1)
-    endif()
-  endif()
-  if(NOT EDR_FL_KAFKA_AVAILABLE)
-    message(FATAL_ERROR "EDR_WITH_FL_KAFKA=ON but librdkafka not found (install librdkafka; pkg-config rdkafka or set CMAKE_PREFIX_PATH)")
-  endif()
-endif()
-
-set(EDR_FL_TRAINER_SOURCES
-  src/fl_trainer/fl_trainer.c
-  src/fl_trainer/fl_round.c
-  src/fl_trainer/fl_samples_db.c
-  src/fl_trainer/local_train_core.c
-  src/fl_trainer/fl_dp.c
-  src/fl_trainer/fl_privacy_budget.c
-  src/fl_trainer/fl_crypto.c
-  src/fl_trainer/fl_gradient_upload.c
-  src/fl_trainer/fl_frozen_layers.c
-  src/fl_trainer/fl_pb_wire.c
-  src/fl_trainer/fl_b64.c
-  src/fl_trainer/fl_http_upload.c
-  src/fl_trainer/fl_kafka_stub.c
-)
-if(EDR_WITH_FL_TRAINER AND EDR_FL_KAFKA_AVAILABLE)
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/fl_kafka_rdkafka.c)
-else()
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/fl_kafka_poll_noop.c)
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_LIBTORCH_AVAILABLE)
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/local_train_torch.cpp)
-endif()
-if(EDR_WITH_FL_TRAINER AND EDR_GRPC_CLIENT_AVAILABLE)
-  list(APPEND EDR_FL_TRAINER_SOURCES src/fl_trainer/fl_grpc_upload.cpp)
-endif()
-if(EDR_WITH_FL_TRAINER)
-  list(APPEND EDR_AGENT_SOURCES ${EDR_FL_TRAINER_SOURCES})
-endif()
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99/toml.c")
   message(FATAL_ERROR "tomlc99 required: third_party/tomlc99/toml.c (see third_party/tomlc99/README.txt)")
@@ -273,23 +470,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
   list(APPEND EDR_AGENT_SOURCES third_party/lz4/lz4.c)
 endif()
 
-if(EDR_GRPC_CLIENT_AVAILABLE)
-  list(APPEND EDR_AGENT_SOURCES
-    src/transport/grpc_client_impl.cpp
-    src/grpc_gen/edr/v1/ingest.pb.cc
-    src/grpc_gen/edr/v1/ingest.grpc.pb.cc
-  )
-else()
-  list(APPEND EDR_AGENT_SOURCES src/transport/grpc_client_stub.c)
-endif()
-
 set(EDR_AVE_CORE_SOURCES
   src/ave/ave_engine.c
   src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c
   src/ave/ave_static_features.c
   src/ave/ave_sdk.c
-  src/ave/fl_feature_provider.c
   src/ave/ave_suppression.c
   src/ave/ave_rules_meta.c
   src/ave/ave_behavior_pipeline.c
@@ -301,6 +486,9 @@ set(EDR_AVE_CORE_SOURCES
   src/ave/ave_db_update.c
   src/command/sha256.c
 )
+if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  list(APPEND EDR_AVE_CORE_SOURCES src/ave/edr_onnx_behavior_fl_tensor_export.c)
+endif()
 if(WIN32)
   list(APPEND EDR_AVE_CORE_SOURCES src/ave/ave_sign_whitelist_win.c)
 else()
@@ -308,32 +496,91 @@ else()
 endif()
 
 add_executable(edr_agent ${EDR_AGENT_SOURCES})
+if(WIN32)
+  set_target_properties(edr_agent PROPERTIES OUTPUT_NAME "FDSensor")
+  if(MSVC)
+    # Merge the application settings into MSVC's generated manifest instead of
+    # embedding a second resource with the same executable manifest ID.
+    target_link_options(edr_agent PRIVATE
+      "/MANIFEST:EMBED"
+      "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/resources/FDSensor.manifest")
+  endif()
+  if(EDR_CREATE_LEGACY_AGENT_ALIAS)
+    add_custom_command(TARGET edr_agent POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:edr_agent>"
+        "$<TARGET_FILE_DIR:edr_agent>/edr_agent$<TARGET_FILE_SUFFIX:edr_agent>"
+      COMMENT "Creating legacy edr_agent.exe alias for compatibility"
+      VERBATIM)
+  endif()
+endif()
+
+if(WIN32)
+  add_executable(fd_installer_worker src/installer_worker/installer_worker_win.c)
+  set_target_properties(fd_installer_worker PROPERTIES OUTPUT_NAME "FDSecurityInstallerWorker")
+  target_compile_definitions(fd_installer_worker PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(fd_installer_worker PRIVATE advapi32 shell32 user32)
+  edr_apply_common_warnings(fd_installer_worker)
+
+  add_executable(fd_headless_uninstaller WIN32 src/installer_worker/headless_uninstaller_win.c)
+  set_target_properties(fd_headless_uninstaller PROPERTIES OUTPUT_NAME "uninstall")
+  target_compile_definitions(fd_headless_uninstaller PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  if(MSVC)
+    # The dialog text is authored as UTF-8 wide string literals. Without an
+    # explicit source charset, MSVC decodes this file through the runner's ACP
+    # and the resulting uninstall prompts are permanently mojibaked.
+    target_compile_options(fd_headless_uninstaller PRIVATE /utf-8)
+  endif()
+  target_link_libraries(fd_headless_uninstaller PRIVATE shell32 user32)
+  edr_apply_common_warnings(fd_headless_uninstaller)
+endif()
+
+# C baseline 取证采集器(系统命令级,仅 libc,无第三方依赖)。
+# 命名裁决:Go 适配器(forensic-collector/, 封装 Velociraptor)输出规范名 forensic_collector(.exe)为主;
+# 本 C target 输出 forensic_collector_builtin(.exe)作兜底,由 agent 在 velo 不可用时回退调用。
+# 二者部署到同一目录 C:\Program Files\FDSecurity\collector\,靠文件名区分。
+if(EDR_WITH_FORENSIC_COLLECTOR)
+  add_executable(forensic_collector tools/forensic_collector/main.c)
+  set_target_properties(forensic_collector PROPERTIES OUTPUT_NAME "forensic_collector_builtin")
+  if(MSVC)
+    target_compile_definitions(forensic_collector PRIVATE _CRT_SECURE_NO_WARNINGS)
+  endif()
+  edr_apply_common_warnings(forensic_collector)
+endif()
 
 target_include_directories(edr_agent PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src/ave
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/fl_trainer
   ${CMAKE_CURRENT_SOURCE_DIR}/src/collector
   ${CMAKE_CURRENT_SOURCE_DIR}/src/pmfe
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanopb
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/windivert
   ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 )
-target_compile_definitions(edr_agent PRIVATE EDR_HAVE_NANOPB=1)
-if(EDR_WITH_FL_TRAINER)
-  target_compile_definitions(edr_agent PRIVATE EDR_WITH_FL_TRAINER=1)
+target_compile_definitions(edr_agent PRIVATE
+  EDR_HAVE_NANOPB=1
+  "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
+  "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
+)
+if(MSVC)
+  target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 endif()
-if(EDR_WITH_FL_TRAINER AND EDR_LIBTORCH_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LIBTORCH=1)
-  target_link_libraries(edr_agent PRIVATE ${TORCH_LIBRARIES})
-  if(TORCH_CXX_FLAGS)
-    separate_arguments(_edr_torch_cxx_flags UNIX_COMMAND "${TORCH_CXX_FLAGS}")
-    set_property(SOURCE src/fl_trainer/local_train_torch.cpp APPEND PROPERTY COMPILE_OPTIONS
-                 ${_edr_torch_cxx_flags})
+if(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  target_compile_definitions(edr_agent PRIVATE EDR_WITH_AVE_BEHAVIOR_ONNX=1)
+endif()
+
+if(EDR_PCRE2_AVAILABLE)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(edr_agent PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(edr_agent PRIVATE ${EDR_PCRE2_LIBRARY})
   endif()
 endif()
-if(EDR_WITH_FL_TRAINER AND OpenSSL_FOUND)
+if(EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_FL=1)
   if(TARGET OpenSSL::SSL)
     target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
@@ -341,16 +588,31 @@ if(EDR_WITH_FL_TRAINER AND OpenSSL_FOUND)
     target_link_libraries(edr_agent PRIVATE OpenSSL::Crypto)
   endif()
 endif()
-if(EDR_WITH_FL_TRAINER AND EDR_GRPC_CLIENT_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_GRPC_FL=1)
-endif()
 
-if(EDR_WITH_FL_TRAINER AND EDR_FL_KAFKA_AVAILABLE)
-  if(TARGET PkgConfig::RDKAFKA)
-    target_link_libraries(edr_agent PRIVATE PkgConfig::RDKAFKA)
+if(EDR_WITH_INGEST_HTTPS_OPENSSL AND OpenSSL_FOUND)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_OPENSSL_HTTP=1)
+  if(TARGET OpenSSL::SSL)
+    target_link_libraries(edr_agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   else()
-    target_include_directories(edr_agent PRIVATE ${RDKAFKA_INCLUDE_DIR})
-    target_link_libraries(edr_agent PRIVATE ${RDKAFKA_LIBRARY})
+    target_link_libraries(edr_agent PRIVATE OpenSSL::Crypto)
+  endif()
+endif()
+if(EDR_WITH_HTTP2_CURL AND CURL_FOUND)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_CURL_HTTP2=1)
+  if(TARGET CURL::libcurl)
+    target_link_libraries(edr_agent PRIVATE CURL::libcurl)
+  else()
+    target_include_directories(edr_agent PRIVATE ${CURL_INCLUDE_DIRS})
+    target_link_libraries(edr_agent PRIVATE ${CURL_LIBRARIES})
+  endif()
+endif()
+if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
+  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_ZSTD=1)
+  if(EDR_ZSTD_TARGET)
+    target_link_libraries(edr_agent PRIVATE ${EDR_ZSTD_TARGET})
+  else()
+    target_include_directories(edr_agent PRIVATE ${EDR_ZSTD_INCLUDE_DIR})
+    target_link_libraries(edr_agent PRIVATE ${EDR_ZSTD_LIBRARY})
   endif()
 endif()
 
@@ -366,8 +628,12 @@ endif()
 
 if(EDR_YARA_AVAILABLE)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_YARA=1)
-  target_include_directories(edr_agent PRIVATE ${YARA_INCLUDE_DIR})
-  target_link_libraries(edr_agent PRIVATE ${YARA_LIB})
+  if(EDR_YARA_TARGET)
+    target_link_libraries(edr_agent PRIVATE ${EDR_YARA_TARGET})
+  else()
+    target_include_directories(edr_agent PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(edr_agent PRIVATE ${YARA_LIB})
+  endif()
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
@@ -377,39 +643,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4/lz4.c")
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_LZ4=1)
 endif()
 
-if(EDR_GRPC_CLIENT_AVAILABLE)
-  target_include_directories(edr_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/grpc_gen)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_GRPC=1)
-  target_link_libraries(edr_agent PRIVATE gRPC::grpc++ protobuf::libprotobuf)
-  # gRPC / protobuf 生成代码会触发第三方头里的弃用符号告警，仅对这些源文件压掉
-  if(MSVC)
-    set(_edr_grpc_no_dep_warn /wd4996)
-  else()
-    set(_edr_grpc_no_dep_warn -Wno-deprecated-declarations)
-  endif()
-  set_source_files_properties(
-    src/transport/grpc_client_impl.cpp
-    src/grpc_gen/edr/v1/ingest.pb.cc
-    src/grpc_gen/edr/v1/ingest.grpc.pb.cc
-    PROPERTIES COMPILE_OPTIONS "${_edr_grpc_no_dep_warn}"
-  )
-  if(EDR_WITH_FL_TRAINER)
-    set_source_files_properties(
-      src/fl_trainer/fl_grpc_upload.cpp
-      PROPERTIES COMPILE_OPTIONS "${_edr_grpc_no_dep_warn}"
-    )
-  endif()
-endif()
-
-if(MSVC)
-  target_compile_options(edr_agent PRIVATE /W4 /WX-)
-else()
-  target_compile_options(edr_agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
+edr_apply_common_warnings(edr_agent)
 
 if(WIN32)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
-  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust)
+  target_link_libraries(edr_agent PRIVATE advapi32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32 dbghelp)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -431,635 +669,16 @@ if(SQLite3_FOUND)
     target_link_libraries(edr_agent PRIVATE SQLite::SQLite3)
   endif()
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_SQLITE=1)
+elseif(EDR_REQUIRE_SQLITE)
+  message(FATAL_ERROR "EDR_REQUIRE_SQLITE=ON but SQLite3 was not found")
 endif()
+message(STATUS "SQLite local storage support: ${SQLite3_FOUND}")
 
 if(EDR_BUILD_AVE_SHARED_LIB)
-  add_library(edr_ave_shared SHARED ${EDR_AVE_CORE_SOURCES})
-  target_include_directories(edr_ave_shared PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/ave
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99
-  )
-  target_compile_definitions(edr_ave_shared PRIVATE EDR_AVE_BUILD_DLL=1 EDR_HAVE_NANOPB=1)
-  target_link_libraries(edr_ave_shared PRIVATE Threads::Threads)
-  if(UNIX AND NOT WIN32)
-    target_link_libraries(edr_ave_shared PRIVATE m)
-  endif()
-  if(WIN32)
-    target_link_libraries(edr_ave_shared PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  endif()
-  if(SQLite3_FOUND)
-    if(TARGET SQLite3::SQLite3)
-      target_link_libraries(edr_ave_shared PRIVATE SQLite3::SQLite3)
-    else()
-      target_link_libraries(edr_ave_shared PRIVATE SQLite::SQLite3)
-    endif()
-    target_compile_definitions(edr_ave_shared PRIVATE EDR_HAVE_SQLITE=1)
-  endif()
-  if(EDR_ONNXRUNTIME_AVAILABLE)
-    target_compile_definitions(edr_ave_shared PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-    target_include_directories(edr_ave_shared PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-    target_link_libraries(edr_ave_shared PRIVATE ${ONNXRUNTIME_LIB})
-  endif()
-  set_target_properties(edr_ave_shared PROPERTIES OUTPUT_NAME "edr_ave")
+  add_subdirectory(src/ave)
 endif()
 
-enable_testing()
-add_test(NAME edr_agent_help COMMAND edr_agent --help)
-
-add_executable(test_ave_fp tests/test_ave_fp.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
-target_include_directories(test_ave_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
-add_executable(test_ave_infer tests/test_ave_infer.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
-target_include_directories(test_ave_infer PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
-add_executable(test_ave_phase1 tests/test_ave_phase1_contract.c src/ave/ave_engine.c src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c src/ave/ave_static_features.c)
-target_include_directories(test_ave_phase1 PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
-set(_edr_test_ave_sdk_sources
-  src/ave/ave_sdk.c
-  src/ave/fl_feature_provider.c
-  src/ave/ave_suppression.c
-  src/ave/ave_rules_meta.c
-  src/ave/ave_behavior_pipeline.c
-  src/ave/ave_behavior_features.c
-  src/ave/ave_cross_engine_parse.c
-  src/ave/ave_cross_engine_feed.c
-  src/ave/ave_lf_mpmc.c
-  src/ave/ave_hotfix.c
-  src/ave/ave_db_update.c
-  src/ave/ave_static_features.c
-  src/ave/ave_engine.c
-  src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c
-  src/config/config.c
-  src/command/sha256.c
-  third_party/tomlc99/toml.c
-)
-# 与 `edr_agent` 一致：`ave_behavior_pipeline` → `edr_behavior_alert_emit_to_batch` 的依赖链
-set(_edr_test_behavior_emit_sources
-  src/serialize/behavior_alert_emit.c
-  src/serialize/behavior_proto.c
-  src/proto/edr/v1/event.pb.c
-  third_party/nanopb/pb_common.c
-  third_party/nanopb/pb_encode.c
-  third_party/nanopb/pb_decode.c
-  src/transport/event_batch.c
-  src/transport/ingest_http.c
-  src/transport/transport_stub.c
-  src/transport/grpc_client_stub.c
-  src/core/time_util.c
-  src/storage/queue_sqlite.c
-  tests/stub_preprocess_agent_ids.c
-)
-add_executable(test_ave_sdk tests/test_ave_sdk.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
-target_include_directories(test_ave_sdk PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/src/ave
-  ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  ${CMAKE_SOURCE_DIR}/third_party/nanopb
-  ${CMAKE_SOURCE_DIR}/src/proto
-)
-target_compile_definitions(test_ave_sdk PRIVATE EDR_HAVE_NANOPB=1)
-add_executable(test_ave_fl_abi tests/test_ave_fl_abi.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
-target_include_directories(test_ave_fl_abi PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/src/ave
-  ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  ${CMAKE_SOURCE_DIR}/third_party/nanopb
-  ${CMAKE_SOURCE_DIR}/src/proto
-)
-target_compile_definitions(test_ave_fl_abi PRIVATE EDR_HAVE_NANOPB=1)
-target_compile_definitions(test_ave_fl_abi PRIVATE
-  "EDR_TEST_BEH_ONNX=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx\""
-)
-if(WIN32)
-  target_sources(test_ave_sdk PRIVATE src/attack_surface/listen_table_win.c)
-  target_sources(test_ave_sdk PRIVATE src/ave/ave_sign_whitelist_win.c)
-  target_sources(test_ave_fl_abi PRIVATE src/attack_surface/listen_table_win.c)
-  target_sources(test_ave_fl_abi PRIVATE src/ave/ave_sign_whitelist_win.c)
-else()
-  target_sources(test_ave_sdk PRIVATE src/ave/ave_sign_whitelist_stub.c)
-  target_sources(test_ave_fl_abi PRIVATE src/ave/ave_sign_whitelist_stub.c)
+if(EDR_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
 endif()
-if(SQLite3_FOUND)
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_ave_sdk PRIVATE SQLite3::SQLite3)
-    target_link_libraries(test_ave_fl_abi PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_ave_sdk PRIVATE SQLite::SQLite3)
-    target_link_libraries(test_ave_fl_abi PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_HAVE_SQLITE=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_HAVE_SQLITE=1)
-
-  add_executable(test_fl_ave_samples_bridge tests/test_fl_ave_samples_bridge.c
-    src/fl_trainer/fl_samples_db.c
-    ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
-  target_include_directories(test_fl_ave_samples_bridge PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src/ave
-    ${CMAKE_SOURCE_DIR}/src/fl_trainer
-    ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-    ${CMAKE_SOURCE_DIR}/third_party/nanopb
-    ${CMAKE_SOURCE_DIR}/src/proto
-  )
-  target_compile_definitions(test_fl_ave_samples_bridge PRIVATE EDR_HAVE_NANOPB=1)
-  if(WIN32)
-    target_sources(test_fl_ave_samples_bridge PRIVATE src/attack_surface/listen_table_win.c)
-    target_sources(test_fl_ave_samples_bridge PRIVATE src/ave/ave_sign_whitelist_win.c)
-  else()
-    target_sources(test_fl_ave_samples_bridge PRIVATE src/ave/ave_sign_whitelist_stub.c)
-  endif()
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_fl_ave_samples_bridge PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_fl_ave_samples_bridge PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_fl_ave_samples_bridge PRIVATE EDR_HAVE_SQLITE=1)
-  if(WIN32)
-    target_compile_definitions(test_fl_ave_samples_bridge PRIVATE EDR_OS_WINDOWS=1)
-    target_link_libraries(test_fl_ave_samples_bridge PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  else()
-    target_compile_definitions(test_fl_ave_samples_bridge PRIVATE EDR_OS_POSIX=1)
-    target_link_libraries(test_fl_ave_samples_bridge PRIVATE m)
-  endif()
-  if(MSVC)
-    target_compile_options(test_fl_ave_samples_bridge PRIVATE /W4 /WX-)
-  else()
-    target_compile_options(test_fl_ave_samples_bridge PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  endif()
-  if(EDR_ONNXRUNTIME_AVAILABLE)
-    target_compile_definitions(test_fl_ave_samples_bridge PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-    target_include_directories(test_fl_ave_samples_bridge PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-    target_link_libraries(test_fl_ave_samples_bridge PRIVATE ${ONNXRUNTIME_LIB})
-    if(APPLE)
-      get_filename_component(_edr_ort_libdir_bridge "${ONNXRUNTIME_LIB}" DIRECTORY)
-      set_target_properties(test_fl_ave_samples_bridge PROPERTIES BUILD_RPATH "${_edr_ort_libdir_bridge}")
-    endif()
-  endif()
-endif()
-
-# static + behavior ONNX 同一进程全流程（须 ORT + model_dir 下 release 产物）
-add_executable(test_ave_e2e_full tests/test_ave_e2e_full.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
-target_include_directories(test_ave_e2e_full PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/src/ave
-  ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  ${CMAKE_SOURCE_DIR}/third_party/nanopb
-  ${CMAKE_SOURCE_DIR}/src/proto
-)
-target_compile_definitions(test_ave_e2e_full PRIVATE EDR_HAVE_NANOPB=1)
-if(WIN32)
-  target_sources(test_ave_e2e_full PRIVATE src/attack_surface/listen_table_win.c)
-  target_sources(test_ave_e2e_full PRIVATE src/ave/ave_sign_whitelist_win.c)
-else()
-  target_sources(test_ave_e2e_full PRIVATE src/ave/ave_sign_whitelist_stub.c)
-endif()
-if(SQLite3_FOUND)
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_ave_e2e_full PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_ave_e2e_full PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_HAVE_SQLITE=1)
-endif()
-
-# P4：AVE_ApplyHotfix + AVE_GetStatus（须 ORT + 双目录 fixture）
-add_executable(test_ave_hotfix_smoke tests/test_ave_hotfix_smoke.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
-target_include_directories(test_ave_hotfix_smoke PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/src/ave
-  ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  ${CMAKE_SOURCE_DIR}/third_party/nanopb
-  ${CMAKE_SOURCE_DIR}/src/proto
-)
-target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_HAVE_NANOPB=1)
-if(WIN32)
-  target_sources(test_ave_hotfix_smoke PRIVATE src/attack_surface/listen_table_win.c)
-  target_sources(test_ave_hotfix_smoke PRIVATE src/ave/ave_sign_whitelist_win.c)
-else()
-  target_sources(test_ave_hotfix_smoke PRIVATE src/ave/ave_sign_whitelist_stub.c)
-endif()
-if(SQLite3_FOUND)
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_ave_hotfix_smoke PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_ave_hotfix_smoke PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_HAVE_SQLITE=1)
-endif()
-
-add_executable(test_ave_suppression tests/test_ave_suppression.c
-  src/ave/ave_suppression.c
-  src/ave/ave_rules_meta.c
-)
-target_include_directories(test_ave_suppression PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
-if(SQLite3_FOUND)
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_ave_suppression PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_ave_suppression PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_ave_suppression PRIVATE EDR_HAVE_SQLITE=1)
-endif()
-
-add_executable(test_ave_pipeline tests/test_ave_pipeline.c
-  src/ave/ave_sdk.c
-  src/ave/fl_feature_provider.c
-  src/ave/ave_suppression.c
-  src/ave/ave_rules_meta.c
-  src/ave/ave_behavior_pipeline.c
-  src/ave/ave_behavior_features.c
-  src/ave/ave_cross_engine_parse.c
-  src/ave/ave_cross_engine_feed.c
-  src/ave/ave_lf_mpmc.c
-  src/ave/ave_hotfix.c
-  src/ave/ave_db_update.c
-  src/ave/ave_static_features.c
-  src/ave/ave_engine.c
-  src/ave/ave_onnx_infer.c
-  src/ave/edr_onnx_behavior_fl_tensor_export.c
-  src/config/config.c
-  src/command/sha256.c
-  third_party/tomlc99/toml.c
-  ${_edr_test_behavior_emit_sources}
-)
-target_include_directories(test_ave_pipeline PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/src/ave
-  ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  ${CMAKE_SOURCE_DIR}/third_party/nanopb
-  ${CMAKE_SOURCE_DIR}/src/proto
-)
-target_compile_definitions(test_ave_pipeline PRIVATE EDR_HAVE_NANOPB=1)
-if(WIN32)
-  target_sources(test_ave_pipeline PRIVATE src/attack_surface/listen_table_win.c)
-  target_sources(test_ave_pipeline PRIVATE src/ave/ave_sign_whitelist_win.c)
-else()
-  target_sources(test_ave_pipeline PRIVATE src/ave/ave_sign_whitelist_stub.c)
-endif()
-if(SQLite3_FOUND)
-  if(TARGET SQLite3::SQLite3)
-    target_link_libraries(test_ave_pipeline PRIVATE SQLite3::SQLite3)
-  else()
-    target_link_libraries(test_ave_pipeline PRIVATE SQLite::SQLite3)
-  endif()
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_HAVE_SQLITE=1)
-endif()
-
-add_executable(test_ave_behavior_features_m3a tests/test_ave_behavior_features_m3a.c src/ave/ave_behavior_features.c)
-target_include_directories(test_ave_behavior_features_m3a PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_executable(test_ave_cross_engine_parse tests/test_ave_cross_engine_parse.c src/ave/ave_cross_engine_parse.c)
-target_include_directories(test_ave_cross_engine_parse PRIVATE ${CMAKE_SOURCE_DIR}/include)
-if(NOT WIN32)
-  target_link_libraries(test_ave_cross_engine_parse PRIVATE m)
-endif()
-if(NOT WIN32)
-  target_link_libraries(test_ave_behavior_features_m3a PRIVATE m)
-endif()
-add_test(NAME ave_behavior_features_m3a COMMAND test_ave_behavior_features_m3a WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME ave_cross_engine_parse COMMAND test_ave_cross_engine_parse WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-add_executable(test_ave_behavior_features_m3b tests/test_ave_behavior_features_m3b.c src/ave/ave_behavior_features.c)
-target_include_directories(test_ave_behavior_features_m3b PRIVATE ${CMAKE_SOURCE_DIR}/include)
-if(NOT WIN32)
-  target_link_libraries(test_ave_behavior_features_m3b PRIVATE m)
-endif()
-add_test(NAME ave_behavior_features_m3b COMMAND test_ave_behavior_features_m3b WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-add_executable(test_ave_behavior_gates tests/test_ave_behavior_gates.c)
-target_include_directories(test_ave_behavior_gates PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME ave_behavior_gates COMMAND test_ave_behavior_gates WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-find_program(EDR_PYTHON3 python3)
-if(EDR_PYTHON3)
-  add_test(
-    NAME ave_behavior_m3b_python_parity
-    COMMAND ${EDR_PYTHON3} "${CMAKE_SOURCE_DIR}/scripts/behavior_encode_m3b.py"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-endif()
-
-if(UNIX)
-  add_test(
-    NAME ave_behavior_onnx_contract_check
-    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check_behavior_onnx_contract.sh"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-endif()
-
-add_executable(test_config_fp tests/test_config_fp.c src/config/config.c third_party/tomlc99/toml.c)
-target_include_directories(test_config_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/tomlc99)
-
-add_executable(test_pmfe_detail tests/test_pmfe_detail.c)
-add_test(NAME pmfe_scan_detail_format COMMAND test_pmfe_detail WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(test_pmfe_linux_maps tests/test_pmfe_linux_maps.c src/pmfe/pmfe_linux_scan_util.c)
-  target_include_directories(test_pmfe_linux_maps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/pmfe)
-  add_test(NAME pmfe_linux_maps_parse COMMAND test_pmfe_linux_maps WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-endif()
-
-if(EDR_WITH_FL_TRAINER)
-  add_executable(test_fl_trainer_smoke tests/test_fl_trainer_smoke.c src/ave/fl_feature_provider.c
-                  ${EDR_FL_TRAINER_SOURCES})
-  target_include_directories(test_fl_trainer_smoke PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src/fl_trainer
-  )
-  target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_WITH_FL_TRAINER=1)
-  find_package(Threads REQUIRED)
-  target_link_libraries(test_fl_trainer_smoke PRIVATE Threads::Threads)
-  if(WIN32)
-    target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_OS_WINDOWS=1)
-    target_link_libraries(test_fl_trainer_smoke PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  else()
-    target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_OS_POSIX=1)
-    target_link_libraries(test_fl_trainer_smoke PRIVATE m)
-  endif()
-  if(MSVC)
-    target_compile_options(test_fl_trainer_smoke PRIVATE /W4 /WX-)
-  else()
-    target_compile_options(test_fl_trainer_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  endif()
-  if(SQLite3_FOUND)
-    if(TARGET SQLite3::SQLite3)
-      target_link_libraries(test_fl_trainer_smoke PRIVATE SQLite3::SQLite3)
-    else()
-      target_link_libraries(test_fl_trainer_smoke PRIVATE SQLite::SQLite3)
-    endif()
-    target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_HAVE_SQLITE=1)
-  endif()
-  if(EDR_LIBTORCH_AVAILABLE)
-    target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_HAVE_LIBTORCH=1)
-    target_link_libraries(test_fl_trainer_smoke PRIVATE ${TORCH_LIBRARIES})
-    if(TORCH_CXX_FLAGS)
-      separate_arguments(_edr_torch_test_flags UNIX_COMMAND "${TORCH_CXX_FLAGS}")
-      set_property(SOURCE src/fl_trainer/local_train_torch.cpp APPEND PROPERTY COMPILE_OPTIONS
-                   ${_edr_torch_test_flags})
-    endif()
-  endif()
-  if(OpenSSL_FOUND)
-    target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_HAVE_OPENSSL_FL=1)
-    if(TARGET OpenSSL::SSL)
-      target_link_libraries(test_fl_trainer_smoke PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    else()
-      target_link_libraries(test_fl_trainer_smoke PRIVATE OpenSSL::Crypto)
-    endif()
-  endif()
-  if(EDR_GRPC_CLIENT_AVAILABLE)
-    target_compile_definitions(test_fl_trainer_smoke PRIVATE EDR_HAVE_GRPC_FL=1)
-    target_link_libraries(test_fl_trainer_smoke PRIVATE gRPC::grpc++ protobuf::libprotobuf)
-    target_include_directories(test_fl_trainer_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src/grpc_gen)
-  endif()
-  if(OpenSSL_FOUND)
-    add_executable(test_fl_crypto_fl3 tests/test_fl_crypto_fl3.c src/fl_trainer/fl_crypto.c)
-    target_include_directories(test_fl_crypto_fl3 PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/fl_trainer)
-    target_compile_definitions(test_fl_crypto_fl3 PRIVATE EDR_HAVE_OPENSSL_FL=1)
-    target_link_libraries(test_fl_crypto_fl3 PRIVATE OpenSSL::Crypto)
-    add_test(NAME fl_crypto_fl3 COMMAND test_fl_crypto_fl3 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-  endif()
-  add_executable(test_fl_pb_gradient_chunk tests/test_fl_pb_gradient_chunk.c src/fl_trainer/fl_pb_wire.c)
-  target_include_directories(test_fl_pb_gradient_chunk PRIVATE ${CMAKE_SOURCE_DIR}/src/fl_trainer)
-  add_test(NAME fl_pb_gradient_chunk COMMAND test_fl_pb_gradient_chunk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-endif()
-
-if(WIN32)
-  target_compile_definitions(test_ave_fp PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_infer PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_suppression PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_OS_WINDOWS=1)
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_OS_WINDOWS=1)
-else()
-  target_compile_definitions(test_ave_fp PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_infer PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_suppression PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_OS_POSIX=1)
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_OS_POSIX=1)
-endif()
-
-if(EDR_ONNXRUNTIME_AVAILABLE)
-  target_compile_definitions(test_ave_fp PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_infer PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_sdk PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_fl_abi PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_pipeline PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_e2e_full PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_hotfix_smoke PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_include_directories(test_ave_fp PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_infer PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_sdk PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_fl_abi PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_pipeline PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_e2e_full PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_include_directories(test_ave_hotfix_smoke PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(test_ave_fp PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_infer PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_sdk PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_fl_abi PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_pipeline PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_e2e_full PRIVATE ${ONNXRUNTIME_LIB})
-  target_link_libraries(test_ave_hotfix_smoke PRIVATE ${ONNXRUNTIME_LIB})
-
-  add_executable(test_ave_static_onnx_integration tests/test_ave_static_onnx_integration.c
-    src/ave/ave_engine.c
-    src/ave/ave_onnx_infer.c
-    src/ave/edr_onnx_behavior_fl_tensor_export.c
-    src/ave/ave_static_features.c
-    src/config/config.c
-    third_party/tomlc99/toml.c
-  )
-  target_include_directories(test_ave_static_onnx_integration PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src/ave
-    ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  )
-  target_compile_definitions(test_ave_static_onnx_integration PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_static_onnx_integration PRIVATE
-    "EDR_TEST_FIXTURE_ONNX=\"${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx\""
-  )
-  target_include_directories(test_ave_static_onnx_integration PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(test_ave_static_onnx_integration PRIVATE ${ONNXRUNTIME_LIB} Threads::Threads)
-  if(UNIX AND NOT WIN32)
-    target_link_libraries(test_ave_static_onnx_integration PRIVATE m)
-  endif()
-  if(WIN32)
-    target_compile_definitions(test_ave_static_onnx_integration PRIVATE EDR_OS_WINDOWS=1)
-  else()
-    target_compile_definitions(test_ave_static_onnx_integration PRIVATE EDR_OS_POSIX=1)
-  endif()
-
-  if(APPLE)
-    get_filename_component(_edr_ort_libdir_t "${ONNXRUNTIME_LIB}" DIRECTORY)
-    set_target_properties(test_ave_fp test_ave_infer test_ave_sdk test_ave_fl_abi test_ave_pipeline
-      test_ave_e2e_full test_ave_hotfix_smoke test_ave_static_onnx_integration PROPERTIES BUILD_RPATH "${_edr_ort_libdir_t}")
-  endif()
-
-  add_test(NAME ave_static_onnx_triple_integration COMMAND test_ave_static_onnx_integration
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-  add_executable(test_ave_behavior_onnx_integration tests/test_ave_behavior_onnx_integration.c
-    src/ave/ave_onnx_infer.c
-    src/ave/edr_onnx_behavior_fl_tensor_export.c
-    src/ave/ave_static_features.c
-    src/config/config.c
-    third_party/tomlc99/toml.c
-  )
-  target_include_directories(test_ave_behavior_onnx_integration PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src/ave
-    ${CMAKE_SOURCE_DIR}/third_party/tomlc99
-  )
-  target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE
-    "EDR_TEST_BEHAVIOR_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx\""
-    "EDR_TEST_BEHAVIOR_SEQ128_FIXTURE=\"${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx\""
-  )
-  target_include_directories(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(test_ave_behavior_onnx_integration PRIVATE ${ONNXRUNTIME_LIB} Threads::Threads)
-  if(UNIX AND NOT WIN32)
-    target_link_libraries(test_ave_behavior_onnx_integration PRIVATE m)
-  endif()
-  if(WIN32)
-    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_OS_WINDOWS=1)
-  else()
-    target_compile_definitions(test_ave_behavior_onnx_integration PRIVATE EDR_OS_POSIX=1)
-  endif()
-
-  if(APPLE)
-    get_filename_component(_edr_ort_libdir_beh "${ONNXRUNTIME_LIB}" DIRECTORY)
-    set_target_properties(test_ave_behavior_onnx_integration PROPERTIES BUILD_RPATH "${_edr_ort_libdir_beh}")
-  endif()
-
-  add_test(NAME ave_behavior_onnx_dual_integration COMMAND test_ave_behavior_onnx_integration
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-  # P1：小 fixture 拷成 model_dir 命名（static.onnx + behavior.onnx），与 Agent 真链一致
-  set(EDR_E2E_MODEL_FIXTURE_DIR "${CMAKE_BINARY_DIR}/test_models_e2e")
-  file(MAKE_DIRECTORY "${EDR_E2E_MODEL_FIXTURE_DIR}")
-  configure_file(
-    "${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx"
-    "${EDR_E2E_MODEL_FIXTURE_DIR}/static.onnx"
-    COPYONLY)
-  configure_file(
-    "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx"
-    "${EDR_E2E_MODEL_FIXTURE_DIR}/behavior.onnx"
-    COPYONLY)
-  add_test(NAME ave_e2e_full_smoke COMMAND test_ave_e2e_full WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-  set_tests_properties(ave_e2e_full_smoke PROPERTIES
-    ENVIRONMENT "EDR_AVE_TEST_MODEL_DIR=${EDR_E2E_MODEL_FIXTURE_DIR}")
-
-  set(EDR_E2E_HOTFIX_FIXTURE_DIR "${CMAKE_BINARY_DIR}/test_models_e2e_hotfix")
-  file(MAKE_DIRECTORY "${EDR_E2E_HOTFIX_FIXTURE_DIR}")
-  configure_file(
-    "${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx"
-    "${EDR_E2E_HOTFIX_FIXTURE_DIR}/static.onnx"
-    COPYONLY)
-  configure_file(
-    "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx"
-    "${EDR_E2E_HOTFIX_FIXTURE_DIR}/behavior.onnx"
-    COPYONLY)
-  add_test(NAME ave_hotfix_smoke COMMAND test_ave_hotfix_smoke WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-  set_property(TEST ave_hotfix_smoke PROPERTY ENVIRONMENT
-    "EDR_AVE_TEST_MODEL_DIR=${EDR_E2E_MODEL_FIXTURE_DIR}"
-    "EDR_AVE_HOTFIX_DIR=${EDR_E2E_HOTFIX_FIXTURE_DIR}")
-  if(UNIX AND NOT WIN32)
-    add_test(NAME ave_hotfix_empty_dir_fail COMMAND test_ave_hotfix_smoke WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-    set_property(TEST ave_hotfix_empty_dir_fail PROPERTY ENVIRONMENT
-      "EDR_AVE_TEST_MODEL_DIR=${EDR_E2E_MODEL_FIXTURE_DIR}"
-      "EDR_AVE_HOTFIX_DIR=${EDR_E2E_HOTFIX_FIXTURE_DIR}"
-      "EDR_AVE_TEST_HOTFIX_EMPTY=1")
-  endif()
-endif()
-
-if(WIN32)
-  target_link_libraries(test_ave_sdk PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  target_link_libraries(test_ave_fl_abi PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  target_link_libraries(test_ave_pipeline PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  target_link_libraries(test_ave_e2e_full PRIVATE advapi32 ws2_32 crypt32 wintrust)
-  target_link_libraries(test_ave_hotfix_smoke PRIVATE advapi32 ws2_32 crypt32 wintrust)
-endif()
-if(UNIX AND NOT WIN32)
-  target_link_libraries(test_ave_sdk PRIVATE m)
-  target_link_libraries(test_ave_fl_abi PRIVATE m)
-  target_link_libraries(test_ave_pipeline PRIVATE m)
-  target_link_libraries(test_ave_e2e_full PRIVATE m)
-  target_link_libraries(test_ave_hotfix_smoke PRIVATE m)
-endif()
-
-if(MSVC)
-  target_compile_options(test_ave_fp PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_infer PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_sdk PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_fl_abi PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_suppression PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_pipeline PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_e2e_full PRIVATE /W4 /WX-)
-  target_compile_options(test_ave_hotfix_smoke PRIVATE /W4 /WX-)
-  target_compile_options(test_config_fp PRIVATE /W4 /WX-)
-  if(EDR_ONNXRUNTIME_AVAILABLE)
-    target_compile_options(test_ave_static_onnx_integration PRIVATE /W4 /WX-)
-    target_compile_options(test_ave_behavior_onnx_integration PRIVATE /W4 /WX-)
-  endif()
-else()
-  target_compile_options(test_ave_fp PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_infer PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_sdk PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_fl_abi PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_suppression PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_pipeline PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_e2e_full PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_ave_hotfix_smoke PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  target_compile_options(test_config_fp PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  if(EDR_ONNXRUNTIME_AVAILABLE)
-    target_compile_options(test_ave_static_onnx_integration PRIVATE -Wall -Wextra -Wno-unused-parameter)
-    target_compile_options(test_ave_behavior_onnx_integration PRIVATE -Wall -Wextra -Wno-unused-parameter)
-  endif()
-endif()
-
-add_test(NAME ave_file_fingerprint COMMAND test_ave_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME ave_infer_dry_run COMMAND test_ave_infer WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME ave_phase1_contract COMMAND test_ave_phase1 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_executable(test_ave_static_features tests/test_ave_static_features.c src/ave/ave_static_features.c)
-target_include_directories(test_ave_static_features PRIVATE ${CMAKE_SOURCE_DIR}/src/ave)
-add_test(NAME ave_static_features_lite512 COMMAND test_ave_static_features WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME ave_sdk_smoke COMMAND test_ave_sdk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME ave_fl_abi_c0 COMMAND test_ave_fl_abi WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-if(SQLite3_FOUND)
-  add_test(NAME fl_ave_samples_bridge COMMAND test_fl_ave_samples_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-endif()
-add_test(NAME ave_suppression_sqlite COMMAND test_ave_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME ave_scan_pipeline COMMAND test_ave_pipeline WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME config_fingerprint COMMAND test_config_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-if(EDR_WITH_FL_TRAINER)
-  add_test(NAME fl_trainer_c1 COMMAND test_fl_trainer_smoke WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-endif()
-add_executable(test_shellcode tests/test_shellcode.c ${EDR_SHELLCODE_SRCS})
-target_include_directories(test_shellcode PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/third_party/windivert
-)
-if(EDR_YARA_AVAILABLE)
-  target_compile_definitions(test_shellcode PRIVATE EDR_HAVE_YARA=1)
-  target_include_directories(test_shellcode PRIVATE ${YARA_INCLUDE_DIR})
-  target_link_libraries(test_shellcode PRIVATE ${YARA_LIB})
-endif()
-if(WIN32)
-  target_link_libraries(test_shellcode PRIVATE advapi32 ws2_32)
-endif()
-if(UNIX AND NOT WIN32)
-  target_link_libraries(test_shellcode PRIVATE m)
-endif()
-if(MSVC)
-  target_compile_options(test_shellcode PRIVATE /W4 /WX-)
-else()
-  target_compile_options(test_shellcode PRIVATE -Wall -Wextra -Wno-unused-parameter)
-endif()
-add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
-set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)

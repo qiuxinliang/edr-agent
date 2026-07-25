@@ -1,5 +1,5 @@
 /**
- * §6.2 EventBatch 本地聚合：长度前缀帧拼接，达阈值刷写；载荷前加 BAT1 头便于与 gRPC 对接。
+ * §6.2 EventBatch 本地聚合：长度前缀帧拼接，达阈值刷写；载荷前加 BAT1 头便于与 HTTP ingest 对接。
  */
 #ifndef EDR_EVENT_BATCH_H
 #define EDR_EVENT_BATCH_H
@@ -17,10 +17,16 @@
 /**
  * 分配批次缓冲并设置上限（§11 upload.batch_max_size_mb / batch_max_events）。
  * max_frames_per_batch 为 0 表示仅按字节上限刷批。
- * flush_timeout_s：有未刷数据时，距最后一次写入超过该秒数则刷批（§6.2）；≤0 关闭。
+ * flush_timeout_s：有未刷数据时，距首帧超过该秒数则刷批（§6.2）；≤0 关闭。
  */
 EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
                               int flush_timeout_s);
+
+/**
+ * 运行时画像热更新：仅调整批量条数与 flush 间隔，不重分配批次缓冲。
+ * 控制流允许部分更新；值为 0 表示该字段未携带并保留当前配置。
+ */
+void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s);
 
 /** 刷批并释放缓冲（进程退出 / 预处理线程停止时调用） */
 void edr_event_batch_shutdown(void);

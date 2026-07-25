@@ -36,7 +36,7 @@
 #define CORR_EV_FIELD 96u            /* 证据关键字段截断长度 */
 #define CORR_MAX_STEPS 6u            /* 序列规则最大步数 */
 #define CORR_EMIT_MIN_INTERVAL_MS 3000u /* 同一 (rule,key) 最小发射间隔（内建去抖） */
-#define CORR_DEFAULT_MAX_EMITS_PER_MIN 120u /* 引擎级全局发射上限（agent 单端点即端点级上限） */
+#define CORR_DEFAULT_MAX_EMITS_PER_MIN 32u /* 引擎级全局发射上限（agent 单端点即端点级上限） */
 
 typedef enum {
   CORR_KIND_THRESHOLD = 1, /* 窗口内某维度计数/去重达阈值 */
@@ -146,10 +146,24 @@ typedef struct {
 static CorrInjectPending s_inject_pending[CORR_INJECT_PENDING_SLOTS];
 static volatile long s_inject_write_seq; /* 单调递增，取模定位槽 */
 
+#define CORR_INJECT_HISTORY_SLOTS 128u
+typedef struct {
+  volatile uint32_t ready;
+  uint64_t sequence;
+  uint32_t pid;
+  int64_t event_time_ns;
+  char process_name[256];
+  char technique[32];
+} CorrInjectHistory;
+static CorrInjectHistory s_inject_history[CORR_INJECT_HISTORY_SLOTS];
+static volatile long s_inject_history_seq;
+
 /* ------------------------------------------------------------ 运行态/指标 */
 
 static volatile long s_inited;
-static int s_enabled_cache = -1;
+static volatile long s_enabled_cache = -1;
+static volatile long s_enabled_override = -1;
+static volatile long s_inject_feedback_override = -1;
 static int s_loaded;
 static char s_bundle_version[128] = "edr-corr-rules-v1-builtin";
 
@@ -180,6 +194,26 @@ static long corr_fetch_inc_long(volatile long *p) {
   long old = *p;
   *p = old + 1;
   return old;
+#endif
+}
+
+static long corr_load_long(volatile long *p) {
+#if defined(_WIN32)
+  return (long)InterlockedCompareExchange(p, 0, 0);
+#elif defined(__GNUC__) || defined(__clang__)
+  return __sync_add_and_fetch(p, 0);
+#else
+  return *p;
+#endif
+}
+
+static void corr_store_long(volatile long *p, long value) {
+#if defined(_WIN32)
+  (void)InterlockedExchange(p, value);
+#elif defined(__GNUC__) || defined(__clang__)
+  (void)__sync_lock_test_and_set(p, value);
+#else
+  *p = value;
 #endif
 }
 
@@ -236,10 +270,29 @@ static int corr_env_bool(const char *name, int fallback) {
 }
 
 int edr_correlation_enabled(void) {
-  if (s_enabled_cache < 0) {
-    s_enabled_cache = corr_env_bool("EDR_CORRELATION_ENABLE", 0);
+  long enabled_override = corr_load_long(&s_enabled_override);
+  if (enabled_override >= 0) {
+    return enabled_override != 0;
   }
-  return s_enabled_cache;
+  long enabled_cache = corr_load_long(&s_enabled_cache);
+  if (enabled_cache < 0) {
+    enabled_cache = corr_env_bool("EDR_CORRELATION_ENABLE", 0);
+    corr_store_long(&s_enabled_cache, enabled_cache);
+  }
+  return enabled_cache != 0;
+}
+
+void edr_correlation_configure(int enabled, int inject_feedback_enabled) {
+  corr_store_long(&s_enabled_override, enabled ? 1 : 0);
+  corr_store_long(&s_inject_feedback_override, inject_feedback_enabled ? 1 : 0);
+}
+
+int edr_correlation_inject_feedback_enabled(void) {
+  long feedback_override = corr_load_long(&s_inject_feedback_override);
+  if (feedback_override >= 0) {
+    return feedback_override != 0;
+  }
+  return corr_env_bool("EDR_CORRELATION_INJECT_FEEDBACK", 1);
 }
 
 /* ------------------------------------------------------------ 规则加载 */
@@ -645,7 +698,7 @@ void edr_correlation_lazy_init(void) {
 }
 
 void edr_correlation_reload(void) {
-  s_enabled_cache = -1;
+  corr_store_long(&s_enabled_cache, -1);
 #if defined(_WIN32)
   InterlockedExchange(&s_inited, 1);
 #elif defined(__GNUC__) || defined(__clang__)
@@ -733,6 +786,25 @@ static void corr_evidence_push(CorrStateSlot *s, uint32_t type, uint32_t pid,
   }
 }
 
+static void corr_slot_reset_window(CorrStateSlot *s, int64_t now_ns) {
+  uint64_t key_hash;
+  uint16_t rule_idx;
+  int64_t last_emit_ms;
+  if (!s) {
+    return;
+  }
+  key_hash = s->key_hash;
+  rule_idx = s->rule_idx;
+  last_emit_ms = s->last_emit_ms;
+  memset(s, 0, sizeof(*s));
+  s->used = 1;
+  s->key_hash = key_hash;
+  s->rule_idx = rule_idx;
+  s->first_seen_ns = now_ns;
+  s->last_seen_ns = now_ns;
+  s->last_emit_ms = last_emit_ms;
+}
+
 /* ------------------------------------------------------------ 发射通道 */
 
 /* 内建去抖：同一 (rule,key) 槽在 CORR_EMIT_MIN_INTERVAL_MS 内只发一次。 */
@@ -785,23 +857,119 @@ static int corr_global_emit_allow(int64_t now_ms) {
   return 1;
 }
 
+static void corr_json_escape(const char *in, char *out, size_t cap, size_t max_chars) {
+  size_t o = 0;
+  size_t used_chars = 0;
+  if (!out || cap == 0) {
+    return;
+  }
+  out[0] = '\0';
+  if (!in) {
+    return;
+  }
+  for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+    unsigned char c = *p;
+    if (max_chars > 0 && used_chars >= max_chars) {
+      break;
+    }
+    used_chars++;
+    if (c == '"' || c == '\\') {
+      if (o + 2 >= cap) break;
+      out[o++] = '\\';
+      out[o++] = (char)c;
+      continue;
+    }
+    switch (c) {
+    case '\b':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'b';
+      break;
+    case '\f':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'f';
+      break;
+    case '\n':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'n';
+      break;
+    case '\r':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 'r';
+      break;
+    case '\t':
+      if (o + 2 >= cap) goto done;
+      out[o++] = '\\';
+      out[o++] = 't';
+      break;
+    default:
+      if (c < 0x20u) {
+        if (o + 6 >= cap) goto done;
+        snprintf(out + o, cap - o, "\\u%04x", (unsigned)c);
+        o += 6;
+      } else {
+        if (o + 1 >= cap) goto done;
+        out[o++] = (char)c;
+      }
+      break;
+    }
+  }
+done:
+  out[o < cap ? o : cap - 1] = '\0';
+}
+
 /* 构造证据链 JSON 到 user_subject_json（≤4KiB）。 */
 static void corr_build_subject_json(const CorrRule *rule, const CorrStateSlot *s,
                                     char *out, size_t cap) {
-  int n = snprintf(out, cap,
-                   "{\"subject_type\":\"edr_correlation\",\"rule_id\":\"%s\","
-                   "\"rules_bundle_version\":\"%s\",\"display_title\":\"%s\","
-                   "\"window_ms\":%lld,\"count\":%u,\"evidence_chain\":[",
-                   rule->id, s_bundle_version, rule->title,
-                   (long long)rule->window_ms, s->count);
+  char rule_id[96];
+  char bundle[192];
+  char title[384];
+  uint32_t count;
+  uint32_t distinct;
+  int n;
+  if (!out || cap == 0 || !rule || !s) {
+    return;
+  }
+  corr_json_escape(rule->id, rule_id, sizeof(rule_id), 0);
+  corr_json_escape(s_bundle_version, bundle, sizeof(bundle), 0);
+  corr_json_escape(rule->title, title, sizeof(title), 0);
+  distinct = s->n_distinct;
+  count = distinct > 0 ? distinct : s->count;
+  n = snprintf(out, cap,
+               "{\"subject_type\":\"edr_correlation\",\"rule_id\":\"%s\","
+               "\"rules_bundle_version\":\"%s\",\"display_title\":\"%s\","
+               "\"window_ms\":%lld,\"count\":%u,\"distinct\":%u,\"evidence_chain\":[",
+               rule_id, bundle, title, (long long)rule->window_ms, count, distinct);
   for (uint8_t i = 0; i < s->ev_count && n > 0 && (size_t)n < cap; i++) {
+    char detail[256];
+    corr_json_escape(s->ev[i].key_field, detail, sizeof(detail), 80);
     n += snprintf(out + n, cap - (size_t)n,
-                  "%s{\"type\":%u,\"pid\":%u,\"detail\":\"%.80s\"}",
-                  i ? "," : "", s->ev[i].type, s->ev[i].pid, s->ev[i].key_field);
+                  "%s{\"type\":%u,\"pid\":%u,\"detail\":\"%s\"}",
+                  i ? "," : "", s->ev[i].type, s->ev[i].pid, detail);
   }
   if (n > 0 && (size_t)n < cap) {
     snprintf(out + n, cap - (size_t)n, "]}");
   }
+}
+
+static float corr_alert_score(const CorrRule *rule, const CorrStateSlot *s) {
+  if (!rule) {
+    return 0.7f;
+  }
+  if (strcmp(rule->id, "R-CORR-RANSOM-001") == 0) {
+    uint32_t threshold = rule->th_threshold ? rule->th_threshold : 40u;
+    if (s && s->n_distinct >= threshold * 3u) {
+      return 0.90f;
+    }
+    if (s && s->n_distinct >= threshold * 2u) {
+      return 0.84f;
+    }
+    return 0.76f;
+  }
+  return rule->severity >= 4 ? 0.9f : (rule->severity == 3 ? 0.8f : 0.7f);
 }
 
 static void corr_emit(const CorrRule *rule, CorrStateSlot *s, uint32_t pid,
@@ -823,7 +991,7 @@ static void corr_emit(const CorrRule *rule, CorrStateSlot *s, uint32_t pid,
   if (process_name && process_name[0]) {
     snprintf(a.process_name, sizeof(a.process_name), "%s", process_name);
   }
-  a.anomaly_score = rule->severity >= 4 ? 0.9f : (rule->severity == 3 ? 0.8f : 0.7f);
+  a.anomaly_score = corr_alert_score(rule, s);
   a.needs_l2_review = false;
   a.skip_ai_analysis = false;
   a.timestamp_ns = s->last_seen_ns;
@@ -874,6 +1042,7 @@ static uint32_t corr_dimension_fp(const CorrRule *rule, const EdrSensorInterestE
 
 static int corr_proc_is_bulk_file_safe(const char *process_name); /* 定义见下 */
 static int corr_dns_is_tunnel_like(const char *qname);             /* 定义见下 */
+static int corr_ransom_interest_ok(const EdrSensorInterestEvent *ev); /* 定义见下 */
 
 void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
   int64_t now_ns;
@@ -902,6 +1071,9 @@ void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
     if (rule->th_skip_safe_proc && corr_proc_is_bulk_file_safe(ev->process_name)) {
       continue;
     }
+    if (strcmp(rule->id, "R-CORR-RANSOM-001") == 0 && !corr_ransom_interest_ok(ev)) {
+      continue;
+    }
     /* DNS 隧道：仅统计具备隧道特征（长标签/超长）的查询，正常域名不计入。 */
     if (rule->th_dns_long_label && !corr_dns_is_tunnel_like(ev->path)) {
       continue;
@@ -926,6 +1098,7 @@ void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
     }
     if (hit >= rule->th_threshold) {
       corr_emit(rule, slot, ev->pid, ev->process_name);
+      corr_slot_reset_window(slot, now_ns);
     }
   }
 }
@@ -1044,6 +1217,85 @@ static int corr_path_contains_ci(const char *hay, const char *needle) {
   return 0;
 }
 
+static int corr_path_ends_ci(const char *s, const char *suffix) {
+  size_t sl, nl;
+  if (!s || !suffix || !suffix[0]) {
+    return 0;
+  }
+  sl = strlen(s);
+  nl = strlen(suffix);
+  if (nl > sl) {
+    return 0;
+  }
+  return corr_path_contains_ci(s + sl - nl, suffix);
+}
+
+static int corr_path_has_path_shape(const char *path) {
+  if (!path || !path[0]) {
+    return 0;
+  }
+  for (const char *p = path; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x20u) {
+      return 0;
+    }
+    if (*p == '\\' || *p == '/' || *p == ':') {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int corr_path_is_low_value_file_write(const char *path) {
+  static const char *const low_dirs[] = {
+      "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\microsoft\\edge\\user data\\",
+      "\\appdata\\local\\google\\chrome\\user data\\", "\\appdata\\local\\packages\\",
+      "\\appdata\\local\\microsoft\\windows\\inetcache\\", "\\windows\\softwaredistribution\\",
+      "\\windows\\system32\\winevt\\logs\\", "\\programdata\\microsoft\\windows defender\\",
+      "\\programdata\\fdsecurity\\setup-ui\\", "\\programdata\\fdsecurity\\collector\\",
+      "\\onedrive\\logs\\", "\\cache\\",
+  };
+  static const char *const low_exts[] = {
+      ".tmp", ".temp", ".log", ".etl", ".evtx", ".cache", ".lock",
+  };
+  if (!path || !path[0]) {
+    return 1;
+  }
+  for (size_t i = 0; i < sizeof(low_dirs) / sizeof(low_dirs[0]); i++) {
+    if (corr_path_contains_ci(path, low_dirs[i])) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < sizeof(low_exts) / sizeof(low_exts[0]); i++) {
+    if (corr_path_ends_ci(path, low_exts[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int corr_ransom_interest_ok(const EdrSensorInterestEvent *ev) {
+  if (!ev || ev->type != EDR_EVENT_FILE_WRITE) {
+    return 0;
+  }
+  if (ev->pid == 0u || ev->pid == 4u) {
+    return 0;
+  }
+  if (!ev->process_name[0] || strncmp(ev->process_name, "pid:", 4) == 0) {
+    return 0;
+  }
+  if (corr_proc_is_bulk_file_safe(ev->process_name)) {
+    return 0;
+  }
+  if (!corr_path_has_path_shape(ev->path)) {
+    return 0;
+  }
+  if (corr_path_is_low_value_file_write(ev->path)) {
+    return 0;
+  }
+  return 1;
+}
+
 /* 路径是否为凭证类存储（用于 CORR_STEP_REQUIRE_CRED_PATH）。
  * 覆盖 SAM/SYSTEM/SECURITY Hive、lsass dump、ntds.dit、浏览器凭据库、云/SSH 凭据、
  * DPAPI/Vault 等；未命中则不计入，避免“任意文件读”误报。 */
@@ -1084,12 +1336,53 @@ static const char *corr_basename(const char *s) {
   return last;
 }
 
+static int corr_token_list_exact_ci(const char *list, const char *value) {
+  if (!list || !list[0] || !value || !value[0]) {
+    return 0;
+  }
+  const char *p = list;
+  while (*p) {
+    while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+      p++;
+    }
+    char tok[256];
+    size_t n = 0u;
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r' && n + 1u < sizeof(tok)) {
+      tok[n++] = *p++;
+    }
+    while (*p && *p != ',' && *p != ';' && *p != '\n' && *p != '\r') {
+      p++;
+    }
+    while (n > 0u && (tok[n - 1u] == ' ' || tok[n - 1u] == '\t')) {
+      n--;
+    }
+    tok[n] = '\0';
+    if (tok[0] && strlen(tok) == strlen(value)) {
+      int same = 1;
+      for (size_t i = 0; tok[i]; i++) {
+        char a = tok[i];
+        char b = value[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) {
+          same = 0;
+          break;
+        }
+      }
+      if (same) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* 进程是否属于“会合法地批量改写大量文件”的白名单（备份/索引/压缩/编译/同步）。
  * 用于 RANSOM 阈值规则的降误报；EDR_CORR_RANSOM_ALLOW 逗号分隔可追加。 */
 static int corr_proc_is_bulk_file_safe(const char *process_name) {
   static const char *const safe[] = {
       "wbadmin.exe", "vssadmin.exe", "diskshadow.exe", "robocopy.exe", "xcopy.exe",
-      "backup.exe", "veeam.agent.exe", "acronis", "msmpeng.exe", "searchindexer.exe",
+      "backup.exe", "veeam.agent.exe", "acronis.exe", "msmpeng.exe", "searchindexer.exe",
       "searchprotocolhost.exe", "searchfilterhost.exe", "7z.exe", "7za.exe", "winrar.exe",
       "rar.exe", "zip.exe", "tar.exe", "compress.exe", "onedrive.exe", "dropbox.exe",
       "googledrivefs.exe", "msbuild.exe", "cl.exe", "link.exe", "gcc.exe", "clang.exe",
@@ -1103,13 +1396,12 @@ static int corr_proc_is_bulk_file_safe(const char *process_name) {
   }
   base = corr_basename(process_name);
   for (size_t i = 0; i < sizeof(safe) / sizeof(safe[0]); i++) {
-    /* 包含匹配：兼容 "acronis" 等前缀家族与带路径的进程名。 */
-    if (corr_path_contains_ci(base, safe[i])) {
+    if (corr_token_list_exact_ci(safe[i], base)) {
       return 1;
     }
   }
   env = getenv("EDR_CORR_RANSOM_ALLOW");
-  if (env && env[0] && corr_path_contains_ci(env, base)) {
+  if (env && env[0] && corr_token_list_exact_ci(env, base)) {
     return 1;
   }
   return 0;
@@ -1339,6 +1631,56 @@ static void corr_note_ave_signal(CorrSignalKind kind, uint32_t pid, const char *
 void edr_correlation_note_injection(uint32_t pid, const char *process_name, int64_t event_time_ns,
                                     const char *technique) {
   corr_note_ave_signal(CORR_SIG_INJECT, pid, process_name, event_time_ns, technique);
+  if (pid != 0u) {
+    long sequence = corr_fetch_inc_long(&s_inject_history_seq);
+    CorrInjectHistory *slot = &s_inject_history[(uint32_t)sequence % CORR_INJECT_HISTORY_SLOTS];
+    slot->ready = 0u;
+    slot->sequence = (uint64_t)(unsigned long)sequence;
+    slot->pid = pid;
+    slot->event_time_ns = event_time_ns;
+    snprintf(slot->process_name, sizeof(slot->process_name), "%s",
+             process_name ? process_name : "");
+    snprintf(slot->technique, sizeof(slot->technique), "%s",
+             technique ? technique : "");
+#if defined(_WIN32)
+    MemoryBarrier();
+#elif defined(__GNUC__) || defined(__clang__)
+    __sync_synchronize();
+#endif
+    slot->ready = 1u;
+  }
+}
+
+int edr_correlation_latest_injection(uint32_t pid,
+                                     EdrCorrelationInjectionObservation *out) {
+  if (!out || pid == 0u) return 0;
+  memset(out, 0, sizeof(*out));
+  uint64_t best_sequence = 0u;
+  int found = 0;
+  for (uint32_t i = 0; i < CORR_INJECT_HISTORY_SLOTS; i++) {
+    CorrInjectHistory *slot = &s_inject_history[i];
+    if (slot->ready == 0u || slot->pid != pid) continue;
+    uint64_t sequence = slot->sequence;
+    EdrCorrelationInjectionObservation candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.pid = slot->pid;
+    candidate.event_time_ns = slot->event_time_ns;
+    snprintf(candidate.process_name, sizeof(candidate.process_name), "%s", slot->process_name);
+    snprintf(candidate.technique, sizeof(candidate.technique), "%s", slot->technique);
+    snprintf(candidate.source, sizeof(candidate.source), "%s", "ave_behavior");
+#if defined(_WIN32)
+    MemoryBarrier();
+#elif defined(__GNUC__) || defined(__clang__)
+    __sync_synchronize();
+#endif
+    if (slot->ready == 0u || slot->sequence != sequence || slot->pid != pid) continue;
+    if (!found || sequence >= best_sequence) {
+      *out = candidate;
+      best_sequence = sequence;
+      found = 1;
+    }
+  }
+  return found;
 }
 
 void edr_correlation_note_cred_access(uint32_t pid, const char *process_name, int64_t event_time_ns,

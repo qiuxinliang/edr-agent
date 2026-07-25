@@ -3,13 +3,12 @@
 
 [server]
 address              = ""
-grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
 client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
-# P2 hardware/non-exportable key metadata. Runtime gRPC currently consumes PEM
-# client_key; cng/tpm/pkcs11 entries are written by installers for Schannel or
-# hardware-key transport adapters.
+# P2 hardware/non-exportable key metadata. HTTP/TLS transport currently uses PEM
+# client_key; cng/tpm/pkcs11 entries are written by installers for future Schannel
+# or hardware-key transport adapters.
 client_key_provider  = "pem" # pem | cng | tpm | pkcs11
 client_cert_store    = ""
 client_cert_thumbprint = ""
@@ -25,11 +24,15 @@ tenant_id            = "tenant_default"
 
 [platform]
 rest_base_url        = "https://edr.example.com/api/v1"
+rest_bearer_token    = "" # installer-populated Agent bearer; do not use a platform admin JWT
 proxy_mode           = "auto"
 proxy_url            = ""
 relay_url            = ""
 http2_enabled        = false
 http2_require        = false
+control_http2_enabled = false
+control_http2_require = false
+control_http1_fallback = true
 control_stream_enabled = true
 long_poll_fallback   = true
 report_events_v2_enabled = true
@@ -72,11 +75,20 @@ behavior_monitor_enabled = false
 
 [forensic_auto]
 enabled              = false
+pmfe_followup_enabled = true
+pmfe_heuristic_threshold = 0.90
 cooldown_s           = 30
 per_pid_cooldown_s   = 300
 max_per_hour         = 20
 trigger_on_p0        = true
 collect_process_tree = true
+
+[health_monitor]
+enabled              = true
+profile              = "basic"
+interval_s           = 60
+expires_at_unix_ms   = 0
+request_id           = "bootstrap-runtime"
 
 # 外置取证采集器(深度取证)——经环境变量配置,由 windows_service_install.ps1 在安装时写入机器级 env。
 # agent 走 getenv 读取,此处仅为部署说明(改这些值请改服务 env,不是改本 toml):
@@ -117,6 +129,7 @@ max_log_files        = 5
 allow_dangerous      = false
 allow_rtq_readonly   = true
 signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
+forensic_yara_rules_dir = "C:\\Program Files\\FDSecurity\\rules\\forensic"
 
 [self_protect]
 anti_debug           = true
@@ -129,7 +142,15 @@ enabled              = false
 tick_interval_s      = 300
 
 [shellcode_detector]
+# WinDivert x64 runtime is bundled beside FDSensor.exe; enabling it requires an elevated Agent process on first use.
 enabled              = false
+flow_scan_first_bytes = 65536
+reassembly_max_flows = 512
+reassembly_memory_limit_kb = 16384
+reassembly_idle_timeout_s = 30
+# 单捕获线程将重组后的流投递到有界异步检测队列。
+detector_threads = 2
+scan_queue_capacity = 256
 
 [webshell_detector]
 enabled              = false

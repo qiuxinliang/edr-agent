@@ -9,11 +9,8 @@
 # ETW/采集 profile 与 P0 字段矩阵底线（WP-8）：见 docs/WP8_ETW_COLLECTION_PROFILE.md、config/profiles/wp8_compliance_baseline.env.example
 
 [server]
-# Legacy EventIngest gRPC 兼容地址。默认留空；只有旧平台迁移期才填写 host:port 并设置 grpc_enabled=true。
+# 保留为证书和历史 server_addr 兼容字段；当前通信主路径使用 [platform].rest_base_url。
 address              = ""
-grpc_enabled         = false
-# Plaintext legacy gRPC; 仅旧链路联调使用，生产保持 false。
-grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
 client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
@@ -34,9 +31,12 @@ tenant_id            = "tenant_default"
 # [platform]
 # rest_base_url      = "https://edr.example.com/api/v1"
 # rest_user_id       = "edr-agent"
-# rest_bearer_token  = ""
+# rest_bearer_token  = "" # 安装器会从 enroll 响应写入 Agent 专用 bearer；不要填平台管理员 JWT
 # http2_enabled      = false # 商业默认 HTTPS/1.1；HTTP/2 仅在灰度策略中开启
 # http2_require      = false # 保持 false；仅特定网络验证达标后才考虑强制 h2
+# control_http2_enabled = false # 控制面独立开关；未配置时兼容继承 http2_enabled
+# control_http2_require = false
+# control_http1_fallback = true
 # control_stream_enabled = true
 # long_poll_fallback = true
 # report_events_v2_enabled = true # protobuf envelope；失败默认不回退旧 JSON/base64，避免网络异常时双发
@@ -52,6 +52,10 @@ tenant_id            = "tenant_default"
 # proxy_mode         = "auto" # auto | off | explicit
 # proxy_url          = ""     # http://proxy.corp:8080
 # relay_url          = ""     # https://relay.corp:443/api/v1
+# [platform.request_signing]
+# enabled = false              # enroll 返回 request_signing_enabled 后置 true；旧平台/旧 Agent 保持 false
+# key_id = ""                  # enroll 响应 request_signing_key_id
+# secret = ""                  # enroll 响应 request_signing_secret；生产安装器应限制本文件 ACL
 
 # §19.8 攻击面 TOML（与《EDR_端点详细设计》§19.8 对齐；**成功 POST 最小间隔** = min(port,service,policy,full)；ETW/按需刷新/周期共享；enabled 默认 false）。
 # 快照 JSON 的 collectedAt 为 **UTC**（...Z），与「本地时区显示」需自行换算。
@@ -129,7 +133,7 @@ sampling_rate_whitelist = 0.02
 #                                          # 非门控进程名保留千分比（默认30=3%）；告警判定仍走完整规则
 #   EDR_PREPROCESS_STRICT_BEHAVIOR_GATE=1    # 严格前置门控：仅 PROCESS_CREATE/PROCESS_INJECT 进入后续处理（用于压测验证）
 # 内置默认动态规则版本（与平台 `dynamic_rules_v1.json` 对齐）
-rules_version = "edr-dynamic-rules-v1-r252-086c1be1"
+rules_version = "edr-dynamic-rules-v1-r276-89b04a96"
 # 若本文件未显式配置 [[preprocessing.rules]]，Agent 会尝试从与 agent.toml 同目录的
 # agent_preprocess_rules_v1.toml 自动加载第一版动态前置规则（可用 EDR_PREPROCESS_RULES_BUNDLE_PATH 覆盖路径）。
 
@@ -277,8 +281,13 @@ max_log_files        = 10
 # static   = ["head_b", "head_c"]
 # behavior = ["head_b"]
 
-# §17 协议层 Shellcode 检测（Windows；需管理员 + WinDivert 驱动）。默认关闭。
-# 部署约定：WinDivert.dll 位于 %SystemRoot%\System32（驱动一般在 System32\drivers）；详见 README §17。
+# §16 取证 YARA 扫描规则库。yara_scan 规则来源优先级：命令内联 rules > forensic_yara_rules_dir > EDR_YARA_RULES_DIR > rules/forensic。
+# Windows 安装包默认随包放置到 C:\\Program Files\\FDSecurity\\rules\\forensic；开发态可使用相对路径 rules/forensic。
+[command]
+forensic_yara_rules_dir = "rules/forensic"
+
+# §17 协议层 Shellcode 检测（Windows x64；需管理员）。默认关闭。
+# 官方签名 WinDivert.dll/WinDivert64.sys 随安装包置于 Agent 目录，首次启用时由 WinDivert 按需安装驱动；旧版 System32 部署仅作兼容回退。
 [shellcode_detector]
 enabled                  = false
 windivert_priority       = -1000
@@ -287,8 +296,14 @@ alert_threshold          = 0.70
 auto_isolate_threshold   = 0.95
 auto_isolate_execute     = false
 heuristic_score_scale    = 1.0
+pmfe_followup_enabled    = true
+pmfe_heuristic_threshold = 0.90
 # P0 优化 #2：每条连接只深扫前 N 字节载荷（漏洞利用特征在会话起始）；超过则跳过深扫。0=不限（旧行为）。
 flow_scan_first_bytes    = 65536
+# 方向感知TCP重组：总内存达到上限时淘汰最久未活动的流。
+reassembly_max_flows     = 512
+reassembly_memory_limit_kb = 16384
+reassembly_idle_timeout_s = 30
 # P0 优化 #3：是否深扫 TLS 应用数据（密文）。默认 false：仅取 ClientHello(JA3/SNI)，跳过密文记录，省 CPU 且免误报。
 scan_tls_appdata         = false
 # 排除 Agent 自身到平台/中继/代理的流量(默认 true)。启动解析 [platform] rest_base_url/relay_url/proxy_url 的 IP，
@@ -301,8 +316,9 @@ monitor_rdp              = true
 monitor_winrm            = true
 monitor_msrpc            = true
 monitor_ldap             = true
-# P2 #7：捕获消费线程数(1..4)。>1 时多线程并发 recv 同一句柄、共享状态加锁；>1 时禁用 YARA 热重载(启动加载一次)。
+# 异步检测 worker 数(1..4)。捕获固定使用单线程；worker 消费有界队列，YARA 匹配与热重载由锁保护。
 detector_threads         = 2
+scan_queue_capacity      = 256
 # P2 #8：WinDivert 内核队列参数(0=用内置默认)。瘦终端可调小以约束非分页内存。
 # 范围:length 32..16384、size 64..32768 KiB、time 100..16000 ms。
 windivert_queue_length   = 8192
@@ -400,14 +416,14 @@ trigger_on_mitre = ["T1059", "T1547", "T1543", "T1003"]
 
 # =========================
 # [health_monitor] Agent 健康监测
-# 默认关闭；通常由终端管理详情页按主机临时开启，并带 TTL 自动停止。
+# 默认开启基础健康上报；终端管理详情页可按主机调整 profile/TTL。
 # =========================
 [health_monitor]
-enabled = false
+enabled = true
 profile = "basic"
 interval_s = 60
 expires_at_unix_ms = 0
-request_id = ""
+request_id = "agent-bootstrap"
 
 # =========================
 # [shell] 远程 Shell 会话配置

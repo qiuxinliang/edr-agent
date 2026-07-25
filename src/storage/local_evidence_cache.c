@@ -1427,6 +1427,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "CREATE TABLE IF NOT EXISTS file_evidence ("
       "endpoint_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT,pid INTEGER,last_seen_ns INTEGER,"
       "PRIMARY KEY(endpoint_id,path));"
+      "CREATE INDEX IF NOT EXISTS idx_file_evidence_sha ON file_evidence(sha256 COLLATE NOCASE);"
       "CREATE TABLE IF NOT EXISTS network_ioc ("
       "endpoint_id TEXT NOT NULL,remote_ip TEXT NOT NULL,remote_url TEXT NOT NULL,dst_port INTEGER NOT NULL,"
       "pid INTEGER NOT NULL,last_seen_ns INTEGER,"
@@ -2045,6 +2046,8 @@ typedef struct {
   char process_name_contains[128];
   char cmdline_contains[256];
   char file_path_contains[256];
+  char file_sha256[65];
+  char file_ext[32];
   char remote_ip[64];
   char registry_key_contains[256];
 } RtqFilter;
@@ -2068,6 +2071,37 @@ static int contains_ci(const char *haystack, const char *needle) {
     }
   }
   return 0;
+}
+
+static int same_ci(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return 0;
+    }
+    a++;
+    b++;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int path_ext_matches(const char *path, const char *ext) {
+  if (!ext || !ext[0]) {
+    return 1;
+  }
+  if (!path || !path[0]) {
+    return 0;
+  }
+  const char *dot = strrchr(path, '.');
+  if (!dot || !dot[0]) {
+    return 0;
+  }
+  if (ext[0] == '.') {
+    return same_ci(dot, ext);
+  }
+  return same_ci(dot + 1, ext);
 }
 
 static int json_get_string(const char *json, const char *key, char *out, size_t cap) {
@@ -2197,6 +2231,14 @@ static void parse_rtq_filter(const char *json, RtqFilter *f) {
   (void)json_get_string(json, "cmdline_contains", f->cmdline_contains, sizeof(f->cmdline_contains));
   (void)json_get_string(json, "file_path_contains", f->file_path_contains,
                         sizeof(f->file_path_contains));
+  if (f->file_path_contains[0] == '\0') {
+    (void)json_get_string(json, "file_path", f->file_path_contains,
+                          sizeof(f->file_path_contains));
+  }
+  if (json_get_string(json, "file_sha256", f->file_sha256, sizeof(f->file_sha256)) != 0) {
+    (void)json_get_string(json, "sha256", f->file_sha256, sizeof(f->file_sha256));
+  }
+  (void)json_get_string(json, "file_ext", f->file_ext, sizeof(f->file_ext));
   (void)json_get_string(json, "remote_ip", f->remote_ip, sizeof(f->remote_ip));
   (void)json_get_string(json, "registry_key_contains", f->registry_key_contains,
                         sizeof(f->registry_key_contains));
@@ -2309,6 +2351,124 @@ static void append_event_json(char *out, size_t cap, size_t *off, int *first,
   *first = 0;
 }
 
+int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
+                                                  const char *file_path_contains,
+                                                  const char *file_ext,
+                                                  uint32_t limit,
+                                                  char *out, size_t cap,
+                                                  uint32_t *returned,
+                                                  uint32_t *scanned,
+                                                  int *truncated) {
+  if (!out || cap == 0u) {
+    return -1;
+  }
+  out[0] = '\0';
+  uint32_t ret = 0;
+  uint32_t scan = 0;
+  int partial = 0;
+  uint32_t lim = limit;
+  if (lim == 0u || lim > 500u) {
+    lim = 50u;
+  }
+
+  size_t off = 0;
+  int first = 1;
+  appendf(out, cap, &off, "[");
+  if (file_sha256 && file_sha256[0]) {
+#if defined(EDR_HAVE_SQLITE)
+    if (s_db) {
+      const char *sql =
+          "SELECT endpoint_id,path,sha256,pid,last_seen_ns "
+          "FROM file_evidence WHERE sha256 = ? COLLATE NOCASE "
+          "ORDER BY last_seen_ns DESC LIMIT ?;";
+      sqlite3_stmt *st = NULL;
+      if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
+        bind_text(st, 1, file_sha256);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)(lim * 20u + 100u));
+        while (sqlite3_step(st) == SQLITE_ROW && ret < lim) {
+          const char *ep = (const char *)sqlite3_column_text(st, 0);
+          const char *path = (const char *)sqlite3_column_text(st, 1);
+          const char *sha = (const char *)sqlite3_column_text(st, 2);
+          uint32_t pid = (uint32_t)sqlite3_column_int64(st, 3);
+          int64_t last_seen = sqlite3_column_int64(st, 4);
+          scan++;
+          if (!contains_ci(path, file_path_contains)) {
+            continue;
+          }
+          if (!path_ext_matches(path, file_ext)) {
+            continue;
+          }
+          char epj[120], pathj[1200], shaj[160];
+          json_escape(epj, sizeof(epj), ep);
+          json_escape(pathj, sizeof(pathj), path);
+          json_escape(shaj, sizeof(shaj), sha);
+          size_t row_start = off;
+          appendf(out, cap, &off,
+                  "%s{\"type\":\"file\",\"source\":\"file_evidence\",\"cache_hit\":true,"
+                  "\"endpoint_id\":%s,\"path\":%s,\"sha256\":%s,\"pid\":%u,"
+                  "\"last_seen_ns\":%lld}",
+                  first ? "" : ",", epj, pathj, shaj, pid, (long long)last_seen);
+          if (off >= cap - 1u) {
+            off = row_start;
+            out[off] = '\0';
+            partial = 1;
+            break;
+          }
+          first = 0;
+          ret++;
+        }
+        sqlite3_finalize(st);
+      }
+    }
+#endif
+  }
+  appendf(out, cap, &off, "]");
+  out[cap - 1u] = '\0';
+  if (returned) {
+    *returned = ret;
+  }
+  if (scanned) {
+    *scanned = scan;
+  }
+  if (truncated) {
+    *truncated = partial;
+  }
+  return 0;
+}
+
+static void append_json_array_items(char *out, size_t cap, size_t *off, int *first,
+                                    const char *array_json) {
+  if (!out || !off || !first || !array_json) {
+    return;
+  }
+  const char *b = strchr(array_json, '[');
+  const char *e = strrchr(array_json, ']');
+  if (!b || !e || e <= b + 1) {
+    return;
+  }
+  b++;
+  while (b < e && isspace((unsigned char)*b)) {
+    b++;
+  }
+  while (e > b && isspace((unsigned char)e[-1])) {
+    e--;
+  }
+  if (e <= b) {
+    return;
+  }
+  if (!*first) {
+    appendf(out, cap, off, ",");
+  }
+  size_t n = (size_t)(e - b);
+  if (n > 0u) {
+    if (n > (size_t)2147483647) {
+      n = (size_t)2147483647;
+    }
+    appendf(out, cap, off, "%.*s", (int)n, b);
+    *first = 0;
+  }
+}
+
 int edr_local_evidence_cache_query_json(const char *payload_json, char *out, size_t cap) {
   if (!out || cap == 0u) {
     return -1;
@@ -2320,24 +2480,51 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
   uint32_t returned = 0;
   uint32_t scanned = 0;
   appendf(out, cap, &off, "{\"source\":\"mixed\",\"partial\":false,\"rows\":[");
-  uint32_t ring_pos = s_ring_pos;
-  for (uint32_t i = 0; i < EDR_EVIDENCE_RING_SLOTS && returned < f.limit; i++) {
-    const RingSlot *r = &s_ring[(ring_pos + EDR_EVIDENCE_RING_SLOTS - 1u - i) % EDR_EVIDENCE_RING_SLOTS];
-    if (!r->used) {
-      continue;
+  int hash_query = f.file_sha256[0] != '\0';
+  if (!hash_query) {
+    uint32_t ring_pos = s_ring_pos;
+    for (uint32_t i = 0; i < EDR_EVIDENCE_RING_SLOTS && returned < f.limit; i++) {
+      const RingSlot *r = &s_ring[(ring_pos + EDR_EVIDENCE_RING_SLOTS - 1u - i) % EDR_EVIDENCE_RING_SLOTS];
+      if (!r->used) {
+        continue;
+      }
+      scanned++;
+      if (!rtq_match_common(&f, r->type, r->pid, r->event_time_ns, r->endpoint_id,
+                            r->process_name, "", r->file_path, r->net_dst, "")) {
+        continue;
+      }
+      append_event_json(out, cap, &off, &first, "ring", r->event_time_ns, r->type, r->pid,
+                        r->ppid, r->endpoint_id, r->process_name, "", "", r->file_path,
+                        "", r->net_dst, r->net_dport, "", "", "");
+      returned++;
     }
-    scanned++;
-    if (!rtq_match_common(&f, r->type, r->pid, r->event_time_ns, r->endpoint_id,
-                          r->process_name, "", r->file_path, r->net_dst, "")) {
-      continue;
-    }
-    append_event_json(out, cap, &off, &first, "ring", r->event_time_ns, r->type, r->pid,
-                      r->ppid, r->endpoint_id, r->process_name, "", "", r->file_path,
-                      "", r->net_dst, r->net_dport, "", "", "");
-    returned++;
   }
 #if defined(EDR_HAVE_SQLITE)
-  if (s_db && returned < f.limit) {
+  if (s_db && hash_query && returned < f.limit) {
+    size_t rows_cap = cap > 4096u ? cap - 1024u : 4096u;
+    char *rows = (char *)malloc(rows_cap);
+    uint32_t cache_returned = 0;
+    uint32_t cache_scanned = 0;
+    int cache_truncated = 0;
+    if (rows &&
+        edr_local_evidence_cache_query_file_hash_json(f.file_sha256, f.file_path_contains,
+                                                      f.file_ext, f.limit - returned,
+                                                      rows, rows_cap,
+                                                      &cache_returned, &cache_scanned,
+                                                      &cache_truncated) == 0) {
+      append_json_array_items(out, cap, &off, &first, rows);
+      returned += cache_returned;
+      scanned += cache_scanned;
+      if (cache_truncated) {
+        char *partial_flag = strstr(out, "\"partial\":false");
+        if (partial_flag) {
+          memcpy(partial_flag + 10, "true ", 5u);
+        }
+      }
+    }
+    free(rows);
+  }
+  if (s_db && !hash_query && returned < f.limit) {
     const char *sql =
         "SELECT event_time_ns,type,pid,ppid,endpoint_id,process_name,exe_path,cmdline,"
         "file_path,dns_query,net_dst,net_dport,reg_key_path,reg_value_name,reg_op "

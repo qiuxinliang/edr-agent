@@ -15,6 +15,15 @@ static int fail(const char *msg) {
 
 int main(void) {
   {
+    EdrShellcodeRulesStatus st;
+    memset(&st, 0, sizeof(st));
+    edr_shellcode_known_init(NULL);
+    edr_shellcode_known_get_status(&st);
+    if (strcmp(st.source, "builtin") != 0 || strcmp(st.version, "builtin-embedded") != 0) {
+      return fail("shellcode rules builtin status");
+    }
+  }
+  {
     uint8_t uniform[256];
     memset(uniform, 0x42, sizeof(uniform));
     double e = edr_shellcode_shannon_entropy_bits(uniform, sizeof(uniform));
@@ -66,6 +75,12 @@ int main(void) {
     if (strcmp(rule, "EternalBlue_MS17_010") != 0) {
       return fail("known smb1 rule name");
     }
+    EdrShellcodeRulesStatus st;
+    memset(&st, 0, sizeof(st));
+    edr_shellcode_known_get_status(&st);
+    if (st.matches_total == 0u || st.builtin_matches == 0u || strcmp(st.last_match_rule, "EternalBlue_MS17_010") != 0) {
+      return fail("shellcode match stats");
+    }
   }
   {
     const uint8_t rdp_bluekeep[] = {
@@ -78,6 +93,60 @@ int main(void) {
     }
     if (strcmp(rule, "BlueKeep_CVE_2019_0708") != 0) {
       return fail("known rdp rule name");
+    }
+  }
+  {
+    uint8_t smbghost[96];
+    memset(smbghost, 0, sizeof(smbghost));
+    memcpy(smbghost, "\xfcSMB", 4);
+    smbghost[16] = 0xFFu;
+    smbghost[17] = 0xFFu;
+    smbghost[18] = 0xFFu;
+    smbghost[19] = 0xFFu;
+    memset(smbghost + 48, 0x90, 32);
+    char rule[96];
+    if (!edr_shellcode_match_known_exploit(smbghost, (uint32_t)sizeof(smbghost), EDR_PROTO_KIND_SMB2, rule,
+                                           sizeof(rule))) {
+      return fail("known smbghost match");
+    }
+    if (strcmp(rule, "SMBGhost_CVE_2020_0796") != 0) {
+      return fail("known smbghost rule name");
+    }
+  }
+  {
+    uint8_t http_stage[160];
+    memset(http_stage, 0, sizeof(http_stage));
+    const char *body = "HTTP/1.1 200 OK\r\nContent-Length: 72\r\n\r\nMZ........ReflectiveLoader........beacon.x64";
+    memcpy(http_stage, body, strlen(body));
+    char rule[96];
+    if (!edr_shellcode_match_known_exploit(http_stage, (uint32_t)sizeof(http_stage), EDR_PROTO_KIND_HTTP, rule,
+                                           sizeof(rule))) {
+      return fail("known reflective loader match");
+    }
+    if (strcmp(rule, "ReflectiveLoader_HTTP_Stager") != 0) {
+      return fail("known reflective loader rule name");
+    }
+  }
+  {
+    const uint8_t ch[] = {
+        0x16,0x03,0x01,0x00,0x66, 0x01,0x00,0x00,0x62, 0x03,0x03,
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+        0x00, 0x00,0x04, 0x13,0x01, 0xc0,0x2f, 0x01,0x00, 0x00,0x35,
+        0x00,0x00,0x00,0x12, 0x00,0x10,0x00,0x00,0x0d,
+        'l','o','g','i','n','.','e','x','a','m','p','l','e',
+        0x00,0x0a,0x00,0x08, 0x00,0x06,0x00,0x1d,0x00,0x17,0x00,0x18,
+        0x00,0x0b,0x00,0x02, 0x01,0x00,
+        0x00,0x0d,0x00,0x09, 0x00,0x07,0x04,0x03,0x08,0x04,0x04,0x01,0x05
+    };
+    EdrTlsClientHelloInfo ti;
+    if (!edr_proto_parse_tls_client_hello(ch, (uint32_t)sizeof(ch), &ti)) {
+      return fail("tls clienthello parse");
+    }
+    if (strcmp(ti.sni, "login.example") != 0) {
+      return fail("tls sni parse");
+    }
+    if (strstr(ti.ja3, "771,4865-49199,0-10-11-13,29-23-24,0") == NULL) {
+      return fail("tls ja3 string");
     }
   }
   {

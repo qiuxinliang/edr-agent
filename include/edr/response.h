@@ -10,22 +10,10 @@
 extern "C" {
 #endif
 
-void edr_response_kill(const char *cmd_id, const uint8_t *pl, size_t len,
-                       const EdrSoarCommandMeta *sm);
-
 /* 主机隔离/恢复已统一到 command_stub.c 的 do_isolate / do_restore_host(真实 OS 网络隔离)。
  * 旧的 stamp-only edr_response_isolate / _restore_host / _isolate_auto_from_shellcode 已删除。 */
-
-void edr_response_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                                  const EdrSoarCommandMeta *sm);
-void edr_response_restore_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                               const EdrSoarCommandMeta *sm);
-void edr_response_get_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                           const EdrSoarCommandMeta *sm);
 void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len,
                            const EdrSoarCommandMeta *sm);
-void edr_response_remove_file(const char *cmd_id, const uint8_t *pl, size_t len,
-                              const EdrSoarCommandMeta *sm);
 
 void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                    const EdrSoarCommandMeta *sm);
@@ -42,6 +30,11 @@ int edr_response_forensic_run_external(const char *cmd_id, const char *scope, co
                                        size_t detail_cap);
 /* 取证外移是否启用(EDR_FORENSIC_COLLECTOR=1)。 */
 int edr_response_forensic_external_enabled(void);
+int edr_response_yara_external_enabled(void);
+int edr_response_yara_runtime_status(char *rules_dir, size_t rules_dir_cap,
+                                     size_t *rules_count, char *source,
+                                     size_t source_cap, char *error,
+                                     size_t error_cap);
 
 /* ── 取证异步生命周期(velo 采集硬取消支持)──
  * 受理:由 5 个 forensic 处理器在外移启用时调用,非阻塞 spawn + 登记单槽任务。
@@ -59,19 +52,27 @@ int edr_response_forensic_async_cancel(const char *target_cmd_id);
 void edr_response_forensic_async_abort_shutdown(void);
 /* 是否有采集在运行(busy 查询)。 */
 int edr_response_forensic_async_active(void);
+void edr_response_forensic_complete_queued_upload(
+    const char *command_id, const char *command_type, const EdrSoarCommandMeta *soar_meta,
+    const char *artifact_path, const char *sha256, const char *object_key,
+    const char *source, int partial, int upload_ok, const char *upload_error);
 
-void edr_response_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
-                             const EdrSoarCommandMeta *sm);
-void edr_response_shell_input(const char *cmd_id, const uint8_t *pl, size_t len,
-                              const EdrSoarCommandMeta *sm);
-void edr_response_shell_close(const char *cmd_id, const uint8_t *pl, size_t len,
-                              const EdrSoarCommandMeta *sm);
-void edr_shell_stream_output_cb(const char *sid, const char *data, size_t len,
-                                int exit_code, bool closed, void *user);
 void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm);
 void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
+/** Scan an in-memory PMFE region with the effective forensic YARA rule set.
+ * Returns 0 on a completed scan, 1 when YARA is unavailable, and <0 on error. */
+int edr_response_yara_scan_memory(const char *cmd_id, const uint8_t *buf, size_t len,
+                                  char (*hits)[128], size_t hit_cap, size_t *hit_count,
+                                  char *error, size_t error_cap);
+typedef struct EdrForensicYaraSession EdrForensicYaraSession;
+EdrForensicYaraSession *edr_response_yara_session_open(char *error, size_t error_cap);
+int edr_response_yara_session_scan(EdrForensicYaraSession *session, const char *cmd_id,
+                                   const uint8_t *buf, size_t len, char (*hits)[128],
+                                   size_t hit_cap, size_t *hit_count,
+                                   char *error, size_t error_cap);
+void edr_response_yara_session_close(EdrForensicYaraSession *session);
 void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
 
@@ -84,8 +85,6 @@ void edr_response_reg_query(const char *cmd_id, const uint8_t *pl, size_t len,
                             const EdrSoarCommandMeta *sm);
 void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl, size_t len,
                               const EdrSoarCommandMeta *sm);
-void edr_response_collector_start(const char *cmd_id, const uint8_t *pl, size_t len,
-                                  const EdrSoarCommandMeta *sm);
 
 #ifdef __cplusplus
 }

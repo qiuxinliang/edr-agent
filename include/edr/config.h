@@ -19,10 +19,12 @@
 #define EDR_FL_FROZEN_NAME_MAX 64
 
 typedef struct EdrConfig {
-  struct {
-    char address[256];
-    bool grpc_enabled;
-    bool grpc_insecure;
+	  struct {
+	    char address[256];
+	    /** Legacy config compatibility only; current transport uses platform.rest_base_url. */
+	    bool grpc_enabled;
+	    /** Legacy config compatibility only; current transport ignores this flag. */
+	    bool grpc_insecure;
     char ca_cert[1024];
     char client_cert[1024];
     char client_key[1024];
@@ -111,6 +113,40 @@ typedef struct EdrConfig {
      * 规则间 \x1e，字段间 \x1f（target,process,action,reason,contains_all），contains_all token 间 \x1d。 */
     char suppression_rules[8192];
   } detection_policy;
+
+  /** Product-level sensor modes from remote `[detection]` policy. */
+  struct {
+    bool auto_profile;
+    int shellcode_mode; /* -1 adaptive, 0 off, 1 on */
+    int webshell_mode;  /* -1 adaptive, 0 off, 1 on */
+    int pmfe_mode;      /* -1 adaptive alert, 0 off, 1 reserved idle, 2 alert-triggered */
+  } detection;
+
+  /** Low-latency endpoint correlation. `configured` preserves legacy env-only deployments. */
+  struct {
+    bool configured;
+    bool enabled;
+    bool inject_feedback_enabled;
+  } correlation;
+
+  /** Endpoint policy schema v2. Modes: 0 off, 1 observe, 2 alert, 3 block. */
+  struct {
+    int credential_mode;
+    int lateral_mode;
+    int privilege_mode;
+    int evasion_mode;
+    int persistence_mode;
+    int script_mode;
+    int webshell_mode;
+    int exfil_mode;
+    int impact_mode;
+    bool ransomware_behavior;
+    bool ransomware_mass_write;
+    bool ransomware_vss;
+    bool ransomware_spread;
+    bool ransomware_honey;
+    bool ransomware_forensic;
+  } policy_v2;
 
   struct {
     bool enabled;
@@ -218,6 +254,8 @@ typedef struct EdrConfig {
     uint32_t rtr_shell_max_timeout_sec;
     char signing_public_key_path[1024];
     char signing_public_key_pem[2048];
+    /** 取证 YARA 扫描规则目录（yara_scan 命令使用）。空=用 EDR_YARA_RULES_DIR 或默认 rules/forensic。 */
+    char forensic_yara_rules_dir[1024];
   } command;
 
   /** 告警推荐取证自动派发。该开关独立于 [command].allow_dangerous，避免开启响应权限后自动风暴。 */
@@ -241,6 +279,10 @@ typedef struct EdrConfig {
     /** HTTPS/TLS transport v2: HTTP/2 is the default, HTTP/1.1 remains an explicit fallback unless required. */
     bool http2_enabled;
     bool http2_require;
+    /** Control-plane policy is independent from bulk telemetry HTTP/2. */
+    bool control_http2_enabled;
+    bool control_http2_require;
+    bool control_http1_fallback;
     bool control_stream_enabled;
     bool long_poll_fallback;
     bool report_events_v2_enabled;
@@ -259,6 +301,11 @@ typedef struct EdrConfig {
     char proxy_url[512];
     /** 本地 Relay/Gateway 地址；配置后 Agent 优先连接 relay_url，再由 Relay 转发到 Server。 */
     char relay_url[512];
+    struct {
+      bool enabled;
+      char key_id[128];
+      char secret[256];
+    } request_signing;
   } platform;
 
   /**
@@ -268,6 +315,15 @@ typedef struct EdrConfig {
    */
   struct {
     bool enabled;
+    bool listeners_enabled;
+    bool public_service_enabled;
+    bool local_admins_enabled;
+    bool services_enabled;
+    bool shares_enabled;
+    bool browser_enabled;
+    bool software_enabled;
+    bool defender_enabled;
+    bool egress_enabled;
     uint32_t port_interval_s;
     uint32_t conn_interval_s;
     uint32_t service_interval_s;
@@ -344,11 +400,18 @@ typedef struct EdrConfig {
     bool auto_isolate_execute;
     /** 启发式分数乘数（0.01–3.0），用于现场压误报/提灵敏度 */
     double heuristic_score_scale;
+    /** 网络命中后的定向PMFE确认；启发式仅在达到独立高阈值时触发。 */
+    bool pmfe_followup_enabled;
+    double pmfe_heuristic_threshold;
     /**
      * P0 优化 #2：每条连接（4 元组）只深扫前 N 字节载荷；超过则跳过深扫（漏洞利用特征均在会话起始）。
      * 大幅降低大文件/长连接的逐包 entropy/YARA 开销。0=不限（旧行为，逐包全扫）。默认 65536。
      */
     uint32_t flow_scan_first_bytes;
+    /** TCP方向流重组上限。总内存耗尽时优先淘汰最久未活动的流。 */
+    uint32_t reassembly_max_flows;
+    uint32_t reassembly_memory_limit_kb;
+    uint32_t reassembly_idle_timeout_s;
     /**
      * P0 优化 #3：是否对 TLS 应用数据（密文）做 shellcode 深扫。
      * 默认 false：仅提取 ClientHello（JA3/SNI），跳过 CCS/alert/application_data 记录的熵/YARA 扫描，
@@ -370,6 +433,8 @@ typedef struct EdrConfig {
     bool monitor_ldap;
     bool monitor_tls;
     uint32_t detector_threads;
+    /** 捕获线程到检测worker的有界队列容量。 */
+    uint32_t scan_queue_capacity;
     char yara_rules_dir[1024];
     char forensic_dir[1024];
     /** 告警时写 PCAP（需 forensic_dir 非空；无环形时单包 raw LINKTYPE 228/229） */

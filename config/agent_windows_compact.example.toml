@@ -2,7 +2,6 @@
 
 [server]
 address              = ""
-grpc_insecure        = false
 ca_cert              = "C:\\Program Files\\FDSecurity\\certs\\ca.pem"
 client_cert          = "C:\\Program Files\\FDSecurity\\certs\\client.pem"
 client_key           = "C:\\Program Files\\FDSecurity\\certs\\client-key.pem"
@@ -100,6 +99,7 @@ max_log_files        = 5
 allow_dangerous      = false
 allow_rtq_readonly   = true
 signing_public_key_path = "C:\\Program Files\\FDSecurity\\certs\\command-signing.pub.pem"
+forensic_yara_rules_dir = "C:\\Program Files\\FDSecurity\\rules\\forensic"
 
 [self_protect]
 anti_debug           = true

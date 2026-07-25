@@ -91,6 +91,8 @@ static void test_shellcode_recommends_minidump_and_pmfe(void) {
   assert(!d.trigger_single_process_minidump);
   assert(strstr(r.detection_context, "\"engine\":\"shellcode\"") != NULL);
   assert(strstr(r.detection_context, "\"engine_evidence\"") != NULL);
+  assert(strstr(r.detection_context, "\"schema\":\"shellcode_result_v1\"") != NULL);
+  assert(strstr(r.detection_context, "\"flow\"") != NULL);
   assert(strstr(r.detection_context, "\"detector\":\"yara\"") != NULL);
   assert(strstr(r.detection_context, "\"rule\":\"EternalBlue\"") != NULL);
   assert(strstr(r.detection_context, "\"proto\":\"smb2\"") != NULL);
@@ -109,6 +111,7 @@ static void test_webshell_triggers_targeted_pmfe(void) {
   assert(!d.drop);
   assert(d.trigger_pmfe_scan);
   assert(strstr(r.detection_context, "\"engine\":\"webshell\"") != NULL);
+  assert(strstr(r.detection_context, "\"schema\":\"webshell_result_v1\"") != NULL);
   assert(strstr(r.detection_context, "\"webshell_files\"") != NULL);
   assert(strstr(r.detection_context, "\"targeted_files\":true") != NULL);
   assert(strstr(r.detection_context, "\"rule\":\"PHP_Webshell_Eval\"") != NULL);
@@ -126,9 +129,70 @@ static void test_pmfe_result_keeps_memory_evidence(void) {
   assert(!d.drop);
   assert(!d.trigger_pmfe_scan);
   assert(strstr(r.detection_context, "\"engine\":\"pmfe\"") != NULL);
+  assert(strstr(r.detection_context, "\"schema\":\"pmfe_result_v1\"") != NULL);
   assert(strstr(r.detection_context, "\"pmfe_snapshot\"") != NULL);
   assert(strstr(r.detection_context, "\"detector\":\"pmfe\"") != NULL);
   assert(strstr(r.detection_context, "pmfe_result_feedback") != NULL);
+}
+
+static void test_pmfe_clean_shellcode_followup_closes_without_alert(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=pmfe followup_only=1 source_alert_id=sc-123 "
+           "pmfe_status=completed_clean pmfe_verdict=clean score=0.05 mitre=-");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "regions=7 private_exec=0 stomp_suspicious=0 mz_hits=0 ave_max_score=0");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(!d.drop);
+  assert(d.confidence < 0.25f);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(strstr(d.reason, "pmfe_followup_clean") != NULL);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-123\"") != NULL);
+  assert(strstr(r.detection_context, "\"followup_only\":true") != NULL);
+  assert(strstr(r.detection_context, "\"status\":\"completed_clean\"") != NULL);
+  assert(strstr(r.detection_context, "\"verdict\":\"clean\"") != NULL);
+}
+
+static void test_pmfe_failed_shellcode_followup_reports_context(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=pmfe followup_only=1 source_alert_id=sc-789 "
+           "pmfe_status=failed pmfe_verdict=inconclusive score=0.35 mitre=-");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(!d.drop);
+  assert(d.confidence < 0.25f);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(strstr(d.reason, "pmfe_followup_inconclusive") != NULL);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-789\"") != NULL);
+  assert(strstr(r.detection_context, "\"status\":\"failed\"") != NULL);
+  assert(strstr(r.detection_context, "\"verdict\":\"inconclusive\"") != NULL);
+}
+
+static void test_pmfe_suspicious_shellcode_followup_keeps_alert(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s",
+           "detector=pmfe followup_only=1 source_alert_id=sc-456 "
+           "pmfe_status=completed_suspicious pmfe_verdict=suspicious score=0.94 mitre=T1055");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "regions=9 private_exec=1 stomp_suspicious=1 mz_hits=1 ave_max_score=0.94");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.suppress);
+  assert(!d.drop);
+  assert(d.confidence >= 0.70f);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-456\"") != NULL);
+  assert(strstr(r.detection_context, "\"status\":\"completed_suspicious\"") != NULL);
+  assert(strstr(r.detection_context, "\"verdict\":\"suspicious\"") != NULL);
 }
 
 static void test_rmm_enterprise_allowlist_policy_suppresses_remote_noise(void) {
@@ -373,6 +437,50 @@ static void test_conditional_suppression_skips_high_signal(void) {
   test_unsetenv("EDR_DETECTION_SUPPRESSION_RULES");
 }
 
+static void test_ransom_recovery_requires_dangerous_args(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PROCESS_CREATE;
+  r.pid = 7722u;
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "vssadmin.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "vssadmin.exe list shadows");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "ransom_recovery_tamper") == NULL);
+  assert(strstr(r.detection_context, "\"ransom_recovery_tamper\":true") == NULL);
+}
+
+static void test_ransom_single_counter_does_not_emit_burst(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.pid = 7723u;
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "sync_update.exe");
+  snprintf(r.file_path, sizeof(r.file_path), "%s", "C:\\Users\\alice\\Documents\\report.docx");
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s", "ransom_counter=1 file_rate=10 ext_burst=0 dir_burst=0 content_entropy=0 content_sample_bytes=0");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "ransom_file_burst") == NULL);
+  assert(strstr(r.detection_context, "\"ransom_behavior\":true") == NULL);
+}
+
+static void test_ransom_recovery_plus_file_burst_still_alerts(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.pid = 7724u;
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "vssadmin.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "vssadmin.exe delete shadows /all /quiet");
+  snprintf(r.file_path, sizeof(r.file_path), "%s", "C:\\Users\\alice\\Documents\\invoice.locked");
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s", "file_rate=30 ext_burst=9 dir_burst=2");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "ransom_recovery_tamper") != NULL);
+  assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
+  assert(strstr(r.detection_context, "\"ransom_recovery_tamper\":true") != NULL);
+  assert(strstr(r.detection_context, "\"ransom_behavior\":true") != NULL);
+}
+
 static void test_ransom_control_threshold_context(void) {
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
@@ -411,6 +519,9 @@ int main(void) {
   test_shellcode_recommends_minidump_and_pmfe();
   test_webshell_triggers_targeted_pmfe();
   test_pmfe_result_keeps_memory_evidence();
+  test_pmfe_clean_shellcode_followup_closes_without_alert();
+  test_pmfe_failed_shellcode_followup_reports_context();
+  test_pmfe_suspicious_shellcode_followup_keeps_alert();
   test_rmm_enterprise_allowlist_policy_suppresses_remote_noise();
   test_process_context_window_correlates_remote_script();
   test_process_tree_context_correlates_parent_child();
@@ -421,6 +532,9 @@ int main(void) {
   test_event_quality_p0_forces_alert();
   test_conditional_suppression_downgrades_matching_variant();
   test_conditional_suppression_skips_high_signal();
+  test_ransom_recovery_requires_dangerous_args();
+  test_ransom_single_counter_does_not_emit_burst();
+  test_ransom_recovery_plus_file_burst_still_alerts();
   test_ransom_control_threshold_context();
   puts("detection_decision ok");
   return 0;

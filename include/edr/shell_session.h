@@ -1,6 +1,6 @@
 /**
  * Shell Session — 匿名管道 + PeekNamedPipe 实现远程交互式 Shell。
- * 零新线程，在主循环中 poll；复用现有 gRPC Subscribe 流回传数据。
+ * 零新线程，在主循环中 poll；复用现有 HTTPS 控制面与 ingest 回传数据。
  */
 #ifndef EDR_SHELL_SESSION_H
 #define EDR_SHELL_SESSION_H
@@ -12,8 +12,11 @@
 #define EDR_SS_MAX_SESSIONS 10u
 #define EDR_SS_ID_LEN 48u
 #define EDR_SS_BUF_KB 64u
+/* Keep each durable stream result within EdrCommandStateRecord.detail. */
+#define EDR_SS_STREAM_CHUNK_BYTES 2048u
 
 typedef void (*edr_ss_write_fn)(const char *session_id,
+                                uint64_t seq,
                                 const char *data, size_t len,
                                 int exit_code, bool closed,
                                 void *user);

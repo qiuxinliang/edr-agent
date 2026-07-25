@@ -19,6 +19,7 @@
 | [x] [AGT-010](#agt-010-资源限制与预处理降载) | 资源限制与预处理降载（**`resource` + `preprocess` + README**） | P2 | 全平台 |
 | [x] [AGT-011](#agt-011-文档与用语一致) | 文档与用语一致（**README 矩阵 + main 用语已对齐**） | P3 | 全平台 |
 | [x] [AGT-012](#agt-012-linux-内核态采集-p7) | Linux 内核态采集（P7）（**`docs/AGT012_LINUX_EBPF_P7.md`**） | P3 | Linux |
+| [x] [AGT-P2-SHELLCODE-SOAR](#agt-p2-shellcode-soar--取证根目录与-playbook) | **P2**：Shellcode PCAP 根与 **`EDR_FORENSIC_OUT`** 对齐 + **SOAR playbook** 示例（**`SOAR_CONTRACT` §5.3**；**`WINDOWS_SHELLCODE_FORENSIC_TODO` §P2**） | P2 | Windows |
 
 ---
 
@@ -102,7 +103,7 @@
 - **目标**：Webshell / Shellcode 命中后 **UploadFile** 分片上传与本地降级路径，对 Windows 做端到端验证；与 `WINDOWS_SHELLCODE_FORENSIC_TODO.md` 合并或关闭子项。
 - **交付物**：测试步骤或自动化脚本；服务端对象存储配置说明。
 - **验收**：平台侧可拿到对象键与元数据；失败有可观测日志。
-- **状态（已关闭 AGT-009）**：**`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**（Webshell **UploadFile** 联调步骤、前置条件、平台验收、失败路径）；**`WINDOWS_SHELLCODE_FORENSIC_TODO.md`** 已互链。**远程 `forensic` bundle 自动上传** 仍以该 TODO **P1** 跟踪，不阻塞本项关闭。
+- **状态（已关闭 AGT-009）**：**`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**（Webshell / **`forensic`** **UploadFile**、**`EDR_FORENSIC_UPLOAD`**）；**`WINDOWS_SHELLCODE_FORENSIC_TODO.md`** 已互链。
 
 ---
 
@@ -153,6 +154,15 @@
 | **已关闭 / 文档或代码已交付** | **AGT-002～012**（总览 **`[x]`**）；**AGT-001** 节内 **已完成** |
 | **后续代码（非 AGT 未关项）** | **Linux eBPF 探针** 按 **`docs/AGT012_LINUX_EBPF_P7.md`** 分阶段 PR |
 
+### P0（平台侧仓库门闸 — 已由脚本/CI 承担）
+
+下列项在 **`edr-backend`** 由 **`make verify-p0-repo-gate`**（**`scripts/verify_p0_repo_gate.sh`**）与 **GitHub Actions「Backend CI」** 中 **`P0 release gate`** 步骤自动执行，**不必**在下表重复勾选：
+
+- **`platform/internal/installer/embedded/`** 与 **`edr-agent/scripts/edr_agent_install.{py,ps1,sh}`** 一致且已提交  
+- **`go test ./platform/internal/installer`**、**`go build`** **`edr-api`** / **`edr-worker`**
+
+仍须在 **staging / 生产** 环境完成的 P0（TLS、CORS、**`wss`**、**`POST /enroll` 走公网 HTTPS**、**勿长期 `PLATFORM_SKIP_LICENSE_GATE`**）见 **`edr-backend/docs/RELEASE_PUBLISH_CHECKLIST.md` §2、§4**；网关 **`/healthz`/`/ready`** 可用 **`STAGING_HOST=https://… bash edr-backend/scripts/staging_gateway_health.sh`**；与 Agent 上行冒烟可用 **`API_ROOT=… bash edr-backend/scripts/smoke_i1_demo_ready.sh`**（需已起 **edr-api** + DB）。
+
 ### 联调前检查清单（建议）
 
 **环境与身份**
@@ -163,6 +173,7 @@
 **上行（事件 / 指令结果）**
 
 - [ ] **`ReportEvents`**（BAT1/批次）可达且后端可解析（HTTP 或 gRPC 以当前栈为准）。
+- [ ] **注册表（Windows）**：**`EDR_BEHAVIOR_ENCODING=protobuf`** 时 **`BehaviorEvent.detail.registry`** 与平台 **`category=registry`** 一致；实机步骤见 **`docs/REGISTRY_ETW_ACCEPTANCE.md`**。
 - [ ] **SOAR / `ReportCommandResult`**：终端已调用（**AGT-008**）；确认后端 **EventIngest** 是否已注册 **`ReportCommandResult`**，否则 unary 失败属预期，见 **`docs/SOAR_CONTRACT.md` §5**；联调可设 **`EDR_SOAR_REPORT_ALWAYS=1`**。
 - [ ] **心跳 / 在线**：终端侧 **gRPC keepalive**（**`SOAR_CONTRACT` §4.1**）；平台默认 **滑动时间窗 + `T_offline`** 与 **连接 / `ReportEvents` 成功** 见 **§4.2**；**后端实现** 见 **§4.2.3**。
 
@@ -173,7 +184,32 @@
 **可选 / 分项联调**
 
 - [ ] **AVE / ONNX**：**`docs/AVE_ONNX_LOCAL_STACK.md`**、**`EDR_AVE_INFER_DRY_RUN`**。
-- [ ] **取证 / UploadFile**：步骤见 **`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**（**AGT-009 已关闭**）；**`forensic` bundle 自动上传** 见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`**。
+- [x] **取证 / UploadFile**：步骤见 **`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**；**`forensic`** 完成后 **`UploadFile`**（**`EDR_FORENSIC_UPLOAD`**，**`command_stub.c`**）。
+- [x] **P2 Shellcode / SOAR**：**`SOAR_CONTRACT` §5.3**；**WinDivert PCAP** 根路径（**`windivert_capture.c`** + **`EDR_FORENSIC_OUT\\shellcode`** 回退）。
 - [ ] **Windows 部署**：**`docs/WINDOWS_DEPLOY.md`** 预检；Shellcode/WinDivert 需驱动与权限。
+
+### AGT-P2-Shellcode-SOAR — 取证根目录与 Playbook
+
+- **目标**：**§17 WinDivert** PCAP 与远程取证根 **`EDR_FORENSIC_OUT`** 语义一致；为编排提供可复制的 **Shellcode → `forensic` → 确认 → `isolate`** 步骤说明。
+- **交付物**：**`windivert_capture.c`** 根路径解析；**`docs/SOAR_CONTRACT.md` §5.3**；**`WINDOWS_SHELLCODE_FORENSIC_TODO.md`** §P2 勾选更新；**`README.md`** / **`agent.toml.example`** / **`config.h`** 注释。
+- **仍属 P2 / 后端或控制台**：告警详情展示 **PCAP / MinIO key**（**`WINDOWS_SHELLCODE_FORENSIC_TODO`** 未关项）。
+
+### P2 后续三项（控制台 · WinDivert 性能 · README §9 自保护）
+
+**主文档（含 `[ ]` / `[x]` 子任务表）**：**`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`** — **§P2a**（**C1–C4** 已关：**ingest UploadFile**、**GET /alerts/:id** 的 **artifacts** 合并、**AlertDetailPage** 展示、**`AGT009` §2.1** / **`WINDOWS_DEPLOY`**）、**§P2b**（**P2-PERF-1** SLO 框架见 **`docs/SHELLCODE_AGENT_SLO.md`**；**P2-PERF-2**、**P2-PERF-3** 已落地；**P2-PERF-3** 权威语义见 **`docs/EVENT_BUS_BACKPRESSURE.md`**）、**§P2c**（**S1** **`--service`** 已落地，见 **`WINDOWS_SERVICE_SHUTDOWN.md`**；**S2–S4** 已文档：**`SELF_PROTECT_REGRESSION.md`**、**`PROMETHEUS_BUS_METRICS.md`**、**`WINDOWS_DEPLOY.md` §3.0**）。
+
+| 代号 | 内容 | 责任域 |
+|------|------|--------|
+| **C1** | **`UploadFile`** 流式落 MinIO/S3 | **edr-backend** ingest（**已交付**） |
+| **C2** | **`GET /alerts/:id`** **`artifacts`** 合并 **`ReportCommandResult`** **`UploadFile key=`** | **edr-backend**（**已交付**） |
+| **C3** | **`AlertDetailPage`** 取证/对象存储卡片 + **`AlertEvidenceSection`** 表列 | **edr-frontend**（**已交付**） |
+| **C4** | **gRPC 目标 + MinIO 配置**（**`AGT009` §2.1**、**`WINDOWS_DEPLOY`**） | **文档（已交付）** |
+| **P2-PERF-1** | SLO **框架** **`SHELLCODE_AGENT_SLO.md`**（指标 **TBD**、业务签署仍待） | 产品 + 运维 |
+| **P2-PERF-2** | WinDivert **计数器** + **`EDR_SHELLCODE_WD_STATS`** | **edr-agent**（**`windivert_capture.c`**） |
+| **P2-PERF-3** | 背压语义**已文档化**（**`EVENT_BUS_BACKPRESSURE.md`**）；**可选开关**（降采样 / 按 priority 丢）仍排期 | 文档（已实现）+ 后续产品 |
+| **P2-PERF-4** | 生产压测报告 | 运维 + 专机 |
+| **S1–S4** | **S1** **`--service`** 已落地；**S2–S4** 见 **`WINDOWS_SHELLCODE_FORENSIC_TODO.md` §P2c** 专文 | Agent + 运维 + 可观测栈 |
+
+---
 
 **结论**：**P1 级联调（注册、gRPC、批次上报、Subscribe、指令闭环）** 已具备 **AGT** 文档与客户端实现；**与控制台「在线」一致** 依 **`SOAR_CONTRACT` §4.2** 与 **edr-backend §4.2.3** 落地；**全链路 SOAR** 依赖后端 **`ReportCommandResult`** 注册或 mock。

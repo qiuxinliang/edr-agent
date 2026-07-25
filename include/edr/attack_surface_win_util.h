@@ -4,7 +4,15 @@
 #define EDR_ATTACK_SURFACE_WIN_UTIL_H
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <stddef.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 void edr_asurf_win_ensure_wsa(void);

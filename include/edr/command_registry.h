@@ -1,0 +1,112 @@
+#ifndef EDR_COMMAND_REGISTRY_H
+#define EDR_COMMAND_REGISTRY_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum EdrCommandKind {
+  EDR_COMMAND_KIND_UNKNOWN = 0,
+  EDR_COMMAND_KIND_NOOP,
+  EDR_COMMAND_KIND_ECHO,
+  EDR_COMMAND_KIND_TELEMETRY_PROFILE_UPDATE,
+  EDR_COMMAND_KIND_ISOLATE_HOST,
+  EDR_COMMAND_KIND_RESTORE_HOST,
+  EDR_COMMAND_KIND_ISOLATE_STATUS,
+  EDR_COMMAND_KIND_KILL_PROCESS,
+  EDR_COMMAND_KIND_COLLECT_FORENSIC,
+  EDR_COMMAND_KIND_FORENSIC,
+  EDR_COMMAND_KIND_MEMORY_DUMP,
+  EDR_COMMAND_KIND_TARGETED_FORENSIC,
+  EDR_COMMAND_KIND_YARA_SCAN,
+  EDR_COMMAND_KIND_FORENSIC_CANCEL,
+  EDR_COMMAND_KIND_DEEP_FORENSIC,
+  EDR_COMMAND_KIND_PUT_FILE,
+  EDR_COMMAND_KIND_RTQ_EXECUTE,
+  EDR_COMMAND_KIND_RTQ_QUERY,
+  EDR_COMMAND_KIND_PROCESS_TREE,
+  EDR_COMMAND_KIND_LIST_CONNECTIONS,
+  EDR_COMMAND_KIND_LIST_MODULES,
+  EDR_COMMAND_KIND_PROCESS_SNAPSHOT,
+  EDR_COMMAND_KIND_LIST_AUTORUNS,
+  EDR_COMMAND_KIND_VELO_QUERY,
+  EDR_COMMAND_KIND_FILE_STAT,
+  EDR_COMMAND_KIND_GET_FILE,
+  EDR_COMMAND_KIND_REMOVE_FILE,
+  EDR_COMMAND_KIND_EVENTLOG_VIEW,
+  EDR_COMMAND_KIND_REGISTRY_QUERY,
+  EDR_COMMAND_KIND_QUARANTINE_FILE,
+  EDR_COMMAND_KIND_RESTORE_FILE,
+  EDR_COMMAND_KIND_PMFE_SCAN,
+  EDR_COMMAND_KIND_SHELL_OPEN,
+  EDR_COMMAND_KIND_SHELL_INPUT,
+  EDR_COMMAND_KIND_SHELL_CLOSE,
+  EDR_COMMAND_KIND_RTR_SHELL,
+  EDR_COMMAND_KIND_AVE_STATUS,
+  EDR_COMMAND_KIND_AVE_FINGERPRINT,
+  EDR_COMMAND_KIND_AVE_INFER,
+  EDR_COMMAND_KIND_SELF_PROTECT_STATUS,
+  EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS,
+  EDR_COMMAND_KIND_ATTACK_SURFACE,
+} EdrCommandKind;
+
+typedef enum EdrCommandPayloadSchema {
+  EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT = 0,
+  EDR_COMMAND_PAYLOAD_OBJECT,
+  EDR_COMMAND_PAYLOAD_PID,
+  EDR_COMMAND_PAYLOAD_PATH,
+  EDR_COMMAND_PAYLOAD_REGISTRY_KEY,
+  EDR_COMMAND_PAYLOAD_RESTORE_FILE,
+  EDR_COMMAND_PAYLOAD_SHELL_INPUT,
+  EDR_COMMAND_PAYLOAD_SHELL_CLOSE,
+  EDR_COMMAND_PAYLOAD_RTR_SHELL,
+  EDR_COMMAND_PAYLOAD_UPDATE_SERVER,
+} EdrCommandPayloadSchema;
+
+typedef enum EdrCommandExecutionLane {
+  EDR_COMMAND_LANE_CRITICAL = 0,
+  EDR_COMMAND_LANE_INTERACTIVE = 1,
+  EDR_COMMAND_LANE_BULK = 2,
+  EDR_COMMAND_LANE_SCAN = 3,
+  EDR_COMMAND_LANE_COUNT = 4,
+} EdrCommandExecutionLane;
+
+typedef enum EdrCommandCancelMode {
+  EDR_COMMAND_CANCEL_NONE = 0,
+  EDR_COMMAND_CANCEL_COOPERATIVE = 1,
+  EDR_COMMAND_CANCEL_HARD = 2,
+} EdrCommandCancelMode;
+
+typedef enum EdrCommandReplayPolicy {
+  EDR_COMMAND_REPLAY_IDEMPOTENT = 0,
+  EDR_COMMAND_REPLAY_FINAL_ONLY = 1,
+} EdrCommandReplayPolicy;
+
+enum {
+  EDR_COMMAND_FLAG_DANGEROUS = 1u << 0,
+  EDR_COMMAND_FLAG_SHELL = 1u << 1,
+  EDR_COMMAND_FLAG_OPERATOR_ONLY = 1u << 2,
+};
+
+typedef struct EdrCommandDescriptor {
+  EdrCommandKind kind;
+  const char *canonical_type;
+  unsigned flags;
+  EdrCommandPayloadSchema payload_schema;
+} EdrCommandDescriptor;
+
+const EdrCommandDescriptor *edr_command_registry_lookup(const char *command_type);
+int edr_command_registry_is_dangerous(const char *command_type);
+int edr_command_registry_is_shell(const char *command_type);
+EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_type);
+EdrCommandCancelMode edr_command_registry_cancel_mode(const char *command_type);
+EdrCommandReplayPolicy edr_command_registry_replay_policy(const char *command_type);
+uint32_t edr_command_registry_default_timeout_s(const char *command_type);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

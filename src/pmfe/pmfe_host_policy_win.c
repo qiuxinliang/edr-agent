@@ -3,6 +3,7 @@
 
 #include "edr/pmfe.h"
 #include "edr/listen_table_win.h"
+#include "edr/edr_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -190,7 +191,7 @@ void edr_pmfe_listen_table_refresh(void) {
   if (truncated) {
     const char *q = getenv("EDR_PMFE_LISTEN_TRUNC_QUIET");
     if (!q || q[0] != '1') {
-      fprintf(stderr, "[pmfe][listen] rows truncated (cap=%d), priority table may miss listeners\n", PMFE_LISTEN_ROW_BUF);
+      EDR_LOGE("[pmfe][listen] rows truncated (cap=%d), priority table may miss listeners\n", PMFE_LISTEN_ROW_BUF);
     }
   }
 }

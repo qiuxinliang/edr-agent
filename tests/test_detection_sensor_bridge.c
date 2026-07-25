@@ -1,5 +1,6 @@
 #include "edr/behavior_from_slot.h"
 #include "edr/detection_decision.h"
+#include "edr/windows_event_policy.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -15,7 +16,7 @@ static void test_setenv(const char *k, const char *v) { setenv(k, v, 1); }
 static void test_unsetenv(const char *k) { unsetenv(k); }
 #endif
 
-void edr_isolate_auto_from_ransom_alarm(void) {}
+void edr_isolate_auto_from_ransom_alarm(uint32_t pid) { (void)pid; }
 
 static void fill_slot(EdrEventSlot *slot, EdrEventType type, const char *text) {
   memset(slot, 0, sizeof(*slot));
@@ -154,7 +155,10 @@ static void test_ransom_counter_bridge(void) {
 static void test_ransom_sliding_window_counter(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
+  EdrBehaviorRecord signal_record;
   EdrDetectionDecision d;
+  int signal_count = 0;
+  memset(&signal_record, 0, sizeof(signal_record));
 
   for (int i = 0; i < 85; i++) {
     char payload[768];
@@ -168,15 +172,65 @@ static void test_ransom_sliding_window_counter(void) {
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338500000000000LL + (int64_t)i * 10000000LL;
     edr_behavior_from_slot(&slot, &r);
+    if (strstr(r.script_snippet, "ransom_counter=1") != NULL) {
+      signal_record = r;
+      signal_count++;
+    }
   }
 
-  edr_detection_decision_evaluate(&r, &d);
+  assert(signal_count >= 1);
+  assert(signal_count <= 2);
+  edr_detection_decision_evaluate(&signal_record, &d);
   assert(!d.drop);
-  assert(strstr(r.script_snippet, "file_rate=") != NULL);
-  assert(strstr(r.script_snippet, "ext_burst=") != NULL);
-  assert(strstr(r.script_snippet, "ransom_counter=1") != NULL);
+  assert(strstr(signal_record.script_snippet, "file_rate=") != NULL);
+  assert(strstr(signal_record.script_snippet, "ext_burst=") != NULL);
+  assert(strstr(signal_record.script_snippet, "ransom_counter_transition=1") != NULL);
   assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
-  assert(strstr(r.detection_context, "\"ransom_behavior\":true") != NULL);
+  assert(strstr(signal_record.detection_context, "\"ransom_behavior\":true") != NULL);
+  assert(strstr(signal_record.detection_context, "\"state_transition\":true") != NULL);
+}
+
+static void test_ransom_alert_volume_is_bounded(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  int signal_count = 0;
+  int transition_count = 0;
+  int summary_count = 0;
+
+  test_setenv("EDR_RANSOM_COUNTER_WINDOW_S", "600");
+  test_setenv("EDR_RANSOM_COUNTER_SUMMARY_S", "30");
+  for (int i = 0; i < 1000; i++) {
+    char payload[768];
+    snprintf(payload, sizeof(payload),
+             "ETW1\n"
+             "prov=kfile\n"
+             "pid=5098\n"
+             "img=C:\\Users\\alice\\AppData\\Roaming\\sync_update.exe\n"
+             "file=C:\\Users\\alice\\Documents\\bulk\\d%02d\\doc%04d.e%02d\n",
+             i % 16, i, i % 20);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns = 1779338900000000000LL + (int64_t)i * 100000000LL;
+    edr_behavior_from_slot(&slot, &r);
+    edr_windows_event_policy_apply(&r);
+    if (strstr(r.script_snippet, "ransom_counter=1") == NULL) {
+      continue;
+    }
+    signal_count++;
+    transition_count += strstr(r.script_snippet, "ransom_counter_transition=1") != NULL;
+    summary_count += strstr(r.script_snippet, "ransom_counter_summary=1") != NULL;
+    assert(r.priority == 0u);
+    edr_detection_decision_evaluate(&r, &d);
+    assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
+  }
+  test_unsetenv("EDR_RANSOM_COUNTER_WINDOW_S");
+  test_unsetenv("EDR_RANSOM_COUNTER_SUMMARY_S");
+
+  assert(signal_count >= 3);
+  assert(signal_count <= 5);
+  assert(transition_count >= 1);
+  assert(transition_count <= 2);
+  assert(summary_count <= 3);
 }
 
 static void test_invalid_file_path_does_not_raise_ransom_counter(void) {
@@ -256,6 +310,7 @@ static void test_ransom_canary_deterministic_context(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
+  test_setenv("EDR_RANSOM_CANARY_PATH", "C:\\Users\\Public\\~$canary.docx");
   fill_slot(&slot, EDR_EVENT_FILE_WRITE,
             "ETW1\n"
             "prov=kfile\n"
@@ -263,12 +318,30 @@ static void test_ransom_canary_deterministic_context(void) {
             "img=C:\\Users\\alice\\AppData\\Roaming\\sync_update.exe\n"
             "file=C:\\Users\\Public\\~$canary.docx\n");
   eval_slot(&slot, &r, &d);
+  test_unsetenv("EDR_RANSOM_CANARY_PATH");
   assert(r.priority == 0u);
   assert(strstr(r.script_snippet, "ransom_canary=1") != NULL);
   assert(strstr(d.reason, "ransom_canary_deterministic_encryption") != NULL);
   assert(strstr(r.detection_context, "\"kind\":\"DETERMINISTIC_ENCRYPTION\"") != NULL);
   assert(strstr(r.detection_context, "\"canary\":true") != NULL);
   assert(strstr(r.detection_context, "\"severity\":4") != NULL);
+}
+
+static void test_ransom_generic_canary_filename_is_not_deterministic(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  test_unsetenv("EDR_RANSOM_CANARY_PATH");
+  test_unsetenv("EDR_RANSOM_CANARY_TOKENS");
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=5009\n"
+            "img=C:\\Users\\alice\\AppData\\Roaming\\word.exe\n"
+            "file=C:\\Users\\alice\\Documents\\canary.docx\n");
+  eval_slot(&slot, &r, &d);
+  assert(strstr(r.script_snippet, "ransom_canary=1") == NULL);
+  assert(strstr(d.reason, "ransom_canary_deterministic_encryption") == NULL);
 }
 
 static void test_ransom_counter_allowlist_suppresses_rate_only(void) {
@@ -296,6 +369,24 @@ static void test_ransom_counter_allowlist_suppresses_rate_only(void) {
   assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
   assert(strstr(r.detection_context, "\"ransom_counter_allowlisted\":true") != NULL);
   assert(strstr(r.detection_context, "\"counter_suppressed\":true") != NULL);
+}
+
+static void test_ransom_allowlist_does_not_match_similar_identity(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  test_setenv("EDR_RANSOM_COUNTER_ALLOWLIST", "C:\\Program Files\\TrustedBackup\\trustedbackup.exe");
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=5019\n"
+            "img=C:\\Program Files\\TrustedBackup\\trustedbackup.exe.bak\n"
+            "file=C:\\Users\\alice\\Documents\\bulk\\doc01.locked\n");
+  edr_behavior_from_slot(&slot, &r);
+  edr_detection_decision_evaluate(&r, &d);
+  test_unsetenv("EDR_RANSOM_COUNTER_ALLOWLIST");
+  assert(strstr(r.script_snippet, "ransom_counter_allowlisted=1") == NULL);
+  assert(strstr(r.detection_context, "\"counter_suppressed\":true") == NULL);
 }
 
 static void test_ransom_content_entropy_and_extension_change(void) {
@@ -336,8 +427,8 @@ static void test_ransom_signer_path_allowlist_suppresses_counter(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
-  test_setenv("EDR_RANSOM_SIGNER_ALLOWLIST", "TrustedBackup");
-  test_setenv("EDR_RANSOM_SIGNED_PATH_ALLOWLIST", "C:\\Program Files\\TrustedBackup\\");
+  test_setenv("EDR_RANSOM_SIGNER_ALLOWLIST", "TrustedBackup_Corp");
+  test_setenv("EDR_RANSOM_SIGNED_PATH_ALLOWLIST", "C:\\Program Files\\TrustedBackup\\trustedbackup.exe");
   fill_slot(&slot, EDR_EVENT_FILE_WRITE,
             "ETW1\n"
             "prov=kfile\n"
@@ -476,6 +567,66 @@ static void test_registry_persistence_alias_bridge(void) {
   assert(strstr(r.detection_context, "persistence_changes") != NULL);
 }
 
+static void test_pmfe_followup_bridge_preserves_link_without_false_mitre(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_PMFE_SCAN_RESULT,
+            "ETW1\n"
+            "prov=pmfe\n"
+            "pid=864\n"
+            "cmd_id=etw:shellcode:sc-bridge-1\n"
+            "followup_only=1\n"
+            "source_alert_id=sc-bridge-1\n"
+            "pmfe_status=completed_clean\n"
+            "pmfe_verdict=clean\n"
+            "score=0.05\n"
+            "mitre=-\n"
+            "detector=pmfe\n");
+  eval_slot(&slot, &r, &d);
+  assert(r.pid == 864u);
+  assert(strstr(r.script_snippet, "source_alert_id=sc-bridge-1") != NULL);
+  assert(strstr(r.script_snippet, "pmfe_status=completed_clean") != NULL);
+  assert(r.mitre_ttp_count == 0);
+  assert(d.suppress);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(strstr(r.detection_context, "\"source_alert_id\":\"sc-bridge-1\"") != NULL);
+}
+
+static void test_pmfe_structured_signals_reach_detection_context(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_PMFE_SCAN_RESULT,
+            "ETW1\n"
+            "prov=pmfe\n"
+            "pid=865\n"
+            "pmfe_status=completed_suspicious\n"
+            "pmfe_verdict=suspicious\n"
+            "private_exec=2\n"
+            "memfd_exec=1\n"
+            "deleted_exec=1\n"
+            "mz_hits=1\n"
+            "stomp_suspicious=1\n"
+            "thread_start_matches=1\n"
+            "read_failures=3\n"
+            "injection_observed=1\n"
+            "score=0.94\n"
+            "mitre=T1055\n"
+            "detector=pmfe\n");
+  eval_slot(&slot, &r, &d);
+  assert(!d.drop);
+  assert(strstr(r.script_snippet, "private_exec=2") != NULL);
+  assert(strstr(r.detection_context, "\"private_exec\":2") != NULL);
+  assert(strstr(r.detection_context, "\"memfd_exec\":1") != NULL);
+  assert(strstr(r.detection_context, "\"deleted_exec\":1") != NULL);
+  assert(strstr(r.detection_context, "\"mz_hits\":1") != NULL);
+  assert(strstr(r.detection_context, "\"stomp_suspicious\":1") != NULL);
+  assert(strstr(r.detection_context, "\"thread_start_matches\":1") != NULL);
+  assert(strstr(r.detection_context, "\"read_failures\":3") != NULL);
+  assert(strstr(r.detection_context, "\"injection_observed\":true") != NULL);
+}
+
 int main(void) {
   test_scriptblock_sensor_bridge();
   test_amsi_sensor_bridge();
@@ -483,17 +634,22 @@ int main(void) {
   test_schannel_cert_error_bridge();
   test_ransom_counter_bridge();
   test_ransom_sliding_window_counter();
+  test_ransom_alert_volume_is_bounded();
   test_invalid_file_path_does_not_raise_ransom_counter();
   test_low_value_process_does_not_raise_ransom_counter();
   test_ransom_note_burst_counter();
   test_ransom_canary_deterministic_context();
+  test_ransom_generic_canary_filename_is_not_deterministic();
   test_ransom_counter_allowlist_suppresses_rate_only();
+  test_ransom_allowlist_does_not_match_similar_identity();
   test_ransom_content_entropy_and_extension_change();
   test_ransom_signer_path_allowlist_suppresses_counter();
   test_webshell_semantic_bridge_keeps_yara_evidence();
   test_sensor_alias_bridge();
   test_integer_ip_fields_are_normalized();
   test_registry_persistence_alias_bridge();
+  test_pmfe_followup_bridge_preserves_link_without_false_mitre();
+  test_pmfe_structured_signals_reach_detection_context();
   puts("detection_sensor_bridge ok");
   return 0;
 }

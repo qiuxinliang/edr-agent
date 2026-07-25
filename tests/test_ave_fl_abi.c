@@ -9,11 +9,37 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int fail(const char *msg) {
   fprintf(stderr, "FAIL: %s\n", msg);
   return 1;
 }
+
+typedef struct TestAVEBehaviorEventV26 {
+  uint32_t pid;
+  uint32_t ppid;
+  AVEEventType event_type;
+  uint8_t severity_hint;
+  int64_t timestamp_ns;
+  char target_path[512];
+  char target_ip[46];
+  char target_domain[256];
+  uint16_t target_port;
+  float ave_confidence;
+  float shellcode_score;
+  float webshell_score;
+  float pmfe_confidence;
+  float pmfe_dns_tunnel;
+  uint8_t pmfe_pe_found;
+  char file_sha256_hex[65];
+  uint8_t ioc_ip_hit;
+  uint8_t ioc_domain_hit;
+  uint8_t ioc_sha256_hit;
+  AVEBehaviorFlags behavior_flags;
+  uint8_t target_has_motw;
+  uint8_t cert_revoked_ancestor;
+} TestAVEBehaviorEventV26;
 
 int main(void) {
   float vec[512];
@@ -23,12 +49,41 @@ int main(void) {
   if (AVE_ExportFeatureVector(NULL, vec) != AVE_ERR_NOT_INITIALIZED) {
     return fail("ExportFeatureVector before init should be NOT_INITIALIZED");
   }
+  {
+    AVEBehaviorEvent event = {0};
+    if (AVE_FeedEventEx(&event, sizeof(event)) != AVE_ERR_NOT_INITIALIZED) {
+      return fail("FeedEventEx before init should be NOT_INITIALIZED");
+    }
+  }
 
   AVEConfig cfg = {0};
   cfg.model_dir = ".";
   cfg.max_concurrent_scans = 1;
   if (AVE_Init(&cfg) != AVE_OK) {
     return fail("AVE_Init");
+  }
+
+  {
+    TestAVEBehaviorEventV26 *legacy = (TestAVEBehaviorEventV26 *)calloc(1u, sizeof(*legacy));
+    if (!legacy) {
+      return fail("calloc legacy behavior event");
+    }
+    legacy->pid = 4242u;
+    legacy->event_type = AVE_EVT_PROCESS_CREATE;
+    snprintf(legacy->target_path, sizeof(legacy->target_path), "%s", "C:/legacy.exe");
+    AVE_FeedEvent((const AVEBehaviorEvent *)(const void *)legacy);
+    free(legacy);
+    AVEBehaviorEvent current = {0};
+    current.pid = 4243u;
+    current.event_type = AVE_EVT_PROCESS_CREATE;
+    snprintf(current.process_name, sizeof(current.process_name), "%s", "powershell.exe");
+    if (AVE_FeedEventEx(&current, sizeof(current)) != AVE_OK) {
+      return fail("FeedEventEx current event");
+    }
+    if (AVE_FeedEventEx(&current, sizeof(current) - 1u) != AVE_ERR_INVALID_PARAM ||
+        AVE_FeedEventEx(NULL, sizeof(current)) != AVE_ERR_INVALID_PARAM) {
+      return fail("FeedEventEx size validation");
+    }
   }
 
   if (AVE_ExportFeatureVector(NULL, vec) != AVE_ERR_INVALID_PARAM) {

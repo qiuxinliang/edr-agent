@@ -1,5 +1,5 @@
 # 将 ONNX Runtime 的 DLL 复制到 build\Release\，供 Inno / 便携 zip 与 FDSensor.exe 同目录分发。
-# 前提：已设置环境变量 ONNXRUNTIME_ROOT（官方 onnxruntime-win-x64-* 解压根目录）；在 edr-agent 仓库根执行。
+# 前提：已设置环境变量 ONNXRUNTIME_ROOT（官方 onnxruntime-win-x64-* 或 win-arm64-* 解压根目录）。
 $ErrorActionPreference = 'Stop'
 if (-not $env:ONNXRUNTIME_ROOT) {
     Write-Error "ONNXRUNTIME_ROOT is not set"

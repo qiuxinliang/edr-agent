@@ -1,6 +1,8 @@
 /* §5 AV Engine — 模型目录、扩展名过滤、文件指纹 */
 
 #include "edr/ave.h"
+#include "edr/edr_log.h"
+#include "edr/sha256.h"
 #include "ave_onnx_infer.h"
 
 #include <stdio.h>
@@ -151,6 +153,34 @@ static int find_behavior_onnx_path(const char *dir, char *out, size_t cap) {
   return behavior_onnx_exists(out) ? 1 : 0;
 }
 
+static int ave_env_truthy(const char *name) {
+  const char *v = getenv(name);
+  if (!v || !v[0]) {
+    return 0;
+  }
+  return strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0 ||
+         strcasecmp(v, "on") == 0;
+}
+
+static int should_preload_behavior_onnx(const EdrConfig *cfg) {
+#if !defined(EDR_WITH_AVE_BEHAVIOR_ONNX)
+  (void)cfg;
+  return 0;
+#else
+  if (ave_env_truthy("EDR_AVE_BEHAVIOR_PRELOAD")) {
+    return 1;
+  }
+  return cfg && cfg->ave.behavior_monitor_enabled;
+#endif
+}
+
+static int should_preload_static_onnx(const EdrConfig *cfg) {
+  if (ave_env_truthy("EDR_AVE_STATIC_PRELOAD")) {
+    return 1;
+  }
+  return cfg && cfg->ave.static_model_enabled;
+}
+
 int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
   if (!path || !path[0] || !out_hex || cap < 17u) {
     return -1;
@@ -159,15 +189,33 @@ int edr_ave_file_fingerprint(const char *path, char *out_hex, size_t cap) {
   if (!f) {
     return -1;
   }
-  uint8_t buf[256];
-  size_t n = fread(buf, 1, sizeof(buf), f);
-  fclose(f);
-  uint64_t h = 14695981039346656037ULL;
-  for (size_t i = 0; i < n; i++) {
-    h ^= (uint64_t)buf[i];
-    h *= 1099511628211ULL;
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  uint8_t buf[4096];
+  edr_sha256_init(&ctx);
+  for (;;) {
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    if (n > 0u) {
+      edr_sha256_update(&ctx, buf, n);
+    }
+    if (n < sizeof(buf)) {
+      if (ferror(f)) {
+        fclose(f);
+        return -1;
+      }
+      break;
+    }
   }
-  snprintf(out_hex, cap, "%016llx", (unsigned long long)h);
+  fclose(f);
+  edr_sha256_final(&ctx, digest);
+  static const char *hx = "0123456789abcdef";
+  size_t hex_chars = (cap - 1u < 64u) ? cap - 1u : 64u;
+  hex_chars -= hex_chars % 2u;
+  for (size_t i = 0; i < hex_chars / 2u; i++) {
+    out_hex[i * 2u] = hx[digest[i] >> 4];
+    out_hex[i * 2u + 1u] = hx[digest[i] & 0x0f];
+  }
+  out_hex[hex_chars] = '\0';
   return 0;
 }
 
@@ -175,39 +223,57 @@ EdrError edr_ave_init(const EdrConfig *cfg) {
   if (!cfg) {
     return EDR_ERR_INVALID_ARG;
   }
+  const char *en = getenv("EDR_AVE_ENABLED");
+  if (en && en[0] == '1') {
+    /* 显式启用 */
+  } else if (!cfg->ave.enabled && (!en || en[0] != '1')) {
+    EDR_LOGV("%s", "[ave] disabled by default, set EDR_AVE_ENABLED=1 to enable\n");
+    return EDR_OK;
+  }
   s_ready = 0;
   s_n_model = 0;
   s_n_files = 0;
   const char *dir = cfg->ave.model_dir;
   if (!dir || !dir[0]) {
-    fprintf(stderr, "[ave] model_dir 为空，跳过\n");
+    EDR_LOGV("%s", "[ave] model_dir empty, skip AVE scan init\n");
     return EDR_OK;
   }
   int n_model = 0, n_all = 0;
   scan_dir(dir, &n_model, &n_all);
   s_n_model = n_model;
   s_n_files = n_all;
-  fprintf(stderr, "[ave] model_dir=%s 模型扩展名命中=%d 非目录文件=%d sensitivity=%s threads=%d\n", dir,
-          n_model, n_all, cfg->ave.sensitivity, cfg->ave.scan_threads);
+  EDR_LOGV("[ave] model_dir=%s onnx_files=%d total_files=%d sensitivity=%s threads=%d\n", dir, n_model,
+           n_all, cfg->ave.sensitivity, cfg->ave.scan_threads);
   s_ready = n_model > 0 ? 1 : 0;
 
   char onnx_path[2048];
-  if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
-    EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
-    if (oe != EDR_OK) {
-      fprintf(stderr, "[ave] ONNX Runtime 加载失败 (%d)，推理将退回 dry-run / NOT_IMPL\n", (int)oe);
+  if (should_preload_static_onnx(cfg)) {
+    if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
+      EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
+      if (oe != EDR_OK) {
+        EDR_LOGE("[ave] ONNX Runtime load failed (%d); inference falls back to dry-run / NOT_IMPL\n",
+                 (int)oe);
+      }
+    } else {
+      (void)edr_onnx_runtime_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
+    EDR_LOGV("%s", "[ave] static.onnx preload skipped (static_model_enabled=false)\n");
   }
-  char beh_path[2048];
-  if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
-    EdrError be = edr_onnx_behavior_load(beh_path, cfg);
-    if (be != EDR_OK) {
-      fprintf(stderr, "[ave] behavior.onnx 加载失败 (%d)，行为分将使用启发式\n", (int)be);
+  if (should_preload_behavior_onnx(cfg)) {
+    char beh_path[2048];
+    if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
+      EdrError be = edr_onnx_behavior_load(beh_path, cfg);
+      if (be != EDR_OK) {
+        EDR_LOGE("[ave] behavior.onnx load failed (%d); behavior score uses heuristics\n", (int)be);
+      }
+    } else {
+      (void)edr_onnx_behavior_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
+    EDR_LOGV("%s", "[ave] behavior.onnx preload skipped (server-side gray eval / monitor disabled)\n");
   }
   return EDR_OK;
 }
@@ -221,19 +287,28 @@ EdrError edr_ave_reload_models(const EdrConfig *cfg) {
     return EDR_OK;
   }
   char onnx_path[2048];
-  if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
-    EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
-    if (oe != EDR_OK) {
-      fprintf(stderr, "[ave] reload static ONNX 失败 (%d)\n", (int)oe);
+  if (should_preload_static_onnx(cfg)) {
+    if (find_first_onnx_excluding_behavior(dir, onnx_path, sizeof(onnx_path))) {
+      EdrError oe = edr_onnx_runtime_load(onnx_path, cfg);
+      if (oe != EDR_OK) {
+        EDR_LOGE("[ave] reload static ONNX failed (%d)\n", (int)oe);
+      }
+    } else {
+      (void)edr_onnx_runtime_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_runtime_load(NULL, cfg);
+    EDR_LOGV("%s", "[ave] static.onnx preload skipped on reload\n");
   }
-  char beh_path[2048];
-  if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
-    EdrError be = edr_onnx_behavior_load(beh_path, cfg);
-    if (be != EDR_OK) {
-      fprintf(stderr, "[ave] reload behavior.onnx 失败 (%d)\n", (int)be);
+  if (should_preload_behavior_onnx(cfg)) {
+    char beh_path[2048];
+    if (find_behavior_onnx_path(dir, beh_path, sizeof(beh_path))) {
+      EdrError be = edr_onnx_behavior_load(beh_path, cfg);
+      if (be != EDR_OK) {
+        EDR_LOGE("[ave] reload behavior.onnx failed (%d)\n", (int)be);
+      }
+    } else {
+      (void)edr_onnx_behavior_load(NULL, cfg);
     }
   } else {
     (void)edr_onnx_behavior_load(NULL, cfg);
@@ -276,6 +351,8 @@ EdrError edr_ave_infer_file(const EdrConfig *cfg, const char *path, EdrAveInferR
   if (edr_onnx_runtime_ready()) {
     return edr_onnx_infer_file(cfg, path, out);
   }
-  fprintf(stderr, "[ave] infer 未实现（可设 EDR_AVE_INFER_DRY_RUN=1 联调；生产请 CMake -DEDR_WITH_ONNXRUNTIME=ON 并安装 ONNX Runtime）\n");
+  EDR_LOGE("%s",
+           "[ave] infer not implemented (set EDR_AVE_INFER_DRY_RUN=1 for dev; production: "
+           "CMake -DEDR_WITH_ONNXRUNTIME=ON and install ONNX Runtime)\n");
   return EDR_ERR_NOT_IMPL;
 }

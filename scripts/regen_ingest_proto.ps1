@@ -1,4 +1,5 @@
-# 在 Windows 上由 proto/edr/v1/ingest.proto 生成 C++ gRPC 桩到 src/grpc_gen/edr/v1/。
+# Archived EventIngest gRPC codegen. Product builds use HTTP ingest/control.
+# Set EDR_ALLOW_LEGACY_INGEST_GRPC_CODEGEN=1 only for archived research.
 # 须与最终链接的 libprotobuf 主版本一致：请传入与 CMake/vcpkg 同一 triplet 的 vcpkg_installed 根
 #（例如 .../vcpkg_installed/x64-windows），脚本会选用 tools\protobuf\protoc.exe 与 tools\grpc\grpc_cpp_plugin.exe。
 #
@@ -9,6 +10,10 @@ param(
   [string]$VcpkgInstalledX64 = $env:VCPKG_INSTALLED_X64
 )
 $ErrorActionPreference = "Stop"
+if ($env:EDR_ALLOW_LEGACY_INGEST_GRPC_CODEGEN -ne "1") {
+  Write-Error "EventIngest gRPC codegen is archived. Product path uses HTTP ingest/control. Set EDR_ALLOW_LEGACY_INGEST_GRPC_CODEGEN=1 only for archived research."
+  exit 2
+}
 $EdrRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $VcpkgInstalledX64 -or -not (Test-Path -LiteralPath $VcpkgInstalledX64)) {
   Write-Error "VcpkgInstalledX64 未指到 x64 安装根（如 .../vcpkg_installed/x64-windows），或设环境变量 VCPKG_INSTALLED_X64"

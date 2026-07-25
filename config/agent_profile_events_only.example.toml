@@ -1,9 +1,8 @@
-# P2 B3.1：一键 **events-only** 瘦配置模板（复制为 agent.toml 后改 server/tenant/路径）
+# P2 B3.1：一键 **events-only** 瘦配置模板（复制为 agent.toml 后改平台/tenant/路径）
 # 真源对表与模块说明见 docs/OPS_PROFILE_AND_RELEASE.md §B3.1 与根目录 agent.toml.example。
 
 [server]
-address              = "127.0.0.1:50051"
-grpc_insecure        = true
+address              = ""
 connect_timeout_s    = 10
 keepalive_interval_s = 30
 
@@ -11,7 +10,15 @@ keepalive_interval_s = 30
 endpoint_id          = "auto"
 tenant_id            = "tenant_default"
 
-# 不启用 [platform] / [attack_surface] — 无周期 REST/攻击面
+[platform]
+rest_base_url        = "http://127.0.0.1:8080/api/v1"
+report_events_v2_enabled = true
+data_plane_encoding  = "protobuf"
+data_plane_compression = "identity"
+control_stream_enabled = true
+long_poll_fallback   = true
+
+# 不启用 [attack_surface] — 仅保留事件上送与控制面
 
 [collection]
 etw_enabled          = true

@@ -17,8 +17,8 @@ FDSecurity — 本 zip / Inno 完整负载说明（与 package_bundled_layout.sh
 --------------------------------------------------------------
   • 证书 / IOC / 行为策略等可选 SQLite 库：由平台下发或你们基建放入 data\ 并在 agent.toml 中配置路径
   • 攻击面 GeoIP：GeoLite2-City.mmdb 等需自行放置并配置 geoip_db_path
-  • 若编译开启 YARA/webshell/专项规则：规则目录需按版本另发（本仓库默认未必含生产规则包）
-  • §17 Shellcode/WinDivert：依赖系统侧 WinDivert 驱动与 DLL，不在本 zip 内
+  • YARA 规则目录已随标准包交付：rules\forensic（yara_scan 取证规则）、rules\shellcode（协议层 exploit/shellcode）、rules\webshell（WebShell）。runtime DLL 与规则目录是两类资产：DLL 保证 libyara 引擎可用，规则目录提供签名内容；如平台下发新版规则，应按版本覆盖这些目录。
+  • §17 Shellcode/WinDivert（x64）：已随包交付官方签名 WinDivert.dll / WinDivert64.sys；首次由提升权限的 FDSensor 调用 WinDivertOpen 时按需安装驱动。许可证与来源记录在 licenses\。
   • 行为模型 / 联邦学习热修：端侧标准包不携带，后续如需仅通过服务端灰度能力处理
   • 真实 endpoint/tenant、API 地址、Token：由 enroll 或手工写入 agent.toml
 

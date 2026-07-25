@@ -14,12 +14,30 @@
 | 能力 | Windows | Linux（默认 `EDR_WITH_LINUX_COLLECTOR=ON`） | 其它 POSIX |
 |------|---------|-----------------------------------------------|------------|
 | 采集主路径 | ETW（内核三通道 + TDH + 扩展 Provider，见下文「ETW 增强」） | **M1**：inotify 文件事件（`collector_linux.c`）；进程/网络等 **§3.2** 见路线图 **P7** | `collector_stub` |
-| 预处理 / 批次 / gRPC 客户端 / Subscribe 指令 | 是 | 是 | 是 |
-| §19 攻击面 HTTP `POST` | 是（监听/出站路径最完整） | 是（依赖 `ss`/`curl` 等，见 §19 长段） | 同 Linux |
+| 预处理 / 批次 / HTTP ingest / control 指令 | 是 | 是 | 是 |
+| §19 攻击面 HTTP `POST` | 是（监听/出站路径最完整） | 是（监听/出站依赖 `ss`，上传复用系统组选定的内置 ingest HTTP 通信路线，见 §19 长段） | 同 Linux |
 | §17 WinDivert Shellcode | 是 | 否 | 否 |
 | §1.2 API / IAT 用户态 Hook | **本期不做**（**`docs/AGT004_API_MONITOR_DESCope.md`**，AGT-004 descope） | — | — |
 
-**AVE / ONNX 首次真推理（AGT-005）**：**[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**；一键脚本 **`scripts/onnx_local_stack_smoke.sh`**（`bash ./scripts/onnx_local_stack_smoke.sh`）。与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
+**AVE / ONNX 首次真推理（AGT-005）**：**[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**；一键脚本 **`scripts/onnx_local_stack_smoke.sh`**（`bash ./scripts/onnx_local_stack_smoke.sh`）。**行为链 / ingest 与 ORT 分工**见 **[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**；CI/本地**无模型**符号锚点 **`scripts/verify_ave_behavior_chain_invariants.sh`**。与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
+
+**平台 ingest → `alerts` 先验（WP-1，不依赖本机先跑 Agent）**：**[edr-backend/docs/WP1_ALERT_INGEST_E2E.md](../edr-backend/docs/WP1_ALERT_INGEST_E2E.md)**；脚本 **`edr-backend/scripts/verify_ingest_alert_e2e.sh`** / **`verify_ingest_alert_e2e.ps1`**。真机 P0/告警直出仍见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。
+
+**总线/预处理可运营（WP-2）**：**[docs/WP2_EVENT_BUS_PREPROCESS.md](docs/WP2_EVENT_BUS_PREPROCESS.md)**；环境档示例 **`config/profiles/wp2_lab_e2e.env.example`**、**`config/profiles/wp2_prod_default.env.example`**（见同目录 `README.md`）。
+
+**配置语义与启动 WARN（WP-3）**：**[docs/WP3_CONFIG_VALIDATION.md](docs/WP3_CONFIG_VALIDATION.md)**（`EDR_PLATFORM_REST_BASE` / `[platform].rest_base_url`、**`endpoint_id` / `tenant_id` 在启用平台 REST 时** 的误配提示）。
+
+**HTTP ingest 传输与 `EDR_EVENT_INGEST_SPLIT` 排障（WP-4）**：**[docs/WP4_HTTP_TRANSPORT_OPS.md](docs/WP4_HTTP_TRANSPORT_OPS.md)**（`[transport]` / `[ingest-http]`、回退与队列相关环境变量）。
+
+**规则工程化：母版 → 预处理 TOML + P0 IR + 版本对账（WP-5）**：**[docs/WP5_RULES_ENGINEERING.md](docs/WP5_RULES_ENGINEERING.md)**；预处理 **`[[preprocessing.rules]]`** 见 **`[docs/PREPROCESS_RULES.md](docs/PREPROCESS_RULES.md)`**（与 P0 包**并列**）。
+
+**批处理与上送「先量化再调参」（WP-6）**：**[docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md](docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md)**（`[upload]` / `EDR_AGENT_SHUTDOWN_LOG`、`EDR_TRANSPORT_SEND_QUEUE_CAP` 与 **shutdown** 指标）。
+
+**SQLite 离线队列与重试/退避（WP-7）**：**[docs/WP7_OFFLINE_QUEUE_RETRY.md](docs/WP7_OFFLINE_QUEUE_RETRY.md)**（`EDR_PERSIST_STRATEGY` / `EDR_PERSIST_QUEUE`、`EDR_QUEUE_*`、与 HTTP 补传）。
+
+**ETW/采集 profile 与 P0 合规底线（WP-8）**：**[docs/WP8_ETW_COLLECTION_PROFILE.md](docs/WP8_ETW_COLLECTION_PROFILE.md)**；合规基线环境示例 **`config/profiles/wp8_compliance_baseline.env.example`**（与 `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` 对表）。
+
+**行为回调、AVE 行为管线与 ingest 编码（WP-9）**：**[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**；stderr 在初始化成功后会有一行 **`[ave] on_behavior_alert=…`** 与 TOML 对表；**管道/本机构建目录** 与 **启动行** 可观测性见该文档 **§2.1**，环境档示例 **`config/profiles/wp9_behavior_ave.env.example`**（与 **WP-5/6/8** 分工不混谈）。
 
 ## 目录与 DDD 章节对应
 
@@ -34,14 +52,14 @@
 | `src/transport/event_batch.c` | §6.2 批次：`BAT1` 头 + 多帧 `u32le` 长度前缀 + wire 体；字节/条数上限见 §11 `upload` |
 | `src/ave/`、`include/edr/ave_sdk.h` | §5 AV Engine：`edr_ave_*` 与 09 文档对齐的 **`AVE_*` SDK**；`AVE_ScanFile` 含 **L1** 证书 Stage0、**L2/L3** 哈希白名单与 IOC（见 `docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`） |
 | `src/serialize/` | §6 事件序列化 |
-| `proto/edr/v1/ingest.proto`、`src/grpc_gen/edr/v1/*` | §7 `EventIngest`（`ReportEvents` / `Subscribe`）— **protobuf + grpc_cpp_plugin** 生成 |
-| `src/transport/grpc_client_impl.cpp` | §7 gRPC++ 客户端：mTLS、`ReportEvents`、后台 `Subscribe` |
-| `src/transport/` | §6.2 批次、`transport_stub` 统计与 gRPC 发送 |
+| `proto/edr/v1/ingest.proto` | §7 ingest 消息结构；运行链路已统一为 HTTP ingest / HTTPS control |
+| `src/transport/` | §6.2 批次、`transport_stub` 统计与 HTTP ingest 发送 |
 | `src/command/` | §8 响应指令执行器 |
 | `src/attack_surface/` | §19 `GET_ATTACK_SURFACE`：采集监听并 `POST` 平台 REST |
 | `src/self_protect/` | §9 自保护 |
 | `src/storage/queue_sqlite.c` | §10 SQLite `event_queue`（可选 `EDR_HAVE_SQLITE`） |
 | `src/config/` | §11 配置管理 |
+| `tools/edr_monitor.c`（`edr_monitor`） | §1.2 / §14 终端联调：读 `agent.toml`，对平台 REST `healthz`、`[ave]` 模型目录、`[offline]` 队列与 **edr_agent** 进程做黑盒探针（非进程内观测） |
 | `src/resource/` | §12 资源限制 |
 | `src/shellcode_detector/` | §17 协议层 Shellcode 检测（Windows：WinDivert + 可选 libyara；协议解析含 SMB/RDP/明文 HTTP） |
 | `src/webshell_detector/` | §18 Webshell 检测引擎（站点目录监控、专项规则匹配、告警入总线） |
@@ -54,22 +72,39 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ./build/edr_agent --help
 ./build/edr_agent --config agent.toml.example
+./build/edr_monitor --config agent.toml.example
+./build/edr_monitor --config agent.toml.example --json
 ```
 
-**首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。
+### 加速编译（Windows / Linux）
+
+- **对最终功能的影响**：在**相同 CMake 选项、相同 triplet/依赖**下，下述只缩短编链与 IO；**不**为「加速」单独关功能开关或改源码。杀软排除、盘符、vcpkg 二进制缓存、sccache 均为**环境/缓存层**。详见 Windows 专篇 **[docs/WINDOWS_BUILD_SPEED.md](docs/WINDOWS_BUILD_SPEED.md)**。
+- **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
+  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认安装产品主线依赖（HTTPS REST/SQLite 等）。`cmake --preset w-vcpkg-ninja-dev` 用于日常快编；需要带 static ONNX Runtime 与 YARA 的发版候选时用 **`w-vcpkg-ninja-ort-yara`** 并设置 `ONNXRUNTIME_ROOT`。历史 preset **`w-vcpkg-ninja-grpc-ort`** 仅保留为兼容别名，实际仍是 no-gRPC 构建。
+  - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
+  - **跨平台快编预设**：`any-ninja-fast-dev`（默认开 `EDR_ENABLE_COMPILER_CACHE=ON`），`any-ninja-fast-release-lto`（额外开 `EDR_ENABLE_IPO=ON`，工具链不支持时自动降级并告警）。
+- **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
+  `$env:VCPKG_BINARY_SOURCES="clear;files,$HOME\.vcpkg-bincache,readwrite"` 后再 `vcpkg install`，curl/OpenSSL/SQLite 等命中缓存时冷启动明显变短；或参考 **`scripts/vcpkg_binary_cache_env.example.ps1`**。CI 中已用 `VCPKG_BINARY_SOURCES` + 缓存目录，与本地思路一致。
+- **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须已进 **vcvars / x64 本机工具** 环境）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-client-release` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
+- **统一加速开关**（可显式覆盖）：`EDR_ENABLE_COMPILER_CACHE`（默认 `ON`，自动探测 `sccache` 优先于 `ccache`）、`EDR_ENABLE_UNITY_BUILD`（默认 `OFF`）、`EDR_ENABLE_IPO`（默认 `OFF`）。
+
+**终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、模型目录与离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
+
+**首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。从 **GitHub Release** 下载安装时，优先用 **`EDRAgentSetup-*.exe`（Windows）** 或 zip 内 **`install.sh`（Linux）**，见 **`docs/AGENT_INSTALLER.md`** 中「Release 一键安装」。
 
 **Windows 生产部署（服务账户、ETW/WinDivert 预检、`sc` 示例草案）**：见 **`docs/WINDOWS_DEPLOY.md`**（**AGT-006 已关闭**）；索引见 **`deploy/README.md`**。管理端 zip / MSI 流水线以 **edr-backend** 文档为准。
 
-**无 MSVC、仅验证 Windows 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、**gRPC/protobuf/vcpkg** 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查）。
+**无 MSVC、仅验证 Windows 目标能否编过**：在仓库内执行 **`./scripts/build_windows_mingw.sh`**（需 `x86_64-w64-mingw32-gcc` 在 `PATH` 中，或设置 **`MINGW_PREFIX`** 指向工具链根目录；来源可为 **MacPorts / 任意解压的 MinGW**，或 **docker / podman** 可用时自动执行 **`./scripts/build_windows_mingw_docker.sh`**（Ubuntu `apt` 安装 MinGW，**不经 Homebrew ghcr**；**Docker Desktop 异常**时可用 **Colima / Podman Machine** 等，见文档）。**Homebrew ghcr 超时或容器不可用**，见 **`docs/WINDOWS_CROSS_COMPILE.md`**（含 **终端编译注意要点**：保留 **`build-mingw/`** 等中间文件便于后查、MinGW 依赖与 vcpkg 维护）。产物在 **`build-mingw/`**，与 MSVC 二进制 ABI 不同，仅作编译期检查）。
 
-**本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；仅需 CMake 链路冒烟时可设 **`EDR_WITH_GRPC=OFF`**。
+**本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；产品主线不再编译端侧 gRPC 客户端，事件与控制面走 HTTPS REST/HTTP 长轮询。
 
-### CMake 与 gRPC 可选依赖
+### CMake 与传输 / 模型可选依赖
 
 | 选项 | 含义 |
 |------|------|
-| `EDR_WITH_GRPC`（默认 `ON`） | 为 `ON` 且系统能 `find_package(gRPC CONFIG)` 时，链接 **gRPC++** 与 **protobuf**，编译真实 `grpc_client_impl.cpp` 与 `src/grpc_gen/edr/v1/*.cc`。 |
-| `EDR_WITH_GRPC=OFF` | 不依赖 gRPC，改用 `grpc_client_stub.c`，进程仍可运行，上报与补传 RPC 恒为失败（返回码 `-1`）。 |
+| `EDR_WITH_GRPC` | 已废弃。设为 `ON` 会在 CMake 阶段失败；端侧产品构建统一使用 HTTPS REST ingest/control。 |
+| `EDR_WITH_INGEST_HTTPS_OPENSSL` | 启用 native HTTPS REST 上报路径；Windows 产品构建默认要求可用。 |
+| `EDR_WITH_HTTP2_CURL` / `EDR_REQUIRE_CURL_HTTP2` | 启用 libcurl HTTP/2 控制/上报能力；需要 curl headers 暴露 `CURL_VERSION_HTTP2`。 |
 | `EDR_WITH_LINUX_COLLECTOR`（默认 `ON`，**仅 Linux**） | 为 `ON` 时编入 `src/collector/collector_linux.c`；为 `OFF` 时在 Linux 上退回 `collector_stub.c`（与其它 POSIX 一致）。**Windows 不受影响**（始终使用 `collector_win.c`）。 |
 | `EDR_WITH_ONNXRUNTIME`（默认 `OFF`） | 为 `ON` 且能 `find_path`/`find_library` 找到 **ONNX Runtime**（头文件 `onnxruntime_c_api.h` 与 `libonnxruntime`）时，定义 **`EDR_HAVE_ONNXRUNTIME`**；主进程在 **`edr_agent_init`** 中通过 **`AVE_InitFromEdrConfig(&cfg)`**（见 `ave_sdk.h`）在 **`[ave] model_dir`** 下加载**首个** `.onnx` 做真推理；未找到库时 CMake **告警**并仍按无 ONNX 编译。可通过 **`ONNXRUNTIME_ROOT`** 指向解压的预编译包。**联调步骤**见 **[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**。 |
 
@@ -83,13 +118,13 @@ cmake --build build
 
 若 `etw_enabled = false`，不创建 inotify 线程（与 Windows 下不启 ETW 会话一致）。监视目录不存在或不可读时，启动会失败并打印 `[collector_linux]` 提示。
 
-若已安装 gRPC（如 macOS `brew install grpc`），CMake 会搜索 `/usr/local` 与 `/opt/homebrew`。**不要**在工程中再单独 `find_package(Protobuf)`，以免与 gRPC 自带的 Protobuf 目标冲突。
+**Windows 清单模式（`vcpkg.json`）**：仓库内声明产品主线依赖（curl/OpenSSL/SQLite/PCRE2 等），不再包含 `grpc-client` feature。CI 对 vcpkg 作浅克隆，**不**在清单里写过旧的 `builtin-baseline`（老 commit 可能缺 `versions/baseline.json` 与浅克隆不兼容）。若需钉死 port 版本，在**全量** vcpkg 克隆上执行 `vcpkg x-update-baseline` 后提交，并在 CI 中改为**非** `--depth 1` 的 vcpkg 克隆，或 `git fetch` 到该基线。
 
 ### §17 Shellcode 检测引擎（Windows）
 
 - 配置节 **`[shellcode_detector]`**（见 `agent.toml.example`），默认 **`enabled = false`**，不改变既有部署行为。
 - 已编译：**熵 / 启发式 / SMB2·SMB1·RDP·明文 HTTP 载荷区定位**（`proto_parse.c`；HTTPS/TLS 仍按原始字节启发式），单测 `test_shellcode`。
-- **WinDivert 闭环（初版）**：`windivert_capture.c` 从 **`%SystemRoot%\System32\WinDivert.dll`** **动态加载**（无需链接 `WinDivert.lib`），`SNIFF | RECV_ONLY` 捕获 TCP 端口集合；**`windivert_tcp_ports`** 为空时使用内置端口（SMB/RDP/WinRM/MSRPC/LDAP 等）；**非空**时为逗号分隔列表（如 `80,443,8443`），据此生成过滤器，且 **`monitor_smb` 等按类开关不再生效**（仅按列表匹配）。TCP 载荷经协议区段提取与启发式打分，**≥ `alert_threshold`** 时投递 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（ETW1，`prov=windivert`），预处理映射 **T1210**。
+- **WinDivert 闭环（x64）**：安装包随 **`FDSensor.exe`** 放置官方签名的 `WinDivert.dll` 与 `WinDivert64.sys`，`windivert_capture.c` 优先从该目录动态加载（兼容回退 `%SystemRoot%\System32`，无需链接 `WinDivert.lib`）。首次提升权限调用 `WinDivertOpen()` 时驱动按需安装。模块以 `SNIFF | RECV_ONLY` 捕获 TCP 端口集合；**`windivert_tcp_ports`** 为空时使用内置端口（SMB/RDP/WinRM/MSRPC/LDAP 等）；**非空**时为逗号分隔列表（如 `80,443,8443`），据此生成过滤器，且 **`monitor_smb` 等按类开关不再生效**（仅按列表匹配）。TCP 载荷经协议区段提取与启发式打分，**≥ `alert_threshold`** 时投递 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（ETW1，`prov=windivert`），预处理映射 **T1210**。
 - **已实现（Phase 2）**：优先使用 **libyara** 扫描已知漏洞规则（`yara_rules_dir` 指向规则目录，加载 `.yar/.yara`）；命中时以 `detector=yara` 和 `rule=<规则名>` 上报。若未安装 libyara 或目录未加载到规则，自动降级为内置匹配器（规则名保持一致：`EternalBlue_MS17_010` / `BlueKeep_CVE_2019_0708` / `PrintNightmare_CVE_2021_34527`）。默认规则文件见 `src/shellcode_detector/rules/known_exploits.yar`。
 - **P0（持续迭代）**：IPv6 五元组；**`windivert_tcp_ports`**；**单包或环形 PCAP**（`shellcode_ring_*.pcap`，EN10MB）；**SHA256 + 可选 preview_hex**；环形告警附 **`ring_*_ns` / `ring_trigger_slot`** 与 **`shellcode_json`** 行；**`heuristic_score_scale`** 调启发式灵敏度；**`yara_rules_reload_interval_s`** 热重载规则（libyara）；**`auto_isolate_threshold`** 仍为高优先级标记；**可选端上隔离**：`EDR_SHELLCODE_AUTO_ISOLATE=1` 或 **`auto_isolate_execute`** + 高危策略，与 **`isolate`** 同路径（每进程最多一次）。WinDivert 过滤器在**启动时**固定。**pcapng / 纯服务端编排隔离**等见 **`docs/WINDOWS_SHELLCODE_FORENSIC_TODO.md`**。
 
@@ -100,17 +135,17 @@ cmake --build build
 - 规则目录：`src/webshell_detector/rules/`（`php_webshell.yar`、`jsp_aspx_webshell.yar`），可通过 `[webshell_detector].webshell_rules_dir` 覆盖。
 - 若编译时找到 `libyara` 则优先用 YARA 引擎扫描；否则自动回退到内置关键模式匹配（保证功能可用）。
 - 命中后写入事件总线事件类型 `EDR_EVENT_WEBSHELL_DETECTED`，预处理映射 MITRE `T1505.003`。
-- 取证上传：`ingest.proto` 已扩展 `UploadFile(stream FileChunk)`；agent 命中后优先走 gRPC 流式上传（256KB 分片，首片携带 `sha256/file_size`），失败时自动回退到本地分层落盘（`webshell/{tenant}/{date}/{alert_id}/{filename}`）。
+- 取证上传：agent 命中后走 HTTP upload-file / artifact manifest；失败时自动回退到本地分层落盘（`webshell/{tenant}/{date}/{alert_id}/{filename}`）。
 
 **WinDivert 路径约定（本环境）**
 
 | 用途 | 路径 |
 |------|------|
-| 用户态 DLL（部署） | **`%SystemRoot%\System32\WinDivert.dll`**（例如 `C:\Windows\System32\WinDivert.dll`） |
-| 内核驱动（安装后） | 通常在 **`%SystemRoot%\System32\drivers\`** 下，名称形如 `WinDivert*.sys`（以实际安装为准） |
+| 用户态 DLL（部署） | **`<Agent 安装目录>\WinDivert.dll`**；仅兼容旧终端时回退 `%SystemRoot%\System32\WinDivert.dll` |
+| 内核驱动（安装包） | **`<Agent 安装目录>\WinDivert64.sys`**；官方 DLL 首次 `WinDivertOpen()` 时按需安装 |
 | 开发编译 | **`windivert.h` / `WinDivert.lib`** 仍来自官方 SDK 解压目录；CMake 可用 **`WINDIVERT_ROOT`** 指向该目录；**不要**指望 System32 里带有头文件与导入库 |
 
-运行期若从固定路径加载 DLL，可使用上述 System32 路径；需管理员权限与已正确安装的 WinDivert 服务/驱动。
+标准 x64 安装包已携带官方签名运行时与 LGPL/GPL 许可证；首次启用 Shellcode 检测的 Agent 必须具有管理员权限。ARM64 暂不提供该能力，因为官方 WinDivert 2.2.2 发布包没有 ARM64 驱动。
 
 ---
 
@@ -120,35 +155,66 @@ cmake --build build
 
 | 参数 | 说明 |
 |------|------|
-| `--config <path>` | 加载 TOML 配置文件；未指定则仅使用 `edr_config_apply_defaults` 内置默认值。 |
-| `--help` / `-h` | 打印用法。 |
+| （无参数） | 打印用法说明后退出。 |
+| `--config <path>` | 加载 TOML 配置文件；启动 Agent 时须指定（或依赖安装包/计划任务已写入的带 `--config` 的启动方式）。 |
+| `--help` / `-h` / `-help` / `/?` | 打印用法说明后退出。 |
+
+`edr_agent` 在 Windows 上执行 **`--help`** 或**无参数**时，帮助文本中会顺带说明 **Inno 安装包 `EDRAgentSetup.exe` 静默安装**时如何通过 **`/EDR_API_BASE=`**、**`/EDR_ENROLL_TOKEN=`**（或 **`/API=`**、**`/TOK=`**）传入平台与注册信息；细则见 **`docs/AGENT_INSTALLER.md`**（Release 一键安装 · Windows）。
 
 解析器为 **tomlc99**（`third_party/tomlc99`）。参考模板：**`agent.toml.example`**，可复制为 `agent.toml` 后修改。与 **platform + 前端 + 种子库** 对齐的联调示例见 **`agent.integration.toml`** 与仓库 **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`**。**Windows 真机行为 ONNX 端到端验收**见 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**。
 
-### `[server]` — gRPC 接入与 TLS
+### `[platform]` / `[server]` — 平台接入与历史兼容
 
 | 字段 | 说明 |
 |------|------|
-| `address` | gRPC 服务端地址，如 `host:50051`。为空则跳过 gRPC 初始化（仅本地统计/队列仍可用）。 |
-| `ca_cert` | PEM 路径：服务端/链校验用根或中间 CA。 |
-| `client_cert` / `client_key` | 客户端证书与私钥 PEM 路径；与 `ca_cert` 同时配置时走 **mTLS**。 |
-| `connect_timeout_s` | `ReportEvents` 单次 RPC 截止时间（秒），默认 10。 |
-| `keepalive_interval_s` | 通道 keepalive 间隔（秒），映射为 gRPC `GRPC_ARG_KEEPALIVE_TIME_MS`，默认 30。与平台「在线」判定见 **`docs/SOAR_CONTRACT.md` §4**（**§4.1** 终端；**§4.2** 平台契约与 **`T_offline`**；**后端实现见 §4.2.3**）。 |
+| `[platform].rest_base_url` | 平台 HTTP/HTTPS 基址；事件、控制、命令结果与取证产物都从这里派生。 |
+| `[server].address` | 历史 `server_addr` 兼容字段；新配置不应依赖它建立 EventIngest gRPC。 |
+| `[server].ca_cert` | PEM 路径：HTTPS 服务端/链校验用根或中间 CA。 |
+| `[server].client_cert` / `[server].client_key` | 客户端证书与私钥 PEM 路径；与 `ca_cert` 同时配置时走 HTTP ingest/control mTLS。 |
+| `[server].connect_timeout_s` | HTTP 请求/控制面单次交互超时参考值，默认 10。 |
+| `[server].keepalive_interval_s` | 历史兼容字段；当前在线语义以 HTTP heartbeat/control、`last_seen` 与平台 `T_offline` 为准。 |
 
 仅配置 `ca_cert`、不配客户端证书时，为**单向 TLS**（校验服务端），与完整 mTLS 不同。
 
-`POST /api/v1/enroll` 返回的 `server_addr` 语义应与 `server.address` 一致（即 **Agent gRPC 接入地址**，不是 REST 基址）。平台当前解析优先级为：
+#### 本地用 **mkcert** 跑通 TLS / mTLS（本机/内网联调）
 
-1. 租户 `features.grpcServerAddress`
-2. `ENROLL_PUBLIC_SERVER_ADDR`
-3. `PUBLIC_API_BASE`（URL 会规范化为 `host[:port]`）
-4. `127.0.0.1:8443`（兜底）
+1. 安装并信任本机 **CA**（各环境一次）  
+   - **macOS**：`brew install mkcert nss`（Firefox 用 nss），然后 `mkcert -install`  
+   - **Windows**（或 PowerShell）：[mkcert 发布页](https://github.com/FiloSottile/mkcert/releases) 下可执行档；`choco install mkcert` 亦可。执行 `mkcert -install`，把**本地根 CA** 加进本机受信任区。
+
+2. 为平台 HTTPS 监听地址**签发**证书（名字需与 `rest_base_url` 里的 **host** 能对应上；多个名字写在一行里）：  
+   ```text
+   mkcert localhost 127.0.0.1 192.168.1.35
+   ```  
+   会生成如 `localhost+2.pem` / `localhost+2-key.pem`（**服务端** 给平台进程挂 TLS 用）。
+
+3. 若要做 **mTLS**（与 `client_cert` / `client_key` 对应），**再**签一套**客户端** 证书与私钥：  
+   ```text
+   mkcert -client edr-endpoint-1
+   ```  
+   会生成如 `edr-endpoint-1-client.pem` / `edr-endpoint-1-client-key.pem`（**Agent 侧**）。
+
+4. **根 CA 路径** 给 TOML 的 `ca_cert`（所有 mkcert 证书都由它签发，校验链正确）：  
+   - `mkcert -CAROOT` 会打印目录，其中 `rootCA.pem` 即常用填给 `ca_cert` 的 PEM。  
+5. 在 `agent.toml` 中配：  
+   - `ca_cert` = 上述 `rootCA.pem`  
+   - `client_cert` / `client_key` = 第 3 步的客户端 PEM（**单向 TLS** 可只设 `ca_cert` + 服务端，不配客户端两项）。
+
+平台侧 HTTPS 服务需加载第 2 步的**服务端**证书/私钥；**CN/SAN 与 Agent 所连的 host 一致**即可。若使用其它能导出 PEM 的工具，只要**根 CA、服务端、（可选）客户端**与上述 TOML 项对应即可。
+
+`POST /api/v1/enroll` 返回的 `server_addr` 是历史兼容字段；当前接入主路径使用 `[platform].rest_base_url`。平台当前解析优先级为：
+
+1. 租户 `features.agentServerAddress` / `serverAddress` / `publicApiBase` / `rest_base_url`
+2. 租户历史字段 `features.grpcServerAddress`（只读兼容，不再由前端写入）
+3. `ENROLL_PUBLIC_SERVER_ADDR`
+4. `PUBLIC_API_BASE`（URL 会规范化为 `host[:port]`）
+5. `127.0.0.1:8443`（兜底）
 
 ### `[agent]`
 
 | 字段 | 说明 |
 |------|------|
-| `endpoint_id` | 上报与 `Subscribe` 使用的端点标识。 |
+| `endpoint_id` | 上报、控制和结果回传使用的端点标识。 |
 | `tenant_id` | 租户标识（预留，随配置传给后续逻辑）。 |
 
 ### `[ave]` — ONNX、L1 证书 Stage0、L2/L3 哈希抑制
@@ -185,35 +251,75 @@ cmake --build build
 - `collection.max_event_queue_size`：事件总线槽数。
 - `preprocessing.*`：去重窗口、高频阈值、白名单采样等；**`[[preprocessing.rules]]`** 可配置路径/命令行等 **子串规则**（`drop` / `emit_always`），在 dedup 之前匹配，**条数无 64 条硬顶**（堆分配），详见 **`docs/PREPROCESS_RULES.md`**。
 - `collection.etw_enabled`（仅 Windows）：是否启用 ETW 采集；`false` 可关闭 ETW。
+- `collection.etw_*_provider`（仅 Windows，**A4.3**）：除 **Kernel-Process / Kernel-File / Kernel-Network / Kernel-Registry** 为 mandatory 外，**DNS-Client、PowerShell、Security-Auditing、WMI、TCPIP、WFAS** 各有独立布尔（`agent.toml.example`）；默认 **true**。**关**某 Provider 会缩内核/解析负载，**须与** `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` **对表**，避免 P0 漏报。
 
 ### 环境变量索引（运行时）
 
 | 变量 | 说明（详情见下文对应章节） |
 |------|---------------------------|
-| `EDR_GRPC_INSECURE` | `=1` 时使用非加密 gRPC（仅调试）。 |
 | `EDR_QUEUE_PATH` | 覆盖 TOML 中的 `offline.queue_db_path`。 |
 | `EDR_PERSIST_QUEUE` | `=1` 且策略为 **always** 时，flush 同时将批次写入 SQLite。 |
-| `EDR_PERSIST_STRATEGY` | `always`（默认）或 `on_fail`：见「SQLite」与「gRPC」小节。 |
+| `EDR_PERSIST_STRATEGY` | `always`（默认）或 `on_fail`：见「SQLite」与 HTTP 补传小节。 |
 | `EDR_QUEUE_MAX_RETRIES` | 单条补传最大重试次数，默认 `100`；`0` 表示不限制。 |
 | `EDR_QUEUE_MAX_DB_MB` | 队列库文件大小上限（MB，粗粒度 `stat`），超出则拒绝新入队；未设置则不限制。（当前非 Windows 生效） |
 | `EDR_BEHAVIOR_ENCODING` | 见「Protobuf（nanopb）」：`protobuf` / `protobuf_c` / 默认 BER1。 |
-| `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / forensic**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
+| `EDR_BEHAVIOR_USER_SUBJECT_JSON` | 若设为以 `{` 开头的 JSON 串且长度 < 1KiB，行为告警触发时写入 **`AVEBehaviorAlert.user_subject_json`**，经 ingest 入平台 `alerts.user_subject_json`（**调试用/专线**；与 `edr-backend` 000057 对账）。 |
+| `EDR_P0_DIRECT_EMIT` | `=0` 时禁用 P0 直出；**默认启用**（未设置或设置为1），见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。 |
+| `EDR_P0_DEDUP_SEC` | P0 直出对同一 `(rule_id,endpoint_id,pid)` 的**秒级去重**；默认 `2`；`0` 关。 |
+| `EDR_P0_MAX_EMITS_PER_MIN` | P0 直出**全进程**滑动 60s 内条数上限；`0` 或未设=不限制。 |
+| `EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT` | 按 **tenant_id** 独立滑动 60s 内条数上限；**默认 60/分**；`0` 为关闭**每租户**限流（仍受上项全局限制，若有）。`tenant_id` 空串视为同桶。 |
+| `EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT` | 按 **endpoint_id** 独立滑动 60s 内条数上限；**默认 0=关闭**；与上两项叠加。`endpoint_id` 空串同桶。 |
+| （编译期）`EDR_P0_RULES_BUNDLE_VERSION` | 由 **CMake** `-D` / 默认串 注入 `p0_rule_direct_emit.c`，须与 `config/p0_rule_bundle_manifest.json`、**`p0_rule_bundle_ir_v1.json`** 及平台 `dynamic_rules_v1.json` 根 `version` **一致**；发版前跑 **`edr-backend/scripts/verify_p0_bundle_version_alignment.sh`**（四处对账）。 |
+| （CMake）`EDR_P0_IR_EMBED` | 默认 **ON**（需 **Python3**）：构建时从 `config/p0_rule_bundle_ir_v1.json` 生成 `edr_p0_rule_ir_embed.c` 并入链接；运行期**先**读外置 JSON（`EDR_P0_IR_PATH` / `edr_config/`），读失败或**无可求值** P0 规则时再 **回退** 到嵌入字节。`p0_rule_bundle_ir_v1` 中 `event_type` 与 Go `dynamicrules` 同构（如 `process_create` / `file_write` / `network_connect` / `registry_set`）。设为 **OFF** 可跳过生成（无 Python 的极简环境）。 |
+| （开发）P0 C 对拍 | 改 `p0_golden_vectors.json` 后 **`python3 edr-agent/scripts/gen_p0_golden_vectors_inc.py`**（**仅** `process_create` 写入 `p0_golden_vectors_data.inc`；其它 event 由 Go 金线 + **`edr_p0_ir_record_golden_test`** 覆盖，需 **PCRE2**）。`ctest -R edr_p0_` 或跑 `edr_p0_golden_test` / `edr_p0_ir_record_golden_test`。无 PCRE2 时 PC 行仍 **legacy** 与 Go 对拍。 |
+| （开发）A4.1 总线 | **`ctest -R test_event_bus_mpmc_stress`** 或 **`bash scripts/run_event_bus_mpmc_stress.sh`**；长 soak 见 `docs/OPS_PROFILE_AND_RELEASE.md` 与测试源 `tests/test_event_bus_mpmc_stress.c`（`[ms] [producers] [cap]`）。 |
+| （monorepo）合并前**推荐** | 仓库根 **`bash edr-backend/scripts/recommended_p0_pr_gates.sh`**：六段**机读**（version、金线、TDH try-order、ETW1 槽文本、**A2.3 P3 UserData 十六进制金体**、**Go P0 manifest**）。`edr-agent` **CI** Ubuntu **precheck** 与上式 **6/6** 一致（另含 preprocess gray-release 预检）。全量 B2.4 留档用 **`bash edr-backend/scripts/collect_p0_b24_evidence.sh`** 或一键 **`bash edr-backend/scripts/p0_pack_machine_gates.sh`**。 |
+| `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` | 任一为 `1` 时允许 **kill / isolate / restore_host / forensic / RTR 文件与 eventlog/registry / quarantine / rtr_shell**；亦可由 TOML **`[command] allow_dangerous = true`** 固定策略（环境变量优先于未设置项）。 |
 | `EDR_CMD_KILL_ALLOWLIST` | 若设置（逗号分隔 PID 列表），**kill** 仅允许终止列表内进程（仍须先满足高危策略）；未设置则不限制 PID。 |
 | `EDR_CMD_AUDIT_PATH` | 若设置，高危指令审计**追加**写入该文件（带时间戳）；stderr 仍会打印 `[command][audit]`。 |
-| `EDR_SOAR_REPORT_ALWAYS` | `=1` 时对**每条**指令尝试 gRPC **`ReportCommandResult`**（即使无 `soar_correlation_id`）；默认仅在下发含编排字段时上报。 |
-| `EDR_ISOLATE_HOOK` | 若设置，`isolate` 在写标记后执行 `system(hook)`（POSIX 下会 `setenv("EDR_CMD_ID", …)`）。 |
-| `EDR_SHELLCODE_AUTO_ISOLATE` | `=1` 时，若已允许高危指令且 WinDivert 分数 ≥ **`auto_isolate_threshold`**，执行与 **`isolate`** 相同的标记 + **`EDR_ISOLATE_HOOK`**（每进程最多一次）。亦可由 TOML **`[shellcode_detector] auto_isolate_execute = true`** 开启（仍须高危策略）。 |
+| `EDR_COMMAND_SIGNING_PUBLIC_KEY_PATH` / `EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH` | 生产命令验签公钥 PEM 路径；启用后高危外部命令优先要求 `idempotency_key=<idem>\|sigv2\|ed25519\|<key_id>\|<base64url_sig>`。也可用 TOML `[command] signing_public_key_path`。 |
+| `EDR_COMMAND_SIGNING_PUBLIC_KEY` / `EDR_COMMAND_VERIFY_PUBLIC_KEY` | 生产命令验签公钥 PEM 文本；支持 `\n` 转义。优先级高于公钥路径。 |
+| `EDR_COMMAND_ACCEPT_LEGACY_HMAC` | 配置公钥后是否临时接受旧 `sigv1` HMAC，`=1` 仅用于灰度迁移。 |
+| `EDR_COMMAND_SIGNING_KEY` | 旧版 HMAC 签名密钥；未配置公钥时仍可兼容 `idempotency_key=<idem>\|sigv1\|<key_id>\|<hmac>`。 |
+| `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` | `=1` 时允许多数高危命令无签名执行，仅用于本地调试；**不适用于 `rtr_shell`**。 |
+| `EDR_COMMAND_STATE_DB` | 覆盖本地命令状态库 JSONL 路径，用于幂等、重启恢复与结果追踪。 |
+| `EDR_RTR_SHELL_ALLOWLIST` | `rtr_shell` 必填白名单，逗号分隔首 token，如 `whoami,hostname,ipconfig,tasklist,netstat,dir`；该指令始终要求生产签名、`issued_at_unix_ms`、`deadline_ms` 与签名化 `idempotency_key`，不受 `EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS` 放行。 |
+| `EDR_RTR_SHELL_MAX_TIMEOUT_SEC` | `rtr_shell` 本地最大执行秒数，默认 `60`，硬上限 `300`；payload 的 `timeout_sec` 会被钳制到该值和 SOAR deadline 剩余时间。 |
+| `EDR_RTR_SHELL_BLOCKLIST` | `rtr_shell` 追加本地 blocklist 关键字；默认已拒绝破坏性命令、控制操作符、重定向、管道与常见 PowerShell 编码执行形态。 |
+| `EDR_SOAR_REPORT_ALWAYS` | `=1` 时对**每条**指令尝试 HTTP **`ReportCommandResult`**（即使无 `soar_correlation_id`）；默认仅在下发含编排字段时上报。 |
+| `EDR_ISOLATE_MODE` | 隔离执行模式。**默认 `enforce`**：真实施加 OS 网络隔离（无 `EDR_ISOLATE_HOOK` 时自动调用随包脚本 `windows_isolate_host.ps1` / `linux_isolate_host.sh`），enforcement 失败则**报失败并不留标记**（不再谎报）。`=stamp`：旧行为，仅写隔离标记（+可选 hook），供依赖外部驱动读取标记的部署。 |
+| `EDR_ISOLATE_HOOK` | 若设置,`isolate` 用它作为**自定义 enforcement**(`system(hook)`,POSIX 下先 `setenv("EDR_CMD_ID", …)`);优先于随包脚本。返回非零=隔离失败。 |
+| `EDR_RESTORE_HOOK` / `EDR_ISOLATE_RESTORE_HOOK` | 若设置，`restore_host` 用它撤销隔离；否则 enforce 模式下自动调用随包脚本的 `Remove`/`remove`。 |
+| `EDR_ISOLATE_SCRIPT` | 覆盖随包隔离脚本路径;默认在 agent 可执行同目录或其 `scripts/` 下查找 `windows_isolate_host.ps1`（Win）/ `linux_isolate_host.sh`（Linux）。 |
+| `EDR_ISOLATE_ALLOW_REMOTE_ADDRS` / `EDR_ISOLATE_ALLOW_REMOTE_PORTS` | 隔离时放行的管理服务器 IP/CIDR 与端口（默认端口 `443,50051`）。**未设置时 agent 自动用后端 rest_base 解析出的 IP 与端口填充**,确保隔离后 agent↔后端 管理通道仍可达（否则收不到 `restore_host`，主机将永久失联）。 |
+| `EDR_RANSOM_CANARY_PATH` / `EDR_RANSOM_CANARY_PATH_FILE` | 勒索 Canary 的**每设备唯一完整路径**，或逐行列出路径的文件；未配置时不启用确定性 Canary，普通 `canary.docx` 等文件不会触发 P0。旧 `EDR_RANSOM_CANARY_TOKENS*` 也仅按完整路径精确匹配。 |
+| `EDR_RANSOM_AUTO_ISOLATE` | `=1` 且高危策略开启时，确认勒索后执行端侧网络隔离；默认关闭，失败按 `EDR_RANSOM_AUTO_ISOLATE_MAX_ATTEMPTS` / `EDR_RANSOM_AUTO_ISOLATE_RETRY_S` 重试，并通过 `cmd_auto_ransom_*` 回传结果。 |
+| `EDR_RANSOM_AUTO_TERMINATE` | `=1` 且自动隔离已开启时，先终止确认事件归属的进程并确认其退出；默认关闭，受 `EDR_CMD_KILL_ALLOWLIST`、自保护 PID 保护和高危策略约束。 |
+| `EDR_SHELLCODE_AUTO_ISOLATE` | `=1` 时，若已允许高危指令且 WinDivert 分数 ≥ **`auto_isolate_threshold`**，执行与 **`isolate`** 等价的隔离（每进程最多一次）。亦可由 TOML **`[shellcode_detector] auto_isolate_execute = true`** 开启（仍须高危策略）。 |
 | `EDR_CONFIG_RELOAD_S` | 非 `0` 时每隔 N 秒检测配置文件 mtime，变更则热更 **preprocessing + resource_limit + self_protect**（见 §11.2 初版）。 |
-| `EDR_REMOTE_CONFIG_URL` | 若与 **`EDR_REMOTE_CONFIG_POLL_S`**（秒，≥1）同时设置，则周期性用 **`curl`** 下载 TOML 到临时文件并 **`edr_config_load`**，再应用 **preprocessing + resource_limit + self_protect**（**不**重连 gRPC / 不重初始化传输层，需重启进程才能对齐证书与批次参数）。URL 勿含未转义引号（Windows `cmd` 限制）。 |
+| `EDR_REMOTE_CONFIG_URL` | 若与 **`EDR_REMOTE_CONFIG_POLL_S`**（秒，≥1）同时设置，则周期性用 **`curl`** 下载 TOML 到临时文件并 **`edr_config_load`**，再应用 **preprocessing + resource_limit + self_protect**（**不**重初始化传输层，需重启进程才能对齐证书与批次参数）。URL 勿含未转义引号（Windows `cmd` 限制）。 |
 | `EDR_REMOTE_CONFIG_POLL_S` | 与上一项配合：轮询间隔秒数；未设置或 `0` 则禁用远程拉取。 |
 | `EDR_AVE_INFER_DRY_RUN` | `=1` 时 **`edr_ave_infer_file`** 不调用真实后端，返回占位 **`EdrAveInferResult`**（集成测试/联调；生产应启用 **`EDR_WITH_ONNXRUNTIME`** 并勿依赖此项）。 |
 | `EDR_AVE_ONNX_IN_LEN` | （可选）ONNX 输入含**动态长度**轴时，用作该轴默认元素个数（默认 **4096**）；需与模型一致。 |
+| `EDR_AVE_ETW_FEED` | **仅 Windows**：`=0` 关闭 ETW→`AVE_FeedEvent`；默认开。`AVE_NotifyProcessExit` 仍随进程结束上报。见 **`Cauld Design/EDR_P0_Field_Matrix_Signoff.md`（A3）**。 |
+| `EDR_AVE_ETW_FEED_EVERY_N` | **仅 Windows、仅 AVE**：`N>1` 时对**非** `PROCESS_TERMINATE` 的 `AVE_FeedEvent` 做 1/**N** 分频，**不**影响 TDH 建槽与总线。用于行为 ONNX/启发式**减负**；与 P0 规则/漏报策略 **会签** 后启用。`N=1` 或未设置=全量。 |
+| `EDR_AVE_ETW_ASYNC` | **仅 Windows、仅 AVE、默认关**（A3.2 大全套）：`1` 或 `true`/`yes` 时，非 terminate 事件 `AVE_FeedEvent` 先入队（**256 槽**）再经**单工作线程**调用，与 TDH/入总线**解耦**；`PROCESS_TERMINATE` 仍**同步** `AVE_NotifyProcessExit`。**队列满**时回退**同回调线程同步** `AVE_FeedEvent`，不丢项。可与此表上一行**叠加**分频。 |
+| `EDR_ETW_BUFFER_KB` | **仅 Windows**：覆盖 `[collection] etw_buffer_kb`，实时 ETW 会话每缓冲 **KB**（4–1024，缺省 64）。与内核侧丢包/驻留有关；调参见 A4.2 / `docs/OPS_PROFILE_AND_RELEASE.md`。 |
+| `EDR_ETW_FLUSH_TIMER_S` | **仅 Windows**：覆盖 `[collection] etw_flush_timer_s`，`FlushTimer` **秒**（1–300，缺省 1）。 |
+| `EDR_TDH_LIGHT_PATH` | **仅 Windows、A3.3 首版**：`1`/`y` 时，**Microsoft-Windows-DNS-Client** 在已解出 `qname` 时**不**再拉 `QueryType`；未解出时与关时相同走全量 `dns_try`。缺省/未设/`0` = 与旧版一致（始终试 qname+qtype）。依赖 `qtype` 的规则在开启时可能无 `qtype` 行。 |
+| `EDR_TDH_LIGHT_PATH_PS` | **仅 Windows、A3.3+（会签 v1.1+ / 白名单 建议）**：`1`/`y` 时，**Microsoft-Windows-PowerShell** 先只试 `ScriptBlockText`；若**未**解出 `script` 行再全量 `ScriptBlockText`+`Path`（与关时相同）。仅 `path` 的 P0 在「有 script 行」时可能**少** `path` 行，须与 [`EDR_P0_Field_Matrix_Signoff`](../Cauld%20Design/EDR_P0_Field_Matrix_Signoff.md) 附录对表。 |
+| `EDR_TDH_LIGHT_PATH_TCPIP` | **仅 Windows、A3.3+ P1 扩面（默认关）**：`1`/`y` 时，**Microsoft-Windows-TCPIP** 且 **EventId=1002**（监听/绑定类）**先** 试 `LocalAddress` / `LocalPort` / `PID` 子集，**任一线条未产生槽文本** 再回退**全** `tcpip_try`。其它 EventId 行为不变。会签/P0 对表后启用；与 `EDR_TDH_LIGHT_PATH`（DNS）/ `EDR_TDH_LIGHT_PATH_PS` 独立。 |
+| `EDR_A44_SPLIT_PATH` | **仅 Windows、A4.4 第二期**（**默认关**）：`1`/`y` 时，ETW 回调在 `UserData` ≤32KiB 且 `ExtendedDataCount==0` 时**有界 入队**；**解线程** 再跑与 `edr_collector_tdh_to_bus` 等价的 `Tdh* → 入总线`。`ExtendedData` 或 超长 走**同线程**同步解。队满时 `a44_q_drops` 累计并**同线程**重试、**不**丢。与 `EDR_A44_CB_PHASE_MEAS` 可叠。见 [ADR A4.4](../Cauld%20Design/ADR_A4.4_ETW_Receive_Path_Decouple.md) **§5**。 |
+| `EDR_A44_CB_PHASE_MEAS` | **仅 Windows、A4.4 第一期**：`1`/`y` 时在 `EventRecordCallback` 对 **pre-TDH**（map+AVE+slot 初始化）、`edr_tdh_build_slot_payload`、`edr_event_bus_try_push` 三段**分别**做 QPC 纳秒累计；在 **`EDR_ETW_OBS=1` 的 `[etw_obs]` 行**末尾追加 `a44_us_avg[pre,tdh,bus]=[…] a44_n=[…]`（**各段** 平均 us 与样本数，bus 段仅非空载荷）。**不**开 `EDR_ETW_OBS` 时仍累加、但不打印。见 Cauld [`ADR_A4.4`](../Cauld%20Design/ADR_A4.4_ETW_Receive_Path_Decouple.md)。多 Provider 早返扩面见 [`EDR_A3.3_P1_Light_Path_Expansion`](../Cauld%20Design/EDR_A3.3_P1_Light_Path_Expansion.md)。 |
+| `EDR_ETW_OBS` | **仅 Windows**：`=1`（或 `y`/`Y`）时，在 **`EDR_CONSOLE_HEARTBEAT_SEC` 同周期** 的 `[heartbeat]` 后多打一行 `[etw_obs]`（累计：非本机 ETW 回调、按 `prov` tag 分桶、`edr_tdh_build_slot_payload` 空载荷次数、总线 `push`/`drop`/占用、`TdhGetProperty*` API 错误与行成功、粗 `err%`）。**A1.2 同机基线 10+ min 步骤**见 `scripts/etw_observability_baseline.sh` 与 **[`Cauld Design/EDR_A1.2_ETW_Observability_Baseline.md`](../Cauld%20Design/EDR_A1.2_ETW_Observability_Baseline.md)**；TDH 回归范围见 **`../Cauld Design/EDR_A2.3_TDH_Regression_Coverage.md`**；**B3.1 / D1.1 简表**见 `docs/OPS_PROFILE_AND_RELEASE.md`。 |
+| `EDR_ETW_OBS_EXPORT_PATH` | **仅 Windows、P2**：在 **`EDR_ETW_OBS=1` 时** 将**同一条** `[etw_obs]` 行以追加方式写入该路径（ASCII/UTF-8 路径；`fopen` 失败时 stderr 提示一次并关镜像）。便于本机/共享盘上由 **log shipper** 外送。 |
 | `EDR_RESOURCE_STRICT` | `=1` 时即使 `cpu_limit_percent` &lt; 5 也做 CPU 监控（否则跳过以免默认 1% 刷屏）。 |
 | `EDR_SELF_PROTECT_WATCHDOG` | `=1` 时周期性 stderr 心跳（极粗看门狗）；与 TOML **`[self_protect] watchdog_log_interval_s`** 可并存。 |
 | `EDR_SELF_PROTECT_PIDFILE` | 若设置，启动时写入当前 PID（退出时尝试 `remove`）；便于外部进程管理。 |
 | `EDR_FORENSIC_OUT` | 取证输出根目录；未设置时 **POSIX** 默认 `/tmp/edr_forensic`，**Windows** 默认 **`%TEMP%\\edr_forensic`**。 |
 | `EDR_FORENSIC_COPY_PATHS` | `=1` 时按 payload **每行一个路径**复制到作业目录（POSIX：**`open`/`read`/`write`**；Windows：**`CopyFileA`**；`#` 行与空行忽略）。 |
-| `EDR_ISOLATE_STAMP_PATH` | 隔离标记文件路径；未设置时 POSIX 默认 `/tmp/edr_isolated_<command_id>`，Windows 默认 **`%TEMP%\\edr_isolated_<command_id>`**。 |
+| `EDR_ISOLATE_STAMP_PATH` | 隔离标记文件路径；未设置时 POSIX 默认 `/tmp/edr_isolated.state`，Windows 默认 **`%TEMP%\\edr_isolated.state`**。 |
+| `EDR_UPLOAD_OUTBOX_DIR` / `EDR_COMMAND_OUTBOX_DIR` | 覆盖取证/RTR artifact 上传失败后的本地 outbox 路径，后续指令到达时会自动重试。 |
 | `EDR_PLATFORM_REST_BASE` | 覆盖 **`[platform].rest_base_url`**；攻击面 **`POST`** 的 API 前缀（无尾斜杠）。未设置且 TOML 未配时，指令仍成功结束但不发起 HTTP（结果 detail 含 `skip_no_rest_base`）。 |
 | `EDR_PLATFORM_BEARER` | 可选 JWT，作为 **`Authorization: Bearer …`**（优先于 **`[platform].rest_bearer_token`**）。 |
 | `EDR_WIN_LISTEN_CACHE_TTL_MS` | **（Windows）** 覆盖 **`[attack_surface].win_listen_cache_ttl_ms`**：监听表 **`edr_win_listen_collect_rows`** 进程内缓存 TTL（毫秒）。`0` 表示关闭缓存；未设置则沿用 TOML/默认。 |
@@ -221,11 +327,17 @@ cmake --build build
 | `EDR_ATTACK_SURFACE_ETW_LIGHT` | `=1` 且 **`etw_tcpip_wf`** 触发时，快照 **`snapshotKind=listenersOnly`**（不采集出站 `ss`/系统策略查询，缩短 ETW 洪峰路径延迟）。 |
 | `EDR_ATTACK_SURFACE_LISTENERS_ONLY` | `=1` 时，任意 **`edr_attack_surface_execute`** 均使用 **`listenersOnly`** 快照（调试用）。 |
 
-**系统级网络隔离（nft / 防火墙）**：客户端不内置 nft 规则；将运维脚本路径设为 **`EDR_ISOLATE_HOOK`**（如对某接口 `nft add rule … drop`），由 **`isolate`** 在写标记后调用；配合 **`EDR_CMD_AUDIT_PATH`** 留痕。
+**系统级网络隔离（nft / 防火墙）**：`isolate` **默认 `enforce`**，施加真实 OS 网络隔离——
+- **Windows**：随包 `scripts/windows_isolate_host.ps1`（Defender 防火墙默认 Block in/out + 放行管理服务器，原 profile 存盘供 `restore_host` 恢复）；
+- **Linux**：随包 `scripts/linux_isolate_host.sh`（nftables 优先 / iptables 回退：默认 drop + 放行 loopback、已建立连接、DNS、管理服务器）。
 
-**SOAR 协议契约**：编排字段（`soar_correlation_id`、`playbook_run_id` 等）在 **`CommandEnvelope`** 中下发；执行结束后终端调用 **`ReportCommandResult`** 回传状态。详见 **`docs/SOAR_CONTRACT.md`**。**§19 攻击面** 详设 §19.4/§19.5（调度 / gRPC 示例）与当前 **REST + `curl` POST** 的差异见 **`docs/ATTACK_SURFACE_DESIGN_ALIGNMENT.md`**；gRPC **`ReportSnapshot`** 后续接入步骤见 **`docs/ATTACK_SURFACE_GRPC.md`**。
+隔离前 agent **自动放行后端管理通道**（解析 rest_base 的 host→IP 注入 `EDR_ISOLATE_ALLOW_REMOTE_ADDRS`），保证仍能收到 `restore_host`。需自定义 enforcement 时设 **`EDR_ISOLATE_HOOK`**（优先于随包脚本）。仅依赖外部驱动读取隔离标记的旧部署可设 **`EDR_ISOLATE_MODE=stamp`** 退回纯标记。enforcement 失败时 `isolate` **报失败且不留标记**（不再谎报）；全程配合 **`EDR_CMD_AUDIT_PATH`** 留痕。
 
-**§19 攻击面快照（`GET_ATTACK_SURFACE`）**：Subscribe 指令类型 **`GET_ATTACK_SURFACE`** / `get_attack_surface` / `REFRESH_ATTACK_SURFACE` 时，Agent 组装与控制台 **GET** `/api/v1/endpoints/:id/attack-surface` 同形的 **camelCase JSON**，通过 **`curl`** 执行 **`POST`** `{rest_base}/endpoints/{endpoint_id}/attack-surface`。**Linux**：监听来自 **`ss -ltnp`**（含 **tcp6** 行；解析同时支持「`LISTEN` 起头」与「`tcp/tcp6 LISTEN`」两种列布局），出站 **`ss -tanp state established`**（**含 IPv6**，不再使用 `-4`）；IPv6 私网/链路本地与 v4 一致参与 **`suspiciousEgressCount`/`riskTag`** 启发式。**Windows**：监听枚举在 **`listen_table_win.c`**（**`edr_win_listen_collect_rows`**），底层 **`GetExtendedTcpTable` / `GetExtendedUdpTable`**（**IPv4+IPv6** / `TCP_TABLE_OWNER_PID_LISTENER` / `UDP_TABLE_OWNER_PID`），进程内 **TTL 缓存**（默认 **2000 ms**，**`[attack_surface].win_listen_cache_ttl_ms`** / **`EDR_WIN_LISTEN_CACHE_TTL_MS`**；`0` 关闭缓存）供 §19 与 §21 PMFE 共用；出站来自 **`GetExtendedTcpTable`**（**IPv4+IPv6** `TCP_TABLE_OWNER_PID_CONNECTIONS`，ESTAB=**5**）；IPv6 见 **`edr_asurf_win_ipv6_to_string` / `edr_asurf_win_bind_scope_v6`**；进程短名由 **`QueryFullProcessImageNameA`**；共享辅助见 **`attack_surface_win_util.c`**；协议字段 **`tcp`/`udp`/`tcp6`/`udp6`**。另：**`edr_attack_surface_refresh_pending`** 对 **`GET {rest_base}/endpoints/{id}/attack-surface/refresh-request`** 轮询（同权限头），与控制台 **POST …/attack-surface/refresh** 排队联动。需 **`[platform].rest_base_url`**（无尾斜杠，如 `http://127.0.0.1:8080/api/v1`）或环境变量 **`EDR_PLATFORM_REST_BASE`** 覆盖；可选 **`EDR_PLATFORM_BEARER`** 或 TOML **`rest_bearer_token`**。请求携带 **`X-Tenant-ID`**（`[agent].tenant_id`）、**`X-User-ID`**（默认 `edr-agent`）、**`X-Permission-Set: endpoint:attack_surface_report`**。`[agent].endpoint_id` 为 **`auto`** 时拒绝上报（避免写错路径）。链接 **`ws2_32` `iphlpapi`**（CMake 已加）。
+> 真机验证清单（无法在构建机替做）：① 在 Win/Linux 端点从前端触发 `isolate`，确认除管理通道外网络被阻断、agent 仍在线并能收 `restore_host`；② `restore_host` 后防火墙/profile 完整恢复；③ 后端按 IP 不可达时,先用 `EDR_ISOLATE_DRY_RUN=1` 预演脚本规则；④ Windows ps1 在 PowerShell 5.1+、Linux sh 需 root + nft 或 iptables。
+
+**SOAR 协议契约**：编排字段（`soar_correlation_id`、`playbook_run_id` 等）在 **`CommandEnvelope`** 中下发；执行结束后终端调用 **`ReportCommandResult`** 回传状态。详见 **`docs/SOAR_CONTRACT.md`**。**§19 攻击面** 手动刷新主路径已收敛到平台 HTTP command outbox 下发 **`REFRESH_ATTACK_SURFACE`**，Agent 执行后复用系统组选定的内置 ingest HTTP 通信路线回传快照（是否 HTTP/2 由传输配置决定）；`refresh-request` 仅保留兼容路径。设计差异见 **`docs/ATTACK_SURFACE_DESIGN_ALIGNMENT.md`**。
+
+**§19 攻击面快照（`GET_ATTACK_SURFACE` / `REFRESH_ATTACK_SURFACE`）**：平台通过现有 Agent command 通道下发 **`GET_ATTACK_SURFACE`** / `get_attack_surface` / `REFRESH_ATTACK_SURFACE` 时，Agent 组装与控制台 **GET** `/api/v1/endpoints/:id/attack-surface` 同形的 **camelCase JSON**，并通过 **`edr_ingest_http_post_json_suffix`** 执行 **`POST`** `{rest_base}/endpoints/{endpoint_id}/attack-surface`，复用 REST base、租户/用户/权限头、bearer、CA/mTLS、proxy 以及系统组选定的 HTTP/HTTP2/fallback 传输配置；不再 shell out 外部 `curl`。该手动命令路径**不检查** **`[attack_surface].enabled`**，`enabled` 仅控制启动自动快照、周期快照、ETW/config reload 触发和旧 `refresh-request` 轮询。**Linux**：监听来自 **`ss -ltnp`**（含 **tcp6** 行；解析同时支持「`LISTEN` 起头」与「`tcp/tcp6 LISTEN`」两种列布局），出站 **`ss -tanp state established`**（**含 IPv6**，不再使用 `-4`）；IPv6 私网/链路本地与 v4 一致参与 **`suspiciousEgressCount`/`riskTag`** 启发式。**Windows**：监听枚举在 **`listen_table_win.c`**（**`edr_win_listen_collect_rows`**），底层 **`GetExtendedTcpTable` / `GetExtendedUdpTable`**（**IPv4+IPv6** / `TCP_TABLE_OWNER_PID_LISTENER` / `UDP_TABLE_OWNER_PID`），进程内 **TTL 缓存**（默认 **2000 ms**，**`[attack_surface].win_listen_cache_ttl_ms`** / **`EDR_WIN_LISTEN_CACHE_TTL_MS`**；`0` 关闭缓存）供 §19 与 §21 PMFE 共用；出站来自 **`GetExtendedTcpTable`**（**IPv4+IPv6** `TCP_TABLE_OWNER_PID_CONNECTIONS`，ESTAB=**5**）；IPv6 见 **`edr_asurf_win_ipv6_to_string` / `edr_asurf_win_bind_scope_v6`**；进程短名由 **`QueryFullProcessImageNameA`**；共享辅助见 **`attack_surface_win_util.c`**；协议字段 **`tcp`/`udp`/`tcp6`/`udp6`**。另：**`edr_attack_surface_refresh_pending`** 对 **`GET {rest_base}/endpoints/{id}/attack-surface/refresh-request`** 轮询（同权限头），仅用于兼容旧控制台排队信号。需 **`[platform].rest_base_url`**（无尾斜杠，如 `http://127.0.0.1:8080/api/v1`）或环境变量 **`EDR_PLATFORM_REST_BASE`** 覆盖；可选 **`EDR_PLATFORM_BEARER`** 或 TOML **`rest_bearer_token`**。请求携带 **`X-Tenant-ID`**（`[agent].tenant_id`）、**`X-User-ID`**（默认 `edr-agent`）、**`X-Permission-Set: endpoint:attack_surface_report`**。`[agent].endpoint_id` 为 **`auto`** 时拒绝上报（避免写错路径）。链接 **`ws2_32` `iphlpapi`**（CMake 已加）。
 
 **监听端口 `riskLevel` / `riskReason`（启发式）**：`attack_surface_report.c` 按 **`scope`**（`public` / `lan` / `loopback`）、绑定是否为全网卡（`0.0.0.0`、`::`、`*`、`[::]`）、端口是否命中内置敏感端口表或 **`[attack_surface].high_risk_immediate_ports`**，为 **`listeners.items[]`** 可选写入 **`riskLevel`（1–3）** 与英文 **`riskReason`**（与控制台 UI 字段对齐）；**`loopback`** 默认不写入风险字段。
 
@@ -233,29 +345,26 @@ cmake --build build
 
 ---
 
-## gRPC / mTLS 使用说明（§7）
+## HTTP ingest / control 使用说明（§7）
 
 ### 行为概要
 
-- **`ReportEvents`**：每次批次 flush 时，将 **12 字节批次头 + 载荷**（BAT1 或 BLZ4，见 §6.2）作为 `payload` 上报，并带 `batch_id`（幂等）、`endpoint_id`、`agent_version`。
-- **`upload.max_upload_mbps`**：在 `ReportEvents` 发送前对**本批 wire 字节数**（头+体）做**令牌桶**节流（`0` = 不限制；默认 `1` Mbps）；与失败退避独立，二者可能叠加等待。
-- **`Subscribe`**：独立后台线程向服务端发起**服务端流**；流断开后按 **500ms 起指数退避（上限 60s）** 自动重连。收到 `CommandEnvelope` 时调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`），并传入 **SOAR 扩展字段**（`EdrSoarCommandMeta`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `kill` / `forensic` 在启用高危策略时执行（见环境变量与 **`[command] allow_dangerous`**）。**健康/自保护（只读）**：`self_protect_status` / `agent_health` / `health_status`，返回调试器与事件总线占用等。**AVE（§5）联动**：`ave_status` / `ave_fingerprint`（`ave_fp`）/ `ave_infer`，payload 为 `{"path":"..."}`（`ave_status` 可空）；`main` 在 **`edr_agent_init`** 后调用 **`edr_command_bind_config`**，供 `ave_infer` 使用当前 `EdrConfig`。详见 **`docs/SOAR_CONTRACT.md`**（**§5.2** 平台 gRPC 注册现状与 mock）。执行结束后，若含编排关联或 **`EDR_SOAR_REPORT_ALWAYS=1`**，则 **`ReportCommandResult`** 回传。**`forensic`** 在 Windows 上同样写 manifest、可选 `copy`、`tar` 打 **`bundle.tgz`**（依赖 **`tar.exe`**）。
-- **`ReportCommandResult`**： unary，上报 **`CommandExecutionResult`**（状态、exit_code、detail、完成时间等）；与 **`ReportEvents` 事件批次**相互独立。详见 **`docs/SOAR_CONTRACT.md`**。
-- **`ReportEvents` 失败退避**：连续失败后，下一次 RPC 前在持锁侧做 **50ms～5s** 的指数退避（减轻对不可用服务端的冲击）。
-- 通道参数：`GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS` / `MAX_RECONNECT_BACKOFF_MS` 已设置，便于底层重连。
-- 进程退出前会关闭通道并打印 **`[grpc] rpc_ok=… rpc_fail=…`**，以及 **`[command] handled=… unknown=…`**。
+- **`ReportEvents`**：每次批次 flush 时，将 **12 字节批次头 + 载荷**（BAT1 或 BLZ4，见 §6.2）作为 `payload` 通过 `POST /api/v1/ingest/report-events` 上报，并带 `batch_id`（幂等）、`endpoint_id`、`agent_version`。
+- **`upload.max_upload_mbps`**：在 HTTP 上报前对**本批 wire 字节数**（头+体）做**令牌桶**节流（`0` = 不限制；默认 `1` Mbps）；与失败退避独立，二者可能叠加等待。
+- **Control**：Agent 通过 HTTPS control / long-poll fallback 获取 `CommandEnvelope`，持久化后发送 received-ack，再调用 **`edr_command_on_envelope`**（`src/command/command_stub.c`）。指令类型含 `noop` / `ping` / `echo`；`isolate` / `restore_host` / `kill` / `forensic` / `rtr_get_file` / `rtr_rm_file` / `eventlog_view` / `registry_query` 在启用高危策略和生产签名后执行；`rtr_shell` 是最后兜底能力，额外强制签名、端侧 allowlist、timeout、审计和本地状态库闭环（见环境变量与 **`[command] allow_dangerous`**）。详见 **`docs/SOAR_CONTRACT.md`**。
+- **`ReportCommandResult`**：通过 `POST /api/v1/ingest/report-command-result` 上报 **`CommandExecutionResult`**（状态、exit_code、detail、完成时间等）；与事件批次相互独立。
+- **失败退避**：连续失败后，下一次 HTTP 上报前做 **50ms～5s** 的指数退避（减轻对不可用服务端的冲击）。
+- 进程退出前会打印 HTTP ingest/control 统计，以及 **`[command] handled=… unknown=…`**。
 
 ### 环境变量
 
 | 变量 | 说明 |
 |------|------|
-| `EDR_GRPC_INSECURE=1` | **仅用于开发/内网调试**：在缺少有效 PEM 路径时使用 **非加密** gRPC 通道；生产环境应配置证书并勿设置此项。 |
+| `[platform].rest_base_url` / `EDR_PLATFORM_REST_BASE` | 平台 HTTP/HTTPS 基址；事件、控制与取证产物都从这里派生。 |
 
-未配置任何证书且未设置 `EDR_GRPC_INSECURE=1` 时，客户端会跳过 gRPC 连接并打印提示（仍可运行进程）。
+### `ingest` 消息代码
 
-### 重新生成 `ingest` 桩代码
-
-若修改了 `proto/edr/v1/ingest.proto`，执行 **`./scripts/regen_ingest_proto.sh`**（或手动用 `protoc` + `grpc_cpp_plugin` 生成至 `src/grpc_gen/edr/v1/`）。**protobuf 主版本**须与链接的 `libprotobuf` 一致。
+`EventIngest` gRPC 代码生成脚本已经归档，默认不会生成或启用 gRPC 桩。若修改 `proto/edr/v1/ingest.proto`，只应更新当前 HTTP 链路仍使用的消息结构。
 
 ---
 
@@ -271,18 +380,18 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 |------|------|
 | `EDR_QUEUE_PATH` | 若设置且非空，**优先于** TOML 中的 `offline.queue_db_path`，作为队列库文件路径。 |
 | `offline.queue_db_path` | 未设置 `EDR_QUEUE_PATH` 时使用；均未设置时 `edr_storage_queue_open` 默认打开当前目录下 **`edr_queue.db`**。 |
-| `EDR_PERSIST_QUEUE=1` | 与 **`EDR_PERSIST_STRATEGY=always`**（或未设置策略）配合：每次 flush 将完整 wire **INSERT**（与当次 gRPC 成败无关）。 |
-| `EDR_PERSIST_STRATEGY` | **`always`**（默认）：见上，需 `EDR_PERSIST_QUEUE=1`。**`on_fail`**：flush 时**不写**库；仅在 **`ReportEvents` 失败**且队列已打开时，由传输层把该批写入队列（适合「平时不落盘、失败才缓存」）。 |
+| `EDR_PERSIST_QUEUE=1` | 与 **`EDR_PERSIST_STRATEGY=always`**（或未设置策略）配合：每次 flush 将完整 wire **INSERT**（与当次 HTTP 成败无关）。 |
+| `EDR_PERSIST_STRATEGY` | **`always`**（默认）：见上，需 `EDR_PERSIST_QUEUE=1`。**`on_fail`**：flush 时**不写**库；仅在 HTTP `ReportEvents` 失败且队列已打开时，由传输层把该批写入队列（适合「平时不落盘、失败才缓存」）。 |
 
 ### 库内数据格式
 
-- 表中 `payload` 存 **§6.2 完整 wire：`12` 字节头 + 体**（与 `ReportEvents` 的 `payload` 一致），便于 **`edr_storage_queue_poll_drain`** 直接调用 `edr_grpc_client_send_batch` 补传。
+- 表中 `payload` 存 **§6.2 完整 wire：`12` 字节头 + 体**（与 `ReportEvents` 的 `payload` 一致），便于 **`edr_storage_queue_poll_drain`** 直接调用 HTTP ingest 补传。
 - 字段 `compressed` 仅作记录；`retry_count` 在补传失败时递增。
 
 ### 出队补传行为
 
 - 在**预处理线程**中周期性调用 `edr_storage_queue_poll_drain()`（与入队同线程，无需额外线程锁）。
-- 约 **每 200ms** 最多尝试一轮；单轮内连续成功最多 **32** 条；若某次 **gRPC 失败**，则对该行 `retry_count++` 并**结束本轮**（避免在不可用通道上狂重试）。
+- 约 **每 200ms** 最多尝试一轮；单轮内连续成功最多 **32** 条；若某次 HTTP 上传失败，则对该行 `retry_count++` 并**结束本轮**（避免在不可用通道上狂重试）。
 - 成功上传后删除对应行；**`retry_count` 达到 `EDR_QUEUE_MAX_RETRIES`（默认 100，`0` 表示不限制）** 时丢弃该条并打日志（死信式处理）。
 - **无法识别魔数**的旧数据（仅历史 body、无 12 字节头）会打日志后删除，避免堵塞队列。
 
@@ -294,8 +403,8 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 
 ## 运行与日志
 
-- 退出时 stderr 汇总含：`wire_events`、`batches`、`batch_lz4`、`batch_timeout_flushes`、`bus_hw80`、`bus_dropped`、去重丢弃、`queue_pending` 等；若启用 gRPC，另有 **`[grpc] rpc_ok` / `rpc_fail`** 与 **`[command] handled` / `unknown`**。
-- 启动时若配置了 `server.address`，`[transport] gRPC target: …` 会打印目标地址；随后由 gRPC 客户端按证书或 `EDR_GRPC_INSECURE` 建立通道。
+- 退出时 stderr 汇总含：`wire_events`、`batches`、`batch_lz4`、`batch_timeout_flushes`、`bus_hw80`、`bus_dropped`、去重丢弃、`queue_pending`、HTTP 上报统计与 **`[command] handled` / `unknown`**。
+- 启动时若配置了 `[platform].rest_base_url`，传输层会打印 HTTP ingest/control 目标；旧 `server.address` 只作为兼容字段读取。
 - 成功加载配置文件路径时，stderr 会打印 **`[config] fingerprint=…`**（FNV-1a 十六进制）；热重载成功后再打一行 **`热重载 fingerprint=…`**。
 
 **Linux**（且 `EDR_WITH_LINUX_COLLECTOR=ON`，默认）编入 `collector_linux.c`：**inotify** 监视目录（默认 `/tmp` 或 `EDR_INOTIFY_PATHS`），产出**文件侧**事件（`ETW1\nprov=inotify…`），**无**进程创建/网络等内核级等价流。**其它非 Windows**（如 macOS）仍为 **`collector_stub`**。在 **Windows** 上构建时自动编译 `src/collector/collector_win.c`：创建实时 ETW 会话、启用 **Kernel-Process / Kernel-File / Kernel-Network** 三通道（§3.1.1），并按配置启用 **§19.10** 的 **Microsoft-Windows-TCPIP** / **WFAS 防火墙** Provider（见「ETW 增强」）；独立线程 `OpenTrace` + `ProcessTrace`，回调中过滤本进程 PID 并写入事件总线。
@@ -307,6 +416,7 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 - 运行时库：`third_party/nanopb`（`pb_encode.c`、`pb_common.c`），定义 `EDR_HAVE_NANOPB`。
 - 生成文件：`src/proto/edr/v1/event.pb.h`、`event.pb.c`（由 `proto/edr/v1/event.proto` + `event.options` 生成）。
 - 重新生成：`chmod +x scripts/regen_event_proto.sh && ./scripts/regen_event_proto.sh`（需 Python3，且建议 `pip install protobuf` 与系统 `protoc` 主版本一致，否则 nanopb 生成器可能报错）。
+- **发版前（产品 / 工程约定）**：须在 **CI 或本地与发版机一致的** `protoc` + `protobuf`（Python）版本下重生成 `event.pb.{h,c}` 后再出包；**禁止**手工改 `event.pb.*` 与 `event.proto` 长期不一致。涉及 **`process_chain_depth`（`BehaviorEvent` 字段 14）** 的链深检测在 **非 Windows 端**可能不填，平台规则侧见 `edr-backend` 的 `README_dynamic_rules_v1.md` / `INGEST_EVENT_PAYLOAD.md`。
 - 编码 API：`edr_behavior_record_encode_protobuf()`（`include/edr/behavior_proto.h`）。
 - 默认预处理仍输出 **BER1 线格式**；设置环境变量 `EDR_BEHAVIOR_ENCODING=protobuf` 时尝试 nanopb；`protobuf_c` 时调用 `edr_behavior_record_encode_protobuf_c()`（当前与 nanopb **同一套 protobuf 二进制**，可与 `libprotobuf-c` 解包兼容；若需原生 `*_pack`，见 `third_party/protobuf-c/README_EDR.txt` 与 `scripts/regen_event_proto_c.sh`）；失败则回退 BER1。
 
@@ -326,7 +436,7 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 
 1. **核心**：事件总线背压策略（§2.3；**AGT-002 已关闭**：`event_bus.h` 说明当前为互斥环形队列，stderr 汇总 `bus_hw80`/`bus_dropped`）；配置加载（§11）已有 TOML 子集与运行时接入。
 2. **采集**：Windows ETW Provider 表（§3.1.1）；Linux eBPF CO-RE 与降级（§3.2）。
-3. **预处理 → 上报**：与 protobuf / gRPC 对齐 §6–§7（**Subscribe→指令分发**、队列策略与补传、RPC 退避已具备初版）。
+3. **预处理 → 上报**：与 protobuf / HTTP ingest 对齐 §6–§7（control→指令分发、队列策略与补传、HTTP 退避已具备初版）。
 4. **指令与自保护**：见下方「P1–P6 落地」；**P7 Linux 采集**仍排期在最后。
 
 ---
@@ -335,18 +445,18 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 
 | 模块 | 状态 |
 |------|------|
-| §6–§7 批次上报、gRPC、mTLS、Subscribe 重连、指令入口 | 已接通初版 |
+| §6–§7 批次上报、HTTP ingest/control、mTLS、指令入口 | 已接通初版 |
 | §10 队列 always/on_fail、补传、重试上限、库大小上限 | 已接通初版（Windows 下 MSVC 用 `_stat64` 检查库大小） |
 | **P1 §8** | **深化**：`kill` / `isolate` / `forensic`（POSIX/Windows 路径与产物、**`EDR_FORENSIC_COPY_PATHS`**、**`EDR_CMD_AUDIT_PATH`**、**`EDR_ISOLATE_HOOK`**）；TOML **`[command] allow_dangerous`**；**`EDR_CMD_KILL_ALLOWLIST`**；**Windows** 下 **kill** 拒绝本进程；**`self_protect_status` / `agent_health` / `health_status`**。 |
 | **P2 §9** | **深化**：**`SIGTERM` / `SIGINT`**、**`EDR_SELF_PROTECT_PIDFILE`**、**`EDR_SELF_PROTECT_WATCHDOG`**；**防调试**（`[self_protect] anti_debug`）、**事件总线背压**告警（`event_bus_pressure_warn_pct`）、可选 **Windows Job Object**（`job_object_windows`）、**`watchdog_log_interval_s`**、**`edr_self_protect_format_status`**。 |
 | **P3 §12** | **初版**：`getrusage` 粗算 CPU%、RSS 与 `resource_limit` 比对；`cpu_limit<5%` 且未设 **`EDR_RESOURCE_STRICT=1`** 时不刷屏。**AGT-010**：**`edr_resource_preprocess_throttle_active()`** — 超限时预处理 **跳过低优先级**（`priority!=0`，且非 `attack_surface_hint`）；**Windows** 无 rusage 时可设 **`EDR_PREPROCESS_THROTTLE=1`** 联调。 |
-| **P4 §5** | **深化**：模型目录统计 + **`edr_ave_file_fingerprint`**；**`edr_ave_infer_file`** 占位（未接 ONNX 时返回 **`EDR_ERR_NOT_IMPL`**；**`EDR_AVE_INFER_DRY_RUN=1`** 可走通联调）；**gRPC Subscribe** 指令类型 **`ave_status` / `ave_fingerprint` / `ave_infer`** 与 **`edr_command_bind_config`** 联动。 |
-| **P5 §11.2** | **深化**：本地 mtime 热重载 + **`EDR_REMOTE_CONFIG_URL` / `EDR_REMOTE_CONFIG_POLL_S`** 心跳拉 TOML（依赖 **curl**）；指纹日志；**未**热更 gRPC 证书/批次参数。 |
+| **P4 §5** | **深化**：模型目录统计 + **`edr_ave_file_fingerprint`**；**`edr_ave_infer_file`** 占位（未接 ONNX 时返回 **`EDR_ERR_NOT_IMPL`**；**`EDR_AVE_INFER_DRY_RUN=1`** 可走通联调）；control 指令类型 **`ave_status` / `ave_fingerprint` / `ave_infer`** 与 **`edr_command_bind_config`** 联动。 |
+| **P5 §11.2** | **深化**：本地 mtime 热重载 + **`EDR_REMOTE_CONFIG_URL` / `EDR_REMOTE_CONFIG_POLL_S`** 心跳拉 TOML（依赖 **curl**）；指纹日志；**未**热更传输证书/批次参数。 |
 | **P6** | **ctest**：`edr_agent --help`、**`ave_file_fingerprint`**、**`ave_infer_dry_run`**、**`config_fingerprint`**、**`shellcode_modules`**、**`edr_agent_smoke`**（`scripts/agent_smoke.sh` 启动进程后 SIGINT）；**`scripts/ci_build.sh`**、**`.github/workflows/edr-agent-ci.yml`**（**macOS / Ubuntu / Windows**）。 |
 | §3 采集 | **Windows**：ETW 内核三通道 + TDH + 扩展 Provider（见上文「ETW 增强」）。**Linux**：**M1 inotify** 文件事件（`collector_linux.c`）；**进程/网络等 §3.2 级采集** 仍属 **P7（eBPF CO-RE）**。**其它 POSIX**：`collector_stub`。 |
 | §1.2 API / IAT 监控层 | **本期 descope**（**`docs/AGT004_API_MONITOR_DESCope.md`**）；主路径为 **ETW → 总线 → 预处理**。 |
 | Windows 服务 / 权限预检（§1.1 / §13） | **已关闭 AGT-006**（**`docs/WINDOWS_DEPLOY.md`**、**`deploy/README.md`**）；MSI/平台打包见 **edr-backend**。 |
-| §7 连接保活 / 控制台「在线」 | **已关闭 AGT-007**：终端 **gRPC keepalive**（**`docs/SOAR_CONTRACT.md` §4.1**）；平台 **`T_offline` 与在线语义**（**§4.2**）；**落库与控制台 API** 在 **edr-backend**（**§4.2.3**）。 |
+| §7 连接保活 / 控制台「在线」 | **已关闭 AGT-007**：终端 heartbeat/control 与平台 **`T_offline` 在线语义**（**`docs/SOAR_CONTRACT.md` §4**）；**落库与控制台 API** 在 **edr-backend**（**§4.2.3**）。 |
 | §2.1 线程 / 主循环 | **已关闭 AGT-003**（**`docs/AGENT_THREAD_MODEL.md`**）。 |
 | §12 资源 / 预处理降载 | **已关闭 AGT-010**（预处理 **`priority`** 降载 + **`resource.h`**）；**`README`** 本表 **P3 §12**。 |
 | 取证 UploadFile E2E | **已关闭 AGT-009**（**`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**；`forensic` bundle 上传续见 **WINDOWS_SHELLCODE_FORENSIC_TODO**）。 |

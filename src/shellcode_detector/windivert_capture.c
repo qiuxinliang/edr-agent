@@ -1,5 +1,5 @@
 /**
- * §17 WinDivert：从 %SystemRoot%\System32\WinDivert.dll 动态加载，SNIFF+RECV_ONLY，
+ * §17 WinDivert：优先从 Agent 安装目录加载，兼容回退 %SystemRoot%\System32，SNIFF+RECV_ONLY，
  * TCP payload → proto_parse + 启发式，达阈值则写入事件总线（ETW1 载荷）。
  */
 #if !defined(_WIN32)
@@ -12,15 +12,20 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <wincrypt.h>
 
 #include "edr/command.h"
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
+#include "edr/flow_dedup.h"
 #include "edr/proto_parse.h"
+#include "edr/resource.h"
 #include "edr/shellcode_known.h"
 #include "edr/shellcode_detector.h"
+#include "edr/tcp_reassembly.h"
+#include "edr/transport_v2.h"
 #include "edr/types.h"
 
 #include "windivert_abi.h"
@@ -33,6 +38,9 @@
 #ifndef CALG_SHA_256
 #define CALG_SHA_256 0x0000800c
 #endif
+#ifndef IMAGE_FILE_MACHINE_ARM64
+#define IMAGE_FILE_MACHINE_ARM64 0xAA64
+#endif
 
 /** libpcap LINKTYPE (per tcpdump.org linktypes) */
 #define EDR_PCAP_LT_IPV4 228u
@@ -42,18 +50,20 @@
 /** 环形槽：ts_ns(8) + stored_len(4) + is_v6(4) + payload[max] */
 #define EDR_RING_SLOT_HDR 16u
 
-static const char kWdDllPath[] = "%SystemRoot%\\System32\\WinDivert.dll";
+static const wchar_t kWdDllName[] = L"WinDivert.dll";
 
 static const char kWdFilter[] =
     "tcp and ("
     "tcp.DstPort == 445 or tcp.DstPort == 139 or "
     "tcp.DstPort == 3389 or "
     "tcp.DstPort == 5985 or tcp.DstPort == 5986 or "
+    "tcp.DstPort == 443 or tcp.DstPort == 8443 or "
     "tcp.DstPort == 135 or "
     "tcp.DstPort == 389 or tcp.DstPort == 636 or tcp.DstPort == 3268 or tcp.DstPort == 3269 or "
     "tcp.SrcPort == 445 or tcp.SrcPort == 139 or "
     "tcp.SrcPort == 3389 or "
     "tcp.SrcPort == 5985 or tcp.SrcPort == 5986 or "
+    "tcp.SrcPort == 443 or tcp.SrcPort == 8443 or "
     "tcp.SrcPort == 389 or tcp.SrcPort == 636 or tcp.SrcPort == 3268 or tcp.SrcPort == 3269"
     ")";
 
@@ -72,11 +82,32 @@ static PFN_WinDivertSetParam s_setparam;
 static PFN_WinDivertHelperParsePacket s_parse;
 
 static HANDLE s_handle = INVALID_HANDLE_VALUE;
-static HANDLE s_thread;
+#define EDR_WD_MAX_THREADS 4u
+static HANDLE s_capture_thread;
+static HANDLE s_scan_threads[EDR_WD_MAX_THREADS];
+static uint32_t s_thread_count = 1u;
+static CRITICAL_SECTION s_lock;
+static int s_lock_init;
+static CRITICAL_SECTION s_scan_lock;
+static int s_scan_lock_init;
+static CRITICAL_SECTION s_detection_lock;
+static int s_detection_lock_init;
 static volatile LONG s_capture_stop;
+static volatile LONG s_scan_stop;
 static const EdrConfig *s_cfg;
 static EdrEventBus *s_bus;
 static int s_wsa_started;
+
+static void wd_lock(void) {
+  if (s_lock_init) {
+    EnterCriticalSection(&s_lock);
+  }
+}
+static void wd_unlock(void) {
+  if (s_lock_init) {
+    LeaveCriticalSection(&s_lock);
+  }
+}
 
 /** 环形缓冲（仅捕获线程写；告警同线程读） */
 static uint8_t *s_ring_mem;
@@ -85,6 +116,48 @@ static uint32_t s_ring_stride;
 static uint32_t s_ring_w;
 static uint32_t s_ring_r;
 static uint32_t s_ring_count;
+static volatile LONG s_budget_drop_count;
+static volatile LONG s_packets_received;
+static volatile LONG s_receive_errors;
+static volatile LONG s_scan_queue_dropped;
+static volatile LONG s_scan_jobs_processed;
+static volatile LONG s_alert_seq;
+static EdrShellcodeDetectorRuntime s_runtime;
+
+typedef struct {
+  uint8_t *payload;
+  uint32_t payload_len;
+  uint8_t *ip_packet;
+  uint32_t ip_len;
+  int is_v6;
+  uint16_t dpt;
+  uint16_t spt;
+  char src[64];
+  char dst[64];
+  UINT32 v4_src;
+  UINT32 v4_dst;
+  EdrTcpStreamKey stream_key;
+  int have_stream_key;
+} EdrShellcodeScanJob;
+
+static EdrShellcodeScanJob *s_scan_jobs;
+static uint32_t s_scan_capacity;
+static uint32_t s_scan_head;
+static uint32_t s_scan_tail;
+static uint32_t s_scan_count;
+static HANDLE s_scan_items;
+
+/* 方向感知、有界TCP流重组。所有访问均在 s_lock 下。 */
+static EdrTcpReassemblyTable *s_reassembly;
+
+/* P1 #4：深扫速率令牌桶 + 限速丢弃计数。 */
+static EdrTokenBucket s_scan_bucket;
+static volatile LONG s_rate_drop_count;
+
+/* P0 #1：TCP owner-PID 表缓存（避免每包 GetExtendedTcpTable + malloc + 全表扫描）。 */
+static uint8_t *s_tcp_tab;
+static DWORD s_tcp_tab_cap;
+static uint64_t s_tcp_tab_ts_ns;
 
 static uint64_t edr_win_now_ns(void) {
   FILETIME ft;
@@ -97,6 +170,32 @@ static uint64_t edr_win_now_ns(void) {
     return 0;
   }
   return (u.QuadPart - epoch_100ns) * 100ULL;
+}
+
+static void runtime_set(EdrShellcodeRuntimeState state, const char *status, const char *detail,
+                        DWORD win32_error) {
+  s_runtime.state = state;
+  s_runtime.win32_error = (uint32_t)win32_error;
+  snprintf(s_runtime.runtime_status, sizeof(s_runtime.runtime_status), "%s", status ? status : "degraded");
+  snprintf(s_runtime.detail, sizeof(s_runtime.detail), "%s", detail ? detail : "unknown");
+}
+
+static int native_windows_is_arm64(void) {
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  return 1;
+#else
+  typedef BOOL(WINAPI *PFN_IsWow64Process2)(HANDLE, USHORT *, USHORT *);
+  HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+  PFN_IsWow64Process2 query = kernel
+      ? (PFN_IsWow64Process2)GetProcAddress(kernel, "IsWow64Process2")
+      : NULL;
+  USHORT process_machine = 0;
+  USHORT native_machine = 0;
+  if (!query || !query(GetCurrentProcess(), &process_machine, &native_machine)) {
+    return 0;
+  }
+  return native_machine == IMAGE_FILE_MACHINE_ARM64;
+#endif
 }
 
 static void ipv4_ntoa(uint32_t addr_le, char *out, size_t cap) {
@@ -149,6 +248,52 @@ static int sha256_hex_buf(const uint8_t *data, size_t len, char out65[65]) {
     out65[i * 2 + 1] = hx[hash[i] & 15];
   }
   out65[64] = '\0';
+  return 0;
+}
+
+static int sha256_hex_file(const char *path, char out65[65]) {
+  HCRYPTPROV hProv = 0;
+  HCRYPTHASH hHash = 0;
+  FILE *file = NULL;
+  uint8_t buffer[8192];
+  BYTE digest[32];
+  DWORD digest_len = sizeof(digest);
+  static const char hex[] = "0123456789abcdef";
+  size_t n;
+  if (!path || !path[0] || !out65) {
+    return -1;
+  }
+  out65[0] = '\0';
+  file = fopen(path, "rb");
+  if (!file || !CryptAcquireContextA(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) ||
+      !CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+    if (hHash) CryptDestroyHash(hHash);
+    if (hProv) CryptReleaseContext(hProv, 0);
+    if (file) fclose(file);
+    return -1;
+  }
+  while ((n = fread(buffer, 1u, sizeof(buffer), file)) > 0u) {
+    if (!CryptHashData(hHash, buffer, (DWORD)n, 0)) {
+      CryptDestroyHash(hHash);
+      CryptReleaseContext(hProv, 0);
+      fclose(file);
+      return -1;
+    }
+  }
+  if (ferror(file) || !CryptGetHashParam(hHash, HP_HASHVAL, digest, &digest_len, 0) || digest_len != sizeof(digest)) {
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    fclose(file);
+    return -1;
+  }
+  for (size_t i = 0; i < sizeof(digest); i++) {
+    out65[i * 2u] = hex[digest[i] >> 4u];
+    out65[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out65[64] = '\0';
+  CryptDestroyHash(hHash);
+  CryptReleaseContext(hProv, 0);
+  fclose(file);
   return 0;
 }
 
@@ -359,6 +504,87 @@ static int build_windivert_filter_string(const EdrConfig *cfg, char *out, size_t
   return 0;
 }
 
+/*
+ * 排除 Agent 自身到平台/中继/代理的流量：解析这些 URL 主机的 IP，向已有过滤器尾部追加
+ * ` and not (ip.DstAddr==A or ip.SrcAddr==A or ipv6.DstAddr==B or ...)`。
+ * 返回追加的地址数；0=无可排除；-1=会超长（已回滚，保持原过滤器）。
+ */
+static int append_self_exclusion(const EdrConfig *cfg, char *buf, size_t cap) {
+  if (!cfg || !buf) {
+    return 0;
+  }
+  const char *urls[3];
+  int nu = 0;
+  if (cfg->platform.relay_url[0]) {
+    urls[nu++] = cfg->platform.relay_url; /* 用中继时实际出口是它 */
+  }
+  if (cfg->platform.rest_base_url[0]) {
+    urls[nu++] = cfg->platform.rest_base_url;
+  }
+  if (cfg->platform.proxy_url[0]) {
+    urls[nu++] = cfg->platform.proxy_url;
+  }
+  if (nu == 0) {
+    return 0;
+  }
+
+  char clause[4096];
+  size_t cw = 0;
+  int count = 0;
+  for (int u = 0; u < nu && count < 16; u++) {
+    char host[256];
+    if (edr_url_extract_host(urls[u], host, sizeof(host)) != 0) {
+      continue;
+    }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+      continue;
+    }
+    for (struct addrinfo *ai = res; ai && count < 16; ai = ai->ai_next) {
+      char ip[64];
+      ip[0] = '\0';
+      const char *field = NULL;
+      if (ai->ai_family == AF_INET) {
+        struct sockaddr_in *s4 = (struct sockaddr_in *)ai->ai_addr;
+        if (!inet_ntop(AF_INET, &s4->sin_addr, ip, sizeof(ip))) {
+          continue;
+        }
+        field = "ip";
+      } else if (ai->ai_family == AF_INET6) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)ai->ai_addr;
+        if (!inet_ntop(AF_INET6, &s6->sin6_addr, ip, sizeof(ip))) {
+          continue;
+        }
+        field = "ipv6";
+      } else {
+        continue;
+      }
+      int n = snprintf(clause + cw, sizeof(clause) - cw, "%s%s.DstAddr == %s or %s.SrcAddr == %s",
+                       (count > 0) ? " or " : "", field, ip, field, ip);
+      if (n < 0 || (size_t)n >= sizeof(clause) - cw) {
+        break;
+      }
+      cw += (size_t)n;
+      count++;
+    }
+    freeaddrinfo(res);
+  }
+  if (count == 0) {
+    return 0;
+  }
+  size_t blen = strlen(buf);
+  int n = snprintf(buf + blen, cap - blen, " and not (%s)", clause);
+  if (n < 0 || (size_t)n >= cap - blen) {
+    buf[blen] = '\0'; /* 超长则回滚，保持原过滤器 */
+    return -1;
+  }
+  return count;
+}
+
 static void log_windivert_service_hint(void) {
   SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
   if (!scm) {
@@ -408,6 +634,9 @@ static int monitor_allows(const EdrConfig *c, uint16_t dp, uint16_t sp) {
   if ((dp == 5985u || dp == 5986u || sp == 5985u || sp == 5986u) && !c->shellcode_detector.monitor_winrm) {
     return 0;
   }
+  if ((dp == 443u || dp == 8443u || sp == 443u || sp == 8443u) && !c->shellcode_detector.monitor_tls) {
+    return 0;
+  }
   if ((dp == 135u || sp == 135u) && !c->shellcode_detector.monitor_msrpc) {
     return 0;
   }
@@ -417,6 +646,52 @@ static int monitor_allows(const EdrConfig *c, uint16_t dp, uint16_t sp) {
     return 0;
   }
   return 1;
+}
+
+/* P0 #1：把 GetExtendedTcpTable 结果缓存 ~1s 复用，避免每次解析都做两次系统调用 + malloc。 */
+static void refresh_tcp_table_v4(void) {
+  uint64_t now = edr_win_now_ns();
+  if (s_tcp_tab && (now - s_tcp_tab_ts_ns) < 1000000000ull) {
+    return;
+  }
+  DWORD need = s_tcp_tab_cap;
+  DWORD r = GetExtendedTcpTable(s_tcp_tab, &need, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+  if (r == ERROR_INSUFFICIENT_BUFFER || (!s_tcp_tab && need > 0u)) {
+    uint8_t *nb = (uint8_t *)realloc(s_tcp_tab, need);
+    if (!nb) {
+      return;
+    }
+    s_tcp_tab = nb;
+    s_tcp_tab_cap = need;
+    r = GetExtendedTcpTable(s_tcp_tab, &need, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+  }
+  if (r == NO_ERROR) {
+    s_tcp_tab_ts_ns = now;
+  }
+}
+
+/* P0 #1：惰性解析 —— 仅在真正要发告警/事件时调用，而非每包。命中缓存表内做一次线性扫描。
+ * P2 #7：缓存刷新 + 扫描在锁内（共享 s_tcp_tab，多线程下避免 realloc 竞争）。仅 emit 时调用，开销可忽略。 */
+static uint32_t tcp_owner_pid_v4(UINT32 src_addr, UINT32 dst_addr, uint16_t sp, uint16_t dp) {
+  uint32_t pid = 0u;
+  wd_lock();
+  refresh_tcp_table_v4();
+  if (s_tcp_tab) {
+    PMIB_TCPTABLE_OWNER_PID tab = (PMIB_TCPTABLE_OWNER_PID)s_tcp_tab;
+    for (DWORD i = 0; i < tab->dwNumEntries; i++) {
+      MIB_TCPROW_OWNER_PID *r = &tab->table[i];
+      uint16_t lp = ntohs((u_short)r->dwLocalPort);
+      uint16_t rp = ntohs((u_short)r->dwRemotePort);
+      int fwd = (r->dwLocalAddr == src_addr && r->dwRemoteAddr == dst_addr && lp == sp && rp == dp);
+      int rev = (r->dwLocalAddr == dst_addr && r->dwRemoteAddr == src_addr && lp == dp && rp == sp);
+      if (fwd || rev) {
+        pid = (uint32_t)r->dwOwningPid;
+        break;
+      }
+    }
+  }
+  wd_unlock();
+  return pid;
 }
 
 static const char *kind_name(EdrProtoKind k) {
@@ -435,45 +710,65 @@ static const char *kind_name(EdrProtoKind k) {
 }
 
 static int push_alert(double score, const char *detector_label, const char *rule_name, const char *proto_label,
+                      const EdrShellcodeExploitAttribution *attrib,
                       uint16_t dpt, uint16_t spt, const char *src, const char *dst, const uint8_t *evidence,
-                      uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6) {
+                      uint32_t evidence_len, const uint8_t *ip_packet, UINT ip_len, int is_v6,
+                      uint32_t owner_pid) {
   if (!s_bus) {
     fprintf(stderr, "[shellcode_detector] score=%.3f proto=%s %s:%u -> %s:%u (no event bus)\n", score, proto_label,
             src, (unsigned)spt, dst, (unsigned)dpt);
     return 0;
   }
+  uint64_t alert_ns = edr_win_now_ns();
+  LONG alert_seq = InterlockedIncrement(&s_alert_seq);
+  char alert_id[64];
+  snprintf(alert_id, sizeof(alert_id), "sc-%llx-%lx", (unsigned long long)alert_ns,
+           (unsigned long)alert_seq);
+  int known_detection = attrib != NULL;
+  int pmfe_recommended = s_cfg && s_cfg->shellcode_detector.pmfe_followup_enabled && owner_pid != 0u &&
+                         (known_detection || score >= s_cfg->shellcode_detector.pmfe_heuristic_threshold);
+  const char *pmfe_trigger = known_detection ? "known_exploit" :
+                             (pmfe_recommended ? "high_confidence_heuristic" : "not_recommended");
   int wrote_pcap_ok = 0;
   char forensic_stem[192];
+  char forensic_path[1200];
+  char pcap_object_key[512];
+  const char *pcap_status = "disabled";
   forensic_stem[0] = '\0';
+  forensic_path[0] = '\0';
+  pcap_object_key[0] = '\0';
   unsigned forensic_frames = 0u;
   const char *forensic_kind = "";
 
   if (s_cfg && s_cfg->shellcode_detector.forensic_save_pcap && s_cfg->shellcode_detector.forensic_dir[0]) {
     mkdir_p_win(s_cfg->shellcode_detector.forensic_dir);
-    char pcap_path[1200];
+    pcap_status = "local_only";
     unsigned long long tsn = (unsigned long long)edr_win_now_ns();
     unsigned long pid = (unsigned long)GetCurrentProcessId();
+    wd_lock(); /* P2 #7：环形缓冲读取（write_ring_pcap）与计数读须与捕获线程的 ring 写互斥 */
     if (s_ring_mem && s_cfg->shellcode_detector.forensic_ring_slots > 0u && s_ring_count > 0u) {
-      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_ring_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir,
+      snprintf(forensic_path, sizeof(forensic_path), "%s\\shellcode_ring_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir,
                tsn, pid);
-      if (write_ring_pcap(pcap_path) == 0) {
+      if (write_ring_pcap(forensic_path) == 0) {
         wrote_pcap_ok = 1;
         forensic_kind = "ring";
         forensic_frames = s_ring_count;
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_ring_%llu_%lu", tsn, pid);
-        fprintf(stderr, "[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", pcap_path,
+        fprintf(stderr, "[shellcode_detector] wrote ring pcap %s (frames=%u link=EN10MB)\n", forensic_path,
                 (unsigned)s_ring_count);
       }
     } else if (ip_packet && ip_len > 0u) {
-      snprintf(pcap_path, sizeof(pcap_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
+      snprintf(forensic_path, sizeof(forensic_path), "%s\\shellcode_%llu_%lu.pcap", s_cfg->shellcode_detector.forensic_dir, tsn,
                pid);
-      if (write_single_pcap(pcap_path, ip_packet, ip_len, is_v6) == 0) {
+      if (write_single_pcap(forensic_path, ip_packet, ip_len, is_v6) == 0) {
         wrote_pcap_ok = 1;
         forensic_kind = "single";
         snprintf(forensic_stem, sizeof(forensic_stem), "shellcode_%llu_%lu", tsn, pid);
-        fprintf(stderr, "[shellcode_detector] wrote pcap %s\n", pcap_path);
+        fprintf(stderr, "[shellcode_detector] wrote pcap %s\n", forensic_path);
       }
     }
+    wd_unlock();
+    if (wrote_pcap_ok && forensic_path[0]) pcap_status = "queued";
   }
 
   EdrEventSlot slot;
@@ -489,18 +784,46 @@ static int push_alert(double score, const char *detector_label, const char *rule
 
   char wx[EDR_MAX_EVENT_PAYLOAD];
   int base = snprintf(wx, sizeof(wx),
-                      "ETW1\nprov=windivert\ndetector=%s\nrule=%s\nscore=%.6f\nproto=%s\ndpt=%u\nspt=%u\nsrc=%s\ndst=%s\n",
-                      detector_label ? detector_label : "heuristic", rule_name ? rule_name : "-", score, proto_label,
+                      "ETW1\nprov=windivert\nepid=%u\nalert_id=%s\ndetector=%s\nrule=%s\nscore=%.6f\n"
+                      "pmfe_recommended=%u\npmfe_trigger=%s\npmfe_status=%s\n"
+                      "proto=%s\ndpt=%u\nspt=%u\nsrc=%s\ndst=%s\n",
+                      (unsigned)owner_pid,
+                      alert_id, detector_label ? detector_label : "heuristic", rule_name ? rule_name : "-", score,
+                      (unsigned)pmfe_recommended, pmfe_trigger, pmfe_recommended ? "pending" : "skipped", proto_label,
                       (unsigned)dpt, (unsigned)spt, src, dst);
   if (base < 0 || (size_t)base >= sizeof(wx)) {
     return -1;
   }
   size_t off = (size_t)base;
+  {
+    int ps = snprintf(wx + off, sizeof(wx) - off, "pcap_status=%s\n", pcap_status ? pcap_status : "disabled");
+    if (ps > 0 && (size_t)ps < sizeof(wx) - off) {
+      off += (size_t)ps;
+    }
+  }
+  if (attrib && (attrib->candidate_cve[0] || attrib->family[0] || attrib->vector[0])) {
+    int am = snprintf(wx + off, sizeof(wx) - off,
+                      "attrib_schema=shellcode_vulnerability_attribution_v1\nattrib_cve=%s\nattrib_family=%s\n"
+                      "attrib_product=%s\nattrib_vector=%s\nattrib_confidence=%s\nattrib_source=%s\nattrib_basis=%s\n",
+                      attrib->candidate_cve, attrib->family, attrib->product, attrib->vector,
+                      attrib->confidence[0] ? attrib->confidence : "candidate",
+                      attrib->source[0] ? attrib->source : "builtin_rule_table",
+                      attrib->evidence_basis[0] ? attrib->evidence_basis : "known_rule_name,protocol_region,safe_signature_metadata");
+    if (am > 0 && (size_t)am < sizeof(wx) - off) {
+      off += (size_t)am;
+    }
+  }
   if (wrote_pcap_ok && forensic_kind[0]) {
     int fm = snprintf(wx + off, sizeof(wx) - off,
                       "mitre=T1210\nforensic_kind=%s\npcap_stem=%s\n", forensic_kind, forensic_stem[0] ? forensic_stem : "-");
     if (fm > 0 && (size_t)fm < sizeof(wx) - off) {
       off += (size_t)fm;
+    }
+    if (pcap_object_key[0]) {
+      fm = snprintf(wx + off, sizeof(wx) - off, "pcap_object_key=%s\n", pcap_object_key);
+      if (fm > 0 && (size_t)fm < sizeof(wx) - off) {
+        off += (size_t)fm;
+      }
     }
     if (strcmp(forensic_kind, "ring") == 0 && forensic_frames > 0u) {
       fm = snprintf(wx + off, sizeof(wx) - off, "forensic_frames=%u\n", forensic_frames);
@@ -538,7 +861,9 @@ static int push_alert(double score, const char *detector_label, const char *rule
   if (s_ring_mem && s_ring_slots > 0u && s_ring_count > 0u) {
     uint32_t trig_slot = 0;
     uint64_t oldest_ns = 0, newest_ns = 0, span_ns = 0;
+    wd_lock(); /* P2 #7：与捕获线程 ring 写互斥 */
     ring_snapshot_meta(&trig_slot, &oldest_ns, &newest_ns, &span_ns);
+    wd_unlock();
     int rm = snprintf(wx + off, sizeof(wx) - off,
                       "ring_trigger_slot=%u\nring_oldest_ns=%llu\nring_newest_ns=%llu\nring_span_ns=%llu\n",
                       (unsigned)trig_slot, (unsigned long long)oldest_ns, (unsigned long long)newest_ns,
@@ -563,10 +888,25 @@ static int push_alert(double score, const char *detector_label, const char *rule
       }
     }
     const char *det = detector_label ? detector_label : "heuristic";
-    int jn = snprintf(wx + off, sizeof(wx) - off,
-                      "shellcode_json={\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
-                      "\"rule\":\"%s\"}\n",
-                      score, (unsigned)dpt, (unsigned)spt, eproto, det, erule);
+    int jn;
+    if (attrib && (attrib->candidate_cve[0] || attrib->family[0] || attrib->vector[0])) {
+      jn = snprintf(wx + off, sizeof(wx) - off,
+                    "shellcode_json={\"schema\":\"shellcode_result_v1\",\"alert_id\":\"%s\",\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
+                    "\"rule\":\"%s\",\"pcap\":{\"artifact_ref\":\"%s\",\"object_key\":\"%s\",\"status\":\"%s\"},\"attrib\":{\"schema\":\"shellcode_vulnerability_attribution_v1\","
+                    "\"candidate_cve\":\"%s\",\"family\":\"%s\",\"product\":\"%s\",\"vector\":\"%s\","
+                    "\"confidence\":\"%s\",\"source\":\"%s\",\"evidence_basis\":[\"known_rule_name\",\"protocol_region\",\"safe_signature_metadata\"]}}\n",
+                    alert_id, score, (unsigned)dpt, (unsigned)spt, eproto, det, erule,
+                    forensic_stem[0] ? forensic_stem : "", pcap_object_key[0] ? pcap_object_key : "", pcap_status,
+                    attrib->candidate_cve, attrib->family, attrib->product, attrib->vector,
+                    attrib->confidence[0] ? attrib->confidence : "candidate",
+                    attrib->source[0] ? attrib->source : "builtin_rule_table");
+    } else {
+      jn = snprintf(wx + off, sizeof(wx) - off,
+                    "shellcode_json={\"schema\":\"shellcode_result_v1\",\"alert_id\":\"%s\",\"score\":%.6f,\"dpt\":%u,\"spt\":%u,\"proto\":\"%s\",\"det\":\"%s\","
+                    "\"rule\":\"%s\",\"pcap\":{\"artifact_ref\":\"%s\",\"object_key\":\"%s\",\"status\":\"%s\"}}\n",
+                    alert_id, score, (unsigned)dpt, (unsigned)spt, eproto, det, erule,
+                    forensic_stem[0] ? forensic_stem : "", pcap_object_key[0] ? pcap_object_key : "", pcap_status);
+    }
     if (jn > 0 && (size_t)jn < sizeof(wx) - off) {
       off += (size_t)jn;
     }
@@ -577,18 +917,89 @@ static int push_alert(double score, const char *detector_label, const char *rule
   memcpy(slot.data, wx, off);
   slot.size = (uint32_t)off;
   if (!edr_event_bus_try_push(s_bus, &slot)) {
+    InterlockedIncrement(&s_budget_drop_count);
     fprintf(stderr, "[shellcode_detector] event bus full, drop shellcode alert\n");
   }
-  if (s_cfg && score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
+  if (s_cfg && s_cfg->shellcode_detector.auto_isolate_execute &&
+      score >= s_cfg->shellcode_detector.auto_isolate_threshold) {
     edr_isolate_auto_from_shellcode_alarm();
+  }
+  /* 告警先入总线；大文件上传在检测worker尾部执行，不阻塞WinDivert捕获路径。 */
+  if (wrote_pcap_ok && forensic_path[0]) {
+    /*
+     * The alert is generated before the asynchronous upload completes. Carry
+     * its immutable source ID in the upload ID so the server can persist a
+     * durable evidence record even when the alert and upload arrive out of
+     * order. This is deliberately not a command ID.
+     */
+    char pcap_upload_id[320];
+    char pcap_sha256[65];
+    snprintf(pcap_upload_id, sizeof(pcap_upload_id), "shellcode_pcap__%s__%s", alert_id,
+             forensic_stem[0] ? forensic_stem : "pcap");
+    pcap_sha256[0] = '\0';
+    (void)sha256_hex_file(forensic_path, pcap_sha256);
+    if (edr_transport_v2_upload_file(pcap_upload_id, forensic_path, pcap_sha256,
+                                     pcap_object_key, sizeof(pcap_object_key)) != 0 || !pcap_object_key[0]) {
+      fprintf(stderr, "[shellcode_detector] pcap upload failed artifact_ref=%s\n",
+              forensic_stem[0] ? forensic_stem : "shellcode_pcap");
+    }
   }
   return 0;
 }
 
-static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6_pkt, const uint8_t *pl,
-                                uint32_t plen, uint16_t dpt, uint16_t spt, const char *src, const char *dst) {
-  if (!s_cfg || plen == 0u) {
+static void push_tls_clienthello_event(const EdrTlsClientHelloInfo *ti, uint16_t dpt, uint16_t spt,
+                                       const char *src, const char *dst, uint32_t owner_pid) {
+  if (!s_bus || !ti) {
     return;
+  }
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_win_now_ns();
+  slot.type = EDR_EVENT_NET_TLS_HANDSHAKE;
+  slot.priority = ti->sni_suspicious ? 1u : 2u;
+  char wx[EDR_MAX_EVENT_PAYLOAD];
+  int n = snprintf(wx, sizeof(wx),
+                   "ETW1\nprov=tls_sensor\nsensor=tls_clienthello\nepid=%u\nproto=tls\nsrc=%s\ndst=%s\nspt=%u\ndpt=%u\n"
+                   "ja3=%s\ntls_sni=%s\nsni_suspicious=%u\n",
+                   (unsigned)owner_pid, src ? src : "", dst ? dst : "", (unsigned)spt, (unsigned)dpt,
+                   ti->ja3[0] ? ti->ja3 : "-", ti->sni[0] ? ti->sni : "-", (unsigned)ti->sni_suspicious);
+  if (n <= 0) {
+    return;
+  }
+  if ((size_t)n >= sizeof(wx)) {
+    n = (int)sizeof(wx) - 1;
+  }
+  memcpy(slot.data, wx, (size_t)n);
+  slot.size = (uint32_t)n;
+  (void)edr_event_bus_try_push(s_bus, &slot);
+}
+
+/* P0 #1：仅在确实要发事件时才解析 owner_pid（v6 维持 0，与既有行为一致）。 */
+static uint32_t lazy_owner_pid(int is_v6, UINT32 v4_src, UINT32 v4_dst, uint16_t sp, uint16_t dp) {
+  return is_v6 ? 0u : tcp_owner_pid_v4(v4_src, v4_dst, sp, dp);
+}
+
+static void tcp_stream_key(EdrTcpStreamKey *key, const WINDIVERT_IPHDR *ip,
+                           const WINDIVERT_IPV6HDR *ipv6, uint16_t sp, uint16_t dp) {
+  memset(key, 0, sizeof(*key));
+  key->src_port = sp;
+  key->dst_port = dp;
+  if (ip) {
+    key->family = 4u;
+    memcpy(key->src_addr, &ip->SrcAddr, 4u);
+    memcpy(key->dst_addr, &ip->DstAddr, 4u);
+  } else if (ipv6) {
+    key->family = 6u;
+    memcpy(key->src_addr, ipv6->SrcAddr, 16u);
+    memcpy(key->dst_addr, ipv6->DstAddr, 16u);
+  }
+}
+
+static int inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6_pkt, const uint8_t *pl,
+                               uint32_t plen, uint16_t dpt, uint16_t spt, const char *src, const char *dst,
+                               UINT32 v4_src, UINT32 v4_dst) {
+  if (!s_cfg || plen == 0u) {
+    return 0;
   }
   uint32_t cap = s_cfg->shellcode_detector.max_payload_inspect;
   if (cap == 0u) {
@@ -597,6 +1008,16 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
   uint32_t n = plen;
   if (n > cap) {
     n = cap;
+  }
+  EdrTlsClientHelloInfo tlsi;
+  if (edr_proto_parse_tls_client_hello(pl, n, &tlsi)) {
+    push_tls_clienthello_event(&tlsi, dpt, spt, src, dst, lazy_owner_pid(is_v6_pkt, v4_src, v4_dst, spt, dpt));
+    return 0;
+  }
+  /* P0 #3：跳过 TLS 记录（CCS/alert/handshake/application_data）的 shellcode 深扫。
+   * ClientHello 已在上面提取；其余握手报文与密文（高熵）深扫只会带来误报与无谓 CPU。 */
+  if (!s_cfg->shellcode_detector.scan_tls_appdata && edr_proto_tls_record_type(pl, n) != 0u) {
+    return 0;
   }
   EdrProtoShellcodeRegion reg;
   EdrProtoParseResult pr = edr_proto_find_shellcode_region(pl, n, &reg);
@@ -609,10 +1030,16 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
     snprintf(proto_l, sizeof(proto_l), "%s", kind_name(reg.kind));
   }
   char rule_name[96];
+  EdrShellcodeExploitAttribution attrib;
   EdrProtoKind k = (pr == EDR_PROTO_PARSE_OK) ? reg.kind : EDR_PROTO_KIND_UNKNOWN;
-  if (edr_shellcode_match_known_exploit(scan, slen, k, rule_name, sizeof(rule_name))) {
-    (void)push_alert(1.0, "yara", rule_name, proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt);
-    return;
+  EnterCriticalSection(&s_detection_lock);
+  int known_match = edr_shellcode_match_known_exploit_ex(scan, slen, k, rule_name, sizeof(rule_name), &attrib);
+  LeaveCriticalSection(&s_detection_lock);
+  if (known_match) {
+    (void)push_alert(1.0, attrib.source[0] ? attrib.source : "known", rule_name, proto_l, &attrib,
+                     dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+                     lazy_owner_pid(is_v6_pkt, v4_src, v4_dst, spt, dpt));
+    return 1;
   }
   double sc = edr_shellcode_heuristic_score(scan, slen);
   sc *= s_cfg->shellcode_detector.heuristic_score_scale;
@@ -620,18 +1047,139 @@ static void inspect_tcp_payload(const uint8_t *ip_packet, UINT ip_len, int is_v6
     sc = 1.0;
   }
   if (sc < s_cfg->shellcode_detector.alert_threshold) {
-    return;
+    return 0;
   }
-  (void)push_alert(sc, "heuristic", "-", proto_l, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt);
+  (void)push_alert(sc, "heuristic", "-", proto_l, NULL, dpt, spt, src, dst, scan, slen, ip_packet, ip_len, is_v6_pkt,
+                   lazy_owner_pid(is_v6_pkt, v4_src, v4_dst, spt, dpt));
+  return 1;
+}
+
+static void scan_job_release(EdrShellcodeScanJob *job) {
+  if (!job) return;
+  free(job->payload);
+  free(job->ip_packet);
+  memset(job, 0, sizeof(*job));
+}
+
+static int scan_queue_push(const uint8_t *payload, uint32_t payload_len,
+                           const uint8_t *ip_packet, uint32_t ip_len, int is_v6,
+                           uint16_t dpt, uint16_t spt, const char *src, const char *dst,
+                           UINT32 v4_src, UINT32 v4_dst, const EdrTcpStreamKey *stream_key,
+                           int have_stream_key) {
+  EdrShellcodeScanJob job;
+  memset(&job, 0, sizeof(job));
+  job.payload = (uint8_t *)malloc(payload_len);
+  if (!job.payload) return -1;
+  memcpy(job.payload, payload, payload_len);
+  job.payload_len = payload_len;
+  if (s_cfg && s_cfg->shellcode_detector.forensic_save_pcap && ip_packet && ip_len > 0u) {
+    job.ip_packet = (uint8_t *)malloc(ip_len);
+    if (!job.ip_packet) {
+      scan_job_release(&job);
+      return -1;
+    }
+    memcpy(job.ip_packet, ip_packet, ip_len);
+    job.ip_len = ip_len;
+  }
+  job.is_v6 = is_v6;
+  job.dpt = dpt;
+  job.spt = spt;
+  job.v4_src = v4_src;
+  job.v4_dst = v4_dst;
+  snprintf(job.src, sizeof(job.src), "%s", src ? src : "");
+  snprintf(job.dst, sizeof(job.dst), "%s", dst ? dst : "");
+  if (have_stream_key && stream_key) {
+    job.stream_key = *stream_key;
+    job.have_stream_key = 1;
+  }
+
+  EnterCriticalSection(&s_scan_lock);
+  if (s_scan_count >= s_scan_capacity) {
+    LeaveCriticalSection(&s_scan_lock);
+    scan_job_release(&job);
+    return 1;
+  }
+  s_scan_jobs[s_scan_tail] = job;
+  s_scan_tail = (s_scan_tail + 1u) % s_scan_capacity;
+  s_scan_count++;
+  LeaveCriticalSection(&s_scan_lock);
+  if (job.have_stream_key && s_reassembly) {
+    wd_lock();
+    edr_tcp_reassembly_mark_scan_pending(s_reassembly, &job.stream_key);
+    wd_unlock();
+  }
+  ReleaseSemaphore(s_scan_items, 1, NULL);
+  return 0;
+}
+
+static int scan_queue_pop(EdrShellcodeScanJob *out) {
+  int found = 0;
+  EnterCriticalSection(&s_scan_lock);
+  if (s_scan_count > 0u) {
+    *out = s_scan_jobs[s_scan_head];
+    memset(&s_scan_jobs[s_scan_head], 0, sizeof(s_scan_jobs[s_scan_head]));
+    s_scan_head = (s_scan_head + 1u) % s_scan_capacity;
+    s_scan_count--;
+    found = 1;
+  }
+  LeaveCriticalSection(&s_scan_lock);
+  return found;
+}
+
+static DWORD WINAPI scan_thread_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    DWORD wait_rc = WaitForSingleObject(s_scan_items, 1000u);
+    EdrShellcodeScanJob job;
+    memset(&job, 0, sizeof(job));
+    if (wait_rc == WAIT_OBJECT_0 && scan_queue_pop(&job)) {
+      for (;;) {
+        int alerted = inspect_tcp_payload(job.ip_packet, job.ip_len, job.is_v6, job.payload,
+                                          job.payload_len, job.dpt, job.spt, job.src, job.dst,
+                                          job.v4_src, job.v4_dst);
+        uint8_t *retry_payload = NULL;
+        uint32_t retry_len = 0u;
+        if (job.have_stream_key && s_reassembly) {
+          EdrTcpReassemblyView retry_view;
+          wd_lock();
+          int retry = edr_tcp_reassembly_complete_scan(s_reassembly, &job.stream_key, alerted, &retry_view);
+          if (retry && retry_view.length > 0u) {
+            retry_payload = (uint8_t *)malloc(retry_view.length);
+            if (retry_payload) {
+              memcpy(retry_payload, retry_view.data, retry_view.length);
+              retry_len = retry_view.length;
+            } else {
+              (void)edr_tcp_reassembly_complete_scan(s_reassembly, &job.stream_key, 0, NULL);
+              InterlockedIncrement(&s_scan_queue_dropped);
+            }
+          }
+          wd_unlock();
+        }
+        if (!retry_payload || alerted) break;
+        free(job.payload);
+        job.payload = retry_payload;
+        job.payload_len = retry_len;
+      }
+      scan_job_release(&job);
+      InterlockedIncrement(&s_scan_jobs_processed);
+      continue;
+    }
+    if (InterlockedCompareExchange(&s_scan_stop, 0, 0) != 0) break;
+  }
+  return 0;
 }
 
 static DWORD WINAPI wd_thread_main(void *arg) {
   (void)arg;
   uint8_t buf[0xFFFF];
+  uint8_t scan_buf[0xFFFF];
   while (InterlockedCompareExchange(&s_capture_stop, 0, 0) == 0) {
-    if (s_cfg && s_cfg->shellcode_detector.yara_rules_reload_interval_s > 0u && s_cfg->shellcode_detector.yara_rules_dir[0]) {
+    if (s_cfg && s_cfg->shellcode_detector.yara_rules_reload_interval_s > 0u &&
+        s_cfg->shellcode_detector.yara_rules_dir[0]) {
+      EnterCriticalSection(&s_detection_lock);
       edr_shellcode_known_reload_periodic(s_cfg->shellcode_detector.yara_rules_dir,
                                           s_cfg->shellcode_detector.yara_rules_reload_interval_s);
+      LeaveCriticalSection(&s_detection_lock);
     }
     WINDIVERT_ADDRESS addr;
     UINT recvlen = 0;
@@ -641,8 +1189,11 @@ static DWORD WINAPI wd_thread_main(void *arg) {
       if (e == ERROR_INVALID_HANDLE || InterlockedCompareExchange(&s_capture_stop, 0, 0) != 0) {
         break;
       }
+      InterlockedIncrement(&s_receive_errors);
+      s_runtime.win32_error = (uint32_t)e;
       continue;
     }
+    InterlockedIncrement(&s_packets_received);
     if (recvlen == 0u || !s_cfg) {
       continue;
     }
@@ -664,14 +1215,17 @@ static DWORD WINAPI wd_thread_main(void *arg) {
     if (!tcp || !data || datalen == 0) {
       continue;
     }
-    uint16_t sp = tcp->SrcPort;
-    uint16_t dp = tcp->DstPort;
+    uint16_t sp = ntohs(tcp->SrcPort);
+    uint16_t dp = ntohs(tcp->DstPort);
     if (!monitor_allows(s_cfg, dp, sp)) {
       continue;
     }
     char src[64], dst[64];
     int is_v6 = 0;
+    UINT32 v4_src = 0u, v4_dst = 0u;
     if (ip) {
+      v4_src = ip->SrcAddr;
+      v4_dst = ip->DstAddr;
       ipv4_ntoa(ip->SrcAddr, src, sizeof(src));
       ipv4_ntoa(ip->DstAddr, dst, sizeof(dst));
     } else if (ipv6) {
@@ -680,28 +1234,135 @@ static DWORD WINAPI wd_thread_main(void *arg) {
     } else {
       continue;
     }
+    /* 共享状态（环形缓冲 / TCP重组 / 令牌桶）的准入决策在锁内；昂贵的深扫在锁外。 */
+    uint32_t rate_for_log = 0u;
+    int rate_limited = 0;
+    uint32_t scan_len = 0u;
+    EdrTcpStreamKey stream_key;
+    int have_stream_key = 0;
+    wd_lock();
     ring_packet_push(buf, recvlen, is_v6);
-    inspect_tcp_payload(buf, recvlen, is_v6, (const uint8_t *)data, (uint32_t)datalen, dp, sp, src, dst);
+    int do_scan = 0;
+    if (s_reassembly) {
+      EdrTcpReassemblyView view;
+      tcp_stream_key(&stream_key, ip, (const WINDIVERT_IPV6HDR *)ipv6, sp, dp);
+      have_stream_key = 1;
+      if (edr_tcp_reassembly_submit(s_reassembly, &stream_key, ntohl(tcp->SeqNum),
+                                    (const uint8_t *)data, (uint32_t)datalen,
+                                    edr_win_now_ns(), &view) == 0 && view.updated && view.length > 0u) {
+        scan_len = view.length > (uint32_t)sizeof(scan_buf) ? (uint32_t)sizeof(scan_buf) : view.length;
+        memcpy(scan_buf, view.data, scan_len);
+        do_scan = 1;
+      }
+    } else {
+      scan_len = (uint32_t)datalen > (uint32_t)sizeof(scan_buf) ? (uint32_t)sizeof(scan_buf) : (uint32_t)datalen;
+      memcpy(scan_buf, data, scan_len);
+      do_scan = 1;
+    }
+    /* P1 #4/#5：对幸存的（会话起始）深扫做速率限制；CPU/RSS 压力下进一步收紧。 */
+    if (do_scan) {
+      uint32_t rate = s_cfg->resource_limit.shellcode_packets_per_sec;
+      if (edr_resource_preprocess_throttle_active()) {
+        uint32_t throttled = (rate == 0u) ? 250u : (rate / 4u);
+        if (throttled < 50u) {
+          throttled = 50u;
+        }
+        rate = throttled; /* 即便配置为不限(0)，压力下也强制设上限 */
+      }
+      if (!edr_token_bucket_admit(&s_scan_bucket, rate, edr_win_now_ns())) {
+        do_scan = 0;
+        rate_limited = 1;
+        rate_for_log = rate;
+      }
+    }
+    wd_unlock();
+    if (rate_limited && (InterlockedIncrement(&s_rate_drop_count) % 1000) == 1) {
+      fprintf(stderr, "[shellcode_detector] scan rate-limited (>%u/s or under resource pressure), dropped=%ld\n",
+              (unsigned)rate_for_log, (long)s_rate_drop_count);
+    }
+    if (do_scan) {
+      int qr = scan_queue_push(scan_buf, scan_len, buf, recvlen, is_v6, dp, sp, src, dst,
+                               v4_src, v4_dst, &stream_key, have_stream_key);
+      if (qr != 0) {
+        LONG dropped = InterlockedIncrement(&s_scan_queue_dropped);
+        if ((dropped % 1000) == 1) {
+          fprintf(stderr, "[shellcode_detector] scan queue drop reason=%s dropped=%ld\n",
+                  qr > 0 ? "queue_full" : "allocation_failed", (long)dropped);
+        }
+      }
+    }
   }
+  return 0;
+}
+
+static int windivert_appdir_path(wchar_t *out, DWORD out_cap) {
+  if (!out || out_cap == 0u) {
+    return -1;
+  }
+  DWORD n = GetModuleFileNameW(NULL, out, out_cap);
+  if (n == 0u || n >= out_cap) {
+    return -1;
+  }
+  wchar_t *slash = wcsrchr(out, L'\\');
+  if (!slash) {
+    return -1;
+  }
+  size_t dir_len = (size_t)(slash - out) + 1u;
+  size_t name_len = wcslen(kWdDllName);
+  if (dir_len + name_len + 1u > out_cap) {
+    return -1;
+  }
+  memcpy(slash + 1, kWdDllName, (name_len + 1u) * sizeof(wchar_t));
   return 0;
 }
 
 static int load_windivert(void) {
   wchar_t wpath[512];
-  if (ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\WinDivert.dll", wpath,
-                                (DWORD)(sizeof(wpath) / sizeof(wpath[0]))) == 0u) {
-    return -1;
+  DWORD err = ERROR_SUCCESS;
+  int appdir_present = 0;
+  if (windivert_appdir_path(wpath, (DWORD)(sizeof(wpath) / sizeof(wpath[0]))) == 0) {
+    appdir_present = GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES;
+    if (appdir_present) {
+      s_wd_dll = LoadLibraryW(wpath);
+      if (!s_wd_dll) {
+        err = GetLastError();
+        fprintf(stderr, "[shellcode_detector] LoadLibrary bundled WinDivert failed err=%lu (path=%ls)\n", err,
+                wpath);
+        runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_appdir_load_failed", err);
+        return -1;
+      }
+      snprintf(s_runtime.windivert_source, sizeof(s_runtime.windivert_source), "%s", "appdir");
+    }
   }
-  s_wd_dll = LoadLibraryW(wpath);
   if (!s_wd_dll) {
-    fprintf(stderr, "[shellcode_detector] LoadLibrary WinDivert.dll failed err=%lu (path=%ls)\n", GetLastError(),
-            wpath);
-    return -1;
+    UINT n = GetSystemDirectoryW(wpath, (UINT)(sizeof(wpath) / sizeof(wpath[0])));
+    if (n == 0u || n >= sizeof(wpath) / sizeof(wpath[0]) ||
+        (size_t)n + 1u + wcslen(kWdDllName) + 1u > sizeof(wpath) / sizeof(wpath[0])) {
+      runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_system_path_failed", GetLastError());
+      return -1;
+    }
+    wpath[n++] = L'\\';
+    memcpy(wpath + n, kWdDllName, (wcslen(kWdDllName) + 1u) * sizeof(wchar_t));
+    s_wd_dll = LoadLibraryW(wpath);
+    if (!s_wd_dll) {
+      err = GetLastError();
+      fprintf(stderr, "[shellcode_detector] LoadLibrary WinDivert failed err=%lu (appdir_present=%d path=%ls)\n",
+              err, appdir_present, wpath);
+      runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_dll_load_failed", err);
+      return -1;
+    }
+    snprintf(s_runtime.windivert_source, sizeof(s_runtime.windivert_source), "%s", "system32");
   }
+  s_runtime.dll_loaded = 1;
 #define LOAD(sym, dst, T)                                                                         \
   dst = (T)(void *)GetProcAddress(s_wd_dll, #sym);                                               \
   if (!(dst)) {                                                                                   \
     fprintf(stderr, "[shellcode_detector] GetProcAddress %s failed\n", #sym);                    \
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_symbol_missing",          \
+                ERROR_PROC_NOT_FOUND);                                                            \
+    FreeLibrary(s_wd_dll);                                                                        \
+    s_wd_dll = NULL;                                                                              \
+    s_runtime.dll_loaded = 0;                                                                     \
     return -1;                                                                                    \
   }
   LOAD(WinDivertOpen, s_open, PFN_WinDivertOpen);
@@ -710,21 +1371,79 @@ static int load_windivert(void) {
   LOAD(WinDivertSetParam, s_setparam, PFN_WinDivertSetParam);
   LOAD(WinDivertHelperParsePacket, s_parse, PFN_WinDivertHelperParsePacket);
 #undef LOAD
-  (void)kWdDllPath;
   return 0;
 }
 
+static void scan_workers_stop(void) {
+  InterlockedExchange(&s_scan_stop, 1);
+  if (s_scan_items) {
+    for (uint32_t i = 0; i < s_thread_count; i++) ReleaseSemaphore(s_scan_items, 1, NULL);
+  }
+  for (uint32_t i = 0; i < EDR_WD_MAX_THREADS; i++) {
+    if (s_scan_threads[i]) {
+      WaitForSingleObject(s_scan_threads[i], INFINITE);
+      CloseHandle(s_scan_threads[i]);
+      s_scan_threads[i] = NULL;
+    }
+  }
+  if (s_scan_jobs) {
+    for (uint32_t i = 0; i < s_scan_capacity; i++) scan_job_release(&s_scan_jobs[i]);
+    free(s_scan_jobs);
+    s_scan_jobs = NULL;
+  }
+  s_scan_capacity = s_scan_head = s_scan_tail = s_scan_count = 0u;
+  if (s_scan_items) {
+    CloseHandle(s_scan_items);
+    s_scan_items = NULL;
+  }
+  if (s_scan_lock_init) {
+    DeleteCriticalSection(&s_scan_lock);
+    s_scan_lock_init = 0;
+  }
+  if (s_detection_lock_init) {
+    DeleteCriticalSection(&s_detection_lock);
+    s_detection_lock_init = 0;
+  }
+  InterlockedExchange(&s_scan_stop, 0);
+}
+
 EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
+  const int arm64_os = native_windows_is_arm64();
+  memset(&s_runtime, 0, sizeof(s_runtime));
+  InterlockedExchange(&s_packets_received, 0);
+  InterlockedExchange(&s_receive_errors, 0);
+  InterlockedExchange(&s_scan_queue_dropped, 0);
+  InterlockedExchange(&s_scan_jobs_processed, 0);
+  InterlockedExchange(&s_alert_seq, 0);
+  s_runtime.code_supported = 1;
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  s_runtime.build_supported = 0;
+#else
+  s_runtime.build_supported = arm64_os ? 0 : 1;
+#endif
+  s_runtime.policy_enabled = cfg && cfg->shellcode_detector.enabled ? 1 : 0;
   s_cfg = cfg;
   s_bus = bus;
   InterlockedExchange(&s_capture_stop, 0);
   if (!cfg || !cfg->shellcode_detector.enabled) {
+    runtime_set(EDR_SHELLCODE_RUNTIME_DISABLED, "disabled", "policy_disabled", ERROR_SUCCESS);
     return EDR_OK;
   }
+#if defined(_M_ARM64) || defined(_ARM64_) || defined(__aarch64__)
+  runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "unavailable",
+              "arm64_windivert_driver_unavailable", ERROR_NOT_SUPPORTED);
+  return EDR_ERR_WINDIVERT_OPEN;
+#endif
+  if (arm64_os) {
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "unavailable",
+                "arm64_x64_emulation_windivert_unavailable", ERROR_NOT_SUPPORTED);
+    return EDR_ERR_WINDIVERT_OPEN;
+  }
+  runtime_set(EDR_SHELLCODE_RUNTIME_STARTING, "starting", "loading_windivert", ERROR_SUCCESS);
   (void)edr_shellcode_known_init(cfg->shellcode_detector.yara_rules_dir);
   if (load_windivert() != 0) {
-    fprintf(stderr, "[shellcode_detector] WinDivert 不可用，跳过捕获（安装 DLL/驱动至 System32）\n");
-    return EDR_OK;
+    fprintf(stderr, "[shellcode_detector] WinDivert unavailable; capture skipped (install DLL/driver to System32)\n");
+    return EDR_ERR_WINDIVERT_OPEN;
   }
   log_windivert_service_hint();
   if (!s_wsa_started) {
@@ -732,7 +1451,7 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) {
       s_wsa_started = 1;
     } else {
-      fprintf(stderr, "[shellcode_detector] WSAStartup failed (IPv6 地址显示可能异常)\n");
+      fprintf(stderr, "[shellcode_detector] WSAStartup failed (IPv6 address display may be incomplete)\n");
     }
   }
   UINT64 flags = (UINT64)(WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
@@ -744,30 +1463,62 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     pri = -30000;
   }
   const char *wd_filter = kWdFilter;
+  int dyn_ready = 0;
   if (cfg->shellcode_detector.windivert_ports_is_custom && cfg->shellcode_detector.windivert_tcp_ports_parsed_count > 0u) {
     if (build_windivert_filter_string(cfg, s_wd_filter_dyn, sizeof(s_wd_filter_dyn)) != 0) {
-      fprintf(stderr, "[shellcode_detector] WinDivert 过滤器字符串过长，回退内置端口表\n");
+      fprintf(stderr, "[shellcode_detector] WinDivert filter string too long; falling back to built-in port table\n");
     } else {
       wd_filter = s_wd_filter_dyn;
-      fprintf(stderr, "[shellcode_detector] WinDivert 自定义 TCP 端口数=%zu\n",
+      dyn_ready = 1;
+      fprintf(stderr, "[shellcode_detector] WinDivert custom TCP ports=%zu\n",
               cfg->shellcode_detector.windivert_tcp_ports_parsed_count);
+    }
+  }
+  /* 自流量排除（默认开）：把平台/中继/代理 IP 在内核过滤器层剔除，避免 EDR 自抓自。 */
+  if (cfg->shellcode_detector.exclude_self_traffic) {
+    if (!dyn_ready) {
+      snprintf(s_wd_filter_dyn, sizeof(s_wd_filter_dyn), "%s", kWdFilter);
+    }
+    int n_excl = append_self_exclusion(cfg, s_wd_filter_dyn, sizeof(s_wd_filter_dyn));
+    if (n_excl > 0) {
+      wd_filter = s_wd_filter_dyn;
+      fprintf(stderr, "[shellcode_detector] self-traffic exclusion: %d platform/relay/proxy addr(s) filtered\n",
+              n_excl);
+    } else if (n_excl < 0) {
+      fprintf(stderr, "[shellcode_detector] self-traffic exclusion skipped (filter too long)\n");
     }
   }
   s_handle = s_open(wd_filter, (WINDIVERT_LAYER)0, pri, flags);
   if (s_handle == INVALID_HANDLE_VALUE) {
-    fprintf(stderr, "[shellcode_detector] WinDivertOpen 失败 err=%lu（常见：非管理员/驱动未装），继续运行但不捕获\n",
-            GetLastError());
+    DWORD err = GetLastError();
+    fprintf(stderr, "[shellcode_detector] WinDivertOpen failed err=%lu (common: not admin or driver missing); continuing without capture\n",
+            err);
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "windivert_open_failed", err);
     if (s_wsa_started) {
       (void)WSACleanup();
       s_wsa_started = 0;
     }
     FreeLibrary(s_wd_dll);
     s_wd_dll = NULL;
-    return EDR_OK;
+    s_runtime.dll_loaded = 0;
+    return EDR_ERR_WINDIVERT_OPEN;
   }
-  (void)s_setparam(s_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 8192ull);
-  (void)s_setparam(s_handle, WINDIVERT_PARAM_QUEUE_SIZE, 8ull * 1024ull * 1024ull);
-  (void)s_setparam(s_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000ull);
+  s_runtime.driver_open = 1;
+  /* P2 #8：队列参数可配（0=内置默认）。 */
+  {
+    uint64_t qlen = cfg->shellcode_detector.windivert_queue_length ? cfg->shellcode_detector.windivert_queue_length
+                                                                   : 8192ull;
+    uint64_t qsize = cfg->shellcode_detector.windivert_queue_size_kb
+                         ? (uint64_t)cfg->shellcode_detector.windivert_queue_size_kb * 1024ull
+                         : 8ull * 1024ull * 1024ull;
+    uint64_t qtime = cfg->shellcode_detector.windivert_queue_time_ms ? cfg->shellcode_detector.windivert_queue_time_ms
+                                                                     : 2000ull;
+    (void)s_setparam(s_handle, WINDIVERT_PARAM_QUEUE_LENGTH, qlen);
+    (void)s_setparam(s_handle, WINDIVERT_PARAM_QUEUE_SIZE, qsize);
+    (void)s_setparam(s_handle, WINDIVERT_PARAM_QUEUE_TIME, qtime);
+    fprintf(stderr, "[shellcode_detector] WinDivert queue: length=%llu size=%lluKiB time=%llums\n",
+            (unsigned long long)qlen, (unsigned long long)(qsize / 1024ull), (unsigned long long)qtime);
+  }
 
   if (cfg->shellcode_detector.forensic_save_pcap && cfg->shellcode_detector.forensic_ring_slots > 0u) {
     uint32_t slots = cfg->shellcode_detector.forensic_ring_slots;
@@ -787,8 +1538,75 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     }
   }
 
-  s_thread = CreateThread(NULL, 0, wd_thread_main, NULL, 0, NULL);
-  if (!s_thread) {
+  {
+    uint32_t stream_bytes = cfg->shellcode_detector.flow_scan_first_bytes;
+    if (stream_bytes < cfg->shellcode_detector.max_payload_inspect) {
+      stream_bytes = cfg->shellcode_detector.max_payload_inspect;
+    }
+    if (stream_bytes < 256u) stream_bytes = 256u;
+    if (stream_bytes > 65535u) stream_bytes = 65535u;
+    s_reassembly = edr_tcp_reassembly_create(
+        cfg->shellcode_detector.reassembly_max_flows, stream_bytes,
+        (uint64_t)cfg->shellcode_detector.reassembly_memory_limit_kb * 1024ull,
+        (uint64_t)cfg->shellcode_detector.reassembly_idle_timeout_s * 1000000000ull);
+    if (!s_reassembly) {
+      fprintf(stderr, "[shellcode_detector] TCP reassembly allocation failed\n");
+      if (s_ring_mem) {
+        free(s_ring_mem);
+        s_ring_mem = NULL;
+        s_ring_slots = s_ring_stride = s_ring_w = s_ring_r = s_ring_count = 0u;
+      }
+      s_close(s_handle);
+      s_handle = INVALID_HANDLE_VALUE;
+      if (s_wsa_started) {
+        (void)WSACleanup();
+        s_wsa_started = 0;
+      }
+      FreeLibrary(s_wd_dll);
+      s_wd_dll = NULL;
+      s_runtime.dll_loaded = 0;
+      s_runtime.driver_open = 0;
+      runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "tcp_reassembly_alloc_failed", ERROR_NOT_ENOUGH_MEMORY);
+      return EDR_ERR_MEM_LIMIT;
+    }
+    fprintf(stderr, "[shellcode_detector] TCP reassembly: flows=%u stream=%u memory=%uKiB idle=%us\n",
+            cfg->shellcode_detector.reassembly_max_flows, stream_bytes,
+            cfg->shellcode_detector.reassembly_memory_limit_kb,
+            cfg->shellcode_detector.reassembly_idle_timeout_s);
+  }
+  /* P1 #4：令牌桶状态清零，下次首包按满桶起步。 */
+  s_scan_bucket.tokens = 0.0;
+  s_scan_bucket.last_ns = 0u;
+  InterlockedExchange(&s_rate_drop_count, 0);
+
+  /* 一条捕获线程只负责 recv/解析/重组/入队；detector_threads 专门运行检测worker。 */
+  s_thread_count = cfg->shellcode_detector.detector_threads;
+  if (s_thread_count < 1u) {
+    s_thread_count = 1u;
+  } else if (s_thread_count > EDR_WD_MAX_THREADS) {
+    s_thread_count = EDR_WD_MAX_THREADS;
+  }
+  InitializeCriticalSection(&s_lock);
+  s_lock_init = 1;
+  InitializeCriticalSection(&s_scan_lock);
+  s_scan_lock_init = 1;
+  InitializeCriticalSection(&s_detection_lock);
+  s_detection_lock_init = 1;
+  s_scan_capacity = cfg->shellcode_detector.scan_queue_capacity;
+  s_scan_jobs = (EdrShellcodeScanJob *)calloc(s_scan_capacity, sizeof(*s_scan_jobs));
+  s_scan_items = CreateSemaphoreA(NULL, 0, (LONG)s_scan_capacity + (LONG)EDR_WD_MAX_THREADS, NULL);
+  if (!s_scan_jobs || !s_scan_items) {
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "scan_queue_alloc_failed", GetLastError());
+    scan_workers_stop();
+    DeleteCriticalSection(&s_lock);
+    s_lock_init = 0;
+    edr_tcp_reassembly_destroy(s_reassembly);
+    s_reassembly = NULL;
+    if (s_ring_mem) {
+      free(s_ring_mem);
+      s_ring_mem = NULL;
+      s_ring_slots = s_ring_stride = s_ring_w = s_ring_r = s_ring_count = 0u;
+    }
     s_close(s_handle);
     s_handle = INVALID_HANDLE_VALUE;
     if (s_wsa_started) {
@@ -797,14 +1615,94 @@ EdrError edr_windivert_capture_start(const EdrConfig *cfg, EdrEventBus *bus) {
     }
     FreeLibrary(s_wd_dll);
     s_wd_dll = NULL;
+    s_runtime.dll_loaded = 0;
+    s_runtime.driver_open = 0;
+    return EDR_ERR_MEM_LIMIT;
+  }
+  s_scan_head = s_scan_tail = s_scan_count = 0u;
+  InterlockedExchange(&s_scan_stop, 0);
+  uint32_t started = 0u;
+  for (uint32_t i = 0; i < s_thread_count; i++) {
+    s_scan_threads[i] = CreateThread(NULL, 0, scan_thread_main, NULL, 0, NULL);
+    if (s_scan_threads[i]) {
+      started++;
+    }
+  }
+  if (started == 0u) {
+    scan_workers_stop();
+    DeleteCriticalSection(&s_lock);
+    s_lock_init = 0;
+    s_thread_count = 1u;
+    edr_tcp_reassembly_destroy(s_reassembly);
+    s_reassembly = NULL;
+    if (s_ring_mem) {
+      free(s_ring_mem);
+      s_ring_mem = NULL;
+      s_ring_slots = s_ring_stride = s_ring_w = s_ring_r = s_ring_count = 0u;
+    }
+    s_close(s_handle);
+    s_handle = INVALID_HANDLE_VALUE;
+    if (s_wsa_started) {
+      (void)WSACleanup();
+      s_wsa_started = 0;
+    }
+    FreeLibrary(s_wd_dll);
+    s_wd_dll = NULL;
+    s_runtime.dll_loaded = 0;
+    s_runtime.driver_open = 0;
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "scan_worker_start_failed", GetLastError());
     return EDR_ERR_INTERNAL;
   }
-  fprintf(stderr, "[shellcode_detector] WinDivert 捕获线程已启动（SNIFF+RECV_ONLY）\n");
+  s_thread_count = started;
+  s_capture_thread = CreateThread(NULL, 0, wd_thread_main, NULL, 0, NULL);
+  if (!s_capture_thread) {
+    DWORD err = GetLastError();
+    scan_workers_stop();
+    DeleteCriticalSection(&s_lock);
+    s_lock_init = 0;
+    edr_tcp_reassembly_destroy(s_reassembly);
+    s_reassembly = NULL;
+    if (s_ring_mem) {
+      free(s_ring_mem);
+      s_ring_mem = NULL;
+      s_ring_slots = s_ring_stride = s_ring_w = s_ring_r = s_ring_count = 0u;
+    }
+    s_close(s_handle);
+    s_handle = INVALID_HANDLE_VALUE;
+    if (s_wsa_started) {
+      (void)WSACleanup();
+      s_wsa_started = 0;
+    }
+    FreeLibrary(s_wd_dll);
+    s_wd_dll = NULL;
+    s_runtime.dll_loaded = 0;
+    s_runtime.driver_open = 0;
+    runtime_set(EDR_SHELLCODE_RUNTIME_DEGRADED, "degraded", "capture_thread_start_failed", err);
+    return EDR_ERR_INTERNAL;
+  }
+  s_runtime.capture_threads = 1u;
+  s_runtime.scan_workers = started;
+  s_runtime.scan_queue_capacity = s_scan_capacity;
+  runtime_set(EDR_SHELLCODE_RUNTIME_HEALTHY, "healthy", "capture_running", ERROR_SUCCESS);
+  fprintf(stderr, "[shellcode_detector] WinDivert capture started: capture=1 workers=%u queue=%u (SNIFF+RECV_ONLY)\n",
+          (unsigned)started, (unsigned)s_scan_capacity);
   return EDR_OK;
 }
 
 void edr_windivert_capture_stop(void) {
   InterlockedExchange(&s_capture_stop, 1);
+  /* 先关句柄并停止唯一捕获线程，再排空检测队列，最后释放共享状态。 */
+  if (s_handle != INVALID_HANDLE_VALUE && s_close) {
+    s_close(s_handle);
+    s_handle = INVALID_HANDLE_VALUE;
+  }
+  if (s_capture_thread) {
+    WaitForSingleObject(s_capture_thread, INFINITE);
+    CloseHandle(s_capture_thread);
+    s_capture_thread = NULL;
+  }
+  scan_workers_stop();
+  /* 线程已退出 —— 释放环形缓冲 / 重组表 / TCP 缓存。 */
   if (s_ring_mem) {
     free(s_ring_mem);
     s_ring_mem = NULL;
@@ -812,15 +1710,21 @@ void edr_windivert_capture_stop(void) {
     s_ring_stride = 0;
     s_ring_w = s_ring_r = s_ring_count = 0;
   }
-  if (s_handle != INVALID_HANDLE_VALUE && s_close) {
-    s_close(s_handle);
-    s_handle = INVALID_HANDLE_VALUE;
+  if (s_reassembly) {
+    edr_tcp_reassembly_destroy(s_reassembly);
+    s_reassembly = NULL;
   }
-  if (s_thread) {
-    WaitForSingleObject(s_thread, 15000);
-    CloseHandle(s_thread);
-    s_thread = NULL;
+  if (s_tcp_tab) {
+    free(s_tcp_tab);
+    s_tcp_tab = NULL;
+    s_tcp_tab_cap = 0u;
+    s_tcp_tab_ts_ns = 0u;
   }
+  if (s_lock_init) {
+    DeleteCriticalSection(&s_lock);
+    s_lock_init = 0;
+  }
+  s_thread_count = 1u;
   if (s_wd_dll) {
     FreeLibrary(s_wd_dll);
     s_wd_dll = NULL;
@@ -838,4 +1742,45 @@ void edr_windivert_capture_stop(void) {
     s_wsa_started = 0;
   }
   InterlockedExchange(&s_capture_stop, 0);
+  s_runtime.driver_open = 0;
+  s_runtime.capture_threads = 0u;
+  s_runtime.scan_workers = 0u;
+  s_runtime.scan_queue_depth = 0u;
+  runtime_set(EDR_SHELLCODE_RUNTIME_STOPPED, "stopped", "capture_stopped", ERROR_SUCCESS);
+}
+
+uint64_t edr_windivert_capture_budget_drop_count(void) {
+  return (uint64_t)(unsigned long)InterlockedCompareExchange(&s_budget_drop_count, 0, 0);
+}
+
+uint64_t edr_windivert_capture_rate_drop_count(void) {
+  return (uint64_t)(unsigned long)InterlockedCompareExchange(&s_rate_drop_count, 0, 0);
+}
+
+void edr_windivert_capture_get_runtime(EdrShellcodeDetectorRuntime *out) {
+  if (!out) {
+    return;
+  }
+  *out = s_runtime;
+  out->packets_received = (uint64_t)(unsigned long)InterlockedCompareExchange(&s_packets_received, 0, 0);
+  out->receive_errors = (uint64_t)(unsigned long)InterlockedCompareExchange(&s_receive_errors, 0, 0);
+  out->scan_queue_dropped = (uint64_t)(unsigned long)InterlockedCompareExchange(&s_scan_queue_dropped, 0, 0);
+  out->scan_jobs_processed = (uint64_t)(unsigned long)InterlockedCompareExchange(&s_scan_jobs_processed, 0, 0);
+  if (s_scan_lock_init) {
+    EnterCriticalSection(&s_scan_lock);
+    out->scan_queue_depth = s_scan_count;
+    out->scan_queue_capacity = s_scan_capacity;
+    LeaveCriticalSection(&s_scan_lock);
+  }
+  if (s_reassembly) {
+    EdrTcpReassemblyStats stats;
+    wd_lock();
+    edr_tcp_reassembly_get_stats(s_reassembly, &stats);
+    wd_unlock();
+    out->reassembly_active_streams = stats.active_streams;
+    out->reassembly_memory_bytes = stats.memory_bytes;
+    out->reassembly_out_of_order = stats.out_of_order_segments;
+    out->reassembly_evicted = stats.evicted_streams;
+    out->reassembly_memory_drops = stats.memory_drops;
+  }
 }

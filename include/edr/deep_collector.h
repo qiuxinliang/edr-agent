@@ -16,6 +16,7 @@ typedef enum {
   EDR_DC_ERR_TIMEOUT = -4,
   EDR_DC_ERR_CRASH = -5,
   EDR_DC_ERR_DISABLED = -6,
+  EDR_DC_ERR_CANCELLED = -7,
 } EdrDeepCollectorError;
 
 typedef struct {
@@ -60,6 +61,10 @@ typedef struct {
   const char *output_dir;    /* 本地产物目录 */
   const char *extra_args;    /* 透传 collector,如 "--pid=1234 --full"（已做基本清洗） */
   uint32_t timeout_s;        /* 0 表示默认 300s */
+  uint32_t cpu_limit_percent; /* Windows Job CPU 硬上限；0=默认 10，交互式查询可单独提高 */
+  int needs_velociraptor;    /* 1=velo 层(运行前确保 velociraptor 就绪到其槽位);0=builtin/其它,不拉 velo */
+  int (*cancel_requested)(void *user); /* blocking 模式每 100ms 检查；非零时终止整个子进程树 */
+  void *cancel_user;
 } EdrCollectorRunSpec;
 
 /**
@@ -84,5 +89,8 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec,
  * 单槽:同一时刻只允许一个采集;busy 时调用方应返回"忙"。
  */
 int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, size_t detail_cap);
+
+/** 后台预取/版本检查 adapter 与 Velociraptor；已在运行时自动合并，不阻塞命令热路径。 */
+void edr_deep_collector_schedule_runtime_refresh(void);
 
 #endif

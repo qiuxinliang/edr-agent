@@ -1,5 +1,153 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+add_executable(test_shell_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_policy.c
+  ${CMAKE_SOURCE_DIR}/src/command/shell_exec.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_shell_policy PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_shell_policy)
+add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_inbox PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_command_inbox)
+add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+if(WIN32)
+  target_link_libraries(test_command_inbox PRIVATE advapi32)
+endif()
+
+if(NOT WIN32)
+  add_executable(test_shell_session_stream
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_session_stream.c
+    ${CMAKE_SOURCE_DIR}/src/shell/shell_session.c)
+  target_include_directories(test_shell_session_stream PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  edr_apply_common_warnings(test_shell_session_stream)
+  add_test(NAME shell_session_stream_completeness COMMAND test_shell_session_stream
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
+
+add_executable(test_command_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_contract PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_command_contract)
+add_test(NAME command_registry_and_payload_contract COMMAND test_command_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_executor.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c)
+target_include_directories(test_command_executor PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_command_executor PRIVATE Threads::Threads)
+edr_apply_common_warnings(test_command_executor)
+add_test(NAME command_executor_thread_isolation COMMAND test_command_executor
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_active_type_tls
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_command_active_type_tls.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_util.c)
+target_include_directories(test_command_active_type_tls PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_command_active_type_tls PRIVATE Threads::Threads)
+edr_apply_common_warnings(test_command_active_type_tls)
+add_test(NAME command_active_type_thread_isolation COMMAND test_command_active_type_tls
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_cancel ${CMAKE_CURRENT_SOURCE_DIR}/test_command_cancel.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c)
+target_include_directories(test_command_cancel PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_command_cancel PRIVATE Threads::Threads)
+edr_apply_common_warnings(test_command_cancel)
+add_test(NAME command_cancellation_registry COMMAND test_command_cancel
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_signing.c
+  ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+target_include_directories(test_request_signing PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_request_signing)
+add_test(NAME request_signing COMMAND test_request_signing WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_command_result_json ${CMAKE_CURRENT_SOURCE_DIR}/test_command_result_json.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_result_json PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_command_result_json)
+add_test(NAME command_result_json_contract COMMAND test_command_result_json
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_attack_surface_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_contract.c)
+edr_apply_common_warnings(test_attack_surface_contract)
+add_test(NAME attack_surface_command_ingest_contract COMMAND test_attack_surface_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(attack_surface_command_ingest_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_process_identity_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_process_identity_contract.c)
+edr_apply_common_warnings(test_process_identity_contract)
+add_test(NAME process_identity_lifecycle_contract COMMAND test_process_identity_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(process_identity_lifecycle_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_attack_surface_inventory_policy
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_inventory_policy.c
+  ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_inventory.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_attack_surface_inventory_policy PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(WIN32)
+  target_link_libraries(test_attack_surface_inventory_policy PRIVATE netapi32 advapi32)
+endif()
+edr_apply_common_warnings(test_attack_surface_inventory_policy)
+add_test(NAME attack_surface_inventory_policy COMMAND test_attack_surface_inventory_policy)
+
+add_executable(test_control_stream_lease_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_control_stream_lease_contract.c)
+edr_apply_common_warnings(test_control_stream_lease_contract)
+add_test(NAME control_stream_lease_contract COMMAND test_control_stream_lease_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(control_stream_lease_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_mtls_upload_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_upload_contract.c)
+edr_apply_common_warnings(test_mtls_upload_contract)
+add_test(NAME mtls_upload_transport_contract COMMAND test_mtls_upload_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(mtls_upload_transport_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_yara_delivery_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_yara_delivery_contract.c)
+edr_apply_common_warnings(test_yara_delivery_contract)
+add_test(NAME yara_delivery_contract COMMAND test_yara_delivery_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(yara_delivery_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_windows_headless_runtime_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_headless_runtime_contract.c)
+edr_apply_common_warnings(test_windows_headless_runtime_contract)
+add_test(NAME windows_headless_runtime_contract COMMAND test_windows_headless_runtime_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(windows_headless_runtime_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+add_executable(test_remote_config_status_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_config_status_contract.c)
+edr_apply_common_warnings(test_remote_config_status_contract)
+add_test(NAME remote_config_status_contract COMMAND test_remote_config_status_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(remote_config_status_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 function(edr_absolutize_sources output_var)
   set(_edr_abs_sources)
   foreach(_edr_source ${ARGN})
@@ -45,14 +193,20 @@ set(_edr_test_ave_sdk_sources
 )
 # 与 `edr_agent` 一致：`ave_behavior_pipeline` → `edr_behavior_alert_emit_to_batch` 的依赖链
 set(_edr_test_behavior_emit_sources
+  ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
   ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
+  ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_v2.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_stub.c
   ${CMAKE_SOURCE_DIR}/src/core/time_util.c
@@ -66,6 +220,7 @@ target_include_directories(edr_ave_test_common INTERFACE
   ${CMAKE_SOURCE_DIR}/src/ave
   ${CMAKE_SOURCE_DIR}/third_party/tomlc99
   ${CMAKE_SOURCE_DIR}/third_party/nanopb
+  ${CMAKE_SOURCE_DIR}/third_party/cjson
   ${CMAKE_SOURCE_DIR}/src/proto
 )
 target_compile_definitions(edr_ave_test_common INTERFACE EDR_HAVE_NANOPB=1)
@@ -139,17 +294,28 @@ target_link_libraries(test_ave_suppression PRIVATE edr_ave_test_common)
 
 add_executable(test_detection_decision ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_detection_decision PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_decision)
 add_test(NAME detection_decision_combo COMMAND test_detection_decision WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_detection_regression ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_regression.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_detection_regression PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_regression)
 add_test(NAME detection_regression_scenarios COMMAND test_detection_regression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_detection_profile_trigger
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_profile_trigger.c
+  ${CMAKE_SOURCE_DIR}/src/detection/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/detection_trigger.c)
+target_include_directories(test_detection_profile_trigger PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_detection_profile_trigger)
+add_test(NAME detection_profile_and_trigger_modes COMMAND test_detection_profile_trigger
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_webshell_semantic ${CMAKE_CURRENT_SOURCE_DIR}/test_webshell_semantic.c ${CMAKE_SOURCE_DIR}/src/webshell_detector/webshell_semantic.c)
 target_include_directories(test_webshell_semantic PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -160,7 +326,9 @@ add_executable(test_detection_sensor_bridge ${CMAKE_CURRENT_SOURCE_DIR}/test_det
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c)
 target_include_directories(test_detection_sensor_bridge PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_detection_sensor_bridge)
 if(NOT MSVC)
@@ -202,7 +370,9 @@ add_test(NAME windows_event_policy COMMAND test_windows_event_policy WORKING_DIR
 add_executable(test_p0_direct_emit_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_direct_emit_suppression.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_enforcement.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_p0_direct_emit_suppression PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)
 edr_apply_common_warnings(test_p0_direct_emit_suppression)
@@ -226,12 +396,29 @@ target_include_directories(test_preprocess_dedup PRIVATE ${CMAKE_SOURCE_DIR}/inc
 edr_apply_common_warnings(test_preprocess_dedup)
 add_test(NAME preprocess_dedup COMMAND test_preprocess_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_process_tree_cache ${CMAKE_CURRENT_SOURCE_DIR}/test_process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c)
+target_include_directories(test_process_tree_cache PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(UNIX)
+  target_link_libraries(test_process_tree_cache PRIVATE Threads::Threads)
+endif()
+edr_apply_common_warnings(test_process_tree_cache)
+add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c)
 target_include_directories(test_local_evidence_cache_candidate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(SQLite3_FOUND)
+  if(TARGET SQLite3::SQLite3)
+    target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite3::SQLite3)
+  else()
+    target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite::SQLite3)
+  endif()
+  target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_SQLITE=1)
+endif()
 edr_apply_common_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -253,6 +440,15 @@ else()
   target_sources(test_ave_pipeline PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_stub.c)
 endif()
 
+if(WIN32)
+  foreach(_edr_ave_windows_test
+      test_ave_sdk test_ave_fl_abi test_ave_e2e_full test_ave_hotfix_smoke test_ave_pipeline)
+    target_sources(${_edr_ave_windows_test} PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_win_util.c)
+    target_link_libraries(${_edr_ave_windows_test} PRIVATE iphlpapi ws2_32)
+  endforeach()
+endif()
+
 add_executable(test_ave_behavior_features_m3a ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_behavior_features_m3a.c ${CMAKE_SOURCE_DIR}/src/ave/ave_behavior_features.c)
 target_include_directories(test_ave_behavior_features_m3a PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_executable(test_ave_cross_engine_parse ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_cross_engine_parse.c ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c)
@@ -261,7 +457,8 @@ add_executable(test_ave_cross_engine_feed_quality
   ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_cross_engine_feed_quality.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_feed.c
-  ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c)
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_cross_engine_parse.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
 target_include_directories(test_ave_cross_engine_feed_quality PRIVATE ${CMAKE_SOURCE_DIR}/include)
 if(NOT WIN32)
   target_link_libraries(test_ave_cross_engine_parse PRIVATE m)
@@ -539,10 +736,17 @@ target_include_directories(test_shellcode PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/windivert
 )
+if(WIN32)
+  target_sources(test_shellcode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stub_shellcode_runtime_hooks.c)
+endif()
 if(EDR_YARA_AVAILABLE)
   target_compile_definitions(test_shellcode PRIVATE EDR_HAVE_YARA=1)
-  target_include_directories(test_shellcode PRIVATE ${YARA_INCLUDE_DIR})
-  target_link_libraries(test_shellcode PRIVATE ${YARA_LIB})
+  if(EDR_YARA_TARGET)
+    target_link_libraries(test_shellcode PRIVATE ${EDR_YARA_TARGET})
+  else()
+    target_include_directories(test_shellcode PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(test_shellcode PRIVATE ${YARA_LIB})
+  endif()
 endif()
 if(WIN32)
   target_link_libraries(test_shellcode PRIVATE advapi32 ws2_32 iphlpapi)
@@ -552,6 +756,7 @@ if(UNIX AND NOT WIN32)
 endif()
 edr_apply_common_warnings(test_shellcode)
 add_test(NAME shellcode_modules COMMAND test_shellcode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_modules PROPERTIES LABELS "shellcode")
 
 # §A bundled shellcode YARA 规则可加载 + 已知漏洞命中（无 YARA 时回退内置匹配器）
 add_executable(test_shellcode_yara_rules ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_yara_rules.c ${_edr_shellcode_sources_abs})
@@ -559,12 +764,19 @@ target_include_directories(test_shellcode_yara_rules PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/windivert
 )
+if(WIN32)
+  target_sources(test_shellcode_yara_rules PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stub_shellcode_runtime_hooks.c)
+endif()
 target_compile_definitions(test_shellcode_yara_rules PRIVATE
   EDR_SHELLCODE_RULES_DIR="${CMAKE_SOURCE_DIR}/src/shellcode_detector/rules")
 if(EDR_YARA_AVAILABLE)
   target_compile_definitions(test_shellcode_yara_rules PRIVATE EDR_HAVE_YARA=1)
-  target_include_directories(test_shellcode_yara_rules PRIVATE ${YARA_INCLUDE_DIR})
-  target_link_libraries(test_shellcode_yara_rules PRIVATE ${YARA_LIB})
+  if(EDR_YARA_TARGET)
+    target_link_libraries(test_shellcode_yara_rules PRIVATE ${EDR_YARA_TARGET})
+  else()
+    target_include_directories(test_shellcode_yara_rules PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(test_shellcode_yara_rules PRIVATE ${YARA_LIB})
+  endif()
 endif()
 if(WIN32)
   target_link_libraries(test_shellcode_yara_rules PRIVATE advapi32 ws2_32 iphlpapi)
@@ -574,6 +786,25 @@ if(UNIX AND NOT WIN32)
 endif()
 edr_apply_common_warnings(test_shellcode_yara_rules)
 add_test(NAME shellcode_yara_rules COMMAND test_shellcode_yara_rules WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_yara_rules PROPERTIES LABELS "shellcode")
+
+add_executable(test_yara_rule_catalog_compile ${CMAKE_CURRENT_SOURCE_DIR}/test_yara_rule_catalog_compile.c)
+target_include_directories(test_yara_rule_catalog_compile PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_yara_rule_catalog_compile PRIVATE
+  EDR_FORENSIC_RULES_DIR="${CMAKE_SOURCE_DIR}/rules/forensic"
+  EDR_SHELLCODE_RULES_DIR="${CMAKE_SOURCE_DIR}/src/shellcode_detector/rules"
+  EDR_WEBSHELL_RULES_DIR="${CMAKE_SOURCE_DIR}/src/webshell_detector/rules")
+if(EDR_YARA_AVAILABLE)
+  target_compile_definitions(test_yara_rule_catalog_compile PRIVATE EDR_HAVE_YARA=1)
+  if(EDR_YARA_TARGET)
+    target_link_libraries(test_yara_rule_catalog_compile PRIVATE ${EDR_YARA_TARGET})
+  else()
+    target_include_directories(test_yara_rule_catalog_compile PRIVATE ${YARA_INCLUDE_DIR})
+    target_link_libraries(test_yara_rule_catalog_compile PRIVATE ${YARA_LIB})
+  endif()
+endif()
+edr_apply_common_warnings(test_yara_rule_catalog_compile)
+add_test(NAME yara_rule_catalog_compile COMMAND test_yara_rule_catalog_compile WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # P0 #2/#3 流级去重 + TLS 记录短路（纯逻辑，跨平台）
 add_executable(test_shellcode_flow_dedup
@@ -583,6 +814,42 @@ add_executable(test_shellcode_flow_dedup
 target_include_directories(test_shellcode_flow_dedup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_shellcode_flow_dedup)
 add_test(NAME shellcode_flow_dedup COMMAND test_shellcode_flow_dedup WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_flow_dedup PROPERTIES LABELS "shellcode")
+
+add_executable(test_shellcode_tcp_reassembly
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_tcp_reassembly.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/tcp_reassembly.c)
+target_include_directories(test_shellcode_tcp_reassembly PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_shellcode_tcp_reassembly)
+add_test(NAME shellcode_tcp_reassembly COMMAND test_shellcode_tcp_reassembly
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_tcp_reassembly PROPERTIES LABELS "shellcode")
+
+add_executable(test_shellcode_server_benchmark
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_server_benchmark.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/tcp_reassembly.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/proto_parse.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/shellcode_entropy.c
+  ${CMAKE_SOURCE_DIR}/src/shellcode_detector/shellcode_heuristic.c)
+target_include_directories(test_shellcode_server_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_shellcode_server_benchmark)
+if(UNIX AND NOT WIN32)
+  target_link_libraries(test_shellcode_server_benchmark PRIVATE m)
+endif()
+add_test(NAME shellcode_server_benchmark COMMAND test_shellcode_server_benchmark
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_server_benchmark PROPERTIES
+  LABELS "shellcode;performance;release-gate"
+  TIMEOUT 30)
+
+add_executable(test_shellcode_runtime_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shellcode_runtime_contract.c)
+edr_apply_common_warnings(test_shellcode_runtime_contract)
+add_test(NAME shellcode_runtime_truth_contract COMMAND test_shellcode_runtime_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shellcode_runtime_truth_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+  LABELS "shellcode")
 
 # 端侧网络扇出/扫描检测器核心逻辑
 add_executable(test_net_fanout
@@ -600,5 +867,43 @@ add_executable(test_self_protect_heartbeat
 target_include_directories(test_self_protect_heartbeat PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_self_protect_heartbeat)
 add_test(NAME self_protect_heartbeat COMMAND test_self_protect_heartbeat WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Release blocker: ordinary behavior-alert output must stay within the endpoint/rule SLO.
+add_executable(test_alert_governor_cardinality
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_alert_governor_cardinality.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
+target_include_directories(test_alert_governor_cardinality PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_alert_governor_cardinality PRIVATE EDR_HAVE_NANOPB=1)
+if(UNIX AND NOT WIN32)
+  target_link_libraries(test_alert_governor_cardinality PRIVATE Threads::Threads)
+endif()
+edr_apply_common_warnings(test_alert_governor_cardinality)
+add_test(NAME alert_cardinality_release_gate COMMAND test_alert_governor_cardinality WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(alert_cardinality_release_gate PROPERTIES LABELS "release-gate")
+
+add_executable(test_policy_v2
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_policy_v2.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
+target_include_directories(test_policy_v2 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_policy_v2)
+add_test(NAME endpoint_policy_v2_modes COMMAND test_policy_v2 WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_forensic_result_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_result_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c)
+target_include_directories(test_forensic_result_contract PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_forensic_result_contract)
+add_test(NAME forensic_result_contract COMMAND test_forensic_result_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_event_batch_max_age
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_event_batch_max_age.c
+  ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c)
+target_include_directories(test_event_batch_max_age PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_event_batch_max_age)
+add_test(NAME event_batch_max_age COMMAND test_event_batch_max_age WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)

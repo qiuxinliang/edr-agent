@@ -149,7 +149,18 @@ function Remove-PathPattern {
       Remove-Item -LiteralPath $item.FullName -Force -Recurse -ErrorAction Stop
       Write-Preflight "removed $Label $($item.FullName)"
     } catch {
-      Write-Warning "[preflight] failed to remove $Label $($item.FullName): $_"
+      if (Test-IsWindows) {
+        try { & takeown.exe /F $item.FullName /A 2>$null | Out-Null } catch {}
+        try {
+          & icacls.exe $item.FullName /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
+        } catch {}
+      }
+      try {
+        Remove-Item -LiteralPath $item.FullName -Force -Recurse -ErrorAction Stop
+        Write-Preflight "repaired ACL and removed $Label $($item.FullName)"
+      } catch {
+        Write-Warning "[preflight] failed to remove $Label $($item.FullName): $_"
+      }
     }
   }
 }

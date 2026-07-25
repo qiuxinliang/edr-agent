@@ -1,4 +1,4 @@
-#include "edr/detection_profile.h"
+#include "edr/detection_mode.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +12,7 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
 static int streq_ci(const char *a, const char *b) {
   if (!a || !b) return 0;
   while (*a && *b) {
@@ -27,6 +28,7 @@ static int env_is_on(const char *name) {
   if (!v || !v[0]) return 0;
   return strcmp(v, "1") == 0 || streq_ci(v, "true") || streq_ci(v, "yes") || streq_ci(v, "on");
 }
+#endif
 
 static int path_exists(const char *p) {
   if (!p || !p[0]) return 0;
@@ -62,13 +64,6 @@ static int auto_shellcode_enabled(const EdrConfig *cfg) {
   }
 #endif
   return 0;
-}
-
-static int auto_pmfe_idle_enabled(const EdrConfig *cfg) {
-  if (!cfg) return 0;
-  if (cfg->pmfe.idle_scan_enabled) return 1;
-  if (env_is_on("EDR_PMFE_AUTO_PROFILE")) return 1;
-  return cfg->attack_surface.enabled ? 1 : 0;
 }
 
 void edr_detection_apply_profile(EdrConfig *cfg) {
@@ -112,22 +107,27 @@ void edr_detection_apply_profile(EdrConfig *cfg) {
 
   switch (cfg->detection.pmfe_mode) {
     case 0:
-      cfg->pmfe.idle_scan_enabled = false;
       break;
     case 1:
-      cfg->pmfe.idle_scan_enabled = true;
       break;
     case 2:
-      cfg->pmfe.idle_scan_enabled = false;
       break;
     case -1:
-      if (cfg->detection.auto_profile) {
-        cfg->pmfe.idle_scan_enabled = auto_pmfe_idle_enabled(cfg) ? true : false;
-      }
       break;
     default:
       cfg->detection.pmfe_mode = 0;
-      cfg->pmfe.idle_scan_enabled = false;
       break;
   }
+}
+
+int edr_detection_apply_remote_modes(EdrConfig *current, const EdrConfig *remote) {
+  int changed;
+  if (!current || !remote) return 0;
+  changed = current->detection.auto_profile != remote->detection.auto_profile ||
+            current->detection.shellcode_mode != remote->detection.shellcode_mode ||
+            current->detection.webshell_mode != remote->detection.webshell_mode ||
+            current->detection.pmfe_mode != remote->detection.pmfe_mode;
+  current->detection = remote->detection;
+  edr_detection_apply_profile(current);
+  return changed;
 }

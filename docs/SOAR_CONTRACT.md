@@ -11,17 +11,24 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `command_id` | string | 指令唯一标识（建议 UUID）；与回传结果 **必填** 对齐。 |
-| `command_type` | string | 逻辑类型，如 `noop`、`ping`、`echo`、`isolate`、`kill`、`forensic`；**PMFE（§21）**：`pmfe_scan` / `CMD_PMFE_SCAN`（内存粗扫入队，见 `pmfe_engine.c`）；**AVE（§5）**：`ave_status` / `ave_fingerprint` / `ave_infer`；**自保护/健康**：`self_protect_status` / `agent_health` / `health_status`（见 `command_stub.c`）；**攻击面（§19）**：`GET_ATTACK_SURFACE` / `get_attack_surface` / `REFRESH_ATTACK_SURFACE`（采集并 `POST` 平台 `.../endpoints/:id/attack-surface`，见 `attack_surface_report.c`）。 |
+| `command_type` | string | 逻辑类型，如 `noop`、`ping`、`echo`、`isolate`、`restore_host`、`isolate_status`、`kill`、`forensic`；**RTQ/RTR P0**：`rtq_query`、`rtr_process_tree`、`rtr_list_connections`、`rtr_file_stat`、`rtr_get_file`、`rtr_rm_file`、`eventlog_view`、`registry_query`、`quarantine_file`、`unquarantine_file`、`rtr_shell`；**PMFE（§21）**：`pmfe_scan` / `CMD_PMFE_SCAN`（内存粗扫入队，见 `pmfe_engine.c`）；**AVE（§5）**：`ave_status` / `ave_fingerprint` / `ave_infer`；**自保护/健康**：`self_protect_status` / `agent_health` / `health_status`（见 `command_stub.c`）；**攻击面（§19）**：`GET_ATTACK_SURFACE` / `get_attack_surface` / `REFRESH_ATTACK_SURFACE`（采集并 `POST` 平台 `.../endpoints/:id/attack-surface`，见 `attack_surface_report.c`）。 |
 | `payload` | bytes | 类型相关参数（如 kill 的 `{"pid":1234}` UTF-8 JSON）。 |
 | **SOAR 扩展（可选，空表示非编排下发）** | | |
 | `soar_correlation_id` | string | 与 SOAR **工单 / 全局 run** 关联，建议 UUID。 |
 | `playbook_run_id` | string | 某次 playbook **实例** id。 |
 | `playbook_step_id` | string | playbook 内 **步骤** id。 |
 | `issued_at_unix_ms` | int64 | 服务端签发时间（Unix 毫秒）；`0` 表示未填。 |
-| `deadline_ms` | uint32 | 建议最大执行耗时（毫秒）；`0` 表示未限制（终端当前为 **提示性**，未强制杀）。 |
-| `idempotency_key` | string | 幂等键，便于服务端去重。 |
+| `deadline_ms` | uint32 | 建议最大执行耗时（毫秒）；`0` 表示未限制。终端按 `issued_at_unix_ms + deadline_ms` 做入站过期校验，过期返回 `response_status=timeout`。 |
+| `idempotency_key` | string | 幂等键，服务端与终端本地状态库共同去重。生产签名优先格式为 `<idempotency>|sigv2|ed25519|<key_id>|<base64url_signature>`；旧版兼容格式为 `<idempotency>|sigv1|<key_id>|<hmac_sha256_hex>`。终端去重与签名 canonical 均使用签名前缀 `<idempotency>`。 |
 
 **C 侧结构体**：`EdrSoarCommandMeta`（`include/edr/command.h`）与上表一一对应（定长缓冲，由 gRPC 层截断写入）。
+
+### 1.1 控制面可靠性与恢复语义
+
+- Agent 在验签、过期检查与本地 `command_state` / inbox 持久化成功后，才发送控制面接收 ACK。ACK 请求失败会写入私有 ACK outbox 并由主循环重试；ACK 的送达状态不影响已经可靠接收或已开始执行的命令。
+- HTTP 控制流的 `ready` 是活动租约，不是一次性连接标志。`server_hello`、控制流 heartbeat 或成功解析的 `command_envelope` 刷新活动时间；默认租约为 `90000ms`，可通过 `EDR_CONTROL_STREAM_LEASE_MS` 在 `10000ms` 至 `3600000ms` 内调整。租约过期后，Agent 将控制流标记为 `lease_expired`，并允许已启用的 HTTPS long-poll 立即恢复取命令，即使底层流线程仍在等待 I/O。
+- 引擎心跳的 `communication.enterprise.protocol` 提供 `control_stream_lease_valid`、最后活动时间、租约截止时间和过期计数。诊断画像还在 `command_delivery.quarantine` 输出损坏持久化记录的隔离数量与最近原因。
+- inbox 与 ACK 目录中被完整读取后确认格式非法、字段缺失或超出大小限制的 `.json` 记录，会原子移动到同目录受权限保护的 `quarantine/`，并写入本地审计。打开失败、权限/安全校验失败、读取失败或内存不足不会删除或隔离原记录，以避免把暂时性故障误判为数据损坏。
 
 ### AVE 指令 payload（UTF-8 JSON）
 
@@ -36,17 +43,36 @@
 
 | command_type | payload | 说明 |
 |----------------|---------|------|
-| `pmfe_scan` / `CMD_PMFE_SCAN` | `{"pid":1234}` | 将目标 PID 提交 PMFE 工作队列，**异步**执行：**Windows**：模块基线 + VAD 粗筛 + **高分区精读**（`EDR_PMFE_VAD_PEEK` 个区域，默认 8）：读首 512B 统计 **MZ 命中**、**Shannon 熵**；可选 **`EDR_PMFE_AVE_TEMPFILE=1`** 时对最多 3 个 MZ 区写入 `%TEMP%\\edr_pmfe_<pid>_<addr>.bin` 并调用 **`AVE_ScanFile`**（与主进程 **`AVE_InitFromEdrConfig`** 一致；需已 `edr_pmfe_bind_config` + 模型就绪 / 或 `EDR_AVE_INFER_DRY_RUN=1`）。**Linux**：`/proc/<pid>/maps` 基线统计。`ReportCommandResult` 的 **OK** 仅表示已入队。摘要写入 stderr / `EDR_CMD_AUDIT_PATH`。其它可选：`EDR_PMFE_STOMP_BYTES`、`EDR_PMFE_DISK_HASH_MAX`。 |
+| `pmfe_scan` / `CMD_PMFE_SCAN` | `{"pid":1234}` | 将目标 PID 提交 PMFE 工作队列，**异步**执行：**Windows**：模块基线 + VAD 粗筛 + **高分区精读**（`EDR_PMFE_VAD_PEEK` 个区域，默认 8）：读首 512B 统计 **MZ 命中**、**Shannon 熵**；可选 **`EDR_PMFE_AVE_TEMPFILE=1`** 时对最多 3 个 MZ 区写入 `%TEMP%\\edr_pmfe_<pid>_<addr>.bin` 并调用 **`AVE_ScanFile`**（与主进程 **`AVE_InitFromEdrConfig`** 一致；需已 `edr_pmfe_bind_config` + 模型就绪 / 或 `EDR_AVE_INFER_DRY_RUN=1`）。**Linux**：`/proc/<pid>/maps` 基线统计。`ReportCommandResult` 的枚举仍为 **OK**，但 `detail_utf8.status=queued` 表示已入队。摘要写入 stderr / `EDR_CMD_AUDIT_PATH`。其它可选：`EDR_PMFE_STOMP_BYTES`、`EDR_PMFE_DISK_HASH_MAX`。 |
 
 - **禁用 PMFE 线程**：`EDR_PMFE_DISABLED=1` 时 `edr_pmfe_init` 不启动工作线程，`pmfe_scan` 将因「未运行」入队失败。
 - **预处理自动入队 PMFE**：**Windows**：`EDR_PMFE_ETW_AUTO=1` 且 PMFE 已初始化时，对 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（WinDivert ETW1）：当 `score` ≥ **`EDR_PMFE_ETW_SHELLCODE_SCORE`**（默认 **0.65**）时，将 **`br.pid`**（或 ETW1 中 **`hint_pid`** → `epid` 覆盖后的 PID）或按 **`dpt`** 经 **`GetExtendedTcpTable`** 解析的本地 IPv4 端口属主 PID 提交 **`edr_pmfe_submit_etw_scan_ex`**（内部 `etw:shellcode`；**`slot.priority==0`→P0 否则 P1**；ETW1 可选 **`va=`/`hint=`** 为 VAD 精扫 hint）。**`EDR_PMFE_ETW_COOLDOWN_MS`** 同 PID 冷却，默认 **30000**。**不依赖** `EDR_CMD_ENABLED`。**Linux**：同变量下对 **`EDR_EVENT_WEBSHELL_DETECTED`** 提交 **`etw:webshell`**（P0/P1 由 `slot.priority`）。
 - **监听表刷新（Windows / Linux）**：**`edr_pmfe_init`** 后 **60s** 周期 **`edr_pmfe_listen_table_refresh`**。**Windows**：ETW Kernel-Process 的 **`EDR_EVENT_PROCESS_CREATE` / `EDR_EVENT_PROCESS_TERMINATE`** 会触发 **`edr_pmfe_on_process_lifecycle_hint`**（约 **1s** 去抖）。**Linux**：同样 API，可由未来进程事件源调用；设 **`EDR_PMFE_LISTEN_REFRESH_ON_PROCESS=0`** 可关闭去抖。`EDR_PMFE_DISABLED=1` 时不登记延迟刷新。
 
+### RTQ/RTR P0 指令 payload（UTF-8 JSON）
+
+| command_type | payload | 说明 |
+|----------------|---------|------|
+| `rtq_query` / `RTQ_QUERY` | `{"event_type":"process|network|file|registry|script|shellcode|webshell|pmfe","pid":1234,"limit":50,"time_window_s":600}` | 从端侧 **内存 ring** 优先返回最近元数据，SQLite `local_evidence_cache.db` 可用时补历史；支持 `endpoint_id`、`process_name_contains`、`cmdline_contains`、`file_path_contains`、`remote_ip`、`registry_key_contains`。只查元数据，不读取文件内容。 |
+| `rtr_process_tree` / `RTR_PROCESS_TREE` | `{"pid":1234,"endpoint_id":"optional"}` | 从进程缓存返回 root 与直接子进程，用于告警进程树补全。 |
+| `rtr_list_connections` / `RTR_LIST_CONNECTIONS` | `{"pid":1234,"limit":50,"time_window_s":600}` | 等价于带 `event_type=network` 的 RTQ 查询，返回最近连接元数据。 |
+| `rtr_file_stat` / `file_stat` / `RTR_FILE_STAT` | `{"path":"/abs/path"}` | 只读文件元数据：大小、mtime、SHA256。 |
+| `rtr_get_file` / `rtr_file_get` / `RTR_GET_FILE` | `{"path":"/abs/path","max_size_bytes":104857600}` | 远程取文件：计算 SHA256 后上传，结果在 `detail_utf8.artifacts[]` 中返回本地路径、哈希、大小与 `minio_key`；文件可读但上传失败时返回 `partial_success`。 |
+| `rtr_rm_file` / `rtr_file_rm` / `RTR_RM_FILE` | `{"path":"/abs/path"}` | 删除指定普通文件，需高危策略与生产签名。 |
+| `eventlog_view` / `rtr_eventlog` / `RTR_EVENTLOG` | `{"channel":"Security","max_events":100}` | Windows 通过 `wevtapi` 导出事件 XML JSON；非 Windows 以 `journalctl --output=json` 兜底。产物上传失败返回 `partial_success`。 |
+| `reg_query` / `registry_query` / `RTR_REG_QUERY` | `{"key":"HKLM\\Software\\...","max_values":200}` | Windows 查询注册表键值并生成 artifact；非 Windows 返回 `supported=false`。产物上传失败返回 `partial_success`。 |
+| `quarantine_file` / `file_quarantine` / `rtr_quarantine_file` | `{"path":"/abs/path","reason":"alert|manual"}` | 文件级隔离：移动文件到本地隔离目录并写 `.meta` 清单，返回 `quarantine_id`。需高危策略允许。 |
+| `unquarantine_file` / `restore_file` / `file_unquarantine` | `{"quarantine_id":"...","restore_path":"optional"}` | 按隔离清单恢复文件；默认恢复到原路径，目标已存在时拒绝。需高危策略允许。 |
+| `rtr_shell` / `RTR_SHELL` | `{"command":"whoami","timeout_sec":10}` | 最后兜底型远程命令执行。除高危策略外，**强制要求生产签名**，且必须提供 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key`；`EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS=1` 对该指令无效。执行前必须配置端侧 `EDR_RTR_SHELL_ALLOWLIST`（逗号分隔首 token，如 `whoami,hostname,ipconfig,tasklist,netstat,dir`），并经过默认破坏性 blocklist、控制操作符拦截、超时钳制、审计与本地状态库记录。超时返回 `response_status=timeout`。 |
+
 ### 高危指令策略
 
-- **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）。
+- **环境变量**：`EDR_CMD_ENABLED=1` 或 `EDR_CMD_DANGEROUS=1` 时允许 `kill` / `isolate` / `restore_host` / `forensic` / **`pmfe_scan`**（读他进程内存，与取证同级敏感）/ **RTR 文件、eventlog、registry、rtr_shell** / **`quarantine_file`** / **`unquarantine_file`**。
 - **配置**：`[command] allow_dangerous = true` 与上述环境变量等效（便于生产用 TOML 固定策略）。
 - **kill 白名单**（可选）：设置 `EDR_CMD_KILL_ALLOWLIST=1234,5678` 后，仅允许终止列表内 PID（仍须先满足高危策略）。
+- **生产签名**：高危指令默认要求命令签名；推荐服务端配置 `EDR_COMMAND_SIGNING_PRIVATE_KEY(_PATH)` 生成 `sigv2` Ed25519，Agent 配置 `[command] signing_public_key_path` 或 `EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH` 验签。旧 `EDR_COMMAND_SIGNING_KEY` / `sigv1` HMAC 仅作迁移兼容；Agent 配置公钥后默认不接受旧 HMAC，除非临时设置 `EDR_COMMAND_ACCEPT_LEGACY_HMAC=1`。签名 canonical 为 `command_id\ncommand_type\nidempotency\nissued_at_unix_ms\ndeadline_ms\npayload_sha256`。`rtr_shell` 始终强制签名，并要求 `issued_at_unix_ms`、`deadline_ms`、`idempotency_key` 同时存在。
+- **RTR shell 白名单**：`EDR_RTR_SHELL_ALLOWLIST` 为必填本地策略；`EDR_RTR_SHELL_MAX_TIMEOUT_SEC` 默认 `60`、硬上限 `300`；`EDR_RTR_SHELL_BLOCKLIST` 可追加本地禁用关键字。控制操作符（如 `&&`、管道、重定向、换行）默认拒绝。
+- **本地状态库**：默认写入 `C:\\Program Files\\EDR Agent\\state\\command_state.jsonl`（Windows）或 `/tmp/edr_command_state.jsonl`；可用 `EDR_COMMAND_STATE_DB` 覆盖。字段包含 `command_id`、`idempotency_key`、`response_status`、`retry_count`、`artifacts`，用于断网、重启、重复下发时的本地去重与追踪。
 
 ---
 
@@ -62,7 +88,7 @@
 | `soar_correlation_id` / `playbook_run_id` / `playbook_step_id` | 自下行 **回显**，便于编排闭合。 |
 | `status` | 见下节枚举。 |
 | `exit_code` | 约定型整数：`0` 成功；非 `0` 为子错误码（见实现内注释）。 |
-| `detail_utf8` | 短人类可读说明（英文或 UTF-8 中文均可，宜短）。 |
+| `detail_utf8` | `command_stub.c` 统一返回 JSON：`task_id`、`status`、`exit_code`、`artifacts`、`error`、`retryable`、`raw_detail`。 |
 | `finished_unix_ms` | 终端完成时间（Unix 毫秒）。 |
 
 ### `CommandExecutionStatus`（与 `EdrCommandExecutionStatus` 数值一致）
@@ -75,6 +101,17 @@
 | `FAILED` | 3 | 已接受执行但失败（如 kill 失败） |
 | `UNKNOWN_TYPE` | 4 | 未知 `command_type` |
 
+### 结果语义（`detail_utf8.status`）
+
+| 值 | 含义 |
+|----|------|
+| `ok` | 已完成且语义成功。 |
+| `failed` | 已接受执行但失败。 |
+| `partial_success` | 本地动作完成但上传/回传等后续闭环失败，例如 forensic bundle 已生成但上传失败。 |
+| `queued` | 异步任务已入队，最终执行结果需由后续事件/审计闭环确认。 |
+| `timeout` | 指令已过 `issued_at + deadline_ms`，终端拒绝执行。 |
+| `denied` | 策略、签名或 allowlist 拒绝。 |
+
 ---
 
 ## 3. 何时上报
@@ -83,7 +120,7 @@
 
 调试：设置环境变量 **`EDR_SOAR_REPORT_ALWAYS=1`** 时，对上述字段无要求也会尝试上报（便于联调）。
 
-未连接 gRPC 时，上报 API 失败；不影响本地审计（`EDR_CMD_AUDIT_PATH` 等仍可用）。
+未连接 gRPC 时，上报 API 失败；不影响本地审计（`EDR_CMD_AUDIT_PATH` 等仍可用）。取证与 artifact 上传失败时，终端写本地 outbox（默认 `C:\\Program Files\\EDR Agent\\upload_outbox` 或 `/tmp/edr_upload_outbox`，可用 `EDR_UPLOAD_OUTBOX_DIR` 覆盖），后续收到任意新指令时先尝试补传。
 
 ---
 

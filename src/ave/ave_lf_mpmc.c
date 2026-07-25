@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__) && !defined(_WIN32)
 
 #include <stdatomic.h>
 
@@ -116,14 +116,14 @@ size_t ave_mpmc_approx_depth(const AveMpmcQueue *q) {
 
 #include <windows.h>
 
-typedef struct {
+struct AveMpmcQueue {
   AVEBehaviorEvent *buf;
   size_t cap;
   size_t head;
   size_t count;
   CRITICAL_SECTION mu;
   int mu_inited;
-} AveMpmcQueue;
+};
 
 int ave_mpmc_init(AveMpmcQueue **out_q, size_t capacity) {
   if (!out_q || capacity < 2u) {
@@ -186,9 +186,10 @@ size_t ave_mpmc_approx_depth(const AveMpmcQueue *q) {
   if (!q) {
     return 0;
   }
-  EnterCriticalSection(&q->mu);
-  size_t n = q->count;
-  LeaveCriticalSection(&q->mu);
+  AveMpmcQueue *mq = (AveMpmcQueue *)q;
+  EnterCriticalSection(&mq->mu);
+  size_t n = mq->count;
+  LeaveCriticalSection(&mq->mu);
   return n;
 }
 
@@ -196,13 +197,13 @@ size_t ave_mpmc_approx_depth(const AveMpmcQueue *q) {
 
 #include <pthread.h>
 
-typedef struct {
+struct AveMpmcQueue {
   AVEBehaviorEvent *buf;
   size_t cap;
   size_t head;
   size_t count;
   pthread_mutex_t mu;
-} AveMpmcQueue;
+};
 
 int ave_mpmc_init(AveMpmcQueue **out_q, size_t capacity) {
   if (!out_q || capacity < 2u) {

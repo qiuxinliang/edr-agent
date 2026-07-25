@@ -20,6 +20,7 @@ void edr_ave_bp_set_callbacks(const AVECallbacks *callbacks);
  * @return AVE_OK / AVE_ERR_INVALID_PARAM / AVE_ERR_INTERNAL
  */
 int edr_ave_bp_start_monitor(const struct EdrConfig *cfg);
+void edr_ave_bp_configure_resource_limits(const struct EdrConfig *cfg);
 
 void edr_ave_bp_feed(const AVEBehaviorEvent *event);
 

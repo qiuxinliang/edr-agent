@@ -31,9 +31,11 @@
 #include <linux/cn_proc.h>
 
 #include "edr/collector.h"
+#include "edr/adaptive_collection.h"
 #include "edr/config.h"
 #include "edr/error.h"
 #include "edr/event_bus.h"
+#include "edr/heartbeat.h"
 #include "edr/pmfe.h"
 #include "edr/types.h"
 
@@ -59,6 +61,48 @@ static int s_started;
 static pthread_t s_proc_thread;
 static int s_proc_thread_valid;
 static int s_nl_sock = -1;
+static pthread_t s_audit_thread;
+static int s_audit_thread_valid;
+static FILE *s_audit_fp;
+static char s_audit_path[PATH_MAX];
+static pthread_t s_ebpf_thread;
+static int s_ebpf_thread_valid;
+static FILE *s_ebpf_fp;
+
+static EdrCollectorHealth s_health;
+
+typedef struct {
+  const char *name;
+  int x86_64_nr;
+  int aarch64_nr;
+  EdrEventType event_type;
+} LinuxAuditSyscallMap;
+
+static const LinuxAuditSyscallMap kAuditSyscalls[] = {
+    {"execve", 59, 221, EDR_EVENT_PROCESS_CREATE},
+    {"connect", 42, 203, EDR_EVENT_NET_CONNECT},
+    {"openat", 257, 56, EDR_EVENT_FILE_READ},
+    {"rename", 82, -1, EDR_EVENT_FILE_RENAME},
+    {"renameat", 264, 38, EDR_EVENT_FILE_RENAME},
+    {"renameat2", 316, 276, EDR_EVENT_FILE_RENAME},
+    {"unlink", 87, -1, EDR_EVENT_FILE_DELETE},
+    {"unlinkat", 263, 35, EDR_EVENT_FILE_DELETE},
+    {"chmod", 90, -1, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchmod", 91, 52, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchmodat", 268, 53, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"chown", 92, -1, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchown", 93, 55, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"lchown", 94, -1, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"fchownat", 260, 54, EDR_EVENT_FILE_PERMISSION_CHANGE},
+    {"setuid", 105, 146, EDR_EVENT_AUTH_PRIVILEGE_ESC},
+    {"ptrace", 101, 117, EDR_EVENT_PROCESS_INJECT},
+    {"process_vm_readv", 310, 270, EDR_EVENT_PROCESS_INJECT},
+    {"process_vm_writev", 311, 271, EDR_EVENT_PROCESS_INJECT},
+    {"memfd_create", 319, 279, EDR_EVENT_PROCESS_INJECT},
+    {"init_module", 175, 105, EDR_EVENT_DRIVER_LOAD},
+    {"finit_module", 313, 273, EDR_EVENT_DRIVER_LOAD},
+    {"delete_module", 176, 106, EDR_EVENT_DRIVER_LOAD},
+};
 
 static uint64_t edr_realtime_ns(void) {
   struct timespec ts;
@@ -85,6 +129,97 @@ static void trim_spaces(char *s) {
   }
 }
 
+static void copy_between_quotes(const char *line, const char *key, char *out, size_t cap) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  const char *p = strstr(line, key);
+  if (!p) {
+    return;
+  }
+  p += strlen(key);
+  if (*p == '"') {
+    p++;
+    size_t i = 0;
+    while (p[i] && p[i] != '"' && i + 1u < cap) {
+      out[i] = p[i];
+      i++;
+    }
+    out[i] = '\0';
+  } else {
+    size_t i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '\n' && i + 1u < cap) {
+      out[i] = p[i];
+      i++;
+    }
+    out[i] = '\0';
+  }
+}
+
+static long audit_long_field(const char *line, const char *key, long defv) {
+  const char *p = strstr(line, key);
+  if (!p) {
+    return defv;
+  }
+  p += strlen(key);
+  char *end = NULL;
+  long v = strtol(p, &end, 10);
+  return end != p ? v : defv;
+}
+
+static unsigned long audit_hex_field(const char *line, const char *key, unsigned long defv) {
+  const char *p = strstr(line, key);
+  if (!p) {
+    return defv;
+  }
+  p += strlen(key);
+  char *end = NULL;
+  unsigned long value = strtoul(p, &end, 16);
+  return end != p ? value : defv;
+}
+
+static int env_truthy(const char *key) {
+  const char *v = getenv(key);
+  return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
+static void audit_copy_optional(const char *line, const char *key, const char *out_key,
+                                char *buf, size_t cap) {
+  char val[PATH_MAX];
+  copy_between_quotes(line, key, val, sizeof(val));
+  if (val[0]) {
+    size_t used = strlen(buf);
+    (void)snprintf(buf + used, used < cap ? cap - used : 0u, "%s=%s\n", out_key, val);
+  }
+}
+
+static const LinuxAuditSyscallMap *audit_lookup_syscall(const char *line) {
+  char name[64];
+  copy_between_quotes(line, "syscall=", name, sizeof(name));
+  if (!name[0]) {
+    return NULL;
+  }
+  for (size_t i = 0; i < sizeof(kAuditSyscalls) / sizeof(kAuditSyscalls[0]); i++) {
+    if (strcmp(name, kAuditSyscalls[i].name) == 0) {
+      return &kAuditSyscalls[i];
+    }
+  }
+  char *end = NULL;
+  long nr = strtol(name, &end, 10);
+  if (end == name) {
+    return NULL;
+  }
+  int aarch64 = strstr(line, "arch=c00000b7") != NULL;
+  for (size_t i = 0; i < sizeof(kAuditSyscalls) / sizeof(kAuditSyscalls[0]); i++) {
+    int expected = aarch64 ? kAuditSyscalls[i].aarch64_nr : kAuditSyscalls[i].x86_64_nr;
+    if (expected >= 0 && nr == expected) {
+      return &kAuditSyscalls[i];
+    }
+  }
+  return NULL;
+}
+
 static const char *lookup_dir(int wd) {
   for (int i = 0; i < s_nwatch; i++) {
     if (s_watches[i].wd == wd) {
@@ -94,21 +229,45 @@ static const char *lookup_dir(int wd) {
   return "";
 }
 
-static EdrEventType map_inotify_mask(uint32_t mask) {
+static uint32_t edr_linux_inotify_default_mask(void) {
+  uint32_t mask = IN_CREATE | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO |
+                  IN_DELETE | IN_DELETE_SELF | IN_ATTRIB;
+  const char *v = getenv("EDR_INOTIFY_INCLUDE_MODIFY");
+  if (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) {
+    mask |= IN_MODIFY;
+  }
+  if ((v = getenv("EDR_INOTIFY_VERBOSE_ACCESS")) != NULL &&
+      (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) {
+    mask |= IN_OPEN | IN_ACCESS | IN_CLOSE_NOWRITE;
+  }
+  return mask;
+}
+
+static int edr_linux_map_inotify_mask(uint32_t mask, EdrEventType *out_type) {
+  if (!out_type) {
+    return 0;
+  }
   if ((mask & (IN_DELETE | IN_DELETE_SELF)) != 0u) {
-    return EDR_EVENT_FILE_DELETE;
+    *out_type = EDR_EVENT_FILE_DELETE;
+    return 1;
   }
   if ((mask & IN_CREATE) != 0u) {
-    return EDR_EVENT_FILE_CREATE;
+    *out_type = EDR_EVENT_FILE_CREATE;
+    return 1;
   }
   if ((mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0u) {
-    return EDR_EVENT_FILE_RENAME;
+    *out_type = EDR_EVENT_FILE_RENAME;
+    return 1;
   }
-  if ((mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB)) != 0u) {
-    return EDR_EVENT_FILE_WRITE;
+  if ((mask & IN_ATTRIB) != 0u) {
+    *out_type = EDR_EVENT_FILE_PERMISSION_CHANGE;
+    return 1;
   }
-  /* IN_OPEN / IN_ACCESS 等仍上报为写侧活动，便于观测 */
-  return EDR_EVENT_FILE_WRITE;
+  if ((mask & (IN_CLOSE_WRITE | IN_MODIFY)) != 0u) {
+    *out_type = EDR_EVENT_FILE_WRITE;
+    return 1;
+  }
+  return 0;
 }
 
 static int build_etw1_payload(uint8_t *out, size_t cap, const char *fullpath) {
@@ -127,7 +286,9 @@ static void push_inotify_event(uint32_t mask, const char *fullpath) {
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = edr_realtime_ns();
-  slot.type = map_inotify_mask(mask);
+  if (!edr_linux_map_inotify_mask(mask, &slot.type)) {
+    return;
+  }
   slot.consumed = false;
   slot.priority = 1;
   int plen = build_etw1_payload(slot.data, EDR_MAX_EVENT_PAYLOAD, fullpath);
@@ -135,7 +296,146 @@ static void push_inotify_event(uint32_t mask, const char *fullpath) {
     return;
   }
   slot.size = (uint32_t)plen;
-  (void)edr_event_bus_try_push(s_bus, &slot);
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    s_health.collector_dropped++;
+  }
+}
+
+static void push_audit_event(const char *line) {
+  if (!s_bus || !line || !line[0]) {
+    return;
+  }
+  const LinuxAuditSyscallMap *m = audit_lookup_syscall(line);
+  if (!m) {
+    return;
+  }
+  char comm[128], exe[PATH_MAX], auid[64], uid[64], gid[64], ses[64];
+  copy_between_quotes(line, "comm=", comm, sizeof(comm));
+  copy_between_quotes(line, "exe=", exe, sizeof(exe));
+  copy_between_quotes(line, "auid=", auid, sizeof(auid));
+  copy_between_quotes(line, "uid=", uid, sizeof(uid));
+  copy_between_quotes(line, "gid=", gid, sizeof(gid));
+  copy_between_quotes(line, "ses=", ses, sizeof(ses));
+  long pid = audit_long_field(line, "pid=", 0);
+  long ppid = audit_long_field(line, "ppid=", 0);
+  unsigned long target_pid = 0;
+  if (strcmp(m->name, "ptrace") == 0) {
+    target_pid = audit_hex_field(line, "a1=", 0);
+  } else if (strcmp(m->name, "process_vm_readv") == 0 || strcmp(m->name, "process_vm_writev") == 0) {
+    target_pid = audit_hex_field(line, "a0=", 0);
+  }
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_realtime_ns();
+  slot.type = m->event_type;
+  slot.priority = 0;
+  slot.consumed = false;
+  int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
+                   "ETW1\nprov=auditd\nsensor=auditd\nsyscall=%s\npid=%ld\nppid=%ld\nimg=%s\nprocess=%s\nauid=%s\nuid=%s\ngid=%s\nsession=%s\n",
+                   m->name, pid, ppid, exe[0] ? exe : "-", comm[0] ? comm : "-", auid[0] ? auid : "-",
+                   uid[0] ? uid : "-", gid[0] ? gid : "-", ses[0] ? ses : "-");
+  if (n <= 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
+    return;
+  }
+  audit_copy_optional(line, "cwd=", "cwd", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "name=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "addr=", "dst", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "family=", "family", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "success=", "success", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "exit=", "exit", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  if (target_pid > 0) {
+    size_t used = strlen((char *)slot.data);
+    (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
+                   "target_pid=%lu\n", target_pid);
+  }
+  if (env_truthy("EDR_LINUX_INCLUDE_RAW_AUDIT")) {
+    size_t used = strlen((char *)slot.data);
+    (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
+                   "raw=%.900s\n", line);
+  }
+  slot.size = (uint32_t)strlen((char *)slot.data);
+  s_health.auditd_events++;
+  s_health.security_audit_visible = 1;
+  if (m->event_type == EDR_EVENT_PROCESS_CREATE) {
+    s_health.powershell_visible |= (strstr(comm, "powershell") || strstr(exe, "powershell") ||
+                                    strstr(comm, "pwsh") || strstr(exe, "pwsh")) ? 1 : 0;
+  }
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    s_health.collector_dropped++;
+  }
+}
+
+static void push_ebpf_trace_event(const char *line) {
+  if (!s_bus || !line || !line[0]) {
+    return;
+  }
+  EdrEventType type = EDR_EVENT_PROCESS_CREATE;
+  const char *op = "execve";
+  if (strstr(line, "connect")) {
+    type = EDR_EVENT_NET_CONNECT;
+    op = "connect";
+  } else if (strstr(line, "openat")) {
+    type = EDR_EVENT_FILE_READ;
+    op = "openat";
+  } else if (strstr(line, "rename")) {
+    type = EDR_EVENT_FILE_RENAME;
+    op = "rename";
+  } else if (strstr(line, "unlink")) {
+    type = EDR_EVENT_FILE_DELETE;
+    op = "unlink";
+  } else if (strstr(line, "chmod") || strstr(line, "chown")) {
+    type = EDR_EVENT_FILE_PERMISSION_CHANGE;
+    op = strstr(line, "chown") ? "chown" : "chmod";
+  } else if (strstr(line, "setuid")) {
+    type = EDR_EVENT_AUTH_PRIVILEGE_ESC;
+    op = "setuid";
+  } else if (strstr(line, "ptrace")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "ptrace";
+  } else if (strstr(line, "process_vm_writev")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "process_vm_writev";
+  } else if (strstr(line, "process_vm_readv")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "process_vm_readv";
+  } else if (strstr(line, "memfd_create")) {
+    type = EDR_EVENT_PROCESS_INJECT;
+    op = "memfd_create";
+  } else if (strstr(line, "module")) {
+    type = EDR_EVENT_DRIVER_LOAD;
+    op = "module_load";
+  } else if (!strstr(line, "execve")) {
+    return;
+  }
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_realtime_ns();
+  slot.type = type;
+  slot.priority = 0;
+  long pid = audit_long_field(line, "pid=", 0);
+  int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
+                   "ETW1\nprov=ebpf\nsensor=ebpf\nsyscall=%s\npid=%ld\n", op, pid);
+  if (n <= 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
+    return;
+  }
+  audit_copy_optional(line, "comm=", "process", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "exe=", "img", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "file=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "path=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "dst=", "dst", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "dport=", "dport", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "target_pid=", "target_pid", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  audit_copy_optional(line, "name=", "memfd_name", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD);
+  if (env_truthy("EDR_LINUX_INCLUDE_RAW_EBPF")) {
+    size_t used = strlen((char *)slot.data);
+    (void)snprintf((char *)slot.data + used, used < EDR_MAX_EVENT_PAYLOAD ? EDR_MAX_EVENT_PAYLOAD - used : 0u,
+                   "raw=%.1100s\n", line);
+  }
+  slot.size = (uint32_t)strlen((char *)slot.data);
+  s_health.ebpf_events++;
+  if (!edr_event_bus_try_push(s_bus, &slot)) {
+    s_health.collector_dropped++;
+  }
 }
 
 static void process_inotify_buffer(const char *buf, ssize_t len) {
@@ -177,18 +477,18 @@ static int add_watches(int ifd) {
       continue;
     }
     if (s_nwatch >= MAX_WATCHES) {
-      fprintf(stderr, "[collector_linux] 已达 inotify 监视上限 (%d)，忽略后续路径\n", MAX_WATCHES);
+      fprintf(stderr, "[collector_linux] inotify watch limit reached (%d); ignoring remaining paths\n", MAX_WATCHES);
       break;
     }
     struct stat st;
     if (stat(tok, &st) != 0 || !S_ISDIR(st.st_mode)) {
-      fprintf(stderr, "[collector_linux] 跳过非目录或不可访问路径: %s\n", tok);
+      fprintf(stderr, "[collector_linux] skipping non-directory or inaccessible path: %s\n", tok);
       continue;
     }
-    uint32_t mask = IN_ALL_EVENTS;
+    uint32_t mask = edr_linux_inotify_default_mask();
     int wd = inotify_add_watch(ifd, tok, mask);
     if (wd < 0) {
-      fprintf(stderr, "[collector_linux] inotify_add_watch 失败 %s: %s\n", tok, strerror(errno));
+      fprintf(stderr, "[collector_linux] inotify_add_watch failed %s: %s\n", tok, strerror(errno));
       continue;
     }
     s_watches[s_nwatch].wd = wd;
@@ -215,6 +515,8 @@ static void *inotify_thread_main(void *arg) {
   char buf[INOTIFY_READ_BUF] __attribute__((aligned(sizeof(struct inotify_event))));
 
   while (!s_stop) {
+    /* inotify poll 超时 1s，空闲也会跳动，不会误报“卡死” */
+    edr_health_beat(EDR_HEALTH_COLLECTOR);
     struct pollfd fds[2];
     fds[0].fd = s_ifd;
     fds[0].events = POLLIN;
@@ -251,6 +553,49 @@ static void *inotify_thread_main(void *arg) {
       }
       process_inotify_buffer(buf, n);
     }
+  }
+  return NULL;
+}
+
+static void *audit_thread_main(void *arg) {
+  (void)arg;
+  char line[4096];
+  while (!s_stop && s_audit_fp) {
+    if (fgets(line, sizeof(line), s_audit_fp)) {
+      push_audit_event(line);
+      continue;
+    }
+    if (feof(s_audit_fp)) {
+      clearerr(s_audit_fp);
+      usleep(250000);
+      continue;
+    }
+    snprintf(s_health.auditd_last_error, sizeof(s_health.auditd_last_error), "read_failed:%s", strerror(errno));
+    break;
+  }
+  return NULL;
+}
+
+static void *ebpf_trace_thread_main(void *arg) {
+  (void)arg;
+  char line[2048];
+  while (!s_stop && s_ebpf_fp) {
+    if (fgets(line, sizeof(line), s_ebpf_fp)) {
+      push_ebpf_trace_event(line);
+      continue;
+    }
+    if (feof(s_ebpf_fp)) {
+      clearerr(s_ebpf_fp);
+      usleep(250000);
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+      clearerr(s_ebpf_fp);
+      usleep(100000);
+      continue;
+    }
+    snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "read_failed:%s", strerror(errno));
+    break;
   }
   return NULL;
 }
@@ -359,6 +704,12 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 
   s_bus = bus;
   s_stop = 0;
+  memset(&s_health, 0, sizeof(s_health));
+  s_health.etw_or_inotify_enabled = 1;
+  s_health.ebpf_enabled = cfg->collection.ebpf_enabled ? 1 : 0;
+  if (cfg->collection.ebpf_enabled) {
+    snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "%s", "loader_not_configured");
+  }
 
   if (pipe(s_pipe) != 0) {
     s_bus = NULL;
@@ -374,7 +725,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
 
   if (add_watches(s_ifd) != 0) {
-    fprintf(stderr, "[collector_linux] 无有效监视目录。可设置 EDR_INOTIFY_PATHS（逗号分隔），默认 /tmp\n");
+    fprintf(stderr, "[collector_linux] no valid watch directories; set EDR_INOTIFY_PATHS (comma-separated), default /tmp\n");
     close(s_ifd);
     s_ifd = -1;
     close_pipe_pair();
@@ -405,6 +756,70 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     }
   }
 
+  s_audit_thread_valid = 0;
+  s_audit_fp = NULL;
+  int audit_on = cfg->collection.auditd_enabled ? 1 : 0;
+  const char *ae = getenv("EDR_LINUX_AUDITD");
+  if (ae && ae[0]) {
+    audit_on = (ae[0] == '1') ? 1 : 0;
+  }
+  if (audit_on) {
+    snprintf(s_audit_path, sizeof(s_audit_path), "%s",
+             cfg->collection.auditd_log_path[0] ? cfg->collection.auditd_log_path : "/var/log/audit/audit.log");
+    const char *ap = getenv("EDR_LINUX_AUDITD_LOG");
+    if (ap && ap[0]) {
+      snprintf(s_audit_path, sizeof(s_audit_path), "%s", ap);
+    }
+    s_audit_fp = fopen(s_audit_path, "r");
+    s_health.auditd_enabled = 1;
+    if (!s_audit_fp) {
+      snprintf(s_health.auditd_last_error, sizeof(s_health.auditd_last_error), "open_failed:%s", strerror(errno));
+    } else {
+      s_health.auditd_running = 1;
+      (void)fseek(s_audit_fp, 0, SEEK_END);
+      if (pthread_create(&s_audit_thread, NULL, audit_thread_main, NULL) != 0) {
+        snprintf(s_health.auditd_last_error, sizeof(s_health.auditd_last_error), "%s", "pthread_create_failed");
+        fclose(s_audit_fp);
+        s_audit_fp = NULL;
+      } else {
+        s_audit_thread_valid = 1;
+      }
+    }
+  }
+
+  s_ebpf_thread_valid = 0;
+  s_ebpf_fp = NULL;
+  const char *ebpf_trace = getenv("EDR_LINUX_EBPF_TRACE_PIPE");
+  int ebpf_trace_on = cfg->collection.ebpf_enabled && !(ebpf_trace && ebpf_trace[0] == '0');
+  if (ebpf_trace_on) {
+    const char *tp = getenv("EDR_LINUX_EBPF_TRACE_PIPE_PATH");
+    if (!tp || !tp[0]) {
+      tp = "/run/edr-agent/ebpf-events.pipe";
+    }
+    int trace_fd = open(tp, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (trace_fd < 0) {
+      snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "trace_pipe_open_failed:%s", strerror(errno));
+    } else {
+      s_ebpf_fp = fdopen(trace_fd, "r");
+      if (!s_ebpf_fp) {
+        close(trace_fd);
+        snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "trace_pipe_fdopen_failed:%s", strerror(errno));
+      }
+    }
+    if (s_ebpf_fp) {
+      s_health.ebpf_loaded = 1;
+      snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "%s", "");
+      if (pthread_create(&s_ebpf_thread, NULL, ebpf_trace_thread_main, NULL) != 0) {
+        snprintf(s_health.ebpf_last_error, sizeof(s_health.ebpf_last_error), "%s", "trace_pipe_thread_failed");
+        fclose(s_ebpf_fp);
+        s_ebpf_fp = NULL;
+        s_health.ebpf_loaded = 0;
+      } else {
+        s_ebpf_thread_valid = 1;
+      }
+    }
+  }
+
   s_started = 1;
   return EDR_OK;
 }
@@ -427,6 +842,23 @@ void edr_collector_stop(void) {
       s_nl_sock = -1;
     }
   }
+  if (s_audit_thread_valid) {
+    (void)pthread_join(s_audit_thread, NULL);
+    s_audit_thread_valid = 0;
+  }
+  if (s_audit_fp) {
+    fclose(s_audit_fp);
+    s_audit_fp = NULL;
+  }
+  if (s_ebpf_thread_valid) {
+    (void)pthread_cancel(s_ebpf_thread);
+    (void)pthread_join(s_ebpf_thread, NULL);
+    s_ebpf_thread_valid = 0;
+  }
+  if (s_ebpf_fp) {
+    fclose(s_ebpf_fp);
+    s_ebpf_fp = NULL;
+  }
   (void)pthread_join(s_thread, NULL);
   s_started = 0;
   s_stop = 0;
@@ -441,4 +873,35 @@ void edr_collector_stop(void) {
   }
   close_pipe_pair();
   s_bus = NULL;
+}
+
+void edr_collector_stop_orphan_etw_session(void) {}
+
+void edr_collector_register_policy_canary_process(uint32_t pid, const char *command) {
+  (void)pid;
+  (void)command;
+}
+
+int edr_collector_get_health(EdrCollectorHealth *out_health) {
+  EdrAdaptiveCollectionStatus adaptive;
+  if (!out_health) {
+    return -1;
+  }
+  *out_health = s_health;
+  if (s_bus) {
+    out_health->queue_dropped = edr_event_bus_dropped_total(s_bus);
+  }
+  memset(&adaptive, 0, sizeof(adaptive));
+  edr_adaptive_collection_get_status(&adaptive);
+  out_health->adaptive_collection_enabled = adaptive.enabled;
+  out_health->adaptive_collection_active = adaptive.active;
+  out_health->adaptive_collection_ttl_s = adaptive.ttl_s;
+  out_health->adaptive_collection_remaining_s = adaptive.remaining_s;
+  out_health->adaptive_collection_min_severity = adaptive.min_severity;
+  out_health->adaptive_collection_level = adaptive.level;
+  out_health->adaptive_collection_boosts = adaptive.boosts;
+  out_health->adaptive_collection_last_boost_unix_ms = adaptive.last_boost_unix_ms;
+  snprintf(out_health->adaptive_collection_last_rule_id,
+           sizeof(out_health->adaptive_collection_last_rule_id), "%s", adaptive.last_rule_id);
+  return 0;
 }

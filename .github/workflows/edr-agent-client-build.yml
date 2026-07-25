@@ -185,9 +185,21 @@ jobs:
           if ('${{ inputs.full_features }}' -eq 'true') {
             Write-Host "[vcpkg] full detection build: sqlite + yara + static ONNX support (no grpc/fl)"
             & $tc install --x-feature=sqlite --x-feature=yara
+            $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
+            Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
+            foreach ($p in @(
+              (Join-Path $vcpkgX64 "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+              (Join-Path $vcpkgX64 "include\yara.h"),
+              (Join-Path $vcpkgX64 "include\yara\yara.h"),
+              (Join-Path $vcpkgX64 "lib\yara.lib"),
+              (Join-Path $vcpkgX64 "lib\libyara.lib")
+            )) {
+              if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
+            }
+
           } else {
-            Write-Host "[vcpkg] fast build: manifest defaults only (no grpc/onnx/yara)"
-            & $tc install
+            Write-Host "[vcpkg] fast build: manifest defaults + sqlite + yara (no grpc/onnx)"
+            & $tc install --x-feature=sqlite --x-feature=yara
           }
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -233,6 +245,8 @@ jobs:
           if ('${{ inputs.full_features }}' -eq 'true') {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
               -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+              "-DVCPKG_MANIFEST_FEATURES=yara" `
               "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
@@ -244,11 +258,15 @@ jobs:
               -DEDR_WITH_FL_TRAINER=OFF `
               -DEDR_WITH_FL_KAFKA=OFF `
               "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
+              -DEDR_WITH_YARA=ON `
+              -DEDR_REQUIRE_YARA=ON `
               -DEDR_BUILD_TESTS=OFF
           } else {
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
               -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+              "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+              "-DVCPKG_MANIFEST_FEATURES=yara" `
               "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
               -DCMAKE_C_COMPILER_LAUNCHER=sccache `
               -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
@@ -259,17 +277,39 @@ jobs:
               -DEDR_WITH_ONNXRUNTIME=OFF `
               -DEDR_WITH_FL_TRAINER=OFF `
               -DEDR_WITH_FL_KAFKA=OFF `
-              -DEDR_WITH_YARA=OFF `
-              "-DVCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_X64" `
+              "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
+              -DEDR_WITH_YARA=ON `
+              -DEDR_REQUIRE_YARA=ON `
               -DEDR_BUILD_TESTS=OFF
           }
           if (-not $?) { throw "cmake configure failed" }
+
+      - name: Verify YARA compile definition generated
+        shell: pwsh
+        run: |
+          $generated = @("build\build.ninja", "build\CMakeFiles\edr_agent.dir\flags.make") | Where-Object { Test-Path -LiteralPath $_ }
+          if (-not $generated) { throw "No generated build metadata found under build; cannot verify EDR_HAVE_YARA=1" }
+          $hasYara = $false
+          foreach ($p in $generated) {
+            if (Select-String -Path $p -SimpleMatch "EDR_HAVE_YARA=1" -Quiet) { $hasYara = $true; break }
+          }
+          if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
 
       - name: Build (Ninja + sccache)
         shell: pwsh
         run: |
           cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "FDSensor build failed with exit code $LASTEXITCODE"
+          }
           cmake --build build --target fd_installer_worker --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "FDSecurityInstallerWorker build failed with exit code $LASTEXITCODE"
+          }
+          cmake --build build --target fd_headless_uninstaller --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "headless uninstall.exe build failed with exit code $LASTEXITCODE"
+          }
 
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
@@ -288,6 +328,9 @@ jobs:
           if ($text.Contains("0.3.0")) {
             throw "FDSensor.exe still contains legacy agent version fallback 0.3.0"
           }
+          if ($text.Contains("This Agent build does not include libyara-backed YARA support")) {
+            throw "FDSensor.exe was built without libyara-backed YARA support"
+          }
 
       - name: sccache stats
         shell: bash
@@ -303,6 +346,14 @@ jobs:
             ./scripts/stage_ort_dlls_build_release.ps1
           }
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+          ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
+
+          $stagedYara = @(Get-ChildItem -Path "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
+          if (-not $stagedYara -or $stagedYara.Count -lt 1) {
+            Write-Warning "No YARA runtime DLL staged; vcpkg libyara may be static for x64-windows."
+          } else {
+            Write-Host "Verified staged YARA runtime DLL(s): $($stagedYara.Name -join ', ')"
+          }
 
       - name: Test
         shell: bash
@@ -347,7 +398,10 @@ jobs:
           if (-not $outDir -or -not $agentExe) { throw "missing FDSensor.exe under build\Release or build" }
           $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
           if (-not (Test-Path -LiteralPath $workerExe)) {
-            $workerExe = Get-ChildItem -Path build -Recurse -Filter "FDSecurityInstallerWorker.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            $foundWorker = Get-ChildItem -Path build -Recurse -Filter "FDSecurityInstallerWorker.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            if ($foundWorker) {
+              Copy-Item -LiteralPath $foundWorker -Destination $workerExe -Force
+            }
           }
           $items = New-Object System.Collections.Generic.List[string]
           if (-not (Test-Path "VERSION")) {
@@ -360,8 +414,23 @@ jobs:
           } else {
             throw "FDSecurityInstallerWorker.exe not found after build"
           }
+          $uninstallerExe = Join-Path $outDir "uninstall.exe"
+          if (-not (Test-Path -LiteralPath $uninstallerExe)) {
+            $foundUninstaller = Get-ChildItem -Path build -Recurse -Filter "uninstall.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            if ($foundUninstaller) { Copy-Item -LiteralPath $foundUninstaller -Destination $uninstallerExe -Force }
+          }
+          if (-not (Test-Path -LiteralPath $uninstallerExe)) { throw "headless uninstall.exe not found after build" }
+          $null = $items.Add($uninstallerExe)
+          $uninstallScript = Join-Path $outDir "uninstall.ps1"
+          Copy-Item -LiteralPath "scripts\edr_agent_uninstall.ps1" -Destination $uninstallScript -Force
+          $null = $items.Add($uninstallScript)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
+            $asset = Join-Path $outDir $p
+            if (-not (Test-Path -LiteralPath $asset)) { throw "missing staged WinDivert asset: $asset" }
+            $null = $items.Add($asset)
+          }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
             "scripts\edr_agent_preflight.ps1",
@@ -377,10 +446,26 @@ jobs:
           if (-not (Test-Path "config\p0_rule_bundle_ir_v1.json.enc")) {
             throw "missing encrypted P0 rule bundle: config\p0_rule_bundle_ir_v1.json.enc"
           }
+          $forensicRulesDir = "rules\forensic"
+          $requiredForensicRules = @(
+            "credential_theft.yar",
+            "injection.yar",
+            "lateral_movement.yar",
+            "packers.yar",
+            "privilege_escalation.yar",
+            "suspicious.yar"
+          )
+          foreach ($rule in $requiredForensicRules) {
+            $rulePath = Join-Path $forensicRulesDir $rule
+            if (-not (Test-Path -LiteralPath $rulePath -PathType Leaf)) {
+              throw "missing forensic YARA rule for headless package: $rulePath"
+            }
+          }
+          $null = $items.Add((Resolve-Path -LiteralPath "rules").Path)
 
           $innoOut = "install\windows-inno\Output"
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
-          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION
+          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch amd64
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
           $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
           if (-not (Test-Path -LiteralPath $setupSrc)) {
@@ -389,10 +474,13 @@ jobs:
           if (-not (Test-Path -LiteralPath $setupSrc)) { throw "missing bundled setup exe: $setupSrc" }
           $setupDest = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup.exe"
           Copy-Item -LiteralPath $setupSrc -Destination $setupDest -Force
+          $setupArchSrc = $setupSrc + ".arch"
+          if (-not (Test-Path -LiteralPath $setupArchSrc)) { throw "missing setup architecture metadata: $setupArchSrc" }
+          Copy-Item -LiteralPath $setupArchSrc -Destination ($setupDest + ".arch") -Force
           $null = $items.Add($setupDest)
 
           $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -OutputZip $setupUiZip
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Write-Host "Setup UI package is uploaded as a separate artifact and is not nested into the runtime zip."
@@ -412,10 +500,23 @@ jobs:
             if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
               throw "encrypted P0 rule bundle missing from package"
             }
-            if (-not ($entries -match '(^|/|\\)VERSION$')) {
-              throw "VERSION file missing from package"
+            $forensicEntries = @($entries | Where-Object { $_ -match '(?i)^rules[/\\]forensic[/\\][^/\\]+\.yar(a)?$' })
+            if ($forensicEntries.Count -lt 1) {
+              throw "rules/forensic/*.yar missing from headless package"
             }
-            $versionEntry = $zipObj.Entries | Where-Object { $_.FullName -match '(^|/|\\)VERSION$' } | Select-Object -First 1
+            $normalizedForensicEntries = @($forensicEntries | ForEach-Object { $_.Replace('\', '/').ToLowerInvariant() })
+            foreach ($rule in $requiredForensicRules) {
+              $expectedRuleEntry = "rules/forensic/$($rule.ToLowerInvariant())"
+              if ($normalizedForensicEntries -notcontains $expectedRuleEntry) {
+                throw "required forensic YARA rule missing from headless package: $rule"
+              }
+            }
+            # rules/forensic/VERSION is the rule-bundle version, not the Agent version.
+            $rootVersionEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'VERSION' })
+            if ($rootVersionEntries.Count -ne 1) {
+              throw "package root must contain exactly one VERSION file; found $($rootVersionEntries.Count)"
+            }
+            $versionEntry = $rootVersionEntries[0]
             $reader = New-Object System.IO.StreamReader($versionEntry.Open())
             try {
               $packagedVersion = $reader.ReadToEnd().Trim()
@@ -425,6 +526,10 @@ jobs:
             }
             if ($packagedVersion -ne $env:EDR_AGENT_VERSION) {
               throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
+            }
+
+            if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
+              Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for x64-windows."
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"
@@ -436,6 +541,11 @@ jobs:
               'windows_service_install\.ps1',
               'windows_isolate_host\.ps1',
               'FDSecurityInstallerWorker\.exe',
+              'uninstall\.exe',
+              'uninstall\.ps1',
+              'WinDivert\.dll',
+              'WinDivert64\.sys',
+              'WinDivert-LICENSE\.txt',
               'agent_windows_production\.example\.toml',
               'sensor_interest_manifest\.json'
             )) {
@@ -464,5 +574,5 @@ jobs:
             edr-agent-win-exe.zip
             edr_agent_setup.exe
             edr_agent_setup_ui.zip
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: error

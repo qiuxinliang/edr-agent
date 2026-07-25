@@ -1,1 +1,0 @@
-/Library/Developer/CommandLineTools/usr/bin/cc  -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_fl_crypto_fl3.dir/tests/test_fl_crypto_fl3.c.o CMakeFiles/test_fl_crypto_fl3.dir/src/fl_trainer/fl_crypto.c.o -o test_fl_crypto_fl3  /opt/homebrew/opt/openssl/lib/libcrypto.dylib
