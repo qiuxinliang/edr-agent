@@ -1,0 +1,12 @@
+Velociraptor — 第三方取证引擎(外部调用,未修改)
+====================================================
+版本(pinned): v0.77.1
+架构:         windows-amd64
+资产:         velociraptor-v0.77.1-windows-amd64.exe
+SHA256:       c91cf8a32731c4c45c148393bc7d2af688c392194a9fffc4535e8b583260d55e
+官方下载:     https://github.com/Velocidex/velociraptor/releases/download/v0.77.1/velociraptor-v0.77.1-windows-amd64.exe
+源代码(tag):  https://github.com/Velocidex/velociraptor/tree/v0.77.1
+许可:         AGPLv3(见同目录 velociraptor.LICENSE.txt)
+
+合规声明: 本产品以未修改的官方 Velociraptor 二进制作为独立子进程外部调用(mere aggregation),
+不内嵌/链接/repack 其代码,AGPLv3 不传染本产品自有代码;依分发义务随附许可全文与源获取地址。
