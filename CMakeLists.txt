@@ -397,8 +397,19 @@ endif()
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_win.c)
   list(APPEND EDR_AGENT_SOURCES resources/FDSensor.rc)
+  if(MSVC)
+    # rc.exe receives definitions through cmcldeps. A single CMake quote escape
+    # becomes -DNAME=\"value\"; using the windres form adds a literal backslash
+    # and fails with C7772 "invalid string literal".
+    set(_EDR_RESOURCE_VERSION_STRING
+      "EDR_VERSION_STRING=\"${PROJECT_VERSION}.0\"")
+  else()
+    # GNU windres needs escaped quotes to survive its preprocessor command line.
+    set(_EDR_RESOURCE_VERSION_STRING
+      "EDR_VERSION_STRING=\\\"${PROJECT_VERSION}.0\\\"")
+  endif()
   set(_EDR_RESOURCE_DEFINITIONS
-    "EDR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR};EDR_VERSION_MINOR=${PROJECT_VERSION_MINOR};EDR_VERSION_PATCH=${PROJECT_VERSION_PATCH};EDR_VERSION_STRING=\\\"${PROJECT_VERSION}.0\\\"")
+    "EDR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR};EDR_VERSION_MINOR=${PROJECT_VERSION_MINOR};EDR_VERSION_PATCH=${PROJECT_VERSION_PATCH};${_EDR_RESOURCE_VERSION_STRING}")
   if(MSVC)
     list(APPEND _EDR_RESOURCE_DEFINITIONS EDR_VERSION_RESOURCE_ONLY=1)
   endif()
