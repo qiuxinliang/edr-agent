@@ -887,7 +887,11 @@ typedef struct {
   char regkey[1024];
   char regname[512];
   char regdata[8192];
+  char regold[2048];
   char regop[64];
+  char regsource[48];
+  char regattribution[32];
+  char regstatus[48];
   char user[256];
   char domain[256];
   char parent_img[EDR_BR_STR_LONG];
@@ -1296,9 +1300,18 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "regdata") == 0 || strcmp(key, "registry_data") == 0 ||
              strcmp(key, "value_data") == 0 || strcmp(key, "details") == 0) {
     snprintf(f->regdata, sizeof(f->regdata), "%s", val);
+  } else if (strcmp(key, "regold") == 0 || strcmp(key, "registry_old_data") == 0 ||
+             strcmp(key, "old_value_data") == 0) {
+    snprintf(f->regold, sizeof(f->regold), "%s", val);
   } else if (strcmp(key, "regop") == 0 || strcmp(key, "registry_op") == 0 ||
              strcmp(key, "operation") == 0) {
     snprintf(f->regop, sizeof(f->regop), "%s", val);
+  } else if (strcmp(key, "registry_source") == 0) {
+    snprintf(f->regsource, sizeof(f->regsource), "%s", val);
+  } else if (strcmp(key, "registry_attribution") == 0) {
+    snprintf(f->regattribution, sizeof(f->regattribution), "%s", val);
+  } else if (strcmp(key, "registry_detail_status") == 0) {
+    snprintf(f->regstatus, sizeof(f->regstatus), "%s", val);
   }
 }
 
@@ -1505,8 +1518,18 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.regdata[0]) {
       snprintf(r->reg_value_data, sizeof(r->reg_value_data), "%s", ef.regdata);
     }
+    if (ef.regold[0]) {
+      snprintf(r->reg_old_value_data, sizeof(r->reg_old_value_data), "%s", ef.regold);
+    }
     if (ef.regop[0]) {
       snprintf(r->reg_op, sizeof(r->reg_op), "%s", ef.regop);
+    }
+    snprintf(r->reg_source, sizeof(r->reg_source), "%s",
+             ef.regsource[0] ? ef.regsource : ef.prov);
+    snprintf(r->reg_attribution, sizeof(r->reg_attribution), "%s",
+             ef.regattribution[0] ? ef.regattribution : (r->pid ? "process_id" : "unavailable"));
+    if (ef.regstatus[0]) {
+      snprintf(r->reg_detail_status, sizeof(r->reg_detail_status), "%s", ef.regstatus);
     }
     if (r->type == EDR_EVENT_REG_CREATE_KEY && !r->reg_op[0]) {
       snprintf(r->reg_op, sizeof(r->reg_op), "create_key");

@@ -52,7 +52,11 @@ typedef struct {
   char reg_key_path[1024];
   char reg_value_name[512];
   char reg_value_data[8192];
+  char reg_old_value_data[2048];
   char reg_op[32];
+  char reg_source[48];
+  char reg_attribution[32];
+  char reg_detail_status[48];
 
   char script_snippet[EDR_BR_STR_LONG];
   /** 最近一次 PMFE 扫描摘要（JSON，`edr_pid_history_pmfe_fill_record`）；无则空 */

@@ -1031,6 +1031,11 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char esc_psb[1024];
     char esc_clo[256];
     char esc_ect[96];
+    char esc_registry_source[96];
+    char esc_registry_attribution[64];
+    char esc_registry_detail_status[96];
+    char esc_registry_old_data[512];
+    char registry_context_json[900];
     char esc_enforcement_action[96];
     char esc_enforcement_message[320];
     char parent_name_buf[sizeof(br->parent_name)];
@@ -1079,6 +1084,21 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
                             96);
     p0_json_escape_or_empty(br->encoded_command_type[0] ? br->encoded_command_type : "", esc_ect, sizeof(esc_ect),
                             64);
+    p0_json_escape_or_empty(br->reg_source, esc_registry_source, sizeof(esc_registry_source), 48);
+    p0_json_escape_or_empty(br->reg_attribution, esc_registry_attribution,
+                            sizeof(esc_registry_attribution), 32);
+    p0_json_escape_or_empty(br->reg_detail_status, esc_registry_detail_status,
+                            sizeof(esc_registry_detail_status), 48);
+    p0_json_escape_or_empty(br->reg_old_value_data, esc_registry_old_data,
+                            sizeof(esc_registry_old_data), 220);
+    registry_context_json[0] = '\0';
+    if (br->reg_key_path[0] || br->reg_source[0] || br->reg_op[0]) {
+      snprintf(registry_context_json, sizeof(registry_context_json),
+               ",\"registry_source\":\"%s\",\"registry_attribution\":\"%s\","
+               "\"registry_detail_status\":\"%s\",\"registry_old_data\":\"%s\"",
+               esc_registry_source, esc_registry_attribution,
+               esc_registry_detail_status, esc_registry_old_data);
+    }
     p0_json_escape_or_empty(enforcement.action, esc_enforcement_action,
                             sizeof(esc_enforcement_action), 64);
     p0_json_escape_or_empty(enforcement.message, esc_enforcement_message,
@@ -1120,7 +1140,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           "\"child_pids\":\"%s\","
           "\"powershell_script_block\":\"%s\","
           "\"command_line_origin\":\"%s\","
-          "\"encoded_command_type\":\"%s\""
+          "\"encoded_command_type\":\"%s\"%s"
         "},"
         "\"enforcement\":{"
           "\"requested\":%s,"
@@ -1163,6 +1183,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
         esc_psb,
         esc_clo,
         esc_ect,
+        registry_context_json,
         enforcement.requested ? "true" : "false",
         enforcement.attempted ? "true" : "false",
         enforcement.succeeded ? "true" : "false",

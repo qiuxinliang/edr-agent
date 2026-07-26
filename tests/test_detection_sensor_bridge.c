@@ -556,13 +556,24 @@ static void test_registry_persistence_alias_bridge(void) {
             "cmd=powershell.exe Set-ItemProperty HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run Updater\n"
             "registry_path=HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\n"
             "value_name=Updater\n"
+            "old_value_data=cmd.exe_/c_old\n"
             "value_data=powershell.exe_-w_hidden_-enc_SQBFAFgA\n"
-            "operation=set_value\n");
+            "operation=set_value\n"
+            "registry_source=security_4657\n"
+            "registry_attribution=process_id\n"
+            "registry_detail_status=captured\n");
   eval_slot(&slot, &r, &d);
   assert(strstr(r.reg_key_path, "CurrentVersion\\Run") != NULL);
   assert(strstr(r.reg_value_name, "Updater") != NULL);
+  assert(strcmp(r.reg_source, "security_4657") == 0);
+  assert(strcmp(r.reg_attribution, "process_id") == 0);
+  assert(strcmp(r.reg_detail_status, "captured") == 0);
+  assert(strstr(r.reg_old_value_data, "cmd.exe") != NULL);
   assert(strstr(d.reason, "persistence_change_indicator") != NULL);
   assert(strstr(r.detection_context, "\"registry\"") != NULL);
+  assert(strstr(r.detection_context, "\"source\":\"security_4657\"") != NULL);
+  assert(strstr(r.detection_context, "\"attribution\":\"process_id\"") != NULL);
+  assert(strstr(r.detection_context, "\"old_value_data\":\"cmd.exe_/c_old\"") != NULL);
   assert(strstr(r.detection_context, "\"persistence_change\":true") != NULL);
   assert(strstr(r.detection_context, "persistence_changes") != NULL);
 }

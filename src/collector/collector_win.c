@@ -85,6 +85,7 @@ static uint64_t s_agent_self_fuse_last_cooldown_ns;
 static int s_agent_self_fuse_provider_degraded;
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
+static int edr_collector_registry_event_type(EdrEventType t);
 
 static uint64_t edr_unix_ns(void) {
   FILETIME ft;
@@ -975,12 +976,163 @@ static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag)
 }
 
 #define EDR_REGISTRY_WATCH_MAX 32u
+#define EDR_REGISTRY_WATCH_VALUE_MAX 128u
+#define EDR_REGISTRY_VALUE_NAME_MAX 512u
+#define EDR_REGISTRY_VALUE_DATA_MAX 1024u
+
+typedef struct {
+  char name[EDR_REGISTRY_VALUE_NAME_MAX];
+  char data[EDR_REGISTRY_VALUE_DATA_MAX];
+  DWORD type;
+} EdrRegistryValueSnapshot;
 
 typedef struct {
   HKEY key;
   HANDLE event;
   char path[1024];
+  EdrRegistryValueSnapshot *values;
+  DWORD value_count;
+  int snapshot_available;
 } EdrRegistryWatch;
+
+static void edr_etw1_sanitize_value(char *dst, size_t cap, const char *src) {
+  size_t off = 0u;
+  if (!dst || cap == 0u) {
+    return;
+  }
+  dst[0] = '\0';
+  if (!src) {
+    return;
+  }
+  while (*src && off + 1u < cap) {
+    unsigned char c = (unsigned char)*src++;
+    dst[off++] = (c == '\r' || c == '\n' || c == '\0') ? ' ' : (char)c;
+  }
+  dst[off] = '\0';
+}
+
+static void edr_registry_value_data_text(DWORD type, const BYTE *data, DWORD size,
+                                         char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!data || size == 0u) {
+    return;
+  }
+  if (type == REG_SZ || type == REG_EXPAND_SZ) {
+    char raw[EDR_REGISTRY_VALUE_DATA_MAX];
+    size_t copy = size < sizeof(raw) - 1u ? (size_t)size : sizeof(raw) - 1u;
+    memcpy(raw, data, copy);
+    raw[copy] = '\0';
+    edr_etw1_sanitize_value(out, out_cap, raw);
+    return;
+  }
+  if (type == REG_MULTI_SZ) {
+    size_t off = 0u;
+    for (DWORD i = 0u; i < size && off + 1u < out_cap; ++i) {
+      unsigned char c = data[i];
+      if (c == '\0') {
+        if (i + 1u >= size || data[i + 1u] == '\0') {
+          break;
+        }
+        c = ';';
+      }
+      out[off++] = (c == '\r' || c == '\n') ? ' ' : (char)c;
+    }
+    out[off] = '\0';
+    return;
+  }
+  if (type == REG_DWORD && size >= sizeof(DWORD)) {
+    DWORD value = 0u;
+    memcpy(&value, data, sizeof(value));
+    snprintf(out, out_cap, "%lu (0x%08lX)", (unsigned long)value, (unsigned long)value);
+    return;
+  }
+  if (type == REG_QWORD && size >= sizeof(ULONGLONG)) {
+    ULONGLONG value = 0u;
+    memcpy(&value, data, sizeof(value));
+    snprintf(out, out_cap, "%llu (0x%016llX)",
+             (unsigned long long)value, (unsigned long long)value);
+    return;
+  }
+  {
+    size_t off = 0u;
+    DWORD limit = size < 128u ? size : 128u;
+    for (DWORD i = 0u; i < limit && off + 3u < out_cap; ++i) {
+      int n = snprintf(out + off, out_cap - off, "%02X", (unsigned)data[i]);
+      if (n <= 0) {
+        break;
+      }
+      off += (size_t)n;
+    }
+    if (limit < size && off + 4u < out_cap) {
+      snprintf(out + off, out_cap - off, "...");
+    }
+  }
+}
+
+static int edr_registry_snapshot_capture(HKEY key, EdrRegistryValueSnapshot *values,
+                                         DWORD cap, DWORD *out_count) {
+  DWORD value_total = 0u;
+  DWORD max_name = 0u;
+  DWORD max_data = 0u;
+  char *name = NULL;
+  BYTE *data = NULL;
+  DWORD captured = 0u;
+  if (!key || !values || cap == 0u || !out_count) {
+    return 0;
+  }
+  *out_count = 0u;
+  if (RegQueryInfoKeyA(key, NULL, NULL, NULL, NULL, NULL, NULL, &value_total,
+                       &max_name, &max_data, NULL, NULL) != ERROR_SUCCESS) {
+    return 0;
+  }
+  max_name = max_name < 1u ? 1u : max_name + 1u;
+  max_data = max_data < 1u ? 1u : max_data + 1u;
+  if (max_name > 4096u) max_name = 4096u;
+  if (max_data > 65536u) max_data = 65536u;
+  name = (char *)malloc((size_t)max_name + 1u);
+  data = (BYTE *)malloc((size_t)max_data + 1u);
+  if (!name || !data) {
+    free(name);
+    free(data);
+    return 0;
+  }
+  for (DWORD i = 0u; i < value_total && captured < cap; ++i) {
+    DWORD name_len = max_name;
+    DWORD data_len = max_data;
+    DWORD type = REG_NONE;
+    memset(name, 0, (size_t)max_name + 1u);
+    memset(data, 0, (size_t)max_data + 1u);
+    if (RegEnumValueA(key, i, name, &name_len, NULL, &type, data, &data_len) != ERROR_SUCCESS) {
+      continue;
+    }
+    snprintf(values[captured].name, sizeof(values[captured].name), "%s",
+             name[0] ? name : "(Default)");
+    edr_registry_value_data_text(type, data, data_len, values[captured].data,
+                                 sizeof(values[captured].data));
+    values[captured].type = type;
+    captured++;
+  }
+  free(name);
+  free(data);
+  *out_count = captured;
+  return 1;
+}
+
+static int edr_registry_snapshot_find(const EdrRegistryValueSnapshot *values,
+                                      DWORD count, const char *name) {
+  if (!values || !name) {
+    return -1;
+  }
+  for (DWORD i = 0u; i < count; ++i) {
+    if (_stricmp(values[i].name, name) == 0) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
 
 static int edr_registry_watch_add(EdrRegistryWatch *watches, DWORD *count,
                                   HKEY root, const char *subkey,
@@ -991,8 +1143,10 @@ static int edr_registry_watch_add(EdrRegistryWatch *watches, DWORD *count,
       !subkey || !display_path) {
     return 0;
   }
-  if (RegOpenKeyExA(root, subkey, 0, KEY_NOTIFY | view, &key) != ERROR_SUCCESS) {
-    return 0;
+  if (RegOpenKeyExA(root, subkey, 0, KEY_NOTIFY | KEY_QUERY_VALUE | view, &key) != ERROR_SUCCESS) {
+    if (RegOpenKeyExA(root, subkey, 0, KEY_NOTIFY | view, &key) != ERROR_SUCCESS) {
+      return 0;
+    }
   }
   event = CreateEventW(NULL, FALSE, FALSE, NULL);
   if (!event || RegNotifyChangeKeyValue(key, FALSE,
@@ -1005,13 +1159,24 @@ static int edr_registry_watch_add(EdrRegistryWatch *watches, DWORD *count,
   watches[*count].key = key;
   watches[*count].event = event;
   snprintf(watches[*count].path, sizeof(watches[*count].path), "%s", display_path);
+  watches[*count].values = (EdrRegistryValueSnapshot *)calloc(
+      EDR_REGISTRY_WATCH_VALUE_MAX, sizeof(EdrRegistryValueSnapshot));
+  if (watches[*count].values) {
+    watches[*count].snapshot_available = edr_registry_snapshot_capture(
+        key, watches[*count].values, EDR_REGISTRY_WATCH_VALUE_MAX,
+        &watches[*count].value_count);
+  }
   (*count)++;
   return 1;
 }
 
-static void edr_registry_watch_emit(const char *path) {
+static void edr_registry_watch_emit(const char *path, const char *value_name,
+                                    const char *value_data, const char *operation,
+                                    const char *detail_status) {
   EdrSensorInterestEvent interest;
   EdrEventSlot slot;
+  char safe_name[EDR_REGISTRY_VALUE_NAME_MAX];
+  char safe_data[EDR_REGISTRY_VALUE_DATA_MAX];
   int n;
   if (!path || !path[0] || !s_bus) {
     return;
@@ -1028,11 +1193,20 @@ static void edr_registry_watch_emit(const char *path) {
   }
 
   memset(&slot, 0, sizeof(slot));
+  edr_etw1_sanitize_value(safe_name, sizeof(safe_name), value_name);
+  edr_etw1_sanitize_value(safe_data, sizeof(safe_data), value_data);
   slot.timestamp_ns = edr_unix_ns();
-  slot.type = EDR_EVENT_REG_SET_VALUE;
+  slot.type = operation && strcmp(operation, "delete_value") == 0
+                  ? EDR_EVENT_REG_DELETE_KEY
+                  : EDR_EVENT_REG_SET_VALUE;
   slot.priority = 0u;
   n = snprintf((char *)slot.data, sizeof(slot.data),
-               "ETW1\nprov=regnotify\npid=0\nregkey=%s\nregop=change_notify\n", path);
+               "ETW1\nprov=regnotify_snapshot\npid=0\nregkey=%s\nregname=%s\n"
+               "regdata=%s\nregop=%s\nregistry_source=regnotify_snapshot\n"
+               "registry_attribution=unavailable\nregistry_detail_status=%s\n",
+               path, safe_name, safe_data,
+               operation && operation[0] ? operation : "change_notify",
+               detail_status && detail_status[0] ? detail_status : "captured");
   if (n <= 0 || (size_t)n >= sizeof(slot.data)) {
     s_health.registry_payload_missing++;
     return;
@@ -1041,6 +1215,48 @@ static void edr_registry_watch_emit(const char *path) {
   if (edr_push_slot_after_policy(&slot, "regnotify")) {
     s_health.registry_events_admitted++;
   }
+}
+
+static void edr_registry_watch_process(EdrRegistryWatch *watch) {
+  EdrRegistryValueSnapshot *next = NULL;
+  DWORD next_count = 0u;
+  if (!watch) {
+    return;
+  }
+  next = (EdrRegistryValueSnapshot *)calloc(
+      EDR_REGISTRY_WATCH_VALUE_MAX, sizeof(EdrRegistryValueSnapshot));
+  if (!next || !edr_registry_snapshot_capture(
+                   watch->key, next, EDR_REGISTRY_WATCH_VALUE_MAX, &next_count)) {
+    free(next);
+    edr_registry_watch_emit(watch->path, "", "", "change_notify", "snapshot_unavailable");
+    return;
+  }
+  if (!watch->snapshot_available) {
+    free(watch->values);
+    watch->values = next;
+    watch->value_count = next_count;
+    watch->snapshot_available = 1;
+    edr_registry_watch_emit(watch->path, "", "", "change_notify", "baseline_initialized");
+    return;
+  }
+  for (DWORD i = 0u; i < next_count; ++i) {
+    int old_idx = edr_registry_snapshot_find(watch->values, watch->value_count, next[i].name);
+    if (old_idx < 0 ||
+        watch->values[old_idx].type != next[i].type ||
+        strcmp(watch->values[old_idx].data, next[i].data) != 0) {
+      edr_registry_watch_emit(watch->path, next[i].name, next[i].data,
+                              "set_value", "captured");
+    }
+  }
+  for (DWORD i = 0u; i < watch->value_count; ++i) {
+    if (edr_registry_snapshot_find(next, next_count, watch->values[i].name) < 0) {
+      edr_registry_watch_emit(watch->path, watch->values[i].name,
+                              watch->values[i].data, "delete_value", "captured");
+    }
+  }
+  free(watch->values);
+  watch->values = next;
+  watch->value_count = next_count;
 }
 
 static DWORD WINAPI edr_registry_watch_thread_main(void *arg) {
@@ -1100,12 +1316,12 @@ static DWORD WINAPI edr_registry_watch_thread_main(void *arg) {
     }
     if (wr >= WAIT_OBJECT_0 + 1u && wr < WAIT_OBJECT_0 + wait_count) {
       DWORD idx = wr - WAIT_OBJECT_0 - 1u;
-      edr_registry_watch_emit(watches[idx].path);
       if (RegNotifyChangeKeyValue(watches[idx].key, FALSE,
                                   REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
                                   watches[idx].event, TRUE) != ERROR_SUCCESS) {
         break;
       }
+      edr_registry_watch_process(&watches[idx]);
       continue;
     }
     break;
@@ -1113,6 +1329,7 @@ static DWORD WINAPI edr_registry_watch_thread_main(void *arg) {
   for (DWORD i = 0u; i < count; ++i) {
     if (watches[i].event) CloseHandle(watches[i].event);
     if (watches[i].key) RegCloseKey(watches[i].key);
+    free(watches[i].values);
   }
   return 0u;
 }
@@ -1132,6 +1349,100 @@ static int edr_start_registry_watch(void) {
   return 1;
 }
 
+static unsigned edr_xml_event_id(const char *xml) {
+  const char *p;
+  if (!xml) {
+    return 0u;
+  }
+  p = strstr(xml, "<EventID");
+  if (!p) {
+    return 0u;
+  }
+  p = strchr(p, '>');
+  if (!p) {
+    return 0u;
+  }
+  return (unsigned)strtoul(p + 1, NULL, 10);
+}
+
+static void edr_registry_normalize_security_path(char *out, size_t out_cap,
+                                                 const char *path) {
+  static const char machine_prefix[] = "\\REGISTRY\\MACHINE\\";
+  static const char user_prefix[] = "\\REGISTRY\\USER\\";
+  if (!out || out_cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!path) {
+    return;
+  }
+  if (_strnicmp(path, machine_prefix, sizeof(machine_prefix) - 1u) == 0) {
+    snprintf(out, out_cap, "HKLM\\%s", path + sizeof(machine_prefix) - 1u);
+  } else if (_strnicmp(path, user_prefix, sizeof(user_prefix) - 1u) == 0) {
+    snprintf(out, out_cap, "HKU\\%s", path + sizeof(user_prefix) - 1u);
+  } else {
+    snprintf(out, out_cap, "%s", path);
+  }
+}
+
+static void edr_security_emit_registry_4657(const char *xml) {
+  char pid[64];
+  char img[1024];
+  char key_raw[2048];
+  char key[2048];
+  char value_name[512];
+  char old_value[1024];
+  char new_value[1024];
+  char user[256];
+  char domain[256];
+  char safe_img[1024];
+  char safe_key[2048];
+  char safe_name[512];
+  char safe_old[1024];
+  char safe_new[1024];
+  EdrEventSlot slot;
+  int n;
+  (void)edr_xml_get_data_utf8(xml, "ProcessId", pid, sizeof(pid));
+  (void)edr_xml_get_data_utf8(xml, "ProcessName", img, sizeof(img));
+  (void)edr_xml_get_data_utf8(xml, "ObjectName", key_raw, sizeof(key_raw));
+  (void)edr_xml_get_data_utf8(xml, "ObjectValueName", value_name, sizeof(value_name));
+  (void)edr_xml_get_data_utf8(xml, "OldValue", old_value, sizeof(old_value));
+  (void)edr_xml_get_data_utf8(xml, "NewValue", new_value, sizeof(new_value));
+  (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
+  (void)edr_xml_get_data_utf8(xml, "SubjectDomainName", domain, sizeof(domain));
+  edr_registry_normalize_security_path(key, sizeof(key), key_raw);
+  if (!key[0]) {
+    s_health.registry_payload_missing++;
+    return;
+  }
+  edr_etw1_sanitize_value(safe_img, sizeof(safe_img), img);
+  edr_etw1_sanitize_value(safe_key, sizeof(safe_key), key);
+  edr_etw1_sanitize_value(safe_name, sizeof(safe_name), value_name);
+  edr_etw1_sanitize_value(safe_old, sizeof(safe_old), old_value);
+  edr_etw1_sanitize_value(safe_new, sizeof(safe_new), new_value);
+
+  memset(&slot, 0, sizeof(slot));
+  slot.timestamp_ns = edr_unix_ns();
+  slot.type = EDR_EVENT_REG_SET_VALUE;
+  n = snprintf((char *)slot.data, sizeof(slot.data),
+               "ETW1\nprov=security_4657\npid=%s\neid=4657\nimg=%s\nuser=%s\n"
+               "user_domain=%s\nregkey=%s\nregname=%s\nregold=%s\nregdata=%s\n"
+               "regop=set_value\nregistry_source=security_4657\n"
+               "registry_attribution=process_id\nregistry_detail_status=captured\n",
+               pid[0] ? pid : "0", safe_img, user, domain, safe_key, safe_name,
+               safe_old, safe_new);
+  if (n <= 0 || (size_t)n >= sizeof(slot.data)) {
+    s_health.registry_payload_missing++;
+    return;
+  }
+  slot.size = (uint32_t)n + 1u;
+  s_health.registry_provider_events++;
+  s_health.security_audit_visible = 1;
+  if (edr_push_slot_after_policy(&slot, "security_4657")) {
+    s_health.registry_events_admitted++;
+  }
+}
+
 static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
                                                    PVOID user_context,
                                                    EVT_HANDLE event) {
@@ -1143,6 +1454,19 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   if (!edr_evt_render_xml_utf8(event, &xml)) {
     s_health.collector_dropped++;
     return ERROR_SUCCESS;
+  }
+  {
+    unsigned event_id = edr_xml_event_id(xml);
+    if (event_id == 4657u) {
+      edr_security_emit_registry_4657(xml);
+      free(xml);
+      return ERROR_SUCCESS;
+    }
+    if (event_id != 4688u) {
+      free(xml);
+      s_health.collector_dropped++;
+      return ERROR_SUCCESS;
+    }
   }
   char img[1024];
   char cmd[2048];
@@ -1250,6 +1574,52 @@ static void edr_collector_pid_cache_enrich(EdrBehaviorRecord *br) {
     return;
   }
   s_health.process_identity_cache_misses++;
+}
+
+static void edr_collector_slot_append_kv(EdrEventSlot *slot, const char *key,
+                                         const char *value) {
+  char safe[2048];
+  size_t used;
+  int n;
+  if (!slot || !key || !key[0] || !value || !value[0]) {
+    return;
+  }
+  used = strnlen((const char *)slot->data, sizeof(slot->data));
+  if (used >= sizeof(slot->data) - 4u) {
+    return;
+  }
+  edr_etw1_sanitize_value(safe, sizeof(safe), value);
+  if (!safe[0]) {
+    return;
+  }
+  if (used > 0u && slot->data[used - 1u] != '\n') {
+    slot->data[used++] = '\n';
+    slot->data[used] = '\0';
+  }
+  n = snprintf((char *)slot->data + used, sizeof(slot->data) - used,
+               "%s=%s\n", key, safe);
+  if (n <= 0 || (size_t)n >= sizeof(slot->data) - used) {
+    return;
+  }
+  slot->size = (uint32_t)(used + (size_t)n + 1u);
+}
+
+static void edr_collector_registry_writeback_identity(EdrEventSlot *slot,
+                                                      const EdrBehaviorRecord *br) {
+  const char *raw;
+  if (!slot || !br || br->pid == 0u ||
+      !edr_collector_registry_event_type(slot->type)) {
+    return;
+  }
+  raw = (const char *)slot->data;
+  if (!strstr(raw, "\nimg=")) {
+    edr_collector_slot_append_kv(slot, "img",
+                                 br->exe_path[0] ? br->exe_path : br->process_name);
+  }
+  raw = (const char *)slot->data;
+  if (!strstr(raw, "\ncmd=")) {
+    edr_collector_slot_append_kv(slot, "cmd", br->cmdline);
+  }
 }
 
 static int edr_is_p0_network_port(uint32_t port) {
@@ -1384,6 +1754,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   edr_behavior_from_slot(slot, &br);
   if (slot->type != EDR_EVENT_PROCESS_CREATE) {
     edr_collector_pid_cache_enrich(&br);
+    edr_collector_registry_writeback_identity(slot, &br);
   }
   if ((slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) &&
       br.exe_path[0] && !br.network_aux_path[0]) {
@@ -1716,14 +2087,15 @@ static void edr_start_security_eventlog_subscription(void) {
   if (s_security_sub) {
     return;
   }
-  s_security_sub = EvtSubscribe(NULL, NULL, L"Security", L"*[System[(EventID=4688)]]",
+  s_security_sub = EvtSubscribe(NULL, NULL, L"Security",
+                                L"*[System[(EventID=4688 or EventID=4657)]]",
                                 NULL, NULL, edr_security_eventlog_callback,
                                 EvtSubscribeToFutureEvents);
   if (!s_security_sub) {
     DWORD err = GetLastError();
     fprintf(stderr,
-            "[collector_win] Security 4688 eventlog subscription disabled err=%lu "
-            "(run elevated and enable Audit Process Creation)\n",
+            "[collector_win] Security 4688/4657 eventlog subscription disabled err=%lu "
+            "(run elevated and enable Audit Process Creation / Audit Registry)\n",
             (unsigned long)err);
   } else {
     s_health.security_audit_visible = 1;

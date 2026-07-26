@@ -1645,8 +1645,16 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   json_str(r->detection_context, sizeof(r->detection_context), r->reg_value_name, 120u);
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"value_data\":");
   json_str(r->detection_context, sizeof(r->detection_context), r->reg_value_data, 260u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"old_value_data\":");
+  json_str(r->detection_context, sizeof(r->detection_context), r->reg_old_value_data, 260u);
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"op\":");
   json_str(r->detection_context, sizeof(r->detection_context), r->reg_op, 48u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"source\":");
+  json_str(r->detection_context, sizeof(r->detection_context), r->reg_source, 48u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"attribution\":");
+  json_str(r->detection_context, sizeof(r->detection_context), r->reg_attribution, 32u);
+  json_cat(r->detection_context, sizeof(r->detection_context), ",\"detail_status\":");
+  json_str(r->detection_context, sizeof(r->detection_context), r->reg_detail_status, 48u);
   json_cat(r->detection_context, sizeof(r->detection_context),
            "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
