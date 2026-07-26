@@ -38,6 +38,61 @@ jobs:
       WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v6
+      - name: Validate Windows release signing configuration
+        shell: pwsh
+        run: |
+          $required = @(
+            'WINDOWS_SIGNING_PFX_BASE64',
+            'WINDOWS_SIGNING_PFX_PASSWORD',
+            'WINDOWS_SIGNING_SUBJECT',
+            'WINDOWS_SIGNING_THUMBPRINT'
+          )
+          $missing = @($required | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+          if ($missing.Count -gt 0) {
+            Write-Host "::error title=Windows release signing is not configured::Add the missing GitHub Actions repository or organization secrets: $($missing -join ', ')"
+            throw "release signing configuration is incomplete; missing: $($missing -join ', ')"
+          }
+
+          try {
+            $pfxBytes = [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64)
+          } catch {
+            throw "WINDOWS_SIGNING_PFX_BASE64 is not valid base64"
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'agent-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, $pfxBytes)
+          try {
+            $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $pfx,
+              $env:WINDOWS_SIGNING_PFX_PASSWORD,
+              $flags
+            )
+            if (-not $certificate.HasPrivateKey) {
+              throw "PFX does not contain a private key"
+            }
+            $actualThumbprint = ($certificate.Thumbprint -replace '\s','').ToUpperInvariant()
+            $expectedThumbprint = ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()
+            if ($actualThumbprint -ne $expectedThumbprint) {
+              throw "PFX certificate thumbprint does not match WINDOWS_SIGNING_THUMBPRINT"
+            }
+            if ($certificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) {
+              throw "PFX certificate subject does not match WINDOWS_SIGNING_SUBJECT"
+            }
+            $now = Get-Date
+            if ($now -lt $certificate.NotBefore -or $now -gt $certificate.NotAfter) {
+              throw "PFX certificate is not currently valid"
+            }
+          } catch {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+            throw
+          } finally {
+            if ($certificate) { $certificate.Dispose() }
+          }
+          "WINDOWS_SIGNING_PFX_PATH=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Release signing certificate validated: subject and thumbprint match; private key is available."
+
       - name: AVE / behavior chain invariants (no vcpkg, bash)
         shell: bash
         run: |
@@ -336,17 +391,11 @@ jobs:
 
       - name: Authenticode sign release executables
         shell: pwsh
-        env:
-          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
-          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
-          WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
-          WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
         run: |
-          foreach ($name in @('WINDOWS_SIGNING_PFX_BASE64','WINDOWS_SIGNING_PFX_PASSWORD','WINDOWS_SIGNING_SUBJECT','WINDOWS_SIGNING_THUMBPRINT')) {
-            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "release requires $name" }
+          $pfx = $env:WINDOWS_SIGNING_PFX_PATH
+          if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) {
+            throw "validated release signing PFX is unavailable"
           }
-          $pfx = Join-Path $env:RUNNER_TEMP 'agent-signing.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
           $targets = Get-ChildItem build -Recurse -File | Where-Object Name -in @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe')
           foreach ($target in $targets) {
             & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_SIGNING_PFX_PASSWORD $target.FullName
@@ -494,9 +543,17 @@ jobs:
           $setupArchSrc = $setupSrc + ".arch"
           if (-not (Test-Path -LiteralPath $setupArchSrc)) { throw "missing setup architecture metadata: $setupArchSrc" }
           Copy-Item -LiteralPath $setupArchSrc -Destination ($setupDest + ".arch") -Force
+          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $env:WINDOWS_SIGNING_PFX_PATH /p $env:WINDOWS_SIGNING_PFX_PASSWORD $setupDest
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed: $setupDest" }
+          $setupSignature = Get-AuthenticodeSignature -LiteralPath $setupDest
+          if ($setupSignature.Status -ne 'Valid') { throw "invalid Authenticode signature: $setupDest" }
+          if (($setupSignature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'setup publisher thumbprint mismatch' }
+          if ($setupSignature.SignerCertificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) { throw 'setup publisher subject mismatch' }
           $null = $items.Add($setupDest)
 
           $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
+          $env:EDR_WINDOWS_SIGNING_CERT_BASE64 = $env:WINDOWS_SIGNING_PFX_BASE64
+          $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
           & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
@@ -629,6 +686,10 @@ jobs:
           $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
           $manifestSignature = "$manifestPath.p7s"
           Add-Type -AssemblyName System.Security
+          $pfx = $env:WINDOWS_SIGNING_PFX_PATH
+          if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) {
+            throw "validated release signing PFX is unavailable for artifact manifest signing"
+          }
           $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
           $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx, $securePassword, 'Exportable')
           $content = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,[IO.File]::ReadAllBytes($manifestPath))
