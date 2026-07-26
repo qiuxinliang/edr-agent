@@ -42,6 +42,26 @@ edr_apply_common_warnings(test_command_contract)
 add_test(NAME command_registry_and_payload_contract COMMAND test_command_contract
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_agent_update_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_command.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_agent_update_contract PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(NOT WIN32)
+  target_compile_definitions(test_agent_update_contract PRIVATE EDR_OS_POSIX=1)
+endif()
+edr_apply_common_warnings(test_agent_update_contract)
+add_test(NAME agent_update_command_contract COMMAND test_agent_update_contract)
+
+add_executable(test_agent_update_assets ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_assets.c)
+edr_apply_common_warnings(test_agent_update_assets)
+add_test(NAME agent_update_packaging_contract COMMAND test_agent_update_assets)
+set_tests_properties(agent_update_packaging_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
   ${CMAKE_SOURCE_DIR}/src/command/command_executor.c
   ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c)
@@ -74,14 +94,6 @@ add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_sig
 target_include_directories(test_request_signing PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_common_warnings(test_request_signing)
 add_test(NAME request_signing COMMAND test_request_signing WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-add_executable(test_http_retry ${CMAKE_CURRENT_SOURCE_DIR}/test_http_retry.c
-  ${CMAKE_SOURCE_DIR}/src/transport/http_retry.c
-  ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
-  ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
-target_include_directories(test_http_retry PRIVATE ${CMAKE_SOURCE_DIR}/include)
-edr_apply_common_warnings(test_http_retry)
-add_test(NAME http_retry_request_signing COMMAND test_http_retry WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_command_result_json ${CMAKE_CURRENT_SOURCE_DIR}/test_command_result_json.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
@@ -212,7 +224,6 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c
-  ${CMAKE_SOURCE_DIR}/src/transport/http_retry.c
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c

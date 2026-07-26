@@ -31,7 +31,7 @@
 | **身份** | **`[agent].tenant_id`** / **`endpoint_id`** 与种子一致（如 **`demo-tenant`** + **`ep-1`**）；勿用 `auto`，否则上报路径与控制台不一致。 |
 | **平台上报** | **`[platform].rest_base_url`** 指向可达的 **`…/api/v1`**；若开 RBAC，配置 **`rest_bearer_token`** 或演示权限头（见 LOCAL_STACK §7）。 |
 | **行为编码** | 联调平台 ingest 时设置 **`EDR_BEHAVIOR_ENCODING=protobuf`**（或 **`protobuf_c`**），避免批次内混 wire 导致 HTTP 解析失败（见 **`edr-backend/docs/BAT1_EVENT_INGEST.md`**）。 |
-| **行为监控** | **`[ave] behavior_monitor_enabled = true`**，且进程内已 **`AVE_RegisterCallbacks`**（含 **`on_behavior_alert`**）；否则 **`AVE_StartBehaviorMonitor`** 不会起消费线程，事件仍同步处理但无 MPMC 背压形态。 |
+| **行为监控** | **`[ave] behavior_monitor_enabled = true`** 仅建议在应急/高价值资产策略下开启，且进程内已 **`AVE_RegisterCallbacks`**（含 **`on_behavior_alert`**）；关闭时行为输入不会同步处理，避免噪声拖慢采集主流程。 |
 | **联调模板** | 可复制 **`edr-agent/agent.integration.toml`** 为 **`agent.toml`**，改 **`endpoint_id`**、**`rest_base_url`** 为真机可达地址（内网联调可用 **`start_local_en0.sh all`** 模式，见 LOCAL_STACK §4 后「en0」节）。 |
 
 ---

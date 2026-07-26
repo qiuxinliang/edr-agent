@@ -1,1 +1,0 @@
-/usr/bin/cc  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/test_ave_suppression.dir/tests/test_ave_suppression.c.o CMakeFiles/test_ave_suppression.dir/src/ave/ave_suppression.c.o CMakeFiles/test_ave_suppression.dir/src/ave/ave_rules_meta.c.o -o test_ave_suppression  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libsqlite3.tbd

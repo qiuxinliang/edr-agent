@@ -1,10 +1,7 @@
 # Windows 部署与服务账户（AGT-006）
 
 **关联**：[CLIENT_IMPROVEMENT_TASKS.md §AGT-006](CLIENT_IMPROVEMENT_TASKS.md)、[AGENT_INSTALLER.md](AGENT_INSTALLER.md)  
-**仅 Windows 发版打勾表**：[WINDOWS_RELEASE_CHECKLIST.md](WINDOWS_RELEASE_CHECKLIST.md)  
 **设计对照**：[Cauld Design/EDR_端点详细设计_v1.0.md](../Cauld%20Design/EDR_端点详细设计_v1.0.md) **§1.1 / §13**（部署与服务）
-
-**§P2c 深化**：**[WINDOWS_SERVICE_SHUTDOWN.md](WINDOWS_SERVICE_SHUTDOWN.md)**（服务 STOP vs Ctrl+C）、**[SELF_PROTECT_REGRESSION.md](SELF_PROTECT_REGRESSION.md)**（Job Object / anti_debug 清单）、**[PROMETHEUS_BUS_METRICS.md](PROMETHEUS_BUS_METRICS.md)**（总线指标与 Prometheus）。
 
 本文说明 **注册写配置** 与 **生产运行（服务 / 账户 / 权限）** 的分工；**MSI / 管理端一键安装包** 以 **edr-backend** 的 [INSTALLER_AND_DOWNLOAD_DESIGN.md](../../edr-backend/docs/INSTALLER_AND_DOWNLOAD_DESIGN.md) 等为权威。
 
@@ -16,7 +13,7 @@
 |------|------------|------|
 | 租户注册 + `agent.toml` | **`scripts/edr_agent_install.*`** | 见 [AGENT_INSTALLER.md](AGENT_INSTALLER.md) |
 | 二进制分发与限时 zip | 平台 / **edr-backend** 构建流水线 | 非 `edr-agent` 单独交付 |
-| Windows **服务**安装、账户、开机自启 | **本文 + 下方示例**（草案） | 需与现场组策略 / 运维规范对齐 |
+| Windows **服务**安装、账户、开机自启 | **`edr_agent.exe --service` + `scripts/windows_service_install.ps1`** | 需管理员；与现场组策略 / 运维规范对齐 |
 
 ---
 
@@ -27,7 +24,7 @@
 - **注意**：**完整 ETW 实时会话**、**WinDivert 驱动加载**、**对部分进程执行 forensic** 等能力，在真实环境中常需要 **管理员** 或 **附加特权**（如 **SeDebugPrivilege**、加载驱动权限）。**LOCAL SERVICE 能否满足全量采集**取决于：
   - 是否以 **用户态交互会话** 运行（通常服务无桌面）；
   - 组策略是否限制 **内核 ETW**、**防火墙/WFAS Provider**；
-  - WinDivert 是否已以 **管理员** 预先安装驱动。
+  - 首次开启 Shellcode 检测时，是否以 **管理员** 身份运行，以便随包 WinDivert 安装签名驱动。
 
 **研发结论（草案）**：生产环境常见两种模式——**(A)** 服务账户 + 收窄功能集（仅上报、无 WinDivert）；**(B)** **LocalSystem / 管理员服务** + 全功能。选型需 **安全与产品** 联合签字，本文不强制单一方案。
 
@@ -41,87 +38,116 @@
 |--------|------|
 | **管理员** | 首次安装 WinDivert **驱动**、调整部分 ETW Provider 时常需提升权限 |
 | **ETW** | `edr_collector_start` 失败时 stderr 含 ETW 相关错误；可选 Provider 跳过策略见 README「ETW 增强」 |
-| **WinDivert** | Shellcode 模块依赖 **已安装的 WinDivert.sys**；进程内会 **`log_windivert_service_hint`**（`windivert_capture.c`）探测服务是否存在 |
-| **网络** | gRPC **`server.address`** 可达；证书与 mTLS 与平台一致。**取证 / Webshell 上传**：该地址须为**已实现 `UploadFile`** 的 **EventIngest**（勿指向仅 stub 的 API gRPC）；见 **`docs/AGT009_FORENSIC_UPLOAD_E2E.md` §2.1（C4）** |
+| **WinDivert** | x64 安装包自带官方签名 `WinDivert.dll` / `WinDivert64.sys`；首次 `WinDivertOpen()` 由提升权限的 Agent 按需安装驱动，健康状态必须显示 `windivert_source=appdir`、`driver_open=true` |
+| **网络** | gRPC **`server.address`** 可达；证书与 mTLS 与平台一致 |
 | **磁盘** | 离线队列路径、取证输出 **`EDR_FORENSIC_OUT`** 可写 |
-
-### 3.0 排障顺序与默认值（§P2c **S4**）
-
-现场「无事件 / 无上传 / 进程秒退」时建议按序缩小范围（**详细语义**见 **`README.md`**、**`agent.toml.example`**、**`docs/EVENT_BUS_BACKPRESSURE.md`**）：
-
-1. **进程能否启动**：**`--help`**、同目录 **`agent.toml`** 路径、**ACL**（服务账户写 **ProgramData** / 队列库）。  
-2. **配置指纹**：stderr **`[config] fingerprint=`** 是否随 **`EDR_CONFIG_RELOAD_S`** 热载变化。  
-3. **gRPC**：**`[transport] gRPC target`**、证书或 **`EDR_GRPC_INSECURE=1`**（仅调试）；**`UploadFile`** 与 **MinIO** 见 **`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**。  
-4. **ETW**：管理员权限、Provider 跳过日志（README「ETW 增强」）。  
-5. **WinDivert**：服务 **`WinDivert` / `WinDivert1.4`**、**`[shellcode_detector]`** 开关。  
-6. **高危指令**：**`EDR_CMD_ENABLED`**、**`[command] allow_dangerous`**、**`forensic`/`kill`/`isolate`** 审计路径 **`EDR_CMD_AUDIT_PATH`**。  
-7. **自保护 / 总线**：**`[self_protect] event_bus_pressure_warn_pct`**（默认 90）、退出 **`bus_dropped`**；**Job Object / anti_debug** 见 **[SELF_PROTECT_REGRESSION.md](SELF_PROTECT_REGRESSION.md)**。  
-8. **Windows 服务停止**：**`--service`** 与 **`sc stop`** 见 **[WINDOWS_SERVICE_SHUTDOWN.md](WINDOWS_SERVICE_SHUTDOWN.md)**（与 **Ctrl+C** 同 **`edr_agent_shutdown`**）。
-
-### 3.1 运行 exe 提示「与当前 Windows 版本不兼容」
-
-该文案通常表示 **PE 机器类型与当前系统不匹配**，而不是「Windows 版本号太旧」一种情况：
-
-| 情况 | 处理 |
-|------|------|
-| **64 位 exe 装在 32 位 Windows** | 在 **64 位 Windows** 上运行，或改用 **Win32（x86）** 目标重新编译（不推荐，Agent 默认按 x64 联调）。 |
-| **ARM 版 Windows（如 Snapdragon 本）** 上放了 **x64-only** 的 exe | 需 **ARM64** 目标重编，或确认系统已开启 **x64 模拟**且使用该通道下的兼容构建。 |
-| **exe 实际不是本机架构的 PE**（例如把 **macOS/Linux** 产物改名、或交叉编译用了 **i686** 却部署到纯 x64 策略环境） | 在 **本机 Windows** 用 **Visual Studio / CMake `-A x64`** 生成 **`edr_agent.exe`**，或用 **x86_64-w64-mingw32** 交叉产出 **x64 PE**，勿使用非 Windows PE。 |
-
-在 **x64 Windows 10/11** 上本机编译时建议使用：
-
-```powershell
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
-
-再用 **`.\build\Release\edr_agent.exe --help`**（路径以生成器为准）验证。
-
-### 3.2 Windows on ARM（**ARM64** 本机）
-
-在 **ARM64 Windows** 上应生成 **ARM64 PE**，不要用 x64 的 `edr_agent.exe`（除非仅依赖 x64 模拟且 intentionally 使用 x64 构建）。
-
-1. 安装 **Visual Studio 2022**（或 2019），工作负载勾选 **使用 C++ 的桌面开发**，并确保安装 **用于 ARM64 的 MSVC** 与 **Windows 11 SDK**（安装器中在单个组件里可搜 **ARM64**）。
-2. 在 **`edr-agent`** 仓库根目录执行：
-
-```powershell
-.\scripts\build_windows_arm64.ps1
-```
-
-等价手动命令（与 CI **`windows-11-arm`** 一致，默认关闭 gRPC 以降低依赖）：
-
-```powershell
-cmake -B build-arm64 -G "Visual Studio 17 2022" -A ARM64 -DEDR_WITH_GRPC=OFF
-cmake --build build-arm64 --config Release --parallel
-.\build-arm64\Release\edr_agent.exe --help
-```
-
-**说明**：仓库内 **`./scripts/build_windows_mingw*.sh`** 面向 **x86_64 MinGW** PE，**不**用于产出 ARM64 Windows 二进制；ARM64 请以 **本机 MSVC** 或后续若增加的 **llvm-mingw aarch64** 工具链为准。
 
 ---
 
-## 4. 服务包装示例（**草案**，需按路径与版本修改）
+## 4. 原生服务安装（推荐生产入口）
 
-以下 **不** 随仓库执行，仅供运维/打包参考；亦可改用 **NSSM / 厂商服务框架**。自 **S1** 起，二进制支持内置 **`--service <与 sc create 同名>`**，**`sc stop`** 将触发 **`edr_agent_shutdown`**（与 **Ctrl+C** 同路径）；见 **`docs/WINDOWS_SERVICE_SHUTDOWN.md`**。注册命令也可用 **`scripts/edr_agent_install.ps1 -RegisterService -AgentExe …`**（见 **`docs/AGENT_INSTALLER.md`「方式三 · Windows 服务」**）。
+`edr_agent.exe` 已支持 Windows SCM 生命周期：服务安装时使用 **`--service`**，停止/关机时 SCM 会触发 Agent 优雅退出。
 
-**PowerShell（节选，需管理员）**：
+1. 放置二进制、脚本与配置：
 
 ```powershell
-# 假设 edr_agent.exe 已置于 C:\Program Files\EDR\edr_agent.exe
-# 假设配置为 C:\ProgramData\EDR\agent.toml
-# --service 后的名称须与 sc create 的服务名一致（此处均为 EdrAgent）
-$bin = '"C:\Program Files\EDR\edr_agent.exe" --service EdrAgent --config C:\ProgramData\EDR\agent.toml'
-sc.exe create EdrAgent binPath= $bin obj= "NT AUTHORITY\LocalService" start= auto
-# 按需: sc.exe description EdrAgent "EDR Agent"
-# 首次需验证 LocalService 对配置路径、日志路径是否有 ACL
+Copy-Item .\edr_agent.exe "C:\Program Files\EDR Agent\edr_agent.exe" -Force
+Copy-Item .\scripts\windows_isolate_host.ps1 "C:\Program Files\EDR Agent\windows_isolate_host.ps1" -Force
 ```
 
-使用 **LOCAL SERVICE** 时，必须为 **`agent.toml`、日志、队列库、取证目录** 配置 **ACL**，否则进程启动即失败。
+2. 推荐入口：直接使用 `edr_agent.exe --install`。它会调用同目录或 `scripts\` 下的 `edr_agent_install.ps1` 生成生产配置，自动生成端侧私钥/CSR，调用 enroll 签发终端唯一客户端证书，并写入 mTLS 证书路径；传 `--install-service` 时继续注册并启动 Windows 服务：
+
+```powershell
+cd "C:\Program Files\EDR Agent"
+.\edr_agent.exe --install `
+  --api-base "https://edr.example.com:8080" `
+  --enroll-token "<token>" `
+  --trust-ca `
+  --install-service `
+  --enable-response-actions
+```
+
+输出的 `agent.toml` 只保留一行英文说明，便于现场排障并避免模板注释、中文编码和异常换行问题。便携测试可将 `--install-service` 换成 `--install-autorun`；二者不要同时启用，避免重复启动。
+
+批量分发 zip 时，也可以调用包内 **`scripts\edr_agent_zip_deploy.ps1`**。该脚本会先把包复制到 `C:\Program Files\EDR Agent`，再执行同一套 `edr_agent.exe --install` 流程：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\edr_agent_zip_deploy.ps1 `
+  -ApiBase "https://edr.example.com:8080" `
+  -EnrollToken "<token>" `
+  -TrustCa `
+  -RuntimeMode service `
+  -EnableResponseActions
+```
+
+3. 如需分步排查，可先只生成生产配置：
+
+```powershell
+.\scripts\edr_agent_install.ps1 `
+  -ApiBase "https://edr.example.com:8080" `
+  -EnrollToken "<token>" `
+  -Output "C:\Program Files\EDR Agent\agent.toml" `
+  -TrustCa
+```
+
+也可在便携部署中加 `-InstallAutorun`，脚本会在写入 `agent.toml` 后注册开机计划任务；Inno 安装包仍由向导任务完成同样动作。
+
+4. 安装并启动服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows_service_install.ps1 -Action Install `
+  -ExePath "C:\Program Files\EDR Agent\edr_agent.exe" `
+  -ConfigPath "C:\Program Files\EDR Agent\agent.toml" `
+  -EnableResponseActions
+```
+
+安装脚本会执行以下生产约束：
+
+| 项 | 行为 |
+|----|------|
+| **真实 mTLS** | 设置 `EDR_GRPC_REQUIRE_MTLS=1`；缺少 `ca_cert` / `client_cert` / `client_key` 时 gRPC 不启动 |
+| **服务自恢复** | `sc.exe failure` 配置失败重启 |
+| **ACL** | `%ProgramFiles%\EDR Agent` 仅系统/管理员写；脚本会为服务账户授予队列、日志、取证缓存等运行时子目录写权限 |
+| **自保护** | 生产模板启用 `[self_protect] anti_debug`、`job_object_windows`、watchdog 与事件总线压力告警 |
+| **主机隔离** | 默认 `enforce`：随包 `windows_isolate_host.ps1` 自动生效（Defender 默认 Block + 放行管理服务器）。agent 会用后端 IP 自动填 `EDR_ISOLATE_ALLOW_REMOTE_ADDRS` 保证管理通道存活;需自定义可设 `EDR_ISOLATE_HOOK`,`EDR_ISOLATE_MODE=stamp` 退回纯标记。脚本须随包落到 agent 同目录或其 `scripts/`(或设 `EDR_ISOLATE_SCRIPT`),服务以可写防火墙的特权账户运行 |
+| **取证上传可靠性** | 设置 `EDR_UPLOAD_FILE_RETRIES=3`；上传失败时保留本地 `bundle.tgz` 并在命令结果中返回路径 |
+
+如需以 **LOCAL SERVICE** 运行，可传 `-Account "NT AUTHORITY\LocalService"`；全量 ETW、WinDivert、取证等能力仍可能需要 LocalSystem 或额外特权。
+
+---
+
+## 4.1 Inno `EDRAgentSetup.exe`：开机常驻与卸载（已实现）
+
+安装包也可通过 **`install/windows-inno/edr_windows_autorun.ps1`** 注册计划任务，适合开发与兼容旧包的场景：
+
+| 安装向导任务 | 行为 |
+|--------------|------|
+| **Run at startup (scheduled task as SYSTEM, survives reboot)**（默认勾选） | 注册名称为 **`EdrAgent`** 的计划任务：触发器 **系统启动**、主体 **`NT AUTHORITY\SYSTEM`**、无单次执行时限、失败可重试；安装结束时 **立即 Start-ScheduledTask** 一次。 |
+| **Restrict install folder…**（默认不勾选） | 对 **`%ProgramFiles%\EDR Agent`** 执行 **`icacls`**：去掉继承；**`SYSTEM`** / **`Administrators`** 完全控制；**`Users`**（SID `S-1-5-32-545`）**读取+执行**，以便非管理员仍能运行 **`edr_agent.exe`** 并读取 **`agent.toml`**（不可写目录内文件，降低随意篡改）。若曾用旧脚本加固导致「拒绝访问」，请用**管理员**命令行执行卸载或手动 **`icacls "<安装目录>" /inheritance:e /T`** 恢复继承后重装。 |
+
+**卸载**：使用「程序和功能」中的 **EDR Agent** 项（即 Inno 生成的 **`unins000.exe`**）。卸载阶段会先执行 **`edr_windows_autorun.ps1 -Action Remove`**：停止并注销计划任务、结束 **`edr_agent`** 进程、在删除文件前运行 **`edr_agent.exe --etw-uninstall-cleanup`** 按名 **`ControlTrace` STOP** 本程序使用的 ETW 实时会话（避免异常退出后会话名 **`EDR_Agent_RT_001`** 仍占用）；再对安装目录 **`icacls /inheritance:e`** 恢复继承，最后删除文件。随包的 WinDivert 文件也会删除；若没有其他进程使用该驱动，WinDivert 会在后续重启时自动卸载。安装器不会强制删除共享的 `WinDivert` 服务，避免影响同机其他软件。
+
+## 4.2 Headless `uninstall.exe`：完整卸载（已实现）
+
+Windows headless 安装完成后会在 `%ProgramFiles%\FDSecurity` 写入原生 **`uninstall.exe`**，并注册到 Windows“应用和功能”。双击会请求管理员权限并执行完整卸载：停止并删除 Agent 服务/计划任务、结束进程、清理 ETW、删除客户端证书和 Agent 专用机器环境变量，再删除配置、队列、证据、日志与程序目录。
+
+- 交互卸载：`"C:\Program Files\FDSecurity\uninstall.exe"`
+- 静默卸载：`"C:\Program Files\FDSecurity\uninstall.exe" /S`
+- 仅注销运行时并保留配置、运行数据和程序文件：`"C:\Program Files\FDSecurity\uninstall.exe" /KEEPDATA`
+
+`uninstall.ps1` 作为维护和故障恢复入口继续保留；正常卸载应优先使用 `uninstall.exe`。
+
+若需 **Windows 服务**形态，优先使用上文 §4；与计划任务二选一，避免同一主机启动两个 Agent 实例。
+
+**静默 + 命令行注册**：支持 **`/EDR_API_BASE=`** / **`/EDR_ENROLL_TOKEN=`**（或短写法 **`/API=`** / **`/TOK=`**），可选 **`/EDR_INSECURE_TLS=1`** 或 **`/TLS=1`**；须成对或均省略；与 Inno **`/VERYSILENT`** 等组合使用。完整说明与命令行敏感提示见 **[AGENT_INSTALLER.md](AGENT_INSTALLER.md)**「Release 一键安装」Windows 小节。
 
 ---
 
 ## 5. 与 edr-backend 安装包的关系
 
+- **当前 CI / Inno 发布流程**（根目录 **`publish-windows-setup-exe.yml`**、本仓库 **`edr-agent-client-release.yml` Windows job**）：**vcpkg**（`edr-agent/vcpkg.json` → **`grpc`**，`x64-windows-static-md`）+ **`cmake -DEDR_WITH_GRPC=ON -DEDR_WITH_ONNXRUNTIME=ON`**；CI 下载官方 **`onnxruntime-win-x64-1.17.3`** 并设 **`ONNXRUNTIME_ROOT`**，构建后将 **`onnxruntime.dll`**（及若存在的 **`onnxruntime_providers_shared.dll`**）复制到 **`build\Release\`**，由 **`EDRAgentSetup.iss`** 与 **`edr_agent.exe`** 同目录安装。配置好 **`[server]`** 时 **`grpc_ready` 可为 1**；`models` 下有合法 ONNX 且 ORT 加载成功时 **`[heartbeat]`** 中 **`onnx_static_ready` / `onnx_behavior_ready` 可为 1**。
+- **AVE `models` 目录**：发布前运行 **`scripts/sync_onnx_output_to_models.ps1`**（或 `.sh`），将 **`onnx-output/*.onnx`** 复制到 **`models/`** 后打包。本机自编译带 ORT 时，亦需将上述 DLL 放在 **`edr_agent.exe` 同目录**（与 Inno 约定一致）。
+- **路径约定**：Windows 运行时配置、证书、模型、队列、日志、取证缓存、隔离状态与 outbox 均固定在 **`%ProgramFiles%\EDR Agent`**；检测规则/测试样本中出现的 `ProgramData` 仅代表被检测对象路径，勿作为 Agent 自身存储目录。
 - 平台下发的 zip 可能内含 **同一套** `edr_agent_install.ps1`；**服务注册** 可在 **首次运行向导** 或 **单独 GPO 脚本** 中完成。
 - **24h 下载链接、安装包哈希** 等以 **edr-backend** 文档为准。
 

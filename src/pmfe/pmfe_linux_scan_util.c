@@ -1,5 +1,6 @@
 #include "pmfe_linux_scan_util.h"
 
+#include <stdio.h>
 #include <string.h>
 
 const char *edr_pmfe_linux_skip_ws(const char *p) {
@@ -52,6 +53,14 @@ int edr_pmfe_linux_parse_maps_line(const char *line, uint64_t *lo, uint64_t *hi,
   return 0;
 }
 
+int edr_pmfe_linux_path_is_memfd(const char *path) {
+  return path && (strstr(path, "memfd:") != NULL || strstr(path, "/memfd:") != NULL);
+}
+
+int edr_pmfe_linux_path_is_deleted(const char *path) {
+  return path && strstr(path, " (deleted)") != NULL;
+}
+
 float edr_pmfe_linux_map_candidate_score(const char *perms, uint64_t lo, uint64_t hi, const char *path,
                                          int anon_exec_only) {
   if (!perms || strlen(perms) < 4u) {
@@ -60,7 +69,9 @@ float edr_pmfe_linux_map_candidate_score(const char *perms, uint64_t lo, uint64_
   if (perms[2] != 'x' || perms[3] != 'p') {
     return 0.f;
   }
-  int anon = (!path || path[0] == '\0' || path[0] == '[');
+  int memfd = edr_pmfe_linux_path_is_memfd(path);
+  int deleted = edr_pmfe_linux_path_is_deleted(path);
+  int anon = (!path || path[0] == '\0' || path[0] == '[' || memfd || deleted);
   if (anon_exec_only && !anon) {
     return 0.f;
   }
@@ -68,6 +79,12 @@ float edr_pmfe_linux_map_candidate_score(const char *perms, uint64_t lo, uint64_
   float s = 35.f;
   if (anon) {
     s += 45.f;
+  }
+  if (memfd) {
+    s += 35.f;
+  }
+  if (deleted) {
+    s += 25.f;
   }
   if (perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
     s += 28.f;

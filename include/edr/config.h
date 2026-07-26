@@ -19,11 +19,21 @@
 #define EDR_FL_FROZEN_NAME_MAX 64
 
 typedef struct EdrConfig {
-  struct {
-    char address[256];
+	  struct {
+	    char address[256];
+	    /** Legacy config compatibility only; current transport uses platform.rest_base_url. */
+	    bool grpc_enabled;
+	    /** Legacy config compatibility only; current transport ignores this flag. */
+	    bool grpc_insecure;
     char ca_cert[1024];
     char client_cert[1024];
     char client_key[1024];
+    char client_key_provider[32];
+    char client_cert_store[256];
+    char client_cert_thumbprint[128];
+    char pkcs11_module[1024];
+    char pkcs11_key_uri[512];
+    char tpm_key_uri[512];
     int connect_timeout_s;
     int keepalive_interval_s;
   } server;
@@ -34,15 +44,46 @@ typedef struct EdrConfig {
   } agent;
 
   struct {
+    bool signature_required;
+    char signing_key_id[96];
+    char public_key_pem[4096];
+  } config_signing;
+
+  struct {
     bool etw_enabled;
+    /** Optional Windows provider switches. Defaults preserve the historical collector posture. */
+    bool etw_dns_client_provider;
+    bool etw_powershell_provider;
+    bool etw_amsi_provider;
+    bool etw_schannel_provider;
+    bool etw_security_audit_provider;
+    bool etw_wmi_provider;
     /** Windows：订阅 Microsoft-Windows-TCPIP（§19.10）；失败时跳过不致命 */
     bool etw_tcpip_provider;
     /** Windows：订阅 WFAS 防火墙 ETW（§19.10）；失败时跳过不致命 */
     bool etw_firewall_provider;
     bool ebpf_enabled;
+    bool auditd_enabled;
+    char auditd_log_path[512];
     int poll_interval_s;
     uint32_t max_event_queue_size;
+    bool adaptive_enabled;
+    uint32_t adaptive_boost_seconds;
+    uint32_t adaptive_min_severity;
   } collection;
+
+  struct {
+    bool enabled;
+    char version[64];
+    bool agent_internal_forensic;
+    bool low_value_file_process;
+    bool low_value_file_suffix;
+    bool temp_xml;
+    char low_value_process_names[1024];
+    char low_value_suffixes[1024];
+    char temp_xml_patterns[1024];
+    char agent_internal_patterns[1024];
+  } event_filter;
 
   struct {
     uint32_t dedup_window_s;
@@ -56,6 +97,59 @@ typedef struct EdrConfig {
   } preprocessing;
 
   struct {
+    char source[32];
+    char audit_id[128];
+    char policy_version[64];
+    char rollback_version[64];
+    char fp_policy_version[64];
+    char fp_rollback_version[64];
+    char rmm_policy_version[64];
+    char rmm_rollback_version[64];
+    char allow_paths[2048];
+    char script_dirs[2048];
+    char management_tools[1024];
+    char fp_feedback[2048];
+    /* 二期条件化 suppression 规则的紧凑序列化串（控制符分隔），来自 [[detection_policy.suppression]]。
+     * 规则间 \x1e，字段间 \x1f（target,process,action,reason,contains_all），contains_all token 间 \x1d。 */
+    char suppression_rules[8192];
+  } detection_policy;
+
+  /** Product-level sensor modes from remote `[detection]` policy. */
+  struct {
+    bool auto_profile;
+    int shellcode_mode; /* -1 adaptive, 0 off, 1 on */
+    int webshell_mode;  /* -1 adaptive, 0 off, 1 on */
+    int pmfe_mode;      /* -1 adaptive alert, 0 off, 1 reserved idle, 2 alert-triggered */
+  } detection;
+
+  /** Low-latency endpoint correlation. `configured` preserves legacy env-only deployments. */
+  struct {
+    bool configured;
+    bool enabled;
+    bool inject_feedback_enabled;
+  } correlation;
+
+  /** Endpoint policy schema v2. Modes: 0 off, 1 observe, 2 alert, 3 block. */
+  struct {
+    int credential_mode;
+    int lateral_mode;
+    int privilege_mode;
+    int evasion_mode;
+    int persistence_mode;
+    int script_mode;
+    int webshell_mode;
+    int exfil_mode;
+    int impact_mode;
+    bool ransomware_behavior;
+    bool ransomware_mass_write;
+    bool ransomware_vss;
+    bool ransomware_spread;
+    bool ransomware_honey;
+    bool ransomware_forensic;
+  } policy_v2;
+
+  struct {
+    bool enabled;
     char model_dir[1024];
     int scan_threads;
     int max_file_size_mb;
@@ -72,9 +166,11 @@ typedef struct EdrConfig {
      * 为 true（默认）时 ONNX 前做 IOC 预检；为 false 时仅 ONNX 后二次核对 IOC（便于与模型并行或热库后写）。
      */
     bool ioc_precheck_enabled;
+    /** Static ONNX file model for EPP-style file verdicts. Product builds keep this enabled. */
+    bool static_model_enabled;
     /** L4：不可豁免文件哈希（表 `file_behavior_non_exempt`） */
     char behavior_policy_db_path[1024];
-    /** P2：`AVE_StartBehaviorMonitor` 是否拉起消费线程（默认 true） */
+    /** `AVE_StartBehaviorMonitor` 是否拉起消费线程；生产默认关闭，按策略/应急触发开启。 */
     bool behavior_monitor_enabled;
     /**
      * Windows Authenticode：`WinVerifyTrust` 吊销检查（`WTD_REVOKE_WHOLECHAIN`）。
@@ -112,13 +208,31 @@ typedef struct EdrConfig {
     char queue_db_path[1024];
     uint32_t max_queue_size_mb;
     uint32_t retention_hours;
+    char evidence_cache_path[1024];
+    uint32_t evidence_cache_max_size_mb;
+    uint32_t evidence_cache_retention_hours;
   } offline;
 
   struct {
     uint32_t cpu_limit_percent;
     uint32_t memory_limit_mb;
     uint32_t emergency_cpu_limit;
+    uint32_t ave_infer_per_min;
+    uint32_t behavior_infer_per_min;
+    uint32_t pmfe_scans_per_min;
+    uint32_t webshell_scan_mb_per_min;
+    uint32_t shellcode_packets_per_sec;
+    uint32_t low_priority_keep_percent_under_pressure;
   } resource_limit;
+
+  /** Agent health monitor is opt-in and usually enabled per endpoint from the platform. */
+  struct {
+    bool enabled;
+    char profile[32];
+    uint32_t interval_s;
+    uint64_t expires_at_unix_ms;
+    char request_id[128];
+  } health_monitor;
 
   struct {
     char level[16];
@@ -134,7 +248,25 @@ typedef struct EdrConfig {
      * 环境变量 `EDR_CMD_ENABLED` / `EDR_CMD_DANGEROUS` 仍为最高优先级。
      */
     bool allow_dangerous;
+    /** Read-only RTQ is separated from RTR/response permissions. */
+    bool allow_rtq_readonly;
+    char rtr_shell_allowlist[2048];
+    uint32_t rtr_shell_max_timeout_sec;
+    char signing_public_key_path[1024];
+    char signing_public_key_pem[2048];
+    /** 取证 YARA 扫描规则目录（yara_scan 命令使用）。空=用 EDR_YARA_RULES_DIR 或默认 rules/forensic。 */
+    char forensic_yara_rules_dir[1024];
   } command;
+
+  /** 告警推荐取证自动派发。该开关独立于 [command].allow_dangerous，避免开启响应权限后自动风暴。 */
+  struct {
+    bool enabled;
+    uint32_t cooldown_s;
+    uint32_t per_pid_cooldown_s;
+    uint32_t max_per_hour;
+    bool trigger_on_p0;
+    bool collect_process_tree;
+  } forensic_auto;
 
   /**
    * §19 平台 REST（攻击面上报）。`rest_base_url` 形如 `http://127.0.0.1:8080/api/v1`（无尾斜杠）。
@@ -144,6 +276,36 @@ typedef struct EdrConfig {
     char rest_base_url[512];
     char rest_user_id[128];
     char rest_bearer_token[512];
+    /** HTTPS/TLS transport v2: HTTP/2 is the default, HTTP/1.1 remains an explicit fallback unless required. */
+    bool http2_enabled;
+    bool http2_require;
+    /** Control-plane policy is independent from bulk telemetry HTTP/2. */
+    bool control_http2_enabled;
+    bool control_http2_require;
+    bool control_http1_fallback;
+    bool control_stream_enabled;
+    bool long_poll_fallback;
+    bool report_events_v2_enabled;
+    char data_plane_encoding[32];
+    char data_plane_compression[32];
+    char control_dict_version[64];
+    char control_schema_version[64];
+    char control_profile_id[64];
+    char qos_dscp[32];
+    char telemetry_threshold[32];
+    uint32_t telemetry_sampling_pct;
+    bool backpressure_enabled;
+    /** off | auto | explicit. auto 默认读取 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY。 */
+    char proxy_mode[32];
+    /** 显式 HTTP CONNECT 代理，例如 http://proxy.corp:8080。 */
+    char proxy_url[512];
+    /** 本地 Relay/Gateway 地址；配置后 Agent 优先连接 relay_url，再由 Relay 转发到 Server。 */
+    char relay_url[512];
+    struct {
+      bool enabled;
+      char key_id[128];
+      char secret[256];
+    } request_signing;
   } platform;
 
   /**
@@ -153,6 +315,15 @@ typedef struct EdrConfig {
    */
   struct {
     bool enabled;
+    bool listeners_enabled;
+    bool public_service_enabled;
+    bool local_admins_enabled;
+    bool services_enabled;
+    bool shares_enabled;
+    bool browser_enabled;
+    bool software_enabled;
+    bool defender_enabled;
+    bool egress_enabled;
     uint32_t port_interval_s;
     uint32_t conn_interval_s;
     uint32_t service_interval_s;
@@ -193,6 +364,25 @@ typedef struct EdrConfig {
      * 事件总线占用 ≥ 该百分比时周期性 stderr 告警；0 表示关闭。
      */
     uint32_t event_bus_pressure_warn_pct;
+    /**
+     * §B1 进程内子系统心跳：某子系统（collector/preprocess/main_loop）距上次心跳
+     * ≥ 该秒数时判定 hang 并周期性 WARN；0=关闭（默认）。
+     */
+    uint32_t subsystem_stale_timeout_s;
+    /**
+     * §B2 伴生 watchdog 进程：为 true 时 agent 启动一个独立 watchdog 子进程互守，
+     * 任一被 kill 由另一方按原 argv/config 重新拉起。默认 false。
+     * 环境变量 EDR_SELF_PROTECT_WATCHDOG_PROCESS=1 亦可开启（优先级高于配置）。
+     */
+    bool watchdog_process;
+    /** watchdog 与 agent 写/读心跳文件的间隔（秒），默认 5。 */
+    uint32_t watchdog_heartbeat_interval_s;
+    /** agent 心跳文件超过该秒数视为僵死并由 watchdog 重启，默认 30。 */
+    uint32_t watchdog_stale_timeout_s;
+    /** 重启风暴防护：每分钟最多重启次数，默认 5；超限退避。 */
+    uint32_t watchdog_max_restarts_per_min;
+    /** 心跳文件路径；空则从 pidfile 旁派生或用默认临时路径。 */
+    char watchdog_heartbeat_path[1024];
   } self_protect;
 
   /** §17 协议层 Shellcode 检测引擎（Windows；其它平台忽略 enabled） */
@@ -210,6 +400,30 @@ typedef struct EdrConfig {
     bool auto_isolate_execute;
     /** 启发式分数乘数（0.01–3.0），用于现场压误报/提灵敏度 */
     double heuristic_score_scale;
+    /** 网络命中后的定向PMFE确认；启发式仅在达到独立高阈值时触发。 */
+    bool pmfe_followup_enabled;
+    double pmfe_heuristic_threshold;
+    /**
+     * P0 优化 #2：每条连接（4 元组）只深扫前 N 字节载荷；超过则跳过深扫（漏洞利用特征均在会话起始）。
+     * 大幅降低大文件/长连接的逐包 entropy/YARA 开销。0=不限（旧行为，逐包全扫）。默认 65536。
+     */
+    uint32_t flow_scan_first_bytes;
+    /** TCP方向流重组上限。总内存耗尽时优先淘汰最久未活动的流。 */
+    uint32_t reassembly_max_flows;
+    uint32_t reassembly_memory_limit_kb;
+    uint32_t reassembly_idle_timeout_s;
+    /**
+     * P0 优化 #3：是否对 TLS 应用数据（密文）做 shellcode 深扫。
+     * 默认 false：仅提取 ClientHello（JA3/SNI），跳过 CCS/alert/application_data 记录的熵/YARA 扫描，
+     * 既省 CPU 又避免高熵密文误报。设 true 恢复对 TLS 载荷的深扫。
+     */
+    bool scan_tls_appdata;
+    /**
+     * 排除 Agent 自身到平台/中继/代理的流量（默认 true）。启动时解析 `[platform]` 的
+     * rest_base_url / relay_url / proxy_url 主机 IP，在 WinDivert 过滤器内核层加 `and not (ip.*Addr==..)`，
+     * 避免「EDR 自抓自」浪费与潜在自我误报。平台 IP 变更需重启重新解析；解析失败则本次不排除。
+     */
+    bool exclude_self_traffic;
     /** YARA 规则目录周期性重新编译间隔（秒）；0=仅启动时加载 */
     uint32_t yara_rules_reload_interval_s;
     bool monitor_smb;
@@ -217,11 +431,13 @@ typedef struct EdrConfig {
     bool monitor_winrm;
     bool monitor_msrpc;
     bool monitor_ldap;
+    bool monitor_tls;
     uint32_t detector_threads;
+    /** 捕获线程到检测worker的有界队列容量。 */
+    uint32_t scan_queue_capacity;
     char yara_rules_dir[1024];
-    /** 非空：WinDivert PCAP 根目录；空则回退 EDR_FORENSIC_OUT\\shellcode，再 %TEMP%\\edr_forensic\\shellcode（windivert_capture.c） */
     char forensic_dir[1024];
-    /** 告警时写 PCAP（true 即落盘；根路径见 forensic_dir 与上述回退） */
+    /** 告警时写 PCAP（需 forensic_dir 非空；无环形时单包 raw LINKTYPE 228/229） */
     bool forensic_save_pcap;
     /** 告警 ETW1 中附加证据区 SHA256 后的十六进制预览长度（0=关闭，上限见 config clamp） */
     uint32_t evidence_preview_bytes;
@@ -238,6 +454,13 @@ typedef struct EdrConfig {
     bool windivert_ports_is_custom;
     uint16_t windivert_tcp_ports_parsed[64];
     size_t windivert_tcp_ports_parsed_count;
+    /**
+     * P2 #8：WinDivert 内核队列参数（随机型可调；瘦终端可调小以约束非分页内存）。
+     * 0=用内置默认。范围按 WinDivert 规范 clamp：length 32..16384、size 64..32768 KiB、time 100..16000 ms。
+     */
+    uint32_t windivert_queue_length;
+    uint32_t windivert_queue_size_kb;
+    uint32_t windivert_queue_time_ms;
   } shellcode_detector;
 
   /** §18 Webshell 检测引擎（站点目录增量监控） */
@@ -257,6 +480,14 @@ typedef struct EdrConfig {
     uint32_t upload_timeout_s;
     uint32_t max_upload_size_mb;
   } webshell_detector;
+
+  /** 端侧网络扇出/扫描检测（TOML `[net_fanout]`）。同进程同端口窗口内连大量不同 IP=扫描。 */
+  struct {
+    bool enabled;                   /* 默认 false */
+    uint32_t window_s;              /* 默认 120 */
+    uint32_t distinct_ip_threshold; /* 默认 50 */
+    char ports[256];                /* 逗号分隔扫描敏感端口;空=内置默认 */
+  } net_fanout;
 
   /**
    * 联邦学习本地训练（FL §10）；TOML `[fl]`。

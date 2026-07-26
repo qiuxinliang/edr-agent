@@ -4,8 +4,16 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-exec python3 third_party/nanopb/generator/nanopb_generator.py \
+python3 third_party/nanopb/generator/nanopb_generator.py \
   -I proto \
   -f proto/edr/v1/event.options \
   proto/edr/v1/event.proto \
   -D src/proto
+
+python3 - <<'PY'
+from pathlib import Path
+
+for name in ("event.pb.c", "event.pb.h"):
+    path = Path("src/proto/edr/v1") / name
+    path.write_text(path.read_text().rstrip() + "\n")
+PY

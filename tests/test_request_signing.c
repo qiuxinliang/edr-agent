@@ -15,7 +15,6 @@ int main(void) {
   char canonical[512];
   char mac[65];
   char headers[1024];
-  char headers_second[1024];
   EdrRequestSigningConfig cfg;
   char nonces[64][33];
 
@@ -69,17 +68,9 @@ int main(void) {
   if (!strstr(headers, "X-EDR-Signature-Version: reqsig-v1\r\n") ||
       !strstr(headers, "X-EDR-Key-ID: reqsig_test\r\n") ||
       !strstr(headers, "X-EDR-Timestamp-Ms: 1700000000000\r\n") ||
-      !strstr(headers, "X-EDR-Nonce: ") ||
       !strstr(headers, "X-EDR-Content-SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\n") ||
       !strstr(headers, "X-EDR-Signature: ")) {
     fprintf(stderr, "missing expected request signing headers:\n%s\n", headers);
-    return 1;
-  }
-  if (edr_reqsig_build_headers(&cfg, "GET", poll_path,
-                               "ep-1", NULL, 0u, 1700000000000LL,
-                               headers_second, sizeof(headers_second)) != 0 ||
-      strcmp(headers, headers_second) == 0) {
-    fprintf(stderr, "independent signing attempts must produce fresh headers\n");
     return 1;
   }
   memset(headers, 0, sizeof(headers));

@@ -1,5 +1,0 @@
-post /a HTTP/1.1
-HoSt: t
-Content-Length: 20
-
-https://q?ms-msdt:/x

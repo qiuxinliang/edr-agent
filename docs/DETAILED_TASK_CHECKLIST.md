@@ -102,7 +102,7 @@
 | PL-031 | [~] | P1 | **INS-03～04**：`expires_at`、匿名下载路由 | `INSTALLER_IMPLEMENTATION_TASKS`；**`000023`** + **`public_installer.go`** | PL-030 | 5–12 |
 | PL-032 | [x] | P1 | **INS-06**：`expiresIn` 真实剩余秒 | 与 DB 一致 | PL-031 | 0.5–1 |
 | PL-033 | [x] | P2 | **INS-09**：S3 兼容预签名 **`download_url`**（`INSTALLER_MINIO_*`） | `INSTALLER_IMPLEMENTATION_TASKS` INS-09 | PL-031 | 3–8 |
-| PL-034 | [x] | P2 | **INS-10**：**`INSTALLER_EMBED_AGENT_BINARY`** 打入 zip；路径已设则读失败/空 → **`BuildInstallerZip`** 报错 | **`zipbundle.go`** + **`zipbundle_test.go`**；多 OS 矩阵由部署/CI 注入路径 | PL-033 | 5–15 |
+| PL-034 | [~] | P2 | **INS-10**：**`INSTALLER_EMBED_AGENT_BINARY`** 打入 zip；矩阵/失败策略在 CI | 流水线 + 同表 INS-10 | PL-033 | 5–15 |
 | PL-035 | [ ] | P2 | **INS-07/08** 权限与租户列表入口 | 前端联调 | PL-031 | 2–4 |
 
 ---

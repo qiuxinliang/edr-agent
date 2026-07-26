@@ -1,0 +1,5 @@
+sample_id,sha256,label,family,source,expected_min_score,notes
+malware-lsass-dump-001,0000000000000000000000000000000000000000000000000000000000000001,malicious,credential_access,lab,0.65,LSASS dump behavior fixture
+malware-ransom-001,0000000000000000000000000000000000000000000000000000000000000002,malicious,ransomware,lab,0.70,shadow copy delete plus mass rename fixture
+malware-webshell-001,0000000000000000000000000000000000000000000000000000000000000003,malicious,webshell,lab,0.75,webshell semantic fixture
+clean-admin-001,ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff,clean,it_admin,allowlist,0.00,known admin tool clean baseline

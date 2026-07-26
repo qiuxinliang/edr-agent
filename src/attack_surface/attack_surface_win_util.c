@@ -7,10 +7,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-
 static int s_wsa_ok;
 
 void edr_asurf_win_ensure_wsa(void) {

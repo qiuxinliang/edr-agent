@@ -5,9 +5,6 @@
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
 
-#include "edr/v1/event.pb.h"
-#include <pb_decode.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +23,21 @@ static int persist_strategy_on_fail_only(void) {
 #define EDR_LZ4_MIN_IN 1024u
 #endif
 
+#ifndef EDR_LZ4_COMPRESSION_LEVEL
+#define EDR_LZ4_COMPRESSION_LEVEL 6
+#endif
+
+static int env_lz4_compression_level(void) {
+  const char *e = getenv("EDR_LZ4_COMPRESSION_LEVEL");
+  if (!e || !e[0]) {
+    return EDR_LZ4_COMPRESSION_LEVEL;
+  }
+  int v = atoi(e);
+  if (v < 1) { v = 1; }
+  if (v > 12) { v = 12; }
+  return v;
+}
+
 static uint8_t *s_buf;
 static size_t s_cap;
 static uint32_t s_max_frames;
@@ -35,10 +47,14 @@ static uint64_t s_batch_seq;
 static int s_flush_timeout_s;
 static uint64_t s_deadline_ns;
 static uint64_t s_timeout_flush_count;
+static int s_lz4_compression_level;
 
 static void batch_note_write(void) {
   if (s_flush_timeout_s <= 0) {
     s_deadline_ns = 0;
+    return;
+  }
+  if (s_deadline_ns != 0u) {
     return;
   }
   uint64_t now = edr_monotonic_ns();
@@ -59,7 +75,7 @@ static void make_batch_id(char *out, size_t cap) {
 }
 
 static void maybe_persist(const char *batch_id, const uint8_t *header12, const uint8_t *payload,
-                            size_t payload_len, int compressed) {
+                            size_t payload_len, int compressed, int use_http) {
   if (persist_strategy_on_fail_only()) {
     return;
   }
@@ -67,6 +83,7 @@ static void maybe_persist(const char *batch_id, const uint8_t *header12, const u
   if (!e || e[0] != '1') {
     return;
   }
+  int severity = (use_http == 0) ? 1 : 0;
   size_t wire_len = 12u + payload_len;
   uint8_t *wire = (uint8_t *)malloc(wire_len);
   if (!wire) {
@@ -74,7 +91,7 @@ static void maybe_persist(const char *batch_id, const uint8_t *header12, const u
   }
   memcpy(wire, header12, 12u);
   memcpy(wire + 12u, payload, payload_len);
-  (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed);
+  (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed, severity);
   free(wire);
 }
 
@@ -82,31 +99,10 @@ static uint32_t rd_u32_le(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/**
- * 与《11》§12.4 及 ingest 划分表一致：仅 **BehaviorEvent.behavior_alert（字段 40）** 走 gRPC；
- * 其余（含 webshell/shellcode/PMFE 等无嵌套 behavior_alert 的 protobuf、以及 wire 帧）走 HTTP。
- */
-static int frame_prefers_grpc_path(const uint8_t *frame, size_t frame_len) {
-#if defined(EDR_HAVE_NANOPB)
-  edr_v1_BehaviorEvent msg = edr_v1_BehaviorEvent_init_zero;
-  pb_istream_t st = pb_istream_from_buffer(frame, frame_len);
-  if (!pb_decode(&st, edr_v1_BehaviorEvent_fields, &msg)) {
-    return 0;
-  }
-  return msg.has_behavior_alert ? 1 : 0;
-#else
-  (void)frame;
-  (void)frame_len;
-  return 0;
-#endif
-}
-
 static int ingest_split_enabled(void) {
-  const char *e = getenv("EDR_EVENT_INGEST_SPLIT");
-  if (!e || e[0] == '\0' || strcmp(e, "0") == 0) {
-    return 0;
-  }
-  return edr_ingest_http_configured();
+  /* Product builds use one HTTP ingest path. Keep the function so legacy
+   * diagnostics can report the setting without reintroducing gRPC routing. */
+  return 0;
 }
 
 static int append_frame_bytes(uint8_t **buf, size_t *bcap, size_t *used, const uint8_t *frame,
@@ -167,7 +163,7 @@ static void emit_one_channel(const char *batch_id, const uint8_t *raw_body, size
           wr_u32_le(header + 8, (uint32_t)raw_used);
           edr_transport_send_ingest_batch(use_http, batch_id, header, sizeof(header), dst,
                                           (size_t)clen);
-          maybe_persist(batch_id, header, dst, (size_t)clen, 1);
+          maybe_persist(batch_id, header, dst, (size_t)clen, 1, use_http);
           free(dst);
           return;
         }
@@ -180,13 +176,12 @@ static void emit_one_channel(const char *batch_id, const uint8_t *raw_body, size
   wr_u32_le(header + 4, frame_count);
   wr_u32_le(header + 8, (uint32_t)raw_used);
   edr_transport_send_ingest_batch(use_http, batch_id, header, sizeof(header), raw_body, raw_used);
-  maybe_persist(batch_id, header, raw_body, raw_used, 0);
+  maybe_persist(batch_id, header, raw_body, raw_used, 0, use_http);
 }
 
 static void flush_split(const char *batch_id_base) {
-  uint8_t *grpc_acc = NULL;
   uint8_t *http_acc = NULL;
-  size_t gcap = 0, hcap = 0, gused = 0, hused = 0;
+  size_t hcap = 0, hused = 0;
   size_t off = 0;
   while (off + 4u <= s_used) {
     uint32_t fl = rd_u32_le(s_buf + off);
@@ -194,34 +189,20 @@ static void flush_split(const char *batch_id_base) {
       break;
     }
     const uint8_t *frame = s_buf + off + 4u;
-    int g = frame_prefers_grpc_path(frame, (size_t)fl);
-    if (g) {
-      if (append_frame_bytes(&grpc_acc, &gcap, &gused, frame, (size_t)fl) != 0) {
-        break;
-      }
-    } else {
-      if (append_frame_bytes(&http_acc, &hcap, &hused, frame, (size_t)fl) != 0) {
-        break;
-      }
+    if (append_frame_bytes(&http_acc, &hcap, &hused, frame, (size_t)fl) != 0) {
+      break;
     }
     off += 4u + (size_t)fl;
   }
 
-  char bid_g[80];
   char bid_h[80];
-  snprintf(bid_g, sizeof(bid_g), "%s-g", batch_id_base);
   snprintf(bid_h, sizeof(bid_h), "%s-h", batch_id_base);
 
-  uint32_t gfc = count_frames_in_buf(grpc_acc, gused);
   uint32_t hfc = count_frames_in_buf(http_acc, hused);
 
-  if (gused > 0u && gfc > 0u) {
-    emit_one_channel(bid_g, grpc_acc, gused, gfc, 0);
-  }
   if (hused > 0u && hfc > 0u) {
     emit_one_channel(bid_h, http_acc, hused, hfc, 1);
   }
-  free(grpc_acc);
   free(http_acc);
 }
 
@@ -254,7 +235,7 @@ static void flush_locked(void) {
           wr_u32_le(header + 4, s_frame_count);
           wr_u32_le(header + 8, (uint32_t)s_used);
           edr_transport_on_event_batch(batch_id, header, sizeof(header), dst, (size_t)clen);
-          maybe_persist(batch_id, header, dst, (size_t)clen, 1);
+          maybe_persist(batch_id, header, dst, (size_t)clen, 1, 0);
           free(dst);
           s_used = 0;
           s_frame_count = 0;
@@ -269,7 +250,7 @@ static void flush_locked(void) {
   wr_u32_le(header + 4, s_frame_count);
   wr_u32_le(header + 8, (uint32_t)s_used);
   edr_transport_on_event_batch(batch_id, header, sizeof(header), s_buf, s_used);
-  maybe_persist(batch_id, header, s_buf, s_used, 0);
+  maybe_persist(batch_id, header, s_buf, s_used, 0, 0);
   s_used = 0;
   s_frame_count = 0;
 }
@@ -280,6 +261,7 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
   s_flush_timeout_s = flush_timeout_s;
   s_deadline_ns = 0;
   s_timeout_flush_count = 0;
+  s_lz4_compression_level = env_lz4_compression_level();
   if (max_bytes < 4096u) {
     max_bytes = 4096u;
   }
@@ -296,6 +278,24 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
   s_used = 0;
   s_frame_count = 0;
   return EDR_OK;
+}
+
+void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s) {
+  if (flush_timeout_s > 300) {
+    flush_timeout_s = 300;
+  }
+  if (max_frames_per_batch > 0u) {
+    s_max_frames = max_frames_per_batch;
+  }
+  if (flush_timeout_s > 0) {
+    s_flush_timeout_s = flush_timeout_s;
+  }
+  if (s_used > 0u) {
+    batch_note_write();
+  }
+  if (s_max_frames > 0u && s_frame_count >= s_max_frames) {
+    flush_locked();
+  }
 }
 
 void edr_event_batch_shutdown(void) {

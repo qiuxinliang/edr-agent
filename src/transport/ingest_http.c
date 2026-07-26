@@ -1,7 +1,5 @@
 #include "edr/ingest_http.h"
 
-<<<<<<< Updated upstream
-=======
 #include "edr/command.h"
 #include "edr/command_executor.h"
 #include "edr/command_result_json.h"
@@ -10,7 +8,6 @@
 #include "edr/command_state.h"
 #include "edr/command_util.h"
 #include "edr/event_batch.h"
-#include "edr/http_retry.h"
 #include "edr/preprocess.h"
 #include "edr/sha256.h"
 #include "edr/transport_v2.h"
@@ -18,20 +15,62 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
->>>>>>> Stashed changes
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+static int json_get_bool(const char *obj, const char *key, int *out);
+static void control_ack_refresh_pending_runtime(void);
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (void)pct; }
+#endif
+
 #ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <winreg.h>
 #else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
+#ifdef EDR_HAVE_OPENSSL_HTTP
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#endif
+
+#ifdef EDR_HAVE_CURL_HTTP2
+#include <curl/curl.h>
+#if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x071900
+#define EDR_CURL_HAS_SSL_OPTIONS 1
+#endif
+#endif
+
+#ifdef EDR_HAVE_ZSTD
+#include <zstd.h>
+#endif
+
+#ifdef _WIN32
+typedef SOCKET EdrSocket;
+#define EDR_SOCKET_INVALID INVALID_SOCKET
+#else
+typedef int EdrSocket;
+#define EDR_SOCKET_INVALID (-1)
+#endif
+
 #ifndef EDR_AGENT_VERSION_STRING
-#define EDR_AGENT_VERSION_STRING "0.3.0"
+#define EDR_AGENT_VERSION_STRING "unknown"
 #endif
 
 static char s_rest[512];
@@ -40,8 +79,6 @@ static char s_user[128];
 static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
-<<<<<<< Updated upstream
-=======
 static char s_policy_version[64];
 static char s_ca_file[1024];
 static char s_client_cert_file[1024];
@@ -212,7 +249,6 @@ static pthread_mutex_t s_ws_mu = PTHREAD_MUTEX_INITIALIZER;
 static int edr_ingest_http_refresh_route_profile(int force);
 static void http_conn_close_locked(void);
 static void apply_effective_preprocess_sampling(void);
-static void runtime_http_response_failure(const char *status_line, long status_code);
 static int append_signature_headers(char *req, size_t cap, size_t used,
                                     const char *method, const char *path,
                                     const char *body, size_t body_len);
@@ -1288,19 +1324,67 @@ void edr_ingest_http_configure_request_signing(const EdrRequestSigningConfig *cf
   }
   runtime_state_unlock();
 }
->>>>>>> Stashed changes
 
 void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, const char *user_id,
-                                const char *bearer, const char *endpoint_id, const char *agent_version) {
+                                const char *bearer, const char *endpoint_id, const char *agent_version,
+                                const char *ca_file, const char *client_cert_file,
+                                const char *client_key_file, const char *client_key_provider,
+                                const char *client_cert_store,
+                                const char *client_cert_thumbprint,
+                                const char *proxy_mode,
+                                const char *proxy_url, const char *relay_url) {
+  const char *relay_effective = getenv("EDR_RELAY_URL");
+  const char *proxy_mode_effective = getenv("EDR_PROXY_MODE");
+  const char *proxy_url_effective = getenv("EDR_PROXY_URL");
+  runtime_state_lock();
   memset(s_rest, 0, sizeof(s_rest));
   memset(s_tenant, 0, sizeof(s_tenant));
   memset(s_user, 0, sizeof(s_user));
   memset(s_bearer, 0, sizeof(s_bearer));
   memset(s_endpoint, 0, sizeof(s_endpoint));
   memset(s_agent_ver, 0, sizeof(s_agent_ver));
-  if (rest_base && rest_base[0]) {
-    snprintf(s_rest, sizeof(s_rest), "%s", rest_base);
+  memset(s_ca_file, 0, sizeof(s_ca_file));
+  memset(s_client_cert_file, 0, sizeof(s_client_cert_file));
+  memset(s_client_key_file, 0, sizeof(s_client_key_file));
+  memset(s_client_key_provider, 0, sizeof(s_client_key_provider));
+  memset(s_client_cert_store, 0, sizeof(s_client_cert_store));
+  memset(s_client_cert_thumbprint, 0, sizeof(s_client_cert_thumbprint));
+  memset(s_mtls_status, 0, sizeof(s_mtls_status));
+  memset(s_relay_url, 0, sizeof(s_relay_url));
+  memset(s_proxy_mode, 0, sizeof(s_proxy_mode));
+  memset(s_proxy_url_cfg, 0, sizeof(s_proxy_url_cfg));
+  memset(s_proxy_url_active, 0, sizeof(s_proxy_url_active));
+  memset(s_proxy_status, 0, sizeof(s_proxy_status));
+  memset(s_connection_mode, 0, sizeof(s_connection_mode));
+  memset(s_control_dict_ver, 0, sizeof(s_control_dict_ver));
+  memset(s_control_schema_ver, 0, sizeof(s_control_schema_ver));
+  memset(s_control_profile_id, 0, sizeof(s_control_profile_id));
+  memset(s_control_qos_dscp, 0, sizeof(s_control_qos_dscp));
+  memset(s_control_threshold, 0, sizeof(s_control_threshold));
+  memset(&s_request_signing, 0, sizeof(s_request_signing));
+  snprintf(s_data_plane_encoding, sizeof(s_data_plane_encoding), "%s",
+           env_str_default("EDR_DATA_PLANE_ENCODING", "protobuf"));
+  snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s",
+           env_str_default("EDR_DATA_PLANE_COMPRESSION", "identity"));
+  s_circuit_open = 0;
+  s_circuit_until_ms = 0;
+  s_circuit_reason[0] = '\0';
+  s_consecutive_failures = 0;
+  s_control_hello_ok = 0;
+  s_control_hello_last_ms = 0;
+  if (!relay_effective || !relay_effective[0]) {
+    relay_effective = relay_url;
   }
+  if (!proxy_mode_effective || !proxy_mode_effective[0]) {
+    proxy_mode_effective = proxy_mode;
+  }
+  if (!proxy_url_effective || !proxy_url_effective[0]) {
+    proxy_url_effective = proxy_url;
+  }
+  copy_base_url(s_relay_url, sizeof(s_relay_url), relay_effective);
+  copy_base_url(s_rest, sizeof(s_rest), s_relay_url[0] ? s_relay_url : rest_base);
+  route_seed_initial(s_rest);
+  snprintf(s_connection_mode, sizeof(s_connection_mode), "%s", s_relay_url[0] ? "relay" : "direct");
   if (tenant_id && tenant_id[0]) {
     snprintf(s_tenant, sizeof(s_tenant), "%s", tenant_id);
   }
@@ -1318,9 +1402,402 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   } else {
     snprintf(s_agent_ver, sizeof(s_agent_ver), "%s", EDR_AGENT_VERSION_STRING);
   }
+  if (ca_file && ca_file[0]) {
+    snprintf(s_ca_file, sizeof(s_ca_file), "%s", ca_file);
+  }
+  if (client_cert_file && client_cert_file[0]) {
+    snprintf(s_client_cert_file, sizeof(s_client_cert_file), "%s", client_cert_file);
+  }
+  if (client_key_file && client_key_file[0]) {
+    snprintf(s_client_key_file, sizeof(s_client_key_file), "%s", client_key_file);
+  }
+  if (client_cert_store && client_cert_store[0]) {
+    snprintf(s_client_cert_store, sizeof(s_client_cert_store), "%s", client_cert_store);
+    normalize_cert_store_path(s_client_cert_store);
+  }
+  if (client_cert_thumbprint && client_cert_thumbprint[0]) {
+    compact_thumbprint(s_client_cert_thumbprint, sizeof(s_client_cert_thumbprint),
+                       client_cert_thumbprint);
+  }
+  {
+    const char *kp = getenv("EDR_CLIENT_KEY_PROVIDER");
+    if (!kp || !kp[0]) {
+      kp = client_key_provider;
+    }
+    snprintf(s_client_key_provider, sizeof(s_client_key_provider), "%s",
+             (kp && kp[0]) ? kp : "pem");
+  }
+  if (s_client_cert_thumbprint[0]) {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "schannel_store_ready");
+  } else if (s_client_cert_file[0] && s_client_key_file[0]) {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "pem_ready");
+  } else if (s_client_cert_file[0] && strcmp(s_client_key_provider, "pem") != 0) {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "native_http_%s_pending_adapter",
+             s_client_key_provider);
+  } else {
+    snprintf(s_mtls_status, sizeof(s_mtls_status), "%s", "not_configured");
+  }
+  snprintf(s_proxy_mode, sizeof(s_proxy_mode), "%s",
+           (proxy_mode_effective && proxy_mode_effective[0]) ? proxy_mode_effective : "auto");
+  copy_base_url(s_proxy_url_cfg, sizeof(s_proxy_url_cfg), proxy_url_effective);
+  snprintf(s_proxy_status, sizeof(s_proxy_status), "%s", "not_used");
+  snprintf(s_control_dict_ver, sizeof(s_control_dict_ver), "%s",
+           env_str_default("EDR_CONTROL_DICT_VERSION", "edr-zstd-dict-v1"));
+  snprintf(s_control_schema_ver, sizeof(s_control_schema_ver), "%s",
+           env_str_default("EDR_CONTROL_SCHEMA_VERSION", "edr-control-schema-v1"));
+  snprintf(s_control_profile_id, sizeof(s_control_profile_id), "%s",
+           env_str_default("EDR_CONTROL_PROFILE_ID", "default-http1-protobuf"));
+  snprintf(s_control_qos_dscp, sizeof(s_control_qos_dscp), "%s",
+           env_str_default("EDR_NET_QOS_DSCP", "AF21"));
+  snprintf(s_control_threshold, sizeof(s_control_threshold), "%s",
+           env_str_default("EDR_TELEMETRY_PROFILE_THRESHOLD", "medium"));
+  s_control_sampling_pct = (unsigned)env_ul_clamped("EDR_TELEMETRY_PROFILE_SAMPLING_PCT", 100ul, 1ul, 100ul);
+  s_effective_sampling_pct = s_control_sampling_pct;
+  s_control_backpressure_enabled = env_bool_default("EDR_BACKPRESSURE_PUSH_PROFILE_THROTTLE", 1);
+  apply_effective_preprocess_sampling();
+  s_control_zstd = env_bool_default("EDR_CONTROL_CAP_ZSTD", 0);
+  s_http2_enabled_cfg = env_bool_default("EDR_DATA_PLANE_HTTP2", 0);
+  s_http2_required_cfg = env_bool_default("EDR_HTTP2_REQUIRE", 0);
+  s_control_http2_enabled_cfg = env_bool_default("EDR_CONTROL_HTTP2_ENABLED", s_http2_enabled_cfg);
+  s_control_http2_required_cfg = env_bool_default("EDR_CONTROL_HTTP2_REQUIRE", s_http2_required_cfg);
+  s_control_http1_fallback_cfg = env_bool_default("EDR_CONTROL_HTTP1_FALLBACK",
+                                                  s_control_http2_required_cfg ? 0 : 1);
+  s_control_h2 = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
+  s_control_stream_enabled_cfg = env_bool_default("EDR_HTTP_CONTROL_STREAM", 1);
+  s_long_poll_fallback_cfg = env_bool_default("EDR_CONTROL_LONG_POLL_FALLBACK", 1);
+  s_report_events_v2_enabled_cfg = env_bool_default("EDR_REPORT_EVENTS_V2", 1);
+  s_insecure_http = (strncmp(s_rest, "http://", 7u) == 0) ? 1 : 0;
+  runtime_state_unlock();
 }
 
-int edr_ingest_http_configured(void) { return s_rest[0] != 0 && s_endpoint[0] != 0; }
+int edr_ingest_http_configured(void) {
+  runtime_state_lock();
+  int configured = s_rest[0] != 0 && s_endpoint[0] != 0;
+  runtime_state_unlock();
+  return configured;
+}
+
+void edr_ingest_http_get_rest_base(char *out, size_t cap) {
+  if (!out || cap == 0) {
+    return;
+  }
+  runtime_string_copy(out, cap, s_rest);
+}
+
+void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_required,
+                                                 int control_stream_enabled,
+                                                 int long_poll_fallback,
+                                                 int report_events_v2_enabled,
+                                                 const char *data_plane_encoding,
+                                                 const char *data_plane_compression) {
+  runtime_state_lock();
+  s_http2_enabled_cfg = http2_enabled ? 1 : 0;
+  s_http2_required_cfg = http2_required ? 1 : 0;
+  s_control_stream_enabled_cfg = control_stream_enabled ? 1 : 0;
+  s_long_poll_fallback_cfg = long_poll_fallback ? 1 : 0;
+  s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
+  s_control_h2 = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
+  if (data_plane_encoding && data_plane_encoding[0]) {
+    snprintf(s_data_plane_encoding, sizeof(s_data_plane_encoding), "%s", data_plane_encoding);
+  }
+  if (data_plane_compression && data_plane_compression[0]) {
+    snprintf(s_data_plane_compression, sizeof(s_data_plane_compression), "%s", data_plane_compression);
+  }
+  s_control_zstd = strcmp(s_data_plane_compression, "zstd") == 0 ? 1 : s_control_zstd;
+  runtime_state_unlock();
+  log_transport_capabilities_once();
+}
+
+void edr_ingest_http_configure_control_transport_options(int http2_enabled, int http2_required,
+                                                         int http1_fallback) {
+  runtime_state_lock();
+  s_control_http2_enabled_cfg = (http2_enabled || http2_required) ? 1 : 0;
+  s_control_http2_required_cfg = http2_required ? 1 : 0;
+  s_control_http1_fallback_cfg = http2_required ? 0 : (http1_fallback ? 1 : 0);
+  s_control_h2 = s_control_http2_enabled_cfg;
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_apply_transport_flags(int http2_enabled, int http2_required,
+                                           int control_stream_enabled,
+                                           int long_poll_fallback,
+                                           int report_events_v2_enabled) {
+  runtime_state_lock();
+  if (http2_enabled >= 0) {
+    s_http2_enabled_cfg = http2_enabled ? 1 : 0;
+  }
+  if (http2_required >= 0) {
+    s_http2_required_cfg = http2_required ? 1 : 0;
+  }
+  if (control_stream_enabled >= 0) {
+    s_control_stream_enabled_cfg = control_stream_enabled ? 1 : 0;
+  }
+  if (long_poll_fallback >= 0) {
+    s_long_poll_fallback_cfg = long_poll_fallback ? 1 : 0;
+  }
+  if (report_events_v2_enabled >= 0) {
+    s_report_events_v2_enabled_cfg = report_events_v2_enabled ? 1 : 0;
+  }
+  s_control_h2 = (s_control_http2_enabled_cfg || s_control_http2_required_cfg) ? 1 : 0;
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_apply_control_transport_flags(int http2_enabled, int http2_required,
+                                                   int http1_fallback) {
+  runtime_state_lock();
+  if (http2_enabled >= 0) {
+    s_control_http2_enabled_cfg = http2_enabled ? 1 : 0;
+  }
+  if (http2_required >= 0) {
+    s_control_http2_required_cfg = http2_required ? 1 : 0;
+  }
+  if (http1_fallback >= 0) {
+    s_control_http1_fallback_cfg = http1_fallback ? 1 : 0;
+  }
+  if (s_control_http2_required_cfg) {
+    s_control_http2_enabled_cfg = 1;
+    s_control_http1_fallback_cfg = 0;
+  }
+  s_control_h2 = s_control_http2_enabled_cfg;
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
+  if (!out) {
+    return;
+  }
+  int stream_lease_valid = control_stream_ready_lease_valid();
+  int data_http2_enabled = http2_client_enabled();
+  int data_http2_required = http2_required();
+  int control_h2_enabled = control_http2_client_enabled();
+  int control_h2_required = control_http2_required();
+  int control_h1_fallback = control_http1_fallback_enabled();
+  control_ack_refresh_pending_runtime();
+  runtime_state_lock();
+  int64_t stream_last_activity_ms = s_control_stream_last_activity_ms;
+  memset(out, 0, sizeof(*out));
+  out->configured = edr_ingest_http_configured();
+  out->http_fallback_available = out->configured;
+  out->insecure_http = s_insecure_http;
+  out->mtls_configured = (schannel_store_mtls_configured() ||
+                          (s_client_cert_file[0] && s_client_key_file[0])) ? 1 : 0;
+  out->websocket_ready = (s_ws_ready || stream_lease_valid) ? 1 : 0;
+  out->http2_enabled = data_http2_enabled;
+  out->http2_required = data_http2_required;
+  out->http2_negotiated = s_http2_negotiated ? 1 : 0;
+  out->control_http2_enabled = control_h2_enabled;
+  out->control_http2_required = control_h2_required;
+  out->control_http1_fallback = control_h1_fallback;
+  out->control_stream_enabled = s_control_stream_enabled_cfg;
+  out->control_stream_ready = stream_lease_valid;
+  out->control_stream_lease_valid = stream_lease_valid;
+  out->long_poll_fallback = s_long_poll_fallback_cfg;
+  out->long_poll_last_success_unix_ms = s_long_poll_last_success_ms;
+  out->long_poll_last_failure_unix_ms = s_long_poll_last_failure_ms;
+  {
+    int64_t now_ms = unix_ms_now();
+    int64_t freshness_ms = (int64_t)(s_poll_backoff_ms > 60000 ? s_poll_backoff_ms : 60000) * 2;
+    out->long_poll_ready = s_long_poll_fallback_cfg &&
+                           s_long_poll_last_success_ms > 0 &&
+                           s_long_poll_last_success_ms >= s_long_poll_last_failure_ms &&
+                           now_ms - s_long_poll_last_success_ms <= freshness_ms;
+  }
+  out->report_events_v2_enabled = s_report_events_v2_enabled_cfg;
+  out->zstd_requested = strcmp(s_data_plane_compression, "zstd") == 0 || s_control_zstd;
+  out->backpressure_enabled = s_control_backpressure_enabled;
+#ifdef EDR_HAVE_ZSTD
+  out->zstd_available = 1;
+#else
+  out->zstd_available = 0;
+#endif
+  out->zstd_dict_loaded = s_zstd_dict_loaded ? 1 : 0;
+#ifdef EDR_HAVE_CURL_HTTP2
+  out->http2_multiplex_enabled = curl_h2_multiplex_enabled();
+#else
+  out->http2_multiplex_enabled = 0;
+#endif
+  out->http2_multiplex_active = s_http2_multiplex_active ? 1 : 0;
+  out->poll_backoff_ms = s_poll_backoff_ms;
+  out->ws_backoff_ms = s_ws_backoff_ms;
+  out->circuit_open = s_circuit_open ? 1 : 0;
+  out->circuit_until_unix_ms = s_circuit_until_ms;
+  out->ok_count = s_http_ok;
+  out->fail_count = s_http_fail;
+  out->http_request_ok_count = s_http_request_ok;
+  out->http_request_fail_count = s_http_request_fail;
+  out->ws_message_ok_count = s_ws_message_ok;
+  out->ws_message_fail_count = s_ws_message_fail;
+  out->ws_pong_count = s_ws_pong;
+  out->command_result_ok_count = s_command_result_ok;
+  out->command_result_fail_count = s_command_result_fail;
+  out->command_result_last_success_unix_ms = s_command_result_last_success_ms;
+  out->command_result_last_failure_unix_ms = s_command_result_last_failure_ms;
+  out->command_result_last_error_retryable = s_last_command_result_retryable;
+  snprintf(out->command_result_last_error, sizeof(out->command_result_last_error), "%s",
+           s_last_command_result_error);
+  out->upload_ok_count = s_upload_ok;
+  out->upload_fail_count = s_upload_fail;
+  out->long_poll_ok_count = s_long_poll_ok;
+  out->long_poll_fail_count = s_long_poll_fail;
+  out->control_stream_ok_count = s_control_stream_ok;
+  out->control_stream_fail_count = s_control_stream_fail;
+  out->control_stream_heartbeat_count = s_control_stream_heartbeat;
+  out->control_stream_lease_expired_count = s_control_stream_lease_expired;
+  out->control_stream_last_activity_unix_ms = stream_last_activity_ms;
+  out->control_stream_lease_deadline_unix_ms =
+      stream_last_activity_ms > 0 ? stream_last_activity_ms + control_stream_lease_ms() : 0;
+  out->control_ack_ok_count = s_control_ack_ok;
+  out->control_ack_fail_count = s_control_ack_fail;
+  out->control_ack_retry_attempt_count = s_control_ack_retry_attempt;
+  out->control_ack_retry_ok_count = s_control_ack_retry_ok;
+  out->control_ack_retry_fail_count = s_control_ack_retry_fail;
+  out->control_ack_outbox_persist_fail_count = s_control_ack_outbox_persist_fail;
+  out->control_ack_pending_count = s_control_ack_pending;
+  out->last_command_ack_unix_ms = s_last_command_ack_ms;
+  out->last_command_ack_failure_unix_ms = s_last_command_ack_failure_ms;
+  out->next_control_ack_retry_unix_ms = s_next_control_ack_retry_ms;
+  snprintf(out->last_command_ack_id, sizeof(out->last_command_ack_id), "%s", s_last_command_ack_id);
+  snprintf(out->last_command_ack_failure_id, sizeof(out->last_command_ack_failure_id), "%s",
+           s_last_command_ack_failure_id);
+  out->http2_request_ok_count = s_http2_request_ok;
+  out->http2_request_fail_count = s_http2_request_fail;
+  out->http2_negotiated_count = s_http2_negotiated_count;
+  out->http2_fallback_count = s_http2_fallback_count;
+  out->http2_cert_error_count = s_http2_cert_error_count;
+  out->report_events_v2_ok_count = s_report_events_v2_ok;
+  out->report_events_v2_fail_count = s_report_events_v2_fail;
+  out->zstd_compress_ok_count = s_zstd_compress_ok;
+  out->zstd_compress_fail_count = s_zstd_compress_fail;
+  out->http2_multiplex_ok_count = s_http2_multiplex_ok;
+  out->http2_multiplex_fail_count = s_http2_multiplex_fail;
+  out->budget_drop_count = s_budget_drop_count;
+  out->last_success_unix_ms = s_last_success_ms;
+  out->last_failure_unix_ms = s_last_failure_ms;
+  snprintf(out->last_error, sizeof(out->last_error), "%s", s_last_error);
+  snprintf(out->circuit_reason, sizeof(out->circuit_reason), "%s", s_circuit_reason);
+  snprintf(out->connection_mode, sizeof(out->connection_mode), "%s",
+           s_connection_mode[0] ? s_connection_mode : "direct");
+  snprintf(out->effective_base_url, sizeof(out->effective_base_url), "%s", s_rest);
+  snprintf(out->route_profile_version, sizeof(out->route_profile_version), "%s",
+           s_route_profile_version[0] ? s_route_profile_version : "local");
+  snprintf(out->active_route_url, sizeof(out->active_route_url), "%s", s_rest);
+  out->route_count = s_route_count;
+  out->active_route_index = s_route_active;
+  out->route_failover_count = s_route_failover_count;
+  snprintf(out->relay_url, sizeof(out->relay_url), "%s", s_relay_url);
+  snprintf(out->proxy_mode, sizeof(out->proxy_mode), "%s", s_proxy_mode[0] ? s_proxy_mode : "auto");
+  snprintf(out->proxy_url, sizeof(out->proxy_url), "%s", s_proxy_url_active);
+  snprintf(out->proxy_status, sizeof(out->proxy_status), "%s",
+           s_proxy_status[0] ? s_proxy_status : "not_used");
+  snprintf(out->client_key_provider, sizeof(out->client_key_provider), "%s",
+           s_client_key_provider[0] ? s_client_key_provider : "pem");
+  snprintf(out->mtls_status, sizeof(out->mtls_status), "%s",
+           s_mtls_status[0] ? s_mtls_status : "not_configured");
+  snprintf(out->negotiated_protocol, sizeof(out->negotiated_protocol), "%s",
+           s_negotiated_protocol[0] ? s_negotiated_protocol : (s_http2_negotiated ? "h2" : "http/1.1"));
+  snprintf(out->http2_last_error, sizeof(out->http2_last_error), "%s", s_http2_last_error);
+  snprintf(out->control_stream_status, sizeof(out->control_stream_status), "%s",
+           s_control_stream_status[0] ? s_control_stream_status : "idle");
+  snprintf(out->upload_status, sizeof(out->upload_status), "%s",
+           s_upload_status[0] ? s_upload_status : "idle");
+  snprintf(out->data_plane_encoding, sizeof(out->data_plane_encoding), "%s",
+           s_data_plane_encoding[0] ? s_data_plane_encoding : "protobuf");
+  snprintf(out->data_plane_compression, sizeof(out->data_plane_compression), "%s",
+           s_data_plane_compression[0] ? s_data_plane_compression : "identity");
+  snprintf(out->envelope_format, sizeof(out->envelope_format), "%s",
+           s_report_events_v2_enabled_cfg ? "protobuf:edr.transport.envelope.v1" : "legacy_json_b64");
+  snprintf(out->dict_ver, sizeof(out->dict_ver), "%s",
+           s_control_dict_ver[0] ? s_control_dict_ver : "edr-zstd-dict-v1");
+  snprintf(out->schema_ver, sizeof(out->schema_ver), "%s",
+           s_control_schema_ver[0] ? s_control_schema_ver : "edr-control-schema-v1");
+  snprintf(out->profile_id, sizeof(out->profile_id), "%s",
+           s_control_profile_id[0] ? s_control_profile_id : "default-http1-protobuf");
+  snprintf(out->zstd_dict_path, sizeof(out->zstd_dict_path), "%s", s_zstd_dict_path);
+  snprintf(out->qos_dscp, sizeof(out->qos_dscp), "%s",
+           s_control_qos_dscp[0] ? s_control_qos_dscp : "AF21");
+  snprintf(out->telemetry_threshold, sizeof(out->telemetry_threshold), "%s",
+           s_control_threshold[0] ? s_control_threshold : "medium");
+  out->telemetry_sampling_pct = s_control_sampling_pct;
+  out->effective_sampling_pct = s_effective_sampling_pct;
+  out->zstd_raw_bytes = s_zstd_raw_bytes;
+  out->zstd_wire_bytes = s_zstd_wire_bytes;
+  out->zstd_dict_bytes = s_zstd_dict_bytes;
+  budget_refresh_window_locked();
+  out->requests_this_minute = s_budget_requests;
+  out->request_limit_per_minute = request_limit_per_minute();
+  out->bytes_this_minute = s_budget_bytes;
+  out->byte_limit_per_minute = byte_limit_per_minute();
+  out->tls_handshakes_this_minute = s_budget_tls_handshakes;
+  out->tls_handshake_limit_per_minute = tls_handshake_limit_per_minute();
+  {
+    unsigned long total = s_http_ok + s_http_fail;
+    out->slo_success_rate_pct = total ? (unsigned int)((s_http_ok * 100ul) / total) : 100u;
+  }
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_set_policy_version(const char *policy_version) {
+  runtime_state_lock();
+  memset(s_policy_version, 0, sizeof(s_policy_version));
+  if (policy_version && policy_version[0]) {
+    snprintf(s_policy_version, sizeof(s_policy_version), "%s", policy_version);
+  }
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_copy_policy_version(char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) {
+    return;
+  }
+  runtime_state_lock();
+  snprintf(out, out_cap, "%s", s_policy_version[0] ? s_policy_version : "local");
+  runtime_state_unlock();
+}
+
+void edr_ingest_http_apply_telemetry_profile(const char *dict_ver, const char *schema_ver,
+                                             const char *profile_id, int h2, int zstd,
+                                             const char *qos_dscp, unsigned sampling_pct,
+                                             const char *threshold, int backpressure_enabled) {
+  unsigned applied_sampling;
+  runtime_state_lock();
+  if (dict_ver && dict_ver[0]) {
+    snprintf(s_control_dict_ver, sizeof(s_control_dict_ver), "%s", dict_ver);
+  }
+  if (schema_ver && schema_ver[0]) {
+    snprintf(s_control_schema_ver, sizeof(s_control_schema_ver), "%s", schema_ver);
+  }
+  if (profile_id && profile_id[0]) {
+    snprintf(s_control_profile_id, sizeof(s_control_profile_id), "%s", profile_id);
+  }
+  if (qos_dscp && qos_dscp[0]) {
+    snprintf(s_control_qos_dscp, sizeof(s_control_qos_dscp), "%s", qos_dscp);
+  }
+  if (threshold && threshold[0]) {
+    snprintf(s_control_threshold, sizeof(s_control_threshold), "%s", threshold);
+  }
+  if (sampling_pct > 0u) {
+    if (sampling_pct > 100u) {
+      sampling_pct = 100u;
+    }
+    s_control_sampling_pct = sampling_pct;
+  }
+  if (h2 >= 0) {
+    s_control_h2 = h2 ? 1 : 0;
+  }
+  if (zstd >= 0) {
+    s_control_zstd = zstd ? 1 : 0;
+  }
+  if (backpressure_enabled >= 0) {
+    s_control_backpressure_enabled = backpressure_enabled ? 1 : 0;
+  }
+  s_control_hello_ok = 1;
+  s_control_hello_last_ms = unix_ms_now();
+  applied_sampling = s_control_sampling_pct;
+  runtime_state_unlock();
+  edr_transport_v2_apply_profile(dict_ver, schema_ver, profile_id, h2, zstd, qos_dscp,
+                                 applied_sampling, threshold, backpressure_enabled);
+  apply_effective_preprocess_sampling();
+}
 
 static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
   static const char tbl[] =
@@ -1358,8 +1835,6 @@ static int b64_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
   return (int)o;
 }
 
-<<<<<<< Updated upstream
-=======
 static void proxy_auth_b64_from_config(const char *url_userinfo, size_t url_userinfo_len,
                                        char *out, size_t out_cap) {
   const char *auth_b64 = getenv("EDR_PROXY_AUTH_B64");
@@ -2669,22 +3144,16 @@ static void append_body_copy(char *body, size_t body_cap, size_t *body_used,
 }
 
 static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
-                                        char *body, size_t body_cap, int *out_reusable,
-                                        int *out_response_received, long *out_status_code,
-                                        char *out_status_line, size_t out_status_line_cap) {
+                                        char *body, size_t body_cap, int *out_reusable) {
   char buf[8192];
   size_t used = 0;
   size_t header_len = 0;
   size_t body_used = 0;
   long content_len = -1;
-  long status_code = 0;
   int status_ok = 0;
   int reusable = 0;
   if (body && body_cap > 0u) body[0] = '\0';
   if (out_reusable) *out_reusable = 0;
-  if (out_response_received) *out_response_received = 0;
-  if (out_status_code) *out_status_code = 0;
-  if (out_status_line && out_status_line_cap > 0u) out_status_line[0] = '\0';
   for (;;) {
     int n;
     if (used >= sizeof(buf) - 1u) return -1;
@@ -2696,11 +3165,7 @@ static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int 
       char *hdr = strstr(buf, "\r\n\r\n");
       if (!hdr) continue;
       header_len = (size_t)(hdr + 4 - buf);
-      if (out_response_received) *out_response_received = 1;
-      copy_status_line(buf, out_status_line, out_status_line_cap);
-      status_code = edr_http_status_code_from_line(buf);
-      if (out_status_code) *out_status_code = status_code;
-      status_ok = status_code >= 200 && status_code < 300;
+      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
       content_len = parse_content_length_header(buf);
       reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
       if (used > header_len) {
@@ -2746,19 +3211,15 @@ static int write_response_chunk_to_file(FILE *f, size_t *written, size_t max_byt
 
 static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
                                                 FILE *out, size_t max_bytes, int *out_reusable,
-                                                EdrAgentConfigHeaders *out_agent_config,
-                                                int *out_response_received, long *out_status_code) {
+                                                EdrAgentConfigHeaders *out_agent_config) {
   char buf[8192];
   size_t used = 0;
   size_t header_len = 0;
   size_t written = 0;
   long content_len = -1;
-  long status_code = 0;
   int status_ok = 0;
   int reusable = 0;
   if (out_reusable) *out_reusable = 0;
-  if (out_response_received) *out_response_received = 0;
-  if (out_status_code) *out_status_code = 0;
   if (!out || max_bytes == 0u) return -1;
   for (;;) {
     int n;
@@ -2771,10 +3232,7 @@ static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *b
       char *hdr = strstr(buf, "\r\n\r\n");
       if (!hdr) continue;
       header_len = (size_t)(hdr + 4 - buf);
-      if (out_response_received) *out_response_received = 1;
-      status_code = edr_http_status_code_from_line(buf);
-      if (out_status_code) *out_status_code = status_code;
-      status_ok = status_code >= 200 && status_code < 300;
+      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
       content_len = parse_content_length_header(buf);
       reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
       if (status_ok) {
@@ -3377,11 +3835,7 @@ static void curl_multi_complete_job(CURLM *multi, EdrCurlMultiJob *job, CURLcode
    * return to the caller as a downgrade so fallback and health stay honest. */
   ok = result == CURLE_OK && job->response_code >= 200 && job->response_code < 300 &&
        (!job->stream_ctx || !job->stream_ctx->failed) && job->h2;
-  job->status = ok ? 0 :
-                (result == CURLE_OK && job->response_code >= 100 &&
-                         (job->response_code < 200 || job->response_code >= 300)
-                     ? -3
-                     : -1);
+  job->status = ok ? 0 : -1;
   runtime_state_lock();
   if (ok) {
     s_http2_request_ok++;
@@ -3901,10 +4355,6 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   {
     int mrc = curl_h2_multi_perform(curl, NULL);
     if (mrc != -2) {
-      if (mrc == -3) {
-        (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-        runtime_http_response_failure(NULL, code);
-      }
       curl_slist_free_all(headers);
       curl_easy_cleanup(curl);
       return mrc;
@@ -3933,10 +4383,6 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
           "http2_required=%d err=%s\n",
           method ? method : "-", (int)cc, curl_easy_strerror(cc), code, h2,
           http2_required_for_url(url), errbuf[0] ? errbuf : "-");
-  if (cc == CURLE_OK && code >= 100 && (code < 200 || code >= 300)) {
-    runtime_http_response_failure(NULL, code);
-    return -3;
-  }
   return -1;
 }
 
@@ -4200,72 +4646,6 @@ static int native_post_json_legacy(const char *url, const char *body, size_t bod
   return rc;
 }
 
-typedef struct {
-  const char *method;
-  const char *path;
-  const char *host;
-  const char *content_type;
-  const char *body;
-  size_t body_len;
-  int port;
-  int https;
-  char *resp_body;
-  size_t resp_body_cap;
-} EdrNativeRequestAttempt;
-
-static void runtime_http_response_failure(const char *status_line, long status_code) {
-  char msg[160];
-  const char *kind = status_code >= 200 && status_code < 300
-                         ? "http response incomplete"
-                         : "http status";
-  if (status_line && status_line[0]) {
-    snprintf(msg, sizeof(msg), "%s: %s", kind, status_line);
-  } else {
-    snprintf(msg, sizeof(msg), "%s: HTTP/1.1 %ld", kind, status_code);
-  }
-  runtime_failure(msg);
-}
-
-static EdrHttpAttemptOutcome native_request_attempt(void *opaque, unsigned int attempt) {
-  EdrNativeRequestAttempt *ctx = (EdrNativeRequestAttempt *)opaque;
-  char req[8192];
-  char status_line[96];
-  long status_code = 0;
-  int response_received = 0;
-  int reusable = 0;
-  int rn;
-  EdrHttpConn *conn;
-  (void)attempt;
-  rn = append_request_headers(req, sizeof(req), ctx->method, ctx->path, ctx->host,
-                              ctx->content_type, ctx->body, ctx->body_len);
-  if (rn <= 0) {
-    runtime_failure("http request build failed");
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  conn = http_conn_get_locked(ctx->host, ctx->port, ctx->https);
-  if (!conn) {
-    return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
-  }
-  if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
-      (ctx->body_len == 0u ||
-       (ctx->body && http_conn_write_all(conn, ctx->body, ctx->body_len) == 0)) &&
-      read_http_response_from_recv(http_socket_recv_adapter, conn, ctx->resp_body,
-                                   ctx->resp_body_cap, &reusable, &response_received,
-                                   &status_code, status_line, sizeof(status_line)) == 0) {
-    conn->last_used_ms = unix_ms_now();
-    if (!reusable || !http_keepalive_enabled()) {
-      http_conn_close_locked();
-    }
-    return EDR_HTTP_ATTEMPT_SUCCESS;
-  }
-  http_conn_close_locked();
-  if (response_received && (status_code < 200 || status_code >= 300)) {
-    runtime_http_response_failure(status_line, status_code);
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
-}
-
 static int native_request_ex(const char *method, const char *url, const char *content_type,
                              const char *body, size_t body_len, char *resp_body,
                              size_t resp_body_cap, long timeout_s) {
@@ -4274,7 +4654,8 @@ static int native_request_ex(const char *method, const char *url, const char *co
   int port = 0;
   int https = 0;
   int rc = -1;
-  EdrNativeRequestAttempt attempt_ctx;
+  char req[8192];
+  int rn;
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4284,9 +4665,6 @@ static int native_request_ex(const char *method, const char *url, const char *co
     int h2rc = curl_h2_request(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
     if (h2rc == 0) {
       return 0;
-    }
-    if (h2rc == -3) {
-      return -1;
     }
     if (h2rc != -2) {
       if (http2_required_for_url(url)) {
@@ -4326,22 +4704,30 @@ static int native_request_ex(const char *method, const char *url, const char *co
     runtime_failure("network init failed");
     return -1;
   }
-  memset(&attempt_ctx, 0, sizeof(attempt_ctx));
-  attempt_ctx.method = method;
-  attempt_ctx.path = path;
-  attempt_ctx.host = host;
-  attempt_ctx.content_type = content_type;
-  attempt_ctx.body = body;
-  attempt_ctx.body_len = body_len;
-  attempt_ctx.port = port;
-  attempt_ctx.https = https;
-  attempt_ctx.resp_body = resp_body;
-  attempt_ctx.resp_body_cap = resp_body_cap;
+  rn = append_request_headers(req, sizeof(req), method, path, host, content_type, body, body_len);
+  if (rn <= 0) {
+    runtime_failure("http request build failed");
+    return -1;
+  }
   http_lock();
-  rc = edr_http_run_attempts(2u, native_request_attempt, &attempt_ctx, NULL) ==
-               EDR_HTTP_ATTEMPT_SUCCESS
-           ? 0
-           : -1;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    int reusable = 0;
+    EdrHttpConn *conn = http_conn_get_locked(host, port, https);
+    if (!conn) {
+      break;
+    }
+    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
+        (body_len == 0u || (body && http_conn_write_all(conn, body, body_len) == 0)) &&
+        read_http_response_from_recv(http_socket_recv_adapter, conn, resp_body, resp_body_cap, &reusable) == 0) {
+      rc = 0;
+      conn->last_used_ms = unix_ms_now();
+      if (!reusable || !http_keepalive_enabled()) {
+        http_conn_close_locked();
+      }
+      break;
+    }
+    http_conn_close_locked();
+  }
   http_unlock();
   if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https request failed" : "http request failed");
@@ -4556,67 +4942,6 @@ static int edr_ingest_http_refresh_route_profile(int force) {
   return 0;
 }
 
-typedef struct {
-  const char *host;
-  const char *path;
-  int port;
-  int https;
-  FILE *out;
-  size_t max_bytes;
-  EdrAgentConfigHeaders *out_agent_config;
-} EdrNativeFileGetAttempt;
-
-static int reset_attempt_file(FILE *out) {
-  if (!out || fseek(out, 0L, SEEK_SET) != 0) {
-    return -1;
-  }
-#if defined(_WIN32)
-  return _chsize(_fileno(out), 0) == 0 ? 0 : -1;
-#else
-  return ftruncate(fileno(out), 0) == 0 ? 0 : -1;
-#endif
-}
-
-static EdrHttpAttemptOutcome native_file_get_attempt(void *opaque, unsigned int attempt) {
-  EdrNativeFileGetAttempt *ctx = (EdrNativeFileGetAttempt *)opaque;
-  char req[8192];
-  long status_code = 0;
-  int response_received = 0;
-  int reusable = 0;
-  int rn;
-  EdrHttpConn *conn;
-  (void)attempt;
-  if (reset_attempt_file(ctx->out) != 0) {
-    runtime_failure("http get output reset failed");
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  rn = append_request_headers(req, sizeof(req), "GET", ctx->path, ctx->host,
-                              NULL, NULL, 0u);
-  if (rn <= 0) {
-    runtime_failure("http request build failed");
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  conn = http_conn_get_locked(ctx->host, ctx->port, ctx->https);
-  if (!conn) {
-    return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
-  }
-  if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
-      read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, ctx->out,
-                                           ctx->max_bytes, &reusable,
-                                           ctx->out_agent_config, &response_received,
-                                           &status_code) == 0) {
-    conn->last_used_ms = unix_ms_now();
-    if (!reusable || !http_keepalive_enabled()) {
-      http_conn_close_locked();
-    }
-    return EDR_HTTP_ATTEMPT_SUCCESS;
-  }
-  http_conn_close_locked();
-  return response_received && (status_code < 200 || status_code >= 300)
-             ? EDR_HTTP_ATTEMPT_RESPONSE_FAILURE
-             : EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
-}
-
 static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
                               EdrAgentConfigHeaders *out_agent_config) {
   char host[256];
@@ -4624,7 +4949,8 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   int port = 0;
   int https = 0;
   int rc = -1;
-  EdrNativeFileGetAttempt attempt_ctx;
+  char req[8192];
+  int rn;
   if (!out || parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4646,19 +4972,37 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
     runtime_failure("network init failed");
     return -1;
   }
-  memset(&attempt_ctx, 0, sizeof(attempt_ctx));
-  attempt_ctx.host = host;
-  attempt_ctx.path = path;
-  attempt_ctx.port = port;
-  attempt_ctx.https = https;
-  attempt_ctx.out = out;
-  attempt_ctx.max_bytes = max_bytes;
-  attempt_ctx.out_agent_config = out_agent_config;
+  rn = append_request_headers(req, sizeof(req), "GET", path, host, NULL, NULL, 0u);
+  if (rn <= 0) {
+    runtime_failure("http request build failed");
+    net_done();
+    return -1;
+  }
   http_lock();
-  rc = edr_http_run_attempts(2u, native_file_get_attempt, &attempt_ctx, NULL) ==
-               EDR_HTTP_ATTEMPT_SUCCESS
-           ? 0
-           : -1;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    int reusable = 0;
+    EdrHttpConn *conn = http_conn_get_locked(host, port, https);
+    if (!conn) {
+      break;
+    }
+    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
+        read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config) == 0) {
+      rc = 0;
+      conn->last_used_ms = unix_ms_now();
+      if (!reusable || !http_keepalive_enabled()) {
+        http_conn_close_locked();
+      }
+      break;
+    }
+    http_conn_close_locked();
+    if (fseek(out, 0L, SEEK_SET) == 0) {
+#if defined(_WIN32)
+      (void)_chsize(_fileno(out), 0);
+#else
+      (void)ftruncate(fileno(out), 0);
+#endif
+    }
+  }
   http_unlock();
   net_done();
   if (rc != 0 && runtime_string_empty(s_last_error)) {
@@ -5469,12 +5813,45 @@ static int post_to_suffix(const char *suffix, const char *body) {
   return rc;
 }
 
->>>>>>> Stashed changes
 int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *header12, size_t header_len,
                                        const uint8_t *payload, size_t payload_len) {
   if (!edr_ingest_http_configured() || !batch_id || !header12 || header_len < 12u || !payload ||
       payload_len == 0u) {
     return -1;
+  }
+  if (report_events_v2_should_use()) {
+    uint8_t *env = NULL;
+    size_t env_len = 0u;
+    int v2rc;
+    if (build_report_events_v2_envelope(batch_id, header12, header_len, payload, payload_len,
+                                        &env, &env_len) == 0) {
+      v2rc = request_to_suffix("POST", "ingest/report-events", "application/x-protobuf",
+                               (const char *)env, env_len, NULL, 0u);
+      free(env);
+      if (v2rc == 0) {
+        runtime_state_lock();
+        s_report_events_v2_ok++;
+        runtime_state_unlock();
+        note_http_request_success();
+        return 0;
+      }
+      runtime_state_lock();
+      s_report_events_v2_fail++;
+      runtime_state_unlock();
+      note_http_request_failure();
+      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 0)) {
+        log_native_post_failure("report-events-v2", v2rc);
+        return -1;
+      }
+    } else {
+      runtime_state_lock();
+      s_report_events_v2_fail++;
+      runtime_state_unlock();
+      if (!env_bool_default("EDR_REPORT_EVENTS_V2_FALLBACK_JSON", 0)) {
+        runtime_failure("report-events-v2 envelope build failed");
+        return -1;
+      }
+    }
   }
   size_t raw_len = header_len + payload_len;
   size_t b64_cap = (raw_len / 3u + 2u) * 4u + 16u;
@@ -5496,63 +5873,24 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   }
   free(raw);
 
-  char jsonpath[512];
-  char cfgpath[512];
-#ifdef _WIN32
-  char td[MAX_PATH];
-  DWORD nn = GetTempPathA(sizeof(td), td);
-  if (nn == 0 || nn >= sizeof(td)) {
-    snprintf(td, sizeof(td), ".\\");
-  }
-  snprintf(jsonpath, sizeof(jsonpath), "%sedr_ingest_%lu.json", td,
-           (unsigned long)GetCurrentProcessId());
-  snprintf(cfgpath, sizeof(cfgpath), "%sedr_ingest_%lu.cfg", td, (unsigned long)GetCurrentProcessId());
-#else
-  snprintf(jsonpath, sizeof(jsonpath), "/tmp/edr_ingest_%d.json", (int)getpid());
-  snprintf(cfgpath, sizeof(cfgpath), "/tmp/edr_ingest_%d.cfg", (int)getpid());
-#endif
-
-  FILE *jf = fopen(jsonpath, "wb");
-  if (!jf) {
+  size_t body_cap = strlen(b64) + strlen(s_endpoint) + strlen(batch_id) + strlen(s_agent_ver) + 128u;
+  char *body = (char *)malloc(body_cap);
+  if (!body) {
     free(b64);
     return -1;
   }
-  fprintf(jf,
-          "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}\n",
-          s_endpoint, batch_id, s_agent_ver, b64);
-  fclose(jf);
+  snprintf(body, body_cap,
+           "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}",
+           s_endpoint, batch_id, s_agent_ver, b64);
   free(b64);
-
-  FILE *cf = fopen(cfgpath, "wb");
-  if (!cf) {
-    (void)remove(jsonpath);
-    return -1;
-  }
-  fprintf(cf, "url = \"%s/ingest/report-events\"\n", s_rest);
-  fprintf(cf, "header = \"Content-Type: application/json\"\n");
-  fprintf(cf, "header = \"X-Tenant-ID: %s\"\n", s_tenant[0] ? s_tenant : "demo-tenant");
-  fprintf(cf, "header = \"X-User-ID: %s\"\n", s_user[0] ? s_user : "edr-agent");
-  fprintf(cf, "header = \"X-Permission-Set: telemetry:write\"\n");
-  if (s_bearer[0]) {
-    fprintf(cf, "header = \"Authorization: Bearer %s\"\n", s_bearer);
-  }
-  fprintf(cf, "data = '@%s'\n", jsonpath);
-  fprintf(cf, "silent\n");
-  fclose(cf);
-
-  char cmd[700];
-  snprintf(cmd, sizeof(cmd), "curl -fsS --config '%s'", cfgpath);
-  int rc = system(cmd);
-  (void)remove(jsonpath);
-  (void)remove(cfgpath);
+  int rc = post_to_suffix("ingest/report-events", body);
+  free(body);
   if (rc != 0) {
-    fprintf(stderr, "[ingest-http] curl failed rc=%d (rest=%s)\n", rc, s_rest);
+    log_native_post_failure("report-events", rc);
     return -1;
   }
   return 0;
 }
-<<<<<<< Updated upstream
-=======
 
 int edr_ingest_http_post_engine_health_json(const char *body_json) {
   if (!edr_ingest_http_configured() || !body_json || !body_json[0]) {
@@ -5703,7 +6041,8 @@ static void command_result_note_delivery_failure(const char *response) {
     cJSON_Delete(root);
   }
   runtime_state_lock();
-  s_last_command_result_retryable = edr_http_delivery_status_retryable(status);
+  s_last_command_result_retryable =
+      !(status >= 400 && status < 500 && status != 408 && status != 429);
   if (status > 0 || code[0] || message[0]) {
     snprintf(s_last_command_result_error, sizeof(s_last_command_result_error),
              "HTTP %ld %s%s%s", status,
@@ -6169,68 +6508,6 @@ static int multipart_body_sha256(FILE *file, const char *pre, size_t pre_len,
   return fseek(file, 0, SEEK_SET) == 0 ? 0 : -1;
 }
 
-typedef struct {
-  const char *host;
-  const char *path;
-  const char *content_type;
-  const char *pre;
-  size_t pre_len;
-  FILE *file;
-  size_t file_len;
-  const char *post;
-  size_t post_len;
-  const char *content_sha256_hex;
-  size_t body_len;
-  int port;
-  int https;
-  char *resp_body;
-  size_t resp_body_cap;
-} EdrNativeMultipartAttempt;
-
-static EdrHttpAttemptOutcome native_multipart_attempt(void *opaque, unsigned int attempt) {
-  EdrNativeMultipartAttempt *ctx = (EdrNativeMultipartAttempt *)opaque;
-  char req[8192];
-  char status_line[96];
-  long status_code = 0;
-  int response_received = 0;
-  int reusable = 0;
-  int rn;
-  EdrHttpConn conn;
-  (void)attempt;
-  memset(&conn, 0, sizeof(conn));
-  conn.fd = EDR_SOCKET_INVALID;
-  if (fseek(ctx->file, 0, SEEK_SET) != 0) {
-    runtime_failure("http upload file rewind failed");
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  rn = append_request_headers_hash(req, sizeof(req), "POST", ctx->path, ctx->host,
-                                   ctx->content_type, ctx->body_len,
-                                   ctx->content_sha256_hex);
-  if (rn <= 0) {
-    runtime_failure("http upload request build failed");
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  if (http_conn_open_new(&conn, ctx->host, ctx->port, ctx->https) != 0) {
-    return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
-  }
-  if (http_conn_write_all(&conn, req, (size_t)rn) == 0 &&
-      http_conn_write_all(&conn, ctx->pre, ctx->pre_len) == 0 &&
-      http_conn_write_file(&conn, ctx->file, ctx->file_len) == 0 &&
-      http_conn_write_all(&conn, ctx->post, ctx->post_len) == 0 &&
-      read_http_response_from_recv(http_socket_recv_adapter, &conn, ctx->resp_body,
-                                   ctx->resp_body_cap, &reusable, &response_received,
-                                   &status_code, status_line, sizeof(status_line)) == 0) {
-    http_conn_close(&conn);
-    return EDR_HTTP_ATTEMPT_SUCCESS;
-  }
-  http_conn_close(&conn);
-  if (response_received && (status_code < 200 || status_code >= 300)) {
-    runtime_http_response_failure(status_line, status_code);
-    return EDR_HTTP_ATTEMPT_RESPONSE_FAILURE;
-  }
-  return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
-}
-
 static int request_to_suffix_multipart_file(const char *suffix, const char *content_type,
                                             const char *pre, size_t pre_len,
                                             FILE *file, size_t file_len,
@@ -6243,7 +6520,8 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
   int port = 0;
   int https = 0;
   int rc = -1;
-  EdrNativeMultipartAttempt attempt_ctx;
+  char req[8192];
+  int rn;
   size_t body_len = pre_len + file_len + post_len;
   build_suffix_url(url, sizeof(url), suffix);
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
@@ -6267,26 +6545,35 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     runtime_failure("network init failed");
     return -1;
   }
-  memset(&attempt_ctx, 0, sizeof(attempt_ctx));
-  attempt_ctx.host = host;
-  attempt_ctx.path = path;
-  attempt_ctx.content_type = content_type;
-  attempt_ctx.pre = pre;
-  attempt_ctx.pre_len = pre_len;
-  attempt_ctx.file = file;
-  attempt_ctx.file_len = file_len;
-  attempt_ctx.post = post;
-  attempt_ctx.post_len = post_len;
-  attempt_ctx.content_sha256_hex = content_sha256_hex;
-  attempt_ctx.body_len = body_len;
-  attempt_ctx.port = port;
-  attempt_ctx.https = https;
-  attempt_ctx.resp_body = resp_body;
-  attempt_ctx.resp_body_cap = resp_body_cap;
-  rc = edr_http_run_attempts(2u, native_multipart_attempt, &attempt_ctx, NULL) ==
-               EDR_HTTP_ATTEMPT_SUCCESS
-           ? 0
-           : -1;
+  rn = append_request_headers_hash(req, sizeof(req), "POST", path, host, content_type,
+                                   body_len, content_sha256_hex);
+  if (rn <= 0) {
+    runtime_failure("http upload request build failed");
+    return -1;
+  }
+  for (int attempt = 0; attempt < 2; attempt++) {
+    int reusable = 0;
+    EdrHttpConn local_conn;
+    memset(&local_conn, 0, sizeof(local_conn));
+    local_conn.fd = EDR_SOCKET_INVALID;
+    if (fseek(file, 0, SEEK_SET) != 0) {
+      break;
+    }
+    if (http_conn_open_new(&local_conn, host, port, https) != 0) {
+      break;
+    }
+    if (http_conn_write_all(&local_conn, req, (size_t)rn) == 0 &&
+        http_conn_write_all(&local_conn, pre, pre_len) == 0 &&
+        http_conn_write_file(&local_conn, file, file_len) == 0 &&
+        http_conn_write_all(&local_conn, post, post_len) == 0 &&
+        read_http_response_from_recv(http_socket_recv_adapter, &local_conn,
+                                     resp_body, resp_body_cap, &reusable) == 0) {
+      rc = 0;
+      http_conn_close(&local_conn);
+      break;
+    }
+    http_conn_close(&local_conn);
+  }
   if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https upload failed" : "http upload failed");
   }
@@ -6680,7 +6967,11 @@ static int edr_ingest_http_control_hello_once(void) {
            "\"policy_version\":\"%s\",\"h2\":%s,\"zstd\":%s,"
            "\"dict_ver\":\"%s\",\"schema_ver\":\"%s\",\"profile_id\":\"%s\","
            "\"capabilities\":{\"h2\":%s,\"zstd\":%s,\"dict_ver\":\"%s\","
-           "\"schema_ver\":\"%s\",\"profile_id\":\"%s\"},"
+           "\"schema_ver\":\"%s\",\"profile_id\":\"%s\""
+#ifdef _WIN32
+           ",\"agent_update_v1\":true"
+#endif
+           "},"
            "\"supported_schema\":[\"%s\"],\"supported_dicts\":[\"%s\"],\"profiles\":[\"%s\"]}",
            endpoint, agent, policy,
            h2_cap ? "true" : "false",
@@ -7287,4 +7578,3 @@ int edr_ingest_http_stop_command_poll_timeout(uint32_t timeout_ms) {
 void edr_ingest_http_stop_command_poll(void) {
   (void)edr_ingest_http_stop_command_poll_timeout(10000u);
 }
->>>>>>> Stashed changes

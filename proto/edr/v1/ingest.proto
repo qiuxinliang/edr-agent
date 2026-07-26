@@ -4,7 +4,7 @@ syntax = "proto3";
 
 package edr.v1;
 
-option go_package = "edr-backend/platform/internal/edrpb/ingestv1;ingestv1";
+option go_package = "edr-backend/platform/internal/edrpb/edrv1;edrv1";
 
 message ReportEventsRequest {
   string endpoint_id = 1;
@@ -91,4 +91,6 @@ service EventIngest {
   rpc Subscribe(SubscribeRequest) returns (stream CommandEnvelope);
   rpc ReportCommandResult(ReportCommandResultRequest) returns (ReportCommandResultResponse);
   rpc UploadFile(stream FileChunk) returns (UploadResult);
+  // P2 RTR/RTQ 长会话：服务端下发 CommandEnvelope，Agent 同流回传心跳/结果分片。
+  rpc ControlStream(stream CommandEnvelope) returns (stream CommandEnvelope);
 }

@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FDSecurity 安装向导</title>
+<style>
+:root{
+  --bg:#070a12;--bg1:#0a0e18;--bg2:#0e131f;--bg3:#141b29;--bg4:#1a2433;
+  --ln:#1a2230;--ln2:#263247;--ln3:#33445f;
+  --tx:#c5cfdb;--tx2:#7b8a9a;--tx3:#526070;
+  --pri:#4d7cff;--up:#2ee6a6;--warn:#ffb347;--crit:#ff5277;--info:#36c5e0;
+  --pri-d:rgba(77,124,255,.12);--up-d:rgba(46,230,166,.10);--warn-d:rgba(255,179,71,.10);--crit-d:rgba(255,82,119,.10);--info-d:rgba(54,197,224,.09);
+  --mono:"JetBrains Mono","SF Mono",Consolas,"Microsoft YaHei UI","Microsoft YaHei",monospace;
+}
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--bg);color:var(--tx);font-family:var(--mono);font-size:12px;line-height:1.5;letter-spacing:0;-webkit-font-smoothing:antialiased}
+button,input,select{font-family:inherit;font-size:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--ln2)}
+::-webkit-scrollbar-track{background:transparent}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:.5;transform:scale(1)}50%{opacity:1;transform:scale(1.03)}}
+@keyframes in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+@keyframes flow{to{background-position:28px 0}}
+
+.win{width:100vw;height:100vh;background:var(--bg1);border:1px solid var(--ln3);display:grid;grid-template-rows:42px 1fr 60px;overflow:hidden}
+.titlebar{display:flex;align-items:center;gap:10px;padding:0 14px;background:linear-gradient(180deg,var(--bg2),var(--bg1));border-bottom:1px solid var(--ln);user-select:none}
+.mark{width:18px;height:20px}.tt{font-weight:800;color:#fff}.tt span{margin-left:8px;color:var(--tx3);font-weight:400}.grow{flex:1}
+.wc{display:flex;gap:8px}.wc i{width:12px;height:12px;border-radius:50%;display:block}.wc .mn{background:var(--ln3)}.wc .cl{background:var(--crit);opacity:.8}
+.body{display:grid;grid-template-columns:220px 1fr;min-height:0}
+.rail{background:var(--bg2);border-right:1px solid var(--ln);padding:20px 0;display:flex;flex-direction:column;min-height:0}
+.brand{padding:0 20px 18px;border-bottom:1px solid var(--ln);margin-bottom:14px}.bm{display:flex;align-items:center;gap:12px}.bm svg{width:34px;height:38px}
+.bn{font-size:14px;font-weight:900;color:#fff}.bs{font-size:9px;color:var(--tx3);margin-top:1px}.ver{font-size:9px;color:var(--tx2);margin-top:10px}.ver b{color:var(--info)}
+.steps{padding:0 12px;flex:1}.step{display:flex;align-items:center;gap:11px;padding:9px 8px;color:var(--tx3);position:relative}
+.sn{width:22px;height:22px;border-radius:50%;border:1px solid var(--ln3);display:flex;align-items:center;justify-content:center;font-size:10px;flex-shrink:0}
+.step.on{color:var(--tx)}.step.on .sn{border-color:var(--pri);color:var(--pri);background:var(--pri-d);box-shadow:0 0 0 3px var(--pri-d)}
+.step.done{color:var(--tx2)}.step.done .sn{border-color:var(--up);background:var(--up);color:#06120e}
+.step:not(:last-child)::after{content:"";position:absolute;left:18.5px;top:31px;height:11px;width:1px;background:var(--ln2)}.step.done:not(:last-child)::after{background:var(--up)}
+.railfoot{border-top:1px solid var(--ln);padding:14px 20px 0;color:var(--tx3);font-size:9px;line-height:1.6}
+.main{min-height:0;overflow:auto;padding:26px 30px}.panel{display:none;animation:in .2s ease}.panel.on{display:block}
+.ph{font-size:18px;font-weight:900;color:#fff}.psub{color:var(--tx2);margin-top:6px;line-height:1.7}.hr{height:1px;background:var(--ln);margin:18px 0}
+.hero{display:flex;gap:22px;align-items:center;margin-top:6px}.hero svg{flex-shrink:0}.feat{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px;margin-top:20px}
+.fi{display:flex;gap:10px;align-items:flex-start}.fic{color:var(--up)}.ft{font-weight:800;color:var(--tx)}.fd{font-size:10px;color:var(--tx3);margin-top:2px}
+.note{margin-top:18px;border-left:2px solid var(--info);background:var(--info-d);padding:10px 12px;color:var(--tx2)}
+.preconfig{display:none;margin:0 0 14px;border-left:2px solid var(--up);background:var(--up-d);padding:9px 12px;color:var(--up);font-size:10px}
+.preconfig.on{display:block}
+.eula{height:214px;overflow:auto;border:1px solid var(--ln2);background:var(--bg2);padding:14px 16px;color:var(--tx2);font-size:10px;line-height:1.8}.eula h4{margin:0 0 8px;color:var(--tx);font-size:11px}.eula p{margin:0 0 10px}
+.accept{display:flex;align-items:center;gap:9px;margin-top:14px;cursor:pointer;user-select:none}.cbx{width:16px;height:16px;border:1px solid var(--ln3);display:flex;align-items:center;justify-content:center;color:transparent}.accept.on .cbx{background:var(--pri);border-color:var(--pri);color:#fff}
+.form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.frow{margin-bottom:14px}.wide{grid-column:1 / -1}.flabel{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:10px;color:var(--tx2)}.req{color:var(--crit)}.opt{color:var(--tx3);font-size:9px}
+	.fin,.fsel{width:100%;background:var(--bg3);border:1px solid var(--ln2);outline:none;padding:9px 12px}.fin:focus,.fsel:focus{border-color:var(--pri)}.fin::placeholder{color:var(--tx3)}
+	.testc{margin-left:auto;border:1px solid rgba(54,197,224,.35);color:var(--info);padding:3px 12px}.testc:hover{background:var(--info-d)}
+	.subpanel{grid-column:1 / -1;border:1px solid var(--ln2);background:rgba(20,27,41,.58);padding:12px 14px;margin-bottom:2px}.subpanel .form{gap:12px}.hide{display:none!important}.secret{-webkit-text-security:disc}
+	.toggles{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}.tgl{display:flex;align-items:center;gap:11px;cursor:pointer;user-select:none}.tgl[data-locked=true]{cursor:not-allowed;opacity:.55}.sw{width:34px;height:18px;border-radius:10px;background:var(--bg4);position:relative;flex-shrink:0}.sw i{position:absolute;left:2px;top:2px;width:14px;height:14px;border-radius:50%;background:var(--tx3);transition:.18s}.tgl.on .sw{background:var(--pri-d)}.tgl.on .sw i{left:18px;background:var(--pri)}.tl{font-size:10.5px;color:var(--tx)}.td{font-size:9px;color:var(--tx3)}
+.advtop{display:flex;align-items:center;gap:12px;margin-bottom:14px}.advbtn{margin-left:auto;border:1px solid var(--ln3);color:var(--info);padding:7px 14px}.advbtn:hover{background:var(--info-d)}
+.shade{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:30}.drawer{position:fixed;right:0;top:0;bottom:0;width:390px;background:var(--bg2);border-left:1px solid var(--ln3);z-index:31;padding:20px;box-shadow:-20px 0 50px rgba(0,0,0,.36);overflow:auto;animation:in .16s ease}.dh{display:flex;align-items:center;gap:10px;margin-bottom:14px}.dh .ph{font-size:15px}.xbtn{margin-left:auto;border:1px solid var(--ln2);color:var(--tx2);padding:4px 10px}.xbtn:hover{color:var(--crit);border-color:rgba(255,82,119,.35)}
+.checklist{margin-top:2px}.chk{display:flex;align-items:center;gap:13px;padding:11px 2px;border-bottom:1px solid var(--ln)}.chk:last-child{border-bottom:0}.ci{width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1px solid var(--ln3);color:var(--tx3);flex-shrink:0}.chk.run .ci{border:2px solid var(--ln2);border-top-color:var(--info);animation:spin .8s linear infinite}.chk.ok .ci{background:var(--up);border-color:var(--up);color:#04130d}.chk.warn .ci{background:var(--warn);border-color:var(--warn);color:#160b02}.chk.fail .ci{background:var(--crit);border-color:var(--crit);color:#fff}.ck{width:116px;font-weight:800;color:var(--tx)}.cv{font-size:10px;color:var(--tx3)}.chk.warn .cv{color:var(--warn)}.chk.fail .cv{color:var(--crit)}
+.checksum{margin-top:14px;border-left:2px solid var(--up);background:var(--up-d);color:var(--up);padding:9px 12px}.checksum.warn{border-left-color:var(--warn);background:var(--warn-d);color:var(--warn)}.checksum.fail{border-left-color:var(--crit);background:var(--crit-d);color:var(--crit)}
+.installwrap{text-align:center;padding:22px 0}.instmark{margin:4px auto 18px}.instmark svg{animation:pulse 1.7s ease-in-out infinite}.instnow{font-weight:800;min-height:18px}.instdetail{color:var(--tx3);font-size:10px;margin-top:5px;min-height:16px}.instpct{font-size:30px;font-weight:900;color:var(--pri);font-variant-numeric:tabular-nums;margin:12px 0 4px}.pbar{height:6px;margin:8px 40px 0;border-radius:4px;background:var(--bg4);overflow:hidden}.pbar i{display:block;height:100%;width:0;background:var(--pri);background-image:linear-gradient(45deg,rgba(255,255,255,.18) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.18) 50%,rgba(255,255,255,.18) 75%,transparent 75%);background-size:28px 28px;animation:flow 1s linear infinite;transition:width .25s}
+.insttasks{margin:20px 40px 0;text-align:left;font-size:10px}.itask{display:flex;align-items:center;gap:10px;padding:5px 0;color:var(--tx3)}.itask.done{color:var(--tx2)}.itask.cur{color:var(--tx)}.id{width:14px;text-align:center}.itask.done .id{color:var(--up)}.itask.cur .id{color:var(--info)}
+.donewrap{text-align:center;padding:8px 0}.donering{margin:6px auto 16px}.donetitle{font-size:18px;font-weight:900;color:#fff}.donesub{color:var(--tx2);margin-top:6px}.summary{margin:20px auto 0;max-width:440px;border:1px solid var(--ln2);background:var(--bg2);text-align:left}.erow{display:flex;align-items:center;padding:9px 14px;border-bottom:1px solid var(--ln)}.erow:last-child{border-bottom:0}.ek{color:var(--tx3);width:112px}.ev{color:var(--tx);font-weight:800;overflow:hidden;text-overflow:ellipsis}.ev.ok{color:var(--up)}
+.diag{margin-top:14px;border:1px solid rgba(54,197,224,.35);color:var(--info);padding:7px 14px}.diag:hover{background:var(--info-d)}
+.footer{display:flex;align-items:center;gap:12px;padding:0 22px;border-top:1px solid var(--ln);background:var(--bg2)}.prog{font-size:10px;color:var(--tx3)}.prog b{color:var(--tx2)}.btn{padding:8px 18px;border:1px solid var(--ln2);color:var(--tx2);background:transparent}.btn:hover{border-color:var(--ln3);color:var(--tx)}.btn.prim{border-color:var(--pri);background:var(--pri);color:#fff;font-weight:800}.btn.prim[disabled]{opacity:.42;cursor:not-allowed;background:var(--bg3);border-color:var(--ln2);color:var(--tx3)}.btn.ghost:hover{border-color:rgba(255,82,119,.35);color:var(--crit)}
+.toasts{position:fixed;right:16px;bottom:16px;z-index:20;display:flex;flex-direction:column;gap:8px}.toast{display:flex;min-width:230px;background:var(--bg2);border:1px solid var(--ln2);box-shadow:0 8px 24px rgba(0,0,0,.45);animation:in .2s}.toast .bar{width:3px;background:var(--pri)}.toast.up .bar{background:var(--up)}.toast.warn .bar{background:var(--warn)}.toast.fail .bar{background:var(--crit)}.tc{padding:8px 12px}.toast .t{font-weight:800;font-size:10px}.toast .m{font-size:9px;color:var(--tx2);margin-top:2px}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="titlebar" id="titlebar">
+    <svg class="mark" viewBox="0 0 48 54"><defs><linearGradient id="mg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4d7cff"/><stop offset="1" stop-color="#36c5e0"/></linearGradient></defs><polygon points="24,2 44,13 44,37 24,52 4,37 4,13" fill="none" stroke="url(#mg)" stroke-width="2.5"/><path d="M16 26 L22 33 L33 20" fill="none" stroke="url(#mg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div class="tt">FDSecurity<span>安装向导</span></div>
+    <div class="grow"></div>
+    <div class="wc"><i class="mn" id="winMin"></i><i class="cl" id="winClose"></i></div>
+  </div>
+
+  <div class="body">
+    <aside class="rail">
+      <div class="brand">
+        <div class="bm">
+          <svg viewBox="0 0 48 54"><defs><linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4d7cff"/><stop offset="1" stop-color="#36c5e0"/></linearGradient></defs><polygon points="24,2 44,13 44,37 24,52 4,37 4,13" fill="rgba(77,124,255,.06)" stroke="url(#bg2)" stroke-width="2.5"/><path d="M16 26 L22 33 L33 20" fill="none" stroke="url(#bg2)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div><div class="bn">EDR</div><div class="bs">ENDPOINT AGENT</div></div>
+        </div>
+        <div class="ver">版本 <b id="agentVersion">检测中</b> · <span id="archLabel">x64</span></div>
+      </div>
+      <div class="steps" id="steps"></div>
+      <div class="railfoot">单 Agent · 443 出站<br>WebView2 UI · Inno 安装链路</div>
+    </aside>
+
+    <main class="main" id="main">
+      <section class="panel on" data-step="0">
+        <div class="hero">
+          <svg width="76" height="86" viewBox="0 0 48 54"><defs><linearGradient id="hg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4d7cff"/><stop offset="1" stop-color="#36c5e0"/></linearGradient></defs><polygon points="24,2 44,13 44,37 24,52 4,37 4,13" fill="rgba(77,124,255,.05)" stroke="url(#hg)" stroke-width="2"/><path d="M15 26 L22 34 L34 19" fill="none" stroke="url(#hg)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div><div class="ph">欢迎安装 FDSecurity</div><div class="psub">向导将部署端点传感器、写入 enroll 配置、安装开机任务并等待健康回执。真实安装动作由同目录的 FDSecuritySetup.exe 执行。</div></div>
+        </div>
+        <div class="feat">
+          <div class="fi"><span class="fic">◉</span><div><div class="ft">产品化安装流程</div><div class="fd">预检、参数、提权、安装、诊断路径全部可见</div></div></div>
+          <div class="fi"><span class="fic">◉</span><div><div class="ft">复用现有可靠链路</div><div class="fd">继续使用 Inno + PowerShell 完成落盘和注册</div></div></div>
+          <div class="fi"><span class="fic">◉</span><div><div class="ft">故障可定位</div><div class="fd">失败时保留 setup-ui、Inno、Agent bootstrap 诊断</div></div></div>
+          <div class="fi"><span class="fic">◉</span><div><div class="ft">企业网络兼容</div><div class="fd">支持直连、系统代理、显式代理和 Relay 地址</div></div></div>
+        </div>
+        <div class="note">UI 默认不要求管理员身份运行；真正安装阶段会启动静默 setup 并按需触发 UAC。</div>
+      </section>
+
+      <section class="panel" data-step="1">
+        <div class="ph">最终用户许可协议</div>
+        <div class="psub">请阅读并接受以下条款以继续安装。</div>
+        <div class="hr"></div>
+        <div class="eula">
+          <h4>FDSecurity 最终用户许可协议</h4>
+          <p>1. 本软件仅允许在组织授权的受管终端上安装和运行，用于终端安全检测、响应、取证和运维管理。</p>
+          <p>2. 本软件会采集必要的安全遥测，包括进程、命令行、文件、网络、注册表和运行健康指标，用于威胁检测、误报治理和响应闭环。</p>
+          <p>3. 您不得绕过安全控制、篡改安装目录或将本软件部署在未授权环境。卸载、升级和策略变更应通过组织授权流程完成。</p>
+          <p>4. 本软件按组织策略接收检测规则、采集策略和版本更新，以维持防护有效性和资源占用边界。</p>
+          <p>继续安装即表示您已阅读、理解并同意上述条款。</p>
+        </div>
+        <div class="accept" id="accept"><span class="cbx">✓</span><span>我已阅读并接受上述许可协议条款</span></div>
+      </section>
+
+      <section class="panel" data-step="2">
+        <div class="advtop"><div class="ph">部署配置</div><button class="advbtn" id="openAdvanced">高级选项</button></div>
+        <div class="psub">填写服务端接入、注册令牌和企业网络信息。</div>
+        <div class="hr"></div>
+        <div class="preconfig" id="preconfigNote"></div>
+        <div class="form">
+          <div class="frow wide"><div class="flabel">服务端地址<span class="req">*</span><span class="opt">支持 https://server:8080 或 https://server:8080/api/v1</span><button class="testc" id="testConn">检查格式</button></div><input class="fin" id="apiBase" placeholder="https://server:8080"></div>
+          <div class="frow"><div class="flabel">注册令牌<span class="req">*</span></div><input class="fin" id="token" placeholder="粘贴 enroll token"></div>
+          <div class="frow"><div class="flabel">安装路径</div><input class="fin" id="installPath" value="C:\Program Files\FDSecurity"></div>
+          <div class="frow"><div class="flabel">安装模式</div><select class="fsel" id="installMode"><option value="upgrade_keep">标准安装 / 升级保留</option><option value="fresh">首次安装</option><option value="repair_clean">修复安装 / 清理运行缓存</option><option value="reset_all">完全重置 / 清理本地数据</option></select></div>
+          <div class="frow"><div class="flabel">代理模式</div><select class="fsel" id="proxyMode"><option value="auto">系统代理 / 自动发现</option><option value="off">直连</option><option value="explicit">显式代理</option></select></div>
+          <div class="subpanel hide" id="proxyPanel">
+            <div class="form">
+              <div class="frow wide"><div class="flabel">代理地址<span class="req">*</span><span class="opt">仅显式代理模式需要</span></div><input class="fin" id="proxyUrl" placeholder="http://proxy.example:8080"></div>
+              <div class="frow"><div class="flabel">代理认证</div><select class="fsel" id="proxyAuthMode"><option value="none">无需认证</option><option value="basic">Basic 用户名/密码</option></select></div>
+              <div class="frow"><div class="flabel">用户名</div><input class="fin" id="proxyUser" placeholder="domain\\user 或 user"></div>
+              <div class="frow"><div class="flabel">密码</div><input class="fin secret" id="proxyPassword" type="password" placeholder="仅在安装参数文件中临时保存"></div>
+            </div>
+          </div>
+          <div class="frow wide"><div class="flabel">Relay / Gateway 地址<span class="opt">可填 https://relay:443 或 https://relay:443/api/v1</span></div><input class="fin" id="relayUrl" placeholder="https://relay.example:443"></div>
+        </div>
+        <div class="hr"></div>
+        <div class="toggles">
+          <div class="tgl on" id="keepOfflineQueue"><span class="sw"><i></i></span><div><div class="tl">保留离线事件队列</div><div class="td">升级时不删除历史待上传事件</div></div></div>
+          <div class="tgl on" id="keepEvidenceCache"><span class="sw"><i></i></span><div><div class="tl">保留本地证据缓存</div><div class="td">升级时不删除 evidence cache</div></div></div>
+          <div class="tgl" id="insecureTls"><span class="sw"><i></i></span><div><div class="tl">跳过证书校验</div><div class="td">仅实验室自签证书环境使用</div></div></div>
+        </div>
+      </section>
+
+      <section class="panel" data-step="3">
+        <div class="ph">环境检查</div>
+        <div class="psub">检查系统、安装包、权限、磁盘和必要配置。</div>
+        <div class="hr"></div>
+        <div class="checklist" id="checklist"></div>
+        <div class="checksum" id="checksum">正在等待 native 预检结果。</div>
+      </section>
+
+      <section class="panel" data-step="4">
+        <div class="installwrap">
+          <div class="instmark"><svg width="60" height="68" viewBox="0 0 48 54"><defs><linearGradient id="ig" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4d7cff"/><stop offset="1" stop-color="#36c5e0"/></linearGradient></defs><polygon points="24,2 44,13 44,37 24,52 4,37 4,13" fill="none" stroke="url(#ig)" stroke-width="2"/></svg></div>
+          <div class="instnow" id="instNow">正在准备安装…</div>
+          <div class="instdetail" id="instDetail"></div>
+          <div class="instpct" id="instPct">0%</div>
+          <div class="pbar"><i id="instBar"></i></div>
+          <div class="insttasks" id="instTasks"></div>
+          <button class="diag" id="openDiagInstall" style="display:none">打开诊断包</button>
+        </div>
+      </section>
+
+      <section class="panel" data-step="5">
+        <div class="donewrap">
+          <div class="donering"><svg width="64" height="64" viewBox="0 0 64 64"><circle cx="32" cy="32" r="28" fill="rgba(46,230,166,.06)" stroke="var(--up)" stroke-width="2"/><path d="M20 33 L29 42 L45 23" fill="none" stroke="var(--up)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="donetitle">安装完成，终端已进入纳管流程</div>
+          <div class="donesub">Agent 已完成部署，健康回执和运行状态已写入诊断目录。</div>
+          <div class="summary">
+            <div class="erow"><span class="ek">安装路径</span><span class="ev" id="sumPath">-</span></div>
+            <div class="erow"><span class="ek">Endpoint ID</span><span class="ev" id="sumEndpoint">等待 Agent 回执</span></div>
+            <div class="erow"><span class="ek">Tenant ID</span><span class="ev" id="sumTenant">-</span></div>
+            <div class="erow"><span class="ek">Agent 版本</span><span class="ev" id="sumAgentVersion">-</span></div>
+            <div class="erow"><span class="ek">策略版本</span><span class="ev" id="sumPolicy">-</span></div>
+            <div class="erow"><span class="ek">P0 规则版本</span><span class="ev" id="sumP0">-</span></div>
+            <div class="erow"><span class="ek">运行模式</span><span class="ev" id="sumRuntimeMode">-</span></div>
+            <div class="erow"><span class="ek">健康状态</span><span class="ev ok" id="sumHealth">-</span></div>
+            <div class="erow"><span class="ek">诊断包</span><span class="ev" id="sumDiag">-</span></div>
+          </div>
+          <button class="diag" id="openDiagDone">打开诊断包</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="footer">
+    <span class="prog">步骤 <b id="stepNum">1</b> / 6</span>
+    <div class="grow"></div>
+    <button class="btn ghost" id="btnCancel">取消</button>
+    <button class="btn" id="btnBack" style="display:none">上一步</button>
+    <button class="btn prim" id="btnNext">下一步</button>
+  </div>
+</div>
+<div class="shade hide" id="advShade"></div>
+<aside class="drawer hide" id="advDrawer">
+  <div class="dh"><div class="ph">高级选项</div><button class="xbtn" id="closeAdvanced">关闭</button></div>
+  <div class="form">
+    <div class="frow wide"><div class="flabel">运行模式</div><select class="fsel" id="runtimeMode"><option value="scheduled_task">计划任务 / SYSTEM 自动启动</option><option value="windows_service">Windows 服务</option><option value="manual">手动启动</option></select></div>
+  </div>
+  <div class="hr"></div>
+  <div class="toggles">
+    <div class="tgl" id="hardenAcl"><span class="sw"><i></i></span><div><div class="tl">ACL 加固</div><div class="td">限制普通用户修改安装目录</div></div></div>
+    <div class="tgl" id="trustCa"><span class="sw"><i></i></span><div><div class="tl">导入证书信任</div><div class="td">将随包 CA 导入 Windows Root</div></div></div>
+    <div class="tgl" id="strictHealthCheck"><span class="sw"><i></i></span><div><div class="tl">严格健康校验</div><div class="td">健康检查失败则安装失败</div></div></div>
+  </div>
+</aside>
+<div class="toasts" id="toasts"></div>
+
+<script>
+const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+const STEPS=['欢迎','许可协议','部署配置','环境检查','安装','完成'];
+const INSTALL=['停止旧运行态','清理运行缓存','注册并写入配置','校验配置','安装服务/计划任务','启动 Agent','拉取运行策略','写入健康摘要'];
+const CHECKS=['操作系统','系统架构','安装包','完整性校验','Bootstrap 信任','磁盘空间','管理员权限','服务端地址','注册令牌','代理配置','Relay/Gateway','WebView2 Runtime','服务端连通','Relay 连通'];
+let cur=0,accepted=false,checkOk=false,installDone=false,lastDiagnostics='',nativePreconfig={};
+
+function nativePost(message){ if(window.chrome && window.chrome.webview){ window.chrome.webview.postMessage(message); } }
+window.nativeBridge={receive(msg){
+  if(!msg||!msg.type)return;
+  if(msg.type==='nativeStatus')onNativeStatus(msg.payload||{});
+  if(msg.type==='checkProgress')onCheckProgress(msg.payload||{});
+  if(msg.type==='checkResult')onCheckResult(msg.payload||{});
+  if(msg.type==='installProgress')onInstallProgress(msg.payload||{});
+  if(msg.type==='installComplete')onInstallComplete(msg.payload||{});
+  if(msg.type==='installFailed')onInstallFailed(msg.payload||{});
+  if(msg.type==='toast')toast(msg.payload.title,msg.payload.message,msg.payload.level||'pri');
+}};
+
+function renderSteps(){ $('#steps').innerHTML=STEPS.map((s,i)=>`<div class="step ${i===cur?'on':''} ${i<cur?'done':''}"><span class="sn">${i<cur?'✓':i+1}</span>${s}</div>`).join(''); }
+function renderFooter(){
+  $('#stepNum').textContent=cur+1;
+  $('#btnBack').style.display=(cur>0&&cur<4)?'':'none';
+  $('#btnCancel').style.display=(cur===5)?'none':'';
+  const next=$('#btnNext');
+  next.style.display=(cur===4&&!installDone)?'none':'';
+  if(cur===1){next.textContent='下一步';next.disabled=!accepted;}
+  else if(cur===3){next.textContent='开始安装';next.disabled=!checkOk;}
+  else if(cur===5){next.textContent='完成';next.disabled=false;}
+  else{next.textContent='下一步';next.disabled=false;}
+}
+function show(i){cur=i;$$('.panel').forEach(p=>p.classList.toggle('on',+p.dataset.step===i));$('#main').scrollTop=0;renderSteps();renderFooter();}
+function payload(){
+  return {
+    apiBase:$('#apiBase').value.trim(),
+    enrollToken:$('#token').value.trim(),
+    installPath:$('#installPath').value.trim(),
+    installMode:$('#installMode').value,
+    runtimeMode:$('#runtimeMode').value,
+    proxyMode:$('#proxyMode').value,
+    proxyUrl:$('#proxyUrl').value.trim(),
+    proxyAuthMode:$('#proxyAuthMode').value,
+    proxyUser:$('#proxyUser').value.trim(),
+    proxyPassword:$('#proxyPassword').value,
+    relayUrl:$('#relayUrl').value.trim(),
+    managementUrl:nativePreconfig.managementUrl||'',
+    autoOpenEndpoint:!!nativePreconfig.autoOpenEndpoint,
+    bootstrapManifestUrl:nativePreconfig.bootstrapManifestUrl||'',
+    bootstrapManifestPath:nativePreconfig.bootstrapManifestPath||'',
+    bootstrapManifestJson:nativePreconfig.bootstrapManifestJson||(nativePreconfig.bootstrapManifest?JSON.stringify(nativePreconfig.bootstrapManifest):''),
+    installAutorun:$('#runtimeMode').value==='scheduled_task',
+    trustCa:$('#trustCa').classList.contains('on'),
+    hardenAcl:$('#hardenAcl').classList.contains('on'),
+    keepOfflineQueue:$('#keepOfflineQueue').classList.contains('on'),
+    keepEvidenceCache:$('#keepEvidenceCache').classList.contains('on'),
+    strictHealthCheck:$('#strictHealthCheck').classList.contains('on'),
+    insecureTls:$('#insecureTls').classList.contains('on')
+  };
+}
+function esc(v){return String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+function checkIcon(severity){return severity==='ok'?'✓':severity==='warn'?'!':severity==='fail'?'✕':'';}
+function renderCheckRow(key,severity='run',value='检测中…',index=0){
+  return `<div class="chk ${esc(severity)}" id="chk${index}" data-key="${esc(key)}"><span class="ci">${checkIcon(severity)}</span><span class="ck">${esc(key)}</span><span class="cv">${esc(value)}</span></div>`;
+}
+function toast(t,m,k='pri'){
+  const e=document.createElement('div');e.className='toast '+k;e.innerHTML=`<div class="bar"></div><div class="tc"><div class="t">${esc(t)}</div><div class="m">${esc(m||'')}</div></div>`;
+  $('#toasts').appendChild(e);setTimeout(()=>{e.style.transition='opacity .25s';e.style.opacity='0';setTimeout(()=>e.remove(),260);},2800);
+}
+function validateConfig(){
+  const p=payload();
+  if(!p.apiBase || !/^https?:\/\//i.test(p.apiBase)){toast('地址不完整','服务端 API 地址必须以 http:// 或 https:// 开头','warn');return false;}
+  if(!p.enrollToken){toast('缺少注册令牌','请填写 enroll token','warn');return false;}
+  if(p.proxyMode==='explicit' && !p.proxyUrl){toast('缺少代理地址','显式代理模式必须填写代理 URL','warn');return false;}
+  if(p.proxyMode==='explicit' && !/^https?:\/\//i.test(p.proxyUrl)){toast('代理地址无效','代理地址必须以 http:// 或 https:// 开头','warn');return false;}
+  if(p.proxyMode==='explicit' && p.proxyAuthMode==='basic' && !p.proxyUser){toast('缺少代理用户名','Basic 代理认证需要填写用户名','warn');return false;}
+  if(p.relayUrl && !/^https?:\/\//i.test(p.relayUrl)){toast('Relay 地址无效','Relay / Gateway 地址必须以 http:// 或 https:// 开头','warn');return false;}
+  return true;
+}
+
+function setToggle(id,on){
+  const el=$(id); if(!el)return; el.classList.toggle('on',!!on);
+}
+function syncProxyPanel(){
+  $('#proxyPanel').classList.toggle('hide',$('#proxyMode').value!=='explicit');
+}
+function syncInstallMode(){
+  const mode=$('#installMode').value;
+  if(mode==='upgrade_keep'){
+    setToggle('#keepOfflineQueue',true);
+    setToggle('#keepEvidenceCache',true);
+  }else{
+    setToggle('#keepOfflineQueue',false);
+    setToggle('#keepEvidenceCache',false);
+  }
+}
+function setAdvanced(open){
+  $('#advShade').classList.toggle('hide',!open);
+  $('#advDrawer').classList.toggle('hide',!open);
+}
+
+$('#titlebar').addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.wc'))return;e.preventDefault();nativePost({action:'dragWindow'});});
+$('#winMin').onclick=()=>nativePost({action:'minimize'});
+$('#winClose').onclick=$('#btnCancel').onclick=()=>nativePost({action:'cancel'});
+$('#btnBack').onclick=()=>{if(cur>0)show(cur-1);};
+$('#btnNext').onclick=()=>{
+  if(cur===1 && !accepted)return;
+  if(cur===2){if(!validateConfig())return;show(3);runChecks();return;}
+  if(cur===3){show(4);startInstall();return;}
+  if(cur===5){nativePost({action:'finish'});return;}
+  show(cur+1);
+};
+$('#accept').onclick=function(){accepted=!accepted;this.classList.toggle('on',accepted);renderFooter();};
+$$('.tgl').forEach(t=>t.onclick=()=>{if(t.dataset.locked==='true')return;t.classList.toggle('on')});
+$('#proxyMode').onchange=syncProxyPanel;
+$('#installMode').onchange=syncInstallMode;
+$('#openAdvanced').onclick=()=>setAdvanced(true);
+$('#closeAdvanced').onclick=$('#advShade').onclick=()=>setAdvanced(false);
+$('#testConn').onclick=()=>{const ok=/^https?:\/\//i.test($('#apiBase').value.trim());toast(ok?'格式有效':'格式无效',ok?'下一步会进行真实连通性预检':'服务端地址必须以 http:// 或 https:// 开头',ok?'up':'warn');};
+$('#openDiagInstall').onclick=$('#openDiagDone').onclick=()=>nativePost({action:'openDiagnostics'});
+
+function onNativeStatus(s){
+  $('#agentVersion').textContent=s.agentVersion||'unknown';
+  $('#archLabel').textContent=s.architecture||'x64';
+  applyPreconfig(s.preconfig||{});
+  if(!s.setupFound)toast('未找到安装包','请将 FDSecuritySetup.exe 放在安装器 UI 同目录','warn');
+}
+function setSelectValue(id,value){
+  if(value===undefined||value===null||value==='')return;
+  const el=$(id); if(!el)return;
+  const v=String(value);
+  if([...el.options].some(o=>o.value===v))el.value=v;
+}
+function setInputValue(id,value){
+  if(value===undefined||value===null||value==='')return;
+  const el=$(id); if(el)el.value=String(value);
+}
+function applyPreconfig(c){
+  nativePreconfig=c||{};
+  if(!nativePreconfig.preconfigured)return;
+  const hasBootstrap=!!(nativePreconfig.bootstrapManifestUrl||nativePreconfig.bootstrapManifestPath||nativePreconfig.bootstrapManifest||nativePreconfig.bootstrapManifestJson);
+  setInputValue('#apiBase',nativePreconfig.apiBase||nativePreconfig.restBaseUrl);
+  setInputValue('#token',nativePreconfig.enrollToken||nativePreconfig.token);
+  setInputValue('#installPath',nativePreconfig.installPath);
+  setSelectValue('#installMode',nativePreconfig.installMode);
+  setSelectValue('#runtimeMode',nativePreconfig.runtimeMode);
+  setSelectValue('#proxyMode',nativePreconfig.proxyMode);
+  setInputValue('#proxyUrl',nativePreconfig.proxyUrl);
+  setSelectValue('#proxyAuthMode',nativePreconfig.proxyAuthMode);
+  setInputValue('#proxyUser',nativePreconfig.proxyUser);
+  setInputValue('#proxyPassword',nativePreconfig.proxyPassword);
+  setInputValue('#relayUrl',nativePreconfig.relayUrl);
+  setToggle('#trustCa',!!nativePreconfig.trustCa);
+  setToggle('#hardenAcl',!!nativePreconfig.hardenAcl);
+  setToggle('#strictHealthCheck',!!nativePreconfig.strictHealthCheck);
+  setToggle('#keepOfflineQueue',nativePreconfig.keepOfflineQueue!==false);
+  setToggle('#keepEvidenceCache',nativePreconfig.keepEvidenceCache!==false);
+  setToggle('#insecureTls',hasBootstrap?false:!!nativePreconfig.insecureTls);
+  $('#insecureTls').dataset.locked=hasBootstrap?'true':'false';
+  if(hasBootstrap)$('#insecureTls').title='签名 Bootstrap 已启用私有 CA 校验，禁止跳过证书验证';
+  syncProxyPanel();
+  const note=$('#preconfigNote');
+  note.classList.add('on');
+  const boot=hasBootstrap?' · Bootstrap manifest':'';
+  note.textContent=`预配置已加载${boot} · 租户 ${nativePreconfig.tenantId||'-'} · 构建 ${nativePreconfig.buildId||'-'} · 安装完成后自动打开终端详情`;
+}
+function runChecks(){
+  checkOk=false;renderFooter();
+  $('#checksum').className='checksum';$('#checksum').textContent='正在执行安装前检查。';
+  $('#checklist').innerHTML=CHECKS.map((k,i)=>renderCheckRow(k,'run','等待检测…',i)).join('');
+  nativePost({action:'check',payload:payload()});
+}
+function onCheckProgress(r){
+  const c=r.check||r;
+  if(!c.key)return;
+  $('#checksum').className='checksum';
+  $('#checksum').textContent=`正在检查：${c.key}`;
+  const rows=$$('#checklist .chk');
+  let row=rows.find(x=>x.dataset.key===c.key);
+  if(!row){
+    const index=rows.length;
+    $('#checklist').insertAdjacentHTML('beforeend',renderCheckRow(c.key,c.severity||'run',c.value||'',index));
+    return;
+  }
+  row.className='chk '+(c.severity||'run');
+  row.querySelector('.ci').textContent=checkIcon(c.severity);
+  row.querySelector('.cv').textContent=c.value||'';
+}
+function onCheckResult(r){
+  const checks=r.checks||[];
+  $('#checklist').innerHTML=checks.map((c,i)=>renderCheckRow(c.key,c.severity,c.value||'',i)).join('');
+  checkOk=!!r.ok;
+  const hasWarn=checks.some(c=>c.severity==='warn');
+  $('#checksum').className='checksum '+(checkOk?(hasWarn?'warn':''):'fail');
+  $('#checksum').textContent=checkOk?(hasWarn?'检查通过，但存在提示项，安装阶段会继续校验。':'全部检查通过，可以开始安装。'):'存在阻断项，请修正后重新检查。';
+  renderFooter();
+}
+function startInstall(){
+  installDone=false;lastDiagnostics='';
+  $('#openDiagInstall').style.display='none';
+  $('#instTasks').innerHTML=INSTALL.map((t,i)=>`<div class="itask" id="it${i}"><span class="id">○</span>${t}</div>`).join('');
+  onInstallProgress({stage:'准备安装',progress:1,detail:'正在启动 native 安装流程'});
+  nativePost({action:'startInstall',payload:payload()});
+}
+function setProgress(p){
+  const pct=Math.max(0,Math.min(100,Math.round(p||0)));
+  $('#instBar').style.width=pct+'%';$('#instPct').textContent=pct+'%';
+  const idx=Math.min(INSTALL.length-1,Math.floor(pct/100*INSTALL.length));
+  $$('.itask').forEach((el,i)=>{
+    el.classList.toggle('done',i<idx);
+    el.classList.toggle('cur',i===idx&&pct<100);
+    el.querySelector('.id').textContent=i<idx?'✓':(i===idx&&pct<100?'▸':'○');
+  });
+}
+function onInstallProgress(p){
+  $('#instNow').textContent=p.stage||'安装进行中';
+  $('#instDetail').textContent=p.detail||'';
+  setProgress(p.progress||0);
+}
+function onInstallComplete(r){
+  installDone=true;lastDiagnostics=r.diagnostics||'';setProgress(100);
+  const s=r.summary||{};
+  const healthRaw=String(s.healthStatus||'').toLowerCase();
+  const healthText=healthRaw==='warning_manual_fallback'
+    ? `计划任务未正常启动，已手动拉起进程${s.manualFallbackPid?' PID='+s.manualFallbackPid:''}`
+    : healthRaw==='warning'
+      ? `运行态需要复查${s.scheduledTaskLastResult?'，任务结果='+s.scheduledTaskLastResult:''}`
+      : (s.healthStatus|| (s.agentRunning?'Agent 进程已运行':'已安装，等待首次健康上报'));
+  $('#sumPath').textContent=r.installPath||'-';
+  $('#sumEndpoint').textContent=s.endpointId||'等待 Agent 回执';
+  $('#sumTenant').textContent=s.tenantId||'-';
+  $('#sumAgentVersion').textContent=s.agentVersion||$('#agentVersion').textContent||'-';
+  $('#sumPolicy').textContent=s.policyVersion|| (s.policyUrl?'已配置 runtime policy':'等待服务端策略');
+  $('#sumP0').textContent=s.p0RuleVersion?`${s.p0RuleVersion}${s.p0RuleCount?' / '+s.p0RuleCount+' 条':''}`:'-';
+  $('#sumRuntimeMode').textContent=s.runtimeMode||'-';
+  $('#sumHealth').textContent=healthText;
+  $('#sumHealth').classList.toggle('ok',healthRaw==='ok');
+  $('#sumDiag').textContent=lastDiagnostics||'-';
+  show(5);toast('安装完成','诊断包已生成，可用于排查首启问题','up');
+}
+function onInstallFailed(r){
+  installDone=true;lastDiagnostics=r.diagnostics||'';
+  $('#instNow').textContent='安装失败';
+  $('#instDetail').textContent=r.reason||'未知错误';
+  $('#openDiagInstall').style.display='';
+  $('#btnNext').style.display='';$('#btnNext').textContent='完成';$('#btnNext').disabled=false;
+  $('#btnNext').onclick=()=>nativePost({action:'finish'});
+  toast('安装失败',r.reason||'请打开诊断包查看原因','fail');
+}
+
+syncProxyPanel();syncInstallMode();renderSteps();renderFooter();nativePost({action:'ready'});
+</script>
+</body>
+</html>

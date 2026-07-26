@@ -1,0 +1,94 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int read_all(const char *path, char **out) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  long n = ftell(f);
+  if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
+  char *p = (char *)malloc((size_t)n + 1u);
+  if (!p) { fclose(f); return -1; }
+  size_t got = fread(p, 1, (size_t)n, f);
+  fclose(f);
+  p[got] = '\0';
+  *out = p;
+  return 0;
+}
+
+static int require_text(const char *text, const char *needle) {
+  if (strstr(text, needle)) return 0;
+  fprintf(stderr, "missing contract text: %s\n", needle);
+  return 1;
+}
+
+int main(void) {
+  const char *root = getenv("EDR_SOURCE_DIR");
+  if (!root || !root[0]) root = ".";
+  char path[2048];
+  char *capture = NULL;
+  char *agent = NULL;
+  char *pmfe_preprocess = NULL;
+  char *pmfe_engine = NULL;
+  char *decision = NULL;
+  char *bundled_iss = NULL;
+  char *bundle_script = NULL;
+  snprintf(path, sizeof(path), "%s/src/shellcode_detector/windivert_capture.c", root);
+  if (read_all(path, &capture) != 0) return 2;
+  snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
+  if (read_all(path, &agent) != 0) { free(capture); return 2; }
+  snprintf(path, sizeof(path), "%s/src/pmfe/pmfe_etw_preprocess.c", root);
+  if (read_all(path, &pmfe_preprocess) != 0) { free(capture); free(agent); return 2; }
+  snprintf(path, sizeof(path), "%s/src/pmfe/pmfe_engine.c", root);
+  if (read_all(path, &pmfe_engine) != 0) {
+    free(capture); free(agent); free(pmfe_preprocess); return 2;
+  }
+  snprintf(path, sizeof(path), "%s/src/preprocess/detection_decision.c", root);
+  if (read_all(path, &decision) != 0) {
+    free(capture); free(agent); free(pmfe_preprocess); free(pmfe_engine); return 2;
+  }
+  snprintf(path, sizeof(path), "%s/install/windows-inno/EDRAgentSetup.bundled.iss", root);
+  if (read_all(path, &bundled_iss) != 0) {
+    free(capture); free(agent); free(pmfe_preprocess); free(pmfe_engine); free(decision); return 2;
+  }
+  snprintf(path, sizeof(path), "%s/scripts/stage_windivert_runtime.ps1", root);
+  if (read_all(path, &bundle_script) != 0) {
+    free(capture); free(agent); free(pmfe_preprocess); free(pmfe_engine); free(decision); free(bundled_iss); return 2;
+  }
+
+  int failed = 0;
+  failed |= require_text(capture, "WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY");
+  failed |= require_text(capture, "return EDR_ERR_WINDIVERT_OPEN;");
+  failed |= require_text(capture, "windivert_dll_load_failed");
+  failed |= require_text(capture, "windivert_open_failed");
+  failed |= require_text(capture, "capture_running");
+  failed |= require_text(capture, "scan_queue_push");
+  failed |= require_text(capture, "edr_tcp_reassembly_submit");
+  failed |= require_text(capture, "scan_queue_capacity");
+  failed |= require_text(capture, "GetModuleFileNameW");
+  failed |= require_text(capture, "windivert_source");
+  failed |= require_text(capture, "shellcode_pcap__%s__%s");
+  failed |= require_text(capture, "sha256_hex_file(forensic_path, pcap_sha256)");
+  failed |= require_text(agent, "\\\"shellcode_network\\\"");
+  failed |= require_text(agent, "\\\"driver_open\\\"");
+  failed |= require_text(agent, "\\\"runtime_detail\\\"");
+  failed |= require_text(pmfe_preprocess, "pmfe_recommended");
+  failed |= require_text(pmfe_preprocess, "shellcode:%.46s");
+  failed |= require_text(pmfe_engine, "source_alert_id");
+  failed |= require_text(pmfe_engine, "completed_clean");
+  failed |= require_text(decision, "pmfe_followup_inconclusive");
+  failed |= require_text(decision, "action = \"emit_context\"");
+  failed |= require_text(bundled_iss, "WinDivert64.sys");
+  failed |= require_text(bundled_iss, "EDR_WINDIVERT_RUNTIME_DIR");
+  failed |= require_text(bundle_script, "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2");
+  failed |= require_text(bundle_script, "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2");
+  free(capture);
+  free(agent);
+  free(pmfe_preprocess);
+  free(pmfe_engine);
+  free(decision);
+  free(bundled_iss);
+  free(bundle_script);
+  return failed ? 1 : 0;
+}

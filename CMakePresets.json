@@ -1,0 +1,192 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/out/build/${presetName}"
+    },
+    {
+      "name": "w-vcpkg-ninja-dev",
+      "displayName": "Win vcpkg+Ninja 快编（no-gRPC/HTTPS REST/YARA；无 ORT/无 FL）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Ninja",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置；先 vcpkg install --x-feature=yara。产品主线固定 no-gRPC/no-FL，Windows 构建强制 YARA。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON",
+        "EDR_WITH_HTTP2_CURL": "ON",
+        "EDR_REQUIRE_CURL_HTTP2": "ON",
+        "EDR_REQUIRE_SQLITE": "ON",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "VCPKG_MANIFEST_FEATURES": "yara",
+        "EDR_WITH_YARA": "ON",
+        "EDR_REQUIRE_YARA": "ON",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "w-vcpkg-ninja-nogrpc",
+      "displayName": "Win vcpkg+Ninja 无 gRPC（HTTPS REST + YARA；先 vcpkg install --x-feature=yara）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Ninja",
+      "description": "不编 gRPC；须 vcpkg 的 curl+openssl+sqlite+yara，使 HTTPS REST、本地状态库与 libyara 扫描可用。设 VCPKG_ROOT 并先 vcpkg install --x-feature=yara 后 cmake --preset。" ,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON",
+        "EDR_WITH_HTTP2_CURL": "ON",
+        "EDR_REQUIRE_CURL_HTTP2": "ON",
+        "EDR_REQUIRE_SQLITE": "ON",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "VCPKG_MANIFEST_FEATURES": "yara",
+        "EDR_WITH_YARA": "ON",
+        "EDR_REQUIRE_YARA": "ON",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "w-vcpkg-ninja-ort-yara",
+      "displayName": "Win vcpkg+Ninja 全量（HTTPS REST + static ONNXRuntime + YARA）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Ninja",
+      "description": "产品主线固定 no-gRPC/no-FL；需环境变量 ONNXRUNTIME_ROOT=解压的 onnxruntime 根目录。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_HTTP2_CURL": "ON",
+        "EDR_REQUIRE_CURL_HTTP2": "ON",
+        "EDR_REQUIRE_SQLITE": "ON",
+        "EDR_WITH_ONNXRUNTIME": "ON",
+        "ONNXRUNTIME_ROOT": "$env{ONNXRUNTIME_ROOT}",
+        "VCPKG_MANIFEST_FEATURES": "yara",
+        "EDR_WITH_YARA": "ON",
+        "EDR_REQUIRE_YARA": "ON",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_WITH_FL_KAFKA": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "w-vcpkg-ninja-grpc-ort",
+      "displayName": "DEPRECATED alias: use w-vcpkg-ninja-ort-yara",
+      "inherits": "w-vcpkg-ninja-ort-yara",
+      "description": "历史兼容别名；实际仍为 no-gRPC 产品构建，请改用 w-vcpkg-ninja-ort-yara。"
+    },
+    {
+      "name": "l-ninja-dev",
+      "displayName": "Linux+Ninja 快编（无 gRPC/无 ORT/无 YARA）",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "any-ninja-smoke",
+      "displayName": "任意 OS：Ninja 最小编译（无 gRPC；无 vcpkg 时联调用）",
+      "inherits": "base",
+      "generator": "Ninja",
+      "description": "不限 Windows/Linux，便于在其它系统上 `cmake --list-presets` 可见、快速冒烟。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "any-ninja-fast-dev",
+      "displayName": "任意 OS：Ninja 快编（缓存优先，调试友好）",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF",
+        "EDR_ENABLE_COMPILER_CACHE": "ON",
+        "EDR_ENABLE_UNITY_BUILD": "OFF",
+        "EDR_ENABLE_IPO": "OFF"
+      }
+    },
+    {
+      "name": "any-ninja-fast-release-lto",
+      "displayName": "任意 OS：Ninja Release 快编+LTO（发版候选）",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EDR_WITH_GRPC": "OFF",
+        "EDR_WITH_ONNXRUNTIME": "OFF",
+        "EDR_WITH_YARA": "OFF",
+        "EDR_WITH_FL_TRAINER": "OFF",
+        "EDR_BUILD_TESTS": "OFF",
+        "EDR_ENABLE_COMPILER_CACHE": "ON",
+        "EDR_ENABLE_UNITY_BUILD": "OFF",
+        "EDR_ENABLE_IPO": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "w-vcpkg-ninja-dev",
+      "configurePreset": "w-vcpkg-ninja-dev"
+    },
+    {
+      "name": "w-vcpkg-ninja-nogrpc",
+      "configurePreset": "w-vcpkg-ninja-nogrpc"
+    },
+    {
+      "name": "w-vcpkg-ninja-ort-yara",
+      "configurePreset": "w-vcpkg-ninja-ort-yara"
+    },
+    {
+      "name": "w-vcpkg-ninja-grpc-ort",
+      "configurePreset": "w-vcpkg-ninja-grpc-ort"
+    },
+    {
+      "name": "l-ninja-dev",
+      "configurePreset": "l-ninja-dev"
+    },
+    {
+      "name": "any-ninja-smoke",
+      "configurePreset": "any-ninja-smoke"
+    },
+    {
+      "name": "any-ninja-fast-dev",
+      "configurePreset": "any-ninja-fast-dev"
+    },
+    {
+      "name": "any-ninja-fast-release-lto",
+      "configurePreset": "any-ninja-fast-release-lto"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "l-ninja-dev",
+      "configurePreset": "l-ninja-dev",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

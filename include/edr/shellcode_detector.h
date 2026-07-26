@@ -12,28 +12,55 @@
 struct EdrConfig;
 struct EdrEventBus;
 
+typedef enum {
+  EDR_SHELLCODE_RUNTIME_DISABLED = 0,
+  EDR_SHELLCODE_RUNTIME_STARTING = 1,
+  EDR_SHELLCODE_RUNTIME_HEALTHY = 2,
+  EDR_SHELLCODE_RUNTIME_DEGRADED = 3,
+  EDR_SHELLCODE_RUNTIME_STOPPED = 4,
+} EdrShellcodeRuntimeState;
+
+typedef struct {
+  EdrShellcodeRuntimeState state;
+  int code_supported;
+  int build_supported;
+  int policy_enabled;
+  int dll_loaded;
+  int driver_open;
+  uint32_t capture_threads;
+  uint32_t scan_workers;
+  uint32_t scan_queue_depth;
+  uint32_t scan_queue_capacity;
+  uint32_t win32_error;
+  uint64_t packets_received;
+  uint64_t receive_errors;
+  uint64_t scan_queue_dropped;
+  uint64_t scan_jobs_processed;
+  uint32_t reassembly_active_streams;
+  uint64_t reassembly_memory_bytes;
+  uint64_t reassembly_out_of_order;
+  uint64_t reassembly_evicted;
+  uint64_t reassembly_memory_drops;
+  char runtime_status[16];
+  char windivert_source[16];
+  char detail[128];
+} EdrShellcodeDetectorRuntime;
+
 /**
  * 初始化 §17 模块。`bus` 供 WinDivert 命中后写入事件总线；可为 NULL（仅打日志、不投递）。
  */
 EdrError edr_shellcode_detector_init(const struct EdrConfig *cfg, struct EdrEventBus *bus);
 void edr_shellcode_detector_shutdown(void);
+int edr_shellcode_detector_active(void);
+uint64_t edr_shellcode_detector_budget_drop_count(void);
+/** P1 #4：因深扫速率限制/资源压力而跳过深扫的包数（仅 Windows 捕获路径累计）。 */
+uint64_t edr_shellcode_detector_rate_drop_count(void);
+void edr_shellcode_detector_get_runtime(EdrShellcodeDetectorRuntime *out);
 
 /** Shannon 熵（bit/byte），供 Layer 3 与单测使用 */
 double edr_shellcode_shannon_entropy_bits(const uint8_t *data, size_t len);
 
 /** 0.0–1.0 启发式分数（熵、NOP sled、简化 GetPC 特征），不含 YARA */
 double edr_shellcode_heuristic_score(const uint8_t *data, size_t len);
-
-#ifdef _WIN32
-/**
- * WinDivert 线程累计计数（§17 性能 / P2-PERF-2）；未启动捕获时多为 0。
- * 指针可为 NULL（跳过该项）。关机前 **`edr_windivert_capture_stop`** 若 **`EDR_SHELLCODE_WD_STATS=1`** 会 stderr 打一行汇总。
- * **`alert_dedup_suppressed`**（T-SC-041）：同五元组语义键 + 同 rule 在 30s 内被合并丢弃的次数。
- */
-void edr_shellcode_windivert_stats_snapshot(unsigned long long *recv_packets, unsigned long long *recv_errors,
-                                            unsigned long long *rows_skipped, unsigned long long *monitor_filtered,
-                                            unsigned long long *alerts_pushed, unsigned long long *bus_drops,
-                                            unsigned long long *alert_dedup_suppressed);
-#endif
 
 #endif

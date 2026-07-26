@@ -18,7 +18,7 @@ size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *
 
 struct AVEBehaviorAlert;
 /**
- * 将 behavior.onnx 告警编码为带 `behavior_alert` 的 BehaviorEvent（§12.4）。
+ * 将主机行为告警编码为带 `behavior_alert` 的 BehaviorEvent。
  * endpoint_id / tenant_id 可为空串（由调用方从配置填入）。
  */
 size_t edr_behavior_alert_encode_protobuf(const struct AVEBehaviorAlert *a, const char *endpoint_id,

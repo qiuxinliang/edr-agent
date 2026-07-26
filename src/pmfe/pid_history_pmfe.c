@@ -56,7 +56,7 @@ static void unlock(void) {
 static uint64_t wall_ns(void) {
 #ifdef _WIN32
   FILETIME ft;
-  GetSystemTimePreciseAsFileTime(&ft);
+  GetSystemTimeAsFileTime(&ft);
   ULARGE_INTEGER u;
   u.LowPart = ft.dwLowDateTime;
   u.HighPart = ft.dwHighDateTime;
@@ -178,6 +178,10 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
                  detail_u(detail, "dns_wire_hits=");
   int mz = detail_i(detail, "mz_hits=");
   int elf = detail_i(detail, "elf_hits=");
+  unsigned private_exec = detail_u(detail, "private_exec=");
+  unsigned memfd_exec = detail_u(detail, "memfd_exec=");
+  unsigned deleted_exec = detail_u(detail, "deleted_exec=");
+  unsigned read_failures = detail_u(detail, "vm_read_failures=");
   float ave = detail_f(detail, "ave_max_score=");
   float dns_best = detail_f(detail, "dns_best=");
   char sample[140];
@@ -217,9 +221,12 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
     s_slots[idx].last_ns = now;
     (void)snprintf(
         s_slots[idx].json, sizeof(s_slots[idx].json),
-        "{\"stomp\":%u,\"dns\":%u,\"mz\":%d,\"elf\":%d,\"ave\":%.4f,\"dns_best\":%.4f,\"sample\":\"%.120s\","
+        "{\"stomp\":%u,\"dns\":%u,\"mz\":%d,\"elf\":%d,\"private_exec\":%u,\"memfd_exec\":%u,"
+        "\"deleted_exec\":%u,\"read_failures\":%u,"
+        "\"ave\":%.4f,\"dns_best\":%.4f,\"sample\":\"%.120s\","
         "\"owner\":\"%.120s\"}",
-        stomp, dns, mz, elf, (double)ave, (double)dns_best, esample, eowner);
+        stomp, dns, mz, elf, private_exec, memfd_exec, deleted_exec, read_failures,
+        (double)ave, (double)dns_best, esample, eowner);
   }
   unlock();
 }
@@ -236,7 +243,12 @@ void edr_pid_history_pmfe_fill_record(EdrBehaviorRecord *br) {
   lock();
   for (int i = 0; i < EDR_PID_PMFE_SLOTS; i++) {
     if (s_slots[i].valid && s_slots[i].pid == br->pid) {
-      snprintf(br->pmfe_snapshot, sizeof(br->pmfe_snapshot), "%s", s_slots[i].json);
+      size_t n = strlen(s_slots[i].json);
+      if (n >= sizeof(br->pmfe_snapshot)) {
+        n = sizeof(br->pmfe_snapshot) - 1u;
+      }
+      memcpy(br->pmfe_snapshot, s_slots[i].json, n);
+      br->pmfe_snapshot[n] = '\0';
       break;
     }
   }

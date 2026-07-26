@@ -1,0 +1,18 @@
+[Unit]
+Description=FDSecurity EDR managed eBPF event source
+After=local-fs.target
+Before=edr-agent.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/edr-agent/edr-ebpf-trace.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/edr-agent
+
+[Install]
+WantedBy=multi-user.target

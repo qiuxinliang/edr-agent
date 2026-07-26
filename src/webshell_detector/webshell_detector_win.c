@@ -7,9 +7,12 @@
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
 #include "edr/event_bus.h"
-#include "edr/grpc_client.h"
+#include "edr/ingest_http.h"
+#include "edr/transport_v2.h"
 #include "edr/types.h"
 #include "edr/webshell_forensic.h"
+#include "edr/edr_log.h"
+#include "edr/webshell_semantic.h"
 
 #include <direct.h>
 #include <io.h>
@@ -35,6 +38,8 @@ typedef struct {
 typedef struct {
   char rule_name[128];
   float confidence;
+  float ast_score;
+  float token_score;
   int matched;
 } WebshellRuleMatch;
 
@@ -53,6 +58,9 @@ static WebRoot s_roots[WEBSHELL_MAX_ROOTS];
 static size_t s_root_count;
 static WatchEntry s_watches[WEBSHELL_MAX_WATCHES];
 static size_t s_watch_count;
+static uint64_t s_budget_window_ns;
+static uint64_t s_budget_bytes;
+static uint64_t s_budget_drops;
 
 #ifdef EDR_HAVE_YARA
 static YR_RULES *s_yara_rules;
@@ -75,6 +83,25 @@ static uint64_t now_ns(void) {
     return 0;
   }
   return (u.QuadPart - epoch_100ns) * 100ULL;
+}
+
+static int webshell_scan_budget_allow(uint64_t bytes) {
+  if (!s_cfg || s_cfg->resource_limit.webshell_scan_mb_per_min == 0u) {
+    return 1;
+  }
+  uint64_t now = now_ns();
+  if (s_budget_window_ns == 0u || now < s_budget_window_ns ||
+      now - s_budget_window_ns >= 60000000000ULL) {
+    s_budget_window_ns = now;
+    s_budget_bytes = 0u;
+  }
+  uint64_t cap = (uint64_t)s_cfg->resource_limit.webshell_scan_mb_per_min * 1024ULL * 1024ULL;
+  if (bytes > cap || s_budget_bytes + bytes > cap) {
+    s_budget_drops++;
+    return 0;
+  }
+  s_budget_bytes += bytes;
+  return 1;
 }
 
 static int contains_ci(const char *hay, const char *needle) {
@@ -122,6 +149,9 @@ static int pre_filter(const char *path) {
   }
   uint64_t max_bytes = (uint64_t)s_cfg->webshell_detector.max_file_size_mb * 1024ULL * 1024ULL;
   if ((uint64_t)st.st_size == 0u || (uint64_t)st.st_size > max_bytes) {
+    return 0;
+  }
+  if (!webshell_scan_budget_allow((uint64_t)st.st_size)) {
     return 0;
   }
   __int64 sz1 = st.st_size;
@@ -280,17 +310,29 @@ static int is_rule_file(const char *name) {
   return (_stricmp(dot, ".yar") == 0 || _stricmp(dot, ".yara") == 0) ? 1 : 0;
 }
 
-static int yara_compile_cb(int level, const char *file_name, int line_number, const YR_RULE *rule, const char *msg,
-                           void *user_data) {
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static void yara_compile_cb(int level, const char *file_name, int line_number, const YR_RULE *rule,
+                            const char *msg, void *user_data) {
+#else
+static int yara_compile_cb(int level, const char *file_name, int line_number, const YR_RULE *rule,
+                           const char *msg, void *user_data) {
+#endif
   (void)level;
   (void)rule;
   (void)user_data;
-  fprintf(stderr, "[webshell_detector] yara compile error file=%s line=%d msg=%s\n", file_name ? file_name : "-",
-          line_number, msg ? msg : "-");
+  EDR_LOGE("[webshell_detector] yara compile error file=%s line=%d msg=%s\n", file_name ? file_name : "-", line_number,
+          msg ? msg : "-");
+#if !defined(YR_VERSION_HEX) || YR_VERSION_HEX < 0x040500
   return 0;
+#endif
 }
 
+#if defined(YR_VERSION_HEX) && YR_VERSION_HEX >= 0x040500
+static int yara_scan_cb(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
+  (void)context;
+#else
 static int yara_scan_cb(int message, void *message_data, void *user_data) {
+#endif
   WebshellRuleMatch *m = (WebshellRuleMatch *)user_data;
   if (message == CALLBACK_MSG_RULE_MATCHING && m && !m->matched) {
     const YR_RULE *r = (const YR_RULE *)message_data;
@@ -366,7 +408,7 @@ static int load_yara(const char *dir) {
     return -1;
   }
   yr_compiler_destroy(c);
-  fprintf(stderr, "[webshell_detector] yara rules loaded=%d from %s\n", loaded, dir);
+  EDR_LOGV("[webshell_detector] yara rules loaded=%d from %s\n", loaded, dir);
   return loaded;
 }
 #endif
@@ -405,6 +447,17 @@ static int read_file_text(const char *path, char **out_buf) {
 static int fallback_match(const char *text, WebshellRuleMatch *m) {
   if (!text || !m) {
     return 0;
+  }
+  {
+    EdrWebshellSemanticResult sem;
+    if (edr_webshell_semantic_match_text(text, &sem)) {
+      snprintf(m->rule_name, sizeof(m->rule_name), "%s", sem.rule_name);
+      m->confidence = sem.confidence;
+      m->ast_score = sem.ast_score;
+      m->token_score = sem.token_score;
+      m->matched = 1;
+      return 1;
+    }
   }
   if ((contains_ci(text, "eval(") && contains_ci(text, "$_POST")) ||
       contains_ci(text, "eval(base64_decode($_POST)")) {
@@ -497,7 +550,7 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
       if (s_cfg->agent.tenant_id[0]) {
         tenant = s_cfg->agent.tenant_id;
       }
-      if (edr_grpc_client_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 &&
+      if (edr_transport_v2_upload_file(alert_id, file_path, fp[0] ? fp : "", object_key, sizeof(object_key)) == 0 &&
           object_key[0]) {
         file_uploaded = 1;
       } else {
@@ -516,17 +569,18 @@ static void push_alert(const char *file_path, const char *action, const WebRoot 
   slot.priority = (m->confidence >= s_cfg->webshell_detector.l2_review_threshold) ? 0 : 1;
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=webshell\ndetector=yara\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
-                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s\n",
-                   m->rule_name, m->confidence, file_path, root->service_name, action ? action : "-", url, alert_id,
-                   fp[0] ? fp : "-", file_uploaded, object_key[0] ? object_key : "-", staged_path[0] ? staged_path : "-");
+                   "ETW1\nprov=webshell\ndetector=%s\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
+                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s ast_score=%.3f "
+                   "token_score=%.3f\n",
+                   strncmp(m->rule_name, "WebShell_AST_Token_", 19u) == 0 ? "semantic" : "yara", m->rule_name,
+                   m->confidence, file_path, root->service_name, action ? action : "-", url, alert_id,
+                   fp[0] ? fp : "-", file_uploaded, object_key[0] ? object_key : "-",
+                   staged_path[0] ? staged_path : "-", m->ast_score, m->token_score);
   if (n < 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return;
   }
   slot.size = (uint32_t)n;
-  if (!edr_event_bus_try_push(s_bus, &slot)) {
-    fprintf(stderr, "[webshell_detector] event bus full, drop alert: %s\n", file_path);
-  }
+  (void)edr_event_bus_try_push(s_bus, &slot);
 }
 
 static void handle_change(const char *full_path, const char *action) {
@@ -542,7 +596,7 @@ static void handle_change(const char *full_path, const char *action) {
     return;
   }
   push_alert(full_path, action, root, &m);
-  fprintf(stderr, "[webshell_detector] alert %.2f rule=%s file=%s\n", m.confidence, m.rule_name, full_path);
+  EDR_LOGV("[webshell_detector] alert %.2f rule=%s file=%s\n", m.confidence, m.rule_name, full_path);
 }
 
 static DWORD WINAPI watch_thread_main(LPVOID param) {
@@ -606,12 +660,12 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
   s_bus = bus;
   discover_web_roots();
   if (s_root_count == 0u) {
-    fprintf(stderr, "[webshell_detector] no web roots discovered; set EDR_WEBSHELL_ROOTS to enable\n");
+    EDR_LOGE("%s", "[webshell_detector] no web roots discovered; set EDR_WEBSHELL_ROOTS to enable\n");
     return EDR_OK;
   }
 #ifdef EDR_HAVE_YARA
   if (load_yara(cfg->webshell_detector.webshell_rules_dir) < 0) {
-    fprintf(stderr, "[webshell_detector] yara unavailable, fallback to builtin rules\n");
+    EDR_LOGV("%s", "[webshell_detector] yara unavailable, fallback to builtin rules\n");
   }
 #endif
   InterlockedExchange(&s_stop, 0);
@@ -643,7 +697,7 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
     return EDR_OK;
   }
   s_started = 1;
-  fprintf(stderr, "[webshell_detector] Windows watcher started roots=%zu watches=%zu\n", s_root_count, s_watch_count);
+  EDR_LOGV("[webshell_detector] Windows watcher started roots=%zu watches=%zu\n", s_root_count, s_watch_count);
   return EDR_OK;
 }
 
@@ -676,3 +730,9 @@ void edr_webshell_detector_shutdown(void) {
   unload_yara();
 #endif
 }
+
+unsigned int edr_webshell_detector_watch_count(void) {
+  return (unsigned int)s_watch_count;
+}
+
+uint64_t edr_webshell_detector_budget_drop_count(void) { return s_budget_drops; }

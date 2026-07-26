@@ -1,11 +1,21 @@
 /* §21 PMFE — 队列 + 双扫描线程；Windows：模块基线 + VAD 粗筛 + PE peek + §6 DNS 路径（ASCII 分块）；Linux：maps 粗筛 + process_vm_readv peek + ELF/熵（§9）+ 可选 DNS ASCII */
 
+#ifdef _MSC_VER
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef _CRT_NONSTDC_NO_WARNINGS
+#define _CRT_NONSTDC_NO_WARNINGS
+#endif
+#endif
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
 #include "edr/pmfe.h"
 #include "edr/pid_history_pmfe.h"
+#include "edr/correlation_engine.h"
 
 #include "edr/event_bus.h"
 #include "edr/types.h"
@@ -16,35 +26,40 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #endif
 #include "edr/ave_sdk.h"
 #include "edr/config.h"
+#include "edr/edr_log.h"
 #include "edr/error.h"
 #include "edr/sha256.h"
+#include "edr/response.h"
 
 #if defined(__linux__)
 #include "pmfe_linux_scan_util.h"
 #endif
 
 #include <math.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
+#include "edr/pmfe_idle_scanner.h"
 static const EdrConfig *s_pmfe_cfg;
-#endif
+static EdrPmfeServerScanResultCallback s_server_scan_result_callback;
+static unsigned pmfe_detail_u(const char *d, const char *key);
 
 void edr_pmfe_bind_config(const EdrConfig *cfg) {
-#ifdef _WIN32
   s_pmfe_cfg = cfg;
-#else
-  (void)cfg;
-#endif
+}
+
+const EdrConfig *edr_pmfe_current_config(void) {
+  return s_pmfe_cfg;
 }
 
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -59,7 +74,8 @@ void edr_pmfe_bind_config(const EdrConfig *cfg) {
 
 typedef struct {
   uint32_t pid;
-  char cmd_id[64];
+  char cmd_id[96];
+  EdrPmfeCommandContext command_context;
   uint8_t priority;
   uint8_t band;
   uint8_t force_deep;
@@ -67,6 +83,7 @@ typedef struct {
   uint8_t module_integrity;
   uint8_t dns_path;
   uint8_t peek_cap;
+  uint8_t server_requested;
   /** Windows：`VirtualQueryEx` 精扫窗口中心（用户态 VA）；0 表示未指定（全空间候选逻辑不变）。 */
   uint64_t vad_hint_va;
 } EdrPmfeTask;
@@ -80,10 +97,18 @@ static unsigned s_task_count;
 static volatile LONG s_stat_submitted;
 static volatile LONG s_stat_completed;
 static volatile LONG s_stat_dropped;
+static volatile LONG s_stat_deduped;
+static volatile LONG s_stat_cooldown_skipped;
+
+static LONG pmfe_atomic_load_long(volatile LONG *p) {
+  return InterlockedCompareExchange(p, 0, 0);
+}
 #else
 static volatile unsigned long s_stat_submitted;
 static volatile unsigned long s_stat_completed;
 static volatile unsigned long s_stat_dropped;
+static volatile unsigned long s_stat_deduped;
+static volatile unsigned long s_stat_cooldown_skipped;
 #endif
 
 #ifdef _WIN32
@@ -117,8 +142,37 @@ static EdrEventBus *s_pmfe_bus;
 static uint32_t s_etw_cd_pid[PMFE_ETW_CD_CAP];
 static uint64_t s_etw_cd_ms[PMFE_ETW_CD_CAP];
 
+static void pmfe_stat_inc_deduped(void) {
+#ifdef _WIN32
+  InterlockedIncrement(&s_stat_deduped);
+#else
+  (void)__atomic_add_fetch(&s_stat_deduped, 1ul, __ATOMIC_RELAXED);
+#endif
+}
+
+static void pmfe_stat_inc_cooldown_skipped(void) {
+#ifdef _WIN32
+  InterlockedIncrement(&s_stat_cooldown_skipped);
+#else
+  (void)__atomic_add_fetch(&s_stat_cooldown_skipped, 1ul, __ATOMIC_RELAXED);
+#endif
+}
+
+static int pmfe_task_pending_equiv_locked(const EdrPmfeTask *src) {
+  if (!src || src->force_deep) {
+    return 0;
+  }
+  for (unsigned i = 0, idx = s_task_head; i < s_task_count; i++, idx = (idx + 1u) % PMFE_TASK_CAP) {
+    const EdrPmfeTask *t = &s_task_buf[idx];
+    if (t->pid == src->pid && t->band == src->band && t->vad_hint_va == src->vad_hint_va && !t->force_deep) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void audit_pmfe_line(const char *cmd_id, const char *msg) {
-  fprintf(stderr, "[pmfe][audit] id=%s %s\n", cmd_id ? cmd_id : "", msg);
+  EDR_LOGV("[pmfe][audit] id=%s %s\n", cmd_id ? cmd_id : "", msg);
   const char *ap = getenv("EDR_CMD_AUDIT_PATH");
   if (!ap || !ap[0]) {
     return;
@@ -252,6 +306,21 @@ static int pmfe_module_map_build(HANDLE proc, PmfeModuleRange *out, int max, int
   return 0;
 }
 
+static void pmfe_copy_cstr(char *out, size_t cap, const char *src) {
+  if (!out || cap == 0u) {
+    return;
+  }
+  if (!src) {
+    src = "";
+  }
+  size_t n = strlen(src);
+  if (n >= cap) {
+    n = cap - 1u;
+  }
+  memcpy(out, src, n);
+  out[n] = '\0';
+}
+
 static void pmfe_owner_for_va(const PmfeModuleRange *mods, int nmod, const void *va, char *out, size_t cap) {
   out[0] = '\0';
   if (!va || !out || cap == 0u) {
@@ -266,7 +335,7 @@ static void pmfe_owner_for_va(const PmfeModuleRange *mods, int nmod, const void 
           bn = s + 1;
         }
       }
-      snprintf(out, cap, "%s", bn[0] ? bn : mods[i].path);
+      pmfe_copy_cstr(out, cap, bn[0] ? bn : mods[i].path);
       return;
     }
   }
@@ -390,11 +459,308 @@ static int pmfe_coarse_vad_windows_handle(HANDLE h, unsigned *regions_out, unsig
 
 typedef struct {
   uint8_t *base;
+  uint8_t *allocation_base;
   SIZE_T size;
   DWORD protect;
+  DWORD allocation_protect;
   DWORD type;
   float score;
 } PmfeVadCand;
+
+static int pmfe_win_is_exec(DWORD protect) {
+  return (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                     PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+static void pmfe_win_protection_name(DWORD protect, char *out, size_t cap) {
+  const char *name = "UNKNOWN";
+  switch (protect & 0xffu) {
+    case PAGE_NOACCESS: name = "NOACCESS"; break;
+    case PAGE_READONLY: name = "R"; break;
+    case PAGE_READWRITE: name = "RW"; break;
+    case PAGE_WRITECOPY: name = "WC"; break;
+    case PAGE_EXECUTE: name = "X"; break;
+    case PAGE_EXECUTE_READ: name = "RX"; break;
+    case PAGE_EXECUTE_READWRITE: name = "RWX"; break;
+    case PAGE_EXECUTE_WRITECOPY: name = "RXWC"; break;
+    default: break;
+  }
+  snprintf(out, cap, "%s%s", name, (protect & PAGE_GUARD) ? "+GUARD" : "");
+}
+
+static void pmfe_sha256_bytes(const uint8_t *buf, size_t len, char out65[65]) {
+  static const char hex[] = "0123456789abcdef";
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  EdrSha256Ctx ctx;
+  edr_sha256_init(&ctx);
+  edr_sha256_update(&ctx, buf, len);
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0; i < sizeof(digest); i++) {
+    out65[i * 2u] = hex[digest[i] >> 4];
+    out65[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out65[64] = '\0';
+}
+
+static void pmfe_peek_pe_metadata(const uint8_t *buf, size_t len, EdrPmfeRegionResult *region) {
+  if (!buf || !region || len < 0x40u || buf[0] != 'M' || buf[1] != 'Z') return;
+  uint32_t peoff = (uint32_t)buf[0x3c] | ((uint32_t)buf[0x3d] << 8) |
+                   ((uint32_t)buf[0x3e] << 16) | ((uint32_t)buf[0x3f] << 24);
+  if ((uint64_t)peoff + 28u > len || memcmp(buf + peoff, "PE\0\0", 4u) != 0) return;
+  const uint8_t *fh = buf + peoff + 4u;
+  uint16_t machine = (uint16_t)fh[0] | ((uint16_t)fh[1] << 8);
+  region->pe_sections = (uint16_t)fh[2] | ((uint16_t)fh[3] << 8);
+  region->pe_timestamp = (uint32_t)fh[4] | ((uint32_t)fh[5] << 8) |
+                         ((uint32_t)fh[6] << 16) | ((uint32_t)fh[7] << 24);
+  snprintf(region->pe_arch, sizeof(region->pe_arch), "%s",
+           machine == 0x8664u ? "x64" : (machine == 0x14cu ? "x86" : "other"));
+  const uint8_t *opt = fh + 20u;
+  if ((size_t)(opt - buf) + 20u <= len) {
+    region->pe_entrypoint_rva = (uint32_t)opt[16] | ((uint32_t)opt[17] << 8) |
+                                ((uint32_t)opt[18] << 16) | ((uint32_t)opt[19] << 24);
+  }
+}
+
+static int pmfe_artifact_path(const EdrPmfeTask *task, const char *prefix,
+                              uint64_t base, const char *extension,
+                              char *out, size_t out_cap) {
+  if (!task || !task->server_requested || !task->cmd_id[0] || !out || out_cap == 0u) return 0;
+  out[0] = '\0';
+  char root[1024];
+  const char *configured = getenv("EDR_RESPONSE_ARTIFACT_DIR");
+  if (configured && configured[0]) {
+    pmfe_copy_cstr(root, sizeof(root), configured);
+  } else if (s_pmfe_cfg && s_pmfe_cfg->shellcode_detector.forensic_dir[0]) {
+    pmfe_copy_cstr(root, sizeof(root), s_pmfe_cfg->shellcode_detector.forensic_dir);
+  } else {
+    DWORD n = GetTempPathA((DWORD)sizeof(root), root);
+    if (n == 0u || n >= sizeof(root)) snprintf(root, sizeof(root), ".\\");
+    size_t used = strlen(root);
+    snprintf(root + used, sizeof(root) - used, "edr_response");
+  }
+  (void)CreateDirectoryA(root, NULL);
+  char safe[96];
+  snprintf(safe, sizeof(safe), "%s", task->cmd_id);
+  for (char *p = safe; *p; p++) {
+    if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_')) *p = '_';
+  }
+  if (strlen(root) + strlen(safe) + strlen(prefix ? prefix : "pmfe") + 48u >= out_cap) return 0;
+  char suffix[64];
+  snprintf(suffix, sizeof(suffix), "_%llx.%s", (unsigned long long)base,
+           extension ? extension : "bin");
+  pmfe_copy_cstr(out, out_cap, root);
+  strncat(out, "\\", out_cap - strlen(out) - 1u);
+  strncat(out, prefix ? prefix : "pmfe", out_cap - strlen(out) - 1u);
+  strncat(out, "_", out_cap - strlen(out) - 1u);
+  strncat(out, safe, out_cap - strlen(out) - 1u);
+  strncat(out, suffix, out_cap - strlen(out) - 1u);
+  return 1;
+}
+
+static void pmfe_write_region_artifact(const EdrPmfeTask *task, EdrPmfeRegionResult *region,
+                                       const uint8_t *buf, size_t len) {
+  if (!task || !region || !buf || len == 0u ||
+      !pmfe_artifact_path(task, "pmfe_region", region->base, "bin",
+                          region->artifact_path, sizeof(region->artifact_path))) return;
+  FILE *fp = fopen(region->artifact_path, "wb");
+  if (!fp || fwrite(buf, 1, len, fp) != len) {
+    if (fp) fclose(fp);
+    region->artifact_path[0] = '\0';
+    return;
+  }
+  fclose(fp);
+}
+
+static uint16_t pmfe_u16(const uint8_t *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t pmfe_u32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void pmfe_hex_preview(const uint8_t *buf, size_t len, char *out, size_t cap) {
+  static const char hex[] = "0123456789abcdef";
+  size_t count = len;
+  if (count > (cap - 1u) / 2u) count = (cap - 1u) / 2u;
+  for (size_t i = 0; i < count; i++) {
+    out[i * 2u] = hex[buf[i] >> 4];
+    out[i * 2u + 1u] = hex[buf[i] & 0x0fu];
+  }
+  out[count * 2u] = '\0';
+}
+
+static void pmfe_reconstruct_pe(HANDLE proc, const EdrPmfeTask *task,
+                                EdrPmfeRegionResult *region,
+                                const uint8_t *sample, size_t sample_len) {
+  if (!proc || !task || !region || !sample || sample_len < 0x100u ||
+      sample[0] != 'M' || sample[1] != 'Z') {
+    if (region) snprintf(region->reconstruction_status,
+                         sizeof(region->reconstruction_status), "%s", "not_pe");
+    return;
+  }
+  uint32_t peoff = pmfe_u32(sample + 0x3cu);
+  if ((uint64_t)peoff + 24u > sample_len ||
+      memcmp(sample + peoff, "PE\0\0", 4u) != 0) {
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "invalid_pe");
+    return;
+  }
+  const uint8_t *file_header = sample + peoff + 4u;
+  uint16_t section_count = pmfe_u16(file_header + 2u);
+  uint16_t optional_size = pmfe_u16(file_header + 16u);
+  const uint8_t *optional = file_header + 20u;
+  if (section_count == 0u || section_count > 96u ||
+      (size_t)(optional - sample) + optional_size > sample_len || optional_size < 64u) {
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "invalid_headers");
+    return;
+  }
+  uint16_t magic = pmfe_u16(optional);
+  if (magic != 0x10bu && magic != 0x20bu) {
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "unsupported_pe");
+    return;
+  }
+  uint32_t size_of_image = pmfe_u32(optional + 56u);
+  uint32_t size_of_headers = pmfe_u32(optional + 60u);
+  uint32_t entrypoint_rva = pmfe_u32(optional + 16u);
+  size_t section_table_offset = (size_t)(optional - sample) + optional_size;
+  if (section_table_offset + (size_t)section_count * 40u > sample_len ||
+      size_of_headers == 0u || size_of_image == 0u) {
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "invalid_sections");
+    return;
+  }
+  size_t reconstruct_cap = 32u * 1024u * 1024u;
+  const char *cap_env = getenv("EDR_PMFE_RECONSTRUCT_MAX");
+  if (cap_env && cap_env[0]) {
+    unsigned long v = strtoul(cap_env, NULL, 10);
+    if (v >= 1024ul * 1024ul && v <= 128ul * 1024ul * 1024ul) reconstruct_cap = (size_t)v;
+  }
+  size_t output_size = size_of_headers;
+  for (uint16_t i = 0; i < section_count; i++) {
+    const uint8_t *section = sample + section_table_offset + (size_t)i * 40u;
+    uint32_t raw_size = pmfe_u32(section + 16u);
+    uint32_t raw_offset = pmfe_u32(section + 20u);
+    uint64_t end = (uint64_t)raw_offset + raw_size;
+    if (end > output_size) output_size = (size_t)end;
+  }
+  if (output_size == 0u || output_size > reconstruct_cap || size_of_image > reconstruct_cap) {
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "size_limit");
+    return;
+  }
+  uint8_t *output = (uint8_t *)calloc(1u, output_size);
+  if (!output) {
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "allocation_failed");
+    return;
+  }
+  int partial = 0;
+  SIZE_T read = 0u;
+  SIZE_T headers_to_read = size_of_headers < output_size ? size_of_headers : output_size;
+  if (!ReadProcessMemory(proc, (void *)(uintptr_t)region->base, output,
+                         headers_to_read, &read) || read < headers_to_read) partial = 1;
+  for (uint16_t i = 0; i < section_count; i++) {
+    const uint8_t *section = sample + section_table_offset + (size_t)i * 40u;
+    uint32_t virtual_size = pmfe_u32(section + 8u);
+    uint32_t virtual_address = pmfe_u32(section + 12u);
+    uint32_t raw_size = pmfe_u32(section + 16u);
+    uint32_t raw_offset = pmfe_u32(section + 20u);
+    if (raw_size == 0u || raw_offset >= output_size || virtual_address >= size_of_image) continue;
+    SIZE_T to_read = raw_size;
+    if (virtual_size > 0u && to_read > virtual_size) to_read = virtual_size;
+    if ((uint64_t)raw_offset + to_read > output_size) to_read = output_size - raw_offset;
+    read = 0u;
+    if (!ReadProcessMemory(proc, (void *)(uintptr_t)(region->base + virtual_address),
+                           output + raw_offset, to_read, &read) || read < to_read) partial = 1;
+  }
+  if (entrypoint_rva < size_of_image) {
+    uint8_t preview[64];
+    read = 0u;
+    if (ReadProcessMemory(proc, (void *)(uintptr_t)(region->base + entrypoint_rva),
+                          preview, sizeof(preview), &read) && read > 0u) {
+      pmfe_hex_preview(preview, (size_t)read, region->entrypoint_preview_hex,
+                       sizeof(region->entrypoint_preview_hex));
+    }
+  }
+  if (!pmfe_artifact_path(task, "pmfe_reconstructed", region->base, "pe.bin",
+                          region->reconstructed_path, sizeof(region->reconstructed_path))) {
+    free(output);
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "path_failed");
+    return;
+  }
+  FILE *fp = fopen(region->reconstructed_path, "wb");
+  if (!fp || fwrite(output, 1, output_size, fp) != output_size) {
+    if (fp) fclose(fp);
+    free(output);
+    region->reconstructed_path[0] = '\0';
+    snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s", "write_failed");
+    return;
+  }
+  fclose(fp);
+  pmfe_sha256_bytes(output, output_size, region->reconstructed_sha256);
+  free(output);
+  snprintf(region->reconstruction_status, sizeof(region->reconstruction_status), "%s",
+           partial ? "partial" : "complete");
+}
+
+typedef LONG(NTAPI *PmfeNtQueryInformationThread)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+static void pmfe_map_thread_starts(uint32_t pid, EdrPmfeScanResult *result) {
+  if (!result) return;
+  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  PmfeNtQueryInformationThread query = ntdll
+      ? (PmfeNtQueryInformationThread)(void *)GetProcAddress(ntdll, "NtQueryInformationThread")
+      : NULL;
+  if (!query) {
+    result->thread_query_failures++;
+    return;
+  }
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0u);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    result->thread_query_failures++;
+    return;
+  }
+  THREADENTRY32 entry;
+  memset(&entry, 0, sizeof(entry));
+  entry.dwSize = sizeof(entry);
+  if (!Thread32First(snapshot, &entry)) {
+    CloseHandle(snapshot);
+    result->thread_query_failures++;
+    return;
+  }
+  do {
+    if (entry.th32OwnerProcessID != pid) continue;
+    result->threads_total++;
+    HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+    if (!thread) {
+      result->thread_query_failures++;
+      continue;
+    }
+    PVOID start = NULL;
+    LONG status = query(thread, 9u, &start, (ULONG)sizeof(start), NULL);
+    CloseHandle(thread);
+    if (status < 0 || !start) {
+      result->thread_query_failures++;
+      continue;
+    }
+    uint64_t address = (uint64_t)(uintptr_t)start;
+    for (uint8_t i = 0; i < result->region_count; i++) {
+      EdrPmfeRegionResult *region = &result->regions[i];
+      if (address < region->base || address >= region->base + region->size_bytes) continue;
+      if (region->thread_start_count < EDR_PMFE_MAX_THREAD_STARTS) {
+        EdrPmfeThreadStart *thread_start = &region->thread_starts[region->thread_start_count++];
+        thread_start->tid = entry.th32ThreadID;
+        thread_start->start_address = address;
+      }
+      result->thread_start_matches++;
+      if (!strstr(region->reason, "thread_start")) {
+        strncat(region->reason, ",thread_start",
+                sizeof(region->reason) - strlen(region->reason) - 1u);
+      }
+      if (region->score < 0.92f) region->score = 0.92f;
+      break;
+    }
+  } while (Thread32Next(snapshot, &entry));
+  CloseHandle(snapshot);
+}
 
 /** 任意长度字节串 Shannon 熵（DNS 等短串亦可用） */
 static float pmfe_shannon_entropy_bytes(const uint8_t *b, size_t n) {
@@ -574,7 +940,7 @@ static void pmfe_scan_dns_ascii_in_buf(const uint8_t *buf, size_t len, unsigned 
     (*hits)++;
     if (sc > *best_score) {
       *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", tmp);
+      pmfe_copy_cstr(best_dom, best_cap, tmp);
       if (best_owner && owner_cap > 0u) {
         void *hit_va = (void *)(region_base + region_off + start);
         pmfe_owner_for_va(mods, nmod, hit_va, best_owner, owner_cap);
@@ -695,7 +1061,7 @@ static void pmfe_scan_dns_wire_in_buf(const uint8_t *buf, size_t len, unsigned *
     (*hits)++;
     if (sc > *best_score) {
       *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", qname);
+      pmfe_copy_cstr(best_dom, best_cap, qname);
       if (best_owner && owner_cap > 0u) {
         void *hit_va = (void *)(region_base + region_off + i);
         pmfe_owner_for_va(mods, nmod, hit_va, best_owner, owner_cap);
@@ -758,7 +1124,7 @@ static void pmfe_scan_dns_utf16_in_buf(const uint8_t *buf, size_t len, unsigned 
     (*hits)++;
     if (sc > *best_score) {
       *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", tmp);
+      pmfe_copy_cstr(best_dom, best_cap, tmp);
       if (best_owner && owner_cap > 0u) {
         void *hit_va = (void *)(region_base + region_off + start);
         pmfe_owner_for_va(mods, nmod, hit_va, best_owner, owner_cap);
@@ -831,7 +1197,8 @@ static int pmfe_vad_region_in_hint_window(uint8_t *base, SIZE_T sz, uint64_t hin
 }
 
 static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_req, int full_vad, int dns_path,
-                                   uint64_t vad_hint_va, char *extra, size_t extra_cap) {
+                                   uint64_t vad_hint_va, char *extra, size_t extra_cap,
+                                   const EdrPmfeTask *task, EdrPmfeScanResult *result) {
   extra[0] = '\0';
   const char *peek_ev = getenv("EDR_PMFE_VAD_PEEK");
   int peek_n = (int)peek_cap_req;
@@ -869,8 +1236,10 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
         continue;
       }
       pool[np].base = rb;
+      pool[np].allocation_base = (uint8_t *)mbi.AllocationBase;
       pool[np].size = mbi.RegionSize;
       pool[np].protect = mbi.Protect;
+      pool[np].allocation_protect = mbi.AllocationProtect;
       pool[np].type = mbi.Type;
       pool[np].score = sc;
       np++;
@@ -885,8 +1254,10 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
     if (VirtualQueryEx(proc, (void *)(uintptr_t)vad_hint_va, &mbi, sizeof(mbi)) == sizeof(mbi) &&
         mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_GUARD) == 0 && (mbi.Protect & PAGE_NOACCESS) == 0) {
       pool[0].base = (uint8_t *)mbi.BaseAddress;
+      pool[0].allocation_base = (uint8_t *)mbi.AllocationBase;
       pool[0].size = mbi.RegionSize;
       pool[0].protect = mbi.Protect;
+      pool[0].allocation_protect = mbi.AllocationProtect;
       pool[0].type = mbi.Type;
       pool[0].score = 1000.f;
       np = 1;
@@ -907,15 +1278,70 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
   const char *ave_tmp = getenv("EDR_PMFE_AVE_TEMPFILE");
   int do_ave = (ave_tmp && ave_tmp[0] == '1' && s_pmfe_cfg);
 
+  size_t sample_max = 64u * 1024u;
+  const char *sample_ev = getenv("EDR_PMFE_REGION_SAMPLE_MAX");
+  if (sample_ev && sample_ev[0]) {
+    unsigned long v = strtoul(sample_ev, NULL, 10);
+    if (v >= 512ul && v <= 1024ul * 1024ul) sample_max = (size_t)v;
+  }
+  if (task && task->command_context.requested_region_size > 0u &&
+      task->command_context.requested_region_size < sample_max) {
+    sample_max = (size_t)task->command_context.requested_region_size;
+  }
+  EdrForensicYaraSession *yara_session = NULL;
+  const char *yara_disabled = getenv("EDR_PMFE_YARA");
+  if (task && task->server_requested && task->cmd_id[0] && task->command_context.yara_mode != 2u &&
+      !(yara_disabled && yara_disabled[0] == '0')) {
+    char yara_error[160];
+    yara_session = edr_response_yara_session_open(yara_error, sizeof(yara_error));
+    if (!yara_session && result && !result->warning[0]) {
+      snprintf(result->warning, sizeof(result->warning), "YARA not available: %.180s", yara_error);
+    }
+  }
   for (int i = 0; i < peek_n; i++) {
-    uint8_t buf[512];
-    SIZE_T to_read = pool[i].size < sizeof(buf) ? pool[i].size : sizeof(buf);
+    EdrPmfeRegionResult *region = NULL;
+    if (result && result->region_count < EDR_PMFE_MAX_REGIONS) {
+      region = &result->regions[result->region_count++];
+      memset(region, 0, sizeof(*region));
+      region->base = (uint64_t)(uintptr_t)pool[i].base;
+      region->allocation_base = (uint64_t)(uintptr_t)pool[i].allocation_base;
+      region->size_bytes = (uint64_t)pool[i].size;
+      region->protection = (uint32_t)pool[i].protect;
+      region->memory_type = (uint32_t)pool[i].type;
+      region->score = pool[i].score >= 100.f ? 1.f : pool[i].score / 100.f;
+      pmfe_win_protection_name(pool[i].protect, region->protection_name,
+                               sizeof(region->protection_name));
+      pmfe_win_protection_name(pool[i].allocation_protect,
+                               region->allocation_protection_name,
+                               sizeof(region->allocation_protection_name));
+      if (pool[i].type != MEM_PRIVATE) {
+        (void)GetMappedFileNameA(proc, pool[i].base, region->mapped_path,
+                                 (DWORD)sizeof(region->mapped_path));
+      }
+      snprintf(region->kind, sizeof(region->kind), "%s",
+               pool[i].type == MEM_PRIVATE ? (pmfe_win_is_exec(pool[i].protect) ? "private_exec" : "private") :
+               (pool[i].type == MEM_IMAGE ? "image" : "mapped"));
+      snprintf(region->reason, sizeof(region->reason), "%s",
+               pool[i].type == MEM_PRIVATE && pmfe_win_is_exec(pool[i].protect) ? "private_exec" : "ranked_candidate");
+    }
+    SIZE_T to_read = pool[i].size < sample_max ? pool[i].size : (SIZE_T)sample_max;
     if (to_read == 0u) {
+      continue;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)to_read);
+    if (!buf) {
+      if (result) result->read_failures++;
       continue;
     }
     SIZE_T br = 0;
     if (!ReadProcessMemory(proc, pool[i].base, buf, to_read, &br) || br < 2u) {
+      if (result) result->read_failures++;
+      free(buf);
       continue;
+    }
+    if (result) {
+      result->regions_read++;
+      result->bytes_sampled += (uint64_t)br;
     }
     float ent = pmfe_shannon_bits(buf, (size_t)br);
     if (ent > ent_max) {
@@ -923,6 +1349,38 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
     }
     if (buf[0] == 'M' && buf[1] == 'Z') {
       mz++;
+    }
+    if (region) {
+      region->read_ok = 1u;
+      region->bytes_sampled = (uint64_t)br;
+      region->entropy = ent;
+      region->mz_found = (buf[0] == 'M' && buf[1] == 'Z') ? 1u : 0u;
+      pmfe_sha256_bytes(buf, (size_t)br, region->sha256);
+      if (region->mz_found) {
+        strncat(region->reason, ",mz_header", sizeof(region->reason) - strlen(region->reason) - 1u);
+        pmfe_peek_pe_metadata(buf, (size_t)br, region);
+      }
+      if (ent >= 7.2f) {
+        strncat(region->reason, ",high_entropy", sizeof(region->reason) - strlen(region->reason) - 1u);
+      }
+      if (yara_session && region && i < 3) {
+        size_t yara_count = 0u;
+        char yara_error[160];
+        int yara_rc = edr_response_yara_session_scan(
+            yara_session, task->cmd_id, buf, (size_t)br, region->yara_hits,
+            EDR_PMFE_MAX_YARA_HITS, &yara_count, yara_error, sizeof(yara_error));
+        region->yara_hit_count = (uint8_t)yara_count;
+        if (yara_count > 0u) {
+          strncat(region->reason, ",yara_match", sizeof(region->reason) - strlen(region->reason) - 1u);
+          if (region->score < 0.95f) region->score = 0.95f;
+        } else if (result && yara_rc != 0 && !result->warning[0]) {
+          snprintf(result->warning, sizeof(result->warning), "YARA not completed: %.180s", yara_error);
+        }
+      }
+      if (i < 3) pmfe_write_region_artifact(task, region, buf, (size_t)br);
+      if (i < 3 && task && task->server_requested && region->mz_found) {
+        pmfe_reconstruct_pe(proc, task, region, buf, (size_t)br);
+      }
     }
     if (do_ave && buf[0] == 'M' && buf[1] == 'Z' && ave_probes < 3) {
       char td[MAX_PATH];
@@ -948,7 +1406,9 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
         }
       }
     }
+    free(buf);
   }
+  edr_response_yara_session_close(yara_session);
 
   unsigned dns_ascii_hits = 0;
   unsigned dns_utf16_hits = 0;
@@ -981,10 +1441,16 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
     snprintf(extra, extra_cap, "vad_peek=%d mz_hits=%d ent_max=%.2f ave_probes=%d ave_max_score=%.3f full_vad=%d", peek_n, mz,
              (double)ent_max, ave_probes, (double)ave_max_score, full_vad ? 1 : 0);
   }
+  if (result) {
+    result->mz_hits = (uint32_t)mz;
+    result->entropy_max = ent_max;
+    result->ave_max_score = ave_max_score;
+  }
 #undef PMFE_VAD_POOL
 }
 
-static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detail_cap) {
+static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detail_cap,
+                             EdrPmfeScanResult *result) {
   uint32_t pid = task->pid;
   int do_mod = task->module_integrity != 0u;
   unsigned peek_cap = task->peek_cap == 0u ? 4u : (unsigned)task->peek_cap;
@@ -994,13 +1460,22 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
     snprintf(detail, detail_cap, "pid=%u open_process=failed err=%lu", pid, (unsigned long)GetLastError());
     return -1;
   }
+  if (result) {
+    DWORD image_len = (DWORD)sizeof(result->image_path);
+    (void)QueryFullProcessImageNameA(h, 0, result->image_path, &image_len);
+  }
   PmfeBaselineWin bm;
   (void)pmfe_baseline_windows(h, &bm, do_mod);
   unsigned regions = 0, cand = 0;
   (void)pmfe_coarse_vad_windows_handle(h, &regions, &cand);
   char vad_extra[896];
+  if (result) {
+    result->regions_total = regions;
+    result->private_exec = cand;
+  }
   pmfe_win_vad_deep_scan(h, pid, peek_cap, full_vad, task->dns_path != 0u ? 1 : 0, task->vad_hint_va, vad_extra,
-                         sizeof(vad_extra));
+                         sizeof(vad_extra), task, result);
+  pmfe_map_thread_starts(pid, result);
   CloseHandle(h);
 
   char vh[28];
@@ -1012,16 +1487,19 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
 
   if (bm.enum_failed) {
     snprintf(detail, detail_cap,
-             "pid=%u prio=%u band=%u baseline=enum_failed regions=%u private_exec=%u vad_hint=%s%s%s", pid,
+             "pid=%u prio=%u band=%u baseline=enum_failed regions=%u private_exec=%u vad_hint=%.64s%s%.240s", pid,
              (unsigned)task->priority, (unsigned)task->band, regions, cand, vh, vad_extra[0] ? " | " : "",
              vad_extra[0] ? vad_extra : "");
   } else {
     const char *stomp_path = bm.first_stomp_path[0] ? bm.first_stomp_path : "-";
     snprintf(detail, detail_cap,
              "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
-             "first_stomp=%.200s vad_hint=%s%s%s",
+             "first_stomp=%.200s thread_start=unknown executable_private_page=%u private_page_origin=unknown "
+             "cross_process_write=unknown module_path_consistency=%s module_signature=unknown vad_hint=%.64s%s%.240s",
              pid, (unsigned)task->priority, (unsigned)task->band, bm.module_count, bm.stomp_suspicious, bm.disk_hash_ok,
-             regions, cand, stomp_path, vh, vad_extra[0] ? " | " : "", vad_extra[0] ? vad_extra : "");
+             regions, cand, stomp_path, cand ? 1u : 0u, bm.stomp_suspicious ? "mismatch" : "ok", vh,
+             vad_extra[0] ? " | " : "", vad_extra[0] ? vad_extra : "");
+    if (result) result->stomp_suspicious = bm.stomp_suspicious;
   }
   return 0;
 }
@@ -1325,6 +1803,8 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
   unsigned regions = 0u;
   unsigned private_exec = 0u;
   unsigned file_exec_maps = 0u;
+  unsigned memfd_exec = 0u;
+  unsigned deleted_exec = 0u;
   unsigned vm_read_failures = 0u;
   PmfeLinuxMapCand pool[PMFE_LINUX_MAP_POOL];
   int np = 0;
@@ -1343,7 +1823,15 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
     }
     if (strlen(perms) >= 4u && perms[2] == 'x' && perms[3] == 'p') {
       private_exec++;
-      if (strchr(mpathline, '/') != NULL) {
+      int is_memfd = edr_pmfe_linux_path_is_memfd(mpathline);
+      int is_deleted = edr_pmfe_linux_path_is_deleted(mpathline);
+      if (is_memfd) {
+        memfd_exec++;
+      }
+      if (is_deleted) {
+        deleted_exec++;
+      }
+      if (strchr(mpathline, '/') != NULL && !is_memfd && !is_deleted) {
         file_exec_maps++;
       }
     }
@@ -1447,9 +1935,12 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
 
   snprintf(detail, detail_cap,
            "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
-           "file_exec_maps=%u first_stomp=%.200s | %s",
+           "memfd_exec=%u deleted_exec=%u file_exec_maps=%u first_stomp=%.200s thread_start=unknown executable_private_page=%u "
+           "private_page_origin=%s cross_process_write=unknown module_path_consistency=%s module_signature=unknown | %s",
            pid_u, (unsigned)task->priority, (unsigned)task->band, baseline_mods_u, stomp, disk_ok, regions,
-           private_exec, file_exec_maps, stomp_disp, extra);
+           private_exec, memfd_exec, deleted_exec, file_exec_maps, stomp_disp, private_exec ? 1u : 0u,
+           private_exec > file_exec_maps ? "anonymous_or_memfd" : "file_backed",
+           stomp ? "mismatch" : "ok", extra);
   return 0;
 }
 
@@ -1461,17 +1952,33 @@ static int pmfe_scan_stub(uint32_t pid, char *detail, size_t detail_cap) {
 }
 #endif
 
-static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_cap) {
+static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_cap,
+                         EdrPmfeScanResult *result) {
 #ifdef _WIN32
-  return pmfe_scan_windows(task, detail, detail_cap);
+  return pmfe_scan_windows(task, detail, detail_cap, result);
 #elif defined(__linux__)
-  return pmfe_scan_linux(task, detail, detail_cap);
+  int rc = pmfe_scan_linux(task, detail, detail_cap);
+  if (result) {
+    result->regions_total = pmfe_detail_u(detail, "regions=");
+    result->regions_read = pmfe_detail_u(detail, "maps_peek=");
+    result->read_failures = pmfe_detail_u(detail, "vm_read_failures=");
+    result->private_exec = pmfe_detail_u(detail, "private_exec=");
+    result->memfd_exec = pmfe_detail_u(detail, "memfd_exec=");
+    result->deleted_exec = pmfe_detail_u(detail, "deleted_exec=");
+    result->stomp_suspicious = pmfe_detail_u(detail, "stomp_suspicious=");
+    result->mz_hits = pmfe_detail_u(detail, "elf_hits=");
+  }
+  return rc;
 #else
   return pmfe_scan_stub(task->pid, detail, detail_cap);
 #endif
 }
 
 void edr_pmfe_set_event_bus(EdrEventBus *bus) { s_pmfe_bus = bus; }
+
+void edr_pmfe_set_server_scan_result_callback(EdrPmfeServerScanResultCallback callback) {
+  s_server_scan_result_callback = callback;
+}
 
 static unsigned pmfe_detail_u(const char *d, const char *key) {
   const char *p = strstr(d, key);
@@ -1521,7 +2028,7 @@ static void pmfe_detail_copy_token(const char *d, const char *key, char *out, si
 static uint64_t pmfe_wall_time_ns(void) {
 #ifdef _WIN32
   FILETIME ft;
-  GetSystemTimePreciseAsFileTime(&ft);
+  GetSystemTimeAsFileTime(&ft);
   ULARGE_INTEGER u;
   u.LowPart = ft.dwLowDateTime;
   u.HighPart = ft.dwHighDateTime;
@@ -1564,19 +2071,26 @@ static void pmfe_query_target_image(uint32_t pid, char *out, size_t cap) {
 #endif
 }
 
-static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_max) {
-  if (stomp > 0u || dns_hits > 0u || ave_max >= 0.65f) {
+static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_max,
+                                  unsigned private_exec, unsigned mz_hits, unsigned memfd_exec,
+                                  unsigned deleted_exec,
+                                  unsigned thread_start_matches, int injection_observed) {
+  if (stomp > 0u || dns_hits > 0u || ave_max >= 0.65f ||
+      (private_exec > 0u && mz_hits > 0u) ||
+      (thread_start_matches > 0u && private_exec > 0u) || memfd_exec > 0u || deleted_exec > 0u ||
+      injection_observed) {
     return 0u;
   }
   return 1u;
 }
 
 /**
- * 经 `edr_event_bus_try_push` → 预处理 → `EdrBehaviorRecord` → `edr_event_batch_push` → gRPC（与 ETW 同源）。
+ * 经 `edr_event_bus_try_push` → 预处理 → `EdrBehaviorRecord` → `edr_event_batch_push` → HTTP ingest（与 ETW 同源）。
  * `EDR_PMFE_EMIT_ALERTS=0` 关闭；`EDR_PMFE_EMIT_MZ=1` 时在无 stomp/dns/ave 信号下仍上报「仅 MZ 命中」类结果。
  * Linux：`elf_hits=` 仅由 `EDR_PMFE_EMIT_ELF=1` 控制上报，与 `EDR_PMFE_EMIT_MZ` 无关。
  */
-static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detail) {
+static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detail,
+                                      const EdrPmfeScanResult *scan_result) {
   if (!task || !detail || !detail[0]) {
     return;
   }
@@ -1587,10 +2101,11 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   if (!s_pmfe_bus) {
     return;
   }
-  if (strstr(detail, "open_process=failed")) {
+  int shellcode_followup = strncmp(task->cmd_id, "etw:shellcode:", 14u) == 0;
+  if (!shellcode_followup && strstr(detail, "open_process=failed")) {
     return;
   }
-  if (strstr(detail, "maps_open_failed")) {
+  if (!shellcode_followup && strstr(detail, "maps_open_failed")) {
     return;
   }
   unsigned stomp = pmfe_detail_u(detail, "stomp_suspicious=");
@@ -1600,10 +2115,17 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   int elf = pmfe_detail_i(detail, "elf_hits=");
   float ave_max = pmfe_detail_f(detail, "ave_max_score=");
   float dns_best = pmfe_detail_f(detail, "dns_best=");
+  unsigned private_exec = scan_result ? scan_result->private_exec : pmfe_detail_u(detail, "private_exec=");
+  unsigned memfd_exec = scan_result ? scan_result->memfd_exec : pmfe_detail_u(detail, "memfd_exec=");
+  unsigned deleted_exec = scan_result ? scan_result->deleted_exec : pmfe_detail_u(detail, "deleted_exec=");
+  unsigned mz_hits = scan_result ? scan_result->mz_hits : (unsigned)(mz > 0 ? mz : (elf > 0 ? elf : 0));
+  unsigned thread_start_matches = scan_result ? scan_result->thread_start_matches : 0u;
+  unsigned read_failures = scan_result ? scan_result->read_failures : pmfe_detail_u(detail, "vm_read_failures=");
+  int injection_observed = scan_result && scan_result->injection_observed != 0u;
   char dns_sample[256];
   pmfe_detail_copy_token(detail, "dns_sample=", dns_sample, sizeof(dns_sample));
 
-  int want = 0;
+  int want = shellcode_followup;
   if (stomp > 0u) {
     want = 1;
   }
@@ -1611,6 +2133,13 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
     want = 1;
   }
   if (ave_max >= 0.5f) {
+    want = 1;
+  }
+  if ((private_exec > 0u && mz_hits > 0u) ||
+      (thread_start_matches > 0u && private_exec > 0u) || injection_observed) {
+    want = 1;
+  }
+  if (memfd_exec > 0u || deleted_exec > 0u) {
     want = 1;
   }
   const char *mz_env = getenv("EDR_PMFE_EMIT_MZ");
@@ -1658,7 +2187,26 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   if (ave_max > score) {
     score = ave_max;
   }
-  if (score < 0.35f) {
+  if (private_exec > 0u && mz_hits > 0u && score < 0.90f) {
+    score = 0.90f;
+  }
+  if (thread_start_matches > 0u && private_exec > 0u && score < 0.92f) {
+    score = 0.92f;
+  }
+  if (injection_observed && score < 0.94f) {
+    score = 0.94f;
+  }
+  if (memfd_exec > 0u && score < 0.92f) {
+    score = 0.92f;
+  }
+  if (deleted_exec > 0u && score < 0.88f) {
+    score = 0.88f;
+  }
+  int clean_followup = shellcode_followup && scan_result && strcmp(scan_result->verdict, "clean") == 0;
+  if (clean_followup) {
+    score = 0.05f;
+  }
+  if (!clean_followup && score < 0.35f) {
     score = 0.35f;
   }
   if (score > 1.f) {
@@ -1669,34 +2217,57 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = pmfe_wall_time_ns();
   slot.type = EDR_EVENT_PMFE_SCAN_RESULT;
-  slot.priority = pmfe_emit_priority(stomp, dns_hits, ave_max);
+  slot.priority = pmfe_emit_priority(stomp, dns_hits, ave_max, private_exec, mz_hits, memfd_exec, deleted_exec,
+                                     thread_start_matches, injection_observed);
   slot.consumed = false;
   slot.attack_surface_hint = 0u;
 
   const char *cid = task->cmd_id[0] ? task->cmd_id : "-";
+  const char *source_alert_id = shellcode_followup ? task->cmd_id + 14u : "";
+  const char *status = scan_result && scan_result->status[0] ? scan_result->status : "unknown";
+  const char *verdict = scan_result && scan_result->verdict[0] ? scan_result->verdict : "inconclusive";
+  int suspicious = strcmp(verdict, "suspicious") == 0;
   int n = snprintf((char *)slot.data, sizeof(slot.data),
-                   "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=T1055\n"
+                   "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nfollowup_only=%u\nsource_alert_id=%.63s\n"
+                   "pmfe_status=%s\npmfe_verdict=%s\nprivate_exec=%u\nmemfd_exec=%u\ndeleted_exec=%u\nmz_hits=%u\n"
+                   "stomp_suspicious=%u\nthread_start_matches=%u\nread_failures=%u\n"
+                   "injection_observed=%u\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=%s\n"
                    "detector=pmfe\n",
-                   task->pid, cid, img[0] ? img : "-", cmdline_buf, dns_sample[0] ? dns_sample : "-", score);
+                   task->pid, cid, (unsigned)shellcode_followup, source_alert_id, status, verdict,
+                   private_exec, memfd_exec, deleted_exec, mz_hits, stomp, thread_start_matches, read_failures,
+                   (unsigned)injection_observed, img[0] ? img : "-", cmdline_buf,
+                   dns_sample[0] ? dns_sample : "-", score,
+                   suspicious ? "T1055" : "-");
   if (n < 0 || (size_t)n >= sizeof(slot.data)) {
     return;
   }
   slot.size = (uint32_t)n;
-  if (edr_event_bus_try_push(s_pmfe_bus, &slot)) {
-    return;
-  }
-  {
-    static time_t s_pmfe_bus_warn_last_sec;
-    static unsigned s_pmfe_bus_drops_since_log;
-    s_pmfe_bus_drops_since_log++;
-    time_t now = time(NULL);
-    if (s_pmfe_bus_warn_last_sec == 0 || now - s_pmfe_bus_warn_last_sec >= 5) {
-      fprintf(stderr, "[pmfe] event bus full, dropped PMFE scan result (count since last log: %u)\n",
-              s_pmfe_bus_drops_since_log);
-      s_pmfe_bus_warn_last_sec = now;
-      s_pmfe_bus_drops_since_log = 0u;
-    }
-  }
+  (void)edr_event_bus_try_push(s_pmfe_bus, &slot);
+}
+
+static uint64_t pmfe_result_clock_ms(void) {
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64();
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+#endif
+}
+
+static uint64_t pmfe_result_unix_ms(void) {
+#ifdef _WIN32
+  FILETIME ft;
+  ULARGE_INTEGER u;
+  GetSystemTimeAsFileTime(&ft);
+  u.LowPart = ft.dwLowDateTime;
+  u.HighPart = ft.dwHighDateTime;
+  return (u.QuadPart - 116444736000000000ull) / 10000ull;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+#endif
 }
 
 static void pmfe_worker_body(void) {
@@ -1734,15 +2305,99 @@ static void pmfe_worker_body(void) {
 #endif
 
     char detail[1024];
-    int sr = pmfe_run_scan(&task, detail, sizeof(detail));
+    EdrPmfeScanResult scan_result;
+    memset(&scan_result, 0, sizeof(scan_result));
+    snprintf(scan_result.schema, sizeof(scan_result.schema), "%s", EDR_PMFE_RESULT_SCHEMA);
+    scan_result.pid = task.pid;
+    scan_result.started_unix_ms = pmfe_result_unix_ms();
+    scan_result.injection_age_ms = -1;
+    snprintf(scan_result.cross_process_write_status,
+             sizeof(scan_result.cross_process_write_status), "%s", "not_observed");
+    uint64_t started_clock_ms = pmfe_result_clock_ms();
+    int sr = pmfe_run_scan(&task, detail, sizeof(detail), &scan_result);
     (void)sr;
     if (detail[0] == '\0') {
       snprintf(detail, sizeof(detail), "pid=%u scan_failed", task.pid);
     }
-    fprintf(stderr, "[pmfe] scan_done %s\n", detail);
+    scan_result.finished_unix_ms = pmfe_result_unix_ms();
+    scan_result.duration_ms = pmfe_result_clock_ms() - started_clock_ms;
+    scan_result.dns_hits = pmfe_detail_u(detail, "dns_ascii_hits=") +
+                           pmfe_detail_u(detail, "dns_utf16_hits=") +
+                           pmfe_detail_u(detail, "dns_wire_hits=");
+    scan_result.dns_best = pmfe_detail_f(detail, "dns_best=");
+    pmfe_detail_copy_token(detail, "dns_sample=", scan_result.dns_sample, sizeof(scan_result.dns_sample));
+    pmfe_detail_copy_token(detail, "dns_owner=", scan_result.dns_owner, sizeof(scan_result.dns_owner));
+    pmfe_detail_copy_token(detail, "module_path_consistency=", scan_result.module_consistency,
+                           sizeof(scan_result.module_consistency));
+    scan_result.truncated = scan_result.private_exec > scan_result.region_count ? 1u : 0u;
+#ifdef _WIN32
+    {
+      EdrCorrelationInjectionObservation observation;
+      if (edr_correlation_latest_injection(task.pid, &observation)) {
+        int64_t age_ms = -1;
+        if (observation.event_time_ns > 0) {
+          int64_t event_ms = observation.event_time_ns / 1000000ll;
+          age_ms = (int64_t)scan_result.started_unix_ms - event_ms;
+        }
+        int64_t correlation_window_ms = 15ll * 60ll * 1000ll;
+        const char *window_env = getenv("EDR_PMFE_INJECTION_CORRELATION_MS");
+        if (window_env && window_env[0]) {
+          long long configured = strtoll(window_env, NULL, 10);
+          if (configured >= 1000ll && configured <= 24ll * 60ll * 60ll * 1000ll) {
+            correlation_window_ms = configured;
+          }
+        }
+        if (age_ms >= -60000ll && age_ms <= correlation_window_ms) {
+          scan_result.injection_observed = 1u;
+          scan_result.injection_event_time_ns = observation.event_time_ns;
+          scan_result.injection_age_ms = age_ms;
+          snprintf(scan_result.injection_technique,
+                   sizeof(scan_result.injection_technique), "%s",
+                   observation.technique);
+          snprintf(scan_result.injection_source,
+                   sizeof(scan_result.injection_source), "%s",
+                   observation.source);
+        }
+      }
+    }
+#endif
+    if (sr != 0) {
+      snprintf(scan_result.status, sizeof(scan_result.status), "%s", "failed");
+      snprintf(scan_result.verdict, sizeof(scan_result.verdict), "%s", "inconclusive");
+    } else if (scan_result.read_failures > 0u) {
+      snprintf(scan_result.status, sizeof(scan_result.status), "%s", "partial");
+      int suspicious = scan_result.stomp_suspicious > 0u || scan_result.mz_hits > 0u ||
+                       scan_result.private_exec > 0u || scan_result.dns_hits > 0u ||
+                       scan_result.memfd_exec > 0u || scan_result.deleted_exec > 0u ||
+                       scan_result.ave_max_score >= 0.5f ||
+                       scan_result.thread_start_matches > 0u ||
+                       scan_result.injection_observed;
+      snprintf(scan_result.verdict, sizeof(scan_result.verdict), "%s",
+               suspicious ? "suspicious" : "inconclusive");
+      size_t warning_len = strlen(scan_result.warning);
+      snprintf(scan_result.warning + warning_len, sizeof(scan_result.warning) - warning_len,
+               "%s%u suspicious regions could not be read",
+               warning_len ? "; " : "", scan_result.read_failures);
+    } else if (scan_result.stomp_suspicious > 0u || scan_result.mz_hits > 0u ||
+               scan_result.private_exec > 0u || scan_result.dns_hits > 0u ||
+               scan_result.memfd_exec > 0u || scan_result.deleted_exec > 0u ||
+               scan_result.ave_max_score >= 0.5f ||
+               scan_result.thread_start_matches > 0u ||
+               scan_result.injection_observed) {
+      snprintf(scan_result.status, sizeof(scan_result.status), "%s", "completed_suspicious");
+      snprintf(scan_result.verdict, sizeof(scan_result.verdict), "%s", "suspicious");
+    } else {
+      snprintf(scan_result.status, sizeof(scan_result.status), "%s", "completed_clean");
+      snprintf(scan_result.verdict, sizeof(scan_result.verdict), "%s", "clean");
+    }
+    EDR_LOGV("[pmfe] scan_done %s\n", detail);
     audit_pmfe_line(task.cmd_id[0] ? task.cmd_id : "-", detail);
     edr_pid_history_pmfe_ingest_scan_detail(task.pid, detail);
-    pmfe_try_emit_scan_result(&task, detail);
+    pmfe_try_emit_scan_result(&task, detail, &scan_result);
+    if (task.server_requested && task.cmd_id[0] && s_server_scan_result_callback) {
+      s_server_scan_result_callback(task.cmd_id, task.pid, sr, detail, &scan_result,
+                                    &task.command_context);
+    }
 
 #ifdef _WIN32
     InterlockedIncrement(&s_stat_completed);
@@ -1783,7 +2438,7 @@ void edr_pmfe_on_process_lifecycle_hint(void) {
 }
 
 static void pmfe_try_deferred_listen_refresh(void) {
-  LONG64 w = s_defer_listen_refresh_at_ms;
+  LONG64 w = InterlockedCompareExchange64(&s_defer_listen_refresh_at_ms, 0, 0);
   if (w == 0) {
     return;
   }
@@ -1802,16 +2457,19 @@ static DWORD WINAPI pmfe_listen_poll_main(void *arg) {
   InterlockedExchange64(&s_defer_listen_refresh_at_ms, 0);
   for (;;) {
     for (int i = 0; i < 60; i++) {
-      if (s_listen_stop) {
+      if (pmfe_atomic_load_long(&s_listen_stop)) {
         return 0;
       }
       pmfe_try_deferred_listen_refresh();
       Sleep(1000);
     }
-    if (s_listen_stop) {
+    if (pmfe_atomic_load_long(&s_listen_stop)) {
       break;
     }
     edr_pmfe_listen_table_refresh();
+#ifdef EDR_WITH_PMFE_IDLE_SCANNER
+    pmfe_idle_scanner_tick();
+#endif
   }
   return 0;
 }
@@ -1877,9 +2535,17 @@ void edr_pmfe_on_process_lifecycle_hint(void) {}
 #endif
 
 EdrError edr_pmfe_init(void) {
-  const char *dis = getenv("EDR_PMFE_DISABLED");
-  if (dis && dis[0] == '1') {
-    fprintf(stderr, "[pmfe] disabled (EDR_PMFE_DISABLED=1)\n");
+  const char *en = getenv("EDR_PMFE_ENABLED");
+  if (en && en[0] == '0') {
+    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_ENABLED=0)\n");
+    return EDR_OK;
+  }
+  if (en && en[0] != '1') {
+    EDR_LOGV("%s", "[pmfe] disabled by default, set EDR_PMFE_ENABLED=1 to enable\n");
+    return EDR_OK;
+  }
+  if (!en) {
+    EDR_LOGV("%s", "[pmfe] disabled by default, set EDR_PMFE_ENABLED=1 to enable\n");
     return EDR_OK;
   }
 #ifdef _WIN32
@@ -1901,6 +2567,8 @@ EdrError edr_pmfe_init(void) {
   InitializeConditionVariable(&s_q_nonfull);
   s_shutdown = 0;
   s_task_head = s_task_tail = s_task_count = 0;
+  InterlockedExchange(&s_stat_deduped, 0);
+  InterlockedExchange(&s_stat_cooldown_skipped, 0);
   memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
   memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
   for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
@@ -1946,6 +2614,8 @@ EdrError edr_pmfe_init(void) {
 #endif
   s_shutdown = 0;
   s_task_head = s_task_tail = s_task_count = 0;
+  __atomic_store_n(&s_stat_deduped, 0ul, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_stat_cooldown_skipped, 0ul, __ATOMIC_RELAXED);
   memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
   memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
   for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
@@ -1968,14 +2638,14 @@ EdrError edr_pmfe_init(void) {
   }
 #endif
   edr_pid_history_pmfe_init();
-  fprintf(stderr, "[pmfe] init workers=%d queue=%d (listen_table: 60s + deferred; Windows/Linux)\n", PMFE_NUM_WORKERS,
-          PMFE_TASK_CAP);
+  EDR_LOGV("[pmfe] init workers=%d queue=%d (listen_table: 60s + deferred; Windows/Linux)\n", PMFE_NUM_WORKERS,
+           PMFE_TASK_CAP);
   return EDR_OK;
 }
 
 void edr_pmfe_shutdown(void) {
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return;
   }
   EnterCriticalSection(&s_q_mu);
@@ -2020,13 +2690,21 @@ void edr_pmfe_shutdown(void) {
   __atomic_store_n(&s_inited, 0, __ATOMIC_RELEASE);
 #endif
 #ifdef _WIN32
-  fprintf(stderr, "[pmfe] shutdown submitted=%ld completed=%ld dropped=%ld\n", (long)s_stat_submitted,
+  EDR_LOGV("[pmfe] shutdown submitted=%ld completed=%ld dropped=%ld\n", (long)s_stat_submitted,
           (long)s_stat_completed, (long)s_stat_dropped);
 #else
-  fprintf(stderr, "[pmfe] shutdown submitted=%lu completed=%lu dropped=%lu\n",
-          (unsigned long)s_stat_submitted, (unsigned long)s_stat_completed, (unsigned long)s_stat_dropped);
+  EDR_LOGV("[pmfe] shutdown submitted=%lu completed=%lu dropped=%lu\n", (unsigned long)s_stat_submitted,
+           (unsigned long)s_stat_completed, (unsigned long)s_stat_dropped);
 #endif
   edr_pid_history_pmfe_shutdown();
+}
+
+int edr_pmfe_is_running(void) {
+#ifdef _WIN32
+  return pmfe_atomic_load_long(&s_inited) ? 1 : 0;
+#else
+  return __atomic_load_n(&s_inited, __ATOMIC_ACQUIRE) ? 1 : 0;
+#endif
 }
 
 static uint64_t pmfe_now_ms(void) {
@@ -2137,10 +2815,15 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
     return -1;
   }
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return -1;
   }
   EnterCriticalSection(&s_q_mu);
+  if (pmfe_task_pending_equiv_locked(src)) {
+    LeaveCriticalSection(&s_q_mu);
+    pmfe_stat_inc_deduped();
+    return 1;
+  }
   while (s_task_count >= PMFE_TASK_CAP && !s_shutdown) {
     SleepConditionVariableCS(&s_q_nonfull, &s_q_mu, 2000);
   }
@@ -2160,6 +2843,11 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
     return -1;
   }
   pthread_mutex_lock(&s_q_mu);
+  if (pmfe_task_pending_equiv_locked(src)) {
+    pthread_mutex_unlock(&s_q_mu);
+    pmfe_stat_inc_deduped();
+    return 1;
+  }
   while (s_task_count >= PMFE_TASK_CAP && !s_shutdown) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -2181,12 +2869,13 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
   return 0;
 }
 
-int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
+int edr_pmfe_submit_server_scan_ex(const char *command_id, uint32_t pid,
+                                   const EdrPmfeCommandContext *context) {
   if (pid == 0u) {
     return -1;
   }
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return -1;
   }
 #else
@@ -2204,11 +2893,24 @@ int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
   if (command_id && command_id[0]) {
     snprintf(t.cmd_id, sizeof(t.cmd_id), "%s", command_id);
   }
+  if (context) {
+    t.command_context = *context;
+  }
   t.priority = (uint8_t)pr;
   t.band = (uint8_t)EDR_PMFE_BAND_P0;
   t.force_deep = 1u;
+  t.server_requested = 1u;
   pmfe_task_fill_scope(&t);
+  if (context && context->requested_region_base != 0ull) {
+    t.vad_hint_va = context->requested_region_base;
+    t.full_vad = 0u;
+    t.peek_cap = 1u;
+  }
   return pmfe_enqueue_task(&t);
+}
+
+int edr_pmfe_submit_server_scan(const char *command_id, uint32_t pid) {
+  return edr_pmfe_submit_server_scan_ex(command_id, pid, NULL);
 }
 
 int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTriggerBand band, uint64_t vad_hint_va) {
@@ -2216,7 +2918,7 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
     return -1;
   }
 #ifdef _WIN32
-  if (!s_inited) {
+  if (!pmfe_atomic_load_long(&s_inited)) {
     return -1;
   }
 #else
@@ -2233,6 +2935,7 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
     }
   }
   if (!pmfe_etw_cooldown_pass(pid, cd_ms)) {
+    pmfe_stat_inc_cooldown_skipped();
     return 1;
   }
   EdrPmfeScanPriority pr = edr_pmfe_compute_priority(pid);
@@ -2262,15 +2965,27 @@ int edr_pmfe_submit_etw_scan(const char *reason, uint32_t pid) {
 }
 
 void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_completed, unsigned long *out_dropped) {
+  edr_pmfe_get_extended_stats(out_submitted, out_completed, out_dropped, NULL, NULL);
+}
+
+void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *out_completed,
+                                 unsigned long *out_dropped, unsigned long *out_deduped,
+                                 unsigned long *out_cooldown_skipped) {
 #ifdef _WIN32
   if (out_submitted) {
-    *out_submitted = (unsigned long)(ULONG_PTR)s_stat_submitted;
+    *out_submitted = (unsigned long)pmfe_atomic_load_long(&s_stat_submitted);
   }
   if (out_completed) {
-    *out_completed = (unsigned long)(ULONG_PTR)s_stat_completed;
+    *out_completed = (unsigned long)pmfe_atomic_load_long(&s_stat_completed);
   }
   if (out_dropped) {
-    *out_dropped = (unsigned long)(ULONG_PTR)s_stat_dropped;
+    *out_dropped = (unsigned long)pmfe_atomic_load_long(&s_stat_dropped);
+  }
+  if (out_deduped) {
+    *out_deduped = (unsigned long)pmfe_atomic_load_long(&s_stat_deduped);
+  }
+  if (out_cooldown_skipped) {
+    *out_cooldown_skipped = (unsigned long)pmfe_atomic_load_long(&s_stat_cooldown_skipped);
   }
 #else
   if (out_submitted) {
@@ -2282,5 +2997,31 @@ void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_complet
   if (out_dropped) {
     *out_dropped = s_stat_dropped;
   }
+  if (out_deduped) {
+    *out_deduped = s_stat_deduped;
+  }
+  if (out_cooldown_skipped) {
+    *out_cooldown_skipped = s_stat_cooldown_skipped;
+  }
 #endif
+}
+
+unsigned long edr_pmfe_queue_depth(void) {
+  unsigned long n = 0;
+#ifdef _WIN32
+  if (!pmfe_atomic_load_long(&s_inited)) {
+    return 0;
+  }
+  EnterCriticalSection(&s_q_mu);
+  n = (unsigned long)s_task_count;
+  LeaveCriticalSection(&s_q_mu);
+#else
+  if (!__atomic_load_n(&s_inited, __ATOMIC_ACQUIRE)) {
+    return 0;
+  }
+  pthread_mutex_lock(&s_q_mu);
+  n = (unsigned long)s_task_count;
+  pthread_mutex_unlock(&s_q_mu);
+#endif
+  return n;
 }

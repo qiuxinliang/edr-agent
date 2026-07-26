@@ -4,6 +4,7 @@
 
 #include "edr/config.h"
 #include "edr/event_bus.h"
+#include "edr/heartbeat.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,12 +34,13 @@ static HANDLE s_job;
 static int s_dbg_last;
 static unsigned s_poll_tick;
 static unsigned s_pressure_warn_count;
+static unsigned s_subsystem_stale_warn_count;
 
 void edr_self_protect_set_shutdown_hook(void (*cb)(int signo)) { s_shutdown_hook = cb; }
 
 #ifndef _WIN32
 static void edr_sp_on_signal(int s) {
-  fprintf(stderr, "[self_protect] 收到信号 %d（审计）\n", s);
+  fprintf(stderr, "[self_protect] signal received %d (audit)\n", s);
   if (s_shutdown_hook) {
     s_shutdown_hook(s);
   }
@@ -107,17 +109,17 @@ static void try_install_job_windows(void) {
   }
   s_job = CreateJobObjectW(NULL, NULL);
   if (!s_job || s_job == INVALID_HANDLE_VALUE) {
-    fprintf(stderr, "[self_protect] CreateJobObject 失败 (%lu)\n", (unsigned long)GetLastError());
+    fprintf(stderr, "[self_protect] CreateJobObject failed (%lu)\n", (unsigned long)GetLastError());
     s_job = NULL;
     return;
   }
   if (!AssignProcessToJobObject(s_job, GetCurrentProcess())) {
-    fprintf(stderr, "[self_protect] AssignProcessToJobObject 失败 (%lu)\n", (unsigned long)GetLastError());
+    fprintf(stderr, "[self_protect] AssignProcessToJobObject failed (%lu)\n", (unsigned long)GetLastError());
     CloseHandle(s_job);
     s_job = NULL;
     return;
   }
-  fprintf(stderr, "[self_protect] 已绑定 Windows Job Object\n");
+  fprintf(stderr, "[self_protect] Windows Job Object assigned\n");
 #else
   (void)0;
 #endif
@@ -153,9 +155,9 @@ void edr_self_protect_init(void) {
 #endif
       fclose(f);
       s_pidfile_written = 1;
-      fprintf(stderr, "[self_protect] 已写 PID 文件 %s\n", s_pidfile_path);
+      fprintf(stderr, "[self_protect] pid file written %s\n", s_pidfile_path);
     } else {
-      fprintf(stderr, "[self_protect] 无法写入 PID 文件 %s\n", s_pidfile_path);
+      fprintf(stderr, "[self_protect] pid file write failed %s\n", s_pidfile_path);
     }
   }
 #ifndef _WIN32
@@ -167,7 +169,11 @@ void edr_self_protect_init(void) {
   (void)sigaction(SIGINT, &sa, NULL);
 #endif
   s_active = 1;
-  fprintf(stderr, "[self_protect] 已启用（SIGTERM/SIGINT 审计）\n");
+#ifdef _WIN32
+  fprintf(stderr, "[self_protect] enabled (audit)\n");
+#else
+  fprintf(stderr, "[self_protect] enabled (SIGTERM/SIGINT audit)\n");
+#endif
 }
 
 void edr_self_protect_shutdown(void) {
@@ -179,7 +185,7 @@ void edr_self_protect_shutdown(void) {
 #endif
   if (s_pidfile_written && s_pidfile_path[0]) {
     if (remove(s_pidfile_path) == 0) {
-      fprintf(stderr, "[self_protect] 已删除 PID 文件 %s\n", s_pidfile_path);
+      fprintf(stderr, "[self_protect] pid file removed %s\n", s_pidfile_path);
     }
     s_pidfile_written = 0;
   }
@@ -197,7 +203,7 @@ void edr_self_protect_poll(void) {
   if (s_cfg && s_cfg->self_protect.anti_debug) {
     int d = edr_self_protect_debugger_attached();
     if (d && !s_dbg_last) {
-      fprintf(stderr, "[self_protect] 告警：检测到调试器附着（审计，不退出）\n");
+      fprintf(stderr, "[self_protect] warning: debugger attached (audit, no exit)\n");
     }
     s_dbg_last = d;
   }
@@ -209,10 +215,25 @@ void edr_self_protect_poll(void) {
       unsigned pct = (unsigned)(100u * used / cap);
       if (pct >= s_cfg->self_protect.event_bus_pressure_warn_pct) {
         if ((s_pressure_warn_count++ % 25u) == 0u) {
-          fprintf(stderr, "[self_protect] 事件总线占用 %u%%（阈值 %u%%）hw_hits=%llu dropped=%llu\n", pct,
+          fprintf(stderr, "[self_protect] event bus usage %u%% (threshold %u%%) hw_hits=%llu dropped=%llu\n", pct,
                   (unsigned)s_cfg->self_protect.event_bus_pressure_warn_pct,
                   (unsigned long long)edr_event_bus_high_water_hits(s_bus),
                   (unsigned long long)edr_event_bus_dropped_total(s_bus));
+        }
+      }
+    }
+  }
+
+  if (s_cfg && s_cfg->self_protect.subsystem_stale_timeout_s > 0u) {
+    uint64_t max_age_ns = (uint64_t)s_cfg->self_protect.subsystem_stale_timeout_s * 1000000000ULL;
+    uint32_t stale = edr_health_stale_mask(max_age_ns);
+    if (stale != 0u && (s_subsystem_stale_warn_count++ % 25u) == 0u) {
+      for (unsigned i = 0; i < (unsigned)EDR_HEALTH_COMPONENT_COUNT; i++) {
+        if ((stale & (1u << i)) != 0u) {
+          fprintf(stderr, "[self_protect] subsystem hang suspected: %s idle %llus (threshold %us)\n",
+                  edr_health_component_name((EdrHealthComponent)i),
+                  (unsigned long long)(edr_health_age_ns((EdrHealthComponent)i) / 1000000000ULL),
+                  (unsigned)s_cfg->self_protect.subsystem_stale_timeout_s);
         }
       }
     }

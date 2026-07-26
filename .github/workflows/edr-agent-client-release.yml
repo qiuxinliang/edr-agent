@@ -32,6 +32,10 @@ jobs:
     timeout-minutes: 360
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+      WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
+      WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v6
       - name: AVE / behavior chain invariants (no vcpkg, bash)
@@ -330,6 +334,29 @@ jobs:
           echo "=== sccache compilation cache stats ==="
           sccache --show-stats || echo "(sccache stats unavailable)"
 
+      - name: Authenticode sign release executables
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
+          WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
+        run: |
+          foreach ($name in @('WINDOWS_SIGNING_PFX_BASE64','WINDOWS_SIGNING_PFX_PASSWORD','WINDOWS_SIGNING_SUBJECT','WINDOWS_SIGNING_THUMBPRINT')) {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) { throw "release requires $name" }
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'agent-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+          $targets = Get-ChildItem build -Recurse -File | Where-Object Name -in @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe')
+          foreach ($target in $targets) {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_SIGNING_PFX_PASSWORD $target.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed: $($target.FullName)" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $target.FullName
+            if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($target.FullName)" }
+            if (($signature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'publisher thumbprint mismatch' }
+            if ($signature.SignerCertificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) { throw 'publisher subject mismatch' }
+          }
+
       - name: Stage ORT + vcpkg runtime DLLs
         shell: pwsh
         run: |
@@ -423,6 +450,7 @@ jobs:
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
             "scripts\edr_agent_preflight.ps1",
+            "scripts\edr_agent_inplace_update.ps1",
             "scripts\edr_agent_zip_deploy.ps1",
             "scripts\windows_service_install.ps1",
             "scripts\windows_isolate_host.ps1",
@@ -526,6 +554,7 @@ jobs:
             foreach ($required in @(
               'edr_agent_install\.ps1',
               'edr_agent_preflight\.ps1',
+              'edr_agent_inplace_update\.ps1',
               'edr_agent_zip_deploy\.ps1',
               'windows_service_install\.ps1',
               'windows_isolate_host\.ps1',
@@ -583,6 +612,38 @@ jobs:
           finally {
             $zipObj.Dispose()
           }
+          $manifest = [ordered]@{
+            schema_version = 1
+            version = $env:EDR_AGENT_VERSION
+            signature = [ordered]@{
+              format = 'cms-detached-sha256'
+              signer_thumbprint = ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()
+              signer_subject = $env:WINDOWS_SIGNING_SUBJECT
+            }
+            artifacts = @()
+          }
+          foreach ($asset in Get-ChildItem -LiteralPath $dist -File | Sort-Object Name) {
+            $manifest.artifacts += [ordered]@{ name=$asset.Name; size=$asset.Length; sha256=(Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          $manifestPath = Join-Path $dist "edr-agent-$ref-artifact-manifest.json"
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+          $manifestSignature = "$manifestPath.p7s"
+          Add-Type -AssemblyName System.Security
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx, $securePassword, 'Exportable')
+          $content = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,[IO.File]::ReadAllBytes($manifestPath))
+          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms($content, $true)
+          $signer = New-Object System.Security.Cryptography.Pkcs.CmsSigner($certificate)
+          $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+          $cms.ComputeSignature($signer)
+          [IO.File]::WriteAllBytes($manifestSignature, $cms.Encode())
+          $verify = New-Object System.Security.Cryptography.Pkcs.SignedCms($content, $true)
+          $verify.Decode([IO.File]::ReadAllBytes($manifestSignature)); $verify.CheckSignature($true)
+          $verifiedSigner = $verify.SignerInfos[0].Certificate
+          if (($verifiedSigner.Thumbprint -replace '\s','').ToUpperInvariant() -ne $manifest.signature.signer_thumbprint) { throw 'CMS signer thumbprint does not match manifest trust binding' }
+          if ($verifiedSigner.Subject -ne $manifest.signature.signer_subject) { throw 'CMS signer subject does not match manifest trust binding' }
+          if (-not (Test-Path $manifestSignature)) { throw 'detached CMS artifact manifest signature missing' }
+          Remove-Item $pfx -Force
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
       - uses: softprops/action-gh-release@v2
@@ -596,4 +657,6 @@ jobs:
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup.exe
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup-ui.zip
+            dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json
+            dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json.p7s
           fail_on_unmatched_files: true

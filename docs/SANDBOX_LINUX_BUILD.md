@@ -1,6 +1,6 @@
 # 沙箱 / 容器内编译 Linux 版 Agent（CMake）
 
-在 **本机未安装 CMake、gRPC 开发包** 或 **IDE 沙箱（如 Trae 等）仅提供干净 Linux 环境** 时，可用与 **`build_windows_mingw_docker.sh`** 相同思路：**用 Docker/Podman 拉 Ubuntu，在容器内 `apt` 安装 CMake + Ninja + 依赖再 `cmake` 编译**，产物落在仓库的 **`build-linux/`**（与 Windows 交叉编译的 `build-mingw/` 并列）。
+在 **本机未安装 CMake / Ninja** 或 **IDE 沙箱（如 Trae 等）仅提供干净 Linux 环境** 时，可用与 **`build_windows_mingw_docker.sh`** 相同思路：**用 Docker/Podman 拉 Ubuntu，在容器内 `apt` 安装 CMake + Ninja + 依赖再 `cmake` 编译**，产物落在仓库的 **`build-linux/`**（与 Windows 交叉编译的 `build-mingw/` 并列）。
 
 ## 一键脚本
 
@@ -11,9 +11,8 @@ chmod +x scripts/build_linux_native_docker.sh
 ```
 
 - **前置**：宿主机已安装并启动 **Docker** 或 **Podman**（与 `docs/WINDOWS_CROSS_COMPILE.md` §0 一致）。
-- **默认**：`EDR_WITH_GRPC=ON`，安装 `libgrpc++-dev` 等，链接真实 gRPC 客户端。
-- **快速冒烟**（少依赖、仅验证 CMake 与主干可编）：  
-  `EDR_WITH_GRPC=OFF ./scripts/build_linux_native_docker.sh`
+- **默认**：产品主线 no-gRPC，仅安装 CMake/Ninja/g++/SQLite 等最小 Linux 构建依赖。
+- **说明**：`EDR_WITH_GRPC` 已废弃；脚本会忽略旧环境变量并固定 `-DEDR_WITH_GRPC=OFF`，避免触发 CMake 的废弃选项硬错误。
 
 ## 环境变量（可选）
 
@@ -30,7 +29,7 @@ chmod +x scripts/build_linux_native_docker.sh
 | 脚本 | 目标 | 容器内安装 |
 |------|------|------------|
 | `scripts/build_windows_mingw_docker.sh` | Windows PE（MinGW） | `mingw-w64`、`cmake`、`ninja` |
-| `scripts/build_linux_native_docker.sh` | Linux ELF（本仓库默认开发机架构） | `cmake`、`ninja`、`g++`、可选 gRPC/protobuf、SQLite |
+| `scripts/build_linux_native_docker.sh` | Linux ELF（本仓库默认开发机架构） | `cmake`、`ninja`、`g++`、SQLite |
 
 ## 无容器时
 

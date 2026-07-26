@@ -1,5 +1,6 @@
 #include "edr/proto_parse.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define SMB2_MAGIC "\xfeSMB"
@@ -11,50 +12,189 @@ static uint16_t rd16le(const uint8_t *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-static uint8_t ascii_lower_u8(uint8_t c) {
-  if (c >= 'A' && c <= 'Z') {
-    return (uint8_t)(c + 32u);
-  }
-  return c;
+static uint16_t rd16be(const uint8_t *p) {
+  return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
-/** Case-insensitive prefix match for HTTP methods (T-SC-031). */
-static int http_method_prefix_ci(const uint8_t *d, uint32_t len, const char *lit, size_t lit_len) {
-  if (len < lit_len) {
+static uint32_t rd24be(const uint8_t *p) {
+  return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+}
+
+static int is_grease(uint16_t v) {
+  return ((v & 0x0f0fu) == 0x0a0au && ((v >> 8) == (v & 0xffu))) ? 1 : 0;
+}
+
+static int append_u16_dec(char *out, size_t cap, size_t *off, uint16_t v, int *first) {
+  int n;
+  if (!out || !off || *off >= cap) {
+    return -1;
+  }
+  n = snprintf(out + *off, cap - *off, "%s%u", (*first) ? "" : "-", (unsigned)v);
+  if (n < 0 || (size_t)n >= cap - *off) {
+    return -1;
+  }
+  *off += (size_t)n;
+  *first = 0;
+  return 0;
+}
+
+static int sni_is_suspicious(const char *s) {
+  if (!s || !s[0]) {
     return 0;
   }
-  for (size_t i = 0; i < lit_len; i++) {
-    if (ascii_lower_u8(d[i]) != ascii_lower_u8((uint8_t)lit[i])) {
-      return 0;
+  int dot = 0;
+  int alpha = 0;
+  int digit = 0;
+  int dash = 0;
+  for (const char *p = s; *p; p++) {
+    if (*p == '.') {
+      dot = 1;
+    } else if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) {
+      alpha = 1;
+    } else if (*p >= '0' && *p <= '9') {
+      digit++;
+    } else if (*p == '-') {
+      dash++;
+    } else {
+      return 1;
     }
   }
-  return 1;
+  if (!dot || !alpha) {
+    return 1;
+  }
+  return (digit >= 10 || dash >= 5) ? 1 : 0;
 }
 
-/**
- * SMB2 commands for which we treat bytes after the 64-byte header as the scan region
- * (same coarse model as Write/IOCTL). See docs/SHELLCODE_PROTO_SMB2_COMMAND_COVERAGE.md (T-SC-010/011).
- * MS-SMB2 command codes; intentionally excludes tiny control-only PDUs (e.g. Logoff, Close, Lock).
- */
-static int smb2_command_payload_scannable(uint16_t command) {
-  switch (command) {
-    case 0x0000u: /* Negotiate */
-    case 0x0001u: /* Session Setup */
-    case 0x0003u: /* Tree Connect */
-    case 0x0005u: /* Create */
-    case 0x0008u: /* Read */
-    case 0x0009u: /* Write */
-    case 0x000Bu: /* IOCTL */
-    case 0x000Cu: /* Cancel */
-    case 0x000Du: /* Echo */
-    case 0x000Eu: /* Query Directory */
-    case 0x000Fu: /* Change Notify */
-    case 0x0011u: /* Query Info */
-    case 0x0012u: /* Set Info */
-      return 1;
-    default:
-      return 0;
+int edr_proto_parse_tls_client_hello(const uint8_t *data, uint32_t len,
+                                     EdrTlsClientHelloInfo *out) {
+  if (!out) {
+    return 0;
   }
+  memset(out, 0, sizeof(*out));
+  if (!data || len < 11u || data[0] != 0x16u || data[1] != 0x03u) {
+    return 0;
+  }
+  uint32_t rec_len = rd16be(data + 3u);
+  if (rec_len + 5u > len) {
+    return 0;
+  }
+  const uint8_t *hs = data + 5u;
+  if (hs[0] != 0x01u) {
+    return 0;
+  }
+  uint32_t hs_len = rd24be(hs + 1u);
+  if (hs_len + 4u > rec_len || hs_len < 38u) {
+    return 0;
+  }
+  uint32_t p = 9u;
+  uint32_t end = 5u + 4u + hs_len;
+  if (p + 34u > end) {
+    return 0;
+  }
+  uint16_t ver = rd16be(data + p);
+  out->tls_version = ver;
+  p += 2u + 32u;
+  if (p + 1u > end) {
+    return 0;
+  }
+  uint32_t sid_len = data[p++];
+  if (p + sid_len + 2u > end) {
+    return 0;
+  }
+  p += sid_len;
+  uint32_t cipher_len = rd16be(data + p);
+  p += 2u;
+  if (cipher_len < 2u || (cipher_len & 1u) || p + cipher_len + 1u > end) {
+    return 0;
+  }
+  char ciphers[220] = "";
+  size_t co = 0u;
+  int first = 1;
+  for (uint32_t i = 0; i + 1u < cipher_len; i += 2u) {
+    uint16_t c = rd16be(data + p + i);
+    if (!is_grease(c)) {
+      (void)append_u16_dec(ciphers, sizeof(ciphers), &co, c, &first);
+      out->cipher_count++;
+    }
+  }
+  p += cipher_len;
+  uint32_t comp_len = data[p++];
+  if (p + comp_len > end) {
+    return 0;
+  }
+  p += comp_len;
+  char exts[180] = "";
+  char groups[180] = "";
+  char points[80] = "";
+  if (p + 2u <= end) {
+    uint32_t ext_len = rd16be(data + p);
+    p += 2u;
+    if (p + ext_len > end) {
+      return 0;
+    }
+    uint32_t ext_end = p + ext_len;
+    size_t eo = 0u, go = 0u, po = 0u;
+    int first_ext = 1, first_group = 1, first_point = 1;
+    while (p + 4u <= ext_end) {
+      uint16_t et = rd16be(data + p);
+      uint16_t el = rd16be(data + p + 2u);
+      p += 4u;
+      if (p + el > ext_end) {
+        return 0;
+      }
+      if (!is_grease(et)) {
+        (void)append_u16_dec(exts, sizeof(exts), &eo, et, &first_ext);
+        out->extension_count++;
+      }
+      if (et == 0u && el >= 5u) {
+        uint32_t q = p;
+        uint32_t list_len = rd16be(data + q);
+        q += 2u;
+        uint32_t list_end = q + list_len;
+        while (q + 3u <= p + el && q + 3u <= list_end) {
+          uint8_t name_type = data[q++];
+          uint16_t name_len = rd16be(data + q);
+          q += 2u;
+          if (q + name_len > p + el) {
+            break;
+          }
+          if (name_type == 0u && name_len > 0u) {
+            uint32_t n = name_len;
+            if (n >= sizeof(out->sni)) {
+              n = sizeof(out->sni) - 1u;
+            }
+            memcpy(out->sni, data + q, n);
+            out->sni[n] = '\0';
+          }
+          q += name_len;
+        }
+      } else if (et == 10u && el >= 2u) {
+        uint32_t q = p;
+        uint32_t glen = rd16be(data + q);
+        q += 2u;
+        uint32_t gend = q + glen;
+        while (q + 1u < p + el && q + 1u < gend) {
+          uint16_t g = rd16be(data + q);
+          if (!is_grease(g)) {
+            (void)append_u16_dec(groups, sizeof(groups), &go, g, &first_group);
+          }
+          q += 2u;
+        }
+      } else if (et == 11u && el >= 1u) {
+        uint32_t q = p;
+        uint32_t plen = data[q++];
+        uint32_t pend = q + plen;
+        while (q < p + el && q < pend) {
+          (void)append_u16_dec(points, sizeof(points), &po, (uint16_t)data[q], &first_point);
+          q++;
+        }
+      }
+      p += el;
+    }
+  }
+  (void)snprintf(out->ja3, sizeof(out->ja3), "%u,%s,%s,%s,%s", (unsigned)ver, ciphers, exts, groups, points);
+  out->sni_suspicious = (uint8_t)sni_is_suspicious(out->sni);
+  return 1;
 }
 
 EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_t len,
@@ -92,7 +232,7 @@ EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_
       out->payload_len = len - off - SMB2_HEADER_SIZE;
       return EDR_PROTO_PARSE_OK;
     }
-    if (smb2_command_payload_scannable(command)) {
+    if (command == 0x0009u || command == 0x000Bu) {
       out->is_negotiate = false;
       out->payload_off = off + SMB2_HEADER_SIZE;
       out->payload_len = len - off - SMB2_HEADER_SIZE;
@@ -107,8 +247,7 @@ EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_
       return EDR_PROTO_PARSE_TOO_SHORT;
     }
     uint8_t cmd = data[off + 4u];
-    /* Trans / Trans2 (EternalBlue), TreeConnectAndX, NT Create AndX — same fixed 32-byte header skip (T-SC-012). */
-    if (cmd == 0x25u || cmd == 0x32u || cmd == 0x71u || cmd == 0xa2u) {
+    if (cmd == 0x25u || cmd == 0x32u) {
       if (len < off + SMB1_HEADER_SIZE) {
         return EDR_PROTO_PARSE_TOO_SHORT;
       }
@@ -132,9 +271,9 @@ EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_
 
   /* 明文 HTTP/1.x：请求行或状态行 + \r\n\r\n 后为 body（任意端口） */
   if (len >= 16u) {
-    int req = (http_method_prefix_ci(data, len, "GET ", 4u) || http_method_prefix_ci(data, len, "PUT ", 4u) ||
-               http_method_prefix_ci(data, len, "POST ", 5u) || http_method_prefix_ci(data, len, "HEAD ", 5u));
-    int resp = (len >= 8u && http_method_prefix_ci(data, len, "HTTP/1.", 7u));
+    int req = (memcmp(data, "GET ", 4u) == 0 || memcmp(data, "PUT ", 4u) == 0 ||
+               memcmp(data, "POST ", 5u) == 0 || memcmp(data, "HEAD ", 5u) == 0);
+    int resp = (len >= 8u && memcmp(data, "HTTP/1.", 7u) == 0);
     if (req || resp) {
       uint32_t body_off = len;
       for (uint32_t i = 0; i + 3u < len; i++) {
@@ -169,4 +308,42 @@ EdrProtoParseResult edr_proto_find_shellcode_region(const uint8_t *data, uint32_
   }
 
   return EDR_PROTO_PARSE_UNKNOWN;
+}
+
+uint8_t edr_proto_tls_record_type(const uint8_t *data, uint32_t len) {
+  if (!data || len < 3u) {
+    return 0u;
+  }
+  uint8_t ct = data[0];
+  /* TLS/SSL3 记录：content_type ∈ {20,21,22,23}，version 主版本固定 0x03，次版本 0x00..0x04 */
+  if ((ct == 20u || ct == 21u || ct == 22u || ct == 23u) && data[1] == 0x03u && data[2] <= 0x04u) {
+    return ct;
+  }
+  return 0u;
+}
+
+int edr_url_extract_host(const char *url, char *host, size_t cap) {
+  if (!url || !url[0] || !host || cap == 0u) {
+    return -1;
+  }
+  const char *p = strstr(url, "://");
+  p = p ? p + 3 : url;
+  const char *slash = strchr(p, '/');
+  const char *at = strchr(p, '@');
+  if (at && (!slash || at < slash)) {
+    p = at + 1; /* 跳过 userinfo */
+  }
+  size_t i = 0;
+  if (*p == '[') {
+    p++;
+    while (*p && *p != ']' && i + 1u < cap) {
+      host[i++] = *p++;
+    }
+  } else {
+    while (*p && *p != ':' && *p != '/' && *p != '?' && i + 1u < cap) {
+      host[i++] = *p++;
+    }
+  }
+  host[i] = '\0';
+  return i > 0u ? 0 : -1;
 }

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# 可复现配置：FL + gRPC（+ OpenSSL HTTPS）。用法：
-#   ./scripts/cmake_fl_stack.sh [build-dir]
+# Legacy FL + gRPC stack. FL/gRPC has exited the product build path; keep this
+# script only for historical reference.
+# Use EDR_ALLOW_LEGACY_FL_STACK=1 if you intentionally need the archived stack.
 # 环境：
 #   CMAKE_BUILD_TYPE   默认 Release
 #   CMAKE_EXTRA_ARGS   附加传给 cmake 的参数（引号包裹）
 set -euo pipefail
+if [[ "${EDR_ALLOW_LEGACY_FL_STACK:-0}" != "1" ]]; then
+  echo "FL/gRPC stack is disabled in the product build path. Set EDR_ALLOW_LEGACY_FL_STACK=1 for archived research use." >&2
+  exit 2
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${1:-${ROOT}/build-fl-stack}"
 BT="${CMAKE_BUILD_TYPE:-Release}"

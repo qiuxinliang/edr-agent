@@ -14,6 +14,12 @@
 #define FL3_MAGIC_LEN 3u
 #define FL3_VERSION 2u
 
+/** 默认禁用明文 FLSTUB1；仅显式设置 `EDR_FL_CRYPTO_ALLOW_STUB=1` 才放开兼容路径。 */
+static int fl_allow_stub(void) {
+  const char *e = getenv("EDR_FL_CRYPTO_ALLOW_STUB");
+  return (e && e[0] == '1') ? 1 : 0;
+}
+
 #ifdef EDR_HAVE_OPENSSL_FL
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
@@ -699,6 +705,9 @@ int fl_crypto_seal_gradient(const uint8_t *plain, size_t plain_len, uint8_t *out
     }
   }
 #endif
+  if (!fl_allow_stub()) {
+    return -4;
+  }
   if (out_cap < need) {
     *out_len = need;
     return -2;
@@ -725,6 +734,9 @@ int fl_crypto_open_gradient(const uint8_t *blob, size_t blob_len, uint8_t *plain
     return open_openssl_fl2_legacy(blob, blob_len, plain_out, plain_cap, plain_len);
   }
 #endif
+  if (!fl_allow_stub()) {
+    return -1;
+  }
   if (blob_len <= FLSTUB_MAGIC_LEN) {
     return -1;
   }

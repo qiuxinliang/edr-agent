@@ -2,7 +2,8 @@
 # 前置：reset_local_edr_db.sh 已灌入 demo-tenant / ep-1~ep-3
 
 [server]
-address              = "127.0.0.1:50051"
+# 当前通信主路径使用 [platform].rest_base_url 的 HTTP/HTTPS ingest 与控制面。
+address              = ""
 ca_cert              = ""
 client_cert          = ""
 client_key           = ""
