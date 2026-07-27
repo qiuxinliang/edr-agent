@@ -1,6 +1,6 @@
 # 独立 edr-agent 仓库：工作目录 = 本仓库根。母库默认发布快速 Windows Agent：
 # `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → `edr-agent-<tag>-windows-amd64-exe.zip`。
-# 当前临时启用全局无证书发布；所有 `win_M.m.p` 都创建明确标记的 unsigned prerelease。
+# 当前临时启用全局无证书发布；所有 `win_M.m.p` 都创建明确标记的 unsigned release。
 # YARA/ORT 全量依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
@@ -47,7 +47,7 @@ jobs:
         run: |
           if ($env:WINDOWS_RELEASE_UNSIGNED -eq 'true') {
             "WINDOWS_RELEASE_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "::warning title=Unsigned Windows prerelease::Authenticode and CMS signing are disabled for tag ${{ github.ref_name }}. Automatic Agent update assets will not be published."
+            Write-Host "::warning title=Unsigned Windows release::Authenticode and CMS signing are disabled for tag ${{ github.ref_name }}. Automatic Agent update assets will not be published."
             exit 0
           }
 
@@ -405,7 +405,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:WINDOWS_RELEASE_SIGNED -ne 'true') {
-            Write-Host "::warning::Skipping Authenticode signing for unsigned prerelease."
+            Write-Host "::warning::Skipping Authenticode signing for unsigned release."
             exit 0
           }
           $pfx = $env:WINDOWS_SIGNING_PFX_PATH
@@ -567,9 +567,14 @@ jobs:
             if (($setupSignature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'setup publisher thumbprint mismatch' }
             if ($setupSignature.SignerCertificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) { throw 'setup publisher subject mismatch' }
           } else {
-            Write-Host "::warning::Bundled setup is intentionally unsigned for this prerelease."
+            Write-Host "::warning::Bundled setup is intentionally unsigned for this release."
           }
           $null = $items.Add($setupDest)
+          $releasePackageDir = Join-Path $env:GITHUB_WORKSPACE "build\Release"
+          New-Item -ItemType Directory -Path $releasePackageDir -Force | Out-Null
+          $releaseSetup = Join-Path $releasePackageDir "FDSecuritySetup.exe"
+          Copy-Item -LiteralPath $setupDest -Destination $releaseSetup -Force
+          Copy-Item -LiteralPath ($setupDest + ".arch") -Destination ($releaseSetup + ".arch") -Force
 
           $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
           if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
@@ -579,6 +584,7 @@ jobs:
           & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
+          Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force
           Write-Host "Setup UI package is uploaded as a separate release asset and is not nested into the runtime zip."
 
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
@@ -683,7 +689,7 @@ jobs:
             Copy-Item -LiteralPath $signedAgent -Destination $agentAsset -Force
             if ((Get-FileHash $signedAgent -Algorithm SHA256).Hash -ne (Get-FileHash $agentAsset -Algorithm SHA256).Hash) { throw 'raw update asset changed while copying' }
           } else {
-            Write-Host "::warning::Raw Agent update asset is omitted because the prerelease is unsigned."
+            Write-Host "::warning::Raw Agent update asset is omitted because the release is unsigned."
           }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -769,6 +775,14 @@ jobs:
           }
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
+      - name: Upload packaged Windows release directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: edr-agent-${{ github.ref_name }}-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Publish signed Windows release
         if: env.WINDOWS_RELEASE_UNSIGNED != 'true'
         uses: softprops/action-gh-release@v2
@@ -787,15 +801,16 @@ jobs:
             dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json.p7s
           fail_on_unmatched_files: true
 
-      - name: Publish unsigned Windows prerelease
+      - name: Publish unsigned Windows release
         if: env.WINDOWS_RELEASE_UNSIGNED == 'true'
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (UNSIGNED Windows amd64 prerelease)
-          prerelease: true
+          name: edr-agent ${{ github.ref_name }} (UNSIGNED Windows amd64)
+          prerelease: false
+          make_latest: true
           generate_release_notes: true
           body: |
             WARNING: This temporary Windows build is unsigned.
