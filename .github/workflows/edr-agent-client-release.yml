@@ -775,14 +775,6 @@ jobs:
           }
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
-      - name: Upload packaged Windows release directory
-        uses: actions/upload-artifact@v4
-        with:
-          name: edr-agent-${{ github.ref_name }}-release
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Publish signed Windows release
         if: env.WINDOWS_RELEASE_UNSIGNED != 'true'
         uses: softprops/action-gh-release@v2
