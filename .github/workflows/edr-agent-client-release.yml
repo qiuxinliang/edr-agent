@@ -1,5 +1,6 @@
 # 独立 edr-agent 仓库：工作目录 = 本仓库根。母库默认发布快速 Windows Agent：
 # `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → `edr-agent-<tag>-windows-amd64-exe.zip`。
+# 临时无证书发布使用 `win_M.m.p-unsigned`，只创建明确标记的 prerelease。
 # YARA/ORT 全量依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
@@ -36,11 +37,18 @@ jobs:
       WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
       WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
       WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
+      WINDOWS_RELEASE_UNSIGNED: ${{ endsWith(github.ref_name, '-unsigned') }}
     steps:
       - uses: actions/checkout@v6
-      - name: Validate Windows release signing configuration
+      - name: Resolve Windows release signing mode
         shell: pwsh
         run: |
+          if ($env:WINDOWS_RELEASE_UNSIGNED -eq 'true') {
+            "WINDOWS_RELEASE_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Host "::warning title=Unsigned Windows prerelease::Authenticode and CMS signing are disabled for tag ${{ github.ref_name }}. Automatic Agent update assets will not be published."
+            exit 0
+          }
+
           $required = @(
             'WINDOWS_SIGNING_PFX_BASE64',
             'WINDOWS_SIGNING_PFX_PASSWORD',
@@ -91,6 +99,7 @@ jobs:
             if ($certificate) { $certificate.Dispose() }
           }
           "WINDOWS_SIGNING_PFX_PATH=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "WINDOWS_RELEASE_SIGNED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Release signing certificate validated: subject and thumbprint match; private key is available."
 
       - name: AVE / behavior chain invariants (no vcpkg, bash)
@@ -105,7 +114,7 @@ jobs:
           $tag = '${{ github.ref_name }}'
           # Tag format: win_<version>  or  <prefix>_<version>
           # Extract a.b.c version string
-          if ($tag -match '_(\d+\.\d+\.\d+)$') {
+          if ($tag -match '_(\d+\.\d+\.\d+)(?:-unsigned)?$') {
             $ver = $Matches[1]
             Write-Host "Extracted version: $ver from tag: $tag"
           } else {
@@ -147,11 +156,12 @@ jobs:
         run: |
           set -euo pipefail
           ref="${GITHUB_REF_NAME}"
-          if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+(-unsigned)?$ ]]; then
             echo "::error::Invalid tag '${ref}'."
             exit 1
           fi
           version="${ref#win_}"
+          version="${version%-unsigned}"
           printf '%s\n' "${version}" > VERSION
           {
             echo "EDR_AGENT_RELEASE_TAG=${ref}"
@@ -392,6 +402,10 @@ jobs:
       - name: Authenticode sign release executables
         shell: pwsh
         run: |
+          if ($env:WINDOWS_RELEASE_SIGNED -ne 'true') {
+            Write-Host "::warning::Skipping Authenticode signing for unsigned prerelease."
+            exit 0
+          }
           $pfx = $env:WINDOWS_SIGNING_PFX_PATH
           if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) {
             throw "validated release signing PFX is unavailable"
@@ -543,17 +557,23 @@ jobs:
           $setupArchSrc = $setupSrc + ".arch"
           if (-not (Test-Path -LiteralPath $setupArchSrc)) { throw "missing setup architecture metadata: $setupArchSrc" }
           Copy-Item -LiteralPath $setupArchSrc -Destination ($setupDest + ".arch") -Force
-          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $env:WINDOWS_SIGNING_PFX_PATH /p $env:WINDOWS_SIGNING_PFX_PASSWORD $setupDest
-          if ($LASTEXITCODE -ne 0) { throw "signtool failed: $setupDest" }
-          $setupSignature = Get-AuthenticodeSignature -LiteralPath $setupDest
-          if ($setupSignature.Status -ne 'Valid') { throw "invalid Authenticode signature: $setupDest" }
-          if (($setupSignature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'setup publisher thumbprint mismatch' }
-          if ($setupSignature.SignerCertificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) { throw 'setup publisher subject mismatch' }
+          if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+            & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $env:WINDOWS_SIGNING_PFX_PATH /p $env:WINDOWS_SIGNING_PFX_PASSWORD $setupDest
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed: $setupDest" }
+            $setupSignature = Get-AuthenticodeSignature -LiteralPath $setupDest
+            if ($setupSignature.Status -ne 'Valid') { throw "invalid Authenticode signature: $setupDest" }
+            if (($setupSignature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'setup publisher thumbprint mismatch' }
+            if ($setupSignature.SignerCertificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) { throw 'setup publisher subject mismatch' }
+          } else {
+            Write-Host "::warning::Bundled setup is intentionally unsigned for this prerelease."
+          }
           $null = $items.Add($setupDest)
 
           $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
-          $env:EDR_WINDOWS_SIGNING_CERT_BASE64 = $env:WINDOWS_SIGNING_PFX_BASE64
-          $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
+          if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+            $env:EDR_WINDOWS_SIGNING_CERT_BASE64 = $env:WINDOWS_SIGNING_PFX_BASE64
+            $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
+          }
           & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
@@ -647,9 +667,22 @@ jobs:
           $runtimeAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-exe.zip"
           $setupAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-setup.exe"
           $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-setup-ui.zip"
+          $agentAsset = $null
           Copy-Item -LiteralPath $src -Destination $runtimeAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset -Force
+          if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+            $agentAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-FDSensor.exe"
+            $signedAgent = @("build\Release\FDSensor.exe", "build\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $signedAgent) { throw "signed FDSensor.exe not found for raw update asset" }
+            $agentSignature = Get-AuthenticodeSignature -LiteralPath $signedAgent
+            if ($agentSignature.Status -ne 'Valid') { throw "raw update asset source does not have a valid Authenticode signature" }
+            if (($agentSignature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'raw update asset publisher thumbprint mismatch' }
+            Copy-Item -LiteralPath $signedAgent -Destination $agentAsset -Force
+            if ((Get-FileHash $signedAgent -Algorithm SHA256).Hash -ne (Get-FileHash $agentAsset -Algorithm SHA256).Hash) { throw 'raw update asset changed while copying' }
+          } else {
+            Write-Host "::warning::Raw Agent update asset is omitted because the prerelease is unsigned."
+          }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zipObj = [System.IO.Compression.ZipFile]::OpenRead($runtimeAsset)
@@ -669,45 +702,74 @@ jobs:
           finally {
             $zipObj.Dispose()
           }
-          $manifest = [ordered]@{
-            schema_version = 1
-            version = $env:EDR_AGENT_VERSION
-            signature = [ordered]@{
+          $signatureMetadata = if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+            [ordered]@{
               format = 'cms-detached-sha256'
+              status = 'signed'
               signer_thumbprint = ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()
               signer_subject = $env:WINDOWS_SIGNING_SUBJECT
             }
+          } else {
+            [ordered]@{
+              format = 'none'
+              status = 'unsigned'
+              reason = 'temporary_no_code_signing_certificate'
+            }
+          }
+          $manifest = [ordered]@{
+            schema_version = 1
+            version = $env:EDR_AGENT_VERSION
+            signature = $signatureMetadata
             artifacts = @()
           }
           foreach ($asset in Get-ChildItem -LiteralPath $dist -File | Sort-Object Name) {
-            $manifest.artifacts += [ordered]@{ name=$asset.Name; size=$asset.Length; sha256=(Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+            $entry = [ordered]@{ name=$asset.Name; size=$asset.Length; sha256=(Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+            if ($agentAsset -and $asset.FullName -eq $agentAsset) {
+              $entry.version = $env:EDR_AGENT_VERSION
+              $entry.platform = 'windows'
+              $entry.arch = 'amd64'
+              $entry.update = [ordered]@{
+                internal_name = 'FDSensor'
+                internal_version = $env:EDR_AGENT_VERSION
+                deployment_mode = 'service'
+                service_name = 'FDSecurityAgent'
+                min_current_version = '0.0.0'
+                max_current_version = $env:EDR_AGENT_VERSION
+                min_free_bytes = 268435456
+              }
+            }
+            $manifest.artifacts += $entry
           }
           $manifestPath = Join-Path $dist "edr-agent-$ref-artifact-manifest.json"
           $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
-          $manifestSignature = "$manifestPath.p7s"
-          Add-Type -AssemblyName System.Security
-          $pfx = $env:WINDOWS_SIGNING_PFX_PATH
-          if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) {
-            throw "validated release signing PFX is unavailable for artifact manifest signing"
+          if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+            $manifestSignature = "$manifestPath.p7s"
+            Add-Type -AssemblyName System.Security
+            $pfx = $env:WINDOWS_SIGNING_PFX_PATH
+            if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) {
+              throw "validated release signing PFX is unavailable for artifact manifest signing"
+            }
+            $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+            $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx, $securePassword, 'Exportable')
+            $content = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,[IO.File]::ReadAllBytes($manifestPath))
+            $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms($content, $true)
+            $signer = New-Object System.Security.Cryptography.Pkcs.CmsSigner($certificate)
+            $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+            $cms.ComputeSignature($signer)
+            [IO.File]::WriteAllBytes($manifestSignature, $cms.Encode())
+            $verify = New-Object System.Security.Cryptography.Pkcs.SignedCms($content, $true)
+            $verify.Decode([IO.File]::ReadAllBytes($manifestSignature)); $verify.CheckSignature($true)
+            $verifiedSigner = $verify.SignerInfos[0].Certificate
+            if (($verifiedSigner.Thumbprint -replace '\s','').ToUpperInvariant() -ne $manifest.signature.signer_thumbprint) { throw 'CMS signer thumbprint does not match manifest trust binding' }
+            if ($verifiedSigner.Subject -ne $manifest.signature.signer_subject) { throw 'CMS signer subject does not match manifest trust binding' }
+            if (-not (Test-Path $manifestSignature)) { throw 'detached CMS artifact manifest signature missing' }
+            Remove-Item $pfx -Force
           }
-          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
-          $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx, $securePassword, 'Exportable')
-          $content = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,[IO.File]::ReadAllBytes($manifestPath))
-          $cms = New-Object System.Security.Cryptography.Pkcs.SignedCms($content, $true)
-          $signer = New-Object System.Security.Cryptography.Pkcs.CmsSigner($certificate)
-          $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
-          $cms.ComputeSignature($signer)
-          [IO.File]::WriteAllBytes($manifestSignature, $cms.Encode())
-          $verify = New-Object System.Security.Cryptography.Pkcs.SignedCms($content, $true)
-          $verify.Decode([IO.File]::ReadAllBytes($manifestSignature)); $verify.CheckSignature($true)
-          $verifiedSigner = $verify.SignerInfos[0].Certificate
-          if (($verifiedSigner.Thumbprint -replace '\s','').ToUpperInvariant() -ne $manifest.signature.signer_thumbprint) { throw 'CMS signer thumbprint does not match manifest trust binding' }
-          if ($verifiedSigner.Subject -ne $manifest.signature.signer_subject) { throw 'CMS signer subject does not match manifest trust binding' }
-          if (-not (Test-Path $manifestSignature)) { throw 'detached CMS artifact manifest signature missing' }
-          Remove-Item $pfx -Force
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
-      - uses: softprops/action-gh-release@v2
+      - name: Publish signed Windows release
+        if: env.WINDOWS_RELEASE_UNSIGNED != 'true'
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -718,6 +780,27 @@ jobs:
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup.exe
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup-ui.zip
+            dist/edr-agent-${{ github.ref_name }}-windows-amd64-FDSensor.exe
             dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json
             dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json.p7s
+          fail_on_unmatched_files: true
+
+      - name: Publish unsigned Windows prerelease
+        if: env.WINDOWS_RELEASE_UNSIGNED == 'true'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: edr-agent ${{ github.ref_name }} (UNSIGNED Windows amd64 prerelease)
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            WARNING: This temporary Windows build is unsigned.
+            Windows will show an unknown-publisher warning, and automatic Agent update is intentionally unavailable.
+          files: |
+            dist/edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip
+            dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup.exe
+            dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup-ui.zip
+            dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json
           fail_on_unmatched_files: true

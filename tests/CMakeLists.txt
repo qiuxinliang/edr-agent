@@ -45,6 +45,7 @@ add_test(NAME command_registry_and_payload_contract COMMAND test_command_contrac
 add_executable(test_agent_update_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/agent_update_command.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_event.c
   ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
@@ -55,6 +56,17 @@ if(NOT WIN32)
 endif()
 edr_apply_common_warnings(test_agent_update_contract)
 add_test(NAME agent_update_command_contract COMMAND test_agent_update_contract)
+
+if(NOT WIN32)
+  add_executable(test_agent_update_event
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_event.c
+    ${CMAKE_SOURCE_DIR}/src/command/agent_update_event.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_agent_update_event PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  edr_apply_common_warnings(test_agent_update_event)
+  add_test(NAME agent_update_event_outbox COMMAND test_agent_update_event)
+endif()
 
 add_executable(test_agent_update_assets ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_assets.c)
 edr_apply_common_warnings(test_agent_update_assets)

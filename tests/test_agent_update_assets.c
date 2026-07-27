@@ -37,6 +37,14 @@ int main(void) {
   contains(script, "Stop-Service", "service stop path exists");
   contains(script, "Start-ScheduledTask", "scheduled-task start path exists");
   contains(script, "replacement_committed", "durable replacement journal exists");
+  contains(script, "schema_version = 2", "journal uses strict v2 schema");
+  contains(script, "task_id = $TaskId", "journal binds task identity");
+  contains(script, "command_id = $CommandId", "journal binds command identity");
+  contains(script, "hash = $expectedHash", "journal binds artifact hash");
+  contains(script, "version = $TargetVersion", "journal binds target version");
+  contains(script, "last_event_seq", "journal persists event sequence");
+  contains(script, "Add-UpdateEvent", "PowerShell stages durable update events");
+  contains(script, "rollback_health_check", "rollback health event is recorded");
   contains(script, "$env:ProgramData", "journal survives install-directory binary replacement");
   contains(script, "if ([string]$prior.status -eq 'succeeded') { exit 0 }", "only prior success exits successfully");
   contains(script, "Write-AtomicJson", "journal and report use atomic writes");
@@ -45,6 +53,7 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
   char *cmake = read_file(path);
   contains(cmake, "src/command/agent_update_command.c", "command helper is compiled");
+  contains(cmake, "src/command/agent_update_event.c", "durable update event outbox is compiled");
   require_true(!strstr(cmake, "src/core/agent_update.c"), "dormant self-overwrite implementation remains disabled");
   contains(cmake, "edr_agent_inplace_update.ps1", "updater script is staged by CMake");
   contains(cmake, "shell32", "Windows external updater launch dependency is linked");

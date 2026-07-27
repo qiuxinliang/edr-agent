@@ -5615,16 +5615,16 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
     }
     if (strcmp(inbox[i].command_type, "agent_update") == 0) {
       EdrAgentUpdateRecovery recovery;
-      int recovery_rc = edr_agent_update_recover(inbox[i].command_id, &recovery);
+      int recovery_rc = edr_agent_update_recover(inbox[i].command_id, inbox[i].payload,
+                                                   inbox[i].payload_len, &recovery);
       if (recovery_rc == 2) {
-        char terminal_detail[1400];
-        snprintf(terminal_detail, sizeof(terminal_detail),
-                 "agent update recovered after restart status=%s stage=%s detail=%.1000s",
-                 recovery.status, recovery.stage, recovery.detail);
+        /* Stage and task lifecycle data is delivered only through the durable
+         * upgrade-event outbox. The command result is an ACK-gated transport
+         * terminal and deliberately carries no task-event detail. */
         soar_emit_ex(inbox[i].command_id, &inbox[i].meta,
                      recovery.succeeded ? EdrCmdExecOk : EdrCmdExecFailed,
-                     recovery.exit_code, terminal_detail,
-                     recovery.status[0] ? recovery.status : (recovery.succeeded ? "ok" : "failed"), NULL);
+                     recovery.exit_code, "agent update terminal event acknowledged",
+                     recovery.succeeded ? "ok" : "failed", NULL);
         edr_command_cancel_end(inbox[i].command_id);
         work_done = 1;
         break;

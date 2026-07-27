@@ -342,6 +342,7 @@ set(EDR_AGENT_SOURCES
   src/command/command_cancel.c
   src/command/command_contract.c
   src/command/agent_update_command.c
+  src/command/agent_update_event.c
   src/command/command_executor.c
   src/command/command_registry.c
   src/command/command_state.c

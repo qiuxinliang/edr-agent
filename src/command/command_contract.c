@@ -239,10 +239,16 @@ static const CommandFieldRule k_update_server_rules[] = {
 };
 
 static const CommandFieldRule k_agent_update_rules[] = {
+    RULE("schema", FIELD_STRING, 1, 0, 0, 31, 0),
+    RULE("task_id", FIELD_STRING, 1, 0, 0, 128, 0),
+    RULE("campaign_id", FIELD_STRING, 0, 0, 0, 128, 0),
+    RULE("operation", FIELD_STRING, 1, 0, 0, 15, 0),
+    RULE("initiated_by", FIELD_STRING, 1, 0, 0, 31, 0),
+    RULE("artifact_id", FIELD_STRING, 1, 0, 0, 128, 0),
     RULE("artifact_url", FIELD_STRING, 1, 0, 0, 2048, 0),
-    RULE("sha256", FIELD_STRING, 1, 0, 0, 64, 0),
-    RULE("target_version", FIELD_STRING, 1, 0, 0, 64, 0),
-    RULE("architecture", FIELD_STRING, 1, 0, 0, 15, 0),
+    RULE("hash", FIELD_STRING, 1, 0, 0, 64, 0),
+    RULE("version", FIELD_STRING, 1, 0, 0, 64, 0),
+    RULE("arch", FIELD_STRING, 1, 0, 0, 15, 0),
     RULE("internal_name", FIELD_STRING, 1, 0, 0, 64, 0),
     RULE("publisher_thumbprint", FIELD_STRING, 1, 0, 0, 128, 0),
     RULE("publisher_subject", FIELD_STRING, 1, 0, 0, 256, 0),
@@ -255,6 +261,9 @@ static const CommandFieldRule k_agent_update_rules[] = {
     RULE("scheduled_task_path", FIELD_STRING, 0, 0, 0, 128, 0),
     RULE("service_name", FIELD_STRING, 0, 0, 0, 128, 0),
     RULE("min_free_bytes", FIELD_NUMBER, 0, 0, 1099511627776.0, 0, 0),
+    RULE("issued_at_unix_ms", FIELD_NUMBER, 1, 1, 9007199254740991.0, 0, 0),
+    RULE("deadline_unix_ms", FIELD_NUMBER, 1, 1, 9007199254740991.0, 0, 0),
+    RULE("health_observe_ms", FIELD_NUMBER, 1, 1, 86400000.0, 0, 0),
 };
 
 static int contract_fail(char *reason, size_t cap, const char *message) {
@@ -503,23 +512,41 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     return contract_fail(reason, reason_cap, "update_server_address requires server_address");
   }
   if (kind == EDR_COMMAND_KIND_AGENT_UPDATE) {
+    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+    const cJSON *operation = cJSON_GetObjectItemCaseSensitive(root, "operation");
+    const cJSON *initiated_by = cJSON_GetObjectItemCaseSensitive(root, "initiated_by");
     const cJSON *url = cJSON_GetObjectItemCaseSensitive(root, "artifact_url");
-    const cJSON *sha = cJSON_GetObjectItemCaseSensitive(root, "sha256");
-    const cJSON *arch = cJSON_GetObjectItemCaseSensitive(root, "architecture");
+    const cJSON *sha = cJSON_GetObjectItemCaseSensitive(root, "hash");
+    const cJSON *arch = cJSON_GetObjectItemCaseSensitive(root, "arch");
     const cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "deployment_mode");
     const cJSON *manifest_url = cJSON_GetObjectItemCaseSensitive(root, "runtime_manifest_url");
     const cJSON *manifest_sha = cJSON_GetObjectItemCaseSensitive(root, "runtime_manifest_sha256");
+    const cJSON *issued = cJSON_GetObjectItemCaseSensitive(root, "issued_at_unix_ms");
+    const cJSON *deadline = cJSON_GetObjectItemCaseSensitive(root, "deadline_unix_ms");
+    if (!schema->valuestring || strcmp(schema->valuestring, "edr.agent_update.v1") != 0) {
+      return contract_fail(reason, reason_cap, "agent_update schema must be edr.agent_update.v1");
+    }
+    if (!operation->valuestring || (strcmp(operation->valuestring, "upgrade") != 0 &&
+        strcmp(operation->valuestring, "rollback") != 0)) {
+      return contract_fail(reason, reason_cap, "agent_update operation must be upgrade or rollback");
+    }
+    if (!initiated_by->valuestring || strcmp(initiated_by->valuestring, "operator") != 0) {
+      return contract_fail(reason, reason_cap, "agent_update initiated_by must be operator");
+    }
+    if (!issued || !deadline || deadline->valuedouble <= issued->valuedouble) {
+      return contract_fail(reason, reason_cap, "agent_update deadline must be after issued_at_unix_ms");
+    }
     if (!url->valuestring || strncmp(url->valuestring, "https://", 8u) != 0) {
       return contract_fail(reason, reason_cap, "agent_update artifact_url must use https");
     }
     if (!sha->valuestring || strlen(sha->valuestring) != 64u) {
-      return contract_fail(reason, reason_cap, "agent_update sha256 must contain 64 hex characters");
+      return contract_fail(reason, reason_cap, "agent_update hash must contain 64 hex characters");
     }
     for (const char *p = sha->valuestring; *p; p++) {
-      if (!isxdigit((unsigned char)*p)) return contract_fail(reason, reason_cap, "agent_update sha256 must contain 64 hex characters");
+      if (!isxdigit((unsigned char)*p)) return contract_fail(reason, reason_cap, "agent_update hash must contain 64 hex characters");
     }
     if (!arch->valuestring || (strcmp(arch->valuestring, "x64") && strcmp(arch->valuestring, "arm64"))) {
-      return contract_fail(reason, reason_cap, "agent_update architecture must be x64 or arm64");
+      return contract_fail(reason, reason_cap, "agent_update arch must be x64 or arm64");
     }
     if (mode && (!mode->valuestring || (strcmp(mode->valuestring, "auto") &&
         strcmp(mode->valuestring, "scheduled_task") && strcmp(mode->valuestring, "service")))) {
@@ -633,7 +660,7 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
       }
     }
     const CommandFieldRule *rule = find_rule(rules, rule_count, field->string);
-    if (!rule) {
+    if (!rule && descriptor->kind != EDR_COMMAND_KIND_AGENT_UPDATE) {
       rule = find_rule(k_common_rules, COUNT_OF(k_common_rules), field->string);
     }
     if (!rule) {

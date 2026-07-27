@@ -34,6 +34,19 @@ param(
   [ValidateRange(0, 1099511627776)]
   [UInt64]$MinFreeBytes = 0,
   [string]$CommandId = "manual",
+  [Parameter(Mandatory = $true)]
+  [string]$TaskId,
+  [string]$CampaignId = "",
+  [ValidateSet("upgrade", "rollback")]
+  [string]$Operation = "upgrade",
+  [Parameter(Mandatory = $true)]
+  [string]$ArtifactId,
+  [ValidateRange(1, 9007199254740991)]
+  [UInt64]$IssuedAtUnixMs = 1,
+  [ValidateRange(1, 9007199254740991)]
+  [UInt64]$DeadlineUnixMs = 2,
+  [ValidateRange(1, 86400000)]
+  [UInt64]$HealthObserveMs = 300000,
   [string]$RuntimeManifestSha256 = "",
   [ValidateRange(0, 60)]
   [int]$DrainDelaySeconds = 5,
@@ -396,14 +409,35 @@ $failureMessage = ""
 $runtimePlan = @()
 $resolvedDeploymentMode = $null
 $journal = [ordered]@{
-  schema_version = 1
+  schema_version = 2
+  task_id = $TaskId
   command_id = $CommandId
-  target_version = $TargetVersion
+  operation = $Operation
+  artifact_id = $ArtifactId
+  hash = $expectedHash
+  version = $TargetVersion
+  issued_at_unix_ms = $IssuedAtUnixMs
+  deadline_unix_ms = $DeadlineUnixMs
+  health_observe_ms = $HealthObserveMs
   status = 'running'
   stage = 'initialized'
   replacement_committed = $false
+  last_event_seq = 2
+  events = @()
   error = $null
   updated_at = (Get-Date).ToUniversalTime().ToString('o')
+}
+function Add-UpdateEvent {
+  param([string]$Status, [int]$Progress, [hashtable]$Detail)
+  $nextSequence = [UInt64]$journal['last_event_seq'] + 1
+  $journal['last_event_seq'] = $nextSequence
+  $journal['events'] = @($journal['events']) + [ordered]@{
+    event_seq = $nextSequence
+    status = $Status
+    progress = $Progress
+    detail = $Detail
+    reported_at = (Get-Date).ToUniversalTime().ToString('o')
+  }
 }
 function Set-UpdateStage {
   param([string]$Stage, [string]$Status = 'running')
@@ -437,8 +471,18 @@ $report = [ordered]@{
 }
 
 try {
+  if ($DeadlineUnixMs -le $IssuedAtUnixMs) {
+    throw 'deadline_unix_ms must be after issued_at_unix_ms'
+  }
   if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
     $prior = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+    if ([int]$prior.schema_version -ne 2 -or [string]$prior.task_id -ne $TaskId -or
+        [string]$prior.command_id -ne $CommandId -or [string]$prior.operation -ne $Operation -or
+        [string]$prior.artifact_id -ne $ArtifactId -or
+        ([string]$prior.hash).ToLowerInvariant() -ne $expectedHash -or
+        [string]$prior.version -ne $TargetVersion) {
+      throw 'recovered update journal identity does not match launch arguments'
+    }
     if ([string]$prior.status -in @('succeeded','failed_rolled_back','failed_recovered','failed')) {
       $prior | ConvertTo-Json -Depth 10 -Compress
       if ([string]$prior.status -eq 'succeeded') { exit 0 }
@@ -493,7 +537,12 @@ try {
   $runtimePlan = @(Get-RuntimeUpdatePlan -StagedBinaryPath $stagedPath `
     -InstallDirectory $installFull -ManifestPath $RuntimeManifest `
     -Version $TargetVersion -Timestamp $stamp)
+  $verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
+  Add-UpdateEvent -Status $verifiedStatus -Progress 35 -Detail @{ stage = 'candidate_verified' }
+  Set-UpdateStage -Stage "verified"
 
+  $installingStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'installing' }
+  Add-UpdateEvent -Status $installingStatus -Progress 50 -Detail @{ stage = 'stage_candidate' }
   Set-UpdateStage -Stage "stage_candidate"
   $report["previous_sha256"] = Get-Sha256 -Path $currentPath
   Copy-Item -LiteralPath $stagedPath -Destination $candidatePath -Force
@@ -522,12 +571,18 @@ try {
     throw "installed Agent hash does not match the staged binary"
   }
 
+  $restartingStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'restarting' }
+  Add-UpdateEvent -Status $restartingStatus -Progress 80 -Detail @{ stage = 'start_new_runtime' }
   Set-UpdateStage -Stage "start_new_runtime"
   Start-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
     -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
     -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
   $report["installed_sha256"] = Get-Sha256 -Path $currentPath
   $report["status"] = "succeeded"
+  $healthStatus = if ($Operation -eq 'rollback') { 'rollback_health_check' } else { 'health_check' }
+  Add-UpdateEvent -Status $healthStatus -Progress 100 -Detail @{
+    stage = 'runtime_healthy'; health_observe_ms = $HealthObserveMs
+  }
   Set-UpdateStage -Stage "completed" -Status "succeeded"
   Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
 } catch {
@@ -566,10 +621,23 @@ try {
       $report["rollback"] = "succeeded"
       $report["status"] = "failed_rolled_back"
       $report["installed_sha256"] = Get-Sha256 -Path $currentPath
+      if ($Operation -eq 'rollback') {
+        Add-UpdateEvent -Status 'rollback_health_check' -Progress 100 -Detail @{
+          stage = 'rollback_runtime_healthy'; health_observe_ms = $HealthObserveMs
+        }
+        Set-UpdateStage -Stage "rollback_health_check"
+      } else {
+        Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
+          stage = 'rollback_completed'; rolled_back = $true; error = $report['error']
+        }
+      }
       Set-UpdateStage -Stage "rollback_completed" -Status "failed_rolled_back"
     } catch {
       $report["rollback"] = "failed"
       $report["error"] = "$failureMessage; rollback failed: $($_.Exception.Message)"
+      Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
+        stage = 'rollback_failed'; rolled_back = $false; error = $report['error']
+      }
       Set-UpdateStage -Stage "rollback_failed" -Status "failed"
     }
   } elseif (Test-Path -LiteralPath $currentPath -PathType Leaf) {
@@ -581,13 +649,22 @@ try {
       $report["rollback"] = "not_required_runtime_restarted"
       $report["status"] = "failed_recovered"
       $report["installed_sha256"] = Get-Sha256 -Path $currentPath
+      Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
+        stage = 'recovery_completed'; runtime_recovered = $true; error = $report['error']
+      }
       Set-UpdateStage -Stage "recovery_completed" -Status "failed_recovered"
     } catch {
       $report["rollback"] = "failed"
       $report["error"] = "$failureMessage; runtime recovery failed: $($_.Exception.Message)"
+      Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
+        stage = 'recovery_failed'; runtime_recovered = $false; error = $report['error']
+      }
       Set-UpdateStage -Stage "recovery_failed" -Status "failed"
     }
   } else {
+    Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
+      stage = 'failed_before_stop'; error = $report['error']
+    }
     Set-UpdateStage -Stage "failed_before_stop" -Status "failed"
   }
 } finally {

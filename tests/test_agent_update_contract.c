@@ -6,18 +6,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
+                                     char *resp_body, size_t resp_body_cap) {
+  (void)suffix; (void)body_json; (void)resp_body; (void)resp_body_cap;
+  return -1;
+}
+
 static void require_true(int value, const char *message) {
   if (!value) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 
 int main(void) {
   const char *valid =
-      "{\"artifact_url\":\"https://updates.example/agent/FDSensor.exe\","
-      "\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
-      "\"target_version\":\"2.1.0\",\"architecture\":\"x64\","
+      "{\"schema\":\"edr.agent_update.v1\",\"task_id\":\"task-1\","
+      "\"campaign_id\":\"campaign-1\",\"operation\":\"upgrade\","
+      "\"initiated_by\":\"operator\",\"artifact_id\":\"artifact-1\","
+      "\"artifact_url\":\"https://updates.example/agent/FDSensor.exe\","
+      "\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+      "\"version\":\"2.1.0\",\"arch\":\"x64\","
       "\"internal_name\":\"FDSensor\",\"publisher_thumbprint\":\"AABB\","
       "\"publisher_subject\":\"CN=FDSecurity\",\"deployment_mode\":\"auto\","
-      "\"min_current_version\":\"2.0.0\",\"max_current_version\":\"2.0.99\"}";
+      "\"min_current_version\":\"2.0.0\",\"max_current_version\":\"2.0.99\","
+      "\"issued_at_unix_ms\":1720000000000,\"deadline_unix_ms\":1720003600000,"
+      "\"health_observe_ms\":300000}";
   char reason[256];
   EdrAgentUpdateRequest request;
   const EdrCommandDescriptor *descriptor = edr_command_registry_lookup("agent_update");
@@ -40,16 +51,34 @@ int main(void) {
   require_true(edr_agent_update_parse_request((const uint8_t *)valid, strlen(valid),
                                                &request, reason, sizeof(reason)),
                "executor parser accepts valid update");
-  require_true(strcmp(request.target_version, "2.1.0") == 0, "target version parsed");
-  const char *http =
-      "{\"artifact_url\":\"http://updates.example/FDSensor.exe\","
-      "\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
-      "\"target_version\":\"2.1.0\",\"architecture\":\"x64\","
+  require_true(strcmp(request.target_version, "2.1.0") == 0 &&
+                   strcmp(request.task_id, "task-1") == 0 &&
+                   strcmp(request.operation, "upgrade") == 0 &&
+                   strcmp(request.artifact_id, "artifact-1") == 0 &&
+                   request.deadline_unix_ms == 1720003600000ULL,
+               "strict update identity and timestamps parsed");
+  char invalid[4096];
+  snprintf(invalid, sizeof(invalid), "%s", valid);
+  char *url = strstr(invalid, "https://");
+  require_true(url != NULL, "valid fixture has https URL");
+  memmove(url + 4, url + 5, strlen(url + 5) + 1u);
+  require_true(!edr_command_contract_validate("agent_update", (const uint8_t *)invalid,
+                                               strlen(invalid), reason, sizeof(reason)),
+               "plain HTTP update artifact rejected");
+  const char *legacy =
+      "{\"artifact_url\":\"https://updates.example/FDSensor.exe\","
+      "\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+      "\"version\":\"2.1.0\",\"arch\":\"x64\","
       "\"internal_name\":\"FDSensor\",\"publisher_thumbprint\":\"AA\","
       "\"publisher_subject\":\"CN=FDSecurity\"}";
-  require_true(!edr_command_contract_validate("agent_update", (const uint8_t *)http,
-                                               strlen(http), reason, sizeof(reason)),
-               "plain HTTP update artifact rejected");
+  require_true(!edr_agent_update_parse_request((const uint8_t *)legacy, strlen(legacy),
+                                                &request, reason, sizeof(reason)),
+               "legacy update payload without task identity rejected");
+  snprintf(invalid, sizeof(invalid), "%.*s,\"manual\":true}",
+           (int)strlen(valid) - 1, valid);
+  require_true(!edr_command_contract_validate("agent_update", (const uint8_t *)invalid,
+                                               strlen(invalid), reason, sizeof(reason)),
+               "strict update contract rejects common manual escape field");
   int comparison = 0;
   require_true(edr_agent_update_semver_compare("2.1.0", "2.0.99", &comparison) && comparison > 0,
                "semantic version ordering supports anti-downgrade");
@@ -60,17 +89,37 @@ int main(void) {
   require_true(edr_agent_update_journal_is_terminal("failed_rolled_back"),
                "rollback result is terminal");
   EdrAgentUpdateRecovery recovery;
-  require_true(edr_agent_update_parse_journal(
-                   "{\"status\":\"running\",\"stage\":\"replacement_committed\"}", &recovery) == 1,
-               "nonterminal replacement journal retains inbox");
-  require_true(edr_agent_update_parse_journal(
-                   "{\"status\":\"succeeded\",\"stage\":\"completed\"}", &recovery) == 2 &&
+  const char *running_journal =
+      "{\"schema_version\":2,\"task_id\":\"task-1\",\"command_id\":\"cmd-1\","
+      "\"operation\":\"upgrade\",\"artifact_id\":\"artifact-1\","
+      "\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+      "\"version\":\"2.1.0\",\"status\":\"running\",\"stage\":\"replacement_committed\","
+      "\"last_event_seq\":3,\"events\":[{\"event_seq\":3,\"status\":\"verified\",\"progress\":35,\"detail\":{}}]}";
+  require_true(edr_agent_update_parse_journal(running_journal, &recovery) == 1 &&
+                   recovery.last_event_seq == 3 && strcmp(recovery.task_id, "task-1") == 0,
+               "v2 nonterminal journal retains bound identity and sequence");
+  const char *success_journal =
+      "{\"schema_version\":2,\"task_id\":\"task-1\",\"command_id\":\"cmd-1\","
+      "\"operation\":\"upgrade\",\"artifact_id\":\"artifact-1\","
+      "\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+      "\"version\":\"2.1.0\",\"status\":\"succeeded\",\"stage\":\"completed\","
+      "\"last_event_seq\":7,\"events\":[{\"event_seq\":7,\"status\":\"health_check\",\"progress\":100,\"detail\":{}}]}";
+  require_true(edr_agent_update_parse_journal(success_journal, &recovery) == 2 &&
                    recovery.succeeded && recovery.exit_code == 0,
-               "restart recovery maps succeeded journal to terminal OK");
-  require_true(edr_agent_update_parse_journal(
-                   "{\"status\":\"failed_rolled_back\",\"stage\":\"rollback_completed\",\"error\":\"startup failed\"}", &recovery) == 2 &&
+               "v2 succeeded journal maps to terminal OK");
+  const char *failure_journal =
+      "{\"schema_version\":2,\"task_id\":\"task-1\",\"command_id\":\"cmd-1\","
+      "\"operation\":\"upgrade\",\"artifact_id\":\"artifact-1\","
+      "\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+      "\"version\":\"2.1.0\",\"status\":\"failed_rolled_back\",\"stage\":\"rollback_completed\","
+      "\"last_event_seq\":8,\"events\":[{\"event_seq\":8,\"status\":\"failed\",\"progress\":100,\"detail\":{}}],"
+      "\"error\":\"startup failed\"}";
+  require_true(edr_agent_update_parse_journal(failure_journal, &recovery) == 2 &&
                    !recovery.succeeded && recovery.exit_code != 0 && strstr(recovery.detail, "startup failed"),
-               "restart recovery maps rollback journal to terminal failure");
+               "v2 rollback journal maps to terminal failure");
+  require_true(edr_agent_update_parse_journal(
+                   "{\"schema_version\":1,\"status\":\"succeeded\"}", &recovery) < 0,
+               "legacy journal without bound identity rejected");
 #ifndef _WIN32
   char detail[128];
   require_true(edr_agent_update_execute("cmd-1", (const uint8_t *)valid, strlen(valid),
