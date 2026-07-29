@@ -9,12 +9,15 @@
   Example:
     .\install\windows-setup-ui\Build-SetupUi.ps1 `
       -SetupExe .\FDSecuritySetup.exe `
+      -AgentBinarySha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef `
       -AppVersion 2.1.150 `
       -BootstrapTrustPublicKeyPem .\bootstrap_trust_public_key.pem `
       -OutputZip .\FDSecuritySetupUI.zip
 #>
 param(
     [string] $SetupExe = "",
+    [Parameter(Mandatory = $true)]
+    [string] $AgentBinarySha256,
     [string] $AppVersion = "0.0.0",
     [string] $Configuration = "Release",
     [string] $OutputZip = "",
@@ -30,6 +33,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($AgentBinarySha256 -cnotmatch '\A[0-9A-Fa-f]{64}\z') {
+    throw "AgentBinarySha256 must be exactly 64 hexadecimal characters"
+}
+$AgentBinarySha256 = $AgentBinarySha256.ToLowerInvariant()
+
 $scriptDir = $PSScriptRoot
 $project = Join-Path $scriptDir "EDRAgent.SetupUi.csproj"
 if (-not (Test-Path -LiteralPath $project)) {
@@ -127,6 +135,68 @@ function Invoke-SignIfConfigured([string] $Path) {
     finally {
         Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Get-ManifestPublisherThumbprint {
+    $custom = [string]$env:EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND
+    if ($custom) {
+        $thumbprint = ([string]$env:EDR_AGENT_RELEASE_MANIFEST_SIGNER_THUMBPRINT -replace '[\s:-]', '').ToUpperInvariant()
+        if ($thumbprint -cnotmatch '\A[0-9A-F]{40}\z') {
+            throw "EDR_AGENT_RELEASE_MANIFEST_SIGNER_THUMBPRINT must be the 40-hex leaf certificate thumbprint when EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND is used"
+        }
+        return $thumbprint
+    }
+
+    $certB64 = [string]$env:EDR_WINDOWS_SIGNING_CERT_BASE64
+    if (-not $certB64) {
+        Write-Warning "Setup UI manifest publisher thumbprint is unavailable because manifest signing is not configured."
+        return ""
+    }
+    $password = [string]$env:EDR_WINDOWS_SIGNING_CERT_PASSWORD
+    $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [Convert]::FromBase64String($certB64),
+        $password,
+        $flags
+    )
+    return ($cert.Thumbprint -replace '\s', '').ToUpperInvariant()
+}
+
+function Write-DetachedManifestSignature([string] $ManifestPath, [string] $SignaturePath) {
+    $custom = [string]$env:EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND
+    if ($custom) {
+        $cmd = $custom.Replace('{content}', $ManifestPath).Replace('{signature}', $SignaturePath)
+        Write-Host "Signing Setup UI manifest via EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND"
+        cmd.exe /c $cmd
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $SignaturePath)) {
+            throw "Setup UI manifest signing command failed"
+        }
+        return $true
+    }
+
+    $certB64 = [string]$env:EDR_WINDOWS_SIGNING_CERT_BASE64
+    if (-not $certB64) {
+        Write-Warning "Setup UI manifest is unsigned; platform managed-package upload will reject this package."
+        return $false
+    }
+    Add-Type -AssemblyName System.Security
+    $password = [string]$env:EDR_WINDOWS_SIGNING_CERT_PASSWORD
+    $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [Convert]::FromBase64String($certB64),
+        $password,
+        $flags
+    )
+    if (-not $cert.HasPrivateKey) {
+        throw "Windows signing certificate does not contain a private key for Setup UI manifest signing"
+    }
+    $content = [System.Security.Cryptography.Pkcs.ContentInfo]::new([System.IO.File]::ReadAllBytes($ManifestPath))
+    $cms = [System.Security.Cryptography.Pkcs.SignedCms]::new($content, $true)
+    $signer = [System.Security.Cryptography.Pkcs.CmsSigner]::new($cert)
+    $signer.DigestAlgorithm = [System.Security.Cryptography.Oid]::new("2.16.840.1.101.3.4.2.1")
+    $cms.ComputeSignature($signer)
+    [System.IO.File]::WriteAllBytes($SignaturePath, $cms.Encode())
+    return $true
 }
 
 function Format-SetupUiBytes([Int64] $Bytes) {
@@ -307,6 +377,7 @@ if (Test-Path -LiteralPath $versionFile) {
     [System.IO.File]::WriteAllText((Join-Path $publishDir "VERSION"), $AppVersion)
 }
 
+$manifestPublisherThumbprint = Get-ManifestPublisherThumbprint
 $manifest = @{
     name = "FDSecurity Setup UI"
     version = $AppVersion
@@ -323,6 +394,8 @@ $manifest = @{
     }
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"
+    agent_binary_sha256 = $AgentBinarySha256
+    publisher_thumbprint = $manifestPublisherThumbprint
     setup_exe_sha256 = Get-FileSha256Hex $bundledSetupExe
     ui_exe_sha256 = Get-FileSha256Hex $uiExe
     setup_exe_signed = [bool]$setupSigned
@@ -334,7 +407,11 @@ $manifest = @{
     dotnet_runtime = if ($selfContained -eq "true") { "Self-contained .NET Desktop runtime" } else { "Requires .NET Desktop Runtime 8 on the endpoint" }
     webview2_runtime = "Evergreen runtime required; Windows 11 normally includes it"
 }
-$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $publishDir "setup-ui-manifest.json") -Encoding UTF8
+$manifestPath = Join-Path $publishDir "setup-ui-manifest.json"
+$manifestSignaturePath = Join-Path $publishDir "setup-ui-manifest.p7s"
+$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+Remove-Item -LiteralPath $manifestSignaturePath -Force -ErrorAction SilentlyContinue
+$manifestSigned = Write-DetachedManifestSignature $manifestPath $manifestSignaturePath
 
 if (-not $OutputZip) {
     $OutputZip = Join-Path $scriptDir ("Output\FDSecuritySetupUI-{0}-{1}.zip" -f $runtime, $resolvedRuntimeMode)
@@ -355,13 +432,17 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zipObj = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $OutputZip))
 try {
     $entries = $zipObj.Entries.FullName
-    foreach ($required in @(
+    $requiredEntries = @(
         'FDSecuritySetupUI.exe',
         'FDSecuritySetup.exe',
         'Assets/installer.html',
         'setup-ui-manifest.json',
         'VERSION'
-    )) {
+    )
+    if ($manifestSigned) {
+        $requiredEntries += 'setup-ui-manifest.p7s'
+    }
+    foreach ($required in $requiredEntries) {
         $pattern = [regex]::Escape($required).Replace('/', '[/\\]')
         if (-not ($entries -match "(^|[/\\])$pattern$")) {
             throw "Setup UI package missing required entry: $required"

@@ -13,12 +13,16 @@ The UI is a WPF + WebView2 wrapper around the existing Inno installer:
 Run on Windows after the bundled Inno installer has been built:
 
 ```powershell
+$agentSha256 = (Get-FileHash -LiteralPath .\FDSensor.exe -Algorithm SHA256).Hash
 .\install\windows-setup-ui\Build-SetupUi.ps1 `
   -SetupExe .\FDSecuritySetup.exe `
+  -AgentBinarySha256 $agentSha256 `
   -AppVersion 2.1.150 `
   -BootstrapTrustPublicKeyPem .\bootstrap_trust_public_key.pem `
   -OutputZip .\FDSecuritySetupUI.zip
 ```
+
+`-AgentBinarySha256` is required and must be the SHA-256 of the original Agent executable before it is copied into the Inno staging directory. The value must contain exactly 64 hexadecimal characters. The build normalizes it to lowercase and writes it to `setup-ui-manifest.json` as `agent_binary_sha256`; it is distinct from `setup_exe_sha256`, which identifies the bundled Inno installer.
 
 The output zip contains:
 
@@ -29,7 +33,10 @@ The output zip contains:
 - adjacent `FDSecuritySetup.exe`
 - `VERSION`
 - `setup-ui-manifest.json`
+- `setup-ui-manifest.p7s`（配置发布签名证书或 `EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND` 时生成；平台 managed package 上传必需）
 - optional `bootstrap_trust_public_key.pem`
+
+平台校验要求 `setup-ui-manifest.json` 的 `publisher_thumbprint` 与 CMS 叶证书一致。使用 PFX 时构建脚本会自动写入证书 thumbprint；使用 `EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND` 时还必须设置 `EDR_AGENT_RELEASE_MANIFEST_SIGNER_THUMBPRINT` 为签名叶证书的 40 位十六进制 SHA-1 thumbprint。
 
 Runtime modes:
 
@@ -40,8 +47,10 @@ Runtime modes:
 Example compact build:
 
 ```powershell
+$agentSha256 = (Get-FileHash -LiteralPath .\FDSensor.exe -Algorithm SHA256).Hash
 .\install\windows-setup-ui\Build-SetupUi.ps1 `
   -SetupExe .\FDSecuritySetup.exe `
+  -AgentBinarySha256 $agentSha256 `
   -AppVersion 2.1.150 `
   -RuntimeMode compact `
   -OutputZip .\FDSecuritySetupUI-compact.zip

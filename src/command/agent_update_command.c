@@ -2,6 +2,7 @@
 
 #include "cJSON.h"
 #include "edr/agent_update_event.h"
+#include "edr/command_cancel.h"
 #include "edr/ingest_http.h"
 
 #include <ctype.h>
@@ -535,6 +536,42 @@ static int update_failure(const EdrAgentUpdateRequest *req, const char *command_
 
 static void event_context_from_request(const EdrAgentUpdateRequest *req,
                                        const char *command_id,
+                                       EdrAgentUpdateEventContext *context);
+
+static int update_cancelled(const EdrAgentUpdateRequest *req, const char *command_id,
+                            const char *outbox_dir, uint64_t event_seq,
+                            const char *stage, char *detail, size_t detail_cap) {
+  if (!edr_command_cancel_requested(command_id)) return 0;
+  EdrAgentUpdateEventContext context;
+  event_context_from_request(req, command_id, &context);
+  cJSON *event_detail = cJSON_CreateObject();
+  if (!event_detail || !cJSON_AddStringToObject(event_detail, "stage", stage ? stage : "cancelled") ||
+      !cJSON_AddStringToObject(event_detail, "reason", "operator_cancelled_before_replacement")) {
+    cJSON_Delete(event_detail);
+    snprintf(detail, detail_cap, "agent update cancellation persistence pending");
+    return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
+  }
+  char *printed = cJSON_PrintUnformatted(event_detail);
+  cJSON_Delete(event_detail);
+  if (!printed || edr_agent_update_event_persist(outbox_dir, &context, event_seq,
+                                                  "cancelled", 100, printed, NULL) != 0) {
+    free(printed);
+    snprintf(detail, detail_cap, "agent update cancellation persistence pending");
+    return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
+  }
+  free(printed);
+  uint64_t acked = 0u;
+  (void)edr_agent_update_event_flush_ingest(outbox_dir, &acked);
+  if (acked < event_seq) {
+    snprintf(detail, detail_cap, "agent update cancellation event pending acknowledgement");
+    return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
+  }
+  snprintf(detail, detail_cap, "agent update cancelled before replacement");
+  return 130;
+}
+
+static void event_context_from_request(const EdrAgentUpdateRequest *req,
+                                       const char *command_id,
                                        EdrAgentUpdateEventContext *context) {
   memset(context, 0, sizeof(*context));
   snprintf(context->task_id, sizeof(context->task_id), "%s", req->task_id);
@@ -570,6 +607,9 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
   }
   const char *first_status = strcmp(req.operation, "rollback") == 0 ? "rolling_back" : "downloading";
+  int cancel_rc = update_cancelled(&req, command_id, outbox_dir, 1u,
+                                   "before_download", detail, detail_cap);
+  if (cancel_rc) return cancel_rc;
   if (edr_agent_update_event_persist(outbox_dir, &event_context, 1u, first_status, 5,
                                      "{\"stage\":\"artifact_download\"}", NULL) != 0) {
     (void)write_failure_journal(&req, command_id, 1u, "event_persist",
@@ -594,11 +634,17 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return update_failure(&req, command_id, outbox_dir, 2u, "artifact_download",
                           "authenticated update artifact download failed", 4, detail, detail_cap);
   }
+  cancel_rc = update_cancelled(&req, command_id, outbox_dir, 2u,
+                               "artifact_downloaded", detail, detail_cap);
+  if (cancel_rc) { DeleteFileA(staged); return cancel_rc; }
   if (req.runtime_manifest_url[0] && edr_ingest_http_get_url_to_file(req.runtime_manifest_url, manifest, 1024u * 1024u) != 0) {
     DeleteFileA(staged);
     return update_failure(&req, command_id, outbox_dir, 2u, "runtime_manifest_download",
                           "authenticated runtime manifest download failed", 5, detail, detail_cap);
   }
+  cancel_rc = update_cancelled(&req, command_id, outbox_dir, 2u,
+                               "runtime_manifest_downloaded", detail, detail_cap);
+  if (cancel_rc) { DeleteFileA(staged); DeleteFileA(manifest); return cancel_rc; }
   const char *second_status = strcmp(req.operation, "rollback") == 0 ? "rolling_back" : "downloaded";
   if (edr_agent_update_event_persist(outbox_dir, &event_context, 2u, second_status, 20,
                                      "{\"stage\":\"artifact_downloaded\"}", NULL) != 0) {
@@ -614,6 +660,9 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return update_failure(&req, command_id, outbox_dir, 3u, "launcher_persist",
                           "cannot persist external updater launch script", 6, detail, detail_cap);
   }
+  cancel_rc = update_cancelled(&req, command_id, outbox_dir, 3u,
+                               "before_updater_launch", detail, detail_cap);
+  if (cancel_rc) { DeleteFileA(staged); DeleteFileA(manifest); DeleteFileA(launcher); return cancel_rc; }
   char params[2 * MAX_PATH + 160];
   snprintf(params, sizeof(params), "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"", launcher);
   HINSTANCE launched = ShellExecuteA(NULL, "open", "powershell.exe", params, root, SW_HIDE);

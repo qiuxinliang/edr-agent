@@ -581,7 +581,8 @@ jobs:
             $env:EDR_WINDOWS_SIGNING_CERT_BASE64 = $env:WINDOWS_SIGNING_PFX_BASE64
             $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
           }
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
+          $agentBinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outDir "FDSensor.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force

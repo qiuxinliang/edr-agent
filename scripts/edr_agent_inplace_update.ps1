@@ -523,9 +523,11 @@ try {
   $candidateIdentity = Get-VersionIdentity -Path $stagedPath
   if ($candidateIdentity.InternalName -ne $ExpectedInternalName) { throw 'candidate InternalName mismatch' }
   if ($candidateIdentity.ProductVersion -ne $TargetVersion) { throw 'candidate ProductVersion does not match target_version' }
-  if ((Compare-SemVer $TargetVersion $currentIdentity.ProductVersion) -le 0) { throw 'candidate version is not an upgrade' }
-  if ($MinCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MinCurrentVersion) -lt 0) { throw 'current version is below update compatibility floor' }
-  if ($MaxCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MaxCurrentVersion) -gt 0) { throw 'current version is above update compatibility ceiling' }
+  $versionDirection = Compare-SemVer $TargetVersion $currentIdentity.ProductVersion
+  if ($Operation -eq 'upgrade' -and $versionDirection -le 0) { throw 'candidate version is not an upgrade' }
+  if ($Operation -eq 'rollback' -and $versionDirection -ge 0) { throw 'rollback target is not older than the current version' }
+  if ($Operation -eq 'upgrade' -and $MinCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MinCurrentVersion) -lt 0) { throw 'current version is below update compatibility floor' }
+  if ($Operation -eq 'upgrade' -and $MaxCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MaxCurrentVersion) -gt 0) { throw 'current version is above update compatibility ceiling' }
   Assert-AuthenticodePublisher -Path $stagedPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
   $resolvedDeploymentMode = Resolve-DeploymentMode -Mode $DeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName
 

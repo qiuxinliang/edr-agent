@@ -292,6 +292,7 @@ EdrCommandCancelMode edr_command_registry_cancel_mode(const char *command_type) 
     case EDR_COMMAND_KIND_LIST_MODULES:
     case EDR_COMMAND_KIND_LIST_AUTORUNS:
     case EDR_COMMAND_KIND_EVENTLOG_VIEW:
+    case EDR_COMMAND_KIND_AGENT_UPDATE:
       return EDR_COMMAND_CANCEL_COOPERATIVE;
     default:
       return EDR_COMMAND_CANCEL_NONE;

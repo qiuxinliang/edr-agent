@@ -29,7 +29,9 @@ int main(void) {
   contains(script, "Get-AuthenticodeSignature", "Authenticode validity gate exists");
   contains(script, "TrustedPublisherThumbprint", "trusted publisher thumbprint gate exists");
   contains(script, "TrustedPublisherSubject", "trusted publisher subject gate exists");
-  contains(script, "Compare-SemVer", "semantic anti-downgrade check exists");
+  contains(script, "Compare-SemVer", "semantic version direction checks exist");
+  contains(script, "$Operation -eq 'upgrade' -and $versionDirection -le 0", "upgrade rejects downgrade and same-version targets");
+  contains(script, "$Operation -eq 'rollback' -and $versionDirection -ge 0", "rollback requires an older target version");
   contains(script, "InternalName", "PE InternalName check exists");
   contains(script, "ProductVersion", "PE ProductVersion check exists");
   contains(script, "Get-PSDrive", "disk-space preflight exists");
@@ -49,6 +51,16 @@ int main(void) {
   contains(script, "if ([string]$prior.status -eq 'succeeded') { exit 0 }", "only prior success exits successfully");
   contains(script, "Write-AtomicJson", "journal and report use atomic writes");
   free(script);
+
+  snprintf(path, sizeof(path), "%s/src/command/agent_update_command.c", root);
+  char *command = read_file(path);
+  require_true(command != NULL, "read Agent update command implementation");
+  contains(command, "before_download", "update can be cancelled before download");
+  contains(command, "artifact_downloaded", "update can be cancelled after artifact download");
+  contains(command, "runtime_manifest_downloaded", "update can be cancelled after runtime manifest download");
+  contains(command, "before_updater_launch", "update can be cancelled before replacement process starts");
+  contains(command, "operator_cancelled_before_replacement", "cancel event records the safe cancellation boundary");
+  free(command);
 
   snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
   char *cmake = read_file(path);

@@ -67,6 +67,8 @@ int main(void) {
                "event log collection is routed to bulk execution lane");
   require_true(edr_command_registry_cancel_mode("eventlog_view") == EDR_COMMAND_CANCEL_COOPERATIVE,
                "event log collection declares implemented cooperative cancellation");
+  require_true(edr_command_registry_cancel_mode("agent_update") == EDR_COMMAND_CANCEL_COOPERATIVE,
+               "Agent update supports cancellation before replacement starts");
   test_setenv("EDR_COMMAND_REQUIRE_SIGNATURE", "0");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED", "0");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS", "0");
