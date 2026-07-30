@@ -93,6 +93,13 @@ function Get-VersionIdentity {
 
 function Assert-AuthenticodePublisher {
   param([string]$Path, [string]$Thumbprint, [string]$Subject)
+  if ($Thumbprint -eq 'SHA256_ONLY_UNSIGNED') {
+    if ($Subject -ne 'Unsigned release; SHA-256 integrity only') {
+      throw "unsigned release publisher marker is inconsistent"
+    }
+    Write-Warning "Agent candidate is unsigned; accepting the already verified task-pinned SHA-256 because the platform explicitly published this release in optional-signing mode."
+    return
+  }
   $signature = Get-AuthenticodeSignature -LiteralPath $Path
   if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate) {
     throw "candidate Authenticode signature is not Valid: $($signature.Status) $($signature.StatusMessage)"

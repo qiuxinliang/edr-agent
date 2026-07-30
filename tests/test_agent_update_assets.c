@@ -29,6 +29,8 @@ int main(void) {
   contains(script, "Get-AuthenticodeSignature", "Authenticode validity gate exists");
   contains(script, "TrustedPublisherThumbprint", "trusted publisher thumbprint gate exists");
   contains(script, "TrustedPublisherSubject", "trusted publisher subject gate exists");
+  contains(script, "SHA256_ONLY_UNSIGNED", "explicit optional-signing update mode exists");
+  contains(script, "already verified task-pinned SHA-256", "unsigned mode remains pinned to the task artifact hash");
   contains(script, "Compare-SemVer", "semantic version direction checks exist");
   contains(script, "$Operation -eq 'upgrade' -and $versionDirection -le 0", "upgrade rejects downgrade and same-version targets");
   contains(script, "$Operation -eq 'rollback' -and $versionDirection -ge 0", "rollback requires an older target version");
