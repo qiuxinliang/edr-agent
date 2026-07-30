@@ -42,8 +42,42 @@ env:
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
 
 jobs:
+  prepare-release:
+    name: Prepare immutable GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${EDR_AGENT_RELEASE_TAG}"
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            draft="$(gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
+            test "${draft}" = "true" || {
+              echo "::error::release ${tag} is already published and is immutable"
+              exit 1
+            }
+            echo "Reusing existing draft release ${tag}"
+            exit 0
+          fi
+          args=(release create "${tag}" --repo "${GITHUB_REPOSITORY}" --draft)
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            args+=(--target "${GITHUB_SHA}")
+          else
+            args+=(--verify-tag)
+          fi
+          if [[ "${WINDOWS_RELEASE_MODE}" == "signed" ]]; then
+            args+=(--title "edr-agent ${tag} (Windows AMD64 + ARM64)")
+          else
+            args+=(--title "edr-agent ${tag} (UNSIGNED Windows AMD64 + ARM64)")
+          fi
+          gh "${args[@]}"
+
   windows-build:
     name: Build Windows ${{ matrix.arch }} (FDSensor.exe + runtime DLLs, fast no-gRPC)
+    needs: prepare-release
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) }}
     runs-on: windows-latest
     timeout-minutes: 360
@@ -826,68 +860,71 @@ jobs:
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
       - name: Upload ${{ matrix.arch }} release bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-bundle-${{ matrix.arch }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $assets = @(Get-ChildItem -LiteralPath dist -File)
+          if ($assets.Count -lt 5) { throw "incomplete $env:EDR_RELEASE_ARCH release bundle" }
+          gh release upload $env:EDR_AGENT_RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            @($assets.FullName) --clobber
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release asset upload failed" }
 
   publish-release:
     name: Publish combined Windows Release Bundle
     needs: windows-build
     runs-on: ubuntu-latest
     steps:
-      - name: Download architecture bundles
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-bundle-*
-          path: dist
-          merge-multiple: true
-
       - name: Verify combined AMD64/ARM64 asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          mapfile -t assets < <(
+            gh release view "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --json assets --jq '.assets[].name'
+          )
+          has_asset() {
+            local expected="$1"
+            printf '%s\n' "${assets[@]}" | grep -Fxq "${expected}"
+          }
           for arch in amd64 arm64; do
             for suffix in exe.zip setup.exe setup-ui.zip FDSensor.exe artifact-manifest.json; do
-              path="dist/edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-${suffix}"
-              test -f "${path}" || { echo "::error::missing combined release asset: ${path}"; exit 1; }
+              name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-${suffix}"
+              has_asset "${name}" || { echo "::error::missing combined release asset: ${name}"; exit 1; }
             done
             if [[ "${WINDOWS_RELEASE_MODE}" == "signed" ]]; then
-              path="dist/edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-artifact-manifest.json.p7s"
-              test -f "${path}" || { echo "::error::missing signed manifest: ${path}"; exit 1; }
+              name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-artifact-manifest.json.p7s"
+              has_asset "${name}" || { echo "::error::missing signed manifest: ${name}"; exit 1; }
             fi
           done
 
       - name: Publish signed Windows release
         if: env.WINDOWS_RELEASE_MODE == 'signed'
-        uses: softprops/action-gh-release@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.EDR_AGENT_RELEASE_TAG }}
-          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (Windows AMD64 + ARM64)
-          generate_release_notes: true
-          files: dist/*
-          fail_on_unmatched_files: true
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --prerelease=false --latest \
+            --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (Windows AMD64 + ARM64)"
 
       - name: Publish unsigned Windows release
         if: env.WINDOWS_RELEASE_MODE == 'unsigned'
-        uses: softprops/action-gh-release@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.EDR_AGENT_RELEASE_TAG }}
-          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (UNSIGNED Windows AMD64 + ARM64)
-          prerelease: false
-          make_latest: true
-          generate_release_notes: true
-          body: |
-            WARNING: This temporary Windows build is unsigned.
-            Windows will show an unknown-publisher warning. Platform publication and Agent update require
-            EDR_AGENT_RELEASE_SIGNATURE_POLICY=optional and remain pinned to the manifest and task SHA-256.
-            The standalone FDSensor.exe and manifest update metadata are published so an optional-signature
-            platform can verify and promote the exact SHA-256-pinned artifact.
-          files: dist/*
-          fail_on_unmatched_files: true
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          body="$(mktemp)"
+          cat >"${body}" <<'EOF'
+          WARNING: This temporary Windows build is unsigned.
+          Windows will show an unknown-publisher warning. Platform publication and Agent update require
+          EDR_AGENT_RELEASE_SIGNATURE_POLICY=optional and remain pinned to the manifest and task SHA-256.
+          The standalone FDSensor.exe and manifest update metadata are published so an optional-signature
+          platform can verify and promote the exact SHA-256-pinned artifact.
+          EOF
+          gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --prerelease=false --latest \
+            --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (UNSIGNED Windows AMD64 + ARM64)" \
+            --notes-file "${body}"
