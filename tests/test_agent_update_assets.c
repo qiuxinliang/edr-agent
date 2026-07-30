@@ -92,6 +92,11 @@ int main(void) {
   contains(workflow, "Authenticode sign release executables", "release requires Authenticode signing");
   contains(workflow, "WINDOWS_SIGNING_THUMBPRINT", "release verifies trusted signing thumbprint");
   contains(workflow, "artifact-manifest.json", "release publishes artifact hash manifest");
+  contains(workflow, "workflow_dispatch:", "release supports an explicit manual run");
+  contains(workflow, "WINDOWS_RELEASE_MODE", "release signing mode is configuration-driven");
+  contains(workflow, "Copy-Item -LiteralPath $agentBinary -Destination $agentAsset -Force",
+           "signed and unsigned releases both publish the raw update artifact");
+  contains(workflow, "optional-signature", "unsigned release documents the integrity-pinned platform path");
   contains(workflow, "SignedCms", "release produces detached signed manifest");
   contains(workflow, "signer_thumbprint", "manifest binds expected signer thumbprint");
   contains(workflow, "CMS signer subject does not match", "release verifies CMS signer identity binding");

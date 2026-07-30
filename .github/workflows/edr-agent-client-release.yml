@@ -1,6 +1,7 @@
 # 独立 edr-agent 仓库：工作目录 = 本仓库根。母库默认发布快速 Windows Agent：
 # `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → `edr-agent-<tag>-windows-amd64-exe.zip`。
-# 当前临时启用全局无证书发布；所有 `win_M.m.p` 都创建明确标记的 unsigned release。
+# 当前无证书时默认发布完整 unsigned bundle；取得证书后将仓库变量
+# `WINDOWS_RELEASE_MODE` 设为 `signed`，无需修改工作流。
 # YARA/ORT 全量依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
@@ -11,6 +12,20 @@ on:
   push:
     tags:
       - 'win_*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the win_ prefix (for example 3.2.266)
+        required: true
+        type: string
+      release_mode:
+        description: Publish a complete signed or unsigned Release Bundle
+        required: true
+        default: unsigned
+        type: choice
+        options:
+          - unsigned
+          - signed
 
 permissions:
   contents: write
@@ -24,11 +39,13 @@ env:
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
   SCCACHE_GHA_ENABLED: "true"
+  EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
+  WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
 
 jobs:
   windows-build:
     name: Build Windows (FDSensor.exe + runtime DLLs, fast no-gRPC)
-    if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'win_') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) }}
     runs-on: windows-latest
     timeout-minutes: 360
     env:
@@ -37,19 +54,22 @@ jobs:
       WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
       WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
       WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
-      # Temporary release mode until the production Authenticode certificate is available.
-      # Restore this to `${{ endsWith(github.ref_name, '-unsigned') }}` when signing is enabled.
-      WINDOWS_RELEASE_UNSIGNED: "true"
     steps:
       - uses: actions/checkout@v6
       - name: Resolve Windows release signing mode
         shell: pwsh
         run: |
-          if ($env:WINDOWS_RELEASE_UNSIGNED -eq 'true') {
+          $mode = $env:WINDOWS_RELEASE_MODE.Trim().ToLowerInvariant()
+          if ($mode -notin @('signed', 'unsigned')) {
+            throw "WINDOWS_RELEASE_MODE must be signed or unsigned"
+          }
+          if ($mode -eq 'unsigned') {
+            "WINDOWS_RELEASE_UNSIGNED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
             "WINDOWS_RELEASE_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "::warning title=Unsigned Windows release::Authenticode and CMS signing are disabled for tag ${{ github.ref_name }}. Automatic Agent update assets will not be published."
+            Write-Host "::warning title=Unsigned Windows release::Authenticode and CMS signing are disabled for tag $env:EDR_AGENT_RELEASE_TAG. The complete SHA-256-pinned update bundle will still be published."
             exit 0
           }
+          "WINDOWS_RELEASE_UNSIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           $required = @(
             'WINDOWS_SIGNING_PFX_BASE64',
@@ -113,7 +133,7 @@ jobs:
       - name: Extract version from tag & update source files
         shell: pwsh
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:EDR_AGENT_RELEASE_TAG
           # Tag format: win_<version>  or  <prefix>_<version>
           # Extract a.b.c version string
           if ($tag -match '_(\d+\.\d+\.\d+)(?:-unsigned)?$') {
@@ -129,6 +149,7 @@ jobs:
             Write-Host "::error::update-version.ps1 failed with exit code $LASTEXITCODE"
             throw "Version update failed"
           }
+          "EDR_AGENT_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
           "EDR_AGENT_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $ver)
           Write-Host "Version update completed successfully"
@@ -153,11 +174,10 @@ jobs:
           python .\scripts\prepare_p0_release_bundle.py
 
       - name: Validate release tag (semver)
-        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
-          ref="${GITHUB_REF_NAME}"
+          ref="${EDR_AGENT_RELEASE_TAG}"
           if [[ ! "${ref}" =~ ^win_[0-9]+\.[0-9]+\.[0-9]+(-unsigned)?$ ]]; then
             echo "::error::Invalid tag '${ref}'."
             exit 1
@@ -165,10 +185,7 @@ jobs:
           version="${ref#win_}"
           version="${version%-unsigned}"
           printf '%s\n' "${version}" > VERSION
-          {
-            echo "EDR_AGENT_RELEASE_TAG=${ref}"
-            echo "EDR_AGENT_VERSION=${version}"
-          } >> "${GITHUB_ENV}"
+          echo "EDR_AGENT_VERSION=${version}" >> "${GITHUB_ENV}"
           echo "release tag: ${ref}"
           echo "agent version: ${version}"
 
@@ -466,7 +483,7 @@ jobs:
       - name: Package (setup exe + runtime zip)
         shell: pwsh
         run: |
-          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          $zip = "edr-agent-$env:EDR_AGENT_RELEASE_TAG-windows-amd64-exe.zip"
           $outDir = $null
           $agentExe = $null
           foreach ($c in @("build\Release", "build")) {
@@ -665,8 +682,8 @@ jobs:
       - name: Prepare release assets
         shell: pwsh
         run: |
-          $ref = "${{ github.ref_name }}"
-          $src = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          $ref = $env:EDR_AGENT_RELEASE_TAG
+          $src = "edr-agent-$ref-windows-amd64-exe.zip"
           if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
           if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
           if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
@@ -676,22 +693,19 @@ jobs:
           $runtimeAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-exe.zip"
           $setupAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-setup.exe"
           $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-setup-ui.zip"
-          $agentAsset = $null
+          $agentAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-FDSensor.exe"
           Copy-Item -LiteralPath $src -Destination $runtimeAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset -Force
+          $agentBinary = @("build\Release\FDSensor.exe", "build\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $agentBinary) { throw "FDSensor.exe not found for raw update asset" }
           if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
-            $agentAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-FDSensor.exe"
-            $signedAgent = @("build\Release\FDSensor.exe", "build\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-            if (-not $signedAgent) { throw "signed FDSensor.exe not found for raw update asset" }
-            $agentSignature = Get-AuthenticodeSignature -LiteralPath $signedAgent
+            $agentSignature = Get-AuthenticodeSignature -LiteralPath $agentBinary
             if ($agentSignature.Status -ne 'Valid') { throw "raw update asset source does not have a valid Authenticode signature" }
             if (($agentSignature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant() -ne ($env:WINDOWS_SIGNING_THUMBPRINT -replace '\s','').ToUpperInvariant()) { throw 'raw update asset publisher thumbprint mismatch' }
-            Copy-Item -LiteralPath $signedAgent -Destination $agentAsset -Force
-            if ((Get-FileHash $signedAgent -Algorithm SHA256).Hash -ne (Get-FileHash $agentAsset -Algorithm SHA256).Hash) { throw 'raw update asset changed while copying' }
-          } else {
-            Write-Host "::warning::Raw Agent update asset is omitted because the release is unsigned."
           }
+          Copy-Item -LiteralPath $agentBinary -Destination $agentAsset -Force
+          if ((Get-FileHash $agentBinary -Algorithm SHA256).Hash -ne (Get-FileHash $agentAsset -Algorithm SHA256).Hash) { throw 'raw update asset changed while copying' }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zipObj = [System.IO.Compression.ZipFile]::OpenRead($runtimeAsset)
@@ -733,7 +747,7 @@ jobs:
           }
           foreach ($asset in Get-ChildItem -LiteralPath $dist -File | Sort-Object Name) {
             $entry = [ordered]@{ name=$asset.Name; size=$asset.Length; sha256=(Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
-            if ($agentAsset -and $asset.FullName -eq $agentAsset) {
+            if ($asset.FullName -eq $agentAsset) {
               $entry.version = $env:EDR_AGENT_VERSION
               $entry.platform = 'windows'
               $entry.arch = 'amd64'
@@ -777,31 +791,31 @@ jobs:
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
       - name: Publish signed Windows release
-        if: env.WINDOWS_RELEASE_UNSIGNED != 'true'
+        if: env.WINDOWS_RELEASE_MODE == 'signed'
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (Windows amd64, fast no-gRPC + ONNX)
+          tag_name: ${{ env.EDR_AGENT_RELEASE_TAG }}
+          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (Windows amd64, fast no-gRPC + ONNX)
           generate_release_notes: true
           files: |
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup.exe
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup-ui.zip
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-FDSensor.exe
-            dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json
-            dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json.p7s
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-exe.zip
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup.exe
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup-ui.zip
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-FDSensor.exe
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-artifact-manifest.json
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-artifact-manifest.json.p7s
           fail_on_unmatched_files: true
 
       - name: Publish unsigned Windows release
-        if: env.WINDOWS_RELEASE_UNSIGNED == 'true'
+        if: env.WINDOWS_RELEASE_MODE == 'unsigned'
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref_name }}
-          name: edr-agent ${{ github.ref_name }} (UNSIGNED Windows amd64)
+          tag_name: ${{ env.EDR_AGENT_RELEASE_TAG }}
+          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (UNSIGNED Windows amd64)
           prerelease: false
           make_latest: true
           generate_release_notes: true
@@ -809,10 +823,12 @@ jobs:
             WARNING: This temporary Windows build is unsigned.
             Windows will show an unknown-publisher warning. Platform publication and Agent update require
             EDR_AGENT_RELEASE_SIGNATURE_POLICY=optional and remain pinned to the manifest and task SHA-256.
-            The standalone FDSensor.exe update asset is intentionally omitted until Authenticode signing is enabled.
+            The standalone FDSensor.exe and manifest update metadata are published so an optional-signature
+            platform can verify and promote the exact SHA-256-pinned artifact.
           files: |
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup.exe
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup-ui.zip
-            dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-exe.zip
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup.exe
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup-ui.zip
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-FDSensor.exe
+            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-artifact-manifest.json
           fail_on_unmatched_files: true
