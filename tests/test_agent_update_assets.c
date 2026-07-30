@@ -98,6 +98,7 @@ int main(void) {
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
   contains(workflow, "Assert-WindowsPeArchitecture.ps1", "release rejects architecture-mismatched PE files");
+  contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
            "ARM64 release excludes unsupported WinDivert drivers");
   contains(workflow, "actions/upload-artifact@v4", "architecture bundles are retained before publication");

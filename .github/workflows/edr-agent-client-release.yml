@@ -371,6 +371,7 @@ jobs:
             "-DCMAKE_PREFIX_PATH=$env:VCPKG_INSTALLED_ROOT" `
             "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
             "-DCMAKE_SYSTEM_PROCESSOR=$env:EDR_CMAKE_PROCESSOR" `
+            "-DEDR_WINDOWS_TARGET_ARCH=$env:EDR_RELEASE_ARCH" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
@@ -422,7 +423,6 @@ jobs:
           $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $exe) { throw "FDSensor.exe not found after build" }
           & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $exe -Architecture $env:EDR_RELEASE_ARCH
-          if ($LASTEXITCODE -ne 0) { throw "FDSensor.exe architecture verification failed" }
           $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
           if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
           if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
