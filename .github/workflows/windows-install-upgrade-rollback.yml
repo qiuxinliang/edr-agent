@@ -1,0 +1,95 @@
+name: Windows install upgrade rollback
+
+on:
+  workflow_run:
+    workflows:
+      - edr-agent client release
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: Target release tag
+        required: true
+        type: string
+      baseline_tag:
+        description: Previously verified release used for upgrade and rollback
+        required: true
+        default: win_3.2.263
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-lifecycle-${{ github.event.workflow_run.id || inputs.target_tag }}
+  cancel-in-progress: false
+
+jobs:
+  amd64-lifecycle:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve release tags
+        shell: pwsh
+        run: |
+          $target = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ inputs.target_tag }}'
+          } else {
+            '${{ github.event.workflow_run.head_branch }}'
+          }
+          $baseline = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ inputs.baseline_tag }}'
+          } else {
+            'win_3.2.263'
+          }
+          foreach ($value in @($target, $baseline)) {
+            if ($value -notmatch '^win_\d+\.\d+\.\d+$') {
+              throw "invalid release tag: $value"
+            }
+          }
+          if ($target -eq $baseline) { throw 'target and baseline releases must differ' }
+          "TARGET_TAG=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TARGET_VERSION=$($target.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "BASELINE_TAG=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "BASELINE_VERSION=$($baseline.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download immutable AMD64 release packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path downloads\target, downloads\baseline | Out-Null
+          gh release download $env:TARGET_TAG --repo $env:GITHUB_REPOSITORY `
+            --pattern "*windows-amd64-exe.zip" --dir downloads\target
+          gh release download $env:BASELINE_TAG --repo $env:GITHUB_REPOSITORY `
+            --pattern "*windows-amd64-exe.zip" --dir downloads\baseline
+          $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
+          $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
+          if ($targetZip.Count -ne 1 -or $baselineZip.Count -ne 1) {
+            throw "expected one immutable runtime ZIP for each release"
+          }
+          Expand-Archive -LiteralPath $targetZip[0].FullName -DestinationPath packages\target -Force
+          Expand-Archive -LiteralPath $baselineZip[0].FullName -DestinationPath packages\baseline -Force
+
+      - name: Install, upgrade, rollback, and uninstall
+        shell: pwsh
+        run: |
+          .\scripts\windows_release_lifecycle_smoke.ps1 `
+            -BaselinePackageDir packages\baseline `
+            -TargetPackageDir packages\target `
+            -BaselineVersion $env:BASELINE_VERSION `
+            -TargetVersion $env:TARGET_VERSION `
+            -EvidenceDir evidence
+
+      - name: Upload lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64-lifecycle-${{ github.run_id }}
+          path: evidence/**
+          if-no-files-found: warn
+          retention-days: 30
