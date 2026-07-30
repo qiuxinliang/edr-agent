@@ -809,10 +809,10 @@ jobs:
             WARNING: This temporary Windows build is unsigned.
             Windows will show an unknown-publisher warning. Platform publication and Agent update require
             EDR_AGENT_RELEASE_SIGNATURE_POLICY=optional and remain pinned to the manifest and task SHA-256.
+            The standalone FDSensor.exe update asset is intentionally omitted until Authenticode signing is enabled.
           files: |
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup.exe
             dist/edr-agent-${{ github.ref_name }}-windows-amd64-setup-ui.zip
-            dist/edr-agent-${{ github.ref_name }}-windows-amd64-FDSensor.exe
             dist/edr-agent-${{ github.ref_name }}-artifact-manifest.json
           fail_on_unmatched_files: true
