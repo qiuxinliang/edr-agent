@@ -94,6 +94,15 @@ int main(void) {
   contains(workflow, "artifact-manifest.json", "release publishes artifact hash manifest");
   contains(workflow, "workflow_dispatch:", "release supports an explicit manual run");
   contains(workflow, "WINDOWS_RELEASE_MODE", "release signing mode is configuration-driven");
+  contains(workflow, "arch: arm64", "release builds an ARM64 matrix target");
+  contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
+  contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
+  contains(workflow, "Assert-WindowsPeArchitecture.ps1", "release rejects architecture-mismatched PE files");
+  contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
+           "ARM64 release excludes unsupported WinDivert drivers");
+  contains(workflow, "actions/upload-artifact@v4", "architecture bundles are retained before publication");
+  contains(workflow, "Verify combined AMD64/ARM64 asset set",
+           "combined release is published only after both architecture bundles exist");
   contains(workflow, "Copy-Item -LiteralPath $agentBinary -Destination $agentAsset -Force",
            "signed and unsigned releases both publish the raw update artifact");
   contains(workflow, "optional-signature", "unsigned release documents the integrity-pinned platform path");

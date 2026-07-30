@@ -1,5 +1,5 @@
-# 独立 edr-agent 仓库：工作目录 = 本仓库根。母库默认发布快速 Windows Agent：
-# `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → `edr-agent-<tag>-windows-amd64-exe.zip`。
+# 独立 edr-agent 仓库：工作目录 = 本仓库根。默认发布 AMD64/ARM64 Windows Agent：
+# `win_*` tag → vcpkg(curl + sqlite) + ONNX Runtime zip → 双架构 Release Bundle。
 # 当前无证书时默认发布完整 unsigned bundle；取得证书后将仓库变量
 # `WINDOWS_RELEASE_MODE` 设为 `signed`，无需修改工作流。
 # YARA/ORT 全量依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
@@ -35,7 +35,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
   SCCACHE_GHA_ENABLED: "true"
@@ -44,12 +43,37 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows (FDSensor.exe + runtime DLLs, fast no-gRPC)
+    name: Build Windows ${{ matrix.arch }} (FDSensor.exe + runtime DLLs, fast no-gRPC)
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) }}
     runs-on: windows-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            msvc_arch: x64
+            triplet: x64-windows
+            ort_arch: x64
+            runtime_identifier: win-x64
+            cmake_processor: AMD64
+            include_windivert: "true"
+          - arch: arm64
+            msvc_arch: amd64_arm64
+            triplet: arm64-windows
+            ort_arch: arm64
+            runtime_identifier: win-arm64
+            cmake_processor: ARM64
+            include_windivert: "false"
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      EDR_RELEASE_ARCH: ${{ matrix.arch }}
+      EDR_VCPKG_TRIPLET: ${{ matrix.triplet }}
+      EDR_ORT_ARCH: ${{ matrix.ort_arch }}
+      EDR_RUNTIME_IDENTIFIER: ${{ matrix.runtime_identifier }}
+      EDR_CMAKE_PROCESSOR: ${{ matrix.cmake_processor }}
+      EDR_INCLUDE_WINDIVERT: ${{ matrix.include_windivert }}
       WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
       WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
       WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
@@ -156,7 +180,7 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
-          arch: x64
+          arch: ${{ matrix.msvc_arch }}
       - name: Install build tools
         shell: pwsh
         run: choco install ninja innosetup -y --no-progress
@@ -196,36 +220,37 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+            vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
 
       - name: Cache ONNX Runtime
         uses: actions/cache@v5
         with:
           path: onnxrt-win
-          key: onnxrt-x64-win-1.17.3-${{ runner.os }}
+          key: onnxrt-${{ matrix.ort_arch }}-win-1.17.3-${{ runner.os }}
 
       - name: Cache CMake build directory (incremental)
         uses: actions/cache@v5
         with:
           path: build
-          key: build-x64-win-release-fast-nogrpc-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
+          key: build-${{ matrix.arch }}-win-release-fast-nogrpc-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v4
           restore-keys: |
-            build-x64-win-release-fast-nogrpc-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
+            build-${{ matrix.arch }}-win-release-fast-nogrpc-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v4
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
         run: |
-          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          $installedRoot = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\$env:EDR_VCPKG_TRIPLET"
+          $installed_marker = Join-Path $installedRoot "installed\vcpkg\status"
           if (Test-Path $installed_marker) {
             Write-Host "[pre-build-packages] vcpkg cache hit, skip download"
             "VCPKG_SOURCE=cache" | Out-File -FilePath $env:GITHUB_ENV -Append
             return
           }
           $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
-          $release_tag = "prebuild-fast-x64-windows-$hash"
-          $archive = "vcpkg-installed-x64-windows.7z"
+          $release_tag = "prebuild-fast-$env:EDR_VCPKG_TRIPLET-$hash"
+          $archive = "vcpkg-installed-$env:EDR_VCPKG_TRIPLET.7z"
           $url = "https://github.com/${{ github.repository }}/releases/download/$release_tag/$archive"
           Write-Host "[pre-build-packages] Cache miss, trying pre-built: $url"
           try {
@@ -274,12 +299,11 @@ jobs:
 
       - name: vcpkg install (manifest)
         working-directory: ${{ github.workspace }}
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
         shell: pwsh
         run: |
           if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
-          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          $installedRoot = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\$env:EDR_VCPKG_TRIPLET"
+          $installed_marker = Join-Path $installedRoot "installed\vcpkg\status"
           if (Test-Path $installed_marker) {
             Write-Host "[vcpkg] Packages already installed (from $env:VCPKG_SOURCE), verifying..."
           }
@@ -290,26 +314,26 @@ jobs:
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[vcpkg] release path: curl + sqlite + yara (no grpc/protobuf)"
           & $tc install --x-feature=sqlite --x-feature=yara
-          $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
-          Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
+          Write-Host "[vcpkg] YARA package probe under $installedRoot"
           foreach ($p in @(
-            (Join-Path $vcpkgX64 "share\unofficial-libyara\unofficial-libyara-config.cmake"),
-            (Join-Path $vcpkgX64 "include\yara.h"),
-            (Join-Path $vcpkgX64 "include\yara\yara.h"),
-            (Join-Path $vcpkgX64 "lib\yara.lib"),
-            (Join-Path $vcpkgX64 "lib\libyara.lib")
+            (Join-Path $installedRoot "share\unofficial-libyara\unofficial-libyara-config.cmake"),
+            (Join-Path $installedRoot "include\yara.h"),
+            (Join-Path $installedRoot "include\yara\yara.h"),
+            (Join-Path $installedRoot "lib\yara.lib"),
+            (Join-Path $installedRoot "lib\libyara.lib")
           )) {
             if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
           }
 
-          "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_INSTALLED_ROOT=$installedRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: ONNX Runtime (CPU, Windows x64)
+      - name: ONNX Runtime (CPU, Windows ${{ matrix.ort_arch }})
         working-directory: ${{ github.workspace }}
         shell: pwsh
         run: |
           $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
-          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
+          $archiveName = "onnxruntime-win-$env:EDR_ORT_ARCH-1.17.3"
+          $root = Join-Path $dest $archiveName
           if (Test-Path (Join-Path $root "include\onnxruntime_c_api.h")) {
             Write-Host "[skip] ONNX Runtime 1.17.3 already cached at $root"
           } else {
@@ -321,7 +345,7 @@ jobs:
             $wc.Headers.Add('User-Agent', 'edr-agent-ci')
             for ($i = 0; $i -lt 5; $i++) {
               try {
-                $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip", $zip)
+                $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/$archiveName.zip", $zip)
                 Write-Host "ORT download OK"
                 break
               } catch {
@@ -344,8 +368,9 @@ jobs:
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
-            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+            "-DCMAKE_PREFIX_PATH=$env:VCPKG_INSTALLED_ROOT" `
             "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
+            "-DCMAKE_SYSTEM_PROCESSOR=$env:EDR_CMAKE_PROCESSOR" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
@@ -396,6 +421,8 @@ jobs:
         run: |
           $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $exe) { throw "FDSensor.exe not found after build" }
+          & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $exe -Architecture $env:EDR_RELEASE_ARCH
+          if ($LASTEXITCODE -ne 0) { throw "FDSensor.exe architecture verification failed" }
           $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $exe)))
           if ($text.Contains("https requested but OpenSSL disabled")) { throw "missing HTTPS REST OpenSSL support" }
           if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
@@ -442,14 +469,17 @@ jobs:
       - name: Stage ORT + vcpkg runtime DLLs
         shell: pwsh
         run: |
-          $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
           ./scripts/stage_ort_dlls_build_release.ps1
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
-          ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
+          if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
+            ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
+          } else {
+            Write-Host "WinDivert is intentionally omitted from ARM64: upstream WinDivert 2.2.2 has no ARM64 driver."
+          }
 
           $stagedYara = @(Get-ChildItem -Path "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
           if (-not $stagedYara -or $stagedYara.Count -lt 1) {
-            Write-Warning "No YARA runtime DLL staged; vcpkg libyara may be static for x64-windows."
+            Write-Warning "No YARA runtime DLL staged; vcpkg libyara may be static for $env:EDR_VCPKG_TRIPLET."
           } else {
             Write-Host "Verified staged YARA runtime DLL(s): $($stagedYara.Name -join ', ')"
           }
@@ -468,7 +498,7 @@ jobs:
             Write-Host "========================================"
             Write-Host "Total elapsed build time: $($elapsed.TotalMinutes.ToString('F1')) minutes ($($elapsed.TotalSeconds)s)"
             Write-Host "vcpkg source : $env:VCPKG_SOURCE"
-            $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+            $installed_marker = Join-Path $env:VCPKG_INSTALLED_ROOT "installed\vcpkg\status"
             if (Test-Path $installed_marker) {
               $size = [math]::Round(((Get-ChildItem -Path "vcpkg_installed" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
               Write-Host "vcpkg installed size: ${size} MB"
@@ -483,7 +513,7 @@ jobs:
       - name: Package (setup exe + runtime zip)
         shell: pwsh
         run: |
-          $zip = "edr-agent-$env:EDR_AGENT_RELEASE_TAG-windows-amd64-exe.zip"
+          $zip = "edr-agent-$env:EDR_AGENT_RELEASE_TAG-windows-$env:EDR_RELEASE_ARCH-exe.zip"
           $outDir = $null
           $agentExe = $null
           foreach ($c in @("build\Release", "build")) {
@@ -524,10 +554,12 @@ jobs:
           $null = $items.Add($uninstallScript)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
-          foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
-            $asset = Join-Path $outDir $p
-            if (-not (Test-Path -LiteralPath $asset)) { throw "missing staged WinDivert asset: $asset" }
-            $null = $items.Add($asset)
+          if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
+            foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
+              $asset = Join-Path $outDir $p
+              if (-not (Test-Path -LiteralPath $asset)) { throw "missing staged WinDivert asset: $asset" }
+              $null = $items.Add($asset)
+            }
           }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
@@ -564,7 +596,7 @@ jobs:
 
           $innoOut = "install\windows-inno\Output"
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
-          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch amd64
+          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch $env:EDR_RELEASE_ARCH
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
           $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
           if (-not (Test-Path -LiteralPath $setupSrc)) {
@@ -599,7 +631,7 @@ jobs:
             $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
           }
           $agentBinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outDir "FDSensor.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -OutputZip $setupUiZip
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force
@@ -649,12 +681,12 @@ jobs:
             }
 
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
-              Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for x64-windows."
+              Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for $env:EDR_VCPKG_TRIPLET."
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"
             }
-            foreach ($required in @(
+            $requiredEntries = @(
               'edr_agent_install\.ps1',
               'edr_agent_preflight\.ps1',
               'edr_agent_inplace_update\.ps1',
@@ -664,12 +696,15 @@ jobs:
               'FDSecurityInstallerWorker\.exe',
               'uninstall\.exe',
               'uninstall\.ps1',
-              'WinDivert\.dll',
-              'WinDivert64\.sys',
-              'WinDivert-LICENSE\.txt',
               'agent_windows_production\.example\.toml',
               'sensor_interest_manifest\.json'
-            )) {
+            )
+            if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
+              $requiredEntries += @('WinDivert\.dll', 'WinDivert64\.sys', 'WinDivert-LICENSE\.txt')
+            } elseif ($entries -match '(?i)(^|/|\\)WinDivert(64\.sys|\.dll)$') {
+              throw "ARM64 package must not include unsupported WinDivert binaries"
+            }
+            foreach ($required in $requiredEntries) {
               if (-not ($entries -match "(^|/|\\)${required}$")) {
                 throw "required package entry missing: $required"
               }
@@ -683,17 +718,17 @@ jobs:
         shell: pwsh
         run: |
           $ref = $env:EDR_AGENT_RELEASE_TAG
-          $src = "edr-agent-$ref-windows-amd64-exe.zip"
+          $src = "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-exe.zip"
           if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
           if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
           if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
 
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
-          $runtimeAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-exe.zip"
-          $setupAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-setup.exe"
-          $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-setup-ui.zip"
-          $agentAsset = Join-Path $dist "edr-agent-$ref-windows-amd64-FDSensor.exe"
+          $runtimeAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-exe.zip"
+          $setupAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup.exe"
+          $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup-ui.zip"
+          $agentAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-FDSensor.exe"
           Copy-Item -LiteralPath $src -Destination $runtimeAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset -Force
@@ -750,7 +785,7 @@ jobs:
             if ($asset.FullName -eq $agentAsset) {
               $entry.version = $env:EDR_AGENT_VERSION
               $entry.platform = 'windows'
-              $entry.arch = 'amd64'
+              $entry.arch = $env:EDR_RELEASE_ARCH
               $entry.update = [ordered]@{
                 internal_name = 'FDSensor'
                 internal_version = $env:EDR_AGENT_VERSION
@@ -763,7 +798,7 @@ jobs:
             }
             $manifest.artifacts += $entry
           }
-          $manifestPath = Join-Path $dist "edr-agent-$ref-artifact-manifest.json"
+          $manifestPath = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-artifact-manifest.json"
           $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
           if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
             $manifestSignature = "$manifestPath.p7s"
@@ -790,6 +825,41 @@ jobs:
           }
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
+      - name: Upload ${{ matrix.arch }} release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish combined Windows Release Bundle
+    needs: windows-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download architecture bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify combined AMD64/ARM64 asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            for suffix in exe.zip setup.exe setup-ui.zip FDSensor.exe artifact-manifest.json; do
+              path="dist/edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-${suffix}"
+              test -f "${path}" || { echo "::error::missing combined release asset: ${path}"; exit 1; }
+            done
+            if [[ "${WINDOWS_RELEASE_MODE}" == "signed" ]]; then
+              path="dist/edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-artifact-manifest.json.p7s"
+              test -f "${path}" || { echo "::error::missing signed manifest: ${path}"; exit 1; }
+            fi
+          done
+
       - name: Publish signed Windows release
         if: env.WINDOWS_RELEASE_MODE == 'signed'
         uses: softprops/action-gh-release@v2
@@ -797,15 +867,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.EDR_AGENT_RELEASE_TAG }}
-          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (Windows amd64, fast no-gRPC + ONNX)
+          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (Windows AMD64 + ARM64)
           generate_release_notes: true
-          files: |
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-exe.zip
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup.exe
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup-ui.zip
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-FDSensor.exe
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-artifact-manifest.json
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-artifact-manifest.json.p7s
+          files: dist/*
           fail_on_unmatched_files: true
 
       - name: Publish unsigned Windows release
@@ -815,7 +879,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.EDR_AGENT_RELEASE_TAG }}
-          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (UNSIGNED Windows amd64)
+          name: edr-agent ${{ env.EDR_AGENT_RELEASE_TAG }} (UNSIGNED Windows AMD64 + ARM64)
           prerelease: false
           make_latest: true
           generate_release_notes: true
@@ -825,10 +889,5 @@ jobs:
             EDR_AGENT_RELEASE_SIGNATURE_POLICY=optional and remain pinned to the manifest and task SHA-256.
             The standalone FDSensor.exe and manifest update metadata are published so an optional-signature
             platform can verify and promote the exact SHA-256-pinned artifact.
-          files: |
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-exe.zip
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup.exe
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-setup-ui.zip
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-windows-amd64-FDSensor.exe
-            dist/edr-agent-${{ env.EDR_AGENT_RELEASE_TAG }}-artifact-manifest.json
+          files: dist/*
           fail_on_unmatched_files: true
