@@ -85,11 +85,17 @@ jobs:
             -TargetVersion $env:TARGET_VERSION `
             -EvidenceDir evidence
 
-      - name: Upload lifecycle evidence
+      - name: Publish lifecycle evidence summary
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-amd64-lifecycle-${{ github.run_id }}
-          path: evidence/**
-          if-no-files-found: warn
-          retention-days: 30
+        shell: pwsh
+        run: |
+          "## Windows AMD64 lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (Test-Path -LiteralPath evidence\summary.json) {
+            '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Get-Content -LiteralPath evidence\summary.json |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          } else {
+            "Lifecycle did not reach a passing summary. Inspect the failed step and service diagnostics in this job log." |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
