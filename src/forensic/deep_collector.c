@@ -105,6 +105,11 @@ static const char *dc_last_download_detail(void) {
   return g_dc_download_detail[0] ? g_dc_download_detail : "download failed";
 }
 
+static int dc_native_http_client_error(void) {
+  return strstr(g_dc_download_detail, "http get status: HTTP/1.1 4") != NULL ||
+         strstr(g_dc_download_detail, "http get status: HTTP/1.0 4") != NULL;
+}
+
 static void dc_note_native_http_failure(void) {
   EdrIngestHttpRuntime rt;
   memset(&rt, 0, sizeof(rt));
@@ -208,6 +213,11 @@ static int dc_download(const char *url, const char *dest) {
       }
       dc_note_native_http_failure();
       (void)remove(dest); /* 客户端可能留半截/0 字节,清掉再让 curl 兜底重试 */
+      /* 平台 4xx 是确定性的身份/制品状态响应。curl 不携带 Agent 客户端证书，
+       * 对同一安全端点重试只会把原始 404 放大成额外 401。 */
+      if (dc_native_http_client_error()) {
+        return -1;
+      }
     }
   }
   {
@@ -601,13 +611,13 @@ static void dc_append_stderr_tail(const char *err_path, char *out_detail, size_t
 
 /* 版本感知刷新:本地件已存在时,按间隔拉 manifest 比对 sha256,不一致则原子替换(dest.part → dest)。
  * 平台激活新版后无需人工删旧件即可自动滚更。间隔由 EDR_FORENSIC_VERSION_CHECK_SEC 控制
- * (默认 60s;<=0 禁用,回到“仅缺失时重拉”的旧行为)。*last_check 为每槽位静态计时,限流 manifest 拉取。
+ * (默认 900s;<=0 禁用,回到“仅缺失时重拉”的旧行为)。*last_check 为每槽位静态计时,限流 manifest 拉取。
  * 保守:manifest 不可达 / 平台停用 / sha 缺失 / 本地读不了 → 返回 EDR_DC_OK 保留现有件,绝不因瞬时问题破坏在用件。 */
 static int dc_maybe_refresh(const char *dest, const char *manifest_url, const char *pin_sha,
                             time_t *last_check, char *detail, size_t detail_cap) {
   if (!dest || !dest[0] || !manifest_url || !manifest_url[0] || !last_check) return EDR_DC_OK;
   const char *iv = getenv("EDR_FORENSIC_VERSION_CHECK_SEC");
-  long interval = 60;
+  long interval = 900;
   if (iv && iv[0]) interval = atol(iv);
   if (interval <= 0) return EDR_DC_OK; /* 版本检查禁用 */
   time_t now = time(NULL);

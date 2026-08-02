@@ -1880,7 +1880,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
          * adapter/Velociraptor absent for the lifetime of the service. */
         if (edr_ingest_http_configured()) {
           uint64_t refresh_now_ns = edr_monotonic_ns();
-          uint64_t refresh_interval_ns = 60ULL * 1000000000ULL;
+          uint64_t refresh_interval_ns = 900ULL * 1000000000ULL;
           const char *refresh_interval = getenv("EDR_FORENSIC_PREFETCH_RETRY_SEC");
           if (refresh_interval && refresh_interval[0]) {
             long seconds = atol(refresh_interval);

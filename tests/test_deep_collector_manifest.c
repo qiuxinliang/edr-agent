@@ -110,6 +110,15 @@ static void test_json_url_unescape(void) {
               "json url should unescape unicode ampersands");
 }
 
+static void test_native_http_client_error_detection(void) {
+  snprintf(g_dc_download_detail, sizeof(g_dc_download_detail),
+           "native http: http get status: HTTP/1.1 404 Not Found");
+  expect_true(dc_native_http_client_error(), "HTTP 404 should suppress unauthenticated curl fallback");
+  snprintf(g_dc_download_detail, sizeof(g_dc_download_detail),
+           "native http: https tcp connect failed");
+  expect_true(!dc_native_http_client_error(), "transport failure may still use curl fallback");
+}
+
 static void test_artifact_failure_keeps_existing_dest(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
@@ -368,6 +377,7 @@ static void test_blocking_collector_cancels_process_group(void) {
 
 int main(void) {
   test_json_url_unescape();
+  test_native_http_client_error_detection();
   test_artifact_failure_keeps_existing_dest();
   test_success_installs_part_atomically();
   test_artifact_download_fallback_uses_manifest_origin();

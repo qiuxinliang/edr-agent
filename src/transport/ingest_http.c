@@ -937,6 +937,15 @@ static void runtime_failure(const char *msg) {
   }
 }
 
+static int runtime_last_error_is_http_client_error(void) {
+  int rejected;
+  runtime_state_lock();
+  rejected = strstr(s_last_error, "http get status: HTTP/1.1 4") != NULL ||
+             strstr(s_last_error, "http get status: HTTP/1.0 4") != NULL;
+  runtime_state_unlock();
+  return rejected;
+}
+
 static void note_http_request_success(void) {
   runtime_state_lock();
   s_http_request_ok++;
@@ -4981,6 +4990,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   http_lock();
   for (int attempt = 0; attempt < 2; attempt++) {
     int reusable = 0;
+    int client_error = 0;
     EdrHttpConn *conn = http_conn_get_locked(host, port, https);
     if (!conn) {
       break;
@@ -4994,6 +5004,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
       }
       break;
     }
+    client_error = runtime_last_error_is_http_client_error();
     http_conn_close_locked();
     if (fseek(out, 0L, SEEK_SET) == 0) {
 #if defined(_WIN32)
@@ -5001,6 +5012,9 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
 #else
       (void)ftruncate(fileno(out), 0);
 #endif
+    }
+    if (client_error) {
+      break;
     }
   }
   http_unlock();
