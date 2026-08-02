@@ -96,6 +96,10 @@ int main(void) {
                          "service recovery policy failures must stop installation");
   ok &= require_contains(worker, "takeown.exe",
                          "ACL repair must recover ownership before applying queue permissions");
+  ok &= require_contains(worker, "EDR_FORENSIC_VERSION_CHECK_SEC\", L\"900",
+                         "native worker must install the bounded 15-minute forensic version check");
+  ok &= require_contains(worker, "EDR_FORENSIC_PREFETCH_RETRY_SEC\", L\"900",
+                         "native worker must install the bounded 15-minute forensic prefetch retry");
   ok &= require_absent(worker, "L\"/Create /F /TN %ls /SC ONSTART",
                        "native worker must not build a nested-quoted schtasks action");
   free(worker);
@@ -112,7 +116,19 @@ int main(void) {
                          "scheduled task must use the installation directory");
   ok &= require_contains(autorun, "Repair-RuntimeFileAcls -Path $path",
                          "scheduled-task installation must repair explicit ACLs on existing runtime files");
+  ok &= require_contains(autorun, "SetEnvironmentVariable(\"EDR_FORENSIC_VERSION_CHECK_SEC\", \"900\"",
+                         "scheduled-task installation must preserve the 15-minute forensic version check");
+  ok &= require_contains(autorun, "SetEnvironmentVariable(\"EDR_FORENSIC_PREFETCH_RETRY_SEC\", \"900\"",
+                         "scheduled-task installation must preserve the 15-minute forensic prefetch retry");
   free(autorun);
+
+  char *service_installer = read_source(root, "scripts/windows_service_install.ps1");
+  if (!service_installer) return 1;
+  ok &= require_contains(service_installer, "EDR_FORENSIC_VERSION_CHECK_SEC\" \"900",
+                         "service installation must preserve the 15-minute forensic version check");
+  ok &= require_contains(service_installer, "EDR_FORENSIC_PREFETCH_RETRY_SEC\" \"900",
+                         "service installation must preserve the 15-minute forensic prefetch retry");
+  free(service_installer);
 
   char *installer_ps = read_source(root, "scripts/edr_agent_install.ps1");
   if (!installer_ps) return 1;
@@ -130,6 +146,8 @@ int main(void) {
                          "uninstall cleanup must remove stale deny and inheritance ACL state");
   ok &= require_contains(uninstall_ps, "[IO.FileAttributes]::Normal",
                          "uninstall cleanup must clear restrictive file attributes before deletion");
+  ok &= require_contains(uninstall_ps, "EDR_FORENSIC_PREFETCH_RETRY_SEC",
+                         "uninstall must remove the forensic prefetch retry machine setting");
   free(uninstall_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");

@@ -409,11 +409,11 @@ if(WIN32)
     # becomes -DNAME=\"value\"; using the windres form adds a literal backslash
     # and fails with C7772 "invalid string literal".
     set(_EDR_RESOURCE_VERSION_STRING
-      "EDR_VERSION_STRING=\"${PROJECT_VERSION}.0\"")
+      "EDR_VERSION_STRING=\"${PROJECT_VERSION}\"")
   else()
     # GNU windres needs escaped quotes to survive its preprocessor command line.
     set(_EDR_RESOURCE_VERSION_STRING
-      "EDR_VERSION_STRING=\\\"${PROJECT_VERSION}.0\\\"")
+      "EDR_VERSION_STRING=\\\"${PROJECT_VERSION}\\\"")
   endif()
   set(_EDR_RESOURCE_DEFINITIONS
     "EDR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR};EDR_VERSION_MINOR=${PROJECT_VERSION_MINOR};EDR_VERSION_PATCH=${PROJECT_VERSION_PATCH};${_EDR_RESOURCE_VERSION_STRING}")
@@ -583,7 +583,7 @@ target_include_directories(edr_agent PRIVATE
 target_compile_definitions(edr_agent PRIVATE
   EDR_HAVE_NANOPB=1
   "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
-  "EDR_AGENT_UPDATE_SCRIPT_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1\""
+  "EDR_AGENT_UPDATE_SCRIPT_PATH=\"edr_agent_inplace_update.ps1\""
   "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
 )
 if(MSVC)

@@ -83,11 +83,20 @@ function Compare-SemVer {
   return [string]::CompareOrdinal($a.Pre, $b.Pre)
 }
 
+function Normalize-ProductVersion {
+  param([Parameter(Mandatory = $true)][string]$Version)
+  $value = ($Version -split '[ +]')[0].Trim()
+  if ($value -match '^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))(?:\.0)?$') {
+    return [string]$Matches[1]
+  }
+  throw "invalid Windows ProductVersion: $Version"
+}
+
 function Get-VersionIdentity {
   param([Parameter(Mandatory = $true)][string]$Path)
   $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
   $version = [string]$info.ProductVersion
-  if ($version) { $version = ($version -split '[ +]')[0].Trim() }
+  if ($version) { $version = Normalize-ProductVersion $version }
   return [pscustomobject]@{ InternalName=[string]$info.InternalName; ProductVersion=$version }
 }
 

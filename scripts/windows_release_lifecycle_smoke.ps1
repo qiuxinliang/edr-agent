@@ -38,7 +38,12 @@ function Assert-Administrator {
 function Get-AgentVersion {
   param([string]$Path)
   $value = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Path).ProductVersion
-  if ($value) { $value = ($value -split '[ +]')[0].Trim() }
+  if ($value) {
+    $value = ($value -split '[ +]')[0].Trim()
+    if ($value -match '^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))(?:\.0)?$') {
+      $value = [string]$Matches[1]
+    }
+  }
   return $value
 }
 

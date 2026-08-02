@@ -32,6 +32,8 @@ int main(void) {
   contains(script, "SHA256_ONLY_UNSIGNED", "explicit optional-signing update mode exists");
   contains(script, "already verified task-pinned SHA-256", "unsigned mode remains pinned to the task artifact hash");
   contains(script, "Compare-SemVer", "semantic version direction checks exist");
+  contains(script, "Normalize-ProductVersion", "Windows four-part ProductVersion is normalized to release SemVer");
+  contains(script, "(?:\\.0)?", "only a zero fourth Windows version component is accepted");
   contains(script, "$Operation -eq 'upgrade' -and $versionDirection -le 0", "upgrade rejects downgrade and same-version targets");
   contains(script, "$Operation -eq 'rollback' -and $versionDirection -ge 0", "rollback requires an older target version");
   contains(script, "InternalName", "PE InternalName check exists");
@@ -62,6 +64,8 @@ int main(void) {
   contains(command, "runtime_manifest_downloaded", "update can be cancelled after runtime manifest download");
   contains(command, "before_updater_launch", "update can be cancelled before replacement process starts");
   contains(command, "operator_cancelled_before_replacement", "cancel event records the safe cancellation boundary");
+  contains(command, "GetModuleFileNameA", "updater resolves from the installed Agent directory");
+  contains(command, "installed updater script missing", "missing installed updater is rejected before download");
   free(command);
 
   snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
@@ -70,6 +74,8 @@ int main(void) {
   contains(cmake, "src/command/agent_update_event.c", "durable update event outbox is compiled");
   require_true(!strstr(cmake, "src/core/agent_update.c"), "dormant self-overwrite implementation remains disabled");
   contains(cmake, "edr_agent_inplace_update.ps1", "updater script is staged by CMake");
+  require_true(!strstr(cmake, "EDR_AGENT_UPDATE_SCRIPT_PATH=\\\"${CMAKE_CURRENT_SOURCE_DIR}"),
+               "runtime updater path is not pinned to the CI source checkout");
   contains(cmake, "shell32", "Windows external updater launch dependency is linked");
   free(cmake);
 
@@ -80,6 +86,13 @@ int main(void) {
   contains(dispatch, "awaiting terminal updater journal", "replay-blocked update waits instead of failing or relaunching");
   contains(dispatch, "durable inbox is retained", "launch does not delete durable inbox");
   free(dispatch);
+
+  snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
+  char *agent = read_file(path);
+  require_true(agent != NULL, "read Agent capability manifest implementation");
+  contains(agent, "\\\"agent_update_v1\\\"", "runtime capability manifest advertises agent update");
+  contains(agent, "edr_agent_update_resolve_script_path", "capability depends on installed updater readiness");
+  free(agent);
 
   snprintf(path, sizeof(path), "%s/resources/FDSensor.rc", root);
   char *resource = read_file(path);
@@ -101,7 +114,7 @@ int main(void) {
   contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
            "ARM64 release excludes unsupported WinDivert drivers");
-  contains(workflow, "actions/upload-artifact@v4", "architecture bundles are retained before publication");
+  contains(workflow, "gh release upload", "architecture bundles are retained in the draft release before publication");
   contains(workflow, "Verify combined AMD64/ARM64 asset set",
            "combined release is published only after both architecture bundles exist");
   contains(workflow, "Copy-Item -LiteralPath $agentBinary -Destination $agentAsset -Force",

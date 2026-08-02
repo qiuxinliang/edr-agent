@@ -715,7 +715,8 @@ static void set_runtime_env(const wchar_t *install_dir, const wchar_t *config_pa
   set_machine_env(L"EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", path, log_path);
   join_path(path, sizeof(path) / sizeof(path[0]), install_dir, L"collector\\velociraptor.exe");
   set_machine_env(L"EDR_VELOCIRAPTOR_BIN", path, log_path);
-  set_machine_env(L"EDR_FORENSIC_VERSION_CHECK_SEC", L"60", log_path);
+  set_machine_env(L"EDR_FORENSIC_VERSION_CHECK_SEC", L"900", log_path);
+  set_machine_env(L"EDR_FORENSIC_PREFETCH_RETRY_SEC", L"900", log_path);
   set_machine_env(L"EDR_FORENSIC_COLLECTOR_AUTOFETCH", L"1", log_path);
   rest_base[0] = 0;
   if (read_toml_scalar(config_path, "rest_base_url", rest_base, sizeof(rest_base) / sizeof(rest_base[0]))) {
@@ -743,7 +744,8 @@ static void clear_runtime_env(const wchar_t *log_path) {
   const wchar_t *names[] = {L"EDR_UPLOAD_FILE_RETRIES", L"EDR_UPLOAD_FILE_RETRY_BACKOFF_MS", L"EDR_FORENSIC_OUT",
                             L"EDR_FORENSIC_COLLECTOR", L"EDR_FORENSIC_COLLECTOR_BIN",
                             L"EDR_FORENSIC_COLLECTOR_BUILTIN_BIN", L"EDR_VELOCIRAPTOR_BIN",
-                            L"EDR_FORENSIC_VERSION_CHECK_SEC", L"EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+                            L"EDR_FORENSIC_VERSION_CHECK_SEC", L"EDR_FORENSIC_PREFETCH_RETRY_SEC",
+                            L"EDR_FORENSIC_COLLECTOR_AUTOFETCH",
                             L"EDR_FORENSIC_ADAPTER_MANIFEST_URL", L"EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
                             L"EDR_CMD_AUDIT_PATH", L"EDR_SELF_PROTECT_PIDFILE", L"EDR_ISOLATE_STAMP_PATH",
                             L"EDR_GRPC_REQUIRE_MTLS", L"EDR_ISOLATE_HOOK", L"EDR_CMD_ENABLED", NULL};

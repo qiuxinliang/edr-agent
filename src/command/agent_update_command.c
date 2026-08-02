@@ -29,6 +29,37 @@ static int fail(char *reason, size_t cap, const char *message) {
   return 0;
 }
 
+int edr_agent_update_resolve_script_path(char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) return 0;
+  out[0] = '\0';
+#ifndef _WIN32
+  return 0;
+#else
+  char module[MAX_PATH];
+  DWORD length = GetModuleFileNameA(NULL, module, (DWORD)sizeof(module));
+  if (length > 0u && length < sizeof(module)) {
+    char *slash = strrchr(module, '\\');
+    char *forward = strrchr(module, '/');
+    if (!slash || (forward && forward > slash)) slash = forward;
+    if (slash) {
+      slash[1] = '\0';
+      int written = snprintf(out, out_cap, "%sedr_agent_inplace_update.ps1", module);
+      if (written > 0 && (size_t)written < out_cap) {
+        DWORD attrs = GetFileAttributesA(out);
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return 1;
+      }
+    }
+  }
+  int written = snprintf(out, out_cap, "%s", EDR_AGENT_UPDATE_SCRIPT_PATH);
+  if (written > 0 && (size_t)written < out_cap) {
+    DWORD attrs = GetFileAttributesA(out);
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return 1;
+  }
+  out[0] = '\0';
+  return 0;
+#endif
+}
+
 static int copy_json_string(const cJSON *root, const char *name, char *out, size_t cap,
                             int required, char *reason, size_t reason_cap) {
   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
@@ -599,6 +630,11 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
   if (!command_id || !command_id[0]) {
     snprintf(detail, detail_cap, "agent_update command_id required"); return 2;
   }
+  char updater[MAX_PATH];
+  if (!edr_agent_update_resolve_script_path(updater, sizeof(updater))) {
+    snprintf(detail, detail_cap, "agent_update_v1 runtime unavailable: installed updater script missing");
+    return EDR_AGENT_UPDATE_EXIT_UNSUPPORTED;
+  }
   char outbox_dir[MAX_PATH];
   EdrAgentUpdateEventContext event_context;
   event_context_from_request(&req, command_id, &event_context);
@@ -655,7 +691,7 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
   }
   (void)edr_agent_update_event_flush_ingest(outbox_dir, NULL);
-  if (!write_launch_script(launcher, EDR_AGENT_UPDATE_SCRIPT_PATH, staged,
+  if (!write_launch_script(launcher, updater, staged,
                            req.runtime_manifest_url[0] ? manifest : "", &req, command_id ? command_id : "")) {
     return update_failure(&req, command_id, outbox_dir, 3u, "launcher_persist",
                           "cannot persist external updater launch script", 6, detail, detail_cap);

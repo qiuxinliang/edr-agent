@@ -30,6 +30,7 @@
 #include "edr/collector.h"
 #include "edr/command.h"
 #include "edr/command_executor.h"
+#include "edr/agent_update_command.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/enrich_parent_info.h"
@@ -1659,6 +1660,14 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *signing_runtime = !signing_build ? "unavailable"
                                 : !signing_policy ? "disabled"
                                 : signing_key_configured ? "healthy" : "degraded";
+  char agent_update_script[4096];
+  int agent_update_runtime_ready =
+      edr_agent_update_resolve_script_path(agent_update_script, sizeof(agent_update_script));
+  int agent_update_policy = windows_native &&
+      (!signing_policy || (signing_build && signing_key_configured));
+  const char *agent_update_runtime = !windows_native ? "unavailable"
+                                     : !agent_update_runtime_ready ? "degraded"
+                                     : !agent_update_policy ? "disabled" : "healthy";
   const char *ort_runtime = !ort_build ? "unavailable"
                             : !ort_policy ? "disabled"
                             : (ave_ok && avst && avst->initialized && avst->static_model_version[0])
@@ -1748,6 +1757,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"targeted_forensic_process\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"targeted_forensic_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"targeted_forensic_memory\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"agent_update_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
       platform, architecture, native_architecture,
       architecture_emulated ? "true" : "false",
@@ -1792,6 +1802,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
+      windows_native ? "true" : "false", agent_update_policy ? "true" : "false", agent_update_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);
   if (written < 0 || (size_t)written >= out_cap) {
     out[0] = '\0';
