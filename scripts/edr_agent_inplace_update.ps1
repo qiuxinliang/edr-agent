@@ -255,6 +255,7 @@ function Commit-RuntimeUpdatePlan {
     }
     $item.Committed = $true
     $item.Status = "committed"
+    Sync-RuntimePlanJournal
     $actualHash = Get-Sha256 -Path $item.TargetPath
     if ($actualHash -ne $item.ExpectedSha256) {
       throw "installed runtime DLL hash mismatch: name=$($item.Name)"
@@ -284,7 +285,9 @@ function Rollback-RuntimeUpdatePlan {
     } elseif (Test-Path -LiteralPath $item.TargetPath -PathType Leaf) {
       Move-Item -LiteralPath $item.TargetPath -Destination $item.FailedPath -Force
     }
+    $item.Committed = $false
     $item.Status = "rolled_back"
+    Sync-RuntimePlanJournal
   }
 }
 
@@ -395,6 +398,49 @@ function Start-AgentRuntime {
   }
 }
 
+function Get-UnixTimeMilliseconds {
+  return [UInt64][Math]::Floor((((Get-Date).ToUniversalTime()) - [DateTime]'1970-01-01T00:00:00Z').TotalMilliseconds)
+}
+
+function Wait-AgentHealthObservation {
+  param(
+    [string]$Mode,
+    [string]$TaskName,
+    [string]$TaskPath,
+    [string]$WindowsServiceName,
+    [string]$ExecutablePath,
+    [UInt64]$ObserveUntilUnixMs
+  )
+
+  $nextCheckpoint = Get-UnixTimeMilliseconds
+  while ((Get-UnixTimeMilliseconds) -lt $ObserveUntilUnixMs) {
+    if (@(Get-AgentProcesses -ExecutablePath $ExecutablePath).Count -eq 0) {
+      throw 'FDSensor.exe exited during the local health observation window'
+    }
+    if ($Mode -eq 'service') {
+      $service = Get-Service -Name $WindowsServiceName -ErrorAction SilentlyContinue
+      if (-not $service -or $service.Status -ne 'Running') {
+        throw 'Agent service stopped during the local health observation window'
+      }
+    } else {
+      $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+      if (-not $task -or [string]$task.State -ne 'Running') {
+        throw 'Agent scheduled task stopped during the local health observation window'
+      }
+    }
+    $now = Get-UnixTimeMilliseconds
+    if ($now -ge $nextCheckpoint) {
+      $journal['health_last_checked_unix_ms'] = $now
+      Set-UpdateStage -Stage 'health_observation'
+      $nextCheckpoint = $now + 10000
+    }
+    Start-Sleep -Seconds 2
+  }
+  if (@(Get-AgentProcesses -ExecutablePath $ExecutablePath).Count -eq 0) {
+    throw 'FDSensor.exe exited at the end of the local health observation window'
+  }
+}
+
 function Write-UpdateReport {
   param([string]$Path, [object]$Report)
 
@@ -439,6 +485,14 @@ $journal = [ordered]@{
   status = 'running'
   stage = 'initialized'
   replacement_committed = $false
+  backup_path = $backupPath
+  failed_path = $failedPath
+  resolved_deployment_mode = $null
+  previous_sha256 = $null
+  health_observation_started_at_unix_ms = 0
+  health_observation_deadline_unix_ms = 0
+  health_last_checked_unix_ms = 0
+  runtime_files = @()
   last_event_seq = 2
   events = @()
   error = $null
@@ -465,6 +519,72 @@ function Set-UpdateStage {
   if ($report) { $report['stage'] = $Stage }
 }
 
+function Sync-RuntimePlanJournal {
+  $journal['runtime_files'] = @($runtimePlan | ForEach-Object {
+    [ordered]@{
+      name = $_.Name
+      expected_sha256 = $_.ExpectedSha256
+      target_path = $_.TargetPath
+      candidate_path = $_.CandidatePath
+      backup_path = $_.BackupPath
+      failed_path = $_.FailedPath
+      target_existed = [bool]$_.TargetExisted
+      committed = [bool]$_.Committed
+      status = [string]$_.Status
+    }
+  })
+  $journal['updated_at'] = (Get-Date).ToUniversalTime().ToString('o')
+  Write-AtomicJson -Path $journalPath -Value $journal
+}
+
+function Restore-RuntimePlanFromJournal {
+  param([object[]]$Entries)
+  $restored = @()
+  foreach ($entry in @($Entries)) {
+    if (-not $entry) { continue }
+    $committed = [bool]$entry.committed
+    $targetPath = [string]$entry.target_path
+    $candidatePath = [string]$entry.candidate_path
+    $backupPath = [string]$entry.backup_path
+    $expected = ([string]$entry.expected_sha256).ToLowerInvariant()
+    $status = [string]$entry.status
+    $targetExists = $targetPath -and (Test-Path -LiteralPath $targetPath -PathType Leaf)
+    $targetHash = if ($targetExists) { Get-Sha256 -Path $targetPath } else { '' }
+    $backupExists = $backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)
+    if ($status -eq 'rolled_back') {
+      $committed = $false
+    } elseif ($committed -and [bool]$entry.target_existed -and $backupExists -and
+        $targetHash -eq (Get-Sha256 -Path $backupPath)) {
+      # The restore moved the original bytes back before the journal checkpoint.
+      $committed = $false
+      $status = 'rolled_back'
+    } elseif ($committed -and -not [bool]$entry.target_existed -and -not $targetExists) {
+      # A newly added runtime file was already removed by rollback.
+      $committed = $false
+      $status = 'rolled_back'
+    } elseif (-not $committed -and $targetHash -eq $expected -and
+        (($entry.target_existed -and $backupExists) -or
+         (-not $entry.target_existed -and -not (Test-Path -LiteralPath $candidatePath -PathType Leaf)))) {
+      # The commit completed before its durable checkpoint.
+      $committed = $true
+      $status = 'committed'
+    }
+    $restored += [pscustomobject]@{
+      Name = [string]$entry.name
+      ExpectedSha256 = $expected
+      SourcePath = ''
+      TargetPath = $targetPath
+      CandidatePath = $candidatePath
+      BackupPath = $backupPath
+      FailedPath = [string]$entry.failed_path
+      TargetExisted = [bool]$entry.target_existed
+      Committed = $committed
+      Status = $status
+    }
+  }
+  return @($restored)
+}
+
 $report = [ordered]@{
   created_at = (Get-Date).ToUniversalTime().ToString("o")
   completed_at = $null
@@ -486,6 +606,10 @@ $report = [ordered]@{
   error_position = $null
   error_stack = $null
 }
+$resumeCommitted = $false
+$resumeRollback = $false
+$resumeHealthObservation = $false
+$priorLastStatus = ''
 
 try {
   if ($DeadlineUnixMs -le $IssuedAtUnixMs) {
@@ -505,9 +629,54 @@ try {
       if ([string]$prior.status -eq 'succeeded') { exit 0 }
       exit 1
     }
-    if ([bool]$prior.replacement_committed -or [string]$prior.stage -in @('replacement_committed','start_new_runtime','completed','rollback_started','rollback_completed')) {
-      throw 'recovered update journal proves replacement already committed; refusing duplicate replacement'
+    $journal['last_event_seq'] = [UInt64]$prior.last_event_seq
+    $journal['events'] = @($prior.events)
+    $journal['status'] = [string]$prior.status
+    $journal['stage'] = [string]$prior.stage
+    $journal['replacement_committed'] = [bool]$prior.replacement_committed
+    $journal['error'] = $prior.error
+    $priorProperties = @($prior.PSObject.Properties.Name)
+    foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
+        'health_observation_started_at_unix_ms','health_observation_deadline_unix_ms','health_last_checked_unix_ms')) {
+      if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
+    if ($priorProperties -contains 'backup_path' -and -not [string]::IsNullOrWhiteSpace([string]$prior.backup_path)) {
+      $backupPath = [string]$prior.backup_path
+    }
+    if ($priorProperties -contains 'failed_path' -and -not [string]::IsNullOrWhiteSpace([string]$prior.failed_path)) {
+      $failedPath = [string]$prior.failed_path
+    }
+    if ($priorProperties -contains 'runtime_files') {
+      $runtimePlan = @(Restore-RuntimePlanFromJournal -Entries @($prior.runtime_files))
+      Sync-RuntimePlanJournal
+    }
+    if (@($journal['events']).Count -gt 0) {
+      $priorLastStatus = [string]@($journal['events'])[-1].status
+    }
+    $runtimeCommitDetected = @($runtimePlan | Where-Object { $_.Committed }).Count -gt 0
+    $currentHash = if (Test-Path -LiteralPath $currentPath -PathType Leaf) { Get-Sha256 -Path $currentPath } else { '' }
+    $currentMatchesCandidate = $currentHash -eq $expectedHash
+    $replacementMayHaveStarted = [bool]$prior.replacement_committed -or $currentMatchesCandidate -or
+      [string]$prior.stage -in @('replace_binary','replacement_committed','start_new_runtime','health_observation','resume_after_commit') -or
+      [string]$prior.stage -like 'rollback_*'
+    if ($replacementMayHaveStarted -and -not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+      $fallbackBackup = Get-ChildItem -LiteralPath $installFull -Filter ("FDSensor.exe.rollback-{0}-*" -f $TargetVersion) -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+      if ($fallbackBackup) {
+        $backupPath = $fallbackBackup.FullName
+        $journal['backup_path'] = $backupPath
+      }
+    }
+    $currentMatchesBackup = (Test-Path -LiteralPath $backupPath -PathType Leaf) -and
+      $currentHash -eq (Get-Sha256 -Path $backupPath)
+    $binaryCommitDetected = $currentMatchesCandidate -or ([bool]$prior.replacement_committed -and -not $currentMatchesBackup)
+    $resumeHealthObservation = [string]$prior.stage -eq 'health_observation' -and
+      [UInt64]$journal['health_observation_deadline_unix_ms'] -gt 0
+    $resumeRollback = [string]$prior.stage -like 'rollback_*' -or
+      ($currentMatchesBackup -and $replacementMayHaveStarted) -or
+      ($runtimeCommitDetected -and -not $binaryCommitDetected)
+    $resumeCommitted = $binaryCommitDetected -or [string]$prior.stage -in @(
+      'replacement_committed','start_new_runtime','health_observation','completed','resume_after_commit') -or $resumeRollback
   }
   Set-UpdateStage -Stage "validate_identity"
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -517,6 +686,71 @@ try {
   }
   if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) {
     throw "current Agent binary not found: $currentPath"
+  }
+  if ($resumeCommitted) {
+    $replacementCommitted = $binaryCommitDetected
+    $journal['replacement_committed'] = $replacementCommitted
+    $report['backup_path'] = $backupPath
+    $report['previous_sha256'] = $journal['previous_sha256']
+    $resolvedDeploymentMode = [string]$journal['resolved_deployment_mode']
+    if ([string]::IsNullOrWhiteSpace($resolvedDeploymentMode)) {
+      $resolvedDeploymentMode = Resolve-DeploymentMode -Mode $DeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName
+      $journal['resolved_deployment_mode'] = $resolvedDeploymentMode
+    }
+    if ($resumeRollback) {
+      throw 'resuming interrupted local rollback from durable journal'
+    }
+    if (-not $replacementCommitted -or (Get-Sha256 -Path $currentPath) -ne $expectedHash) {
+      throw 'committed Agent binary no longer matches the task-pinned candidate hash'
+    }
+    foreach ($item in @($runtimePlan | Where-Object { $_.Committed })) {
+      if (-not (Test-Path -LiteralPath $item.TargetPath -PathType Leaf) -or
+          (Get-Sha256 -Path $item.TargetPath) -ne $item.ExpectedSha256) {
+        throw "committed runtime DLL is missing or corrupt: name=$($item.Name)"
+      }
+    }
+    Set-UpdateStage -Stage 'resume_after_commit'
+    $running = @(Get-AgentProcesses -ExecutablePath $currentPath).Count -gt 0
+    if ($resumeHealthObservation -and -not $running) {
+      throw 'Agent exited while recovering the local health observation window'
+    }
+    if (-not $resumeHealthObservation -and $priorLastStatus -notin @('restarting','rolling_back','health_check','rollback_health_check')) {
+      $resumeStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'restarting' }
+      Add-UpdateEvent -Status $resumeStatus -Progress 80 -Detail @{ stage = 'resume_start_new_runtime'; recovered = $true }
+      Set-UpdateStage -Stage 'start_new_runtime'
+    }
+    if (-not $running) {
+      Start-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
+        -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
+        -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
+    }
+    if (-not $resumeHealthObservation) {
+      $observationStarted = Get-UnixTimeMilliseconds
+      $journal['health_observation_started_at_unix_ms'] = $observationStarted
+      $journal['health_observation_deadline_unix_ms'] = $observationStarted + $HealthObserveMs
+      $observingStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'restarting' }
+      Add-UpdateEvent -Status $observingStatus -Progress 90 -Detail @{
+        stage = 'local_health_observation'; health_observe_ms = $HealthObserveMs; local_watchdog = 'observing'; recovered = $true
+      }
+    }
+    $observeUntil = [UInt64]$journal['health_observation_deadline_unix_ms']
+    if ($observeUntil -le 0) {
+      $observeUntil = (Get-UnixTimeMilliseconds) + $HealthObserveMs
+      $journal['health_observation_deadline_unix_ms'] = $observeUntil
+    }
+    Set-UpdateStage -Stage 'health_observation'
+    Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
+      -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
+      -ObserveUntilUnixMs $observeUntil
+    $healthStatus = if ($Operation -eq 'rollback') { 'rollback_health_check' } else { 'health_check' }
+    Add-UpdateEvent -Status $healthStatus -Progress 100 -Detail @{
+      stage = 'local_health_observation_passed'; health_observe_ms = $HealthObserveMs; local_watchdog = 'passed'; recovered = $true
+    }
+    $report['installed_sha256'] = Get-Sha256 -Path $currentPath
+    $report['status'] = 'succeeded'
+    Set-UpdateStage -Stage 'completed' -Status 'succeeded'
+    Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
+    return
   }
   if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf)) {
     throw "staged Agent binary not found: $stagedPath"
@@ -547,6 +781,8 @@ try {
   if ($Operation -eq 'upgrade' -and $MaxCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MaxCurrentVersion) -gt 0) { throw 'current version is above update compatibility ceiling' }
   Assert-AuthenticodePublisher -Path $stagedPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
   $resolvedDeploymentMode = Resolve-DeploymentMode -Mode $DeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName
+  $journal['resolved_deployment_mode'] = $resolvedDeploymentMode
+  Set-UpdateStage -Stage 'deployment_resolved'
 
   Set-UpdateStage -Stage "validate_runtime_manifest"
   if ($RuntimeManifest) {
@@ -556,14 +792,23 @@ try {
   $runtimePlan = @(Get-RuntimeUpdatePlan -StagedBinaryPath $stagedPath `
     -InstallDirectory $installFull -ManifestPath $RuntimeManifest `
     -Version $TargetVersion -Timestamp $stamp)
+  Sync-RuntimePlanJournal
   $verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
-  Add-UpdateEvent -Status $verifiedStatus -Progress 35 -Detail @{ stage = 'candidate_verified' }
+  if ($priorLastStatus -notin @('verified','installing','rolling_back')) {
+    Add-UpdateEvent -Status $verifiedStatus -Progress 35 -Detail @{ stage = 'candidate_verified'; recovered = [bool]$priorLastStatus }
+  }
   Set-UpdateStage -Stage "verified"
 
   $installingStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'installing' }
-  Add-UpdateEvent -Status $installingStatus -Progress 50 -Detail @{ stage = 'stage_candidate' }
+  if ($priorLastStatus -notin @('installing','rolling_back')) {
+    Add-UpdateEvent -Status $installingStatus -Progress 50 -Detail @{ stage = 'stage_candidate'; recovered = [bool]$priorLastStatus }
+  }
   Set-UpdateStage -Stage "stage_candidate"
   $report["previous_sha256"] = Get-Sha256 -Path $currentPath
+  $journal['previous_sha256'] = $report['previous_sha256']
+  $journal['backup_path'] = $backupPath
+  $journal['failed_path'] = $failedPath
+  Set-UpdateStage -Stage 'stage_candidate'
   Copy-Item -LiteralPath $stagedPath -Destination $candidatePath -Force
   if ((Get-Sha256 -Path $candidatePath) -ne $expectedHash) {
     throw "candidate Agent hash changed after local staging"
@@ -597,11 +842,22 @@ try {
     -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
     -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
   $report["installed_sha256"] = Get-Sha256 -Path $currentPath
-  $report["status"] = "succeeded"
+  $observationStarted = Get-UnixTimeMilliseconds
+  $observationDeadline = $observationStarted + $HealthObserveMs
+  $journal['health_observation_started_at_unix_ms'] = $observationStarted
+  $journal['health_observation_deadline_unix_ms'] = $observationDeadline
+  Add-UpdateEvent -Status $restartingStatus -Progress 90 -Detail @{
+    stage = 'local_health_observation'; health_observe_ms = $HealthObserveMs; local_watchdog = 'observing'
+  }
+  Set-UpdateStage -Stage 'health_observation'
+  Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
+    -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
+    -ObserveUntilUnixMs $observationDeadline
   $healthStatus = if ($Operation -eq 'rollback') { 'rollback_health_check' } else { 'health_check' }
   Add-UpdateEvent -Status $healthStatus -Progress 100 -Detail @{
-    stage = 'runtime_healthy'; health_observe_ms = $HealthObserveMs
+    stage = 'local_health_observation_passed'; health_observe_ms = $HealthObserveMs; local_watchdog = 'passed'
   }
+  $report["status"] = "succeeded"
   Set-UpdateStage -Stage "completed" -Status "succeeded"
   Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
 } catch {
@@ -614,7 +870,7 @@ try {
   $report["status"] = "failed"
 
   $runtimeCommitted = @($runtimePlan | Where-Object { $_.Committed }).Count -gt 0
-  if ($replacementCommitted -or $runtimeCommitted) {
+  if ($replacementCommitted -or $runtimeCommitted -or $resumeRollback) {
     try {
       Set-UpdateStage -Stage "rollback_started"
       Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
@@ -630,6 +886,9 @@ try {
         } else {
           Move-Item -LiteralPath $restoreCandidate -Destination $currentPath -Force
         }
+        $replacementCommitted = $false
+        $journal['replacement_committed'] = $false
+        Set-UpdateStage -Stage 'rollback_binary_restored'
       }
       Set-UpdateStage -Stage "rollback_restore_runtime"
       Rollback-RuntimeUpdatePlan -Plan $runtimePlan
@@ -637,6 +896,11 @@ try {
       Start-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
         -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
         -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
+      $rollbackObserveUntil = (Get-UnixTimeMilliseconds) + [UInt64][Math]::Min([double]$HealthObserveMs, 60000.0)
+      Set-UpdateStage -Stage 'rollback_health_observation'
+      Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
+        -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
+        -ObserveUntilUnixMs $rollbackObserveUntil
       $report["rollback"] = "succeeded"
       $report["status"] = "failed_rolled_back"
       $report["installed_sha256"] = Get-Sha256 -Path $currentPath
@@ -647,7 +911,7 @@ try {
         Set-UpdateStage -Stage "rollback_health_check"
       } else {
         Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
-          stage = 'rollback_completed'; rolled_back = $true; error = $report['error']
+          stage = 'rollback_completed'; rolled_back = $true; local_watchdog = $true; error = $report['error']
         }
       }
       Set-UpdateStage -Stage "rollback_completed" -Status "failed_rolled_back"

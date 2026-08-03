@@ -356,9 +356,10 @@ static int write_launch_script(const char *path, const char *invocation,
           "$taskName=%s\r\n"
           "$powershell=Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'\r\n"
           "$action=New-ScheduledTaskAction -Execute $powershell -Argument %s\r\n"
+          "$trigger=New-ScheduledTaskTrigger -AtStartup\r\n"
           "$principal=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest\r\n"
-          "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2)\r\n"
-          "Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null\r\n"
+          "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Hours 26)\r\n"
+          "Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null\r\n"
           "Start-ScheduledTask -TaskName $taskName\r\n",
           quoted_task, quoted_args);
   return fclose(file) == 0;

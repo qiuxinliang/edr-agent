@@ -44,6 +44,17 @@ int main(void) {
   contains(script, "Start-ScheduledTask", "scheduled-task start path exists");
   contains(script, "UpdaterTaskName", "temporary updater task identity is explicit");
   contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
+  contains(script, "Wait-AgentHealthObservation", "local health watchdog is enforced before updater exit");
+  contains(script, "local_health_observation_passed", "platform health check starts only after the local watchdog passes");
+  contains(script, "local_watchdog = 'observing'", "local observation is reported as nonterminal runtime progress");
+  contains(script, "$resumeHealthObservation -and -not $running", "Agent exit during recovered health observation forces rollback");
+  contains(script, "resume_after_commit", "committed replacement can resume after updater interruption");
+  contains(script, "Restore-RuntimePlanFromJournal", "runtime DLL rollback plan survives updater interruption");
+  contains(script, "$item.Committed = $false", "runtime rollback checkpoints cannot be applied twice after a crash");
+  contains(script, "$journal['replacement_committed'] = $false", "binary rollback completion is durable across updater crashes");
+  contains(script, "$currentMatchesBackup -and $replacementMayHaveStarted", "binary rollback is inferred if a crash precedes its journal checkpoint");
+  contains(script, "$targetHash -eq (Get-Sha256 -Path $backupPath)", "runtime rollback is inferred from restored file content");
+  contains(script, "health_observation_deadline_unix_ms", "health observation deadline is durable");
   contains(script, "replacement_committed", "durable replacement journal exists");
   contains(script, "schema_version = 2", "journal uses strict v2 schema");
   contains(script, "task_id = $TaskId", "journal binds task identity");
@@ -67,6 +78,9 @@ int main(void) {
   contains(command, "before_updater_launch", "update can be cancelled before replacement process starts");
   contains(command, "operator_cancelled_before_replacement", "cancel event records the safe cancellation boundary");
   contains(command, "New-ScheduledTaskPrincipal", "updater runs in an independent SYSTEM scheduled task");
+  contains(command, "New-ScheduledTaskTrigger -AtStartup", "updater survives a host restart after replacement begins");
+  contains(command, "-RestartCount 5", "updater task retries after an unexpected process exit");
+  contains(command, "-MultipleInstances IgnoreNew", "updater task cannot run duplicate replacement instances");
   contains(command, "ShellExecuteExA", "updater bootstrap completion is observed");
   contains(command, "GetModuleFileNameA", "updater resolves from the installed Agent directory");
   contains(command, "installed updater script missing", "missing installed updater is rejected before download");
