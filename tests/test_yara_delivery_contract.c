@@ -108,8 +108,23 @@ int main(void) {
                          "remote command policy must merge only explicit fields");
   ok &= require_contains(agent, "edr_agent_toml_section_has_key",
                          "remote command policy merge must preserve omitted local settings");
+  ok &= require_contains(agent,
+                         "edr_agent_toml_section_has_key(toml_path, \"command.rtr_shell\", \"allowlist\")",
+                         "remote policy must hot-reload the nested RTR allowlist");
+  ok &= require_contains(agent,
+                         "edr_agent_toml_section_has_key(toml_path, \"command.rtr_shell\", \"max_timeout_sec\")",
+                         "remote policy must hot-reload the nested RTR timeout");
   ok &= require_absent(agent, "agent->cfg.command = remote->command;",
                        "remote policy must not replace the complete command configuration");
+  ok &= require_contains(agent,
+                         "\\\"targeted_forensic_process\\\":{\\\"code_supported\\\":false",
+                         "process targeted forensic must not be advertised before it is implemented");
+  ok &= require_contains(agent,
+                         "\\\"targeted_forensic_registry\\\":{\\\"code_supported\\\":false",
+                         "registry targeted forensic must not be advertised before it is implemented");
+  ok &= require_contains(agent,
+                         "\\\"targeted_forensic_memory\\\":{\\\"code_supported\\\":false",
+                         "memory targeted forensic must use the dedicated memory-dump capability");
   ok &= require_contains(agent, "yara_rules_ready",
                          "capability manifest must distinguish compiled YARA from ready rules");
   ok &= require_contains(agent, "edr_deep_collector_schedule_runtime_refresh();",

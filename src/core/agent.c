@@ -1754,9 +1754,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"memory_dump\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"targeted_forensic\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
       "\"targeted_forensic_file\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
-      "\"targeted_forensic_process\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
-      "\"targeted_forensic_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
-      "\"targeted_forensic_memory\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"targeted_forensic_process\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
+      "\"targeted_forensic_registry\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
+      "\"targeted_forensic_memory\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"agent_update_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
       platform, architecture, native_architecture,
@@ -1799,9 +1799,6 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       windows_native ? "healthy" : (velo_policy ? "idle" : "unavailable"),
       dangerous_policy ? "true" : "false",
       dangerous_policy ? "true" : "false",
-      velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
-      velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
-      velo_policy ? "true" : "false", dangerous_policy ? "true" : "false", velo_policy ? "idle" : "unavailable",
       windows_native ? "true" : "false", agent_update_policy ? "true" : "false", agent_update_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);
   if (written < 0 || (size_t)written >= out_cap) {
@@ -3245,6 +3242,14 @@ static void edr_agent_apply_remote_command_policy(EdrConfig *cfg, const EdrConfi
   EDR_REMOTE_COMMAND_STRING(signing_public_key_path);
   EDR_REMOTE_COMMAND_STRING(signing_public_key_pem);
   EDR_REMOTE_COMMAND_STRING(forensic_yara_rules_dir);
+
+  if (edr_agent_toml_section_has_key(toml_path, "command.rtr_shell", "allowlist")) {
+    snprintf(cfg->command.rtr_shell_allowlist, sizeof(cfg->command.rtr_shell_allowlist), "%s",
+             remote->command.rtr_shell_allowlist);
+  }
+  if (edr_agent_toml_section_has_key(toml_path, "command.rtr_shell", "max_timeout_sec")) {
+    cfg->command.rtr_shell_max_timeout_sec = remote->command.rtr_shell_max_timeout_sec;
+  }
 #undef EDR_REMOTE_COMMAND_STRING
 #undef EDR_REMOTE_COMMAND_U32
 #undef EDR_REMOTE_COMMAND_BOOL
