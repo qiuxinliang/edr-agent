@@ -64,6 +64,7 @@ int edr_agent_update_journal_is_terminal(const char *status);
 int edr_agent_update_journal_blocks_replacement(const char *stage);
 int edr_agent_update_parse_journal(const char *json, EdrAgentUpdateRecovery *out);
 int edr_agent_update_resolve_script_path(char *out, size_t out_cap);
+int edr_agent_update_create_directories(const char *path);
 int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
                              size_t payload_len, char *detail, size_t detail_cap);
 int edr_agent_update_recover(const char *command_id, const uint8_t *payload,

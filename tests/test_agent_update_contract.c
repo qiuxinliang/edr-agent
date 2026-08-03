@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
                                      char *resp_body, size_t resp_body_cap) {
   (void)suffix; (void)body_json; (void)resp_body; (void)resp_body_cap;
@@ -57,6 +61,11 @@ int main(void) {
                    strcmp(request.artifact_id, "artifact-1") == 0 &&
                    request.deadline_unix_ms == 1720003600000ULL,
                "strict update identity and timestamps parsed");
+  require_true(strcmp(request.deployment_mode, "auto") == 0 &&
+                   strcmp(request.scheduled_task_name, "FDSecurityAgent") == 0 &&
+                   strcmp(request.scheduled_task_path, "\\") == 0 &&
+                   strcmp(request.service_name, "FDSecurityAgent") == 0,
+               "missing runtime identifiers receive safe Windows defaults");
   char invalid[4096];
   snprintf(invalid, sizeof(invalid), "%s", valid);
   char *url = strstr(invalid, "https://");
@@ -120,6 +129,27 @@ int main(void) {
   require_true(edr_agent_update_parse_journal(
                    "{\"schema_version\":1,\"status\":\"succeeded\"}", &recovery) < 0,
                "legacy journal without bound identity rejected");
+#ifdef _WIN32
+  char temp[MAX_PATH], nested[MAX_PATH];
+  DWORD temp_len = GetTempPathA(sizeof(temp), temp);
+  require_true(temp_len > 0u && temp_len < sizeof(temp), "Windows temp directory is available");
+  snprintf(nested, sizeof(nested), "%sFDSecurity-update-dir-test-%lu\\parent\\child",
+           temp, (unsigned long)GetCurrentProcessId());
+  require_true(edr_agent_update_create_directories(nested),
+               "first upgrade recursively creates staging parents");
+  DWORD attrs = GetFileAttributesA(nested);
+  require_true(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0u,
+               "recursive staging directory exists");
+  require_true(edr_agent_update_create_directories(nested),
+               "existing staging directory is idempotent");
+  RemoveDirectoryA(nested);
+  char *leaf = strrchr(nested, '\\');
+  if (leaf) {
+    *leaf = '\0'; RemoveDirectoryA(nested);
+    leaf = strrchr(nested, '\\');
+    if (leaf) { *leaf = '\0'; RemoveDirectoryA(nested); }
+  }
+#endif
 #ifndef _WIN32
   char detail[128];
   require_true(edr_agent_update_execute("cmd-1", (const uint8_t *)valid, strlen(valid),

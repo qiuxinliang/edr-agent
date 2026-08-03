@@ -60,6 +60,44 @@ int edr_agent_update_resolve_script_path(char *out, size_t out_cap) {
 #endif
 }
 
+#ifdef _WIN32
+static int agent_update_create_directory(const char *path) {
+  if (CreateDirectoryA(path, NULL)) return 1;
+  if (GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+  DWORD attrs = GetFileAttributesA(path);
+  return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0u;
+}
+#endif
+
+int edr_agent_update_create_directories(const char *path) {
+#ifndef _WIN32
+  (void)path;
+  return 0;
+#else
+  char copy[MAX_PATH];
+  size_t length;
+  if (!path || !path[0] || strlen(path) >= sizeof(copy)) return 0;
+  snprintf(copy, sizeof(copy), "%s", path);
+  length = strlen(copy);
+  while (length > 0u && (copy[length - 1u] == '\\' || copy[length - 1u] == '/')) {
+    copy[--length] = '\0';
+  }
+  if (length == 0u) return 0;
+  for (size_t i = 1u; i < length; ++i) {
+    if (copy[i] != '\\' && copy[i] != '/') continue;
+    if (i == 2u && copy[1] == ':') continue;
+    char saved = copy[i];
+    copy[i] = '\0';
+    if (!agent_update_create_directory(copy)) {
+      copy[i] = saved;
+      return 0;
+    }
+    copy[i] = saved;
+  }
+  return agent_update_create_directory(copy);
+#endif
+}
+
 static int copy_json_string(const cJSON *root, const char *name, char *out, size_t cap,
                             int required, char *reason, size_t reason_cap) {
   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
@@ -246,6 +284,15 @@ int edr_agent_update_parse_request(const uint8_t *payload, size_t payload_len,
   if (strcmp(out->deployment_mode, "auto") && strcmp(out->deployment_mode, "scheduled_task") && strcmp(out->deployment_mode, "service")) {
     fail(reason, reason_cap, "deployment_mode must be auto, scheduled_task, or service"); goto invalid;
   }
+  if (!out->scheduled_task_name[0]) {
+    snprintf(out->scheduled_task_name, sizeof(out->scheduled_task_name), "FDSecurityAgent");
+  }
+  if (!out->scheduled_task_path[0]) {
+    snprintf(out->scheduled_task_path, sizeof(out->scheduled_task_path), "\\");
+  }
+  if (!out->service_name[0]) {
+    snprintf(out->service_name, sizeof(out->service_name), "FDSecurityAgent");
+  }
   if (strncmp(out->artifact_url, "https://", 8u) != 0) {
     fail(reason, reason_cap, "artifact_url must use https"); goto invalid;
   }
@@ -274,21 +321,80 @@ static int quote_ps(const char *input, char *out, size_t cap) {
   return 1;
 }
 
-static int write_launch_script(const char *path, const char *updater, const char *staged,
-                               const char *manifest, const EdrAgentUpdateRequest *req,
-                               const char *command_id) {
+static int write_update_invocation_script(const char *path, const char *updater, const char *staged,
+                                          const char *manifest, const EdrAgentUpdateRequest *req,
+                                          const char *command_id, const char *updater_task_name) {
   const char *values[] = { updater, staged, req->sha256, req->target_version, req->architecture,
     req->internal_name, req->publisher_thumbprint, req->publisher_subject, req->min_current_version,
     req->max_current_version, req->deployment_mode, req->scheduled_task_name,
     req->scheduled_task_path, req->service_name, command_id, manifest, req->runtime_manifest_sha256,
-    req->task_id, req->campaign_id, req->operation, req->artifact_id };
-  char quoted[21][4600];
-  for (size_t i = 0; i < 21u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
+    req->task_id, req->campaign_id, req->operation, req->artifact_id, updater_task_name };
+  char quoted[22][4600];
+  for (size_t i = 0; i < 22u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
   FILE *file = fopen(path, "wb");
   if (!file) return 0;
-  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\nexit $LASTEXITCODE\r\n",
-          quoted[0], quoted[1], quoted[2], quoted[3], quoted[4], quoted[5], quoted[6], quoted[7], quoted[8], quoted[9], quoted[10], quoted[11], quoted[12], quoted[13], quoted[14], quoted[15], quoted[16], quoted[17], quoted[18], quoted[19], quoted[20], (unsigned long long)req->min_free_bytes, (unsigned long long)req->issued_at_unix_ms, (unsigned long long)req->deadline_unix_ms, (unsigned long long)req->health_observe_ms);
+  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\nexit $LASTEXITCODE\r\n",
+          quoted[0], quoted[1], quoted[2], quoted[3], quoted[4], quoted[5], quoted[6], quoted[7], quoted[8], quoted[9], quoted[10], quoted[11], quoted[12], quoted[13], quoted[14], quoted[15], quoted[16], quoted[17], quoted[18], quoted[19], quoted[20], quoted[21], (unsigned long long)req->min_free_bytes, (unsigned long long)req->issued_at_unix_ms, (unsigned long long)req->deadline_unix_ms, (unsigned long long)req->health_observe_ms);
   return fclose(file) == 0;
+}
+
+static int write_launch_script(const char *path, const char *invocation,
+                               const char *updater_task_name) {
+  char invocation_args[2 * MAX_PATH + 160];
+  char quoted_args[2 * MAX_PATH + 320];
+  char quoted_task[512];
+  int written = snprintf(invocation_args, sizeof(invocation_args),
+                         "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
+                         invocation ? invocation : "");
+  if (written <= 0 || (size_t)written >= sizeof(invocation_args) ||
+      !quote_ps(invocation_args, quoted_args, sizeof(quoted_args)) ||
+      !quote_ps(updater_task_name, quoted_task, sizeof(quoted_task))) return 0;
+  FILE *file = fopen(path, "wb");
+  if (!file) return 0;
+  fprintf(file,
+          "$ErrorActionPreference='Stop'\r\n"
+          "$taskName=%s\r\n"
+          "$powershell=Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'\r\n"
+          "$action=New-ScheduledTaskAction -Execute $powershell -Argument %s\r\n"
+          "$principal=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest\r\n"
+          "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2)\r\n"
+          "Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null\r\n"
+          "Start-ScheduledTask -TaskName $taskName\r\n",
+          quoted_task, quoted_args);
+  return fclose(file) == 0;
+}
+
+static int launch_update_bootstrap(const char *launcher, const char *working_dir,
+                                   char *reason, size_t reason_cap) {
+  char params[2 * MAX_PATH + 160];
+  snprintf(params, sizeof(params), "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
+           launcher ? launcher : "");
+  SHELLEXECUTEINFOA execute;
+  memset(&execute, 0, sizeof(execute));
+  execute.cbSize = sizeof(execute);
+  execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+  execute.lpVerb = "open";
+  execute.lpFile = "powershell.exe";
+  execute.lpParameters = params;
+  execute.lpDirectory = working_dir;
+  execute.nShow = SW_HIDE;
+  if (!ShellExecuteExA(&execute) || !execute.hProcess) {
+    snprintf(reason, reason_cap, "isolated updater bootstrap launch failed gle=%lu",
+             (unsigned long)GetLastError());
+    return 0;
+  }
+  DWORD waited = WaitForSingleObject(execute.hProcess, 30000u);
+  DWORD exit_code = STILL_ACTIVE;
+  if (waited == WAIT_OBJECT_0) (void)GetExitCodeProcess(execute.hProcess, &exit_code);
+  if (waited != WAIT_OBJECT_0 || exit_code != 0u) {
+    if (waited == WAIT_TIMEOUT) (void)TerminateProcess(execute.hProcess, 124u);
+    snprintf(reason, reason_cap, "isolated updater bootstrap failed wait=%lu exit=%lu",
+             (unsigned long)waited, (unsigned long)exit_code);
+    CloseHandle(execute.hProcess);
+    return 0;
+  }
+  CloseHandle(execute.hProcess);
+  return 1;
 }
 #endif
 
@@ -654,18 +760,19 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
   }
   (void)edr_agent_update_event_flush_ingest(outbox_dir, NULL);
-  char temp[MAX_PATH], root[MAX_PATH], staged[MAX_PATH], manifest[MAX_PATH], launcher[MAX_PATH];
+  char temp[MAX_PATH], root[MAX_PATH], staged[MAX_PATH], manifest[MAX_PATH], launcher[MAX_PATH], invocation[MAX_PATH];
   DWORD n = GetTempPathA(sizeof(temp), temp);
   if (!n || n >= sizeof(temp))
     return update_failure(&req, command_id, outbox_dir, 2u, "staging_directory",
                           "cannot resolve update staging directory", 3, detail, detail_cap);
   snprintf(root, sizeof(root), "%sFDSecurity\\agent-update\\%s", temp, command_id ? command_id : "unknown");
-  if (!CreateDirectoryA(root, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+  if (!edr_agent_update_create_directories(root))
     return update_failure(&req, command_id, outbox_dir, 2u, "staging_directory",
                           "cannot create update staging directory", 3, detail, detail_cap);
   snprintf(staged, sizeof(staged), "%s\\FDSensor.next.exe", root);
   snprintf(manifest, sizeof(manifest), "%s\\runtime-manifest.json", root);
   snprintf(launcher, sizeof(launcher), "%s\\launch-update.ps1", root);
+  snprintf(invocation, sizeof(invocation), "%s\\invoke-update.ps1", root);
   if (edr_ingest_http_get_url_to_file(req.artifact_url, staged, EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES) != 0) {
     return update_failure(&req, command_id, outbox_dir, 2u, "artifact_download",
                           "authenticated update artifact download failed", 4, detail, detail_cap);
@@ -691,25 +798,26 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
   }
   (void)edr_agent_update_event_flush_ingest(outbox_dir, NULL);
-  if (!write_launch_script(launcher, updater, staged,
-                           req.runtime_manifest_url[0] ? manifest : "", &req, command_id ? command_id : "")) {
+  char safe_id[129], updater_task_name[180];
+  safe_command_id(command_id, safe_id, sizeof(safe_id));
+  snprintf(updater_task_name, sizeof(updater_task_name), "FDSecurityAgentUpdate-%s", safe_id);
+  if (!write_update_invocation_script(invocation, updater, staged,
+                                      req.runtime_manifest_url[0] ? manifest : "", &req,
+                                      command_id ? command_id : "", updater_task_name) ||
+      !write_launch_script(launcher, invocation, updater_task_name)) {
     return update_failure(&req, command_id, outbox_dir, 3u, "launcher_persist",
                           "cannot persist external updater launch script", 6, detail, detail_cap);
   }
   cancel_rc = update_cancelled(&req, command_id, outbox_dir, 3u,
                                "before_updater_launch", detail, detail_cap);
-  if (cancel_rc) { DeleteFileA(staged); DeleteFileA(manifest); DeleteFileA(launcher); return cancel_rc; }
-  char params[2 * MAX_PATH + 160];
-  snprintf(params, sizeof(params), "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"", launcher);
-  HINSTANCE launched = ShellExecuteA(NULL, "open", "powershell.exe", params, root, SW_HIDE);
-  if ((INT_PTR)launched <= 32) {
-    char launch_error[128];
-    snprintf(launch_error, sizeof(launch_error), "external updater launch failed code=%lld",
-             (long long)(INT_PTR)launched);
+  if (cancel_rc) { DeleteFileA(staged); DeleteFileA(manifest); DeleteFileA(launcher); DeleteFileA(invocation); return cancel_rc; }
+  char launch_error[256];
+  if (!launch_update_bootstrap(launcher, root, launch_error, sizeof(launch_error))) {
     return update_failure(&req, command_id, outbox_dir, 3u, "launcher_start",
                           launch_error, 7, detail, detail_cap);
   }
-  snprintf(detail, detail_cap, "agent update staged and external updater launched command_id=%s target_version=%s", command_id ? command_id : "", req.target_version);
+  DeleteFileA(launcher);
+  snprintf(detail, detail_cap, "agent update staged and isolated updater task launched command_id=%s target_version=%s", command_id ? command_id : "", req.target_version);
   return EDR_AGENT_UPDATE_EXIT_LAUNCHED;
 #endif
 }

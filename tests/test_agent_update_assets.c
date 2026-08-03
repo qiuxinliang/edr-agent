@@ -42,6 +42,8 @@ int main(void) {
   contains(script, "Resolve-DeploymentMode", "auto deployment mode exists");
   contains(script, "Stop-Service", "service stop path exists");
   contains(script, "Start-ScheduledTask", "scheduled-task start path exists");
+  contains(script, "UpdaterTaskName", "temporary updater task identity is explicit");
+  contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
   contains(script, "replacement_committed", "durable replacement journal exists");
   contains(script, "schema_version = 2", "journal uses strict v2 schema");
   contains(script, "task_id = $TaskId", "journal binds task identity");
@@ -64,6 +66,8 @@ int main(void) {
   contains(command, "runtime_manifest_downloaded", "update can be cancelled after runtime manifest download");
   contains(command, "before_updater_launch", "update can be cancelled before replacement process starts");
   contains(command, "operator_cancelled_before_replacement", "cancel event records the safe cancellation boundary");
+  contains(command, "New-ScheduledTaskPrincipal", "updater runs in an independent SYSTEM scheduled task");
+  contains(command, "ShellExecuteExA", "updater bootstrap completion is observed");
   contains(command, "GetModuleFileNameA", "updater resolves from the installed Agent directory");
   contains(command, "installed updater script missing", "missing installed updater is rejected before download");
   free(command);

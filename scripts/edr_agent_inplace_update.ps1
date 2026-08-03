@@ -31,6 +31,7 @@ param(
   [string]$ScheduledTaskName = "FDSecurityAgent",
   [string]$ScheduledTaskPath = "\",
   [string]$ServiceName = "FDSecurityAgent",
+  [string]$UpdaterTaskName = "",
   [ValidateRange(0, 1099511627776)]
   [UInt64]$MinFreeBytes = 0,
   [string]$CommandId = "manual",
@@ -704,6 +705,13 @@ try {
     Write-UpdateReport -Path $reportPath -Report $report
   } catch {
     Write-Error ("failed to persist Agent update report: " + $_.Exception.Message)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($UpdaterTaskName)) {
+    try {
+      Unregister-ScheduledTask -TaskName $UpdaterTaskName -Confirm:$false -ErrorAction Stop
+    } catch {
+      Write-Warning ("failed to remove temporary Agent updater task: " + $_.Exception.Message)
+    }
   }
 }
 
