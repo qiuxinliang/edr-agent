@@ -1,11 +1,17 @@
 name: Windows install upgrade rollback
 
 on:
-  workflow_run:
-    workflows:
-      - edr-agent client release
-    types:
-      - completed
+  workflow_call:
+    inputs:
+      target_tag:
+        description: Target release tag
+        required: true
+        type: string
+      baseline_tag:
+        description: Previously verified release; empty selects the newest older release
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
     inputs:
       target_tag:
@@ -13,21 +19,20 @@ on:
         required: true
         type: string
       baseline_tag:
-        description: Previously verified release used for upgrade and rollback
-        required: true
-        default: win_3.2.263
+        description: Previously verified release; empty selects the newest older release
+        required: false
+        default: ''
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-lifecycle-${{ github.event.workflow_run.id || inputs.target_tag }}
+  group: windows-lifecycle-${{ inputs.target_tag }}
   cancel-in-progress: false
 
 jobs:
   amd64-lifecycle:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: windows-latest
     timeout-minutes: 45
     env:
@@ -38,22 +43,29 @@ jobs:
       - name: Resolve release tags
         shell: pwsh
         run: |
-          $target = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
-            '${{ inputs.target_tag }}'
-          } else {
-            '${{ github.event.workflow_run.head_branch }}'
+          $target = '${{ inputs.target_tag }}'.Trim()
+          $baseline = '${{ inputs.baseline_tag }}'.Trim()
+          if ($target -notmatch '^win_\d+\.\d+\.\d+$') {
+            throw "invalid target release tag: $target"
           }
-          $baseline = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
-            '${{ inputs.baseline_tag }}'
-          } else {
-            'win_3.2.263'
-          }
-          foreach ($value in @($target, $baseline)) {
-            if ($value -notmatch '^win_\d+\.\d+\.\d+$') {
-              throw "invalid release tag: $value"
+          if (-not $baseline) {
+            $targetVersion = [Version]$target.Substring(4)
+            $releaseJson = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 `
+              --json tagName,isDraft,isPrerelease
+            if ($LASTEXITCODE -ne 0) { throw 'cannot list published releases for baseline selection' }
+            $candidates = @()
+            foreach ($release in @($releaseJson | ConvertFrom-Json)) {
+              if ($release.isDraft -or $release.isPrerelease -or $release.tagName -notmatch '^win_\d+\.\d+\.\d+$') { continue }
+              $version = [Version]$release.tagName.Substring(4)
+              if ($version -lt $targetVersion) {
+                $candidates += [pscustomobject]@{ Tag = $release.tagName; Version = $version }
+              }
             }
+            $baseline = ($candidates | Sort-Object Version -Descending | Select-Object -First 1).Tag
           }
+          if ($baseline -notmatch '^win_\d+\.\d+\.\d+$') { throw "no valid older release exists for target $target" }
           if ($target -eq $baseline) { throw 'target and baseline releases must differ' }
+          Write-Host "Lifecycle target=$target baseline=$baseline"
           "TARGET_TAG=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TARGET_VERSION=$($target.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BASELINE_TAG=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Append

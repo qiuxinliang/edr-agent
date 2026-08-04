@@ -1661,8 +1661,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                 : !signing_policy ? "disabled"
                                 : signing_key_configured ? "healthy" : "degraded";
   char agent_update_script[4096];
-  int agent_update_runtime_ready =
-      edr_agent_update_resolve_script_path(agent_update_script, sizeof(agent_update_script));
+  EdrAgentUpdateRuntimeInfo agent_update_info;
+  int agent_update_runtime_ready = edr_agent_update_get_runtime_info(
+      &agent_update_info, agent_update_script, sizeof(agent_update_script));
   int agent_update_policy = windows_native &&
       (!signing_policy || (signing_build && signing_key_configured));
   const char *agent_update_runtime = !windows_native ? "unavailable"
@@ -1757,7 +1758,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"targeted_forensic_process\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"targeted_forensic_registry\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"targeted_forensic_memory\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
-      "\"agent_update_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"agent_update_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
+      "\"updater_source\":\"%s\",\"updater_version\":\"%s\",\"updater_sha256\":\"%s\","
+      "\"updater_protocol_version\":%d,\"updater_materialized\":%s,\"updater_error_code\":\"%s\"},"
       "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
       platform, architecture, native_architecture,
       architecture_emulated ? "true" : "false",
@@ -1800,6 +1803,12 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       dangerous_policy ? "true" : "false",
       dangerous_policy ? "true" : "false",
       windows_native ? "true" : "false", agent_update_policy ? "true" : "false", agent_update_runtime,
+      agent_update_info.source[0] ? agent_update_info.source : "unavailable",
+      agent_update_info.version[0] ? agent_update_info.version : "unknown",
+      agent_update_info.sha256,
+      agent_update_info.protocol_version,
+      agent_update_info.materialized ? "true" : "false",
+      agent_update_info.error_code,
       dangerous_policy ? "true" : "false", velo_query_runtime);
   if (written < 0 || (size_t)written >= out_cap) {
     out[0] = '\0';

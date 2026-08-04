@@ -32,6 +32,7 @@ param(
   [string]$ScheduledTaskPath = "\",
   [string]$ServiceName = "FDSecurityAgent",
   [string]$UpdaterTaskName = "",
+  [string]$StagingDirectory = "",
   [ValidateRange(0, 1099511627776)]
   [UInt64]$MinFreeBytes = 0,
   [string]$CommandId = "manual",
@@ -58,6 +59,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$AgentUpdateUpdaterProtocolVersion = 2
 
 function Get-Sha256 {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -449,6 +451,55 @@ function Write-UpdateReport {
   Write-AtomicJson -Path $Path -Value $Report
 }
 
+function Clear-StaleUpdateWork {
+  param([string]$CurrentStagingDirectory)
+
+  $workRoot = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) 'FDSecurity\agent-update'))
+  if (-not (Test-Path -LiteralPath $workRoot -PathType Container)) { return }
+  $current = if ([string]::IsNullOrWhiteSpace($CurrentStagingDirectory)) { '' } else {
+    [System.IO.Path]::GetFullPath($CurrentStagingDirectory)
+  }
+  $cutoff = (Get-Date).ToUniversalTime().AddHours(-24)
+  foreach ($directory in @(Get-ChildItem -LiteralPath $workRoot -Directory -ErrorAction SilentlyContinue)) {
+    if ($current -and [string]::Equals($directory.FullName, $current, [StringComparison]::OrdinalIgnoreCase)) { continue }
+    if ($directory.LastWriteTimeUtc -ge $cutoff) { continue }
+    $taskName = 'FDSecurityAgentUpdate-' + $directory.Name
+    try {
+      $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+      if ($task) {
+        if ([string]$task.State -eq 'Running') { continue }
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($taskInfo -and $taskInfo.LastRunTime -and $taskInfo.LastRunTime.ToUniversalTime() -ge $cutoff) { continue }
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+      }
+      Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction Stop
+    } catch {
+      Write-Warning ("failed to clean stale Agent update work {0}: {1}" -f $directory.FullName, $_.Exception.Message)
+    }
+  }
+}
+
+function Remove-CurrentUpdateWork {
+  param([string]$Directory, [string]$StagedPath, [string]$SafeCommandId)
+
+  if ([string]::IsNullOrWhiteSpace($Directory)) { return }
+  try {
+    $full = [System.IO.Path]::GetFullPath($Directory)
+    $stagedParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $StagedPath))
+    $workRoot = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) 'FDSecurity\agent-update'))
+    $prefix = $workRoot.TrimEnd('\') + '\'
+    if (-not [string]::Equals($full, $stagedParent, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Split-Path -Leaf $full), $SafeCommandId, [StringComparison]::OrdinalIgnoreCase)) {
+      Write-Warning ("refusing unsafe Agent update staging cleanup: " + $full)
+      return
+    }
+    Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+  } catch {
+    Write-Warning ("failed to clean current Agent update work: " + $_.Exception.Message)
+  }
+}
+
 $installFull = [System.IO.Path]::GetFullPath($InstallDir)
 $stateRoot = Join-Path $env:ProgramData 'FDSecurity\state'
 $logRoot = Join-Path $env:ProgramData 'FDSecurity\logs'
@@ -471,6 +522,7 @@ $replacementCommitted = $false
 $failureMessage = ""
 $runtimePlan = @()
 $resolvedDeploymentMode = $null
+Clear-StaleUpdateWork -CurrentStagingDirectory $StagingDirectory
 $journal = [ordered]@{
   schema_version = 2
   task_id = $TaskId
@@ -977,6 +1029,7 @@ try {
       Write-Warning ("failed to remove temporary Agent updater task: " + $_.Exception.Message)
     }
   }
+  Remove-CurrentUpdateWork -Directory $StagingDirectory -StagedPath $stagedPath -SafeCommandId $safeCommandId
 }
 
 if ($report["status"] -ne "succeeded") {

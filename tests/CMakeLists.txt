@@ -46,6 +46,7 @@ add_executable(test_agent_update_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/agent_update_command.c
   ${CMAKE_SOURCE_DIR}/src/command/agent_update_event.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
@@ -73,6 +74,17 @@ edr_apply_common_warnings(test_agent_update_assets)
 add_test(NAME agent_update_packaging_contract COMMAND test_agent_update_assets)
 set_tests_properties(agent_update_packaging_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+if(WIN32)
+  add_executable(test_agent_update_embedded_resource
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_embedded_resource.c
+    ${CMAKE_SOURCE_DIR}/resources/FDSensor.rc)
+  target_include_directories(test_agent_update_embedded_resource PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  edr_apply_common_warnings(test_agent_update_embedded_resource)
+  add_test(NAME agent_update_embedded_resource COMMAND test_agent_update_embedded_resource)
+  set_tests_properties(agent_update_embedded_resource PROPERTIES
+    ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+endif()
 
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
   ${CMAKE_SOURCE_DIR}/src/command/command_executor.c

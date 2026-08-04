@@ -74,6 +74,25 @@ function Wait-ServiceStable {
   }
 }
 
+function Wait-EmbeddedUpdaterMaterialized {
+  param(
+    [string]$Version,
+    [string]$ExpectedScript,
+    [int]$Seconds = 45
+  )
+  $materialized = Join-Path $installDir ("edr_agent_inplace_update-{0}.ps1" -f $Version)
+  $expectedHash = (Get-FileHash -LiteralPath $ExpectedScript -Algorithm SHA256).Hash
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    if (Test-Path -LiteralPath $materialized -PathType Leaf) {
+      $actualHash = (Get-FileHash -LiteralPath $materialized -Algorithm SHA256).Hash
+      if ($actualHash -eq $expectedHash) { return $actualHash.ToLowerInvariant() }
+      throw "materialized embedded updater hash mismatch: expected=$expectedHash actual=$actualHash"
+    }
+    Start-Sleep -Seconds 1
+  }
+  throw "target Agent did not materialize its embedded updater within $Seconds seconds: $materialized"
+}
+
 function Invoke-VersionTransition {
   param(
     [ValidateSet("upgrade", "rollback")][string]$Operation,
@@ -164,6 +183,8 @@ try {
 
   Invoke-VersionTransition -Operation upgrade -Candidate $targetBinary `
     -Version $TargetVersion -ArtifactID "ci-$TargetVersion-amd64" -UpdateScript $targetUpdater
+  $embeddedUpdaterSha256 = Wait-EmbeddedUpdaterMaterialized -Version $TargetVersion `
+    -ExpectedScript $targetUpdater
   Invoke-VersionTransition -Operation rollback -Candidate $baselineBinary `
     -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-amd64" -UpdateScript $targetUpdater
 
@@ -183,6 +204,8 @@ try {
     architecture = "amd64"
     install = "passed"
     upgrade = "passed"
+    embedded_updater = "passed"
+    embedded_updater_sha256 = $embeddedUpdaterSha256
     rollback = "passed"
     uninstall = "passed"
     completed_at = [DateTimeOffset]::UtcNow.ToString("o")

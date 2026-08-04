@@ -44,6 +44,9 @@ int main(void) {
   contains(script, "Start-ScheduledTask", "scheduled-task start path exists");
   contains(script, "UpdaterTaskName", "temporary updater task identity is explicit");
   contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
+  contains(script, "Clear-StaleUpdateWork", "stale updater tasks and work directories are bounded");
+  contains(script, "Remove-CurrentUpdateWork", "terminal update work is removed after durable reporting");
+  contains(script, "AgentUpdateUpdaterProtocolVersion = 2", "updater protocol version is explicit in the release script");
   contains(script, "Wait-AgentHealthObservation", "local health watchdog is enforced before updater exit");
   contains(script, "local_health_observation_passed", "platform health check starts only after the local watchdog passes");
   contains(script, "local_watchdog = 'observing'", "local observation is reported as nonterminal runtime progress");
@@ -86,7 +89,15 @@ int main(void) {
   contains(command, "FindResourceA", "updater script is loaded from the running Agent resource");
   contains(command, "IDR_EDR_AGENT_UPDATE_SCRIPT", "embedded updater resource identity is explicit");
   contains(command, "MOVEFILE_WRITE_THROUGH", "embedded updater is materialized atomically before use");
-  contains(command, "embedded and installed updater scripts missing", "missing embedded and fallback updater is rejected before download");
+  contains(command, "EMBEDDED_UPDATER_FAILED", "embedded updater extraction failure is distinct from resource absence");
+  contains(command, "if (embedded == EMBEDDED_UPDATER_FAILED) return 0", "embedded extraction failure cannot fall back to a stale sidecar");
+  contains(command, "embedded_materialized_hash_mismatch", "runtime readiness requires the materialized updater bytes to match the embedded resource");
+  contains(command, "cleanup_old_materialized_updaters", "old materialized updater scripts receive bounded cleanup");
+  contains(command, "cleanup_prelaunch_update_work", "pre-launch failures remove the current staging directory immediately");
+  contains(command, "update staging directory path is too long", "staging path truncation fails before download");
+  contains(command, "update staging file path is too long", "staging file truncation fails before download");
+  contains(command, "temp, safe_id", "staging directory uses the same normalized command identity as cleanup");
+  contains(command, "updater_info.error_code", "runtime failure reports the exact updater readiness error before download");
   free(command);
 
   snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
@@ -112,7 +123,10 @@ int main(void) {
   char *agent = read_file(path);
   require_true(agent != NULL, "read Agent capability manifest implementation");
   contains(agent, "\\\"agent_update_v1\\\"", "runtime capability manifest advertises agent update");
-  contains(agent, "edr_agent_update_resolve_script_path", "capability depends on embedded or installed updater readiness");
+  contains(agent, "edr_agent_update_get_runtime_info", "capability depends on audited embedded or installed updater readiness");
+  contains(agent, "updater_protocol_version", "capability reports updater protocol compatibility");
+  contains(agent, "updater_materialized", "capability reports whether the embedded updater was materialized");
+  contains(agent, "updater_sha256", "capability reports the resolved updater hash");
   free(agent);
 
   snprintf(path, sizeof(path), "%s/resources/FDSensor.rc", root);
@@ -147,7 +161,29 @@ int main(void) {
   contains(workflow, "signer_thumbprint", "manifest binds expected signer thumbprint");
   contains(workflow, "CMS signer subject does not match", "release verifies CMS signer identity binding");
   contains(workflow, "edr_agent_inplace_update.ps1", "release package contains updater script");
+  contains(workflow, "windows-install-upgrade-rollback.yml", "release completion includes the Windows lifecycle workflow");
+  contains(workflow, "      - windows-lifecycle", "release publication waits for the Windows lifecycle gate");
+  contains(workflow, "target_tag: ${{ github.event_name == 'workflow_dispatch'", "lifecycle validation receives the exact release tag");
   free(workflow);
+
+  snprintf(path, sizeof(path), "%s/.github/workflows/windows-install-upgrade-rollback.yml", root);
+  char *lifecycle = read_file(path);
+  require_true(lifecycle != NULL, "read Windows release lifecycle workflow");
+  contains(lifecycle, "workflow_call:", "release lifecycle is callable with an explicit target");
+  contains(lifecycle, "target_tag:", "release lifecycle target tag is an explicit input");
+  contains(lifecycle, "gh release list", "blank baseline resolves to the latest lower stable Windows release");
+  require_true(!strstr(lifecycle, "github.event.workflow_run.head_branch"),
+               "release lifecycle never guesses a version from a workflow branch name");
+  contains(lifecycle, "windows_release_lifecycle_smoke.ps1", "release lifecycle executes the Windows install-upgrade-rollback smoke test");
+  free(lifecycle);
+
+  snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
+  char *lifecycle_smoke = read_file(path);
+  require_true(lifecycle_smoke != NULL, "read Windows release lifecycle smoke test");
+  contains(lifecycle_smoke, "Wait-EmbeddedUpdaterMaterialized", "lifecycle verifies updater extraction from the installed target binary");
+  contains(lifecycle_smoke, "embedded updater hash mismatch", "lifecycle binds the materialized updater to the target release hash");
+  contains(lifecycle_smoke, "embedded_updater", "lifecycle summary records embedded updater verification");
+  free(lifecycle_smoke);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");
   return 0;

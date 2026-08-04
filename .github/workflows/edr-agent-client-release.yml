@@ -872,7 +872,9 @@ jobs:
 
   publish-release:
     name: Publish combined Windows Release Bundle
-    needs: windows-build
+    needs:
+      - windows-build
+      - windows-lifecycle
     runs-on: ubuntu-latest
     steps:
       - name: Verify combined AMD64/ARM64 asset set
@@ -928,3 +930,13 @@ jobs:
             --draft=false --prerelease=false --latest \
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (UNSIGNED Windows AMD64 + ARM64)" \
             --notes-file "${body}"
+
+  windows-lifecycle:
+    name: Validate Windows install, upgrade, rollback, and embedded updater
+    needs: windows-build
+    permissions:
+      contents: read
+    uses: ./.github/workflows/windows-install-upgrade-rollback.yml
+    with:
+      target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
+      baseline_tag: ''

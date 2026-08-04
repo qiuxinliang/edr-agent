@@ -11,6 +11,17 @@ extern "C" {
 #define EDR_AGENT_UPDATE_EXIT_UNSUPPORTED 95
 #define EDR_AGENT_UPDATE_EXIT_LAUNCHED 96
 #define EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES (256u * 1024u * 1024u)
+#define EDR_AGENT_UPDATE_UPDATER_PROTOCOL_VERSION 2
+
+typedef struct EdrAgentUpdateRuntimeInfo {
+  int ready;
+  int protocol_version;
+  int materialized;
+  char source[32];
+  char version[65];
+  char sha256[65];
+  char error_code[64];
+} EdrAgentUpdateRuntimeInfo;
 
 typedef struct EdrAgentUpdateRecovery {
   char task_id[129];
@@ -63,6 +74,8 @@ int edr_agent_update_semver_compare(const char *left, const char *right, int *co
 int edr_agent_update_journal_is_terminal(const char *status);
 int edr_agent_update_journal_blocks_replacement(const char *stage);
 int edr_agent_update_parse_journal(const char *json, EdrAgentUpdateRecovery *out);
+int edr_agent_update_get_runtime_info(EdrAgentUpdateRuntimeInfo *info,
+                                      char *script_path, size_t script_path_cap);
 int edr_agent_update_resolve_script_path(char *out, size_t out_cap);
 int edr_agent_update_create_directories(const char *path);
 int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
