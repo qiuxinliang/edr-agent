@@ -12,6 +12,7 @@
 #include <string.h>
 
 #ifdef _WIN32
+#include "edr/windows_resource_ids.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <io.h>
@@ -22,6 +23,66 @@
 #endif
 #ifndef EDR_AGENT_UPDATE_SCRIPT_PATH
 #define EDR_AGENT_UPDATE_SCRIPT_PATH "scripts/edr_agent_inplace_update.ps1"
+#endif
+
+#ifdef _WIN32
+static int materialize_embedded_update_script(char *out, size_t out_cap) {
+  HMODULE module = GetModuleHandleA(NULL);
+  HRSRC resource = module ? FindResourceA(module, MAKEINTRESOURCEA(IDR_EDR_AGENT_UPDATE_SCRIPT), RT_RCDATA) : NULL;
+  HGLOBAL loaded = resource ? LoadResource(module, resource) : NULL;
+  DWORD size = resource ? SizeofResource(module, resource) : 0u;
+  const void *bytes = loaded ? LockResource(loaded) : NULL;
+  if (!bytes || size == 0u) return 0;
+
+  char module_path[MAX_PATH], directory[MAX_PATH], version[96];
+  DWORD module_path_len = GetModuleFileNameA(NULL, module_path, (DWORD)sizeof(module_path));
+  if (module_path_len == 0u || module_path_len >= sizeof(module_path)) return 0;
+  char *slash = strrchr(module_path, '\\');
+  char *forward = strrchr(module_path, '/');
+  if (!slash || (forward && forward > slash)) slash = forward;
+  if (!slash) return 0;
+  *slash = '\0';
+  int written = snprintf(directory, sizeof(directory), "%s", module_path);
+  if (written <= 0 || (size_t)written >= sizeof(directory)) return 0;
+
+  size_t version_len = 0u;
+  for (const unsigned char *p = (const unsigned char *)EDR_AGENT_VERSION_STRING;
+       *p && version_len + 1u < sizeof(version); ++p) {
+    version[version_len++] = (isalnum(*p) || *p == '.' || *p == '-' || *p == '_') ? (char)*p : '_';
+  }
+  if (version_len == 0u) version[version_len++] = '0';
+  version[version_len] = '\0';
+
+  char final_path[MAX_PATH], temporary_path[MAX_PATH];
+  written = snprintf(final_path, sizeof(final_path), "%s\\edr_agent_inplace_update-%s.ps1", directory, version);
+  if (written <= 0 || (size_t)written >= sizeof(final_path)) return 0;
+  written = snprintf(temporary_path, sizeof(temporary_path), "%s.tmp-%lu-%lu", final_path,
+                     (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId());
+  if (written <= 0 || (size_t)written >= sizeof(temporary_path)) return 0;
+
+  HANDLE file = CreateFileA(temporary_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY, NULL);
+  if (file == INVALID_HANDLE_VALUE) return 0;
+  DWORD offset = 0u;
+  int ok = 1;
+  while (offset < size) {
+    DWORD chunk = 0u;
+    if (!WriteFile(file, (const unsigned char *)bytes + offset, size - offset, &chunk, NULL) || chunk == 0u) {
+      ok = 0;
+      break;
+    }
+    offset += chunk;
+  }
+  if (ok && !FlushFileBuffers(file)) ok = 0;
+  CloseHandle(file);
+  if (!ok || !MoveFileExA(temporary_path, final_path,
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileA(temporary_path);
+    return 0;
+  }
+  written = snprintf(out, out_cap, "%s", final_path);
+  return written > 0 && (size_t)written < out_cap;
+}
 #endif
 
 static int fail(char *reason, size_t cap, const char *message) {
@@ -35,6 +96,7 @@ int edr_agent_update_resolve_script_path(char *out, size_t out_cap) {
 #ifndef _WIN32
   return 0;
 #else
+  if (materialize_embedded_update_script(out, out_cap)) return 1;
   char module[MAX_PATH];
   DWORD length = GetModuleFileNameA(NULL, module, (DWORD)sizeof(module));
   if (length > 0u && length < sizeof(module)) {
@@ -739,7 +801,7 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
   }
   char updater[MAX_PATH];
   if (!edr_agent_update_resolve_script_path(updater, sizeof(updater))) {
-    snprintf(detail, detail_cap, "agent_update_v1 runtime unavailable: installed updater script missing");
+    snprintf(detail, detail_cap, "agent_update_v1 runtime unavailable: embedded and installed updater scripts missing");
     return EDR_AGENT_UPDATE_EXIT_UNSUPPORTED;
   }
   char outbox_dir[MAX_PATH];

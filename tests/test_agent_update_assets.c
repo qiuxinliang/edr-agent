@@ -83,7 +83,10 @@ int main(void) {
   contains(command, "-MultipleInstances IgnoreNew", "updater task cannot run duplicate replacement instances");
   contains(command, "ShellExecuteExA", "updater bootstrap completion is observed");
   contains(command, "GetModuleFileNameA", "updater resolves from the installed Agent directory");
-  contains(command, "installed updater script missing", "missing installed updater is rejected before download");
+  contains(command, "FindResourceA", "updater script is loaded from the running Agent resource");
+  contains(command, "IDR_EDR_AGENT_UPDATE_SCRIPT", "embedded updater resource identity is explicit");
+  contains(command, "MOVEFILE_WRITE_THROUGH", "embedded updater is materialized atomically before use");
+  contains(command, "embedded and installed updater scripts missing", "missing embedded and fallback updater is rejected before download");
   free(command);
 
   snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
@@ -109,13 +112,15 @@ int main(void) {
   char *agent = read_file(path);
   require_true(agent != NULL, "read Agent capability manifest implementation");
   contains(agent, "\\\"agent_update_v1\\\"", "runtime capability manifest advertises agent update");
-  contains(agent, "edr_agent_update_resolve_script_path", "capability depends on installed updater readiness");
+  contains(agent, "edr_agent_update_resolve_script_path", "capability depends on embedded or installed updater readiness");
   free(agent);
 
   snprintf(path, sizeof(path), "%s/resources/FDSensor.rc", root);
   char *resource = read_file(path);
   contains(resource, "InternalName", "Windows version resource has InternalName");
   contains(resource, "ProductVersion", "Windows version resource has ProductVersion");
+  contains(resource, "IDR_EDR_AGENT_UPDATE_SCRIPT RCDATA", "Windows binary embeds its matching updater script");
+  contains(resource, "../scripts/edr_agent_inplace_update.ps1", "embedded updater resource uses the release script");
   free(resource);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-release.yml", root);
