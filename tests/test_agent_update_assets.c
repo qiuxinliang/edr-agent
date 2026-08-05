@@ -195,6 +195,12 @@ int main(void) {
   contains(lifecycle_smoke, "Wait-EmbeddedUpdaterMaterialized", "lifecycle verifies updater extraction from the installed target binary");
   contains(lifecycle_smoke, "embedded updater hash mismatch", "lifecycle binds the materialized updater to the target release hash");
   contains(lifecycle_smoke, "embedded_updater", "lifecycle summary records embedded updater verification");
+  contains(lifecycle_smoke, "$targetInstaller = Find-OneFile -Root $TargetPackageDir",
+           "lifecycle uses the current target installer to drive the immutable baseline runtime");
+  contains(lifecycle_smoke, "target package service installer hash mismatch",
+           "lifecycle binds the packaged service installer to the checked-out release source");
+  require_true(!strstr(lifecycle_smoke, "$baselineInstaller"),
+               "lifecycle does not execute an immutable baseline installer with obsolete PowerShell argument semantics");
   free(lifecycle_smoke);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");

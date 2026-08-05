@@ -128,6 +128,14 @@ int main(void) {
                          "service installation must preserve the 15-minute forensic version check");
   ok &= require_contains(service_installer, "EDR_FORENSIC_PREFETCH_RETRY_SEC\" \"900",
                          "service installation must preserve the 15-minute forensic prefetch retry");
+  ok &= require_contains(service_installer, "\"start=\", \"auto\"",
+                         "service installation must pass sc.exe option names and values as separate arguments");
+  ok &= require_contains(service_installer, "sc.exe $($Arguments[0]) failed with exit code",
+                         "service installation must stop immediately when sc.exe fails");
+  ok &= require_absent(service_installer, "\"start= auto\"",
+                       "service installation must not use legacy PowerShell native argument flattening");
+  ok &= require_absent(service_installer, "\"binPath= $binPath\"",
+                       "service installation must keep the sc.exe binPath option separate from its value");
   free(service_installer);
 
   char *installer_ps = read_source(root, "scripts/edr_agent_install.ps1");

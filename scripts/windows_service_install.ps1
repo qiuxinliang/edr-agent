@@ -51,6 +51,18 @@ function Remove-MachineEnv([string]$Name) {
   [Environment]::SetEnvironmentVariable($Name, $null, "Machine")
 }
 
+function Invoke-ServiceControl {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string[]]$Arguments
+  )
+  & sc.exe @Arguments | Out-Host
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    throw "sc.exe $($Arguments[0]) failed with exit code $exitCode"
+  }
+}
+
 function Read-AgentTomlScalar {
   param([string]$Path, [string]$Key)
   if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return "" }
@@ -224,8 +236,18 @@ function Install-AgentService {
   if ($existing) {
     Write-Host "Service $ServiceName already exists; refreshing configuration"
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-    & sc.exe config $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
-    & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host
+    Invoke-ServiceControl -Arguments @(
+      "config", $ServiceName,
+      "binPath=", $binPath,
+      "start=", "auto",
+      "obj=", $Account,
+      "DisplayName=", $DisplayName
+    )
+    Invoke-ServiceControl -Arguments @(
+      "failure", $ServiceName,
+      "actions=", "restart/60000/restart/60000",
+      "reset=", "86400"
+    )
     if (-not $NoStart) {
       Start-Service -Name $ServiceName
     }
@@ -233,9 +255,22 @@ function Install-AgentService {
     return
   }
 
-  & sc.exe create $ServiceName "binPath= $binPath" "start= auto" "obj= $Account" "DisplayName= $DisplayName" | Out-Host
-  & sc.exe description $ServiceName "FDSecurity endpoint sensor" | Out-Host
-  & sc.exe failure $ServiceName "actions= restart/60000/restart/60000" "reset= 86400" | Out-Host
+  Invoke-ServiceControl -Arguments @(
+    "create", $ServiceName,
+    "binPath=", $binPath,
+    "start=", "auto",
+    "obj=", $Account,
+    "DisplayName=", $DisplayName
+  )
+  Invoke-ServiceControl -Arguments @(
+    "description", $ServiceName,
+    "FDSecurity endpoint sensor"
+  )
+  Invoke-ServiceControl -Arguments @(
+    "failure", $ServiceName,
+    "actions=", "restart/60000/restart/60000",
+    "reset=", "86400"
+  )
   if (-not $NoStart) {
     Start-Service -Name $ServiceName
   }

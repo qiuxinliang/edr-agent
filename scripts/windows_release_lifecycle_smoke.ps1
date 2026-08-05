@@ -144,9 +144,19 @@ $baselineBinary = Find-OneFile -Root $BaselinePackageDir -Name "FDSensor.exe"
 $targetBinary = Find-OneFile -Root $TargetPackageDir -Name "FDSensor.exe"
 $baselineRoot = Split-Path -Parent $baselineBinary
 $targetRoot = Split-Path -Parent $targetBinary
-$baselineInstaller = Find-OneFile -Root $BaselinePackageDir -Name "windows_service_install.ps1"
+$targetInstaller = Find-OneFile -Root $TargetPackageDir -Name "windows_service_install.ps1"
 $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_update.ps1"
 $baselineTemplate = Find-OneFile -Root $BaselinePackageDir -Name "agent_windows_production.example.toml"
+$sourceInstaller = Join-Path $PSScriptRoot "windows_service_install.ps1"
+
+if (-not (Test-Path -LiteralPath $sourceInstaller)) {
+  throw "current windows_service_install.ps1 is missing from the checked-out repository"
+}
+$targetInstallerHash = (Get-FileHash -LiteralPath $targetInstaller -Algorithm SHA256).Hash
+$sourceInstallerHash = (Get-FileHash -LiteralPath $sourceInstaller -Algorithm SHA256).Hash
+if ($targetInstallerHash -ne $sourceInstallerHash) {
+  throw "target package service installer hash mismatch"
+}
 
 if ((Get-AgentVersion -Path $baselineBinary) -ne $BaselineVersion) {
   throw "baseline binary ProductVersion does not match $BaselineVersion"
@@ -173,7 +183,10 @@ try {
   $template = $template.Replace('https://edr.example.com/api/v1', 'https://127.0.0.1:9/api/v1')
   [IO.File]::WriteAllText($configPath, $template, (New-Object Text.UTF8Encoding($false)))
 
-  & $baselineInstaller -Action Install -ServiceName $serviceName `
+  # Historical runtime packages remain immutable. Use the target package's
+  # current installer to exercise the baseline binary without reviving an old
+  # PowerShell/sc.exe compatibility bug from the baseline release.
+  & $targetInstaller -Action Install -ServiceName $serviceName `
     -DisplayName "FDSecurity Agent CI Lifecycle Smoke" `
     -ExePath (Join-Path $installDir "FDSensor.exe") `
     -ConfigPath $configPath -InstallDir $installDir -DataDir $installDir `
@@ -188,7 +201,7 @@ try {
   Invoke-VersionTransition -Operation rollback -Candidate $baselineBinary `
     -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-amd64" -UpdateScript $targetUpdater
 
-  & $baselineInstaller -Action Uninstall -ServiceName $serviceName `
+  & $targetInstaller -Action Uninstall -ServiceName $serviceName `
     -ExePath (Join-Path $installDir "FDSensor.exe") `
     -ConfigPath $configPath -InstallDir $installDir -DataDir $installDir `
     -SkipPreflight
