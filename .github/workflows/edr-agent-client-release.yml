@@ -935,7 +935,7 @@ jobs:
     name: Validate Windows install, upgrade, rollback, and embedded updater
     needs: windows-build
     permissions:
-      contents: read
+      contents: write
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml
     with:
       target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}

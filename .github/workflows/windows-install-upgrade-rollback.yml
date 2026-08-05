@@ -25,7 +25,10 @@ on:
         type: string
 
 permissions:
-  contents: read
+  # GitHub hides draft releases from tokens without push-level contents access.
+  # This job never mutates a release, but it must read the target draft assets
+  # before the publish gate can complete.
+  contents: write
 
 concurrency:
   group: windows-lifecycle-${{ inputs.target_tag }}
@@ -78,12 +81,18 @@ jobs:
 
           function Get-ImmutableRuntimeAsset([string]$Tag) {
             $expected = "edr-agent-$Tag-windows-amd64-exe.zip"
-            $releaseOutput = gh release view $Tag --repo $env:GITHUB_REPOSITORY `
-              --json tagName,isDraft,isPrerelease,assets 2>&1
+            $releaseOutput = gh api `
+              "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
             if ($LASTEXITCODE -ne 0) {
-              throw "release '$Tag' was not found or is not readable: $($releaseOutput -join ' ')"
+              throw "cannot list draft and published releases while resolving '$Tag': $($releaseOutput -join ' ')"
             }
-            $release = $releaseOutput | ConvertFrom-Json
+            $releases = @($releaseOutput | ConvertFrom-Json)
+            $releaseMatches = @($releases | Where-Object { $_.tag_name -eq $Tag })
+            if ($releaseMatches.Count -ne 1) {
+              $availableTags = @($releases | ForEach-Object { $_.tag_name }) -join ', '
+              throw "release '$Tag' was not found in the authenticated draft/published release list; visible tags: $availableTags"
+            }
+            $release = $releaseMatches[0]
             $matches = @($release.assets | Where-Object { $_.name -eq $expected })
             if ($matches.Count -ne 1) {
               $available = @($release.assets | ForEach-Object { $_.name }) -join ', '
@@ -94,7 +103,7 @@ jobs:
 
           function Download-ImmutableRuntime([string]$Tag, [string]$Destination) {
             $asset = Get-ImmutableRuntimeAsset $Tag
-            $apiUrl = "$($asset.apiUrl)".Trim()
+            $apiUrl = "$($asset.url)".Trim()
             if (-not $apiUrl) {
               throw "release asset '$($asset.name)' for '$Tag' has no API download URL"
             }

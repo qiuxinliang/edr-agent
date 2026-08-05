@@ -174,6 +174,10 @@ int main(void) {
   contains(lifecycle, "gh release list", "blank baseline resolves to the latest lower stable Windows release");
   contains(lifecycle, "edr-agent-$Tag-windows-amd64-exe.zip",
            "release lifecycle selects baseline runtime assets by immutable exact name");
+  contains(lifecycle, "contents: write",
+           "release lifecycle has the push-level visibility GitHub requires for draft releases");
+  contains(lifecycle, "repos/$env:GITHUB_REPOSITORY/releases?per_page=100",
+           "release lifecycle resolves target drafts from the authenticated release list");
   contains(lifecycle, "Invoke-WebRequest -Uri $apiUrl",
            "release lifecycle downloads draft and published assets through the authenticated asset API");
   contains(lifecycle, "runtime '$($asset.name)' SHA-256 mismatch",
