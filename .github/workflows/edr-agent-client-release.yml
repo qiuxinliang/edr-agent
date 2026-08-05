@@ -870,6 +870,15 @@ jobs:
             @($assets.FullName) --clobber
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release asset upload failed" }
 
+      - name: Preserve AMD64 runtime for lifecycle validation
+        if: ${{ matrix.arch == 'amd64' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: edr-agent-runtime-amd64
+          path: dist/*windows-amd64-exe.zip
+          if-no-files-found: error
+          retention-days: 7
+
   publish-release:
     name: Publish combined Windows Release Bundle
     needs:
@@ -935,8 +944,10 @@ jobs:
     name: Validate Windows install, upgrade, rollback, and embedded updater
     needs: windows-build
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml
     with:
       target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
       baseline_tag: ''
+      target_artifact_name: edr-agent-runtime-amd64

@@ -12,6 +12,11 @@ on:
         required: false
         default: ''
         type: string
+      target_artifact_name:
+        description: Current workflow artifact containing the target AMD64 runtime ZIP; empty downloads the target release
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
     inputs:
       target_tag:
@@ -23,8 +28,14 @@ on:
         required: false
         default: ''
         type: string
+      target_artifact_name:
+        description: Leave empty for standalone runs; reusable release workflows may provide a current-run artifact
+        required: false
+        default: ''
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -39,6 +50,13 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Download target runtime from current workflow
+        if: ${{ inputs.target_artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.target_artifact_name }}
+          path: downloads/target
 
       - name: Resolve release tags
         shell: pwsh
@@ -75,14 +93,44 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path downloads\target, downloads\baseline | Out-Null
-          gh release download $env:TARGET_TAG --repo $env:GITHUB_REPOSITORY `
-            --pattern "*windows-amd64-exe.zip" --dir downloads\target
-          gh release download $env:BASELINE_TAG --repo $env:GITHUB_REPOSITORY `
-            --pattern "*windows-amd64-exe.zip" --dir downloads\baseline
+
+          function Get-ImmutableRuntimeAsset([string]$Tag) {
+            $expected = "edr-agent-$Tag-windows-amd64-exe.zip"
+            $releaseOutput = gh release view $Tag --repo $env:GITHUB_REPOSITORY `
+              --json tagName,isDraft,isPrerelease,assets 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "release '$Tag' was not found or is not readable: $($releaseOutput -join ' ')"
+            }
+            $release = $releaseOutput | ConvertFrom-Json
+            $matches = @($release.assets | Where-Object { $_.name -eq $expected })
+            if ($matches.Count -ne 1) {
+              $available = @($release.assets | ForEach-Object { $_.name }) -join ', '
+              throw "release '$Tag' must contain exactly one '$expected'; available assets: $available"
+            }
+            return $expected
+          }
+
+          function Download-ImmutableRuntime([string]$Tag, [string]$Destination) {
+            $asset = Get-ImmutableRuntimeAsset $Tag
+            gh release download $Tag --repo $env:GITHUB_REPOSITORY `
+              --pattern $asset --dir $Destination
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to download immutable runtime '$asset' from release '$Tag'"
+            }
+          }
+
+          if (-not '${{ inputs.target_artifact_name }}'.Trim()) {
+            Download-ImmutableRuntime $env:TARGET_TAG downloads\target
+          }
+          Download-ImmutableRuntime $env:BASELINE_TAG downloads\baseline
+
           $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
           $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
-          if ($targetZip.Count -ne 1 -or $baselineZip.Count -ne 1) {
-            throw "expected one immutable runtime ZIP for each release"
+          if ($targetZip.Count -ne 1) {
+            throw "target '$env:TARGET_TAG' resolved to $($targetZip.Count) runtime ZIP files; expected exactly one"
+          }
+          if ($baselineZip.Count -ne 1) {
+            throw "baseline '$env:BASELINE_TAG' resolved to $($baselineZip.Count) runtime ZIP files; expected exactly one"
           }
           Expand-Archive -LiteralPath $targetZip[0].FullName -DestinationPath packages\target -Force
           Expand-Archive -LiteralPath $baselineZip[0].FullName -DestinationPath packages\baseline -Force

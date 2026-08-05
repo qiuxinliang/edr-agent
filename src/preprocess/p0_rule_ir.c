@@ -710,9 +710,9 @@ static int p0_br_wants_event_type(EdrEventType t, const char *et) {
     return (t == EDR_EVENT_NET_CONNECT || t == EDR_EVENT_NET_LISTEN) ? 1 : 0;
   }
   if (strcmp(et, "registry_set") == 0) {
-    return (t == EDR_EVENT_REG_SET_VALUE || t == EDR_EVENT_REG_CREATE_KEY || t == EDR_EVENT_REG_DELETE_KEY)
-               ? 1
-               : 0;
+    /* registry_set is intentionally a write-only semantic.  Treating delete
+     * notifications as a set made Run/RunOnce cleanup look like persistence. */
+    return (t == EDR_EVENT_REG_SET_VALUE || t == EDR_EVENT_REG_CREATE_KEY) ? 1 : 0;
   }
   return 0;
 }

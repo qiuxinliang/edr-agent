@@ -1182,6 +1182,7 @@ static void edr_registry_watch_emit(const char *path, const char *value_name,
     return;
   }
   s_health.registry_provider_events++;
+  s_health.registry_unattributed_events++;
   memset(&interest, 0, sizeof(interest));
   interest.type = EDR_EVENT_REG_SET_VALUE;
   snprintf(interest.provider, sizeof(interest.provider), "%s", "regnotify");
@@ -1402,6 +1403,8 @@ static void edr_security_emit_registry_4657(const char *xml) {
   char safe_new[1024];
   EdrEventSlot slot;
   int n;
+  int has_process_id;
+  s_health.security_4657_received++;
   (void)edr_xml_get_data_utf8(xml, "ProcessId", pid, sizeof(pid));
   (void)edr_xml_get_data_utf8(xml, "ProcessName", img, sizeof(img));
   (void)edr_xml_get_data_utf8(xml, "ObjectName", key_raw, sizeof(key_raw));
@@ -1410,6 +1413,7 @@ static void edr_security_emit_registry_4657(const char *xml) {
   (void)edr_xml_get_data_utf8(xml, "NewValue", new_value, sizeof(new_value));
   (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
   (void)edr_xml_get_data_utf8(xml, "SubjectDomainName", domain, sizeof(domain));
+  has_process_id = pid[0] && strtoul(pid, NULL, 0) > 0u;
   edr_registry_normalize_security_path(key, sizeof(key), key_raw);
   if (!key[0]) {
     s_health.registry_payload_missing++;
@@ -1428,15 +1432,20 @@ static void edr_security_emit_registry_4657(const char *xml) {
                "ETW1\nprov=security_4657\npid=%s\neid=4657\nimg=%s\nuser=%s\n"
                "user_domain=%s\nregkey=%s\nregname=%s\nregold=%s\nregdata=%s\n"
                "regop=set_value\nregistry_source=security_4657\n"
-               "registry_attribution=process_id\nregistry_detail_status=captured\n",
+               "registry_attribution=%s\nregistry_detail_status=captured\n",
                pid[0] ? pid : "0", safe_img, user, domain, safe_key, safe_name,
-               safe_old, safe_new);
+               safe_old, safe_new, has_process_id ? "process_id" : "unavailable");
   if (n <= 0 || (size_t)n >= sizeof(slot.data)) {
     s_health.registry_payload_missing++;
     return;
   }
   slot.size = (uint32_t)n + 1u;
   s_health.registry_provider_events++;
+  if (has_process_id) {
+    s_health.registry_attributed_events++;
+  } else {
+    s_health.registry_unattributed_events++;
+  }
   s_health.security_audit_visible = 1;
   if (edr_push_slot_after_policy(&slot, "security_4657")) {
     s_health.registry_events_admitted++;
@@ -1467,6 +1476,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
       s_health.collector_dropped++;
       return ERROR_SUCCESS;
     }
+    s_health.security_4688_received++;
   }
   char img[1024];
   char cmd[2048];
@@ -2098,6 +2108,7 @@ static void edr_start_security_eventlog_subscription(void) {
             "(run elevated and enable Audit Process Creation / Audit Registry)\n",
             (unsigned long)err);
   } else {
+    s_health.security_subscription_ready = 1;
     s_health.security_audit_visible = 1;
   }
 }

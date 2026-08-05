@@ -1231,6 +1231,28 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     return;
   }
 
+  /* RegNotifyChangeKeyValue snapshot diffs prove that a value changed, but do
+   * not identify the writer.  Keep those events as telemetry and require an
+   * attributed source (Security 4657 / kernel provider) for direct P0 alerts.
+   * This prevents a pid=0 snapshot from being presented as a process-backed
+   * persistence detection. */
+  if ((br->type == EDR_EVENT_REG_SET_VALUE || br->type == EDR_EVENT_REG_CREATE_KEY ||
+       br->type == EDR_EVENT_REG_DELETE_KEY) &&
+      (strcmp(br->reg_attribution, "unavailable") == 0 || br->pid == 0u)) {
+    static uint64_t s_unattributed_registry_skipped;
+    s_unattributed_registry_skipped++;
+    if (p0_debug_enabled() &&
+        (s_unattributed_registry_skipped == 1u ||
+         (s_unattributed_registry_skipped & 1023u) == 0u)) {
+      fprintf(stderr,
+              "[P0 DEBUG] unattributed registry event kept as telemetry: count=%llu source=%s op=%s\n",
+              (unsigned long long)s_unattributed_registry_skipped,
+              br->reg_source[0] ? br->reg_source : "unknown",
+              br->reg_op[0] ? br->reg_op : "unknown");
+    }
+    return;
+  }
+
   static int64_t  s_ev_ts_ns;
   static uint32_t s_ev_pid;
   static int      s_ev_type;
@@ -1290,10 +1312,34 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   if (edr_p0_rule_ir_is_ready()) {
     int i;
     int n = edr_p0_rule_ir_rule_count();
+    int registry_best_index = -1;
+    int registry_best_severity = -1;
+    if (br->type == EDR_EVENT_REG_SET_VALUE || br->type == EDR_EVENT_REG_CREATE_KEY) {
+      /* A single registry write can match both a canonical persistence rule
+       * and an older ATT&CK compatibility rule.  Emit the strongest match
+       * once instead of creating two alerts for the same evidence frame. */
+      for (i = 0; i < n; i++) {
+        if (edr_p0_rule_ir_br_matches_index(br, i)) {
+          const char *candidate_id = NULL;
+          int candidate_severity;
+          if (!edr_p0_rule_ir_rule_id_at(i, &candidate_id) || !candidate_id) {
+            continue;
+          }
+          candidate_severity = edr_p0_rule_ir_get_severity(candidate_id);
+          if (candidate_severity > registry_best_severity) {
+            registry_best_index = i;
+            registry_best_severity = candidate_severity;
+          }
+        }
+      }
+    }
     for (i = 0; i < n; i++) {
       int hit = edr_p0_rule_ir_br_matches_index(br, i);
       edr_p0_rule_ir_stats_record(i, hit);
       if (!hit) {
+        continue;
+      }
+      if (registry_best_index >= 0 && i != registry_best_index) {
         continue;
       }
       const char *rid = NULL;

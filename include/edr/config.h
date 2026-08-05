@@ -547,6 +547,13 @@ void edr_config_free_heap(EdrConfig *cfg);
 EdrError edr_config_load(const char *path, EdrConfig *cfg);
 
 /**
+ * Load only the standalone [preprocessing] rules document served by
+ * /api/v1/agent/rules.toml.  The destination is replaced only after the TOML
+ * parses and contains a versioned, non-empty rule set.
+ */
+EdrError edr_config_load_preprocessing_rules(const char *path, EdrConfig *cfg);
+
+/**
  * §11.2 轻量热更新：若 path 可访问且 mtime 与 *mtime_cache 不同则重新加载并写回 mtime。
  * 初始化：在首次 `edr_config_load` 成功后对配置文件 `stat`，将 `st_mtime` 写入 *mtime_cache。
  * 若 out_reloaded 非空，本次是否发生重新加载写入 *out_reloaded（0/1）。

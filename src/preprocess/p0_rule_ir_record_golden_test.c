@@ -121,6 +121,18 @@ int main(void) {
   if (!check_br("DEFENSE-001 miss", &br, i_def, 0)) {
     return 1;
   }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_REG_DELETE_KEY;
+  snprintf(
+      br.reg_key_path, sizeof(br.reg_key_path), "%s",
+      "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System"
+  );
+  snprintf(br.reg_value_name, sizeof(br.reg_value_name), "EnableLUA");
+  snprintf(br.reg_value_data, sizeof(br.reg_value_data), "0");
+  snprintf(br.reg_op, sizeof(br.reg_op), "delete_value");
+  if (!check_br("DEFENSE-001 delete is not registry_set", &br, i_def, 0)) {
+    return 1;
+  }
 
   /* R-MITRE-WIN-T1138 Application Shimming: maintenance scan must not alert. */
   edr_behavior_record_init(&br);

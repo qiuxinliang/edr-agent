@@ -84,6 +84,7 @@ typedef enum {
   EDR_AGENT_POLL_SELF_PROTECT,
   EDR_AGENT_POLL_CONFIG_RELOAD,
   EDR_AGENT_POLL_REMOTE_CONFIG,
+  EDR_AGENT_POLL_RULES,
   EDR_AGENT_POLL_P0_BUNDLE,
   EDR_AGENT_POLL_SENSOR_INTEREST,
   EDR_AGENT_POLL_ATTACK_SURFACE,
@@ -188,6 +189,14 @@ static int edr_agent_config_signature_required(const EdrConfig *cfg) {
     return 1;
   }
   return cfg && cfg->config_signing.signature_required;
+}
+
+static int edr_agent_rules_signature_required(void) {
+  const char *v = getenv("EDR_RULES_SIGNATURE_REQUIRED");
+  if (v && (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N')) {
+    return 0;
+  }
+  return 1;
 }
 
 static const char *edr_agent_config_signing_key_id(const EdrConfig *cfg) {
@@ -1513,6 +1522,7 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
 static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_ns);
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns,
                                          uint64_t *last_health_ns);
+static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns);
 static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns);
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
@@ -1842,6 +1852,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
   {
     uint64_t last_reload_ns = 0;
     uint64_t last_remote_ns = 0;
+    uint64_t last_rules_ns = 0;
     uint64_t last_p0_bundle_ns = 0;
     uint64_t last_sensor_interest_ns = 0;
     uint64_t last_heartbeat_ns = 0;
@@ -1883,6 +1894,8 @@ EdrError edr_agent_run(EdrAgent *agent) {
                              edr_agent_poll_config_reload(agent, &last_reload_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_REMOTE_CONFIG,
                              edr_agent_poll_remote_config(agent, &last_remote_ns, &last_health_ns));
+        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RULES,
+                             edr_agent_poll_rules(agent, &last_rules_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_P0_BUNDLE,
                              edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns));
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SENSOR_INTEREST,
@@ -2014,21 +2027,22 @@ static void edr_agent_poll_probe_json(char *out, size_t cap) {
   snprintf(
       out, cap,
       "\"poll_latency_us\":{\"resource\":%llu,\"self_protect\":%llu,"
-      "\"config_reload\":%llu,\"remote_config\":%llu,\"p0_bundle\":%llu,"
+      "\"config_reload\":%llu,\"remote_config\":%llu,\"rules\":%llu,\"p0_bundle\":%llu,"
       "\"sensor_interest\":%llu,\"attack_surface\":%llu,\"engine_health\":%llu,"
       "\"shell_session\":%llu,\"command_delivery\":%llu},"
       "\"poll_latency_max_us\":{\"resource\":%llu,\"self_protect\":%llu,"
-      "\"config_reload\":%llu,\"remote_config\":%llu,\"p0_bundle\":%llu,"
+      "\"config_reload\":%llu,\"remote_config\":%llu,\"rules\":%llu,\"p0_bundle\":%llu,"
       "\"sensor_interest\":%llu,\"attack_surface\":%llu,\"engine_health\":%llu,"
       "\"shell_session\":%llu,\"command_delivery\":%llu},"
       "\"poll_calls\":{\"resource\":%llu,\"self_protect\":%llu,"
-      "\"config_reload\":%llu,\"remote_config\":%llu,\"p0_bundle\":%llu,"
+      "\"config_reload\":%llu,\"remote_config\":%llu,\"rules\":%llu,\"p0_bundle\":%llu,"
       "\"sensor_interest\":%llu,\"attack_surface\":%llu,\"engine_health\":%llu,"
       "\"shell_session\":%llu,\"command_delivery\":%llu},",
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RESOURCE].last_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SELF_PROTECT].last_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_CONFIG_RELOAD].last_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_REMOTE_CONFIG].last_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RULES].last_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_P0_BUNDLE].last_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SENSOR_INTEREST].last_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ATTACK_SURFACE].last_us,
@@ -2039,6 +2053,7 @@ static void edr_agent_poll_probe_json(char *out, size_t cap) {
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SELF_PROTECT].max_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_CONFIG_RELOAD].max_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_REMOTE_CONFIG].max_us,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RULES].max_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_P0_BUNDLE].max_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SENSOR_INTEREST].max_us,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ATTACK_SURFACE].max_us,
@@ -2049,6 +2064,7 @@ static void edr_agent_poll_probe_json(char *out, size_t cap) {
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SELF_PROTECT].calls,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_CONFIG_RELOAD].calls,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_REMOTE_CONFIG].calls,
+      (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_RULES].calls,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_P0_BUNDLE].calls,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_SENSOR_INTEREST].calls,
       (unsigned long long)s_agent_poll_probe[EDR_AGENT_POLL_ATTACK_SURFACE].calls,
@@ -2673,11 +2689,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"rollback_version\":\"%s\",\"audit_id\":\"%s\"},"
       "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,\"powershell_visible\":%s,"
       "\"amsi_visible\":%s,\"security_audit_visible\":%s,"
+      "\"security_subscription_ready\":%s,\"security_4688_received\":%llu,"
+      "\"security_4657_received\":%llu,"
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
       "\"collector_thread_id\":%u,"
       "\"registry_provider\":{\"events\":%llu,\"unmapped\":%llu,"
-      "\"payload_missing\":%llu,\"admitted\":%llu},"
+      "\"payload_missing\":%llu,\"admitted\":%llu,\"attributed\":%llu,"
+      "\"unattributed\":%llu},"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
       "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
@@ -2910,6 +2929,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       det_policy_source, det_policy_version, det_policy_rollback, det_policy_audit,
       ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
       ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
+      ch.security_subscription_ready ? "true" : "false",
+      (unsigned long long)ch.security_4688_received,
+      (unsigned long long)ch.security_4657_received,
       ch.auditd_enabled ? "true" : "false", ch.auditd_running ? "true" : "false",
       (unsigned long long)ch.auditd_events,
       ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
@@ -2918,6 +2940,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.registry_provider_unmapped,
       (unsigned long long)ch.registry_payload_missing,
       (unsigned long long)ch.registry_events_admitted,
+      (unsigned long long)ch.registry_attributed_events,
+      (unsigned long long)ch.registry_unattributed_events,
       (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
       (unsigned long long)ch.process_create_missing_identity,
@@ -3755,6 +3779,108 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     fprintf(stderr, " fingerprint=%s", fp);
   }
   fprintf(stderr, "\n");
+}
+
+static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns) {
+  const char *url = getenv("EDR_RULES_URL");
+  const char *auto_pull = getenv("EDR_RULES_AUTO_PULL");
+  const char *iv = getenv("EDR_RULES_POLL_S");
+  int interval = 300;
+  uint64_t now;
+  char derived[768];
+  char tmp[520];
+  char fp[80];
+  char verify_reason[192];
+  const char *base;
+  EdrError load_rc;
+  EdrAgentConfigHeaders rules_headers;
+  if (!agent || !last_rules_ns) {
+    return;
+  }
+  if (auto_pull && (auto_pull[0] == '0' || auto_pull[0] == 'n' || auto_pull[0] == 'N')) {
+    return;
+  }
+  if (!url || !url[0]) {
+    base = agent->cfg.platform.relay_url[0]
+               ? agent->cfg.platform.relay_url
+               : agent->cfg.platform.rest_base_url;
+    if (!base[0]) {
+      return;
+    }
+    snprintf(derived, sizeof(derived), "%s/agent/rules.toml", base);
+    url = derived;
+  }
+  if (iv && iv[0]) {
+    int v = atoi(iv);
+    if (v >= 30 && v <= 86400) {
+      interval = v;
+    }
+  }
+  now = edr_monotonic_ns();
+  if (*last_rules_ns != 0u &&
+      now - *last_rules_ns < (uint64_t)interval * 1000000000ULL) {
+    return;
+  }
+  *last_rules_ns = now;
+
+#ifdef _WIN32
+  {
+    const char *t = getenv("TEMP");
+    if (!t || !t[0]) {
+      t = ".";
+    }
+    snprintf(tmp, sizeof(tmp), "%s\\edr_preprocess_rules_%lu.toml", t,
+             (unsigned long)GetCurrentProcessId());
+  }
+#else
+  snprintf(tmp, sizeof(tmp), "/tmp/edr_preprocess_rules_%d.toml", (int)getpid());
+#endif
+  memset(&rules_headers, 0, sizeof(rules_headers));
+  if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "preprocess rules", &rules_headers) != 0) {
+    return;
+  }
+  verify_reason[0] = '\0';
+  if (edr_agent_rules_signature_required() &&
+      (!rules_headers.signature[0] || !rules_headers.signed_payload_b64[0] ||
+       !rules_headers.sequence[0] || !rules_headers.config_hash[0])) {
+    snprintf(verify_reason, sizeof(verify_reason), "missing signed rules headers");
+  } else if (edr_agent_verify_config_headers(
+                 &agent->cfg, agent->cfg.offline.queue_db_path, tmp,
+                 &rules_headers, verify_reason, sizeof(verify_reason)) != 0) {
+    /* verify_reason is populated by the shared policy verifier. */
+  }
+  if (verify_reason[0]) {
+    fprintf(stderr, "[emit_rules] remote rules signature rejected: %s\n", verify_reason);
+    (void)edr_ingest_http_post_config_status(
+        agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,
+        EDR_AGENT_VERSION_STRING, agent->cfg.preprocessing.rules_version,
+        rules_headers.config_hash, rules_headers.sequence, rules_headers.nonce,
+        rules_headers.signature, rules_headers.signing_key_id, 0, verify_reason,
+        "", rules_headers.config_hash, "rules_failed", 0);
+    (void)remove(tmp);
+    return;
+  }
+  fp[0] = '\0';
+  edr_config_fingerprint(tmp, fp, sizeof(fp));
+  load_rc = edr_config_load_preprocessing_rules(tmp, &agent->cfg);
+  (void)remove(tmp);
+  if (load_rc != EDR_OK) {
+    fprintf(stderr, "[emit_rules] remote rules rejected: rc=%d\n", (int)load_rc);
+    return;
+  }
+  edr_preprocess_apply_config(&agent->cfg);
+  (void)edr_ingest_http_post_config_status(
+      agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,
+      EDR_AGENT_VERSION_STRING, agent->cfg.preprocessing.rules_version,
+      rules_headers.config_hash, rules_headers.sequence, rules_headers.nonce,
+      rules_headers.signature, rules_headers.signing_key_id, 1, "",
+      agent->cfg.preprocessing.rules_version, rules_headers.config_hash,
+      "rules_applied", 0);
+  fprintf(stderr, "[emit_rules] remote rules hot-reloaded: version=%s rules=%u fingerprint=%s\n",
+          agent->cfg.preprocessing.rules_version[0]
+              ? agent->cfg.preprocessing.rules_version
+              : "unknown",
+          agent->cfg.preprocessing.rules_count, fp[0] ? fp : "unknown");
 }
 
 static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns) {

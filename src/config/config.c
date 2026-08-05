@@ -1020,6 +1020,49 @@ static void load_preprocessing(toml_table_t *t, EdrConfig *cfg) {
   load_preprocessing_rules(t, cfg);
 }
 
+EdrError edr_config_load_preprocessing_rules(const char *path, EdrConfig *cfg) {
+  char errbuf[512];
+  toml_table_t *root;
+  toml_table_t *preprocessing;
+  EdrConfig parsed;
+  EdrEmitRule *old_rules;
+  if (!path || !path[0] || !cfg) {
+    return EDR_ERR_INVALID_ARG;
+  }
+  memset(errbuf, 0, sizeof(errbuf));
+  root = edr_config_parse_file_compat(path, errbuf, (int)sizeof(errbuf));
+  if (!root) {
+    if (errbuf[0]) {
+      fprintf(stderr, "preprocessing TOML parse error: %s\n", errbuf);
+    }
+    return EDR_ERR_CONFIG_PARSE;
+  }
+  preprocessing = toml_table_in(root, "preprocessing");
+  if (!preprocessing) {
+    toml_free(root);
+    fprintf(stderr, "[config] remote rules rejected: missing [preprocessing]\n");
+    return EDR_ERR_CONFIG_PARSE;
+  }
+  memset(&parsed, 0, sizeof(parsed));
+  edr_config_apply_defaults(&parsed);
+  load_preprocessing(preprocessing, &parsed);
+  toml_free(root);
+  if (!parsed.preprocessing.rules_version[0] ||
+      !parsed.preprocessing.rules || parsed.preprocessing.rules_count == 0u) {
+    edr_config_free_heap(&parsed);
+    fprintf(stderr, "[config] remote rules rejected: versioned non-empty rules required\n");
+    return EDR_ERR_CONFIG_PARSE;
+  }
+
+  old_rules = cfg->preprocessing.rules;
+  cfg->preprocessing = parsed.preprocessing;
+  parsed.preprocessing.rules = NULL;
+  parsed.preprocessing.rules_count = 0u;
+  free(old_rules);
+  edr_config_free_heap(&parsed);
+  return EDR_OK;
+}
+
 /* 把 [[detection_policy.suppression]] 数组表序列化为控制符分隔的紧凑串，供检测引擎消费。
  * 规则间 0x1e，字段间 0x1f：target,process,action,reason,contains_all；contains_all token 间 0x1d。 */
 static void sup_append(char *out, size_t cap, size_t *len, const char *s) {

@@ -54,6 +54,7 @@ typedef struct {
     int powershell_visible;
     int amsi_visible;
     int security_audit_visible;
+    int security_subscription_ready;
     int auditd_enabled;
     int auditd_running;
     int ebpf_enabled;
@@ -65,6 +66,10 @@ typedef struct {
     uint64_t registry_provider_unmapped;
     uint64_t registry_payload_missing;
     uint64_t registry_events_admitted;
+    uint64_t security_4688_received;
+    uint64_t security_4657_received;
+    uint64_t registry_attributed_events;
+    uint64_t registry_unattributed_events;
     uint64_t collector_dropped;
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;

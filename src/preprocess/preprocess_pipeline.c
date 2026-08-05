@@ -434,7 +434,6 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
-  edr_p0_rule_try_emit(&br);
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   {
@@ -455,6 +454,10 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (!edr_preprocess_should_emit(&br)) {
     return;
   }
+  /* P0 direct emit must honor detection admission and preprocessing
+   * drop/emit rules.  Calling it earlier allowed dropped registry events to
+   * create alerts even though their telemetry was rejected. */
+  edr_p0_rule_try_emit(&br);
   edr_local_evidence_cache_record_behavior(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);
   /* P2 T9：Shellcode / Webshell / PMFE → AVE 行为槽（E 组 46–47、53–54） */

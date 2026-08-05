@@ -240,6 +240,37 @@ static void test_detection_policy_conditional_suppression(void) {
   assert(strstr(env, "downgrade") != NULL);
 }
 
+static void test_remote_preprocessing_rules_replace_only_rule_section(void) {
+  const char *fn = "edr_test_remote_rules.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[preprocessing]\n"
+          "dedup_window_s = 17\n"
+          "high_freq_threshold = 29\n"
+          "rules_version = \"rules-hot-v2\"\n\n"
+          "[[preprocessing.rules]]\n"
+          "name = \"drop-reg-delete\"\n"
+          "action = \"drop\"\n"
+          "event_type = \"REG_DELETE_KEY\"\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  edr_config_apply_defaults(&cfg);
+  snprintf(cfg.agent.endpoint_id, sizeof(cfg.agent.endpoint_id), "%s", "ep-preserved");
+  EdrError e = edr_config_load_preprocessing_rules(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(strcmp(cfg.agent.endpoint_id, "ep-preserved") == 0);
+  assert(strcmp(cfg.preprocessing.rules_version, "rules-hot-v2") == 0);
+  assert(cfg.preprocessing.dedup_window_s == 17u);
+  assert(cfg.preprocessing.high_freq_threshold == 29u);
+  assert(cfg.preprocessing.rules_count == 1u);
+  assert(cfg.preprocessing.rules[0].event_type == EDR_EVENT_REG_DELETE_KEY);
+  edr_config_free_heap(&cfg);
+}
+
 int main(void) {
   const char *fn = "edr_test_cfg_fp.toml";
   FILE *f = fopen(fn, "wb");
@@ -262,6 +293,7 @@ int main(void) {
   test_policy_v2_and_attack_surface_parse();
   test_control_http2_policy_parse_and_legacy_fallback();
   test_legacy_windows_path_escape_compatibility();
+  test_remote_preprocessing_rules_replace_only_rule_section();
   puts("config_fp ok");
   return 0;
 }

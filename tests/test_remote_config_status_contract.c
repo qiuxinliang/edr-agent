@@ -45,6 +45,9 @@ int main(void) {
   if (!contains(agent, "edr_agent_report_remote_config_failure(agent, NULL, \"remote_config_download_failed\", now)") ||
       !contains(agent, "edr_agent_report_remote_config_failure(agent, &config_headers, parse_reason, now)") ||
       !contains(agent, "edr_agent_clear_remote_config_failure();") ||
+      !contains(agent, "edr_agent_poll_rules(agent, &last_rules_ns)") ||
+      !contains(agent, "\"%s/agent/rules.toml\"") ||
+      !contains(agent, "edr_config_load_preprocessing_rules(tmp, &agent->cfg)") ||
       !contains(agent, "15ULL * 60ULL * 1000000000ULL") ||
       !contains(ingest, "desired_version && desired_version[0] ? desired_version : \"\"")) {
     fprintf(stderr, "remote config status/retry contract missing\n");

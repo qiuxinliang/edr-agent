@@ -164,6 +164,10 @@ int main(void) {
   contains(workflow, "windows-install-upgrade-rollback.yml", "release completion includes the Windows lifecycle workflow");
   contains(workflow, "      - windows-lifecycle", "release publication waits for the Windows lifecycle gate");
   contains(workflow, "target_tag: ${{ github.event_name == 'workflow_dispatch'", "lifecycle validation receives the exact release tag");
+  contains(workflow, "name: edr-agent-runtime-amd64",
+           "release preserves the current AMD64 runtime outside the draft release");
+  contains(workflow, "target_artifact_name: edr-agent-runtime-amd64",
+           "lifecycle receives the current-run AMD64 runtime artifact");
   free(workflow);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/windows-install-upgrade-rollback.yml", root);
@@ -172,6 +176,12 @@ int main(void) {
   contains(lifecycle, "workflow_call:", "release lifecycle is callable with an explicit target");
   contains(lifecycle, "target_tag:", "release lifecycle target tag is an explicit input");
   contains(lifecycle, "gh release list", "blank baseline resolves to the latest lower stable Windows release");
+  contains(lifecycle, "actions/download-artifact@v4",
+           "release lifecycle can consume the target runtime from its current workflow run");
+  contains(lifecycle, "edr-agent-$Tag-windows-amd64-exe.zip",
+           "release lifecycle selects baseline runtime assets by immutable exact name");
+  contains(lifecycle, "if (-not '${{ inputs.target_artifact_name }}'.Trim())",
+           "standalone lifecycle runs download the target only when no workflow artifact was supplied");
   require_true(!strstr(lifecycle, "github.event.workflow_run.head_branch"),
                "release lifecycle never guesses a version from a workflow branch name");
   contains(lifecycle, "windows_release_lifecycle_smoke.ps1", "release lifecycle executes the Windows install-upgrade-rollback smoke test");
