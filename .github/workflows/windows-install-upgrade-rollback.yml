@@ -12,11 +12,6 @@ on:
         required: false
         default: ''
         type: string
-      target_artifact_name:
-        description: Current workflow artifact containing the target AMD64 runtime ZIP; empty downloads the target release
-        required: false
-        default: ''
-        type: string
   workflow_dispatch:
     inputs:
       target_tag:
@@ -28,14 +23,8 @@ on:
         required: false
         default: ''
         type: string
-      target_artifact_name:
-        description: Leave empty for standalone runs; reusable release workflows may provide a current-run artifact
-        required: false
-        default: ''
-        type: string
 
 permissions:
-  actions: read
   contents: read
 
 concurrency:
@@ -50,13 +39,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
-
-      - name: Download target runtime from current workflow
-        if: ${{ inputs.target_artifact_name != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.target_artifact_name }}
-          path: downloads/target
 
       - name: Resolve release tags
         shell: pwsh
@@ -107,21 +89,40 @@ jobs:
               $available = @($release.assets | ForEach-Object { $_.name }) -join ', '
               throw "release '$Tag' must contain exactly one '$expected'; available assets: $available"
             }
-            return $expected
+            return $matches[0]
           }
 
           function Download-ImmutableRuntime([string]$Tag, [string]$Destination) {
             $asset = Get-ImmutableRuntimeAsset $Tag
-            gh release download $Tag --repo $env:GITHUB_REPOSITORY `
-              --pattern $asset --dir $Destination
-            if ($LASTEXITCODE -ne 0) {
-              throw "failed to download immutable runtime '$asset' from release '$Tag'"
+            $apiUrl = "$($asset.apiUrl)".Trim()
+            if (-not $apiUrl) {
+              throw "release asset '$($asset.name)' for '$Tag' has no API download URL"
+            }
+            $destinationPath = Join-Path $Destination $asset.name
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = 'application/octet-stream'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+            try {
+              Invoke-WebRequest -Uri $apiUrl -Headers $headers -OutFile $destinationPath
+            } catch {
+              throw "failed to download immutable runtime '$($asset.name)' from release '$Tag': $($_.Exception.Message)"
+            }
+            $downloaded = Get-Item -LiteralPath $destinationPath
+            if ($asset.size -and $downloaded.Length -ne [int64]$asset.size) {
+              throw "runtime '$($asset.name)' size mismatch: expected $($asset.size), got $($downloaded.Length)"
+            }
+            $digest = "$($asset.digest)".Trim()
+            if ($digest -match '^sha256:(?<hash>[0-9a-fA-F]{64})$') {
+              $actual = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash
+              if ($actual -ine $Matches.hash) {
+                throw "runtime '$($asset.name)' SHA-256 mismatch"
+              }
             }
           }
 
-          if (-not '${{ inputs.target_artifact_name }}'.Trim()) {
-            Download-ImmutableRuntime $env:TARGET_TAG downloads\target
-          }
+          Download-ImmutableRuntime $env:TARGET_TAG downloads\target
           Download-ImmutableRuntime $env:BASELINE_TAG downloads\baseline
 
           $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
