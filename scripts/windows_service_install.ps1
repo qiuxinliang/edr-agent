@@ -90,6 +90,10 @@ function Invoke-AgentEtwUninstallCleanup {
   }
   try {
     & $exe --etw-uninstall-cleanup | Out-Host
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+      Write-Warning "ETW cleanup returned exit code $exitCode; continuing uninstall"
+    }
   } catch {
     Write-Warning ("ETW cleanup failed: " + $_.Exception.Message)
   }
@@ -286,7 +290,7 @@ function Uninstall-AgentService {
         Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
       }
-      & sc.exe delete $name | Out-Host
+      Invoke-ServiceControl -Arguments @("delete", $name)
     }
   }
   Invoke-AgentEtwUninstallCleanup
@@ -307,6 +311,8 @@ function Uninstall-AgentService {
       "EDR_FORENSIC_COLLECTOR_BUILTIN_BIN",
       "EDR_VELOCIRAPTOR_BIN",
       "EDR_FORENSIC_COLLECTOR_AUTOFETCH",
+      "EDR_FORENSIC_VERSION_CHECK_SEC",
+      "EDR_FORENSIC_PREFETCH_RETRY_SEC",
       "EDR_FORENSIC_ADAPTER_MANIFEST_URL",
       "EDR_FORENSIC_COLLECTOR_MANIFEST_URL",
       "EDR_CMD_AUDIT_PATH",

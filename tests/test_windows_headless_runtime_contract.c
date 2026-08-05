@@ -136,6 +136,12 @@ int main(void) {
                        "service installation must not use legacy PowerShell native argument flattening");
   ok &= require_absent(service_installer, "\"binPath= $binPath\"",
                        "service installation must keep the sc.exe binPath option separate from its value");
+  ok &= require_contains(service_installer, "ETW cleanup returned exit code $exitCode; continuing uninstall",
+                         "best-effort ETW cleanup must report but not poison successful uninstall status");
+  ok &= require_contains(service_installer, "EDR_FORENSIC_VERSION_CHECK_SEC",
+                         "service uninstall must remove the forensic version check setting");
+  ok &= require_contains(service_installer, "EDR_FORENSIC_PREFETCH_RETRY_SEC",
+                         "service uninstall must remove the forensic prefetch retry setting");
   free(service_installer);
 
   char *installer_ps = read_source(root, "scripts/edr_agent_install.ps1");

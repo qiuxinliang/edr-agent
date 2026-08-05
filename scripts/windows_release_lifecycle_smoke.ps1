@@ -74,6 +74,17 @@ function Wait-ServiceStable {
   }
 }
 
+function Wait-ServiceDeleted {
+  param([int]$Seconds = 20)
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+      return
+    }
+    Start-Sleep -Seconds 1
+  }
+  throw "service $serviceName still exists after waiting $Seconds seconds for deletion"
+}
+
 function Wait-EmbeddedUpdaterMaterialized {
   param(
     [string]$Version,
@@ -165,11 +176,16 @@ if ((Get-AgentVersion -Path $targetBinary) -ne $TargetVersion) {
   throw "target binary ProductVersion does not match $TargetVersion"
 }
 
+$stage = "prepare"
 try {
   $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
   if ($existing) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
     & sc.exe delete $serviceName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "failed to remove pre-existing lifecycle service: sc.exe exit code $LASTEXITCODE"
+    }
+    Wait-ServiceDeleted
   }
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -186,30 +202,34 @@ try {
   # Historical runtime packages remain immutable. Use the target package's
   # current installer to exercise the baseline binary without reviving an old
   # PowerShell/sc.exe compatibility bug from the baseline release.
+  $stage = "baseline_install"
   & $targetInstaller -Action Install -ServiceName $serviceName `
     -DisplayName "FDSecurity Agent CI Lifecycle Smoke" `
     -ExePath (Join-Path $installDir "FDSensor.exe") `
     -ConfigPath $configPath -InstallDir $installDir -DataDir $installDir `
     -SkipPreflight -NoStart
-  if ($LASTEXITCODE -ne 0) { throw "headless install failed with exit code $LASTEXITCODE" }
+  $stage = "baseline_stability"
   Wait-ServiceStable
 
+  $stage = "upgrade"
   Invoke-VersionTransition -Operation upgrade -Candidate $targetBinary `
     -Version $TargetVersion -ArtifactID "ci-$TargetVersion-amd64" -UpdateScript $targetUpdater
+  $stage = "embedded_updater"
   $embeddedUpdaterSha256 = Wait-EmbeddedUpdaterMaterialized -Version $TargetVersion `
     -ExpectedScript $targetUpdater
+  $stage = "rollback"
   Invoke-VersionTransition -Operation rollback -Candidate $baselineBinary `
     -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-amd64" -UpdateScript $targetUpdater
 
+  $stage = "uninstall"
   & $targetInstaller -Action Uninstall -ServiceName $serviceName `
     -ExePath (Join-Path $installDir "FDSensor.exe") `
     -ConfigPath $configPath -InstallDir $installDir -DataDir $installDir `
     -SkipPreflight
-  if ($LASTEXITCODE -ne 0) { throw "headless uninstall failed with exit code $LASTEXITCODE" }
-  if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    throw "service still exists after uninstall"
-  }
+  $stage = "verify_uninstall"
+  Wait-ServiceDeleted
 
+  $stage = "completed"
   [ordered]@{
     schema_version = 1
     baseline_version = $BaselineVersion
@@ -223,6 +243,18 @@ try {
     uninstall = "passed"
     completed_at = [DateTimeOffset]::UtcNow.ToString("o")
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
+} catch {
+  [ordered]@{
+    schema_version = 1
+    baseline_version = $BaselineVersion
+    target_version = $TargetVersion
+    architecture = "amd64"
+    status = "failed"
+    failed_stage = $stage
+    error = $_.Exception.Message
+    completed_at = [DateTimeOffset]::UtcNow.ToString("o")
+  } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
+  throw
 } finally {
   Get-Service -Name $serviceName -ErrorAction SilentlyContinue |
     Format-List * | Out-File -FilePath (Join-Path $EvidenceDir "service-final.txt")
@@ -237,3 +269,7 @@ try {
   & sc.exe delete $serviceName 2>$null | Out-Null
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# GitHub's pwsh wrapper propagates a stale native-command LASTEXITCODE even
+# when every lifecycle assertion passed. Make successful completion explicit.
+exit 0

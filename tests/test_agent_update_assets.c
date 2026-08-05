@@ -201,6 +201,14 @@ int main(void) {
            "lifecycle binds the packaged service installer to the checked-out release source");
   require_true(!strstr(lifecycle_smoke, "$baselineInstaller"),
                "lifecycle does not execute an immutable baseline installer with obsolete PowerShell argument semantics");
+  require_true(!strstr(lifecycle_smoke, "headless uninstall failed with exit code $LASTEXITCODE"),
+               "lifecycle does not treat a stale native exit code as the result of a PowerShell installer script");
+  contains(lifecycle_smoke, "failed_stage = $stage",
+           "lifecycle persists the exact failed stage for actionable CI diagnostics");
+  contains(lifecycle_smoke, "function Wait-ServiceDeleted",
+           "lifecycle waits for asynchronous Windows service deletion");
+  contains(lifecycle_smoke, "exit 0",
+           "lifecycle explicitly clears stale native-command status after successful assertions");
   free(lifecycle_smoke);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");
