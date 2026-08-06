@@ -48,7 +48,7 @@ param(
   [ValidateRange(1, 9007199254740991)]
   [UInt64]$DeadlineUnixMs = 2,
   [ValidateRange(1, 86400000)]
-  [UInt64]$HealthObserveMs = 300000,
+  [UInt64]$HealthObserveMs = 30000,
   [string]$RuntimeManifestSha256 = "",
   [ValidateRange(0, 60)]
   [int]$DrainDelaySeconds = 5,
@@ -391,12 +391,22 @@ function Start-AgentRuntime {
     Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
   }
   Wait-AgentProcess -ExecutablePath $ExecutablePath -Running $true -TimeoutSeconds $TimeoutSeconds
-  Start-Sleep -Seconds 5
-  if (@(Get-AgentProcesses -ExecutablePath $ExecutablePath).Count -eq 0) {
-    throw "FDSensor.exe exited during the startup stability check"
-  }
-  if ($Mode -eq 'service' -and (Get-Service -Name $WindowsServiceName).Status -ne 'Running') {
-    throw "Agent service exited during the startup stability check"
+  for ($stableCheck = 0; $stableCheck -lt 3; $stableCheck++) {
+    Start-Sleep -Seconds 1
+    if (@(Get-AgentProcesses -ExecutablePath $ExecutablePath).Count -eq 0) {
+      throw "FDSensor.exe exited during the startup stability check"
+    }
+    if ($Mode -eq 'service') {
+      $service = Get-Service -Name $WindowsServiceName -ErrorAction SilentlyContinue
+      if (-not $service -or $service.Status -ne 'Running') {
+        throw "Agent service exited during the startup stability check"
+      }
+    } else {
+      $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+      if (-not $task -or [string]$task.State -ne 'Running') {
+        throw "Agent scheduled task exited during the startup stability check"
+      }
+    }
   }
 }
 
@@ -436,7 +446,11 @@ function Wait-AgentHealthObservation {
       Set-UpdateStage -Stage 'health_observation'
       $nextCheckpoint = $now + 10000
     }
-    Start-Sleep -Seconds 2
+    $remainingMs = [Int64]$ObserveUntilUnixMs - [Int64](Get-UnixTimeMilliseconds)
+    if ($remainingMs -gt 0) {
+      $sleepMs = [int][Math]::Min(1000, [Math]::Max(100, $remainingMs))
+      Start-Sleep -Milliseconds $sleepMs
+    }
   }
   if (@(Get-AgentProcesses -ExecutablePath $ExecutablePath).Count -eq 0) {
     throw 'FDSensor.exe exited at the end of the local health observation window'

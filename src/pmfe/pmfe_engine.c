@@ -2541,11 +2541,12 @@ EdrError edr_pmfe_init(void) {
     return EDR_OK;
   }
   if (en && en[0] != '1') {
-    EDR_LOGV("%s", "[pmfe] disabled by default, set EDR_PMFE_ENABLED=1 to enable\n");
+    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_ENABLED must be 0 or 1)\n");
     return EDR_OK;
   }
-  if (!en) {
-    EDR_LOGV("%s", "[pmfe] disabled by default, set EDR_PMFE_ENABLED=1 to enable\n");
+  if (!en && (!s_pmfe_cfg || s_pmfe_cfg->detection.pmfe_mode == 0 ||
+              s_pmfe_cfg->resource_limit.pmfe_scans_per_min == 0u)) {
+    EDR_LOGV("%s", "[pmfe] disabled by endpoint policy or zero scan budget\n");
     return EDR_OK;
   }
 #ifdef _WIN32

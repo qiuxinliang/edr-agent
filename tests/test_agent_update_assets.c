@@ -48,6 +48,10 @@ int main(void) {
   contains(script, "Remove-CurrentUpdateWork", "terminal update work is removed after durable reporting");
   contains(script, "AgentUpdateUpdaterProtocolVersion = 2", "updater protocol version is explicit in the release script");
   contains(script, "Wait-AgentHealthObservation", "local health watchdog is enforced before updater exit");
+  contains(script, "[UInt64]$HealthObserveMs = 30000", "manual updater defaults to the bounded local health gate");
+  contains(script, "$stableCheck -lt 3", "startup stability uses consecutive liveness samples");
+  require_true(!strstr(script, "Start-Sleep -Seconds 5"), "startup does not impose the old fixed five-second delay");
+  contains(script, "[Math]::Min(1000, [Math]::Max(100, $remainingMs))", "health polling cannot overshoot a short observation window by two seconds");
   contains(script, "local_health_observation_passed", "platform health check starts only after the local watchdog passes");
   contains(script, "local_watchdog = 'observing'", "local observation is reported as nonterminal runtime progress");
   contains(script, "$resumeHealthObservation -and -not $running", "Agent exit during recovered health observation forces rollback");
