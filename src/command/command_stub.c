@@ -11,6 +11,7 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/agent_update_command.h"
+#include "edr/agent_lifecycle_command.h"
 #include "edr/command.h"
 #include "edr/command_cancel.h"
 #include "edr/command_contract.h"
@@ -5643,6 +5644,32 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
        * Continue through durable begin; final-only replay policy will block an
        * already-started command rather than launch replacement twice. */
     }
+    if (strcmp(inbox[i].command_type, "agent_restart_service") == 0) {
+      EdrAgentLifecycleRecovery recovery;
+      int recovery_rc = edr_agent_lifecycle_recover(
+          inbox[i].command_id, inbox[i].payload, inbox[i].payload_len, &recovery);
+      if (recovery_rc == 2) {
+        soar_emit_ex(inbox[i].command_id, &inbox[i].meta,
+                     recovery.succeeded ? EdrCmdExecOk : EdrCmdExecFailed,
+                     recovery.exit_code,
+                     recovery.detail[0] ? recovery.detail : "Agent service restart completed",
+                     recovery.succeeded ? "ok" : "failed", NULL);
+        edr_command_cancel_end(inbox[i].command_id);
+        work_done = 1;
+        break;
+      }
+      if (recovery_rc < 0) {
+        audit_both(inbox[i].command_id,
+                   "Agent lifecycle journal recovery failed; inbox retained");
+        edr_command_cancel_end(inbox[i].command_id);
+        saw_error = 1;
+        continue;
+      }
+      if (recovery_rc == 1) {
+        edr_command_cancel_end(inbox[i].command_id);
+        continue;
+      }
+    }
     char reason[180];
     reason[0] = '\0';
     if (command_deadline_expired(&inbox[i].meta, reason, sizeof(reason))) {
@@ -5689,6 +5716,12 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
       if (strcmp(inbox[i].command_type, "agent_update") == 0) {
         audit_both(inbox[i].command_id,
                    "agent update already launched; awaiting terminal updater journal");
+        edr_command_cancel_end(inbox[i].command_id);
+        continue;
+      }
+      if (strcmp(inbox[i].command_type, "agent_restart_service") == 0) {
+        audit_both(inbox[i].command_id,
+                   "Agent restart already launched; awaiting terminal worker journal");
         edr_command_cancel_end(inbox[i].command_id);
         continue;
       }
@@ -6765,6 +6798,41 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
       soar_emit_ex(id, sm,
                    update_rc == EDR_AGENT_UPDATE_EXIT_UNSUPPORTED ? EdrCmdExecRejected : EdrCmdExecFailed,
                    update_rc, detail, update_rc == EDR_AGENT_UPDATE_EXIT_UNSUPPORTED ? "unsupported" : "failed", NULL);
+      return;
+    }
+    case EDR_COMMAND_KIND_AGENT_RESTART_SERVICE:
+    case EDR_COMMAND_KIND_AGENT_OFFBOARD:
+    case EDR_COMMAND_KIND_AGENT_UNINSTALL: {
+      char detail[1024];
+      if (!forensic_operator_gate(sm, payload, payload_len)) {
+        s_rejected++;
+        soar_emit_ex(id, sm, EdrCmdExecRejected, 8,
+                     "endpoint lifecycle command requires operator-initiated dispatch",
+                     "denied", NULL);
+        return;
+      }
+      int lifecycle_rc = edr_agent_lifecycle_execute(id, payload, payload_len,
+                                                       detail, sizeof(detail));
+      if (lifecycle_rc == EDR_AGENT_LIFECYCLE_EXIT_LAUNCHED) {
+        s_handled++;
+        audit_both(id, detail);
+        return;
+      }
+      if (lifecycle_rc == EDR_AGENT_LIFECYCLE_EXIT_HANDOFF) {
+        s_handled++;
+        s_exec_ok++;
+        audit_both(id, detail);
+        soar_emit_ex(id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
+        return;
+      }
+      s_exec_fail++;
+      soar_emit_ex(id, sm,
+                   lifecycle_rc == EDR_AGENT_LIFECYCLE_EXIT_UNSUPPORTED
+                       ? EdrCmdExecRejected : EdrCmdExecFailed,
+                   lifecycle_rc, detail,
+                   lifecycle_rc == EDR_AGENT_LIFECYCLE_EXIT_UNSUPPORTED
+                       ? "unsupported" : "failed",
+                   NULL);
       return;
     }
     case EDR_COMMAND_KIND_ATTACK_SURFACE: {

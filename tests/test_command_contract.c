@@ -69,8 +69,31 @@ int main(void) {
                "event log collection declares implemented cooperative cancellation");
   require_true(edr_command_registry_cancel_mode("agent_update") == EDR_COMMAND_CANCEL_COOPERATIVE,
                "Agent update supports cancellation before replacement starts");
+  require_true(edr_command_registry_execution_lane("agent_restart_service") == EDR_COMMAND_LANE_CRITICAL,
+               "Agent restart is routed to the critical execution lane");
+  require_true(edr_command_registry_replay_policy("agent_restart_service") == EDR_COMMAND_REPLAY_FINAL_ONLY,
+               "Agent restart cannot be launched twice after a process restart");
+  require_true(edr_command_registry_default_timeout_s("agent_restart_service") == 1800u,
+               "Agent restart has a bounded recovery timeout");
   test_setenv("EDR_COMMAND_REQUIRE_SIGNATURE", "0");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED", "0");
+
+  const char *lifecycle =
+      "{\"schema\":\"edr.endpoint.lifecycle.v1\",\"task_id\":\"task-1\","
+      "\"action\":\"restart\",\"tenant_id\":\"tenant-1\",\"endpoint_id\":\"ep-1\","
+      "\"reason\":\"policy activation\",\"requested_by\":\"operator-1\","
+      "\"initiated_by\":\"operator\",\"keep_data\":true}";
+  require_true(validate("agent_restart_service", lifecycle, reason, sizeof(reason)),
+               "valid endpoint lifecycle restart contract");
+  require_true(!validate("agent_uninstall", lifecycle, reason, sizeof(reason)),
+               "lifecycle action must match its command type");
+  require_true(!validate("agent_restart_service",
+                         "{\"schema\":\"edr.endpoint.lifecycle.v1\",\"task_id\":\"task-1\","
+                         "\"action\":\"restart\",\"tenant_id\":\"tenant-1\","
+                         "\"endpoint_id\":\"ep-1\",\"reason\":\"x\","
+                         "\"requested_by\":\"operator-1\",\"initiated_by\":\"automation\","
+                         "\"keep_data\":true}", reason, sizeof(reason)),
+               "lifecycle commands require explicit operator initiation");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS", "0");
   require_true(edr_command_contract_signature_required("cmd-1", "ping"),
                "external read-only command requires signature by default");

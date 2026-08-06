@@ -1187,9 +1187,141 @@ static int stage_write_health_summary(const wchar_t *install_dir, const wchar_t 
   return 0;
 }
 
+static void json_escape_wide_utf8(const wchar_t *value, char *out, size_t cap) {
+  if (!out || cap == 0) return;
+  char utf8[1024];
+  utf8[0] = 0;
+  if (value && value[0]) {
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, utf8, (int)sizeof(utf8), NULL, NULL);
+    utf8[sizeof(utf8) - 1] = 0;
+  }
+  size_t pos = 0;
+  for (const unsigned char *p = (const unsigned char *)utf8; *p && pos + 2 < cap; ++p) {
+    if (*p == '"' || *p == '\\') out[pos++] = '\\';
+    if (*p >= 0x20) out[pos++] = (char)*p;
+  }
+  out[pos] = 0;
+}
+
+static int write_lifecycle_journal(const wchar_t *journal_path, const wchar_t *task_id,
+                                   const wchar_t *command_id, const wchar_t *action,
+                                   int rc, const char *detail) {
+  if (!journal_path || !journal_path[0]) return 0;
+  char task[512], command[768], action_utf8[128];
+  json_escape_wide_utf8(task_id, task, sizeof(task));
+  json_escape_wide_utf8(command_id, command, sizeof(command));
+  json_escape_wide_utf8(action, action_utf8, sizeof(action_utf8));
+  char json[2048];
+  snprintf(json, sizeof(json),
+           "{\r\n  \"schema\": \"edr.endpoint.lifecycle.journal.v1\",\r\n"
+           "  \"task_id\": \"%s\",\r\n  \"command_id\": \"%s\",\r\n"
+           "  \"action\": \"%s\",\r\n  \"status\": \"%s\",\r\n"
+           "  \"succeeded\": %s,\r\n  \"exit_code\": %d,\r\n"
+           "  \"detail\": \"%s\"\r\n}\r\n",
+           task, command, action_utf8, rc == 0 ? "succeeded" : "failed",
+           rc == 0 ? "true" : "false", rc, detail ? detail : "lifecycle worker completed");
+  wchar_t temporary[MAX_PATH * 2];
+  _snwprintf(temporary, sizeof(temporary) / sizeof(temporary[0]), L"%ls.tmp", journal_path);
+  temporary[(sizeof(temporary) / sizeof(temporary[0])) - 1] = 0;
+  HANDLE h = CreateFileW(temporary, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  DWORD written = 0;
+  BOOL ok = WriteFile(h, json, (DWORD)strlen(json), &written, NULL) &&
+            written == (DWORD)strlen(json) && FlushFileBuffers(h);
+  CloseHandle(h);
+  if (!ok || !MoveFileExW(temporary, journal_path,
+                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temporary);
+    return 0;
+  }
+  return 1;
+}
+
+static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *journal_path,
+                                   const wchar_t *task_id, const wchar_t *command_id,
+                                   const wchar_t *action, DWORD delay_ms,
+                                   const wchar_t *log_path) {
+  append_log_utf8(log_path, L"stage=lifecycle-restart begin");
+  if (delay_ms > 30000) delay_ms = 30000;
+  Sleep(delay_ms);
+  int stopped = stop_service_by_name(service_name, log_path);
+  int rc = stopped ? start_service_by_name(service_name, log_path) : 6;
+  const char *detail = rc == 0 ? "Agent service restarted and process is running" :
+                                 "Agent service restart failed health verification";
+  if (!write_lifecycle_journal(journal_path, task_id, command_id, action, rc, detail)) {
+    append_log_utf8(log_path, L"lifecycle_journal_write_failed");
+    return rc == 0 ? 7 : rc;
+  }
+  append_log_utf8(log_path, rc == 0 ? L"stage=lifecycle-restart ok" :
+                                      L"stage=lifecycle-restart failed");
+  return rc;
+}
+
+static int launch_uninstaller_detached(const wchar_t *install_dir, int keep_data,
+                                       const wchar_t *log_path) {
+  wchar_t uninstaller[MAX_PATH * 2], quoted_exe[MAX_PATH * 4], quoted_dir[MAX_PATH * 4];
+  join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir, L"uninstall.exe");
+  if (!file_exists(uninstaller)) {
+    append_log_utf8(log_path, L"lifecycle_uninstall_missing_uninstall_exe");
+    return 8;
+  }
+  quote_arg(quoted_exe, sizeof(quoted_exe) / sizeof(quoted_exe[0]), uninstaller);
+  quote_arg(quoted_dir, sizeof(quoted_dir) / sizeof(quoted_dir[0]), install_dir);
+  wchar_t command[8192];
+  _snwprintf(command, sizeof(command) / sizeof(command[0]), L"%ls --silent --install-dir %ls%ls",
+             quoted_exe, quoted_dir, keep_data ? L" --keep-data" : L"");
+  command[(sizeof(command) / sizeof(command[0])) - 1] = 0;
+  STARTUPINFOW startup;
+  PROCESS_INFORMATION process;
+  ZeroMemory(&startup, sizeof(startup));
+  ZeroMemory(&process, sizeof(process));
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESHOWWINDOW;
+  startup.wShowWindow = SW_HIDE;
+  if (!CreateProcessW(NULL, command, NULL, NULL, FALSE,
+                      CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, install_dir,
+                      &startup, &process)) {
+    append_log_utf8(log_path, L"lifecycle_uninstall_launch_failed");
+    return 9;
+  }
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  append_log_utf8(log_path, L"lifecycle_uninstall_launched");
+  return 0;
+}
+
+static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *service_name,
+                                    const wchar_t *journal_path, const wchar_t *task_id,
+                                    const wchar_t *command_id, const wchar_t *action,
+                                    DWORD delay_ms, int keep_data, const wchar_t *log_path) {
+  append_log_utf8(log_path, L"stage=lifecycle-teardown begin");
+  if (delay_ms < 5000) delay_ms = 5000;
+  if (delay_ms > 120000) delay_ms = 120000;
+  Sleep(delay_ms);
+  int rc = 64;
+  const char *detail = "unsupported lifecycle teardown action";
+  if (_wcsicmp(action, L"offboard") == 0) {
+    rc = stop_service_by_name(service_name, log_path) ? 0 : 6;
+    detail = rc == 0 ? "Agent service stopped after offboard handoff" :
+                       "Agent offboard service stop failed";
+  } else if (_wcsicmp(action, L"uninstall") == 0) {
+    rc = launch_uninstaller_detached(install_dir, keep_data, log_path);
+    detail = rc == 0 ? "Native uninstaller launched after command-result handoff" :
+                       "Native uninstaller launch failed";
+  }
+  if (!write_lifecycle_journal(journal_path, task_id, command_id, action, rc, detail)) {
+    append_log_utf8(log_path, L"lifecycle_teardown_journal_write_failed");
+    return rc == 0 ? 7 : rc;
+  }
+  append_log_utf8(log_path, rc == 0 ? L"stage=lifecycle-teardown accepted" :
+                                      L"stage=lifecycle-teardown failed");
+  return rc;
+}
+
 static void usage(void) {
   fwprintf(stderr,
-           L"FDSecurityInstallerWorker --stage <stop-runtime|clean-cache|validate-config|harden-acl|install-service|install-autorun|start-autorun|start-runtime|start-service|uninstall-runtime|write-health-summary> "
+           L"FDSecurityInstallerWorker --stage <stop-runtime|clean-cache|validate-config|harden-acl|install-service|install-autorun|start-autorun|start-runtime|start-service|lifecycle-restart|lifecycle-offboard|lifecycle-uninstall|uninstall-runtime|write-health-summary> "
            L"[--install-dir <dir>] [--config <path>] [--exe <path>] [--log <path>] [--report <path>]\n");
 }
 
@@ -1201,6 +1333,11 @@ int main(void) {
   const wchar_t *install_dir = arg_value(argc, argv, L"--install-dir");
   const wchar_t *log_path = arg_value(argc, argv, L"--log");
   const wchar_t *report_path = arg_value(argc, argv, L"--report");
+  const wchar_t *journal_path = arg_value(argc, argv, L"--journal");
+  const wchar_t *task_id = arg_value(argc, argv, L"--task-id");
+  const wchar_t *command_id = arg_value(argc, argv, L"--command-id");
+  const wchar_t *action = arg_value(argc, argv, L"--action");
+  const wchar_t *delay_raw = arg_value(argc, argv, L"--delay-ms");
   wchar_t default_log[MAX_PATH * 2], default_cfg[MAX_PATH * 2], default_exe[MAX_PATH * 2];
   join_path(default_log, sizeof(default_log) / sizeof(default_log[0]), install_dir, L"diagnostics\\installer-worker.log");
   join_path(default_cfg, sizeof(default_cfg) / sizeof(default_cfg[0]), install_dir, L"agent.toml");
@@ -1239,6 +1376,30 @@ int main(void) {
     rc = stage_start_runtime(install_dir, exe_path, config_path, log_path);
   } else if (_wcsicmp(stage, L"start-service") == 0) {
     rc = start_service_by_name(svc, log_path);
+  } else if (_wcsicmp(stage, L"lifecycle-restart") == 0) {
+    DWORD delay_ms = delay_raw && delay_raw[0] ? (DWORD)_wtoi(delay_raw) : 2000;
+    if (!journal_path[0] || !task_id[0] || !command_id[0] ||
+        _wcsicmp(action, L"restart") != 0) {
+      append_log_utf8(log_path, L"lifecycle_restart_invalid_arguments");
+      rc = 64;
+    } else {
+      rc = stage_lifecycle_restart(svc, journal_path, task_id, command_id, action,
+                                   delay_ms, log_path);
+    }
+  } else if (_wcsicmp(stage, L"lifecycle-offboard") == 0 ||
+             _wcsicmp(stage, L"lifecycle-uninstall") == 0) {
+    DWORD delay_ms = delay_raw && delay_raw[0] ? (DWORD)_wtoi(delay_raw) : 30000;
+    const wchar_t *expected_action = _wcsicmp(stage, L"lifecycle-offboard") == 0
+                                         ? L"offboard" : L"uninstall";
+    if (!journal_path[0] || !task_id[0] || !command_id[0] ||
+        _wcsicmp(action, expected_action) != 0) {
+      append_log_utf8(log_path, L"lifecycle_teardown_invalid_arguments");
+      rc = 64;
+    } else {
+      rc = stage_lifecycle_teardown(install_dir, svc, journal_path, task_id, command_id,
+                                    action, delay_ms, has_flag(argc, argv, L"--keep-data"),
+                                    log_path);
+    }
   } else if (_wcsicmp(stage, L"uninstall-runtime") == 0) {
     rc = stage_uninstall_runtime(install_dir, log_path);
   } else if (_wcsicmp(stage, L"write-health-summary") == 0) {

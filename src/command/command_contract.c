@@ -266,6 +266,20 @@ static const CommandFieldRule k_agent_update_rules[] = {
     RULE("health_observe_ms", FIELD_NUMBER, 1, 1, 86400000.0, 0, 0),
 };
 
+static const CommandFieldRule k_endpoint_lifecycle_rules[] = {
+    RULE("schema", FIELD_STRING, 1, 0, 0, 31, 0),
+    RULE("task_id", FIELD_STRING, 1, 0, 0, 128, 0),
+    RULE("action", FIELD_STRING, 1, 0, 0, 15, 0),
+    RULE("tenant_id", FIELD_STRING, 1, 0, 0, 64, 0),
+    RULE("endpoint_id", FIELD_STRING, 1, 0, 0, 128, 0),
+    RULE("reason", FIELD_STRING, 1, 0, 0, 512, 0),
+    RULE("requested_by", FIELD_STRING, 1, 0, 0, 128, 0),
+    RULE("initiated_by", FIELD_STRING, 1, 0, 0, 31, 0),
+    RULE("expected_policy_version", FIELD_STRING, 0, 0, 0, 128, 0),
+    RULE("keep_data", FIELD_BOOL, 1, 0, 0, 0, 0),
+    RULE("not_before_unix_ms", FIELD_NUMBER, 0, 0, 9007199254740991.0, 0, 0),
+};
+
 static int contract_fail(char *reason, size_t cap, const char *message) {
   if (reason && cap > 0u) {
     snprintf(reason, cap, "%s", message ? message : "invalid command payload");
@@ -393,6 +407,10 @@ static void command_rules(EdrCommandKind kind, const CommandFieldRule **rules,
       *rules = k_update_server_rules; *count = COUNT_OF(k_update_server_rules); break;
     case EDR_COMMAND_KIND_AGENT_UPDATE:
       *rules = k_agent_update_rules; *count = COUNT_OF(k_agent_update_rules); break;
+    case EDR_COMMAND_KIND_AGENT_RESTART_SERVICE:
+    case EDR_COMMAND_KIND_AGENT_OFFBOARD:
+    case EDR_COMMAND_KIND_AGENT_UNINSTALL:
+      *rules = k_endpoint_lifecycle_rules; *count = COUNT_OF(k_endpoint_lifecycle_rules); break;
     default:
       break;
   }
@@ -558,6 +576,25 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     if (manifest_url && (!manifest_url->valuestring || strncmp(manifest_url->valuestring, "https://", 8u) != 0 ||
         !manifest_sha->valuestring || strlen(manifest_sha->valuestring) != 64u)) {
       return contract_fail(reason, reason_cap, "runtime manifest contract is invalid");
+    }
+  }
+  if (kind == EDR_COMMAND_KIND_AGENT_RESTART_SERVICE ||
+      kind == EDR_COMMAND_KIND_AGENT_OFFBOARD ||
+      kind == EDR_COMMAND_KIND_AGENT_UNINSTALL) {
+    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+    const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
+    const cJSON *initiated_by = cJSON_GetObjectItemCaseSensitive(root, "initiated_by");
+    const char *expected = kind == EDR_COMMAND_KIND_AGENT_RESTART_SERVICE ? "restart" :
+                           kind == EDR_COMMAND_KIND_AGENT_OFFBOARD ? "offboard" : "uninstall";
+    if (!schema->valuestring || strcmp(schema->valuestring, "edr.endpoint.lifecycle.v1") != 0) {
+      return contract_fail(reason, reason_cap,
+                           "endpoint lifecycle schema must be edr.endpoint.lifecycle.v1");
+    }
+    if (!action->valuestring || strcmp(action->valuestring, expected) != 0) {
+      return contract_fail(reason, reason_cap, "endpoint lifecycle action does not match command type");
+    }
+    if (!initiated_by->valuestring || strcmp(initiated_by->valuestring, "operator") != 0) {
+      return contract_fail(reason, reason_cap, "endpoint lifecycle initiated_by must be operator");
     }
   }
   if (kind == EDR_COMMAND_KIND_RTQ_EXECUTE) {
