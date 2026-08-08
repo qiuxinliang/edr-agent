@@ -595,6 +595,12 @@ struct EdrAgent {
   uint64_t asurf_last_pending_check_ns;
   /** 安装/注册后补采集：endpoint_id 首次变为有效时仅执行一次。 */
   int asurf_enrolled_posted;
+  /** 本进程已成功应用的可信远程策略身份；用于消除相同策略轮询的重复副作用。 */
+  char applied_remote_config_hash[65];
+  char applied_remote_config_sequence[32];
+  int applied_remote_config_status_reported;
+  uint64_t remote_config_unchanged_count;
+  uint64_t remote_config_last_unchanged_log_ns;
 };
 
 static void edr_agent_clear_config_recovery(EdrAgent *agent) {
@@ -2107,6 +2113,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 
   unsigned long pmfe_sub = 0, pmfe_done = 0, pmfe_drop = 0;
   unsigned long pmfe_q = 0;
+  EdrPmfeRuntimeStats pmfe_runtime;
+  memset(&pmfe_runtime, 0, sizeof(pmfe_runtime));
 
   AVEStatus avst;
   memset(&avst, 0, sizeof(avst));
@@ -2311,13 +2319,20 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"queue_rejected\":%llu}},"
         "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
         "\"behavior_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,"
-        "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
+        "\"cpu_percent\":%u,\"cpu_percent_x100\":%u,"
+        "\"cpu_avg_10s_x100\":%u,\"cpu_avg_60s_x100\":%u,"
+        "\"cpu_max_60s_x100\":%u,\"cpu_p95_60s_x100\":%u,"
+        "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"logical_processors\":%u,"
+        "\"process_cpu_delta_100ns\":%llu,\"wall_delta_100ns\":%llu,"
+        "\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
         "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
         "\"thread_count\":%u,\"handle_count\":%u,"
         "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
+        "\"thread_sample_interval_ms\":%u,\"thread_sample_age_ms\":%u,"
+        "\"thread_sample_count\":%llu,"
         "\"hot_thread_role\":\"%s\","
         "\"throttle_active\":%s,\"pressure\":%s,\"pressure_level\":%u,"
-        "\"pressure_reason\":\"%s\",\"sample_count\":%llu},"
+        "\"pressure_reason\":\"%s\",\"sample_count\":%llu,\"sampler_reset_count\":%llu},"
         "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\","
         "\"rule_version\":\"%s\",\"rules_count\":%u,"
         "\"last_degrade_reason\":\"%s\"},"
@@ -2433,15 +2448,23 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
         agent->cfg.resource_limit.behavior_infer_per_min,
         agent->cfg.resource_limit.pmfe_scans_per_min,
-        rs.cpu_percent, (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
+        rs.cpu_percent, rs.cpu_percent_x100, rs.cpu_avg_10s_x100, rs.cpu_avg_60s_x100,
+        rs.cpu_max_60s_x100, rs.cpu_p95_60s_x100, rs.cpu_sample_window_ms,
+        rs.process_id, rs.logical_processor_count,
+        (unsigned long long)rs.process_cpu_delta_100ns,
+        (unsigned long long)rs.wall_delta_100ns,
+        (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
         (unsigned long long)rs.working_set_mb,
         (unsigned long long)rs.private_bytes_mb,
         (unsigned long long)rs.pagefile_mb,
         rs.thread_count, rs.handle_count,
-        rs.hot_thread_id, rs.hot_thread_cpu_percent, hot_thread_role,
+        rs.hot_thread_id, rs.hot_thread_cpu_percent,
+        rs.thread_sample_interval_ms, rs.thread_sample_age_ms,
+        (unsigned long long)rs.thread_sample_count, hot_thread_role,
         rs.throttle_active ? "true" : "false", rs.throttle_active ? "true" : "false",
         rs.pressure_level, resource_pressure_reason[0] ? resource_pressure_reason : "ok",
-        (unsigned long long)rs.sample_count, rules_ver, agent->cfg.preprocessing.rules_count,
+        (unsigned long long)rs.sample_count, (unsigned long long)rs.sampler_reset_count,
+        rules_ver, agent->cfg.preprocessing.rules_count,
         rs.throttle_active ? "resource_throttle" : "",
         ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
         ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
@@ -2499,6 +2522,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   }
 
   edr_pmfe_get_stats(&pmfe_sub, &pmfe_done, &pmfe_drop);
+  edr_pmfe_get_runtime_stats(&pmfe_runtime);
   pmfe_q = edr_pmfe_queue_depth();
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
@@ -2680,15 +2704,22 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
       "\"shellcode_packets_per_sec\":%u,\"low_priority_keep_percent_under_pressure\":%u,"
-      "\"cpu_percent\":%u,\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
+      "\"cpu_percent\":%u,\"cpu_percent_x100\":%u,"
+      "\"cpu_avg_10s_x100\":%u,\"cpu_avg_60s_x100\":%u,"
+      "\"cpu_max_60s_x100\":%u,\"cpu_p95_60s_x100\":%u,"
+      "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"logical_processors\":%u,"
+      "\"process_cpu_delta_100ns\":%llu,\"wall_delta_100ns\":%llu,"
+      "\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
       "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
       "\"thread_count\":%u,\"handle_count\":%u,"
       "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
+      "\"thread_sample_interval_ms\":%u,\"thread_sample_age_ms\":%u,"
+      "\"thread_sample_count\":%llu,"
       "\"hot_thread_role\":\"%s\","
       "\"hot_thread_kernel_delta_100ns\":%llu,\"hot_thread_user_delta_100ns\":%llu,"
       "\"hot_thread_total_delta_100ns\":%llu,"
       "\"throttle_active\":%s,\"pressure\":%s,\"pressure_level\":%u,"
-      "\"pressure_reason\":\"%s\",\"sample_count\":%llu},"
+      "\"pressure_reason\":\"%s\",\"sample_count\":%llu,\"sampler_reset_count\":%llu},"
       "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\",\"rule_version\":\"%s\","
       "\"rules_count\":%u,\"last_degrade_reason\":\"%s\"},"
       "\"suppression_policy\":{\"source\":\"%s\",\"policy_version\":\"%s\","
@@ -2758,6 +2789,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"webshell_configured\":%s},"
       "\"pmfe\":{\"enabled\":true,\"mode\":\"alert_single_process\",\"queue_depth\":%lu,"
       "\"submitted\":%lu,\"completed\":%lu,\"dropped\":%lu,"
+      "\"active\":%lu,\"failed\":%lu,\"duration_last_ms\":%llu,"
+      "\"duration_max_ms\":%llu,\"duration_avg_ms\":%llu,"
       "\"last_degrade_reason\":\"%s\"},"
       "\"shellcode\":{\"configured\":%s,\"enabled\":%s,\"runtime_status\":\"%s\","
       "\"provider\":\"windivert\",\"windivert_source\":\"%s\",\"dll_loaded\":%s,\"driver_open\":%s,"
@@ -2918,18 +2951,25 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.resource_limit.webshell_scan_mb_per_min,
       agent->cfg.resource_limit.shellcode_packets_per_sec,
       agent->cfg.resource_limit.low_priority_keep_percent_under_pressure,
-      rs.cpu_percent, (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
+      rs.cpu_percent, rs.cpu_percent_x100, rs.cpu_avg_10s_x100, rs.cpu_avg_60s_x100,
+      rs.cpu_max_60s_x100, rs.cpu_p95_60s_x100, rs.cpu_sample_window_ms,
+      rs.process_id, rs.logical_processor_count,
+      (unsigned long long)rs.process_cpu_delta_100ns,
+      (unsigned long long)rs.wall_delta_100ns,
+      (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
       (unsigned long long)rs.working_set_mb,
       (unsigned long long)rs.private_bytes_mb,
       (unsigned long long)rs.pagefile_mb,
       rs.thread_count, rs.handle_count,
-      rs.hot_thread_id, rs.hot_thread_cpu_percent, hot_thread_role,
+      rs.hot_thread_id, rs.hot_thread_cpu_percent,
+      rs.thread_sample_interval_ms, rs.thread_sample_age_ms,
+      (unsigned long long)rs.thread_sample_count, hot_thread_role,
       (unsigned long long)rs.hot_thread_kernel_delta_100ns,
       (unsigned long long)rs.hot_thread_user_delta_100ns,
       (unsigned long long)rs.hot_thread_total_delta_100ns,
       rs.throttle_active ? "true" : "false", rs.throttle_active ? "true" : "false",
       rs.pressure_level, resource_pressure_reason[0] ? resource_pressure_reason : "ok",
-      (unsigned long long)rs.sample_count,
+      (unsigned long long)rs.sample_count, (unsigned long long)rs.sampler_reset_count,
       rules_ver, agent->cfg.preprocessing.rules_count,
       rs.throttle_active ? "resource_throttle" : "",
       det_policy_source, det_policy_version, det_policy_rollback, det_policy_audit,
@@ -3062,6 +3102,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.shellcode_detector.enabled ? "true" : "false",
       agent->cfg.webshell_detector.enabled ? "true" : "false",
       pmfe_q, pmfe_sub, pmfe_done, pmfe_drop,
+      pmfe_runtime.active, pmfe_runtime.failed,
+      (unsigned long long)pmfe_runtime.duration_last_ms,
+      (unsigned long long)pmfe_runtime.duration_max_ms,
+      (unsigned long long)(pmfe_done ? pmfe_runtime.duration_total_ms / pmfe_done : 0u),
       pmfe_drop ? "queue_drop" : "",
       agent->cfg.shellcode_detector.enabled ? "true" : "false",
       edr_shellcode_detector_active() ? "true" : "false",
@@ -3156,7 +3200,7 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
     edr_preprocess_apply_config(&agent->cfg);
     edr_adaptive_collection_configure(&agent->cfg);
     edr_agent_apply_event_filter_config(&agent->cfg);
-    edr_resource_init(&agent->cfg);
+    edr_resource_reconfigure(&agent->cfg);
     edr_self_protect_apply_config(&agent->cfg);
     agent->asurf_last_post_ns = 0;
     {
@@ -3678,6 +3722,33 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     }
   }
 
+  if (config_headers.config_hash[0] && config_headers.sequence[0] &&
+      strcmp(agent->applied_remote_config_hash, config_headers.config_hash) == 0 &&
+      strcmp(agent->applied_remote_config_sequence, config_headers.sequence) == 0) {
+    if (!agent->applied_remote_config_status_reported &&
+        edr_ingest_http_post_config_status(
+            agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,
+            EDR_AGENT_VERSION_STRING, agent->cfg.preprocessing.rules_version,
+            config_headers.config_hash, config_headers.sequence, config_headers.nonce,
+            config_headers.signature, config_headers.signing_key_id, 1, "",
+            agent->cfg.preprocessing.rules_version, config_headers.config_hash,
+            "applied", 0) == 0) {
+      agent->applied_remote_config_status_reported = 1;
+    }
+    agent->remote_config_unchanged_count++;
+    if (agent->remote_config_last_unchanged_log_ns == 0u ||
+        now - agent->remote_config_last_unchanged_log_ns >= 15ULL * 60ULL * 1000000000ULL) {
+      fprintf(stderr,
+              "[config] verified remote policy unchanged sequence=%s hash=%s skipped=%llu\n",
+              config_headers.sequence, config_headers.config_hash,
+              (unsigned long long)agent->remote_config_unchanged_count);
+      agent->remote_config_last_unchanged_log_ns = now;
+    }
+    edr_agent_clear_remote_config_failure();
+    (void)remove(tmp);
+    return;
+  }
+
   EdrConfig remote;
   memset(&remote, 0, sizeof(remote));
   EdrError ce = edr_config_load(tmp, &remote);
@@ -3712,7 +3783,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     }
   }
   edr_preprocess_apply_config(&agent->cfg);
-  edr_resource_init(&agent->cfg);
+  edr_resource_reconfigure(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
   edr_ingest_http_set_policy_version(agent->cfg.preprocessing.rules_version);
   if ((changed & EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED) != 0 &&
@@ -3738,21 +3809,26 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     if (seq > 0) {
       edr_agent_write_config_sequence_state(agent->cfg.offline.queue_db_path, seq);
     }
-    (void)edr_ingest_http_post_config_status(agent->cfg.agent.tenant_id,
-                                             agent->cfg.agent.endpoint_id,
-                                             EDR_AGENT_VERSION_STRING,
-                                             agent->cfg.preprocessing.rules_version,
-                                             config_headers.config_hash,
-                                             config_headers.sequence,
-                                             config_headers.nonce,
-                                             config_headers.signature,
-                                             config_headers.signing_key_id,
-                                             1,
-                                             "",
-                                             agent->cfg.preprocessing.rules_version,
-                                             config_headers.config_hash,
-                                             "applied",
-                                             0);
+    snprintf(agent->applied_remote_config_hash, sizeof(agent->applied_remote_config_hash), "%s",
+             config_headers.config_hash);
+    snprintf(agent->applied_remote_config_sequence, sizeof(agent->applied_remote_config_sequence), "%s",
+             config_headers.sequence);
+    agent->applied_remote_config_status_reported =
+        edr_ingest_http_post_config_status(agent->cfg.agent.tenant_id,
+                                           agent->cfg.agent.endpoint_id,
+                                           EDR_AGENT_VERSION_STRING,
+                                           agent->cfg.preprocessing.rules_version,
+                                           config_headers.config_hash,
+                                           config_headers.sequence,
+                                           config_headers.nonce,
+                                           config_headers.signature,
+                                           config_headers.signing_key_id,
+                                           1,
+                                           "",
+                                           agent->cfg.preprocessing.rules_version,
+                                           config_headers.config_hash,
+                                           "applied",
+                                           0) == 0;
     fprintf(stderr, "[config] signed remote policy applied sequence=%s hash=%s rollout=%s/%s\n",
             config_headers.sequence[0] ? config_headers.sequence : "0",
             config_headers.config_hash[0] ? config_headers.config_hash : "-",

@@ -205,6 +205,16 @@ void edr_pmfe_get_stats(unsigned long *out_submitted, unsigned long *out_complet
 void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *out_completed,
                                  unsigned long *out_dropped, unsigned long *out_deduped,
                                  unsigned long *out_cooldown_skipped);
+typedef struct {
+  unsigned long active;
+  unsigned long failed;
+  uint64_t duration_last_ms;
+  uint64_t duration_max_ms;
+  uint64_t duration_total_ms;
+} EdrPmfeRuntimeStats;
+
+/** 实际 PMFE 工作线程执行指标，用于区分队列压力与扫描 CPU 开销。 */
+void edr_pmfe_get_runtime_stats(EdrPmfeRuntimeStats *out);
 unsigned long edr_pmfe_queue_depth(void);
 
 #endif

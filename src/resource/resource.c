@@ -24,6 +24,16 @@ static unsigned long s_emergency;
 /** 1：预处理应跳过低优先级（AGT-010；POSIX 由 resource_poll 置位） */
 static int s_preprocess_throttle;
 static EdrResourceSample s_sample;
+static uint32_t s_cpu_limit_percent;
+static int s_initialized;
+typedef struct {
+  uint64_t at_ms;
+  uint32_t cpu_x100;
+} EdrCpuWindowPoint;
+#define EDR_CPU_WINDOW_POINTS_MAX 128u
+static EdrCpuWindowPoint s_cpu_window[EDR_CPU_WINDOW_POINTS_MAX];
+static size_t s_cpu_window_next;
+static size_t s_cpu_window_count;
 static struct {
 #ifdef _WIN32
   FILETIME wall;
@@ -46,6 +56,7 @@ typedef struct {
 static EdrThreadCpuPoint s_thread_cpu_prev[EDR_THREAD_CPU_POINTS_MAX];
 static size_t s_thread_cpu_prev_count;
 static uint64_t s_last_working_set_trim_ms;
+static uint64_t s_last_thread_sample_ms;
 
 static long resource_env_long(const char *name, long fallback, long minv, long maxv) {
   const char *v = getenv(name);
@@ -77,6 +88,49 @@ static void sample_init(void) {
 #endif
 }
 
+static void cpu_window_add(uint64_t now_ms, uint32_t cpu_x100) {
+  uint32_t values[EDR_CPU_WINDOW_POINTS_MAX];
+  uint64_t sum10 = 0u;
+  uint64_t sum60 = 0u;
+  uint32_t count10 = 0u;
+  uint32_t count60 = 0u;
+  uint32_t max60 = 0u;
+  s_cpu_window[s_cpu_window_next].at_ms = now_ms;
+  s_cpu_window[s_cpu_window_next].cpu_x100 = cpu_x100;
+  s_cpu_window_next = (s_cpu_window_next + 1u) % EDR_CPU_WINDOW_POINTS_MAX;
+  if (s_cpu_window_count < EDR_CPU_WINDOW_POINTS_MAX) {
+    s_cpu_window_count++;
+  }
+  for (size_t i = 0u; i < s_cpu_window_count; i++) {
+    const EdrCpuWindowPoint *point = &s_cpu_window[i];
+    uint64_t age_ms = now_ms >= point->at_ms ? now_ms - point->at_ms : 0u;
+    if (age_ms <= 60000u) {
+      values[count60++] = point->cpu_x100;
+      sum60 += point->cpu_x100;
+      if (point->cpu_x100 > max60) {
+        max60 = point->cpu_x100;
+      }
+      if (age_ms <= 10000u) {
+        sum10 += point->cpu_x100;
+        count10++;
+      }
+    }
+  }
+  for (uint32_t i = 1u; i < count60; i++) {
+    uint32_t value = values[i];
+    uint32_t j = i;
+    while (j > 0u && values[j - 1u] > value) {
+      values[j] = values[j - 1u];
+      j--;
+    }
+    values[j] = value;
+  }
+  s_sample.cpu_avg_10s_x100 = count10 ? (uint32_t)(sum10 / count10) : cpu_x100;
+  s_sample.cpu_avg_60s_x100 = count60 ? (uint32_t)(sum60 / count60) : cpu_x100;
+  s_sample.cpu_max_60s_x100 = max60;
+  s_sample.cpu_p95_60s_x100 = count60 ? values[((count60 * 95u) + 99u) / 100u - 1u] : cpu_x100;
+}
+
 static int preprocess_throttle_forced(void) {
   const char *force = getenv("EDR_PREPROCESS_THROTTLE");
   return force && force[0] == '1';
@@ -94,15 +148,42 @@ void edr_resource_init(const EdrConfig *cfg) {
   s_emergency = 0;
   s_preprocess_throttle = 0;
   memset(&s_sample, 0, sizeof(s_sample));
+  memset(s_cpu_window, 0, sizeof(s_cpu_window));
+  s_cpu_window_next = 0u;
+  s_cpu_window_count = 0u;
+  s_cpu_limit_percent = cfg ? cfg->resource_limit.cpu_limit_percent : 0u;
+  s_initialized = 1;
+  s_sample.sampler_reset_count = 1u;
 #ifdef _WIN32
   s_thread_cpu_prev_count = 0u;
   s_last_working_set_trim_ms = 0u;
+  s_last_thread_sample_ms = 0u;
 #endif
   set_pressure_sample(0u, 0u, "ok");
   sample_init();
 }
 
-void edr_resource_shutdown(void) { s_cfg = NULL; }
+void edr_resource_reconfigure(const EdrConfig *cfg) {
+  uint32_t next_cpu_limit = cfg ? cfg->resource_limit.cpu_limit_percent : 0u;
+  if (!s_initialized) {
+    edr_resource_init(cfg);
+    return;
+  }
+  s_cfg = cfg;
+  if (s_cpu_limit_percent == 0u && next_cpu_limit > 0u) {
+    sample_init();
+#ifdef _WIN32
+    s_thread_cpu_prev_count = 0u;
+#endif
+    s_sample.sampler_reset_count++;
+  }
+  s_cpu_limit_percent = next_cpu_limit;
+}
+
+void edr_resource_shutdown(void) {
+  s_cfg = NULL;
+  s_initialized = 0;
+}
 
 unsigned long edr_resource_emergency_count(void) { return s_emergency; }
 
@@ -267,10 +348,14 @@ void edr_resource_poll(void) {
   }
   uint64_t cpu_delta = (filetime_u64(now_kernel) - filetime_u64(s_last.kernel)) +
                        (filetime_u64(now_user) - filetime_u64(s_last.user));
-  SYSTEM_INFO si;
-  GetSystemInfo(&si);
-  DWORD ncpu = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1u;
-  unsigned pct = (unsigned)((cpu_delta * 100ULL) / (wall_delta * (uint64_t)ncpu));
+  DWORD ncpu = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+  if (ncpu == 0u) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    ncpu = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1u;
+  }
+  uint32_t pct_x100 = (uint32_t)((cpu_delta * 10000ULL) / (wall_delta * (uint64_t)ncpu));
+  unsigned pct = pct_x100 / 100u;
   PROCESS_MEMORY_COUNTERS_EX pmc;
   memset(&pmc, 0, sizeof(pmc));
   unsigned long rss_mb = 0;
@@ -284,14 +369,32 @@ void edr_resource_poll(void) {
   maybe_trim_working_set(pct, &rss_mb);
   DWORD handles = 0;
   (void)GetProcessHandleCount(GetCurrentProcess(), &handles);
-  uint32_t hot_thread_id = 0u;
-  uint32_t hot_thread_cpu_percent = 0u;
-  uint64_t hot_thread_kernel_delta_100ns = 0u;
-  uint64_t hot_thread_user_delta_100ns = 0u;
-  uint32_t thread_count =
-      sample_threads_for_pid(GetCurrentProcessId(), wall_delta, ncpu, &hot_thread_id,
-                             &hot_thread_cpu_percent, &hot_thread_kernel_delta_100ns,
-                             &hot_thread_user_delta_100ns);
+  uint64_t sample_now_ms = resource_monotonic_ms();
+  uint32_t thread_count = s_sample.thread_count;
+  uint32_t hot_thread_id = s_sample.hot_thread_id;
+  uint32_t hot_thread_cpu_percent = s_sample.hot_thread_cpu_percent;
+  uint64_t hot_thread_kernel_delta_100ns = s_sample.hot_thread_kernel_delta_100ns;
+  uint64_t hot_thread_user_delta_100ns = s_sample.hot_thread_user_delta_100ns;
+  uint32_t normal_thread_interval_ms =
+      (uint32_t)resource_env_long("EDR_RESOURCE_THREAD_SAMPLE_INTERVAL_MS", 5000, 1000, 60000);
+  uint32_t hot_thread_interval_ms =
+      (uint32_t)resource_env_long("EDR_RESOURCE_THREAD_SAMPLE_HOT_INTERVAL_MS", 2000, 1000, 10000);
+  uint32_t thread_interval_ms = pct_x100 >= 500u ? hot_thread_interval_ms : normal_thread_interval_ms;
+  uint64_t thread_age_ms = s_last_thread_sample_ms == 0u
+                               ? (uint64_t)thread_interval_ms
+                               : sample_now_ms - s_last_thread_sample_ms;
+  if (s_last_thread_sample_ms == 0u || thread_age_ms >= thread_interval_ms) {
+    uint64_t thread_wall_delta = s_last_thread_sample_ms == 0u
+                                     ? wall_delta
+                                     : thread_age_ms * 10000ULL;
+    thread_count = sample_threads_for_pid(
+        GetCurrentProcessId(), thread_wall_delta, ncpu, &hot_thread_id,
+        &hot_thread_cpu_percent, &hot_thread_kernel_delta_100ns,
+        &hot_thread_user_delta_100ns);
+    s_last_thread_sample_ms = sample_now_ms;
+    s_sample.thread_sample_count++;
+    thread_age_ms = 0u;
+  }
 
   s_last.wall = now_wall;
   s_last.kernel = now_kernel;
@@ -302,6 +405,13 @@ void edr_resource_poll(void) {
   bool mem_bad = enforce_limits && s_cfg->resource_limit.memory_limit_mb > 0u &&
                  rss_mb > (unsigned long)s_cfg->resource_limit.memory_limit_mb;
   s_sample.cpu_percent = pct;
+  s_sample.cpu_percent_x100 = pct_x100;
+  s_sample.cpu_sample_window_ms = (uint32_t)(wall_delta / 10000ULL);
+  s_sample.process_id = (uint32_t)GetCurrentProcessId();
+  s_sample.logical_processor_count = (uint32_t)ncpu;
+  s_sample.process_cpu_delta_100ns = cpu_delta;
+  s_sample.wall_delta_100ns = wall_delta;
+  cpu_window_add(sample_now_ms, pct_x100);
   s_sample.rss_mb = rss_mb;
   s_sample.working_set_mb = rss_mb;
   s_sample.private_bytes_mb = private_mb;
@@ -313,6 +423,8 @@ void edr_resource_poll(void) {
   s_sample.hot_thread_kernel_delta_100ns = hot_thread_kernel_delta_100ns;
   s_sample.hot_thread_user_delta_100ns = hot_thread_user_delta_100ns;
   s_sample.hot_thread_total_delta_100ns = hot_thread_kernel_delta_100ns + hot_thread_user_delta_100ns;
+  s_sample.thread_sample_interval_ms = thread_interval_ms;
+  s_sample.thread_sample_age_ms = (uint32_t)(thread_age_ms > UINT32_MAX ? UINT32_MAX : thread_age_ms);
   s_sample.sample_count++;
   if (cpu_bad) {
     s_emergency++;
@@ -361,6 +473,19 @@ void edr_resource_poll(void) {
   bool cpu_bad = cpu_soft && pct > s_cfg->resource_limit.emergency_cpu_limit;
   bool mem_bad = false;
   unsigned long rss_mb = 0;
+
+  s_sample.cpu_percent = pct;
+  s_sample.cpu_percent_x100 = (uint32_t)(cpu_frac * 10000.0);
+  s_sample.cpu_sample_window_ms = (uint32_t)(wall_s * 1000.0);
+  s_sample.process_id = (uint32_t)getpid();
+  {
+    long logical_processors = sysconf(_SC_NPROCESSORS_ONLN);
+    s_sample.logical_processor_count = logical_processors > 0 ? (uint32_t)logical_processors : 1u;
+  }
+  s_sample.process_cpu_delta_100ns = (uint64_t)((ut + st) * 10000000.0);
+  s_sample.wall_delta_100ns = (uint64_t)(wall_s * 10000000.0);
+  cpu_window_add((uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_usec / 1000ULL,
+                 s_sample.cpu_percent_x100);
 
   if (s_cfg->resource_limit.memory_limit_mb > 0u) {
 #if defined(__APPLE__)

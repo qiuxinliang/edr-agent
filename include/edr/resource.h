@@ -12,6 +12,8 @@ extern "C" {
 
 /** §12 资源限制：按配置轮询 CPU/内存占用并打日志；超限时进入 emergency 计数 */
 void edr_resource_init(const EdrConfig *cfg);
+/** 热更新资源配置但保留 CPU 基线、滚动窗口和累计样本。 */
+void edr_resource_reconfigure(const EdrConfig *cfg);
 void edr_resource_shutdown(void);
 void edr_resource_poll(void);
 
@@ -19,6 +21,17 @@ unsigned long edr_resource_emergency_count(void);
 
 typedef struct {
   uint32_t cpu_percent;
+  /** 与 Windows 任务管理器一致的整机容量口径，单位为 0.01%。 */
+  uint32_t cpu_percent_x100;
+  uint32_t cpu_avg_10s_x100;
+  uint32_t cpu_avg_60s_x100;
+  uint32_t cpu_max_60s_x100;
+  uint32_t cpu_p95_60s_x100;
+  uint32_t cpu_sample_window_ms;
+  uint32_t process_id;
+  uint32_t logical_processor_count;
+  uint64_t process_cpu_delta_100ns;
+  uint64_t wall_delta_100ns;
   uint64_t rss_mb;
   uint64_t working_set_mb;
   uint64_t private_bytes_mb;
@@ -30,9 +43,13 @@ typedef struct {
   uint64_t hot_thread_kernel_delta_100ns;
   uint64_t hot_thread_user_delta_100ns;
   uint64_t hot_thread_total_delta_100ns;
+  uint32_t thread_sample_interval_ms;
+  uint32_t thread_sample_age_ms;
+  uint64_t thread_sample_count;
   uint32_t throttle_active;
   uint32_t pressure_level;
   uint64_t sample_count;
+  uint64_t sampler_reset_count;
   char pressure_reason[48];
 } EdrResourceSample;
 

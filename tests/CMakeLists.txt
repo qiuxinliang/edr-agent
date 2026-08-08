@@ -771,6 +771,16 @@ add_test(NAME ave_fl_abi_c0 COMMAND test_ave_fl_abi WORKING_DIRECTORY ${CMAKE_BI
 add_test(NAME ave_suppression_sqlite COMMAND test_ave_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_scan_pipeline COMMAND test_ave_pipeline WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME config_fingerprint COMMAND test_config_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_resource_metrics
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_resource_metrics.c
+  ${CMAKE_SOURCE_DIR}/src/resource/resource.c)
+target_include_directories(test_resource_metrics PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(WIN32)
+  target_link_libraries(test_resource_metrics PRIVATE psapi)
+endif()
+add_test(NAME resource_metrics_hot_reconfigure COMMAND test_resource_metrics
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(EDR_WITH_FL_TRAINER)
   add_test(NAME fl_trainer_c1 COMMAND test_fl_trainer_smoke WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()

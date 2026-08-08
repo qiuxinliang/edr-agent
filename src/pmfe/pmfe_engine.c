@@ -99,6 +99,11 @@ static volatile LONG s_stat_completed;
 static volatile LONG s_stat_dropped;
 static volatile LONG s_stat_deduped;
 static volatile LONG s_stat_cooldown_skipped;
+static volatile LONG s_stat_active;
+static volatile LONG s_stat_failed;
+static volatile LONG64 s_stat_duration_last_ms;
+static volatile LONG64 s_stat_duration_max_ms;
+static volatile LONG64 s_stat_duration_total_ms;
 
 static LONG pmfe_atomic_load_long(volatile LONG *p) {
   return InterlockedCompareExchange(p, 0, 0);
@@ -109,6 +114,11 @@ static volatile unsigned long s_stat_completed;
 static volatile unsigned long s_stat_dropped;
 static volatile unsigned long s_stat_deduped;
 static volatile unsigned long s_stat_cooldown_skipped;
+static volatile unsigned long s_stat_active;
+static volatile unsigned long s_stat_failed;
+static volatile uint64_t s_stat_duration_last_ms;
+static volatile uint64_t s_stat_duration_max_ms;
+static volatile uint64_t s_stat_duration_total_ms;
 #endif
 
 #ifdef _WIN32
@@ -2314,6 +2324,11 @@ static void pmfe_worker_body(void) {
     snprintf(scan_result.cross_process_write_status,
              sizeof(scan_result.cross_process_write_status), "%s", "not_observed");
     uint64_t started_clock_ms = pmfe_result_clock_ms();
+#ifdef _WIN32
+    InterlockedIncrement(&s_stat_active);
+#else
+    (void)__atomic_add_fetch(&s_stat_active, 1ul, __ATOMIC_RELAXED);
+#endif
     int sr = pmfe_run_scan(&task, detail, sizeof(detail), &scan_result);
     (void)sr;
     if (detail[0] == '\0') {
@@ -2321,6 +2336,35 @@ static void pmfe_worker_body(void) {
     }
     scan_result.finished_unix_ms = pmfe_result_unix_ms();
     scan_result.duration_ms = pmfe_result_clock_ms() - started_clock_ms;
+#ifdef _WIN32
+    InterlockedExchange64(&s_stat_duration_last_ms, (LONG64)scan_result.duration_ms);
+    InterlockedExchangeAdd64(&s_stat_duration_total_ms, (LONG64)scan_result.duration_ms);
+    for (;;) {
+      LONG64 observed = InterlockedCompareExchange64(&s_stat_duration_max_ms, 0, 0);
+      if ((uint64_t)observed >= scan_result.duration_ms ||
+          InterlockedCompareExchange64(&s_stat_duration_max_ms,
+                                       (LONG64)scan_result.duration_ms, observed) == observed) {
+        break;
+      }
+    }
+    if (sr != 0) {
+      InterlockedIncrement(&s_stat_failed);
+    }
+    InterlockedDecrement(&s_stat_active);
+#else
+    __atomic_store_n(&s_stat_duration_last_ms, scan_result.duration_ms, __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&s_stat_duration_total_ms, scan_result.duration_ms, __ATOMIC_RELAXED);
+    uint64_t observed = __atomic_load_n(&s_stat_duration_max_ms, __ATOMIC_RELAXED);
+    while (observed < scan_result.duration_ms &&
+           !__atomic_compare_exchange_n(&s_stat_duration_max_ms, &observed,
+                                        scan_result.duration_ms, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+    if (sr != 0) {
+      (void)__atomic_add_fetch(&s_stat_failed, 1ul, __ATOMIC_RELAXED);
+    }
+    (void)__atomic_sub_fetch(&s_stat_active, 1ul, __ATOMIC_RELAXED);
+#endif
     scan_result.dns_hits = pmfe_detail_u(detail, "dns_ascii_hits=") +
                            pmfe_detail_u(detail, "dns_utf16_hits=") +
                            pmfe_detail_u(detail, "dns_wire_hits=");
@@ -3004,6 +3048,26 @@ void edr_pmfe_get_extended_stats(unsigned long *out_submitted, unsigned long *ou
   if (out_cooldown_skipped) {
     *out_cooldown_skipped = s_stat_cooldown_skipped;
   }
+#endif
+}
+
+void edr_pmfe_get_runtime_stats(EdrPmfeRuntimeStats *out) {
+  if (!out) {
+    return;
+  }
+  memset(out, 0, sizeof(*out));
+#ifdef _WIN32
+  out->active = (unsigned long)pmfe_atomic_load_long(&s_stat_active);
+  out->failed = (unsigned long)pmfe_atomic_load_long(&s_stat_failed);
+  out->duration_last_ms = (uint64_t)InterlockedCompareExchange64(&s_stat_duration_last_ms, 0, 0);
+  out->duration_max_ms = (uint64_t)InterlockedCompareExchange64(&s_stat_duration_max_ms, 0, 0);
+  out->duration_total_ms = (uint64_t)InterlockedCompareExchange64(&s_stat_duration_total_ms, 0, 0);
+#else
+  out->active = __atomic_load_n(&s_stat_active, __ATOMIC_RELAXED);
+  out->failed = __atomic_load_n(&s_stat_failed, __ATOMIC_RELAXED);
+  out->duration_last_ms = __atomic_load_n(&s_stat_duration_last_ms, __ATOMIC_RELAXED);
+  out->duration_max_ms = __atomic_load_n(&s_stat_duration_max_ms, __ATOMIC_RELAXED);
+  out->duration_total_ms = __atomic_load_n(&s_stat_duration_total_ms, __ATOMIC_RELAXED);
 #endif
 }
 
