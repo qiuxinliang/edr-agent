@@ -919,6 +919,7 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "scan_queue_capacity = %u\n", cfg->shellcode_detector.scan_queue_capacity);
   fprintf(fp, "\n[webshell_detector]\n");
   fprintf(fp, "enabled = %s\n", cfg->webshell_detector.enabled ? "true" : "false");
+  edr_agent_write_toml_string(fp, "roots", cfg->webshell_detector.roots);
   fprintf(fp, "\n[fl]\n");
   fprintf(fp, "enabled = %s\n", cfg->fl.enabled ? "true" : "false");
   fclose(fp);
@@ -1578,6 +1579,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   int architecture_emulated = 0;
   const char *native_architecture =
       edr_agent_native_architecture(architecture, &architecture_emulated);
+  if (native_architecture && strcmp(native_architecture, architecture) != 0) {
+    architecture_emulated = 1;
+  }
 #ifdef EDR_HAVE_PCRE2
   const int pcre2_build = 1;
 #else
@@ -1701,12 +1705,15 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                    : edr_deep_collector_is_running() ? "healthy" : "idle";
   EdrAlertGovernorStats alert_stats;
   EdrShellcodeDetectorRuntime shellcode_rt;
+  EdrWebshellDetectorRuntime webshell_rt;
   char endpoint_policy_capability[2048];
   char artifact_upload_capability[512];
   memset(&alert_stats, 0, sizeof(alert_stats));
   memset(&shellcode_rt, 0, sizeof(shellcode_rt));
+  memset(&webshell_rt, 0, sizeof(webshell_rt));
   edr_alert_governor_get_stats(&alert_stats);
   edr_shellcode_detector_get_runtime(&shellcode_rt);
+  edr_webshell_detector_get_runtime(&webshell_rt);
   snprintf(artifact_upload_capability, sizeof(artifact_upload_capability),
            "\"artifact_upload\":{\"code_supported\":true,\"build_supported\":true,"
            "\"policy_enabled\":%s,\"runtime_status\":\"%s\","
@@ -1753,6 +1760,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"runtime_status\":\"%s\",\"provider\":\"windivert\",\"windivert_source\":\"%s\",\"dll_loaded\":%s,"
       "\"driver_open\":%s,\"capture_threads\":%u,\"scan_workers\":%u,"
       "\"scan_queue_capacity\":%u,\"win32_error\":%u,\"detail\":\"%s\"},"
+      "\"webshell\":{\"code_supported\":%s,\"build_supported\":%s,\"policy_enabled\":%s,"
+      "\"runtime_status\":\"%s\",\"root_count\":%u,\"watch_count\":%u,\"detail\":\"%s\"},"
       "\"pmfe\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
       "\"result_schema\":\"pmfe_result_v1\",\"region_metadata\":%s,\"region_dump\":%s,\"yara_memory\":%s,"
       "\"vad_allocation_metadata\":%s,\"thread_start_snapshot\":%s,\"pe_reconstruction\":%s},"
@@ -1799,6 +1808,11 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       shellcode_rt.capture_threads, shellcode_rt.scan_workers, shellcode_rt.scan_queue_capacity,
       shellcode_rt.win32_error,
       shellcode_rt.detail[0] ? shellcode_rt.detail : "unknown",
+      webshell_rt.code_supported ? "true" : "false", webshell_rt.build_supported ? "true" : "false",
+      webshell_rt.policy_enabled ? "true" : "false",
+      webshell_rt.runtime_status[0] ? webshell_rt.runtime_status : "unavailable",
+      webshell_rt.root_count, webshell_rt.watch_count,
+      webshell_rt.detail[0] ? webshell_rt.detail : "unknown",
       inventory_native ? "true" : "false",
       (agent && agent->cfg.detection.pmfe_mode != 0 &&
        agent->cfg.resource_limit.pmfe_scans_per_min > 0u) ? "true" : "false",
@@ -2539,10 +2553,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   }
   EdrShellcodeRulesStatus shell_rules;
   EdrShellcodeDetectorRuntime shell_runtime;
+  EdrWebshellDetectorRuntime webshell_runtime;
   memset(&shell_rules, 0, sizeof(shell_rules));
   memset(&shell_runtime, 0, sizeof(shell_runtime));
+  memset(&webshell_runtime, 0, sizeof(webshell_runtime));
   edr_shellcode_known_get_status(&shell_rules);
   edr_shellcode_detector_get_runtime(&shell_runtime);
+  edr_webshell_detector_get_runtime(&webshell_runtime);
   char shell_source[48], shell_version[128], shell_error[192], shell_rb[128], shell_last_rule[128], shell_last_src[48];
   char shell_runtime_detail[192], shell_runtime_source[32];
   char audit_err[192], ebpf_err[192];
@@ -2808,7 +2825,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"builtin_matches\":%llu,\"gray_shadow_matches\":%llu,"
       "\"last_match_rule\":\"%s\",\"last_match_source\":\"%s\","
       "\"last_error\":\"%s\",\"last_degrade_reason\":\"%s\"},"
-      "\"webshell\":{\"enabled\":%s,\"mode\":\"web_roots_only\",\"watch_count\":%u,"
+      "\"webshell\":{\"configured\":%s,\"enabled\":%s,\"policy_enabled\":%s,"
+      "\"code_supported\":%s,\"build_supported\":%s,\"runtime_status\":\"%s\","
+      "\"runtime_detail\":\"%s\",\"mode\":\"web_roots_only\",\"root_count\":%u,\"watch_count\":%u,"
       "\"max_file_size_mb\":%u,\"scan_threads\":%u,\"last_degrade_reason\":\"%s\"},"
       "%s%s"
       "}}",
@@ -3142,9 +3161,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)shell_rules.builtin_matches, (unsigned long long)shell_rules.gray_shadow_matches,
       shell_last_rule, shell_last_src, shell_error,
       shell_error[0] ? "rules_error" : "",
-      agent->cfg.webshell_detector.enabled ? "true" : "false", agent->cfg.webshell_detector.max_watch_dirs,
+      agent->cfg.webshell_detector.roots[0] ? "true" : "false",
+      webshell_runtime.started ? "true" : "false",
+      webshell_runtime.policy_enabled ? "true" : "false",
+      webshell_runtime.code_supported ? "true" : "false",
+      webshell_runtime.build_supported ? "true" : "false",
+      webshell_runtime.runtime_status[0] ? webshell_runtime.runtime_status : "unavailable",
+      webshell_runtime.detail[0] ? webshell_runtime.detail : "unknown",
+      webshell_runtime.root_count, webshell_runtime.watch_count,
       agent->cfg.webshell_detector.max_file_size_mb, agent->cfg.webshell_detector.scan_threads,
-      "", evidence_json, corr_health_json);
+      (webshell_runtime.policy_enabled && !webshell_runtime.started) ? webshell_runtime.detail : "",
+      evidence_json, corr_health_json);
   if (n > 0 && (size_t)n < sizeof(body)) {
     int health_rc = edr_ingest_http_post_engine_health_json(body);
     fprintf(stderr, "[engine-health] post %s profile=diagnostic http2_enabled=%d negotiated=%s protocol=%s\n",
@@ -3507,6 +3534,13 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     if (edr_detection_apply_remote_modes(&agent->cfg, remote)) {
       changed |= EDR_REMOTE_POLICY_DETECTION_CHANGED;
     }
+  }
+  if (edr_agent_toml_has_section(tmp, "webshell_detector")) {
+    if (strcmp(agent->cfg.webshell_detector.roots, remote->webshell_detector.roots) != 0) {
+      changed |= EDR_REMOTE_POLICY_DETECTION_CHANGED;
+    }
+    snprintf(agent->cfg.webshell_detector.roots, sizeof(agent->cfg.webshell_detector.roots), "%s",
+             remote->webshell_detector.roots);
   }
   if (edr_agent_toml_has_section(tmp, "policy_v2")) {
     (void)edr_policy_v2_apply_remote(&agent->cfg, remote);

@@ -213,7 +213,9 @@ static void discover_web_roots(void) {
   add_root("C:\\phpstudy_pro\\WWW");
   add_root("C:\\nginx\\html");
   add_root("C:\\tomcat\\webapps");
-  const char *extra = getenv("EDR_WEBSHELL_ROOTS");
+  const char *extra = s_cfg && s_cfg->webshell_detector.roots[0]
+                          ? s_cfg->webshell_detector.roots
+                          : getenv("EDR_WEBSHELL_ROOTS");
   if (!extra || !extra[0]) {
     return;
   }
@@ -650,14 +652,14 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
   if (!cfg) {
     return EDR_ERR_INVALID_ARG;
   }
+  s_cfg = cfg;
+  s_bus = bus;
   if (!cfg->webshell_detector.enabled) {
     return EDR_OK;
   }
   if (s_started) {
     return EDR_OK;
   }
-  s_cfg = cfg;
-  s_bus = bus;
   discover_web_roots();
   if (s_root_count == 0u) {
     EDR_LOGE("%s", "[webshell_detector] no web roots discovered; set EDR_WEBSHELL_ROOTS to enable\n");
@@ -703,6 +705,13 @@ EdrError edr_webshell_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
 
 void edr_webshell_detector_shutdown(void) {
   if (!s_started) {
+    s_root_count = 0;
+    s_watch_count = 0;
+    s_cfg = NULL;
+    s_bus = NULL;
+#ifdef EDR_HAVE_YARA
+    unload_yara();
+#endif
     return;
   }
   InterlockedExchange(&s_stop, 1);
@@ -736,3 +745,27 @@ unsigned int edr_webshell_detector_watch_count(void) {
 }
 
 uint64_t edr_webshell_detector_budget_drop_count(void) { return s_budget_drops; }
+
+void edr_webshell_detector_get_runtime(EdrWebshellDetectorRuntime *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  out->code_supported = 1;
+  out->build_supported = 1;
+  out->policy_enabled = s_cfg && s_cfg->webshell_detector.enabled;
+  out->started = s_started;
+  out->root_count = (unsigned int)s_root_count;
+  out->watch_count = (unsigned int)s_watch_count;
+  if (!out->policy_enabled) {
+    snprintf(out->runtime_status, sizeof(out->runtime_status), "%s", "disabled");
+    snprintf(out->detail, sizeof(out->detail), "%s", "policy_disabled");
+  } else if (s_root_count == 0u) {
+    snprintf(out->runtime_status, sizeof(out->runtime_status), "%s", "degraded");
+    snprintf(out->detail, sizeof(out->detail), "%s", "no_valid_web_roots");
+  } else if (!s_started || s_watch_count == 0u) {
+    snprintf(out->runtime_status, sizeof(out->runtime_status), "%s", "degraded");
+    snprintf(out->detail, sizeof(out->detail), "%s", "no_active_watchers");
+  } else {
+    snprintf(out->runtime_status, sizeof(out->runtime_status), "%s", "healthy");
+    snprintf(out->detail, sizeof(out->detail), "%s", "watching");
+  }
+}

@@ -84,6 +84,24 @@ static void test_remote_detection_modes_parse(void) {
   assert(cfg.detection.pmfe_mode == 2);
 }
 
+static void test_webshell_roots_parse(void) {
+  const char *fn = "edr_test_cfg_webshell_roots.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[webshell_detector]\n"
+          "roots = \"C:\\\\inetpub\\\\wwwroot;D:\\\\sites\\\\portal\"\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(strcmp(cfg.webshell_detector.roots,
+                "C:\\inetpub\\wwwroot;D:\\sites\\portal") == 0);
+}
+
 static void test_correlation_policy_parse(void) {
   const char *fn = "edr_test_cfg_correlation.toml";
   FILE *f = fopen(fn, "wb");
@@ -289,6 +307,7 @@ int main(void) {
   test_detection_policy_conditional_suppression();
   test_command_forensic_yara_rules_dir();
   test_remote_detection_modes_parse();
+  test_webshell_roots_parse();
   test_correlation_policy_parse();
   test_policy_v2_and_attack_surface_parse();
   test_control_http2_policy_parse_and_legacy_fallback();

@@ -468,6 +468,8 @@ typedef struct EdrConfig {
     bool enabled;
     uint32_t discovery_interval_s;
     char iis_config_path[1024];
+    /** 管理面正式下发的监听根目录，逗号或分号分隔；空值保留平台默认目录发现。 */
+    char roots[4096];
     uint32_t max_watch_dirs;
     bool monitor_subdirs;
     char webshell_rules_dir[1024];

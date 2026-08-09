@@ -1769,6 +1769,8 @@ static void load_webshell_detector(toml_table_t *t, EdrConfig *cfg) {
   }
   take_string(toml_string_in(t, "iis_config_path"), cfg->webshell_detector.iis_config_path,
               sizeof(cfg->webshell_detector.iis_config_path));
+  take_string(toml_string_in(t, "roots"), cfg->webshell_detector.roots,
+              sizeof(cfg->webshell_detector.roots));
   {
     toml_datum_t d = toml_int_in(t, "max_watch_dirs");
     if (d.ok && d.u.i > 0 && d.u.i <= 0x7fffffffLL) {
@@ -2368,6 +2370,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->webshell_detector.enabled = false;
   cfg->webshell_detector.discovery_interval_s = 1800u;
   cfg->webshell_detector.iis_config_path[0] = '\0';
+  cfg->webshell_detector.roots[0] = '\0';
   cfg->webshell_detector.max_watch_dirs = 64u;
   cfg->webshell_detector.monitor_subdirs = true;
   cfg->webshell_detector.webshell_rules_dir[0] = '\0';

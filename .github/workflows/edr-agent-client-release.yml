@@ -812,6 +812,19 @@ jobs:
             schema_version = 1
             version = $env:EDR_AGENT_VERSION
             signature = $signatureMetadata
+            runtime_capabilities = [ordered]@{
+              shellcode_network = [ordered]@{
+                provider = 'windivert'
+                build_supported = ($env:EDR_INCLUDE_WINDIVERT -eq 'true')
+                runtime_status = if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') { 'ready' } else { 'unavailable' }
+                detail = if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') { 'windivert_runtime_packaged' } else { 'arm64_windivert_driver_unavailable' }
+              }
+              webshell = [ordered]@{
+                build_supported = $true
+                runtime_status = 'policy_configurable'
+                roots_policy_key = 'agent.detection.webshell_roots'
+              }
+            }
             artifacts = @()
           }
           foreach ($asset in Get-ChildItem -LiteralPath $dist -File | Sort-Object Name) {
