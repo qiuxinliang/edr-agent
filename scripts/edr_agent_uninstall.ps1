@@ -102,7 +102,10 @@ function Wait-AgentServiceDeleted {
   )
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
   do {
-    if (-not (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { return $true }
+    $escapedName = $Name.Replace("'", "''")
+    if (-not (Get-CimInstance Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue)) {
+      return $true
+    }
     Start-Sleep -Milliseconds 500
   } while ([DateTime]::UtcNow -lt $deadline)
   return $false
@@ -115,16 +118,24 @@ function Remove-AgentServices {
     $service = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $service) { continue }
     Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
-    try { $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20)) } catch {
+    try {
+      $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20))
+    } catch {
       Stop-AgentProcesses
       Start-Sleep -Milliseconds 500
+    } finally {
+      # A service remains DELETE_PENDING while a ServiceController handle is
+      # open. Release this handle before asking SCM to delete the service.
+      try { $service.Close() } catch {}
+      try { $service.Dispose() } catch {}
+      $service = $null
     }
     $deleteExitCode = 0
     for ($attempt = 0; $attempt -lt 3; $attempt++) {
       $deleteOutput = (& sc.exe delete $name 2>&1 | Out-String).Trim()
       $deleteExitCode = $LASTEXITCODE
       if ($deleteOutput) { Write-Host $deleteOutput }
-      if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { break }
+      if (Wait-AgentServiceDeleted -Name $name -TimeoutSeconds 1) { break }
       Start-Sleep -Seconds 1
     }
     if (-not (Wait-AgentServiceDeleted -Name $name)) {

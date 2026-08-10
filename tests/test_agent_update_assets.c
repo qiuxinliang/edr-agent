@@ -218,6 +218,12 @@ int main(void) {
            "lifecycle binds the packaged service installer to the checked-out release source");
   require_true(!strstr(lifecycle_smoke, "$baselineInstaller"),
                "lifecycle does not execute an immutable baseline installer with obsolete PowerShell argument semantics");
+  contains(lifecycle_smoke, "$targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name \"uninstall.ps1\"",
+           "lifecycle selects the current uninstall PowerShell protocol");
+  contains(lifecycle_smoke, "Copy-Item -LiteralPath $targetUninstallScript",
+           "lifecycle never mixes the current native uninstaller with a baseline uninstall script");
+  contains(lifecycle_smoke, "target package uninstall script hash mismatch",
+           "lifecycle binds the packaged uninstall protocol to the checked-out release source");
   require_true(!strstr(lifecycle_smoke, "headless uninstall failed with exit code $LASTEXITCODE"),
                "lifecycle does not treat a stale native exit code as the result of a PowerShell installer script");
   contains(lifecycle_smoke, "failed_stage = $stage",
@@ -250,6 +256,10 @@ int main(void) {
   require_true(uninstall_script != NULL, "read Windows uninstall script");
   contains(uninstall_script, "function Wait-AgentServiceDeleted",
            "uninstall verifies that Windows services disappear");
+  contains(uninstall_script, "$service.Dispose()",
+           "uninstall releases ServiceController handles before service deletion");
+  contains(uninstall_script, "Get-CimInstance Win32_Service",
+           "uninstall deletion polling does not retain a new SCM service handle");
   contains(uninstall_script, "$deleteExitCode = $LASTEXITCODE",
            "uninstall checks the service deletion result");
   contains(uninstall_script, "FDSecurity\\UninstallArchive",

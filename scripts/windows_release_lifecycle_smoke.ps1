@@ -67,9 +67,9 @@ function Wait-ServiceStable {
   Start-Service -Name $serviceName
   for ($i = 0; $i -lt $Seconds; $i++) {
     Start-Sleep -Seconds 1
-    $service = Get-Service -Name $serviceName -ErrorAction Stop
-    if ($service.Status -ne "Running") {
-      throw "service $serviceName stopped during stability window: $($service.Status)"
+    $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop
+    if ($service.State -ne "Running") {
+      throw "service $serviceName stopped during stability window: $($service.State)"
     }
   }
 }
@@ -77,11 +77,14 @@ function Wait-ServiceStable {
 function Wait-ServiceDeleted {
   param([int]$Seconds = 20)
   for ($i = 0; $i -lt $Seconds; $i++) {
-    if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+    if (-not (Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue)) {
       return
     }
     Start-Sleep -Seconds 1
   }
+  & sc.exe queryex $serviceName 2>&1 | Out-Host
+  Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue |
+    Format-List Name, State, Status, ProcessId, StartMode | Out-Host
   throw "service $serviceName still exists after waiting $Seconds seconds for deletion"
 }
 
@@ -164,7 +167,7 @@ function Invoke-VersionTransition {
   if ($installedVersion -ne $Version) {
     throw "$Operation version mismatch: expected=$Version actual=$installedVersion"
   }
-  if ((Get-Service -Name $serviceName).Status -ne "Running") {
+  if ((Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).State -ne "Running") {
     throw "$Operation left service non-running"
   }
 }
@@ -179,16 +182,26 @@ $targetRoot = Split-Path -Parent $targetBinary
 $targetInstaller = Find-OneFile -Root $TargetPackageDir -Name "windows_service_install.ps1"
 $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_update.ps1"
 $targetUninstaller = Find-OneFile -Root $TargetPackageDir -Name "uninstall.exe"
+$targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name "uninstall.ps1"
 $baselineTemplate = Find-OneFile -Root $BaselinePackageDir -Name "agent_windows_production.example.toml"
 $sourceInstaller = Join-Path $PSScriptRoot "windows_service_install.ps1"
+$sourceUninstallScript = Join-Path $PSScriptRoot "edr_agent_uninstall.ps1"
 
 if (-not (Test-Path -LiteralPath $sourceInstaller)) {
   throw "current windows_service_install.ps1 is missing from the checked-out repository"
+}
+if (-not (Test-Path -LiteralPath $sourceUninstallScript)) {
+  throw "current edr_agent_uninstall.ps1 is missing from the checked-out repository"
 }
 $targetInstallerHash = (Get-FileHash -LiteralPath $targetInstaller -Algorithm SHA256).Hash
 $sourceInstallerHash = (Get-FileHash -LiteralPath $sourceInstaller -Algorithm SHA256).Hash
 if ($targetInstallerHash -ne $sourceInstallerHash) {
   throw "target package service installer hash mismatch"
+}
+$targetUninstallScriptHash = (Get-FileHash -LiteralPath $targetUninstallScript -Algorithm SHA256).Hash
+$sourceUninstallScriptHash = (Get-FileHash -LiteralPath $sourceUninstallScript -Algorithm SHA256).Hash
+if ($targetUninstallScriptHash -ne $sourceUninstallScriptHash) {
+  throw "target package uninstall script hash mismatch"
 }
 
 if ((Get-AgentVersion -Path $baselineBinary) -ne $BaselineVersion) {
@@ -200,7 +213,7 @@ if ((Get-AgentVersion -Path $targetBinary) -ne $TargetVersion) {
 
 $stage = "prepare"
 try {
-  $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+  $existing = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue
   if ($existing) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
     & sc.exe delete $serviceName | Out-Null
@@ -246,6 +259,7 @@ try {
   $stage = "uninstall"
   $agentProcessId = [int](Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).ProcessId
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
+  Copy-Item -LiteralPath $targetUninstallScript -Destination (Join-Path $installDir "uninstall.ps1") -Force
   & (Join-Path $installDir "uninstall.exe") --silent --install-dir $installDir --service-name $serviceName
   if ($LASTEXITCODE -ne 0) {
     throw "native uninstaller returned code $LASTEXITCODE"
@@ -282,7 +296,7 @@ try {
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
   throw
 } finally {
-  Get-Service -Name $serviceName -ErrorAction SilentlyContinue |
+  Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue |
     Format-List * | Out-File -FilePath (Join-Path $EvidenceDir "service-final.txt")
   foreach ($root in @($programDataState, $programDataLogs)) {
     if (Test-Path -LiteralPath $root) {
