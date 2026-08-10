@@ -181,6 +181,7 @@ $baselineRoot = Split-Path -Parent $baselineBinary
 $targetRoot = Split-Path -Parent $targetBinary
 $targetInstaller = Find-OneFile -Root $TargetPackageDir -Name "windows_service_install.ps1"
 $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_update.ps1"
+$targetLifecycleWorker = Find-OneFile -Root $TargetPackageDir -Name "FDSecurityInstallerWorker.exe"
 $targetUninstaller = Find-OneFile -Root $TargetPackageDir -Name "uninstall.exe"
 $targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name "uninstall.ps1"
 $baselineTemplate = Find-OneFile -Root $BaselinePackageDir -Name "agent_windows_production.example.toml"
@@ -258,16 +259,52 @@ try {
 
   $stage = "uninstall"
   $agentProcessId = [int](Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).ProcessId
+  $lifecycleCommandId = "cmd_lifecycle_uninstall_ci_$($TargetVersion.Replace('.', '_'))"
+  $lifecycleTaskId = "ci-lifecycle-uninstall-$($TargetVersion.Replace('.', '-'))"
+  $lifecycleJournal = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.journal.json"
+  $lifecycleLog = Join-Path $installDir "diagnostics\lifecycle-worker.log"
+  $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-last.json"
+  New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
+  New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
+  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt -Force -ErrorAction SilentlyContinue
+  Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
   Copy-Item -LiteralPath $targetUninstallScript -Destination (Join-Path $installDir "uninstall.ps1") -Force
-  & (Join-Path $installDir "uninstall.exe") --silent --install-dir $installDir --service-name $serviceName
-  if ($LASTEXITCODE -ne 0) {
-    throw "native uninstaller returned code $LASTEXITCODE"
+  $worker = Start-Process -FilePath (Join-Path $installDir "FDSecurityInstallerWorker.exe") `
+    -ArgumentList @(
+      "--stage", "lifecycle-uninstall",
+      "--install-dir", $installDir,
+      "--service-name", $serviceName,
+      "--journal", $lifecycleJournal,
+      "--log", $lifecycleLog,
+      "--command-id", $lifecycleCommandId,
+      "--task-id", $lifecycleTaskId,
+      "--action", "uninstall",
+      "--delay-ms", "5000"
+    ) -Wait -PassThru
+  if ($worker.ExitCode -ne 0) {
+    if (Test-Path -LiteralPath $lifecycleLog) { Get-Content -LiteralPath $lifecycleLog | Out-Host }
+    throw "lifecycle uninstall worker returned code $($worker.ExitCode)"
+  }
+  if (-not (Test-Path -LiteralPath $lifecycleJournal -PathType Leaf)) {
+    throw "lifecycle uninstall worker did not write its terminal journal"
+  }
+  $lifecycleResult = Get-Content -LiteralPath $lifecycleJournal -Raw | ConvertFrom-Json
+  if ($lifecycleResult.succeeded -ne $true -or [int]$lifecycleResult.exit_code -ne 0) {
+    throw "lifecycle uninstall journal reported failure: $($lifecycleResult.detail)"
   }
   $stage = "verify_uninstall"
   Wait-ServiceDeleted
   Wait-ProcessDeleted -ProcessId $agentProcessId
   Wait-InstallDirectoryDeleted
+  if (-not (Test-Path -LiteralPath $cleanupReceipt -PathType Leaf)) {
+    throw "deferred uninstall cleanup did not write its receipt"
+  }
+  $cleanupResult = Get-Content -LiteralPath $cleanupReceipt -Raw | ConvertFrom-Json
+  if ($cleanupResult.status -ne "succeeded") {
+    throw "deferred uninstall cleanup failed for $($cleanupResult.install_dir)"
+  }
+  Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt -Destination $EvidenceDir -Force
 
   $stage = "completed"
   [ordered]@{
@@ -281,6 +318,7 @@ try {
     embedded_updater_sha256 = $embeddedUpdaterSha256
     rollback = "passed"
     uninstall = "passed"
+    uninstall_path = "agent_lifecycle_worker"
     completed_at = [DateTimeOffset]::UtcNow.ToString("o")
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
 } catch {

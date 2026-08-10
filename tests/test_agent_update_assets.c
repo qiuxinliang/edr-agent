@@ -220,6 +220,14 @@ int main(void) {
                "lifecycle does not execute an immutable baseline installer with obsolete PowerShell argument semantics");
   contains(lifecycle_smoke, "$targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name \"uninstall.ps1\"",
            "lifecycle selects the current uninstall PowerShell protocol");
+  contains(lifecycle_smoke, "$targetLifecycleWorker = Find-OneFile -Root $TargetPackageDir",
+           "lifecycle selects the current detached lifecycle worker");
+  contains(lifecycle_smoke, "--stage\", \"lifecycle-uninstall\"",
+           "lifecycle smoke exercises the same worker stage used by remote uninstall");
+  contains(lifecycle_smoke, "lifecycle uninstall journal reported failure",
+           "lifecycle smoke requires the detached worker terminal journal");
+  contains(lifecycle_smoke, "deferred uninstall cleanup did not write its receipt",
+           "lifecycle smoke verifies the asynchronous program-file cleanup result");
   contains(lifecycle_smoke, "Copy-Item -LiteralPath $targetUninstallScript",
            "lifecycle never mixes the current native uninstaller with a baseline uninstall script");
   contains(lifecycle_smoke, "target package uninstall script hash mismatch",
@@ -282,6 +290,13 @@ int main(void) {
   contains(installer_worker, "--service-name %ls",
            "lifecycle worker binds uninstall to the installed service name");
   free(installer_worker);
+
+  snprintf(path, sizeof(path), "%s/src/command/agent_lifecycle_command.c", root);
+  char *lifecycle_command = read_file(path);
+  require_true(lifecycle_command != NULL, "read endpoint lifecycle command implementation");
+  contains(lifecycle_command, "--install-dir \\\"%s\\\"",
+           "remote lifecycle handoff pins the worker to its installed runtime directory");
+  free(lifecycle_command);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");
   return 0;

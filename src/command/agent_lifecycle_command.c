@@ -102,13 +102,21 @@ static int lifecycle_paths(const char *command_id, char *helper, size_t helper_c
 
 static int launch_worker(const char *helper, const char *journal, const char *log_path,
                          const char *command_id, const EdrAgentLifecycleRequest *request) {
+  char install_dir[MAX_PATH];
+  if (snprintf(install_dir, sizeof(install_dir), "%s", helper) >= (int)sizeof(install_dir)) {
+    return 0;
+  }
+  char *slash = strrchr(install_dir, '\\');
+  if (!slash || slash == install_dir) return 0;
+  *slash = '\0';
   char command[4096];
   int written = snprintf(
       command, sizeof(command),
       "\"%s\" --stage lifecycle-%s --service-name \"FDSecurityAgent\" "
+      "--install-dir \"%s\" "
       "--journal \"%s\" --log \"%s\" --command-id \"%s\" --task-id \"%s\" "
       "--action \"%s\" --delay-ms %u%s",
-      helper, request->action, journal, log_path, command_id, request->task_id,
+      helper, request->action, install_dir, journal, log_path, command_id, request->task_id,
       request->action, strcmp(request->action, "restart") == 0 ? 2000u : 30000u,
       request->keep_data ? " --keep-data" : "");
   if (written <= 0 || written >= (int)sizeof(command)) return 0;
