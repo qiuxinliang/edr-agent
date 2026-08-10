@@ -152,6 +152,9 @@ int main(void) {
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
   contains(workflow, "Assert-WindowsPeArchitecture.ps1", "release rejects architecture-mismatched PE files");
+  contains(workflow, "stage_msvc_runtime_dlls_build_release.ps1", "release stages the app-local MSVC runtime");
+  contains(workflow, "vcruntime140_1.dll", "release package gate requires the MSVC runtime dependency closure");
+  contains(workflow, "msvcp140.dll", "release package gate requires the C++ runtime used by ONNX Runtime");
   contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
            "ARM64 release excludes unsupported WinDivert drivers");
@@ -169,6 +172,16 @@ int main(void) {
   contains(workflow, "      - windows-lifecycle", "release publication waits for the Windows lifecycle gate");
   contains(workflow, "target_tag: ${{ github.event_name == 'workflow_dispatch'", "lifecycle validation receives the exact release tag");
   free(workflow);
+
+  snprintf(path, sizeof(path), "%s/scripts/stage_msvc_runtime_dlls_build_release.ps1", root);
+  char *msvc_runtime = read_file(path);
+  require_true(msvc_runtime != NULL, "read app-local MSVC runtime staging script");
+  contains(msvc_runtime, "VCToolsRedistDir", "MSVC runtime staging uses the selected compiler toolset first");
+  contains(msvc_runtime, "vswhere.exe", "MSVC runtime staging has a Visual Studio discovery fallback");
+  contains(msvc_runtime, "vcruntime140.dll", "MSVC runtime staging requires the core runtime");
+  contains(msvc_runtime, "vcruntime140_1.dll", "MSVC runtime staging requires the extended runtime");
+  contains(msvc_runtime, "msvcp140.dll", "MSVC runtime staging requires the C++ standard library runtime");
+  free(msvc_runtime);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/windows-install-upgrade-rollback.yml", root);
   char *lifecycle = read_file(path);

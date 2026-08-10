@@ -500,11 +500,12 @@ jobs:
             if ($signature.SignerCertificate.Subject -ne $env:WINDOWS_SIGNING_SUBJECT) { throw 'publisher subject mismatch' }
           }
 
-      - name: Stage ORT + vcpkg runtime DLLs
+      - name: Stage ORT + vcpkg + MSVC runtime DLLs
         shell: pwsh
         run: |
           ./scripts/stage_ort_dlls_build_release.ps1
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+          ./scripts/stage_msvc_runtime_dlls_build_release.ps1 -Architecture $env:EDR_RELEASE_ARCH
           if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
             ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
           } else {
@@ -716,6 +717,12 @@ jobs:
 
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
               Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for $env:EDR_VCPKG_TRIPLET."
+            }
+            foreach ($runtimeDll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+              $escapedRuntimeDll = [Regex]::Escape($runtimeDll)
+              if (-not ($entries -match "(?i)(^|/|\\)$escapedRuntimeDll$")) {
+                throw "required app-local MSVC runtime DLL missing from package: $runtimeDll"
+              }
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"

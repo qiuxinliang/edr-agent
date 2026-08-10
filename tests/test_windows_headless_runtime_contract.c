@@ -150,6 +150,12 @@ int main(void) {
                          "headless enrollment must repair explicit ACLs on existing queue DB sidecars");
   ok &= require_contains(installer_ps, "if ($sub -eq \"queue\") { throw }",
                          "headless enrollment must fail when queue ACL repair fails");
+  ok &= require_contains(installer_ps, "packaged MSVC runtime missing beside",
+                         "headless enrollment must identify an incomplete app-local MSVC runtime");
+  ok &= require_contains(installer_ps, "vcruntime140_1.dll",
+                         "headless enrollment must validate the extended MSVC runtime dependency");
+  ok &= require_contains(installer_ps, "msvcp140.dll",
+                         "headless enrollment must validate the C++ runtime dependency");
   free(installer_ps);
 
   char *uninstall_ps = read_source(root, "scripts/edr_agent_uninstall.ps1");

@@ -338,7 +338,7 @@ jobs:
           echo "=== sccache compilation cache stats ==="
           sccache --show-stats || echo "(sccache stats unavailable)"
 
-      - name: Stage ORT + vcpkg runtime DLLs
+      - name: Stage ORT + vcpkg + MSVC runtime DLLs
         shell: pwsh
         run: |
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
@@ -346,6 +346,7 @@ jobs:
             ./scripts/stage_ort_dlls_build_release.ps1
           }
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+          ./scripts/stage_msvc_runtime_dlls_build_release.ps1 -Architecture amd64
           ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
 
           $stagedYara = @(Get-ChildItem -Path "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
@@ -531,6 +532,12 @@ jobs:
 
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
               Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for x64-windows."
+            }
+            foreach ($runtimeDll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+              $escapedRuntimeDll = [Regex]::Escape($runtimeDll)
+              if (-not ($entries -match "(?i)(^|/|\\)$escapedRuntimeDll$")) {
+                throw "required app-local MSVC runtime DLL missing from package: $runtimeDll"
+              }
             }
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"

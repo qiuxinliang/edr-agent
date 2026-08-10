@@ -360,6 +360,14 @@ function Test-ExistingAgentTomlWithAgent {
     if (-not (Test-Path -LiteralPath $exe)) {
       continue
     }
+    $missingRuntime = @(
+      "vcruntime140.dll",
+      "vcruntime140_1.dll",
+      "msvcp140.dll"
+    ) | Where-Object { -not (Test-Path -LiteralPath (Join-Path $InstallRoot $_) -PathType Leaf) }
+    if ($missingRuntime.Count -gt 0) {
+      return ("packaged MSVC runtime missing beside {0}: {1}" -f $exeName, ($missingRuntime -join ", "))
+    }
     try {
       $result = Invoke-CapturedProcess -Exe $exe -ArgList @("--config", $ConfigPath, "--config-test")
       $out = (($result.Stdout, $result.Stderr | Where-Object { $_ }) -join "`n").Trim()

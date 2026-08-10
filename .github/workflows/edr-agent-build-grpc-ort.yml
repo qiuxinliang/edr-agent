@@ -146,12 +146,13 @@ jobs:
       - name: Build
         run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 
-      - name: Stage ORT + vcpkg runtime DLLs
+      - name: Stage ORT + vcpkg + MSVC runtime DLLs
         shell: pwsh
         run: |
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
           ./scripts/stage_ort_dlls_build_release.ps1
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
+          ./scripts/stage_msvc_runtime_dlls_build_release.ps1 -Architecture amd64
 
       - name: Test
         shell: bash
