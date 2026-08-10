@@ -85,6 +85,27 @@ function Wait-ServiceDeleted {
   throw "service $serviceName still exists after waiting $Seconds seconds for deletion"
 }
 
+function Wait-ProcessDeleted {
+  param([int]$ProcessId, [int]$Seconds = 20)
+  if ($ProcessId -le 0) { throw "Agent service did not expose a process id before uninstall" }
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+      return
+    }
+    Start-Sleep -Seconds 1
+  }
+  throw "Agent process still exists after waiting $Seconds seconds"
+}
+
+function Wait-InstallDirectoryDeleted {
+  param([int]$Seconds = 120)
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    if (-not (Test-Path -LiteralPath $installDir)) { return }
+    Start-Sleep -Seconds 1
+  }
+  throw "install directory still exists after waiting $Seconds seconds: $installDir"
+}
+
 function Wait-EmbeddedUpdaterMaterialized {
   param(
     [string]$Version,
@@ -157,6 +178,7 @@ $baselineRoot = Split-Path -Parent $baselineBinary
 $targetRoot = Split-Path -Parent $targetBinary
 $targetInstaller = Find-OneFile -Root $TargetPackageDir -Name "windows_service_install.ps1"
 $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_update.ps1"
+$targetUninstaller = Find-OneFile -Root $TargetPackageDir -Name "uninstall.exe"
 $baselineTemplate = Find-OneFile -Root $BaselinePackageDir -Name "agent_windows_production.example.toml"
 $sourceInstaller = Join-Path $PSScriptRoot "windows_service_install.ps1"
 
@@ -222,12 +244,16 @@ try {
     -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-amd64" -UpdateScript $targetUpdater
 
   $stage = "uninstall"
-  & $targetInstaller -Action Uninstall -ServiceName $serviceName `
-    -ExePath (Join-Path $installDir "FDSensor.exe") `
-    -ConfigPath $configPath -InstallDir $installDir -DataDir $installDir `
-    -SkipPreflight
+  $agentProcessId = [int](Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).ProcessId
+  Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
+  & (Join-Path $installDir "uninstall.exe") --silent --install-dir $installDir --service-name $serviceName
+  if ($LASTEXITCODE -ne 0) {
+    throw "native uninstaller returned code $LASTEXITCODE"
+  }
   $stage = "verify_uninstall"
   Wait-ServiceDeleted
+  Wait-ProcessDeleted -ProcessId $agentProcessId
+  Wait-InstallDirectoryDeleted
 
   $stage = "completed"
   [ordered]@{

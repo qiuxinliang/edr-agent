@@ -235,6 +235,14 @@ int main(void) {
            "keep-data uninstall archives diagnostics but still removes program files");
   contains(uninstaller, "-RemoveData -RemoveProgramFiles",
            "complete uninstall removes runtime data and program files");
+  contains(uninstaller, "current_process_is_elevated",
+           "native uninstaller detects LocalSystem or an elevated administrator token");
+  contains(uninstaller, "run_powershell_direct",
+           "elevated lifecycle uninstall avoids an interactive UAC handoff");
+  contains(uninstaller, "exec_info.lpVerb = L\"runas\"",
+           "manual non-elevated uninstall retains the UAC elevation path");
+  contains(uninstaller, "-ServiceName",
+           "native uninstall forwards the exact lifecycle service name");
   free(uninstaller);
 
   snprintf(path, sizeof(path), "%s/scripts/edr_agent_uninstall.ps1", root);
@@ -261,6 +269,8 @@ int main(void) {
            "remote uninstall observes native uninstaller completion");
   contains(installer_worker, "lifecycle_uninstall_completed",
            "remote uninstall journals verified native completion");
+  contains(installer_worker, "--service-name %ls",
+           "lifecycle worker binds uninstall to the installed service name");
   free(installer_worker);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");

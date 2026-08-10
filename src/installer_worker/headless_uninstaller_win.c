@@ -116,7 +116,8 @@ static int append_quoted_arg(wchar_t *out, size_t out_count, size_t *used, const
 }
 
 static int build_powershell_parameters(wchar_t *out, size_t out_count, const wchar_t *script,
-                                       const wchar_t *install_dir, DWORD parent_pid, int keep_data) {
+                                       const wchar_t *install_dir, const wchar_t *service_name,
+                                       DWORD parent_pid, int keep_data) {
   size_t used = 0;
   wchar_t pid_text[32];
   out[0] = L'\0';
@@ -127,6 +128,10 @@ static int build_powershell_parameters(wchar_t *out, size_t out_count, const wch
   if (!append_quoted_arg(out, out_count, &used, install_dir)) return 0;
   if (!append_text(out, out_count, &used, L" -ParentProcessId ")) return 0;
   if (!append_text(out, out_count, &used, pid_text)) return 0;
+  if (service_name && service_name[0]) {
+    if (!append_text(out, out_count, &used, L" -ServiceName ")) return 0;
+    if (!append_quoted_arg(out, out_count, &used, service_name)) return 0;
+  }
   if (keep_data) {
     if (!append_text(out, out_count, &used, L" -PreserveDiagnostics -RemoveProgramFiles")) return 0;
   } else if (!append_text(out, out_count, &used, L" -RemoveData -RemoveProgramFiles")) {
@@ -135,14 +140,65 @@ static int build_powershell_parameters(wchar_t *out, size_t out_count, const wch
   return 1;
 }
 
-static int run_uninstall_script(const wchar_t *script, const wchar_t *install_dir, int silent, int keep_data) {
+static int current_process_is_elevated(void) {
+  HANDLE token = NULL;
+  TOKEN_ELEVATION elevation;
+  DWORD returned = 0;
+  int elevated = 0;
+  if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned)) {
+      elevated = elevation.TokenIsElevated != 0;
+    }
+    CloseHandle(token);
+  }
+  return elevated;
+}
+
+static int wait_for_process(HANDLE process) {
+  DWORD exit_code = ERROR_GEN_FAILURE;
+  if (!process) return ERROR_INVALID_HANDLE;
+  if (WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0) {
+    exit_code = GetLastError();
+  } else if (!GetExitCodeProcess(process, &exit_code)) {
+    exit_code = GetLastError();
+  }
+  CloseHandle(process);
+  return (int)exit_code;
+}
+
+static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *parameters,
+                                 const wchar_t *install_dir, int silent) {
+  wchar_t command[32768];
+  size_t used = 0;
+  STARTUPINFOW startup;
+  PROCESS_INFORMATION process;
+  if (!append_quoted_arg(command, sizeof(command) / sizeof(command[0]), &used,
+                         powershell_path) ||
+      !append_text(command, sizeof(command) / sizeof(command[0]), &used, L" ") ||
+      !append_text(command, sizeof(command) / sizeof(command[0]), &used, parameters)) {
+    return ERROR_INSUFFICIENT_BUFFER;
+  }
+  ZeroMemory(&startup, sizeof(startup));
+  ZeroMemory(&process, sizeof(process));
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESHOWWINDOW;
+  startup.wShowWindow = silent ? SW_HIDE : SW_SHOWNORMAL;
+  if (!CreateProcessW(powershell_path, command, NULL, NULL, FALSE,
+                      silent ? CREATE_NO_WINDOW : 0, NULL, install_dir, &startup, &process)) {
+    return (int)GetLastError();
+  }
+  CloseHandle(process.hThread);
+  return wait_for_process(process.hProcess);
+}
+
+static int run_uninstall_script(const wchar_t *script, const wchar_t *install_dir,
+                                const wchar_t *service_name, int silent, int keep_data) {
   wchar_t parameters[32768];
   wchar_t system_dir[MAX_PATH * 2];
   wchar_t powershell_path[MAX_PATH * 4];
   SHELLEXECUTEINFOW exec_info;
-  DWORD exit_code = ERROR_GEN_FAILURE;
   if (!build_powershell_parameters(parameters, sizeof(parameters) / sizeof(parameters[0]), script,
-                                   install_dir, GetCurrentProcessId(), keep_data)) {
+                                   install_dir, service_name, GetCurrentProcessId(), keep_data)) {
     return ERROR_INSUFFICIENT_BUFFER;
   }
   if (GetSystemDirectoryW(system_dir, (UINT)(sizeof(system_dir) / sizeof(system_dir[0]))) == 0 ||
@@ -150,6 +206,14 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
                  L"WindowsPowerShell\\v1.0\\powershell.exe") ||
       !file_exists(powershell_path)) {
     return ERROR_FILE_NOT_FOUND;
+  }
+
+  /* A lifecycle worker runs as LocalSystem in session 0. Asking ShellExecute
+   * for the interactive `runas` verb there can never complete a UAC consent
+   * flow. An already elevated process must preserve its token and launch
+   * PowerShell directly; only a manual, non-elevated invocation needs UAC. */
+  if (current_process_is_elevated()) {
+    return run_powershell_direct(powershell_path, parameters, install_dir, silent);
   }
 
   ZeroMemory(&exec_info, sizeof(exec_info));
@@ -163,10 +227,7 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
   exec_info.nShow = silent ? SW_HIDE : SW_SHOWNORMAL;
   if (!ShellExecuteExW(&exec_info)) return (int)GetLastError();
   if (!exec_info.hProcess) return ERROR_INVALID_HANDLE;
-  WaitForSingleObject(exec_info.hProcess, INFINITE);
-  if (!GetExitCodeProcess(exec_info.hProcess, &exit_code)) exit_code = GetLastError();
-  CloseHandle(exec_info.hProcess);
-  return (int)exit_code;
+  return wait_for_process(exec_info.hProcess);
 }
 
 static void show_error(int silent, const wchar_t *message, DWORD code) {
@@ -184,6 +245,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   wchar_t install_dir[MAX_PATH * 4];
   wchar_t script_path[MAX_PATH * 4];
   const wchar_t *requested_dir;
+  const wchar_t *service_name;
   int silent;
   int keep_data;
   int rc;
@@ -205,6 +267,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   }
   requested_dir = arg_value(argc, argv, L"/INSTALLDIR");
   if (!requested_dir) requested_dir = arg_value(argc, argv, L"--install-dir");
+  service_name = arg_value(argc, argv, L"/SERVICENAME");
+  if (!service_name) service_name = arg_value(argc, argv, L"--service-name");
   _snwprintf(install_dir, sizeof(install_dir) / sizeof(install_dir[0]), L"%ls",
              requested_dir && requested_dir[0] ? requested_dir : exe_dir);
   if (!join_path(script_path, sizeof(script_path) / sizeof(script_path[0]), install_dir,
@@ -225,7 +289,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     }
   }
 
-  rc = run_uninstall_script(script_path, install_dir, silent, keep_data);
+  rc = run_uninstall_script(script_path, install_dir, service_name, silent, keep_data);
   if (rc == 0) {
     if (!silent) {
       MessageBoxW(NULL,

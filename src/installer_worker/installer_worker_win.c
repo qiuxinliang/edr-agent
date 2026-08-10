@@ -1258,9 +1258,10 @@ static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *j
   return rc;
 }
 
-static int launch_uninstaller_detached(const wchar_t *install_dir, int keep_data,
-                                       const wchar_t *log_path) {
+static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t *service_name,
+                                       int keep_data, const wchar_t *log_path) {
   wchar_t uninstaller[MAX_PATH * 2], quoted_exe[MAX_PATH * 4], quoted_dir[MAX_PATH * 4];
+  wchar_t quoted_service[MAX_PATH * 2];
   join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir, L"uninstall.exe");
   if (!file_exists(uninstaller)) {
     append_log_utf8(log_path, L"lifecycle_uninstall_missing_uninstall_exe");
@@ -1268,9 +1269,11 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, int keep_data
   }
   quote_arg(quoted_exe, sizeof(quoted_exe) / sizeof(quoted_exe[0]), uninstaller);
   quote_arg(quoted_dir, sizeof(quoted_dir) / sizeof(quoted_dir[0]), install_dir);
+  quote_arg(quoted_service, sizeof(quoted_service) / sizeof(quoted_service[0]), service_name);
   wchar_t command[8192];
-  _snwprintf(command, sizeof(command) / sizeof(command[0]), L"%ls --silent --install-dir %ls%ls",
-             quoted_exe, quoted_dir, keep_data ? L" --keep-data" : L"");
+  _snwprintf(command, sizeof(command) / sizeof(command[0]),
+             L"%ls --silent --install-dir %ls --service-name %ls%ls",
+             quoted_exe, quoted_dir, quoted_service, keep_data ? L" --keep-data" : L"");
   command[(sizeof(command) / sizeof(command[0])) - 1] = 0;
   STARTUPINFOW startup;
   PROCESS_INFORMATION process;
@@ -1332,7 +1335,7 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
     detail = rc == 0 ? "Agent service stopped after offboard handoff" :
                        "Agent offboard service stop failed";
   } else if (_wcsicmp(action, L"uninstall") == 0) {
-    rc = launch_uninstaller_detached(install_dir, keep_data, log_path);
+    rc = launch_uninstaller_detached(install_dir, service_name, keep_data, log_path);
     detail = rc == 0 ? "Native uninstaller completed after command-result handoff" :
                        "Native uninstaller failed after command-result handoff";
   }

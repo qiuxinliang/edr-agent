@@ -22,6 +22,7 @@ param(
   [switch]$RemoveData,
   [switch]$RemoveProgramFiles,
   [switch]$PreserveDiagnostics,
+  [string]$ServiceName = "FDSecurityAgent",
   [int]$ParentProcessId = 0
 )
 
@@ -108,7 +109,7 @@ function Wait-AgentServiceDeleted {
 }
 
 function Remove-AgentServices {
-  $serviceNames = @("FDSecurityAgent", "EdrAgent")
+  $serviceNames = @($ServiceName, "FDSecurityAgent", "EdrAgent")
   if ($env:EDR_SERVICE_NAME) { $serviceNames += $env:EDR_SERVICE_NAME }
   foreach ($name in ($serviceNames | Select-Object -Unique)) {
     $service = Get-Service -Name $name -ErrorAction SilentlyContinue
