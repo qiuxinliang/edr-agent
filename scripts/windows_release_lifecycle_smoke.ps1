@@ -109,6 +109,15 @@ function Wait-InstallDirectoryDeleted {
   throw "install directory still exists after waiting $Seconds seconds: $installDir"
 }
 
+function Wait-CleanupReceipt {
+  param([string]$Path, [int]$Seconds = 90)
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
+    Start-Sleep -Seconds 1
+  }
+  throw "deferred uninstall cleanup did not write its receipt within $Seconds seconds"
+}
+
 function Wait-EmbeddedUpdaterMaterialized {
   param(
     [string]$Version,
@@ -213,6 +222,7 @@ if ((Get-AgentVersion -Path $targetBinary) -ne $TargetVersion) {
 }
 
 $stage = "prepare"
+$attestationJob = $null
 try {
   $existing = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue
   if ($existing) {
@@ -264,6 +274,33 @@ try {
   $lifecycleJournal = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.journal.json"
   $lifecycleLog = Join-Path $installDir "diagnostics\lifecycle-worker.log"
   $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-last.json"
+  $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
+  $attestationPort = Get-Random -Minimum 32000 -Maximum 45000
+  $attestationURL = "http://127.0.0.1:$attestationPort/uninstall-attest/"
+  $attestationToken = "ci-lifecycle-uninstall-token-$($TargetVersion.Replace('.', '-'))"
+  $attestationJob = Start-Job -ScriptBlock {
+    param($Port, $EvidencePath)
+    $listener = New-Object Net.HttpListener
+    $listener.Prefixes.Add("http://127.0.0.1:$Port/uninstall-attest/")
+    try {
+      $listener.Start()
+      $context = $listener.GetContext()
+      $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
+      $body = $reader.ReadToEnd()
+      $reader.Dispose()
+      [ordered]@{
+        authorization_present = $context.Request.Headers['Authorization'] -like 'Bearer *'
+        body = ($body | ConvertFrom-Json)
+      } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $EvidencePath -Encoding UTF8
+      $responseBody = [Text.Encoding]::UTF8.GetBytes('{"success":true}')
+      $context.Response.StatusCode = 200
+      $context.Response.ContentType = 'application/json'
+      $context.Response.OutputStream.Write($responseBody, 0, $responseBody.Length)
+      $context.Response.Close()
+    } finally {
+      $listener.Close()
+    }
+  } -ArgumentList $attestationPort, $attestationEvidence
   New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
   New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
   Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt -Force -ErrorAction SilentlyContinue
@@ -280,7 +317,10 @@ try {
       "--command-id", $lifecycleCommandId,
       "--task-id", $lifecycleTaskId,
       "--action", "uninstall",
-      "--delay-ms", "5000"
+      "--delay-ms", "5000",
+      "--attestation-url", $attestationURL,
+      "--attestation-token", $attestationToken,
+      "--endpoint-id", "ci-lifecycle-smoke"
     ) -Wait -PassThru
   if ($worker.ExitCode -ne 0) {
     if (Test-Path -LiteralPath $lifecycleLog) { Get-Content -LiteralPath $lifecycleLog | Out-Host }
@@ -297,12 +337,21 @@ try {
   Wait-ServiceDeleted
   Wait-ProcessDeleted -ProcessId $agentProcessId
   Wait-InstallDirectoryDeleted
-  if (-not (Test-Path -LiteralPath $cleanupReceipt -PathType Leaf)) {
-    throw "deferred uninstall cleanup did not write its receipt"
-  }
+  Wait-CleanupReceipt -Path $cleanupReceipt
   $cleanupResult = Get-Content -LiteralPath $cleanupReceipt -Raw | ConvertFrom-Json
-  if ($cleanupResult.status -ne "succeeded") {
+  if ($cleanupResult.status -ne "succeeded" -or $cleanupResult.attestation_status -ne "succeeded") {
     throw "deferred uninstall cleanup failed for $($cleanupResult.install_dir)"
+  }
+  if (-not (Test-Path -LiteralPath $attestationEvidence -PathType Leaf)) {
+    throw "uninstall attestation callback evidence is missing"
+  }
+  $attestationResult = Get-Content -LiteralPath $attestationEvidence -Raw | ConvertFrom-Json
+  if ($attestationResult.authorization_present -ne $true -or
+      $attestationResult.body.schema -ne "edr.endpoint.uninstall.attestation.v1" -or
+      $attestationResult.body.service_removed -ne $true -or
+      $attestationResult.body.process_stopped -ne $true -or
+      $attestationResult.body.install_dir_removed -ne $true) {
+    throw "uninstall attestation callback did not contain complete local teardown proof"
   }
   Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt -Destination $EvidenceDir -Force
 
@@ -334,6 +383,10 @@ try {
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
   throw
 } finally {
+  if ($attestationJob) {
+    Stop-Job -Job $attestationJob -ErrorAction SilentlyContinue
+    Remove-Job -Job $attestationJob -Force -ErrorAction SilentlyContinue
+  }
   Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue |
     Format-List * | Out-File -FilePath (Join-Path $EvidenceDir "service-final.txt")
   foreach ($root in @($programDataState, $programDataLogs)) {

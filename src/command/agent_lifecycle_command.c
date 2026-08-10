@@ -16,6 +16,9 @@
 typedef struct EdrAgentLifecycleRequest {
   char task_id[129];
   char action[16];
+  char endpoint_id[129];
+  char attestation_url[1024];
+  char attestation_token[257];
   int keep_data;
 } EdrAgentLifecycleRequest;
 
@@ -33,6 +36,14 @@ static int safe_identifier(const char *value) {
   if (!value || !value[0]) return 0;
   for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
     if (!isalnum(*p) && *p != '-' && *p != '_' && *p != '.') return 0;
+  }
+  return 1;
+}
+
+static int safe_https_url(const char *value) {
+  if (!value || strncmp(value, "https://", 8u) != 0) return 0;
+  for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
+    if (!isalnum(*p) && !strchr(":/._?&=%-", *p)) return 0;
   }
   return 1;
 }
@@ -60,6 +71,15 @@ static int parse_request(const uint8_t *payload, size_t payload_len,
            safe_identifier(out->task_id) &&
            (!strcmp(out->action, "restart") || !strcmp(out->action, "offboard") ||
             !strcmp(out->action, "uninstall")) && cJSON_IsBool(keep_data);
+  if (ok && !strcmp(out->action, "uninstall")) {
+    ok = copy_json_string(root, "endpoint_id", out->endpoint_id, sizeof(out->endpoint_id)) &&
+         copy_json_string(root, "attestation_url", out->attestation_url,
+                          sizeof(out->attestation_url)) &&
+         copy_json_string(root, "attestation_token", out->attestation_token,
+                          sizeof(out->attestation_token)) &&
+         safe_identifier(out->endpoint_id) && safe_https_url(out->attestation_url) &&
+         safe_identifier(out->attestation_token);
+  }
   if (ok) out->keep_data = cJSON_IsTrue(keep_data);
   cJSON_Delete(root);
   return ok;
@@ -115,10 +135,14 @@ static int launch_worker(const char *helper, const char *journal, const char *lo
       "\"%s\" --stage lifecycle-%s --service-name \"FDSecurityAgent\" "
       "--install-dir \"%s\" "
       "--journal \"%s\" --log \"%s\" --command-id \"%s\" --task-id \"%s\" "
-      "--action \"%s\" --delay-ms %u%s",
+      "--action \"%s\" --delay-ms %u%s%s%s%s%s%s%s%s",
       helper, request->action, install_dir, journal, log_path, command_id, request->task_id,
       request->action, strcmp(request->action, "restart") == 0 ? 2000u : 30000u,
-      request->keep_data ? " --keep-data" : "");
+      request->keep_data ? " --keep-data" : "",
+      request->attestation_url[0] ? " --attestation-url \"" : "", request->attestation_url,
+      request->attestation_url[0] ? "\" --attestation-token \"" : "", request->attestation_token,
+      request->attestation_url[0] ? "\" --endpoint-id \"" : "", request->endpoint_id,
+      request->attestation_url[0] ? "\"" : "");
   if (written <= 0 || written >= (int)sizeof(command)) return 0;
   STARTUPINFOA startup;
   PROCESS_INFORMATION process;

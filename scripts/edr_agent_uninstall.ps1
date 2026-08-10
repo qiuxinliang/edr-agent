@@ -23,16 +23,30 @@ param(
   [switch]$RemoveProgramFiles,
   [switch]$PreserveDiagnostics,
   [string]$ServiceName = "FDSecurityAgent",
-  [int]$ParentProcessId = 0
+  [int]$ParentProcessId = 0,
+  [string]$AttestationURL = "",
+  [string]$AttestationToken = "",
+  [string]$LifecycleTaskID = "",
+  [string]$EndpointID = ""
 )
 
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
+$script:CriticalErrors = New-Object System.Collections.Generic.List[string]
+$script:TargetProcessIds = New-Object System.Collections.Generic.HashSet[int]
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 $ConfigPath = Join-Path $InstallDir "agent.toml"
+
+function Add-CriticalFailure {
+  param([string]$Message)
+  if (-not [string]::IsNullOrWhiteSpace($Message)) {
+    $script:CriticalErrors.Add($Message)
+    Write-Warning $Message
+  }
+}
 
 function Assert-Admin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -72,7 +86,7 @@ function Remove-AgentClientCertificate {
       Write-Host "Client certificate not found: $scope\My\$thumbprint"
     }
   } catch {
-    Write-Warning ("Client certificate cleanup failed: " + $_.Exception.Message)
+    Add-CriticalFailure ("Client certificate cleanup failed: " + $_.Exception.Message)
   }
 }
 
@@ -80,17 +94,38 @@ function Invoke-AgentEtwUninstallCleanup {
   foreach ($name in @("FDSensor.exe", "edr_agent.exe")) {
     $exe = Join-Path $InstallDir $name
     if (-not (Test-Path -LiteralPath $exe)) { continue }
-    try { & $exe --etw-uninstall-cleanup | Out-Host } catch {
-      Write-Warning ("ETW cleanup failed: " + $_.Exception.Message)
+    try {
+      & $exe --etw-uninstall-cleanup | Out-Host
+      if ($LASTEXITCODE -ne 0) { throw "ETW cleanup returned exit code $LASTEXITCODE" }
+    } catch {
+      Add-CriticalFailure ("ETW cleanup failed: " + $_.Exception.Message)
     }
     break
   }
 }
 
 function Stop-AgentProcesses {
-  foreach ($name in @("FDSensor", "edr_agent")) {
-    Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
-      Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+  $installPrefix = $InstallDir.TrimEnd('\') + '\'
+  foreach ($name in @("FDSensor.exe", "edr_agent.exe")) {
+    Get-CimInstance Win32_Process -Filter ("Name='{0}'" -f $name) -ErrorAction SilentlyContinue | ForEach-Object {
+      $processId = [int]$_.ProcessId
+      $path = [string]$_.ExecutablePath
+      $pathMatches = $path -and $path.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)
+      if ($script:TargetProcessIds.Contains($processId) -or $pathMatches) {
+        $null = $script:TargetProcessIds.Add($processId)
+        try {
+          Stop-Process -Id $processId -Force -ErrorAction Stop
+        } catch {
+          Add-CriticalFailure ("Failed to stop Agent process PID $processId: " + $_.Exception.Message)
+        }
+      } else {
+        Write-Warning "Skipped unrelated $name process PID $processId outside $InstallDir"
+      }
+    }
+  }
+  foreach ($targetProcessId in @($script:TargetProcessIds)) {
+    if (Get-Process -Id $targetProcessId -ErrorAction SilentlyContinue) {
+      Add-CriticalFailure "Target Agent process PID $targetProcessId is still running after stop"
     }
   }
 }
@@ -115,6 +150,11 @@ function Remove-AgentServices {
   $serviceNames = @($ServiceName, "FDSecurityAgent", "EdrAgent")
   if ($env:EDR_SERVICE_NAME) { $serviceNames += $env:EDR_SERVICE_NAME }
   foreach ($name in ($serviceNames | Select-Object -Unique)) {
+    $escapedName = $name.Replace("'", "''")
+    $serviceCim = Get-CimInstance Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue
+    if ($serviceCim -and [int]$serviceCim.ProcessId -gt 0) {
+      $null = $script:TargetProcessIds.Add([int]$serviceCim.ProcessId)
+    }
     $service = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $service) { continue }
     Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
@@ -139,7 +179,8 @@ function Remove-AgentServices {
       Start-Sleep -Seconds 1
     }
     if (-not (Wait-AgentServiceDeleted -Name $name)) {
-      throw "Windows service '$name' still exists after delete attempts; last sc.exe exit code $deleteExitCode."
+      Add-CriticalFailure "Windows service '$name' still exists after delete attempts; last sc.exe exit code $deleteExitCode."
+      continue
     }
     Write-Host "Removed Windows service: $name"
   }
@@ -172,12 +213,19 @@ function Export-AgentDiagnostics {
 }
 
 function Remove-AgentScheduledTasks {
-  foreach ($name in @("FDSecurityAgent", "EdrAgent")) {
-    try { Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue } catch {}
+  foreach ($name in (@($ServiceName, "FDSecurityAgent", "EdrAgent") | Select-Object -Unique)) {
+    $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if (-not $task) { continue }
     try {
-      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+      Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
       Write-Host "Removed scheduled task: $name"
-    } catch {}
+    } catch {
+      Add-CriticalFailure ("Failed to remove scheduled task ${name}: " + $_.Exception.Message)
+    }
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+      Add-CriticalFailure "Scheduled task '$name' still exists after uninstall cleanup"
+    }
   }
 }
 
@@ -203,7 +251,7 @@ function Remove-MachineEnvironment {
       "EDR_CMD_ENABLED"
     )) {
     try { [Environment]::SetEnvironmentVariable($name, $null, "Machine") } catch {
-      Write-Warning ("Failed to remove machine environment variable " + $name + ": " + $_.Exception.Message)
+      Add-CriticalFailure ("Failed to remove machine environment variable " + $name + ": " + $_.Exception.Message)
     }
   }
 }
@@ -211,9 +259,14 @@ function Remove-MachineEnvironment {
 function Remove-HeadlessUninstallRegistration {
   $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\FDSecurityAgentHeadless"
   try {
-    Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $key) {
+      Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $key) {
+      throw "registry key still exists after removal"
+    }
   } catch {
-    Write-Warning ("Failed to remove uninstall registry entry: " + $_.Exception.Message)
+    Add-CriticalFailure ("Failed to remove uninstall registry entry: " + $_.Exception.Message)
   }
 }
 
@@ -221,19 +274,23 @@ function Grant-InstallDirectoryRemovalRights {
   if (-not (Test-Path -LiteralPath $InstallDir)) { return }
   try {
     & takeown.exe /F $InstallDir /A /R /D Y | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "takeown.exe returned exit code $LASTEXITCODE" }
   } catch {
-    Write-Warning ("Failed to take ownership of install directory: " + $_.Exception.Message)
+    Add-CriticalFailure ("Failed to take ownership of install directory: " + $_.Exception.Message)
   }
   try {
     & icacls.exe $InstallDir /inheritance:e /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls inheritance returned exit code $LASTEXITCODE" }
     & icacls.exe $InstallDir /reset /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls reset returned exit code $LASTEXITCODE" }
   } catch {
-    Write-Warning ("Failed to reset install directory ACL: " + $_.Exception.Message)
+    Add-CriticalFailure ("Failed to reset install directory ACL: " + $_.Exception.Message)
   }
   try {
     & icacls.exe $InstallDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls grant returned exit code $LASTEXITCODE" }
   } catch {
-    Write-Warning ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
+    Add-CriticalFailure ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
   }
   Get-ChildItem -LiteralPath $InstallDir -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
     try { $_.Attributes = [IO.FileAttributes]::Normal } catch {}
@@ -245,6 +302,12 @@ function Start-DeferredProgramFilesRemoval {
   Grant-InstallDirectoryRemovalRights
 
   $quotedDir = $InstallDir.Replace("'", "''")
+  $quotedService = $ServiceName.Replace("'", "''")
+  $quotedAttestationURL = $AttestationURL.Replace("'", "''")
+  $quotedAttestationToken = $AttestationToken.Replace("'", "''")
+  $quotedLifecycleTaskID = $LifecycleTaskID.Replace("'", "''")
+  $quotedEndpointID = $EndpointID.Replace("'", "''")
+  $targetPidLiteral = (@($script:TargetProcessIds) | ForEach-Object { [string][int]$_ }) -join ','
   $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
   $receiptDir = Join-Path $programData "FDSecurity\state"
   New-Item -ItemType Directory -Path $receiptDir -Force -ErrorAction Stop | Out-Null
@@ -259,6 +322,12 @@ if (`$parentId -gt 0) {
 Start-Sleep -Milliseconds 750
 `$target = '$quotedDir'
 `$receipt = '$quotedReceipt'
+`$serviceName = '$quotedService'
+`$attestationURL = '$quotedAttestationURL'
+`$attestationToken = '$quotedAttestationToken'
+`$taskID = '$quotedLifecycleTaskID'
+`$endpointID = '$quotedEndpointID'
+`$targetPids = @($targetPidLiteral)
 try { & takeown.exe /F `$target /A /R /D Y | Out-Null } catch {}
 try {
   & icacls.exe `$target /inheritance:e /T /C /Q | Out-Null
@@ -273,13 +342,57 @@ for (`$attempt = 0; `$attempt -lt 120 -and (Test-Path -LiteralPath `$target); `$
   if (Test-Path -LiteralPath `$target) { Start-Sleep -Milliseconds 500 }
 }
 `$remaining = Test-Path -LiteralPath `$target
+`$escapedService = `$serviceName.Replace("'", "''")
+`$serviceRemoved = -not (Get-CimInstance Win32_Service -Filter "Name='`$escapedService'" -ErrorAction SilentlyContinue)
+`$installPrefix = `$target.TrimEnd('\') + '\'
+`$processStopped = `$true
+foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
+  foreach (`$candidate in @(Get-CimInstance Win32_Process -Filter "Name='`$imageName'" -ErrorAction SilentlyContinue)) {
+    `$candidatePath = [string]`$candidate.ExecutablePath
+    if (`$targetPids -contains [int]`$candidate.ProcessId -or
+        (`$candidatePath -and `$candidatePath.StartsWith(`$installPrefix, [StringComparison]::OrdinalIgnoreCase))) {
+      `$processStopped = `$false
+    }
+  }
+}
+`$completedAt = [DateTime]::UtcNow.ToString('o')
+`$localSucceeded = (-not `$remaining) -and `$serviceRemoved -and `$processStopped
+`$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) { 'not_configured' } else { 'pending' }
+if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
+  `$body = [ordered]@{
+    schema = 'edr.endpoint.uninstall.attestation.v1'
+    task_id = `$taskID
+    endpoint_id = `$endpointID
+    service_removed = `$serviceRemoved
+    process_stopped = `$processStopped
+    install_dir_removed = (-not `$remaining)
+    completed_at = `$completedAt
+  } | ConvertTo-Json -Compress
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  for (`$postAttempt = 0; `$postAttempt -lt 12 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
+    try {
+      `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
+        -Headers @{ Authorization = "Bearer `$attestationToken" } -Body `$body -TimeoutSec 20
+      `$attestationStatus = 'succeeded'
+    } catch {
+      `$attestationStatus = 'failed'
+      if (`$postAttempt -lt 11) { Start-Sleep -Seconds 5 }
+    }
+  }
+}
 [ordered]@{
   schema = 'edr.agent.uninstall.cleanup.v1'
-  completed_at = [DateTime]::UtcNow.ToString('o')
-  status = if (`$remaining) { 'failed' } else { 'succeeded' }
+  completed_at = `$completedAt
+  status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }
   install_dir = `$target
+  service_removed = `$serviceRemoved
+  process_stopped = `$processStopped
+  install_dir_removed = (-not `$remaining)
+  attestation_status = `$attestationStatus
+  lifecycle_task_id = `$taskID
+  endpoint_id = `$endpointID
 } | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath `$receipt -Encoding UTF8 -Force
-if (`$remaining) { exit 1 }
+if (-not `$localSucceeded -or (`$attestationURL -and `$attestationStatus -ne 'succeeded')) { exit 1 }
 "@
   try {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanup))
@@ -289,8 +402,7 @@ if (`$remaining) { exit 1 }
     ) | Out-Null
     Write-Host "Scheduled program directory removal: $InstallDir"
   } catch {
-    Write-Warning ("Failed to schedule program directory removal: " + $_.Exception.Message)
-    exit 1
+    throw ("Failed to schedule program directory removal: " + $_.Exception.Message)
   }
 }
 
@@ -312,6 +424,9 @@ function Remove-AgentData {
     if (Test-Path -LiteralPath $path) {
       Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
       Write-Host "Removed runtime data: $relative"
+      if (Test-Path -LiteralPath $path) {
+        Add-CriticalFailure "Failed to remove runtime data: $path"
+      }
     }
   }
 }
@@ -338,6 +453,9 @@ if ($RemoveData) {
   Write-Host "Only logs and diagnostics were archived; credentials, configuration and runtime state will not be retained."
 } else {
   Write-Host "Runtime data preserved. Use -RemoveData to remove config, certificates, queue, evidence and logs."
+}
+if ($script:CriticalErrors.Count -gt 0) {
+  throw ("Uninstall stopped after critical cleanup failures: " + ($script:CriticalErrors -join "; "))
 }
 if ($RemoveProgramFiles) {
   Start-DeferredProgramFilesRemoval

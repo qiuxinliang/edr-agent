@@ -1788,6 +1788,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"updater_protocol_version\":%d,\"updater_materialized\":%s,\"updater_error_code\":\"%s\"},"
       "\"endpoint_lifecycle_v1\":{\"code_supported\":true,\"build_supported\":%s,"
       "\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"actions\":[\"restart\",\"offboard\",\"uninstall\"]},"
+      "\"endpoint_uninstall_attestation_v1\":{\"code_supported\":true,\"build_supported\":%s,"
+      "\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"velociraptor_query\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}}}",
       platform, architecture, native_architecture,
       architecture_emulated ? "true" : "false",
@@ -1843,6 +1845,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       agent_update_info.protocol_version,
       agent_update_info.materialized ? "true" : "false",
       agent_update_info.error_code,
+      windows_native ? "true" : "false", dangerous_policy ? "true" : "false",
+      windows_native && dangerous_policy ? "healthy" : "unavailable",
       windows_native ? "true" : "false", dangerous_policy ? "true" : "false",
       windows_native && dangerous_policy ? "healthy" : "unavailable",
       dangerous_policy ? "true" : "false", velo_query_runtime);

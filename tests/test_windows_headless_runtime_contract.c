@@ -168,6 +168,10 @@ int main(void) {
                          "uninstall cleanup must clear restrictive file attributes before deletion");
   ok &= require_contains(uninstall_ps, "EDR_FORENSIC_PREFETCH_RETRY_SEC",
                          "uninstall must remove the forensic prefetch retry machine setting");
+  ok &= require_contains(uninstall_ps, "edr.endpoint.uninstall.attestation.v1",
+                         "uninstall must attest positive local teardown after deferred cleanup");
+  ok &= require_contains(uninstall_ps, "Skipped unrelated $name process PID",
+                         "uninstall must scope process termination to the target installation");
   free(uninstall_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");

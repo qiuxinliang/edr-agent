@@ -228,6 +228,10 @@ int main(void) {
            "lifecycle smoke requires the detached worker terminal journal");
   contains(lifecycle_smoke, "deferred uninstall cleanup did not write its receipt",
            "lifecycle smoke verifies the asynchronous program-file cleanup result");
+  contains(lifecycle_smoke, "uninstall-attestation-callback.json",
+           "lifecycle smoke captures the detached cleanup attestation callback");
+  contains(lifecycle_smoke, "edr.endpoint.uninstall.attestation.v1",
+           "lifecycle smoke verifies the positive local teardown proof schema");
   contains(lifecycle_smoke, "Copy-Item -LiteralPath $targetUninstallScript",
            "lifecycle never mixes the current native uninstaller with a baseline uninstall script");
   contains(lifecycle_smoke, "target package uninstall script hash mismatch",
@@ -257,6 +261,8 @@ int main(void) {
            "manual non-elevated uninstall retains the UAC elevation path");
   contains(uninstaller, "-ServiceName",
            "native uninstall forwards the exact lifecycle service name");
+  contains(uninstaller, "-AttestationToken",
+           "native uninstall forwards the task-pinned one-time attestation secret");
   free(uninstaller);
 
   snprintf(path, sizeof(path), "%s/scripts/edr_agent_uninstall.ps1", root);
@@ -278,6 +284,12 @@ int main(void) {
            "deferred program-file removal tolerates bounded endpoint security file locks");
   contains(uninstall_script, "uninstall-cleanup-last.json",
            "deferred cleanup persists a result outside the removed program directory");
+  contains(uninstall_script, "edr.endpoint.uninstall.attestation.v1",
+           "deferred cleanup reports positive service, process and directory teardown proof");
+  contains(uninstall_script, "Invoke-RestMethod -Uri `$attestationURL",
+           "deferred cleanup posts its one-time completion attestation");
+  contains(uninstall_script, "Skipped unrelated $name process PID",
+           "uninstall never kills an unrelated same-name process by image name alone");
   free(uninstall_script);
 
   snprintf(path, sizeof(path), "%s/src/installer_worker/installer_worker_win.c", root);
@@ -289,6 +301,8 @@ int main(void) {
            "remote uninstall journals verified native completion");
   contains(installer_worker, "--service-name %ls",
            "lifecycle worker binds uninstall to the installed service name");
+  contains(installer_worker, "--attestation-token %ls",
+           "lifecycle worker passes the one-time attestation secret to the native uninstaller");
   free(installer_worker);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_lifecycle_command.c", root);
@@ -296,7 +310,18 @@ int main(void) {
   require_true(lifecycle_command != NULL, "read endpoint lifecycle command implementation");
   contains(lifecycle_command, "--install-dir \\\"%s\\\"",
            "remote lifecycle handoff pins the worker to its installed runtime directory");
+  contains(lifecycle_command, "safe_https_url",
+           "remote uninstall accepts only HTTPS attestation destinations");
+  contains(lifecycle_command, "--attestation-token \\\"",
+           "remote lifecycle handoff passes the signed task attestation secret");
   free(lifecycle_command);
+
+  snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
+  char *agent_core = read_file(path);
+  require_true(agent_core != NULL, "read Agent capability manifest implementation");
+  contains(agent_core, "endpoint_uninstall_attestation_v1",
+           "fixed Agent advertises the two-phase uninstall attestation protocol separately from legacy lifecycle support");
+  free(agent_core);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");
   return 0;

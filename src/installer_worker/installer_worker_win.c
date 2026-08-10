@@ -1259,9 +1259,12 @@ static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *j
 }
 
 static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t *service_name,
-                                       int keep_data, const wchar_t *log_path) {
+                                       int keep_data, const wchar_t *attestation_url,
+                                       const wchar_t *attestation_token, const wchar_t *task_id,
+                                       const wchar_t *endpoint_id, const wchar_t *log_path) {
   wchar_t uninstaller[MAX_PATH * 2], quoted_exe[MAX_PATH * 4], quoted_dir[MAX_PATH * 4];
-  wchar_t quoted_service[MAX_PATH * 2];
+  wchar_t quoted_service[MAX_PATH * 2], quoted_url[4096], quoted_token[1024];
+  wchar_t quoted_task[1024], quoted_endpoint[1024];
   join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir, L"uninstall.exe");
   if (!file_exists(uninstaller)) {
     append_log_utf8(log_path, L"lifecycle_uninstall_missing_uninstall_exe");
@@ -1270,10 +1273,16 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
   quote_arg(quoted_exe, sizeof(quoted_exe) / sizeof(quoted_exe[0]), uninstaller);
   quote_arg(quoted_dir, sizeof(quoted_dir) / sizeof(quoted_dir[0]), install_dir);
   quote_arg(quoted_service, sizeof(quoted_service) / sizeof(quoted_service[0]), service_name);
+  quote_arg(quoted_url, sizeof(quoted_url) / sizeof(quoted_url[0]), attestation_url);
+  quote_arg(quoted_token, sizeof(quoted_token) / sizeof(quoted_token[0]), attestation_token);
+  quote_arg(quoted_task, sizeof(quoted_task) / sizeof(quoted_task[0]), task_id);
+  quote_arg(quoted_endpoint, sizeof(quoted_endpoint) / sizeof(quoted_endpoint[0]), endpoint_id);
   wchar_t command[8192];
   _snwprintf(command, sizeof(command) / sizeof(command[0]),
-             L"%ls --silent --install-dir %ls --service-name %ls%ls",
-             quoted_exe, quoted_dir, quoted_service, keep_data ? L" --keep-data" : L"");
+             L"%ls --silent --install-dir %ls --service-name %ls%ls "
+             L"--attestation-url %ls --attestation-token %ls --task-id %ls --endpoint-id %ls",
+             quoted_exe, quoted_dir, quoted_service, keep_data ? L" --keep-data" : L"",
+             quoted_url, quoted_token, quoted_task, quoted_endpoint);
   command[(sizeof(command) / sizeof(command[0])) - 1] = 0;
   STARTUPINFOW startup;
   PROCESS_INFORMATION process;
@@ -1323,7 +1332,9 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
 static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *service_name,
                                     const wchar_t *journal_path, const wchar_t *task_id,
                                     const wchar_t *command_id, const wchar_t *action,
-                                    DWORD delay_ms, int keep_data, const wchar_t *log_path) {
+                                    DWORD delay_ms, int keep_data, const wchar_t *attestation_url,
+                                    const wchar_t *attestation_token, const wchar_t *endpoint_id,
+                                    const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=lifecycle-teardown begin");
   if (delay_ms < 5000) delay_ms = 5000;
   if (delay_ms > 120000) delay_ms = 120000;
@@ -1335,7 +1346,8 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
     detail = rc == 0 ? "Agent service stopped after offboard handoff" :
                        "Agent offboard service stop failed";
   } else if (_wcsicmp(action, L"uninstall") == 0) {
-    rc = launch_uninstaller_detached(install_dir, service_name, keep_data, log_path);
+    rc = launch_uninstaller_detached(install_dir, service_name, keep_data, attestation_url,
+                                     attestation_token, task_id, endpoint_id, log_path);
     detail = rc == 0 ? "Native uninstaller completed after command-result handoff" :
                        "Native uninstaller failed after command-result handoff";
   }
@@ -1367,6 +1379,9 @@ int main(void) {
   const wchar_t *command_id = arg_value(argc, argv, L"--command-id");
   const wchar_t *action = arg_value(argc, argv, L"--action");
   const wchar_t *delay_raw = arg_value(argc, argv, L"--delay-ms");
+  const wchar_t *attestation_url = arg_value(argc, argv, L"--attestation-url");
+  const wchar_t *attestation_token = arg_value(argc, argv, L"--attestation-token");
+  const wchar_t *endpoint_id = arg_value(argc, argv, L"--endpoint-id");
   wchar_t default_log[MAX_PATH * 2], default_cfg[MAX_PATH * 2], default_exe[MAX_PATH * 2];
   join_path(default_log, sizeof(default_log) / sizeof(default_log[0]), install_dir, L"diagnostics\\installer-worker.log");
   join_path(default_cfg, sizeof(default_cfg) / sizeof(default_cfg[0]), install_dir, L"agent.toml");
@@ -1421,13 +1436,15 @@ int main(void) {
     const wchar_t *expected_action = _wcsicmp(stage, L"lifecycle-offboard") == 0
                                          ? L"offboard" : L"uninstall";
     if (!journal_path[0] || !task_id[0] || !command_id[0] ||
-        _wcsicmp(action, expected_action) != 0) {
+        _wcsicmp(action, expected_action) != 0 ||
+        (_wcsicmp(expected_action, L"uninstall") == 0 &&
+         (!attestation_url[0] || !attestation_token[0] || !endpoint_id[0]))) {
       append_log_utf8(log_path, L"lifecycle_teardown_invalid_arguments");
       rc = 64;
     } else {
       rc = stage_lifecycle_teardown(install_dir, svc, journal_path, task_id, command_id,
                                     action, delay_ms, has_flag(argc, argv, L"--keep-data"),
-                                    log_path);
+                                    attestation_url, attestation_token, endpoint_id, log_path);
     }
   } else if (_wcsicmp(stage, L"uninstall-runtime") == 0) {
     rc = stage_uninstall_runtime(install_dir, log_path);

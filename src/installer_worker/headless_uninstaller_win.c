@@ -117,7 +117,11 @@ static int append_quoted_arg(wchar_t *out, size_t out_count, size_t *used, const
 
 static int build_powershell_parameters(wchar_t *out, size_t out_count, const wchar_t *script,
                                        const wchar_t *install_dir, const wchar_t *service_name,
-                                       DWORD parent_pid, int keep_data) {
+                                       DWORD parent_pid, int keep_data,
+                                       const wchar_t *attestation_url,
+                                       const wchar_t *attestation_token,
+                                       const wchar_t *task_id,
+                                       const wchar_t *endpoint_id) {
   size_t used = 0;
   wchar_t pid_text[32];
   out[0] = L'\0';
@@ -131,6 +135,19 @@ static int build_powershell_parameters(wchar_t *out, size_t out_count, const wch
   if (service_name && service_name[0]) {
     if (!append_text(out, out_count, &used, L" -ServiceName ")) return 0;
     if (!append_quoted_arg(out, out_count, &used, service_name)) return 0;
+  }
+  if (attestation_url && attestation_url[0] && attestation_token && attestation_token[0] &&
+      task_id && task_id[0] && endpoint_id && endpoint_id[0]) {
+    if (!append_text(out, out_count, &used, L" -AttestationURL ") ||
+        !append_quoted_arg(out, out_count, &used, attestation_url) ||
+        !append_text(out, out_count, &used, L" -AttestationToken ") ||
+        !append_quoted_arg(out, out_count, &used, attestation_token) ||
+        !append_text(out, out_count, &used, L" -LifecycleTaskID ") ||
+        !append_quoted_arg(out, out_count, &used, task_id) ||
+        !append_text(out, out_count, &used, L" -EndpointID ") ||
+        !append_quoted_arg(out, out_count, &used, endpoint_id)) {
+      return 0;
+    }
   }
   if (keep_data) {
     if (!append_text(out, out_count, &used, L" -PreserveDiagnostics -RemoveProgramFiles")) return 0;
@@ -192,13 +209,18 @@ static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *
 }
 
 static int run_uninstall_script(const wchar_t *script, const wchar_t *install_dir,
-                                const wchar_t *service_name, int silent, int keep_data) {
+                                const wchar_t *service_name, int silent, int keep_data,
+                                const wchar_t *attestation_url,
+                                const wchar_t *attestation_token,
+                                const wchar_t *task_id,
+                                const wchar_t *endpoint_id) {
   wchar_t parameters[32768];
   wchar_t system_dir[MAX_PATH * 2];
   wchar_t powershell_path[MAX_PATH * 4];
   SHELLEXECUTEINFOW exec_info;
   if (!build_powershell_parameters(parameters, sizeof(parameters) / sizeof(parameters[0]), script,
-                                   install_dir, service_name, GetCurrentProcessId(), keep_data)) {
+                                   install_dir, service_name, GetCurrentProcessId(), keep_data,
+                                   attestation_url, attestation_token, task_id, endpoint_id)) {
     return ERROR_INSUFFICIENT_BUFFER;
   }
   if (GetSystemDirectoryW(system_dir, (UINT)(sizeof(system_dir) / sizeof(system_dir[0]))) == 0 ||
@@ -246,6 +268,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   wchar_t script_path[MAX_PATH * 4];
   const wchar_t *requested_dir;
   const wchar_t *service_name;
+  const wchar_t *attestation_url;
+  const wchar_t *attestation_token;
+  const wchar_t *task_id;
+  const wchar_t *endpoint_id;
   int silent;
   int keep_data;
   int rc;
@@ -269,6 +295,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   if (!requested_dir) requested_dir = arg_value(argc, argv, L"--install-dir");
   service_name = arg_value(argc, argv, L"/SERVICENAME");
   if (!service_name) service_name = arg_value(argc, argv, L"--service-name");
+  attestation_url = arg_value(argc, argv, L"--attestation-url");
+  attestation_token = arg_value(argc, argv, L"--attestation-token");
+  task_id = arg_value(argc, argv, L"--task-id");
+  endpoint_id = arg_value(argc, argv, L"--endpoint-id");
   _snwprintf(install_dir, sizeof(install_dir) / sizeof(install_dir[0]), L"%ls",
              requested_dir && requested_dir[0] ? requested_dir : exe_dir);
   if (!join_path(script_path, sizeof(script_path) / sizeof(script_path[0]), install_dir,
@@ -289,7 +319,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     }
   }
 
-  rc = run_uninstall_script(script_path, install_dir, service_name, silent, keep_data);
+  rc = run_uninstall_script(script_path, install_dir, service_name, silent, keep_data,
+                            attestation_url, attestation_token, task_id, endpoint_id);
   if (rc == 0) {
     if (!silent) {
       MessageBoxW(NULL,
