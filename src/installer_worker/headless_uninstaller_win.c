@@ -127,7 +127,11 @@ static int build_powershell_parameters(wchar_t *out, size_t out_count, const wch
   if (!append_quoted_arg(out, out_count, &used, install_dir)) return 0;
   if (!append_text(out, out_count, &used, L" -ParentProcessId ")) return 0;
   if (!append_text(out, out_count, &used, pid_text)) return 0;
-  if (!keep_data && !append_text(out, out_count, &used, L" -RemoveData -RemoveProgramFiles")) return 0;
+  if (keep_data) {
+    if (!append_text(out, out_count, &used, L" -PreserveDiagnostics -RemoveProgramFiles")) return 0;
+  } else if (!append_text(out, out_count, &used, L" -RemoveData -RemoveProgramFiles")) {
+    return 0;
+  }
   return 1;
 }
 
@@ -212,7 +216,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
 
   if (!silent) {
     const wchar_t *prompt = keep_data
-                                ? L"将停止并注销 FDSecurity Agent。配置和运行数据将保留。是否继续？"
+                                ? L"将完整卸载 FDSecurity Agent，并将日志和诊断数据归档到 ProgramData。是否继续？"
                                 : L"将完整卸载 FDSecurity Agent，并删除配置、证书、队列、日志和程序文件。是否继续？";
     if (MessageBoxW(NULL, prompt, EDR_UNINSTALL_TITLE,
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) != IDYES) {
@@ -225,7 +229,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   if (rc == 0) {
     if (!silent) {
       MessageBoxW(NULL,
-                  keep_data ? L"FDSecurity Agent 已停止并注销，配置和运行数据已保留。"
+                  keep_data ? L"FDSecurity Agent 已卸载，日志和诊断数据已归档到 ProgramData。"
                             : L"FDSecurity Agent 已卸载。程序目录将在本窗口关闭后清理。",
                   EDR_UNINSTALL_TITLE, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
     }

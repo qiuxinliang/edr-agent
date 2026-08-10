@@ -1286,8 +1286,34 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, int keep_data
     return 9;
   }
   CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
   append_log_utf8(log_path, L"lifecycle_uninstall_launched");
+  DWORD wait_result = WaitForSingleObject(process.hProcess, 300000);
+  if (wait_result == WAIT_TIMEOUT) {
+    append_log_utf8(log_path, L"lifecycle_uninstall_completion_timeout");
+    CloseHandle(process.hProcess);
+    return 10;
+  }
+  if (wait_result != WAIT_OBJECT_0) {
+    append_log_utf8(log_path, L"lifecycle_uninstall_wait_failed");
+    CloseHandle(process.hProcess);
+    return 11;
+  }
+  DWORD exit_code = ERROR_GEN_FAILURE;
+  if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+    append_log_utf8(log_path, L"lifecycle_uninstall_exit_code_unavailable");
+    CloseHandle(process.hProcess);
+    return 12;
+  }
+  CloseHandle(process.hProcess);
+  if (exit_code != 0) {
+    wchar_t line[256];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]),
+               L"lifecycle_uninstall_failed exit_code=%lu", (unsigned long)exit_code);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    return (int)exit_code;
+  }
+  append_log_utf8(log_path, L"lifecycle_uninstall_completed");
   return 0;
 }
 
@@ -1307,8 +1333,8 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
                        "Agent offboard service stop failed";
   } else if (_wcsicmp(action, L"uninstall") == 0) {
     rc = launch_uninstaller_detached(install_dir, keep_data, log_path);
-    detail = rc == 0 ? "Native uninstaller launched after command-result handoff" :
-                       "Native uninstaller launch failed";
+    detail = rc == 0 ? "Native uninstaller completed after command-result handoff" :
+                       "Native uninstaller failed after command-result handoff";
   }
   if (!write_lifecycle_journal(journal_path, task_id, command_id, action, rc, detail)) {
     append_log_utf8(log_path, L"lifecycle_teardown_journal_write_failed");

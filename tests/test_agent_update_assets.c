@@ -215,6 +215,41 @@ int main(void) {
            "lifecycle explicitly clears stale native-command status after successful assertions");
   free(lifecycle_smoke);
 
+  snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
+  char *uninstaller = read_file(path);
+  require_true(uninstaller != NULL, "read headless uninstaller implementation");
+  contains(uninstaller, "-PreserveDiagnostics -RemoveProgramFiles",
+           "keep-data uninstall archives diagnostics but still removes program files");
+  contains(uninstaller, "-RemoveData -RemoveProgramFiles",
+           "complete uninstall removes runtime data and program files");
+  free(uninstaller);
+
+  snprintf(path, sizeof(path), "%s/scripts/edr_agent_uninstall.ps1", root);
+  char *uninstall_script = read_file(path);
+  require_true(uninstall_script != NULL, "read Windows uninstall script");
+  contains(uninstall_script, "function Wait-AgentServiceDeleted",
+           "uninstall verifies that Windows services disappear");
+  contains(uninstall_script, "$deleteExitCode = $LASTEXITCODE",
+           "uninstall checks the service deletion result");
+  contains(uninstall_script, "FDSecurity\\UninstallArchive",
+           "diagnostic retention uses a directory outside program files");
+  contains(uninstall_script, "foreach ($relative in @(\"logs\", \"diagnostics\"))",
+           "diagnostic retention excludes credentials and active runtime state");
+  contains(uninstall_script, "$attempt -lt 120",
+           "deferred program-file removal tolerates bounded endpoint security file locks");
+  contains(uninstall_script, "uninstall-cleanup-last.json",
+           "deferred cleanup persists a result outside the removed program directory");
+  free(uninstall_script);
+
+  snprintf(path, sizeof(path), "%s/src/installer_worker/installer_worker_win.c", root);
+  char *installer_worker = read_file(path);
+  require_true(installer_worker != NULL, "read Windows installer worker");
+  contains(installer_worker, "WaitForSingleObject(process.hProcess, 300000)",
+           "remote uninstall observes native uninstaller completion");
+  contains(installer_worker, "lifecycle_uninstall_completed",
+           "remote uninstall journals verified native completion");
+  free(installer_worker);
+
   puts("ok (pure source contract; Windows execution intentionally not simulated)");
   return 0;
 }

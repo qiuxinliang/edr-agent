@@ -11,15 +11,17 @@
   machine environment variables, runtime data and program files.
 
   The default action removes runtime registration and identity material but
-  preserves queue/evidence/log data. uninstall.exe invokes this script with
-  -RemoveData and -RemoveProgramFiles for a complete uninstall. Administrators
-  may run the script directly without those switches for recoverable cleanup.
+  leaves program files for a recoverable administrator-driven cleanup.
+  uninstall.exe always invokes this script with -RemoveProgramFiles. It either
+  passes -RemoveData for a complete uninstall or -PreserveDiagnostics to archive
+  logs and diagnostics outside the installation directory before removal.
 #>
 [CmdletBinding()]
 param(
   [string]$InstallDir = "",
   [switch]$RemoveData,
   [switch]$RemoveProgramFiles,
+  [switch]$PreserveDiagnostics,
   [int]$ParentProcessId = 0
 )
 
@@ -92,6 +94,19 @@ function Stop-AgentProcesses {
   }
 }
 
+function Wait-AgentServiceDeleted {
+  param(
+    [string]$Name,
+    [int]$TimeoutSeconds = 30
+  )
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    if (-not (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { return $true }
+    Start-Sleep -Milliseconds 500
+  } while ([DateTime]::UtcNow -lt $deadline)
+  return $false
+}
+
 function Remove-AgentServices {
   $serviceNames = @("FDSecurityAgent", "EdrAgent")
   if ($env:EDR_SERVICE_NAME) { $serviceNames += $env:EDR_SERVICE_NAME }
@@ -99,9 +114,49 @@ function Remove-AgentServices {
     $service = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $service) { continue }
     Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
-    & sc.exe delete $name | Out-Host
+    try { $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20)) } catch {
+      Stop-AgentProcesses
+      Start-Sleep -Milliseconds 500
+    }
+    $deleteExitCode = 0
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+      $deleteOutput = (& sc.exe delete $name 2>&1 | Out-String).Trim()
+      $deleteExitCode = $LASTEXITCODE
+      if ($deleteOutput) { Write-Host $deleteOutput }
+      if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { break }
+      Start-Sleep -Seconds 1
+    }
+    if (-not (Wait-AgentServiceDeleted -Name $name)) {
+      throw "Windows service '$name' still exists after delete attempts; last sc.exe exit code $deleteExitCode."
+    }
     Write-Host "Removed Windows service: $name"
   }
+}
+
+function Export-AgentDiagnostics {
+  $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
+  $archiveRoot = Join-Path $programData "FDSecurity\UninstallArchive"
+  $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+  $archiveDir = Join-Path $archiveRoot $stamp
+  New-Item -ItemType Directory -Path $archiveDir -Force -ErrorAction Stop | Out-Null
+  $copied = @()
+  foreach ($relative in @("logs", "diagnostics")) {
+    $source = Join-Path $InstallDir $relative
+    if (-not (Test-Path -LiteralPath $source)) { continue }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $archiveDir $relative) `
+      -Recurse -Force -ErrorAction Stop
+    $copied += $relative
+  }
+  [ordered]@{
+    schema = "edr.agent.uninstall.archive.v1"
+    archived_at = [DateTime]::UtcNow.ToString("o")
+    hostname = $env:COMPUTERNAME
+    source_install_dir = $InstallDir
+    contents = $copied
+  } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $archiveDir "manifest.json") `
+    -Encoding UTF8 -ErrorAction Stop
+  Write-Host "Archived local diagnostics: $archiveDir"
+  return $archiveDir
 }
 
 function Remove-AgentScheduledTasks {
@@ -178,6 +233,10 @@ function Start-DeferredProgramFilesRemoval {
   Grant-InstallDirectoryRemovalRights
 
   $quotedDir = $InstallDir.Replace("'", "''")
+  $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
+  $receiptDir = Join-Path $programData "FDSecurity\state"
+  New-Item -ItemType Directory -Path $receiptDir -Force -ErrorAction Stop | Out-Null
+  $quotedReceipt = (Join-Path $receiptDir "uninstall-cleanup-last.json").Replace("'", "''")
   $cleanup = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 `$parentId = $ParentProcessId
@@ -187,6 +246,7 @@ if (`$parentId -gt 0) {
 }
 Start-Sleep -Milliseconds 750
 `$target = '$quotedDir'
+`$receipt = '$quotedReceipt'
 try { & takeown.exe /F `$target /A /R /D Y | Out-Null } catch {}
 try {
   & icacls.exe `$target /inheritance:e /T /C /Q | Out-Null
@@ -196,10 +256,18 @@ try {
 Get-ChildItem -LiteralPath `$target -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
   try { `$_.Attributes = [IO.FileAttributes]::Normal } catch {}
 }
-for (`$attempt = 0; `$attempt -lt 20 -and (Test-Path -LiteralPath `$target); `$attempt++) {
+for (`$attempt = 0; `$attempt -lt 120 -and (Test-Path -LiteralPath `$target); `$attempt++) {
   Remove-Item -LiteralPath `$target -Recurse -Force -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath `$target) { Start-Sleep -Milliseconds 500 }
 }
+`$remaining = Test-Path -LiteralPath `$target
+[ordered]@{
+  schema = 'edr.agent.uninstall.cleanup.v1'
+  completed_at = [DateTime]::UtcNow.ToString('o')
+  status = if (`$remaining) { 'failed' } else { 'succeeded' }
+  install_dir = `$target
+} | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath `$receipt -Encoding UTF8 -Force
+if (`$remaining) { exit 1 }
 "@
   try {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanup))
@@ -245,17 +313,27 @@ Invoke-AgentEtwUninstallCleanup
 Remove-AgentClientCertificate
 Remove-MachineEnvironment
 Remove-HeadlessUninstallRegistration
+$diagnosticArchive = ""
+if ($PreserveDiagnostics) {
+  $diagnosticArchive = Export-AgentDiagnostics
+}
 if ($RemoveData -or $RemoveProgramFiles) {
   Grant-InstallDirectoryRemovalRights
 }
 if ($RemoveData) {
   Remove-AgentData
+} elseif ($PreserveDiagnostics) {
+  Write-Host "Only logs and diagnostics were archived; credentials, configuration and runtime state will not be retained."
 } else {
   Write-Host "Runtime data preserved. Use -RemoveData to remove config, certificates, queue, evidence and logs."
 }
 if ($RemoveProgramFiles) {
   Start-DeferredProgramFilesRemoval
-  Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal."
+  if ($diagnosticArchive) {
+    Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal; diagnostics archive: $diagnosticArchive"
+  } else {
+    Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal."
+  }
 } else {
   Write-Host "FDSecurity runtime unregistered successfully. Program files remain in place for audit/recovery."
 }
