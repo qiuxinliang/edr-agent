@@ -193,6 +193,24 @@ int main(void) {
                          "complete uninstall must hand persistent file locks to verified directory cleanup");
   ok &= require_contains(uninstall_ps, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
                          "synchronous uninstall receipt must disclose paths handed to deferred cleanup");
+  ok &= require_contains(uninstall_ps, "deletion_last_error = `$deleteLastError",
+                         "deferred cleanup must retain the final directory deletion error");
+  ok &= require_contains(uninstall_ps, "remaining_entries = @(`$remainingEntries)",
+                         "deferred cleanup must identify files that survive bounded removal");
+  ok &= require_contains(uninstall_ps, "attestation_error = `$attestationError",
+                         "deferred cleanup must retain callback transport diagnostics");
+  ok &= require_contains(uninstall_ps, "failure_reasons = @(`$failureReasons)",
+                         "deferred cleanup must report machine-readable terminal causes");
+  ok &= require_contains(uninstall_ps,
+                         "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",
+                         "terminal cleanup status must include required attestation success");
+  ok &= require_contains(uninstall_ps,
+                         "local_status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }",
+                         "cleanup receipt must retain independent local teardown status");
+  ok &= require_contains(uninstall_ps, "Management.Automation.Language.Parser]::ParseInput($cleanup",
+                         "generated deferred cleanup must pass the native Windows PowerShell parser before launch");
+  ok &= require_contains(uninstall_ps, "uninstall-cleanup-last.stderr.log",
+                         "detached cleanup parser and runtime errors must remain observable after program removal");
   ok &= require_contains(uninstall_ps, "elseif ($RemoveProgramFiles)",
                          "runtime data cleanup may defer only when complete program removal is scheduled");
   ok &= require_absent(uninstall_ps,

@@ -110,12 +110,34 @@ function Wait-InstallDirectoryDeleted {
 }
 
 function Wait-CleanupReceipt {
-  param([string]$Path, [int]$Seconds = 90)
+  param([string]$Path, [int]$Seconds = 120)
   for ($i = 0; $i -lt $Seconds; $i++) {
     if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
     Start-Sleep -Seconds 1
   }
   throw "deferred uninstall cleanup did not write its receipt within $Seconds seconds"
+}
+
+function Wait-AttestationListenerReady {
+  param(
+    [string]$Path,
+    [System.Management.Automation.Job]$Job,
+    [int]$Seconds = 15
+  )
+  $pollCount = $Seconds * 4
+  for ($i = 0; $i -lt $pollCount; $i++) {
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
+    if ($Job.State -eq "Failed" -or $Job.State -eq "Stopped" -or $Job.State -eq "Completed") {
+      $reason = ""
+      if ($Job.ChildJobs.Count -gt 0 -and $Job.ChildJobs[0].JobStateInfo.Reason) {
+        $reason = $Job.ChildJobs[0].JobStateInfo.Reason.Message
+      }
+      $output = ((Receive-Job -Job $Job -Keep -ErrorAction SilentlyContinue | Out-String).Trim())
+      throw "uninstall attestation listener stopped before becoming ready: state=$($Job.State) reason=$reason output=$output"
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  throw "uninstall attestation listener did not become ready within $Seconds seconds"
 }
 
 function Wait-EmbeddedUpdaterMaterialized {
@@ -181,6 +203,7 @@ function Invoke-VersionTransition {
   }
 }
 
+$EvidenceDir = [IO.Path]::GetFullPath($EvidenceDir)
 New-Item -ItemType Directory -Path $EvidenceDir -Force | Out-Null
 Assert-Administrator
 $syntaxValidator = Join-Path $PSScriptRoot "validate_windows_powershell_syntax.ps1"
@@ -276,39 +299,61 @@ try {
   $lifecycleJournal = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.journal.json"
   $lifecycleLog = Join-Path $installDir "diagnostics\lifecycle-worker.log"
   $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-last.json"
+  $cleanupStdout = Join-Path $programDataState "uninstall-cleanup-last.stdout.log"
+  $cleanupStderr = Join-Path $programDataState "uninstall-cleanup-last.stderr.log"
   $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-last.json"
   $uninstallPowerShellLog = Join-Path $programDataState "uninstall-powershell-last.log"
   $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
+  $attestationReady = Join-Path $EvidenceDir "uninstall-attestation-listener-ready.json"
   $attestationPort = Get-Random -Minimum 32000 -Maximum 45000
   $attestationURL = "http://127.0.0.1:$attestationPort/uninstall-attest/"
   $attestationToken = "ci-lifecycle-uninstall-token-$($TargetVersion.Replace('.', '-'))"
+  New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
+  New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
+  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $cleanupStdout, $cleanupStderr, `
+    $uninstallScriptReceipt, $uninstallPowerShellLog, `
+    $attestationEvidence, $attestationReady -Force -ErrorAction SilentlyContinue
   $attestationJob = Start-Job -ScriptBlock {
-    param($Port, $EvidencePath)
+    param($Port, $EvidencePath, $ReadyPath, $ExpectedToken)
     $listener = New-Object Net.HttpListener
     $listener.Prefixes.Add("http://127.0.0.1:$Port/uninstall-attest/")
     try {
       $listener.Start()
+      [ordered]@{
+        ready_at = [DateTime]::UtcNow.ToString("o")
+        port = $Port
+      } | ConvertTo-Json | Set-Content -LiteralPath $ReadyPath -Encoding UTF8 -Force -ErrorAction Stop
       $context = $listener.GetContext()
       $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
       $body = $reader.ReadToEnd()
       $reader.Dispose()
+      $authorization = [string]$context.Request.Headers['Authorization']
+      $parsedBody = $null
+      $bodyError = ""
+      try {
+        $parsedBody = $body | ConvertFrom-Json -ErrorAction Stop
+      } catch {
+        $bodyError = $_.Exception.Message
+      }
+      $authorizationValid = $authorization -ceq ("Bearer " + $ExpectedToken)
       [ordered]@{
-        authorization_present = $context.Request.Headers['Authorization'] -like 'Bearer *'
-        body = ($body | ConvertFrom-Json)
-      } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $EvidencePath -Encoding UTF8
-      $responseBody = [Text.Encoding]::UTF8.GetBytes('{"success":true}')
-      $context.Response.StatusCode = 200
+        authorization_present = $authorization -like 'Bearer *'
+        authorization_valid = $authorizationValid
+        body_parse_error = $bodyError
+        body = $parsedBody
+      } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $EvidencePath -Encoding UTF8 -Force -ErrorAction Stop
+      $accepted = $authorizationValid -and $parsedBody
+      $responseJson = if ($accepted) { '{"success":true}' } else { '{"success":false}' }
+      $responseBody = [Text.Encoding]::UTF8.GetBytes($responseJson)
+      $context.Response.StatusCode = if ($accepted) { 200 } elseif (-not $authorizationValid) { 401 } else { 400 }
       $context.Response.ContentType = 'application/json'
       $context.Response.OutputStream.Write($responseBody, 0, $responseBody.Length)
       $context.Response.Close()
     } finally {
       $listener.Close()
     }
-  } -ArgumentList $attestationPort, $attestationEvidence
-  New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
-  New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
-  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt, $uninstallPowerShellLog `
-    -Force -ErrorAction SilentlyContinue
+  } -ArgumentList $attestationPort, $attestationEvidence, $attestationReady, $attestationToken
+  Wait-AttestationListenerReady -Path $attestationReady -Job $attestationJob
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
   Copy-Item -LiteralPath $targetUninstallScript -Destination (Join-Path $installDir "uninstall.ps1") -Force
@@ -364,13 +409,18 @@ try {
   Wait-CleanupReceipt -Path $cleanupReceipt
   $cleanupResult = Get-Content -LiteralPath $cleanupReceipt -Raw | ConvertFrom-Json
   if ($cleanupResult.status -ne "succeeded" -or $cleanupResult.attestation_status -ne "succeeded") {
-    throw "deferred uninstall cleanup failed for $($cleanupResult.install_dir)"
+    Copy-Item -LiteralPath $cleanupReceipt -Destination $EvidenceDir -Force
+    Write-Host "--- deferred uninstall cleanup receipt ---"
+    Get-Content -LiteralPath $cleanupReceipt | Out-Host
+    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_error=$($cleanupResult.attestation_error) failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')"
   }
   if (-not (Test-Path -LiteralPath $attestationEvidence -PathType Leaf)) {
     throw "uninstall attestation callback evidence is missing"
   }
   $attestationResult = Get-Content -LiteralPath $attestationEvidence -Raw | ConvertFrom-Json
   if ($attestationResult.authorization_present -ne $true -or
+      $attestationResult.authorization_valid -ne $true -or
+      $attestationResult.body_parse_error -or
       $attestationResult.body.schema -ne "edr.endpoint.uninstall.attestation.v1" -or
       $attestationResult.body.service_removed -ne $true -or
       $attestationResult.body.process_stopped -ne $true -or
@@ -412,6 +462,18 @@ try {
   throw
 } finally {
   if ($attestationJob) {
+    try {
+      $reason = ""
+      if ($attestationJob.ChildJobs.Count -gt 0 -and $attestationJob.ChildJobs[0].JobStateInfo.Reason) {
+        $reason = $attestationJob.ChildJobs[0].JobStateInfo.Reason.Message
+      }
+      [ordered]@{
+        state = [string]$attestationJob.State
+        reason = $reason
+        output = ((Receive-Job -Job $attestationJob -Keep -ErrorAction SilentlyContinue | Out-String).Trim())
+      } | ConvertTo-Json -Depth 3 | Set-Content `
+        -LiteralPath (Join-Path $EvidenceDir "uninstall-attestation-listener-job.json") -Encoding UTF8 -Force
+    } catch {}
     Stop-Job -Job $attestationJob -ErrorAction SilentlyContinue
     Remove-Job -Job $attestationJob -Force -ErrorAction SilentlyContinue
   }

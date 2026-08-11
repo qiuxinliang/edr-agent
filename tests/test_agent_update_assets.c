@@ -204,6 +204,12 @@ int main(void) {
   require_true(!strstr(lifecycle, "github.event.workflow_run.head_branch"),
                "release lifecycle never guesses a version from a workflow branch name");
   contains(lifecycle, "windows_release_lifecycle_smoke.ps1", "release lifecycle executes the Windows install-upgrade-rollback smoke test");
+  contains(lifecycle, "Deferred uninstall cleanup receipt",
+           "failed lifecycle summaries expose the asynchronous cleanup receipt");
+  contains(lifecycle, "Uninstall attestation listener",
+           "failed lifecycle summaries expose callback listener diagnostics");
+  contains(lifecycle, "Deferred uninstall cleanup stderr",
+           "failed lifecycle summaries expose deferred PowerShell runtime errors");
   free(lifecycle);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
@@ -230,6 +236,16 @@ int main(void) {
            "lifecycle smoke verifies the asynchronous program-file cleanup result");
   contains(lifecycle_smoke, "uninstall-attestation-callback.json",
            "lifecycle smoke captures the detached cleanup attestation callback");
+  contains(lifecycle_smoke, "[IO.Path]::GetFullPath($EvidenceDir)",
+           "background attestation jobs receive absolute evidence paths");
+  contains(lifecycle_smoke, "function Wait-AttestationListenerReady",
+           "lifecycle smoke verifies the callback listener before uninstall starts");
+  contains(lifecycle_smoke, "authorization_valid = $authorizationValid",
+           "lifecycle callback validates the exact one-time bearer token");
+  contains(lifecycle_smoke, "attestation_error=$($cleanupResult.attestation_error)",
+           "lifecycle failure output reports the exact attestation error");
+  contains(lifecycle_smoke, "[int]$Seconds = 120",
+           "cleanup receipt wait covers the bounded attestation retry window");
   contains(lifecycle_smoke, "edr.endpoint.uninstall.attestation.v1",
            "lifecycle smoke verifies the positive local teardown proof schema");
   contains(lifecycle_smoke, "Copy-Item -LiteralPath $targetUninstallScript",
@@ -301,6 +317,22 @@ int main(void) {
            "complete uninstall routes persistent runtime locks to final directory proof");
   contains(uninstall_script, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
            "uninstall diagnostics identify files delegated to deferred cleanup");
+  contains(uninstall_script, "deletion_last_error = `$deleteLastError",
+           "deferred cleanup records the final directory deletion error");
+  contains(uninstall_script, "remaining_entries = @(`$remainingEntries)",
+           "deferred cleanup records paths that survive bounded deletion");
+  contains(uninstall_script, "attestation_error = `$attestationError",
+           "deferred cleanup records the final callback transport error");
+  contains(uninstall_script, "failure_reasons = @(`$failureReasons)",
+           "deferred cleanup emits machine-readable failure reasons");
+  contains(uninstall_script, "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",
+           "cleanup receipt status covers both local teardown and required attestation");
+  contains(uninstall_script, "local_status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }",
+           "cleanup receipt distinguishes local teardown from overall completion");
+  contains(uninstall_script, "Management.Automation.Language.Parser]::ParseInput($cleanup",
+           "generated deferred cleanup code is parsed before detached launch");
+  contains(uninstall_script, "uninstall-cleanup-last.stderr.log",
+           "deferred PowerShell failures are persisted outside program files");
   contains(uninstall_script, "uninstall-cleanup-last.json",
            "deferred cleanup persists a result outside the removed program directory");
   contains(uninstall_script, "edr.endpoint.uninstall.attestation.v1",

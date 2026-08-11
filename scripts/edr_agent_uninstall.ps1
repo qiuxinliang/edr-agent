@@ -388,11 +388,23 @@ try {
 Get-ChildItem -LiteralPath `$target -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
   try { `$_.Attributes = [IO.FileAttributes]::Normal } catch {}
 }
+`$deleteAttemptCount = 0
+`$deleteLastError = ''
 for (`$attempt = 0; `$attempt -lt 120 -and (Test-Path -LiteralPath `$target); `$attempt++) {
-  Remove-Item -LiteralPath `$target -Recurse -Force -ErrorAction SilentlyContinue
+  `$deleteAttemptCount = `$attempt + 1
+  try {
+    Remove-Item -LiteralPath `$target -Recurse -Force -ErrorAction Stop
+  } catch {
+    `$deleteLastError = `$_.Exception.Message
+  }
   if (Test-Path -LiteralPath `$target) { Start-Sleep -Milliseconds 500 }
 }
 `$remaining = Test-Path -LiteralPath `$target
+`$remainingEntries = @()
+if (`$remaining) {
+  `$remainingEntries = @(Get-ChildItem -LiteralPath `$target -Force -Recurse -ErrorAction SilentlyContinue |
+    Select-Object -First 50 | ForEach-Object { `$_.FullName })
+}
 `$escapedService = `$serviceName.Replace("'", "''")
 `$serviceRemoved = -not (Get-CimInstance Win32_Service -Filter "Name='`$escapedService'" -ErrorAction SilentlyContinue)
 `$installPrefix = `$target.TrimEnd('\') + '\'
@@ -406,9 +418,16 @@ foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
     }
   }
 }
-`$completedAt = [DateTime]::UtcNow.ToString('o')
+`$teardownCompletedAt = [DateTime]::UtcNow.ToString('o')
 `$localSucceeded = (-not `$remaining) -and `$serviceRemoved -and `$processStopped
-`$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) { 'not_configured' } else { 'pending' }
+`$attestationError = ''
+`$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) {
+  'not_configured'
+} elseif (`$localSucceeded) {
+  'pending'
+} else {
+  'skipped_local_teardown_failed'
+}
 if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
   `$body = [ordered]@{
     schema = 'edr.endpoint.uninstall.attestation.v1'
@@ -417,40 +436,75 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
     service_removed = `$serviceRemoved
     process_stopped = `$processStopped
     install_dir_removed = (-not `$remaining)
-    completed_at = `$completedAt
+    completed_at = `$teardownCompletedAt
   } | ConvertTo-Json -Compress
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  for (`$postAttempt = 0; `$postAttempt -lt 12 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
+  for (`$postAttempt = 0; `$postAttempt -lt 8 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
     try {
       `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
-        -Headers @{ Authorization = "Bearer `$attestationToken" } -Body `$body -TimeoutSec 20
+        -Headers @{ Authorization = "Bearer `$attestationToken" } -Body `$body -TimeoutSec 5
       `$attestationStatus = 'succeeded'
+      `$attestationError = ''
     } catch {
       `$attestationStatus = 'failed'
-      if (`$postAttempt -lt 11) { Start-Sleep -Seconds 5 }
+      `$attestationError = `$_.Exception.Message
+      if (`$postAttempt -lt 7) { Start-Sleep -Seconds 4 }
     }
   }
 }
+`$failureReasons = @()
+if (`$remaining) { `$failureReasons += 'install_dir_remaining' }
+if (-not `$serviceRemoved) { `$failureReasons += 'service_remaining' }
+if (-not `$processStopped) { `$failureReasons += 'process_remaining' }
+if (`$attestationStatus -eq 'failed') {
+  `$failureReasons += 'attestation_failed'
+} elseif (`$attestationStatus -eq 'skipped_local_teardown_failed') {
+  `$failureReasons += 'attestation_skipped_local_teardown_failed'
+}
+`$attestationRequired = -not [string]::IsNullOrWhiteSpace(`$attestationURL)
+`$overallSucceeded = `$localSucceeded -and (-not `$attestationRequired -or `$attestationStatus -eq 'succeeded')
 [ordered]@{
   schema = 'edr.agent.uninstall.cleanup.v1'
-  completed_at = `$completedAt
-  status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }
+  completed_at = [DateTime]::UtcNow.ToString('o')
+  local_teardown_completed_at = `$teardownCompletedAt
+  status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }
+  local_status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }
   install_dir = `$target
   service_removed = `$serviceRemoved
   process_stopped = `$processStopped
   install_dir_removed = (-not `$remaining)
+  deletion_attempts = `$deleteAttemptCount
+  deletion_last_error = `$deleteLastError
+  remaining_entries = @(`$remainingEntries)
   attestation_status = `$attestationStatus
+  attestation_error = `$attestationError
+  failure_reasons = @(`$failureReasons)
   lifecycle_task_id = `$taskID
   endpoint_id = `$endpointID
-} | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath `$receipt -Encoding UTF8 -Force
-if (-not `$localSucceeded -or (`$attestationURL -and `$attestationStatus -ne 'succeeded')) { exit 1 }
+} | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath `$receipt -Encoding UTF8 -Force -ErrorAction Stop
+`$cleanupStatus = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }
+Write-Output ("deferred_cleanup status=" + `$cleanupStatus + " attestation_status=" +
+  `$attestationStatus + " failure_reasons=" + (`$failureReasons -join ','))
+if (-not `$overallSucceeded) { exit 1 }
 "@
   try {
+    $tokens = $null
+    $parseErrors = $null
+    [void][Management.Automation.Language.Parser]::ParseInput($cleanup, [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -gt 0) {
+      $parseDetail = @($parseErrors | ForEach-Object {
+        "line $($_.Extent.StartLineNumber), column $($_.Extent.StartColumnNumber): $($_.Message)"
+      }) -join "; "
+      throw "Generated deferred cleanup script failed syntax validation: $parseDetail"
+    }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanup))
     $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $cleanupStdout = Join-Path $receiptDir "uninstall-cleanup-last.stdout.log"
+    $cleanupStderr = Join-Path $receiptDir "uninstall-cleanup-last.stderr.log"
+    Remove-Item -LiteralPath $cleanupStdout, $cleanupStderr -Force -ErrorAction SilentlyContinue
     Start-Process -FilePath $powershell -WorkingDirectory $env:SystemRoot -WindowStyle Hidden -ArgumentList @(
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded
-    ) | Out-Null
+    ) -RedirectStandardOutput $cleanupStdout -RedirectStandardError $cleanupStderr | Out-Null
     Write-Host "Scheduled program directory removal: $InstallDir"
   } catch {
     throw ("Failed to schedule program directory removal: " + $_.Exception.Message)
