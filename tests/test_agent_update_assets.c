@@ -221,6 +221,8 @@ int main(void) {
                "release workflow must not restore mutable CMake build outputs");
   contains(client_release, "Verify native uninstall attestation capabilities",
            "release workflow probes freshly built native uninstall components");
+  contains(client_release, "invoke_windows_native_capability_probe.ps1",
+           "release workflow waits for GUI subsystem capability probes through the shared runner");
   contains(client_release, "$env:EDR_RELEASE_ARCH -eq \"amd64\"",
            "release workflow only executes native capability probes on the runner-compatible architecture");
   contains(client_release, "$env:EDR_RELEASE_ARCH -eq \"arm64\"",
@@ -242,6 +244,8 @@ int main(void) {
            "client build workflow probes freshly built native uninstall components");
   contains(client_build, "native-package-integrity.json",
            "client build workflow packages native component SHA-256 identities");
+  contains(client_build, "invoke_windows_native_capability_probe.ps1",
+           "client build waits for GUI subsystem capability probes through the shared runner");
   free(client_build);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
@@ -304,8 +308,8 @@ int main(void) {
            "lifecycle binds the packaged uninstall protocol to the checked-out release source");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
-  contains(lifecycle_smoke, "--capability-probe",
-           "lifecycle rejects native uninstall components without the required protocol probe");
+  contains(lifecycle_smoke, "invoke_windows_native_capability_probe.ps1",
+           "lifecycle waits for GUI subsystem capability probes before reading evidence");
   contains(lifecycle_smoke, "attestation_token_length",
            "lifecycle failure output identifies token loss without disclosing token plaintext");
   require_true(!strstr(lifecycle_smoke, "headless uninstall failed with exit code $LASTEXITCODE"),
@@ -320,11 +324,24 @@ int main(void) {
            "lifecycle validates release script grammar before mutating Windows services");
   free(lifecycle_smoke);
 
+  snprintf(path, sizeof(path), "%s/scripts/invoke_windows_native_capability_probe.ps1", root);
+  char *capability_probe_runner = read_file(path);
+  require_true(capability_probe_runner != NULL, "read native capability probe runner");
+  contains(capability_probe_runner, "Start-Process", "native capability runner starts GUI executables explicitly");
+  contains(capability_probe_runner, "--capability-probe", "native capability runner invokes the required protocol probe");
+  contains(capability_probe_runner, "-Wait", "native capability runner waits for GUI executables to exit");
+  contains(capability_probe_runner, "could not remove stale result", "native capability runner cannot accept stale evidence");
+  contains(capability_probe_runner, "Test-Path", "native capability runner requires a newly generated result file");
+  contains(capability_probe_runner, "ConvertFrom-Json", "native capability runner rejects malformed probe output");
+  free(capability_probe_runner);
+
   snprintf(path, sizeof(path), "%s/scripts/validate_windows_powershell_syntax.ps1", root);
   char *powershell_validator = read_file(path);
   require_true(powershell_validator != NULL, "read Windows PowerShell syntax validator");
   contains(powershell_validator, "Management.Automation.Language.Parser]::ParseFile",
            "release validation uses the Windows PowerShell parser");
+  contains(powershell_validator, "invoke_windows_native_capability_probe.ps1",
+           "release validation parses the shared native capability runner on Windows PowerShell 5.1");
   contains(powershell_validator, "Non-ASCII Windows PowerShell 5.1 script must be UTF-8 with BOM",
            "release validation rejects ambiguous ANSI decoding of non-ASCII runtime scripts");
   free(powershell_validator);

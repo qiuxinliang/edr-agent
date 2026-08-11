@@ -20,6 +20,7 @@ $relativePaths = @(
   "scripts\edr_agent_uninstall.ps1",
   "scripts\windows_service_install.ps1",
   "scripts\windows_isolate_host.ps1",
+  "scripts\invoke_windows_native_capability_probe.ps1",
   "scripts\windows_release_lifecycle_smoke.ps1",
   "install\windows-inno\edr_install_wizard_enroll.ps1",
   "install\windows-inno\edr_windows_autorun.ps1"

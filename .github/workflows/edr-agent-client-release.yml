@@ -460,12 +460,15 @@ jobs:
           if ($env:EDR_RELEASE_ARCH -eq "amd64") {
             $workerProbe = Join-Path $env:RUNNER_TEMP "installer-worker-capabilities.json"
             $uninstallerProbe = Join-Path $env:RUNNER_TEMP "headless-uninstaller-capabilities.json"
-            & $workerExe --capability-probe $workerProbe
-            if ($LASTEXITCODE -ne 0) { throw "installer worker capability probe failed" }
-            & $uninstallerExe --capability-probe $uninstallerProbe
-            if ($LASTEXITCODE -ne 0) { throw "headless uninstaller capability probe failed" }
-            $worker = Get-Content -LiteralPath $workerProbe -Raw | ConvertFrom-Json
-            $uninstaller = Get-Content -LiteralPath $uninstallerProbe -Raw | ConvertFrom-Json
+            $probeRunner = Resolve-Path ".\scripts\invoke_windows_native_capability_probe.ps1"
+            $worker = & $probeRunner `
+              -ExecutablePath $workerExe `
+              -ProbePath $workerProbe `
+              -ComponentName "installer worker"
+            $uninstaller = & $probeRunner `
+              -ExecutablePath $uninstallerExe `
+              -ProbePath $uninstallerProbe `
+              -ComponentName "headless uninstaller"
             if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
               throw "installer worker does not implement uninstall attestation v2 token handoff"
             }

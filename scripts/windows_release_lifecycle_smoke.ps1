@@ -290,12 +290,15 @@ foreach ($component in @(
 }
 $workerProbe = Join-Path $EvidenceDir "installer-worker-capabilities.json"
 $uninstallerProbe = Join-Path $EvidenceDir "headless-uninstaller-capabilities.json"
-& $targetLifecycleWorker --capability-probe $workerProbe
-if ($LASTEXITCODE -ne 0) { throw "target installer worker capability probe failed" }
-& $targetUninstaller --capability-probe $uninstallerProbe
-if ($LASTEXITCODE -ne 0) { throw "target headless uninstaller capability probe failed" }
-$workerCapabilities = Get-Content -LiteralPath $workerProbe -Raw | ConvertFrom-Json
-$uninstallerCapabilities = Get-Content -LiteralPath $uninstallerProbe -Raw | ConvertFrom-Json
+$capabilityProbeRunner = Join-Path $PSScriptRoot "invoke_windows_native_capability_probe.ps1"
+$workerCapabilities = & $capabilityProbeRunner `
+  -ExecutablePath $targetLifecycleWorker `
+  -ProbePath $workerProbe `
+  -ComponentName "target installer worker"
+$uninstallerCapabilities = & $capabilityProbeRunner `
+  -ExecutablePath $targetUninstaller `
+  -ProbePath $uninstallerProbe `
+  -ComponentName "target headless uninstaller"
 if ($workerCapabilities.uninstall_attestation -ne "v2" -or
     $workerCapabilities.token_handoff -ne $true) {
   throw "target installer worker lacks uninstall attestation v2 token handoff"
