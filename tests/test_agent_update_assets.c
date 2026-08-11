@@ -214,6 +214,28 @@ int main(void) {
            "failed lifecycle summaries expose deferred PowerShell runtime errors");
   free(lifecycle);
 
+  snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-release.yml", root);
+  char *client_release = read_file(path);
+  require_true(client_release != NULL, "read Windows client release workflow");
+  require_true(!strstr(client_release, "Cache CMake build directory"),
+               "release workflow must not restore mutable CMake build outputs");
+  contains(client_release, "Verify native uninstall attestation capabilities",
+           "release workflow probes freshly built native uninstall components");
+  contains(client_release, "native-package-integrity.json",
+           "release workflow packages native component SHA-256 identities");
+  free(client_release);
+
+  snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
+  char *client_build = read_file(path);
+  require_true(client_build != NULL, "read Windows client build workflow");
+  require_true(!strstr(client_build, "Cache CMake build directory"),
+               "client build workflow must not restore mutable CMake build outputs");
+  contains(client_build, "Verify native uninstall attestation capabilities",
+           "client build workflow probes freshly built native uninstall components");
+  contains(client_build, "native-package-integrity.json",
+           "client build workflow packages native component SHA-256 identities");
+  free(client_build);
+
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
   char *lifecycle_smoke = read_file(path);
   require_true(lifecycle_smoke != NULL, "read Windows release lifecycle smoke test");
@@ -272,6 +294,12 @@ int main(void) {
            "lifecycle never mixes the current native uninstaller with a baseline uninstall script");
   contains(lifecycle_smoke, "target package uninstall script hash mismatch",
            "lifecycle binds the packaged uninstall protocol to the checked-out release source");
+  contains(lifecycle_smoke, "native-package-integrity.json",
+           "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
+  contains(lifecycle_smoke, "--capability-probe",
+           "lifecycle rejects native uninstall components without the required protocol probe");
+  contains(lifecycle_smoke, "attestation_token_length",
+           "lifecycle failure output identifies token loss without disclosing token plaintext");
   require_true(!strstr(lifecycle_smoke, "headless uninstall failed with exit code $LASTEXITCODE"),
                "lifecycle does not treat a stale native exit code as the result of a PowerShell installer script");
   contains(lifecycle_smoke, "failed_stage = $stage",

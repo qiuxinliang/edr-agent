@@ -13,6 +13,11 @@
 
 #define EDR_UNINSTALL_TITLE L"FDSecurity Agent Uninstaller"
 #define EDR_UNINSTALL_SCRIPT L"uninstall.ps1"
+static const char *HEADLESS_UNINSTALLER_CAPABILITIES =
+    "{\"schema\":\"edr.windows.native-capabilities.v1\","
+    "\"component\":\"headless-uninstaller\","
+    "\"uninstall_attestation\":\"v2\","
+    "\"powershell_token_handoff\":true}";
 
 static int has_flag(int argc, wchar_t **argv, const wchar_t *flag) {
   int i;
@@ -32,6 +37,23 @@ static const wchar_t *arg_value(int argc, wchar_t **argv, const wchar_t *name) {
     }
   }
   return NULL;
+}
+
+static int write_capability_probe(const wchar_t *path, const char *payload) {
+  HANDLE file;
+  DWORD written = 0;
+  size_t length;
+  if (!path || !path[0] || !payload) return 0;
+  file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                     FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE) return 0;
+  length = strlen(payload);
+  if (!WriteFile(file, payload, (DWORD)length, &written, NULL) || written != (DWORD)length) {
+    CloseHandle(file);
+    return 0;
+  }
+  CloseHandle(file);
+  return 1;
 }
 
 static int file_exists(const wchar_t *path) {
@@ -386,6 +408,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
 
   argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) return (int)GetLastError();
+  {
+    const wchar_t *capability_probe = arg_value(argc, argv, L"--capability-probe");
+    if (capability_probe && capability_probe[0]) {
+      int probe_ok = write_capability_probe(capability_probe, HEADLESS_UNINSTALLER_CAPABILITIES);
+      LocalFree(argv);
+      return probe_ok ? 0 : ERROR_WRITE_FAULT;
+    }
+  }
   silent = has_flag(argc, argv, L"/S") || has_flag(argc, argv, L"/SILENT") ||
            has_flag(argc, argv, L"/VERYSILENT") || has_flag(argc, argv, L"--silent");
   keep_data = has_flag(argc, argv, L"/KEEPDATA") || has_flag(argc, argv, L"--keep-data");

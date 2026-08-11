@@ -11,6 +11,11 @@
 
 static const wchar_t *DEFAULT_INSTALL_DIR = L"C:\\Program Files\\FDSecurity";
 static const wchar_t *DEFAULT_SERVICE_NAME = L"FDSecurityAgent";
+static const char *INSTALLER_WORKER_CAPABILITIES =
+    "{\"schema\":\"edr.windows.native-capabilities.v1\","
+    "\"component\":\"installer-worker\","
+    "\"uninstall_attestation\":\"v2\","
+    "\"token_handoff\":true}";
 
 static const wchar_t *arg_value(int argc, wchar_t **argv, const wchar_t *key) {
   for (int i = 1; i + 1 < argc; ++i) {
@@ -24,6 +29,23 @@ static int has_flag(int argc, wchar_t **argv, const wchar_t *key) {
     if (_wcsicmp(argv[i], key) == 0) return 1;
   }
   return 0;
+}
+
+static int write_capability_probe(const wchar_t *path, const char *payload) {
+  HANDLE file;
+  DWORD written = 0;
+  size_t length;
+  if (!path || !path[0] || !payload) return 0;
+  file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                     FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE) return 0;
+  length = strlen(payload);
+  if (!WriteFile(file, payload, (DWORD)length, &written, NULL) || written != (DWORD)length) {
+    CloseHandle(file);
+    return 0;
+  }
+  CloseHandle(file);
+  return 1;
 }
 
 static void append_log_utf8(const wchar_t *path, const wchar_t *line) {
@@ -1346,6 +1368,14 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
     detail = rc == 0 ? "Agent service stopped after offboard handoff" :
                        "Agent offboard service stop failed";
   } else if (_wcsicmp(action, L"uninstall") == 0) {
+    wchar_t attestation_line[256];
+    _snwprintf(attestation_line,
+               sizeof(attestation_line) / sizeof(attestation_line[0]),
+               L"lifecycle_attestation_handoff protocol=v2 token_present=%d token_length=%llu",
+               attestation_token && attestation_token[0] ? 1 : 0,
+               (unsigned long long)(attestation_token ? wcslen(attestation_token) : 0));
+    attestation_line[(sizeof(attestation_line) / sizeof(attestation_line[0])) - 1] = 0;
+    append_log_utf8(log_path, attestation_line);
     rc = launch_uninstaller_detached(install_dir, service_name, keep_data, attestation_url,
                                      attestation_token, task_id, endpoint_id, log_path);
     detail = rc == 0 ? "Native uninstaller completed after command-result handoff" :
@@ -1370,6 +1400,12 @@ int main(void) {
   int argc = 0;
   wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   if (!argv) return 99;
+  const wchar_t *capability_probe = arg_value(argc, argv, L"--capability-probe");
+  if (capability_probe[0]) {
+    int probe_ok = write_capability_probe(capability_probe, INSTALLER_WORKER_CAPABILITIES);
+    LocalFree(argv);
+    return probe_ok ? 0 : 65;
+  }
   const wchar_t *stage = arg_value(argc, argv, L"--stage");
   const wchar_t *install_dir = arg_value(argc, argv, L"--install-dir");
   const wchar_t *log_path = arg_value(argc, argv, L"--log");

@@ -102,14 +102,6 @@ jobs:
           path: onnxrt-win
           key: onnxrt-x64-win-1.17.3-${{ runner.os }}
 
-      - name: Cache CMake build directory (incremental)
-        uses: actions/cache@v5
-        with:
-          path: build
-          key: build-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
-          restore-keys: |
-            build-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('CMakeLists.txt', 'vcpkg.json') }}-${{ runner.os }}-v3
-
       - name: Restore vcpkg from pre-built packages (if cache miss)
         if: ${{ inputs.full_features }}
         shell: pwsh
@@ -314,6 +306,28 @@ jobs:
             throw "headless uninstall.exe build failed with exit code $LASTEXITCODE"
           }
 
+      - name: Verify native uninstall attestation capabilities
+        shell: pwsh
+        run: |
+          $outDir = @("build\Release", "build") | Where-Object {
+            Test-Path -LiteralPath (Join-Path $_ "FDSecurityInstallerWorker.exe")
+          } | Select-Object -First 1
+          if (-not $outDir) { throw "native installer worker output directory not found" }
+          $workerProbe = Join-Path $env:RUNNER_TEMP "installer-worker-capabilities.json"
+          $uninstallerProbe = Join-Path $env:RUNNER_TEMP "headless-uninstaller-capabilities.json"
+          & (Join-Path $outDir "FDSecurityInstallerWorker.exe") --capability-probe $workerProbe
+          if ($LASTEXITCODE -ne 0) { throw "installer worker capability probe failed" }
+          & (Join-Path $outDir "uninstall.exe") --capability-probe $uninstallerProbe
+          if ($LASTEXITCODE -ne 0) { throw "headless uninstaller capability probe failed" }
+          $worker = Get-Content -LiteralPath $workerProbe -Raw | ConvertFrom-Json
+          $uninstaller = Get-Content -LiteralPath $uninstallerProbe -Raw | ConvertFrom-Json
+          if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
+            throw "installer worker does not implement uninstall attestation v2 token handoff"
+          }
+          if ($uninstaller.uninstall_attestation -ne "v2" -or $uninstaller.powershell_token_handoff -ne $true) {
+            throw "headless uninstaller does not implement uninstall attestation v2 PowerShell handoff"
+          }
+
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
         run: |
@@ -428,6 +442,16 @@ jobs:
           $uninstallScript = Join-Path $outDir "uninstall.ps1"
           Copy-Item -LiteralPath "scripts\edr_agent_uninstall.ps1" -Destination $uninstallScript -Force
           $null = $items.Add($uninstallScript)
+          $nativeIntegrityPath = Join-Path $outDir "native-package-integrity.json"
+          [ordered]@{
+            schema = "edr.windows.native-package-integrity.v1"
+            files = @(
+              [ordered]@{ name = "FDSecurityInstallerWorker.exe"; sha256 = (Get-FileHash -LiteralPath $workerExe -Algorithm SHA256).Hash.ToLowerInvariant() },
+              [ordered]@{ name = "uninstall.exe"; sha256 = (Get-FileHash -LiteralPath $uninstallerExe -Algorithm SHA256).Hash.ToLowerInvariant() },
+              [ordered]@{ name = "uninstall.ps1"; sha256 = (Get-FileHash -LiteralPath $uninstallScript -Algorithm SHA256).Hash.ToLowerInvariant() }
+            )
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
+          $null = $items.Add($nativeIntegrityPath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {

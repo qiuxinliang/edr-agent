@@ -80,6 +80,9 @@ function Write-UninstallScriptReceipt {
       service_name = $ServiceName
       remove_data = [bool]$RemoveData
       remove_program_files = [bool]$RemoveProgramFiles
+      attestation_url_configured = -not [string]::IsNullOrWhiteSpace($AttestationURL)
+      attestation_token_present = -not [string]::IsNullOrWhiteSpace($AttestationToken)
+      attestation_token_length = ([string]$AttestationToken).Length
       error = $ErrorMessage
       error_type = $ErrorType
       error_position = $ErrorPosition
@@ -521,6 +524,8 @@ if (`$attestationStatus -eq 'failed') {
   deletion_last_error = `$deleteLastError
   remaining_entries = @(`$remainingEntries)
   attestation_status = `$attestationStatus
+  attestation_token_present = -not [string]::IsNullOrWhiteSpace(`$normalizedAttestationToken)
+  attestation_token_length = ([string]`$normalizedAttestationToken).Length
   attestation_error = `$attestationError
   attestation_attempts = `$attestationAttemptCount
   attestation_last_http_status = `$attestationLastHttpStatus

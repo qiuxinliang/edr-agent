@@ -248,6 +248,7 @@ $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_u
 $targetLifecycleWorker = Find-OneFile -Root $TargetPackageDir -Name "FDSecurityInstallerWorker.exe"
 $targetUninstaller = Find-OneFile -Root $TargetPackageDir -Name "uninstall.exe"
 $targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name "uninstall.ps1"
+$targetNativeIntegrity = Find-OneFile -Root $TargetPackageDir -Name "native-package-integrity.json"
 $baselineTemplate = Find-OneFile -Root $BaselinePackageDir -Name "agent_windows_production.example.toml"
 $sourceInstaller = Join-Path $PSScriptRoot "windows_service_install.ps1"
 $sourceUninstallScript = Join-Path $PSScriptRoot "edr_agent_uninstall.ps1"
@@ -267,6 +268,41 @@ $targetUninstallScriptHash = (Get-FileHash -LiteralPath $targetUninstallScript -
 $sourceUninstallScriptHash = (Get-FileHash -LiteralPath $sourceUninstallScript -Algorithm SHA256).Hash
 if ($targetUninstallScriptHash -ne $sourceUninstallScriptHash) {
   throw "target package uninstall script hash mismatch"
+}
+$nativeIntegrity = Get-Content -LiteralPath $targetNativeIntegrity -Raw | ConvertFrom-Json
+if ($nativeIntegrity.schema -ne "edr.windows.native-package-integrity.v1") {
+  throw "target package native integrity manifest schema mismatch"
+}
+foreach ($component in @(
+    @{ Name = "FDSecurityInstallerWorker.exe"; Path = $targetLifecycleWorker },
+    @{ Name = "uninstall.exe"; Path = $targetUninstaller },
+    @{ Name = "uninstall.ps1"; Path = $targetUninstallScript }
+  )) {
+  $entry = @($nativeIntegrity.files | Where-Object { $_.name -eq $component.Name })
+  if ($entry.Count -ne 1) {
+    throw "target package native integrity manifest is missing $($component.Name)"
+  }
+  $actualHash = (Get-FileHash -LiteralPath $component.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  $expectedHash = ([string]($entry[0].sha256)).ToLowerInvariant()
+  if ($expectedHash -cne $actualHash) {
+    throw "target package native integrity hash mismatch for $($component.Name)"
+  }
+}
+$workerProbe = Join-Path $EvidenceDir "installer-worker-capabilities.json"
+$uninstallerProbe = Join-Path $EvidenceDir "headless-uninstaller-capabilities.json"
+& $targetLifecycleWorker --capability-probe $workerProbe
+if ($LASTEXITCODE -ne 0) { throw "target installer worker capability probe failed" }
+& $targetUninstaller --capability-probe $uninstallerProbe
+if ($LASTEXITCODE -ne 0) { throw "target headless uninstaller capability probe failed" }
+$workerCapabilities = Get-Content -LiteralPath $workerProbe -Raw | ConvertFrom-Json
+$uninstallerCapabilities = Get-Content -LiteralPath $uninstallerProbe -Raw | ConvertFrom-Json
+if ($workerCapabilities.uninstall_attestation -ne "v2" -or
+    $workerCapabilities.token_handoff -ne $true) {
+  throw "target installer worker lacks uninstall attestation v2 token handoff"
+}
+if ($uninstallerCapabilities.uninstall_attestation -ne "v2" -or
+    $uninstallerCapabilities.powershell_token_handoff -ne $true) {
+  throw "target headless uninstaller lacks uninstall attestation v2 PowerShell handoff"
 }
 
 if ((Get-AgentVersion -Path $baselineBinary) -ne $BaselineVersion) {
@@ -574,12 +610,12 @@ try {
     if (Test-Path -LiteralPath $attestationAttempts -PathType Leaf) {
       try {
         $attemptResult = @(Get-Content -LiteralPath $attestationAttempts -Raw | ConvertFrom-Json)[-1]
-        $attemptDetail = " expected_token_sha256=$($attemptResult.expected_token_sha256) bearer_token_sha256=$($attemptResult.bearer_token_sha256) loopback_token_sha256=$($attemptResult.loopback_token_sha256) body_token_proof_valid=$($attemptResult.body_token_proof_valid) proof_valid=$($attemptResult.proof_valid) accepted_token_transport=$($attemptResult.accepted_token_transport)"
+        $attemptDetail = " expected_token_sha256=$($attemptResult.expected_token_sha256) bearer_token_sha256=$($attemptResult.bearer_token_sha256) loopback_token_sha256=$($attemptResult.loopback_token_sha256) body_token_proof_present=$($attemptResult.body_token_proof_present) expected_body_token_proof_sha256=$($attemptResult.expected_body_token_proof_sha256) received_body_token_proof_sha256=$($attemptResult.received_body_token_proof_sha256) body_token_proof_valid=$($attemptResult.body_token_proof_valid) body_parse_error=$($attemptResult.body_parse_error) proof_valid=$($attemptResult.proof_valid) accepted_token_transport=$($attemptResult.accepted_token_transport)"
       } catch {
         $attemptDetail = " attestation_attempt_diagnostic=invalid_json"
       }
     }
-    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_attempts=$($cleanupResult.attestation_attempts) attestation_proxy_mode=$($cleanupResult.attestation_proxy_mode) attestation_http_status=$($cleanupResult.attestation_last_http_status) attestation_error=$($cleanupResult.attestation_error) attestation_errors=$(@($cleanupResult.attestation_errors) -join '|') failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')$attemptDetail"
+    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_token_present=$($cleanupResult.attestation_token_present) attestation_token_length=$($cleanupResult.attestation_token_length) attestation_attempts=$($cleanupResult.attestation_attempts) attestation_proxy_mode=$($cleanupResult.attestation_proxy_mode) attestation_http_status=$($cleanupResult.attestation_last_http_status) attestation_error=$($cleanupResult.attestation_error) attestation_errors=$(@($cleanupResult.attestation_errors) -join '|') failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')$attemptDetail"
   }
   if (-not (Test-Path -LiteralPath $attestationEvidence -PathType Leaf)) {
     throw "uninstall attestation callback evidence is missing"

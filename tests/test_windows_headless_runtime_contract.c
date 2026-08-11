@@ -109,6 +109,12 @@ int main(void) {
                          "native worker must install the bounded 15-minute forensic version check");
   ok &= require_contains(worker, "EDR_FORENSIC_PREFETCH_RETRY_SEC\", L\"900",
                          "native worker must install the bounded 15-minute forensic prefetch retry");
+  ok &= require_contains(worker, "--capability-probe",
+                         "native worker must expose a machine-readable release capability probe");
+  ok &= require_contains(worker, "\\\"uninstall_attestation\\\":\\\"v2\\\"",
+                         "native worker capability probe must declare uninstall attestation v2");
+  ok &= require_contains(worker, "lifecycle_attestation_handoff protocol=v2",
+                         "native worker must record sanitized token handoff diagnostics");
   ok &= require_absent(worker, "L\"/Create /F /TN %ls /SC ONSTART",
                        "native worker must not build a nested-quoted schtasks action");
   free(worker);
@@ -250,6 +256,10 @@ int main(void) {
                          "native uninstall must capture PowerShell output outside the removable install directory");
   ok &= require_contains(headless_uninstaller, "STARTF_USESTDHANDLES",
                          "native uninstall must redirect child stdout and stderr for actionable CI diagnostics");
+  ok &= require_contains(headless_uninstaller, "--capability-probe",
+                         "native uninstaller must expose a machine-readable release capability probe");
+  ok &= require_contains(headless_uninstaller, "\\\"uninstall_attestation\\\":\\\"v2\\\"",
+                         "native uninstaller capability probe must declare uninstall attestation v2");
   free(headless_uninstaller);
 
   char *cmake = read_source(root, "CMakeLists.txt");
