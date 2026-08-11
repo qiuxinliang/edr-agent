@@ -200,6 +200,13 @@ jobs:
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
+            if (Test-Path -LiteralPath evidence\uninstall-attestation-attempts.json) {
+              "### Uninstall attestation attempts" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              Get-Content -LiteralPath evidence\uninstall-attestation-attempts.json |
+                Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
           } else {
             "Lifecycle did not reach a passing summary. Inspect the failed step and service diagnostics in this job log." |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append

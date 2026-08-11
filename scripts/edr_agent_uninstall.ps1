@@ -421,6 +421,9 @@ foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
 `$teardownCompletedAt = [DateTime]::UtcNow.ToString('o')
 `$localSucceeded = (-not `$remaining) -and `$serviceRemoved -and `$processStopped
 `$attestationError = ''
+`$attestationAttemptCount = 0
+`$attestationErrors = @()
+`$attestationProxyMode = 'system'
 `$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) {
   'not_configured'
 } elseif (`$localSucceeded) {
@@ -439,17 +442,29 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
     completed_at = `$teardownCompletedAt
   } | ConvertTo-Json -Compress
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  for (`$postAttempt = 0; `$postAttempt -lt 8 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
-    try {
-      `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
-        -Headers @{ Authorization = "Bearer `$attestationToken" } -Body `$body -TimeoutSec 5
-      `$attestationStatus = 'succeeded'
-      `$attestationError = ''
-    } catch {
-      `$attestationStatus = 'failed'
-      `$attestationError = `$_.Exception.Message
-      if (`$postAttempt -lt 7) { Start-Sleep -Seconds 4 }
+  `$originalDefaultProxy = [Net.WebRequest]::DefaultWebProxy
+  `$bypassProxy = ([Uri]`$attestationURL).IsLoopback
+  if (`$bypassProxy) {
+    [Net.WebRequest]::DefaultWebProxy = `$null
+    `$attestationProxyMode = 'loopback_direct'
+  }
+  try {
+    for (`$postAttempt = 0; `$postAttempt -lt 8 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
+      `$attestationAttemptCount = `$postAttempt + 1
+      try {
+        `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
+          -Headers @{ Authorization = "Bearer `$attestationToken" } -Body `$body -TimeoutSec 5
+        `$attestationStatus = 'succeeded'
+        `$attestationError = ''
+      } catch {
+        `$attestationStatus = 'failed'
+        `$attestationError = `$_.Exception.Message
+        `$attestationErrors += ("attempt {0}: {1}" -f `$attestationAttemptCount, `$attestationError)
+        if (`$postAttempt -lt 7) { Start-Sleep -Seconds 4 }
+      }
     }
+  } finally {
+    if (`$bypassProxy) { [Net.WebRequest]::DefaultWebProxy = `$originalDefaultProxy }
   }
 }
 `$failureReasons = @()
@@ -478,6 +493,9 @@ if (`$attestationStatus -eq 'failed') {
   remaining_entries = @(`$remainingEntries)
   attestation_status = `$attestationStatus
   attestation_error = `$attestationError
+  attestation_attempts = `$attestationAttemptCount
+  attestation_errors = @(`$attestationErrors)
+  attestation_proxy_mode = `$attestationProxyMode
   failure_reasons = @(`$failureReasons)
   lifecycle_task_id = `$taskID
   endpoint_id = `$endpointID

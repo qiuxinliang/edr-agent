@@ -199,6 +199,10 @@ int main(void) {
                          "deferred cleanup must identify files that survive bounded removal");
   ok &= require_contains(uninstall_ps, "attestation_error = `$attestationError",
                          "deferred cleanup must retain callback transport diagnostics");
+  ok &= require_contains(uninstall_ps, "[Net.WebRequest]::DefaultWebProxy = `$null",
+                         "loopback callback transport must not inherit a machine proxy under LocalSystem");
+  ok &= require_contains(uninstall_ps, "attestation_errors = @(`$attestationErrors)",
+                         "cleanup receipt must retain the complete bounded attestation attempt history");
   ok &= require_contains(uninstall_ps, "failure_reasons = @(`$failureReasons)",
                          "deferred cleanup must report machine-readable terminal causes");
   ok &= require_contains(uninstall_ps,

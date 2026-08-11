@@ -208,6 +208,8 @@ int main(void) {
            "failed lifecycle summaries expose the asynchronous cleanup receipt");
   contains(lifecycle, "Uninstall attestation listener",
            "failed lifecycle summaries expose callback listener diagnostics");
+  contains(lifecycle, "Uninstall attestation attempts",
+           "failed lifecycle summaries expose every callback request observed by the listener");
   contains(lifecycle, "Deferred uninstall cleanup stderr",
            "failed lifecycle summaries expose deferred PowerShell runtime errors");
   free(lifecycle);
@@ -242,6 +244,10 @@ int main(void) {
            "lifecycle smoke verifies the callback listener before uninstall starts");
   contains(lifecycle_smoke, "authorization_valid = $authorizationValid",
            "lifecycle callback validates the exact one-time bearer token");
+  contains(lifecycle_smoke, "while (-not $accepted)",
+           "callback listener survives unrelated or invalid requests until valid teardown proof arrives");
+  contains(lifecycle_smoke, "uninstall-attestation-attempts.json",
+           "callback listener persists sanitized diagnostics for every observed request");
   contains(lifecycle_smoke, "attestation_error=$($cleanupResult.attestation_error)",
            "lifecycle failure output reports the exact attestation error");
   contains(lifecycle_smoke, "[int]$Seconds = 120",
@@ -323,6 +329,12 @@ int main(void) {
            "deferred cleanup records paths that survive bounded deletion");
   contains(uninstall_script, "attestation_error = `$attestationError",
            "deferred cleanup records the final callback transport error");
+  contains(uninstall_script, "[Net.WebRequest]::DefaultWebProxy = `$null",
+           "loopback lifecycle attestation bypasses machine proxy settings under LocalSystem");
+  contains(uninstall_script, "attestation_errors = @(`$attestationErrors)",
+           "deferred cleanup retains every bounded callback failure");
+  contains(uninstall_script, "attestation_proxy_mode = `$attestationProxyMode",
+           "cleanup receipt identifies whether loopback direct transport was selected");
   contains(uninstall_script, "failure_reasons = @(`$failureReasons)",
            "deferred cleanup emits machine-readable failure reasons");
   contains(uninstall_script, "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",

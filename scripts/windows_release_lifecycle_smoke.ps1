@@ -304,6 +304,7 @@ try {
   $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-last.json"
   $uninstallPowerShellLog = Join-Path $programDataState "uninstall-powershell-last.log"
   $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
+  $attestationAttempts = Join-Path $EvidenceDir "uninstall-attestation-attempts.json"
   $attestationReady = Join-Path $EvidenceDir "uninstall-attestation-listener-ready.json"
   $attestationPort = Get-Random -Minimum 32000 -Maximum 45000
   $attestationURL = "http://127.0.0.1:$attestationPort/uninstall-attest/"
@@ -312,47 +313,89 @@ try {
   New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
   Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $cleanupStdout, $cleanupStderr, `
     $uninstallScriptReceipt, $uninstallPowerShellLog, `
-    $attestationEvidence, $attestationReady -Force -ErrorAction SilentlyContinue
+    $attestationEvidence, $attestationAttempts, $attestationReady -Force -ErrorAction SilentlyContinue
   $attestationJob = Start-Job -ScriptBlock {
-    param($Port, $EvidencePath, $ReadyPath, $ExpectedToken)
+    param($Port, $EvidencePath, $AttemptsPath, $ReadyPath, $ExpectedToken)
     $listener = New-Object Net.HttpListener
     $listener.Prefixes.Add("http://127.0.0.1:$Port/uninstall-attest/")
+    $attemptRecords = @()
     try {
       $listener.Start()
       [ordered]@{
         ready_at = [DateTime]::UtcNow.ToString("o")
         port = $Port
       } | ConvertTo-Json | Set-Content -LiteralPath $ReadyPath -Encoding UTF8 -Force -ErrorAction Stop
-      $context = $listener.GetContext()
-      $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
-      $body = $reader.ReadToEnd()
-      $reader.Dispose()
-      $authorization = [string]$context.Request.Headers['Authorization']
-      $parsedBody = $null
-      $bodyError = ""
-      try {
-        $parsedBody = $body | ConvertFrom-Json -ErrorAction Stop
-      } catch {
-        $bodyError = $_.Exception.Message
+      $accepted = $false
+      while (-not $accepted) {
+        $context = $listener.GetContext()
+        $requestAccepted = $false
+        $responseStatus = 500
+        $responseJson = '{"success":false}'
+        try {
+          $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
+          $body = $reader.ReadToEnd()
+          $reader.Dispose()
+          $authorization = [string]$context.Request.Headers['Authorization']
+          $parsedBody = $null
+          $bodyError = ""
+          try {
+            $parsedBody = $body | ConvertFrom-Json -ErrorAction Stop
+          } catch {
+            $bodyError = $_.Exception.Message
+          }
+          $authorizationValid = $authorization -ceq ("Bearer " + $ExpectedToken)
+          $proofValid = ($null -ne $parsedBody -and
+            $parsedBody.schema -eq "edr.endpoint.uninstall.attestation.v1" -and
+            $parsedBody.service_removed -eq $true -and
+            $parsedBody.process_stopped -eq $true -and
+            $parsedBody.install_dir_removed -eq $true)
+          $requestAccepted = $authorizationValid -and $proofValid
+          $attemptRecords += [ordered]@{
+            received_at = [DateTime]::UtcNow.ToString("o")
+            method = [string]$context.Request.HttpMethod
+            remote_endpoint = [string]$context.Request.RemoteEndPoint
+            authorization_present = $authorization -like 'Bearer *'
+            authorization_valid = $authorizationValid
+            body_parse_error = $bodyError
+            proof_valid = $proofValid
+          }
+          @($attemptRecords) | ConvertTo-Json -Depth 4 | Set-Content `
+            -LiteralPath $AttemptsPath -Encoding UTF8 -Force -ErrorAction Stop
+          if ($requestAccepted) {
+            [ordered]@{
+              authorization_present = $authorization -like 'Bearer *'
+              authorization_valid = $authorizationValid
+              body_parse_error = $bodyError
+              body = $parsedBody
+            } | ConvertTo-Json -Depth 4 | Set-Content `
+              -LiteralPath $EvidencePath -Encoding UTF8 -Force -ErrorAction Stop
+            $responseStatus = 200
+            $responseJson = '{"success":true}'
+          } elseif (-not $authorizationValid) {
+            $responseStatus = 401
+          } else {
+            $responseStatus = 400
+          }
+        } catch {
+          $requestAccepted = $false
+          Write-Output ("attestation_listener_request_failed: " + $_.Exception.Message)
+        }
+        try {
+          $responseBody = [Text.Encoding]::UTF8.GetBytes($responseJson)
+          $context.Response.StatusCode = $responseStatus
+          $context.Response.ContentType = 'application/json'
+          $context.Response.OutputStream.Write($responseBody, 0, $responseBody.Length)
+          $context.Response.Close()
+          if ($requestAccepted -and $responseStatus -eq 200) { $accepted = $true }
+        } catch {
+          Write-Output ("attestation_listener_response_failed: " + $_.Exception.Message)
+          try { $context.Response.Abort() } catch {}
+        }
       }
-      $authorizationValid = $authorization -ceq ("Bearer " + $ExpectedToken)
-      [ordered]@{
-        authorization_present = $authorization -like 'Bearer *'
-        authorization_valid = $authorizationValid
-        body_parse_error = $bodyError
-        body = $parsedBody
-      } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $EvidencePath -Encoding UTF8 -Force -ErrorAction Stop
-      $accepted = $authorizationValid -and $parsedBody
-      $responseJson = if ($accepted) { '{"success":true}' } else { '{"success":false}' }
-      $responseBody = [Text.Encoding]::UTF8.GetBytes($responseJson)
-      $context.Response.StatusCode = if ($accepted) { 200 } elseif (-not $authorizationValid) { 401 } else { 400 }
-      $context.Response.ContentType = 'application/json'
-      $context.Response.OutputStream.Write($responseBody, 0, $responseBody.Length)
-      $context.Response.Close()
     } finally {
       $listener.Close()
     }
-  } -ArgumentList $attestationPort, $attestationEvidence, $attestationReady, $attestationToken
+  } -ArgumentList $attestationPort, $attestationEvidence, $attestationAttempts, $attestationReady, $attestationToken
   Wait-AttestationListenerReady -Path $attestationReady -Job $attestationJob
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
@@ -412,7 +455,21 @@ try {
     Copy-Item -LiteralPath $cleanupReceipt -Destination $EvidenceDir -Force
     Write-Host "--- deferred uninstall cleanup receipt ---"
     Get-Content -LiteralPath $cleanupReceipt | Out-Host
-    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_error=$($cleanupResult.attestation_error) failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')"
+    if (Test-Path -LiteralPath $attestationAttempts -PathType Leaf) {
+      Write-Host "--- uninstall attestation listener attempts ---"
+      Get-Content -LiteralPath $attestationAttempts | Out-Host
+    }
+    if (Test-Path -LiteralPath $attestationEvidence -PathType Leaf) {
+      Write-Host "--- uninstall attestation callback evidence ---"
+      Get-Content -LiteralPath $attestationEvidence | Out-Host
+    }
+    $listenerReason = ""
+    if ($attestationJob.ChildJobs.Count -gt 0 -and $attestationJob.ChildJobs[0].JobStateInfo.Reason) {
+      $listenerReason = $attestationJob.ChildJobs[0].JobStateInfo.Reason.Message
+    }
+    Write-Host "attestation_listener state=$($attestationJob.State) reason=$listenerReason"
+    Receive-Job -Job $attestationJob -Keep -ErrorAction SilentlyContinue | Out-Host
+    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_attempts=$($cleanupResult.attestation_attempts) attestation_proxy_mode=$($cleanupResult.attestation_proxy_mode) attestation_error=$($cleanupResult.attestation_error) attestation_errors=$(@($cleanupResult.attestation_errors) -join '|') failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')"
   }
   if (-not (Test-Path -LiteralPath $attestationEvidence -PathType Leaf)) {
     throw "uninstall attestation callback evidence is missing"
