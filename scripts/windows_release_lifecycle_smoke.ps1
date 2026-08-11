@@ -472,6 +472,9 @@ try {
             received_at = [DateTime]::UtcNow.ToString("o")
             method = [string]$context.Request.HttpMethod
             remote_endpoint = [string]$context.Request.RemoteEndPoint
+            content_type = [string]$context.Request.ContentType
+            content_length = [long]$context.Request.ContentLength64
+            body_utf8_length = [Text.Encoding]::UTF8.GetByteCount([string]$body)
             authorization_present = $authorization -like 'Bearer *'
             authorization_valid = $authorizationValid
             loopback_token_present = -not [string]::IsNullOrEmpty($loopbackToken)
@@ -613,12 +616,12 @@ try {
     if (Test-Path -LiteralPath $attestationAttempts -PathType Leaf) {
       try {
         $attemptResult = @(Get-Content -LiteralPath $attestationAttempts -Raw | ConvertFrom-Json)[-1]
-        $attemptDetail = " expected_token_sha256=$($attemptResult.expected_token_sha256) bearer_token_sha256=$($attemptResult.bearer_token_sha256) loopback_token_sha256=$($attemptResult.loopback_token_sha256) body_token_proof_present=$($attemptResult.body_token_proof_present) expected_body_token_proof_sha256=$($attemptResult.expected_body_token_proof_sha256) received_body_token_proof_sha256=$($attemptResult.received_body_token_proof_sha256) body_token_proof_valid=$($attemptResult.body_token_proof_valid) body_parse_error=$($attemptResult.body_parse_error) proof_valid=$($attemptResult.proof_valid) accepted_token_transport=$($attemptResult.accepted_token_transport)"
+        $attemptDetail = " method=$($attemptResult.method) content_type=$($attemptResult.content_type) content_length=$($attemptResult.content_length) body_utf8_length=$($attemptResult.body_utf8_length) expected_token_sha256=$($attemptResult.expected_token_sha256) bearer_token_sha256=$($attemptResult.bearer_token_sha256) loopback_token_sha256=$($attemptResult.loopback_token_sha256) body_token_proof_present=$($attemptResult.body_token_proof_present) expected_body_token_proof_sha256=$($attemptResult.expected_body_token_proof_sha256) received_body_token_proof_sha256=$($attemptResult.received_body_token_proof_sha256) body_token_proof_valid=$($attemptResult.body_token_proof_valid) body_parse_error=$($attemptResult.body_parse_error) proof_valid=$($attemptResult.proof_valid) accepted_token_transport=$($attemptResult.accepted_token_transport)"
       } catch {
         $attemptDetail = " attestation_attempt_diagnostic=invalid_json"
       }
     }
-    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_token_present=$($cleanupResult.attestation_token_present) attestation_token_length=$($cleanupResult.attestation_token_length) attestation_attempts=$($cleanupResult.attestation_attempts) attestation_proxy_mode=$($cleanupResult.attestation_proxy_mode) attestation_http_status=$($cleanupResult.attestation_last_http_status) attestation_error=$($cleanupResult.attestation_error) attestation_errors=$(@($cleanupResult.attestation_errors) -join '|') failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')$attemptDetail"
+    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_token_present=$($cleanupResult.attestation_token_present) attestation_token_length=$($cleanupResult.attestation_token_length) attestation_attempts=$($cleanupResult.attestation_attempts) attestation_proxy_mode=$($cleanupResult.attestation_proxy_mode) attestation_transport=$($cleanupResult.attestation_transport) attestation_request_body_bytes=$($cleanupResult.attestation_request_body_bytes) attestation_http_status=$($cleanupResult.attestation_last_http_status) attestation_error=$($cleanupResult.attestation_error) attestation_errors=$(@($cleanupResult.attestation_errors) -join '|') failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')$attemptDetail"
   }
   if (-not (Test-Path -LiteralPath $attestationEvidence -PathType Leaf)) {
     throw "uninstall attestation callback evidence is missing"

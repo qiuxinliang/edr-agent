@@ -426,6 +426,14 @@ int main(void) {
            "loopback cleanup proves one-time token possession in the attestation body");
   contains(uninstall_script, "Security.Cryptography.HMACSHA256",
            "deferred cleanup uses HMAC-SHA256 for the header-independent token proof");
+  contains(uninstall_script, "tcp_loopback_http11",
+           "loopback attestation uses a byte-exact HTTP transport under LocalSystem");
+  contains(uninstall_script, "New-Object Net.Sockets.TcpClient",
+           "loopback attestation bypasses WebRequest header and body rewriting");
+  contains(uninstall_script, "Content-Length: `$(`$bodyBytes.Length)",
+           "loopback attestation sends an explicit UTF-8 body length");
+  contains(uninstall_script, "attestation_request_body_bytes = `$attestationRequestBodyBytes",
+           "cleanup receipt records the outgoing attestation body size");
   contains(uninstall_script, "Invoke-RestMethod -Uri `$attestationURL",
            "deferred cleanup posts its one-time completion attestation");
   contains(uninstall_script, "Skipped unrelated $name process PID",

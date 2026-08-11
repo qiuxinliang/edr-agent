@@ -191,6 +191,12 @@ int main(void) {
                          "loopback uninstall attestation must carry a header-independent token proof");
   ok &= require_contains(uninstall_ps, "Security.Cryptography.HMACSHA256",
                          "uninstall attestation body proof must use HMAC-SHA256");
+  ok &= require_contains(uninstall_ps, "tcp_loopback_http11",
+                         "loopback attestation must use byte-exact HTTP under LocalSystem");
+  ok &= require_contains(uninstall_ps, "New-Object Net.Sockets.TcpClient",
+                         "loopback attestation must bypass WebRequest rewriting");
+  ok &= require_contains(uninstall_ps, "Content-Length: `$(`$bodyBytes.Length)",
+                         "loopback attestation must bind the exact UTF-8 body length");
   ok &= require_contains(uninstall_ps, "Skipped unrelated $name process PID",
                          "uninstall must scope process termination to the target installation");
   ok &= require_contains(uninstall_ps, "ETW cleanup returned exit code $LASTEXITCODE; continuing uninstall",

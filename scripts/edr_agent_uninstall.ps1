@@ -428,6 +428,8 @@ foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
 `$attestationLastHttpStatus = 0
 `$attestationErrors = @()
 `$attestationProxyMode = 'system'
+`$attestationTransport = 'invoke_rest_method'
+`$attestationRequestBodyBytes = 0
 `$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) {
   'not_configured'
 } elseif (`$localSucceeded) {
@@ -466,28 +468,86 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
     }
   }
   `$body = `$bodyFields | ConvertTo-Json -Compress
+  `$bodyBytes = [Text.Encoding]::UTF8.GetBytes(`$body)
+  `$attestationRequestBodyBytes = `$bodyBytes.Length
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   `$originalDefaultProxy = [Net.WebRequest]::DefaultWebProxy
   if (`$bypassProxy) {
     [Net.WebRequest]::DefaultWebProxy = `$null
     `$attestationProxyMode = 'loopback_direct'
+    `$attestationTransport = 'tcp_loopback_http11'
   }
   `$requestHeaders = @{ Authorization = "Bearer `$normalizedAttestationToken" }
   if (`$bypassProxy) { `$requestHeaders['X-EDR-Uninstall-Token'] = `$normalizedAttestationToken }
   try {
     for (`$postAttempt = 0; `$postAttempt -lt 8 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
       `$attestationAttemptCount = `$postAttempt + 1
+      `$attestationLastHttpStatus = 0
       try {
-        `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
-          -Headers `$requestHeaders -Body `$body -TimeoutSec 5
+        if (`$bypassProxy) {
+          # Windows PowerShell 5.1 can silently suppress restricted headers and
+          # request bodies through its loopback WebRequest path under LocalSystem.
+          # The CI-only loopback listener needs a byte-exact HTTP request so it
+          # can verify the same token that crossed both native process handoffs.
+          `$attestationUri = [Uri]`$attestationURL
+          `$requestPath = if ([string]::IsNullOrEmpty(`$attestationUri.PathAndQuery)) {
+            '/'
+          } else {
+            `$attestationUri.PathAndQuery
+          }
+          `$requestAuthority = `$attestationUri.Authority
+          `$requestHead = "POST `$requestPath HTTP/1.1``r``n" +
+            "Host: `$requestAuthority``r``n" +
+            "Authorization: Bearer `$normalizedAttestationToken``r``n" +
+            "X-EDR-Uninstall-Token: `$normalizedAttestationToken``r``n" +
+            "Content-Type: application/json; charset=utf-8``r``n" +
+            "Content-Length: `$(`$bodyBytes.Length)``r``n" +
+            "Connection: close``r``n``r``n"
+          `$requestHeadBytes = [Text.Encoding]::ASCII.GetBytes(`$requestHead)
+          `$tcpClient = New-Object Net.Sockets.TcpClient
+          try {
+            `$tcpClient.NoDelay = `$true
+            `$tcpClient.ReceiveTimeout = 5000
+            `$tcpClient.SendTimeout = 5000
+            `$tcpClient.Connect(`$attestationUri.Host, `$attestationUri.Port)
+            `$networkStream = `$tcpClient.GetStream()
+            `$networkStream.Write(`$requestHeadBytes, 0, `$requestHeadBytes.Length)
+            `$networkStream.Write(`$bodyBytes, 0, `$bodyBytes.Length)
+            `$networkStream.Flush()
+            `$responseBytes = New-Object byte[] 4096
+            `$responseLength = 0
+            `$statusLine = ''
+            while (`$responseLength -lt `$responseBytes.Length -and -not `$statusLine) {
+              `$readCount = `$networkStream.Read(
+                `$responseBytes, `$responseLength, `$responseBytes.Length - `$responseLength)
+              if (`$readCount -le 0) { break }
+              `$responseLength += `$readCount
+              `$responseText = [Text.Encoding]::ASCII.GetString(`$responseBytes, 0, `$responseLength)
+              `$lineEnd = `$responseText.IndexOf("``r``n", [StringComparison]::Ordinal)
+              if (`$lineEnd -ge 0) { `$statusLine = `$responseText.Substring(0, `$lineEnd) }
+            }
+            if (`$statusLine -notmatch '^HTTP/1\.[01] ([0-9]{3})(?: |$)') {
+              throw "loopback attestation returned an invalid HTTP status line"
+            }
+            `$attestationLastHttpStatus = [int]`$Matches[1]
+            if (`$attestationLastHttpStatus -ne 200) {
+              throw "loopback attestation returned HTTP `$attestationLastHttpStatus"
+            }
+          } finally {
+            if (`$tcpClient) { `$tcpClient.Dispose() }
+          }
+        } else {
+          `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
+            -Headers `$requestHeaders -Body `$body -TimeoutSec 5
+          `$attestationLastHttpStatus = 200
+        }
         `$attestationStatus = 'succeeded'
         `$attestationError = ''
-        `$attestationLastHttpStatus = 200
       } catch {
         `$attestationStatus = 'failed'
         `$attestationError = `$_.Exception.Message
-        `$attestationLastHttpStatus = 0
-        if (`$_.Exception.Response -and `$_.Exception.Response.StatusCode) {
+        if (`$attestationLastHttpStatus -eq 0 -and
+            `$_.Exception.Response -and `$_.Exception.Response.StatusCode) {
           `$attestationLastHttpStatus = [int]`$_.Exception.Response.StatusCode
         }
         `$attestationErrors += ("attempt {0}: {1}" -f `$attestationAttemptCount, `$attestationError)
@@ -531,6 +591,8 @@ if (`$attestationStatus -eq 'failed') {
   attestation_last_http_status = `$attestationLastHttpStatus
   attestation_errors = @(`$attestationErrors)
   attestation_proxy_mode = `$attestationProxyMode
+  attestation_transport = `$attestationTransport
+  attestation_request_body_bytes = `$attestationRequestBodyBytes
   failure_reasons = @(`$failureReasons)
   lifecycle_task_id = `$taskID
   endpoint_id = `$endpointID
