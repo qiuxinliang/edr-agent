@@ -203,6 +203,10 @@ int main(void) {
                          "loopback callback transport must not inherit a machine proxy under LocalSystem");
   ok &= require_contains(uninstall_ps, "attestation_errors = @(`$attestationErrors)",
                          "cleanup receipt must retain the complete bounded attestation attempt history");
+  ok &= require_contains(uninstall_ps, "`$requestHeaders['X-EDR-Uninstall-Token']",
+                         "loopback callback must not depend on HTTP.sys exposing Authorization headers");
+  ok &= require_contains(uninstall_ps, "`$attestationLastHttpStatus -in @(400, 401, 403)",
+                         "deterministic callback authorization failures must not consume the retry window");
   ok &= require_contains(uninstall_ps, "failure_reasons = @(`$failureReasons)",
                          "deferred cleanup must report machine-readable terminal causes");
   ok &= require_contains(uninstall_ps,

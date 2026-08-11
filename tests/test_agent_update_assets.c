@@ -248,6 +248,12 @@ int main(void) {
            "callback listener survives unrelated or invalid requests until valid teardown proof arrives");
   contains(lifecycle_smoke, "uninstall-attestation-attempts.json",
            "callback listener persists sanitized diagnostics for every observed request");
+  contains(lifecycle_smoke, "function Normalize-AttestationToken",
+           "callback listener normalizes quoting introduced by Windows command-line handoffs");
+  contains(lifecycle_smoke, "X-EDR-Uninstall-Token",
+           "loopback lifecycle callback has an HTTP.sys-independent proof-of-token header");
+  contains(lifecycle_smoke, "expected_token_sha256",
+           "callback diagnostics compare token identities without disclosing token plaintext");
   contains(lifecycle_smoke, "attestation_error=$($cleanupResult.attestation_error)",
            "lifecycle failure output reports the exact attestation error");
   contains(lifecycle_smoke, "[int]$Seconds = 120",
@@ -335,6 +341,12 @@ int main(void) {
            "deferred cleanup retains every bounded callback failure");
   contains(uninstall_script, "attestation_proxy_mode = `$attestationProxyMode",
            "cleanup receipt identifies whether loopback direct transport was selected");
+  contains(uninstall_script, "`$requestHeaders['X-EDR-Uninstall-Token']",
+           "loopback callback sends a dedicated token header in addition to Authorization");
+  contains(uninstall_script, "attestation_last_http_status = `$attestationLastHttpStatus",
+           "cleanup receipt retains the terminal callback HTTP status");
+  contains(uninstall_script, "`$attestationLastHttpStatus -in @(400, 401, 403)",
+           "non-retryable callback authentication failures stop immediately");
   contains(uninstall_script, "failure_reasons = @(`$failureReasons)",
            "deferred cleanup emits machine-readable failure reasons");
   contains(uninstall_script, "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",

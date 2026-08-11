@@ -422,6 +422,7 @@ foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
 `$localSucceeded = (-not `$remaining) -and `$serviceRemoved -and `$processStopped
 `$attestationError = ''
 `$attestationAttemptCount = 0
+`$attestationLastHttpStatus = 0
 `$attestationErrors = @()
 `$attestationProxyMode = 'system'
 `$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) {
@@ -432,6 +433,12 @@ foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
   'skipped_local_teardown_failed'
 }
 if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
+  `$normalizedAttestationToken = `$attestationToken.Trim()
+  if (`$normalizedAttestationToken.Length -ge 2 -and
+      ((`$normalizedAttestationToken[0] -eq [char]34 -and `$normalizedAttestationToken[`$normalizedAttestationToken.Length - 1] -eq [char]34) -or
+       (`$normalizedAttestationToken[0] -eq [char]39 -and `$normalizedAttestationToken[`$normalizedAttestationToken.Length - 1] -eq [char]39))) {
+    `$normalizedAttestationToken = `$normalizedAttestationToken.Substring(1, `$normalizedAttestationToken.Length - 2).Trim()
+  }
   `$body = [ordered]@{
     schema = 'edr.endpoint.uninstall.attestation.v1'
     task_id = `$taskID
@@ -448,18 +455,26 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
     [Net.WebRequest]::DefaultWebProxy = `$null
     `$attestationProxyMode = 'loopback_direct'
   }
+  `$requestHeaders = @{ Authorization = "Bearer `$normalizedAttestationToken" }
+  if (`$bypassProxy) { `$requestHeaders['X-EDR-Uninstall-Token'] = `$normalizedAttestationToken }
   try {
     for (`$postAttempt = 0; `$postAttempt -lt 8 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
       `$attestationAttemptCount = `$postAttempt + 1
       try {
         `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
-          -Headers @{ Authorization = "Bearer `$attestationToken" } -Body `$body -TimeoutSec 5
+          -Headers `$requestHeaders -Body `$body -TimeoutSec 5
         `$attestationStatus = 'succeeded'
         `$attestationError = ''
+        `$attestationLastHttpStatus = 200
       } catch {
         `$attestationStatus = 'failed'
         `$attestationError = `$_.Exception.Message
+        `$attestationLastHttpStatus = 0
+        if (`$_.Exception.Response -and `$_.Exception.Response.StatusCode) {
+          `$attestationLastHttpStatus = [int]`$_.Exception.Response.StatusCode
+        }
         `$attestationErrors += ("attempt {0}: {1}" -f `$attestationAttemptCount, `$attestationError)
+        if (`$attestationLastHttpStatus -in @(400, 401, 403)) { break }
         if (`$postAttempt -lt 7) { Start-Sleep -Seconds 4 }
       }
     }
@@ -494,6 +509,7 @@ if (`$attestationStatus -eq 'failed') {
   attestation_status = `$attestationStatus
   attestation_error = `$attestationError
   attestation_attempts = `$attestationAttemptCount
+  attestation_last_http_status = `$attestationLastHttpStatus
   attestation_errors = @(`$attestationErrors)
   attestation_proxy_mode = `$attestationProxyMode
   failure_reasons = @(`$failureReasons)
