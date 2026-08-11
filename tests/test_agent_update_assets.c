@@ -221,6 +221,14 @@ int main(void) {
                "release workflow must not restore mutable CMake build outputs");
   contains(client_release, "Verify native uninstall attestation capabilities",
            "release workflow probes freshly built native uninstall components");
+  contains(client_release, "$env:EDR_RELEASE_ARCH -eq \"amd64\"",
+           "release workflow only executes native capability probes on the runner-compatible architecture");
+  contains(client_release, "$env:EDR_RELEASE_ARCH -eq \"arm64\"",
+           "release workflow explicitly selects static capability verification for ARM64");
+  contains(client_release, "unsupported native capability probe architecture",
+           "release workflow rejects unknown native target architectures");
+  contains(client_release, "ARM64 binary does not contain the required uninstall attestation capability marker",
+           "release workflow statically verifies capabilities for non-runnable ARM64 binaries");
   contains(client_release, "native-package-integrity.json",
            "release workflow packages native component SHA-256 identities");
   free(client_release);

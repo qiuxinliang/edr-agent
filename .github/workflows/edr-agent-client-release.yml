@@ -453,19 +453,39 @@ jobs:
             Test-Path -LiteralPath (Join-Path $_ "FDSecurityInstallerWorker.exe")
           } | Select-Object -First 1
           if (-not $outDir) { throw "native installer worker output directory not found" }
-          $workerProbe = Join-Path $env:RUNNER_TEMP "installer-worker-capabilities.json"
-          $uninstallerProbe = Join-Path $env:RUNNER_TEMP "headless-uninstaller-capabilities.json"
-          & (Join-Path $outDir "FDSecurityInstallerWorker.exe") --capability-probe $workerProbe
-          if ($LASTEXITCODE -ne 0) { throw "installer worker capability probe failed" }
-          & (Join-Path $outDir "uninstall.exe") --capability-probe $uninstallerProbe
-          if ($LASTEXITCODE -ne 0) { throw "headless uninstaller capability probe failed" }
-          $worker = Get-Content -LiteralPath $workerProbe -Raw | ConvertFrom-Json
-          $uninstaller = Get-Content -LiteralPath $uninstallerProbe -Raw | ConvertFrom-Json
-          if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
-            throw "installer worker does not implement uninstall attestation v2 token handoff"
-          }
-          if ($uninstaller.uninstall_attestation -ne "v2" -or $uninstaller.powershell_token_handoff -ne $true) {
-            throw "headless uninstaller does not implement uninstall attestation v2 PowerShell handoff"
+          $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
+          $uninstallerExe = Join-Path $outDir "uninstall.exe"
+          & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $workerExe -Architecture $env:EDR_RELEASE_ARCH
+          & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $uninstallerExe -Architecture $env:EDR_RELEASE_ARCH
+          if ($env:EDR_RELEASE_ARCH -eq "amd64") {
+            $workerProbe = Join-Path $env:RUNNER_TEMP "installer-worker-capabilities.json"
+            $uninstallerProbe = Join-Path $env:RUNNER_TEMP "headless-uninstaller-capabilities.json"
+            & $workerExe --capability-probe $workerProbe
+            if ($LASTEXITCODE -ne 0) { throw "installer worker capability probe failed" }
+            & $uninstallerExe --capability-probe $uninstallerProbe
+            if ($LASTEXITCODE -ne 0) { throw "headless uninstaller capability probe failed" }
+            $worker = Get-Content -LiteralPath $workerProbe -Raw | ConvertFrom-Json
+            $uninstaller = Get-Content -LiteralPath $uninstallerProbe -Raw | ConvertFrom-Json
+            if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
+              throw "installer worker does not implement uninstall attestation v2 token handoff"
+            }
+            if ($uninstaller.uninstall_attestation -ne "v2" -or $uninstaller.powershell_token_handoff -ne $true) {
+              throw "headless uninstaller does not implement uninstall attestation v2 PowerShell handoff"
+            }
+          } elseif ($env:EDR_RELEASE_ARCH -eq "arm64") {
+            foreach ($component in @(
+                @{ Name = "installer worker"; Path = $workerExe; Marker = '"token_handoff":true' },
+                @{ Name = "headless uninstaller"; Path = $uninstallerExe; Marker = '"powershell_token_handoff":true' }
+              )) {
+              $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($component.Path))
+              if (-not $binaryText.Contains('"schema":"edr.windows.native-capabilities.v1"') -or
+                  -not $binaryText.Contains('"uninstall_attestation":"v2"') -or
+                  -not $binaryText.Contains($component.Marker)) {
+                throw "$($component.Name) ARM64 binary does not contain the required uninstall attestation capability marker"
+              }
+            }
+          } else {
+            throw "unsupported native capability probe architecture: $env:EDR_RELEASE_ARCH"
           }
 
       - name: Verify HTTPS REST and SQLite compiled in
