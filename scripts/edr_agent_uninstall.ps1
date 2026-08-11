@@ -439,7 +439,8 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
        (`$normalizedAttestationToken[0] -eq [char]39 -and `$normalizedAttestationToken[`$normalizedAttestationToken.Length - 1] -eq [char]39))) {
     `$normalizedAttestationToken = `$normalizedAttestationToken.Substring(1, `$normalizedAttestationToken.Length - 2).Trim()
   }
-  `$body = [ordered]@{
+  `$bypassProxy = ([Uri]`$attestationURL).IsLoopback
+  `$bodyFields = [ordered]@{
     schema = 'edr.endpoint.uninstall.attestation.v1'
     task_id = `$taskID
     endpoint_id = `$endpointID
@@ -447,10 +448,23 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
     process_stopped = `$processStopped
     install_dir_removed = (-not `$remaining)
     completed_at = `$teardownCompletedAt
-  } | ConvertTo-Json -Compress
+  }
+  if (`$bypassProxy) {
+    `$proofKey = [Text.Encoding]::UTF8.GetBytes(`$normalizedAttestationToken)
+    `$proofMessage = [Text.Encoding]::UTF8.GetBytes(
+      "edr.endpoint.uninstall.attestation.v1``n`$taskID``n`$endpointID")
+    `$proofHmac = New-Object Security.Cryptography.HMACSHA256 -ArgumentList (,`$proofKey)
+    try {
+      `$tokenProofRaw = [BitConverter]::ToString(`$proofHmac.ComputeHash(`$proofMessage))
+      `$tokenProof = `$tokenProofRaw.Replace('-', '').ToLowerInvariant()
+      `$bodyFields.token_proof_hmac_sha256 = `$tokenProof
+    } finally {
+      `$proofHmac.Dispose()
+    }
+  }
+  `$body = `$bodyFields | ConvertTo-Json -Compress
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   `$originalDefaultProxy = [Net.WebRequest]::DefaultWebProxy
-  `$bypassProxy = ([Uri]`$attestationURL).IsLoopback
   if (`$bypassProxy) {
     [Net.WebRequest]::DefaultWebProxy = `$null
     `$attestationProxyMode = 'loopback_direct'

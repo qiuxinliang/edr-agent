@@ -254,6 +254,14 @@ int main(void) {
            "loopback lifecycle callback has an HTTP.sys-independent proof-of-token header");
   contains(lifecycle_smoke, "expected_token_sha256",
            "callback diagnostics compare token identities without disclosing token plaintext");
+  contains(lifecycle_smoke, "Get-UninstallAttestationProof",
+           "lifecycle callback binds a header-independent HMAC proof to the task and endpoint");
+  contains(lifecycle_smoke, "body_token_proof_valid",
+           "lifecycle callback reports whether the HMAC body proof matched");
+  contains(lifecycle_smoke, "token_valid = $tokenValid",
+           "lifecycle callback distinguishes overall token proof from the Authorization transport");
+  contains(lifecycle_smoke, "[Guid]::NewGuid().ToString(\"N\")",
+           "lifecycle uses a fresh one-time attestation token for each run");
   contains(lifecycle_smoke, "attestation_error=$($cleanupResult.attestation_error)",
            "lifecycle failure output reports the exact attestation error");
   contains(lifecycle_smoke, "[int]$Seconds = 120",
@@ -361,6 +369,10 @@ int main(void) {
            "deferred cleanup persists a result outside the removed program directory");
   contains(uninstall_script, "edr.endpoint.uninstall.attestation.v1",
            "deferred cleanup reports positive service, process and directory teardown proof");
+  contains(uninstall_script, "`$bodyFields.token_proof_hmac_sha256 = `$tokenProof",
+           "loopback cleanup proves one-time token possession in the attestation body");
+  contains(uninstall_script, "Security.Cryptography.HMACSHA256",
+           "deferred cleanup uses HMAC-SHA256 for the header-independent token proof");
   contains(uninstall_script, "Invoke-RestMethod -Uri `$attestationURL",
            "deferred cleanup posts its one-time completion attestation");
   contains(uninstall_script, "Skipped unrelated $name process PID",

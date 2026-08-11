@@ -181,6 +181,10 @@ int main(void) {
                          "uninstall must remove the forensic prefetch retry machine setting");
   ok &= require_contains(uninstall_ps, "edr.endpoint.uninstall.attestation.v1",
                          "uninstall must attest positive local teardown after deferred cleanup");
+  ok &= require_contains(uninstall_ps, "`$bodyFields.token_proof_hmac_sha256 = `$tokenProof",
+                         "loopback uninstall attestation must carry a header-independent token proof");
+  ok &= require_contains(uninstall_ps, "Security.Cryptography.HMACSHA256",
+                         "uninstall attestation body proof must use HMAC-SHA256");
   ok &= require_contains(uninstall_ps, "Skipped unrelated $name process PID",
                          "uninstall must scope process termination to the target installation");
   ok &= require_contains(uninstall_ps, "ETW cleanup returned exit code $LASTEXITCODE; continuing uninstall",
