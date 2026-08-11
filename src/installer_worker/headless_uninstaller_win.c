@@ -67,6 +67,52 @@ static int join_path(wchar_t *out, size_t out_count, const wchar_t *dir, const w
   return 1;
 }
 
+static int ensure_directory(const wchar_t *path) {
+  if (CreateDirectoryW(path, NULL)) return 1;
+  return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static int get_powershell_log_path(wchar_t *out, size_t out_count) {
+  wchar_t program_data[MAX_PATH * 2];
+  wchar_t vendor_dir[MAX_PATH * 3];
+  wchar_t state_dir[MAX_PATH * 3];
+  DWORD n = GetEnvironmentVariableW(L"ProgramData", program_data,
+                                    (DWORD)(sizeof(program_data) / sizeof(program_data[0])));
+  if (n == 0 || n >= sizeof(program_data) / sizeof(program_data[0])) return 0;
+  if (!join_path(vendor_dir, sizeof(vendor_dir) / sizeof(vendor_dir[0]),
+                 program_data, L"FDSecurity") ||
+      !ensure_directory(vendor_dir) ||
+      !join_path(state_dir, sizeof(state_dir) / sizeof(state_dir[0]),
+                 vendor_dir, L"state") ||
+      !ensure_directory(state_dir)) {
+    return 0;
+  }
+  return join_path(out, out_count, state_dir, L"uninstall-powershell-last.log");
+}
+
+static void append_utf8_line(const wchar_t *path, const wchar_t *line) {
+  HANDLE file;
+  int size;
+  char *utf8;
+  DWORD written = 0;
+  if (!path || !path[0] || !line) return;
+  file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE) return;
+  size = WideCharToMultiByte(CP_UTF8, 0, line, -1, NULL, 0, NULL, NULL);
+  if (size > 1) {
+    utf8 = (char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)size + 2);
+    if (utf8) {
+      WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, size, NULL, NULL);
+      utf8[size - 1] = '\r';
+      utf8[size] = '\n';
+      WriteFile(file, utf8, (DWORD)size + 1, &written, NULL);
+      HeapFree(GetProcessHeap(), 0, utf8);
+    }
+  }
+  CloseHandle(file);
+}
+
 static int append_text(wchar_t *out, size_t out_count, size_t *used, const wchar_t *text) {
   size_t n;
   if (!out || !used || !text) return 0;
@@ -186,9 +232,14 @@ static int wait_for_process(HANDLE process) {
 static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *parameters,
                                  const wchar_t *install_dir, int silent) {
   wchar_t command[32768];
+  wchar_t diagnostic_path[MAX_PATH * 4];
   size_t used = 0;
   STARTUPINFOW startup;
   PROCESS_INFORMATION process;
+  SECURITY_ATTRIBUTES security;
+  HANDLE diagnostic = INVALID_HANDLE_VALUE;
+  HANDLE input = INVALID_HANDLE_VALUE;
+  BOOL inherit_handles = FALSE;
   if (!append_quoted_arg(command, sizeof(command) / sizeof(command[0]), &used,
                          powershell_path) ||
       !append_text(command, sizeof(command) / sizeof(command[0]), &used, L" ") ||
@@ -200,12 +251,48 @@ static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *
   startup.cb = sizeof(startup);
   startup.dwFlags = STARTF_USESHOWWINDOW;
   startup.wShowWindow = silent ? SW_HIDE : SW_SHOWNORMAL;
-  if (!CreateProcessW(powershell_path, command, NULL, NULL, FALSE,
-                      silent ? CREATE_NO_WINDOW : 0, NULL, install_dir, &startup, &process)) {
-    return (int)GetLastError();
+  diagnostic_path[0] = L'\0';
+  if (get_powershell_log_path(diagnostic_path,
+                              sizeof(diagnostic_path) / sizeof(diagnostic_path[0]))) {
+    DeleteFileW(diagnostic_path);
+    append_utf8_line(diagnostic_path, L"uninstall_powershell_launch mode=direct elevated=true");
+    ZeroMemory(&security, sizeof(security));
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+    diagnostic = CreateFileW(diagnostic_path, FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             &security, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (diagnostic != INVALID_HANDLE_VALUE) {
+      input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+      if (input != INVALID_HANDLE_VALUE) {
+        startup.dwFlags |= STARTF_USESTDHANDLES;
+        startup.hStdInput = input;
+        startup.hStdOutput = diagnostic;
+        startup.hStdError = diagnostic;
+        inherit_handles = TRUE;
+      }
+    }
   }
+  if (!CreateProcessW(powershell_path, command, NULL, NULL, inherit_handles,
+                      silent ? CREATE_NO_WINDOW : 0, NULL, install_dir, &startup, &process)) {
+    int error = (int)GetLastError();
+    if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+    if (diagnostic != INVALID_HANDLE_VALUE) CloseHandle(diagnostic);
+    return error;
+  }
+  if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+  if (diagnostic != INVALID_HANDLE_VALUE) CloseHandle(diagnostic);
   CloseHandle(process.hThread);
-  return wait_for_process(process.hProcess);
+  {
+    int rc = wait_for_process(process.hProcess);
+    wchar_t result[128];
+    _snwprintf(result, sizeof(result) / sizeof(result[0]),
+               L"uninstall_powershell_exit_code=%d", rc);
+    result[(sizeof(result) / sizeof(result[0])) - 1] = L'\0';
+    append_utf8_line(diagnostic_path, result);
+    return rc;
+  }
 }
 
 static int run_uninstall_script(const wchar_t *script, const wchar_t *install_dir,
@@ -217,6 +304,7 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
   wchar_t parameters[32768];
   wchar_t system_dir[MAX_PATH * 2];
   wchar_t powershell_path[MAX_PATH * 4];
+  wchar_t diagnostic_path[MAX_PATH * 4];
   SHELLEXECUTEINFOW exec_info;
   if (!build_powershell_parameters(parameters, sizeof(parameters) / sizeof(parameters[0]), script,
                                    install_dir, service_name, GetCurrentProcessId(), keep_data,
@@ -238,6 +326,14 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
     return run_powershell_direct(powershell_path, parameters, install_dir, silent);
   }
 
+  diagnostic_path[0] = L'\0';
+  if (get_powershell_log_path(diagnostic_path,
+                              sizeof(diagnostic_path) / sizeof(diagnostic_path[0]))) {
+    DeleteFileW(diagnostic_path);
+    append_utf8_line(diagnostic_path,
+                     L"uninstall_powershell_launch mode=runas elevated=false");
+  }
+
   ZeroMemory(&exec_info, sizeof(exec_info));
   exec_info.cbSize = sizeof(exec_info);
   exec_info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
@@ -249,7 +345,15 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
   exec_info.nShow = silent ? SW_HIDE : SW_SHOWNORMAL;
   if (!ShellExecuteExW(&exec_info)) return (int)GetLastError();
   if (!exec_info.hProcess) return ERROR_INVALID_HANDLE;
-  return wait_for_process(exec_info.hProcess);
+  {
+    int rc = wait_for_process(exec_info.hProcess);
+    wchar_t result[128];
+    _snwprintf(result, sizeof(result) / sizeof(result[0]),
+               L"uninstall_powershell_exit_code=%d", rc);
+    result[(sizeof(result) / sizeof(result[0])) - 1] = L'\0';
+    append_utf8_line(diagnostic_path, result);
+    return rc;
+  }
 }
 
 static void show_error(int silent, const wchar_t *message, DWORD code) {

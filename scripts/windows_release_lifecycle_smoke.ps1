@@ -275,6 +275,7 @@ try {
   $lifecycleLog = Join-Path $installDir "diagnostics\lifecycle-worker.log"
   $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-last.json"
   $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-last.json"
+  $uninstallPowerShellLog = Join-Path $programDataState "uninstall-powershell-last.log"
   $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
   $attestationPort = Get-Random -Minimum 32000 -Maximum 45000
   $attestationURL = "http://127.0.0.1:$attestationPort/uninstall-attest/"
@@ -304,7 +305,8 @@ try {
   } -ArgumentList $attestationPort, $attestationEvidence
   New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
   New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
-  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt, $uninstallPowerShellLog `
+    -Force -ErrorAction SilentlyContinue
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
   Copy-Item -LiteralPath $targetUninstallScript -Destination (Join-Path $installDir "uninstall.ps1") -Force
@@ -335,6 +337,11 @@ try {
       } catch {
         $uninstallFailure = "; uninstall diagnostic receipt was not valid JSON"
       }
+    }
+    if (Test-Path -LiteralPath $uninstallPowerShellLog -PathType Leaf) {
+      Copy-Item -LiteralPath $uninstallPowerShellLog -Destination $EvidenceDir -Force
+      Write-Host "--- uninstall PowerShell output ---"
+      Get-Content -LiteralPath $uninstallPowerShellLog | Out-Host
     }
     if (Test-Path -LiteralPath $lifecycleJournal -PathType Leaf) {
       Copy-Item -LiteralPath $lifecycleJournal -Destination $EvidenceDir -Force
@@ -368,7 +375,11 @@ try {
       $attestationResult.body.install_dir_removed -ne $true) {
     throw "uninstall attestation callback did not contain complete local teardown proof"
   }
-  Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt -Destination $EvidenceDir -Force
+  Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt `
+    -Destination $EvidenceDir -Force
+  if (Test-Path -LiteralPath $uninstallPowerShellLog -PathType Leaf) {
+    Copy-Item -LiteralPath $uninstallPowerShellLog -Destination $EvidenceDir -Force
+  }
 
   $stage = "completed"
   [ordered]@{
@@ -407,7 +418,7 @@ try {
   foreach ($root in @($programDataState, $programDataLogs)) {
     if (Test-Path -LiteralPath $root) {
       Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue |
-        Where-Object Name -Match "agent-update-ci-|agent-lifecycle-|uninstall-(script|cleanup)-last" |
+        Where-Object Name -Match "agent-update-ci-|agent-lifecycle-|uninstall-(script|cleanup|powershell)-last" |
         Copy-Item -Destination $EvidenceDir -Force -ErrorAction SilentlyContinue
     }
   }

@@ -180,6 +180,8 @@ int main(void) {
                          "ACL repair helper failures must defer to final deletion proof");
   ok &= require_absent(uninstall_ps, "Add-CriticalFailure (\"ETW cleanup failed:",
                        "best-effort ETW cleanup must never become a terminal uninstall failure");
+  ok &= require_absent(uninstall_ps, "System.Collections.Generic.HashSet",
+                       "Windows PowerShell 5.1 uninstall initialization must not depend on generic type construction");
   free(uninstall_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");
@@ -188,6 +190,10 @@ int main(void) {
                          "headless uninstall prompts must use the Unicode Windows API");
   ok &= require_absent(headless_uninstaller, "MessageBoxA(",
                        "headless uninstall prompts must never use the ANSI Windows API");
+  ok &= require_contains(headless_uninstaller, "uninstall-powershell-last.log",
+                         "native uninstall must capture PowerShell output outside the removable install directory");
+  ok &= require_contains(headless_uninstaller, "STARTF_USESTDHANDLES",
+                         "native uninstall must redirect child stdout and stderr for actionable CI diagnostics");
   free(headless_uninstaller);
 
   char *cmake = read_source(root, "CMakeLists.txt");

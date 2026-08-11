@@ -263,6 +263,8 @@ int main(void) {
            "native uninstall forwards the exact lifecycle service name");
   contains(uninstaller, "-AttestationToken",
            "native uninstall forwards the task-pinned one-time attestation secret");
+  contains(uninstaller, "uninstall-powershell-last.log",
+           "native uninstall preserves PowerShell output outside the removed program directory");
   free(uninstaller);
 
   snprintf(path, sizeof(path), "%s/scripts/edr_agent_uninstall.ps1", root);

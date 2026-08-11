@@ -31,23 +31,25 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$script:CriticalErrors = New-Object System.Collections.Generic.List[string]
-$script:TargetProcessIds = New-Object System.Collections.Generic.HashSet[int]
+$script:CriticalErrors = @()
+$script:TargetProcessIds = @()
 $script:UninstallStage = "initialization"
-
-if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-  $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-}
-$InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
-$ConfigPath = Join-Path $InstallDir "agent.toml"
 $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
 $script:UninstallReceiptPath = Join-Path $programData "FDSecurity\state\uninstall-script-last.json"
+$ConfigPath = ""
 
 function Add-CriticalFailure {
   param([string]$Message)
   if (-not [string]::IsNullOrWhiteSpace($Message)) {
-    $script:CriticalErrors.Add($Message)
+    $script:CriticalErrors += $Message
     Write-Warning $Message
+  }
+}
+
+function Add-TargetProcessId {
+  param([int]$ProcessId)
+  if ($ProcessId -gt 0 -and $script:TargetProcessIds -notcontains $ProcessId) {
+    $script:TargetProcessIds += $ProcessId
   }
 }
 
@@ -153,8 +155,8 @@ function Stop-AgentProcesses {
       $processId = [int]$_.ProcessId
       $path = [string]$_.ExecutablePath
       $pathMatches = $path -and $path.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)
-      if ($script:TargetProcessIds.Contains($processId) -or $pathMatches) {
-        $null = $script:TargetProcessIds.Add($processId)
+      if (($script:TargetProcessIds -contains $processId) -or $pathMatches) {
+        Add-TargetProcessId -ProcessId $processId
         try {
           Stop-Process -Id $processId -Force -ErrorAction Stop
         } catch {
@@ -195,7 +197,7 @@ function Remove-AgentServices {
     $escapedName = $name.Replace("'", "''")
     $serviceCim = Get-CimInstance Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue
     if ($serviceCim -and [int]$serviceCim.ProcessId -gt 0) {
-      $null = $script:TargetProcessIds.Add([int]$serviceCim.ProcessId)
+      Add-TargetProcessId -ProcessId ([int]$serviceCim.ProcessId)
     }
     $service = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $service) { continue }
@@ -214,8 +216,13 @@ function Remove-AgentServices {
     }
     $deleteExitCode = 0
     for ($attempt = 0; $attempt -lt 3; $attempt++) {
-      $deleteOutput = (& sc.exe delete $name 2>&1 | Out-String).Trim()
-      $deleteExitCode = $LASTEXITCODE
+      try {
+        $deleteOutput = (& sc.exe delete $name 2>&1 | Out-String).Trim()
+        $deleteExitCode = $LASTEXITCODE
+      } catch {
+        $deleteOutput = $_.Exception.Message
+        $deleteExitCode = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+      }
       if ($deleteOutput) { Write-Host $deleteOutput }
       if (Wait-AgentServiceDeleted -Name $name -TimeoutSeconds 1) { break }
       Start-Sleep -Seconds 1
@@ -474,6 +481,11 @@ function Remove-AgentData {
 }
 
 try {
+  if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+  }
+  $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
+  $ConfigPath = Join-Path $InstallDir "agent.toml"
   $script:UninstallStage = "admin_check"
   Assert-Admin
   Write-Host "Uninstalling FDSecurity runtime from $InstallDir"
