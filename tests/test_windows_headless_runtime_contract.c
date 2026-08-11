@@ -41,6 +41,15 @@ static int require_absent(const char *text, const char *needle, const char *mess
   return 0;
 }
 
+static int require_utf8_bom(const char *text, const char *message) {
+  if (text && (unsigned char)text[0] == 0xef &&
+      (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf) {
+    return 1;
+  }
+  fprintf(stderr, "FAIL: %s (missing UTF-8 BOM)\n", message);
+  return 0;
+}
+
 static char *read_source(const char *root, const char *relative) {
   char path[1400];
   snprintf(path, sizeof(path), "%s/%s", root, relative);
@@ -146,6 +155,8 @@ int main(void) {
 
   char *installer_ps = read_source(root, "scripts/edr_agent_install.ps1");
   if (!installer_ps) return 1;
+  ok &= require_utf8_bom(installer_ps,
+                         "non-ASCII enrollment script must retain a UTF-8 BOM for Windows PowerShell 5.1");
   ok &= require_contains(installer_ps, "Repair-RuntimeFileAcls -Path $path",
                          "headless enrollment must repair explicit ACLs on existing queue DB sidecars");
   ok &= require_contains(installer_ps, "if ($sub -eq \"queue\") { throw }",

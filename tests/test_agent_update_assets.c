@@ -248,6 +248,15 @@ int main(void) {
            "lifecycle validates release script grammar before mutating Windows services");
   free(lifecycle_smoke);
 
+  snprintf(path, sizeof(path), "%s/scripts/validate_windows_powershell_syntax.ps1", root);
+  char *powershell_validator = read_file(path);
+  require_true(powershell_validator != NULL, "read Windows PowerShell syntax validator");
+  contains(powershell_validator, "Management.Automation.Language.Parser]::ParseFile",
+           "release validation uses the Windows PowerShell parser");
+  contains(powershell_validator, "Non-ASCII Windows PowerShell 5.1 script must be UTF-8 with BOM",
+           "release validation rejects ambiguous ANSI decoding of non-ASCII runtime scripts");
+  free(powershell_validator);
+
   snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
   char *uninstaller = read_file(path);
   require_true(uninstaller != NULL, "read headless uninstaller implementation");

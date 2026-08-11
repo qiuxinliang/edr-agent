@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   独立运行：调用 POST /api/v1/enroll，生成 agent.toml（不依赖 Python）。
