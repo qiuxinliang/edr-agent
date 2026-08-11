@@ -290,6 +290,12 @@ int main(void) {
            "deferred cleanup posts its one-time completion attestation");
   contains(uninstall_script, "Skipped unrelated $name process PID",
            "uninstall never kills an unrelated same-name process by image name alone");
+  contains(uninstall_script, "uninstall-script-last.json",
+           "uninstall persists a stage-specific synchronous failure receipt outside program files");
+  contains(uninstall_script, "continuing uninstall",
+           "best-effort ETW cleanup cannot block verified service and directory removal");
+  contains(uninstall_script, "exit 0",
+           "handled native helper warnings cannot leak a stale process exit code");
   free(uninstall_script);
 
   snprintf(path, sizeof(path), "%s/src/installer_worker/installer_worker_win.c", root);

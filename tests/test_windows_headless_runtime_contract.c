@@ -172,6 +172,14 @@ int main(void) {
                          "uninstall must attest positive local teardown after deferred cleanup");
   ok &= require_contains(uninstall_ps, "Skipped unrelated $name process PID",
                          "uninstall must scope process termination to the target installation");
+  ok &= require_contains(uninstall_ps, "ETW cleanup returned exit code $LASTEXITCODE; continuing uninstall",
+                         "best-effort ETW cleanup must not poison complete uninstall status");
+  ok &= require_contains(uninstall_ps, "uninstall-script-last.json",
+                         "uninstall must persist the exact synchronous failure stage outside program files");
+  ok &= require_contains(uninstall_ps, "Add-CleanupWarning (\"Failed to reset install directory ACL:",
+                         "ACL repair helper failures must defer to final deletion proof");
+  ok &= require_absent(uninstall_ps, "Add-CriticalFailure (\"ETW cleanup failed:",
+                       "best-effort ETW cleanup must never become a terminal uninstall failure");
   free(uninstall_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");

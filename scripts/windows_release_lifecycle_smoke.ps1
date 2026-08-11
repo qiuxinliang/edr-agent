@@ -274,6 +274,7 @@ try {
   $lifecycleJournal = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.journal.json"
   $lifecycleLog = Join-Path $installDir "diagnostics\lifecycle-worker.log"
   $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-last.json"
+  $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-last.json"
   $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
   $attestationPort = Get-Random -Minimum 32000 -Maximum 45000
   $attestationURL = "http://127.0.0.1:$attestationPort/uninstall-attest/"
@@ -303,7 +304,7 @@ try {
   } -ArgumentList $attestationPort, $attestationEvidence
   New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
   New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
-  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt -Force -ErrorAction SilentlyContinue
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
   Copy-Item -LiteralPath $targetUninstallScript -Destination (Join-Path $installDir "uninstall.ps1") -Force
@@ -324,7 +325,21 @@ try {
     ) -Wait -PassThru
   if ($worker.ExitCode -ne 0) {
     if (Test-Path -LiteralPath $lifecycleLog) { Get-Content -LiteralPath $lifecycleLog | Out-Host }
-    throw "lifecycle uninstall worker returned code $($worker.ExitCode)"
+    $uninstallFailure = ""
+    if (Test-Path -LiteralPath $uninstallScriptReceipt -PathType Leaf) {
+      Copy-Item -LiteralPath $uninstallScriptReceipt -Destination $EvidenceDir -Force
+      Get-Content -LiteralPath $uninstallScriptReceipt | Out-Host
+      try {
+        $uninstallResult = Get-Content -LiteralPath $uninstallScriptReceipt -Raw | ConvertFrom-Json
+        $uninstallFailure = "; uninstall stage '$($uninstallResult.stage)': $($uninstallResult.error)"
+      } catch {
+        $uninstallFailure = "; uninstall diagnostic receipt was not valid JSON"
+      }
+    }
+    if (Test-Path -LiteralPath $lifecycleJournal -PathType Leaf) {
+      Copy-Item -LiteralPath $lifecycleJournal -Destination $EvidenceDir -Force
+    }
+    throw "lifecycle uninstall worker returned code $($worker.ExitCode)$uninstallFailure"
   }
   if (-not (Test-Path -LiteralPath $lifecycleJournal -PathType Leaf)) {
     throw "lifecycle uninstall worker did not write its terminal journal"
@@ -353,7 +368,7 @@ try {
       $attestationResult.body.install_dir_removed -ne $true) {
     throw "uninstall attestation callback did not contain complete local teardown proof"
   }
-  Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt -Destination $EvidenceDir -Force
+  Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt -Destination $EvidenceDir -Force
 
   $stage = "completed"
   [ordered]@{
@@ -392,7 +407,7 @@ try {
   foreach ($root in @($programDataState, $programDataLogs)) {
     if (Test-Path -LiteralPath $root) {
       Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue |
-        Where-Object Name -Match "agent-update-ci-" |
+        Where-Object Name -Match "agent-update-ci-|agent-lifecycle-|uninstall-(script|cleanup)-last" |
         Copy-Item -Destination $EvidenceDir -Force -ErrorAction SilentlyContinue
     }
   }

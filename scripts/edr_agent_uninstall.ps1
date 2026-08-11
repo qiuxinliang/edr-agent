@@ -33,18 +33,58 @@ param(
 $ErrorActionPreference = "Stop"
 $script:CriticalErrors = New-Object System.Collections.Generic.List[string]
 $script:TargetProcessIds = New-Object System.Collections.Generic.HashSet[int]
+$script:UninstallStage = "initialization"
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 $ConfigPath = Join-Path $InstallDir "agent.toml"
+$programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
+$script:UninstallReceiptPath = Join-Path $programData "FDSecurity\state\uninstall-script-last.json"
 
 function Add-CriticalFailure {
   param([string]$Message)
   if (-not [string]::IsNullOrWhiteSpace($Message)) {
     $script:CriticalErrors.Add($Message)
     Write-Warning $Message
+  }
+}
+
+function Add-CleanupWarning {
+  param([string]$Message)
+  if (-not [string]::IsNullOrWhiteSpace($Message)) {
+    Write-Warning $Message
+  }
+}
+
+function Write-UninstallScriptReceipt {
+  param(
+    [string]$Status,
+    [string]$ErrorMessage = "",
+    [string]$ErrorType = "",
+    [string]$ErrorPosition = ""
+  )
+  try {
+    $parent = Split-Path -Parent $script:UninstallReceiptPath
+    New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+    [ordered]@{
+      schema = "edr.agent.uninstall.script.v1"
+      completed_at = [DateTime]::UtcNow.ToString("o")
+      status = $Status
+      stage = $script:UninstallStage
+      install_dir = $InstallDir
+      service_name = $ServiceName
+      remove_data = [bool]$RemoveData
+      remove_program_files = [bool]$RemoveProgramFiles
+      error = $ErrorMessage
+      error_type = $ErrorType
+      error_position = $ErrorPosition
+      critical_errors = @($script:CriticalErrors)
+    } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $script:UninstallReceiptPath `
+      -Encoding UTF8 -Force -ErrorAction Stop
+  } catch {
+    Write-Warning ("Unable to persist uninstall diagnostic receipt: " + $_.Exception.Message)
   }
 }
 
@@ -96,9 +136,11 @@ function Invoke-AgentEtwUninstallCleanup {
     if (-not (Test-Path -LiteralPath $exe)) { continue }
     try {
       & $exe --etw-uninstall-cleanup | Out-Host
-      if ($LASTEXITCODE -ne 0) { throw "ETW cleanup returned exit code $LASTEXITCODE" }
+      if ($LASTEXITCODE -ne 0) {
+        Add-CleanupWarning "ETW cleanup returned exit code $LASTEXITCODE; continuing uninstall"
+      }
     } catch {
-      Add-CriticalFailure ("ETW cleanup failed: " + $_.Exception.Message)
+      Add-CleanupWarning ("ETW cleanup failed: " + $_.Exception.Message + "; continuing uninstall")
     }
     break
   }
@@ -276,7 +318,7 @@ function Grant-InstallDirectoryRemovalRights {
     & takeown.exe /F $InstallDir /A /R /D Y | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "takeown.exe returned exit code $LASTEXITCODE" }
   } catch {
-    Add-CriticalFailure ("Failed to take ownership of install directory: " + $_.Exception.Message)
+    Add-CleanupWarning ("Failed to take ownership of install directory: " + $_.Exception.Message)
   }
   try {
     & icacls.exe $InstallDir /inheritance:e /T /C /Q | Out-Null
@@ -284,13 +326,13 @@ function Grant-InstallDirectoryRemovalRights {
     & icacls.exe $InstallDir /reset /T /C /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "icacls reset returned exit code $LASTEXITCODE" }
   } catch {
-    Add-CriticalFailure ("Failed to reset install directory ACL: " + $_.Exception.Message)
+    Add-CleanupWarning ("Failed to reset install directory ACL: " + $_.Exception.Message)
   }
   try {
     & icacls.exe $InstallDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "icacls grant returned exit code $LASTEXITCODE" }
   } catch {
-    Add-CriticalFailure ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
+    Add-CleanupWarning ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
   }
   Get-ChildItem -LiteralPath $InstallDir -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
     try { $_.Attributes = [IO.FileAttributes]::Normal } catch {}
@@ -431,39 +473,72 @@ function Remove-AgentData {
   }
 }
 
-Assert-Admin
-Write-Host "Uninstalling FDSecurity runtime from $InstallDir"
-Remove-AgentServices
-Remove-AgentScheduledTasks
-Stop-AgentProcesses
-Invoke-AgentEtwUninstallCleanup
-Remove-AgentClientCertificate
-Remove-MachineEnvironment
-Remove-HeadlessUninstallRegistration
-$diagnosticArchive = ""
-if ($PreserveDiagnostics) {
-  $diagnosticArchive = Export-AgentDiagnostics
-}
-if ($RemoveData -or $RemoveProgramFiles) {
-  Grant-InstallDirectoryRemovalRights
-}
-if ($RemoveData) {
-  Remove-AgentData
-} elseif ($PreserveDiagnostics) {
-  Write-Host "Only logs and diagnostics were archived; credentials, configuration and runtime state will not be retained."
-} else {
-  Write-Host "Runtime data preserved. Use -RemoveData to remove config, certificates, queue, evidence and logs."
-}
-if ($script:CriticalErrors.Count -gt 0) {
-  throw ("Uninstall stopped after critical cleanup failures: " + ($script:CriticalErrors -join "; "))
-}
-if ($RemoveProgramFiles) {
-  Start-DeferredProgramFilesRemoval
-  if ($diagnosticArchive) {
-    Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal; diagnostics archive: $diagnosticArchive"
-  } else {
-    Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal."
+try {
+  $script:UninstallStage = "admin_check"
+  Assert-Admin
+  Write-Host "Uninstalling FDSecurity runtime from $InstallDir"
+
+  $script:UninstallStage = "service_cleanup"
+  Remove-AgentServices
+  $script:UninstallStage = "scheduled_task_cleanup"
+  Remove-AgentScheduledTasks
+  $script:UninstallStage = "process_cleanup"
+  Stop-AgentProcesses
+  $script:UninstallStage = "etw_cleanup"
+  Invoke-AgentEtwUninstallCleanup
+  $script:UninstallStage = "identity_cleanup"
+  Remove-AgentClientCertificate
+  $script:UninstallStage = "environment_cleanup"
+  Remove-MachineEnvironment
+  $script:UninstallStage = "registration_cleanup"
+  Remove-HeadlessUninstallRegistration
+
+  $diagnosticArchive = ""
+  if ($PreserveDiagnostics) {
+    $script:UninstallStage = "diagnostics_archive"
+    $diagnosticArchive = Export-AgentDiagnostics
   }
-} else {
-  Write-Host "FDSecurity runtime unregistered successfully. Program files remain in place for audit/recovery."
+  if ($RemoveData -or $RemoveProgramFiles) {
+    $script:UninstallStage = "acl_preparation"
+    Grant-InstallDirectoryRemovalRights
+  }
+  if ($RemoveData) {
+    $script:UninstallStage = "runtime_data_cleanup"
+    Remove-AgentData
+  } elseif ($PreserveDiagnostics) {
+    Write-Host "Only logs and diagnostics were archived; credentials, configuration and runtime state will not be retained."
+  } else {
+    Write-Host "Runtime data preserved. Use -RemoveData to remove config, certificates, queue, evidence and logs."
+  }
+  if ($script:CriticalErrors.Count -gt 0) {
+    throw ("Uninstall stopped after critical cleanup failures: " + ($script:CriticalErrors -join "; "))
+  }
+  if ($RemoveProgramFiles) {
+    $script:UninstallStage = "deferred_program_files_cleanup"
+    Start-DeferredProgramFilesRemoval
+    $script:UninstallStage = "deferred_cleanup_scheduled"
+    if ($diagnosticArchive) {
+      Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal; diagnostics archive: $diagnosticArchive"
+    } else {
+      Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal."
+    }
+  } else {
+    $script:UninstallStage = "completed"
+    Write-Host "FDSecurity runtime unregistered successfully. Program files remain in place for audit/recovery."
+  }
+  Write-UninstallScriptReceipt -Status "accepted"
+} catch {
+  $failure = $_
+  $failureType = $failure.Exception.GetType().FullName
+  $failurePosition = $failure.InvocationInfo.PositionMessage
+  Write-UninstallScriptReceipt -Status "failed" `
+    -ErrorMessage $failure.Exception.Message `
+    -ErrorType $failureType `
+    -ErrorPosition $failurePosition
+  Write-Error -ErrorRecord $failure -ErrorAction Continue
+  exit 1
 }
+
+# Do not let a handled best-effort native helper exit code leak through
+# powershell.exe after all required teardown assertions were accepted.
+exit 0
