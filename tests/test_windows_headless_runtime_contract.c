@@ -182,6 +182,10 @@ int main(void) {
                        "best-effort ETW cleanup must never become a terminal uninstall failure");
   ok &= require_absent(uninstall_ps, "System.Collections.Generic.HashSet",
                        "Windows PowerShell 5.1 uninstall initialization must not depend on generic type construction");
+  ok &= require_contains(uninstall_ps, "PID ${processId}:",
+                         "PowerShell variables immediately before a colon must use braced interpolation");
+  ok &= require_absent(uninstall_ps, "PID $processId:",
+                       "unbraced processId interpolation must not reintroduce a Windows PowerShell parser error");
   free(uninstall_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");

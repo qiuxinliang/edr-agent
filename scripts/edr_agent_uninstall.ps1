@@ -160,7 +160,7 @@ function Stop-AgentProcesses {
         try {
           Stop-Process -Id $processId -Force -ErrorAction Stop
         } catch {
-          Add-CriticalFailure ("Failed to stop Agent process PID $processId: " + $_.Exception.Message)
+          Add-CriticalFailure ("Failed to stop Agent process PID ${processId}: " + $_.Exception.Message)
         }
       } else {
         Write-Warning "Skipped unrelated $name process PID $processId outside $InstallDir"

@@ -183,6 +183,8 @@ function Invoke-VersionTransition {
 
 New-Item -ItemType Directory -Path $EvidenceDir -Force | Out-Null
 Assert-Administrator
+$syntaxValidator = Join-Path $PSScriptRoot "validate_windows_powershell_syntax.ps1"
+& $syntaxValidator -RepositoryRoot (Split-Path -Parent $PSScriptRoot)
 
 $baselineBinary = Find-OneFile -Root $BaselinePackageDir -Name "FDSensor.exe"
 $targetBinary = Find-OneFile -Root $TargetPackageDir -Name "FDSensor.exe"

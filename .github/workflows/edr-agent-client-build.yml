@@ -35,6 +35,9 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
+      - name: Validate release scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: .\scripts\validate_windows_powershell_syntax.ps1
       - name: AVE / behavior chain invariants (no vcpkg, bash)
         shell: bash
         run: |

@@ -114,6 +114,9 @@ jobs:
       WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v6
+      - name: Validate release scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: .\scripts\validate_windows_powershell_syntax.ps1
       - name: Resolve Windows release signing mode
         shell: pwsh
         run: |

@@ -244,6 +244,8 @@ int main(void) {
            "lifecycle waits for asynchronous Windows service deletion");
   contains(lifecycle_smoke, "exit 0",
            "lifecycle explicitly clears stale native-command status after successful assertions");
+  contains(lifecycle_smoke, "validate_windows_powershell_syntax.ps1",
+           "lifecycle validates release script grammar before mutating Windows services");
   free(lifecycle_smoke);
 
   snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
