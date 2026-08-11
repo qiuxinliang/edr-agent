@@ -295,6 +295,12 @@ int main(void) {
            "diagnostic retention excludes credentials and active runtime state");
   contains(uninstall_script, "$attempt -lt 120",
            "deferred program-file removal tolerates bounded endpoint security file locks");
+  contains(uninstall_script, "function Remove-RuntimePathWithRetry",
+           "runtime data removal retries transient file locks before deferring");
+  contains(uninstall_script, "Runtime data remains for verified deferred directory cleanup:",
+           "complete uninstall routes persistent runtime locks to final directory proof");
+  contains(uninstall_script, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
+           "uninstall diagnostics identify files delegated to deferred cleanup");
   contains(uninstall_script, "uninstall-cleanup-last.json",
            "deferred cleanup persists a result outside the removed program directory");
   contains(uninstall_script, "edr.endpoint.uninstall.attestation.v1",

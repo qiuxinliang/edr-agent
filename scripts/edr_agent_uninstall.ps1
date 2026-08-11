@@ -32,6 +32,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:CriticalErrors = @()
+$script:DeferredRuntimePaths = @()
 $script:TargetProcessIds = @()
 $script:UninstallStage = "initialization"
 $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
@@ -83,6 +84,7 @@ function Write-UninstallScriptReceipt {
       error_type = $ErrorType
       error_position = $ErrorPosition
       critical_errors = @($script:CriticalErrors)
+      deferred_runtime_paths = @($script:DeferredRuntimePaths)
     } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $script:UninstallReceiptPath `
       -Encoding UTF8 -Force -ErrorAction Stop
   } catch {
@@ -455,6 +457,36 @@ if (-not `$localSucceeded -or (`$attestationURL -and `$attestationStatus -ne 'su
   }
 }
 
+function Remove-RuntimePathWithRetry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+    [int]$Attempts = 12,
+    [int]$DelayMilliseconds = 250
+  )
+  $lastError = ""
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    try {
+      if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($item) {
+          try { $item.Attributes = [IO.FileAttributes]::Normal } catch {}
+        }
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+      }
+    } catch {
+      $lastError = $_.Exception.Message
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+      return [pscustomobject]@{ Removed = $true; Error = "" }
+    }
+    if ($attempt -lt $Attempts) {
+      Start-Sleep -Milliseconds $DelayMilliseconds
+    }
+  }
+  return [pscustomobject]@{ Removed = $false; Error = $lastError }
+}
+
 function Remove-AgentData {
   foreach ($relative in @(
       "agent.toml",
@@ -471,10 +503,16 @@ function Remove-AgentData {
     )) {
     $path = Join-Path $InstallDir $relative
     if (Test-Path -LiteralPath $path) {
-      Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-      Write-Host "Removed runtime data: $relative"
-      if (Test-Path -LiteralPath $path) {
-        Add-CriticalFailure "Failed to remove runtime data: $path"
+      $result = Remove-RuntimePathWithRetry -Path $path
+      if ($result.Removed) {
+        Write-Host "Removed runtime data: $relative"
+      } elseif ($RemoveProgramFiles) {
+        $script:DeferredRuntimePaths += $path
+        $detail = if ($result.Error) { "; last error: " + $result.Error } else { "" }
+        Add-CleanupWarning ("Runtime data remains for verified deferred directory cleanup: " + $path + $detail)
+      } else {
+        $detail = if ($result.Error) { "; last error: " + $result.Error } else { "" }
+        Add-CriticalFailure ("Failed to remove runtime data: " + $path + $detail)
       }
     }
   }

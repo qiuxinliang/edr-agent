@@ -187,6 +187,17 @@ int main(void) {
                          "best-effort ETW cleanup must not poison complete uninstall status");
   ok &= require_contains(uninstall_ps, "uninstall-script-last.json",
                          "uninstall must persist the exact synchronous failure stage outside program files");
+  ok &= require_contains(uninstall_ps, "function Remove-RuntimePathWithRetry",
+                         "runtime data cleanup must retry transient endpoint-security file locks");
+  ok &= require_contains(uninstall_ps, "Runtime data remains for verified deferred directory cleanup:",
+                         "complete uninstall must hand persistent file locks to verified directory cleanup");
+  ok &= require_contains(uninstall_ps, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
+                         "synchronous uninstall receipt must disclose paths handed to deferred cleanup");
+  ok &= require_contains(uninstall_ps, "elseif ($RemoveProgramFiles)",
+                         "runtime data cleanup may defer only when complete program removal is scheduled");
+  ok &= require_absent(uninstall_ps,
+                       "Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue",
+                       "runtime data cleanup must not regress to one-shot silent deletion");
   ok &= require_contains(uninstall_ps, "Add-CleanupWarning (\"Failed to reset install directory ACL:",
                          "ACL repair helper failures must defer to final deletion proof");
   ok &= require_absent(uninstall_ps, "Add-CriticalFailure (\"ETW cleanup failed:",
