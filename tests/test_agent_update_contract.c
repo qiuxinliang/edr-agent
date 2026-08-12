@@ -16,6 +16,23 @@ int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
   return -1;
 }
 
+/* The contract test links the production executor to exercise the parser and
+ * Windows staging helpers, but it never starts an update.  Keep its two live
+ * execution dependencies explicit so Windows linkers do not pull in the
+ * complete command-cancellation registry or HTTP transport stack. */
+int edr_command_cancel_requested(const char *command_id) {
+  (void)command_id;
+  return 0;
+}
+
+int edr_ingest_http_get_url_to_file(const char *url, const char *file_path,
+                                    size_t max_bytes) {
+  (void)url;
+  (void)file_path;
+  (void)max_bytes;
+  return -1;
+}
+
 static void require_true(int value, const char *message) {
   if (!value) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
