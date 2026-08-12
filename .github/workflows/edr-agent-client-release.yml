@@ -566,7 +566,19 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
             throw "Release test configuration has no discoverable tests"
           }
-          & ctest --test-dir build --output-on-failure
+          $required = @(
+            'agent_update_command_contract',
+            'agent_update_packaging_contract',
+            'windows_headless_runtime_contract',
+            'command_registry_and_payload_contract'
+          )
+          $listedText = $listed -join "`n"
+          foreach ($name in $required) {
+            if ($listedText -notmatch [regex]::Escape($name)) {
+              throw "Required release test was not configured: $name"
+            }
+          }
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract)$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed" }
 
       - name: "[Timing] Build summary"

@@ -242,6 +242,10 @@ int main(void) {
            "release workflow statically verifies capabilities for non-runnable ARM64 binaries");
   contains(client_release, "native-package-integrity.json",
            "release workflow packages native component SHA-256 identities");
+  contains(client_release, "Required release test was not configured",
+           "release workflow rejects a missing lifecycle release gate");
+  contains(client_release, "agent_update_packaging_contract",
+           "release workflow executes the OTA packaging contract gate");
   contains(client_release, "'native-package-integrity\\.json'",
            "release workflow rejects packages missing native component integrity metadata");
   free(client_release);

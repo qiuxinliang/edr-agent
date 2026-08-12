@@ -633,7 +633,19 @@ if(EDR_WITH_FL_TRAINER)
   add_test(NAME fl_pb_gradient_chunk COMMAND test_fl_pb_gradient_chunk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()
 
-if(EDR_ONNXRUNTIME_AVAILABLE)
+# The binary fixture set is intentionally optional in source-only checkouts.
+# Do not let absent large-model artifacts turn an otherwise valid Windows
+# release configure into a build failure.  The ONNX integration tests remain
+# enabled automatically in CI jobs that provide the complete fixture set.
+set(_edr_onnx_static_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx")
+set(_edr_onnx_behavior_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx")
+set(_edr_onnx_behavior_seq128_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx")
+set(EDR_ONNX_INTEGRATION_FIXTURES_AVAILABLE OFF)
+if(EDR_ONNXRUNTIME_AVAILABLE AND
+   EXISTS "${_edr_onnx_static_fixture}" AND
+   EXISTS "${_edr_onnx_behavior_fixture}" AND
+   EXISTS "${_edr_onnx_behavior_seq128_fixture}")
+  set(EDR_ONNX_INTEGRATION_FIXTURES_AVAILABLE ON)
   add_library(edr_ave_onnx_test_common INTERFACE)
   target_compile_definitions(edr_ave_onnx_test_common INTERFACE EDR_HAVE_ONNXRUNTIME=1)
   target_include_directories(edr_ave_onnx_test_common INTERFACE ${ONNXRUNTIME_INCLUDE_DIR})
@@ -759,6 +771,13 @@ if(EDR_ONNXRUNTIME_AVAILABLE)
   endif()
 endif()
 
+if(EDR_ONNXRUNTIME_AVAILABLE AND
+   (NOT EXISTS "${_edr_onnx_static_fixture}" OR
+    NOT EXISTS "${_edr_onnx_behavior_fixture}" OR
+    NOT EXISTS "${_edr_onnx_behavior_seq128_fixture}"))
+  message(STATUS "Skipping ONNX integration fixtures: expected static_triple_minimal.onnx, behavior_dual_minimal.onnx, and behavior_seq128_dual_minimal.onnx")
+endif()
+
 foreach(_edr_warning_target IN ITEMS
     test_ave_fp
     test_ave_infer
@@ -772,7 +791,7 @@ foreach(_edr_warning_target IN ITEMS
     test_config_fp)
   edr_apply_common_warnings(${_edr_warning_target})
 endforeach()
-if(EDR_ONNXRUNTIME_AVAILABLE)
+if(EDR_ONNX_INTEGRATION_FIXTURES_AVAILABLE)
   edr_apply_common_warnings(test_ave_static_onnx_integration)
   if(EDR_WITH_AVE_BEHAVIOR_ONNX)
     edr_apply_common_warnings(test_ave_behavior_onnx_integration)
