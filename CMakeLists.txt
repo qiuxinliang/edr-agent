@@ -440,6 +440,7 @@ endif()
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES
     src/collector/collector_win.c
+    src/collector/etw_observability_win.c
     src/collector/etw_tdh_win.c
     src/collector/ave_etw_feed_win.c
   )
