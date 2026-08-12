@@ -260,6 +260,8 @@ int main(void) {
                        "headless uninstall prompts must never use the ANSI Windows API");
   ok &= require_contains(headless_uninstaller, "uninstall-powershell-last.log",
                          "native uninstall must capture PowerShell output outside the removable install directory");
+  ok &= require_contains(headless_uninstaller, "详细诊断日志",
+                         "native uninstall dialog must point operators to the captured PowerShell diagnostics");
   ok &= require_contains(headless_uninstaller, "STARTF_USESTDHANDLES",
                          "native uninstall must redirect child stdout and stderr for actionable CI diagnostics");
   ok &= require_contains(headless_uninstaller, "--capability-probe",
@@ -300,6 +302,16 @@ int main(void) {
                          "PowerShell manual fallback must reject an early Agent exit");
   ok &= require_contains(inno, "#ifdef EDR_ALLOW_POWERSHELL_FALLBACK",
                          "worker-less bundled installers must require an explicit lab-only build flag");
+  ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.exe\"",
+                         "Setup UI must package the same native uninstaller as the release ZIP");
+  ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.ps1\"",
+                         "Setup UI must package the release-owned PowerShell uninstaller");
+  ok &= require_contains(inno, "INSTALL_FAILURE_ROLLBACK begin",
+                         "first-install Setup UI failure must initiate controlled rollback");
+  ok &= require_contains(inno, "EdrHadExistingInstallation := FileExists(ExpandConstant('{app}\\unins000.exe'))",
+                         "only a completed GUI installation may be preserved during failure rollback");
+  ok &= require_contains(inno, "skipped_existing_installation=true",
+                         "upgrade failure must preserve the previous installation instead of deleting it");
   free(inno);
 
   char *setup_ui = read_source(root, "install/windows-setup-ui/MainWindow.xaml.cs");

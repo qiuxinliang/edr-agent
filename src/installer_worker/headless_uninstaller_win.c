@@ -379,10 +379,19 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
 }
 
 static void show_error(int silent, const wchar_t *message, DWORD code) {
-  wchar_t detail[1024];
+  wchar_t detail[MAX_PATH * 5];
+  wchar_t diagnostic_path[MAX_PATH * 4];
+  const wchar_t *diagnostic_hint = L"";
+  diagnostic_path[0] = L'\0';
+  if (get_powershell_log_path(diagnostic_path,
+                              sizeof(diagnostic_path) / sizeof(diagnostic_path[0])) &&
+      file_exists(diagnostic_path)) {
+    diagnostic_hint = L"\n\n详细诊断日志:\n";
+  }
   if (silent) return;
-  _snwprintf(detail, sizeof(detail) / sizeof(detail[0]), L"%ls\n\n错误代码: %lu", message,
-             (unsigned long)code);
+  _snwprintf(detail, sizeof(detail) / sizeof(detail[0]), L"%ls\n\n错误代码: %lu%ls%ls", message,
+             (unsigned long)code, diagnostic_hint, diagnostic_hint[0] ? diagnostic_path : L"");
+  detail[(sizeof(detail) / sizeof(detail[0])) - 1] = L'\0';
   MessageBoxW(NULL, detail, EDR_UNINSTALL_TITLE, MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
 }
 

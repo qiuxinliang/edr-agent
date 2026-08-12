@@ -233,6 +233,8 @@ int main(void) {
            "release workflow statically verifies capabilities for non-runnable ARM64 binaries");
   contains(client_release, "native-package-integrity.json",
            "release workflow packages native component SHA-256 identities");
+  contains(client_release, "'native-package-integrity\\.json'",
+           "release workflow rejects packages missing native component integrity metadata");
   free(client_release);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
@@ -244,6 +246,8 @@ int main(void) {
            "client build workflow probes freshly built native uninstall components");
   contains(client_build, "native-package-integrity.json",
            "client build workflow packages native component SHA-256 identities");
+  contains(client_build, "'native-package-integrity\\.json'",
+           "client build workflow rejects packages missing native component integrity metadata");
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
            "client build waits for GUI subsystem capability probes through the shared runner");
   free(client_build);
@@ -365,6 +369,8 @@ int main(void) {
            "native uninstall forwards the task-pinned one-time attestation secret");
   contains(uninstaller, "uninstall-powershell-last.log",
            "native uninstall preserves PowerShell output outside the removed program directory");
+  contains(uninstaller, "详细诊断日志",
+           "native uninstall dialog exposes the captured PowerShell diagnostic path");
   free(uninstaller);
 
   snprintf(path, sizeof(path), "%s/scripts/edr_agent_uninstall.ps1", root);

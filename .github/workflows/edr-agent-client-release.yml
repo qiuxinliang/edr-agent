@@ -787,6 +787,7 @@ jobs:
               'FDSecurityInstallerWorker\.exe',
               'uninstall\.exe',
               'uninstall\.ps1',
+              'native-package-integrity\.json',
               'agent_windows_production\.example\.toml',
               'sensor_interest_manifest\.json'
             )

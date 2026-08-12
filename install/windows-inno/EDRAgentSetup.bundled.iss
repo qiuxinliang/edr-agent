@@ -87,6 +87,9 @@ Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags:
 #else
 Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion
 #endif
+Source: "{#EDR_BIN_DIR}\uninstall.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_BIN_DIR}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EDR_BIN_DIR}\native-package-integrity.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 #ifndef EDR_TARGET_ARM64
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
@@ -175,6 +178,7 @@ var
   EdrDiagnosticsBundle: string;
   EdrStageLog: string;
   EdrCurrentStage: string;
+  EdrHadExistingInstallation: Boolean;
 
 function EdrCmdLineParamValue(const Flag: string): string;
 var
@@ -278,6 +282,11 @@ function InitializeSetup(): Boolean;
 var
   A, T: string;
 begin
+  // [Files] entries are copied after InitializeSetup. Only a prior Inno
+  // uninstaller proves that {app} is a completed GUI installation. A leftover
+  // directory without unins000.exe is an incomplete install and is safe to
+  // remove during failure rollback.
+  EdrHadExistingInstallation := FileExists(ExpandConstant('{app}\unins000.exe'));
   EdrCmdApiBase := '';
   EdrCmdToken := '';
   EdrCmdParamsFile := '';
@@ -656,9 +665,43 @@ end;
 
 procedure EdrAbortInstall;
 var
-  Msg: string;
+  Msg, Cmd: string;
+  Code: Integer;
 begin
   EdrInstallFailed := True;
+  EdrAppendStageLog('INSTALL_WORKFLOW_FAILED stage=' + EdrCurrentStage + ' reason=' + EdrFailureReason);
+  if not EdrHadExistingInstallation then
+  begin
+    EdrAppendStageLog('INSTALL_FAILURE_ROLLBACK begin');
+    Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
+      + '$d=' + EdrPsSq(ExpandConstant('{app}')) + ';'
+      + 'Stop-Service -Name ''{#MyServiceName}'' -Force -ErrorAction SilentlyContinue;'
+      + 'Stop-Service -Name ''{#MyLegacyServiceName}'' -Force -ErrorAction SilentlyContinue;'
+      + '& sc.exe delete ''{#MyServiceName}'' 2>$null | Out-Null;'
+      + '& sc.exe delete ''{#MyLegacyServiceName}'' 2>$null | Out-Null;'
+      + 'schtasks.exe /Delete /F /TN ''{#MyServiceName}'' 2>$null | Out-Null;'
+      + 'schtasks.exe /Delete /F /TN ''{#MyLegacyServiceName}'' 2>$null | Out-Null;'
+      + 'Stop-Process -Name ''FDSensor'' -Force -ErrorAction SilentlyContinue;'
+      + 'Stop-Process -Name ''{#MyLegacyProcessName}'' -Force -ErrorAction SilentlyContinue;'
+      + 'Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue;'
+      + 'exit 0"';
+    if Exec(EdrPowerShellPath, Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
+      EdrAppendStageLog('INSTALL_FAILURE_ROLLBACK completed')
+    else
+      EdrAppendStageLog('INSTALL_FAILURE_ROLLBACK incomplete exit=' + IntToStr(Code));
+  end
+  else
+  begin
+    EdrAppendStageLog('INSTALL_FAILURE_ROLLBACK skipped_existing_installation=true');
+    Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
+      + 'try { Start-Service -Name ''{#MyServiceName}'' -ErrorAction Stop } catch {'
+      + 'try { schtasks.exe /Run /TN ''{#MyServiceName}'' | Out-Null } catch {}'
+      + '}; exit 0"';
+    if Exec(EdrPowerShellPath, Cmd, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+      EdrAppendStageLog('INSTALL_FAILURE_ROLLBACK previous_runtime_restart exit=' + IntToStr(Code))
+    else
+      EdrAppendStageLog('INSTALL_FAILURE_ROLLBACK previous_runtime_restart could_not_start');
+  end;
   EdrCreateDiagnosticsBundle;
   EdrProgressPage.Hide;
   Msg := 'FDSecurity setup failed.' + #13#10 + #13#10
@@ -1082,6 +1125,7 @@ begin
   EdrInstallFailed := False;
   EdrFailureReason := '';
   EdrInitDiagnostics;
+  EdrAppendStageLog('install_existing_installation=' + EdrBoolJson(EdrHadExistingInstallation));
   SaveEnrollParamsFileIfNeeded;
   Enrolled := EnrollParamsFileExists;
 
