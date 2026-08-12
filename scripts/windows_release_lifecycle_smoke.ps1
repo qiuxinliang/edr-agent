@@ -216,6 +216,7 @@ function Invoke-VersionTransition {
     -TaskId ([Guid]::NewGuid().ToString("N")) `
     -Operation $Operation `
     -ArtifactId $ArtifactID `
+    -UpgradeClass binary_hot `
     -IssuedAtUnixMs $issued `
     -DeadlineUnixMs $deadline `
     -HealthObserveMs 1000 `

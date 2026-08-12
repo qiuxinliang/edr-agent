@@ -310,6 +310,7 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
   char *lifecycle_smoke = read_file(path);
   require_true(lifecycle_smoke != NULL, "read Windows release lifecycle smoke test");
+  contains(lifecycle_smoke, "-UpgradeClass binary_hot", "binary-only lifecycle smoke explicitly selects the no-package update path");
   contains(lifecycle_smoke, "Wait-EmbeddedUpdaterMaterialized", "lifecycle verifies updater extraction from the installed target binary");
   contains(lifecycle_smoke, "embedded updater hash mismatch", "lifecycle binds the materialized updater to the target release hash");
   contains(lifecycle_smoke, "embedded_updater", "lifecycle summary records embedded updater verification");
