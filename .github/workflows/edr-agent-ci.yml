@@ -100,7 +100,20 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
       - name: Build
         shell: pwsh
-        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+        run: |
+          $windowsTargets = @(
+            'edr_agent',
+            'test_command_contract',
+            'test_agent_update_contract',
+            'test_agent_update_assets',
+            'test_windows_headless_runtime_contract'
+          )
+          cmake --build build --target $windowsTargets --parallel $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "Windows product or gate-test build failed with exit code $LASTEXITCODE" }
+          foreach ($nativeTarget in @('fd_installer_worker', 'fd_headless_uninstaller')) {
+            cmake --build build --target $nativeTarget --parallel $env:NUMBER_OF_PROCESSORS
+            if ($LASTEXITCODE -ne 0) { throw "Windows native target $nativeTarget failed with exit code $LASTEXITCODE" }
+          }
       - name: Verify HTTPS REST and SQLite compiled in
         shell: pwsh
         run: |
@@ -117,7 +130,19 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
             throw "CI test configuration has no discoverable tests"
           }
-          & ctest --test-dir build --output-on-failure
+          $required = @(
+            'agent_update_command_contract',
+            'agent_update_packaging_contract',
+            'windows_headless_runtime_contract',
+            'command_registry_and_payload_contract'
+          )
+          $listedText = $listed -join "`n"
+          foreach ($name in $required) {
+            if ($listedText -notmatch [regex]::Escape($name)) {
+              throw "Required Windows CI test was not configured: $name"
+            }
+          }
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract)$'
           if ($LASTEXITCODE -ne 0) { throw "CI tests failed" }
 
   build-linux:

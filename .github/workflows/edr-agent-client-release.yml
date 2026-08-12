@@ -433,17 +433,22 @@ jobs:
       - name: Build (Ninja + sccache)
         shell: pwsh
         run: |
-          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          $releaseTargets = @(
+            'edr_agent',
+            'test_command_contract',
+            'test_agent_update_contract',
+            'test_agent_update_assets',
+            'test_windows_headless_runtime_contract'
+          )
+          cmake --build build --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
           if ($LASTEXITCODE -ne 0) {
-            throw "FDSensor build failed with exit code $LASTEXITCODE"
+            throw "Windows release product or gate-test build failed with exit code $LASTEXITCODE"
           }
-          cmake --build build --target fd_installer_worker --parallel $env:NUMBER_OF_PROCESSORS --verbose
-          if ($LASTEXITCODE -ne 0) {
-            throw "FDSecurityInstallerWorker build failed with exit code $LASTEXITCODE"
-          }
-          cmake --build build --target fd_headless_uninstaller --parallel $env:NUMBER_OF_PROCESSORS --verbose
-          if ($LASTEXITCODE -ne 0) {
-            throw "headless uninstall.exe build failed with exit code $LASTEXITCODE"
+          foreach ($nativeTarget in @('fd_installer_worker', 'fd_headless_uninstaller')) {
+            cmake --build build --target $nativeTarget --parallel $env:NUMBER_OF_PROCESSORS --verbose
+            if ($LASTEXITCODE -ne 0) {
+              throw "Windows release native target $nativeTarget failed with exit code $LASTEXITCODE"
+            }
           }
 
       - name: Verify native uninstall attestation capabilities

@@ -246,6 +246,10 @@ int main(void) {
            "release workflow rejects a missing lifecycle release gate");
   contains(client_release, "agent_update_packaging_contract",
            "release workflow executes the OTA packaging contract gate");
+  contains(client_release, "Windows release native target $nativeTarget failed",
+           "release workflow builds native uninstall binaries after gate tests without building unrelated targets");
+  contains(client_release, "$releaseTargets = @(",
+           "release workflow uses an explicit Windows build target allowlist");
   contains(client_release, "'native-package-integrity\\.json'",
            "release workflow rejects packages missing native component integrity metadata");
   free(client_release);
@@ -264,6 +268,15 @@ int main(void) {
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
            "client build waits for GUI subsystem capability probes through the shared runner");
   free(client_build);
+
+  snprintf(path, sizeof(path), "%s/tests/CMakeLists.txt", root);
+  char *test_cmake = read_file(path);
+  require_true(test_cmake != NULL, "read test CMake configuration");
+  contains(test_cmake, "if(NOT MSVC)",
+           "C11 atomic stress test is excluded from MSVC builds");
+  contains(test_cmake, "Skipping ONNX integration fixtures",
+           "missing optional ONNX fixtures do not block a release configure");
+  free(test_cmake);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
   char *lifecycle_smoke = read_file(path);
