@@ -1743,10 +1743,11 @@ void edr_windivert_capture_stop(void) {
   }
   InterlockedExchange(&s_capture_stop, 0);
   s_runtime.driver_open = 0;
+  s_runtime.policy_enabled = 0;
   s_runtime.capture_threads = 0u;
   s_runtime.scan_workers = 0u;
   s_runtime.scan_queue_depth = 0u;
-  runtime_set(EDR_SHELLCODE_RUNTIME_STOPPED, "stopped", "capture_stopped", ERROR_SUCCESS);
+  runtime_set(EDR_SHELLCODE_RUNTIME_DISABLED, "disabled", "policy_disabled", ERROR_SUCCESS);
 }
 
 uint64_t edr_windivert_capture_budget_drop_count(void) {

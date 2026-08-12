@@ -22,9 +22,6 @@ EdrError edr_shellcode_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
   if (!cfg) {
     return EDR_ERR_INVALID_ARG;
   }
-  if (!cfg->shellcode_detector.enabled) {
-    return EDR_OK;
-  }
   if (s_active) {
     return EDR_OK;
   }
@@ -33,14 +30,13 @@ EdrError edr_shellcode_detector_init(const EdrConfig *cfg, EdrEventBus *bus) {
   if (e != EDR_OK) {
     return e;
   }
-  s_active = 1;
+  s_active = cfg->shellcode_detector.enabled ? 1 : 0;
   return EDR_OK;
 }
 
 void edr_shellcode_detector_shutdown(void) {
-  if (!s_active) {
-    return;
-  }
+  /* Failed or policy-disabled starts still populate runtime capability state and
+   * may own partially initialized WinDivert resources. The stop path is idempotent. */
   edr_windivert_capture_stop();
   s_active = 0;
 }

@@ -38,6 +38,7 @@ __attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (vo
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -100,6 +101,8 @@ static char s_control_qos_dscp[32];
 static char s_control_threshold[32];
 static char s_data_plane_encoding[32] = "protobuf";
 static char s_data_plane_compression[32] = "identity";
+/* Accessed only while the HTTP connection lock is held. */
+static int s_http_request_timeout_override_ms;
 static EdrRequestSigningConfig s_request_signing;
 static unsigned s_control_sampling_pct;
 static unsigned s_effective_sampling_pct;
@@ -2721,12 +2724,68 @@ static void close_fd(EdrSocket fd) {
 
 static void socket_enable_keepalive(EdrSocket fd);
 
+static int socket_set_nonblocking(EdrSocket fd, int enabled) {
+#ifdef _WIN32
+  u_long mode = enabled ? 1ul : 0ul;
+  return ioctlsocket(fd, FIONBIO, &mode) == 0 ? 0 : -1;
+#else
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  if (enabled) flags |= O_NONBLOCK;
+  else flags &= ~O_NONBLOCK;
+  return fcntl(fd, F_SETFL, flags) == 0 ? 0 : -1;
+#endif
+}
+
+static int socket_connect_with_timeout(EdrSocket fd, const struct sockaddr *addr,
+                                       int addr_len, int timeout_ms) {
+  if (socket_set_nonblocking(fd, 1) != 0) {
+    return -1;
+  }
+  if (connect(fd, addr, addr_len) == 0) {
+    return socket_set_nonblocking(fd, 0);
+  }
+#ifdef _WIN32
+  if (WSAGetLastError() != WSAEWOULDBLOCK && WSAGetLastError() != WSAEINPROGRESS) {
+    (void)socket_set_nonblocking(fd, 0);
+    return -1;
+  }
+#else
+  if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+    (void)socket_set_nonblocking(fd, 0);
+    return -1;
+  }
+#endif
+  fd_set writable;
+  struct timeval timeout;
+  FD_ZERO(&writable);
+  FD_SET(fd, &writable);
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  int selected = select((int)fd + 1, NULL, &writable, NULL, &timeout);
+  int socket_error = 0;
+#ifdef _WIN32
+  int error_len = (int)sizeof(socket_error);
+#else
+  socklen_t error_len = (socklen_t)sizeof(socket_error);
+#endif
+  if (selected <= 0 || !FD_ISSET(fd, &writable) ||
+      getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&socket_error, &error_len) != 0 ||
+      socket_error != 0) {
+    (void)socket_set_nonblocking(fd, 0);
+    return -1;
+  }
+  return socket_set_nonblocking(fd, 0);
+}
+
 static int tcp_connect_host(const char *host, int port, EdrSocket *out_fd) {
   struct addrinfo hints;
   struct addrinfo *res = NULL;
   struct addrinfo *rp = NULL;
   char portstr[16];
   EdrSocket fd = EDR_SOCKET_INVALID;
+  int timeout_ms = (int)env_ul_clamped("EDR_HTTP_CONNECT_TIMEOUT_MS", 3000ul,
+                                      500ul, 30000ul);
   memset(&hints, 0, sizeof(hints));
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_family = AF_UNSPEC;
@@ -2743,7 +2802,8 @@ static int tcp_connect_host(const char *host, int port, EdrSocket *out_fd) {
     if (fd == EDR_SOCKET_INVALID) {
       continue;
     }
-    if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+    if (socket_connect_with_timeout(fd, rp->ai_addr, (int)rp->ai_addrlen,
+                                    timeout_ms) == 0) {
       break;
     }
     close_fd(fd);
@@ -3436,7 +3496,9 @@ static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int
     runtime_failure(https ? "https tcp connect failed" : "http connect failed");
     return -1;
   }
-  socket_set_timeout_ms(conn->fd, (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
+  socket_set_timeout_ms(conn->fd, s_http_request_timeout_override_ms > 0
+                                      ? s_http_request_timeout_override_ms
+                                      : (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
   snprintf(conn->host, sizeof(conn->host), "%s", host ? host : "");
   conn->port = port;
   conn->https = https;
@@ -4952,7 +5014,8 @@ static int edr_ingest_http_refresh_route_profile(int force) {
 }
 
 static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
-                              EdrAgentConfigHeaders *out_agent_config) {
+                              EdrAgentConfigHeaders *out_agent_config,
+                              int io_timeout_ms, int max_attempts) {
   char host[256];
   char path[1024];
   int port = 0;
@@ -4988,17 +5051,27 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
     return -1;
   }
   http_lock();
-  for (int attempt = 0; attempt < 2; attempt++) {
+  if (io_timeout_ms <= 0) {
+    io_timeout_ms = (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul,
+                                       1000ul, 120000ul);
+  }
+  if (max_attempts < 1) max_attempts = 1;
+  if (max_attempts > 3) max_attempts = 3;
+  s_http_request_timeout_override_ms = io_timeout_ms;
+  for (int attempt = 0; attempt < max_attempts; attempt++) {
     int reusable = 0;
     int client_error = 0;
     EdrHttpConn *conn = http_conn_get_locked(host, port, https);
     if (!conn) {
       break;
     }
+    socket_set_timeout_ms(conn->fd, io_timeout_ms);
     if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
         read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config) == 0) {
       rc = 0;
       conn->last_used_ms = unix_ms_now();
+      socket_set_timeout_ms(conn->fd, (int)env_ul_clamped(
+          "EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
       if (!reusable || !http_keepalive_enabled()) {
         http_conn_close_locked();
       }
@@ -5017,6 +5090,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
       break;
     }
   }
+  s_http_request_timeout_override_ms = 0;
   http_unlock();
   net_done();
   if (rc != 0 && runtime_string_empty(s_last_error)) {
@@ -5025,8 +5099,12 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   return rc;
 }
 
-int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
-                                         size_t max_bytes, EdrAgentConfigHeaders *headers) {
+int edr_ingest_http_get_url_to_file_meta_bounded(const char *url,
+                                                 const char *file_path,
+                                                 size_t max_bytes,
+                                                 EdrAgentConfigHeaders *headers,
+                                                 int timeout_ms,
+                                                 int max_attempts) {
 	FILE *f;
 	size_t cap;
 	int rc;
@@ -5050,7 +5128,7 @@ int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
 	if (headers) {
 		memset(headers, 0, sizeof(*headers));
 	}
-	rc = native_get_to_file(url, f, cap, headers);
+	rc = native_get_to_file(url, f, cap, headers, timeout_ms, max_attempts);
 	fclose(f);
 	if (rc != 0) {
 		(void)remove(file_path);
@@ -5059,6 +5137,12 @@ int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
   }
 	note_http_request_success();
 	return 0;
+}
+
+int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
+                                         size_t max_bytes, EdrAgentConfigHeaders *headers) {
+  return edr_ingest_http_get_url_to_file_meta_bounded(
+      url, file_path, max_bytes, headers, 0, 2);
 }
 
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {

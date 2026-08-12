@@ -78,6 +78,7 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
 #define EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED 0x02
 #define EDR_REMOTE_POLICY_DETECTION_CHANGED 0x04
+#define EDR_REMOTE_POLICY_PMFE_LIFECYCLE_CHANGED 0x08
 
 typedef enum {
   EDR_AGENT_POLL_RESOURCE = 0,
@@ -164,13 +165,20 @@ static void edr_agent_loop_probe_end(uint64_t started_ns) {
 static int edr_agent_download_text_file(const char *url, const char *tmp, size_t max_bytes,
                                         const char *label, EdrAgentConfigHeaders *headers) {
   int rc;
+  int timeout_ms = 5000;
+  const char *timeout_env = getenv("EDR_AGENT_MAINTENANCE_TIMEOUT_MS");
   EdrIngestHttpRuntime runtime;
   if (!url || !url[0] || !tmp || !tmp[0]) {
     return -1;
   }
-  rc = headers
-           ? edr_ingest_http_get_url_to_file_meta(url, tmp, max_bytes, headers)
-           : edr_ingest_http_get_url_to_file(url, tmp, max_bytes);
+  if (timeout_env && timeout_env[0]) {
+    int configured = atoi(timeout_env);
+    if (configured >= 1000 && configured <= 15000) {
+      timeout_ms = configured;
+    }
+  }
+  rc = edr_ingest_http_get_url_to_file_meta_bounded(
+      url, tmp, max_bytes, headers, timeout_ms, 1);
   if (rc == 0) {
     return 0;
   }
@@ -1888,6 +1896,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
     uint64_t last_heartbeat_ns = 0;
     uint64_t last_health_ns = 0;
     uint64_t last_forensic_refresh_ns = 0;
+    uint32_t maintenance_slot = 0u;
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
       if (e != EDR_OK) {
@@ -1922,14 +1931,25 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SELF_PROTECT, edr_self_protect_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_CONFIG_RELOAD,
                              edr_agent_poll_config_reload(agent, &last_reload_ns));
-        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_REMOTE_CONFIG,
-                             edr_agent_poll_remote_config(agent, &last_remote_ns, &last_health_ns));
-        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RULES,
-                             edr_agent_poll_rules(agent, &last_rules_ns));
-        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_P0_BUNDLE,
-                             edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns));
-        EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SENSOR_INTEREST,
-                             edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns));
+        /* At most one potentially blocking maintenance download per loop. */
+        switch (maintenance_slot++ & 3u) {
+        case 0u:
+          EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_REMOTE_CONFIG,
+                               edr_agent_poll_remote_config(agent, &last_remote_ns, &last_health_ns));
+          break;
+        case 1u:
+          EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RULES,
+                               edr_agent_poll_rules(agent, &last_rules_ns));
+          break;
+        case 2u:
+          EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_P0_BUNDLE,
+                               edr_agent_poll_p0_bundle(agent, &last_p0_bundle_ns));
+          break;
+        default:
+          EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SENSOR_INTEREST,
+                               edr_agent_poll_sensor_interest(agent, &last_sensor_interest_ns));
+          break;
+        }
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ATTACK_SURFACE, edr_agent_poll_attack_surface(agent));
         edr_agent_poll_heartbeat(&last_heartbeat_ns);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ENGINE_HEALTH,
@@ -2357,11 +2377,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,"
         "\"powershell_visible\":%s,\"amsi_visible\":%s,"
         "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
+        "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
+        "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
         "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
         "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
         "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
         "\"snapshot_rejects\":%llu},"
         "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
+        "\"fast_drop\":%s,"
         "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
         "\"current_minute_count\":%llu,\"threshold_per_min\":%llu,"
         "\"cooldown_s\":%llu},"
@@ -2487,6 +2510,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
         ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
         ch.collector_thread_id,
+        (unsigned long long)ch.etw_callbacks_total,
+        (unsigned long long)ch.etw_callbacks_process,
+        (unsigned long long)ch.etw_callbacks_file,
+        (unsigned long long)ch.etw_callbacks_network,
+        (unsigned long long)ch.etw_callbacks_registry,
+        (unsigned long long)ch.etw_prefilter_dropped,
         (unsigned long long)ch.collector_dropped,
         (unsigned long long)ch.queue_dropped,
         (unsigned long long)ch.process_create_missing_identity,
@@ -2497,6 +2526,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)process_cache_metrics.snapshot_time_rejects,
         ch.agent_self_fuse_active ? "true" : "false",
         ch.agent_self_fuse_provider_degraded ? "true" : "false",
+        ch.agent_self_fuse_fast_drop ? "true" : "false",
         (unsigned long long)ch.agent_self_fuse_until_unix_ms,
         (unsigned long long)ch.agent_self_fuse_trips,
         (unsigned long long)ch.agent_self_fuse_suppressed,
@@ -2755,6 +2785,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"registry_provider\":{\"events\":%llu,\"unmapped\":%llu,"
       "\"payload_missing\":%llu,\"admitted\":%llu,\"attributed\":%llu,"
       "\"unattributed\":%llu},"
+      "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
+      "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
       "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
@@ -2763,6 +2795,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"parent_attempts\":%llu,\"parent_succeeded\":%llu,\"parent_access_denied\":%llu,"
       "\"parent_exited\":%llu,\"parent_other_failed\":%llu},"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
+      "\"fast_drop\":%s,"
       "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
       "\"current_minute_count\":%llu,\"threshold_per_min\":%llu,"
       "\"cooldown_s\":%llu},"
@@ -3011,6 +3044,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.registry_events_admitted,
       (unsigned long long)ch.registry_attributed_events,
       (unsigned long long)ch.registry_unattributed_events,
+      (unsigned long long)ch.etw_callbacks_total,
+      (unsigned long long)ch.etw_callbacks_process,
+      (unsigned long long)ch.etw_callbacks_file,
+      (unsigned long long)ch.etw_callbacks_network,
+      (unsigned long long)ch.etw_callbacks_registry,
+      (unsigned long long)ch.etw_prefilter_dropped,
       (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
       (unsigned long long)ch.process_create_missing_identity,
@@ -3032,6 +3071,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)parent_metrics.other_failed,
       ch.agent_self_fuse_active ? "true" : "false",
       ch.agent_self_fuse_provider_degraded ? "true" : "false",
+      ch.agent_self_fuse_fast_drop ? "true" : "false",
       (unsigned long long)ch.agent_self_fuse_until_unix_ms,
       (unsigned long long)ch.agent_self_fuse_trips,
       (unsigned long long)ch.agent_self_fuse_suppressed,
@@ -3501,9 +3541,12 @@ static void edr_agent_apply_attack_surface_policy(EdrConfig *cfg, const EdrConfi
 
 static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remote, const char *tmp) {
   int changed = 0;
+  int pmfe_was_enabled;
   if (!agent || !remote || !tmp || !tmp[0]) {
     return 0;
   }
+  pmfe_was_enabled = agent->cfg.detection.pmfe_mode != 0 &&
+                     agent->cfg.resource_limit.pmfe_scans_per_min > 0u;
   if (edr_agent_toml_has_section(tmp, "preprocessing")) {
     snprintf(agent->cfg.preprocessing.rules_version, sizeof(agent->cfg.preprocessing.rules_version), "%s",
              remote->preprocessing.rules_version);
@@ -3643,6 +3686,10 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   }
   if (edr_agent_toml_has_section(tmp, "self_protect")) {
     agent->cfg.self_protect.event_bus_pressure_warn_pct = remote->self_protect.event_bus_pressure_warn_pct;
+  }
+  if (pmfe_was_enabled != (agent->cfg.detection.pmfe_mode != 0 &&
+                           agent->cfg.resource_limit.pmfe_scans_per_min > 0u)) {
+    changed |= EDR_REMOTE_POLICY_PMFE_LIFECYCLE_CHANGED;
   }
   return changed;
 }
@@ -3818,6 +3865,23 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     edr_webshell_detector_shutdown();
     if (edr_webshell_detector_init(&agent->cfg, agent->event_bus) != EDR_OK) {
       fprintf(stderr, "[config] webshell detector hot reload failed\n");
+    }
+  }
+  if ((changed & (EDR_REMOTE_POLICY_DETECTION_CHANGED |
+                  EDR_REMOTE_POLICY_PMFE_LIFECYCLE_CHANGED)) != 0) {
+    int pmfe_should_run = agent->cfg.detection.pmfe_mode != 0 &&
+                          agent->cfg.resource_limit.pmfe_scans_per_min > 0u;
+    edr_pmfe_bind_config(&agent->cfg);
+    if (!pmfe_should_run && edr_pmfe_is_running()) {
+      edr_pmfe_shutdown();
+      fprintf(stderr, "[config] PMFE stopped by remote policy\n");
+    } else if (pmfe_should_run && !edr_pmfe_is_running()) {
+      EdrError pe = edr_pmfe_init();
+      if (pe != EDR_OK) {
+        fprintf(stderr, "[config] PMFE hot reload failed: %d\n", (int)pe);
+      } else {
+        fprintf(stderr, "[config] PMFE started by remote policy\n");
+      }
     }
   }
   edr_preprocess_apply_config(&agent->cfg);

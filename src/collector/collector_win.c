@@ -14,6 +14,7 @@
 
 #include <evntcons.h>
 #include <evntrace.h>
+#include <tdh.h>
 #include <winevt.h>
 
 #include "edr/collector.h"
@@ -21,6 +22,7 @@
 #include "edr/behavior_from_slot.h"
 #include "edr/config.h"
 #include "edr/etw_guids_win.h"
+#include "edr/etw_observability_win.h"
 #include "edr/etw_tdh_win.h"
 #include "edr/event_bus.h"
 #include "edr/p0_rule_ir.h"
@@ -32,7 +34,6 @@
 #include "edr/windows_event_policy.h"
 
 #include "ave_etw_feed_win.h"
-#include "edr/etw_tdh_win.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -82,10 +83,56 @@ static uint64_t s_agent_self_fuse_until_ns;
 static uint64_t s_agent_self_fuse_trips;
 static uint64_t s_agent_self_fuse_suppressed;
 static uint64_t s_agent_self_fuse_last_cooldown_ns;
-static int s_agent_self_fuse_provider_degraded;
+static int s_agent_self_fuse_fast_drop;
+
+#define EDR_ETW_SEMANTIC_CACHE_SIZE 256u
+
+typedef struct {
+  uint8_t valid;
+  uint8_t provider_kind;
+  uint8_t version;
+  uint8_t opcode;
+  uint16_t event_id;
+  uint16_t task;
+  EdrEventType event_type;
+} EdrEtwSemanticCacheEntry;
+
+static EdrEtwSemanticCacheEntry s_etw_semantic_cache[EDR_ETW_SEMANTIC_CACHE_SIZE];
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
 static int edr_collector_registry_event_type(EdrEventType t);
+
+static const char *edr_provider_tag(const GUID *g) {
+  if (!g) return "unk";
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) return "kproc";
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) return "kfile";
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) return "knet";
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
+      memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) return "kreg";
+  if (memcmp(g, &EDR_ETW_GUID_DNS_CLIENT, sizeof(GUID)) == 0) return "dns";
+  if (memcmp(g, &EDR_ETW_GUID_POWERSHELL, sizeof(GUID)) == 0) return "ps";
+  if (memcmp(g, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) return "sec";
+  if (memcmp(g, &EDR_ETW_GUID_WMI_ACTIVITY, sizeof(GUID)) == 0) return "wmi";
+  if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) return "tcpip";
+  if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) return "wf";
+  return "other";
+}
+
+static void edr_note_provider_callback(const GUID *g) {
+  s_health.etw_callbacks_total++;
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
+    s_health.etw_callbacks_process++;
+  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
+    s_health.etw_callbacks_file++;
+  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
+    s_health.etw_callbacks_network++;
+  } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
+             memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
+             memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) {
+    s_health.etw_callbacks_registry++;
+  }
+}
 
 static uint64_t edr_unix_ns(void) {
   FILETIME ft;
@@ -99,6 +146,107 @@ static uint64_t edr_unix_ns(void) {
     return 0;
   }
   return (t - epoch_100ns) * 100ULL;
+}
+
+static WCHAR edr_wide_fold_ascii(WCHAR c) {
+  if (c >= L'A' && c <= L'Z') {
+    return (WCHAR)(c - L'A' + L'a');
+  }
+  return c;
+}
+
+static int edr_tdh_field_contains(const TRACE_EVENT_INFO *info, ULONG info_size,
+                                  ULONG offset, const WCHAR *needle) {
+  if (!info || !needle || !needle[0] || offset == 0u || offset >= info_size) {
+    return 0;
+  }
+  const WCHAR *text = (const WCHAR *)((const uint8_t *)info + offset);
+  size_t text_cap = (size_t)(info_size - offset) / sizeof(WCHAR);
+  size_t needle_len = wcslen(needle);
+  if (needle_len == 0u || text_cap < needle_len) {
+    return 0;
+  }
+  for (size_t i = 0u; i + needle_len <= text_cap && text[i] != L'\0'; i++) {
+    size_t j = 0u;
+    while (j < needle_len && i + j < text_cap && text[i + j] != L'\0' &&
+           edr_wide_fold_ascii(text[i + j]) == edr_wide_fold_ascii(needle[j])) {
+      j++;
+    }
+    if (j == needle_len) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int edr_tdh_info_contains(const TRACE_EVENT_INFO *info, ULONG info_size,
+                                 const WCHAR *needle) {
+  return edr_tdh_field_contains(info, info_size, info->TaskNameOffset, needle) ||
+         edr_tdh_field_contains(info, info_size, info->OpcodeNameOffset, needle) ||
+         edr_tdh_field_contains(info, info_size, info->EventMessageOffset, needle);
+}
+
+static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_kind,
+                                           EdrEventType *out_type) {
+  const EVENT_DESCRIPTOR *descriptor = &rec->EventHeader.EventDescriptor;
+  uint32_t cache_key = (uint32_t)provider_kind * 16777619u;
+  cache_key ^= (uint32_t)descriptor->Id * 2166136261u;
+  cache_key ^= (uint32_t)descriptor->Task * 2246822519u;
+  cache_key ^= ((uint32_t)descriptor->Version << 8u) | descriptor->Opcode;
+  EdrEtwSemanticCacheEntry *entry =
+      &s_etw_semantic_cache[cache_key % EDR_ETW_SEMANTIC_CACHE_SIZE];
+  if (entry->valid && entry->provider_kind == provider_kind &&
+      entry->event_id == descriptor->Id && entry->version == descriptor->Version &&
+      entry->opcode == descriptor->Opcode && entry->task == descriptor->Task) {
+    if (entry->event_type == 0) {
+      return 0;
+    }
+    *out_type = entry->event_type;
+    return 1;
+  }
+
+  EdrEventType event_type = 0;
+  ULONG info_size = 0u;
+  ULONG status = TdhGetEventInformation(rec, 0u, NULL, NULL, &info_size);
+  if (status == ERROR_INSUFFICIENT_BUFFER && info_size >= sizeof(TRACE_EVENT_INFO) &&
+      info_size <= (256u * 1024u)) {
+    TRACE_EVENT_INFO *info = (TRACE_EVENT_INFO *)malloc(info_size);
+    if (info) {
+      status = TdhGetEventInformation(rec, 0u, NULL, info, &info_size);
+      if (status == ERROR_SUCCESS) {
+        if (provider_kind == 1u) {
+          if (edr_tdh_info_contains(info, info_size, L"delete")) {
+            event_type = EDR_EVENT_FILE_DELETE;
+          } else if (edr_tdh_info_contains(info, info_size, L"write")) {
+            event_type = EDR_EVENT_FILE_WRITE;
+          } else if (edr_tdh_info_contains(info, info_size, L"create")) {
+            event_type = EDR_EVENT_FILE_CREATE;
+          }
+        } else if (provider_kind == 2u) {
+          int disconnect = edr_tdh_info_contains(info, info_size, L"disconnect");
+          int connect = edr_tdh_info_contains(info, info_size, L"connect") ||
+                        edr_tdh_info_contains(info, info_size, L"connection");
+          if (connect && !disconnect) {
+            event_type = EDR_EVENT_NET_CONNECT;
+          }
+        }
+      }
+      free(info);
+    }
+  }
+
+  entry->valid = 1u;
+  entry->provider_kind = provider_kind;
+  entry->event_id = descriptor->Id;
+  entry->version = descriptor->Version;
+  entry->opcode = descriptor->Opcode;
+  entry->task = descriptor->Task;
+  entry->event_type = event_type;
+  if (event_type == 0) {
+    return 0;
+  }
+  *out_type = event_type;
+  return 1;
 }
 
 static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
@@ -126,29 +274,17 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     *out_tag = "kfile";
-    if (op == 12) {
-      *out_type = EDR_EVENT_FILE_CREATE;
+    if (edr_classify_manifest_semantics(rec, 1u, out_type)) {
       return 1;
     }
-    if (op == 14) {
-      *out_type = EDR_EVENT_FILE_WRITE;
-      return 1;
-    }
-    if (op == 16) {
-      *out_type = EDR_EVENT_FILE_DELETE;
-      return 1;
-    }
-    *out_type = EDR_EVENT_FILE_WRITE;
-    return 1;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
     *out_tag = "knet";
-    if (op == 15) {
-      *out_type = EDR_EVENT_NET_DNS_QUERY;
+    if (edr_classify_manifest_semantics(rec, 2u, out_type)) {
       return 1;
     }
-    *out_type = EDR_EVENT_NET_CONNECT;
-    return 1;
+    return 0;
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
     *out_tag = "kreg";
@@ -384,65 +520,20 @@ static uint64_t edr_agent_self_fuse_effective_cooldown_ns(void) {
   return ns > max_ns ? max_ns : ns;
 }
 
-static ULONG edr_control_trace_provider(const GUID *guid, ULONG control_code) {
-  if (!guid || s_session_handle == INVALID_PROCESSTRACE_HANDLE) {
-    return ERROR_INVALID_HANDLE;
-  }
-  return EnableTraceEx2(s_session_handle, guid, control_code, TRACE_LEVEL_VERBOSE,
-                        0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
-}
-
-static int edr_optional_provider_wanted(const GUID *guid) {
-  if (!guid || !s_collector_cfg) {
-    return 0;
-  }
-  if (memcmp(guid, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
-    return s_collector_cfg->collection.etw_tcpip_provider ? 1 : 0;
-  }
-  if (memcmp(guid, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
-    return s_collector_cfg->collection.etw_firewall_provider ? 1 : 0;
-  }
-  return 0;
-}
-
-static void edr_agent_self_fuse_control_noise_providers(ULONG control_code) {
-  typedef struct {
-    const GUID *guid;
-    int mandatory;
-  } NoiseProvider;
-  /* During a self-noise fuse we temporarily drop kernel process as well:
-   * Security 4688/EventLog remains enabled and keeps ProcessCreate coverage. */
-  const NoiseProvider providers[] = {
-      {&EDR_ETW_GUID_KERNEL_PROCESS, 1},
-      {&EDR_ETW_GUID_KERNEL_FILE, 1},
-      {&EDR_ETW_GUID_KERNEL_NETWORK, 1},
-      {&EDR_ETW_GUID_KERNEL_REGISTRY, 1},
-      {&EDR_ETW_GUID_MICROSOFT_TCPIP, 0},
-      {&EDR_ETW_GUID_WINFIREWALL_WFAS, 0},
-  };
-  for (size_t i = 0; i < sizeof(providers) / sizeof(providers[0]); i++) {
-    if (control_code == EVENT_CONTROL_CODE_ENABLE_PROVIDER &&
-        !providers[i].mandatory && !edr_optional_provider_wanted(providers[i].guid)) {
-      continue;
-    }
-    (void)edr_control_trace_provider(providers[i].guid, control_code);
-  }
-}
-
 static void edr_agent_self_fuse_degrade_providers(void) {
-  if (s_agent_self_fuse_provider_degraded || edr_collector_keep_agent_self_events()) {
+  if (s_agent_self_fuse_fast_drop || edr_collector_keep_agent_self_events()) {
     return;
   }
-  edr_agent_self_fuse_control_noise_providers(EVENT_CONTROL_CODE_DISABLE_PROVIDER);
-  s_agent_self_fuse_provider_degraded = 1;
+  /* Keep every provider enabled. The fuse only activates the callback's
+   * PID-cache fast path so external process/file/network coverage is retained. */
+  s_agent_self_fuse_fast_drop = 1;
 }
 
 static void edr_agent_self_fuse_restore_providers(void) {
-  if (!s_agent_self_fuse_provider_degraded) {
+  if (!s_agent_self_fuse_fast_drop) {
     return;
   }
-  edr_agent_self_fuse_control_noise_providers(EVENT_CONTROL_CODE_ENABLE_PROVIDER);
-  s_agent_self_fuse_provider_degraded = 0;
+  s_agent_self_fuse_fast_drop = 0;
 }
 
 static int edr_agent_self_fuse_active(uint64_t now_ns) {
@@ -514,11 +605,7 @@ static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSo
   default:
     break;
   }
-  /* Direct PID and sensor-interest self events are already dropped before
-   * payload admission; they should not degrade unrelated providers. */
-  edr_agent_self_note_suppressed(now_ns,
-                                 source != EDR_AGENT_SELF_DROP_DIRECT_PID &&
-                                     source != EDR_AGENT_SELF_DROP_INTEREST);
+  edr_agent_self_note_suppressed(now_ns, 1);
 }
 
 static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
@@ -739,28 +826,21 @@ static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
   return 0;
 }
 
-static int edr_agent_self_fuse_should_drop_provider(PEVENT_RECORD event_record) {
+static int edr_agent_self_fuse_should_drop_event(PEVENT_RECORD event_record,
+                                                 uint64_t now_ns) {
   if (!event_record || s_agent_self_fuse_until_ns == 0u) {
     return 0;
   }
-  if (!edr_agent_self_fuse_active(edr_unix_ns())) {
+  if (!edr_agent_self_fuse_active(now_ns)) {
     return 0;
   }
   const GUID *g = &event_record->EventHeader.ProviderId;
   UCHAR op = event_record->EventHeader.EventDescriptor.Opcode;
-  if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 ||
-      memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
-      memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
-      memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0 ||
-      memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 ||
-      memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0 ||
-      memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
-    return 1;
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 && op == 1u) {
+    return 0;
   }
-  if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 && op != 1u) {
-    return 1;
-  }
-  return 0;
+  return edr_agent_self_pid_seen((uint32_t)event_record->EventHeader.ProcessId,
+                                 now_ns);
 }
 
 static int edr_ends_with_ci(const char *s, const char *suffix) {
@@ -981,9 +1061,10 @@ static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag)
 #define EDR_REGISTRY_VALUE_DATA_MAX 1024u
 
 typedef struct {
-  char name[EDR_REGISTRY_VALUE_NAME_MAX];
-  char data[EDR_REGISTRY_VALUE_DATA_MAX];
+  char *name;
+  char *data;
   DWORD type;
+  uint64_t hash;
 } EdrRegistryValueSnapshot;
 
 typedef struct {
@@ -1072,20 +1153,63 @@ static void edr_registry_value_data_text(DWORD type, const BYTE *data, DWORD siz
   }
 }
 
-static int edr_registry_snapshot_capture(HKEY key, EdrRegistryValueSnapshot *values,
-                                         DWORD cap, DWORD *out_count) {
+static uint64_t edr_registry_snapshot_hash(const char *name, DWORD type,
+                                           const char *data) {
+  uint64_t hash = 1469598103934665603ULL;
+  const unsigned char *p;
+  for (p = (const unsigned char *)(name ? name : ""); *p; ++p) {
+    hash = (hash ^ *p) * 1099511628211ULL;
+  }
+  for (size_t i = 0u; i < sizeof(type); ++i) {
+    hash = (hash ^ (unsigned char)((type >> (i * 8u)) & 0xffu)) *
+           1099511628211ULL;
+  }
+  for (p = (const unsigned char *)(data ? data : ""); *p; ++p) {
+    hash = (hash ^ *p) * 1099511628211ULL;
+  }
+  return hash;
+}
+
+static void edr_registry_snapshot_free(EdrRegistryValueSnapshot *values,
+                                       DWORD count) {
+  if (!values) {
+    return;
+  }
+  for (DWORD i = 0u; i < count; ++i) {
+    free(values[i].name);
+    free(values[i].data);
+  }
+  free(values);
+}
+
+static int edr_registry_snapshot_capture(HKEY key,
+                                         EdrRegistryValueSnapshot **out_values,
+                                         DWORD *out_count) {
   DWORD value_total = 0u;
   DWORD max_name = 0u;
   DWORD max_data = 0u;
+  DWORD cap = 0u;
+  EdrRegistryValueSnapshot *values = NULL;
   char *name = NULL;
   BYTE *data = NULL;
   DWORD captured = 0u;
-  if (!key || !values || cap == 0u || !out_count) {
+  if (!key || !out_values || !out_count) {
     return 0;
   }
+  *out_values = NULL;
   *out_count = 0u;
   if (RegQueryInfoKeyA(key, NULL, NULL, NULL, NULL, NULL, NULL, &value_total,
                        &max_name, &max_data, NULL, NULL) != ERROR_SUCCESS) {
+    return 0;
+  }
+  cap = value_total < EDR_REGISTRY_WATCH_VALUE_MAX
+            ? value_total
+            : EDR_REGISTRY_WATCH_VALUE_MAX;
+  if (cap == 0u) {
+    return 1;
+  }
+  values = (EdrRegistryValueSnapshot *)calloc(cap, sizeof(*values));
+  if (!values) {
     return 0;
   }
   max_name = max_name < 1u ? 1u : max_name + 1u;
@@ -1097,6 +1221,7 @@ static int edr_registry_snapshot_capture(HKEY key, EdrRegistryValueSnapshot *val
   if (!name || !data) {
     free(name);
     free(data);
+    free(values);
     return 0;
   }
   for (DWORD i = 0u; i < value_total && captured < cap; ++i) {
@@ -1108,15 +1233,26 @@ static int edr_registry_snapshot_capture(HKEY key, EdrRegistryValueSnapshot *val
     if (RegEnumValueA(key, i, name, &name_len, NULL, &type, data, &data_len) != ERROR_SUCCESS) {
       continue;
     }
-    snprintf(values[captured].name, sizeof(values[captured].name), "%s",
-             name[0] ? name : "(Default)");
-    edr_registry_value_data_text(type, data, data_len, values[captured].data,
-                                 sizeof(values[captured].data));
+    char rendered[EDR_REGISTRY_VALUE_DATA_MAX];
+    const char *display_name = name[0] ? name : "(Default)";
+    edr_registry_value_data_text(type, data, data_len, rendered,
+                                 sizeof(rendered));
+    values[captured].name = _strdup(display_name);
+    values[captured].data = _strdup(rendered);
+    if (!values[captured].name || !values[captured].data) {
+      free(name);
+      free(data);
+      edr_registry_snapshot_free(values, captured + 1u);
+      return 0;
+    }
     values[captured].type = type;
+    values[captured].hash = edr_registry_snapshot_hash(
+        values[captured].name, type, values[captured].data);
     captured++;
   }
   free(name);
   free(data);
+  *out_values = values;
   *out_count = captured;
   return 1;
 }
@@ -1159,13 +1295,8 @@ static int edr_registry_watch_add(EdrRegistryWatch *watches, DWORD *count,
   watches[*count].key = key;
   watches[*count].event = event;
   snprintf(watches[*count].path, sizeof(watches[*count].path), "%s", display_path);
-  watches[*count].values = (EdrRegistryValueSnapshot *)calloc(
-      EDR_REGISTRY_WATCH_VALUE_MAX, sizeof(EdrRegistryValueSnapshot));
-  if (watches[*count].values) {
-    watches[*count].snapshot_available = edr_registry_snapshot_capture(
-        key, watches[*count].values, EDR_REGISTRY_WATCH_VALUE_MAX,
-        &watches[*count].value_count);
-  }
+  watches[*count].snapshot_available = edr_registry_snapshot_capture(
+      key, &watches[*count].values, &watches[*count].value_count);
   (*count)++;
   return 1;
 }
@@ -1224,16 +1355,13 @@ static void edr_registry_watch_process(EdrRegistryWatch *watch) {
   if (!watch) {
     return;
   }
-  next = (EdrRegistryValueSnapshot *)calloc(
-      EDR_REGISTRY_WATCH_VALUE_MAX, sizeof(EdrRegistryValueSnapshot));
-  if (!next || !edr_registry_snapshot_capture(
-                   watch->key, next, EDR_REGISTRY_WATCH_VALUE_MAX, &next_count)) {
-    free(next);
+  if (!edr_registry_snapshot_capture(watch->key, &next, &next_count)) {
+    edr_registry_snapshot_free(next, next_count);
     edr_registry_watch_emit(watch->path, "", "", "change_notify", "snapshot_unavailable");
     return;
   }
   if (!watch->snapshot_available) {
-    free(watch->values);
+    edr_registry_snapshot_free(watch->values, watch->value_count);
     watch->values = next;
     watch->value_count = next_count;
     watch->snapshot_available = 1;
@@ -1242,7 +1370,7 @@ static void edr_registry_watch_process(EdrRegistryWatch *watch) {
   }
   for (DWORD i = 0u; i < next_count; ++i) {
     int old_idx = edr_registry_snapshot_find(watch->values, watch->value_count, next[i].name);
-    if (old_idx < 0 ||
+    if (old_idx < 0 || watch->values[old_idx].hash != next[i].hash ||
         watch->values[old_idx].type != next[i].type ||
         strcmp(watch->values[old_idx].data, next[i].data) != 0) {
       edr_registry_watch_emit(watch->path, next[i].name, next[i].data,
@@ -1255,7 +1383,7 @@ static void edr_registry_watch_process(EdrRegistryWatch *watch) {
                               watch->values[i].data, "delete_value", "captured");
     }
   }
-  free(watch->values);
+  edr_registry_snapshot_free(watch->values, watch->value_count);
   watch->values = next;
   watch->value_count = next_count;
 }
@@ -1330,7 +1458,7 @@ static DWORD WINAPI edr_registry_watch_thread_main(void *arg) {
   for (DWORD i = 0u; i < count; ++i) {
     if (watches[i].event) CloseHandle(watches[i].event);
     if (watches[i].key) RegCloseKey(watches[i].key);
-    free(watches[i].values);
+    edr_registry_snapshot_free(watches[i].values, watches[i].value_count);
   }
   return 0u;
 }
@@ -1895,22 +2023,30 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (!s_bus || !event_record) {
     return;
   }
-  if (edr_agent_self_fuse_should_drop_provider(event_record)) {
+  const GUID *provider = &event_record->EventHeader.ProviderId;
+  const char *provider_tag = edr_provider_tag(provider);
+  uint64_t now_ns = edr_unix_ns();
+  edr_note_provider_callback(provider);
+  edr_etw_observability_on_callback(provider_tag);
+
+  if (!edr_collector_keep_agent_self_events() &&
+      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
+      !(memcmp(provider, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 &&
+        event_record->EventHeader.EventDescriptor.Opcode == 1u)) {
+    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
+    return;
+  }
+  if (edr_agent_self_fuse_should_drop_event(event_record, now_ns)) {
     s_agent_self_fuse_suppressed++;
     s_health.agent_self_fuse_provider_suppressed++;
-    s_health.collector_dropped++;
+    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
     return;
   }
   EdrEventType ty;
   const char *tag;
   if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
+    s_health.etw_prefilter_dropped++;
     s_health.collector_dropped++;
-    return;
-  }
-  if (!edr_collector_keep_agent_self_events() &&
-      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
-      ty != EDR_EVENT_PROCESS_CREATE) {
-    edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_DIRECT_PID);
     return;
   }
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
@@ -1948,6 +2084,7 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   size_t plen =
       edr_tdh_build_slot_payload(event_record, tag, slot.data, EDR_MAX_EVENT_PAYLOAD);
   if (plen == 0) {
+    edr_etw_observability_on_slot_payload_empty();
     return;
   }
   if (plen > EDR_MAX_EVENT_PAYLOAD) {
@@ -2039,9 +2176,23 @@ void edr_collector_stop_orphan_etw_session(void) {
   edr_stop_named_trace_session(g_registry_session_name);
 }
 
+static UCHAR edr_trace_provider_level(const GUID *guid) {
+  if (edr_env_bool_default("EDR_ETW_KERNEL_VERBOSE", 0)) {
+    return TRACE_LEVEL_VERBOSE;
+  }
+  if (memcmp(guid, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 ||
+      memcmp(guid, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 ||
+      memcmp(guid, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 ||
+      memcmp(guid, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0) {
+    return TRACE_LEVEL_INFORMATION;
+  }
+  return TRACE_LEVEL_VERBOSE;
+}
+
 static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
   return EnableTraceEx2(session, guid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                        TRACE_LEVEL_VERBOSE, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
+                        edr_trace_provider_level(guid),
+                        0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
 }
 
 static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
@@ -2143,7 +2294,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_agent_self_fuse_trips = 0u;
   s_agent_self_fuse_suppressed = 0u;
   s_agent_self_fuse_last_cooldown_ns = 0u;
-  s_agent_self_fuse_provider_degraded = 0;
+  s_agent_self_fuse_fast_drop = 0;
   edr_sensor_interest_lazy_init();
 
   ULONG name_bytes =
@@ -2267,7 +2418,7 @@ void edr_collector_stop(void) {
     s_registry_watch_stop_event = NULL;
   }
 
-  s_agent_self_fuse_provider_degraded = 0;
+  s_agent_self_fuse_fast_drop = 0;
   s_consumer_thread_id = 0u;
   s_registry_watch_thread_id = 0u;
   s_bus = NULL;
@@ -2284,7 +2435,8 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   {
     uint64_t now = edr_unix_ns();
     out_health->agent_self_fuse_active = edr_agent_self_fuse_active(now);
-    out_health->agent_self_fuse_provider_degraded = s_agent_self_fuse_provider_degraded;
+    out_health->agent_self_fuse_provider_degraded = 0;
+    out_health->agent_self_fuse_fast_drop = s_agent_self_fuse_fast_drop;
     out_health->agent_self_fuse_until_unix_ms =
         s_agent_self_fuse_until_ns > 0u ? (s_agent_self_fuse_until_ns / 1000000ULL) : 0u;
     out_health->agent_self_fuse_trips = s_agent_self_fuse_trips;

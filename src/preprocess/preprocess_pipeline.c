@@ -506,7 +506,7 @@ static void *preprocess_main(void *arg) {
       edr_local_evidence_cache_poll_maintenance();
       break;
     }
-    Sleep(1);
+    (void)edr_event_bus_wait(s_bus, 25u);
 #else
     if (s_stop_preprocess) {
       while (edr_event_bus_try_pop(s_bus, &slot)) {
@@ -516,7 +516,7 @@ static void *preprocess_main(void *arg) {
       edr_local_evidence_cache_poll_maintenance();
       break;
     }
-    usleep(1000);
+    (void)edr_event_bus_wait(s_bus, 10u);
 #endif
   }
 #ifdef _WIN32
@@ -604,6 +604,7 @@ void edr_preprocess_stop(void) {
   }
 #ifdef _WIN32
   InterlockedExchange(&s_stop_preprocess, 1);
+  edr_event_bus_wake(s_bus);
   if (s_thread) {
     WaitForSingleObject(s_thread, 60000);
     CloseHandle(s_thread);
@@ -611,6 +612,7 @@ void edr_preprocess_stop(void) {
   }
 #else
   s_stop_preprocess = 1;
+  edr_event_bus_wake(s_bus);
   pthread_join(s_thread, NULL);
 #endif
   s_bus = NULL;

@@ -60,6 +60,11 @@ static int test_seq(void) {
     edr_event_bus_destroy(b);
     return 1;
   }
+  if (!edr_event_bus_wait(b, 1u)) {
+    fprintf(stderr, "seq: wait did not observe queued data\n");
+    edr_event_bus_destroy(b);
+    return 1;
+  }
   for (int j = 0; j < 10; j++) {
     if (!edr_event_bus_try_pop(b, &slot)) {
       fprintf(stderr, "seq: pop %d failed\n", j);
@@ -69,6 +74,11 @@ static int test_seq(void) {
   }
   if (edr_event_bus_used_approx(b) != 0u) {
     fprintf(stderr, "seq: not empty (used=%u)\n", edr_event_bus_used_approx(b));
+    edr_event_bus_destroy(b);
+    return 1;
+  }
+  if (edr_event_bus_wait(b, 1u)) {
+    fprintf(stderr, "seq: empty wait reported data\n");
     edr_event_bus_destroy(b);
     return 1;
   }

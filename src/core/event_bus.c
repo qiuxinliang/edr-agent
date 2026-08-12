@@ -10,6 +10,7 @@
 #include <windows.h>
 #else
 #include <stdatomic.h>
+#include <time.h>
 #endif
 
 /**
@@ -35,6 +36,7 @@ struct EdrEventBus {
   uint64_t pushed;
   uint64_t high_water_hits;
   CRITICAL_SECTION mu;
+  CONDITION_VARIABLE nonempty;
   int mu_inited;
 };
 
@@ -53,6 +55,7 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
   }
   bus->cap = slot_count;
   InitializeCriticalSection(&bus->mu);
+  InitializeConditionVariable(&bus->nonempty);
   bus->mu_inited = 1;
   return bus;
 }
@@ -78,12 +81,16 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
     LeaveCriticalSection(&bus->mu);
     return false;
   }
+  int was_empty = bus->count == 0u;
   memcpy(&bus->cells[bus->tail].data, slot, sizeof(EdrEventSlot));
   bus->tail = (bus->tail + 1u) % bus->cap;
   bus->count++;
   bus->pushed++;
   if ((uint64_t)bus->count * 100u >= (uint64_t)bus->cap * 80u) {
     bus->high_water_hits++;
+  }
+  if (was_empty) {
+    WakeConditionVariable(&bus->nonempty);
   }
   LeaveCriticalSection(&bus->mu);
   return true;
@@ -103,6 +110,26 @@ bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {
   bus->count--;
   LeaveCriticalSection(&bus->mu);
   return true;
+}
+
+bool edr_event_bus_wait(EdrEventBus *bus, uint32_t timeout_ms) {
+  if (!bus || !bus->mu_inited) {
+    return false;
+  }
+  EnterCriticalSection(&bus->mu);
+  if (bus->count == 0u) {
+    DWORD wait_ms = timeout_ms == 0u ? 1u : (DWORD)timeout_ms;
+    (void)SleepConditionVariableCS(&bus->nonempty, &bus->mu, wait_ms);
+  }
+  bool ready = bus->count > 0u;
+  LeaveCriticalSection(&bus->mu);
+  return ready;
+}
+
+void edr_event_bus_wake(EdrEventBus *bus) {
+  if (bus && bus->mu_inited) {
+    WakeAllConditionVariable(&bus->nonempty);
+  }
 }
 
 uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, uint32_t max_count) {
@@ -284,6 +311,22 @@ bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {
     }
   }
 }
+
+bool edr_event_bus_wait(EdrEventBus *bus, uint32_t timeout_ms) {
+  (void)bus;
+  if (timeout_ms == 0u) {
+    timeout_ms = 1u;
+  }
+  {
+    struct timespec ts;
+    ts.tv_sec = (time_t)(timeout_ms / 1000u);
+    ts.tv_nsec = (long)(timeout_ms % 1000u) * 1000000L;
+    (void)nanosleep(&ts, NULL);
+  }
+  return bus && edr_event_bus_used_approx(bus) > 0u;
+}
+
+void edr_event_bus_wake(EdrEventBus *bus) { (void)bus; }
 
 uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, uint32_t max_count) {
   if (!bus || !out_slots || max_count == 0u) {

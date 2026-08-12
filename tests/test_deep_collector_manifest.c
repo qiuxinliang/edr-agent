@@ -79,6 +79,17 @@ int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
   return edr_ingest_http_get_url_to_file(url, file_path, max_bytes);
 }
 
+int edr_ingest_http_get_url_to_file_meta_bounded(const char *url,
+                                                 const char *file_path,
+                                                 size_t max_bytes,
+                                                 EdrAgentConfigHeaders *headers,
+                                                 int timeout_ms,
+                                                 int max_attempts) {
+  (void)timeout_ms;
+  (void)max_attempts;
+  return edr_ingest_http_get_url_to_file_meta(url, file_path, max_bytes, headers);
+}
+
 void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   if (!out) return;
   memset(out, 0, sizeof(*out));

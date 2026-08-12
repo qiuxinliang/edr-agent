@@ -89,6 +89,50 @@ int main(void) {
                          "Agent startup must fail closed when the durable queue cannot open");
   free(main_source);
 
+  char *collector = read_source(root, "src/collector/collector_win.c");
+  if (!collector) return 1;
+  ok &= require_contains(collector, "return edr_agent_self_pid_seen(",
+                         "self-noise fuse must be scoped to Agent-owned PIDs");
+  ok &= require_contains(collector, "s_health.etw_prefilter_dropped++",
+                         "uninteresting ETW schemas must be observable before payload parsing");
+  ok &= require_contains(collector, "edr_classify_manifest_semantics",
+                         "file and network ETW schemas must be classified by TDH metadata");
+  ok &= require_contains(collector, "EDR_ETW_SEMANTIC_CACHE_SIZE",
+                         "TDH schema classification must be cached rather than repeated per event");
+  ok &= require_absent(collector, "if (op == 10u || op == 11u)",
+                       "network send and receive opcodes must not be treated as connections");
+  ok &= require_absent(collector, "EVENT_CONTROL_CODE_DISABLE_PROVIDER",
+                       "self-noise fuse must not disable mandatory ETW providers");
+  ok &= require_contains(collector, "return TRACE_LEVEL_INFORMATION;",
+                         "high-volume kernel providers must use the production information level");
+  ok &= require_contains(collector, "edr_registry_snapshot_free",
+                         "registry snapshots must release exact-sized value allocations");
+  free(collector);
+
+  char *agent = read_source(root, "src/core/agent.c");
+  if (!agent) return 1;
+  ok &= require_contains(agent, "EDR_REMOTE_POLICY_PMFE_LIFECYCLE_CHANGED",
+                         "remote PMFE policy changes must participate in engine lifecycle");
+  ok &= require_contains(agent, "edr_pmfe_shutdown();",
+                         "remote policy must stop PMFE workers when PMFE is disabled");
+  ok &= require_contains(agent, "PMFE started by remote policy",
+                         "remote policy must restart PMFE when it is re-enabled");
+  free(agent);
+
+  char *shellcode = read_source(root, "src/shellcode_detector/shellcode_detector_win.c");
+  if (!shellcode) return 1;
+  ok &= require_absent(shellcode, "if (!s_active) {\n    return;\n  }",
+                       "failed shellcode starts must still be cleaned up on policy disable");
+  free(shellcode);
+
+  char *transport = read_source(root, "src/transport/ingest_http.c");
+  if (!transport) return 1;
+  ok &= require_contains(transport, "EDR_HTTP_CONNECT_TIMEOUT_MS",
+                         "maintenance transport must bound TCP connect time");
+  ok &= require_contains(transport, "socket_connect_with_timeout",
+                         "native HTTP must use non-blocking bounded connect");
+  free(transport);
+
   char *worker = read_source(root, "src/installer_worker/installer_worker_win.c");
   if (!worker) return 1;
   ok &= require_contains(worker, "edr_windows_autorun.ps1",

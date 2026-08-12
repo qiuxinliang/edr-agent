@@ -27,6 +27,16 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot);
 bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot);
 
 /**
+ * 等待总线出现数据或超时。返回 true 表示调用方应再次尝试 pop；
+ * false 表示超时。Windows 使用条件变量，由 push 精确唤醒消费者；
+ * 其他平台保留有界休眠，避免改变无锁 MPMC 数据路径。
+ */
+bool edr_event_bus_wait(EdrEventBus *bus, uint32_t timeout_ms);
+
+/** 唤醒等待中的消费者，用于受控停机。 */
+void edr_event_bus_wake(EdrEventBus *bus);
+
+/**
  * 批量弹出最多 max_count 条事件，返回实际弹出数量；0 表示当前无事件。
  * 用于减少高频加锁开销（处理顺序与单条 pop 一致）。
  */

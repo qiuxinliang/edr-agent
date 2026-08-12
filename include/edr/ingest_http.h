@@ -208,6 +208,13 @@ typedef struct {
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes);
 int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,
                                          size_t max_bytes, EdrAgentConfigHeaders *headers);
+/** Bounded variant used by main-loop maintenance pulls. */
+int edr_ingest_http_get_url_to_file_meta_bounded(const char *url,
+                                                 const char *file_path,
+                                                 size_t max_bytes,
+                                                 EdrAgentConfigHeaders *headers,
+                                                 int timeout_ms,
+                                                 int max_attempts);
 
 int edr_ingest_http_post_config_status(const char *tenant_id,
                                        const char *endpoint_id,

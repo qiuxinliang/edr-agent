@@ -70,6 +70,12 @@ typedef struct {
     uint64_t security_4657_received;
     uint64_t registry_attributed_events;
     uint64_t registry_unattributed_events;
+    uint64_t etw_callbacks_total;
+    uint64_t etw_callbacks_process;
+    uint64_t etw_callbacks_file;
+    uint64_t etw_callbacks_network;
+    uint64_t etw_callbacks_registry;
+    uint64_t etw_prefilter_dropped;
     uint64_t collector_dropped;
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;
@@ -80,6 +86,7 @@ typedef struct {
     uint64_t agent_self_fuse_provider_suppressed;
     int agent_self_fuse_active;
     int agent_self_fuse_provider_degraded;
+    int agent_self_fuse_fast_drop;
     uint64_t agent_self_fuse_until_unix_ms;
     uint64_t agent_self_fuse_trips;
     uint64_t agent_self_fuse_suppressed;
