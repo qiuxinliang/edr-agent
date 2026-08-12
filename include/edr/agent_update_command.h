@@ -11,7 +11,7 @@ extern "C" {
 #define EDR_AGENT_UPDATE_EXIT_UNSUPPORTED 95
 #define EDR_AGENT_UPDATE_EXIT_LAUNCHED 96
 #define EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES (256u * 1024u * 1024u)
-#define EDR_AGENT_UPDATE_UPDATER_PROTOCOL_VERSION 3
+#define EDR_AGENT_UPDATE_UPDATER_PROTOCOL_VERSION 4
 
 typedef struct EdrAgentUpdateRuntimeInfo {
   int ready;
@@ -57,6 +57,7 @@ typedef struct EdrAgentUpdateRequest {
   char max_current_version[65];
   char runtime_manifest_url[2049];
   char runtime_manifest_sha256[65];
+  char upgrade_class[32];
   char deployment_mode[24];
   char scheduled_task_name[129];
   char scheduled_task_path[129];

@@ -172,6 +172,7 @@ var
   EdrCmdInsecureTls: Boolean;
   EdrCmdKeepOfflineQueue: Boolean;
   EdrCmdKeepEvidenceCache: Boolean;
+  EdrCmdUpgradeExisting: Boolean;
   EdrInstallFailed: Boolean;
   EdrFailureReason: string;
   EdrDiagnosticsDir: string;
@@ -246,12 +247,12 @@ end;
 
 function ShouldKeepOfflineQueue: Boolean;
 begin
-  Result := EdrCmdKeepOfflineQueue or WizardIsTaskSelected('keepofflinequeue');
+  Result := EdrCmdUpgradeExisting or EdrCmdKeepOfflineQueue or WizardIsTaskSelected('keepofflinequeue');
 end;
 
 function ShouldKeepEvidenceCache: Boolean;
 begin
-  Result := EdrCmdKeepEvidenceCache or WizardIsTaskSelected('keepevidencecache');
+  Result := EdrCmdUpgradeExisting or EdrCmdKeepEvidenceCache or WizardIsTaskSelected('keepevidencecache');
 end;
 
 procedure EdrLoadCmdlineEnroll;
@@ -271,6 +272,7 @@ begin
   EdrCmdInsecureTls := EdrParseTruthyParam('/EDR_INSECURE_TLS', '/TLS');
   EdrCmdKeepOfflineQueue := EdrParseTruthyParam('/EDR_KEEP_OFFLINE_QUEUE', '/KEEPQ');
   EdrCmdKeepEvidenceCache := EdrParseTruthyParam('/EDR_KEEP_EVIDENCE_CACHE', '/KEEPE');
+  EdrCmdUpgradeExisting := EdrParseTruthyParam('/EDR_UPGRADE_EXISTING', '/UPGRADEEXISTING');
 end;
 
 function EdrHasCmdlineEnroll: Boolean;
@@ -296,7 +298,23 @@ begin
   EdrCmdInsecureTls := False;
   EdrCmdKeepOfflineQueue := False;
   EdrCmdKeepEvidenceCache := False;
+  EdrCmdUpgradeExisting := False;
   EdrLoadCmdlineEnroll;
+  if EdrCmdUpgradeExisting then
+  begin
+    if not FileExists(ExpandConstant('{app}\agent.toml')) then
+    begin
+      MsgBox('EDR: /EDR_UPGRADE_EXISTING requires an existing protected agent.toml.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if EdrHasCmdlineEnroll then
+    begin
+      MsgBox('EDR: existing-install upgrade preserves endpoint identity and must not include enrollment parameters.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+  end;
   A := EdrCmdApiBase;
   T := EdrCmdToken;
   if EdrCmdParamsFile <> '' then
@@ -1126,6 +1144,7 @@ begin
   EdrFailureReason := '';
   EdrInitDiagnostics;
   EdrAppendStageLog('install_existing_installation=' + EdrBoolJson(EdrHadExistingInstallation));
+  EdrAppendStageLog('upgrade_existing_mode=' + EdrBoolJson(EdrCmdUpgradeExisting));
   SaveEnrollParamsFileIfNeeded;
   Enrolled := EnrollParamsFileExists;
 

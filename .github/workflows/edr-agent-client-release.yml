@@ -26,6 +26,16 @@ on:
         options:
           - unsigned
           - signed
+      upgrade_class:
+        description: Upgrade path classification; auto is recommended and fails closed when the diff is unavailable
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - binary_hot
+          - runtime_bundle
+          - installer_required
 
 permissions:
   contents: write
@@ -40,6 +50,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
+  EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
 
 jobs:
   prepare-release:
@@ -114,6 +125,8 @@ jobs:
       WINDOWS_SIGNING_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
@@ -214,6 +227,27 @@ jobs:
           "EDR_AGENT_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $ver)
           Write-Host "Version update completed successfully"
+
+      - name: Classify supported upgrade path
+        shell: pwsh
+        run: |
+          $currentTag = $env:EDR_AGENT_RELEASE_TAG
+          $previousTag = @(git tag --list 'win_*' --sort=-version:refname | Where-Object { $_ -ne $currentTag } | Select-Object -First 1)
+          if ($previousTag.Count -eq 0) {
+            Write-Warning 'No previous Windows release tag is available; classification will fail closed to installer_required.'
+            if ($env:EDR_UPGRADE_CLASS_OVERRIDE -eq 'auto') {
+              $upgradeClass = 'installer_required'
+            } else {
+              $upgradeClass = & python .\scripts\classify_windows_upgrade.py --override $env:EDR_UPGRADE_CLASS_OVERRIDE
+            }
+          } else {
+            $upgradeClass = & python .\scripts\classify_windows_upgrade.py --previous-ref $previousTag[0] --current-ref HEAD --override $env:EDR_UPGRADE_CLASS_OVERRIDE
+          }
+          if ($LASTEXITCODE -ne 0 -or $upgradeClass -notin @('binary_hot','runtime_bundle','installer_required')) {
+            throw "invalid Windows release upgrade classification: $upgradeClass"
+          }
+          "EDR_UPGRADE_CLASS=$upgradeClass" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Windows release upgrade class: $upgradeClass"
 
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
@@ -951,6 +985,7 @@ jobs:
                 min_current_version = '0.0.0'
                 max_current_version = $env:EDR_AGENT_VERSION
                 min_free_bytes = 268435456
+                upgrade_class = $env:EDR_UPGRADE_CLASS
               }
             }
             $manifest.artifacts += $entry

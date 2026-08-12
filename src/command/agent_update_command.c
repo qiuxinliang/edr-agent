@@ -399,6 +399,7 @@ static int request_field_known(const char *name) {
     "artifact_url", "hash", "version", "arch", "internal_name",
     "publisher_thumbprint", "publisher_subject", "min_current_version",
     "max_current_version", "runtime_manifest_url", "runtime_manifest_sha256",
+    "upgrade_class",
     "deployment_mode", "scheduled_task_name", "scheduled_task_path", "service_name",
     "min_free_bytes", "issued_at_unix_ms", "deadline_unix_ms", "health_observe_ms"
   };
@@ -492,6 +493,7 @@ int edr_agent_update_parse_request(const uint8_t *payload, size_t payload_len,
   COPY("max_current_version", max_current_version, 0);
   COPY("runtime_manifest_url", runtime_manifest_url, 0);
   COPY("runtime_manifest_sha256", runtime_manifest_sha256, 0);
+  COPY("upgrade_class", upgrade_class, 0);
   COPY("deployment_mode", deployment_mode, 0);
   COPY("scheduled_task_name", scheduled_task_name, 0);
   COPY("scheduled_task_path", scheduled_task_path, 0);
@@ -541,6 +543,15 @@ int edr_agent_update_parse_request(const uint8_t *payload, size_t payload_len,
   if (strcmp(out->architecture, "x64") && strcmp(out->architecture, "arm64")) {
     fail(reason, reason_cap, "architecture must be x64 or arm64"); goto invalid;
   }
+  if (!out->upgrade_class[0]) snprintf(out->upgrade_class, sizeof(out->upgrade_class), "%s",
+                                       out->runtime_manifest_url[0] ? "runtime_bundle" : "binary_hot");
+  if (strcmp(out->upgrade_class, "binary_hot") && strcmp(out->upgrade_class, "runtime_bundle") &&
+      strcmp(out->upgrade_class, "installer_required")) {
+    fail(reason, reason_cap, "upgrade_class must be binary_hot, runtime_bundle, or installer_required"); goto invalid;
+  }
+  if (strcmp(out->upgrade_class, "binary_hot") && !out->runtime_manifest_url[0]) {
+    fail(reason, reason_cap, "selected upgrade_class requires a task-pinned package"); goto invalid;
+  }
   if (!out->deployment_mode[0]) snprintf(out->deployment_mode, sizeof(out->deployment_mode), "auto");
   if (strcmp(out->deployment_mode, "auto") && strcmp(out->deployment_mode, "scheduled_task") && strcmp(out->deployment_mode, "service")) {
     fail(reason, reason_cap, "deployment_mode must be auto, scheduled_task, or service"); goto invalid;
@@ -588,16 +599,16 @@ static int write_update_invocation_script(const char *path, const char *updater,
                                           const char *staging_directory) {
   const char *values[] = { updater, staged, req->sha256, req->target_version, req->architecture,
     req->internal_name, req->publisher_thumbprint, req->publisher_subject, req->min_current_version,
-    req->max_current_version, req->deployment_mode, req->scheduled_task_name,
+    req->max_current_version, req->upgrade_class, req->deployment_mode, req->scheduled_task_name,
     req->scheduled_task_path, req->service_name, command_id, manifest, req->runtime_manifest_sha256,
     req->task_id, req->campaign_id, req->operation, req->artifact_id, updater_task_name,
     staging_directory };
-  char quoted[23][4600];
-  for (size_t i = 0; i < 23u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
+  char quoted[24][4600];
+  for (size_t i = 0; i < 24u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
   FILE *file = fopen(path, "wb");
   if (!file) return 0;
-  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -StagingDirectory %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\nexit $LASTEXITCODE\r\n",
-          quoted[0], quoted[1], quoted[2], quoted[3], quoted[4], quoted[5], quoted[6], quoted[7], quoted[8], quoted[9], quoted[10], quoted[11], quoted[12], quoted[13], quoted[14], quoted[15], quoted[16], quoted[17], quoted[18], quoted[19], quoted[20], quoted[21], quoted[22], (unsigned long long)req->min_free_bytes, (unsigned long long)req->issued_at_unix_ms, (unsigned long long)req->deadline_unix_ms, (unsigned long long)req->health_observe_ms);
+  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -UpgradeClass %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -StagingDirectory %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\nexit $LASTEXITCODE\r\n",
+          quoted[0], quoted[1], quoted[2], quoted[3], quoted[4], quoted[5], quoted[6], quoted[7], quoted[8], quoted[9], quoted[10], quoted[11], quoted[12], quoted[13], quoted[14], quoted[15], quoted[16], quoted[17], quoted[18], quoted[19], quoted[20], quoted[21], quoted[22], quoted[23], (unsigned long long)req->min_free_bytes, (unsigned long long)req->issued_at_unix_ms, (unsigned long long)req->deadline_unix_ms, (unsigned long long)req->health_observe_ms);
   return fclose(file) == 0;
 }
 

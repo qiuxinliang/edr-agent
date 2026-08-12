@@ -47,6 +47,7 @@ int main(void) {
       "\"version\":\"2.1.0\",\"arch\":\"x64\","
       "\"internal_name\":\"FDSensor\",\"publisher_thumbprint\":\"AABB\","
       "\"publisher_subject\":\"CN=FDSecurity\",\"deployment_mode\":\"auto\","
+      "\"upgrade_class\":\"binary_hot\","
       "\"min_current_version\":\"2.0.0\",\"max_current_version\":\"2.0.99\","
       "\"issued_at_unix_ms\":1720000000000,\"deadline_unix_ms\":1720003600000,"
       "\"health_observe_ms\":300000}";
@@ -79,6 +80,7 @@ int main(void) {
                    request.deadline_unix_ms == 1720003600000ULL,
                "strict update identity and timestamps parsed");
   require_true(strcmp(request.deployment_mode, "auto") == 0 &&
+                   strcmp(request.upgrade_class, "binary_hot") == 0 &&
                    strcmp(request.scheduled_task_name, "FDSecurityAgent") == 0 &&
                    strcmp(request.scheduled_task_path, "\\") == 0 &&
                    strcmp(request.service_name, "FDSecurityAgent") == 0,

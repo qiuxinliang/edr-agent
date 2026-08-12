@@ -46,8 +46,17 @@ int main(void) {
   contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
   contains(script, "Clear-StaleUpdateWork", "stale updater tasks and work directories are bounded");
   contains(script, "Remove-CurrentUpdateWork", "terminal update work is removed after durable reporting");
-  contains(script, "AgentUpdateUpdaterProtocolVersion = 3", "updater protocol version is explicit in the release script");
+  contains(script, "AgentUpdateUpdaterProtocolVersion = 4", "updater protocol version is explicit in the release script");
+  contains(script, "Invoke-FullInstallerUpgrade", "protocol v4 supports the task-pinned full installer path");
+  contains(script, "EDR_UPGRADE_EXISTING=1", "full installer preserves the existing endpoint identity");
+  contains(script, "full installer modified protected agent.toml identity configuration", "full installer verifies the protected identity was not rewritten");
+  contains(script, "Invoke-FullInstallerRuntimeMirror", "full installer has an immutable runtime backup and restore path");
+  contains(script, "rollback_full_installer_started", "full installer failure starts a bounded runtime rollback");
+  contains(script, "preserving Agent update work for recovery", "unrecoverable update failure retains the restricted recovery snapshot");
   contains(script, "native-package-integrity.json", "complete runtime package integrity manifest is required");
+  contains(script, "$files += [pscustomobject]@{", "native package integrity manifest joins the transactional runtime plan");
+  contains(script, "'FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1','native-package-integrity.json'",
+           "complete runtime update requires helpers and their installed integrity manifest");
   contains(script, "A Headless base package can contain optional rules", "runtime update accepts the complete verified Headless package");
   contains(script, "$name.Contains('/')", "runtime update ignores nested Headless package assets instead of extracting them");
   contains(script, "FDSecurityInstallerWorker.exe", "runtime update includes lifecycle worker");
@@ -166,6 +175,9 @@ int main(void) {
   contains(workflow, "artifact-manifest.json", "release publishes artifact hash manifest");
   contains(workflow, "workflow_dispatch:", "release supports an explicit manual run");
   contains(workflow, "WINDOWS_RELEASE_MODE", "release signing mode is configuration-driven");
+  contains(workflow, "EDR_UPGRADE_CLASS", "release records a fail-closed upgrade classification");
+  contains(workflow, "classify_windows_upgrade.py", "release classifies changed components before manifest signing");
+  contains(workflow, "upgrade_class = $env:EDR_UPGRADE_CLASS", "signed artifact metadata binds the upgrade class");
   contains(workflow, "arch: arm64", "release builds an ARM64 matrix target");
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");

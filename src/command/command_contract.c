@@ -256,6 +256,7 @@ static const CommandFieldRule k_agent_update_rules[] = {
     RULE("max_current_version", FIELD_STRING, 0, 0, 0, 64, 0),
     RULE("runtime_manifest_url", FIELD_STRING, 0, 0, 0, 2048, 0),
     RULE("runtime_manifest_sha256", FIELD_STRING, 0, 0, 0, 64, 0),
+    RULE("upgrade_class", FIELD_STRING, 0, 0, 0, 31, 0),
     RULE("deployment_mode", FIELD_STRING, 0, 0, 0, 23, 0),
     RULE("scheduled_task_name", FIELD_STRING, 0, 0, 0, 128, 0),
     RULE("scheduled_task_path", FIELD_STRING, 0, 0, 0, 128, 0),
@@ -545,6 +546,7 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     const cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "deployment_mode");
     const cJSON *manifest_url = cJSON_GetObjectItemCaseSensitive(root, "runtime_manifest_url");
     const cJSON *manifest_sha = cJSON_GetObjectItemCaseSensitive(root, "runtime_manifest_sha256");
+    const cJSON *upgrade_class = cJSON_GetObjectItemCaseSensitive(root, "upgrade_class");
     const cJSON *issued = cJSON_GetObjectItemCaseSensitive(root, "issued_at_unix_ms");
     const cJSON *deadline = cJSON_GetObjectItemCaseSensitive(root, "deadline_unix_ms");
     if (!schema->valuestring || strcmp(schema->valuestring, "edr.agent_update.v1") != 0) {
@@ -582,6 +584,14 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     if (manifest_url && (!manifest_url->valuestring || strncmp(manifest_url->valuestring, "https://", 8u) != 0 ||
         !manifest_sha->valuestring || strlen(manifest_sha->valuestring) != 64u)) {
       return contract_fail(reason, reason_cap, "runtime manifest contract is invalid");
+    }
+    if (upgrade_class && (!upgrade_class->valuestring ||
+        (strcmp(upgrade_class->valuestring, "binary_hot") && strcmp(upgrade_class->valuestring, "runtime_bundle") &&
+         strcmp(upgrade_class->valuestring, "installer_required")))) {
+      return contract_fail(reason, reason_cap, "agent_update upgrade_class is invalid");
+    }
+    if (upgrade_class && strcmp(upgrade_class->valuestring, "binary_hot") && !manifest_url) {
+      return contract_fail(reason, reason_cap, "selected upgrade_class requires a task-pinned package");
     }
   }
   if (kind == EDR_COMMAND_KIND_AGENT_RESTART_SERVICE ||
