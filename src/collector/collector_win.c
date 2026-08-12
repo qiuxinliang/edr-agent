@@ -24,6 +24,7 @@
 #include "edr/etw_guids_win.h"
 #include "edr/etw_observability_win.h"
 #include "edr/etw_tdh_win.h"
+#include "edr/edr_a44_split_path_win.h"
 #include "edr/event_bus.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/pmfe.h"
@@ -101,6 +102,8 @@ static EdrEtwSemanticCacheEntry s_etw_semantic_cache[EDR_ETW_SEMANTIC_CACHE_SIZE
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot);
 static int edr_collector_registry_event_type(EdrEventType t);
+static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
+                                              const char *tag, uint64_t timestamp_ns);
 
 static const char *edr_provider_tag(const GUID *g) {
   if (!g) return "unk";
@@ -455,7 +458,16 @@ static void edr_copy_trunc(char *dst, size_t cap, const char *src) {
   if (!dst || cap == 0u) {
     return;
   }
-  snprintf(dst, cap, "%s", src ? src : "");
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+  size_t len = 0u;
+  while (len + 1u < cap && src[len] != '\0') {
+    len++;
+  }
+  memcpy(dst, src, len);
+  dst[len] = '\0';
 }
 
 static int edr_collector_keep_agent_self_events(void) {
@@ -2019,34 +2031,9 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   }
 }
 
-static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
-  if (!s_bus || !event_record) {
-    return;
-  }
-  const GUID *provider = &event_record->EventHeader.ProviderId;
-  const char *provider_tag = edr_provider_tag(provider);
-  uint64_t now_ns = edr_unix_ns();
-  edr_note_provider_callback(provider);
-  edr_etw_observability_on_callback(provider_tag);
-
-  if (!edr_collector_keep_agent_self_events() &&
-      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
-      !(memcmp(provider, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 &&
-        event_record->EventHeader.EventDescriptor.Opcode == 1u)) {
-    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
-    return;
-  }
-  if (edr_agent_self_fuse_should_drop_event(event_record, now_ns)) {
-    s_agent_self_fuse_suppressed++;
-    s_health.agent_self_fuse_provider_suppressed++;
-    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
-    return;
-  }
-  EdrEventType ty;
-  const char *tag;
-  if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
-    s_health.etw_prefilter_dropped++;
-    s_health.collector_dropped++;
+static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
+                                              const char *tag, uint64_t timestamp_ns) {
+  if (!s_bus || !event_record || !tag) {
     return;
   }
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
@@ -2077,7 +2064,7 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
 
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
-  slot.timestamp_ns = edr_unix_ns();
+  slot.timestamp_ns = timestamp_ns ? timestamp_ns : edr_unix_ns();
   slot.type = ty;
   slot.consumed = false;
 
@@ -2124,6 +2111,70 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
              ty == EDR_EVENT_REG_DELETE_KEY) {
     s_health.registry_events_admitted++;
   }
+}
+
+/*
+ * A4.4 decoder threads use an owned copy of EVENT_RECORD::UserData.  They
+ * deliberately enter below the callback-only self-event filter and type map:
+ * those decisions are made before the copy is queued, while all TDH parsing,
+ * policy admission, AVE feed and event-bus publication remain identical.
+ */
+void edr_collector_decode_from_a44_item(const EdrA44QueueItem *item) {
+  EVENT_RECORD event_record;
+  if (!item || !s_bus) {
+    return;
+  }
+  edr_a44_item_to_event_record(item, &event_record);
+  edr_collector_decode_mapped_event(&event_record, item->ty, item->tag, item->ts_ns);
+}
+
+static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
+  if (!s_bus || !event_record) {
+    return;
+  }
+  const GUID *provider = &event_record->EventHeader.ProviderId;
+  const char *provider_tag = edr_provider_tag(provider);
+  uint64_t now_ns = edr_unix_ns();
+  edr_note_provider_callback(provider);
+  edr_etw_observability_on_callback(provider_tag);
+
+  if (!edr_collector_keep_agent_self_events() &&
+      event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
+      !(memcmp(provider, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 &&
+        event_record->EventHeader.EventDescriptor.Opcode == 1u)) {
+    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
+    return;
+  }
+  if (edr_agent_self_fuse_should_drop_event(event_record, now_ns)) {
+    s_agent_self_fuse_suppressed++;
+    s_health.agent_self_fuse_provider_suppressed++;
+    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
+    return;
+  }
+  EdrEventType ty;
+  const char *tag;
+  if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
+    s_health.etw_prefilter_dropped++;
+    s_health.collector_dropped++;
+    return;
+  }
+
+  if (edr_a44_split_path_enabled()) {
+    EdrA44QueueItem item;
+    int reason_sync = 0;
+    int packed = edr_a44_item_pack(event_record, now_ns, ty, tag, &item, &reason_sync);
+    if (packed == 0 && edr_a44_try_push(&item)) {
+      return;
+    }
+    /*
+     * The queue is intentionally lossless: records which cannot safely be
+     * copied (ExtendedData/oversized payload) and transient full-queue cases
+     * stay on the ETW consumer thread and take the exact same decode path.
+     */
+    (void)reason_sync;
+    edr_a44_note_sync_fallback();
+  }
+  edr_collector_decode_mapped_event(event_record, ty, tag, now_ns);
 }
 
 static DWORD WINAPI edr_etw_consumer_thread(void *arg) {
@@ -2355,6 +2406,15 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
 
   edr_start_security_eventlog_subscription();
 
+  if (edr_a44_split_path_enabled()) {
+    EdrError a44_err = edr_a44_split_path_start(s_bus);
+    if (a44_err != EDR_OK) {
+      /* A4.4 is an optional latency optimization; synchronous ETW decode remains safe. */
+      fprintf(stderr, "[collector_win] A4.4 split-path unavailable err=%d; using synchronous decode\n",
+              (int)a44_err);
+    }
+  }
+
   s_consumer_thread =
       CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, &s_consumer_thread_id);
   if (!s_consumer_thread) {
@@ -2374,6 +2434,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
       CloseHandle(s_registry_watch_stop_event);
       s_registry_watch_stop_event = NULL;
     }
+    edr_a44_split_path_stop();
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_INTERNAL;
   }
@@ -2407,6 +2468,9 @@ void edr_collector_stop(void) {
     CloseHandle(s_consumer_thread);
     s_consumer_thread = NULL;
   }
+
+  /* No decoder can retain ETW-owned UserData: it only owns queue copies. */
+  edr_a44_split_path_stop();
 
   if (s_registry_watch_thread) {
     WaitForSingleObject(s_registry_watch_thread, 30000);

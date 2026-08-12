@@ -143,6 +143,14 @@ add_test(NAME process_identity_lifecycle_contract COMMAND test_process_identity_
 set_tests_properties(process_identity_lifecycle_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_windows_a44_collector_contract
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_a44_collector_contract.c)
+edr_apply_common_warnings(test_windows_a44_collector_contract)
+add_test(NAME windows_a44_collector_contract COMMAND test_windows_a44_collector_contract
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(windows_a44_collector_contract PROPERTIES
+  ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
 add_executable(test_attack_surface_inventory_policy
   ${CMAKE_CURRENT_SOURCE_DIR}/test_attack_surface_inventory_policy.c
   ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_inventory.c

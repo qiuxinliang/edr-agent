@@ -89,20 +89,25 @@ int main(void) {
 
   char *callback = slice_between(collector, "static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {",
                                  "static DWORD WINAPI edr_etw_consumer_thread(");
-  char *admission = slice_between(collector, "static int edr_collector_should_admit_slot(",
-                                  "static VOID WINAPI edr_event_record_callback(");
-  if (!callback || !admission) {
+  char *admission = slice_between(collector, "static int edr_collector_should_admit_slot(EdrEventSlot *slot) {",
+                                  "static void edr_collector_decode_mapped_event(");
+  char *decode = slice_between(collector,
+                               "static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record,",
+                               "void edr_collector_decode_from_a44_item(");
+  if (!callback || !admission || !decode) {
     fprintf(stderr, "FAIL: cannot isolate collector lifecycle functions\n");
     ok = 0;
   }
 
-  ok &= require_contains(callback, "edr_tdh_build_sensor_interest_event",
+  ok &= require_contains(callback, "edr_collector_decode_mapped_event(event_record, ty, tag, now_ns)",
+                         "callback must send mapped events through the shared decode path");
+  ok &= require_contains(decode, "edr_tdh_build_sensor_interest_event",
                          "terminate handling must use the TDH-parsed target PID");
-  ok &= require_contains(callback, "edr_pt_cache_mark_exit(interest_event.pid, exit_time_ns)",
+  ok &= require_contains(decode, "edr_pt_cache_mark_exit(interest_event.pid, exit_time_ns)",
                          "terminate handling must mark the process-tree generation exited");
-  ok &= require_contains(callback, "AVE_NotifyProcessExit(interest_event.pid)",
+  ok &= require_contains(decode, "AVE_NotifyProcessExit(interest_event.pid)",
                          "terminate handling must notify AVE history from the collector path");
-  ok &= require_before(callback, "edr_pt_cache_mark_exit(interest_event.pid, exit_time_ns)",
+  ok &= require_before(decode, "edr_pt_cache_mark_exit(interest_event.pid, exit_time_ns)",
                        "edr_sensor_interest_should_admit(&interest_event)",
                        "terminate lifecycle marking must happen before sensor-interest filtering");
 
@@ -148,6 +153,7 @@ int main(void) {
 
   free(callback);
   free(admission);
+  free(decode);
   free(collector);
   free(direct_feed);
   free(alert_emit);

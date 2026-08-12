@@ -33,6 +33,7 @@ void edr_collector_decode_from_a44_item(const EdrA44QueueItem *it);
 #endif
 
 #define EDR_A44_MAX_THREADS 4
+#define EDR_A44_BATCH_SIZE 1u
 
 static int edr_a44_yes(const char *e) {
   if (!e || !e[0]) {
@@ -118,6 +119,7 @@ static EdrA44QueueItem *s_a44_buf;
 static uint32_t s_a44_buf_cap;
 static uint32_t s_a44_head;
 static uint32_t s_a44_tail;
+static uint32_t s_a44_queued_count;
 static HANDLE *s_a44_threads;
 static HANDLE s_a44_hFree;
 static HANDLE s_a44_hData;
@@ -129,7 +131,7 @@ static volatile LONG64 s_a44_userdata_overflow_drop;
 static volatile LONG64 s_a44_total_processed;
 static volatile LONG64 s_a44_total_pushed;
 static int s_a44_num_threads;
-static uint32_t s_a44_current_depth;
+static volatile LONG s_a44_current_depth;
 static volatile LONG64 s_a44_q_depth_sum;
 static volatile LONG64 s_a44_q_depth_samples;
 static volatile LONG64 s_a44_thread_processed[EDR_A44_MAX_THREADS];
@@ -212,6 +214,8 @@ static EdrA44DynamicConfig s_dynamic_config = {
 };
 static volatile LONG64 s_last_adjust_time = 0;
 static CRITICAL_SECTION s_thread_reconfig_lock;
+static CRITICAL_SECTION s_a44_decode_lock;
+static int s_a44_decode_lock_initialized;
 
 static void edr_a44_init_dynamic_config(void) {
   if (edr_a44_yes(getenv("EDR_A44_DYNAMIC_THREADS"))) {
@@ -230,78 +234,46 @@ static void edr_a44_init_dynamic_config(void) {
 }
 
 static void edr_a44_decode_one_popped(EdrA44QueueItem *it) {
+  /* Shared collector state is not MPMC-safe; retain deterministic decode state. */
+  EnterCriticalSection(&s_a44_decode_lock);
   edr_collector_decode_from_a44_item(it);
+  LeaveCriticalSection(&s_a44_decode_lock);
 }
-
-#ifndef EDR_A44_BATCH_SIZE
-#define EDR_A44_BATCH_SIZE 8
-#endif
 
 static unsigned __stdcall edr_a44_decode_trampoline(void *arg) {
   int thread_idx = arg ? *(int *)arg : 0;
-  EdrA44QueueItem batch_items[EDR_A44_BATCH_SIZE];
-  while (InterlockedCompareExchange(&s_a44_life, 1, 1) == 1) {
-    DWORD w = WaitForSingleObject(s_a44_hData, 80);
-    if (w == WAIT_OBJECT_0) {
-      uint32_t batch_count = 0;
-      EnterCriticalSection(&s_a44_lock);
-      while (batch_count < EDR_A44_BATCH_SIZE) {
-        uint32_t head = s_a44_head;
-        if (head == s_a44_tail) {
-          break;
-        }
-        batch_items[batch_count] = s_a44_buf[head % s_a44_buf_cap];
-        s_a44_head = (s_a44_head + 1u) % s_a44_buf_cap;
-        batch_count++;
-      }
-      LeaveCriticalSection(&s_a44_lock);
-      for (uint32_t i = 0; i < batch_count; i++) {
-        (void)ReleaseSemaphore(s_a44_hFree, 1, NULL);
-        edr_a44_decode_one_popped(&batch_items[i]);
-        (void)InterlockedIncrement64(&s_a44_total_processed);
-        if (thread_idx >= 0 && thread_idx < EDR_A44_MAX_THREADS) {
-          (void)InterlockedIncrement64(&s_a44_thread_processed[thread_idx]);
-        }
-      }
-      if (batch_count == 0) {
-        if (InterlockedCompareExchange(&s_a44_life, 1, 1) == 0) {
-          break;
-        }
-      }
-    } else {
+  for (;;) {
+    DWORD timeout = InterlockedCompareExchange(&s_a44_life, 1, 1) == 1 ? 80u : 0u;
+    DWORD w = WaitForSingleObject(s_a44_hData, timeout);
+    if (w != WAIT_OBJECT_0) {
       if (InterlockedCompareExchange(&s_a44_life, 1, 1) == 0) {
         break;
       }
+      continue;
     }
-  }
-
-  for (;;) {
-    DWORD w = WaitForSingleObject(s_a44_hData, 0);
-    if (w != WAIT_OBJECT_0) {
-      break;
-    }
-    uint32_t batch_count = 0;
+    EdrA44QueueItem item;
+    int have_item = 0;
     EnterCriticalSection(&s_a44_lock);
-    while (batch_count < EDR_A44_BATCH_SIZE) {
+    if (s_a44_queued_count > 0u) {
       uint32_t head = s_a44_head;
-      if (head == s_a44_tail) {
+      item = s_a44_buf[head % s_a44_buf_cap];
+      s_a44_head = (s_a44_head + 1u) % s_a44_buf_cap;
+      s_a44_queued_count--;
+      have_item = 1;
+    }
+    (void)InterlockedExchange(&s_a44_current_depth, (LONG)s_a44_queued_count);
+    LeaveCriticalSection(&s_a44_lock);
+    if (!have_item) {
+      if (InterlockedCompareExchange(&s_a44_life, 1, 1) == 0) {
         break;
       }
-      batch_items[batch_count] = s_a44_buf[head % s_a44_buf_cap];
-      s_a44_head = (s_a44_head + 1u) % s_a44_buf_cap;
-      batch_count++;
+      continue;
     }
-    LeaveCriticalSection(&s_a44_lock);
-    for (uint32_t i = 0; i < batch_count; i++) {
-      (void)ReleaseSemaphore(s_a44_hFree, 1, NULL);
-      edr_a44_decode_one_popped(&batch_items[i]);
-      (void)InterlockedIncrement64(&s_a44_total_processed);
-      if (thread_idx >= 0 && thread_idx < EDR_A44_MAX_THREADS) {
-        (void)InterlockedIncrement64(&s_a44_thread_processed[thread_idx]);
-      }
-    }
-    if (batch_count == 0) {
-      break;
+    (void)ReleaseSemaphore(s_a44_hFree, 1, NULL);
+    edr_a44_decode_one_popped(&item);
+    (void)InterlockedIncrement64(&s_a44_total_processed);
+    if (thread_idx >= 0 && thread_idx < EDR_A44_MAX_THREADS) {
+      (void)InterlockedIncrement64(&s_a44_thread_processed[thread_idx]);
     }
   }
   return 0u;
@@ -324,12 +296,19 @@ EdrError edr_a44_split_path_start(EdrEventBus *bus) {
 
   s_a44_buf = (EdrA44QueueItem *)calloc(s_a44_buf_cap, sizeof(EdrA44QueueItem));
   if (!s_a44_buf) {
+    if (s_dynamic_config.enabled) {
+      DeleteCriticalSection(&s_thread_reconfig_lock);
+      s_dynamic_config.enabled = 0;
+    }
     return EDR_ERR_INTERNAL;
   }
 
   InitializeCriticalSection(&s_a44_lock);
+  InitializeCriticalSection(&s_a44_decode_lock);
+  s_a44_decode_lock_initialized = 1;
   s_a44_head = 0u;
   s_a44_tail = 0u;
+  s_a44_queued_count = 0u;
   s_a44_life = 1;
   s_a44_drop = 0;
   s_a44_backoff_sync = 0;
@@ -357,7 +336,21 @@ EdrError edr_a44_split_path_start(EdrEventBus *bus) {
   s_a44_hFree = CreateSemaphoreW(NULL, (LONG)s_a44_buf_cap, (LONG)s_a44_buf_cap, NULL);
   s_a44_hData = CreateSemaphoreW(NULL, 0, (LONG)s_a44_buf_cap, NULL);
   if (!s_a44_hFree || !s_a44_hData) {
+    if (s_a44_hFree) {
+      CloseHandle(s_a44_hFree);
+      s_a44_hFree = NULL;
+    }
+    if (s_a44_hData) {
+      CloseHandle(s_a44_hData);
+      s_a44_hData = NULL;
+    }
+    DeleteCriticalSection(&s_a44_decode_lock);
+    s_a44_decode_lock_initialized = 0;
     DeleteCriticalSection(&s_a44_lock);
+    if (s_dynamic_config.enabled) {
+      DeleteCriticalSection(&s_thread_reconfig_lock);
+      s_dynamic_config.enabled = 0;
+    }
     free(s_a44_buf);
     s_a44_buf = NULL;
     return EDR_ERR_INTERNAL;
@@ -367,7 +360,15 @@ EdrError edr_a44_split_path_start(EdrEventBus *bus) {
   if (!s_a44_threads) {
     CloseHandle(s_a44_hFree);
     CloseHandle(s_a44_hData);
+    s_a44_hFree = NULL;
+    s_a44_hData = NULL;
+    DeleteCriticalSection(&s_a44_decode_lock);
+    s_a44_decode_lock_initialized = 0;
     DeleteCriticalSection(&s_a44_lock);
+    if (s_dynamic_config.enabled) {
+      DeleteCriticalSection(&s_thread_reconfig_lock);
+      s_dynamic_config.enabled = 0;
+    }
     free(s_a44_buf);
     s_a44_buf = NULL;
     return EDR_ERR_INTERNAL;
@@ -387,14 +388,28 @@ EdrError edr_a44_split_path_start(EdrEventBus *bus) {
   for (int i = 0; i < s_a44_num_threads; i++) {
     s_a44_threads[i] = (HANDLE)_beginthreadex(NULL, 0, edr_a44_decode_trampoline, &s_a44_thread_indices[i], 0, NULL);
     if (!s_a44_threads[i]) {
+      (void)InterlockedExchange(&s_a44_life, 0);
       for (int j = 0; j < i; j++) {
+        (void)ReleaseSemaphore(s_a44_hData, 1, NULL);
+      }
+      for (int j = 0; j < i; j++) {
+        (void)WaitForSingleObject(s_a44_threads[j], 25000);
         CloseHandle(s_a44_threads[j]);
       }
       free(s_a44_threads);
       s_a44_threads = NULL;
       CloseHandle(s_a44_hFree);
       CloseHandle(s_a44_hData);
+      s_a44_hFree = NULL;
+      s_a44_hData = NULL;
+      edr_a44_lockfree_queue_shutdown();
+      DeleteCriticalSection(&s_a44_decode_lock);
+      s_a44_decode_lock_initialized = 0;
       DeleteCriticalSection(&s_a44_lock);
+      if (s_dynamic_config.enabled) {
+        DeleteCriticalSection(&s_thread_reconfig_lock);
+        s_dynamic_config.enabled = 0;
+      }
       free(s_a44_buf);
       s_a44_buf = NULL;
       return EDR_ERR_INTERNAL;
@@ -429,16 +444,18 @@ int edr_a44_try_push(const EdrA44QueueItem *it) {
   uint32_t tail = s_a44_tail;
   s_a44_buf[tail % s_a44_buf_cap] = *it;
   s_a44_tail = (s_a44_tail + 1u) % s_a44_buf_cap;
-  uint32_t head = s_a44_head;
-  uint32_t new_depth = (s_a44_tail >= head) ? (s_a44_tail - head) : (s_a44_buf_cap - head + s_a44_tail);
+  s_a44_queued_count++;
+  uint32_t new_depth = s_a44_queued_count;
   LeaveCriticalSection(&s_a44_lock);
-  (void)InterlockedExchange64((volatile LONG64 *)&s_a44_current_depth, new_depth);
+  (void)InterlockedExchange(&s_a44_current_depth, (LONG)new_depth);
   (void)InterlockedAdd64(&s_a44_q_depth_sum, new_depth);
   (void)InterlockedIncrement64(&s_a44_q_depth_samples);
   (void)InterlockedAdd64(&s_a44_total_pushed, 1);
   (void)ReleaseSemaphore(s_a44_hData, 1, NULL);
   return 1;
 }
+
+void edr_a44_note_sync_fallback(void) { (void)InterlockedIncrement64(&s_a44_backoff_sync); }
 
 uint64_t edr_a44_dropped_total(void) { return (uint64_t)s_a44_drop; }
 
@@ -450,7 +467,7 @@ int edr_a44_get_stats(EdrA44Stats *out_stats) {
   out_stats->dropped_total = (uint64_t)s_a44_drop;
   out_stats->backoff_sync_total = (uint64_t)s_a44_backoff_sync;
   out_stats->queue_capacity = s_a44_buf_cap;
-  out_stats->current_depth = (uint32_t)s_a44_current_depth;
+  out_stats->current_depth = (uint32_t)InterlockedCompareExchange(&s_a44_current_depth, 0, 0);
   out_stats->active_threads = (uint32_t)(s_a44_threads ? s_a44_num_threads : 0);
   out_stats->total_processed = (uint64_t)s_a44_total_processed;
   out_stats->total_pushed = (uint64_t)s_a44_total_pushed;
@@ -1414,6 +1431,7 @@ int edr_a44_pipeline_set_config(const EdrA44PipelineConfig *config) {
 }
 
 int edr_a44_pipeline_prefetch_start(int lookahead_count) {
+    (void)lookahead_count;
     (void)InterlockedExchange(&s_pipeline_prefetch_enabled, 1);
     return 0;
 }
@@ -1481,9 +1499,15 @@ void edr_a44_split_path_stop(void) {
     s_a44_hData = NULL;
   }
   DeleteCriticalSection(&s_a44_lock);
+  if (s_a44_decode_lock_initialized) {
+    DeleteCriticalSection(&s_a44_decode_lock);
+    s_a44_decode_lock_initialized = 0;
+  }
   if (s_dynamic_config.enabled) {
     DeleteCriticalSection(&s_thread_reconfig_lock);
+    s_dynamic_config.enabled = 0;
   }
+  edr_a44_lockfree_queue_shutdown();
   free(s_a44_buf);
   s_a44_buf = NULL;
   fprintf(stderr, "[collector_win] A4.4 split: decode joined (a44_drop=%" PRId64 " a44_backoff=%" PRId64 ")\n",

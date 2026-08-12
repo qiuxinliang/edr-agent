@@ -104,6 +104,8 @@ int edr_a44_item_pack(PEVENT_RECORD r, uint64_t ts_ns, EdrEventType ty, const ch
                       int *reason_sync);
 
 int edr_a44_try_push(const EdrA44QueueItem *it);
+/** Records a deliberate synchronous decode fallback. The caller must still decode the record. */
+void edr_a44_note_sync_fallback(void);
 uint64_t edr_a44_dropped_total(void);
 void edr_a44_item_to_event_record(const EdrA44QueueItem *it, EVENT_RECORD *er);
 
