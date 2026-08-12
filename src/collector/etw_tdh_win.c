@@ -23,6 +23,40 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Kept at the TDH boundary so the observability path can distinguish an
+ * expected missing property from a failed TDH call without inspecting event
+ * payloads a second time. */
+static volatile LONG64 s_tdh_property_api_errors;
+static volatile LONG64 s_tdh_property_lines_ok;
+static volatile LONG64 s_tdh_property_not_found;
+
+static void edr_tdh_note_property_status(ULONG status) {
+  if (status == ERROR_SUCCESS) {
+    (void)InterlockedIncrement64(&s_tdh_property_lines_ok);
+  } else if (status == ERROR_NOT_FOUND) {
+    (void)InterlockedIncrement64(&s_tdh_property_not_found);
+  } else {
+    (void)InterlockedIncrement64(&s_tdh_property_api_errors);
+  }
+}
+
+void edr_tdh_win_get_property_stats(int64_t *out_tdh_api_err, int64_t *out_tdh_line_ok) {
+  if (out_tdh_api_err) {
+    *out_tdh_api_err = (int64_t)InterlockedCompareExchange64(&s_tdh_property_api_errors, 0, 0);
+  }
+  if (out_tdh_line_ok) {
+    *out_tdh_line_ok = (int64_t)InterlockedCompareExchange64(&s_tdh_property_lines_ok, 0, 0);
+  }
+}
+
+void edr_tdh_win_get_property_stats_ext(int64_t *out_api_err, int64_t *out_line_ok,
+                                        int64_t *out_prop_not_found) {
+  edr_tdh_win_get_property_stats(out_api_err, out_line_ok);
+  if (out_prop_not_found) {
+    *out_prop_not_found = (int64_t)InterlockedCompareExchange64(&s_tdh_property_not_found, 0, 0);
+  }
+}
+
 static size_t append_utf8(char *base, size_t cap, size_t *off, const char *fmt, ...) {
   if (*off >= cap) {
     return 0;
@@ -69,7 +103,9 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   ULONG cb = 0;
   ULONG st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
   if (st != ERROR_SUCCESS || cb == 0 || cb > 65536) {
-    return st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+    ULONG result = st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+    edr_tdh_note_property_status(result);
+    return result;
   }
 
   BYTE stack_tmp[4096];
@@ -87,6 +123,7 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
 
   st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, tmp);
   if (st != ERROR_SUCCESS) {
+    edr_tdh_note_property_status(st);
     if (heap_tmp) {
       HeapFree(GetProcessHeap(), 0, tmp);
     }
@@ -96,6 +133,7 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   if (cb == 4) {
     ULONG v = *(ULONG *)tmp;
     snprintf(out, out_cap, "%lu", (unsigned long)v);
+    edr_tdh_note_property_status(ERROR_SUCCESS);
     if (heap_tmp) {
       HeapFree(GetProcessHeap(), 0, tmp);
     }
@@ -113,8 +151,10 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
           HeapFree(GetProcessHeap(), 0, tmp);
         }
         out[0] = '\0';
+        edr_tdh_note_property_status(ERROR_NOT_FOUND);
         return ERROR_NOT_FOUND;
       }
+      edr_tdh_note_property_status(ERROR_SUCCESS);
       if (heap_tmp) {
         HeapFree(GetProcessHeap(), 0, tmp);
       }
@@ -125,6 +165,7 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   if (heap_tmp) {
     HeapFree(GetProcessHeap(), 0, tmp);
   }
+  edr_tdh_note_property_status(ERROR_NOT_FOUND);
   return ERROR_NOT_FOUND;
 }
 
