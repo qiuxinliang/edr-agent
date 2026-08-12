@@ -31,6 +31,7 @@
 #include "edr/command.h"
 #include "edr/command_executor.h"
 #include "edr/agent_update_command.h"
+#include "edr/agent_lifecycle_command.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/enrich_parent_info.h"
@@ -1697,6 +1698,10 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *agent_update_runtime = !windows_native ? "unavailable"
                                      : !agent_update_runtime_ready ? "degraded"
                                      : !agent_update_policy ? "disabled" : "healthy";
+  int lifecycle_runtime_ready = edr_agent_lifecycle_runtime_ready();
+  const char *lifecycle_runtime = !windows_native ? "unavailable"
+                                  : !dangerous_policy ? "disabled"
+                                  : lifecycle_runtime_ready ? "healthy" : "degraded";
   const char *ort_runtime = !ort_build ? "unavailable"
                             : !ort_policy ? "disabled"
                             : (ave_ok && avst && avst->initialized && avst->static_model_version[0])
@@ -1853,10 +1858,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       agent_update_info.protocol_version,
       agent_update_info.materialized ? "true" : "false",
       agent_update_info.error_code,
-      windows_native ? "true" : "false", dangerous_policy ? "true" : "false",
-      windows_native && dangerous_policy ? "healthy" : "unavailable",
-      windows_native ? "true" : "false", dangerous_policy ? "true" : "false",
-      windows_native && dangerous_policy ? "healthy" : "unavailable",
+      windows_native ? "true" : "false", dangerous_policy ? "true" : "false", lifecycle_runtime,
+      windows_native ? "true" : "false", dangerous_policy ? "true" : "false", lifecycle_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);
   if (written < 0 || (size_t)written >= out_cap) {
     out[0] = '\0';

@@ -24,6 +24,9 @@ typedef struct EdrAgentLifecycleRecovery {
 
 int edr_agent_lifecycle_execute(const char *command_id, const uint8_t *payload,
                                 size_t payload_len, char *detail, size_t detail_cap);
+// Returns non-zero only when the installed native lifecycle worker and every
+// file in its pinned native-package-integrity manifest are present and match.
+int edr_agent_lifecycle_runtime_ready(void);
 int edr_agent_lifecycle_recover(const char *command_id, const uint8_t *payload,
                                 size_t payload_len, EdrAgentLifecycleRecovery *out);
 

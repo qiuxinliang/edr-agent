@@ -1058,7 +1058,7 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return update_failure(&req, command_id, outbox_dir, 2u, "staging_directory",
                           "cannot create update staging directory", 3, detail, detail_cap);
   if (snprintf(staged, sizeof(staged), "%s\\FDSensor.next.exe", root) >= (int)sizeof(staged) ||
-      snprintf(manifest, sizeof(manifest), "%s\\runtime-manifest.json", root) >= (int)sizeof(manifest) ||
+      snprintf(manifest, sizeof(manifest), "%s\\runtime-package.zip", root) >= (int)sizeof(manifest) ||
       snprintf(launcher, sizeof(launcher), "%s\\launch-update.ps1", root) >= (int)sizeof(launcher) ||
       snprintf(invocation, sizeof(invocation), "%s\\invoke-update.ps1", root) >= (int)sizeof(invocation)) {
     int result = update_failure(&req, command_id, outbox_dir, 2u, "staging_directory",
@@ -1078,7 +1078,8 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     cleanup_prelaunch_update_work(root, staged, manifest, launcher, invocation);
     return cancel_rc;
   }
-  if (req.runtime_manifest_url[0] && edr_ingest_http_get_url_to_file(req.runtime_manifest_url, manifest, 1024u * 1024u) != 0) {
+  if (req.runtime_manifest_url[0] && edr_ingest_http_get_url_to_file(req.runtime_manifest_url, manifest,
+                                                                       EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES) != 0) {
     int result = update_failure(&req, command_id, outbox_dir, 2u, "runtime_manifest_download",
                                 "authenticated runtime manifest download failed", 5, detail, detail_cap);
     cleanup_prelaunch_update_work(root, staged, manifest, launcher, invocation);

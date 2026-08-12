@@ -59,7 +59,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$AgentUpdateUpdaterProtocolVersion = 2
+$AgentUpdateUpdaterProtocolVersion = 3
 
 function Get-Sha256 {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -180,11 +180,63 @@ function Get-RuntimeUpdatePlan {
     throw "runtime manifest not found: $resolvedManifest"
   }
 
-  $manifest = Get-Content -LiteralPath $resolvedManifest -Raw | ConvertFrom-Json
-  if ([int]$manifest.schema_version -ne 1) {
-    throw "unsupported runtime manifest schema_version: $($manifest.schema_version)"
+  $manifestDirectory = Split-Path -Parent $resolvedManifest
+  $files = @()
+  $sourceRoot = $manifestDirectory
+  if ([string]::Equals([System.IO.Path]::GetExtension($resolvedManifest), '.zip', [StringComparison]::OrdinalIgnoreCase)) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($resolvedManifest)
+    try {
+      $entries = @{}
+      foreach ($entry in @($archive.Entries)) {
+        $name = ([string]$entry.FullName).Replace('\\', '/')
+        if ($name -match '(^|/)\.\.(/|$)' -or $name.StartsWith('/')) {
+          throw "runtime package contains unsafe entry: $name"
+        }
+        # A Headless base package can contain optional rules and third-party
+        # directories. The updater never extracts those entries: only the
+        # flat, integrity-listed lifecycle helpers below are eligible.
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.EndsWith('/') -or $name.Contains('/')) {
+          continue
+        }
+        $key = $name.ToLowerInvariant()
+        if ($entries.ContainsKey($key)) { throw "runtime package contains duplicate entry: $name" }
+        $entries[$key] = $entry
+      }
+      $integrityEntry = $entries['native-package-integrity.json']
+      if (-not $integrityEntry) { throw 'runtime package is missing native-package-integrity.json' }
+      $reader = New-Object System.IO.StreamReader($integrityEntry.Open(), [System.Text.UTF8Encoding]::new($false), $true)
+      try { $integrity = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+      if ([string]$integrity.schema -ne 'edr.windows.native-package-integrity.v1') {
+        throw "unsupported runtime package integrity schema: $($integrity.schema)"
+      }
+      $files = @($integrity.files)
+      $required = @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1')
+      if ($files.Count -ne $required.Count) { throw 'runtime package integrity manifest must contain exactly the native uninstall chain' }
+      $sourceRoot = Join-Path $manifestDirectory 'runtime-components'
+      New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+      foreach ($component in $required) {
+        $entry = $entries[$component.ToLowerInvariant()]
+        if (-not $entry -or $entry.Length -le 0 -or $entry.Length -gt (256MB)) {
+          throw "runtime package component is missing or invalid: $component"
+        }
+        $destination = Join-Path $sourceRoot $component
+        $input = $entry.Open()
+        try {
+          $output = [System.IO.File]::Open($destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+          try { $input.CopyTo($output) } finally { $output.Dispose() }
+        } finally { $input.Dispose() }
+      }
+    } finally {
+      $archive.Dispose()
+    }
+  } else {
+    $manifest = Get-Content -LiteralPath $resolvedManifest -Raw | ConvertFrom-Json
+    if ([int]$manifest.schema_version -ne 1) {
+      throw "unsupported runtime manifest schema_version: $($manifest.schema_version)"
+    }
+    $files = @($manifest.files)
   }
-  $files = @($manifest.files)
   if ($files.Count -lt 1 -or $files.Count -gt 64) {
     throw "runtime manifest must contain between 1 and 64 files"
   }
@@ -194,26 +246,26 @@ function Get-RuntimeUpdatePlan {
   foreach ($entry in $files) {
     $name = [string]$entry.name
     $hash = ([string]$entry.sha256).ToLowerInvariant()
-    if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.dll$' -or
+    if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1)$' -or
         [System.IO.Path]::GetFileName($name) -ne $name) {
-      throw "invalid runtime DLL name in manifest: $name"
+      throw "invalid runtime component name in manifest: $name"
     }
     $key = $name.ToLowerInvariant()
     if ($seen.ContainsKey($key)) {
-      throw "duplicate runtime DLL in manifest: $name"
+      throw "duplicate runtime component in manifest: $name"
     }
     $seen[$key] = $true
     if ($hash -notmatch '^[0-9a-f]{64}$') {
-      throw "invalid SHA256 for runtime DLL: $name"
+      throw "invalid SHA256 for runtime component: $name"
     }
 
-    $sourcePath = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $resolvedManifest) $name))
+    $sourcePath = [System.IO.Path]::GetFullPath((Join-Path $sourceRoot $name))
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-      throw "staged runtime DLL not found: $sourcePath"
+      throw "staged runtime component not found: $sourcePath"
     }
     $actualHash = Get-Sha256 -Path $sourcePath
     if ($actualHash -ne $hash) {
-      throw "staged runtime DLL hash mismatch: name=$name expected=$hash actual=$actualHash"
+      throw "staged runtime component hash mismatch: name=$name expected=$hash actual=$actualHash"
     }
 
     $targetPath = Join-Path $InstallDirectory $name
@@ -230,6 +282,13 @@ function Get-RuntimeUpdatePlan {
       Status = "validated"
     }
   }
+  if ([string]::Equals([System.IO.Path]::GetExtension($resolvedManifest), '.zip', [StringComparison]::OrdinalIgnoreCase)) {
+    foreach ($required in @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1')) {
+      if (-not $seen.ContainsKey($required.ToLowerInvariant())) {
+        throw "runtime package integrity manifest is missing required component: $required"
+      }
+    }
+  }
   return $plan
 }
 
@@ -240,7 +299,7 @@ function Stage-RuntimeUpdatePlan {
     Copy-Item -LiteralPath $item.SourcePath -Destination $item.CandidatePath -Force
     $actualHash = Get-Sha256 -Path $item.CandidatePath
     if ($actualHash -ne $item.ExpectedSha256) {
-      throw "runtime DLL hash changed after local staging: name=$($item.Name)"
+      throw "runtime component hash changed after local staging: name=$($item.Name)"
     }
     $item.Status = "staged"
   }

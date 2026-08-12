@@ -416,7 +416,7 @@ jobs:
             -DEDR_REQUIRE_YARA=ON `
             -DEDR_ENABLE_IPO=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-            -DEDR_BUILD_TESTS=OFF
+            -DEDR_BUILD_TESTS=ON
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Verify YARA compile definition generated
@@ -560,8 +560,14 @@ jobs:
           }
 
       - name: Test
-        shell: bash
-        run: ctest --test-dir build --output-on-failure
+        shell: pwsh
+        run: |
+          $listed = & ctest --test-dir build -N
+          if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
+            throw "Release test configuration has no discoverable tests"
+          }
+          & ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Release tests failed" }
 
       - name: "[Timing] Build summary"
         if: always()
@@ -636,6 +642,7 @@ jobs:
               [ordered]@{ name = "uninstall.ps1"; sha256 = (Get-FileHash -LiteralPath $uninstallScript -Algorithm SHA256).Hash.ToLowerInvariant() }
             )
           } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
+
           $null = $items.Add($nativeIntegrityPath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
@@ -818,10 +825,12 @@ jobs:
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
           $runtimeAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-exe.zip"
+
           $setupAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup.exe"
           $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup-ui.zip"
           $agentAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-FDSensor.exe"
           Copy-Item -LiteralPath $src -Destination $runtimeAsset -Force
+
           Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset -Force
           Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset -Force
           $agentBinary = @("build\Release\FDSensor.exe", "build\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1

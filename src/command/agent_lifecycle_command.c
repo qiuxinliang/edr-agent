@@ -1,6 +1,7 @@
 #include "edr/agent_lifecycle_command.h"
 
 #include "cJSON.h"
+#include "edr/sha256.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -86,6 +87,76 @@ static int parse_request(const uint8_t *payload, size_t payload_len,
 }
 
 #ifdef _WIN32
+static int lifecycle_file_sha256(const char *path, char out[65]) {
+  FILE *file = path ? fopen(path, "rb") : NULL;
+  if (!file) return 0;
+  EdrSha256Ctx hash;
+  edr_sha256_init(&hash);
+  unsigned char buffer[16384];
+  int ok = 1;
+  for (;;) {
+    size_t count = fread(buffer, 1u, sizeof(buffer), file);
+    if (count) edr_sha256_update(&hash, buffer, count);
+    if (count < sizeof(buffer)) { if (ferror(file)) ok = 0; break; }
+  }
+  if (fclose(file) != 0) ok = 0;
+  if (!ok) return 0;
+  unsigned char digest[EDR_SHA256_DIGEST_LEN];
+  edr_sha256_final(&hash, digest);
+  for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; ++i) snprintf(out + i * 2u, 3u, "%02x", digest[i]);
+  out[64] = '\0';
+  return 1;
+}
+
+static int lifecycle_install_dir(char *directory, size_t cap) {
+  char module[MAX_PATH];
+  DWORD length = GetModuleFileNameA(NULL, module, (DWORD)sizeof(module));
+  if (!length || length >= sizeof(module)) return 0;
+  char *slash = strrchr(module, '\\');
+  if (!slash) return 0;
+  *slash = '\0';
+  int written = snprintf(directory, cap, "%s", module);
+  return written > 0 && (size_t)written < cap;
+}
+
+int edr_agent_lifecycle_runtime_ready(void) {
+  char directory[MAX_PATH], manifest_path[MAX_PATH];
+  if (!lifecycle_install_dir(directory, sizeof(directory)) ||
+      snprintf(manifest_path, sizeof(manifest_path), "%s\\native-package-integrity.json", directory) >= (int)sizeof(manifest_path)) return 0;
+  FILE *file = fopen(manifest_path, "rb");
+  if (!file) return 0;
+  if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return 0; }
+  long length = ftell(file);
+  if (length <= 0 || length > 65536L || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return 0; }
+  char *json = (char *)malloc((size_t)length + 1u);
+  if (!json || fread(json, 1u, (size_t)length, file) != (size_t)length) { free(json); fclose(file); return 0; }
+  fclose(file); json[length] = '\0';
+  cJSON *root = cJSON_Parse(json); free(json);
+  if (!root) return 0;
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+  const cJSON *files = cJSON_GetObjectItemCaseSensitive(root, "files");
+  const char *required[] = {"FDSecurityInstallerWorker.exe", "uninstall.exe", "uninstall.ps1"};
+  int ok = cJSON_IsObject(root) && cJSON_IsString(schema) && schema->valuestring &&
+           strcmp(schema->valuestring, "edr.windows.native-package-integrity.v1") == 0 && cJSON_IsArray(files);
+  for (size_t i = 0; ok && i < sizeof(required) / sizeof(required[0]); ++i) {
+    const cJSON *entry = NULL;
+    for (const cJSON *item = files->child; item; item = item->next) {
+      const cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+      if (cJSON_IsString(name) && name->valuestring && _stricmp(name->valuestring, required[i]) == 0) {
+        if (entry) { ok = 0; break; }
+        entry = item;
+      }
+    }
+    const cJSON *sha = entry ? cJSON_GetObjectItemCaseSensitive(entry, "sha256") : NULL;
+    char path[MAX_PATH], actual[65];
+    if (!entry || !cJSON_IsString(sha) || !sha->valuestring || strlen(sha->valuestring) != 64u ||
+        snprintf(path, sizeof(path), "%s\\%s", directory, required[i]) >= (int)sizeof(path) ||
+        !lifecycle_file_sha256(path, actual) || _stricmp(actual, sha->valuestring) != 0) ok = 0;
+  }
+  cJSON_Delete(root);
+  return ok;
+}
+
 static int lifecycle_paths(const char *command_id, char *helper, size_t helper_cap,
                            char *journal, size_t journal_cap, char *log_path,
                            size_t log_cap) {
@@ -117,7 +188,7 @@ static int lifecycle_paths(const char *command_id, char *helper, size_t helper_c
                program_data, safe_command) >= (int)journal_cap) {
     return 0;
   }
-  return GetFileAttributesA(helper) != INVALID_FILE_ATTRIBUTES;
+  return GetFileAttributesA(helper) != INVALID_FILE_ATTRIBUTES && edr_agent_lifecycle_runtime_ready();
 }
 
 static int launch_worker(const char *helper, const char *journal, const char *log_path,
@@ -195,6 +266,10 @@ static int read_journal(const char *path, EdrAgentLifecycleRecovery *out) {
   cJSON_Delete(root);
   return ok ? 2 : -1;
 }
+#endif
+
+#ifndef _WIN32
+int edr_agent_lifecycle_runtime_ready(void) { return 0; }
 #endif
 
 int edr_agent_lifecycle_execute(const char *command_id, const uint8_t *payload,

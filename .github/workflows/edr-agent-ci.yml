@@ -95,7 +95,7 @@ jobs:
             -DEDR_WITH_ONNXRUNTIME=OFF `
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
-            -DEDR_BUILD_TESTS=OFF `
+            -DEDR_BUILD_TESTS=ON `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
       - name: Build
@@ -111,8 +111,14 @@ jobs:
           if ($text.Contains("sqlite disabled")) { throw "missing SQLite local storage support" }
           if ($text.Contains("This Agent build does not include libyara-backed YARA support")) { throw "missing libyara-backed YARA support" }
       - name: Test
-        shell: bash
-        run: ctest --test-dir build --output-on-failure
+        shell: pwsh
+        run: |
+          $listed = & ctest --test-dir build -N
+          if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
+            throw "CI test configuration has no discoverable tests"
+          }
+          & ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "CI tests failed" }
 
   build-linux:
     if: false

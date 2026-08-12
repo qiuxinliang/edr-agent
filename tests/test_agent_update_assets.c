@@ -46,7 +46,13 @@ int main(void) {
   contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
   contains(script, "Clear-StaleUpdateWork", "stale updater tasks and work directories are bounded");
   contains(script, "Remove-CurrentUpdateWork", "terminal update work is removed after durable reporting");
-  contains(script, "AgentUpdateUpdaterProtocolVersion = 2", "updater protocol version is explicit in the release script");
+  contains(script, "AgentUpdateUpdaterProtocolVersion = 3", "updater protocol version is explicit in the release script");
+  contains(script, "native-package-integrity.json", "complete runtime package integrity manifest is required");
+  contains(script, "A Headless base package can contain optional rules", "runtime update accepts the complete verified Headless package");
+  contains(script, "$name.Contains('/')", "runtime update ignores nested Headless package assets instead of extracting them");
+  contains(script, "FDSecurityInstallerWorker.exe", "runtime update includes lifecycle worker");
+  contains(script, "uninstall.exe", "runtime update includes headless uninstaller");
+  contains(script, "uninstall.ps1", "runtime update includes uninstall script");
   contains(script, "Wait-AgentHealthObservation", "local health watchdog is enforced before updater exit");
   contains(script, "[UInt64]$HealthObserveMs = 30000", "manual updater defaults to the bounded local health gate");
   contains(script, "$stableCheck -lt 3", "startup stability uses consecutive liveness samples");
@@ -82,6 +88,8 @@ int main(void) {
   contains(command, "before_download", "update can be cancelled before download");
   contains(command, "artifact_downloaded", "update can be cancelled after artifact download");
   contains(command, "runtime_manifest_downloaded", "update can be cancelled after runtime manifest download");
+  contains(command, "runtime-package.zip", "complete runtime ZIP is downloaded into isolated staging");
+  contains(command, "EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES", "runtime package has an explicit download size limit");
   contains(command, "before_updater_launch", "update can be cancelled before replacement process starts");
   contains(command, "operator_cancelled_before_replacement", "cancel event records the safe cancellation boundary");
   contains(command, "New-ScheduledTaskPrincipal", "updater runs in an independent SYSTEM scheduled task");
@@ -131,6 +139,7 @@ int main(void) {
   contains(agent, "updater_protocol_version", "capability reports updater protocol compatibility");
   contains(agent, "updater_materialized", "capability reports whether the embedded updater was materialized");
   contains(agent, "updater_sha256", "capability reports the resolved updater hash");
+  contains(agent, "edr_agent_lifecycle_runtime_ready", "lifecycle capability is based on installed native chain integrity");
   free(agent);
 
   snprintf(path, sizeof(path), "%s/resources/FDSensor.rc", root);
