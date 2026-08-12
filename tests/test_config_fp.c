@@ -60,6 +60,29 @@ static void test_command_forensic_yara_rules_dir(void) {
   assert(strcmp(cfg.command.forensic_yara_rules_dir, "rules/forensic") == 0);
 }
 
+static void test_lifecycle_maintenance_policy_is_separate_from_dangerous_commands(void) {
+  const char *fn = "edr_test_cfg_lifecycle.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fprintf(f,
+          "[agent]\nendpoint_id = \"t\"\n\n"
+          "[command]\n"
+          "allow_dangerous = false\n"
+          "allow_lifecycle_maintenance = false\n");
+  fclose(f);
+
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  EdrError e = edr_config_load(fn, &cfg);
+  (void)remove(fn);
+  assert(e == EDR_OK);
+  assert(!cfg.command.allow_dangerous);
+  assert(!cfg.command.allow_lifecycle_maintenance);
+
+  edr_config_apply_defaults(&cfg);
+  assert(cfg.command.allow_lifecycle_maintenance);
+}
+
 static void test_remote_detection_modes_parse(void) {
   const char *fn = "edr_test_cfg_detection.toml";
   FILE *f = fopen(fn, "wb");
@@ -306,6 +329,7 @@ int main(void) {
   test_detection_policy_fp_feedback_maps_to_env();
   test_detection_policy_conditional_suppression();
   test_command_forensic_yara_rules_dir();
+  test_lifecycle_maintenance_policy_is_separate_from_dangerous_commands();
   test_remote_detection_modes_parse();
   test_webshell_roots_parse();
   test_correlation_policy_parse();

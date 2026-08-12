@@ -16,6 +16,7 @@ const struct EdrConfig *edr_command_get_config(void);
 
 int edr_command_dangerous_enabled(void);
 int edr_command_rtq_readonly_enabled(void);
+int edr_command_lifecycle_maintenance_enabled(void);
 int edr_command_kill_pid_allowed(long pid);
 
 void edr_command_audit_both(const char *cmd_id, const char *msg);

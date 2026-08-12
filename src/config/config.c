@@ -2404,6 +2404,7 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 
   cfg->command.allow_dangerous = false;
   cfg->command.allow_rtq_readonly = true;
+  cfg->command.allow_lifecycle_maintenance = true;
   cfg->command.rtr_shell_allowlist[0] = '\0';
   cfg->command.rtr_shell_max_timeout_sec = 60u;
   cfg->command.signing_public_key_path[0] = '\0';
@@ -2490,6 +2491,10 @@ static void load_command(toml_table_t *t, EdrConfig *cfg) {
   d = toml_bool_in(t, "allow_rtq_readonly");
   if (d.ok) {
     cfg->command.allow_rtq_readonly = d.u.b ? true : false;
+  }
+  d = toml_bool_in(t, "allow_lifecycle_maintenance");
+  if (d.ok) {
+    cfg->command.allow_lifecycle_maintenance = d.u.b ? true : false;
   }
   take_string(toml_string_in(t, "rtr_shell_allowlist"), cfg->command.rtr_shell_allowlist,
               sizeof(cfg->command.rtr_shell_allowlist));

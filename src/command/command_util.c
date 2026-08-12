@@ -97,6 +97,13 @@ int edr_command_rtq_readonly_enabled(void) {
   return 1;
 }
 
+int edr_command_lifecycle_maintenance_enabled(void) {
+  const char *e = getenv("EDR_LIFECYCLE_MAINTENANCE_ENABLED");
+  if (e && e[0] == '1') return 1;
+  if (e && e[0] == '0') return 0;
+  return s_bound_cfg && s_bound_cfg->command.allow_lifecycle_maintenance;
+}
+
 int edr_command_kill_pid_allowed(long pid) {
   const char *list = getenv("EDR_CMD_KILL_ALLOWLIST");
   if (!list || !list[0]) {

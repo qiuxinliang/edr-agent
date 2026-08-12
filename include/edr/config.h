@@ -250,6 +250,13 @@ typedef struct EdrConfig {
     bool allow_dangerous;
     /** Read-only RTQ is separated from RTR/response permissions. */
     bool allow_rtq_readonly;
+    /**
+     * Allows signed, operator-initiated lifecycle maintenance (restart,
+     * offboard and uninstall). This is intentionally separate from broad
+     * dangerous-response permissions: lifecycle commands retain their own
+     * operator, signature, confirmation and uninstall-attestation gates.
+     */
+    bool allow_lifecycle_maintenance;
     char rtr_shell_allowlist[2048];
     uint32_t rtr_shell_max_timeout_sec;
     char signing_public_key_path[1024];

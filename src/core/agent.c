@@ -892,6 +892,8 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "\n[command]\n");
   fprintf(fp, "allow_dangerous = %s\n", cfg->command.allow_dangerous ? "true" : "false");
   fprintf(fp, "allow_rtq_readonly = %s\n", cfg->command.allow_rtq_readonly ? "true" : "false");
+  fprintf(fp, "allow_lifecycle_maintenance = %s\n",
+          cfg->command.allow_lifecycle_maintenance ? "true" : "false");
   edr_agent_write_toml_string(fp, "signing_public_key_path", cfg->command.signing_public_key_path);
   fprintf(fp, "\n[forensic_auto]\n");
   fprintf(fp, "enabled = %s\n", cfg->forensic_auto.enabled ? "true" : "false");
@@ -965,6 +967,7 @@ static void edr_agent_apply_config_recovery_safe_mode(EdrConfig *cfg) {
   cfg->ave.behavior_monitor_enabled = false;
   cfg->command.allow_dangerous = false;
   cfg->command.allow_rtq_readonly = true;
+  cfg->command.allow_lifecycle_maintenance = true;
   cfg->forensic_auto.enabled = false;
   cfg->attack_surface.enabled = false;
   cfg->shellcode_detector.enabled = false;
@@ -1654,6 +1657,10 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   int dangerous_policy = (agent && agent->cfg.command.allow_dangerous) ||
                          (command_enabled_env && command_enabled_env[0] == '1') ||
                          (command_dangerous_env && command_dangerous_env[0] == '1');
+  const char *lifecycle_enabled_env = getenv("EDR_LIFECYCLE_MAINTENANCE_ENABLED");
+  int lifecycle_policy = windows_native && agent && agent->cfg.command.allow_lifecycle_maintenance;
+  if (lifecycle_enabled_env && lifecycle_enabled_env[0] == '1') lifecycle_policy = windows_native;
+  if (lifecycle_enabled_env && lifecycle_enabled_env[0] == '0') lifecycle_policy = 0;
   int ort_policy = agent && agent->cfg.ave.enabled && agent->cfg.ave.static_model_enabled;
   int sqlite_policy = agent && agent->cfg.offline.queue_db_path[0];
   int velo_policy = edr_response_forensic_external_enabled();
@@ -1700,7 +1707,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                      : !agent_update_policy ? "disabled" : "healthy";
   int lifecycle_runtime_ready = edr_agent_lifecycle_runtime_ready();
   const char *lifecycle_runtime = !windows_native ? "unavailable"
-                                  : !dangerous_policy ? "disabled"
+                                  : !lifecycle_policy ? "disabled"
                                   : lifecycle_runtime_ready ? "healthy" : "degraded";
   const char *ort_runtime = !ort_build ? "unavailable"
                             : !ort_policy ? "disabled"
@@ -1858,8 +1865,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       agent_update_info.protocol_version,
       agent_update_info.materialized ? "true" : "false",
       agent_update_info.error_code,
-      windows_native ? "true" : "false", dangerous_policy ? "true" : "false", lifecycle_runtime,
-      windows_native ? "true" : "false", dangerous_policy ? "true" : "false", lifecycle_runtime,
+      windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
+      windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);
   if (written < 0 || (size_t)written >= out_cap) {
     out[0] = '\0';
@@ -3394,6 +3401,7 @@ static void edr_agent_apply_remote_command_policy(EdrConfig *cfg, const EdrConfi
   } while (0)
   EDR_REMOTE_COMMAND_BOOL(allow_dangerous);
   EDR_REMOTE_COMMAND_BOOL(allow_rtq_readonly);
+  EDR_REMOTE_COMMAND_BOOL(allow_lifecycle_maintenance);
   EDR_REMOTE_COMMAND_STRING(rtr_shell_allowlist);
   EDR_REMOTE_COMMAND_U32(rtr_shell_max_timeout_sec);
   EDR_REMOTE_COMMAND_STRING(signing_public_key_path);

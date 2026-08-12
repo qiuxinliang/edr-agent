@@ -6804,6 +6804,13 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
     case EDR_COMMAND_KIND_AGENT_OFFBOARD:
     case EDR_COMMAND_KIND_AGENT_UNINSTALL: {
       char detail[1024];
+      if (!edr_command_lifecycle_maintenance_enabled()) {
+        s_rejected++;
+        soar_emit_ex(id, sm, EdrCmdExecRejected, 1,
+                     "endpoint lifecycle maintenance is disabled by endpoint policy",
+                     "denied", NULL);
+        return;
+      }
       if (!forensic_operator_gate(sm, payload, payload_len)) {
         s_rejected++;
         soar_emit_ex(id, sm, EdrCmdExecRejected, 8,
