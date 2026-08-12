@@ -583,8 +583,34 @@ jobs:
               throw "Required release test was not configured: $name"
             }
           }
-          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract)$'
-          if ($LASTEXITCODE -ne 0) { throw "Release tests failed" }
+          if ($env:EDR_RELEASE_ARCH -eq 'amd64') {
+            & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract)$'
+            if ($LASTEXITCODE -ne 0) { throw "Release tests failed" }
+            exit 0
+          }
+          if ($env:EDR_RELEASE_ARCH -ne 'arm64') {
+            throw "unsupported release test architecture: $env:EDR_RELEASE_ARCH"
+          }
+
+          # windows-latest is an AMD64 runner. ARM64 test binaries must be
+          # compiled and linked here, but cannot be started by CTest on it.
+          $arm64GateTests = @(
+            'tests\test_command_contract.exe',
+            'tests\test_agent_update_contract.exe',
+            'tests\test_agent_update_assets.exe',
+            'tests\test_windows_headless_runtime_contract.exe'
+          )
+          foreach ($relativePath in $arm64GateTests) {
+            $testExe = Join-Path 'build' $relativePath
+            if (-not (Test-Path -LiteralPath $testExe -PathType Leaf)) {
+              throw "required ARM64 release test executable was not linked: $testExe"
+            }
+            & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $testExe -Architecture arm64
+            if ($LASTEXITCODE -ne 0) {
+              throw "ARM64 release test architecture check failed: $testExe"
+            }
+          }
+          Write-Host 'ARM64 gate test executables compiled and linked; execution is deferred to an ARM64 Windows runner.'
 
       - name: "[Timing] Build summary"
         if: always()

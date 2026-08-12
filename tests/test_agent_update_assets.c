@@ -255,6 +255,14 @@ int main(void) {
            "release workflow rejects a missing lifecycle release gate");
   contains(client_release, "agent_update_packaging_contract",
            "release workflow executes the OTA packaging contract gate");
+  contains(client_release, "$env:EDR_RELEASE_ARCH -eq 'amd64'",
+           "release workflow executes gate tests only on the runner-compatible AMD64 target");
+  contains(client_release, "required ARM64 release test executable was not linked",
+           "release workflow requires every ARM64 gate-test executable to link");
+  contains(client_release, "Assert-WindowsPeArchitecture.ps1 -Path $testExe -Architecture arm64",
+           "release workflow verifies ARM64 gate-test executable architecture before packaging");
+  contains(client_release, "execution is deferred to an ARM64 Windows runner",
+           "release workflow does not attempt to execute ARM64 binaries on an AMD64 runner");
   contains(client_release, "Windows release native target $nativeTarget failed",
            "release workflow builds native uninstall binaries after gate tests without building unrelated targets");
   contains(client_release, "$releaseTargets = @(",
