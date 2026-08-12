@@ -87,6 +87,33 @@ int main(void) {
                "valid endpoint lifecycle restart contract");
   require_true(!validate("agent_uninstall", lifecycle, reason, sizeof(reason)),
                "lifecycle action must match its command type");
+  const char *uninstall =
+      "{\"schema\":\"edr.endpoint.lifecycle.v1\",\"task_id\":\"task-2\","
+      "\"action\":\"uninstall\",\"tenant_id\":\"tenant-1\",\"endpoint_id\":\"ep-1\","
+      "\"reason\":\"retire endpoint\",\"requested_by\":\"operator-1\","
+      "\"initiated_by\":\"operator\",\"keep_data\":false,"
+      "\"attestation_url\":\"https://edr.example/api/v1/agent/lifecycle/uninstall-attest\","
+      "\"attestation_token\":\"signed-token_123\","
+      "\"attestation_expires_unix_ms\":1786500000000}";
+  require_true(validate("agent_uninstall", uninstall, reason, sizeof(reason)),
+               "uninstall accepts the platform attestation payload");
+  require_true(!validate("agent_uninstall",
+                         "{\"schema\":\"edr.endpoint.lifecycle.v1\",\"task_id\":\"task-2\","
+                         "\"action\":\"uninstall\",\"tenant_id\":\"tenant-1\",\"endpoint_id\":\"ep-1\","
+                         "\"reason\":\"retire endpoint\",\"requested_by\":\"operator-1\","
+                         "\"initiated_by\":\"operator\",\"keep_data\":false}",
+                         reason, sizeof(reason)),
+               "uninstall rejects a payload without attestation");
+  require_true(!validate("agent_uninstall",
+                         "{\"schema\":\"edr.endpoint.lifecycle.v1\",\"task_id\":\"task-2\","
+                         "\"action\":\"uninstall\",\"tenant_id\":\"tenant-1\",\"endpoint_id\":\"ep-1\","
+                         "\"reason\":\"retire endpoint\",\"requested_by\":\"operator-1\","
+                         "\"initiated_by\":\"operator\",\"keep_data\":false,"
+                         "\"attestation_url\":\"http://edr.example/attest\","
+                         "\"attestation_token\":\"signed-token_123\","
+                         "\"attestation_expires_unix_ms\":1786500000000}",
+                         reason, sizeof(reason)),
+               "uninstall requires an HTTPS attestation endpoint");
   require_true(!validate("agent_restart_service",
                          "{\"schema\":\"edr.endpoint.lifecycle.v1\",\"task_id\":\"task-1\","
                          "\"action\":\"restart\",\"tenant_id\":\"tenant-1\","

@@ -278,6 +278,12 @@ static const CommandFieldRule k_endpoint_lifecycle_rules[] = {
     RULE("expected_policy_version", FIELD_STRING, 0, 0, 0, 128, 0),
     RULE("keep_data", FIELD_BOOL, 1, 0, 0, 0, 0),
     RULE("not_before_unix_ms", FIELD_NUMBER, 0, 0, 9007199254740991.0, 0, 0),
+    // Uninstall attestation is optional for restart/offboard but mandatory for
+    // agent_uninstall. Semantic validation below keeps that action-specific
+    // requirement while allowing the shared lifecycle payload schema.
+    RULE("attestation_url", FIELD_STRING, 0, 0, 0, 1024, 0),
+    RULE("attestation_token", FIELD_STRING, 0, 0, 0, 256, 0),
+    RULE("attestation_expires_unix_ms", FIELD_NUMBER, 0, 1, 9007199254740991.0, 0, 0),
 };
 
 static int contract_fail(char *reason, size_t cap, const char *message) {
@@ -595,6 +601,33 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     }
     if (!initiated_by->valuestring || strcmp(initiated_by->valuestring, "operator") != 0) {
       return contract_fail(reason, reason_cap, "endpoint lifecycle initiated_by must be operator");
+    }
+    if (kind == EDR_COMMAND_KIND_AGENT_UNINSTALL) {
+      const cJSON *attestation_url = cJSON_GetObjectItemCaseSensitive(root, "attestation_url");
+      const cJSON *attestation_token = cJSON_GetObjectItemCaseSensitive(root, "attestation_token");
+      const cJSON *attestation_expires =
+          cJSON_GetObjectItemCaseSensitive(root, "attestation_expires_unix_ms");
+      if (!has_nonempty_string(root, "attestation_url") ||
+          strncmp(attestation_url->valuestring, "https://", 8u) != 0) {
+        return contract_fail(reason, reason_cap,
+                             "agent_uninstall requires an https attestation_url");
+      }
+      if (!has_nonempty_string(root, "attestation_token")) {
+        return contract_fail(reason, reason_cap,
+                             "agent_uninstall requires an attestation_token");
+      }
+      for (const char *p = attestation_token->valuestring; *p; ++p) {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_' && *p != '.') {
+          return contract_fail(reason, reason_cap,
+                               "agent_uninstall attestation_token contains invalid characters");
+        }
+      }
+      if (!attestation_expires || attestation_expires->valuedouble < 1 ||
+          attestation_expires->valuedouble !=
+              (double)(uint64_t)attestation_expires->valuedouble) {
+        return contract_fail(reason, reason_cap,
+                             "agent_uninstall requires attestation_expires_unix_ms");
+      }
     }
   }
   if (kind == EDR_COMMAND_KIND_RTQ_EXECUTE) {
