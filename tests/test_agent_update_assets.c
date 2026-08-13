@@ -224,6 +224,10 @@ int main(void) {
            "explicit binary-hot releases prove runtime component identity after build");
   contains(workflow, "Get-ChildItem -LiteralPath $outDir -Filter \"*.dll\"",
            "release Runtime identity binds every root app-local DLL");
+  contains(workflow, "$nativeIntegrityFiles.ToArray()",
+           "release materializes the Runtime component list before ordered-manifest serialization");
+  require_true(!strstr(workflow, "files = @($nativeIntegrityFiles)"),
+               "release must not trigger PowerShell generic-list expansion inside an ordered manifest");
   contains(workflow, "arch: arm64", "release builds an ARM64 matrix target");
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");

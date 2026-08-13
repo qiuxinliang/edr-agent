@@ -714,22 +714,30 @@ jobs:
           $nativeIntegrityPath = Join-Path $outDir "native-package-integrity.json"
           $nativeIntegrityFiles = New-Object System.Collections.Generic.List[object]
           foreach ($componentPath in @($workerExe, $uninstallerExe, $uninstallScript)) {
-            $nativeIntegrityFiles.Add([ordered]@{
+            $null = $nativeIntegrityFiles.Add([ordered]@{
               name = [System.IO.Path]::GetFileName($componentPath)
               sha256 = (Get-FileHash -LiteralPath $componentPath -Algorithm SHA256).Hash.ToLowerInvariant()
             })
           }
           Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
             Sort-Object Name | ForEach-Object {
-              $nativeIntegrityFiles.Add([ordered]@{
+              $null = $nativeIntegrityFiles.Add([ordered]@{
                 name = $_.Name
                 sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
               })
             }
-          [ordered]@{
+          # PowerShell 7 can throw "Argument types do not match" when a
+          # List[object] is expanded with @($list) inside an ordered hashtable.
+          # Materialize the generic collection before constructing the manifest.
+          [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()
+          if ($nativeIntegrityFileArray.Count -lt 3) {
+            throw "native Runtime integrity manifest is incomplete: expected lifecycle components"
+          }
+          $nativeIntegrityManifest = [ordered]@{
             schema = "edr.windows.native-package-integrity.v1"
-            files = @($nativeIntegrityFiles)
-          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
+            files = $nativeIntegrityFileArray
+          }
+          $nativeIntegrityManifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
 
           $null = $items.Add($nativeIntegrityPath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
