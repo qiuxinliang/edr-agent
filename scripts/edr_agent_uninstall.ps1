@@ -36,7 +36,14 @@ $script:DeferredRuntimePaths = @()
 $script:TargetProcessIds = @()
 $script:UninstallStage = "initialization"
 $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
-$script:UninstallReceiptPath = Join-Path $programData "FDSecurity\state\uninstall-script-last.json"
+$receiptRoot = Join-Path $programData "FDSecurity\state"
+$safeLifecycleTaskID = ([string]$LifecycleTaskID) -replace '[^A-Za-z0-9_.-]', '_'
+$script:UninstallReceiptLatestPath = Join-Path $receiptRoot "uninstall-script-last.json"
+$script:UninstallReceiptPath = if ($safeLifecycleTaskID) {
+  Join-Path $receiptRoot "uninstall-script-$safeLifecycleTaskID.json"
+} else {
+  $script:UninstallReceiptLatestPath
+}
 $ConfigPath = ""
 
 function Add-CriticalFailure {
@@ -71,7 +78,7 @@ function Write-UninstallScriptReceipt {
   try {
     $parent = Split-Path -Parent $script:UninstallReceiptPath
     New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
-    [ordered]@{
+    $receiptJSON = [ordered]@{
       schema = "edr.agent.uninstall.script.v1"
       completed_at = [DateTime]::UtcNow.ToString("o")
       status = $Status
@@ -88,11 +95,22 @@ function Write-UninstallScriptReceipt {
       error_position = $ErrorPosition
       critical_errors = @($script:CriticalErrors)
       deferred_runtime_paths = @($script:DeferredRuntimePaths)
-    } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $script:UninstallReceiptPath `
+    } | ConvertTo-Json -Depth 3
+    $receiptJSON | Set-Content -LiteralPath $script:UninstallReceiptPath `
       -Encoding UTF8 -Force -ErrorAction Stop
+    if ($script:UninstallReceiptLatestPath -ne $script:UninstallReceiptPath) {
+      $receiptJSON | Set-Content -LiteralPath $script:UninstallReceiptLatestPath `
+        -Encoding UTF8 -Force -ErrorAction Stop
+    }
   } catch {
     Write-Warning ("Unable to persist uninstall diagnostic receipt: " + $_.Exception.Message)
   }
+}
+
+function Set-UninstallStage {
+  param([string]$Stage)
+  $script:UninstallStage = $Stage
+  Write-UninstallScriptReceipt -Status "running"
 }
 
 function Assert-Admin {
@@ -141,13 +159,20 @@ function Invoke-AgentEtwUninstallCleanup {
   foreach ($name in @("FDSensor.exe", "edr_agent.exe")) {
     $exe = Join-Path $InstallDir $name
     if (-not (Test-Path -LiteralPath $exe)) { continue }
+    $cleanupProcess = $null
     try {
-      & $exe --etw-uninstall-cleanup | Out-Host
-      if ($LASTEXITCODE -ne 0) {
-        Add-CleanupWarning "ETW cleanup returned exit code $LASTEXITCODE; continuing uninstall"
+      $cleanupProcess = Start-Process -FilePath $exe -ArgumentList "--etw-uninstall-cleanup" `
+        -WorkingDirectory $InstallDir -WindowStyle Hidden -PassThru -ErrorAction Stop
+      if (-not $cleanupProcess.WaitForExit(15000)) {
+        try { $cleanupProcess.Kill() } catch {}
+        Add-CleanupWarning "ETW cleanup exceeded 15 seconds and was terminated; continuing uninstall"
+      } elseif ($cleanupProcess.ExitCode -ne 0) {
+        Add-CleanupWarning "ETW cleanup returned exit code $($cleanupProcess.ExitCode); continuing uninstall"
       }
     } catch {
       Add-CleanupWarning ("ETW cleanup failed: " + $_.Exception.Message + "; continuing uninstall")
+    } finally {
+      if ($cleanupProcess) { try { $cleanupProcess.Dispose() } catch {} }
     }
     break
   }
@@ -195,6 +220,35 @@ function Wait-AgentServiceDeleted {
   return $false
 }
 
+function Disable-AgentServiceRecovery {
+  param([string]$Name)
+  if (-not (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { return }
+  try {
+    $failureArguments = @("failure", $Name, "reset=", "0", "actions=", "")
+    $failureOutput = (& sc.exe @failureArguments 2>&1 | Out-String).Trim()
+    $failureExitCode = $LASTEXITCODE
+    if ($failureOutput) { Write-Host $failureOutput }
+    if ($failureExitCode -ne 0) {
+      throw "sc.exe failure returned exit code $failureExitCode"
+    }
+    $flagArguments = @("failureflag", $Name, "0")
+    $flagOutput = (& sc.exe @flagArguments 2>&1 | Out-String).Trim()
+    $flagExitCode = $LASTEXITCODE
+    if ($flagOutput) { Write-Host $flagOutput }
+    if ($flagExitCode -ne 0) {
+      throw "sc.exe failureflag returned exit code $flagExitCode"
+    }
+    Write-Host "Disabled Windows service recovery: $Name"
+  } catch {
+    # The detached lifecycle worker disables recovery with the native SCM API
+    # before it starts uninstall.exe.  Keep this script-level guard best effort:
+    # Windows PowerShell 5.1 can drop the intentionally empty actions argument
+    # while serializing native command lines, which must not abort teardown after
+    # the authoritative native guard already succeeded.
+    Add-CleanupWarning ("Failed to disable Windows service recovery for ${Name}: " + $_.Exception.Message)
+  }
+}
+
 function Remove-AgentServices {
   $serviceNames = @($ServiceName, "FDSecurityAgent", "EdrAgent")
   if ($env:EDR_SERVICE_NAME) { $serviceNames += $env:EDR_SERVICE_NAME }
@@ -206,6 +260,7 @@ function Remove-AgentServices {
     }
     $service = Get-Service -Name $name -ErrorAction SilentlyContinue
     if (-not $service) { continue }
+    Disable-AgentServiceRecovery -Name $name
     Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
     try {
       $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20))
@@ -365,7 +420,13 @@ function Start-DeferredProgramFilesRemoval {
   $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
   $receiptDir = Join-Path $programData "FDSecurity\state"
   New-Item -ItemType Directory -Path $receiptDir -Force -ErrorAction Stop | Out-Null
-  $quotedReceipt = (Join-Path $receiptDir "uninstall-cleanup-last.json").Replace("'", "''")
+  $cleanupReceiptName = if ($safeLifecycleTaskID) {
+    "uninstall-cleanup-$safeLifecycleTaskID.json"
+  } else {
+    "uninstall-cleanup-last.json"
+  }
+  $quotedReceipt = (Join-Path $receiptDir $cleanupReceiptName).Replace("'", "''")
+  $quotedLatestReceipt = (Join-Path $receiptDir "uninstall-cleanup-last.json").Replace("'", "''")
   $cleanup = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 `$parentId = $ParentProcessId
@@ -376,6 +437,7 @@ if (`$parentId -gt 0) {
 Start-Sleep -Milliseconds 750
 `$target = '$quotedDir'
 `$receipt = '$quotedReceipt'
+`$latestReceipt = '$quotedLatestReceipt'
 `$serviceName = '$quotedService'
 `$attestationURL = '$quotedAttestationURL'
 `$attestationToken = '$quotedAttestationToken'
@@ -570,7 +632,7 @@ if (`$attestationStatus -eq 'failed') {
 }
 `$attestationRequired = -not [string]::IsNullOrWhiteSpace(`$attestationURL)
 `$overallSucceeded = `$localSucceeded -and (-not `$attestationRequired -or `$attestationStatus -eq 'succeeded')
-[ordered]@{
+`$receiptJSON = [ordered]@{
   schema = 'edr.agent.uninstall.cleanup.v1'
   completed_at = [DateTime]::UtcNow.ToString('o')
   local_teardown_completed_at = `$teardownCompletedAt
@@ -596,7 +658,11 @@ if (`$attestationStatus -eq 'failed') {
   failure_reasons = @(`$failureReasons)
   lifecycle_task_id = `$taskID
   endpoint_id = `$endpointID
-} | ConvertTo-Json -Depth 2 | Set-Content -LiteralPath `$receipt -Encoding UTF8 -Force -ErrorAction Stop
+} | ConvertTo-Json -Depth 2
+`$receiptJSON | Set-Content -LiteralPath `$receipt -Encoding UTF8 -Force -ErrorAction Stop
+if (`$latestReceipt -ne `$receipt) {
+  `$receiptJSON | Set-Content -LiteralPath `$latestReceipt -Encoding UTF8 -Force -ErrorAction Stop
+}
 `$cleanupStatus = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }
 Write-Output ("deferred_cleanup status=" + `$cleanupStatus + " attestation_status=" +
   `$attestationStatus + " failure_reasons=" + (`$failureReasons -join ','))
@@ -616,6 +682,10 @@ if (-not `$overallSucceeded) { exit 1 }
     $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     $cleanupStdout = Join-Path $receiptDir "uninstall-cleanup-last.stdout.log"
     $cleanupStderr = Join-Path $receiptDir "uninstall-cleanup-last.stderr.log"
+    if ($safeLifecycleTaskID) {
+      $cleanupStdout = Join-Path $receiptDir ("uninstall-cleanup-$safeLifecycleTaskID.stdout.log")
+      $cleanupStderr = Join-Path $receiptDir ("uninstall-cleanup-$safeLifecycleTaskID.stderr.log")
+    }
     Remove-Item -LiteralPath $cleanupStdout, $cleanupStderr -Force -ErrorAction SilentlyContinue
     Start-Process -FilePath $powershell -WorkingDirectory $env:SystemRoot -WindowStyle Hidden -ArgumentList @(
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded
@@ -693,36 +763,36 @@ try {
   }
   $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
   $ConfigPath = Join-Path $InstallDir "agent.toml"
-  $script:UninstallStage = "admin_check"
+  Set-UninstallStage -Stage "admin_check"
   Assert-Admin
   Write-Host "Uninstalling FDSecurity runtime from $InstallDir"
 
-  $script:UninstallStage = "service_cleanup"
+  Set-UninstallStage -Stage "service_cleanup"
   Remove-AgentServices
-  $script:UninstallStage = "scheduled_task_cleanup"
+  Set-UninstallStage -Stage "scheduled_task_cleanup"
   Remove-AgentScheduledTasks
-  $script:UninstallStage = "process_cleanup"
+  Set-UninstallStage -Stage "process_cleanup"
   Stop-AgentProcesses
-  $script:UninstallStage = "etw_cleanup"
+  Set-UninstallStage -Stage "etw_cleanup"
   Invoke-AgentEtwUninstallCleanup
-  $script:UninstallStage = "identity_cleanup"
+  Set-UninstallStage -Stage "identity_cleanup"
   Remove-AgentClientCertificate
-  $script:UninstallStage = "environment_cleanup"
+  Set-UninstallStage -Stage "environment_cleanup"
   Remove-MachineEnvironment
-  $script:UninstallStage = "registration_cleanup"
+  Set-UninstallStage -Stage "registration_cleanup"
   Remove-HeadlessUninstallRegistration
 
   $diagnosticArchive = ""
   if ($PreserveDiagnostics) {
-    $script:UninstallStage = "diagnostics_archive"
+    Set-UninstallStage -Stage "diagnostics_archive"
     $diagnosticArchive = Export-AgentDiagnostics
   }
   if ($RemoveData -or $RemoveProgramFiles) {
-    $script:UninstallStage = "acl_preparation"
+    Set-UninstallStage -Stage "acl_preparation"
     Grant-InstallDirectoryRemovalRights
   }
   if ($RemoveData) {
-    $script:UninstallStage = "runtime_data_cleanup"
+    Set-UninstallStage -Stage "runtime_data_cleanup"
     Remove-AgentData
   } elseif ($PreserveDiagnostics) {
     Write-Host "Only logs and diagnostics were archived; credentials, configuration and runtime state will not be retained."
@@ -733,16 +803,16 @@ try {
     throw ("Uninstall stopped after critical cleanup failures: " + ($script:CriticalErrors -join "; "))
   }
   if ($RemoveProgramFiles) {
-    $script:UninstallStage = "deferred_program_files_cleanup"
+    Set-UninstallStage -Stage "deferred_program_files_cleanup"
     Start-DeferredProgramFilesRemoval
-    $script:UninstallStage = "deferred_cleanup_scheduled"
+    Set-UninstallStage -Stage "deferred_cleanup_scheduled"
     if ($diagnosticArchive) {
       Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal; diagnostics archive: $diagnosticArchive"
     } else {
       Write-Host "FDSecurity Agent uninstalled successfully. Program files are scheduled for removal."
     }
   } else {
-    $script:UninstallStage = "completed"
+    Set-UninstallStage -Stage "completed"
     Write-Host "FDSecurity runtime unregistered successfully. Program files remain in place for audit/recovery."
   }
   Write-UninstallScriptReceipt -Status "accepted"

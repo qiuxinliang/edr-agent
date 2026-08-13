@@ -18,6 +18,20 @@ static const char *HEADLESS_UNINSTALLER_CAPABILITIES =
     "\"component\":\"headless-uninstaller\","
     "\"uninstall_attestation\":\"v2\","
     "\"powershell_token_handoff\":true}";
+static wchar_t s_diagnostic_task_id[129];
+
+static DWORD child_creation_flags(DWORD base_flags) {
+  BOOL in_job = FALSE;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+  if (!IsProcessInJob(GetCurrentProcess(), NULL, &in_job) || !in_job) return base_flags;
+  ZeroMemory(&limits, sizeof(limits));
+  if (QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation, &limits,
+                                sizeof(limits), NULL) &&
+      (limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK)) {
+    return base_flags | CREATE_BREAKAWAY_FROM_JOB;
+  }
+  return base_flags;
+}
 
 static int has_flag(int argc, wchar_t **argv, const wchar_t *flag) {
   int i;
@@ -94,10 +108,27 @@ static int ensure_directory(const wchar_t *path) {
   return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+static void set_diagnostic_task_id(const wchar_t *task_id) {
+  size_t pos = 0;
+  s_diagnostic_task_id[0] = L'\0';
+  if (!task_id) return;
+  while (*task_id && pos + 1 < sizeof(s_diagnostic_task_id) / sizeof(s_diagnostic_task_id[0])) {
+    wchar_t ch = *task_id++;
+    if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') ||
+        (ch >= L'0' && ch <= L'9') || ch == L'-' || ch == L'_' || ch == L'.') {
+      s_diagnostic_task_id[pos++] = ch;
+    } else {
+      s_diagnostic_task_id[pos++] = L'_';
+    }
+  }
+  s_diagnostic_task_id[pos] = L'\0';
+}
+
 static int get_powershell_log_path(wchar_t *out, size_t out_count) {
   wchar_t program_data[MAX_PATH * 2];
   wchar_t vendor_dir[MAX_PATH * 3];
   wchar_t state_dir[MAX_PATH * 3];
+  wchar_t log_name[256];
   DWORD n = GetEnvironmentVariableW(L"ProgramData", program_data,
                                     (DWORD)(sizeof(program_data) / sizeof(program_data[0])));
   if (n == 0 || n >= sizeof(program_data) / sizeof(program_data[0])) return 0;
@@ -109,7 +140,14 @@ static int get_powershell_log_path(wchar_t *out, size_t out_count) {
       !ensure_directory(state_dir)) {
     return 0;
   }
-  return join_path(out, out_count, state_dir, L"uninstall-powershell-last.log");
+  if (s_diagnostic_task_id[0]) {
+    _snwprintf(log_name, sizeof(log_name) / sizeof(log_name[0]),
+               L"uninstall-powershell-%ls.log", s_diagnostic_task_id);
+    log_name[(sizeof(log_name) / sizeof(log_name[0])) - 1] = L'\0';
+  } else {
+    wcscpy(log_name, L"uninstall-powershell-last.log");
+  }
+  return join_path(out, out_count, state_dir, log_name);
 }
 
 static void append_utf8_line(const wchar_t *path, const wchar_t *line) {
@@ -239,10 +277,15 @@ static int current_process_is_elevated(void) {
   return elevated;
 }
 
-static int wait_for_process(HANDLE process) {
+static int wait_for_process(HANDLE process, DWORD timeout_ms) {
   DWORD exit_code = ERROR_GEN_FAILURE;
   if (!process) return ERROR_INVALID_HANDLE;
-  if (WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0) {
+  DWORD wait_result = WaitForSingleObject(process, timeout_ms);
+  if (wait_result == WAIT_TIMEOUT) {
+    TerminateProcess(process, ERROR_TIMEOUT);
+    WaitForSingleObject(process, 5000);
+    exit_code = ERROR_TIMEOUT;
+  } else if (wait_result != WAIT_OBJECT_0) {
     exit_code = GetLastError();
   } else if (!GetExitCodeProcess(process, &exit_code)) {
     exit_code = GetLastError();
@@ -276,7 +319,6 @@ static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *
   diagnostic_path[0] = L'\0';
   if (get_powershell_log_path(diagnostic_path,
                               sizeof(diagnostic_path) / sizeof(diagnostic_path[0]))) {
-    DeleteFileW(diagnostic_path);
     append_utf8_line(diagnostic_path, L"uninstall_powershell_launch mode=direct elevated=true");
     ZeroMemory(&security, sizeof(security));
     security.nLength = sizeof(security);
@@ -297,7 +339,8 @@ static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *
     }
   }
   if (!CreateProcessW(powershell_path, command, NULL, NULL, inherit_handles,
-                      silent ? CREATE_NO_WINDOW : 0, NULL, install_dir, &startup, &process)) {
+                      child_creation_flags(silent ? CREATE_NO_WINDOW : 0),
+                      NULL, install_dir, &startup, &process)) {
     int error = (int)GetLastError();
     if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
     if (diagnostic != INVALID_HANDLE_VALUE) CloseHandle(diagnostic);
@@ -307,7 +350,7 @@ static int run_powershell_direct(const wchar_t *powershell_path, const wchar_t *
   if (diagnostic != INVALID_HANDLE_VALUE) CloseHandle(diagnostic);
   CloseHandle(process.hThread);
   {
-    int rc = wait_for_process(process.hProcess);
+    int rc = wait_for_process(process.hProcess, 240000);
     wchar_t result[128];
     _snwprintf(result, sizeof(result) / sizeof(result[0]),
                L"uninstall_powershell_exit_code=%d", rc);
@@ -345,13 +388,16 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
    * flow. An already elevated process must preserve its token and launch
    * PowerShell directly; only a manual, non-elevated invocation needs UAC. */
   if (current_process_is_elevated()) {
+    if (get_powershell_log_path(diagnostic_path,
+                                sizeof(diagnostic_path) / sizeof(diagnostic_path[0]))) {
+      append_utf8_line(diagnostic_path, L"uninstall_native_stage=powershell_direct");
+    }
     return run_powershell_direct(powershell_path, parameters, install_dir, silent);
   }
 
   diagnostic_path[0] = L'\0';
   if (get_powershell_log_path(diagnostic_path,
                               sizeof(diagnostic_path) / sizeof(diagnostic_path[0]))) {
-    DeleteFileW(diagnostic_path);
     append_utf8_line(diagnostic_path,
                      L"uninstall_powershell_launch mode=runas elevated=false");
   }
@@ -368,7 +414,7 @@ static int run_uninstall_script(const wchar_t *script, const wchar_t *install_di
   if (!ShellExecuteExW(&exec_info)) return (int)GetLastError();
   if (!exec_info.hProcess) return ERROR_INVALID_HANDLE;
   {
-    int rc = wait_for_process(exec_info.hProcess);
+    int rc = wait_for_process(exec_info.hProcess, 240000);
     wchar_t result[128];
     _snwprintf(result, sizeof(result) / sizeof(result[0]),
                L"uninstall_powershell_exit_code=%d", rc);
@@ -442,6 +488,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   attestation_token = arg_value(argc, argv, L"--attestation-token");
   task_id = arg_value(argc, argv, L"--task-id");
   endpoint_id = arg_value(argc, argv, L"--endpoint-id");
+  set_diagnostic_task_id(task_id);
   _snwprintf(install_dir, sizeof(install_dir) / sizeof(install_dir[0]), L"%ls",
              requested_dir && requested_dir[0] ? requested_dir : exe_dir);
   if (!join_path(script_path, sizeof(script_path) / sizeof(script_path[0]), install_dir,
@@ -449,6 +496,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     show_error(silent, L"未找到 uninstall.ps1，无法执行完整卸载。", ERROR_FILE_NOT_FOUND);
     LocalFree(argv);
     return ERROR_FILE_NOT_FOUND;
+  }
+
+  {
+    wchar_t diagnostic_path[MAX_PATH * 4];
+    if (get_powershell_log_path(diagnostic_path,
+                                sizeof(diagnostic_path) / sizeof(diagnostic_path[0]))) {
+      wchar_t line[256];
+      DeleteFileW(diagnostic_path);
+      _snwprintf(line, sizeof(line) / sizeof(line[0]),
+                 L"uninstall_native_start pid=%lu silent=%d elevated=%d",
+                 (unsigned long)GetCurrentProcessId(), silent,
+                 current_process_is_elevated());
+      line[(sizeof(line) / sizeof(line[0])) - 1] = L'\0';
+      append_utf8_line(diagnostic_path, line);
+    }
   }
 
   if (!silent) {

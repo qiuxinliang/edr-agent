@@ -12,6 +12,19 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+static DWORD lifecycle_child_creation_flags(DWORD base_flags) {
+  BOOL in_job = FALSE;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+  if (!IsProcessInJob(GetCurrentProcess(), NULL, &in_job) || !in_job) return base_flags;
+  memset(&limits, 0, sizeof(limits));
+  if (QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation, &limits,
+                                sizeof(limits), NULL) &&
+      (limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK)) {
+    return base_flags | CREATE_BREAKAWAY_FROM_JOB;
+  }
+  return base_flags;
+}
 #endif
 
 typedef struct EdrAgentLifecycleRequest {
@@ -167,9 +180,7 @@ static int lifecycle_paths(const char *command_id, char *helper, size_t helper_c
   if (!slash) return 0;
   *slash = '\0';
   if (snprintf(helper, helper_cap, "%s\\FDSecurityInstallerWorker.exe", module) >=
-          (int)helper_cap ||
-      snprintf(log_path, log_cap, "%s\\diagnostics\\lifecycle-worker.log", module) >=
-          (int)log_cap) {
+          (int)helper_cap) {
     return 0;
   }
   char program_data[MAX_PATH];
@@ -183,6 +194,9 @@ static int lifecycle_paths(const char *command_id, char *helper, size_t helper_c
   }
   safe_command[pos] = '\0';
   if (!safe_command[0] ||
+      snprintf(log_path, log_cap,
+               "%s\\FDSecurity\\state\\agent-lifecycle-%s.worker.log",
+               program_data, safe_command) >= (int)log_cap ||
       snprintf(journal, journal_cap,
                "%s\\FDSecurity\\state\\agent-lifecycle-%s.journal.json",
                program_data, safe_command) >= (int)journal_cap) {
@@ -223,7 +237,8 @@ static int launch_worker(const char *helper, const char *journal, const char *lo
   startup.dwFlags = STARTF_USESHOWWINDOW;
   startup.wShowWindow = SW_HIDE;
   if (!CreateProcessA(NULL, command, NULL, NULL, FALSE,
-                      CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &startup, &process)) {
+                      lifecycle_child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS),
+                      NULL, NULL, &startup, &process)) {
     return 0;
   }
   CloseHandle(process.hThread);

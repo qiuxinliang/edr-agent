@@ -17,6 +17,19 @@ static const char *INSTALLER_WORKER_CAPABILITIES =
     "\"uninstall_attestation\":\"v2\","
     "\"token_handoff\":true}";
 
+static DWORD child_creation_flags(DWORD base_flags) {
+  BOOL in_job = FALSE;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+  if (!IsProcessInJob(GetCurrentProcess(), NULL, &in_job) || !in_job) return base_flags;
+  ZeroMemory(&limits, sizeof(limits));
+  if (QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation, &limits,
+                                sizeof(limits), NULL) &&
+      (limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_BREAKAWAY_OK)) {
+    return base_flags | CREATE_BREAKAWAY_FROM_JOB;
+  }
+  return base_flags;
+}
+
 static const wchar_t *arg_value(int argc, wchar_t **argv, const wchar_t *key) {
   for (int i = 1; i + 1 < argc; ++i) {
     if (_wcsicmp(argv[i], key) == 0) return argv[i + 1];
@@ -1280,6 +1293,57 @@ static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *j
   return rc;
 }
 
+static int configure_service_recovery(const wchar_t *service_name, int enabled,
+                                      const wchar_t *log_path) {
+  SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+  SC_HANDLE svc = scm ? OpenServiceW(scm, service_name, SERVICE_CHANGE_CONFIG) : NULL;
+  SC_ACTION actions[2];
+  SERVICE_FAILURE_ACTIONSW failure;
+  SERVICE_FAILURE_ACTIONS_FLAG failure_flag;
+  ZeroMemory(actions, sizeof(actions));
+  ZeroMemory(&failure, sizeof(failure));
+  ZeroMemory(&failure_flag, sizeof(failure_flag));
+  if (enabled) {
+    actions[0].Type = SC_ACTION_RESTART;
+    actions[0].Delay = 60000;
+    actions[1].Type = SC_ACTION_RESTART;
+    actions[1].Delay = 60000;
+    failure.dwResetPeriod = 86400;
+    failure.cActions = 2;
+    failure.lpsaActions = actions;
+  }
+  failure_flag.fFailureActionsOnNonCrashFailures = FALSE;
+  if (!svc || !ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure) ||
+      !ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag)) {
+    DWORD gle = GetLastError();
+    wchar_t line[256];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]),
+               enabled ? L"lifecycle_uninstall_restore_recovery_failed gle=%lu"
+                       : L"lifecycle_uninstall_disable_recovery_failed gle=%lu",
+               (unsigned long)gle);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    if (svc) CloseServiceHandle(svc);
+    if (scm) CloseServiceHandle(scm);
+    return 0;
+  }
+  CloseServiceHandle(svc);
+  CloseServiceHandle(scm);
+  append_log_utf8(log_path, enabled ? L"lifecycle_uninstall_service_recovery_restored"
+                                    : L"lifecycle_uninstall_service_recovery_disabled");
+  return 1;
+}
+
+static int lifecycle_uninstall_failed(const wchar_t *service_name,
+                                      const wchar_t *log_path, int rc) {
+  if (configure_service_recovery(service_name, 1, log_path)) {
+    int start_rc = start_service_by_name(service_name, log_path);
+    append_log_utf8(log_path, start_rc == 0 ? L"lifecycle_uninstall_failure_service_restarted"
+                                             : L"lifecycle_uninstall_failure_service_restart_failed");
+  }
+  return rc;
+}
+
 static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t *service_name,
                                        int keep_data, const wchar_t *attestation_url,
                                        const wchar_t *attestation_token, const wchar_t *task_id,
@@ -1291,6 +1355,10 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
   if (!file_exists(uninstaller)) {
     append_log_utf8(log_path, L"lifecycle_uninstall_missing_uninstall_exe");
     return 8;
+  }
+  if (!configure_service_recovery(service_name, 0, log_path)) {
+    configure_service_recovery(service_name, 1, log_path);
+    return 13;
   }
   quote_arg(quoted_exe, sizeof(quoted_exe) / sizeof(quoted_exe[0]), uninstaller);
   quote_arg(quoted_dir, sizeof(quoted_dir) / sizeof(quoted_dir[0]), install_dir);
@@ -1314,29 +1382,44 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
   startup.dwFlags = STARTF_USESHOWWINDOW;
   startup.wShowWindow = SW_HIDE;
   if (!CreateProcessW(NULL, command, NULL, NULL, FALSE,
-                      CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, install_dir,
+                      child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS),
+                      NULL, install_dir,
                       &startup, &process)) {
-    append_log_utf8(log_path, L"lifecycle_uninstall_launch_failed");
-    return 9;
+    wchar_t line[256];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]),
+               L"lifecycle_uninstall_launch_failed gle=%lu", (unsigned long)GetLastError());
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    return lifecycle_uninstall_failed(service_name, log_path, 9);
   }
   CloseHandle(process.hThread);
-  append_log_utf8(log_path, L"lifecycle_uninstall_launched");
+  {
+    wchar_t line[256];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]),
+               L"lifecycle_uninstall_launched pid=%lu", (unsigned long)process.dwProcessId);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+  }
   DWORD wait_result = WaitForSingleObject(process.hProcess, 300000);
   if (wait_result == WAIT_TIMEOUT) {
     append_log_utf8(log_path, L"lifecycle_uninstall_completion_timeout");
+    TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+    WaitForSingleObject(process.hProcess, 5000);
     CloseHandle(process.hProcess);
-    return 10;
+    return lifecycle_uninstall_failed(service_name, log_path, 10);
   }
   if (wait_result != WAIT_OBJECT_0) {
     append_log_utf8(log_path, L"lifecycle_uninstall_wait_failed");
+    TerminateProcess(process.hProcess, ERROR_GEN_FAILURE);
+    WaitForSingleObject(process.hProcess, 5000);
     CloseHandle(process.hProcess);
-    return 11;
+    return lifecycle_uninstall_failed(service_name, log_path, 11);
   }
   DWORD exit_code = ERROR_GEN_FAILURE;
   if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
     append_log_utf8(log_path, L"lifecycle_uninstall_exit_code_unavailable");
     CloseHandle(process.hProcess);
-    return 12;
+    return lifecycle_uninstall_failed(service_name, log_path, 12);
   }
   CloseHandle(process.hProcess);
   if (exit_code != 0) {
@@ -1345,7 +1428,7 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
                L"lifecycle_uninstall_failed exit_code=%lu", (unsigned long)exit_code);
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
     append_log_utf8(log_path, line);
-    return (int)exit_code;
+    return lifecycle_uninstall_failed(service_name, log_path, (int)exit_code);
   }
   append_log_utf8(log_path, L"lifecycle_uninstall_completed");
   return 0;

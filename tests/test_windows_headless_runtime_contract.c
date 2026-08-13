@@ -223,6 +223,10 @@ int main(void) {
   if (!uninstall_ps) return 1;
   ok &= require_contains(uninstall_ps, "takeown.exe /F $InstallDir /A /R /D Y",
                          "uninstall cleanup must recover ownership recursively");
+  ok &= require_contains(uninstall_ps, "function Disable-AgentServiceRecovery",
+                         "uninstall must disable Windows service recovery before teardown");
+  ok &= require_contains(uninstall_ps, "failureflag",
+                         "uninstall must prevent non-crash failures from restarting the service");
   ok &= require_contains(uninstall_ps, "/reset /T /C /Q",
                          "uninstall cleanup must remove stale deny and inheritance ACL state");
   ok &= require_contains(uninstall_ps, "[IO.FileAttributes]::Normal",
@@ -243,7 +247,9 @@ int main(void) {
                          "loopback attestation must bind the exact UTF-8 body length");
   ok &= require_contains(uninstall_ps, "Skipped unrelated $name process PID",
                          "uninstall must scope process termination to the target installation");
-  ok &= require_contains(uninstall_ps, "ETW cleanup returned exit code $LASTEXITCODE; continuing uninstall",
+  ok &= require_contains(uninstall_ps, "ETW cleanup exceeded 15 seconds and was terminated; continuing uninstall",
+                         "best-effort ETW cleanup must have a bounded execution window");
+  ok &= require_contains(uninstall_ps, "ETW cleanup returned exit code $($cleanupProcess.ExitCode); continuing uninstall",
                          "best-effort ETW cleanup must not poison complete uninstall status");
   ok &= require_contains(uninstall_ps, "uninstall-script-last.json",
                          "uninstall must persist the exact synchronous failure stage outside program files");
@@ -304,10 +310,20 @@ int main(void) {
                        "headless uninstall prompts must never use the ANSI Windows API");
   ok &= require_contains(headless_uninstaller, "uninstall-powershell-last.log",
                          "native uninstall must capture PowerShell output outside the removable install directory");
+  ok &= require_contains(headless_uninstaller, "uninstall-powershell-%ls.log",
+                         "remote uninstall must preserve task-bound PowerShell diagnostics");
+  ok &= require_contains(headless_uninstaller, "uninstall_native_start pid=%lu",
+                         "native uninstall must record entry before launching PowerShell");
   ok &= require_contains(headless_uninstaller, "详细诊断日志",
                          "native uninstall dialog must point operators to the captured PowerShell diagnostics");
   ok &= require_contains(headless_uninstaller, "STARTF_USESTDHANDLES",
                          "native uninstall must redirect child stdout and stderr for actionable CI diagnostics");
+  ok &= require_contains(headless_uninstaller, "wait_for_process(process.hProcess, 240000)",
+                         "native uninstall must bound a stalled PowerShell cleanup");
+  ok &= require_contains(headless_uninstaller, "TerminateProcess(process, ERROR_TIMEOUT)",
+                         "native uninstall must terminate and report a timed-out PowerShell cleanup");
+  ok &= require_contains(headless_uninstaller, "CREATE_BREAKAWAY_FROM_JOB",
+                         "PowerShell cleanup must survive parent service Job Object teardown");
   ok &= require_contains(headless_uninstaller, "--capability-probe",
                          "native uninstaller must expose a machine-readable release capability probe");
   ok &= require_contains(headless_uninstaller, "\\\"uninstall_attestation\\\":\\\"v2\\\"",

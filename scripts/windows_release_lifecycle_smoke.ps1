@@ -367,12 +367,12 @@ try {
   $lifecycleCommandId = "cmd_lifecycle_uninstall_ci_$($TargetVersion.Replace('.', '_'))"
   $lifecycleTaskId = "ci-lifecycle-uninstall-$($TargetVersion.Replace('.', '-'))"
   $lifecycleJournal = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.journal.json"
-  $lifecycleLog = Join-Path $installDir "diagnostics\lifecycle-worker.log"
-  $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-last.json"
-  $cleanupStdout = Join-Path $programDataState "uninstall-cleanup-last.stdout.log"
-  $cleanupStderr = Join-Path $programDataState "uninstall-cleanup-last.stderr.log"
-  $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-last.json"
-  $uninstallPowerShellLog = Join-Path $programDataState "uninstall-powershell-last.log"
+  $lifecycleLog = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.worker.log"
+  $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-$lifecycleTaskId.json"
+  $cleanupStdout = Join-Path $programDataState "uninstall-cleanup-$lifecycleTaskId.stdout.log"
+  $cleanupStderr = Join-Path $programDataState "uninstall-cleanup-$lifecycleTaskId.stderr.log"
+  $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-$lifecycleTaskId.json"
+  $uninstallPowerShellLog = Join-Path $programDataState "uninstall-powershell-$lifecycleTaskId.log"
   $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
   $attestationAttempts = Join-Path $EvidenceDir "uninstall-attestation-attempts.json"
   $attestationReady = Join-Path $EvidenceDir "uninstall-attestation-listener-ready.json"
@@ -384,7 +384,6 @@ try {
   $attestationTokenSha256 = Get-TextSha256 -Value $attestationToken
   $attestationProof = Get-UninstallAttestationProof -Token $attestationToken `
     -TaskID $lifecycleTaskId -EndpointID "ci-lifecycle-smoke"
-  New-Item -ItemType Directory -Path (Split-Path -Parent $lifecycleLog) -Force | Out-Null
   New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
   Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $cleanupStdout, $cleanupStderr, `
     $uninstallScriptReceipt, $uninstallPowerShellLog, `

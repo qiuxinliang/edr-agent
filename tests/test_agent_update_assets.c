@@ -328,6 +328,12 @@ int main(void) {
            "lifecycle smoke exercises the same worker stage used by remote uninstall");
   contains(lifecycle_smoke, "lifecycle uninstall journal reported failure",
            "lifecycle smoke requires the detached worker terminal journal");
+  contains(lifecycle_smoke, "agent-lifecycle-$lifecycleCommandId.worker.log",
+           "lifecycle smoke preserves task-bound worker diagnostics outside program files");
+  contains(lifecycle_smoke, "uninstall-script-$lifecycleTaskId.json",
+           "lifecycle smoke reads the exact task-specific synchronous uninstall receipt");
+  contains(lifecycle_smoke, "uninstall-cleanup-$lifecycleTaskId.json",
+           "lifecycle smoke reads the exact task-specific deferred cleanup receipt");
   contains(lifecycle_smoke, "deferred uninstall cleanup did not write its receipt",
            "lifecycle smoke verifies the asynchronous program-file cleanup result");
   contains(lifecycle_smoke, "uninstall-attestation-callback.json",
@@ -425,6 +431,8 @@ int main(void) {
            "native uninstall forwards the task-pinned one-time attestation secret");
   contains(uninstaller, "uninstall-powershell-last.log",
            "native uninstall preserves PowerShell output outside the removed program directory");
+  contains(uninstaller, "uninstall-powershell-%ls.log",
+           "remote uninstall preserves task-bound PowerShell diagnostics across reinstall attempts");
   contains(uninstaller, "详细诊断日志",
            "native uninstall dialog exposes the captured PowerShell diagnostic path");
   free(uninstaller);
@@ -434,6 +442,8 @@ int main(void) {
   require_true(uninstall_script != NULL, "read Windows uninstall script");
   contains(uninstall_script, "function Wait-AgentServiceDeleted",
            "uninstall verifies that Windows services disappear");
+  contains(uninstall_script, "function Disable-AgentServiceRecovery",
+           "manual and remote uninstall disable SCM automatic service restart");
   contains(uninstall_script, "$service.Dispose()",
            "uninstall releases ServiceController handles before service deletion");
   contains(uninstall_script, "Get-CimInstance Win32_Service",
@@ -502,8 +512,16 @@ int main(void) {
            "uninstall never kills an unrelated same-name process by image name alone");
   contains(uninstall_script, "uninstall-script-last.json",
            "uninstall persists a stage-specific synchronous failure receipt outside program files");
-  contains(uninstall_script, "continuing uninstall",
+  contains(uninstall_script, "uninstall-script-$safeLifecycleTaskID.json",
+           "uninstall preserves a task-specific synchronous receipt across later reinstall attempts");
+  contains(uninstall_script, "uninstall-cleanup-$safeLifecycleTaskID.json",
+           "deferred cleanup preserves a task-specific receipt across later reinstall attempts");
+  contains(uninstall_script, "function Set-UninstallStage",
+           "uninstall checkpoints every synchronous stage before executing it");
+  contains(uninstall_script, "ETW cleanup exceeded 15 seconds and was terminated; continuing uninstall",
            "best-effort ETW cleanup cannot block verified service and directory removal");
+  contains(uninstall_script, "Write-UninstallScriptReceipt -Status \"running\"",
+           "uninstall persists a receipt before entering teardown stages");
   contains(uninstall_script, "exit 0",
            "handled native helper warnings cannot leak a stale process exit code");
   free(uninstall_script);
@@ -513,6 +531,18 @@ int main(void) {
   require_true(installer_worker != NULL, "read Windows installer worker");
   contains(installer_worker, "WaitForSingleObject(process.hProcess, 300000)",
            "remote uninstall observes native uninstaller completion");
+  contains(installer_worker, "lifecycle_uninstall_launched pid=%lu",
+           "remote uninstall logs the launched native uninstaller PID");
+  contains(installer_worker, "CREATE_BREAKAWAY_FROM_JOB",
+           "native uninstaller must survive Agent service Job Object teardown");
+  contains(installer_worker, "lifecycle_uninstall_service_recovery_disabled",
+           "remote uninstall must disable SCM recovery before stopping the Agent service");
+  contains(installer_worker, "lifecycle_uninstall_service_recovery_restored",
+           "failed remote uninstall must restore SCM recovery before recovering the Agent service");
+  contains(installer_worker, "lifecycle_uninstall_failure_service_restarted",
+           "failed remote uninstall must recover endpoint availability after recording failure");
+  contains(installer_worker, "TerminateProcess(process.hProcess, ERROR_TIMEOUT)",
+           "timed-out native uninstall must stop before endpoint service recovery begins");
   contains(installer_worker, "lifecycle_uninstall_completed",
            "remote uninstall journals verified native completion");
   contains(installer_worker, "--service-name %ls",
@@ -526,6 +556,10 @@ int main(void) {
   require_true(lifecycle_command != NULL, "read endpoint lifecycle command implementation");
   contains(lifecycle_command, "--install-dir \\\"%s\\\"",
            "remote lifecycle handoff pins the worker to its installed runtime directory");
+  contains(lifecycle_command, "agent-lifecycle-%s.worker.log",
+           "remote lifecycle diagnostics are task-bound and survive removal of the installation directory");
+  contains(lifecycle_command, "CREATE_BREAKAWAY_FROM_JOB",
+           "lifecycle worker must escape the Agent service Job Object before stopping it");
   contains(lifecycle_command, "safe_https_url",
            "remote uninstall accepts only HTTPS attestation destinations");
   contains(lifecycle_command, "--attestation-token \\\"",

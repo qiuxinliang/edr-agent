@@ -113,6 +113,19 @@ static void try_install_job_windows(void) {
     s_job = NULL;
     return;
   }
+  {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    if (!SetInformationJobObject(s_job, JobObjectExtendedLimitInformation,
+                                 &limits, sizeof(limits))) {
+      fprintf(stderr, "[self_protect] SetInformationJobObject breakaway failed (%lu)\n",
+              (unsigned long)GetLastError());
+      CloseHandle(s_job);
+      s_job = NULL;
+      return;
+    }
+  }
   if (!AssignProcessToJobObject(s_job, GetCurrentProcess())) {
     fprintf(stderr, "[self_protect] AssignProcessToJobObject failed (%lu)\n", (unsigned long)GetLastError());
     CloseHandle(s_job);
