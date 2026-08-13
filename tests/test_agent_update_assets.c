@@ -119,6 +119,8 @@ int main(void) {
   contains(command, "update staging file path is too long", "staging file truncation fails before download");
   contains(command, "temp, safe_id", "staging directory uses the same normalized command identity as cleanup");
   contains(command, "updater_info.error_code", "runtime failure reports the exact updater readiness error before download");
+  contains(command, "describe_http_download_failure", "download failures preserve the bounded transport diagnostic");
+  contains(command, "runtime package download failed", "runtime package errors no longer mislabel every failure as authentication");
   free(command);
 
   snprintf(path, sizeof(path), "%s/tests/test_agent_update_contract.c", root);
@@ -128,6 +130,8 @@ int main(void) {
            "Windows update contract target stubs cancellation dependency");
   contains(update_contract_test, "int edr_ingest_http_get_url_to_file",
            "Windows update contract target stubs download dependency");
+  contains(update_contract_test, "void edr_ingest_http_get_runtime",
+           "Windows update contract target stubs transport diagnostics dependency");
   free(update_contract_test);
 
   snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);

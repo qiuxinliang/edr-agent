@@ -961,6 +961,22 @@ static int update_failure(const EdrAgentUpdateRequest *req, const char *command_
   return exit_code;
 }
 
+// Preserve the transport's bounded, credential-free diagnostic instead of
+// collapsing every HTTP/TLS/server failure into an authentication message.
+// ingest_http never places the request URL or bearer token in last_error.
+static void describe_http_download_failure(const char *summary, char *out, size_t out_cap) {
+  EdrIngestHttpRuntime runtime;
+  if (!out || out_cap == 0u) return;
+  memset(&runtime, 0, sizeof(runtime));
+  edr_ingest_http_get_runtime(&runtime);
+  if (runtime.last_error[0]) {
+    snprintf(out, out_cap, "%s: %.159s", summary ? summary : "download failed",
+             runtime.last_error);
+    return;
+  }
+  snprintf(out, out_cap, "%s", summary ? summary : "download failed");
+}
+
 static void event_context_from_request(const EdrAgentUpdateRequest *req,
                                        const char *command_id,
                                        EdrAgentUpdateEventContext *context);
@@ -1078,8 +1094,11 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     return result;
   }
   if (edr_ingest_http_get_url_to_file(req.artifact_url, staged, EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES) != 0) {
+    char download_error[256];
+    describe_http_download_failure("update artifact download failed", download_error,
+                                   sizeof(download_error));
     int result = update_failure(&req, command_id, outbox_dir, 2u, "artifact_download",
-                                "authenticated update artifact download failed", 4, detail, detail_cap);
+                                download_error, 4, detail, detail_cap);
     cleanup_prelaunch_update_work(root, staged, manifest, launcher, invocation);
     return result;
   }
@@ -1091,8 +1110,11 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
   }
   if (req.runtime_manifest_url[0] && edr_ingest_http_get_url_to_file(req.runtime_manifest_url, manifest,
                                                                        EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES) != 0) {
+    char download_error[256];
+    describe_http_download_failure("runtime package download failed", download_error,
+                                   sizeof(download_error));
     int result = update_failure(&req, command_id, outbox_dir, 2u, "runtime_manifest_download",
-                                "authenticated runtime manifest download failed", 5, detail, detail_cap);
+                                download_error, 5, detail, detail_cap);
     cleanup_prelaunch_update_work(root, staged, manifest, launcher, invocation);
     return result;
   }

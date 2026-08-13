@@ -1,6 +1,7 @@
 #include "edr/agent_update_command.h"
 #include "edr/command_contract.h"
 #include "edr/command_registry.h"
+#include "edr/ingest_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,13 @@ int edr_ingest_http_get_url_to_file(const char *url, const char *file_path,
   (void)file_path;
   (void)max_bytes;
   return -1;
+}
+
+void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->last_error, sizeof(out->last_error), "%s",
+           "http get status: HTTP/1.1 500 Internal Server Error");
 }
 
 static void require_true(int value, const char *message) {
