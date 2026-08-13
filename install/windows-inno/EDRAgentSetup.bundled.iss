@@ -80,6 +80,12 @@ Name: "keepofflinequeue"; Description: "Keep existing offline event queue during
 Name: "keepevidencecache"; Description: "Keep existing local evidence cache during upgrade"; GroupDescription: "Upgrade cleanup:"; Flags: unchecked
 Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fails"; GroupDescription: "Validation:"; Flags: unchecked
 
+[InstallDelete]
+; A verified full-package upgrade owns the root app-local DLL closure. Remove
+; the previous closure after PrepareToInstall has stopped the runtime so DLLs
+; removed by the new Release cannot remain loadable beside the new Agent.
+Type: files; Name: "{app}\*.dll"; Check: ShouldReconcileRuntimeDlls
+
 [Files]
 Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 #ifdef EDR_ALLOW_POWERSHELL_FALLBACK
@@ -90,7 +96,7 @@ Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags:
 Source: "{#EDR_BIN_DIR}\uninstall.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\native-package-integrity.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,onnxruntime*.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 #ifndef EDR_TARGET_ARM64
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
 Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
@@ -278,6 +284,11 @@ end;
 function EdrHasCmdlineEnroll: Boolean;
 begin
   Result := (EdrCmdParamsFile <> '') or ((EdrCmdApiBase <> '') and (EdrCmdToken <> ''));
+end;
+
+function ShouldReconcileRuntimeDlls: Boolean;
+begin
+  Result := EdrCmdUpgradeExisting;
 end;
 
 function InitializeSetup(): Boolean;

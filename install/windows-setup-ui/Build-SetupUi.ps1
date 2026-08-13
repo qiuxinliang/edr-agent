@@ -18,6 +18,7 @@ param(
     [string] $SetupExe = "",
     [Parameter(Mandatory = $true)]
     [string] $AgentBinarySha256,
+    [string] $RuntimeIdentitySha256 = "",
     [string] $AppVersion = "0.0.0",
     [string] $Configuration = "Release",
     [string] $OutputZip = "",
@@ -37,6 +38,10 @@ if ($AgentBinarySha256 -cnotmatch '\A[0-9A-Fa-f]{64}\z') {
     throw "AgentBinarySha256 must be exactly 64 hexadecimal characters"
 }
 $AgentBinarySha256 = $AgentBinarySha256.ToLowerInvariant()
+if ($RuntimeIdentitySha256 -and $RuntimeIdentitySha256 -cnotmatch '\A[0-9A-Fa-f]{64}\z') {
+    throw "RuntimeIdentitySha256 must be exactly 64 hexadecimal characters"
+}
+$RuntimeIdentitySha256 = $RuntimeIdentitySha256.ToLowerInvariant()
 
 $scriptDir = $PSScriptRoot
 $project = Join-Path $scriptDir "EDRAgent.SetupUi.csproj"
@@ -395,6 +400,7 @@ $manifest = @{
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"
     agent_binary_sha256 = $AgentBinarySha256
+    runtime_identity_sha256 = $RuntimeIdentitySha256
     publisher_thumbprint = $manifestPublisherThumbprint
     setup_exe_sha256 = Get-FileSha256Hex $bundledSetupExe
     upgrade_protocol = "edr.windows.full-installer-upgrade.v1"

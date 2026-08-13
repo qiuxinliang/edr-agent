@@ -27,7 +27,7 @@ on:
           - unsigned
           - signed
       upgrade_class:
-        description: Upgrade path classification; auto is recommended and fails closed when the diff is unavailable
+        description: Upgrade path classification; binary_hot additionally requires post-build identity proof against the previous immutable Release
         required: true
         default: auto
         type: choice
@@ -242,6 +242,7 @@ jobs:
             }
           } else {
             $upgradeClass = & python .\scripts\classify_windows_upgrade.py --previous-ref $previousTag[0] --current-ref HEAD --override $env:EDR_UPGRADE_CLASS_OVERRIDE
+            "EDR_PREVIOUS_RELEASE_TAG=$($previousTag[0])" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
           if ($LASTEXITCODE -ne 0 -or $upgradeClass -notin @('binary_hot','runtime_bundle','installer_required')) {
             throw "invalid Windows release upgrade classification: $upgradeClass"
@@ -711,13 +712,23 @@ jobs:
           Copy-Item -LiteralPath "scripts\edr_agent_uninstall.ps1" -Destination $uninstallScript -Force
           $null = $items.Add($uninstallScript)
           $nativeIntegrityPath = Join-Path $outDir "native-package-integrity.json"
+          $nativeIntegrityFiles = New-Object System.Collections.Generic.List[object]
+          foreach ($componentPath in @($workerExe, $uninstallerExe, $uninstallScript)) {
+            $nativeIntegrityFiles.Add([ordered]@{
+              name = [System.IO.Path]::GetFileName($componentPath)
+              sha256 = (Get-FileHash -LiteralPath $componentPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            })
+          }
+          Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+            Sort-Object Name | ForEach-Object {
+              $nativeIntegrityFiles.Add([ordered]@{
+                name = $_.Name
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              })
+            }
           [ordered]@{
             schema = "edr.windows.native-package-integrity.v1"
-            files = @(
-              [ordered]@{ name = "FDSecurityInstallerWorker.exe"; sha256 = (Get-FileHash -LiteralPath $workerExe -Algorithm SHA256).Hash.ToLowerInvariant() },
-              [ordered]@{ name = "uninstall.exe"; sha256 = (Get-FileHash -LiteralPath $uninstallerExe -Algorithm SHA256).Hash.ToLowerInvariant() },
-              [ordered]@{ name = "uninstall.ps1"; sha256 = (Get-FileHash -LiteralPath $uninstallScript -Algorithm SHA256).Hash.ToLowerInvariant() }
-            )
+            files = @($nativeIntegrityFiles)
           } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
 
           $null = $items.Add($nativeIntegrityPath)
@@ -800,7 +811,8 @@ jobs:
             $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
           }
           $agentBinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outDir "FDSensor.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -OutputZip $setupUiZip
+          $runtimeIdentitySha256 = (Get-FileHash -LiteralPath $nativeIntegrityPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentitySha256 $runtimeIdentitySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force
@@ -890,6 +902,30 @@ jobs:
             $zipObj.Dispose()
           }
 
+      - name: Prove explicit binary-hot compatibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          if ($env:EDR_UPGRADE_CLASS -ne 'binary_hot') {
+            Write-Host "binary-hot proof is not required for upgrade class $env:EDR_UPGRADE_CLASS"
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:EDR_PREVIOUS_RELEASE_TAG)) {
+            throw 'binary_hot requires a previous immutable Windows Release'
+          }
+          $current = "edr-agent-$env:EDR_AGENT_RELEASE_TAG-windows-$env:EDR_RELEASE_ARCH-exe.zip"
+          $previousName = "edr-agent-$env:EDR_PREVIOUS_RELEASE_TAG-windows-$env:EDR_RELEASE_ARCH-exe.zip"
+          $previousDir = Join-Path $env:RUNNER_TEMP 'previous-release-runtime'
+          New-Item -ItemType Directory -Force -Path $previousDir | Out-Null
+          gh release download $env:EDR_PREVIOUS_RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --pattern $previousName --dir $previousDir --clobber
+          if ($LASTEXITCODE -ne 0) { throw "previous immutable runtime package is unavailable: $previousName" }
+          $previous = Join-Path $previousDir $previousName
+          if (-not (Test-Path -LiteralPath $previous -PathType Leaf)) { throw "previous runtime package was not downloaded: $previous" }
+          python .\scripts\verify_binary_hot_compatibility.py --previous $previous --current $current
+          if ($LASTEXITCODE -ne 0) { throw 'binary_hot runtime component identity proof failed' }
+
       - name: Prepare release assets
         shell: pwsh
         run: |
@@ -934,6 +970,17 @@ jobs:
             if ($rootVersionEntries.Count -ne 1) {
               throw "release asset root must contain exactly one VERSION file; found $($rootVersionEntries.Count)"
             }
+            $runtimeIdentityEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'native-package-integrity.json' })
+            if ($runtimeIdentityEntries.Count -ne 1) {
+              throw "release asset root must contain exactly one native-package-integrity.json; found $($runtimeIdentityEntries.Count)"
+            }
+            $runtimeIdentityStream = $runtimeIdentityEntries[0].Open()
+            try {
+              $runtimeIdentityHash = [System.Security.Cryptography.SHA256]::Create()
+              try {
+                $runtimeIdentitySha256 = ([BitConverter]::ToString($runtimeIdentityHash.ComputeHash($runtimeIdentityStream))).Replace('-', '').ToLowerInvariant()
+              } finally { $runtimeIdentityHash.Dispose() }
+            } finally { $runtimeIdentityStream.Dispose() }
           }
           finally {
             $zipObj.Dispose()
@@ -986,6 +1033,7 @@ jobs:
                 max_current_version = $env:EDR_AGENT_VERSION
                 min_free_bytes = 268435456
                 upgrade_class = $env:EDR_UPGRADE_CLASS
+                runtime_identity_sha256 = $runtimeIdentitySha256
               }
             }
             $manifest.artifacts += $entry

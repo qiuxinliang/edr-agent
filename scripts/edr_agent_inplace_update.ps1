@@ -61,7 +61,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$AgentUpdateUpdaterProtocolVersion = 4
+$AgentUpdateUpdaterProtocolVersion = 5
 
 function Get-SetupInstallerFromPackage {
   param(
@@ -97,6 +97,11 @@ function Get-SetupInstallerFromPackage {
     }
     $setupHash = ([string]$manifest.setup_exe_sha256).ToLowerInvariant()
     if ($setupHash -notmatch '^[0-9a-f]{64}$') { throw 'full installer manifest setup_exe_sha256 is invalid' }
+    $runtimeIdentityProperty = $manifest.PSObject.Properties['runtime_identity_sha256']
+    $runtimeIdentityHash = if ($runtimeIdentityProperty) { ([string]$runtimeIdentityProperty.Value).ToLowerInvariant() } else { '' }
+    if ((Compare-SemVer $ExpectedVersion '3.2.320') -ge 0 -and $runtimeIdentityHash -notmatch '^[0-9a-f]{64}$') {
+      throw 'full installer manifest runtime_identity_sha256 is required for protocol-5 releases'
+    }
     $setupPath = Join-Path $DestinationDirectory 'FDSecuritySetup.exe'
     $input = $setupEntry.Open()
     try {
@@ -104,7 +109,7 @@ function Get-SetupInstallerFromPackage {
       try { $input.CopyTo($output) } finally { $output.Dispose() }
     } finally { $input.Dispose() }
     if ((Get-Sha256 -Path $setupPath) -ne $setupHash) { throw 'extracted full installer SHA256 does not match its signed companion manifest' }
-    return $setupPath
+    return [pscustomobject]@{ SetupPath = $setupPath; RuntimeIdentitySha256 = $runtimeIdentityHash }
   } finally { $archive.Dispose() }
 }
 
@@ -120,6 +125,23 @@ function Invoke-FullInstallerUpgrade {
     '/EDR_UPGRADE_EXISTING=1','/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1')
   $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw "full installer upgrade failed with exit code $($process.ExitCode)" }
+}
+
+function Wait-FullInstallerProcess {
+  param([Parameter(Mandatory = $true)][string]$SetupPath, [int]$TimeoutSeconds = 300)
+  $expected = [System.IO.Path]::GetFullPath($SetupPath)
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='FDSecuritySetup.exe'" -ErrorAction SilentlyContinue |
+      Where-Object {
+        $actual = [string]$_.ExecutablePath
+        if (-not $actual) { return $false }
+        try { return [System.IO.Path]::GetFullPath($actual) -ieq $expected } catch { return $false }
+      })
+    if ($running.Count -eq 0) { return }
+    Start-Sleep -Seconds 1
+  } while ((Get-Date) -lt $deadline)
+  throw 'timed out waiting for the recovered full installer process to finish'
 }
 
 function Invoke-FullInstallerRuntimeMirror {
@@ -140,6 +162,50 @@ function Invoke-FullInstallerRuntimeMirror {
 function Get-Sha256 {
   param([Parameter(Mandatory = $true)][string]$Path)
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Assert-InstalledRuntimeIdentity {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallDirectory,
+    [Parameter(Mandatory = $true)][string]$ExpectedIdentitySha256
+  )
+  $manifestPath = Join-Path $InstallDirectory 'native-package-integrity.json'
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or
+      (Get-Sha256 -Path $manifestPath) -ne $ExpectedIdentitySha256.ToLowerInvariant()) {
+    throw 'full installer completed but installed Runtime component identity does not match the task-pinned release'
+  }
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  if ([string]$manifest.schema -ne 'edr.windows.native-package-integrity.v1') {
+    throw 'installed Runtime component identity schema is invalid'
+  }
+  $files = @($manifest.files)
+  $required = @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1')
+  if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
+    throw 'installed Runtime component identity file count is invalid'
+  }
+  $seen = @{}
+  foreach ($componentSpec in $files) {
+    $component = [string]$componentSpec.name
+    $hash = ([string]$componentSpec.sha256).ToLowerInvariant()
+    if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1)$' -or
+        [System.IO.Path]::GetFileName($component) -ne $component -or
+        ($component -notin $required -and [System.IO.Path]::GetExtension($component) -ine '.dll') -or
+        $hash -notmatch '^[0-9a-f]{64}$') {
+      throw "installed Runtime component identity entry is invalid: $component"
+    }
+    $key = $component.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { throw "installed Runtime component identity contains a duplicate: $component" }
+    $seen[$key] = $true
+    $path = Join-Path $InstallDirectory $component
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Sha256 -Path $path) -ne $hash) {
+      throw "installed Runtime component hash mismatch: $component"
+    }
+  }
+  foreach ($component in $required) {
+    if (-not $seen.ContainsKey($component.ToLowerInvariant())) {
+      throw "installed Runtime component identity is missing required component: $component"
+    }
+  }
 }
 
 function Convert-SemVer {
@@ -291,11 +357,25 @@ function Get-RuntimeUpdatePlan {
       }
       $files = @($integrity.files)
       $required = @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1')
-      if ($files.Count -ne $required.Count) { throw 'runtime package integrity manifest must contain exactly the native uninstall chain' }
+      if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
+        throw 'runtime package integrity manifest must contain the native uninstall chain and at most 61 app-local DLLs'
+      }
       $sourceRoot = Join-Path $manifestDirectory 'runtime-components'
       New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
-      foreach ($component in $required) {
-        $entry = $entries[$component.ToLowerInvariant()]
+      $declared = @{}
+      foreach ($componentSpec in $files) {
+        $component = [string]$componentSpec.name
+        if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1)$' -or
+            [System.IO.Path]::GetFileName($component) -ne $component) {
+          throw "runtime package integrity manifest contains an unsupported component: $component"
+        }
+        if ($component -notin $required -and [System.IO.Path]::GetExtension($component) -ine '.dll') {
+          throw "runtime package integrity manifest may only add app-local DLLs: $component"
+        }
+        $componentKey = $component.ToLowerInvariant()
+        if ($declared.ContainsKey($componentKey)) { throw "runtime package integrity manifest contains a duplicate component: $component" }
+        $declared[$componentKey] = $true
+        $entry = $entries[$componentKey]
         if (-not $entry -or $entry.Length -le 0 -or $entry.Length -gt (256MB)) {
           throw "runtime package component is missing or invalid: $component"
         }
@@ -310,10 +390,15 @@ function Get-RuntimeUpdatePlan {
       # installed copy of native-package-integrity.json.  Replacing helpers
       # without replacing the manifest creates a mixed runtime that reports
       # degraded even though every downloaded byte was valid.  The archive
-      # itself is task-pinned by SHA-256, so materialize the exact parsed
-      # manifest as a fourth transactional runtime component.
+      # itself is task-pinned by SHA-256, so preserve the exact archive bytes
+      # as a fourth transactional runtime component.
       $integrityDestination = Join-Path $sourceRoot 'native-package-integrity.json'
-      [System.IO.File]::WriteAllText($integrityDestination, $integrityText, [System.Text.UTF8Encoding]::new($false))
+      $integrityInput = $integrityEntry.Open()
+      try {
+        $integrityOutput = [System.IO.File]::Open($integrityDestination, [System.IO.FileMode]::Create,
+          [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try { $integrityInput.CopyTo($integrityOutput) } finally { $integrityOutput.Dispose() }
+      } finally { $integrityInput.Dispose() }
       $files += [pscustomobject]@{
         name = 'native-package-integrity.json'
         sha256 = (Get-Sha256 -Path $integrityDestination)
@@ -688,6 +773,7 @@ $failedPath = Join-Path $installFull ("FDSensor.exe.failed-{0}-{1}" -f $TargetVe
 $fullInstallerBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-runtime-backup'
 $fullInstallerConfigBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-agent.toml.backup'
 $fullInstallerStarted = $false
+$fullInstallerExpectedRuntimeIdentity = ''
 $replacementCommitted = $false
 $failureMessage = ""
 $runtimePlan = @()
@@ -718,6 +804,7 @@ $journal = [ordered]@{
   runtime_files = @()
   full_installer_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerBackupPath } else { $null }
   full_installer_config_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerConfigBackupPath } else { $null }
+  expected_runtime_identity_sha256 = $null
   last_event_seq = 2
   events = @()
   error = $null
@@ -863,9 +950,13 @@ try {
     $journal['error'] = $prior.error
     $priorProperties = @($prior.PSObject.Properties.Name)
     foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
-        'health_observation_started_at_unix_ms','health_observation_deadline_unix_ms','health_last_checked_unix_ms')) {
+        'health_observation_started_at_unix_ms','health_observation_deadline_unix_ms','health_last_checked_unix_ms',
+        'expected_runtime_identity_sha256')) {
       if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
+	if ($priorProperties -contains 'expected_runtime_identity_sha256') {
+	  $fullInstallerExpectedRuntimeIdentity = ([string]$prior.expected_runtime_identity_sha256).ToLowerInvariant()
+	}
     if ($priorProperties -contains 'backup_path' -and -not [string]::IsNullOrWhiteSpace([string]$prior.backup_path)) {
       $backupPath = [string]$prior.backup_path
     }
@@ -881,7 +972,30 @@ try {
     }
     $runtimeCommitDetected = @($runtimePlan | Where-Object { $_.Committed }).Count -gt 0
     $currentHash = if (Test-Path -LiteralPath $currentPath -PathType Leaf) { Get-Sha256 -Path $currentPath } else { '' }
+	$interruptedFullInstaller = $UpgradeClass -eq 'installer_required' -and
+	  [string]$prior.stage -in @('full_installer_upgrade','full_installer_recovery')
+	if ($interruptedFullInstaller) {
+	  $fullInstallerStarted = $true
+	  $resolvedDeploymentMode = [string]$journal['resolved_deployment_mode']
+	  if ([string]::IsNullOrWhiteSpace($resolvedDeploymentMode)) {
+		$resolvedDeploymentMode = Resolve-DeploymentMode -Mode $DeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName
+		$journal['resolved_deployment_mode'] = $resolvedDeploymentMode
+	  }
+	  Set-UpdateStage -Stage 'full_installer_recovery'
+	  Wait-FullInstallerProcess -SetupPath (Join-Path (Split-Path -Parent $stagedPath) 'FDSecuritySetup.exe')
+	  $currentHash = if (Test-Path -LiteralPath $currentPath -PathType Leaf) { Get-Sha256 -Path $currentPath } else { '' }
+	  if ($currentHash -ne $expectedHash) {
+		throw 'recovered full installer did not complete the task-pinned Agent replacement'
+	  }
+	  if ($fullInstallerExpectedRuntimeIdentity) {
+		Assert-InstalledRuntimeIdentity -InstallDirectory $installFull -ExpectedIdentitySha256 $fullInstallerExpectedRuntimeIdentity
+	  }
+	}
     $currentMatchesCandidate = $currentHash -eq $expectedHash
+	if ($UpgradeClass -eq 'installer_required' -and $currentMatchesCandidate -and
+	    [string]$prior.stage -in @('full_installer_upgrade','full_installer_recovery','health_observation','resume_after_commit')) {
+	  $fullInstallerStarted = $true
+	}
     $replacementMayHaveStarted = [bool]$prior.replacement_committed -or $currentMatchesCandidate -or
       [string]$prior.stage -in @('replace_binary','replacement_committed','start_new_runtime','health_observation','resume_after_commit') -or
       [string]$prior.stage -like 'rollback_*'
@@ -935,6 +1049,9 @@ try {
         throw "committed runtime DLL is missing or corrupt: name=$($item.Name)"
       }
     }
+	if ($UpgradeClass -eq 'installer_required' -and $fullInstallerExpectedRuntimeIdentity) {
+	  Assert-InstalledRuntimeIdentity -InstallDirectory $installFull -ExpectedIdentitySha256 $fullInstallerExpectedRuntimeIdentity
+	}
     Set-UpdateStage -Stage 'resume_after_commit'
     $running = @(Get-AgentProcesses -ExecutablePath $currentPath).Count -gt 0
     if ($resumeHealthObservation -and -not $running) {
@@ -1017,9 +1134,13 @@ try {
     if ($RuntimeManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$') { throw 'RuntimeManifestSha256 is required for runtime manifest' }
     if ((Get-Sha256 -Path $RuntimeManifest) -ne $RuntimeManifestSha256.ToLowerInvariant()) { throw 'runtime manifest SHA256 mismatch' }
   }
+	$verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
   if ($UpgradeClass -eq 'installer_required') {
-    $setupPath = Get-SetupInstallerFromPackage -PackagePath $RuntimeManifest -DestinationDirectory (Split-Path -Parent $stagedPath) `
+    $setupPackage = Get-SetupInstallerFromPackage -PackagePath $RuntimeManifest -DestinationDirectory (Split-Path -Parent $stagedPath) `
       -ExpectedAgentSha256 $expectedHash -ExpectedVersion $TargetVersion
+    $setupPath = [string]$setupPackage.SetupPath
+	$fullInstallerExpectedRuntimeIdentity = ([string]$setupPackage.RuntimeIdentitySha256).ToLowerInvariant()
+	$journal['expected_runtime_identity_sha256'] = $fullInstallerExpectedRuntimeIdentity
     Assert-AuthenticodePublisher -Path $setupPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
     Add-UpdateEvent -Status $verifiedStatus -Progress 35 -Detail @{ stage = 'full_installer_verified'; upgrade_class = $UpgradeClass }
     Set-UpdateStage -Stage 'full_installer_verified'
@@ -1035,6 +1156,9 @@ try {
     }
     if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf) -or (Get-Sha256 -Path $currentPath) -ne $expectedHash) {
       throw 'full installer completed but installed FDSensor does not match the task-pinned release hash'
+    }
+    if ([string]$setupPackage.RuntimeIdentitySha256) {
+      Assert-InstalledRuntimeIdentity -InstallDirectory $installFull -ExpectedIdentitySha256 ([string]$setupPackage.RuntimeIdentitySha256)
     }
     $report['installed_sha256'] = Get-Sha256 -Path $currentPath
     $observationDeadline = (Get-UnixTimeMilliseconds) + $HealthObserveMs
@@ -1053,7 +1177,6 @@ try {
     -InstallDirectory $installFull -ManifestPath $RuntimeManifest `
     -Version $TargetVersion -Timestamp $stamp)
   Sync-RuntimePlanJournal
-  $verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
   if ($priorLastStatus -notin @('verified','installing','rolling_back')) {
     Add-UpdateEvent -Status $verifiedStatus -Progress 35 -Detail @{ stage = 'candidate_verified'; recovered = [bool]$priorLastStatus }
   }
@@ -1154,7 +1277,14 @@ try {
       Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{ stage = 'full_installer_rollback_failed'; rolled_back = $false; error = $report['error'] }
       Set-UpdateStage -Stage 'rollback_failed' -Status 'failed'
     }
-  } elseif ($replacementCommitted -or $runtimeCommitted -or $resumeRollback) {
+	} elseif ($UpgradeClass -eq 'installer_required' -and $fullInstallerStarted) {
+	  $report['rollback'] = 'failed'
+	  $report['error'] = "$failureMessage; full installer rollback backup is unavailable; refusing to start an unverified mixed Runtime"
+	  Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{
+		stage = 'full_installer_rollback_backup_missing'; rolled_back = $false; runtime_restarted = $false; error = $report['error']
+	  }
+	  Set-UpdateStage -Stage 'rollback_failed' -Status 'failed'
+	} elseif ($replacementCommitted -or $runtimeCommitted -or $resumeRollback) {
     try {
       Set-UpdateStage -Stage "rollback_started"
       Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath

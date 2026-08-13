@@ -10,9 +10,10 @@ from pathlib import PurePosixPath
 
 
 VALID_CLASSES = {"binary_hot", "runtime_bundle", "installer_required"}
+CLASS_RISK = {"binary_hot": 0, "runtime_bundle": 1, "installer_required": 2}
 
 # These paths change installation layout, the updater itself, service/driver
-# ownership, or assets that protocol v3 cannot replace transactionally.
+# ownership, or assets that the current protocol cannot replace transactionally.
 INSTALLER_REQUIRED_PREFIXES = (
     "config/",
     "install/windows-inno/",
@@ -35,12 +36,18 @@ INSTALLER_REQUIRED_FILES = {
     "vcpkg.json",
 }
 
-# Protocol v3 atomically replaces these lifecycle helpers together with their
-# integrity manifest. They do not require the full Inno installer.
+# Protocol v5 atomically replaces these lifecycle helpers, app-local DLLs, and
+# their integrity manifest. They do not require the full Inno installer.
 RUNTIME_BUNDLE_PREFIXES = ("src/installer_worker/",)
 RUNTIME_BUNDLE_FILES = {"scripts/edr_agent_uninstall.ps1"}
-HOT_UPDATE_PREFIXES = ("src/", "tests/")
-HOT_UPDATE_FILES = {"readme.md", "version"}
+
+# Source-only changes are *not* automatically binary-hot. A release build also
+# produces native lifecycle helpers and may pick up a different app-local
+# runtime from the current Windows runner. The post-build Release gate may
+# permit an explicit binary_hot override only after comparing those immutable
+# runtime components with the previous published Release.
+RUNTIME_SOURCE_PREFIXES = ("src/", "tests/")
+RUNTIME_SOURCE_FILES = {"readme.md", "version"}
 
 
 def normalize_path(value: str) -> str:
@@ -72,8 +79,8 @@ def classify_paths(paths: list[str]) -> tuple[str, list[str]]:
     ]
     if runtime_reasons:
         return "runtime_bundle", runtime_reasons
-    if all(path in HOT_UPDATE_FILES or any(path.startswith(prefix) for prefix in HOT_UPDATE_PREFIXES) for path in normalized):
-        return "binary_hot", normalized
+    if all(path in RUNTIME_SOURCE_FILES or any(path.startswith(prefix) for prefix in RUNTIME_SOURCE_PREFIXES) for path in normalized):
+        return "runtime_bundle", normalized
     # Unknown build, packaging, resource, or repository layout changes must not
     # silently become a binary-only update. The operator can review and apply a
     # signed override, but automatic classification remains fail-closed.
@@ -91,6 +98,23 @@ def git_changed_paths(previous_ref: str, current_ref: str) -> list[str]:
     return completed.stdout.splitlines()
 
 
+def resolve_upgrade_class(paths: list[str], override: str) -> tuple[str, list[str]]:
+    automatic, reasons = classify_paths(paths)
+    if override == "auto":
+        return automatic, reasons
+    if override not in VALID_CLASSES:
+        raise ValueError("override must be auto, binary_hot, runtime_bundle, or installer_required")
+    if override == "binary_hot":
+        if automatic != "runtime_bundle":
+            raise ValueError(
+                f"binary_hot cannot override automatic {automatic}; installation-layout and unknown changes must fail closed"
+            )
+        return override, ["operator requested binary_hot; post-build component identity proof is required"]
+    if CLASS_RISK[override] < CLASS_RISK[automatic]:
+        raise ValueError(f"{override} cannot downgrade automatic {automatic}")
+    return override, [f"operator promoted automatic {automatic} to {override}"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--previous-ref", default="")
@@ -99,18 +123,14 @@ def main() -> int:
     parser.add_argument("paths", nargs="*")
     args = parser.parse_args()
 
-    override = args.override.strip().lower()
-    if override != "auto":
-        if override not in VALID_CLASSES:
-            parser.error("--override must be auto, binary_hot, runtime_bundle, or installer_required")
-        print(override)
-        print(f"upgrade_class_reason=operator override: {override}", file=sys.stderr)
-        return 0
-
     paths = args.paths
     if not paths and args.previous_ref:
         paths = git_changed_paths(args.previous_ref, args.current_ref)
-    upgrade_class, reasons = classify_paths(paths)
+    override = args.override.strip().lower()
+    try:
+        upgrade_class, reasons = resolve_upgrade_class(paths, override)
+    except ValueError as error:
+        parser.error(str(error))
     print(upgrade_class)
     print("upgrade_class_reason=" + ",".join(reasons[:20]), file=sys.stderr)
     return 0

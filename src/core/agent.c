@@ -1705,7 +1705,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *agent_update_runtime = !windows_native ? "unavailable"
                                      : !agent_update_runtime_ready ? "degraded"
                                      : !agent_update_policy ? "disabled" : "healthy";
-  int lifecycle_runtime_ready = edr_agent_lifecycle_runtime_ready();
+  char lifecycle_runtime_identity[65];
+  memset(lifecycle_runtime_identity, 0, sizeof(lifecycle_runtime_identity));
+  int lifecycle_runtime_ready = edr_agent_lifecycle_runtime_identity(lifecycle_runtime_identity);
   const char *lifecycle_runtime = !windows_native ? "unavailable"
                                   : !lifecycle_policy ? "disabled"
                                   : lifecycle_runtime_ready ? "healthy" : "degraded";
@@ -1805,7 +1807,8 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"targeted_forensic_memory\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"agent_update_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
       "\"updater_source\":\"%s\",\"updater_version\":\"%s\",\"updater_sha256\":\"%s\","
-      "\"updater_protocol_version\":%d,\"updater_materialized\":%s,\"updater_error_code\":\"%s\"},"
+      "\"updater_protocol_version\":%d,\"updater_materialized\":%s,\"updater_error_code\":\"%s\","
+      "\"runtime_identity_sha256\":\"%s\"},"
       "\"endpoint_lifecycle_v1\":{\"code_supported\":true,\"build_supported\":%s,"
       "\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"actions\":[\"restart\",\"offboard\",\"uninstall\"]},"
       "\"endpoint_uninstall_attestation_v1\":{\"code_supported\":true,\"build_supported\":%s,"
@@ -1865,6 +1868,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       agent_update_info.protocol_version,
       agent_update_info.materialized ? "true" : "false",
       agent_update_info.error_code,
+      lifecycle_runtime_identity,
       windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
       windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);

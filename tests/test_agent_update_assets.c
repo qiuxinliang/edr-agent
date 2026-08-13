@@ -46,15 +46,31 @@ int main(void) {
   contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
   contains(script, "Clear-StaleUpdateWork", "stale updater tasks and work directories are bounded");
   contains(script, "Remove-CurrentUpdateWork", "terminal update work is removed after durable reporting");
-  contains(script, "AgentUpdateUpdaterProtocolVersion = 4", "updater protocol version is explicit in the release script");
-  contains(script, "Invoke-FullInstallerUpgrade", "protocol v4 supports the task-pinned full installer path");
+  contains(script, "AgentUpdateUpdaterProtocolVersion = 5", "updater protocol version is explicit in the release script");
+  contains(script, "Invoke-FullInstallerUpgrade", "protocol v5 supports the task-pinned full installer path");
   contains(script, "EDR_UPGRADE_EXISTING=1", "full installer preserves the existing endpoint identity");
   contains(script, "full installer modified protected agent.toml identity configuration", "full installer verifies the protected identity was not rewritten");
+  contains(script, "full installer completed but installed Runtime component identity does not match the task-pinned release",
+           "full installer verifies the complete installed Runtime identity before reporting success");
+  contains(script, "runtime_identity_sha256 is required for protocol-5 releases",
+           "protocol-5 full installers require a signed Runtime identity");
   contains(script, "Invoke-FullInstallerRuntimeMirror", "full installer has an immutable runtime backup and restore path");
+  contains(script, "expected_runtime_identity_sha256", "full installer recovery journal binds the target Runtime identity");
+  contains(script, "full_installer_recovery", "interrupted full installer recovery has an explicit durable stage");
+  contains(script, "Wait-FullInstallerProcess", "recovery waits for the already launched installer instead of starting a second copy");
+  contains(script, "recovered full installer did not complete the task-pinned Agent replacement",
+           "incomplete recovered installer execution enters rollback without overwriting the original backup");
+  contains(script, "full installer rollback backup is unavailable; refusing to start an unverified mixed Runtime",
+           "full installer recovery fails closed when the immutable rollback baseline is missing");
+  contains(script, "$verifiedStatus = if ($Operation -eq 'rollback')", "full installer event status is initialized before either upgrade branch uses it");
   contains(script, "rollback_full_installer_started", "full installer failure starts a bounded runtime rollback");
   contains(script, "preserving Agent update work for recovery", "unrecoverable update failure retains the restricted recovery snapshot");
   contains(script, "native-package-integrity.json", "complete runtime package integrity manifest is required");
+  contains(script, "runtime package integrity manifest may only add app-local DLLs",
+           "complete runtime package limits extended components to app-local DLLs");
   contains(script, "$files += [pscustomobject]@{", "native package integrity manifest joins the transactional runtime plan");
+  contains(script, "$integrityInput.CopyTo($integrityOutput)",
+           "Runtime identity manifest bytes are preserved exactly during transactional update");
   contains(script, "'FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1','native-package-integrity.json'",
            "complete runtime update requires helpers and their installed integrity manifest");
   contains(script, "A Headless base package can contain optional rules", "runtime update accepts the complete verified Headless package");
@@ -90,6 +106,15 @@ int main(void) {
   contains(script, "if ([string]$prior.status -eq 'succeeded') { exit 0 }", "only prior success exits successfully");
   contains(script, "Write-AtomicJson", "journal and report use atomic writes");
   free(script);
+
+  snprintf(path, sizeof(path), "%s/install/windows-inno/EDRAgentSetup.bundled.iss", root);
+  char *inno = read_file(path);
+  require_true(inno != NULL, "read Windows bundled installer definition");
+  contains(inno, "[InstallDelete]", "full installer has an explicit release-owned Runtime reconciliation stage");
+  contains(inno, "Name: \"{app}\\*.dll\"; Check: ShouldReconcileRuntimeDlls",
+           "full installer removes obsolete root DLLs only during an identity-preserving upgrade");
+  contains(inno, "Result := EdrCmdUpgradeExisting", "Runtime DLL reconciliation is restricted to verified upgrades");
+  free(inno);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_update_command.c", root);
   char *command = read_file(path);
@@ -161,8 +186,19 @@ int main(void) {
   contains(agent, "updater_protocol_version", "capability reports updater protocol compatibility");
   contains(agent, "updater_materialized", "capability reports whether the embedded updater was materialized");
   contains(agent, "updater_sha256", "capability reports the resolved updater hash");
-  contains(agent, "edr_agent_lifecycle_runtime_ready", "lifecycle capability is based on installed native chain integrity");
+  contains(agent, "edr_agent_lifecycle_runtime_identity", "lifecycle capability is based on installed native chain integrity and identity");
   free(agent);
+
+  snprintf(path, sizeof(path), "%s/src/command/agent_lifecycle_command.c", root);
+  char *lifecycle_identity_command = read_file(path);
+  require_true(lifecycle_identity_command != NULL, "read Agent lifecycle Runtime identity implementation");
+  contains(lifecycle_identity_command, "cJSON_GetArraySize(files)",
+           "lifecycle Runtime identity bounds the full component list");
+  contains(lifecycle_identity_command, "lifecycle_runtime_name_valid",
+           "lifecycle Runtime identity rejects unsupported component types");
+  contains(lifecycle_identity_command, "lifecycle_file_sha256(path, actual)",
+           "lifecycle Runtime identity verifies every declared component hash");
+  free(lifecycle_identity_command);
 
   snprintf(path, sizeof(path), "%s/resources/FDSensor.rc", root);
   char *resource = read_file(path);
@@ -182,6 +218,12 @@ int main(void) {
   contains(workflow, "EDR_UPGRADE_CLASS", "release records a fail-closed upgrade classification");
   contains(workflow, "classify_windows_upgrade.py", "release classifies changed components before manifest signing");
   contains(workflow, "upgrade_class = $env:EDR_UPGRADE_CLASS", "signed artifact metadata binds the upgrade class");
+  contains(workflow, "runtime_identity_sha256 = $runtimeIdentitySha256",
+           "signed artifact metadata binds the complete runtime identity");
+  contains(workflow, "verify_binary_hot_compatibility.py",
+           "explicit binary-hot releases prove runtime component identity after build");
+  contains(workflow, "Get-ChildItem -LiteralPath $outDir -Filter \"*.dll\"",
+           "release Runtime identity binds every root app-local DLL");
   contains(workflow, "arch: arm64", "release builds an ARM64 matrix target");
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
