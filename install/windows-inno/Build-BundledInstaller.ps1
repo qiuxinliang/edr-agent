@@ -221,7 +221,9 @@ $packageCapabilities = @{
     target_arch = $TargetArch
     windivert = ($TargetArch -eq "amd64")
     network_packet_capture = ($TargetArch -eq "amd64")
-    arm64_emulation_supported = ($TargetArch -eq "amd64")
+    # AMD64-on-ARM64 remains blocked until the complete package (including
+    # service lifecycle and security controls) passes a native ARM64 E2E gate.
+    arm64_emulation_supported = $false
     arm64_emulation_network_packet_capture = $false
     windows_firewall_isolation = $true
 } | ConvertTo-Json -Compress

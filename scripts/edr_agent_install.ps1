@@ -74,6 +74,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+try {
+  $script:EDR_UTF8_OUTPUT = New-Object System.Text.UTF8Encoding -ArgumentList $false
+  [Console]::OutputEncoding = $script:EDR_UTF8_OUTPUT
+  $OutputEncoding = $script:EDR_UTF8_OUTPUT
+} catch {
+  # Diagnostics still carry numeric HRESULT/Win32 codes when console encoding
+  # cannot be changed by a constrained PowerShell host.
+}
 
 function Get-EnrollOs {
   if ($env:OS -match "Windows_NT" -or $env:OS -like "*Windows*") { return "windows" }
@@ -350,6 +358,128 @@ function Get-ExistingAgentTomlRequestSigningIssue {
   return ""
 }
 
+function Get-DurableInstallDiagnosticsDir {
+  if ($env:EDR_INSTALL_DIAGNOSTICS_DIR) {
+    return [System.IO.Path]::GetFullPath($env:EDR_INSTALL_DIAGNOSTICS_DIR)
+  }
+  $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+  if (-not $programData) { $programData = "C:\ProgramData" }
+  return (Join-Path $programData "FDSecurity\diagnostics")
+}
+
+function Write-DurableInstallDiagnostic {
+  param([string]$Name, [object]$Report)
+  try {
+    $dir = Get-DurableInstallDiagnosticsDir
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $path = Join-Path $dir $Name
+    $json = $Report | ConvertTo-Json -Depth 8
+    $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+    [System.IO.File]::WriteAllText($path, $json, $utf8NoBom)
+    return $path
+  } catch {
+    Write-Warning ("failed to persist install diagnostic: " + $_.Exception.Message)
+    return ""
+  }
+}
+
+function Get-NativeWindowsArchitecture {
+  if ((Get-EnrollOs) -ne "windows") { return (Get-EnrollOs) }
+  try {
+    return [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+  } catch {
+    try {
+      $osArch = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).OSArchitecture
+      if ($osArch -match "ARM") { return "arm64" }
+      if ($osArch -match "64") { return "x64" }
+      return [string]$osArch
+    } catch {
+      return "unknown"
+    }
+  }
+}
+
+function Get-PeMachineName {
+  param([string]$Path)
+  try {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $reader = New-Object System.IO.BinaryReader -ArgumentList $stream
+    try {
+      if ($reader.ReadUInt16() -ne 0x5A4D) { return "not-pe" }
+      $stream.Position = 0x3C
+      $peOffset = $reader.ReadUInt32()
+      $stream.Position = $peOffset
+      if ($reader.ReadUInt32() -ne 0x00004550) { return "not-pe" }
+      $machine = $reader.ReadUInt16()
+      switch ($machine) {
+        0x8664 { return "amd64" }
+        0xAA64 { return "arm64" }
+        0x014C { return "x86" }
+        default { return ("0x{0:X4}" -f $machine) }
+      }
+    } finally {
+      $reader.Dispose()
+      $stream.Dispose()
+    }
+  } catch {
+    return "unreadable"
+  }
+}
+
+function Get-ExceptionNativeErrorCode {
+  param([object]$Exception)
+  $current = $Exception
+  while ($current) {
+    if ($current -is [System.ComponentModel.Win32Exception]) {
+      return [int]$current.NativeErrorCode
+    }
+    $current = $current.InnerException
+  }
+  return $null
+}
+
+function Write-AgentProcessLaunchDiagnostic {
+  param([string]$Exe, [string[]]$ArgList, [object]$Exception)
+  $nativeErrorCode = Get-ExceptionNativeErrorCode $Exception
+  $hresult = if ($Exception) { [int]$Exception.HResult } else { 0 }
+  $sha256 = ""
+  $signatureStatus = "unknown"
+  try { $sha256 = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch {}
+  try { $signatureStatus = [string](Get-AuthenticodeSignature -LiteralPath $Exe -ErrorAction Stop).Status } catch {}
+  $report = [ordered]@{
+    schema = "edr.agent.install.process_failure.v1"
+    created_at = (Get-Date).ToUniversalTime().ToString("o")
+    stage = "agent_config_test_launch"
+    executable = $Exe
+    executable_sha256 = $sha256
+    executable_machine = Get-PeMachineName $Exe
+    process_architecture = [string]$env:PROCESSOR_ARCHITECTURE
+    native_os_architecture = Get-NativeWindowsArchitecture
+    authenticode_status = $signatureStatus
+    arguments = @($ArgList)
+    exception_type = if ($Exception) { $Exception.GetType().FullName } else { "" }
+    exception_message = if ($Exception) { [string]$Exception.Message } else { "" }
+    hresult = $hresult
+    hresult_hex = ("0x{0:X8}" -f ($hresult -band 0xffffffffL))
+    native_error_code = $nativeErrorCode
+  }
+  return Write-DurableInstallDiagnostic -Name "install-process-failure-last.json" -Report $report
+}
+
+function Format-AgentProcessLaunchFailure {
+  param([object]$Exception, [string]$DiagnosticPath)
+  $nativeErrorCode = Get-ExceptionNativeErrorCode $Exception
+  $hresult = if ($Exception) { [int]$Exception.HResult } else { 0 }
+  $parts = New-Object System.Collections.Generic.List[string]
+  $parts.Add(("type={0}" -f $(if ($Exception) { $Exception.GetType().FullName } else { "unknown" }))) | Out-Null
+  $parts.Add(("hresult=0x{0:X8}" -f ($hresult -band 0xffffffffL))) | Out-Null
+  if ($null -ne $nativeErrorCode) { $parts.Add(("win32={0}" -f $nativeErrorCode)) | Out-Null }
+  $parts.Add(("native_os={0}" -f (Get-NativeWindowsArchitecture))) | Out-Null
+  if ($DiagnosticPath) { $parts.Add(("diagnostic={0}" -f $DiagnosticPath)) | Out-Null }
+  if ($Exception -and $Exception.Message) { $parts.Add(("message={0}" -f $Exception.Message)) | Out-Null }
+  return ($parts -join "; ")
+}
+
 function Test-ExistingAgentTomlWithAgent {
   param([string]$InstallRoot, [string]$ConfigPath)
   if (-not $InstallRoot -or -not $ConfigPath) {
@@ -379,7 +509,8 @@ function Test-ExistingAgentTomlWithAgent {
       }
       return ("agent parser rejected existing TOML with {0}: {1}" -f $exeName, $out)
     } catch {
-      return ("agent parser execution failed with {0}: {1}" -f $exeName, $_.Exception.Message)
+      $diagnosticPath = Write-AgentProcessLaunchDiagnostic -Exe $exe -ArgList @("--config", $ConfigPath, "--config-test") -Exception $_.Exception
+      return ("agent process launch failed with {0}: {1}" -f $exeName, (Format-AgentProcessLaunchFailure -Exception $_.Exception -DiagnosticPath $diagnosticPath))
     }
   }
   return ""
@@ -1051,6 +1182,8 @@ function Ensure-CngAgentCSR {
     "FDSecurity-Agent-$safeCN-$suffix"
   }
   $script:EDR_CNG_KEY_CONTAINER = $safeKeyName
+  $script:EDR_CNG_KEY_CREATED_BY_INSTALL = -not [bool]$KeyName
+  $script:EDR_CNG_PROVIDER_USED = $ProviderName
   Write-Host "Using CNG key container: $safeKeyName"
   $infPath = [System.IO.Path]::ChangeExtension($CsrPath, ".inf")
   foreach ($stalePath in @($CsrPath, $infPath)) {
@@ -1159,6 +1292,71 @@ function Ensure-AgentCSR {
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
 }
 
+$script:EDR_INSTALL_TRANSACTION_ACTIVE = $false
+$script:EDR_INSTALL_TRANSACTION_COMMITTED = $false
+$script:EDR_PROVISIONAL_CERT_THUMBPRINT = ""
+$script:EDR_PROVISIONAL_CERT_STORE = ""
+$script:EDR_PROVISIONAL_CERT_PREEXISTED = $false
+$script:EDR_CNG_KEY_CREATED_BY_INSTALL = $false
+$script:EDR_CNG_PROVIDER_USED = ""
+
+function Remove-ProvisionalEnrollmentMaterial {
+  param([string]$Reason)
+  if (-not $script:EDR_INSTALL_TRANSACTION_ACTIVE -or $script:EDR_INSTALL_TRANSACTION_COMMITTED) { return }
+
+  $certificateRemoved = $false
+  $keyRemoved = $false
+  $errors = New-Object System.Collections.Generic.List[string]
+  if ((Get-EnrollOs) -eq "windows") {
+    $thumbprint = ([string]$script:EDR_PROVISIONAL_CERT_THUMBPRINT -replace '\s+', '').ToUpperInvariant()
+    if ($thumbprint -and -not $script:EDR_PROVISIONAL_CERT_PREEXISTED) {
+      $store = if ($script:EDR_PROVISIONAL_CERT_STORE) { [string]$script:EDR_PROVISIONAL_CERT_STORE } else { "LocalMachine\My" }
+      $store = ($store -replace '^Cert:\\?', '').Trim([char]0x5c)
+      $certPath = "Cert:\$store\$thumbprint"
+      try {
+        if (Test-Path -LiteralPath $certPath) {
+          Remove-Item -LiteralPath $certPath -Force -ErrorAction Stop
+          $certificateRemoved = $true
+        }
+      } catch {
+        $errors.Add(("client certificate cleanup failed: " + $_.Exception.Message)) | Out-Null
+      }
+    }
+
+    if ($script:EDR_CNG_KEY_CREATED_BY_INSTALL -and $script:EDR_CNG_KEY_CONTAINER) {
+      try {
+        $certutil = Get-Command "certutil.exe" -ErrorAction Stop | Select-Object -First 1
+        $provider = if ($script:EDR_CNG_PROVIDER_USED) { [string]$script:EDR_CNG_PROVIDER_USED } else { "Microsoft Software Key Storage Provider" }
+        $output = & $certutil.Source -f -csp $provider -delkey ([string]$script:EDR_CNG_KEY_CONTAINER) 2>&1
+        if ($LASTEXITCODE -eq 0) {
+          $keyRemoved = $true
+        } else {
+          $errors.Add(("CNG key cleanup failed exit={0}: {1}" -f $LASTEXITCODE, (($output | Out-String).Trim()))) | Out-Null
+        }
+      } catch {
+        $errors.Add(("CNG key cleanup failed: " + $_.Exception.Message)) | Out-Null
+      }
+    }
+  }
+
+  $receipt = [ordered]@{
+    schema = "edr.agent.install.rollback.v1"
+    completed_at = (Get-Date).ToUniversalTime().ToString("o")
+    status = if ($errors.Count -eq 0) { "succeeded" } else { "partial_failed" }
+    reason = $Reason
+    certificate_thumbprint = [string]$script:EDR_PROVISIONAL_CERT_THUMBPRINT
+    certificate_preexisting = [bool]$script:EDR_PROVISIONAL_CERT_PREEXISTED
+    certificate_removed = $certificateRemoved
+    cng_key_container = [string]$script:EDR_CNG_KEY_CONTAINER
+    cng_key_created_by_install = [bool]$script:EDR_CNG_KEY_CREATED_BY_INSTALL
+    cng_key_removed = $keyRemoved
+    errors = [string[]]$errors
+  }
+  $path = Write-DurableInstallDiagnostic -Name "install-enrollment-rollback-last.json" -Report $receipt
+  if ($path) { Write-Warning ("Rolled back provisional enrollment material; receipt=" + $path) }
+  $script:EDR_INSTALL_TRANSACTION_ACTIVE = $false
+}
+
 Invoke-AgentPreflightIfNeeded
 
 Repair-AgentTomlAcl -Path $Output
@@ -1200,9 +1398,11 @@ if ($existingEndpointId -and $existingTenantId -and -not $ForceEnroll) {
   }
 }
 
-$keyProviderNorm = Normalize-KeyProvider $KeyProvider
-$csrPem = Ensure-AgentCSR -KeyPath $ClientKeyPath -CsrPath $ClientCsrPath -SubjectCN $env:COMPUTERNAME -Provider $keyProviderNorm
-$effectiveKeyProvider = if ($script:EDR_EFFECTIVE_KEY_PROVIDER) { [string]$script:EDR_EFFECTIVE_KEY_PROVIDER } else { $keyProviderNorm }
+try {
+  $script:EDR_INSTALL_TRANSACTION_ACTIVE = $true
+  $keyProviderNorm = Normalize-KeyProvider $KeyProvider
+  $csrPem = Ensure-AgentCSR -KeyPath $ClientKeyPath -CsrPath $ClientCsrPath -SubjectCN $env:COMPUTERNAME -Provider $keyProviderNorm
+  $effectiveKeyProvider = if ($script:EDR_EFFECTIVE_KEY_PROVIDER) { [string]$script:EDR_EFFECTIVE_KEY_PROVIDER } else { $keyProviderNorm }
 if ($keyProviderNorm -eq "cng" -and $effectiveKeyProvider -eq "pem") {
   # CNG can fall back to a local PEM key on hosts where certreq/KSP enrollment is
   # unavailable. Keep the rest of the install path aligned with the key material
@@ -1841,6 +2041,11 @@ function Test-AgentBootstrapHealth {
 $issuedCertThumbprint = Get-PemCertificateThumbprint $d.client_cert
 if ($UseNativeWindowsStore) {
   $EffectiveCertThumbprint = $issuedCertThumbprint
+  $script:EDR_PROVISIONAL_CERT_THUMBPRINT = $EffectiveCertThumbprint
+  $script:EDR_PROVISIONAL_CERT_STORE = $EffectiveCertStore
+  $candidateStore = (([string]$EffectiveCertStore) -replace '^Cert:\\?', '').Trim([char]0x5c)
+  $candidateCertPath = "Cert:\$candidateStore\" + ($EffectiveCertThumbprint -replace '\s+', '')
+  $script:EDR_PROVISIONAL_CERT_PREEXISTED = [bool](Test-Path -LiteralPath $candidateCertPath)
 }
 
 function Merge-EnrollIntoAgentTomlExample {
@@ -2386,6 +2591,7 @@ max_log_files        = 5
 
 [command]
 allow_dangerous      = false
+allow_lifecycle_maintenance = true
 allow_rtq_readonly   = true
 signing_public_key_path = "$(Escape-Toml $TomlSigningPublicKeyPath)"
 
@@ -2506,6 +2712,7 @@ if ($tomlIssue) {
 if ($DryRun) {
   $displayToml = [regex]::Replace($toml, '(?m)^(\s*rest_bearer_token\s*=\s*")[^"]*(")', '$1<redacted>$2')
   Write-Output $displayToml
+  Remove-ProvisionalEnrollmentMaterial -Reason "dry_run"
   exit 0
 }
 
@@ -2576,7 +2783,7 @@ if ($generatedTomlIssue) {
 }
 if ($generatedTomlIssue) {
   Write-AgentTomlSanityDiagnostic -TomlText $toml -Issue ("source={0}; {1}" -f $tomlSource, $generatedTomlIssue) -OutputPath $Output -ReportPath $HealthReportPath
-  Write-Error ("Generated agent.toml failed Agent parser validation ({0}); source={1}" -f $generatedTomlIssue, $tomlSource)
+  Write-Error ("Generated agent.toml failed Agent config validation ({0}); source={1}" -f $generatedTomlIssue, $tomlSource)
 }
 Repair-AgentTomlAcl -Path $outFile
 Repair-InstallRuntimeAcls -InstallRoot $InstallDirForToml
@@ -2598,4 +2805,11 @@ if ($ConfigureSensorPolicy) {
 
 if ($InstallAutorun) {
   Install-AgentAutorun
+}
+$script:EDR_INSTALL_TRANSACTION_COMMITTED = $true
+$script:EDR_INSTALL_TRANSACTION_ACTIVE = $false
+} catch {
+  $failure = $_
+  Remove-ProvisionalEnrollmentMaterial -Reason ([string]$failure.Exception.Message)
+  throw $failure
 }

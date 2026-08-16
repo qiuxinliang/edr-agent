@@ -238,6 +238,14 @@ int main(void) {
   contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
            "ARM64 release excludes unsupported WinDivert drivers");
+  contains(workflow, "edr.windows.package-capabilities.v1",
+           "release package declares an enforceable Windows architecture capability contract");
+  contains(workflow, "arm64_emulation_supported = $false",
+           "release does not claim unverified AMD64-on-ARM64 compatibility");
+  contains(workflow, "signature_status = if",
+           "release package records signed versus unsigned launch policy context");
+  contains(workflow, "package root must contain exactly one package-capabilities.json",
+           "release gate verifies the architecture capability manifest is packaged exactly once");
   contains(workflow, "gh release upload", "architecture bundles are retained in the draft release before publication");
   contains(workflow, "Verify combined AMD64/ARM64 asset set",
            "combined release is published only after both architecture bundles exist");

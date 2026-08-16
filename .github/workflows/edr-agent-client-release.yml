@@ -695,6 +695,16 @@ jobs:
           if (-not $env:EDR_AGENT_VERSION) { throw "EDR_AGENT_VERSION was not resolved from the release tag" }
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
+          $packageCapabilitiesPath = Join-Path $env:GITHUB_WORKSPACE "package-capabilities.json"
+          $packageCapabilities = [ordered]@{
+            schema = "edr.windows.package-capabilities.v1"
+            target_arch = $env:EDR_RELEASE_ARCH
+            arm64_emulation_supported = $false
+            arm64_emulation_network_packet_capture = $false
+            network_packet_capture = ($env:EDR_INCLUDE_WINDIVERT -eq 'true')
+            signature_status = if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') { 'signed' } else { 'unsigned' }
+          }
+          $packageCapabilities | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $packageCapabilitiesPath -Encoding UTF8
           $null = $items.Add($agentExe)
           if ($workerExe -and (Test-Path -LiteralPath $workerExe)) {
             $null = $items.Add($workerExe)
@@ -741,6 +751,7 @@ jobs:
 
           $null = $items.Add($nativeIntegrityPath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
+          $null = $items.Add($packageCapabilitiesPath)
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
           if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
             foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
@@ -867,6 +878,20 @@ jobs:
             }
             if ($packagedVersion -ne $env:EDR_AGENT_VERSION) {
               throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
+            }
+            $capabilityEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'package-capabilities.json' })
+            if ($capabilityEntries.Count -ne 1) {
+              throw "package root must contain exactly one package-capabilities.json; found $($capabilityEntries.Count)"
+            }
+            $capabilityReader = New-Object System.IO.StreamReader($capabilityEntries[0].Open())
+            try {
+              $packagedCapabilities = $capabilityReader.ReadToEnd() | ConvertFrom-Json
+            } finally {
+              $capabilityReader.Dispose()
+            }
+            if ($packagedCapabilities.schema -ne 'edr.windows.package-capabilities.v1' -or
+                $packagedCapabilities.target_arch -ne $env:EDR_RELEASE_ARCH) {
+              throw "package-capabilities.json does not bind the release architecture"
             }
 
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
