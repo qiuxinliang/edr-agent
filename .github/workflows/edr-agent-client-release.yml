@@ -94,6 +94,9 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
+      # A source-cache miss contacts GitHub archive endpoints. Serialize the
+      # two architectures until their immutable pre-built packages are restored.
+      max-parallel: 1
       matrix:
         include:
           - arch: amd64
@@ -311,6 +314,8 @@ jobs:
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $installedRoot = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\$env:EDR_VCPKG_TRIPLET"
           $installed_marker = Join-Path $installedRoot "installed\vcpkg\status"
@@ -320,13 +325,12 @@ jobs:
             return
           }
           $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
-          $release_tag = "prebuild-fast-$env:EDR_VCPKG_TRIPLET-$hash"
+          $release_tag = "prebuild-yara-$env:EDR_VCPKG_TRIPLET-$hash"
           $archive = "vcpkg-installed-$env:EDR_VCPKG_TRIPLET.7z"
-          $url = "https://github.com/${{ github.repository }}/releases/download/$release_tag/$archive"
-          Write-Host "[pre-build-packages] Cache miss, trying pre-built: $url"
+          Write-Host "[pre-build-packages] Cache miss, trying authenticated pre-built release: $release_tag/$archive"
           try {
-            $progressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
+            & gh release download $release_tag --repo $env:GITHUB_REPOSITORY --pattern $archive --dir $env:GITHUB_WORKSPACE --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release download failed with exit code $LASTEXITCODE" }
             Write-Host "[pre-build-packages] Download OK, extracting..."
             7z x $archive -o"$env:GITHUB_WORKSPACE" -y
             if ($LASTEXITCODE -ne 0) { throw "7z extract failed" }
@@ -372,16 +376,21 @@ jobs:
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[vcpkg] release path: curl + sqlite + yara (no grpc/protobuf)"
-          & $tc install --x-feature=sqlite --x-feature=yara
+          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $tc -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
           Write-Host "[vcpkg] YARA package probe under $installedRoot"
-          foreach ($p in @(
+          $yaraProbePaths = @(
             (Join-Path $installedRoot "share\unofficial-libyara\unofficial-libyara-config.cmake"),
             (Join-Path $installedRoot "include\yara.h"),
             (Join-Path $installedRoot "include\yara\yara.h"),
             (Join-Path $installedRoot "lib\yara.lib"),
             (Join-Path $installedRoot "lib\libyara.lib")
-          )) {
-            if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
+          )
+          $yaraFound = $false
+          foreach ($p in $yaraProbePaths) {
+            if (Test-Path -LiteralPath $p) { $yaraFound = $true; Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
+          }
+          if (-not $yaraFound) {
+            throw "vcpkg install completed without a usable YARA package under $installedRoot"
           }
 
           "VCPKG_INSTALLED_ROOT=$installedRoot" | Out-File -FilePath $env:GITHUB_ENV -Append

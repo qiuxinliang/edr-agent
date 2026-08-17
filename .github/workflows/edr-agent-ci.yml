@@ -52,7 +52,7 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $v = Join-Path $vroot "vcpkg.exe"
           Push-Location $env:GITHUB_WORKSPACE
-          & $v install --x-feature=yara
+          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $v -FeatureArgs @('--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
           $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
           Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
           foreach ($p in @(

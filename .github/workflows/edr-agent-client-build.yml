@@ -102,6 +102,8 @@ jobs:
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
           if (Test-Path $installed_marker) {
@@ -110,13 +112,12 @@ jobs:
             return
           }
           $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
-          $release_tag = "prebuild-x64-windows-$hash"
+          $release_tag = "prebuild-yara-x64-windows-$hash"
           $archive = "vcpkg-installed-x64-windows.7z"
-          $url = "https://github.com/${{ github.repository }}/releases/download/$release_tag/$archive"
-          Write-Host "[pre-build-packages] Cache miss, trying pre-built: $url"
+          Write-Host "[pre-build-packages] Cache miss, trying authenticated pre-built release: $release_tag/$archive"
           try {
-            $progressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
+            & gh release download $release_tag --repo $env:GITHUB_REPOSITORY --pattern $archive --dir $env:GITHUB_WORKSPACE --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release download failed with exit code $LASTEXITCODE" }
             Write-Host "[pre-build-packages] Download OK, extracting..."
             7z x $archive -o"$env:GITHUB_WORKSPACE" -y
             if ($LASTEXITCODE -ne 0) { throw "7z extract failed" }
@@ -163,7 +164,7 @@ jobs:
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[vcpkg] Windows product build: sqlite + yara (no gRPC)"
-          & $tc install --x-feature=sqlite --x-feature=yara
+          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $tc -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure (Ninja, Release)

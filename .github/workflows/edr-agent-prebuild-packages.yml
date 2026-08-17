@@ -5,35 +5,42 @@ name: Build Pre-built vcpkg Packages
 
 on:
   workflow_dispatch:
-    inputs:
-      full_features:
-        description: "Prebuild YARA full dependency set (slow)"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
 
 jobs:
   prebuild:
-    name: Prebuild vcpkg dependencies → GitHub Release
-    runs-on: windows-2022
+    name: Prebuild vcpkg ${{ matrix.triplet }} → GitHub Release
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      # A cold cache is the only path that contacts GitHub source archives.
+      # Do not let AMD64 and ARM64 multiply that request burst.
+      max-parallel: 1
+      matrix:
+        include:
+          - triplet: x64-windows
+            runner: windows-2022
+            msvc_arch: x64
+          - triplet: arm64-windows
+            runner: windows-11-arm
+            msvc_arch: arm64
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
-        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
+        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
 
       - name: Compute vcpkg.json hash (for release tag)
         shell: pwsh
@@ -44,19 +51,23 @@ jobs:
           Write-Host "Short hash: $short"
           "VCPKG_JSON_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
           "VCPKG_JSON_SHORT=$short" | Out-File -FilePath $env:GITHUB_ENV -Append
-          if ('${{ inputs.full_features }}' -eq 'true') {
-            "PREBUILD_PROFILE=full" | Out-File -FilePath $env:GITHUB_ENV -Append
-            "PREBUILD_RELEASE_TAG=prebuild-x64-windows-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
-          } else {
-            "PREBUILD_PROFILE=fast" | Out-File -FilePath $env:GITHUB_ENV -Append
-            "PREBUILD_RELEASE_TAG=prebuild-fast-x64-windows-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
+          "PREBUILD_RELEASE_TAG=prebuild-yara-$env:VCPKG_DEFAULT_TRIPLET-$short" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Prepare cache directories
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
+
+      - name: Cache vcpkg source and binary downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: vcpkg-prebuild-yara-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          restore-keys: |
+            vcpkg-prebuild-yara-${{ matrix.triplet }}-
 
       - name: Bootstrap pinned vcpkg
         working-directory: ${{ github.workspace }}
@@ -65,8 +76,6 @@ jobs:
 
       - name: vcpkg install (source build)
         working-directory: ${{ github.workspace }}
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
         shell: pwsh
         run: |
           if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
@@ -75,19 +84,14 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          Write-Host "[Prebuild] Installing vcpkg packages from source (profile=$env:PREBUILD_PROFILE)..."
-          if ($env:PREBUILD_PROFILE -eq "full") {
-            & $tc install --x-feature=sqlite --x-feature=yara --keep-going
-          } else {
-            & $tc install --x-feature=sqlite --keep-going
-          }
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          Write-Host "[Prebuild] Installing production vcpkg packages from source for $env:VCPKG_DEFAULT_TRIPLET..."
+          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $tc -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
           Write-Host "[Prebuild] vcpkg install completed successfully"
 
       - name: Archive vcpkg_installed (7z)
         shell: pwsh
         run: |
-          $archive = "vcpkg-installed-x64-windows.7z"
+          $archive = "vcpkg-installed-$env:VCPKG_DEFAULT_TRIPLET.7z"
           $size_before = (Get-ChildItem -Path "vcpkg_installed" -Recurse -File | Measure-Object -Property Length -Sum).Sum
           Write-Host "vcpkg_installed size before compression: $([math]::Round($size_before / 1MB, 1)) MB"
           7z a -mx=9 -mmt=on $archive "vcpkg_installed\"
@@ -113,59 +117,19 @@ jobs:
           }
           # Recreate
           $now = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss UTC')
-          $packages = if ($env:PREBUILD_PROFILE -eq "full") { "curl, openssl, yara, pcre2, sqlite3" } else { "curl, sqlite3" }
+          $packages = "curl, openssl, yara, pcre2, sqlite3"
           $notes = @"
           vcpkg.json SHA256: $env:VCPKG_JSON_SHA256
-          Platform: x64-windows
-          Profile: $env:PREBUILD_PROFILE
+          Platform: $env:VCPKG_DEFAULT_TRIPLET
+          Profile: production-yara
           Created: $now
           Packages: $packages
           "@
           gh release create $tag $archive `
-            --title "Pre-built vcpkg packages (x64-windows, $env:PREBUILD_PROFILE)" `
+            --title "Pre-built vcpkg packages ($env:VCPKG_DEFAULT_TRIPLET, production-yara)" `
             --notes $notes
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           Write-Host "Release created: $tag"
-          "PREBUILD_RELEASE_CREATED_AT=$now" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Update manifest.json
-        shell: pwsh
-        run: |
-          $packages = if ($env:PREBUILD_PROFILE -eq "full") {
-            @("curl", "openssl", "yara", "pcre2", "sqlite3")
-          } else {
-            @("curl", "sqlite3")
-          }
-          $manifest = @{
-            platform = "x64-windows"
-            profile = $env:PREBUILD_PROFILE
-            packages = $packages
-            latest_prebuild = @{
-              vcpkg_json_sha256 = $env:VCPKG_JSON_SHA256
-              release_tag = $env:PREBUILD_RELEASE_TAG
-              archive = "vcpkg-installed-x64-windows.7z"
-              size_bytes = [long]$env:PREBUILD_ARCHIVE_SIZE
-              created_at = $env:PREBUILD_RELEASE_CREATED_AT
-              status = "available"
-            }
-          }
-          $manifest | ConvertTo-Json -Depth 4 | Out-File -FilePath "pre-build-packages/manifest.json" -Encoding utf8 -Force
-          Write-Host "manifest.json updated"
-
-      - name: Commit and push manifest.json
-        shell: pwsh
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pre-build-packages/manifest.json
-          $diff = git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "ci: update pre-build manifest ($env:PREBUILD_RELEASE_TAG)"
-            git push
-            Write-Host "manifest.json pushed"
-          } else {
-            Write-Host "manifest.json unchanged, skip push"
-          }
 
       - name: "[Prebuild] Summary"
         shell: pwsh

@@ -384,6 +384,12 @@ int main(void) {
            "release workflow pins the Visual Studio compiler generation on both architectures");
   contains(client_release, "bootstrap_pinned_vcpkg.ps1",
            "release workflow bootstraps the manifest-pinned vcpkg commit");
+  contains(client_release, "Invoke-VcpkgInstallWithRetry.ps1",
+           "release workflow retries only a bounded GitHub source-archive rate limit");
+  contains(client_release, "prebuild-yara-$env:EDR_VCPKG_TRIPLET-$hash",
+           "release workflow restores the matching production YARA pre-built dependency closure");
+  contains(client_release, "max-parallel: 1",
+           "release serializes cold AMD64 and ARM64 source-cache fallbacks");
   contains(client_release, "actions/setup-dotnet@v5",
            "release workflow uses the Node 24 setup-dotnet action");
   contains(client_release, "actions/setup-python@v6",
@@ -431,6 +437,10 @@ int main(void) {
            "client build derives the immutable Setup UI lock name from its runtime identifier");
   contains(client_build, "-p:NuGetLockFilePath=$lock",
            "client build explicitly selects its immutable target RID lock after RuntimeIdentifier is supplied");
+  contains(client_build, "Invoke-VcpkgInstallWithRetry.ps1",
+           "client build retries bounded GitHub source-archive rate limits");
+  contains(client_build, "prebuild-yara-x64-windows-$hash",
+           "client build restores the matching production YARA pre-built dependency closure");
   contains(client_build, "actions/upload-artifact@v6",
            "client build uses the Node 24 artifact upload action");
   contains(client_build, "$nativeIntegrityFiles.ToArray()",
@@ -438,6 +448,28 @@ int main(void) {
   require_true(!strstr(client_build, "files = @(\n              [ordered]@{ name = \"FDSecurityInstallerWorker.exe\""),
                "client build must not use inline generic-list expansion inside an ordered manifest");
   free(client_build);
+
+  snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-prebuild-packages.yml", root);
+  char *vcpkg_prebuild = read_file(path);
+  require_true(vcpkg_prebuild != NULL, "read vcpkg prebuild workflow");
+  contains(vcpkg_prebuild, "triplet: arm64-windows",
+           "vcpkg prebuild workflow publishes a native ARM64 dependency closure");
+  contains(vcpkg_prebuild, "--x-feature=yara",
+           "vcpkg prebuild workflow matches the production YARA dependency set");
+  contains(vcpkg_prebuild, "prebuild-yara-$env:VCPKG_DEFAULT_TRIPLET-$short",
+           "vcpkg prebuild tag binds the manifest hash and target triplet");
+  contains(vcpkg_prebuild, "Invoke-VcpkgInstallWithRetry.ps1",
+           "vcpkg prebuild uses bounded rate-limit recovery");
+  free(vcpkg_prebuild);
+
+  snprintf(path, sizeof(path), "%s/scripts/Invoke-VcpkgInstallWithRetry.ps1", root);
+  char *vcpkg_retry = read_file(path);
+  require_true(vcpkg_retry != NULL, "read vcpkg rate-limit recovery helper");
+  contains(vcpkg_retry, "response\\s+code\\s+429",
+           "vcpkg recovery helper detects HTTP 429 explicitly");
+  contains(vcpkg_retry, "not retrying because the failure is not an HTTP 429 rate limit",
+           "vcpkg recovery helper must not mask non-rate-limit build failures");
+  free(vcpkg_retry);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/windows-platform-https-lifecycle.yml", root);
   char *platform_https = read_file(path);
