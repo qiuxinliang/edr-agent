@@ -266,12 +266,29 @@ function Write-SetupUiSizeReport([string] $PublishDir, [string] $OutputZipPath) 
 }
 
 $targetFramework = "net8.0-windows10.0.17763.0"
+# NuGet normalizes the Windows platform version by dropping the trailing .0
+# in packages.lock.json target keys.
+$nugetLockTargetFramework = "net8.0-windows10.0.17763"
 $runtime = if ($RuntimeIdentifier) { $RuntimeIdentifier } elseif ($env:EDR_SETUP_UI_RUNTIME_IDENTIFIER) { [string]$env:EDR_SETUP_UI_RUNTIME_IDENTIFIER } else { "win-x64" }
 if ($runtime -notin @("win-x64", "win-arm64")) {
     throw "Invalid RuntimeIdentifier: $runtime"
 }
 $platformDir = if ($runtime -eq "win-arm64") { "arm64" } else { "x64" }
 $targetArch = if ($runtime -eq "win-arm64") { "arm64" } else { "amd64" }
+$runtimeLockFile = Join-Path $scriptDir "packages.$runtime.lock.json"
+if (-not (Test-Path -LiteralPath $runtimeLockFile -PathType Leaf)) {
+    throw "Missing locked NuGet dependency closure for ${runtime}: $runtimeLockFile"
+}
+try {
+    $runtimeLock = Get-Content -LiteralPath $runtimeLockFile -Raw | ConvertFrom-Json
+    $expectedLockTarget = "$nugetLockTargetFramework/$runtime"
+    if ($null -eq $runtimeLock.dependencies.PSObject.Properties[$expectedLockTarget]) {
+        throw "missing target graph $expectedLockTarget"
+    }
+} catch {
+    throw "Invalid locked NuGet dependency closure for ${runtime}: $runtimeLockFile ($($_.Exception.Message))"
+}
+Write-Host "Setup UI NuGet lock: $runtimeLockFile ($expectedLockTarget)"
 $setupArchSidecar = $SetupExe + ".arch"
 if (-not $SetupTargetArch -and (Test-Path -LiteralPath $setupArchSidecar)) {
     $SetupTargetArch = ([System.IO.File]::ReadAllText($setupArchSidecar)).Trim().ToLowerInvariant()
@@ -313,7 +330,9 @@ $publishArgs = @(
     "-p:PublishSingleFile=false",
     "-p:PublishReadyToRun=$readyToRun",
     "-p:DebugType=None",
-    "-p:DebugSymbols=false"
+    "-p:DebugSymbols=false",
+    "--locked-mode",
+    "-p:NuGetLockFilePath=$runtimeLockFile"
 )
 dotnet publish @publishArgs
 if ($LASTEXITCODE -ne 0) {

@@ -62,30 +62,43 @@ foreach ($architecture in @("x64", "arm64")) {
 }
 
 $projectPath = Join-Path $RepositoryRoot "install\windows-setup-ui\EDRAgent.SetupUi.csproj"
-$nugetLock = Read-JsonFile "install\windows-setup-ui\packages.lock.json"
-if ([int]$nugetLock.version -ne 1 -or @($nugetLock.dependencies.PSObject.Properties).Count -ne 1) {
-  throw "Setup UI NuGet lock must contain exactly one target framework"
-}
 [xml]$project = [IO.File]::ReadAllText($projectPath)
-$lockedFramework = @($nugetLock.dependencies.PSObject.Properties)[0].Value
 $packageReferences = @($project.Project.ItemGroup.PackageReference | Where-Object { $_.Include })
 if ($packageReferences.Count -eq 0) {
   throw "Setup UI project has no package references to validate"
 }
-foreach ($packageReference in $packageReferences) {
-  $name = [string]$packageReference.Include
-  $version = [string]$packageReference.Version
-  $locked = $lockedFramework.PSObject.Properties[$name].Value
-  if ($null -eq $locked -or [string]$locked.type -ne "Direct" -or
-      [string]$locked.resolved -ne $version -or
-      [string]$locked.contentHash -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
-    throw "Setup UI package '$name' is not exactly bound by packages.lock.json"
+
+$setupUiFramework = "net8.0-windows10.0.17763"
+$setupUiLocks = @(
+  @{ Path = "install\windows-setup-ui\packages.lock.json"; Target = $setupUiFramework },
+  @{ Path = "install\windows-setup-ui\packages.win-x64.lock.json"; Target = "$setupUiFramework/win-x64" },
+  @{ Path = "install\windows-setup-ui\packages.win-arm64.lock.json"; Target = "$setupUiFramework/win-arm64" }
+)
+foreach ($setupUiLockSpec in $setupUiLocks) {
+  $nugetLock = Read-JsonFile $setupUiLockSpec.Path
+  $lockTargets = @($nugetLock.dependencies.PSObject.Properties)
+  if ([int]$nugetLock.version -ne 1 -or $lockTargets.Count -ne 1 -or
+      [string]$lockTargets[0].Name -ne [string]$setupUiLockSpec.Target) {
+    throw "Setup UI NuGet lock '$($setupUiLockSpec.Path)' must contain exactly target '$($setupUiLockSpec.Target)'"
+  }
+  $lockedFramework = $lockTargets[0].Value
+  foreach ($packageReference in $packageReferences) {
+    $name = [string]$packageReference.Include
+    $version = [string]$packageReference.Version
+    $locked = $lockedFramework.PSObject.Properties[$name].Value
+    if ($null -eq $locked -or [string]$locked.type -ne "Direct" -or
+        [string]$locked.resolved -ne $version -or
+        [string]$locked.contentHash -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+      throw "Setup UI package '$name' is not exactly bound by $($setupUiLockSpec.Path)"
+    }
   }
 }
 $projectText = [IO.File]::ReadAllText($projectPath)
+$requiredRidLockSelector = '<NuGetLockFilePath Condition="''$(RuntimeIdentifier)'' != ''''">packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>'
 if ($projectText -notmatch '<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>' -or
-    $projectText -notmatch '<RestoreLockedMode>true</RestoreLockedMode>') {
-  throw "Setup UI restore must require the committed NuGet lock"
+    $projectText -notmatch '<RestoreLockedMode>true</RestoreLockedMode>' -or
+    -not $projectText.Contains($requiredRidLockSelector)) {
+  throw "Setup UI restore must require committed per-RID NuGet locks"
 }
 
 Write-Host "Dependency locks verified: VS2022, .NET $($globalJson.sdk.version), vcpkg $vcpkgBaseline, ONNX Runtime $onnxVersion, NuGet locked mode"

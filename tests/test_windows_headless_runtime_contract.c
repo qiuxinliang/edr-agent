@@ -414,7 +414,21 @@ int main(void) {
                          "Setup UI capability metadata binds the native target architecture");
   ok &= require_contains(setup_ui_build, "Assert-WindowsInstallerBootstrapArchitecture.ps1",
                          "Setup UI packaging must preserve the explicit Inno bootstrap architecture exception");
+  ok &= require_contains(setup_ui_build, "packages.$runtime.lock.json",
+                         "Setup UI build must select the immutable NuGet lock for its target RID");
+  ok &= require_contains(setup_ui_build, "--locked-mode",
+                         "Setup UI publish must refuse a dependency graph that differs from its committed RID lock");
   free(setup_ui_build);
+
+  char *dependency_locks = read_source(root, "scripts/Validate-DependencyLocks.ps1");
+  if (!dependency_locks) return 1;
+  ok &= require_contains(dependency_locks, "packages.win-x64.lock.json",
+                         "dependency validation must require the immutable Windows x64 Setup UI lock");
+  ok &= require_contains(dependency_locks, "packages.win-arm64.lock.json",
+                         "dependency validation must require the immutable Windows ARM64 Setup UI lock");
+  ok &= require_contains(dependency_locks, "committed per-RID NuGet locks",
+                         "dependency validation must reject a project that stops selecting RID-specific locks");
+  free(dependency_locks);
 
   char *bootstrap_arch = read_source(root, "scripts/Assert-WindowsInstallerBootstrapArchitecture.ps1");
   if (!bootstrap_arch) return 1;
