@@ -52,32 +52,26 @@ if ($packageReferences.Count -eq 0) {
 
 $setupUiFramework = "net8.0-windows10.0.17763"
 $setupUiLocks = @(
-  @{ Path = "install\windows-setup-ui\packages.lock.json"; Targets = @($setupUiFramework) },
-  @{ Path = "install\windows-setup-ui\packages.win-x64.lock.json"; Targets = @($setupUiFramework, "$setupUiFramework/win-x64") },
-  @{ Path = "install\windows-setup-ui\packages.win-arm64.lock.json"; Targets = @($setupUiFramework, "$setupUiFramework/win-arm64") }
+  @{ Path = "install\windows-setup-ui\packages.lock.json"; Target = $setupUiFramework },
+  @{ Path = "install\windows-setup-ui\packages.win-x64.lock.json"; Target = "$setupUiFramework/win-x64" },
+  @{ Path = "install\windows-setup-ui\packages.win-arm64.lock.json"; Target = "$setupUiFramework/win-arm64" }
 )
 foreach ($setupUiLockSpec in $setupUiLocks) {
   $nugetLock = Read-JsonFile $setupUiLockSpec.Path
   $lockTargets = @($nugetLock.dependencies.PSObject.Properties)
-  $expectedTargets = @($setupUiLockSpec.Targets)
-  $actualTargetNames = @($lockTargets | ForEach-Object { [string]$_.Name })
-  $missingTargets = @($expectedTargets | Where-Object { $_ -notin $actualTargetNames })
-  $unexpectedTargets = @($actualTargetNames | Where-Object { $_ -notin $expectedTargets })
-  if ([int]$nugetLock.version -ne 1 -or $missingTargets.Count -gt 0 -or $unexpectedTargets.Count -gt 0) {
-    $expectedTargetText = $expectedTargets -join ", "
-    throw "Setup UI NuGet lock '$($setupUiLockSpec.Path)' must contain exactly dependency graphs '$expectedTargetText'"
+  if ([int]$nugetLock.version -ne 1 -or $lockTargets.Count -ne 1 -or
+      [string]$lockTargets[0].Name -ne [string]$setupUiLockSpec.Target) {
+    throw "Setup UI NuGet lock '$($setupUiLockSpec.Path)' must contain exactly runtime graph '$($setupUiLockSpec.Target)'"
   }
-  foreach ($target in $expectedTargets) {
-    $lockedFramework = $nugetLock.dependencies.PSObject.Properties[$target].Value
-    foreach ($packageReference in $packageReferences) {
-      $name = [string]$packageReference.Include
-      $version = [string]$packageReference.Version
-      $locked = $lockedFramework.PSObject.Properties[$name].Value
-      if ($null -eq $locked -or [string]$locked.type -ne "Direct" -or
-          [string]$locked.resolved -ne $version -or
-          [string]$locked.contentHash -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
-        throw "Setup UI package '$name' is not exactly bound by $($setupUiLockSpec.Path) target '$target'"
-      }
+  $lockedFramework = $lockTargets[0].Value
+  foreach ($packageReference in $packageReferences) {
+    $name = [string]$packageReference.Include
+    $version = [string]$packageReference.Version
+    $locked = $lockedFramework.PSObject.Properties[$name].Value
+    if ($null -eq $locked -or [string]$locked.type -ne "Direct" -or
+        [string]$locked.resolved -ne $version -or
+        [string]$locked.contentHash -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+      throw "Setup UI package '$name' is not exactly bound by $($setupUiLockSpec.Path)"
     }
   }
 }

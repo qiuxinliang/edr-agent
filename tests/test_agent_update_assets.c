@@ -467,8 +467,8 @@ int main(void) {
            "dependency validation prevents vcpkg baseline drift");
   contains(dependency_validator, "Setup UI package '$name' is not exactly bound",
            "dependency validation enforces NuGet locked restore inputs");
-  contains(dependency_validator, "must contain exactly dependency graphs",
-           "dependency validation requires both base and runtime-specific NuGet lock graphs");
+  contains(dependency_validator, "must contain exactly runtime graph",
+           "dependency validation requires one immutable NuGet graph per restore runtime");
   contains(dependency_validator, "cryptography==44.0.3",
            "dependency validation pins the P0 encryption root dependency");
   free(dependency_validator);

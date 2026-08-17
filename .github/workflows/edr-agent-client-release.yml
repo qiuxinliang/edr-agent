@@ -591,10 +591,9 @@ jobs:
           $lockJson = Get-Content -LiteralPath $lock -Raw | ConvertFrom-Json
           $baseGraph = 'net8.0-windows10.0.17763'
           $runtimeGraph = "$baseGraph/$env:EDR_RUNTIME_IDENTIFIER"
-          foreach ($graph in @($baseGraph, $runtimeGraph)) {
-            if ($null -eq $lockJson.dependencies.PSObject.Properties[$graph]) {
-              throw "Setup UI NuGet lock is incomplete; missing dependency graph '$graph' in $lock"
-            }
+          $lockGraphs = @($lockJson.dependencies.PSObject.Properties | ForEach-Object { [string]$_.Name })
+          if ($lockGraphs.Count -ne 1 -or $lockGraphs[0] -ne $runtimeGraph) {
+            throw "Setup UI NuGet lock must contain exactly runtime graph '$runtimeGraph' in $lock"
           }
           $restoreArgs = @(
             $project,

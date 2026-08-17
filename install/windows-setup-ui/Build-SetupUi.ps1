@@ -281,12 +281,10 @@ if (-not (Test-Path -LiteralPath $runtimeLockFile -PathType Leaf)) {
 }
 try {
     $runtimeLock = Get-Content -LiteralPath $runtimeLockFile -Raw | ConvertFrom-Json
-    if ($null -eq $runtimeLock.dependencies.PSObject.Properties[$nugetLockTargetFramework]) {
-        throw "missing base target graph $nugetLockTargetFramework"
-    }
     $expectedLockTarget = "$nugetLockTargetFramework/$runtime"
-    if ($null -eq $runtimeLock.dependencies.PSObject.Properties[$expectedLockTarget]) {
-        throw "missing target graph $expectedLockTarget"
+    $lockTargets = @($runtimeLock.dependencies.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($lockTargets.Count -ne 1 -or $lockTargets[0] -ne $expectedLockTarget) {
+        throw "Setup UI RID lock must contain exactly runtime graph $expectedLockTarget"
     }
 } catch {
     throw "Invalid locked NuGet dependency closure for ${runtime}: $runtimeLockFile ($($_.Exception.Message))"
