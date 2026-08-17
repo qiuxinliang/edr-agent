@@ -54,7 +54,7 @@ int main(void) {
   ok &= require_contains(installer, "[platform.request_signing]", "installer must write request-signing TOML section");
   ok &= require_contains(installer, "Get-ExistingAgentTomlRequestSigningIssue", "upgrade must repair legacy unsigned config");
   ok &= require_contains(installer, "minimal-parser-fallback", "installer must recover from template parser failures");
-  ok &= require_contains(installer, "Generated agent.toml failed Agent parser validation",
+  ok &= require_contains(installer, "Generated agent.toml failed Agent config validation",
                          "installer must fail before handoff when minimal TOML is rejected");
   ok &= require_contains(installer, "rest_bearer_token|secret|signing_public_key_path",
                          "installer diagnostics must redact request-signing secrets");

@@ -678,6 +678,8 @@ if(EDR_ONNXRUNTIME_AVAILABLE AND
     ${CMAKE_SOURCE_DIR}/src/ave/ave_engine.c
     ${CMAKE_SOURCE_DIR}/src/ave/ave_onnx_infer.c
     ${CMAKE_SOURCE_DIR}/src/ave/ave_static_features.c
+    ${CMAKE_SOURCE_DIR}/src/core/edr_log.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
     ${CMAKE_SOURCE_DIR}/src/config/config.c
     ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
   )

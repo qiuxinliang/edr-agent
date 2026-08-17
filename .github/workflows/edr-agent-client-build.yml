@@ -398,13 +398,23 @@ jobs:
           Copy-Item -LiteralPath "scripts\edr_agent_uninstall.ps1" -Destination $uninstallScript -Force
           $null = $items.Add($uninstallScript)
           $nativeIntegrityPath = Join-Path $outDir "native-package-integrity.json"
+          $nativeIntegrityFiles = New-Object System.Collections.Generic.List[object]
+          $null = $nativeIntegrityFiles.Add([ordered]@{
+            name = "FDSecurityInstallerWorker.exe"
+            sha256 = (Get-FileHash -LiteralPath $workerExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          })
+          $null = $nativeIntegrityFiles.Add([ordered]@{
+            name = "uninstall.exe"
+            sha256 = (Get-FileHash -LiteralPath $uninstallerExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          })
+          $null = $nativeIntegrityFiles.Add([ordered]@{
+            name = "uninstall.ps1"
+            sha256 = (Get-FileHash -LiteralPath $uninstallScript -Algorithm SHA256).Hash.ToLowerInvariant()
+          })
+          [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()
           [ordered]@{
             schema = "edr.windows.native-package-integrity.v1"
-            files = @(
-              [ordered]@{ name = "FDSecurityInstallerWorker.exe"; sha256 = (Get-FileHash -LiteralPath $workerExe -Algorithm SHA256).Hash.ToLowerInvariant() },
-              [ordered]@{ name = "uninstall.exe"; sha256 = (Get-FileHash -LiteralPath $uninstallerExe -Algorithm SHA256).Hash.ToLowerInvariant() },
-              [ordered]@{ name = "uninstall.ps1"; sha256 = (Get-FileHash -LiteralPath $uninstallScript -Algorithm SHA256).Hash.ToLowerInvariant() }
-            )
+            files = $nativeIntegrityFileArray
           } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
           $null = $items.Add($nativeIntegrityPath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))

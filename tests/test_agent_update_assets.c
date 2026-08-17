@@ -400,6 +400,16 @@ int main(void) {
                "release workflow has no Node 20 sccache action");
   free(client_release);
 
+  snprintf(path, sizeof(path), "%s/tests/test_ave_static_onnx_integration.c", root);
+  char *static_onnx_integration = read_file(path);
+  require_true(static_onnx_integration != NULL,
+               "release workflow target has a checked static ONNX integration test source");
+  contains(static_onnx_integration, "edr_onnx_runtime_load",
+           "static ONNX integration test loads the pinned fixture through the Agent runtime");
+  contains(static_onnx_integration, "onnx_layout != 1",
+           "static ONNX integration test requires the named triple-output contract");
+  free(static_onnx_integration);
+
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
   char *client_build = read_file(path);
   require_true(client_build != NULL, "read Windows client build workflow");
@@ -417,6 +427,10 @@ int main(void) {
            "client build uses the Node 24 setup-dotnet action");
   contains(client_build, "actions/upload-artifact@v6",
            "client build uses the Node 24 artifact upload action");
+  contains(client_build, "$nativeIntegrityFiles.ToArray()",
+           "client build materializes the Runtime component list before ordered-manifest serialization");
+  require_true(!strstr(client_build, "files = @(\n              [ordered]@{ name = \"FDSecurityInstallerWorker.exe\""),
+               "client build must not use inline generic-list expansion inside an ordered manifest");
   free(client_build);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/windows-platform-https-lifecycle.yml", root);
