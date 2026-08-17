@@ -113,6 +113,10 @@ if ($forensicRuleFiles.Count -lt 1) {
 Write-Host "Verified forensic YARA rules: $($forensicRuleFiles.Count) file(s)."
 $archCheck = Join-Path $agentRoot "scripts\Assert-WindowsPeArchitecture.ps1"
 if (-not (Test-Path -LiteralPath $archCheck)) { throw "Missing architecture verifier: $archCheck" }
+$installerBootstrapArchCheck = Join-Path $agentRoot "scripts\Assert-WindowsInstallerBootstrapArchitecture.ps1"
+if (-not (Test-Path -LiteralPath $installerBootstrapArchCheck)) {
+    throw "Missing installer bootstrap architecture verifier: $installerBootstrapArchCheck"
+}
 & $archCheck -Path $binExe -Architecture $TargetArch
 if ($TargetArch -eq "amd64") {
     Assert-WinDivertRuntime -AgentRoot $agentRoot
@@ -276,7 +280,7 @@ if ($LASTEXITCODE -ne 0) {
 $outDir = Join-Path $scriptDir "Output"
 $out = Join-Path $outDir "FDSecuritySetup-bundled.exe"
 if (Test-Path -LiteralPath $out) {
-    & $archCheck -Path $out -Architecture $TargetArch
+    & $installerBootstrapArchCheck -Path $out -PayloadArchitecture $TargetArch
     [System.IO.File]::WriteAllText($out + ".arch", $TargetArch + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
     Write-Host "OK: $out"
     $legacyOut = Join-Path $outDir "EDRAgentSetup-bundled.exe"

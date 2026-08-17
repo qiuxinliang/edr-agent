@@ -26,7 +26,7 @@ try {
             $actualFields = @($roundTrip.PSObject.Properties.Name | Sort-Object)
             $expectedSorted = @($expectedFields | Sort-Object)
             if (($actualFields -join "|") -ne ($expectedSorted -join "|")) {
-                throw "Unexpected v1 capability fields for $arch/$signatureStatus: $($actualFields -join ',')"
+                throw "Unexpected v1 capability fields for $arch/${signatureStatus}: $($actualFields -join ',')"
             }
             $expectedNetworkCapture = ($arch -eq "amd64")
             if ($roundTrip.schema -ne "edr.windows.package-capabilities.v1" -or

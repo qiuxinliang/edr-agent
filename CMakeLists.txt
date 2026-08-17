@@ -52,12 +52,19 @@ set(EDR_AGENT_VERSION_STRING
 message(STATUS "gRPC client removed from product build; HTTP ingest/control only")
 
 option(EDR_WITH_ONNXRUNTIME "Link ONNX Runtime C API for AVE real inference (optional)" OFF)
+option(EDR_REQUIRE_ONNXRUNTIME "Fail configure when ONNX Runtime is requested but unavailable" OFF)
 option(EDR_WITH_AVE_BEHAVIOR_ONNX "Deprecated: run behavior.onnx on endpoint instead of server-side evaluation" OFF)
+set(ONNXRUNTIME_ROOT "" CACHE PATH "Root of the SHA-256-pinned ONNX Runtime native package")
 set(EDR_ONNXRUNTIME_AVAILABLE 0)
+if(EDR_REQUIRE_ONNXRUNTIME AND NOT EDR_WITH_ONNXRUNTIME)
+  message(FATAL_ERROR "EDR_REQUIRE_ONNXRUNTIME=ON requires EDR_WITH_ONNXRUNTIME=ON")
+endif()
 if(EDR_WITH_ONNXRUNTIME)
   find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_c_api.h
     PATHS
       ENV ONNXRUNTIME_ROOT
+      "${ONNXRUNTIME_ROOT}"
+      "${ONNXRUNTIME_ROOT}/include"
       "$ENV{ONNXRUNTIME_ROOT}/include"
       /opt/homebrew/opt/onnxruntime/include
       /usr/local/opt/onnxruntime/include
@@ -66,15 +73,49 @@ if(EDR_WITH_ONNXRUNTIME)
   find_library(ONNXRUNTIME_LIB NAMES onnxruntime
     PATHS
       ENV ONNXRUNTIME_ROOT
+      "${ONNXRUNTIME_ROOT}"
+      "${ONNXRUNTIME_ROOT}/lib"
       "$ENV{ONNXRUNTIME_ROOT}/lib"
       /opt/homebrew/opt/onnxruntime/lib
       /usr/local/opt/onnxruntime/lib
       "C:/onnxruntime/lib")
   if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
     set(EDR_ONNXRUNTIME_AVAILABLE 1)
+  elseif(EDR_REQUIRE_ONNXRUNTIME)
+    message(FATAL_ERROR "EDR_REQUIRE_ONNXRUNTIME=ON but ONNX Runtime was not found; set ONNXRUNTIME_ROOT to the pinned native package")
   else()
     message(WARNING "EDR_WITH_ONNXRUNTIME=ON but onnxruntime not found (install or set ONNXRUNTIME_ROOT)")
   endif()
+endif()
+
+# Required ONNX builds must bind the exact checked model fixtures even when
+# EDR_BUILD_TESTS=OFF. Keeping this at the top level prevents a production
+# configure from bypassing the fixture gate by omitting tests/.
+set(EDR_ONNX_STATIC_FIXTURE
+  "${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx")
+set(EDR_ONNX_BEHAVIOR_FIXTURE
+  "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx")
+set(EDR_ONNX_BEHAVIOR_SEQ128_FIXTURE
+  "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx")
+if(EDR_REQUIRE_ONNXRUNTIME)
+  set(_edr_required_onnx_fixtures
+    "${EDR_ONNX_STATIC_FIXTURE}|0bc9404e918264af98fd7296ab960e8e7a3eb359487283bca8fc1e23b8149793"
+    "${EDR_ONNX_BEHAVIOR_FIXTURE}|02c02b0e0e8aa5416817502ec0fa50fa011c52801702e992dec413b42291be24"
+    "${EDR_ONNX_BEHAVIOR_SEQ128_FIXTURE}|14bc1dee6372baad94a2f33412ac2fd04b480bef29f6c853a2636f4a0d6cdd3e")
+  foreach(_edr_required_onnx_fixture IN LISTS _edr_required_onnx_fixtures)
+    string(REPLACE "|" ";" _edr_fixture_fields "${_edr_required_onnx_fixture}")
+    list(GET _edr_fixture_fields 0 _edr_fixture_path)
+    list(GET _edr_fixture_fields 1 _edr_fixture_expected_sha256)
+    if(NOT EXISTS "${_edr_fixture_path}")
+      message(FATAL_ERROR
+        "EDR_REQUIRE_ONNXRUNTIME=ON requires checked ONNX fixture: ${_edr_fixture_path}")
+    endif()
+    file(SHA256 "${_edr_fixture_path}" _edr_fixture_actual_sha256)
+    if(NOT _edr_fixture_actual_sha256 STREQUAL _edr_fixture_expected_sha256)
+      message(FATAL_ERROR
+        "Checked ONNX fixture SHA256 mismatch: ${_edr_fixture_path} expected=${_edr_fixture_expected_sha256} actual=${_edr_fixture_actual_sha256}")
+    endif()
+  endforeach()
 endif()
 
 option(EDR_BUILD_AVE_SHARED_LIB "Build standalone edr_ave_shared (AVE DLL/so for embedding)" OFF)

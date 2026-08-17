@@ -398,6 +398,8 @@ int main(void) {
                          "bundled installer capability metadata must bind the Agent signature mode");
   ok &= require_contains(build_ps, "Verified Runtime PE closure",
                          "bundled installer must verify every Runtime EXE and DLL architecture");
+  ok &= require_contains(build_ps, "Assert-WindowsInstallerBootstrapArchitecture.ps1",
+                         "Inno bootstrap architecture must be validated separately from native payload architecture");
   ok &= require_contains(build_ps, "/DEDR_ALLOW_POWERSHELL_FALLBACK=1",
                          "lab-only PowerShell fallback must be explicit in the Inno build contract");
   free(build_ps);
@@ -410,7 +412,19 @@ int main(void) {
                          "Setup UI capability metadata records signed versus unsigned state");
   ok &= require_contains(setup_ui_build, "target_arch = $targetArch",
                          "Setup UI capability metadata binds the native target architecture");
+  ok &= require_contains(setup_ui_build, "Assert-WindowsInstallerBootstrapArchitecture.ps1",
+                         "Setup UI packaging must preserve the explicit Inno bootstrap architecture exception");
   free(setup_ui_build);
+
+  char *bootstrap_arch = read_source(root, "scripts/Assert-WindowsInstallerBootstrapArchitecture.ps1");
+  if (!bootstrap_arch) return 1;
+  ok &= require_contains(bootstrap_arch, "[ValidateSet(\"amd64\", \"arm64\")]",
+                         "installer bootstrap validation must bind a supported native payload architecture");
+  ok &= require_contains(bootstrap_arch, "$expectedInno6Bootstrap = [UInt16]0x014c",
+                         "Inno Setup 6 bootstrap verification must require the expected x86 PE machine");
+  ok &= require_contains(bootstrap_arch, "Do not weaken the separate native Runtime PE checks",
+                         "the bootstrap exception must remain isolated from native Runtime PE validation");
+  free(bootstrap_arch);
 
   char *build_cmd = read_source(root, "install/windows-inno/build_bundled.cmd");
   if (!build_cmd) return 1;

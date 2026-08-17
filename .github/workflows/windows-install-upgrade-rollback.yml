@@ -30,6 +30,9 @@ permissions:
   # before the publish gate can complete.
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: windows-lifecycle-${{ inputs.target_tag }}
   cancel-in-progress: false
@@ -41,11 +44,11 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: windows-latest
+            runner: windows-2022
           - arch: arm64
             runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -68,8 +71,10 @@ jobs:
               if ($release.draft -or $release.prerelease -or $release.tag_name -notmatch '^win_\d+\.\d+\.\d+$') { continue }
               $version = [Version]$release.tag_name.Substring(4)
               $expectedAsset = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-exe.zip"
+              $expectedSetup = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-setup.exe"
               $hasNativeAsset = @($release.assets | Where-Object { $_.name -eq $expectedAsset }).Count -eq 1
-              if ($version -lt $targetVersion -and $hasNativeAsset) {
+              $hasSetupAsset = @($release.assets | Where-Object { $_.name -eq $expectedSetup }).Count -eq 1
+              if ($version -lt $targetVersion -and $hasNativeAsset -and $hasSetupAsset) {
                 $candidates += [pscustomobject]@{ Tag = $release.tag_name; Version = $version }
               }
             }
@@ -83,13 +88,12 @@ jobs:
           "BASELINE_TAG=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BASELINE_VERSION=$($baseline.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Download immutable native release packages
+      - name: Download immutable runtime and Setup EXE release packages
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path downloads\target, downloads\baseline | Out-Null
 
-          function Get-ImmutableRuntimeAsset([string]$Tag) {
-            $expected = "edr-agent-$Tag-windows-${{ matrix.arch }}-exe.zip"
+          function Get-ImmutableAsset([string]$Tag, [string]$Expected) {
             $releaseOutput = gh api `
               "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
             if ($LASTEXITCODE -ne 0) {
@@ -110,8 +114,8 @@ jobs:
             return $matches[0]
           }
 
-          function Download-ImmutableRuntime([string]$Tag, [string]$Destination) {
-            $asset = Get-ImmutableRuntimeAsset $Tag
+          function Download-ImmutableAsset([string]$Tag, [string]$Expected, [string]$Destination) {
+            $asset = Get-ImmutableAsset $Tag $Expected
             $apiUrl = "$($asset.url)".Trim()
             if (-not $apiUrl) {
               throw "release asset '$($asset.name)' for '$Tag' has no API download URL"
@@ -140,8 +144,14 @@ jobs:
             }
           }
 
-          Download-ImmutableRuntime $env:TARGET_TAG downloads\target
-          Download-ImmutableRuntime $env:BASELINE_TAG downloads\baseline
+          $targetRuntime = "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-exe.zip"
+          $baselineRuntime = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-exe.zip"
+          $targetSetup = "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-setup.exe"
+          $baselineSetup = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-setup.exe"
+          Download-ImmutableAsset $env:TARGET_TAG $targetRuntime downloads\target
+          Download-ImmutableAsset $env:BASELINE_TAG $baselineRuntime downloads\baseline
+          Download-ImmutableAsset $env:TARGET_TAG $targetSetup downloads\target
+          Download-ImmutableAsset $env:BASELINE_TAG $baselineSetup downloads\baseline
 
           $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
           $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
@@ -154,7 +164,23 @@ jobs:
           Expand-Archive -LiteralPath $targetZip[0].FullName -DestinationPath packages\target -Force
           Expand-Archive -LiteralPath $baselineZip[0].FullName -DestinationPath packages\baseline -Force
 
-      - name: Install, upgrade, rollback, and uninstall
+      - name: Execute real Setup EXE install, upgrade, rollback, and uninstall
+        shell: pwsh
+        run: |
+          $targetSetup = @(Get-ChildItem downloads\target -Filter "*-setup.exe" -File)
+          $baselineSetup = @(Get-ChildItem downloads\baseline -Filter "*-setup.exe" -File)
+          if ($targetSetup.Count -ne 1 -or $baselineSetup.Count -ne 1) {
+            throw "expected exactly one target and baseline Setup EXE"
+          }
+          .\scripts\windows_setup_exe_lifecycle_smoke.ps1 `
+            -BaselineSetupExe $baselineSetup[0].FullName `
+            -TargetSetupExe $targetSetup[0].FullName `
+            -BaselineVersion $env:BASELINE_VERSION `
+            -TargetVersion $env:TARGET_VERSION `
+            -Architecture '${{ matrix.arch }}' `
+            -EvidenceDir setup-exe-evidence
+
+      - name: Execute native runtime update lifecycle
         shell: pwsh
         run: |
           .\scripts\windows_release_lifecycle_smoke.ps1 `
@@ -163,57 +189,63 @@ jobs:
             -BaselineVersion $env:BASELINE_VERSION `
             -TargetVersion $env:TARGET_VERSION `
             -Architecture '${{ matrix.arch }}' `
-            -EvidenceDir evidence
+            -EvidenceDir runtime-evidence
 
       - name: Publish lifecycle evidence summary
         if: always()
         shell: pwsh
         run: |
-          "## Windows ${{ matrix.arch }} native lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          if (Test-Path -LiteralPath evidence\summary.json) {
+          "## Windows ${{ matrix.arch }} Setup EXE lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (Test-Path -LiteralPath setup-exe-evidence\summary.json) {
             '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-            Get-Content -LiteralPath evidence\summary.json |
+            Get-Content -LiteralPath setup-exe-evidence\summary.json | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          "## Windows ${{ matrix.arch }} native runtime lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (Test-Path -LiteralPath runtime-evidence\summary.json) {
+            '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Get-Content -LiteralPath runtime-evidence\summary.json |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-            if (Test-Path -LiteralPath evidence\uninstall-script-last.json) {
+            if (Test-Path -LiteralPath runtime-evidence\uninstall-script-last.json) {
               "### Uninstall script diagnostic" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-              Get-Content -LiteralPath evidence\uninstall-script-last.json |
+              Get-Content -LiteralPath runtime-evidence\uninstall-script-last.json |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
-            if (Test-Path -LiteralPath evidence\uninstall-powershell-last.log) {
+            if (Test-Path -LiteralPath runtime-evidence\uninstall-powershell-last.log) {
               "### Native-captured uninstall PowerShell output" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-              Get-Content -LiteralPath evidence\uninstall-powershell-last.log |
+              Get-Content -LiteralPath runtime-evidence\uninstall-powershell-last.log |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
-            if (Test-Path -LiteralPath evidence\uninstall-cleanup-last.json) {
+            if (Test-Path -LiteralPath runtime-evidence\uninstall-cleanup-last.json) {
               "### Deferred uninstall cleanup receipt" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-              Get-Content -LiteralPath evidence\uninstall-cleanup-last.json |
+              Get-Content -LiteralPath runtime-evidence\uninstall-cleanup-last.json |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
-            if (Test-Path -LiteralPath evidence\uninstall-cleanup-last.stderr.log) {
+            if (Test-Path -LiteralPath runtime-evidence\uninstall-cleanup-last.stderr.log) {
               "### Deferred uninstall cleanup stderr" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-              Get-Content -LiteralPath evidence\uninstall-cleanup-last.stderr.log |
+              Get-Content -LiteralPath runtime-evidence\uninstall-cleanup-last.stderr.log |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
-            if (Test-Path -LiteralPath evidence\uninstall-attestation-listener-job.json) {
+            if (Test-Path -LiteralPath runtime-evidence\uninstall-attestation-listener-job.json) {
               "### Uninstall attestation listener" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-              Get-Content -LiteralPath evidence\uninstall-attestation-listener-job.json |
+              Get-Content -LiteralPath runtime-evidence\uninstall-attestation-listener-job.json |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
-            if (Test-Path -LiteralPath evidence\uninstall-attestation-attempts.json) {
+            if (Test-Path -LiteralPath runtime-evidence\uninstall-attestation-attempts.json) {
               "### Uninstall attestation attempts" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-              Get-Content -LiteralPath evidence\uninstall-attestation-attempts.json |
+              Get-Content -LiteralPath runtime-evidence\uninstall-attestation-attempts.json |
                 Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }

@@ -12,6 +12,7 @@ $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
 
 $relativePaths = @(
   "scripts\validate_windows_powershell_syntax.ps1",
+  "scripts\Validate-DependencyLocks.ps1",
   "scripts\edr_agent_install.ps1",
   "scripts\edr_agent_preflight.ps1",
   "scripts\edr_agent_inplace_update.ps1",
@@ -21,8 +22,14 @@ $relativePaths = @(
   "scripts\windows_service_install.ps1",
   "scripts\windows_isolate_host.ps1",
   "scripts\invoke_windows_native_capability_probe.ps1",
+  "scripts\bootstrap_pinned_vcpkg.ps1",
+  "scripts\Initialize-VS2022Environment.ps1",
+  "scripts\Install-PinnedOnnxRuntime.ps1",
+  "scripts\Assert-WindowsPeArchitecture.ps1",
+  "scripts\Assert-WindowsInstallerBootstrapArchitecture.ps1",
   "scripts\write_windows_package_capabilities.ps1",
   "scripts\test_windows_package_capabilities_contract.ps1",
+  "scripts\windows_setup_exe_lifecycle_smoke.ps1",
   "scripts\windows_release_lifecycle_smoke.ps1",
   "install\windows-inno\Build-BundledInstaller.ps1",
   "install\windows-inno\edr_install_wizard_enroll.ps1",

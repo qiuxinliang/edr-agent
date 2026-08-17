@@ -646,13 +646,12 @@ if(EDR_WITH_FL_TRAINER)
   add_test(NAME fl_pb_gradient_chunk COMMAND test_fl_pb_gradient_chunk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()
 
-# The binary fixture set is intentionally optional in source-only checkouts.
-# Do not let absent large-model artifacts turn an otherwise valid Windows
-# release configure into a build failure.  The ONNX integration tests remain
-# enabled automatically in CI jobs that provide the complete fixture set.
-set(_edr_onnx_static_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx")
-set(_edr_onnx_behavior_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx")
-set(_edr_onnx_behavior_seq128_fixture "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx")
+# Source-only builds may leave ONNX disabled. A production/release configure
+# that explicitly requires ONNX must also carry the checked, executable model
+# fixtures; otherwise configuration fails before a misleading partial build.
+set(_edr_onnx_static_fixture "${EDR_ONNX_STATIC_FIXTURE}")
+set(_edr_onnx_behavior_fixture "${EDR_ONNX_BEHAVIOR_FIXTURE}")
+set(_edr_onnx_behavior_seq128_fixture "${EDR_ONNX_BEHAVIOR_SEQ128_FIXTURE}")
 set(EDR_ONNX_INTEGRATION_FIXTURES_AVAILABLE OFF)
 if(EDR_ONNXRUNTIME_AVAILABLE AND
    EXISTS "${_edr_onnx_static_fixture}" AND
@@ -788,7 +787,7 @@ if(EDR_ONNXRUNTIME_AVAILABLE AND
    (NOT EXISTS "${_edr_onnx_static_fixture}" OR
     NOT EXISTS "${_edr_onnx_behavior_fixture}" OR
     NOT EXISTS "${_edr_onnx_behavior_seq128_fixture}"))
-  message(STATUS "Skipping ONNX integration fixtures: expected static_triple_minimal.onnx, behavior_dual_minimal.onnx, and behavior_seq128_dual_minimal.onnx")
+  message(STATUS "Skipping optional ONNX integration fixtures because the complete checked fixture set is unavailable")
 endif()
 
 foreach(_edr_warning_target IN ITEMS

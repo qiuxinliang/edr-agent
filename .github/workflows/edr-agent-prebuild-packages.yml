@@ -24,16 +24,16 @@ env:
 jobs:
   prebuild:
     name: Prebuild vcpkg dependencies → GitHub Release
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 360
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
 
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
+      - name: Initialize pinned Visual Studio 2022 environment
+        shell: pwsh
+        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
 
       - name: Compute vcpkg.json hash (for release tag)
         shell: pwsh
@@ -58,14 +58,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
 
-      - name: Clone and bootstrap vcpkg
+      - name: Bootstrap pinned vcpkg
         working-directory: ${{ github.workspace }}
         shell: pwsh
-        run: |
-          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          }
-          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+        run: .\scripts\bootstrap_pinned_vcpkg.ps1
 
       - name: vcpkg install (source build)
         working-directory: ${{ github.workspace }}

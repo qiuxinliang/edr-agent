@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
 
 env:
-  SCCACHE_GHA_ENABLED: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
     steps:
@@ -38,13 +38,9 @@ jobs:
           key: vcpkg-x64-win-https-sqlite-yara-nogrpc-${{ hashFiles('vcpkg.json', 'CMakeLists.txt') }}-${{ runner.os }}
           restore-keys: |
             vcpkg-x64-win-https-sqlite-yara-nogrpc-${{ hashFiles('vcpkg.json') }}-
-      - name: Clone and bootstrap vcpkg
+      - name: Bootstrap pinned vcpkg
         shell: pwsh
-        run: |
-          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          }
-          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+        run: .\scripts\bootstrap_pinned_vcpkg.ps1
       - name: vcpkg install (curl + OpenSSL + SQLite + YARA; no grpc feature)
         env:
           VCPKG_DEFAULT_TRIPLET: x64-windows
@@ -70,14 +66,13 @@ jobs:
           }
 
           Pop-Location
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
+      - name: Initialize pinned Visual Studio 2022 environment
+        shell: pwsh
+        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Configure (vcpkg HTTPS + SQLite + YARA, no gRPC, Ninja, sccache)
+      - name: Configure (vcpkg HTTPS + SQLite + YARA, no gRPC, Ninja)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -95,9 +90,7 @@ jobs:
             -DEDR_WITH_ONNXRUNTIME=OFF `
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
-            -DEDR_BUILD_TESTS=ON `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            -DEDR_BUILD_TESTS=ON
       - name: Build
         shell: pwsh
         run: |

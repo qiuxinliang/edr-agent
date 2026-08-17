@@ -45,9 +45,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
-  SCCACHE_GHA_ENABLED: "true"
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
@@ -97,7 +97,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: windows-latest
+            runner: windows-2022
             msvc_arch: x64
             triplet: x64-windows
             ort_arch: x64
@@ -255,14 +255,12 @@ jobs:
           "EDR_UPGRADE_CLASS=$upgradeClass" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Windows release upgrade class: $upgradeClass"
 
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: ${{ matrix.msvc_arch }}
+      - name: Initialize pinned Visual Studio 2022 environment
+        shell: pwsh
+        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
       - name: Install build tools
         shell: pwsh
         run: choco install ninja innosetup -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.9
-        if: matrix.arch == 'amd64'
       - name: Prepare vcpkg cache directories
         shell: pwsh
         run: |
@@ -306,7 +304,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: onnxrt-win
-          key: onnxrt-${{ matrix.ort_arch }}-win-1.17.3-${{ runner.os }}
+          key: onnxrt-${{ matrix.ort_arch }}-win-${{ hashFiles('dependencies.lock.json') }}-${{ runner.os }}
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
@@ -350,22 +348,10 @@ jobs:
           "BUILD_TIMING_START=$($start.ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Build started at $($start.ToString('HH:mm:ss'))"
 
-      - name: sccache pre-check
-        shell: bash
-        run: |
-          echo "=== sccache version ==="
-          sccache --version || echo "(not found)"
-          echo "=== sccache stats (pre-build) ==="
-          sccache --show-stats || echo "(stats not available)"
-
-      - name: Clone and bootstrap vcpkg
+      - name: Bootstrap pinned vcpkg
         working-directory: ${{ github.workspace }}
         shell: pwsh
-        run: |
-          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          }
-          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+        run: .\scripts\bootstrap_pinned_vcpkg.ps1
 
       - name: vcpkg install (manifest)
         working-directory: ${{ github.workspace }}
@@ -400,36 +386,9 @@ jobs:
       - name: ONNX Runtime (CPU, Windows ${{ matrix.ort_arch }})
         working-directory: ${{ github.workspace }}
         shell: pwsh
-        run: |
-          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
-          $archiveName = "onnxruntime-win-$env:EDR_ORT_ARCH-1.17.3"
-          $root = Join-Path $dest $archiveName
-          if (Test-Path (Join-Path $root "include\onnxruntime_c_api.h")) {
-            Write-Host "[skip] ONNX Runtime 1.17.3 already cached at $root"
-          } else {
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            $zip = Join-Path $dest "ort.zip"
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $progressPreference = 'SilentlyContinue'
-            $wc = New-Object System.Net.WebClient
-            $wc.Headers.Add('User-Agent', 'edr-agent-ci')
-            for ($i = 0; $i -lt 5; $i++) {
-              try {
-                $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/$archiveName.zip", $zip)
-                Write-Host "ORT download OK"
-                break
-              } catch {
-                Write-Host "ORT download attempt $($i+1)/5 failed: $_"
-                if ($i -ge 4) { throw "ORT download exhausted retries: $_" }
-                Start-Sleep -Seconds 15
-              }
-            }
-            Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
-            if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
-          }
-          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+        run: .\scripts\Install-PinnedOnnxRuntime.ps1 -Architecture $env:EDR_ORT_ARCH
 
-      - name: Configure (Ninja, Release, ONNX, no-gRPC, sccache)
+      - name: Configure (Ninja, Release, required ONNX, no-gRPC)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         shell: pwsh
@@ -444,13 +403,12 @@ jobs:
             "-DEDR_WINDOWS_TARGET_ARCH=$env:EDR_RELEASE_ARCH" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-            "-DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.arch == 'amd64' && 'sccache' || '' }}" `
-            "-DCMAKE_CXX_COMPILER_LAUNCHER=${{ matrix.arch == 'amd64' && 'sccache' || '' }}" `
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_WITH_P0_RULES_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
+            -DEDR_REQUIRE_ONNXRUNTIME=ON `
             -DEDR_WITH_FL_TRAINER=OFF `
             -DEDR_WITH_FL_KAFKA=OFF `
             -DEDR_WITH_YARA=ON `
@@ -470,8 +428,13 @@ jobs:
             if (Select-String -Path $p -SimpleMatch "EDR_HAVE_YARA=1" -Quiet) { $hasYara = $true; break }
           }
           if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
+          $hasOnnx = $false
+          foreach ($p in $generated) {
+            if (Select-String -Path $p -SimpleMatch "EDR_HAVE_ONNXRUNTIME=1" -Quiet) { $hasOnnx = $true; break }
+          }
+          if (-not $hasOnnx) { throw "Generated build files do not contain EDR_HAVE_ONNXRUNTIME=1" }
 
-      - name: Build (Ninja + sccache)
+      - name: Build (Ninja)
         shell: pwsh
         run: |
           $releaseTargets = @(
@@ -479,7 +442,9 @@ jobs:
             'test_command_contract',
             'test_agent_update_contract',
             'test_agent_update_assets',
-            'test_windows_headless_runtime_contract'
+            'test_windows_headless_runtime_contract',
+            'test_pmfe_pe_arch',
+            'test_ave_static_onnx_integration'
           )
           cmake --build build --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
           if ($LASTEXITCODE -ne 0) {
@@ -543,12 +508,6 @@ jobs:
             throw "FDSensor.exe was built without libyara-backed YARA support"
           }
 
-      - name: sccache stats
-        shell: bash
-        run: |
-          echo "=== sccache compilation cache stats ==="
-          sccache --show-stats || echo "(sccache stats unavailable)"
-
       - name: Authenticode sign release executables
         shell: pwsh
         run: |
@@ -601,7 +560,8 @@ jobs:
             'agent_update_packaging_contract',
             'windows_headless_runtime_contract',
             'command_registry_and_payload_contract',
-            'pmfe_pe_architectures'
+            'pmfe_pe_architectures',
+            'ave_static_onnx_triple_integration'
           )
           $listedText = $listed -join "`n"
           foreach ($name in $required) {
@@ -609,7 +569,7 @@ jobs:
               throw "Required release test was not configured: $name"
             }
           }
-          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures)$'
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures|ave_static_onnx_triple_integration)$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
 
       - name: "[Timing] Build summary"
@@ -630,9 +590,9 @@ jobs:
             Write-Host "========================================"
           }
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '8.0.x'
+          global-json-file: global.json
 
       - name: Package (setup exe + runtime zip)
         shell: pwsh

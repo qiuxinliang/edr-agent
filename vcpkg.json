@@ -2,6 +2,7 @@
   "name": "edr-agent",
   "version-string": "1.0.0",
   "description": "EDR Agent — C runtime with vcpkg manifest for Windows client build dependencies.",
+  "builtin-baseline": "94a541197763a4f449a1b91478df48c0584a6256",
   "dependencies": [
     {
       "name": "curl",

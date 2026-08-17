@@ -352,8 +352,12 @@ $uiExe = Join-Path $publishDir "FDSecuritySetupUI.exe"
 $bundledSetupExe = Join-Path $publishDir "FDSecuritySetup.exe"
 $archVerifier = Join-Path (Resolve-Path (Join-Path $scriptDir "..\..")).Path "scripts\Assert-WindowsPeArchitecture.ps1"
 if (-not (Test-Path -LiteralPath $archVerifier)) { throw "Missing architecture verifier: $archVerifier" }
+$installerBootstrapArchVerifier = Join-Path (Resolve-Path (Join-Path $scriptDir "..\..")).Path "scripts\Assert-WindowsInstallerBootstrapArchitecture.ps1"
+if (-not (Test-Path -LiteralPath $installerBootstrapArchVerifier)) {
+    throw "Missing installer bootstrap architecture verifier: $installerBootstrapArchVerifier"
+}
 & $archVerifier -Path $uiExe -Architecture $targetArch
-& $archVerifier -Path $bundledSetupExe -Architecture $targetArch
+& $installerBootstrapArchVerifier -Path $bundledSetupExe -PayloadArchitecture $targetArch
 $uiSigned = Invoke-SignIfConfigured $uiExe
 $setupSigned = Invoke-SignIfConfigured $bundledSetupExe
 

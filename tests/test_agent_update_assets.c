@@ -312,7 +312,7 @@ int main(void) {
   contains(lifecycle, "target_tag:", "release lifecycle target tag is an explicit input");
   contains(lifecycle, "$hasNativeAsset",
            "blank baseline resolves to the latest lower release with a matching native package");
-  contains(lifecycle, "edr-agent-$Tag-windows-${{ matrix.arch }}-exe.zip",
+  contains(lifecycle, "$targetRuntime = \"edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-exe.zip\"",
            "release lifecycle selects baseline runtime assets by architecture-specific immutable exact name");
   contains(lifecycle, "contents: write",
            "release lifecycle has the push-level visibility GitHub requires for draft releases");
@@ -327,6 +327,12 @@ int main(void) {
   require_true(!strstr(lifecycle, "github.event.workflow_run.head_branch"),
                "release lifecycle never guesses a version from a workflow branch name");
   contains(lifecycle, "windows_release_lifecycle_smoke.ps1", "release lifecycle executes the Windows install-upgrade-rollback smoke test");
+  contains(lifecycle, "windows_setup_exe_lifecycle_smoke.ps1",
+           "release lifecycle executes the real Setup EXE install-upgrade-rollback-uninstall test");
+  contains(lifecycle, "windows-${{ matrix.arch }}-setup.exe",
+           "release lifecycle downloads the architecture-matched immutable Setup EXE");
+  contains(lifecycle, "runner: windows-2022",
+           "AMD64 Setup lifecycle is pinned to the Visual Studio 2022 Windows image");
   contains(lifecycle, "runner: windows-11-arm",
            "release lifecycle executes on a native Windows ARM64 runner");
   contains(lifecycle, "-Architecture '${{ matrix.arch }}'",
@@ -364,6 +370,12 @@ int main(void) {
            "release workflow executes the OTA packaging contract gate");
   contains(client_release, "pmfe_pe_architectures",
            "release workflow executes the ARM64, ARM64EC, and x64 emulation PE recognition test");
+  contains(client_release, "'test_pmfe_pe_arch'",
+           "release workflow builds the PMFE PE architecture test before CTest executes it");
+  contains(client_release, "'test_ave_static_onnx_integration'",
+           "release workflow builds the real ONNX fixture test before CTest executes it");
+  contains(client_release, "ave_static_onnx_triple_integration",
+           "release gate executes real ONNX inference on both native architectures");
   contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
            "release workflow executes the contract suite natively on AMD64 and ARM64");
   contains(client_release, "Windows release native target $nativeTarget failed",
@@ -372,6 +384,20 @@ int main(void) {
            "release workflow uses an explicit Windows build target allowlist");
   contains(client_release, "'native-package-integrity\\.json'",
            "release workflow rejects packages missing native component integrity metadata");
+  contains(client_release, "Initialize-VS2022Environment.ps1",
+           "release workflow pins the Visual Studio compiler generation on both architectures");
+  contains(client_release, "bootstrap_pinned_vcpkg.ps1",
+           "release workflow bootstraps the manifest-pinned vcpkg commit");
+  contains(client_release, "Install-PinnedOnnxRuntime.ps1",
+           "release workflow downloads only SHA-256 pinned ONNX Runtime archives");
+  contains(client_release, "-DEDR_REQUIRE_ONNXRUNTIME=ON",
+           "release configure fails closed when ONNX Runtime is unavailable");
+  contains(client_release, "actions/setup-dotnet@v5",
+           "release workflow uses the Node 24 setup-dotnet action");
+  require_true(!strstr(client_release, "ilammy/msvc-dev-cmd"),
+               "release workflow has no Node 20 MSVC action");
+  require_true(!strstr(client_release, "mozilla-actions/sccache-action"),
+               "release workflow has no Node 20 sccache action");
   free(client_release);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
@@ -387,16 +413,84 @@ int main(void) {
            "client build workflow rejects packages missing native component integrity metadata");
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
            "client build waits for GUI subsystem capability probes through the shared runner");
+  contains(client_build, "actions/setup-dotnet@v5",
+           "client build uses the Node 24 setup-dotnet action");
+  contains(client_build, "actions/upload-artifact@v6",
+           "client build uses the Node 24 artifact upload action");
   free(client_build);
+
+  snprintf(path, sizeof(path), "%s/.github/workflows/windows-platform-https-lifecycle.yml", root);
+  char *platform_https = read_file(path);
+  require_true(platform_https != NULL, "read real platform HTTPS lifecycle workflow");
+  contains(platform_https, "environment: staging-platform-https",
+           "destructive real platform lifecycle is protected by a staging environment approval");
+  contains(platform_https, "loopback is forbidden in the real platform HTTPS gate",
+           "real platform gate rejects loopback substitutes");
+  contains(platform_https, "/admin/ops/agent-rollouts/${campaign_id}/execute",
+           "real platform gate executes the production rollout API");
+  contains(platform_https, "/lifecycle/uninstall",
+           "real platform gate executes the production uninstall API");
+  contains(platform_https, "uninstall_attested:true",
+           "real platform gate requires the two-phase uninstall attestation to succeed");
+  contains(platform_https, "uninstall_verification_failed|uninstall_attestation_timeout",
+           "real platform gate keeps polling through the backend's bounded late-attestation repair window");
+  require_true(!strstr(platform_https, "--insecure") && !strstr(platform_https, " -k"),
+               "real platform HTTPS gate never disables certificate validation");
+  free(platform_https);
+
+  snprintf(path, sizeof(path), "%s/dependencies.lock.json", root);
+  char *dependency_lock = read_file(path);
+  require_true(dependency_lock != NULL, "read native dependency lock");
+  contains(dependency_lock, "\"onnxruntime\"", "dependency lock pins ONNX Runtime");
+  contains(dependency_lock, "\"sha256\"", "dependency lock binds native archives by SHA-256");
+  contains(dependency_lock, "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd",
+           "dependency lock binds the official ONNX Runtime x64 asset digest");
+  contains(dependency_lock, "1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168",
+           "dependency lock binds the official ONNX Runtime ARM64 asset digest");
+  free(dependency_lock);
+
+  snprintf(path, sizeof(path), "%s/scripts/Validate-DependencyLocks.ps1", root);
+  char *dependency_validator = read_file(path);
+  require_true(dependency_validator != NULL, "read dependency lock consistency validator");
+  contains(dependency_validator, "global.json SDK version does not match dependencies.lock.json",
+           "dependency validation prevents .NET lock drift");
+  contains(dependency_validator, "vcpkg builtin-baseline is invalid or inconsistent",
+           "dependency validation prevents vcpkg baseline drift");
+  contains(dependency_validator, "Setup UI package '$name' is not exactly bound",
+           "dependency validation enforces NuGet locked restore inputs");
+  free(dependency_validator);
+
+  snprintf(path, sizeof(path), "%s/global.json", root);
+  char *dotnet_lock = read_file(path);
+  require_true(dotnet_lock != NULL, "read .NET SDK lock");
+  contains(dotnet_lock, "\"rollForward\": \"disable\"", ".NET SDK roll-forward is disabled");
+  free(dotnet_lock);
+
+  const char *onnx_fixtures[] = {
+    "static_triple_minimal.onnx", "behavior_dual_minimal.onnx", "behavior_seq128_dual_minimal.onnx"
+  };
+  for (size_t i = 0; i < sizeof(onnx_fixtures) / sizeof(onnx_fixtures[0]); ++i) {
+    snprintf(path, sizeof(path), "%s/tests/fixtures/%s", root, onnx_fixtures[i]);
+    char *fixture = read_file(path);
+    require_true(fixture != NULL, "checked ONNX integration fixture exists");
+    free(fixture);
+  }
 
   snprintf(path, sizeof(path), "%s/tests/CMakeLists.txt", root);
   char *test_cmake = read_file(path);
   require_true(test_cmake != NULL, "read test CMake configuration");
   contains(test_cmake, "if(NOT MSVC)",
            "C11 atomic stress test is excluded from MSVC builds");
-  contains(test_cmake, "Skipping ONNX integration fixtures",
-           "missing optional ONNX fixtures do not block a release configure");
   free(test_cmake);
+
+  snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
+  char *required_onnx_cmake = read_file(path);
+  require_true(required_onnx_cmake != NULL, "read top-level required ONNX gate");
+  contains(required_onnx_cmake, "EDR_REQUIRE_ONNXRUNTIME=ON requires checked ONNX fixture",
+           "missing ONNX fixtures block every required configure, including tests-off builds");
+  contains(required_onnx_cmake, "Checked ONNX fixture SHA256 mismatch",
+           "required configure binds checked ONNX fixtures by SHA-256");
+  free(required_onnx_cmake);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
   char *lifecycle_smoke = read_file(path);

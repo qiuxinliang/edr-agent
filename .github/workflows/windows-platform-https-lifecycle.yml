@@ -1,0 +1,232 @@
+name: Windows real platform HTTPS lifecycle
+
+on:
+  workflow_call:
+    inputs:
+      platform_api_base:
+        description: Absolute HTTPS API base ending in /api/v1
+        required: true
+        type: string
+      target_version:
+        required: true
+        type: string
+      tenant_id:
+        required: true
+        type: string
+      amd64_endpoint_id:
+        required: true
+        type: string
+      amd64_hostname:
+        required: true
+        type: string
+      arm64_endpoint_id:
+        required: true
+        type: string
+      arm64_hostname:
+        required: true
+        type: string
+    secrets:
+      PLATFORM_ADMIN_BEARER_TOKEN:
+        required: true
+      PLATFORM_CA_PEM:
+        required: false
+  workflow_dispatch:
+    inputs:
+      platform_api_base:
+        description: Absolute HTTPS API base ending in /api/v1
+        required: true
+        type: string
+      target_version:
+        description: Deployable Windows Release version
+        required: true
+        type: string
+      tenant_id:
+        description: Dedicated staging tenant ID
+        required: true
+        type: string
+      amd64_endpoint_id:
+        description: Dedicated AMD64 staging endpoint ID
+        required: true
+        type: string
+      amd64_hostname:
+        description: AMD64 confirmation hostname
+        required: true
+        type: string
+      arm64_endpoint_id:
+        description: Dedicated ARM64 staging endpoint ID
+        required: true
+        type: string
+      arm64_hostname:
+        description: ARM64 confirmation hostname
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: real-platform-https-lifecycle-${{ inputs.tenant_id }}-${{ inputs.target_version }}
+  cancel-in-progress: false
+
+jobs:
+  upgrade-and-uninstall:
+    name: Real HTTPS ${{ matrix.arch }} upgrade and uninstall attestation
+    environment: staging-platform-https
+    runs-on: [self-hosted, linux, edr-staging]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            endpoint_id: ${{ inputs.amd64_endpoint_id }}
+            hostname: ${{ inputs.amd64_hostname }}
+          - arch: arm64
+            endpoint_id: ${{ inputs.arm64_endpoint_id }}
+            hostname: ${{ inputs.arm64_hostname }}
+    env:
+      PLATFORM_API_BASE: ${{ inputs.platform_api_base }}
+      TARGET_VERSION: ${{ inputs.target_version }}
+      TENANT_ID: ${{ inputs.tenant_id }}
+      ENDPOINT_ID: ${{ matrix.endpoint_id }}
+      ENDPOINT_HOSTNAME: ${{ matrix.hostname }}
+      ENDPOINT_ARCH: ${{ matrix.arch }}
+      PLATFORM_ADMIN_BEARER_TOKEN: ${{ secrets.PLATFORM_ADMIN_BEARER_TOKEN }}
+      PLATFORM_CA_PEM: ${{ secrets.PLATFORM_CA_PEM }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Execute fail-closed HTTPS platform lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${PLATFORM_API_BASE}" =~ ^https://[^/]+/api/v1$ ]]; then
+            echo "::error::platform_api_base must be an absolute HTTPS URL ending in /api/v1"
+            exit 1
+          fi
+          if [[ "${PLATFORM_API_BASE}" =~ (localhost|127\.0\.0\.1|\[::1\]) ]]; then
+            echo "::error::loopback is forbidden in the real platform HTTPS gate"
+            exit 1
+          fi
+          if [[ ! "${TARGET_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::invalid target_version"
+            exit 1
+          fi
+          for value in "${TENANT_ID}" "${ENDPOINT_ID}"; do
+            [[ "${value}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::unsafe tenant or endpoint ID"; exit 1; }
+          done
+          if [[ -z "${PLATFORM_ADMIN_BEARER_TOKEN}" ]]; then
+            echo "::error::platform_admin_bearer_token is required"
+            exit 1
+          fi
+
+          mkdir -p evidence
+          umask 077
+          auth_config="${RUNNER_TEMP}/edr-platform-curl-auth.conf"
+          printf 'header = "Authorization: Bearer %s"\n' "${PLATFORM_ADMIN_BEARER_TOKEN}" > "${auth_config}"
+          curl_tls=()
+          if [[ -n "${PLATFORM_CA_PEM:-}" ]]; then
+            ca_file="${RUNNER_TEMP}/edr-platform-ca.pem"
+            printf '%s\n' "${PLATFORM_CA_PEM}" > "${ca_file}"
+            curl_tls=(--cacert "${ca_file}")
+          fi
+          api() {
+            local method="$1" path="$2" body="${3:-}"
+            local output="${RUNNER_TEMP}/platform-api-response.json"
+            local args=(--config "${auth_config}" --silent --show-error --fail-with-body --http1.1 "${curl_tls[@]}"
+              -X "${method}"
+              -H 'Accept: application/json' -H 'Content-Type: application/json'
+              -o "${output}" "${PLATFORM_API_BASE}${path}")
+            if [[ -n "${body}" ]]; then args+=('--data-binary' "${body}"); fi
+            if ! curl "${args[@]}"; then
+              cat "${output}" >&2 || true
+              return 1
+            fi
+            jq -e . "${output}" >/dev/null
+            cat "${output}"
+          }
+
+          campaign_body="$(jq -cn \
+            --arg name "https-${ENDPOINT_ARCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --arg version "${TARGET_VERSION}" --arg tenant "${TENANT_ID}" \
+            --arg endpoint "${ENDPOINT_ID}" --arg arch "${ENDPOINT_ARCH}" \
+            '{name:$name,targetVersion:$version,tenantId:$tenant,ring:"canary",percent:100,selector:{platform:"windows",arch:$arch,endpointIds:[$endpoint]}}')"
+          campaign_json="$(api POST '/admin/ops/agent-rollouts' "${campaign_body}")"
+          campaign_id="$(jq -er '.data.id' <<<"${campaign_json}")"
+          preview_json="$(api GET "/admin/ops/agent-rollouts/${campaign_id}/preview")"
+          jq -e --arg endpoint "${ENDPOINT_ID}" \
+            '.data.canExecute == true and .data.upgradeCount == 1 and (.data.sample | any(.endpointId == $endpoint and .willUpgrade == true))' \
+            <<<"${preview_json}" >/dev/null
+          api POST "/admin/ops/agent-rollouts/${campaign_id}/execute" '{}' > evidence/upgrade-execute.json
+
+          upgrade_deadline=$((SECONDS + 1800))
+          while (( SECONDS < upgrade_deadline )); do
+            detail_json="$(api GET "/admin/ops/agent-rollouts/${campaign_id}")"
+            printf '%s\n' "${detail_json}" > evidence/upgrade-detail.json
+            task_status="$(jq -r --arg endpoint "${ENDPOINT_ID}" '.data.tasks[]? | select(.endpointId == $endpoint) | .status' <<<"${detail_json}" | tail -1)"
+            task_version="$(jq -r --arg endpoint "${ENDPOINT_ID}" '.data.tasks[]? | select(.endpointId == $endpoint) | .toVersion' <<<"${detail_json}" | tail -1)"
+            if [[ "${task_status}" == "succeeded" || "${task_status}" == "completed" ]]; then
+              [[ "${task_version}" == "${TARGET_VERSION}" ]] || { echo "::error::upgrade reported wrong target version"; exit 1; }
+              break
+            fi
+            if [[ "${task_status}" =~ ^(failed|cancelled|rolled_back)$ ]]; then
+              echo "::error::platform upgrade task ended as ${task_status}"
+              exit 1
+            fi
+            sleep 5
+          done
+          [[ "${task_status:-}" =~ ^(succeeded|completed)$ ]] || { echo "::error::platform upgrade timed out"; exit 1; }
+
+          uninstall_body="$(jq -cn --arg reason "release HTTPS lifecycle ${GITHUB_RUN_ID}" \
+            --arg hostname "${ENDPOINT_HOSTNAME}" \
+            '{reason:$reason,expiresInSeconds:900,queueIfOffline:false,confirmationHostname:$hostname,keepData:false}')"
+          lifecycle_base="/admin/ops/tenants/${TENANT_ID}/endpoints/${ENDPOINT_ID}"
+          uninstall_json="$(api POST "${lifecycle_base}/lifecycle/uninstall" "${uninstall_body}")"
+          printf '%s\n' "${uninstall_json}" > evidence/uninstall-create.json
+          lifecycle_task_id="$(jq -er '.data.taskId' <<<"${uninstall_json}")"
+
+          uninstall_deadline=$((SECONDS + 1200))
+          while (( SECONDS < uninstall_deadline )); do
+            lifecycle_json="$(api GET "${lifecycle_base}/lifecycle-tasks/${lifecycle_task_id}")"
+            printf '%s\n' "${lifecycle_json}" > evidence/uninstall-detail.json
+            lifecycle_status="$(jq -r '.data.task.status' <<<"${lifecycle_json}")"
+            lifecycle_failure_code="$(jq -r '.data.task.failure_code // ""' <<<"${lifecycle_json}")"
+            if [[ "${lifecycle_status}" == "succeeded" ]]; then break; fi
+            if [[ "${lifecycle_status}" == "failed" &&
+                  ! "${lifecycle_failure_code}" =~ ^(uninstall_verification_failed|uninstall_attestation_timeout)$ ]]; then
+              echo "::error::platform uninstall task failed with ${lifecycle_failure_code:-unknown_failure}"
+              exit 1
+            fi
+            if [[ "${lifecycle_status}" =~ ^(cancelled|expired)$ ]]; then
+              echo "::error::platform uninstall task ended as ${lifecycle_status}"
+              exit 1
+            fi
+            if [[ "${lifecycle_status}" == "failed" ]]; then
+              echo "Waiting for a valid task-bound late attestation after recoverable verifier failure: ${lifecycle_failure_code}"
+            fi
+            sleep 5
+          done
+          [[ "${lifecycle_status:-}" == "succeeded" ]] || { echo "::error::platform uninstall attestation timed out"; exit 1; }
+
+          jq -cn --arg arch "${ENDPOINT_ARCH}" --arg endpoint "${ENDPOINT_ID}" \
+            --arg version "${TARGET_VERSION}" --arg campaign "${campaign_id}" --arg task "${lifecycle_task_id}" \
+            '{schema:"edr.agent.real-platform-https-lifecycle.v1",status:"succeeded",transport:"https",arch:$arch,endpoint_id:$endpoint,target_version:$version,campaign_id:$campaign,lifecycle_task_id:$task,upgrade_verified:true,uninstall_attested:true}' \
+            > evidence/summary.json
+
+      - name: Publish HTTPS lifecycle summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Real platform HTTPS lifecycle - ${ENDPOINT_ARCH}"
+            if [[ -f evidence/summary.json ]]; then
+              echo '```json'
+              cat evidence/summary.json
+              echo '```'
+            else
+              echo "The fail-closed HTTPS gate did not complete. Inspect the API evidence and job log."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

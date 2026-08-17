@@ -13,16 +13,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
     if: ${{ false }}
     name: legacy gRPC build disabled
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 360
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
@@ -33,13 +33,12 @@ jobs:
         run: |
           chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
           ./scripts/verify_ave_behavior_chain_invariants.sh
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
+      - name: Initialize pinned Visual Studio 2022 environment
+        shell: pwsh
+        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja -y --no-progress
-      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Prepare vcpkg cache directories
         working-directory: ${{ github.workspace }}
         shell: pwsh
@@ -58,14 +57,10 @@ jobs:
           restore-keys: |
             vcpkg-x64-win-yara-legacy-ort-ci-${{ hashFiles('vcpkg.json') }}-
 
-      - name: Clone and bootstrap vcpkg
+      - name: Bootstrap pinned vcpkg
         working-directory: ${{ github.workspace }}
         shell: pwsh
-        run: |
-          if (-not (Test-Path "vcpkg\bootstrap-vcpkg.bat")) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          }
-          & ".\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+        run: .\scripts\bootstrap_pinned_vcpkg.ps1
 
       - name: vcpkg install (manifest)
         working-directory: ${{ github.workspace }}
@@ -97,29 +92,7 @@ jobs:
       - name: ONNX Runtime (CPU, Windows x64)
         working-directory: ${{ github.workspace }}
         shell: pwsh
-        run: |
-          $dest = Join-Path $env:GITHUB_WORKSPACE "onnxrt-win"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $zip = Join-Path $dest "ort.zip"
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          $progressPreference = 'SilentlyContinue'
-          $wc = New-Object System.Net.WebClient
-          $wc.Headers.Add('User-Agent', 'edr-agent-ci')
-          for ($i = 0; $i -lt 5; $i++) {
-            try {
-              $wc.DownloadFile("https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-win-x64-1.17.3.zip", $zip)
-              Write-Host "ORT download OK"
-              break
-            } catch {
-              Write-Host "ORT download attempt $($i+1)/5 failed: $_"
-              if ($i -ge 4) { throw "ORT download exhausted retries: $_" }
-              Start-Sleep -Seconds 15
-            }
-          }
-          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
-          $root = Join-Path $dest "onnxruntime-win-x64-1.17.3"
-          if (-not (Test-Path -LiteralPath $root)) { throw "ORT extract layout unexpected" }
-          "ONNXRUNTIME_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+        run: .\scripts\Install-PinnedOnnxRuntime.ps1 -Architecture x64
 
       - name: Configure (Ninja, ORT; CMake may force stub ingest)
         env:
@@ -133,12 +106,11 @@ jobs:
             "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
             -DEDR_WITH_ONNXRUNTIME=ON `
+            -DEDR_REQUIRE_ONNXRUNTIME=ON `
             "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
             -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
