@@ -353,6 +353,7 @@ $bundledSetupExe = Join-Path $publishDir "FDSecuritySetup.exe"
 $archVerifier = Join-Path (Resolve-Path (Join-Path $scriptDir "..\..")).Path "scripts\Assert-WindowsPeArchitecture.ps1"
 if (-not (Test-Path -LiteralPath $archVerifier)) { throw "Missing architecture verifier: $archVerifier" }
 & $archVerifier -Path $uiExe -Architecture $targetArch
+& $archVerifier -Path $bundledSetupExe -Architecture $targetArch
 $uiSigned = Invoke-SignIfConfigured $uiExe
 $setupSigned = Invoke-SignIfConfigured $bundledSetupExe
 
@@ -391,11 +392,13 @@ $manifest = @{
     target_arch = $targetArch
     setup_target_arch = $SetupTargetArch
     capabilities = @{
-        windivert = ($targetArch -eq "amd64")
+        schema = "edr.windows.package-capabilities.v1"
+        target_arch = $targetArch
         network_packet_capture = ($targetArch -eq "amd64")
         arm64_emulation_supported = $false
         arm64_emulation_network_packet_capture = $false
         windows_firewall_isolation = $true
+        signature_status = if ($uiSigned -and $setupSigned) { "signed" } else { "unsigned" }
     }
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"

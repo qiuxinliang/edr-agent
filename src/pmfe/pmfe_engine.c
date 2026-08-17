@@ -30,6 +30,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #include "edr/error.h"
 #include "edr/sha256.h"
 #include "edr/response.h"
+#include "pmfe_pe_arch.h"
 
 #if defined(__linux__)
 #include "pmfe_linux_scan_util.h"
@@ -523,7 +524,7 @@ static void pmfe_peek_pe_metadata(const uint8_t *buf, size_t len, EdrPmfeRegionR
   region->pe_timestamp = (uint32_t)fh[4] | ((uint32_t)fh[5] << 8) |
                          ((uint32_t)fh[6] << 16) | ((uint32_t)fh[7] << 24);
   snprintf(region->pe_arch, sizeof(region->pe_arch), "%s",
-           machine == 0x8664u ? "x64" : (machine == 0x14cu ? "x86" : "other"));
+           edr_pmfe_pe_machine_arch(machine));
   const uint8_t *opt = fh + 20u;
   if ((size_t)(opt - buf) + 20u <= len) {
     region->pe_entrypoint_rva = (uint32_t)opt[16] | ((uint32_t)opt[17] << 8) |

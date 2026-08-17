@@ -35,8 +35,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  amd64-lifecycle:
-    runs-on: windows-latest
+  native-lifecycle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
@@ -53,15 +61,16 @@ jobs:
           }
           if (-not $baseline) {
             $targetVersion = [Version]$target.Substring(4)
-            $releaseJson = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 `
-              --json tagName,isDraft,isPrerelease
+            $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
             if ($LASTEXITCODE -ne 0) { throw 'cannot list published releases for baseline selection' }
             $candidates = @()
             foreach ($release in @($releaseJson | ConvertFrom-Json)) {
-              if ($release.isDraft -or $release.isPrerelease -or $release.tagName -notmatch '^win_\d+\.\d+\.\d+$') { continue }
-              $version = [Version]$release.tagName.Substring(4)
-              if ($version -lt $targetVersion) {
-                $candidates += [pscustomobject]@{ Tag = $release.tagName; Version = $version }
+              if ($release.draft -or $release.prerelease -or $release.tag_name -notmatch '^win_\d+\.\d+\.\d+$') { continue }
+              $version = [Version]$release.tag_name.Substring(4)
+              $expectedAsset = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-exe.zip"
+              $hasNativeAsset = @($release.assets | Where-Object { $_.name -eq $expectedAsset }).Count -eq 1
+              if ($version -lt $targetVersion -and $hasNativeAsset) {
+                $candidates += [pscustomobject]@{ Tag = $release.tag_name; Version = $version }
               }
             }
             $baseline = ($candidates | Sort-Object Version -Descending | Select-Object -First 1).Tag
@@ -74,13 +83,13 @@ jobs:
           "BASELINE_TAG=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BASELINE_VERSION=$($baseline.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Download immutable AMD64 release packages
+      - name: Download immutable native release packages
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path downloads\target, downloads\baseline | Out-Null
 
           function Get-ImmutableRuntimeAsset([string]$Tag) {
-            $expected = "edr-agent-$Tag-windows-amd64-exe.zip"
+            $expected = "edr-agent-$Tag-windows-${{ matrix.arch }}-exe.zip"
             $releaseOutput = gh api `
               "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
             if ($LASTEXITCODE -ne 0) {
@@ -153,13 +162,14 @@ jobs:
             -TargetPackageDir packages\target `
             -BaselineVersion $env:BASELINE_VERSION `
             -TargetVersion $env:TARGET_VERSION `
+            -Architecture '${{ matrix.arch }}' `
             -EvidenceDir evidence
 
       - name: Publish lifecycle evidence summary
         if: always()
         shell: pwsh
         run: |
-          "## Windows AMD64 lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "## Windows ${{ matrix.arch }} native lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if (Test-Path -LiteralPath evidence\summary.json) {
             '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             Get-Content -LiteralPath evidence\summary.json |

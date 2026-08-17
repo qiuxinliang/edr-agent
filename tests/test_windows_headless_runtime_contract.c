@@ -344,6 +344,10 @@ int main(void) {
 
   char *inno = read_source(root, "install/windows-inno/EDRAgentSetup.bundled.iss");
   if (!inno) return 1;
+  ok &= require_contains(inno, "#define EDR_SETUP_ARCH \"x64os\"",
+                         "AMD64 Setup must be limited to native x64 Windows");
+  ok &= require_absent(inno, "#define EDR_SETUP_ARCH \"x64compatible\"",
+                       "AMD64 Setup must not bypass the native-only v1 contract through ARM64 emulation");
   ok &= require_contains(inno, "EdrWorkerStartAutorunParams, True",
                          "headless setup must fail if the scheduled task cannot start the Agent");
   ok &= require_contains(inno, "EdrWorkerBaseParams('start-autorun')",
@@ -388,9 +392,25 @@ int main(void) {
 
   char *build_ps = read_source(root, "install/windows-inno/Build-BundledInstaller.ps1");
   if (!build_ps) return 1;
+  ok &= require_contains(build_ps, "write_windows_package_capabilities.ps1",
+                         "Setup UI and headless packages must use the shared capability contract writer");
+  ok &= require_contains(build_ps, "-SignatureStatus $SignatureStatus",
+                         "bundled installer capability metadata must bind the Agent signature mode");
+  ok &= require_contains(build_ps, "Verified Runtime PE closure",
+                         "bundled installer must verify every Runtime EXE and DLL architecture");
   ok &= require_contains(build_ps, "/DEDR_ALLOW_POWERSHELL_FALLBACK=1",
                          "lab-only PowerShell fallback must be explicit in the Inno build contract");
   free(build_ps);
+
+  char *setup_ui_build = read_source(root, "install/windows-setup-ui/Build-SetupUi.ps1");
+  if (!setup_ui_build) return 1;
+  ok &= require_contains(setup_ui_build, "edr.windows.package-capabilities.v1",
+                         "Setup UI manifest uses the canonical package capability schema");
+  ok &= require_contains(setup_ui_build, "signature_status = if ($uiSigned -and $setupSigned)",
+                         "Setup UI capability metadata records signed versus unsigned state");
+  ok &= require_contains(setup_ui_build, "target_arch = $targetArch",
+                         "Setup UI capability metadata binds the native target architecture");
+  free(setup_ui_build);
 
   char *build_cmd = read_source(root, "install/windows-inno/build_bundled.cmd");
   if (!build_cmd) return 1;

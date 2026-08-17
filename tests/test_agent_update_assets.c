@@ -232,18 +232,20 @@ int main(void) {
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
   contains(workflow, "Assert-WindowsPeArchitecture.ps1", "release rejects architecture-mismatched PE files");
+  contains(workflow, "Verified Runtime PE closure",
+           "release verifies every Runtime EXE and DLL against the target architecture");
   contains(workflow, "stage_msvc_runtime_dlls_build_release.ps1", "release stages the app-local MSVC runtime");
   contains(workflow, "vcruntime140_1.dll", "release package gate requires the MSVC runtime dependency closure");
   contains(workflow, "msvcp140.dll", "release package gate requires the C++ runtime used by ONNX Runtime");
   contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
            "ARM64 release excludes unsupported WinDivert drivers");
-  contains(workflow, "edr.windows.package-capabilities.v1",
-           "release package declares an enforceable Windows architecture capability contract");
-  contains(workflow, "arm64_emulation_supported = $false",
-           "release does not claim unverified AMD64-on-ARM64 compatibility");
-  contains(workflow, "signature_status = if",
-           "release package records signed versus unsigned launch policy context");
+  contains(workflow, "write_windows_package_capabilities.ps1",
+           "release uses the shared Windows package capability contract writer");
+  contains(workflow, "test_windows_package_capabilities_contract.ps1",
+           "release runs the AMD64 and ARM64 capability round-trip gate");
+  contains(workflow, "-SignatureStatus $signatureStatus",
+           "release passes signed versus unsigned launch policy context to the contract writer");
   contains(workflow, "package root must contain exactly one package-capabilities.json",
            "release gate verifies the architecture capability manifest is packaged exactly once");
   contains(workflow, "gh release upload", "architecture bundles are retained in the draft release before publication");
@@ -261,6 +263,38 @@ int main(void) {
   contains(workflow, "target_tag: ${{ github.event_name == 'workflow_dispatch'", "lifecycle validation receives the exact release tag");
   free(workflow);
 
+  snprintf(path, sizeof(path), "%s/scripts/write_windows_package_capabilities.ps1", root);
+  char *package_capabilities = read_file(path);
+  require_true(package_capabilities != NULL, "read shared Windows package capability writer");
+  contains(package_capabilities, "edr.windows.package-capabilities.v1",
+           "package writer declares the strict Windows capability schema");
+  contains(package_capabilities, "arm64_emulation_supported = $false",
+           "package writer rejects unverified AMD64-on-ARM64 compatibility");
+  contains(package_capabilities, "arm64_emulation_network_packet_capture = $false",
+           "package writer rejects network capture through AMD64 emulation");
+  contains(package_capabilities, "network_packet_capture = $networkPacketCapture",
+           "package writer binds native network capture to the target architecture");
+  contains(package_capabilities, "windows_firewall_isolation = $true",
+           "package writer retains architecture-independent host isolation");
+  contains(package_capabilities, "signature_status = $SignatureStatus",
+           "package writer records signed versus unsigned launch policy context");
+  contains(package_capabilities, "UTF8Encoding]::new($false)",
+           "package writer emits UTF-8 JSON without a BOM");
+  free(package_capabilities);
+
+  snprintf(path, sizeof(path), "%s/install/windows-inno/package_bundled_layout.sh", root);
+  char *legacy_layout = read_file(path);
+  require_true(legacy_layout != NULL, "read legacy bundle layout generator");
+  contains(legacy_layout, "edr.windows.package-capabilities.v1",
+           "legacy bundle layout emits the canonical package capability schema");
+  contains(legacy_layout, "package-capabilities.json",
+           "legacy bundle layout writes the canonical root capability manifest");
+  contains(legacy_layout, "EDR_WINDOWS_SIGNATURE_STATUS",
+           "legacy bundle layout records signed versus unsigned state");
+  require_true(strstr(legacy_layout, "capabilities/package.json") == NULL,
+               "legacy bundle layout no longer emits the incompatible nested capability manifest");
+  free(legacy_layout);
+
   snprintf(path, sizeof(path), "%s/scripts/stage_msvc_runtime_dlls_build_release.ps1", root);
   char *msvc_runtime = read_file(path);
   require_true(msvc_runtime != NULL, "read app-local MSVC runtime staging script");
@@ -276,9 +310,10 @@ int main(void) {
   require_true(lifecycle != NULL, "read Windows release lifecycle workflow");
   contains(lifecycle, "workflow_call:", "release lifecycle is callable with an explicit target");
   contains(lifecycle, "target_tag:", "release lifecycle target tag is an explicit input");
-  contains(lifecycle, "gh release list", "blank baseline resolves to the latest lower stable Windows release");
-  contains(lifecycle, "edr-agent-$Tag-windows-amd64-exe.zip",
-           "release lifecycle selects baseline runtime assets by immutable exact name");
+  contains(lifecycle, "$hasNativeAsset",
+           "blank baseline resolves to the latest lower release with a matching native package");
+  contains(lifecycle, "edr-agent-$Tag-windows-${{ matrix.arch }}-exe.zip",
+           "release lifecycle selects baseline runtime assets by architecture-specific immutable exact name");
   contains(lifecycle, "contents: write",
            "release lifecycle has the push-level visibility GitHub requires for draft releases");
   contains(lifecycle, "repos/$env:GITHUB_REPOSITORY/releases?per_page=100",
@@ -292,6 +327,12 @@ int main(void) {
   require_true(!strstr(lifecycle, "github.event.workflow_run.head_branch"),
                "release lifecycle never guesses a version from a workflow branch name");
   contains(lifecycle, "windows_release_lifecycle_smoke.ps1", "release lifecycle executes the Windows install-upgrade-rollback smoke test");
+  contains(lifecycle, "runner: windows-11-arm",
+           "release lifecycle executes on a native Windows ARM64 runner");
+  contains(lifecycle, "-Architecture '${{ matrix.arch }}'",
+           "release lifecycle passes the native target architecture into the smoke test");
+  contains(lifecycle, "windows-${{ matrix.arch }}-exe.zip",
+           "release lifecycle downloads the architecture-matched immutable package");
   contains(lifecycle, "Deferred uninstall cleanup receipt",
            "failed lifecycle summaries expose the asynchronous cleanup receipt");
   contains(lifecycle, "Uninstall attestation listener",
@@ -311,28 +352,20 @@ int main(void) {
            "release workflow probes freshly built native uninstall components");
   contains(client_release, "invoke_windows_native_capability_probe.ps1",
            "release workflow waits for GUI subsystem capability probes through the shared runner");
-  contains(client_release, "$env:EDR_RELEASE_ARCH -eq \"amd64\"",
-           "release workflow only executes native capability probes on the runner-compatible architecture");
-  contains(client_release, "$env:EDR_RELEASE_ARCH -eq \"arm64\"",
-           "release workflow explicitly selects static capability verification for ARM64");
-  contains(client_release, "unsupported native capability probe architecture",
-           "release workflow rejects unknown native target architectures");
-  contains(client_release, "ARM64 binary does not contain the required uninstall attestation capability marker",
-           "release workflow statically verifies capabilities for non-runnable ARM64 binaries");
+  contains(client_release, "runner: windows-11-arm",
+           "release workflow builds and tests ARM64 on a native Windows runner");
+  contains(client_release, "invoke_windows_native_capability_probe.ps1",
+           "release workflow executes native lifecycle capability probes on both architectures");
   contains(client_release, "native-package-integrity.json",
            "release workflow packages native component SHA-256 identities");
   contains(client_release, "Required release test was not configured",
            "release workflow rejects a missing lifecycle release gate");
   contains(client_release, "agent_update_packaging_contract",
            "release workflow executes the OTA packaging contract gate");
-  contains(client_release, "$env:EDR_RELEASE_ARCH -eq 'amd64'",
-           "release workflow executes gate tests only on the runner-compatible AMD64 target");
-  contains(client_release, "required ARM64 release test executable was not linked",
-           "release workflow requires every ARM64 gate-test executable to link");
-  contains(client_release, "Assert-WindowsPeArchitecture.ps1 -Path $testExe -Architecture arm64",
-           "release workflow verifies ARM64 gate-test executable architecture before packaging");
-  contains(client_release, "execution is deferred to an ARM64 Windows runner",
-           "release workflow does not attempt to execute ARM64 binaries on an AMD64 runner");
+  contains(client_release, "pmfe_pe_architectures",
+           "release workflow executes the ARM64, ARM64EC, and x64 emulation PE recognition test");
+  contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
+           "release workflow executes the contract suite natively on AMD64 and ARM64");
   contains(client_release, "Windows release native target $nativeTarget failed",
            "release workflow builds native uninstall binaries after gate tests without building unrelated targets");
   contains(client_release, "$releaseTargets = @(",
@@ -369,6 +402,10 @@ int main(void) {
   char *lifecycle_smoke = read_file(path);
   require_true(lifecycle_smoke != NULL, "read Windows release lifecycle smoke test");
   contains(lifecycle_smoke, "-UpgradeClass binary_hot", "binary-only lifecycle smoke explicitly selects the no-package update path");
+  contains(lifecycle_smoke, "ValidateSet(\"amd64\", \"arm64\")",
+           "lifecycle smoke requires an explicit native architecture");
+  contains(lifecycle_smoke, "$expectedUpdateArchitecture",
+           "lifecycle smoke passes the correct architecture to the updater");
   contains(lifecycle_smoke, "Wait-EmbeddedUpdaterMaterialized", "lifecycle verifies updater extraction from the installed target binary");
   contains(lifecycle_smoke, "embedded updater hash mismatch", "lifecycle binds the materialized updater to the target release hash");
   contains(lifecycle_smoke, "embedded_updater", "lifecycle summary records embedded updater verification");
@@ -466,6 +503,10 @@ int main(void) {
            "release validation uses the Windows PowerShell parser");
   contains(powershell_validator, "invoke_windows_native_capability_probe.ps1",
            "release validation parses the shared native capability runner on Windows PowerShell 5.1");
+  contains(powershell_validator, "write_windows_package_capabilities.ps1",
+           "release validation parses the shared package capability writer on Windows PowerShell 5.1");
+  contains(powershell_validator, "Build-BundledInstaller.ps1",
+           "release validation parses the complete Setup UI build entrypoint on Windows PowerShell 5.1");
   contains(powershell_validator, "Non-ASCII Windows PowerShell 5.1 script must be UTF-8 with BOM",
            "release validation rejects ambiguous ANSI decoding of non-ASCII runtime scripts");
   free(powershell_validator);

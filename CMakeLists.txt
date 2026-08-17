@@ -365,6 +365,7 @@ set(EDR_AGENT_SOURCES
   src/forensic/deep_collector.c
   src/shell/shell_session.c
   src/pmfe/pmfe_engine.c
+  src/pmfe/pmfe_pe_arch.c
   src/pmfe/pmfe_etw_preprocess.c
   src/pmfe/pid_history_pmfe.c
   src/attack_surface/attack_surface_report.c

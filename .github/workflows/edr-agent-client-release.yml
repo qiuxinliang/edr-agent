@@ -90,13 +90,14 @@ jobs:
     name: Build Windows ${{ matrix.arch }} (FDSensor.exe + runtime DLLs, fast no-gRPC)
     needs: prepare-release
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref_name, 'win_')) }}
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
+            runner: windows-latest
             msvc_arch: x64
             triplet: x64-windows
             ort_arch: x64
@@ -104,7 +105,8 @@ jobs:
             cmake_processor: AMD64
             include_windivert: "true"
           - arch: arm64
-            msvc_arch: amd64_arm64
+            runner: windows-11-arm
+            msvc_arch: arm64
             triplet: arm64-windows
             ort_arch: arm64
             runtime_identifier: win-arm64
@@ -130,6 +132,9 @@ jobs:
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
+      - name: Round-trip Windows package capabilities for AMD64 and ARM64
+        shell: pwsh
+        run: .\scripts\test_windows_package_capabilities_contract.ps1
       - name: Resolve Windows release signing mode
         shell: pwsh
         run: |
@@ -257,6 +262,7 @@ jobs:
         shell: pwsh
         run: choco install ninja innosetup -y --no-progress
       - uses: mozilla-actions/sccache-action@v0.0.9
+        if: matrix.arch == 'amd64'
       - name: Prepare vcpkg cache directories
         shell: pwsh
         run: |
@@ -438,8 +444,8 @@ jobs:
             "-DEDR_WINDOWS_TARGET_ARCH=$env:EDR_RELEASE_ARCH" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            "-DCMAKE_C_COMPILER_LAUNCHER=${{ matrix.arch == 'amd64' && 'sccache' || '' }}" `
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=${{ matrix.arch == 'amd64' && 'sccache' || '' }}" `
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_WITH_P0_RULES_OPENSSL=ON `
@@ -497,38 +503,22 @@ jobs:
           $uninstallerExe = Join-Path $outDir "uninstall.exe"
           & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $workerExe -Architecture $env:EDR_RELEASE_ARCH
           & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $uninstallerExe -Architecture $env:EDR_RELEASE_ARCH
-          if ($env:EDR_RELEASE_ARCH -eq "amd64") {
-            $workerProbe = Join-Path $env:RUNNER_TEMP "installer-worker-capabilities.json"
-            $uninstallerProbe = Join-Path $env:RUNNER_TEMP "headless-uninstaller-capabilities.json"
-            $probeRunner = Resolve-Path ".\scripts\invoke_windows_native_capability_probe.ps1"
-            $worker = & $probeRunner `
-              -ExecutablePath $workerExe `
-              -ProbePath $workerProbe `
-              -ComponentName "installer worker"
-            $uninstaller = & $probeRunner `
-              -ExecutablePath $uninstallerExe `
-              -ProbePath $uninstallerProbe `
-              -ComponentName "headless uninstaller"
-            if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
-              throw "installer worker does not implement uninstall attestation v2 token handoff"
-            }
-            if ($uninstaller.uninstall_attestation -ne "v2" -or $uninstaller.powershell_token_handoff -ne $true) {
-              throw "headless uninstaller does not implement uninstall attestation v2 PowerShell handoff"
-            }
-          } elseif ($env:EDR_RELEASE_ARCH -eq "arm64") {
-            foreach ($component in @(
-                @{ Name = "installer worker"; Path = $workerExe; Marker = '"token_handoff":true' },
-                @{ Name = "headless uninstaller"; Path = $uninstallerExe; Marker = '"powershell_token_handoff":true' }
-              )) {
-              $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($component.Path))
-              if (-not $binaryText.Contains('"schema":"edr.windows.native-capabilities.v1"') -or
-                  -not $binaryText.Contains('"uninstall_attestation":"v2"') -or
-                  -not $binaryText.Contains($component.Marker)) {
-                throw "$($component.Name) ARM64 binary does not contain the required uninstall attestation capability marker"
-              }
-            }
-          } else {
-            throw "unsupported native capability probe architecture: $env:EDR_RELEASE_ARCH"
+          $workerProbe = Join-Path $env:RUNNER_TEMP "installer-worker-capabilities.json"
+          $uninstallerProbe = Join-Path $env:RUNNER_TEMP "headless-uninstaller-capabilities.json"
+          $probeRunner = Resolve-Path ".\scripts\invoke_windows_native_capability_probe.ps1"
+          $worker = & $probeRunner `
+            -ExecutablePath $workerExe `
+            -ProbePath $workerProbe `
+            -ComponentName "installer worker"
+          $uninstaller = & $probeRunner `
+            -ExecutablePath $uninstallerExe `
+            -ProbePath $uninstallerProbe `
+            -ComponentName "headless uninstaller"
+          if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
+            throw "installer worker does not implement uninstall attestation v2 token handoff"
+          }
+          if ($uninstaller.uninstall_attestation -ne "v2" -or $uninstaller.powershell_token_handoff -ne $true) {
+            throw "headless uninstaller does not implement uninstall attestation v2 PowerShell handoff"
           }
 
       - name: Verify HTTPS REST and SQLite compiled in
@@ -610,7 +600,8 @@ jobs:
             'agent_update_command_contract',
             'agent_update_packaging_contract',
             'windows_headless_runtime_contract',
-            'command_registry_and_payload_contract'
+            'command_registry_and_payload_contract',
+            'pmfe_pe_architectures'
           )
           $listedText = $listed -join "`n"
           foreach ($name in $required) {
@@ -618,34 +609,8 @@ jobs:
               throw "Required release test was not configured: $name"
             }
           }
-          if ($env:EDR_RELEASE_ARCH -eq 'amd64') {
-            & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract)$'
-            if ($LASTEXITCODE -ne 0) { throw "Release tests failed" }
-            exit 0
-          }
-          if ($env:EDR_RELEASE_ARCH -ne 'arm64') {
-            throw "unsupported release test architecture: $env:EDR_RELEASE_ARCH"
-          }
-
-          # windows-latest is an AMD64 runner. ARM64 test binaries must be
-          # compiled and linked here, but cannot be started by CTest on it.
-          $arm64GateTests = @(
-            'tests\test_command_contract.exe',
-            'tests\test_agent_update_contract.exe',
-            'tests\test_agent_update_assets.exe',
-            'tests\test_windows_headless_runtime_contract.exe'
-          )
-          foreach ($relativePath in $arm64GateTests) {
-            $testExe = Join-Path 'build' $relativePath
-            if (-not (Test-Path -LiteralPath $testExe -PathType Leaf)) {
-              throw "required ARM64 release test executable was not linked: $testExe"
-            }
-            & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $testExe -Architecture arm64
-            if ($LASTEXITCODE -ne 0) {
-              throw "ARM64 release test architecture check failed: $testExe"
-            }
-          }
-          Write-Host 'ARM64 gate test executables compiled and linked; execution is deferred to an ARM64 Windows runner.'
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures)$'
+          if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
 
       - name: "[Timing] Build summary"
         if: always()
@@ -696,15 +661,11 @@ jobs:
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
           $packageCapabilitiesPath = Join-Path $env:GITHUB_WORKSPACE "package-capabilities.json"
-          $packageCapabilities = [ordered]@{
-            schema = "edr.windows.package-capabilities.v1"
-            target_arch = $env:EDR_RELEASE_ARCH
-            arm64_emulation_supported = $false
-            arm64_emulation_network_packet_capture = $false
-            network_packet_capture = ($env:EDR_INCLUDE_WINDIVERT -eq 'true')
-            signature_status = if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') { 'signed' } else { 'unsigned' }
-          }
-          $packageCapabilities | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $packageCapabilitiesPath -Encoding UTF8
+          $signatureStatus = if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') { 'signed' } else { 'unsigned' }
+          & ".\scripts\write_windows_package_capabilities.ps1" `
+            -OutputPath $packageCapabilitiesPath `
+            -TargetArch $env:EDR_RELEASE_ARCH `
+            -SignatureStatus $signatureStatus
           $null = $items.Add($agentExe)
           if ($workerExe -and (Test-Path -LiteralPath $workerExe)) {
             $null = $items.Add($workerExe)
@@ -753,6 +714,14 @@ jobs:
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           $null = $items.Add($packageCapabilitiesPath)
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
+          $runtimePeFiles = @(Get-ChildItem -LiteralPath $outDir -File -ErrorAction Stop | Where-Object {
+              $_.Extension -ieq '.exe' -or $_.Extension -ieq '.dll'
+            })
+          if ($runtimePeFiles.Count -lt 1) { throw "Runtime PE closure is empty: $outDir" }
+          foreach ($runtimePeFile in $runtimePeFiles) {
+            & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $runtimePeFile.FullName -Architecture $env:EDR_RELEASE_ARCH
+          }
+          Write-Host "Verified Runtime PE closure: arch=$env:EDR_RELEASE_ARCH files=$($runtimePeFiles.Count)"
           if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
             foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
               $asset = Join-Path $outDir $p
@@ -795,7 +764,12 @@ jobs:
 
           $innoOut = "install\windows-inno\Output"
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
-          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch $env:EDR_RELEASE_ARCH
+          $signatureStatus = if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') { 'signed' } else { 'unsigned' }
+          & ".\install\windows-inno\Build-BundledInstaller.ps1" `
+            -BinDir (Resolve-Path $outDir).Path `
+            -AppVersion $env:EDR_AGENT_VERSION `
+            -TargetArch $env:EDR_RELEASE_ARCH `
+            -SignatureStatus $signatureStatus
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
           $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
           if (-not (Test-Path -LiteralPath $setupSrc)) {
@@ -889,9 +863,15 @@ jobs:
             } finally {
               $capabilityReader.Dispose()
             }
+            $expectedNetworkPacketCapture = ($env:EDR_RELEASE_ARCH -eq 'amd64')
             if ($packagedCapabilities.schema -ne 'edr.windows.package-capabilities.v1' -or
-                $packagedCapabilities.target_arch -ne $env:EDR_RELEASE_ARCH) {
-              throw "package-capabilities.json does not bind the release architecture"
+                $packagedCapabilities.target_arch -ne $env:EDR_RELEASE_ARCH -or
+                $packagedCapabilities.arm64_emulation_supported -ne $false -or
+                $packagedCapabilities.arm64_emulation_network_packet_capture -ne $false -or
+                $packagedCapabilities.network_packet_capture -ne $expectedNetworkPacketCapture -or
+                $packagedCapabilities.windows_firewall_isolation -ne $true -or
+                $packagedCapabilities.signature_status -ne $signatureStatus) {
+              throw "package-capabilities.json does not match the native release contract"
             }
 
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {

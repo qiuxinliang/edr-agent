@@ -34,7 +34,7 @@
 #ifdef EDR_TARGET_ARM64
   #define EDR_SETUP_ARCH "arm64"
 #else
-  #define EDR_SETUP_ARCH "x64compatible"
+  #define EDR_SETUP_ARCH "x64os"
   #define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
 #endif
 #define EDR_WINDIVERT_LICENSE "..\..\third_party\windivert\LICENSE"

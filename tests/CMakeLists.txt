@@ -572,6 +572,13 @@ target_include_directories(test_config_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${
 add_executable(test_pmfe_detail ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_detail.c)
 add_test(NAME pmfe_scan_detail_format COMMAND test_pmfe_detail WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_pmfe_pe_arch
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_pe_arch.c
+  ${CMAKE_SOURCE_DIR}/src/pmfe/pmfe_pe_arch.c)
+target_include_directories(test_pmfe_pe_arch PRIVATE ${CMAKE_SOURCE_DIR}/src/pmfe)
+edr_apply_common_warnings(test_pmfe_pe_arch)
+add_test(NAME pmfe_pe_architectures COMMAND test_pmfe_pe_arch WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(test_pmfe_linux_maps ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_linux_maps.c ${CMAKE_SOURCE_DIR}/src/pmfe/pmfe_linux_scan_util.c)
   target_include_directories(test_pmfe_linux_maps PRIVATE ${CMAKE_SOURCE_DIR}/src/pmfe)

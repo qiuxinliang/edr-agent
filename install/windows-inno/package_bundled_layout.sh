@@ -22,6 +22,11 @@ OUT_NAME="${EDR_BUNDLE_ZIP_NAME:-EDRAgent-bundled-payload-win-${ARCH}}"
 OUT_DIR="$SCRIPT_DIR/Output/${OUT_NAME}"
 ZIP_PATH="$SCRIPT_DIR/Output/${OUT_NAME}.zip"
 STRICT="${EDR_BUNDLE_STRICT:-0}"
+SIGNATURE_STATUS="${EDR_WINDOWS_SIGNATURE_STATUS:-unsigned}"
+case "$SIGNATURE_STATUS" in
+  signed|unsigned) ;;
+  *) echo "Error: EDR_WINDOWS_SIGNATURE_STATUS must be signed or unsigned (got: $SIGNATURE_STATUS)" >&2; exit 1 ;;
+esac
 
 require_yara_runtime_dlls_in_dir() {
   local dir="$1"
@@ -114,17 +119,18 @@ if [[ "$DLL_COUNT" -lt 1 ]]; then
   echo "Warning: no .dll next to FDSensor.exe; Windows runtime will not start if FDSensor.exe is dynamically linked." >&2
 fi
 require_yara_runtime_dlls_in_dir "$OUT_DIR" "bundled payload output"
-mkdir -p "$OUT_DIR/licenses" "$OUT_DIR/capabilities"
+mkdir -p "$OUT_DIR/licenses"
 if [[ "$ARCH" == "amd64" ]]; then
   require_windivert_runtime
   cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert.dll" "$OUT_DIR/WinDivert.dll"
   cp -a "$EDR_AGENT_DIR/third_party/windivert/runtime/amd64/WinDivert64.sys" "$OUT_DIR/WinDivert64.sys"
   cp -a "$EDR_AGENT_DIR/third_party/windivert/LICENSE" "$OUT_DIR/licenses/WinDivert-LICENSE.txt"
   cp -a "$EDR_AGENT_DIR/third_party/windivert/SOURCE.json" "$OUT_DIR/licenses/WinDivert-SOURCE.json"
-  printf '%s\n' '{"target_arch":"amd64","windivert":true,"network_packet_capture":true,"arm64_emulation_supported":false,"arm64_emulation_network_packet_capture":false,"windows_firewall_isolation":true,"reason":"AMD64-on-ARM64 is blocked until the full package passes a native ARM64 E2E gate"}' > "$OUT_DIR/capabilities/package.json"
+  NETWORK_PACKET_CAPTURE=true
 else
-  printf '%s\n' '{"target_arch":"arm64","windivert":false,"network_packet_capture":false,"arm64_emulation_supported":false,"arm64_emulation_network_packet_capture":false,"windows_firewall_isolation":true,"reason":"WinDivert 2.2.2 has no ARM64 kernel driver; Windows Firewall host isolation remains available"}' > "$OUT_DIR/capabilities/package.json"
+  NETWORK_PACKET_CAPTURE=false
 fi
+printf '%s\n' "{\"schema\":\"edr.windows.package-capabilities.v1\",\"target_arch\":\"${ARCH}\",\"arm64_emulation_supported\":false,\"arm64_emulation_network_packet_capture\":false,\"network_packet_capture\":${NETWORK_PACKET_CAPTURE},\"windows_firewall_isolation\":true,\"signature_status\":\"${SIGNATURE_STATUS}\"}" > "$OUT_DIR/package-capabilities.json"
 printf '%s\n' "$ARCH" > "$OUT_DIR/ARCH"
 
 # models: whitelist production-ready compact model artifacts only.

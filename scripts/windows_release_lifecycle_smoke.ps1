@@ -5,6 +5,7 @@ param(
   [Parameter(Mandatory = $true)][string]$TargetPackageDir,
   [Parameter(Mandatory = $true)][string]$BaselineVersion,
   [Parameter(Mandatory = $true)][string]$TargetVersion,
+  [Parameter(Mandatory = $true)][ValidateSet("amd64", "arm64")][string]$Architecture,
   [Parameter(Mandatory = $true)][string]$EvidenceDir
 )
 
@@ -17,6 +18,7 @@ $serviceName = "FDSecurityAgentCISmoke"
 $configPath = Join-Path $installDir "agent.toml"
 $programDataState = Join-Path $env:ProgramData "FDSecurity\state"
 $programDataLogs = Join-Path $env:ProgramData "FDSecurity\logs"
+$expectedUpdateArchitecture = if ($Architecture -eq "arm64") { "arm64" } else { "x64" }
 
 function Find-OneFile {
   param([string]$Root, [string]$Name)
@@ -207,7 +209,7 @@ function Invoke-VersionTransition {
     -StagedBinary $staged `
     -ExpectedSha256 ((Get-FileHash -LiteralPath $Candidate -Algorithm SHA256).Hash) `
     -TargetVersion $Version `
-    -ExpectedArchitecture x64 `
+    -ExpectedArchitecture $expectedUpdateArchitecture `
     -TrustedPublisherThumbprint $publisher.Thumbprint `
     -TrustedPublisherSubject $publisher.Subject `
     -DeploymentMode service `
@@ -354,13 +356,13 @@ try {
 
   $stage = "upgrade"
   Invoke-VersionTransition -Operation upgrade -Candidate $targetBinary `
-    -Version $TargetVersion -ArtifactID "ci-$TargetVersion-amd64" -UpdateScript $targetUpdater
+    -Version $TargetVersion -ArtifactID "ci-$TargetVersion-$Architecture" -UpdateScript $targetUpdater
   $stage = "embedded_updater"
   $embeddedUpdaterSha256 = Wait-EmbeddedUpdaterMaterialized -Version $TargetVersion `
     -ExpectedScript $targetUpdater
   $stage = "rollback"
   Invoke-VersionTransition -Operation rollback -Candidate $baselineBinary `
-    -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-amd64" -UpdateScript $targetUpdater
+    -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-$Architecture" -UpdateScript $targetUpdater
 
   $stage = "uninstall"
   $agentProcessId = [int](Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).ProcessId
@@ -647,7 +649,7 @@ try {
     schema_version = 1
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
-    architecture = "amd64"
+    architecture = $Architecture
     install = "passed"
     upgrade = "passed"
     embedded_updater = "passed"
@@ -662,7 +664,7 @@ try {
     schema_version = 1
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
-    architecture = "amd64"
+    architecture = $Architecture
     status = "failed"
     failed_stage = $stage
     error = $_.Exception.Message

@@ -41,7 +41,9 @@
 #ifdef EDR_TARGET_ARM64
   #define EDR_SETUP_ARCH "arm64"
 #else
-  #define EDR_SETUP_ARCH "x64compatible"
+  ; v1 release policy is native-only. x64compatible would also admit AMD64
+  ; emulation on Windows ARM64, bypassing the package capability contract.
+  #define EDR_SETUP_ARCH "x64os"
   #define EDR_WINDIVERT_RUNTIME_DIR "..\..\third_party\windivert\runtime\amd64"
 #endif
 #define EDR_WINDIVERT_LICENSE "..\..\third_party\windivert\LICENSE"

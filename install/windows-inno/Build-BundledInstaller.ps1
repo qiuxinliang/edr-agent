@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   Builds FDSecuritySetup-bundled.exe (full layout: staged exe/DLLs + models dir + preprocess TOML + scripts).
   Run on Windows from the monorepo root OR from this directory.
@@ -16,6 +16,8 @@ param(
     [string] $AppVersion = "",
     [ValidateSet("amd64", "arm64")]
     [string] $TargetArch = "amd64",
+    [ValidateSet("signed", "unsigned")]
+    [string] $SignatureStatus = "unsigned",
     [string] $CollectorArch = "",
     [switch] $SkipForensicCollectorBuild,
     [switch] $AllowPowerShellFallback
@@ -217,17 +219,14 @@ if (-not $AppVersion) {
 Write-Host "Staged VERSION: $AppVersion"
 $archFile = Join-Path $BinDir "ARCH"
 [System.IO.File]::WriteAllText($archFile, $TargetArch + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
-$packageCapabilities = @{
-    target_arch = $TargetArch
-    windivert = ($TargetArch -eq "amd64")
-    network_packet_capture = ($TargetArch -eq "amd64")
-    # AMD64-on-ARM64 remains blocked until the complete package (including
-    # service lifecycle and security controls) passes a native ARM64 E2E gate.
-    arm64_emulation_supported = $false
-    arm64_emulation_network_packet_capture = $false
-    windows_firewall_isolation = $true
-} | ConvertTo-Json -Compress
-[System.IO.File]::WriteAllText((Join-Path $BinDir "package-capabilities.json"), $packageCapabilities, [System.Text.Encoding]::UTF8)
+$capabilityWriter = Join-Path $agentRoot "scripts\write_windows_package_capabilities.ps1"
+if (-not (Test-Path -LiteralPath $capabilityWriter -PathType Leaf)) {
+    throw "Missing package capability writer: $capabilityWriter"
+}
+& $capabilityWriter `
+    -OutputPath (Join-Path $BinDir "package-capabilities.json") `
+    -TargetArch $TargetArch `
+    -SignatureStatus $SignatureStatus
 
 $collectorArchInput = if ($CollectorArch) { $CollectorArch } else { $TargetArch }
 $resolvedCollectorArch = Resolve-CollectorArch $collectorArchInput
@@ -235,6 +234,15 @@ if ($resolvedCollectorArch -ne $TargetArch) {
     throw "CollectorArch '$resolvedCollectorArch' must match TargetArch '$TargetArch'"
 }
 Build-AndStageForensicCollector -RepoRoot $repoRoot -BinDir $BinDir -Arch $resolvedCollectorArch -Skip:$SkipForensicCollectorBuild
+
+$runtimePeFiles = @(Get-ChildItem -LiteralPath $BinDir -File -ErrorAction Stop | Where-Object {
+    $_.Extension -ieq ".exe" -or $_.Extension -ieq ".dll"
+})
+if ($runtimePeFiles.Count -lt 1) { throw "No Runtime EXE/DLL files found for architecture validation: $BinDir" }
+foreach ($runtimePeFile in $runtimePeFiles) {
+    & $archCheck -Path $runtimePeFile.FullName -Architecture $TargetArch
+}
+Write-Host "Verified Runtime PE closure: arch=$TargetArch files=$($runtimePeFiles.Count)"
 
 $modelsDir = Join-Path $agentRoot "models"
 if (Test-Path -LiteralPath $modelsDir) {
@@ -268,6 +276,7 @@ if ($LASTEXITCODE -ne 0) {
 $outDir = Join-Path $scriptDir "Output"
 $out = Join-Path $outDir "FDSecuritySetup-bundled.exe"
 if (Test-Path -LiteralPath $out) {
+    & $archCheck -Path $out -Architecture $TargetArch
     [System.IO.File]::WriteAllText($out + ".arch", $TargetArch + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
     Write-Host "OK: $out"
     $legacyOut = Join-Path $outDir "EDRAgentSetup-bundled.exe"
