@@ -18,6 +18,18 @@
 #error "EDR_TEST_FIXTURE_ONNX must name the checked static ONNX fixture"
 #endif
 
+/*
+ * `edr_config_load` applies the Windows listener-cache settings after a
+ * successful parse.  This ONNX contract test exercises configuration solely
+ * to supply AVE options; it neither owns nor needs the listener table.  Keep
+ * the platform hook local to the test, as test_config_fp does, so the target
+ * remains a focused ONNX link/run gate instead of pulling network-enumeration
+ * and WinSock dependencies into the test binary.
+ */
+#ifdef _WIN32
+void edr_win_listen_apply_config(const EdrConfig *cfg) { (void)cfg; }
+#endif
+
 static int fail(const char *message) {
   fprintf(stderr, "test_ave_static_onnx_integration: %s\n", message);
   edr_onnx_runtime_cleanup();

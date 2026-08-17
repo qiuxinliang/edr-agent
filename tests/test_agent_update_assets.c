@@ -408,6 +408,8 @@ int main(void) {
            "static ONNX integration test loads the pinned fixture through the Agent runtime");
   contains(static_onnx_integration, "onnx_layout != 1",
            "static ONNX integration test requires the named triple-output contract");
+  contains(static_onnx_integration, "void edr_win_listen_apply_config",
+           "static ONNX integration test supplies config.c's Windows-only listener hook");
   free(static_onnx_integration);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
