@@ -596,7 +596,13 @@ jobs:
               throw "Setup UI NuGet lock is incomplete; missing dependency graph '$graph' in $lock"
             }
           }
-          dotnet restore $project -r $env:EDR_RUNTIME_IDENTIFIER --locked-mode
+          $restoreArgs = @(
+            $project,
+            '-r', $env:EDR_RUNTIME_IDENTIFIER,
+            '--locked-mode',
+            "-p:NuGetLockFilePath=$lock"
+          )
+          & dotnet restore @restoreArgs
           if ($LASTEXITCODE -ne 0) {
             throw "Setup UI locked restore failed for $env:EDR_RUNTIME_IDENTIFIER"
           }

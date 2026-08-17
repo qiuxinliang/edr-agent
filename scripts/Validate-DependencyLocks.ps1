@@ -82,11 +82,11 @@ foreach ($setupUiLockSpec in $setupUiLocks) {
   }
 }
 $projectText = [IO.File]::ReadAllText($projectPath)
-$requiredRidLockSelector = '<NuGetLockFilePath Condition="''$(RuntimeIdentifier)'' != ''''">packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>'
+$requiredPortableLockSelector = '<NuGetLockFilePath>packages.lock.json</NuGetLockFilePath>'
 if ($projectText -notmatch '<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>' -or
     $projectText -notmatch '<RestoreLockedMode>true</RestoreLockedMode>' -or
-    -not $projectText.Contains($requiredRidLockSelector)) {
-  throw "Setup UI restore must require committed per-RID NuGet locks"
+    -not $projectText.Contains($requiredPortableLockSelector)) {
+  throw "Setup UI restore must keep packages.lock.json as its portable default; runtime callers must explicitly select committed per-RID NuGet locks"
 }
 
 $releaseRequirements = Join-Path $RepositoryRoot "requirements-release.txt"

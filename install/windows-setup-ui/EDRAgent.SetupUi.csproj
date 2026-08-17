@@ -12,11 +12,12 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode>true</RestoreLockedMode>
     <!--
-      Self-contained WPF publishes restore runtime packs for their target RID.
-      A portable lock file cannot satisfy a locked `dotnet publish -r` call, so
-      keep immutable lock closures per supported Windows architecture.
+      RuntimeIdentifier supplied by `dotnet restore -r` is applied after
+      project-property conditions are evaluated.  Keep the portable lock as
+      the default; every RID restore/publish caller must explicitly pass its
+      matching `-p:NuGetLockFilePath=...` closure.
     -->
-    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+    <NuGetLockFilePath>packages.lock.json</NuGetLockFilePath>
   </PropertyGroup>
 
   <ItemGroup>
