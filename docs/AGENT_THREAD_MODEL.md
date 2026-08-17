@@ -31,7 +31,6 @@
 | **AVE 行为** | 可选 worker | `src/ave/ave_behavior_pipeline.c` |
 | **Webshell / WinDivert** | 各模块独立监视/捕获线程 | `webshell_detector_*.c`、`windivert_capture.c` |
 | **攻击面** | 主路径同步 + 部分 **临时** `pthread_create` 并行 | `src/attack_surface/attack_surface_report.c` |
-| **联邦学习（可选）** | `fl_trainer` 协议 / 本地线程 | `src/fl_trainer/fl_trainer.c` |
 
 ---
 

@@ -53,10 +53,6 @@ extern "C" {
 #define AVE_ERR_NOT_SUPPORTED (-100)
 /** 子系统尚未实现（Phase 1 占位） */
 #define AVE_ERR_NOT_IMPL (-101)
-/** `AVE_ExportModelWeights`：输出缓冲区不足；`*size` 回写所需最小字节数（C0+ 实现） */
-#define AVE_ERR_BUFFER_TOO_SMALL (-102)
-/** Legacy compatibility: feature cache miss; endpoint FL training is no longer part of product builds. */
-#define AVE_ERR_FL_SAMPLE_NOT_FOUND (-103)
 
 typedef enum EDRVerdict {
   VERDICT_CLEAN = 0,
@@ -128,15 +124,12 @@ typedef enum AVEEventType {
 } AVEEventType;
 
 typedef struct AVEConfig {
-  const char *model_dir;
   const char *whitelist_db_path;
   const char *ioc_db_path;
   /** L4：不可豁免哈希库（表 `file_behavior_non_exempt`）；可为 NULL */
   const char *behavior_policy_db_path;
   const char *cert_whitelist_db_path;
   const char *yara_rules_dir;
-  /** Legacy compatibility only; endpoint product builds ignore local FL sample DBs. */
-  const char *fl_samples_db_path;
 
   int max_concurrent_scans;
   int scan_timeout_ms;
@@ -158,13 +151,9 @@ typedef struct AVEConfig {
   float cert_min_confidence_floor;
 
   bool behavior_monitor_enabled;
-  /** Legacy compatibility only; learning/evaluation is handled server-side. */
-  bool federated_learning_enabled;
   bool yara_scan_enabled;
   bool cert_whitelist_enabled;
 
-  float fl_idle_cpu_threshold;
-  int fl_min_samples;
 
   /** L4×实时行为：`AVE_ScanFileWithSubject` 使用 `subject_pid` 时是否联动行为异常分 */
   bool l4_realtime_behavior_link;
@@ -232,7 +221,7 @@ typedef struct AVEBehaviorEvent {
   char target_domain[256];
   uint16_t target_port;
   float ave_confidence;
-  /** §12.2 / 《11》§5.5 E 组：WinDivert / Webshell / PMFE → behavior.onnx（未接入时为 0） */
+  /** §12.2 / 《11》§5.5 E 组：WinDivert / Webshell / PMFE → 行为启发式评分。 */
   float shellcode_score;
   float webshell_score;
   float pmfe_confidence;
@@ -274,14 +263,10 @@ typedef void(AVE_CALL *AVEBehaviorCallback)(const AVEBehaviorAlert *alert, void 
 typedef void(AVE_CALL *AVEWhitelistHitCallback)(const char *sha256, const char *file_path,
                                                   EDRVerdict raw_ai_verdict, float raw_confidence,
                                                   const char *whitelist_reason, void *user_data);
-typedef void(AVE_CALL *AVEHotfixAppliedCallback)(const char *hotfix_id, bool success,
-                                                 const char *error_message, void *user_data);
-
 typedef struct AVECallbacks {
   AVEThreatCallback on_threat_detected;
   AVEBehaviorCallback on_behavior_alert;
   AVEWhitelistHitCallback on_whitelist_hit;
-  AVEHotfixAppliedCallback on_hotfix_applied;
   void *user_data;
 } AVECallbacks;
 
@@ -292,6 +277,7 @@ typedef struct AVEStatus {
   int async_queue_size;
   /** MPMC **近似**深度（多生产者下为估计值）；与 **`behavior_queue_capacity`** 对照可观测背压 */
   int behavior_event_queue_size;
+  /** Deprecated compatibility fields: endpoint models are not supported and remain empty. */
   char static_model_version[32];
   char behavior_model_version[32];
   char whitelist_version[32];
@@ -299,7 +285,6 @@ typedef struct AVEStatus {
   char yara_version[32];
   int cert_whitelist_entry_count;
   int ioc_entry_count;
-  float fl_samples_count;
   /** `ioc_db_path` 库内 `ave_db_meta.rules_version`（无表或键则为空） */
   char ioc_rules_version[32];
   /** `edr_ave_bp_feed` 非 NULL 调用累计（多线程安全计数） */
@@ -314,7 +299,7 @@ typedef struct AVEStatus {
   uint64_t behavior_feed_sync_bypass;
   /** 消费线程从 MPMC **成功 pop** 次数（与 enqueued+当前深度大致守恒） */
   uint64_t behavior_worker_dequeued;
-  /** **`edr_onnx_behavior_infer`** 成功 / 非 **EDR_OK** 次数 */
+  /** 保留遥测 ABI；端点不再执行模型推理，两个值恒为 0。 */
   uint64_t behavior_infer_ok;
   uint64_t behavior_infer_fail;
   uint64_t behavior_infer_budget_dropped;
@@ -335,13 +320,13 @@ typedef struct AVEStatus {
 AVE_EXPORT int AVE_CALL AVE_Init(const AVEConfig *config);
 struct EdrConfig;
 /**
- * 使用 Agent 已加载的 `EdrConfig` 初始化 ONNX/模型子系统（与 `AVE_Init` 二选一）。
+ * 使用 Agent 已加载的 `EdrConfig` 初始化规则、白名单与行为启发式子系统（与 `AVE_Init` 二选一）。
  * `cfg` 在 `AVE_Shutdown` 之前必须保持有效；典型调用点为 `edr_agent_init` 在 TOML 加载成功后。
  */
 AVE_EXPORT int AVE_CALL AVE_InitFromEdrConfig(const struct EdrConfig *cfg);
 /**
- * 配置热载（`edr_config_reload_if_modified` / 远程 TOML）成功后调用：按当前 `EdrConfig` 从 `model_dir` 重载 static / behavior ONNX。
- * 其它 `[ave]` 项（吊销、L4、SQLite 路径等）在扫描路径上每次从 `cfg` 读取；与 `AVE_InitFromEdrConfig` 使用**同一** `EdrConfig` 指针并原地更新时无需再调本接口，但重载 ONNX 仍需本调用。
+ * 配置热载（`edr_config_reload_if_modified` / 远程 TOML）成功后调用，以更新行为资源预算。
+ * 其它 `[ave]` 项（吊销、L4、SQLite 路径等）在扫描路径上每次从 `cfg` 读取；与 `AVE_InitFromEdrConfig` 使用**同一** `EdrConfig` 指针并原地更新时无需再调本接口。
  * 若 AVE 未初始化则返回 `AVE_ERR_NOT_INITIALIZED`。
  */
 AVE_EXPORT int AVE_CALL AVE_SyncFromEdrConfig(const struct EdrConfig *cfg);
@@ -352,7 +337,7 @@ AVE_EXPORT const char *AVE_CALL AVE_GetVersion(void);
 AVE_EXPORT int AVE_CALL AVE_GetStatus(AVEStatus *status_out);
 
 /**
- * 可选扫描主体 PID（如发起读写的进程）。与 `[ave] l4_realtime_behavior_link` 配合，在 ONNX 之后按行为分叠加 L4（`behavior_realtime`）。
+ * 可选扫描主体 PID（如发起读写的进程）。与 `[ave] l4_realtime_behavior_link` 配合，按行为分叠加 L4（`behavior_realtime`）。
  */
 typedef struct AVEScanSubject {
   uint32_t subject_pid;
@@ -378,52 +363,6 @@ AVE_EXPORT void AVE_CALL AVE_NotifyProcessExit(uint32_t pid);
 
 AVE_EXPORT int AVE_CALL AVE_ReportFalsePositive(const char *sha256, const char *file_path);
 AVE_EXPORT int AVE_CALL AVE_ReportTruePositive(const char *sha256);
-/** Legacy compatibility no-op: product builds return 0/0 samples. */
-AVE_EXPORT int AVE_CALL AVE_GetFLSampleCount(int *confirmed_malware_count, int *confirmed_clean_count);
-
-/**
- * Legacy compatibility: export a deterministic zero 512-float vector.
- * Endpoint product builds do not read local FL sample stores.
- */
-AVE_EXPORT int AVE_CALL AVE_ExportFeatureVector(const char *sha256, float *out_512d);
-
-/** Legacy feature vector dimension kept for SDK ABI compatibility. */
-#define AVE_FL_FEATURE_DIM_STATIC 512u
-/** Legacy behavior feature dimension kept for SDK ABI compatibility. */
-#define AVE_FL_FEATURE_DIM_BEHAVIOR_DEFAULT 256u
-/** Behavior feature sequence length retained for compatibility and server-side analysis. */
-#define AVE_FL_BEHAVIOR_SEQ_LEN 128u
-#define AVE_FL_FEATURE_DIM_MAX 4096u
-
-/**
- * Legacy compatibility: writes a zero vector for the requested dimension.
- */
-AVE_EXPORT int AVE_CALL AVE_ExportFeatureVectorEx(const char *sha256, float *out, size_t dim, int target);
-
-/**
- * 导出当前 **ONNX 模型原始权重字节**（`target`: `"static"` 或 `"behavior"`）。
- * C0：返回 `AVE_ERR_NOT_IMPL`（占位）；`*size` 行为以实现为准。
- */
-AVE_EXPORT int AVE_CALL AVE_ExportModelWeights(const char *target, void *buf, size_t *size);
-
-/**
- * Legacy compatibility: endpoint product builds return `AVE_ERR_NOT_IMPL`.
- * Historical builds used this for behavior.onnx trainable tensor export.
- * `out == NULL`：`*out_nelem` ← 所需 float 元素数；`manifest_json` 若非空则写入 JSON 切片说明（`cap` 含 NUL）。
- * `out != NULL`：`*out_nelem` 入参为缓冲可容元素数，成功时回写实际写入数。
- */
-AVE_EXPORT int AVE_CALL AVE_ExportBehaviorFlTrainableTensors(float *out, size_t *out_nelem, char *manifest_json,
-                                                             size_t manifest_cap);
-
-/**
- * 将权重写回引擎（本地验证 / 回滚；**不**触发线上灰度）。
- * **FL3**（`FL3` + 版本字节 `2`）为加密梯度载荷，非模型权重；返回 `AVE_ERR_NOT_SUPPORTED`。
- * 开发占位：`FLSTUB1` / `FL2` 前缀可返回 `AVE_OK`；其余返回 `AVE_ERR_NOT_IMPL`。
- */
-AVE_EXPORT int AVE_CALL AVE_ImportModelWeights(const char *target, const void *buf, size_t size);
-
-AVE_EXPORT int AVE_CALL AVE_ApplyHotfix(const char *hotfix_path);
-AVE_EXPORT int AVE_CALL AVE_UpdateModel(const char *model_path, const char *pca_path);
 AVE_EXPORT int AVE_CALL AVE_UpdateWhitelist(const char *entries_json);
 AVE_EXPORT int AVE_CALL AVE_UpdateIOC(const char *ioc_json);
 

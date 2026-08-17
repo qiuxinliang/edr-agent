@@ -10,20 +10,5 @@
   },
   "vcpkg": {
     "builtin_baseline": "94a541197763a4f449a1b91478df48c0584a6256"
-  },
-  "onnxruntime": {
-    "version": "1.23.2",
-    "archives": {
-      "x64": {
-        "name": "onnxruntime-win-x64-1.23.2.zip",
-        "size_bytes": 78127794,
-        "sha256": "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd"
-      },
-      "arm64": {
-        "name": "onnxruntime-win-arm64-1.23.2.zip",
-        "size_bytes": 78932411,
-        "sha256": "1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168"
-      }
-    }
   }
 }

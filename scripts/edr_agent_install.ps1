@@ -628,7 +628,7 @@ function Repair-InstallRuntimeAcls {
     } catch {}
   }
 
-  foreach ($publicPattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*", "models\*")) {
+  foreach ($publicPattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*")) {
     try {
       Get-ChildItem -Path (Join-Path $InstallRoot $publicPattern) -Force -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object {
@@ -1797,7 +1797,6 @@ function Get-EnrollBearerToken([object]$Data) {
 $RestBearerToken = Get-EnrollBearerToken $d
 
 $InstallDirForToml = if ($InstallDir) { $InstallDir } elseif ((Get-EnrollOs) -eq "windows") { "C:\Program Files\FDSecurity" } else { "." }
-$TomlModelDir = Join-Path $InstallDirForToml "models"
 $TomlQueueDbPath = Join-Path $InstallDirForToml "queue\edr_queue.db"
 $TomlEvidenceCachePath = Join-Path $InstallDirForToml "evidence\local_evidence_cache.db"
 $TomlLogDir = Join-Path $InstallDirForToml "logs"
@@ -2098,7 +2097,6 @@ function Merge-EnrollIntoAgentTomlExample {
   }
   $AgentApiBase = if ($RelayUrl -and $RelayUrl.Trim()) { $RelayUrl.Trim().TrimEnd("/") } else { $RestBaseUrl.TrimEnd("/") }
   $installRoot = if ($InstallDir -and $InstallDir.Trim()) { $InstallDir.Trim() } elseif ($env:OS -match 'Windows') { 'C:\Program Files\FDSecurity' } else { Split-Path -Parent $ExamplePath }
-  $modelDir = Join-Path $installRoot "models"
   $queueDb = Join-Path $installRoot "queue\edr_queue.db"
   $evidenceDb = Join-Path $installRoot "evidence\local_evidence_cache.db"
   $logDir = Join-Path $installRoot "logs"
@@ -2182,8 +2180,7 @@ function Merge-EnrollIntoAgentTomlExample {
       $i++
       continue
     }
-    if ($line -match '^\s*model_dir\s*=') {
-      $out.Add(('model_dir            = "{0}"' -f (Escape-Toml $modelDir)))
+    if ($line -match '^\s*(model_dir|static_model_enabled|static_infer_cache_max_entries|static_infer_cache_ttl_s|ave_infer_per_min|behavior_infer_per_min)\s*=') {
       $i++
       continue
     }
@@ -2543,11 +2540,9 @@ sampling_rate_whitelist = 0.03
 rules_version        = "edr-dynamic-rules-v1"
 
 [ave]
-model_dir            = "$(Escape-Toml $TomlModelDir)"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
-static_model_enabled = true
 behavior_monitor_enabled = false
 
 [forensic_auto]
@@ -2581,7 +2576,6 @@ evidence_cache_retention_hours = 72
 cpu_limit_percent    = 10
 memory_limit_mb      = 512
 emergency_cpu_limit  = 25
-behavior_infer_per_min = 30
 
 [logging]
 level                = "info"

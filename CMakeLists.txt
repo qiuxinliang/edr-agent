@@ -51,82 +51,8 @@ set(EDR_AGENT_VERSION_STRING
   CACHE STRING "Agent version string reported to the platform")
 message(STATUS "gRPC client removed from product build; HTTP ingest/control only")
 
-option(EDR_WITH_ONNXRUNTIME "Link ONNX Runtime C API for AVE real inference (optional)" OFF)
-option(EDR_REQUIRE_ONNXRUNTIME "Fail configure when ONNX Runtime is requested but unavailable" OFF)
-option(EDR_WITH_AVE_BEHAVIOR_ONNX "Deprecated: run behavior.onnx on endpoint instead of server-side evaluation" OFF)
-set(ONNXRUNTIME_ROOT "" CACHE PATH "Root of the SHA-256-pinned ONNX Runtime native package")
-set(EDR_ONNXRUNTIME_AVAILABLE 0)
-if(EDR_REQUIRE_ONNXRUNTIME AND NOT EDR_WITH_ONNXRUNTIME)
-  message(FATAL_ERROR "EDR_REQUIRE_ONNXRUNTIME=ON requires EDR_WITH_ONNXRUNTIME=ON")
-endif()
-if(EDR_WITH_ONNXRUNTIME)
-  find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_c_api.h
-    PATHS
-      ENV ONNXRUNTIME_ROOT
-      "${ONNXRUNTIME_ROOT}"
-      "${ONNXRUNTIME_ROOT}/include"
-      "$ENV{ONNXRUNTIME_ROOT}/include"
-      /opt/homebrew/opt/onnxruntime/include
-      /usr/local/opt/onnxruntime/include
-      "C:/onnxruntime/include"
-    PATH_SUFFIXES onnxruntime "")
-  find_library(ONNXRUNTIME_LIB NAMES onnxruntime
-    PATHS
-      ENV ONNXRUNTIME_ROOT
-      "${ONNXRUNTIME_ROOT}"
-      "${ONNXRUNTIME_ROOT}/lib"
-      "$ENV{ONNXRUNTIME_ROOT}/lib"
-      /opt/homebrew/opt/onnxruntime/lib
-      /usr/local/opt/onnxruntime/lib
-      "C:/onnxruntime/lib")
-  if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
-    set(EDR_ONNXRUNTIME_AVAILABLE 1)
-  elseif(EDR_REQUIRE_ONNXRUNTIME)
-    message(FATAL_ERROR "EDR_REQUIRE_ONNXRUNTIME=ON but ONNX Runtime was not found; set ONNXRUNTIME_ROOT to the pinned native package")
-  else()
-    message(WARNING "EDR_WITH_ONNXRUNTIME=ON but onnxruntime not found (install or set ONNXRUNTIME_ROOT)")
-  endif()
-endif()
-
-# Required ONNX builds must bind the exact checked model fixtures even when
-# EDR_BUILD_TESTS=OFF. Keeping this at the top level prevents a production
-# configure from bypassing the fixture gate by omitting tests/.
-set(EDR_ONNX_STATIC_FIXTURE
-  "${CMAKE_SOURCE_DIR}/tests/fixtures/static_triple_minimal.onnx")
-set(EDR_ONNX_BEHAVIOR_FIXTURE
-  "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_dual_minimal.onnx")
-set(EDR_ONNX_BEHAVIOR_SEQ128_FIXTURE
-  "${CMAKE_SOURCE_DIR}/tests/fixtures/behavior_seq128_dual_minimal.onnx")
-if(EDR_REQUIRE_ONNXRUNTIME)
-  set(_edr_required_onnx_fixtures
-    "${EDR_ONNX_STATIC_FIXTURE}|0bc9404e918264af98fd7296ab960e8e7a3eb359487283bca8fc1e23b8149793"
-    "${EDR_ONNX_BEHAVIOR_FIXTURE}|02c02b0e0e8aa5416817502ec0fa50fa011c52801702e992dec413b42291be24"
-    "${EDR_ONNX_BEHAVIOR_SEQ128_FIXTURE}|14bc1dee6372baad94a2f33412ac2fd04b480bef29f6c853a2636f4a0d6cdd3e")
-  foreach(_edr_required_onnx_fixture IN LISTS _edr_required_onnx_fixtures)
-    string(REPLACE "|" ";" _edr_fixture_fields "${_edr_required_onnx_fixture}")
-    list(GET _edr_fixture_fields 0 _edr_fixture_path)
-    list(GET _edr_fixture_fields 1 _edr_fixture_expected_sha256)
-    if(NOT EXISTS "${_edr_fixture_path}")
-      message(FATAL_ERROR
-        "EDR_REQUIRE_ONNXRUNTIME=ON requires checked ONNX fixture: ${_edr_fixture_path}")
-    endif()
-    file(SHA256 "${_edr_fixture_path}" _edr_fixture_actual_sha256)
-    if(NOT _edr_fixture_actual_sha256 STREQUAL _edr_fixture_expected_sha256)
-      message(FATAL_ERROR
-        "Checked ONNX fixture SHA256 mismatch: ${_edr_fixture_path} expected=${_edr_fixture_expected_sha256} actual=${_edr_fixture_actual_sha256}")
-    endif()
-  endforeach()
-endif()
-
 option(EDR_BUILD_AVE_SHARED_LIB "Build standalone edr_ave_shared (AVE DLL/so for embedding)" OFF)
-option(EDR_WITH_FL_TRAINER "Deprecated: federated learning trainer is removed from endpoint product builds" OFF)
-option(EDR_WITH_FL_KAFKA "Deprecated: federated learning Kafka consumer is removed from endpoint product builds" OFF)
 option(EDR_CREATE_LEGACY_AGENT_ALIAS "Create legacy edr_agent.exe alias next to FDSensor.exe on Windows" OFF)
-set(TORCH_ROOT "" CACHE PATH "Deprecated: LibTorch was used only by the removed endpoint FL trainer")
-option(EDR_WITH_LIBTORCH "Deprecated: LibTorch local FL training is removed from endpoint product builds" OFF)
-if(EDR_WITH_FL_TRAINER OR EDR_WITH_FL_KAFKA OR EDR_WITH_LIBTORCH)
-  message(FATAL_ERROR "Endpoint FL training has been removed from product builds; keep model learning server-side.")
-endif()
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 option(EDR_REQUIRE_YARA "Fail configure when libyara is unavailable" OFF)
 option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
@@ -278,7 +204,6 @@ if(EDR_WITH_P0_RULES_OPENSSL AND NOT OpenSSL_FOUND)
   message(FATAL_ERROR "EDR_WITH_P0_RULES_OPENSSL=ON but OpenSSL was not found")
 endif()
 message(STATUS "P0 encrypted rule bundle OpenSSL support: ${EDR_WITH_P0_RULES_OPENSSL}")
-set(EDR_LIBTORCH_AVAILABLE 0)
 set(EDR_YARA_AVAILABLE 0)
 set(EDR_YARA_TARGET "")
 if(EDR_WITH_YARA)
@@ -420,7 +345,6 @@ set(EDR_AGENT_SOURCES
   src/detection/net_fanout_detector.c
   src/resource/resource.c
   src/ave/ave_engine.c
-  src/ave/ave_onnx_infer.c
   src/ave/ave_sdk.c
   src/ave/ave_suppression.c
   src/ave/ave_rules_meta.c
@@ -429,14 +353,9 @@ set(EDR_AGENT_SOURCES
   src/ave/ave_cross_engine_parse.c
   src/ave/ave_cross_engine_feed.c
   src/ave/ave_lf_mpmc.c
-  src/ave/ave_hotfix.c
   src/ave/ave_db_update.c
-  src/ave/ave_static_features.c
   third_party/cjson/cJSON.c
 )
-if(EDR_WITH_AVE_BEHAVIOR_ONNX)
-  list(APPEND EDR_AGENT_SOURCES src/ave/edr_onnx_behavior_fl_tensor_export.c)
-endif()
 if(EDR_PCRE2_AVAILABLE)
   list(APPEND EDR_AGENT_SOURCES
     src/preprocess/p0_rule_ir.c
@@ -525,8 +444,6 @@ else()
   list(APPEND EDR_WEBSHELL_SRCS src/webshell_detector/webshell_detector_none.c)
 endif()
 list(APPEND EDR_AGENT_SOURCES ${EDR_WEBSHELL_SRCS})
-set(EDR_FL_KAFKA_AVAILABLE 0)
-
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tomlc99/toml.c")
   message(FATAL_ERROR "tomlc99 required: third_party/tomlc99/toml.c (see third_party/tomlc99/README.txt)")
 endif()
@@ -538,8 +455,6 @@ endif()
 
 set(EDR_AVE_CORE_SOURCES
   src/ave/ave_engine.c
-  src/ave/ave_onnx_infer.c
-  src/ave/ave_static_features.c
   src/ave/ave_sdk.c
   src/ave/ave_suppression.c
   src/ave/ave_rules_meta.c
@@ -548,13 +463,9 @@ set(EDR_AVE_CORE_SOURCES
   src/ave/ave_cross_engine_parse.c
   src/ave/ave_cross_engine_feed.c
   src/ave/ave_lf_mpmc.c
-  src/ave/ave_hotfix.c
   src/ave/ave_db_update.c
   src/command/sha256.c
 )
-if(EDR_WITH_AVE_BEHAVIOR_ONNX)
-  list(APPEND EDR_AVE_CORE_SOURCES src/ave/edr_onnx_behavior_fl_tensor_export.c)
-endif()
 if(WIN32)
   list(APPEND EDR_AVE_CORE_SOURCES src/ave/ave_sign_whitelist_win.c)
 else()
@@ -634,10 +545,6 @@ target_compile_definitions(edr_agent PRIVATE
 if(MSVC)
   target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
 endif()
-if(EDR_WITH_AVE_BEHAVIOR_ONNX)
-  target_compile_definitions(edr_agent PRIVATE EDR_WITH_AVE_BEHAVIOR_ONNX=1)
-endif()
-
 if(EDR_PCRE2_AVAILABLE)
   target_compile_definitions(edr_agent PRIVATE EDR_HAVE_PCRE2=1)
   if(EDR_PCRE2_TARGET)
@@ -680,16 +587,6 @@ if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
   else()
     target_include_directories(edr_agent PRIVATE ${EDR_ZSTD_INCLUDE_DIR})
     target_link_libraries(edr_agent PRIVATE ${EDR_ZSTD_LIBRARY})
-  endif()
-endif()
-
-if(EDR_ONNXRUNTIME_AVAILABLE)
-  target_compile_definitions(edr_agent PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_include_directories(edr_agent PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(edr_agent PRIVATE ${ONNXRUNTIME_LIB})
-  if(APPLE)
-    get_filename_component(_edr_ort_libdir "${ONNXRUNTIME_LIB}" DIRECTORY)
-    set_target_properties(edr_agent PROPERTIES BUILD_RPATH "${_edr_ort_libdir}")
   endif()
 endif()
 

@@ -1,5 +1,5 @@
 /**
- * P2 行为管线：MPMC 事件队列 + 监控线程 + PID 异常分（ONNX/启发式）。
+ * P2 行为管线：MPMC 事件队列 + 监控线程 + PID 启发式异常分。
  * 由 ave_sdk.c 调用；不对外导出 ABI。
  */
 #ifndef EDR_AVE_BEHAVIOR_PIPELINE_H
@@ -25,7 +25,7 @@ void edr_ave_bp_configure_resource_limits(const struct EdrConfig *cfg);
 void edr_ave_bp_feed(const AVEBehaviorEvent *event);
 
 /**
- * B3b：static.onnx 扫描结论写入行为 PID 槽，供 §5.5 特征维 44–45（与《11》PidHistory.ave_* 对齐）。
+ * B3b：静态规则扫描结论写入行为 PID 槽，供 §5.5 特征维 44–45（与《11》PidHistory.ave_* 对齐）。
  * @param verdict_edr_enum `EDRVerdict` 数值 0..9
  */
 void edr_ave_bp_merge_static_scan(uint32_t pid, float max_confidence, int verdict_edr_enum);
@@ -39,7 +39,7 @@ uint32_t edr_ave_bp_queue_depth(void);
 uint32_t edr_ave_bp_queue_capacity(void);
 int edr_ave_bp_monitor_running(void);
 
-/** 填充 `AVEStatus` 中行为 MPMC / ONNX 推理计数（供 **`AVE_GetStatus`**） */
+/** 填充 `AVEStatus` 中行为 MPMC 指标（推理计数兼容字段固定为 0）。 */
 void edr_ave_bp_fill_metrics(AVEStatus *status_out);
 
 #endif

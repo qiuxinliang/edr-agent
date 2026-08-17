@@ -1,8 +1,8 @@
 # 真机行为管线 E2E 验收（Agent → platform → DB/API/可选前端）
 
-目标：在**真实 Windows 终端**上跑 `edr_agent`，使 **behavior.onnx** 路径产生事件 → 批次上报 → 平台 **`ingest/report-events`** 落库 → **`GET .../processes/:pid/events`** 与告警列表可查到；与《11》及 **`BEHAVIOR_ONNX_IMPLEMENTATION_PLAN.md`** §0.1 对齐。
+目标：在**真实 Windows 终端**上跑 `edr_agent`，使行为启发式路径产生事件 → 批次上报 → 平台 **`ingest/report-events`** 落库 → **`GET .../processes/:pid/events`** 与告警列表可查到。
 
-实验室「无 ETW 真流量」时，用 **`edr-backend/scripts/smoke_i1_demo_ready.sh`**（内含 **`smoke_behavior_ingest.sh`**）做 **I1** 平台健康 + ingest + API 回归；或单独跑 **`smoke_behavior_ingest.sh`**（不等价于真机 ONNX 触发，见 §6）。
+实验室「无 ETW 真流量」时，用 **`edr-backend/scripts/smoke_i1_demo_ready.sh`**（内含 **`smoke_behavior_ingest.sh`**）做 **I1** 平台健康 + ingest + API 回归；或单独跑 **`smoke_behavior_ingest.sh`**（不等价于真机行为触发，见 §6）。
 
 ---
 
@@ -27,7 +27,7 @@
 
 | 项 | 说明 |
 |----|------|
-| **构建** | 目标机安装与 **`edr-agent`** 一致的产物（建议 **`-DEDR_WITH_ONNXRUNTIME=ON`**，并部署 **ONNX Runtime** 与 **`behavior.onnx`** 至 **`[ave].model_dir`**）。 |
+| **构建** | 目标机安装与 **`edr-agent`** 一致的产品产物；无需模型文件或 ONNX Runtime。 |
 | **身份** | **`[agent].tenant_id`** / **`endpoint_id`** 与种子一致（如 **`demo-tenant`** + **`ep-1`**）；勿用 `auto`，否则上报路径与控制台不一致。 |
 | **平台上报** | **`[platform].rest_base_url`** 指向可达的 **`…/api/v1`**；若开 RBAC，配置 **`rest_bearer_token`** 或演示权限头（见 LOCAL_STACK §7）。 |
 | **行为编码** | 联调平台 ingest 时设置 **`EDR_BEHAVIOR_ENCODING=protobuf`**（或 **`protobuf_c`**），避免批次内混 wire 导致 HTTP 解析失败（见 **`edr-backend/docs/BAT1_EVENT_INGEST.md`**）。 |
@@ -40,9 +40,9 @@
 
 1. 以**管理员**或设计文档要求的权限运行 Agent（ETW/部分采集依赖）。  
 2. 配置 **`[collection].etw_enabled=true`**（或与现场策略一致），确保有行为类事件进入预处理 → **`AVE_FeedEvent`**。  
-3. 触发可产生 **文件/网络/注册表** 等行为的操作（或红队脚本），使 **`behavior.onnx`** 有机会推理并在超阈值时 **`on_behavior_alert`**。  
-4. 等待 **gRPC 批次上报**或本地离线队列 **`[offline].queue_db_path`** 刷盘策略（视 `edr_agent` 实现与网络而定）。  
-5. **停进程前**看 stderr：应出现 **`[ave/behavior] feed=… enq=… q_full_sync=…`** 等汇总行（见 **`AVE_GetStatus`** / **`main.c`**），用于判断队列背压与推理次数。
+3. 触发可产生 **文件/网络/注册表** 等行为的操作（或红队脚本），使行为启发式达到阈值并调用 **`on_behavior_alert`**。
+4. 等待 **HTTP 批次上报**或本地离线队列 **`[offline].queue_db_path`** 刷盘策略（视 `edr_agent` 实现与网络而定）。
+5. **停进程前**看 stderr：应出现 **`[ave/behavior] feed=… enq=… q_full_sync=…`** 等汇总行（见 **`AVE_GetStatus`** / **`main.c`**），用于判断队列背压与告警次数。
 
 ---
 
@@ -70,7 +70,7 @@ curl -fsS -H "X-Tenant-ID: demo-tenant" -H "X-User-ID: demo-user" \
 
 ---
 
-## 6. 实验室替代（验证平台链路与 BAT1，非 ONNX 真触发）
+## 6. 实验室替代（验证平台链路与 BAT1，非真机行为触发）
 
 在 **`edr-backend`** 目录、platform 已起、DB 已灌：
 
@@ -79,7 +79,7 @@ curl -fsS -H "X-Tenant-ID: demo-tenant" -H "X-User-ID: demo-user" \
 # 或：BASE=http://<api>:8080/api/v1 EP=ep-1 PID=4242 ./edr-backend/scripts/smoke_behavior_ingest.sh
 ```
 
-该脚本用 **`edr-ingest-sample`** 生成 **BAT1 + protobuf** 负载，不经过真机 Agent ONNX。
+该脚本用 **`edr-ingest-sample`** 生成 **BAT1 + protobuf** 负载，不经过真机 Agent 行为链。
 
 ---
 
@@ -89,5 +89,5 @@ curl -fsS -H "X-Tenant-ID: demo-tenant" -H "X-User-ID: demo-user" \
 |------|------|
 | **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`** | 灌库、起 API、前端、纯 HTTP 冒烟 |
 | **`edr-backend/docs/BAT1_EVENT_INGEST.md`** | BAT1 头、protobuf、`behavior_alert` 字段 |
-| **`edr-agent/docs/BEHAVIOR_ONNX_IMPLEMENTATION_PLAN.md`** | 实施阶段与 B2 联调说明 |
-| **`edr-agent/docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`** | AVE 生命周期、`AVE_GetStatus` 与队列 metrics |
+| **`edr-agent/docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`** | AVE 生命周期、规则/IOC、`AVE_GetStatus` 与队列 metrics |
+| **`edr-agent/docs/WP9_BEHAVIOR_AVE.md`** | 行为启发式数据流与回调边界 |

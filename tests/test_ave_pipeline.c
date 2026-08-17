@@ -1,5 +1,5 @@
 /**
- * AVE_ScanFile 管线：IOC 预检关闭 + ONNX 后 IOC 二次核对；依赖 EDR_AVE_INFER_DRY_RUN。
+ * AVE_ScanFile 管线：IOC 预检关闭后，规则扫描仍会执行最终 IOC 核对。
  * （L4 命中见 tests/test_ave_suppression.c）
  */
 #include "edr/ave_sdk.h"
@@ -66,12 +66,6 @@ static int init_ioc_db(const char *path) {
 }
 
 int main(void) {
-#ifdef _WIN32
-  (void)_putenv("EDR_AVE_INFER_DRY_RUN=1");
-#else
-  (void)setenv("EDR_AVE_INFER_DRY_RUN", "1", 1);
-#endif
-
   char tdb[512], tempty[512];
   if (make_temp_path(tdb, sizeof(tdb)) != 0 || make_temp_path(tempty, sizeof(tempty)) != 0) {
     return 1;
@@ -93,7 +87,6 @@ int main(void) {
   EdrConfig cfg;
   edr_config_apply_defaults(&cfg);
   cfg.ave.cert_whitelist_enabled = false;
-  snprintf(cfg.ave.model_dir, sizeof(cfg.ave.model_dir), ".");
   snprintf(cfg.ave.ioc_db_path, sizeof(cfg.ave.ioc_db_path), "%s", tdb);
   cfg.ave.ioc_precheck_enabled = false;
 

@@ -11,7 +11,7 @@
 | [x] [AGT-002](#agt-002-事件总线与背压) | 事件总线与背压（**`event_bus.h` + README 背压观测**） | P1 | 全平台 |
 | [x] [AGT-003](#agt-003-线程模型与主循环) | 线程模型与主循环（**`docs/AGENT_THREAD_MODEL.md`**） | P2 | 全平台 |
 | [x] [AGT-004](#agt-004-api--iat-监控层) | API / IAT 监控层（**正式 descope：`docs/AGT004_API_MONITOR_DESCope.md`**） | P3 | Windows |
-| [x] [AGT-005](#agt-005-ave--onnx-联调路径) | AVE / ONNX 联调路径（**`docs/AVE_ONNX_LOCAL_STACK.md` + `scripts/onnx_local_stack_smoke.sh`**） | P1 | 全平台 |
+| [x] [AGT-005](#agt-005-ave-规则与行为启发式联调路径) | AVE 规则与行为启发式联调路径（**`docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`**） | P1 | 全平台 |
 | [x] [AGT-006](#agt-006-windows-安装与服务账户) | Windows 安装与服务账户（**`deploy/` + `docs/WINDOWS_DEPLOY.md`；MSI 见 edr-backend**） | P2 | Windows |
 | [x] [AGT-007](#agt-007-心跳与在线语义) | 心跳与在线语义（**`SOAR_CONTRACT` §4.1 终端 + §4.2 平台契约**；**后端实现见 §4.2.3**） | P2 | 全平台 |
 | [x] [AGT-008](#agt-008-soar--reportcommandresult) | SOAR / ReportCommandResult（**终端已调用；`SOAR_CONTRACT` §5 平台/mock 说明**） | P1 | 全平台 |
@@ -59,12 +59,12 @@
 
 ---
 
-### AGT-005 AVE / ONNX 联调路径
+### AGT-005 AVE 规则与行为启发式联调路径
 
-- **目标**：缩短「第一次能跑真推理」路径：`EDR_WITH_ONNXRUNTIME`、模型目录、`agent.toml.example` 与 `LOCAL_STACK_INTEGRATION` 对齐；CI 可选 job 或文档化的一键命令。
-- **交付物**：README + 示例配置 +（可选）脚本。
-- **验收**：按文档步骤可在本仓库联调栈上完成一次 `ave_infer` 或等效 RPC 验证。
-- **状态（已关闭 AGT-005）**：**`docs/AVE_ONNX_LOCAL_STACK.md`**（CMake、`ONNXRUNTIME_ROOT`、`test_ave_infer` 与 **`EDR_AVE_INFER_DRY_RUN`**）；**`scripts/onnx_local_stack_smoke.sh`**；README CMake 表与 **`LOCAL_STACK_INTEGRATION`** 互链；**`test_ave_infer`** 仅在未设置 **`EDR_AVE_INFER_DRY_RUN`** 时默认 dry-run，便于真 ONNX 覆盖。
+- **目标**：缩短“规则、IOC、证书信任和行为启发式”在真实端点的验证路径，使 `agent.toml.example`、`LOCAL_STACK_INTEGRATION` 与发布构建保持一致。
+- **交付物**：README、示例配置、CTest 与端到端验证说明。
+- **验收**：按文档步骤可在本仓库联调栈上完成一次 `ave_infer` 规则扫描或等效指令验证。
+- **状态（已关闭 AGT-005）**：端点模型与联邦训练功能已退役；现行说明为 **`docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`**、**`docs/WP9_BEHAVIOR_AVE.md`** 和 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**，并由标准 CTest 与 Windows 生命周期验证覆盖。
 
 ---
 
@@ -183,7 +183,7 @@
 
 **可选 / 分项联调**
 
-- [ ] **AVE / ONNX**：**`docs/AVE_ONNX_LOCAL_STACK.md`**、**`EDR_AVE_INFER_DRY_RUN`**。
+- [x] **AVE 规则与行为启发式**：现行说明见 **`docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`**。
 - [x] **取证 / UploadFile**：步骤见 **`docs/AGT009_FORENSIC_UPLOAD_E2E.md`**；**`forensic`** 完成后 **`UploadFile`**（**`EDR_FORENSIC_UPLOAD`**，**`command_stub.c`**）。
 - [x] **P2 Shellcode / SOAR**：**`SOAR_CONTRACT` §5.3**；**WinDivert PCAP** 根路径（**`windivert_capture.c`** + **`EDR_FORENSIC_OUT\\shellcode`** 回退）。
 - [ ] **Windows 部署**：**`docs/WINDOWS_DEPLOY.md`** 预检；Shellcode/WinDivert 需驱动与权限。

@@ -147,8 +147,8 @@ Windows headless 安装完成后会在 `%ProgramFiles%\FDSecurity` 写入原生 
 
 ## 5. 与 edr-backend 安装包的关系
 
-- **当前 CI / Inno 发布流程**（根目录 **`publish-windows-setup-exe.yml`**、本仓库 **`edr-agent-client-release.yml` Windows job**）：**vcpkg**（`edr-agent/vcpkg.json` → **`grpc`**，`x64-windows-static-md`）+ **`cmake -DEDR_WITH_GRPC=ON -DEDR_WITH_ONNXRUNTIME=ON`**；CI 下载官方 **`onnxruntime-win-x64-1.17.3`** 并设 **`ONNXRUNTIME_ROOT`**，构建后将 **`onnxruntime.dll`**（及若存在的 **`onnxruntime_providers_shared.dll`**）复制到 **`build\Release\`**，由 **`EDRAgentSetup.iss`** 与 **`edr_agent.exe`** 同目录安装。配置好 **`[server]`** 时 **`grpc_ready` 可为 1**；`models` 下有合法 ONNX 且 ORT 加载成功时 **`[heartbeat]`** 中 **`onnx_static_ready` / `onnx_behavior_ready` 可为 1**。
-- **AVE `models` 目录**：发布前运行 **`scripts/sync_onnx_output_to_models.ps1`**（或 `.sh`），将 **`onnx-output/*.onnx`** 复制到 **`models/`** 后打包。本机自编译带 ORT 时，亦需将上述 DLL 放在 **`edr_agent.exe` 同目录**（与 Inno 约定一致）。
+- **当前 CI / Inno 发布流程**：Windows Release 使用固定 VS2022、vcpkg 清单依赖和标准 CMake 产品构建；终端通信统一为 HTTPS HTTP/2 控制与上报。安装包不包含 gRPC 客户端、ONNX Runtime、模型 DLL 或端侧模型文件。
+- **AVE 发布边界**：规则、IOC、证书信任、租户抑制与行为启发式都编译入 `FDSensor.exe`；无需 `models/` 目录或额外模型运行时。
 - **路径约定**：Windows 运行时配置、证书、模型、队列、日志、取证缓存、隔离状态与 outbox 均固定在 **`%ProgramFiles%\EDR Agent`**；检测规则/测试样本中出现的 `ProgramData` 仅代表被检测对象路径，勿作为 Agent 自身存储目录。
 - 平台下发的 zip 可能内含 **同一套** `edr_agent_install.ps1`；**服务注册** 可在 **首次运行向导** 或 **单独 GPO 脚本** 中完成。
 - **24h 下载链接、安装包哈希** 等以 **edr-backend** 文档为准。

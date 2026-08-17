@@ -1,5 +1,5 @@
 /**
- * P2：MPMC 无锁入队 + 单消费线程 + PID 状态；behavior.onnx 就绪时以模型分替代启发式 bump。
+ * MPMC 无锁入队 + 单消费线程 + PID 状态；行为分数由本地启发式计算。
  */
 
 #include "ave_behavior_pipeline.h"
@@ -11,8 +11,6 @@
 #include "edr/resource.h"
 
 #include "ave_lf_mpmc.h"
-#include "ave_onnx_infer.h"
-
 #include "edr/config.h"
 
 #include <ctype.h>
@@ -30,11 +28,6 @@
 #include <windows.h>
 #endif
 
-/** 《11》§6.1 最大展平元素数；热路径 ORT 输入缓冲（T04） */
-#define AVE_BP_ORT_NELEM_MAX (EDR_PID_HISTORY_MAX_SEQ * EDR_PID_HISTORY_FEAT_DIM)
-
-static float s_bp_ort_scratch[AVE_BP_ORT_NELEM_MAX];
-
 #ifdef _WIN32
 typedef volatile LONG64 EdrBpMetric64;
 static void bp_metric_store(EdrBpMetric64 *p, uint64_t v) { (void)InterlockedExchange64(p, (LONG64)v); }
@@ -47,44 +40,22 @@ static uint64_t bp_metric_inc(EdrBpMetric64 *p) { return __atomic_add_fetch(p, 1
 static uint64_t bp_metric_load(EdrBpMetric64 *p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }
 #endif
 
-static EdrBpMetric64 s_bp_beh_infer_ok;
-static EdrBpMetric64 s_bp_beh_infer_fail;
 static EdrBpMetric64 s_bp_feed_total;
 static EdrBpMetric64 s_bp_queue_enqueued;
 static EdrBpMetric64 s_bp_queue_full_fallback;
 static EdrBpMetric64 s_bp_queue_full_dropped;
 static EdrBpMetric64 s_bp_feed_sync_bypass;
 static EdrBpMetric64 s_bp_worker_dequeued;
-static EdrBpMetric64 s_bp_infer_budget_dropped;
 static EdrBpMetric64 s_bp_pressure_feed_dropped;
-static EdrBpMetric64 s_bp_pressure_infer_dropped;
-static uint32_t s_bp_behavior_infer_per_min;
-static uint32_t s_bp_low_priority_keep_percent_under_pressure;
-static int64_t s_bp_infer_budget_window_ns;
-static uint32_t s_bp_infer_budget_count;
-static uint32_t s_bp_infer_latency_ms[64];
-static uint32_t s_bp_infer_latency_pos;
-static uint32_t s_bp_infer_latency_count;
-static uint32_t s_bp_infer_latency_last_ms;
 
 static void bp_reset_metrics(void) {
-  bp_metric_store(&s_bp_beh_infer_ok, 0u);
-  bp_metric_store(&s_bp_beh_infer_fail, 0u);
   bp_metric_store(&s_bp_feed_total, 0u);
   bp_metric_store(&s_bp_queue_enqueued, 0u);
   bp_metric_store(&s_bp_queue_full_fallback, 0u);
   bp_metric_store(&s_bp_queue_full_dropped, 0u);
   bp_metric_store(&s_bp_feed_sync_bypass, 0u);
   bp_metric_store(&s_bp_worker_dequeued, 0u);
-  bp_metric_store(&s_bp_infer_budget_dropped, 0u);
   bp_metric_store(&s_bp_pressure_feed_dropped, 0u);
-  bp_metric_store(&s_bp_pressure_infer_dropped, 0u);
-  s_bp_infer_budget_window_ns = 0;
-  s_bp_infer_budget_count = 0u;
-  s_bp_infer_latency_pos = 0u;
-  s_bp_infer_latency_count = 0u;
-  s_bp_infer_latency_last_ms = 0u;
-  memset(s_bp_infer_latency_ms, 0, sizeof(s_bp_infer_latency_ms));
 }
 
 static int bp_str_has_ci(const char *hay, const char *needle);
@@ -307,85 +278,6 @@ static float bp_ransom_counter_score(const EdrPidHistory *sl, const AVEBehaviorE
   return s;
 }
 
-/**
- * 若设置了 **EDR_AVE_BEH_INFER_MIN_EVENTS**，则仅使用该 legacy 阈值（与旧版「每 N 事件推理」一致），
- * **不**再套用《11》§7.1 的立即触发与 16/8 步长。
- * @return 非 0 表示已设置且写入 *out_min*
- */
-static int env_infer_min_events_explicit(uint32_t *out_min) {
-  const char *e = getenv("EDR_AVE_BEH_INFER_MIN_EVENTS");
-  if (!e || !e[0]) {
-    return 0;
-  }
-  char *end = NULL;
-  unsigned long v = strtoul(e, &end, 10);
-  if (end == e || v < 1ul) {
-    *out_min = 1u;
-    return 1;
-  }
-  if (v > 10000ul) {
-    *out_min = 10000u;
-    return 1;
-  }
-  *out_min = (uint32_t)v;
-  return 1;
-}
-
-/** 《11》§7.1：P0 立即触发 ORT（与 `events_since_last_inference` 无关，阈值取 1） */
-static int bp_infer_immediate(const AVEBehaviorEvent *e) {
-  if (!e) {
-    return 0;
-  }
-  if (e->event_type == AVE_EVT_PROCESS_INJECT || e->event_type == AVE_EVT_MEM_ALLOC_EXEC ||
-      e->event_type == AVE_EVT_LSASS_ACCESS) {
-    return 1;
-  }
-  if (e->event_type == AVE_EVT_SHELLCODE_SIGNAL || e->event_type == AVE_EVT_PMFE_RESULT ||
-      e->event_type == AVE_EVT_WEBSHELL_SIGNAL) {
-    return 1;
-  }
-  if (e->ioc_ip_hit || e->ioc_domain_hit) {
-    return 1;
-  }
-  const uint32_t nx = (uint32_t)(AVE_BEH_INJECT_LSASS | AVE_BEH_ALLOC_EXEC_REMOTE | AVE_BEH_MODULE_STOMP |
-                                 AVE_BEH_HOLLOW_PROCESS | AVE_BEH_REFLECTIVE_LOAD | AVE_BEH_LSASS_DUMP |
-                                 AVE_BEH_NTDS_ACCESS | AVE_BEH_SAM_DUMP | AVE_BEH_DNS_TUNNEL);
-  if (e->behavior_flags & nx) {
-    return 1;
-  }
-  return 0;
-}
-
-static int env_dynamic_threshold_enabled(void) {
-  const char *e = getenv("EDR_AVE_BEH_DYNAMIC_THRESHOLD");
-  if (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) {
-    return 0;
-  }
-  return 1;  // 默认启用
-}
-
-static uint32_t bp_infer_events_threshold_design7(const AVEBehaviorEvent *e, const EdrPidHistory *sl) {
-  if (bp_infer_immediate(e)) {
-    return 1u;
-  }
-  uint32_t step = EDR_AVE_BEH_INFER_STEP_DEFAULT;
-  if (sl->consecutive_medium_scores >= EDR_AVE_BEH_MEDIUM_RUN_LEN_FOR_STEP_TIGHT) {
-    step = EDR_AVE_BEH_INFER_STEP_TIGHT;
-  }
-
-  // 动态调整：根据当前异常分数调整阈值（性能优化）
-  if (env_dynamic_threshold_enabled()) {
-    if (sl->anomaly < 0.1f) {
-      return step * 2;  // 低风险，降低推理频率
-    } else if (sl->anomaly > 0.7f) {
-      // 高风险，提高推理频率
-      return (step > 1) ? (step / 2) : step;
-    }
-  }
-
-  return step;
-}
-
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -503,97 +395,13 @@ static int64_t wall_ns(void) {
 }
 
 void edr_ave_bp_configure_resource_limits(const struct EdrConfig *cfg) {
-  uint32_t v = cfg ? cfg->resource_limit.behavior_infer_per_min : 30u;
-  uint32_t keep = cfg ? cfg->resource_limit.low_priority_keep_percent_under_pressure : 5u;
-  if (keep > 100u) {
-    keep = 100u;
-  }
-  lock_bp();
-  s_bp_behavior_infer_per_min = v;
-  s_bp_low_priority_keep_percent_under_pressure = keep;
-  unlock_bp();
+  /* The public hook remains so remote policy reloads stay ABI compatible.
+   * Model-inference budgets were retired with endpoint ONNX execution. */
+  (void)cfg;
 }
 
 static int bp_pressure_active(void) {
   return edr_resource_preprocess_throttle_active() ? 1 : 0;
-}
-
-static uint32_t bp_effective_behavior_infer_limit(void) {
-  uint32_t limit = s_bp_behavior_infer_per_min;
-  if (limit == 0u || !bp_pressure_active()) {
-    return limit;
-  }
-  uint32_t keep = s_bp_low_priority_keep_percent_under_pressure;
-  if (keep == 0u) {
-    return 0u;
-  }
-  uint64_t scaled = ((uint64_t)limit * (uint64_t)keep + 99ULL) / 100ULL;
-  if (scaled == 0u) {
-    scaled = 1u;
-  }
-  return scaled > 0xffffffffULL ? 0xffffffffu : (uint32_t)scaled;
-}
-
-static int bp_behavior_infer_budget_allow(int64_t now_ns) {
-  uint32_t configured = s_bp_behavior_infer_per_min;
-  uint32_t limit = bp_effective_behavior_infer_limit();
-  if (limit == 0u) {
-    (void)bp_metric_inc(&s_bp_infer_budget_dropped);
-    if (configured > 0u && bp_pressure_active()) {
-      (void)bp_metric_inc(&s_bp_pressure_infer_dropped);
-    }
-    return 0;
-  }
-  if (s_bp_infer_budget_window_ns == 0 || now_ns < s_bp_infer_budget_window_ns ||
-      now_ns - s_bp_infer_budget_window_ns >= 60000000000LL) {
-    s_bp_infer_budget_window_ns = now_ns;
-    s_bp_infer_budget_count = 0u;
-  }
-  if (s_bp_infer_budget_count >= limit) {
-    (void)bp_metric_inc(&s_bp_infer_budget_dropped);
-    if (limit < configured && bp_pressure_active()) {
-      (void)bp_metric_inc(&s_bp_pressure_infer_dropped);
-    }
-    return 0;
-  }
-  s_bp_infer_budget_count++;
-  return 1;
-}
-
-static void bp_record_infer_latency_ms(uint32_t ms) {
-  s_bp_infer_latency_last_ms = ms;
-  s_bp_infer_latency_ms[s_bp_infer_latency_pos++ % 64u] = ms;
-  if (s_bp_infer_latency_count < 64u) {
-    s_bp_infer_latency_count++;
-  }
-}
-
-static uint32_t bp_latency_p95_ms(void) {
-  uint32_t n = s_bp_infer_latency_count;
-  if (n == 0u) {
-    return 0u;
-  }
-  uint32_t tmp[64];
-  for (uint32_t i = 0; i < n; i++) {
-    tmp[i] = s_bp_infer_latency_ms[i];
-  }
-  for (uint32_t i = 1; i < n; i++) {
-    uint32_t v = tmp[i];
-    uint32_t j = i;
-    while (j > 0u && tmp[j - 1u] > v) {
-      tmp[j] = tmp[j - 1u];
-      j--;
-    }
-    tmp[j] = v;
-  }
-  uint32_t idx = (uint32_t)(((uint64_t)n * 95u + 99u) / 100u);
-  if (idx == 0u) {
-    idx = 1u;
-  }
-  if (idx > n) {
-    idx = n;
-  }
-  return tmp[idx - 1u];
 }
 
 static int bp_event_high_value_under_pressure(const AVEBehaviorEvent *event) {
@@ -629,13 +437,6 @@ static int popcount_u32(uint32_t x) {
     x &= x - 1u;
   }
   return n;
-}
-
-static float score_to_unit(float s) {
-  if (s >= 0.f && s <= 1.f) {
-    return s;
-  }
-  return 1.f / (1.f + expf(-s));
 }
 
 static uint32_t bp_hash_str(const char *s) {
@@ -716,12 +517,6 @@ static float bp_clamp01f(float x) {
 
 static void ph_append_feat(EdrPidHistory *ph, const float *f64) {
   size_t cap = (size_t)EDR_PID_HISTORY_MAX_SEQ;
-  if (edr_onnx_behavior_ready()) {
-    size_t m = edr_onnx_behavior_input_seq_len();
-    if (m > 0u && m < cap) {
-      cap = m;
-    }
-  }
   if (ph->feat_len < cap) {
     memcpy(ph->feat_chrono[ph->feat_len], f64, EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
     ph->feat_len++;
@@ -729,34 +524,6 @@ static void ph_append_feat(EdrPidHistory *ph, const float *f64) {
     memmove(ph->feat_chrono[0], ph->feat_chrono[1], (cap - 1u) * EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
     memcpy(ph->feat_chrono[cap - 1u], f64, EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
     ph->feat_len = (uint32_t)cap;
-  }
-}
-
-static void ph_build_ort_input(const EdrPidHistory *ph, float *out, size_t nelem) {
-  memset(out, 0, nelem * sizeof(float));
-  size_t seq = edr_onnx_behavior_input_seq_len();
-  if (seq > (size_t)EDR_PID_HISTORY_MAX_SEQ) {
-    seq = (size_t)EDR_PID_HISTORY_MAX_SEQ;
-  }
-  if (nelem == (size_t)EDR_PID_HISTORY_FEAT_DIM) {
-    if (ph->feat_len == 0u) {
-      memset(out, 0, EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
-      return;
-    }
-    memcpy(out, ph->feat_chrono[ph->feat_len - 1u], EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
-    return;
-  }
-  if (seq > 0u && nelem == seq * (size_t)EDR_PID_HISTORY_FEAT_DIM) {
-    size_t pad = (ph->feat_len < seq) ? (seq - ph->feat_len) : 0u;
-    /* 《11》§5.6 PAD：每步 64 维全 0（含维 57 is_real_event=0），与 encode_e_group 中真实步 feat[57]=1 对偶。 */
-    for (size_t i = 0; i < pad; i++) {
-      memset(out + i * (size_t)EDR_PID_HISTORY_FEAT_DIM, 0, (size_t)EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
-    }
-    for (size_t i = 0; i < ph->feat_len && i < seq; i++) {
-      memcpy(out + (pad + i) * (size_t)EDR_PID_HISTORY_FEAT_DIM, ph->feat_chrono[i],
-             (size_t)EDR_PID_HISTORY_FEAT_DIM * sizeof(float));
-    }
-    return;
   }
 }
 
@@ -800,32 +567,6 @@ static void fill_pid_snapshot(const EdrPidHistory *sl, const AVEBehaviorEvent *e
   out->events_last_5min = n5;
   out->is_first_event_of_proc = (ec_prev == 0u) ? 1 : 0;
   out->events_after_net_connect = sl->events_after_net_connect;
-}
-
-/** 与设计 §6.3 MITRE 战术维度顺序一致（14）。 */
-static const char *k_tactic_label[14] = {
-    "Initial Access",      "Execution",           "Persistence",          "Privilege Escalation",
-    "Defense Evasion",     "Credential Access",   "Discovery",          "Lateral Movement",
-    "Collection",          "Exfiltration",        "Command and Control", "Impact",
-    "Resource Development", "Reconnaissance",
-};
-
-static void fill_triggered_tactics(const float tactic_probs[14], char *buf, size_t cap) {
-  if (!buf || cap == 0u) {
-    return;
-  }
-  buf[0] = '\0';
-  size_t pos = 0u;
-  for (int i = 0; i < 14; i++) {
-    if (tactic_probs[i] <= 0.50f) {
-      continue;
-    }
-    int w = snprintf(buf + pos, cap > pos ? cap - pos : 0, "%s%s", pos > 0u ? ", " : "", k_tactic_label[i]);
-    if (w < 0 || (size_t)w >= cap - pos) {
-      break;
-    }
-    pos += (size_t)w;
-  }
 }
 
 static void build_behavior_features(const AVEBehaviorEvent *e, const EdrAveBehaviorFeatExtra *ex,
@@ -1164,69 +905,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
 
   float last_tactic_probs[14];
   memset(last_tactic_probs, 0, sizeof(last_tactic_probs));
-  if (edr_onnx_behavior_ready()) {
-    size_t need = edr_onnx_behavior_input_nelem();
-    uint32_t min_ev;
-    if (env_infer_min_events_explicit(&min_ev)) {
-      /* legacy：显式 EDR_AVE_BEH_INFER_MIN_EVENTS */
-    } else {
-      /* 《11》§7.1：立即触发 或 步长 16/8（由连续中等分计数收紧） */
-      min_ev = bp_infer_events_threshold_design7(e, sl);
-    }
-    /* 序列张量：避免仅 PAD 步即推理；legacy 下仍可将环境变量调到 ≥4 */
-    if (need > (size_t)EDR_PID_HISTORY_FEAT_DIM && min_ev < 4u) {
-      min_ev = 4u;
-    }
-    if (need > 0u && need <= 1024u * 1024u && sl->events_since_last_inference >= min_ev) {
-      if (!bp_behavior_infer_budget_allow(now)) {
-        sl->events_since_last_inference = 0u;
-        goto behavior_infer_done;
-      }
-      float *ort_in = NULL;
-      int use_stack = (need <= (size_t)AVE_BP_ORT_NELEM_MAX) ? 1 : 0;
-      if (use_stack) {
-        ort_in = s_bp_ort_scratch;
-      } else {
-        ort_in = (float *)malloc(need * sizeof(float));
-      }
-      if (ort_in) {
-        ph_build_ort_input(sl, ort_in, need);
-        float raw = 0.f;
-        int64_t infer_t0 = wall_ns();
-        if (edr_onnx_behavior_infer(ort_in, need, &raw, last_tactic_probs) == EDR_OK) {
-          int64_t infer_t1 = wall_ns();
-          uint32_t ms = (infer_t1 > infer_t0) ? (uint32_t)((infer_t1 - infer_t0) / 1000000LL) : 0u;
-          bp_record_infer_latency_ms(ms);
-          float u = score_to_unit(raw);
-          sl->anomaly = fminf(1.f, 0.35f * sl->anomaly + 0.65f * u);
-          sl->last_anomaly_score = u;
-          sl->last_inference_ts = (uint64_t)now;
-          sl->events_since_last_inference = 0u;
-          if (u >= EDR_AVE_BEH_SCORE_MEDIUM_LOW && u < EDR_AVE_BEH_SCORE_HIGH &&
-              sl->consecutive_medium_scores < 255u) {
-            sl->consecutive_medium_scores++;
-          } else {
-            sl->consecutive_medium_scores = 0u;
-          }
-          (void)bp_metric_inc(&s_bp_beh_infer_ok);
-        } else {
-          int64_t infer_t1 = wall_ns();
-          uint32_t ms = (infer_t1 > infer_t0) ? (uint32_t)((infer_t1 - infer_t0) / 1000000LL) : 0u;
-          bp_record_infer_latency_ms(ms);
-          uint64_t nf = bp_metric_inc(&s_bp_beh_infer_fail);
-          if ((nf & 63u) == 0u) {
-            fprintf(stderr, "[ave/bp] behavior onnx infer failures (count=%llu)\n",
-                    (unsigned long long)nf);
-          }
-        }
-        if (!use_stack) {
-          free(ort_in);
-        }
-      }
-    }
-behavior_infer_done:
-    ;
-  } else {
+  {
     float sev = (float)e->severity_hint / 255.0f;
     float bump = sev * 0.12f + (float)popcount_u32(e->behavior_flags) * 0.04f;
     if (e->event_type == AVE_EVT_LSASS_ACCESS || e->event_type == AVE_EVT_MEM_ALLOC_EXEC) {
@@ -1236,7 +915,6 @@ behavior_infer_done:
   }
 
   int fire = 0;
-  int onnx_ready = edr_onnx_behavior_ready();
   if (s_callbacks_set && s_callbacks.on_behavior_alert && sl->anomaly >= AVE_BP_ALERT_THRESH &&
       (sl->last_alert_ns == 0 || now - sl->last_alert_ns >= AVE_BP_ALERT_COOLDOWN_NS)) {
     fire = 1;
@@ -1296,15 +974,9 @@ behavior_infer_done:
     snprintf(al.cmdline, sizeof(al.cmdline), "%s", ev_cmdline);
     al.anomaly_score = an_copy;
     memcpy(al.tactic_probs, tactic_copy, sizeof(al.tactic_probs));
-    if (!onnx_ready) {
-      al.triggered_tactics[0] = '\0';
-      al.skip_ai_analysis = true;
-      al.needs_l2_review = true;
-    } else {
-      fill_triggered_tactics(tactic_copy, al.triggered_tactics, sizeof(al.triggered_tactics));
-      al.needs_l2_review = true;
-      al.skip_ai_analysis = false;
-    }
+    al.triggered_tactics[0] = '\0';
+    al.skip_ai_analysis = true;
+    al.needs_l2_review = true;
     al.behavior_flags = (AVEBehaviorFlags)fl_copy;
     al.timestamp_ns = now;
     if (sl_proc_name[0] && strncmp(sl_proc_name, "pid:", 4) != 0) {
@@ -1405,8 +1077,6 @@ void edr_ave_bp_init(void) {
   bp_hist_free();
   memset(&s_callbacks, 0, sizeof(s_callbacks));
   s_callbacks_set = 0;
-  s_bp_behavior_infer_per_min = 30u;
-  s_bp_low_priority_keep_percent_under_pressure = 5u;
   bp_reset_metrics();
 }
 
@@ -1615,15 +1285,15 @@ void edr_ave_bp_fill_metrics(AVEStatus *status_out) {
   status_out->behavior_queue_full_dropped = bp_metric_load(&s_bp_queue_full_dropped);
   status_out->behavior_feed_sync_bypass = bp_metric_load(&s_bp_feed_sync_bypass);
   status_out->behavior_worker_dequeued = bp_metric_load(&s_bp_worker_dequeued);
-  status_out->behavior_infer_ok = bp_metric_load(&s_bp_beh_infer_ok);
-  status_out->behavior_infer_fail = bp_metric_load(&s_bp_beh_infer_fail);
-  status_out->behavior_infer_budget_dropped = bp_metric_load(&s_bp_infer_budget_dropped);
+  status_out->behavior_infer_ok = 0u;
+  status_out->behavior_infer_fail = 0u;
+  status_out->behavior_infer_budget_dropped = 0u;
   status_out->behavior_pressure_feed_dropped = bp_metric_load(&s_bp_pressure_feed_dropped);
-  status_out->behavior_pressure_infer_dropped = bp_metric_load(&s_bp_pressure_infer_dropped);
-  status_out->behavior_infer_budget_per_min = s_bp_behavior_infer_per_min;
-  status_out->behavior_infer_effective_budget_per_min = bp_effective_behavior_infer_limit();
-  status_out->behavior_infer_latency_last_ms = s_bp_infer_latency_last_ms;
-  status_out->behavior_infer_latency_p95_ms = bp_latency_p95_ms();
+  status_out->behavior_pressure_infer_dropped = 0u;
+  status_out->behavior_infer_budget_per_min = 0u;
+  status_out->behavior_infer_effective_budget_per_min = 0u;
+  status_out->behavior_infer_latency_last_ms = 0u;
+  status_out->behavior_infer_latency_p95_ms = 0u;
   status_out->behavior_pressure_active = bp_pressure_active() ? 1u : 0u;
   status_out->behavior_queue_capacity = edr_ave_bp_queue_capacity();
   status_out->behavior_pid_history_used = hist_used;

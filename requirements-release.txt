@@ -1,0 +1,6 @@
+# This tool only prepares architecture-independent P0 rule artifacts.  CI always
+# runs it with the x64 CPython interpreter, including on the Windows ARM64 host,
+# because upstream does not publish a compatible native Windows ARM64 wheel for
+# this pinned cryptography release.  `--only-binary=:all:` in the workflows
+# makes any attempted source build a hard, early failure.
+cryptography==44.0.3

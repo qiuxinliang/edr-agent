@@ -1,5 +1,5 @@
 /**
- * 《11》behavior.onnx 64 维特征编码 — M3a（8–43 占位）/ M3b（§5.1–5.5 管线用完整 B/C/D）。
+ * 《11》行为启发式 64 维特征编码 — M3a（8–43 占位）/ M3b（§5.1–5.5 管线用完整 B/C/D）。
  */
 #ifndef EDR_AVE_BEHAVIOR_FEATURES_H
 #define EDR_AVE_BEHAVIOR_FEATURES_H

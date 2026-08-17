@@ -22,7 +22,7 @@ typedef struct EdrAveTenantNoiseDecision {
   int observe_only;
 } EdrAveTenantNoiseDecision;
 
-/** @return 1 命中白名单（应跳过 ONNX），0 未命中或不可用 */
+/** @return 1 命中白名单（应结束静态扫描），0 未命中或不可用 */
 int edr_ave_file_hash_whitelist_hit(const struct EdrConfig *cfg, const char sha256_hex[65]);
 
 /**
@@ -64,7 +64,7 @@ int edr_ave_gray_eval_record(const struct EdrConfig *cfg, const char *tenant_id,
                              const char *policy_version, const char *rule_name, float raw_confidence,
                              float adjusted_confidence, const char *decision, const char *shadow_verdict);
 
-/** ONNX 之后：若 IOC 命中，将 final_* 置为 IOC_CONFIRMED，保留 raw_ai_* */
+/** 静态规则阶段后：若 IOC 命中，将 final_* 置为 IOC_CONFIRMED。 */
 void edr_ave_overlay_ioc_post_ai(struct AVEScanResult *out, int severity);
 
 /**

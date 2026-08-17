@@ -1,5 +1,5 @@
 /**
- * 《11》§5：behavior.onnx 64 维特征 — M3a（回归占位）/ M3b（§5.2–5.4 + C 组启发式）。
+ * 《11》§5：行为启发式 64 维特征 — M3a（回归占位）/ M3b（§5.2–5.4 + C 组启发式）。
  */
 #include "edr/ave_behavior_features.h"
 

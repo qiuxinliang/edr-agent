@@ -23,7 +23,6 @@ inject_feedback_enabled = true
 cpu_limit_percent = 12
 memory_limit_mb = 512
 emergency_cpu_limit = 40
-behavior_infer_per_min = 20
 pmfe_scans_per_min = 4
 
 # Runtime environment used by the Linux service:

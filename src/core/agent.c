@@ -22,10 +22,6 @@
 #include "edr/shellcode_known.h"
 #include "edr/time_util.h"
 
-#if defined(EDR_WITH_FL_TRAINER)
-#include "edr/fl_trainer.h"
-#endif
-
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
 #include "edr/command.h"
@@ -881,7 +877,6 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "\n[resource_limit]\n");
   fprintf(fp, "cpu_limit_percent = %u\n", cfg->resource_limit.cpu_limit_percent);
   fprintf(fp, "memory_limit_mb = %u\n", cfg->resource_limit.memory_limit_mb);
-  fprintf(fp, "behavior_infer_per_min = %u\n", cfg->resource_limit.behavior_infer_per_min);
   fprintf(fp, "pmfe_scans_per_min = %u\n", cfg->resource_limit.pmfe_scans_per_min);
   fprintf(fp, "\n[health_monitor]\n");
   fprintf(fp, "enabled = %s\n", cfg->health_monitor.enabled ? "true" : "false");
@@ -904,8 +899,6 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "collect_process_tree = %s\n", cfg->forensic_auto.collect_process_tree ? "true" : "false");
   fprintf(fp, "\n[ave]\n");
   fprintf(fp, "enabled = %s\n", cfg->ave.enabled ? "true" : "false");
-  edr_agent_write_toml_string(fp, "model_dir", cfg->ave.model_dir);
-  fprintf(fp, "static_model_enabled = %s\n", cfg->ave.static_model_enabled ? "true" : "false");
   fprintf(fp, "behavior_monitor_enabled = %s\n", cfg->ave.behavior_monitor_enabled ? "true" : "false");
   fprintf(fp, "\n[attack_surface]\n");
   fprintf(fp, "enabled = %s\n", cfg->attack_surface.enabled ? "true" : "false");
@@ -931,8 +924,6 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   fprintf(fp, "\n[webshell_detector]\n");
   fprintf(fp, "enabled = %s\n", cfg->webshell_detector.enabled ? "true" : "false");
   edr_agent_write_toml_string(fp, "roots", cfg->webshell_detector.roots);
-  fprintf(fp, "\n[fl]\n");
-  fprintf(fp, "enabled = %s\n", cfg->fl.enabled ? "true" : "false");
   fclose(fp);
 
   memset(&check, 0, sizeof(check));
@@ -963,7 +954,6 @@ static void edr_agent_apply_config_recovery_safe_mode(EdrConfig *cfg) {
   cfg->collection.max_event_queue_size = 512u;
   cfg->collection.adaptive_enabled = false;
   cfg->ave.enabled = false;
-  cfg->ave.static_model_enabled = false;
   cfg->ave.behavior_monitor_enabled = false;
   cfg->command.allow_dangerous = false;
   cfg->command.allow_rtq_readonly = true;
@@ -972,11 +962,8 @@ static void edr_agent_apply_config_recovery_safe_mode(EdrConfig *cfg) {
   cfg->attack_surface.enabled = false;
   cfg->shellcode_detector.enabled = false;
   cfg->webshell_detector.enabled = false;
-  cfg->fl.enabled = false;
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
-  cfg->resource_limit.ave_infer_per_min = 0u;
-  cfg->resource_limit.behavior_infer_per_min = 0u;
   cfg->resource_limit.pmfe_scans_per_min = 0u;
   cfg->resource_limit.webshell_scan_mb_per_min = 0u;
   cfg->resource_limit.shellcode_packets_per_sec = 0u;
@@ -1299,10 +1286,7 @@ static void edr_agent_register_ave_behavior_callbacks(EdrAgent *agent) {
     AVEStatus st;
     memset(&st, 0, sizeof(st));
     (void)AVE_GetStatus(&st);
-    fprintf(stderr,
-            "[ave] behavior_monitor=0 static_model=%s behavior_model=%s l4_th=%.2f\n",
-            st.static_model_version,
-            st.behavior_model_version,
+    fprintf(stderr, "[ave] behavior_monitor=0 mode=rules_and_heuristics l4_th=%.2f\n",
             agent ? (double)agent->cfg.ave.l4_realtime_anomaly_threshold : 0.0);
     return;
   }
@@ -1323,13 +1307,8 @@ static void edr_agent_register_ave_behavior_callbacks(EdrAgent *agent) {
   AVEStatus st;
   memset(&st, 0, sizeof(st));
   (void)AVE_GetStatus(&st);
-  fprintf(stderr,
-          "[ave] on_behavior_alert=1 behavior_monitor=%d model_dir=%s "
-          "static_model=%s behavior_model=%s l4_th=%.2f\n",
+  fprintf(stderr, "[ave] on_behavior_alert=1 behavior_monitor=%d mode=rules_and_heuristics l4_th=%.2f\n",
           st.behavior_monitor_running ? 1 : 0,
-          agent ? agent->cfg.ave.model_dir : "",
-          st.static_model_version,
-          st.behavior_model_version,
           agent ? (double)agent->cfg.ave.l4_realtime_anomaly_threshold : 0.0);
 }
 
@@ -1368,9 +1347,6 @@ void edr_agent_destroy(EdrAgent *agent) {
   edr_preprocess_stop();
   edr_self_protect_shutdown();
   edr_resource_shutdown();
-#if defined(EDR_WITH_FL_TRAINER)
-  FLT_Shutdown();
-#endif
   AVE_Shutdown();
   edr_event_bus_destroy(agent->event_bus);
   edr_config_free_heap(&agent->cfg);
@@ -1508,26 +1484,9 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       edr_agent_register_ave_behavior_callbacks(agent);
     }
   }
-#if defined(EDR_WITH_FL_TRAINER)
-  if (agent->cfg.fl.enabled) {
-    int fr = FLT_InitFromEdrConfig(&agent->cfg);
-    if (fr != FLT_OK) {
-      fprintf(stderr, "[fl] FLT_InitFromEdrConfig failed: %d\n", fr);
-    } else {
-      fr = FLT_Start();
-      if (fr != FLT_OK) {
-        fprintf(stderr, "[fl] FLT_Start failed: %d\n", fr);
-        FLT_Shutdown();
-      }
-    }
-  }
-#endif
   agent->event_bus =
       edr_event_bus_create(agent->cfg.collection.max_event_queue_size);
   if (!agent->event_bus) {
-#if defined(EDR_WITH_FL_TRAINER)
-    FLT_Shutdown();
-#endif
     AVE_Shutdown();
     edr_resource_shutdown();
     edr_self_protect_shutdown();
@@ -1615,11 +1574,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                        yara_rules_error, sizeof(yara_rules_error));
   const char *yara_runtime = !yara_build ? "unavailable"
                                : yara_rules_ready ? "healthy" : "degraded";
-#ifdef EDR_HAVE_ONNXRUNTIME
-  const int ort_build = 1;
-#else
   const int ort_build = 0;
-#endif
 #ifdef EDR_HAVE_SQLITE
   const int sqlite_build = 1;
 #else
@@ -1661,7 +1616,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   int lifecycle_policy = windows_native && agent && agent->cfg.command.allow_lifecycle_maintenance;
   if (lifecycle_enabled_env && lifecycle_enabled_env[0] == '1') lifecycle_policy = windows_native;
   if (lifecycle_enabled_env && lifecycle_enabled_env[0] == '0') lifecycle_policy = 0;
-  int ort_policy = agent && agent->cfg.ave.enabled && agent->cfg.ave.static_model_enabled;
+  const int ort_policy = 0;
   int sqlite_policy = agent && agent->cfg.offline.queue_db_path[0];
   int velo_policy = edr_response_forensic_external_enabled();
   int yara_external_policy = edr_response_yara_external_enabled();
@@ -1711,10 +1666,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *lifecycle_runtime = !windows_native ? "unavailable"
                                   : !lifecycle_policy ? "disabled"
                                   : lifecycle_runtime_ready ? "healthy" : "degraded";
-  const char *ort_runtime = !ort_build ? "unavailable"
-                            : !ort_policy ? "disabled"
-                            : (ave_ok && avst && avst->initialized && avst->static_model_version[0])
-                                  ? "healthy" : "degraded";
+  const char *ort_runtime = "unavailable";
   const char *http2_runtime = !http2_build ? "unavailable"
                               : !(http_rt && http_rt->http2_enabled) ? "disabled"
                               : http_rt->http2_negotiated ? "healthy" : "degraded";
@@ -1787,7 +1739,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"pmfe\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
       "\"result_schema\":\"pmfe_result_v1\",\"region_metadata\":%s,\"region_dump\":%s,\"yara_memory\":%s,"
       "\"vad_allocation_metadata\":%s,\"thread_start_snapshot\":%s,\"pe_reconstruction\":%s},"
-      "\"onnxruntime\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"onnxruntime\":{\"code_supported\":false,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"sqlite\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"http2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"zstd\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
@@ -2501,7 +2453,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         ceh.lane_worker_count[EDR_COMMAND_LANE_SCAN],
         (unsigned long long)ceh.queue_rejected_count,
         agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
-        agent->cfg.resource_limit.behavior_infer_per_min,
+        0u,
         agent->cfg.resource_limit.pmfe_scans_per_min,
         rs.cpu_percent, rs.cpu_percent_x100, rs.cpu_avg_10s_x100, rs.cpu_avg_60s_x100,
         rs.cpu_max_60s_x100, rs.cpu_p95_60s_x100, rs.cpu_sample_window_ms,
@@ -3015,8 +2967,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_BULK],
       (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_SCAN],
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
-      agent->cfg.resource_limit.ave_infer_per_min,
-      agent->cfg.resource_limit.behavior_infer_per_min,
+      0u,
+      0u,
       agent->cfg.resource_limit.pmfe_scans_per_min,
       agent->cfg.resource_limit.webshell_scan_mb_per_min,
       agent->cfg.resource_limit.shellcode_packets_per_sec,
@@ -3687,7 +3639,6 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   }
   if (edr_agent_toml_has_section(tmp, "ave")) {
     agent->cfg.ave.behavior_monitor_enabled = false;
-    agent->cfg.ave.static_model_enabled = remote->ave.static_model_enabled;
     agent->cfg.ave.scan_threads = remote->ave.scan_threads;
     agent->cfg.ave.max_file_size_mb = remote->ave.max_file_size_mb;
     snprintf(agent->cfg.ave.sensitivity, sizeof(agent->cfg.ave.sensitivity), "%s", remote->ave.sensitivity);

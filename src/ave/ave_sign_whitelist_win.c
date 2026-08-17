@@ -618,11 +618,11 @@ static void fill_blacklist_hint(AVEScanResult *res) {
 }
 
 static int apply_whitelist_row(const WhitelistRow *row, const char *path_utf8, const wchar_t *wpath, AveCertCtx *ctx,
-                               AVEScanResult *res, int *skip_onnx, DWORD revoke_flags) {
+                               AVEScanResult *res, int *skip_remaining_checks, DWORD revoke_flags) {
   if (!row->found) {
     return 0;
   }
-  /* 08 白名单：T3（LOW）仅抑制误报，不在这里跳过 ONNX */
+  /* 08 白名单：T3（LOW）仅抑制误报，不在这里放行后续静态检查。 */
   if (row->trust_level >= 3) {
     return 0;
   }
@@ -647,17 +647,14 @@ static int apply_whitelist_row(const WhitelistRow *row, const char *path_utf8, c
   if (row->vendor_name[0]) {
     snprintf(res->sig_vendor_name, sizeof(res->sig_vendor_name), "%s", row->vendor_name);
   }
-  *skip_onnx = 1;
+  *skip_remaining_checks = 1;
   return 1;
 }
 
 int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const char file_sha256_hex[65],
-                        AVEScanResult *res, int *skip_onnx_out, float *onnx_boost_out) {
-  if (skip_onnx_out) {
-    *skip_onnx_out = 0;
-  }
-  if (onnx_boost_out) {
-    *onnx_boost_out = 0.f;
+                        AVEScanResult *res, int *skip_remaining_checks_out) {
+  if (skip_remaining_checks_out) {
+    *skip_remaining_checks_out = 0;
   }
   if (!cfg || !path || !path[0] || !res) {
     return 0;
@@ -706,9 +703,6 @@ int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const cha
 
   if (act.has_thumb && dbp && sign_blacklist_lookup(dbp, act.thumb_sha256)) {
     fill_blacklist_hint(res);
-    if (onnx_boost_out) {
-      *onnx_boost_out = 0.30f;
-    }
     ave_cert_close(&act);
     return 0;
   }
@@ -718,8 +712,8 @@ int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const cha
   if (dbp && whitelist_lookup(dbp, &act, &wl)) {
     int skip = 0;
     if (apply_whitelist_row(&wl, path, wpath, &act, res, &skip, revoke_flags) && skip) {
-      if (skip_onnx_out) {
-        *skip_onnx_out = 1;
+      if (skip_remaining_checks_out) {
+        *skip_remaining_checks_out = 1;
       }
 #ifdef EDR_HAVE_SQLITE
       if (has_file_sha && dbp) {
@@ -733,8 +727,8 @@ int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const cha
 
   if (chain_has_ms_root_2011(act.leaf, act.store) && winverify_file(wpath, revoke_flags)) {
     fill_trusted_l1(res, act.subject_org, act.subject_cn, "builtin:MSRootCA2011", SIG_VALID_MICROSOFT, TRUST_MICROSOFT);
-    if (skip_onnx_out) {
-      *skip_onnx_out = 1;
+    if (skip_remaining_checks_out) {
+      *skip_remaining_checks_out = 1;
     }
 #ifdef EDR_HAVE_SQLITE
     if (has_file_sha && dbp) {
@@ -765,8 +759,8 @@ int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const cha
 
   if (org_is_microsoft(act.subject_org) && path_under_system_tree(path) && wv) {
     fill_trusted_l1(res, act.subject_org, act.subject_cn, "sign_whitelist:Microsoft", SIG_VALID_MICROSOFT, TRUST_MICROSOFT);
-    if (skip_onnx_out) {
-      *skip_onnx_out = 1;
+    if (skip_remaining_checks_out) {
+      *skip_remaining_checks_out = 1;
     }
     ave_cert_close(&act);
     return 0;
@@ -777,8 +771,8 @@ int edr_ave_sign_stage0(const struct EdrConfig *cfg, const char *path, const cha
       (path_under_program_files(path) || path_under_system_tree(path)) && wv) {
     fill_trusted_l1(res, act.subject_org, act.subject_cn, "sign_whitelist:known_vendor", SIG_VALID_KNOWN_VENDOR,
                     TRUST_MAJOR_SW);
-    if (skip_onnx_out) {
-      *skip_onnx_out = 1;
+    if (skip_remaining_checks_out) {
+      *skip_remaining_checks_out = 1;
     }
     ave_cert_close(&act);
     return 0;

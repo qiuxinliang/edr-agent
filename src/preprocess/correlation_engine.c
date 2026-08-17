@@ -365,7 +365,7 @@ static void corr_load_builtin_rules(void) {
    *
    * 平台依赖：Linux 经 ptrace 产生 EDR_EVENT_PROCESS_INJECT（collector_linux.c），
    * 本规则可直接生效。Windows 上注入信号当前被转为 AVE_EVT_PROCESS_INJECT 送入 AVE
-   * 行为 ONNX 管道（ave_etw_feed_win.c / ave_cross_engine_feed.c），不以 BehaviorRecord
+   * 行为启发式管道（ave_etw_feed_win.c / ave_cross_engine_feed.c），不以 BehaviorRecord
    * 流经 process_one_slot —— 故 Windows 触发需后续将该 AVE 交叉引擎信号也回灌到
    * edr_correlation_evaluate（或让注入检测器同时 emit 记录）。机制已就绪，缺的是事件源接线。 */
   r = corr_rule_new("R-CORR-INJECT-001", "远程线程注入序列", 4, "T1055",

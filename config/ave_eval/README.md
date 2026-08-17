@@ -1,10 +1,5 @@
-# AVE Model Evaluation Pack
+# AVE 规则评估资料
 
-This pack pins one model version to a fixed malicious sample set, a known false-positive set, a threshold curve, and a manifest.
+端点已停止使用 ONNX Runtime、FP32 模型和联邦训练链，本目录不再承载模型清单、阈值曲线或模型质量门禁。
 
-Release gate:
-
-1. Fill `model_manifest.example.json` with the exact static and behavior model versions.
-2. Run the fixed samples and false-positive set through the same AVE build that ships to endpoints.
-3. Update `threshold_curve.csv` and the manifest metrics.
-4. Attach the manifest hash to the server rollout policy so endpoints can report `static_model_version` and `behavior_model_version` against an audited evaluation package.
+规则、IOC、证书信任、误报抑制和行为启发式的验收，应通过对应的 CTest、Windows 安装包生命周期测试和平台端到端回归完成。

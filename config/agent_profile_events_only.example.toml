@@ -40,8 +40,7 @@ sampling_rate_whitelist = 0.03
 rules_version        = "edr-dynamic-rules-v1-r218-9ae52519"
 
 [ave]
-# 指向无 .onnx 的目录 → 不跑推理；与 CMake EDR_WITH_ONNXRUNTIME=OFF 构建可叠加
-model_dir            = "/opt/edr/models_empty"
+# 仅保留事件采集和规则检测；关闭本地行为启发式链。
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
@@ -64,7 +63,6 @@ retention_hours      = 48
 cpu_limit_percent    = 1
 memory_limit_mb      = 100
 emergency_cpu_limit  = 5
-behavior_infer_per_min = 0
 
 [logging]
 level                = "info"
@@ -72,5 +70,5 @@ log_dir              = "/var/log/edr"
 max_log_size_mb      = 50
 max_log_files        = 5
 
-# 不含 [fl] [shellcode_detector] [webshell_detector] [command] — 默认不启重模块
+# 不含 [shellcode_detector] [webshell_detector] [command] — 默认不启重模块
 # 不含 [self_protect] — 按需开 event_bus 背压等

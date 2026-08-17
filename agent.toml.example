@@ -174,33 +174,19 @@ fp_feedback = ""
 # icase_exe_path = true
 
 # 配置热载（可选）：设置环境变量 EDR_CONFIG_RELOAD_S 为正整数秒，则主循环周期性检测本文件 mtime，
-# 变更后重载 preprocessing / resource / self_protect / 攻击面调度，并调用 AVE_SyncFromEdrConfig 从 [ave].model_dir 重载 ONNX。
-# 吊销、L4 联动、SQLite 路径等 [ave] 项在扫描时从内存配置读取，热载后即可生效；仅更换磁盘上的模型文件时需依赖 AVE_SyncFromEdrConfig（或 AVE_UpdateModel / AVE_ApplyHotfix）。
+# 变更后重载 preprocessing / resource / self_protect / 攻击面调度及 AVE 的规则与行为启发式配置。
+# 吊销、L4 联动、SQLite 路径等 [ave] 项在扫描时从内存配置读取，热载后即可生效。
 [ave]
-# 静态 ONNX：将 static.onnx 放到本目录（与仓库 onnx-output 中产物一致）。
-# 安装：./scripts/install_static_onnx.sh（默认安装到本路径；无权限时用 --dest-dir $PWD/models 做本机联调）。
-# 加载：目录内首个非 behavior.onnx 的 .onnx 作为 static；端侧 behavior.onnx 已退出产品默认形态。
-# 动态行为检测由 P0 主机行为检测引擎承担，服务端可基于精选事件做后续行为模型评估。
-#
-# 本仓库开发/测试：训练产物在**仓库根目录** `model/releases/<release_id>/`（见根目录 `model/releases/current.json`）。
-# 将 model_dir 设为该目录的绝对路径即可，例如（按本机路径与 release 名修改）：
-#   macOS/Linux:  /…/AI Agent/model/releases/20260418_053704_UTC
-#   Windows:      C:/…/AI Agent/model/releases/20260418_053704_UTC
-# Windows 默认发布布局：所有运行时数据与模型均放在安装目录下。
-model_dir            = "C:\\Program Files\\FDSecurity\\models"
+# 静态检测由签名 IOC、哈希/证书白名单和规则引擎完成；行为检测由本地启发式链完成。
 scan_threads         = 2
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
-static_model_enabled = true
-# P2：static ONNX 推理结果进程内缓存（键为文件 SHA256；0=关闭）。TTL 秒；0=仅 LRU、不按时间过期。
-# static_infer_cache_max_entries = 0
-# static_infer_cache_ttl_s       = 0
 # Windows Authenticode：WinVerifyTrust 吊销链（WTD_REVOKE_WHOLECHAIN）。可被环境变量 EDR_AVE_CERT_REVOCATION=0/1 覆盖。
 # cert_revocation_check = false
-# 与 AVE_ScanFileWithSubject(subject_pid) 配合：ONNX 之后若行为异常分 ≥ 阈值则叠加 L4（rule_name=behavior_realtime）。环境变量 EDR_AVE_L4_BEHAVIOR_LINK=0/1 可覆盖开关。
+# 与 AVE_ScanFileWithSubject(subject_pid) 配合：行为异常分 ≥ 阈值时可叠加 L4（rule_name=behavior_realtime）。环境变量 EDR_AVE_L4_BEHAVIOR_LINK=0/1 可覆盖开关。
 # l4_realtime_behavior_link = false
 # l4_realtime_anomaly_threshold = 0.65
-# L3 IOC 先于 L2 哈希白名单匹配；为 false 时仅 ONNX 后二次核对 IOC。
+# L3 IOC 先于 L2 哈希白名单匹配；为 false 时仍会在规则扫描结束后核对 IOC。
 # ioc_precheck_enabled = true
 # 行为管线消费线程（AVE_StartBehaviorMonitor）；生产默认关闭，P0 阶段不由远程策略自动开启。
 # behavior_monitor_enabled = false
@@ -232,7 +218,6 @@ profile              = "workstation"
 cpu_limit_percent    = 1
 memory_limit_mb      = 100
 emergency_cpu_limit  = 5
-ave_infer_per_min    = 120
 pmfe_scans_per_min   = 3
 webshell_scan_mb_per_min = 64
 shellcode_packets_per_sec = 2000
@@ -272,14 +257,6 @@ max_log_files        = 10
 #   "sangfor,dbappsecurity,venustech,topsec,nsfocus,beyondtrust,citrix,zoom,slack,notion,microsoft,google,mozilla,"
 #   "adobe,oracle,intel,amd,nvidia,apple,dell,lenovo,hp,ibm,sap"
 # 建议：先在灰度环境按你们资产画像裁剪，再全量推广。
-
-# §10 联邦学习（T-015 frozen_layers）：与 `docs/FL_ROUND_TRAINING_SEMANTICS.md` 一致；默认关闭。
-# [fl]
-# enabled = false
-# model_target = "static"
-# [fl.frozen_layers]
-# static   = ["head_b", "head_c"]
-# behavior = ["head_b"]
 
 # §16 取证 YARA 扫描规则库。yara_scan 规则来源优先级：命令内联 rules > forensic_yara_rules_dir > EDR_YARA_RULES_DIR > rules/forensic。
 # Windows 安装包默认随包放置到 C:\\Program Files\\FDSecurity\\rules\\forensic；开发态可使用相对路径 rules/forensic。

@@ -34,16 +34,16 @@
 
 | command_type | payload | 说明 |
 |--------------|---------|------|
-| `ave_status` / `ave_model_status` | 可空 | 返回模型目录扫描摘要（`model_files` / `non_dir_files` / `ready`），见 `edr_ave_get_scan_counts`。 |
+| `ave_status` / `ave_model_status` | 可空 | 返回 AVE 规则、IOC、抑制与行为队列摘要，见 `edr_ave_get_scan_counts`。 |
 | `ave_fingerprint` / `ave_fp` | `{"path":"/abs/path"}` | 对文件做前 256B FNV-1a 指纹；**只读**，无需 `EDR_CMD_ENABLED`。 |
-| `ave_infer` | `{"path":"/abs/path"}` | 调用 **`AVE_ScanFile`**（含 SHA256、`EDRVerdict`、`verification_layer`：可为 **L1**（证书信任）/ **L2**（文件哈希白名单）/ **L3**（IOC）/ **AI**（ONNX）等、耗时）；成功时 `detail` 形如 `final=... raw=... final_conf=... sha256=... dur_ms=...`。未接 ONNX 且未命中 L1–L3 时可能返回 **FAILED** + `EDR_ERR_NOT_IMPL`；联调可设 **`EDR_AVE_INFER_DRY_RUN=1`**。需进程已 **`edr_command_bind_config`** 且 **`AVE_InitFromEdrConfig`** 已完成（main 在 `edr_agent_init` 后绑定）。 |
+| `ave_infer` | `{"path":"/abs/path"}` | 保留指令名以兼容已发布的平台协议，实际调用 **`AVE_ScanFile`** 的规则扫描（含 SHA256、`EDRVerdict`、`verification_layer`：**L1** 证书信任 / **L2** 文件哈希白名单 / **L3** IOC / **L4** 不可豁免行为策略等、耗时）。成功时 `detail` 形如 `final=... raw=... final_conf=... sha256=... dur_ms=...`。无需模型或 dry-run 开关；需进程已 **`edr_command_bind_config`** 且 **`AVE_InitFromEdrConfig`** 已完成（main 在 `edr_agent_init` 后绑定）。 |
 | `self_protect_status` / `agent_health` / `health_status` | 可空 | 返回自保护快照：`debugger`、`bus_pct`、Windows `job_win`、总线 `hw_hits`/`dropped` 等（`edr_self_protect_format_status`）。**只读**，无需高危开关。 |
 
 ### PMFE 指令 payload（UTF-8 JSON）
 
 | command_type | payload | 说明 |
 |----------------|---------|------|
-| `pmfe_scan` / `CMD_PMFE_SCAN` | `{"pid":1234}` | 将目标 PID 提交 PMFE 工作队列，**异步**执行：**Windows**：模块基线 + VAD 粗筛 + **高分区精读**（`EDR_PMFE_VAD_PEEK` 个区域，默认 8）：读首 512B 统计 **MZ 命中**、**Shannon 熵**；可选 **`EDR_PMFE_AVE_TEMPFILE=1`** 时对最多 3 个 MZ 区写入 `%TEMP%\\edr_pmfe_<pid>_<addr>.bin` 并调用 **`AVE_ScanFile`**（与主进程 **`AVE_InitFromEdrConfig`** 一致；需已 `edr_pmfe_bind_config` + 模型就绪 / 或 `EDR_AVE_INFER_DRY_RUN=1`）。**Linux**：`/proc/<pid>/maps` 基线统计。`ReportCommandResult` 的枚举仍为 **OK**，但 `detail_utf8.status=queued` 表示已入队。摘要写入 stderr / `EDR_CMD_AUDIT_PATH`。其它可选：`EDR_PMFE_STOMP_BYTES`、`EDR_PMFE_DISK_HASH_MAX`。 |
+| `pmfe_scan` / `CMD_PMFE_SCAN` | `{"pid":1234}` | 将目标 PID 提交 PMFE 工作队列，**异步**执行：**Windows**：模块基线 + VAD 粗筛 + **高分区精读**（`EDR_PMFE_VAD_PEEK` 个区域，默认 8）：读首 512B 统计 **MZ 命中**、**Shannon 熵**；可选 **`EDR_PMFE_AVE_TEMPFILE=1`** 时对最多 3 个 MZ 区写入 `%TEMP%\\edr_pmfe_<pid>_<addr>.bin` 并调用 **`AVE_ScanFile`**（与主进程 **`AVE_InitFromEdrConfig`** 一致；需已 `edr_pmfe_bind_config`）。**Linux**：`/proc/<pid>/maps` 基线统计。`ReportCommandResult` 的枚举仍为 **OK**，但 `detail_utf8.status=queued` 表示已入队。摘要写入 stderr / `EDR_CMD_AUDIT_PATH`。其它可选：`EDR_PMFE_STOMP_BYTES`、`EDR_PMFE_DISK_HASH_MAX`。 |
 
 - **禁用 PMFE 线程**：`EDR_PMFE_DISABLED=1` 时 `edr_pmfe_init` 不启动工作线程，`pmfe_scan` 将因「未运行」入队失败。
 - **预处理自动入队 PMFE**：**Windows**：`EDR_PMFE_ETW_AUTO=1` 且 PMFE 已初始化时，对 **`EDR_EVENT_PROTOCOL_SHELLCODE`**（WinDivert ETW1）：当 `score` ≥ **`EDR_PMFE_ETW_SHELLCODE_SCORE`**（默认 **0.65**）时，将 **`br.pid`**（或 ETW1 中 **`hint_pid`** → `epid` 覆盖后的 PID）或按 **`dpt`** 经 **`GetExtendedTcpTable`** 解析的本地 IPv4 端口属主 PID 提交 **`edr_pmfe_submit_etw_scan_ex`**（内部 `etw:shellcode`；**`slot.priority==0`→P0 否则 P1**；ETW1 可选 **`va=`/`hint=`** 为 VAD 精扫 hint）。**`EDR_PMFE_ETW_COOLDOWN_MS`** 同 PID 冷却，默认 **30000**。**不依赖** `EDR_CMD_ENABLED`。**Linux**：同变量下对 **`EDR_EVENT_WEBSHELL_DETECTED`** 提交 **`etw:webshell`**（P0/P1 由 `slot.priority`）。

@@ -39,10 +39,4 @@ if(SQLite3_FOUND)
   target_compile_definitions(edr_ave_shared PRIVATE EDR_HAVE_SQLITE=1)
 endif()
 
-if(EDR_ONNXRUNTIME_AVAILABLE)
-  target_compile_definitions(edr_ave_shared PRIVATE EDR_HAVE_ONNXRUNTIME=1)
-  target_include_directories(edr_ave_shared PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  target_link_libraries(edr_ave_shared PRIVATE ${ONNXRUNTIME_LIB})
-endif()
-
 set_target_properties(edr_ave_shared PROPERTIES OUTPUT_NAME "edr_ave")

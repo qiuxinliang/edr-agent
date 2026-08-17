@@ -236,7 +236,7 @@ int main(void) {
            "release verifies every Runtime EXE and DLL against the target architecture");
   contains(workflow, "stage_msvc_runtime_dlls_build_release.ps1", "release stages the app-local MSVC runtime");
   contains(workflow, "vcruntime140_1.dll", "release package gate requires the MSVC runtime dependency closure");
-  contains(workflow, "msvcp140.dll", "release package gate requires the C++ runtime used by ONNX Runtime");
+  contains(workflow, "msvcp140.dll", "release package gate requires the app-local C++ runtime");
   contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
            "ARM64 release excludes unsupported WinDivert drivers");
@@ -372,14 +372,6 @@ int main(void) {
            "release workflow executes the ARM64, ARM64EC, and x64 emulation PE recognition test");
   contains(client_release, "'test_pmfe_pe_arch'",
            "release workflow builds the PMFE PE architecture test before CTest executes it");
-  contains(client_release, "'test_ave_static_onnx_integration'",
-           "release workflow builds the real ONNX fixture test before CTest executes it");
-  contains(client_release, "ave_static_onnx_triple_integration",
-           "release gate executes real ONNX inference on both native architectures");
-  contains(client_release, "ONNX Runtime test DLL is unavailable",
-           "release CTest verifies that the official ONNX Runtime DLL is reachable from test executables");
-  contains(client_release, "Release CTest ONNX Runtime DLL directory",
-           "release CTest explicitly prepends the task-pinned ONNX Runtime DLL directory to PATH");
   contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
            "release workflow executes the contract suite natively on AMD64 and ARM64");
   contains(client_release, "Windows release native target $nativeTarget failed",
@@ -392,12 +384,16 @@ int main(void) {
            "release workflow pins the Visual Studio compiler generation on both architectures");
   contains(client_release, "bootstrap_pinned_vcpkg.ps1",
            "release workflow bootstraps the manifest-pinned vcpkg commit");
-  contains(client_release, "Install-PinnedOnnxRuntime.ps1",
-           "release workflow downloads only SHA-256 pinned ONNX Runtime archives");
-  contains(client_release, "-DEDR_REQUIRE_ONNXRUNTIME=ON",
-           "release configure fails closed when ONNX Runtime is unavailable");
   contains(client_release, "actions/setup-dotnet@v5",
            "release workflow uses the Node 24 setup-dotnet action");
+  contains(client_release, "actions/setup-python@v6",
+           "release workflow uses the Node 24 Python setup action");
+  contains(client_release, "python-version: '3.12.10'",
+           "release workflow pins the Python interpreter for P0 encryption");
+  contains(client_release, "architecture: x64",
+           "release workflow runs P0 encryption with the portable x64 Python wheel on both Windows architectures");
+  contains(client_release, "--only-binary=:all: --requirement .\\requirements-release.txt",
+           "release workflow forbids cryptography source builds");
   contains(client_release, "Verify locked Setup UI NuGet closure",
            "release workflow verifies the target RID Setup UI lock before packaging");
   contains(client_release, "packages.{0}.lock.json",
@@ -409,31 +405,6 @@ int main(void) {
   require_true(!strstr(client_release, "mozilla-actions/sccache-action"),
                "release workflow has no Node 20 sccache action");
   free(client_release);
-
-  snprintf(path, sizeof(path), "%s/tests/test_ave_static_onnx_integration.c", root);
-  char *static_onnx_integration = read_file(path);
-  require_true(static_onnx_integration != NULL,
-               "release workflow target has a checked static ONNX integration test source");
-  contains(static_onnx_integration, "edr_onnx_runtime_load",
-           "static ONNX integration test loads the pinned fixture through the Agent runtime");
-  contains(static_onnx_integration, "onnx_layout != 1",
-           "static ONNX integration test requires the named triple-output contract");
-  contains(static_onnx_integration, "void edr_win_listen_apply_config",
-           "static ONNX integration test supplies config.c's Windows-only listener hook");
-  contains(static_onnx_integration, "write_deterministic_input",
-           "static ONNX integration test uses a cross-platform deterministic feature input");
-  contains(static_onnx_integration, "static ONNX result: layout=",
-           "static ONNX integration failures include runtime output diagnostics");
-  free(static_onnx_integration);
-
-  snprintf(path, sizeof(path), "%s/tests/CMakeLists.txt", root);
-  char *tests_cmake = read_file(path);
-  require_true(tests_cmake != NULL, "read test target CMake definitions");
-  contains(tests_cmake, "Stage task-pinned ONNX Runtime DLL beside static ONNX integration test",
-           "Windows static ONNX test stages the pinned runtime DLL next to its executable");
-  contains(tests_cmake, "onnxruntime_providers_shared.dll",
-           "Windows static ONNX test stages optional ONNX provider DLLs with the core runtime");
-  free(tests_cmake);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
   char *client_build = read_file(path);
@@ -450,6 +421,10 @@ int main(void) {
            "client build waits for GUI subsystem capability probes through the shared runner");
   contains(client_build, "actions/setup-dotnet@v5",
            "client build uses the Node 24 setup-dotnet action");
+  contains(client_build, "actions/setup-python@v6",
+           "client build uses the Node 24 Python setup action");
+  contains(client_build, "--only-binary=:all: --requirement .\\requirements-release.txt",
+           "client build forbids cryptography source builds");
   contains(client_build, "Verify locked Setup UI NuGet closure",
            "client build verifies the AMD64 Setup UI lock before packaging");
   contains(client_build, "packages.{0}.lock.json",
@@ -483,17 +458,6 @@ int main(void) {
                "real platform HTTPS gate never disables certificate validation");
   free(platform_https);
 
-  snprintf(path, sizeof(path), "%s/dependencies.lock.json", root);
-  char *dependency_lock = read_file(path);
-  require_true(dependency_lock != NULL, "read native dependency lock");
-  contains(dependency_lock, "\"onnxruntime\"", "dependency lock pins ONNX Runtime");
-  contains(dependency_lock, "\"sha256\"", "dependency lock binds native archives by SHA-256");
-  contains(dependency_lock, "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd",
-           "dependency lock binds the official ONNX Runtime x64 asset digest");
-  contains(dependency_lock, "1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168",
-           "dependency lock binds the official ONNX Runtime ARM64 asset digest");
-  free(dependency_lock);
-
   snprintf(path, sizeof(path), "%s/scripts/Validate-DependencyLocks.ps1", root);
   char *dependency_validator = read_file(path);
   require_true(dependency_validator != NULL, "read dependency lock consistency validator");
@@ -503,6 +467,10 @@ int main(void) {
            "dependency validation prevents vcpkg baseline drift");
   contains(dependency_validator, "Setup UI package '$name' is not exactly bound",
            "dependency validation enforces NuGet locked restore inputs");
+  contains(dependency_validator, "must contain exactly dependency graphs",
+           "dependency validation requires both base and runtime-specific NuGet lock graphs");
+  contains(dependency_validator, "cryptography==44.0.3",
+           "dependency validation pins the P0 encryption root dependency");
   free(dependency_validator);
 
   snprintf(path, sizeof(path), "%s/global.json", root);
@@ -511,31 +479,12 @@ int main(void) {
   contains(dotnet_lock, "\"rollForward\": \"disable\"", ".NET SDK roll-forward is disabled");
   free(dotnet_lock);
 
-  const char *onnx_fixtures[] = {
-    "static_triple_minimal.onnx", "behavior_dual_minimal.onnx", "behavior_seq128_dual_minimal.onnx"
-  };
-  for (size_t i = 0; i < sizeof(onnx_fixtures) / sizeof(onnx_fixtures[0]); ++i) {
-    snprintf(path, sizeof(path), "%s/tests/fixtures/%s", root, onnx_fixtures[i]);
-    char *fixture = read_file(path);
-    require_true(fixture != NULL, "checked ONNX integration fixture exists");
-    free(fixture);
-  }
-
   snprintf(path, sizeof(path), "%s/tests/CMakeLists.txt", root);
   char *test_cmake = read_file(path);
   require_true(test_cmake != NULL, "read test CMake configuration");
   contains(test_cmake, "if(NOT MSVC)",
            "C11 atomic stress test is excluded from MSVC builds");
   free(test_cmake);
-
-  snprintf(path, sizeof(path), "%s/CMakeLists.txt", root);
-  char *required_onnx_cmake = read_file(path);
-  require_true(required_onnx_cmake != NULL, "read top-level required ONNX gate");
-  contains(required_onnx_cmake, "EDR_REQUIRE_ONNXRUNTIME=ON requires checked ONNX fixture",
-           "missing ONNX fixtures block every required configure, including tests-off builds");
-  contains(required_onnx_cmake, "Checked ONNX fixture SHA256 mismatch",
-           "required configure binds checked ONNX fixtures by SHA-256");
-  free(required_onnx_cmake);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
   char *lifecycle_smoke = read_file(path);

@@ -35,7 +35,7 @@ Linux 运行时能力以 `edr-agent/src/pmfe/pmfe_engine.c` 中 `#elif defined(_
 |------|------|------|
 | 优先级 / 监听表 | **`pmfe_host_policy_linux.c`** + **`edr_pmfe_listen_table_refresh`** | 已落地；**无** Windows **规则 3（Win32 服务 PID + 监听）** 的 systemd 等价（可选后续）。 |
 | 进程生命周期 → 监听刷新 | **`EDR_LINUX_PROC_CONNECTOR=1`**、预处理对 **`PROCESS_CREATE`/`TERMINATE`** | 与 ETW 全量进程事件仍有差距。 |
-| 预处理自动入队 | **`EDR_PMFE_ETW_AUTO` + webshell**（**`pmfe_etw_preprocess.c`**） | **无** Windows 侧 **`EDR_EVENT_PROTOCOL_SHELLCODE`** 全量 ETW1 能力；扩展依赖 **`11_behavior.onnx详细设计.md`** 与流水线。 |
+| 预处理自动入队 | **`EDR_PMFE_ETW_AUTO` + webshell**（**`pmfe_etw_preprocess.c`**） | **无** Windows 侧 **`EDR_EVENT_PROTOCOL_SHELLCODE`** 全量 ETW1 能力；扩展依赖行为事件字段与现有启发式流水线。 |
 
 ### 2.2 扫描与 §9
 
@@ -64,7 +64,7 @@ Linux 运行时能力以 `edr-agent/src/pmfe/pmfe_engine.c` 中 `#elif defined(_
 |--------|------|------|
 | **P0** | **ELF 路径 A（样本重建/上传）** | 对齐设计 §9 / MinIO / gRPC；与 Webshell/平台模块衔接。 |
 | **P0** | **Linux AVE（或等价）与 `EDR_PMFE_AVE_*` 对齐** | 与 Windows tempfile 扫描路径一致化，需 **`edr_pmfe_bind_config`** + AVE 初始化。 |
-| **P1** | **预处理扩展** | `EDR_PMFE_ETW_AUTO` 下增加 **`behavior.onnx` 高置信类型**、脚本/shellcode 等（见 **`11_behavior.onnx详细设计.md`**）。 |
+| **P1** | **预处理扩展** | `EDR_PMFE_ETW_AUTO` 下增加高置信行为类型、脚本/shellcode 等。 |
 | **P1** | **宿主：systemd 运行单元 → PID**（可选） | 近似 Windows **规则 3**；与 `pmfe_host_policy_linux.c` 组合策略。 |
 | **P1** | **可观测性** | `vm_read` **errno 分桶**或 **`pid_history` 增加 `vm_read_failures`**：注意 detail 长度与下游解析。 |
 | **P2** | **工程** | Linux **CI 全量编译**（含 `collector_linux` + netlink 头）、**集成测试**（需 Linux Runner）。 |

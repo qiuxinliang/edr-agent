@@ -1,6 +1,6 @@
 ; FDSecurity — 完整/本地暂存版安装脚本（Inno 6, x64）
 ; 与 EDRAgentSetup.iss 行为一致（注册/开机任务等），但主程序与 DLL 来自**单独目录**（如 CI/本机
-; 输出目录 monorepo\edr-agent-win_2-2），并打齐：models、agent_preprocess 规则、脚本、data 说明。
+; 输出目录 monorepo\edr-agent-win_2-2），并打齐：agent_preprocess 规则、脚本、data 说明。
 ;
 ; 默认 EDR_BIN_DIR=..\..\..\edr-agent-win_2-2（相对本 .iss 所在位置，即 monorepo 根下常见暂存名）
 ;
@@ -10,8 +10,7 @@
 ;   ISCC.exe /DEDR_BIN_DIR=C:\staged\edr-bin /DMyAppVersion=2.2.0 EDRAgentSetup.bundled.iss
 ; 或运行:  .\Build-BundledInstaller.ps1
 ;
-; 说明: ONNX .onnx 应事先放入 edr-agent\models\（本仓库内 models 常仅含 README，需从流水线复制）；
-; 证书/IOC 等 SQLite 为可选，若 agent.toml 未指路径可不带库文件；{app}\data\README_OPTIONAL_DBS.txt 有说明。
+; 说明: 证书/IOC 等 SQLite 为可选，若 agent.toml 未指路径可不带库文件；{app}\data\README_OPTIONAL_DBS.txt 有说明。
 
 #define MyAppName "FDSecurity"
 #define MyAppPublisher "FDSecurity"
@@ -25,9 +24,6 @@
 #endif
 #ifndef EDR_AGENT_TOML_EXAMPLE
   #define EDR_AGENT_TOML_EXAMPLE "..\..\agent.toml.example"
-#endif
-#ifndef EDR_MODELS_GLOB
-  #define EDR_MODELS_GLOB "..\..\models\*"
 #endif
 #ifndef EDR_AGENT_PREPROCESS_TOML
   #define EDR_AGENT_PREPROCESS_TOML "..\..\..\edr-backend\platform\config\agent_preprocess_rules_v1.toml"
@@ -108,7 +104,6 @@ Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDive
 Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\ARCH"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\package-capabilities.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_MODELS_GLOB}"; DestDir: "{app}\models"; Excludes: "behavior.onnx,static_fp32.onnx,*.training.*,*.tmp"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "{#EDR_AGENT_PREPROCESS_TOML}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion
@@ -1082,7 +1077,7 @@ begin
     + 'try { L (''dir_acl=''+((& icacls.exe $wd) -join '' | '')) } catch {};'
     + 'try { L (''exe_acl=''+((& icacls.exe $exe) -join '' | '')) } catch {};'
     + 'try { L (''cfg_acl=''+((& icacls.exe $cfg) -join '' | '')) } catch {};'
-    + 'foreach($n in @(''libcrypto-3-x64.dll'',''libssl-3-x64.dll'',''libcurl.dll'',''sqlite3.dll'',''onnxruntime.dll'',''pcre2-8.dll'',''edr_agent_postinstall_verify.ps1'',''certs\ca.pem'',''certs\client.pem'',''certs\client-key.pem'')){try{$fp=Join-Path $wd $n;if(Test-Path -LiteralPath $fp){L (''dep_acl ''+$n+''=''+((& icacls.exe $fp) -join '' | ''))}}catch{}};'
+    + 'foreach($n in @(''libcrypto-3-x64.dll'',''libssl-3-x64.dll'',''libcurl.dll'',''sqlite3.dll'',''pcre2-8.dll'',''edr_agent_postinstall_verify.ps1'',''certs\ca.pem'',''certs\client.pem'',''certs\client-key.pem'')){try{$fp=Join-Path $wd $n;if(Test-Path -LiteralPath $fp){L (''dep_acl ''+$n+''=''+((& icacls.exe $fp) -join '' | ''))}}catch{}};'
     + 'try { $task0=Get-ScheduledTask -TaskName ''{#MyServiceName}'' -ErrorAction SilentlyContinue; if($task0){foreach($a in @($task0.Actions)){L (''task_action execute=''+$a.Execute+'' args=''+$a.Arguments+'' wd=''+$a.WorkingDirectory)}; L (''task_principal user=''+$task0.Principal.UserId+'' logon=''+$task0.Principal.LogonType+'' runlevel=''+$task0.Principal.RunLevel)} } catch {};'
     + '$startupLog=Join-Path $wd ''logs\startup-task.log'';'
     + 'try { Remove-Item -LiteralPath $startupLog -Force -ErrorAction SilentlyContinue } catch {};'

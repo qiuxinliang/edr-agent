@@ -914,6 +914,8 @@ static void do_ave_fingerprint(const char *cmd_id, const uint8_t *pl, size_t len
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
+/* Keep the published `ave_infer` command name for platform compatibility.
+ * Endpoint execution is now the rules/IOC/behavior-heuristic scan path. */
 static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!edr_command_get_config()) {
     s_exec_fail++;
@@ -935,12 +937,6 @@ static void do_ave_infer(const char *cmd_id, const uint8_t *pl, size_t len, cons
     s_exec_fail++;
     audit_both(cmd_id, "ave_infer: AVE 未初始化（需先 edr_agent_init）");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 22, "ave not initialized");
-    return;
-  }
-  if (ar == AVE_ERR_NOT_IMPL) {
-    s_exec_fail++;
-    audit_both(cmd_id, "ave_infer: 推理后端未实现（可设 EDR_AVE_INFER_DRY_RUN=1）");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, (int)EDR_ERR_NOT_IMPL, "infer not implemented");
     return;
   }
   if (ar == AVE_ERR_FILE_NOT_FOUND) {

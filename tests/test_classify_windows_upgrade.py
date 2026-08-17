@@ -33,7 +33,7 @@ class ClassifyWindowsUpgradeTests(unittest.TestCase):
         self.assertEqual("runtime_bundle", result)
 
     def test_updater_and_layout_changes_require_installer(self):
-        for path in ("scripts/edr_agent_inplace_update.ps1", "CMakeLists.txt", "models/static.onnx"):
+        for path in ("scripts/edr_agent_inplace_update.ps1", "CMakeLists.txt", "package-capabilities.json"):
             with self.subTest(path=path):
                 result, _ = MODULE.classify_paths([path])
                 self.assertEqual("installer_required", result)

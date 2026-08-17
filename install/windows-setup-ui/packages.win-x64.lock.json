@@ -1,6 +1,28 @@
 {
   "version": 1,
   "dependencies": {
+    "net8.0-windows10.0.17763": {
+      "Microsoft.Web.WebView2": {
+        "type": "Direct",
+        "requested": "[1.0.2903.40, )",
+        "resolved": "1.0.2903.40",
+        "contentHash": "pDLSrpyma3xyOGXlw3Aowy7XceBdeJbukZzKLVdPCFvyfnn8PrCLylMn6c456ja0TcOOal8IdQCVONDRU2OGkw=="
+      },
+      "System.Drawing.Common": {
+        "type": "Direct",
+        "requested": "[8.0.0, )",
+        "resolved": "8.0.0",
+        "contentHash": "QKFsnF3VkUgFG9VaI1Uzk0MYbsGIvLjp6lq+DcYDUQbn10UyPMTUknUOeRxBOXxTYWtVPXm41eX8Vt/zNF7VMw==",
+        "dependencies": {
+          "Microsoft.Win32.SystemEvents": "8.0.0"
+        }
+      },
+      "Microsoft.Win32.SystemEvents": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "JQFsUIZT+/RjxS2Pw9J3O3whHCQCxOp7SqmH+ynIUdP4DF56u8rOLU1eBhrikFJOgCmvvEmjfX5Rhv4GqkYJsg=="
+      }
+    },
     "net8.0-windows10.0.17763/win-x64": {
       "Microsoft.Web.WebView2": {
         "type": "Direct",

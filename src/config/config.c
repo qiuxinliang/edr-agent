@@ -1268,7 +1268,6 @@ static void load_ave(toml_table_t *t, EdrConfig *cfg) {
       cfg->ave.enabled = d.u.b ? true : false;
     }
   }
-  take_string(toml_string_in(t, "model_dir"), cfg->ave.model_dir, sizeof(cfg->ave.model_dir));
   {
     toml_datum_t d = toml_int_in(t, "scan_threads");
     if (d.ok) {
@@ -1299,12 +1298,6 @@ static void load_ave(toml_table_t *t, EdrConfig *cfg) {
       cfg->ave.ioc_precheck_enabled = d.u.b ? true : false;
     }
   }
-  {
-    toml_datum_t d = toml_bool_in(t, "static_model_enabled");
-    if (d.ok) {
-      cfg->ave.static_model_enabled = d.u.b ? true : false;
-    }
-  }
   take_string(toml_string_in(t, "behavior_policy_db_path"), cfg->ave.behavior_policy_db_path,
               sizeof(cfg->ave.behavior_policy_db_path));
   {
@@ -1329,18 +1322,6 @@ static void load_ave(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_double_in(t, "l4_realtime_anomaly_threshold");
     if (d.ok) {
       cfg->ave.l4_realtime_anomaly_threshold = (float)d.u.d;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "static_infer_cache_max_entries");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->ave.static_infer_cache_max_entries = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "static_infer_cache_ttl_s");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->ave.static_infer_cache_ttl_s = (uint32_t)d.u.i;
     }
   }
 }
@@ -1420,18 +1401,6 @@ static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
     toml_datum_t d = toml_int_in(t, "emergency_cpu_limit");
     if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
       cfg->resource_limit.emergency_cpu_limit = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "ave_infer_per_min");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->resource_limit.ave_infer_per_min = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "behavior_infer_per_min");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 0x7fffffffLL) {
-      cfg->resource_limit.behavior_infer_per_min = (uint32_t)d.u.i;
     }
   }
   {
@@ -2001,70 +1970,6 @@ static void edr_config_clamp(EdrConfig *cfg) {
     cfg->webshell_detector.max_upload_size_mb = 1024u;
   }
 
-  if (cfg->fl.min_new_samples < 1) {
-    cfg->fl.min_new_samples = 100;
-  }
-  if (cfg->fl.min_new_samples > 1000000) {
-    cfg->fl.min_new_samples = 1000000;
-  }
-  if (cfg->fl.idle_cpu_threshold < 0.0f) {
-    cfg->fl.idle_cpu_threshold = 0.0f;
-  }
-  if (cfg->fl.idle_cpu_threshold > 1.0f) {
-    cfg->fl.idle_cpu_threshold = 1.0f;
-  }
-  if (cfg->fl.dp_epsilon < 0.01f) {
-    cfg->fl.dp_epsilon = 0.01f;
-  }
-  if (cfg->fl.dp_epsilon > 100.0f) {
-    cfg->fl.dp_epsilon = 100.0f;
-  }
-  if (cfg->fl.dp_clip_norm < 1e-6f) {
-    cfg->fl.dp_clip_norm = 1e-6f;
-  }
-  if (cfg->fl.dp_clip_norm > 1.0e6f) {
-    cfg->fl.dp_clip_norm = 1.0e6f;
-  }
-  if (cfg->fl.max_participated_rounds < 1) {
-    cfg->fl.max_participated_rounds = 1;
-  }
-  if (cfg->fl.max_participated_rounds > 100000) {
-    cfg->fl.max_participated_rounds = 100000;
-  }
-  if (cfg->fl.gradient_chunk_size_kb < 16) {
-    cfg->fl.gradient_chunk_size_kb = 16;
-  }
-  if (cfg->fl.gradient_chunk_size_kb > 4096) {
-    cfg->fl.gradient_chunk_size_kb = 4096;
-  }
-  if (cfg->fl.local_epochs < 1) {
-    cfg->fl.local_epochs = 1;
-  }
-  if (cfg->fl.local_epochs > 100) {
-    cfg->fl.local_epochs = 100;
-  }
-  if (cfg->fl.mock_round_interval_s > 86400u) {
-    cfg->fl.mock_round_interval_s = 86400u;
-  }
-  {
-    size_t i;
-    if (cfg->fl.model_target[0] == '\0') {
-      snprintf(cfg->fl.model_target, sizeof(cfg->fl.model_target), "%s", "static");
-    }
-    for (i = 0; i < sizeof(cfg->fl.model_target) && cfg->fl.model_target[i]; i++) {
-      cfg->fl.model_target[i] = (char)tolower((unsigned char)cfg->fl.model_target[i]);
-    }
-    if (strcmp(cfg->fl.model_target, "static") != 0 && strcmp(cfg->fl.model_target, "behavior") != 0) {
-      snprintf(cfg->fl.model_target, sizeof(cfg->fl.model_target), "%s", "static");
-    }
-  }
-  if (cfg->fl.frozen_layer_count_static > EDR_FL_FROZEN_MAX) {
-    cfg->fl.frozen_layer_count_static = EDR_FL_FROZEN_MAX;
-  }
-  if (cfg->fl.frozen_layer_count_behavior > EDR_FL_FROZEN_MAX) {
-    cfg->fl.frozen_layer_count_behavior = EDR_FL_FROZEN_MAX;
-  }
-
   /* §19.8 攻击面：间隔秒数、TOP 上限、防火墙规则枚举上限 */
   {
     uint32_t *iv[] = {
@@ -2116,12 +2021,6 @@ static void edr_config_clamp(EdrConfig *cfg) {
   }
   if (cfg->ave.l4_realtime_anomaly_threshold > 1.f) {
     cfg->ave.l4_realtime_anomaly_threshold = 1.f;
-  }
-  if (cfg->ave.static_infer_cache_max_entries > 4096u) {
-    cfg->ave.static_infer_cache_max_entries = 4096u;
-  }
-  if (cfg->ave.static_infer_cache_ttl_s > 864000u) {
-    cfg->ave.static_infer_cache_ttl_s = 864000u;
   }
   if (cfg->health_monitor.profile[0] == '\0') {
     snprintf(cfg->health_monitor.profile, sizeof(cfg->health_monitor.profile), "%s", "basic");
@@ -2244,13 +2143,6 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->policy_v2.ransomware_honey = true;
   cfg->policy_v2.ransomware_forensic = true;
 
-#ifdef _WIN32
-  /* 与 agent.toml.example / WINDOWS_DEPLOY 约定一致；无配置时仍建议显式写 [ave].model_dir */
-  snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s",
-           "C:\\Program Files\\FDSecurity\\models");
-#else
-  snprintf(cfg->ave.model_dir, sizeof(cfg->ave.model_dir), "%s", "/opt/edr/models");
-#endif
   cfg->ave.enabled = true;
   cfg->ave.scan_threads = 2;
   cfg->ave.max_file_size_mb = 256;
@@ -2264,14 +2156,11 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->ave.file_whitelist_db_path[0] = '\0';
   cfg->ave.ioc_db_path[0] = '\0';
   cfg->ave.ioc_precheck_enabled = true;
-  cfg->ave.static_model_enabled = true;
   cfg->ave.behavior_policy_db_path[0] = '\0';
   cfg->ave.behavior_monitor_enabled = false;
   cfg->ave.cert_revocation_check = false;
   cfg->ave.l4_realtime_behavior_link = false;
   cfg->ave.l4_realtime_anomaly_threshold = 0.65f;
-  cfg->ave.static_infer_cache_max_entries = 0u;
-  cfg->ave.static_infer_cache_ttl_s = 0u;
 
   cfg->upload.batch_max_events = 500u;
   cfg->upload.batch_max_size_mb = 4u;
@@ -2300,8 +2189,6 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
   cfg->resource_limit.emergency_cpu_limit = 5u;
-  cfg->resource_limit.ave_infer_per_min = 120u;
-  cfg->resource_limit.behavior_infer_per_min = 30u;
   cfg->resource_limit.pmfe_scans_per_min = 3u;
   cfg->resource_limit.webshell_scan_mb_per_min = 64u;
   cfg->resource_limit.shellcode_packets_per_sec = 2000u;
@@ -2382,25 +2269,6 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
   cfg->webshell_detector.upload_webshell_files = true;
   cfg->webshell_detector.upload_timeout_s = 60u;
   cfg->webshell_detector.max_upload_size_mb = 10u;
-
-  cfg->fl.enabled = false;
-  cfg->fl.coordinator_grpc_addr[0] = '\0';
-  cfg->fl.coordinator_http_url[0] = '\0';
-  cfg->fl.privacy_budget_db_path[0] = '\0';
-  cfg->fl.fl_samples_db_path[0] = '\0';
-  cfg->fl.min_new_samples = 100;
-  cfg->fl.idle_cpu_threshold = 0.3f;
-  cfg->fl.local_epochs = 3;
-  cfg->fl.dp_epsilon = 1.2f;
-  cfg->fl.dp_clip_norm = 1.0f;
-  cfg->fl.max_participated_rounds = 50;
-  cfg->fl.gradient_chunk_size_kb = 256;
-  cfg->fl.mock_round_interval_s = 0u;
-  snprintf(cfg->fl.model_target, sizeof(cfg->fl.model_target), "%s", "static");
-  cfg->fl.coordinator_secp256r1_pubkey_hex[0] = '\0';
-  cfg->fl.coordinator_secp256r1_pub_len = 0u;
-  cfg->fl.frozen_layer_count_static = 0;
-  cfg->fl.frozen_layer_count_behavior = 0;
 
   cfg->command.allow_dangerous = false;
   cfg->command.allow_rtq_readonly = true;
@@ -2707,172 +2575,6 @@ static void load_config_signing(toml_table_t *t, EdrConfig *cfg) {
     snprintf(cfg->config_signing.public_key_pem, sizeof(cfg->config_signing.public_key_pem), "%s", expanded);
   }
 }
-
-/** 解析 `[fl] coordinator_secp256r1_pubkey_hex` → SEC1 点（33 或 65 字节） */
-static int parse_p256_pubkey_hex(const char *hex, uint8_t *out, size_t out_cap, uint32_t *out_len) {
-  const char *p = hex;
-  size_t n = 0;
-  if (!hex || !out || !out_len) {
-    return -1;
-  }
-  while (*p == ' ' || *p == '\t') {
-    p++;
-  }
-  if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-    p += 2;
-  }
-  while (*p) {
-    unsigned int v;
-    if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
-      break;
-    }
-    if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1])) {
-      return -1;
-    }
-    if (sscanf(p, "%2x", &v) != 1) {
-      return -1;
-    }
-    if (n >= out_cap) {
-      return -1;
-    }
-    out[n++] = (uint8_t)v;
-    p += 2;
-  }
-  *out_len = (uint32_t)n;
-  if (n != 33u && n != 65u) {
-    return -1;
-  }
-  return 0;
-}
-
-static void sanitize_fl_frozen_name(const char *in, char *out, size_t out_cap) {
-  size_t j = 0;
-  const char *p = in;
-  if (!in || !out || out_cap < 2u) {
-    if (out && out_cap > 0u) {
-      out[0] = '\0';
-    }
-    return;
-  }
-  while (*p && j + 1u < out_cap) {
-    unsigned char c = (unsigned char)*p++;
-    if (c <= 32u) {
-      continue;
-    }
-    if (strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-", (int)c) != NULL) {
-      out[j++] = (char)c;
-    } else {
-      out[j++] = '_';
-    }
-  }
-  out[j] = '\0';
-}
-
-static void load_fl_frozen_array(toml_table_t *fz, const char *key, char buf[][EDR_FL_FROZEN_NAME_MAX], size_t *count) {
-  toml_array_t *arr = toml_array_in(fz, key);
-  int ni;
-  int i;
-  *count = 0;
-  if (!arr) {
-    return;
-  }
-  ni = toml_array_nelem(arr);
-  for (i = 0; i < ni && *count < EDR_FL_FROZEN_MAX; i++) {
-    toml_datum_t d = toml_string_at(arr, i);
-    if (!d.ok || !d.u.s) {
-      continue;
-    }
-    sanitize_fl_frozen_name(d.u.s, buf[*count], EDR_FL_FROZEN_NAME_MAX);
-    free(d.u.s);
-    if (buf[*count][0]) {
-      (*count)++;
-    }
-  }
-}
-
-static void load_fl(toml_table_t *t, EdrConfig *cfg) {
-  {
-    toml_datum_t d = toml_bool_in(t, "enabled");
-    if (d.ok) {
-      cfg->fl.enabled = d.u.b ? true : false;
-    }
-  }
-  take_string(toml_string_in(t, "coordinator_grpc_addr"), cfg->fl.coordinator_grpc_addr,
-              sizeof(cfg->fl.coordinator_grpc_addr));
-  take_string(toml_string_in(t, "coordinator_http_url"), cfg->fl.coordinator_http_url,
-              sizeof(cfg->fl.coordinator_http_url));
-  take_string(toml_string_in(t, "coordinator_secp256r1_pubkey_hex"), cfg->fl.coordinator_secp256r1_pubkey_hex,
-              sizeof(cfg->fl.coordinator_secp256r1_pubkey_hex));
-  if (cfg->fl.coordinator_secp256r1_pubkey_hex[0]) {
-    if (parse_p256_pubkey_hex(cfg->fl.coordinator_secp256r1_pubkey_hex, cfg->fl.coordinator_secp256r1_pub,
-                              sizeof(cfg->fl.coordinator_secp256r1_pub),
-                              &cfg->fl.coordinator_secp256r1_pub_len) != 0) {
-      cfg->fl.coordinator_secp256r1_pub_len = 0u;
-    }
-  } else {
-    cfg->fl.coordinator_secp256r1_pub_len = 0u;
-  }
-  take_string(toml_string_in(t, "privacy_budget_db_path"), cfg->fl.privacy_budget_db_path,
-              sizeof(cfg->fl.privacy_budget_db_path));
-  take_string(toml_string_in(t, "fl_samples_db_path"), cfg->fl.fl_samples_db_path,
-              sizeof(cfg->fl.fl_samples_db_path));
-  take_string(toml_string_in(t, "model_target"), cfg->fl.model_target, sizeof(cfg->fl.model_target));
-  {
-    toml_datum_t d = toml_int_in(t, "min_new_samples");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 10000000) {
-      cfg->fl.min_new_samples = (int)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_double_in(t, "idle_cpu_threshold");
-    if (d.ok) {
-      cfg->fl.idle_cpu_threshold = (float)d.u.d;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "local_epochs");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 1000) {
-      cfg->fl.local_epochs = (int)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_double_in(t, "dp_epsilon");
-    if (d.ok) {
-      cfg->fl.dp_epsilon = (float)d.u.d;
-    }
-  }
-  {
-    toml_datum_t d = toml_double_in(t, "dp_clip_norm");
-    if (d.ok) {
-      cfg->fl.dp_clip_norm = (float)d.u.d;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "max_participated_rounds");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 10000000) {
-      cfg->fl.max_participated_rounds = (int)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "gradient_chunk_size_kb");
-    if (d.ok && d.u.i >= 1 && d.u.i <= 100000) {
-      cfg->fl.gradient_chunk_size_kb = (int)d.u.i;
-    }
-  }
-  {
-    toml_datum_t d = toml_int_in(t, "mock_round_interval_s");
-    if (d.ok && d.u.i >= 0 && d.u.i <= 86400000) {
-      cfg->fl.mock_round_interval_s = (uint32_t)d.u.i;
-    }
-  }
-  {
-    toml_table_t *fz = toml_table_in(t, "frozen_layers");
-    if (fz) {
-      load_fl_frozen_array(fz, "static", cfg->fl.frozen_layer_static, &cfg->fl.frozen_layer_count_static);
-      load_fl_frozen_array(fz, "behavior", cfg->fl.frozen_layer_behavior, &cfg->fl.frozen_layer_count_behavior);
-    }
-  }
-  }
 
 static void load_attack_surface(toml_table_t *t, EdrConfig *cfg) {
   free(cfg->attack_surface.high_risk_immediate_ports);
@@ -3248,13 +2950,6 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
       take_string(toml_string_in(t, "ports"), cfg->net_fanout.ports, sizeof(cfg->net_fanout.ports));
     }
   }
-  {
-    toml_table_t *t = toml_table_in(root, "fl");
-    if (t) {
-      load_fl(t, cfg);
-    }
-  }
-
   toml_free(root);
   edr_config_clamp(cfg);
   apply_detection_policy_env(cfg);

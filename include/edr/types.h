@@ -58,6 +58,7 @@ typedef enum {
   /** §21 PMFE 内存扫描结论（经预处理 → 统一 HTTP 行为批次，与 ETW 路径一致） */
   EDR_EVENT_PMFE_SCAN_RESULT = 66,
   /** 主机行为告警帧（protobuf `BehaviorEvent.behavior_alert`，P0/PMFE/脚本等可复用） */
+  /* Legacy wire name retained for platform compatibility; emitted by the behavior heuristic. */
   EDR_EVENT_BEHAVIOR_ONNX_ALERT = 70,
   /** 行为簇摘要：端侧把被 coalesce 压制的同类低价值事件聚合成一条上报，替代重复明细。 */
   EDR_EVENT_BEHAVIOR_SUMMARY = 71,

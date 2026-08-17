@@ -56,11 +56,9 @@ sampling_rate_whitelist = 0.03
 rules_version        = "edr-dynamic-rules-v1"
 
 [ave]
-model_dir            = "C:\\Program Files\\FDSecurity\\models"
 scan_threads         = 1
 max_file_size_mb     = 256
 sensitivity          = "MEDIUM"
-static_model_enabled = true
 behavior_monitor_enabled = false
 
 [forensic_auto]
@@ -87,7 +85,6 @@ evidence_cache_retention_hours = 72
 cpu_limit_percent    = 10
 memory_limit_mb      = 512
 emergency_cpu_limit  = 25
-behavior_infer_per_min = 30
 
 [logging]
 level                = "info"

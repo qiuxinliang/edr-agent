@@ -1,5 +1,5 @@
 /**
- * 《11》§3 PidHistory：进程行为状态 + **128×64** 特征序列（用于 behavior.onnx）。
+ * 《11》§3 PidHistory：进程行为状态 + **128×64** 特征序列（用于行为启发式）。
  * 与 `AVEBehaviorEvent` 环形缓冲等价物：此处存 **已编码** 的 64 维向量序列（时间正序，最旧→最新）。
  */
 #ifndef EDR_PID_HISTORY_H
@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-/** 与 §6.1 / ONNX 默认一致；若模型 seq 更小，运行期截断 */
+/** 与现行行为特征窗口一致。 */
 #define EDR_PID_HISTORY_MAX_SEQ 128
 #define EDR_PID_HISTORY_FEAT_DIM 64
 

@@ -1,4 +1,4 @@
-// 与《EDR 端点详细设计》§6.1 一致；`AveBehaviorEventFeed` 与《11_behavior.onnx详细设计》§4.1 / `AVEBehaviorEvent` 对齐。
+// 与《EDR 端点详细设计》§6.1 一致；`AveBehaviorEventFeed` 与行为事件契约 / `AVEBehaviorEvent` 对齐。
 // nanopb：src/proto/edr/v1/event.pb.{h,c}（scripts/regen_event_proto.sh；需与本机 protobuf 版本匹配）。
 // Go 服务端生成：edr-backend/platform/Makefile proto（internal/edrpb/edrv1）。
 syntax = "proto3";
@@ -7,7 +7,7 @@ package edr.v1;
 
 option go_package = "edr-backend/platform/internal/edrpb/edrv1;edrv1";
 
-// 《11_behavior.onnx详细设计》§4.1：`AVEBehaviorEvent` 标准载荷（ETW/预处理 → 行为 ONNX）。
+// 《11》§4.1：`AVEBehaviorEvent` 标准载荷（ETW/预处理 → 行为启发式）。
 // 与 `include/edr/ave_sdk.h` 中 `AVEBehaviorEvent` 字段语义一致；嵌于 `BehaviorEvent` 供平台强类型入库与特征重建。
 // `BehaviorEvent.type` 为平台 `EdrEventType`；`ave_event_type` 为 **AVEEventType**（0–13），二者缺省可独立填写。
 message AveBehaviorEventFeed {
@@ -59,7 +59,7 @@ message AveBehaviorEventFeed {
   optional int32 ave_event_type = 29;
 }
 
-// §12.4 behavior.onnx → 平台：与《11_behavior.onnx详细设计》AVEBehaviorAlert 对齐（嵌于 BehaviorEvent 或单独帧）。
+// §12.4 行为启发式 → 平台：与《11》AVEBehaviorAlert 对齐（嵌于 BehaviorEvent 或单独帧）。
 message BehaviorAlert {
   float anomaly_score = 1;           // 0–1
   // 固定 14 维；nanopb 默认对 repeated 标量走 packed（LEN）；ingest 侧仍归一为 14 浮点再入库。
@@ -113,10 +113,10 @@ message BehaviorEvent {
   repeated string mitre_ttps = 31;
   uint32 priority = 32;
 
-  // 行为 ONNX 高危/中危告警载荷（与 ave_result_json 二选一或并存；上报时优先填本字段便于平台强类型入库）
+  // 行为启发式高危/中危告警载荷（与 ave_result_json 二选一或并存；上报时优先填本字段便于平台强类型入库）
   BehaviorAlert behavior_alert = 40;
 
-  // 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台 ONNX/检索优先读本消息）
+  // 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台检索优先读本消息）
   optional AveBehaviorEventFeed ave_behavior_feed = 41;
 }
 

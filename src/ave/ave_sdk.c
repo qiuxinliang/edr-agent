@@ -1,5 +1,5 @@
 /**
- * AVEngine SDK — Phase 1：对接 edr_ave_* / ONNX 推理，完整 API 占位见 ave_sdk.h。
+ * AVEngine SDK — rule, allow-list, and behavior-heuristic operations.
  */
 
 #include "edr/ave_sdk.h"
@@ -12,8 +12,6 @@
 #include "ave_suppression.h"
 #include "ave_rules_meta.h"
 #include "ave_behavior_pipeline.h"
-#include "ave_onnx_infer.h"
-#include "ave_hotfix.h"
 #include "ave_db_update.h"
 
 #include <errno.h>
@@ -101,14 +99,6 @@ static int edr_err_to_ave(EdrError e) {
   }
 }
 
-/** 将后端 score（可能为 logit）映射到 (0,1) 便于与阈值比较 */
-static float score_to_unit(float s) {
-  if (s >= 0.0f && s <= 1.0f) {
-    return s;
-  }
-  return 1.0f / (1.0f + expf(-s));
-}
-
 static int64_t mono_ms(void) {
 #ifdef _WIN32
   return (int64_t)GetTickCount64();
@@ -119,135 +109,6 @@ static int64_t mono_ms(void) {
   }
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 #endif
-}
-
-#ifndef EDR_AVE_INFER_CACHE_CAP
-#define EDR_AVE_INFER_CACHE_CAP 256u
-#endif
-
-typedef struct {
-  char sha256[65];
-  EdrAveInferResult infer;
-  int64_t inserted_ms;
-} AveInferCacheEntry;
-
-static AveInferCacheEntry s_infer_cache[EDR_AVE_INFER_CACHE_CAP];
-static size_t s_infer_cache_n;
-static int64_t s_infer_budget_window_ms;
-static uint32_t s_infer_budget_count;
-static uint64_t s_infer_budget_drops;
-
-void edr_ave_infer_cache_clear(void) {
-  s_infer_cache_n = 0;
-  memset(s_infer_cache, 0, sizeof(s_infer_cache));
-}
-
-static void infer_cache_mru_touch(size_t idx) {
-  if (idx == 0u || idx >= s_infer_cache_n) {
-    return;
-  }
-  AveInferCacheEntry t = s_infer_cache[idx];
-  memmove(&s_infer_cache[1], s_infer_cache, idx * sizeof(AveInferCacheEntry));
-  s_infer_cache[0] = t;
-}
-
-static uint32_t infer_cache_max_effective(const EdrConfig *pcfg) {
-  uint32_t m = pcfg->ave.static_infer_cache_max_entries;
-  const char *ev = getenv("EDR_AVE_STATIC_INFER_CACHE_MAX");
-  if (ev && ev[0]) {
-    char *end = NULL;
-    unsigned long v = strtoul(ev, &end, 10);
-    (void)end;
-    if (v <= (unsigned long)EDR_AVE_INFER_CACHE_CAP) {
-      m = (uint32_t)v;
-    }
-  }
-  if (m > (uint32_t)EDR_AVE_INFER_CACHE_CAP) {
-    m = (uint32_t)EDR_AVE_INFER_CACHE_CAP;
-  }
-  return m;
-}
-
-static uint32_t infer_cache_ttl_effective(const EdrConfig *pcfg) {
-  uint32_t t = pcfg->ave.static_infer_cache_ttl_s;
-  const char *ev = getenv("EDR_AVE_STATIC_INFER_CACHE_TTL_S");
-  if (ev && ev[0]) {
-    char *end = NULL;
-    unsigned long v = strtoul(ev, &end, 10);
-    (void)end;
-    if (v <= 8640000UL) {
-      t = (uint32_t)v;
-    }
-  }
-  return t;
-}
-
-static int infer_cache_get(const char *sha256, EdrAveInferResult *out, uint32_t ttl_s) {
-  int64_t now = mono_ms();
-  for (size_t i = 0; i < s_infer_cache_n; i++) {
-    if (strcmp(s_infer_cache[i].sha256, sha256) != 0) {
-      continue;
-    }
-    if (ttl_s > 0u) {
-      int64_t age = now - s_infer_cache[i].inserted_ms;
-      if (age > (int64_t)ttl_s * 1000) {
-        memmove(&s_infer_cache[i], &s_infer_cache[i + 1u],
-                (s_infer_cache_n - i - 1u) * sizeof(AveInferCacheEntry));
-        s_infer_cache_n--;
-        return 0;
-      }
-    }
-    *out = s_infer_cache[i].infer;
-    infer_cache_mru_touch(i);
-    return 1;
-  }
-  return 0;
-}
-
-static void infer_cache_put(const char *sha256, const EdrAveInferResult *infer, size_t max_n) {
-  if (max_n == 0u) {
-    return;
-  }
-  if (max_n > (size_t)EDR_AVE_INFER_CACHE_CAP) {
-    max_n = (size_t)EDR_AVE_INFER_CACHE_CAP;
-  }
-  for (size_t i = 0; i < s_infer_cache_n; i++) {
-    if (strcmp(s_infer_cache[i].sha256, sha256) == 0) {
-      memmove(&s_infer_cache[i], &s_infer_cache[i + 1u],
-              (s_infer_cache_n - i - 1u) * sizeof(AveInferCacheEntry));
-      s_infer_cache_n--;
-      break;
-    }
-  }
-  if (s_infer_cache_n >= max_n) {
-    if (max_n < 1u) {
-      return;
-    }
-    s_infer_cache_n--;
-  }
-  memmove(&s_infer_cache[1], s_infer_cache, s_infer_cache_n * sizeof(AveInferCacheEntry));
-  snprintf(s_infer_cache[0].sha256, sizeof(s_infer_cache[0].sha256), "%s", sha256);
-  s_infer_cache[0].infer = *infer;
-  s_infer_cache[0].inserted_ms = mono_ms();
-  s_infer_cache_n++;
-}
-
-static int ave_infer_budget_allow(const EdrConfig *pcfg) {
-  if (!pcfg || pcfg->resource_limit.ave_infer_per_min == 0u) {
-    return 1;
-  }
-  int64_t now = mono_ms();
-  if (s_infer_budget_window_ms == 0 || now < s_infer_budget_window_ms ||
-      now - s_infer_budget_window_ms >= 60000) {
-    s_infer_budget_window_ms = now;
-    s_infer_budget_count = 0u;
-  }
-  if (s_infer_budget_count >= pcfg->resource_limit.ave_infer_per_min) {
-    s_infer_budget_drops++;
-    return 0;
-  }
-  s_infer_budget_count++;
-  return 1;
 }
 
 static int hash_file_sha256(const char *path, char out65[65]) {
@@ -274,112 +135,7 @@ static int hash_file_sha256(const char *path, char out65[65]) {
   return 0;
 }
 
-static void apply_infer_verdict(const EdrAveInferResult *infer, AVEScanResult *out) {
-  if (infer->onnx_layout == 1) {
-    static const char *const kFam[32] = {
-        "Ransomware",      "Trojan.Dropper", "Trojan.Downloader", "Backdoor",   "Rootkit",
-        "Spyware",         "Adware",         "Worm",              "Exploit",    "Cryptominer",
-        "Infostealer",     "RAT",            "Banker",            "Fileless",   "Packer.Malicious",
-        "Emotet",          "TrickBot",       "Lockbit",           "Cobalt_Strike", "Mimikatz",
-        "Meterpreter",     "AgentTesla",     "AsyncRAT",          "NJRat",      "RedLineStealer",
-        "Qakbot",          "IcedID",         "PlugX",             "ShadowPad",  "APT_Tool_Generic",
-        "Hacktool_Generic", "Unknown_Malware"};
-    int vi = 0;
-    float mx = infer->verdict_probs[0];
-    for (int i = 1; i < 4; i++) {
-      if (infer->verdict_probs[i] > mx) {
-        mx = infer->verdict_probs[i];
-        vi = i;
-      }
-    }
-    /* 静态 SUSPICIOUS 低置信 → 降 CLEAN；0.40 与《11》§7 `EDR_AVE_BEH_SCORE_MEDIUM_LOW` 同刻度，规则域不同 */
-    if (vi == 1 && infer->verdict_probs[1] < 0.40f) {
-      vi = 0;
-      mx = infer->verdict_probs[0];
-    }
-    out->raw_confidence = mx;
-    out->final_confidence = mx;
-    switch (vi) {
-      case 0:
-        out->raw_ai_verdict = VERDICT_CLEAN;
-        out->final_verdict = VERDICT_CLEAN;
-        break;
-      case 1:
-        out->raw_ai_verdict = VERDICT_SUSPICIOUS;
-        out->final_verdict = VERDICT_SUSPICIOUS;
-        break;
-      case 2:
-        out->raw_ai_verdict = VERDICT_MALWARE;
-        out->final_verdict = VERDICT_MALWARE;
-        break;
-      case 3:
-        out->raw_ai_verdict = VERDICT_SUSPICIOUS;
-        out->final_verdict = VERDICT_SUSPICIOUS;
-        out->needs_l2_review = true;
-        break;
-      default:
-        out->raw_ai_verdict = VERDICT_CLEAN;
-        out->final_verdict = VERDICT_CLEAN;
-        break;
-    }
-    snprintf(out->verification_layer, sizeof(out->verification_layer), "AI");
-    snprintf(out->rule_name, sizeof(out->rule_name), "%s", "static_onnx");
-    out->family_name[0] = '\0';
-    {
-      int fi = 0;
-      float fmx = infer->family_probs[0];
-      for (int i = 1; i < 32; i++) {
-        if (infer->family_probs[i] > fmx) {
-          fmx = infer->family_probs[i];
-          fi = i;
-        }
-      }
-      if (fmx > 0.50f) {
-        snprintf(out->family_name, sizeof(out->family_name), "%s", kFam[fi]);
-      }
-    }
-    out->is_packed = false;
-    for (int i = 0; i < 8; i++) {
-      if (infer->packer_probs[i] > 0.60f) {
-        out->is_packed = true;
-        break;
-      }
-    }
-    return;
-  }
-
-  float c = score_to_unit(infer->score);
-  out->raw_confidence = c;
-  out->final_confidence = c;
-  if (c >= s_l3_trigger) {
-    out->raw_ai_verdict = VERDICT_MALWARE;
-    out->final_verdict = VERDICT_MALWARE;
-  } else if (c >= s_fp_floor) {
-    out->raw_ai_verdict = VERDICT_SUSPICIOUS;
-    out->final_verdict = VERDICT_SUSPICIOUS;
-  } else {
-    out->raw_ai_verdict = VERDICT_CLEAN;
-    out->final_verdict = VERDICT_CLEAN;
-  }
-  snprintf(out->verification_layer, sizeof(out->verification_layer), "AI");
-}
-
-static void apply_onnx_boost(AVEScanResult *out, float boost) {
-  if (boost <= 0.f) {
-    return;
-  }
-  out->final_confidence = fminf(1.f, out->final_confidence + boost);
-  out->raw_confidence = fminf(1.f, out->raw_confidence + boost);
-  if (out->final_confidence >= s_l3_trigger) {
-    out->final_verdict = VERDICT_MALWARE;
-    out->raw_ai_verdict = VERDICT_MALWARE;
-  } else if (out->final_confidence >= s_fp_floor) {
-    out->final_verdict = VERDICT_SUSPICIOUS;
-    out->raw_ai_verdict = VERDICT_SUSPICIOUS;
-  }
-}
-
-/** L3 IOC：已知恶意哈希，跳过 ONNX（优先于 L2 哈希白名单，避免双库冲突误放行） */
+/** L3 IOC：已知恶意哈希优先于 L2 哈希白名单，避免双库冲突误放行。 */
 static void fill_ioc_file_hash(AVEScanResult *out, int severity) {
   (void)severity;
   out->raw_ai_verdict = VERDICT_MALWARE;
@@ -391,7 +147,7 @@ static void fill_ioc_file_hash(AVEScanResult *out, int severity) {
   out->skip_ai_analysis = true;
 }
 
-/** L2：文件哈希白名单，跳过 ONNX */
+/** L2：文件哈希白名单。 */
 static void fill_file_hash_whitelist(AVEScanResult *out) {
   out->raw_ai_verdict = VERDICT_CLEAN;
   out->final_verdict = VERDICT_WHITELISTED;
@@ -431,7 +187,7 @@ static void apply_tenant_noise_policy(const EdrConfig *pcfg, AVEScanResult *out)
   if (override && override[0]) {
     snprintf(model_version, sizeof(model_version), "%s", override);
   } else {
-    edr_onnx_static_model_version(model_version, sizeof(model_version));
+    snprintf(model_version, sizeof(model_version), "%s", "rules-only-v1");
   }
   EdrAveTenantNoiseDecision dec;
   if (!edr_ave_tenant_noise_lookup(pcfg, pcfg->agent.tenant_id, model_version, out->rule_name,
@@ -474,10 +230,6 @@ int AVE_Init(const AVEConfig *config) {
     edr_config_free_heap(&g_cfg);
     memset(&g_cfg, 0, sizeof(g_cfg));
     return AVE_ERR_INTERNAL;
-  }
-
-  if (config->model_dir && config->model_dir[0]) {
-    snprintf(g_cfg.ave.model_dir, sizeof(g_cfg.ave.model_dir), "%s", config->model_dir);
   }
 
   int threads = config->max_concurrent_scans > 0 ? config->max_concurrent_scans : 4;
@@ -575,12 +327,8 @@ int AVE_SyncFromEdrConfig(const EdrConfig *cfg) {
   if (!cfg) {
     return AVE_ERR_INVALID_PARAM;
   }
-  EdrError e = edr_ave_reload_models(cfg);
   edr_ave_bp_configure_resource_limits(cfg);
-  if (e == EDR_OK) {
-    edr_ave_infer_cache_clear();
-  }
-  return edr_err_to_ave(e);
+  return AVE_OK;
 }
 
 int AVE_RegisterCallbacks(const AVECallbacks *callbacks) {
@@ -615,7 +363,6 @@ void AVE_Shutdown(void) {
     return;
   }
   scan_lock();
-  edr_ave_infer_cache_clear();
   edr_ave_bp_shutdown();
   edr_ave_shutdown();
   if (s_owns_edr_config) {
@@ -640,8 +387,6 @@ int AVE_GetStatus(AVEStatus *status_out) {
   status_out->initialized = g_initialized ? true : false;
   status_out->behavior_monitor_running = edr_ave_bp_monitor_running() ? true : false;
   status_out->behavior_event_queue_size = (int)edr_ave_bp_queue_depth();
-  edr_onnx_static_model_version(status_out->static_model_version, sizeof(status_out->static_model_version));
-  edr_onnx_behavior_model_version(status_out->behavior_model_version, sizeof(status_out->behavior_model_version));
 #ifdef EDR_HAVE_SQLITE
   {
     const EdrConfig *pcfg = active_edr_config();
@@ -790,19 +535,18 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     return AVE_OK;
   }
 
-  int skip_onnx = 0;
-  float onnx_boost = 0.f;
+  int skip_static_analysis = 0;
   if (pcfg->ave.cert_whitelist_enabled) {
-    edr_ave_sign_stage0(pcfg, file_path, result_out->sha256, result_out, &skip_onnx, &onnx_boost);
+    edr_ave_sign_stage0(pcfg, file_path, result_out->sha256, result_out, &skip_static_analysis);
   }
-  if (skip_onnx) {
+  if (skip_static_analysis) {
     int64_t t1done = mono_ms();
     result_out->scan_duration_ms = t1done - t0;
     ave_bp_merge_static_if_subject(subject_pid, result_out);
     return AVE_OK;
   }
 
-  /* L3 IOC 预检（可关）：先于 L2 哈希白名单；关则仅 ONNX 后二次核对 */
+  /* L3 IOC 预检（可关）：先于 L2 哈希白名单；关闭时仍在规则阶段二次核对。 */
   if (pcfg->ave.ioc_precheck_enabled) {
     int ioc_sev = 3;
     if (edr_ave_ioc_file_hit(pcfg, result_out->sha256, &ioc_sev)) {
@@ -821,83 +565,48 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     return AVE_OK;
   }
 
-  scan_lock();
-  EdrAveInferResult infer;
-  memset(&infer, 0, sizeof(infer));
-  EdrError ie;
+  /* Endpoint model execution was retired.  A file that did not match a
+   * trusted rule stays clean; later L4 and tenant policy may still elevate or
+   * suppress the result using signed policy and behavior evidence. */
+  result_out->raw_ai_verdict = VERDICT_CLEAN;
+  result_out->final_verdict = VERDICT_CLEAN;
+  result_out->raw_confidence = 0.f;
+  result_out->final_confidence = 0.f;
+  snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "R0");
+  snprintf(result_out->rule_name, sizeof(result_out->rule_name), "rules_only_no_match");
   {
-    const char *dry = getenv("EDR_AVE_INFER_DRY_RUN");
-    int skip_cache = (dry && dry[0] == '1');
-    uint32_t cmax = infer_cache_max_effective(pcfg);
-    uint32_t cttl = infer_cache_ttl_effective(pcfg);
-    if (!skip_cache && cmax > 0u && infer_cache_get(result_out->sha256, &infer, cttl)) {
-      ie = EDR_OK;
-    } else if (!ave_infer_budget_allow(pcfg)) {
-      ie = EDR_ERR_AVE_SCAN_TIMEOUT;
-    } else {
-      ie = edr_ave_infer_file(pcfg, file_path, &infer);
-      if (ie == EDR_OK && !skip_cache && cmax > 0u) {
-        infer_cache_put(result_out->sha256, &infer, (size_t)cmax);
+    int ioc_sev2 = 3;
+    if (edr_ave_ioc_file_hit(pcfg, result_out->sha256, &ioc_sev2)) {
+      edr_ave_overlay_ioc_post_ai(result_out, ioc_sev2);
+    }
+  }
+  {
+    int esc = 1;
+    if (edr_ave_l4_non_exempt_hit(pcfg, result_out->sha256, &esc)) {
+      edr_ave_apply_l4_non_exempt(result_out, esc, s_fp_floor, s_l3_trigger);
+    }
+  }
+  {
+    int link = pcfg->ave.l4_realtime_behavior_link ? 1 : 0;
+    const char *el = getenv("EDR_AVE_L4_BEHAVIOR_LINK");
+    if (el && el[0] == '1') {
+      link = 1;
+    }
+    if (el && el[0] == '0') {
+      link = 0;
+    }
+    if (link && subject_pid != 0u) {
+      float sc = 0.f;
+      if (edr_ave_bp_get_score(subject_pid, &sc) == AVE_OK &&
+          sc >= pcfg->ave.l4_realtime_anomaly_threshold) {
+        edr_ave_apply_l4_realtime_behavior(result_out, 1, s_fp_floor, s_l3_trigger);
       }
     }
   }
-  scan_unlock();
-  int64_t t1 = mono_ms();
-  result_out->scan_duration_ms = t1 - t0;
-
-  if (ie == EDR_OK) {
-    apply_infer_verdict(&infer, result_out);
-    if (onnx_boost > 0.f) {
-      apply_onnx_boost(result_out, onnx_boost);
-    }
-    {
-      int ioc_sev2 = 3;
-      if (edr_ave_ioc_file_hit(pcfg, result_out->sha256, &ioc_sev2)) {
-        edr_ave_overlay_ioc_post_ai(result_out, ioc_sev2);
-      }
-    }
-    {
-      int esc = 1;
-      if (edr_ave_l4_non_exempt_hit(pcfg, result_out->sha256, &esc)) {
-        edr_ave_apply_l4_non_exempt(result_out, esc, s_fp_floor, s_l3_trigger);
-      }
-    }
-    {
-      int link = pcfg->ave.l4_realtime_behavior_link ? 1 : 0;
-      const char *el = getenv("EDR_AVE_L4_BEHAVIOR_LINK");
-      if (el && el[0] == '1') {
-        link = 1;
-      }
-      if (el && el[0] == '0') {
-        link = 0;
-      }
-      if (link && subject_pid != 0u) {
-        float sc = 0.f;
-        if (edr_ave_bp_get_score(subject_pid, &sc) == AVE_OK &&
-            sc >= pcfg->ave.l4_realtime_anomaly_threshold) {
-          edr_ave_apply_l4_realtime_behavior(result_out, 1, s_fp_floor, s_l3_trigger);
-        }
-      }
-    }
-    apply_tenant_noise_policy(pcfg, result_out);
-    ave_bp_merge_static_if_subject(subject_pid, result_out);
-    return AVE_OK;
-  }
-
-  if (ie == EDR_ERR_NOT_IMPL) {
-    result_out->raw_ai_verdict = VERDICT_ERROR;
-    result_out->final_verdict = VERDICT_ERROR;
-    snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "");
-    return AVE_ERR_NOT_IMPL;
-  }
-
-  if (ie == EDR_ERR_AVE_SCAN_TIMEOUT) {
-    result_out->raw_ai_verdict = VERDICT_TIMEOUT;
-    result_out->final_verdict = VERDICT_TIMEOUT;
-    snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "%s",
-             "infer_budget_throttle");
-  }
-  return edr_err_to_ave(ie);
+  result_out->scan_duration_ms = mono_ms() - t0;
+  apply_tenant_noise_policy(pcfg, result_out);
+  ave_bp_merge_static_if_subject(subject_pid, result_out);
+  return AVE_OK;
 }
 
 int AVE_ScanFile(const char *file_path, AVEScanResult *result_out) {
@@ -1087,61 +796,6 @@ int AVE_ReportTruePositive(const char *sha256) {
   return AVE_OK;
 }
 
-int AVE_GetFLSampleCount(int *confirmed_malware_count, int *confirmed_clean_count) {
-  if (!confirmed_malware_count || !confirmed_clean_count) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  *confirmed_malware_count = 0;
-  *confirmed_clean_count = 0;
-  return AVE_OK;
-}
-
-int AVE_ApplyHotfix(const char *hotfix_path) {
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  if (!hotfix_path || !hotfix_path[0]) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  const EdrConfig *pcfg = active_edr_config();
-  if (!pcfg) {
-    return AVE_ERR_INTERNAL;
-  }
-  EdrError he = edr_ave_apply_hotfix_path(pcfg, hotfix_path);
-  if (he != EDR_OK) {
-    return edr_err_to_ave(he);
-  }
-  he = edr_ave_reload_models(pcfg);
-  if (he == EDR_OK) {
-    edr_ave_infer_cache_clear();
-  }
-  return he == EDR_OK ? AVE_OK : edr_err_to_ave(he);
-}
-
-int AVE_UpdateModel(const char *model_path, const char *pca_path) {
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  const EdrConfig *pcfg = active_edr_config();
-  if (!pcfg) {
-    return AVE_ERR_INTERNAL;
-  }
-  if (model_path && model_path[0]) {
-    EdrError e = edr_onnx_runtime_load(model_path, pcfg);
-    if (e != EDR_OK) {
-      return edr_err_to_ave(e);
-    }
-    edr_ave_infer_cache_clear();
-  }
-  if (pca_path && pca_path[0]) {
-    EdrError e = edr_onnx_behavior_load(pca_path, pcfg);
-    if (e != EDR_OK) {
-      return edr_err_to_ave(e);
-    }
-  }
-  return AVE_OK;
-}
-
 int AVE_UpdateWhitelist(const char *entries_json) {
   if (!g_initialized) {
     return AVE_ERR_NOT_INITIALIZED;
@@ -1179,157 +833,6 @@ int AVE_IsWhitelisted(const char *sha256) {
     return 0;
   }
   return edr_ave_file_hash_whitelist_hit(pcfg, sha256) ? 1 : 0;
-}
-
-/** 64 位十六进制 + '\0'。 */
-static int is_sha256_hex64(const char *s) {
-  if (!s) {
-    return 0;
-  }
-  for (int i = 0; i < 64; i++) {
-    char c = s[i];
-    if (c >= '0' && c <= '9') {
-      continue;
-    }
-    if (c >= 'a' && c <= 'f') {
-      continue;
-    }
-    if (c >= 'A' && c <= 'F') {
-      continue;
-    }
-    return 0;
-  }
-  return s[64] == '\0';
-}
-
-int AVE_ExportFeatureVector(const char *sha256, float *out_512d) {
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  if (!out_512d) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  if (!is_sha256_hex64(sha256)) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  /* Endpoint FL training was removed from product builds. Keep this SDK
-   * compatibility API deterministic by returning a zero feature vector. */
-  for (int i = 0; i < 512; i++) {
-    out_512d[i] = 0.0f;
-  }
-  return AVE_OK;
-}
-
-int AVE_ExportFeatureVectorEx(const char *sha256, float *out, size_t dim, int target) {
-  size_t i;
-
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  if (!out || dim == 0u || dim > AVE_FL_FEATURE_DIM_MAX) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  if (!is_sha256_hex64(sha256)) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  (void)target;
-  for (i = 0; i < dim; i++) {
-    out[i] = 0.0f;
-  }
-  return AVE_OK;
-}
-
-int AVE_ExportModelWeights(const char *target, void *buf, size_t *size) {
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  if (!target || !target[0] || !size) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  if (strcmp(target, "static") != 0 && strcmp(target, "behavior") != 0) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  if (strcmp(target, "static") == 0) {
-    int r = edr_onnx_static_export_weights(buf, size);
-    if (r == -1) {
-      return AVE_ERR_INVALID_PARAM;
-    }
-    if (r == 1) {
-      return AVE_ERR_NOT_IMPL;
-    }
-    if (r == 2) {
-      return AVE_ERR_BUFFER_TOO_SMALL;
-    }
-    if (r == 3) {
-      return AVE_ERR_INTERNAL;
-    }
-    return AVE_OK;
-  }
-  /* Legacy behavior model export: product builds normally return AVE_ERR_NOT_IMPL. */
-  int r = edr_onnx_behavior_export_weights(buf, size);
-  if (r == -1) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  if (r == 1) {
-    return AVE_ERR_NOT_IMPL;
-  }
-  if (r == 2) {
-    return AVE_ERR_BUFFER_TOO_SMALL;
-  }
-  if (r == 3) {
-    return AVE_ERR_INTERNAL;
-  }
-  return AVE_OK;
-}
-
-int AVE_ExportBehaviorFlTrainableTensors(float *out, size_t *out_nelem, char *manifest_json,
-                                         size_t manifest_cap) {
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  if (!out_nelem) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  int r = edr_onnx_behavior_export_fl_trainable_floats(out, out_nelem, manifest_json, manifest_cap);
-  if (r == -1) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  if (r == 1) {
-    return AVE_ERR_NOT_IMPL;
-  }
-  if (r == 2) {
-    return AVE_ERR_BUFFER_TOO_SMALL;
-  }
-  if (r == 3) {
-    return AVE_ERR_INTERNAL;
-  }
-  return AVE_OK;
-}
-
-int AVE_ImportModelWeights(const char *target, const void *buf, size_t size) {
-  if (!g_initialized) {
-    return AVE_ERR_NOT_INITIALIZED;
-  }
-  if (!target || !target[0]) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  (void)buf;
-  (void)size;
-  if (strcmp(target, "static") != 0 && strcmp(target, "behavior") != 0) {
-    return AVE_ERR_INVALID_PARAM;
-  }
-  /* Historical FL3 gradient envelopes are not ONNX model weights. */
-  if (buf && size >= 4u && memcmp(buf, "FL3", 3) == 0 && ((const uint8_t *)buf)[3] == 2u) {
-    return AVE_ERR_NOT_SUPPORTED;
-  }
-  /* Legacy development markers are accepted for compatibility only. */
-  if (buf && size >= 7u && memcmp(buf, "FLSTUB1", 7) == 0) {
-    return AVE_OK;
-  }
-  if (buf && size >= 4u && memcmp(buf, "FL2", 3) == 0) {
-    return AVE_OK;
-  }
-  return AVE_ERR_NOT_IMPL;
 }
 
 #ifdef _WIN32

@@ -123,7 +123,7 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
     if (!s_no_nanopb_logged) {
       fprintf(stderr,
               "[edr] FATAL: EDR_HAVE_NANOPB is not defined; ALL behavior alerts "
-              "(P0 direct emit + AVE ONNX) are being SILENTLY DISCARDED. "
+              "(P0 direct emit + AVE behavior heuristic) are being SILENTLY DISCARDED. "
               "Rebuild with nanopb support enabled.\n");
       s_no_nanopb_logged = 1;
     }

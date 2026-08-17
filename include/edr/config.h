@@ -13,11 +13,6 @@
 #include <stdint.h>
 #include <time.h>
 
-/** T-015：`[fl.frozen_layers]` 逻辑名列表上限（与《10》§5 示例对齐） */
-#define EDR_FL_FROZEN_MAX 16
-/** 单层逻辑名最大长度（ONNX 子串/模块名） */
-#define EDR_FL_FROZEN_NAME_MAX 64
-
 typedef struct EdrConfig {
 	  struct {
 	    char address[256];
@@ -150,7 +145,6 @@ typedef struct EdrConfig {
 
   struct {
     bool enabled;
-    char model_dir[1024];
     int scan_threads;
     int max_file_size_mb;
     char sensitivity[16];
@@ -162,12 +156,8 @@ typedef struct EdrConfig {
     char file_whitelist_db_path[1024];
     /** L3：已知恶意文件哈希 IOC（表 `ioc_file_hash`） */
     char ioc_db_path[1024];
-    /**
-     * 为 true（默认）时 ONNX 前做 IOC 预检；为 false 时仅 ONNX 后二次核对 IOC（便于与模型并行或热库后写）。
-     */
+    /** 为 true（默认）时先做 IOC 预检；为 false 时在规则阶段二次核对 IOC。 */
     bool ioc_precheck_enabled;
-    /** Static ONNX file model for EPP-style file verdicts. Product builds keep this enabled. */
-    bool static_model_enabled;
     /** L4：不可豁免文件哈希（表 `file_behavior_non_exempt`） */
     char behavior_policy_db_path[1024];
     /** `AVE_StartBehaviorMonitor` 是否拉起消费线程；生产默认关闭，按策略/应急触发开启。 */
@@ -177,24 +167,12 @@ typedef struct EdrConfig {
      * 可由环境变量 **`EDR_AVE_CERT_REVOCATION=0/1`** 覆盖（加载后于 clamp 中应用）。
      */
     bool cert_revocation_check;
-    /**
-     * ONNX 之后：若 **`AVE_ScanFileWithSubject`** 提供 `subject_pid`，且该 PID 行为异常分 ≥ 阈值，则叠加 L4 类覆盖（`rule_name=behavior_realtime`）。
-     */
+    /** 若 `AVE_ScanFileWithSubject` 提供 `subject_pid`，且该 PID 行为异常分 ≥ 阈值，则叠加 L4 类覆盖。 */
     bool l4_realtime_behavior_link;
     /**
      * 与行为管线 **`anomaly`** 对齐；产品默认等于 **`EDR_AVE_BEH_SCORE_HIGH`**（《11》§7.3，见 `ave_behavior_gates.h`）。
      */
     float l4_realtime_anomaly_threshold;
-    /**
-     * P2：`AVE_ScanFile` 在已通过 SHA256 后，对 **static ONNX** 推理结果做进程内 LRU；**0**=关闭。
-     * 可被 **`EDR_AVE_STATIC_INFER_CACHE_MAX`** 覆盖；实际上限见 `ave_sdk.c`。
-     */
-    uint32_t static_infer_cache_max_entries;
-    /**
-     * 缓存条目存活时间（秒）；**0**=不按时间过期（仅 LRU 驱逐）。
-     * 可被 **`EDR_AVE_STATIC_INFER_CACHE_TTL_S`** 覆盖。
-     */
-    uint32_t static_infer_cache_ttl_s;
   } ave;
 
   struct {
@@ -217,8 +195,6 @@ typedef struct EdrConfig {
     uint32_t cpu_limit_percent;
     uint32_t memory_limit_mb;
     uint32_t emergency_cpu_limit;
-    uint32_t ave_infer_per_min;
-    uint32_t behavior_infer_per_min;
     uint32_t pmfe_scans_per_min;
     uint32_t webshell_scan_mb_per_min;
     uint32_t shellcode_packets_per_sec;
@@ -498,48 +474,6 @@ typedef struct EdrConfig {
     char ports[256];                /* 逗号分隔扫描敏感端口;空=内置默认 */
   } net_fanout;
 
-  /**
-   * 联邦学习本地训练（FL §10）；TOML `[fl]`。
-   */
-  struct {
-    bool enabled;
-    /** 协调器 gRPC 地址，如 `coordinator.example.com:7443` */
-    char coordinator_grpc_addr[256];
-    /** C5：HTTP 梯度上传降级（空则仅用占位上传器） */
-    char coordinator_http_url[512];
-    /**
-     * P-256 协调方公钥，**十六进制**（可选 `0x` 前缀），长度 66 或 130 个十六进制字符
-     *（对应 33 字节压缩或 65 字节未压缩 SEC1）。与 `EDR_FL_CRYPTO_OPENSSL=1` 配合启用 **FL3**（ECDH+HKDF+GCM）。
-     */
-    char coordinator_secp256r1_pubkey_hex[288];
-    uint8_t coordinator_secp256r1_pub[96];
-    uint32_t coordinator_secp256r1_pub_len;
-    char privacy_budget_db_path[1024];
-    /** C3：`fl_samples.db` 路径（空则不注册特征查找，行为同 C0 全零） */
-    char fl_samples_db_path[1024];
-    int min_new_samples;
-    float idle_cpu_threshold;
-    int local_epochs;
-    float dp_epsilon;
-    float dp_clip_norm;
-    int max_participated_rounds;
-    int gradient_chunk_size_kb;
-    /** C2：>0 时协议线程周期性注入假 Round（联调 / 单测） */
-    uint32_t mock_round_interval_s;
-    /**
-     * 本轮本地训练向量语义：`static`（512 维，与 static ONNX 一致）或 `behavior`（默认 256 维 CLS）。
-     * 见 `docs/FL_ROUND_TRAINING_SEMANTICS.md`；`fl_samples.db` 当前仍以 static 枚举为主。
-     */
-    char model_target[32];
-    /**
-     * T-015：`[fl.frozen_layers]`，按 `model_target` 选用 static 或 behavior 列表。
-     * 名称与 ONNX initializer/模块名子串对齐；HTTP 上传会附带 `frozen_layer_names` JSON 字段供协调端/审计。
-     */
-    size_t frozen_layer_count_static;
-    char frozen_layer_static[EDR_FL_FROZEN_MAX][EDR_FL_FROZEN_NAME_MAX];
-    size_t frozen_layer_count_behavior;
-    char frozen_layer_behavior[EDR_FL_FROZEN_MAX][EDR_FL_FROZEN_NAME_MAX];
-  } fl;
 } EdrConfig;
 
 /** 设计文档默认值（无文件或未指定键时使用） */

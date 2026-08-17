@@ -154,7 +154,7 @@ function Repair-RuntimeDependencyAcls {
     & icacls.exe $Dir /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" /C /Q | Out-Null
   } catch {}
 
-  foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.toml", "*.json", "*.enc", "models\*", "edr_config\*")) {
+  foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.toml", "*.json", "*.enc", "edr_config\*")) {
     try {
       Get-ChildItem -Path (Join-Path $Dir $pattern) -Force -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object {
@@ -197,7 +197,7 @@ function Repair-SensitiveRuntimeAcls {
     } catch {}
   }
 
-  foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*", "models\*")) {
+  foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*")) {
     try {
       Get-ChildItem -Path (Join-Path $Dir $pattern) -Force -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object {

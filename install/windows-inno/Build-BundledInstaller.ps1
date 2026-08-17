@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-  Builds FDSecuritySetup-bundled.exe (full layout: staged exe/DLLs + models dir + preprocess TOML + scripts).
+  Builds FDSecuritySetup-bundled.exe (full layout: staged exe/DLLs + preprocess TOML + scripts).
   Run on Windows from the monorepo root OR from this directory.
 
   Default staging folder (relative to this .iss file): ..\..\..\edr-agent-win_2-2
@@ -247,14 +247,6 @@ foreach ($runtimePeFile in $runtimePeFiles) {
     & $archCheck -Path $runtimePeFile.FullName -Architecture $TargetArch
 }
 Write-Host "Verified Runtime PE closure: arch=$TargetArch files=$($runtimePeFiles.Count)"
-
-$modelsDir = Join-Path $agentRoot "models"
-if (Test-Path -LiteralPath $modelsDir) {
-    $onnx = Get-ChildItem -Path $modelsDir -Filter "*.onnx" -File -Recurse -ErrorAction SilentlyContinue
-    if (-not $onnx) {
-        Write-Warning "No .onnx under $modelsDir — install will still include README; copy models before build for a full stack."
-    }
-}
 
 $pre = Join-Path $repoRoot "edr-backend\platform\config\agent_preprocess_rules_v1.toml"
 if (-not (Test-Path -LiteralPath $pre)) {

@@ -87,7 +87,6 @@ jobs:
             -DEDR_WITH_GRPC=OFF `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `
-            -DEDR_WITH_ONNXRUNTIME=OFF `
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
             -DEDR_BUILD_TESTS=ON
@@ -154,7 +153,6 @@ jobs:
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DEDR_WITH_GRPC=OFF \
-            -DEDR_WITH_ONNXRUNTIME=OFF \
             -DEDR_WITH_YARA=ON \
             -DEDR_BUILD_TESTS=OFF
       - name: Build

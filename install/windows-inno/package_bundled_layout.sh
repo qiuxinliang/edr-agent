@@ -4,8 +4,7 @@
 #
 # Usage:
 #   ./package_bundled_layout.sh
-#   EDR_BIN_DIR=/path/to/stage EDR_BUNDLE_STRICT=1 ./package_bundled_layout.sh
-# EDR_BUNDLE_STRICT=1: fail if no static-capable .onnx is present
+#   EDR_BIN_DIR=/path/to/stage ./package_bundled_layout.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +20,6 @@ EDR_AGENT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUT_NAME="${EDR_BUNDLE_ZIP_NAME:-EDRAgent-bundled-payload-win-${ARCH}}"
 OUT_DIR="$SCRIPT_DIR/Output/${OUT_NAME}"
 ZIP_PATH="$SCRIPT_DIR/Output/${OUT_NAME}.zip"
-STRICT="${EDR_BUNDLE_STRICT:-0}"
 SIGNATURE_STATUS="${EDR_WINDOWS_SIGNATURE_STATUS:-unsigned}"
 case "$SIGNATURE_STATUS" in
   signed|unsigned) ;;
@@ -60,7 +58,7 @@ require_windivert_runtime() {
 }
 
 rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR/models" "$OUT_DIR/data"
+mkdir -p "$OUT_DIR/data"
 
 if [[ ! -d "$STAGE_DIR" ]]; then
   echo "Error: STAGE_DIR not found: $STAGE_DIR" >&2
@@ -99,14 +97,9 @@ else
 fi
 shopt -s nullglob
 DLL_COUNT=0
-BUNDLE_ONNX_RUNTIME="${EDR_BUNDLE_ONNX_RUNTIME:-0}"
-DLL_DENY_REGEX="${EDR_BUNDLE_DLL_DENY_REGEX:-(^|/)(onnxruntime.*|.*\\.(pdb|ilk|exp|lib|xml))$}"
+DLL_DENY_REGEX="${EDR_BUNDLE_DLL_DENY_REGEX:-(^|/)(.*\\.(pdb|ilk|exp|lib|xml))$}"
 for f in "$STAGE_DIR"/*.dll; do
   name="$(basename "$f")"
-  if [[ "$BUNDLE_ONNX_RUNTIME" != "1" && "$name" =~ ^onnxruntime.*\.dll$ ]]; then
-    echo "Info: skip large optional ONNX Runtime DLL from standard package: $name (set EDR_BUNDLE_ONNX_RUNTIME=1 to include)." >&2
-    continue
-  fi
   if [[ "$name" =~ $DLL_DENY_REGEX ]]; then
     echo "Info: skip denied runtime file: $name" >&2
     continue
@@ -132,15 +125,6 @@ else
 fi
 printf '%s\n' "{\"schema\":\"edr.windows.package-capabilities.v1\",\"target_arch\":\"${ARCH}\",\"arm64_emulation_supported\":false,\"arm64_emulation_network_packet_capture\":false,\"network_packet_capture\":${NETWORK_PACKET_CAPTURE},\"windows_firewall_isolation\":true,\"signature_status\":\"${SIGNATURE_STATUS}\"}" > "$OUT_DIR/package-capabilities.json"
 printf '%s\n' "$ARCH" > "$OUT_DIR/ARCH"
-
-# models: whitelist production-ready compact model artifacts only.
-if [[ -d "$EDR_AGENT_DIR/models" ]]; then
-  shopt -s nullglob
-  for f in "$EDR_AGENT_DIR/models"/README* "$EDR_AGENT_DIR/models"/pca_*.npy "$EDR_AGENT_DIR/models"/static.onnx "$EDR_AGENT_DIR/models"/static_quant*.onnx; do
-    [[ -f "$f" ]] && cp -a "$f" "$OUT_DIR/models/"
-  done
-  shopt -u nullglob
-fi
 
 PREP_TOML="$REPO_ROOT/edr-backend/platform/config/agent_preprocess_rules_v1.toml"
 if [[ -f "$PREP_TOML" ]]; then
@@ -284,36 +268,6 @@ fi
 # collector 目录若为空则移除,避免空目录入包
 rmdir "$COLLECTOR_OUT" 2>/dev/null || true
 
-# --- Full-stack checks (ONNX + rules) ---
-ONNX_LIST=0
-STATIC_CAND=0
-shopt -s nullglob
-for f in "$OUT_DIR/models"/*.onnx; do
-  [[ -f "$f" ]] || continue
-  ONNX_LIST=$((ONNX_LIST + 1))
-  b=$(basename "$f")
-  if [[ "$b" != "behavior.onnx" ]]; then
-    STATIC_CAND=1
-  fi
-done
-shopt -u nullglob
-
-check_fail() {
-  if [[ "$STRICT" == "1" ]]; then
-    echo "Error: $1" >&2
-    exit 1
-  fi
-  echo "Warning: $1" >&2
-}
-
-if [[ "$ONNX_LIST" -eq 0 ]]; then
-  check_fail "models/ has no .onnx — AVE static EPP will not run; not a full endpoint protection stack."
-else
-  if [[ "$STATIC_CAND" -ne 1 ]]; then
-    check_fail "static engine needs a non-behavior .onnx (e.g. static.onnx)."
-  fi
-fi
-
 # Drop macOS junk from payload
 find "$OUT_DIR" -name '.DS_Store' -delete 2>/dev/null || true
 
@@ -361,4 +315,3 @@ for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.tx
 done
 echo "OK: $ZIP_PATH"
 echo "Read BUNDLE_README inside the zip for full terminal feature coverage and out-of-band items."
-echo "Optional: EDR_BUNDLE_STRICT=1 to require a static .onnx before zipping."

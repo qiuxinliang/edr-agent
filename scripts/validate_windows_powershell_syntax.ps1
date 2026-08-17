@@ -24,7 +24,6 @@ $relativePaths = @(
   "scripts\invoke_windows_native_capability_probe.ps1",
   "scripts\bootstrap_pinned_vcpkg.ps1",
   "scripts\Initialize-VS2022Environment.ps1",
-  "scripts\Install-PinnedOnnxRuntime.ps1",
   "scripts\Assert-WindowsPeArchitecture.ps1",
   "scripts\Assert-WindowsInstallerBootstrapArchitecture.ps1",
   "scripts\write_windows_package_capabilities.ps1",

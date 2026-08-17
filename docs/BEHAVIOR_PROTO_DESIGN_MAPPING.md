@@ -1,6 +1,6 @@
 # 《11》与 `BehaviorEvent` / `AveBehaviorEventFeed` 字段映射（DOC-001）
 
-> **权威设计**：`Cauld Design/11_behavior.onnx详细设计.md`（下称《11》）  
+> **权威设计**：`Cauld Design/11_behavior.onnx详细设计.md`（下称《11》；端点当前仅采用其中的行为事件字段与启发式边界）
 > **Proto 源**：`edr-agent/proto/edr/v1/event.proto`  
 > **C 侧载荷**：`include/edr/ave_sdk.h` 中 **`AVEBehaviorEvent`**、**`AVEBehaviorAlert`**（批次编码见 `behavior_proto.c`）
 
@@ -38,7 +38,7 @@
 
 | proto 字段 | 编号 | 语义 |
 |------------|------|------|
-| `anomaly_score` | 1 | ONNX 异常分 0–1 |
+| `anomaly_score` | 1 | 行为启发式异常分 0–1 |
 | `tactic_probs` | 2 | 固定 **14** 维（`packed`） |
 | `triggered_tactics` | 3 | MITRE 战术 id 或展示名（平台归一） |
 | `skip_ai_analysis` | 4 | 跳过附加 AI |
@@ -64,5 +64,5 @@ C 侧 **`AVEBehaviorAlert`**：`include/edr/ave_sdk.h`，战术概率 **`tactic_
 
 ## 4. 维护
 
-- **变更 proto** 时同步更新本表与 **`BEHAVIOR_ONNX_IMPLEMENTATION_PLAN.md`**。  
+- **变更 proto** 时同步更新本表与 **`AVE_ENGINE_IMPLEMENTATION_PLAN.md`**。
 - **关单**：在 **`edr-agent/docs/DETAILED_TASK_CHECKLIST.md`** 将 **DOC-001** 标为完成。

@@ -9,11 +9,11 @@
     },
     {
       "name": "w-vcpkg-ninja-dev",
-      "displayName": "Win vcpkg+Ninja 快编（no-gRPC/HTTPS REST/YARA；无 ORT/无 FL）",
+      "displayName": "Win vcpkg+Ninja 快编（no-gRPC/HTTPS REST/YARA）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置；先 vcpkg install --x-feature=yara。产品主线固定 no-gRPC/no-FL，Windows 构建强制 YARA。",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置；先 vcpkg install --x-feature=yara。Windows 构建强制 YARA。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -22,11 +22,9 @@
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
-        "EDR_WITH_ONNXRUNTIME": "OFF",
         "VCPKG_MANIFEST_FEATURES": "yara",
         "EDR_WITH_YARA": "ON",
         "EDR_REQUIRE_YARA": "ON",
-        "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },
@@ -45,21 +43,19 @@
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
-        "EDR_WITH_ONNXRUNTIME": "OFF",
         "VCPKG_MANIFEST_FEATURES": "yara",
         "EDR_WITH_YARA": "ON",
         "EDR_REQUIRE_YARA": "ON",
-        "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },
     {
       "name": "w-vcpkg-ninja-ort-yara",
-      "displayName": "Win vcpkg+Ninja 全量（HTTPS REST + static ONNXRuntime + YARA）",
+      "displayName": "Win vcpkg+Ninja 全量（HTTPS REST + YARA）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "产品主线固定 no-gRPC/no-FL；需环境变量 ONNXRUNTIME_ROOT=解压的 onnxruntime 根目录。",
+      "description": "兼容旧 preset 名称；不再下载或链接 ONNX Runtime。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
@@ -67,13 +63,9 @@
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
-        "EDR_WITH_ONNXRUNTIME": "ON",
-        "ONNXRUNTIME_ROOT": "$env{ONNXRUNTIME_ROOT}",
         "VCPKG_MANIFEST_FEATURES": "yara",
         "EDR_WITH_YARA": "ON",
         "EDR_REQUIRE_YARA": "ON",
-        "EDR_WITH_FL_TRAINER": "OFF",
-        "EDR_WITH_FL_KAFKA": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },
@@ -81,20 +73,18 @@
       "name": "w-vcpkg-ninja-grpc-ort",
       "displayName": "DEPRECATED alias: use w-vcpkg-ninja-ort-yara",
       "inherits": "w-vcpkg-ninja-ort-yara",
-      "description": "历史兼容别名；实际仍为 no-gRPC 产品构建，请改用 w-vcpkg-ninja-ort-yara。"
+      "description": "历史兼容别名；实际为无 ONNX Runtime 的 no-gRPC 产品构建，请改用 w-vcpkg-ninja-ort-yara。"
     },
     {
       "name": "l-ninja-dev",
-      "displayName": "Linux+Ninja 快编（无 gRPC/无 ORT/无 YARA）",
+      "displayName": "Linux+Ninja 快编（无 gRPC/无 YARA）",
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "EDR_WITH_GRPC": "OFF",
-        "EDR_WITH_ONNXRUNTIME": "OFF",
         "EDR_WITH_YARA": "OFF",
-        "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },
@@ -107,9 +97,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "EDR_WITH_GRPC": "OFF",
-        "EDR_WITH_ONNXRUNTIME": "OFF",
         "EDR_WITH_YARA": "OFF",
-        "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
     },
@@ -121,9 +109,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "EDR_WITH_GRPC": "OFF",
-        "EDR_WITH_ONNXRUNTIME": "OFF",
         "EDR_WITH_YARA": "OFF",
-        "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF",
         "EDR_ENABLE_COMPILER_CACHE": "ON",
         "EDR_ENABLE_UNITY_BUILD": "OFF",
@@ -138,9 +124,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "EDR_WITH_GRPC": "OFF",
-        "EDR_WITH_ONNXRUNTIME": "OFF",
         "EDR_WITH_YARA": "OFF",
-        "EDR_WITH_FL_TRAINER": "OFF",
         "EDR_BUILD_TESTS": "OFF",
         "EDR_ENABLE_COMPILER_CACHE": "ON",
         "EDR_ENABLE_UNITY_BUILD": "OFF",

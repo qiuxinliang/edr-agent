@@ -6,12 +6,6 @@ name: edr-agent client build (Windows)
 
 on:
   workflow_dispatch:
-    inputs:
-      full_features:
-        description: "Build with static ONNX Runtime + YARA (release-like, no gRPC/FL)"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -68,6 +62,20 @@ jobs:
       - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
         run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
+      # P0 bundle generation is architecture-independent.  Use the x64 Python
+      # wheel on every Windows runner, including ARM64, so cryptography never
+      # silently falls back to a Rust/source build.
+      - name: Set up pinned Python for release tools
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Install pinned P0 encryption dependency
+        shell: pwsh
+        run: |
+          python --version
+          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement .\requirements-release.txt
+          python -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('cryptography AESGCM ready')"
       - name: Install build tools
         shell: pwsh
         run: choco install ninja innosetup -y --no-progress
@@ -79,9 +87,7 @@ jobs:
 
       - name: Prepare P0 rule bundle
         shell: pwsh
-        run: |
-          python -m pip install -q cryptography
-          python .\scripts\prepare_p0_release_bundle.py
+        run: python .\scripts\prepare_p0_release_bundle.py
 
       - name: Cache vcpkg (installed + downloads + binary cache)
         uses: actions/cache@v5
@@ -90,19 +96,11 @@ jobs:
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
             vcpkg_installed
-          key: vcpkg-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: vcpkg-x64-win-yara-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-${{ inputs.full_features && 'full' || 'fast' }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
-
-      - name: Cache ONNX Runtime
-        if: ${{ inputs.full_features }}
-        uses: actions/cache@v5
-        with:
-          path: onnxrt-win
-          key: onnxrt-x64-win-${{ hashFiles('dependencies.lock.json') }}-${{ runner.os }}
+            vcpkg-x64-win-yara-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
-        if: ${{ inputs.full_features }}
         shell: pwsh
         run: |
           $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
@@ -164,32 +162,9 @@ jobs:
           $env:Path = $vroot + ";" + $env:Path
           $tc = Join-Path $vroot "vcpkg.exe"
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
-          if ('${{ inputs.full_features }}' -eq 'true') {
-            Write-Host "[vcpkg] full detection build: sqlite + yara + static ONNX support (no grpc/fl)"
-            & $tc install --x-feature=sqlite --x-feature=yara
-            $vcpkgX64 = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows"
-            Write-Host "[vcpkg] YARA package probe under $vcpkgX64"
-            foreach ($p in @(
-              (Join-Path $vcpkgX64 "share\unofficial-libyara\unofficial-libyara-config.cmake"),
-              (Join-Path $vcpkgX64 "include\yara.h"),
-              (Join-Path $vcpkgX64 "include\yara\yara.h"),
-              (Join-Path $vcpkgX64 "lib\yara.lib"),
-              (Join-Path $vcpkgX64 "lib\libyara.lib")
-            )) {
-              if (Test-Path -LiteralPath $p) { Write-Host "[vcpkg] found $p" } else { Write-Host "[vcpkg] missing $p" }
-            }
-
-          } else {
-            Write-Host "[vcpkg] fast build: manifest defaults + sqlite + yara (no grpc/onnx)"
-            & $tc install --x-feature=sqlite --x-feature=yara
-          }
+          Write-Host "[vcpkg] Windows product build: sqlite + yara (no gRPC)"
+          & $tc install --x-feature=sqlite --x-feature=yara
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: ONNX Runtime (CPU, Windows x64)
-        if: ${{ inputs.full_features }}
-        working-directory: ${{ github.workspace }}
-        shell: pwsh
-        run: .\scripts\Install-PinnedOnnxRuntime.ps1 -Architecture x64
 
       - name: Configure (Ninja, Release)
         env:
@@ -198,43 +173,19 @@ jobs:
         run: |
           $tcf = (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
-          if ('${{ inputs.full_features }}' -eq 'true') {
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-              -DCMAKE_TOOLCHAIN_FILE="$tcf" `
-              "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
-              "-DVCPKG_MANIFEST_FEATURES=yara" `
-              "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-              -DEDR_WITH_GRPC=OFF `
-              -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
-              -DEDR_WITH_P0_RULES_OPENSSL=ON `
-              -DEDR_REQUIRE_SQLITE=ON `
-              -DEDR_WITH_ONNXRUNTIME=ON `
-              -DEDR_REQUIRE_ONNXRUNTIME=ON `
-              -DEDR_WITH_FL_TRAINER=OFF `
-              -DEDR_WITH_FL_KAFKA=OFF `
-              "-DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT" `
-              "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
-              -DEDR_WITH_YARA=ON `
-              -DEDR_REQUIRE_YARA=ON `
-              -DEDR_BUILD_TESTS=OFF
-          } else {
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-              -DCMAKE_TOOLCHAIN_FILE="$tcf" `
-              "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
-              "-DVCPKG_MANIFEST_FEATURES=yara" `
-              "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-              -DEDR_WITH_GRPC=OFF `
-              -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
-              -DEDR_WITH_P0_RULES_OPENSSL=ON `
-              -DEDR_REQUIRE_SQLITE=ON `
-              -DEDR_WITH_ONNXRUNTIME=OFF `
-              -DEDR_WITH_FL_TRAINER=OFF `
-              -DEDR_WITH_FL_KAFKA=OFF `
-              "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
-              -DEDR_WITH_YARA=ON `
-              -DEDR_REQUIRE_YARA=ON `
-              -DEDR_BUILD_TESTS=OFF
-          }
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$tcf" `
+            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+            "-DVCPKG_MANIFEST_FEATURES=yara" `
+            "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
+            -DEDR_WITH_GRPC=OFF `
+            -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+            -DEDR_WITH_P0_RULES_OPENSSL=ON `
+            -DEDR_REQUIRE_SQLITE=ON `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
+            -DEDR_WITH_YARA=ON `
+            -DEDR_REQUIRE_YARA=ON `
+            -DEDR_BUILD_TESTS=OFF
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Verify YARA compile definition generated
@@ -310,13 +261,10 @@ jobs:
             throw "FDSensor.exe was built without libyara-backed YARA support"
           }
 
-      - name: Stage ORT + vcpkg + MSVC runtime DLLs
+      - name: Stage vcpkg + MSVC runtime DLLs
         shell: pwsh
         run: |
           $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
-          if ('${{ inputs.full_features }}' -eq 'true') {
-            ./scripts/stage_ort_dlls_build_release.ps1
-          }
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
           ./scripts/stage_msvc_runtime_dlls_build_release.ps1 -Architecture amd64
           ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
@@ -364,7 +312,15 @@ jobs:
           if (-not (Test-Path -LiteralPath $lock -PathType Leaf)) {
             throw "missing Setup UI NuGet lock for ${runtime}: $lock"
           }
-          dotnet restore $project -r $runtime --locked-mode "-p:NuGetLockFilePath=$lock"
+          $lockJson = Get-Content -LiteralPath $lock -Raw | ConvertFrom-Json
+          $baseGraph = 'net8.0-windows10.0.17763'
+          $runtimeGraph = "$baseGraph/$runtime"
+          foreach ($graph in @($baseGraph, $runtimeGraph)) {
+            if ($null -eq $lockJson.dependencies.PSObject.Properties[$graph]) {
+              throw "Setup UI NuGet lock is incomplete; missing dependency graph '$graph' in $lock"
+            }
+          }
+          dotnet restore $project -r $runtime --locked-mode
           if ($LASTEXITCODE -ne 0) {
             throw "Setup UI locked restore failed for $runtime"
           }

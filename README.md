@@ -19,7 +19,7 @@
 | §17 WinDivert Shellcode | 是 | 否 | 否 |
 | §1.2 API / IAT 用户态 Hook | **本期不做**（**`docs/AGT004_API_MONITOR_DESCope.md`**，AGT-004 descope） | — | — |
 
-**AVE / ONNX 首次真推理（AGT-005）**：**[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**；一键脚本 **`scripts/onnx_local_stack_smoke.sh`**（`bash ./scripts/onnx_local_stack_smoke.sh`）。**行为链 / ingest 与 ORT 分工**见 **[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**；CI/本地**无模型**符号锚点 **`scripts/verify_ave_behavior_chain_invariants.sh`**。与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
+**AVE 规则、IOC、证书信任与行为启发式**：行为链、ingest 与告警语义见 **[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**。端点不再包含 ONNX Runtime、端侧模型或联邦训练链；与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
 
 **平台 ingest → `alerts` 先验（WP-1，不依赖本机先跑 Agent）**：**[edr-backend/docs/WP1_ALERT_INGEST_E2E.md](../edr-backend/docs/WP1_ALERT_INGEST_E2E.md)**；脚本 **`edr-backend/scripts/verify_ingest_alert_e2e.sh`** / **`verify_ingest_alert_e2e.ps1`**。真机 P0/告警直出仍见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。
 
@@ -80,7 +80,7 @@ cmake --build build
 
 - **对最终功能的影响**：在**相同 CMake 选项、相同 triplet/依赖**下，下述只缩短编链与 IO；**不**为「加速」单独关功能开关或改源码。杀软排除、盘符、vcpkg 二进制缓存、sccache 均为**环境/缓存层**。详见 Windows 专篇 **[docs/WINDOWS_BUILD_SPEED.md](docs/WINDOWS_BUILD_SPEED.md)**。
 - **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
-  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认安装产品主线依赖（HTTPS REST/SQLite 等）。`cmake --preset w-vcpkg-ninja-dev` 用于日常快编；需要带 static ONNX Runtime 与 YARA 的发版候选时用 **`w-vcpkg-ninja-ort-yara`** 并设置 `ONNXRUNTIME_ROOT`。历史 preset **`w-vcpkg-ninja-grpc-ort`** 仅保留为兼容别名，实际仍是 no-gRPC 构建。
+  - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认安装产品主线依赖（HTTPS REST/SQLite 等）。`cmake --preset w-vcpkg-ninja-dev` 用于日常快编；`w-vcpkg-ninja-ort-yara` 与 `w-vcpkg-ninja-grpc-ort` 是历史兼容别名，实际均为不含 ONNX Runtime、无 gRPC 的产品构建。
   - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
   - **跨平台快编预设**：`any-ninja-fast-dev`（默认开 `EDR_ENABLE_COMPILER_CACHE=ON`），`any-ninja-fast-release-lto`（额外开 `EDR_ENABLE_IPO=ON`，工具链不支持时自动降级并告警）。
 - **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
@@ -88,7 +88,7 @@ cmake --build build
 - **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须已进 **vcvars / x64 本机工具** 环境）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-client-release` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
 - **统一加速开关**（可显式覆盖）：`EDR_ENABLE_COMPILER_CACHE`（默认 `ON`，自动探测 `sccache` 优先于 `ccache`）、`EDR_ENABLE_UNITY_BUILD`（默认 `OFF`）、`EDR_ENABLE_IPO`（默认 `OFF`）。
 
-**终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、模型目录与离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
+**终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
 
 **首次部署 / 租户注册**：使用独立安装器调用 **`POST /api/v1/enroll`** 并生成 **`agent.toml`**（`[server].address`、`endpoint_id`、`tenant_id`、`[platform].rest_base_url`）。脚本见 **`scripts/edr_agent_install.py`**（跨平台，标准库）、**`scripts/edr_agent_install.ps1`**（Windows 无 Python）、**`scripts/edr_agent_install.sh`**（调用前者）；说明见 **`docs/AGENT_INSTALLER.md`**。从 **GitHub Release** 下载安装时，优先用 **`EDRAgentSetup-*.exe`（Windows）** 或 zip 内 **`install.sh`（Linux）**，见 **`docs/AGENT_INSTALLER.md`** 中「Release 一键安装」。
 
@@ -98,7 +98,7 @@ cmake --build build
 
 **本机无 CMake / 沙箱或 CI 中编 Linux 版**：在 **`docker`/`podman` 可用**时执行 **`./scripts/build_linux_native_docker.sh`**，在 Ubuntu 容器内 **`apt` 安装 CMake + Ninja + 依赖** 并生成 **`build-linux/edr_agent`**（与 Trae 等沙箱内「干净环境装依赖再编译」同思路）。说明见 **`docs/SANDBOX_LINUX_BUILD.md`**；产品主线不再编译端侧 gRPC 客户端，事件与控制面走 HTTPS REST/HTTP 长轮询。
 
-### CMake 与传输 / 模型可选依赖
+### CMake 与传输依赖
 
 | 选项 | 含义 |
 |------|------|
@@ -106,7 +106,6 @@ cmake --build build
 | `EDR_WITH_INGEST_HTTPS_OPENSSL` | 启用 native HTTPS REST 上报路径；Windows 产品构建默认要求可用。 |
 | `EDR_WITH_HTTP2_CURL` / `EDR_REQUIRE_CURL_HTTP2` | 启用 libcurl HTTP/2 控制/上报能力；需要 curl headers 暴露 `CURL_VERSION_HTTP2`。 |
 | `EDR_WITH_LINUX_COLLECTOR`（默认 `ON`，**仅 Linux**） | 为 `ON` 时编入 `src/collector/collector_linux.c`；为 `OFF` 时在 Linux 上退回 `collector_stub.c`（与其它 POSIX 一致）。**Windows 不受影响**（始终使用 `collector_win.c`）。 |
-| `EDR_WITH_ONNXRUNTIME`（默认 `OFF`） | 为 `ON` 且能 `find_path`/`find_library` 找到 **ONNX Runtime**（头文件 `onnxruntime_c_api.h` 与 `libonnxruntime`）时，定义 **`EDR_HAVE_ONNXRUNTIME`**；主进程在 **`edr_agent_init`** 中通过 **`AVE_InitFromEdrConfig(&cfg)`**（见 `ave_sdk.h`）在 **`[ave] model_dir`** 下加载**首个** `.onnx` 做真推理；未找到库时 CMake **告警**并仍按无 ONNX 编译。可通过 **`ONNXRUNTIME_ROOT`** 指向解压的预编译包。**联调步骤**见 **[docs/AVE_ONNX_LOCAL_STACK.md](docs/AVE_ONNX_LOCAL_STACK.md)**。 |
 
 #### Linux：inotify（M1）
 
@@ -161,7 +160,7 @@ cmake --build build
 
 `edr_agent` 在 Windows 上执行 **`--help`** 或**无参数**时，帮助文本中会顺带说明 **Inno 安装包 `EDRAgentSetup.exe` 静默安装**时如何通过 **`/EDR_API_BASE=`**、**`/EDR_ENROLL_TOKEN=`**（或 **`/API=`**、**`/TOK=`**）传入平台与注册信息；细则见 **`docs/AGENT_INSTALLER.md`**（Release 一键安装 · Windows）。
 
-解析器为 **tomlc99**（`third_party/tomlc99`）。参考模板：**`agent.toml.example`**，可复制为 `agent.toml` 后修改。与 **platform + 前端 + 种子库** 对齐的联调示例见 **`agent.integration.toml`** 与仓库 **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`**。**Windows 真机行为 ONNX 端到端验收**见 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**。
+解析器为 **tomlc99**（`third_party/tomlc99`）。参考模板：**`agent.toml.example`**，可复制为 `agent.toml` 后修改。与 **platform + 前端 + 种子库** 对齐的联调示例见 **`agent.integration.toml`** 与仓库 **`edr-backend/docs/LOCAL_STACK_INTEGRATION.md`**。**Windows 真机行为检测端到端验收**见 **`docs/REAL_DEVICE_BEHAVIOR_E2E.md`**。
 
 ### `[platform]` / `[server]` — 平台接入与历史兼容
 
@@ -217,17 +216,17 @@ cmake --build build
 | `endpoint_id` | 上报、控制和结果回传使用的端点标识。 |
 | `tenant_id` | 租户标识（预留，随配置传给后续逻辑）。 |
 
-### `[ave]` — ONNX、L1 证书 Stage0、L2/L3 哈希抑制
+### `[ave]` — 规则、IOC、L1 证书与 L2/L3 哈希抑制
 
 | 字段 | 说明 |
 |------|------|
-| `model_dir` / `scan_threads` / `max_file_size_mb` / `sensitivity` | 见上文构建说明与端点设计 §5。 |
-| `cert_whitelist_enabled` | **Windows** 默认 `true`：`AVE_ScanFile` 在 ONNX 前走 **L1**（`WinVerifyTrust`、可选内置链/SQL 白名单/厂商路径等；见 `docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`）。非 Windows忽略。 |
-| `cert_whitelist_db_path` | 可选 SQLite；表 **`sign_blacklist`**（`cert_thumbprint` BLOB 32B）命中则 ONNX 后 **+0.30** 置信度；另有 **`sign_whitelist`** / **`sign_cache`** 等供 L1（需 **`EDR_HAVE_SQLITE`**）。 |
-| `file_whitelist_db_path` | 可选 SQLite；表 **`file_hash_whitelist`**（`sha256` TEXT 64 位小写 hex，`is_active`）命中则 **`VERDICT_WHITELISTED`**，`verification_layer=L2`，**跳过 ONNX**。 |
-| `ioc_db_path` | 可选 SQLite；表 **`ioc_file_hash`**（同上 + 可选 `severity`）与 **`ave_db_meta`**（键 **`rules_version`** 等）。预检命中可跳过 ONNX；**ONNX 后**仍会二次核对（`ioc_file_hash_post`），**保留** `raw_ai_*`。 |
-| `ioc_precheck_enabled` | 默认 `true`；为 `false` 时**不**在 ONNX 前拦截 IOC（便于先跑模型再以后检为准）。 |
-| `behavior_policy_db_path` | 可选 SQLite；表 **`file_behavior_non_exempt`**（`escalate` 等）用于 **L4**（ONNX 之后），见实施计划。 |
+| `scan_threads` / `max_file_size_mb` / `sensitivity` | 扫描资源和规则敏感度；不再支持模型目录。 |
+| `cert_whitelist_enabled` | **Windows** 默认 `true`：`AVE_ScanFile` 先走 **L1**（`WinVerifyTrust`、可选内置链/SQL 白名单/厂商路径）。非 Windows 忽略。 |
+| `cert_whitelist_db_path` | 可选 SQLite；`sign_blacklist`、`sign_whitelist` / `sign_cache` 等表供 L1 证书信任与审计使用（需 **`EDR_HAVE_SQLITE`**）。 |
+| `file_whitelist_db_path` | 可选 SQLite；表 **`file_hash_whitelist`**（`sha256` TEXT 64 位小写 hex，`is_active`）命中则 **`VERDICT_WHITELISTED`**，`verification_layer=L2`。 |
+| `ioc_db_path` | 可选 SQLite；表 **`ioc_file_hash`**（同上 + 可选 `severity`）与 **`ave_db_meta`**（键 **`rules_version`** 等）。预检和后检均可命中，确保 IOC 不会因白名单或行为链被遗漏。 |
+| `ioc_precheck_enabled` | 默认 `true`；为 `false` 时跳过预检，但仍执行后检。 |
+| `behavior_policy_db_path` | 可选 SQLite；表 **`file_behavior_non_exempt`**（`escalate` 等）用于 **L4** 不可豁免策略。 |
 | `behavior_monitor_enabled` | 默认 `true`：在已 **`AVE_RegisterCallbacks`**（含 `on_behavior_alert`）时，**`AVE_StartBehaviorMonitor`** 可拉起行为消费线程；为 `false` 时不拉起（事件仍可 **`AVE_FeedEvent`** 入队）。 |
 
 完整扫描顺序、元数据表、P2 行为管线与单元测试说明见 **`docs/AVE_ENGINE_IMPLEMENTATION_PLAN.md`**。
@@ -299,10 +298,8 @@ cmake --build build
 | `EDR_CONFIG_RELOAD_S` | 非 `0` 时每隔 N 秒检测配置文件 mtime，变更则热更 **preprocessing + resource_limit + self_protect**（见 §11.2 初版）。 |
 | `EDR_REMOTE_CONFIG_URL` | 若与 **`EDR_REMOTE_CONFIG_POLL_S`**（秒，≥1）同时设置，则周期性用 **`curl`** 下载 TOML 到临时文件并 **`edr_config_load`**，再应用 **preprocessing + resource_limit + self_protect**（**不**重初始化传输层，需重启进程才能对齐证书与批次参数）。URL 勿含未转义引号（Windows `cmd` 限制）。 |
 | `EDR_REMOTE_CONFIG_POLL_S` | 与上一项配合：轮询间隔秒数；未设置或 `0` 则禁用远程拉取。 |
-| `EDR_AVE_INFER_DRY_RUN` | `=1` 时 **`edr_ave_infer_file`** 不调用真实后端，返回占位 **`EdrAveInferResult`**（集成测试/联调；生产应启用 **`EDR_WITH_ONNXRUNTIME`** 并勿依赖此项）。 |
-| `EDR_AVE_ONNX_IN_LEN` | （可选）ONNX 输入含**动态长度**轴时，用作该轴默认元素个数（默认 **4096**）；需与模型一致。 |
 | `EDR_AVE_ETW_FEED` | **仅 Windows**：`=0` 关闭 ETW→`AVE_FeedEvent`；默认开。`AVE_NotifyProcessExit` 仍随进程结束上报。见 **`Cauld Design/EDR_P0_Field_Matrix_Signoff.md`（A3）**。 |
-| `EDR_AVE_ETW_FEED_EVERY_N` | **仅 Windows、仅 AVE**：`N>1` 时对**非** `PROCESS_TERMINATE` 的 `AVE_FeedEvent` 做 1/**N** 分频，**不**影响 TDH 建槽与总线。用于行为 ONNX/启发式**减负**；与 P0 规则/漏报策略 **会签** 后启用。`N=1` 或未设置=全量。 |
+| `EDR_AVE_ETW_FEED_EVERY_N` | **仅 Windows、仅 AVE**：`N>1` 时对**非** `PROCESS_TERMINATE` 的 `AVE_FeedEvent` 做 1/**N** 分频，**不**影响 TDH 建槽与总线。用于行为启发式**减负**；与 P0 规则/漏报策略 **会签** 后启用。`N=1` 或未设置=全量。 |
 | `EDR_AVE_ETW_ASYNC` | **仅 Windows、仅 AVE、默认关**（A3.2 大全套）：`1` 或 `true`/`yes` 时，非 terminate 事件 `AVE_FeedEvent` 先入队（**256 槽**）再经**单工作线程**调用，与 TDH/入总线**解耦**；`PROCESS_TERMINATE` 仍**同步** `AVE_NotifyProcessExit`。**队列满**时回退**同回调线程同步** `AVE_FeedEvent`，不丢项。可与此表上一行**叠加**分频。 |
 | `EDR_ETW_BUFFER_KB` | **仅 Windows**：覆盖 `[collection] etw_buffer_kb`，实时 ETW 会话每缓冲 **KB**（4–1024，缺省 64）。与内核侧丢包/驻留有关；调参见 A4.2 / `docs/OPS_PROFILE_AND_RELEASE.md`。 |
 | `EDR_ETW_FLUSH_TIMER_S` | **仅 Windows**：覆盖 `[collection] etw_flush_timer_s`，`FlushTimer` **秒**（1–300，缺省 1）。 |
@@ -450,9 +447,9 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 | **P1 §8** | **深化**：`kill` / `isolate` / `forensic`（POSIX/Windows 路径与产物、**`EDR_FORENSIC_COPY_PATHS`**、**`EDR_CMD_AUDIT_PATH`**、**`EDR_ISOLATE_HOOK`**）；TOML **`[command] allow_dangerous`**；**`EDR_CMD_KILL_ALLOWLIST`**；**Windows** 下 **kill** 拒绝本进程；**`self_protect_status` / `agent_health` / `health_status`**。 |
 | **P2 §9** | **深化**：**`SIGTERM` / `SIGINT`**、**`EDR_SELF_PROTECT_PIDFILE`**、**`EDR_SELF_PROTECT_WATCHDOG`**；**防调试**（`[self_protect] anti_debug`）、**事件总线背压**告警（`event_bus_pressure_warn_pct`）、可选 **Windows Job Object**（`job_object_windows`）、**`watchdog_log_interval_s`**、**`edr_self_protect_format_status`**。 |
 | **P3 §12** | **初版**：`getrusage` 粗算 CPU%、RSS 与 `resource_limit` 比对；`cpu_limit<5%` 且未设 **`EDR_RESOURCE_STRICT=1`** 时不刷屏。**AGT-010**：**`edr_resource_preprocess_throttle_active()`** — 超限时预处理 **跳过低优先级**（`priority!=0`，且非 `attack_surface_hint`）；**Windows** 无 rusage 时可设 **`EDR_PREPROCESS_THROTTLE=1`** 联调。 |
-| **P4 §5** | **深化**：模型目录统计 + **`edr_ave_file_fingerprint`**；**`edr_ave_infer_file`** 占位（未接 ONNX 时返回 **`EDR_ERR_NOT_IMPL`**；**`EDR_AVE_INFER_DRY_RUN=1`** 可走通联调）；control 指令类型 **`ave_status` / `ave_fingerprint` / `ave_infer`** 与 **`edr_command_bind_config`** 联动。 |
+| **P4 §5** | **深化**：规则与离线库统计 + **`edr_ave_file_fingerprint`**；兼容 control 指令类型 **`ave_status` / `ave_fingerprint` / `ave_infer`** 统一执行规则/IOC/行为启发式扫描，并与 **`edr_command_bind_config`** 联动。 |
 | **P5 §11.2** | **深化**：本地 mtime 热重载 + **`EDR_REMOTE_CONFIG_URL` / `EDR_REMOTE_CONFIG_POLL_S`** 心跳拉 TOML（依赖 **curl**）；指纹日志；**未**热更传输证书/批次参数。 |
-| **P6** | **ctest**：`edr_agent --help`、**`ave_file_fingerprint`**、**`ave_infer_dry_run`**、**`config_fingerprint`**、**`shellcode_modules`**、**`edr_agent_smoke`**（`scripts/agent_smoke.sh` 启动进程后 SIGINT）；**`scripts/ci_build.sh`**、**`.github/workflows/edr-agent-ci.yml`**（**macOS / Ubuntu / Windows**）。 |
+| **P6** | **ctest**：`edr_agent --help`、**`ave_file_fingerprint`**、**`ave_scan_pipeline`**、**`config_fingerprint`**、**`shellcode_modules`**、**`edr_agent_smoke`**（`scripts/agent_smoke.sh` 启动进程后 SIGINT）；**`scripts/ci_build.sh`**、**`.github/workflows/edr-agent-ci.yml`**（**macOS / Ubuntu / Windows**）。 |
 | §3 采集 | **Windows**：ETW 内核三通道 + TDH + 扩展 Provider（见上文「ETW 增强」）。**Linux**：**M1 inotify** 文件事件（`collector_linux.c`）；**进程/网络等 §3.2 级采集** 仍属 **P7（eBPF CO-RE）**。**其它 POSIX**：`collector_stub`。 |
 | §1.2 API / IAT 监控层 | **本期 descope**（**`docs/AGT004_API_MONITOR_DESCope.md`**）；主路径为 **ETW → 总线 → 预处理**。 |
 | Windows 服务 / 权限预检（§1.1 / §13） | **已关闭 AGT-006**（**`docs/WINDOWS_DEPLOY.md`**、**`deploy/README.md`**）；MSI/平台打包见 **edr-backend**。 |

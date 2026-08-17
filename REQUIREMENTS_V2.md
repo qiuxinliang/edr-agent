@@ -29,7 +29,6 @@
 
 | 宏 | 默认值 | 说明 |
 |---|---|---|
-| `EDR_WITH_FL_TRAINER` | OFF | 联邦学习训练器 |
 | `EDR_HAVE_LIBCURL` | ON | curl HTTP |
 | `EDR_HAVE_SQLITE` | ON | SQLite |
 | `EDR_HAVE_PCRE2` | ON | 正则 |
@@ -57,7 +56,6 @@
 | 文件 | 说明 |
 |---|---|
 | [edr-agent-client-build.yml](file:///Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/.github/workflows/edr-agent-client-build.yml) | 客户端 CI |
-| [edr-agent-build-grpc-ort.yml](file:///Users/qiuxinliang/工程区/EDR DEV/AI Agent/edr-agent/.github/workflows/edr-agent-build-grpc-ort.yml) | gRPC 专用 CI |
 
 #### 2.1.3 已修复问题
 
@@ -65,7 +63,6 @@
 |---|---|
 | vcpkg.json 缺失 → 添加 cjson/curl/protobuf 依赖 | ✅ |
 | cJSON.h not found → third_party/cjson 无条件编译 | ✅ |
-| agent.c #endif 未闭合 → FL_TRAINER 条件块修复 | ✅ |
 | agent.c L191-205 代码损坏 → 还原 | ✅ |
 | agent.c edr_agent_destroy 截断 → 恢复清理代码 | ✅ |
 | behavior_from_slot 参数不匹配 → 头文件补齐 | ✅ |
@@ -73,7 +70,6 @@
 | queue_sqlite.c 误放代码 → 删除 trim_queue_if_full | ✅ |
 | transport_stub.c 类型截断 → size_t 统一 | ✅ |
 | response_utils.h 缺失 → 创建头文件 | ✅ |
-| 5 个头文件误放 FL_TRAINER 条件块 → 移出 | ✅ |
 | IngestHandler 未注入 RealtimeHub → 后端修复 | ✅ |
 
 #### 2.1.4 待检查

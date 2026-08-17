@@ -11,6 +11,5 @@ For the full list of what the bundled zip covers vs what ships separately, see B
 
 - Empty schemas are not required for a working install. Populate DBs from your platform release process.
 
-For ONNX models, copy static.onnx (or another non-behavior .onnx used by the static EPP engine)
-into the install staging folder edr-agent\models\ before building the installer, or add it to
-{app}\models post-install. behavior.onnx is not part of the standard endpoint package.
+Endpoint ONNX models and federated-training artifacts are intentionally not supported by this package.
+Use signed IOC, certificate/hash allow-lists, and rules supplied through the platform release process.

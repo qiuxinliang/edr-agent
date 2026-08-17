@@ -10,7 +10,7 @@
 #endif
 
 /* Struct definitions */
-/* 《11_behavior.onnx详细设计》§4.1：`AVEBehaviorEvent` 标准载荷（ETW/预处理 → 行为 ONNX）。
+/* 《11》§4.1：`AVEBehaviorEvent` 标准载荷（ETW/预处理 → 行为启发式）。
  与 `include/edr/ave_sdk.h` 中 `AVEBehaviorEvent` 字段语义一致；嵌于 `BehaviorEvent` 供平台强类型入库与特征重建。
  `BehaviorEvent.type` 为平台 `EdrEventType`；`ave_event_type` 为 **AVEEventType**（0–13），二者缺省可独立填写。 */
 typedef struct _edr_v1_AveBehaviorEventFeed {
@@ -55,7 +55,7 @@ typedef struct _edr_v1_AveBehaviorEventFeed {
     int32_t ave_event_type;
 } edr_v1_AveBehaviorEventFeed;
 
-/* §12.4 behavior.onnx → 平台：与《11_behavior.onnx详细设计》AVEBehaviorAlert 对齐（嵌于 BehaviorEvent 或单独帧）。 */
+/* §12.4 行为启发式 → 平台：与《11》AVEBehaviorAlert 对齐（嵌于 BehaviorEvent 或单独帧）。 */
 typedef struct _edr_v1_BehaviorAlert {
     float anomaly_score; /* 0–1 */
     /* 固定 14 维；nanopb 默认对 repeated 标量走 packed（LEN）；ingest 侧仍归一为 14 浮点再入库。 */
@@ -160,10 +160,10 @@ typedef struct _edr_v1_BehaviorEvent {
     pb_size_t mitre_ttps_count;
     char mitre_ttps[8][16];
     uint32_t priority;
-    /* 行为 ONNX 高危/中危告警载荷（与 ave_result_json 二选一或并存；上报时优先填本字段便于平台强类型入库） */
+    /* 行为启发式高危/中危告警载荷（与 ave_result_json 二选一或并存；上报时优先填本字段便于平台强类型入库） */
     bool has_behavior_alert;
     edr_v1_BehaviorAlert behavior_alert;
-    /* 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台 ONNX/检索优先读本消息） */
+    /* 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台检索优先读本消息） */
     bool has_ave_behavior_feed;
     edr_v1_AveBehaviorEventFeed ave_behavior_feed;
 } edr_v1_BehaviorEvent;

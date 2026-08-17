@@ -281,6 +281,9 @@ if (-not (Test-Path -LiteralPath $runtimeLockFile -PathType Leaf)) {
 }
 try {
     $runtimeLock = Get-Content -LiteralPath $runtimeLockFile -Raw | ConvertFrom-Json
+    if ($null -eq $runtimeLock.dependencies.PSObject.Properties[$nugetLockTargetFramework]) {
+        throw "missing base target graph $nugetLockTargetFramework"
+    }
     $expectedLockTarget = "$nugetLockTargetFramework/$runtime"
     if ($null -eq $runtimeLock.dependencies.PSObject.Properties[$expectedLockTarget]) {
         throw "missing target graph $expectedLockTarget"
