@@ -36,35 +36,83 @@ static int fail(const char *message) {
   return 1;
 }
 
+static void report_result(const EdrAveInferResult *result) {
+  if (!result) {
+    return;
+  }
+  fprintf(stderr,
+          "static ONNX result: layout=%d label=%d score=%.7g detail=%s\n"
+          "  verdict=[%.7g, %.7g, %.7g, %.7g]\n"
+          "  family=[%.7g, %.7g]\n"
+          "  packer=[%.7g, %.7g, %.7g]\n",
+          result->onnx_layout, result->label, result->score, result->detail, result->verdict_probs[0],
+          result->verdict_probs[1], result->verdict_probs[2], result->verdict_probs[3], result->family_probs[0],
+          result->family_probs[1], result->packer_probs[0], result->packer_probs[1], result->packer_probs[2]);
+}
+
+static int write_deterministic_input(const char *path) {
+  FILE *file = fopen(path, "wb");
+  if (!file) {
+    return 0;
+  }
+  for (unsigned int index = 0; index < 8192u; ++index) {
+    unsigned char byte = (unsigned char)((index * 37u + 13u) & 0xffu);
+    if (fputc((int)byte, file) == EOF) {
+      fclose(file);
+      (void)remove(path);
+      return 0;
+    }
+  }
+  if (fclose(file) != 0) {
+    (void)remove(path);
+    return 0;
+  }
+  return 1;
+}
+
 int main(void) {
+  const char *input_path = "edr_static_onnx_integration_input.bin";
   EdrConfig cfg;
   EdrAveInferResult result;
   memset(&cfg, 0, sizeof(cfg));
   memset(&result, 0, sizeof(result));
   cfg.ave.scan_threads = 1;
 
-  if (edr_onnx_runtime_load(EDR_TEST_FIXTURE_ONNX, &cfg) != EDR_OK) {
+  EdrError error = edr_onnx_runtime_load(EDR_TEST_FIXTURE_ONNX, &cfg);
+  if (error != EDR_OK) {
+    fprintf(stderr, "static ONNX load error=%d fixture=%s\n", (int)error, EDR_TEST_FIXTURE_ONNX);
     return fail("checked static ONNX fixture did not load");
   }
   if (!edr_onnx_runtime_ready()) {
     return fail("ONNX Runtime did not report a ready static session");
   }
-  if (edr_onnx_infer_file(&cfg, __FILE__, &result) != EDR_OK) {
+  if (!write_deterministic_input(input_path)) {
+    return fail("could not create deterministic static ONNX input");
+  }
+  error = edr_onnx_infer_file(&cfg, input_path, &result);
+  if (error != EDR_OK) {
+    (void)remove(input_path);
+    fprintf(stderr, "static ONNX inference error=%d source=%s\n", (int)error, input_path);
     return fail("static ONNX inference did not complete");
   }
+  (void)remove(input_path);
   if (result.onnx_layout != 1) {
+    report_result(&result);
     return fail("static ONNX fixture did not use the named triple-output contract");
   }
   if (result.label != 0 || result.verdict_probs[0] <= result.verdict_probs[1] ||
       result.verdict_probs[0] <= result.verdict_probs[2] ||
       result.verdict_probs[0] <= result.verdict_probs[3]) {
+    report_result(&result);
     return fail("static ONNX verdict output is not the deterministic fixture result");
   }
   if (result.family_probs[0] <= result.family_probs[1] ||
       result.packer_probs[2] <= result.packer_probs[0]) {
+    report_result(&result);
     return fail("static ONNX family or packer output is not the deterministic fixture result");
   }
   if (strncmp(result.detail, "static_onnx triple", strlen("static_onnx triple")) != 0) {
+    report_result(&result);
     return fail("static ONNX inference did not report the triple-output detail");
   }
 

@@ -376,6 +376,10 @@ int main(void) {
            "release workflow builds the real ONNX fixture test before CTest executes it");
   contains(client_release, "ave_static_onnx_triple_integration",
            "release gate executes real ONNX inference on both native architectures");
+  contains(client_release, "ONNX Runtime test DLL is unavailable",
+           "release CTest verifies that the official ONNX Runtime DLL is reachable from test executables");
+  contains(client_release, "Release CTest ONNX Runtime DLL directory",
+           "release CTest explicitly prepends the task-pinned ONNX Runtime DLL directory to PATH");
   contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
            "release workflow executes the contract suite natively on AMD64 and ARM64");
   contains(client_release, "Windows release native target $nativeTarget failed",
@@ -410,7 +414,20 @@ int main(void) {
            "static ONNX integration test requires the named triple-output contract");
   contains(static_onnx_integration, "void edr_win_listen_apply_config",
            "static ONNX integration test supplies config.c's Windows-only listener hook");
+  contains(static_onnx_integration, "write_deterministic_input",
+           "static ONNX integration test uses a cross-platform deterministic feature input");
+  contains(static_onnx_integration, "static ONNX result: layout=",
+           "static ONNX integration failures include runtime output diagnostics");
   free(static_onnx_integration);
+
+  snprintf(path, sizeof(path), "%s/tests/CMakeLists.txt", root);
+  char *tests_cmake = read_file(path);
+  require_true(tests_cmake != NULL, "read test target CMake definitions");
+  contains(tests_cmake, "Stage task-pinned ONNX Runtime DLL beside static ONNX integration test",
+           "Windows static ONNX test stages the pinned runtime DLL next to its executable");
+  contains(tests_cmake, "onnxruntime_providers_shared.dll",
+           "Windows static ONNX test stages optional ONNX provider DLLs with the core runtime");
+  free(tests_cmake);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-build.yml", root);
   char *client_build = read_file(path);

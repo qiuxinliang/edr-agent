@@ -551,6 +551,17 @@ jobs:
       - name: Test
         shell: pwsh
         run: |
+          # CTest runs the ONNX integration executable from build\tests, while
+          # the package staging step puts the official runtime DLL in
+          # build\Release.  Make the task-pinned ORT directory explicit for
+          # the test process rather than relying on Windows DLL search order.
+          $onnxRuntimeDllDir = Join-Path $env:ONNXRUNTIME_ROOT 'lib'
+          $onnxRuntimeDll = Join-Path $onnxRuntimeDllDir 'onnxruntime.dll'
+          if (-not (Test-Path -LiteralPath $onnxRuntimeDll -PathType Leaf)) {
+            throw "ONNX Runtime test DLL is unavailable: $onnxRuntimeDll"
+          }
+          $env:PATH = "$onnxRuntimeDllDir;$env:PATH"
+          Write-Host "Release CTest ONNX Runtime DLL directory: $onnxRuntimeDllDir"
           $listed = & ctest --test-dir build -N
           if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
             throw "Release test configuration has no discoverable tests"

@@ -697,6 +697,28 @@ if(EDR_ONNXRUNTIME_AVAILABLE AND
   endif()
   if(WIN32)
     target_compile_definitions(test_ave_static_onnx_integration PRIVATE EDR_OS_WINDOWS=1)
+    # CTest starts this executable from build/tests, while the release staging
+    # directory is build/Release.  Keep the task-pinned ONNX DLL next to the
+    # test executable so its launch does not depend on the caller's PATH or
+    # the Windows DLL search order.
+    get_filename_component(_edr_onnx_test_runtime_dir "${ONNXRUNTIME_LIB}" DIRECTORY)
+    set(_edr_onnx_test_runtime_dll "${_edr_onnx_test_runtime_dir}/onnxruntime.dll")
+    if(NOT EXISTS "${_edr_onnx_test_runtime_dll}")
+      message(FATAL_ERROR
+        "ONNX Runtime import library was found but its test runtime DLL is missing: ${_edr_onnx_test_runtime_dll}")
+    endif()
+    add_custom_command(TARGET test_ave_static_onnx_integration POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${_edr_onnx_test_runtime_dll}"
+        "$<TARGET_FILE_DIR:test_ave_static_onnx_integration>/onnxruntime.dll"
+      COMMENT "Stage task-pinned ONNX Runtime DLL beside static ONNX integration test")
+    set(_edr_onnx_test_providers_dll "${_edr_onnx_test_runtime_dir}/onnxruntime_providers_shared.dll")
+    if(EXISTS "${_edr_onnx_test_providers_dll}")
+      add_custom_command(TARGET test_ave_static_onnx_integration POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${_edr_onnx_test_providers_dll}"
+          "$<TARGET_FILE_DIR:test_ave_static_onnx_integration>/onnxruntime_providers_shared.dll")
+    endif()
   else()
     target_compile_definitions(test_ave_static_onnx_integration PRIVATE EDR_OS_POSIX=1)
   endif()
