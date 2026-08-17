@@ -398,6 +398,12 @@ int main(void) {
            "release configure fails closed when ONNX Runtime is unavailable");
   contains(client_release, "actions/setup-dotnet@v5",
            "release workflow uses the Node 24 setup-dotnet action");
+  contains(client_release, "Verify locked Setup UI NuGet closure",
+           "release workflow verifies the target RID Setup UI lock before packaging");
+  contains(client_release, "packages.{0}.lock.json",
+           "release workflow derives the immutable Setup UI lock name from its runtime identifier");
+  contains(client_release, "dotnet restore $project -r $env:EDR_RUNTIME_IDENTIFIER --locked-mode",
+           "release workflow restores the Setup UI through its immutable target RID lock");
   require_true(!strstr(client_release, "ilammy/msvc-dev-cmd"),
                "release workflow has no Node 20 MSVC action");
   require_true(!strstr(client_release, "mozilla-actions/sccache-action"),
@@ -444,6 +450,12 @@ int main(void) {
            "client build waits for GUI subsystem capability probes through the shared runner");
   contains(client_build, "actions/setup-dotnet@v5",
            "client build uses the Node 24 setup-dotnet action");
+  contains(client_build, "Verify locked Setup UI NuGet closure",
+           "client build verifies the AMD64 Setup UI lock before packaging");
+  contains(client_build, "packages.{0}.lock.json",
+           "client build derives the immutable Setup UI lock name from its runtime identifier");
+  contains(client_build, "dotnet restore $project -r $runtime --locked-mode",
+           "client build restores the Setup UI through its immutable target RID lock");
   contains(client_build, "actions/upload-artifact@v6",
            "client build uses the Node 24 artifact upload action");
   contains(client_build, "$nativeIntegrityFiles.ToArray()",

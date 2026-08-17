@@ -354,6 +354,21 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Verify locked Setup UI NuGet closure
+        shell: pwsh
+        run: |
+          $runtime = 'win-x64'
+          $project = Join-Path $env:GITHUB_WORKSPACE 'install\windows-setup-ui\EDRAgent.SetupUi.csproj'
+          $lockRelative = 'install\windows-setup-ui\packages.{0}.lock.json' -f $runtime
+          $lock = Join-Path $env:GITHUB_WORKSPACE $lockRelative
+          if (-not (Test-Path -LiteralPath $lock -PathType Leaf)) {
+            throw "missing Setup UI NuGet lock for ${runtime}: $lock"
+          }
+          dotnet restore $project -r $runtime --locked-mode "-p:NuGetLockFilePath=$lock"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Setup UI locked restore failed for $runtime"
+          }
+
       - name: Package (setup exe + runtime zip)
         shell: pwsh
         run: |
