@@ -483,6 +483,10 @@ int main(void) {
            "vcpkg recovery helper detects HTTP 429 explicitly");
   contains(vcpkg_retry, "not retrying because the failure is not an HTTP 429 rate limit",
            "vcpkg recovery helper must not mask non-rate-limit build failures");
+  contains(vcpkg_retry, "max parallel build jobs",
+           "vcpkg recovery helper reports source-build progress and parallelism live");
+  require_true(!strstr(vcpkg_retry, "$env:VCPKG_MAX_CONCURRENCY = \"1\""),
+               "vcpkg recovery helper must not force all source dependency builds to one job");
   free(vcpkg_retry);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/windows-platform-https-lifecycle.yml", root);

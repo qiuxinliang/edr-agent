@@ -24,22 +24,32 @@ if (-not (Test-Path -LiteralPath $VcpkgExe -PathType Leaf)) {
 
 $installArgs = @("install") + @($FeatureArgs)
 $previousConcurrency = [Environment]::GetEnvironmentVariable("VCPKG_MAX_CONCURRENCY", "Process")
-# Source fallbacks are rare. Keep them serialized so a cold ARM64 and AMD64
-# cache miss cannot multiply requests against GitHub's archive endpoint.
-$env:VCPKG_MAX_CONCURRENCY = "1"
+$restoreConcurrency = $false
+if ([string]::IsNullOrWhiteSpace($previousConcurrency)) {
+  # The release matrix already serializes AMD64 and ARM64 cold fallbacks.
+  # Keep a small local fan-out for port builds rather than forcing every
+  # OpenSSL/YARA dependency to compile one at a time.
+  $parallelism = [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount))
+  $env:VCPKG_MAX_CONCURRENCY = [string]$parallelism
+  $restoreConcurrency = $true
+}
 
 try {
   for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-    Write-Host "[vcpkg] install attempt $attempt/$MaxAttempts (serialized source fallback)"
-    $output = @(& $VcpkgExe @installArgs 2>&1)
+    Write-Host "[vcpkg] install attempt $attempt/$MaxAttempts (max parallel build jobs: $env:VCPKG_MAX_CONCURRENCY)"
+    $output = New-Object 'System.Collections.Generic.List[string]'
+    & $VcpkgExe @installArgs 2>&1 | ForEach-Object {
+      $line = [string]$_
+      $null = $output.Add($line)
+      Write-Host $line
+    }
     $exitCode = $LASTEXITCODE
-    $output | ForEach-Object { Write-Host $_ }
     if ($exitCode -eq 0) {
       Write-Host "[vcpkg] install succeeded on attempt $attempt"
       return
     }
 
-    $outputText = $output | Out-String
+    $outputText = $output -join [Environment]::NewLine
     $rateLimited = $outputText -match '(?im)(response\s+code\s+429|http\s*429|too\s+many\s+requests|rate\s*limit)'
     if (-not $rateLimited) {
       throw "vcpkg install failed with exit code $exitCode; not retrying because the failure is not an HTTP 429 rate limit"
@@ -57,10 +67,10 @@ try {
   }
 }
 finally {
-  if ($null -eq $previousConcurrency) {
+  if ($restoreConcurrency) {
     Remove-Item Env:VCPKG_MAX_CONCURRENCY -ErrorAction SilentlyContinue
   }
-  else {
+  elseif ($null -ne $previousConcurrency) {
     $env:VCPKG_MAX_CONCURRENCY = $previousConcurrency
   }
 }
