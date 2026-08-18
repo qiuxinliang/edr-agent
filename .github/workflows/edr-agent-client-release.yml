@@ -132,9 +132,6 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
-      - name: Verify locked Setup UI NuGet closure before native dependency build
-        shell: pwsh
-        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER
       # P0 encryption produces architecture-independent artifacts.  Pin it to
       # x64 CPython before any workflow Python invocation: the selected
       # cryptography release has an x64 Windows wheel but no native ARM64 one.
@@ -152,6 +149,9 @@ jobs:
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
+      - name: Verify locked Setup UI NuGet closure and publish before native dependency build
+        shell: pwsh
+        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
       - name: Round-trip Windows package capabilities for AMD64 and ARM64
         shell: pwsh
         run: .\scripts\test_windows_package_capabilities_contract.ps1

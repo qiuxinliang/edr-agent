@@ -325,13 +325,22 @@ if ($resolvedRuntimeMode -notin @("self-contained", "compact", "framework-depend
 $selfContained = if ($resolvedRuntimeMode -eq "framework-dependent") { "false" } else { "true" }
 $defaultReadyToRun = if ($resolvedRuntimeMode -eq "self-contained") { "true" } else { "false" }
 $readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { $defaultReadyToRun }
+$readyToRun = $readyToRun.Trim().ToLowerInvariant()
+if ($readyToRun -notin @("true", "false")) {
+    throw "EDR_SETUP_UI_READYTORUN must be true or false"
+}
 Write-Host "Setup UI runtime mode: $resolvedRuntimeMode (self-contained=$selfContained, readyToRun=$readyToRun)"
 
 $lockedRestoreScript = Join-Path $repositoryRoot "scripts\Restore-SetupUiLocked.ps1"
 if (-not (Test-Path -LiteralPath $lockedRestoreScript -PathType Leaf)) {
     throw "Missing Setup UI locked-restore gate: $lockedRestoreScript"
 }
-& $lockedRestoreScript -RuntimeIdentifier $runtime -RepositoryRoot $repositoryRoot
+& $lockedRestoreScript `
+    -RuntimeIdentifier $runtime `
+    -SelfContained $selfContained `
+    -PublishReadyToRun $readyToRun `
+    -Configuration $Configuration `
+    -RepositoryRoot $repositoryRoot
 
 $publishArgs = @(
     $project,

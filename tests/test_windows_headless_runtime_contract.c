@@ -418,9 +418,29 @@ int main(void) {
                          "Setup UI build must select the immutable NuGet lock for its target RID");
   ok &= require_contains(setup_ui_build, "Restore-SetupUiLocked.ps1",
                          "Setup UI build must run the shared immutable NuGet restore gate before publish");
+  ok &= require_contains(setup_ui_build, "-SelfContained $selfContained",
+                         "Setup UI restore must receive the same self-contained mode as publish");
+  ok &= require_contains(setup_ui_build, "-PublishReadyToRun $readyToRun",
+                         "Setup UI restore must receive the same ReadyToRun mode as publish");
+  ok &= require_contains(setup_ui_build, "-Configuration $Configuration",
+                         "Setup UI restore must receive the same configuration as publish");
   ok &= require_contains(setup_ui_build, "--no-restore",
                          "Setup UI publish must consume the already verified locked restore closure");
   free(setup_ui_build);
+
+  char *setup_ui_restore = read_source(root, "scripts/Restore-SetupUiLocked.ps1");
+  if (!setup_ui_restore) return 1;
+  ok &= require_contains(setup_ui_restore, "-p:SelfContained=$SelfContained",
+                         "locked restore must explicitly resolve self-contained runtime packs");
+  ok &= require_contains(setup_ui_restore, "-p:PublishReadyToRun=$PublishReadyToRun",
+                         "locked restore must resolve the selected ReadyToRun closure");
+  ok &= require_contains(setup_ui_restore, "-p:Configuration=$Configuration",
+                         "locked restore must match the selected publish configuration");
+  ok &= require_contains(setup_ui_restore, "if ($VerifyPublish)",
+                         "locked restore gate must support a real publish smoke");
+  ok &= require_contains(setup_ui_restore, "Setup UI publish smoke did not produce FDSecuritySetupUI.exe",
+                         "publish smoke must require the product executable");
+  free(setup_ui_restore);
 
   char *dependency_locks = read_source(root, "scripts/Validate-DependencyLocks.ps1");
   if (!dependency_locks) return 1;

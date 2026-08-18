@@ -32,12 +32,12 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
-      - name: Verify locked Setup UI NuGet closure before native dependency build
-        shell: pwsh
-        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier win-x64
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
+      - name: Verify locked Setup UI NuGet closure and publish before native dependency build
+        shell: pwsh
+        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier win-x64 -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
       - name: AVE / behavior chain invariants (no vcpkg, bash)
         shell: bash
         run: |

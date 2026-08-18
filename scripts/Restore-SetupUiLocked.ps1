@@ -4,6 +4,12 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('win-x64', 'win-arm64')]
   [string] $RuntimeIdentifier,
+  [ValidateSet('true', 'false')]
+  [string] $SelfContained = 'true',
+  [ValidateSet('true', 'false')]
+  [string] $PublishReadyToRun = 'false',
+  [string] $Configuration = 'Release',
+  [switch] $VerifyPublish,
   [string] $RepositoryRoot = ""
 )
 
@@ -12,6 +18,11 @@ if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
   $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 }
 $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
+$SelfContained = $SelfContained.ToLowerInvariant()
+$PublishReadyToRun = $PublishReadyToRun.ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($Configuration)) {
+  throw 'Setup UI Configuration must not be empty'
+}
 
 $project = Join-Path $RepositoryRoot 'install\windows-setup-ui\EDRAgent.SetupUi.csproj'
 $nugetConfig = Join-Path $RepositoryRoot 'NuGet.Config'
@@ -34,6 +45,10 @@ if ($lockGraphs.Count -ne 1 -or $lockGraphs[0] -ne $runtimeGraph) {
 $restoreArgs = @(
   $project,
   "-p:RuntimeIdentifier=$RuntimeIdentifier",
+  "-p:SelfContained=$SelfContained",
+  "-p:PublishReadyToRun=$PublishReadyToRun",
+  '-p:PublishSingleFile=false',
+  "-p:Configuration=$Configuration",
   '--configfile', $nugetConfig,
   '--locked-mode',
   '--verbosity', 'normal'
@@ -47,4 +62,39 @@ if ($restoreExitCode -ne 0) {
   throw "Setup UI locked restore failed for $RuntimeIdentifier with exit $restoreExitCode; diagnostic log: $restoreLog"
 }
 
-Write-Host "Setup UI locked restore verified: runtime=$RuntimeIdentifier lock=$lock source=$nugetConfig"
+Write-Host "Setup UI locked restore verified: runtime=$RuntimeIdentifier selfContained=$SelfContained readyToRun=$PublishReadyToRun configuration=$Configuration lock=$lock source=$nugetConfig"
+
+if ($VerifyPublish) {
+  $smokeId = [Guid]::NewGuid().ToString('N')
+  $smokePublishDir = Join-Path ([System.IO.Path]::GetTempPath()) "edr-setup-ui-publish-smoke-$RuntimeIdentifier-$smokeId"
+  $smokeLog = Join-Path ([System.IO.Path]::GetTempPath()) "edr-setup-ui-publish-smoke-$RuntimeIdentifier-$smokeId.log"
+  try {
+    $publishArgs = @(
+      $project,
+      '-c', $Configuration,
+      "-p:RuntimeIdentifier=$RuntimeIdentifier",
+      '--self-contained', $SelfContained,
+      "-p:PublishReadyToRun=$PublishReadyToRun",
+      '-p:PublishSingleFile=false',
+      '-p:DebugType=None',
+      '-p:DebugSymbols=false',
+      '--no-restore',
+      '--verbosity', 'normal',
+      '-o', $smokePublishDir
+    )
+    & dotnet publish @publishArgs 2>&1 | Tee-Object -FilePath $smokeLog
+    $publishExitCode = $LASTEXITCODE
+    if ($publishExitCode -ne 0) {
+      Write-Host '---- Setup UI publish smoke diagnostic (last 160 lines) ----'
+      Get-Content -LiteralPath $smokeLog -Tail 160 | ForEach-Object { Write-Host $_ }
+      throw "Setup UI publish smoke failed for $RuntimeIdentifier with exit $publishExitCode; diagnostic log: $smokeLog"
+    }
+    $smokeExe = Join-Path $smokePublishDir 'FDSecuritySetupUI.exe'
+    if (-not (Test-Path -LiteralPath $smokeExe -PathType Leaf)) {
+      throw "Setup UI publish smoke did not produce FDSecuritySetupUI.exe for $RuntimeIdentifier"
+    }
+    Write-Host "Setup UI publish smoke verified: runtime=$RuntimeIdentifier output=$smokeExe"
+  } finally {
+    Remove-Item -LiteralPath $smokePublishDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}

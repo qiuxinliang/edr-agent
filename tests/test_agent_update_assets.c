@@ -410,14 +410,14 @@ int main(void) {
            "release workflow runs P0 encryption with the portable x64 Python wheel on both Windows architectures");
   contains(client_release, "--only-binary=:all: --requirement .\\requirements-release.txt",
            "release workflow forbids cryptography source builds");
-  contains(client_release, "Verify locked Setup UI NuGet closure before native dependency build",
-           "release workflow verifies the target RID Setup UI lock before native work");
-  contains(client_release, "Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER",
-           "release workflow delegates immutable Setup UI restore to the shared gate");
+  contains(client_release, "Verify locked Setup UI NuGet closure and publish before native dependency build",
+           "release workflow verifies the target RID Setup UI lock and real publish before native work");
+  contains(client_release, "-RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish",
+           "release workflow supplies one complete compact Setup UI build profile to the shared gate");
   contains_before(client_release,
-                  "Verify locked Setup UI NuGet closure before native dependency build",
+                  "Verify locked Setup UI NuGet closure and publish before native dependency build",
                   "vcpkg install (manifest)",
-                  "release workflow fails a bad Setup UI lock before the expensive vcpkg build");
+                  "release workflow fails a bad Setup UI restore or publish before the expensive vcpkg build");
   require_true(!strstr(client_release, "ilammy/msvc-dev-cmd"),
                "release workflow has no Node 20 MSVC action");
   require_true(!strstr(client_release, "mozilla-actions/sccache-action"),
@@ -443,14 +443,14 @@ int main(void) {
            "client build uses the Node 24 Python setup action");
   contains(client_build, "--only-binary=:all: --requirement .\\requirements-release.txt",
            "client build forbids cryptography source builds");
-  contains(client_build, "Verify locked Setup UI NuGet closure before native dependency build",
-           "client build verifies the AMD64 Setup UI lock before native work");
-  contains(client_build, "Restore-SetupUiLocked.ps1 -RuntimeIdentifier win-x64",
-           "client build delegates immutable Setup UI restore to the shared gate");
+  contains(client_build, "Verify locked Setup UI NuGet closure and publish before native dependency build",
+           "client build verifies the AMD64 Setup UI lock and real publish before native work");
+  contains(client_build, "-RuntimeIdentifier win-x64 -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish",
+           "client build supplies one complete compact Setup UI build profile to the shared gate");
   contains_before(client_build,
-                  "Verify locked Setup UI NuGet closure before native dependency build",
+                  "Verify locked Setup UI NuGet closure and publish before native dependency build",
                   "vcpkg install (manifest)",
-                  "client build fails a bad Setup UI lock before the expensive vcpkg build");
+                  "client build fails a bad Setup UI restore or publish before the expensive vcpkg build");
   contains(client_build, "Invoke-VcpkgInstallWithRetry.ps1",
            "client build retries bounded GitHub source-archive rate limits");
   contains(client_build, "prebuild-yara-x64-windows-$hash",
