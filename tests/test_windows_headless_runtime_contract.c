@@ -426,10 +426,10 @@ int main(void) {
                          "dependency validation must require the immutable Windows x64 Setup UI lock");
   ok &= require_contains(dependency_locks, "packages.win-arm64.lock.json",
                          "dependency validation must require the immutable Windows ARM64 Setup UI lock");
-  ok &= require_contains(dependency_locks, "committed per-RID NuGet locks",
-                         "dependency validation must reject a project that stops selecting RID-specific locks");
-  ok &= require_contains(dependency_locks, "packages.lock.json as its portable default",
-                         "dependency validation must not rely on a late RuntimeIdentifier project-property condition");
+  ok &= require_contains(dependency_locks, "committed RID lock during MSBuild project evaluation",
+                         "dependency validation must reject a project that stops selecting RID-specific locks during evaluation");
+  ok &= require_contains(dependency_locks, "preserve packages.lock.json for portable restores",
+                         "dependency validation must retain a portable NuGet lock for no-RID restores");
   free(dependency_locks);
 
   char *bootstrap_arch = read_source(root, "scripts/Assert-WindowsInstallerBootstrapArchitecture.ps1");

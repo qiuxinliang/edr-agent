@@ -325,7 +325,9 @@ Write-Host "Setup UI runtime mode: $resolvedRuntimeMode (self-contained=$selfCon
 $publishArgs = @(
     $project,
     "-c", $Configuration,
-    "-r", $runtime,
+    # RuntimeIdentifier must be an MSBuild global property before project
+    # evaluation so EDRAgent.SetupUi.csproj selects packages.$runtime.lock.json.
+    "-p:RuntimeIdentifier=$runtime",
     "--self-contained", $selfContained,
     "-p:Version=$AppVersion",
     "-p:PublishSingleFile=false",
@@ -333,11 +335,15 @@ $publishArgs = @(
     "-p:DebugType=None",
     "-p:DebugSymbols=false",
     "--locked-mode",
-    "-p:NuGetLockFilePath=$runtimeLockFile"
+    "--verbosity", "normal"
 )
-dotnet publish @publishArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "dotnet publish failed with exit $LASTEXITCODE"
+$publishLog = Join-Path ([System.IO.Path]::GetTempPath()) "edr-setup-ui-publish-$runtime.log"
+& dotnet publish @publishArgs 2>&1 | Tee-Object -FilePath $publishLog
+$publishExitCode = $LASTEXITCODE
+if ($publishExitCode -ne 0) {
+    Write-Host "---- Setup UI publish diagnostic (last 160 lines) ----"
+    Get-Content -LiteralPath $publishLog -Tail 160 | ForEach-Object { Write-Host $_ }
+    throw "dotnet publish failed with exit $publishExitCode; diagnostic log: $publishLog"
 }
 
 $publishDir = $null

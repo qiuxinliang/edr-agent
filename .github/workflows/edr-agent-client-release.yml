@@ -612,13 +612,17 @@ jobs:
           }
           $restoreArgs = @(
             $project,
-            '-r', $env:EDR_RUNTIME_IDENTIFIER,
+            "-p:RuntimeIdentifier=$env:EDR_RUNTIME_IDENTIFIER",
             '--locked-mode',
-            "-p:NuGetLockFilePath=$lock"
+            '--verbosity', 'normal'
           )
-          & dotnet restore @restoreArgs
-          if ($LASTEXITCODE -ne 0) {
-            throw "Setup UI locked restore failed for $env:EDR_RUNTIME_IDENTIFIER"
+          $restoreLog = Join-Path $env:RUNNER_TEMP "setup-ui-locked-restore-$env:EDR_RUNTIME_IDENTIFIER.log"
+          & dotnet restore @restoreArgs 2>&1 | Tee-Object -FilePath $restoreLog
+          $restoreExitCode = $LASTEXITCODE
+          if ($restoreExitCode -ne 0) {
+            Write-Host "---- Setup UI locked restore diagnostic (last 160 lines) ----"
+            Get-Content -LiteralPath $restoreLog -Tail 160 | ForEach-Object { Write-Host $_ }
+            throw "Setup UI locked restore failed for $env:EDR_RUNTIME_IDENTIFIER with exit $restoreExitCode; diagnostic log: $restoreLog"
           }
 
       - name: Package (setup exe + runtime zip)

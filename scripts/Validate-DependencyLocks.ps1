@@ -76,11 +76,16 @@ foreach ($setupUiLockSpec in $setupUiLocks) {
   }
 }
 $projectText = [IO.File]::ReadAllText($projectPath)
-$requiredPortableLockSelector = '<NuGetLockFilePath>packages.lock.json</NuGetLockFilePath>'
+$requiredPortableLockSelector = '<NuGetLockFilePath Condition="''$(RuntimeIdentifier)'' == ''''">packages.lock.json</NuGetLockFilePath>'
+$requiredRuntimeLockSelectors = @(
+  '<NuGetLockFilePath Condition="''$(RuntimeIdentifier)'' == ''win-x64''">packages.win-x64.lock.json</NuGetLockFilePath>',
+  '<NuGetLockFilePath Condition="''$(RuntimeIdentifier)'' == ''win-arm64''">packages.win-arm64.lock.json</NuGetLockFilePath>'
+)
 if ($projectText -notmatch '<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>' -or
     $projectText -notmatch '<RestoreLockedMode>true</RestoreLockedMode>' -or
-    -not $projectText.Contains($requiredPortableLockSelector)) {
-  throw "Setup UI restore must keep packages.lock.json as its portable default; runtime callers must explicitly select committed per-RID NuGet locks"
+    -not $projectText.Contains($requiredPortableLockSelector) -or
+    @($requiredRuntimeLockSelectors | Where-Object { -not $projectText.Contains($_) }).Count -ne 0) {
+  throw "Setup UI restore must select its committed RID lock during MSBuild project evaluation and preserve packages.lock.json for portable restores"
 }
 
 $releaseRequirements = Join-Path $RepositoryRoot "requirements-release.txt"

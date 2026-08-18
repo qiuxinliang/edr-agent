@@ -408,8 +408,8 @@ int main(void) {
            "release workflow verifies the target RID Setup UI lock before packaging");
   contains(client_release, "packages.{0}.lock.json",
            "release workflow derives the immutable Setup UI lock name from its runtime identifier");
-  contains(client_release, "-p:NuGetLockFilePath=$lock",
-           "release workflow explicitly selects its immutable target RID lock after RuntimeIdentifier is supplied");
+  contains(client_release, "-p:RuntimeIdentifier=$env:EDR_RUNTIME_IDENTIFIER",
+           "release workflow supplies RuntimeIdentifier as an MSBuild global property before lock selection");
   require_true(!strstr(client_release, "ilammy/msvc-dev-cmd"),
                "release workflow has no Node 20 MSVC action");
   require_true(!strstr(client_release, "mozilla-actions/sccache-action"),
@@ -439,8 +439,8 @@ int main(void) {
            "client build verifies the AMD64 Setup UI lock before packaging");
   contains(client_build, "packages.{0}.lock.json",
            "client build derives the immutable Setup UI lock name from its runtime identifier");
-  contains(client_build, "-p:NuGetLockFilePath=$lock",
-           "client build explicitly selects its immutable target RID lock after RuntimeIdentifier is supplied");
+  contains(client_build, "-p:RuntimeIdentifier=$runtime",
+           "client build supplies RuntimeIdentifier as an MSBuild global property before lock selection");
   contains(client_build, "Invoke-VcpkgInstallWithRetry.ps1",
            "client build retries bounded GitHub source-archive rate limits");
   contains(client_build, "prebuild-yara-x64-windows-$hash",

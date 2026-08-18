@@ -12,12 +12,15 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode>true</RestoreLockedMode>
     <!--
-      RuntimeIdentifier supplied by `dotnet restore -r` is applied after
-      project-property conditions are evaluated.  Keep the portable lock as
-      the default; every RID restore/publish caller must explicitly pass its
-      matching `-p:NuGetLockFilePath=...` closure.
+      The Windows build callers set RuntimeIdentifier as an MSBuild global
+      property (not with `dotnet -r`).  It is therefore available while this
+      project is evaluated and selects the immutable lock closure before
+      NuGet starts restore.  This avoids a late RID injection accidentally
+      falling back to the portable packages.lock.json graph.
     -->
-    <NuGetLockFilePath>packages.lock.json</NuGetLockFilePath>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' == ''">packages.lock.json</NuGetLockFilePath>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' == 'win-x64'">packages.win-x64.lock.json</NuGetLockFilePath>
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' == 'win-arm64'">packages.win-arm64.lock.json</NuGetLockFilePath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -28,4 +31,9 @@
   <ItemGroup>
     <Content Include="Assets\installer.html" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <Target Name="ValidateSetupUiRuntimeIdentifier" BeforeTargets="Restore"
+          Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64' and '$(RuntimeIdentifier)' != 'win-arm64'">
+    <Error Text="Unsupported Setup UI RuntimeIdentifier '$(RuntimeIdentifier)'. Supported values are win-x64 and win-arm64." />
+  </Target>
 </Project>
