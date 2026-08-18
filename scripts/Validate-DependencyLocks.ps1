@@ -36,6 +36,19 @@ if ([string]$globalJson.sdk.rollForward -ne [string]$dependencyLock.dotnet_sdk.r
   throw "The .NET SDK lock must disable roll-forward in both lock files"
 }
 
+$nugetConfigPath = Join-Path $RepositoryRoot "NuGet.Config"
+if (-not (Test-Path -LiteralPath $nugetConfigPath -PathType Leaf)) {
+  throw "Repository NuGet source policy is missing: $nugetConfigPath"
+}
+[xml]$nugetConfig = [IO.File]::ReadAllText($nugetConfigPath)
+$packageSources = $nugetConfig.configuration.packageSources
+$configuredSources = @($packageSources.add)
+if ($null -eq $packageSources.clear -or $configuredSources.Count -ne 1 -or
+    [string]$configuredSources[0].key -ne "nuget.org" -or
+    [string]$configuredSources[0].value -ne "https://api.nuget.org/v3/index.json") {
+  throw "NuGet source policy must clear runner-local feeds and use only https://api.nuget.org/v3/index.json"
+}
+
 $vcpkgManifest = Read-JsonFile "vcpkg.json"
 $vcpkgBaseline = [string]$vcpkgManifest.'builtin-baseline'
 if ($vcpkgBaseline -notmatch '^[0-9a-f]{40}$' -or
@@ -94,4 +107,4 @@ if (-not (Test-Path -LiteralPath $releaseRequirements -PathType Leaf) -or
   throw "Release P0 encryption dependency must pin cryptography==44.0.3 in requirements-release.txt"
 }
 
-Write-Host "Dependency locks verified: VS2022, .NET $($globalJson.sdk.version), vcpkg $vcpkgBaseline, NuGet RID closures, P0 cryptography"
+Write-Host "Dependency locks verified: VS2022, .NET $($globalJson.sdk.version), vcpkg $vcpkgBaseline, NuGet source policy and RID closures, P0 cryptography"

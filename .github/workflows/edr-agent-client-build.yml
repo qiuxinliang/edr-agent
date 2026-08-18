@@ -29,6 +29,12 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+      - name: Verify locked Setup UI NuGet closure before native dependency build
+        shell: pwsh
+        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier win-x64
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
@@ -324,42 +330,6 @@ jobs:
               Write-Host "vcpkg installed size: ${size} MB"
             }
             Write-Host "========================================"
-          }
-
-      - uses: actions/setup-dotnet@v5
-        with:
-          global-json-file: global.json
-
-      - name: Verify locked Setup UI NuGet closure
-        shell: pwsh
-        run: |
-          $runtime = 'win-x64'
-          $project = Join-Path $env:GITHUB_WORKSPACE 'install\windows-setup-ui\EDRAgent.SetupUi.csproj'
-          $lockRelative = 'install\windows-setup-ui\packages.{0}.lock.json' -f $runtime
-          $lock = Join-Path $env:GITHUB_WORKSPACE $lockRelative
-          if (-not (Test-Path -LiteralPath $lock -PathType Leaf)) {
-            throw "missing Setup UI NuGet lock for ${runtime}: $lock"
-          }
-          $lockJson = Get-Content -LiteralPath $lock -Raw | ConvertFrom-Json
-          $baseGraph = 'net8.0-windows10.0.17763'
-          $runtimeGraph = "$baseGraph/$runtime"
-          $lockGraphs = @($lockJson.dependencies.PSObject.Properties | ForEach-Object { [string]$_.Name })
-          if ($lockGraphs.Count -ne 1 -or $lockGraphs[0] -ne $runtimeGraph) {
-            throw "Setup UI NuGet lock must contain exactly runtime graph '$runtimeGraph' in $lock"
-          }
-          $restoreArgs = @(
-            $project,
-            "-p:RuntimeIdentifier=$runtime",
-            '--locked-mode',
-            '--verbosity', 'normal'
-          )
-          $restoreLog = Join-Path $env:RUNNER_TEMP "setup-ui-locked-restore-$runtime.log"
-          & dotnet restore @restoreArgs 2>&1 | Tee-Object -FilePath $restoreLog
-          $restoreExitCode = $LASTEXITCODE
-          if ($restoreExitCode -ne 0) {
-            Write-Host "---- Setup UI locked restore diagnostic (last 160 lines) ----"
-            Get-Content -LiteralPath $restoreLog -Tail 160 | ForEach-Object { Write-Host $_ }
-            throw "Setup UI locked restore failed for $runtime with exit $restoreExitCode; diagnostic log: $restoreLog"
           }
 
       - name: Package (setup exe + runtime zip)

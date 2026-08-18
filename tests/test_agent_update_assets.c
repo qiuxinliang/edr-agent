@@ -19,6 +19,12 @@ static void contains(const char *text, const char *needle, const char *message) 
   require_true(text && strstr(text, needle), message);
 }
 
+static void contains_before(const char *text, const char *first, const char *second, const char *message) {
+  const char *first_at = text ? strstr(text, first) : NULL;
+  const char *second_at = text ? strstr(text, second) : NULL;
+  require_true(first_at && second_at && first_at < second_at, message);
+}
+
 int main(void) {
   const char *root = getenv("EDR_SOURCE_DIR");
   require_true(root && root[0], "EDR_SOURCE_DIR is configured");
@@ -404,12 +410,14 @@ int main(void) {
            "release workflow runs P0 encryption with the portable x64 Python wheel on both Windows architectures");
   contains(client_release, "--only-binary=:all: --requirement .\\requirements-release.txt",
            "release workflow forbids cryptography source builds");
-  contains(client_release, "Verify locked Setup UI NuGet closure",
-           "release workflow verifies the target RID Setup UI lock before packaging");
-  contains(client_release, "packages.{0}.lock.json",
-           "release workflow derives the immutable Setup UI lock name from its runtime identifier");
-  contains(client_release, "-p:RuntimeIdentifier=$env:EDR_RUNTIME_IDENTIFIER",
-           "release workflow supplies RuntimeIdentifier as an MSBuild global property before lock selection");
+  contains(client_release, "Verify locked Setup UI NuGet closure before native dependency build",
+           "release workflow verifies the target RID Setup UI lock before native work");
+  contains(client_release, "Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER",
+           "release workflow delegates immutable Setup UI restore to the shared gate");
+  contains_before(client_release,
+                  "Verify locked Setup UI NuGet closure before native dependency build",
+                  "vcpkg install (manifest)",
+                  "release workflow fails a bad Setup UI lock before the expensive vcpkg build");
   require_true(!strstr(client_release, "ilammy/msvc-dev-cmd"),
                "release workflow has no Node 20 MSVC action");
   require_true(!strstr(client_release, "mozilla-actions/sccache-action"),
@@ -435,12 +443,14 @@ int main(void) {
            "client build uses the Node 24 Python setup action");
   contains(client_build, "--only-binary=:all: --requirement .\\requirements-release.txt",
            "client build forbids cryptography source builds");
-  contains(client_build, "Verify locked Setup UI NuGet closure",
-           "client build verifies the AMD64 Setup UI lock before packaging");
-  contains(client_build, "packages.{0}.lock.json",
-           "client build derives the immutable Setup UI lock name from its runtime identifier");
-  contains(client_build, "-p:RuntimeIdentifier=$runtime",
-           "client build supplies RuntimeIdentifier as an MSBuild global property before lock selection");
+  contains(client_build, "Verify locked Setup UI NuGet closure before native dependency build",
+           "client build verifies the AMD64 Setup UI lock before native work");
+  contains(client_build, "Restore-SetupUiLocked.ps1 -RuntimeIdentifier win-x64",
+           "client build delegates immutable Setup UI restore to the shared gate");
+  contains_before(client_build,
+                  "Verify locked Setup UI NuGet closure before native dependency build",
+                  "vcpkg install (manifest)",
+                  "client build fails a bad Setup UI lock before the expensive vcpkg build");
   contains(client_build, "Invoke-VcpkgInstallWithRetry.ps1",
            "client build retries bounded GitHub source-archive rate limits");
   contains(client_build, "prebuild-yara-x64-windows-$hash",
@@ -519,6 +529,8 @@ int main(void) {
            "dependency validation enforces NuGet locked restore inputs");
   contains(dependency_validator, "must contain exactly runtime graph",
            "dependency validation requires one immutable NuGet graph per restore runtime");
+  contains(dependency_validator, "NuGet source policy must clear runner-local feeds",
+           "dependency validation rejects runner-specific NuGet fallback feeds");
   contains(dependency_validator, "cryptography==44.0.3",
            "dependency validation pins the P0 encryption root dependency");
   free(dependency_validator);

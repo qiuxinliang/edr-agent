@@ -416,8 +416,10 @@ int main(void) {
                          "Setup UI packaging must preserve the explicit Inno bootstrap architecture exception");
   ok &= require_contains(setup_ui_build, "packages.$runtime.lock.json",
                          "Setup UI build must select the immutable NuGet lock for its target RID");
-  ok &= require_contains(setup_ui_build, "--locked-mode",
-                         "Setup UI publish must refuse a dependency graph that differs from its committed RID lock");
+  ok &= require_contains(setup_ui_build, "Restore-SetupUiLocked.ps1",
+                         "Setup UI build must run the shared immutable NuGet restore gate before publish");
+  ok &= require_contains(setup_ui_build, "--no-restore",
+                         "Setup UI publish must consume the already verified locked restore closure");
   free(setup_ui_build);
 
   char *dependency_locks = read_source(root, "scripts/Validate-DependencyLocks.ps1");

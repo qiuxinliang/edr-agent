@@ -13,6 +13,7 @@ $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
 $relativePaths = @(
   "scripts\validate_windows_powershell_syntax.ps1",
   "scripts\Validate-DependencyLocks.ps1",
+  "scripts\Restore-SetupUiLocked.ps1",
   "scripts\edr_agent_install.ps1",
   "scripts\edr_agent_preflight.ps1",
   "scripts\edr_agent_inplace_update.ps1",

@@ -129,6 +129,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+      - name: Verify locked Setup UI NuGet closure before native dependency build
+        shell: pwsh
+        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER
       # P0 encryption produces architecture-independent artifacts.  Pin it to
       # x64 CPython before any workflow Python invocation: the selected
       # cryptography release has an x64 Windows wheel but no native ARM64 one.
@@ -588,41 +594,6 @@ jobs:
               Write-Host "vcpkg installed size: ${size} MB"
             }
             Write-Host "========================================"
-          }
-
-      - uses: actions/setup-dotnet@v5
-        with:
-          global-json-file: global.json
-
-      - name: Verify locked Setup UI NuGet closure
-        shell: pwsh
-        run: |
-          $project = Join-Path $env:GITHUB_WORKSPACE 'install\windows-setup-ui\EDRAgent.SetupUi.csproj'
-          $lockRelative = 'install\windows-setup-ui\packages.{0}.lock.json' -f $env:EDR_RUNTIME_IDENTIFIER
-          $lock = Join-Path $env:GITHUB_WORKSPACE $lockRelative
-          if (-not (Test-Path -LiteralPath $lock -PathType Leaf)) {
-            throw "missing Setup UI NuGet lock for ${env:EDR_RUNTIME_IDENTIFIER}: $lock"
-          }
-          $lockJson = Get-Content -LiteralPath $lock -Raw | ConvertFrom-Json
-          $baseGraph = 'net8.0-windows10.0.17763'
-          $runtimeGraph = "$baseGraph/$env:EDR_RUNTIME_IDENTIFIER"
-          $lockGraphs = @($lockJson.dependencies.PSObject.Properties | ForEach-Object { [string]$_.Name })
-          if ($lockGraphs.Count -ne 1 -or $lockGraphs[0] -ne $runtimeGraph) {
-            throw "Setup UI NuGet lock must contain exactly runtime graph '$runtimeGraph' in $lock"
-          }
-          $restoreArgs = @(
-            $project,
-            "-p:RuntimeIdentifier=$env:EDR_RUNTIME_IDENTIFIER",
-            '--locked-mode',
-            '--verbosity', 'normal'
-          )
-          $restoreLog = Join-Path $env:RUNNER_TEMP "setup-ui-locked-restore-$env:EDR_RUNTIME_IDENTIFIER.log"
-          & dotnet restore @restoreArgs 2>&1 | Tee-Object -FilePath $restoreLog
-          $restoreExitCode = $LASTEXITCODE
-          if ($restoreExitCode -ne 0) {
-            Write-Host "---- Setup UI locked restore diagnostic (last 160 lines) ----"
-            Get-Content -LiteralPath $restoreLog -Tail 160 | ForEach-Object { Write-Host $_ }
-            throw "Setup UI locked restore failed for $env:EDR_RUNTIME_IDENTIFIER with exit $restoreExitCode; diagnostic log: $restoreLog"
           }
 
       - name: Package (setup exe + runtime zip)

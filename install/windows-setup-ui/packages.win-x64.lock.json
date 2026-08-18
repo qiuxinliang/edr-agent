@@ -6,13 +6,13 @@
         "type": "Direct",
         "requested": "[1.0.2903.40, )",
         "resolved": "1.0.2903.40",
-        "contentHash": "pDLSrpyma3xyOGXlw3Aowy7XceBdeJbukZzKLVdPCFvyfnn8PrCLylMn6c456ja0TcOOal8IdQCVONDRU2OGkw=="
+        "contentHash": "THrzYAnJgE3+cNH+9Epr44XjoZoRELdVpXlWGPs6K9C9G6TqyDfVCeVAR/Er8ljLitIUX5gaSkPsy9wRhD1sgQ=="
       },
       "System.Drawing.Common": {
         "type": "Direct",
         "requested": "[8.0.0, )",
         "resolved": "8.0.0",
-        "contentHash": "QKFsnF3VkUgFG9VaI1Uzk0MYbsGIvLjp6lq+DcYDUQbn10UyPMTUknUOeRxBOXxTYWtVPXm41eX8Vt/zNF7VMw==",
+        "contentHash": "JkbHJjtI/dWc5dfmEdJlbe3VwgZqCkZRtfuWFh5GOv0f+gGCfBtzMpIVkmdkj2AObO9y+oiOi81UGwH3aBYuqA==",
         "dependencies": {
           "Microsoft.Win32.SystemEvents": "8.0.0"
         }
@@ -20,7 +20,7 @@
       "Microsoft.Win32.SystemEvents": {
         "type": "Transitive",
         "resolved": "8.0.0",
-        "contentHash": "JQFsUIZT+/RjxS2Pw9J3O3whHCQCxOp7SqmH+ynIUdP4DF56u8rOLU1eBhrikFJOgCmvvEmjfX5Rhv4GqkYJsg=="
+        "contentHash": "9opKRyOKMCi2xJ7Bj7kxtZ1r9vbzosMvRrdEhVhDz8j8MoBGgB+WmC94yH839NPH+BclAjtQ/pyagvi/8gDLkw=="
       }
     }
   }

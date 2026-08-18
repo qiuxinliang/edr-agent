@@ -48,6 +48,11 @@ $project = Join-Path $scriptDir "EDRAgent.SetupUi.csproj"
 if (-not (Test-Path -LiteralPath $project)) {
     throw "Missing setup UI project: $project"
 }
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
+$nugetConfig = Join-Path $repositoryRoot "NuGet.Config"
+if (-not (Test-Path -LiteralPath $nugetConfig -PathType Leaf)) {
+    throw "Missing repository NuGet source policy: $nugetConfig"
+}
 
 if (-not $SetupExe) {
     $candidate = Join-Path (Join-Path $scriptDir "..\windows-inno\Output") "FDSecuritySetup-bundled.exe"
@@ -322,6 +327,12 @@ $defaultReadyToRun = if ($resolvedRuntimeMode -eq "self-contained") { "true" } e
 $readyToRun = if ($env:EDR_SETUP_UI_READYTORUN) { [string]$env:EDR_SETUP_UI_READYTORUN } else { $defaultReadyToRun }
 Write-Host "Setup UI runtime mode: $resolvedRuntimeMode (self-contained=$selfContained, readyToRun=$readyToRun)"
 
+$lockedRestoreScript = Join-Path $repositoryRoot "scripts\Restore-SetupUiLocked.ps1"
+if (-not (Test-Path -LiteralPath $lockedRestoreScript -PathType Leaf)) {
+    throw "Missing Setup UI locked-restore gate: $lockedRestoreScript"
+}
+& $lockedRestoreScript -RuntimeIdentifier $runtime -RepositoryRoot $repositoryRoot
+
 $publishArgs = @(
     $project,
     "-c", $Configuration,
@@ -334,7 +345,7 @@ $publishArgs = @(
     "-p:PublishReadyToRun=$readyToRun",
     "-p:DebugType=None",
     "-p:DebugSymbols=false",
-    "--locked-mode",
+    "--no-restore",
     "--verbosity", "normal"
 )
 $publishLog = Join-Path ([System.IO.Path]::GetTempPath()) "edr-setup-ui-publish-$runtime.log"
