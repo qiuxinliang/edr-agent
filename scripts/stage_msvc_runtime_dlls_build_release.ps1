@@ -18,9 +18,40 @@ if (-not (Test-Path -LiteralPath $agentExe -PathType Leaf)) {
 $redistArch = if ($Architecture -eq "arm64") { "arm64" } else { "x64" }
 $requiredDlls = @(
   "vcruntime140.dll",
-  "vcruntime140_1.dll",
   "msvcp140.dll"
 )
+if ($Architecture -eq "amd64") {
+  # The x64 product imports the extended runtime. The VS ARM64 redist directory
+  # can contain an x64 compatibility copy of this DLL, which must not leak into
+  # a native ARM64 package.
+  $requiredDlls += "vcruntime140_1.dll"
+}
+$expectedMachine = if ($Architecture -eq "arm64") { [UInt16]0xaa64 } else { [UInt16]0x8664 }
+$architectureVerifier = Join-Path $PSScriptRoot "Assert-WindowsPeArchitecture.ps1"
+
+function Get-PeMachine {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  try {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 256 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+      return $null
+    }
+    $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+    if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length -or
+        $bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45) {
+      return $null
+    }
+    return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+  } catch {
+    return $null
+  }
+}
+
+function Test-TargetPeArchitecture {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $machine = Get-PeMachine -Path $Path
+  return ($null -ne $machine -and $machine -eq $expectedMachine)
+}
 
 $candidateRoots = New-Object System.Collections.Generic.List[string]
 if ($env:VCToolsRedistDir) {
@@ -48,7 +79,9 @@ foreach ($candidate in @($candidateRoots | Select-Object -Unique)) {
   if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
   $complete = $true
   foreach ($dll in $requiredDlls) {
-    if (-not (Test-Path -LiteralPath (Join-Path $candidate $dll) -PathType Leaf)) {
+    $candidateDll = Join-Path $candidate $dll
+    if (-not (Test-Path -LiteralPath $candidateDll -PathType Leaf) -or
+        -not (Test-TargetPeArchitecture -Path $candidateDll)) {
       $complete = $false
       break
     }
@@ -63,9 +96,26 @@ if (-not $crtDir) {
   throw "A complete Microsoft VC runtime for $redistArch was not found. Checked VCToolsRedistDir and Visual Studio VC\Redist\MSVC."
 }
 
+# A reused build directory may still contain CRT files from another target.
+# Remove only the MSVC app-local runtime family before staging the selected
+# target; vcpkg-owned dependency DLLs are deliberately left untouched.
+Get-ChildItem -LiteralPath $releaseDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -match '^(?i:concrt|msvcp|vccorlib|vcruntime)\d.*\.dll$' } |
+  Remove-Item -Force
+
 $staged = 0
 Get-ChildItem -LiteralPath $crtDir -Filter "*.dll" -File | ForEach-Object {
+  $machine = Get-PeMachine -Path $_.FullName
+  if ($null -eq $machine) {
+    throw "MSVC runtime candidate is not a valid PE DLL: $($_.FullName)"
+  }
+  if ($machine -ne $expectedMachine) {
+    Write-Warning ("Skipping non-target MSVC runtime DLL: path={0} expected={1}/0x{2:x4} actual=0x{3:x4}" -f `
+      $_.FullName, $Architecture, $expectedMachine, $machine)
+    return
+  }
   Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $releaseDir $_.Name) -Force
+  & $architectureVerifier -Path (Join-Path $releaseDir $_.Name) -Architecture $Architecture
   $staged++
 }
 

@@ -839,7 +839,11 @@ jobs:
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
               Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for $env:EDR_VCPKG_TRIPLET."
             }
-            foreach ($runtimeDll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+            $requiredRuntimeDlls = @('vcruntime140.dll', 'msvcp140.dll')
+            if ($env:EDR_RELEASE_ARCH -eq 'amd64') {
+              $requiredRuntimeDlls += 'vcruntime140_1.dll'
+            }
+            foreach ($runtimeDll in $requiredRuntimeDlls) {
               $escapedRuntimeDll = [Regex]::Escape($runtimeDll)
               if (-not ($entries -match "(?i)(^|/|\\)$escapedRuntimeDll$")) {
                 throw "required app-local MSVC runtime DLL missing from package: $runtimeDll"

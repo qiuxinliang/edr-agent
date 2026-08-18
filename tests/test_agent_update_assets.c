@@ -241,7 +241,10 @@ int main(void) {
   contains(workflow, "Verified Runtime PE closure",
            "release verifies every Runtime EXE and DLL against the target architecture");
   contains(workflow, "stage_msvc_runtime_dlls_build_release.ps1", "release stages the app-local MSVC runtime");
-  contains(workflow, "vcruntime140_1.dll", "release package gate requires the MSVC runtime dependency closure");
+  contains(workflow, "if ($env:EDR_RELEASE_ARCH -eq 'amd64')",
+           "release package gate treats the extended MSVC runtime as AMD64-only");
+  contains(workflow, "$requiredRuntimeDlls += 'vcruntime140_1.dll'",
+           "release package gate retains the AMD64 extended runtime dependency");
   contains(workflow, "msvcp140.dll", "release package gate requires the app-local C++ runtime");
   contains(workflow, "EDR_WINDOWS_TARGET_ARCH", "release passes an explicit MSVC target architecture");
   contains(workflow, "ARM64 package must not include unsupported WinDivert binaries",
@@ -307,8 +310,15 @@ int main(void) {
   contains(msvc_runtime, "VCToolsRedistDir", "MSVC runtime staging uses the selected compiler toolset first");
   contains(msvc_runtime, "vswhere.exe", "MSVC runtime staging has a Visual Studio discovery fallback");
   contains(msvc_runtime, "vcruntime140.dll", "MSVC runtime staging requires the core runtime");
-  contains(msvc_runtime, "vcruntime140_1.dll", "MSVC runtime staging requires the extended runtime");
+  contains(msvc_runtime, "if ($Architecture -eq \"amd64\")",
+           "MSVC runtime staging treats the extended runtime as AMD64-only");
+  contains(msvc_runtime, "$requiredDlls += \"vcruntime140_1.dll\"",
+           "MSVC runtime staging retains the AMD64 extended runtime dependency");
   contains(msvc_runtime, "msvcp140.dll", "MSVC runtime staging requires the C++ standard library runtime");
+  contains(msvc_runtime, "Assert-WindowsPeArchitecture.ps1",
+           "MSVC runtime staging verifies every copied DLL against the target PE architecture");
+  contains(msvc_runtime, "Skipping non-target MSVC runtime DLL",
+           "MSVC runtime staging excludes compatibility DLLs for a different architecture");
   free(msvc_runtime);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/windows-install-upgrade-rollback.yml", root);
@@ -655,6 +665,8 @@ int main(void) {
            "release validation parses the shared native capability runner on Windows PowerShell 5.1");
   contains(powershell_validator, "write_windows_package_capabilities.ps1",
            "release validation parses the shared package capability writer on Windows PowerShell 5.1");
+  contains(powershell_validator, "stage_msvc_runtime_dlls_build_release.ps1",
+           "release validation parses the target-aware MSVC runtime staging script on Windows PowerShell 5.1");
   contains(powershell_validator, "Build-BundledInstaller.ps1",
            "release validation parses the complete Setup UI build entrypoint on Windows PowerShell 5.1");
   contains(powershell_validator, "Non-ASCII Windows PowerShell 5.1 script must be UTF-8 with BOM",

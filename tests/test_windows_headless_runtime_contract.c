@@ -213,8 +213,10 @@ int main(void) {
                          "headless enrollment must fail when queue ACL repair fails");
   ok &= require_contains(installer_ps, "packaged MSVC runtime missing beside",
                          "headless enrollment must identify an incomplete app-local MSVC runtime");
-  ok &= require_contains(installer_ps, "vcruntime140_1.dll",
-                         "headless enrollment must validate the extended MSVC runtime dependency");
+  ok &= require_contains(installer_ps, "if ($exeMachine -ne \"arm64\")",
+                         "headless enrollment must apply architecture-specific runtime requirements");
+  ok &= require_contains(installer_ps, "$requiredRuntime += \"vcruntime140_1.dll\"",
+                         "headless enrollment must validate the extended MSVC runtime outside native ARM64");
   ok &= require_contains(installer_ps, "msvcp140.dll",
                          "headless enrollment must validate the C++ runtime dependency");
   free(installer_ps);

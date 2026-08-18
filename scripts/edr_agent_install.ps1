@@ -490,11 +490,17 @@ function Test-ExistingAgentTomlWithAgent {
     if (-not (Test-Path -LiteralPath $exe)) {
       continue
     }
-    $missingRuntime = @(
+    $requiredRuntime = @(
       "vcruntime140.dll",
-      "vcruntime140_1.dll",
       "msvcp140.dll"
-    ) | Where-Object { -not (Test-Path -LiteralPath (Join-Path $InstallRoot $_) -PathType Leaf) }
+    )
+    $exeMachine = Get-PeMachineName $exe
+    if ($exeMachine -ne "arm64") {
+      $requiredRuntime += "vcruntime140_1.dll"
+    }
+    $missingRuntime = @($requiredRuntime | Where-Object {
+      -not (Test-Path -LiteralPath (Join-Path $InstallRoot $_) -PathType Leaf)
+    })
     if ($missingRuntime.Count -gt 0) {
       return ("packaged MSVC runtime missing beside {0}: {1}" -f $exeName, ($missingRuntime -join ", "))
     }
