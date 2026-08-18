@@ -89,16 +89,19 @@ jobs:
         shell: pwsh
         run: python .\scripts\prepare_p0_release_bundle.py
 
-      - name: Cache vcpkg (installed + downloads + binary cache)
+      # Do not restore vcpkg_installed across jobs: its status file can make
+      # vcpkg skip validation after a runner/compiler image change. Downloads
+      # and the ABI-keyed binary cache are safe to reuse; a complete installed
+      # tree must come from the immutable pre-built Release or this job.
+      - name: Cache vcpkg source and binary downloads
         uses: actions/cache@v5
         with:
           path: |
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
-            vcpkg_installed
           key: vcpkg-x64-win-yara-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-x64-win-yara-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+            vcpkg-x64-win-yara-
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
@@ -133,6 +136,9 @@ jobs:
             Write-Host "[pre-build-packages] Falling back to source build"
             "VCPKG_SOURCE=source" | Out-File -FilePath $env:GITHUB_ENV -Append
             if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
+            # A missing pre-built release is an expected cache miss. Native
+            # tools leave LASTEXITCODE non-zero even when the miss is handled.
+            $global:LASTEXITCODE = 0
           }
 
       - name: "[Timing] Build start"
@@ -186,7 +192,7 @@ jobs:
             "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
-            -DEDR_BUILD_TESTS=OFF
+            -DEDR_BUILD_TESTS=ON
           if (-not $?) { throw "cmake configure failed" }
 
       - name: Verify YARA compile definition generated
@@ -203,17 +209,19 @@ jobs:
       - name: Build (Ninja)
         shell: pwsh
         run: |
-          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          $buildTargets = @(
+            'edr_agent',
+            'fd_installer_worker',
+            'fd_headless_uninstaller',
+            'test_command_contract',
+            'test_agent_update_contract',
+            'test_agent_update_assets',
+            'test_windows_headless_runtime_contract',
+            'test_pmfe_pe_arch'
+          )
+          cmake --build build --target $buildTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
           if ($LASTEXITCODE -ne 0) {
-            throw "FDSensor build failed with exit code $LASTEXITCODE"
-          }
-          cmake --build build --target fd_installer_worker --parallel $env:NUMBER_OF_PROCESSORS --verbose
-          if ($LASTEXITCODE -ne 0) {
-            throw "FDSecurityInstallerWorker build failed with exit code $LASTEXITCODE"
-          }
-          cmake --build build --target fd_headless_uninstaller --parallel $env:NUMBER_OF_PROCESSORS --verbose
-          if ($LASTEXITCODE -ne 0) {
-            throw "headless uninstall.exe build failed with exit code $LASTEXITCODE"
+            throw "Windows product or gate-test build failed with exit code $LASTEXITCODE"
           }
 
       - name: Verify native uninstall attestation capabilities
@@ -278,8 +286,27 @@ jobs:
           }
 
       - name: Test
-        shell: bash
-        run: ctest --test-dir build --output-on-failure
+        shell: pwsh
+        run: |
+          $listed = & ctest --test-dir build -N
+          if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
+            throw "Client build test configuration has no discoverable tests"
+          }
+          $required = @(
+            'agent_update_command_contract',
+            'agent_update_packaging_contract',
+            'windows_headless_runtime_contract',
+            'command_registry_and_payload_contract',
+            'pmfe_pe_architectures'
+          )
+          $listedText = $listed -join "`n"
+          foreach ($name in $required) {
+            if ($listedText -notmatch [regex]::Escape($name)) {
+              throw "Required client build test was not configured: $name"
+            }
+          }
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures)$'
+          if ($LASTEXITCODE -ne 0) { throw "Client build gate tests failed" }
 
       - name: "[Timing] Build summary"
         if: always()

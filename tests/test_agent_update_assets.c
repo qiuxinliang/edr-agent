@@ -388,6 +388,10 @@ int main(void) {
            "release workflow retries only a bounded GitHub source-archive rate limit");
   contains(client_release, "prebuild-yara-$env:EDR_VCPKG_TRIPLET-$hash",
            "release workflow restores the matching production YARA pre-built dependency closure");
+  contains(client_release, "Cache vcpkg source and binary downloads",
+           "release workflow reuses validated vcpkg caches without restoring an installed tree");
+  contains(client_release, "$global:LASTEXITCODE = 0",
+           "release workflow clears the handled pre-built cache-miss exit status");
   contains(client_release, "max-parallel: 1",
            "release serializes cold AMD64 and ARM64 source-cache fallbacks");
   contains(client_release, "actions/setup-dotnet@v5",
@@ -441,6 +445,14 @@ int main(void) {
            "client build retries bounded GitHub source-archive rate limits");
   contains(client_build, "prebuild-yara-x64-windows-$hash",
            "client build restores the matching production YARA pre-built dependency closure");
+  contains(client_build, "Cache vcpkg source and binary downloads",
+           "client build reuses validated vcpkg caches without restoring an installed tree");
+  contains(client_build, "$global:LASTEXITCODE = 0",
+           "client build clears the handled pre-built cache-miss exit status");
+  contains(client_build, "Client build test configuration has no discoverable tests",
+           "client build rejects an empty CTest configuration");
+  contains(client_build, "test_pmfe_pe_arch",
+           "client build compiles the PMFE architecture contract test");
   contains(client_build, "actions/upload-artifact@v6",
            "client build uses the Node 24 artifact upload action");
   contains(client_build, "$nativeIntegrityFiles.ToArray()",
@@ -460,6 +472,8 @@ int main(void) {
            "vcpkg prebuild tag binds the manifest hash and target triplet");
   contains(vcpkg_prebuild, "Invoke-VcpkgInstallWithRetry.ps1",
            "vcpkg prebuild uses bounded rate-limit recovery");
+  contains(vcpkg_prebuild, "paths:",
+           "vcpkg prebuild workflow warms dependencies when the manifest changes on main");
   free(vcpkg_prebuild);
 
   snprintf(path, sizeof(path), "%s/scripts/Invoke-VcpkgInstallWithRetry.ps1", root);

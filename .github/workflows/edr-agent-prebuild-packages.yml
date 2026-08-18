@@ -5,6 +5,15 @@ name: Build Pre-built vcpkg Packages
 
 on:
   workflow_dispatch:
+  # Seed immutable dependency closures before a release tag is created. The
+  # Windows build/release workflows still have a bounded source fallback for
+  # the small race where a release starts before this job completes.
+  push:
+    branches:
+      - main
+    paths:
+      - vcpkg.json
+      - .github/workflows/edr-agent-prebuild-packages.yml
 
 permissions:
   contents: write

@@ -301,16 +301,19 @@ jobs:
           echo "release tag: ${ref}"
           echo "agent version: ${version}"
 
-      - name: Cache vcpkg (installed + downloads + binary cache)
+      # Do not restore vcpkg_installed across jobs: its status file can make
+      # vcpkg skip validation after a runner/compiler image change. Downloads
+      # and the ABI-keyed binary cache are safe to reuse; a complete installed
+      # tree must come from the immutable pre-built Release or this job.
+      - name: Cache vcpkg source and binary downloads
         uses: actions/cache@v5
         with:
           path: |
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
-            vcpkg_installed
           key: vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
           restore-keys: |
-            vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+            vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
@@ -346,6 +349,9 @@ jobs:
             Write-Host "[pre-build-packages] Falling back to source build"
             "VCPKG_SOURCE=source" | Out-File -FilePath $env:GITHUB_ENV -Append
             if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
+            # A missing pre-built release is an expected cache miss. Native
+            # tools leave LASTEXITCODE non-zero even when the miss is handled.
+            $global:LASTEXITCODE = 0
           }
 
       - name: "[Timing] Build start"
