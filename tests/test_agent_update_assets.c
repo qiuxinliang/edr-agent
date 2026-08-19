@@ -345,6 +345,16 @@ int main(void) {
   contains(lifecycle, "windows_release_lifecycle_smoke.ps1", "release lifecycle executes the Windows install-upgrade-rollback smoke test");
   contains(lifecycle, "windows_setup_exe_lifecycle_smoke.ps1",
            "release lifecycle executes the real Setup EXE install-upgrade-rollback-uninstall test");
+  snprintf(path, sizeof(path), "%s/scripts/windows_setup_exe_lifecycle_smoke.ps1", root);
+  char *setup_lifecycle = read_file(path);
+  require_true(setup_lifecycle != NULL, "read Setup EXE lifecycle smoke script");
+  contains(setup_lifecycle, "[object[]]$eventArray = $events.ToArray()",
+           "Setup lifecycle materializes generic evidence before ordered summary serialization");
+  contains(setup_lifecycle, "events = $eventArray",
+           "Setup lifecycle summary uses the PowerShell-safe evidence array");
+  require_true(!strstr(setup_lifecycle, "events = @($events)"),
+               "Setup lifecycle avoids PowerShell generic-list expansion in ordered hashtables");
+  free(setup_lifecycle);
   contains(lifecycle, "windows-${{ matrix.arch }}-setup.exe",
            "release lifecycle downloads the architecture-matched immutable Setup EXE");
   contains(lifecycle, "runner: windows-2022",

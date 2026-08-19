@@ -45,7 +45,7 @@ function Add-Evidence([string] $Stage, [string] $Status, [string] $Detail) {
     stage = $Stage
     status = $Status
     detail = $Detail
-  })
+  }) | Out-Null
 }
 function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisting) {
   $log = Join-Path $EvidenceDir ($Stage + ".setup.log")
@@ -133,6 +133,10 @@ try {
   Add-Evidence "lifecycle" "failed" $_.Exception.Message
   throw
 } finally {
+  # PowerShell 7 can throw "Argument types do not match" when a generic
+  # List[object] is expanded with @($list) inside an ordered hashtable. Convert
+  # it explicitly so summary serialization cannot mask the lifecycle result.
+  [object[]]$eventArray = $events.ToArray()
   $summary = [ordered]@{
     schema = "edr.agent.setup-exe.lifecycle.v1"
     completed_at = [DateTime]::UtcNow.ToString("o")
@@ -141,7 +145,7 @@ try {
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
     install_dir = $InstallDir
-    events = @($events)
+    events = $eventArray
   }
   [IO.File]::WriteAllText(
     (Join-Path $EvidenceDir "summary.json"),
