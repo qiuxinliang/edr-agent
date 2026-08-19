@@ -153,6 +153,11 @@ Type: filesandordirs; Name: "{app}\evidence"
 Type: filesandordirs; Name: "{app}\state"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\forensic"
+; The native installer worker creates collector unconditionally, even when a
+; standard package contains no optional collector binary.  In that case Inno
+; never records the empty directory as an installed [Files] destination, so it
+; must be removed explicitly or the app root remains with ERROR_DIR_NOT_EMPTY.
+Type: filesandordirs; Name: "{app}\collector"
 Type: filesandordirs; Name: "{app}\isolation"
 Type: filesandordirs; Name: "{app}\diagnostics"
 Type: filesandordirs; Name: "{app}\upload_outbox"

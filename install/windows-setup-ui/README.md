@@ -18,6 +18,7 @@ $agentSha256 = (Get-FileHash -LiteralPath .\FDSensor.exe -Algorithm SHA256).Hash
   -SetupExe .\FDSecuritySetup.exe `
   -AgentBinarySha256 $agentSha256 `
   -AppVersion 2.1.150 `
+  -ExpectedSignatureStatus unsigned `
   -BootstrapTrustPublicKeyPem .\bootstrap_trust_public_key.pem `
   -OutputZip .\FDSecuritySetupUI.zip
 ```
@@ -52,6 +53,7 @@ $agentSha256 = (Get-FileHash -LiteralPath .\FDSensor.exe -Algorithm SHA256).Hash
   -SetupExe .\FDSecuritySetup.exe `
   -AgentBinarySha256 $agentSha256 `
   -AppVersion 2.1.150 `
+  -ExpectedSignatureStatus unsigned `
   -RuntimeMode compact `
   -OutputZip .\FDSecuritySetupUI-compact.zip
 ```

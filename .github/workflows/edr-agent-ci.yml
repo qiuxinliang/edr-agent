@@ -5,9 +5,6 @@
 name: edr-agent build
 
 on:
-  push:
-    tags:
-      - 'win_*.*.*'
   pull_request:
   workflow_dispatch:
 

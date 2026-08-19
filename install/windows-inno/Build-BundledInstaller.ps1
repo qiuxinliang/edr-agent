@@ -242,11 +242,47 @@ Build-AndStageForensicCollector -RepoRoot $repoRoot -BinDir $BinDir -Arch $resol
 $runtimePeFiles = @(Get-ChildItem -LiteralPath $BinDir -File -ErrorAction Stop | Where-Object {
     $_.Extension -ieq ".exe" -or $_.Extension -ieq ".dll"
 })
+$collectorDir = Join-Path $BinDir "collector"
+if (Test-Path -LiteralPath $collectorDir -PathType Container) {
+    $runtimePeFiles += @(Get-ChildItem -LiteralPath $collectorDir -File -ErrorAction Stop | Where-Object {
+        $_.Extension -ieq ".exe" -or $_.Extension -ieq ".dll"
+    })
+}
 if ($runtimePeFiles.Count -lt 1) { throw "No Runtime EXE/DLL files found for architecture validation: $BinDir" }
 foreach ($runtimePeFile in $runtimePeFiles) {
     & $archCheck -Path $runtimePeFile.FullName -Architecture $TargetArch
 }
 Write-Host "Verified Runtime PE closure: arch=$TargetArch files=$($runtimePeFiles.Count)"
+
+# package-capabilities.v1 describes the executable launch closure, not whether
+# this particular build process happened to receive a signing secret. Bind the
+# declared value to every executable the installer can launch, including an
+# optional staged forensic collector.
+$signatureClosure = @(
+    $binExe,
+    (Join-Path $BinDir "uninstall.exe")
+)
+if (Test-Path -LiteralPath $workerExe -PathType Leaf) {
+    $signatureClosure += $workerExe
+}
+if (Test-Path -LiteralPath $collectorDir -PathType Container) {
+    $signatureClosure += @(Get-ChildItem -LiteralPath $collectorDir -Filter "*.exe" -File -ErrorAction Stop |
+        ForEach-Object { $_.FullName })
+}
+foreach ($signaturePath in $signatureClosure) {
+    if (-not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) {
+        throw "Signature closure is missing required executable: $signaturePath"
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $signaturePath
+    if ($signature.Status -notin @("Valid", "NotSigned")) {
+        throw "Executable has an invalid Authenticode state: path=$signaturePath authenticode=$($signature.Status) $($signature.StatusMessage)"
+    }
+    $actualSignatureStatus = if ($signature.Status -eq "Valid") { "signed" } else { "unsigned" }
+    if ($actualSignatureStatus -ne $SignatureStatus) {
+        throw "Executable signature status mismatch: path=$signaturePath expected=$SignatureStatus actual=$actualSignatureStatus authenticode=$($signature.Status)"
+    }
+}
+Write-Host "Verified executable signature closure: status=$SignatureStatus files=$($signatureClosure.Count)"
 
 $pre = Join-Path $repoRoot "edr-backend\platform\config\agent_preprocess_rules_v1.toml"
 if (-not (Test-Path -LiteralPath $pre)) {

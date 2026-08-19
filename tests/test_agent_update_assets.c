@@ -255,6 +255,8 @@ int main(void) {
            "release runs the AMD64 and ARM64 capability round-trip gate");
   contains(workflow, "-SignatureStatus $signatureStatus",
            "release passes signed versus unsigned launch policy context to the contract writer");
+  contains(workflow, "-ExpectedSignatureStatus $signatureStatus",
+           "release binds the outer Setup UI signature state to the same verified release mode");
   contains(workflow, "package root must contain exactly one package-capabilities.json",
            "release gate verifies the architecture capability manifest is packaged exactly once");
   contains(workflow, "gh release upload", "architecture bundles are retained in the draft release before publication");
@@ -271,6 +273,13 @@ int main(void) {
   contains(workflow, "      - windows-lifecycle", "release publication waits for the Windows lifecycle gate");
   contains(workflow, "target_tag: ${{ github.event_name == 'workflow_dispatch'", "lifecycle validation receives the exact release tag");
   free(workflow);
+
+  snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-ci.yml", root);
+  char *ordinary_ci = read_file(path);
+  require_true(ordinary_ci != NULL, "read ordinary Agent CI workflow");
+  require_true(strstr(ordinary_ci, "'win_*.*.*'") == NULL,
+               "ordinary CI must not duplicate the authoritative Release build on win tags");
+  free(ordinary_ci);
 
   snprintf(path, sizeof(path), "%s/scripts/write_windows_package_capabilities.ps1", root);
   char *package_capabilities = read_file(path);
@@ -372,6 +381,8 @@ int main(void) {
            "Setup lifecycle validates clean target uninstall before installing the baseline");
   contains(setup_lifecycle, "Copy-InstallerDiagnostics",
            "Setup lifecycle prints and preserves Inno and Agent diagnostics on every failed stage");
+  contains(setup_lifecycle, ".install-dir-residue.txt",
+           "Setup lifecycle preserves the exact remaining install-directory entries on uninstall failure");
   contains(setup_lifecycle, "uninstall-after-rollback",
            "Setup lifecycle verifies final cleanup after the rollback path");
   contains(setup_lifecycle, "uninstall-after-upgrade",
@@ -703,6 +714,8 @@ int main(void) {
            "release validation parses the target-aware MSVC runtime staging script on Windows PowerShell 5.1");
   contains(powershell_validator, "Build-BundledInstaller.ps1",
            "release validation parses the complete Setup UI build entrypoint on Windows PowerShell 5.1");
+  contains(powershell_validator, "windows-setup-ui\\Build-SetupUi.ps1",
+           "release validation parses the outer Setup UI package producer on Windows PowerShell 5.1");
   contains(powershell_validator, "Non-ASCII Windows PowerShell 5.1 script must be UTF-8 with BOM",
            "release validation rejects ambiguous ANSI decoding of non-ASCII runtime scripts");
   free(powershell_validator);

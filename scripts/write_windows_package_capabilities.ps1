@@ -14,6 +14,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# v1 signature_status describes the verified executable launch closure inside
+# the package: signed means every required executable has valid Authenticode;
+# unsigned means none does. Producers must reject mixed closures before calling
+# this serializer. Detached CMS manifest signing is an independent trust layer.
+#
 # v1 deliberately permits only native Windows packages. AMD64-on-ARM64 can be
 # introduced in a new schema after the complete service, PMFE, update and
 # uninstall chain passes a native ARM64 end-to-end gate.

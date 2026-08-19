@@ -731,7 +731,8 @@ jobs:
             -BinDir (Resolve-Path $outDir).Path `
             -AppVersion $env:EDR_AGENT_VERSION `
             -TargetArch $env:EDR_RELEASE_ARCH `
-            -SignatureStatus $signatureStatus
+            -SignatureStatus $signatureStatus `
+            -SkipForensicCollectorBuild
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
           $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
           if (-not (Test-Path -LiteralPath $setupSrc)) {
@@ -767,7 +768,7 @@ jobs:
           }
           $agentBinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outDir "FDSensor.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
           $runtimeIdentitySha256 = (Get-FileHash -LiteralPath $nativeIntegrityPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentitySha256 $runtimeIdentitySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -OutputZip $setupUiZip
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentitySha256 $runtimeIdentitySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -ExpectedSignatureStatus $signatureStatus -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force

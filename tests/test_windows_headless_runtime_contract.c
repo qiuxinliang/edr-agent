@@ -378,6 +378,8 @@ int main(void) {
                          "Setup UI must package the same native uninstaller as the release ZIP");
   ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.ps1\"",
                          "Setup UI must package the release-owned PowerShell uninstaller");
+  ok &= require_contains(inno, "Type: filesandordirs; Name: \"{app}\\collector\"",
+                         "Setup uninstall must remove the worker-created optional collector directory");
   ok &= require_contains(inno, "INSTALL_FAILURE_ROLLBACK begin",
                          "first-install Setup UI failure must initiate controlled rollback");
   ok &= require_contains(inno, "EdrHadExistingInstallation := FileExists(AppDir + '\\unins000.exe')",
@@ -416,6 +418,12 @@ int main(void) {
                          "Setup UI and headless packages must use the shared capability contract writer");
   ok &= require_contains(build_ps, "-SignatureStatus $SignatureStatus",
                          "bundled installer capability metadata must bind the Agent signature mode");
+  ok &= require_contains(build_ps, "Verified executable signature closure",
+                         "bundled installer must verify declared inner executable signing state");
+  ok &= require_contains(build_ps, "actualSignatureStatus -ne $SignatureStatus",
+                         "bundled installer must reject an inner signature-state mismatch");
+  ok &= require_contains(build_ps, "notin @(\"Valid\", \"NotSigned\")",
+                         "bundled installer must reject corrupt or unverifiable Authenticode states");
   ok &= require_contains(build_ps, "Verified Runtime PE closure",
                          "bundled installer must verify every Runtime EXE and DLL architecture");
   ok &= require_contains(build_ps, "Assert-WindowsInstallerBootstrapArchitecture.ps1",
@@ -428,8 +436,14 @@ int main(void) {
   if (!setup_ui_build) return 1;
   ok &= require_contains(setup_ui_build, "edr.windows.package-capabilities.v1",
                          "Setup UI manifest uses the canonical package capability schema");
-  ok &= require_contains(setup_ui_build, "signature_status = if ($uiSigned -and $setupSigned)",
-                         "Setup UI capability metadata records signed versus unsigned state");
+  ok &= require_contains(setup_ui_build, "[string] $ExpectedSignatureStatus",
+                         "Setup UI packaging requires an explicit Release signature expectation");
+  ok &= require_contains(setup_ui_build, "$actualSignatureStatus -eq \"mixed\"",
+                         "Setup UI packaging rejects partially signed executable closures");
+  ok &= require_contains(setup_ui_build, "notin @('Valid', 'NotSigned')",
+                         "Setup UI packaging rejects corrupt or unverifiable executable signatures");
+  ok &= require_contains(setup_ui_build, "signature_status = $actualSignatureStatus",
+                         "Setup UI capability metadata records the verified executable closure state");
   ok &= require_contains(setup_ui_build, "target_arch = $targetArch",
                          "Setup UI capability metadata binds the native target architecture");
   ok &= require_contains(setup_ui_build, "Assert-WindowsInstallerBootstrapArchitecture.ps1",

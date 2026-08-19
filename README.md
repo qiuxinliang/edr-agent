@@ -4,6 +4,10 @@
 
 **改进任务单（按 AGT-xxx 编号，可拆 issue）**：[docs/CLIENT_IMPROVEMENT_TASKS.md](docs/CLIENT_IMPROVEMENT_TASKS.md)。
 
+## 正式发布边界
+
+本独立仓库的 [`.github/workflows/edr-agent-client-release.yml`](.github/workflows/edr-agent-client-release.yml) 是 Windows Agent 唯一正式构建与 Release 入口。`win_<SemVer>` 必须由该工作流产出同一源码提交的 AMD64/ARM64 Runtime、Setup、Setup UI 和 Artifact Manifest，并通过两个原生 Windows 架构的安装、升级、回滚、卸载门禁后才能发布。主仓库只固定本仓库的 gitlink，不得重新编译或用当前 HEAD 覆盖已发布版本资产。
+
 **线程模型（M2）**：[docs/AGENT_THREAD_MODEL.md](docs/AGENT_THREAD_MODEL.md)（**AGT-003**）。**取证 UploadFile 联调**：[docs/AGT009_FORENSIC_UPLOAD_E2E.md](docs/AGT009_FORENSIC_UPLOAD_E2E.md)。**Linux P7 eBPF 路线图**：[docs/AGT012_LINUX_EBPF_P7.md](docs/AGT012_LINUX_EBPF_P7.md)。
 
 ### 工程文档与 Windows / Linux 能力对齐（AGT-011）

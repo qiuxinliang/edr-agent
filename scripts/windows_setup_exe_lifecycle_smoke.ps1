@@ -166,7 +166,19 @@ function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
     Start-Sleep -Seconds 1
   } while ((Get-Date) -lt $deadline)
   if ($service -or $runtime -or (Test-Path -LiteralPath $InstallDir)) {
-    throw "$Stage residue: service=$([bool]$service) process=$([bool]$runtime) install_dir=$([bool](Test-Path -LiteralPath $InstallDir))"
+    $residue = @()
+    if (Test-Path -LiteralPath $InstallDir -PathType Container) {
+      $residue = @(Get-ChildItem -LiteralPath $InstallDir -Force -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object {
+          $relative = $_.FullName.Substring($InstallDir.TrimEnd('\').Length).TrimStart('\')
+          if ($_.PSIsContainer) { $relative + '\' } else { $relative }
+        })
+      $residuePath = Join-Path $EvidenceDir ($Stage + ".install-dir-residue.txt")
+      [IO.File]::WriteAllLines($residuePath, [string[]]$residue, [Text.UTF8Encoding]::new($false))
+      Write-Host "--- $Stage install directory residue ---"
+      $residue | ForEach-Object { Write-Host $_ }
+    }
+    throw "$Stage residue: service=$([bool]$service) process=$([bool]$runtime) install_dir=$([bool](Test-Path -LiteralPath $InstallDir)) entries=$($residue -join '|')"
   }
   Add-Evidence $Stage "verified" "service_removed=true process_stopped=true install_dir_removed=true"
 }

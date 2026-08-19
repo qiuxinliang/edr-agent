@@ -30,6 +30,9 @@ param(
     [string] $RuntimeIdentifier = "",
     [ValidateSet("", "amd64", "arm64")]
     [string] $SetupTargetArch = "",
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("signed", "unsigned")]
+    [string] $ExpectedSignatureStatus,
     [switch] $AllowMissingSetupArchMetadata
 )
 
@@ -118,7 +121,14 @@ function Invoke-SignIfConfigured([string] $Path) {
 
     $certB64 = [string]$env:EDR_WINDOWS_SIGNING_CERT_BASE64
     if (-not $certB64) {
-        return $false
+        # Immutable Release consumers may pass an already signed Setup binary.
+        # Report its real Authenticode state instead of equating "no signing
+        # secret in this process" with "unsigned artifact".
+        $existing = Get-AuthenticodeSignature -LiteralPath $Path
+        if ($existing.Status -notin @('Valid', 'NotSigned')) {
+            throw "Executable has an invalid Authenticode state: ${Path}: $($existing.Status) $($existing.StatusMessage)"
+        }
+        return ($existing.Status -eq 'Valid')
     }
     $signtool = Resolve-SignToolPath
     if (-not $signtool) {
@@ -406,6 +416,13 @@ if (-not (Test-Path -LiteralPath $installerBootstrapArchVerifier)) {
 & $installerBootstrapArchVerifier -Path $bundledSetupExe -PayloadArchitecture $targetArch
 $uiSigned = Invoke-SignIfConfigured $uiExe
 $setupSigned = Invoke-SignIfConfigured $bundledSetupExe
+$actualSignatureStatus = if ($uiSigned -and $setupSigned) { "signed" } elseif (-not $uiSigned -and -not $setupSigned) { "unsigned" } else { "mixed" }
+if ($actualSignatureStatus -eq "mixed") {
+    throw "Setup UI signature closure is inconsistent: setup_exe_signed=$setupSigned ui_exe_signed=$uiSigned"
+}
+if ($actualSignatureStatus -ne $ExpectedSignatureStatus) {
+    throw "Setup UI signature status mismatch: expected=$ExpectedSignatureStatus actual=$actualSignatureStatus"
+}
 
 if ($PreconfigJson) {
     if (-not (Test-Path -LiteralPath $PreconfigJson)) {
@@ -448,7 +465,10 @@ $manifest = @{
         arm64_emulation_supported = $false
         arm64_emulation_network_packet_capture = $false
         windows_firewall_isolation = $true
-        signature_status = if ($uiSigned -and $setupSigned) { "signed" } else { "unsigned" }
+        # v1 semantics: signed means every executable entry point in this
+        # outer package has a valid Authenticode signature; unsigned means none
+        # is signed. Mixed closures are rejected above and never serialized.
+        signature_status = $actualSignatureStatus
     }
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"

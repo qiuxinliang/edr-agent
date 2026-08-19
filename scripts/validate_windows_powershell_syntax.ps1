@@ -35,7 +35,8 @@ $relativePaths = @(
   "scripts\windows_release_lifecycle_smoke.ps1",
   "install\windows-inno\Build-BundledInstaller.ps1",
   "install\windows-inno\edr_install_wizard_enroll.ps1",
-  "install\windows-inno\edr_windows_autorun.ps1"
+  "install\windows-inno\edr_windows_autorun.ps1",
+  "install\windows-setup-ui\Build-SetupUi.ps1"
 )
 
 $failureCount = 0
