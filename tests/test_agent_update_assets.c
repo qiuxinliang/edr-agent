@@ -328,6 +328,12 @@ int main(void) {
   contains(lifecycle, "target_tag:", "release lifecycle target tag is an explicit input");
   contains(lifecycle, "$hasNativeAsset",
            "blank baseline resolves to the latest lower release with a matching native package");
+  contains(lifecycle, "baseline_state=$baselineState",
+           "lifecycle diagnostics identify whether the selected baseline candidate was draft or published");
+  contains(lifecycle, "if ($release.prerelease -or $release.tag_name",
+           "baseline discovery admits older draft candidates for native verification in the current run");
+  require_true(!strstr(lifecycle, "if ($release.draft -or $release.prerelease"),
+               "baseline discovery does not fall back to an ancient published release merely because newer candidates are drafts");
   contains(lifecycle, "$targetRuntime = \"edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-exe.zip\"",
            "release lifecycle selects baseline runtime assets by architecture-specific immutable exact name");
   contains(lifecycle, "contents: write",
@@ -354,6 +360,14 @@ int main(void) {
            "Setup lifecycle summary uses the PowerShell-safe evidence array");
   require_true(!strstr(setup_lifecycle, "events = @($events)"),
                "Setup lifecycle avoids PowerShell generic-list expansion in ordered hashtables");
+  contains(setup_lifecycle, "install-target-fresh",
+           "Setup lifecycle validates a clean target install before historical compatibility stages");
+  contains(setup_lifecycle, "uninstall-target-fresh",
+           "Setup lifecycle validates clean target uninstall before installing the baseline");
+  contains(setup_lifecycle, "Copy-InstallerDiagnostics",
+           "Setup lifecycle prints and preserves Inno and Agent diagnostics on every failed stage");
+  contains(setup_lifecycle, "uninstall-after-rollback",
+           "Setup lifecycle verifies final cleanup after the rollback path");
   free(setup_lifecycle);
   contains(lifecycle, "windows-${{ matrix.arch }}-setup.exe",
            "release lifecycle downloads the architecture-matched immutable Setup EXE");

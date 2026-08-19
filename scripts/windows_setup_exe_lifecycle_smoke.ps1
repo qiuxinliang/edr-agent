@@ -47,8 +47,45 @@ function Add-Evidence([string] $Stage, [string] $Status, [string] $Detail) {
     detail = $Detail
   }) | Out-Null
 }
+function Copy-InstallerDiagnostics([string] $Stage, [string] $SetupLog) {
+  # Evidence collection must never hide the original installer failure.
+  try {
+    if (Test-Path -LiteralPath $SetupLog -PathType Leaf) {
+      Write-Host "--- $Stage Inno Setup log tail ---"
+      Get-Content -LiteralPath $SetupLog -Tail 120 | ForEach-Object { Write-Host $_ }
+    } else {
+      Write-Warning "$Stage did not create its requested Inno Setup log: $SetupLog"
+    }
+
+    $diagnosticsRoot = Join-Path $env:ProgramData "FDSecurity\setup-ui\agent-diagnostics"
+    if (Test-Path -LiteralPath $diagnosticsRoot -PathType Container) {
+      $stageDiagnostics = Join-Path $EvidenceDir ($Stage + ".agent-diagnostics")
+      New-Item -ItemType Directory -Path $stageDiagnostics -Force | Out-Null
+      Get-ChildItem -LiteralPath $diagnosticsRoot -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $stageDiagnostics -Recurse -Force -ErrorAction SilentlyContinue
+      }
+      $stageLog = Join-Path $diagnosticsRoot "install-stage.log"
+      if (Test-Path -LiteralPath $stageLog -PathType Leaf) {
+        Write-Host "--- $Stage Agent install-stage.log ---"
+        Get-Content -LiteralPath $stageLog -Tail 120 | ForEach-Object { Write-Host $_ }
+      }
+    } else {
+      Write-Warning "$Stage did not create Agent installer diagnostics: $diagnosticsRoot"
+    }
+
+    $diagnosticsBundle = Join-Path $env:ProgramData "FDSecurity\setup-ui\install-diagnostics.zip"
+    if (Test-Path -LiteralPath $diagnosticsBundle -PathType Leaf) {
+      Copy-Item -LiteralPath $diagnosticsBundle `
+        -Destination (Join-Path $EvidenceDir ($Stage + ".install-diagnostics.zip")) -Force
+    }
+  } catch {
+    Write-Warning ("Unable to collect diagnostics for {0}: {1}" -f $Stage, $_.Exception.Message)
+  }
+}
 function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisting) {
   $log = Join-Path $EvidenceDir ($Stage + ".setup.log")
+  $script:LastLifecycleStage = $Stage
+  $script:LastSetupLog = $log
   $arguments = @(
     "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
     ('/DIR="{0}"' -f $InstallDir),
@@ -98,24 +135,20 @@ function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage) {
   }
   Add-Evidence $Stage "verified" "version=$actualVersion service=running process=running"
 }
-
-$status = "failed"
-try {
-  Invoke-Installer $BaselineSetupExe "install-baseline" $false
-  Assert-InstalledRuntime $BaselineVersion "install-baseline"
-  Invoke-Installer $TargetSetupExe "upgrade-target" $true
-  Assert-InstalledRuntime $TargetVersion "upgrade-target"
-  Invoke-Installer $BaselineSetupExe "rollback-baseline" $true
-  Assert-InstalledRuntime $BaselineVersion "rollback-baseline"
-
+function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
   $uninstaller = Join-Path $InstallDir "unins000.exe"
-  $uninstallLog = Join-Path $EvidenceDir "uninstall.setup.log"
-  Add-Evidence "uninstall" "started" $uninstaller
+  $uninstallLog = Join-Path $EvidenceDir ($Stage + ".setup.log")
+  $script:LastLifecycleStage = $Stage
+  $script:LastSetupLog = $uninstallLog
+  if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+    throw "$Stage is missing the Inno Setup uninstaller: $uninstaller"
+  }
+  Add-Evidence $Stage "started" $uninstaller
   $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @(
     "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", ('/LOG="{0}"' -f $uninstallLog)
   ) -Wait -PassThru
   if ($uninstallProcess.ExitCode -ne 0) {
-    throw "Setup uninstaller failed with exit code $($uninstallProcess.ExitCode); log=$uninstallLog"
+    throw "$Stage failed with exit code $($uninstallProcess.ExitCode); log=$uninstallLog"
   }
   $deadline = (Get-Date).AddSeconds(120)
   do {
@@ -125,11 +158,33 @@ try {
     Start-Sleep -Seconds 1
   } while ((Get-Date) -lt $deadline)
   if ($service -or $runtime -or (Test-Path -LiteralPath $InstallDir)) {
-    throw "Setup uninstall residue: service=$([bool]$service) process=$([bool]$runtime) install_dir=$([bool](Test-Path -LiteralPath $InstallDir))"
+    throw "$Stage residue: service=$([bool]$service) process=$([bool]$runtime) install_dir=$([bool](Test-Path -LiteralPath $InstallDir))"
   }
-  Add-Evidence "uninstall" "verified" "service_removed=true process_stopped=true install_dir_removed=true"
+  Add-Evidence $Stage "verified" "service_removed=true process_stopped=true install_dir_removed=true"
+}
+
+$status = "failed"
+$script:LastLifecycleStage = "lifecycle"
+$script:LastSetupLog = ""
+try {
+  # Validate the target independently first. A broken historical baseline must
+  # not hide whether the candidate can install and uninstall on a clean host.
+  Invoke-Installer $TargetSetupExe "install-target-fresh" $false
+  Assert-InstalledRuntime $TargetVersion "install-target-fresh"
+  Invoke-UninstallerAndAssertCleanup "uninstall-target-fresh"
+
+  # Then verify the cross-version compatibility path using a baseline that is
+  # freshly installed and validated in this same native-runner job.
+  Invoke-Installer $BaselineSetupExe "install-baseline" $false
+  Assert-InstalledRuntime $BaselineVersion "install-baseline"
+  Invoke-Installer $TargetSetupExe "upgrade-target" $true
+  Assert-InstalledRuntime $TargetVersion "upgrade-target"
+  Invoke-Installer $BaselineSetupExe "rollback-baseline" $true
+  Assert-InstalledRuntime $BaselineVersion "rollback-baseline"
+  Invoke-UninstallerAndAssertCleanup "uninstall-after-rollback"
   $status = "succeeded"
 } catch {
+  Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
   Add-Evidence "lifecycle" "failed" $_.Exception.Message
   throw
 } finally {

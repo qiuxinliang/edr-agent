@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       baseline_tag:
-        description: Previously verified release; empty selects the newest older release
+        description: Previous release candidate; empty selects and verifies the newest older candidate with complete native assets
         required: false
         default: ''
         type: string
@@ -19,7 +19,7 @@ on:
         required: true
         type: string
       baseline_tag:
-        description: Previously verified release; empty selects the newest older release
+        description: Previous release candidate; empty selects and verifies the newest older candidate with complete native assets
         required: false
         default: ''
         type: string
@@ -59,30 +59,40 @@ jobs:
         run: |
           $target = '${{ inputs.target_tag }}'.Trim()
           $baseline = '${{ inputs.baseline_tag }}'.Trim()
+          $baselineState = 'explicit'
           if ($target -notmatch '^win_\d+\.\d+\.\d+$') {
             throw "invalid target release tag: $target"
           }
           if (-not $baseline) {
             $targetVersion = [Version]$target.Substring(4)
             $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
-            if ($LASTEXITCODE -ne 0) { throw 'cannot list published releases for baseline selection' }
+            if ($LASTEXITCODE -ne 0) { throw 'cannot list draft and published releases for baseline selection' }
             $candidates = @()
             foreach ($release in @($releaseJson | ConvertFrom-Json)) {
-              if ($release.draft -or $release.prerelease -or $release.tag_name -notmatch '^win_\d+\.\d+\.\d+$') { continue }
+              # Target releases are still drafts while this gate runs. An older
+              # draft with complete immutable assets is a valid candidate only
+              # after this job installs and verifies it on the native runner.
+              if ($release.prerelease -or $release.tag_name -notmatch '^win_\d+\.\d+\.\d+$') { continue }
               $version = [Version]$release.tag_name.Substring(4)
               $expectedAsset = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-exe.zip"
               $expectedSetup = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-setup.exe"
               $hasNativeAsset = @($release.assets | Where-Object { $_.name -eq $expectedAsset }).Count -eq 1
               $hasSetupAsset = @($release.assets | Where-Object { $_.name -eq $expectedSetup }).Count -eq 1
               if ($version -lt $targetVersion -and $hasNativeAsset -and $hasSetupAsset) {
-                $candidates += [pscustomobject]@{ Tag = $release.tag_name; Version = $version }
+                $candidates += [pscustomobject]@{
+                  Tag = $release.tag_name
+                  Version = $version
+                  State = $(if ($release.draft) { 'draft' } else { 'published' })
+                }
               }
             }
-            $baseline = ($candidates | Sort-Object Version -Descending | Select-Object -First 1).Tag
+            $selectedBaseline = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+            $baseline = $selectedBaseline.Tag
+            $baselineState = $selectedBaseline.State
           }
           if ($baseline -notmatch '^win_\d+\.\d+\.\d+$') { throw "no valid older release exists for target $target" }
           if ($target -eq $baseline) { throw 'target and baseline releases must differ' }
-          Write-Host "Lifecycle target=$target baseline=$baseline"
+          Write-Host "Lifecycle target=$target baseline=$baseline baseline_state=$baselineState"
           "TARGET_TAG=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TARGET_VERSION=$($target.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BASELINE_TAG=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Append
