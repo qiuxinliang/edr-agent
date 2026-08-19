@@ -330,6 +330,12 @@ int main(void) {
            "blank baseline resolves to the latest lower release with a matching native package");
   contains(lifecycle, "baseline_state=$baselineState",
            "lifecycle diagnostics identify whether the selected baseline candidate was draft or published");
+  contains(lifecycle, "$brokenSetupBaselineMin = [Version]'3.2.304'",
+           "lifecycle excludes the first release affected by the pre-initialized app-path Setup regression");
+  contains(lifecycle, "$brokenSetupBaselineMax = [Version]'3.2.341'",
+           "lifecycle excludes every release through the final known-broken Setup package");
+  contains(lifecycle, "BASELINE_SETUP_ROLLBACK_SUPPORTED",
+           "lifecycle records whether full Setup rollback is valid for the selected baseline");
   contains(lifecycle, "if ($release.prerelease -or $release.tag_name",
            "baseline discovery admits older draft candidates for native verification in the current run");
   require_true(!strstr(lifecycle, "if ($release.draft -or $release.prerelease"),
@@ -368,6 +374,10 @@ int main(void) {
            "Setup lifecycle prints and preserves Inno and Agent diagnostics on every failed stage");
   contains(setup_lifecycle, "uninstall-after-rollback",
            "Setup lifecycle verifies final cleanup after the rollback path");
+  contains(setup_lifecycle, "uninstall-after-upgrade",
+           "bootstrap lifecycle still removes the upgraded target when legacy Setup rollback is impossible");
+  contains(setup_lifecycle, "native runtime rollback remains mandatory",
+           "one-time legacy Setup rollback exemption remains explicit and delegates rollback to the native gate");
   free(setup_lifecycle);
   contains(lifecycle, "windows-${{ matrix.arch }}-setup.exe",
            "release lifecycle downloads the architecture-matched immutable Setup EXE");

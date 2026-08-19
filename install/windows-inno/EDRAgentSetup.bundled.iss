@@ -292,11 +292,10 @@ function InitializeSetup(): Boolean;
 var
   A, T: string;
 begin
-  // [Files] entries are copied after InitializeSetup. Only a prior Inno
-  // uninstaller proves that {app} is a completed GUI installation. A leftover
-  // directory without unins000.exe is an incomplete install and is safe to
-  // remove during failure rollback.
-  EdrHadExistingInstallation := FileExists(ExpandConstant('{app}\unins000.exe'));
+  // Inno has not initialized {app} while InitializeSetup runs. Keep this hook
+  // limited to command-line validation; install-path checks belong in
+  // PrepareToInstall, where {app} is guaranteed to be available.
+  EdrHadExistingInstallation := False;
   EdrCmdApiBase := '';
   EdrCmdToken := '';
   EdrCmdParamsFile := '';
@@ -310,12 +309,6 @@ begin
   EdrLoadCmdlineEnroll;
   if EdrCmdUpgradeExisting then
   begin
-    if not FileExists(ExpandConstant('{app}\agent.toml')) then
-    begin
-      MsgBox('EDR: /EDR_UPGRADE_EXISTING requires an existing protected agent.toml.', mbError, MB_OK);
-      Result := False;
-      Exit;
-    end;
     if EdrHasCmdlineEnroll then
     begin
       MsgBox('EDR: existing-install upgrade preserves endpoint identity and must not include enrollment parameters.', mbError, MB_OK);
@@ -442,12 +435,30 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): string;
 var
   Code: Integer;
-  Cmd: string;
+  Cmd, AppDir: string;
 begin
   Result := '';
+  AppDir := ExpandConstant('{app}');
+  // [Files] entries have not been copied yet. Only a prior Inno uninstaller
+  // proves this is a completed GUI installation; a leftover directory without
+  // unins000.exe is an incomplete install and remains eligible for cleanup.
+  EdrHadExistingInstallation := FileExists(AppDir + '\unins000.exe');
+  if EdrCmdUpgradeExisting then
+  begin
+    if not EdrHadExistingInstallation then
+    begin
+      Result := 'EDR: /EDR_UPGRADE_EXISTING requires a completed existing Setup installation.';
+      Exit;
+    end;
+    if not FileExists(AppDir + '\agent.toml') then
+    begin
+      Result := 'EDR: /EDR_UPGRADE_EXISTING requires an existing protected agent.toml.';
+      Exit;
+    end;
+  end;
   SaveEnrollParamsFileIfNeeded;
   Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + '$d=''' + ExpandConstant('{app}') + ''';'
+    + '$d=''' + AppDir + ''';'
     + 'Stop-Service -Name ''{#MyServiceName}'' -Force -ErrorAction SilentlyContinue;'
     + 'Stop-Service -Name ''{#MyLegacyServiceName}'' -Force -ErrorAction SilentlyContinue;'
     + 'Stop-Process -Name ''FDSensor'' -Force -ErrorAction SilentlyContinue;'

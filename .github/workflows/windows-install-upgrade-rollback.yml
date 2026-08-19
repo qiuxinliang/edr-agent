@@ -60,6 +60,8 @@ jobs:
           $target = '${{ inputs.target_tag }}'.Trim()
           $baseline = '${{ inputs.baseline_tag }}'.Trim()
           $baselineState = 'explicit'
+          $brokenSetupBaselineMin = [Version]'3.2.304'
+          $brokenSetupBaselineMax = [Version]'3.2.341'
           if ($target -notmatch '^win_\d+\.\d+\.\d+$') {
             throw "invalid target release tag: $target"
           }
@@ -78,6 +80,10 @@ jobs:
               $expectedSetup = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-setup.exe"
               $hasNativeAsset = @($release.assets | Where-Object { $_.name -eq $expectedAsset }).Count -eq 1
               $hasSetupAsset = @($release.assets | Where-Object { $_.name -eq $expectedSetup }).Count -eq 1
+              if ($version -ge $brokenSetupBaselineMin -and $version -le $brokenSetupBaselineMax) {
+                Write-Host "Skipping known-broken Setup baseline $($release.tag_name): InitializeSetup expands {app} before initialization"
+                continue
+              }
               if ($version -lt $targetVersion -and $hasNativeAsset -and $hasSetupAsset) {
                 $candidates += [pscustomobject]@{
                   Tag = $release.tag_name
@@ -92,11 +98,17 @@ jobs:
           }
           if ($baseline -notmatch '^win_\d+\.\d+\.\d+$') { throw "no valid older release exists for target $target" }
           if ($target -eq $baseline) { throw 'target and baseline releases must differ' }
-          Write-Host "Lifecycle target=$target baseline=$baseline baseline_state=$baselineState"
+          $baselineVersion = [Version]$baseline.Substring(4)
+          if ($baselineVersion -ge $brokenSetupBaselineMin -and $baselineVersion -le $brokenSetupBaselineMax) {
+            throw "baseline $baseline is in the known-broken Setup range win_3.2.304..win_3.2.341"
+          }
+          $baselineSetupRollbackSupported = $baselineVersion -gt $brokenSetupBaselineMax
+          Write-Host "Lifecycle target=$target baseline=$baseline baseline_state=$baselineState setup_rollback_supported=$baselineSetupRollbackSupported"
           "TARGET_TAG=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TARGET_VERSION=$($target.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BASELINE_TAG=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Append
           "BASELINE_VERSION=$($baseline.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "BASELINE_SETUP_ROLLBACK_SUPPORTED=$($baselineSetupRollbackSupported.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Download immutable runtime and Setup EXE release packages
         shell: pwsh
@@ -182,13 +194,18 @@ jobs:
           if ($targetSetup.Count -ne 1 -or $baselineSetup.Count -ne 1) {
             throw "expected exactly one target and baseline Setup EXE"
           }
-          .\scripts\windows_setup_exe_lifecycle_smoke.ps1 `
-            -BaselineSetupExe $baselineSetup[0].FullName `
-            -TargetSetupExe $targetSetup[0].FullName `
-            -BaselineVersion $env:BASELINE_VERSION `
-            -TargetVersion $env:TARGET_VERSION `
-            -Architecture '${{ matrix.arch }}' `
-            -EvidenceDir setup-exe-evidence
+          $lifecycleParams = @{
+            BaselineSetupExe = $baselineSetup[0].FullName
+            TargetSetupExe = $targetSetup[0].FullName
+            BaselineVersion = $env:BASELINE_VERSION
+            TargetVersion = $env:TARGET_VERSION
+            Architecture = '${{ matrix.arch }}'
+            EvidenceDir = 'setup-exe-evidence'
+          }
+          if ($env:BASELINE_SETUP_ROLLBACK_SUPPORTED -ne 'true') {
+            $lifecycleParams.SkipSetupRollback = $true
+          }
+          & .\scripts\windows_setup_exe_lifecycle_smoke.ps1 @lifecycleParams
 
       - name: Execute native runtime update lifecycle
         shell: pwsh

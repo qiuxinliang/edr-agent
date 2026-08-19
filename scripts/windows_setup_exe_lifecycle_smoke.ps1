@@ -10,7 +10,8 @@ param(
   [string] $Architecture,
   [string] $InstallDir = "C:\edr-agent-setup-lifecycle-smoke",
   [string] $ServiceName = "FDSecurityAgent",
-  [string] $EvidenceDir = "setup-exe-evidence"
+  [string] $EvidenceDir = "setup-exe-evidence",
+  [switch] $SkipSetupRollback
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,7 +101,7 @@ function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisti
   }
   Add-Evidence $Stage "completed" "exit_code=0"
 }
-function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage) {
+function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage, [bool] $RequireModernLifecycleAssets = $true) {
   $versionPath = Join-Path $InstallDir "VERSION"
   if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
     throw "$Stage did not install VERSION"
@@ -109,12 +110,12 @@ function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage) {
   if ($actualVersion -ne $ExpectedVersion) {
     throw "$Stage version mismatch: expected=$ExpectedVersion actual=$actualVersion"
   }
-  foreach ($name in @("FDSensor.exe", "FDSecurityInstallerWorker.exe", "uninstall.exe")) {
+  foreach ($name in @("FDSensor.exe", "FDSecurityInstallerWorker.exe")) {
     $path = Join-Path $InstallDir $name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$Stage is missing $name" }
     & $archVerifier -Path $path -Architecture $Architecture
   }
-  foreach ($name in @("uninstall.ps1", "native-package-integrity.json", "package-capabilities.json", "unins000.exe")) {
+  foreach ($name in @("package-capabilities.json", "unins000.exe")) {
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $name) -PathType Leaf)) {
       throw "$Stage is missing $name"
     }
@@ -122,6 +123,13 @@ function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage) {
   $capabilities = [IO.File]::ReadAllText((Join-Path $InstallDir "package-capabilities.json")) | ConvertFrom-Json
   if ([string]$capabilities.target_arch -ne $Architecture) {
     throw "$Stage package capability architecture mismatch: $($capabilities.target_arch)"
+  }
+  if ($RequireModernLifecycleAssets) {
+    foreach ($name in @("uninstall.exe", "uninstall.ps1", "native-package-integrity.json")) {
+      if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $name) -PathType Leaf)) {
+        throw "$Stage is missing modern lifecycle asset $name"
+      }
+    }
   }
   $deadline = (Get-Date).AddSeconds(60)
   do {
@@ -176,12 +184,17 @@ try {
   # Then verify the cross-version compatibility path using a baseline that is
   # freshly installed and validated in this same native-runner job.
   Invoke-Installer $BaselineSetupExe "install-baseline" $false
-  Assert-InstalledRuntime $BaselineVersion "install-baseline"
+  Assert-InstalledRuntime $BaselineVersion "install-baseline" (-not $SkipSetupRollback)
   Invoke-Installer $TargetSetupExe "upgrade-target" $true
   Assert-InstalledRuntime $TargetVersion "upgrade-target"
-  Invoke-Installer $BaselineSetupExe "rollback-baseline" $true
-  Assert-InstalledRuntime $BaselineVersion "rollback-baseline"
-  Invoke-UninstallerAndAssertCleanup "uninstall-after-rollback"
+  if ($SkipSetupRollback) {
+    Add-Evidence "rollback-baseline" "skipped" "legacy baseline predates the immutable full-Setup rollback contract; native runtime rollback remains mandatory"
+    Invoke-UninstallerAndAssertCleanup "uninstall-after-upgrade"
+  } else {
+    Invoke-Installer $BaselineSetupExe "rollback-baseline" $true
+    Assert-InstalledRuntime $BaselineVersion "rollback-baseline"
+    Invoke-UninstallerAndAssertCleanup "uninstall-after-rollback"
+  }
   $status = "succeeded"
 } catch {
   Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
@@ -199,6 +212,7 @@ try {
     architecture = $Architecture
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
+    setup_rollback_skipped = [bool]$SkipSetupRollback
     install_dir = $InstallDir
     events = $eventArray
   }

@@ -41,6 +41,12 @@ static int require_absent(const char *text, const char *needle, const char *mess
   return 0;
 }
 
+static int require_true(int condition, const char *message) {
+  if (condition) return 1;
+  fprintf(stderr, "FAIL: %s\n", message);
+  return 0;
+}
+
 static int require_utf8_bom(const char *text, const char *message) {
   if (text && (unsigned char)text[0] == 0xef &&
       (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf) {
@@ -374,8 +380,20 @@ int main(void) {
                          "Setup UI must package the release-owned PowerShell uninstaller");
   ok &= require_contains(inno, "INSTALL_FAILURE_ROLLBACK begin",
                          "first-install Setup UI failure must initiate controlled rollback");
-  ok &= require_contains(inno, "EdrHadExistingInstallation := FileExists(ExpandConstant('{app}\\unins000.exe'))",
+  ok &= require_contains(inno, "EdrHadExistingInstallation := FileExists(AppDir + '\\unins000.exe')",
                          "only a completed GUI installation may be preserved during failure rollback");
+  const char *initialize_setup = strstr(inno, "function InitializeSetup(): Boolean;");
+  const char *json_escape = strstr(inno, "function JsonEscape(const S: string): string;");
+  const char *early_app_expansion = initialize_setup ? strstr(initialize_setup, "ExpandConstant('{app}") : NULL;
+  ok &= require_true(initialize_setup && json_escape &&
+                         (!early_app_expansion || early_app_expansion >= json_escape),
+                     "InitializeSetup must not expand {app} before Inno initializes the install directory");
+  const char *prepare_to_install = strstr(inno, "function PrepareToInstall(var NeedsRestart: Boolean): string;");
+  const char *existing_install_probe = strstr(inno, "EdrHadExistingInstallation := FileExists(AppDir + '\\unins000.exe')");
+  ok &= require_true(prepare_to_install && existing_install_probe && existing_install_probe > prepare_to_install,
+                     "completed-install probing must run from PrepareToInstall after {app} is initialized");
+  ok &= require_contains(inno, "/EDR_UPGRADE_EXISTING requires a completed existing Setup installation",
+                         "upgrade mode must reject incomplete directories before replacing release files");
   ok &= require_contains(inno, "skipped_existing_installation=true",
                          "upgrade failure must preserve the previous installation instead of deleting it");
   free(inno);
