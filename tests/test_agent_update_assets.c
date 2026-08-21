@@ -296,6 +296,12 @@ int main(void) {
            "package writer retains architecture-independent host isolation");
   contains(package_capabilities, "signature_status = $SignatureStatus",
            "package writer records signed versus unsigned launch policy context");
+  contains(package_capabilities, "components = [ordered]@{",
+           "package writer declares component-scoped compatibility metadata");
+  contains(package_capabilities, "execution_mode = $velociraptorExecutionMode",
+           "package writer isolates Velociraptor x64 emulation from the native Agent package");
+  contains(package_capabilities, "network_packet_capture = $false",
+           "emulated Velociraptor never claims kernel packet capture");
   contains(package_capabilities, "UTF8Encoding]::new($false)",
            "package writer emits UTF-8 JSON without a BOM");
   free(package_capabilities);

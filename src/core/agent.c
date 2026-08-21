@@ -1673,9 +1673,14 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *zstd_runtime = !zstd_build ? "unavailable"
                              : !(http_rt && http_rt->zstd_requested) ? "idle"
                              : http_rt->zstd_available ? "healthy" : "degraded";
+  EdrVelociraptorRuntime velo_rt;
+  memset(&velo_rt, 0, sizeof(velo_rt));
+  edr_deep_collector_get_velociraptor_runtime(&velo_rt);
   const char *velo_runtime = !velo_policy ? "disabled"
+                             : !velo_rt.ready ? "unavailable"
                              : edr_deep_collector_is_running() ? "healthy" : "idle";
   const char *velo_query_runtime = !dangerous_policy ? "disabled"
+                                   : !velo_rt.ready ? "unavailable"
                                    : edr_deep_collector_is_running() ? "healthy" : "idle";
   EdrAlertGovernorStats alert_stats;
   EdrShellcodeDetectorRuntime shellcode_rt;
@@ -1743,7 +1748,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"sqlite\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"http2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"zstd\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
-      "\"velociraptor\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"velociraptor\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
+      "\"binary_arch\":\"%s\",\"execution_mode\":\"%s\",\"emulation_supported\":%s,\"detail\":\"%s\","
+      "\"network_packet_capture\":false},"
       "%s"
       "\"command_signing\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}},"
       "\"commands\":{"
@@ -1802,6 +1809,10 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       http2_build ? "true" : "false", http_rt && http_rt->http2_enabled ? "true" : "false", http2_runtime,
       zstd_build ? "true" : "false", http_rt && http_rt->zstd_requested ? "true" : "false", zstd_runtime,
       velo_policy ? "true" : "false", velo_runtime,
+      velo_rt.binary_arch[0] ? velo_rt.binary_arch : "unavailable",
+      velo_rt.execution_mode[0] ? velo_rt.execution_mode : "unavailable",
+      velo_rt.emulation_supported ? "true" : "false",
+      velo_rt.detail[0] ? velo_rt.detail : "unknown",
       artifact_upload_capability,
       signing_build ? "true" : "false", signing_policy ? "true" : "false", signing_runtime,
       rtq_policy ? "true" : "false",

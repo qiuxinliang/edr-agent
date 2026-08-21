@@ -123,10 +123,13 @@ Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "bundle_extra\README_OPTIONAL_DBS.txt"; DestDir: "{app}\data"; DestName: "README_OPTIONAL_DBS.txt"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "bundle_extra\BUNDLE_README.txt"; DestDir: "{app}"; DestName: "BUNDLE_README.txt"; Flags: ignoreversion skipifsourcedoesntexist
 ; 取证采集器白名单: standard 包只允许小型 adapter/builtin 与许可说明进入安装包。
-; velociraptor.exe 体积大，必须由 offline/full 构建显式写入 staging 后用独立 Inno 定义追加，standard 包不递归打包 collector\*。
+; velociraptor.exe 体积大，standard 包默认不写入 staging，由平台按需下发。
+; offline/full 构建可显式写入 collector\velociraptor.exe；ARM64 包中该单一文件
+; 为 AMD64 用户态子进程，由 Windows x64 仿真执行，不允许携带驱动。
 ; 缺失不致命(skipifsourcedoesntexist):无 collector 时 agent 自动回退 in-process 取证。
 Source: "{#EDR_BIN_DIR}\collector\forensic_collector.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\collector\forensic_collector_builtin.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\collector\velociraptor.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\collector\*.LICENSE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\collector\*.SOURCE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 

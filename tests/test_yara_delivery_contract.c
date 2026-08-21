@@ -165,6 +165,18 @@ int main(void) {
                          "existing collector binaries must refresh asynchronously");
   ok &= require_contains(collector, "dc_prepare_velociraptor",
                          "Velo preparation must reuse a ready binary without blocking on version checks");
+  ok &= require_contains(collector, "GetMachineTypeAttributes",
+                         "ARM64 Velociraptor execution must probe Windows x64 user-mode emulation");
+  ok &= require_contains(collector, "DC_MACHINE_ATTRIBUTE_USER_ENABLED = 0x00000001",
+                         "Windows machine capability probe must test the UserEnabled bit");
+  ok &= require_contains(collector, "typedef LONG(WINAPI *PFN_IsWow64GuestMachineSupported)",
+                         "legacy Windows guest capability probe must preserve HRESULT semantics");
+  ok &= require_contains(collector, "if (hr >= 0) return supported ? 1 : 0;",
+                         "successful HRESULT zero must not be treated as a false API call result");
+  ok &= require_contains(collector, "collector PE architecture mismatch",
+                         "downloaded collector PE architecture must match manifest metadata");
+  ok &= require_contains(collector, "emulated collector cannot declare network packet capture",
+                         "emulated Velociraptor must reject driver packet-capture claims");
   free(collector);
 
   snprintf(path, sizeof(path), "%s/src/attack_surface/security_policy_collect.c", root);

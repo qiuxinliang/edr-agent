@@ -827,13 +827,19 @@ jobs:
               $capabilityReader.Dispose()
             }
             $expectedNetworkPacketCapture = ($env:EDR_RELEASE_ARCH -eq 'amd64')
+            $expectedVelociraptorMode = if ($env:EDR_RELEASE_ARCH -eq 'arm64') { 'windows_x64_emulation' } else { 'native' }
             if ($packagedCapabilities.schema -ne 'edr.windows.package-capabilities.v1' -or
                 $packagedCapabilities.target_arch -ne $env:EDR_RELEASE_ARCH -or
                 $packagedCapabilities.arm64_emulation_supported -ne $false -or
                 $packagedCapabilities.arm64_emulation_network_packet_capture -ne $false -or
                 $packagedCapabilities.network_packet_capture -ne $expectedNetworkPacketCapture -or
                 $packagedCapabilities.windows_firewall_isolation -ne $true -or
-                $packagedCapabilities.signature_status -ne $signatureStatus) {
+                $packagedCapabilities.signature_status -ne $signatureStatus -or
+                $packagedCapabilities.components.velociraptor.delivery -ne 'platform_autofetch' -or
+                $packagedCapabilities.components.velociraptor.binary_arch -ne 'amd64' -or
+                $packagedCapabilities.components.velociraptor.execution_mode -ne $expectedVelociraptorMode -or
+                $packagedCapabilities.components.velociraptor.optional -ne $true -or
+                $packagedCapabilities.components.velociraptor.network_packet_capture -ne $false) {
               throw "package-capabilities.json does not match the native release contract"
             }
 

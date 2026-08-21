@@ -227,10 +227,13 @@ $capabilityWriter = Join-Path $agentRoot "scripts\write_windows_package_capabili
 if (-not (Test-Path -LiteralPath $capabilityWriter -PathType Leaf)) {
     throw "Missing package capability writer: $capabilityWriter"
 }
+$stagedVelociraptor = Join-Path $BinDir "collector\velociraptor.exe"
+$velociraptorDelivery = if (Test-Path -LiteralPath $stagedVelociraptor -PathType Leaf) { "bundled" } else { "platform_autofetch" }
 & $capabilityWriter `
     -OutputPath (Join-Path $BinDir "package-capabilities.json") `
     -TargetArch $TargetArch `
-    -SignatureStatus $SignatureStatus
+    -SignatureStatus $SignatureStatus `
+    -VelociraptorDelivery $velociraptorDelivery
 
 $collectorArchInput = if ($CollectorArch) { $CollectorArch } else { $TargetArch }
 $resolvedCollectorArch = Resolve-CollectorArch $collectorArchInput
@@ -250,7 +253,17 @@ if (Test-Path -LiteralPath $collectorDir -PathType Container) {
 }
 if ($runtimePeFiles.Count -lt 1) { throw "No Runtime EXE/DLL files found for architecture validation: $BinDir" }
 foreach ($runtimePeFile in $runtimePeFiles) {
-    & $archCheck -Path $runtimePeFile.FullName -Architecture $TargetArch
+    $isEmulatedVelociraptor = $TargetArch -eq "arm64" -and
+        $runtimePeFile.FullName -ieq $stagedVelociraptor
+    if ($isEmulatedVelociraptor) {
+        # The only cross-architecture launch item in an ARM64 package. It is a
+        # user-mode child process and never extends to the Agent/service,
+        # updater, uninstaller, PMFE or any kernel driver.
+        & $archCheck -Path $runtimePeFile.FullName -Architecture "amd64"
+        Write-Host "Verified isolated Velociraptor emulation component: host=arm64 binary=amd64 mode=windows_x64_emulation"
+    } else {
+        & $archCheck -Path $runtimePeFile.FullName -Architecture $TargetArch
+    }
 }
 Write-Host "Verified Runtime PE closure: arch=$TargetArch files=$($runtimePeFiles.Count)"
 
@@ -267,6 +280,7 @@ if (Test-Path -LiteralPath $workerExe -PathType Leaf) {
 }
 if (Test-Path -LiteralPath $collectorDir -PathType Container) {
     $signatureClosure += @(Get-ChildItem -LiteralPath $collectorDir -Filter "*.exe" -File -ErrorAction Stop |
+        Where-Object { $_.Name -ine "velociraptor.exe" } |
         ForEach-Object { $_.FullName })
 }
 foreach ($signaturePath in $signatureClosure) {
@@ -283,6 +297,16 @@ foreach ($signaturePath in $signatureClosure) {
     }
 }
 Write-Host "Verified executable signature closure: status=$SignatureStatus files=$($signatureClosure.Count)"
+if (Test-Path -LiteralPath $stagedVelociraptor -PathType Leaf) {
+    # Velociraptor is an independently versioned upstream component pinned by
+    # SHA-256. Its Authenticode state is observed, but does not change the
+    # first-party Agent launch-closure signature_status.
+    $velociraptorSignature = Get-AuthenticodeSignature -LiteralPath $stagedVelociraptor
+    if ($velociraptorSignature.Status -notin @("Valid", "NotSigned")) {
+        throw "Velociraptor has an invalid Authenticode state: $($velociraptorSignature.Status) $($velociraptorSignature.StatusMessage)"
+    }
+    Write-Host "Verified upstream Velociraptor signature state: authenticode=$($velociraptorSignature.Status)"
+}
 
 $pre = Join-Path $repoRoot "edr-backend\platform\config\agent_preprocess_rules_v1.toml"
 if (-not (Test-Path -LiteralPath $pre)) {

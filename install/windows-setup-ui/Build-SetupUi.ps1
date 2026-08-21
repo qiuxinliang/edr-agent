@@ -469,6 +469,15 @@ $manifest = @{
         # outer package has a valid Authenticode signature; unsigned means none
         # is signed. Mixed closures are rejected above and never serialized.
         signature_status = $actualSignatureStatus
+        components = @{
+            velociraptor = @{
+                delivery = "platform_autofetch"
+                binary_arch = "amd64"
+                execution_mode = if ($targetArch -eq "arm64") { "windows_x64_emulation" } else { "native" }
+                optional = $true
+                network_packet_capture = $false
+            }
+        }
     }
     setup_exe = "FDSecuritySetup.exe"
     ui_exe = "FDSecuritySetupUI.exe"

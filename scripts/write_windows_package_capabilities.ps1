@@ -9,7 +9,10 @@ param(
     [string] $TargetArch,
 
     [ValidateSet("signed", "unsigned")]
-    [string] $SignatureStatus = "unsigned"
+    [string] $SignatureStatus = "unsigned",
+
+    [ValidateSet("platform_autofetch", "bundled")]
+    [string] $VelociraptorDelivery = "platform_autofetch"
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,10 +22,12 @@ $ErrorActionPreference = "Stop"
 # unsigned means none does. Producers must reject mixed closures before calling
 # this serializer. Detached CMS manifest signing is an independent trust layer.
 #
-# v1 deliberately permits only native Windows packages. AMD64-on-ARM64 can be
-# introduced in a new schema after the complete service, PMFE, update and
-# uninstall chain passes a native ARM64 end-to-end gate.
+# v1 permits only native Agent packages. The Velociraptor user-mode child is a
+# deliberately isolated exception: the ARM64 package may consume the official
+# AMD64 Velociraptor binary through Windows x64 emulation, while the Agent,
+# service, updater, uninstaller and every driver remain native ARM64.
 $networkPacketCapture = ($TargetArch -eq "amd64")
+$velociraptorExecutionMode = if ($TargetArch -eq "arm64") { "windows_x64_emulation" } else { "native" }
 $capabilities = [ordered]@{
     schema = "edr.windows.package-capabilities.v1"
     target_arch = $TargetArch
@@ -31,6 +36,15 @@ $capabilities = [ordered]@{
     network_packet_capture = $networkPacketCapture
     windows_firewall_isolation = $true
     signature_status = $SignatureStatus
+    components = [ordered]@{
+        velociraptor = [ordered]@{
+            delivery = $VelociraptorDelivery
+            binary_arch = "amd64"
+            execution_mode = $velociraptorExecutionMode
+            optional = $true
+            network_packet_capture = $false
+        }
+    }
 }
 
 $json = $capabilities | ConvertTo-Json -Depth 3 -Compress
@@ -52,7 +66,8 @@ $expectedFields = @(
     "arm64_emulation_network_packet_capture",
     "network_packet_capture",
     "windows_firewall_isolation",
-    "signature_status"
+    "signature_status",
+    "components"
 )
 $actualFields = @($roundTrip.PSObject.Properties.Name)
 if ($actualFields.Count -ne $expectedFields.Count) {
@@ -63,14 +78,35 @@ foreach ($field in $expectedFields) {
         throw "package capability field missing after serialization: $field"
     }
 }
+$expectedVelociraptorFields = @(
+    "delivery",
+    "binary_arch",
+    "execution_mode",
+    "optional",
+    "network_packet_capture"
+)
+$actualVelociraptorFields = @($roundTrip.components.velociraptor.PSObject.Properties.Name)
+if ($actualVelociraptorFields.Count -ne $expectedVelociraptorFields.Count) {
+    throw "Velociraptor capability field count mismatch: expected=$($expectedVelociraptorFields.Count) actual=$($actualVelociraptorFields.Count)"
+}
+foreach ($field in $expectedVelociraptorFields) {
+    if ($actualVelociraptorFields -notcontains $field) {
+        throw "Velociraptor capability field missing after serialization: $field"
+    }
+}
 if ($roundTrip.schema -ne "edr.windows.package-capabilities.v1" -or
     $roundTrip.target_arch -ne $TargetArch -or
     $roundTrip.signature_status -ne $SignatureStatus -or
     $roundTrip.arm64_emulation_supported -ne $false -or
     $roundTrip.arm64_emulation_network_packet_capture -ne $false -or
     $roundTrip.network_packet_capture -ne $networkPacketCapture -or
-    $roundTrip.windows_firewall_isolation -ne $true) {
+    $roundTrip.windows_firewall_isolation -ne $true -or
+    $roundTrip.components.velociraptor.delivery -ne $VelociraptorDelivery -or
+    $roundTrip.components.velociraptor.binary_arch -ne "amd64" -or
+    $roundTrip.components.velociraptor.execution_mode -ne $velociraptorExecutionMode -or
+    $roundTrip.components.velociraptor.optional -ne $true -or
+    $roundTrip.components.velociraptor.network_packet_capture -ne $false) {
     throw "package capability values changed during serialization"
 }
 
-Write-Host "Wrote Windows package capabilities: arch=$TargetArch signature=$SignatureStatus network_packet_capture=$networkPacketCapture path=$outputFullPath"
+Write-Host "Wrote Windows package capabilities: arch=$TargetArch signature=$SignatureStatus network_packet_capture=$networkPacketCapture velociraptor=amd64/$velociraptorExecutionMode/$VelociraptorDelivery path=$outputFullPath"

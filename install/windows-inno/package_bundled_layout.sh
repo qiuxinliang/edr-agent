@@ -120,10 +120,16 @@ if [[ "$ARCH" == "amd64" ]]; then
   cp -a "$EDR_AGENT_DIR/third_party/windivert/LICENSE" "$OUT_DIR/licenses/WinDivert-LICENSE.txt"
   cp -a "$EDR_AGENT_DIR/third_party/windivert/SOURCE.json" "$OUT_DIR/licenses/WinDivert-SOURCE.json"
   NETWORK_PACKET_CAPTURE=true
+  VELOCIRAPTOR_EXECUTION_MODE=native
 else
   NETWORK_PACKET_CAPTURE=false
+  VELOCIRAPTOR_EXECUTION_MODE=windows_x64_emulation
 fi
-printf '%s\n' "{\"schema\":\"edr.windows.package-capabilities.v1\",\"target_arch\":\"${ARCH}\",\"arm64_emulation_supported\":false,\"arm64_emulation_network_packet_capture\":false,\"network_packet_capture\":${NETWORK_PACKET_CAPTURE},\"windows_firewall_isolation\":true,\"signature_status\":\"${SIGNATURE_STATUS}\"}" > "$OUT_DIR/package-capabilities.json"
+VELOCIRAPTOR_DELIVERY=platform_autofetch
+if [[ "${EDR_BUNDLE_VELO:-0}" == "1" ]]; then
+  VELOCIRAPTOR_DELIVERY=bundled
+fi
+printf '%s\n' "{\"schema\":\"edr.windows.package-capabilities.v1\",\"target_arch\":\"${ARCH}\",\"arm64_emulation_supported\":false,\"arm64_emulation_network_packet_capture\":false,\"network_packet_capture\":${NETWORK_PACKET_CAPTURE},\"windows_firewall_isolation\":true,\"signature_status\":\"${SIGNATURE_STATUS}\",\"components\":{\"velociraptor\":{\"delivery\":\"${VELOCIRAPTOR_DELIVERY}\",\"binary_arch\":\"amd64\",\"execution_mode\":\"${VELOCIRAPTOR_EXECUTION_MODE}\",\"optional\":true,\"network_packet_capture\":false}}}" > "$OUT_DIR/package-capabilities.json"
 printf '%s\n' "$ARCH" > "$OUT_DIR/ARCH"
 
 PREP_TOML="$REPO_ROOT/edr-backend/platform/config/agent_preprocess_rules_v1.toml"
@@ -214,10 +220,11 @@ if [[ -f "$SCRIPT_DIR/bundle_extra/BUNDLE_README.txt" ]]; then
 fi
 
 # --- 取证采集器 collector/ (装到 {app}\collector\ = C:\Program Files\FDSecurity\collector\) ---
-# 按架构(ARCH=amd64|arm64)取件:
+# 按主机架构(ARCH=amd64|arm64)取件:
 #   forensic_collector.exe          ← Go 适配器:forensic-collector/build.sh (dist/win-<ARCH>/)
 #   forensic_collector_builtin.exe  ← CMake target(C baseline);从 STAGE_DIR 取(发布 CI 同 FDSensor 一起 stage)
-#   velociraptor.exe + LICENSE/SOURCE ← fetch_velociraptor.sh (collector_stage/<ARCH>/)
+#   velociraptor.exe + LICENSE/SOURCE ← 官方 Windows AMD64 制品;在 ARM64 上仅作为
+#                                      Windows x64 仿真用户态子进程，不承载驱动。
 # velo 体积大:**默认不内置**(平台自托管 + agent 按需下载是主路径);
 # 仅 EDR_BUNDLE_VELO=1 时才内置(离线/无平台连通场景)。adapter+builtin 始终内置(小)。
 # 任一缺失仅 Warning(非 strict):agent 三层兜底(velo→builtin→in-process)。
@@ -225,7 +232,8 @@ BUNDLE_VELO="${EDR_BUNDLE_VELO:-0}"
 COLLECTOR_OUT="$OUT_DIR/collector"
 mkdir -p "$COLLECTOR_OUT"
 GO_FC="${EDR_FORENSIC_COLLECTOR_BIN:-$EDR_AGENT_DIR/../forensic-collector/dist/win-${ARCH}/forensic_collector.exe}"
-VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}/${ARCH}"
+VELO_BINARY_ARCH=amd64
+VELO_STAGE="${EDR_VELO_OUT:-$SCRIPT_DIR/collector_stage}/${VELO_BINARY_ARCH}"
 if [[ "$BUNDLE_VELO" != "1" && -f "$STAGE_DIR/collector/velociraptor.exe" ]]; then
   echo "Error: standard installer staging contains collector/velociraptor.exe. Remove it or build an explicit offline package with EDR_BUNDLE_VELO=1." >&2
   exit 1
@@ -251,6 +259,13 @@ fi
 if [[ "$BUNDLE_VELO" == "1" ]]; then
   if [[ -f "$VELO_STAGE/velociraptor.exe" ]]; then
     cp -a "$VELO_STAGE/velociraptor.exe" "$COLLECTOR_OUT/"
+    if command -v file >/dev/null 2>&1; then
+      VELO_PE_DESC="$(file -b "$COLLECTOR_OUT/velociraptor.exe")"
+      [[ "$VELO_PE_DESC" == *"x86-64"* ]] || {
+        echo "Error: Velociraptor component must be an AMD64 PE for both host packages; got: $VELO_PE_DESC" >&2
+        exit 1
+      }
+    fi
     # AGPL 合规件必须随 velociraptor.exe 一起分发;有 velo 无许可即视为打包错误。
     if [[ -f "$VELO_STAGE/velociraptor.LICENSE.txt" && -f "$VELO_STAGE/velociraptor.SOURCE.txt" ]]; then
       cp -a "$VELO_STAGE/velociraptor.LICENSE.txt" "$VELO_STAGE/velociraptor.SOURCE.txt" "$COLLECTOR_OUT/"
@@ -259,7 +274,7 @@ if [[ "$BUNDLE_VELO" == "1" ]]; then
       exit 1
     fi
   else
-    echo "Error: [$ARCH] EDR_BUNDLE_VELO=1 but velociraptor.exe missing ($VELO_STAGE/velociraptor.exe); run fetch_velociraptor.sh EDR_VELO_ARCHES=$ARCH" >&2
+    echo "Error: [$ARCH] EDR_BUNDLE_VELO=1 but AMD64 velociraptor.exe missing ($VELO_STAGE/velociraptor.exe); run fetch_velociraptor.sh EDR_VELO_ARCHES=amd64" >&2
     exit 1
   fi
 else
@@ -286,12 +301,14 @@ if ! grep -E '^\./rules/forensic/.+\.yar(a)?$' "$OUT_DIR/MANIFEST.txt" >/dev/nul
   echo "Error: MANIFEST.txt does not include forensic YARA rules" >&2
   exit 1
 fi
-for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.txt" "licenses/WinDivert-SOURCE.json"; do
-  if ! grep -Fqx "./$required" "$OUT_DIR/MANIFEST.txt"; then
-    echo "Error: MANIFEST.txt does not include $required" >&2
-    exit 1
-  fi
-done
+if [[ "$ARCH" == "amd64" ]]; then
+  for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.txt" "licenses/WinDivert-SOURCE.json"; do
+    if ! grep -Fqx "./$required" "$OUT_DIR/MANIFEST.txt"; then
+      echo "Error: MANIFEST.txt does not include $required" >&2
+      exit 1
+    fi
+  done
+fi
 
 mkdir -p "$SCRIPT_DIR/Output"
 ( cd "$SCRIPT_DIR/Output" && rm -f "${OUT_NAME}.zip" && zip -r -q "${OUT_NAME}.zip" "$OUT_NAME" )
@@ -307,11 +324,13 @@ if ! unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)rules/forensic/.+\.yar(a)?$' >/dev/nu
   echo "Error: forensic YARA rules missing from $ZIP_PATH" >&2
   exit 1
 fi
-for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.txt" "licenses/WinDivert-SOURCE.json"; do
-  if ! unzip -Z1 "$ZIP_PATH" | grep -Fq "/$required"; then
-    echo "Error: $required missing from $ZIP_PATH" >&2
-    exit 1
-  fi
-done
+if [[ "$ARCH" == "amd64" ]]; then
+  for required in "WinDivert.dll" "WinDivert64.sys" "licenses/WinDivert-LICENSE.txt" "licenses/WinDivert-SOURCE.json"; do
+    if ! unzip -Z1 "$ZIP_PATH" | grep -Fq "/$required"; then
+      echo "Error: $required missing from $ZIP_PATH" >&2
+      exit 1
+    fi
+  done
+fi
 echo "OK: $ZIP_PATH"
 echo "Read BUNDLE_README inside the zip for full terminal feature coverage and out-of-band items."

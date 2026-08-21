@@ -51,6 +51,21 @@ void edr_deep_collector_kill(void);
 /** 判断当前是否有采集器在运行。 */
 int edr_deep_collector_is_running(void);
 
+typedef struct {
+  int ready;
+  int emulation_supported;
+  char binary_arch[16];
+  char execution_mode[32];
+  char detail[128];
+} EdrVelociraptorRuntime;
+
+/**
+ * Report the actual Velociraptor child-process runtime, including PE
+ * architecture and the Windows x64-emulation gate. File presence alone is not
+ * considered healthy.
+ */
+void edr_deep_collector_get_velociraptor_runtime(EdrVelociraptorRuntime *out);
+
 /**
  * 同步运行规格 — 取证生成外移用（memory_dump 等）。
  * 通信硬约束:collector 只在本地落产物,不接收 upload-url、不做任何网络 I/O。

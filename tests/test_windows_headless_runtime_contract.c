@@ -426,6 +426,10 @@ int main(void) {
                          "bundled installer must reject corrupt or unverifiable Authenticode states");
   ok &= require_contains(build_ps, "Verified Runtime PE closure",
                          "bundled installer must verify every Runtime EXE and DLL architecture");
+  ok &= require_contains(build_ps, "Verified isolated Velociraptor emulation component",
+                         "ARM64 packaging permits only the AMD64 Velociraptor child-process exception");
+  ok &= require_contains(build_ps, "-Architecture \"amd64\"",
+                         "the Velociraptor exception must still verify an AMD64 PE explicitly");
   ok &= require_contains(build_ps, "Assert-WindowsInstallerBootstrapArchitecture.ps1",
                          "Inno bootstrap architecture must be validated separately from native payload architecture");
   ok &= require_contains(build_ps, "/DEDR_ALLOW_POWERSHELL_FALLBACK=1",
@@ -446,6 +450,8 @@ int main(void) {
                          "Setup UI capability metadata records the verified executable closure state");
   ok &= require_contains(setup_ui_build, "target_arch = $targetArch",
                          "Setup UI capability metadata binds the native target architecture");
+  ok &= require_contains(setup_ui_build, "windows_x64_emulation",
+                         "Setup UI metadata exposes the isolated Velociraptor emulation mode");
   ok &= require_contains(setup_ui_build, "Assert-WindowsInstallerBootstrapArchitecture.ps1",
                          "Setup UI packaging must preserve the explicit Inno bootstrap architecture exception");
   ok &= require_contains(setup_ui_build, "packages.$runtime.lock.json",

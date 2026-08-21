@@ -408,6 +408,139 @@ static int dc_json_enabled(const char *json) {
   return strncmp(p, "true", 4) == 0 ? 1 : 0;
 }
 
+#ifdef _WIN32
+enum {
+  DC_IMAGE_FILE_MACHINE_I386 = 0x014c,
+  DC_IMAGE_FILE_MACHINE_AMD64 = 0x8664,
+  DC_IMAGE_FILE_MACHINE_ARM64 = 0xaa64,
+  DC_MACHINE_ATTRIBUTE_USER_ENABLED = 0x00000001
+};
+
+static int dc_windows_pe_machine(const char *path, unsigned short *machine) {
+  if (machine) *machine = 0;
+  if (!path || !path[0]) return -1;
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  unsigned char dos[64];
+  if (fread(dos, 1, sizeof(dos), f) != sizeof(dos) || dos[0] != 'M' || dos[1] != 'Z') {
+    fclose(f);
+    return -1;
+  }
+  unsigned long pe_offset = (unsigned long)dos[0x3c] |
+                            ((unsigned long)dos[0x3d] << 8) |
+                            ((unsigned long)dos[0x3e] << 16) |
+                            ((unsigned long)dos[0x3f] << 24);
+  if (pe_offset > 16u * 1024u * 1024u || fseek(f, (long)pe_offset, SEEK_SET) != 0) {
+    fclose(f);
+    return -1;
+  }
+  unsigned char pe[6];
+  size_t n = fread(pe, 1, sizeof(pe), f);
+  fclose(f);
+  if (n != sizeof(pe) || pe[0] != 'P' || pe[1] != 'E' || pe[2] != 0 || pe[3] != 0) return -1;
+  if (machine) *machine = (unsigned short)(pe[4] | ((unsigned short)pe[5] << 8));
+  return 0;
+}
+
+static const char *dc_windows_machine_arch(unsigned short machine) {
+  switch (machine) {
+    case DC_IMAGE_FILE_MACHINE_AMD64: return "amd64";
+    case DC_IMAGE_FILE_MACHINE_ARM64: return "arm64";
+    case DC_IMAGE_FILE_MACHINE_I386: return "x86";
+    default: return "unknown";
+  }
+}
+
+static unsigned short dc_windows_native_machine(void) {
+  SYSTEM_INFO info;
+  memset(&info, 0, sizeof(info));
+  GetNativeSystemInfo(&info);
+  switch (info.wProcessorArchitecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64: return DC_IMAGE_FILE_MACHINE_AMD64;
+    case PROCESSOR_ARCHITECTURE_ARM64: return DC_IMAGE_FILE_MACHINE_ARM64;
+    case PROCESSOR_ARCHITECTURE_INTEL: return DC_IMAGE_FILE_MACHINE_I386;
+    default: return 0;
+  }
+}
+
+static int dc_windows_amd64_guest_supported(void) {
+  unsigned short native_machine = dc_windows_native_machine();
+  if (native_machine == DC_IMAGE_FILE_MACHINE_AMD64) return 1;
+  if (native_machine != DC_IMAGE_FILE_MACHINE_ARM64) return 0;
+  HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+  if (!kernel) return 0;
+
+  /* Windows 11 exposes the preferred component-level machine capability API.
+   * Resolve it dynamically so the native ARM64 Agent still starts on an older
+   * OS; an unavailable API fails closed and the collector falls back builtin. */
+  typedef LONG(WINAPI *PFN_GetMachineTypeAttributes)(USHORT, DWORD *);
+  PFN_GetMachineTypeAttributes get_attributes =
+      (PFN_GetMachineTypeAttributes)GetProcAddress(kernel, "GetMachineTypeAttributes");
+  if (get_attributes) {
+    DWORD attributes = 0;
+    LONG hr = get_attributes(DC_IMAGE_FILE_MACHINE_AMD64, &attributes);
+    if (hr >= 0) return (attributes & DC_MACHINE_ATTRIBUTE_USER_ENABLED) != 0;
+  }
+
+  typedef LONG(WINAPI *PFN_IsWow64GuestMachineSupported)(USHORT, PBOOL);
+  PFN_IsWow64GuestMachineSupported is_supported =
+      (PFN_IsWow64GuestMachineSupported)GetProcAddress(kernel, "IsWow64GuestMachineSupported");
+  if (is_supported) {
+    BOOL supported = FALSE;
+    LONG hr = is_supported(DC_IMAGE_FILE_MACHINE_AMD64, &supported);
+    if (hr >= 0) return supported ? 1 : 0;
+  }
+  return 0;
+}
+
+static int dc_validate_windows_runtime_manifest(const char *manifest_json, const char *path,
+                                                char *detail, size_t detail_cap) {
+  char binary_arch[32];
+  char execution_mode[64];
+  binary_arch[0] = '\0';
+  execution_mode[0] = '\0';
+  if (dc_json_str(manifest_json, "binaryArch", binary_arch, sizeof(binary_arch)) != 0 ||
+      dc_json_str(manifest_json, "executionMode", execution_mode, sizeof(execution_mode)) != 0) {
+    return EDR_DC_OK; /* immutable legacy manifests remain readable */
+  }
+  unsigned short machine = 0;
+  if (dc_windows_pe_machine(path, &machine) != 0) {
+    if (detail) snprintf(detail, detail_cap, "downloaded collector is not a valid Windows PE");
+    return EDR_DC_ERR_SIGNATURE;
+  }
+  const char *actual_arch = dc_windows_machine_arch(machine);
+  if (strcmp(binary_arch, actual_arch) != 0) {
+    if (detail) snprintf(detail, detail_cap, "collector PE architecture mismatch declared=%s actual=%s", binary_arch, actual_arch);
+    return EDR_DC_ERR_SIGNATURE;
+  }
+  unsigned short native_machine = dc_windows_native_machine();
+  if (strcmp(execution_mode, "native") == 0) {
+    if (machine != native_machine) {
+      if (detail) snprintf(detail, detail_cap, "native collector does not match host architecture");
+      return EDR_DC_ERR_SIGNATURE;
+    }
+    return EDR_DC_OK;
+  }
+  if (strcmp(execution_mode, "windows_x64_emulation") == 0) {
+    if (machine != DC_IMAGE_FILE_MACHINE_AMD64 || native_machine != DC_IMAGE_FILE_MACHINE_ARM64) {
+      if (detail) snprintf(detail, detail_cap, "x64 emulation contract requires ARM64 host and AMD64 PE");
+      return EDR_DC_ERR_SIGNATURE;
+    }
+    if (strstr(manifest_json, "\"networkPacketCapture\":true") != NULL) {
+      if (detail) snprintf(detail, detail_cap, "emulated collector cannot declare network packet capture");
+      return EDR_DC_ERR_SIGNATURE;
+    }
+    if (!dc_windows_amd64_guest_supported()) {
+      if (detail) snprintf(detail, detail_cap, "Windows x64 emulation is unavailable on this ARM64 host");
+      return EDR_DC_ERR_DISABLED;
+    }
+    return EDR_DC_OK;
+  }
+  if (detail) snprintf(detail, detail_cap, "unsupported collector execution mode: %.48s", execution_mode);
+  return EDR_DC_ERR_SIGNATURE;
+}
+#endif
+
 static int dc_replace_file(const char *tmp, const char *dest) {
   if (!tmp || !tmp[0] || !dest || !dest[0]) return -1;
 #ifdef _WIN32
@@ -500,6 +633,15 @@ static int dc_autofetch_via_manifest(const char *manifest_url, const char *dest,
       return EDR_DC_ERR_SIGNATURE;
     }
   }
+#ifdef _WIN32
+  {
+    int runtime_rc = dc_validate_windows_runtime_manifest(buf, part_path, detail, detail_cap);
+    if (runtime_rc != EDR_DC_OK) {
+      (void)remove(part_path);
+      return runtime_rc;
+    }
+  }
+#endif
   if (dc_replace_file(part_path, dest) != 0) {
     (void)remove(part_path);
     if (detail) snprintf(detail, detail_cap, "artifact install failed");
@@ -805,6 +947,12 @@ static int dc_ensure_velociraptor_unlocked(int refresh_existing, char *detail, s
       static time_t s_velo_last_check = 0;
       (void)dc_maybe_refresh(path, mf, want, &s_velo_last_check, detail, detail_cap);
     }
+    EdrVelociraptorRuntime runtime;
+    edr_deep_collector_get_velociraptor_runtime(&runtime);
+    if (!runtime.ready) {
+      if (detail) snprintf(detail, detail_cap, "velociraptor runtime unavailable: %.96s", runtime.detail);
+      return EDR_DC_ERR_DISABLED;
+    }
     return EDR_DC_OK;
   }
 
@@ -829,12 +977,61 @@ static int dc_ensure_velociraptor(int refresh_existing, char *detail, size_t det
 }
 
 static int dc_velociraptor_ready(void) {
-  const char *velo = getenv("EDR_VELOCIRAPTOR_BIN");
-  if (velo && velo[0]) return dc_file_nonempty(velo);
+  EdrVelociraptorRuntime runtime;
+  edr_deep_collector_get_velociraptor_runtime(&runtime);
+  return runtime.ready;
+}
+
+void edr_deep_collector_get_velociraptor_runtime(EdrVelociraptorRuntime *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  snprintf(out->binary_arch, sizeof(out->binary_arch), "%s", "unavailable");
+  snprintf(out->execution_mode, sizeof(out->execution_mode), "%s", "unavailable");
+  char path[1024];
+  const char *configured = getenv("EDR_VELOCIRAPTOR_BIN");
+  if (configured && configured[0]) {
+    snprintf(path, sizeof(path), "%s", configured);
+  } else {
 #ifdef _WIN32
-  return dc_file_nonempty("C:\\Program Files\\FDSecurity\\collector\\velociraptor.exe");
+    snprintf(path, sizeof(path), "%s", "C:\\Program Files\\FDSecurity\\collector\\velociraptor.exe");
 #else
-  return dc_file_nonempty(dc_posix_default_velociraptor_path());
+    snprintf(path, sizeof(path), "%s", dc_posix_default_velociraptor_path());
+#endif
+  }
+  if (!dc_file_nonempty(path)) {
+    snprintf(out->detail, sizeof(out->detail), "%s", "binary_missing");
+    return;
+  }
+#ifdef _WIN32
+  unsigned short machine = 0;
+  if (dc_windows_pe_machine(path, &machine) != 0) {
+    snprintf(out->detail, sizeof(out->detail), "%s", "invalid_pe");
+    return;
+  }
+  snprintf(out->binary_arch, sizeof(out->binary_arch), "%s", dc_windows_machine_arch(machine));
+  unsigned short native_machine = dc_windows_native_machine();
+  if (machine == native_machine) {
+    snprintf(out->execution_mode, sizeof(out->execution_mode), "%s", "native");
+    out->emulation_supported = 1;
+    out->ready = 1;
+    snprintf(out->detail, sizeof(out->detail), "%s", "ready");
+    return;
+  }
+  if (native_machine == DC_IMAGE_FILE_MACHINE_ARM64 && machine == DC_IMAGE_FILE_MACHINE_AMD64) {
+    snprintf(out->execution_mode, sizeof(out->execution_mode), "%s", "windows_x64_emulation");
+    out->emulation_supported = dc_windows_amd64_guest_supported();
+    out->ready = out->emulation_supported;
+    snprintf(out->detail, sizeof(out->detail), "%s",
+             out->ready ? "ready" : "x64_emulation_unavailable");
+    return;
+  }
+  snprintf(out->detail, sizeof(out->detail), "%s", "host_binary_arch_mismatch");
+#else
+  snprintf(out->binary_arch, sizeof(out->binary_arch), "%s", "native");
+  snprintf(out->execution_mode, sizeof(out->execution_mode), "%s", "native");
+  out->emulation_supported = 1;
+  out->ready = 1;
+  snprintf(out->detail, sizeof(out->detail), "%s", "ready");
 #endif
 }
 
