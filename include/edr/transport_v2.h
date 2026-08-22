@@ -118,5 +118,8 @@ int edr_transport_v2_command_result_typed(const char *command_id, const char *co
 int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
                                  const char *sha256_hex, char *out_minio_key,
                                  size_t out_minio_key_cap);
+int edr_transport_v2_upload_file_for_command(const char *command_id, const char *upload_id,
+                                             const char *file_path, const char *sha256_hex,
+                                             char *out_minio_key, size_t out_minio_key_cap);
 
 #endif

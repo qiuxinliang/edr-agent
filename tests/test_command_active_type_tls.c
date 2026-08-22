@@ -178,6 +178,14 @@ int main(void) {
             s_direct_report_pending, s_internal_report_pending);
     return 1;
   }
+  if (edr_command_terminal_allows_cancel_override(1, 0, "ok") ||
+      edr_command_terminal_allows_cancel_override(1, 1, "failed") ||
+      !edr_command_terminal_allows_cancel_override(0, 0, "ok") ||
+      edr_command_terminal_allows_cancel_override(0, 130, "failed") ||
+      edr_command_terminal_allows_cancel_override(0, 1, "cancelled")) {
+    fprintf(stderr, "authoritative terminal late-cancel policy mismatch\n");
+    return 1;
+  }
 #ifdef _WIN32
   DeleteCriticalSection(&s_mu);
 #endif

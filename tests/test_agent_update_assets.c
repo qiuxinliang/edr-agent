@@ -187,13 +187,17 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
   char *agent = read_file(path);
   require_true(agent != NULL, "read Agent capability manifest implementation");
-  contains(agent, "\\\"agent_update_v1\\\"", "runtime capability manifest advertises agent update");
+  contains(agent, "edr_agent_update_manifest_fragment", "runtime capability manifest uses production serializer");
   contains(agent, "edr_agent_update_get_runtime_info", "capability depends on audited embedded or installed updater readiness");
-  contains(agent, "updater_protocol_version", "capability reports updater protocol compatibility");
-  contains(agent, "updater_materialized", "capability reports whether the embedded updater was materialized");
-  contains(agent, "updater_sha256", "capability reports the resolved updater hash");
   contains(agent, "edr_agent_lifecycle_runtime_identity", "lifecycle capability is based on installed native chain integrity and identity");
   free(agent);
+  snprintf(path, sizeof(path), "%s/src/command/agent_update_manifest.c", root);
+  char *manifest = read_file(path);
+  contains(manifest, "agent_update_v1", "production serializer advertises agent update capability");
+  contains(manifest, "updater_protocol_version", "capability reports updater protocol compatibility");
+  contains(manifest, "updater_materialized", "capability reports whether the embedded updater was materialized");
+  contains(manifest, "updater_sha256", "capability reports the resolved updater hash");
+  free(manifest);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_lifecycle_command.c", root);
   char *lifecycle_identity_command = read_file(path);

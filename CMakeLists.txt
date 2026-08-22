@@ -317,6 +317,9 @@ set(EDR_AGENT_SOURCES
   src/command/command_cancel.c
   src/command/command_contract.c
   src/command/agent_update_command.c
+  src/command/full_installer_readiness.c
+  src/command/full_installer_windows_identity.c
+  src/command/agent_update_manifest.c
   src/command/agent_lifecycle_command.c
   src/command/agent_update_event.c
   src/command/command_executor.c
@@ -616,7 +619,7 @@ if(WIN32)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1
     ${CMAKE_CURRENT_BINARY_DIR}/edr_agent_inplace_update.ps1 COPYONLY)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
-  target_link_libraries(edr_agent PRIVATE advapi32 shell32 tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32 dbghelp)
+  target_link_libraries(edr_agent PRIVATE advapi32 shell32 ole32 oleaut32 uuid taskschd tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32 dbghelp)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

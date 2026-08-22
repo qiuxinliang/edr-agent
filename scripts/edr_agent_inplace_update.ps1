@@ -113,6 +113,73 @@ function Get-SetupInstallerFromPackage {
   } finally { $archive.Dispose() }
 }
 
+function Get-InstallerLogPath {
+  param([Parameter(Mandatory=$true)][string]$TaskId, [Parameter(Mandatory=$true)][string]$CommandId)
+  $safe = (("$TaskId-$CommandId") -replace '[^A-Za-z0-9._-]', '_')
+  if ($safe.Length -gt 120) { $safe = $safe.Substring(0,120) }
+  $root = Join-Path ${env:ProgramData} 'FDSecurity\logs'
+  New-Item -ItemType Directory -Force -Path $root | Out-Null
+  return (Join-Path $root ("agent-update-{0}-installer.log" -f $safe))
+}
+
+function Get-InstallerLogEvidence {
+  param([Parameter(Mandatory=$true)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]@{ Status='missing'; Size=0; Sha256=''; Summary='' } }
+  $item = Get-Item -LiteralPath $Path -Force
+	if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'INSTALL_LOG_UNSAFE_PATH' }
+  if ($item.Length -gt 1MB) { return [pscustomobject]@{ Status='too_large'; Size=[UInt64]$item.Length; Sha256=(Get-Sha256 -Path $Path); Summary='installer log exceeded 1 MiB' } }
+  $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+	$safe = $raw
+	$safe = [regex]::Replace($safe, '(?im)^\s*Authorization\s*:\s*.*$', 'Authorization: [REDACTED]')
+	$safe = [regex]::Replace($safe, '(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]')
+	$safe = [regex]::Replace($safe, '(?i)(token|password|passwd|secret|api[_-]?key|private.?key|certificate|thumbprint)\s*[:=]\s*[^\r\n\s]+', '$1=[REDACTED]')
+	$safe = [regex]::Replace($safe, '(?is)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----', '[PRIVATE_KEY_REDACTED]')
+	$safe = [regex]::Replace($safe, '(?i)https?://[^\s?]+\?[^\s]+', '[URL_REDACTED]')
+  $tail = if ($safe.Length -gt 4096) { $safe.Substring($safe.Length - 4096) } else { $safe }
+  $snapshotPath = "$Path.redacted"
+	if (Test-Path -LiteralPath $snapshotPath) {
+		$snapshotExisting = Get-Item -LiteralPath $snapshotPath -Force
+		if (($snapshotExisting.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $snapshotExisting.PSIsContainer) { throw 'INSTALL_LOG_UNSAFE_PATH' }
+	}
+  $tmp = Join-Path (Split-Path -Parent $snapshotPath) ('.installer-redacted-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+  $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($tail)
+  $handle = [System.IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
+  if (Test-Path -LiteralPath $snapshotPath) { [System.IO.File]::Replace($tmp, $snapshotPath, $null, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
+  $snapshot = Get-Item -LiteralPath $snapshotPath -Force
+	if (($snapshot.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $snapshot.PSIsContainer) { throw 'INSTALL_LOG_UNSAFE_PATH' }
+  [pscustomobject]@{ Status='ready'; Path=$snapshotPath; Size=[UInt64]$snapshot.Length; OriginalSize=[UInt64]$item.Length; Sha256=(Get-Sha256 -Path $snapshotPath); Summary=$tail }
+}
+
+function Get-InstallerEvidenceId {
+  param([Parameter(Mandatory=$true)][string]$TaskId, [Parameter(Mandatory=$true)][string]$CommandId)
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes("$TaskId`n$CommandId`ninstaller-log-v1")
+  $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+  return 'ev_installer_' + (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function New-InstallerDiagnosticEvidence {
+  param([Parameter(Mandatory=$true)][string]$Path, [Parameter(Mandatory=$true)][string]$Status,
+        [Parameter(Mandatory=$true)][UInt64]$OriginalSize)
+  $snapshotPath = "$Path.redacted"
+  $diagnostic = [ordered]@{
+    schema = 'edr.agent-upgrade.installer-log-diagnostic.v1'
+    status = $Status
+    original_size = $OriginalSize
+	message = switch ($Status) { 'missing' { 'installer log was not produced' } 'too_large' { 'installer log exceeded the bounded capture limit' } default { 'installer process did not produce a readable log' } }
+  } | ConvertTo-Json -Compress
+  $existing = Get-Item -LiteralPath $snapshotPath -Force -ErrorAction SilentlyContinue
+  if ($existing -and (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $existing.PSIsContainer)) { throw 'INSTALL_LOG_UNSAFE_PATH' }
+  $tmp = Join-Path (Split-Path -Parent $snapshotPath) ('.installer-diagnostic-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+  $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($diagnostic)
+  $handle = [System.IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
+  if ($existing) { [System.IO.File]::Replace($tmp, $snapshotPath, $null, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
+  $snapshot = Get-Item -LiteralPath $snapshotPath -Force
+	if (($snapshot.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $snapshot.PSIsContainer) { throw 'INSTALL_LOG_UNSAFE_PATH' }
+  return [pscustomobject]@{ Path=$snapshotPath; Size=[UInt64]$snapshot.Length; Sha256=(Get-Sha256 -Path $snapshotPath) }
+}
+
 function Invoke-FullInstallerUpgrade {
   param([Parameter(Mandatory = $true)][string]$SetupPath, [Parameter(Mandatory = $true)][string]$Mode)
   if (-not (Test-Path -LiteralPath (Join-Path $InstallDir 'agent.toml') -PathType Leaf)) {
@@ -120,11 +187,30 @@ function Invoke-FullInstallerUpgrade {
   }
   if ($Mode -notin @('service','scheduled_task')) { throw "full installer upgrade cannot preserve unsupported deployment mode: $Mode" }
   $runtimeTask = if ($Mode -eq 'service') { 'windowsservice' } else { 'windowsautorun' }
+  $logPath = Get-InstallerLogPath -TaskId $TaskId -CommandId $CommandId
   $arguments = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CLOSEAPPLICATIONS',
     (('/TASKS="{0},keepofflinequeue,keepevidencecache,stricthealthcheck"' -f $runtimeTask)),
-    '/EDR_UPGRADE_EXISTING=1','/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1')
-  $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -Wait -PassThru
-  if ($process.ExitCode -ne 0) { throw "full installer upgrade failed with exit code $($process.ExitCode)" }
+    '/EDR_UPGRADE_EXISTING=1','/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1',("/LOG=`"$logPath`""))
+  try { $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -Wait -PassThru }
+  catch {
+    $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'start_failed' -OriginalSize 0
+    throw "INSTALL_LOG_UNAVAILABLE|installer_exit_code=-1|log_sha256=$($diagnostic.Sha256)|log_size=$($diagnostic.Size)|original_size=0"
+  }
+  $evidence = Get-InstallerLogEvidence -Path $logPath
+  if ($evidence.Status -eq 'missing') {
+    $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'missing' -OriginalSize 0
+    throw "INSTALL_LOG_UNAVAILABLE|installer_exit_code=$($process.ExitCode)|log_sha256=$($diagnostic.Sha256)|log_size=$($diagnostic.Size)|original_size=0"
+  }
+  if ($evidence.Status -eq 'too_large') {
+    $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'too_large' -OriginalSize $evidence.Size
+    throw "INSTALL_LOG_TOO_LARGE|installer_exit_code=$($process.ExitCode)|log_sha256=$($diagnostic.Sha256)|log_size=$($diagnostic.Size)|original_size=$($evidence.Size)"
+  }
+  if ($process.ExitCode -ne 0) {
+    $code = if ($process.ExitCode -eq 7 -and $evidence.Summary -match '(?i)PrepareToInstall|baseline|uninstall') { 'INSTALL_BASELINE_UNSUPPORTED' } else { 'INSTALL_EXIT_NONZERO' }
+    # Keep exception text machine-readable and deliberately free of paths/log content.
+    throw "$code|installer_exit_code=$($process.ExitCode)|log_sha256=$($evidence.Sha256)|log_size=$($evidence.Size)"
+  }
+  return [pscustomobject]@{ ExitCode=$process.ExitCode; LogPath=$logPath; Evidence=$evidence; ErrorCode=''; EvidenceId=(Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId); StorageKey=("evidence/{0}/{1}.log" -f (Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId), $evidence.Sha256) }
 }
 
 function Wait-FullInstallerProcess {
@@ -805,6 +891,13 @@ $journal = [ordered]@{
   full_installer_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerBackupPath } else { $null }
   full_installer_config_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerConfigBackupPath } else { $null }
   expected_runtime_identity_sha256 = $null
+  installer_log_file = $null
+  installer_log_sha256 = $null
+  installer_log_size = 0
+  installer_log_original_size = 0
+  installer_log_evidence_id = $null
+  installer_log_storage_key = $null
+  installer_evidence_status = $null
   last_event_seq = 2
   events = @()
   error = $null
@@ -1150,7 +1243,23 @@ try {
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
     Set-UpdateStage -Stage 'full_installer_upgrade'
     $fullInstallerStarted = $true
-    Invoke-FullInstallerUpgrade -SetupPath $setupPath -Mode $resolvedDeploymentMode
+    $installerResult = Invoke-FullInstallerUpgrade -SetupPath $setupPath -Mode $resolvedDeploymentMode
+    $report['installer_exit_code'] = $installerResult.ExitCode
+    $report['installer_log_sha256'] = $installerResult.Evidence.Sha256
+    $report['installer_log_size'] = $installerResult.Evidence.Size
+    $report['installer_log_original_size'] = $installerResult.Evidence.OriginalSize
+    $report['installer_log_status'] = $installerResult.Evidence.Status
+    $report['installer_log_path'] = Split-Path -Leaf $installerResult.Evidence.Path
+    $report['installer_log_evidence_id'] = $installerResult.EvidenceId
+    $report['installer_log_storage_key'] = $installerResult.StorageKey
+    $journal['installer_log_file'] = Split-Path -Leaf $installerResult.Evidence.Path
+    $journal['installer_log_sha256'] = $installerResult.Evidence.Sha256
+    $journal['installer_log_size'] = [UInt64]$installerResult.Evidence.Size
+    $journal['installer_log_original_size'] = [UInt64]$installerResult.Evidence.OriginalSize
+    $journal['installer_log_evidence_id'] = $installerResult.EvidenceId
+    $journal['installer_log_storage_key'] = $installerResult.StorageKey
+    $journal['installer_evidence_status'] = 'pending_upload'
+    Write-AtomicJson -Path $journalPath -Value $journal
     if ((Get-Sha256 -Path (Join-Path $installFull 'agent.toml')) -ne (Get-Sha256 -Path $fullInstallerConfigBackupPath)) {
       throw 'full installer modified protected agent.toml identity configuration'
     }
@@ -1245,6 +1354,30 @@ try {
   Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
 } catch {
   $failureMessage = $_.Exception.Message
+  if ($failureMessage -match '^(INSTALL_[A-Z_]+)\|') {
+    $report['error_code'] = $Matches[1]
+    if ($failureMessage -match 'installer_exit_code=([0-9-]+)') { $report['installer_exit_code'] = [int]$Matches[1] }
+    if ($failureMessage -match 'log_sha256=([0-9a-fA-F]{64})') { $report['installer_log_sha256'] = $Matches[1].ToLowerInvariant() }
+    if ($failureMessage -match 'log_size=([0-9]+)') { $report['installer_log_size'] = [UInt64]$Matches[1] }
+    if ($failureMessage -match 'original_size=([0-9]+)') { $report['installer_log_original_size'] = [UInt64]$Matches[1] }
+    $report['installer_log_status'] = if ($report['error_code'] -eq 'INSTALL_LOG_UNAVAILABLE') { 'missing' } elseif ($report['error_code'] -eq 'INSTALL_LOG_TOO_LARGE') { 'too_large' } else { 'ready' }
+    if ($TaskId -and $CommandId) {
+      $report['installer_log_evidence_id'] = Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId
+      if ($report['installer_log_sha256']) {
+        $report['installer_log_storage_key'] = "evidence/$($report['installer_log_evidence_id'])/$($report['installer_log_sha256']).log"
+      }
+      $logLeaf = Split-Path -Leaf (Get-InstallerLogPath -TaskId $TaskId -CommandId $CommandId)
+      $logLeaf = "$logLeaf.redacted"
+      $journal['installer_log_file'] = $logLeaf
+      $journal['installer_log_sha256'] = [string]$report['installer_log_sha256']
+      $journal['installer_log_size'] = if ($report['installer_log_size']) { [UInt64]$report['installer_log_size'] } else { [UInt64]0 }
+      $journal['installer_log_original_size'] = if ($report['installer_log_original_size']) { [UInt64]$report['installer_log_original_size'] } else { [UInt64]0 }
+      $journal['installer_log_evidence_id'] = $report['installer_log_evidence_id']
+      $journal['installer_log_storage_key'] = [string]$report['installer_log_storage_key']
+      $journal['installer_evidence_status'] = [string]$report['installer_log_status']
+    }
+    $failureMessage = $report['error_code']
+  }
   $report["failed_stage"] = $report["stage"]
   $report["error"] = $failureMessage
   $report["error_type"] = $_.Exception.GetType().FullName

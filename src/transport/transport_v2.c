@@ -312,8 +312,8 @@ int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
   if (edr_transport_v2_send(stream_id, upload_id, upload_id ? strlen(upload_id) : 0u) != 0) {
     return -1;
   }
-  rc = edr_ingest_http_upload_file_multipart(upload_id, file_path, sha256_hex,
-                                             out_minio_key, out_minio_key_cap);
+  rc = edr_ingest_http_upload_file_multipart_for_command(upload_id, upload_id, file_path, sha256_hex,
+                                                         out_minio_key, out_minio_key_cap);
   if (rc != 0) {
     tv2_lock();
     s_rt.send_fail++;
@@ -321,4 +321,14 @@ int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
     tv2_unlock();
   }
   return rc;
+}
+
+int edr_transport_v2_upload_file_for_command(const char *command_id, const char *upload_id,
+                                             const char *file_path, const char *sha256_hex,
+                                             char *out_minio_key, size_t out_minio_key_cap) {
+  int stream_id = edr_transport_v2_open_stream(EDR_TV2_CHANNEL_UPLOAD, EDR_TV2_OP_UPLOAD_FILE);
+  if (edr_transport_v2_send(stream_id, upload_id, upload_id ? strlen(upload_id) : 0u) != 0) return -1;
+  return edr_ingest_http_upload_file_multipart_for_command(command_id, upload_id, file_path,
+                                                           sha256_hex, out_minio_key,
+                                                           out_minio_key_cap);
 }

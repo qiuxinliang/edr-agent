@@ -40,6 +40,13 @@ int edr_command_parse_server_address_json(const uint8_t *p, size_t len, char *ou
 
 int edr_command_streq(const char *a, const char *b);
 
+/* A task terminal already acknowledged by its authoritative lifecycle stream
+ * is immutable.  A late cancel may still override an ordinary in-flight
+ * command result, but must not rewrite that acknowledged terminal. */
+int edr_command_terminal_allows_cancel_override(
+    int authoritative_terminal_acked, int exit_code,
+    const char *response_status);
+
 extern unsigned long g_cmd_handled;
 extern unsigned long g_cmd_rejected;
 extern unsigned long g_cmd_exec_ok;

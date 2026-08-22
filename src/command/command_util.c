@@ -58,6 +58,13 @@ const struct EdrConfig *edr_command_get_config(void) { return s_bound_cfg; }
 
 int edr_command_streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
 
+int edr_command_terminal_allows_cancel_override(
+    int authoritative_terminal_acked, int exit_code,
+    const char *response_status) {
+  if (authoritative_terminal_acked || exit_code == 130) return 0;
+  return !response_status || strcmp(response_status, "cancelled") != 0;
+}
+
 int edr_command_dangerous_enabled(void) {
   const char *e = getenv("EDR_CMD_ENABLED");
   if (e && e[0] == '1') {

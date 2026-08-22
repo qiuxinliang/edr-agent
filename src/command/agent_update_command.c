@@ -1,10 +1,13 @@
 #include "edr/agent_update_command.h"
+#include "edr/full_installer_readiness.h"
+#include "edr/full_installer_windows_identity.h"
 
 #include "cJSON.h"
 #include "edr/agent_update_event.h"
 #include "edr/command_cancel.h"
 #include "edr/ingest_http.h"
 #include "edr/sha256.h"
+#include "edr/transport_v2.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -13,10 +16,15 @@
 #include <string.h>
 
 #ifdef _WIN32
+#define COBJMACROS
 #include "edr/windows_resource_ids.h"
+#include <ole2.h>
+#include <taskschd.h>
 #include <windows.h>
+#include <winreg.h>
 #include <shellapi.h>
 #include <io.h>
+#include <sys/stat.h>
 #endif
 
 #ifndef EDR_AGENT_VERSION_STRING
@@ -41,6 +49,11 @@ static void runtime_info_error(EdrAgentUpdateRuntimeInfo *info, const char *sour
   snprintf(info->version, sizeof(info->version), "%s", EDR_AGENT_VERSION_STRING);
   snprintf(info->error_code, sizeof(info->error_code), "%s",
            error_code ? error_code : "updater_unavailable");
+  info->full_installer_ready = 0;
+  snprintf(info->full_installer_reason, sizeof(info->full_installer_reason), "%s",
+           error_code ? error_code : "updater_unavailable");
+  snprintf(info->installation_family, sizeof(info->installation_family), "unknown");
+  snprintf(info->installation_baseline, sizeof(info->installation_baseline), "%s", EDR_AGENT_VERSION_STRING);
 }
 
 static int file_sha256(const char *path, char out65[65]) {
@@ -67,6 +80,270 @@ static int file_sha256(const char *path, char out65[65]) {
     snprintf(out65 + i * 2u, 3u, "%02x", digest[i]);
   }
   out65[64] = '\0';
+  return 1;
+}
+
+static int regular_nonreparse_file(const char *path) {
+  DWORD attrs = GetFileAttributesA(path);
+  return attrs != INVALID_FILE_ATTRIBUTES &&
+         !(attrs & FILE_ATTRIBUTE_DIRECTORY) && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+static int canonical_executable_matches(const char *expected, const char *actual) {
+  char expected_path[MAX_PATH] = {0}, actual_path[MAX_PATH] = {0};
+  if (!actual || !actual[0] || GetFullPathNameA(expected, sizeof(expected_path), expected_path, NULL) == 0 ||
+      GetFullPathNameA(actual, sizeof(actual_path), actual_path, NULL) == 0) return 0;
+  return _stricmp(expected_path, actual_path) == 0;
+}
+
+static int service_identity_matches(const char *expected) {
+  SC_HANDLE manager = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+  SC_HANDLE service = manager ? OpenServiceA(manager, "FDSecurityAgent", SERVICE_QUERY_CONFIG) : NULL;
+  DWORD needed = 0;
+  if (service) QueryServiceConfigA(service, NULL, 0, &needed);
+  QUERY_SERVICE_CONFIGA *query = needed ? (QUERY_SERVICE_CONFIGA *)malloc(needed) : NULL;
+  char executable[MAX_PATH] = {0};
+  int ok = service && query && QueryServiceConfigA(service, query, needed, &needed);
+  if (ok) {
+    const char *raw = query->lpBinaryPathName;
+    if (raw && raw[0] == '"') {
+      const char *end = strchr(raw + 1, '"');
+      if (end && (size_t)(end - raw - 1) < sizeof(executable)) {
+        memcpy(executable, raw + 1, (size_t)(end - raw - 1));
+        executable[end - raw - 1] = '\0';
+      }
+    } else if (raw) {
+      snprintf(executable, sizeof(executable), "%s", raw);
+      char *space = strchr(executable, ' ');
+      if (space) *space = '\0';
+    }
+    ok = canonical_executable_matches(expected, executable);
+  }
+  free(query);
+  if (service) CloseServiceHandle(service);
+  if (manager) CloseServiceHandle(manager);
+  return ok;
+}
+
+static int bstr_to_local(BSTR value, char *output, size_t output_cap) {
+  if (!value || !output || output_cap == 0u) return 0;
+  int written = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, value, -1,
+                                    output, (int)output_cap, NULL, NULL);
+  return written > 0 && (size_t)written <= output_cap;
+}
+
+static char *read_identity_file(const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (!file) return NULL;
+  const size_t maximum = 256u * 1024u;
+  char *contents = (char *)malloc(maximum + 1u);
+  if (!contents) {
+    fclose(file);
+    return NULL;
+  }
+  size_t used = fread(contents, 1u, maximum + 1u, file);
+  int ok = !ferror(file) && used <= maximum && feof(file);
+  fclose(file);
+  if (!ok) {
+    free(contents);
+    return NULL;
+  }
+  contents[used] = '\0';
+  return contents;
+}
+
+static int scheduled_task_identity_matches(const char *expected) {
+  if (!expected || !expected[0]) return 0;
+  char directory[MAX_PATH] = {0};
+  snprintf(directory, sizeof(directory), "%s", expected);
+  char *separator = strrchr(directory, '\\');
+  if (!separator) return 0;
+  *separator = '\0';
+
+  HRESULT initialize = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  int uninitialize = SUCCEEDED(initialize);
+  if (FAILED(initialize) && initialize != RPC_E_CHANGED_MODE) return 0;
+  ITaskService *service = NULL;
+  ITaskFolder *folder = NULL;
+  IRegisteredTask *registered = NULL;
+  ITaskDefinition *definition = NULL;
+  IActionCollection *actions = NULL;
+  IAction *action = NULL;
+  IExecAction *exec = NULL;
+  IPrincipal *principal = NULL;
+  BSTR root_path = NULL, task_name = NULL;
+  BSTR action_path = NULL, action_arguments = NULL, action_workdir = NULL, principal_user = NULL;
+  int matched = 0;
+  VARIANT empty;
+  VariantInit(&empty);
+
+  HRESULT hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_ITaskService, (void **)&service);
+  if (FAILED(hr) || !service) goto cleanup;
+  hr = ITaskService_Connect(service, empty, empty, empty, empty);
+  if (FAILED(hr)) goto cleanup;
+  root_path = SysAllocString(L"\\");
+  task_name = SysAllocString(L"FDSecurityAgent");
+  if (!root_path || !task_name) goto cleanup;
+  hr = ITaskService_GetFolder(service, root_path, &folder);
+  if (FAILED(hr) || !folder) goto cleanup;
+  hr = ITaskFolder_GetTask(folder, task_name, &registered);
+  if (FAILED(hr) || !registered) goto cleanup;
+  VARIANT_BOOL enabled = VARIANT_FALSE;
+  if (FAILED(IRegisteredTask_get_Enabled(registered, &enabled)) || enabled != VARIANT_TRUE) goto cleanup;
+  if (FAILED(IRegisteredTask_get_Definition(registered, &definition)) || !definition) goto cleanup;
+  if (FAILED(ITaskDefinition_get_Actions(definition, &actions)) || !actions) goto cleanup;
+  LONG count = 0;
+  if (FAILED(IActionCollection_get_Count(actions, &count)) || count != 1) goto cleanup;
+  if (FAILED(IActionCollection_get_Item(actions, 1, &action)) || !action) goto cleanup;
+  TASK_ACTION_TYPE action_type = TASK_ACTION_COM_HANDLER;
+  if (FAILED(IAction_get_Type(action, &action_type)) || action_type != TASK_ACTION_EXEC) goto cleanup;
+  if (FAILED(IAction_QueryInterface(action, &IID_IExecAction, (void **)&exec)) || !exec) goto cleanup;
+  if (FAILED(IExecAction_get_Path(exec, &action_path)) ||
+      FAILED(IExecAction_get_Arguments(exec, &action_arguments)) ||
+      FAILED(IExecAction_get_WorkingDirectory(exec, &action_workdir))) goto cleanup;
+  if (FAILED(ITaskDefinition_get_Principal(definition, &principal)) || !principal) goto cleanup;
+  TASK_LOGON_TYPE logon = TASK_LOGON_NONE;
+  TASK_RUNLEVEL_TYPE run_level = TASK_RUNLEVEL_LUA;
+  if (FAILED(IPrincipal_get_UserId(principal, &principal_user)) ||
+      FAILED(IPrincipal_get_LogonType(principal, &logon)) ||
+      FAILED(IPrincipal_get_RunLevel(principal, &run_level))) goto cleanup;
+
+  char path[MAX_PATH] = {0}, arguments[4096] = {0}, workdir[MAX_PATH] = {0}, user[256] = {0};
+  char windows[MAX_PATH] = {0}, powershell[MAX_PATH] = {0}, launcher[MAX_PATH] = {0};
+  if (!bstr_to_local(action_path, path, sizeof(path)) ||
+      !bstr_to_local(action_arguments, arguments, sizeof(arguments)) ||
+      !bstr_to_local(action_workdir, workdir, sizeof(workdir)) ||
+      !bstr_to_local(principal_user, user, sizeof(user)) ||
+      GetWindowsDirectoryA(windows, (UINT)sizeof(windows)) == 0u) goto cleanup;
+  if (snprintf(powershell, sizeof(powershell), "%s\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", windows) <= 0 ||
+      snprintf(launcher, sizeof(launcher), "%s\\FDSensorTaskLaunch.ps1", directory) <= 0 ||
+      !regular_nonreparse_file(launcher)) goto cleanup;
+  char *launcher_contents = read_identity_file(launcher);
+  if (!launcher_contents) goto cleanup;
+  EdrFullInstallerTaskIdentity identity = {
+      path, arguments, workdir, user, (int)logon, (int)run_level, launcher_contents};
+  matched = edr_full_installer_task_identity_matches(directory, powershell, &identity);
+  free(launcher_contents);
+
+cleanup:
+  if (principal_user) SysFreeString(principal_user);
+  if (action_workdir) SysFreeString(action_workdir);
+  if (action_arguments) SysFreeString(action_arguments);
+  if (action_path) SysFreeString(action_path);
+  if (task_name) SysFreeString(task_name);
+  if (root_path) SysFreeString(root_path);
+  if (principal) IPrincipal_Release(principal);
+  if (exec) IExecAction_Release(exec);
+  if (action) IAction_Release(action);
+  if (actions) IActionCollection_Release(actions);
+  if (definition) ITaskDefinition_Release(definition);
+  if (registered) IRegisteredTask_Release(registered);
+  if (folder) ITaskFolder_Release(folder);
+  if (service) ITaskService_Release(service);
+  if (uninitialize) CoUninitialize();
+  return matched;
+}
+
+static int read_registry_string(HKEY key, const char *name, char *output, DWORD output_cap) {
+  if (!key || !name || !output || output_cap < 2u) return 0;
+  DWORD type = 0, size = output_cap;
+  output[0] = '\0';
+  LONG result = RegQueryValueExA(key, name, NULL, &type, (BYTE *)output, &size);
+  if (result != ERROR_SUCCESS || type != REG_SZ || size == 0u || size > output_cap) {
+    output[0] = '\0';
+    return 0;
+  }
+  output[output_cap - 1u] = '\0';
+  if (!memchr(output, '\0', size)) {
+    output[0] = '\0';
+    return 0;
+  }
+  return output[0] != '\0';
+}
+
+static int uninstall_provenance_matches(const char *directory) {
+  const char *subkeys[] = {
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}",
+      "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
+  char uninstaller[2 * MAX_PATH], install[MAX_PATH], display_name[256], publisher[256];
+  for (size_t i = 0; i < sizeof(subkeys) / sizeof(subkeys[0]); ++i) {
+    HKEY key = NULL;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkeys[i], 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
+    int complete = read_registry_string(key, "InstallLocation", install, sizeof(install)) &&
+                   read_registry_string(key, "UninstallString", uninstaller, sizeof(uninstaller)) &&
+                   read_registry_string(key, "DisplayName", display_name, sizeof(display_name)) &&
+                   read_registry_string(key, "Publisher", publisher, sizeof(publisher));
+    RegCloseKey(key);
+    EdrFullInstallerUninstallIdentity identity = {
+        install, uninstaller, display_name, publisher,
+        "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
+    if (complete && edr_full_installer_uninstall_identity_matches(directory, &identity)) return 1;
+  }
+  return 0;
+}
+
+static int readiness_regular_file(void *ctx, const char *path) {
+  (void)ctx;
+  return regular_nonreparse_file(path);
+}
+static int readiness_readable_config(void *ctx, const char *path) {
+  (void)ctx;
+  FILE *file = fopen(path, "rb");
+  if (!file) return 0;
+  int value = fgetc(file) != EOF;
+  fclose(file);
+  return value;
+}
+static int readiness_uninstall(void *ctx, const char *directory) {
+  (void)ctx;
+  return uninstall_provenance_matches(directory);
+}
+static int readiness_service(void *ctx, const char *expected) {
+  (void)ctx;
+  return service_identity_matches(expected);
+}
+static int readiness_task(void *ctx, const char *expected) {
+  (void)ctx;
+  return scheduled_task_identity_matches(expected);
+}
+static int readiness_module(void *ctx, const char *expected) {
+  (void)ctx;
+  char module[MAX_PATH] = {0};
+  DWORD length = GetModuleFileNameA(NULL, module, (DWORD)sizeof(module));
+  return length > 0u && canonical_executable_matches(expected, module);
+}
+
+int edr_agent_update_probe_full_installer_baseline(
+    const char *directory, char *reason, size_t reason_cap) {
+  if (!directory || !directory[0]) {
+    snprintf(reason, reason_cap, "installation_directory_unavailable");
+    return 0;
+  }
+  EdrFullInstallerReadinessDeps deps = {
+      NULL, readiness_regular_file, readiness_readable_config, readiness_uninstall,
+      readiness_service, readiness_task, readiness_module};
+  if (!edr_full_installer_baseline_ready(&deps, directory, reason, reason_cap)) return 0;
+  const char *required[] = {"unins000.exe", "unins000.dat", "agent.toml", "FDSensor.exe"};
+  for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
+    char path[MAX_PATH];
+    int n = snprintf(path, sizeof(path), "%s\\%s", directory, required[i]);
+    if (n <= 0 || (size_t)n >= sizeof(path) || !regular_nonreparse_file(path)) {
+      snprintf(reason, reason_cap, "installation_baseline_missing_%s", required[i]);
+      return 0;
+    }
+  }
+  if (!uninstall_provenance_matches(directory)) {
+    snprintf(reason, reason_cap, "uninstaller_provenance_missing_or_mismatch");
+    return 0;
+  }
+  char expected[MAX_PATH];
+  snprintf(expected, sizeof(expected), "%s\\FDSensor.exe", directory);
+  int service_ok = service_identity_matches(expected);
+  int task_ok = scheduled_task_identity_matches(expected);
+  if (!service_ok && !task_ok) { snprintf(reason, reason_cap, "installation_identity_mismatch"); return 0; }
+  if (service_ok && task_ok) { snprintf(reason, reason_cap, "installation_identity_conflict"); return 0; }
+  snprintf(reason, reason_cap, "ready");
   return 1;
 }
 
@@ -197,6 +474,11 @@ static enum embedded_updater_result materialize_embedded_update_script(
     snprintf(info->version, sizeof(info->version), "%s", EDR_AGENT_VERSION_STRING);
     snprintf(info->sha256, sizeof(info->sha256), "%s", embedded_sha256);
     info->error_code[0] = '\0';
+    info->full_installer_ready = edr_agent_update_probe_full_installer_baseline(
+        directory, info->full_installer_reason,
+        sizeof(info->full_installer_reason));
+    snprintf(info->installation_family, sizeof(info->installation_family), "embedded_full_installer");
+    snprintf(info->installation_baseline, sizeof(info->installation_baseline), "%s", EDR_AGENT_VERSION_STRING);
     cleanup_old_materialized_updaters(directory, final_path);
     return EMBEDDED_UPDATER_READY;
   }
@@ -243,8 +525,23 @@ static enum embedded_updater_result materialize_embedded_update_script(
   snprintf(info->version, sizeof(info->version), "%s", EDR_AGENT_VERSION_STRING);
   snprintf(info->sha256, sizeof(info->sha256), "%s", embedded_sha256);
   info->error_code[0] = '\0';
+  info->full_installer_ready = edr_agent_update_probe_full_installer_baseline(
+      directory, info->full_installer_reason,
+      sizeof(info->full_installer_reason));
+  snprintf(info->installation_family, sizeof(info->installation_family), "embedded_full_installer");
+  snprintf(info->installation_baseline, sizeof(info->installation_baseline), "%s", EDR_AGENT_VERSION_STRING);
   cleanup_old_materialized_updaters(directory, final_path);
   return EMBEDDED_UPDATER_READY;
+}
+#endif
+
+#ifndef _WIN32
+int edr_agent_update_probe_full_installer_baseline(
+    const char *directory, char *reason, size_t reason_cap) {
+  (void)directory;
+  if (reason && reason_cap)
+    snprintf(reason, reason_cap, "platform_unsupported");
+  return 0;
 }
 #endif
 
@@ -262,6 +559,9 @@ int edr_agent_update_get_runtime_info(EdrAgentUpdateRuntimeInfo *info,
   snprintf(info->source, sizeof(info->source), "unsupported");
   snprintf(info->version, sizeof(info->version), "%s", EDR_AGENT_VERSION_STRING);
   snprintf(info->error_code, sizeof(info->error_code), "non_windows");
+  snprintf(info->full_installer_reason, sizeof(info->full_installer_reason), "platform_unsupported");
+  snprintf(info->installation_family, sizeof(info->installation_family), "unsupported");
+  snprintf(info->installation_baseline, sizeof(info->installation_baseline), "%s", EDR_AGENT_VERSION_STRING);
   return 0;
 #else
   enum embedded_updater_result embedded =
@@ -285,10 +585,14 @@ int edr_agent_update_get_runtime_info(EdrAgentUpdateRuntimeInfo *info,
             script_path[0] = '\0';
             return 0;
           }
-          info->ready = 1;
+  info->ready = 1;
           info->protocol_version = 1;
           snprintf(info->source, sizeof(info->source), "installed_sidecar");
           snprintf(info->version, sizeof(info->version), "legacy");
+          info->full_installer_ready = 0;
+          snprintf(info->full_installer_reason, sizeof(info->full_installer_reason), "updater_protocol_below_full_installer_baseline");
+          snprintf(info->installation_family, sizeof(info->installation_family), "sidecar");
+          snprintf(info->installation_baseline, sizeof(info->installation_baseline), "%s", EDR_AGENT_VERSION_STRING);
           return 1;
         }
       }
@@ -307,6 +611,10 @@ int edr_agent_update_get_runtime_info(EdrAgentUpdateRuntimeInfo *info,
       info->protocol_version = 1;
       snprintf(info->source, sizeof(info->source), "configured_sidecar");
       snprintf(info->version, sizeof(info->version), "legacy");
+      info->full_installer_ready = 0;
+      snprintf(info->full_installer_reason, sizeof(info->full_installer_reason), "updater_protocol_below_full_installer_baseline");
+      snprintf(info->installation_family, sizeof(info->installation_family), "sidecar");
+      snprintf(info->installation_baseline, sizeof(info->installation_baseline), "%s", EDR_AGENT_VERSION_STRING);
       return 1;
     }
   }
@@ -710,6 +1018,18 @@ static int journal_uint64(const cJSON *root, const char *name, uint64_t *out) {
   return 1;
 }
 
+static int journal_optional_string(const cJSON *root, const char *name, char *out, size_t cap) {
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+  if (!item) return 1;
+  return journal_string(root, name, out, cap);
+}
+
+static int journal_optional_uint64(const cJSON *root, const char *name, uint64_t *out) {
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+  if (!item) return 1;
+  return journal_uint64(root, name, out);
+}
+
 int edr_agent_update_parse_journal(const char *json, EdrAgentUpdateRecovery *out) {
   if (!json || !out) return -1;
   memset(out, 0, sizeof(*out));
@@ -753,6 +1073,20 @@ int edr_agent_update_parse_journal(const char *json, EdrAgentUpdateRecovery *out
   }
   if (cJSON_IsString(error) && error->valuestring)
     snprintf(out->detail, sizeof(out->detail), "%s", error->valuestring);
+  if (!journal_optional_string(root, "installer_log_file", out->installer_log_file,
+                               sizeof(out->installer_log_file)) ||
+      !journal_optional_string(root, "installer_log_sha256", out->installer_log_sha256,
+                               sizeof(out->installer_log_sha256)) ||
+      !journal_optional_uint64(root, "installer_log_size", &out->installer_log_size) ||
+      !journal_optional_uint64(root, "installer_log_original_size", &out->installer_log_original_size) ||
+      !journal_optional_string(root, "installer_log_evidence_id", out->installer_log_evidence_id,
+                               sizeof(out->installer_log_evidence_id)) ||
+      !journal_optional_string(root, "installer_log_storage_key", out->installer_log_storage_key,
+                               sizeof(out->installer_log_storage_key)) ||
+      !journal_optional_string(root, "installer_evidence_status", out->installer_evidence_status,
+                               sizeof(out->installer_evidence_status))) {
+    cJSON_Delete(root); memset(out, 0, sizeof(*out)); return -1;
+  }
   cJSON_Delete(root);
   if (!edr_agent_update_journal_is_terminal(out->status)) return 1;
   out->succeeded = strcmp(out->status, "succeeded") == 0;
@@ -761,8 +1095,93 @@ int edr_agent_update_parse_journal(const char *json, EdrAgentUpdateRecovery *out
   return 2;
 }
 
+int edr_agent_update_finalize_recovery(
+    EdrAgentUpdateRecovery *recovery, const char *installer_log_path,
+    const char *event_outbox_dir, EdrAgentUpdateRecoveryUploadFn upload,
+    EdrAgentUpdateRecoveryFlushFn flush, void *user) {
+  if (!recovery || !event_outbox_dir || !event_outbox_dir[0] || !flush) return -1;
+
+  if (edr_agent_update_journal_is_terminal(recovery->status) &&
+      recovery->installer_log_file[0]) {
+    if (!upload || !installer_log_path || !installer_log_path[0] ||
+        !recovery->command_id[0] || !recovery->installer_log_evidence_id[0] ||
+        !is_hex(recovery->installer_log_sha256, 64u) ||
+        recovery->installer_log_size == 0u) return -1;
+
+    char uploaded_key[sizeof(recovery->installer_log_storage_key)];
+    memset(uploaded_key, 0, sizeof(uploaded_key));
+    if (upload(recovery->command_id, recovery->installer_log_evidence_id,
+               installer_log_path, recovery->installer_log_sha256,
+               uploaded_key, sizeof(uploaded_key), user) != 0) return -1;
+    if (uploaded_key[0]) {
+      snprintf(recovery->installer_log_storage_key,
+               sizeof(recovery->installer_log_storage_key), "%s", uploaded_key);
+    }
+    if (!recovery->installer_log_storage_key[0]) return -1;
+    snprintf(recovery->installer_evidence_status,
+             sizeof(recovery->installer_evidence_status), "uploaded");
+
+    cJSON *artifacts = cJSON_CreateArray();
+    cJSON *artifact = cJSON_CreateObject();
+    if (!artifacts || !artifact ||
+        !cJSON_AddStringToObject(artifact, "artifact_id",
+                                recovery->installer_log_evidence_id) ||
+        !cJSON_AddStringToObject(artifact, "kind",
+                                "agent_upgrade_installer_log") ||
+        !cJSON_AddStringToObject(artifact, "storage_key",
+                                recovery->installer_log_storage_key) ||
+        !cJSON_AddStringToObject(artifact, "sha256",
+                                recovery->installer_log_sha256) ||
+        !cJSON_AddNumberToObject(artifact, "size",
+                                (double)recovery->installer_log_size) ||
+        !cJSON_AddNumberToObject(artifact, "original_size",
+                                (double)recovery->installer_log_original_size) ||
+        !cJSON_AddBoolToObject(artifact, "agent_redacted", 1) ||
+        !cJSON_AddStringToObject(artifact, "status", "uploaded") ||
+        !cJSON_AddItemToArray(artifacts, artifact)) {
+      cJSON_Delete(artifact);
+      cJSON_Delete(artifacts);
+      return -1;
+    }
+    artifact = NULL;
+    char *printed = cJSON_PrintUnformatted(artifacts);
+    cJSON_Delete(artifacts);
+    if (!printed || strlen(printed) >= sizeof(recovery->installer_artifact_json)) {
+      free(printed);
+      return -1;
+    }
+    snprintf(recovery->installer_artifact_json,
+             sizeof(recovery->installer_artifact_json), "%s", printed);
+    free(printed);
+  }
+
+  uint64_t last_acked = 0u;
+  if (flush(event_outbox_dir, &last_acked, user) < 0) return -1;
+  recovery->terminal_event_acked =
+      edr_agent_update_journal_is_terminal(recovery->status) &&
+      last_acked >= recovery->last_event_seq;
+  return recovery->terminal_event_acked ? 2 : 1;
+}
+
 #ifdef _WIN32
 static int event_command_dir(const char *command_id, char *out, size_t cap);
+
+static int recovery_upload_production(
+    const char *command_id, const char *upload_id, const char *file_path,
+    const char *sha256_hex, char *out_storage_key,
+    size_t out_storage_key_cap, void *user) {
+  (void)user;
+  return edr_transport_v2_upload_file_for_command(
+      command_id, upload_id, file_path, sha256_hex,
+      out_storage_key, out_storage_key_cap);
+}
+
+static int recovery_flush_production(const char *outbox_dir,
+                                     uint64_t *last_acked_seq,
+                                     void *user) {
+  (void)user;
+  return edr_agent_update_event_flush_ingest(outbox_dir, last_acked_seq);
+}
 
 static int same_hex(const char *left, const char *right) {
   if (!left || !right || strlen(left) != strlen(right)) return 0;
@@ -849,10 +1268,29 @@ int edr_agent_update_recover(const char *command_id, const uint8_t *payload,
     cJSON_Delete(root); return -1;
   }
   cJSON_Delete(root);
-  uint64_t last_acked = 0u;
-  if (edr_agent_update_event_flush_ingest(outbox_dir, &last_acked) < 0) return -1;
-  out->terminal_event_acked = parse_rc == 2 && last_acked >= out->last_event_seq;
-  return out->terminal_event_acked ? 2 : 1;
+  char installer_log_path[MAX_PATH] = {0};
+  if (parse_rc == 2 && out->installer_log_file[0]) {
+    char program_data[MAX_PATH];
+    DWORD pn = GetEnvironmentVariableA("ProgramData", program_data, sizeof(program_data));
+    if (!pn || pn >= sizeof(program_data) || strchr(out->installer_log_file, '/') ||
+        strchr(out->installer_log_file, '\\') || strstr(out->installer_log_file, "..") ||
+        snprintf(installer_log_path, sizeof(installer_log_path),
+                 "%s\\FDSecurity\\logs\\%s", program_data,
+                 out->installer_log_file) >= (int)sizeof(installer_log_path)) return -1;
+    DWORD attrs = GetFileAttributesA(installer_log_path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return -1;
+    struct _stat64 st;
+    char actual[65];
+    if (_stat64(installer_log_path, &st) != 0 ||
+        (uint64_t)st.st_size != out->installer_log_size ||
+        !is_hex(out->installer_log_sha256, 64u) ||
+        !file_sha256(installer_log_path, actual) ||
+        !same_hex(actual, out->installer_log_sha256)) return -1;
+  }
+  return edr_agent_update_finalize_recovery(
+      out, installer_log_path, outbox_dir, recovery_upload_production,
+      recovery_flush_production, NULL);
 #endif
 }
 

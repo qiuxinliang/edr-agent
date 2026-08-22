@@ -28,6 +28,7 @@
 #include "edr/command_executor.h"
 #include "edr/response_capability_manifest.h"
 #include "edr/agent_update_command.h"
+#include "edr/agent_update_manifest.h"
 #include "edr/agent_lifecycle_command.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
@@ -1661,19 +1662,19 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                 : signing_key_configured ? "healthy" : "degraded";
   char agent_update_script[4096];
   EdrAgentUpdateRuntimeInfo agent_update_info;
-  int agent_update_runtime_ready = edr_agent_update_get_runtime_info(
-      &agent_update_info, agent_update_script, sizeof(agent_update_script));
-  int agent_update_policy = windows_native &&
-      (!signing_policy || (signing_build && signing_key_configured));
-  const char *agent_update_runtime = !windows_native ? "unavailable"
-                                     : !agent_update_runtime_ready ? "degraded"
-                                     : !agent_update_policy ? "disabled" : "healthy";
+  (void)edr_agent_update_get_runtime_info(&agent_update_info, agent_update_script, sizeof(agent_update_script));
   char lifecycle_runtime_identity[65];
   memset(lifecycle_runtime_identity, 0, sizeof(lifecycle_runtime_identity));
   int lifecycle_runtime_ready = edr_agent_lifecycle_runtime_identity(lifecycle_runtime_identity);
   const char *lifecycle_runtime = !windows_native ? "unavailable"
                                   : !lifecycle_policy ? "disabled"
                                   : lifecycle_runtime_ready ? "healthy" : "degraded";
+  snprintf(agent_update_info.runtime_identity_sha256, sizeof(agent_update_info.runtime_identity_sha256), "%s", lifecycle_runtime_identity);
+  char agent_update_manifest_fragment[1024];
+  if (edr_agent_update_manifest_fragment(&agent_update_info, agent_update_manifest_fragment,
+                                         sizeof(agent_update_manifest_fragment)) != 0) {
+    agent_update_manifest_fragment[0] = '\0';
+  }
   const char *ort_runtime = "unavailable";
   const char *http2_runtime = !http2_build ? "unavailable"
                               : !(http_rt && http_rt->http2_enabled) ? "disabled"
@@ -1773,10 +1774,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"targeted_forensic_process\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"targeted_forensic_registry\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"targeted_forensic_memory\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
-      "\"agent_update_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\","
-      "\"updater_source\":\"%s\",\"updater_version\":\"%s\",\"updater_sha256\":\"%s\","
-      "\"updater_protocol_version\":%d,\"updater_materialized\":%s,\"updater_error_code\":\"%s\","
-      "\"runtime_identity_sha256\":\"%s\"},"
+      "%s"
       "\"endpoint_lifecycle_v1\":{\"code_supported\":true,\"build_supported\":%s,"
       "\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"actions\":[\"restart\",\"offboard\",\"uninstall\"]},"
       "\"endpoint_uninstall_attestation_v1\":{\"code_supported\":true,\"build_supported\":%s,"
@@ -1834,14 +1832,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       windows_native ? "healthy" : (velo_policy ? "idle" : "unavailable"),
       dangerous_policy ? "true" : "false",
       dangerous_policy ? "true" : "false",
-      windows_native ? "true" : "false", agent_update_policy ? "true" : "false", agent_update_runtime,
-      agent_update_info.source[0] ? agent_update_info.source : "unavailable",
-      agent_update_info.version[0] ? agent_update_info.version : "unknown",
-      agent_update_info.sha256,
-      agent_update_info.protocol_version,
-      agent_update_info.materialized ? "true" : "false",
-      agent_update_info.error_code,
-      lifecycle_runtime_identity,
+      agent_update_manifest_fragment,
       windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
       windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);

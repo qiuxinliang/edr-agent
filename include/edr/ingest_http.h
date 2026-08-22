@@ -273,6 +273,12 @@ void edr_ingest_http_get_last_command_result_delivery_error(char *out, size_t ca
 int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,
                                           const char *sha256_hex, char *out_minio_key,
                                           size_t out_minio_key_cap);
+int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
+                                                      const char *upload_id,
+                                                      const char *file_path,
+                                                      const char *sha256_hex,
+                                                      char *out_minio_key,
+                                                      size_t out_minio_key_cap);
 
 /** HTTPS h2 control stream 优先；stream 不可用时由 long-poll 接管命令面。 */
 void edr_ingest_http_start_command_poll(void);

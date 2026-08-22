@@ -6442,7 +6442,7 @@ static long upload_max_mb(void) {
 }
 
 #ifdef EDR_HAVE_CURL_HTTP2
-static int curl_upload_multipart_file(const char *upload_id, const char *file_path,
+static int curl_upload_multipart_file(const char *command_id, const char *upload_id, const char *file_path,
                                       const char *sha256_hex, char *resp_body,
                                       size_t resp_body_cap) {
   char url[1400];
@@ -6482,6 +6482,9 @@ static int curl_upload_multipart_file(const char *upload_id, const char *file_pa
     return -2;
   }
   part = curl_mime_addpart(mime);
+	  curl_mime_name(part, "command_id");
+	  curl_mime_data(part, command_id && command_id[0] ? command_id : upload_id, CURL_ZERO_TERMINATED);
+	  part = curl_mime_addpart(mime);
   curl_mime_name(part, "upload_id");
   curl_mime_data(part, upload_id, CURL_ZERO_TERMINATED);
   if (s_endpoint[0]) {
@@ -6678,14 +6681,18 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
   return rc;
 }
 
-int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,
-                                          const char *sha256_hex, char *out_minio_key,
-                                          size_t out_minio_key_cap) {
+int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
+                                                      const char *upload_id,
+                                                      const char *file_path,
+                                                      const char *sha256_hex,
+                                                      char *out_minio_key,
+                                                      size_t out_minio_key_cap) {
   const char *boundary = "----edr-agent-upload-boundary-v1";
   const char *filename;
   FILE *file = NULL;
   size_t file_len = 0;
   char *uid = NULL;
+  char *cid = NULL;
   char *eid = NULL;
   char *sha = NULL;
   char *fname = NULL;
@@ -6740,7 +6747,8 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     int store_mtls_curl = curl_ssl_backend_is_schannel() && schannel_store_mtls_configured();
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "uploading_h2");
     resp[0] = '\0';
-    rc = curl_upload_multipart_file(upload_id, file_path, sha256_hex ? sha256_hex : "", resp, sizeof(resp));
+    rc = curl_upload_multipart_file(command_id, upload_id, file_path,
+	                                sha256_hex ? sha256_hex : "", resp, sizeof(resp));
     if (rc == 0) {
       note_http_request_success();
       note_upload_success();
@@ -6780,27 +6788,30 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   }
   filename = base_name_ptr(file_path);
   uid = json_escape_alloc(upload_id);
+  cid = json_escape_alloc(command_id ? command_id : upload_id);
   eid = json_escape_alloc(s_endpoint);
   sha = json_escape_alloc(sha256_hex ? sha256_hex : "");
   fname = json_escape_alloc(filename);
-  if (!uid || !eid || !sha || !fname) {
+  if (!uid || !cid || !eid || !sha || !fname) {
     fclose(file);
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_build");
     note_upload_failure();
     free(uid);
+    free(cid);
     free(eid);
     free(sha);
     free(fname);
     return -1;
   }
   snprintf(pre, sizeof(pre),
+           "--%s\r\nContent-Disposition: form-data; name=\"command_id\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"upload_id\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"endpoint_id\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"sha256\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"file_name\"\r\n\r\n%s\r\n"
            "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
            "Content-Type: application/octet-stream\r\n\r\n",
-           boundary, uid, boundary, eid, boundary, sha, boundary, fname, boundary, fname);
+           boundary, cid, boundary, uid, boundary, eid, boundary, sha, boundary, fname, boundary, fname);
   snprintf(post, sizeof(post), "\r\n--%s--\r\n", boundary);
   snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
   {
@@ -6809,6 +6820,7 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
     if (multipart_body_sha256(file, pre, pre_len, post, post_len, multipart_sha256) != 0) {
       fclose(file);
       free(uid);
+      free(cid);
       free(eid);
       free(sha);
       free(fname);
@@ -6842,10 +6854,19 @@ int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *fil
   }
   fclose(file);
   free(uid);
+  free(cid);
   free(eid);
   free(sha);
   free(fname);
   return rc;
+}
+
+int edr_ingest_http_upload_file_multipart(const char *upload_id, const char *file_path,
+                                          const char *sha256_hex, char *out_minio_key,
+                                          size_t out_minio_key_cap) {
+  return edr_ingest_http_upload_file_multipart_for_command(upload_id, upload_id, file_path,
+                                                           sha256_hex, out_minio_key,
+                                                           out_minio_key_cap);
 }
 
 static int poll_dispatch_one(const char *obj) {

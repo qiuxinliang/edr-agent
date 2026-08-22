@@ -77,6 +77,8 @@ add_executable(test_agent_update_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/agent_update_command.c
   ${CMAKE_SOURCE_DIR}/src/command/agent_update_event.c
+  ${CMAKE_SOURCE_DIR}/src/command/full_installer_readiness.c
+  ${CMAKE_SOURCE_DIR}/src/command/full_installer_windows_identity.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
@@ -85,6 +87,9 @@ target_include_directories(test_agent_update_contract PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 if(NOT WIN32)
   target_compile_definitions(test_agent_update_contract PRIVATE EDR_OS_POSIX=1)
+else()
+  target_link_libraries(test_agent_update_contract PRIVATE
+    advapi32 shell32 ole32 oleaut32 uuid taskschd)
 endif()
 edr_apply_common_warnings(test_agent_update_contract)
 add_test(NAME agent_update_command_contract COMMAND test_agent_update_contract)
@@ -280,6 +285,51 @@ set(_edr_test_ave_sdk_sources
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
 )
+
+add_executable(test_full_installer_readiness
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_full_installer_readiness.c
+  ${CMAKE_SOURCE_DIR}/src/command/full_installer_readiness.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_manifest.c
+)
+target_include_directories(test_full_installer_readiness PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME full_installer_readiness_core COMMAND test_full_installer_readiness)
+
+add_executable(generate_agent_update_manifest
+  ${CMAKE_CURRENT_SOURCE_DIR}/generate_agent_update_manifest.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_command.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_event.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_manifest.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(generate_agent_update_manifest PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(NOT WIN32)
+  target_compile_definitions(generate_agent_update_manifest PRIVATE EDR_OS_POSIX=1)
+endif()
+edr_apply_common_warnings(generate_agent_update_manifest)
+add_test(NAME agent_update_manifest_fixture_check COMMAND generate_agent_update_manifest
+  --check ${CMAKE_SOURCE_DIR}/tests/testdata/agent_update_v1_manifest_fixture.json)
+
+add_executable(test_full_installer_windows_identity
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_full_installer_windows_identity.c
+  ${CMAKE_SOURCE_DIR}/src/command/full_installer_windows_identity.c
+)
+target_include_directories(test_full_installer_windows_identity PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME full_installer_windows_identity_contract COMMAND test_full_installer_windows_identity)
+
+add_executable(test_full_installer_windows_adapter
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_full_installer_windows_adapter.c
+  ${CMAKE_SOURCE_DIR}/src/command/full_installer_readiness.c
+  ${CMAKE_SOURCE_DIR}/src/command/full_installer_windows_identity.c)
+target_include_directories(test_full_installer_windows_adapter PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_common_warnings(test_full_installer_windows_adapter)
+if(WIN32)
+  add_test(NAME full_installer_windows_adapter_snapshot COMMAND test_full_installer_windows_adapter)
+else()
+  set_target_properties(test_full_installer_windows_adapter PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
 # 与 `edr_agent` 一致：`ave_behavior_pipeline` → `edr_behavior_alert_emit_to_batch` 的依赖链
 set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c

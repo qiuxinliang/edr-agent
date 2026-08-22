@@ -452,12 +452,15 @@ static char *json_escape_alloc_cmd(const char *s) {
   return out;
 }
 
-static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
-                         int exit_code, const char *detail, const char *response_status,
-                         const char *artifacts) {
+static void soar_emit_ex_policy(const char *cmd_id, const EdrSoarCommandMeta *sm,
+                                EdrCommandExecutionStatus st, int exit_code,
+                                const char *detail, const char *response_status,
+                                const char *artifacts,
+                                int authoritative_terminal_acked) {
   char cancel_detail[1536];
-  if (cmd_id && edr_command_cancel_requested(cmd_id) && exit_code != 130 &&
-      (!response_status || strcmp(response_status, "cancelled") != 0)) {
+  if (cmd_id && edr_command_cancel_requested(cmd_id) &&
+      edr_command_terminal_allows_cancel_override(
+          authoritative_terminal_acked, exit_code, response_status)) {
     snprintf(cancel_detail, sizeof(cancel_detail),
              "cancellation requested while action was running; backend returned status=%s exit=%d detail=%.1200s",
              response_status_label(st), exit_code, detail ? detail : "");
@@ -541,6 +544,14 @@ static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCo
   free(raw);
   free(err);
   free(detail_json);
+}
+
+static void soar_emit_ex(const char *cmd_id, const EdrSoarCommandMeta *sm,
+                         EdrCommandExecutionStatus st, int exit_code,
+                         const char *detail, const char *response_status,
+                         const char *artifacts) {
+  soar_emit_ex_policy(cmd_id, sm, st, exit_code, detail, response_status,
+                      artifacts, 0);
 }
 
 static void soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st,
@@ -5258,10 +5269,19 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
         /* Stage and task lifecycle data is delivered only through the durable
          * upgrade-event outbox. The command result is an ACK-gated transport
          * terminal and deliberately carries no task-event detail. */
-        soar_emit_ex(inbox[i].command_id, &inbox[i].meta,
-                     recovery.succeeded ? EdrCmdExecOk : EdrCmdExecFailed,
-                     recovery.exit_code, "agent update terminal event acknowledged",
-                     recovery.succeeded ? "ok" : "failed", NULL);
+        /* The server has already accepted the journal terminal event.  A cancel
+         * request that arrives after that acknowledgement is stale and must not
+         * rewrite the command result to cancelled, otherwise task and command
+         * terminals diverge and first-terminal-wins reconciliation conflicts. */
+        soar_emit_ex_policy(
+            inbox[i].command_id, &inbox[i].meta,
+            recovery.succeeded ? EdrCmdExecOk : EdrCmdExecFailed,
+            recovery.exit_code, "agent update terminal event acknowledged",
+            recovery.succeeded ? "ok" : "failed",
+            recovery.installer_artifact_json[0]
+                ? recovery.installer_artifact_json
+                : NULL,
+            1);
         edr_command_cancel_end(inbox[i].command_id);
         work_done = 1;
         break;

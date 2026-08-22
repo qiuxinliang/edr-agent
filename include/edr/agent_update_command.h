@@ -21,6 +21,11 @@ typedef struct EdrAgentUpdateRuntimeInfo {
   char version[65];
   char sha256[65];
   char error_code[64];
+  int full_installer_ready;
+  char full_installer_reason[96];
+  char installation_family[32];
+  char installation_baseline[65];
+  char runtime_identity_sha256[65];
 } EdrAgentUpdateRuntimeInfo;
 
 typedef struct EdrAgentUpdateRecovery {
@@ -37,7 +42,23 @@ typedef struct EdrAgentUpdateRecovery {
   int succeeded;
   int exit_code;
   int terminal_event_acked;
+  char installer_log_file[260];
+  char installer_log_sha256[65];
+  uint64_t installer_log_size;
+  uint64_t installer_log_original_size;
+  char installer_log_evidence_id[160];
+  char installer_log_storage_key[512];
+  char installer_evidence_status[32];
+  char installer_artifact_json[2048];
 } EdrAgentUpdateRecovery;
+
+typedef int (*EdrAgentUpdateRecoveryUploadFn)(
+    const char *command_id, const char *upload_id, const char *file_path,
+    const char *sha256_hex, char *out_storage_key,
+    size_t out_storage_key_cap, void *user);
+
+typedef int (*EdrAgentUpdateRecoveryFlushFn)(
+    const char *outbox_dir, uint64_t *last_acked_seq, void *user);
 
 typedef struct EdrAgentUpdateRequest {
   char schema[32];
@@ -77,12 +98,23 @@ int edr_agent_update_journal_blocks_replacement(const char *stage);
 int edr_agent_update_parse_journal(const char *json, EdrAgentUpdateRecovery *out);
 int edr_agent_update_get_runtime_info(EdrAgentUpdateRuntimeInfo *info,
                                       char *script_path, size_t script_path_cap);
+/* Executes the real platform adapters (filesystem, uninstall registry and
+ * SCM/Task Scheduler identity) used by the manifest producer. */
+int edr_agent_update_probe_full_installer_baseline(
+    const char *installation_directory, char *reason, size_t reason_cap);
 int edr_agent_update_resolve_script_path(char *out, size_t out_cap);
 int edr_agent_update_create_directories(const char *path);
 int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
                              size_t payload_len, char *detail, size_t detail_cap);
 int edr_agent_update_recover(const char *command_id, const uint8_t *payload,
                              size_t payload_len, EdrAgentUpdateRecovery *out);
+/* Production recovery ordering boundary.  Installer evidence is uploaded and
+ * durably indexed before terminal events may be flushed.  The callback form
+ * keeps the safety sequence directly testable without duplicating it. */
+int edr_agent_update_finalize_recovery(
+    EdrAgentUpdateRecovery *recovery, const char *installer_log_path,
+    const char *event_outbox_dir, EdrAgentUpdateRecoveryUploadFn upload,
+    EdrAgentUpdateRecoveryFlushFn flush, void *user);
 
 #ifdef __cplusplus
 }
