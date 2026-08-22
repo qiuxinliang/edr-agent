@@ -18,6 +18,7 @@
 #include "edr/command_executor.h"
 #include "edr/command_registry.h"
 #include "edr/command_state.h"
+#include "edr/command_signature.h"
 #include "edr/command_util.h"
 #include "edr/deep_collector.h"
 #include "edr/ave.h"
@@ -5158,396 +5159,6 @@ static void do_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, cons
   edr_response_pmfe_scan(cmd_id, pl, len, sm);
 }
 
-static void hex_from_bytes(const uint8_t *in, size_t len, char *out, size_t cap) {
-  static const char *hx = "0123456789abcdef";
-  if (!out || cap == 0u) {
-    return;
-  }
-  size_t o = 0;
-  for (size_t i = 0; i < len && o + 2u < cap; i++) {
-    out[o++] = hx[in[i] >> 4];
-    out[o++] = hx[in[i] & 15u];
-  }
-  out[o] = 0;
-}
-
-static void hmac_sha256_hex(const char *key, const uint8_t *data, size_t len, char out65[65]) {
-  uint8_t key_block[64];
-  uint8_t digest[EDR_SHA256_DIGEST_LEN];
-  uint8_t ipad[64];
-  uint8_t opad[64];
-  memset(key_block, 0, sizeof(key_block));
-  if (!key) {
-    key = "";
-  }
-  size_t key_len = strlen(key);
-  if (key_len > sizeof(key_block)) {
-    EdrSha256Ctx kh;
-    edr_sha256_init(&kh);
-    edr_sha256_update(&kh, (const uint8_t *)key, key_len);
-    edr_sha256_final(&kh, key_block);
-  } else if (key_len > 0u) {
-    memcpy(key_block, key, key_len);
-  }
-  for (size_t i = 0; i < sizeof(key_block); i++) {
-    ipad[i] = key_block[i] ^ 0x36u;
-    opad[i] = key_block[i] ^ 0x5cu;
-  }
-  EdrSha256Ctx inner;
-  edr_sha256_init(&inner);
-  edr_sha256_update(&inner, ipad, sizeof(ipad));
-  edr_sha256_update(&inner, data, len);
-  edr_sha256_final(&inner, digest);
-
-  EdrSha256Ctx outer;
-  edr_sha256_init(&outer);
-  edr_sha256_update(&outer, opad, sizeof(opad));
-  edr_sha256_update(&outer, digest, sizeof(digest));
-  edr_sha256_final(&outer, digest);
-  hex_from_bytes(digest, sizeof(digest), out65, 65u);
-}
-
-static int command_signature_extract_sigv1(const char *idempotency_key, char sig65[65]) {
-  if (!idempotency_key || !sig65) {
-    return 0;
-  }
-  const char *mark = strstr(idempotency_key, "|sigv1|");
-  if (!mark) {
-    return 0;
-  }
-  const char *keyid = mark + strlen("|sigv1|");
-  const char *bar = strchr(keyid, '|');
-  if (!bar || strlen(bar + 1) != 64u) {
-    return 0;
-  }
-  for (size_t i = 0; i < 64u; i++) {
-    char c = bar[1 + i];
-    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-      return 0;
-    }
-    sig65[i] = (char)tolower((unsigned char)c);
-  }
-  sig65[64] = 0;
-  return 1;
-}
-
-static int b64url_value(unsigned char c) {
-  if (c >= 'A' && c <= 'Z') return (int)(c - 'A');
-  if (c >= 'a' && c <= 'z') return (int)(c - 'a' + 26);
-  if (c >= '0' && c <= '9') return (int)(c - '0' + 52);
-  if (c == '-') return 62;
-  if (c == '_') return 63;
-  return -1;
-}
-
-static int b64url_decode_raw(const char *s, uint8_t *out, size_t out_cap, size_t *out_len) {
-  if (!s || !out || !out_len) {
-    return -1;
-  }
-  uint32_t acc = 0;
-  unsigned bits = 0;
-  size_t o = 0;
-  for (; *s; s++) {
-    if (*s == '=') {
-      break;
-    }
-    int v = b64url_value((unsigned char)*s);
-    if (v < 0) {
-      return -1;
-    }
-    acc = (acc << 6) | (uint32_t)v;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      if (o >= out_cap) {
-        return -1;
-      }
-      out[o++] = (uint8_t)((acc >> bits) & 0xffu);
-    }
-  }
-  *out_len = o;
-  return 0;
-}
-
-static int command_signature_extract_sigv2(const char *idempotency_key, char *alg, size_t alg_cap,
-                                           uint8_t *sig, size_t sig_cap, size_t *sig_len) {
-  if (!idempotency_key || !alg || alg_cap == 0u || !sig || !sig_len) {
-    return 0;
-  }
-  const char *mark = strstr(idempotency_key, "|sigv2|");
-  if (!mark) {
-    return 0;
-  }
-  const char *algp = mark + strlen("|sigv2|");
-  const char *bar1 = strchr(algp, '|');
-  if (!bar1 || bar1 == algp) {
-    return 0;
-  }
-  size_t alg_len = (size_t)(bar1 - algp);
-  if (alg_len >= alg_cap) {
-    alg_len = alg_cap - 1u;
-  }
-  memcpy(alg, algp, alg_len);
-  alg[alg_len] = '\0';
-  const char *keyid = bar1 + 1;
-  const char *bar2 = strchr(keyid, '|');
-  if (!bar2 || bar2 == keyid || !bar2[1]) {
-    return 0;
-  }
-  if (b64url_decode_raw(bar2 + 1, sig, sig_cap, sig_len) != 0) {
-    return 0;
-  }
-  return *sig_len > 0u;
-}
-
-static void normalize_pem_newlines(char *s) {
-  if (!s) {
-    return;
-  }
-  char *r = s;
-  char *w = s;
-  while (*r) {
-    if (r[0] == '\\' && r[1] == 'n') {
-      *w++ = '\n';
-      r += 2;
-    } else {
-      *w++ = *r++;
-    }
-  }
-  *w = '\0';
-}
-
-static int read_text_file_small(const char *path, char *out, size_t cap) {
-  if (!path || !path[0] || !out || cap < 2u) {
-    return -1;
-  }
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    return -1;
-  }
-  size_t n = fread(out, 1, cap - 1u, f);
-  fclose(f);
-  out[n] = '\0';
-  return n > 0u ? 0 : -1;
-}
-
-static int read_command_public_key_path(const char *path, char *out, size_t cap) {
-  if (!path || !path[0]) {
-    return -1;
-  }
-  if (read_text_file_small(path, out, cap) == 0) {
-    return 0;
-  }
-#ifdef _WIN32
-  {
-    const char *legacy = "\\EDR Agent\\";
-    const char *p = strstr(path, legacy);
-    if (p) {
-      char alt[1024];
-      size_t prefix_len = (size_t)(p - path);
-      int n = snprintf(alt, sizeof(alt), "%.*s\\FDSecurity\\%s",
-                       (int)prefix_len, path, p + strlen(legacy));
-      if (n > 0 && (size_t)n < sizeof(alt) &&
-          read_text_file_small(alt, out, cap) == 0) {
-        return 0;
-      }
-    }
-  }
-#endif
-  return -1;
-}
-
-static int command_public_key_pem(char *out, size_t cap) {
-  if (!out || cap < 2u) {
-    return 0;
-  }
-  out[0] = '\0';
-  const char *inline_pem = getenv("EDR_COMMAND_SIGNING_PUBLIC_KEY");
-  if (!inline_pem || !inline_pem[0]) {
-    inline_pem = getenv("EDR_COMMAND_VERIFY_PUBLIC_KEY");
-  }
-  if (inline_pem && inline_pem[0]) {
-    snprintf(out, cap, "%s", inline_pem);
-    normalize_pem_newlines(out);
-    return out[0] != '\0';
-  }
-  const char *path = getenv("EDR_COMMAND_SIGNING_PUBLIC_KEY_PATH");
-  if (!path || !path[0]) {
-    path = getenv("EDR_COMMAND_VERIFY_PUBLIC_KEY_PATH");
-  }
-  if (path && path[0] && read_command_public_key_path(path, out, cap) == 0) {
-    normalize_pem_newlines(out);
-    return 1;
-  }
-  if (edr_command_get_config() && edr_command_get_config()->command.signing_public_key_pem[0]) {
-    snprintf(out, cap, "%s", edr_command_get_config()->command.signing_public_key_pem);
-    normalize_pem_newlines(out);
-    return out[0] != '\0';
-  }
-  if (edr_command_get_config() && edr_command_get_config()->command.signing_public_key_path[0] &&
-      read_command_public_key_path(edr_command_get_config()->command.signing_public_key_path, out, cap) == 0) {
-    normalize_pem_newlines(out);
-    return 1;
-  }
-  return 0;
-}
-
-static int command_verify_ed25519_pem(const char *public_key_pem, const uint8_t *msg, size_t msg_len,
-                                      const uint8_t *sig, size_t sig_len) {
-#ifdef EDR_HAVE_COMMAND_SIGNATURE_OPENSSL
-  if (!public_key_pem || !public_key_pem[0] || !msg || !sig || sig_len == 0u) {
-    return 0;
-  }
-  BIO *bio = BIO_new_mem_buf(public_key_pem, -1);
-  if (!bio) {
-    return 0;
-  }
-  EVP_PKEY *pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-  BIO_free(bio);
-  if (!pkey) {
-    return 0;
-  }
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  int ok = 0;
-  if (ctx && EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
-      EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len) == 1) {
-    ok = 1;
-  }
-  if (ctx) {
-    EVP_MD_CTX_free(ctx);
-  }
-  EVP_PKEY_free(pkey);
-  return ok;
-#else
-  (void)public_key_pem;
-  (void)msg;
-  (void)msg_len;
-  (void)sig;
-  (void)sig_len;
-  return -1;
-#endif
-}
-
-static void command_signature_idempotency_value(const char *idempotency_key, char *out, size_t cap) {
-  if (!out || cap == 0u) {
-    return;
-  }
-  out[0] = '\0';
-  if (!idempotency_key || !idempotency_key[0]) {
-    return;
-  }
-  const char *mark = strstr(idempotency_key, "|sigv1|");
-  const char *mark2 = strstr(idempotency_key, "|sigv2|");
-  if (!mark || (mark2 && mark2 < mark)) {
-    mark = mark2;
-  }
-  size_t n = mark ? (size_t)(mark - idempotency_key) : strlen(idempotency_key);
-  if (n >= cap) {
-    n = cap - 1u;
-  }
-  memcpy(out, idempotency_key, n);
-  out[n] = '\0';
-}
-
-static int command_signature_verify(const char *cmd_id, const char *cmd_type, const uint8_t *payload,
-                                    size_t payload_len, const EdrSoarCommandMeta *sm,
-                                    int internal_trusted, char *reason, size_t reason_cap) {
-  int required = internal_trusted ? 0 :
-      edr_command_contract_signature_required(cmd_id, cmd_type);
-  if (required && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
-    snprintf(reason, reason_cap, "signed external command requires issued_at_unix_ms and deadline_ms");
-    return 0;
-  }
-  if (required) {
-    int64_t now_ms = command_now_ms();
-    uint32_t max_future_skew_ms = command_u32_env_clamped(
-        "EDR_COMMAND_MAX_FUTURE_SKEW_MS", 300000u, 1000u, 3600000u);
-    if (sm->issued_at_unix_ms > now_ms + (int64_t)max_future_skew_ms) {
-      snprintf(reason, reason_cap, "command issued_at_unix_ms is too far in the future");
-      return 0;
-    }
-  }
-
-  char idem[512];
-  command_signature_idempotency_value(sm ? sm->idempotency_key : NULL, idem, sizeof(idem));
-  if (required && !idem[0]) {
-    snprintf(reason, reason_cap, "missing idempotency key");
-    return 0;
-  }
-  char payload_hash[65];
-  (void)edr_sha256_hex(payload ? payload : (const uint8_t *)"", payload_len, payload_hash);
-  char canonical[1024];
-  snprintf(canonical, sizeof(canonical), "%s\n%s\n%s\n%lld\n%u\n%s",
-           cmd_id ? cmd_id : "", cmd_type ? cmd_type : "",
-           idem,
-           (long long)(sm ? sm->issued_at_unix_ms : 0), (unsigned)(sm ? sm->deadline_ms : 0),
-           payload_hash);
-
-  char alg[32];
-  uint8_t sig2[96];
-  size_t sig2_len = 0u;
-  if (command_signature_extract_sigv2(sm ? sm->idempotency_key : NULL, alg, sizeof(alg),
-                                      sig2, sizeof(sig2), &sig2_len)) {
-    if (strcmp(alg, "ed25519") != 0) {
-      snprintf(reason, reason_cap, "unsupported command signature algorithm: %s", alg);
-      return 0;
-    }
-    if (sig2_len != 64u) {
-      snprintf(reason, reason_cap, "invalid command sigv2 signature length");
-      return 0;
-    }
-    char public_key_pem[4096];
-    if (!command_public_key_pem(public_key_pem, sizeof(public_key_pem))) {
-      snprintf(reason, reason_cap, "command sigv2 public key missing");
-      return 0;
-    }
-    int ok = command_verify_ed25519_pem(public_key_pem, (const uint8_t *)canonical,
-                                        strlen(canonical), sig2, sig2_len);
-    if (ok == -1) {
-      snprintf(reason, reason_cap, "command sigv2 requires OpenSSL verification support");
-      return 0;
-    }
-    if (!ok) {
-      snprintf(reason, reason_cap, "invalid command sigv2 signature");
-      return 0;
-    }
-    return 1;
-  }
-
-  char configured_public_key[4096];
-  int has_public_key = command_public_key_pem(configured_public_key, sizeof(configured_public_key));
-  const char *accept_legacy = getenv("EDR_COMMAND_ACCEPT_LEGACY_HMAC");
-  if (required && has_public_key && !(accept_legacy && accept_legacy[0] == '1')) {
-    snprintf(reason, reason_cap, "missing command sigv2 signature");
-    return 0;
-  }
-
-  const char *key = getenv("EDR_COMMAND_SIGNING_KEY");
-  if ((!key || !key[0]) && !required) {
-    return 1;
-  }
-  if (!key || !key[0]) {
-    snprintf(reason, reason_cap, "command signature required but no sigv2 public key or EDR_COMMAND_SIGNING_KEY configured");
-    return 0;
-  }
-
-  char got[65];
-  if (!command_signature_extract_sigv1(sm ? sm->idempotency_key : NULL, got)) {
-    if (required) {
-      snprintf(reason, reason_cap, "missing command signature");
-      return 0;
-    }
-    return 1;
-  }
-  char want[65];
-  hmac_sha256_hex(key, (const uint8_t *)canonical, strlen(canonical), want);
-  if (strcmp(got, want) != 0) {
-    snprintf(reason, reason_cap, "invalid command signature");
-    return 0;
-  }
-  return 1;
-}
-
 static int64_t command_now_ms(void) {
   return (int64_t)time(NULL) * 1000LL;
 }
@@ -5583,6 +5194,26 @@ static int command_lane_filter(const char *command_type, void *user) {
   return lane < 0 || (int)edr_command_registry_execution_lane(command_type) == lane;
 }
 
+static int command_signature_policy_for(const char *cmd_id, const char *cmd_type,
+                                        const EdrSoarCommandMeta *sm, int internal_trusted,
+                                        CommandSignaturePolicy *out, char *reason, size_t reason_cap) {
+  int required = internal_trusted ? 0 : edr_command_contract_signature_required(cmd_id, cmd_type);
+  if (out) out->required = required;
+  if (required && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
+    snprintf(reason, reason_cap, "signed external command requires issued_at_unix_ms and deadline_ms");
+    return 0;
+  }
+  if (required) {
+    int64_t now_ms = command_now_ms();
+    uint32_t max_future_skew_ms = command_u32_env_clamped("EDR_COMMAND_MAX_FUTURE_SKEW_MS", 300000u, 1000u, 3600000u);
+    if (sm->issued_at_unix_ms > now_ms + (int64_t)max_future_skew_ms) {
+      snprintf(reason, reason_cap, "command issued_at_unix_ms is too far in the future");
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
   EdrCommandInboxRecord inbox[16];
   memset(inbox, 0, sizeof(inbox));
@@ -5599,9 +5230,18 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
     sig_reason[0] = '\0';
     int internal_trusted = strncmp(inbox[i].command_id, "auto-", 5u) == 0 &&
                            strcmp(inbox[i].meta.initiated_by, "agent_auto") == 0;
-    if (!command_signature_verify(inbox[i].command_id, inbox[i].command_type,
+    CommandSignaturePolicy signature_policy;
+    if (!command_signature_policy_for(inbox[i].command_id, inbox[i].command_type, &inbox[i].meta,
+                                       internal_trusted, &signature_policy, sig_reason, sizeof(sig_reason))) {
+      audit_both(inbox[i].command_id, sig_reason);
+      soar_emit(inbox[i].command_id, &inbox[i].meta, EdrCmdExecRejected, 15, sig_reason);
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
+    }
+    if (!edr_command_signature_verify(inbox[i].command_id, inbox[i].command_type,
                                   inbox[i].payload, inbox[i].payload_len,
-                                  &inbox[i].meta, internal_trusted,
+                                  &inbox[i].meta, &signature_policy,
                                   sig_reason, sizeof(sig_reason))) {
       audit_both(inbox[i].command_id, sig_reason[0] ? sig_reason : "persisted command signature rejected");
       soar_emit(inbox[i].command_id, &inbox[i].meta, EdrCmdExecRejected, 15,
@@ -6447,7 +6087,15 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
 
   char sig_reason[160];
   sig_reason[0] = 0;
-  if (!command_signature_verify(id, t, payload, payload_len, sm, internal_trusted,
+  CommandSignaturePolicy signature_policy;
+  if (!command_signature_policy_for(id, t, sm, internal_trusted, &signature_policy,
+                                    sig_reason, sizeof(sig_reason))) {
+    s_rejected++;
+    audit_both(id, sig_reason[0] ? sig_reason : "command signature policy rejected");
+    soar_emit(id, sm, EdrCmdExecRejected, 15, sig_reason[0] ? sig_reason : "command signature policy rejected");
+    return 0;
+  }
+  if (!edr_command_signature_verify(id, t, payload, payload_len, sm, &signature_policy,
                                 sig_reason, sizeof(sig_reason))) {
     s_rejected++;
     audit_both(id, sig_reason[0] ? sig_reason : "command signature rejected");

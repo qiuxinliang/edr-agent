@@ -1,5 +1,36 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+add_executable(test_command_signature_cross_language
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_command_signature_cross_language.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_signature.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_signature_helpers.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/testdata/command_sigv2_fixture.json
+  ${CMAKE_CURRENT_BINARY_DIR}/command_sigv2_fixture.json
+  COPYONLY)
+target_include_directories(test_command_signature_cross_language PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_command_signature_cross_language)
+target_compile_definitions(test_command_signature_cross_language PRIVATE EDR_HAVE_OPENSSL_HTTP=1)
+if(OPENSSL_FOUND)
+  target_link_libraries(test_command_signature_cross_language PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+add_test(NAME command_signature_cross_language COMMAND test_command_signature_cross_language
+  ${CMAKE_CURRENT_BINARY_DIR}/command_sigv2_fixture.json
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_response_capability_manifest
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_response_capability_manifest.c
+  ${CMAKE_SOURCE_DIR}/src/core/response_capability_manifest.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_response_capability_manifest PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_common_warnings(test_response_capability_manifest)
+add_test(NAME response_capability_manifest_contract COMMAND test_response_capability_manifest
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_executable(test_shell_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_policy.c
   ${CMAKE_SOURCE_DIR}/src/command/shell_exec.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)

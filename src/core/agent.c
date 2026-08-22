@@ -26,6 +26,7 @@
 #include "edr/collector.h"
 #include "edr/command.h"
 #include "edr/command_executor.h"
+#include "edr/response_capability_manifest.h"
 #include "edr/agent_update_command.h"
 #include "edr/agent_lifecycle_command.h"
 #include "edr/ingest_http.h"
@@ -1612,6 +1613,13 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   int dangerous_policy = (agent && agent->cfg.command.allow_dangerous) ||
                          (command_enabled_env && command_enabled_env[0] == '1') ||
                          (command_dangerous_env && command_dangerous_env[0] == '1');
+  const int response_command_build = windows_native || inventory_native;
+  char response_command_capability[1024];
+  if (edr_response_capability_manifest_json(response_command_build, dangerous_policy,
+                                            response_command_capability,
+                                            sizeof(response_command_capability)) < 0) {
+    response_command_capability[0] = '\0';
+  }
   const char *lifecycle_enabled_env = getenv("EDR_LIFECYCLE_MAINTENANCE_ENABLED");
   int lifecycle_policy = windows_native && agent && agent->cfg.command.allow_lifecycle_maintenance;
   if (lifecycle_enabled_env && lifecycle_enabled_env[0] == '1') lifecycle_policy = windows_native;
@@ -1754,6 +1762,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "%s"
       "\"command_signing\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}},"
       "\"commands\":{"
+      "%s"
       "\"rtq_execute\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
       "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
@@ -1815,6 +1824,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       velo_rt.detail[0] ? velo_rt.detail : "unknown",
       artifact_upload_capability,
       signing_build ? "true" : "false", signing_policy ? "true" : "false", signing_runtime,
+      response_command_capability,
       rtq_policy ? "true" : "false",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",

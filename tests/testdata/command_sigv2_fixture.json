@@ -1,0 +1,9 @@
+{
+  "command_id": "fixture-command-001",
+  "command_type": "isolate_host",
+  "deadline_ms": 300000,
+  "idempotency_key": "fixture-idem-001|sigv2|ed25519|fixture|A2YPHtpbCkXHNjFC8CuShnWfBuBuO6Zzl8ILYoF2UtOJ0bhojFGrFOxfqm-LM2Ti4OQJdc6TgCKWLD_9lKIoDQ",
+  "issued_at_unix_ms": 1700000000123,
+  "payload": "eyJlbmRwb2ludF9pZCI6ImZpeHR1cmUtZW5kcG9pbnQiLCJ0ZW5hbnRfaWQiOiJmaXh0dXJlLXRlbmFudCJ9",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=\n-----END PUBLIC KEY-----\n"
+}

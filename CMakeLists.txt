@@ -267,6 +267,7 @@ endif()
 set(EDR_AGENT_SOURCES
   src/main.c
   src/core/agent.c
+  src/core/response_capability_manifest.c
   src/core/edr_log.c
   src/core/event_bus.c
   src/core/time_util.c
@@ -310,6 +311,8 @@ set(EDR_AGENT_SOURCES
   src/storage/queue_sqlite.c
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
+  src/command/command_signature.c
+  src/command/command_signature_helpers.c
   src/command/forensic_result_contract.c
   src/command/command_cancel.c
   src/command/command_contract.c
