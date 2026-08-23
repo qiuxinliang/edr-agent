@@ -184,6 +184,8 @@ var
   EdrCmdKeepOfflineQueue: Boolean;
   EdrCmdKeepEvidenceCache: Boolean;
   EdrCmdUpgradeExisting: Boolean;
+  EdrCmdRepairBaseline: Boolean;
+  EdrCmdRepairBackupDir: string;
   EdrInstallFailed: Boolean;
   EdrFailureReason: string;
   EdrDiagnosticsDir: string;
@@ -258,12 +260,12 @@ end;
 
 function ShouldKeepOfflineQueue: Boolean;
 begin
-  Result := EdrCmdUpgradeExisting or EdrCmdKeepOfflineQueue or WizardIsTaskSelected('keepofflinequeue');
+  Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepOfflineQueue or WizardIsTaskSelected('keepofflinequeue');
 end;
 
 function ShouldKeepEvidenceCache: Boolean;
 begin
-  Result := EdrCmdUpgradeExisting or EdrCmdKeepEvidenceCache or WizardIsTaskSelected('keepevidencecache');
+  Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepEvidenceCache or WizardIsTaskSelected('keepevidencecache');
 end;
 
 procedure EdrLoadCmdlineEnroll;
@@ -284,6 +286,8 @@ begin
   EdrCmdKeepOfflineQueue := EdrParseTruthyParam('/EDR_KEEP_OFFLINE_QUEUE', '/KEEPQ');
   EdrCmdKeepEvidenceCache := EdrParseTruthyParam('/EDR_KEEP_EVIDENCE_CACHE', '/KEEPE');
   EdrCmdUpgradeExisting := EdrParseTruthyParam('/EDR_UPGRADE_EXISTING', '/UPGRADEEXISTING');
+  EdrCmdRepairBaseline := EdrParseTruthyParam('/EDR_REPAIR_BASELINE', '/REPAIRBASELINE');
+  EdrCmdRepairBackupDir := Trim(EdrCmdLineParamValue('/EDR_REPAIR_BACKUP_DIR'));
 end;
 
 function EdrHasCmdlineEnroll: Boolean;
@@ -293,7 +297,7 @@ end;
 
 function ShouldReconcileRuntimeDlls: Boolean;
 begin
-  Result := EdrCmdUpgradeExisting;
+  Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline;
 end;
 
 function InitializeSetup(): Boolean;
@@ -314,12 +318,26 @@ begin
   EdrCmdKeepOfflineQueue := False;
   EdrCmdKeepEvidenceCache := False;
   EdrCmdUpgradeExisting := False;
+  EdrCmdRepairBaseline := False;
+  EdrCmdRepairBackupDir := '';
   EdrLoadCmdlineEnroll;
-  if EdrCmdUpgradeExisting then
+  if EdrCmdUpgradeExisting and EdrCmdRepairBaseline then
+  begin
+    MsgBox('EDR: choose either existing-install upgrade or baseline repair, not both.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  if EdrCmdRepairBaseline and (EdrCmdRepairBackupDir = '') then
+  begin
+    MsgBox('EDR: baseline repair requires /EDR_REPAIR_BACKUP_DIR with the immutable updater backup.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  if EdrCmdUpgradeExisting or EdrCmdRepairBaseline then
   begin
     if EdrHasCmdlineEnroll then
     begin
-      MsgBox('EDR: existing-install upgrade preserves endpoint identity and must not include enrollment parameters.', mbError, MB_OK);
+      MsgBox('EDR: existing-install upgrade or repair preserves endpoint identity and must not include enrollment parameters.', mbError, MB_OK);
       Result := False;
       Exit;
     end;
@@ -451,6 +469,29 @@ begin
   // proves this is a completed GUI installation; a leftover directory without
   // unins000.exe is an incomplete install and remains eligible for cleanup.
   EdrHadExistingInstallation := FileExists(AppDir + '\unins000.exe');
+  if EdrCmdRepairBaseline then
+  begin
+    if EdrHadExistingInstallation or FileExists(AppDir + '\unins000.dat') then
+    begin
+      Result := 'EDR: baseline repair only accepts an installation with both Inno uninstaller files absent.';
+      Exit;
+    end;
+    if not FileExists(AppDir + '\agent.toml') or not FileExists(AppDir + '\FDSensor.exe') then
+    begin
+      Result := 'EDR: baseline repair requires the existing protected Agent and agent.toml.';
+      Exit;
+    end;
+    if not FileExists(EdrCmdRepairBackupDir + '\agent.toml') or
+       not FileExists(EdrCmdRepairBackupDir + '\FDSensor.exe') then
+    begin
+      Result := 'EDR: baseline repair backup is incomplete; refusing to modify the existing Agent.';
+      Exit;
+    end;
+    // Treat the protected legacy installation as existing so a later workflow
+    // failure never invokes the new-install destructive cleanup. The parent
+    // updater owns restoration from EdrCmdRepairBackupDir.
+    EdrHadExistingInstallation := True;
+  end;
   if EdrCmdUpgradeExisting then
   begin
     if not EdrHadExistingInstallation then
@@ -1172,6 +1213,7 @@ begin
   EdrInitDiagnostics;
   EdrAppendStageLog('install_existing_installation=' + EdrBoolJson(EdrHadExistingInstallation));
   EdrAppendStageLog('upgrade_existing_mode=' + EdrBoolJson(EdrCmdUpgradeExisting));
+  EdrAppendStageLog('repair_baseline_mode=' + EdrBoolJson(EdrCmdRepairBaseline));
   SaveEnrollParamsFileIfNeeded;
   Enrolled := EnrollParamsFileExists;
 

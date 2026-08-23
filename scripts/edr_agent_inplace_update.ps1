@@ -181,7 +181,9 @@ function New-InstallerDiagnosticEvidence {
 }
 
 function Invoke-FullInstallerUpgrade {
-  param([Parameter(Mandatory = $true)][string]$SetupPath, [Parameter(Mandatory = $true)][string]$Mode)
+  param([Parameter(Mandatory = $true)][string]$SetupPath,
+        [Parameter(Mandatory = $true)][string]$Mode,
+        [Parameter(Mandatory = $true)][string]$RuntimeBackupPath)
   if (-not (Test-Path -LiteralPath (Join-Path $InstallDir 'agent.toml') -PathType Leaf)) {
     throw 'existing protected agent.toml is required for a full installer upgrade'
   }
@@ -190,7 +192,27 @@ function Invoke-FullInstallerUpgrade {
   $logPath = Get-InstallerLogPath -TaskId $TaskId -CommandId $CommandId
   $arguments = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CLOSEAPPLICATIONS',
     (('/TASKS="{0},keepofflinequeue,keepevidencecache,stricthealthcheck"' -f $runtimeTask)),
-    '/EDR_UPGRADE_EXISTING=1','/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1',("/LOG=`"$logPath`""))
+    '/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1',("/LOG=`"$logPath`""))
+  $uninstallerExe = Join-Path $InstallDir 'unins000.exe'
+  $uninstallerData = Join-Path $InstallDir 'unins000.dat'
+  $hasUninstallerExe = Test-Path -LiteralPath $uninstallerExe -PathType Leaf
+  $hasUninstallerData = Test-Path -LiteralPath $uninstallerData -PathType Leaf
+  $baselineMode = 'upgrade_existing'
+  if ($hasUninstallerExe -xor $hasUninstallerData) {
+    throw 'INSTALL_BASELINE_CORRUPT|Inno uninstaller files are incomplete'
+  }
+  if ($hasUninstallerExe) {
+    $arguments += '/EDR_UPGRADE_EXISTING=1'
+  } else {
+    foreach ($required in @('FDSensor.exe','agent.toml')) {
+      if (-not (Test-Path -LiteralPath (Join-Path $RuntimeBackupPath $required) -PathType Leaf)) {
+        throw "INSTALL_REPAIR_BACKUP_INCOMPLETE|missing=$required"
+      }
+    }
+    $baselineMode = 'repair_baseline'
+    $arguments += '/EDR_REPAIR_BASELINE=1'
+    $arguments += ("/EDR_REPAIR_BACKUP_DIR=`"$RuntimeBackupPath`"")
+  }
   try { $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -Wait -PassThru }
   catch {
     $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'start_failed' -OriginalSize 0
@@ -210,7 +232,11 @@ function Invoke-FullInstallerUpgrade {
     # Keep exception text machine-readable and deliberately free of paths/log content.
     throw "$code|installer_exit_code=$($process.ExitCode)|log_sha256=$($evidence.Sha256)|log_size=$($evidence.Size)"
   }
-  return [pscustomobject]@{ ExitCode=$process.ExitCode; LogPath=$logPath; Evidence=$evidence; ErrorCode=''; EvidenceId=(Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId); StorageKey=("evidence/{0}/{1}.log" -f (Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId), $evidence.Sha256) }
+  if (-not (Test-Path -LiteralPath $uninstallerExe -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $uninstallerData -PathType Leaf)) {
+    throw "INSTALL_BASELINE_REPAIR_INCOMPLETE|installer_exit_code=$($process.ExitCode)|log_sha256=$($evidence.Sha256)|log_size=$($evidence.Size)"
+  }
+  return [pscustomobject]@{ ExitCode=$process.ExitCode; LogPath=$logPath; Evidence=$evidence; ErrorCode=''; BaselineMode=$baselineMode; EvidenceId=(Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId); StorageKey=("evidence/{0}/{1}.log" -f (Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId), $evidence.Sha256) }
 }
 
 function Wait-FullInstallerProcess {
@@ -1243,7 +1269,7 @@ try {
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
     Set-UpdateStage -Stage 'full_installer_upgrade'
     $fullInstallerStarted = $true
-    $installerResult = Invoke-FullInstallerUpgrade -SetupPath $setupPath -Mode $resolvedDeploymentMode
+    $installerResult = Invoke-FullInstallerUpgrade -SetupPath $setupPath -Mode $resolvedDeploymentMode -RuntimeBackupPath $fullInstallerBackupPath
     $report['installer_exit_code'] = $installerResult.ExitCode
     $report['installer_log_sha256'] = $installerResult.Evidence.Sha256
     $report['installer_log_size'] = $installerResult.Evidence.Size
@@ -1252,6 +1278,7 @@ try {
     $report['installer_log_path'] = Split-Path -Leaf $installerResult.Evidence.Path
     $report['installer_log_evidence_id'] = $installerResult.EvidenceId
     $report['installer_log_storage_key'] = $installerResult.StorageKey
+    $report['installer_baseline_mode'] = $installerResult.BaselineMode
     $journal['installer_log_file'] = Split-Path -Leaf $installerResult.Evidence.Path
     $journal['installer_log_sha256'] = $installerResult.Evidence.Sha256
     $journal['installer_log_size'] = [UInt64]$installerResult.Evidence.Size
@@ -1259,6 +1286,7 @@ try {
     $journal['installer_log_evidence_id'] = $installerResult.EvidenceId
     $journal['installer_log_storage_key'] = $installerResult.StorageKey
     $journal['installer_evidence_status'] = 'pending_upload'
+    $journal['installer_baseline_mode'] = $installerResult.BaselineMode
     Write-AtomicJson -Path $journalPath -Value $journal
     if ((Get-Sha256 -Path (Join-Path $installFull 'agent.toml')) -ne (Get-Sha256 -Path $fullInstallerConfigBackupPath)) {
       throw 'full installer modified protected agent.toml identity configuration'

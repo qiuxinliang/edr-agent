@@ -55,6 +55,11 @@ int main(void) {
   contains(script, "AgentUpdateUpdaterProtocolVersion = 5", "updater protocol version is explicit in the release script");
   contains(script, "Invoke-FullInstallerUpgrade", "protocol v5 supports the task-pinned full installer path");
   contains(script, "EDR_UPGRADE_EXISTING=1", "full installer preserves the existing endpoint identity");
+  contains(script, "EDR_REPAIR_BASELINE=1", "legacy installations can enter the explicitly backed-up baseline repair path");
+  contains(script, "EDR_REPAIR_BACKUP_DIR", "baseline repair is bound to the immutable runtime backup");
+  contains(script, "INSTALL_BASELINE_CORRUPT", "partial uninstaller baselines fail closed");
+  contains(script, "INSTALL_REPAIR_BACKUP_INCOMPLETE", "baseline repair refuses an incomplete rollback source");
+  contains(script, "INSTALL_BASELINE_REPAIR_INCOMPLETE", "baseline repair verifies the Inno lifecycle files before success");
   contains(script, "full installer modified protected agent.toml identity configuration", "full installer verifies the protected identity was not rewritten");
   contains(script, "full installer completed but installed Runtime component identity does not match the task-pinned release",
            "full installer verifies the complete installed Runtime identity before reporting success");
@@ -113,13 +118,24 @@ int main(void) {
   contains(script, "Write-AtomicJson", "journal and report use atomic writes");
   free(script);
 
+  snprintf(path, sizeof(path), "%s/scripts/windows_setup_exe_lifecycle_smoke.ps1", root);
+  char *baseline_repair_lifecycle = read_file(path);
+  require_true(baseline_repair_lifecycle != NULL, "read Windows Setup lifecycle smoke");
+  contains(baseline_repair_lifecycle, "Assert-BaselineRepair", "native Windows lifecycle exercises the missing-uninstaller repair path");
+  contains(baseline_repair_lifecycle, "EDR_REPAIR_BASELINE=1", "lifecycle invokes the explicit repair mode");
+  contains(baseline_repair_lifecycle, "identity_preserved=true", "lifecycle verifies protected endpoint identity preservation");
+  contains(baseline_repair_lifecycle, "queue_preserved=true", "lifecycle verifies offline queue preservation");
+  contains(baseline_repair_lifecycle, "evidence_preserved=true", "lifecycle verifies evidence preservation");
+  free(baseline_repair_lifecycle);
+
   snprintf(path, sizeof(path), "%s/install/windows-inno/EDRAgentSetup.bundled.iss", root);
   char *inno = read_file(path);
   require_true(inno != NULL, "read Windows bundled installer definition");
   contains(inno, "[InstallDelete]", "full installer has an explicit release-owned Runtime reconciliation stage");
   contains(inno, "Name: \"{app}\\*.dll\"; Check: ShouldReconcileRuntimeDlls",
            "full installer removes obsolete root DLLs only during an identity-preserving upgrade");
-  contains(inno, "Result := EdrCmdUpgradeExisting", "Runtime DLL reconciliation is restricted to verified upgrades");
+  contains(inno, "Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline",
+           "Runtime DLL reconciliation is restricted to verified upgrades or backed-up baseline repair");
   free(inno);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_update_command.c", root);

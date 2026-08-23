@@ -101,6 +101,59 @@ function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisti
   }
   Add-Evidence $Stage "completed" "exit_code=0"
 }
+function Invoke-BaselineRepair([string] $Path, [string] $Stage, [string] $BackupDir) {
+  $log = Join-Path $EvidenceDir ($Stage + ".setup.log")
+  $script:LastLifecycleStage = $Stage
+  $script:LastSetupLog = $log
+  $arguments = @(
+    "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+    ('/DIR="{0}"' -f $InstallDir),
+    '/TASKS="windowsservice,keepofflinequeue,keepevidencecache,stricthealthcheck"',
+    '/EDR_REPAIR_BASELINE=1',
+    ('/EDR_REPAIR_BACKUP_DIR="{0}"' -f $BackupDir),
+    '/EDR_KEEP_OFFLINE_QUEUE=1', '/EDR_KEEP_EVIDENCE_CACHE=1',
+    ('/LOG="{0}"' -f $log)
+  )
+  Add-Evidence $Stage "started" "repairing missing Inno lifecycle baseline"
+  $process = Start-Process -FilePath $Path -ArgumentList $arguments -Wait -PassThru
+  if ($process.ExitCode -ne 0) {
+    throw "Setup EXE baseline repair '$Stage' failed with exit code $($process.ExitCode); log=$log"
+  }
+  Add-Evidence $Stage "completed" "exit_code=0"
+}
+function Assert-BaselineRepair([string] $SetupPath) {
+  $stage = "repair-baseline"
+  $backupDir = Join-Path $EvidenceDir "repair-baseline-backup"
+  $queueMarker = Join-Path $InstallDir "queue\baseline-repair-preserve.marker"
+  $evidenceMarker = Join-Path $InstallDir "evidence\baseline-repair-preserve.marker"
+  New-Item -ItemType Directory -Path (Split-Path -Parent $queueMarker),(Split-Path -Parent $evidenceMarker) -Force | Out-Null
+  [IO.File]::WriteAllText($queueMarker, "queue-preserve", [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($evidenceMarker, "evidence-preserve", [Text.UTF8Encoding]::new($false))
+  $configPath = Join-Path $InstallDir "agent.toml"
+  $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+
+  Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+  Get-Process -Name "FDSensor" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force }
+  New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+  Get-ChildItem -LiteralPath $InstallDir -Force | Copy-Item -Destination $backupDir -Recurse -Force
+  foreach ($name in @("unins000.exe", "unins000.dat")) {
+    Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force
+    if (Test-Path -LiteralPath (Join-Path $InstallDir $name)) { throw "$stage could not remove $name from the repair fixture" }
+  }
+
+  Invoke-BaselineRepair $SetupPath $stage $backupDir
+  Assert-InstalledRuntime $BaselineVersion $stage
+  if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne $configHash) {
+    throw "$stage modified protected agent.toml"
+  }
+  if ([IO.File]::ReadAllText($queueMarker) -ne "queue-preserve" -or
+      [IO.File]::ReadAllText($evidenceMarker) -ne "evidence-preserve") {
+    throw "$stage did not preserve queue/evidence data"
+  }
+  Add-Evidence $stage "verified" "uninstaller_restored=true identity_preserved=true queue_preserved=true evidence_preserved=true"
+  Remove-Item -LiteralPath $backupDir -Recurse -Force
+}
 function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage, [bool] $RequireModernLifecycleAssets = $true) {
   $versionPath = Join-Path $InstallDir "VERSION"
   if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
@@ -197,6 +250,7 @@ try {
   # freshly installed and validated in this same native-runner job.
   Invoke-Installer $BaselineSetupExe "install-baseline" $false
   Assert-InstalledRuntime $BaselineVersion "install-baseline" (-not $SkipSetupRollback)
+  Assert-BaselineRepair $BaselineSetupExe
   Invoke-Installer $TargetSetupExe "upgrade-target" $true
   Assert-InstalledRuntime $TargetVersion "upgrade-target"
   if ($SkipSetupRollback) {

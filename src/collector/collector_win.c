@@ -600,7 +600,10 @@ typedef enum {
 
 static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSource source) {
   s_health.agent_self_suppressed++;
-  s_health.collector_dropped++;
+  /* Agent-owned activity is intentionally filtered before it reaches the
+   * event bus.  It is not collector loss and must not inflate the commercial
+   * "collector_dropped" reliability signal.  Dedicated agent_self counters
+   * retain the full diagnostic volume. */
   switch (source) {
   case EDR_AGENT_SELF_DROP_DIRECT_PID:
     s_health.agent_self_direct_pid_suppressed++;
@@ -2155,7 +2158,8 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   const char *tag;
   if (!edr_map_type_and_tag(event_record, &ty, &tag)) {
     s_health.etw_prefilter_dropped++;
-    s_health.collector_dropped++;
+    /* Unmapped provider events are an intentional ETW prefilter decision,
+     * not a failed collection attempt. */
     return;
   }
 

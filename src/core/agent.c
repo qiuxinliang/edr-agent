@@ -2361,6 +2361,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
         "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
         "\"snapshot_rejects\":%llu},"
+        "\"agent_self_sources\":{\"direct_pid\":%llu,\"security_event\":%llu,"
+        "\"record\":%llu,\"interest\":%llu,\"fuse_provider\":%llu},"
         "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
         "\"fast_drop\":%s,"
         "\"until_unix_ms\":%llu,\"trips\":%llu,\"suppressed\":%llu,"
@@ -2502,6 +2504,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)process_cache_metrics.snapshot_hits,
         (unsigned long long)process_cache_metrics.snapshot_misses,
         (unsigned long long)process_cache_metrics.snapshot_time_rejects,
+        (unsigned long long)ch.agent_self_direct_pid_suppressed,
+        (unsigned long long)ch.agent_self_security_event_suppressed,
+        (unsigned long long)ch.agent_self_record_suppressed,
+        (unsigned long long)ch.agent_self_interest_suppressed,
+        (unsigned long long)ch.agent_self_fuse_provider_suppressed,
         ch.agent_self_fuse_active ? "true" : "false",
         ch.agent_self_fuse_provider_degraded ? "true" : "false",
         ch.agent_self_fuse_fast_drop ? "true" : "false",

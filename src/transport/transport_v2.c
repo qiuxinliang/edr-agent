@@ -261,9 +261,13 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
   }
   rc = edr_ingest_http_post_report_events(batch_id, header12, header_len, payload, payload_len);
   if (rc != 0) {
+    EdrIngestHttpRuntime http_rt;
+    memset(&http_rt, 0, sizeof(http_rt));
+    edr_ingest_http_get_runtime(&http_rt);
     tv2_lock();
     s_rt.send_fail++;
-    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "report_events failed");
+    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), http_rt.last_error,
+             "report_events failed");
     tv2_unlock();
   }
   return rc;

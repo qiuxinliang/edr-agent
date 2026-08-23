@@ -47,6 +47,18 @@ static int require_true(int condition, const char *message) {
   return 0;
 }
 
+static int require_range_absent(const char *text, const char *begin, const char *end,
+                                const char *needle, const char *message) {
+  const char *start = text ? strstr(text, begin) : NULL;
+  const char *finish = start ? strstr(start + strlen(begin), end) : NULL;
+  if (start && finish) {
+    const char *hit = strstr(start, needle);
+    if (!hit || hit >= finish) return 1;
+  }
+  fprintf(stderr, "FAIL: %s\n", message);
+  return 0;
+}
+
 static int require_utf8_bom(const char *text, const char *message) {
   if (text && (unsigned char)text[0] == 0xef &&
       (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf) {
@@ -101,6 +113,12 @@ int main(void) {
                          "self-noise fuse must be scoped to Agent-owned PIDs");
   ok &= require_contains(collector, "s_health.etw_prefilter_dropped++",
                          "uninteresting ETW schemas must be observable before payload parsing");
+  ok &= require_range_absent(collector, "static void edr_agent_self_count_drop_source",
+                             "static void edr_agent_self_mark_pid", "s_health.collector_dropped++",
+                             "intentional Agent self filtering must not count as collector loss");
+  ok &= require_range_absent(collector, "if (!edr_map_type_and_tag(event_record, &ty, &tag))",
+                             "if (edr_a44_split_path_enabled())", "s_health.collector_dropped++",
+                             "intentional ETW schema prefiltering must not count as collector loss");
   ok &= require_contains(collector, "edr_classify_manifest_semantics",
                          "file and network ETW schemas must be classified by TDH metadata");
   ok &= require_contains(collector, "EDR_ETW_SEMANTIC_CACHE_SIZE",
@@ -123,6 +141,8 @@ int main(void) {
                          "remote policy must stop PMFE workers when PMFE is disabled");
   ok &= require_contains(agent, "PMFE started by remote policy",
                          "remote policy must restart PMFE when it is re-enabled");
+  ok &= require_contains(agent, "\\\"agent_self_sources\\\":{\\\"direct_pid\\\"",
+                         "basic health must expose the source of Agent self filtering");
   free(agent);
 
   char *shellcode = read_source(root, "src/shellcode_detector/shellcode_detector_win.c");
