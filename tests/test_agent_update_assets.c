@@ -407,6 +407,14 @@ int main(void) {
            "Setup lifecycle validates clean target uninstall before installing the baseline");
   contains(setup_lifecycle, "Copy-InstallerDiagnostics",
            "Setup lifecycle prints and preserves Inno and Agent diagnostics on every failed stage");
+  contains(setup_lifecycle, "edr_queue.db.baseline-repair-preserve",
+           "baseline repair preservation check uses the real legacy queue cleanup namespace");
+  contains(setup_lifecycle, "local_evidence_cache.db.baseline-repair-preserve",
+           "baseline repair preservation check uses the real legacy evidence cleanup namespace");
+  require_true(!strstr(setup_lifecycle, "queue\\baseline-repair-preserve.marker"),
+               "baseline repair smoke does not read the protected queue directory after ACL hardening");
+  require_true(!strstr(setup_lifecycle, "evidence\\baseline-repair-preserve.marker"),
+               "baseline repair smoke does not read the protected evidence directory after ACL hardening");
   contains(setup_lifecycle, ".install-dir-residue.txt",
            "Setup lifecycle preserves the exact remaining install-directory entries on uninstall failure");
   contains(setup_lifecycle, "uninstall-after-rollback",

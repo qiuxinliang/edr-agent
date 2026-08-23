@@ -124,9 +124,14 @@ function Invoke-BaselineRepair([string] $Path, [string] $Stage, [string] $Backup
 function Assert-BaselineRepair([string] $SetupPath) {
   $stage = "repair-baseline"
   $backupDir = Join-Path $EvidenceDir "repair-baseline-backup"
-  $queueMarker = Join-Path $InstallDir "queue\baseline-repair-preserve.marker"
-  $evidenceMarker = Join-Path $InstallDir "evidence\baseline-repair-preserve.marker"
-  New-Item -ItemType Directory -Path (Split-Path -Parent $queueMarker),(Split-Path -Parent $evidenceMarker) -Force | Out-Null
+  # Use the legacy root-level database names that the cleanup stage also
+  # manages.  The repair workflow intentionally hardens queue/ and evidence/
+  # to SYSTEM/Administrators only, so reading arbitrary markers inside those
+  # directories from the unelevated CI parent would test ACL enforcement, not
+  # preservation.  These files still exercise the real keep-queue/evidence
+  # branches and remain readable under the hardened install-root RX ACL.
+  $queueMarker = Join-Path $InstallDir "edr_queue.db.baseline-repair-preserve"
+  $evidenceMarker = Join-Path $InstallDir "local_evidence_cache.db.baseline-repair-preserve"
   [IO.File]::WriteAllText($queueMarker, "queue-preserve", [Text.UTF8Encoding]::new($false))
   [IO.File]::WriteAllText($evidenceMarker, "evidence-preserve", [Text.UTF8Encoding]::new($false))
   $configPath = Join-Path $InstallDir "agent.toml"
