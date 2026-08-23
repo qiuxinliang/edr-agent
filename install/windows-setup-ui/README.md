@@ -5,8 +5,14 @@ This directory contains the product-grade Windows installer shell for FDSecurity
 The UI is a WPF + WebView2 wrapper around the existing Inno installer:
 
 - `FDSecuritySetupUI.exe` renders the high-fidelity installer experience and collects operator input.
-- `FDSecuritySetup.exe` remains the authoritative elevated installer and runs the existing Inno + PowerShell workflow.
+- `FDSecuritySetup.exe` remains the authoritative elevated installer and runs the Inno + native installer-worker workflow. PowerShell fallback is lab-only.
 - Diagnostics are collected from the UI layer, Inno log, and Agent bootstrap reports.
+
+The commercial UI intentionally exposes one installation policy: run as a
+Windows service, harden the install ACL, require bootstrap health validation,
+and preserve endpoint identity, the offline queue, and the evidence cache
+during upgrades. Legacy scheduled-task and repair/reset inputs remain accepted
+only for managed compatibility workflows; they are not operator choices.
 
 ## Build
 

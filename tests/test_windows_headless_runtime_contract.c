@@ -394,6 +394,10 @@ int main(void) {
                          "PowerShell manual fallback must reject an early Agent exit");
   ok &= require_contains(inno, "#ifdef EDR_ALLOW_POWERSHELL_FALLBACK",
                          "worker-less bundled installers must require an explicit lab-only build flag");
+  ok &= require_contains(inno, "FDSecurityInstallerWorker.exe is required by commercial installers",
+                         "commercial Setup fails closed instead of entering the lab PowerShell fallback");
+  ok &= require_contains(inno, "(not EdrInstallerWorkerExists) and (not EdrPowerShellFallbackAllowed)",
+                         "commercial Setup checks the native worker before any install stage");
   ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.exe\"",
                          "Setup UI must package the same native uninstaller as the release ZIP");
   ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.ps1\"",
@@ -430,7 +434,25 @@ int main(void) {
                          "GUI completion must require a live Agent process");
   ok &= require_contains(setup_ui, "Process.GetProcessesByName(\"FDSensor\")",
                          "GUI health collection must verify live process state directly");
+  ok &= require_contains(setup_ui, "public string RuntimeMode { get; set; } = \"windows_service\";",
+                         "commercial Setup UI defaults to the Windows service");
+  ok &= require_contains(setup_ui, "[\"harden_acl\"] = true",
+                         "commercial Setup UI makes ACL hardening invariant");
+  ok &= require_contains(setup_ui, "[\"strict_health_check\"] = true",
+                         "commercial Setup UI makes health validation invariant");
+  ok &= require_contains(setup_ui, "return normalizedMode == \"upgrade_keep\";",
+                         "commercial Setup UI preserves upgrade data without a checkbox");
   free(setup_ui);
+
+  char *setup_html = read_source(root, "install/windows-setup-ui/Assets/installer.html");
+  if (!setup_html) return 1;
+  ok &= require_contains(setup_html, "自动安装 / 升级（保留终端身份、队列和证据）",
+                         "commercial Setup presents one automatic installation policy");
+  ok &= require_contains(setup_html, "正式部署固定使用 Windows Service、ACL 加固和严格健康校验",
+                         "commercial Setup explains its fixed safety defaults");
+  ok &= require_true(!strstr(setup_html, "<div class=\"tl\">跳过证书校验</div>"),
+                     "commercial Setup does not offer a clickable TLS verification bypass");
+  free(setup_html);
 
   char *build_ps = read_source(root, "install/windows-inno/Build-BundledInstaller.ps1");
   if (!build_ps) return 1;

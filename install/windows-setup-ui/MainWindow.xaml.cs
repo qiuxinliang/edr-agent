@@ -606,26 +606,6 @@ public partial class MainWindow : Window
             runtimeMode == "scheduled_task" ? "windowsautorun" : "!windowsautorun",
             runtimeMode == "windows_service" ? "windowsservice" : "!windowsservice"
         };
-        if (request.HardenAcl)
-        {
-            tasks.Add("hardeninstalldir");
-        }
-        if (request.StrictHealthCheck)
-        {
-            tasks.Add("stricthealthcheck");
-        }
-        if (keepOfflineQueue)
-        {
-            tasks.Add("keepofflinequeue");
-        }
-        if (keepEvidenceCache)
-        {
-            tasks.Add("keepevidencecache");
-        }
-        if (request.InsecureTls)
-        {
-            tasks.Add("enrollinsecure");
-        }
 
         var proxyMode = NormalizeProxyMode(request.ProxyMode);
         var parts = new List<string>
@@ -1328,31 +1308,26 @@ public partial class MainWindow : Window
 
     private static string NormalizeRuntimeMode(string? value)
     {
-        var v = (value ?? "scheduled_task").Trim().ToLowerInvariant();
+        var v = (value ?? "windows_service").Trim().ToLowerInvariant();
         return v switch
         {
             "windows_service" or "service" => "windows_service",
             "manual" or "manual_console" or "none" => "manual",
-            _ => "scheduled_task"
+            "scheduled_task" or "autorun" => "scheduled_task",
+            _ => "windows_service"
         };
     }
 
     private static bool ShouldKeepOfflineQueue(InstallRequest request, string normalizedMode)
     {
-        return normalizedMode switch
-        {
-            "upgrade_keep" => request.KeepOfflineQueue,
-            _ => false
-        };
+        _ = request;
+        return normalizedMode == "upgrade_keep";
     }
 
     private static bool ShouldKeepEvidenceCache(InstallRequest request, string normalizedMode)
     {
-        return normalizedMode switch
-        {
-            "upgrade_keep" => request.KeepEvidenceCache,
-            _ => false
-        };
+        _ = request;
+        return normalizedMode == "upgrade_keep";
     }
 
     private static EndpointConfig NormalizeEndpointInput(string? raw)
@@ -1780,10 +1755,10 @@ public partial class MainWindow : Window
             ["install_mode"] = normalizedMode,
             ["runtime_mode"] = runtimeMode,
             ["trust_ca"] = request.TrustCa,
-            ["harden_acl"] = request.HardenAcl,
+            ["harden_acl"] = true,
             ["keep_offline_queue"] = ShouldKeepOfflineQueue(request, normalizedMode),
             ["keep_evidence_cache"] = ShouldKeepEvidenceCache(request, normalizedMode),
-            ["strict_health_check"] = request.StrictHealthCheck,
+            ["strict_health_check"] = true,
             ["http2_enabled"] = request.Http2Enabled ?? ReadPreconfigBool("http2Enabled"),
             ["http2_require"] = request.Http2Require ?? ReadPreconfigBool("http2Require"),
             ["control_stream_enabled"] = request.ControlStreamEnabled ?? ReadPreconfigBool("controlStreamEnabled"),
@@ -2898,7 +2873,7 @@ public sealed class InstallRequest
     public string EnrollToken { get; set; } = "";
     public string ManagementUrl { get; set; } = "";
     public string InstallMode { get; set; } = "upgrade_keep";
-    public string RuntimeMode { get; set; } = "scheduled_task";
+    public string RuntimeMode { get; set; } = "windows_service";
     public string ProxyMode { get; set; } = "auto";
     public string ProxyUrl { get; set; } = "";
     public string ProxyAuthMode { get; set; } = "none";
@@ -2910,13 +2885,13 @@ public sealed class InstallRequest
     public string BootstrapManifestPath { get; set; } = "";
     public string BootstrapManifestJson { get; set; } = "";
     public string InstallPath { get; set; } = "";
-    public bool InstallAutorun { get; set; } = true;
+    public bool InstallAutorun { get; set; }
     public bool TrustCa { get; set; }
-    public bool HardenAcl { get; set; }
+    public bool HardenAcl { get; set; } = true;
     public bool InsecureTls { get; set; }
-    public bool KeepOfflineQueue { get; set; }
-    public bool KeepEvidenceCache { get; set; }
-    public bool StrictHealthCheck { get; set; }
+    public bool KeepOfflineQueue { get; set; } = true;
+    public bool KeepEvidenceCache { get; set; } = true;
+    public bool StrictHealthCheck { get; set; } = true;
     public bool AutoOpenEndpoint { get; set; }
     public bool? Http2Enabled { get; set; }
     public bool? Http2Require { get; set; }

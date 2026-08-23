@@ -55,6 +55,8 @@ int main(void) {
   contains(script, "AgentUpdateUpdaterProtocolVersion = 5", "updater protocol version is explicit in the release script");
   contains(script, "Invoke-FullInstallerUpgrade", "protocol v5 supports the task-pinned full installer path");
   contains(script, "EDR_UPGRADE_EXISTING=1", "full installer preserves the existing endpoint identity");
+  require_true(!strstr(script, "keepofflinequeue,keepevidencecache,stricthealthcheck"),
+               "full-installer upgrade does not expose data and health invariants as Inno task choices");
   contains(script, "EDR_REPAIR_BASELINE=1", "legacy installations can enter the explicitly backed-up baseline repair path");
   contains(script, "EDR_REPAIR_BACKUP_DIR", "baseline repair is bound to the immutable runtime backup");
   contains(script, "INSTALL_BASELINE_CORRUPT", "partial uninstaller baselines fail closed");
@@ -126,6 +128,8 @@ int main(void) {
   contains(baseline_repair_lifecycle, "identity_preserved=true", "lifecycle verifies protected endpoint identity preservation");
   contains(baseline_repair_lifecycle, "queue_preserved=true", "lifecycle verifies offline queue preservation");
   contains(baseline_repair_lifecycle, "evidence_preserved=true", "lifecycle verifies evidence preservation");
+  contains(baseline_repair_lifecycle, "product_residue=none",
+           "lifecycle judges uninstall by product residue instead of an empty container directory");
   free(baseline_repair_lifecycle);
 
   snprintf(path, sizeof(path), "%s/install/windows-inno/EDRAgentSetup.bundled.iss", root);
@@ -136,6 +140,18 @@ int main(void) {
            "full installer removes obsolete root DLLs only during an identity-preserving upgrade");
   contains(inno, "Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline",
            "Runtime DLL reconciliation is restricted to verified upgrades or backed-up baseline repair");
+  contains(inno, "Name: \"windowsservice\"; Description: \"Run as the FDSecurity Windows service (recommended)\"",
+           "commercial Setup defaults to the native Windows service");
+  require_true(!strstr(inno, "Name: \"hardeninstalldir\"") &&
+                   !strstr(inno, "Name: \"keepofflinequeue\"") &&
+                   !strstr(inno, "Name: \"keepevidencecache\"") &&
+                   !strstr(inno, "Name: \"stricthealthcheck\"") &&
+                   !strstr(inno, "Name: \"enrollinsecure\""),
+               "commercial Setup does not expose fixed safety invariants or lab TLS bypass as tasks");
+  contains(inno, "StrictHealth := True;", "commercial Setup always enables strict bootstrap health validation");
+  contains(inno, "Insecure := EdrCmdInsecureTls;", "insecure enrollment remains explicit command-line lab compatibility only");
+  contains(inno, "Result := EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepOfflineQueue;",
+           "existing installs preserve the offline queue without an operator checkbox");
   contains(inno, "Type: filesandordirs; Name: \"{app}\\config\"",
            "Setup uninstall removes static configuration examples after cross-version rollback");
   contains(inno, "Type: filesandordirs; Name: \"{app}\\data\"",
@@ -146,6 +162,10 @@ int main(void) {
            "Setup uninstall removes static third-party license content after cross-version rollback");
   contains(inno, "Type: filesandordirs; Name: \"{app}\\rules\"",
            "Setup uninstall removes static detection rule content after cross-version rollback");
+  contains(inno, "Type: dirifempty; Name: \"{app}\"",
+           "baseline repair uninstall removes only the pre-existing app root after it is empty");
+  require_true(!strstr(inno, "Type: filesandordirs; Name: \"{app}\""),
+               "Setup uninstall must not recursively erase unknown app-root residue");
   free(inno);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_update_command.c", root);
@@ -427,6 +447,8 @@ int main(void) {
                "baseline repair smoke does not read the protected evidence directory after ACL hardening");
   contains(setup_lifecycle, ".install-dir-residue.txt",
            "Setup lifecycle preserves the exact remaining install-directory entries on uninstall failure");
+  contains(setup_lifecycle, "$residue.Count -gt 0",
+           "Setup lifecycle fails only for real remaining product entries, not an empty directory");
   contains(setup_lifecycle, "uninstall-after-rollback",
            "Setup lifecycle verifies final cleanup after the rollback path");
   contains(setup_lifecycle, "uninstall-after-upgrade",

@@ -70,13 +70,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "enrollinsecure"; Description: "Skip TLS certificate verification during enrollment (self-signed / lab only)"; GroupDescription: "Enrollment:"; Flags: unchecked
-Name: "windowsautorun"; Description: "Run at startup (scheduled task as SYSTEM, survives reboot)"; GroupDescription: "Runtime:"; Flags: checkedonce
-Name: "windowsservice"; Description: "Run as native Windows service (advanced)"; GroupDescription: "Runtime:"; Flags: unchecked
-Name: "hardeninstalldir"; Description: "Harden install folder ACL (SYSTEM/Admin full, Users read+execute; use Add/Remove Programs to uninstall)"; GroupDescription: "Runtime:"; Flags: unchecked
-Name: "keepofflinequeue"; Description: "Keep existing offline event queue during upgrade"; GroupDescription: "Upgrade cleanup:"; Flags: unchecked
-Name: "keepevidencecache"; Description: "Keep existing local evidence cache during upgrade"; GroupDescription: "Upgrade cleanup:"; Flags: unchecked
-Name: "stricthealthcheck"; Description: "Fail setup if bootstrap health check fails"; GroupDescription: "Validation:"; Flags: unchecked
+; The commercial path has one safe runtime default. Scheduled-task mode remains
+; selectable only for legacy compatibility while old endpoints are migrated.
+; ACL hardening, strict health validation, and upgrade data preservation are
+; invariants implemented below, not operator choices.
+Name: "windowsservice"; Description: "Run as the FDSecurity Windows service (recommended)"; GroupDescription: "Runtime:"; Flags: exclusive checkedonce
+Name: "windowsautorun"; Description: "Legacy scheduled-task compatibility"; GroupDescription: "Runtime:"; Flags: exclusive unchecked
 
 [InstallDelete]
 ; A verified full-package upgrade owns the root app-local DLL closure. Remove
@@ -178,6 +177,13 @@ Type: filesandordirs; Name: "{commonappdata}\FDSecurity\setup-ui"
 Type: dirifempty; Name: "{commonappdata}\FDSecurity"
 Type: filesandordirs; Name: "{localappdata}\FDSecurity\setup-ui"
 Type: dirifempty; Name: "{localappdata}\FDSecurity"
+; Baseline repair deliberately installs over a pre-existing protected app
+; root whose original Inno lifecycle files are missing. Inno therefore does
+; not consider that outer directory one it created, even after every owned
+; file and explicit subdirectory is removed. Remove only the empty root as the
+; final step; never use filesandordirs here because unknown residue must remain
+; visible and keep uninstall fail-closed.
+Type: dirifempty; Name: "{app}"
 
 [Code]
 var
@@ -270,12 +276,12 @@ end;
 
 function ShouldKeepOfflineQueue: Boolean;
 begin
-  Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepOfflineQueue or WizardIsTaskSelected('keepofflinequeue');
+  Result := EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepOfflineQueue;
 end;
 
 function ShouldKeepEvidenceCache: Boolean;
 begin
-  Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepEvidenceCache or WizardIsTaskSelected('keepevidencecache');
+  Result := EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline or EdrCmdKeepEvidenceCache;
 end;
 
 procedure EdrLoadCmdlineEnroll;
@@ -446,8 +452,10 @@ begin
   end;
   if (U = '') or (T = '') then
     Exit;
-  Insecure := EdrCmdInsecureTls or WizardIsTaskSelected('enrollinsecure');
-  StrictHealth := WizardIsTaskSelected('stricthealthcheck');
+  // Lab builds may still opt into insecure enrollment explicitly on the command
+  // line. The commercial wizard never exposes it as an install task.
+  Insecure := EdrCmdInsecureTls;
+  StrictHealth := True;
 
   Json := Chr(123)
     + Chr(34) + 'api_base' + Chr(34) + ':' + JsonEscape(U) + ','
@@ -658,6 +666,15 @@ end;
 function EdrInstallerWorkerExists: Boolean;
 begin
   Result := FileExists(EdrInstallerWorkerPath);
+end;
+
+function EdrPowerShellFallbackAllowed: Boolean;
+begin
+#ifdef EDR_ALLOW_POWERSHELL_FALLBACK
+  Result := True;
+#else
+  Result := False;
+#endif
 end;
 
 function EdrDiagnosticsFile(const FileName: string): string;
@@ -1080,9 +1097,7 @@ end;
 
 function AutorunInstallPsParameters(Param: string): string;
 begin
-  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_windows_autorun.ps1') + '" -Action Install -NoStart';
-  if WizardIsTaskSelected('hardeninstalldir') then
-    Result := Result + ' -HardenAcl';
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\edr_windows_autorun.ps1') + '" -Action Install -NoStart -HardenAcl';
 end;
 
 function WindowsServiceInstallPsParameters(Param: string): string;
@@ -1221,6 +1236,12 @@ begin
   EdrInstallFailed := False;
   EdrFailureReason := '';
   EdrInitDiagnostics;
+  if (not EdrInstallerWorkerExists) and (not EdrPowerShellFallbackAllowed) then
+  begin
+    EdrCurrentStage := 'Initialize native installer worker';
+    EdrFailureReason := 'FDSecurityInstallerWorker.exe is required by commercial installers';
+    EdrAbortInstall;
+  end;
   EdrAppendStageLog('install_existing_installation=' + EdrBoolJson(EdrHadExistingInstallation));
   EdrAppendStageLog('upgrade_existing_mode=' + EdrBoolJson(EdrCmdUpgradeExisting));
   EdrAppendStageLog('repair_baseline_mode=' + EdrBoolJson(EdrCmdRepairBaseline));

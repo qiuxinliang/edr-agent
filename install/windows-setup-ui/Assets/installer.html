@@ -118,7 +118,7 @@ button{background:none;border:0;cursor:pointer}
       </section>
 
       <section class="panel" data-step="2">
-        <div class="advtop"><div class="ph">部署配置</div><button class="advbtn" id="openAdvanced">高级选项</button></div>
+        <div class="advtop"><div class="ph">部署配置</div><button class="advbtn" id="openAdvanced">信任设置</button></div>
         <div class="psub">填写服务端接入、注册令牌和企业网络信息。</div>
         <div class="hr"></div>
         <div class="preconfig" id="preconfigNote"></div>
@@ -126,7 +126,7 @@ button{background:none;border:0;cursor:pointer}
           <div class="frow wide"><div class="flabel">服务端地址<span class="req">*</span><span class="opt">支持 https://server:8080 或 https://server:8080/api/v1</span><button class="testc" id="testConn">检查格式</button></div><input class="fin" id="apiBase" placeholder="https://server:8080"></div>
           <div class="frow"><div class="flabel">注册令牌<span class="req">*</span></div><input class="fin" id="token" placeholder="粘贴 enroll token"></div>
           <div class="frow"><div class="flabel">安装路径</div><input class="fin" id="installPath" value="C:\Program Files\FDSecurity"></div>
-          <div class="frow"><div class="flabel">安装模式</div><select class="fsel" id="installMode"><option value="upgrade_keep">标准安装 / 升级保留</option><option value="fresh">首次安装</option><option value="repair_clean">修复安装 / 清理运行缓存</option><option value="reset_all">完全重置 / 清理本地数据</option></select></div>
+          <div class="frow"><div class="flabel">安装策略</div><div class="fin">自动安装 / 升级（保留终端身份、队列和证据）</div></div>
           <div class="frow"><div class="flabel">代理模式</div><select class="fsel" id="proxyMode"><option value="auto">系统代理 / 自动发现</option><option value="off">直连</option><option value="explicit">显式代理</option></select></div>
           <div class="subpanel hide" id="proxyPanel">
             <div class="form">
@@ -139,11 +139,7 @@ button{background:none;border:0;cursor:pointer}
           <div class="frow wide"><div class="flabel">Relay / Gateway 地址<span class="opt">可填 https://relay:443 或 https://relay:443/api/v1</span></div><input class="fin" id="relayUrl" placeholder="https://relay.example:443"></div>
         </div>
         <div class="hr"></div>
-        <div class="toggles">
-          <div class="tgl on" id="keepOfflineQueue"><span class="sw"><i></i></span><div><div class="tl">保留离线事件队列</div><div class="td">升级时不删除历史待上传事件</div></div></div>
-          <div class="tgl on" id="keepEvidenceCache"><span class="sw"><i></i></span><div><div class="tl">保留本地证据缓存</div><div class="td">升级时不删除 evidence cache</div></div></div>
-          <div class="tgl" id="insecureTls"><span class="sw"><i></i></span><div><div class="tl">跳过证书校验</div><div class="td">仅实验室自签证书环境使用</div></div></div>
-        </div>
+        <div class="psub">正式部署固定使用 Windows Service、ACL 加固和严格健康校验；升级自动保留离线队列与证据缓存。</div>
       </section>
 
       <section class="panel" data-step="3">
@@ -198,23 +194,26 @@ button{background:none;border:0;cursor:pointer}
 </div>
 <div class="shade hide" id="advShade"></div>
 <aside class="drawer hide" id="advDrawer">
-  <div class="dh"><div class="ph">高级选项</div><button class="xbtn" id="closeAdvanced">关闭</button></div>
-  <div class="form">
-    <div class="frow wide"><div class="flabel">运行模式</div><select class="fsel" id="runtimeMode"><option value="scheduled_task">计划任务 / SYSTEM 自动启动</option><option value="windows_service">Windows 服务</option><option value="manual">手动启动</option></select></div>
-  </div>
+  <div class="dh"><div class="ph">信任设置</div><button class="xbtn" id="closeAdvanced">关闭</button></div>
+  <div class="psub">仅保留与企业 CA 有关的可选设置。运行方式和安全策略由安装器自动处理。</div>
   <div class="hr"></div>
   <div class="toggles">
-    <div class="tgl" id="hardenAcl"><span class="sw"><i></i></span><div><div class="tl">ACL 加固</div><div class="td">限制普通用户修改安装目录</div></div></div>
     <div class="tgl" id="trustCa"><span class="sw"><i></i></span><div><div class="tl">导入证书信任</div><div class="td">将随包 CA 导入 Windows Root</div></div></div>
-    <div class="tgl" id="strictHealthCheck"><span class="sw"><i></i></span><div><div class="tl">严格健康校验</div><div class="td">健康检查失败则安装失败</div></div></div>
   </div>
+  <select class="hide" id="installMode"><option value="upgrade_keep" selected>自动安装 / 升级保留</option><option value="fresh">首次安装</option><option value="repair_clean">兼容修复</option><option value="reset_all">兼容重置</option></select>
+  <select class="hide" id="runtimeMode"><option value="windows_service" selected>Windows Service</option><option value="scheduled_task">兼容计划任务</option><option value="manual">兼容手动模式</option></select>
+  <div class="tgl on hide" id="hardenAcl"></div>
+  <div class="tgl on hide" id="keepOfflineQueue"></div>
+  <div class="tgl on hide" id="keepEvidenceCache"></div>
+  <div class="tgl on hide" id="strictHealthCheck"></div>
+  <div class="tgl hide" id="insecureTls"></div>
 </aside>
 <div class="toasts" id="toasts"></div>
 
 <script>
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const STEPS=['欢迎','许可协议','部署配置','环境检查','安装','完成'];
-const INSTALL=['停止旧运行态','清理运行缓存','注册并写入配置','校验配置','安装服务/计划任务','启动 Agent','拉取运行策略','写入健康摘要'];
+const INSTALL=['停止旧运行态','保留数据并清理锁','注册并写入配置','校验配置','安装 Windows Service','启动 Agent','拉取运行策略','写入健康摘要'];
 const CHECKS=['操作系统','系统架构','安装包','完整性校验','Bootstrap 信任','磁盘空间','管理员权限','服务端地址','注册令牌','代理配置','Relay/Gateway','WebView2 Runtime','服务端连通','Relay 连通'];
 let cur=0,accepted=false,checkOk=false,installDone=false,lastDiagnostics='',nativePreconfig={};
 

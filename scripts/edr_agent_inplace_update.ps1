@@ -191,7 +191,7 @@ function Invoke-FullInstallerUpgrade {
   $runtimeTask = if ($Mode -eq 'service') { 'windowsservice' } else { 'windowsautorun' }
   $logPath = Get-InstallerLogPath -TaskId $TaskId -CommandId $CommandId
   $arguments = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CLOSEAPPLICATIONS',
-    (('/TASKS="{0},keepofflinequeue,keepevidencecache,stricthealthcheck"' -f $runtimeTask)),
+    (('/TASKS="{0}"' -f $runtimeTask)),
     '/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1',("/LOG=`"$logPath`""))
   $uninstallerExe = Join-Path $InstallDir 'unins000.exe'
   $uninstallerData = Join-Path $InstallDir 'unins000.dat'
