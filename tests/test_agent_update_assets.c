@@ -136,6 +136,16 @@ int main(void) {
            "full installer removes obsolete root DLLs only during an identity-preserving upgrade");
   contains(inno, "Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline",
            "Runtime DLL reconciliation is restricted to verified upgrades or backed-up baseline repair");
+  contains(inno, "Type: filesandordirs; Name: \"{app}\\config\"",
+           "Setup uninstall removes static configuration examples after cross-version rollback");
+  contains(inno, "Type: filesandordirs; Name: \"{app}\\data\"",
+           "Setup uninstall removes static package data after cross-version rollback");
+  contains(inno, "Type: filesandordirs; Name: \"{app}\\edr_config\"",
+           "Setup uninstall removes static encrypted configuration bundles after cross-version rollback");
+  contains(inno, "Type: filesandordirs; Name: \"{app}\\licenses\"",
+           "Setup uninstall removes static third-party license content after cross-version rollback");
+  contains(inno, "Type: filesandordirs; Name: \"{app}\\rules\"",
+           "Setup uninstall removes static detection rule content after cross-version rollback");
   free(inno);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_update_command.c", root);
@@ -487,8 +497,8 @@ int main(void) {
            "release workflow reuses validated vcpkg caches without restoring an installed tree");
   contains(client_release, "$global:LASTEXITCODE = 0",
            "release workflow clears the handled pre-built cache-miss exit status");
-  contains(client_release, "max-parallel: 1",
-           "release serializes cold AMD64 and ARM64 source-cache fallbacks");
+  contains(client_release, "max-parallel: 2",
+           "release builds AMD64 and ARM64 concurrently on isolated native runners");
   contains(client_release, "actions/setup-dotnet@v5",
            "release workflow uses the Node 24 setup-dotnet action");
   contains(client_release, "actions/setup-python@v6",
@@ -571,6 +581,8 @@ int main(void) {
            "vcpkg prebuild tag binds the manifest hash and target triplet");
   contains(vcpkg_prebuild, "Invoke-VcpkgInstallWithRetry.ps1",
            "vcpkg prebuild uses bounded rate-limit recovery");
+  contains(vcpkg_prebuild, "max-parallel: 2",
+           "vcpkg prebuild produces AMD64 and ARM64 dependency closures concurrently");
   contains(vcpkg_prebuild, "paths:",
            "vcpkg prebuild workflow warms dependencies when the manifest changes on main");
   free(vcpkg_prebuild);

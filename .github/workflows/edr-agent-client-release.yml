@@ -94,9 +94,11 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      # A source-cache miss contacts GitHub archive endpoints. Serialize the
-      # two architectures until their immutable pre-built packages are restored.
-      max-parallel: 1
+      # AMD64 and ARM64 use separate runners, triplets, cache keys, build
+      # directories, and architecture-qualified release asset names.  Build
+      # both rows concurrently; bounded vcpkg retry still protects the rare
+      # source-cache fallback from transient GitHub archive throttling.
+      max-parallel: 2
       matrix:
         include:
           - arch: amd64

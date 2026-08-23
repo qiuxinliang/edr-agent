@@ -30,9 +30,10 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      # A cold cache is the only path that contacts GitHub source archives.
-      # Do not let AMD64 and ARM64 multiply that request burst.
-      max-parallel: 1
+      # Triplet-specific runners, cache keys, and immutable release tags make
+      # the two dependency closures independent.  Source fallback remains
+      # protected by Invoke-VcpkgInstallWithRetry's bounded 429 backoff.
+      max-parallel: 2
       matrix:
         include:
           - triplet: x64-windows

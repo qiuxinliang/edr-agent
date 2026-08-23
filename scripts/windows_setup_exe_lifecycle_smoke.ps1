@@ -70,6 +70,11 @@ function Copy-InstallerDiagnostics([string] $Stage, [string] $SetupLog) {
         Write-Host "--- $Stage Agent install-stage.log ---"
         Get-Content -LiteralPath $stageLog -Tail 120 | ForEach-Object { Write-Host $_ }
       }
+    } elseif ($Stage -like "uninstall-*") {
+      # A successful uninstaller removes ProgramData setup diagnostics by
+      # contract. The requested Inno log above remains the authoritative
+      # failure evidence if a later residue assertion fails.
+      Write-Host "$Stage removed Agent installer diagnostics as expected: $diagnosticsRoot"
     } else {
       Write-Warning "$Stage did not create Agent installer diagnostics: $diagnosticsRoot"
     }

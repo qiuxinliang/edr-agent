@@ -164,6 +164,16 @@ Type: filesandordirs; Name: "{app}\collector"
 Type: filesandordirs; Name: "{app}\isolation"
 Type: filesandordirs; Name: "{app}\diagnostics"
 Type: filesandordirs; Name: "{app}\upload_outbox"
+; Static package content can be owned by an earlier Setup generation after an
+; in-place repair/upgrade/rollback sequence. The active uninstaller may remove
+; every recorded file while leaving those now-empty directories behind, so
+; make their final cleanup explicit. Runtime identity, queue, and evidence are
+; handled separately above and are not part of this list.
+Type: filesandordirs; Name: "{app}\config"
+Type: filesandordirs; Name: "{app}\data"
+Type: filesandordirs; Name: "{app}\edr_config"
+Type: filesandordirs; Name: "{app}\licenses"
+Type: filesandordirs; Name: "{app}\rules"
 Type: filesandordirs; Name: "{commonappdata}\FDSecurity\setup-ui"
 Type: dirifempty; Name: "{commonappdata}\FDSecurity"
 Type: filesandordirs; Name: "{localappdata}\FDSecurity\setup-ui"
