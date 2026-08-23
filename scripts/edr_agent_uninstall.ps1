@@ -379,36 +379,8 @@ function Remove-HeadlessUninstallRegistration {
   }
 }
 
-function Grant-InstallDirectoryRemovalRights {
-  if (-not (Test-Path -LiteralPath $InstallDir)) { return }
-  try {
-    & takeown.exe /F $InstallDir /A /R /D Y | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "takeown.exe returned exit code $LASTEXITCODE" }
-  } catch {
-    Add-CleanupWarning ("Failed to take ownership of install directory: " + $_.Exception.Message)
-  }
-  try {
-    & icacls.exe $InstallDir /inheritance:e /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls inheritance returned exit code $LASTEXITCODE" }
-    & icacls.exe $InstallDir /reset /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls reset returned exit code $LASTEXITCODE" }
-  } catch {
-    Add-CleanupWarning ("Failed to reset install directory ACL: " + $_.Exception.Message)
-  }
-  try {
-    & icacls.exe $InstallDir /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls grant returned exit code $LASTEXITCODE" }
-  } catch {
-    Add-CleanupWarning ("Failed to prepare install directory ACL for removal: " + $_.Exception.Message)
-  }
-  Get-ChildItem -LiteralPath $InstallDir -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-    try { $_.Attributes = [IO.FileAttributes]::Normal } catch {}
-  }
-}
-
 function Start-DeferredProgramFilesRemoval {
   if (-not $RemoveProgramFiles) { return }
-  Grant-InstallDirectoryRemovalRights
 
   $quotedDir = $InstallDir.Replace("'", "''")
   $quotedService = $ServiceName.Replace("'", "''")
@@ -786,10 +758,6 @@ try {
   if ($PreserveDiagnostics) {
     Set-UninstallStage -Stage "diagnostics_archive"
     $diagnosticArchive = Export-AgentDiagnostics
-  }
-  if ($RemoveData -or $RemoveProgramFiles) {
-    Set-UninstallStage -Stage "acl_preparation"
-    Grant-InstallDirectoryRemovalRights
   }
   if ($RemoveData) {
     Set-UninstallStage -Stage "runtime_data_cleanup"

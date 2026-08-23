@@ -249,8 +249,12 @@ int main(void) {
 
   char *uninstall_ps = read_source(root, "scripts/edr_agent_uninstall.ps1");
   if (!uninstall_ps) return 1;
-  ok &= require_contains(uninstall_ps, "takeown.exe /F $InstallDir /A /R /D Y",
-                         "uninstall cleanup must recover ownership recursively");
+  ok &= require_contains(uninstall_ps, "takeown.exe /F `$target /A /R /D Y",
+                         "deferred uninstall cleanup must recover ownership recursively");
+  ok &= require_absent(uninstall_ps, "takeown.exe /F $InstallDir",
+                       "synchronous uninstall must not recursively traverse the install tree");
+  ok &= require_absent(uninstall_ps, "function Grant-InstallDirectoryRemovalRights",
+                       "uninstall must keep recursive ACL repair in the deferred cleanup only");
   ok &= require_contains(uninstall_ps, "function Disable-AgentServiceRecovery",
                          "uninstall must disable Windows service recovery before teardown");
   ok &= require_contains(uninstall_ps, "failureflag",
@@ -318,8 +322,8 @@ int main(void) {
   ok &= require_absent(uninstall_ps,
                        "Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue",
                        "runtime data cleanup must not regress to one-shot silent deletion");
-  ok &= require_contains(uninstall_ps, "Add-CleanupWarning (\"Failed to reset install directory ACL:",
-                         "ACL repair helper failures must defer to final deletion proof");
+  ok &= require_absent(uninstall_ps, "Failed to reset install directory ACL:",
+                       "synchronous uninstall must not perform a duplicate recursive ACL pass");
   ok &= require_absent(uninstall_ps, "Add-CriticalFailure (\"ETW cleanup failed:",
                        "best-effort ETW cleanup must never become a terminal uninstall failure");
   ok &= require_absent(uninstall_ps, "System.Collections.Generic.HashSet",
