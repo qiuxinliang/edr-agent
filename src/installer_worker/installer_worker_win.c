@@ -1293,10 +1293,44 @@ static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *j
   return rc;
 }
 
+enum service_recovery_config_result {
+  SERVICE_RECOVERY_CONFIG_FAILED = 0,
+  SERVICE_RECOVERY_CONFIGURED = 1,
+  SERVICE_RECOVERY_NOT_APPLICABLE = 2
+};
+
 static int configure_service_recovery(const wchar_t *service_name, int enabled,
                                       const wchar_t *log_path) {
   SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-  SC_HANDLE svc = scm ? OpenServiceW(scm, service_name, SERVICE_CHANGE_CONFIG) : NULL;
+  if (!scm) {
+    DWORD gle = GetLastError();
+    wchar_t line[256];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]),
+               enabled ? L"lifecycle_uninstall_restore_recovery_failed gle=%lu"
+                       : L"lifecycle_uninstall_disable_recovery_failed gle=%lu",
+               (unsigned long)gle);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    return SERVICE_RECOVERY_CONFIG_FAILED;
+  }
+  SC_HANDLE svc = OpenServiceW(scm, service_name, SERVICE_CHANGE_CONFIG);
+  if (!svc) {
+    DWORD gle = GetLastError();
+    if (gle == ERROR_SERVICE_DOES_NOT_EXIST) {
+      append_log_utf8(log_path, L"lifecycle_uninstall_service_recovery_not_applicable service_missing");
+      CloseServiceHandle(scm);
+      return SERVICE_RECOVERY_NOT_APPLICABLE;
+    }
+    wchar_t line[256];
+    _snwprintf(line, sizeof(line) / sizeof(line[0]),
+               enabled ? L"lifecycle_uninstall_restore_recovery_failed gle=%lu"
+                       : L"lifecycle_uninstall_disable_recovery_failed gle=%lu",
+               (unsigned long)gle);
+    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    append_log_utf8(log_path, line);
+    CloseServiceHandle(scm);
+    return SERVICE_RECOVERY_CONFIG_FAILED;
+  }
   SC_ACTION actions[2];
   SERVICE_FAILURE_ACTIONSW failure;
   SERVICE_FAILURE_ACTIONS_FLAG failure_flag;
@@ -1313,7 +1347,7 @@ static int configure_service_recovery(const wchar_t *service_name, int enabled,
     failure.lpsaActions = actions;
   }
   failure_flag.fFailureActionsOnNonCrashFailures = FALSE;
-  if (!svc || !ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure) ||
+  if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure) ||
       !ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag)) {
     DWORD gle = GetLastError();
     wchar_t line[256];
@@ -1323,20 +1357,20 @@ static int configure_service_recovery(const wchar_t *service_name, int enabled,
                (unsigned long)gle);
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
     append_log_utf8(log_path, line);
-    if (svc) CloseServiceHandle(svc);
-    if (scm) CloseServiceHandle(scm);
-    return 0;
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return SERVICE_RECOVERY_CONFIG_FAILED;
   }
   CloseServiceHandle(svc);
   CloseServiceHandle(scm);
   append_log_utf8(log_path, enabled ? L"lifecycle_uninstall_service_recovery_restored"
                                     : L"lifecycle_uninstall_service_recovery_disabled");
-  return 1;
+  return SERVICE_RECOVERY_CONFIGURED;
 }
 
 static int lifecycle_uninstall_failed(const wchar_t *service_name,
                                       const wchar_t *log_path, int rc) {
-  if (configure_service_recovery(service_name, 1, log_path)) {
+  if (configure_service_recovery(service_name, 1, log_path) == SERVICE_RECOVERY_CONFIGURED) {
     int start_rc = start_service_by_name(service_name, log_path);
     append_log_utf8(log_path, start_rc == 0 ? L"lifecycle_uninstall_failure_service_restarted"
                                              : L"lifecycle_uninstall_failure_service_restart_failed");
@@ -1356,7 +1390,7 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
     append_log_utf8(log_path, L"lifecycle_uninstall_missing_uninstall_exe");
     return 8;
   }
-  if (!configure_service_recovery(service_name, 0, log_path)) {
+  if (configure_service_recovery(service_name, 0, log_path) == SERVICE_RECOVERY_CONFIG_FAILED) {
     configure_service_recovery(service_name, 1, log_path);
     return 13;
   }

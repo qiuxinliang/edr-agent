@@ -917,6 +917,12 @@ int main(void) {
            "native uninstaller must survive Agent service Job Object teardown");
   contains(installer_worker, "lifecycle_uninstall_service_recovery_disabled",
            "remote uninstall must disable SCM recovery before stopping the Agent service");
+  contains(installer_worker, "gle == ERROR_SERVICE_DOES_NOT_EXIST",
+           "scheduled-task installs must not fail uninstall when no Windows service exists");
+  contains(installer_worker, "SERVICE_RECOVERY_CONFIG_FAILED",
+           "SCM failures other than a missing service must still block uninstall");
+  contains(installer_worker, "lifecycle_uninstall_service_recovery_not_applicable service_missing",
+           "missing-service recovery bypass must remain visible in lifecycle diagnostics");
   contains(installer_worker, "lifecycle_uninstall_service_recovery_restored",
            "failed remote uninstall must restore SCM recovery before recovering the Agent service");
   contains(installer_worker, "lifecycle_uninstall_failure_service_restarted",
