@@ -32,6 +32,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:CriticalErrors = @()
+$script:CleanupWarnings = @()
 $script:DeferredRuntimePaths = @()
 $script:TargetProcessIds = @()
 $script:UninstallStage = "initialization"
@@ -64,6 +65,7 @@ function Add-TargetProcessId {
 function Add-CleanupWarning {
   param([string]$Message)
   if (-not [string]::IsNullOrWhiteSpace($Message)) {
+    $script:CleanupWarnings += $Message
     Write-Warning $Message
   }
 }
@@ -94,6 +96,7 @@ function Write-UninstallScriptReceipt {
       error_type = $ErrorType
       error_position = $ErrorPosition
       critical_errors = @($script:CriticalErrors)
+      cleanup_warnings = @($script:CleanupWarnings)
       deferred_runtime_paths = @($script:DeferredRuntimePaths)
     } | ConvertTo-Json -Depth 3
     $receiptJSON | Set-Content -LiteralPath $script:UninstallReceiptPath `
@@ -151,7 +154,21 @@ function Remove-AgentClientCertificate {
       Write-Host "Client certificate not found: $scope\My\$thumbprint"
     }
   } catch {
-    Add-CriticalFailure ("Client certificate cleanup failed: " + $_.Exception.Message)
+    Add-CleanupWarning ("Certificate provider removal failed; trying certutil: " + $_.Exception.Message)
+    try {
+      $certutilArguments = @()
+      if ($scope -eq "CurrentUser") { $certutilArguments += "-user" }
+      $certutilArguments += @("-delstore", "My", $thumbprint)
+      $certutilOutput = (& certutil.exe @certutilArguments 2>&1 | Out-String).Trim()
+      if ($certutilOutput) { Write-Host $certutilOutput }
+    } catch {
+      Add-CleanupWarning ("certutil client certificate removal failed: " + $_.Exception.Message)
+    }
+    if (Test-Path -LiteralPath $certPath) {
+      Add-CriticalFailure "Client certificate still exists after uninstall cleanup: $scope\My\$thumbprint"
+    } else {
+      Write-Host "Removed client certificate with certutil: $scope\My\$thumbprint"
+    }
   }
 }
 
@@ -346,7 +363,15 @@ function Remove-AgentScheduledTasks {
       Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
       Write-Host "Removed scheduled task: $name"
     } catch {
-      Add-CriticalFailure ("Failed to remove scheduled task ${name}: " + $_.Exception.Message)
+      Add-CleanupWarning ("Failed to remove scheduled task ${name}: " + $_.Exception.Message)
+    }
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+      try {
+        $taskOutput = (& schtasks.exe /Delete /F /TN $name 2>&1 | Out-String).Trim()
+        if ($taskOutput) { Write-Host $taskOutput }
+      } catch {
+        Add-CleanupWarning ("Scheduled task fallback removal failed for ${name}: " + $_.Exception.Message)
+      }
     }
     if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
       Add-CriticalFailure "Scheduled task '$name' still exists after uninstall cleanup"
@@ -376,7 +401,7 @@ function Remove-MachineEnvironment {
       "EDR_CMD_ENABLED"
     )) {
     try { [Environment]::SetEnvironmentVariable($name, $null, "Machine") } catch {
-      Add-CriticalFailure ("Failed to remove machine environment variable " + $name + ": " + $_.Exception.Message)
+      Add-CleanupWarning ("Failed to remove machine environment variable " + $name + ": " + $_.Exception.Message)
     }
   }
 }
@@ -391,7 +416,7 @@ function Remove-HeadlessUninstallRegistration {
       throw "registry key still exists after removal"
     }
   } catch {
-    Add-CriticalFailure ("Failed to remove uninstall registry entry: " + $_.Exception.Message)
+    Add-CleanupWarning ("Failed to remove uninstall registry entry: " + $_.Exception.Message)
   }
 }
 

@@ -838,6 +838,18 @@ int main(void) {
            "complete uninstall routes persistent runtime locks to final directory proof");
   contains(uninstall_script, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
            "uninstall diagnostics identify files delegated to deferred cleanup");
+  contains(uninstall_script, "cleanup_warnings = @($script:CleanupWarnings)",
+           "non-runtime cleanup warnings remain auditable without stranding program files");
+  contains(uninstall_script, "$certutilArguments += @(\"-delstore\", \"My\", $thumbprint)",
+           "certificate cleanup has a direct fallback before enforcing identity removal");
+  contains(uninstall_script, "Client certificate still exists after uninstall cleanup:",
+           "uninstall does not report success while endpoint identity remains installed");
+  contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove machine environment variable ",
+           "environment cleanup failures do not block service and program removal");
+  contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove uninstall registry entry:",
+           "uninstall registration cleanup failures do not block program removal");
+  contains(uninstall_script, "& schtasks.exe /Delete /F /TN $name",
+           "scheduled task cleanup has a direct fallback before continuing program removal");
   contains(uninstall_script, "deletion_last_error = `$deleteLastError",
            "deferred cleanup records the final directory deletion error");
   contains(uninstall_script, "remaining_entries = @(`$remainingEntries)",
