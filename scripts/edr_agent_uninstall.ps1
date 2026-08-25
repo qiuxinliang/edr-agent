@@ -295,6 +295,22 @@ function Remove-AgentServices {
   }
 }
 
+function Restore-AgentServiceAfterFailure {
+  $serviceNames = @($ServiceName, "FDSecurityAgent", "EdrAgent")
+  if ($env:EDR_SERVICE_NAME) { $serviceNames += $env:EDR_SERVICE_NAME }
+  foreach ($name in ($serviceNames | Select-Object -Unique)) {
+    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { continue }
+    try {
+      & sc.exe failure $name reset= 86400 actions= restart/60000/restart/60000 | Out-Null
+      & sc.exe failureflag $name 0 | Out-Null
+      Start-Service -Name $name -ErrorAction Stop
+      Write-Warning "Uninstall failed before service removal; restored Agent service availability: $name"
+    } catch {
+      Add-CleanupWarning ("Unable to restore Agent service ${name} after uninstall failure: " + $_.Exception.Message)
+    }
+  }
+}
+
 function Export-AgentDiagnostics {
   $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
   $archiveRoot = Join-Path $programData "FDSecurity\UninstallArchive"
@@ -418,7 +434,6 @@ Start-Sleep -Milliseconds 750
 `$targetPids = @($targetPidLiteral)
 try { & takeown.exe /F `$target /A /R /D Y | Out-Null } catch {}
 try {
-  & icacls.exe `$target /inheritance:e /T /C /Q | Out-Null
   & icacls.exe `$target /reset /T /C /Q | Out-Null
   & icacls.exe `$target /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
 } catch {}
@@ -759,9 +774,11 @@ try {
     Set-UninstallStage -Stage "diagnostics_archive"
     $diagnosticArchive = Export-AgentDiagnostics
   }
-  if ($RemoveData) {
+  if ($RemoveData -and -not $RemoveProgramFiles) {
     Set-UninstallStage -Stage "runtime_data_cleanup"
     Remove-AgentData
+  } elseif ($RemoveData) {
+    Write-Host "Runtime data will be removed once by the deferred program directory cleanup."
   } elseif ($PreserveDiagnostics) {
     Write-Host "Only logs and diagnostics were archived; credentials, configuration and runtime state will not be retained."
   } else {
@@ -786,6 +803,7 @@ try {
   Write-UninstallScriptReceipt -Status "accepted"
 } catch {
   $failure = $_
+  Restore-AgentServiceAfterFailure
   $failureType = $failure.Exception.GetType().FullName
   $failurePosition = $failure.InvocationInfo.PositionMessage
   Write-UninstallScriptReceipt -Status "failed" `

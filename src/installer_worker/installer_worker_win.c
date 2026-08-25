@@ -1400,14 +1400,9 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
     line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
     append_log_utf8(log_path, line);
   }
-  DWORD wait_result = WaitForSingleObject(process.hProcess, 300000);
-  if (wait_result == WAIT_TIMEOUT) {
-    append_log_utf8(log_path, L"lifecycle_uninstall_completion_timeout");
-    TerminateProcess(process.hProcess, ERROR_TIMEOUT);
-    WaitForSingleObject(process.hProcess, 5000);
-    CloseHandle(process.hProcess);
-    return lifecycle_uninstall_failed(service_name, log_path, 10);
-  }
+  /* uninstall.exe owns the bounded PowerShell handoff. Do not impose a second
+   * wall-clock deadline that can kill valid cleanup on a large endpoint. */
+  DWORD wait_result = WaitForSingleObject(process.hProcess, INFINITE);
   if (wait_result != WAIT_OBJECT_0) {
     append_log_utf8(log_path, L"lifecycle_uninstall_wait_failed");
     TerminateProcess(process.hProcess, ERROR_GEN_FAILURE);

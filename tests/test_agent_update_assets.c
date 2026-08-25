@@ -898,6 +898,10 @@ int main(void) {
            "best-effort ETW cleanup cannot block verified service and directory removal");
   contains(uninstall_script, "Write-UninstallScriptReceipt -Status \"running\"",
            "uninstall persists a receipt before entering teardown stages");
+  contains(uninstall_script, "if ($RemoveData -and -not $RemoveProgramFiles)",
+           "full uninstall defers runtime data deletion to the single directory cleanup pass");
+  contains(uninstall_script, "Restore-AgentServiceAfterFailure",
+           "failed uninstall restores a service that still exists");
   contains(uninstall_script, "exit 0",
            "handled native helper warnings cannot leak a stale process exit code");
   free(uninstall_script);
@@ -905,8 +909,8 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/src/installer_worker/installer_worker_win.c", root);
   char *installer_worker = read_file(path);
   require_true(installer_worker != NULL, "read Windows installer worker");
-  contains(installer_worker, "WaitForSingleObject(process.hProcess, 300000)",
-           "remote uninstall observes native uninstaller completion");
+  contains(installer_worker, "WaitForSingleObject(process.hProcess, INFINITE)",
+           "remote uninstall delegates the only bounded handoff window to uninstall.exe");
   contains(installer_worker, "lifecycle_uninstall_launched pid=%lu",
            "remote uninstall logs the launched native uninstaller PID");
   contains(installer_worker, "CREATE_BREAKAWAY_FROM_JOB",
@@ -917,8 +921,8 @@ int main(void) {
            "failed remote uninstall must restore SCM recovery before recovering the Agent service");
   contains(installer_worker, "lifecycle_uninstall_failure_service_restarted",
            "failed remote uninstall must recover endpoint availability after recording failure");
-  contains(installer_worker, "TerminateProcess(process.hProcess, ERROR_TIMEOUT)",
-           "timed-out native uninstall must stop before endpoint service recovery begins");
+  require_true(!strstr(installer_worker, "lifecycle_uninstall_completion_timeout"),
+               "remote uninstall has no duplicate wall-clock cleanup deadline");
   contains(installer_worker, "lifecycle_uninstall_completed",
            "remote uninstall journals verified native completion");
   contains(installer_worker, "--service-name %ls",

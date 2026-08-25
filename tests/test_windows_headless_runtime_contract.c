@@ -351,9 +351,9 @@ int main(void) {
   ok &= require_contains(headless_uninstaller, "STARTF_USESTDHANDLES",
                          "native uninstall must redirect child stdout and stderr for actionable CI diagnostics");
   ok &= require_contains(headless_uninstaller, "wait_for_process(process.hProcess, 240000)",
-                         "native uninstall must bound a stalled PowerShell cleanup");
+                         "native uninstall must bound a stalled PowerShell handoff");
   ok &= require_contains(headless_uninstaller, "TerminateProcess(process, ERROR_TIMEOUT)",
-                         "native uninstall must terminate and report a timed-out PowerShell cleanup");
+                         "native uninstall must recover when the handoff itself stalls");
   ok &= require_contains(headless_uninstaller, "CREATE_BREAKAWAY_FROM_JOB",
                          "PowerShell cleanup must survive parent service Job Object teardown");
   ok &= require_contains(headless_uninstaller, "--capability-probe",
