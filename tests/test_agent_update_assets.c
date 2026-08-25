@@ -848,8 +848,12 @@ int main(void) {
            "environment cleanup failures do not block service and program removal");
   contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove uninstall registry entry:",
            "uninstall registration cleanup failures do not block program removal");
-  contains(uninstall_script, "& schtasks.exe /Delete /F /TN $name",
-           "scheduled task cleanup has a direct fallback before continuing program removal");
+  contains(uninstall_script, "function Invoke-BoundedScheduledTaskCommand",
+           "scheduled task cleanup uses one bounded native command path under LocalSystem");
+  contains(uninstall_script, "$process.WaitForExit($TimeoutMilliseconds)",
+           "scheduled task cleanup cannot block the remote uninstall worker indefinitely");
+  require_true(!strstr(uninstall_script, "Get-ScheduledTask"),
+               "scheduled task cleanup avoids the hanging ScheduledTasks COM path");
   contains(uninstall_script, "deletion_last_error = `$deleteLastError",
            "deferred cleanup records the final directory deletion error");
   contains(uninstall_script, "remaining_entries = @(`$remainingEntries)",

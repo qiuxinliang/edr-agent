@@ -529,8 +529,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
   if (rc == 0) {
     if (!silent) {
       MessageBoxW(NULL,
-                  keep_data ? L"FDSecurity Agent 已卸载，日志和诊断数据已归档到 ProgramData。"
-                            : L"FDSecurity Agent 已卸载。程序目录将在本窗口关闭后清理。",
+                  keep_data ? L"FDSecurity Agent 卸载清理已启动；完成后日志和诊断数据将保留在 ProgramData。"
+                            : L"FDSecurity Agent 卸载清理已启动；程序目录将在本窗口关闭后自动删除。",
                   EDR_UNINSTALL_TITLE, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
     }
   } else if (rc == ERROR_CANCELLED) {

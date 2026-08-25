@@ -332,6 +332,12 @@ int main(void) {
                          "PowerShell variables immediately before a colon must use braced interpolation");
   ok &= require_absent(uninstall_ps, "PID $processId:",
                        "unbraced processId interpolation must not reintroduce a Windows PowerShell parser error");
+  ok &= require_contains(uninstall_ps, "function Invoke-BoundedScheduledTaskCommand",
+                         "scheduled-task cleanup must use the bounded native command path");
+  ok &= require_contains(uninstall_ps, "$process.WaitForExit($TimeoutMilliseconds)",
+                         "scheduled-task cleanup must not block indefinitely under LocalSystem");
+  ok &= require_absent(uninstall_ps, "Get-ScheduledTask",
+                       "uninstall must not enter the hanging ScheduledTasks COM path under LocalSystem");
   free(uninstall_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");
@@ -360,6 +366,8 @@ int main(void) {
                          "native uninstaller must expose a machine-readable release capability probe");
   ok &= require_contains(headless_uninstaller, "\\\"uninstall_attestation\\\":\\\"v2\\\"",
                          "native uninstaller capability probe must declare uninstall attestation v2");
+  ok &= require_contains(headless_uninstaller, "卸载清理已启动",
+                         "manual uninstall must not claim terminal success before deferred deletion finishes");
   free(headless_uninstaller);
 
   char *cmake = read_source(root, "CMakeLists.txt");

@@ -354,27 +354,43 @@ function Export-AgentDiagnostics {
   return $archiveDir
 }
 
+function Invoke-BoundedScheduledTaskCommand {
+  param(
+    [string[]]$Arguments,
+    [int]$TimeoutMilliseconds = 10000
+  )
+  $tool = Join-Path $env:SystemRoot "System32\schtasks.exe"
+  $process = Start-Process -FilePath $tool -ArgumentList $Arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
+  try {
+    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+      try { $process.Kill() } catch {}
+      $null = $process.WaitForExit(5000)
+      return 1460
+    }
+    return [int]$process.ExitCode
+  } finally {
+    $process.Dispose()
+  }
+}
+
 function Remove-AgentScheduledTasks {
   foreach ($name in (@($ServiceName, "FDSecurityAgent", "EdrAgent") | Select-Object -Unique)) {
-    $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    if (-not $task) { continue }
+    $taskArgument = '"' + $name.Replace('"', '\"') + '"'
     try {
-      Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
-      Write-Host "Removed scheduled task: $name"
-    } catch {
-      Add-CleanupWarning ("Failed to remove scheduled task ${name}: " + $_.Exception.Message)
-    }
-    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-      try {
-        $taskOutput = (& schtasks.exe /Delete /F /TN $name 2>&1 | Out-String).Trim()
-        if ($taskOutput) { Write-Host $taskOutput }
-      } catch {
-        Add-CleanupWarning ("Scheduled task fallback removal failed for ${name}: " + $_.Exception.Message)
+      # ScheduledTasks cmdlets can block indefinitely under LocalSystem/session 0.
+      # Use the native tool with one bounded wait for each operation instead.
+      $null = Invoke-BoundedScheduledTaskCommand -Arguments @("/End", "/TN", $taskArgument)
+      $deleteExitCode = Invoke-BoundedScheduledTaskCommand -Arguments @("/Delete", "/F", "/TN", $taskArgument)
+      $queryExitCode = Invoke-BoundedScheduledTaskCommand -Arguments @("/Query", "/TN", $taskArgument)
+      if ($queryExitCode -eq 0) {
+        Add-CriticalFailure "Scheduled task '$name' still exists after uninstall cleanup; delete exit code $deleteExitCode."
+      } elseif ($queryExitCode -eq 1460) {
+        Add-CriticalFailure "Scheduled task '$name' verification timed out after uninstall cleanup."
+      } else {
+        Write-Host "Scheduled task absent after cleanup: $name"
       }
-    }
-    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-      Add-CriticalFailure "Scheduled task '$name' still exists after uninstall cleanup"
+    } catch {
+      Add-CriticalFailure ("Scheduled task cleanup failed for " + $name + ": " + $_.Exception.Message)
     }
   }
 }
