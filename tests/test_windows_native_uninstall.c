@@ -192,15 +192,19 @@ cleanup:
 }
 
 static int edr_finalizer_foundation_self_test(void) {
-  wchar_t source[MAX_PATH_LONG];
-  wchar_t root[MAX_PATH_LONG];
-  wchar_t sibling[MAX_PATH_LONG];
-  wchar_t sentinel[MAX_PATH_LONG];
-  wchar_t target[MAX_PATH_LONG];
-  wchar_t empty_dir[MAX_PATH_LONG];
-  wchar_t payload[MAX_PATH_LONG];
-  wchar_t link_path[MAX_PATH_LONG];
-  wchar_t command[32768];
+  /* This executable runs one self-test; long-path scratch must not consume the
+     Windows default thread stack before the first assertion can run. */
+  static wchar_t source[MAX_PATH_LONG];
+  static wchar_t root[MAX_PATH_LONG];
+  static wchar_t sibling[MAX_PATH_LONG];
+  static wchar_t sentinel[MAX_PATH_LONG];
+  static wchar_t target[MAX_PATH_LONG];
+  static wchar_t empty_dir[MAX_PATH_LONG];
+  static wchar_t payload[MAX_PATH_LONG];
+  static wchar_t link_path[MAX_PATH_LONG];
+  static wchar_t nested_dir[MAX_PATH_LONG];
+  static wchar_t nested_child[MAX_PATH_LONG];
+  static wchar_t command[32768];
   DWORD source_length;
   BYTE secret[] = "edr.local.uninstall.handoff.v1";
   SECURITY_ATTRIBUTES pipe_security;
@@ -275,6 +279,23 @@ static int edr_finalizer_foundation_self_test(void) {
       !edr_finalizer_safe_delete_tree(empty_dir, &cleanup_error) ||
       !edr_finalizer_copy_verified(source, target)) {
     goto cleanup;
+  }
+  wcscpy(nested_dir, root);
+  {
+    unsigned int depth;
+    for (depth = 0; depth < 12; ++depth) {
+      wchar_t component[16];
+      _snwprintf(component, sizeof(component) / sizeof(component[0]),
+                 L"depth-%u", depth);
+      component[(sizeof(component) / sizeof(component[0])) - 1] = L'\0';
+      if (!join_path(nested_child,
+                     sizeof(nested_child) / sizeof(nested_child[0]),
+                     nested_dir, component) ||
+          !edr_finalizer_secure_directory(nested_child)) {
+        goto cleanup;
+      }
+      wcscpy(nested_dir, nested_child);
+    }
   }
   {
     HANDLE file = CreateFileW(payload, GENERIC_WRITE, FILE_SHARE_READ,

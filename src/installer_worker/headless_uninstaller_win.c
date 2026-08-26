@@ -337,42 +337,66 @@ static int edr_finalizer_is_volume_root(const wchar_t *canonical) {
 }
 
 static int edr_finalizer_is_protected_root(const wchar_t *canonical) {
-  wchar_t windows_dir[MAX_PATH_LONG];
-  wchar_t common_data[MAX_PATH_LONG];
-  wchar_t program_files[MAX_PATH_LONG];
-  wchar_t protected_root[MAX_PATH_LONG];
+  wchar_t *paths;
+  wchar_t *system_path;
+  wchar_t *protected_root;
   DWORD length;
+  int protected = 0;
 
   if (!canonical ||
       !((canonical[0] >= L'A' && canonical[0] <= L'Z') ||
         (canonical[0] >= L'a' && canonical[0] <= L'z')) ||
       canonical[1] != L':' || canonical[2] != L'\\') return 1;
   if (edr_finalizer_is_volume_root(canonical)) return 1;
-  length = GetWindowsDirectoryW(windows_dir,
-                                (DWORD)(sizeof(windows_dir) / sizeof(windows_dir[0])));
-  if (length && edr_finalizer_is_exact_path(canonical, windows_dir)) return 1;
-  if (length && _wcsnicmp(canonical, windows_dir, length) == 0 &&
-      (canonical[length] == L'\\' || canonical[length] == L'/')) return 1;
+  paths = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                               2u * MAX_PATH_LONG * sizeof(wchar_t));
+  if (!paths) return 1;
+  system_path = paths;
+  protected_root = paths + MAX_PATH_LONG;
+  length = GetWindowsDirectoryW(system_path, MAX_PATH_LONG);
+  if (!length || length >= MAX_PATH_LONG) {
+    protected = 1;
+    goto cleanup;
+  }
+  if (edr_finalizer_is_exact_path(canonical, system_path)) {
+    protected = 1;
+    goto cleanup;
+  }
+  if (_wcsnicmp(canonical, system_path, length) == 0 &&
+      (canonical[length] == L'\\' || canonical[length] == L'/')) {
+    protected = 1;
+    goto cleanup;
+  }
 
   if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, SHGFP_TYPE_CURRENT,
-                       common_data) == S_OK &&
-      edr_finalizer_canonical_path(common_data, protected_root,
-                                   (DWORD)(sizeof(protected_root) / sizeof(protected_root[0])))) {
-    if (edr_finalizer_is_exact_path(canonical, protected_root)) return 1;
+                       system_path) == S_OK &&
+      edr_finalizer_canonical_path(system_path, protected_root, MAX_PATH_LONG) &&
+      edr_finalizer_is_exact_path(canonical, protected_root)) {
+    protected = 1;
+    goto cleanup;
   }
   if (SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, SHGFP_TYPE_CURRENT,
-                       program_files) == S_OK &&
-      edr_finalizer_canonical_path(program_files, protected_root,
-                                   (DWORD)(sizeof(protected_root) / sizeof(protected_root[0])))) {
-    if (edr_finalizer_is_exact_path(canonical, protected_root)) return 1;
+                       system_path) == S_OK &&
+      edr_finalizer_canonical_path(system_path, protected_root, MAX_PATH_LONG) &&
+      edr_finalizer_is_exact_path(canonical, protected_root)) {
+    protected = 1;
   }
-  return 0;
+cleanup:
+  HeapFree(GetProcessHeap(), 0, paths);
+  return protected;
 }
 
 static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out) {
   FILE_ATTRIBUTE_TAG_INFO tag_info;
   DWORD root_attributes;
   DWORD root_error;
+  wchar_t *path;
+  HANDLE root_handle;
+  DWORD canonical_length;
+  WIN32_FIND_DATAW item;
+  HANDLE find;
+  int ok = 1;
+  DWORD last_error = ERROR_SUCCESS;
   if (!root || !root[0]) {
     if (error_out) *error_out = ERROR_INVALID_PARAMETER;
     return 0;
@@ -387,14 +411,19 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
     if (error_out) *error_out = root_error;
     return 0;
   }
-  wchar_t canonical[MAX_PATH_LONG];
-  HANDLE root_handle = CreateFileW(root, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                   NULL, OPEN_EXISTING,
-                                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                                   NULL);
+  path = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, MAX_PATH_LONG * sizeof(wchar_t));
+  if (!path) {
+    if (error_out) *error_out = ERROR_NOT_ENOUGH_MEMORY;
+    return 0;
+  }
+  root_handle = CreateFileW(root, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                            NULL);
   if (root_handle == INVALID_HANDLE_VALUE) {
     if (error_out) *error_out = edr_finalizer_last_error();
+    HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
   if (!GetFileInformationByHandleEx(root_handle, FileAttributeTagInfo,
@@ -403,48 +432,71 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
       !(tag_info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
     CloseHandle(root_handle);
     if (error_out) *error_out = ERROR_INVALID_REPARSE_DATA;
+    HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
-  DWORD canonical_length = GetFinalPathNameByHandleW(root_handle, canonical,
-                                                      (DWORD)(sizeof(canonical) / sizeof(canonical[0])),
-                                                      FILE_NAME_NORMALIZED);
+  canonical_length = GetFinalPathNameByHandleW(root_handle, path, MAX_PATH_LONG,
+                                               FILE_NAME_NORMALIZED);
   CloseHandle(root_handle);
-  if (!canonical_length || canonical_length >= sizeof(canonical) / sizeof(canonical[0])) {
+  if (!canonical_length || canonical_length >= MAX_PATH_LONG) {
     if (error_out) *error_out = canonical_length ? ERROR_BUFFER_OVERFLOW : GetLastError();
+    HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
-  if (!edr_finalizer_normalize_final_path(canonical, sizeof(canonical) / sizeof(canonical[0])) ||
-      edr_finalizer_is_protected_root(canonical)) {
+  if (!edr_finalizer_normalize_final_path(path, MAX_PATH_LONG) ||
+      edr_finalizer_is_protected_root(path)) {
     if (error_out) *error_out = ERROR_ACCESS_DENIED;
+    HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
-  wchar_t pattern[MAX_PATH_LONG]; if (!join_path(pattern, sizeof(pattern) / sizeof(pattern[0]), root, L"*")) { if (error_out) *error_out = ERROR_BUFFER_OVERFLOW; return 0; }
-  WIN32_FIND_DATAW item;
-  HANDLE find = FindFirstFileW(pattern, &item);
+  if (!join_path(path, MAX_PATH_LONG, root, L"*")) {
+    if (error_out) *error_out = ERROR_BUFFER_OVERFLOW;
+    HeapFree(GetProcessHeap(), 0, path);
+    return 0;
+  }
+  find = FindFirstFileW(path, &item);
   if (find == INVALID_HANDLE_VALUE) {
     DWORD find_error = edr_finalizer_last_error();
     if (find_error == ERROR_FILE_NOT_FOUND || find_error == ERROR_PATH_NOT_FOUND) {
       if (!RemoveDirectoryW(root)) {
         if (error_out) *error_out = edr_finalizer_last_error();
+        HeapFree(GetProcessHeap(), 0, path);
         return 0;
       }
       if (error_out) *error_out = ERROR_SUCCESS;
+      HeapFree(GetProcessHeap(), 0, path);
       return 1;
     }
     if (error_out) *error_out = find_error;
+    HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
-  int ok = 1; DWORD last_error = ERROR_SUCCESS;
   do {
     if (!wcscmp(item.cFileName, L".") || !wcscmp(item.cFileName, L"..")) continue;
-    wchar_t child[MAX_PATH_LONG]; if (!join_path(child, sizeof(child) / sizeof(child[0]), root, item.cFileName)) { ok = 0; last_error = ERROR_BUFFER_OVERFLOW; break; }
+    if (!join_path(path, MAX_PATH_LONG, root, item.cFileName)) {
+      ok = 0;
+      last_error = ERROR_BUFFER_OVERFLOW;
+      break;
+    }
     if (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-      if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? !RemoveDirectoryW(child) : !DeleteFileW(child)) { ok = 0; last_error = GetLastError(); break; }
+      if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? !RemoveDirectoryW(path)
+                                                           : !DeleteFileW(path)) {
+        ok = 0;
+        last_error = GetLastError();
+        break;
+      }
     } else if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      if (!edr_finalizer_safe_delete_tree(child, &last_error)) { ok = 0; break; }
+      if (!edr_finalizer_safe_delete_tree(path, &last_error)) {
+        ok = 0;
+        break;
+      }
     } else {
-      SetFileAttributesW(child, FILE_ATTRIBUTE_NORMAL);
-      if (!DeleteFileW(child)) { ok = 0; last_error = GetLastError(); break; }
+      SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+      if (!DeleteFileW(path)) {
+        ok = 0;
+        last_error = GetLastError();
+        break;
+      }
     }
   } while (FindNextFileW(find, &item));
   if (ok && GetLastError() != ERROR_NO_MORE_FILES) {
@@ -452,8 +504,12 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
     last_error = GetLastError();
   }
   FindClose(find);
-  if (ok && !RemoveDirectoryW(root)) { ok = 0; last_error = GetLastError(); }
+  if (ok && !RemoveDirectoryW(root)) {
+    ok = 0;
+    last_error = GetLastError();
+  }
   if (error_out) *error_out = ok ? ERROR_SUCCESS : last_error;
+  HeapFree(GetProcessHeap(), 0, path);
   return ok;
 }
 
