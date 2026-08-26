@@ -288,6 +288,12 @@ int main(void) {
   ok &= require_contains(headless_uninstaller,
                          "result = (int)finalizer_exit;",
                          "coordinator must return the finalizer preflight error instead of generic code 31");
+  ok &= require_contains(headless_uninstaller,
+                         "error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION",
+                         "native uninstall must bound retries to transient Windows file locks");
+  ok &= require_contains(headless_uninstaller,
+                         "stage=finalizer\\nerror=%d\\npath=%s\\n",
+                         "native uninstall failure receipt must identify the blocked path");
   ok &= require_count(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1", 1,
                       "native Inno cleanup must pass exactly one coordination marker");
   free(headless_uninstaller);

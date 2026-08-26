@@ -142,6 +142,42 @@ static int suppressed(const char *rule_id, EdrBehaviorRecord *r, const char *det
   return ok;
 }
 
+static void init_signed_edge_update(EdrBehaviorRecord *r) {
+  init_record(r);
+  snprintf(r->process_name, sizeof(r->process_name), "MicrosoftEdgeUpdate.exe");
+  snprintf(r->exe_path, sizeof(r->exe_path),
+           "C:\\Program Files (x86)\\Microsoft\\Temp\\EU8AA.tmp\\MicrosoftEdgeUpdate.exe");
+  snprintf(r->exe_hash, sizeof(r->exe_hash),
+           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  snprintf(r->cmdline, sizeof(r->cmdline),
+           "\"C:\\Program Files (x86)\\Microsoft\\Temp\\EU8AA.tmp\\MicrosoftEdgeUpdate.exe\" /update /sessionid \"{788F1F69-597A-44E0-B28D-F001647BB3BB}\"");
+  snprintf(r->parent_name, sizeof(r->parent_name), "MicrosoftEdgeUpdateSetup_X86_1.3.239.19.exe");
+  snprintf(r->parent_path, sizeof(r->parent_path),
+           "C:\\Program Files (x86)\\Microsoft\\EdgeUpdate\\Install\\x\\MicrosoftEdgeUpdateSetup_X86_1.3.239.19.exe");
+  snprintf(r->script_snippet, sizeof(r->script_snippet),
+           "signature_status=trusted signer=Microsoft Corporation");
+}
+
+static void test_edge_update_signed_chain_is_suppressed(void) {
+  EdrBehaviorRecord r;
+  init_signed_edge_update(&r);
+  assert(suppressed("R-LOLBIN-010", &r, r.cmdline, "microsoft_edge_update_temp_baseline"));
+}
+
+static void test_edge_update_without_signature_is_not_suppressed(void) {
+  EdrBehaviorRecord r;
+  init_signed_edge_update(&r);
+  r.script_snippet[0] = '\0';
+  assert(!suppressed("R-LOLBIN-010", &r, r.cmdline, NULL));
+}
+
+static void test_edge_update_malicious_command_is_not_suppressed(void) {
+  EdrBehaviorRecord r;
+  init_signed_edge_update(&r);
+  strncat(r.cmdline, " -EncodedCommand AAAA", sizeof(r.cmdline) - strlen(r.cmdline) - 1u);
+  assert(!suppressed("R-LOLBIN-010", &r, r.cmdline, NULL));
+}
+
 static void test_fdsecurity_sensor_task_is_suppressed(void) {
   EdrBehaviorRecord r;
   init_record(&r);
@@ -301,6 +337,9 @@ static void test_searchprotocolhost_no_cmdline_user_path_not_suppressed(void) {
 }
 
 int main(void) {
+  test_edge_update_signed_chain_is_suppressed();
+  test_edge_update_without_signature_is_not_suppressed();
+  test_edge_update_malicious_command_is_not_suppressed();
   test_fdsecurity_sensor_task_is_suppressed();
   test_fdsecurity_setup_diagnostics_is_suppressed();
   test_fdsecurity_arbitrary_dll_is_not_suppressed();

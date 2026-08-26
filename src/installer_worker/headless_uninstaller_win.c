@@ -33,6 +33,10 @@
 
 #define EDR_UNINSTALL_TITLE L"FDSecurity Agent Uninstaller"
 #define EDR_FINALIZER_IO_TIMEOUT_MS 5000u
+#ifndef EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS
+#define EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS 5000u
+#endif
+#define EDR_FINALIZER_DELETE_RETRY_INTERVAL_MS 100u
 #define MAX_PATH_LONG 32768
 static const char *HEADLESS_UNINSTALLER_CAPABILITIES =
     "{\"schema\":\"edr.windows.native-capabilities.v1\","
@@ -386,7 +390,48 @@ cleanup:
   return protected;
 }
 
-static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out) {
+static void edr_finalizer_record_failure_path(wchar_t *out, size_t out_count,
+                                              const wchar_t *path) {
+  size_t length;
+  if (!out || out_count == 0) return;
+  out[0] = L'\0';
+  if (!path) return;
+  length = wcslen(path);
+  if (length >= out_count) length = out_count - 1;
+  memcpy(out, path, length * sizeof(wchar_t));
+  out[length] = L'\0';
+}
+
+static int edr_finalizer_delete_path_with_retry(const wchar_t *path, int directory,
+                                                 DWORD *error_out,
+                                                 ULONGLONG retry_deadline) {
+  DWORD error = ERROR_SUCCESS;
+  for (;;) {
+    ULONGLONG now;
+    DWORD delay_ms;
+    if (directory ? RemoveDirectoryW(path) : DeleteFileW(path)) {
+      if (error_out) *error_out = ERROR_SUCCESS;
+      return 1;
+    }
+    error = edr_finalizer_last_error();
+    now = GetTickCount64();
+    if ((error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) ||
+        now >= retry_deadline) {
+      if (error_out) *error_out = error;
+      return 0;
+    }
+    delay_ms = (DWORD)(retry_deadline - now);
+    if (delay_ms > EDR_FINALIZER_DELETE_RETRY_INTERVAL_MS) {
+      delay_ms = EDR_FINALIZER_DELETE_RETRY_INTERVAL_MS;
+    }
+    Sleep(delay_ms);
+  }
+}
+
+static int edr_finalizer_safe_delete_tree_until(const wchar_t *root, DWORD *error_out,
+                                                wchar_t *failure_path,
+                                                size_t failure_path_count,
+                                                ULONGLONG retry_deadline) {
   FILE_ATTRIBUTE_TAG_INFO tag_info;
   DWORD root_attributes;
   DWORD root_error;
@@ -399,6 +444,7 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
   DWORD last_error = ERROR_SUCCESS;
   if (!root || !root[0]) {
     if (error_out) *error_out = ERROR_INVALID_PARAMETER;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     return 0;
   }
   root_attributes = GetFileAttributesW(root);
@@ -409,11 +455,13 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
       return 1;
     }
     if (error_out) *error_out = root_error;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     return 0;
   }
   path = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, MAX_PATH_LONG * sizeof(wchar_t));
   if (!path) {
     if (error_out) *error_out = ERROR_NOT_ENOUGH_MEMORY;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     return 0;
   }
   root_handle = CreateFileW(root, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -423,6 +471,7 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
                             NULL);
   if (root_handle == INVALID_HANDLE_VALUE) {
     if (error_out) *error_out = edr_finalizer_last_error();
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
@@ -432,6 +481,7 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
       !(tag_info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
     CloseHandle(root_handle);
     if (error_out) *error_out = ERROR_INVALID_REPARSE_DATA;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
@@ -440,17 +490,20 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
   CloseHandle(root_handle);
   if (!canonical_length || canonical_length >= MAX_PATH_LONG) {
     if (error_out) *error_out = canonical_length ? ERROR_BUFFER_OVERFLOW : GetLastError();
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
   if (!edr_finalizer_normalize_final_path(path, MAX_PATH_LONG) ||
       edr_finalizer_is_protected_root(path)) {
     if (error_out) *error_out = ERROR_ACCESS_DENIED;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
   if (!join_path(path, MAX_PATH_LONG, root, L"*")) {
     if (error_out) *error_out = ERROR_BUFFER_OVERFLOW;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
@@ -458,8 +511,9 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
   if (find == INVALID_HANDLE_VALUE) {
     DWORD find_error = edr_finalizer_last_error();
     if (find_error == ERROR_FILE_NOT_FOUND || find_error == ERROR_PATH_NOT_FOUND) {
-      if (!RemoveDirectoryW(root)) {
-        if (error_out) *error_out = edr_finalizer_last_error();
+      if (!edr_finalizer_delete_path_with_retry(root, 1, error_out,
+                                                retry_deadline)) {
+        edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
         HeapFree(GetProcessHeap(), 0, path);
         return 0;
       }
@@ -468,6 +522,7 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
       return 1;
     }
     if (error_out) *error_out = find_error;
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
     HeapFree(GetProcessHeap(), 0, path);
     return 0;
   }
@@ -476,25 +531,30 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
     if (!join_path(path, MAX_PATH_LONG, root, item.cFileName)) {
       ok = 0;
       last_error = ERROR_BUFFER_OVERFLOW;
+      edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
       break;
     }
     if (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-      if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? !RemoveDirectoryW(path)
-                                                           : !DeleteFileW(path)) {
+      if (!edr_finalizer_delete_path_with_retry(
+              path, (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+              &last_error, retry_deadline)) {
         ok = 0;
-        last_error = GetLastError();
+        edr_finalizer_record_failure_path(failure_path, failure_path_count, path);
         break;
       }
     } else if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      if (!edr_finalizer_safe_delete_tree(path, &last_error)) {
+      if (!edr_finalizer_safe_delete_tree_until(path, &last_error,
+                                                failure_path, failure_path_count,
+                                                retry_deadline)) {
         ok = 0;
         break;
       }
     } else {
       SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-      if (!DeleteFileW(path)) {
+      if (!edr_finalizer_delete_path_with_retry(path, 0, &last_error,
+                                                retry_deadline)) {
         ok = 0;
-        last_error = GetLastError();
+        edr_finalizer_record_failure_path(failure_path, failure_path_count, path);
         break;
       }
     }
@@ -502,15 +562,25 @@ static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out)
   if (ok && GetLastError() != ERROR_NO_MORE_FILES) {
     ok = 0;
     last_error = GetLastError();
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
   }
   FindClose(find);
-  if (ok && !RemoveDirectoryW(root)) {
+  if (ok && !edr_finalizer_delete_path_with_retry(root, 1, &last_error,
+                                                  retry_deadline)) {
     ok = 0;
-    last_error = GetLastError();
+    edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
   }
   if (error_out) *error_out = ok ? ERROR_SUCCESS : last_error;
   HeapFree(GetProcessHeap(), 0, path);
   return ok;
+}
+
+static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out,
+                                          wchar_t *failure_path,
+                                          size_t failure_path_count) {
+  return edr_finalizer_safe_delete_tree_until(
+      root, error_out, failure_path, failure_path_count,
+      GetTickCount64() + EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS);
 }
 
 static DWORD edr_finalizer_schedule_self_delete(const wchar_t *path) {
@@ -901,11 +971,14 @@ static int edr_native_run_inno_uninstaller(const wchar_t *install_dir) {
                                 install_dir, 120000);
 }
 
-static int edr_native_delete_install_root(const wchar_t *install_dir) {
+static int edr_native_delete_install_root(const wchar_t *install_dir,
+                                          wchar_t *failure_path,
+                                          size_t failure_path_count) {
   wchar_t uninstaller[MAX_PATH_LONG];
   wchar_t data[MAX_PATH_LONG];
   DWORD error = ERROR_SUCCESS;
   int inno_present;
+  if (failure_path && failure_path_count) failure_path[0] = L'\0';
   if (!join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir,
                  L"unins000.exe") ||
       !join_path(data, sizeof(data) / sizeof(data[0]), install_dir, L"unins000.dat")) {
@@ -921,7 +994,10 @@ static int edr_native_delete_install_root(const wchar_t *install_dir) {
     int exit_code = edr_native_run_inno_uninstaller(install_dir);
     if (exit_code != 0) return exit_code;
   }
-  if (!edr_finalizer_safe_delete_tree(install_dir, &error)) return (int)error;
+  if (!edr_finalizer_safe_delete_tree(install_dir, &error,
+                                      failure_path, failure_path_count)) {
+    return (int)error;
+  }
   return ERROR_SUCCESS;
 }
 
@@ -1246,7 +1322,8 @@ static int edr_native_validate_certificate_identity(const wchar_t *install_dir,
   return 1;
 }
 
-static void edr_native_write_failure_receipt(const wchar_t *self_path, int error) {
+static void edr_native_write_failure_receipt(const wchar_t *self_path, int error,
+                                             const wchar_t *failure_path) {
   wchar_t receipt[MAX_PATH_LONG];
   wchar_t temporary[MAX_PATH_LONG];
   wchar_t directory[MAX_PATH_LONG];
@@ -1254,7 +1331,10 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path, int error
   SECURITY_ATTRIBUTES security;
   PSECURITY_DESCRIPTOR descriptor = NULL;
   HANDLE file = INVALID_HANDLE_VALUE;
-  char content[128];
+  char *content = NULL;
+  char *path_utf8 = NULL;
+  SIZE_T content_capacity = 128;
+  int path_utf8_count = 0;
   int written;
   DWORD bytes_written = 0;
   int write_ok = 0;
@@ -1270,23 +1350,61 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path, int error
                  L"%ls\\last-native-uninstall-failure.receipt", directory) < 0 ||
       _snwprintf(temporary, sizeof(temporary) / sizeof(temporary[0]),
                  L"%ls\\last-native-uninstall-failure.receipt.tmp", directory) < 0) return;
-  if (!edr_finalizer_security_attributes(&security, &descriptor)) return;
+  if (failure_path && failure_path[0]) {
+    path_utf8_count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                          failure_path, -1, NULL, 0, NULL, NULL);
+    if (path_utf8_count > 0) {
+      path_utf8 = (char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)path_utf8_count);
+      if (!path_utf8 ||
+          WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, failure_path, -1,
+                              path_utf8, path_utf8_count, NULL, NULL) != path_utf8_count) {
+        if (path_utf8) HeapFree(GetProcessHeap(), 0, path_utf8);
+        path_utf8 = NULL;
+      } else {
+        char *cursor;
+        for (cursor = path_utf8; *cursor; ++cursor) {
+          if (*cursor == '\r' || *cursor == '\n') *cursor = '?';
+        }
+        content_capacity += (SIZE_T)path_utf8_count + 6;
+      }
+    }
+  }
+  content = (char *)HeapAlloc(GetProcessHeap(), 0, content_capacity);
+  if (!content) {
+    if (path_utf8) HeapFree(GetProcessHeap(), 0, path_utf8);
+    return;
+  }
+  if (!edr_finalizer_security_attributes(&security, &descriptor)) goto cleanup;
   file = CreateFileW(temporary, GENERIC_WRITE, FILE_SHARE_READ, &security, CREATE_ALWAYS,
                      FILE_ATTRIBUTE_NORMAL, NULL);
   LocalFree(descriptor);
-  if (file == INVALID_HANDLE_VALUE) return;
-  written = _snprintf(content, sizeof(content), "stage=finalizer\nerror=%d\n", error);
-  if (written > 0 && (size_t)written < sizeof(content) &&
+  if (file == INVALID_HANDLE_VALUE) goto cleanup;
+  written = path_utf8
+                ? _snprintf(content, content_capacity,
+                            "stage=finalizer\nerror=%d\npath=%s\n", error, path_utf8)
+                : _snprintf(content, content_capacity,
+                            "stage=finalizer\nerror=%d\n", error);
+  if (written > 0 && (SIZE_T)written < content_capacity &&
       WriteFile(file, content, (DWORD)written, &bytes_written, NULL) &&
       bytes_written == (DWORD)written) {
     write_ok = FlushFileBuffers(file) != FALSE;
   }
-  SecureZeroMemory(content, sizeof(content));
   CloseHandle(file);
+  file = INVALID_HANDLE_VALUE;
   if (write_ok) {
     (void)MoveFileExW(temporary, receipt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
   } else {
     DeleteFileW(temporary);
+  }
+cleanup:
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  if (content) {
+    SecureZeroMemory(content, content_capacity);
+    HeapFree(GetProcessHeap(), 0, content);
+  }
+  if (path_utf8) {
+    SecureZeroMemory(path_utf8, (SIZE_T)path_utf8_count);
+    HeapFree(GetProcessHeap(), 0, path_utf8);
   }
 }
 
@@ -1536,6 +1654,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   int self_delete_attempted = 0;
   DWORD parent_pid = 0;
   HANDLE parent_handle = NULL;
+  wchar_t *failure_path = NULL;
   static const BYTE ready[] = "edr.finalizer.ready.v1";
 
   ZeroMemory(token, sizeof(token));
@@ -1641,7 +1760,13 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   if (result != ERROR_SUCCESS) goto cleanup;
   result = edr_native_remove_registration();
   if (result != ERROR_SUCCESS) goto cleanup;
-  result = edr_native_delete_install_root(install_dir);
+  failure_path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                      MAX_PATH_LONG * sizeof(wchar_t));
+  if (!failure_path) {
+    result = ERROR_NOT_ENOUGH_MEMORY;
+    goto cleanup;
+  }
+  result = edr_native_delete_install_root(install_dir, failure_path, MAX_PATH_LONG);
   if (result != ERROR_SUCCESS) goto cleanup;
   result = edr_native_verify_removed(install_dir, service_name);
   if (result != ERROR_SUCCESS) goto cleanup;
@@ -1677,13 +1802,16 @@ cleanup:
     self_length = GetModuleFileNameW(NULL, self_path,
                                      (DWORD)(sizeof(self_path) / sizeof(self_path[0])));
     if (self_length && self_length < sizeof(self_path) / sizeof(self_path[0])) {
-      if (result != ERROR_SUCCESS) edr_native_write_failure_receipt(self_path, result);
+      if (result != ERROR_SUCCESS) {
+        edr_native_write_failure_receipt(self_path, result, failure_path);
+      }
       if (!self_delete_attempted) (void)edr_finalizer_schedule_self_delete(self_path);
     }
   }
   if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
   if (acknowledgement != INVALID_HANDLE_VALUE) CloseHandle(acknowledgement);
   if (parent_handle) CloseHandle(parent_handle);
+  if (failure_path) HeapFree(GetProcessHeap(), 0, failure_path);
   SecureZeroMemory(token, sizeof(token));
   return result;
 }

@@ -4,6 +4,7 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#define EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS 1000u
 #define wWinMain edr_native_test_embedded_entry
 #include "../src/installer_worker/headless_uninstaller_win.c"
 #undef wWinMain
@@ -36,6 +37,94 @@ static int edr_finalizer_unique_directory(wchar_t *out, size_t out_count) {
   RpcStringFreeW(&uuid_text);
   if (written < 0 || (size_t)written >= out_count) return 0;
   return edr_finalizer_secure_directory(out);
+}
+
+typedef struct EdrDelayedHandleClose {
+  HANDLE handle;
+  DWORD delay_ms;
+} EdrDelayedHandleClose;
+
+static DWORD WINAPI edr_delayed_handle_close_thread(LPVOID context) {
+  EdrDelayedHandleClose *close = (EdrDelayedHandleClose *)context;
+  Sleep(close->delay_ms);
+  return CloseHandle(close->handle) ? ERROR_SUCCESS : GetLastError();
+}
+
+static int edr_test_transient_locked_delete(const wchar_t *root) {
+  static wchar_t directory[MAX_PATH_LONG];
+  static wchar_t file_path[MAX_PATH_LONG];
+  static wchar_t failure_path[MAX_PATH_LONG];
+  HANDLE file = INVALID_HANDLE_VALUE;
+  HANDLE close_thread = NULL;
+  EdrDelayedHandleClose delayed_close;
+  DWORD error = ERROR_SUCCESS;
+  DWORD thread_exit = ERROR_GEN_FAILURE;
+  int ok = 0;
+
+  failure_path[0] = L'\0';
+  ZeroMemory(&delayed_close, sizeof(delayed_close));
+  if (!join_path(directory, sizeof(directory) / sizeof(directory[0]),
+                 root, L"transient-lock") ||
+      !join_path(file_path, sizeof(file_path) / sizeof(file_path[0]),
+                 directory, L"startup-task.log") ||
+      !edr_finalizer_secure_directory(directory)) {
+    goto cleanup;
+  }
+  file = CreateFileW(file_path, GENERIC_WRITE, FILE_SHARE_READ,
+                     NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE) goto cleanup;
+  delayed_close.handle = file;
+  delayed_close.delay_ms = 250;
+  close_thread = CreateThread(NULL, 0, edr_delayed_handle_close_thread,
+                              &delayed_close, 0, NULL);
+  if (!close_thread) goto cleanup;
+  file = INVALID_HANDLE_VALUE;
+  if (!edr_finalizer_safe_delete_tree(directory, &error,
+                                      failure_path,
+                                      sizeof(failure_path) / sizeof(failure_path[0])) ||
+      error != ERROR_SUCCESS || failure_path[0] != L'\0' ||
+      WaitForSingleObject(close_thread, 5000) != WAIT_OBJECT_0 ||
+      !GetExitCodeThread(close_thread, &thread_exit) || thread_exit != ERROR_SUCCESS ||
+      GetFileAttributesW(directory) != INVALID_FILE_ATTRIBUTES) {
+    goto cleanup;
+  }
+  CloseHandle(close_thread);
+  close_thread = NULL;
+
+  failure_path[0] = L'\0';
+  error = ERROR_SUCCESS;
+  if (!edr_finalizer_secure_directory(directory)) goto cleanup;
+  file = CreateFileW(file_path, GENERIC_WRITE, FILE_SHARE_READ,
+                     NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE ||
+      edr_finalizer_safe_delete_tree(directory, &error,
+                                     failure_path,
+                                     sizeof(failure_path) / sizeof(failure_path[0])) ||
+      error != ERROR_SHARING_VIOLATION ||
+      _wcsicmp(failure_path, file_path) != 0) {
+    goto cleanup;
+  }
+  CloseHandle(file);
+  file = INVALID_HANDLE_VALUE;
+  if (!edr_finalizer_safe_delete_tree(directory, &error, NULL, 0)) goto cleanup;
+  ok = 1;
+
+cleanup:
+  if (!ok) {
+    fwprintf(stderr,
+             L"transient locked delete failed: error=%lu path=%ls thread_exit=%lu\n",
+             (unsigned long)error, failure_path,
+             (unsigned long)thread_exit);
+  }
+  if (close_thread) {
+    WaitForSingleObject(close_thread, 5000);
+    CloseHandle(close_thread);
+  }
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  if (GetFileAttributesW(directory) != INVALID_FILE_ATTRIBUTES) {
+    (void)edr_finalizer_safe_delete_tree(directory, &error, NULL, 0);
+  }
+  return ok;
 }
 
 typedef struct EdrSpawnLockProbe {
@@ -306,10 +395,12 @@ static int edr_finalizer_foundation_self_test(void) {
   }
   failure_stage = "empty-delete-and-copy";
   if (!edr_finalizer_secure_directory(empty_dir) ||
-      !edr_finalizer_safe_delete_tree(empty_dir, &cleanup_error) ||
+      !edr_finalizer_safe_delete_tree(empty_dir, &cleanup_error, NULL, 0) ||
       !edr_finalizer_copy_verified(source, target)) {
     goto cleanup;
   }
+  failure_stage = "transient-locked-delete";
+  if (!edr_test_transient_locked_delete(root)) goto cleanup;
   failure_stage = "recursive-delete-fixture";
   wcscpy(nested_dir, root);
   {
@@ -460,7 +551,7 @@ cleanup:
   if (handoff.ack_read != INVALID_HANDLE_VALUE) CloseHandle(handoff.ack_read);
   SecureZeroMemory(secret, sizeof(secret));
   if (root[0]) {
-    root_deleted = edr_finalizer_safe_delete_tree(root, &cleanup_error);
+    root_deleted = edr_finalizer_safe_delete_tree(root, &cleanup_error, NULL, 0);
     if (!root_deleted && result == ERROR_SUCCESS) {
       failure_stage = "cleanup-root";
       failure_error = cleanup_error;
@@ -474,7 +565,8 @@ cleanup:
     result = ERROR_DATA_CHECKSUM_ERROR;
   }
   if (sibling[0] && GetFileAttributesW(sibling) != INVALID_FILE_ATTRIBUTES &&
-      !edr_finalizer_safe_delete_tree(sibling, &cleanup_error) && result == ERROR_SUCCESS) {
+      !edr_finalizer_safe_delete_tree(sibling, &cleanup_error, NULL, 0) &&
+      result == ERROR_SUCCESS) {
     failure_stage = "cleanup-sibling";
     failure_error = cleanup_error;
     result = (int)cleanup_error;

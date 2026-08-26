@@ -1,7 +1,7 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 2,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r276-89b04a96",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r276-2b3b6a19",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 173,
@@ -532,7 +532,7 @@
       "mitre_ttps": [
         "T1021.006"
       ],
-      "description": "5985/5986 端口异常连接",
+      "description": "检测到主机通过 WinRM 默认管理端口 5985/5986 建立远程管理连接。WinRM 可被用于远程执行 PowerShell 或命令并向其他主机横向移动；仅端口命中不能单独确认攻击，应结合发起进程、目标资产、账户与登录行为判断。对应 ATT&CK T1021.006，潜在影响包括远程命令执行、凭据滥用和横向扩散。",
       "condition": {
         "remote_port_in": [
           5985,
@@ -2887,9 +2887,12 @@
         "T1059",
         "T1218"
       ],
-      "description": "cmd/powershell/wmic/certutil/regsvr32 等系统文件从 %TEMP%/%APPDATA% 等非系统目录执行(攻击者重命名绕过进程名白名单)",
+      "description": "cmd/powershell/wmic/certutil/regsvr32 等系统二进制的实际进程映像从 %TEMP%/%APPDATA% 等非系统目录执行；脚本参数位于临时目录不构成本规则命中。",
       "condition": {
-        "command_regex_any": [
+        "process_name_regex_any": [
+          "(?i)^(bitsadmin|certutil|checknetisolation|cmd|cmstp|conhost|control|cscript|desktopimgdownldr|diantz|expand|extrac32|findstr|forfiles|hh|ieexec|installutil|makecab|mavinject|microsoftedgeupdate|msbuild|msconfig|mshta|msiexec|odbcconf|powershell|presentationhost|pwsh|reg|regasm|regsvcs|regsvr32|replace|rundll32|sc|schtasks|scriptrunner|searchprotocolhost|syncappvpublishingserver|wmic|wscript|xwizard)\\.exe$"
+        ],
+        "process_path_regex_any": [
           "(?i)\\\\Temp\\\\|\\\\AppData\\\\Local\\\\Temp\\\\",
           "(?i)\\\\AppData\\\\Roaming\\\\",
           "(?i)\\\\Users\\\\.+\\\\Downloads\\\\"

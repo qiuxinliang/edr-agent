@@ -29,7 +29,7 @@
 #endif
 
 #ifndef EDR_P0_RULES_BUNDLE_VERSION
-#define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r276-89b04a96"
+#define EDR_P0_RULES_BUNDLE_VERSION "edr-dynamic-rules-v1-r276-2b3b6a19"
 #endif
 
 /* 同一 (rule_id, endpoint_id, pid, event_time_ns) 在窗口内不重复上送。
@@ -150,6 +150,123 @@ static int p0_contains_ci(const char *hay, const char *needle) {
   return 0;
 }
 
+static int p0_equals_ci(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  while (*a && *b) {
+    char ca = *a++;
+    char cb = *b++;
+    if (ca == '\\') ca = '/';
+    if (cb == '\\') cb = '/';
+    if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+    if (ca != cb) {
+      return 0;
+    }
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static int p0_path_ends_with_ci(const char *value, const char *suffix) {
+  size_t nv;
+  size_t ns;
+  if (!value || !suffix) {
+    return 0;
+  }
+  nv = strlen(value);
+  ns = strlen(suffix);
+  return nv >= ns && p0_equals_ci(value + nv - ns, suffix);
+}
+
+static int p0_is_sha256_hex(const char *value) {
+  if (!value || strlen(value) != 64u) {
+    return 0;
+  }
+  for (size_t i = 0u; i < 64u; i++) {
+    char c = value[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* 仅用于维护基线匹配：统一大小写、路径分隔符、引号和连续空白，
+ * 避免同一签名命令因转义/空格差异形成重复基线。 */
+static void p0_normalize_maintenance_command(const char *input, char *out, size_t cap) {
+  size_t used = 0u;
+  int pending_space = 0;
+  if (!out || cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (!input) {
+    return;
+  }
+  for (const char *p = input; *p && used + 1u < cap; p++) {
+    char c = *p;
+    if (c == '"' || c == '\'') {
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      pending_space = used > 0u ? 1 : 0;
+      continue;
+    }
+    if (pending_space && used + 1u < cap) {
+      out[used++] = ' ';
+      pending_space = 0;
+    }
+    if (c == '\\') {
+      c = '/';
+    } else if (c >= 'A' && c <= 'Z') {
+      c = (char)(c - 'A' + 'a');
+    }
+    out[used++] = c;
+  }
+  out[used] = '\0';
+}
+
+static int p0_has_trusted_signature_evidence(const EdrBehaviorRecord *br, const char *signer_fragment) {
+  int trusted;
+  int signer_ok;
+  if (!br || !signer_fragment || !signer_fragment[0]) {
+    return 0;
+  }
+  trusted = p0_contains_ci(br->script_snippet, "signature_status=trusted") ||
+            p0_contains_ci(br->script_snippet, "signature_status=verified") ||
+            p0_contains_ci(br->script_snippet, "signature_status=valid") ||
+            p0_contains_ci(br->detection_context, "\"signature_trust\":{\"status\":\"trusted\"") ||
+            p0_contains_ci(br->detection_context, "\"signature_trust\":{\"status\":\"verified\"") ||
+            p0_contains_ci(br->detection_context, "\"signature_trust\":{\"status\":\"valid\"");
+  signer_ok = (p0_contains_ci(br->script_snippet, "signer=") &&
+               p0_contains_ci(br->script_snippet, signer_fragment)) ||
+              (p0_contains_ci(br->detection_context, "\"signer\":") &&
+               p0_contains_ci(br->detection_context, signer_fragment));
+  return trusted && signer_ok;
+}
+
+static int p0_has_maintenance_hard_blocker(const EdrBehaviorRecord *br, const char *normalized_cmd) {
+  static const char *blocked[] = {
+      "-enc ", "-encodedcommand", "frombase64string", "downloadstring", "invoke-expression",
+      "iex ", "invoke-webrequest", "invoke-restmethod", "http://", "https://", "ftp://",
+      "mimikatz", "sekurlsa", "lsass", "vssadmin", "delete shadows", "set-mppreference",
+      "add-mppreference", "regsvr32", "rundll32", "mshta", "certutil -urlcache"};
+  if (!br) {
+    return 1;
+  }
+  for (size_t i = 0u; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+    if (p0_contains_ci(normalized_cmd, blocked[i]) || p0_contains_ci(br->script_snippet, blocked[i]) ||
+        p0_contains_ci(br->detection_context, blocked[i])) {
+      return 1;
+    }
+  }
+  if (br->net_dst[0] || br->dns_query[0] || br->cert_revoked_ancestor) {
+    return 1;
+  }
+  return 0;
+}
+
 static int p0_is_agent_internal_command(const EdrBehaviorRecord *br) {
   const char *cmd = br ? br->cmdline : NULL;
   if (!br) {
@@ -248,20 +365,29 @@ static int p0_is_known_smoke_command(const EdrBehaviorRecord *br, const char *de
 
 static int p0_is_edge_update_temp_baseline(const EdrBehaviorRecord *br, const char *detail) {
   const char *cmd = (detail && detail[0]) ? detail : (br ? br->cmdline : NULL);
-  if (!br) {
+  char normalized[EDR_BR_STR_LONG];
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || !cmd || !cmd[0]) {
     return 0;
   }
-  if (!p0_contains_ci(br->process_name, "MicrosoftEdgeUpdate.exe") &&
-      !p0_contains_ci(br->exe_path, "\\MicrosoftEdgeUpdate.exe") &&
-      !p0_contains_ci(cmd, "\\MicrosoftEdgeUpdate.exe")) {
+  p0_normalize_maintenance_command(cmd, normalized, sizeof(normalized));
+  if (!p0_equals_ci(br->process_name, "MicrosoftEdgeUpdate.exe") ||
+      !p0_path_ends_with_ci(br->exe_path, "\\MicrosoftEdgeUpdate.exe") ||
+      !p0_contains_ci(br->exe_path, "\\Program Files (x86)\\Microsoft\\Temp\\EU")) {
     return 0;
   }
-  if (p0_contains_ci(br->exe_path, "\\Program Files (x86)\\Microsoft\\Temp\\EUF") ||
-      p0_contains_ci(br->cmdline, "\\Program Files (x86)\\Microsoft\\Temp\\EUF") ||
-      p0_contains_ci(cmd, "\\Program Files (x86)\\Microsoft\\Temp\\EUF")) {
-    return 1;
+  if (!p0_contains_ci(br->parent_name, "MicrosoftEdgeUpdateSetup_") ||
+      !p0_path_ends_with_ci(br->parent_name, ".exe") ||
+      !p0_contains_ci(br->parent_path, "\\Microsoft\\EdgeUpdate\\Install\\")) {
+    return 0;
   }
-  return 0;
+  if (!p0_contains_ci(normalized, " /update ") ||
+      !p0_contains_ci(normalized, " /sessionid ") ||
+      p0_has_maintenance_hard_blocker(br, normalized)) {
+    return 0;
+  }
+  /* 临时目录中的更新器只有在 Authenticode 信任链、Microsoft 发布者和
+   * 当前映像 SHA-256 同时存在时才降噪；缺任一项均保留告警。 */
+  return p0_has_trusted_signature_evidence(br, "Microsoft") && p0_is_sha256_hex(br->exe_hash);
 }
 
 static int p0_is_sangfor_checknetisolation_baseline(const EdrBehaviorRecord *br, const char *detail) {

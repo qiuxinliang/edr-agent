@@ -58,6 +58,8 @@ struct p0_ir_one {
   int n_cmd_all;
   pcre2_code *re_pn_rx[P0_IR_PAT];
   int n_pn_rx;
+  pcre2_code *re_ppath_rx[P0_IR_PAT];
+  int n_ppath_rx;
   pcre2_code *re_pr_rx[P0_IR_PAT];
   int n_pr_rx;
   pcre2_code *re_fpath[P0_IR_PAT];
@@ -292,6 +294,10 @@ static void p0_ir_free_pcre_in_rule(struct p0_ir_one *r) {
       pcre2_code_free((pcre2_code *)r->re_pn_rx[i]);
       r->re_pn_rx[i] = NULL;
     }
+    if (r->re_ppath_rx[i]) {
+      pcre2_code_free((pcre2_code *)r->re_ppath_rx[i]);
+      r->re_ppath_rx[i] = NULL;
+    }
     if (r->re_pr_rx[i]) {
       pcre2_code_free((pcre2_code *)r->re_pr_rx[i]);
       r->re_pr_rx[i] = NULL;
@@ -505,7 +511,8 @@ static int try_load_default_paths(void) {
 }
 
 static int one_rule_match_process(
-    const struct p0_ir_one *r, const char *process_name, const char *cmdline, const char *parent_name, int pchain) {
+    const struct p0_ir_one *r, const char *process_name, const char *process_path,
+    const char *cmdline, const char *parent_name, int pchain) {
   const char *cmd = cmdline ? cmdline : "";
   const char *par = parent_name ? parent_name : "";
   char pnlow[1024];
@@ -530,6 +537,12 @@ static int one_rule_match_process(
   }
   if (r->n_pn_rx > 0) {
     if (!any_pcre((pcre2_code *const *)r->re_pn_rx, r->n_pn_rx, process_name ? process_name : "")) {
+      return 0;
+    }
+  }
+  if (r->n_ppath_rx > 0) {
+    if (!process_path || !process_path[0] ||
+        !any_pcre((pcre2_code *const *)r->re_ppath_rx, r->n_ppath_rx, process_path)) {
       return 0;
     }
   }
@@ -724,7 +737,8 @@ static int p0_rule_has_constraints(const char *et, const struct p0_ir_one *r) {
   if (strcmp(et, "process_create") == 0 || strcmp(et, "script_powershell") == 0 ||
       strcmp(et, "powershell_script") == 0 || strcmp(et, "script_wmi") == 0 ||
       strcmp(et, "wmi_script") == 0) {
-    return r->n_name_in > 0 || r->n_parent_in > 0 || r->n_pn_rx > 0 || r->n_pr_rx > 0 || r->n_cmd_any > 0 ||
+    return r->n_name_in > 0 || r->n_parent_in > 0 || r->n_pn_rx > 0 || r->n_ppath_rx > 0 ||
+           r->n_pr_rx > 0 || r->n_cmd_any > 0 ||
            r->n_cmd_all > 0 || r->chain_gt > 0;
   }
   if (strcmp(et, "file_read") == 0 || strcmp(et, "file_write") == 0) {
@@ -755,7 +769,8 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
       pn = "wmiprvse.exe";
     }
     return one_rule_match_process(
-        r, pn, cmd, br->parent_name[0] ? br->parent_name : NULL, (int)br->process_chain_depth
+        r, pn, br->exe_path[0] ? br->exe_path : NULL, cmd,
+        br->parent_name[0] ? br->parent_name : NULL, (int)br->process_chain_depth
     );
   }
   if (strcmp(r->event_type, "file_read") == 0 || strcmp(r->event_type, "file_write") == 0) {
@@ -880,6 +895,9 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       );
       add_rx_array(
           jcond, "process_name_regex_any", t.re_pn_rx, &t.n_pn_rx, P0_IR_PAT, jid->valuestring
+      );
+      add_rx_array(
+          jcond, "process_path_regex_any", t.re_ppath_rx, &t.n_ppath_rx, P0_IR_PAT, jid->valuestring
       );
       add_rx_array(
           jcond, "parent_name_regex_any", t.re_pr_rx, &t.n_pr_rx, P0_IR_PAT, jid->valuestring
@@ -1062,7 +1080,7 @@ int edr_p0_rule_ir_matches(const char *rule_id, const char *process_name, const 
       return 0;
     }
     return one_rule_match_process(
-               &s_rule[i], process_name, cmdline, parent_name, process_chain_depth
+               &s_rule[i], process_name, NULL, cmdline, parent_name, process_chain_depth
            )
              ? 1
              : 0;

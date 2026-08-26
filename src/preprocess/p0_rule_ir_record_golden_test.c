@@ -44,7 +44,8 @@ int main(void) {
   int i_lmove = find_rule_index("R-LMOVE-001");
   int i_def = find_rule_index("R-DEFENSE-001");
   int i_t1138 = find_rule_index("R-MITRE-WIN-T1138");
-  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_def < 0 || i_t1138 < 0) {
+  int i_lolbin10 = find_rule_index("R-LOLBIN-010");
+  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_def < 0 || i_t1138 < 0 || i_lolbin10 < 0) {
     fprintf(stderr, "[p0_ir_record] missing expected rule in bundle (indices)\n");
     return 1;
   }
@@ -156,9 +157,29 @@ int main(void) {
     return 1;
   }
 
+  /* R-LOLBIN-010 必须检查实际映像路径，而不是把临时脚本参数误当成临时二进制。 */
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_PROCESS_CREATE;
+  snprintf(br.process_name, sizeof(br.process_name), "powershell.exe");
+  snprintf(br.exe_path, sizeof(br.exe_path), "%s",
+           "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(br.cmdline, sizeof(br.cmdline), "%s",
+           "powershell.exe -File C:\\Windows\\Temp\\edr-agent-post-upgrade-verify.ps1");
+  if (!check_br("LOLBIN-010 maintenance script argument miss", &br, i_lolbin10, 0)) {
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_PROCESS_CREATE;
+  snprintf(br.process_name, sizeof(br.process_name), "powershell.exe");
+  snprintf(br.exe_path, sizeof(br.exe_path), "%s", "C:\\Windows\\Temp\\powershell.exe");
+  snprintf(br.cmdline, sizeof(br.cmdline), "%s", "C:\\Windows\\Temp\\powershell.exe -EncodedCommand AAAA");
+  if (!check_br("LOLBIN-010 temp image hit", &br, i_lolbin10, 1)) {
+    return 1;
+  }
+
   fprintf(
       stderr,
-      "[p0_ir_record] ok (file_read / file_write / network_connect / registry_set / T1138 process golden)\n"
+      "[p0_ir_record] ok (file_read / file_write / network_connect / registry_set / process path golden)\n"
   );
   return 0;
 }
