@@ -495,6 +495,8 @@ int main(void) {
            "release workflow uses an explicit Windows build target allowlist");
   contains(client_release, "'native-package-integrity\\.json'",
            "release workflow rejects packages missing native component integrity metadata");
+  require_true(!strstr(client_release, "uninstall\\.ps1"),
+               "release package gate must not require the removed PowerShell uninstaller");
   contains(client_release, "Initialize-VS2022Environment.ps1",
            "release workflow pins the Visual Studio compiler generation on both architectures");
   contains(client_release, "bootstrap_pinned_vcpkg.ps1",
@@ -544,6 +546,8 @@ int main(void) {
            "client build workflow packages native component SHA-256 identities");
   contains(client_build, "'native-package-integrity\\.json'",
            "client build workflow rejects packages missing native component integrity metadata");
+  require_true(!strstr(client_build, "uninstall\\.ps1"),
+               "client build package gate must not require the removed PowerShell uninstaller");
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
            "client build waits for GUI subsystem capability probes through the shared runner");
   contains(client_build, "actions/setup-dotnet@v5",

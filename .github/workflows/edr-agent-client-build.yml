@@ -517,7 +517,6 @@ jobs:
               'windows_isolate_host\.ps1',
               'FDSecurityInstallerWorker\.exe',
               'uninstall\.exe',
-              'uninstall\.ps1',
               'native-package-integrity\.json',
               'WinDivert\.dll',
               'WinDivert64\.sys',
