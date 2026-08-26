@@ -295,6 +295,7 @@ try {
     -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-$Architecture" -UpdateScript $targetUpdater
 
   $stage = "uninstall"
+  $agentProcessId = [int](Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).ProcessId
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
   # Rollback restores the baseline runtime. Preserve its DLL hashes and update

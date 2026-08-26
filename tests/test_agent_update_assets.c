@@ -684,6 +684,10 @@ int main(void) {
            "lifecycle selects the current detached lifecycle worker");
   contains(lifecycle_smoke, "Start-Process -FilePath (Join-Path $installDir \"uninstall.exe\")",
            "lifecycle smoke exercises the same native coordinator used by local uninstall");
+  contains_before(lifecycle_smoke,
+                  "$agentProcessId = [int](Get-CimInstance Win32_Service",
+                  "Wait-ProcessDeleted -ProcessId $agentProcessId",
+                  "lifecycle captures the running Agent PID before verifying native uninstall cleanup");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
   contains(lifecycle_smoke, "$targetNativeHashes[$component.Name] = $actualHash",
