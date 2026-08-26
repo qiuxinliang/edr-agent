@@ -686,6 +686,15 @@ int main(void) {
            "lifecycle smoke exercises the same native coordinator used by local uninstall");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
+  contains(lifecycle_smoke, "$targetNativeHashes[$component.Name] = $actualHash",
+           "lifecycle retains the target manifest hashes after validating native components");
+  contains(lifecycle_smoke, "$installedEntry[0].sha256 = $targetNativeHashes[$componentName]",
+           "lifecycle updates only copied native components while preserving baseline DLL hashes");
+  require_true(!strstr(lifecycle_smoke,
+                       "Copy-Item -LiteralPath $targetNativeIntegrity -Destination"),
+               "lifecycle does not attach a full target DLL manifest to a rolled-back baseline runtime");
+  contains(lifecycle_smoke, "[ComponentModel.Win32Exception]::new",
+           "lifecycle reports the propagated finalizer exit code as an actionable Win32 error");
   contains(lifecycle_smoke, "invoke_windows_native_capability_probe.ps1",
            "lifecycle waits for GUI subsystem capability probes before reading evidence");
   require_true(!strstr(lifecycle_smoke, "headless uninstall failed with exit code $LASTEXITCODE"),

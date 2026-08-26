@@ -1881,7 +1881,20 @@ static int edr_native_coordinator(int argc, wchar_t **argv) {
   handoff.ack_read = ack_read;
   secret_write = INVALID_HANDLE_VALUE;
   ack_read = INVALID_HANDLE_VALUE;
-  if (!edr_finalizer_exchange_ready(&handoff, handoff_secret, handoff_secret_length)) goto cleanup;
+  if (!edr_finalizer_exchange_ready(&handoff, handoff_secret, handoff_secret_length)) {
+    DWORD wait_result = WaitForSingleObject(process.hProcess, EDR_FINALIZER_IO_TIMEOUT_MS);
+    DWORD finalizer_exit = STILL_ACTIVE;
+    if (wait_result == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &finalizer_exit) &&
+        finalizer_exit != STILL_ACTIVE) {
+      result = (int)finalizer_exit;
+    } else if (wait_result == WAIT_TIMEOUT) {
+      result = ERROR_TIMEOUT;
+    } else {
+      result = ERROR_BROKEN_PIPE;
+    }
+    goto cleanup;
+  }
   SecureZeroMemory(token, sizeof(token));
   if (external_ack != INVALID_HANDLE_VALUE) {
     static const BYTE coordinator_ready[] = "edr.finalizer.ready.v1";

@@ -206,6 +206,7 @@ $nativeIntegrity = Get-Content -LiteralPath $targetNativeIntegrity -Raw | Conver
 if ($nativeIntegrity.schema -ne "edr.windows.native-package-integrity.v1") {
   throw "target package native integrity manifest schema mismatch"
 }
+$targetNativeHashes = @{}
 foreach ($component in @(
     @{ Name = "FDSecurityInstallerWorker.exe"; Path = $targetLifecycleWorker },
     @{ Name = "uninstall.exe"; Path = $targetUninstaller }
@@ -219,6 +220,7 @@ foreach ($component in @(
   if ($expectedHash -cne $actualHash) {
     throw "target package native integrity hash mismatch for $($component.Name)"
   }
+  $targetNativeHashes[$component.Name] = $actualHash
 }
 $workerProbe = Join-Path $EvidenceDir "installer-worker-capabilities.json"
 $uninstallerProbe = Join-Path $EvidenceDir "headless-uninstaller-capabilities.json"
@@ -295,12 +297,28 @@ try {
   $stage = "uninstall"
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
-  Copy-Item -LiteralPath $targetNativeIntegrity -Destination (Join-Path $installDir "native-package-integrity.json") -Force
+  # Rollback restores the baseline runtime. Preserve its DLL hashes and update
+  # only the two target lifecycle components copied into this test fixture.
+  $installedNativeIntegrityPath = Join-Path $installDir "native-package-integrity.json"
+  $installedNativeIntegrity = Get-Content -LiteralPath $installedNativeIntegrityPath -Raw | ConvertFrom-Json
+  if ($installedNativeIntegrity.schema -ne "edr.windows.native-package-integrity.v1") {
+    throw "installed baseline native integrity manifest schema mismatch"
+  }
+  foreach ($componentName in @("FDSecurityInstallerWorker.exe", "uninstall.exe")) {
+    $installedEntry = @($installedNativeIntegrity.files | Where-Object { $_.name -eq $componentName })
+    if ($installedEntry.Count -ne 1) {
+      throw "installed baseline native integrity manifest is missing $componentName"
+    }
+    $installedEntry[0].sha256 = $targetNativeHashes[$componentName]
+  }
+  $installedNativeIntegrity | ConvertTo-Json -Depth 4 | Set-Content `
+    -LiteralPath $installedNativeIntegrityPath -Encoding UTF8
   $uninstallerProcess = Start-Process -FilePath (Join-Path $installDir "uninstall.exe") -ArgumentList @(
     "--silent", "--install-dir", $installDir, "--service-name", $serviceName
   ) -Wait -PassThru
   if ($uninstallerProcess.ExitCode -ne 0) {
-    throw "native uninstall coordinator returned code $($uninstallerProcess.ExitCode)"
+    $uninstallError = [ComponentModel.Win32Exception]::new([int]$uninstallerProcess.ExitCode).Message
+    throw "native uninstall coordinator returned code $($uninstallerProcess.ExitCode): $uninstallError"
   }
   $stage = "verify_uninstall"
   Wait-ServiceDeleted

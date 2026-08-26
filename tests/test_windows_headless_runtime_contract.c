@@ -285,6 +285,9 @@ int main(void) {
   ok &= require_contains(headless_uninstaller,
                          "!thumbprint || !thumbprint[0] ||",
                          "remote uninstall must still require a certificate thumbprint");
+  ok &= require_contains(headless_uninstaller,
+                         "result = (int)finalizer_exit;",
+                         "coordinator must return the finalizer preflight error instead of generic code 31");
   ok &= require_count(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1", 1,
                       "native Inno cleanup must pass exactly one coordination marker");
   free(headless_uninstaller);
