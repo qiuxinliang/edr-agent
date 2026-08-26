@@ -149,6 +149,18 @@ cleanup:
   return 0;
 }
 
+static int edr_test_parse_handle_value(const wchar_t *text, HANDLE *handle_out) {
+  wchar_t *end = NULL;
+  unsigned long long value;
+  if (!text || !text[0] || !handle_out || text[0] < L'0' || text[0] > L'9') return 0;
+  errno = 0;
+  value = _wcstoui64(text, &end, 10);
+  if (errno == ERANGE || !end || *end != L'\0' || value == 0 ||
+      (unsigned long long)(ULONG_PTR)value != value) return 0;
+  *handle_out = (HANDLE)(ULONG_PTR)value;
+  return 1;
+}
+
 static int edr_finalizer_foundation_child(int argc, wchar_t **argv) {
   HANDLE secret_read = INVALID_HANDLE_VALUE;
   HANDLE acknowledgement = INVALID_HANDLE_VALUE;
@@ -163,27 +175,38 @@ static int edr_finalizer_foundation_child(int argc, wchar_t **argv) {
   const BYTE *expected_secret = EDR_LOCAL_HANDOFF_MARKER;
   DWORD expected_secret_length = sizeof(EDR_LOCAL_HANDOFF_MARKER) - 1;
   static const BYTE ready[] = "edr.finalizer.ready.v1";
+  const char *failure_stage = "parse-inherited-handles";
   ZeroMemory(secret, sizeof(secret));
   if (!edr_finalizer_parse_handle(secret_text, &secret_read) ||
       !edr_finalizer_parse_handle(ack_text, &acknowledgement) ||
-      !edr_finalizer_parse_handle(canary_text, &canary) ||
-      !edr_windows_spawn_lock_acquire(&child_spawn_lock)) {
+      !edr_test_parse_handle_value(canary_text, &canary)) {
     goto cleanup;
   }
+  failure_stage = "reject-unlisted-canary";
   {
     DWORD canary_flags = 0;
-    if (GetHandleInformation(canary, &canary_flags) ||
-        !edr_windows_handoff_read_frame(secret_read, secret, sizeof(secret), &secret_length) ||
-        secret_length != expected_secret_length ||
-        memcmp(secret, expected_secret, expected_secret_length) != 0) {
+    if (GetHandleInformation(canary, &canary_flags)) {
       goto cleanup;
     }
   }
+  canary = INVALID_HANDLE_VALUE;
+  failure_stage = "read-handoff-secret";
+  if (!edr_windows_spawn_lock_acquire(&child_spawn_lock) ||
+      !edr_windows_handoff_read_frame(secret_read, secret, sizeof(secret), &secret_length) ||
+      secret_length != expected_secret_length ||
+      memcmp(secret, expected_secret, expected_secret_length) != 0) {
+    goto cleanup;
+  }
   edr_windows_spawn_lock_release(&child_spawn_lock);
   SecureZeroMemory(secret, sizeof(secret));
+  failure_stage = "write-ready-acknowledgement";
   if (!edr_windows_handoff_write_frame(acknowledgement, ready, sizeof(ready) - 1)) goto cleanup;
   ok = 1;
 cleanup:
+  if (!ok) {
+    fprintf(stderr, "windows native uninstall child failed: stage=%s win32=%lu\n",
+            failure_stage, (unsigned long)GetLastError());
+  }
   edr_windows_spawn_lock_release(&child_spawn_lock);
   SecureZeroMemory(secret, sizeof(secret));
   if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
@@ -220,12 +243,14 @@ static int edr_finalizer_foundation_self_test(void) {
   HANDLE probe_thread = NULL;
   EdrSpawnLockProbe probe;
   DWORD cleanup_error = ERROR_SUCCESS;
-  DWORD wait_result;
+  DWORD wait_result = WAIT_FAILED;
+  DWORD failure_error = ERROR_SUCCESS;
   DWORD exit_code = ERROR_GEN_FAILURE;
   int result = ERROR_GEN_FAILURE;
   int created_link = 0;
   int root_deleted = 0;
   int sibling_written;
+  const char *failure_stage = "handoff-frames";
 
   ZeroMemory(&process, sizeof(process));
   ZeroMemory(&handoff, sizeof(handoff));
@@ -233,6 +258,7 @@ static int edr_finalizer_foundation_self_test(void) {
   handoff.ack_read = INVALID_HANDLE_VALUE;
   ZeroMemory(&probe, sizeof(probe));
   if (!edr_test_handoff_frames()) goto cleanup;
+  failure_stage = "local-handoff-marker";
   if (!edr_native_is_local_handoff_marker(EDR_LOCAL_HANDOFF_MARKER,
                                           sizeof(EDR_LOCAL_HANDOFF_MARKER) - 1) ||
       edr_native_valid_bearer_token(EDR_LOCAL_HANDOFF_MARKER,
@@ -240,12 +266,14 @@ static int edr_finalizer_foundation_self_test(void) {
     goto cleanup;
   }
   root[0] = L'\0';
+  failure_stage = "invalid-handle-parser";
   {
     HANDLE rejected_handle = INVALID_HANDLE_VALUE;
     if (edr_finalizer_parse_handle(L"0", &rejected_handle) ||
         edr_finalizer_parse_handle(L"12x", &rejected_handle) ||
         edr_finalizer_parse_handle(L"-1", &rejected_handle)) goto cleanup;
   }
+  failure_stage = "spawn-lock";
   if (!edr_windows_spawn_lock_acquire(&spawn_lock)) goto cleanup;
   probe_thread = CreateThread(NULL, 0, edr_spawn_lock_probe_thread, &probe, 0, NULL);
   if (!probe_thread) goto cleanup;
@@ -257,6 +285,7 @@ static int edr_finalizer_foundation_self_test(void) {
   }
   CloseHandle(probe_thread);
   probe_thread = NULL;
+  failure_stage = "prepare-test-paths";
   sibling[0] = L'\0';
   source_length = GetModuleFileNameW(NULL, source,
                                      (DWORD)(sizeof(source) / sizeof(source[0])));
@@ -275,11 +304,13 @@ static int edr_finalizer_foundation_self_test(void) {
       !join_path(link_path, sizeof(link_path) / sizeof(link_path[0]), root, L"reparse-link")) {
     goto cleanup;
   }
+  failure_stage = "empty-delete-and-copy";
   if (!edr_finalizer_secure_directory(empty_dir) ||
       !edr_finalizer_safe_delete_tree(empty_dir, &cleanup_error) ||
       !edr_finalizer_copy_verified(source, target)) {
     goto cleanup;
   }
+  failure_stage = "recursive-delete-fixture";
   wcscpy(nested_dir, root);
   {
     unsigned int depth;
@@ -297,6 +328,7 @@ static int edr_finalizer_foundation_self_test(void) {
       wcscpy(nested_dir, nested_child);
     }
   }
+  failure_stage = "payload-file";
   {
     HANDLE file = CreateFileW(payload, GENERIC_WRITE, FILE_SHARE_READ,
                               NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -310,6 +342,7 @@ static int edr_finalizer_foundation_self_test(void) {
     }
     CloseHandle(file);
   }
+  failure_stage = "sibling-sentinel";
   if (!edr_finalizer_secure_directory(sibling)) goto cleanup;
   {
     HANDLE sentinel_file = CreateFileW(sentinel, GENERIC_WRITE, FILE_SHARE_READ,
@@ -324,6 +357,7 @@ static int edr_finalizer_foundation_self_test(void) {
     }
     CloseHandle(sentinel_file);
   }
+  failure_stage = "reparse-link";
   {
     if (!CreateSymbolicLinkW(link_path, sibling,
                              SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
@@ -332,6 +366,7 @@ static int edr_finalizer_foundation_self_test(void) {
       created_link = 1;
     }
   }
+  failure_stage = "self-unlink";
   {
     wchar_t self_delete_path[MAX_PATH_LONG];
     HANDLE self_delete_file = INVALID_HANDLE_VALUE;
@@ -350,6 +385,7 @@ static int edr_finalizer_foundation_self_test(void) {
     if (self_delete_error != ERROR_FILE_NOT_FOUND &&
         self_delete_error != ERROR_PATH_NOT_FOUND) goto cleanup;
   }
+  failure_stage = "handoff-pipes";
   ZeroMemory(&pipe_security, sizeof(pipe_security));
   pipe_security.nLength = sizeof(pipe_security);
   pipe_security.bInheritHandle = FALSE;
@@ -358,6 +394,7 @@ static int edr_finalizer_foundation_self_test(void) {
       !CreatePipe(&ack_read, &ack_write, &pipe_security, 0)) goto cleanup;
   canary = CreateEventW(&pipe_security, TRUE, FALSE, NULL);
   if (!canary || !SetHandleInformation(canary, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) goto cleanup;
+  failure_stage = "spawn-foundation-child";
   handles[0] = secret_read;
   handles[1] = ack_write;
   _snwprintf(command, sizeof(command) / sizeof(command[0]),
@@ -368,6 +405,7 @@ static int edr_finalizer_foundation_self_test(void) {
   command[(sizeof(command) / sizeof(command[0])) - 1] = L'\0';
   if (!edr_windows_spawn_whitelisted(command, root, handles, 2, &process,
                                      child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS))) goto cleanup;
+  failure_stage = "parent-handle-flags";
   {
     DWORD secret_flags = 0;
     DWORD ack_flags = 0;
@@ -390,13 +428,17 @@ static int edr_finalizer_foundation_self_test(void) {
   handoff.ack_read = ack_read;
   secret_write = INVALID_HANDLE_VALUE;
   ack_read = INVALID_HANDLE_VALUE;
+  failure_stage = "finalizer-ready-exchange";
   if (!edr_finalizer_exchange_ready(&handoff, secret, sizeof(secret) - 1)) goto cleanup;
   SecureZeroMemory(secret, sizeof(secret));
+  failure_stage = "foundation-child-exit";
   wait_result = WaitForSingleObject(process.hProcess, EDR_FINALIZER_IO_TIMEOUT_MS * 2);
   if (wait_result != WAIT_OBJECT_0 || !GetExitCodeProcess(process.hProcess, &exit_code) ||
       exit_code != 0) goto cleanup;
   result = ERROR_SUCCESS;
+  failure_stage = "complete";
 cleanup:
+  failure_error = GetLastError();
   edr_windows_spawn_lock_release(&spawn_lock);
   if (probe_thread) CloseHandle(probe_thread);
   if (process.hProcess) {
@@ -419,20 +461,34 @@ cleanup:
   SecureZeroMemory(secret, sizeof(secret));
   if (root[0]) {
     root_deleted = edr_finalizer_safe_delete_tree(root, &cleanup_error);
-    if (!root_deleted && result == ERROR_SUCCESS) result = (int)cleanup_error;
+    if (!root_deleted && result == ERROR_SUCCESS) {
+      failure_stage = "cleanup-root";
+      failure_error = cleanup_error;
+      result = (int)cleanup_error;
+    }
   }
   if (created_link && (!root_deleted ||
                        GetFileAttributesW(sibling) == INVALID_FILE_ATTRIBUTES ||
                        GetFileAttributesW(sentinel) == INVALID_FILE_ATTRIBUTES)) {
+    failure_stage = "reparse-target-integrity";
     result = ERROR_DATA_CHECKSUM_ERROR;
   }
   if (sibling[0] && GetFileAttributesW(sibling) != INVALID_FILE_ATTRIBUTES &&
       !edr_finalizer_safe_delete_tree(sibling, &cleanup_error) && result == ERROR_SUCCESS) {
+    failure_stage = "cleanup-sibling";
+    failure_error = cleanup_error;
     result = (int)cleanup_error;
+  }
+  if (result != ERROR_SUCCESS) {
+    fprintf(stderr,
+            "windows native uninstall test failed: stage=%s result=%d win32=%lu "
+            "cleanup=%lu wait=%lu child_exit=%lu\n",
+            failure_stage, result, (unsigned long)failure_error,
+            (unsigned long)cleanup_error, (unsigned long)wait_result,
+            (unsigned long)exit_code);
   }
   return result;
 }
-
 
 int wmain(int argc, wchar_t **argv) {
   if (has_flag(argc, argv, L"--native-foundation-child")) {
