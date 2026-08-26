@@ -840,18 +840,44 @@ int main(void) {
            "uninstall diagnostics identify files delegated to deferred cleanup");
   contains(uninstall_script, "cleanup_warnings = @($script:CleanupWarnings)",
            "non-runtime cleanup warnings remain auditable without stranding program files");
-  contains(uninstall_script, "$certutilArguments += @(\"-delstore\", \"My\", $thumbprint)",
-           "certificate cleanup has a direct fallback before enforcing identity removal");
+  contains(uninstall_script, "Invoke-BoundedNativeCommand -FilePath $certutil -Arguments ($scopeArguments + @(\"-delstore\", \"My\", $candidateThumbprint))",
+           "certificate cleanup uses the bounded native path");
+  contains(uninstall_script, "X509Certificates.X509Store(\"My\", $storeLocation)",
+           "certificate cleanup discovers prior identities for the same endpoint without the hanging certificate provider");
+  contains(uninstall_script, "Read-AgentTomlScalar -Path $ConfigPath -Key \"endpoint_id\"",
+           "local uninstall can remove prior endpoint identity certificates without a remote endpoint argument");
+  require_true(!strstr(uninstall_script, "Cert:\\$scope\\My\\$thumbprint"),
+               "certificate cleanup avoids the hanging PowerShell certificate provider");
   contains(uninstall_script, "Client certificate still exists after uninstall cleanup:",
            "uninstall does not report success while endpoint identity remains installed");
   contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove machine environment variable ",
            "environment cleanup failures do not block service and program removal");
   contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove uninstall registry entry:",
            "uninstall registration cleanup failures do not block program removal");
-  contains(uninstall_script, "function Invoke-BoundedScheduledTaskCommand",
-           "scheduled task cleanup uses one bounded native command path under LocalSystem");
+  contains(uninstall_script, "function Invoke-BoundedNativeCommand",
+           "uninstall cleanup uses one bounded native command path under LocalSystem");
+  contains(uninstall_script, "function Start-UninstallScheduledTaskHandoff",
+           "remote uninstall escapes the Agent scheduled-task job before stopping the runtime");
+  contains(uninstall_script, "FDSecurityAgentUninstall",
+           "the independent uninstall task has one fixed cleanup identity");
+  contains(uninstall_script, "$security.SetAccessRuleProtection($true, $false)",
+           "the one-time attestation handoff file has an explicit restricted ACL");
+  contains(uninstall_script, "Write-ProtectedSystemScript -Path $cleanupScriptPath -Content $cleanup",
+           "deferred cleanup uses a protected file instead of the Windows command line");
+  contains(uninstall_script, "-EncodedCommand\", $encodedLauncher",
+           "deferred cleanup encodes only the short protected-file launcher");
+  require_true(!strstr(uninstall_script, "GetBytes($cleanup))"),
+               "the full deferred cleanup body must not exceed the Windows command-line limit");
+  contains(uninstall_script, "Remove-Item -LiteralPath $cleanupScriptLiteral -Force",
+           "the cleanup file containing the attestation secret is removed after one use");
+  contains(uninstall_script, "$taskCommand = \"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $handoffPath\"",
+           "the scheduled-task action references only the protected handoff file");
+  require_true(!strstr(uninstall_script, "$taskCommand = \"powershell.exe $AttestationToken"),
+               "the one-time attestation token must not be stored in task metadata");
   contains(uninstall_script, "$process.WaitForExit($TimeoutMilliseconds)",
            "scheduled task cleanup cannot block the remote uninstall worker indefinitely");
+  require_true(!strstr(uninstall_script, "Invoke-BoundedNativeCommand -FilePath $tool -Arguments @(\"/End\""),
+               "scheduled task cleanup must not terminate its own remote uninstall process tree");
   require_true(!strstr(uninstall_script, "Get-ScheduledTask"),
                "scheduled task cleanup avoids the hanging ScheduledTasks COM path");
   contains(uninstall_script, "deletion_last_error = `$deleteLastError",
@@ -866,12 +892,16 @@ int main(void) {
            "deferred cleanup retains every bounded callback failure");
   contains(uninstall_script, "attestation_proxy_mode = `$attestationProxyMode",
            "cleanup receipt identifies whether loopback direct transport was selected");
-  contains(uninstall_script, "`$requestHeaders['X-EDR-Uninstall-Token']",
+  contains(uninstall_script, "X-EDR-Uninstall-Token: `$normalizedAttestationToken",
            "loopback callback sends a dedicated token header in addition to Authorization");
   contains(uninstall_script, "attestation_last_http_status = `$attestationLastHttpStatus",
            "cleanup receipt retains the terminal callback HTTP status");
-  contains(uninstall_script, "`$attestationLastHttpStatus -in @(400, 401, 403)",
+  contains(uninstall_script, "`$attestationLastHttpStatus -in @(401, 403)",
            "non-retryable callback authentication failures stop immediately");
+  contains(uninstall_script, "`$attestationResponseCode -eq 'INVALID_ATTESTATION'",
+           "semantic attestation rejection stops while opaque HTTP 400 remains retryable");
+  contains(uninstall_script, "attestation_response_code = `$attestationLastResponseCode",
+           "cleanup receipt records the safe structured server error code");
   contains(uninstall_script, "failure_reasons = @(`$failureReasons)",
            "deferred cleanup emits machine-readable failure reasons");
   contains(uninstall_script, "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",
@@ -898,8 +928,12 @@ int main(void) {
            "loopback attestation sends an explicit UTF-8 body length");
   contains(uninstall_script, "attestation_request_body_bytes = `$attestationRequestBodyBytes",
            "cleanup receipt records the outgoing attestation body size");
-  contains(uninstall_script, "Invoke-RestMethod -Uri `$attestationURL",
-           "deferred cleanup posts its one-time completion attestation");
+  contains(uninstall_script, "`$webRequest.ContentLength = `$bodyBytes.Length",
+           "deferred cleanup sends the exact verified attestation body length");
+  contains(uninstall_script, "`$requestStream.Write(`$bodyBytes, 0, `$bodyBytes.Length)",
+           "deferred cleanup writes the attestation JSON bytes to the request stream");
+  require_true(strstr(uninstall_script, "Invoke-RestMethod -Uri `$attestationURL") == NULL,
+               "LocalSystem attestation cannot use the zero-length Invoke-RestMethod path");
   contains(uninstall_script, "Skipped unrelated $name process PID",
            "uninstall never kills an unrelated same-name process by image name alone");
   contains(uninstall_script, "uninstall-script-last.json",

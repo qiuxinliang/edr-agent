@@ -301,10 +301,16 @@ int main(void) {
                          "loopback callback transport must not inherit a machine proxy under LocalSystem");
   ok &= require_contains(uninstall_ps, "attestation_errors = @(`$attestationErrors)",
                          "cleanup receipt must retain the complete bounded attestation attempt history");
-  ok &= require_contains(uninstall_ps, "`$requestHeaders['X-EDR-Uninstall-Token']",
+  ok &= require_contains(uninstall_ps, "X-EDR-Uninstall-Token: `$normalizedAttestationToken",
                          "loopback callback must not depend on HTTP.sys exposing Authorization headers");
-  ok &= require_contains(uninstall_ps, "`$attestationLastHttpStatus -in @(400, 401, 403)",
+  ok &= require_contains(uninstall_ps, "`$attestationLastHttpStatus -in @(401, 403)",
                          "deterministic callback authorization failures must not consume the retry window");
+  ok &= require_contains(uninstall_ps,
+                         "`$attestationResponseCode -eq 'INVALID_ATTESTATION'",
+                         "semantic attestation rejection must stop while opaque HTTP 400 remains retryable");
+  ok &= require_contains(uninstall_ps,
+                         "attestation_response_code = `$attestationLastResponseCode",
+                         "cleanup receipt must retain the safe structured server error code");
   ok &= require_contains(uninstall_ps, "failure_reasons = @(`$failureReasons)",
                          "deferred cleanup must report machine-readable terminal causes");
   ok &= require_contains(uninstall_ps,
@@ -332,10 +338,31 @@ int main(void) {
                          "PowerShell variables immediately before a colon must use braced interpolation");
   ok &= require_absent(uninstall_ps, "PID $processId:",
                        "unbraced processId interpolation must not reintroduce a Windows PowerShell parser error");
-  ok &= require_contains(uninstall_ps, "function Invoke-BoundedScheduledTaskCommand",
-                         "scheduled-task cleanup must use the bounded native command path");
+  ok &= require_contains(uninstall_ps, "function Invoke-BoundedNativeCommand",
+                         "uninstall cleanup must use the bounded native command path");
+  ok &= require_contains(uninstall_ps, "function Start-UninstallScheduledTaskHandoff",
+                         "remote uninstall must escape the Agent scheduled-task job before teardown");
+  ok &= require_contains(uninstall_ps, "$security.SetAccessRuleProtection($true, $false)",
+                         "the remote handoff secret must be protected by an explicit file ACL");
+  ok &= require_contains(uninstall_ps,
+                         "Write-ProtectedSystemScript -Path $cleanupScriptPath -Content $cleanup",
+                         "deferred cleanup must use a protected file instead of the Windows command line");
+  ok &= require_contains(uninstall_ps, "-EncodedCommand\", $encodedLauncher",
+                         "deferred cleanup must encode only the short protected-file launcher");
+  ok &= require_absent(uninstall_ps, "GetBytes($cleanup))",
+                       "the full deferred cleanup body must not exceed the Windows command-line limit");
+  ok &= require_contains(uninstall_ps,
+                         "Remove-Item -LiteralPath $cleanupScriptLiteral -Force",
+                         "the protected cleanup file containing the attestation secret must be one-time");
+  ok &= require_contains(uninstall_ps, "FDSecurityAgentUninstall",
+                         "the independent uninstall task must be removed by normal task cleanup");
   ok &= require_contains(uninstall_ps, "$process.WaitForExit($TimeoutMilliseconds)",
                          "scheduled-task cleanup must not block indefinitely under LocalSystem");
+  ok &= require_absent(uninstall_ps,
+                       "Invoke-BoundedNativeCommand -FilePath $tool -Arguments @(\"/End\"",
+                       "scheduled-task cleanup must not terminate its own remote uninstall process tree");
+  ok &= require_absent(uninstall_ps, "Cert:\\$scope\\My\\$thumbprint",
+                       "uninstall must not enter the hanging PowerShell certificate provider");
   ok &= require_absent(uninstall_ps, "Get-ScheduledTask",
                        "uninstall must not enter the hanging ScheduledTasks COM path under LocalSystem");
   free(uninstall_ps);

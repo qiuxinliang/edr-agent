@@ -27,7 +27,8 @@ param(
   [string]$AttestationURL = "",
   [string]$AttestationToken = "",
   [string]$LifecycleTaskID = "",
-  [string]$EndpointID = ""
+  [string]$EndpointID = "",
+  [switch]$ScheduledTaskHandoff
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +37,7 @@ $script:CleanupWarnings = @()
 $script:DeferredRuntimePaths = @()
 $script:TargetProcessIds = @()
 $script:UninstallStage = "initialization"
+$script:UninstallScriptPath = [System.IO.Path]::GetFullPath($PSCommandPath)
 $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
 $receiptRoot = Join-Path $programData "FDSecurity\state"
 $safeLifecycleTaskID = ([string]$LifecycleTaskID) -replace '[^A-Za-z0-9_.-]', '_'
@@ -116,6 +118,82 @@ function Set-UninstallStage {
   Write-UninstallScriptReceipt -Status "running"
 }
 
+function ConvertTo-PowerShellSingleQuotedLiteral {
+  param([string]$Value)
+  return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+function Write-ProtectedSystemScript {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+    [Parameter(Mandatory = $true)]
+    [string]$Content
+  )
+  New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force -ErrorAction Stop | Out-Null
+  [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+  $security = [System.Security.AccessControl.FileSecurity]::new()
+  $systemSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")
+  $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+  $security.SetOwner($systemSid)
+  $security.SetAccessRuleProtection($true, $false)
+  $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+    $systemSid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow))
+  $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+    $administratorsSid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow))
+  Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
+}
+
+function Start-UninstallScheduledTaskHandoff {
+  $taskName = "FDSecurityAgentUninstall"
+  $handoffPath = Join-Path $receiptRoot ("uninstall-handoff-{0}.ps1" -f $safeLifecycleTaskID)
+  $arguments = @(
+    "-InstallDir " + (ConvertTo-PowerShellSingleQuotedLiteral $InstallDir),
+    "-ServiceName " + (ConvertTo-PowerShellSingleQuotedLiteral $ServiceName),
+    "-AttestationURL " + (ConvertTo-PowerShellSingleQuotedLiteral $AttestationURL),
+    "-AttestationToken " + (ConvertTo-PowerShellSingleQuotedLiteral $AttestationToken),
+    "-LifecycleTaskID " + (ConvertTo-PowerShellSingleQuotedLiteral $LifecycleTaskID),
+    "-EndpointID " + (ConvertTo-PowerShellSingleQuotedLiteral $EndpointID),
+    "-ScheduledTaskHandoff"
+  )
+  if ($RemoveData) { $arguments += "-RemoveData" }
+  if ($RemoveProgramFiles) { $arguments += "-RemoveProgramFiles" }
+  if ($PreserveDiagnostics) { $arguments += "-PreserveDiagnostics" }
+  $invocation = "& " + (ConvertTo-PowerShellSingleQuotedLiteral $script:UninstallScriptPath) + " " + ($arguments -join " ")
+  $handoffScript = @(
+    '$ErrorActionPreference = ''Stop''',
+    'try {',
+    "  $invocation",
+    '  $handoffExitCode = $LASTEXITCODE',
+    '} finally {',
+    '  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue',
+    '}',
+    'exit $handoffExitCode'
+  ) -join "`r`n"
+  Write-ProtectedSystemScript -Path $handoffPath -Content $handoffScript
+
+  $tool = Join-Path $env:SystemRoot "System32\schtasks.exe"
+  $taskCommand = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $handoffPath"
+  $taskCommandArgument = '"' + $taskCommand + '"'
+  $createExitCode = Invoke-BoundedNativeCommand -FilePath $tool -Arguments @(
+    "/Create", "/F", "/TN", $taskName, "/SC", "ONCE", "/ST", "00:00",
+    "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR", $taskCommandArgument
+  )
+  if ($createExitCode -ne 0) {
+    Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+    throw "Failed to create independent uninstall task; schtasks exit code $createExitCode."
+  }
+  $runExitCode = Invoke-BoundedNativeCommand -FilePath $tool -Arguments @("/Run", "/TN", $taskName)
+  if ($runExitCode -ne 0) {
+    $null = Invoke-BoundedNativeCommand -FilePath $tool -Arguments @("/Delete", "/F", "/TN", $taskName)
+    Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+    throw "Failed to start independent uninstall task; schtasks exit code $runExitCode."
+  }
+  Write-Host "Independent SYSTEM uninstall task started: $taskName"
+}
+
 function Assert-Admin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -140,34 +218,48 @@ function Read-AgentTomlScalar {
 function Remove-AgentClientCertificate {
   $thumbprint = (Read-AgentTomlScalar -Path $ConfigPath -Key "client_cert_thumbprint") -replace '\s+', ''
   $store = Read-AgentTomlScalar -Path $ConfigPath -Key "client_cert_store"
-  if (-not $thumbprint) {
-    Write-Host "Client certificate cleanup skipped: thumbprint not found in agent.toml"
+  $scope = if ($store -match "CurrentUser") { "CurrentUser" } else { "LocalMachine" }
+  $thumbprints = @($thumbprint)
+  $certificateEndpointID = if (-not [string]::IsNullOrWhiteSpace($EndpointID)) {
+    $EndpointID.Trim()
+  } else {
+    (Read-AgentTomlScalar -Path $ConfigPath -Key "endpoint_id").Trim()
+  }
+  if ($certificateEndpointID) {
+    $storeLocation = if ($scope -eq "CurrentUser") {
+      [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    } else {
+      [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+    }
+    $certificateStore = New-Object Security.Cryptography.X509Certificates.X509Store("My", $storeLocation)
+    try {
+      $certificateStore.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+      $escapedEndpointID = [regex]::Escape($certificateEndpointID)
+      $thumbprints += @($certificateStore.Certificates | Where-Object {
+        $_.Subject -match ("(^|,\s*)CN=" + $escapedEndpointID + "(,|$)")
+      } | ForEach-Object { $_.Thumbprint })
+    } finally {
+      $certificateStore.Close()
+    }
+  }
+  $thumbprints = @($thumbprints | Where-Object { $_ } | ForEach-Object {
+    ($_ -replace '\s+', '').ToUpperInvariant()
+  } | Select-Object -Unique)
+  if ($thumbprints.Count -eq 0) {
+    Write-Host "Client certificate cleanup skipped: no Agent identity certificate found"
     return
   }
-  $scope = if ($store -match "CurrentUser") { "CurrentUser" } else { "LocalMachine" }
-  $certPath = "Cert:\$scope\My\$thumbprint"
-  try {
-    if (Test-Path -LiteralPath $certPath) {
-      Remove-Item -LiteralPath $certPath -DeleteKey -Force -ErrorAction Stop
-      Write-Host "Removed client certificate: $scope\My\$thumbprint"
+  $certutil = Join-Path $env:SystemRoot "System32\certutil.exe"
+  $scopeArguments = if ($scope -eq "CurrentUser") { @("-user") } else { @() }
+  foreach ($candidateThumbprint in $thumbprints) {
+    $deleteExitCode = Invoke-BoundedNativeCommand -FilePath $certutil -Arguments ($scopeArguments + @("-delstore", "My", $candidateThumbprint))
+    $queryExitCode = Invoke-BoundedNativeCommand -FilePath $certutil -Arguments ($scopeArguments + @("-store", "My", $candidateThumbprint))
+    if ($queryExitCode -eq 0) {
+      Add-CriticalFailure "Client certificate still exists after uninstall cleanup: $scope\My\$candidateThumbprint; delete exit code $deleteExitCode."
+    } elseif ($queryExitCode -eq 1460) {
+      Add-CriticalFailure "Client certificate verification timed out after uninstall cleanup: $scope\My\$candidateThumbprint."
     } else {
-      Write-Host "Client certificate not found: $scope\My\$thumbprint"
-    }
-  } catch {
-    Add-CleanupWarning ("Certificate provider removal failed; trying certutil: " + $_.Exception.Message)
-    try {
-      $certutilArguments = @()
-      if ($scope -eq "CurrentUser") { $certutilArguments += "-user" }
-      $certutilArguments += @("-delstore", "My", $thumbprint)
-      $certutilOutput = (& certutil.exe @certutilArguments 2>&1 | Out-String).Trim()
-      if ($certutilOutput) { Write-Host $certutilOutput }
-    } catch {
-      Add-CleanupWarning ("certutil client certificate removal failed: " + $_.Exception.Message)
-    }
-    if (Test-Path -LiteralPath $certPath) {
-      Add-CriticalFailure "Client certificate still exists after uninstall cleanup: $scope\My\$thumbprint"
-    } else {
-      Write-Host "Removed client certificate with certutil: $scope\My\$thumbprint"
+      Write-Host "Client certificate absent after cleanup: $scope\My\$candidateThumbprint"
     }
   }
 }
@@ -354,13 +446,13 @@ function Export-AgentDiagnostics {
   return $archiveDir
 }
 
-function Invoke-BoundedScheduledTaskCommand {
+function Invoke-BoundedNativeCommand {
   param(
+    [string]$FilePath,
     [string[]]$Arguments,
     [int]$TimeoutMilliseconds = 10000
   )
-  $tool = Join-Path $env:SystemRoot "System32\schtasks.exe"
-  $process = Start-Process -FilePath $tool -ArgumentList $Arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
+  $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
   try {
     if (-not $process.WaitForExit($TimeoutMilliseconds)) {
       try { $process.Kill() } catch {}
@@ -374,14 +466,14 @@ function Invoke-BoundedScheduledTaskCommand {
 }
 
 function Remove-AgentScheduledTasks {
-  foreach ($name in (@($ServiceName, "FDSecurityAgent", "EdrAgent") | Select-Object -Unique)) {
+  $tool = Join-Path $env:SystemRoot "System32\schtasks.exe"
+  foreach ($name in (@($ServiceName, "FDSecurityAgent", "EdrAgent", "FDSecurityAgentUninstall") | Select-Object -Unique)) {
     $taskArgument = '"' + $name.Replace('"', '\"') + '"'
     try {
-      # ScheduledTasks cmdlets can block indefinitely under LocalSystem/session 0.
-      # Use the native tool with one bounded wait for each operation instead.
-      $null = Invoke-BoundedScheduledTaskCommand -Arguments @("/End", "/TN", $taskArgument)
-      $deleteExitCode = Invoke-BoundedScheduledTaskCommand -Arguments @("/Delete", "/F", "/TN", $taskArgument)
-      $queryExitCode = Invoke-BoundedScheduledTaskCommand -Arguments @("/Query", "/TN", $taskArgument)
+      # The remote uninstaller can still belong to this scheduled task's job.
+      # Ending the task here would terminate the teardown process itself.
+      $deleteExitCode = Invoke-BoundedNativeCommand -FilePath $tool -Arguments @("/Delete", "/F", "/TN", $taskArgument)
+      $queryExitCode = Invoke-BoundedNativeCommand -FilePath $tool -Arguments @("/Query", "/TN", $taskArgument)
       if ($queryExitCode -eq 0) {
         Add-CriticalFailure "Scheduled task '$name' still exists after uninstall cleanup; delete exit code $deleteExitCode."
       } elseif ($queryExitCode -eq 1460) {
@@ -516,9 +608,10 @@ foreach (`$imageName in @('FDSensor.exe', 'edr_agent.exe')) {
 `$attestationError = ''
 `$attestationAttemptCount = 0
 `$attestationLastHttpStatus = 0
+`$attestationLastResponseCode = ''
 `$attestationErrors = @()
 `$attestationProxyMode = 'system'
-`$attestationTransport = 'invoke_rest_method'
+`$attestationTransport = 'http_web_request'
 `$attestationRequestBodyBytes = 0
 `$attestationStatus = if ([string]::IsNullOrWhiteSpace(`$attestationURL)) {
   'not_configured'
@@ -567,12 +660,11 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
     `$attestationProxyMode = 'loopback_direct'
     `$attestationTransport = 'tcp_loopback_http11'
   }
-  `$requestHeaders = @{ Authorization = "Bearer `$normalizedAttestationToken" }
-  if (`$bypassProxy) { `$requestHeaders['X-EDR-Uninstall-Token'] = `$normalizedAttestationToken }
   try {
     for (`$postAttempt = 0; `$postAttempt -lt 8 -and `$attestationStatus -ne 'succeeded'; `$postAttempt++) {
       `$attestationAttemptCount = `$postAttempt + 1
       `$attestationLastHttpStatus = 0
+      `$attestationResponseCode = ''
       try {
         if (`$bypassProxy) {
           # Windows PowerShell 5.1 can silently suppress restricted headers and
@@ -627,9 +719,31 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
             if (`$tcpClient) { `$tcpClient.Dispose() }
           }
         } else {
-          `$null = Invoke-RestMethod -Uri `$attestationURL -Method Post -ContentType 'application/json' `
-            -Headers `$requestHeaders -Body `$body -TimeoutSec 5
-          `$attestationLastHttpStatus = 200
+          # Write the verified JSON bytes directly. Windows PowerShell 5.1 can
+          # emit a zero-length POST from Invoke-RestMethod under LocalSystem.
+          `$webRequest = [Net.HttpWebRequest]::Create(`$attestationURL)
+          `$webRequest.Method = 'POST'
+          `$webRequest.ContentType = 'application/json; charset=utf-8'
+          `$webRequest.ContentLength = `$bodyBytes.Length
+          `$webRequest.Timeout = 5000
+          `$webRequest.ReadWriteTimeout = 5000
+          `$webRequest.AllowAutoRedirect = `$false
+          `$webRequest.Headers.Add('Authorization', "Bearer `$normalizedAttestationToken")
+          `$requestStream = `$webRequest.GetRequestStream()
+          try {
+            `$requestStream.Write(`$bodyBytes, 0, `$bodyBytes.Length)
+          } finally {
+            `$requestStream.Dispose()
+          }
+          `$webResponse = [Net.HttpWebResponse]`$webRequest.GetResponse()
+          try {
+            `$attestationLastHttpStatus = [int]`$webResponse.StatusCode
+            if (`$attestationLastHttpStatus -ne 200) {
+              throw "uninstall attestation returned HTTP `$attestationLastHttpStatus"
+            }
+          } finally {
+            `$webResponse.Dispose()
+          }
         }
         `$attestationStatus = 'succeeded'
         `$attestationError = ''
@@ -640,8 +754,28 @@ if (`$localSucceeded -and `$attestationStatus -eq 'pending') {
             `$_.Exception.Response -and `$_.Exception.Response.StatusCode) {
           `$attestationLastHttpStatus = [int]`$_.Exception.Response.StatusCode
         }
-        `$attestationErrors += ("attempt {0}: {1}" -f `$attestationAttemptCount, `$attestationError)
-        if (`$attestationLastHttpStatus -in @(400, 401, 403)) { break }
+        if (`$_.Exception.Response) {
+          try {
+            `$responseStream = `$_.Exception.Response.GetResponseStream()
+            if (`$responseStream) {
+              `$responseReader = New-Object IO.StreamReader(`$responseStream)
+              try {
+                `$responsePayload = `$responseReader.ReadToEnd()
+                if (-not [string]::IsNullOrWhiteSpace(`$responsePayload)) {
+                  `$responseObject = `$responsePayload | ConvertFrom-Json -ErrorAction Stop
+                  `$attestationResponseCode = [string]`$responseObject.code
+                }
+              } finally {
+                `$responseReader.Dispose()
+              }
+            }
+          } catch {}
+        }
+        `$attestationLastResponseCode = `$attestationResponseCode
+        `$attestationErrors += ("attempt {0}: http={1} code={2} error={3}" -f `
+          `$attestationAttemptCount, `$attestationLastHttpStatus, `$attestationResponseCode, `$attestationError)
+        if (`$attestationLastHttpStatus -in @(401, 403)) { break }
+        if (`$attestationLastHttpStatus -eq 400 -and `$attestationResponseCode -eq 'INVALID_ATTESTATION') { break }
         if (`$postAttempt -lt 7) { Start-Sleep -Seconds 4 }
       }
     }
@@ -679,6 +813,7 @@ if (`$attestationStatus -eq 'failed') {
   attestation_error = `$attestationError
   attestation_attempts = `$attestationAttemptCount
   attestation_last_http_status = `$attestationLastHttpStatus
+  attestation_response_code = `$attestationLastResponseCode
   attestation_errors = @(`$attestationErrors)
   attestation_proxy_mode = `$attestationProxyMode
   attestation_transport = `$attestationTransport
@@ -706,8 +841,26 @@ if (-not `$overallSucceeded) { exit 1 }
       }) -join "; "
       throw "Generated deferred cleanup script failed syntax validation: $parseDetail"
     }
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanup))
     $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $cleanupScriptName = if ($safeLifecycleTaskID) {
+      "uninstall-cleanup-$safeLifecycleTaskID.ps1"
+    } else {
+      "uninstall-cleanup-last.ps1"
+    }
+    $cleanupScriptPath = Join-Path $receiptDir $cleanupScriptName
+    Write-ProtectedSystemScript -Path $cleanupScriptPath -Content $cleanup
+    $cleanupScriptLiteral = ConvertTo-PowerShellSingleQuotedLiteral $cleanupScriptPath
+    $cleanupLauncher = @"
+`$cleanupExitCode = 1
+try {
+  & $cleanupScriptLiteral
+  `$cleanupExitCode = if (`$null -eq `$LASTEXITCODE) { 0 } else { [int]`$LASTEXITCODE }
+} finally {
+  Remove-Item -LiteralPath $cleanupScriptLiteral -Force -ErrorAction SilentlyContinue
+}
+exit `$cleanupExitCode
+"@
+    $encodedLauncher = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanupLauncher))
     $cleanupStdout = Join-Path $receiptDir "uninstall-cleanup-last.stdout.log"
     $cleanupStderr = Join-Path $receiptDir "uninstall-cleanup-last.stderr.log"
     if ($safeLifecycleTaskID) {
@@ -716,10 +869,13 @@ if (-not `$overallSucceeded) { exit 1 }
     }
     Remove-Item -LiteralPath $cleanupStdout, $cleanupStderr -Force -ErrorAction SilentlyContinue
     Start-Process -FilePath $powershell -WorkingDirectory $env:SystemRoot -WindowStyle Hidden -ArgumentList @(
-      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedLauncher
     ) -RedirectStandardOutput $cleanupStdout -RedirectStandardError $cleanupStderr | Out-Null
     Write-Host "Scheduled program directory removal: $InstallDir"
   } catch {
+    if ($cleanupScriptPath) {
+      Remove-Item -LiteralPath $cleanupScriptPath -Force -ErrorAction SilentlyContinue
+    }
     throw ("Failed to schedule program directory removal: " + $_.Exception.Message)
   }
 }
@@ -794,6 +950,18 @@ try {
   Set-UninstallStage -Stage "admin_check"
   Assert-Admin
   Write-Host "Uninstalling FDSecurity runtime from $InstallDir"
+
+  if (-not $ScheduledTaskHandoff -and
+      -not [string]::IsNullOrWhiteSpace($AttestationURL) -and
+      -not [string]::IsNullOrWhiteSpace($AttestationToken) -and
+      -not [string]::IsNullOrWhiteSpace($LifecycleTaskID) -and
+      -not [string]::IsNullOrWhiteSpace($EndpointID)) {
+    Set-UninstallStage -Stage "scheduled_task_handoff"
+    Start-UninstallScheduledTaskHandoff
+    Set-UninstallStage -Stage "scheduled_task_handoff_started"
+    Write-UninstallScriptReceipt -Status "accepted"
+    exit 0
+  }
 
   Set-UninstallStage -Stage "service_cleanup"
   Remove-AgentServices

@@ -1020,7 +1020,7 @@ static int journal_uint64(const cJSON *root, const char *name, uint64_t *out) {
 
 static int journal_optional_string(const cJSON *root, const char *name, char *out, size_t cap) {
   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
-  if (!item) return 1;
+  if (!item || cJSON_IsNull(item)) return 1;
   return journal_string(root, name, out, cap);
 }
 

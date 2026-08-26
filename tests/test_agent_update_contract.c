@@ -202,6 +202,22 @@ int main(void) {
                    recovery.installer_log_size == 1234 &&
                    strcmp(recovery.installer_evidence_status, "pending_upload") == 0,
                "v2 succeeded journal maps terminal OK and preserves installer evidence descriptor");
+  const char *runtime_bundle_success_journal =
+      "{\"schema_version\":2,\"task_id\":\"task-1\",\"command_id\":\"cmd-1\","
+      "\"operation\":\"upgrade\",\"artifact_id\":\"artifact-1\","
+      "\"hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+      "\"version\":\"2.1.0\",\"status\":\"succeeded\",\"stage\":\"completed\","
+      "\"installer_log_file\":null,\"installer_log_sha256\":null,"
+      "\"installer_log_evidence_id\":null,\"installer_log_storage_key\":null,"
+      "\"installer_evidence_status\":null,\"last_event_seq\":7,"
+      "\"events\":[{\"event_seq\":7,\"status\":\"health_check\",\"progress\":100,\"detail\":{}}]}";
+  EdrAgentUpdateRecovery runtime_bundle_recovery;
+  require_true(edr_agent_update_parse_journal(runtime_bundle_success_journal,
+                                               &runtime_bundle_recovery) == 2 &&
+                   runtime_bundle_recovery.succeeded &&
+                   runtime_bundle_recovery.installer_log_file[0] == '\0' &&
+                   runtime_bundle_recovery.installer_log_sha256[0] == '\0',
+               "v2 runtime-bundle journal accepts JSON null for absent optional installer evidence");
 
   RecoveryFinalizeProbe finalize_probe;
   memset(&finalize_probe, 0, sizeof(finalize_probe));
