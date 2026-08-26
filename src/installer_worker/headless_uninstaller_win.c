@@ -1531,6 +1531,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   int service_deleted = 0;
   int remote_requested = 0;
   int local_handoff = 0;
+  int certificate_configured = 0;
   int handoff_acknowledged = 0;
   int self_delete_attempted = 0;
   DWORD parent_pid = 0;
@@ -1570,16 +1571,21 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   } else if (!local_handoff || !endpoint_id || !edr_native_safe_identifier(endpoint_id)) {
     goto cleanup;
   }
-  if (!edr_native_validate_certificate_identity(install_dir, endpoint_id, thumbprint,
-                                                certificate_store,
-                                                sizeof(certificate_store) /
-                                                    sizeof(certificate_store[0]))) {
-    result = ERROR_INVALID_DATA;
-    goto cleanup;
+  /* Local administrators may remove an unenrolled install. Remote uninstall
+     required a valid certificate thumbprint above. */
+  certificate_configured = thumbprint && thumbprint[0];
+  if (certificate_configured) {
+    if (!edr_native_validate_certificate_identity(install_dir, endpoint_id, thumbprint,
+                                                  certificate_store,
+                                                  sizeof(certificate_store) /
+                                                      sizeof(certificate_store[0]))) {
+      result = ERROR_INVALID_DATA;
+      goto cleanup;
+    }
+    result = edr_native_preflight_certificate_identity(thumbprint, endpoint_id,
+                                                       certificate_store);
+    if (result != ERROR_SUCCESS) goto cleanup;
   }
-  result = edr_native_preflight_certificate_identity(thumbprint, endpoint_id,
-                                                     certificate_store);
-  if (result != ERROR_SUCCESS) goto cleanup;
   if (parent_text && parent_text[0]) {
     wchar_t *end = NULL;
     unsigned long parsed = wcstoul(parent_text, &end, 10);
@@ -1639,9 +1645,11 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   if (result != ERROR_SUCCESS) goto cleanup;
   result = edr_native_verify_removed(install_dir, service_name);
   if (result != ERROR_SUCCESS) goto cleanup;
-  result = edr_native_remove_certificate_identity(thumbprint, endpoint_id,
-                                                  certificate_store);
-  if (result != ERROR_SUCCESS) goto cleanup;
+  if (certificate_configured) {
+    result = edr_native_remove_certificate_identity(thumbprint, endpoint_id,
+                                                    certificate_store);
+    if (result != ERROR_SUCCESS) goto cleanup;
+  }
   self_length = GetModuleFileNameW(NULL, self_path,
                                    (DWORD)(sizeof(self_path) / sizeof(self_path[0])));
   if (!self_length || self_length >= sizeof(self_path) / sizeof(self_path[0])) {
@@ -1818,11 +1826,12 @@ static int edr_native_coordinator(int argc, wchar_t **argv) {
   source_length = GetModuleFileNameW(NULL, source,
                                      (DWORD)(sizeof(source) / sizeof(source[0])));
   if (!install_dir || !install_dir[0] || !service_name || !service_name[0] ||
-      !thumbprint || !thumbprint[0] || !endpoint_id ||
+      !endpoint_id ||
       !edr_native_safe_identifier(endpoint_id) ||
       (remote_requested && (!attestation_url || !edr_native_valid_attestation_url(attestation_url) ||
                              !task_id || !edr_native_safe_identifier(task_id) ||
                              !endpoint_id || !edr_native_safe_identifier(endpoint_id) ||
+                             !thumbprint || !thumbprint[0] ||
                              !input_secret_text || !input_secret_text[0])) ||
       (!remote_requested && ((attestation_url && attestation_url[0]) ||
                              (task_id && task_id[0]))) ||

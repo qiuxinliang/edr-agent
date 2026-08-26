@@ -277,6 +277,14 @@ int main(void) {
                        "production uninstall must not expose test-only child flags");
   ok &= require_absent(headless_uninstaller, "INFINITE",
                        "native uninstall waits must remain bounded");
+  ok &= require_contains(headless_uninstaller,
+                         "certificate_configured = thumbprint && thumbprint[0]",
+                         "local uninstall must permit an unenrolled Agent with no certificate to remove");
+  ok &= require_count(headless_uninstaller, "if (certificate_configured) {", 2,
+                      "configured certificates must be validated and removed exactly once");
+  ok &= require_contains(headless_uninstaller,
+                         "!thumbprint || !thumbprint[0] ||",
+                         "remote uninstall must still require a certificate thumbprint");
   ok &= require_count(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1", 1,
                       "native Inno cleanup must pass exactly one coordination marker");
   free(headless_uninstaller);
