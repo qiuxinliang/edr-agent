@@ -174,12 +174,6 @@ fi
 if [[ -f "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" ]]; then
   cp -a "$EDR_AGENT_DIR/scripts/edr_agent_install.ps1" "$OUT_DIR/"
 fi
-if [[ -f "$EDR_AGENT_DIR/scripts/edr_agent_uninstall.ps1" ]]; then
-  cp -a "$EDR_AGENT_DIR/scripts/edr_agent_uninstall.ps1" "$OUT_DIR/uninstall.ps1"
-else
-  echo "Error: missing headless uninstall script: $EDR_AGENT_DIR/scripts/edr_agent_uninstall.ps1" >&2
-  exit 1
-fi
 for n in "edr_agent_preflight.ps1" "windows_service_install.ps1" "windows_isolate_host.ps1"; do
   if [[ -f "$EDR_AGENT_DIR/scripts/$n" ]]; then
     cp -a "$EDR_AGENT_DIR/scripts/$n" "$OUT_DIR/"

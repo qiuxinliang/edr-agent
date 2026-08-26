@@ -223,6 +223,8 @@ jobs:
             'test_agent_update_contract',
             'test_agent_update_assets',
             'test_windows_headless_runtime_contract',
+            'test_windows_native_manifest',
+            'test_windows_native_uninstall',
             'test_pmfe_pe_arch'
           )
           cmake --build build --target $buildTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
@@ -248,11 +250,11 @@ jobs:
             -ExecutablePath (Join-Path $outDir "uninstall.exe") `
             -ProbePath $uninstallerProbe `
             -ComponentName "headless uninstaller"
-          if ($worker.uninstall_attestation -ne "v2" -or $worker.token_handoff -ne $true) {
-            throw "installer worker does not implement uninstall attestation v2 token handoff"
+          if ($worker.uninstall_attestation -ne "v3" -or $worker.native_in_memory_token_handoff -ne $true) {
+            throw "installer worker does not implement native in-memory uninstall attestation v3 handoff"
           }
-          if ($uninstaller.uninstall_attestation -ne "v2" -or $uninstaller.powershell_token_handoff -ne $true) {
-            throw "headless uninstaller does not implement uninstall attestation v2 PowerShell handoff"
+          if ($uninstaller.uninstall_attestation -ne "v3" -or $uninstaller.native_in_memory_token_handoff -ne $true) {
+            throw "headless uninstaller does not implement native in-memory uninstall attestation v3 handoff"
           }
 
       - name: Verify HTTPS REST and SQLite compiled in
@@ -303,7 +305,9 @@ jobs:
             'agent_update_packaging_contract',
             'windows_headless_runtime_contract',
             'command_registry_and_payload_contract',
-            'pmfe_pe_architectures'
+            'pmfe_pe_architectures',
+            'windows_native_manifest_behavior',
+            'windows_native_uninstall_behavior'
           )
           $listedText = $listed -join "`n"
           foreach ($name in $required) {
@@ -311,7 +315,7 @@ jobs:
               throw "Required client build test was not configured: $name"
             }
           }
-          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures)$'
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures|windows_native_manifest_behavior|windows_native_uninstall_behavior)$'
           if ($LASTEXITCODE -ne 0) { throw "Client build gate tests failed" }
 
       - name: "[Timing] Build summary"
@@ -372,9 +376,6 @@ jobs:
           }
           if (-not (Test-Path -LiteralPath $uninstallerExe)) { throw "headless uninstall.exe not found after build" }
           $null = $items.Add($uninstallerExe)
-          $uninstallScript = Join-Path $outDir "uninstall.ps1"
-          Copy-Item -LiteralPath "scripts\edr_agent_uninstall.ps1" -Destination $uninstallScript -Force
-          $null = $items.Add($uninstallScript)
           $nativeIntegrityPath = Join-Path $outDir "native-package-integrity.json"
           $nativeIntegrityFiles = New-Object System.Collections.Generic.List[object]
           $null = $nativeIntegrityFiles.Add([ordered]@{
@@ -384,10 +385,6 @@ jobs:
           $null = $nativeIntegrityFiles.Add([ordered]@{
             name = "uninstall.exe"
             sha256 = (Get-FileHash -LiteralPath $uninstallerExe -Algorithm SHA256).Hash.ToLowerInvariant()
-          })
-          $null = $nativeIntegrityFiles.Add([ordered]@{
-            name = "uninstall.ps1"
-            sha256 = (Get-FileHash -LiteralPath $uninstallScript -Algorithm SHA256).Hash.ToLowerInvariant()
           })
           [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()
           [ordered]@{

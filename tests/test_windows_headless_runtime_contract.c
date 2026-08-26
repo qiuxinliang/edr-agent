@@ -47,6 +47,22 @@ static int require_true(int condition, const char *message) {
   return 0;
 }
 
+static int require_count(const char *text, const char *needle, size_t expected,
+                         const char *message) {
+  size_t count = 0;
+  const char *cursor = text;
+  size_t needle_length = needle ? strlen(needle) : 0;
+  if (!needle || needle_length == 0) return 0;
+  while ((cursor = strstr(cursor, needle)) != NULL) {
+    ++count;
+    cursor += needle_length;
+  }
+  if (count == expected) return 1;
+  fprintf(stderr, "FAIL: %s (expected %zu occurrences, found %zu)\n",
+          message, expected, count);
+  return 0;
+}
+
 static int require_range_absent(const char *text, const char *begin, const char *end,
                                 const char *needle, const char *message) {
   const char *start = text ? strstr(text, begin) : NULL;
@@ -179,12 +195,10 @@ int main(void) {
                          "native worker must install the bounded 15-minute forensic version check");
   ok &= require_contains(worker, "EDR_FORENSIC_PREFETCH_RETRY_SEC\", L\"900",
                          "native worker must install the bounded 15-minute forensic prefetch retry");
-  ok &= require_contains(worker, "--capability-probe",
-                         "native worker must expose a machine-readable release capability probe");
-  ok &= require_contains(worker, "\\\"uninstall_attestation\\\":\\\"v2\\\"",
-                         "native worker capability probe must declare uninstall attestation v2");
-  ok &= require_contains(worker, "lifecycle_attestation_handoff protocol=v2",
-                         "native worker must record sanitized token handoff diagnostics");
+  ok &= require_absent(worker, "--attestation-token",
+                       "worker must not pass the token through a command-line argument");
+  ok &= require_absent(worker, "INFINITE",
+                       "worker lifecycle waits must remain bounded");
   ok &= require_absent(worker, "L\"/Create /F /TN %ls /SC ONSTART",
                        "native worker must not build a nested-quoted schtasks action");
   free(worker);
@@ -247,161 +261,35 @@ int main(void) {
                          "headless enrollment must validate the C++ runtime dependency");
   free(installer_ps);
 
-  char *uninstall_ps = read_source(root, "scripts/edr_agent_uninstall.ps1");
-  if (!uninstall_ps) return 1;
-  ok &= require_contains(uninstall_ps, "takeown.exe /F `$target /A /R /D Y",
-                         "deferred uninstall cleanup must recover ownership recursively");
-  ok &= require_absent(uninstall_ps, "takeown.exe /F $InstallDir",
-                       "synchronous uninstall must not recursively traverse the install tree");
-  ok &= require_absent(uninstall_ps, "function Grant-InstallDirectoryRemovalRights",
-                       "uninstall must keep recursive ACL repair in the deferred cleanup only");
-  ok &= require_contains(uninstall_ps, "function Disable-AgentServiceRecovery",
-                         "uninstall must disable Windows service recovery before teardown");
-  ok &= require_contains(uninstall_ps, "failureflag",
-                         "uninstall must prevent non-crash failures from restarting the service");
-  ok &= require_contains(uninstall_ps, "/reset /T /C /Q",
-                         "uninstall cleanup must remove stale deny and inheritance ACL state");
-  ok &= require_contains(uninstall_ps, "[IO.FileAttributes]::Normal",
-                         "uninstall cleanup must clear restrictive file attributes before deletion");
-  ok &= require_contains(uninstall_ps, "EDR_FORENSIC_PREFETCH_RETRY_SEC",
-                         "uninstall must remove the forensic prefetch retry machine setting");
-  ok &= require_contains(uninstall_ps, "edr.endpoint.uninstall.attestation.v1",
-                         "uninstall must attest positive local teardown after deferred cleanup");
-  ok &= require_contains(uninstall_ps, "`$bodyFields.token_proof_hmac_sha256 = `$tokenProof",
-                         "loopback uninstall attestation must carry a header-independent token proof");
-  ok &= require_contains(uninstall_ps, "Security.Cryptography.HMACSHA256",
-                         "uninstall attestation body proof must use HMAC-SHA256");
-  ok &= require_contains(uninstall_ps, "tcp_loopback_http11",
-                         "loopback attestation must use byte-exact HTTP under LocalSystem");
-  ok &= require_contains(uninstall_ps, "New-Object Net.Sockets.TcpClient",
-                         "loopback attestation must bypass WebRequest rewriting");
-  ok &= require_contains(uninstall_ps, "Content-Length: `$(`$bodyBytes.Length)",
-                         "loopback attestation must bind the exact UTF-8 body length");
-  ok &= require_contains(uninstall_ps, "Skipped unrelated $name process PID",
-                         "uninstall must scope process termination to the target installation");
-  ok &= require_contains(uninstall_ps, "ETW cleanup exceeded 15 seconds and was terminated; continuing uninstall",
-                         "best-effort ETW cleanup must have a bounded execution window");
-  ok &= require_contains(uninstall_ps, "ETW cleanup returned exit code $($cleanupProcess.ExitCode); continuing uninstall",
-                         "best-effort ETW cleanup must not poison complete uninstall status");
-  ok &= require_contains(uninstall_ps, "uninstall-script-last.json",
-                         "uninstall must persist the exact synchronous failure stage outside program files");
-  ok &= require_contains(uninstall_ps, "function Remove-RuntimePathWithRetry",
-                         "runtime data cleanup must retry transient endpoint-security file locks");
-  ok &= require_contains(uninstall_ps, "Runtime data remains for verified deferred directory cleanup:",
-                         "complete uninstall must hand persistent file locks to verified directory cleanup");
-  ok &= require_contains(uninstall_ps, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
-                         "synchronous uninstall receipt must disclose paths handed to deferred cleanup");
-  ok &= require_contains(uninstall_ps, "deletion_last_error = `$deleteLastError",
-                         "deferred cleanup must retain the final directory deletion error");
-  ok &= require_contains(uninstall_ps, "remaining_entries = @(`$remainingEntries)",
-                         "deferred cleanup must identify files that survive bounded removal");
-  ok &= require_contains(uninstall_ps, "attestation_error = `$attestationError",
-                         "deferred cleanup must retain callback transport diagnostics");
-  ok &= require_contains(uninstall_ps, "[Net.WebRequest]::DefaultWebProxy = `$null",
-                         "loopback callback transport must not inherit a machine proxy under LocalSystem");
-  ok &= require_contains(uninstall_ps, "attestation_errors = @(`$attestationErrors)",
-                         "cleanup receipt must retain the complete bounded attestation attempt history");
-  ok &= require_contains(uninstall_ps, "X-EDR-Uninstall-Token: `$normalizedAttestationToken",
-                         "loopback callback must not depend on HTTP.sys exposing Authorization headers");
-  ok &= require_contains(uninstall_ps, "`$attestationLastHttpStatus -in @(401, 403)",
-                         "deterministic callback authorization failures must not consume the retry window");
-  ok &= require_contains(uninstall_ps,
-                         "`$attestationResponseCode -eq 'INVALID_ATTESTATION'",
-                         "semantic attestation rejection must stop while opaque HTTP 400 remains retryable");
-  ok &= require_contains(uninstall_ps,
-                         "attestation_response_code = `$attestationLastResponseCode",
-                         "cleanup receipt must retain the safe structured server error code");
-  ok &= require_contains(uninstall_ps, "failure_reasons = @(`$failureReasons)",
-                         "deferred cleanup must report machine-readable terminal causes");
-  ok &= require_contains(uninstall_ps,
-                         "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",
-                         "terminal cleanup status must include required attestation success");
-  ok &= require_contains(uninstall_ps,
-                         "local_status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }",
-                         "cleanup receipt must retain independent local teardown status");
-  ok &= require_contains(uninstall_ps, "Management.Automation.Language.Parser]::ParseInput($cleanup",
-                         "generated deferred cleanup must pass the native Windows PowerShell parser before launch");
-  ok &= require_contains(uninstall_ps, "uninstall-cleanup-last.stderr.log",
-                         "detached cleanup parser and runtime errors must remain observable after program removal");
-  ok &= require_contains(uninstall_ps, "elseif ($RemoveProgramFiles)",
-                         "runtime data cleanup may defer only when complete program removal is scheduled");
-  ok &= require_absent(uninstall_ps,
-                       "Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue",
-                       "runtime data cleanup must not regress to one-shot silent deletion");
-  ok &= require_absent(uninstall_ps, "Failed to reset install directory ACL:",
-                       "synchronous uninstall must not perform a duplicate recursive ACL pass");
-  ok &= require_absent(uninstall_ps, "Add-CriticalFailure (\"ETW cleanup failed:",
-                       "best-effort ETW cleanup must never become a terminal uninstall failure");
-  ok &= require_absent(uninstall_ps, "System.Collections.Generic.HashSet",
-                       "Windows PowerShell 5.1 uninstall initialization must not depend on generic type construction");
-  ok &= require_contains(uninstall_ps, "PID ${processId}:",
-                         "PowerShell variables immediately before a colon must use braced interpolation");
-  ok &= require_absent(uninstall_ps, "PID $processId:",
-                       "unbraced processId interpolation must not reintroduce a Windows PowerShell parser error");
-  ok &= require_contains(uninstall_ps, "function Invoke-BoundedNativeCommand",
-                         "uninstall cleanup must use the bounded native command path");
-  ok &= require_contains(uninstall_ps, "function Start-UninstallScheduledTaskHandoff",
-                         "remote uninstall must escape the Agent scheduled-task job before teardown");
-  ok &= require_contains(uninstall_ps, "$security.SetAccessRuleProtection($true, $false)",
-                         "the remote handoff secret must be protected by an explicit file ACL");
-  ok &= require_contains(uninstall_ps,
-                         "Write-ProtectedSystemScript -Path $cleanupScriptPath -Content $cleanup",
-                         "deferred cleanup must use a protected file instead of the Windows command line");
-  ok &= require_contains(uninstall_ps, "-EncodedCommand\", $encodedLauncher",
-                         "deferred cleanup must encode only the short protected-file launcher");
-  ok &= require_absent(uninstall_ps, "GetBytes($cleanup))",
-                       "the full deferred cleanup body must not exceed the Windows command-line limit");
-  ok &= require_contains(uninstall_ps,
-                         "Remove-Item -LiteralPath $cleanupScriptLiteral -Force",
-                         "the protected cleanup file containing the attestation secret must be one-time");
-  ok &= require_contains(uninstall_ps, "FDSecurityAgentUninstall",
-                         "the independent uninstall task must be removed by normal task cleanup");
-  ok &= require_contains(uninstall_ps, "$process.WaitForExit($TimeoutMilliseconds)",
-                         "scheduled-task cleanup must not block indefinitely under LocalSystem");
-  ok &= require_absent(uninstall_ps,
-                       "Invoke-BoundedNativeCommand -FilePath $tool -Arguments @(\"/End\"",
-                       "scheduled-task cleanup must not terminate its own remote uninstall process tree");
-  ok &= require_absent(uninstall_ps, "Cert:\\$scope\\My\\$thumbprint",
-                       "uninstall must not enter the hanging PowerShell certificate provider");
-  ok &= require_absent(uninstall_ps, "Get-ScheduledTask",
-                       "uninstall must not enter the hanging ScheduledTasks COM path under LocalSystem");
-  free(uninstall_ps);
-
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");
   if (!headless_uninstaller) return 1;
-  ok &= require_contains(headless_uninstaller, "MessageBoxW(",
-                         "headless uninstall prompts must use the Unicode Windows API");
-  ok &= require_absent(headless_uninstaller, "MessageBoxA(",
-                       "headless uninstall prompts must never use the ANSI Windows API");
-  ok &= require_contains(headless_uninstaller, "uninstall-powershell-last.log",
-                         "native uninstall must capture PowerShell output outside the removable install directory");
-  ok &= require_contains(headless_uninstaller, "uninstall-powershell-%ls.log",
-                         "remote uninstall must preserve task-bound PowerShell diagnostics");
-  ok &= require_contains(headless_uninstaller, "uninstall_native_start pid=%lu",
-                         "native uninstall must record entry before launching PowerShell");
-  ok &= require_contains(headless_uninstaller, "详细诊断日志",
-                         "native uninstall dialog must point operators to the captured PowerShell diagnostics");
-  ok &= require_contains(headless_uninstaller, "STARTF_USESTDHANDLES",
-                         "native uninstall must redirect child stdout and stderr for actionable CI diagnostics");
-  ok &= require_contains(headless_uninstaller, "wait_for_process(process.hProcess, 240000)",
-                         "native uninstall must bound a stalled PowerShell handoff");
-  ok &= require_contains(headless_uninstaller, "TerminateProcess(process, ERROR_TIMEOUT)",
-                         "native uninstall must recover when the handoff itself stalls");
-  ok &= require_contains(headless_uninstaller, "CREATE_BREAKAWAY_FROM_JOB",
-                         "PowerShell cleanup must survive parent service Job Object teardown");
-  ok &= require_contains(headless_uninstaller, "--capability-probe",
-                         "native uninstaller must expose a machine-readable release capability probe");
-  ok &= require_contains(headless_uninstaller, "\\\"uninstall_attestation\\\":\\\"v2\\\"",
-                         "native uninstaller capability probe must declare uninstall attestation v2");
-  ok &= require_contains(headless_uninstaller, "卸载清理已启动",
-                         "manual uninstall must not claim terminal success before deferred deletion finishes");
+  ok &= require_absent(headless_uninstaller, "uninstall.ps1",
+                       "native uninstall must not depend on PowerShell");
+  ok &= require_absent(headless_uninstaller, "--attestation-token",
+                       "native uninstall must not accept a token command-line argument");
+  ok &= require_absent(headless_uninstaller, "powershell.exe",
+                       "native uninstall must not launch PowerShell");
+  ok &= require_absent(headless_uninstaller, "token_proof_hmac_sha256",
+                       "native uninstall must not invent an HMAC protocol");
+  ok &= require_absent(headless_uninstaller, "--native-foundation-self-test",
+                       "production uninstall must not expose test-only self-test flags");
+  ok &= require_absent(headless_uninstaller, "--native-foundation-child",
+                       "production uninstall must not expose test-only child flags");
+  ok &= require_absent(headless_uninstaller, "INFINITE",
+                       "native uninstall waits must remain bounded");
+  ok &= require_count(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1", 1,
+                      "native Inno cleanup must pass exactly one coordination marker");
   free(headless_uninstaller);
 
-  char *cmake = read_source(root, "CMakeLists.txt");
-  if (!cmake) return 1;
-  ok &= require_contains(cmake, "target_compile_options(fd_headless_uninstaller PRIVATE /utf-8)",
-                         "MSVC must decode the UTF-8 Chinese uninstall prompt source explicitly");
-  free(cmake);
+  char *lifecycle = read_source(root, "src/command/agent_lifecycle_command.c");
+  if (!lifecycle) return 1;
+  ok &= require_absent(lifecycle, "--attestation-token",
+                       "Agent lifecycle must not pass tokens through command-line arguments");
+  ok &= require_absent(lifecycle, "powershell.exe",
+                       "Agent lifecycle must not launch PowerShell");
+  ok &= require_absent(lifecycle, "INFINITE",
+                       "Agent lifecycle waits must remain bounded");
+  free(lifecycle);
 
   char *preflight = read_source(root, "scripts/edr_agent_preflight.ps1");
   if (!preflight) return 1;
@@ -439,8 +327,14 @@ int main(void) {
                          "commercial Setup checks the native worker before any install stage");
   ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.exe\"",
                          "Setup UI must package the same native uninstaller as the release ZIP");
-  ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.ps1\"",
-                         "Setup UI must package the release-owned PowerShell uninstaller");
+  ok &= require_contains(inno, "EdrNativeCoordinatedUninstall",
+                         "Inno cleanup hooks must recognize the native coordination marker");
+  ok &= require_count(inno, "not EdrNativeCoordinatedUninstall", 3,
+                      "bundled Inno worker/service/autorun hooks must skip native coordination");
+  ok &= require_contains(inno, "UpperCase(ParamStr(I)) = '/EDR_NATIVE_COORDINATED=1'",
+                         "only an exact coordination value enables native Inno mode");
+  ok &= require_absent(inno, "EdrCmdLineParamValue('/EDR_NATIVE_COORDINATED')",
+                       "native coordination must not use prefix-matching parameter parsing");
   ok &= require_contains(inno, "Type: filesandordirs; Name: \"{app}\\collector\"",
                          "Setup uninstall must remove the worker-created optional collector directory");
   ok &= require_contains(inno, "INSTALL_FAILURE_ROLLBACK begin",
@@ -462,6 +356,16 @@ int main(void) {
   ok &= require_contains(inno, "skipped_existing_installation=true",
                          "upgrade failure must preserve the previous installation instead of deleting it");
   free(inno);
+
+  char *plain_inno = read_source(root, "install/windows-inno/EDRAgentSetup.iss");
+  if (!plain_inno) return 1;
+  ok &= require_count(plain_inno, "not EdrNativeCoordinatedUninstall", 2,
+                      "plain Inno service/autorun hooks must skip native coordination");
+  ok &= require_contains(plain_inno, "UpperCase(ParamStr(I)) = '/EDR_NATIVE_COORDINATED=1'",
+                         "plain Inno must require the exact coordination value");
+  ok &= require_absent(plain_inno, "EdrCmdLineParamValue('/EDR_NATIVE_COORDINATED')",
+                       "plain Inno must not use prefix-matching parameter parsing");
+  free(plain_inno);
 
   char *setup_ui = read_source(root, "install/windows-setup-ui/MainWindow.xaml.cs");
   if (!setup_ui) return 1;

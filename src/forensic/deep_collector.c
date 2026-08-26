@@ -11,6 +11,7 @@
 /* 平台头(供下方共享段的 dc_download 直起 curl 用;平台分支后会重复 include,有头文件 guard 无碍)。 */
 #ifdef _WIN32
 #include <windows.h>
+#include "edr/windows_spawn_lock.h"
 #else
 #include <pthread.h>
 #include <signal.h>
@@ -1266,6 +1267,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   }
   const char *bin = binpath;
   uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
+  EdrWindowsSpawnLock spawn_lock = { 0 };
 
   /* NOTE: 通信硬约束 — 不拼 --upload-url;collector 只写本地 output-dir。 */
   char cmdline[2048];
@@ -1315,6 +1317,11 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   snprintf(errpath, sizeof(errpath), "%s\\fc_stderr_%lu.log",
            spec->output_dir ? spec->output_dir : ".", (unsigned long)GetCurrentProcessId());
   SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock)) {
+    if (job) CloseHandle(job);
+    if (out_detail) snprintf(out_detail, detail_cap, "child launch lock unavailable");
+    return EDR_DC_ERR_SPAWN;
+  }
   HANDLE herr = CreateFileA(errpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   BOOL inherit = FALSE;
@@ -1329,6 +1336,11 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   }
   PROCESS_INFORMATION pi = {0};
   BOOL cr = CreateProcess(bin, cmdline, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi);
+  if (cr && inherit && !SetHandleInformation(herr, HANDLE_FLAG_INHERIT, 0)) {
+    TerminateProcess(pi.hProcess, ERROR_CANCELLED);
+    cr = FALSE;
+  }
+  edr_windows_spawn_lock_release(&spawn_lock);
   if (!cr) {
     if (out_detail) {
       snprintf(out_detail, detail_cap, "CreateProcess failed: %lu", (unsigned long)GetLastError());

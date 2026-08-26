@@ -291,7 +291,7 @@ function Assert-InstalledRuntimeIdentity {
     throw 'installed Runtime component identity schema is invalid'
   }
   $files = @($manifest.files)
-  $required = @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1')
+  $required = @('FDSecurityInstallerWorker.exe','uninstall.exe')
   if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
     throw 'installed Runtime component identity file count is invalid'
   }
@@ -299,7 +299,7 @@ function Assert-InstalledRuntimeIdentity {
   foreach ($componentSpec in $files) {
     $component = [string]$componentSpec.name
     $hash = ([string]$componentSpec.sha256).ToLowerInvariant()
-    if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1)$' -or
+    if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe)$' -or
         [System.IO.Path]::GetFileName($component) -ne $component -or
         ($component -notin $required -and [System.IO.Path]::GetExtension($component) -ine '.dll') -or
         $hash -notmatch '^[0-9a-f]{64}$') {
@@ -468,7 +468,7 @@ function Get-RuntimeUpdatePlan {
         throw "unsupported runtime package integrity schema: $($integrity.schema)"
       }
       $files = @($integrity.files)
-      $required = @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1')
+      $required = @('FDSecurityInstallerWorker.exe','uninstall.exe')
       if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
         throw 'runtime package integrity manifest must contain the native uninstall chain and at most 61 app-local DLLs'
       }
@@ -477,7 +477,7 @@ function Get-RuntimeUpdatePlan {
       $declared = @{}
       foreach ($componentSpec in $files) {
         $component = [string]$componentSpec.name
-        if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1)$' -or
+        if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe)$' -or
             [System.IO.Path]::GetFileName($component) -ne $component) {
           throw "runtime package integrity manifest contains an unsupported component: $component"
         }
@@ -574,7 +574,7 @@ function Get-RuntimeUpdatePlan {
     }
   }
   if ([string]::Equals([System.IO.Path]::GetExtension($resolvedManifest), '.zip', [StringComparison]::OrdinalIgnoreCase)) {
-    foreach ($required in @('FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1','native-package-integrity.json')) {
+    foreach ($required in @('FDSecurityInstallerWorker.exe','uninstall.exe','native-package-integrity.json')) {
       if (-not $seen.ContainsKey($required.ToLowerInvariant())) {
         throw "runtime package integrity manifest is missing required component: $required"
       }

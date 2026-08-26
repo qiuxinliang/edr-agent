@@ -3,19 +3,23 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+#include "edr/windows_handoff.h"
+#include "edr/windows_spawn.h"
+#include "edr/windows_spawn_lock.h"
 
 static const wchar_t *DEFAULT_INSTALL_DIR = L"C:\\Program Files\\FDSecurity";
 static const wchar_t *DEFAULT_SERVICE_NAME = L"FDSecurityAgent";
 static const char *INSTALLER_WORKER_CAPABILITIES =
     "{\"schema\":\"edr.windows.native-capabilities.v1\","
     "\"component\":\"installer-worker\","
-    "\"uninstall_attestation\":\"v2\","
-    "\"token_handoff\":true}";
+    "\"uninstall_attestation\":\"v3\","
+    "\"native_in_memory_token_handoff\":true}";
 
 static DWORD child_creation_flags(DWORD base_flags) {
   BOOL in_job = FALSE;
@@ -42,6 +46,24 @@ static int has_flag(int argc, wchar_t **argv, const wchar_t *key) {
     if (_wcsicmp(argv[i], key) == 0) return 1;
   }
   return 0;
+}
+
+static int parse_inherited_handle(const wchar_t *text, HANDLE *handle_out) {
+  wchar_t *end = NULL;
+  unsigned long long value;
+  HANDLE handle;
+  DWORD handle_flags = 0;
+  if (!text || !text[0] || !handle_out || text[0] < L'0' || text[0] > L'9') return 0;
+  errno = 0;
+  value = _wcstoui64(text, &end, 10);
+  if (errno == ERANGE || !end || *end != L'\0' || value == 0 ||
+      (unsigned long long)(ULONG_PTR)value != value) return 0;
+  handle = (HANDLE)(ULONG_PTR)value;
+  if (!handle || handle == INVALID_HANDLE_VALUE || !GetHandleInformation(handle, &handle_flags)) {
+    return 0;
+  }
+  *handle_out = handle;
+  return 1;
 }
 
 static int write_capability_probe(const wchar_t *path, const char *payload) {
@@ -293,6 +315,8 @@ static int run_process_wait(const wchar_t *exe_path, const wchar_t *args, const 
   sa.bInheritHandle = TRUE;
   HANDLE child_log = INVALID_HANDLE_VALUE;
   HANDLE child_stdin = INVALID_HANDLE_VALUE;
+  EdrWindowsSpawnLock spawn_lock = { 0 };
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock)) return 9001;
   if (log_path && log_path[0]) {
     child_log = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, NULL);
@@ -313,8 +337,17 @@ static int run_process_wait(const wchar_t *exe_path, const wchar_t *args, const 
 
   BOOL inherit_handles = child_log != INVALID_HANDLE_VALUE;
   BOOL ok = CreateProcessW(exe_path, cmd, NULL, NULL, inherit_handles, CREATE_NO_WINDOW, NULL, work_dir, &si, &pi);
+  if (ok && inherit_handles &&
+      (!SetHandleInformation(child_log, HANDLE_FLAG_INHERIT, 0) ||
+       !SetHandleInformation(child_stdin, HANDLE_FLAG_INHERIT, 0))) {
+    TerminateProcess(pi.hProcess, ERROR_CANCELLED);
+    ok = FALSE;
+  }
+  edr_windows_spawn_lock_release(&spawn_lock);
   if (!ok) {
     DWORD create_error = GetLastError();
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
     if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);
     if (child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
     _snwprintf(line, sizeof(line) / sizeof(line[0]), L"run_failed gle=%lu exe=%ls", create_error, exe_path);
@@ -1253,7 +1286,7 @@ static int write_lifecycle_journal(const wchar_t *journal_path, const wchar_t *t
            "  \"action\": \"%s\",\r\n  \"status\": \"%s\",\r\n"
            "  \"succeeded\": %s,\r\n  \"exit_code\": %d,\r\n"
            "  \"detail\": \"%s\"\r\n}\r\n",
-           task, command, action_utf8, rc == 0 ? "succeeded" : "failed",
+           task, command, action_utf8, rc == 0 ? "handoff_accepted" : "failed",
            rc == 0 ? "true" : "false", rc, detail ? detail : "lifecycle worker completed");
   wchar_t temporary[MAX_PATH * 2];
   _snwprintf(temporary, sizeof(temporary) / sizeof(temporary[0]), L"%ls.tmp", journal_path);
@@ -1293,186 +1326,110 @@ static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *j
   return rc;
 }
 
-enum service_recovery_config_result {
-  SERVICE_RECOVERY_CONFIG_FAILED = 0,
-  SERVICE_RECOVERY_CONFIGURED = 1,
-  SERVICE_RECOVERY_NOT_APPLICABLE = 2
-};
-
-static int configure_service_recovery(const wchar_t *service_name, int enabled,
-                                      const wchar_t *log_path) {
-  SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-  if (!scm) {
-    DWORD gle = GetLastError();
-    wchar_t line[256];
-    _snwprintf(line, sizeof(line) / sizeof(line[0]),
-               enabled ? L"lifecycle_uninstall_restore_recovery_failed gle=%lu"
-                       : L"lifecycle_uninstall_disable_recovery_failed gle=%lu",
-               (unsigned long)gle);
-    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
-    append_log_utf8(log_path, line);
-    return SERVICE_RECOVERY_CONFIG_FAILED;
-  }
-  SC_HANDLE svc = OpenServiceW(scm, service_name, SERVICE_CHANGE_CONFIG);
-  if (!svc) {
-    DWORD gle = GetLastError();
-    if (gle == ERROR_SERVICE_DOES_NOT_EXIST) {
-      append_log_utf8(log_path, L"lifecycle_uninstall_service_recovery_not_applicable service_missing");
-      CloseServiceHandle(scm);
-      return SERVICE_RECOVERY_NOT_APPLICABLE;
-    }
-    wchar_t line[256];
-    _snwprintf(line, sizeof(line) / sizeof(line[0]),
-               enabled ? L"lifecycle_uninstall_restore_recovery_failed gle=%lu"
-                       : L"lifecycle_uninstall_disable_recovery_failed gle=%lu",
-               (unsigned long)gle);
-    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
-    append_log_utf8(log_path, line);
-    CloseServiceHandle(scm);
-    return SERVICE_RECOVERY_CONFIG_FAILED;
-  }
-  SC_ACTION actions[2];
-  SERVICE_FAILURE_ACTIONSW failure;
-  SERVICE_FAILURE_ACTIONS_FLAG failure_flag;
-  ZeroMemory(actions, sizeof(actions));
-  ZeroMemory(&failure, sizeof(failure));
-  ZeroMemory(&failure_flag, sizeof(failure_flag));
-  if (enabled) {
-    actions[0].Type = SC_ACTION_RESTART;
-    actions[0].Delay = 60000;
-    actions[1].Type = SC_ACTION_RESTART;
-    actions[1].Delay = 60000;
-    failure.dwResetPeriod = 86400;
-    failure.cActions = 2;
-    failure.lpsaActions = actions;
-  }
-  failure_flag.fFailureActionsOnNonCrashFailures = FALSE;
-  if (!ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure) ||
-      !ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag)) {
-    DWORD gle = GetLastError();
-    wchar_t line[256];
-    _snwprintf(line, sizeof(line) / sizeof(line[0]),
-               enabled ? L"lifecycle_uninstall_restore_recovery_failed gle=%lu"
-                       : L"lifecycle_uninstall_disable_recovery_failed gle=%lu",
-               (unsigned long)gle);
-    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
-    append_log_utf8(log_path, line);
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-    return SERVICE_RECOVERY_CONFIG_FAILED;
-  }
-  CloseServiceHandle(svc);
-  CloseServiceHandle(scm);
-  append_log_utf8(log_path, enabled ? L"lifecycle_uninstall_service_recovery_restored"
-                                    : L"lifecycle_uninstall_service_recovery_disabled");
-  return SERVICE_RECOVERY_CONFIGURED;
-}
-
-static int lifecycle_uninstall_failed(const wchar_t *service_name,
-                                      const wchar_t *log_path, int rc) {
-  if (configure_service_recovery(service_name, 1, log_path) == SERVICE_RECOVERY_CONFIGURED) {
-    int start_rc = start_service_by_name(service_name, log_path);
-    append_log_utf8(log_path, start_rc == 0 ? L"lifecycle_uninstall_failure_service_restarted"
-                                             : L"lifecycle_uninstall_failure_service_restart_failed");
-  }
-  return rc;
-}
-
 static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t *service_name,
-                                       int keep_data, const wchar_t *attestation_url,
-                                       const wchar_t *attestation_token, const wchar_t *task_id,
-                                       const wchar_t *endpoint_id, const wchar_t *log_path) {
-  wchar_t uninstaller[MAX_PATH * 2], quoted_exe[MAX_PATH * 4], quoted_dir[MAX_PATH * 4];
-  wchar_t quoted_service[MAX_PATH * 2], quoted_url[4096], quoted_token[1024];
-  wchar_t quoted_task[1024], quoted_endpoint[1024];
-  join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir, L"uninstall.exe");
-  if (!file_exists(uninstaller)) {
-    append_log_utf8(log_path, L"lifecycle_uninstall_missing_uninstall_exe");
-    return 8;
-  }
-  if (configure_service_recovery(service_name, 0, log_path) == SERVICE_RECOVERY_CONFIG_FAILED) {
-    configure_service_recovery(service_name, 1, log_path);
-    return 13;
-  }
-  quote_arg(quoted_exe, sizeof(quoted_exe) / sizeof(quoted_exe[0]), uninstaller);
-  quote_arg(quoted_dir, sizeof(quoted_dir) / sizeof(quoted_dir[0]), install_dir);
-  quote_arg(quoted_service, sizeof(quoted_service) / sizeof(quoted_service[0]), service_name);
-  quote_arg(quoted_url, sizeof(quoted_url) / sizeof(quoted_url[0]), attestation_url);
-  quote_arg(quoted_token, sizeof(quoted_token) / sizeof(quoted_token[0]), attestation_token);
-  quote_arg(quoted_task, sizeof(quoted_task) / sizeof(quoted_task[0]), task_id);
-  quote_arg(quoted_endpoint, sizeof(quoted_endpoint) / sizeof(quoted_endpoint[0]), endpoint_id);
+                                       const wchar_t *attestation_url,
+                                       const wchar_t *task_id, const wchar_t *endpoint_id,
+                                       HANDLE agent_secret_read, HANDLE agent_ack_write,
+                                       const wchar_t *log_path) {
+  wchar_t uninstaller[MAX_PATH * 2];
   wchar_t command[8192];
-  _snwprintf(command, sizeof(command) / sizeof(command[0]),
-             L"%ls --silent --install-dir %ls --service-name %ls%ls "
-             L"--attestation-url %ls --attestation-token %ls --task-id %ls --endpoint-id %ls",
-             quoted_exe, quoted_dir, quoted_service, keep_data ? L" --keep-data" : L"",
-             quoted_url, quoted_token, quoted_task, quoted_endpoint);
-  command[(sizeof(command) / sizeof(command[0])) - 1] = 0;
-  STARTUPINFOW startup;
+  wchar_t quoted[MAX_PATH * 4];
+  SECURITY_ATTRIBUTES security;
   PROCESS_INFORMATION process;
-  ZeroMemory(&startup, sizeof(startup));
+  HANDLE secret_read = INVALID_HANDLE_VALUE, secret_write = INVALID_HANDLE_VALUE;
+  HANDLE ack_read = INVALID_HANDLE_VALUE, ack_write = INVALID_HANDLE_VALUE;
+  HANDLE handles[2];
+  EdrWindowsSpawnLock spawn_lock = { 0 };
+  BYTE token[256];
+  DWORD token_length = 0;
+  static const BYTE ready[] = "edr.finalizer.ready.v1";
+  int launched = 0;
+  int ok = 0;
   ZeroMemory(&process, sizeof(process));
-  startup.cb = sizeof(startup);
-  startup.dwFlags = STARTF_USESHOWWINDOW;
-  startup.wShowWindow = SW_HIDE;
-  if (!CreateProcessW(NULL, command, NULL, NULL, FALSE,
-                      child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS),
-                      NULL, install_dir,
-                      &startup, &process)) {
-    wchar_t line[256];
-    _snwprintf(line, sizeof(line) / sizeof(line[0]),
-               L"lifecycle_uninstall_launch_failed gle=%lu", (unsigned long)GetLastError());
-    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
-    append_log_utf8(log_path, line);
-    return lifecycle_uninstall_failed(service_name, log_path, 9);
+  join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]),
+            install_dir, L"uninstall.exe");
+  if (!file_exists(uninstaller) ||
+      !edr_windows_handoff_read_frame(agent_secret_read, token, sizeof(token), &token_length)) {
+    append_log_utf8(log_path, L"lifecycle_uninstall_native_input_failed");
+    goto cleanup;
   }
-  CloseHandle(process.hThread);
+  ZeroMemory(&security, sizeof(security));
+  security.nLength = sizeof(security);
+  security.bInheritHandle = FALSE;
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock)) goto cleanup;
+  if (!CreatePipe(&secret_read, &secret_write, &security, 0) ||
+      !CreatePipe(&ack_read, &ack_write, &security, 0)) goto cleanup;
+  quote_arg(quoted, sizeof(quoted) / sizeof(quoted[0]), uninstaller);
+  _snwprintf(command, sizeof(command) / sizeof(command[0]),
+             L"%ls --silent --install-dir \"%ls\" --service-name \"%ls\" "
+             L"--secret-read-handle %llu --task-id \"%ls\" --endpoint-id \"%ls\" "
+             L"--ack-write-handle %llu --parent-pid %lu%ls%ls%ls%ls",
+             quoted, install_dir, service_name,
+             (unsigned long long)(ULONG_PTR)secret_read, task_id, endpoint_id,
+             (unsigned long long)(ULONG_PTR)ack_write,
+             (unsigned long)GetCurrentProcessId(), attestation_url && attestation_url[0]
+                 ? L" --attestation-url \"" : L"", attestation_url ? attestation_url : L"",
+             attestation_url && attestation_url[0] ? L"\"" : L"",
+             L"");
+  command[(sizeof(command) / sizeof(command[0])) - 1] = L'\0';
+  handles[0] = secret_read;
+  handles[1] = ack_write;
+  if (!edr_windows_spawn_whitelisted(command, install_dir, handles, 2, &process,
+                                     child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS))) {
+    goto cleanup;
+  }
+  edr_windows_spawn_lock_release(&spawn_lock);
+  launched = 1;
   {
-    wchar_t line[256];
+    wchar_t line[128];
     _snwprintf(line, sizeof(line) / sizeof(line[0]),
                L"lifecycle_uninstall_launched pid=%lu", (unsigned long)process.dwProcessId);
-    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
+    line[(sizeof(line) / sizeof(line[0])) - 1] = L'\0';
     append_log_utf8(log_path, line);
   }
-  /* uninstall.exe owns the bounded PowerShell handoff. Do not impose a second
-   * wall-clock deadline that can kill valid cleanup on a large endpoint. */
-  DWORD wait_result = WaitForSingleObject(process.hProcess, INFINITE);
-  if (wait_result != WAIT_OBJECT_0) {
-    append_log_utf8(log_path, L"lifecycle_uninstall_wait_failed");
-    TerminateProcess(process.hProcess, ERROR_GEN_FAILURE);
+  CloseHandle(secret_read); secret_read = INVALID_HANDLE_VALUE;
+  CloseHandle(ack_write); ack_write = INVALID_HANDLE_VALUE;
+  if (!edr_windows_handoff_write_frame(secret_write, token, token_length)) goto cleanup;
+  CloseHandle(secret_write); secret_write = INVALID_HANDLE_VALUE;
+  if (!edr_windows_handoff_read_frame(ack_read, token, sizeof(token), &token_length) ||
+      token_length != sizeof(ready) - 1 ||
+      memcmp(token, ready, sizeof(ready) - 1) != 0 ||
+      !edr_windows_handoff_write_frame(agent_ack_write, (const BYTE *)"edr.worker.ready.v1",
+                                    sizeof("edr.worker.ready.v1") - 1)) goto cleanup;
+  ok = 1;
+  append_log_utf8(log_path, L"lifecycle_uninstall_handoff_accepted");
+  CloseHandle(ack_read); ack_read = INVALID_HANDLE_VALUE;
+  CloseHandle(process.hThread); process.hThread = NULL;
+  CloseHandle(process.hProcess); process.hProcess = NULL;
+cleanup:
+  edr_windows_spawn_lock_release(&spawn_lock);
+  SecureZeroMemory(token, sizeof(token));
+  if (!ok && launched && process.hProcess) {
+    TerminateProcess(process.hProcess, ERROR_CANCELLED);
     WaitForSingleObject(process.hProcess, 5000);
-    CloseHandle(process.hProcess);
-    return lifecycle_uninstall_failed(service_name, log_path, 11);
   }
-  DWORD exit_code = ERROR_GEN_FAILURE;
-  if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
-    append_log_utf8(log_path, L"lifecycle_uninstall_exit_code_unavailable");
-    CloseHandle(process.hProcess);
-    return lifecycle_uninstall_failed(service_name, log_path, 12);
-  }
-  CloseHandle(process.hProcess);
-  if (exit_code != 0) {
-    wchar_t line[256];
-    _snwprintf(line, sizeof(line) / sizeof(line[0]),
-               L"lifecycle_uninstall_failed exit_code=%lu", (unsigned long)exit_code);
-    line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
-    append_log_utf8(log_path, line);
-    return lifecycle_uninstall_failed(service_name, log_path, (int)exit_code);
-  }
-  append_log_utf8(log_path, L"lifecycle_uninstall_completed");
-  return 0;
+  if (process.hThread) CloseHandle(process.hThread);
+  if (process.hProcess) CloseHandle(process.hProcess);
+  if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
+  if (secret_write != INVALID_HANDLE_VALUE) CloseHandle(secret_write);
+  if (ack_read != INVALID_HANDLE_VALUE) CloseHandle(ack_read);
+  if (ack_write != INVALID_HANDLE_VALUE) CloseHandle(ack_write);
+  if (agent_secret_read != INVALID_HANDLE_VALUE) CloseHandle(agent_secret_read);
+  if (agent_ack_write != INVALID_HANDLE_VALUE) CloseHandle(agent_ack_write);
+  return ok ? 0 : 11;
 }
 
 static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *service_name,
                                     const wchar_t *journal_path, const wchar_t *task_id,
                                     const wchar_t *command_id, const wchar_t *action,
-                                    DWORD delay_ms, int keep_data, const wchar_t *attestation_url,
-                                    const wchar_t *attestation_token, const wchar_t *endpoint_id,
+                                    DWORD delay_ms, const wchar_t *attestation_url,
+                                    const wchar_t *endpoint_id, HANDLE agent_secret_read,
+                                    HANDLE agent_ack_write,
                                     const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=lifecycle-teardown begin");
   if (delay_ms < 5000) delay_ms = 5000;
   if (delay_ms > 120000) delay_ms = 120000;
-  Sleep(delay_ms);
+  if (_wcsicmp(action, L"uninstall") != 0) Sleep(delay_ms);
   int rc = 64;
   const char *detail = "unsupported lifecycle teardown action";
   if (_wcsicmp(action, L"offboard") == 0) {
@@ -1480,18 +1437,11 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
     detail = rc == 0 ? "Agent service stopped after offboard handoff" :
                        "Agent offboard service stop failed";
   } else if (_wcsicmp(action, L"uninstall") == 0) {
-    wchar_t attestation_line[256];
-    _snwprintf(attestation_line,
-               sizeof(attestation_line) / sizeof(attestation_line[0]),
-               L"lifecycle_attestation_handoff protocol=v2 token_present=%d token_length=%llu",
-               attestation_token && attestation_token[0] ? 1 : 0,
-               (unsigned long long)(attestation_token ? wcslen(attestation_token) : 0));
-    attestation_line[(sizeof(attestation_line) / sizeof(attestation_line[0])) - 1] = 0;
-    append_log_utf8(log_path, attestation_line);
-    rc = launch_uninstaller_detached(install_dir, service_name, keep_data, attestation_url,
-                                     attestation_token, task_id, endpoint_id, log_path);
-    detail = rc == 0 ? "Native uninstaller completed after command-result handoff" :
-                       "Native uninstaller failed after command-result handoff";
+    rc = launch_uninstaller_detached(install_dir, service_name, attestation_url,
+                                     task_id, endpoint_id, agent_secret_read,
+                                     agent_ack_write, log_path);
+    detail = rc == 0 ? "Native finalizer accepted takeover; physical uninstall is pending" :
+                       "Native finalizer takeover failed before Agent acknowledgement";
   }
   if (!write_lifecycle_journal(journal_path, task_id, command_id, action, rc, detail)) {
     append_log_utf8(log_path, L"lifecycle_teardown_journal_write_failed");
@@ -1528,7 +1478,8 @@ int main(void) {
   const wchar_t *action = arg_value(argc, argv, L"--action");
   const wchar_t *delay_raw = arg_value(argc, argv, L"--delay-ms");
   const wchar_t *attestation_url = arg_value(argc, argv, L"--attestation-url");
-  const wchar_t *attestation_token = arg_value(argc, argv, L"--attestation-token");
+  const wchar_t *secret_read_handle_text = arg_value(argc, argv, L"--secret-read-handle");
+  const wchar_t *ack_write_handle_text = arg_value(argc, argv, L"--ack-write-handle");
   const wchar_t *endpoint_id = arg_value(argc, argv, L"--endpoint-id");
   wchar_t default_log[MAX_PATH * 2], default_cfg[MAX_PATH * 2], default_exe[MAX_PATH * 2];
   join_path(default_log, sizeof(default_log) / sizeof(default_log[0]), install_dir, L"diagnostics\\installer-worker.log");
@@ -1583,16 +1534,28 @@ int main(void) {
     DWORD delay_ms = delay_raw && delay_raw[0] ? (DWORD)_wtoi(delay_raw) : 30000;
     const wchar_t *expected_action = _wcsicmp(stage, L"lifecycle-offboard") == 0
                                          ? L"offboard" : L"uninstall";
-    if (!journal_path[0] || !task_id[0] || !command_id[0] ||
+    HANDLE agent_secret_read = INVALID_HANDLE_VALUE;
+    HANDLE agent_ack_write = INVALID_HANDLE_VALUE;
+    int handles_valid = 1;
+    if (_wcsicmp(expected_action, L"uninstall") == 0) {
+      if (!parse_inherited_handle(secret_read_handle_text, &agent_secret_read) ||
+          !parse_inherited_handle(ack_write_handle_text, &agent_ack_write)) {
+        append_log_utf8(log_path, L"lifecycle_teardown_invalid_handle_arguments");
+        handles_valid = 0;
+      }
+    }
+    if (!handles_valid || !journal_path[0] || !task_id[0] || !command_id[0] ||
         _wcsicmp(action, expected_action) != 0 ||
         (_wcsicmp(expected_action, L"uninstall") == 0 &&
-         (!attestation_url[0] || !attestation_token[0] || !endpoint_id[0]))) {
+         (!attestation_url[0] || !endpoint_id[0] ||
+          agent_secret_read == INVALID_HANDLE_VALUE || agent_ack_write == INVALID_HANDLE_VALUE))) {
       append_log_utf8(log_path, L"lifecycle_teardown_invalid_arguments");
       rc = 64;
     } else {
       rc = stage_lifecycle_teardown(install_dir, svc, journal_path, task_id, command_id,
-                                    action, delay_ms, has_flag(argc, argv, L"--keep-data"),
-                                    attestation_url, attestation_token, endpoint_id, log_path);
+                                    action, delay_ms,
+                                    attestation_url, endpoint_id, agent_secret_read,
+                                    agent_ack_write, log_path);
     }
   } else if (_wcsicmp(stage, L"uninstall-runtime") == 0) {
     rc = stage_uninstall_runtime(install_dir, log_path);

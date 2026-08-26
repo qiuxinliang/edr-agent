@@ -3,6 +3,7 @@
 #include "edr/security_policy_collect.h"
 
 #include "edr/config.h"
+#include "edr/windows_spawn_lock.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -137,10 +138,15 @@ static int run_command_capture_timeout(const char *cmdline, char *out, size_t ca
   sa.nLength = sizeof(sa);
   sa.bInheritHandle = TRUE;
   HANDLE rd = NULL, wr = NULL;
-  if (!CreatePipe(&rd, &wr, &sa, 0)) {
+  EdrWindowsSpawnLock spawn_lock = { 0 };
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock) ||
+      !CreatePipe(&rd, &wr, &sa, 0) ||
+      !SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0)) {
+    edr_windows_spawn_lock_release(&spawn_lock);
+    if (wr) CloseHandle(wr);
+    if (rd) CloseHandle(rd);
     return -1;
   }
-  (void)SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
   STARTUPINFOA si;
   PROCESS_INFORMATION pi;
   memset(&si, 0, sizeof(si));
@@ -166,6 +172,11 @@ static int run_command_capture_timeout(const char *cmdline, char *out, size_t ca
   BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
                            CREATE_NO_WINDOW | CREATE_SUSPENDED,
                            NULL, NULL, &si, &pi);
+  if (ok && !SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0)) {
+    TerminateProcess(pi.hProcess, ERROR_CANCELLED);
+    ok = FALSE;
+  }
+  edr_windows_spawn_lock_release(&spawn_lock);
   CloseHandle(wr);
   if (!ok) {
     CloseHandle(rd);

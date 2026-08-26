@@ -188,7 +188,7 @@ function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage, [bo
     throw "$Stage package capability architecture mismatch: $($capabilities.target_arch)"
   }
   if ($RequireModernLifecycleAssets) {
-    foreach ($name in @("uninstall.exe", "uninstall.ps1", "native-package-integrity.json")) {
+    foreach ($name in @("uninstall.exe", "native-package-integrity.json")) {
       if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $name) -PathType Leaf)) {
         throw "$Stage is missing modern lifecycle asset $name"
       }

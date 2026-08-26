@@ -91,7 +91,6 @@ Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags:
 Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 Source: "{#EDR_BIN_DIR}\uninstall.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\uninstall.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\native-package-integrity.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 #ifndef EDR_TARGET_ARM64
@@ -1406,17 +1405,35 @@ begin
   end;
 end;
 
+function EdrNativeCoordinatedUninstall: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if UpperCase(ParamStr(I)) = '/EDR_NATIVE_COORDINATED=1' then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
 function InstallerWorkerPresentForUninstall: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{app}\FDSecurityInstallerWorker.exe'));
+  Result := (not EdrNativeCoordinatedUninstall) and
+    FileExists(ExpandConstant('{app}\FDSecurityInstallerWorker.exe'));
 end;
 
 function AutorunScriptPresentForUninstall: Boolean;
 begin
-  Result := (not InstallerWorkerPresentForUninstall) and FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
+  Result := (not EdrNativeCoordinatedUninstall) and
+    (not InstallerWorkerPresentForUninstall) and
+    FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
 end;
 
 function ServiceScriptPresentForUninstall: Boolean;
 begin
-  Result := (not InstallerWorkerPresentForUninstall) and FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
+  Result := (not EdrNativeCoordinatedUninstall) and
+    (not InstallerWorkerPresentForUninstall) and
+    FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
 end;

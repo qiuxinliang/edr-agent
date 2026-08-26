@@ -1,5 +1,6 @@
 #include "edr/shell_exec.h"
 #include "edr/collector.h"
+#include "edr/windows_spawn_lock.h"
 #include "cJSON.h"
 #include <ctype.h>
 #include <errno.h>
@@ -102,10 +103,17 @@ int edr_shell_exec_cancellable(const char *command, int timeout_sec,
   output[0] = '\0';
 
 #ifdef _WIN32
-  HANDLE hRead, hWrite;
+  HANDLE hRead = NULL, hWrite = NULL;
   SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-  if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return -1;
-  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+  EdrWindowsSpawnLock spawn_lock = { 0 };
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock) ||
+      !CreatePipe(&hRead, &hWrite, &sa, 0) ||
+      !SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0)) {
+    edr_windows_spawn_lock_release(&spawn_lock);
+    if (hWrite) CloseHandle(hWrite);
+    if (hRead) CloseHandle(hRead);
+    return -1;
+  }
   STARTUPINFOA si;
   memset(&si, 0, sizeof(si));
   si.cb = sizeof(si);
@@ -116,10 +124,16 @@ int edr_shell_exec_cancellable(const char *command, int timeout_sec,
   snprintf(cmdline, sizeof(cmdline), "cmd.exe /c \"%s\"", command);
   PROCESS_INFORMATION pi = { 0 };
   if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                      NULL, NULL, &si, &pi)) {
+                      NULL, NULL, &si, &pi) ||
+      !SetHandleInformation(hWrite, HANDLE_FLAG_INHERIT, 0)) {
+    if (pi.hProcess) TerminateProcess(pi.hProcess, ERROR_CANCELLED);
+    edr_windows_spawn_lock_release(&spawn_lock);
     CloseHandle(hWrite); CloseHandle(hRead);
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
     return -1;
   }
+  edr_windows_spawn_lock_release(&spawn_lock);
   edr_collector_register_policy_canary_process((uint32_t)pi.dwProcessId, command);
   if (ResumeThread(pi.hThread) == (DWORD)-1) {
     TerminateProcess(pi.hProcess, 125);

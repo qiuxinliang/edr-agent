@@ -19,7 +19,6 @@ class VerifyBinaryHotCompatibilityTests(unittest.TestCase):
         components = {
             "FDSecurityInstallerWorker.exe": worker,
             "uninstall.exe": b"uninstaller",
-            "uninstall.ps1": b"script",
             "runtime.dll": dll,
         }
         manifest = {

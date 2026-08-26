@@ -133,11 +133,8 @@ Windows headless 安装完成后会在 `%ProgramFiles%\FDSecurity` 写入原生 
 
 - 交互卸载：`"C:\Program Files\FDSecurity\uninstall.exe"`
 - 静默卸载：`"C:\Program Files\FDSecurity\uninstall.exe" /S`
-- 卸载 Agent 并将日志、诊断数据归档到 `%ProgramData%\FDSecurity\UninstallArchive`：`"C:\Program Files\FDSecurity\uninstall.exe" /KEEPDATA`
 
-`/KEEPDATA` 不会保留 Agent 服务、程序文件、身份证书、注册配置、私钥、队列或取证缓存；这些内容仍会随完整卸载清理。归档目录仅包含 `logs` 和 `diagnostics`。
-
-`uninstall.ps1` 作为维护和故障恢复入口继续保留；正常卸载应优先使用 `uninstall.exe`。
+`uninstall.exe` 是唯一卸载入口：本地启动会通过 UAC 提升权限，远程卸载由 Agent/Worker 交接给原生协调器，并在物理删除和证明上报完成后才报告成功。
 
 若需 **Windows 服务**形态，优先使用上文 §4；与计划任务二选一，避免同一主机启动两个 Agent 实例。
 

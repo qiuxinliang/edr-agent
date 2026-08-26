@@ -19,7 +19,6 @@ from pathlib import Path, PurePosixPath
 REQUIRED_NATIVE = (
     "FDSecurityInstallerWorker.exe",
     "uninstall.exe",
-    "uninstall.ps1",
 )
 RUNTIME_SUFFIXES = (".dll", ".sys")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")

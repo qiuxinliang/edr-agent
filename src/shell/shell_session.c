@@ -1,4 +1,5 @@
 #include "edr/shell_session.h"
+#include "edr/windows_spawn_lock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,31 +106,37 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   HANDLE stdin_r = NULL, stdin_w = NULL;
   HANDLE stdout_r = NULL, stdout_w = NULL;
   SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+  EdrWindowsSpawnLock spawn_lock = { 0 };
 
-  if (!CreatePipe(&stdin_r, &stdin_w, &sa, 0) ||
-      !CreatePipe(&stdout_r, &stdout_w, &sa, 0)) {
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock) ||
+      !CreatePipe(&stdin_r, &stdin_w, &sa, 0) ||
+      !SetHandleInformation(stdin_w, HANDLE_FLAG_INHERIT, 0) ||
+      !CreatePipe(&stdout_r, &stdout_w, &sa, 0) ||
+      !SetHandleInformation(stdout_r, HANDLE_FLAG_INHERIT, 0)) {
     if (stdin_r)  CloseHandle(stdin_r);
     if (stdin_w)  CloseHandle(stdin_w);
     if (stdout_r) CloseHandle(stdout_r);
     if (stdout_w) CloseHandle(stdout_w);
+    edr_windows_spawn_lock_release(&spawn_lock);
     sessions_unlock();
     return -1;
   }
-  SetHandleInformation(stdin_w, HANDLE_FLAG_INHERIT, 0);
-  SetHandleInformation(stdout_r, HANDLE_FLAG_INHERIT, 0);
 
   size_t shell_wlen = strlen(shell) + 1;
   wchar_t *wshell = (wchar_t *)malloc(shell_wlen * sizeof(wchar_t));
   if (!wshell) {
     CloseHandle(stdin_r);  CloseHandle(stdin_w);
     CloseHandle(stdout_r); CloseHandle(stdout_w);
+    edr_windows_spawn_lock_release(&spawn_lock);
     sessions_unlock();
     return -1;
   }
   MultiByteToWideChar(CP_UTF8, 0, shell, -1, wshell, (int)shell_wlen);
 
   PROCESS_INFORMATION pi = {0};
-  STARTUPINFOW si = { sizeof(si) };
+  STARTUPINFOW si;
+  memset(&si, 0, sizeof(si));
+  si.cb = sizeof(si);
   si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
   si.hStdInput  = stdin_r;
@@ -150,6 +157,7 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   free(wshell);
   CloseHandle(stdin_r);
   CloseHandle(stdout_w);
+  edr_windows_spawn_lock_release(&spawn_lock);
 
   if (!cr) {
     CloseHandle(stdin_w);

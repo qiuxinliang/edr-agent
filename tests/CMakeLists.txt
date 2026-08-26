@@ -37,6 +37,10 @@ add_executable(test_shell_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_policy.c
 target_include_directories(test_shell_policy PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(WIN32)
+  target_sources(test_shell_policy PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn_lock.c)
+endif()
 edr_apply_common_warnings(test_shell_policy)
 add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -227,6 +231,44 @@ add_test(NAME windows_headless_runtime_contract COMMAND test_windows_headless_ru
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(windows_headless_runtime_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+
+if(WIN32)
+  add_executable(test_windows_native_manifest
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_native_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_native_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_windows_native_manifest PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_link_libraries(test_windows_native_manifest PRIVATE advapi32)
+  edr_apply_common_warnings(test_windows_native_manifest)
+  add_test(NAME windows_native_manifest_behavior COMMAND test_windows_native_manifest
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(windows_native_manifest_behavior PROPERTIES TIMEOUT 60)
+
+  # The production uninstall.exe has no test-only command-line modes. This
+  # executable includes the same native implementation and owns the Windows
+  # handoff, inheritance, safe-delete, and self-unlink behavior checks.
+  add_executable(test_windows_native_uninstall
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_native_uninstall.c
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn_lock.c
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_handoff.c
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn.c
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_native_manifest.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_compile_definitions(test_windows_native_uninstall PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_include_directories(test_windows_native_uninstall PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_link_libraries(test_windows_native_uninstall PRIVATE
+    shell32 user32 advapi32 rpcrt4 crypt32 ncrypt winhttp ole32 oleaut32 taskschd)
+  edr_apply_common_warnings(test_windows_native_uninstall)
+  add_test(NAME windows_native_uninstall_behavior COMMAND test_windows_native_uninstall
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(windows_native_uninstall_behavior PROPERTIES TIMEOUT 120)
+endif()
 
 add_executable(test_remote_config_status_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_config_status_contract.c)
@@ -531,6 +573,10 @@ add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_c
 add_executable(test_deep_collector_manifest ${CMAKE_CURRENT_SOURCE_DIR}/test_deep_collector_manifest.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_deep_collector_manifest PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(WIN32)
+  target_sources(test_deep_collector_manifest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn_lock.c)
+endif()
 edr_apply_common_warnings(test_deep_collector_manifest)
 add_test(NAME deep_collector_manifest COMMAND test_deep_collector_manifest WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 

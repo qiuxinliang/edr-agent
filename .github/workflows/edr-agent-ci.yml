@@ -95,7 +95,8 @@ jobs:
             'test_command_contract',
             'test_agent_update_contract',
             'test_agent_update_assets',
-            'test_windows_headless_runtime_contract'
+            'test_windows_headless_runtime_contract',
+            'test_windows_native_manifest'
           )
           cmake --build build --target $windowsTargets --parallel $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) { throw "Windows product or gate-test build failed with exit code $LASTEXITCODE" }
@@ -123,7 +124,8 @@ jobs:
             'agent_update_command_contract',
             'agent_update_packaging_contract',
             'windows_headless_runtime_contract',
-            'command_registry_and_payload_contract'
+            'command_registry_and_payload_contract',
+            'windows_native_manifest_behavior'
           )
           $listedText = $listed -join "`n"
           foreach ($name in $required) {
@@ -131,7 +133,7 @@ jobs:
               throw "Required Windows CI test was not configured: $name"
             }
           }
-          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract)$'
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|windows_native_manifest_behavior)$'
           if ($LASTEXITCODE -ne 0) { throw "CI tests failed" }
 
   build-linux:

@@ -1,7 +1,10 @@
 #include "edr/agent_lifecycle_command.h"
 
 #include "cJSON.h"
-#include "edr/sha256.h"
+#include "edr/windows_handoff.h"
+#include "edr/windows_native_manifest.h"
+#include "edr/windows_spawn.h"
+#include "edr/windows_spawn_lock.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -36,6 +39,40 @@ typedef struct EdrAgentLifecycleRequest {
   int keep_data;
 } EdrAgentLifecycleRequest;
 
+static void lifecycle_clear_token(char *token, size_t capacity) {
+  if (!token || !capacity) return;
+#ifdef _WIN32
+  SecureZeroMemory(token, capacity);
+#else
+  volatile unsigned char *cursor = (volatile unsigned char *)token;
+  while (capacity--) *cursor++ = 0;
+#endif
+}
+
+static void lifecycle_clear_json_tokens(cJSON *root) {
+  cJSON *item;
+  if (!root || !cJSON_IsObject(root)) return;
+  for (item = root->child; item; item = item->next) {
+    if (item->string && strcmp(item->string, "attestation_token") == 0 &&
+        cJSON_IsString(item) && item->valuestring) {
+      lifecycle_clear_token(item->valuestring, strlen(item->valuestring));
+    }
+  }
+}
+
+static int lifecycle_json_has_duplicate_keys(const cJSON *root) {
+  const cJSON *item;
+  const cJSON *prior;
+  if (!root || !cJSON_IsObject(root)) return 1;
+  for (item = root->child; item; item = item->next) {
+    if (!item->string) return 1;
+    for (prior = root->child; prior != item; prior = prior->next) {
+      if (prior->string && strcmp(prior->string, item->string) == 0) return 1;
+    }
+  }
+  return 0;
+}
+
 static int copy_json_string(const cJSON *root, const char *name, char *out, size_t cap) {
   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
   if (!cJSON_IsString(item) || !item->valuestring || !item->valuestring[0] ||
@@ -62,23 +99,47 @@ static int safe_https_url(const char *value) {
   return 1;
 }
 
+static int lifecycle_bearer_token_valid(const char *value) {
+  size_t length;
+  if (!value || (length = strlen(value)) < 32u || length > 256u) return 0;
+  for (size_t i = 0; i < length; ++i) {
+    unsigned char ch = (unsigned char)value[i];
+    if (!isalnum(ch) && ch != '_' && ch != '-') return 0;
+  }
+  return 1;
+}
+
+static int lifecycle_payload_contains_nul_escape(const uint8_t *payload, size_t payload_len) {
+  size_t i;
+  if (!payload) return 0;
+  for (i = 0; i + 5u < payload_len; ++i) {
+    if (payload[i] == '\\' && (payload[i + 1u] == 'u' || payload[i + 1u] == 'U') &&
+        payload[i + 2u] == '0' && payload[i + 3u] == '0' &&
+        payload[i + 4u] == '0' && payload[i + 5u] == '0') return 1;
+  }
+  return 0;
+}
+
 static int parse_request(const uint8_t *payload, size_t payload_len,
                          EdrAgentLifecycleRequest *out) {
-  if (!payload || !payload_len || payload_len > 8192u || !out) return 0;
+  char *json = NULL;
+  cJSON *root = NULL;
+  const char *parse_end = NULL;
+  int ok = 0;
+  if (!payload || !payload_len || payload_len > 8192u || !out ||
+      memchr(payload, '\0', payload_len) != NULL ||
+      lifecycle_payload_contains_nul_escape(payload, payload_len)) return 0;
   memset(out, 0, sizeof(*out));
-  char *json = (char *)malloc(payload_len + 1u);
+  json = (char *)calloc(payload_len + 1u, 1u);
   if (!json) return 0;
   memcpy(json, payload, payload_len);
   json[payload_len] = '\0';
-  cJSON *root = cJSON_Parse(json);
-  free(json);
-  if (!cJSON_IsObject(root)) {
-    cJSON_Delete(root);
-    return 0;
-  }
+  root = cJSON_ParseWithLengthOpts(json, payload_len + 1u, &parse_end, 1);
+  if (!cJSON_IsObject(root) || parse_end != json + payload_len ||
+      lifecycle_json_has_duplicate_keys(root)) goto cleanup;
   const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
   const cJSON *keep_data = cJSON_GetObjectItemCaseSensitive(root, "keep_data");
-  int ok = cJSON_IsString(schema) && schema->valuestring &&
+  ok = cJSON_IsString(schema) && schema->valuestring &&
            strcmp(schema->valuestring, "edr.endpoint.lifecycle.v1") == 0 &&
            copy_json_string(root, "task_id", out->task_id, sizeof(out->task_id)) &&
            copy_json_string(root, "action", out->action, sizeof(out->action)) &&
@@ -92,35 +153,19 @@ static int parse_request(const uint8_t *payload, size_t payload_len,
          copy_json_string(root, "attestation_token", out->attestation_token,
                           sizeof(out->attestation_token)) &&
          safe_identifier(out->endpoint_id) && safe_https_url(out->attestation_url) &&
-         safe_identifier(out->attestation_token);
+         lifecycle_bearer_token_valid(out->attestation_token);
   }
   if (ok) out->keep_data = cJSON_IsTrue(keep_data);
+cleanup:
+  lifecycle_clear_json_tokens(root);
   cJSON_Delete(root);
+  lifecycle_clear_token(json, payload_len + 1u);
+  free(json);
+  if (!ok) lifecycle_clear_token(out->attestation_token, sizeof(out->attestation_token));
   return ok;
 }
 
 #ifdef _WIN32
-static int lifecycle_file_sha256(const char *path, char out[65]) {
-  FILE *file = path ? fopen(path, "rb") : NULL;
-  if (!file) return 0;
-  EdrSha256Ctx hash;
-  edr_sha256_init(&hash);
-  unsigned char buffer[16384];
-  int ok = 1;
-  for (;;) {
-    size_t count = fread(buffer, 1u, sizeof(buffer), file);
-    if (count) edr_sha256_update(&hash, buffer, count);
-    if (count < sizeof(buffer)) { if (ferror(file)) ok = 0; break; }
-  }
-  if (fclose(file) != 0) ok = 0;
-  if (!ok) return 0;
-  unsigned char digest[EDR_SHA256_DIGEST_LEN];
-  edr_sha256_final(&hash, digest);
-  for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; ++i) snprintf(out + i * 2u, 3u, "%02x", digest[i]);
-  out[64] = '\0';
-  return 1;
-}
-
 static int lifecycle_install_dir(char *directory, size_t cap) {
   char module[MAX_PATH];
   DWORD length = GetModuleFileNameA(NULL, module, (DWORD)sizeof(module));
@@ -132,86 +177,16 @@ static int lifecycle_install_dir(char *directory, size_t cap) {
   return written > 0 && (size_t)written < cap;
 }
 
-static int lifecycle_sha256_text_valid(const char *value) {
-  if (!value || strlen(value) != 64u) return 0;
-  for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
-    if (!isxdigit(*p)) return 0;
-  }
-  return 1;
-}
-
-static int lifecycle_runtime_name_valid(const char *name) {
-  const char *required[] = {"FDSecurityInstallerWorker.exe", "uninstall.exe", "uninstall.ps1"};
-  if (!name || !name[0]) return 0;
-  for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
-    if (!isalnum(*p) && *p != '-' && *p != '_' && *p != '.') return 0;
-  }
-  for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
-    if (_stricmp(name, required[i]) == 0) return 1;
-  }
-  size_t length = strlen(name);
-  return length > 4u && _stricmp(name + length - 4u, ".dll") == 0;
-}
-
 static int lifecycle_runtime_validate(char identity_sha256[65]) {
-  char directory[MAX_PATH], manifest_path[MAX_PATH];
+  char directory[MAX_PATH];
+  wchar_t directory_wide[MAX_PATH];
   if (!lifecycle_install_dir(directory, sizeof(directory)) ||
-      snprintf(manifest_path, sizeof(manifest_path), "%s\\native-package-integrity.json", directory) >= (int)sizeof(manifest_path)) return 0;
-  FILE *file = fopen(manifest_path, "rb");
-  if (!file) return 0;
-  if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return 0; }
-  long length = ftell(file);
-  if (length <= 0 || length > 65536L || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return 0; }
-  char *json = (char *)malloc((size_t)length + 1u);
-  if (!json || fread(json, 1u, (size_t)length, file) != (size_t)length) { free(json); fclose(file); return 0; }
-  fclose(file); json[length] = '\0';
-  if (identity_sha256 && edr_sha256_hex((const uint8_t *)json, (size_t)length, identity_sha256) != 0) {
-    free(json);
+      MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, directory, -1,
+                          directory_wide, (int)(sizeof(directory_wide) /
+                                                sizeof(directory_wide[0]))) <= 0) {
     return 0;
   }
-  cJSON *root = cJSON_Parse(json); free(json);
-  if (!root) return 0;
-  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
-  const cJSON *files = cJSON_GetObjectItemCaseSensitive(root, "files");
-  const char *required[] = {"FDSecurityInstallerWorker.exe", "uninstall.exe", "uninstall.ps1"};
-  int ok = cJSON_IsObject(root) && cJSON_IsString(schema) && schema->valuestring &&
-           strcmp(schema->valuestring, "edr.windows.native-package-integrity.v1") == 0 && cJSON_IsArray(files);
-  int file_count = ok ? cJSON_GetArraySize(files) : 0;
-  int required_seen[3] = {0, 0, 0};
-  if (file_count < 3 || file_count > 64) ok = 0;
-  for (const cJSON *item = ok ? files->child : NULL; item && ok; item = item->next) {
-    const cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
-    const cJSON *sha = cJSON_GetObjectItemCaseSensitive(item, "sha256");
-    if (!cJSON_IsObject(item) || !cJSON_IsString(name) ||
-        !lifecycle_runtime_name_valid(name->valuestring) || !cJSON_IsString(sha) ||
-        !lifecycle_sha256_text_valid(sha->valuestring)) {
-      ok = 0;
-      break;
-    }
-    for (const cJSON *previous = files->child; previous && previous != item; previous = previous->next) {
-      const cJSON *previous_name = cJSON_GetObjectItemCaseSensitive(previous, "name");
-      if (cJSON_IsString(previous_name) && previous_name->valuestring &&
-          _stricmp(previous_name->valuestring, name->valuestring) == 0) {
-        ok = 0;
-        break;
-      }
-    }
-    for (size_t i = 0; ok && i < sizeof(required) / sizeof(required[0]); ++i) {
-      if (_stricmp(name->valuestring, required[i]) == 0) required_seen[i] = 1;
-    }
-    char path[MAX_PATH], actual[65];
-    if (!ok || snprintf(path, sizeof(path), "%s\\%s", directory, name->valuestring) >=
-                   (int)sizeof(path) ||
-        !lifecycle_file_sha256(path, actual) || _stricmp(actual, sha->valuestring) != 0) {
-      ok = 0;
-    }
-  }
-  for (size_t i = 0; ok && i < sizeof(required_seen) / sizeof(required_seen[0]); ++i) {
-    if (!required_seen[i]) ok = 0;
-  }
-  cJSON_Delete(root);
-  if (!ok && identity_sha256) identity_sha256[0] = '\0';
-  return ok;
+  return edr_windows_native_manifest_validate(directory_wide, identity_sha256);
 }
 
 int edr_agent_lifecycle_runtime_ready(void) { return lifecycle_runtime_validate(NULL); }
@@ -258,8 +233,20 @@ static int lifecycle_paths(const char *command_id, char *helper, size_t helper_c
 }
 
 static int launch_worker(const char *helper, const char *journal, const char *log_path,
-                         const char *command_id, const EdrAgentLifecycleRequest *request) {
+                         const char *command_id, EdrAgentLifecycleRequest *request) {
   char install_dir[MAX_PATH];
+  SECURITY_ATTRIBUTES security;
+  HANDLE secret_read = INVALID_HANDLE_VALUE, secret_write = INVALID_HANDLE_VALUE;
+  HANDLE ack_read = INVALID_HANDLE_VALUE, ack_write = INVALID_HANDLE_VALUE;
+  HANDLE handles[2];
+  PROCESS_INFORMATION process;
+  STARTUPINFOA startup;
+  wchar_t wide_command[32768];
+  wchar_t wide_directory[MAX_PATH];
+  EdrWindowsSpawnLock spawn_lock = { 0 };
+  char token_ack[256];
+  DWORD token_ack_length = 0;
+  int ok = 0;
   if (snprintf(install_dir, sizeof(install_dir), "%s", helper) >= (int)sizeof(install_dir)) {
     return 0;
   }
@@ -267,35 +254,103 @@ static int launch_worker(const char *helper, const char *journal, const char *lo
   if (!slash || slash == install_dir) return 0;
   *slash = '\0';
   char command[4096];
-  int written = snprintf(
-      command, sizeof(command),
-      "\"%s\" --stage lifecycle-%s --service-name \"FDSecurityAgent\" "
-      "--install-dir \"%s\" "
-      "--journal \"%s\" --log \"%s\" --command-id \"%s\" --task-id \"%s\" "
-      "--action \"%s\" --delay-ms %u%s%s%s%s%s%s%s%s",
-      helper, request->action, install_dir, journal, log_path, command_id, request->task_id,
-      request->action, strcmp(request->action, "restart") == 0 ? 2000u : 30000u,
-      request->keep_data ? " --keep-data" : "",
-      request->attestation_url[0] ? " --attestation-url \"" : "", request->attestation_url,
-      request->attestation_url[0] ? "\" --attestation-token \"" : "", request->attestation_token,
-      request->attestation_url[0] ? "\" --endpoint-id \"" : "", request->endpoint_id,
-      request->attestation_url[0] ? "\"" : "");
+  int written = 0;
+  if (strcmp(request->action, "uninstall") != 0) {
+    written = snprintf(
+        command, sizeof(command),
+        "\"%s\" --stage lifecycle-%s --service-name \"FDSecurityAgent\" "
+        "--install-dir \"%s\" --journal \"%s\" --log \"%s\" --command-id \"%s\" "
+        "--task-id \"%s\" --action \"%s\" --delay-ms %u",
+        helper, request->action, install_dir, journal, log_path, command_id, request->task_id,
+        request->action, strcmp(request->action, "restart") == 0 ? 2000u : 30000u);
+  }
+  if (strcmp(request->action, "uninstall") == 0) {
+    written = snprintf(command, sizeof(command),
+                       "\"%s\" --stage lifecycle-uninstall --service-name \"FDSecurityAgent\" "
+                       "--install-dir \"%s\" --journal \"%s\" --log \"%s\" --command-id \"%s\" "
+                       "--task-id \"%s\" --action uninstall --delay-ms 30000 "
+                       "--attestation-url \"%s\" --endpoint-id \"%s\" "
+                       "--secret-read-handle %llu --ack-write-handle %llu",
+                       helper, install_dir, journal, log_path, command_id, request->task_id,
+                       request->attestation_url, request->endpoint_id,
+                       (unsigned long long)(ULONG_PTR)0,
+                       (unsigned long long)(ULONG_PTR)0);
+  }
   if (written <= 0 || written >= (int)sizeof(command)) return 0;
-  STARTUPINFOA startup;
-  PROCESS_INFORMATION process;
   memset(&startup, 0, sizeof(startup));
   memset(&process, 0, sizeof(process));
-  startup.cb = sizeof(startup);
+  if (strcmp(request->action, "uninstall") != 0) {
+    startup.cb = sizeof(STARTUPINFOA);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    if (!CreateProcessA(NULL, command, NULL, NULL, FALSE,
+                        lifecycle_child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS),
+                        NULL, NULL, &startup, &process)) return 0;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return 1;
+  }
+  memset(&security, 0, sizeof(security));
+  security.nLength = sizeof(security);
+  security.bInheritHandle = FALSE;
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock)) goto cleanup;
+  if (!CreatePipe(&secret_read, &secret_write, &security, 0) ||
+      !CreatePipe(&ack_read, &ack_write, &security, 0)) goto cleanup;
+  written = snprintf(command, sizeof(command),
+                     "\"%s\" --stage lifecycle-uninstall --service-name \"FDSecurityAgent\" "
+                     "--install-dir \"%s\" --journal \"%s\" --log \"%s\" --command-id \"%s\" "
+                     "--task-id \"%s\" --action uninstall --delay-ms 30000 "
+                     "--attestation-url \"%s\" --endpoint-id \"%s\" "
+                     "--secret-read-handle %llu --ack-write-handle %llu",
+                     helper, install_dir, journal, log_path, command_id, request->task_id,
+                     request->attestation_url, request->endpoint_id,
+                     (unsigned long long)(ULONG_PTR)secret_read,
+                     (unsigned long long)(ULONG_PTR)ack_write);
+  if (written <= 0 || written >= (int)sizeof(command)) goto cleanup;
+  handles[0] = secret_read;
+  handles[1] = ack_write;
+  startup.cb = sizeof(STARTUPINFOA);
   startup.dwFlags = STARTF_USESHOWWINDOW;
   startup.wShowWindow = SW_HIDE;
-  if (!CreateProcessA(NULL, command, NULL, NULL, FALSE,
-                      lifecycle_child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS),
-                      NULL, NULL, &startup, &process)) {
-    return 0;
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, command, -1,
+                          wide_command, (int)(sizeof(wide_command) / sizeof(wide_command[0]))) <= 0 ||
+      MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, install_dir, -1,
+                          wide_directory, (int)(sizeof(wide_directory) / sizeof(wide_directory[0]))) <= 0 ||
+      !edr_windows_spawn_whitelisted(
+          wide_command, wide_directory, handles, 2, &process,
+          lifecycle_child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS))) {
+    goto cleanup;
   }
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  return 1;
+  edr_windows_spawn_lock_release(&spawn_lock);
+  CloseHandle(secret_read); secret_read = INVALID_HANDLE_VALUE;
+  CloseHandle(ack_write); ack_write = INVALID_HANDLE_VALUE;
+  if (!edr_windows_handoff_write_frame(secret_write, (const BYTE *)request->attestation_token,
+                                       (DWORD)strlen(request->attestation_token))) goto cleanup;
+  lifecycle_clear_token(request->attestation_token, sizeof(request->attestation_token));
+  CloseHandle(secret_write); secret_write = INVALID_HANDLE_VALUE;
+  if (!edr_windows_handoff_read_frame(ack_read, (BYTE *)token_ack, sizeof(token_ack),
+                                      &token_ack_length) ||
+      token_ack_length != sizeof("edr.worker.ready.v1") - 1 ||
+      memcmp(token_ack, "edr.worker.ready.v1", sizeof("edr.worker.ready.v1") - 1) != 0) goto cleanup;
+  ok = 1;
+cleanup:
+  edr_windows_spawn_lock_release(&spawn_lock);
+  if (request) {
+    lifecycle_clear_token(request->attestation_token,
+                          sizeof(request->attestation_token));
+  }
+  SecureZeroMemory(token_ack, sizeof(token_ack));
+  if (!ok && process.hProcess) {
+    TerminateProcess(process.hProcess, ERROR_CANCELLED);
+    WaitForSingleObject(process.hProcess, 5000);
+  }
+  if (process.hThread) CloseHandle(process.hThread);
+  if (process.hProcess) CloseHandle(process.hProcess);
+  if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
+  if (secret_write != INVALID_HANDLE_VALUE) CloseHandle(secret_write);
+  if (ack_read != INVALID_HANDLE_VALUE) CloseHandle(ack_read);
+  if (ack_write != INVALID_HANDLE_VALUE) CloseHandle(ack_write);
+  return ok;
 }
 
 static int read_journal(const char *path, EdrAgentLifecycleRecovery *out) {
@@ -356,16 +411,24 @@ int edr_agent_lifecycle_execute(const char *command_id, const uint8_t *payload,
     snprintf(detail, detail_cap, "invalid endpoint lifecycle command payload");
     return 2;
   }
+  if (request.keep_data) {
+    lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
+    snprintf(detail, detail_cap, "keep_data is unsupported; complete uninstall is required");
+    return EDR_AGENT_LIFECYCLE_EXIT_UNSUPPORTED;
+  }
   char helper[MAX_PATH], journal[MAX_PATH], log_path[MAX_PATH];
   if (!lifecycle_paths(command_id, helper, sizeof(helper), journal, sizeof(journal),
                        log_path, sizeof(log_path))) {
+    lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
     snprintf(detail, detail_cap, "lifecycle worker is missing from the installed runtime");
     return EDR_AGENT_LIFECYCLE_EXIT_UNSUPPORTED;
   }
   if (!launch_worker(helper, journal, log_path, command_id, &request)) {
+    lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
     snprintf(detail, detail_cap, "cannot launch lifecycle worker");
     return 3;
   }
+  lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
   if (strcmp(request.action, "restart") != 0) {
     snprintf(detail, detail_cap,
              "%s handoff accepted; local teardown is delayed for command-result delivery",
@@ -386,10 +449,13 @@ int edr_agent_lifecycle_recover(const char *command_id, const uint8_t *payload,
   return 0;
 #else
   EdrAgentLifecycleRequest request;
+  memset(&request, 0, sizeof(request));
   char helper[MAX_PATH], journal[MAX_PATH], log_path[MAX_PATH];
   if (!command_id || !parse_request(payload, payload_len, &request) ||
+      request.keep_data ||
       !lifecycle_paths(command_id, helper, sizeof(helper), journal, sizeof(journal),
                        log_path, sizeof(log_path))) {
+    lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
     return -1;
   }
   int rc = read_journal(journal, out);
@@ -397,8 +463,10 @@ int edr_agent_lifecycle_recover(const char *command_id, const uint8_t *payload,
                   strcmp(out->command_id, command_id) ||
                   strcmp(out->action, request.action))) {
     memset(out, 0, sizeof(*out));
+    lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
     return -1;
   }
+  lifecycle_clear_token(request.attestation_token, sizeof(request.attestation_token));
   return rc;
 #endif
 }

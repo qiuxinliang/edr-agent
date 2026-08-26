@@ -502,19 +502,30 @@ if(WIN32)
   add_executable(fd_installer_worker src/installer_worker/installer_worker_win.c)
   set_target_properties(fd_installer_worker PROPERTIES OUTPUT_NAME "FDSecurityInstallerWorker")
   target_compile_definitions(fd_installer_worker PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_sources(fd_installer_worker PRIVATE src/platform/windows_spawn_lock.c)
+  target_sources(fd_installer_worker PRIVATE src/platform/windows_handoff.c src/platform/windows_spawn.c)
+  target_include_directories(fd_installer_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(fd_installer_worker PRIVATE advapi32 shell32 user32)
   edr_apply_common_warnings(fd_installer_worker)
 
   add_executable(fd_headless_uninstaller WIN32 src/installer_worker/headless_uninstaller_win.c)
   set_target_properties(fd_headless_uninstaller PROPERTIES OUTPUT_NAME "uninstall")
   target_compile_definitions(fd_headless_uninstaller PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+  target_sources(fd_headless_uninstaller PRIVATE src/platform/windows_spawn_lock.c)
+  target_sources(fd_headless_uninstaller PRIVATE src/platform/windows_handoff.c src/platform/windows_spawn.c)
+  target_sources(fd_headless_uninstaller PRIVATE src/platform/windows_native_manifest.c)
+  target_sources(fd_headless_uninstaller PRIVATE src/command/sha256.c)
   if(MSVC)
     # The dialog text is authored as UTF-8 wide string literals. Without an
     # explicit source charset, MSVC decodes this file through the runner's ACP
     # and the resulting uninstall prompts are permanently mojibaked.
     target_compile_options(fd_headless_uninstaller PRIVATE /utf-8)
   endif()
-  target_link_libraries(fd_headless_uninstaller PRIVATE shell32 user32)
+  target_sources(fd_headless_uninstaller PRIVATE third_party/cjson/cJSON.c)
+  target_include_directories(fd_headless_uninstaller PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cjson)
+  target_link_libraries(fd_headless_uninstaller PRIVATE shell32 user32 advapi32 rpcrt4 crypt32 ncrypt winhttp ole32 oleaut32 taskschd)
   edr_apply_common_warnings(fd_headless_uninstaller)
 endif()
 
@@ -619,6 +630,9 @@ if(WIN32)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1
     ${CMAKE_CURRENT_BINARY_DIR}/edr_agent_inplace_update.ps1 COPYONLY)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)
+  target_sources(edr_agent PRIVATE src/platform/windows_spawn_lock.c)
+  target_sources(edr_agent PRIVATE src/platform/windows_handoff.c src/platform/windows_spawn.c)
+  target_sources(edr_agent PRIVATE src/platform/windows_native_manifest.c)
   target_link_libraries(edr_agent PRIVATE advapi32 shell32 ole32 oleaut32 uuid taskschd tdh ws2_32 iphlpapi psapi crypt32 wintrust wevtapi netapi32 dbghelp)
 else()
   target_compile_definitions(edr_agent PRIVATE EDR_OS_POSIX=1)

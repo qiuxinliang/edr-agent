@@ -19,7 +19,6 @@ $relativePaths = @(
   "scripts\edr_agent_inplace_update.ps1",
   "scripts\edr_agent_postinstall_verify.ps1",
   "scripts\edr_agent_zip_deploy.ps1",
-  "scripts\edr_agent_uninstall.ps1",
   "scripts\windows_service_install.ps1",
   "scripts\windows_isolate_host.ps1",
   "scripts\invoke_windows_native_capability_probe.ps1",

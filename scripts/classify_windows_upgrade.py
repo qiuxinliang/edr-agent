@@ -39,7 +39,7 @@ INSTALLER_REQUIRED_FILES = {
 # Protocol v5 atomically replaces these lifecycle helpers, app-local DLLs, and
 # their integrity manifest. They do not require the full Inno installer.
 RUNTIME_BUNDLE_PREFIXES = ("src/installer_worker/",)
-RUNTIME_BUNDLE_FILES = {"scripts/edr_agent_uninstall.ps1"}
+RUNTIME_BUNDLE_FILES: set[str] = set()
 
 # Source-only changes are *not* automatically binary-hot. A release build also
 # produces native lifecycle helpers and may pick up a different app-local

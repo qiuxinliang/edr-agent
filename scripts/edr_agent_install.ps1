@@ -647,8 +647,7 @@ function Repair-InstallRuntimeAcls {
   foreach ($uninstaller in @(
     @{ Name = "unins000.exe"; Grant = "*S-1-5-32-545:RX" },
     @{ Name = "unins000.dat"; Grant = "*S-1-5-32-545:R" },
-    @{ Name = "uninstall.exe"; Grant = "*S-1-5-32-545:RX" },
-    @{ Name = "uninstall.ps1"; Grant = "*S-1-5-32-545:R" }
+    @{ Name = "uninstall.exe"; Grant = "*S-1-5-32-545:RX" }
   )) {
     $path = Join-Path $InstallRoot $uninstaller.Name
     try {
@@ -892,33 +891,14 @@ function Install-HeadlessUninstaller {
   param([string]$InstallRoot)
   if ((Get-EnrollOs) -ne "windows" -or -not $InstallRoot) { return }
 
-  $packageDirs = New-Object System.Collections.Generic.List[string]
-  if ($PSScriptRoot) {
-    $packageDirs.Add($PSScriptRoot) | Out-Null
-    $packageRoot = Split-Path -Parent $PSScriptRoot
-    if ($packageRoot) {
-      $packageDirs.Add($packageRoot) | Out-Null
-    }
-  }
-  $scriptSource = $packageDirs | ForEach-Object { Join-Path $_ "uninstall.ps1" } |
-    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+  $packageDirs = @($PSScriptRoot, (Split-Path -Parent $PSScriptRoot)) |
+    Where-Object { $_ } | Select-Object -Unique
   $exeSource = $packageDirs | ForEach-Object { Join-Path $_ "uninstall.exe" } |
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-  if (-not $scriptSource) {
-    Write-Warning "Headless uninstall.ps1 was not found next to the installer script"
-    return
-  }
 
   $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot)
-  $scriptDestination = Join-Path $installRootFull "uninstall.ps1"
-  if ([System.IO.Path]::GetFullPath($scriptSource) -ne [System.IO.Path]::GetFullPath($scriptDestination)) {
-    Copy-Item -LiteralPath $scriptSource -Destination $scriptDestination -Force
-  }
-  try { Unblock-File -LiteralPath $scriptDestination -ErrorAction SilentlyContinue } catch {}
-
   if (-not $exeSource) {
-    Write-Warning "Headless uninstall.exe was not found; PowerShell uninstall remains available"
-    return
+    throw "Headless uninstall.exe was not found; a verified native Release artifact is required"
   }
   $exeDestination = Join-Path $installRootFull "uninstall.exe"
   if ([System.IO.Path]::GetFullPath($exeSource) -ne [System.IO.Path]::GetFullPath($exeDestination)) {

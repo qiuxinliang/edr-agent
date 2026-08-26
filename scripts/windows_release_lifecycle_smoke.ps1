@@ -64,35 +64,6 @@ function Get-Publisher {
   }
 }
 
-function Get-TextSha256 {
-  param([Parameter(Mandatory = $true)][string]$Value)
-  $sha = [Security.Cryptography.SHA256]::Create()
-  try {
-    $digest = [BitConverter]::ToString(
-      $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)))
-    return $digest.Replace("-", "").ToLowerInvariant()
-  } finally {
-    $sha.Dispose()
-  }
-}
-
-function Get-UninstallAttestationProof {
-  param(
-    [Parameter(Mandatory = $true)][string]$Token,
-    [Parameter(Mandatory = $true)][string]$TaskID,
-    [Parameter(Mandatory = $true)][string]$EndpointID
-  )
-  $key = [Text.Encoding]::UTF8.GetBytes($Token)
-  $message = [Text.Encoding]::UTF8.GetBytes(
-    "edr.endpoint.uninstall.attestation.v1`n$TaskID`n$EndpointID")
-  $hmac = New-Object Security.Cryptography.HMACSHA256 -ArgumentList (,$key)
-  try {
-    $proof = [BitConverter]::ToString($hmac.ComputeHash($message))
-    return $proof.Replace("-", "").ToLowerInvariant()
-  } finally {
-    $hmac.Dispose()
-  }
-}
 
 function Wait-ServiceStable {
   param([int]$Seconds = 10)
@@ -139,37 +110,6 @@ function Wait-InstallDirectoryDeleted {
     Start-Sleep -Seconds 1
   }
   throw "install directory still exists after waiting $Seconds seconds: $installDir"
-}
-
-function Wait-CleanupReceipt {
-  param([string]$Path, [int]$Seconds = 120)
-  for ($i = 0; $i -lt $Seconds; $i++) {
-    if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
-    Start-Sleep -Seconds 1
-  }
-  throw "deferred uninstall cleanup did not write its receipt within $Seconds seconds"
-}
-
-function Wait-AttestationListenerReady {
-  param(
-    [string]$Path,
-    [System.Management.Automation.Job]$Job,
-    [int]$Seconds = 15
-  )
-  $pollCount = $Seconds * 4
-  for ($i = 0; $i -lt $pollCount; $i++) {
-    if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
-    if ($Job.State -eq "Failed" -or $Job.State -eq "Stopped" -or $Job.State -eq "Completed") {
-      $reason = ""
-      if ($Job.ChildJobs.Count -gt 0 -and $Job.ChildJobs[0].JobStateInfo.Reason) {
-        $reason = $Job.ChildJobs[0].JobStateInfo.Reason.Message
-      }
-      $output = ((Receive-Job -Job $Job -Keep -ErrorAction SilentlyContinue | Out-String).Trim())
-      throw "uninstall attestation listener stopped before becoming ready: state=$($Job.State) reason=$reason output=$output"
-    }
-    Start-Sleep -Milliseconds 250
-  }
-  throw "uninstall attestation listener did not become ready within $Seconds seconds"
 }
 
 function Wait-EmbeddedUpdaterMaterialized {
@@ -250,27 +190,17 @@ $targetInstaller = Find-OneFile -Root $TargetPackageDir -Name "windows_service_i
 $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_update.ps1"
 $targetLifecycleWorker = Find-OneFile -Root $TargetPackageDir -Name "FDSecurityInstallerWorker.exe"
 $targetUninstaller = Find-OneFile -Root $TargetPackageDir -Name "uninstall.exe"
-$targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name "uninstall.ps1"
 $targetNativeIntegrity = Find-OneFile -Root $TargetPackageDir -Name "native-package-integrity.json"
 $baselineTemplate = Find-OneFile -Root $BaselinePackageDir -Name "agent_windows_production.example.toml"
 $sourceInstaller = Join-Path $PSScriptRoot "windows_service_install.ps1"
-$sourceUninstallScript = Join-Path $PSScriptRoot "edr_agent_uninstall.ps1"
 
 if (-not (Test-Path -LiteralPath $sourceInstaller)) {
   throw "current windows_service_install.ps1 is missing from the checked-out repository"
-}
-if (-not (Test-Path -LiteralPath $sourceUninstallScript)) {
-  throw "current edr_agent_uninstall.ps1 is missing from the checked-out repository"
 }
 $targetInstallerHash = (Get-FileHash -LiteralPath $targetInstaller -Algorithm SHA256).Hash
 $sourceInstallerHash = (Get-FileHash -LiteralPath $sourceInstaller -Algorithm SHA256).Hash
 if ($targetInstallerHash -ne $sourceInstallerHash) {
   throw "target package service installer hash mismatch"
-}
-$targetUninstallScriptHash = (Get-FileHash -LiteralPath $targetUninstallScript -Algorithm SHA256).Hash
-$sourceUninstallScriptHash = (Get-FileHash -LiteralPath $sourceUninstallScript -Algorithm SHA256).Hash
-if ($targetUninstallScriptHash -ne $sourceUninstallScriptHash) {
-  throw "target package uninstall script hash mismatch"
 }
 $nativeIntegrity = Get-Content -LiteralPath $targetNativeIntegrity -Raw | ConvertFrom-Json
 if ($nativeIntegrity.schema -ne "edr.windows.native-package-integrity.v1") {
@@ -278,8 +208,7 @@ if ($nativeIntegrity.schema -ne "edr.windows.native-package-integrity.v1") {
 }
 foreach ($component in @(
     @{ Name = "FDSecurityInstallerWorker.exe"; Path = $targetLifecycleWorker },
-    @{ Name = "uninstall.exe"; Path = $targetUninstaller },
-    @{ Name = "uninstall.ps1"; Path = $targetUninstallScript }
+    @{ Name = "uninstall.exe"; Path = $targetUninstaller }
   )) {
   $entry = @($nativeIntegrity.files | Where-Object { $_.name -eq $component.Name })
   if ($entry.Count -ne 1) {
@@ -302,13 +231,13 @@ $uninstallerCapabilities = & $capabilityProbeRunner `
   -ExecutablePath $targetUninstaller `
   -ProbePath $uninstallerProbe `
   -ComponentName "target headless uninstaller"
-if ($workerCapabilities.uninstall_attestation -ne "v2" -or
-    $workerCapabilities.token_handoff -ne $true) {
-  throw "target installer worker lacks uninstall attestation v2 token handoff"
+if ($workerCapabilities.uninstall_attestation -ne "v3" -or
+    $workerCapabilities.native_in_memory_token_handoff -ne $true) {
+  throw "target installer worker lacks native uninstall attestation v3 handoff"
 }
-if ($uninstallerCapabilities.uninstall_attestation -ne "v2" -or
-    $uninstallerCapabilities.powershell_token_handoff -ne $true) {
-  throw "target headless uninstaller lacks uninstall attestation v2 PowerShell handoff"
+if ($uninstallerCapabilities.uninstall_attestation -ne "v3" -or
+    $uninstallerCapabilities.native_in_memory_token_handoff -ne $true) {
+  throw "target headless uninstaller lacks native uninstall attestation v3 handoff"
 }
 
 if ((Get-AgentVersion -Path $baselineBinary) -ne $BaselineVersion) {
@@ -319,7 +248,6 @@ if ((Get-AgentVersion -Path $targetBinary) -ne $TargetVersion) {
 }
 
 $stage = "prepare"
-$attestationJob = $null
 try {
   $existing = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue
   if ($existing) {
@@ -365,285 +293,19 @@ try {
     -Version $BaselineVersion -ArtifactID "ci-$BaselineVersion-$Architecture" -UpdateScript $targetUpdater
 
   $stage = "uninstall"
-  $agentProcessId = [int](Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop).ProcessId
-  $lifecycleCommandId = "cmd_lifecycle_uninstall_ci_$($TargetVersion.Replace('.', '_'))"
-  $lifecycleTaskId = "ci-lifecycle-uninstall-$($TargetVersion.Replace('.', '-'))"
-  $lifecycleJournal = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.journal.json"
-  $lifecycleLog = Join-Path $programDataState "agent-lifecycle-$lifecycleCommandId.worker.log"
-  $cleanupReceipt = Join-Path $programDataState "uninstall-cleanup-$lifecycleTaskId.json"
-  $cleanupStdout = Join-Path $programDataState "uninstall-cleanup-$lifecycleTaskId.stdout.log"
-  $cleanupStderr = Join-Path $programDataState "uninstall-cleanup-$lifecycleTaskId.stderr.log"
-  $uninstallScriptReceipt = Join-Path $programDataState "uninstall-script-$lifecycleTaskId.json"
-  $uninstallPowerShellLog = Join-Path $programDataState "uninstall-powershell-$lifecycleTaskId.log"
-  $attestationEvidence = Join-Path $EvidenceDir "uninstall-attestation-callback.json"
-  $attestationAttempts = Join-Path $EvidenceDir "uninstall-attestation-attempts.json"
-  $attestationReady = Join-Path $EvidenceDir "uninstall-attestation-listener-ready.json"
-  $attestationPort = Get-Random -Minimum 32000 -Maximum 45000
-  $attestationURL = "http://127.0.0.1:$attestationPort/uninstall-attest/"
-  # A fresh token makes the smoke exercise the same one-time credential model
-  # as production instead of relying on a predictable release-derived value.
-  $attestationToken = ([Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N"))
-  $attestationTokenSha256 = Get-TextSha256 -Value $attestationToken
-  $attestationProof = Get-UninstallAttestationProof -Token $attestationToken `
-    -TaskID $lifecycleTaskId -EndpointID "ci-lifecycle-smoke"
-  New-Item -ItemType Directory -Path $programDataState -Force | Out-Null
-  Remove-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $cleanupStdout, $cleanupStderr, `
-    $uninstallScriptReceipt, $uninstallPowerShellLog, `
-    $attestationEvidence, $attestationAttempts, $attestationReady -Force -ErrorAction SilentlyContinue
-  $attestationJob = Start-Job -ScriptBlock {
-    param(
-      $Port,
-      $EvidencePath,
-      $AttemptsPath,
-      $ReadyPath,
-      $ExpectedTokenSha256,
-      $ExpectedTokenLength,
-      $ExpectedProof
-    )
-    function Normalize-AttestationToken {
-      param([string]$Value)
-      if ($null -eq $Value) { return "" }
-      $normalized = $Value.Trim()
-      if ($normalized.Length -ge 2 -and
-          (($normalized[0] -eq [char]34 -and $normalized[$normalized.Length - 1] -eq [char]34) -or
-           ($normalized[0] -eq [char]39 -and $normalized[$normalized.Length - 1] -eq [char]39))) {
-        $normalized = $normalized.Substring(1, $normalized.Length - 2).Trim()
-      }
-      return $normalized
-    }
-    function Get-TokenFingerprint {
-      param([string]$Value)
-      if ([string]::IsNullOrEmpty($Value)) { return "" }
-      $sha = [Security.Cryptography.SHA256]::Create()
-      try {
-        return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)))).Replace("-", "").ToLowerInvariant()
-      } finally {
-        $sha.Dispose()
-      }
-    }
-    $listener = New-Object Net.HttpListener
-    $listener.Prefixes.Add("http://127.0.0.1:$Port/uninstall-attest/")
-    $attemptRecords = @()
-    $expectedTokenFingerprint = [string]$ExpectedTokenSha256
-    try {
-      $listener.Start()
-      [ordered]@{
-        ready_at = [DateTime]::UtcNow.ToString("o")
-        port = $Port
-      } | ConvertTo-Json | Set-Content -LiteralPath $ReadyPath -Encoding UTF8 -Force -ErrorAction Stop
-      $accepted = $false
-      while (-not $accepted) {
-        $context = $listener.GetContext()
-        $requestAccepted = $false
-        $responseStatus = 500
-        $responseJson = '{"success":false}'
-        try {
-          $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
-          $body = $reader.ReadToEnd()
-          $reader.Dispose()
-          $authorization = [string]$context.Request.Headers['Authorization']
-          $parsedBody = $null
-          $bodyError = ""
-          try {
-            $parsedBody = $body | ConvertFrom-Json -ErrorAction Stop
-          } catch {
-            $bodyError = $_.Exception.Message
-          }
-          $bearerToken = ""
-          if ($authorization.StartsWith("Bearer ", [StringComparison]::OrdinalIgnoreCase)) {
-            $bearerToken = Normalize-AttestationToken -Value $authorization.Substring(7)
-          }
-          $loopbackToken = Normalize-AttestationToken `
-            -Value ([string]$context.Request.Headers['X-EDR-Uninstall-Token'])
-          $bearerTokenFingerprint = Get-TokenFingerprint -Value $bearerToken
-          $loopbackTokenFingerprint = Get-TokenFingerprint -Value $loopbackToken
-          $authorizationValid = $bearerTokenFingerprint -and
-            $bearerTokenFingerprint -ceq $expectedTokenFingerprint
-          $loopbackTokenValid = $loopbackTokenFingerprint -and
-            $loopbackTokenFingerprint -ceq $expectedTokenFingerprint
-          $bodyTokenProofValid = ($null -ne $parsedBody -and
-            [string]$parsedBody.token_proof_hmac_sha256 -ceq [string]$ExpectedProof)
-          $tokenValid = $authorizationValid -or $loopbackTokenValid -or $bodyTokenProofValid
-          $proofValid = ($null -ne $parsedBody -and
-            $parsedBody.schema -eq "edr.endpoint.uninstall.attestation.v1" -and
-            $parsedBody.service_removed -eq $true -and
-            $parsedBody.process_stopped -eq $true -and
-            $parsedBody.install_dir_removed -eq $true)
-          $requestAccepted = $tokenValid -and $proofValid
-          $attemptRecords += [ordered]@{
-            received_at = [DateTime]::UtcNow.ToString("o")
-            method = [string]$context.Request.HttpMethod
-            remote_endpoint = [string]$context.Request.RemoteEndPoint
-            content_type = [string]$context.Request.ContentType
-            content_length = [long]$context.Request.ContentLength64
-            body_utf8_length = [Text.Encoding]::UTF8.GetByteCount([string]$body)
-            authorization_present = $authorization -like 'Bearer *'
-            authorization_valid = $authorizationValid
-            loopback_token_present = -not [string]::IsNullOrEmpty($loopbackToken)
-            loopback_token_valid = $loopbackTokenValid
-            body_token_proof_present = ($null -ne $parsedBody -and
-              -not [string]::IsNullOrWhiteSpace([string]$parsedBody.token_proof_hmac_sha256))
-            body_token_proof_valid = $bodyTokenProofValid
-            accepted_token_transport = if ($authorizationValid) { "authorization" } elseif ($loopbackTokenValid) { "loopback_header" } elseif ($bodyTokenProofValid) { "body_hmac_sha256" } else { "none" }
-            expected_token_length = [int]$ExpectedTokenLength
-            expected_token_sha256 = $expectedTokenFingerprint
-            bearer_token_length = $bearerToken.Length
-            bearer_token_sha256 = $bearerTokenFingerprint
-            loopback_token_length = $loopbackToken.Length
-            loopback_token_sha256 = $loopbackTokenFingerprint
-            expected_body_token_proof_sha256 = Get-TokenFingerprint -Value ([string]$ExpectedProof)
-            received_body_token_proof_sha256 = if ($null -ne $parsedBody) {
-              Get-TokenFingerprint -Value ([string]$parsedBody.token_proof_hmac_sha256)
-            } else { "" }
-            body_parse_error = $bodyError
-            proof_valid = $proofValid
-          }
-          @($attemptRecords) | ConvertTo-Json -Depth 4 | Set-Content `
-            -LiteralPath $AttemptsPath -Encoding UTF8 -Force -ErrorAction Stop
-          if ($requestAccepted) {
-            [ordered]@{
-              authorization_present = $authorization -like 'Bearer *'
-              authorization_valid = $authorizationValid
-              token_valid = $tokenValid
-              authorization_standard_valid = $authorizationValid
-              loopback_token_valid = $loopbackTokenValid
-              body_token_proof_valid = $bodyTokenProofValid
-              accepted_token_transport = if ($authorizationValid) { "authorization" } elseif ($loopbackTokenValid) { "loopback_header" } else { "body_hmac_sha256" }
-              body_parse_error = $bodyError
-              body = $parsedBody
-            } | ConvertTo-Json -Depth 4 | Set-Content `
-              -LiteralPath $EvidencePath -Encoding UTF8 -Force -ErrorAction Stop
-            $responseStatus = 200
-            $responseJson = '{"success":true}'
-          } elseif (-not $tokenValid) {
-            $responseStatus = 401
-          } else {
-            $responseStatus = 400
-          }
-        } catch {
-          $requestAccepted = $false
-          Write-Output ("attestation_listener_request_failed: " + $_.Exception.Message)
-        }
-        try {
-          $responseBody = [Text.Encoding]::UTF8.GetBytes($responseJson)
-          $context.Response.StatusCode = $responseStatus
-          $context.Response.ContentType = 'application/json'
-          $context.Response.OutputStream.Write($responseBody, 0, $responseBody.Length)
-          $context.Response.Close()
-          if ($requestAccepted -and $responseStatus -eq 200) { $accepted = $true }
-        } catch {
-          Write-Output ("attestation_listener_response_failed: " + $_.Exception.Message)
-          try { $context.Response.Abort() } catch {}
-        }
-      }
-    } finally {
-      $listener.Close()
-    }
-  } -ArgumentList $attestationPort, $attestationEvidence, $attestationAttempts, $attestationReady, `
-    $attestationTokenSha256, $attestationToken.Length, $attestationProof
-  Wait-AttestationListenerReady -Path $attestationReady -Job $attestationJob
   Copy-Item -LiteralPath $targetLifecycleWorker -Destination (Join-Path $installDir "FDSecurityInstallerWorker.exe") -Force
   Copy-Item -LiteralPath $targetUninstaller -Destination (Join-Path $installDir "uninstall.exe") -Force
-  Copy-Item -LiteralPath $targetUninstallScript -Destination (Join-Path $installDir "uninstall.ps1") -Force
-  $worker = Start-Process -FilePath (Join-Path $installDir "FDSecurityInstallerWorker.exe") `
-    -ArgumentList @(
-      "--stage", "lifecycle-uninstall",
-      "--install-dir", $installDir,
-      "--service-name", $serviceName,
-      "--journal", $lifecycleJournal,
-      "--log", $lifecycleLog,
-      "--command-id", $lifecycleCommandId,
-      "--task-id", $lifecycleTaskId,
-      "--action", "uninstall",
-      "--delay-ms", "5000",
-      "--attestation-url", $attestationURL,
-      "--attestation-token", $attestationToken,
-      "--endpoint-id", "ci-lifecycle-smoke"
-    ) -Wait -PassThru
-  if ($worker.ExitCode -ne 0) {
-    if (Test-Path -LiteralPath $lifecycleLog) { Get-Content -LiteralPath $lifecycleLog | Out-Host }
-    $uninstallFailure = ""
-    if (Test-Path -LiteralPath $uninstallScriptReceipt -PathType Leaf) {
-      Copy-Item -LiteralPath $uninstallScriptReceipt -Destination $EvidenceDir -Force
-      Get-Content -LiteralPath $uninstallScriptReceipt | Out-Host
-      try {
-        $uninstallResult = Get-Content -LiteralPath $uninstallScriptReceipt -Raw | ConvertFrom-Json
-        $uninstallFailure = "; uninstall stage '$($uninstallResult.stage)': $($uninstallResult.error)"
-      } catch {
-        $uninstallFailure = "; uninstall diagnostic receipt was not valid JSON"
-      }
-    }
-    if (Test-Path -LiteralPath $uninstallPowerShellLog -PathType Leaf) {
-      Copy-Item -LiteralPath $uninstallPowerShellLog -Destination $EvidenceDir -Force
-      Write-Host "--- uninstall PowerShell output ---"
-      Get-Content -LiteralPath $uninstallPowerShellLog | Out-Host
-    }
-    if (Test-Path -LiteralPath $lifecycleJournal -PathType Leaf) {
-      Copy-Item -LiteralPath $lifecycleJournal -Destination $EvidenceDir -Force
-    }
-    throw "lifecycle uninstall worker returned code $($worker.ExitCode)$uninstallFailure"
-  }
-  if (-not (Test-Path -LiteralPath $lifecycleJournal -PathType Leaf)) {
-    throw "lifecycle uninstall worker did not write its terminal journal"
-  }
-  $lifecycleResult = Get-Content -LiteralPath $lifecycleJournal -Raw | ConvertFrom-Json
-  if ($lifecycleResult.succeeded -ne $true -or [int]$lifecycleResult.exit_code -ne 0) {
-    throw "lifecycle uninstall journal reported failure: $($lifecycleResult.detail)"
+  Copy-Item -LiteralPath $targetNativeIntegrity -Destination (Join-Path $installDir "native-package-integrity.json") -Force
+  $uninstallerProcess = Start-Process -FilePath (Join-Path $installDir "uninstall.exe") -ArgumentList @(
+    "--silent", "--install-dir", $installDir, "--service-name", $serviceName
+  ) -Wait -PassThru
+  if ($uninstallerProcess.ExitCode -ne 0) {
+    throw "native uninstall coordinator returned code $($uninstallerProcess.ExitCode)"
   }
   $stage = "verify_uninstall"
   Wait-ServiceDeleted
   Wait-ProcessDeleted -ProcessId $agentProcessId
   Wait-InstallDirectoryDeleted
-  Wait-CleanupReceipt -Path $cleanupReceipt
-  $cleanupResult = Get-Content -LiteralPath $cleanupReceipt -Raw | ConvertFrom-Json
-  if ($cleanupResult.status -ne "succeeded" -or $cleanupResult.attestation_status -ne "succeeded") {
-    Copy-Item -LiteralPath $cleanupReceipt -Destination $EvidenceDir -Force
-    Write-Host "--- deferred uninstall cleanup receipt ---"
-    Get-Content -LiteralPath $cleanupReceipt | Out-Host
-    if (Test-Path -LiteralPath $attestationAttempts -PathType Leaf) {
-      Write-Host "--- uninstall attestation listener attempts ---"
-      Get-Content -LiteralPath $attestationAttempts | Out-Host
-    }
-    if (Test-Path -LiteralPath $attestationEvidence -PathType Leaf) {
-      Write-Host "--- uninstall attestation callback evidence ---"
-      Get-Content -LiteralPath $attestationEvidence | Out-Host
-    }
-    $listenerReason = ""
-    if ($attestationJob.ChildJobs.Count -gt 0 -and $attestationJob.ChildJobs[0].JobStateInfo.Reason) {
-      $listenerReason = $attestationJob.ChildJobs[0].JobStateInfo.Reason.Message
-    }
-    Write-Host "attestation_listener state=$($attestationJob.State) reason=$listenerReason"
-    Receive-Job -Job $attestationJob -Keep -ErrorAction SilentlyContinue | Out-Host
-    $attemptDetail = ""
-    if (Test-Path -LiteralPath $attestationAttempts -PathType Leaf) {
-      try {
-        $attemptResult = @(Get-Content -LiteralPath $attestationAttempts -Raw | ConvertFrom-Json)[-1]
-        $attemptDetail = " method=$($attemptResult.method) content_type=$($attemptResult.content_type) content_length=$($attemptResult.content_length) body_utf8_length=$($attemptResult.body_utf8_length) expected_token_sha256=$($attemptResult.expected_token_sha256) bearer_token_sha256=$($attemptResult.bearer_token_sha256) loopback_token_sha256=$($attemptResult.loopback_token_sha256) body_token_proof_present=$($attemptResult.body_token_proof_present) expected_body_token_proof_sha256=$($attemptResult.expected_body_token_proof_sha256) received_body_token_proof_sha256=$($attemptResult.received_body_token_proof_sha256) body_token_proof_valid=$($attemptResult.body_token_proof_valid) body_parse_error=$($attemptResult.body_parse_error) proof_valid=$($attemptResult.proof_valid) accepted_token_transport=$($attemptResult.accepted_token_transport)"
-      } catch {
-        $attemptDetail = " attestation_attempt_diagnostic=invalid_json"
-      }
-    }
-    throw "deferred uninstall cleanup failed: status=$($cleanupResult.status) local_status=$($cleanupResult.local_status) service_removed=$($cleanupResult.service_removed) process_stopped=$($cleanupResult.process_stopped) install_dir_removed=$($cleanupResult.install_dir_removed) deletion_attempts=$($cleanupResult.deletion_attempts) deletion_last_error=$($cleanupResult.deletion_last_error) remaining_entries=$(@($cleanupResult.remaining_entries) -join '|') attestation_status=$($cleanupResult.attestation_status) attestation_token_present=$($cleanupResult.attestation_token_present) attestation_token_length=$($cleanupResult.attestation_token_length) attestation_attempts=$($cleanupResult.attestation_attempts) attestation_proxy_mode=$($cleanupResult.attestation_proxy_mode) attestation_transport=$($cleanupResult.attestation_transport) attestation_request_body_bytes=$($cleanupResult.attestation_request_body_bytes) attestation_http_status=$($cleanupResult.attestation_last_http_status) attestation_error=$($cleanupResult.attestation_error) attestation_errors=$(@($cleanupResult.attestation_errors) -join '|') failure_reasons=$(@($cleanupResult.failure_reasons) -join ',')$attemptDetail"
-  }
-  if (-not (Test-Path -LiteralPath $attestationEvidence -PathType Leaf)) {
-    throw "uninstall attestation callback evidence is missing"
-  }
-  $attestationResult = Get-Content -LiteralPath $attestationEvidence -Raw | ConvertFrom-Json
-  if ($attestationResult.token_valid -ne $true -or
-      $attestationResult.body_token_proof_valid -ne $true -or
-      $attestationResult.body_parse_error -or
-      $attestationResult.body.schema -ne "edr.endpoint.uninstall.attestation.v1" -or
-      $attestationResult.body.service_removed -ne $true -or
-      $attestationResult.body.process_stopped -ne $true -or
-      $attestationResult.body.install_dir_removed -ne $true) {
-    throw "uninstall attestation callback did not contain complete local teardown proof"
-  }
-  Copy-Item -LiteralPath $lifecycleJournal, $cleanupReceipt, $uninstallScriptReceipt `
-    -Destination $EvidenceDir -Force
-  if (Test-Path -LiteralPath $uninstallPowerShellLog -PathType Leaf) {
-    Copy-Item -LiteralPath $uninstallPowerShellLog -Destination $EvidenceDir -Force
-  }
-
   $stage = "completed"
   [ordered]@{
     schema_version = 1
@@ -656,7 +318,7 @@ try {
     embedded_updater_sha256 = $embeddedUpdaterSha256
     rollback = "passed"
     uninstall = "passed"
-    uninstall_path = "agent_lifecycle_worker"
+    uninstall_path = "native_coordinator"
     completed_at = [DateTimeOffset]::UtcNow.ToString("o")
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
 } catch {
@@ -672,28 +334,12 @@ try {
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
   throw
 } finally {
-  if ($attestationJob) {
-    try {
-      $reason = ""
-      if ($attestationJob.ChildJobs.Count -gt 0 -and $attestationJob.ChildJobs[0].JobStateInfo.Reason) {
-        $reason = $attestationJob.ChildJobs[0].JobStateInfo.Reason.Message
-      }
-      [ordered]@{
-        state = [string]$attestationJob.State
-        reason = $reason
-        output = ((Receive-Job -Job $attestationJob -Keep -ErrorAction SilentlyContinue | Out-String).Trim())
-      } | ConvertTo-Json -Depth 3 | Set-Content `
-        -LiteralPath (Join-Path $EvidenceDir "uninstall-attestation-listener-job.json") -Encoding UTF8 -Force
-    } catch {}
-    Stop-Job -Job $attestationJob -ErrorAction SilentlyContinue
-    Remove-Job -Job $attestationJob -Force -ErrorAction SilentlyContinue
-  }
   Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue |
     Format-List * | Out-File -FilePath (Join-Path $EvidenceDir "service-final.txt")
   foreach ($root in @($programDataState, $programDataLogs)) {
     if (Test-Path -LiteralPath $root) {
       Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue |
-        Where-Object Name -Match "agent-update-ci-|agent-lifecycle-|uninstall-(script|cleanup|powershell)-last" |
+        Where-Object Name -Match "agent-update-ci-|agent-lifecycle-|last-native-uninstall-failure" |
         Copy-Item -Destination $EvidenceDir -Force -ErrorAction SilentlyContinue
     }
   }

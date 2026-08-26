@@ -84,13 +84,12 @@ int main(void) {
   contains(script, "$files += [pscustomobject]@{", "native package integrity manifest joins the transactional runtime plan");
   contains(script, "$integrityInput.CopyTo($integrityOutput)",
            "Runtime identity manifest bytes are preserved exactly during transactional update");
-  contains(script, "'FDSecurityInstallerWorker.exe','uninstall.exe','uninstall.ps1','native-package-integrity.json'",
+  contains(script, "'FDSecurityInstallerWorker.exe','uninstall.exe','native-package-integrity.json'",
            "complete runtime update requires helpers and their installed integrity manifest");
   contains(script, "A Headless base package can contain optional rules", "runtime update accepts the complete verified Headless package");
   contains(script, "$name.Contains('/')", "runtime update ignores nested Headless package assets instead of extracting them");
   contains(script, "FDSecurityInstallerWorker.exe", "runtime update includes lifecycle worker");
   contains(script, "uninstall.exe", "runtime update includes headless uninstaller");
-  contains(script, "uninstall.ps1", "runtime update includes uninstall script");
   contains(script, "Wait-AgentHealthObservation", "local health watchdog is enforced before updater exit");
   contains(script, "[UInt64]$HealthObserveMs = 30000", "manual updater defaults to the bounded local health gate");
   contains(script, "$stableCheck -lt 3", "startup stability uses consecutive liveness samples");
@@ -235,7 +234,6 @@ int main(void) {
   require_true(agent != NULL, "read Agent capability manifest implementation");
   contains(agent, "edr_agent_update_manifest_fragment", "runtime capability manifest uses production serializer");
   contains(agent, "edr_agent_update_get_runtime_info", "capability depends on audited embedded or installed updater readiness");
-  contains(agent, "edr_agent_lifecycle_runtime_identity", "lifecycle capability is based on installed native chain integrity and identity");
   free(agent);
   snprintf(path, sizeof(path), "%s/src/command/agent_update_manifest.c", root);
   char *manifest = read_file(path);
@@ -245,16 +243,6 @@ int main(void) {
   contains(manifest, "updater_sha256", "capability reports the resolved updater hash");
   free(manifest);
 
-  snprintf(path, sizeof(path), "%s/src/command/agent_lifecycle_command.c", root);
-  char *lifecycle_identity_command = read_file(path);
-  require_true(lifecycle_identity_command != NULL, "read Agent lifecycle Runtime identity implementation");
-  contains(lifecycle_identity_command, "cJSON_GetArraySize(files)",
-           "lifecycle Runtime identity bounds the full component list");
-  contains(lifecycle_identity_command, "lifecycle_runtime_name_valid",
-           "lifecycle Runtime identity rejects unsupported component types");
-  contains(lifecycle_identity_command, "lifecycle_file_sha256(path, actual)",
-           "lifecycle Runtime identity verifies every declared component hash");
-  free(lifecycle_identity_command);
 
   snprintf(path, sizeof(path), "%s/resources/FDSensor.rc", root);
   char *resource = read_file(path);
@@ -688,64 +676,14 @@ int main(void) {
            "lifecycle binds the packaged service installer to the checked-out release source");
   require_true(!strstr(lifecycle_smoke, "$baselineInstaller"),
                "lifecycle does not execute an immutable baseline installer with obsolete PowerShell argument semantics");
-  contains(lifecycle_smoke, "$targetUninstallScript = Find-OneFile -Root $TargetPackageDir -Name \"uninstall.ps1\"",
-           "lifecycle selects the current uninstall PowerShell protocol");
   contains(lifecycle_smoke, "$targetLifecycleWorker = Find-OneFile -Root $TargetPackageDir",
            "lifecycle selects the current detached lifecycle worker");
-  contains(lifecycle_smoke, "--stage\", \"lifecycle-uninstall\"",
-           "lifecycle smoke exercises the same worker stage used by remote uninstall");
-  contains(lifecycle_smoke, "lifecycle uninstall journal reported failure",
-           "lifecycle smoke requires the detached worker terminal journal");
-  contains(lifecycle_smoke, "agent-lifecycle-$lifecycleCommandId.worker.log",
-           "lifecycle smoke preserves task-bound worker diagnostics outside program files");
-  contains(lifecycle_smoke, "uninstall-script-$lifecycleTaskId.json",
-           "lifecycle smoke reads the exact task-specific synchronous uninstall receipt");
-  contains(lifecycle_smoke, "uninstall-cleanup-$lifecycleTaskId.json",
-           "lifecycle smoke reads the exact task-specific deferred cleanup receipt");
-  contains(lifecycle_smoke, "deferred uninstall cleanup did not write its receipt",
-           "lifecycle smoke verifies the asynchronous program-file cleanup result");
-  contains(lifecycle_smoke, "uninstall-attestation-callback.json",
-           "lifecycle smoke captures the detached cleanup attestation callback");
-  contains(lifecycle_smoke, "[IO.Path]::GetFullPath($EvidenceDir)",
-           "background attestation jobs receive absolute evidence paths");
-  contains(lifecycle_smoke, "function Wait-AttestationListenerReady",
-           "lifecycle smoke verifies the callback listener before uninstall starts");
-  contains(lifecycle_smoke, "authorization_valid = $authorizationValid",
-           "lifecycle callback validates the exact one-time bearer token");
-  contains(lifecycle_smoke, "while (-not $accepted)",
-           "callback listener survives unrelated or invalid requests until valid teardown proof arrives");
-  contains(lifecycle_smoke, "uninstall-attestation-attempts.json",
-           "callback listener persists sanitized diagnostics for every observed request");
-  contains(lifecycle_smoke, "function Normalize-AttestationToken",
-           "callback listener normalizes quoting introduced by Windows command-line handoffs");
-  contains(lifecycle_smoke, "X-EDR-Uninstall-Token",
-           "loopback lifecycle callback has an HTTP.sys-independent proof-of-token header");
-  contains(lifecycle_smoke, "expected_token_sha256",
-           "callback diagnostics compare token identities without disclosing token plaintext");
-  contains(lifecycle_smoke, "Get-UninstallAttestationProof",
-           "lifecycle callback binds a header-independent HMAC proof to the task and endpoint");
-  contains(lifecycle_smoke, "body_token_proof_valid",
-           "lifecycle callback reports whether the HMAC body proof matched");
-  contains(lifecycle_smoke, "token_valid = $tokenValid",
-           "lifecycle callback distinguishes overall token proof from the Authorization transport");
-  contains(lifecycle_smoke, "[Guid]::NewGuid().ToString(\"N\")",
-           "lifecycle uses a fresh one-time attestation token for each run");
-  contains(lifecycle_smoke, "attestation_error=$($cleanupResult.attestation_error)",
-           "lifecycle failure output reports the exact attestation error");
-  contains(lifecycle_smoke, "[int]$Seconds = 120",
-           "cleanup receipt wait covers the bounded attestation retry window");
-  contains(lifecycle_smoke, "edr.endpoint.uninstall.attestation.v1",
-           "lifecycle smoke verifies the positive local teardown proof schema");
-  contains(lifecycle_smoke, "Copy-Item -LiteralPath $targetUninstallScript",
-           "lifecycle never mixes the current native uninstaller with a baseline uninstall script");
-  contains(lifecycle_smoke, "target package uninstall script hash mismatch",
-           "lifecycle binds the packaged uninstall protocol to the checked-out release source");
+  contains(lifecycle_smoke, "Start-Process -FilePath (Join-Path $installDir \"uninstall.exe\")",
+           "lifecycle smoke exercises the same native coordinator used by local uninstall");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
   contains(lifecycle_smoke, "invoke_windows_native_capability_probe.ps1",
            "lifecycle waits for GUI subsystem capability probes before reading evidence");
-  contains(lifecycle_smoke, "attestation_token_length",
-           "lifecycle failure output identifies token loss without disclosing token plaintext");
   require_true(!strstr(lifecycle_smoke, "headless uninstall failed with exit code $LASTEXITCODE"),
                "lifecycle does not treat a stale native exit code as the result of a PowerShell installer script");
   contains(lifecycle_smoke, "failed_stage = $stage",
@@ -788,225 +726,11 @@ int main(void) {
            "release validation rejects ambiguous ANSI decoding of non-ASCII runtime scripts");
   free(powershell_validator);
 
-  snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
-  char *uninstaller = read_file(path);
-  require_true(uninstaller != NULL, "read headless uninstaller implementation");
-  contains(uninstaller, "-PreserveDiagnostics -RemoveProgramFiles",
-           "keep-data uninstall archives diagnostics but still removes program files");
-  contains(uninstaller, "-RemoveData -RemoveProgramFiles",
-           "complete uninstall removes runtime data and program files");
-  contains(uninstaller, "current_process_is_elevated",
-           "native uninstaller detects LocalSystem or an elevated administrator token");
-  contains(uninstaller, "run_powershell_direct",
-           "elevated lifecycle uninstall avoids an interactive UAC handoff");
-  contains(uninstaller, "exec_info.lpVerb = L\"runas\"",
-           "manual non-elevated uninstall retains the UAC elevation path");
-  contains(uninstaller, "-ServiceName",
-           "native uninstall forwards the exact lifecycle service name");
-  contains(uninstaller, "-AttestationToken",
-           "native uninstall forwards the task-pinned one-time attestation secret");
-  contains(uninstaller, "uninstall-powershell-last.log",
-           "native uninstall preserves PowerShell output outside the removed program directory");
-  contains(uninstaller, "uninstall-powershell-%ls.log",
-           "remote uninstall preserves task-bound PowerShell diagnostics across reinstall attempts");
-  contains(uninstaller, "详细诊断日志",
-           "native uninstall dialog exposes the captured PowerShell diagnostic path");
-  free(uninstaller);
-
-  snprintf(path, sizeof(path), "%s/scripts/edr_agent_uninstall.ps1", root);
-  char *uninstall_script = read_file(path);
-  require_true(uninstall_script != NULL, "read Windows uninstall script");
-  contains(uninstall_script, "function Wait-AgentServiceDeleted",
-           "uninstall verifies that Windows services disappear");
-  contains(uninstall_script, "function Disable-AgentServiceRecovery",
-           "manual and remote uninstall disable SCM automatic service restart");
-  contains(uninstall_script, "$service.Dispose()",
-           "uninstall releases ServiceController handles before service deletion");
-  contains(uninstall_script, "Get-CimInstance Win32_Service",
-           "uninstall deletion polling does not retain a new SCM service handle");
-  contains(uninstall_script, "$deleteExitCode = $LASTEXITCODE",
-           "uninstall checks the service deletion result");
-  contains(uninstall_script, "FDSecurity\\UninstallArchive",
-           "diagnostic retention uses a directory outside program files");
-  contains(uninstall_script, "foreach ($relative in @(\"logs\", \"diagnostics\"))",
-           "diagnostic retention excludes credentials and active runtime state");
-  contains(uninstall_script, "$attempt -lt 120",
-           "deferred program-file removal tolerates bounded endpoint security file locks");
-  contains(uninstall_script, "function Remove-RuntimePathWithRetry",
-           "runtime data removal retries transient file locks before deferring");
-  contains(uninstall_script, "Runtime data remains for verified deferred directory cleanup:",
-           "complete uninstall routes persistent runtime locks to final directory proof");
-  contains(uninstall_script, "deferred_runtime_paths = @($script:DeferredRuntimePaths)",
-           "uninstall diagnostics identify files delegated to deferred cleanup");
-  contains(uninstall_script, "cleanup_warnings = @($script:CleanupWarnings)",
-           "non-runtime cleanup warnings remain auditable without stranding program files");
-  contains(uninstall_script, "Invoke-BoundedNativeCommand -FilePath $certutil -Arguments ($scopeArguments + @(\"-delstore\", \"My\", $candidateThumbprint))",
-           "certificate cleanup uses the bounded native path");
-  contains(uninstall_script, "X509Certificates.X509Store(\"My\", $storeLocation)",
-           "certificate cleanup discovers prior identities for the same endpoint without the hanging certificate provider");
-  contains(uninstall_script, "Read-AgentTomlScalar -Path $ConfigPath -Key \"endpoint_id\"",
-           "local uninstall can remove prior endpoint identity certificates without a remote endpoint argument");
-  require_true(!strstr(uninstall_script, "Cert:\\$scope\\My\\$thumbprint"),
-               "certificate cleanup avoids the hanging PowerShell certificate provider");
-  contains(uninstall_script, "Client certificate still exists after uninstall cleanup:",
-           "uninstall does not report success while endpoint identity remains installed");
-  contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove machine environment variable ",
-           "environment cleanup failures do not block service and program removal");
-  contains(uninstall_script, "Add-CleanupWarning (\"Failed to remove uninstall registry entry:",
-           "uninstall registration cleanup failures do not block program removal");
-  contains(uninstall_script, "function Invoke-BoundedNativeCommand",
-           "uninstall cleanup uses one bounded native command path under LocalSystem");
-  contains(uninstall_script, "function Start-UninstallScheduledTaskHandoff",
-           "remote uninstall escapes the Agent scheduled-task job before stopping the runtime");
-  contains(uninstall_script, "FDSecurityAgentUninstall",
-           "the independent uninstall task has one fixed cleanup identity");
-  contains(uninstall_script, "$security.SetAccessRuleProtection($true, $false)",
-           "the one-time attestation handoff file has an explicit restricted ACL");
-  contains(uninstall_script, "Write-ProtectedSystemScript -Path $cleanupScriptPath -Content $cleanup",
-           "deferred cleanup uses a protected file instead of the Windows command line");
-  contains(uninstall_script, "-EncodedCommand\", $encodedLauncher",
-           "deferred cleanup encodes only the short protected-file launcher");
-  require_true(!strstr(uninstall_script, "GetBytes($cleanup))"),
-               "the full deferred cleanup body must not exceed the Windows command-line limit");
-  contains(uninstall_script, "Remove-Item -LiteralPath $cleanupScriptLiteral -Force",
-           "the cleanup file containing the attestation secret is removed after one use");
-  contains(uninstall_script, "$taskCommand = \"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $handoffPath\"",
-           "the scheduled-task action references only the protected handoff file");
-  require_true(!strstr(uninstall_script, "$taskCommand = \"powershell.exe $AttestationToken"),
-               "the one-time attestation token must not be stored in task metadata");
-  contains(uninstall_script, "$process.WaitForExit($TimeoutMilliseconds)",
-           "scheduled task cleanup cannot block the remote uninstall worker indefinitely");
-  require_true(!strstr(uninstall_script, "Invoke-BoundedNativeCommand -FilePath $tool -Arguments @(\"/End\""),
-               "scheduled task cleanup must not terminate its own remote uninstall process tree");
-  require_true(!strstr(uninstall_script, "Get-ScheduledTask"),
-               "scheduled task cleanup avoids the hanging ScheduledTasks COM path");
-  contains(uninstall_script, "deletion_last_error = `$deleteLastError",
-           "deferred cleanup records the final directory deletion error");
-  contains(uninstall_script, "remaining_entries = @(`$remainingEntries)",
-           "deferred cleanup records paths that survive bounded deletion");
-  contains(uninstall_script, "attestation_error = `$attestationError",
-           "deferred cleanup records the final callback transport error");
-  contains(uninstall_script, "[Net.WebRequest]::DefaultWebProxy = `$null",
-           "loopback lifecycle attestation bypasses machine proxy settings under LocalSystem");
-  contains(uninstall_script, "attestation_errors = @(`$attestationErrors)",
-           "deferred cleanup retains every bounded callback failure");
-  contains(uninstall_script, "attestation_proxy_mode = `$attestationProxyMode",
-           "cleanup receipt identifies whether loopback direct transport was selected");
-  contains(uninstall_script, "X-EDR-Uninstall-Token: `$normalizedAttestationToken",
-           "loopback callback sends a dedicated token header in addition to Authorization");
-  contains(uninstall_script, "attestation_last_http_status = `$attestationLastHttpStatus",
-           "cleanup receipt retains the terminal callback HTTP status");
-  contains(uninstall_script, "`$attestationLastHttpStatus -in @(401, 403)",
-           "non-retryable callback authentication failures stop immediately");
-  contains(uninstall_script, "`$attestationResponseCode -eq 'INVALID_ATTESTATION'",
-           "semantic attestation rejection stops while opaque HTTP 400 remains retryable");
-  contains(uninstall_script, "attestation_response_code = `$attestationLastResponseCode",
-           "cleanup receipt records the safe structured server error code");
-  contains(uninstall_script, "failure_reasons = @(`$failureReasons)",
-           "deferred cleanup emits machine-readable failure reasons");
-  contains(uninstall_script, "status = if (`$overallSucceeded) { 'succeeded' } else { 'failed' }",
-           "cleanup receipt status covers both local teardown and required attestation");
-  contains(uninstall_script, "local_status = if (`$localSucceeded) { 'succeeded' } else { 'failed' }",
-           "cleanup receipt distinguishes local teardown from overall completion");
-  contains(uninstall_script, "Management.Automation.Language.Parser]::ParseInput($cleanup",
-           "generated deferred cleanup code is parsed before detached launch");
-  contains(uninstall_script, "uninstall-cleanup-last.stderr.log",
-           "deferred PowerShell failures are persisted outside program files");
-  contains(uninstall_script, "uninstall-cleanup-last.json",
-           "deferred cleanup persists a result outside the removed program directory");
-  contains(uninstall_script, "edr.endpoint.uninstall.attestation.v1",
-           "deferred cleanup reports positive service, process and directory teardown proof");
-  contains(uninstall_script, "`$bodyFields.token_proof_hmac_sha256 = `$tokenProof",
-           "loopback cleanup proves one-time token possession in the attestation body");
-  contains(uninstall_script, "Security.Cryptography.HMACSHA256",
-           "deferred cleanup uses HMAC-SHA256 for the header-independent token proof");
-  contains(uninstall_script, "tcp_loopback_http11",
-           "loopback attestation uses a byte-exact HTTP transport under LocalSystem");
-  contains(uninstall_script, "New-Object Net.Sockets.TcpClient",
-           "loopback attestation bypasses WebRequest header and body rewriting");
-  contains(uninstall_script, "Content-Length: `$(`$bodyBytes.Length)",
-           "loopback attestation sends an explicit UTF-8 body length");
-  contains(uninstall_script, "attestation_request_body_bytes = `$attestationRequestBodyBytes",
-           "cleanup receipt records the outgoing attestation body size");
-  contains(uninstall_script, "`$webRequest.ContentLength = `$bodyBytes.Length",
-           "deferred cleanup sends the exact verified attestation body length");
-  contains(uninstall_script, "`$requestStream.Write(`$bodyBytes, 0, `$bodyBytes.Length)",
-           "deferred cleanup writes the attestation JSON bytes to the request stream");
-  require_true(strstr(uninstall_script, "Invoke-RestMethod -Uri `$attestationURL") == NULL,
-               "LocalSystem attestation cannot use the zero-length Invoke-RestMethod path");
-  contains(uninstall_script, "Skipped unrelated $name process PID",
-           "uninstall never kills an unrelated same-name process by image name alone");
-  contains(uninstall_script, "uninstall-script-last.json",
-           "uninstall persists a stage-specific synchronous failure receipt outside program files");
-  contains(uninstall_script, "uninstall-script-$safeLifecycleTaskID.json",
-           "uninstall preserves a task-specific synchronous receipt across later reinstall attempts");
-  contains(uninstall_script, "uninstall-cleanup-$safeLifecycleTaskID.json",
-           "deferred cleanup preserves a task-specific receipt across later reinstall attempts");
-  contains(uninstall_script, "function Set-UninstallStage",
-           "uninstall checkpoints every synchronous stage before executing it");
-  contains(uninstall_script, "ETW cleanup exceeded 15 seconds and was terminated; continuing uninstall",
-           "best-effort ETW cleanup cannot block verified service and directory removal");
-  contains(uninstall_script, "Write-UninstallScriptReceipt -Status \"running\"",
-           "uninstall persists a receipt before entering teardown stages");
-  contains(uninstall_script, "if ($RemoveData -and -not $RemoveProgramFiles)",
-           "full uninstall defers runtime data deletion to the single directory cleanup pass");
-  contains(uninstall_script, "Restore-AgentServiceAfterFailure",
-           "failed uninstall restores a service that still exists");
-  contains(uninstall_script, "exit 0",
-           "handled native helper warnings cannot leak a stale process exit code");
-  free(uninstall_script);
-
-  snprintf(path, sizeof(path), "%s/src/installer_worker/installer_worker_win.c", root);
-  char *installer_worker = read_file(path);
-  require_true(installer_worker != NULL, "read Windows installer worker");
-  contains(installer_worker, "WaitForSingleObject(process.hProcess, INFINITE)",
-           "remote uninstall delegates the only bounded handoff window to uninstall.exe");
-  contains(installer_worker, "lifecycle_uninstall_launched pid=%lu",
-           "remote uninstall logs the launched native uninstaller PID");
-  contains(installer_worker, "CREATE_BREAKAWAY_FROM_JOB",
-           "native uninstaller must survive Agent service Job Object teardown");
-  contains(installer_worker, "lifecycle_uninstall_service_recovery_disabled",
-           "remote uninstall must disable SCM recovery before stopping the Agent service");
-  contains(installer_worker, "gle == ERROR_SERVICE_DOES_NOT_EXIST",
-           "scheduled-task installs must not fail uninstall when no Windows service exists");
-  contains(installer_worker, "SERVICE_RECOVERY_CONFIG_FAILED",
-           "SCM failures other than a missing service must still block uninstall");
-  contains(installer_worker, "lifecycle_uninstall_service_recovery_not_applicable service_missing",
-           "missing-service recovery bypass must remain visible in lifecycle diagnostics");
-  contains(installer_worker, "lifecycle_uninstall_service_recovery_restored",
-           "failed remote uninstall must restore SCM recovery before recovering the Agent service");
-  contains(installer_worker, "lifecycle_uninstall_failure_service_restarted",
-           "failed remote uninstall must recover endpoint availability after recording failure");
-  require_true(!strstr(installer_worker, "lifecycle_uninstall_completion_timeout"),
-               "remote uninstall has no duplicate wall-clock cleanup deadline");
-  contains(installer_worker, "lifecycle_uninstall_completed",
-           "remote uninstall journals verified native completion");
-  contains(installer_worker, "--service-name %ls",
-           "lifecycle worker binds uninstall to the installed service name");
-  contains(installer_worker, "--attestation-token %ls",
-           "lifecycle worker passes the one-time attestation secret to the native uninstaller");
-  free(installer_worker);
-
-  snprintf(path, sizeof(path), "%s/src/command/agent_lifecycle_command.c", root);
-  char *lifecycle_command = read_file(path);
-  require_true(lifecycle_command != NULL, "read endpoint lifecycle command implementation");
-  contains(lifecycle_command, "--install-dir \\\"%s\\\"",
-           "remote lifecycle handoff pins the worker to its installed runtime directory");
-  contains(lifecycle_command, "agent-lifecycle-%s.worker.log",
-           "remote lifecycle diagnostics are task-bound and survive removal of the installation directory");
-  contains(lifecycle_command, "CREATE_BREAKAWAY_FROM_JOB",
-           "lifecycle worker must escape the Agent service Job Object before stopping it");
-  contains(lifecycle_command, "safe_https_url",
-           "remote uninstall accepts only HTTPS attestation destinations");
-  contains(lifecycle_command, "--attestation-token \\\"",
-           "remote lifecycle handoff passes the signed task attestation secret");
-  free(lifecycle_command);
-
   snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
   char *agent_core = read_file(path);
   require_true(agent_core != NULL, "read Agent capability manifest implementation");
   contains(agent_core, "endpoint_uninstall_attestation_v1",
-           "fixed Agent advertises the two-phase uninstall attestation protocol separately from legacy lifecycle support");
+           "fixed Agent advertises the two-phase uninstall attestation protocol separately from the signed lifecycle command capability");
   free(agent_core);
 
   puts("ok (pure source contract; Windows execution intentionally not simulated)");
