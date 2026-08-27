@@ -249,7 +249,8 @@ jobs:
           $uninstaller = & $probeRunner `
             -ExecutablePath (Join-Path $outDir "uninstall.exe") `
             -ProbePath $uninstallerProbe `
-            -ComponentName "headless uninstaller"
+            -ComponentName "headless uninstaller" `
+            -RequireSelfContainedMsvcRuntime
           if ($worker.uninstall_attestation -ne "v3" -or $worker.native_in_memory_token_handoff -ne $true) {
             throw "installer worker does not implement native in-memory uninstall attestation v3 handoff"
           }

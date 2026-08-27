@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
+cmake_policy(SET CMP0091 NEW)
 project(edr_agent
   VERSION 0.1.0
   DESCRIPTION "EDR endpoint agent"
@@ -520,6 +521,11 @@ if(WIN32)
     # explicit source charset, MSVC decodes this file through the runner's ACP
     # and the resulting uninstall prompts are permanently mojibaked.
     target_compile_options(fd_headless_uninstaller PRIVATE /utf-8)
+    # The detached finalizer must remain runnable after it starts deleting the
+    # installation directory. A dynamic CRT would keep DLLs in that directory
+    # loaded and make the finalizer lock the tree it is responsible for removing.
+    set_property(TARGET fd_headless_uninstaller PROPERTY
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   endif()
   target_sources(fd_headless_uninstaller PRIVATE third_party/cjson/cJSON.c)
   target_include_directories(fd_headless_uninstaller PRIVATE

@@ -223,6 +223,10 @@ int main(void) {
   require_true(!strstr(cmake, "EDR_AGENT_UPDATE_SCRIPT_PATH=\\\"${CMAKE_CURRENT_SOURCE_DIR}"),
                "runtime updater path is not pinned to the CI source checkout");
   contains(cmake, "shell32", "Windows external updater launch dependency is linked");
+  contains(cmake, "cmake_policy(SET CMP0091 NEW)",
+           "CMake exposes per-target MSVC runtime selection");
+  contains(cmake, "MSVC_RUNTIME_LIBRARY \"MultiThreaded$<$<CONFIG:Debug>:Debug>\"",
+           "detached uninstaller is statically linked to the MSVC runtime");
   free(cmake);
 
   snprintf(path, sizeof(path), "%s/src/command/command_stub.c", root);
@@ -481,6 +485,8 @@ int main(void) {
            "release workflow builds and tests ARM64 on a native Windows runner");
   contains(client_release, "invoke_windows_native_capability_probe.ps1",
            "release workflow executes native lifecycle capability probes on both architectures");
+  contains(client_release, "-RequireSelfContainedMsvcRuntime",
+           "release workflow rejects an uninstaller that imports the installed MSVC runtime");
   contains(client_release, "native-package-integrity.json",
            "release workflow packages native component SHA-256 identities");
   contains(client_release, "Required release test was not configured",
@@ -554,6 +560,8 @@ int main(void) {
                "client build package gate must not require the removed PowerShell uninstaller");
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
            "client build waits for GUI subsystem capability probes through the shared runner");
+  contains(client_build, "-RequireSelfContainedMsvcRuntime",
+           "client build rejects an uninstaller that imports the installed MSVC runtime");
   contains(client_build, "actions/setup-dotnet@v5",
            "client build uses the Node 24 setup-dotnet action");
   contains(client_build, "actions/setup-python@v6",
@@ -726,6 +734,10 @@ int main(void) {
   contains(capability_probe_runner, "could not remove stale result", "native capability runner cannot accept stale evidence");
   contains(capability_probe_runner, "Test-Path", "native capability runner requires a newly generated result file");
   contains(capability_probe_runner, "ConvertFrom-Json", "native capability runner rejects malformed probe output");
+  contains(capability_probe_runner, "RequireSelfContainedMsvcRuntime",
+           "native capability runner can enforce a self-contained finalizer binary");
+  contains(capability_probe_runner, "/DEPENDENTS",
+           "native capability runner checks the built PE import table");
   free(capability_probe_runner);
 
   snprintf(path, sizeof(path), "%s/scripts/validate_windows_powershell_syntax.ps1", root);

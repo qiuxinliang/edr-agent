@@ -3,11 +3,30 @@
 param(
   [Parameter(Mandatory = $true)][string]$ExecutablePath,
   [Parameter(Mandatory = $true)][string]$ProbePath,
-  [Parameter(Mandatory = $true)][string]$ComponentName
+  [Parameter(Mandatory = $true)][string]$ComponentName,
+  [switch]$RequireSelfContainedMsvcRuntime
 )
 
 $ErrorActionPreference = "Stop"
 $resolvedExecutable = (Resolve-Path -LiteralPath $ExecutablePath).Path
+if ($RequireSelfContainedMsvcRuntime) {
+  $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+  if (-not $dumpbin) {
+    throw "$ComponentName runtime dependency verification requires dumpbin.exe"
+  }
+  $dumpbinPath = $dumpbin.Source
+  $dependencyOutput = & $dumpbinPath /DEPENDENTS $resolvedExecutable 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "$ComponentName runtime dependency verification failed with exit code $LASTEXITCODE"
+  }
+  $dynamicRuntime = [regex]::Match(
+    ($dependencyOutput -join "`n"),
+    "(?im)^\s*((?:vcruntime\d+(?:_\d+)?|msvcp\d+(?:_\d+)?|ucrtbase|api-ms-win-crt-[a-z0-9-]+-l\d+-\d+-\d+)\.dll)\s*$"
+  )
+  if ($dynamicRuntime.Success) {
+    throw "$ComponentName must be self-contained but imports $($dynamicRuntime.Groups[1].Value): $resolvedExecutable"
+  }
+}
 $resolvedProbe = [IO.Path]::GetFullPath($ProbePath)
 $probeDirectory = Split-Path -Parent $resolvedProbe
 if ([string]::IsNullOrWhiteSpace($probeDirectory)) {
