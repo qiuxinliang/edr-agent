@@ -1405,35 +1405,19 @@ begin
   end;
 end;
 
-function EdrNativeCoordinatedUninstall: Boolean;
-var
-  I: Integer;
-begin
-  Result := False;
-  for I := 1 to ParamCount do
-    if UpperCase(ParamStr(I)) = '/EDR_NATIVE_COORDINATED=1' then
-    begin
-      Result := True;
-      Exit;
-    end;
-end;
-
 function InstallerWorkerPresentForUninstall: Boolean;
 begin
-  Result := (not EdrNativeCoordinatedUninstall) and
-    FileExists(ExpandConstant('{app}\FDSecurityInstallerWorker.exe'));
+  Result := FileExists(ExpandConstant('{app}\FDSecurityInstallerWorker.exe'));
 end;
 
 function AutorunScriptPresentForUninstall: Boolean;
 begin
-  Result := (not EdrNativeCoordinatedUninstall) and
-    (not InstallerWorkerPresentForUninstall) and
+  Result := (not InstallerWorkerPresentForUninstall) and
     FileExists(ExpandConstant('{app}\edr_windows_autorun.ps1'));
 end;
 
 function ServiceScriptPresentForUninstall: Boolean;
 begin
-  Result := (not EdrNativeCoordinatedUninstall) and
-    (not InstallerWorkerPresentForUninstall) and
+  Result := (not InstallerWorkerPresentForUninstall) and
     FileExists(ExpandConstant('{app}\windows_service_install.ps1'));
 end;

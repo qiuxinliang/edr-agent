@@ -63,6 +63,18 @@ static int edr_test_parent_delivery_window(void) {
   return ok;
 }
 
+static int edr_test_attestation_retry_policy(void) {
+  int ok = !edr_native_attestation_should_retry(401) &&
+           !edr_native_attestation_should_retry(410) &&
+           edr_native_attestation_should_retry(429) &&
+           edr_native_attestation_should_retry(500) &&
+           edr_native_attestation_should_retry(ERROR_WINHTTP_NAME_NOT_RESOLVED) &&
+           edr_native_attestation_retry_delay_ms(429, 0) == 60000u &&
+           edr_native_attestation_retry_delay_ms(500, 2) == 750u;
+  if (!ok) fprintf(stderr, "attestation retry policy contract failed\n");
+  return ok;
+}
+
 static int edr_test_transient_locked_delete(const wchar_t *root) {
   static wchar_t directory[MAX_PATH_LONG];
   static wchar_t file_path[MAX_PATH_LONG];
@@ -362,6 +374,8 @@ static int edr_finalizer_foundation_self_test(void) {
   if (!edr_test_handoff_frames()) goto cleanup;
   failure_stage = "parent-delivery-window";
   if (!edr_test_parent_delivery_window()) goto cleanup;
+  failure_stage = "attestation-retry-policy";
+  if (!edr_test_attestation_retry_policy()) goto cleanup;
   failure_stage = "local-handoff-marker";
   if (!edr_native_is_local_handoff_marker(EDR_LOCAL_HANDOFF_MARKER,
                                           sizeof(EDR_LOCAL_HANDOFF_MARKER) - 1) ||

@@ -209,20 +209,8 @@ static int edr_native_read_toml_scalar(const wchar_t *path, const char *key,
 }
 
 static int edr_native_validate_package_shape(const wchar_t *install_dir) {
-  wchar_t uninstaller[MAX_PATH_LONG];
-  wchar_t data[MAX_PATH_LONG];
-  int has_uninstaller;
-  int has_data;
-  if (!join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]),
-                 install_dir, L"unins000.exe") ||
-      !join_path(data, sizeof(data) / sizeof(data[0]), install_dir, L"unins000.dat")) {
-    return ERROR_INSUFFICIENT_BUFFER;
-  }
-  has_uninstaller = file_exists(uninstaller);
-  has_data = file_exists(data);
-  if (has_uninstaller != has_data) return ERROR_INVALID_DATA;
-  if (has_uninstaller) return ERROR_SUCCESS;
-  return edr_windows_native_manifest_validate(install_dir, NULL) ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+  return edr_windows_native_manifest_validate(install_dir, NULL) ? ERROR_SUCCESS
+                                                                   : ERROR_INVALID_DATA;
 }
 
 static int edr_finalizer_copy_verified(const wchar_t *source, const wchar_t *target) {
@@ -966,43 +954,11 @@ static int edr_native_run_etw_cleanup(const wchar_t *install_dir) {
   return edr_native_run_process(sensor, L" --etw-uninstall-cleanup", install_dir, 30000);
 }
 
-static int edr_native_run_inno_uninstaller(const wchar_t *install_dir) {
-  wchar_t uninstaller[MAX_PATH_LONG];
-  wchar_t data[MAX_PATH_LONG];
-  if (!join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir,
-                 L"unins000.exe") ||
-      !join_path(data, sizeof(data) / sizeof(data[0]), install_dir, L"unins000.dat")) {
-    return ERROR_INSUFFICIENT_BUFFER;
-  }
-  if (!file_exists(uninstaller) || !file_exists(data)) return ERROR_FILE_NOT_FOUND;
-  return edr_native_run_process(uninstaller,
-                                L" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /EDR_NATIVE_COORDINATED=1",
-                                install_dir, 120000);
-}
-
 static int edr_native_delete_install_root(const wchar_t *install_dir,
                                           wchar_t *failure_path,
                                           size_t failure_path_count) {
-  wchar_t uninstaller[MAX_PATH_LONG];
-  wchar_t data[MAX_PATH_LONG];
   DWORD error = ERROR_SUCCESS;
-  int inno_present;
   if (failure_path && failure_path_count) failure_path[0] = L'\0';
-  if (!join_path(uninstaller, sizeof(uninstaller) / sizeof(uninstaller[0]), install_dir,
-                 L"unins000.exe") ||
-      !join_path(data, sizeof(data) / sizeof(data[0]), install_dir, L"unins000.dat")) {
-    return ERROR_INSUFFICIENT_BUFFER;
-  }
-  {
-    int has_uninstaller = file_exists(uninstaller);
-    int has_data = file_exists(data);
-    if (has_uninstaller != has_data) return ERROR_INVALID_DATA;
-    inno_present = has_uninstaller && has_data;
-  }
-  if (inno_present) {
-    int exit_code = edr_native_run_inno_uninstaller(install_dir);
-    if (exit_code != 0) return exit_code;
-  }
   if (!edr_finalizer_safe_delete_tree(install_dir, &error,
                                       failure_path, failure_path_count)) {
     return (int)error;
@@ -1115,9 +1071,18 @@ static int edr_native_stop_sensor(const wchar_t *install_dir) {
   return ERROR_SUCCESS;
 }
 
+static int edr_native_attestation_should_retry(DWORD error) {
+  return error == 429 || error >= 500;
+}
+
+static DWORD edr_native_attestation_retry_delay_ms(DWORD error, int attempt) {
+  if (error == 429) return 60000u;
+  return 250u * (DWORD)(attempt + 1);
+}
+
 static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
                              const wchar_t *endpoint_id, const BYTE *token,
-                             DWORD token_length) {
+                             DWORD token_length, const char **failure_stage_out) {
   URL_COMPONENTSW components;
   wchar_t host[256];
   wchar_t path[2048];
@@ -1136,14 +1101,19 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
   HINTERNET connection = NULL;
   HINTERNET request = NULL;
   BOOL result = FALSE;
+  DWORD last_error = ERROR_NETWORK_UNREACHABLE;
+
+  if (failure_stage_out) *failure_stage_out = "attestation";
 
   if (!url || !url[0]) return ERROR_SUCCESS;
   if (!edr_native_valid_bearer_token(token, token_length) || !task_id || !endpoint_id) {
+    if (failure_stage_out) *failure_stage_out = "attestation-input";
     return ERROR_INVALID_DATA;
   }
   if (!edr_native_crack_attestation_url(url, &components, host,
                                         sizeof(host) / sizeof(host[0]), path,
                                         sizeof(path) / sizeof(path[0]))) {
+    if (failure_stage_out) *failure_stage_out = "attestation-url";
     return ERROR_INVALID_PARAMETER;
   }
   is_https = components.nScheme == INTERNET_SCHEME_HTTPS;
@@ -1151,17 +1121,24 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
                                     task_utf8, sizeof(task_utf8), NULL, NULL);
   endpoint_length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, endpoint_id, -1,
                                     endpoint_utf8, sizeof(endpoint_utf8), NULL, NULL);
-  if (!task_length || !endpoint_length) return ERROR_INVALID_DATA;
+  if (!task_length || !endpoint_length) {
+    if (failure_stage_out) *failure_stage_out = "attestation-encoding";
+    return ERROR_INVALID_DATA;
+  }
   {
     int written;
     written = _snprintf(authorization, sizeof(authorization),
                         "Authorization: Bearer %.*s\r\n", (int)token_length,
                         (const char *)token);
-    if (written < 0 || (size_t)written >= sizeof(authorization)) return ERROR_INVALID_DATA;
+    if (written < 0 || (size_t)written >= sizeof(authorization)) {
+      if (failure_stage_out) *failure_stage_out = "attestation-headers";
+      return ERROR_INVALID_DATA;
+    }
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, authorization, -1,
                             request_headers,
                             (int)(sizeof(request_headers) / sizeof(request_headers[0]))) <= 0) {
       SecureZeroMemory(authorization, sizeof(authorization));
+      if (failure_stage_out) *failure_stage_out = "attestation-headers";
       return ERROR_INVALID_DATA;
     }
   }
@@ -1178,6 +1155,7 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
     SecureZeroMemory(authorization, sizeof(authorization));
     SecureZeroMemory(request_headers, sizeof(request_headers));
     SecureZeroMemory(body, sizeof(body));
+    if (failure_stage_out) *failure_stage_out = "attestation-body";
     return ERROR_INSUFFICIENT_BUFFER;
   }
 
@@ -1188,7 +1166,8 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
     SecureZeroMemory(authorization, sizeof(authorization));
     SecureZeroMemory(request_headers, sizeof(request_headers));
     SecureZeroMemory(body, sizeof(body));
-    return (int)GetLastError();
+    if (failure_stage_out) *failure_stage_out = "attestation-session";
+    return (int)edr_finalizer_last_error();
   }
   WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
   for (attempt = 0; attempt < 3 && !result; ++attempt) {
@@ -1203,31 +1182,53 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
                                    WINHTTP_DEFAULT_ACCEPT_TYPES,
                                    is_https ? WINHTTP_FLAG_SECURE : 0);
     }
-    if (request && WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
-                                   &redirect_policy, sizeof(redirect_policy)) &&
-        WinHttpAddRequestHeaders(request, L"Content-Type: application/json\r\n",
-                                 (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) &&
-        WinHttpAddRequestHeaders(request, request_headers, (DWORD)-1L,
-                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) &&
-        WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                           body, (DWORD)body_length, (DWORD)body_length, 0) &&
-        WinHttpReceiveResponse(request, NULL) &&
-        WinHttpQueryHeaders(request,
-                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-                            WINHTTP_NO_HEADER_INDEX) &&
-        status >= 200 && status < 300) {
+    if (!connection) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-connect";
+    } else if (!request) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-request";
+    } else if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+                                 &redirect_policy, sizeof(redirect_policy)) ||
+               !WinHttpAddRequestHeaders(request, L"Content-Type: application/json\r\n",
+                                          (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) ||
+               !WinHttpAddRequestHeaders(request, request_headers, (DWORD)-1L,
+                                          WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-headers";
+    } else if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   body, (DWORD)body_length, (DWORD)body_length, 0)) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-send";
+    } else if (!WinHttpReceiveResponse(request, NULL)) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-response";
+    } else if (!WinHttpQueryHeaders(request,
+                                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-status";
+    } else if (status >= 200 && status < 300) {
       result = TRUE;
+    } else {
+      /* Keep the HTTP status in the receipt/result instead of collapsing an
+       * authenticated rejection or replay/expiry response into a network error. */
+      last_error = status;
+      if (failure_stage_out) *failure_stage_out = "attestation-http";
     }
     if (request) WinHttpCloseHandle(request);
     if (connection) WinHttpCloseHandle(connection);
-    if (!result && attempt < 2) Sleep(250u * (DWORD)(attempt + 1));
+    if (!result && !edr_native_attestation_should_retry(last_error)) break;
+    if (!result && attempt < 2) {
+      Sleep(edr_native_attestation_retry_delay_ms(last_error, attempt));
+    }
   }
   WinHttpCloseHandle(session);
   SecureZeroMemory(authorization, sizeof(authorization));
   SecureZeroMemory(request_headers, sizeof(request_headers));
   SecureZeroMemory(body, sizeof(body));
-  return result ? ERROR_SUCCESS : ERROR_NETWORK_UNREACHABLE;
+  return result ? ERROR_SUCCESS : (int)last_error;
 }
 
 static int edr_native_crack_attestation_url(const wchar_t *url,
@@ -1605,6 +1606,49 @@ static int edr_native_remove_certificate_identity(const wchar_t *thumbprint,
   return edr_native_certificate_identity_action(thumbprint, endpoint_id, store_name, 1);
 }
 
+static int edr_native_remove_registry_tree_64(const wchar_t *subkey) {
+  HKEY key = NULL;
+  LONG status;
+  status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, 0,
+                         KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY, &key);
+  if (status == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+  if (status != ERROR_SUCCESS) return (int)status;
+  status = RegDeleteTreeW(key, NULL);
+  RegCloseKey(key);
+  if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) return (int)status;
+  status = RegDeleteKeyExW(HKEY_LOCAL_MACHINE, subkey, KEY_WOW64_64KEY, 0);
+  if (status == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
+  return (int)status;
+}
+
+static int edr_native_remove_common_program_links(void) {
+  wchar_t common_programs[MAX_PATH_LONG];
+  wchar_t common_desktop[MAX_PATH_LONG];
+  wchar_t program_link[MAX_PATH_LONG];
+  wchar_t desktop_link[MAX_PATH_LONG];
+  int result;
+
+  if (SHGetFolderPathW(NULL, CSIDL_COMMON_PROGRAMS, NULL, SHGFP_TYPE_CURRENT,
+                       common_programs) != S_OK ||
+      SHGetFolderPathW(NULL, CSIDL_COMMON_DESKTOPDIRECTORY, NULL, SHGFP_TYPE_CURRENT,
+                       common_desktop) != S_OK ||
+      !join_path(program_link, sizeof(program_link) / sizeof(program_link[0]),
+                 common_programs, L"FDSecurity.lnk") ||
+      !join_path(desktop_link, sizeof(desktop_link) / sizeof(desktop_link[0]),
+                 common_desktop, L"FDSecurity.lnk")) {
+    return ERROR_PATH_NOT_FOUND;
+  }
+  if (!DeleteFileW(program_link)) {
+    result = (int)GetLastError();
+    if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) return result;
+  }
+  if (!DeleteFileW(desktop_link)) {
+    result = (int)GetLastError();
+    if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) return result;
+  }
+  return ERROR_SUCCESS;
+}
+
 static int edr_native_remove_registration(void) {
   static const wchar_t *environment_names[] = {
       L"EDR_GRPC_REQUIRE_MTLS", L"EDR_UPLOAD_FILE_RETRIES",
@@ -1619,6 +1663,9 @@ static int edr_native_remove_registration(void) {
   HKEY environment = NULL;
   LONG status;
   size_t index;
+  static const wchar_t *uninstall_keys[] = {
+      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FDSecurityAgentHeadless",
+      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}_is1"};
 
   status = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                          L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
@@ -1634,10 +1681,11 @@ static int edr_native_remove_registration(void) {
     }
     RegCloseKey(environment);
   }
-  status = RegDeleteTreeW(HKEY_LOCAL_MACHINE,
-                          L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FDSecurityAgentHeadless");
-  if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) return (int)status;
-  return ERROR_SUCCESS;
+  for (index = 0; index < sizeof(uninstall_keys) / sizeof(uninstall_keys[0]); ++index) {
+    status = (LONG)edr_native_remove_registry_tree_64(uninstall_keys[index]);
+    if (status != ERROR_SUCCESS) return (int)status;
+  }
+  return edr_native_remove_common_program_links();
 }
 
 static int edr_native_finalizer(int argc, wchar_t **argv) {
@@ -1665,7 +1713,9 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   int certificate_configured = 0;
   int handoff_acknowledged = 0;
   int self_delete_attempted = 0;
+  DWORD self_delete_error = ERROR_SUCCESS;
   const char *failure_stage = "preflight";
+  const char *attestation_failure_stage = "attestation";
   DWORD parent_pid = 0;
   HANDLE parent_handle = NULL;
   wchar_t *failure_path = NULL;
@@ -1804,18 +1854,34 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     goto cleanup;
   }
   failure_stage = "self-delete";
-  result = (int)edr_native_unlink_self(self_path);
+  self_delete_error = edr_native_unlink_self(self_path);
   self_delete_attempted = 1;
-  if (result != ERROR_SUCCESS) goto cleanup;
+  if (self_delete_error != ERROR_SUCCESS) {
+    /* The finalizer is already outside the verified package tree. A locked
+     * image must not prevent proof of the completed service/process/tree
+     * teardown; retain a durable receipt and request reboot cleanup. */
+    edr_native_write_failure_receipt(self_path, "self-delete", (int)self_delete_error, NULL);
+    DWORD deferred_result = edr_finalizer_schedule_self_delete(self_path);
+    if (deferred_result != ERROR_SUCCESS &&
+        deferred_result != ERROR_SUCCESS_REBOOT_REQUIRED) {
+      DWORD deferred_error = deferred_result;
+      edr_native_write_failure_receipt(self_path, "self-delete-schedule",
+                                       (int)deferred_error, NULL);
+    }
+  }
   if (local_handoff) {
     /* Local uninstall has no attestation endpoint or bearer token. */
-    edr_native_clear_failure_receipt(self_path);
+    if (self_delete_error == ERROR_SUCCESS) edr_native_clear_failure_receipt(self_path);
     result = ERROR_SUCCESS;
     goto cleanup;
   }
   failure_stage = "attestation";
-  result = edr_native_attest(attestation_url, task_id, endpoint_id, token, token_length);
-  if (result == ERROR_SUCCESS) edr_native_clear_failure_receipt(self_path);
+  result = edr_native_attest(attestation_url, task_id, endpoint_id, token, token_length,
+                             &attestation_failure_stage);
+  if (result != ERROR_SUCCESS) failure_stage = attestation_failure_stage;
+  if (result == ERROR_SUCCESS && self_delete_error == ERROR_SUCCESS) {
+    edr_native_clear_failure_receipt(self_path);
+  }
   goto cleanup;
 recovery:
   if (service_touched && !service_deleted) {

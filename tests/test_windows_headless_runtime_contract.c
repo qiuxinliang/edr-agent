@@ -304,9 +304,44 @@ int main(void) {
   ok &= require_contains(headless_uninstaller,
                          "stage=%s\\nerror=%d\\npath=%s\\n",
                          "native uninstall failure receipt must identify the blocked stage and path");
-  ok &= require_count(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1", 1,
-                      "native Inno cleanup must pass exactly one coordination marker");
+  ok &= require_absent(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1",
+                       "native finalizer must not invoke the legacy Inno coordination path");
+  ok &= require_contains(headless_uninstaller, "edr_native_attestation_should_retry("
+                         , "attestation retry policy must be explicit and bounded");
+  ok &= require_contains(headless_uninstaller, "error == 429 || error >= 500",
+                         "401/410 must stop while 429/5xx remain retryable");
+  ok &= require_contains(headless_uninstaller, "if (error == 429) return 60000u",
+                         "HTTP 429 must honor the one-minute retry window");
+  ok &= require_contains(headless_uninstaller, "self_delete_error = edr_native_unlink_self",
+                         "self-delete failure must be recorded without aborting teardown proof");
+  ok &= require_contains(headless_uninstaller, "edr_finalizer_schedule_self_delete(self_path)",
+                         "failed self-delete must request deferred reboot cleanup");
+  ok &= require_contains(headless_uninstaller, "RegDeleteKeyExW(HKEY_LOCAL_MACHINE, subkey, KEY_WOW64_64KEY",
+                         "native uninstall must remove only the 64-bit installer registration view");
+  ok &= require_contains(headless_uninstaller,
+                         "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}_is1",
+                         "native uninstall must remove the exact Inno AppId registration");
+  ok &= require_contains(headless_uninstaller, "CSIDL_COMMON_PROGRAMS",
+                         "native uninstall must resolve the shared Programs folder through Shell APIs");
+  ok &= require_contains(headless_uninstaller, "CSIDL_COMMON_DESKTOPDIRECTORY",
+                         "native uninstall must resolve the shared Desktop folder through Shell APIs");
+  ok &= require_contains(headless_uninstaller, "FDSecurity.lnk",
+                         "native uninstall must remove only the product desktop shortcut");
+  ok &= require_contains(headless_uninstaller, "DeleteFileW(program_link)",
+                         "native uninstall must remove the exact Common Programs shortcut");
+  ok &= require_absent(headless_uninstaller, "SHFileOperationW",
+                       "native uninstall must not recursively delete a shared Programs directory");
   free(headless_uninstaller);
+
+  char *agent_core = read_source(root, "src/core/agent.c");
+  if (!agent_core) return 1;
+  ok &= require_contains(agent_core, "lifecycle_attestation_ready",
+                         "capability health must gate remote uninstall on finalizer prerequisites");
+  ok &= require_contains(agent_core, "schannel_store_ready",
+                         "remote uninstall capability must require a ready Schannel certificate store");
+  ok &= require_contains(agent_core, "lifecycle_attestation_runtime",
+                         "remote uninstall capability must report degraded state when trust prerequisites are absent");
+  free(agent_core);
 
   char *lifecycle = read_source(root, "src/command/agent_lifecycle_command.c");
   if (!lifecycle) return 1;
@@ -358,14 +393,16 @@ int main(void) {
                          "commercial Setup checks the native worker before any install stage");
   ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.exe\"",
                          "Setup UI must package the same native uninstaller as the release ZIP");
-  ok &= require_contains(inno, "EdrNativeCoordinatedUninstall",
-                         "Inno cleanup hooks must recognize the native coordination marker");
-  ok &= require_count(inno, "not EdrNativeCoordinatedUninstall", 3,
-                      "bundled Inno worker/service/autorun hooks must skip native coordination");
-  ok &= require_contains(inno, "UpperCase(ParamStr(I)) = '/EDR_NATIVE_COORDINATED=1'",
-                         "only an exact coordination value enables native Inno mode");
-  ok &= require_absent(inno, "EdrCmdLineParamValue('/EDR_NATIVE_COORDINATED')",
-                       "native coordination must not use prefix-matching parameter parsing");
+  ok &= require_contains(inno, "AppId={{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}",
+                         "bundled Setup must retain the exact native-owned Inno registration identity");
+  ok &= require_contains(inno, "Name: \"{autoprograms}\\{#MyAppName}\"",
+                         "bundled Setup Programs entry must remain product-scoped for native cleanup");
+  ok &= require_contains(inno, "Name: \"{autodesktop}\\{#MyAppName}\"",
+                         "bundled Setup Desktop entry must remain product-scoped for native cleanup");
+  ok &= require_absent(inno, "EdrNativeCoordinatedUninstall",
+                       "Inno must not retain the removed native coordination branch");
+  ok &= require_absent(inno, "EDR_NATIVE_COORDINATED",
+                       "Inno must not expose the removed native coordination marker");
   ok &= require_contains(inno, "Type: filesandordirs; Name: \"{app}\\collector\"",
                          "Setup uninstall must remove the worker-created optional collector directory");
   ok &= require_contains(inno, "INSTALL_FAILURE_ROLLBACK begin",
@@ -390,12 +427,16 @@ int main(void) {
 
   char *plain_inno = read_source(root, "install/windows-inno/EDRAgentSetup.iss");
   if (!plain_inno) return 1;
-  ok &= require_count(plain_inno, "not EdrNativeCoordinatedUninstall", 2,
-                      "plain Inno service/autorun hooks must skip native coordination");
-  ok &= require_contains(plain_inno, "UpperCase(ParamStr(I)) = '/EDR_NATIVE_COORDINATED=1'",
-                         "plain Inno must require the exact coordination value");
-  ok &= require_absent(plain_inno, "EdrCmdLineParamValue('/EDR_NATIVE_COORDINATED')",
-                       "plain Inno must not use prefix-matching parameter parsing");
+  ok &= require_contains(plain_inno, "AppId={{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}",
+                         "plain Setup must retain the exact native-owned Inno registration identity");
+  ok &= require_contains(plain_inno, "Name: \"{autoprograms}\\{#MyAppName}\"",
+                         "plain Setup Programs entry must remain product-scoped for native cleanup");
+  ok &= require_contains(plain_inno, "Name: \"{autodesktop}\\{#MyAppName}\"",
+                         "plain Setup Desktop entry must remain product-scoped for native cleanup");
+  ok &= require_absent(plain_inno, "EdrNativeCoordinatedUninstall",
+                       "plain Inno must not retain the removed native coordination branch");
+  ok &= require_absent(plain_inno, "EDR_NATIVE_COORDINATED",
+                       "plain Inno must not expose the removed native coordination marker");
   free(plain_inno);
 
   char *setup_ui = read_source(root, "install/windows-setup-ui/MainWindow.xaml.cs");

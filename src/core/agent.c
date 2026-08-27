@@ -1669,6 +1669,20 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *lifecycle_runtime = !windows_native ? "unavailable"
                                   : !lifecycle_policy ? "disabled"
                                   : lifecycle_runtime_ready ? "healthy" : "degraded";
+  /* Remote teardown is performed by the detached native finalizer, which
+   * validates the Schannel store certificate again after the Agent exits.
+   * Do not advertise that proof path as healthy from the package manifest
+   * alone: the configured store, thumbprint, and live mTLS setup are all
+   * required prerequisites. Windows still performs the actual chain and
+   * endpoint trust verification during the finalizer preflight/attestation. */
+  int lifecycle_attestation_ready = lifecycle_runtime_ready && agent && http_rt &&
+      http_rt->mtls_configured &&
+      strcmp(http_rt->mtls_status, "schannel_store_ready") == 0 &&
+      agent->cfg.server.client_cert_store[0] &&
+      agent->cfg.server.client_cert_thumbprint[0];
+  const char *lifecycle_attestation_runtime = !windows_native ? "unavailable"
+                                             : !lifecycle_policy ? "disabled"
+                                             : lifecycle_attestation_ready ? "healthy" : "degraded";
   snprintf(agent_update_info.runtime_identity_sha256, sizeof(agent_update_info.runtime_identity_sha256), "%s", lifecycle_runtime_identity);
   char agent_update_manifest_fragment[1024];
   if (edr_agent_update_manifest_fragment(&agent_update_info, agent_update_manifest_fragment,
@@ -1834,7 +1848,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       dangerous_policy ? "true" : "false",
       agent_update_manifest_fragment,
       windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
-      windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_runtime,
+      windows_native ? "true" : "false", lifecycle_policy ? "true" : "false", lifecycle_attestation_runtime,
       dangerous_policy ? "true" : "false", velo_query_runtime);
   if (written < 0 || (size_t)written >= out_cap) {
     out[0] = '\0';
