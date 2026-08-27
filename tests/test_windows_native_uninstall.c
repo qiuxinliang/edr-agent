@@ -50,6 +50,19 @@ static DWORD WINAPI edr_delayed_handle_close_thread(LPVOID context) {
   return CloseHandle(close->handle) ? ERROR_SUCCESS : GetLastError();
 }
 
+static int edr_test_parent_delivery_window(void) {
+  HANDLE exited = CreateEventW(NULL, TRUE, TRUE, NULL);
+  HANDLE running = CreateEventW(NULL, TRUE, FALSE, NULL);
+  int ok = exited && running &&
+           edr_native_wait_for_parent_delivery_window(exited, 10) == ERROR_SUCCESS &&
+           edr_native_wait_for_parent_delivery_window(running, 10) == ERROR_SUCCESS &&
+           edr_native_wait_for_parent_delivery_window(NULL, 10) == ERROR_INVALID_HANDLE;
+  if (exited) CloseHandle(exited);
+  if (running) CloseHandle(running);
+  if (!ok) fprintf(stderr, "parent delivery window contract failed\n");
+  return ok;
+}
+
 static int edr_test_transient_locked_delete(const wchar_t *root) {
   static wchar_t directory[MAX_PATH_LONG];
   static wchar_t file_path[MAX_PATH_LONG];
@@ -347,6 +360,8 @@ static int edr_finalizer_foundation_self_test(void) {
   handoff.ack_read = INVALID_HANDLE_VALUE;
   ZeroMemory(&probe, sizeof(probe));
   if (!edr_test_handoff_frames()) goto cleanup;
+  failure_stage = "parent-delivery-window";
+  if (!edr_test_parent_delivery_window()) goto cleanup;
   failure_stage = "local-handoff-marker";
   if (!edr_native_is_local_handoff_marker(EDR_LOCAL_HANDOFF_MARKER,
                                           sizeof(EDR_LOCAL_HANDOFF_MARKER) - 1) ||

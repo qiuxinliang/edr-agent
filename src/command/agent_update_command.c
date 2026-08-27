@@ -323,28 +323,7 @@ int edr_agent_update_probe_full_installer_baseline(
   EdrFullInstallerReadinessDeps deps = {
       NULL, readiness_regular_file, readiness_readable_config, readiness_uninstall,
       readiness_service, readiness_task, readiness_module};
-  if (!edr_full_installer_baseline_ready(&deps, directory, reason, reason_cap)) return 0;
-  const char *required[] = {"unins000.exe", "unins000.dat", "agent.toml", "FDSensor.exe"};
-  for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
-    char path[MAX_PATH];
-    int n = snprintf(path, sizeof(path), "%s\\%s", directory, required[i]);
-    if (n <= 0 || (size_t)n >= sizeof(path) || !regular_nonreparse_file(path)) {
-      snprintf(reason, reason_cap, "installation_baseline_missing_%s", required[i]);
-      return 0;
-    }
-  }
-  if (!uninstall_provenance_matches(directory)) {
-    snprintf(reason, reason_cap, "uninstaller_provenance_missing_or_mismatch");
-    return 0;
-  }
-  char expected[MAX_PATH];
-  snprintf(expected, sizeof(expected), "%s\\FDSensor.exe", directory);
-  int service_ok = service_identity_matches(expected);
-  int task_ok = scheduled_task_identity_matches(expected);
-  if (!service_ok && !task_ok) { snprintf(reason, reason_cap, "installation_identity_mismatch"); return 0; }
-  if (service_ok && task_ok) { snprintf(reason, reason_cap, "installation_identity_conflict"); return 0; }
-  snprintf(reason, reason_cap, "ready");
-  return 1;
+  return edr_full_installer_baseline_ready(&deps, directory, reason, reason_cap);
 }
 
 static int file_time_is_older_than(const FILETIME *value, ULONGLONG age_100ns) {

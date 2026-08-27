@@ -82,6 +82,15 @@ static DWORD edr_finalizer_last_error(void) {
   return error ? error : ERROR_GEN_FAILURE;
 }
 
+static int edr_native_wait_for_parent_delivery_window(HANDLE parent_handle,
+                                                       DWORD timeout_ms) {
+  DWORD wait_result;
+  if (!parent_handle) return ERROR_INVALID_HANDLE;
+  wait_result = WaitForSingleObject(parent_handle, timeout_ms);
+  if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT) return ERROR_SUCCESS;
+  return (int)edr_finalizer_last_error();
+}
+
 /* The finalizer directory and executable are outside the package being
  * removed. Its ACL is established before any package-derived bytes are
  * written; only SYSTEM and the local Administrators group can replace it. */
@@ -1732,16 +1741,14 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   CloseHandle(acknowledgement);
   acknowledgement = INVALID_HANDLE_VALUE;
   handoff_acknowledged = 1;
-  failure_stage = "wait-agent-exit";
-  {
-    DWORD wait_result = WaitForSingleObject(parent_handle, 30000);
-    CloseHandle(parent_handle);
-    parent_handle = NULL;
-    if (wait_result != WAIT_OBJECT_0) {
-      result = wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : (int)GetLastError();
-      goto cleanup;
-    }
-  }
+  /* The remote Agent owns command-result delivery and normally remains alive
+     until SCM stops it below.  Treat this bounded wait as a delivery window,
+     not as proof that uninstall failed.  A real wait error still fails closed. */
+  failure_stage = "wait-command-delivery-window";
+  result = edr_native_wait_for_parent_delivery_window(parent_handle, 30000);
+  CloseHandle(parent_handle);
+  parent_handle = NULL;
+  if (result != ERROR_SUCCESS) goto cleanup;
   failure_stage = "delete-tasks";
   if (!edr_native_delete_tasks()) {
     result = ERROR_ACCESS_DENIED;

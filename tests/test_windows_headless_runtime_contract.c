@@ -282,6 +282,12 @@ int main(void) {
   ok &= require_absent(headless_uninstaller, "INFINITE",
                        "native uninstall waits must remain bounded");
   ok &= require_contains(headless_uninstaller,
+                         "wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT",
+                         "an expired Agent result-delivery window must continue into SCM cleanup");
+  ok &= require_contains(headless_uninstaller,
+                         "return edr_windows_native_manifest_validate(install_dir, NULL)",
+                         "native uninstall must accept a valid manifest without legacy Inno files");
+  ok &= require_contains(headless_uninstaller,
                          "certificate_configured = thumbprint && thumbprint[0]",
                          "local uninstall must permit an unenrolled Agent with no certificate to remove");
   ok &= require_count(headless_uninstaller, "if (certificate_configured) {", 2,
