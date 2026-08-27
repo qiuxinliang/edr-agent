@@ -185,6 +185,10 @@ int main(void) {
                          "scheduled-task startup must fail when no Agent process appears");
   ok &= require_contains(worker, "service_running=%d process_running=%d",
                          "service startup must verify both SCM state and the Agent process");
+  ok &= require_contains(worker, "(unsigned long)agent_parent_pid",
+                         "uninstall worker must forward the Agent owner PID to the native finalizer");
+  ok &= require_absent(worker, "(unsigned long)GetCurrentProcessId(), attestation_url",
+                       "uninstall worker must not make the finalizer wait on the short-lived worker process");
   ok &= require_contains(worker, "change_service_config_failed",
                          "service reconfiguration failures must stop installation");
   ok &= require_contains(worker, "service_failure_actions_config_failed",
@@ -292,8 +296,8 @@ int main(void) {
                          "error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION",
                          "native uninstall must bound retries to transient Windows file locks");
   ok &= require_contains(headless_uninstaller,
-                         "stage=finalizer\\nerror=%d\\npath=%s\\n",
-                         "native uninstall failure receipt must identify the blocked path");
+                         "stage=%s\\nerror=%d\\npath=%s\\n",
+                         "native uninstall failure receipt must identify the blocked stage and path");
   ok &= require_count(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1", 1,
                       "native Inno cleanup must pass exactly one coordination marker");
   free(headless_uninstaller);
@@ -306,6 +310,10 @@ int main(void) {
                        "Agent lifecycle must not launch PowerShell");
   ok &= require_absent(lifecycle, "INFINITE",
                        "Agent lifecycle waits must remain bounded");
+  ok &= require_contains(lifecycle, "--parent-pid %lu",
+                         "Agent lifecycle must identify the process that owns the uninstall handoff");
+  ok &= require_contains(lifecycle, "(unsigned long)GetCurrentProcessId()",
+                         "Agent lifecycle must pass its own PID through the uninstall handoff");
   free(lifecycle);
 
   char *preflight = read_source(root, "scripts/edr_agent_preflight.ps1");

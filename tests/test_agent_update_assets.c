@@ -59,6 +59,8 @@ int main(void) {
                "full-installer upgrade does not expose data and health invariants as Inno task choices");
   contains(script, "EDR_REPAIR_BASELINE=1", "legacy installations can enter the explicitly backed-up baseline repair path");
   contains(script, "EDR_REPAIR_BACKUP_DIR", "baseline repair is bound to the immutable runtime backup");
+  contains(script, "Join-Path $fullInstallerBackupPath 'agent.toml'",
+           "baseline repair immutable backup includes the protected configuration required by Setup");
   contains(script, "INSTALL_BASELINE_CORRUPT", "partial uninstaller baselines fail closed");
   contains(script, "INSTALL_REPAIR_BACKUP_INCOMPLETE", "baseline repair refuses an incomplete rollback source");
   contains(script, "INSTALL_BASELINE_REPAIR_INCOMPLETE", "baseline repair verifies the Inno lifecycle files before success");
@@ -78,6 +80,8 @@ int main(void) {
   contains(script, "$verifiedStatus = if ($Operation -eq 'rollback')", "full installer event status is initialized before either upgrade branch uses it");
   contains(script, "rollback_full_installer_started", "full installer failure starts a bounded runtime rollback");
   contains(script, "preserving Agent update work for recovery", "unrecoverable update failure retains the restricted recovery snapshot");
+  contains(script, "$hasInstallerLogEvidence",
+           "pre-installer failures do not fabricate an installer log evidence descriptor");
   contains(script, "native-package-integrity.json", "complete runtime package integrity manifest is required");
   contains(script, "runtime package integrity manifest may only add app-local DLLs",
            "complete runtime package limits extended components to app-local DLLs");

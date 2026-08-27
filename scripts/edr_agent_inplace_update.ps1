@@ -1265,6 +1265,7 @@ try {
     Set-UpdateStage -Stage 'full_installer_verified'
     Set-UpdateStage -Stage 'full_installer_backup'
     Invoke-FullInstallerRuntimeMirror -Source $installFull -Destination $fullInstallerBackupPath -Stage 'backup'
+    Copy-Item -LiteralPath (Join-Path $installFull 'agent.toml') -Destination (Join-Path $fullInstallerBackupPath 'agent.toml') -Force
     Copy-Item -LiteralPath (Join-Path $installFull 'agent.toml') -Destination $fullInstallerConfigBackupPath -Force
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
     Set-UpdateStage -Stage 'full_installer_upgrade'
@@ -1388,8 +1389,9 @@ try {
     if ($failureMessage -match 'log_sha256=([0-9a-fA-F]{64})') { $report['installer_log_sha256'] = $Matches[1].ToLowerInvariant() }
     if ($failureMessage -match 'log_size=([0-9]+)') { $report['installer_log_size'] = [UInt64]$Matches[1] }
     if ($failureMessage -match 'original_size=([0-9]+)') { $report['installer_log_original_size'] = [UInt64]$Matches[1] }
-    $report['installer_log_status'] = if ($report['error_code'] -eq 'INSTALL_LOG_UNAVAILABLE') { 'missing' } elseif ($report['error_code'] -eq 'INSTALL_LOG_TOO_LARGE') { 'too_large' } else { 'ready' }
-    if ($TaskId -and $CommandId) {
+    $hasInstallerLogEvidence = [string]$report['installer_log_sha256'] -match '^[0-9a-f]{64}$' -and [UInt64]$report['installer_log_size'] -gt 0
+    $report['installer_log_status'] = if ($report['error_code'] -eq 'INSTALL_LOG_UNAVAILABLE') { 'missing' } elseif ($report['error_code'] -eq 'INSTALL_LOG_TOO_LARGE') { 'too_large' } elseif ($hasInstallerLogEvidence) { 'ready' } else { 'not_produced' }
+    if ($TaskId -and $CommandId -and $hasInstallerLogEvidence) {
       $report['installer_log_evidence_id'] = Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId
       if ($report['installer_log_sha256']) {
         $report['installer_log_storage_key'] = "evidence/$($report['installer_log_evidence_id'])/$($report['installer_log_sha256']).log"

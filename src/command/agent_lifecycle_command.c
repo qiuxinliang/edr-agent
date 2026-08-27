@@ -264,22 +264,10 @@ static int launch_worker(const char *helper, const char *journal, const char *lo
         helper, request->action, install_dir, journal, log_path, command_id, request->task_id,
         request->action, strcmp(request->action, "restart") == 0 ? 2000u : 30000u);
   }
-  if (strcmp(request->action, "uninstall") == 0) {
-    written = snprintf(command, sizeof(command),
-                       "\"%s\" --stage lifecycle-uninstall --service-name \"FDSecurityAgent\" "
-                       "--install-dir \"%s\" --journal \"%s\" --log \"%s\" --command-id \"%s\" "
-                       "--task-id \"%s\" --action uninstall --delay-ms 30000 "
-                       "--attestation-url \"%s\" --endpoint-id \"%s\" "
-                       "--secret-read-handle %llu --ack-write-handle %llu",
-                       helper, install_dir, journal, log_path, command_id, request->task_id,
-                       request->attestation_url, request->endpoint_id,
-                       (unsigned long long)(ULONG_PTR)0,
-                       (unsigned long long)(ULONG_PTR)0);
-  }
-  if (written <= 0 || written >= (int)sizeof(command)) return 0;
   memset(&startup, 0, sizeof(startup));
   memset(&process, 0, sizeof(process));
   if (strcmp(request->action, "uninstall") != 0) {
+    if (written <= 0 || written >= (int)sizeof(command)) return 0;
     startup.cb = sizeof(STARTUPINFOA);
     startup.dwFlags = STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_HIDE;
@@ -301,11 +289,12 @@ static int launch_worker(const char *helper, const char *journal, const char *lo
                      "--install-dir \"%s\" --journal \"%s\" --log \"%s\" --command-id \"%s\" "
                      "--task-id \"%s\" --action uninstall --delay-ms 30000 "
                      "--attestation-url \"%s\" --endpoint-id \"%s\" "
-                     "--secret-read-handle %llu --ack-write-handle %llu",
+                     "--secret-read-handle %llu --ack-write-handle %llu --parent-pid %lu",
                      helper, install_dir, journal, log_path, command_id, request->task_id,
                      request->attestation_url, request->endpoint_id,
                      (unsigned long long)(ULONG_PTR)secret_read,
-                     (unsigned long long)(ULONG_PTR)ack_write);
+                     (unsigned long long)(ULONG_PTR)ack_write,
+                     (unsigned long)GetCurrentProcessId());
   if (written <= 0 || written >= (int)sizeof(command)) goto cleanup;
   handles[0] = secret_read;
   handles[1] = ack_write;

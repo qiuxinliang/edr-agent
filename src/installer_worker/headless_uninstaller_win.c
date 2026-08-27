@@ -1322,7 +1322,8 @@ static int edr_native_validate_certificate_identity(const wchar_t *install_dir,
   return 1;
 }
 
-static void edr_native_write_failure_receipt(const wchar_t *self_path, int error,
+static void edr_native_write_failure_receipt(const wchar_t *self_path,
+                                             const char *failure_stage, int error,
                                              const wchar_t *failure_path) {
   wchar_t receipt[MAX_PATH_LONG];
   wchar_t temporary[MAX_PATH_LONG];
@@ -1342,6 +1343,8 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path, int error
       wcslen(self_path) >= sizeof(directory) / sizeof(directory[0])) {
     return;
   }
+  if (!failure_stage || !failure_stage[0]) failure_stage = "finalizer";
+  content_capacity += strlen(failure_stage);
   wcscpy(directory, self_path);
   separator = wcsrchr(directory, L'\\');
   if (!separator) return;
@@ -1381,9 +1384,10 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path, int error
   if (file == INVALID_HANDLE_VALUE) goto cleanup;
   written = path_utf8
                 ? _snprintf(content, content_capacity,
-                            "stage=finalizer\nerror=%d\npath=%s\n", error, path_utf8)
+                            "stage=%s\nerror=%d\npath=%s\n",
+                            failure_stage, error, path_utf8)
                 : _snprintf(content, content_capacity,
-                            "stage=finalizer\nerror=%d\n", error);
+                            "stage=%s\nerror=%d\n", failure_stage, error);
   if (written > 0 && (SIZE_T)written < content_capacity &&
       WriteFile(file, content, (DWORD)written, &bytes_written, NULL) &&
       bytes_written == (DWORD)written) {
@@ -1652,6 +1656,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   int certificate_configured = 0;
   int handoff_acknowledged = 0;
   int self_delete_attempted = 0;
+  const char *failure_stage = "preflight";
   DWORD parent_pid = 0;
   HANDLE parent_handle = NULL;
   wchar_t *failure_path = NULL;
@@ -1694,6 +1699,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
      required a valid certificate thumbprint above. */
   certificate_configured = thumbprint && thumbprint[0];
   if (certificate_configured) {
+    failure_stage = "certificate-preflight";
     if (!edr_native_validate_certificate_identity(install_dir, endpoint_id, thumbprint,
                                                   certificate_store,
                                                   sizeof(certificate_store) /
@@ -1726,6 +1732,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   CloseHandle(acknowledgement);
   acknowledgement = INVALID_HANDLE_VALUE;
   handoff_acknowledged = 1;
+  failure_stage = "wait-agent-exit";
   {
     DWORD wait_result = WaitForSingleObject(parent_handle, 30000);
     CloseHandle(parent_handle);
@@ -1735,12 +1742,14 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
       goto cleanup;
     }
   }
+  failure_stage = "delete-tasks";
   if (!edr_native_delete_tasks()) {
     result = ERROR_ACCESS_DENIED;
     goto recovery;
   }
   {
     int service_result;
+    failure_stage = "delete-service";
     service_touched = 1;
     service_result = edr_native_stop_delete_service(service_name);
     if (service_result < 0) {
@@ -1754,10 +1763,13 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     }
   }
   service_deleted = 1;
+  failure_stage = "stop-sensor";
   result = edr_native_stop_sensor(install_dir);
   if (result != ERROR_SUCCESS) goto cleanup;
+  failure_stage = "etw-cleanup";
   result = edr_native_run_etw_cleanup(install_dir);
   if (result != ERROR_SUCCESS) goto cleanup;
+  failure_stage = "remove-registration";
   result = edr_native_remove_registration();
   if (result != ERROR_SUCCESS) goto cleanup;
   failure_path = (wchar_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -1766,11 +1778,14 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     result = ERROR_NOT_ENOUGH_MEMORY;
     goto cleanup;
   }
+  failure_stage = "remove-install-root";
   result = edr_native_delete_install_root(install_dir, failure_path, MAX_PATH_LONG);
   if (result != ERROR_SUCCESS) goto cleanup;
+  failure_stage = "verify-removed";
   result = edr_native_verify_removed(install_dir, service_name);
   if (result != ERROR_SUCCESS) goto cleanup;
   if (certificate_configured) {
+    failure_stage = "remove-certificate";
     result = edr_native_remove_certificate_identity(thumbprint, endpoint_id,
                                                     certificate_store);
     if (result != ERROR_SUCCESS) goto cleanup;
@@ -1781,6 +1796,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     result = ERROR_FILE_NOT_FOUND;
     goto cleanup;
   }
+  failure_stage = "self-delete";
   result = (int)edr_native_unlink_self(self_path);
   self_delete_attempted = 1;
   if (result != ERROR_SUCCESS) goto cleanup;
@@ -1790,6 +1806,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     result = ERROR_SUCCESS;
     goto cleanup;
   }
+  failure_stage = "attestation";
   result = edr_native_attest(attestation_url, task_id, endpoint_id, token, token_length);
   if (result == ERROR_SUCCESS) edr_native_clear_failure_receipt(self_path);
   goto cleanup;
@@ -1803,7 +1820,7 @@ cleanup:
                                      (DWORD)(sizeof(self_path) / sizeof(self_path[0])));
     if (self_length && self_length < sizeof(self_path) / sizeof(self_path[0])) {
       if (result != ERROR_SUCCESS) {
-        edr_native_write_failure_receipt(self_path, result, failure_path);
+        edr_native_write_failure_receipt(self_path, failure_stage, result, failure_path);
       }
       if (!self_delete_attempted) (void)edr_finalizer_schedule_self_delete(self_path);
     }

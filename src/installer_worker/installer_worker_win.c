@@ -1329,6 +1329,7 @@ static int stage_lifecycle_restart(const wchar_t *service_name, const wchar_t *j
 static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t *service_name,
                                        const wchar_t *attestation_url,
                                        const wchar_t *task_id, const wchar_t *endpoint_id,
+                                       DWORD agent_parent_pid,
                                        HANDLE agent_secret_read, HANDLE agent_ack_write,
                                        const wchar_t *log_path) {
   wchar_t uninstaller[MAX_PATH * 2];
@@ -1367,7 +1368,7 @@ static int launch_uninstaller_detached(const wchar_t *install_dir, const wchar_t
              quoted, install_dir, service_name,
              (unsigned long long)(ULONG_PTR)secret_read, task_id, endpoint_id,
              (unsigned long long)(ULONG_PTR)ack_write,
-             (unsigned long)GetCurrentProcessId(), attestation_url && attestation_url[0]
+             (unsigned long)agent_parent_pid, attestation_url && attestation_url[0]
                  ? L" --attestation-url \"" : L"", attestation_url ? attestation_url : L"",
              attestation_url && attestation_url[0] ? L"\"" : L"",
              L"");
@@ -1423,7 +1424,8 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
                                     const wchar_t *journal_path, const wchar_t *task_id,
                                     const wchar_t *command_id, const wchar_t *action,
                                     DWORD delay_ms, const wchar_t *attestation_url,
-                                    const wchar_t *endpoint_id, HANDLE agent_secret_read,
+                                    const wchar_t *endpoint_id, DWORD agent_parent_pid,
+                                    HANDLE agent_secret_read,
                                     HANDLE agent_ack_write,
                                     const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=lifecycle-teardown begin");
@@ -1438,7 +1440,8 @@ static int stage_lifecycle_teardown(const wchar_t *install_dir, const wchar_t *s
                        "Agent offboard service stop failed";
   } else if (_wcsicmp(action, L"uninstall") == 0) {
     rc = launch_uninstaller_detached(install_dir, service_name, attestation_url,
-                                     task_id, endpoint_id, agent_secret_read,
+                                     task_id, endpoint_id, agent_parent_pid,
+                                     agent_secret_read,
                                      agent_ack_write, log_path);
     detail = rc == 0 ? "Native finalizer accepted takeover; physical uninstall is pending" :
                        "Native finalizer takeover failed before Agent acknowledgement";
@@ -1480,6 +1483,7 @@ int main(void) {
   const wchar_t *attestation_url = arg_value(argc, argv, L"--attestation-url");
   const wchar_t *secret_read_handle_text = arg_value(argc, argv, L"--secret-read-handle");
   const wchar_t *ack_write_handle_text = arg_value(argc, argv, L"--ack-write-handle");
+  const wchar_t *parent_pid_text = arg_value(argc, argv, L"--parent-pid");
   const wchar_t *endpoint_id = arg_value(argc, argv, L"--endpoint-id");
   wchar_t default_log[MAX_PATH * 2], default_cfg[MAX_PATH * 2], default_exe[MAX_PATH * 2];
   join_path(default_log, sizeof(default_log) / sizeof(default_log[0]), install_dir, L"diagnostics\\installer-worker.log");
@@ -1536,15 +1540,28 @@ int main(void) {
                                          ? L"offboard" : L"uninstall";
     HANDLE agent_secret_read = INVALID_HANDLE_VALUE;
     HANDLE agent_ack_write = INVALID_HANDLE_VALUE;
+    DWORD agent_parent_pid = 0;
     int handles_valid = 1;
+    int parent_pid_valid = 1;
     if (_wcsicmp(expected_action, L"uninstall") == 0) {
+      wchar_t *parent_pid_end = NULL;
+      unsigned long parsed_parent_pid;
+      errno = 0;
+      parsed_parent_pid = wcstoul(parent_pid_text, &parent_pid_end, 10);
+      if (errno == ERANGE || !parent_pid_text[0] || !parent_pid_end || *parent_pid_end ||
+          parsed_parent_pid == 0) {
+        append_log_utf8(log_path, L"lifecycle_teardown_invalid_parent_pid");
+        parent_pid_valid = 0;
+      } else {
+        agent_parent_pid = (DWORD)parsed_parent_pid;
+      }
       if (!parse_inherited_handle(secret_read_handle_text, &agent_secret_read) ||
           !parse_inherited_handle(ack_write_handle_text, &agent_ack_write)) {
         append_log_utf8(log_path, L"lifecycle_teardown_invalid_handle_arguments");
         handles_valid = 0;
       }
     }
-    if (!handles_valid || !journal_path[0] || !task_id[0] || !command_id[0] ||
+    if (!handles_valid || !parent_pid_valid || !journal_path[0] || !task_id[0] || !command_id[0] ||
         _wcsicmp(action, expected_action) != 0 ||
         (_wcsicmp(expected_action, L"uninstall") == 0 &&
          (!attestation_url[0] || !endpoint_id[0] ||
@@ -1554,7 +1571,8 @@ int main(void) {
     } else {
       rc = stage_lifecycle_teardown(install_dir, svc, journal_path, task_id, command_id,
                                     action, delay_ms,
-                                    attestation_url, endpoint_id, agent_secret_read,
+                                    attestation_url, endpoint_id, agent_parent_pid,
+                                    agent_secret_read,
                                     agent_ack_write, log_path);
     }
   } else if (_wcsicmp(stage, L"uninstall-runtime") == 0) {
