@@ -1211,6 +1211,22 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
                                    uint64_t vad_hint_va, char *extra, size_t extra_cap,
                                    const EdrPmfeTask *task, EdrPmfeScanResult *result) {
   extra[0] = '\0';
+  const char *ave_tmp = getenv("EDR_PMFE_AVE_TEMPFILE");
+  const int do_ave = (ave_tmp && ave_tmp[0] == '1' && s_pmfe_cfg);
+  const char *yara_disabled = getenv("EDR_PMFE_YARA");
+  const int yara_requested = task && task->server_requested && task->cmd_id[0] &&
+                             task->command_context.yara_mode != 2u &&
+                             !(yara_disabled && yara_disabled[0] == '0');
+  const char *dns_disabled = getenv("EDR_PMFE_DNS_DISABLED");
+  const int dns_requested = dns_path && !(dns_disabled && dns_disabled[0] == '1');
+  if (result) {
+    snprintf(result->yara_status, sizeof(result->yara_status), "%s",
+             yara_requested ? "no_candidate" : "disabled");
+    snprintf(result->ave_status, sizeof(result->ave_status), "%s",
+             do_ave ? "no_candidate" : "disabled");
+    snprintf(result->dns_status, sizeof(result->dns_status), "%s",
+             dns_requested ? "no_candidate" : "disabled");
+  }
   const char *peek_ev = getenv("EDR_PMFE_VAD_PEEK");
   int peek_n = (int)peek_cap_req;
   if (peek_ev && peek_ev[0]) {
@@ -1284,10 +1300,9 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
 
   int mz = 0;
   float ent_max = 0.f;
+  int ave_candidates = 0;
   int ave_probes = 0;
   float ave_max_score = 0.f;
-  const char *ave_tmp = getenv("EDR_PMFE_AVE_TEMPFILE");
-  int do_ave = (ave_tmp && ave_tmp[0] == '1' && s_pmfe_cfg);
 
   size_t sample_max = 64u * 1024u;
   const char *sample_ev = getenv("EDR_PMFE_REGION_SAMPLE_MAX");
@@ -1300,15 +1315,19 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
     sample_max = (size_t)task->command_context.requested_region_size;
   }
   EdrForensicYaraSession *yara_session = NULL;
-  const char *yara_disabled = getenv("EDR_PMFE_YARA");
-  if (task && task->server_requested && task->cmd_id[0] && task->command_context.yara_mode != 2u &&
-      !(yara_disabled && yara_disabled[0] == '0')) {
+  if (yara_requested) {
     char yara_error[160];
     yara_session = edr_response_yara_session_open(yara_error, sizeof(yara_error));
     if (!yara_session && result && !result->warning[0]) {
       snprintf(result->warning, sizeof(result->warning), "YARA not available: %.180s", yara_error);
     }
+    if (result) {
+      snprintf(result->yara_status, sizeof(result->yara_status), "%s",
+               yara_session ? "running" : "unavailable");
+    }
   }
+  int yara_failed = 0;
+  int ave_failed = 0;
   for (int i = 0; i < peek_n; i++) {
     EdrPmfeRegionResult *region = NULL;
     if (result && result->region_count < EDR_PMFE_MAX_REGIONS) {
@@ -1381,6 +1400,9 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
             yara_session, task->cmd_id, buf, (size_t)br, region->yara_hits,
             EDR_PMFE_MAX_YARA_HITS, &yara_count, yara_error, sizeof(yara_error));
         region->yara_hit_count = (uint8_t)yara_count;
+        if (yara_rc != 0) {
+          yara_failed = 1;
+        }
         if (yara_count > 0u) {
           strncat(region->reason, ",yara_match", sizeof(region->reason) - strlen(region->reason) - 1u);
           if (region->score < 0.95f) region->score = 0.95f;
@@ -1394,6 +1416,7 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
       }
     }
     if (do_ave && buf[0] == 'M' && buf[1] == 'Z' && ave_probes < 3) {
+      ave_candidates++;
       char td[MAX_PATH];
       char tp[MAX_PATH + 80];
       DWORD tdl = GetTempPathA((DWORD)sizeof(td), td);
@@ -1413,13 +1436,28 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
           ave_probes++;
           if (ar == AVE_OK && avr.final_confidence > ave_max_score) {
             ave_max_score = avr.final_confidence;
+          } else if (ar != AVE_OK) {
+            ave_failed = 1;
           }
+        } else {
+          ave_failed = 1;
         }
+      } else {
+        ave_failed = 1;
       }
     }
     free(buf);
   }
   edr_response_yara_session_close(yara_session);
+  if (result && strcmp(result->yara_status, "running") == 0) {
+    snprintf(result->yara_status, sizeof(result->yara_status), "%s",
+             yara_failed ? "failed" : "completed");
+  }
+  if (result) {
+    snprintf(result->ave_status, sizeof(result->ave_status), "%s",
+             !do_ave ? "disabled" : (ave_failed ? "failed" : (ave_probes > 0 ? "completed" :
+                                                                 (ave_candidates > 0 ? "failed" : "no_candidate"))));
+  }
 
   unsigned dns_ascii_hits = 0;
   unsigned dns_utf16_hits = 0;
@@ -1429,8 +1467,7 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
   char dns_owner[200];
   dns_sample[0] = '\0';
   dns_owner[0] = '\0';
-  const char *dns_dis = getenv("EDR_PMFE_DNS_DISABLED");
-  if (dns_path && !(dns_dis && dns_dis[0] == '1')) {
+  if (dns_requested) {
     PmfeModuleRange modmap[512];
     int nmod = 0;
     (void)pmfe_module_map_build(proc, modmap, 512, &nmod);
@@ -1440,8 +1477,12 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
                            nmod);
     }
   }
+  if (result) {
+    snprintf(result->dns_status, sizeof(result->dns_status), "%s",
+             dns_requested ? "completed" : "disabled");
+  }
 
-  if (dns_path && !(dns_dis && dns_dis[0] == '1')) {
+  if (dns_requested) {
     snprintf(extra, extra_cap,
              "vad_peek=%d mz_hits=%d ent_max=%.2f ave_probes=%d ave_max_score=%.3f full_vad=%d | "
              "dns_ascii_hits=%u dns_utf16_hits=%u dns_wire_hits=%u dns_best=%.2f dns_sample=%.80s dns_owner=%.80s",
@@ -1970,6 +2011,10 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
 #elif defined(__linux__)
   int rc = pmfe_scan_linux(task, detail, detail_cap);
   if (result) {
+    snprintf(result->yara_status, sizeof(result->yara_status), "%s", "unsupported");
+    snprintf(result->ave_status, sizeof(result->ave_status), "%s", "unsupported");
+    snprintf(result->dns_status, sizeof(result->dns_status), "%s",
+             task->dns_path != 0u ? "completed" : "disabled");
     result->regions_total = pmfe_detail_u(detail, "regions=");
     result->regions_read = pmfe_detail_u(detail, "maps_peek=");
     result->read_failures = pmfe_detail_u(detail, "vm_read_failures=");
@@ -1981,6 +2026,11 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
   }
   return rc;
 #else
+  if (result) {
+    snprintf(result->yara_status, sizeof(result->yara_status), "%s", "unsupported");
+    snprintf(result->ave_status, sizeof(result->ave_status), "%s", "unsupported");
+    snprintf(result->dns_status, sizeof(result->dns_status), "%s", "unsupported");
+  }
   return pmfe_scan_stub(task->pid, detail, detail_cap);
 #endif
 }

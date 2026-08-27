@@ -5709,6 +5709,9 @@ static char *pmfe_completion_result_json(PmfeCompletion *completion) {
   cJSON_AddStringToObject(signals, "dns_sample", r->dns_sample);
   cJSON_AddStringToObject(signals, "dns_owner", r->dns_owner);
   cJSON_AddNumberToObject(signals, "ave_max_score", r->ave_max_score);
+  cJSON_AddStringToObject(signals, "yara_status", r->yara_status);
+  cJSON_AddStringToObject(signals, "ave_status", r->ave_status);
+  cJSON_AddStringToObject(signals, "dns_status", r->dns_status);
   cJSON_AddNumberToObject(signals, "entropy_max", r->entropy_max);
   cJSON_AddNumberToObject(signals, "regions_scanned", r->regions_total);
   cJSON_AddNumberToObject(signals, "private_exec", r->private_exec);

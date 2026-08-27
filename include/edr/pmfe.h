@@ -116,6 +116,9 @@ typedef struct EdrPmfeScanResult {
   uint32_t dns_hits;
   float entropy_max;
   float ave_max_score;
+  char yara_status[24];
+  char ave_status[24];
+  char dns_status[24];
   float dns_best;
   char dns_sample[200];
   char dns_owner[200];
