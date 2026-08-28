@@ -295,9 +295,13 @@ int main(void) {
   ok &= require_contains(headless_uninstaller,
                          "!thumbprint || !thumbprint[0] ||",
                          "remote uninstall must still require a certificate thumbprint");
+  ok &= require_contains(headless_uninstaller, "CreateNamedPipeW(",
+                         "coordinator must keep the finalizer token in a protected memory channel");
+  ok &= require_contains(headless_uninstaller, "edr_native_register_finalizer_task(",
+                         "finalizer must start outside the Agent scheduled-task job");
   ok &= require_contains(headless_uninstaller,
-                         "result = (int)finalizer_exit;",
-                         "coordinator must return the finalizer preflight error instead of generic code 31");
+                         "edr_native_delete_finalizer_task(finalizer_task_name)",
+                         "one-shot finalizer task registration must be removed before teardown");
   ok &= require_contains(headless_uninstaller,
                          "error != ERROR_LOCK_VIOLATION",
                          "native uninstall must retry transient file lock errors");
@@ -325,7 +329,7 @@ int main(void) {
   ok &= require_contains(headless_uninstaller, "RegDeleteKeyExW(HKEY_LOCAL_MACHINE, subkey, KEY_WOW64_64KEY",
                          "native uninstall must remove only the 64-bit installer registration view");
   ok &= require_contains(headless_uninstaller,
-                         "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}_is1",
+                         "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1",
                          "native uninstall must remove the exact Inno AppId registration");
   ok &= require_contains(headless_uninstaller, "CSIDL_COMMON_PROGRAMS",
                          "native uninstall must resolve the shared Programs folder through Shell APIs");

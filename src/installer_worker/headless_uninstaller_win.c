@@ -28,11 +28,10 @@
 #include "cJSON.h"
 #include "edr/windows_native_manifest.h"
 #include "edr/windows_handoff.h"
-#include "edr/windows_spawn.h"
-#include "edr/windows_spawn_lock.h"
 
 #define EDR_UNINSTALL_TITLE L"FDSecurity Agent Uninstaller"
 #define EDR_FINALIZER_IO_TIMEOUT_MS 5000u
+#define EDR_FINALIZER_TASK_PREFIX L"FDSecurityAgentUninstall-"
 #ifndef EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS
 #define EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS 5000u
 #endif
@@ -43,6 +42,9 @@ static const char *HEADLESS_UNINSTALLER_CAPABILITIES =
     "\"component\":\"headless-uninstaller\","
     "\"uninstall_attestation\":\"v3\","
     "\"native_in_memory_token_handoff\":true}";
+static const wchar_t EDR_INNO_UNINSTALL_REGISTRY_KEY[] =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+    L"{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1";
 
 static int join_path(wchar_t *out, size_t out_count, const wchar_t *dir, const wchar_t *name);
 static DWORD child_creation_flags(DWORD base_flags);
@@ -59,11 +61,14 @@ static int edr_native_crack_attestation_url(const wchar_t *url,
                                             wchar_t *host, DWORD host_count,
                                             wchar_t *path, DWORD path_count);
 static int edr_native_valid_bearer_token(const BYTE *token, DWORD token_length);
+static int edr_native_safe_identifier(const wchar_t *value);
 
-typedef struct EdrFinalizerHandoff {
-  HANDLE secret_write;
-  HANDLE ack_read;
-} EdrFinalizerHandoff;
+typedef struct EdrFinalizerErrorFrame {
+  DWORD magic;
+  DWORD error;
+} EdrFinalizerErrorFrame;
+
+#define EDR_FINALIZER_ERROR_MAGIC 0x31525245u
 
 /* A local uninstall has no bearer token.  It still uses a non-empty framed
  * value so the shared handoff protocol never treats an empty frame as valid.
@@ -138,6 +143,88 @@ static int edr_finalizer_unique_name(wchar_t *out, size_t cap, const wchar_t *di
   int written = _snwprintf(out, cap, L"%ls\\uninstall-finalizer-%ls.exe", directory, text);
   RpcStringFreeW(&text);
   return written >= 0 && (size_t)written < cap;
+}
+
+static int edr_finalizer_unique_channel(wchar_t *pipe_name, size_t pipe_cap,
+                                        wchar_t *task_name, size_t task_cap) {
+  UUID uuid;
+  RPC_WSTR text = NULL;
+  RPC_STATUS uuid_status = UuidCreate(&uuid);
+  int pipe_written;
+  int task_written;
+  if (!pipe_name || !pipe_cap || !task_name || !task_cap ||
+      (uuid_status != RPC_S_OK && uuid_status != RPC_S_UUID_LOCAL_ONLY) ||
+      UuidToStringW(&uuid, &text) != RPC_S_OK || !text) {
+    return 0;
+  }
+  pipe_written = _snwprintf(pipe_name, pipe_cap,
+                            L"\\\\.\\pipe\\%ls%ls", EDR_FINALIZER_TASK_PREFIX, text);
+  task_written = _snwprintf(task_name, task_cap,
+                            L"%ls%ls", EDR_FINALIZER_TASK_PREFIX, text);
+  RpcStringFreeW(&text);
+  return pipe_written >= 0 && (size_t)pipe_written < pipe_cap &&
+         task_written >= 0 && (size_t)task_written < task_cap;
+}
+
+typedef struct EdrFinalizerPipeConnect {
+  HANDLE pipe;
+} EdrFinalizerPipeConnect;
+
+static DWORD WINAPI edr_finalizer_connect_pipe_thread(LPVOID context) {
+  EdrFinalizerPipeConnect *connect = (EdrFinalizerPipeConnect *)context;
+  DWORD error;
+  if (ConnectNamedPipe(connect->pipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
+    error = ERROR_SUCCESS;
+  } else {
+    error = edr_finalizer_last_error();
+  }
+  HeapFree(GetProcessHeap(), 0, connect);
+  return error;
+}
+
+static int edr_finalizer_wait_for_pipe(HANDLE pipe) {
+  EdrFinalizerPipeConnect *connect;
+  HANDLE thread;
+  DWORD wait_result;
+  DWORD error = ERROR_GEN_FAILURE;
+  if (!pipe || pipe == INVALID_HANDLE_VALUE) return 0;
+  connect = (EdrFinalizerPipeConnect *)HeapAlloc(
+      GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*connect));
+  if (!connect) return 0;
+  connect->pipe = pipe;
+  thread = CreateThread(NULL, 0, edr_finalizer_connect_pipe_thread, connect, 0, NULL);
+  if (!thread) {
+    HeapFree(GetProcessHeap(), 0, connect);
+    return 0;
+  }
+  wait_result = WaitForSingleObject(thread, EDR_FINALIZER_IO_TIMEOUT_MS);
+  if (wait_result == WAIT_TIMEOUT) {
+    (void)CancelSynchronousIo(thread);
+    wait_result = WaitForSingleObject(thread, EDR_FINALIZER_IO_TIMEOUT_MS);
+    error = ERROR_TIMEOUT;
+  } else if (wait_result != WAIT_OBJECT_0) {
+    error = edr_finalizer_last_error();
+  } else {
+    (void)GetExitCodeThread(thread, &error);
+  }
+  CloseHandle(thread);
+  SetLastError(error);
+  return wait_result == WAIT_OBJECT_0 && error == ERROR_SUCCESS;
+}
+
+static HANDLE edr_finalizer_open_pipe(const wchar_t *pipe_name) {
+  HANDLE pipe;
+  size_t prefix_length = wcslen(L"\\\\.\\pipe\\" EDR_FINALIZER_TASK_PREFIX);
+  if (!pipe_name || wcslen(pipe_name) <= prefix_length || wcslen(pipe_name) > 255 ||
+      wcsncmp(pipe_name, L"\\\\.\\pipe\\" EDR_FINALIZER_TASK_PREFIX,
+              prefix_length) != 0 ||
+      !edr_native_safe_identifier(pipe_name + prefix_length) ||
+      !WaitNamedPipeW(pipe_name, EDR_FINALIZER_IO_TIMEOUT_MS)) {
+    return INVALID_HANDLE_VALUE;
+  }
+  pipe = CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                     SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, NULL);
+  return pipe;
 }
 
 static int edr_finalizer_sha256_handle(HANDLE file, BYTE digest[32]) {
@@ -253,28 +340,45 @@ cleanup:
   return ok;
 }
 
-static int edr_finalizer_exchange_ready(EdrFinalizerHandoff *handoff,
-                                        const BYTE *secret, DWORD secret_length) {
+static int edr_finalizer_exchange_ready(HANDLE pipe,
+                                        const BYTE *secret, DWORD secret_length,
+                                        DWORD *error_out) {
   BYTE acknowledgement[EDR_WINDOWS_HANDOFF_MAX_FRAME];
   DWORD acknowledgement_length = 0;
   static const BYTE ready[] = "edr.finalizer.ready.v1";
-  if (!handoff || handoff->secret_write == INVALID_HANDLE_VALUE ||
-      handoff->ack_read == INVALID_HANDLE_VALUE || secret_length > EDR_WINDOWS_HANDOFF_MAX_FRAME ||
-      !edr_windows_handoff_write_frame(handoff->secret_write, secret, secret_length)) {
+  static const BYTE commit[] = "edr.finalizer.commit.v1";
+  static const BYTE committed[] = "edr.finalizer.committed.v1";
+  if (error_out) *error_out = ERROR_BROKEN_PIPE;
+  if (pipe == INVALID_HANDLE_VALUE ||
+      secret_length > EDR_WINDOWS_HANDOFF_MAX_FRAME ||
+      !edr_windows_handoff_write_frame(pipe, secret, secret_length)) {
+    if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
     return 0;
   }
-  CloseHandle(handoff->secret_write);
-  handoff->secret_write = INVALID_HANDLE_VALUE;
-  if (!edr_windows_handoff_read_frame(handoff->ack_read, acknowledgement,
+  if (!edr_windows_handoff_read_frame(pipe, acknowledgement,
                                       sizeof(acknowledgement), &acknowledgement_length)) {
-    CloseHandle(handoff->ack_read);
-    handoff->ack_read = INVALID_HANDLE_VALUE;
+    CloseHandle(pipe);
     return 0;
   }
-  CloseHandle(handoff->ack_read);
-  handoff->ack_read = INVALID_HANDLE_VALUE;
+  if (acknowledgement_length == sizeof(EdrFinalizerErrorFrame)) {
+    EdrFinalizerErrorFrame error_frame;
+    memcpy(&error_frame, acknowledgement, sizeof(error_frame));
+    if (error_frame.magic == EDR_FINALIZER_ERROR_MAGIC && error_frame.error) {
+      if (error_out) *error_out = error_frame.error;
+      CloseHandle(pipe);
+      SecureZeroMemory(acknowledgement, sizeof(acknowledgement));
+      return 0;
+    }
+  }
   int ok = acknowledgement_length == sizeof(ready) - 1 &&
-           memcmp(acknowledgement, ready, sizeof(ready) - 1) == 0;
+           memcmp(acknowledgement, ready, sizeof(ready) - 1) == 0 &&
+           edr_windows_handoff_write_frame(pipe, commit, sizeof(commit) - 1) &&
+           edr_windows_handoff_read_frame(pipe, acknowledgement,
+                                          sizeof(acknowledgement),
+                                          &acknowledgement_length) &&
+           acknowledgement_length == sizeof(committed) - 1 &&
+           memcmp(acknowledgement, committed, sizeof(committed) - 1) == 0;
+  CloseHandle(pipe);
   SecureZeroMemory(acknowledgement, sizeof(acknowledgement));
   return ok;
 }
@@ -862,9 +966,8 @@ cleanup:
   }
 }
 
-static int edr_native_delete_tasks(void) {
-  static const wchar_t *task_names[] = {
-      L"FDSecurityAgent", L"EdrAgent", L"FDSecurityAgentUninstall"};
+static int edr_native_delete_task_names(const wchar_t *const *task_names,
+                                        size_t task_count) {
   ITaskService *task_service = NULL;
   ITaskFolder *root_folder = NULL;
   VARIANT empty;
@@ -888,7 +991,7 @@ static int edr_native_delete_tasks(void) {
     ok = 0;
     goto cleanup;
   }
-  for (index = 0; index < sizeof(task_names) / sizeof(task_names[0]); ++index) {
+  for (index = 0; index < task_count; ++index) {
     BSTR name = SysAllocString(task_names[index]);
     if (!name) {
       ok = 0;
@@ -904,6 +1007,143 @@ cleanup:
   if (task_service) ITaskService_Release(task_service);
   VariantClear(&empty);
   if (SUCCEEDED(init_hr)) CoUninitialize();
+  return ok;
+}
+
+static int edr_native_delete_tasks(void) {
+  static const wchar_t *task_names[] = {
+      L"FDSecurityAgent", L"EdrAgent", L"FDSecurityAgentUninstall"};
+  return edr_native_delete_task_names(
+      task_names, sizeof(task_names) / sizeof(task_names[0]));
+}
+
+static int edr_native_delete_finalizer_task(const wchar_t *task_name) {
+  const wchar_t *task_names[1];
+  if (!task_name || wcsncmp(task_name, EDR_FINALIZER_TASK_PREFIX,
+                            wcslen(EDR_FINALIZER_TASK_PREFIX)) != 0) {
+    return 0;
+  }
+  task_names[0] = task_name;
+  return edr_native_delete_task_names(task_names, 1);
+}
+
+/* The Agent itself may run in a non-breakaway Task Scheduler Job. Registering
+   the finalizer as a one-shot SYSTEM task gives it an independent Job owner;
+   the task definition is deleted after the pipe connects, without stopping
+   the already-running process. No bearer token enters the task definition. */
+static int edr_native_register_finalizer_task(const wchar_t *task_name,
+                                              const wchar_t *executable,
+                                              const wchar_t *arguments,
+                                              const wchar_t *working_directory) {
+  ITaskService *task_service = NULL;
+  ITaskFolder *root_folder = NULL;
+  ITaskDefinition *definition = NULL;
+  IPrincipal *principal = NULL;
+  ITaskSettings *settings = NULL;
+  ITriggerCollection *triggers = NULL;
+  ITrigger *trigger = NULL;
+  IActionCollection *actions = NULL;
+  IAction *action = NULL;
+  IExecAction *exec = NULL;
+  IRegisteredTask *registered = NULL;
+  VARIANT empty;
+  VARIANT user;
+  BSTR root_name = NULL;
+  BSTR name = NULL;
+  BSTR system_user = NULL;
+  BSTR path = NULL;
+  BSTR action_arguments = NULL;
+  BSTR action_workdir = NULL;
+  BSTR execution_limit = NULL;
+  HRESULT hr;
+  HRESULT init_hr;
+  DWORD error = ERROR_GEN_FAILURE;
+  int ok = 0;
+
+  if (!task_name || wcsncmp(task_name, EDR_FINALIZER_TASK_PREFIX,
+                             wcslen(EDR_FINALIZER_TASK_PREFIX)) != 0 ||
+      !executable || !executable[0] || !arguments || !working_directory) {
+    return 0;
+  }
+  init_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
+    SetLastError(HRESULT_CODE(init_hr) ? HRESULT_CODE(init_hr) : ERROR_GEN_FAILURE);
+    return 0;
+  }
+  VariantInit(&empty);
+  VariantInit(&user);
+  root_name = SysAllocString(L"\\");
+  name = SysAllocString(task_name);
+  system_user = SysAllocString(L"SYSTEM");
+  path = SysAllocString(executable);
+  action_arguments = SysAllocString(arguments);
+  action_workdir = SysAllocString(working_directory);
+  execution_limit = SysAllocString(L"PT10M");
+  if (!root_name || !name || !system_user || !path || !action_arguments ||
+      !action_workdir || !execution_limit) {
+    error = ERROR_NOT_ENOUGH_MEMORY;
+    goto cleanup;
+  }
+  V_VT(&user) = VT_BSTR;
+  V_BSTR(&user) = SysAllocString(L"SYSTEM");
+  if (!V_BSTR(&user)) {
+    error = ERROR_NOT_ENOUGH_MEMORY;
+    goto cleanup;
+  }
+  hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
+                        &IID_ITaskService, (void **)&task_service);
+  if (FAILED(hr) ||
+      FAILED(hr = ITaskService_Connect(task_service, empty, empty, empty, empty)) ||
+      FAILED(hr = ITaskService_GetFolder(task_service, root_name, &root_folder)) ||
+      FAILED(hr = ITaskService_NewTask(task_service, 0, &definition)) ||
+      FAILED(hr = ITaskDefinition_get_Principal(definition, &principal)) ||
+      FAILED(hr = IPrincipal_put_UserId(principal, system_user)) ||
+      FAILED(hr = IPrincipal_put_LogonType(principal, TASK_LOGON_SERVICE_ACCOUNT)) ||
+      FAILED(hr = IPrincipal_put_RunLevel(principal, TASK_RUNLEVEL_HIGHEST)) ||
+      FAILED(hr = ITaskDefinition_get_Settings(definition, &settings)) ||
+      FAILED(hr = ITaskSettings_put_StartWhenAvailable(settings, VARIANT_TRUE)) ||
+      FAILED(hr = ITaskSettings_put_DisallowStartIfOnBatteries(settings, VARIANT_FALSE)) ||
+      FAILED(hr = ITaskSettings_put_StopIfGoingOnBatteries(settings, VARIANT_FALSE)) ||
+      FAILED(hr = ITaskSettings_put_ExecutionTimeLimit(settings, execution_limit)) ||
+      FAILED(hr = ITaskDefinition_get_Triggers(definition, &triggers)) ||
+      FAILED(hr = ITriggerCollection_Create(triggers, TASK_TRIGGER_REGISTRATION, &trigger)) ||
+      FAILED(hr = ITaskDefinition_get_Actions(definition, &actions)) ||
+      FAILED(hr = IActionCollection_Create(actions, TASK_ACTION_EXEC, &action)) ||
+      FAILED(hr = IAction_QueryInterface(action, &IID_IExecAction, (void **)&exec)) ||
+      FAILED(hr = IExecAction_put_Path(exec, path)) ||
+      FAILED(hr = IExecAction_put_Arguments(exec, action_arguments)) ||
+      FAILED(hr = IExecAction_put_WorkingDirectory(exec, action_workdir)) ||
+      FAILED(hr = ITaskFolder_RegisterTaskDefinition(
+          root_folder, name, definition, TASK_CREATE, user, empty,
+          TASK_LOGON_SERVICE_ACCOUNT, empty, &registered))) {
+    error = HRESULT_CODE(hr) ? HRESULT_CODE(hr) : ERROR_GEN_FAILURE;
+    goto cleanup;
+  }
+  ok = 1;
+
+cleanup:
+  if (registered) IRegisteredTask_Release(registered);
+  if (exec) IExecAction_Release(exec);
+  if (action) IAction_Release(action);
+  if (actions) IActionCollection_Release(actions);
+  if (trigger) ITrigger_Release(trigger);
+  if (triggers) ITriggerCollection_Release(triggers);
+  if (settings) ITaskSettings_Release(settings);
+  if (principal) IPrincipal_Release(principal);
+  if (definition) ITaskDefinition_Release(definition);
+  if (root_folder) ITaskFolder_Release(root_folder);
+  if (task_service) ITaskService_Release(task_service);
+  if (root_name) SysFreeString(root_name);
+  if (name) SysFreeString(name);
+  if (system_user) SysFreeString(system_user);
+  if (path) SysFreeString(path);
+  if (action_arguments) SysFreeString(action_arguments);
+  if (action_workdir) SysFreeString(action_workdir);
+  if (execution_limit) SysFreeString(execution_limit);
+  VariantClear(&user);
+  VariantClear(&empty);
+  if (SUCCEEDED(init_hr)) CoUninitialize();
+  if (!ok) SetLastError(error);
   return ok;
 }
 
@@ -1456,10 +1696,75 @@ static void edr_native_clear_failure_receipt(const wchar_t *self_path) {
   }
 }
 
-static int edr_native_certificate_identity_action(const wchar_t *thumbprint,
+static int edr_native_certificate_matches_endpoint(PCCERT_CONTEXT certificate,
+                                                   const wchar_t *endpoint_id) {
+  wchar_t friendly_name[256];
+  DWORD name_length;
+  if (!certificate || !endpoint_id || !endpoint_id[0]) return 0;
+  name_length = CertGetNameStringW(
+      certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, friendly_name,
+      (DWORD)(sizeof(friendly_name) / sizeof(friendly_name[0])));
+  return name_length && _wcsicmp(friendly_name, endpoint_id) == 0;
+}
+
+static int edr_native_delete_certificate(PCCERT_CONTEXT certificate) {
+  HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key = 0;
+  DWORD key_spec = 0;
+  BOOL must_free = FALSE;
+  if (!certificate) return 0;
+  if (CryptAcquireCertificatePrivateKey(certificate,
+                                        CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG |
+                                            CRYPT_ACQUIRE_SILENT_FLAG,
+                                        NULL, &key, &key_spec, &must_free)) {
+    if (NCryptDeleteKey((NCRYPT_KEY_HANDLE)key, 0) != ERROR_SUCCESS) {
+      if (must_free) NCryptFreeObject((NCRYPT_HANDLE)key);
+      CertFreeCertificateContext(certificate);
+      return 0;
+    }
+    must_free = FALSE;
+  } else {
+    DWORD property_size = 0;
+    if (!CertGetCertificateContextProperty(certificate, CERT_KEY_PROV_INFO_PROP_ID,
+                                           NULL, &property_size)) {
+      if (GetLastError() != (DWORD)CRYPT_E_NOT_FOUND) {
+        CertFreeCertificateContext(certificate);
+        return 0;
+      }
+    } else {
+      PCRYPT_KEY_PROV_INFO property =
+          (PCRYPT_KEY_PROV_INFO)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                          property_size);
+      HCRYPTPROV provider = 0;
+      if (!property ||
+          !CertGetCertificateContextProperty(certificate, CERT_KEY_PROV_INFO_PROP_ID,
+                                             property, &property_size)) {
+        if (property) HeapFree(GetProcessHeap(), 0, property);
+        CertFreeCertificateContext(certificate);
+        return 0;
+      }
+      if (!CryptAcquireContextW(&provider, property->pwszContainerName,
+                                property->pwszProvName, property->dwProvType,
+                                property->dwFlags | CRYPT_DELETEKEYSET)) {
+        DWORD delete_error = GetLastError();
+        if (delete_error != (DWORD)NTE_BAD_KEYSET &&
+            delete_error != (DWORD)NTE_KEYSET_NOT_DEF &&
+            delete_error != ERROR_FILE_NOT_FOUND) {
+          HeapFree(GetProcessHeap(), 0, property);
+          CertFreeCertificateContext(certificate);
+          return 0;
+        }
+      }
+      if (provider) CryptReleaseContext(provider, 0);
+      HeapFree(GetProcessHeap(), 0, property);
+    }
+  }
+  if (must_free) NCryptFreeObject((NCRYPT_HANDLE)key);
+  return CertDeleteCertificateFromStore(certificate) ? 1 : 0;
+}
+
+static int edr_native_verify_certificate_identity(const wchar_t *thumbprint,
                                                   const wchar_t *endpoint_id,
-                                                  const wchar_t *store_name,
-                                                  int remove_certificate) {
+                                                  const wchar_t *store_name) {
   BYTE hash[32];
   DWORD hash_length;
   size_t text_length;
@@ -1516,14 +1821,8 @@ static int edr_native_certificate_identity_action(const wchar_t *thumbprint,
     ok = 0;
     goto cleanup;
   }
+  if (!edr_native_certificate_matches_endpoint(certificate, endpoint_id)) goto cleanup;
   {
-    wchar_t friendly_name[256];
-    DWORD name_length = CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                                           0, NULL, friendly_name,
-                                           (DWORD)(sizeof(friendly_name) / sizeof(friendly_name[0])));
-    if (!name_length || _wcsicmp(friendly_name, endpoint_id) != 0) goto cleanup;
-  }
-  if (!remove_certificate) {
     HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key = 0;
     DWORD key_spec = 0;
     BOOL must_free = FALSE;
@@ -1534,8 +1833,7 @@ static int edr_native_certificate_identity_action(const wchar_t *thumbprint,
       if (must_free) NCryptFreeObject((NCRYPT_HANDLE)key);
       ok = 1;
       goto cleanup;
-    }
-    {
+    } else {
       DWORD property_size = 0;
       PCRYPT_KEY_PROV_INFO property = NULL;
       HCRYPTPROV provider = 0;
@@ -1560,46 +1858,6 @@ static int edr_native_certificate_identity_action(const wchar_t *thumbprint,
       goto cleanup;
     }
   }
-  {
-    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key = 0;
-    DWORD key_spec = 0;
-    BOOL must_free = FALSE;
-    if (CryptAcquireCertificatePrivateKey(certificate,
-                                          CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG |
-                                              CRYPT_ACQUIRE_SILENT_FLAG,
-                                          NULL, &key, &key_spec, &must_free)) {
-      if (NCryptDeleteKey((NCRYPT_KEY_HANDLE)key, 0) != ERROR_SUCCESS) {
-        if (must_free) NCryptFreeObject((NCRYPT_HANDLE)key);
-        goto cleanup;
-      }
-      must_free = FALSE;
-    } else {
-      DWORD property_size = 0;
-      if (!CertGetCertificateContextProperty(certificate, CERT_KEY_PROV_INFO_PROP_ID,
-                                             NULL, &property_size)) {
-        if (GetLastError() != (DWORD)CRYPT_E_NOT_FOUND) goto cleanup;
-      } else {
-        PCRYPT_KEY_PROV_INFO property =
-            (PCRYPT_KEY_PROV_INFO)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                            property_size);
-        HCRYPTPROV provider = 0;
-        if (!property ||
-            !CertGetCertificateContextProperty(certificate, CERT_KEY_PROV_INFO_PROP_ID,
-                                               property, &property_size) ||
-            !CryptAcquireContextW(&provider, property->pwszContainerName,
-                                  property->pwszProvName, property->dwProvType,
-                                  property->dwFlags | CRYPT_DELETEKEYSET)) {
-          if (property) HeapFree(GetProcessHeap(), 0, property);
-          goto cleanup;
-        }
-        if (provider) CryptReleaseContext(provider, 0);
-        HeapFree(GetProcessHeap(), 0, property);
-      }
-    }
-    if (must_free) NCryptFreeObject((NCRYPT_HANDLE)key);
-  }
-  ok = CertDeleteCertificateFromStore(certificate) ? 1 : 0;
-  certificate = NULL;
 cleanup:
   if (certificate) CertFreeCertificateContext(certificate);
   if (store) CertCloseStore(store, 0);
@@ -1610,13 +1868,49 @@ cleanup:
 static int edr_native_preflight_certificate_identity(const wchar_t *thumbprint,
                                                      const wchar_t *endpoint_id,
                                                      const wchar_t *store_name) {
-  return edr_native_certificate_identity_action(thumbprint, endpoint_id, store_name, 0);
+  return edr_native_verify_certificate_identity(thumbprint, endpoint_id, store_name);
 }
 
 static int edr_native_remove_certificate_identity(const wchar_t *thumbprint,
                                                   const wchar_t *endpoint_id,
                                                   const wchar_t *store_name) {
-  return edr_native_certificate_identity_action(thumbprint, endpoint_id, store_name, 1);
+  HCERTSTORE store = NULL;
+  PCCERT_CONTEXT certificate = NULL;
+  DWORD store_location;
+  int removed = 0;
+  if (edr_native_verify_certificate_identity(thumbprint, endpoint_id, store_name) !=
+      ERROR_SUCCESS) {
+    return ERROR_ACCESS_DENIED;
+  }
+  store_location = _wcsicmp(store_name, L"CurrentUser\\My") == 0
+                       ? CERT_SYSTEM_STORE_CURRENT_USER
+                       : CERT_SYSTEM_STORE_LOCAL_MACHINE;
+  store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, (HCRYPTPROV_LEGACY)0,
+                        store_location, L"My");
+  if (!store) return (int)GetLastError();
+  for (;;) {
+    PCCERT_CONTEXT matched = NULL;
+    while ((certificate = CertEnumCertificatesInStore(store, certificate)) != NULL) {
+      if (edr_native_certificate_matches_endpoint(certificate, endpoint_id)) {
+        matched = CertDuplicateCertificateContext(certificate);
+        CertFreeCertificateContext(certificate);
+        certificate = NULL;
+        if (!matched) {
+          CertCloseStore(store, 0);
+          return ERROR_NOT_ENOUGH_MEMORY;
+        }
+        break;
+      }
+    }
+    if (!matched) break;
+    if (!edr_native_delete_certificate(matched)) {
+      CertCloseStore(store, 0);
+      return ERROR_ACCESS_DENIED;
+    }
+    ++removed;
+  }
+  CertCloseStore(store, 0);
+  return removed ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
 }
 
 static int edr_native_remove_registry_tree_64(const wchar_t *subkey) {
@@ -1678,7 +1972,7 @@ static int edr_native_remove_registration(void) {
   size_t index;
   static const wchar_t *uninstall_keys[] = {
       L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FDSecurityAgentHeadless",
-      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}_is1"};
+      EDR_INNO_UNINSTALL_REGISTRY_KEY};
 
   status = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                          L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
@@ -1708,11 +2002,9 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   const wchar_t *task_id = arg_value(argc, argv, L"--task-id");
   const wchar_t *endpoint_id = arg_value(argc, argv, L"--endpoint-id");
   const wchar_t *thumbprint = arg_value(argc, argv, L"--cert-thumbprint");
-  const wchar_t *secret_text = arg_value(argc, argv, L"--secret-handle");
-  const wchar_t *ack_text = arg_value(argc, argv, L"--ack-handle");
+  const wchar_t *handoff_pipe_name = arg_value(argc, argv, L"--handoff-pipe");
   const wchar_t *parent_text = arg_value(argc, argv, L"--parent-pid");
-  HANDLE secret_read = INVALID_HANDLE_VALUE;
-  HANDLE acknowledgement = INVALID_HANDLE_VALUE;
+  HANDLE handoff_pipe = INVALID_HANDLE_VALUE;
   BYTE token[EDR_WINDOWS_HANDOFF_MAX_FRAME];
   DWORD token_length = 0;
   wchar_t self_path[MAX_PATH_LONG];
@@ -1733,15 +2025,19 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   HANDLE parent_handle = NULL;
   wchar_t *failure_path = NULL;
   static const BYTE ready[] = "edr.finalizer.ready.v1";
+  static const BYTE commit[] = "edr.finalizer.commit.v1";
+  static const BYTE committed[] = "edr.finalizer.committed.v1";
+  BYTE commit_frame[EDR_WINDOWS_HANDOFF_MAX_FRAME];
+  DWORD commit_length = 0;
 
   ZeroMemory(token, sizeof(token));
+  ZeroMemory(commit_frame, sizeof(commit_frame));
   self_path[0] = L'\0';
   certificate_store[0] = L'\0';
   if (!install_dir || !install_dir[0] || !service_name || !service_name[0] ||
-      !edr_finalizer_parse_handle(secret_text, &secret_read) ||
-      !edr_finalizer_parse_handle(ack_text, &acknowledgement) ||
+      (handoff_pipe = edr_finalizer_open_pipe(handoff_pipe_name)) == INVALID_HANDLE_VALUE ||
       edr_native_validate_install_root(install_dir) != ERROR_SUCCESS ||
-      !edr_windows_handoff_read_frame(secret_read, token, sizeof(token), &token_length)) {
+      !edr_windows_handoff_read_frame(handoff_pipe, token, sizeof(token), &token_length)) {
       goto cleanup;
   }
   local_handoff = edr_native_is_local_handoff_marker(token, token_length);
@@ -1798,11 +2094,17 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     result = (int)edr_finalizer_last_error();
     goto cleanup;
   }
-  CloseHandle(secret_read);
-  secret_read = INVALID_HANDLE_VALUE;
-  if (!edr_windows_handoff_write_frame(acknowledgement, ready, sizeof(ready) - 1)) goto cleanup;
-  CloseHandle(acknowledgement);
-  acknowledgement = INVALID_HANDLE_VALUE;
+  if (!edr_windows_handoff_write_frame(handoff_pipe, ready, sizeof(ready) - 1) ||
+      !edr_windows_handoff_read_frame(handoff_pipe, commit_frame,
+                                      sizeof(commit_frame), &commit_length) ||
+      commit_length != sizeof(commit) - 1 ||
+      memcmp(commit_frame, commit, sizeof(commit) - 1) != 0 ||
+      !edr_windows_handoff_write_frame(handoff_pipe, committed,
+                                       sizeof(committed) - 1)) {
+    goto cleanup;
+  }
+  CloseHandle(handoff_pipe);
+  handoff_pipe = INVALID_HANDLE_VALUE;
   handoff_acknowledged = 1;
   /* The remote Agent owns command-result delivery and normally remains alive
      until SCM stops it below.  Treat this bounded wait as a delivery window,
@@ -1901,6 +2203,14 @@ recovery:
     edr_native_restore_service_and_start(service_name);
   }
 cleanup:
+  if (!handoff_acknowledged && handoff_pipe != INVALID_HANDLE_VALUE) {
+    EdrFinalizerErrorFrame error_frame;
+    error_frame.magic = EDR_FINALIZER_ERROR_MAGIC;
+    error_frame.error = result ? (DWORD)result : ERROR_GEN_FAILURE;
+    (void)edr_windows_handoff_write_frame(
+        handoff_pipe, (const BYTE *)&error_frame, sizeof(error_frame));
+    SecureZeroMemory(&error_frame, sizeof(error_frame));
+  }
   if (handoff_acknowledged) {
     self_length = GetModuleFileNameW(NULL, self_path,
                                      (DWORD)(sizeof(self_path) / sizeof(self_path[0])));
@@ -1911,54 +2221,48 @@ cleanup:
       if (!self_delete_attempted) (void)edr_finalizer_schedule_self_delete(self_path);
     }
   }
-  if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
-  if (acknowledgement != INVALID_HANDLE_VALUE) CloseHandle(acknowledgement);
+  if (handoff_pipe != INVALID_HANDLE_VALUE) CloseHandle(handoff_pipe);
   if (parent_handle) CloseHandle(parent_handle);
   if (failure_path) HeapFree(GetProcessHeap(), 0, failure_path);
+  SecureZeroMemory(commit_frame, sizeof(commit_frame));
   SecureZeroMemory(token, sizeof(token));
   return result;
 }
 
-static int edr_native_build_finalizer_command(wchar_t *command, size_t command_count,
-                                              const wchar_t *target,
-                                              const wchar_t *install_dir,
-                                              const wchar_t *service_name,
-                                              const wchar_t *attestation_url,
-                                              const wchar_t *task_id,
-                                              const wchar_t *endpoint_id,
-                                              const wchar_t *thumbprint,
-                                              HANDLE secret_read, HANDLE ack_write,
-                                              DWORD parent_pid) {
+static int edr_native_build_finalizer_arguments(wchar_t *arguments,
+                                                size_t argument_count,
+                                                const wchar_t *install_dir,
+                                                const wchar_t *service_name,
+                                                const wchar_t *attestation_url,
+                                                const wchar_t *task_id,
+                                                const wchar_t *endpoint_id,
+                                                const wchar_t *thumbprint,
+                                                const wchar_t *handoff_pipe,
+                                                DWORD parent_pid) {
   size_t used = 0;
-  wchar_t handle_text[64];
-  if (!append_quoted_arg(command, command_count, &used, target) ||
-      !append_text(command, command_count, &used, L" --native-finalizer --install-dir ") ||
-      !append_quoted_arg(command, command_count, &used, install_dir) ||
-      !append_text(command, command_count, &used, L" --service-name ") ||
-      !append_quoted_arg(command, command_count, &used, service_name) ||
-      !append_text(command, command_count, &used, L" --task-id ") ||
-      !append_quoted_arg(command, command_count, &used, task_id ? task_id : L"") ||
-      !append_text(command, command_count, &used, L" --endpoint-id ") ||
-      !append_quoted_arg(command, command_count, &used, endpoint_id ? endpoint_id : L"") ||
-      !append_text(command, command_count, &used, L" --attestation-url ") ||
-      !append_quoted_arg(command, command_count, &used, attestation_url ? attestation_url : L"") ||
-      !append_text(command, command_count, &used, L" --secret-handle ")) {
+  wchar_t pid_text[64];
+  if (!append_text(arguments, argument_count, &used, L"--native-finalizer --install-dir ") ||
+      !append_quoted_arg(arguments, argument_count, &used, install_dir) ||
+      !append_text(arguments, argument_count, &used, L" --service-name ") ||
+      !append_quoted_arg(arguments, argument_count, &used, service_name) ||
+      !append_text(arguments, argument_count, &used, L" --task-id ") ||
+      !append_quoted_arg(arguments, argument_count, &used, task_id ? task_id : L"") ||
+      !append_text(arguments, argument_count, &used, L" --endpoint-id ") ||
+      !append_quoted_arg(arguments, argument_count, &used, endpoint_id ? endpoint_id : L"") ||
+      !append_text(arguments, argument_count, &used, L" --attestation-url ") ||
+      !append_quoted_arg(arguments, argument_count, &used,
+                         attestation_url ? attestation_url : L"") ||
+      !append_text(arguments, argument_count, &used, L" --handoff-pipe ") ||
+      !append_quoted_arg(arguments, argument_count, &used, handoff_pipe) ||
+      !append_text(arguments, argument_count, &used, L" --parent-pid ")) {
     return 0;
   }
-  _snwprintf(handle_text, sizeof(handle_text) / sizeof(handle_text[0]),
-             L"%llu", (unsigned long long)(ULONG_PTR)secret_read);
-  if (!append_text(command, command_count, &used, handle_text) ||
-      !append_text(command, command_count, &used, L" --ack-handle ")) return 0;
-  _snwprintf(handle_text, sizeof(handle_text) / sizeof(handle_text[0]),
-             L"%llu", (unsigned long long)(ULONG_PTR)ack_write);
-  if (!append_text(command, command_count, &used, handle_text) ||
-      !append_text(command, command_count, &used, L" --parent-pid ")) return 0;
-  _snwprintf(handle_text, sizeof(handle_text) / sizeof(handle_text[0]),
+  _snwprintf(pid_text, sizeof(pid_text) / sizeof(pid_text[0]),
              L"%lu", (unsigned long)parent_pid);
-  if (!append_text(command, command_count, &used, handle_text)) return 0;
+  if (!append_text(arguments, argument_count, &used, pid_text)) return 0;
   if (thumbprint && thumbprint[0]) {
-    if (!append_text(command, command_count, &used, L" --cert-thumbprint ") ||
-        !append_quoted_arg(command, command_count, &used, thumbprint)) return 0;
+    if (!append_text(arguments, argument_count, &used, L" --cert-thumbprint ") ||
+        !append_quoted_arg(arguments, argument_count, &used, thumbprint)) return 0;
   }
   return 1;
 }
@@ -1981,37 +2285,32 @@ static int edr_native_coordinator(int argc, wchar_t **argv) {
   wchar_t source[MAX_PATH_LONG];
   wchar_t state_dir[MAX_PATH_LONG];
   wchar_t finalizer[MAX_PATH_LONG];
-  wchar_t command[32768];
+  wchar_t arguments[32768];
+  wchar_t handoff_pipe_name[256];
+  wchar_t finalizer_task_name[128];
   DWORD source_length;
   BYTE token[EDR_WINDOWS_HANDOFF_MAX_FRAME];
   DWORD token_length = 0;
   HANDLE input_secret = INVALID_HANDLE_VALUE;
   HANDLE external_ack = INVALID_HANDLE_VALUE;
   HANDLE upstream_parent = NULL;
-  HANDLE secret_read = INVALID_HANDLE_VALUE;
-  HANDLE secret_write = INVALID_HANDLE_VALUE;
-  HANDLE ack_read = INVALID_HANDLE_VALUE;
-  HANDLE ack_write = INVALID_HANDLE_VALUE;
-  HANDLE handles[2];
-  EdrWindowsSpawnLock spawn_lock = { 0 };
-  PROCESS_INFORMATION process;
+  HANDLE finalizer_pipe = INVALID_HANDLE_VALUE;
   SECURITY_ATTRIBUTES pipe_security;
-  EdrFinalizerHandoff handoff;
+  PSECURITY_DESCRIPTOR pipe_descriptor = NULL;
   int result = ERROR_GEN_FAILURE;
-  int launched = 0;
+  int task_registered = 0;
   int handoff_accepted = 0;
+  DWORD finalizer_error = ERROR_BROKEN_PIPE;
   int remote_requested;
   DWORD upstream_parent_pid = GetCurrentProcessId();
   const BYTE *handoff_secret;
   DWORD handoff_secret_length;
 
   ZeroMemory(token, sizeof(token));
-  ZeroMemory(&process, sizeof(process));
-  ZeroMemory(&handoff, sizeof(handoff));
   finalizer[0] = L'\0';
   state_dir[0] = L'\0';
-  handoff.secret_write = INVALID_HANDLE_VALUE;
-  handoff.ack_read = INVALID_HANDLE_VALUE;
+  handoff_pipe_name[0] = L'\0';
+  finalizer_task_name[0] = L'\0';
   remote_requested = (attestation_url && attestation_url[0]) ||
                      (task_id && task_id[0]) ||
                      (input_secret_text && input_secret_text[0]) ||
@@ -2088,44 +2387,57 @@ static int edr_native_coordinator(int argc, wchar_t **argv) {
   }
   if (external_ack_text && external_ack_text[0] &&
       !edr_finalizer_parse_handle(external_ack_text, &external_ack)) goto cleanup;
-  ZeroMemory(&pipe_security, sizeof(pipe_security));
-  pipe_security.nLength = sizeof(pipe_security);
-  pipe_security.bInheritHandle = FALSE;
-  if (!edr_windows_spawn_lock_acquire(&spawn_lock) ||
-      !CreatePipe(&secret_read, &secret_write, &pipe_security, 0) ||
-      !CreatePipe(&ack_read, &ack_write, &pipe_security, 0) ||
-      !edr_native_build_finalizer_command(command, sizeof(command) / sizeof(command[0]),
-                                          finalizer, install_dir, service_name,
-                                          attestation_url, task_id, endpoint_id, thumbprint,
-                                          secret_read, ack_write, upstream_parent_pid)) goto cleanup;
-  handles[0] = secret_read;
-  handles[1] = ack_write;
-  if (!edr_windows_spawn_whitelisted(command, state_dir, handles, 2, &process,
-                                     child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS))) goto cleanup;
-  edr_windows_spawn_lock_release(&spawn_lock);
-  launched = 1;
-  CloseHandle(secret_read);
-  secret_read = INVALID_HANDLE_VALUE;
-  CloseHandle(ack_write);
-  ack_write = INVALID_HANDLE_VALUE;
-  handoff.secret_write = secret_write;
-  handoff.ack_read = ack_read;
-  secret_write = INVALID_HANDLE_VALUE;
-  ack_read = INVALID_HANDLE_VALUE;
-  if (!edr_finalizer_exchange_ready(&handoff, handoff_secret, handoff_secret_length)) {
-    DWORD wait_result = WaitForSingleObject(process.hProcess, EDR_FINALIZER_IO_TIMEOUT_MS);
-    DWORD finalizer_exit = STILL_ACTIVE;
-    if (wait_result == WAIT_OBJECT_0 &&
-        GetExitCodeProcess(process.hProcess, &finalizer_exit) &&
-        finalizer_exit != STILL_ACTIVE) {
-      result = (int)finalizer_exit;
-    } else if (wait_result == WAIT_TIMEOUT) {
-      result = ERROR_TIMEOUT;
-    } else {
-      result = ERROR_BROKEN_PIPE;
-    }
+  if (!edr_finalizer_unique_channel(handoff_pipe_name,
+                                    sizeof(handoff_pipe_name) /
+                                        sizeof(handoff_pipe_name[0]),
+                                    finalizer_task_name,
+                                    sizeof(finalizer_task_name) /
+                                        sizeof(finalizer_task_name[0])) ||
+      !edr_finalizer_security_attributes(&pipe_security, &pipe_descriptor)) {
     goto cleanup;
   }
+  finalizer_pipe = CreateNamedPipeW(
+      handoff_pipe_name, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+      1, EDR_WINDOWS_HANDOFF_MAX_FRAME + sizeof(DWORD),
+      EDR_WINDOWS_HANDOFF_MAX_FRAME + sizeof(DWORD), EDR_FINALIZER_IO_TIMEOUT_MS,
+      &pipe_security);
+  LocalFree(pipe_descriptor);
+  pipe_descriptor = NULL;
+  if (finalizer_pipe == INVALID_HANDLE_VALUE) {
+    result = (int)edr_finalizer_last_error();
+    goto cleanup;
+  }
+  if (!edr_native_build_finalizer_arguments(
+          arguments, sizeof(arguments) / sizeof(arguments[0]), install_dir,
+          service_name, attestation_url, task_id, endpoint_id, thumbprint,
+          handoff_pipe_name, upstream_parent_pid)) {
+    result = ERROR_INSUFFICIENT_BUFFER;
+    goto cleanup;
+  }
+  if (!edr_native_register_finalizer_task(finalizer_task_name, finalizer,
+                                          arguments, state_dir)) {
+    result = (int)edr_finalizer_last_error();
+    goto cleanup;
+  }
+  task_registered = 1;
+  if (!edr_finalizer_wait_for_pipe(finalizer_pipe)) {
+    result = (int)edr_finalizer_last_error();
+    goto cleanup;
+  }
+  if (!edr_native_delete_finalizer_task(finalizer_task_name)) {
+    result = ERROR_ACCESS_DENIED;
+    goto cleanup;
+  }
+  task_registered = 0;
+  if (!edr_finalizer_exchange_ready(finalizer_pipe, handoff_secret,
+                                    handoff_secret_length,
+                                    &finalizer_error)) {
+    finalizer_pipe = INVALID_HANDLE_VALUE;
+    result = (int)finalizer_error;
+    goto cleanup;
+  }
+  finalizer_pipe = INVALID_HANDLE_VALUE;
   SecureZeroMemory(token, sizeof(token));
   if (external_ack != INVALID_HANDLE_VALUE) {
     static const BYTE coordinator_ready[] = "edr.finalizer.ready.v1";
@@ -2137,26 +2449,22 @@ static int edr_native_coordinator(int argc, wchar_t **argv) {
   handoff_accepted = 1;
   result = ERROR_SUCCESS;
 cleanup:
-  edr_windows_spawn_lock_release(&spawn_lock);
-  if (process.hProcess && launched && !handoff_accepted) {
-    DWORD process_exit = STILL_ACTIVE;
-    if (GetExitCodeProcess(process.hProcess, &process_exit) && process_exit == STILL_ACTIVE) {
-      TerminateProcess(process.hProcess, ERROR_CANCELLED);
-      WaitForSingleObject(process.hProcess, 5000);
-    }
+  if (task_registered) {
+    (void)edr_native_delete_finalizer_task(finalizer_task_name);
   }
-  if (process.hThread) CloseHandle(process.hThread);
-  if (process.hProcess) CloseHandle(process.hProcess);
+  if (pipe_descriptor) LocalFree(pipe_descriptor);
+  if (finalizer_pipe != INVALID_HANDLE_VALUE) CloseHandle(finalizer_pipe);
   if (input_secret != INVALID_HANDLE_VALUE) CloseHandle(input_secret);
-  if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
-  if (secret_write != INVALID_HANDLE_VALUE) CloseHandle(secret_write);
-  if (ack_read != INVALID_HANDLE_VALUE) CloseHandle(ack_read);
-  if (ack_write != INVALID_HANDLE_VALUE) CloseHandle(ack_write);
   if (external_ack != INVALID_HANDLE_VALUE) CloseHandle(external_ack);
   if (upstream_parent) CloseHandle(upstream_parent);
-  if (handoff.secret_write != INVALID_HANDLE_VALUE) CloseHandle(handoff.secret_write);
-  if (handoff.ack_read != INVALID_HANDLE_VALUE) CloseHandle(handoff.ack_read);
-  if (finalizer[0] && !handoff_accepted) DeleteFileW(finalizer);
+  if (finalizer[0] && !handoff_accepted) {
+    DWORD delete_error = ERROR_SUCCESS;
+    if (!edr_finalizer_delete_path_with_retry(finalizer, 0, &delete_error) &&
+        delete_error != ERROR_FILE_NOT_FOUND &&
+        delete_error != ERROR_PATH_NOT_FOUND) {
+      (void)edr_finalizer_schedule_self_delete(finalizer);
+    }
+  }
   SecureZeroMemory(token, sizeof(token));
   return result;
 }
