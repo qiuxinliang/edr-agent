@@ -299,8 +299,11 @@ int main(void) {
                          "result = (int)finalizer_exit;",
                          "coordinator must return the finalizer preflight error instead of generic code 31");
   ok &= require_contains(headless_uninstaller,
-                         "error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION",
-                         "native uninstall must bound retries to transient Windows file locks");
+                         "error != ERROR_LOCK_VIOLATION &&\n        error != ERROR_ACCESS_DENIED",
+                         "native uninstall must retry transient mapped-image access denial");
+  ok &= require_contains(headless_uninstaller,
+                         "edr_finalizer_delete_path_with_retry(receipt, 0, &delete_error)",
+                         "native uninstall must not silently preserve a stale failure receipt");
   ok &= require_contains(headless_uninstaller,
                          "stage=%s\\nerror=%d\\npath=%s\\n",
                          "native uninstall failure receipt must identify the blocked stage and path");

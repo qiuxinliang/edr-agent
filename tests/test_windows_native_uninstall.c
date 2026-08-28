@@ -44,10 +44,21 @@ typedef struct EdrDelayedHandleClose {
   DWORD delay_ms;
 } EdrDelayedHandleClose;
 
+typedef struct EdrDelayedLibraryUnload {
+  HMODULE module;
+  DWORD delay_ms;
+} EdrDelayedLibraryUnload;
+
 static DWORD WINAPI edr_delayed_handle_close_thread(LPVOID context) {
   EdrDelayedHandleClose *close = (EdrDelayedHandleClose *)context;
   Sleep(close->delay_ms);
   return CloseHandle(close->handle) ? ERROR_SUCCESS : GetLastError();
+}
+
+static DWORD WINAPI edr_delayed_library_unload_thread(LPVOID context) {
+  EdrDelayedLibraryUnload *unload = (EdrDelayedLibraryUnload *)context;
+  Sleep(unload->delay_ms);
+  return FreeLibrary(unload->module) ? ERROR_SUCCESS : GetLastError();
 }
 
 static int edr_test_parent_delivery_window(void) {
@@ -149,6 +160,145 @@ cleanup:
   if (GetFileAttributesW(directory) != INVALID_FILE_ATTRIBUTES) {
     (void)edr_finalizer_safe_delete_tree(directory, &error, NULL, 0);
   }
+  return ok;
+}
+
+static int edr_test_transient_mapped_image_delete(const wchar_t *root) {
+  static wchar_t directory[MAX_PATH_LONG];
+  static wchar_t system_directory[MAX_PATH_LONG];
+  static wchar_t source_path[MAX_PATH_LONG];
+  static wchar_t image_path[MAX_PATH_LONG];
+  static wchar_t failure_path[MAX_PATH_LONG];
+  EdrDelayedLibraryUnload delayed_unload;
+  HMODULE module = NULL;
+  HANDLE unload_thread = NULL;
+  DWORD system_length;
+  DWORD error = ERROR_SUCCESS;
+  DWORD thread_exit = ERROR_GEN_FAILURE;
+  int ok = 0;
+
+  ZeroMemory(&delayed_unload, sizeof(delayed_unload));
+  failure_path[0] = L'\0';
+  system_length = GetSystemDirectoryW(
+      system_directory,
+      (UINT)(sizeof(system_directory) / sizeof(system_directory[0])));
+  if (!system_length ||
+      system_length >= sizeof(system_directory) / sizeof(system_directory[0]) ||
+      !join_path(directory, sizeof(directory) / sizeof(directory[0]),
+                 root, L"transient-mapped-image") ||
+      !join_path(source_path, sizeof(source_path) / sizeof(source_path[0]),
+                 system_directory, L"version.dll") ||
+      !join_path(image_path, sizeof(image_path) / sizeof(image_path[0]),
+                 directory, L"mapped-image.dll") ||
+      !edr_finalizer_secure_directory(directory) ||
+      !CopyFileW(source_path, image_path, TRUE)) {
+    goto cleanup;
+  }
+  module = LoadLibraryW(image_path);
+  if (!module) goto cleanup;
+  delayed_unload.module = module;
+  delayed_unload.delay_ms = 250;
+  unload_thread = CreateThread(NULL, 0, edr_delayed_library_unload_thread,
+                               &delayed_unload, 0, NULL);
+  if (!unload_thread) goto cleanup;
+  module = NULL;
+  if (!edr_finalizer_safe_delete_tree(directory, &error,
+                                      failure_path,
+                                      sizeof(failure_path) / sizeof(failure_path[0])) ||
+      error != ERROR_SUCCESS || failure_path[0] != L'\0' ||
+      WaitForSingleObject(unload_thread, 5000) != WAIT_OBJECT_0 ||
+      !GetExitCodeThread(unload_thread, &thread_exit) ||
+      thread_exit != ERROR_SUCCESS ||
+      GetFileAttributesW(directory) != INVALID_FILE_ATTRIBUTES) {
+    goto cleanup;
+  }
+  ok = 1;
+
+cleanup:
+  if (!ok) {
+    fwprintf(stderr,
+             L"transient mapped-image delete failed: error=%lu path=%ls thread_exit=%lu\n",
+             (unsigned long)error, failure_path,
+             (unsigned long)thread_exit);
+  }
+  if (unload_thread) {
+    WaitForSingleObject(unload_thread, 5000);
+    CloseHandle(unload_thread);
+  }
+  if (module) FreeLibrary(module);
+  if (GetFileAttributesW(directory) != INVALID_FILE_ATTRIBUTES) {
+    (void)edr_finalizer_safe_delete_tree(directory, &error, NULL, 0);
+  }
+  return ok;
+}
+
+static int edr_test_failure_receipt_replaces_open_previous(const wchar_t *root) {
+  static wchar_t self_path[MAX_PATH_LONG];
+  static wchar_t receipt_path[MAX_PATH_LONG];
+  static wchar_t failure_path[MAX_PATH_LONG];
+  EdrDelayedHandleClose delayed_close;
+  HANDLE receipt = INVALID_HANDLE_VALUE;
+  HANDLE close_thread = NULL;
+  DWORD bytes_read = 0;
+  DWORD thread_exit = ERROR_GEN_FAILURE;
+  char content[512];
+  int ok = 0;
+
+  ZeroMemory(&delayed_close, sizeof(delayed_close));
+  ZeroMemory(content, sizeof(content));
+  if (!join_path(self_path, sizeof(self_path) / sizeof(self_path[0]),
+                 root, L"uninstall-finalizer.exe") ||
+      !join_path(receipt_path, sizeof(receipt_path) / sizeof(receipt_path[0]),
+                 root, L"last-native-uninstall-failure.receipt") ||
+      !join_path(failure_path, sizeof(failure_path) / sizeof(failure_path[0]),
+                 root, L"current-failure.dll")) {
+    goto cleanup;
+  }
+  edr_native_write_failure_receipt(self_path, "previous", ERROR_GEN_FAILURE, NULL);
+  receipt = CreateFileW(receipt_path, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (receipt == INVALID_HANDLE_VALUE) goto cleanup;
+  delayed_close.handle = receipt;
+  delayed_close.delay_ms = 250;
+  close_thread = CreateThread(NULL, 0, edr_delayed_handle_close_thread,
+                              &delayed_close, 0, NULL);
+  if (!close_thread) goto cleanup;
+  receipt = INVALID_HANDLE_VALUE;
+  edr_native_write_failure_receipt(self_path, "remove-install-root",
+                                   ERROR_ACCESS_DENIED, failure_path);
+  if (WaitForSingleObject(close_thread, 5000) != WAIT_OBJECT_0 ||
+      !GetExitCodeThread(close_thread, &thread_exit) ||
+      thread_exit != ERROR_SUCCESS) {
+    goto cleanup;
+  }
+  CloseHandle(close_thread);
+  close_thread = NULL;
+  receipt = CreateFileW(receipt_path, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (receipt == INVALID_HANDLE_VALUE ||
+      !ReadFile(receipt, content, sizeof(content) - 1, &bytes_read, NULL) ||
+      !bytes_read ||
+      !strstr(content, "stage=remove-install-root") ||
+      !strstr(content, "error=5") ||
+      !strstr(content, "current-failure.dll")) {
+    goto cleanup;
+  }
+  ok = 1;
+
+cleanup:
+  if (!ok) {
+    fprintf(stderr,
+            "failure receipt replacement failed: win32=%lu thread_exit=%lu content=%s\n",
+            (unsigned long)GetLastError(), (unsigned long)thread_exit, content);
+  }
+  if (close_thread) {
+    WaitForSingleObject(close_thread, 5000);
+    CloseHandle(close_thread);
+  }
+  if (receipt != INVALID_HANDLE_VALUE) CloseHandle(receipt);
+  DeleteFileW(receipt_path);
   return ok;
 }
 
@@ -430,6 +580,10 @@ static int edr_finalizer_foundation_self_test(void) {
   }
   failure_stage = "transient-locked-delete";
   if (!edr_test_transient_locked_delete(root)) goto cleanup;
+  failure_stage = "transient-mapped-image-delete";
+  if (!edr_test_transient_mapped_image_delete(root)) goto cleanup;
+  failure_stage = "failure-receipt-replacement";
+  if (!edr_test_failure_receipt_replaces_open_previous(root)) goto cleanup;
   failure_stage = "recursive-delete-fixture";
   wcscpy(nested_dir, root);
   {

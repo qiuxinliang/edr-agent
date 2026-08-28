@@ -412,7 +412,8 @@ static int edr_finalizer_delete_path_with_retry(const wchar_t *path, int directo
     }
     error = edr_finalizer_last_error();
     now = GetTickCount64();
-    if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) {
+    if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION &&
+        error != ERROR_ACCESS_DENIED) {
       if (error_out) *error_out = error;
       return 0;
     }
@@ -1399,7 +1400,26 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path,
   CloseHandle(file);
   file = INVALID_HANDLE_VALUE;
   if (write_ok) {
-    (void)MoveFileExW(temporary, receipt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!MoveFileExW(temporary, receipt,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      DWORD delete_error = ERROR_SUCCESS;
+      /* A diagnostics reader may have opened the previous receipt without
+       * FILE_SHARE_DELETE. Wait for that transient handle, then publish the
+       * current failure instead of silently leaving stale evidence. */
+      if ((edr_finalizer_delete_path_with_retry(receipt, 0, &delete_error) ||
+           delete_error == ERROR_FILE_NOT_FOUND ||
+           delete_error == ERROR_PATH_NOT_FOUND) &&
+          MoveFileExW(temporary, receipt, MOVEFILE_WRITE_THROUGH)) {
+        write_ok = 1;
+      } else {
+        write_ok = 0;
+        OutputDebugStringW(L"native uninstall: failed to publish current failure receipt\n");
+      }
+    }
+    if (!write_ok) {
+      /* Keep the flushed .tmp receipt for local diagnostics. */
+      OutputDebugStringW(L"native uninstall: current failure receipt retained as .tmp\n");
+    }
   } else {
     DeleteFileW(temporary);
   }
