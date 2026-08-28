@@ -400,9 +400,9 @@ static void edr_finalizer_record_failure_path(wchar_t *out, size_t out_count,
 }
 
 static int edr_finalizer_delete_path_with_retry(const wchar_t *path, int directory,
-                                                 DWORD *error_out,
-                                                 ULONGLONG retry_deadline) {
+                                                 DWORD *error_out) {
   DWORD error = ERROR_SUCCESS;
+  ULONGLONG retry_deadline = 0;
   for (;;) {
     ULONGLONG now;
     DWORD delay_ms;
@@ -412,8 +412,14 @@ static int edr_finalizer_delete_path_with_retry(const wchar_t *path, int directo
     }
     error = edr_finalizer_last_error();
     now = GetTickCount64();
-    if ((error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) ||
-        now >= retry_deadline) {
+    if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) {
+      if (error_out) *error_out = error;
+      return 0;
+    }
+    if (!retry_deadline) {
+      retry_deadline = now + EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS;
+    }
+    if (now >= retry_deadline) {
       if (error_out) *error_out = error;
       return 0;
     }
@@ -425,10 +431,9 @@ static int edr_finalizer_delete_path_with_retry(const wchar_t *path, int directo
   }
 }
 
-static int edr_finalizer_safe_delete_tree_until(const wchar_t *root, DWORD *error_out,
-                                                wchar_t *failure_path,
-                                                size_t failure_path_count,
-                                                ULONGLONG retry_deadline) {
+static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out,
+                                          wchar_t *failure_path,
+                                          size_t failure_path_count) {
   FILE_ATTRIBUTE_TAG_INFO tag_info;
   DWORD root_attributes;
   DWORD root_error;
@@ -508,8 +513,7 @@ static int edr_finalizer_safe_delete_tree_until(const wchar_t *root, DWORD *erro
   if (find == INVALID_HANDLE_VALUE) {
     DWORD find_error = edr_finalizer_last_error();
     if (find_error == ERROR_FILE_NOT_FOUND || find_error == ERROR_PATH_NOT_FOUND) {
-      if (!edr_finalizer_delete_path_with_retry(root, 1, error_out,
-                                                retry_deadline)) {
+      if (!edr_finalizer_delete_path_with_retry(root, 1, error_out)) {
         edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
         HeapFree(GetProcessHeap(), 0, path);
         return 0;
@@ -534,22 +538,20 @@ static int edr_finalizer_safe_delete_tree_until(const wchar_t *root, DWORD *erro
     if (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
       if (!edr_finalizer_delete_path_with_retry(
               path, (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
-              &last_error, retry_deadline)) {
+              &last_error)) {
         ok = 0;
         edr_finalizer_record_failure_path(failure_path, failure_path_count, path);
         break;
       }
     } else if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      if (!edr_finalizer_safe_delete_tree_until(path, &last_error,
-                                                failure_path, failure_path_count,
-                                                retry_deadline)) {
+      if (!edr_finalizer_safe_delete_tree(path, &last_error,
+                                          failure_path, failure_path_count)) {
         ok = 0;
         break;
       }
     } else {
       SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-      if (!edr_finalizer_delete_path_with_retry(path, 0, &last_error,
-                                                retry_deadline)) {
+      if (!edr_finalizer_delete_path_with_retry(path, 0, &last_error)) {
         ok = 0;
         edr_finalizer_record_failure_path(failure_path, failure_path_count, path);
         break;
@@ -562,22 +564,13 @@ static int edr_finalizer_safe_delete_tree_until(const wchar_t *root, DWORD *erro
     edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
   }
   FindClose(find);
-  if (ok && !edr_finalizer_delete_path_with_retry(root, 1, &last_error,
-                                                  retry_deadline)) {
+  if (ok && !edr_finalizer_delete_path_with_retry(root, 1, &last_error)) {
     ok = 0;
     edr_finalizer_record_failure_path(failure_path, failure_path_count, root);
   }
   if (error_out) *error_out = ok ? ERROR_SUCCESS : last_error;
   HeapFree(GetProcessHeap(), 0, path);
   return ok;
-}
-
-static int edr_finalizer_safe_delete_tree(const wchar_t *root, DWORD *error_out,
-                                          wchar_t *failure_path,
-                                          size_t failure_path_count) {
-  return edr_finalizer_safe_delete_tree_until(
-      root, error_out, failure_path, failure_path_count,
-      GetTickCount64() + EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS);
 }
 
 static DWORD edr_finalizer_schedule_self_delete(const wchar_t *path) {

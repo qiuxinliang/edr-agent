@@ -229,6 +229,19 @@ int main(void) {
            "detached uninstaller is statically linked to the MSVC runtime");
   free(cmake);
 
+  snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
+  char *native_uninstaller = read_file(path);
+  require_true(native_uninstaller != NULL, "read native Windows uninstaller implementation");
+  contains(native_uninstaller,
+           "retry_deadline = now + EDR_FINALIZER_DELETE_RETRY_TIMEOUT_MS",
+           "each transiently locked path starts its own bounded deletion retry window");
+  require_true(!strstr(native_uninstaller, "edr_finalizer_safe_delete_tree_until"),
+               "recursive install-root deletion does not share one tree-wide retry deadline");
+  contains(native_uninstaller,
+           "error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION",
+           "native deletion retries remain limited to transient lock errors");
+  free(native_uninstaller);
+
   snprintf(path, sizeof(path), "%s/src/command/command_stub.c", root);
   char *dispatch = read_file(path);
   contains(dispatch, "EDR_AGENT_UPDATE_EXIT_LAUNCHED", "launch result is handled as nonterminal");
