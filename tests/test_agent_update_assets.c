@@ -238,7 +238,10 @@ int main(void) {
   require_true(!strstr(native_uninstaller, "edr_finalizer_safe_delete_tree_until"),
                "recursive install-root deletion does not share one tree-wide retry deadline");
   contains(native_uninstaller,
-           "error != ERROR_LOCK_VIOLATION &&\n        error != ERROR_ACCESS_DENIED",
+           "error != ERROR_LOCK_VIOLATION",
+           "native deletion retries transient file lock errors");
+  contains(native_uninstaller,
+           "error != ERROR_ACCESS_DENIED",
            "native deletion retries transient mapped-image access denial");
   contains(native_uninstaller,
            "edr_finalizer_delete_path_with_retry(receipt, 0, &delete_error)",
