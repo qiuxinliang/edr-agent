@@ -12,6 +12,16 @@ on:
         required: false
         default: ''
         type: string
+      architecture:
+        description: Native architecture to validate (all, amd64, or arm64)
+        required: false
+        default: all
+        type: string
+      native_repeat_count:
+        description: Serial native runtime lifecycle rounds (1..5)
+        required: false
+        default: 1
+        type: number
   workflow_dispatch:
     inputs:
       target_tag:
@@ -23,6 +33,20 @@ on:
         required: false
         default: ''
         type: string
+      architecture:
+        description: Native architecture to validate (all, amd64, or arm64)
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - amd64
+          - arm64
+      native_repeat_count:
+        description: Serial native runtime lifecycle rounds (1..5)
+        required: false
+        default: 1
+        type: number
 
 permissions:
   # GitHub hides draft releases from tokens without push-level contents access.
@@ -42,17 +66,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            runner: windows-2022
-          - arch: arm64
-            runner: windows-11-arm
+        include: ${{ fromJSON(inputs.architecture == 'all' && '[{"arch":"amd64","runner":"windows-2022"},{"arch":"arm64","runner":"windows-11-arm"}]' || inputs.architecture == 'amd64' && '[{"arch":"amd64","runner":"windows-2022"}]' || inputs.architecture == 'arm64' && '[{"arch":"arm64","runner":"windows-11-arm"}]' || '[{"arch":"invalid","runner":"windows-2022"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Validate lifecycle inputs
+        shell: pwsh
+        env:
+          LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
+          LIFECYCLE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}
+          LIFECYCLE_MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          $architecture = $env:LIFECYCLE_ARCHITECTURE
+          if ($architecture -cnotin @('all', 'amd64', 'arm64')) {
+            throw "invalid architecture input: $architecture"
+          }
+          if ($env:LIFECYCLE_MATRIX_ARCH -eq 'invalid') {
+            throw "invalid lifecycle matrix architecture for input: $architecture"
+          }
+          [int]$repeatCount = 0
+          $repeatText = $env:LIFECYCLE_REPEAT_COUNT
+          if (-not [int]::TryParse($repeatText, [ref]$repeatCount) -or $repeatCount -lt 1 -or $repeatCount -gt 5) {
+            throw "native_repeat_count must be an integer in 1..5; got '$repeatText'"
+          }
+          "NATIVE_REPEAT_COUNT=$repeatCount" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Resolve release tags
         shell: pwsh
@@ -210,13 +251,17 @@ jobs:
       - name: Execute native runtime update lifecycle
         shell: pwsh
         run: |
-          .\scripts\windows_release_lifecycle_smoke.ps1 `
-            -BaselinePackageDir packages\baseline `
-            -TargetPackageDir packages\target `
-            -BaselineVersion $env:BASELINE_VERSION `
-            -TargetVersion $env:TARGET_VERSION `
-            -Architecture '${{ matrix.arch }}' `
-            -EvidenceDir runtime-evidence
+          [int]$repeatCount = $env:NATIVE_REPEAT_COUNT
+          for ($round = 1; $round -le $repeatCount; $round++) {
+            $evidenceDir = if ($round -eq 1) { 'runtime-evidence' } else { 'runtime-evidence\round-{0:D2}' -f $round }
+            .\scripts\windows_release_lifecycle_smoke.ps1 `
+              -BaselinePackageDir packages\baseline `
+              -TargetPackageDir packages\target `
+              -BaselineVersion $env:BASELINE_VERSION `
+              -TargetVersion $env:TARGET_VERSION `
+              -Architecture '${{ matrix.arch }}' `
+              -EvidenceDir $evidenceDir
+          }
 
       - name: Publish lifecycle evidence summary
         if: always()
@@ -298,6 +343,58 @@ jobs:
               '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               Get-Content -LiteralPath $diagnosticPath -TotalCount 120 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
               '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+          }
+          [int]$expectedRounds = 0
+          try { $expectedRounds = [int]$env:NATIVE_REPEAT_COUNT } catch {
+            "Unable to parse expected native round count: $($_.Exception.Message)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          $roundDirectories = @()
+          try {
+            if (Test-Path -LiteralPath runtime-evidence) {
+              $roundDirectories = @(Get-ChildItem -LiteralPath runtime-evidence -Directory -Filter 'round-*' -ErrorAction Stop | Sort-Object Name)
+            }
+          } catch {
+            "Unable to enumerate native lifecycle round evidence: $($_.Exception.Message)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          $actualSummaryCount = if (Test-Path -LiteralPath runtime-evidence\summary.json) { 1 } else { 0 }
+          foreach ($roundDirectory in $roundDirectories) {
+            $roundSummary = Join-Path $roundDirectory.FullName 'summary.json'
+            if (Test-Path -LiteralPath $roundSummary) { $actualSummaryCount++ }
+          }
+          "Native runtime rounds: expected=$expectedRounds actual_summaries=$actualSummaryCount" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          foreach ($roundDirectory in $roundDirectories) {
+            "## Native runtime lifecycle $($roundDirectory.Name)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            try {
+              $roundSummary = Join-Path $roundDirectory.FullName 'summary.json'
+              if (Test-Path -LiteralPath $roundSummary) {
+                '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                Get-Content -LiteralPath $roundSummary -ErrorAction Stop | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              } else {
+                'No summary.json was produced for this round.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              }
+              foreach ($diagnostic in @(
+                  'uninstall-finalizers-this-run.json',
+                  'uninstall-finalizer-state.json',
+                  'native-failure-receipt.txt',
+                  'native-failure-receipt-tmp.txt',
+                  'uninstall-install-root-residual.json',
+                  'uninstall-install-processes.json',
+                  'uninstall-service.txt',
+                  'uninstall-tasks.txt',
+                  'uninstall-diagnostics-errors.json'
+                )) {
+                $diagnosticPath = Join-Path $roundDirectory.FullName $diagnostic
+                if (Test-Path -LiteralPath $diagnosticPath) {
+                  "### $($roundDirectory.Name) diagnostic: $diagnostic" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                  '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                  Get-Content -LiteralPath $diagnosticPath -TotalCount 120 -ErrorAction Stop | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                  '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+                }
+              }
+            } catch {
+              "Unable to collect $($roundDirectory.Name) evidence: $($_.Exception.Message)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
           }
 

@@ -25,6 +25,11 @@ static void contains_before(const char *text, const char *first, const char *sec
   require_true(first_at && second_at && first_at < second_at, message);
 }
 
+static void contains_after(const char *text, const char *first, const char *second, const char *message) {
+  const char *first_at = text ? strstr(text, first) : NULL;
+  require_true(first_at && strstr(first_at + strlen(first), second), message);
+}
+
 static int has_adjacent_lines(const char *text, const char *first_line, const char *second_line) {
   const char *first_at = text ? strstr(text, first_line) : NULL;
   const char *next;
@@ -41,6 +46,31 @@ static int has_adjacent_lines(const char *text, const char *first_line, const ch
 
 static void contains_adjacent_lines(const char *text, const char *first_line, const char *second_line, const char *message) {
   require_true(has_adjacent_lines(text, first_line, second_line), message);
+}
+
+static size_t count_adjacent_lines(const char *text, const char *first_line, const char *second_line) {
+  size_t count = 0u;
+  const char *cursor = text;
+  while (cursor && (cursor = strstr(cursor, first_line)) != NULL) {
+    if (has_adjacent_lines(cursor, first_line, second_line)) count++;
+    cursor++;
+  }
+  return count;
+}
+
+static void section_contains_excludes(const char *text, const char *section, const char *required, const char *excluded_a, const char *excluded_b, const char *message) {
+  const char *start = text ? strstr(text, section) : NULL;
+  const char *end = NULL;
+  const char *cursor = start ? start + strlen(section) : NULL;
+  while (cursor && (cursor = strstr(cursor, "\n  ")) != NULL) {
+    if (cursor[3] != ' ') { end = cursor; break; }
+    cursor++;
+  }
+  size_t length = end ? (size_t)(end - start) : (start ? strlen(start) : 0u);
+  char *body = start ? (char *)malloc(length + 1u) : NULL;
+  if (body) { memcpy(body, start, length); body[length] = 0; }
+  require_true(body && strstr(body, required) && !strstr(body, excluded_a) && !strstr(body, excluded_b), message);
+  free(body);
 }
 
 static void function_excludes(const char *text, const char *function_name, const char *needle, const char *message) {
@@ -372,6 +402,10 @@ int main(void) {
   contains(workflow, "windows-install-upgrade-rollback.yml", "release completion includes the Windows lifecycle workflow");
   contains(workflow, "      - windows-lifecycle", "release publication waits for the Windows lifecycle gate");
   contains(workflow, "target_tag: ${{ github.event_name == 'workflow_dispatch'", "lifecycle validation receives the exact release tag");
+  section_contains_excludes(workflow, "  windows-lifecycle:",
+                            "uses: ./.github/workflows/windows-install-upgrade-rollback.yml",
+                            "architecture:", "native_repeat_count:",
+                            "release lifecycle call keeps the reusable workflow defaults of all architectures and one native round");
   free(workflow);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-ci.yml", root);
@@ -508,14 +542,75 @@ int main(void) {
   free(setup_lifecycle);
   contains(lifecycle, "windows-${{ matrix.arch }}-setup.exe",
            "release lifecycle downloads the architecture-matched immutable Setup EXE");
-  contains(lifecycle, "runner: windows-2022",
-           "AMD64 Setup lifecycle is pinned to the Visual Studio 2022 Windows image");
-  contains(lifecycle, "runner: windows-11-arm",
-           "release lifecycle executes on a native Windows ARM64 runner");
+  require_true(count_adjacent_lines(lifecycle, "      architecture:", "        description: Native architecture to validate (all, amd64, or arm64)") == 2u,
+               "workflow_call and workflow_dispatch each declare the architecture input");
+  require_true(count_adjacent_lines(lifecycle, "      native_repeat_count:", "        description: Serial native runtime lifecycle rounds (1..5)") == 2u,
+               "workflow_call and workflow_dispatch each declare the native repeat-count input");
+  require_true(count_adjacent_lines(lifecycle, "        default: all", "        type: string") == 1u &&
+                   count_adjacent_lines(lifecycle, "        default: all", "        type: choice") == 1u,
+               "workflow_call and workflow_dispatch keep their architecture default at all");
+  require_true(count_adjacent_lines(lifecycle, "        default: 1", "        type: number") == 2u,
+               "workflow_call and workflow_dispatch keep their native repeat-count default at one");
+  contains_adjacent_lines(lifecycle, "        type: choice", "        options:",
+           "manual lifecycle dispatch exposes explicit architecture choices");
+  contains(lifecycle, "          - all", "manual lifecycle dispatch permits all architectures");
+  contains(lifecycle, "          - amd64", "manual lifecycle dispatch permits AMD64 only");
+  contains(lifecycle, "          - arm64", "manual lifecycle dispatch permits ARM64 only");
+  contains(lifecycle, "fromJSON(inputs.architecture == 'all'",
+           "matrix is derived from the requested architecture input");
+  contains(lifecycle, "inputs.architecture == 'all' && '[{\"arch\":\"amd64\",\"runner\":\"windows-2022\"},{\"arch\":\"arm64\",\"runner\":\"windows-11-arm\"}]'",
+           "all architecture input expands to exactly the AMD64 and ARM64 matrix rows");
+  contains(lifecycle, "inputs.architecture == 'arm64' && '[{\"arch\":\"arm64\",\"runner\":\"windows-11-arm\"}]'",
+           "ARM64-only input expands to its single native ARM64 matrix row");
+  contains(lifecycle, "windows-11-arm",
+           "ARM64-only runs retain the native Windows ARM runner");
+  require_true(!strstr(lifecycle, "native-lifecycle:\n    if:") && !strstr(lifecycle, "native-lifecycle:\r\n    if:"),
+               "architecture selection does not use a matrix-dependent job-level if");
+  contains(lifecycle, "invalid architecture input: $architecture",
+           "invalid reusable-workflow architecture fails closed before lifecycle work");
+  contains(lifecycle, "LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}",
+           "input architecture is bound to the validation step environment");
+  contains(lifecycle, "LIFECYCLE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}",
+           "input repeat count is bound to the validation step environment");
+  contains(lifecycle, "LIFECYCLE_MATRIX_ARCH: ${{ matrix.arch }}",
+           "resolved matrix architecture is bound to the validation step environment");
+  contains(lifecycle, "$architecture = $env:LIFECYCLE_ARCHITECTURE",
+           "validation reads the raw architecture value from the step environment");
+  contains(lifecycle, "$architecture -cnotin @('all', 'amd64', 'arm64')",
+           "architecture validation rejects case variants rather than using PowerShell's default case-insensitive comparison");
+  contains(lifecycle, "$repeatText = $env:LIFECYCLE_REPEAT_COUNT",
+           "validation parses the raw repeat count from the step environment");
+  require_true(!strstr(lifecycle, "$architecture = '${{ inputs.architecture }}'") &&
+                   !strstr(lifecycle, "$repeatText = '${{ inputs.native_repeat_count }}'"),
+               "PowerShell validation does not interpolate workflow inputs directly into quoted script values");
+  require_true(!strstr(lifecycle, "LIFECYCLE_ARCHITECTURE.Trim()") &&
+                   !strstr(lifecycle, "LIFECYCLE_ARCHITECTURE.ToLowerInvariant()"),
+               "architecture validation rejects non-exact input rather than normalizing it");
+  contains(lifecycle, "if ($env:LIFECYCLE_MATRIX_ARCH -eq 'invalid')",
+           "invalid fallback matrix rows fail before downloads begin");
+  contains_before(lifecycle, "if ($env:LIFECYCLE_MATRIX_ARCH -eq 'invalid')", "- name: Resolve release tags",
+                  "invalid fallback matrix rows are rejected before release resolution and downloads");
+  contains(lifecycle, "native_repeat_count must be an integer in 1..5",
+           "native repeat count has an explicit bounded validation failure");
+  contains(lifecycle, "$repeatCount -lt 1 -or $repeatCount -gt 5",
+           "native repeat count enforces the inclusive 1..5 bounds");
+  contains(lifecycle, "\"arch\":\"amd64\",\"runner\":\"windows-2022\"",
+           "AMD64 lifecycle matrix is pinned to the Visual Studio 2022 Windows image");
+  contains(lifecycle, "\"arch\":\"arm64\",\"runner\":\"windows-11-arm\"",
+           "ARM64 lifecycle matrix executes on a native Windows ARM64 runner");
   contains(lifecycle, "-Architecture '${{ matrix.arch }}'",
            "release lifecycle passes the native target architecture into the smoke test");
   contains(lifecycle, "windows-${{ matrix.arch }}-exe.zip",
            "release lifecycle downloads the architecture-matched immutable package");
+  contains_before(lifecycle, "- name: Execute real Setup EXE install, upgrade, rollback, and uninstall",
+                  "- name: Execute native runtime update lifecycle",
+                  "Setup EXE lifecycle remains outside serial native rounds");
+  contains(lifecycle, "for ($round = 1; $round -le $repeatCount; $round++)",
+           "native lifecycle executes repeat rounds serially in one step");
+  contains(lifecycle, "if ($round -eq 1) { 'runtime-evidence' } else { 'runtime-evidence\\round-{0:D2}' -f $round }",
+           "round one preserves the existing runtime-evidence location and later rounds use subdirectories");
+  contains(lifecycle, "-EvidenceDir $evidenceDir",
+           "each native round passes its distinct evidence directory directly to the smoke script");
   contains(lifecycle, "Deferred uninstall cleanup receipt",
            "failed lifecycle summaries expose the asynchronous cleanup receipt");
   contains(lifecycle, "Uninstall attestation listener",
@@ -536,6 +631,18 @@ int main(void) {
            "workflow summary prints the copied native failure receipt when present");
   contains(lifecycle, "native-failure-receipt-tmp.txt",
            "workflow summary prints the copied native temporary failure receipt when present");
+  contains(lifecycle, "Native runtime rounds: expected=$expectedRounds actual_summaries=$actualSummaryCount",
+           "always summary reports requested and observed native round evidence counts");
+  contains(lifecycle, "Get-ChildItem -LiteralPath runtime-evidence -Directory -Filter 'round-*'",
+           "always summary enumerates later native round evidence by directory name");
+  contains(lifecycle, "## Native runtime lifecycle $($roundDirectory.Name)",
+           "always summary includes each additional native round by name");
+  contains(lifecycle, "Join-Path $roundDirectory.FullName $diagnostic",
+           "additional round diagnostics are read from the current round directory");
+  contains_after(lifecycle, "foreach ($roundDirectory in $roundDirectories)", "'uninstall-finalizers-this-run.json'",
+                 "additional round summaries include this-run finalizer correlation evidence");
+  contains_after(lifecycle, "foreach ($roundDirectory in $roundDirectories)", "'uninstall-finalizer-state.json'",
+                 "additional round summaries include finalizer state evidence");
   contains(lifecycle, "windows-lifecycle-evidence-${{ matrix.arch }}",
            "workflow gives each architecture a distinct lifecycle evidence artifact");
   free(lifecycle);
