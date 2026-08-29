@@ -1246,6 +1246,103 @@ static int edr_native_prepare_state_directory(wchar_t *out, size_t out_count) {
   return 1;
 }
 
+#define EDR_FINALIZER_STALE_AGE_100NS (15ULL * 60ULL * 10000000ULL)
+
+static int edr_native_stale_finalizer_name(const wchar_t *name) {
+  static const wchar_t prefix[] = L"uninstall-finalizer-";
+  static const wchar_t suffix[] = L".exe";
+  const wchar_t *uuid;
+  size_t index;
+  size_t name_length;
+  size_t prefix_length = sizeof(prefix) / sizeof(prefix[0]) - 1;
+  size_t suffix_length = sizeof(suffix) / sizeof(suffix[0]) - 1;
+  if (!name) return 0;
+  name_length = wcslen(name);
+  if (name_length != prefix_length + 36u + suffix_length ||
+      _wcsnicmp(name, prefix, prefix_length) != 0 ||
+      _wcsicmp(name + name_length - suffix_length, suffix) != 0) return 0;
+  uuid = name + prefix_length;
+  for (index = 0; index < 36u; ++index) {
+    wchar_t character = uuid[index];
+    if (index == 8u || index == 13u || index == 18u || index == 23u) {
+      if (character != L'-') return 0;
+    } else if (!((character >= L'0' && character <= L'9') ||
+                 (character >= L'a' && character <= L'f') ||
+                 (character >= L'A' && character <= L'F'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int edr_native_stale_finalizer_age(const FILETIME *last_write) {
+  FILETIME now_filetime;
+  ULARGE_INTEGER now;
+  ULARGE_INTEGER written;
+  if (!last_write) return 0;
+  GetSystemTimeAsFileTime(&now_filetime);
+  now.LowPart = now_filetime.dwLowDateTime;
+  now.HighPart = now_filetime.dwHighDateTime;
+  written.LowPart = last_write->dwLowDateTime;
+  written.HighPart = last_write->dwHighDateTime;
+  return now.QuadPart >= written.QuadPart &&
+         now.QuadPart - written.QuadPart >= EDR_FINALIZER_STALE_AGE_100NS;
+}
+
+static int edr_native_cleanup_stale_finalizers(const wchar_t *state_dir) {
+  wchar_t pattern[MAX_PATH_LONG];
+  wchar_t path[MAX_PATH_LONG];
+  wchar_t canonical_path[MAX_PATH_LONG];
+  WIN32_FIND_DATAW item;
+  HANDLE find;
+  int running;
+
+  if (!state_dir ||
+      !join_path(pattern, sizeof(pattern) / sizeof(pattern[0]), state_dir,
+                 L"uninstall-finalizer-*.exe")) {
+    return 0;
+  }
+  find = FindFirstFileW(pattern, &item);
+  if (find == INVALID_HANDLE_VALUE) {
+    DWORD error = edr_finalizer_last_error();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return 1;
+    OutputDebugStringW(L"native uninstall: stale finalizer enumeration failed\n");
+    return 1;
+  }
+  do {
+    if (!edr_native_stale_finalizer_name(item.cFileName) ||
+        !edr_native_stale_finalizer_age(&item.ftLastWriteTime) ||
+        (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        !join_path(path, sizeof(path) / sizeof(path[0]), state_dir, item.cFileName)) {
+      continue;
+    }
+    if (!edr_finalizer_canonical_path(path, canonical_path,
+                                      (DWORD)(sizeof(canonical_path) /
+                                              sizeof(canonical_path[0]))) ||
+        !edr_native_stale_finalizer_name(wcsrchr(canonical_path, L'\\')
+                                             ? wcsrchr(canonical_path, L'\\') + 1
+                                             : canonical_path)) {
+      continue;
+    }
+    running = edr_native_process_running_at_path(path);
+    if (running != 0) continue;
+    if (!DeleteFileW(path)) {
+      DWORD error = edr_finalizer_last_error();
+      if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+        OutputDebugStringW(L"native uninstall: stale finalizer cleanup failed\n");
+      }
+    }
+  } while (FindNextFileW(find, &item));
+  if (GetLastError() != ERROR_NO_MORE_FILES) {
+    OutputDebugStringW(L"native uninstall: stale finalizer enumeration ended early\n");
+    FindClose(find);
+    return 1;
+  }
+  FindClose(find);
+  return 1;
+}
+
 static int edr_native_stop_sensor(const wchar_t *install_dir) {
   wchar_t sensor[MAX_PATH_LONG];
   wchar_t canonical_sensor[MAX_PATH_LONG];
@@ -1306,7 +1403,19 @@ static int edr_native_stop_sensor(const wchar_t *install_dir) {
 }
 
 static int edr_native_attestation_should_retry(DWORD error) {
-  return error == 429 || error >= 500;
+  if (error == 429 || (error >= 500 && error <= 599)) return 1;
+  if (error == ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED) return 0;
+  switch (error) {
+    case ERROR_NETWORK_UNREACHABLE:
+    case ERROR_WINHTTP_TIMEOUT:
+    case ERROR_WINHTTP_NAME_NOT_RESOLVED:
+    case ERROR_WINHTTP_CANNOT_CONNECT:
+    case ERROR_WINHTTP_CONNECTION_ERROR:
+    case ERROR_WINHTTP_RESEND_REQUEST:
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 static DWORD edr_native_attestation_retry_delay_ms(DWORD error, int attempt) {
@@ -1422,6 +1531,10 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
     } else if (!request) {
       last_error = edr_finalizer_last_error();
       if (failure_stage_out) *failure_stage_out = "attestation-request";
+    } else if (!WinHttpSetOption(request, WINHTTP_OPTION_CLIENT_CERT_CONTEXT,
+                                 WINHTTP_NO_CLIENT_CERT_CONTEXT, 0)) {
+      last_error = edr_finalizer_last_error();
+      if (failure_stage_out) *failure_stage_out = "attestation-client-certificate-policy";
     } else if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
                                  &redirect_policy, sizeof(redirect_policy)) ||
                !WinHttpAddRequestHeaders(request, L"Content-Type: application/json\r\n",
@@ -2367,8 +2480,12 @@ static int edr_native_coordinator(int argc, wchar_t **argv) {
                              (task_id && task_id[0]))) ||
       edr_native_validate_install_root(install_dir) != ERROR_SUCCESS ||
       !source_length || source_length >= sizeof(source) / sizeof(source[0]) ||
-      !edr_native_prepare_state_directory(state_dir, sizeof(state_dir) / sizeof(state_dir[0])) ||
-      !edr_finalizer_unique_name(finalizer, sizeof(finalizer) / sizeof(finalizer[0]), state_dir) ||
+      !edr_native_prepare_state_directory(state_dir, sizeof(state_dir) / sizeof(state_dir[0]))) {
+    goto cleanup;
+  }
+  /* Historical finalizers are opportunistic cleanup; never block a new uninstall. */
+  (void)edr_native_cleanup_stale_finalizers(state_dir);
+  if (!edr_finalizer_unique_name(finalizer, sizeof(finalizer) / sizeof(finalizer[0]), state_dir) ||
       !edr_finalizer_copy_verified(source, finalizer)) {
     goto cleanup;
   }

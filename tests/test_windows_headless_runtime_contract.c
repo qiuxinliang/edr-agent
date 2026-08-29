@@ -316,10 +316,43 @@ int main(void) {
                          "native uninstall failure receipt must identify the blocked stage and path");
   ok &= require_absent(headless_uninstaller, "/EDR_NATIVE_COORDINATED=1",
                        "native finalizer must not invoke the legacy Inno coordination path");
-  ok &= require_contains(headless_uninstaller, "edr_native_attestation_should_retry("
-                         , "attestation retry policy must be explicit and bounded");
-  ok &= require_contains(headless_uninstaller, "error == 429 || error >= 500",
-                         "401/410 must stop while 429/5xx remain retryable");
+  ok &= require_contains(headless_uninstaller, "edr_native_attestation_should_retry(",
+                         "attestation retry policy must be explicit and bounded");
+  ok &= require_contains(headless_uninstaller, "WINHTTP_OPTION_CLIENT_CERT_CONTEXT",
+                         "remote attestation must make the no-client-certificate policy explicit");
+  ok &= require_contains(headless_uninstaller, "WINHTTP_NO_CLIENT_CERT_CONTEXT, 0",
+                         "remote attestation must explicitly decline optional client-certificate authentication");
+  const char *finalizer_body = strstr(headless_uninstaller, "static int edr_native_finalizer(");
+  const char *certificate_removal = finalizer_body
+                                        ? strstr(finalizer_body, "edr_native_remove_certificate_identity(")
+                                        : NULL;
+  const char *attestation = finalizer_body
+                                ? strstr(finalizer_body, "edr_native_attest(")
+                                : NULL;
+  ok &= require_true(finalizer_body && certificate_removal && attestation &&
+                         certificate_removal < attestation,
+                     "remote attestation must remain after local certificate cleanup");
+  ok &= require_contains(headless_uninstaller, "(void)edr_native_cleanup_stale_finalizers(state_dir)",
+                         "historical finalizer cleanup must be best-effort and non-blocking");
+  ok &= require_range_absent(headless_uninstaller,
+                             "static int edr_native_cleanup_stale_finalizers(",
+                             "static int edr_native_stop_sensor(",
+                             "edr_finalizer_delete_path_with_retry(",
+                             "stale finalizer cleanup must not wait on retry delays");
+  ok &= require_contains(headless_uninstaller, "uninstall-finalizer-*.exe",
+                         "historical finalizer cleanup must use an exact state-directory filename pattern");
+  ok &= require_contains(headless_uninstaller, "edr_native_stale_finalizer_name",
+                         "historical finalizer cleanup must require the canonical UUID filename");
+  ok &= require_contains(headless_uninstaller, "EDR_FINALIZER_STALE_AGE_100NS",
+                         "historical finalizer cleanup must enforce a fixed stale age threshold");
+  ok &= require_contains(headless_uninstaller, "edr_native_process_running_at_path(path)",
+                         "historical finalizer cleanup must skip any image still running");
+  ok &= require_contains(headless_uninstaller, "FILE_ATTRIBUTE_REPARSE_POINT",
+                         "historical finalizer cleanup must not follow reparse-point entries");
+  ok &= require_contains(headless_uninstaller, "error == 429 || (error >= 500 && error <= 599)",
+                         "only HTTP 429 and 5xx responses must be retryable");
+  ok &= require_contains(headless_uninstaller, "ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED",
+                         "certificate transport failures must not be retried as HTTP statuses");
   ok &= require_contains(headless_uninstaller, "if (error == 429) return 60000u",
                          "HTTP 429 must honor the one-minute retry window");
   ok &= require_contains(headless_uninstaller, "self_delete_error = edr_native_unlink_self",
