@@ -26,10 +26,23 @@ typedef struct {
   char exe_hash[65];
   char exe_path[EDR_BR_STR_LONG];
   char username[EDR_BR_STR_SHORT];
+  /* effective process identity; username/domain retain their legacy meaning. */
+  char user_sid[EDR_BR_STR_SHORT];
+  char logon_id[64];
+  char creator_username[EDR_BR_STR_SHORT];
+  char creator_domain[EDR_BR_STR_SHORT];
+  char creator_sid[EDR_BR_STR_SHORT];
+  char creator_logon_id[64];
+  /* target_4688 > token_sid > cache > creator_fallback > none */
+  char identity_source[32];
+  char identity_quality[32];
   uint32_t session_id;
   /** 自根向上的父链跳数（与平台 `process_chain_depth` / R-ANOM-001 对齐）；0=未算 */
   uint32_t process_chain_depth;
   EdrEventType type;
+  /* Internal source provenance. Never serialized: Security EventLog 4688 must
+   * not become authoritative process-tree lifecycle evidence. */
+  uint8_t is_security_4688;
   uint32_t priority;
 
   char parent_name[EDR_BR_STR_SHORT];
@@ -103,5 +116,9 @@ typedef struct {
 void edr_behavior_record_init(EdrBehaviorRecord *r);
 
 void edr_behavior_record_enrich_system_context(EdrBehaviorRecord *r);
+
+/** Security EventLog process-create observations carry useful identity but are
+ * not authoritative process lifecycle evidence for process_tree_cache. */
+int edr_process_create_is_lifecycle_authoritative(const EdrBehaviorRecord *r);
 
 #endif

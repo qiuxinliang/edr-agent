@@ -43,10 +43,53 @@ struct p0_dedup_slot {
   int64_t  event_time_ns;
   uint64_t last_ms;
   uint32_t suppressed_count;
+  uint8_t identity_rank;
+  uint8_t upgrade_emitted;
 };
 static struct p0_dedup_slot s_p0_dedup[P0_DEDUP_SLOTS];
 static uint32_t s_p0_dedup_next;
 static uint64_t s_p0_dedup_suppressed_total;
+static uint64_t s_p0_dedup_exact_suppressed;
+static uint64_t s_p0_dedup_equal_quality_suppressed;
+static uint64_t s_p0_dedup_identity_upgrade_seen;
+static uint64_t s_p0_dedup_lower_quality_suppressed;
+static uint64_t s_p0_dedup_intermediate_upgrade_suppressed;
+static uint64_t s_p0_pre_rule_event_duplicates;
+static uint64_t s_p0_emit_user_subject_full, s_p0_emit_user_subject_degraded;
+static uint64_t s_p0_emit_alerts_with_optional_omission, s_p0_emit_values_truncated, s_p0_emit_escape_overflow_values;
+static uint64_t s_p0_emit_minimal_failures, s_p0_emit_emitted_without_full_context;
+#ifdef EDR_P0_DIRECT_EMIT_TESTING
+static uint64_t s_p0_test_monotonic_ms;
+void edr_p0_rule_test_reset_dedup(void) { memset(s_p0_dedup, 0, sizeof(s_p0_dedup)); s_p0_dedup_next=0; s_p0_dedup_suppressed_total=s_p0_dedup_exact_suppressed=s_p0_dedup_equal_quality_suppressed=s_p0_dedup_identity_upgrade_seen=s_p0_dedup_lower_quality_suppressed=s_p0_dedup_intermediate_upgrade_suppressed=s_p0_pre_rule_event_duplicates=0; s_p0_emit_user_subject_full=s_p0_emit_user_subject_degraded=s_p0_emit_alerts_with_optional_omission=s_p0_emit_values_truncated=s_p0_emit_escape_overflow_values=s_p0_emit_minimal_failures=s_p0_emit_emitted_without_full_context=0; }
+void edr_p0_rule_test_set_monotonic_ms(uint64_t value) { s_p0_test_monotonic_ms=value; }
+#endif
+
+void edr_p0_rule_get_dedup_metrics(EdrP0DedupMetrics *out) {
+  if (!out) return;
+  out->suppressed_total = s_p0_dedup_suppressed_total;
+  out->exact_suppressed = s_p0_dedup_exact_suppressed;
+  out->equal_quality_suppressed = s_p0_dedup_equal_quality_suppressed;
+  out->identity_upgrade_seen = s_p0_dedup_identity_upgrade_seen;
+  out->lower_quality_suppressed = s_p0_dedup_lower_quality_suppressed;
+  out->intermediate_upgrade_suppressed = s_p0_dedup_intermediate_upgrade_suppressed;
+  out->pre_rule_event_duplicates = s_p0_pre_rule_event_duplicates;
+}
+
+void edr_p0_rule_get_emit_metrics(EdrP0EmitMetrics *out) {
+  if (!out) return;
+  out->user_subject_full=s_p0_emit_user_subject_full; out->user_subject_degraded=s_p0_emit_user_subject_degraded;
+  out->alerts_with_optional_omission=s_p0_emit_alerts_with_optional_omission; out->values_truncated=s_p0_emit_values_truncated; out->escape_overflow_values=s_p0_emit_escape_overflow_values;
+  out->minimal_failures=s_p0_emit_minimal_failures; out->emitted_without_full_context=s_p0_emit_emitted_without_full_context;
+}
+
+static uint8_t p0_identity_rank(const EdrBehaviorRecord *br) {
+  const char *q = br ? br->identity_quality : "";
+  if (strcmp(q, "target_4688") == 0) return 4u;
+  if (strcmp(q, "token_sid") == 0) return 3u;
+  if (strcmp(q, "cache") == 0) return 2u;
+  if (strcmp(q, "creator_fallback") == 0) return 1u;
+  return 0u;
+}
 
 /* 全进程滑动 60s 内 BehaviorAlert 直出条数上限（B2.3）；未设置或 0=不限制 */
 static uint64_t s_p0_gwin_start_ms;
@@ -700,6 +743,9 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
 }
 
 static uint64_t p0_monotonic_ms(void) {
+#ifdef EDR_P0_DIRECT_EMIT_TESTING
+  if (s_p0_test_monotonic_ms) return s_p0_test_monotonic_ms;
+#endif
 #if defined(_WIN32)
   return (uint64_t)GetTickCount64();
 #else
@@ -775,9 +821,38 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
   for (uint32_t i = 0; i < P0_DEDUP_SLOTS; i++) {
     if (s_p0_dedup[i].pid == br->pid && strcmp(s_p0_dedup[i].rule_id, rule_id) == 0 &&
         strcmp(s_p0_dedup[i].endpoint_id, br->endpoint_id) == 0) {
+      uint8_t incoming = p0_identity_rank(br);
+      if (now >= s_p0_dedup[i].last_ms + window_ms) {
+        s_p0_dedup[i].last_ms = now;
+        s_p0_dedup[i].event_time_ns = br->event_time_ns;
+        s_p0_dedup[i].identity_rank = incoming;
+        s_p0_dedup[i].upgrade_emitted = 0u;
+        s_p0_dedup[i].suppressed_count = 0u;
+        return 1;
+      }
+      if (incoming > s_p0_dedup[i].identity_rank) {
+        if (incoming == 4u && !s_p0_dedup[i].upgrade_emitted) {
+          /* Only target_4688 is material enough to earn one second alert. */
+          s_p0_dedup_identity_upgrade_seen++;
+          s_p0_dedup[i].identity_rank = incoming;
+          s_p0_dedup[i].event_time_ns = br->event_time_ns;
+          s_p0_dedup[i].last_ms = now;
+          s_p0_dedup[i].upgrade_emitted = 1u;
+          s_p0_dedup[i].suppressed_count = 0u;
+          return 1;
+        }
+        s_p0_dedup[i].identity_rank = incoming;
+        s_p0_dedup_intermediate_upgrade_suppressed++;
+        s_p0_dedup_suppressed_total++;
+        return 0;
+      }
+      if (incoming < s_p0_dedup[i].identity_rank) {
+        s_p0_dedup_lower_quality_suppressed++; s_p0_dedup_suppressed_total++;
+        return 0;
+      }
       if (s_p0_dedup[i].event_time_ns == br->event_time_ns) {
         s_p0_dedup[i].suppressed_count++;
-        s_p0_dedup_suppressed_total++;
+        s_p0_dedup_suppressed_total++; s_p0_dedup_exact_suppressed++;
         if (p0_should_log_dedup(s_p0_dedup[i].suppressed_count)) {
           fprintf(stderr, "[P0 DEBUG] dedup: skip exact-duplicate event (rule=%s pid=%u ts=%lld suppressed=%u total_suppressed=%llu)\n",
                   rule_id, br->pid, (long long)br->event_time_ns,
@@ -788,7 +863,7 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
       }
       if (now < s_p0_dedup[i].last_ms + window_ms) {
         s_p0_dedup[i].suppressed_count++;
-        s_p0_dedup_suppressed_total++;
+        s_p0_dedup_suppressed_total++; s_p0_dedup_equal_quality_suppressed++;
         if (p0_should_log_dedup(s_p0_dedup[i].suppressed_count)) {
           fprintf(stderr, "[P0 DEBUG] dedup: suppress (rule=%s pid=%u window=%lus suppressed=%u total_suppressed=%llu)\n",
                   rule_id, br->pid, (unsigned long)win_sec,
@@ -797,9 +872,6 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
         }
         return 0;
       }
-      s_p0_dedup[i].last_ms = now;
-      s_p0_dedup[i].event_time_ns = br->event_time_ns;
-      return 1;
     }
   }
   struct p0_dedup_slot *s = &s_p0_dedup[s_p0_dedup_next % P0_DEDUP_SLOTS];
@@ -810,6 +882,8 @@ static int p0_dedup_allow(const char *rule_id, const EdrBehaviorRecord *br) {
   s->event_time_ns = br->event_time_ns;
   s->last_ms = now;
   s->suppressed_count = 0;
+  s->identity_rank = p0_identity_rank(br);
+  s->upgrade_emitted = 0u;
   return 1;
 }
 
@@ -1050,10 +1124,22 @@ static int p0_json_escape(const char *in, char *out, size_t out_cap, size_t max_
   return 1;
 }
 
-static void p0_json_escape_or_empty(const char *in, char *out, size_t out_cap, size_t max_in) {
+static void p0_json_escape_or_empty_impl(const char *in, char *out, size_t out_cap, size_t max_in,
+                                         unsigned *values_capped, unsigned *escape_overflows) {
+  if (in && in[0] && max_in > 0u && strlen(in) > max_in && values_capped) (*values_capped)++;
   if (!p0_json_escape(in, out, out_cap, max_in)) {
     out[0] = '\0';
+    if (in && in[0] && escape_overflows) (*escape_overflows)++;
   }
+}
+
+/* emit_for_rule keeps these counters local until it chooses full/compact output.
+ * Compact reconstruction intentionally does not recount a full-pass cap. */
+#define p0_json_escape_or_empty(in, out, out_cap, max_in) \
+  p0_json_escape_or_empty_impl((in), (out), (out_cap), (max_in), &full_values_capped, &full_escape_overflows)
+
+static int p0_json_escape_compact(const char *in, char *out, size_t out_cap, size_t max_in) {
+  return p0_json_escape(in, out, out_cap, max_in);
 }
 
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
@@ -1132,6 +1218,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
 
   /* user_subject_json：所有嵌入字符串必须 JSON 转义，否则 \\ 未写成 \\\\ 会导致非法 JSON，ingest 不入库、标题退回默认。 */
   {
+    unsigned full_values_capped = 0u;
+    unsigned full_escape_overflows = 0u;
     char esc_rule_id[80];
     char esc_bundle[160];
     char esc_title[640];
@@ -1164,6 +1252,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char registry_context_json[900];
     char esc_enforcement_action[96];
     char esc_enforcement_message[320];
+    char esc_user_sid[320], esc_logon_id[96], esc_creator_user[320], esc_creator_domain[320];
+    char esc_creator_sid[320], esc_creator_logon[96], esc_identity_source[64], esc_identity_quality[64], esc_event_id[96];
     char parent_name_buf[sizeof(br->parent_name)];
     char parent_path_buf[sizeof(br->parent_path)];
 
@@ -1197,6 +1287,15 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     p0_json_escape_or_empty(br->tenant_id[0] ? br->tenant_id : "", esc_tenant, sizeof(esc_tenant), 64);
     p0_json_escape_or_empty(br->hostname[0] ? br->hostname : "", esc_host, sizeof(esc_host), 128);
     p0_json_escape_or_empty(br->domain[0] ? br->domain : "", esc_domain, sizeof(esc_domain), 128);
+    p0_json_escape_or_empty(br->user_sid, esc_user_sid, sizeof(esc_user_sid), 256);
+    p0_json_escape_or_empty(br->logon_id, esc_logon_id, sizeof(esc_logon_id), 64);
+    p0_json_escape_or_empty(br->creator_username, esc_creator_user, sizeof(esc_creator_user), 160);
+    p0_json_escape_or_empty(br->creator_domain, esc_creator_domain, sizeof(esc_creator_domain), 160);
+    p0_json_escape_or_empty(br->creator_sid, esc_creator_sid, sizeof(esc_creator_sid), 256);
+    p0_json_escape_or_empty(br->creator_logon_id, esc_creator_logon, sizeof(esc_creator_logon), 64);
+    p0_json_escape_or_empty(br->identity_source, esc_identity_source, sizeof(esc_identity_source), 32);
+    p0_json_escape_or_empty(br->identity_quality, esc_identity_quality, sizeof(esc_identity_quality), 32);
+    p0_json_escape_or_empty(br->event_id, esc_event_id, sizeof(esc_event_id), 48);
     p0_json_escape_or_empty(br->current_directory[0] ? br->current_directory : "", esc_cwd, sizeof(esc_cwd), 240);
     p0_json_escape_or_empty(br->integrity_level[0] ? br->integrity_level : "Unknown", esc_il, sizeof(esc_il), 48);
     p0_json_escape_or_empty(br->process_creation_time[0] ? br->process_creation_time : "", esc_pct, sizeof(esc_pct),
@@ -1257,6 +1356,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           "\"event_type\":%d,"
           "\"hostname\":\"%s\","
           "\"domain\":\"%s\","
+          "\"user_sid\":\"%s\",\"logon_id\":\"%s\",\"creator_username\":\"%s\",\"creator_domain\":\"%s\",\"creator_sid\":\"%s\",\"creator_logon_id\":\"%s\",\"identity_source\":\"%s\",\"identity_quality\":\"%s\",\"source_event_id\":\"%s\","
           "\"current_directory\":\"%s\","
           "\"logon_time_ns\":%llu,"
           "\"integrity_level\":\"%s\","
@@ -1299,6 +1399,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
         (int)br->type,
         esc_host,
         esc_domain,
+        esc_user_sid, esc_logon_id, esc_creator_user, esc_creator_domain, esc_creator_sid,
+        esc_creator_logon, esc_identity_source, esc_identity_quality, esc_event_id,
         esc_cwd,
         (unsigned long long)br->logon_time_ns,
         esc_il,
@@ -1316,11 +1418,50 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
         esc_enforcement_action,
         enforcement.error_code,
         esc_enforcement_message);
-    if (n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
-      a.user_subject_json[0] = 0;
-      fprintf(stderr, "[P0] emit_for_rule: user_subject_json overflow (need=%d cap=%zu rule=%s pid=%u)\n",
-              n, sizeof(a.user_subject_json), rule_id, br->pid);
-      return 0;
+    s_p0_emit_values_truncated += full_values_capped;
+    s_p0_emit_escape_overflow_values += full_escape_overflows;
+    if (full_escape_overflows != 0u || n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
+      /* Rebuild from scratch.  Do not emit snprintf's partial JSON. */
+      char crule[128], cbundle[192], cproc[384], cpath[768], cep[128], ctenant[128], cevent[192];
+      char cuser[384], csid[384], csource[128], cquality[128], caction[192], cmessage[384], identity[1152];
+      int compact_ok =
+          p0_json_escape_compact(rule_id, crule, sizeof(crule), 24) &&
+          p0_json_escape_compact(EDR_P0_RULES_BUNDLE_VERSION, cbundle, sizeof(cbundle), 48) &&
+          p0_json_escape_compact(pn ? pn : "", cproc, sizeof(cproc), 96) &&
+          p0_json_escape_compact(br->exe_path, cpath, sizeof(cpath), 180) &&
+          p0_json_escape_compact(br->endpoint_id, cep, sizeof(cep), 48) &&
+          p0_json_escape_compact(br->tenant_id, ctenant, sizeof(ctenant), 48) &&
+          p0_json_escape_compact(br->event_id, cevent, sizeof(cevent), 48) &&
+          p0_json_escape_compact(br->username, cuser, sizeof(cuser), 96) &&
+          p0_json_escape_compact(br->user_sid, csid, sizeof(csid), 96) &&
+          p0_json_escape_compact(br->identity_source, csource, sizeof(csource), 24) &&
+          p0_json_escape_compact(br->identity_quality, cquality, sizeof(cquality), 24) &&
+          p0_json_escape_compact(enforcement.action, caction, sizeof(caction), 48) &&
+          p0_json_escape_compact(enforcement.message, cmessage, sizeof(cmessage), 96);
+      identity[0] = '\0';
+      if (compact_ok) {
+        if (cuser[0]) snprintf(identity + strlen(identity), sizeof(identity) - strlen(identity), ",\"username\":\"%s\"", cuser);
+        if (csid[0]) snprintf(identity + strlen(identity), sizeof(identity) - strlen(identity), ",\"user_sid\":\"%s\"", csid);
+        if (csource[0]) snprintf(identity + strlen(identity), sizeof(identity) - strlen(identity), ",\"identity_source\":\"%s\"", csource);
+        if (cquality[0]) snprintf(identity + strlen(identity), sizeof(identity) - strlen(identity), ",\"identity_quality\":\"%s\"", cquality);
+      }
+      s_p0_emit_user_subject_degraded++;
+      s_p0_emit_alerts_with_optional_omission++;
+      if (compact_ok) {
+        n = snprintf(a.user_subject_json, sizeof(a.user_subject_json),
+          "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"%s\",\"rules_bundle_version\":\"%s\",\"context\":{\"context_degraded\":true,\"pid\":%u,\"ppid\":%u,\"event_type\":%d,\"process_name\":\"%s\",\"process_path\":\"%s\",\"endpoint_id\":\"%s\",\"tenant_id\":\"%s\",\"source_event_id\":\"%s\"%s},\"enforcement\":{\"requested\":%s,\"attempted\":%s,\"succeeded\":%s,\"action\":\"%s\",\"error_code\":%u,\"message\":\"%s\"}}",
+          crule, cbundle, br->pid, br->ppid, (int)br->type, cproc, cpath, cep, ctenant, cevent, identity,
+          enforcement.requested ? "true" : "false", enforcement.attempted ? "true" : "false",
+          enforcement.succeeded ? "true" : "false", caction, enforcement.error_code, cmessage);
+      }
+      if (!compact_ok || n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
+        snprintf(a.user_subject_json, sizeof(a.user_subject_json),
+                 "{\"subject_type\":\"edr_dynamic_rule\",\"context\":{\"context_degraded\":true},\"enforcement\":{\"requested\":false,\"attempted\":false,\"succeeded\":false}}");
+        s_p0_emit_minimal_failures++;
+      }
+      s_p0_emit_emitted_without_full_context++;
+    } else {
+      s_p0_emit_user_subject_full++;
     }
   }
   edr_behavior_alert_emit_to_batch(&a);
@@ -1329,6 +1470,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   p0_ep_rate_bump(br->endpoint_id);
   return 1;
 }
+
+#undef p0_json_escape_or_empty
 
 void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   if (!br) {
@@ -1386,6 +1529,7 @@ void edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   if (br->event_time_ns != 0u && br->event_time_ns == s_ev_ts_ns &&
       br->pid == s_ev_pid && (int)br->type == s_ev_type) {
     s_ev_dup_skipped++;
+    s_p0_pre_rule_event_duplicates++;
     if (p0_debug_all_enabled() &&
         (s_ev_dup_skipped == 1u || (s_ev_dup_skipped & 1023u) == 0u)) {
       fprintf(stderr, "[P0] skipped duplicate event (ts=%llu pid=%u type=%d count=%llu)\n",

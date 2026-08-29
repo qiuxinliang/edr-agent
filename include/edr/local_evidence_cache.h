@@ -35,6 +35,26 @@ typedef struct {
   uint64_t metric_network_drops;
   uint64_t metric_other_drops;
   uint64_t maintenance_runs;
+  uint64_t identity_observations_total;
+  uint64_t identity_none;
+  uint64_t process_cache_hits;
+  uint64_t process_cache_misses;
+  uint64_t identity_cache_hits;
+  uint64_t identity_cache_misses;
+  uint64_t identity_upgrades;
+  uint64_t identity_stale_rejects;
+  uint64_t process_cache_evictions;
+  uint64_t identity_target_4688;
+  uint64_t identity_creator_fallback;
+  uint64_t identity_cache;
+  uint64_t identity_token_sid;
+  uint64_t identity_enrich_attempts;
+  uint64_t identity_generation_unknown_rejects;
+  uint64_t identity_generation_mismatch_rejects;
+  uint64_t generation_resets;
+  uint64_t late_generation_rejects;
+  uint64_t generation_unknown_update_rejects;
+  uint64_t generation_mismatch_update_rejects;
   uint32_t process_slots_used;
   uint32_t process_slots_capacity;
   uint32_t ring_events;
@@ -65,6 +85,9 @@ void edr_local_evidence_cache_close(void);
 
 /** 用已缓存的进程元数据补全 pid/ppid/name/path/cmdline/parent。 */
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r);
+
+/** Observe process metadata before rule/P0 evaluation. Never persists evidence. */
+void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r);
 
 /** 记录一条行为元数据；函数内部会维护内存环与 SQLite。 */
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r);

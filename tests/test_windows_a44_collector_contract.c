@@ -52,11 +52,13 @@ int main(void) {
   char *collector = read_source(root, "src/collector/collector_win.c");
   char *a44 = read_source(root, "src/collector/edr_a44_split_path_win.c");
   char *tdh = read_source(root, "src/collector/etw_tdh_win.c");
-  if (!cmake || !collector || !a44 || !tdh) {
+  char *preprocess = read_source(root, "src/preprocess/preprocess_pipeline.c");
+  if (!cmake || !collector || !a44 || !tdh || !preprocess) {
     free(cmake);
     free(collector);
     free(a44);
     free(tdh);
+    free(preprocess);
     return 1;
   }
 
@@ -90,10 +92,36 @@ int main(void) {
                          "A4.4 restart paths must reset dynamic-thread lock state after teardown");
   ok &= require_contains(tdh, "void edr_tdh_win_get_property_stats_ext(",
                          "ETW observability extended TDH statistics must be implemented");
+  /* Source-contract only: macOS cannot compile the Windows EventLog callback. */
+  ok &= require_contains(collector, "static void edr_security_emit_registry_4657(const char *xml)",
+                         "4657 must retain a dedicated callback");
+  ok &= require_contains(collector, "(void)edr_xml_get_data_utf8(xml, \"SubjectUserName\", user, sizeof(user));",
+                         "4657 must preserve Subject actor identity");
+  ok &= require_contains(collector, "TargetUserName\", user, sizeof(user));",
+                         "4688 must parse Target Subject as effective identity");
+  ok &= require_contains(collector, "SubjectUserName\", creator_user, sizeof(creator_user));",
+                         "4688 must preserve Subject as creator identity");
+  ok &= require_contains(collector, "char creator_user[256];",
+                         "4688 creator variables must be declared in collector source");
+  ok &= require_contains(collector, "EdrSlotKvResult rp = edr_collector_slot_append_kv",
+                         "4688 must use checked atomic ETW1 field appends");
+  ok &= require_contains(collector, "security_4688_required_overflow_dropped++",
+                         "4688 must drop incomplete required payloads rather than truncate");
+  ok &= require_contains(collector, "EDR_SLOT_KV_VALUE_TOO_LONG",
+                         "ETW1 append helper must distinguish oversized values");
+  ok &= require_contains(collector, "EdrSlotKvResult identity[]",
+                         "4688 must append identity fields before image and command fields");
+  ok &= require_contains(collector, "security_4688_identity_capacity_omitted_fields",
+                         "4688 health must distinguish capacity identity omissions");
+  ok &= require_contains(collector, "edr_security_identity_value_present(user_sid)",
+                         "4688 identity presence must reject blank and dash placeholders");
+  ok &= require_contains(preprocess, "edr_process_create_is_lifecycle_authoritative(br)",
+                         "all Security 4688 observations must not overwrite process-tree generation");
 
   free(cmake);
   free(collector);
   free(a44);
   free(tdh);
+  free(preprocess);
   return ok ? 0 : 1;
 }

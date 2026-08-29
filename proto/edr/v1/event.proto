@@ -118,6 +118,18 @@ message BehaviorEvent {
 
   // 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台检索优先读本消息）
   optional AveBehaviorEventFeed ave_behavior_feed = 41;
+
+  // Additive process identity evidence. username remains the effective display
+  // identity for compatibility; SID is intentionally a separate field.
+  string domain = 42;
+  string user_sid = 43;
+  string logon_id = 44;
+  string creator_username = 45;
+  string creator_domain = 46;
+  string creator_sid = 47;
+  string creator_logon_id = 48;
+  string identity_source = 49;
+  string identity_quality = 50;
 }
 
 message ProcessDetail {

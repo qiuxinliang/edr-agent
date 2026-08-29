@@ -68,6 +68,14 @@ typedef struct {
     uint64_t registry_events_admitted;
     uint64_t security_4688_received;
     uint64_t security_4657_received;
+    uint64_t security_4688_payload_full;
+    uint64_t security_4688_payload_degraded;
+    uint64_t security_4688_values_rejected;
+    uint64_t security_4688_identity_capacity_omitted_fields;
+    uint64_t security_4688_identity_none_events;
+    uint64_t security_4688_effective_identity_present_events;
+    uint64_t security_4688_creator_identity_present_events;
+    uint64_t security_4688_required_overflow_dropped;
     uint64_t registry_attributed_events;
     uint64_t registry_unattributed_events;
     uint64_t etw_callbacks_total;

@@ -2285,16 +2285,17 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   self_delete_error = edr_native_unlink_self(self_path);
   self_delete_attempted = 1;
   if (self_delete_error != ERROR_SUCCESS) {
-    /* The finalizer is already outside the verified package tree. A locked
-     * image must not prevent proof of the completed service/process/tree
-     * teardown; retain a durable receipt and request reboot cleanup. */
-    edr_native_write_failure_receipt(self_path, "self-delete", (int)self_delete_error, NULL);
     DWORD deferred_result = edr_finalizer_schedule_self_delete(self_path);
-    if (deferred_result != ERROR_SUCCESS &&
-        deferred_result != ERROR_SUCCESS_REBOOT_REQUIRED) {
-      DWORD deferred_error = deferred_result;
+    if (deferred_result == ERROR_SUCCESS ||
+        deferred_result == ERROR_SUCCESS_REBOOT_REQUIRED) {
+      /* A running Windows image may reject immediate POSIX deletion. A
+       * successful MoveFileEx reboot registration is the native terminal
+       * cleanup path, not an uninstall failure. */
+      self_delete_error = ERROR_SUCCESS;
+    } else {
+      self_delete_error = deferred_result;
       edr_native_write_failure_receipt(self_path, "self-delete-schedule",
-                                       (int)deferred_error, NULL);
+                                       (int)self_delete_error, NULL);
     }
   }
   if (local_handoff) {

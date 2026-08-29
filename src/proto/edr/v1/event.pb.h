@@ -166,6 +166,17 @@ typedef struct _edr_v1_BehaviorEvent {
     /* 《11》§4.1：与 `AVEBehaviorEvent` 对齐的行为特征载荷（与 `detail` oneof 并存；平台检索优先读本消息） */
     bool has_ave_behavior_feed;
     edr_v1_AveBehaviorEventFeed ave_behavior_feed;
+    /* Additive process identity evidence. username remains the effective display
+ identity for compatibility; SID is intentionally a separate field. */
+    char domain[256];
+    char user_sid[256];
+    char logon_id[64];
+    char creator_username[256];
+    char creator_domain[256];
+    char creator_sid[256];
+    char creator_logon_id[64];
+    char identity_source[32];
+    char identity_quality[32];
 } edr_v1_BehaviorEvent;
 
 
@@ -176,7 +187,7 @@ extern "C" {
 /* Initializer values for message structs */
 #define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, ""}
-#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default}
+#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", ""}
 #define edr_v1_ProcessDetail_init_default        {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_default           {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
@@ -185,7 +196,7 @@ extern "C" {
 #define edr_v1_ScriptDetail_init_default         {""}
 #define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, ""}
-#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero}
+#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", ""}
 #define edr_v1_ProcessDetail_init_zero           {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
@@ -287,6 +298,15 @@ extern "C" {
 #define edr_v1_BehaviorEvent_priority_tag        32
 #define edr_v1_BehaviorEvent_behavior_alert_tag  40
 #define edr_v1_BehaviorEvent_ave_behavior_feed_tag 41
+#define edr_v1_BehaviorEvent_domain_tag          42
+#define edr_v1_BehaviorEvent_user_sid_tag        43
+#define edr_v1_BehaviorEvent_logon_id_tag        44
+#define edr_v1_BehaviorEvent_creator_username_tag 45
+#define edr_v1_BehaviorEvent_creator_domain_tag  46
+#define edr_v1_BehaviorEvent_creator_sid_tag     47
+#define edr_v1_BehaviorEvent_creator_logon_id_tag 48
+#define edr_v1_BehaviorEvent_identity_source_tag 49
+#define edr_v1_BehaviorEvent_identity_quality_tag 50
 
 /* Struct field encoding specification for nanopb */
 #define edr_v1_AveBehaviorEventFeed_FIELDLIST(X, a) \
@@ -364,7 +384,16 @@ X(a, STATIC,   SINGULAR, STRING,   ave_result_json,  30) \
 X(a, STATIC,   REPEATED, STRING,   mitre_ttps,       31) \
 X(a, STATIC,   SINGULAR, UINT32,   priority,         32) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  behavior_alert,   40) \
-X(a, STATIC,   OPTIONAL, MESSAGE,  ave_behavior_feed,  41)
+X(a, STATIC,   OPTIONAL, MESSAGE,  ave_behavior_feed,  41) \
+X(a, STATIC,   SINGULAR, STRING,   domain,           42) \
+X(a, STATIC,   SINGULAR, STRING,   user_sid,         43) \
+X(a, STATIC,   SINGULAR, STRING,   logon_id,         44) \
+X(a, STATIC,   SINGULAR, STRING,   creator_username,  45) \
+X(a, STATIC,   SINGULAR, STRING,   creator_domain,   46) \
+X(a, STATIC,   SINGULAR, STRING,   creator_sid,      47) \
+X(a, STATIC,   SINGULAR, STRING,   creator_logon_id,  48) \
+X(a, STATIC,   SINGULAR, STRING,   identity_source,  49) \
+X(a, STATIC,   SINGULAR, STRING,   identity_quality,  50)
 #define edr_v1_BehaviorEvent_CALLBACK NULL
 #define edr_v1_BehaviorEvent_DEFAULT NULL
 #define edr_v1_BehaviorEvent_detail_process_MSGTYPE edr_v1_ProcessDetail
@@ -451,7 +480,7 @@ extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         1792
 #define edr_v1_BehaviorAlert_size                11110
-#define edr_v1_BehaviorEvent_size                29774
+#define edr_v1_BehaviorEvent_size                31269
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   1072
 #define edr_v1_NetworkDetail_size                1185

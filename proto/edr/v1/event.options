@@ -7,6 +7,15 @@ edr.v1.BehaviorEvent.cmdline max_size:1024
 edr.v1.BehaviorEvent.exe_hash max_size:65
 edr.v1.BehaviorEvent.exe_path max_size:1024
 edr.v1.BehaviorEvent.username max_size:256
+edr.v1.BehaviorEvent.domain max_size:256
+edr.v1.BehaviorEvent.user_sid max_size:256
+edr.v1.BehaviorEvent.logon_id max_size:64
+edr.v1.BehaviorEvent.creator_username max_size:256
+edr.v1.BehaviorEvent.creator_domain max_size:256
+edr.v1.BehaviorEvent.creator_sid max_size:256
+edr.v1.BehaviorEvent.creator_logon_id max_size:64
+edr.v1.BehaviorEvent.identity_source max_size:32
+edr.v1.BehaviorEvent.identity_quality max_size:32
 edr.v1.BehaviorEvent.ave_result_json max_size:4096
 edr.v1.BehaviorEvent.mitre_ttps max_count:8 max_size:16
 

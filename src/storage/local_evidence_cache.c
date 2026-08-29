@@ -1,6 +1,7 @@
 #include "edr/local_evidence_cache.h"
 
 #include "edr/p0_rule_ir.h"
+#include "edr/process_tree_cache.h"
 #include "edr/resource.h"
 #include "edr/time_util.h"
 #include "edr/windows_event_policy.h"
@@ -28,6 +29,7 @@
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
+  uint64_t generation_start_ns;
   int64_t last_seen_ns;
   char endpoint_id[48];
   char tenant_id[64];
@@ -39,6 +41,14 @@ typedef struct {
   char parent_cmdline[1024];
   char username[256];
   char domain[256];
+  char user_sid[256];
+  char logon_id[64];
+  char creator_username[256];
+  char creator_domain[256];
+  char creator_sid[256];
+  char creator_logon_id[64];
+  char identity_source[32];
+  char identity_quality[32];
   char integrity_level[32];
   uint32_t token_elevation;
   char exe_hash[65];
@@ -148,6 +158,15 @@ static void copy_s(char *dst, size_t cap, const char *src) {
   snprintf(dst, cap, "%s", src ? src : "");
 }
 
+static int identity_quality_rank(const char *q) {
+  if (!q) return 0;
+  if (strcmp(q, "target_4688") == 0) return 4;
+  if (strcmp(q, "token_sid") == 0) return 3;
+  if (strcmp(q, "cache") == 0) return 2;
+  if (strcmp(q, "creator_fallback") == 0) return 1;
+  return 0;
+}
+
 static int64_t now_unix_ns(void) {
   time_t t = time(NULL);
   return (int64_t)t * 1000000000LL;
@@ -203,6 +222,7 @@ static ProcSlot *alloc_proc(uint32_t pid, const EdrBehaviorRecord *r) {
     }
   }
   ProcSlot *p = empty ? empty : oldest;
+  if (!empty && p->pid != 0u) s_status.process_cache_evictions++;
   memset(p, 0, sizeof(*p));
   p->pid = pid;
   return p;
@@ -214,7 +234,7 @@ static int should_update_process_cache(const EdrBehaviorRecord *r) {
   }
   return r->process_name[0] || r->exe_path[0] || r->cmdline[0] || r->ppid != 0u ||
          r->parent_name[0] || r->parent_path[0] || r->parent_cmdline[0] ||
-         r->username[0] || r->domain[0] || r->integrity_level[0] ||
+         r->username[0] || r->user_sid[0] || r->creator_username[0] || r->creator_sid[0] || r->identity_quality[0] || r->domain[0] || r->integrity_level[0] ||
          r->token_elevation != 0u || r->exe_hash[0] || r->current_directory[0] ||
          r->process_creation_time[0];
 }
@@ -223,9 +243,35 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   if (!should_update_process_cache(r)) {
     return;
   }
-  ProcSlot *p = alloc_proc(r->pid, r);
-  if (!p) {
+  int has_identity = r->username[0] || r->domain[0] || r->user_sid[0] || r->logon_id[0] ||
+                     r->creator_username[0] || r->creator_domain[0] || r->creator_sid[0] || r->creator_logon_id[0];
+  ProcessTreeEntry generation;
+  uint64_t incoming_generation = 0u;
+  int snapshot_ok = edr_pt_cache_snapshot_at(r->pid, (uint64_t)record_time_ns(r), &generation) == 0;
+  if (snapshot_ok) incoming_generation = generation.start_time_ns;
+  if (strcmp(r->identity_quality, "target_4688") == 0) s_status.identity_target_4688++;
+  else if (strcmp(r->identity_quality, "creator_fallback") == 0) s_status.identity_creator_fallback++;
+  else if (strcmp(r->identity_quality, "token_sid") == 0) s_status.identity_token_sid++;
+  else if (!r->identity_quality[0]) s_status.identity_none++;
+  ProcSlot *p = find_proc(r->pid, r->endpoint_id);
+  if (!p && has_identity && (!snapshot_ok || incoming_generation == 0u)) {
+    /* Do not create a generation-zero identity slot that a later PID reuse can inherit. */
+    s_status.generation_unknown_update_rejects++;
     return;
+  }
+  if (!p) p = alloc_proc(r->pid, r);
+  if (!p) return;
+  if (p->generation_start_ns != 0u && record_time_ns(r) > 0 && (uint64_t)record_time_ns(r) < p->generation_start_ns) { s_status.late_generation_rejects++; return; }
+  if (p->generation_start_ns != 0u && r->event_time_ns == 0 && (r->username[0] || r->user_sid[0] || r->creator_username[0] || r->creator_sid[0] || r->identity_quality[0])) { s_status.generation_unknown_update_rejects++; return; }
+  if (p->generation_start_ns != 0u && (incoming_generation == 0u || !snapshot_ok)) {
+    if (r->username[0] || r->user_sid[0] || r->creator_username[0] || r->creator_sid[0] || r->identity_quality[0]) s_status.generation_unknown_update_rejects++;
+    return;
+  }
+  if (p->generation_start_ns != 0u && incoming_generation != 0u && incoming_generation != p->generation_start_ns) {
+    if (incoming_generation < p->generation_start_ns) { s_status.late_generation_rejects++; return; }
+    memset(p, 0, sizeof(*p)); p->pid = r->pid; p->generation_start_ns = incoming_generation; s_status.generation_resets++;
+  } else if (p->generation_start_ns == 0u && incoming_generation != 0u) {
+    p->generation_start_ns = incoming_generation;
   }
   p->pid = r->pid;
   if (r->ppid != 0u) {
@@ -258,12 +304,29 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   if (r->parent_cmdline[0]) {
     copy_s(p->parent_cmdline, sizeof(p->parent_cmdline), r->parent_cmdline);
   }
-  if (r->username[0]) {
-    copy_s(p->username, sizeof(p->username), r->username);
+  if (r->username[0] || r->user_sid[0]) {
+    int incoming = identity_quality_rank(r->identity_quality);
+    int current = identity_quality_rank(p->identity_quality);
+    if ((!p->username[0] && !p->user_sid[0]) || incoming > current || incoming == current) {
+      if (p->identity_quality[0] && incoming > current) s_status.identity_upgrades++;
+      if ((!p->username[0] && !p->user_sid[0]) || incoming > current) copy_s(p->username, sizeof(p->username), r->username);
+      if (incoming > current || !p->identity_quality[0]) {
+        copy_s(p->domain, sizeof(p->domain), r->domain);
+        copy_s(p->user_sid, sizeof(p->user_sid), r->user_sid);
+        copy_s(p->logon_id, sizeof(p->logon_id), r->logon_id);
+        copy_s(p->identity_source, sizeof(p->identity_source), r->identity_source);
+        copy_s(p->identity_quality, sizeof(p->identity_quality), r->identity_quality);
+      } else if (incoming == current) {
+        if (!p->domain[0]) copy_s(p->domain, sizeof(p->domain), r->domain);
+        if (!p->user_sid[0]) copy_s(p->user_sid, sizeof(p->user_sid), r->user_sid);
+        if (!p->logon_id[0]) copy_s(p->logon_id, sizeof(p->logon_id), r->logon_id);
+      }
+    }
   }
-  if (r->domain[0]) {
-    copy_s(p->domain, sizeof(p->domain), r->domain);
-  }
+  if (r->creator_username[0]) copy_s(p->creator_username, sizeof(p->creator_username), r->creator_username);
+  if (r->creator_domain[0]) copy_s(p->creator_domain, sizeof(p->creator_domain), r->creator_domain);
+  if (r->creator_sid[0]) copy_s(p->creator_sid, sizeof(p->creator_sid), r->creator_sid);
+  if (r->creator_logon_id[0]) copy_s(p->creator_logon_id, sizeof(p->creator_logon_id), r->creator_logon_id);
   if (r->integrity_level[0]) {
     copy_s(p->integrity_level, sizeof(p->integrity_level), r->integrity_level);
   }
@@ -281,12 +344,31 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   }
 }
 
+void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r) {
+  if (!r) return;
+  s_status.identity_observations_total++;
+  process_cache_update(r);
+}
+
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
   if (!r) {
     return;
   }
+  s_status.identity_enrich_attempts++;
   ProcSlot *p = find_proc(r->pid, r->endpoint_id);
   if (p) {
+    /* PID is not a process identity. When both sides carry creation evidence
+     * and it differs, do not transfer cached identity into a reused PID. */
+    ProcessTreeEntry generation;
+    int identity_safe = p->generation_start_ns != 0u &&
+                        edr_pt_cache_snapshot_at(r->pid, (uint64_t)record_time_ns(r), &generation) == 0 &&
+                        generation.start_time_ns == p->generation_start_ns;
+    if (!identity_safe && !r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0])) {
+      if (p->generation_start_ns == 0u) s_status.identity_generation_unknown_rejects++;
+      else s_status.identity_generation_mismatch_rejects++;
+      s_status.identity_stale_rejects++;
+    }
+    s_status.process_cache_hits++;
     if (r->ppid == 0u && p->ppid != 0u) {
       r->ppid = p->ppid;
     }
@@ -308,11 +390,23 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
     if (!r->parent_cmdline[0] && p->parent_cmdline[0]) {
       copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), p->parent_cmdline);
     }
-    if (!r->username[0] && p->username[0]) {
+    if (!r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0]) && identity_safe) {
       copy_s(r->username, sizeof(r->username), p->username);
-    }
-    if (!r->domain[0] && p->domain[0]) {
       copy_s(r->domain, sizeof(r->domain), p->domain);
+      copy_s(r->user_sid, sizeof(r->user_sid), p->user_sid);
+      copy_s(r->logon_id, sizeof(r->logon_id), p->logon_id);
+      /* Cache describes transport provenance, not evidence quality. */
+      copy_s(r->identity_source, sizeof(r->identity_source), "cache");
+      copy_s(r->identity_quality, sizeof(r->identity_quality), p->identity_quality);
+      s_status.identity_cache_hits++;
+    } else if (!r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0]) && !identity_safe) {
+      s_status.identity_cache_misses++;
+    }
+    if (identity_safe) {
+      if (!r->creator_username[0]) copy_s(r->creator_username, sizeof(r->creator_username), p->creator_username);
+      if (!r->creator_domain[0]) copy_s(r->creator_domain, sizeof(r->creator_domain), p->creator_domain);
+      if (!r->creator_sid[0]) copy_s(r->creator_sid, sizeof(r->creator_sid), p->creator_sid);
+      if (!r->creator_logon_id[0]) copy_s(r->creator_logon_id, sizeof(r->creator_logon_id), p->creator_logon_id);
     }
     if (!r->integrity_level[0] && p->integrity_level[0]) {
       copy_s(r->integrity_level, sizeof(r->integrity_level), p->integrity_level);
@@ -329,7 +423,7 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
     if (!r->process_creation_time[0] && p->process_creation_time[0]) {
       copy_s(r->process_creation_time, sizeof(r->process_creation_time), p->process_creation_time);
     }
-  }
+  } else { s_status.process_cache_misses++; s_status.identity_cache_misses++; }
   if (!r->parent_name[0] && r->ppid != 0u) {
     ProcSlot *pp = find_proc(r->ppid, r->endpoint_id);
     if (pp) {
@@ -1864,7 +1958,6 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     return;
   }
   int64_t ts = record_time_ns(r);
-  process_cache_update(r);
   int store_candidate = evidence_should_store_record(r);
   int low_value_file_noise = evidence_is_low_value_file_noise(r);
   if (store_candidate && candidate_dedupe_should_skip(r, ts)) {
@@ -2667,6 +2760,8 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
            "\"candidate_deduped\":%llu,\"write_budget_dropped\":%llu,"
+           "\"process_cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"used\":%u,\"capacity\":%u},"
+           "\"identity\":{\"observations_total\":%llu,\"none\":%llu,\"hits\":%llu,\"misses\":%llu,\"enrich_attempts\":%llu,\"upgrades\":%llu,\"stale_rejects\":%llu,\"generation_unknown_rejects\":%llu,\"generation_mismatch_rejects\":%llu,\"generation_unknown_update_rejects\":%llu,\"generation_mismatch_update_rejects\":%llu,\"generation_resets\":%llu,\"late_generation_rejects\":%llu,\"target_4688\":%llu,\"creator_fallback\":%llu,\"token_sid\":%llu},"
            "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
            "\"pressure_active\":%s,\"ordinary_coalesced\":%llu,"
            "\"aggregate_slots_used\":%u,\"static_bytes\":%llu,"
@@ -2686,6 +2781,16 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.records_skipped, (unsigned long long)st.hot_ring_ingested,
            (unsigned long long)st.candidate_deduped,
            (unsigned long long)st.write_budget_dropped,
+           (unsigned long long)st.process_cache_hits, (unsigned long long)st.process_cache_misses,
+           (unsigned long long)st.process_cache_evictions, st.process_slots_used, st.process_slots_capacity,
+           (unsigned long long)st.identity_observations_total, (unsigned long long)st.identity_none,
+           (unsigned long long)st.identity_cache_hits, (unsigned long long)st.identity_cache_misses,
+           (unsigned long long)st.identity_enrich_attempts, (unsigned long long)st.identity_upgrades,
+           (unsigned long long)st.identity_stale_rejects, (unsigned long long)st.identity_generation_unknown_rejects,
+           (unsigned long long)st.identity_generation_mismatch_rejects, (unsigned long long)st.generation_unknown_update_rejects,
+           (unsigned long long)st.generation_mismatch_update_rejects, (unsigned long long)st.generation_resets,
+           (unsigned long long)st.late_generation_rejects, (unsigned long long)st.identity_target_4688,
+           (unsigned long long)st.identity_creator_fallback, (unsigned long long)st.identity_token_sid,
            (unsigned long long)st.db_budget_dropped,
            (unsigned long long)st.pressure_dropped,
            st.pressure_active ? "true" : "false",

@@ -259,6 +259,15 @@ size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *
   copy_str(msg.exe_hash, sizeof(msg.exe_hash), r->exe_hash);
   copy_str(msg.exe_path, sizeof(msg.exe_path), r->exe_path);
   copy_str(msg.username, sizeof(msg.username), r->username);
+  copy_str(msg.domain, sizeof(msg.domain), r->domain);
+  copy_str(msg.user_sid, sizeof(msg.user_sid), r->user_sid);
+  copy_str(msg.logon_id, sizeof(msg.logon_id), r->logon_id);
+  copy_str(msg.creator_username, sizeof(msg.creator_username), r->creator_username);
+  copy_str(msg.creator_domain, sizeof(msg.creator_domain), r->creator_domain);
+  copy_str(msg.creator_sid, sizeof(msg.creator_sid), r->creator_sid);
+  copy_str(msg.creator_logon_id, sizeof(msg.creator_logon_id), r->creator_logon_id);
+  copy_str(msg.identity_source, sizeof(msg.identity_source), r->identity_source);
+  copy_str(msg.identity_quality, sizeof(msg.identity_quality), r->identity_quality);
   msg.session_id = r->session_id;
   if (r->detection_context[0]) {
     copy_str(msg.ave_result_json, sizeof(msg.ave_result_json), r->detection_context);

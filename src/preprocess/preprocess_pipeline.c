@@ -330,8 +330,10 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
     (void)enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name),
                                     br->parent_path, sizeof(br->parent_path));
   }
-  (void)edr_pt_cache_put(br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path,
-                         br->parent_name, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0));
+  if (edr_process_create_is_lifecycle_authoritative(br)) {
+    (void)edr_pt_cache_put(br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path,
+                           br->parent_name, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0));
+  }
   {
     uint32_t chain_depth = 0u;
     edr_pt_cache_fill_record(br->pid,
@@ -431,6 +433,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   edr_behavior_from_slot(slot, &br);
   apply_agent_ids_to_record(&br);
   enrich_process_integrity_context(&br);
+  edr_local_evidence_cache_observe_process(&br);
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);

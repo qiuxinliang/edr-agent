@@ -150,6 +150,14 @@ int main(void) {
                          "engine health must snapshot parent-enrichment metrics");
   ok &= require_contains(agent, "edr_pt_cache_get_metrics(&process_cache_metrics)",
                          "engine health must snapshot process-tree cache metrics");
+  ok &= require_contains(agent, "\\\"alerts_with_optional_omission\\\"",
+                         "engine health must expose the per-alert P0 optional-context omission count");
+  ok &= require_absent(agent, "\\\"optional_fields_omitted\\\"",
+                       "engine health must not label a per-alert P0 count as fields omitted");
+  ok &= require_contains(agent, "\\\"intermediate_upgrade_suppressed\\\"",
+                         "engine health must expose non-material P0 identity upgrades separately");
+  ok &= require_contains(agent, "\\\"escape_overflow_values\\\"",
+                         "engine health must expose P0 JSON escape-overflow degradation");
 
   free(callback);
   free(admission);

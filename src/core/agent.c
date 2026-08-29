@@ -32,6 +32,7 @@
 #include "edr/agent_lifecycle_command.h"
 #include "edr/ingest_http.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/p0_rule_direct_emit.h"
 #include "edr/enrich_parent_info.h"
 #include "edr/process_tree_cache.h"
 #include "edr/p0_rule_ir.h"
@@ -2155,7 +2156,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
   char http_err[192], command_result_error[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
-  char corr_health_json[600];
+  char corr_health_json[600], p0_health_json[320];
   char event_filter_ver[96];
   char event_filter_last_reason[128], event_filter_last_process[128];
   char event_filter_last_path[320], event_filter_last_cmdline[320];
@@ -2573,6 +2574,20 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   pmfe_q = edr_pmfe_queue_depth();
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
+  EdrP0DedupMetrics p0_metrics;
+  edr_p0_rule_get_dedup_metrics(&p0_metrics);
+  EdrP0EmitMetrics p0_emit_metrics;
+  edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
+  (void)snprintf(p0_health_json, sizeof(p0_health_json),
+                 ",\"p0_dedup\":{\"suppressed_total\":%llu,\"exact_suppressed\":%llu,\"equal_quality_suppressed\":%llu,\"identity_upgrade_allowed\":%llu,\"lower_quality_suppressed\":%llu,\"intermediate_upgrade_suppressed\":%llu,\"pre_rule_event_duplicates\":%llu}",
+                 (unsigned long long)p0_metrics.suppressed_total, (unsigned long long)p0_metrics.exact_suppressed,
+                 (unsigned long long)p0_metrics.equal_quality_suppressed, (unsigned long long)p0_metrics.identity_upgrade_seen,
+                 (unsigned long long)p0_metrics.lower_quality_suppressed, (unsigned long long)p0_metrics.intermediate_upgrade_suppressed, (unsigned long long)p0_metrics.pre_rule_event_duplicates);
+  (void)snprintf(p0_health_json + strlen(p0_health_json), sizeof(p0_health_json) - strlen(p0_health_json),
+                 ",\"p0_emit_context\":{\"user_subject_full\":%llu,\"user_subject_degraded\":%llu,\"alerts_with_optional_omission\":%llu,\"values_truncated\":%llu,\"escape_overflow_values\":%llu,\"minimal_failures\":%llu,\"emitted_without_full_context\":%llu}",
+                 (unsigned long long)p0_emit_metrics.user_subject_full, (unsigned long long)p0_emit_metrics.user_subject_degraded,
+                 (unsigned long long)p0_emit_metrics.alerts_with_optional_omission, (unsigned long long)p0_emit_metrics.values_truncated,
+                 (unsigned long long)p0_emit_metrics.escape_overflow_values, (unsigned long long)p0_emit_metrics.minimal_failures, (unsigned long long)p0_emit_metrics.emitted_without_full_context);
   /* 关联引擎状态（含注入回灌/发射限流指标）随健康周期上报，供后端看板评估误报/数据量。
    * 拼成 `,"correlation":{...}` 片段挂到 body 末尾（evidence_cache 之后）；关闭时留空，
    * 既不改 body 结构也不产生悬挂逗号。同时打一行 stderr 便于本地/验证脚本读取。 */
@@ -2778,6 +2793,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"amsi_visible\":%s,\"security_audit_visible\":%s,"
       "\"security_subscription_ready\":%s,\"security_4688_received\":%llu,"
       "\"security_4657_received\":%llu,"
+      "\"security_4688_payload\":{\"full\":%llu,\"degraded\":%llu,\"values_rejected\":%llu,\"identity_capacity_omitted_fields\":%llu,\"identity_none_events\":%llu,\"effective_identity_present_events\":%llu,\"creator_identity_present_events\":%llu,\"required_overflow_dropped\":%llu},"
       "\"auditd_enabled\":%s,\"auditd_running\":%s,\"auditd_events\":%llu,"
       "\"ebpf_enabled\":%s,\"ebpf_loaded\":%s,\"ebpf_events\":%llu,"
       "\"collector_thread_id\":%u,"
@@ -2865,7 +2881,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"code_supported\":%s,\"build_supported\":%s,\"runtime_status\":\"%s\","
       "\"runtime_detail\":\"%s\",\"mode\":\"web_roots_only\",\"root_count\":%u,\"watch_count\":%u,"
       "\"max_file_size_mb\":%u,\"scan_threads\":%u,\"last_degrade_reason\":\"%s\"},"
-      "%s%s"
+      "%s%s%s"
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
       runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
@@ -3033,6 +3049,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.security_subscription_ready ? "true" : "false",
       (unsigned long long)ch.security_4688_received,
       (unsigned long long)ch.security_4657_received,
+      (unsigned long long)ch.security_4688_payload_full,
+      (unsigned long long)ch.security_4688_payload_degraded,
+      (unsigned long long)ch.security_4688_values_rejected,
+      (unsigned long long)ch.security_4688_identity_capacity_omitted_fields,
+      (unsigned long long)ch.security_4688_identity_none_events,
+      (unsigned long long)ch.security_4688_effective_identity_present_events,
+      (unsigned long long)ch.security_4688_creator_identity_present_events,
+      (unsigned long long)ch.security_4688_required_overflow_dropped,
       ch.auditd_enabled ? "true" : "false", ch.auditd_running ? "true" : "false",
       (unsigned long long)ch.auditd_events,
       ch.ebpf_enabled ? "true" : "false", ch.ebpf_loaded ? "true" : "false",
@@ -3214,7 +3238,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       webshell_runtime.root_count, webshell_runtime.watch_count,
       agent->cfg.webshell_detector.max_file_size_mb, agent->cfg.webshell_detector.scan_threads,
       (webshell_runtime.policy_enabled && !webshell_runtime.started) ? webshell_runtime.detail : "",
-      evidence_json, corr_health_json);
+      evidence_json, corr_health_json, p0_health_json);
   if (n > 0 && (size_t)n < sizeof(body)) {
     int health_rc = edr_ingest_http_post_engine_health_json(body);
     fprintf(stderr, "[engine-health] post %s profile=diagnostic http2_enabled=%d negotiated=%s protocol=%s\n",

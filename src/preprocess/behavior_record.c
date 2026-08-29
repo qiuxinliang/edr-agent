@@ -34,12 +34,10 @@ void edr_behavior_record_enrich_system_context(EdrBehaviorRecord *r) {
     }
 #endif
   }
-  if (!r->domain[0]) {
-#ifdef _WIN32
-    DWORD n = GetEnvironmentVariableA("USERDOMAIN", r->domain, sizeof(r->domain));
-    if (n == 0 || n >= sizeof(r->domain)) {
-      r->domain[0] = '\0';
-    }
-#endif
-  }
+  /* USERDOMAIN belongs to the Agent service, not necessarily the observed process.
+   * Leave an unknown process domain empty instead of manufacturing attribution. */
+}
+
+int edr_process_create_is_lifecycle_authoritative(const EdrBehaviorRecord *r) {
+  return r && r->type == EDR_EVENT_PROCESS_CREATE && !r->is_security_4688;
 }

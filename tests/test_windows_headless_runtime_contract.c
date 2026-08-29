@@ -332,6 +332,12 @@ int main(void) {
   ok &= require_true(finalizer_body && certificate_removal && attestation &&
                          certificate_removal < attestation,
                      "remote attestation must remain after local certificate cleanup");
+  ok &= require_contains(headless_uninstaller,
+                         "deferred_result == ERROR_SUCCESS_REBOOT_REQUIRED",
+                         "accepted Windows reboot deletion must be treated as terminal cleanup");
+  ok &= require_absent(headless_uninstaller,
+                       "edr_native_write_failure_receipt(self_path, \"self-delete\"",
+                       "accepted reboot deletion must not leave a false uninstall failure receipt");
   ok &= require_contains(headless_uninstaller, "(void)edr_native_cleanup_stale_finalizers(state_dir)",
                          "historical finalizer cleanup must be best-effort and non-blocking");
   ok &= require_range_absent(headless_uninstaller,

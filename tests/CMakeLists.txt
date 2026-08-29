@@ -555,6 +555,7 @@ add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTO
 
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c)

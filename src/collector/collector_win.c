@@ -1595,6 +1595,18 @@ static void edr_security_emit_registry_4657(const char *xml) {
   }
 }
 
+typedef enum { EDR_SLOT_KV_APPENDED, EDR_SLOT_KV_EMPTY, EDR_SLOT_KV_NO_SPACE, EDR_SLOT_KV_VALUE_TOO_LONG } EdrSlotKvResult;
+static EdrSlotKvResult edr_collector_slot_append_kv(EdrEventSlot *slot, const char *key, const char *value);
+
+static int edr_security_identity_value_present(const char *value) {
+  const char *end;
+  if (!value) return 0;
+  while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') value++;
+  end = value + strlen(value);
+  while (end > value && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+  return end > value && !(end == value + 1 && value[0] == '-');
+}
+
 static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
                                                    PVOID user_context,
                                                    EVT_HANDLE event) {
@@ -1627,6 +1639,12 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   char ppid[64];
   char user[256];
   char domain[256];
+  char user_sid[256];
+  char logon_id[64];
+  char creator_user[256];
+  char creator_domain[256];
+  char creator_sid[256];
+  char creator_logon_id[64];
   char parent_img[1024];
   char integrity[256];
   char token_elev[64];
@@ -1634,16 +1652,18 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   (void)edr_xml_get_data_utf8(xml, "CommandLine", cmd, sizeof(cmd));
   (void)edr_xml_get_data_utf8(xml, "NewProcessId", epid, sizeof(epid));
   (void)edr_xml_get_data_utf8(xml, "ProcessId", ppid, sizeof(ppid));
-  (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
-  (void)edr_xml_get_data_utf8(xml, "SubjectDomainName", domain, sizeof(domain));
+  (void)edr_xml_get_data_utf8(xml, "SubjectUserName", creator_user, sizeof(creator_user));
+  (void)edr_xml_get_data_utf8(xml, "SubjectDomainName", creator_domain, sizeof(creator_domain));
+  (void)edr_xml_get_data_utf8(xml, "SubjectUserSid", creator_sid, sizeof(creator_sid));
+  (void)edr_xml_get_data_utf8(xml, "SubjectLogonId", creator_logon_id, sizeof(creator_logon_id));
+  (void)edr_xml_get_data_utf8(xml, "TargetUserName", user, sizeof(user));
+  (void)edr_xml_get_data_utf8(xml, "TargetDomainName", domain, sizeof(domain));
+  (void)edr_xml_get_data_utf8(xml, "TargetUserSid", user_sid, sizeof(user_sid));
+  (void)edr_xml_get_data_utf8(xml, "TargetLogonId", logon_id, sizeof(logon_id));
   (void)edr_xml_get_data_utf8(xml, "ParentProcessName", parent_img, sizeof(parent_img));
   (void)edr_xml_get_data_utf8(xml, "MandatoryLabel", integrity, sizeof(integrity));
   (void)edr_xml_get_data_utf8(xml, "TokenElevationType", token_elev, sizeof(token_elev));
   free(xml);
-  if (!img[0] && !cmd[0]) {
-    s_health.collector_dropped++;
-    return ERROR_SUCCESS;
-  }
   if (edr_agent_self_suppress_security_event(img, cmd, epid, ppid, parent_img)) {
     edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_SECURITY_EVENT);
     return ERROR_SUCCESS;
@@ -1654,18 +1674,33 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   slot.timestamp_ns = edr_unix_ns();
   slot.type = EDR_EVENT_PROCESS_CREATE;
   slot.consumed = false;
-  int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=sec\npid=%s\neid=4688\nop=0\nimg=%s\ncmd=%s\nepid=%s\nppid=%s\nuser=%s\nuser_domain=%s\nparent_img=%s\nintegrity=%s\ntoken_elevation=%s\n",
-                   epid[0] ? epid : "0", img, cmd, epid, ppid, user, domain, parent_img, integrity, token_elev);
-  if (n <= 0) {
-    s_health.collector_dropped++;
-    return ERROR_SUCCESS;
+  memcpy(slot.data, "ETW1\nprov=sec\neid=4688\nop=0\n", sizeof("ETW1\nprov=sec\neid=4688\nop=0\n"));
+  slot.size = (uint32_t)strlen((const char *)slot.data) + 1u;
+  EdrSlotKvResult rp = edr_collector_slot_append_kv(&slot, "pid", epid[0] ? epid : "0");
+  EdrSlotKvResult re = edr_collector_slot_append_kv(&slot, "epid", epid);
+  EdrSlotKvResult rpp = edr_collector_slot_append_kv(&slot, "ppid", ppid);
+  EdrSlotKvResult identity[] = {
+    edr_collector_slot_append_kv(&slot, "user_sid", user_sid), edr_collector_slot_append_kv(&slot, "user", user),
+    edr_collector_slot_append_kv(&slot, "user_domain", domain), edr_collector_slot_append_kv(&slot, "logon_id", logon_id),
+    edr_collector_slot_append_kv(&slot, "creator_sid", creator_sid), edr_collector_slot_append_kv(&slot, "creator_user", creator_user),
+    edr_collector_slot_append_kv(&slot, "creator_domain", creator_domain), edr_collector_slot_append_kv(&slot, "creator_logon_id", creator_logon_id)};
+  EdrSlotKvResult ri = edr_collector_slot_append_kv(&slot, "img", img);
+  EdrSlotKvResult rc = edr_collector_slot_append_kv(&slot, "cmd", cmd);
+  EdrSlotKvResult optional[] = {
+    edr_collector_slot_append_kv(&slot, "parent_img", parent_img), edr_collector_slot_append_kv(&slot, "integrity", integrity),
+    edr_collector_slot_append_kv(&slot, "token_elevation", token_elev)};
+  if (rp != EDR_SLOT_KV_APPENDED || re != EDR_SLOT_KV_APPENDED || rpp != EDR_SLOT_KV_APPENDED ||
+      (ri != EDR_SLOT_KV_APPENDED && rc != EDR_SLOT_KV_APPENDED)) {
+    s_health.security_4688_required_overflow_dropped++; s_health.collector_dropped++; return ERROR_SUCCESS;
   }
-  if ((size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
-    n = (int)EDR_MAX_EVENT_PAYLOAD - 1;
-    slot.data[n] = '\0';
-  }
-  slot.size = (uint32_t)n + 1u;
+  int degraded = 0;
+  for (size_t oi = 0; oi < sizeof(identity)/sizeof(identity[0]); oi++) if (identity[oi] == EDR_SLOT_KV_NO_SPACE || identity[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) { degraded = 1; s_health.security_4688_identity_capacity_omitted_fields++; }
+  for (size_t oi = 0; oi < sizeof(optional)/sizeof(optional[0]); oi++) if (optional[oi] == EDR_SLOT_KV_NO_SPACE || optional[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) degraded = 1;
+  if (ri == EDR_SLOT_KV_VALUE_TOO_LONG || rc == EDR_SLOT_KV_VALUE_TOO_LONG) s_health.security_4688_values_rejected++;
+  if (edr_security_identity_value_present(user_sid) || edr_security_identity_value_present(user) || edr_security_identity_value_present(domain) || edr_security_identity_value_present(logon_id)) s_health.security_4688_effective_identity_present_events++;
+  if (edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id)) s_health.security_4688_creator_identity_present_events++;
+  if (!(edr_security_identity_value_present(user_sid) || edr_security_identity_value_present(user) || edr_security_identity_value_present(domain) || edr_security_identity_value_present(logon_id) || edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id))) s_health.security_4688_identity_none_events++;
+  if (degraded) s_health.security_4688_payload_degraded++; else s_health.security_4688_payload_full++;
   s_health.security_audit_visible = 1;
   (void)edr_push_slot_after_policy(&slot, "sec");
   return ERROR_SUCCESS;
@@ -1729,32 +1764,29 @@ static void edr_collector_pid_cache_enrich(EdrBehaviorRecord *br) {
   s_health.process_identity_cache_misses++;
 }
 
-static void edr_collector_slot_append_kv(EdrEventSlot *slot, const char *key,
-                                         const char *value) {
+static EdrSlotKvResult edr_collector_slot_append_kv(EdrEventSlot *slot, const char *key,
+                                                      const char *value) {
   char safe[2048];
   size_t used;
   int n;
   if (!slot || !key || !key[0] || !value || !value[0]) {
-    return;
+    return EDR_SLOT_KV_EMPTY;
   }
   used = strnlen((const char *)slot->data, sizeof(slot->data));
   if (used >= sizeof(slot->data) - 4u) {
-    return;
+    return EDR_SLOT_KV_NO_SPACE;
   }
   edr_etw1_sanitize_value(safe, sizeof(safe), value);
+  if (strlen(value) >= sizeof(safe)) return EDR_SLOT_KV_VALUE_TOO_LONG;
   if (!safe[0]) {
-    return;
+    return EDR_SLOT_KV_EMPTY;
   }
-  if (used > 0u && slot->data[used - 1u] != '\n') {
-    slot->data[used++] = '\n';
-    slot->data[used] = '\0';
-  }
-  n = snprintf((char *)slot->data + used, sizeof(slot->data) - used,
-               "%s=%s\n", key, safe);
-  if (n <= 0 || (size_t)n >= sizeof(slot->data) - used) {
-    return;
-  }
+  n = snprintf(NULL, 0, "%s%s=%s\n", (used > 0u && slot->data[used - 1u] != '\n') ? "\n" : "", key, safe);
+  if (n <= 0 || used + (size_t)n >= sizeof(slot->data)) return EDR_SLOT_KV_NO_SPACE;
+  n = snprintf((char *)slot->data + used, sizeof(slot->data) - used, "%s%s=%s\n",
+               (used > 0u && slot->data[used - 1u] != '\n') ? "\n" : "", key, safe);
   slot->size = (uint32_t)(used + (size_t)n + 1u);
+  return EDR_SLOT_KV_APPENDED;
 }
 
 static void edr_collector_registry_writeback_identity(EdrEventSlot *slot,

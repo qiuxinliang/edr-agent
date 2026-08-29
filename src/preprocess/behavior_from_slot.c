@@ -46,6 +46,13 @@ static RansomNoteBucket g_ransom_note_buckets[RANSOM_NOTE_BUCKETS];
 
 static int detail_token_value(const char *text, const char *key, char *out, size_t cap);
 
+static int identity_value_present(const char *s) {
+  if (!s) return 0;
+  while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+  if (*s == '-' && (s[1] == '\0' || s[1] == ' ' || s[1] == '\t' || s[1] == '\r' || s[1] == '\n')) return 0;
+  return *s != '\0';
+}
+
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = ++g_event_seq;
   snprintf(out, cap, "e-%llx-%llx", (unsigned long long)(uint64_t)time_ns,
@@ -836,6 +843,7 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
 
 typedef struct {
   char prov[48];
+  unsigned long eid;
   char img[EDR_BR_STR_LONG];
   char cmd[EDR_BR_STR_LONG];
   char file[EDR_BR_STR_LONG];
@@ -894,6 +902,12 @@ typedef struct {
   char regstatus[48];
   char user[256];
   char domain[256];
+  char user_sid[256];
+  char logon_id[64];
+  char creator_user[256];
+  char creator_domain[256];
+  char creator_sid[256];
+  char creator_logon_id[64];
   char parent_img[EDR_BR_STR_LONG];
   char parent_cmdline[EDR_BR_STR_LONG];
   char cwd[EDR_BR_STR_LONG];
@@ -1050,6 +1064,8 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   }
   if (strcmp(key, "prov") == 0) {
     snprintf(f->prov, sizeof(f->prov), "%s", val);
+  } else if (strcmp(key, "eid") == 0) {
+    f->eid = parse_ulong_auto(val);
   } else if (strcmp(key, "pid") == 0) {
     f->pid = parse_ulong_auto(val);
   } else if (strcmp(key, "epid") == 0) {
@@ -1060,8 +1076,20 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->ppid = parse_ulong_auto(val);
   } else if (strcmp(key, "user") == 0 || strcmp(key, "username") == 0) {
     snprintf(f->user, sizeof(f->user), "%s", val);
+  } else if (strcmp(key, "user_sid") == 0 || strcmp(key, "target_user_sid") == 0) {
+    snprintf(f->user_sid, sizeof(f->user_sid), "%s", val);
+  } else if (strcmp(key, "logon_id") == 0 || strcmp(key, "target_logon_id") == 0) {
+    snprintf(f->logon_id, sizeof(f->logon_id), "%s", val);
   } else if (strcmp(key, "user_domain") == 0 || strcmp(key, "subject_domain") == 0) {
     snprintf(f->domain, sizeof(f->domain), "%s", val);
+  } else if (strcmp(key, "creator_user") == 0) {
+    snprintf(f->creator_user, sizeof(f->creator_user), "%s", val);
+  } else if (strcmp(key, "creator_domain") == 0) {
+    snprintf(f->creator_domain, sizeof(f->creator_domain), "%s", val);
+  } else if (strcmp(key, "creator_sid") == 0) {
+    snprintf(f->creator_sid, sizeof(f->creator_sid), "%s", val);
+  } else if (strcmp(key, "creator_logon_id") == 0) {
+    snprintf(f->creator_logon_id, sizeof(f->creator_logon_id), "%s", val);
   } else if (strcmp(key, "parent_img") == 0 || strcmp(key, "parent_path") == 0) {
     snprintf(f->parent_img, sizeof(f->parent_img), "%s", val);
     f->has_parent_img = 1;
@@ -1408,6 +1436,9 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
 
   Etw1Fields ef;
   if (slot->size > 0 && etw1_parse(slot->data, slot->size, &ef) == 0) {
+    if (strcmp(ef.prov, "sec") == 0 && ef.eid == 4688u) {
+      r->is_security_4688 = 1u;
+    }
     if (ef.pid) {
       r->pid = (uint32_t)ef.pid;
     }
@@ -1432,15 +1463,46 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
         }
       }
     }
-    if (ef.user[0]) {
+    if (identity_value_present(ef.creator_user) || identity_value_present(ef.creator_domain) ||
+        identity_value_present(ef.creator_sid) || identity_value_present(ef.creator_logon_id)) {
+      snprintf(r->creator_username, sizeof(r->creator_username), "%s", ef.creator_user);
+      snprintf(r->creator_domain, sizeof(r->creator_domain), "%s", ef.creator_domain);
+      snprintf(r->creator_sid, sizeof(r->creator_sid), "%s", ef.creator_sid);
+      snprintf(r->creator_logon_id, sizeof(r->creator_logon_id), "%s", ef.creator_logon_id);
+    }
+    int target_present = identity_value_present(ef.user) || identity_value_present(ef.domain) ||
+                         identity_value_present(ef.user_sid) || identity_value_present(ef.logon_id);
+    if (identity_value_present(ef.user)) {
       if (ef.domain[0]) {
         snprintf(r->username, sizeof(r->username), "%s\\%s", ef.domain, ef.user);
       } else {
         snprintf(r->username, sizeof(r->username), "%s", ef.user);
       }
     }
-    if (ef.domain[0]) {
+    if (identity_value_present(ef.domain)) {
       snprintf(r->domain, sizeof(r->domain), "%s", ef.domain);
+    }
+    if (identity_value_present(ef.user_sid)) {
+      snprintf(r->user_sid, sizeof(r->user_sid), "%s", ef.user_sid);
+    }
+    if (identity_value_present(ef.logon_id)) {
+      snprintf(r->logon_id, sizeof(r->logon_id), "%s", ef.logon_id);
+    }
+    if (target_present) {
+      snprintf(r->identity_source, sizeof(r->identity_source), "%s", "target_4688");
+      snprintf(r->identity_quality, sizeof(r->identity_quality), "%s", "target_4688");
+    } else if (identity_value_present(r->creator_username) || identity_value_present(r->creator_domain) ||
+               identity_value_present(r->creator_sid) || identity_value_present(r->creator_logon_id)) {
+      if (r->creator_domain[0]) {
+        snprintf(r->username, sizeof(r->username), "%s\\%s", r->creator_domain, r->creator_username);
+      } else {
+        snprintf(r->username, sizeof(r->username), "%s", r->creator_username);
+      }
+      snprintf(r->domain, sizeof(r->domain), "%s", r->creator_domain);
+      snprintf(r->user_sid, sizeof(r->user_sid), "%s", r->creator_sid);
+      snprintf(r->logon_id, sizeof(r->logon_id), "%s", r->creator_logon_id);
+      snprintf(r->identity_source, sizeof(r->identity_source), "%s", "creator_fallback");
+      snprintf(r->identity_quality, sizeof(r->identity_quality), "%s", "creator_fallback");
     }
     if (ef.has_parent_img) {
       snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.parent_img);
