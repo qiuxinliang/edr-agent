@@ -25,6 +25,16 @@ static void contains_before(const char *text, const char *first, const char *sec
   require_true(first_at && second_at && first_at < second_at, message);
 }
 
+static void function_excludes(const char *text, const char *function_name, const char *needle, const char *message) {
+  const char *start = text ? strstr(text, function_name) : NULL;
+  const char *end = start ? strstr(start + strlen(function_name), "\nfunction ") : NULL;
+  size_t length = end ? (size_t)(end - start) : (start ? strlen(start) : 0u);
+  char *body = start ? (char *)malloc(length + 1u) : NULL;
+  if (body) { memcpy(body, start, length); body[length] = 0; }
+  require_true(body && !strstr(body, needle), message);
+  free(body);
+}
+
 int main(void) {
   const char *root = getenv("EDR_SOURCE_DIR");
   require_true(root && root[0], "EDR_SOURCE_DIR is configured");
@@ -489,6 +499,20 @@ int main(void) {
            "failed lifecycle summaries expose every callback request observed by the listener");
   contains(lifecycle, "Deferred uninstall cleanup stderr",
            "failed lifecycle summaries expose deferred PowerShell runtime errors");
+  contains(lifecycle, "actions/upload-artifact@v4",
+           "workflow uploads lifecycle evidence even when the smoke test fails");
+  contains(lifecycle, "- name: Publish lifecycle evidence summary\n        if: always()",
+           "workflow binds always() directly to the lifecycle evidence summary step");
+  contains(lifecycle, "- name: Upload Windows lifecycle evidence\n        if: always()",
+           "workflow binds always() directly to the lifecycle evidence upload step");
+  contains(lifecycle, "uninstall-install-root-residual.json",
+           "workflow summary prints residual install-root diagnostics when present");
+  contains(lifecycle, "native-failure-receipt.txt",
+           "workflow summary prints the copied native failure receipt when present");
+  contains(lifecycle, "native-failure-receipt-tmp.txt",
+           "workflow summary prints the copied native temporary failure receipt when present");
+  contains(lifecycle, "windows-lifecycle-evidence-${{ matrix.arch }}",
+           "workflow gives each architecture a distinct lifecycle evidence artifact");
   free(lifecycle);
 
   snprintf(path, sizeof(path), "%s/.github/workflows/edr-agent-client-release.yml", root);
@@ -717,7 +741,7 @@ int main(void) {
            "lifecycle smoke exercises the same native coordinator used by local uninstall");
   contains_before(lifecycle_smoke,
                   "$agentProcessId = [int](Get-CimInstance Win32_Service",
-                  "Wait-ProcessDeleted -ProcessId $agentProcessId",
+                  "Wait-NativeUninstallTerminal -AgentProcessId $agentProcessId",
                   "lifecycle captures the running Agent PID before verifying native uninstall cleanup");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
@@ -736,8 +760,58 @@ int main(void) {
                "lifecycle does not treat a stale native exit code as the result of a PowerShell installer script");
   contains(lifecycle_smoke, "failed_stage = $stage",
            "lifecycle persists the exact failed stage for actionable CI diagnostics");
-  contains(lifecycle_smoke, "function Wait-ServiceDeleted",
-           "lifecycle waits for asynchronous Windows service deletion");
+  contains(lifecycle_smoke, "function Wait-NativeUninstallTerminal",
+           "lifecycle uses one terminal waiter for asynchronous native uninstall");
+  require_true(!strstr(lifecycle_smoke, "function Wait-ServiceDeleted"),
+               "lifecycle removes superseded independent service deletion waiter");
+  require_true(!strstr(lifecycle_smoke, "function Wait-ProcessDeleted"),
+               "lifecycle removes superseded independent process deletion waiter");
+  require_true(!strstr(lifecycle_smoke, "function Wait-InstallDirectoryDeleted"),
+               "lifecycle removes superseded independent install-directory waiter");
+  contains(lifecycle_smoke, "Get-UninstallFinalizerSnapshot",
+           "lifecycle snapshots finalizers before coordinator handoff");
+  contains(lifecycle_smoke, "Get-NativeUninstallFailureSnapshot",
+           "lifecycle snapshots native failure receipts before coordinator handoff");
+  contains(lifecycle_smoke, "$snapshot.LastWriteUtc = $item.LastWriteTimeUtc",
+           "receipt snapshot records its last-write timestamp");
+  contains(lifecycle_smoke, "$snapshot.Length = $item.Length",
+           "receipt snapshot records its file length");
+  contains(lifecycle_smoke, "$snapshot.Sha256 = (Get-FileHash",
+           "receipt snapshot records its SHA-256 fingerprint");
+  contains(lifecycle_smoke, "-not $before.Exists -or $before.LastWriteUtc -ne $item.LastWriteTimeUtc -or $before.Length -ne $item.Length -or $before.Sha256 -ne $hash",
+           "only a new or fingerprint-changed receipt is attributed to this uninstall run");
+  require_true(!strstr(lifecycle_smoke, "$_.CreationUtc -ge $StartedUtc"),
+               "finalizer association uses the before-path delta without a creation-time gate");
+  contains(lifecycle_smoke, "Get-NewUninstallFinalizers -Before $finalizersBefore",
+           "lifecycle correlates only finalizers created by this uninstall run");
+  contains(lifecycle_smoke, "receipt_before = @($nativeFailureBefore)",
+           "lifecycle preserves the pre-handoff receipt fingerprints in evidence");
+  contains(lifecycle_smoke, "Exit 0 is only a committed handoff",
+           "lifecycle does not treat coordinator success as uninstall completion");
+  contains(lifecycle_smoke, "AddSeconds(120)",
+           "lifecycle uses one bounded 120 second uninstall deadline");
+  contains(lifecycle_smoke, "Wait-NativeUninstallTerminal -AgentProcessId",
+           "lifecycle waits for finalizer terminal state and install-root removal");
+  contains(lifecycle_smoke, "last-native-uninstall-failure.receipt.tmp",
+           "lifecycle checks the finalizer's retained temporary failure receipt");
+  contains(lifecycle_smoke, "native-failure-receipt.txt",
+           "failure diagnostics preserve the retained native receipt body in EvidenceDir");
+  contains(lifecycle_smoke, "native-failure-receipt-tmp.txt",
+           "failure diagnostics preserve the retained native temporary receipt body in EvidenceDir");
+  contains(lifecycle_smoke, "ConvertTo-Json -InputObject @($items)",
+           "diagnostic empty arrays remain valid JSON under Windows PowerShell 5.1");
+  contains(lifecycle_smoke, "Get-CimInstance Win32_Process -ErrorAction Stop",
+           "terminal waiter treats process-query errors as indeterminate rather than gone");
+  contains(lifecycle_smoke, "last_query_error=$lastQueryError",
+           "terminal timeout retains the last query failure for diagnostics");
+  function_excludes(lifecycle_smoke, "function Wait-NativeUninstallTerminal", "SilentlyContinue",
+                    "terminal observation never converts a query failure into successful absence");
+  contains(lifecycle_smoke, "native finalizer failure: stage=$($receipt.Stage)",
+           "lifecycle reports finalizer stage error and failure path immediately");
+  contains_before(lifecycle_smoke, "Write-UninstallDiagnostics -Reason", "} finally {",
+                  "uninstall diagnostics are captured before finally cleanup");
+  contains(lifecycle_smoke, "uninstall-install-root-residual.json",
+           "failure diagnostics inventory residual install-root metadata");
   contains(lifecycle_smoke, "exit 0",
            "lifecycle explicitly clears stale native-command status after successful assertions");
   contains(lifecycle_smoke, "validate_windows_powershell_syntax.ps1",

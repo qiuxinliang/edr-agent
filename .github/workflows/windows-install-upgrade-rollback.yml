@@ -223,6 +223,7 @@ jobs:
         shell: pwsh
         run: |
           "## Windows ${{ matrix.arch }} Setup EXE lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "Evidence artifact: `windows-lifecycle-evidence-${{ matrix.arch }}` (setup-exe-evidence, runtime-evidence)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if (Test-Path -LiteralPath setup-exe-evidence\summary.json) {
             '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             Get-Content -LiteralPath setup-exe-evidence\summary.json | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
@@ -280,3 +281,32 @@ jobs:
             "Lifecycle did not reach a passing summary. Inspect the failed step and service diagnostics in this job log." |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           }
+          foreach ($diagnostic in @(
+              'uninstall-finalizers-this-run.json',
+              'uninstall-finalizer-state.json',
+              'native-failure-receipt.txt',
+              'native-failure-receipt-tmp.txt',
+              'uninstall-install-root-residual.json',
+              'uninstall-install-processes.json',
+              'uninstall-service.txt',
+              'uninstall-tasks.txt',
+              'uninstall-diagnostics-errors.json'
+            )) {
+            $diagnosticPath = Join-Path 'runtime-evidence' $diagnostic
+            if (Test-Path -LiteralPath $diagnosticPath) {
+              "### Uninstall diagnostic: $diagnostic" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              '```text' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              Get-Content -LiteralPath $diagnosticPath -TotalCount 120 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+          }
+
+      - name: Upload Windows lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-lifecycle-evidence-${{ matrix.arch }}
+          path: |
+            setup-exe-evidence
+            runtime-evidence
+          if-no-files-found: warn

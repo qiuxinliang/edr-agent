@@ -77,39 +77,121 @@ function Wait-ServiceStable {
   }
 }
 
-function Wait-ServiceDeleted {
-  param([int]$Seconds = 20)
-  for ($i = 0; $i -lt $Seconds; $i++) {
-    if (-not (Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue)) {
-      return
+function Get-UninstallFinalizerSnapshot {
+  if (-not (Test-Path -LiteralPath $programDataState)) { return @() }
+  return @(Get-ChildItem -LiteralPath $programDataState -File -Filter "uninstall-finalizer-*.exe" -ErrorAction Stop |
+    ForEach-Object { [pscustomobject]@{ Path = $_.FullName; CreationUtc = $_.CreationTimeUtc; LastWriteUtc = $_.LastWriteTimeUtc; Length = $_.Length } })
+}
+
+function Get-NewUninstallFinalizers {
+  param([object[]]$Before)
+  $beforePaths = @{}; foreach ($item in $Before) { $beforePaths[$item.Path] = $true }
+  return @(Get-UninstallFinalizerSnapshot | Where-Object { -not $beforePaths.ContainsKey($_.Path) })
+}
+
+function Get-UninstallFinalizerProcesses {
+  param([object[]]$Finalizers)
+  if (-not $Finalizers -or $Finalizers.Count -eq 0) { return @() }
+  $paths = @{}; foreach ($item in $Finalizers) { $paths[$item.Path] = $true }
+  return @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+    $_.ExecutablePath -and $paths.ContainsKey($_.ExecutablePath)
+  } | Select-Object ProcessId, Name, ExecutablePath, CommandLine, CreationDate)
+}
+
+function Get-NativeUninstallFailureSnapshot {
+  $snapshots = @()
+  foreach ($name in @("last-native-uninstall-failure.receipt", "last-native-uninstall-failure.receipt.tmp")) {
+    $path = Join-Path $programDataState $name
+    $snapshot = [ordered]@{ Path = $path; Exists = $false; LastWriteUtc = $null; Length = 0; Sha256 = $null }
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+      $item = Get-Item -LiteralPath $path -ErrorAction Stop
+      $snapshot.Exists = $true
+      $snapshot.LastWriteUtc = $item.LastWriteTimeUtc
+      $snapshot.Length = $item.Length
+      $snapshot.Sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+    $snapshots += [pscustomobject]$snapshot
+  }
+  return @($snapshots)
+}
+
+function Get-NativeUninstallFailure {
+  param([object[]]$Before)
+  $beforeByPath = @{}
+  foreach ($item in $Before) { $beforeByPath[$item.Path] = $item }
+  foreach ($name in @("last-native-uninstall-failure.receipt", "last-native-uninstall-failure.receipt.tmp")) {
+    $path = Join-Path $programDataState $name
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+      $item = Get-Item -LiteralPath $path -ErrorAction Stop
+      $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+      $before = $beforeByPath[$path]
+      if (-not $before -or -not $before.Exists -or $before.LastWriteUtc -ne $item.LastWriteTimeUtc -or $before.Length -ne $item.Length -or $before.Sha256 -ne $hash) {
+      $fields = @{}; Get-Content -LiteralPath $path -ErrorAction Stop | ForEach-Object {
+        $pair = $_ -split "=", 2; if ($pair.Count -eq 2) { $fields[$pair[0]] = $pair[1] }
+      }
+        return [pscustomobject]@{ Path = $path; Stage = $fields["stage"]; Error = $fields["error"]; FailurePath = $fields["path"]; LastWriteUtc = $item.LastWriteTimeUtc; Length = $item.Length; Sha256 = $hash }
+      }
+    }
+  }
+  return $null
+}
+
+function Wait-NativeUninstallTerminal {
+  param([int]$AgentProcessId, [object[]]$Finalizers, [DateTime]$DeadlineUtc, [object[]]$ReceiptBefore)
+  $lastQueryError = $null
+  while ([DateTime]::UtcNow -lt $DeadlineUtc) {
+    try {
+      $receipt = Get-NativeUninstallFailure -Before $ReceiptBefore
+      if ($receipt) { throw "native finalizer failure: stage=$($receipt.Stage) error=$($receipt.Error) failure_path=$($receipt.FailurePath) receipt=$($receipt.Path)" }
+      $rootGone = -not (Test-Path -LiteralPath $installDir -ErrorAction Stop)
+      $service = @(Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop)
+      $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+      $serviceGone = $service.Count -eq 0
+      $agentGone = @($processes | Where-Object { $_.ProcessId -eq $AgentProcessId }).Count -eq 0
+      $finalizerPaths = @{}; foreach ($finalizer in $Finalizers) { $finalizerPaths[$finalizer.Path] = $true }
+      $finalizerRunning = @($processes | Where-Object { $_.ExecutablePath -and $finalizerPaths.ContainsKey($_.ExecutablePath) }).Count -gt 0
+      # A finalizer can delete its own executable before the process table refreshes;
+      # install-root removal is the terminal success condition once registration is gone.
+      if ($rootGone -and $serviceGone -and $agentGone -and -not $finalizerRunning) { return }
+    } catch {
+      if ($_.Exception.Message -like "native finalizer failure:*") { throw }
+      $lastQueryError = $_.Exception.Message
     }
     Start-Sleep -Seconds 1
   }
-  & sc.exe queryex $serviceName 2>&1 | Out-Host
-  Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue |
-    Format-List Name, State, Status, ProcessId, StartMode | Out-Host
-  throw "service $serviceName still exists after waiting $Seconds seconds for deletion"
+  $receipt = Get-NativeUninstallFailure -Before $ReceiptBefore
+  if ($receipt) { throw "native finalizer failure: stage=$($receipt.Stage) error=$($receipt.Error) failure_path=$($receipt.FailurePath) receipt=$($receipt.Path)" }
+  throw "native uninstall terminal state timed out within the shared 120 second budget; install_root=$installDir last_query_error=$lastQueryError"
 }
 
-function Wait-ProcessDeleted {
-  param([int]$ProcessId, [int]$Seconds = 20)
-  if ($ProcessId -le 0) { throw "Agent service did not expose a process id before uninstall" }
-  for ($i = 0; $i -lt $Seconds; $i++) {
-    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-      return
+function Write-UninstallDiagnostics {
+  param([string]$Reason)
+  $errors = [System.Collections.Generic.List[string]]::new()
+  try {
+    $items = @(); if (Test-Path -LiteralPath $installDir) {
+      $items = @(Get-ChildItem -LiteralPath $installDir -Force -Recurse -ErrorAction Stop | ForEach-Object {
+        $entry = $_
+        try { $acl = Get-Acl -LiteralPath $entry.FullName -ErrorAction Stop; $owner = $acl.Owner; $access = @($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights):$($_.AccessControlType)" }) -join ";" }
+        catch { $owner = "<acl-error>"; $access = $_.Exception.Message; $errors.Add("ACL $($entry.FullName): $($_.Exception.Message)") }
+        [pscustomobject]@{ relative_path = $entry.FullName.Substring($installDir.Length).TrimStart('\\'); type = if ($entry.PSIsContainer) { "directory" } else { "file" }; size = if ($entry.PSIsContainer) { 0 } else { $entry.Length }; attributes = [string]$entry.Attributes; creation_utc = $entry.CreationTimeUtc; lastwrite_utc = $entry.LastWriteTimeUtc; owner = $owner; acl = $access }
+      })
     }
-    Start-Sleep -Seconds 1
+    ConvertTo-Json -InputObject @($items) -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDir "uninstall-install-root-residual.json") -Encoding UTF8
+  } catch { $errors.Add("install-root inventory: $($_.Exception.Message)") }
+  try { $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ExecutablePath -like "$installDir*" -or $_.CommandLine -like "*$installDir*" } | Select-Object ProcessId, Name, ExecutablePath, CommandLine); ConvertTo-Json -InputObject @($processes) -Depth 3 | Set-Content (Join-Path $EvidenceDir "uninstall-install-processes.json") -Encoding UTF8 } catch { $errors.Add("process inventory: $($_.Exception.Message)") }
+  try { Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction Stop | Format-List * | Out-File (Join-Path $EvidenceDir "uninstall-service.txt") } catch { $errors.Add("service inventory: $($_.Exception.Message)") }
+  try { Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -match "FDSecurity|$serviceName" } | Format-List * | Out-File (Join-Path $EvidenceDir "uninstall-tasks.txt") } catch { $errors.Add("task inventory: $($_.Exception.Message)") }
+  try { if (Test-Path -LiteralPath $programDataState) { $state = @(Get-ChildItem -LiteralPath $programDataState -Force -ErrorAction Stop | Where-Object { $_.Name -match "uninstall-finalizer-|last-native-uninstall-failure" } | Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc, Attributes); ConvertTo-Json -InputObject @($state) | Set-Content (Join-Path $EvidenceDir "uninstall-finalizer-state.json") -Encoding UTF8 } } catch { $errors.Add("finalizer inventory: $($_.Exception.Message)") }
+  foreach ($receiptCopy in @(
+      [pscustomobject]@{ Source = (Join-Path $programDataState "last-native-uninstall-failure.receipt"); Destination = "native-failure-receipt.txt" },
+      [pscustomobject]@{ Source = (Join-Path $programDataState "last-native-uninstall-failure.receipt.tmp"); Destination = "native-failure-receipt-tmp.txt" }
+    )) {
+    try {
+      $content = if (Test-Path -LiteralPath $receiptCopy.Source -PathType Leaf) { Get-Content -LiteralPath $receiptCopy.Source -Raw -ErrorAction Stop } else { "<absent>" }
+      Set-Content -LiteralPath (Join-Path $EvidenceDir $receiptCopy.Destination) -Value $content -Encoding UTF8 -ErrorAction Stop
+    } catch { $errors.Add("receipt diagnostic $($receiptCopy.Source): $($_.Exception.Message)") }
   }
-  throw "Agent process still exists after waiting $Seconds seconds"
-}
-
-function Wait-InstallDirectoryDeleted {
-  param([int]$Seconds = 120)
-  for ($i = 0; $i -lt $Seconds; $i++) {
-    if (-not (Test-Path -LiteralPath $installDir)) { return }
-    Start-Sleep -Seconds 1
-  }
-  throw "install directory still exists after waiting $Seconds seconds: $installDir"
+  ConvertTo-Json -InputObject @([pscustomobject]@{ reason = $Reason; errors = @($errors) }) -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDir "uninstall-diagnostics-errors.json") -Encoding UTF8
 }
 
 function Wait-EmbeddedUpdaterMaterialized {
@@ -258,7 +340,12 @@ try {
     if ($LASTEXITCODE -ne 0) {
       throw "failed to remove pre-existing lifecycle service: sc.exe exit code $LASTEXITCODE"
     }
-    Wait-ServiceDeleted
+    $preexistingDeleteDeadline = [DateTime]::UtcNow.AddSeconds(20)
+    while ((Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue) -and
+           [DateTime]::UtcNow -lt $preexistingDeleteDeadline) { Start-Sleep -Seconds 1 }
+    if (Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $serviceName) -ErrorAction SilentlyContinue) {
+      throw "pre-existing lifecycle service still exists after deletion request"
+    }
   }
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -314,6 +401,11 @@ try {
   }
   $installedNativeIntegrity | ConvertTo-Json -Depth 4 | Set-Content `
     -LiteralPath $installedNativeIntegrityPath -Encoding UTF8
+  $finalizersBefore = Get-UninstallFinalizerSnapshot
+  $finalizerProcessesBefore = Get-UninstallFinalizerProcesses -Finalizers $finalizersBefore
+  $nativeFailureBefore = Get-NativeUninstallFailureSnapshot
+  $uninstallStartedUtc = [DateTime]::UtcNow
+  $uninstallDeadlineUtc = $uninstallStartedUtc.AddSeconds(120)
   $uninstallerProcess = Start-Process -FilePath (Join-Path $installDir "uninstall.exe") -ArgumentList @(
     "--silent", "--install-dir", $installDir, "--service-name", $serviceName
   ) -Wait -PassThru
@@ -321,10 +413,12 @@ try {
     $uninstallError = [ComponentModel.Win32Exception]::new([int]$uninstallerProcess.ExitCode).Message
     throw "native uninstall coordinator returned code $($uninstallerProcess.ExitCode): $uninstallError"
   }
+  # Exit 0 is only a committed handoff to the detached finalizer, not proof of removal.
+  $finalizersThisRun = Get-NewUninstallFinalizers -Before $finalizersBefore
+  ConvertTo-Json -InputObject @([pscustomobject]@{ started_utc = $uninstallStartedUtc; before_finalizers = @($finalizersBefore); before_processes = @($finalizerProcessesBefore); receipt_before = @($nativeFailureBefore); this_run_finalizers = @($finalizersThisRun); this_run_processes = @(Get-UninstallFinalizerProcesses -Finalizers $finalizersThisRun); receipt_after_handoff = @(Get-NativeUninstallFailureSnapshot) }) -Depth 4 |
+    Set-Content -LiteralPath (Join-Path $EvidenceDir "uninstall-finalizers-this-run.json") -Encoding UTF8
   $stage = "verify_uninstall"
-  Wait-ServiceDeleted
-  Wait-ProcessDeleted -ProcessId $agentProcessId
-  Wait-InstallDirectoryDeleted
+  Wait-NativeUninstallTerminal -AgentProcessId $agentProcessId -Finalizers $finalizersThisRun -DeadlineUtc $uninstallDeadlineUtc -ReceiptBefore $nativeFailureBefore
   $stage = "completed"
   [ordered]@{
     schema_version = 1
@@ -341,6 +435,10 @@ try {
     completed_at = [DateTimeOffset]::UtcNow.ToString("o")
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "summary.json") -Encoding UTF8
 } catch {
+  try { Write-UninstallDiagnostics -Reason $_.Exception.Message } catch {
+    [pscustomobject]@{ reason = "diagnostic wrapper failure"; error = $_.Exception.Message } |
+      ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "uninstall-diagnostics-errors.json") -Encoding UTF8
+  }
   [ordered]@{
     schema_version = 1
     baseline_version = $BaselineVersion
