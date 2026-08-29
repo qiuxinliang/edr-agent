@@ -30,6 +30,17 @@ static void contains_after(const char *text, const char *first, const char *seco
   require_true(first_at && strstr(first_at + strlen(first), second), message);
 }
 
+static size_t count_occurrences(const char *text, const char *needle) {
+  size_t count = 0u;
+  size_t needle_length = strlen(needle);
+  const char *cursor = text;
+  while (cursor && (cursor = strstr(cursor, needle)) != NULL) {
+    count++;
+    cursor += needle_length;
+  }
+  return count;
+}
+
 static int has_adjacent_lines(const char *text, const char *first_line, const char *second_line) {
   const char *first_at = text ? strstr(text, first_line) : NULL;
   const char *next;
@@ -185,6 +196,8 @@ int main(void) {
   contains(script, "rollback_health_check", "rollback health event is recorded");
   contains(script, "$env:ProgramData", "journal survives install-directory binary replacement");
   contains(script, "if ([string]$prior.status -eq 'succeeded') { exit 0 }", "only prior success exits successfully");
+  contains(script, "[string]$prior.task_id -ne $TaskId", "prior update journal rejects a mismatched task identity");
+  contains(script, "[string]$prior.command_id -ne $CommandId", "prior update journal rejects a mismatched command identity");
   contains(script, "Write-AtomicJson", "journal and report use atomic writes");
   free(script);
 
@@ -858,6 +871,17 @@ int main(void) {
            "lifecycle smoke requires an explicit native architecture");
   contains(lifecycle_smoke, "$expectedUpdateArchitecture",
            "lifecycle smoke passes the correct architecture to the updater");
+  require_true(count_occurrences(lifecycle_smoke, "$transitionId = [Guid]::NewGuid().ToString(\"N\")") == 1u,
+               "each version transition creates exactly one transition identity");
+  contains_before(lifecycle_smoke, "$transitionId = [Guid]::NewGuid().ToString(\"N\")", "& $UpdateScript",
+                  "transition identity is generated before launching the updater");
+  contains(lifecycle_smoke, "-TaskId $transitionId",
+           "TaskId reuses the transition identity for the updater journal");
+  contains(lifecycle_smoke, "-CommandId (\"ci-{0}-{1}-{2}\" -f $Operation, $Version, $transitionId)",
+           "CommandId includes operation version and the same transition identity");
+  require_true(!strstr(lifecycle_smoke, "-CommandId (\"ci-{0}-{1}\" -f $Operation, $Version)") &&
+                   !strstr(lifecycle_smoke, "-TaskId ([Guid]::NewGuid().ToString(\"N\"))"),
+               "lifecycle does not reuse a fixed command identity or generate an inline unrelated TaskId");
   contains(lifecycle_smoke, "Wait-EmbeddedUpdaterMaterialized", "lifecycle verifies updater extraction from the installed target binary");
   contains(lifecycle_smoke, "embedded updater hash mismatch", "lifecycle binds the materialized updater to the target release hash");
   contains(lifecycle_smoke, "embedded_updater", "lifecycle summary records embedded updater verification");

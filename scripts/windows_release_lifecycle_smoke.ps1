@@ -224,6 +224,7 @@ function Invoke-VersionTransition {
   $staged = Join-Path $installDir "FDSensor.next.exe"
   Copy-Item -LiteralPath $Candidate -Destination $staged -Force
   $publisher = Get-Publisher -Path $Candidate
+  $transitionId = [Guid]::NewGuid().ToString("N")
   $issued = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $deadline = $issued + 900000
   & $UpdateScript `
@@ -236,8 +237,8 @@ function Invoke-VersionTransition {
     -TrustedPublisherSubject $publisher.Subject `
     -DeploymentMode service `
     -ServiceName $serviceName `
-    -CommandId ("ci-{0}-{1}" -f $Operation, $Version) `
-    -TaskId ([Guid]::NewGuid().ToString("N")) `
+    -CommandId ("ci-{0}-{1}-{2}" -f $Operation, $Version, $transitionId) `
+    -TaskId $transitionId `
     -Operation $Operation `
     -ArtifactId $ArtifactID `
     -UpgradeClass binary_hot `
