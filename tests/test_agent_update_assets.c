@@ -25,6 +25,24 @@ static void contains_before(const char *text, const char *first, const char *sec
   require_true(first_at && second_at && first_at < second_at, message);
 }
 
+static int has_adjacent_lines(const char *text, const char *first_line, const char *second_line) {
+  const char *first_at = text ? strstr(text, first_line) : NULL;
+  const char *next;
+  size_t second_length = strlen(second_line);
+  if (!first_at) return 0;
+  next = first_at + strlen(first_line);
+  if (*next == '\r') { next++; if (*next != '\n') return 0; }
+  if (*next != '\n') return 0;
+  next++;
+  return strncmp(next, second_line, second_length) == 0 &&
+         (next[second_length] == 0 || next[second_length] == '\n' ||
+          (next[second_length] == '\r' && next[second_length + 1] == '\n'));
+}
+
+static void contains_adjacent_lines(const char *text, const char *first_line, const char *second_line, const char *message) {
+  require_true(has_adjacent_lines(text, first_line, second_line), message);
+}
+
 static void function_excludes(const char *text, const char *function_name, const char *needle, const char *message) {
   const char *start = text ? strstr(text, function_name) : NULL;
   const char *end = start ? strstr(start + strlen(function_name), "\nfunction ") : NULL;
@@ -36,6 +54,13 @@ static void function_excludes(const char *text, const char *function_name, const
 }
 
 int main(void) {
+  require_true(has_adjacent_lines("step\n  if: always()\n", "step", "  if: always()"),
+               "adjacent-line helper accepts LF workflow lines");
+  require_true(has_adjacent_lines("step\r\n  if: always()\r\n", "step", "  if: always()"),
+               "adjacent-line helper accepts CRLF workflow lines");
+  require_true(!has_adjacent_lines("step\n\n  if: always()\n", "step", "  if: always()") &&
+                   !has_adjacent_lines("step\n if: always()\n", "step", "  if: always()"),
+               "adjacent-line helper rejects a blank line and wrong indentation");
   const char *root = getenv("EDR_SOURCE_DIR");
   require_true(root && root[0], "EDR_SOURCE_DIR is configured");
   char path[4096];
@@ -501,9 +526,9 @@ int main(void) {
            "failed lifecycle summaries expose deferred PowerShell runtime errors");
   contains(lifecycle, "actions/upload-artifact@v4",
            "workflow uploads lifecycle evidence even when the smoke test fails");
-  contains(lifecycle, "- name: Publish lifecycle evidence summary\n        if: always()",
+  contains_adjacent_lines(lifecycle, "- name: Publish lifecycle evidence summary", "        if: always()",
            "workflow binds always() directly to the lifecycle evidence summary step");
-  contains(lifecycle, "- name: Upload Windows lifecycle evidence\n        if: always()",
+  contains_adjacent_lines(lifecycle, "- name: Upload Windows lifecycle evidence", "        if: always()",
            "workflow binds always() directly to the lifecycle evidence upload step");
   contains(lifecycle, "uninstall-install-root-residual.json",
            "workflow summary prints residual install-root diagnostics when present");
