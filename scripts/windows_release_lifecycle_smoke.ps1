@@ -366,10 +366,12 @@ try {
     foreach ($packageRoot in @($baselineRoot, $targetRoot)) {
       foreach ($packageConfigDir in @("edr_config", "config")) {
         $candidateDetectionAsset = Join-Path (Join-Path $packageRoot $packageConfigDir) $detectionAssetName
-        if (Test-Path -LiteralPath $candidateDetectionAsset -PathType Leaf -and
-            (Get-Item -LiteralPath $candidateDetectionAsset).Length -gt 0) {
-          $packagedDetectionAsset = $candidateDetectionAsset
-          break
+        if (Test-Path -LiteralPath $candidateDetectionAsset -PathType Leaf) {
+          $candidateDetectionAssetLength = (Get-Item -LiteralPath $candidateDetectionAsset).Length
+          if ($candidateDetectionAssetLength -gt 0) {
+            $packagedDetectionAsset = $candidateDetectionAsset
+            break
+          }
         }
       }
       if ($packagedDetectionAsset) { break }
@@ -377,8 +379,9 @@ try {
     if (-not $packagedDetectionAsset) {
       throw "target and baseline packages are missing required detection artifact: $detectionAssetName"
     }
-    if ([IO.Path]::GetFullPath($packagedDetectionAsset).StartsWith(
-        [IO.Path]::GetFullPath($targetRoot), [StringComparison]::OrdinalIgnoreCase)) {
+    $packagedDetectionAssetFullPath = [IO.Path]::GetFullPath($packagedDetectionAsset)
+    $targetRootFullPath = [IO.Path]::GetFullPath($targetRoot)
+    if ($packagedDetectionAssetFullPath.StartsWith($targetRootFullPath, [StringComparison]::OrdinalIgnoreCase)) {
       Write-Warning "baseline package omitted $detectionAssetName; using the target package's verified detection asset for the installed lifecycle fixture"
     }
     Copy-Item -LiteralPath $packagedDetectionAsset -Destination $installedDetectionAsset -Force
