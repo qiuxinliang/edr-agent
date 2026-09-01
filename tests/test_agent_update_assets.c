@@ -118,6 +118,14 @@ int main(void) {
   contains(script, "(?:\\.0)?", "only a zero fourth Windows version component is accepted");
   contains(script, "$Operation -eq 'upgrade' -and $versionDirection -le 0", "upgrade rejects downgrade and same-version targets");
   contains(script, "$Operation -eq 'rollback' -and $versionDirection -ge 0", "rollback requires an older target version");
+  contains(script, "ValidateSet(\"upgrade\", \"rollback\", \"repair\")", "updater exposes an explicit repair operation");
+  contains(script, "$Operation -eq 'repair' -and $UpgradeClass -ne 'installer_required'", "repair requires the full installer path");
+  contains(script, "$Operation -eq 'repair' -and $versionDirection -ne 0", "repair is restricted to the installed version");
+  contains(script, "function Assert-RequiredDetectionArtifacts", "updater validates the installed P0 configuration baseline");
+  contains(script, "edr_config\\p0_rule_bundle_ir_v1.json.enc", "updater requires the encrypted P0 rule artifact");
+  contains(script, "edr_config\\sensor_interest_manifest.json", "updater requires the sensor-interest artifact");
+  contains(script, "$Operation -eq 'upgrade' -and $UpgradeClass -ne 'installer_required'", "non-installer upgrades reject an incomplete configuration baseline without blocking rollback");
+  contains(script, "full installer completed without a usable P0 configuration", "full installer repair verifies P0 artifacts before success");
   contains(script, "InternalName", "PE InternalName check exists");
   contains(script, "ProductVersion", "PE ProductVersion check exists");
   contains(script, "Get-PSDrive", "disk-space preflight exists");

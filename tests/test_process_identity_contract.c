@@ -117,16 +117,34 @@ int main(void) {
   char *direct_feed = read_source(root, "src/collector/ave_etw_feed_win.c");
   char *alert_emit = read_source(root, "src/serialize/behavior_alert_emit.c");
   char *agent = read_source(root, "src/core/agent.c");
+  char *p0_rule_ir = read_source(root, "src/preprocess/p0_rule_ir.c");
   char *process_cache = read_source(root, "src/forensic/process_tree_cache.c");
-  if (!collector || !tdh || !direct_feed || !alert_emit || !agent || !process_cache) {
+  if (!collector || !tdh || !direct_feed || !alert_emit || !agent || !p0_rule_ir ||
+      !process_cache) {
     free(collector);
     free(tdh);
     free(direct_feed);
     free(alert_emit);
     free(agent);
+    free(p0_rule_ir);
     free(process_cache);
     return 1;
   }
+
+  ok &= require_contains(agent, "edr_p0_rule_ir_get_binding(&p0_ir_binding)",
+                         "engine health must report the active P0 IR binding");
+  ok &= require_contains(agent, "p0_ir_ready ? \"true\" : \"false\"",
+                         "engine health must derive P0 enabled state from matcher readiness");
+  ok &= require_contains(agent, "p0_ir_ready ? \"\" : \"p0_ir_not_ready\"",
+                         "engine health must expose an unavailable P0 matcher as degraded");
+  ok &= require_contains(agent, "\\\"preprocessing_rules\\\"",
+                         "preprocessing-rule telemetry must not masquerade as P0 IR health");
+  ok &= require_absent(agent, "\\\"p0_rule\\\":{\\\"enabled\\\":true",
+                       "P0 health must not be reported enabled unconditionally");
+  ok &= require_contains(p0_rule_ir, "GENERIC_READ | GENERIC_WRITE",
+                         "Windows P0 IR durability flush must use a writable file handle");
+  ok &= require_contains(p0_rule_ir, "staged bundle durability sync failed",
+                         "Windows P0 IR hot publication failures must expose the Win32 cause");
 
   char *callback = slice_between(collector, "static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {",
                                  "static DWORD WINAPI edr_etw_consumer_thread(");
@@ -464,6 +482,7 @@ int main(void) {
   free(direct_feed);
   free(alert_emit);
   free(agent);
+  free(p0_rule_ir);
   free(process_cache);
   return ok ? 0 : 1;
 }

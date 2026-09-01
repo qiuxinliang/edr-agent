@@ -797,14 +797,35 @@ int edr_p0_rule_ir_validate_candidate_path(const char *path) {
 static int p0_ir_sync_staged_file(const char *path) {
 #ifdef _WIN32
   HANDLE file;
+  DWORD error;
   if (!path || !path[0]) return 0;
-  file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-  if (file == INVALID_HANDLE_VALUE) return 0;
-  if (!FlushFileBuffers(file)) {
-    CloseHandle(file);
+  /* FlushFileBuffers requires a handle opened with GENERIC_WRITE.  A
+   * read-only handle made every otherwise-valid Windows hot publication fail
+   * before MoveFileExA could durably replace the active IR artifact. */
+  file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, 0, NULL);
+  if (file == INVALID_HANDLE_VALUE) {
+    error = GetLastError();
+    fprintf(stderr,
+            "[p0_rule_ir] staged bundle durability open failed path=%s win32_error=%lu\n",
+            path, (unsigned long)error);
     return 0;
   }
-  CloseHandle(file);
+  if (!FlushFileBuffers(file)) {
+    error = GetLastError();
+    CloseHandle(file);
+    fprintf(stderr,
+            "[p0_rule_ir] staged bundle durability sync failed path=%s win32_error=%lu\n",
+            path, (unsigned long)error);
+    return 0;
+  }
+  if (!CloseHandle(file)) {
+    error = GetLastError();
+    fprintf(stderr,
+            "[p0_rule_ir] staged bundle durability close failed path=%s win32_error=%lu\n",
+            path, (unsigned long)error);
+    return 0;
+  }
   return 1;
 #else
   int fd;

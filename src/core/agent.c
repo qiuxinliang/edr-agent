@@ -2192,6 +2192,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char poll_probe_json[1600];
   char config_recovery_json[1600];
   char capability_manifest_json[16384];
+  char p0_ir_version[256], p0_ir_artifact_sha[80], p0_ir_degrade_reason[192];
+  char p0_artifact_reason[192];
+  char p0_artifact_reason_raw[96];
+  const char *p0_bundle_sha256 = "";
   const char *hot_thread_role = "unknown";
   EdrIngestHttpRuntime http_rt;
   EdrTransportV2Runtime tv2_rt;
@@ -2204,6 +2208,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   EdrCommandDeliveryHealth cdh;
   EdrCommandExecutorHealth ceh;
   EdrWindowsEventFilterStatus event_filter_status;
+  EdrP0RuleIrBinding p0_ir_binding;
+  int p0_ir_ready;
+  int p0_artifact_healthy;
   memset(&http_rt, 0, sizeof(http_rt));
   memset(&tv2_rt, 0, sizeof(tv2_rt));
   memset(&rs, 0, sizeof(rs));
@@ -2215,6 +2222,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&cdh, 0, sizeof(cdh));
   memset(&ceh, 0, sizeof(ceh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
+  memset(&p0_ir_binding, 0, sizeof(p0_ir_binding));
   edr_ingest_http_get_runtime(&http_rt);
   edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
@@ -2294,6 +2302,23 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(tv2_rt.last_error, tv2_last_error, sizeof(tv2_last_error));
   json_escape_small(tv2_rt.envelope_format, tv2_envelope_format, sizeof(tv2_envelope_format));
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
+  (void)edr_p0_rule_ir_get_binding(&p0_ir_binding);
+  p0_ir_ready = edr_p0_rule_ir_is_ready();
+  (void)edr_p0_rule_ir_get_bundle_info(NULL, NULL, &p0_bundle_sha256);
+  p0_artifact_healthy = edr_p0_rule_ir_artifact_healthy(
+      p0_artifact_reason_raw, sizeof(p0_artifact_reason_raw));
+  json_escape_small(p0_artifact_reason_raw, p0_artifact_reason,
+                    sizeof(p0_artifact_reason));
+  json_escape_small(p0_ir_binding.rules_bundle_version, p0_ir_version,
+                    sizeof(p0_ir_version));
+  json_escape_small(p0_ir_binding.artifact_sha256[0]
+                        ? p0_ir_binding.artifact_sha256
+                        : p0_bundle_sha256,
+                    p0_ir_artifact_sha, sizeof(p0_ir_artifact_sha));
+  json_escape_small(!p0_artifact_healthy && p0_artifact_reason_raw[0]
+                        ? p0_artifact_reason_raw
+                        : (p0_ir_ready ? "" : "p0_ir_not_ready"),
+                    p0_ir_degrade_reason, sizeof(p0_ir_degrade_reason));
   edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
   /* P0 acceptance metrics are required in every health profile.  The basic
    * profile is the normal production profile and cannot hide the exact
@@ -2400,7 +2425,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"hot_thread_role\":\"%s\","
         "\"throttle_active\":%s,\"pressure\":%s,\"pressure_level\":%u,"
         "\"pressure_reason\":\"%s\",\"sample_count\":%llu,\"sampler_reset_count\":%llu},"
-        "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\","
+        "\"p0_rule\":{\"enabled\":%s,\"mode\":\"resident\",\"ready\":%s,"
+        "\"artifact_healthy\":%s,\"rule_version\":\"%s\",\"rules_count\":%u,"
+        "\"artifact_sha256\":\"%s\",\"snapshot_epoch\":%llu,"
+        "\"last_degrade_reason\":\"%s\"},"
+        "\"preprocessing_rules\":{\"enabled\":true,\"mode\":\"resident\","
         "\"rule_version\":\"%s\",\"rules_count\":%u,"
         "\"last_degrade_reason\":\"%s\"},"
         "\"p0_acceptance\":{"
@@ -2556,6 +2585,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         rs.throttle_active ? "true" : "false", rs.throttle_active ? "true" : "false",
         rs.pressure_level, resource_pressure_reason[0] ? resource_pressure_reason : "ok",
         (unsigned long long)rs.sample_count, (unsigned long long)rs.sampler_reset_count,
+        p0_ir_ready ? "true" : "false", p0_ir_ready ? "true" : "false",
+        p0_artifact_healthy ? "true" : "false", p0_ir_version,
+        p0_ir_binding.rule_count, p0_ir_artifact_sha,
+        (unsigned long long)p0_ir_binding.snapshot_epoch, p0_ir_degrade_reason,
         rules_ver, agent->cfg.preprocessing.rules_count,
         rs.throttle_active ? "resource_throttle" : "",
         (unsigned long long)p0_metrics.suppressed_total,
@@ -2673,12 +2706,6 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
   EdrEnforcementTerminalJournalMetrics terminal_journal_metrics;
   edr_storage_queue_enforcement_terminal_get_metrics(&terminal_journal_metrics);
-  const char *p0_bundle_sha256 = "";
-  char p0_artifact_reason[96];
-  int p0_artifact_healthy;
-  (void)edr_p0_rule_ir_get_bundle_info(NULL, NULL, &p0_bundle_sha256);
-  p0_artifact_healthy = edr_p0_rule_ir_artifact_healthy(
-      p0_artifact_reason, sizeof(p0_artifact_reason));
   size_t p0_health_used = 0u;
   int p0_health_ok;
   p0_health_json[0] = '\0';
@@ -3005,8 +3032,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"hot_thread_total_delta_100ns\":%llu,"
       "\"throttle_active\":%s,\"pressure\":%s,\"pressure_level\":%u,"
       "\"pressure_reason\":\"%s\",\"sample_count\":%llu,\"sampler_reset_count\":%llu},"
-      "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\",\"rule_version\":\"%s\","
-      "\"rules_count\":%u,\"last_degrade_reason\":\"%s\"},"
+      "\"p0_rule\":{\"enabled\":%s,\"mode\":\"resident\",\"ready\":%s,"
+      "\"artifact_healthy\":%s,\"rule_version\":\"%s\",\"rules_count\":%u,"
+      "\"artifact_sha256\":\"%s\",\"snapshot_epoch\":%llu,"
+      "\"last_degrade_reason\":\"%s\"},"
+      "\"preprocessing_rules\":{\"enabled\":true,\"mode\":\"resident\","
+      "\"rule_version\":\"%s\",\"rules_count\":%u,"
+      "\"last_degrade_reason\":\"%s\"},"
       "\"suppression_policy\":{\"source\":\"%s\",\"policy_version\":\"%s\","
       "\"rollback_version\":\"%s\",\"audit_id\":\"%s\"},"
       "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,\"powershell_visible\":%s,"
@@ -3274,6 +3306,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       rs.throttle_active ? "true" : "false", rs.throttle_active ? "true" : "false",
       rs.pressure_level, resource_pressure_reason[0] ? resource_pressure_reason : "ok",
       (unsigned long long)rs.sample_count, (unsigned long long)rs.sampler_reset_count,
+      p0_ir_ready ? "true" : "false", p0_ir_ready ? "true" : "false",
+      p0_artifact_healthy ? "true" : "false", p0_ir_version,
+      p0_ir_binding.rule_count, p0_ir_artifact_sha,
+      (unsigned long long)p0_ir_binding.snapshot_epoch, p0_ir_degrade_reason,
       rules_ver, agent->cfg.preprocessing.rules_count,
       rs.throttle_active ? "resource_throttle" : "",
       det_policy_source, det_policy_version, det_policy_rollback, det_policy_audit,

@@ -1,11 +1,12 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Replace a running Windows Agent binary with hash, architecture, and rollback checks.
+  Upgrade, roll back, or repair a Windows Agent with hash, architecture, and rollback checks.
 
 .DESCRIPTION
   Run this script from a separate elevated process or scheduled task. It preserves
   enrollment, policy, queue, evidence, and configuration data under InstallDir.
+  Repair is restricted to a same-version, task-pinned full installer package.
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +42,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$TaskId,
   [string]$CampaignId = "",
-  [ValidateSet("upgrade", "rollback")]
+  [ValidateSet("upgrade", "rollback", "repair")]
   [string]$Operation = "upgrade",
   [Parameter(Mandatory = $true)]
   [string]$ArtifactId,
@@ -316,6 +317,23 @@ function Assert-InstalledRuntimeIdentity {
   foreach ($component in $required) {
     if (-not $seen.ContainsKey($component.ToLowerInvariant())) {
       throw "installed Runtime component identity is missing required component: $component"
+    }
+  }
+}
+
+function Assert-RequiredDetectionArtifacts {
+  param(
+    [Parameter(Mandatory = $true)][string]$InstallDirectory,
+    [Parameter(Mandatory = $true)][string]$Context
+  )
+  foreach ($relativePath in @(
+    'edr_config\p0_rule_bundle_ir_v1.json.enc',
+    'edr_config\sensor_interest_manifest.json'
+  )) {
+    $artifactPath = Join-Path $InstallDirectory $relativePath
+    if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf) -or
+        (Get-Item -LiteralPath $artifactPath).Length -le 0) {
+      throw "$Context required detection artifact is missing or empty: $relativePath"
     }
   }
 }
@@ -1023,6 +1041,7 @@ $report = [ordered]@{
   stage = "initialized"
   failed_stage = $null
   target_version = $TargetVersion
+  operation = $Operation
   upgrade_class = $UpgradeClass
   expected_architecture = $ExpectedArchitecture
   expected_sha256 = $expectedHash
@@ -1239,6 +1258,8 @@ try {
   $versionDirection = Compare-SemVer $TargetVersion $currentIdentity.ProductVersion
   if ($Operation -eq 'upgrade' -and $versionDirection -le 0) { throw 'candidate version is not an upgrade' }
   if ($Operation -eq 'rollback' -and $versionDirection -ge 0) { throw 'rollback target is not older than the current version' }
+  if ($Operation -eq 'repair' -and $UpgradeClass -ne 'installer_required') { throw 'repair requires a task-pinned full installer package' }
+  if ($Operation -eq 'repair' -and $versionDirection -ne 0) { throw 'repair target must match the installed version' }
   if ($Operation -eq 'upgrade' -and $MinCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MinCurrentVersion) -lt 0) { throw 'current version is below update compatibility floor' }
   if ($Operation -eq 'upgrade' -and $MaxCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MaxCurrentVersion) -gt 0) { throw 'current version is above update compatibility ceiling' }
   Assert-AuthenticodePublisher -Path $stagedPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
@@ -1253,7 +1274,11 @@ try {
     if ($RuntimeManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$') { throw 'RuntimeManifestSha256 is required for runtime manifest' }
     if ((Get-Sha256 -Path $RuntimeManifest) -ne $RuntimeManifestSha256.ToLowerInvariant()) { throw 'runtime manifest SHA256 mismatch' }
   }
-	$verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
+  if ($Operation -eq 'upgrade' -and $UpgradeClass -ne 'installer_required') {
+    Assert-RequiredDetectionArtifacts -InstallDirectory $installFull `
+      -Context "$UpgradeClass cannot repair the installed baseline; use installer_required:"
+  }
+  $verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
   if ($UpgradeClass -eq 'installer_required') {
     $setupPackage = Get-SetupInstallerFromPackage -PackagePath $RuntimeManifest -DestinationDirectory (Split-Path -Parent $stagedPath) `
       -ExpectedAgentSha256 $expectedHash -ExpectedVersion $TargetVersion
@@ -1292,6 +1317,8 @@ try {
     if ((Get-Sha256 -Path (Join-Path $installFull 'agent.toml')) -ne (Get-Sha256 -Path $fullInstallerConfigBackupPath)) {
       throw 'full installer modified protected agent.toml identity configuration'
     }
+    Assert-RequiredDetectionArtifacts -InstallDirectory $installFull `
+      -Context 'full installer completed without a usable P0 configuration:'
     if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf) -or (Get-Sha256 -Path $currentPath) -ne $expectedHash) {
       throw 'full installer completed but installed FDSensor does not match the task-pinned release hash'
     }
