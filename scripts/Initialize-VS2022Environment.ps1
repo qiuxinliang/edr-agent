@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+$callerVcpkgRoot = [Environment]::GetEnvironmentVariable("VCPKG_ROOT", "Process")
 & (Join-Path $PSScriptRoot "Validate-DependencyLocks.ps1") -RepositoryRoot $repositoryRoot
 $dependencyLock = [IO.File]::ReadAllText((Join-Path $repositoryRoot "dependencies.lock.json")) | ConvertFrom-Json
 $visualStudioVersionRange = [string]$dependencyLock.visual_studio.version_range
@@ -45,9 +46,18 @@ try {
     if ($separator -le 0) { continue }
     $name = $line.Substring(0, $separator)
     $value = $line.Substring($separator + 1)
+    if ($name -ieq "VCPKG_ROOT" -and -not [string]::IsNullOrWhiteSpace($callerVcpkgRoot)) {
+      continue
+    }
     [Environment]::SetEnvironmentVariable($name, $value, 'Process')
     if (-not [string]::IsNullOrWhiteSpace($GithubEnvPath)) {
       Add-Content -LiteralPath $GithubEnvPath -Value ("{0}={1}" -f $name, $value) -Encoding UTF8
+    }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($callerVcpkgRoot)) {
+    [Environment]::SetEnvironmentVariable("VCPKG_ROOT", $callerVcpkgRoot, 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($GithubEnvPath)) {
+      Add-Content -LiteralPath $GithubEnvPath -Value ("VCPKG_ROOT={0}" -f $callerVcpkgRoot) -Encoding UTF8
     }
   }
 } finally {

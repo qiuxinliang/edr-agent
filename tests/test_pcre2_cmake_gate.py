@@ -100,6 +100,21 @@ def production_cmake_configure_blocks(source: str) -> list[str]:
 
 
 class PCRE2CMakeGateTests(unittest.TestCase):
+    def test_visual_studio_environment_preserves_caller_vcpkg_root(self):
+        source = (AGENT_ROOT / "scripts" / "Initialize-VS2022Environment.ps1").read_text(encoding="utf-8")
+        self.assertIn(
+            '$callerVcpkgRoot = [Environment]::GetEnvironmentVariable("VCPKG_ROOT", "Process")',
+            source,
+        )
+        self.assertIn(
+            'if ($name -ieq "VCPKG_ROOT" -and -not [string]::IsNullOrWhiteSpace($callerVcpkgRoot))',
+            source,
+        )
+        self.assertIn(
+            'Add-Content -LiteralPath $GithubEnvPath -Value ("VCPKG_ROOT={0}" -f $callerVcpkgRoot)',
+            source,
+        )
+
     def configure(self, *, build_tests: bool, require_pcre2: bool,
                   allow_test_stub: bool, build_type: str = "",
                   extra_args: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
